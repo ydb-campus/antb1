@@ -9,11 +9,11 @@
 namespace antb1::sql {
 
 enum class TokenKind : std::uint8_t {
-  kIdentifier,        // unquoted; text as written
-  kQuotedIdentifier,  // "..." ; text unescaped ("" -> ")
+  kIdentifier,        // unquoted ASCII [A-Za-z_][A-Za-z0-9_]*; text as written
+  kQuotedIdentifier,  // "..." ; text unescaped ("" -> "), never empty
   kString,            // '...' ; text unescaped ('' -> ')
   kInteger,           // digits only
-  kDecimal,           // digits '.' digits (optionally with exponent)
+  kDecimal,           // digits with '.' and/or an exponent (1.5, .5, 5., 1e3, 2.5E-3)
   kStar,
   kComma,
   kLeftParen,
@@ -30,6 +30,13 @@ enum class TokenKind : std::uint8_t {
   kLessEqual,     // <=
   kGreater,       // >
   kGreaterEqual,  // >=
+  kDoubleColon,   // :: (cast; lexed only so the parser can reject it as unsupported)
+  kConcat,        // || (concatenation; lexed only so the parser can reject it as unsupported)
+  // The kinds below are lexed only so the parser can reject them as unsupported.
+  kOperator,     // any other PostgreSQL-style operator (~, !~, ^, &, |, <<, ==, ->, ?, ...)
+  kParameter,    // $1, $name (and the start of a $$dollar-quoted$$ string)
+  kLeftBracket,  // [ (list literal, subscript)
+  kLeftBrace,    // { (struct literal)
   kEnd,
 };
 
@@ -38,7 +45,7 @@ struct Token {
   std::string text;
   SourceSpan span;
 
-  // Case-insensitive keyword match for kIdentifier tokens (keywords are not reserved in the lexer).
+  // Case-insensitive (ASCII) keyword match for kIdentifier tokens; the lexer reserves no words.
   [[nodiscard]] bool IsKeyword(std::string_view keyword) const;
 };
 

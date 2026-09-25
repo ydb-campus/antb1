@@ -1,5 +1,6 @@
 #include "antb1/sql/unparse.h"
 
+#include <cstddef>
 #include <string>
 #include <variant>
 

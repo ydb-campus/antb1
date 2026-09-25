@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <string_view>
 
 #include "antb1/common/source_span.h"
 
@@ -15,5 +16,8 @@ struct ParseError {
   std::string message;
   SourceSpan span;
 };
+
+// Every kUnsupported message ends with this pointer to the subset documentation.
+inline constexpr std::string_view kUnsupportedHint = "; see docs/sql-subset.md";
 
 }  // namespace antb1::sql

@@ -1,4 +1,4 @@
-antb1: unsupported error: only COUNT(*) is supported yet
-  at line 1, column 8
+antb1: unsupported error: only SELECT COUNT(*) FROM <table> is supported yet
+  at line 1, column 1
   SELECT * FROM t LIMIT 10
-         ^
+  ^^^^^^^^^^^^^^^^^^^^^^^^
