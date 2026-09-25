@@ -1,0 +1,18 @@
+# build trees and caches
+/build/
+/.cache/
+/compile_commands.json
+*.profraw
+*.profdata
+# pixi environments (config.toml is shareable)
+.pixi/*
+!.pixi/config.toml
+# data never lives in the repo (see docs/adr/0006-test-strategy-and-data-policy.md)
+*.parquet
+# personal agent/editor files
+CLAUDE.local.md
+.claude/settings.local.json
+.DS_Store
+__pycache__/
+.pytest_cache/
+.ruff_cache/
