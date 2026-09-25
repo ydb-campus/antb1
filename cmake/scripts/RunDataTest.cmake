@@ -8,7 +8,9 @@
 #                  `hits <files> clickbench` (EventDate as DATE on both engines, as ClickBench's DuckDB setup does)
 #   {QUERIES}      <data dir>/queries.sql: ClickBench's query file, fetched by `pixi run fetch-data`, never committed
 # The command's output passes through unchanged (the commands redact it themselves); the test fails unless the
-# command exits with 0.
+# command exits with 0. Sanitizer reports (asan-data) never reach the log, because a UBSan report prints operand
+# values, which can come from the data: they go to files in WORK_DIR/sanitizers, and only their SUMMARY lines (the
+# kind of error and its source location) are printed; a report fails the test through the command's exit code.
 cmake_minimum_required(VERSION 3.28)
 include("${CMAKE_CURRENT_LIST_DIR}/DataPaths.cmake")
 
@@ -46,7 +48,35 @@ foreach(_arg IN LISTS _args)
   endif()
 endforeach()
 
+set(_sanitizer_dir "${WORK_DIR}/sanitizers")
+file(REMOVE_RECURSE "${_sanitizer_dir}")
+file(MAKE_DIRECTORY "${_sanitizer_dir}")
+foreach(_var ASAN_OPTIONS UBSAN_OPTIONS LSAN_OPTIONS)
+  string(TOLOWER "${_var}" _log)
+  string(REPLACE "_options" "" _log "${_log}")
+  set(_options "$ENV{${_var}}")
+  if(NOT _options STREQUAL "")
+    string(APPEND _options ":")
+  endif()
+  set(ENV{${_var}} "${_options}log_path=${_sanitizer_dir}/${_log}")
+endforeach()
+
 execute_process(COMMAND ${_command} RESULT_VARIABLE _rc)
+file(GLOB _reports LIST_DIRECTORIES false "${_sanitizer_dir}/*")
+if(_reports)
+  set(_summary "")
+  foreach(_report IN LISTS _reports)
+    file(STRINGS "${_report}" _lines REGEX "^SUMMARY: ")
+    string(APPEND _summary "\n  ${_report}")
+    foreach(_line IN LISTS _lines)
+      string(APPEND _summary "\n    ${_line}")
+    endforeach()
+  endforeach()
+  message(
+    "RunDataTest.cmake: sanitizer output in the files below, not printed because it can contain data values; "
+    "run `pixi run asan-data` locally and read it:${_summary}"
+  )
+endif()
 if(NOT _rc STREQUAL "0")
   list(GET _command 0 _program)
   get_filename_component(_program "${_program}" NAME)

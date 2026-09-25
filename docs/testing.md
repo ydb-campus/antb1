@@ -243,7 +243,7 @@ together with the fix. The exact commands are in [fuzz/regressions/README.md](..
 ## ClickBench data tests
 
 The data tests run antb1 on real ClickBench data: `hits_0.parquet`, the first of the 100 partitions of the `hits`
-dataset (122 MB, 1 million rows), and ClickBench's own query file. Both are pinned by sha256 and size in
+dataset (122 MB), and ClickBench's own query file. Both are pinned by sha256 and size in
 `tools/data/clickbench.lock`, downloaded on demand and never committed ([data policy](#data-policy)).
 
 ```bash
@@ -285,16 +285,20 @@ FAIL Q0: result mismatch: values differ
     build/ci-release/bin/antb1-slt clickbench ... --only 0
 ```
 
-The harness self-tests `harness.queries.*` and `harness.clickbench.*` prove on the fixtures that corrupted answers
-are caught and that redacted reports print no SQL and no value.
+Sanitizer reports never reach the log either, because a UBSan report prints operand values: under
+`pixi run asan-data` they go to files in `build/ci-asan/data-tmp/<test>/sanitizers/`, and the test prints only
+their `SUMMARY:` lines (the kind of error and the source location). The harness self-tests `harness.queries.*` and
+`harness.clickbench.*` prove on the fixtures that corrupted answers are caught and that redacted reports print no
+SQL and no value.
 
 ### Queries of our own: `tests/data/hits0_slice.sql`
 
 Each query ends with `;` and follows a `-- features:` line that lists the SQL features it uses, with the names of
 `tests/slt/supported_features.h` (the format is in `tests/slt/runner/query_file.h`). DuckDB runs every query. A
 query whose features are all declared supported must give DuckDB's answer. The others are pending: antb1 must
-answer Unsupported (or reject the query), and once antb1 answers one, the test fails until the slice PR declares
-its features. Write new queries yourself; never copy ClickBench's.
+answer Unsupported or reject the query with a parse or bind error (an I/O or execution error fails the test), and
+once antb1 answers one, the test fails until the slice PR declares its features. Write new queries yourself; never
+copy ClickBench's.
 
 ### The ClickBench ratchet
 

@@ -38,12 +38,19 @@ case "$data_dir" in
 esac
 data_dir="${data_dir%/}"
 
-# ClickBench data must never become committable: a data dir inside the work tree must be git-ignored.
+# ClickBench data must never become committable: a data dir inside the work tree must be git-ignored. Compared as
+# physical paths, so neither `..` nor a symlink hides that a directory is inside the work tree.
+created=0
+[ -d "$data_dir" ] || created=1
+mkdir -p "$data_dir"
+data_dir=$(cd "$data_dir" && pwd -P)
+root_phys=$(cd "$root" && pwd -P)
 case "$data_dir/" in
-  "$root"/*)
-    rel="${data_dir#"$root"}"
+  "$root_phys"/*)
+    rel="${data_dir#"$root_phys"}"
     rel="${rel#/}"
-    if ! git -C "$root" check-ignore -q "${rel:+$rel/}queries.sql" 2>/dev/null; then
+    if ! git -C "$root_phys" check-ignore -q "${rel:+$rel/}queries.sql" 2>/dev/null; then
+      [ "$created" = 0 ] || rmdir "$data_dir" 2>/dev/null || true
       echo "fetch-data: ANTB1_DATA_DIR=$data_dir is inside the repository but not ignored by git;" \
         "use a directory under .cache/ or outside the repository" >&2
       exit 2
@@ -62,8 +69,9 @@ download() {
   local part="$dest.part"
   rm -f "$part"
   echo "fetch-data: downloading $url"
+  # A stalled transfer (under 1 KiB/s for 2 minutes) is aborted and retried like any other error.
   if ! curl -fL --proto '=https' --proto-redir '=https' --retry 5 --retry-all-errors --retry-delay 5 \
-    --connect-timeout 30 --no-progress-meter -o "$part" "$url"; then
+    --connect-timeout 30 --speed-limit 1024 --speed-time 120 --no-progress-meter -o "$part" "$url"; then
     rm -f "$part"
     echo "fetch-data: download failed: $url" >&2
     return 1
@@ -85,7 +93,6 @@ download() {
   echo "fetch-data: $(basename "$dest"): downloaded ($bytes bytes, sha256 $sha)"
 }
 
-mkdir -p "$data_dir"
 status=0
 hits0_url="" hits0_sha="" hits0_bytes=""
 while read -r name sha bytes url extra; do

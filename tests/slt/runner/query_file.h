@@ -36,10 +36,10 @@ std::optional<Feature> FeatureByName(std::string_view name);
 // `antb1-slt queries FILE`: every statement of FILE (each must declare its features) runs on antb1
 // and on the DuckDB oracle.
 //   - features all in `supported`: antb1 must answer, and its answer must equal DuckDB's;
-//   - otherwise the query is pending: antb1 must answer Unsupported (counted), or fail with another
-//     query error (parse, bind: counted as rejected, like the target-grammar samples of `diff`);
-//     if it answers, the answer must equal DuckDB's and the query fails until its features are
-//     declared in supported_features.h;
+//   - otherwise the query is pending: antb1 must answer Unsupported (counted), or fail with a parse
+//     or bind error (counted as rejected); an io or execution error is a failure, as in
+//     `clickbench`; if it answers, the answer must equal DuckDB's and the query fails until its
+//     features are declared in supported_features.h;
 //   - DuckDB must answer every query (the file must be valid DuckDB SQL); an antb1 internal error
 //     is always a failure.
 // Projections (columns or *) compare as rowsort; a projection with LIMIT compares row counts only.

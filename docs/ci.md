@@ -80,7 +80,8 @@ a merge queue (`merge_group` is already wired) can take over when PR volume need
   Fork PRs get no comment (their token cannot write); the table is still in the job summary.
 - `cache-gc` runs after every run on `main` (never on pull requests or in the merge queue) with `actions: write`. It
   deletes the pixi caches of other `pixi.lock` generations, the data caches of other `tools/data/clickbench.lock`
-  files and all but the newest ccache of each leg, then lists what is left in the job summary. Pull requests still
+  files and all but the newest ccache of each leg, then lists what is left in the job summary. A run whose commit is
+  no longer the head of `main` deletes nothing, so it never removes the caches of a newer lock. Pull requests still
   on an older `pixi.lock` install their environments without a cache until they merge `main`.
 - `pixi run ci` (Clang Debug `-Werror` plus tests) is not a separate job; it is the fast local gate inside
   `pixi run check`.
@@ -104,7 +105,7 @@ but every failure is tracked in an issue.
 | `arm64` | ubuntu-24.04-arm | `pixi run release` then `pixi run test-data` | Linux ARM64: the release build, the hermetic tests and the data tests |
 | `diff-extended` | ubuntu-24.04 | `ANTB1_DIFF_SEED=<run id> ANTB1_DIFF_COUNT=20000 pixi run diff-random` | 20,000 random differential queries with the run id as the seed |
 | `ci-shuffle` | ubuntu-24.04 | `pixi run ci-shuffle` | the hermetic tests in random order, each repeated until it fails (at most twice) |
-| `report` | ubuntu-slim | nothing to run | on any failure: opens an issue labelled `nightly-failure` and `agent-task`, or comments on the open one, with the failing jobs, the run URL and the commands above |
+| `report` | ubuntu-slim | nothing to run | on any failed or timed-out job: opens an issue labelled `nightly-failure` and `agent-task`, or comments on the open one, with the failing jobs, the run URL and the commands above |
 
 The nightly jobs only read caches: pixi environments and ccache come from the runs on `main` (`asan-data` reuses
 the ccache of `clang-asan`, `fuzz-long` that of `clang-coverage-fuzz`), and the data comes from the cache that

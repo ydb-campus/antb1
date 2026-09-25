@@ -147,6 +147,12 @@ TEST(RunQueryFile, PendingQueriesNeedUnsupportedOrARejection) {
       RunOne(kPendingFeatures, [](const std::string&) { return Error("parse"); }, oracle);
   EXPECT_EQ(rejected.stats.rejected, 1);
   EXPECT_EQ(rejected.stats.failed, 0);
+  for (const std::string kind : {"io", "execution"}) {
+    const FileRun unclean =
+        RunOne(kPendingFeatures, [&kind](const std::string&) { return Error(kind); }, oracle);
+    EXPECT_EQ(unclean.stats.failed, 1) << kind << " errors are not clean rejections";
+    EXPECT_TRUE(unclean.out.contains("a pending query must fail cleanly")) << unclean.out;
+  }
   const FileRun internal = RunOne(
       kPendingFeatures, [](const std::string&) { return Error("internal", false, true); }, oracle);
   EXPECT_EQ(internal.stats.failed, 1) << "an internal error is always a failure";

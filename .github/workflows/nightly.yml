@@ -252,11 +252,13 @@ jobs:
           if-no-files-found: ignore
 
   # Opens an issue (labels nightly-failure, agent-task) for a failed night, or comments on the open one, with the
-  # failing jobs, the run URL and the local commands. Every value reaches the script through env:, never inline.
+  # failing jobs, the run URL and the local commands. Every value reaches the script through env:, never inline. A
+  # job cancelled on its own (a timeout) counts as failed; a cancelled workflow run reports nothing.
   report:
     name: report
     needs: [fuzz-long, tsan, asan-data, arm64, diff-extended, ci-shuffle]
-    if: ${{ always() && contains(needs.*.result, 'failure') }}
+    if: >-
+      ${{ !cancelled() && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) }}
     runs-on: ubuntu-slim
     timeout-minutes: 10
     permissions:
@@ -286,8 +288,9 @@ jobs:
             echo
             echo '| Job | Reproduce locally |'
             echo '| --- | --- |'
-            jq -r 'to_entries[] | select(.value.result == "failure") | .key' <<<"$NEEDS" | while read -r job; do
-              echo "| \`$job\` | \`${repro[$job]:-see the job log}\` |"
+            jq -r 'to_entries[] | select(.value.result == "failure" or .value.result == "cancelled")
+              | "\(.key) \(.value.result)"' <<<"$NEEDS" | while read -r job result; do
+              echo "| \`$job\` ($result) | \`${repro[$job]:-see the job log}\` |"
             done
             echo
             echo 'The data jobs print redacted output only; run their command locally for details (docs/ci.md).'

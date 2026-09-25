@@ -18,7 +18,7 @@ namespace {
 using enum slt::Feature;
 
 // Batch sizes of the invariance relations: odd sizes that split row groups and pages at random
-// places, and the default. (Batch size 1 would take minutes over a million rows.)
+// places, and the default. (Batch size 1 would take minutes on a whole partition.)
 constexpr std::array<int64_t, 3> kHitsBatchSizes = {1024, 7919, kDefaultBatchSize};
 
 Probe Q(std::string sql, int64_t batch_size = kDefaultBatchSize) {

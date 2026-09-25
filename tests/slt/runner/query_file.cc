@@ -87,8 +87,17 @@ Answer Check(const Statement& s, FeatureSet supported_set, Engine& antb1, Engine
                               supported_set.Names());
       return Failed(std::move(d));
     }
-    return Answer{.kind = e.unsupported ? Answer::Kind::kPending : Answer::Kind::kRejected,
-                  .failure = {}};
+    if (e.unsupported) {
+      return Answer{.kind = Answer::Kind::kPending, .failure = {}};
+    }
+    if (e.kind == "parse" || e.kind == "bind") {
+      return Answer{.kind = Answer::Kind::kRejected, .failure = {}};
+    }
+    return Failed(ErrorDiscrepancy(
+        std::format("antb1 fails with an {} error; a pending query must fail cleanly "
+                    "(Unsupported, a parse or a bind error)",
+                    e.kind),
+        e));
   }
   if (auto d = CompareAnswers(*o, *a, sort, row_count_only)) {
     return Failed(*std::move(d));
