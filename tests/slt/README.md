@@ -120,6 +120,20 @@ ctest runs `diff.random` (label `diff`) with a fixed seed and 300 queries. A sli
 feature adds it to `kSupportedFeatures` (and new grammar to `runner/query_gen.cc`; the unit test
 `harness.QueryGenerator.TargetSamplesCoverTheWholeGrammar` fails until every feature is generated).
 
+## Data tests: `queries` and `clickbench`
+
+The ClickBench data tests (`tests/data`, label `data`) use two more subcommands:
+
+- `antb1-slt queries FILE` runs our own queries (`tests/data/hits0_slice.sql`, format in
+  `runner/query_file.h`) on antb1 and DuckDB. Each query declares its features; a query with only supported
+  features must equal DuckDB's answer, the others must still get Unsupported.
+- `antb1-slt clickbench --status FILE QUERIES` runs ClickBench's queries on antb1, DuckDB only where antb1
+  answers, and compares the passing queries with the ratchet `tests/data/clickbench_status.json`
+  (`runner/clickbench.h`).
+
+`canary/canary_queries.sql` and `canary/status_pass_*.json` drive their self-tests (`harness.queries.*`,
+`harness.clickbench.*`).
+
 ## Options for data tests
 
 - `--redact` never prints values or SQL: only the record id, column types, row counts, the first
@@ -127,4 +141,4 @@ feature adds it to `kSupportedFeatures` (and new grammar to `runner/query_gen.cc
 - `--mutate <kind>` corrupts antb1 results (`value`, `null`, `drop-row`, `extra-row`, `extra-column`,
   `error`, `unsupported`, `succeed`, `canary`); the self-tests prove that each one is caught.
 
-Both options work for `run` and `diff`.
+Both options work for `run`, `diff`, `queries` and `clickbench`.

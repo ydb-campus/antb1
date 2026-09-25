@@ -332,8 +332,8 @@ Verdict Evaluate(const Relation& r, const std::vector<slt::ExecResult>& answers,
                  slt::FeatureSet supported) {
   using Kind = Verdict::Kind;
   if (answers.size() != r.probes.size()) {
-    return {.kind = Kind::kBroken,
-            .message = std::format("{} answers for {} queries", answers.size(), r.probes.size())};
+    std::string message = std::format("{} answers for {} queries", answers.size(), r.probes.size());
+    return {.kind = Kind::kBroken, .message = message, .redacted = message};
   }
   const slt::FeatureSet missing = r.features.Minus(supported);
   int unsupported = 0;
@@ -348,25 +348,29 @@ Verdict Evaluate(const Relation& r, const std::vector<slt::ExecResult>& answers,
       ++unsupported;
       continue;
     }
-    return {.kind = Kind::kBroken, .message = std::format("query {} fails: {}", i, e.message)};
+    return {.kind = Kind::kBroken,
+            .message = std::format("query {} fails: {}", i, e.message),
+            .redacted = std::format("query {} fails ({} error)", i, e.kind)};
   }
   if (!missing.empty()) {
     if (unsupported == 0) {
-      return {.kind = Kind::kBroken,
-              .message = std::format(
-                  "antb1 answers every query of this pending relation, but it uses features that "
-                  "tests/slt/supported_features.h does not declare: {}. Add them to "
-                  "kSupportedFeatures to activate the relation.",
-                  missing.Names())};
+      std::string message = std::format(
+          "antb1 answers every query of this pending relation, but it uses features that "
+          "tests/slt/supported_features.h does not declare: {}. Add them to "
+          "kSupportedFeatures to activate the relation.",
+          missing.Names());
+      return {.kind = Kind::kBroken, .message = message, .redacted = message};
     }
-    return {.kind = Kind::kPending,
-            .message = std::format("pending: needs {} ({} of {} queries answered Unsupported)",
-                                   missing.Names(), unsupported, answers.size())};
+    std::string message = std::format("pending: needs {} ({} of {} queries answered Unsupported)",
+                                      missing.Names(), unsupported, answers.size());
+    return {.kind = Kind::kPending, .message = message, .redacted = message};
   }
   if (auto violation = r.check(results)) {
-    return {.kind = Kind::kViolated, .message = *std::move(violation)};
+    return {.kind = Kind::kViolated,
+            .message = *std::move(violation),
+            .redacted = "the answers violate the relation (values not shown)"};
   }
-  return {.kind = Kind::kHolds, .message = {}};
+  return {.kind = Kind::kHolds, .message = {}, .redacted = {}};
 }
 
 std::span<const TablePath> TablePaths() { return kTablePaths; }

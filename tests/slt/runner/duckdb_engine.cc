@@ -503,10 +503,32 @@ std::expected<std::unique_ptr<DuckDbEngine>, std::string> DuckDbEngine::Make(
   if (duckdb_connect(handles->db, &handles->conn) == DuckDBError) {
     return std::unexpected("duckdb: cannot connect");
   }
+  // File access: the fixtures, the temp directory and the directories of the table files (the
+  // ClickBench data directory in the data tests), nothing else. DuckDB checks the resolved path of
+  // a symlink, so a table file's resolved directory is allowed too.
+  std::vector<std::string> allowed = {fixtures + "/", temp + "/"};
+  const auto allow = [&allowed](const fs::path& dir) {
+    std::string text = dir.lexically_normal().string() + "/";
+    if (!std::ranges::contains(allowed, text)) {
+      allowed.push_back(std::move(text));
+    }
+  };
+  for (const auto& t : tables) {
+    for (const auto& f : t.files) {
+      allow(fs::path(f).parent_path());
+      const fs::path resolved = fs::canonical(f, ec);
+      if (!ec) {
+        allow(resolved.parent_path());
+      }
+    }
+  }
+  std::string allowed_list;
+  for (const auto& dir : allowed) {
+    allowed_list += (allowed_list.empty() ? "" : ", ") + SqlString(dir);
+  }
   std::vector<std::string> setup = {
       "SET binary_as_string = true",
-      std::format("SET allowed_directories = [{}, {}]", SqlString(fixtures + "/"),
-                  SqlString(temp + "/")),
+      std::format("SET allowed_directories = [{}]", allowed_list),
       "SET enable_external_access = false",
   };
   for (const auto& t : tables) {

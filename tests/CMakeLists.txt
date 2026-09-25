@@ -4,8 +4,10 @@
 #   integration                 tests/integration: engine::Session end to end over the fixtures
 #   cli                         tests/cli: golden outputs of the antb1 binary
 #   harness                     tests/harness: fixture digest (and the self-tests of every layer)
+#   data                        tests/data: ClickBench data tests (network data, redacted; not hermetic)
 add_subdirectory(slt)
 add_subdirectory(metamorphic)
 add_subdirectory(integration)
 add_subdirectory(cli)
 add_subdirectory(harness)
+add_subdirectory(data)

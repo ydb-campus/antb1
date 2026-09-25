@@ -1,0 +1,305 @@
+# Nightly deep checks on main (advisory, never a merge gate): long fuzzing, ThreadSanitizer, the ClickBench data
+# tests under ASan and on ARM64, a long random differential run and shuffled test order. A failure opens one issue
+# labelled nightly-failure (or comments on the open one) with the failing jobs and the commands that reproduce them.
+# Every job name contains its local command (docs/ci.md). The jobs only read caches (CI on main writes them).
+name: Nightly
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+# One nightly at a time; a manual run waits for the scheduled one.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  fuzz-long:
+    name: fuzz-long (ANTB1_FUZZ_SECONDS=1200 pixi run fuzz)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read # checkout
+    env:
+      ANTB1_FUZZ_SECONDS: 1200
+      CCACHE_MAXSIZE: 250M
+      CMAKE_BUILD_PARALLEL_LEVEL: 4
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
+        with:
+          pixi-version: v0.81.0
+          environments: default
+          locked: true
+          cache: true
+          cache-key: pixi-${{ hashFiles('pixi.lock') }}-
+          cache-write: false
+      - name: Restore ccache (the fuzz preset of clang-coverage-fuzz)
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/ccache
+          key: ccache-clang-coverage-fuzz-${{ github.run_id }}
+          restore-keys: ccache-clang-coverage-fuzz-
+      - name: Long fuzzing (pixi run fuzz)
+        id: fuzz
+        run: pixi run --frozen -e default fuzz
+      # Crash, leak and timeout inputs grown from our own seed corpus (never data): fuzz/regressions/README.md.
+      - name: Upload fuzz crashes
+        if: ${{ failure() && steps.fuzz.outcome == 'failure' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-long-artifacts
+          path: build/fuzz/artifacts/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  tsan:
+    name: tsan (pixi run tsan)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read # checkout
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: 4
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
+        with:
+          pixi-version: v0.81.0
+          environments: default
+          locked: true
+          cache: true
+          cache-key: pixi-${{ hashFiles('pixi.lock') }}-
+          cache-write: false
+      - name: ThreadSanitizer (pixi run tsan)
+        run: pixi run --frozen -e default tsan
+      - name: Test report
+        if: ${{ !cancelled() }}
+        uses: mikepenz/action-junit-report@a9170d5795813c01ab4901ffb045b52bab4ab09d # v6.5.0
+        with:
+          report_paths: build/tsan/junit.xml
+          annotate_only: true
+          job_summary: true
+          detailed_summary: true
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: logs-tsan
+          path: |
+            build/tsan/Testing/Temporary/LastTest*.log
+            build/tsan/junit.xml
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # The data tests on the ASan build. Their output is redacted and nothing is uploaded (no logs, no data).
+  asan-data:
+    name: asan-data (pixi run asan-data)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read # checkout
+    env:
+      ANTB1_DATA_DIR: ${{ github.workspace }}/.cache/clickbench
+      CCACHE_MAXSIZE: 250M
+      CMAKE_BUILD_PARALLEL_LEVEL: 4
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
+        with:
+          pixi-version: v0.81.0
+          environments: default
+          locked: true
+          cache: true
+          cache-key: pixi-${{ hashFiles('pixi.lock') }}-
+          cache-write: false
+      - name: Restore ccache (the ci-asan preset of clang-asan)
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/ccache
+          key: ccache-clang-asan-${{ github.run_id }}
+          restore-keys: ccache-clang-asan-
+      - name: Restore ClickBench data
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/clickbench
+          key: clickbench-${{ hashFiles('tools/data/clickbench.lock') }}
+      - name: Data tests under ASan and UBSan (pixi run asan-data)
+        run: pixi run --frozen -e default asan-data
+      - name: Test report (redacted)
+        if: ${{ !cancelled() }}
+        uses: mikepenz/action-junit-report@a9170d5795813c01ab4901ffb045b52bab4ab09d # v6.5.0
+        with:
+          report_paths: build/ci-asan/junit-data.xml
+          annotate_only: true
+          job_summary: true
+          detailed_summary: true
+
+  # Linux ARM64 (not a PR leg): the release build with the hermetic tests, then the data tests. Its pixi environments
+  # are not cached (the cache budget covers the x86-64 and macOS legs); the data cache is platform-independent.
+  arm64:
+    name: arm64 (pixi run release && pixi run test-data)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    permissions:
+      contents: read # checkout
+    env:
+      ANTB1_DATA_DIR: ${{ github.workspace }}/.cache/clickbench
+      CMAKE_BUILD_PARALLEL_LEVEL: 4
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
+        with:
+          pixi-version: v0.81.0
+          environments: default
+          locked: true
+          cache: false
+          cache-key: pixi-${{ hashFiles('pixi.lock') }}-
+          cache-write: false
+      - name: Restore ClickBench data
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/clickbench
+          key: clickbench-${{ hashFiles('tools/data/clickbench.lock') }}
+      - name: Release build and hermetic tests (pixi run release)
+        run: pixi run --frozen -e default release
+      - name: Data tests (pixi run test-data)
+        run: pixi run --frozen -e default test-data
+      - name: Test report (redacted for the data tests)
+        if: ${{ !cancelled() }}
+        uses: mikepenz/action-junit-report@a9170d5795813c01ab4901ffb045b52bab4ab09d # v6.5.0
+        with:
+          report_paths: build/ci-release/junit*.xml
+          annotate_only: true
+          job_summary: true
+          detailed_summary: true
+
+  diff-extended:
+    name: diff-extended (ANTB1_DIFF_COUNT=20000 pixi run diff-random)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read # checkout
+    env:
+      ANTB1_DIFF_SEED: ${{ github.run_id }} # printed first; a failure prints the repro of each case
+      ANTB1_DIFF_COUNT: 20000
+      CMAKE_BUILD_PARALLEL_LEVEL: 4
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
+        with:
+          pixi-version: v0.81.0
+          environments: default
+          locked: true
+          cache: true
+          cache-key: pixi-${{ hashFiles('pixi.lock') }}-
+          cache-write: false
+      - name: Random differential test (pixi run diff-random)
+        run: pixi run --frozen -e default diff-random
+
+  ci-shuffle:
+    name: ci-shuffle (pixi run ci-shuffle)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read # checkout
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: 4
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
+        with:
+          pixi-version: v0.81.0
+          environments: default
+          locked: true
+          cache: true
+          cache-key: pixi-${{ hashFiles('pixi.lock') }}-
+          cache-write: false
+      - name: Tests in random order (pixi run ci-shuffle)
+        run: pixi run --frozen -e default ci-shuffle
+      - name: Test report
+        if: ${{ !cancelled() }}
+        uses: mikepenz/action-junit-report@a9170d5795813c01ab4901ffb045b52bab4ab09d # v6.5.0
+        with:
+          report_paths: build/ci/junit-shuffle.xml
+          annotate_only: true
+          job_summary: true
+          detailed_summary: true
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: logs-ci-shuffle
+          path: |
+            build/ci/Testing/Temporary/LastTest*.log
+            build/ci/junit-shuffle.xml
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # Opens an issue (labels nightly-failure, agent-task) for a failed night, or comments on the open one, with the
+  # failing jobs, the run URL and the local commands. Every value reaches the script through env:, never inline. A
+  # job cancelled on its own (a timeout) counts as failed; a cancelled workflow run reports nothing.
+  report:
+    name: report
+    needs: [fuzz-long, tsan, asan-data, arm64, diff-extended, ci-shuffle]
+    if: >-
+      ${{ !cancelled() && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) }}
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
+    permissions:
+      issues: write # create or comment on the nightly-failure issue
+    steps:
+      - name: Open or update the nightly-failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SHA: ${{ github.sha }}
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          declare -A repro=(
+            [fuzz-long]='ANTB1_FUZZ_SECONDS=1200 pixi run fuzz (crash inputs: the fuzz-long-artifacts artifact)'
+            [tsan]='pixi run tsan'
+            [asan-data]='pixi run asan-data'
+            [arm64]='pixi run release && pixi run test-data (on linux-aarch64)'
+            [diff-extended]="ANTB1_DIFF_SEED=$RUN_ID ANTB1_DIFF_COUNT=20000 pixi run diff-random"
+            [ci-shuffle]='pixi run ci-shuffle'
+          )
+          body="$RUNNER_TEMP/nightly-failure.md"
+          {
+            echo "The nightly run $RUN_URL (commit $SHA) failed."
+            echo
+            echo '| Job | Reproduce locally |'
+            echo '| --- | --- |'
+            jq -r 'to_entries[] | select(.value.result == "failure" or .value.result == "cancelled")
+              | "\(.key) \(.value.result)"' <<<"$NEEDS" | while read -r job result; do
+              echo "| \`$job\` ($result) | \`${repro[$job]:-see the job log}\` |"
+            done
+            echo
+            echo 'The data jobs print redacted output only; run their command locally for details (docs/ci.md).'
+          } >"$body"
+          number=$(gh issue list -R "$REPO" --label nightly-failure --state open --limit 1 --json number \
+            --jq '.[0].number // empty')
+          if [ -n "$number" ]; then
+            gh issue comment "$number" -R "$REPO" --body-file "$body"
+          else
+            gh issue create -R "$REPO" --title "Nightly failure" --label nightly-failure,agent-task \
+              --body-file "$body"
+          fi

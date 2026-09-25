@@ -2,10 +2,10 @@
 
 Every behavior change ships with tests in the same PR, and `pixi run check` runs all hermetic tests before a PR is
 opened. This page describes the test layers, the ctest labels, the rules every test follows and the workflows for
-SQL logic tests, differential tests, goldens, fixtures, coverage and fuzzing. The strategy and the data policy are
-decided in [ADR 0006](adr/0006-test-strategy-and-data-policy.md); the harness internals are described next to the
-code in [tests/README.md](../tests/README.md), [tests/slt/README.md](../tests/slt/README.md) and
-[fuzz/regressions/README.md](../fuzz/regressions/README.md).
+SQL logic tests, differential tests, goldens, fixtures, coverage, fuzzing and the ClickBench data tests. The
+strategy and the data policy are decided in [ADR 0006](adr/0006-test-strategy-and-data-policy.md); the harness
+internals are described next to the code in [tests/README.md](../tests/README.md),
+[tests/slt/README.md](../tests/slt/README.md) and [fuzz/regressions/README.md](../fuzz/regressions/README.md).
 
 ## Test layers
 
@@ -21,14 +21,15 @@ code in [tests/README.md](../tests/README.md), [tests/slt/README.md](../tests/sl
 | Harness self-tests | `tests/harness/`, `tests/slt/`, `tests/cli/`, `fuzz/`, `tools/fixturegen/` | a deliberately wrong engine is caught, redaction leaks nothing, fixtures match their digest | in use |
 | Fuzzing | `fuzz/` | parser round trip `Parse(ToSql(ast)) == ast`, idempotent unparser, no crash or UB | in use |
 | Coverage floors | `tools/ci/` | line and branch coverage of each module never drops below its floor | in use |
-| ClickBench data tests | – | antb1 against DuckDB on `hits` data, with redacted output | planned |
+| ClickBench data tests | `tests/data/` | antb1 against DuckDB on the pinned `hits_0` partition, metamorphic relations on it and the ClickBench ratchet, with redacted output | in use |
 | Benchmark smoke tests | – | micro benchmarks run once to prove they work | planned |
 
 Build-level gates run on every PR as well: ASan and UBSan (`pixi run asan`), clang-tidy (`pixi run tidy`), the
-coverage floors (`pixi run coverage`), a libFuzzer smoke run (`pixi run fuzz-smoke`) and the GCC 15 compatibility
-build (`pixi run ci-gcc`). ThreadSanitizer (`pixi run tsan`), shuffled test order (`pixi run ci-shuffle`) and long
-fuzzing (`pixi run fuzz`) are deep checks outside the PR gates; the nightly workflow that runs them arrives in a
-later PR.
+coverage floors (`pixi run coverage`), a libFuzzer smoke run (`pixi run fuzz-smoke`), the GCC 15 compatibility
+build (`pixi run ci-gcc`) and the data tests on `hits_0` (`pixi run test-data`). ThreadSanitizer (`pixi run tsan`),
+shuffled test order (`pixi run ci-shuffle`), long fuzzing (`pixi run fuzz`), the data tests under ASan
+(`pixi run asan-data`) and on ARM64, and a 20,000-query differential run are deep checks outside the PR gates: the
+nightly workflow runs them ([ci.md](ci.md#nightly)).
 
 ## Labels
 
@@ -48,8 +49,8 @@ table must match it (`pixi run lint` compares them).
 | `fuzz-replay` | in use | `fuzz.replay.sql_parser`: the fuzz corpus and regressions replayed as an ordinary test, on every leg |
 | `fuzz` | in use | `fuzz.sql_parser.smoke`: a short libFuzzer run with a fixed seed (Clang `fuzz` preset only) |
 | `setup` | in use | `fixtures.generate`: writes the Parquet fixtures before any test that needs them |
+| `data` | in use | ClickBench data tests (`data.*`, [below](#clickbench-data-tests)): downloaded data, always redacted; only the `data` and `asan-data` test presets run them |
 | `bench-smoke` | reserved | micro benchmarks run once to prove they work (numbers never gate) |
-| `data` | reserved | ClickBench data tests (network download, redacted; excluded from hermetic runs) |
 
 The hermetic test presets (`dev`, `ci`, `ci-asan`, `ci-release`, `ci-gcc`, `coverage`, `tsan`, `ci-shuffle`) exclude
 the `data` and `fuzz` labels. The `fuzz` test preset runs only `fuzz` and `fuzz-replay`.
@@ -239,6 +240,93 @@ Every fuzzer finding becomes a regression test. Reproduce the saved input with t
 like `<what-broke>[-<issue>]`, fix the bug and check the replay with `pixi run test -R fuzz.replay`. Commit the input
 together with the fix. The exact commands are in [fuzz/regressions/README.md](../fuzz/regressions/README.md).
 
+## ClickBench data tests
+
+The data tests run antb1 on real ClickBench data: `hits_0.parquet`, the first of the 100 partitions of the `hits`
+dataset (122 MB), and ClickBench's own query file. Both are pinned by sha256 and size in
+`tools/data/clickbench.lock`, downloaded on demand and never committed ([data policy](#data-policy)).
+
+```bash
+pixi run fetch-data     # NETWORK: download the pinned files into ~/.cache/antb1/clickbench (kept once verified)
+pixi run test-data      # fetch-data, then the ci-release build and the data tests -> build/ci-release/junit-data.xml
+pixi run asan-data      # the same tests on the ASan build (nightly)
+```
+
+- `pixi run fetch-data` downloads with conda curl (retries, HTTPS only, no range requests) into a `.part` file,
+  checks size and sha256 against the lock and renames the file atomically; files that already match are kept, so a
+  second run needs no network. `ANTB1_DATA_DIR` moves the data directory (CI uses `.cache/clickbench` in the
+  workspace; a directory inside the repository must be git-ignored).
+- `pixi run test-data` runs `fetch-data` first, then the `data` workflow preset: the `ci-release` build and the
+  `data` test preset (label `data`, 2 tests in parallel). The hermetic presets never run these tests, and
+  `pixi run test` cannot select them.
+
+| Test | What it checks |
+| --- | --- |
+| `data.hits0.verify` | the files of the lock are in the data directory with the pinned size and sha256 (`cmake/scripts/VerifyData.cmake`); the other data tests only run after it passed. On failure it says `run pixi run fetch-data` |
+| `data.hits0.schema` | the hits files have the 105-column physical schema that `tools/fixturegen` models (`antb1-fixturegen --check-schema`) |
+| `data.hits0.slice` | `tests/data/hits0_slice.sql`, our own queries over the hits columns, on antb1 and DuckDB (`antb1-slt queries`) |
+| `data.hits0.metamorphic` | the relations of `tests/data/hits_relations.cc` on the hits data, and COUNT(*) against the rows the Parquet library decodes (`antb1-data-metamorphic`) |
+| `data.clickbench.status` | ClickBench's queries on antb1 against DuckDB and the ratchet `tests/data/clickbench_status.json` (`antb1-slt clickbench`) |
+
+### Redaction
+
+Every data test runs with `--redact` (`pixi run lint` rejects a data test without it), so neither a value nor
+ClickBench query text reaches a log, a JUnit report or a CI annotation. A failure prints only the query id
+(`hits0_slice.sql:<line>` or `Q<n>`), the features, the column types, the error kind, the row counts, the first
+differing row and the sha256 of each engine's canonical result, plus the unredacted command. Run that command
+locally after `pixi run test-data` to see the SQL and the values:
+
+```text
+FAIL Q0: result mismatch: values differ
+  rows: DuckDB 1, antb1 1; first differing row: 0
+  sha256: DuckDB <64 hex digits>
+          antb1  <64 hex digits>
+  repro (unredacted, prints values and query text; run it locally):
+    build/ci-release/bin/antb1-slt clickbench ... --only 0
+```
+
+Sanitizer reports never reach the log either, because a UBSan report prints operand values: under
+`pixi run asan-data` they go to files in `build/ci-asan/data-tmp/<test>/sanitizers/`, and the test prints only
+their `SUMMARY:` lines (the kind of error and the source location). The harness self-tests `harness.queries.*` and
+`harness.clickbench.*` prove on the fixtures that corrupted answers are caught and that redacted reports print no
+SQL and no value.
+
+### Queries of our own: `tests/data/hits0_slice.sql`
+
+Each query ends with `;` and follows a `-- features:` line that lists the SQL features it uses, with the names of
+`tests/slt/supported_features.h` (the format is in `tests/slt/runner/query_file.h`). DuckDB runs every query. A
+query whose features are all declared supported must give DuckDB's answer. The others are pending: antb1 must
+answer Unsupported or reject the query with a parse or bind error (an I/O or execution error fails the test), and
+once antb1 answers one, the test fails until the slice PR declares its features. Write new queries yourself; never
+copy ClickBench's.
+
+### The ClickBench ratchet
+
+`data.clickbench.status` runs every query of ClickBench's `queries.sql` (pinned at ClickBench commit
+`5a56398c975bfd9f328f544894bcb92533ed134c`; `Q<n>` is the 0-based statement number) on antb1 with EventDate read as
+DATE. DuckDB runs only the queries antb1 answers. A query passes when antb1 answers and the answer equals DuckDB's.
+Every other query must fail cleanly: Unsupported, or a parse or bind error. The test fails on a wrong answer, on
+an unclean failure (an I/O, execution or internal error) and on any difference from the ratchet
+`tests/data/clickbench_status.json`: `{"clickbench_commit": "<commit>", "pass": [<n>, ...]}`.
+
+The PR that changes the pass set updates the ratchet and the status table in
+[sql-subset.md](sql-subset.md#clickbench-status) in the same PR (`pixi run lint` checks that they agree and that
+the commit matches the lock). An unexpected pass is good news: add the query to both. An unexpected fail is a
+regression to fix. The ratchet is `[0]` today.
+
+### Full dataset (host only)
+
+```bash
+pixi run fetch-data --full    # all 100 partitions (about 14.7 GB) into ~/.cache/antb1/clickbench/full
+ANTB1_HITS_FILES="$HOME/.cache/antb1/clickbench/full/hits_*.parquet" pixi run test-data
+```
+
+`--full` checks the free space first. `hits_0` is verified against the pin; the other partitions are
+trust-on-first-use: their sha256 is recorded in `full/SHA256SUMS` on the first download (outside the repository)
+and checked on every later run. `ANTB1_HITS_FILES` takes a file, a glob in the file name or a comma-separated list;
+`data.hits0.verify` then skips the pinned `hits_0` with a warning. The published full-dataset answers are compared
+by hand with the CLI, never committed.
+
 ## Writing tests
 
 - Put unit tests in `src/<module>/tests/<topic>_test.cc` and add the file to `antb1_add_module_tests(...)` in
@@ -270,14 +358,16 @@ in the job summary (from the JUnit file), and the ctest logs are uploaded as the
 
 Every CI job name contains the command that reproduces it, for example `clang-asan (pixi run asan)`.
 [ci.md](ci.md) has the full map. `pixi run check-full` runs every Linux PR gate locally: `check` (lint and the Clang
-Debug build with tests), `asan`, `tidy`, `coverage`, `fuzz-smoke` and `ci-gcc`.
+Debug build with tests), `asan`, `tidy`, `coverage`, `fuzz-smoke` and `ci-gcc`. The data tests run separately:
+`pixi run test-data` (CI job `clickbench-hits0`).
 
 ## Data policy
 
 Nothing derived from ClickBench is ever committed: no Parquet files or samples, no query text and no result values.
 No file larger than 1 MiB is committed either. `pixi run lint` rejects data files (`*.parquet`, `*.arrow`,
 `*.feather`, `*.csv.gz`, `queries.sql`) and any other file over 1 MiB except `pixi.lock`; authors and reviewers
-check the rest. Fixtures, `.slt` queries, golden files and fuzz seeds are our own. The data tests (added in a later
-PR) download the pinned `hits` partition into a cache outside the repository, redact their output (query numbers,
-column names, row counts and hashes only) and never upload data as CI artifacts. The full policy is
+check the rest. Fixtures, `.slt` queries, golden files and fuzz seeds are our own. The data tests download the pinned
+`hits` partition and query file into a cache outside the repository, redact their output (query ids, column types,
+row counts and hashes only) and never upload data or logs as CI artifacts; committed are only pins, our own
+queries and the pass/fail ratchet. The full policy is
 [ADR 0006](adr/0006-test-strategy-and-data-policy.md).

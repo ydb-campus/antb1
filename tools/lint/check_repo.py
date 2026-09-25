@@ -19,7 +19,8 @@ Usage: python tools/lint/check_repo.py [--root DIR] [--only R001,R007]
   R009  no data files (Parquet, ClickBench queries, ...) and no file over 1 MiB except pixi.lock.
   R010  workflow hardening (permissions, timeouts, SHA pins, persist-credentials, triggers, setup-pixi cache key,
         no `${{ github.event.* }}`/`${{ github.head_ref }}` in `run:`); `data` tests use `--redact`.
-  R011  ClickBench ratchet `pass` list == docs/sql-subset.md status table.
+  R011  ClickBench ratchet `pass` list == docs/sql-subset.md status table; its `clickbench_commit` is the commit
+        of the queries.sql pin in tools/data/clickbench.lock.
   R012  CODEOWNERS, AGENTS.md "Ask a human first" and .claude/settings.json cover the governance path set G.
   R013  docs/adr/README.md lists every ADR.
   R014  relative links and backticked repo paths in agent docs and docs/** exist.
@@ -1401,11 +1402,13 @@ def check_r011(ctx: Ctx) -> None:
         return
     path = "tests/data/clickbench_status.json"
     try:
-        raw = json.loads(status_text).get("pass", [])
+        status = json.loads(status_text)
+        raw = status.get("pass", [])
         ratchet = {q for q in (query_number(str(v)) for v in raw) if q is not None}
     except (json.JSONDecodeError, AttributeError):
         repo.add("R011", path, 1, "not a JSON object with a `pass` list", "fix the JSON")
         return
+    check_ratchet_commit(ctx, path, status_text, str(status.get("clickbench_commit", "")))
     doc = repo.text("docs/sql-subset.md")
     if doc is None:
         repo.add("R011", "docs/sql-subset.md", 1, "missing (it must carry the ClickBench status table)", "add it")
@@ -1430,6 +1433,32 @@ def check_r011(ctx: Ctx) -> None:
             )
         return
     repo.add("R011", "docs/sql-subset.md", 1, "no ClickBench status table (| Query | Status |)", "add it")
+
+
+LOCK_PATH = "tools/data/clickbench.lock"
+
+
+def check_ratchet_commit(ctx: Ctx, path: str, status_text: str, commit: str) -> None:
+    """The ratchet's `clickbench_commit` must be the commit that the queries.sql URL of the lock pins."""
+    lock = ctx.repo.text(LOCK_PATH)
+    if lock is None:
+        return
+    pinned = None
+    for line in lock.splitlines():
+        parts = line.split()
+        if len(parts) == 4 and parts[0] == "queries.sql":
+            m = re.search(r"/([0-9a-f]{40})/", parts[3])
+            pinned = m.group(1) if m else None
+    if pinned is None:
+        ctx.repo.add("R011", LOCK_PATH, 1, "no queries.sql line pinned to a 40-hex commit", "pin queries.sql by commit")
+    elif commit != pinned:
+        ctx.repo.add(
+            "R011",
+            path,
+            line_of(status_text, r'"clickbench_commit"'),
+            f"`clickbench_commit` {commit or '(missing)'} is not the queries.sql commit {pinned} of {LOCK_PATH}",
+            "re-verify the ratchet against the pinned queries.sql and update both together",
+        )
 
 
 def norm_gov(path: str) -> str:

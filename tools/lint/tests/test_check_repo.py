@@ -696,6 +696,20 @@ def test_r011_ratchet_drift(repo: Path) -> None:
     assert "passes [0], the ratchet (tests/data/clickbench_status.json) [0, 1]" in messages(repo, "R011")
 
 
+def test_r011_ratchet_commit_matches_the_lock(repo: Path) -> None:
+    commit, other = "a" * 40, "b" * 40
+    (repo / "tools/data").mkdir(parents=True)
+    (repo / "tools/data/clickbench.lock").write_text(
+        f"# pins\nqueries.sql {'0' * 64} 10 https://example.org/ClickBench/{commit}/duckdb-parquet/queries.sql\n",
+        encoding="utf-8",
+    )
+    status = repo / "tests/data/clickbench_status.json"
+    status.write_text(f'{{"clickbench_commit": "{other}", "pass": [0]}}', encoding="utf-8")
+    assert f"`clickbench_commit` {other} is not the queries.sql commit {commit}" in messages(repo, "R011")
+    status.write_text(f'{{"clickbench_commit": "{commit}", "pass": [0]}}', encoding="utf-8")
+    assert findings(repo, "R011") == []
+
+
 def test_r011_skipped_without_ratchet(repo: Path) -> None:
     (repo / "tests/data/clickbench_status.json").unlink()
     (repo / "docs/sql-subset.md").write_text("# SQL\n", encoding="utf-8")

@@ -36,6 +36,7 @@ environment, so `pixi run <task>` never needs `-e`; pixi installs a missing envi
 | Lint and repository drift checks (read-only) | `pixi run lint` |
 | Required before every PR | `pixi run check` |
 | Every Linux PR gate (ASan/UBSan, clang-tidy, coverage floors, fuzz smoke, GCC leg) | `pixi run check-full` |
+| ClickBench data tests (downloads 122 MB once into `~/.cache/antb1`; redacted output) | `pixi run test-data` |
 | Toolchain, build and data status | `pixi run doctor` |
 
 [docs/ci.md](docs/ci.md) maps every CI job to the local command that reproduces it, and
@@ -93,8 +94,10 @@ guide).
 ## Data policy
 
 Nothing derived from ClickBench (Parquet files, samples, query text, result values) is ever committed, and no file
-larger than 1 MiB may be committed. Tests generate their own data. See
-[docs/adr/0006-test-strategy-and-data-policy.md](docs/adr/0006-test-strategy-and-data-policy.md).
+larger than 1 MiB may be committed. Tests generate their own data; the ClickBench data tests download the pinned
+files into a cache outside the repository and redact their output. See
+[docs/adr/0006-test-strategy-and-data-policy.md](docs/adr/0006-test-strategy-and-data-policy.md) and
+[docs/testing.md](docs/testing.md#clickbench-data-tests).
 
 ## Optional git hooks
 

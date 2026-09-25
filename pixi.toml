@@ -131,6 +131,20 @@ cmd = "cmake --workflow --preset tsan"
 description = "Nightly ci-shuffle: the `ci` build, hermetic tests in random order, each repeated until it fails (max 2) -> build/ci/junit-shuffle.xml"
 cmd = "cmake --workflow --preset ci-shuffle"
 
+[feature.clang.tasks.fetch-data]
+description = "NETWORK: download the pinned ClickBench files (tools/data/clickbench.lock: hits_0.parquet 122 MB, queries.sql) into $ANTB1_DATA_DIR (default ~/.cache/antb1/clickbench), sha256-verified, kept when they match; --full: all 100 partitions (14.7 GB, host only)"
+cmd = "bash scripts/fetch-data.sh"
+
+[feature.clang.tasks.test-data]
+description = "ClickBench data tests (label data, redacted) on the ci-release build: hits_0 vs DuckDB, metamorphic, the ClickBench ratchet -> build/ci-release/junit-data.xml; ANTB1_HITS_FILES=<glob> for other hits files"
+cmd = "cmake --workflow --preset data"
+depends-on = ["fetch-data"]
+
+[feature.clang.tasks.asan-data]
+description = "Nightly asan-data: the ClickBench data tests on the ci-asan build (ASan+UBSan) -> build/ci-asan/junit-data.xml"
+cmd = "cmake --workflow --preset asan-data"
+depends-on = ["fetch-data"]
+
 [feature.clang.tasks.doctor]
 description = "Environment/build/data status; `pixi run doctor --json` for machines"
 cmd = "bash scripts/doctor.sh"
