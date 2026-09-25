@@ -1,28 +1,34 @@
 # Testing
 
 Every behavior change ships with tests in the same PR, and `pixi run check` runs all hermetic tests before a PR is
-opened. This page describes the test layers, the ctest labels, the rules every test follows and how to reproduce a
-CI failure. The strategy and the data policy are decided in
-[ADR 0006](adr/0006-test-strategy-and-data-policy.md).
+opened. This page describes the test layers, the ctest labels, the rules every test follows and the workflows for
+SQL logic tests, differential tests, goldens, fixtures, coverage and fuzzing. The strategy and the data policy are
+decided in [ADR 0006](adr/0006-test-strategy-and-data-policy.md); the harness internals are described next to the
+code in [tests/README.md](../tests/README.md), [tests/slt/README.md](../tests/slt/README.md) and
+[fuzz/regressions/README.md](../fuzz/regressions/README.md).
 
 ## Test layers
 
-The harness grows in layers. Today only the base of the pyramid exists; the rest lands in the test-harness PR and
-the data-test PR.
+| Layer | Where | What it checks | Status |
+| --- | --- | --- | --- |
+| Unit tests (GoogleTest) | `src/<module>/tests/` | one module in isolation: lexer, parser, unparser, binder, types, Parquet table, operators, formatter, CLI | in use |
+| Integration tests | `tests/integration/` | `engine::Session` end to end; corrupt, missing and mismatched Parquet inputs; globs | in use |
+| SQL logic tests | `tests/slt/cases/` | `.slt` files with expected results written by DuckDB, run against antb1 | in use |
+| Oracle tests | `tests/slt/cases/` | the same `.slt` files run against DuckDB, so every expectation stays DuckDB's answer | in use |
+| Random differential tests | `tests/slt/runner/` | seeded generated queries, antb1 against DuckDB | in use |
+| Metamorphic tests | `tests/metamorphic/` | relations between answers: split files, path vs name, batch sizes, predicate partitions | in use |
+| CLI golden tests | `tests/cli/` | stdout, stderr and exit code of the `antb1` binary, including EXPLAIN output | in use |
+| Harness self-tests | `tests/harness/`, `tests/slt/`, `tests/cli/`, `fuzz/`, `tools/fixturegen/` | a deliberately wrong engine is caught, redaction leaks nothing, fixtures match their digest | in use |
+| Fuzzing | `fuzz/` | parser round trip `Parse(ToSql(ast)) == ast`, idempotent unparser, no crash or UB | in use |
+| Coverage floors | `tools/ci/` | line and branch coverage of each module never drops below its floor | in use |
+| ClickBench data tests | – | antb1 against DuckDB on `hits` data, with redacted output | planned |
+| Benchmark smoke tests | – | micro benchmarks run once to prove they work | planned |
 
-| Layer | What it checks | Status |
-| --- | --- | --- |
-| Unit tests (GoogleTest) | one module in isolation: lexer, parser, unparser, binder, types, Parquet table, operators, formatter, CLI | in use |
-| Integration tests | several modules together, including corrupt, missing and mismatched Parquet inputs | planned |
-| SQL logic tests | `.slt` files with expected results written by DuckDB, run against antb1 | planned |
-| Oracle and random differential tests | antb1 against DuckDB on the same files, for fixed and seeded random queries | planned |
-| Metamorphic tests | invariants such as predicate partitioning, split-file and batch-size invariance | planned |
-| Harness self-tests | a deliberately wrong engine must be caught by the comparator and redaction | planned |
-| Fuzzing | parser round trip `Parse(ToSql(ast)) == ast`, no crash or UB | planned |
-| ClickBench data tests | antb1 against DuckDB on `hits` data, with redacted output | planned |
-
-Build-level gates run on every PR as well: ASan and UBSan (`pixi run asan`), clang-tidy (`pixi run tidy`) and the
-GCC 15 compatibility build (`pixi run ci-gcc`). Coverage floors are added later.
+Build-level gates run on every PR as well: ASan and UBSan (`pixi run asan`), clang-tidy (`pixi run tidy`), the
+coverage floors (`pixi run coverage`), a libFuzzer smoke run (`pixi run fuzz-smoke`) and the GCC 15 compatibility
+build (`pixi run ci-gcc`). ThreadSanitizer (`pixi run tsan`), shuffled test order (`pixi run ci-shuffle`) and long
+fuzzing (`pixi run fuzz`) are deep checks outside the PR gates; the nightly workflow that runs them arrives in a
+later PR.
 
 ## Labels
 
@@ -32,30 +38,38 @@ table must match it (`pixi run lint` compares them).
 | Label | Status | Meaning |
 | --- | --- | --- |
 | `unit` | in use | module unit tests in `src/<module>/tests/*_test.cc`, named `<module>.<Suite>.<Case>` |
-| `integration` | reserved | cross-module gtest suites, including invalid Parquet inputs |
-| `slt` | reserved | sqllogictest files run against antb1, plus EXPLAIN snapshots |
-| `oracle` | reserved | the same `.slt` files checked against DuckDB |
-| `diff` | reserved | seeded random differential queries against DuckDB |
-| `metamorphic` | reserved | metamorphic relations on generated fixtures |
-| `cli` | reserved | golden tests of the `antb1` command line (output formats, errors, exit codes) |
-| `harness` | reserved | self-tests of the harness (mutated engines, fixture digest, redaction canary) |
-| `fuzz-replay` | reserved | replay of the fuzz corpus and regressions as ordinary tests, on every leg |
-| `fuzz` | reserved | short libFuzzer run with a fixed seed (Clang only; excluded from hermetic runs) |
+| `integration` | in use | cross-module gtest suites in `tests/integration/` (`integration.*`), including invalid Parquet inputs |
+| `slt` | in use | sqllogictest files run against antb1 (`slt.<area>.<file>`) |
+| `oracle` | in use | the same `.slt` files checked against DuckDB (`oracle.<area>.<file>`) |
+| `diff` | in use | `diff.random`: seeded random differential queries against DuckDB (fixed seed, 300 queries) |
+| `metamorphic` | in use | metamorphic relations on the generated fixtures (`metamorphic.*`) |
+| `cli` | in use | golden tests of the `antb1` command line (`cli.<case>`): output formats, errors, exit codes, EXPLAIN |
+| `harness` | in use | self-tests of the harness (`harness.*`): mutated engines, redaction canaries, fixture digest, runner unit tests |
+| `fuzz-replay` | in use | `fuzz.replay.sql_parser`: the fuzz corpus and regressions replayed as an ordinary test, on every leg |
+| `fuzz` | in use | `fuzz.sql_parser.smoke`: a short libFuzzer run with a fixed seed (Clang `fuzz` preset only) |
+| `setup` | in use | `fixtures.generate`: writes the Parquet fixtures before any test that needs them |
 | `bench-smoke` | reserved | micro benchmarks run once to prove they work (numbers never gate) |
 | `data` | reserved | ClickBench data tests (network download, redacted; excluded from hermetic runs) |
-| `setup` | reserved | fixture generation that other tests depend on |
 
-The hermetic test presets (`dev`, `ci`, `ci-asan`, `ci-release`, `ci-gcc`) exclude the `data` and `fuzz` labels.
+The hermetic test presets (`dev`, `ci`, `ci-asan`, `ci-release`, `ci-gcc`, `coverage`, `tsan`, `ci-shuffle`) exclude
+the `data` and `fuzz` labels. The `fuzz` test preset runs only `fuzz` and `fuzz-replay`.
 
 ## Running tests
 
 - `pixi run test` builds the `dev` preset and runs its hermetic tests. It accepts these ctest arguments, and only
   these: `-R`, `-E`, `-L`, `-j`, `-N`, `-V`, `-VV`, `--rerun-failed`, `--output-on-failure`, `--timeout`, `--repeat`,
   `--schedule-random`, `--stop-on-failure` (`scripts/ctest.sh` rejects everything else).
-- Examples: `pixi run test -R '^sql\.'` (one module), `pixi run test -R '^cli\.CliTest\.JsonErrorObject$' -V` (one
-  test), `pixi run test --rerun-failed`, `pixi run test -R '^io\.' --repeat until-fail:20` (hunt a flaky test).
+- Examples: `pixi run test -R '^sql\.'` (one module), `pixi run test -L slt` (one label),
+  `pixi run test -L '^(slt|oracle)$'` (two labels; repeated `-L` options must all match),
+  `pixi run test -R '^cli\.CliTest\.JsonErrorObject$' -V` (one test), `pixi run test --rerun-failed`,
+  `pixi run test -R '^io\.' --repeat until-fail:20` (hunt a flaky test).
+- A filtered run still generates the fixtures first: every test that reads them requires the ctest fixture that
+  `fixtures.generate` sets up.
 - `pixi run ci`, `pixi run asan`, `pixi run ci-gcc` and `pixi run release` run the same tests in the CI
   configurations. Each writes JUnit XML to `build/<preset>/junit.xml`.
+- `pixi run tsan` runs the hermetic tests under ThreadSanitizer (`build/tsan`); `pixi run ci-shuffle` runs the tests
+  of the `ci` build in random order, each repeated until it fails (at most twice), and writes
+  `build/ci/junit-shuffle.xml`.
 
 ## Hermetic rules
 
@@ -63,24 +77,177 @@ Every test except those labeled `data` must be hermetic:
 
 - no network, no dependence on the machine (absolute paths, user, locale, time zone, wall-clock time) and no sleeps;
 - files are written only under `::testing::TempDir()`, in a directory unique to the test, because ctest runs up to
-  8 tests in parallel;
-- test data is generated by the test itself (for example with `parquet::arrow::WriteTable`); nothing is downloaded;
-- randomness uses fixed, printed seeds; the engine runs single-threaded;
+  8 tests in parallel. The one exception is the shared Parquet fixtures, which `fixtures.generate` writes to
+  `build/<preset>/fixtures` (see [Fixtures](#fixtures)); every other test only reads them;
+- test data is generated by the test itself or by our fixture generator; nothing is downloaded;
+- queries, tables and values are our own, never ClickBench data or query text;
+- randomness uses fixed, printed seeds; the engine and DuckDB run single-threaded;
 - the test presets set `OMP_NUM_THREADS=1`, `ARROW_IO_THREADS=2`, `LC_ALL=C`, `TZ=UTC` and `GTEST_COLOR=no`, and each
   gtest case has a 120-second timeout.
 
-The sanitizer preset (`pixi run asan`) additionally uses `ARROW_DEFAULT_MEMORY_POOL=system`, aborts on the first ASan
-error and runs UBSan in recoverable mode with `halt_on_error=1`, so every finding still fails the test while the
-suppression files in `tools/sanitizers/` can work. The suppression files start empty; every entry needs a comment
-that justifies it and a maintainer's agreement.
+The sanitizer presets (`pixi run asan`, `pixi run fuzz-smoke`) additionally use `ARROW_DEFAULT_MEMORY_POOL=system`,
+abort on the first ASan error and run UBSan in recoverable mode with `halt_on_error=1`, so every finding still fails
+the test while the suppression files in `tools/sanitizers/` can work. The suppression files start empty; every entry
+needs a comment that justifies it and a maintainer's agreement.
+
+## Fixtures
+
+`tools/fixturegen` (`antb1-fixturegen`) writes deterministic Parquet files with a hits-shaped schema and synthetic
+values: `hits_like.parquet` (10,000 rows in 4 row groups), `hits_like_nulls.parquet` (the same rows with NULLs),
+`hits_like_split/part-0.parquet` to `part-3.parquet` (the same rows in 4 files), `hits_like_required.parquet`
+(REQUIRED columns and UTF8 strings), `edge.parquet` (type extremes, escapes, empty strings, NULLs) and
+`empty.parquet` (0 rows). The ctest `fixtures.generate` (label `setup`) writes them to `build/<preset>/fixtures`.
+Values come from splitmix64 with integer-only arithmetic (no `<random>` distributions, no libm, no NaN), so every
+platform generates the same data.
+
+`harness.fixtures.digest` compares the generated files with `tests/fixtures/fixtures.digest`, a logical digest
+(schema, row groups and values; not compression or page layout), on every leg, macOS included. After an intended
+change of the generator, run the tests once (they regenerate the fixtures, and the digest test fails), rewrite the
+digest, regenerate the `.slt` expectations and the CLI goldens, and review every diff:
+
+```bash
+pixi run test   # regenerates build/dev/fixtures; harness.fixtures.digest fails
+build/dev/bin/antb1-fixture-digest --write tests/fixtures/fixtures.digest build/dev/fixtures
+pixi run slt-complete
+ANTB1_UPDATE_GOLDENS=1 pixi run test -L cli
+```
+
+## SQL logic tests
+
+SQL behavior is tested with sqllogictest files in `tests/slt/cases/<area>/<file>.slt`, run by `antb1-slt`. Each file
+becomes two ctest tests: `slt.<area>.<file>` checks antb1 and `oracle.<area>.<file>` checks DuckDB against the same
+expectations. The file format, the tables (`tests/slt/tables.txt`) and the DuckDB lockdown are described in
+[tests/slt/README.md](../tests/slt/README.md).
+
+Workflow for new or changed SQL:
+
+1. Add `statement ok`, `statement error` or `query <types> [nosort|rowsort|valuesort]` records to a file under
+   `tests/slt/cases/`. Write only the SQL and leave out the expected block. A new file is picked up by the next build.
+2. Run `pixi run slt-complete`. It regenerates the fixtures, runs every record on DuckDB and rewrites the expected
+   blocks (and wrong column-type letters, printed as `NOTE`) of every registered `.slt` file. `ERROR` lines are
+   records that could not be completed; `REVIEW` lines are `onlyif antb1` records, completed from antb1, which you
+   must check by hand.
+3. Review `git diff tests/slt`: only the records you meant to change may differ. Never edit an expected block by
+   hand.
+4. Run `pixi run test -L '^(slt|oracle)$'`.
+
+An antb1 `Unsupported` answer always fails, also for `statement error`. A record for SQL that antb1 does not support
+yet carries `onlyif duckdb`; the PR that implements the feature removes the guard and declares the feature in
+`tests/slt/supported_features.h`, which also activates its random differential queries and metamorphic relations.
+`onlyif antb1` is for antb1's own error texts and for registered divergences
+([sql-subset.md](sql-subset.md#divergences-from-duckdb)).
+
+## Random differential tests
+
+`antb1-slt diff` generates queries over the tables of `tests/slt/tables.txt`, runs each on antb1 and on DuckDB and
+compares the results and the exact column types. Query `i` of seed `s` depends only on `s`, `i`, the tables and the
+supported features, so a single case reproduces on its own.
+
+- ctest `diff.random` (label `diff`) runs 300 queries with a fixed seed on every leg.
+- `pixi run diff-random` runs 2000 queries with a random seed, printed first. `ANTB1_DIFF_SEED` and
+  `ANTB1_DIFF_COUNT` set the seed and the count. Extra arguments go to `antb1-slt diff`: `--list` prints the queries
+  without running them, `--table NAME` restricts the tables, `--target-percent P` sets the share of queries that
+  sample the full target grammar.
+- Most queries use only the features declared in `tests/slt/supported_features.h`; for them an antb1 `Unsupported`
+  answer is a failure. The rest sample the whole target grammar of [sql-subset.md](sql-subset.md#target-grammar):
+  there an `Unsupported` answer is counted per missing feature and reported, not a failure.
+- A failure prints the seed, the case index, the features, the SQL, at most 5 differing rows and the command that
+  reproduces the case:
+
+```bash
+ANTB1_DIFF_SEED=<seed> ANTB1_DIFF_ONLY=<case> pixi run diff-random
+ANTB1_DIFF_SEED=7 ANTB1_DIFF_COUNT=20000 pixi run diff-random   # a longer run
+```
+
+The reproduction holds while `tests/slt/supported_features.h`, the generator and the tables are unchanged. Once
+the bug is fixed, add the query to an `.slt` file (with `pixi run slt-complete`) so that it stays covered.
+
+## Metamorphic tests
+
+`tests/metamorphic/` checks relations between antb1 answers that must hold whatever the data: `COUNT(*)` of a split
+table equals the sum over its parts, a path reference equals the registered table, and batch sizes 1, 7 and 65536
+give the same answers. A relation whose features are not all declared in `tests/slt/supported_features.h` is
+pending: it is reported as skipped with the missing features, and once antb1 answers all its queries it fails until
+the features are declared. Details: [tests/README.md](../tests/README.md#metamorphic-relations-metamorphic).
+
+## CLI goldens
+
+`tests/cli/` runs the `antb1` binary and compares its exit code, stdout and (where registered) stderr with the files
+in `tests/cli/golden/`; fixture and source paths are normalized to `${FIXTURES}` and `${SOURCE}`. After an intended
+change of the output, rewrite the golden files and review the diff:
+
+```bash
+ANTB1_UPDATE_GOLDENS=1 pixi run test -L cli
+```
+
+Exit codes are never rewritten: change `EXIT_CODE` in `tests/cli/CMakeLists.txt` deliberately.
+
+## Harness self-tests
+
+The `harness` label proves that the harness catches failures: every corruption of antb1's answers (`--mutate`) must
+make the slt runner and the differential test fail; `--redact` output never contains SQL, values or error messages
+(the canaries in `tests/slt/canary/`); the golden comparison catches changed output and exit codes; the fuzz replay
+catches a broken unparser; the fixtures match their digest. A change to the harness comes with a self-test that
+fails without it.
+
+## Coverage
+
+`pixi run coverage` (CI job `clang-coverage-fuzz`) builds the `coverage` preset (Clang source-based coverage, Debug,
+`build/coverage`), runs every hermetic test and then `tools/ci/coverage.py`, which:
+
+- merges the profiles from `build/coverage/prof/` and runs `llvm-cov` over the binaries in `build/coverage/bin`;
+- counts only the code in `src/<module>/`: tests (`src/<module>/tests/` too), `fuzz/`, `bench/`, `tools/` and build
+  trees do not count;
+- writes `build/coverage/summary.md` (a per-module table, also used as the CI job summary and the PR comment),
+  `build/coverage/report.txt` (per file) and `build/coverage/coverage.lcov` (for editors);
+- fails when a module's line or branch coverage is below its floor in `tools/ci/coverage_thresholds.json`, or when a
+  module has no floor. A module without branches (or lines) is N/A for that floor.
+
+Floors only go up. Each floor is the measured value minus 2, rounded down to 0.1. A PR that raises a module's
+coverage may raise its floors; a slice PR that extends a module sets its floors again from the new measurement.
+Changing the thresholds file needs a maintainer's approval (AGENTS.md, "Ask a human first"). The long-term targets:
+
+| Modules | Lines | Branches |
+| --- | --- | --- |
+| `common`, `sql`, `plan` | 90% | 75% |
+| `io`, `exec`, `engine` | 85% | 70% |
+| `cli` | 60% | 40% |
+
+When the gate fails, `build/coverage/summary.md` names the module and the metric, and `build/coverage/report.txt`
+shows the files. Add tests for the uncovered code instead of lowering a floor.
+
+## Fuzzing
+
+The fuzz target `antb1-sql-parser-fuzzer` checks the property in `fuzz/sql_parser_property.h` for every input: the
+parser neither crashes nor triggers UB, and for every accepted query `Parse(ToSql(ast))` equals `ast` and `ToSql`
+is idempotent. The seeds in `fuzz/corpus/sql_parser/` and the dictionary `fuzz/sql.dict` are our own.
+
+| Run | Command | What it does |
+| --- | --- | --- |
+| Replay | `pixi run test` (every leg, GCC too) | `fuzz.replay.sql_parser` runs the seeds and `fuzz/regressions/` through the property, without libFuzzer |
+| Smoke | `pixi run fuzz-smoke` (CI `clang-coverage-fuzz`) | the `fuzz` preset (Clang, ASan and UBSan, RelWithDebInfo, `-Werror`, only `common`, `sql` and `fuzz/`) runs `fuzz.sql_parser.smoke` (libFuzzer `-seed=1 -runs=200000`, deterministic) and the replay |
+| Long | `pixi run fuzz` | libFuzzer for `ANTB1_FUZZ_SECONDS` (default 600) with `ANTB1_FUZZ_SEED` (default random, printed); extra arguments go to libFuzzer, e.g. `-jobs=8 -workers=8` |
+
+The long run keeps its work corpus in `build/fuzz/corpus/sql_parser` between runs and never modifies the committed
+seeds. Crash, leak and timeout inputs are written to `build/fuzz/artifacts/`; in CI a failed smoke run uploads them
+as the `fuzz-artifacts` artifact for 14 days.
+
+### Fuzz regressions
+
+Every fuzzer finding becomes a regression test. Reproduce the saved input with the fuzzer binary
+(`build/fuzz/bin/antb1-sql-parser-fuzzer`), minimize it, copy it as raw bytes to `fuzz/regressions/` under a name
+like `<what-broke>[-<issue>]`, fix the bug and check the replay with `pixi run test -R fuzz.replay`. Commit the input
+together with the fix. The exact commands are in [fuzz/regressions/README.md](../fuzz/regressions/README.md).
 
 ## Writing tests
 
 - Put unit tests in `src/<module>/tests/<topic>_test.cc` and add the file to `antb1_add_module_tests(...)` in
   that module's `CMakeLists.txt`. Extra libraries go under `LIBS`: modules reachable through the allow-list (for
-  example `antb1::plan` in the `cli` tests) and libraries that build fixtures (for example `Parquet::parquet_shared`).
+  example `antb1::plan` in the `cli` tests) and libraries that build test data (for example `Parquet::parquet_shared`).
   Tests of `common` and `sql` stay Arrow-free.
-- Cross-module suites are registered in `tests/CMakeLists.txt` with `antb1_add_gtest(... LABEL <label> ...)`.
+- Cross-module suites are registered in `tests/CMakeLists.txt` with `antb1_add_gtest(... LABEL <label> ...)`, or with
+  `antb1_add_fixture_gtest(...)` when they read the fixtures (`cmake/Antb1Testing.cmake`).
+- SQL behavior goes into `.slt` files ([SQL logic tests](#sql-logic-tests)); command-line behavior into CLI goldens.
 - A bug fix comes with a test that fails without the fix.
 - Test the error path too: the error kind, the source span and, for the CLI, the exit code.
 - Never use ClickBench-derived data or query text in a test.
@@ -95,21 +262,22 @@ ANTB1-TESTS: FAIL preset=dev junit=build/dev/junit.xml
 ```
 
 The last line is always `ANTB1-TESTS: PASS ...` or `ANTB1-TESTS: FAIL ...`, which is easy for humans and agents to
-check. In CI, failing tests appear as annotations on the PR and in the job summary (from the JUnit file), and the
-ctest logs are uploaded as the `logs-<job>` artifact for 7 days.
+check. A failing `.slt` record prints the file and line, the SQL, the expected and actual blocks and a repro command;
+a failing differential case prints its seed and case index. In CI, failing tests appear as annotations on the PR and
+in the job summary (from the JUnit file), and the ctest logs are uploaded as the `logs-<job>` artifact for 7 days.
 
 ## Reproducing CI
 
 Every CI job name contains the command that reproduces it, for example `clang-asan (pixi run asan)`.
-[ci.md](ci.md) has the full map. `pixi run check-full` runs every Linux PR gate locally (lint, Clang Debug,
-ASan/UBSan, clang-tidy and the GCC leg).
+[ci.md](ci.md) has the full map. `pixi run check-full` runs every Linux PR gate locally: `check` (lint and the Clang
+Debug build with tests), `asan`, `tidy`, `coverage`, `fuzz-smoke` and `ci-gcc`.
 
 ## Data policy
 
 Nothing derived from ClickBench is ever committed: no Parquet files or samples, no query text and no result values.
 No file larger than 1 MiB is committed either. `pixi run lint` rejects data files (`*.parquet`, `*.arrow`,
 `*.feather`, `*.csv.gz`, `queries.sql`) and any other file over 1 MiB except `pixi.lock`; authors and reviewers
-check the rest. Tests generate their own data; the data tests (added in a later PR) download the pinned `hits`
-partition into a cache outside the repository, redact their output (query numbers, column names, row counts and
-hashes only) and never upload data as CI artifacts. The full policy is
+check the rest. Fixtures, `.slt` queries, golden files and fuzz seeds are our own. The data tests (added in a later
+PR) download the pinned `hits` partition into a cache outside the repository, redact their output (query numbers,
+column names, row counts and hashes only) and never upload data as CI artifacts. The full policy is
 [ADR 0006](adr/0006-test-strategy-and-data-policy.md).

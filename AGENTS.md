@@ -1,11 +1,9 @@
 # AGENTS.md: antb1
-
 antb1 is an experimental C++23 analytics engine: SQL-like queries over local Parquet files, built on Apache Arrow C++
 25 (conda-forge). Namespace `antb1`, CLI `antb1`. Today it answers `SELECT COUNT(*) FROM t` (ClickBench Q0) from Parquet
 footers; the slice target is global aggregates, `WHERE col <op> literal [AND ...]`, projection and `LIMIT`. This file
 is the canonical guide for every agent. Maps: [architecture](docs/architecture.md) · [SQL subset](docs/sql-subset.md)
 · [testing](docs/testing.md) · [CI](docs/ci.md) · [ADRs](docs/adr/README.md) · [contributing](CONTRIBUTING.md).
-
 ## Golden rules
 
 1. Only use `pixi run <task>` from the table below. Never call host compilers, `cmake` or `ctest` directly (only the
@@ -19,7 +17,7 @@ is the canonical guide for every agent. Maps: [architecture](docs/architecture.m
 5. Respect module boundaries (`cmake/Antb1Modules.cmake`): `common` and `sql` never include Arrow, `exec` never uses
    `io`. A new edge needs an ADR.
 6. Never weaken a gate to get green: no disabled or skipped tests, silenced warnings, sanitizer or clang-tidy
-   exclusions, or bare `NOLINT`.
+   exclusions, bare `NOLINT`, lowered coverage floors or hand-edited `.slt` expectations.
 
 ## Setup
 
@@ -27,38 +25,37 @@ is the canonical guide for every agent. Maps: [architecture](docs/architecture.m
   (add `--envs "default lint gcc"` for the GCC leg); put `pixi` on `PATH`, then run `pixi run doctor`. macOS (Apple
   silicon): install pixi 0.81.0 or newer from <https://pixi.prefix.dev>. Installed environments work offline.
 - Environments: `default` (Clang 23 with libstdc++ 15 on Linux and libc++ on macOS, Arrow 25, CLI11, GoogleTest,
-  DuckDB for tests), `gcc` (GCC 15, linux-64 only: `ci-gcc`, `codeql-build`; also needed by `check-full`), `lint`
-  (`lint`, `fmt`, `install-git-hooks`).
+  DuckDB for tests), `gcc` (GCC 15, linux-64 only: `ci-gcc`, `codeql-build`, part of `check-full`), `lint` (linters).
 
 ## Commands
 
 | Goal | Command |
 | --- | --- |
-| Configure / incremental Debug build (`build/<preset>`, preset `dev`) | `pixi run configure` · `pixi run build` |
-| Hermetic tests (allowlisted ctest args) | `pixi run test` · `pixi run test -R '^sql\.'` · `pixi run test --rerun-failed` |
-| Run the dev CLI | `pixi run antb1 query -c "SELECT COUNT(*) FROM t" --table t=/data/t.parquet` |
+| Configure / incremental Debug build (`build/<preset>`, preset `dev`); run the dev CLI | `pixi run configure` · `pixi run build` · `pixi run antb1 query -c "SELECT COUNT(*) FROM t" --table t=/data/t.parquet` |
+| Hermetic tests (allowlisted ctest args) | `pixi run test` · `pixi run test -R '^sql\.'` · `pixi run test -L slt` · `pixi run test --rerun-failed` |
 | Format everything in place; lint and repo drift checks (read-only; CI `lint`) | `pixi run fmt` · `pixi run lint` |
 | Required before every PR: `lint` + `ci` (Clang Debug `-Werror` + tests) | `pixi run check` |
-| All Linux PR gates: `check` + `asan` + `tidy` + `ci-gcc` | `pixi run check-full` |
-| Single legs; CodeQL traced build (GCC, no tests) | `pixi run ci` · `pixi run asan` · `pixi run ci-gcc` · `pixi run release` · `pixi run tidy` · `pixi run codeql-build` |
+| All Linux PR gates: `check` + `asan` + `tidy` + `coverage` + `fuzz-smoke` + `ci-gcc` | `pixi run check-full` |
+| Single legs (coverage floors: `tools/ci/coverage_thresholds.json`); CodeQL traced build (GCC, no tests) | `pixi run ci` · `pixi run asan` · `pixi run ci-gcc` · `pixi run release` · `pixi run tidy` · `pixi run coverage` · `pixi run fuzz-smoke` · `pixi run codeql-build` |
+| Rewrite `.slt` expectations from DuckDB (then review the diff); random differential test vs DuckDB, and its repro | `pixi run slt-complete` · `pixi run diff-random` · `ANTB1_DIFF_SEED=<s> ANTB1_DIFF_ONLY=<case> pixi run diff-random` |
+| Deep checks, not PR gates: long fuzzing (`ANTB1_FUZZ_SECONDS`), ThreadSanitizer, random test order | `pixi run fuzz` · `pixi run tsan` · `pixi run ci-shuffle` |
 | Environment status; delete build trees; optional git hook (lint on staged files) | `pixi run doctor` · `pixi run doctor --json` · `pixi run clean` · `pixi run install-git-hooks` |
 
 Every CI job name contains the command that reproduces it (docs/ci.md). SQL containing single quotes must go through
 `-f file.sql` or `-c -` (stdin): pixi does not escape quotes in forwarded arguments.
-
 ## Repository map
 
 - `src/<module>/include/antb1/<module>/*.h` public API, `src/<module>/*.cc`, `src/<module>/tests/*_test.cc` tests.
   Modules: `common` → `sql` → `plan` → {`io`, `exec`} → `engine` → `cli`; allow-list in `cmake/Antb1Modules.cmake`.
-- `cmake/` build logic · `CMakePresets.json` · `tests/` cross-module suites · `scripts/` task entry points
-  (`scripts/ctest.sh` allowlists ctest args) · `tools/lint/check_repo.py` drift checks · `tools/github/` settings as
-  code · `tools/sanitizers/` suppressions · `docs/`, `docs/adr/` · `.github/` workflows, templates, CODEOWNERS.
+- `cmake/` build logic · `CMakePresets.json` · `tests/` cross-module suites and harness · `tools/fixturegen/` fixtures
+  · `fuzz/` parser fuzzer · `scripts/` task entry points (`scripts/ctest.sh` allowlists ctest args) ·
+  `tools/lint/check_repo.py` drift checks · `tools/ci/coverage.py` coverage gate · `tools/github/` settings as code ·
+  `tools/sanitizers/` suppressions · `docs/`, `docs/adr/` · `.github/` workflows, templates, CODEOWNERS.
 
 ## C++ conventions
 
-- C++23 without compiler extensions. Clang 23 is the primary compiler (dev, tests, ASan/UBSan, clang-tidy) on Linux
-  and macOS; GCC 15 runs a compatibility leg with GCC-only warnings. Code must build warning-free with both, against
-  libstdc++ 15 (Linux) and libc++ (macOS).
+- C++23 without compiler extensions. Clang 23 is the primary compiler on Linux and macOS; GCC 15 runs a compatibility
+  leg with GCC-only warnings. Code must build warning-free with both, on libstdc++ 15 (Linux) and libc++ (macOS).
 - Style = `.clang-format` (Google-based, 100 columns). Naming (`.clang-tidy`): types and functions `CamelCase` (cheap
   accessors may be `snake_case`), variables `snake_case`, private members `name_`, constants and enumerators `kName`,
   namespaces `antb1::<module>`.
@@ -80,11 +77,17 @@ Every CI job name contains the command that reproduces it (docs/ci.md). SQL cont
 
 ## Testing
 
-- Unit tests live in `src/<module>/tests/*_test.cc`, registered with `antb1_add_module_tests` in the module's
-  `CMakeLists.txt`; names are `<module>.<Suite>.<Case>`, label `unit`. Labels: `cmake/Antb1Testing.cmake` and
-  docs/testing.md. Only `unit` is used today; SQL logic, oracle, fuzz and data suites arrive in later PRs.
-- Hermetic: no network, fixed seeds, no sleeps or wall-clock dependence, no absolute paths. Tests write only under
-  `::testing::TempDir()` and build their own Parquet files. The test presets pin `LC_ALL=C`, `TZ=UTC` and threads.
+- Unit tests live in `src/<module>/tests/*_test.cc` (`antb1_add_module_tests`, named `<module>.<Suite>.<Case>`, label
+  `unit`); cross-module suites and the harness live in `tests/` ([tests/README.md](tests/README.md)). Labels in use:
+  `unit` `integration` `slt` `oracle` `diff` `metamorphic` `cli` `harness` `fuzz-replay` `setup` (hermetic) and `fuzz`
+  (`pixi run fuzz-smoke` only); `data` and `bench-smoke` are reserved. Details: docs/testing.md.
+- SQL behavior goes into `tests/slt/cases/<area>/*.slt`: write the SQL, let `pixi run slt-complete` write the expected
+  blocks from DuckDB, review the diff. Declare a newly answered feature in `tests/slt/supported_features.h`.
+- Hermetic: no network, fixed seeds, no sleeps or wall-clock dependence, no absolute paths, only our own tables and
+  queries. Tests write only under `::testing::TempDir()`; the one exception is `fixtures.generate`, which writes the
+  shared Parquet fixtures to `build/<preset>/fixtures` (read-only for all other tests). Presets pin locale, TZ, threads.
+- After an intended CLI output change run `ANTB1_UPDATE_GOLDENS=1 pixi run test -L cli` and review the diff. A fuzzer
+  crash: commit its minimized input to `fuzz/regressions/` with the fix (`fuzz/regressions/README.md`).
 - `pixi run test` ends with `ANTB1-TESTS: PASS` or `ANTB1-TESTS: FAIL` and prints a repro command on failure. A crash,
   UB or leak found by `pixi run asan` is a bug to fix, not to suppress.
 
@@ -92,14 +95,12 @@ Every CI job name contains the command that reproduces it (docs/ci.md). SQL cont
 
 - Branch `<type>/<slug>`. The PR title is a Conventional Commit with a lowercase subject, e.g.
   `feat(sql): add IN lists`; types: feat fix perf refactor test docs build ci chore revert. PRs are squash-merged.
-- Fill in `.github/pull_request_template.md`: exact verification commands with results, and the AI-assistance
-  disclosure. One logical change per PR. Same-PR docs: docs/sql-subset.md for SQL changes, the command table above
-  for tasks, an ADR for architecture.
+- Fill in `.github/pull_request_template.md`: exact verification commands with results, AI-assistance disclosure.
+  One logical change per PR. Same-PR docs: docs/sql-subset.md (SQL), the command table (tasks), an ADR (architecture).
 - Merging needs green `CI OK` and `PR title` checks, 1 human approval and every review thread resolved. The branch
   does not need to be up to date with main (update it only on conflicts). AI reviews are advisory and never approve.
 
 ## Ask a human first
-
 Do not change these paths without a maintainer's approval (CODEOWNERS covers the same set); describe the change you need
 instead: `/.github/`, `/.githooks/`, `/.claude/`, `/.agents/`, `/AGENTS.md`, `/CLAUDE.md`, `/pixi.toml`,
 `/CMakePresets.json`, `/cmake/`, `/tools/github/`, `/tools/lint/`, `/tools/data/`, `/tools/sanitizers/`,
@@ -108,13 +109,10 @@ instead: `/.github/`, `/.githooks/`, `/.claude/`, `/.agents/`, `/AGENTS.md`, `/C
 `/scripts/ctest.sh`, `/scripts/lint.sh`, `/scripts/fmt.sh`, `/scripts/agent-setup.sh`,
 `/tests/data/clickbench_status.json`. Also ask before ADR status changes, `pixi.lock` updates, and anything that adds
 network access or threads to tests.
-
 ## Code Review Rules
-
 Report only concrete, high-confidence problems with a failure scenario: `file:line`, what breaks, how to fix it.
 Never approve. Skip formatting and lint findings (CI enforces them). Priorities: P0 wrong results, UB, security;
 P1 missing tests, boundary violations; P2 performance. Never quote ClickBench data values.
-
 ### Correctness
 
 - Unchecked `arrow::Status`/`Result`, `ValueOrDie()`/`ValueUnsafe()` outside tests, ignored `std::expected` errors.

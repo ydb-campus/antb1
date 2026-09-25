@@ -30,7 +30,7 @@ pixi run antb1 explain -c "SELECT COUNT(*) FROM hits" --table hits=/data/clickbe
 ```
 
 Globs are allowed in the file-name part of a path only (`/data/hits_*.parquet`, not `/data/*/hits.parquet`) and
-expand to a sorted file list. All files of a table must have the same schema.
+expand to a sorted file list. All files of a table must have the same schema (divergence D1 below).
 
 ## Target grammar
 
@@ -89,7 +89,8 @@ the subset, such as `SELECT COUNT(*) FORM t`, is a syntax error with exit code 1
 
 `--column-type COL=DATE` reinterprets a USMALLINT or INTEGER column as days since 1970-01-01; `--clickbench` is a
 shortcut for `EventDate`. Both apply to every table (registered or opened with `FROM 'path'`) that has a column with
-exactly that name; for now `COL` is matched case-sensitively, and tables without the column are left unchanged.
+exactly that name; for now `COL` is matched case-sensitively, and tables without the column are left unchanged. The
+test oracle handles `FROM 'path'` differently (divergence D2 below).
 
 ## Semantics
 
@@ -163,7 +164,8 @@ compare against DuckDB, so an unregistered difference is a bug.
 
 | ID | Area | antb1 | DuckDB | How tests handle it |
 | --- | --- | --- | --- | --- |
-| – | – | none registered yet | – | – |
+| D1 | Files with different schemas | a table (or a `FROM '<glob>'`) whose files have different Parquet schemas is an I/O error, exit code 3: `schema of '<file>' differs from '<first file>'` | `read_parquet` over the same files reads them and answers | an `onlyif antb1` record in `tests/slt/cases/basic/errors.slt`; `integration.ParquetErrors.*` (mismatched and mixed schemas); the CLI golden `io_schema_mismatch`; every table in `tests/slt/tables.txt` has a single schema |
+| D2 | Column-type overrides | `--clickbench` and `--column-type COL=DATE` apply to every table with that column, including tables opened with `FROM '<path>'` | the oracle applies `make_date(EventDate)` only to the named tables with the `clickbench` option in `tests/slt/tables.txt`; `FROM '<path>'` reads the raw integers | the runner rejects a table list where some tables with an `EventDate` column have the option and others do not; the random generator never reads an overridden column through `FROM '<path>'`; `.slt` records read `EventDate` only through table names |
 
 Known candidates, to be confirmed and registered by the PR that implements the feature:
 

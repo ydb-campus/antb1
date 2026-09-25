@@ -91,8 +91,9 @@ steps (all single-threaded):
 | Name resolution or type rules | `src/plan/binder.cc`, `src/plan/types.cc` | [sql-subset.md](sql-subset.md), [ADR 0004](adr/0004-types-null-overflow-semantics.md) if semantics change |
 | A logical plan node | the variant in `src/plan/include/antb1/plan/logical_plan.h`; the compiler then points at every `std::visit` to extend (physical planner, EXPLAIN) | tests in `src/plan/tests/` and `src/exec/tests/` |
 | A physical operator | `src/exec/` | tests in `src/exec/tests/` |
+| A SQL feature antb1 now answers | the modules above | `.slt` records in `tests/slt/cases/` (`pixi run slt-complete`), the feature in `tests/slt/supported_features.h`, [sql-subset.md](sql-subset.md) |
 | A table source or file format | a new `plan::Table` implementation in `src/io/` | an ADR if it needs a new dependency |
-| A CLI flag or subcommand | `src/cli/cli.cc` | tests in `src/cli/tests/`, [sql-subset.md](sql-subset.md) |
+| A CLI flag or subcommand | `src/cli/cli.cc` | tests in `src/cli/tests/`, CLI goldens in `tests/cli/`, [sql-subset.md](sql-subset.md) |
 | An output format | `src/engine/format.cc` | tests in `src/engine/tests/` |
 | A module edge or external library | `cmake/Antb1Modules.cmake` (ask a maintainer first) | this page and a new ADR |
 | A cross-module test suite | `tests/CMakeLists.txt` | [testing.md](testing.md) |

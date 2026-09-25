@@ -35,7 +35,7 @@ environment, so `pixi run <task>` never needs `-e`; pixi installs a missing envi
 | Format C++, CMake, Python, TOML and Markdown in place | `pixi run fmt` |
 | Lint and repository drift checks (read-only) | `pixi run lint` |
 | Required before every PR | `pixi run check` |
-| Every Linux PR gate (ASan/UBSan, clang-tidy, GCC leg) | `pixi run check-full` |
+| Every Linux PR gate (ASan/UBSan, clang-tidy, coverage floors, fuzz smoke, GCC leg) | `pixi run check-full` |
 | Toolchain, build and data status | `pixi run doctor` |
 
 [docs/ci.md](docs/ci.md) maps every CI job to the local command that reproduces it, and
