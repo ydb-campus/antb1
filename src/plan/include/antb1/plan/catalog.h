@@ -35,4 +35,7 @@ class Catalog {
 
 std::string AsciiLower(std::string_view text);
 
+// Whether `name` can be written unquoted as far as its characters go: [A-Za-z_][A-Za-z0-9_]*.
+bool IsPlainIdentifier(std::string_view name);
+
 }  // namespace antb1::plan

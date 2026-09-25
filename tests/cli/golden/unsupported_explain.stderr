@@ -1,4 +1,4 @@
-antb1: unsupported error: only SELECT COUNT(*) FROM <table> is supported yet
-  at line 1, column 1
-  SELECT * FROM t LIMIT 10
-  ^^^^^^^^^^^^^^^^^^^^^^^^
+antb1: unsupported error: ORDER BY is not supported; see docs/sql-subset.md
+  at line 1, column 17
+  SELECT * FROM t ORDER BY WatchID LIMIT 10
+                  ^^^^^

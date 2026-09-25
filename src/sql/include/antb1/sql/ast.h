@@ -66,11 +66,13 @@ struct TableRef {
 };
 
 struct SelectStatement {
-  bool star = false;  // SELECT *
+  bool star = false;     // SELECT *
+  SourceSpan star_span;  // the '*' (when star)
   std::vector<SelectItem> items;
   TableRef from;
   std::vector<Comparison> where;      // conjunction (AND)
   std::optional<std::int64_t> limit;  // non-negative
+  SourceSpan limit_span;              // LIMIT and its value (when limit)
   SourceSpan span;                    // SELECT .. last token of the query (without ';')
 };
 

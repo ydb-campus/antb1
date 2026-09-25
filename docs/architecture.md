@@ -29,10 +29,14 @@ Responsibilities:
   `EqualIgnoringSpans`. Arrow-free; errors are `std::expected<T, sql::ParseError>`
   ([ADR 0008](adr/0008-parser-and-unparser.md)).
 - `plan`: logical types and their Arrow mapping, the `plan::Table` interface, the case-insensitive `Catalog`, the
-  binder, the logical plan, EXPLAIN, and the error boundary between `std::expected` and `arrow::Status` in
+  binder with exact literal folding (`binder.h`, `literal.h`), the logical plan (`logical_plan.h`), the rule
+  optimizer (`optimizer.h`), EXPLAIN, and the error boundary between `std::expected` and `arrow::Status` in
   `src/plan/include/antb1/plan/sql_status.h` ([ADR 0005](adr/0005-error-boundary.md)).
 - `io`: `io::ParquetTable`, which implements `plan::Table` over one or more Parquet files with identical schemas,
-  and glob expansion. Every Parquet exception becomes an `IOError` here.
+  and glob expansion. Its `Scan` reads the requested top-level fields file by file (one `parquet::arrow::FileReader`
+  at a time, single-threaded, mapping each field to its Parquet leaf columns) and converts the batches to the
+  engine view: UTF8 and large strings to binary without UTF-8 validation, FLOAT to DOUBLE, a USMALLINT or INTEGER
+  column read as DATE to date32. Every Parquet exception and read failure becomes an `IOError` here.
 - `exec`: pull-based, batch-at-a-time physical operators (`Operator::Open`/`Next`/`Close`), the physical planner
   and `Drain`. It scans only through `plan::Table` and never depends on `io`.
 - `engine`: `engine::Session` (owns the catalog, calls `arrow::compute::Initialize()`, runs parse, bind, plan and
@@ -70,18 +74,23 @@ steps (all single-threaded):
 3. Parse (`sql::Parse`): tokens, then a `SelectStatement` AST with spans. Syntax outside the supported subset is a
    `kUnsupported` error with the span of the offending token. The engine converts a parse error with
    `plan::ToArrowStatus` into an `arrow::Status` that carries a `SqlErrorDetail`.
-4. Bind (`plan::Bind`): table names resolve case-insensitively in the catalog (or `FROM 'path'` opens a file), the
-   statement is checked against what the engine supports, and the result is a `plan::LogicalPlan`: a tree of
-   immutable nodes in a `std::variant` plus the output columns.
-5. Physical plan (`exec::BuildPhysicalPlan`): an exhaustive `std::visit` turns each logical node into an operator.
-   Today the only node is `RowCountNode`, which becomes a `RowCountOperator` fed by the footer row counts.
-6. Drain (`exec::Drain`): `Open`, pull batches with `Next` until it returns `nullptr`, `Close`; the batches form an
+4. Bind (`plan::Bind`): table names resolve case-insensitively in the catalog (or `FROM 'path'` opens a file),
+   columns resolve against the table's schema, types are checked, and every `WHERE` literal is folded exactly into
+   its column's type ([Binding](sql-subset.md#binding)). The result is a `plan::LogicalPlan`: a tree of immutable
+   nodes in a `std::variant` (`Scan`, `Filter`, `Project`, `Aggregate`, `Limit`, `RowCount`) plus the output
+   columns.
+5. Optimize (`plan::Optimize`): projection pruning (a `Scan` reads only the fields used above it) and `COUNT(*)`
+   without `WHERE` to `RowCount`.
+6. Physical plan (`exec::BuildPhysicalPlan`): an exhaustive `std::visit` turns each logical node into an operator.
+   Today only `RowCountNode` runs, as a `RowCountOperator` fed by the footer row counts; a plan rooted at any other
+   node is valid SQL the executor cannot run yet, so it fails as unsupported (exit code 4) at that node's span.
+7. Drain (`exec::Drain`): `Open`, pull batches with `Next` until it returns `nullptr`, `Close`; the batches form an
    `arrow::Table`.
-7. Format (`engine::FormatResult`): `table`, `csv` or `json` output on stdout, built from one canonical value
+8. Format (`engine::FormatResult`): `table`, `csv` or `json` output on stdout, built from one canonical value
    formatter. With `--timing`, the elapsed seconds are the last line on stderr.
 
-`antb1 explain` stops after step 4 and prints the logical plan. Any error travels up as an `arrow::Status`, and
-`cli` maps it to an exit code (see [the SQL subset](sql-subset.md#exit-codes)).
+`antb1 explain` stops after step 5 and prints the optimized logical plan. Any error travels up as an
+`arrow::Status`, and `cli` maps it to an exit code (see [the SQL subset](sql-subset.md#exit-codes)).
 
 ## Where to add things
 
@@ -89,7 +98,8 @@ steps (all single-threaded):
 | --- | --- | --- |
 | SQL syntax | `src/sql/` (lexer, parser, AST, unparser) with tests in `src/sql/tests/` | [sql-subset.md](sql-subset.md) grammar |
 | Name resolution or type rules | `src/plan/binder.cc`, `src/plan/types.cc` | [sql-subset.md](sql-subset.md), [ADR 0004](adr/0004-types-null-overflow-semantics.md) if semantics change |
-| A logical plan node | the variant in `src/plan/include/antb1/plan/logical_plan.h`; the compiler then points at every `std::visit` to extend (physical planner, EXPLAIN) | tests in `src/plan/tests/` and `src/exec/tests/` |
+| A logical plan node | the variant in `src/plan/include/antb1/plan/logical_plan.h`; the compiler then points at every `std::visit` to extend (physical planner, optimizer, EXPLAIN) | tests in `src/plan/tests/` and `src/exec/tests/` |
+| An optimizer rule | `src/plan/optimizer.cc` | tests in `src/plan/tests/optimizer_test.cc`, an EXPLAIN golden in `tests/cli/` |
 | A physical operator | `src/exec/` | tests in `src/exec/tests/` |
 | A SQL feature antb1 now answers | the modules above | `.slt` records in `tests/slt/cases/` (`pixi run slt-complete`), the feature in `tests/slt/supported_features.h`, [sql-subset.md](sql-subset.md); when `pixi run test-data` reports a new ClickBench pass, the ratchet `tests/data/clickbench_status.json` and the status table |
 | A table source or file format | a new `plan::Table` implementation in `src/io/` | an ADR if it needs a new dependency |

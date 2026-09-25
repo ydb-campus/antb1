@@ -200,14 +200,14 @@ std::string KeywordOf(const Token& token) {
   return upper;
 }
 
-bool IsReservedWord(std::string_view keyword) {
+bool IsReservedKeyword(std::string_view keyword) {
   return !keyword.empty() && std::ranges::binary_search(kReservedWords, keyword);
 }
 
 // A token usable as a name: quoted identifier or non-reserved unquoted identifier.
 bool IsName(const Token& token) {
   return token.kind == TokenKind::kQuotedIdentifier ||
-         (token.kind == TokenKind::kIdentifier && !IsReservedWord(KeywordOf(token)));
+         (token.kind == TokenKind::kIdentifier && !IsReservedKeyword(KeywordOf(token)));
 }
 
 std::string Clip(std::string_view text) {
@@ -223,7 +223,7 @@ std::string Describe(const Token& token) {
   switch (token.kind) {
     case TokenKind::kIdentifier: {
       const std::string keyword = KeywordOf(token);
-      if (IsReservedWord(keyword)) {
+      if (IsReservedKeyword(keyword)) {
         return "keyword " + keyword;
       }
       return "identifier " + Clip(token.text);
@@ -422,12 +422,13 @@ class Parser {
       }
     }
     if (Peek().IsKeyword("LIMIT")) {
-      Take();
+      const std::size_t limit_begin = Take().span.offset;
       auto limit = ParseLimit();
       if (!limit) {
         return std::unexpected(std::move(limit.error()));
       }
       stmt.limit = *limit;
+      stmt.limit_span = SourceSpan{.offset = limit_begin, .length = last_end_ - limit_begin};
     }
     stmt.span = SourceSpan{.offset = begin, .length = last_end_ - begin};
     if (auto status = ParseEnd(!stmt.where.empty(), stmt.limit.has_value()); !status) {
@@ -445,7 +446,7 @@ class Parser {
       return Unsupported(first.span, "SELECT ALL is not supported");
     }
     if (first.kind == TokenKind::kStar) {
-      Take();
+      stmt.star_span = Take().span;
       stmt.star = true;
       const Token& next = Peek();
       if (next.kind == TokenKind::kComma) {
@@ -662,13 +663,15 @@ class Parser {
       if (auto construct = Find(kUnsupportedTypedLiterals, keyword); construct.has_value()) {
         return Unsupported(token.span, *construct);
       }
-      if (!IsReservedWord(keyword)) {  // type 'text' (INT '1') or a prefixed string (E'\n', X'00')
+      if (!IsReservedKeyword(
+              keyword)) {  // type 'text' (INT '1') or a prefixed string (E'\n', X'00')
         return Unsupported(token.span,
                            "typed literals other than DATE '...' and prefixed strings (E'...') are "
                            "not supported");
       }
     }
-    const bool function_like = !IsReservedWord(keyword) || keyword == "LEFT" || keyword == "RIGHT";
+    const bool function_like =
+        !IsReservedKeyword(keyword) || keyword == "LEFT" || keyword == "RIGHT";
     if (next.kind == TokenKind::kLeftParen && function_like) {
       if (AggregateOf(token).has_value()) {
         return Syntax(token.span, context == Context::kWhere
@@ -678,7 +681,7 @@ class Parser {
       return Unsupported(token.span, "function " + Clip(token.text) +
                                          "() is not supported (only COUNT, SUM, AVG, MIN, MAX)");
     }
-    if (IsReservedWord(keyword)) {
+    if (IsReservedKeyword(keyword)) {
       return Syntax(token.span,
                     "expected " + std::string(Expectation(context)) + ", found keyword " + keyword);
     }
@@ -764,10 +767,10 @@ class Parser {
       case TokenKind::kIdentifier:
       case TokenKind::kQuotedIdentifier: {
         const std::string keyword = KeywordOf(token);
-        if (PeekAt(1).kind == TokenKind::kLeftParen && !IsReservedWord(keyword)) {
+        if (PeekAt(1).kind == TokenKind::kLeftParen && !IsReservedKeyword(keyword)) {
           return Unsupported(token.span, "table functions are not supported");
         }
-        if (IsReservedWord(keyword)) {
+        if (IsReservedKeyword(keyword)) {
           return Syntax(token.span,
                         "expected a table name or a quoted file path, found keyword " + keyword);
         }
@@ -997,6 +1000,14 @@ class Parser {
 
 std::expected<SelectStatement, ParseError> Parse(std::string_view text) {
   return Parser(text).Run();
+}
+
+bool IsReservedWord(std::string_view word) {
+  if (word.size() > kMaxKeywordLength) {
+    return false;  // also keeps KeywordOf from copying long names
+  }
+  const Token token{.kind = TokenKind::kIdentifier, .text = std::string(word), .span = {}};
+  return IsReservedKeyword(KeywordOf(token));
 }
 
 }  // namespace antb1::sql

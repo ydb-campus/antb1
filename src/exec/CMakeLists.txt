@@ -7,5 +7,5 @@ antb1_add_module(
 )
 
 if(ANTB1_BUILD_TESTS)
-  antb1_add_module_tests(exec SOURCES tests/row_count_test.cc)
+  antb1_add_module_tests(exec SOURCES tests/row_count_test.cc tests/physical_planner_test.cc)
 endif()

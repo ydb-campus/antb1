@@ -7,5 +7,9 @@ antb1_add_module(
 )
 
 if(ANTB1_BUILD_TESTS)
-  antb1_add_module_tests(io SOURCES tests/parquet_table_test.cc tests/glob_test.cc LIBS Parquet::parquet_shared)
+  antb1_add_module_tests(
+    io
+    SOURCES tests/parquet_table_test.cc tests/parquet_scan_test.cc tests/glob_test.cc
+    LIBS Parquet::parquet_shared
+  )
 endif()

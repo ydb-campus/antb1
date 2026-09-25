@@ -1,0 +1,4 @@
+antb1: bind error: SUM needs a numeric column, but 'Title' is VARCHAR
+  at line 1, column 8
+  SELECT SUM(Title) FROM t
+         ^^^^^^^^^^

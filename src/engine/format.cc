@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
-#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -14,6 +13,8 @@
 
 #include <arrow/api.h>
 #include <arrow/util/decimal.h>
+
+#include "antb1/plan/literal.h"
 
 namespace antb1::engine {
 namespace {
@@ -28,13 +29,6 @@ std::string FormatDouble(double v) {
   std::array<char, 64> buf{};
   auto [end, ec] = std::to_chars(buf.data(), buf.data() + buf.size(), v);
   return ec == std::errc{} ? std::string(buf.data(), end) : std::format("{}", v);
-}
-
-std::string FormatDate(int32_t days) {
-  const std::chrono::sys_days d{std::chrono::days{days}};
-  const std::chrono::year_month_day ymd{d};
-  return std::format("{:04}-{:02}-{:02}", static_cast<int>(ymd.year()),
-                     static_cast<unsigned>(ymd.month()), static_cast<unsigned>(ymd.day()));
 }
 
 template <class ArrayType>
@@ -113,7 +107,7 @@ std::string FormatValue(const arrow::Array& column, int64_t row, plan::LogicalTy
       return std::to_string(Value<arrow::Int16Array>(column, row));
     case arrow::Type::INT32:
       if (type == plan::LogicalType::kDate) {
-        return FormatDate(Value<arrow::Int32Array>(column, row));
+        return plan::FormatDate(Value<arrow::Int32Array>(column, row));
       }
       return std::to_string(Value<arrow::Int32Array>(column, row));
     case arrow::Type::INT64:
@@ -129,7 +123,7 @@ std::string FormatValue(const arrow::Array& column, int64_t row, plan::LogicalTy
     case arrow::Type::DOUBLE:
       return FormatDouble(Value<arrow::DoubleArray>(column, row));
     case arrow::Type::DATE32:
-      return FormatDate(Value<arrow::Date32Array>(column, row));
+      return plan::FormatDate(Value<arrow::Date32Array>(column, row));
     case arrow::Type::BINARY:
       return std::string(static_cast<const arrow::BinaryArray&>(column).GetView(row));
     case arrow::Type::STRING:
