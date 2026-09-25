@@ -670,6 +670,21 @@ def test_r010_workflow_hardening(repo: Path) -> None:
     assert "`${{ github.event.* }}` inside `run:`" in out
 
 
+def test_r010_cache_key_without_caching(repo: Path) -> None:
+    wf = ".github/workflows/ci.yml"
+    # cache: false with the standard key: setup-pixi rejects it ("Cannot specify project cache key ...").
+    edit(
+        repo,
+        wf,
+        "cache-key: pixi-${{ hashFiles('pixi.lock') }}-",
+        "cache: false\n          cache-key: pixi-${{ hashFiles('pixi.lock') }}-",
+    )
+    assert "setup-pixi with `cache: false` must not set `cache-key`" in messages(repo, "R010")
+    # cache: false without a key is fine.
+    edit(repo, wf, "cache: false\n          cache-key: pixi-${{ hashFiles('pixi.lock') }}-", "cache: false")
+    assert "cache-key" not in messages(repo, "R010")
+
+
 def test_r010_missing_permissions_comment_and_merge_group(repo: Path) -> None:
     edit(repo, ".github/workflows/pr-title.yml", "permissions: {}\n", "")
     edit(repo, ".github/workflows/pr-title.yml", "  merge_group:\n", "")
