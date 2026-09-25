@@ -1,0 +1,51 @@
+# Copilot coding agent environment. Copilot runs the job `copilot-setup-steps` (the name is fixed by GitHub) before
+# each task, outside the agent's firewall: it installs the locked pixi environments and warms the dev build, so the
+# agent can run `pixi run test`, `pixi run lint` and `pixi run check` without network access. The push and
+# pull_request triggers only validate this file when it or the toolchain changes. See docs/agents.md.
+name: Copilot Setup Steps
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+      - pixi.toml
+      - pixi.lock
+  pull_request:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+      - pixi.toml
+      - pixi.lock
+
+permissions: {}
+
+concurrency:
+  # Validation runs only (Copilot ignores workflow-level keys): a new push to a PR cancels the older run; every
+  # other event gets its own group.
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  copilot-setup-steps:
+    name: copilot-setup-steps
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30 # Copilot allows at most 59
+    permissions:
+      contents: read # checkout; Copilot gets its own token for its work
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
+        with:
+          pixi-version: v0.81.0
+          environments: default
+          activate-environment: default
+          locked: true
+          cache: true
+          cache-key: pixi-${{ hashFiles('pixi.lock') }}-
+          cache-write: false # only CI on main writes caches
+      - name: Install the lint environment (pixi run lint, fmt and check)
+        run: pixi install --locked -e lint
+      - name: Warm the dev build (pixi run build)
+        run: pixi run --frozen -e default build

@@ -52,14 +52,15 @@ Every CI job name contains the command that reproduces it (docs/ci.md). SQL cont
   · `fuzz/` parser fuzzer · `scripts/` task entry points (`scripts/ctest.sh` allowlists ctest args) ·
   `tools/lint/check_repo.py` drift checks · `tools/ci/coverage.py` coverage gate · `tools/github/` settings as code ·
   `tools/sanitizers/` suppressions · `docs/`, `docs/adr/` · `.github/` workflows, templates, CODEOWNERS.
+- Skills for every agent in `.agents/skills/<name>/SKILL.md` (`.claude/skills/` is a generated copy), recipes in
+  `docs/recipes/`; agent setup, AI reviews and secrets in [docs/agents.md](docs/agents.md).
 
 ## C++ conventions
 
 - C++23 without compiler extensions. Clang 23 is the primary compiler on Linux and macOS; GCC 15 runs a compatibility
   leg with GCC-only warnings. Code must build warning-free with both, on libstdc++ 15 (Linux) and libc++ (macOS).
-- Style = `.clang-format` (Google-based, 100 columns). Naming (`.clang-tidy`): types and functions `CamelCase` (cheap
-  accessors may be `snake_case`), variables `snake_case`, private members `name_`, constants and enumerators `kName`,
-  namespaces `antb1::<module>`.
+- Style = `.clang-format` (Google, 100 columns). Naming (`.clang-tidy`): types/functions `CamelCase` (accessors may
+  be `snake_case`), variables `snake_case`, members `name_`, constants/enumerators `kName`, namespaces `antb1::<m>`.
 - Errors: `common` and `sql` return `std::expected` (`sql::ParseError`); `plan` and above use `arrow::Status` and
   `arrow::Result` with `ARROW_RETURN_NOT_OK`/`ARROW_ASSIGN_OR_RAISE`; the boundary is
   `src/plan/include/antb1/plan/sql_status.h`. No exceptions across modules: `io` turns `parquet::ParquetException`

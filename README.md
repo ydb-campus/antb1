@@ -50,6 +50,7 @@ pixi run check        # lint + Clang Debug -Werror build + tests
 
 - [CONTRIBUTING.md](CONTRIBUTING.md): workflow, commands, commit and review rules
 - [AGENTS.md](AGENTS.md): the canonical guide for AI coding agents (and a compact summary for humans)
+- [docs/agents.md](docs/agents.md): Claude, Codex and Copilot setup, AI reviews, secrets
 - [docs/architecture.md](docs/architecture.md): modules, query lifecycle, where to add things
 - [docs/sql-subset.md](docs/sql-subset.md): grammar, types, semantics, exit codes, ClickBench status
 - [docs/testing.md](docs/testing.md): test layers, labels, hermetic rules, data policy

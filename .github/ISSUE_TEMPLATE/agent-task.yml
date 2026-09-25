@@ -10,8 +10,8 @@ body:
         Keep the task small enough for one reviewable PR. Agents and humans follow AGENTS.md and must pass
         `pixi run check` before opening the PR.
 
-        After filing, a maintainer routes the task: the label `claude` (Claude Code), a `@codex` comment (Codex)
-        or assigning Copilot. The AI integrations arrive in a later PR; until then choose Any or Human.
+        After filing, a maintainer routes the task: the label `claude` (Claude Code; the issue author needs write
+        access), a `@codex` comment (Codex) or assigning Copilot. See docs/agents.md.
   - type: textarea
     id: goal
     attributes:

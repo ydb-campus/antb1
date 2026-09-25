@@ -1,0 +1,64 @@
+# Automatic Claude code review, once per PR (opened, ready for review, reopened), never on every push. Advisory:
+# it posts inline comments and never approves. For another review, a collaborator comments `@claude review`
+# (.github/workflows/claude.yml). Uses Anthropic's code-review plugin, which applies the repository's CLAUDE.md files
+# (CLAUDE.md imports AGENTS.md and its Code Review Rules). Same-repo, non-draft PRs only; bot PRs are skipped except
+# Copilot's.
+# The workflow token is read-only: comments are posted with the Claude GitHub App token (OIDC exchange).
+# Requirements: the Claude GitHub App, the CLAUDE_CODE_OAUTH_TOKEN secret and this file on the default branch.
+name: Claude review
+
+on:
+  pull_request:
+    types: [opened, ready_for_review, reopened]
+
+permissions: {}
+
+jobs:
+  review:
+    name: claude-review (code-review plugin)
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      (github.event.pull_request.user.type != 'Bot' || github.event.pull_request.user.login == 'Copilot')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    concurrency:
+      # Job level: a run that the condition above skips never cancels a review in progress.
+      group: claude-review-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    permissions:
+      contents: read # checkout
+      pull-requests: read # the plugin reads the PR, its diff and its comments
+      issues: read # PR conversation comments live in the issues API
+      id-token: write # OIDC token exchanged for the Claude GitHub App token, which posts the comments
+    steps:
+      - id: token
+        name: Check that the CLAUDE_CODE_OAUTH_TOKEN secret exists
+        env:
+          HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }} # zizmor: ignore[secrets-outside-env] only a boolean
+        run: |
+          if [ "$HAS_TOKEN" = true ]; then
+            echo "run=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "::notice::the CLAUDE_CODE_OAUTH_TOKEN secret is not set, so the Claude review is skipped (docs/agents.md)"
+            echo "run=false" >>"$GITHUB_OUTPUT"
+          fi
+      - if: steps.token.outputs.run == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - if: steps.token.outputs.run == 'true'
+        uses: anthropics/claude-code-action@9171db3e57d6a3140a37ddc2ba92788584e0ead6 # v1.0.234
+        with:
+          # A repository secret, not an environment secret: this job runs on PR branches, and an environment that
+          # PR branches may use protects nothing. Forks never get it (the job skips them and GitHub withholds it).
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }} # zizmor: ignore[secrets-outside-env]
+          allowed_bots: Copilot
+          # The marketplace is cloned at its default branch: an unpinned vendor input from Anthropic (docs/agents.md).
+          plugin_marketplaces: https://github.com/anthropics/claude-code.git
+          plugins: code-review@claude-code-plugins
+          prompt: /code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}
+          claude_args: >-
+            --allowedTools "mcp__github_inline_comment__create_inline_comment"
+            --settings '{"disableAllHooks":true}'

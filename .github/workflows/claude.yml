@@ -1,0 +1,123 @@
+# `@claude` on issues and PRs (advisory; never a required check). Claude Code runs with the Claude GitHub App's token
+# (obtained through OIDC, hence `id-token: write`); the workflow token itself stays read-only. See docs/agents.md.
+# Guards against prompt injection and secret exposure:
+#   - the job condition ignores bots and anything without `@claude` (or the issue label `claude`);
+#   - the gate step requires write/maintain/admin for BOTH the sender and the issue or PR author, and refuses fork
+#     PRs (members are private org members, so `author_association` cannot be used; the action checks the actor too);
+#   - hooks are disabled and only the tools listed in --allowedTools run without a prompt, which in CI means they
+#     are the only shell commands Claude can use (argument-less pixi tasks only: pixi does not escape quotes in
+#     forwarded arguments, so `pixi run <task> *` would allow arbitrary commands; read-only git and gh); on PRs the
+#     action restores
+#     .claude/ and CLAUDE.md from the base branch, so the ask rules there become denials;
+#   - every event value reaches the shell through `env:`, never through `${{ }}` inside `run:`.
+# Not a sandbox: `pixi run build`/`test` execute the branch's code with this job's credentials, which is why the gate
+# requires write access for the author as well as the sender.
+# Requirements: the Claude GitHub App is installed on the repository, the CLAUDE_CODE_OAUTH_TOKEN secret exists and
+# this file is on the default branch (the token exchange fails with workflow_not_found_on_default_branch otherwise).
+name: Claude
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+  issues:
+    types: [opened, labeled]
+
+permissions: {}
+
+jobs:
+  claude:
+    name: claude (@claude)
+    if: >-
+      github.event.sender.type != 'Bot' && (
+      (github.event_name == 'issues' && github.event.action == 'labeled' && github.event.label.name == 'claude') ||
+      (github.event_name == 'issues' && github.event.action == 'opened' &&
+      (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude'))) ||
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    concurrency:
+      # One run at a time per issue or PR; a second mention waits instead of cancelling work in progress.
+      group: claude-${{ github.event.issue.number || github.event.pull_request.number }}
+      cancel-in-progress: false
+    permissions:
+      contents: read # checkout; Claude pushes branches with the Claude App token, not with this one
+      pull-requests: read # the gate reads the PR (fork check); the action reads PR context
+      issues: read # the action reads the issue and its comments
+      id-token: write # OIDC token exchanged for the Claude GitHub App token
+      actions: read # additional_permissions: Claude reads CI runs and logs of the PR
+    env:
+      PIXI_LOCKED: "true" # a pixi.toml that disagrees with pixi.lock fails instead of silently re-locking
+    steps:
+      - name: Gate (sender and author need write access; no fork PRs)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SENDER: ${{ github.event.sender.login }}
+          AUTHOR: ${{ github.event.issue.user.login || github.event.pull_request.user.login }}
+          AUTHOR_TYPE: ${{ github.event.issue.user.type || github.event.pull_request.user.type }}
+          NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          IS_PR: ${{ (github.event.issue.pull_request || github.event.pull_request) && 'true' || 'false' }}
+          HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }} # zizmor: ignore[secrets-outside-env] only a boolean
+        run: |
+          require_write() {
+            local perm
+            perm=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$1/permission" --jq .permission 2>/dev/null) ||
+              perm=none
+            case "$perm" in
+              admin | maintain | write) ;;
+              *)
+                echo "::error::@claude needs write access for both the sender and the author; $1 has '$perm'"
+                exit 1
+                ;;
+            esac
+          }
+          require_write "$SENDER"
+          # Copilot's PRs have the bot account `Copilot` as author; the human sender was checked above.
+          if [ "$AUTHOR" != Copilot ] || [ "$AUTHOR_TYPE" != Bot ]; then
+            require_write "$AUTHOR"
+          fi
+          if [ "$IS_PR" = true ]; then
+            cross=$(gh pr view "$NUMBER" -R "$GITHUB_REPOSITORY" --json isCrossRepository -q .isCrossRepository)
+            if [ "$cross" != false ]; then
+              echo "::error::@claude is disabled on pull requests from forks"
+              exit 1
+            fi
+          fi
+          if [ "$HAS_TOKEN" != true ]; then
+            echo "::error::the CLAUDE_CODE_OAUTH_TOKEN secret is not set (docs/agents.md, Claude GitHub App and token)"
+            exit 1
+          fi
+          echo "gate: OK (sender $SENDER, author $AUTHOR)"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false # the action configures git with the Claude App token itself
+      - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
+        with:
+          pixi-version: v0.81.0
+          environments: default
+          locked: true
+          cache: true
+          cache-key: pixi-${{ hashFiles('pixi.lock') }}-
+          cache-write: false # only CI on main writes caches
+      - name: Install the lint environment (pixi run lint, fmt and check)
+        run: pixi install --locked -e lint
+      - uses: anthropics/claude-code-action@9171db3e57d6a3140a37ddc2ba92788584e0ead6 # v1.0.234
+        with:
+          # A repository secret, not an environment secret: review events run this job on the PR's merge ref, and an
+          # environment that PR refs may use protects nothing. The gate above refuses forks and outsiders.
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }} # zizmor: ignore[secrets-outside-env]
+          use_sticky_comment: true
+          additional_permissions: |
+            actions: read
+          # Only named tasks, never `pixi run *` (pixi run executes arbitrary commands). The task list is checked by
+          # tools/lint/check_repo.py (R001). Tasks of the `gcc` env and the slow `tidy` leg are left to CI.
+          claude_args: |
+            --max-turns 100
+            --settings '{"disableAllHooks":true}'
+            --allowedTools "Bash(pixi run configure),Bash(pixi run build),Bash(pixi run test),Bash(pixi run ci),Bash(pixi run asan),Bash(pixi run lint),Bash(pixi run fmt),Bash(pixi run check),Bash(pixi run doctor),Bash(git status),Bash(git diff),Bash(git diff *),Bash(git log *),Bash(git show *),Bash(gh pr view *),Bash(gh pr diff *),Bash(gh pr checks *),Bash(gh run view *),Bash(gh run list *),Bash(gh issue view *)"

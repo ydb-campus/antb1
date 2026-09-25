@@ -42,8 +42,8 @@ Accepted
 - Repository settings (squash commit title and body from the PR, deleted head branches, auto-merge, secret scanning
   with push protection, Dependabot alerts, private vulnerability reporting) are applied by
   `tools/github/apply-settings.sh`, which is a dry run unless asked to apply.
-- Automated dependency PRs (the weekly `pixi.lock` refresh) come from a dedicated organization GitHub App, added in a
-  later PR, so they trigger CI like any other PR without a personal token.
+- Automated dependency PRs (the weekly `pixi.lock` refresh, `.github/workflows/pixi-lock-update.yml`) come from a
+  dedicated organization GitHub App (antb1-bot), so they trigger CI like any other PR without a personal token.
 
 ## Consequences
 
