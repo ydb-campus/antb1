@@ -16,8 +16,15 @@ behind this setup are in [ADR 0009](adr/0009-ci-and-governance.md).
 | `Scorecard` | `.github/workflows/scorecard.yml` | pushes to `main`, weekly, branch protection changes | OpenSSF Scorecard, results in the Security tab and on scorecard.dev; advisory |
 | `Agent bootstrap` | `.github/workflows/agent-bootstrap.yml` | pull requests that change `scripts/agent-setup.sh`, `pixi.toml`, `pixi.lock` or the workflow; weekly; manual | a cold `scripts/agent-setup.sh` from both pixi sources, then the tests; advisory |
 | Dependabot | `.github/dependabot.yml` | weekly (Monday) | one grouped PR that updates the pinned GitHub Actions, for releases at least 7 days old |
+| `Claude` | `.github/workflows/claude.yml` | `@claude` in issues, PR comments and reviews; issue label `claude` | advisory: Claude Code works on the issue or PR (write-access gate, no forks) |
+| `Claude review` | `.github/workflows/claude-review.yml` | pull requests opened, ready for review or reopened | advisory: one automatic Claude review per PR, inline comments |
+| `Codex harness audit` | `.github/workflows/codex-review.yml` | pull requests opened, ready for review or reopened; label `codex-review` | advisory: read-only Codex audit, one sticky comment |
+| `Copilot Setup Steps` | `.github/workflows/copilot-setup-steps.yml` | every Copilot coding-agent task; manual; changes to itself, `pixi.toml` or `pixi.lock` | prepares Copilot's environment (`default` and `lint`, dev build) |
+| `pixi.lock update` | `.github/workflows/pixi-lock-update.yml` | weekly (Monday), manual | PR `build(deps): update pixi.lock` from the antb1-bot App |
 
-Later PRs add the benchmark workflow, the weekly `pixi.lock` refresh and the AI review workflows.
+The AI and bot workflows (Claude, Claude review, Codex harness audit, Copilot Setup Steps, pixi.lock update) are
+advisory: they are not required checks and not part of `CI OK`, and their failures never block a merge. Their setup,
+secrets and security model are described in [docs/agents.md](agents.md). A later PR adds the benchmark workflow.
 
 ## Required checks
 
@@ -52,6 +59,17 @@ a merge queue (`merge_group` is already wired) can take over when PR volume need
 | `cache-gc` (`main` only) | ubuntu-slim | none | nothing to run |
 | `CI OK` | ubuntu-slim | none | aggregator, nothing to run |
 | `PR title` | ubuntu-slim | none | check the title against the rules above |
+
+Advisory jobs (not required):
+
+| Job | Workflow | Runner | What it runs |
+| --- | --- | --- | --- |
+| `claude (@claude)` | `Claude` | ubuntu-24.04 | Claude Code with named `pixi run` tasks and read-only `git`/`gh` only; 60 min |
+| `claude-review (code-review plugin)` | `Claude review` | ubuntu-24.04 | Anthropic's code-review plugin; 30 min |
+| `codex-audit (harness checklist)` | `Codex harness audit` | ubuntu-24.04 | Codex CLI 0.155.1, `:read-only` profile, no sudo; 30 min |
+| `codex-audit comment` | `Codex harness audit` | ubuntu-slim | posts the audit as one sticky comment |
+| `copilot-setup-steps` | `Copilot Setup Steps` | ubuntu-24.04 | `pixi install --locked -e lint`, then `pixi run --frozen -e default build` |
+| `pixi update` | `pixi.lock update` | ubuntu-24.04 | `pixi update` with pixi 0.81.0 and a PR through the antb1-bot App token |
 
 - `lint` is read-only: format checks, linters, offline zizmor, the repository drift and policy checks and their own
   tests. On pull requests it also runs GitHub's dependency review. `pixi run fmt` fixes what can be fixed
@@ -219,6 +237,11 @@ enforces them:
   `cache-gc` (`actions: write`, `main` only) and the nightly `report` (`issues: write`) check out nothing from a PR.
   The analyses that upload results (`CodeQL`, `Security`, `Scorecard`) hold only `security-events: write` (Scorecard
   also `id-token: write`, on `main`); on fork pull requests GitHub makes their token read-only.
+
+The advisory AI and bot workflows add their own limits: their jobs get a read-only workflow token and write only
+through their own GitHub App tokens (Claude, antb1-bot) or, for the Codex audit comment, through a separate job
+that has nothing but `pull-requests: write`. The AI jobs skip pull requests from forks. See
+[docs/agents.md](agents.md).
 
 The repository settings (`tools/github/apply-settings.sh`) add the rest: workflow runs from external contributors'
 forks need a maintainer's approval, and GitHub Actions cannot approve pull requests.

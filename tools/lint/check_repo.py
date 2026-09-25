@@ -10,7 +10,8 @@ Usage: python tools/lint/check_repo.py [--root DIR] [--only R001,R007]
         environment; no tasks in the default feature; `depends-on` targets exist.
   R002  every non-hidden task is documented in the AGENTS.md command table or docs/ci.md.
   R003  CLAUDE.md line 1 is `@AGENTS.md`; AGENTS.md size and `## Code Review Rules`; copilot-instructions size.
-  R004  .claude/skills is a byte-identical copy of .agents/skills; SKILL.md frontmatter.
+  R004  .claude/skills is a byte-identical copy of .agents/skills; each SKILL.md is .agents/skills/<name>/SKILL.md
+        and its frontmatter has only `name` (equal to <name>) and `description`.
   R005  one pixi version everywhere (requires-pixi, workflows, scripts, docs); pixi.lock starts with `version: 7`.
   R006  `--preset X` and `build/<X>` references (workflow matrix values too) name CMake presets of the right kind.
   R007  docs/architecture.md module table == cmake/Antb1Modules.cmake; `#include` scan of src/ (a module may include
@@ -21,7 +22,8 @@ Usage: python tools/lint/check_repo.py [--root DIR] [--only R001,R007]
         no `${{ github.event.* }}`/`${{ github.head_ref }}` in `run:`); `data` tests use `--redact`.
   R011  ClickBench ratchet `pass` list == docs/sql-subset.md status table; its `clickbench_commit` is the commit
         of the queries.sql pin in tools/data/clickbench.lock.
-  R012  CODEOWNERS, AGENTS.md "Ask a human first" and .claude/settings.json cover the governance path set G.
+  R012  CODEOWNERS, AGENTS.md "Ask a human first" and .claude/settings.json cover the governance path set G; the
+        settings allow list approves named pixi tasks only (never `pixi run *`, `pixi run -x`, `pixi exec`).
   R013  docs/adr/README.md lists every ADR.
   R014  relative links and backticked repo paths in agent docs and docs/** exist.
   R015  every action used (and the known nested ones) is allowed by tools/github/allowed-actions.json.
@@ -939,6 +941,26 @@ def check_r004(ctx: Ctx) -> None:
                 "`allowed-tools` in a shared skill",
                 "remove it (permissions live in .claude/settings.json)",
             )
+        extra = sorted(str(k) for k in meta if k not in ("name", "description", "allowed-tools"))
+        if extra:
+            repo.add(
+                "R004",
+                path,
+                1,
+                f"frontmatter key(s) {', '.join(extra)}: a shared skill has only `name` and `description`",
+                "remove them (Codex, Copilot and Claude Code read the same file)",
+            )
+        parts = path.split("/")
+        if len(parts) != 4:
+            repo.add("R004", path, 1, "not at .agents/skills/<name>/SKILL.md", "move it to its own skill directory")
+        elif meta.get("name") and meta["name"] != parts[2]:
+            repo.add(
+                "R004",
+                path,
+                line_of(text, r"^name:"),
+                f"`name: {meta['name']}` differs from the skill directory `{parts[2]}`",
+                f"use `name: {parts[2]}`",
+            )
 
 
 VERSION_PATTERNS = (
@@ -1482,6 +1504,31 @@ def check_coverage(ctx: Ctx, path: str, line: int, patterns: Iterable[str], targ
             ctx.repo.add("R012", path, line, f"{what} does not cover governance path `{target}`", f"add `{target}`")
 
 
+PIXI_VALUE_OPTIONS = frozenset({"-e", "--environment"})
+PIXI_FOREIGN_OPTIONS = frozenset({"-x", "--executable", "-m", "--manifest-path", "-s", "--script", "-w", "--workspace"})
+
+
+def broad_allow_rule(rule: str) -> bool:
+    """Whether a permissions.allow rule approves any command: `Bash`, `Bash(*)`, `pixi run *`, `pixi exec`, ..."""
+    rule = rule.strip()
+    if rule in ("Bash", "Bash(*)"):
+        return True
+    m = re.fullmatch(r"Bash\((.*)\)", rule)
+    tokens = m.group(1).replace(":*", " *").split() if m else []
+    if len(tokens) < 2 or tokens[0] != "pixi":
+        return False
+    if "*" in tokens[1] or tokens[1] == "exec":
+        return True
+    if tokens[1] != "run":
+        return False
+    for i, tok in enumerate(tokens[2:], 2):
+        if "*" in tok or tok.split("=", 1)[0] in PIXI_FOREIGN_OPTIONS:
+            return True  # any task, any executable, or the tasks of another manifest
+        if not tok.startswith("-") and tokens[i - 1] not in PIXI_VALUE_OPTIONS:
+            return False  # a named task: later wildcards only match its arguments
+    return False
+
+
 def check_r012(ctx: Ctx) -> None:
     repo = ctx.repo
     owners = repo.text(".github/CODEOWNERS")
@@ -1515,13 +1562,23 @@ def check_r012(ctx: Ctx) -> None:
             repo.add("R012", ".claude/settings.json", 1, "not a JSON object", "fix the JSON")
             return
 
+        def rules(kind: str) -> list[str]:
+            listed = perms.get(kind, []) if isinstance(perms, dict) else []
+            return [str(r) for r in listed] if isinstance(listed, list) else []
+
         def edit_paths(kind: str) -> list[str]:
-            out = []
-            for rule in perms.get(kind, []) if isinstance(perms, dict) else []:
-                m = re.fullmatch(r"(?:Edit|Write)\((.+)\)", str(rule))
-                if m:
-                    out.append(m.group(1))
-            return out
+            # Claude Code checks file paths against Edit(...) rules only; a Write(...) path rule is never consulted.
+            return [m.group(1) for r in rules(kind) if (m := re.fullmatch(r"Edit\((.+)\)", r))]
+
+        for rule in rules("allow"):
+            if broad_allow_rule(rule):
+                repo.add(
+                    "R012",
+                    ".claude/settings.json",
+                    line_of(settings, re.escape(json.dumps(rule))),
+                    f"allow rule `{rule}` approves arbitrary commands",
+                    "allow named tasks only, e.g. `Bash(pixi run test *)`; `pixi run` executes any command",
+                )
 
         line = line_of(settings, r'"ask"')
         check_coverage(

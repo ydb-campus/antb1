@@ -9,6 +9,7 @@ while IFS= read -r -d '' f; do
   [ -f "$f" ] || continue # deleted but still tracked
   case "$f" in
     pixi.lock | .pixi/* | build/* | .cache/*) ;;
+    .claude/skills/*) ;; # generated from .agents/skills by sync_skills.py below
     *.c | *.cc | *.cpp | *.cxx | *.h | *.hh | *.hpp | *.hxx | *.inl | *.ipp | *.tpp) cxx+=("$f") ;;
     CMakeLists.txt | */CMakeLists.txt | *.cmake) cmake+=("$f") ;;
     *.py) py+=("$f") ;;
@@ -32,9 +33,7 @@ if [ ${#py[@]} -gt 0 ]; then
 fi
 [ ${#toml[@]} -eq 0 ] || run tombi format --offline --quiet "${toml[@]}"
 [ ${#md[@]} -eq 0 ] || run markdownlint-cli2 --fix "${md[@]}"
-if [ -f tools/lint/sync_skills.py ]; then
-  run python tools/lint/sync_skills.py # .agents/skills -> .claude/skills (added with the skills)
-fi
+run python tools/lint/sync_skills.py # .agents/skills (canonical) -> .claude/skills (byte copy; R004)
 
 if [ $rc -eq 0 ]; then
   echo "fmt: done; review with \`git diff\`"

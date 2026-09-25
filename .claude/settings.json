@@ -1,0 +1,189 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "env": {
+    "NO_COLOR": "1",
+    "GTEST_COLOR": "no"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(pixi run configure)",
+      "Bash(pixi run build)",
+      "Bash(pixi run test)",
+      "Bash(pixi run test *)",
+      "Bash(pixi run antb1 *)",
+      "Bash(pixi run fmt)",
+      "Bash(pixi run lint)",
+      "Bash(pixi run check)",
+      "Bash(pixi run check-full)",
+      "Bash(pixi run ci)",
+      "Bash(pixi run asan)",
+      "Bash(pixi run release)",
+      "Bash(pixi run tidy)",
+      "Bash(pixi run ci-gcc)",
+      "Bash(pixi run codeql-build)",
+      "Bash(pixi run coverage)",
+      "Bash(pixi run fuzz-smoke)",
+      "Bash(pixi run fuzz)",
+      "Bash(pixi run tsan)",
+      "Bash(pixi run ci-shuffle)",
+      "Bash(pixi run slt-complete)",
+      "Bash(pixi run diff-random)",
+      "Bash(pixi run fetch-data)",
+      "Bash(pixi run test-data)",
+      "Bash(pixi run asan-data)",
+      "Bash(pixi run doctor)",
+      "Bash(pixi run doctor *)",
+      "Bash(pixi run clean)",
+      "Bash(pixi install --locked)",
+      "Bash(pixi install --locked -e *)",
+      "Bash(pixi task list)",
+      "Bash(pixi info)",
+      "Bash(pixi list)",
+      "Bash(pixi list *)",
+      "Bash(git status)",
+      "Bash(git status *)",
+      "Bash(git diff)",
+      "Bash(git diff *)",
+      "Bash(git log)",
+      "Bash(git log *)",
+      "Bash(git show *)",
+      "Bash(git branch)",
+      "Bash(git branch --show-current)",
+      "Bash(git switch *)",
+      "Bash(git fetch origin)",
+      "Bash(git fetch origin *)",
+      "Bash(git merge-base *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(gh pr view *)",
+      "Bash(gh pr diff *)",
+      "Bash(gh pr checks *)",
+      "Bash(gh pr list *)",
+      "Bash(gh run view *)",
+      "Bash(gh run list *)",
+      "Bash(gh issue view *)",
+      "Bash(gh issue list *)"
+    ],
+    "ask": [
+      "Bash(pixi add *)",
+      "Bash(pixi remove *)",
+      "Bash(pixi update *)",
+      "Bash(pixi upgrade *)",
+      "Bash(pixi lock *)",
+      "Bash(pixi run -x *)",
+      "Bash(pixi run --executable *)",
+      "Bash(pixi exec *)",
+      "Bash(pixi run install-git-hooks)",
+      "Bash(pixi run *\"*'*)",
+      "Bash(git switch -f*)",
+      "Bash(git switch * -f*)",
+      "Bash(git switch --force*)",
+      "Bash(git switch * --force*)",
+      "Bash(git switch --discard-changes*)",
+      "Bash(git switch * --discard-changes*)",
+      "Bash(git push *)",
+      "Bash(gh pr create *)",
+      "Bash(gh pr merge *)",
+      "Edit(/.github/**)",
+      "Edit(/.githooks/**)",
+      "Edit(/.claude/**)",
+      "Edit(/.agents/**)",
+      "Edit(/AGENTS.md)",
+      "Edit(/CLAUDE.md)",
+      "Edit(/pixi.toml)",
+      "Edit(/CMakePresets.json)",
+      "Edit(/cmake/**)",
+      "Edit(/tools/github/**)",
+      "Edit(/tools/lint/**)",
+      "Edit(/tools/data/**)",
+      "Edit(/tools/ci/coverage_thresholds.json)",
+      "Edit(/.pre-commit-config.yaml)",
+      "Edit(/.clang-format)",
+      "Edit(/.clang-tidy)",
+      "Edit(/tests/.clang-tidy)",
+      "Edit(/scripts/ctest.sh)",
+      "Edit(/scripts/agent-setup.sh)",
+      "Edit(/tests/data/clickbench_status.json)",
+      "Edit(/scripts/lint.sh)",
+      "Edit(/scripts/fmt.sh)",
+      "Edit(/tools/sanitizers/**)",
+      "Edit(/.markdownlint-cli2.yaml)",
+      "Edit(/_typos.toml)",
+      "Edit(/ruff.toml)",
+      "Edit(/.gersemirc)",
+      "Edit(/tombi.toml)"
+    ],
+    "deny": [
+      "Edit(/pixi.lock)",
+      "Read(.env)",
+      "Read(.env.*)",
+      "Bash(sudo *)",
+      "Bash(apt *)",
+      "Bash(apt-get *)",
+      "Bash(brew *)",
+      "Bash(pip *)",
+      "Bash(pip3 *)",
+      "Bash(python -m pip*)",
+      "Bash(python3 -m pip*)",
+      "Bash(uv *)",
+      "Bash(uvx *)",
+      "Bash(conda *)",
+      "Bash(mamba *)",
+      "Bash(micromamba *)",
+      "Bash(pixi global *)",
+      "Bash(pixi * --manifest-path*)",
+      "Bash(pixi * -m *)",
+      "Bash(git push --force*)",
+      "Bash(git push * --force*)",
+      "Bash(git push -f*)",
+      "Bash(git push * -f*)",
+      "Bash(git push * +*)",
+      "Bash(git reset --hard*)",
+      "Bash(git reset * --hard*)",
+      "Bash(git clean *)",
+      "Bash(git commit --no-verify*)",
+      "Bash(git commit * --no-verify*)",
+      "Bash(git commit -n*)",
+      "Bash(git commit * -n*)",
+      "Bash(git * --output*)",
+      "Bash(git fetch *--upload-pack*)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/session-start.sh\"",
+            "timeout": 600
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/format-edited.sh\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/stop-verify.sh\"",
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  }
+}

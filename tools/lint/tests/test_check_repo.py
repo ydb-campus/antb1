@@ -499,6 +499,18 @@ def test_r004_missing_copy(repo: Path) -> None:
     assert ".agents/skills/other/SKILL.md:1: R004 missing from .claude/skills" in messages(repo, "R004")
 
 
+def test_r004_frontmatter_keys_name_and_location(repo: Path) -> None:
+    for rel in (".agents/skills/demo/SKILL.md", ".claude/skills/demo/SKILL.md"):
+        edit(repo, rel, "name: demo\n", "name: other\nmodel: opus\n")
+    nested = "---\nname: deep\ndescription: d\n---\n"
+    write(repo, {".agents/skills/x/deep/SKILL.md": nested, ".claude/skills/x/deep/SKILL.md": nested})
+    out = messages(repo, "R004")
+    assert "frontmatter key(s) model: a shared skill has only `name` and `description`" in out
+    assert ".agents/skills/demo/SKILL.md:2: R004 `name: other` differs from the skill directory `demo`" in out
+    assert ".agents/skills/x/deep/SKILL.md:1: R004 not at .agents/skills/<name>/SKILL.md" in out
+    assert ".claude/skills/demo" not in out  # the copy is identical, so only the canonical file is reported
+
+
 # --- R005 ------------------------------------------------------------------------------------------------------------
 
 
@@ -741,6 +753,47 @@ def test_r012_settings(repo: Path) -> None:
     out = messages(repo, "R012")
     assert "ask/deny Edit does not cover governance path `/scripts/ctest.sh`" in out
     assert "deny does not cover governance path `/pixi.lock`" in out
+
+
+def test_r012_settings_write_rules_do_not_count(repo: Path) -> None:
+    edit(repo, ".claude/settings.json", '"Edit(/cmake/**)"', '"Write(/cmake/**)"')
+    assert "ask/deny Edit does not cover governance path `/cmake/`" in messages(repo, "R012")
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        "Bash",
+        "Bash(*)",
+        "Bash(pixi *)",
+        "Bash(pixi:*)",
+        "Bash(pixi run *)",
+        "Bash(pixi run:*)",
+        "Bash(pixi run -e lint *)",
+        "Bash(pixi run --frozen *)",
+        "Bash(pixi run -x python)",
+        "Bash(pixi run --manifest-path=x.toml build)",
+        "Bash(pixi exec cmake)",
+    ],
+)
+def test_r012_settings_broad_allow_rule(repo: Path, rule: str) -> None:
+    edit(repo, ".claude/settings.json", '"Bash(pixi run build)"', json.dumps(rule))
+    assert f"allow rule `{rule}` approves arbitrary commands" in messages(repo, "R012")
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        "Bash(pixi run test *)",
+        "Bash(pixi run --frozen -e default test)",
+        "Bash(pixi install --locked -e *)",
+        "Bash(pixi task list)",
+        "Bash(git diff *)",
+    ],
+)
+def test_r012_settings_specific_allow_rule(repo: Path, rule: str) -> None:
+    edit(repo, ".claude/settings.json", '"Bash(pixi run build)"', json.dumps(rule))
+    assert findings(repo, "R012") == []
 
 
 # --- R013 ------------------------------------------------------------------------------------------------------------

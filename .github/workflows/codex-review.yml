@@ -1,0 +1,114 @@
+# Codex harness audit (advisory; never a required check). Runs once per PR (opened, ready for review, reopened) and
+# again when a maintainer adds the label `codex-review`. Codex CLI (pinned) runs read-only without sudo and checks the
+# diff against the test-harness rules; a separate job posts the answer as one sticky PR comment.
+# Defense in depth against prompt injection from PR content:
+#   - the prompt (.github/codex/review-prompt.md) and the review rules (AGENTS.md) come from the BASE commit, so a
+#     PR cannot rewrite its own instructions; a base without the prompt skips the audit; Codex does not load the
+#     checkout's (PR's) AGENTS.md or skills as instructions (codex-args below);
+#   - same-repo, non-draft, non-bot PRs only; the audit job has a read-only token and no write access to anything;
+#   - only the `post` job can write, and it only posts the audit text.
+# Inert until the OPENAI_API_KEY secret exists (a spend-capped OpenAI project key; see docs/agents.md).
+# Native Codex review is separate: comment `@codex review` on a PR (ChatGPT Codex settings, manual mode).
+name: Codex harness audit
+
+on:
+  pull_request:
+    types: [opened, ready_for_review, reopened, labeled]
+
+permissions: {}
+
+jobs:
+  audit:
+    name: codex-audit (harness checklist)
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.type != 'Bot' &&
+      (github.event.action != 'labeled' || github.event.label.name == 'codex-review')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    concurrency:
+      # Job level: a run skipped by the condition above (any other label) never cancels an audit in progress.
+      group: codex-audit-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    permissions:
+      contents: read # checkout; codex-action checks the actor's write access with this token
+    outputs:
+      message: ${{ steps.codex.outputs.final-message }}
+    steps:
+      - id: key
+        name: Check that the OPENAI_API_KEY secret exists
+        env:
+          HAS_KEY: ${{ secrets.OPENAI_API_KEY != '' }} # zizmor: ignore[secrets-outside-env] only a boolean
+        run: |
+          if [ "$HAS_KEY" = true ]; then
+            echo "run=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "::notice::the OPENAI_API_KEY secret is not set, so the Codex harness audit is skipped (docs/agents.md)"
+            echo "run=false" >>"$GITHUB_OUTPUT"
+          fi
+      - if: steps.key.outputs.run == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the base commit (prompt, AGENTS.md) and the merge base for `git diff BASE...HEAD`
+          persist-credentials: false
+      - id: prompt
+        name: Prompt and review rules from the base commit
+        if: steps.key.outputs.run == 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if ! git cat-file -e "$BASE_SHA:.github/codex/review-prompt.md" 2>/dev/null; then
+            echo "::notice::the base commit has no .github/codex/review-prompt.md, so the audit is skipped"
+            echo "run=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          prompt="$RUNNER_TEMP/codex-prompt.md"
+          git show "$BASE_SHA:.github/codex/review-prompt.md" >"$prompt"
+          {
+            echo
+            echo "## Inputs"
+            echo
+            echo "- Base commit: $BASE_SHA"
+            echo "- Head commit: $HEAD_SHA"
+            echo
+            echo "## Review rules: AGENTS.md from the base commit"
+            echo
+            echo "<base-agents-md>"
+            git show "$BASE_SHA:AGENTS.md" 2>/dev/null || echo "(the base commit has no AGENTS.md)"
+            echo "</base-agents-md>"
+          } >>"$prompt"
+          echo "run=true" >>"$GITHUB_OUTPUT"
+      - id: codex
+        if: steps.prompt.outputs.run == 'true'
+        uses: openai/codex-action@86365089eb2b84e0a8fb0717b304f8bdcb13b20e # v1.12
+        with:
+          # A repository secret, not an environment secret: this job runs on PR branches, and an environment that
+          # PR branches may use protects nothing. Forks never get it (the job skips them and GitHub withholds it).
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }} # zizmor: ignore[secrets-outside-env]
+          # Newest release at least 7 days old on 2026-09-25; bump by hand (R010 requires a pinned version).
+          codex-version: 0.155.1
+          prompt-file: ${{ runner.temp }}/codex-prompt.md
+          # Codex would otherwise load ./AGENTS.md (the PR's copy) as instructions and list the PR's .agents/skills;
+          # the base copy of AGENTS.md is already in the prompt.
+          codex-args: '["-c", "project_doc_max_bytes=0", "-c", "skills.include_instructions=false"]'
+          permission-profile: ":read-only"
+          safety-strategy: drop-sudo
+
+  post:
+    name: codex-audit comment
+    needs: audit
+    if: needs.audit.outputs.message != ''
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    concurrency:
+      group: codex-audit-comment-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    permissions:
+      pull-requests: write # create or update the one sticky audit comment
+    steps:
+      - uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88 # v3.0.5
+        with:
+          header: codex-harness-audit
+          message: ${{ needs.audit.outputs.message }}
