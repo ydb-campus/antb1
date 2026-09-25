@@ -1,0 +1,57 @@
+name: Bug report
+description: A wrong result, crash, bad error message or build problem.
+title: "bug: "
+type: Bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Security problems go to a private advisory, not here (see SECURITY.md).
+        Do not paste values or query answers from ClickBench data: describe the query and the file shape instead,
+        or reproduce with a small file you generated yourself.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: A short description of the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: The exact commands, starting from a clean checkout. Put SQL with quotes in a file (`-f q.sql`).
+      render: shell
+      placeholder: |
+        pixi run antb1 query -f q.sql --table t=path/to/file.parquet --format csv
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What you expected, e.g. DuckDB's answer for the same query and file.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead, including the exit code and the error message.
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Environment
+      description: Output of `pixi run doctor --json`.
+      render: json
+    validations:
+      required: true
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      description: Output of `git rev-parse --short HEAD`.
+    validations:
+      required: false

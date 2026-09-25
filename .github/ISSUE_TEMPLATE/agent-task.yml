@@ -1,0 +1,70 @@
+name: Agent task
+description: A small, well-scoped task that an AI agent (or a human) can pick up and finish in one PR.
+title: "task: "
+type: Task
+labels: [agent-task]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Keep the task small enough for one reviewable PR. Agents and humans follow AGENTS.md and must pass
+        `pixi run check` before opening the PR.
+
+        After filing, a maintainer routes the task: the label `claude` (Claude Code), a `@codex` comment (Codex)
+        or assigning Copilot. The AI integrations arrive in a later PR; until then choose Any or Human.
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What should be true when this is done? One or two sentences.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Why it matters, related issues, ADRs, docs or code pointers (paths, functions).
+    validations:
+      required: false
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Concrete, checkable outcomes. Keep the defaults unless they do not apply.
+      value: |
+        - [ ] `pixi run check` passes
+        - [ ] Unit tests cover the change (plus sqllogictest cases once the harness lands)
+        - [ ] Docs updated where behavior, commands or architecture change
+    validations:
+      required: true
+  - type: textarea
+    id: in-scope
+    attributes:
+      label: Files in scope
+      description: Paths the change may touch. Governance paths (.github/CODEOWNERS) need a maintainer's agreement.
+      placeholder: |
+        src/sql/parser.cc
+        src/sql/tests/parser_test.cc
+    validations:
+      required: true
+  - type: textarea
+    id: out-of-scope
+    attributes:
+      label: Out of scope
+      description: What must not change in this task.
+    validations:
+      required: false
+  - type: dropdown
+    id: executor
+    attributes:
+      label: Executor
+      description: Who should do the work. A maintainer triggers the chosen agent.
+      options:
+        - Any
+        - Claude
+        - Codex
+        - Copilot
+        - Human
+      default: 0
+    validations:
+      required: true

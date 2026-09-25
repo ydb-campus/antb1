@@ -1,0 +1,12 @@
+# tombi (TOML formatter). `pixi run fmt` applies it; `pixi run lint` runs `tombi format --check --offline`.
+# TOML 1.0 only (pixi.toml must stay TOML 1.0). Schema-driven formatting is off, so the result is identical with and
+# without network or a warm schema cache.
+toml-version = "v1.0.0"
+
+[schema]
+enabled = false
+
+[format.rules]
+indent-width = 4
+line-width = 120
+trailing-comment-alignment = true

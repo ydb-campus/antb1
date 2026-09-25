@@ -1,0 +1,155 @@
+{
+  "version": 8,
+  "$schema": "https://raw.githubusercontent.com/Kitware/CMake/v4.4.3/Help/manual/presets/schema.json",
+  "cmakeMinimumRequired": { "major": 3, "minor": 28, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_PREFIX_PATH": "$env{CONDA_PREFIX}",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "ANTB1_BUILD_TESTS": "ON"
+      }
+    },
+    { "name": "werror", "hidden": true, "cacheVariables": { "CMAKE_COMPILE_WARNING_AS_ERROR": "ON" } },
+    { "name": "san-address", "hidden": true, "cacheVariables": { "ANTB1_SANITIZE": "address;undefined" } },
+    { "name": "dev", "displayName": "Debug (inner loop)", "inherits": ["base"] },
+    { "name": "ci", "displayName": "CI clang-debug: Debug -Werror", "inherits": ["werror", "base"] },
+    {
+      "name": "ci-asan",
+      "displayName": "CI clang-asan: ASan+UBSan -Werror",
+      "inherits": ["werror", "san-address", "base"]
+    },
+    {
+      "name": "ci-release",
+      "displayName": "CI macos-release / nightly arm64: RelWithDebInfo -Werror",
+      "inherits": ["werror", "base"],
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
+    },
+    {
+      "name": "ci-gcc",
+      "displayName": "CI gcc-compat: GCC 15 Debug -Werror (pixi env gcc)",
+      "inherits": ["werror", "base"],
+      "cacheVariables": { "ANTB1_REQUIRE_COMPILER": "GNU" }
+    },
+    {
+      "name": "tidy",
+      "displayName": "clang-tidy on every TU (-Werror)",
+      "inherits": ["werror", "base"],
+      "cacheVariables": { "ANTB1_CLANG_TIDY": "ON", "ANTB1_REQUIRE_COMPILER": "Clang", "ANTB1_USE_CCACHE": "OFF" }
+    },
+    {
+      "name": "codeql",
+      "displayName": "CodeQL traced build (pixi env gcc, no ccache, no tests)",
+      "inherits": ["base"],
+      "cacheVariables": { "ANTB1_BUILD_TESTS": "OFF", "ANTB1_USE_CCACHE": "OFF", "ANTB1_REQUIRE_COMPILER": "GNU" }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "build-base",
+      "hidden": true,
+      "environment": {
+        "CCACHE_DIR": "${sourceDir}/.cache/ccache",
+        "CCACHE_BASEDIR": "${sourceDir}",
+        "CCACHE_NOHASHDIR": "true",
+        "CCACHE_COMPILERCHECK": "content"
+      }
+    },
+    { "name": "dev", "configurePreset": "dev", "inherits": ["build-base"] },
+    { "name": "ci", "configurePreset": "ci", "inherits": ["build-base"] },
+    { "name": "ci-asan", "configurePreset": "ci-asan", "inherits": ["build-base"] },
+    { "name": "ci-release", "configurePreset": "ci-release", "inherits": ["build-base"] },
+    { "name": "ci-gcc", "configurePreset": "ci-gcc", "inherits": ["build-base"] },
+    { "name": "tidy", "configurePreset": "tidy", "inherits": ["build-base"] },
+    { "name": "codeql", "configurePreset": "codeql", "inherits": ["build-base"] }
+  ],
+  "testPresets": [
+    {
+      "name": "test-common",
+      "hidden": true,
+      "output": { "outputOnFailure": true, "outputJUnitFile": "junit.xml" },
+      "execution": { "noTestsAction": "error", "timeout": 300, "jobs": 8 },
+      "environment": {
+        "OMP_NUM_THREADS": "1",
+        "ARROW_IO_THREADS": "2",
+        "LC_ALL": "C",
+        "TZ": "UTC",
+        "GTEST_COLOR": "no"
+      }
+    },
+    {
+      "name": "hermetic",
+      "hidden": true,
+      "inherits": ["test-common"],
+      "filter": { "exclude": { "label": "^(data|fuzz)$" } }
+    },
+    {
+      "name": "sanitizer-env",
+      "hidden": true,
+      "environment": {
+        "ARROW_DEFAULT_MEMORY_POOL": "system",
+        "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1:detect_stack_use_after_return=1:strict_string_checks=1:check_initialization_order=1",
+        "UBSAN_OPTIONS": "halt_on_error=1:print_stacktrace=1:suppressions=${sourceDir}/tools/sanitizers/ubsan.supp",
+        "LSAN_OPTIONS": "suppressions=${sourceDir}/tools/sanitizers/lsan.supp"
+      }
+    },
+    { "name": "dev", "configurePreset": "dev", "inherits": ["hermetic"] },
+    { "name": "ci", "configurePreset": "ci", "inherits": ["hermetic"] },
+    { "name": "ci-asan", "configurePreset": "ci-asan", "inherits": ["sanitizer-env", "hermetic"] },
+    { "name": "ci-release", "configurePreset": "ci-release", "inherits": ["hermetic"] },
+    { "name": "ci-gcc", "configurePreset": "ci-gcc", "inherits": ["hermetic"] }
+  ],
+  "workflowPresets": [
+    {
+      "name": "ci",
+      "steps": [
+        { "type": "configure", "name": "ci" },
+        { "type": "build", "name": "ci" },
+        { "type": "test", "name": "ci" }
+      ]
+    },
+    {
+      "name": "ci-asan",
+      "steps": [
+        { "type": "configure", "name": "ci-asan" },
+        { "type": "build", "name": "ci-asan" },
+        { "type": "test", "name": "ci-asan" }
+      ]
+    },
+    {
+      "name": "ci-release",
+      "steps": [
+        { "type": "configure", "name": "ci-release" },
+        { "type": "build", "name": "ci-release" },
+        { "type": "test", "name": "ci-release" }
+      ]
+    },
+    {
+      "name": "ci-gcc",
+      "steps": [
+        { "type": "configure", "name": "ci-gcc" },
+        { "type": "build", "name": "ci-gcc" },
+        { "type": "test", "name": "ci-gcc" }
+      ]
+    },
+    {
+      "name": "tidy",
+      "steps": [
+        { "type": "configure", "name": "tidy" },
+        { "type": "build", "name": "tidy" }
+      ]
+    },
+    {
+      "name": "codeql",
+      "steps": [
+        { "type": "configure", "name": "codeql" },
+        { "type": "build", "name": "codeql" }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,167 @@
+#:schema https://pixi.prefix.dev/v0.81.0/schema/manifest/schema.json
+# antb1 toolchain and the ONLY supported command surface: `pixi run <task>`.
+# Invariants (enforced by `pixi run lint` -> tools/lint/check_repo.py):
+#   * TOML 1.0 only; installable standalone from pixi.toml + pixi.lock.
+#   * NO tasks and NO compilers in the default feature; every task name exists in exactly ONE environment (R001).
+#   * The pixi version 0.81.0 appears identically here, in workflows, scripts/agent-setup.sh and docs (R005).
+# Layout (kept by `tombi format`): the default feature (shared libraries), then one feature per environment with
+# its dependencies and tasks, then [environments]. Every task name exists in exactly one environment, so
+# `pixi run <task>` needs no `-e` (CI still passes `-e`). Arguments after the task name are forwarded
+# (`pixi run test -R sql`).
+
+[workspace]
+name = "antb1"
+version = "0.1.0"
+description = "Experimental C++23 analytics engine: SQL-like queries over local Parquet files (Apache Arrow)"
+channels = ["conda-forge"]
+platforms = ["linux-64", "linux-aarch64", "osx-arm64"]
+requires-pixi = ">=0.81.0"
+
+# ---- default feature: libraries + build tools shared by the `default` and `gcc` environments ----
+[dependencies]
+cmake = "4.4.*"
+ninja = "1.13.*"
+ccache = "4.14.*"
+curl = ">=8.10"                                     # host curl 7.68 lacks --retry-all-errors
+bash = "5.*"                                        # macOS /bin/bash is 3.2
+libarrow = { version = "25.0.*", build = "*cpu*" }  # never the stale arrow-cpp metapackage
+libarrow-compute = "25.0.*"
+libparquet = "25.0.*"
+cli11 = "2.7.*"
+gtest = "1.18.*"
+benchmark = "1.9.*"
+libduckdb-devel = "1.5.*"                           # DuckDB C API: TEST ORACLE ONLY, never linked into src/
+duckdb-cli = "1.5.*"
+
+# ---- clang toolchain -> env `default` (primary compiler on every platform) ----
+[feature.clang.dependencies]
+clang = "23.1.*"
+clangxx = "23.1.*"
+clang-tools = "23.1.*"
+llvm-tools = "23.1.*"
+lld = "23.1.*"
+compiler-rt = "23.1.*"
+python = "3.14.*"       # run-clang-tidy, tools/ci/coverage.py
+
+[feature.clang.target.linux-64.dependencies]
+sysroot_linux-64 = "2.28.*"
+libstdcxx-devel_linux-64 = "15.*"  # clang uses conda libstdc++; NEVER -stdlib=libc++ with conda Arrow
+libgcc-devel_linux-64 = "15.*"     # keep in lockstep with libstdcxx-devel
+
+[feature.clang.target.linux-aarch64.dependencies]
+sysroot_linux-aarch64 = "2.28.*"
+libstdcxx-devel_linux-aarch64 = "15.*"
+libgcc-devel_linux-aarch64 = "15.*"
+
+[feature.clang.activation.env]
+CC = "clang"
+CXX = "clang++"
+
+# ---- env `default` (clang) ----
+[feature.clang.tasks.configure]
+description = "Configure build/dev (Debug + tests); cheap to re-run"
+cmd = "cmake --preset dev"
+
+[feature.clang.tasks.build]
+description = "Incremental Debug build into build/dev"
+cmd = "cmake --build --preset dev"
+depends-on = ["configure"]
+
+[feature.clang.tasks.test]
+description = "Build + hermetic tests (build/dev). Allowed ctest args: -R -E -L -j -N -V -VV --rerun-failed --output-on-failure --timeout --repeat --schedule-random --stop-on-failure"
+cmd = "bash scripts/ctest.sh dev"
+depends-on = ["build"]
+
+[feature.clang.tasks.antb1]
+description = "Run the dev CLI, e.g. `pixi run antb1 query -f q.sql --table t=f.parquet --format json`"
+cmd = "bash scripts/antb1.sh"
+depends-on = ["build"]
+
+[feature.clang.tasks.check]
+description = "REQUIRED before every PR: lint + `ci` (clang Debug -Werror, all hermetic tests)"
+depends-on = [{ task = "lint", environment = "lint" }, "ci"]
+
+[feature.clang.tasks.check-full]
+description = "All Linux x86-64 PR gates except data/CodeQL: check + asan + tidy + ci-gcc"
+depends-on = ["check", "asan", "tidy", { task = "ci-gcc", environment = "gcc" }]
+
+[feature.clang.tasks.ci]
+description = "clang Debug -Werror + hermetic tests -> build/ci/junit.xml"
+cmd = "cmake --workflow --preset ci"
+
+[feature.clang.tasks.asan]
+description = "CI leg clang-asan: ASan+UBSan -Werror + hermetic tests -> build/ci-asan"
+cmd = "cmake --workflow --preset ci-asan"
+
+[feature.clang.tasks.release]
+description = "CI leg macos-release (nightly arm64): RelWithDebInfo -Werror + hermetic tests -> build/ci-release"
+cmd = "cmake --workflow --preset ci-release"
+
+[feature.clang.tasks.tidy]
+description = "CI leg clang-tidy: clang-tidy on every TU (-Werror) -> build/tidy"
+cmd = "cmake --workflow --preset tidy"
+
+[feature.clang.tasks.doctor]
+description = "Environment/build/data status; `pixi run doctor --json` for machines"
+cmd = "bash scripts/doctor.sh"
+
+[feature.clang.tasks.clean]
+description = "Delete all build trees"
+cmd = "cmake -E rm -rf build"
+
+# ---- GCC 15 compatibility toolchain -> env `gcc` (CI leg gcc-compat + CodeQL traced build) ----
+[feature.gcc]
+platforms = ["linux-64"]
+
+[feature.gcc.dependencies]
+gcc = "15.*"
+gxx = "15.*"
+binutils = "*"
+sysroot_linux-64 = "2.28.*"
+
+[feature.gcc.activation.env]
+CC = "gcc"
+CXX = "g++"
+
+# ---- env `gcc` (GCC 15 compatibility) ----
+[feature.gcc.tasks.ci-gcc]
+description = "CI leg gcc-compat: GCC 15 Debug -Werror (GCC-only warnings) + hermetic tests -> build/ci-gcc"
+cmd = "cmake --workflow --preset ci-gcc"
+
+[feature.gcc.tasks.codeql-build]
+description = "Clean, no-ccache GCC build of src/ as traced by CodeQL -> build/codeql"
+cmd = "cmake -E rm -rf build/codeql && cmake --workflow --preset codeql"
+
+# ---- lint -> env `lint` (no C++ deps) ----
+[feature.lint.dependencies]
+python = "3.14.*"
+pytest = "*"
+bash = "5.*"
+pre-commit = "4.6.*"
+clang-format = "23.1.*"
+gersemi = "0.24.*"
+ruff = "0.16.*"
+typos = "1.50.*"
+actionlint = "1.7.*"
+shellcheck = "0.11.*"
+zizmor = "1.30.*"
+markdownlint-cli2 = "0.23.*"
+tombi = "1.5.*"
+
+# ---- env `lint` ----
+[feature.lint.tasks.lint]
+description = "CI job lint: READ-ONLY format checks, linters, zizmor --offline, repo drift/policy checks"
+cmd = "bash scripts/lint.sh"
+
+[feature.lint.tasks.fmt]
+description = "Format everything in place (C++, CMake, Python, TOML, Markdown)"
+cmd = "bash scripts/fmt.sh"
+
+[feature.lint.tasks.install-git-hooks]
+description = "Optional for humans: git uses .githooks/ (lint hooks on staged files, run through pixi)"
+cmd = "git config core.hooksPath .githooks"
+
+[environments]
+default = { features = ["clang"] }
+gcc = { features = ["gcc"] }
+lint = { features = ["lint"], no-default-feature = true }

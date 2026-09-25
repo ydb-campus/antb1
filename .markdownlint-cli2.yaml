@@ -1,0 +1,23 @@
+# markdownlint-cli2. `pixi run lint` checks; `pixi run fmt` runs `markdownlint-cli2 --fix` (fixable rules only).
+# House style: ATX headings, `-` bullets, fenced code blocks with a language, lines <= 120 (tables and code exempt).
+gitignore: true
+ignores:
+  - ".pixi/**"
+  - "build/**"
+  - ".cache/**"
+config:
+  default: true
+  MD003: { style: atx }
+  MD004: { style: dash }
+  MD009: { br_spaces: 0 } # no trailing spaces at all (no two-space line breaks; use <br> if one is really needed)
+  MD013: { line_length: 120, heading_line_length: 120, code_blocks: false, tables: false }
+  # A heading may directly follow or precede a text line (renders the same) to keep AGENTS.md <= 150 lines (R003).
+  # Lists keep their blank lines (MD032): a text line right after a list would render as part of the last item.
+  MD022: false
+  MD024: { siblings_only: true }
+  MD033: { allowed_elements: [br, details, summary] }
+  MD036: false # bold lead-in lines ("**Rules**") are fine
+  MD041: false # CLAUDE.md line 1 must be "@AGENTS.md" (R003); templates start with a comment
+  MD046: { style: fenced }
+  MD048: { style: backtick }
+  MD060: false # table pipe padding is cosmetic; `|---|---|` delimiter rows are allowed
