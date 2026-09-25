@@ -1,4 +1,4 @@
-antb1: parse error: expected a table name or a quoted file path
+antb1: parse error: expected a table name or a quoted file path, found end of input
   at line 1, column 21
   SELECT COUNT(*) FROM
                       ^

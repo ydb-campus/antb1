@@ -1,4 +1,4 @@
-antb1: unsupported error: clause 'GROUP' is not supported yet
+antb1: unsupported error: GROUP BY is not supported; see docs/sql-subset.md
   at line 1, column 24
   SELECT COUNT(*) FROM t GROUP BY CounterID
                          ^^^^^

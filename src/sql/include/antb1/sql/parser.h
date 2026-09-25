@@ -9,8 +9,11 @@
 namespace antb1::sql {
 
 // Parses one statement of the supported subset (docs/sql-subset.md); an optional trailing ';' is
-// allowed. SQL outside the subset yields ParseError::Kind::kUnsupported with the span of the first
-// offending token.
+// allowed. Recognized SQL outside the subset (GROUP BY, OR, function calls, ...) yields
+// ParseError::Kind::kUnsupported with the span of the first offending token and a message naming
+// the construct; malformed input yields kSyntax. Any byte sequence is accepted as input: Parse
+// never crashes, never recurses and stops working at the first error, and every error span lies
+// inside `text`.
 std::expected<SelectStatement, ParseError> Parse(std::string_view text);
 
 }  // namespace antb1::sql
