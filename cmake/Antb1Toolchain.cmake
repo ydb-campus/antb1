@@ -30,6 +30,15 @@ if(ANTB1_USE_CCACHE AND NOT CMAKE_CXX_COMPILER_LAUNCHER)
   endif()
 endif()
 
+# macOS: conda-forge's libc++ headers mark newer library functions (e.g. floating-point std::from_chars) as
+# unavailable below the macOS release whose *system* libc++ ships them. antb1 links the pixi environment's own
+# libc++ (rpath from the conda clang config), which provides them, so the markup does not apply; see
+# https://conda-forge.org/docs/maintainer/knowledge_base/#newer-c-features-with-old-sdk. Builds against the system
+# libc++ (no conda libc++ next to the compiler) keep Apple's availability checks.
+if(APPLE AND DEFINED ENV{CONDA_PREFIX} AND EXISTS "$ENV{CONDA_PREFIX}/lib/libc++.1.dylib")
+  add_compile_definitions(_LIBCPP_DISABLE_AVAILABILITY)
+endif()
+
 # Clang on Linux links with lld (faster than GNU ld; ships in the pixi env).
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
   set(CMAKE_LINKER_TYPE LLD)
