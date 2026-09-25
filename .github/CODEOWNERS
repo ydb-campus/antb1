@@ -1,0 +1,36 @@
+# Governance paths: changes here request a review from a maintainer (requested, not required: the ruleset has
+# require_code_owner_review=false; see docs/adr/0009-ci-and-governance.md).
+# Keep this list in sync with the governance path set G in tools/lint/check_repo.py (R012), the AGENTS.md
+# "Ask a human first" list and, later, the .claude ask rules. One pattern per line.
+# Switch the owners to an org team (@ydb-campus/antb1-maintainers) once one exists.
+
+/.github/ @Hor911 @lll-phill-lll
+/.githooks/ @Hor911 @lll-phill-lll
+/.claude/ @Hor911 @lll-phill-lll
+/.agents/ @Hor911 @lll-phill-lll
+/AGENTS.md @Hor911 @lll-phill-lll
+/CLAUDE.md @Hor911 @lll-phill-lll
+/pixi.toml @Hor911 @lll-phill-lll
+/pixi.lock @Hor911 @lll-phill-lll
+/CMakePresets.json @Hor911 @lll-phill-lll
+/cmake/ @Hor911 @lll-phill-lll
+/tools/github/ @Hor911 @lll-phill-lll
+/tools/lint/ @Hor911 @lll-phill-lll
+/tools/data/ @Hor911 @lll-phill-lll
+/tools/ci/coverage_thresholds.json @Hor911 @lll-phill-lll
+/.pre-commit-config.yaml @Hor911 @lll-phill-lll
+/.clang-format @Hor911 @lll-phill-lll
+/.clang-tidy @Hor911 @lll-phill-lll
+/tests/.clang-tidy @Hor911 @lll-phill-lll
+/scripts/ctest.sh @Hor911 @lll-phill-lll
+/scripts/agent-setup.sh @Hor911 @lll-phill-lll
+/tests/data/clickbench_status.json @Hor911 @lll-phill-lll
+/scripts/lint.sh @Hor911 @lll-phill-lll
+/scripts/fmt.sh @Hor911 @lll-phill-lll
+/tools/sanitizers/ @Hor911 @lll-phill-lll
+/.markdownlint-cli2.yaml @Hor911 @lll-phill-lll
+/_typos.toml @Hor911 @lll-phill-lll
+/ruff.toml @Hor911 @lll-phill-lll
+/.gersemirc @Hor911 @lll-phill-lll
+/tombi.toml @Hor911 @lll-phill-lll
+/docs/adr/ @Hor911 @lll-phill-lll

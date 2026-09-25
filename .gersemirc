@@ -1,0 +1,7 @@
+# gersemi (CMake formatter). `pixi run fmt` applies it; `pixi run lint` checks it (read-only).
+# `definitions` teaches gersemi the keyword signatures of our own functions (antb1_add_module, antb1_add_gtest, ...).
+definitions: [cmake]
+indent: 2
+line_length: 120
+list_expansion: favour-inlining
+warn_about_unknown_commands: true

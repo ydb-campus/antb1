@@ -1,0 +1,2 @@
+# Clang -fsanitize-ignorelist entries (compile time). Every entry needs a justification comment.
+# Format: https://clang.llvm.org/docs/SanitizerSpecialCaseList.html

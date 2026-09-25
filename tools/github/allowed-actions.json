@@ -1,0 +1,18 @@
+{
+  "github_owned_allowed": true,
+  "verified_allowed": false,
+  "patterns_allowed": [
+    "amannn/action-semantic-pull-request@*",
+    "anthropics/claude-code-action@*",
+    "benchmark-action/github-action-benchmark@*",
+    "marocchino/sticky-pull-request-comment@*",
+    "mikepenz/action-junit-report@*",
+    "openai/codex-action@*",
+    "oven-sh/setup-bun@*",
+    "ossf/scorecard-action@*",
+    "peter-evans/create-pull-request@*",
+    "prefix-dev/setup-pixi@*",
+    "re-actors/alls-green@*",
+    "zizmorcore/zizmor-action@*"
+  ]
+}

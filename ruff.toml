@@ -1,0 +1,17 @@
+# ruff (Python formatter and linter) for the repository tooling (tools/**/*.py).
+# `pixi run fmt` formats and applies safe fixes; `pixi run lint` only checks.
+# The lint env runs Python 3.14, but the tooling stays valid for Python >= 3.11 (tomllib) so any runner can import it.
+line-length = 120
+target-version = "py311"
+
+[lint]
+select = [
+    "B",    # flake8-bugbear
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "I",    # isort
+    "RUF",  # ruff-specific
+    "SIM",  # flake8-simplify
+    "UP",   # pyupgrade
+    "W",    # pycodestyle warnings
+]

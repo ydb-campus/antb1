@@ -1,0 +1,191 @@
+# Required check: `CI OK` (the aggregator below). Every job name contains the local command that reproduces it;
+# see docs/ci.md. Hardening rules (tools/lint/check_repo.py R010/R015, zizmor, actionlint): top-level
+# `permissions: {}`, minimal per-job permissions, timeouts everywhere, SHA-pinned actions, no credentials left in
+# .git, no `${{ github.event.* }}` in `run:`, caches written only from main.
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  merge_group:
+  schedule:
+    - cron: "30 2 * * *" # daily full run on main: the only run (with workflow_dispatch) that saves ccache
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  # PRs share one group per PR number (a new push cancels the old run); every other event gets its own group,
+  # so pushes and scheduled runs on main are never dropped.
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    name: lint (pixi run lint)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read # checkout; dependency-review compares the dependency graph of base and head
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
+        with:
+          pixi-version: v0.81.0
+          environments: lint
+          locked: true
+          cache: true
+          cache-key: pixi-${{ hashFiles('pixi.lock') }}-
+          cache-write: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - name: Lint (pixi run lint)
+        run: pixi run --frozen -e lint lint
+      - name: Dependency review (PRs only; folded into lint to save a job slot)
+        if: github.event_name == 'pull_request'
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: moderate
+          comment-summary-in-pr: never
+
+  build-test:
+    name: ${{ matrix.name }} (pixi run ${{ matrix.task }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: read # checkout
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Clang 23 (env `default`) is the primary compiler; GCC 15 (env `gcc`, linux-64 only) is a compatibility leg.
+          - name: clang-asan
+            os: ubuntu-24.04
+            pixi_env: default
+            task: asan
+            preset: ci-asan
+            parallel: 4
+          - name: gcc-compat
+            os: ubuntu-24.04
+            pixi_env: gcc
+            task: ci-gcc
+            preset: ci-gcc
+            parallel: 4
+          - name: macos-release
+            os: macos-15 # arm64: 3 cores, 7 GB RAM
+            pixi_env: default
+            task: release
+            preset: ci-release
+            parallel: 3
+    env:
+      CCACHE_MAXSIZE: 250M
+      CMAKE_BUILD_PARALLEL_LEVEL: ${{ matrix.parallel }}
+      PIXI_ENV: ${{ matrix.pixi_env }}
+      TASK: ${{ matrix.task }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
+        with:
+          pixi-version: v0.81.0
+          environments: ${{ matrix.pixi_env }}
+          locked: true
+          cache: true
+          cache-key: pixi-${{ hashFiles('pixi.lock') }}-
+          cache-write: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - name: Restore ccache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/ccache # CCACHE_DIR of every build preset (CMakePresets.json)
+          key: ccache-${{ matrix.name }}-${{ github.run_id }}
+          restore-keys: ccache-${{ matrix.name }}-
+      - name: Build and test
+        run: pixi run --frozen -e "$PIXI_ENV" "$TASK"
+      - name: Save ccache (main, scheduled or manual runs only)
+        if: >-
+          ${{ !cancelled() && github.ref == 'refs/heads/main'
+          && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/ccache
+          key: ccache-${{ matrix.name }}-${{ github.run_id }}
+      - name: Test report
+        if: ${{ !cancelled() }}
+        uses: mikepenz/action-junit-report@a9170d5795813c01ab4901ffb045b52bab4ab09d # v6.5.0
+        with:
+          report_paths: build/${{ matrix.preset }}/junit.xml
+          annotate_only: true
+          job_summary: true
+          detailed_summary: true
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: logs-${{ matrix.name }}
+          path: |
+            build/${{ matrix.preset }}/Testing/Temporary/LastTest*.log
+            build/${{ matrix.preset }}/junit.xml
+          retention-days: 7
+          if-no-files-found: ignore
+      - name: Disk usage
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo '### Disk usage'
+            echo '```text'
+            df -h .
+            du -sh .pixi build .cache 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # clang-tidy runs as the compiler launcher of the `tidy` preset, which disables ccache (ANTB1_USE_CCACHE=OFF),
+  # so this job has no ccache steps; it has no tests, so no JUnit report or test logs either.
+  clang-tidy:
+    name: clang-tidy (pixi run tidy)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read # checkout
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: 4
+      TASK: tidy
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
+        with:
+          pixi-version: v0.81.0
+          environments: default
+          locked: true
+          cache: true
+          cache-key: pixi-${{ hashFiles('pixi.lock') }}-
+          cache-write: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - name: clang-tidy
+        run: pixi run --frozen -e default "$TASK"
+      - name: Disk usage
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo '### Disk usage'
+            echo '```text'
+            df -h .
+            du -sh .pixi build 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  ci-ok:
+    name: CI OK
+    if: always()
+    needs: [lint, build-test, clang-tidy]
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: All required jobs succeeded
+        uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # v1.3.0
+        with:
+          jobs: ${{ toJSON(needs) }}

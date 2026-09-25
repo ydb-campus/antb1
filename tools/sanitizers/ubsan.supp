@@ -1,0 +1,2 @@
+# UBSan runtime suppressions (UBSAN_OPTIONS=suppressions=...). Every entry needs a justification comment
+# and a tracking issue. Prefer fixing the code. Format: <check>:<file or function pattern>

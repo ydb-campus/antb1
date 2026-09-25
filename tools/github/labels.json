@@ -1,0 +1,22 @@
+[
+  { "name": "dependencies", "color": "0366d6", "description": "Dependency updates" },
+  { "name": "github-actions", "color": "000000", "description": "GitHub Actions workflow or action updates" },
+  { "name": "pixi", "color": "f7c948", "description": "pixi.toml or pixi.lock changes" },
+  { "name": "agent-task", "color": "7057ff", "description": "Scoped task suitable for an AI agent" },
+  { "name": "claude", "color": "d97757", "description": "Issues: triggers @claude (author needs write)" },
+  { "name": "codex-review", "color": "10a37f", "description": "Re-run the Codex harness audit on a PR" },
+  { "name": "performance", "color": "d93f0b", "description": "Run benchmarks on a PR" },
+  { "name": "nightly-failure", "color": "b60205", "description": "Opened automatically when the nightly run fails" },
+  { "name": "security", "color": "b60205", "description": "Security-relevant change or report" },
+  { "name": "breaking-change", "color": "e11d21", "description": "Incompatible CLI, output or semantics change" },
+  { "name": "area:sql", "color": "c5def5", "description": "Module sql: lexer, parser, unparser" },
+  { "name": "area:plan", "color": "c5def5", "description": "Module plan: binder, types, logical plan" },
+  { "name": "area:io", "color": "c5def5", "description": "Module io: Parquet tables and globs" },
+  { "name": "area:exec", "color": "c5def5", "description": "Module exec: physical operators" },
+  { "name": "area:engine", "color": "c5def5", "description": "Module engine: session and result formatting" },
+  { "name": "area:cli", "color": "c5def5", "description": "Module cli: the antb1 command line" },
+  { "name": "area:tests", "color": "c5def5", "description": "Test harness, fixtures and test data policy" },
+  { "name": "area:ci", "color": "c5def5", "description": "CI workflows, presets and toolchain" },
+  { "name": "area:docs", "color": "c5def5", "description": "Documentation and ADRs" },
+  { "name": "area:agents", "color": "c5def5", "description": "AI agent integration (AGENTS.md, skills, workflows)" }
+]

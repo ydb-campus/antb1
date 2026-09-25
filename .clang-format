@@ -1,0 +1,17 @@
+---
+Language: Cpp
+BasedOnStyle: Google
+ColumnLimit: 100
+DerivePointerAlignment: false
+PointerAlignment: Left
+IncludeBlocks: Regroup
+IncludeCategories:
+  - Regex: '^<[a-z_]+>$'          # C++ standard headers
+    Priority: 1
+  - Regex: '^<(arrow|parquet|duckdb|CLI|gtest|gmock|benchmark)[/.]'
+    Priority: 2
+  - Regex: '^"antb1/'
+    Priority: 3
+  - Regex: '.*'
+    Priority: 4
+...

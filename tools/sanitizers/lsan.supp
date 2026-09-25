@@ -1,0 +1,2 @@
+# LeakSanitizer suppressions (LSAN_OPTIONS=suppressions=...). Every entry needs a justification comment.
+# Format: leak:<function/library pattern>

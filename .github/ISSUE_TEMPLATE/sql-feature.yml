@@ -1,0 +1,45 @@
+name: SQL feature
+description: Propose new SQL syntax, a function or an aggregate for the engine.
+title: "feat(sql): "
+type: Feature
+labels: ["area:sql"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The supported subset and the DuckDB-compatible semantics are described in docs/sql-subset.md.
+        Architecture changes (new modules or module edges) need an ADR first (docs/adr/).
+  - type: textarea
+    id: sql
+    attributes:
+      label: SQL example
+      description: One or more queries that should work, written against your own small table.
+      render: sql
+      placeholder: |
+        SELECT COUNT(*) FROM t WHERE x > 10 LIMIT 5
+    validations:
+      required: true
+  - type: textarea
+    id: semantics
+    attributes:
+      label: Expected semantics
+      description: |
+        Types, NULL handling, overflow and error cases. antb1 follows DuckDB unless docs/sql-subset.md records a
+        divergence; say where your expectation differs.
+    validations:
+      required: true
+  - type: input
+    id: clickbench
+    attributes:
+      label: ClickBench queries
+      description: Which ClickBench query numbers need this feature, if any (numbers only, no answers).
+      placeholder: Q7, Q8
+    validations:
+      required: false
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Implementation ideas, affected modules (sql, plan, io, exec, engine, cli), alternatives.
+    validations:
+      required: false

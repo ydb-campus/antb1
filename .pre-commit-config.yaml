@@ -1,0 +1,67 @@
+# Lint gate for `pixi run lint` (scripts/lint.sh) and the optional git hook (.githooks/pre-commit).
+# READ-ONLY: every hook only checks; `pixi run fmt` (scripts/fmt.sh) applies the fixes.
+# Local hooks only: the tools come from the pixi `lint` environment (pixi.toml), so pre-commit never downloads
+# anything (`language: unsupported` runs the entry from PATH).
+minimum_pre_commit_version: "4.4.0"
+fail_fast: false
+exclude: '^(pixi\.lock|\.pixi/|build/|\.cache/)'
+repos:
+  - repo: local
+    hooks:
+      - id: clang-format
+        name: clang-format (C/C++)
+        entry: clang-format --dry-run -Werror --style=file
+        language: unsupported
+        types_or: [c, c++]
+      - id: gersemi
+        name: gersemi (CMake)
+        entry: gersemi --check --no-cache
+        language: unsupported
+        files: '(^|/)(CMakeLists\.txt|[^/]+\.cmake)$'
+      - id: ruff-format
+        name: ruff format (Python)
+        entry: ruff format --check
+        language: unsupported
+        types: [python]
+      - id: ruff-check
+        name: ruff check (Python)
+        entry: ruff check
+        language: unsupported
+        types: [python]
+      - id: tombi
+        name: tombi format (TOML)
+        entry: tombi format --check --offline
+        language: unsupported
+        types: [toml]
+      - id: markdownlint
+        name: markdownlint-cli2 (Markdown)
+        entry: markdownlint-cli2
+        language: unsupported
+        types: [markdown]
+      - id: typos
+        name: typos (spelling)
+        entry: typos --force-exclude
+        language: unsupported
+        types: [text]
+      - id: shellcheck
+        name: shellcheck (shell)
+        entry: shellcheck
+        language: unsupported
+        types: [shell]
+      - id: actionlint
+        name: actionlint (workflows)
+        entry: actionlint
+        language: unsupported
+        files: '^\.github/workflows/[^/]+\.ya?ml$'
+      - id: zizmor
+        name: zizmor --offline (GitHub Actions security)
+        entry: zizmor --offline .
+        language: unsupported
+        pass_filenames: false
+        files: '^(\.github/|\.pre-commit-config\.yaml$)'
+      - id: check-repo
+        name: check_repo.py (repo drift and policy, R001-R015)
+        entry: python tools/lint/check_repo.py
+        language: unsupported
+        pass_filenames: false
+        always_run: true
