@@ -1,0 +1,1 @@
+SELECT /* never closed COUNT(*) FROM sales

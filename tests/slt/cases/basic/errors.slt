@@ -1,0 +1,68 @@
+# Statements both engines reject. antb1 must fail with a query error (parse, bind, io, execution):
+# an Unsupported answer fails the test.
+
+statement error
+SELECT COUNT(*) FROM no_such_table
+
+statement error
+SELECT COUNT(*) FROM '${FIXTURES}/no_such_file.parquet'
+
+statement error
+SELECT COUNT(*) FROM '${FIXTURES}/no_such_*.parquet'
+
+statement error
+SELECT COUNT(*) FROM
+
+statement error
+SELECT COUNT(*) FROM hits_like)
+
+statement error
+SELECT COUNT(*) FROM 'unterminated
+
+statement error
+SELECT COUNT(*) FROM hits_like /* unterminated comment
+
+# The error kinds antb1 reports (the CLI maps them to exit codes 1 and 3).
+
+onlyif antb1
+statement error ^bind: .*no_such_table
+SELECT COUNT(*) FROM no_such_table
+
+onlyif antb1
+statement error ^io: .*no_such_file\.parquet
+SELECT COUNT(*) FROM '${FIXTURES}/no_such_file.parquet'
+
+onlyif antb1
+statement error ^io: no files match
+SELECT COUNT(*) FROM '${FIXTURES}/no_such_*.parquet'
+
+onlyif antb1
+statement error ^parse: expected a table name
+SELECT COUNT(*) FROM
+
+onlyif antb1
+statement error ^parse: unexpected
+SELECT COUNT(*) FROM hits_like)
+
+onlyif antb1
+statement error ^parse: unterminated
+SELECT COUNT(*) FROM 'unterminated
+
+# antb1 rejects files with different schemas in one table; DuckDB reads them (known divergence).
+onlyif antb1
+statement error ^io: schema of .* differs
+SELECT COUNT(*) FROM '${FIXTURES}/*.parquet'
+
+# The error types DuckDB reports.
+
+onlyif duckdb
+statement error ^Catalog Error:
+SELECT COUNT(*) FROM no_such_table
+
+onlyif duckdb
+statement error ^IO Error: No files found
+SELECT COUNT(*) FROM '${FIXTURES}/no_such_file.parquet'
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM hits_like)

@@ -1,0 +1,19 @@
+{
+  "_comment": [
+    "Coverage floors (percent) per module, checked by `pixi run coverage` (tools/ci/coverage.py): clang source-based",
+    "line and branch coverage of src/<module>/ (module unit tests excluded) by the hermetic tests.",
+    "Floors only go up: each is the measured value minus 2, rounded down to 0.1 (stub modules 0). A PR that raises",
+    "a module's coverage may raise its floors; a slice PR that extends a module sets them again from its measurement.",
+    "Long-term targets (lines / branches): common, sql and plan 90 / 75; io, exec and engine 85 / 70; cli 60 / 40.",
+    "Measured 2026-09-25 (lines / branches): common 94.12 / 92.31, sql 80.45 / 73.06, plan 87.14 / 81.95,",
+    "io 93.33 / 87.84, exec 92.73 / 72.41, engine 86.18 / 73.89, cli 95.40 / 85.37.",
+    "A module without branches (or lines) is N/A for that floor."
+  ],
+  "common": { "lines": 92.1, "branches": 90.3 },
+  "sql": { "lines": 78.4, "branches": 71.0 },
+  "plan": { "lines": 85.1, "branches": 79.9 },
+  "io": { "lines": 91.3, "branches": 85.8 },
+  "exec": { "lines": 90.7, "branches": 70.4 },
+  "engine": { "lines": 84.1, "branches": 71.8 },
+  "cli": { "lines": 93.4, "branches": 83.3 }
+}

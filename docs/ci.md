@@ -11,9 +11,9 @@ behind this setup are in [ADR 0009](adr/0009-ci-and-governance.md).
 | `CI` | `.github/workflows/ci.yml` | pull requests to `main`, pushes to `main`, merge queue, daily schedule, manual | build, test, lint; required check `CI OK` |
 | `PR title` | `.github/workflows/pr-title.yml` | pull requests (opened, edited, reopened, synchronized), merge queue | Conventional Commits title; required check `PR title` |
 
-Later PRs add CodeQL (a merge gate through the ruleset), a nightly workflow (long fuzzing, TSan, ARM64, extended
-differential tests), benchmarks, security scanning (zizmor, OpenSSF Scorecard), an agent bootstrap check and the AI
-review workflows. The ClickBench data job and the coverage and fuzz job join `CI` later as well.
+Later PRs add CodeQL (a merge gate through the ruleset), a nightly workflow (long fuzzing, TSan, shuffled test
+order, ARM64, extended differential tests), benchmarks, security scanning (zizmor, OpenSSF Scorecard), an agent
+bootstrap check and the AI review workflows. The ClickBench data job joins `CI` later as well.
 
 ## Required checks
 
@@ -42,6 +42,8 @@ a merge queue (`merge_group` is already wired) can take over when PR volume need
 | `gcc-compat (pixi run ci-gcc)` | ubuntu-24.04 | `gcc` | `pixi run ci-gcc` |
 | `macos-release (pixi run release)` | macos-15 (arm64) | `default` | `pixi run release` (on a Mac) |
 | `clang-tidy (pixi run tidy)` | ubuntu-24.04 | `default` | `pixi run tidy` |
+| `clang-coverage-fuzz (pixi run coverage && pixi run fuzz-smoke)` | ubuntu-24.04 | `default` | `pixi run coverage` · `pixi run fuzz-smoke` |
+| `coverage-comment` (advisory) | ubuntu-slim | none | read `build/coverage/summary.md` after `pixi run coverage` |
 | `CI OK` | ubuntu-slim | none | aggregator, nothing to run |
 | `PR title` | ubuntu-slim | none | check the title against the rules above |
 
@@ -54,9 +56,22 @@ a merge queue (`merge_group` is already wired) can take over when PR volume need
 - `macos-release` is a RelWithDebInfo build with `-Werror` against libc++ on Apple silicon, followed by the hermetic
   tests.
 - `clang-tidy` runs clang-tidy on every translation unit, with warnings as errors.
+- `clang-coverage-fuzz` runs two Clang-only gates. `pixi run coverage` builds with source-based coverage, runs the
+  hermetic tests and fails when a module drops below its floor in `tools/ci/coverage_thresholds.json`; its per-module
+  table goes to the job summary and to the `coverage-summary` artifact. `pixi run fuzz-smoke` then runs even when
+  coverage failed: a deterministic libFuzzer run of the SQL parser (seed 1, 200,000 runs, ASan and UBSan) and the
+  corpus replay. On a fuzz failure the crash inputs are uploaded as the `fuzz-artifacts` artifact for 14 days. See
+  [testing.md](testing.md#coverage) for the floors and [testing.md](testing.md#fuzzing) for fuzzing.
+- `coverage-comment` is advisory and not part of `CI OK`. On pull requests from branches of this repository it posts
+  the coverage table as one sticky PR comment and updates it on every push. It only downloads the
+  `coverage-summary` artifact, never checks out or runs PR code, and is the only job with `pull-requests: write`.
+  Fork PRs get no comment (their token cannot write); the table is still in the job summary.
 - `pixi run ci` (Clang Debug `-Werror` plus tests) is not a separate job; it is the fast local gate inside
   `pixi run check`.
-- `pixi run check-full` runs every Linux gate above in one command: lint, `ci`, `asan`, `tidy` and `ci-gcc`.
+- `pixi run check-full` runs every Linux gate above in one command: `check` (lint and `ci`), `asan`, `tidy`,
+  `coverage`, `fuzz-smoke` and `ci-gcc`.
+- `pixi run tsan` (ThreadSanitizer), `pixi run ci-shuffle` (random test order) and `pixi run fuzz` (long fuzzing) are
+  deep checks, not PR gates; the nightly workflow that runs them is added in a later PR.
 - `pixi run codeql-build` reproduces the GCC build that the CodeQL workflow will trace.
 
 CI always calls tasks with an explicit environment and a frozen lock, for example
@@ -65,10 +80,20 @@ prefix-dev/setup-pixi.
 
 ## Test reports and logs
 
-Test jobs write JUnit XML to `build/<preset>/junit.xml`. The results appear as annotations on the PR and in the job
-summary. When a job fails, the ctest logs and the JUnit file are uploaded as the `logs-<job>` artifact and kept for 7
-days. The build jobs and `clang-tidy` also write their disk usage to the job summary. Timing and cache measurements
-are recorded here once enough runs exist.
+Test jobs write JUnit XML to `build/<preset>/junit.xml` (`clang-coverage-fuzz`: `build/coverage/junit.xml` and
+`build/fuzz/junit.xml`). The results appear as annotations on the PR and in the job summary. When a job fails, the
+ctest logs and the JUnit files are uploaded as the `logs-<job>` artifact and kept for 7 days. The build jobs and
+`clang-tidy` also write their disk usage to the job summary. Timing and cache measurements are recorded here once
+enough runs exist.
+
+| Artifact | Job | When | Kept |
+| --- | --- | --- | --- |
+| `logs-<job>` | every test job | on failure | 7 days |
+| `coverage-summary` | `clang-coverage-fuzz` | always (when the report exists) | 7 days |
+| `fuzz-artifacts` | `clang-coverage-fuzz` | when the fuzz smoke run fails | 14 days |
+
+Artifacts never contain data: the coverage summary holds only percentages, and fuzz inputs grow from our own seed
+corpus.
 
 ## Caches
 
@@ -89,6 +114,12 @@ are recorded here once enough runs exist.
 4. For a sanitizer finding, run `pixi run asan`, fix the code and add a regression test; do not add a suppression
    without a maintainer's agreement.
 5. For a lint failure, run `pixi run fmt`, then `pixi run lint`; the drift checks print the file, line and fix.
+6. For a coverage failure, run `pixi run coverage` and read `build/coverage/summary.md` (module and metric) and
+   `build/coverage/report.txt` (files); add tests rather than lowering a floor.
+7. For a fuzz failure, download the `fuzz-artifacts` artifact (or run `pixi run fuzz-smoke`) and follow
+   [fuzz/regressions/README.md](../fuzz/regressions/README.md): reproduce, minimize, commit the input with the fix.
+8. For a failing random differential case, run the repro line that the failure prints:
+   `ANTB1_DIFF_SEED=<seed> ANTB1_DIFF_ONLY=<case> pixi run diff-random`.
 
 ## Workflow security rules
 
@@ -102,7 +133,9 @@ enforces them:
 - the checkout action with `persist-credentials: false`;
 - no `pull_request_target` or `workflow_run` triggers, and no `${{ github.event.* }}` expressions inside `run:`
   (values are passed through `env:`);
-- caches are written only from `main`.
+- caches are written only from `main`;
+- a job that needs a write permission (today only `coverage-comment`, with `pull-requests: write`) never checks out
+  or runs code from the pull request.
 
 The repository settings (`tools/github/apply-settings.sh`) add the rest: workflow runs from external contributors'
 forks need a maintainer's approval, and GitHub Actions cannot approve pull requests.

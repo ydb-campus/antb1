@@ -1,0 +1,7 @@
+# Redaction canary (harness.slt.redact): `antb1-slt run --redact --mutate value` must report the mismatch
+# without the SQL text and without any value. Keep exactly this one record.
+
+query I nosort
+SELECT COUNT(*) FROM hits_like_required
+----
+10000

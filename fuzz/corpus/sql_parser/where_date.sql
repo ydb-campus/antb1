@@ -1,0 +1,1 @@
+SELECT MIN(day), MAX(day) FROM sales WHERE day >= DATE '2024-01-01' AND day < DATE '2024-02-01'

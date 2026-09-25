@@ -1,0 +1,1 @@
+SELECT region, COUNT(*) FROM sales GROUP BY region ORDER BY 2 DESC

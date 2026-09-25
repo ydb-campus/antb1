@@ -1,0 +1,4 @@
+antb1: unsupported error: clause 'GROUP' is not supported yet
+  at line 1, column 24
+  SELECT COUNT(*) FROM t GROUP BY CounterID
+                         ^^^^^

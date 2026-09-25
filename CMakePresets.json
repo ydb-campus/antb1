@@ -12,11 +12,13 @@
         "CMAKE_BUILD_TYPE": "Debug",
         "CMAKE_PREFIX_PATH": "$env{CONDA_PREFIX}",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "ANTB1_BUILD_TESTS": "ON"
+        "ANTB1_BUILD_TESTS": "ON",
+        "ANTB1_WITH_DUCKDB": "ON"
       }
     },
     { "name": "werror", "hidden": true, "cacheVariables": { "CMAKE_COMPILE_WARNING_AS_ERROR": "ON" } },
     { "name": "san-address", "hidden": true, "cacheVariables": { "ANTB1_SANITIZE": "address;undefined" } },
+    { "name": "clang-only", "hidden": true, "cacheVariables": { "ANTB1_REQUIRE_COMPILER": "Clang" } },
     { "name": "dev", "displayName": "Debug (inner loop)", "inherits": ["base"] },
     { "name": "ci", "displayName": "CI clang-debug: Debug -Werror", "inherits": ["werror", "base"] },
     {
@@ -47,6 +49,28 @@
       "displayName": "CodeQL traced build (pixi env gcc, no ccache, no tests)",
       "inherits": ["base"],
       "cacheVariables": { "ANTB1_BUILD_TESTS": "OFF", "ANTB1_USE_CCACHE": "OFF", "ANTB1_REQUIRE_COMPILER": "GNU" }
+    },
+    {
+      "name": "coverage",
+      "displayName": "CI clang-coverage-fuzz: clang source-based coverage, Debug",
+      "inherits": ["clang-only", "base"],
+      "cacheVariables": { "ANTB1_COVERAGE": "ON" }
+    },
+    {
+      "name": "fuzz",
+      "displayName": "CI clang-coverage-fuzz: libFuzzer + ASan+UBSan, common/sql/fuzz only, RelWithDebInfo -Werror",
+      "inherits": ["werror", "san-address", "clang-only", "base"],
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "ANTB1_BUILD_FUZZERS": "ON",
+        "ANTB1_FUZZ_ONLY": "ON"
+      }
+    },
+    {
+      "name": "tsan",
+      "displayName": "Nightly tsan: ThreadSanitizer, RelWithDebInfo",
+      "inherits": ["clang-only", "base"],
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo", "ANTB1_SANITIZE": "thread" }
     }
   ],
   "buildPresets": [
@@ -66,7 +90,10 @@
     { "name": "ci-release", "configurePreset": "ci-release", "inherits": ["build-base"] },
     { "name": "ci-gcc", "configurePreset": "ci-gcc", "inherits": ["build-base"] },
     { "name": "tidy", "configurePreset": "tidy", "inherits": ["build-base"] },
-    { "name": "codeql", "configurePreset": "codeql", "inherits": ["build-base"] }
+    { "name": "codeql", "configurePreset": "codeql", "inherits": ["build-base"] },
+    { "name": "coverage", "configurePreset": "coverage", "inherits": ["build-base"] },
+    { "name": "fuzz", "configurePreset": "fuzz", "inherits": ["build-base"] },
+    { "name": "tsan", "configurePreset": "tsan", "inherits": ["build-base"] }
   ],
   "testPresets": [
     {
@@ -102,7 +129,36 @@
     { "name": "ci", "configurePreset": "ci", "inherits": ["hermetic"] },
     { "name": "ci-asan", "configurePreset": "ci-asan", "inherits": ["sanitizer-env", "hermetic"] },
     { "name": "ci-release", "configurePreset": "ci-release", "inherits": ["hermetic"] },
-    { "name": "ci-gcc", "configurePreset": "ci-gcc", "inherits": ["hermetic"] }
+    { "name": "ci-gcc", "configurePreset": "ci-gcc", "inherits": ["hermetic"] },
+    {
+      "name": "coverage",
+      "configurePreset": "coverage",
+      "inherits": ["hermetic"],
+      "environment": { "LLVM_PROFILE_FILE": "${sourceDir}/build/coverage/prof/%m-%p.profraw" }
+    },
+    {
+      "name": "tsan",
+      "configurePreset": "tsan",
+      "inherits": ["hermetic"],
+      "environment": {
+        "ARROW_DEFAULT_MEMORY_POOL": "system",
+        "TSAN_OPTIONS": "halt_on_error=1:second_deadlock_stack=1"
+      }
+    },
+    {
+      "name": "fuzz",
+      "configurePreset": "fuzz",
+      "inherits": ["sanitizer-env", "test-common"],
+      "filter": { "include": { "label": "^(fuzz|fuzz-replay)$" } }
+    },
+    {
+      "name": "ci-shuffle",
+      "displayName": "Nightly ci-shuffle: the ci build, tests in random order, each repeated until it fails (max 2)",
+      "configurePreset": "ci",
+      "inherits": ["hermetic"],
+      "output": { "outputJUnitFile": "junit-shuffle.xml" },
+      "execution": { "scheduleRandom": true, "repeat": { "mode": "until-fail", "count": 2 } }
+    }
   ],
   "workflowPresets": [
     {
@@ -149,6 +205,38 @@
       "steps": [
         { "type": "configure", "name": "codeql" },
         { "type": "build", "name": "codeql" }
+      ]
+    },
+    {
+      "name": "coverage",
+      "steps": [
+        { "type": "configure", "name": "coverage" },
+        { "type": "build", "name": "coverage" },
+        { "type": "test", "name": "coverage" }
+      ]
+    },
+    {
+      "name": "fuzz",
+      "steps": [
+        { "type": "configure", "name": "fuzz" },
+        { "type": "build", "name": "fuzz" },
+        { "type": "test", "name": "fuzz" }
+      ]
+    },
+    {
+      "name": "tsan",
+      "steps": [
+        { "type": "configure", "name": "tsan" },
+        { "type": "build", "name": "tsan" },
+        { "type": "test", "name": "tsan" }
+      ]
+    },
+    {
+      "name": "ci-shuffle",
+      "steps": [
+        { "type": "configure", "name": "ci" },
+        { "type": "build", "name": "ci" },
+        { "type": "test", "name": "ci-shuffle" }
       ]
     }
   ]

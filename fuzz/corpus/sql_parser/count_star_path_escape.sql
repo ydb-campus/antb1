@@ -1,0 +1,1 @@
+SELECT COUNT(*) FROM 'it''s here/x.parquet'

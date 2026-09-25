@@ -1,0 +1,4 @@
+antb1: parse error: expected a table name or a quoted file path
+  at line 1, column 21
+  SELECT COUNT(*) FROM
+                      ^

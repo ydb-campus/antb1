@@ -1,0 +1,1 @@
+SELECT SUM(delta) FROM moves WHERE delta < -42 AND delta != -7

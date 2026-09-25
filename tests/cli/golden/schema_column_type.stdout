@@ -1,0 +1,9 @@
+edge
+  id	INTEGER
+  i16	SMALLINT
+  i32	INTEGER
+  i64	BIGINT
+  u16	DATE
+  d	DOUBLE
+  s	VARCHAR
+  u	VARCHAR

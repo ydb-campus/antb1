@@ -4,6 +4,8 @@ include_guard(GLOBAL)
 option(ANTB1_USE_CCACHE "Use ccache when available" ON)
 set(ANTB1_SANITIZE "" CACHE STRING "Sanitizers: 'address;undefined' or 'thread'")
 option(ANTB1_COVERAGE "Clang source-based coverage instrumentation" OFF)
+option(ANTB1_BUILD_FUZZERS "Build the libFuzzer targets in fuzz/ (Clang only)" OFF)
+set(ANTB1_FUZZ_ENGINE "-fsanitize=fuzzer" CACHE STRING "Link flags or library of the fuzzing engine (fuzz targets)")
 set(ANTB1_REQUIRE_COMPILER "" CACHE STRING "Fail unless CMAKE_CXX_COMPILER_ID matches (e.g. GNU)")
 
 if(ANTB1_REQUIRE_COMPILER AND NOT CMAKE_CXX_COMPILER_ID MATCHES "${ANTB1_REQUIRE_COMPILER}")
@@ -26,6 +28,15 @@ if(ANTB1_USE_CCACHE AND NOT CMAKE_CXX_COMPILER_LAUNCHER)
   if(ANTB1_CCACHE_EXE)
     set(CMAKE_CXX_COMPILER_LAUNCHER "${ANTB1_CCACHE_EXE}")
   endif()
+endif()
+
+# macOS: conda-forge's libc++ headers mark newer library functions (e.g. floating-point std::from_chars) as
+# unavailable below the macOS release whose *system* libc++ ships them. antb1 links the pixi environment's own
+# libc++ (rpath from the conda clang config), which provides them, so the markup does not apply; see
+# https://conda-forge.org/docs/maintainer/knowledge_base/#newer-c-features-with-old-sdk. Builds against the system
+# libc++ (no conda libc++ next to the compiler) keep Apple's availability checks.
+if(APPLE AND DEFINED ENV{CONDA_PREFIX} AND EXISTS "$ENV{CONDA_PREFIX}/lib/libc++.1.dylib")
+  add_compile_definitions(_LIBCPP_DISABLE_AVAILABILITY)
 endif()
 
 # Clang on Linux links with lld (faster than GNU ld; ships in the pixi env).
@@ -59,4 +70,10 @@ if(ANTB1_COVERAGE)
   endif()
   add_compile_options(-fprofile-instr-generate -fcoverage-mapping)
   add_link_options(-fprofile-instr-generate)
+endif()
+
+# The libFuzzer instrumentation (-fsanitize=fuzzer-no-link) is added per target in fuzz/CMakeLists.txt (common,
+# sql and the fuzz targets), never globally.
+if(ANTB1_BUILD_FUZZERS AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  message(FATAL_ERROR "ANTB1_BUILD_FUZZERS requires Clang (libFuzzer). Run `pixi run fuzz-smoke` or `pixi run fuzz`.")
 endif()

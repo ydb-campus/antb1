@@ -1,0 +1,127 @@
+# The canonical value text (tests/slt/runner/canonical.h) on the edge and hits-like fixtures: integer
+# extremes, 128-bit sums, doubles, dates, NULL, (empty), escapes and UTF-8, sort modes, hashing, labels.
+# DuckDB-only until antb1 supports projections and aggregates; then drop the `onlyif duckdb` lines so
+# every record also checks antb1.
+
+onlyif duckdb
+query IIII nosort
+SELECT id, i16, i32, i64 FROM edge
+----
+0	-32768	-2147483648	-9223372036854775808
+1	32767	2147483647	9223372036854775807
+2	0	0	0
+3	-1	-1	-1
+4	1	1	1
+5	NULL	NULL	NULL
+6	100	100000	1000000000000000
+7	-100	-100000	-1000000000000000
+8	NULL	7	NULL
+9	12345	NULL	42
+10	-12345	54321	-42
+11	7	-7	7
+
+onlyif duckdb
+query IIR nosort
+SELECT id, u16, d FROM edge
+----
+0	0	-0.5
+1	65535	0.3333333333333333
+2	1	0
+3	32768	0.6666666666666666
+4	15887	0.1
+5	NULL	NULL
+6	15917	123456789.125
+7	40000	-9007199254740992
+8	2	9.99999993e-10
+9	NULL	NULL
+10	12	922337203685477632
+11	7	-0.3333333333333333
+
+onlyif duckdb
+query ITT nosort
+SELECT id, s, u FROM edge
+----
+0	(empty)	(empty)
+1	a	a
+2	tab\there	tab\there
+3	line\nbreak	line\nbreak
+4	back\\slash	back\\slash
+5	NULL	NULL
+6	\x20leading space	trailing space\x20
+7	x\x01y	x\x7fy
+8	Привет, мир	Привет, мир
+9	\x4eULL	\x28empty)
+10	NULL	日本語
+11	naïve café	NULL
+
+onlyif duckdb
+query T valuesort
+SELECT s FROM edge
+----
+(empty)
+NULL
+NULL
+\x20leading space
+\x4eULL
+a
+back\\slash
+line\nbreak
+naïve café
+tab\there
+x\x01y
+Привет, мир
+
+# 12 rows x 2 values > 10: the block is a hash.
+hash-threshold 10
+
+onlyif duckdb
+query IT rowsort
+SELECT id, u FROM edge
+----
+24 values hashing to 51f6f4f855babfbcea9d8ea850ac2635f40140596ef60745cd42e60ea371cdb4
+
+hash-threshold 0
+
+# Integer SUM is a 128-bit HUGEINT: UserID holds int64 extremes and the sum overflows int64.
+onlyif duckdb
+query I nosort
+SELECT SUM(UserID) FROM hits_like
+----
+23021353196360218899981
+
+onlyif duckdb
+query IR nosort
+SELECT SUM(WatchID), AVG(WatchID) FROM hits_like_nulls
+----
+110231108887945010512	11963437040150316
+
+# tol 1e-6
+onlyif duckdb
+query R nosort
+SELECT AVG(ResolutionWidth) FROM hits_like_split
+----
+1397.6722
+
+onlyif duckdb
+query TT nosort
+SELECT MAX(EventDate), MIN(EventDate) FROM hits_like_required
+----
+2013-07-31	2013-07-01
+
+onlyif duckdb
+query III nosort
+SELECT COUNT(*), COUNT(SocialAction), COUNT(HistoryLength) FROM hits_like_nulls
+----
+10000	0	0
+
+onlyif duckdb
+query TT nosort
+SELECT MIN(Title), MAX(SearchPhrase) FROM hits_like
+----
+(empty)	погода погода погода
+
+onlyif duckdb
+query IIII nosort
+SELECT MIN(Interests), MAX(Interests), MIN(ClientIP), MAX(ClientIP) FROM hits_like
+----
+-32768	32767	-2147483648	2147483647

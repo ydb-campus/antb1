@@ -1,0 +1,1 @@
+SELECT COUNT(*) FROM sales WHERE NOT (qty IN (1, 2) OR region LIKE 'n%')

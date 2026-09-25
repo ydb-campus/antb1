@@ -1,0 +1,1 @@
+SELECT COUNT(qty), SUM(qty), AVG(price), MIN(price), MAX(price) FROM sales

@@ -1,0 +1,64 @@
+# The DuckDB oracle is locked down (tests/slt/runner/duckdb_engine.h): one thread, frozen settings,
+# no file access outside the fixtures directory, no extension installs (so no network), and one
+# read-only statement per record, so no record can write next to the shared fixtures.
+
+onlyif duckdb
+query IT nosort
+SELECT current_setting('threads'), current_setting('autoload_known_extensions')
+----
+1	false
+
+onlyif duckdb
+statement error the configuration has been locked
+SET threads = 4
+
+onlyif duckdb
+statement error the configuration has been locked
+SET enable_external_access = true
+
+# DuckDB's own lockdown: file access outside the allowed directories and extension installs.
+
+onlyif duckdb
+statement error ^Permission Error: Cannot access file
+COPY (SELECT 42) TO '${FIXTURES}/../lockdown-canary.csv'
+
+onlyif duckdb
+statement error ^Permission Error:
+SELECT COUNT(*) FROM read_csv('${FIXTURES}/../CMakeCache.txt')
+
+onlyif duckdb
+statement error ^Permission Error:
+SELECT * FROM read_text('${FIXTURES}/../CMakeCache.txt')
+
+onlyif duckdb
+statement error ^Permission Error:
+SELECT * FROM glob('${FIXTURES}/../*')
+
+onlyif duckdb
+statement error ^Permission Error:
+INSTALL httpfs
+
+# The oracle's statement check: writes and state changes are refused before they run, also inside
+# the allowed directories.
+
+onlyif duckdb
+statement error ^Permission Error: .*COPY statements
+COPY (SELECT 42) TO '${FIXTURES}/lockdown-canary.csv'
+
+onlyif duckdb
+statement error ^Permission Error: .*ATTACH statements
+ATTACH '${FIXTURES}/lockdown-canary.db' AS canary
+
+onlyif duckdb
+statement error ^Permission Error: .*CREATE statements
+CREATE TABLE lockdown_canary AS SELECT 42 AS x
+
+onlyif duckdb
+statement error ^Permission Error: .*2 statements in one record
+SELECT 42; SELECT 43
+
+onlyif duckdb
+query I nosort
+SELECT COUNT(*) FROM glob('${FIXTURES}/lockdown-canary*')
+----
+0
