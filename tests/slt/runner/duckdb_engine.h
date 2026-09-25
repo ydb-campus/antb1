@@ -13,11 +13,11 @@
 namespace antb1::slt {
 
 // The DuckDB oracle (C API, DUCKDB_API_NO_DEPRECATED, results via duckdb_fetch_chunk), locked down:
-// threads=1, no extension autoinstall/autoload, no file access outside the fixtures directory, temp
-// files under temp_dir, then lock_configuration=true. Execute() runs one statement per call, and
-// only SELECT, EXPLAIN, SET and LOAD: anything else (COPY, ATTACH, EXPORT, DDL, DML) is refused
-// with a "Permission Error: ..." before it runs, so no record can write next to the shared fixtures
-// or change the oracle's state. Every table is a view
+// threads=1, no extension autoinstall/autoload, no file access outside the fixtures directory, the
+// directories of the table files and temp_dir (temp files), then lock_configuration=true. Execute()
+// runs one statement per call, and only SELECT, EXPLAIN, SET and LOAD: anything else (COPY, ATTACH,
+// EXPORT, DDL, DML) is refused with a "Permission Error: ..." before it runs, so no record can
+// write next to the shared fixtures or change the oracle's state. Every table is a view
 //   CREATE VIEW <name> AS SELECT * [REPLACE (make_date(EventDate) AS EventDate)]
 //     FROM read_parquet([<files>], binary_as_string=true)
 // and binary_as_string is also on for `FROM '<path>'`. Values are converted to the canonical text.

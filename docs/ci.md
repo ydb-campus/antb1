@@ -8,12 +8,16 @@ behind this setup are in [ADR 0009](adr/0009-ci-and-governance.md).
 
 | Workflow | File | Triggers | Purpose |
 | --- | --- | --- | --- |
-| `CI` | `.github/workflows/ci.yml` | pull requests to `main`, pushes to `main`, merge queue, daily schedule, manual | build, test, lint; required check `CI OK` |
+| `CI` | `.github/workflows/ci.yml` | pull requests to `main`, pushes to `main`, merge queue, daily schedule, manual | build, test, lint, ClickBench data tests; required check `CI OK`; cache clean-up on `main` |
 | `PR title` | `.github/workflows/pr-title.yml` | pull requests (opened, edited, reopened, synchronized), merge queue | Conventional Commits title; required check `PR title` |
+| `CodeQL` | `.github/workflows/codeql.yml` | every pull request to `main` (no paths filter), pushes to `main`, weekly, manual | code scanning of the C++ code and the workflows; a merge gate through the ruleset ([CodeQL](#codeql)) |
+| `Nightly` | `.github/workflows/nightly.yml` | daily schedule, manual | deep checks, advisory; a failure opens a `nightly-failure` issue ([Nightly](#nightly)) |
+| `Security` | `.github/workflows/security.yml` | pushes and pull requests that change `.github/**`, weekly, manual | zizmor with its online audits, results in the Security tab; advisory |
+| `Scorecard` | `.github/workflows/scorecard.yml` | pushes to `main`, weekly, branch protection changes | OpenSSF Scorecard, results in the Security tab and on scorecard.dev; advisory |
+| `Agent bootstrap` | `.github/workflows/agent-bootstrap.yml` | pull requests that change `scripts/agent-setup.sh`, `pixi.toml`, `pixi.lock` or the workflow; weekly; manual | a cold `scripts/agent-setup.sh` from both pixi sources, then the tests; advisory |
+| Dependabot | `.github/dependabot.yml` | weekly (Monday) | one grouped PR that updates the pinned GitHub Actions, for releases at least 7 days old |
 
-Later PRs add CodeQL (a merge gate through the ruleset), a nightly workflow (long fuzzing, TSan, shuffled test
-order, ARM64, extended differential tests), benchmarks, security scanning (zizmor, OpenSSF Scorecard), an agent
-bootstrap check and the AI review workflows. The ClickBench data job joins `CI` later as well.
+Later PRs add the benchmark workflow, the weekly `pixi.lock` refresh and the AI review workflows.
 
 ## Required checks
 
@@ -25,9 +29,9 @@ A pull request can merge only when:
 - `PR title` is green: the title is a Conventional Commit with a lowercase subject, and one of the types `feat`,
   `fix`, `perf`, `refactor`, `test`, `docs`, `build`, `ci`, `chore`, `revert`.
 - One human maintainer approved and every review thread is resolved. AI reviews never count.
-- Once CodeQL lands: code scanning reports no new error-level alerts and no security alerts of high severity or
-  above. A CodeQL failure, or a missing CodeQL analysis, blocks all merges until it is fixed or an admin bypasses
-  the rule through the PR.
+- Once ruleset stage B is applied (`tools/github/ruleset-main.json`), code scanning reports no new error-level
+  alerts and no security alerts of high severity or above. **A CodeQL failure, or a missing CodeQL analysis, blocks
+  all merges** until it is fixed or an admin bypasses the rule through the PR.
 
 The branch does not need to be up to date with `main` (the ruleset's strict mode is off), so there is no need to
 press "Update branch" unless there are conflicts. Push-to-main CI and the daily run catch the rare semantic conflict;
@@ -43,7 +47,9 @@ a merge queue (`merge_group` is already wired) can take over when PR volume need
 | `macos-release (pixi run release)` | macos-15 (arm64) | `default` | `pixi run release` (on a Mac) |
 | `clang-tidy (pixi run tidy)` | ubuntu-24.04 | `default` | `pixi run tidy` |
 | `clang-coverage-fuzz (pixi run coverage && pixi run fuzz-smoke)` | ubuntu-24.04 | `default` | `pixi run coverage` · `pixi run fuzz-smoke` |
+| `clickbench-hits0 (pixi run test-data)` | ubuntu-24.04 | `default` | `pixi run test-data` (downloads 122 MB once) |
 | `coverage-comment` (advisory) | ubuntu-slim | none | read `build/coverage/summary.md` after `pixi run coverage` |
+| `cache-gc` (`main` only) | ubuntu-slim | none | nothing to run |
 | `CI OK` | ubuntu-slim | none | aggregator, nothing to run |
 | `PR title` | ubuntu-slim | none | check the title against the rules above |
 
@@ -62,38 +68,105 @@ a merge queue (`merge_group` is already wired) can take over when PR volume need
   coverage failed: a deterministic libFuzzer run of the SQL parser (seed 1, 200,000 runs, ASan and UBSan) and the
   corpus replay. On a fuzz failure the crash inputs are uploaded as the `fuzz-artifacts` artifact for 14 days. See
   [testing.md](testing.md#coverage) for the floors and [testing.md](testing.md#fuzzing) for fuzzing.
+- `clickbench-hits0` runs the ClickBench data tests ([testing.md](testing.md#clickbench-data-tests)) on the
+  `ci-release` build: antb1 against DuckDB on the pinned `hits_0` partition, metamorphic relations on it and the
+  ClickBench ratchet. `ANTB1_DATA_DIR` points into the workspace (`.cache/clickbench`), which is restored from the
+  Actions cache under a key made of the hash of `tools/data/clickbench.lock`; on a miss `pixi run fetch-data`
+  downloads the files, and a run on `main` saves them. The output is redacted, the JUnit file is
+  `build/ci-release/junit-data.xml`, and the job uploads nothing: no logs and no data.
 - `coverage-comment` is advisory and not part of `CI OK`. On pull requests from branches of this repository it posts
   the coverage table as one sticky PR comment and updates it on every push. It only downloads the
   `coverage-summary` artifact, never checks out or runs PR code, and is the only job with `pull-requests: write`.
   Fork PRs get no comment (their token cannot write); the table is still in the job summary.
+- `cache-gc` runs after every run on `main` (never on pull requests or in the merge queue) with `actions: write`. It
+  deletes the pixi caches of other `pixi.lock` generations, the data caches of other `tools/data/clickbench.lock`
+  files and all but the newest ccache of each leg, then lists what is left in the job summary. Pull requests still
+  on an older `pixi.lock` install their environments without a cache until they merge `main`.
 - `pixi run ci` (Clang Debug `-Werror` plus tests) is not a separate job; it is the fast local gate inside
   `pixi run check`.
-- `pixi run check-full` runs every Linux gate above in one command: `check` (lint and `ci`), `asan`, `tidy`,
-  `coverage`, `fuzz-smoke` and `ci-gcc`.
-- `pixi run tsan` (ThreadSanitizer), `pixi run ci-shuffle` (random test order) and `pixi run fuzz` (long fuzzing) are
-  deep checks, not PR gates; the nightly workflow that runs them is added in a later PR.
-- `pixi run codeql-build` reproduces the GCC build that the CodeQL workflow will trace.
+- `pixi run check-full` runs every Linux gate above except the data tests in one command: `check` (lint and `ci`),
+  `asan`, `tidy`, `coverage`, `fuzz-smoke` and `ci-gcc`. Run `pixi run test-data` for `clickbench-hits0`.
 
 CI always calls tasks with an explicit environment and a frozen lock, for example
 `pixi run --frozen -e default asan` or `pixi run --frozen -e gcc ci-gcc`, after installing pixi 0.81.0 with
 prefix-dev/setup-pixi.
 
+## Nightly
+
+`nightly.yml` runs the deep checks on `main` every night (and on demand). It is advisory: nothing blocks a merge,
+but every failure is tracked in an issue.
+
+| Job | Runner | Reproduce locally | What it adds |
+| --- | --- | --- | --- |
+| `fuzz-long` | ubuntu-24.04 | `ANTB1_FUZZ_SECONDS=1200 pixi run fuzz` | 20 minutes of libFuzzer with a random seed; crash inputs are uploaded as `fuzz-long-artifacts` for 14 days |
+| `tsan` | ubuntu-24.04 | `pixi run tsan` | the hermetic tests under ThreadSanitizer |
+| `asan-data` | ubuntu-24.04 | `pixi run asan-data` | the data tests under ASan and UBSan (redacted, no uploads) |
+| `arm64` | ubuntu-24.04-arm | `pixi run release` then `pixi run test-data` | Linux ARM64: the release build, the hermetic tests and the data tests |
+| `diff-extended` | ubuntu-24.04 | `ANTB1_DIFF_SEED=<run id> ANTB1_DIFF_COUNT=20000 pixi run diff-random` | 20,000 random differential queries with the run id as the seed |
+| `ci-shuffle` | ubuntu-24.04 | `pixi run ci-shuffle` | the hermetic tests in random order, each repeated until it fails (at most twice) |
+| `report` | ubuntu-slim | nothing to run | on any failure: opens an issue labelled `nightly-failure` and `agent-task`, or comments on the open one, with the failing jobs, the run URL and the commands above |
+
+The nightly jobs only read caches: pixi environments and ccache come from the runs on `main` (`asan-data` reuses
+the ccache of `clang-asan`, `fuzz-long` that of `clang-coverage-fuzz`), and the data comes from the cache that
+`clickbench-hits0` saved. The ARM64 environments are not cached, to stay within the cache budget. To work on a
+nightly failure, take the issue, run its command locally, fix the cause with a regression test and close the issue
+from the PR.
+
+## CodeQL
+
+`codeql.yml` analyses the C++ code and the GitHub Actions workflows with the `security-extended` queries and uploads
+the results to the Security tab. It runs on every pull request, so the analysis that the ruleset's `code_scanning`
+rule requires always exists; it has no `merge_group` trigger because code scanning merge protection does not apply
+to merge queue groups.
+
+- `c-cpp` (build mode `manual`): prefix-dev/setup-pixi installs and activates the `gcc` environment, CodeQL is
+  initialized, and then a plain `cmake -E rm -rf build/codeql && cmake --workflow --preset codeql` builds `src/` with
+  GCC 15 and without ccache, the same build as `pixi run codeql-build`. The build does not go through `pixi run`,
+  because the CodeQL tracer does not follow processes through the static pixi binary. CodeQL traces GCC up to 16 but
+  Clang only up to 22, which is why this build uses the `gcc` environment
+  ([ADR 0002](adr/0002-toolchain-pixi-conda-forge.md)).
+- `actions` (build mode `none`): the workflow files.
+
+When CodeQL fails on a pull request, open the job log: a build failure reproduces with `pixi run codeql-build`; a
+new alert is listed in the Security tab and on the PR. Fix the code, or, for a false positive, ask a maintainer to
+dismiss the alert with a reason. Until then the ruleset blocks the merge (after stage B).
+
+## Security, Scorecard, agent bootstrap and Dependabot
+
+- `Security` runs zizmor 1.30.1 (the version of the `lint` environment, pinned in zizmorcore/zizmor-action) with its
+  online audits and uploads SARIF to the Security tab. The blocking check is the offline zizmor in `pixi run lint`;
+  this workflow adds the audits that need the GitHub API, such as known-vulnerable action versions. Fork pull
+  requests are skipped, because their token cannot upload results.
+- `Scorecard` runs OpenSSF Scorecard and publishes the results. Scorecard accepts published results only from a
+  restricted workflow: no workflow-level `env` or write permissions, `id-token: write` only in its job, no job `env`,
+  and only checkout, upload-artifact, codeql-action/upload-sarif and scorecard-action as steps. The findings
+  accepted for now are the missing license (decided later) and the admin bypass of the ruleset.
+- `Agent bootstrap` checks the shared sandbox bootstrap from scratch, as a Claude, Codex or Copilot sandbox runs it:
+  `bash scripts/agent-setup.sh --envs "default lint"` with `ANTB1_PIXI_SOURCE=github` and `ANTB1_PIXI_SOURCE=conda`,
+  then `pixi run --as-is test` and `pixi run --as-is doctor --json`. It uses no caches on purpose.
+- Dependabot opens one grouped PR per week (`ci(deps): ...`, labels `dependencies` and `github-actions`) that moves
+  the SHA pins of the actions to releases at least 7 days old. A new action also needs an entry in
+  `tools/github/allowed-actions.json`. `pixi.lock` is not updated by Dependabot.
+
 ## Test reports and logs
 
 Test jobs write JUnit XML to `build/<preset>/junit.xml` (`clang-coverage-fuzz`: `build/coverage/junit.xml` and
-`build/fuzz/junit.xml`). The results appear as annotations on the PR and in the job summary. When a job fails, the
-ctest logs and the JUnit files are uploaded as the `logs-<job>` artifact and kept for 7 days. The build jobs and
-`clang-tidy` also write their disk usage to the job summary. Timing and cache measurements are recorded here once
-enough runs exist.
+`build/fuzz/junit.xml`; the data tests: `build/ci-release/junit-data.xml` and, nightly, `build/ci-asan/junit-data.xml`;
+`ci-shuffle`: `build/ci/junit-shuffle.xml`). The results appear as annotations on the PR and in the job summary. When
+a hermetic test job fails, the ctest logs and the JUnit files are uploaded as the `logs-<job>` artifact and kept for
+7 days. The build jobs and `clang-tidy` also write their disk usage to the job summary. Timing and cache
+measurements are recorded here once enough runs exist.
 
 | Artifact | Job | When | Kept |
 | --- | --- | --- | --- |
-| `logs-<job>` | every test job | on failure | 7 days |
+| `logs-<job>` | every hermetic test job (CI legs, nightly `tsan` and `ci-shuffle`) | on failure | 7 days |
 | `coverage-summary` | `clang-coverage-fuzz` | always (when the report exists) | 7 days |
 | `fuzz-artifacts` | `clang-coverage-fuzz` | when the fuzz smoke run fails | 14 days |
+| `fuzz-long-artifacts` | nightly `fuzz-long` | when long fuzzing fails | 14 days |
+| `scorecard-sarif` | `Scorecard` | always | 5 days |
 
-Artifacts never contain data: the coverage summary holds only percentages, and fuzz inputs grow from our own seed
-corpus.
+Artifacts never contain data: the coverage summary holds only percentages, fuzz inputs grow from our own seed
+corpus, and the data jobs (`clickbench-hits0`, nightly `asan-data` and `arm64`) upload nothing.
 
 ## Caches
 
@@ -103,6 +176,9 @@ corpus.
 - ccache: restored in every build job from `ccache-<job>-` keys and saved only by scheduled and manual runs on
   `main`, which keeps the cache small and prevents pull requests from writing to it. `clang-tidy` does not use
   ccache.
+- ClickBench data: `.cache/clickbench` under the key `clickbench-<hash of tools/data/clickbench.lock>`, saved by
+  `clickbench-hits0` on `main` after a miss and read by every data job.
+- `cache-gc` removes stale entries after each run on `main` (see above).
 - A run on a pull request is cancelled when a newer push to the same PR arrives; runs on `main` are never
   cancelled.
 
@@ -120,6 +196,10 @@ corpus.
    [fuzz/regressions/README.md](../fuzz/regressions/README.md): reproduce, minimize, commit the input with the fix.
 8. For a failing random differential case, run the repro line that the failure prints:
    `ANTB1_DIFF_SEED=<seed> ANTB1_DIFF_ONLY=<case> pixi run diff-random`.
+9. For a data test failure (`clickbench-hits0`), run `pixi run test-data`, then the unredacted command that the
+   failure prints; it shows the SQL and the values on your machine only. Never paste them into the PR or an issue.
+   An unexpected ClickBench pass or fail means the ratchet and the docs/sql-subset.md table need updating
+   ([testing.md](testing.md#the-clickbench-ratchet)).
 
 ## Workflow security rules
 
@@ -134,8 +214,10 @@ enforces them:
 - no `pull_request_target` or `workflow_run` triggers, and no `${{ github.event.* }}` expressions inside `run:`
   (values are passed through `env:`);
 - caches are written only from `main`;
-- a job that needs a write permission (today only `coverage-comment`, with `pull-requests: write`) never checks out
-  or runs code from the pull request.
+- a job with a write permission never runs code from a pull request: `coverage-comment` (`pull-requests: write`),
+  `cache-gc` (`actions: write`, `main` only) and the nightly `report` (`issues: write`) check out nothing from a PR.
+  The analyses that upload results (`CodeQL`, `Security`, `Scorecard`) hold only `security-events: write` (Scorecard
+  also `id-token: write`, on `main`); on fork pull requests GitHub makes their token read-only.
 
 The repository settings (`tools/github/apply-settings.sh`) add the rest: workflow runs from external contributors'
 forks need a maintainer's approval, and GitHub Actions cannot approve pull requests.

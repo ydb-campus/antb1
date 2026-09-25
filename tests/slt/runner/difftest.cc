@@ -10,52 +10,13 @@
 #include <utility>
 #include <vector>
 
-#include "canonical.h"
 #include "engine.h"
 #include "query_gen.h"
-#include "sha256.h"
+#include "result_diff.h"
 #include "supported_features.h"
 
 namespace antb1::slt {
 namespace {
-
-constexpr std::size_t kMaxDiffRows = 5;
-
-std::string Letters(const ResultSet& r) {
-  std::string letters;
-  for (const auto c : r.classes) {
-    letters += ClassLetter(c);
-  }
-  return letters;
-}
-
-std::string Types(const ResultSet& r) {
-  std::string names;
-  for (const auto& n : r.type_names) {
-    names += (names.empty() ? "" : ", ") + n;
-  }
-  return std::format("{} ({})", Letters(r), names);
-}
-
-std::string Join(const std::vector<std::string>& lines) {
-  std::string text;
-  for (const auto& line : lines) {
-    text += line;
-    text += '\n';
-  }
-  return text;
-}
-
-struct Failure {
-  std::string what;      // one line; safe to print in redacted mode
-  std::string detail;    // unredacted details (error messages)
-  std::string redacted;  // details that are safe to print
-  bool mismatch = false;
-  std::string types;                  // I/R/T per column (R compares with a tolerance)
-  std::vector<std::string> expected;  // DuckDB's block
-  std::vector<std::string> actual;    // antb1's block
-  std::optional<std::size_t> first_row;
-};
 
 enum class Outcome : std::uint8_t { kCompared, kUnsupported, kRejected, kFailed };
 
@@ -63,63 +24,23 @@ constexpr std::size_t kMaxListedRejects = 5;
 
 struct CaseResult {
   Outcome outcome = Outcome::kCompared;
-  Failure failure;
+  Discrepancy failure;
 };
 
-CaseResult Fail(Failure f) {
-  return CaseResult{.outcome = Outcome::kFailed, .failure = std::move(f)};
-}
-
-Failure ErrorFailure(std::string what, const EngineError& error) {
-  return Failure{.what = std::move(what),
-                 .detail = error.message,
-                 .redacted = std::format("error kind: {}", error.kind)};
-}
-
-CaseResult Compare(const GeneratedQuery& q, const ResultSet& oracle, const ResultSet& antb1) {
-  const std::string letters = Letters(oracle);
-  // The engine types too, not only the I/R/T classes: e.g. an integer SUM must be HUGEINT, as in
-  // DuckDB, even while its values still fit a BIGINT.
-  if (letters != Letters(antb1) || oracle.type_names != antb1.type_names) {
-    return Fail(Failure{.what = std::format("column types differ: DuckDB {}, antb1 {}",
-                                            Types(oracle), Types(antb1))});
-  }
-  auto expected = RenderBlock(oracle, q.sort, 0);
-  auto actual = RenderBlock(antb1, q.sort, 0);
-  if (q.row_count_only) {
-    if (expected.size() == actual.size()) {
-      return {};
-    }
-    return Fail(Failure{
-        .what = std::format("row counts differ (LIMIT on a projection: any {} rows are right)",
-                            expected.size()),
-        .mismatch = true,
-        .types = letters,
-        .expected = std::move(expected),
-        .actual = std::move(actual),
-        .first_row = std::nullopt});
-  }
-  if (auto diff = CompareBlocks(expected, actual, letters, q.sort, kDefaultRelTolerance)) {
-    return Fail(Failure{.what = "result mismatch: " + diff->reason,
-                        .mismatch = true,
-                        .types = letters,
-                        .expected = std::move(expected),
-                        .actual = std::move(actual),
-                        .first_row = diff->first_row});
-  }
-  return {};
+CaseResult Fail(Discrepancy d) {
+  return CaseResult{.outcome = Outcome::kFailed, .failure = std::move(d)};
 }
 
 CaseResult CheckCase(const GeneratedQuery& q, FeatureSet supported_set, Engine& antb1,
                      Engine& oracle) {
   const bool supported = supported_set.Contains(q.features);
   if (q.sql.empty()) {
-    return Fail(Failure{.what = "the generator produced no query (a generator bug)"});
+    return Fail(Discrepancy{.what = "the generator produced no query (a generator bug)"});
   }
   const auto a = antb1.Execute(q.sql);
   const auto o = oracle.Execute(q.sql);
   if (!o.has_value()) {
-    return Fail(ErrorFailure(
+    return Fail(ErrorDiscrepancy(
         "DuckDB rejects the generated SQL (a generator bug: queries must be valid DuckDB SQL)",
         o.error()));
   }
@@ -128,77 +49,31 @@ CaseResult CheckCase(const GeneratedQuery& q, FeatureSet supported_set, Engine& 
       return CaseResult{.outcome = Outcome::kUnsupported, .failure = {}};
     }
     if (a.error().unsupported) {
-      Failure f = ErrorFailure(
+      Discrepancy d = ErrorDiscrepancy(
           "antb1 reports Unsupported for a query that uses only supported features", a.error());
-      f.detail += std::format("\n  declared supported (tests/slt/supported_features.h): {}",
+      d.detail += std::format("\n  declared supported (tests/slt/supported_features.h): {}",
                               supported_set.Names());
-      return Fail(std::move(f));
+      return Fail(std::move(d));
     }
     if (!supported && !a.error().internal) {
       return CaseResult{.outcome = Outcome::kRejected, .failure = {}};
     }
-    return Fail(ErrorFailure(std::format("antb1 fails ({} error), DuckDB answers", a.error().kind),
-                             a.error()));
+    return Fail(ErrorDiscrepancy(
+        std::format("antb1 fails ({} error), DuckDB answers", a.error().kind), a.error()));
   }
-  return Compare(q, *o, *a);
-}
-
-bool SameLine(const std::string& e, const std::string& a, std::string_view types, SortMode sort) {
-  return !CompareBlocks({e}, {a}, types, sort, kDefaultRelTolerance).has_value();
-}
-
-void AppendDifferingRows(const Failure& f, SortMode sort, std::string& out) {
-  out += std::format("  DuckDB: {} row(s), antb1: {} row(s); differing rows (at most {}):\n",
-                     f.expected.size(), f.actual.size(), kMaxDiffRows);
-  std::size_t shown = 0;
-  const std::size_t n = std::max(f.expected.size(), f.actual.size());
-  for (std::size_t i = 0; i < n && shown < kMaxDiffRows; ++i) {
-    const bool has_e = i < f.expected.size();
-    const bool has_a = i < f.actual.size();
-    if (has_e && has_a && SameLine(f.expected[i], f.actual[i], f.types, sort)) {
-      continue;
-    }
-    const std::string label = std::format("row {}:", i);
-    out += std::format("    {} DuckDB {}\n", label, has_e ? f.expected[i] : "(no row)");
-    out += std::format("    {:{}} antb1  {}\n", "", label.size(), has_a ? f.actual[i] : "(no row)");
-    ++shown;
+  if (auto d = CompareAnswers(*o, *a, q.sort, q.row_count_only)) {
+    return Fail(*std::move(d));
   }
+  return {};
 }
 
-void Report(const GeneratedQuery& q, uint64_t seed, bool supported, const Failure& f,
+void Report(const GeneratedQuery& q, uint64_t seed, bool supported, const Discrepancy& d,
             const DiffOptions& options, std::string& out) {
   out += std::format("FAIL diff case {} (seed {}, {}): {}\n", q.index, seed,
-                     supported ? "supported features" : "target grammar sample", f.what);
+                     supported ? "supported features" : "target grammar sample", d.what);
   out += std::format("  features: {}\n", q.features.Names());
-  if (options.redact) {
-    if (!f.redacted.empty()) {
-      out += "  " + f.redacted + "\n";
-    }
-    if (f.mismatch) {
-      out += std::format("  rows: DuckDB {}, antb1 {}", f.expected.size(), f.actual.size());
-      if (f.first_row.has_value()) {
-        out += std::format("; first differing row: {}", *f.first_row);
-      }
-      out += std::format("\n  sha256: DuckDB {}\n          antb1  {}\n",
-                         Sha256Hex(Join(f.expected)), Sha256Hex(Join(f.actual)));
-    }
-    out += "  repro (unredacted, prints values; run it locally):\n";
-  } else {
-    if (!f.detail.empty()) {
-      out += "  " + f.detail + "\n";
-    }
-    out += "  SQL:\n";
-    std::size_t pos = 0;
-    while (pos <= q.sql.size()) {
-      const std::size_t end = std::min(q.sql.find('\n', pos), q.sql.size());
-      out += "    " + q.sql.substr(pos, end - pos) + "\n";
-      pos = end + 1;
-    }
-    if (f.mismatch) {
-      AppendDifferingRows(f, q.sort, out);
-    }
-    out += "  repro:\n";
-  }
+  AppendDiscrepancy(d, q.sql, q.sort, options.redact, out);
+  out += options.redact ? "  repro (unredacted, prints values; run it locally):\n" : "  repro:\n";
   out += std::format("    ANTB1_DIFF_SEED={} ANTB1_DIFF_ONLY={} pixi run diff-random\n", seed,
                      q.index);
   if (!options.command.empty()) {

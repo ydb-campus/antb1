@@ -163,6 +163,30 @@ TEST(Evaluate, PendingRelationsNeedAnUnsupportedAnswer) {
   EXPECT_EQ(Evaluate(r, {Single("1"), Single("1")}, r.features).kind, Verdict::Kind::kHolds);
 }
 
+TEST(Evaluate, RedactedMessagesHoldNoValuesOrErrorTexts) {
+  const Relation r{.name = "r",
+                   .features = {slt::Feature::kCountStar},
+                   .probes = {Probe{.sql = "a"}, Probe{.sql = "b"}},
+                   .check = FirstEqualsSumOfRest()};
+  const slt::FeatureSet supported = {slt::Feature::kCountStar};
+  const Verdict wrong = Evaluate(r, {Single("5"), Single("4")}, supported);
+  ASSERT_EQ(wrong.kind, Verdict::Kind::kViolated);
+  EXPECT_NE(wrong.message.find('5'), std::string::npos) << wrong.message;
+  EXPECT_EQ(wrong.redacted.find_first_of("0123456789"), std::string::npos) << wrong.redacted;
+  const slt::ExecResult bind =
+      std::unexpected(slt::EngineError{.kind = "bind", .message = "bind: SECRET_COLUMN"});
+  const Verdict broken = Evaluate(r, {Single("5"), bind}, supported);
+  ASSERT_EQ(broken.kind, Verdict::Kind::kBroken);
+  EXPECT_EQ(broken.redacted, "query 1 fails (bind error)");
+  const Verdict pending =
+      Evaluate(Relation{.name = "p",
+                        .features = {slt::Feature::kCountStar, slt::Feature::kWhere},
+                        .probes = {Probe{.sql = "a"}, Probe{.sql = "b"}},
+                        .check = AllEqual()},
+               {Single("5"), UnsupportedAnswer()}, supported);
+  EXPECT_EQ(pending.redacted, pending.message) << "pending messages name only features";
+}
+
 TEST(Checks, MinMaxRowCountsAndEquality) {
   EXPECT_FALSE(
       FirstEqualsMinOfRest()(std::vector{Single("2"), Single("5"), Single("2")}).has_value());

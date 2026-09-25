@@ -1,0 +1,19 @@
+# Dependabot keeps the SHA-pinned GitHub Actions current: one grouped PR per week, for releases at least 7 days
+# old. pixi.lock is refreshed by its own weekly workflow (a later PR), not by Dependabot. A new action must also be
+# allowed in tools/github/allowed-actions.json (pixi run lint checks it).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
+      include: scope
+    labels: [dependencies, github-actions]

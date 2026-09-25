@@ -1,11 +1,16 @@
 // antb1-fixturegen: writes the deterministic Parquet fixtures of the test harness, or compares the
 // Parquet schema of a file with the hits-like schema.
 //
-//   antb1-fixturegen <outdir>                     write every fixture into <outdir>
-//   antb1-fixturegen --check-schema <file>        exit 0 if <file> has the hits-like schema, else 1
+//   antb1-fixturegen <outdir>                              write every fixture into <outdir>
+//   antb1-fixturegen --check-schema [--redact] <file>...   exit 0 if every <file> has the hits-like
+//                                                          schema, else 1
 //
+// --check-schema also checks real ClickBench partitions (ctest data.hits0.schema). Its report holds
+// only column names and Parquet types, never values; --redact, which every data test passes, is
+// accepted for that convention and changes nothing.
 // Exit codes: 0 ok, 1 schema mismatch, 2 usage, 3 I/O error.
 
+#include <algorithm>
 #include <cstdio>
 #include <exception>
 #include <print>
@@ -26,7 +31,7 @@ constexpr int kExitIo = 3;
 int Usage() {
   std::println(stderr,
                "usage: antb1-fixturegen <outdir>\n"
-               "       antb1-fixturegen --check-schema <parquet file>");
+               "       antb1-fixturegen --check-schema [--redact] <parquet file>...");
   return kExitUsage;
 }
 
@@ -63,14 +68,25 @@ int CheckSchema(const std::string& path) {
 }
 
 int Run(std::span<char*> argv) {
-  const std::vector<std::string_view> args(argv.begin() + 1, argv.end());
+  std::vector<std::string_view> args(argv.begin() + 1, argv.end());
   if (args.size() == 1 && !args[0].starts_with('-')) {
     return Generate(std::string(args[0]));
   }
-  if (args.size() == 2 && args[0] == "--check-schema") {
-    return CheckSchema(std::string(args[1]));
+  if (args.empty() || args[0] != "--check-schema") {
+    return Usage();
   }
-  return Usage();
+  args.erase(args.begin());
+  if (!args.empty() && args[0] == "--redact") {
+    args.erase(args.begin());
+  }
+  if (args.empty() || std::ranges::any_of(args, [](auto a) { return a.starts_with('-'); })) {
+    return Usage();
+  }
+  int rc = 0;
+  for (const auto file : args) {
+    rc = std::max(rc, CheckSchema(std::string(file)));
+  }
+  return rc;
 }
 
 }  // namespace

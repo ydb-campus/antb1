@@ -12,7 +12,7 @@
 # Usage: bash scripts/agent-setup.sh [--envs "default lint"] [--pixi-only] [--with-data] [--persist-bashrc]
 #   --envs LIST        pixi environments to install (default: "default lint"; `gcc` is linux-64 only)
 #   --pixi-only        only make sure pixi is available; install no environment
-#   --with-data        also run `pixi run fetch-data` (skipped with a notice while that task does not exist)
+#   --with-data        also run `pixi run fetch-data` (NETWORK: the pinned ClickBench files, 122 MB; non-fatal)
 #   --persist-bashrc   put the pixi dir on PATH in ~/.bashrc and ~/.profile (and /usr/local/bin/pixi as root)
 # Env:   ANTB1_PIXI_SOURCE=auto|github|conda (auto: conda first when CLAUDE_CODE_REMOTE=true, else github first);
 #        ANTB1_PIXI_DIR (private install dir).
@@ -210,13 +210,7 @@ if [ ${#args[@]} -gt 0 ]; then
 fi
 
 if [ "$with_data" = 1 ]; then
-  # Captured first: `pixi ... | grep -q` under pipefail fails when grep exits early and pixi gets SIGPIPE.
-  tasks_json=$("$PIXI" task list --json 2>/dev/null || true)
-  if grep -Eq '"name": *"fetch-data"' <<<"$tasks_json"; then
-    "$PIXI" run --frozen -e default fetch-data || echo "agent-setup: fetch-data failed (non-fatal)" >&2
-  else
-    echo "agent-setup: --with-data: the fetch-data task does not exist yet (it arrives in a later PR); skipping" >&2
-  fi
+  "$PIXI" run --frozen -e default fetch-data || echo "agent-setup: fetch-data failed (non-fatal)" >&2
 fi
 
 echo "antb1 agent-setup OK: $("$PIXI" --version) at $PIXI; envs: ${installed[*]:-(none)}"

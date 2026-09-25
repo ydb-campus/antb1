@@ -1,0 +1,6 @@
+# ClickBench files for the data tests, pinned by sha256 and size. `pixi run fetch-data` (scripts/fetch-data.sh)
+# downloads them into $ANTB1_DATA_DIR (default ~/.cache/antb1/clickbench), outside the repository; the ctest
+# data.hits0.verify (cmake/scripts/VerifyData.cmake) checks them. Their content is never committed or uploaded
+# (docs/adr/0006-test-strategy-and-data-policy.md). One file per line: <name> <sha256> <bytes> <url>
+hits_0.parquet fa134fe101e68324e0de851146fda69624f5cbb707d387141d1c2a88a219a16d 122446530 https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_0.parquet
+queries.sql e84ea26e1ed13a1dc1e46e76ddc9e49ead67a0444cdd5ae92085daad269c5508 8320 https://raw.githubusercontent.com/ClickHouse/ClickBench/5a56398c975bfd9f328f544894bcb92533ed134c/duckdb-parquet/queries.sql

@@ -5,7 +5,13 @@
 //   antb1-slt complete --fixtures DIR --tables FILE FILE...
 //   antb1-slt diff --fixtures DIR --tables FILE --seed S --count N [--only I] [--table NAME]...
 //                  [--redact] [--mutate KIND] [--target-percent P]
+//   antb1-slt queries --fixtures DIR --tables FILE [--redact] [--only LINE] [--mutate KIND] FILE
+//   antb1-slt clickbench --fixtures DIR --tables FILE --status FILE [--redact] [--only N]
+//                        [--mutate KIND] QUERIES
 //   antb1-slt version
+//
+// `queries` and `clickbench` run the ClickBench data tests (tests/data): see query_file.h and
+// clickbench.h.
 //
 // Exit codes: 0 every record (query) passed, 1 failures, 2 usage or .slt syntax error, 3 setup
 // error (tables, fixtures, engine), 70 internal error.
@@ -14,6 +20,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <exception>
+#include <expected>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -31,8 +38,10 @@
 #include <CLI/CLI.hpp>
 
 #include "antb1_engine.h"
+#include "clickbench.h"
 #include "difftest.h"
 #include "engine.h"
+#include "query_file.h"
 #include "query_gen.h"
 #include "runner.h"
 #include "slt_file.h"
@@ -68,6 +77,9 @@ struct Args {
   std::vector<std::string> only_tables;
   unsigned target_percent = 25;
   bool list = false;
+  // queries, clickbench
+  std::string query_file;
+  std::string status;
 };
 
 std::string ShellQuote(std::string_view arg) {
@@ -336,6 +348,104 @@ int Diff(const Args& args, std::vector<TableDef> tables, std::span<char*> argv) 
   return stats.failed == 0 ? 0 : kExitFailed;
 }
 
+// The antb1 engine and, with --mutate, the corrupting wrapper the run must use instead.
+struct Antb1Under {
+  std::unique_ptr<Engine> engine;
+  std::unique_ptr<Engine> mutating;
+  [[nodiscard]] Engine& get() const { return mutating ? *mutating : *engine; }
+};
+
+std::expected<Antb1Under, std::string> MakeAntb1(const std::vector<TableDef>& tables,
+                                                 const Args& args) {
+  const auto mutation = ParseMutation(args.mutate);
+  if (!mutation.has_value()) {
+    return std::unexpected(
+        std::format("unknown --mutate kind '{}' (known: {})", args.mutate, kMutationNames));
+  }
+  auto engine = MakeEngine("antb1", tables, args);
+  if (!engine) {
+    return std::unexpected(engine.error());
+  }
+  Antb1Under out{.engine = std::move(*engine), .mutating = nullptr};
+  if (*mutation != Mutation::kNone) {
+    out.mutating = MakeMutatingEngine(*out.engine, *mutation);
+  }
+  return out;
+}
+
+std::expected<std::vector<Statement>, std::string> LoadStatements(const std::string& path) {
+  auto text = ReadFile(path);
+  if (!text) {
+    return std::unexpected(text.error());
+  }
+  auto statements = ParseSqlFile(path, *text);
+  if (!statements) {
+    return std::unexpected("antb1-slt: " + statements.error());
+  }
+  return statements;
+}
+
+int Queries(const Args& args, const std::vector<TableDef>& tables, std::span<char*> argv) {
+  auto statements = LoadStatements(args.query_file);
+  if (!statements) {
+    std::println(stderr, "{}", statements.error());
+    return kExitUsage;
+  }
+  for (const auto& s : *statements) {
+    if (!s.features.has_value()) {
+      std::println(stderr, "antb1-slt: {}:{}: no `-- features:` line before the query",
+                   args.query_file, s.line);
+      return kExitUsage;
+    }
+  }
+  auto antb1 = MakeAntb1(tables, args);
+  auto oracle = MakeEngine("duckdb", tables, args);
+  if (!antb1 || !oracle) {
+    std::println(stderr, "antb1-slt: {}", !antb1 ? antb1.error() : oracle.error());
+    return kExitSetup;
+  }
+  const QueryFileOptions options{
+      .redact = args.redact, .only_line = args.only, .command = CommandLine(argv)};
+  std::string out;
+  const QueryFileStats stats = RunQueryFile(args.query_file, *statements, kSupportedFeatures,
+                                            antb1->get(), **oracle, options, out);
+  std::print("{}", out);
+  return stats.failed == 0 ? 0 : kExitFailed;
+}
+
+int ClickBench(const Args& args, const std::vector<TableDef>& tables, std::span<char*> argv) {
+  auto queries = LoadStatements(args.query_file);
+  if (!queries) {
+    std::println(stderr, "{}", queries.error());
+    return kExitSetup;
+  }
+  auto status_text = ReadFile(args.status);
+  if (!status_text) {
+    std::println(stderr, "{}", status_text.error());
+    return kExitSetup;
+  }
+  auto status = ParseClickBenchStatus(*status_text);
+  if (!status) {
+    std::println(stderr, "antb1-slt: {}: {}", args.status, status.error());
+    return kExitUsage;
+  }
+  auto antb1 = MakeAntb1(tables, args);
+  auto oracle = MakeEngine("duckdb", tables, args);
+  if (!antb1 || !oracle) {
+    std::println(stderr, "antb1-slt: {}", !antb1 ? antb1.error() : oracle.error());
+    return kExitSetup;
+  }
+  const ClickBenchOptions options{.redact = args.redact,
+                                  .only = args.only,
+                                  .status_path = args.status,
+                                  .command = CommandLine(argv)};
+  std::string out;
+  const ClickBenchStats stats =
+      RunClickBench(*queries, *status, antb1->get(), **oracle, options, out);
+  std::print("{}", out);
+  return stats.failed == 0 ? 0 : kExitFailed;
+}
+
 int Main(std::span<char*> argv) {
   CLI::App app{"antb1-slt: sqllogictest runner (antb1 engine, DuckDB oracle)", "antb1-slt"};
   app.require_subcommand(1);
@@ -366,6 +476,26 @@ int Main(std::span<char*> argv) {
   diff->add_option("--mutate", args.mutate, "Corrupt antb1 results (harness self-tests)");
   diff->add_flag("--list", args.list,
                  "Print the generated queries (index, features, SQL); run nothing");
+  auto* queries = app.add_subcommand(
+      "queries", "Run the queries of FILE on antb1 and DuckDB and compare them (data tests)");
+  AddSetup(queries, args);
+  queries->add_option("file", args.query_file, "Query file (a `-- features:` line per query)")
+      ->required();
+  queries->add_flag("--redact", args.redact,
+                    "Never print values or SQL (only ids, features, types, counts, sha256)");
+  queries->add_option("--only", args.only, "Run only the query that starts on this line (repro)");
+  queries->add_option("--mutate", args.mutate, "Corrupt antb1 results (harness self-tests)");
+  auto* clickbench = app.add_subcommand(
+      "clickbench", "ClickBench status: run QUERIES on antb1, compare with DuckDB and the ratchet");
+  AddSetup(clickbench, args);
+  clickbench->add_option("--status", args.status, "The ratchet (tests/data/clickbench_status.json)")
+      ->required();
+  clickbench->add_option("queries", args.query_file, "ClickBench's queries.sql")->required();
+  clickbench->add_flag(
+      "--redact", args.redact,
+      "Never print values or query text (only query numbers, types, counts, sha256)");
+  clickbench->add_option("--only", args.only, "Run only Q<n> (repro)");
+  clickbench->add_option("--mutate", args.mutate, "Corrupt antb1 results (harness self-tests)");
   const auto* version = app.add_subcommand("version", "Print the DuckDB version the oracle uses");
   try {
     app.parse(static_cast<int>(argv.size()), argv.data());
@@ -395,6 +525,12 @@ int Main(std::span<char*> argv) {
   }
   if (diff->parsed()) {
     return Diff(args, *tables, argv);
+  }
+  if (queries->parsed()) {
+    return Queries(args, *tables, argv);
+  }
+  if (clickbench->parsed()) {
+    return ClickBench(args, *tables, argv);
   }
   return complete->parsed() ? Complete(args, *tables) : Run(args, *tables, argv);
 }

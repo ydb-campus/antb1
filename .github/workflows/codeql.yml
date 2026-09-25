@@ -1,0 +1,67 @@
+# CodeQL code scanning (security-extended queries): C++ from a traced GCC 15 build (CodeQL cannot trace Clang 23)
+# and the GitHub Actions workflows. Once ruleset stage B is applied, the ruleset's code_scanning rule blocks every
+# merge while a PR has new error-level or high-severity alerts, or no CodeQL analysis at all (docs/ci.md). Runs on
+# every PR (no paths filter, so the analysis always exists), on main and weekly. No merge_group trigger: code
+# scanning merge protection is not evaluated for merge queue groups.
+name: CodeQL
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  analyze:
+    name: CodeQL ${{ matrix.language }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read # checkout
+      security-events: write # upload the results
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: c-cpp
+            build-mode: manual
+          - language: actions
+            build-mode: none
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: 4
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The gcc environment, activated for the later steps: the build below runs cmake directly, because CodeQL's
+      # tracer does not follow processes through the static pixi binary (`pixi run codeql-build` locally).
+      - if: matrix.build-mode == 'manual'
+        uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
+        with:
+          pixi-version: v0.81.0
+          environments: gcc
+          activate-environment: gcc
+          locked: true
+          cache: true
+          cache-key: pixi-${{ hashFiles('pixi.lock') }}-
+          cache-write: false
+      - uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          queries: security-extended
+      - name: Traced GCC build (the commands of pixi run codeql-build)
+        if: matrix.build-mode == 'manual'
+        run: cmake -E rm -rf build/codeql && cmake --workflow --preset codeql
+      - uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          category: /language:${{ matrix.language }}

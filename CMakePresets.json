@@ -152,6 +152,24 @@
       "filter": { "include": { "label": "^(fuzz|fuzz-replay)$" } }
     },
     {
+      "name": "data",
+      "displayName": "ClickBench data tests (label data, NETWORK data, redacted) on the ci-release build",
+      "configurePreset": "ci-release",
+      "inherits": ["test-common"],
+      "filter": { "include": { "label": "^data$" } },
+      "output": { "outputJUnitFile": "junit-data.xml" },
+      "execution": { "jobs": 2 }
+    },
+    {
+      "name": "asan-data",
+      "displayName": "Nightly asan-data: the ClickBench data tests on the ci-asan build",
+      "configurePreset": "ci-asan",
+      "inherits": ["sanitizer-env", "test-common"],
+      "filter": { "include": { "label": "^data$" } },
+      "output": { "outputJUnitFile": "junit-data.xml" },
+      "execution": { "jobs": 2 }
+    },
+    {
       "name": "ci-shuffle",
       "displayName": "Nightly ci-shuffle: the ci build, tests in random order, each repeated until it fails (max 2)",
       "configurePreset": "ci",
@@ -229,6 +247,22 @@
         { "type": "configure", "name": "tsan" },
         { "type": "build", "name": "tsan" },
         { "type": "test", "name": "tsan" }
+      ]
+    },
+    {
+      "name": "data",
+      "steps": [
+        { "type": "configure", "name": "ci-release" },
+        { "type": "build", "name": "ci-release" },
+        { "type": "test", "name": "data" }
+      ]
+    },
+    {
+      "name": "asan-data",
+      "steps": [
+        { "type": "configure", "name": "ci-asan" },
+        { "type": "build", "name": "ci-asan" },
+        { "type": "test", "name": "asan-data" }
       ]
     },
     {

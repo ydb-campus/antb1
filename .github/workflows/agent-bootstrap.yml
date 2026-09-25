@@ -1,0 +1,49 @@
+# The shared sandbox bootstrap works from scratch (advisory): scripts/agent-setup.sh installs pixi 0.81.0 from the
+# GitHub release or from conda-forge (both sha256-pinned; the conda leg also proves that the conda-forge pixi binary
+# runs on Ubuntu 24.04) and the locked `default` and `lint` environments, as in the Claude, Codex and Copilot
+# sandboxes; then the tests and the doctor run against those environments as installed. No caches: the point is a
+# cold start.
+name: Agent bootstrap
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - scripts/agent-setup.sh
+      - pixi.toml
+      - pixi.lock
+      - .github/workflows/agent-bootstrap.yml
+  schedule:
+    - cron: "47 5 * * 3"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  bootstrap:
+    name: bootstrap ${{ matrix.source }} (bash scripts/agent-setup.sh --envs "default lint")
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read # checkout
+    strategy:
+      fail-fast: false
+      matrix:
+        source: [github, conda]
+    env:
+      ANTB1_PIXI_SOURCE: ${{ matrix.source }}
+      CMAKE_BUILD_PARALLEL_LEVEL: 4
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Bootstrap (bash scripts/agent-setup.sh --envs "default lint")
+        run: bash scripts/agent-setup.sh --envs "default lint"
+      - name: Tests (pixi run --as-is test)
+        run: pixi run --as-is test
+      - name: Doctor (pixi run --as-is doctor --json)
+        run: pixi run --as-is doctor --json

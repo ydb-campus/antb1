@@ -11,7 +11,7 @@ on:
     branches: [main]
   merge_group:
   schedule:
-    - cron: "30 2 * * *" # daily full run on main: the only run (with workflow_dispatch) that saves ccache
+    - cron: "30 2 * * *" # daily full run on main: the only run (with workflow_dispatch) that saves ccache; cache-gc
   workflow_dispatch:
 
 permissions: {}
@@ -312,10 +312,85 @@ jobs:
           header: coverage
           path: summary.md
 
+  # ClickBench data tests (label data): antb1 vs DuckDB on the pinned hits_0 partition, metamorphic relations on it
+  # and the ClickBench ratchet (docs/testing.md#clickbench-data-tests). The data (122 MB, tools/data/clickbench.lock)
+  # is cached under a key of its lock file; a miss downloads it, and only runs on main save it. Data-test output is
+  # redacted and this job uploads nothing (no logs, no data: docs/adr/0006-test-strategy-and-data-policy.md).
+  clickbench-hits0:
+    name: clickbench-hits0 (pixi run test-data)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read # checkout
+    env:
+      ANTB1_DATA_DIR: ${{ github.workspace }}/.cache/clickbench
+      CCACHE_MAXSIZE: 250M
+      CMAKE_BUILD_PARALLEL_LEVEL: 4
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
+        with:
+          pixi-version: v0.81.0
+          environments: default
+          locked: true
+          cache: true
+          cache-key: pixi-${{ hashFiles('pixi.lock') }}-
+          cache-write: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - name: Restore ccache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/ccache # CCACHE_DIR of every build preset (CMakePresets.json)
+          key: ccache-clickbench-hits0-${{ github.run_id }}
+          restore-keys: ccache-clickbench-hits0-
+      - name: Restore ClickBench data
+        id: data
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/clickbench
+          key: clickbench-${{ hashFiles('tools/data/clickbench.lock') }}
+      - name: Fetch data (pixi run fetch-data)
+        run: pixi run --frozen -e default fetch-data
+      - name: Save ClickBench data (main only, on a cache miss)
+        if: ${{ steps.data.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/clickbench
+          key: clickbench-${{ hashFiles('tools/data/clickbench.lock') }}
+      - name: Data tests (pixi run test-data)
+        run: pixi run --frozen -e default test-data
+      - name: Save ccache (main, scheduled or manual runs only)
+        if: >-
+          ${{ !cancelled() && github.ref == 'refs/heads/main'
+          && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/ccache
+          key: ccache-clickbench-hits0-${{ github.run_id }}
+      - name: Test report (redacted)
+        if: ${{ !cancelled() }}
+        uses: mikepenz/action-junit-report@a9170d5795813c01ab4901ffb045b52bab4ab09d # v6.5.0
+        with:
+          report_paths: build/ci-release/junit-data.xml
+          annotate_only: true
+          job_summary: true
+          detailed_summary: true
+      - name: Disk usage
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo '### Disk usage'
+            echo '```text'
+            df -h .
+            du -sh .pixi build .cache 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
   ci-ok:
     name: CI OK
     if: always()
-    needs: [lint, build-test, clang-tidy, clang-coverage-fuzz]
+    needs: [lint, build-test, clang-tidy, clang-coverage-fuzz, clickbench-hits0]
     runs-on: ubuntu-slim
     timeout-minutes: 5
     permissions: {}
@@ -324,3 +399,45 @@ jobs:
         uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # v1.3.0
         with:
           jobs: ${{ toJSON(needs) }}
+
+  # Keeps the Actions cache (10 GB per repository) small. After every run on main (not in the merge queue, not on
+  # PRs, whose caches are read-only), it deletes the pixi caches of other pixi.lock generations, the ClickBench data
+  # caches of other lock files and all but the newest ccache of each leg. Open PRs still on an old pixi.lock then
+  # install their environments without a cache until they merge main.
+  cache-gc:
+    name: cache-gc
+    needs: [lint, build-test, clang-tidy, clang-coverage-fuzz, clickbench-hits0]
+    if: ${{ always() && github.ref == 'refs/heads/main' && github.event_name != 'merge_group' }}
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
+    permissions:
+      actions: write # delete caches
+      contents: read # sparse checkout of the two lock files (their hashes name the caches to keep)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            pixi.lock
+            tools/data/clickbench.lock
+          sparse-checkout-cone-mode: false
+      - name: Delete stale caches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PIXI_KEEP: pixi-${{ hashFiles('pixi.lock') }}-
+          DATA_KEEP: clickbench-${{ hashFiles('tools/data/clickbench.lock') }}
+        run: |
+          set -euo pipefail
+          delete() { xargs -r -n1 gh cache delete -R "$REPO"; }
+          gh cache list -R "$REPO" --key pixi- --limit 1000 --json id,key \
+            --jq '.[] | select(.key | startswith(env.PIXI_KEEP) | not) | .id' | delete
+          gh cache list -R "$REPO" --key clickbench- --limit 100 --json id,key \
+            --jq '.[] | select(.key != env.DATA_KEEP) | .id' | delete
+          for leg in clang-asan gcc-compat macos-release clang-coverage-fuzz clickbench-hits0; do
+            gh cache list -R "$REPO" --key "ccache-$leg-" --sort created_at --order desc --limit 100 --json id \
+              --jq '.[1:][].id' | delete
+          done
+          gh cache list -R "$REPO" --limit 100 --json key,sizeInBytes \
+            --jq '"### Caches after cache-gc", "", (.[] | "- \(.key): \(.sizeInBytes / 1048576 | floor) MiB")' \
+            >> "$GITHUB_STEP_SUMMARY"

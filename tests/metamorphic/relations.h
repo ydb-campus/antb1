@@ -67,6 +67,7 @@ struct Verdict {
   };
   Kind kind = Kind::kHolds;
   std::string message;
+  std::string redacted;  // the message without values or error texts (the data tests print it)
 };
 
 // Judges the answers (one per probe) of relation `r` given the declared `supported` features.

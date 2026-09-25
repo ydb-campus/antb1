@@ -4,8 +4,11 @@ add_library(
   STATIC
   runner/antb1_engine.cc
   runner/canonical.cc
+  runner/clickbench.cc
   runner/difftest.cc
+  runner/query_file.cc
   runner/query_gen.cc
+  runner/result_diff.cc
   runner/runner.cc
   runner/sha256.cc
   runner/slt_file.cc
@@ -35,8 +38,10 @@ antb1_add_gtest(
   PREFIX harness
   SOURCES
     tests/canonical_test.cc
+    tests/clickbench_test.cc
     tests/comparator_test.cc
     tests/difftest_test.cc
+    tests/query_file_test.cc
     tests/query_gen_test.cc
     tests/runner_test.cc
     tests/slt_file_test.cc
@@ -200,6 +205,78 @@ if(ANTB1_HAVE_DUCKDB)
     FORBID "${_canary_regex}" "[sS][eE][lL][eE][cC][tT]"
     COMMAND $<TARGET_FILE:antb1-slt> diff ${_args}
   )
+
+  # `antb1-slt queries` and `antb1-slt clickbench` (the ClickBench data tests, tests/data) on the canary query
+  # file: a correct run passes, corrupted answers and ratchet differences fail, and a redacted report prints
+  # neither the SQL (it names the sentinel table) nor a value.
+  set(_queries "${CMAKE_CURRENT_SOURCE_DIR}/canary/canary_queries.sql")
+  set(_canary_tables TABLES "${CMAKE_CURRENT_SOURCE_DIR}/canary/tables.txt")
+  set(_redacted_forbid FORBID "${_canary_regex}" "[sS][eE][lL][eE][cC][tT]")
+  set(_cases pass mutate.value mutate.unsupported redact)
+  set(_opts_pass "")
+  set(_exit_pass 0)
+  set(_require_pass "QUERIES: PASS .* queries=2 compared=1 pending=1 rejected=0 failed=0")
+  set(_opts_mutate.value --mutate value)
+  set(_exit_mutate.value 1)
+  set(_require_mutate.value "FAIL .*canary_queries\\.sql:[0-9]+: result mismatch" "QUERIES: FAIL ")
+  set(_opts_mutate.unsupported --mutate unsupported)
+  set(_exit_mutate.unsupported 1)
+  set(_require_mutate.unsupported "antb1 reports Unsupported for a query that uses only supported features")
+  set(_opts_redact --redact --mutate canary)
+  set(_exit_redact 1)
+  set(_require_redact "FAIL .*canary_queries\\.sql:[0-9]+: result mismatch" "sha256: DuckDB [0-9a-f]+" "QUERIES: FAIL ")
+  foreach(case IN LISTS _cases)
+    set(_name harness.queries.${case})
+    antb1_slt_args(_args ${_name} ${_canary_tables} ${_opts_${case}})
+    set(_forbid "")
+    if(case STREQUAL "redact")
+      set(_forbid ${_redacted_forbid})
+    endif()
+    antb1_add_expect_test(
+      ${_name}
+      LABELS harness
+      FIXTURES_REQUIRED antb1_fixtures
+      EXIT_CODE ${_exit_${case}}
+      REQUIRE ${_require_${case}} ${_forbid}
+      COMMAND $<TARGET_FILE:antb1-slt> queries ${_args} "${_queries}"
+    )
+  endforeach()
+
+  # clickbench: the ratchet (canary/status_pass_*.json) must equal the passing queries exactly.
+  set(_cases pass unexpected_pass unexpected_fail redact)
+  set(_status_pass q0)
+  set(_exit_pass 0)
+  set(_require_pass "Q0: pass" "Q1: unsupported" "CLICKBENCH: PASS queries=2 pass=\\[0\\]")
+  set(_status_unexpected_pass none)
+  set(_exit_unexpected_pass 1)
+  set(_require_unexpected_pass "FAIL Q0: unexpected pass" "CLICKBENCH: FAIL ")
+  set(_status_unexpected_fail q0_q1)
+  set(_exit_unexpected_fail 1)
+  set(_require_unexpected_fail "FAIL Q1: unexpected fail" "CLICKBENCH: FAIL ")
+  set(_status_redact q0)
+  set(_opts_redact --redact --mutate canary)
+  set(_exit_redact 1)
+  set(_require_redact "FAIL Q0: result mismatch" "sha256: DuckDB [0-9a-f]+" "CLICKBENCH: FAIL ")
+  set(_opts_pass "")
+  set(_opts_unexpected_pass "")
+  set(_opts_unexpected_fail "")
+  foreach(case IN LISTS _cases)
+    set(_name harness.clickbench.${case})
+    set(_status "${CMAKE_CURRENT_SOURCE_DIR}/canary/status_pass_${_status_${case}}.json")
+    antb1_slt_args(_args ${_name} ${_canary_tables} --status "${_status}" ${_opts_${case}})
+    set(_forbid "")
+    if(case STREQUAL "redact")
+      set(_forbid ${_redacted_forbid})
+    endif()
+    antb1_add_expect_test(
+      ${_name}
+      LABELS harness
+      FIXTURES_REQUIRED antb1_fixtures
+      EXIT_CODE ${_exit_${case}}
+      REQUIRE ${_require_${case}} ${_forbid}
+      COMMAND $<TARGET_FILE:antb1-slt> clickbench ${_args} "${_queries}"
+    )
+  endforeach()
 endif()
 
 antb1_add_slt_complete_target()

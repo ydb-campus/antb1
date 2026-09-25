@@ -176,13 +176,17 @@ Known candidates, to be confirmed and registered by the PR that implements the f
 ## ClickBench status
 
 The target of the first slice is ClickBench Q0, Q1, Q2, Q3 and Q6, run with `--clickbench`. Query numbers follow
-ClickBench's DuckDB/Parquet query file (0-based); the query text itself is never committed. The data tests (added
-in a later PR) compare antb1 with DuckDB on the first partition of the `hits` dataset and keep a ratchet of verified
-passes in sync with this table; the PR that changes the pass set updates both.
+ClickBench's DuckDB/Parquet query file at ClickBench commit `5a56398c975bfd9f328f544894bcb92533ed134c` (0-based); the
+query text itself is never committed. The data test `data.clickbench.status` (`pixi run test-data`, CI job
+`clickbench-hits0`) runs every query on antb1 over the first partition of the `hits` dataset, compares the answers
+with DuckDB and fails when the passing queries differ from the ratchet `tests/data/clickbench_status.json`. `pass`
+below means exactly the ratchet (`pixi run lint` compares them); the PR that changes the pass set updates both
+([testing.md](testing.md#the-clickbench-ratchet)). Every other query must fail cleanly (exit code 4, or a parse or
+bind error); today all of them answer Unsupported.
 
 | Query | Status | Notes |
 | --- | --- | --- |
-| Q0 | pass | answered from the Parquet footer row counts |
+| Q0 | pass | answered from the Parquet footer row counts; equal to DuckDB on `hits_0` |
 | Q1 | target | slice |
 | Q2 | target | slice |
 | Q3 | target | slice |

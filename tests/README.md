@@ -12,6 +12,7 @@ modules. Every suite reads the Parquet fixtures of `tools/fixturegen`: the ctest
 | `integration/` | `integration.*` | `integration` | `engine::Session` end to end; bad Parquet inputs; globs |
 | `cli/` | `cli.<case>` | `cli` | stdout, stderr and exit code of the `antb1` binary |
 | `slt/`, `harness/`, `cli/` | `harness.*` | `harness` | the harness itself: mutations, redaction, digest |
+| `data/` | `data.*` | `data` | ClickBench data tests on downloaded data, redacted (`pixi run test-data` only) |
 
 ```bash
 pixi run test -L diff          # one label
@@ -19,7 +20,10 @@ pixi run diff-random           # 2000 generated queries, random seed (tests/slt/
 pixi run slt-complete          # rewrite .slt expectations from DuckDB, then review the diff
 ```
 
-Tests use our own tables, columns and queries only: never ClickBench data or ClickBench query text.
+Tests use our own tables, columns and queries only: never ClickBench data or ClickBench query text. The one
+exception is `data/` ([docs/testing.md](../docs/testing.md#clickbench-data-tests)): it reads the ClickBench files
+that `pixi run fetch-data` downloads (never committed) and runs with `--redact`, so no value or query text reaches
+a log. Its own queries (`data/hits0_slice.sql`) and relations (`data/hits_relations.cc`) are ours.
 
 ## What antb1 supports: `slt/supported_features.h`
 
