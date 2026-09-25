@@ -65,3 +65,14 @@ jobs:
       - uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
         with:
           category: /language:${{ matrix.language }}
+          upload: never
+          output: sarif-results
+      # CodeQL traces every header the compiler reads, so it also reports results in the toolchain's libstdc++
+      # headers under .pixi/ (and could in generated build files) that we cannot act on. paths-ignore has no effect
+      # on compiled languages, so the results are filtered here before the upload.
+      - name: Drop results in third-party code (tools/ci/filter_sarif.py)
+        run: python3 tools/ci/filter_sarif.py sarif-results --exclude '.pixi/*' --exclude 'build/*'
+      - uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          sarif_file: sarif-results
+          category: /language:${{ matrix.language }}
