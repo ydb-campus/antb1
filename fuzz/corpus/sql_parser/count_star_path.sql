@@ -1,0 +1,1 @@
+SELECT COUNT(*) FROM 'data/part-0.parquet'

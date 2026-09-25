@@ -1,0 +1,1 @@
+SELECT COUNT(*) FROM 'data/events_*.parquet'

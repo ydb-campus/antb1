@@ -1,0 +1,1 @@
+SELECT "Qty" FROM sales WHERE "Unit Price" = 3

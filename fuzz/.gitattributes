@@ -1,0 +1,4 @@
+# Fuzz inputs are raw bytes: never normalize their line endings (a committed crash input must stay byte-exact).
+corpus/** -text
+regressions/** -text
+regressions/README.md text

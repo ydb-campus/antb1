@@ -1,0 +1,1 @@
+INSERT INTO sales VALUES (1, 'x')

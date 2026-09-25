@@ -1,0 +1,3 @@
+# Tables of the diff redaction canary (harness.diff.redact): the table name is a sentinel that only
+# the generated SQL contains, so a redacted report must never print it.
+antb1_canary_table  edge.parquet

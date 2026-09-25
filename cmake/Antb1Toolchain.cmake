@@ -4,6 +4,8 @@ include_guard(GLOBAL)
 option(ANTB1_USE_CCACHE "Use ccache when available" ON)
 set(ANTB1_SANITIZE "" CACHE STRING "Sanitizers: 'address;undefined' or 'thread'")
 option(ANTB1_COVERAGE "Clang source-based coverage instrumentation" OFF)
+option(ANTB1_BUILD_FUZZERS "Build the libFuzzer targets in fuzz/ (Clang only)" OFF)
+set(ANTB1_FUZZ_ENGINE "-fsanitize=fuzzer" CACHE STRING "Link flags or library of the fuzzing engine (fuzz targets)")
 set(ANTB1_REQUIRE_COMPILER "" CACHE STRING "Fail unless CMAKE_CXX_COMPILER_ID matches (e.g. GNU)")
 
 if(ANTB1_REQUIRE_COMPILER AND NOT CMAKE_CXX_COMPILER_ID MATCHES "${ANTB1_REQUIRE_COMPILER}")
@@ -59,4 +61,10 @@ if(ANTB1_COVERAGE)
   endif()
   add_compile_options(-fprofile-instr-generate -fcoverage-mapping)
   add_link_options(-fprofile-instr-generate)
+endif()
+
+# The libFuzzer instrumentation (-fsanitize=fuzzer-no-link) is added per target in fuzz/CMakeLists.txt (common,
+# sql and the fuzz targets), never globally.
+if(ANTB1_BUILD_FUZZERS AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  message(FATAL_ERROR "ANTB1_BUILD_FUZZERS requires Clang (libFuzzer). Run `pixi run fuzz-smoke` or `pixi run fuzz`.")
 endif()

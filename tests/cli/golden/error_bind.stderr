@@ -1,0 +1,4 @@
+antb1: bind error: table 'nope' does not exist
+  at line 1, column 22
+  SELECT COUNT(*) FROM nope
+                       ^^^^

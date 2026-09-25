@@ -77,13 +77,23 @@ description = "Run the dev CLI, e.g. `pixi run antb1 query -f q.sql --table t=f.
 cmd = "bash scripts/antb1.sh"
 depends-on = ["build"]
 
+[feature.clang.tasks.slt-complete]
+description = "Rewrite the expected results in tests/slt/**/*.slt from the DuckDB oracle (review the diff before committing)"
+cmd = "cmake --build --preset dev --target slt-complete"
+depends-on = ["configure"]
+
+[feature.clang.tasks.diff-random]
+description = "Random differential test antb1 vs DuckDB (build/dev): ANTB1_DIFF_SEED (default random, printed), ANTB1_DIFF_COUNT (default 2000); repro one case with ANTB1_DIFF_SEED=<s> ANTB1_DIFF_ONLY=<case>"
+cmd = "bash scripts/diff-random.sh"
+depends-on = ["build"]
+
 [feature.clang.tasks.check]
 description = "REQUIRED before every PR: lint + `ci` (clang Debug -Werror, all hermetic tests)"
 depends-on = [{ task = "lint", environment = "lint" }, "ci"]
 
 [feature.clang.tasks.check-full]
-description = "All Linux x86-64 PR gates except data/CodeQL: check + asan + tidy + ci-gcc"
-depends-on = ["check", "asan", "tidy", { task = "ci-gcc", environment = "gcc" }]
+description = "All Linux x86-64 PR gates except data/CodeQL: check + asan + tidy + coverage + fuzz-smoke + ci-gcc"
+depends-on = ["check", "asan", "tidy", "coverage", "fuzz-smoke", { task = "ci-gcc", environment = "gcc" }]
 
 [feature.clang.tasks.ci]
 description = "clang Debug -Werror + hermetic tests -> build/ci/junit.xml"
@@ -100,6 +110,26 @@ cmd = "cmake --workflow --preset ci-release"
 [feature.clang.tasks.tidy]
 description = "CI leg clang-tidy: clang-tidy on every TU (-Werror) -> build/tidy"
 cmd = "cmake --workflow --preset tidy"
+
+[feature.clang.tasks.coverage]
+description = "CI leg clang-coverage-fuzz: hermetic tests with clang source-based coverage, per-module floors of tools/ci/coverage_thresholds.json -> build/coverage/summary.md, coverage.lcov"
+cmd = "cmake -E rm -rf build/coverage/prof && cmake --workflow --preset coverage && python tools/ci/coverage.py build/coverage --thresholds tools/ci/coverage_thresholds.json"
+
+[feature.clang.tasks.fuzz-smoke]
+description = "CI leg clang-coverage-fuzz: libFuzzer smoke run of the SQL parser (seed 1, 200k runs) + corpus replay, ASan+UBSan -> build/fuzz"
+cmd = "cmake --workflow --preset fuzz"
+
+[feature.clang.tasks.fuzz]
+description = "Long libFuzzer run of the SQL parser: ANTB1_FUZZ_SECONDS (default 600); crash inputs -> build/fuzz/artifacts/ (fuzz/regressions/README.md)"
+cmd = "bash scripts/fuzz.sh"
+
+[feature.clang.tasks.tsan]
+description = "Nightly tsan (advisory): ThreadSanitizer RelWithDebInfo + hermetic tests -> build/tsan"
+cmd = "cmake --workflow --preset tsan"
+
+[feature.clang.tasks.ci-shuffle]
+description = "Nightly ci-shuffle: the `ci` build, hermetic tests in random order, each repeated until it fails (max 2) -> build/ci/junit-shuffle.xml"
+cmd = "cmake --workflow --preset ci-shuffle"
 
 [feature.clang.tasks.doctor]
 description = "Environment/build/data status; `pixi run doctor --json` for machines"

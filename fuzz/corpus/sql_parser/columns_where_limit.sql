@@ -1,0 +1,1 @@
+SELECT region, qty FROM sales WHERE qty >= 10 AND region <> 'north' LIMIT 5

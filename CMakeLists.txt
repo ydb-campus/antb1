@@ -23,6 +23,7 @@ list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
 option(ANTB1_BUILD_TESTS "Build tests" ${PROJECT_IS_TOP_LEVEL})
 option(ANTB1_BUILD_BENCHMARKS "Build Google Benchmark micro benchmarks" OFF)
 option(ANTB1_CLANG_TIDY "Run clang-tidy on every translation unit" OFF)
+option(ANTB1_FUZZ_ONLY "Build only the Arrow-free modules (common, sql) and fuzz/: no Arrow, Parquet or CLI11" OFF)
 
 include(Antb1Toolchain) # global flags: ccache, linker, sanitizers, coverage, compiler guard
 include(Antb1BuildOptions) # antb1::build_options (warnings) for our targets only
@@ -41,12 +42,20 @@ if(ANTB1_CLANG_TIDY)
   set(CMAKE_CXX_CLANG_TIDY "${ANTB1_CLANG_TIDY_EXE}")
 endif()
 
-foreach(module IN LISTS ANTB1_MODULES)
+set(_antb1_modules ${ANTB1_MODULES})
+if(ANTB1_FUZZ_ONLY)
+  set(_antb1_modules common sql) # Arrow-free (ANTB1_EXT_common/sql are empty): all that fuzz/ links
+endif()
+foreach(module IN LISTS _antb1_modules)
   add_subdirectory(src/${module})
 endforeach()
 
-if(ANTB1_BUILD_TESTS)
+if(ANTB1_BUILD_TESTS AND NOT ANTB1_FUZZ_ONLY)
+  add_subdirectory(tools/fixturegen) # antb1-fixturegen: Parquet fixtures for the hermetic tests
   add_subdirectory(tests)
+endif()
+if(ANTB1_BUILD_TESTS OR ANTB1_BUILD_FUZZERS)
+  add_subdirectory(fuzz) # corpus replay in every build; libFuzzer targets with ANTB1_BUILD_FUZZERS (Clang)
 endif()
 
 antb1_check_module_graph()

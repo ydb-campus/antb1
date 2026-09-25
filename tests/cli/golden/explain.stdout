@@ -1,0 +1,2 @@
+Output: count_star():BIGINT
+RowCount table=t source=parquet(files=4, rows=10000)

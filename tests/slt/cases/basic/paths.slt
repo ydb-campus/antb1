@@ -1,0 +1,31 @@
+# FROM '<path>': a file, a glob (sorted matches) or a single part of a split table.
+
+query I nosort
+SELECT COUNT(*) FROM '${FIXTURES}/hits_like.parquet'
+----
+10000
+
+query I nosort
+SELECT COUNT(*) FROM '${FIXTURES}/hits_like_split/part-*.parquet'
+----
+10000
+
+query I nosort
+SELECT COUNT(*) FROM '${FIXTURES}/hits_like_split/part-2.parquet'
+----
+2500
+
+query I nosort
+SELECT COUNT(*) FROM '${FIXTURES}/hits_like_split/part-[01].parquet'
+----
+4000
+
+query I nosort
+SELECT COUNT(*) FROM '${FIXTURES}/edge.parquet'
+----
+12
+
+query I nosort
+SELECT COUNT(*) FROM '${FIXTURES}/empty.parquet'
+----
+0

@@ -1,0 +1,1 @@
+SELECT COUNT(*) FROM sales WHERE 100 < qty

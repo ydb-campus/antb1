@@ -1,0 +1,19 @@
+# Harness self-test: passes as is (slt.selftest.mutate); every `antb1-slt run --mutate <kind>` of it must
+# fail (harness.slt.mutate.<kind>). Keep at least one non-empty query, one `statement ok` and one
+# `statement error` record, all running on antb1.
+
+query I nosort
+SELECT COUNT(*) FROM hits_like
+----
+10000
+
+query I nosort
+SELECT COUNT(*) FROM edge
+----
+12
+
+statement ok
+SELECT COUNT(*) FROM hits_like_split
+
+statement error
+SELECT COUNT(*) FROM no_such_table

@@ -1,0 +1,18 @@
+# Redaction canary (harness.slt.redact_sentinels; not a test case: every record fails on purpose).
+# Each failure prints a sentinel (ANTB1_CANARY_*, antb1_canary_*) if --redact leaks the SQL, an
+# expected or actual value, an engine error message or a statement error regex. The test also
+# runs with --mutate canary, which makes antb1's first value a sentinel.
+
+query I nosort
+SELECT COUNT(*) /* ANTB1_CANARY_SQL */ FROM edge
+----
+ANTB1_CANARY_EXPECTED
+
+statement ok
+SELECT COUNT(*) FROM antb1_canary_missing_table
+
+statement error ANTB1_CANARY_REGEX
+SELECT COUNT(*) FROM no_such_table
+
+statement ok
+SELECT COUNT(*) FROM '${FIXTURES}/antb1_canary_file.parquet'

@@ -1,0 +1,1 @@
+SELECT SUM(qty * price) / 100 % 7 FROM sales

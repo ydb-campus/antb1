@@ -1,0 +1,1 @@
+SeLeCt CoUnT ( * ) FrOm Sales_2024 ;

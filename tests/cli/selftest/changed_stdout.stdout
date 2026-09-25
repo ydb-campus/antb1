@@ -1,0 +1,1 @@
+harness self-test (tests/cli/CMakeLists.txt): no antb1 output ever equals this file

@@ -1,0 +1,1 @@
+SELECT COUNT(*) FROM sales WHERE price > 1.5 AND price <= 2.5e3 AND discount <> .25

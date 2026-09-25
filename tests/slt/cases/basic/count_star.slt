@@ -1,0 +1,64 @@
+# COUNT(*) over every fixture table (tests/slt/tables.txt): antb1 answers it from the Parquet footers.
+
+query I nosort
+SELECT COUNT(*) FROM hits_like
+----
+10000
+
+# Keywords and table names are case-insensitive; quoted names too (DuckDB semantics).
+query I nosort
+select count(*) from HITS_LIKE
+----
+10000
+
+query I nosort
+SELECT COUNT(*) FROM "Hits_Like";
+----
+10000
+
+query I nosort
+SELECT COUNT(*) FROM hits_like_nulls
+----
+10000
+
+query I nosort
+SELECT COUNT(*) FROM hits_like_split
+----
+10000
+
+query I nosort
+SELECT COUNT(*) FROM hits_like_required
+----
+10000
+
+query I nosort
+SELECT COUNT(*) FROM edge
+----
+12
+
+query I nosort
+SELECT COUNT(*) FROM empty
+----
+0
+
+# SQL may span lines and carry comments.
+query I nosort
+SELECT
+  COUNT(*) -- all rows
+FROM /* four files */ hits_like_split
+----
+10000
+
+# The same label means the same result.
+query I nosort same_rows
+SELECT COUNT(*) FROM hits_like_split
+----
+10000
+
+query I nosort same_rows
+SELECT COUNT(*) FROM hits_like_required
+----
+10000
+
+statement ok
+SELECT COUNT(*) FROM hits_like
