@@ -1,7 +1,10 @@
 #include "antb1/cli/cli.h"
 
+#include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <cstddef>
+#include <cstdint>
 #include <format>
 #include <fstream>
 #include <istream>
@@ -12,6 +15,8 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <system_error>
+#include <utility>
 #include <vector>
 
 #include <CLI/CLI.hpp>
@@ -25,20 +30,14 @@
 #include "antb1/plan/sql_status.h"
 #include "antb1/plan/types.h"
 
+#include "cli_internal.h"
+#include <spawn.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+
 namespace antb1::cli {
-namespace {
 
-struct Inputs {
-  std::vector<std::string> tables;        // NAME=PATH[,PATH...]
-  std::vector<std::string> column_types;  // COLUMN=DATE
-  bool clickbench = false;
-  std::string command;  // -c
-  std::string file;     // -f
-  std::string format = "table";
-  bool timing = false;
-};
-
-std::string_view KindName(const arrow::Status& status) {
+std::string_view ErrorKind(const arrow::Status& status) {
   if (auto detail = plan::GetSqlError(status)) {
     switch (detail->kind()) {
       case plan::SqlErrorDetail::Kind::kParse:
@@ -73,12 +72,47 @@ std::string JsonString(std::string_view s) {
   return out + "\"";
 }
 
+namespace {
+
+struct Inputs {
+  std::vector<std::string> tables;        // NAME=PATH[,PATH...]
+  std::vector<std::string> column_types;  // COLUMN=DATE
+  bool clickbench = false;
+  std::string command;  // -c
+  std::string file;     // -f
+  std::string format = "table";
+  bool timing = false;
+  BenchSettings bench;
+};
+
+// The real implementations of the hooks that `hooks` leaves empty.
+CliHooks WithDefaults(CliHooks hooks) {
+  if (!hooks.seconds) {
+    hooks.seconds = [] {
+      return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch())
+          .count();
+    };
+  }
+  if (!hooks.today) {
+    hooks.today = [] {
+      const auto today = std::chrono::floor<std::chrono::days>(std::chrono::system_clock::now());
+      return std::format("{:%F}", std::chrono::year_month_day(today));
+    };
+  }
+  if (!hooks.drop_caches) {
+    hooks.drop_caches = [] {
+      return RunCommand({"sudo", "-n", "sh", "-c", "sync && echo 3 > /proc/sys/vm/drop_caches"});
+    };
+  }
+  return hooks;
+}
+
 // kind_override replaces the status-derived kind (used for command-line errors: "usage").
 void ReportError(const arrow::Status& status, std::string_view sql, bool json, std::ostream& err,
                  std::string_view kind_override = {}) {
   const auto detail = plan::GetSqlError(status);
   const std::string& message = status.message();
-  const std::string_view kind = kind_override.empty() ? KindName(status) : kind_override;
+  const std::string_view kind = kind_override.empty() ? ErrorKind(status) : kind_override;
   if (json) {
     std::string obj =
         std::format(R"({{"error":{{"kind":"{}","message":{})", kind, JsonString(message));
@@ -173,6 +207,27 @@ int Fail(const arrow::Status& status, std::string_view sql, const Inputs& in, st
   return ExitCodeFor(status);
 }
 
+// `antb1 bench` once the tables are registered (in load_time seconds).
+int Bench(engine::Session& session, const Inputs& in, double load_time, const CliHooks& hooks,
+          std::ostream& out, std::ostream& err) {
+#ifndef __linux__
+  if (in.bench.drop_caches) {
+    err << "antb1: usage error: --drop-caches is only supported on Linux\n";
+    return kExitUsage;
+  }
+#endif
+  BenchReport report{.date = hooks.today(),
+                     .machine = in.bench.machine.empty() ? DefaultMachine() : in.bench.machine,
+                     .git_sha = in.bench.git_sha,
+                     .batch_size = engine::SessionOptions{}.batch_size,
+                     .load_time = load_time};
+  for (const auto& spec : in.tables) {
+    const auto table = session.catalog().Find(spec.substr(0, spec.find('=')));
+    report.data_size += table == nullptr ? 0 : table->data_size().value_or(0);
+  }
+  return RunBench(session, in.bench, std::move(report), hooks, out, err);
+}
+
 }  // namespace
 
 int ExitCodeFor(const arrow::Status& status) {
@@ -193,7 +248,8 @@ int ExitCodeFor(const arrow::Status& status) {
 }
 
 int RunCli(std::span<const std::string> args, std::istream& in_stream, std::ostream& out,
-           std::ostream& err) {
+           std::ostream& err, const CliHooks& hooks) {
+  const CliHooks h = WithDefaults(hooks);
   CLI::App app{"antb1: experimental SQL engine over Parquet files", "antb1"};
   app.require_subcommand(1);
   Inputs in;
@@ -211,6 +267,23 @@ int RunCli(std::span<const std::string> args, std::istream& in_stream, std::ostr
 
   auto* schema = app.add_subcommand("schema", "Print the columns of the registered tables");
   AddTableOptions(schema, in);
+
+  auto* bench = app.add_subcommand(
+      "bench", "Run a query file (one query per line) and write ClickBench's result JSON");
+  bench->add_option("--queries", in.bench.queries_file, "Query file: one query per line")
+      ->required()
+      ->type_name("FILE");
+  AddTableOptions(bench, in);
+  bench->add_option("--tries", in.bench.tries, "Runs of every query")
+      ->default_val(3)
+      ->check(CLI::Range(1, 1000));
+  bench->add_option("--out", in.bench.out, "Result JSON file, - for stdout")
+      ->required()
+      ->type_name("FILE");
+  bench->add_option("--machine", in.bench.machine, "Machine description (default: this host)");
+  bench->add_option("--git-sha", in.bench.git_sha, "Commit of the build, recorded in the JSON");
+  bench->add_flag("--drop-caches", in.bench.drop_caches,
+                  "Drop the page cache (sudo -n) before the first try of every query (Linux)");
 
   const auto* version = app.add_subcommand("version", "Print version information");
 
@@ -231,9 +304,9 @@ int RunCli(std::span<const std::string> args, std::istream& in_stream, std::ostr
     return kExitOk;
   }
 
-  const auto start = std::chrono::steady_clock::now();
+  const double start = h.seconds();
   std::string sql;
-  if (!schema->parsed()) {
+  if (!schema->parsed() && !bench->parsed()) {
     auto text = ReadSql(in, in_stream);
     if (!text.ok()) {
       const bool io = text.status().IsIOError();
@@ -247,6 +320,10 @@ int RunCli(std::span<const std::string> args, std::istream& in_stream, std::ostr
     const bool io = session.status().IsIOError();
     ReportError(session.status(), "", in.format == "json", err, io ? "io" : "usage");
     return io ? kExitIo : kExitUsage;
+  }
+
+  if (bench->parsed()) {
+    return Bench(**session, in, h.seconds() - start, h, out, err);
   }
 
   if (schema->parsed()) {
@@ -291,11 +368,43 @@ int RunCli(std::span<const std::string> args, std::istream& in_stream, std::ostr
   out << *text;
   out.flush();
   if (in.timing) {
-    const std::chrono::duration<double> elapsed = std::chrono::steady_clock::now() - start;
-    err << std::format("{:.6f}\n",
-                       elapsed.count());  // plain fixed-point: ClickBench timing contract
+    err << std::format("{:.6f}\n", h.seconds() - start);  // plain fixed-point (ClickBench)
   }
   return kExitOk;
+}
+
+arrow::Status RunCommand(const std::vector<std::string>& argv) {
+  if (argv.empty()) {
+    return arrow::Status::Invalid("no command to run");
+  }
+  std::vector<std::string> storage = argv;  // posix_spawnp takes mutable strings
+  std::vector<char*> args;
+  args.reserve(storage.size() + 1);
+  for (std::string& a : storage) {
+    args.push_back(a.data());
+  }
+  args.push_back(nullptr);
+  std::vector<char*> no_environment = {nullptr};
+  pid_t pid = 0;
+  const int spawned =
+      ::posix_spawnp(&pid, args[0], nullptr, nullptr, args.data(), no_environment.data());
+  if (spawned != 0) {
+    return arrow::Status::IOError("cannot run '", argv[0],
+                                  "': ", std::generic_category().message(spawned));
+  }
+  siginfo_t info{};
+  while (::waitid(P_PID, static_cast<id_t>(pid), &info, WEXITED) != 0) {
+    if (errno != EINTR) {
+      return arrow::Status::IOError("cannot wait for '", argv[0], "'");
+    }
+  }
+  if (info.si_code != CLD_EXITED) {
+    return arrow::Status::IOError("'", argv[0], "' was killed");
+  }
+  if (info.si_status != 0) {
+    return arrow::Status::IOError("'", argv[0], "' failed with exit code ", info.si_status);
+  }
+  return arrow::Status::OK();
 }
 
 }  // namespace antb1::cli

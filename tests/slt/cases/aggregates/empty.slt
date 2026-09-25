@@ -1,0 +1,38 @@
+# Over no rows COUNT is 0 and SUM, AVG, MIN and MAX are NULL: an empty table, a WHERE that selects nothing,
+# and a WHERE that folds to FALSE at bind time (no column is read).
+
+query IIIRTT nosort
+SELECT COUNT(*), COUNT(Title), SUM(RegionID), AVG(UserID), MIN(EventDate), MAX(URL) FROM empty
+----
+0	0	NULL	NULL	NULL	NULL
+
+query IIIRTT nosort
+SELECT COUNT(*), COUNT(Title), SUM(RegionID), AVG(UserID), MIN(EventDate), MAX(URL) FROM hits_like WHERE RegionID > 20000
+----
+0	0	NULL	NULL	NULL	NULL
+
+# RegionID is INTEGER: 1.5 is not an integer, so the comparison is never true.
+query IIIRTT nosort
+SELECT COUNT(*), COUNT(Title), SUM(RegionID), AVG(UserID), MIN(EventDate), MAX(URL) FROM hits_like WHERE RegionID = 1.5
+----
+0	0	NULL	NULL	NULL	NULL
+
+# SMALLINT: 40000 is outside the type, so no value is greater.
+query IIR nosort
+SELECT COUNT(*), SUM(i16), AVG(d) FROM edge WHERE i16 > 40000
+----
+0	NULL	NULL
+
+query I nosort
+SELECT COUNT(*) FROM empty WHERE RegionID <> 0
+----
+0
+
+# A projection with no row.
+query IT rowsort
+SELECT WatchID, Title FROM hits_like WHERE RegionID < 0
+----
+
+query IT rowsort
+SELECT WatchID, Title FROM empty
+----

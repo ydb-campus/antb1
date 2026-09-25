@@ -57,5 +57,8 @@ endif()
 if(ANTB1_BUILD_TESTS OR ANTB1_BUILD_FUZZERS)
   add_subdirectory(fuzz) # corpus replay in every build; libFuzzer targets with ANTB1_BUILD_FUZZERS (Clang)
 endif()
+if(ANTB1_BUILD_BENCHMARKS AND NOT ANTB1_FUZZ_ONLY)
+  add_subdirectory(bench) # Google Benchmark micro benchmarks (presets bench and ci-release)
+endif()
 
 antb1_check_module_graph()

@@ -5,15 +5,16 @@
     "Floors only go up: each is the measured value minus 2, rounded down to 0.1 (stub modules 0). A PR that raises",
     "a module's coverage may raise its floors; a slice PR that extends a module sets them again from its measurement.",
     "Long-term targets (lines / branches): common, sql and plan 90 / 75; io, exec and engine 85 / 70; cli 60 / 40.",
-    "Measured 2026-09-25 (lines / branches): common 94.12 / 92.31, sql 80.45 / 73.06, plan 87.14 / 81.95,",
-    "io 93.33 / 87.84, exec 92.73 / 72.41, engine 86.18 / 73.89, cli 95.40 / 85.37.",
+    "Measured 2026-09-25 after the exec/engine/cli slice (lines / branches): common 94.94 / 92.86, sql 99.38 / 97.67,",
+    "plan 95.55 / 91.57, io 95.27 / 88.64, exec 98.12 / 87.19, engine 95.04 / 87.17, cli 95.11 / 88.41",
+    "(cli keeps its higher earlier line floor).",
     "A module without branches (or lines) is N/A for that floor."
   ],
-  "common": { "lines": 92.1, "branches": 90.3 },
-  "sql": { "lines": 78.4, "branches": 71.0 },
-  "plan": { "lines": 85.1, "branches": 79.9 },
-  "io": { "lines": 91.3, "branches": 85.8 },
-  "exec": { "lines": 90.7, "branches": 70.4 },
-  "engine": { "lines": 84.1, "branches": 71.8 },
-  "cli": { "lines": 93.4, "branches": 83.3 }
+  "common": { "lines": 92.9, "branches": 90.8 },
+  "sql": { "lines": 97.3, "branches": 95.6 },
+  "plan": { "lines": 93.5, "branches": 89.5 },
+  "io": { "lines": 93.2, "branches": 86.6 },
+  "exec": { "lines": 96.1, "branches": 85.1 },
+  "engine": { "lines": 93.0, "branches": 85.1 },
+  "cli": { "lines": 93.4, "branches": 86.4 }
 }

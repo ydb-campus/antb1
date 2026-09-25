@@ -19,15 +19,15 @@ arrow::Status RowCountOperator::Open(ExecContext& ctx) {
   return arrow::Status::OK();
 }
 
-arrow::Result<std::shared_ptr<arrow::RecordBatch>> RowCountOperator::Next() {
+arrow::Result<Batch> RowCountOperator::Next() {
   if (done_) {
-    return nullptr;
+    return Batch{};
   }
   done_ = true;
   arrow::Int64Builder builder(pool_);
   ARROW_RETURN_NOT_OK(builder.Append(row_count_));
   ARROW_ASSIGN_OR_RAISE(auto array, builder.Finish());
-  return arrow::RecordBatch::Make(schema_, 1, {std::move(array)});
+  return Batch{.data = arrow::RecordBatch::Make(schema_, 1, {std::move(array)}), .selection = {}};
 }
 
 }  // namespace antb1::exec

@@ -250,7 +250,14 @@ arrow::Result<Predicate> BindComparison(const sql::Comparison& cmp, const BoundC
       if (!number) {
         return mismatch("write a number without quotes");
       }
-      const auto exact = ParseExactNumber(lit.text, lit.negative);
+      std::optional<ExactNumber> exact;
+      if (IsApproximateNumber(lit.text)) {
+        // DuckDB reads it as a DOUBLE: compare with the nearest double, exactly (divergence D7).
+        const auto value = ParseDoubleLiteral(lit.text, lit.negative);
+        exact = value.has_value() ? std::optional(ExactNumberOf(*value)) : std::nullopt;
+      } else {
+        exact = ParseExactNumber(lit.text, lit.negative);
+      }
       if (!exact.has_value()) {
         return BindError("invalid number " + Clip(lit.text), lit.span);
       }

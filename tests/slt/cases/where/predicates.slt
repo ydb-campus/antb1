@@ -1,0 +1,72 @@
+# WHERE is a conjunction of column <op> literal comparisons; literal-first comparisons are mirrored.
+
+query IIIIIIT nosort
+SELECT COUNT(*), COUNT(i32), SUM(i32), MIN(i32), MAX(i32), COUNT(s), MIN(s) FROM edge WHERE i32 <> 0
+----
+9	9	54320	-2147483648	2147483647	8	(empty)
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE AdvEngineID = 7
+----
+15
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE AdvEngineID != 7
+----
+9985
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE ResolutionWidth > 1366
+----
+5043
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE 1366 < ResolutionWidth
+----
+5043
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE ResolutionWidth <= 1024 AND ResolutionHeight >= 900
+----
+1589
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE IsMobile = 1 AND OS < 60 AND TraficSourceID >= 0 AND 5000 > RegionID
+----
+620
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE -3 < ClientTimeZone AND ClientTimeZone < 3
+----
+1901
+
+query I nosort
+SELECT COUNT(*) FROM hits_like_nulls WHERE RegionID < 10000 AND Title >= 'm'
+----
+2175
+
+query I nosort
+SELECT COUNT(*) FROM hits_like_nulls WHERE Title >= 'm' AND RegionID < 10000
+----
+2175
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE SearchPhrase <> '' AND AdvEngineID = 0
+----
+1816
+
+query IR nosort
+SELECT SUM(ResolutionWidth), AVG(UserAgent) FROM hits_like WHERE CounterID = 62 AND IsRefresh = 0
+----
+177012	28.49586776859504
+
+# The same column twice.
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i64 > -100 AND i64 < 100
+----
+6
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE EventTime >= 1373000000 AND EventTime < 1373500000
+----
+1834

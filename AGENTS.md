@@ -1,9 +1,9 @@
 # AGENTS.md: antb1
 antb1 is an experimental C++23 analytics engine: SQL-like queries over local Parquet files, built on Apache Arrow C++
-25 (conda-forge). Namespace `antb1`, CLI `antb1`. Today it answers `SELECT COUNT(*) FROM t` (ClickBench Q0) from Parquet
-footers; the slice target is global aggregates, `WHERE col <op> literal [AND ...]`, projection and `LIMIT`. This file
-is the canonical guide for every agent. Maps: [architecture](docs/architecture.md) · [SQL subset](docs/sql-subset.md)
-· [testing](docs/testing.md) · [CI](docs/ci.md) · [ADRs](docs/adr/README.md) · [contributing](CONTRIBUTING.md).
+25 (conda-forge). Namespace `antb1`, CLI `antb1`. It runs global aggregates (COUNT, SUM, AVG, MIN, MAX), projections,
+`WHERE col <op> literal [AND ...]` and `LIMIT` (ClickBench Q0-Q3, Q6). This file is the canonical guide for every
+agent. Maps: [architecture](docs/architecture.md) · [SQL subset](docs/sql-subset.md) · [testing](docs/testing.md) ·
+[CI](docs/ci.md) · [benchmarks](docs/benchmarks.md) · [ADRs](docs/adr/README.md) · [contributing](CONTRIBUTING.md).
 ## Golden rules
 
 1. Only use `pixi run <task>` from the table below. Never call host compilers, `cmake` or `ctest` directly (only the
@@ -38,7 +38,7 @@ is the canonical guide for every agent. Maps: [architecture](docs/architecture.m
 | All Linux PR gates: `check` + `asan` + `tidy` + `coverage` + `fuzz-smoke` + `ci-gcc` | `pixi run check-full` |
 | Single legs (coverage floors: `tools/ci/coverage_thresholds.json`); CodeQL traced build (GCC, no tests) | `pixi run ci` · `pixi run asan` · `pixi run ci-gcc` · `pixi run release` · `pixi run tidy` · `pixi run coverage` · `pixi run fuzz-smoke` · `pixi run codeql-build` |
 | Rewrite `.slt` expectations from DuckDB (then review the diff); random differential test vs DuckDB, and its repro | `pixi run slt-complete` · `pixi run diff-random` · `ANTB1_DIFF_SEED=<s> ANTB1_DIFF_ONLY=<case> pixi run diff-random` |
-| Deep checks, not PR gates: long fuzzing (`ANTB1_FUZZ_SECONDS`), ThreadSanitizer, random test order | `pixi run fuzz` · `pixi run tsan` · `pixi run ci-shuffle` |
+| Not PR gates: long fuzzing (`ANTB1_FUZZ_SECONDS`), ThreadSanitizer, random test order; micro benchmarks (`build/bench/micro.json`) and ClickBench runs of `antb1 bench` (docs/benchmarks.md) | `pixi run fuzz` · `pixi run tsan` · `pixi run ci-shuffle` · `pixi run bench` · `pixi run bench-clickbench` |
 | ClickBench (NETWORK; files in `~/.cache/antb1`, never committed): pinned download (`--full`: 14.7 GB, host only); redacted data tests (CI `clickbench-hits0`); their nightly ASan run | `pixi run fetch-data` · `pixi run test-data` · `pixi run asan-data` |
 | Environment status; delete build trees; optional git hook (lint on staged files) | `pixi run doctor` · `pixi run doctor --json` · `pixi run clean` · `pixi run install-git-hooks` |
 
@@ -49,9 +49,9 @@ Every CI job name contains the command that reproduces it (docs/ci.md). SQL cont
 - `src/<module>/include/antb1/<module>/*.h` public API, `src/<module>/*.cc`, `src/<module>/tests/*_test.cc` tests.
   Modules: `common` → `sql` → `plan` → {`io`, `exec`} → `engine` → `cli`; allow-list in `cmake/Antb1Modules.cmake`.
 - `cmake/` build logic · `CMakePresets.json` · `tests/` cross-module suites and harness · `tools/fixturegen/` fixtures
-  · `fuzz/` parser fuzzer · `scripts/` task entry points (`scripts/ctest.sh` allowlists ctest args) ·
-  `tools/lint/check_repo.py` drift checks · `tools/ci/coverage.py` coverage gate · `tools/github/` settings as code ·
-  `tools/sanitizers/` suppressions · `docs/`, `docs/adr/` · `.github/` workflows, templates, CODEOWNERS.
+  · `fuzz/` parser fuzzer · `bench/` micro benchmarks · `scripts/` task entry points (`scripts/ctest.sh` allowlists
+  ctest args) · `tools/lint/check_repo.py` drift checks · `tools/ci/coverage.py` coverage gate · `tools/github/`
+  settings as code · `tools/sanitizers/` suppressions · `docs/`, `docs/adr/` · `.github/` workflows, CODEOWNERS.
 - Skills for every agent in `.agents/skills/<name>/SKILL.md` (`.claude/skills/` is a generated copy), recipes in
   `docs/recipes/`; agent setup, AI reviews and secrets in [docs/agents.md](docs/agents.md).
 
@@ -82,7 +82,7 @@ Every CI job name contains the command that reproduces it (docs/ci.md). SQL cont
 - Unit tests live in `src/<module>/tests/*_test.cc` (`antb1_add_module_tests`, named `<module>.<Suite>.<Case>`, label
   `unit`); cross-module suites and the harness live in `tests/` ([tests/README.md](tests/README.md)). Labels in use:
   `unit` `integration` `slt` `oracle` `diff` `metamorphic` `cli` `harness` `fuzz-replay` `setup` (hermetic), `fuzz`
-  (`pixi run fuzz-smoke` only) and `data` (`pixi run test-data` only); `bench-smoke` is reserved. See docs/testing.md.
+  (`pixi run fuzz-smoke`), `bench-smoke` (`pixi run release`) and `data` (`pixi run test-data`). See docs/testing.md.
 - SQL behavior goes into `tests/slt/cases/<area>/*.slt`: write the SQL, let `pixi run slt-complete` write the expected
   blocks from DuckDB, review the diff. Declare a newly answered feature in `tests/slt/supported_features.h`; when the
   ClickBench pass set changes, update `tests/data/clickbench_status.json` and the docs/sql-subset.md table with it.

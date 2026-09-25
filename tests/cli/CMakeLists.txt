@@ -23,6 +23,101 @@ antb1_add_cli_golden(
   ARGS query -c "${_count}" --table "t=${_f}/empty.parquet" --format csv
 )
 
+# ---- results of every query shape (our own queries over the fixtures) ----
+set(_aggregates "SELECT COUNT(*), COUNT(Title), SUM(UserID), AVG(ResolutionWidth), MIN(EventDate), MAX(URL) FROM t")
+antb1_add_cli_golden(
+  query_aggregates
+  ARGS query --clickbench -c "${_aggregates}" --table "${_t}"
+)
+antb1_add_cli_golden(
+  query_aggregates_json
+  ARGS query --clickbench -c "${_aggregates} WHERE RegionID < 5000 AND IsMobile <> 0" --table "${_t}" --format json
+)
+antb1_add_cli_golden(
+  query_aggregates_empty
+  ARGS
+    query
+    -c
+    "SELECT COUNT(*), COUNT(Title), SUM(RegionID) AS s, AVG(RegionID), MIN(Title), MAX(WatchID) FROM t WHERE RegionID > 70000"
+    --table
+    "${_t}"
+    --format
+    csv
+)
+antb1_add_cli_golden(
+  query_aggregates_empty_json
+  ARGS query -c "SELECT COUNT(*), SUM(RegionID), MIN(Title) FROM t WHERE RegionID = 1.5" --table "${_t}" --format json
+)
+antb1_add_cli_golden(
+  query_projection
+  ARGS
+    query
+    --clickbench
+    -c
+    "SELECT WatchID, EventDate, ResolutionWidth AS width, SearchPhrase FROM t WHERE SearchPhrase <> '' AND RegionID < 3000 LIMIT 4"
+    --table
+    "${_t}"
+)
+antb1_add_cli_golden(
+  query_projection_csv
+  ARGS query -c "SELECT id, i64, d, s FROM t WHERE id <= 4" --table "t=${_f}/edge.parquet" --format csv
+)
+antb1_add_cli_golden(
+  query_projection_json
+  ARGS
+    query
+    -c
+    "SELECT id, i64, d, s, u FROM edge WHERE id >= 5 AND id <> 7 LIMIT 4"
+    --table
+    "edge=${_f}/edge.parquet"
+    --format
+    json
+)
+antb1_add_cli_golden(
+  query_limit_zero
+  ARGS query -c "SELECT Title FROM t LIMIT 0" --table "${_t}" --format csv
+)
+antb1_add_cli_golden(
+  query_edge_aggregates
+  ARGS query -c "SELECT SUM(i64), SUM(u16), AVG(i64), MAX(d), MIN(s) FROM edge" --table "edge=${_f}/edge.parquet"
+)
+
+# ---- bench: ClickBench-format JSON (docs/benchmarks.md); timings vary, so regexes ----
+# CMake regex: [.] [{] [}] [[] []] match the character itself; \n is a newline. Built with string(APPEND):
+# a CMake list would split at the ; separators inside [ ].
+set(_num "[0-9]+[.][0-9]+")
+set(_bench_json "^[{]\n  \"system\": \"antb1\",\n  \"date\": \"[0-9]+-[0-9][0-9]-[0-9][0-9]\",\n")
+string(APPEND _bench_json "  \"machine\": \"[^\"]+\",\n  \"cluster_size\": 1,\n  \"proprietary\": \"no\",\n")
+string(APPEND _bench_json "  \"hardware\": \"cpu\",\n  \"tuned\": \"no\",\n")
+string(APPEND _bench_json "  \"tags\": [[]\"C[+][+]\", \"column-oriented\", \"embedded\", \"stateless\"[]],\n")
+string(APPEND _bench_json "  \"load_time\": ${_num},\n  \"data_size\": [1-9][0-9]*,\n")
+string(APPEND _bench_json "  \"concurrent_qps\": null,\n  \"concurrent_error_ratio\": null,\n  \"result\": [[]\n")
+string(APPEND _bench_json "    [[]${_num}, ${_num}[]],\n    [[]${_num}, ${_num}[]],\n")
+string(APPEND _bench_json "    [[]null, null[]],\n    [[]null, null[]]\n  []],\n  \"antb1\": [{]\n")
+string(APPEND _bench_json ".*    \"cache\": \"lukewarm\",\n    \"tries\": 2,\n    \"batch_size\": 65536,\n")
+string(APPEND _bench_json "    \"failed\": [[][{]\"query\": 2, \"kind\": \"unsupported\"[}], ")
+string(APPEND _bench_json "[{]\"query\": 3, \"kind\": \"bind\"[}][]]\n  [}]\n[}]$")
+set(_bench_log "^Q0: ${_num} ${_num}\nQ1: ${_num} ${_num}\nQ2: unsupported error\nQ3: bind error\n")
+string(APPEND _bench_log "bench: 4 queries, 2 answered, 2 failed[;] JSON on stdout [(]lukewarm[)]$")
+antb1_add_cli_golden(
+  bench
+  STDOUT_REGEX "${_bench_json}"
+  STDERR_REGEX "${_bench_log}"
+  ARGS bench --clickbench --queries "${_sql}/bench.sql" --table "${_t}" --tries 2 --out -
+)
+antb1_add_cli_golden(
+  bench_missing_queries
+  EXIT_CODE 3
+  STDERR_REGEX "^antb1: io error: cannot read the query file '[$][{]FIXTURES[}]/no_such[.]sql'$"
+  ARGS bench --queries "${_f}/no_such.sql" --table "${_t}" --out -
+)
+antb1_add_cli_golden(
+  usage_bench_tries
+  EXIT_CODE 2
+  STDERR_REGEX "--tries"
+  ARGS bench --queries "${_sql}/bench.sql" --table "${_t}" --tries 0 --out -
+)
+
 # ---- SQL sources and table forms ----
 antb1_add_cli_golden(
   query_file
@@ -87,7 +182,7 @@ antb1_add_cli_golden(
   unsupported_json
   EXIT_CODE 4
   STDERR
-  ARGS query -c "SELECT SUM(AdvEngineID) FROM t" --table "${_t}" --format json
+  ARGS query -c "SELECT SUM(AdvEngineID) FROM t HAVING SUM(AdvEngineID) > 0" --table "${_t}" --format json
 )
 antb1_add_cli_golden(
   unsupported_explain
@@ -99,7 +194,7 @@ antb1_add_cli_golden(
   unsupported_where
   EXIT_CODE 4
   STDERR
-  ARGS query -c "SELECT COUNT(*) FROM t\nWHERE IsMobile = 1" --table "${_t}"
+  ARGS query -c "SELECT COUNT(*) FROM t\nWHERE IsMobile = 1 OR IsRefresh = 1" --table "${_t}"
 )
 antb1_add_cli_golden(
   error_bind_column

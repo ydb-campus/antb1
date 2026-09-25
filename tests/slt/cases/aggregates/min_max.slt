@@ -1,0 +1,59 @@
+# MIN and MAX keep their column's type. VARCHAR compares byte-wise (UTF-8 sorts after ASCII), DATE
+# chronologically. Under WHERE only the selected rows count.
+
+query IIIIIIII nosort
+SELECT MIN(i16), MAX(i16), MIN(i32), MAX(i32), MIN(i64), MAX(i64), MIN(u16), MAX(u16) FROM edge
+----
+-32768	32767	-2147483648	2147483647	-9223372036854775808	9223372036854775807	0	65535
+
+query RR nosort
+SELECT MIN(d), MAX(d) FROM edge
+----
+-9007199254740992	922337203685477632
+
+query TTTT nosort
+SELECT MIN(s), MAX(s), MIN(u), MAX(u) FROM edge
+----
+(empty)	Привет, мир	(empty)	日本語
+
+query TT nosort
+SELECT MAX(EventDate), MIN(EventDate) FROM hits_like_nulls
+----
+2013-07-31	2013-07-01
+
+query IIII nosort
+SELECT MIN(UserID), MAX(UserID), MIN(WatchID), MAX(WatchID) FROM hits_like
+----
+-9223372036854775808	9223372036854775807	-9223372036854775808	9223372036854775807
+
+query TT nosort
+SELECT MIN(Title), MAX(Title) FROM hits_like_nulls
+----
+(empty)	погода погода музыка stone river
+
+query TT nosort
+SELECT MIN(URL), MAX(Referer) FROM hits_like_required
+----
+(empty)	https://ref.example.org/погода/99824?q=tundra
+
+# Under WHERE.
+query IITT nosort
+SELECT MIN(RegionID), MAX(RegionID), MIN(EventDate), MAX(EventDate) FROM hits_like WHERE IsMobile = 1 AND RegionID > 100
+----
+103	19998	2013-07-01	2013-07-31
+
+query TT nosort
+SELECT MIN(s), MAX(u) FROM edge WHERE id > 3
+----
+\x20leading space	日本語
+
+query II nosort
+SELECT MIN(i64), MAX(i64) FROM edge WHERE i64 <> 0 AND i64 < 100
+----
+-9223372036854775808	42
+
+# A column that is NULL everywhere.
+query TI nosort
+SELECT MAX(SocialAction), MIN(HistoryLength) FROM hits_like_nulls
+----
+NULL	NULL

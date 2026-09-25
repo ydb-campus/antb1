@@ -1,0 +1,62 @@
+# SUM over integers is an exact 128-bit HUGEINT (it never wraps at 64 bits); SUM over DOUBLE is DOUBLE; AVG is
+# DOUBLE, from the exact integer sum divided once by the count.
+
+# UserID and WatchID hold int64 extremes: the sums leave the BIGINT range.
+query II nosort
+SELECT SUM(UserID), SUM(WatchID) FROM hits_like
+----
+23021353196360218899981	176694416255356125902
+
+query I nosort
+SELECT SUM(i64) FROM edge WHERE i64 > 0
+----
+9224372036854775857
+
+query II nosort
+SELECT SUM(i64), SUM(i32) FROM edge WHERE i64 >= 1000000000000000
+----
+9224372036854775807	2147583647
+
+# Every integer type and DOUBLE.
+query IIIIR nosort
+SELECT SUM(i16), SUM(i32), SUM(i64), SUM(u16), SUM(d) FROM edge
+----
+6	54320	6	170129	913330004554193408
+
+query IIII nosort
+SELECT SUM(Interests), SUM(ClientIP), SUM(RegionID), SUM(EventTime) FROM hits_like
+----
+82727325	77740495380	97210255	13739675660694
+
+# tol 1e-9
+query RRRRR nosort
+SELECT AVG(i16), AVG(i32), AVG(i64), AVG(u16), AVG(d) FROM edge
+----
+0.6	5432	0.6	17012.9	91333000455419344
+
+query RR nosort
+SELECT AVG(UserID), AVG(ResolutionWidth) FROM hits_like_nulls
+----
+2306245186493317120	1400.8192927435925
+
+query RR nosort
+SELECT AVG(WatchID), AVG(ClientIP) FROM hits_like WHERE RegionID < 5000
+----
+93295893444752688	13334174.703935271
+
+# NULLs are skipped: the sum and the count only see non-NULL values.
+query IRI nosort
+SELECT SUM(RegionID), AVG(RegionID), COUNT(RegionID) FROM hits_like_nulls
+----
+89481898	9710.460987520348	9215
+
+query IR nosort
+SELECT SUM(i16), AVG(i16) FROM edge WHERE id >= 5
+----
+7	1.4
+
+# A DOUBLE sum in row order.
+query RR nosort
+SELECT SUM(d), AVG(d) FROM edge WHERE d < 1
+----
+-9007199254740991	-1125899906842623.9

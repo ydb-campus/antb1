@@ -1,15 +1,21 @@
 #include "antb1/engine/session.h"
 
+#include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <arrow/api.h>
 #include <arrow/io/file.h>
 #include <gtest/gtest.h>
 #include <parquet/arrow/writer.h>
 
+#include "antb1/engine/format.h"
 #include "antb1/plan/sql_status.h"
+#include "antb1/plan/types.h"
 
 namespace antb1::engine {
 namespace {
@@ -114,22 +120,81 @@ TEST_F(SessionTest, ExplainShowsTheOptimizedPlan) {
             "    Scan table=t source=parquet(files=1, rows=10) columns=[AdvEngineID, EventDate]\n");
 }
 
-// The binder accepts the whole grammar; the executor answers only COUNT(*) without WHERE so far,
-// so everything else is Unsupported (exit code 4), not an internal error.
-TEST_F(SessionTest, QueriesTheExecutorCannotRunYetAreUnsupported) {
+// The rows of a result as canonical text (engine::FormatValue), one vector per row.
+std::vector<std::vector<std::string>> Rows(const QueryResult& result) {
+  const auto table = result.table->CombineChunks().ValueOrDie();
+  std::vector<std::vector<std::string>> rows;
+  for (int64_t r = 0; r < table->num_rows(); ++r) {
+    std::vector<std::string> row;
+    row.reserve(static_cast<std::size_t>(table->num_columns()));
+    for (int c = 0; c < table->num_columns(); ++c) {
+      row.push_back(FormatValue(*table->column(c)->chunk(0), r,
+                                result.types.at(static_cast<std::size_t>(c))));
+    }
+    rows.push_back(std::move(row));
+  }
+  return rows;
+}
+
+// Every query shape of the grammar runs; results carry the output names (also as the table's
+// field names) and types.
+TEST_F(SessionTest, ExecutesAggregatesProjectionsFiltersAndLimits) {
+  SessionOptions options;
+  options.default_overrides.emplace_back("EventDate", plan::LogicalType::kDate);
+  options.batch_size = 3;
+  auto session = Session::Make(options).ValueOrDie();
+  ASSERT_TRUE(session->RegisterParquet("t", {path_}).ok());
+
+  auto aggregates = session->Execute(
+      "SELECT COUNT(*), SUM(AdvEngineID) AS s, AVG(AdvEngineID), MIN(EventDate), "
+      "MAX(AdvEngineID), COUNT(EventDate) FROM t WHERE AdvEngineID >= 2");
+  ASSERT_TRUE(aggregates.ok()) << aggregates.status().ToString();
+  EXPECT_EQ(aggregates->names,
+            (std::vector<std::string>{"count_star()", "s", "avg(AdvEngineID)", "min(EventDate)",
+                                      "max(AdvEngineID)", "count(EventDate)"}));
+  EXPECT_EQ(aggregates->types, (std::vector<plan::LogicalType>{
+                                   plan::LogicalType::kBigInt, plan::LogicalType::kHugeInt,
+                                   plan::LogicalType::kDouble, plan::LogicalType::kDate,
+                                   plan::LogicalType::kSmallInt, plan::LogicalType::kBigInt}));
+  EXPECT_EQ(aggregates->table->schema()->field(1)->name(), "s");
+  EXPECT_EQ(Rows(*aggregates),
+            (std::vector<std::vector<std::string>>{{"8", "44", "5.5", "2022-01-08", "9", "8"}}));
+
+  auto projection = session->Execute(
+      "SELECT AdvEngineID, EventDate AS d FROM t WHERE AdvEngineID <> 1 AND 5 > AdvEngineID "
+      "LIMIT 3");
+  ASSERT_TRUE(projection.ok()) << projection.status().ToString();
+  EXPECT_EQ(Rows(*projection), (std::vector<std::vector<std::string>>{
+                                   {"0", "2022-01-08"}, {"2", "2022-01-08"}, {"3", "2022-01-08"}}));
+
+  auto star = session->Execute("SELECT * FROM t WHERE AdvEngineID > 8.5");
+  ASSERT_TRUE(star.ok()) << star.status().ToString();
+  EXPECT_EQ(Rows(*star), (std::vector<std::vector<std::string>>{{"9", "2022-01-08"}}));
+
+  // No row passes: COUNT is 0, the other aggregates are NULL; a projection has no rows.
+  auto none = session->Execute(
+      "SELECT COUNT(*), COUNT(AdvEngineID), SUM(AdvEngineID), MAX(EventDate) FROM t "
+      "WHERE AdvEngineID > 100000");
+  ASSERT_TRUE(none.ok()) << none.status().ToString();
+  EXPECT_EQ(Rows(*none), (std::vector<std::vector<std::string>>{{"0", "0", "NULL", "NULL"}}));
+  auto empty = session->Execute("SELECT AdvEngineID FROM t WHERE AdvEngineID = 1.5");
+  ASSERT_TRUE(empty.ok()) << empty.status().ToString();
+  EXPECT_EQ(empty->table->num_rows(), 0);
+  EXPECT_EQ(empty->names, std::vector<std::string>{"AdvEngineID"});
+}
+
+TEST_F(SessionTest, UnsupportedAndBindErrorsKeepTheirKinds) {
   auto session = Session::Make().ValueOrDie();
   ASSERT_TRUE(session->RegisterParquet("t", {path_}).ok());
   for (const char* sql :
-       {"SELECT * FROM t", "SELECT AdvEngineID FROM t LIMIT 3", "SELECT SUM(AdvEngineID) FROM t",
-        "SELECT COUNT(*) FROM t WHERE AdvEngineID <> 70000", "SELECT COUNT(*) FROM t LIMIT 1"}) {
+       {"SELECT COUNT(*) FROM t GROUP BY AdvEngineID", "SELECT AdvEngineID FROM t ORDER BY 1",
+        "SELECT DISTINCT AdvEngineID FROM t"}) {
     auto result = session->Execute(sql);
-    ASSERT_FALSE(result.ok()) << sql;
     const auto detail = plan::GetSqlError(result.status());
     ASSERT_NE(detail, nullptr) << sql << ": " << result.status().ToString();
     EXPECT_EQ(detail->kind(), plan::SqlErrorDetail::Kind::kUnsupported) << sql;
     EXPECT_TRUE(result.status().IsNotImplemented()) << sql;
   }
-  // Bind errors come first.
   auto bind = session->Execute("SELECT SUM(nope) FROM t");
   const auto detail = plan::GetSqlError(bind.status());
   ASSERT_NE(detail, nullptr) << bind.status().ToString();
@@ -138,6 +203,7 @@ TEST_F(SessionTest, QueriesTheExecutorCannotRunYetAreUnsupported) {
   auto count = session->Execute("SELECT COUNT(*) AS n FROM t");
   ASSERT_TRUE(count.ok()) << count.status().ToString();
   EXPECT_EQ(count->names, std::vector<std::string>{"n"});
+  EXPECT_EQ(Rows(*count), (std::vector<std::vector<std::string>>{{"10"}}));
 }
 
 }  // namespace

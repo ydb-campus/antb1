@@ -1,4 +1,4 @@
 {
   "clickbench_commit": "5a56398c975bfd9f328f544894bcb92533ed134c",
-  "pass": [0]
+  "pass": [0, 1, 2, 3, 6, 19]
 }

@@ -39,7 +39,7 @@ TEST(Sha256, MatchesFips180Vectors) {
 TEST(Canonical, Doubles) {
   EXPECT_EQ(CanonicalDouble(0.1), "0.1");
   EXPECT_EQ(CanonicalDouble(1.0 / 3.0), "0.3333333333333333");
-  EXPECT_EQ(CanonicalDouble(1513.0), "1513");
+  EXPECT_EQ(CanonicalDouble(2048.0), "2048");
   EXPECT_EQ(CanonicalDouble(-0.5), "-0.5");
   EXPECT_EQ(CanonicalDouble(1e300), "1e+300");
   EXPECT_EQ(CanonicalDouble(std::numeric_limits<double>::infinity()), "inf");
@@ -51,20 +51,22 @@ TEST(Canonical, Dates) {
   EXPECT_EQ(CanonicalDate(0), "1970-01-01");
   EXPECT_EQ(CanonicalDate(15'887), "2013-07-01");
   EXPECT_EQ(CanonicalDate(-1), "1969-12-31");
+  EXPECT_EQ(CanonicalDate(-719'163), "0001-12-31 (BC)");
+  EXPECT_EQ(CanonicalDate(17'542'962), "50000-12-31");
 }
 
 // One canonical formatter: engine::FormatValue (antb1) and the helpers the DuckDB adapter uses
 // agree.
 TEST(Canonical, AgreesWithEngineFormatValue) {
   arrow::DoubleBuilder doubles;
-  ASSERT_TRUE(doubles.AppendValues({0.1, 1.0 / 3.0, 1513.0, -2.5e-300, 9.223372036854776e18}).ok());
+  ASSERT_TRUE(doubles.AppendValues({0.1, 1.0 / 3.0, 2048.0, -2.5e-300, 9.223372036854776e18}).ok());
   const auto d = doubles.Finish().ValueOrDie();
   for (int64_t i = 0; i < d->length(); ++i) {
     EXPECT_EQ(engine::FormatValue(*d, i, plan::LogicalType::kDouble),
               CanonicalDouble(std::static_pointer_cast<arrow::DoubleArray>(d)->Value(i)));
   }
   arrow::Date32Builder dates;
-  ASSERT_TRUE(dates.AppendValues({0, 15'887, 15'917, -1}).ok());
+  ASSERT_TRUE(dates.AppendValues({0, 15'887, 15'917, -1, -719'163, 17'542'962}).ok());
   const auto dt = dates.Finish().ValueOrDie();
   for (int64_t i = 0; i < dt->length(); ++i) {
     EXPECT_EQ(engine::FormatValue(*dt, i, plan::LogicalType::kDate),

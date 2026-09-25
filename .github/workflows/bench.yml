@@ -1,0 +1,120 @@
+# Benchmarks (advisory, never gating; docs/benchmarks.md). `bench-run` runs the micro benchmarks and, when the
+# ClickBench data is in the cache, `antb1 bench` on hits_0; it uploads only timings. `bench-publish` (pushes to main
+# only) appends the micro benchmark series to the gh-pages branch (dev/bench) and comments on a commit whose numbers
+# regress by more than 50%. Hardening as in ci.yml (R010/R015, zizmor, actionlint).
+name: Benchmarks
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "bench/**"
+      - "tools/fixturegen/**"
+      - "pixi.lock"
+  pull_request:
+    branches: [main]
+    types: [labeled, synchronize]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  # PRs share one group per PR number; every other event gets its own group (runs on main are never dropped).
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  bench-run:
+    name: bench-run (pixi run bench && pixi run bench-clickbench)
+    # Pull requests only with the `performance` label.
+    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'performance') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read # checkout
+    env:
+      ANTB1_DATA_DIR: ${{ github.workspace }}/.cache/clickbench
+      CMAKE_BUILD_PARALLEL_LEVEL: 4
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
+        with:
+          pixi-version: v0.81.0
+          environments: default
+          locked: true
+          cache: true
+          cache-key: pixi-${{ hashFiles('pixi.lock') }}-
+          cache-write: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      # Read-only: the data PR's clickbench-hits0 job fills this cache from main. Nothing here writes a cache.
+      - name: Restore ClickBench data
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/clickbench
+          key: clickbench-${{ hashFiles('tools/data/clickbench.lock') }}
+      - name: Micro benchmarks (pixi run bench)
+        shell: bash # -eo pipefail: tee must not hide a failure
+        run: pixi run --frozen -e default bench | tee bench-micro.txt
+      - name: ClickBench on hits_0 (pixi run bench-clickbench)
+        run: |
+          if [ -f "$ANTB1_DATA_DIR/hits_0.parquet" ] && [ -f "$ANTB1_DATA_DIR/queries.sql" ]; then
+            pixi run --frozen -e default bench-clickbench
+          else
+            echo "No ClickBench data in the cache: bench-clickbench skipped." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Summary
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo '### Micro benchmarks'
+            echo '```text'
+            grep -E '^(Benchmark|BM_|-+$)' bench-micro.txt || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      # Timings only: micro.json and ClickBench's result JSON hold no data, query text or results.
+      - name: Upload timings
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bench-results
+          path: |
+            build/bench/micro.json
+            build/bench/clickbench.json
+          retention-days: 30
+          if-no-files-found: warn
+
+  bench-publish:
+    name: bench-publish
+    needs: bench-run
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write # push the series to gh-pages; comment on a commit that regresses
+    concurrency:
+      group: bench-publish
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download timings
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bench-results
+          path: bench-results
+      - name: Publish the micro benchmark series (gh-pages dev/bench)
+        uses: benchmark-action/github-action-benchmark@4322e5726e6334590d251fc4f92bec0efafc45dc # v1.22.2
+        with:
+          name: antb1 micro benchmarks
+          tool: googlecpp
+          output-file-path: bench-results/micro.json
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: dev/bench
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          alert-threshold: "150%"
+          comment-on-alert: true
+          fail-on-alert: false

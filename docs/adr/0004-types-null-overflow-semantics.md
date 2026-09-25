@@ -30,7 +30,9 @@ antb1 follows DuckDB's semantics for everything in the supported subset:
 - Literals are folded exactly at bind time. A literal outside the column type's range makes the comparison constant
   true or false for non-NULL values while NULL stays NULL; a decimal literal against an integer column becomes an
   equivalent integer comparison (`c > 1.5` becomes `c >= 2`; `c = 1.5` is never true). No comparison goes through a
-  lossy cast. A number compared with a DOUBLE column is the nearest double, as in DuckDB. A literal of another kind
+  lossy cast. A number that DuckDB types as DOUBLE (with an exponent, or a decimal of more than 38 digits) is first
+  rounded to the nearest double, as DuckDB does, and that double is folded exactly. A number compared with a DOUBLE
+  column is the nearest double, as in DuckDB. A literal of another kind
   than its column (a string for a number, a number for a VARCHAR or DATE, a date for anything but DATE) is a bind
   error, and dates are written exactly `YYYY-MM-DD`: stricter than DuckDB, which casts, and registered as
   divergences in [sql-subset.md](../sql-subset.md#divergences-from-duckdb).

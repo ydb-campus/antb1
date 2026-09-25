@@ -6,5 +6,5 @@
 -- features: count_star, table_name
 SELECT COUNT(*) /* ANTB1_CANARY_SQL */ FROM antb1_canary_table;
 
--- features: count_column, integer_columns, table_name
-SELECT COUNT(id) FROM antb1_canary_table;
+-- features: group_by, count_star, columns, integer_columns, table_name
+SELECT id, COUNT(*) FROM antb1_canary_table GROUP BY id;

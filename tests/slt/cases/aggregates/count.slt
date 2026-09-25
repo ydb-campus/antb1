@@ -1,0 +1,50 @@
+# COUNT(*) counts rows, COUNT(col) counts non-NULL values; both are BIGINT. Under WHERE, COUNT(*) is the
+# number of selected rows (a true count of the filter's selection, nothing is materialized).
+
+query II nosort
+SELECT COUNT(*), COUNT(WatchID) FROM hits_like
+----
+10000	10000
+
+# hits_like_nulls: row 0 is entirely NULL, SocialAction and HistoryLength are NULL everywhere.
+query IIIII nosort
+SELECT COUNT(*), COUNT(Title), COUNT(RegionID), COUNT(SocialAction), COUNT(HistoryLength) FROM hits_like_nulls
+----
+10000	9174	9215	0	0
+
+query IIII nosort
+SELECT COUNT(EventDate), COUNT(UserID), COUNT(ResolutionWidth), COUNT(URL) FROM hits_like_nulls
+----
+9238	9225	9247	9225
+
+# Every column type of the edge table.
+query IIIIIIIII nosort
+SELECT COUNT(*), COUNT(id), COUNT(i16), COUNT(i32), COUNT(i64), COUNT(u16), COUNT(d), COUNT(s), COUNT(u) FROM edge
+----
+12	12	10	10	10	10	10	10	10
+
+query II nosort
+SELECT COUNT(*), COUNT(RegionID) FROM hits_like_nulls WHERE RegionID < 10000
+----
+4754	4754
+
+query III nosort
+SELECT COUNT(Title), COUNT(*) AS n, COUNT(SearchPhrase) cnt FROM hits_like_nulls WHERE IsMobile = 1 AND AdvEngineID <> 0
+----
+403	444	405
+
+# COUNT(col) under WHERE counts the selected rows where col is not NULL.
+query II nosort
+SELECT COUNT(i64), COUNT(s) FROM edge WHERE id >= 5
+----
+5	5
+
+query I nosort
+SELECT COUNT(*) FROM hits_like_split WHERE ResolutionWidth >= 1440 AND AdvEngineID <> 0
+----
+524
+
+query I nosort
+SELECT COUNT(*) FROM '${FIXTURES}/hits_like_split/part-*.parquet' WHERE CounterID = 62
+----
+242

@@ -47,6 +47,8 @@ class ParquetTable final : public plan::Table {
   arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> Scan(const std::vector<int>& fields,
                                                                 int64_t batch_size) const override;
   std::string Describe() const override;
+  // The sum of the file sizes (total_bytes()).
+  std::optional<int64_t> data_size() const override { return total_bytes_; }
 
   [[nodiscard]] const std::vector<std::string>& files() const { return files_; }
   [[nodiscard]] int64_t total_bytes() const { return total_bytes_; }

@@ -1,1 +1,1 @@
-{"error":{"kind":"unsupported","message":"an aggregate over table data cannot be executed yet: only SELECT COUNT(*) FROM <table> (without WHERE) is answered","offset":7,"length":16,"line":1,"column":8}}
+{"error":{"kind":"unsupported","message":"HAVING is not supported; see docs/sql-subset.md","offset":31,"length":6,"line":1,"column":32}}

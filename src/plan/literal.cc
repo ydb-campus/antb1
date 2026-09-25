@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <format>
@@ -130,6 +131,35 @@ std::optional<double> ParseDoubleLiteral(std::string_view text, bool negative) {
   return negative ? -value : value;
 }
 
+bool IsApproximateNumber(std::string_view text) {
+  if (text.find_first_of("eE") != std::string_view::npos) {
+    return true;
+  }
+  return text.contains('.') && std::ranges::count_if(text, IsDigit) > kMaxIntegerDigits;
+}
+
+ExactNumber ExactNumberOf(double value) {
+  ExactNumber number;
+  if (std::isnan(value) || value == 0) {
+    return number;
+  }
+  number.negative = value < 0;
+  const double magnitude = std::fabs(value);
+  if (!(magnitude < 0x1p127)) {  // +-inf too
+    number.huge = true;
+    return number;
+  }
+  const double whole = std::floor(magnitude);
+  number.magnitude = static_cast<Int128>(whole);  // exact: an integral double below 2^127
+  if (number.magnitude > kHugeIntMax) {
+    number.magnitude = 0;
+    number.huge = true;
+    return number;
+  }
+  number.fraction = whole != magnitude;
+  return number;
+}
+
 std::optional<int32_t> ParseDate(std::string_view text) {
   if (text.size() != 10 || text[4] != '-' || text[7] != '-') {
     return std::nullopt;
@@ -160,9 +190,29 @@ std::optional<int32_t> ParseDate(std::string_view text) {
 }
 
 std::string FormatDate(int32_t days) {
-  const std::chrono::year_month_day date{std::chrono::sys_days{std::chrono::days{days}}};
-  return std::format("{:04}-{:02}-{:02}", static_cast<int>(date.year()),
-                     static_cast<unsigned>(date.month()), static_cast<unsigned>(date.day()));
+  if (days == std::numeric_limits<int32_t>::max()) {
+    return "infinity";
+  }
+  if (days == -std::numeric_limits<int32_t>::max()) {
+    return "-infinity";
+  }
+  // std::chrono::year holds only -32767..32767, so the civil date is computed in 64 bits
+  // (H. Hinnant's days_from_civil inverse: 400-year eras of 146097 days starting on March 1).
+  const int64_t z = int64_t{days} + 719'468;
+  const int64_t era = (z >= 0 ? z : z - 146'096) / 146'097;
+  const int64_t day_of_era = z - (era * 146'097);
+  const int64_t year_of_era =
+      (day_of_era - (day_of_era / 1'460) + (day_of_era / 36'524) - (day_of_era / 146'096)) / 365;
+  const int64_t day_of_year =
+      day_of_era - ((365 * year_of_era) + (year_of_era / 4) - (year_of_era / 100));
+  const int64_t shifted_month = ((5 * day_of_year) + 2) / 153;  // 0 = March
+  const int64_t day = day_of_year - (((153 * shifted_month) + 2) / 5) + 1;
+  const int64_t month = shifted_month < 10 ? shifted_month + 3 : shifted_month - 9;
+  const int64_t year = year_of_era + (era * 400) + (month <= 2 ? 1 : 0);
+  if (year <= 0) {
+    return std::format("{:04}-{:02}-{:02} (BC)", 1 - year, month, day);
+  }
+  return std::format("{:04}-{:02}-{:02}", year, month, day);
 }
 
 IntegerRange RangeOf(LogicalType integer_type) {

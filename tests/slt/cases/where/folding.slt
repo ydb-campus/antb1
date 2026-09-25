@@ -1,0 +1,297 @@
+# WHERE literals are folded exactly into the column's type at bind time (docs/sql-subset.md, "Binding"):
+# a non-integer bound becomes the nearest integer on the kept side, and a bound outside the type makes
+# the comparison true for every non-NULL value or for none. NULL still rejects the row.
+
+# SMALLINT i16: -32768, 32767, 0, -1, 1, NULL, 100, -100, NULL, 12345, -12345, 7.
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i16 < 32767
+----
+9
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i16 <= 32767
+----
+10
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i16 > 32767
+----
+0
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i16 >= 32768
+----
+0
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i16 < 32768
+----
+10
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i16 > -32769
+----
+10
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i16 = -32769
+----
+0
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i16 <> 40000
+----
+10
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i16 = -32768
+----
+1
+
+# Decimals against integer columns.
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i16 > 1.5
+----
+4
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i16 >= 1.5
+----
+4
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i16 < -1.5
+----
+3
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i16 <= -1.5
+----
+3
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i16 = 1.0
+----
+1
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i16 = 1.5
+----
+0
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i16 <> 1.5
+----
+10
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i16 < 0.5
+----
+5
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i16 >= -0.5
+----
+6
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE -1.5 > i16
+----
+3
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE 32767 <= i16
+----
+1
+
+# USMALLINT u16: 0, 65535, 1, 32768, 15887, NULL, 15917, 40000, 2, NULL, 12, 7.
+query I nosort
+SELECT COUNT(*) FROM edge WHERE u16 = -1
+----
+0
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE u16 > -1
+----
+10
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE u16 < 65536
+----
+10
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE u16 >= 65535
+----
+1
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE u16 > 65534.5
+----
+1
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE u16 <= 0.25
+----
+1
+
+# INTEGER i32 holds both extremes.
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i32 >= 2147483647
+----
+1
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i32 > 2147483647
+----
+0
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i32 < -2147483648
+----
+0
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i32 >= -2147483648.5
+----
+10
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i32 <> 2147483648
+----
+10
+
+# BIGINT i64 holds both extremes: literals beyond 64 bits compare exactly.
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i64 = 9223372036854775807
+----
+1
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i64 > 9223372036854775807
+----
+0
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i64 < 9223372036854775808
+----
+10
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i64 >= -9223372036854775808
+----
+10
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i64 > -9223372036854775809
+----
+10
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i64 <> 99999999999999999999999
+----
+10
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i64 > 9223372036854775806.5
+----
+1
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i64 <= -9223372036854775807.5
+----
+1
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE UserID > 4611686018427387904
+----
+2
+
+# DOUBLE: a number is the nearest double.
+query I nosort
+SELECT COUNT(*) FROM edge WHERE d = 0.1
+----
+1
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE d = 922337203685477580
+----
+1
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE d > 922337203685477580
+----
+0
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE d < 0
+----
+3
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE d >= -0.5
+----
+9
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE d <> 123456789.125
+----
+9
+
+# NULL rejects the row, also for comparisons folded to "every value".
+query III nosort
+SELECT COUNT(*), COUNT(RegionID), COUNT(Title) FROM hits_like_nulls WHERE RegionID > -1
+----
+9215	9215	8445
+
+query I nosort
+SELECT COUNT(*) FROM hits_like_nulls WHERE Interests > -40000
+----
+9260
+
+# Numbers that DuckDB reads as DOUBLE (an exponent, or a decimal of more than 38 digits) are rounded
+# to the nearest double first, then compared exactly (divergence D7 covers BIGINT values beyond 2^53).
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i16 = 1.0000000000000000000001e0
+----
+1
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i16 < 1.00000000000000000000000000000000000000001
+----
+5
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i16 <= 0.99999999999999999999999999999999999999999
+----
+6
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i16 = 1.00000000000000000000000000000001
+----
+0
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i32 > 1.5e0
+----
+4
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE u16 < 1e5
+----
+10
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i64 = 1e15
+----
+1
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i64 = 1e-400
+----
+1
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i64 < 1e400
+----
+10

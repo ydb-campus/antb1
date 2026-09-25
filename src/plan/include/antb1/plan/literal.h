@@ -31,11 +31,21 @@ std::optional<ExactNumber> ParseExactNumber(std::string_view text, bool negative
 // not a number.
 std::optional<double> ParseDoubleLiteral(std::string_view text, bool negative);
 
+// Whether DuckDB reads the text of a numeric literal (without its sign) as a DOUBLE rather than as
+// an exact integer or DECIMAL: it has an exponent ("1e3"), or it is a decimal with more than 38
+// digits, DECIMAL's maximum width (leading zeros count, as in DuckDB).
+bool IsApproximateNumber(std::string_view text);
+
+// The exact value of a double: +-inf and magnitudes of 10^38 or more are huge; NaN is zero.
+ExactNumber ExactNumberOf(double value);
+
 // Days since 1970-01-01 of a date written exactly as YYYY-MM-DD (proleptic Gregorian, years 0000 to
 // 9999); std::nullopt for any other text or an invalid date.
 std::optional<int32_t> ParseDate(std::string_view text);
 
-// YYYY-MM-DD of a day number.
+// A day number as DuckDB prints a DATE, for every int32: YYYY-MM-DD (years past 9999 with more
+// digits), YYYY-MM-DD (BC) before year 1 (year 0 is 1 BC), and DuckDB's sentinels INT32_MAX and
+// -INT32_MAX as infinity and -infinity.
 std::string FormatDate(int32_t days);
 
 // Inclusive value range of an integer logical type; HUGEINT is decimal128(38, 0), so +-(10^38 - 1).
