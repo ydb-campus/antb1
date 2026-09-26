@@ -57,6 +57,11 @@ arrow::Result<std::shared_ptr<arrow::Table>> MakeHitsTable(HitsVariant variant, 
 // strings, NULLs. Columns: id i16 i32 i64 u16 d s (BYTE_ARRAY) u (UTF8).
 arrow::Result<std::shared_ptr<arrow::Table>> MakeEdgeTable();
 
+// FLOAT values where comparing in FLOAT and in DOUBLE differ, as exact bit patterns: 0.1F and its
+// neighbour below, 0.2F, 0.3F, +-19.99F, 3.3F, 1234.5F, 2^24 and the next FLOAT, 2^100 and the
+// next FLOAT, the FLOAT maximum, +-inf, +-0 and NULL. Columns: id (INTEGER) f (FLOAT).
+arrow::Result<std::shared_ptr<arrow::Table>> MakeFloatTable();
+
 // Writes table as Parquet: SNAPPY, row groups of at most row_group_rows rows, no stored
 // ARROW:schema. Writes to a temporary file first, then renames it (readers never see partial
 // files).
@@ -75,7 +80,7 @@ struct FixtureFile {
 //   hits_like_split/part-N.parquet  the same rows split into 4 files (1000/3000/2500/3500 rows)
 //   hits_like_required.parquet   the same rows, REQUIRED columns and UTF8 strings (single-file
 //   layout) edge.parquet                 MakeEdgeTable() empty.parquet                the
-//   partitioned hits schema, 0 rows
+//   partitioned hits schema, 0 rows floats.parquet               MakeFloatTable()
 arrow::Result<std::vector<FixtureFile>> WriteAllFixtures(const std::filesystem::path& dir);
 
 // Compares the Parquet schema (column path, physical type, logical type, converted type,

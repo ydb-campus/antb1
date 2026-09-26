@@ -146,8 +146,8 @@ TEST(QueryGenerator, MakeRejectsWhatCannotBeGenerated) {
           .has_value());
 }
 
-// antb1 reads FLOAT as DOUBLE, DuckDB keeps FLOAT and compares literals with it in FLOAT
-// (divergence D11): a FLOAT column is never referenced, and its table gets no SELECT *.
+// antb1 returns a FLOAT column's values as DOUBLE, DuckDB as FLOAT (divergence D11): a FLOAT
+// column is never referenced, and its table gets no SELECT *.
 TEST(LoadGenTables, SkipsFloatColumns) {
   const std::filesystem::path dir =
       std::filesystem::path(::testing::TempDir()) / "antb1_query_gen_float";

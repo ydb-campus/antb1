@@ -227,7 +227,8 @@ std::string_view LiteralKind(const sql::Literal& lit) {
 }
 
 // `column <op> literal`, with the literal folded exactly into the column's type.
-arrow::Result<Predicate> BindComparison(const sql::Comparison& cmp, const BoundColumn& column) {
+arrow::Result<Predicate> BindComparison(const sql::Comparison& cmp, const BoundColumn& column,
+                                        const Table& table) {
   const sql::Literal& lit = cmp.literal;
   const auto mismatch = [&](std::string_view hint) {
     return BindError(std::format("cannot compare {} column '{}' with {}; {}", ToString(column.type),
@@ -280,6 +281,14 @@ arrow::Result<Predicate> BindComparison(const sql::Comparison& cmp, const BoundC
         return BindError("invalid number " + Clip(lit.text), lit.span);
       }
       p.constant.value = *value;
+      // A FLOAT column: DuckDB casts an integer or DECIMAL literal to FLOAT and compares in FLOAT.
+      // Widening that float to double is exact and keeps the order, so comparing the widened
+      // column with it gives DuckDB's answer.
+      if (table.StoredAsFloat(column.index)) {
+        if (const auto f = DuckDbFloatOf(lit.text, lit.negative)) {
+          p.constant.value = static_cast<double>(*f);
+        }
+      }
       return p;
     }
     case LogicalType::kVarchar:
@@ -366,7 +375,7 @@ arrow::Result<LogicalPlan> Bind(const sql::SelectStatement& stmt, const Catalog&
   std::vector<Predicate> predicates;
   for (const sql::Comparison& cmp : stmt.where) {
     ARROW_ASSIGN_OR_RAISE(BoundColumn column, columns.Resolve(cmp.column));
-    ARROW_ASSIGN_OR_RAISE(Predicate predicate, BindComparison(cmp, column));
+    ARROW_ASSIGN_OR_RAISE(Predicate predicate, BindComparison(cmp, column, *table));
     predicates.push_back(std::move(predicate));
   }
   if (stmt.limit.has_value() && *stmt.limit < 0) {

@@ -1,0 +1,326 @@
+# WHERE on a FLOAT column (floats: bit-exact FLOAT values, see tools/fixturegen MakeFloatTable):
+# DuckDB casts an integer or DECIMAL literal to FLOAT with its own rounding and compares in FLOAT;
+# a literal it types as DOUBLE (an exponent, more than 38 digits) compares in DOUBLE.
+# docs/sql-subset.md, "Binding"; plan::DuckDbFloatOf.
+
+query I rowsort
+SELECT id FROM floats WHERE f = 0.1
+----
+0
+
+query I rowsort
+SELECT id FROM floats WHERE f > 0.1
+----
+10
+11
+12
+13
+2
+3
+4
+6
+7
+8
+9
+
+query I rowsort
+SELECT id FROM floats WHERE f >= 0.1
+----
+0
+10
+11
+12
+13
+2
+3
+4
+6
+7
+8
+9
+
+query I rowsort
+SELECT id FROM floats WHERE f < 0.1
+----
+1
+14
+15
+16
+5
+
+query I rowsort
+SELECT id FROM floats WHERE f <= 0.1
+----
+0
+1
+14
+15
+16
+5
+
+query I rowsort
+SELECT id FROM floats WHERE f <> 0.1
+----
+1
+10
+11
+12
+13
+14
+15
+16
+2
+3
+4
+5
+6
+7
+8
+9
+
+query I rowsort
+SELECT id FROM floats WHERE 0.1 = f
+----
+0
+
+query I rowsort
+SELECT id FROM floats WHERE 0.1 < f
+----
+10
+11
+12
+13
+2
+3
+4
+6
+7
+8
+9
+
+query I rowsort
+SELECT id FROM floats WHERE f = 0.2
+----
+2
+
+query I rowsort
+SELECT id FROM floats WHERE f = 0.3
+----
+3
+
+query I rowsort
+SELECT id FROM floats WHERE f = 3.3
+----
+6
+
+query I rowsort
+SELECT id FROM floats WHERE f = 19.99
+----
+4
+
+query I rowsort
+SELECT id FROM floats WHERE f = -19.99
+----
+5
+
+query I rowsort
+SELECT id FROM floats WHERE f < -19.99
+----
+14
+
+query I rowsort
+SELECT id FROM floats WHERE f = 1234.5
+----
+7
+
+query I rowsort
+SELECT id FROM floats WHERE f = 16777216
+----
+8
+
+query I rowsort
+SELECT id FROM floats WHERE f = 16777217
+----
+8
+
+query I rowsort
+SELECT id FROM floats WHERE f > 16777216
+----
+10
+11
+12
+13
+9
+
+query I rowsort
+SELECT id FROM floats WHERE f = 16777218
+----
+9
+
+query I rowsort
+SELECT id FROM floats WHERE f = 16777217.5
+----
+8
+
+query I rowsort
+SELECT id FROM floats WHERE f < 16777217.5
+----
+0
+1
+14
+15
+16
+2
+3
+4
+5
+6
+7
+
+query I rowsort
+SELECT id FROM floats WHERE f = 16777216.5
+----
+8
+
+query I rowsort
+SELECT id FROM floats WHERE f = 0.100000000000000000000000
+----
+1
+
+query I rowsort
+SELECT id FROM floats WHERE f = 0.1000000000000000
+----
+1
+
+query I rowsort
+SELECT id FROM floats WHERE f = 0.10000000149011612
+----
+0
+
+query I rowsort
+SELECT id FROM floats WHERE f = 1267650675786093127411026624513
+----
+10
+
+query I rowsort
+SELECT id FROM floats WHERE f > 1267650600228229401496703205376
+----
+11
+12
+13
+
+query I rowsort
+SELECT id FROM floats WHERE f = 340282346638528859811704183484516925440
+----
+12
+
+query I rowsort
+SELECT id FROM floats WHERE f = 340282356779733661637539395458142568447
+----
+13
+
+query I rowsort
+SELECT id FROM floats WHERE f < 340282366920938463463374607431768211455
+----
+0
+1
+10
+11
+12
+14
+15
+16
+2
+3
+4
+5
+6
+7
+8
+9
+
+query I rowsort
+SELECT id FROM floats WHERE f > 340282366920938463463374607431768211455
+----
+
+query I rowsort
+SELECT id FROM floats WHERE f = 0
+----
+15
+16
+
+query I rowsort
+SELECT id FROM floats WHERE f = -0.0
+----
+15
+16
+
+query I rowsort
+SELECT id FROM floats WHERE f >= 0 AND f <= 0
+----
+15
+16
+
+query I rowsort
+SELECT id FROM floats WHERE f > 1e-1
+----
+0
+10
+11
+12
+13
+2
+3
+4
+6
+7
+8
+9
+
+query I rowsort
+SELECT id FROM floats WHERE f = 1e-1
+----
+
+query I rowsort
+SELECT id FROM floats WHERE f >= -1e400
+----
+0
+1
+10
+11
+12
+13
+14
+15
+16
+2
+3
+4
+5
+6
+7
+8
+9
+
+query I rowsort
+SELECT id FROM floats WHERE f > 0.1 AND f < 20
+----
+2
+3
+4
+6
+
+query I rowsort
+SELECT id FROM floats WHERE f > -20 AND f < 0.3
+----
+0
+1
+15
+16
+2
+5
+
+query I nosort
+SELECT COUNT(f) FROM floats
+----
+17

@@ -1,6 +1,7 @@
 #include "antb1/plan/literal.h"
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -129,6 +130,109 @@ std::optional<double> ParseDoubleLiteral(std::string_view text, bool negative) {
     return std::nullopt;
   }
   return negative ? -value : value;
+}
+
+namespace {
+
+// DuckDB's NumericHelper::DOUBLE_POWERS_OF_TEN: correctly rounded doubles.
+constexpr std::array<double, 39> kDoublePowersOfTen = {
+    1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,  1e10, 1e11, 1e12,
+    1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22, 1e23, 1e24, 1e25,
+    1e26, 1e27, 1e28, 1e29, 1e30, 1e31, 1e32, 1e33, 1e34, 1e35, 1e36, 1e37, 1e38};
+
+// double(UINT64_MAX), which rounds to 2^64; DuckDB's casts are written with it.
+constexpr auto kUint64MaxAsDouble = static_cast<double>(std::numeric_limits<uint64_t>::max());
+
+// DuckDB's Hugeint::TryCast(hugeint_t, double) (CastBigintToFloating), from the two's-complement
+// halves of the value.
+double DuckDbHugeintToDouble(Int128 value) {
+  const auto bits = static_cast<UInt128>(value);
+  const auto lower = static_cast<uint64_t>(bits);
+  const auto upper = static_cast<int64_t>(static_cast<uint64_t>(bits >> 64U));
+  if (upper == -1) {
+    // DuckDB's special case for small negative numbers: -double(UINT64_MAX - lower) - 1.
+    return -static_cast<double>(std::numeric_limits<uint64_t>::max() - lower) - 1;
+  }
+  return static_cast<double>(lower) + (static_cast<double>(upper) * (kUint64MaxAsDouble + 1));
+}
+
+// DuckDB's Uhugeint::TryCast(uhugeint_t, double) (CastUhugeintToFloating).
+double DuckDbUhugeintToDouble(UInt128 value) {
+  const auto lower = static_cast<uint64_t>(value);
+  const auto upper = static_cast<uint64_t>(value >> 64U);
+  return static_cast<double>(lower) + (static_cast<double>(upper) * kUint64MaxAsDouble);
+}
+
+// DuckDB's cast of a DECIMAL's storage integer to float: int16/int32/int64 directly (width up to
+// 18), hugeint through a double.
+float DuckDbStorageToFloat(Int128 value, std::size_t width) {
+  if (width <= 18) {
+    return static_cast<float>(static_cast<int64_t>(value));
+  }
+  return static_cast<float>(DuckDbHugeintToDouble(value));
+}
+
+// DuckDB's TryCastDecimalToFloatingPoint<SRC, float>.
+float DuckDbDecimalToFloat(Int128 unscaled, std::size_t width, std::size_t scale) {
+  constexpr Int128 kMaxExactInFloat = 16'777'216;  // 2^24, MAX_INT_REPRESENTABLE_IN_FLOAT
+  const auto power = static_cast<float>(kDoublePowersOfTen.at(scale));
+  // int16 storage (width <= 4) is always "representable exactly" in DuckDB.
+  if (width <= 4 || scale == 0 || (unscaled <= kMaxExactInFloat && unscaled >= -kMaxExactInFloat)) {
+    return DuckDbStorageToFloat(unscaled, width) / power;
+  }
+  Int128 pow10 = 1;
+  for (std::size_t i = 0; i < scale; ++i) {
+    pow10 *= 10;
+  }
+  const Int128 div = unscaled / pow10;  // truncating, as in C++ and DuckDB
+  const Int128 mod = unscaled % pow10;
+  return DuckDbStorageToFloat(div, width) + (DuckDbStorageToFloat(mod, width) / power);
+}
+
+}  // namespace
+
+std::optional<float> DuckDbFloatOf(std::string_view text, bool negative) {
+  if (IsApproximateNumber(text) || !ParseExactNumber(text, negative).has_value()) {
+    return std::nullopt;  // an exponent or more than 38 digits: DOUBLE
+  }
+  const std::size_t dot = text.find('.');
+  if (dot != std::string_view::npos) {
+    // DECIMAL(width, scale): every digit counts, leading zeros too.
+    const std::size_t scale = text.size() - dot - 1;
+    const std::size_t width = text.size() - 1;
+    std::string digits(text.substr(0, dot));
+    digits += text.substr(dot + 1);
+    const Int128 magnitude = DigitsValue(digits);
+    return DuckDbDecimalToFloat(negative ? -magnitude : magnitude, std::max<std::size_t>(width, 1),
+                                scale);
+  }
+  // An integer, typed by value; the magnitude is checked against 2^128 - 1 while it is read.
+  UInt128 magnitude = 0;
+  for (const char c : text) {
+    if (__builtin_mul_overflow(magnitude, UInt128{10}, &magnitude) ||
+        __builtin_add_overflow(magnitude, static_cast<UInt128>(c - '0'), &magnitude)) {
+      return std::nullopt;  // beyond UHUGEINT: DOUBLE
+    }
+  }
+  constexpr UInt128 kHugeIntLimit = UInt128{1} << 127U;  // |HUGEINT min|
+  if (negative) {
+    if (magnitude > kHugeIntLimit) {
+      return std::nullopt;  // below HUGEINT's minimum: DOUBLE
+    }
+    const auto value = static_cast<Int128>(UInt128{0} - magnitude);
+    if (const auto small = Int128ToInt64(value)) {
+      return static_cast<float>(*small);  // INTEGER or BIGINT
+    }
+    return static_cast<float>(DuckDbHugeintToDouble(value));
+  }
+  if (magnitude >= kHugeIntLimit) {
+    return static_cast<float>(DuckDbUhugeintToDouble(magnitude));  // UHUGEINT
+  }
+  const auto value = static_cast<Int128>(magnitude);
+  if (const auto small = Int128ToInt64(value)) {
+    return static_cast<float>(*small);
+  }
+  return static_cast<float>(DuckDbHugeintToDouble(value));
 }
 
 bool IsApproximateNumber(std::string_view text) {
