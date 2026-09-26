@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790427144291,
+  "lastUpdate": 1790432162933,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -180,6 +180,66 @@ window.BENCHMARK_DATA = {
             "value": 2177514.8650305993,
             "unit": "ns/iter",
             "extra": "iterations: 326\ncpu: 2176810.2944785273 ns\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "037cf8b3dad3024133f8d815a0a730d7d443de5a",
+          "message": "fix(plan): compare float columns like duckdb (#16)\n\n## Summary\n\nA follow-up from #7, where this was registered as divergence D11. A\nParquet FLOAT column is widened to DOUBLE on read, and `WHERE` compared\nit with the literal's nearest *double*. DuckDB casts an integer or\nDECIMAL literal to *FLOAT* and compares in FLOAT. So `WHERE price =\n19.99` returned the stored `19.99F` rows in DuckDB and **no rows** in\nantb1, and range filters moved their boundary. It affected most decimal\nliterals (0.1, 19.99, 3.3, …) and integers above 2^24.\n\nAs agreed, antb1 now mirrors DuckDB exactly, including its rounding\nquirks, rather than rounding correctly:\n\n- **`plan::Table::StoredAsFloat(field)`** (public header, default\n`false`): `io::ParquetTable` answers it from its storage schema. The\ncolumn stays `LogicalType::kDouble` everywhere else, and there is no new\nmodule edge.\n- **`plan::DuckDbFloatOf(text, negative)`** (public header): the FLOAT\nthat DuckDB 1.5.5 casts a literal to, or `nullopt` when DuckDB types it\nas DOUBLE.\n- Typing: an integer by value (INTEGER/BIGINT/HUGEINT/UHUGEINT; outside\n-2^127 … 2^128-1 it is DOUBLE). A decimal is DECIMAL(all digits\nincluding leading zeros, fraction digits); above 38 digits, or with an\nexponent, it is DOUBLE.\n  - Casts, ported from DuckDB's source:\n- `TryCastDecimalToFloatingPoint`: `float(unscaled) / float(1e<scale>)`\non the fast path (int16 storage, scale 0, or |unscaled| ≤ 2^24),\notherwise `float(div) + float(mod) / float(1e<scale>)`;\n- `Hugeint::TryCast` to float through `CastBigintToFloating<double>`,\nincluding its `upper == -1` case;\n    - UHUGEINT through a double;\n    - `static_cast` for INTEGER/BIGINT.\n- So `16777217.5`, `0.1` written with 16 or 24 decimals, and HUGEINT\nliterals get DuckDB's FLOAT, which is not always the nearest one.\nLiterals beyond the FLOAT range become ±inf.\n- **Binder:** for a DOUBLE column stored as FLOAT, the constant becomes\nthat FLOAT, widened. Widening is exact and preserves order, so the\nexisting double comparison selects DuckDB's rows, and nothing changes in\n`exec`. DOUBLE-typed literals and DOUBLE-stored columns behave as\nbefore.\n- **Docs:** the Binding and Types tables in `docs/sql-subset.md`, ADR\n0004 (wording only, status unchanged), `docs/testing.md` (the new\nfixture) and the harness comments. D11 now covers only the remaining\ndifference: FLOAT *results* print as DOUBLE, where DuckDB keeps FLOAT.\nSo the random generator still never references FLOAT columns.\n\n## Tests\n\n- `plan.DuckDbFloatOf.MatchesDuckDbCasts`: 48 literals across every\ntyping class and path boundary. The expected values were generated with\nDuckDB 1.5.5 and are compared bit for bit, so signed zero counts too.\n`DoubleLiteralsAreNotConverted` covers the DOUBLE-typed forms.\n- `harness.FloatLiteralOracle.MatchesDuckDbOnRandomLiterals`: 20,000\nseeded random literals checked against the DuckDB library at test time,\nboth the FLOAT value and whether DuckDB types the literal as DOUBLE. The\nliterals include random integers and decimals and mutated edges near\n2^24, 2^63, 2^64, 2^127, 2^128 and the FLOAT maximum. It takes 1.6 s,\nand is compiled only when DuckDB is available, like `diff.random`.\n- A new fixture, `floats.parquet` (bit-exact FLOAT values), with\n`tests/slt/cases/where/float.slt`: 40 records whose expectations\n`slt-complete` wrote from DuckDB. They run as `slt.*` on antb1 and\n`oracle.*` on DuckDB. The fixture digest gains one line; the existing\nfixtures are unchanged.\n- `engine.SessionTest.FloatColumnsCompareLikeDuckDb` (renamed): DuckDB's\nanswers for a FLOAT column; a DOUBLE column with the same values still\nuses the nearest double; results stay DOUBLE.\n- Mutation check: forcing the DECIMAL fast path everywhere makes the\nunit table, the oracle test and `slt.where.float` fail.\n- The `reviewer` agent ran its own 450-literal end-to-end comparison\nwith 0 differences. Its two docs findings (an overstated \"16 or more\ndecimals\" and the fixture list in `docs/testing.md`) are fixed.\n\n## Type of change\n\n- [x] fix: wrong results or a crash\n\n## Verification\n\n```text\n$ pixi run check-full\nlint: PASS; 100% tests passed out of 893 (ci, asan, coverage, ci-gcc); tidy clean; fuzz-smoke 2/2\n$ pixi run diff-random\nDIFF: PASS seed=1470416822 queries=2000 failed=0 unsupported=0\n$ pixi run test-data\n100% tests passed out of 6\n```\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change\n- [x] Docs updated where behavior, commands or architecture changed\n- [x] No ClickBench-derived data is committed\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer (none changed)\n\n## AI assistance\n\n- [x] AI-assisted. Tools and what they did: Claude Code (Claude Opus\n5.5) wrote the change after a plan the maintainer approved (the \"mirror\nDuckDB\" option), ported DuckDB's cast code from its v1.5.5 source, and\nran a reviewer agent on the diff.\n- Accountable human (has read and understands the whole diff): @Hor911\n(please confirm before merging)",
+          "timestamp": "2026-09-26T17:14:28+03:00",
+          "tree_id": "2ddcac3541e40befa480709c13028ad9cbc75459",
+          "url": "https://github.com/ydb-campus/antb1/commit/037cf8b3dad3024133f8d815a0a730d7d443de5a"
+        },
+        "date": 1790432162044,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 2650.1040640510273,
+            "unit": "ns/iter",
+            "extra": "iterations: 264539\ncpu: 2649.8015302091558 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 87182.51640624786,
+            "unit": "ns/iter",
+            "extra": "iterations: 7680\ncpu: 87174.34062500001 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 94359.8889934178,
+            "unit": "ns/iter",
+            "extra": "iterations: 7441\ncpu: 94354.94476548853 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 368811.87651077216,
+            "unit": "ns/iter",
+            "extra": "iterations: 1903\ncpu: 368739.06095638446 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 381695.80995716644,
+            "unit": "ns/iter",
+            "extra": "iterations: 1868\ncpu: 381682.9823340471 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2599388.7910447232,
+            "unit": "ns/iter",
+            "extra": "iterations: 268\ncpu: 2598412.9104477647 ns\nthreads: 1"
           }
         ]
       }
