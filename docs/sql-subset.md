@@ -196,8 +196,9 @@ formatter:
   digits after 9999, `infinity` and `-infinity` for DuckDB's sentinel day numbers; VARCHAR as its raw bytes;
 - NULL as `NULL` in `table`, an empty field in `csv` and `null` in `json`;
 - `csv` has a header row and RFC 4180 quoting, with LF line endings; `json` is an array of objects, where numbers are
-  JSON numbers except HUGEINT and non-finite doubles, which are strings (exactness), and invalid UTF-8 bytes in
-  strings are written as the text `\xHH`.
+  JSON numbers except HUGEINT and non-finite doubles, which are strings (exactness), and every byte of ill-formed
+  UTF-8 in strings (RFC 3629, so also overlong forms, surrogates and code points above U+10FFFF) is written as the
+  text `\xHH` with lowercase hex digits, so the output is always valid UTF-8; `table` and `csv` write the raw bytes.
 
 `--timing` prints the elapsed seconds in fixed-point notation (for example `0.003620`) as the last line on stderr.
 
