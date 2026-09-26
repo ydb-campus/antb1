@@ -1,0 +1,12 @@
+# ThreadSanitizer suppressions (TSAN_OPTIONS=suppressions=..., set by the tsan test preset). Every entry needs a
+# justification. Prefer fixing the code; TSan runs nightly and is advisory (docs/testing.md).
+#
+# libarrow and libparquet (conda-forge) are not built with TSan: the synchronization inside Arrow's thread pools and
+# futures (e.g. the I/O pool that pre-buffers Parquet column chunks) is invisible to TSan, so a buffer that an Arrow
+# I/O thread frees after the reader is done is reported as racing with the reader's earlier memcpy (first seen in the
+# nightly of 2026-09-26: BaseMemoryPoolImpl<SystemAllocator>::Free vs snappy decompression). Suppress race reports
+# whose stacks run through these libraries. Deliberately `race:` and not `called_from_lib:`: ignoring the libraries'
+# interceptors hides their mutex locks, and an unlock that Arrow's inlined future callbacks then perform in another
+# library is reported as "unlock of an unlocked mutex". Races confined to our own code are still reported.
+race:libarrow.so
+race:libparquet.so

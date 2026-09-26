@@ -1388,10 +1388,21 @@ def check_step(ctx: Ctx, wf: Workflow, step: YMap) -> None:
                 "R010", wf.path, step.line, "checkout without `persist-credentials: false`", "add it under `with:`"
             )
         if action == "prefix-dev/setup-pixi":
-            key = re.sub(r"\s+", " ", str(with_.get("cache-key", "")))
-            if key != SETUP_PIXI_CACHE_KEY:
-                line = with_.kline("cache-key") if "cache-key" in with_ else step.line
-                repo.add("R010", wf.path, line, f"setup-pixi cache-key must be `{SETUP_PIXI_CACHE_KEY}`", "use it")
+            if str(with_.get("cache", "")).lower() == "false":
+                # setup-pixi fails with "Cannot specify project cache key without project caching".
+                if "cache-key" in with_:
+                    repo.add(
+                        "R010",
+                        wf.path,
+                        with_.kline("cache-key"),
+                        "setup-pixi with `cache: false` must not set `cache-key` (setup-pixi rejects it)",
+                        "remove `cache-key`",
+                    )
+            else:
+                key = re.sub(r"\s+", " ", str(with_.get("cache-key", "")))
+                if key != SETUP_PIXI_CACHE_KEY:
+                    line = with_.kline("cache-key") if "cache-key" in with_ else step.line
+                    repo.add("R010", wf.path, line, f"setup-pixi cache-key must be `{SETUP_PIXI_CACHE_KEY}`", "use it")
         if action == "openai/codex-action" and "codex-version" not in with_:
             repo.add("R010", wf.path, step.line, "codex-action without `codex-version`", "pin the Codex CLI version")
     run = step.get("run")

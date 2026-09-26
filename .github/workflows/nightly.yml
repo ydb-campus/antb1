@@ -164,8 +164,7 @@ jobs:
           pixi-version: v0.81.0
           environments: default
           locked: true
-          cache: false
-          cache-key: pixi-${{ hashFiles('pixi.lock') }}-
+          cache: false # arm64 envs are not cached (cache budget); setup-pixi rejects a cache-key without caching
           cache-write: false
       - name: Restore ClickBench data
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
