@@ -65,7 +65,7 @@ Advisory jobs (not required):
 | Job | Workflow | Runner | What it runs |
 | --- | --- | --- | --- |
 | `claude (@claude)` | `Claude` | ubuntu-24.04 | Claude Code with named `pixi run` tasks and read-only `git`/`gh` only; 60 min |
-| `claude-review (code-review plugin)` | `Claude review` | ubuntu-24.04 | Anthropic's code-review plugin; 30 min |
+| `claude-review (AGENTS.md review rules)` | `Claude review` | ubuntu-24.04 | Claude Code with one review prompt, read-only `git`/`gh` and no file edits; 30 min |
 | `codex-audit (harness checklist)` | `Codex harness audit` | ubuntu-24.04 | Codex CLI 0.155.1, `:read-only` profile, no sudo; 30 min |
 | `codex-audit comment` | `Codex harness audit` | ubuntu-slim | posts the audit as one sticky comment |
 | `copilot-setup-steps` | `Copilot Setup Steps` | ubuntu-24.04 | `pixi install --locked -e lint`, then `pixi run --frozen -e default build` |

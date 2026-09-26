@@ -28,9 +28,9 @@ Accepted
 - AI reviews are advisory. They comment, never approve, and never count toward the required human approval. The
   repository settings do not let GitHub Actions approve pull requests. No AI workflow is a required check.
 - AI integrations on GitHub, set up as described in [docs/agents.md](../agents.md):
-  - Claude: `@claude` on issues and PRs (`.github/workflows/claude.yml`) and one automatic review per PR with
-    Anthropic's code-review plugin (`.github/workflows/claude-review.yml`), both through the Claude GitHub App and
-    a Claude subscription token (`CLAUDE_CODE_OAUTH_TOKEN`);
+  - Claude: `@claude` on issues and PRs (`.github/workflows/claude.yml`) and one automatic review per PR from a
+    prompt that applies the Code Review Rules (`.github/workflows/claude-review.yml`), both through the Claude
+    GitHub App and a Claude subscription token (`CLAUDE_CODE_OAUTH_TOKEN`);
   - Codex: native review on request (`@codex review`, automatic reviews off) and a harness audit per PR
     (`.github/workflows/codex-review.yml`) that runs a pinned Codex CLI read-only with a spend-capped project key
     (`OPENAI_API_KEY`) and posts one sticky comment;
