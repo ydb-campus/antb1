@@ -1,0 +1,64 @@
+# DATE: EventDate (uint16 days) read as DATE through the `clickbench` option of tests/slt/tables.txt. Literals are
+# DATE 'YYYY-MM-DD' or a string 'YYYY-MM-DD'; dates compare chronologically and print as YYYY-MM-DD.
+
+query ITT nosort
+SELECT COUNT(EventDate), MAX(EventDate), MIN(EventDate) FROM hits_like
+----
+10000	2013-07-31	2013-07-01
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE EventDate = DATE '2013-07-15'
+----
+335
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE EventDate = '2013-07-15'
+----
+335
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE EventDate >= '2013-07-10' AND EventDate < DATE '2013-07-20'
+----
+3227
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE EventDate > DATE '2013-07-31'
+----
+0
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE EventDate <> '2013-07-01'
+----
+9647
+
+query I nosort
+SELECT COUNT(*) FROM hits_like_nulls WHERE EventDate <= '9999-12-31'
+----
+9238
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE EventDate < DATE '1970-01-02'
+----
+0
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE DATE '2013-07-04' >= EventDate
+----
+1376
+
+query TT nosort
+SELECT MAX(EventDate), MIN(EventDate) FROM hits_like_split WHERE AdvEngineID <> 0 AND EventDate > '2013-07-05'
+----
+2013-07-31	2013-07-06
+
+query IT rowsort
+SELECT WatchID, EventDate FROM hits_like WHERE EventDate = '2013-07-31' AND RegionID > 19000
+----
+-118000787521951111	2013-07-31
+1789877250658587283	2013-07-31
+2331564732249556418	2013-07-31
+2545292003254428623	2013-07-31
+3105945136773485013	2013-07-31
+3477670019347388496	2013-07-31
+4306430868111253586	2013-07-31
+5862655407271182817	2013-07-31

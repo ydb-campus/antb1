@@ -1,9 +1,6 @@
 # The canonical value text (tests/slt/runner/canonical.h) on the edge and hits-like fixtures: integer
 # extremes, 128-bit sums, doubles, dates, NULL, (empty), escapes and UTF-8, sort modes, hashing, labels.
-# DuckDB-only until antb1 supports projections and aggregates; then drop the `onlyif duckdb` lines so
-# every record also checks antb1.
 
-onlyif duckdb
 query IIII nosort
 SELECT id, i16, i32, i64 FROM edge
 ----
@@ -20,7 +17,6 @@ SELECT id, i16, i32, i64 FROM edge
 10	-12345	54321	-42
 11	7	-7	7
 
-onlyif duckdb
 query IIR nosort
 SELECT id, u16, d FROM edge
 ----
@@ -37,7 +33,6 @@ SELECT id, u16, d FROM edge
 10	12	922337203685477632
 11	7	-0.3333333333333333
 
-onlyif duckdb
 query ITT nosort
 SELECT id, s, u FROM edge
 ----
@@ -54,7 +49,6 @@ SELECT id, s, u FROM edge
 10	NULL	日本語
 11	naïve café	NULL
 
-onlyif duckdb
 query T valuesort
 SELECT s FROM edge
 ----
@@ -74,7 +68,6 @@ x\x01y
 # 12 rows x 2 values > 10: the block is a hash.
 hash-threshold 10
 
-onlyif duckdb
 query IT rowsort
 SELECT id, u FROM edge
 ----
@@ -83,44 +76,37 @@ SELECT id, u FROM edge
 hash-threshold 0
 
 # Integer SUM is a 128-bit HUGEINT: UserID holds int64 extremes and the sum overflows int64.
-onlyif duckdb
 query I nosort
 SELECT SUM(UserID) FROM hits_like
 ----
 23021353196360218899981
 
-onlyif duckdb
 query IR nosort
 SELECT SUM(WatchID), AVG(WatchID) FROM hits_like_nulls
 ----
 110231108887945010512	11963437040150316
 
 # tol 1e-6
-onlyif duckdb
 query R nosort
 SELECT AVG(ResolutionWidth) FROM hits_like_split
 ----
 1397.6722
 
-onlyif duckdb
 query TT nosort
 SELECT MAX(EventDate), MIN(EventDate) FROM hits_like_required
 ----
 2013-07-31	2013-07-01
 
-onlyif duckdb
 query III nosort
 SELECT COUNT(*), COUNT(SocialAction), COUNT(HistoryLength) FROM hits_like_nulls
 ----
 10000	0	0
 
-onlyif duckdb
 query TT nosort
 SELECT MIN(Title), MAX(SearchPhrase) FROM hits_like
 ----
 (empty)	погода погода погода
 
-onlyif duckdb
 query IIII nosort
 SELECT MIN(Interests), MAX(Interests), MIN(ClientIP), MAX(ClientIP) FROM hits_like
 ----

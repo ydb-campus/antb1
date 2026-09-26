@@ -21,10 +21,11 @@ behind this setup are in [ADR 0009](adr/0009-ci-and-governance.md).
 | `Codex harness audit` | `.github/workflows/codex-review.yml` | pull requests opened, ready for review or reopened; label `codex-review` | advisory: read-only Codex audit, one sticky comment |
 | `Copilot Setup Steps` | `.github/workflows/copilot-setup-steps.yml` | every Copilot coding-agent task; manual; changes to itself, `pixi.toml` or `pixi.lock` | prepares Copilot's environment (`default` and `lint`, dev build) |
 | `pixi.lock update` | `.github/workflows/pixi-lock-update.yml` | weekly (Monday), manual | PR `build(deps): update pixi.lock` from the antb1-bot App |
+| `Benchmarks` | `.github/workflows/bench.yml` | pushes to `main` that touch `src/`, `bench/`, `tools/fixturegen/` or `pixi.lock`; pull requests labeled `performance`; manual | micro benchmarks and ClickBench timings; publishes the series from `main` to `gh-pages`; advisory, never gating ([benchmarks.md](benchmarks.md)) |
 
-The AI and bot workflows (Claude, Claude review, Codex harness audit, Copilot Setup Steps, pixi.lock update) are
-advisory: they are not required checks and not part of `CI OK`, and their failures never block a merge. Their setup,
-secrets and security model are described in [docs/agents.md](agents.md). A later PR adds the benchmark workflow.
+The AI and bot workflows (Claude, Claude review, Codex harness audit, Copilot Setup Steps, pixi.lock update) and
+`Benchmarks` are advisory: they are not required checks and not part of `CI OK`, and their failures never block a
+merge. The AI workflows' setup, secrets and security model are described in [docs/agents.md](agents.md).
 
 ## Required checks
 
@@ -58,6 +59,8 @@ a merge queue (`merge_group` is already wired) can take over when PR volume need
 | `coverage-comment` (advisory) | ubuntu-slim | none | read `build/coverage/summary.md` after `pixi run coverage` |
 | `cache-gc` (`main` only) | ubuntu-slim | none | nothing to run |
 | `CI OK` | ubuntu-slim | none | aggregator, nothing to run |
+| `bench-run (pixi run bench && pixi run bench-clickbench)` (advisory) | ubuntu-24.04 | `default` | `pixi run bench` · `pixi run bench-clickbench` |
+| `bench-publish` (advisory, `main` only) | ubuntu-24.04 | none | nothing to reproduce: appends `micro.json` to the `gh-pages` series |
 | `PR title` | ubuntu-slim | none | check the title against the rules above |
 
 Advisory jobs (not required):
@@ -78,7 +81,7 @@ Advisory jobs (not required):
   the hermetic tests.
 - `gcc-compat` builds with GCC 15 and GCC-only warnings, with `-Werror`, and runs the hermetic tests.
 - `macos-release` is a RelWithDebInfo build with `-Werror` against libc++ on Apple silicon, followed by the hermetic
-  tests.
+  tests; it also builds the micro benchmarks and runs each once (`bench.micro.smoke`).
 - `clang-tidy` runs clang-tidy on every translation unit, with warnings as errors.
 - `clang-coverage-fuzz` runs two Clang-only gates. `pixi run coverage` builds with source-based coverage, runs the
   hermetic tests and fails when a module drops below its floor in `tools/ci/coverage_thresholds.json`; its per-module
@@ -183,9 +186,11 @@ measurements are recorded here once enough runs exist.
 | `fuzz-artifacts` | `clang-coverage-fuzz` | when the fuzz smoke run fails | 14 days |
 | `fuzz-long-artifacts` | nightly `fuzz-long` | when long fuzzing fails | 14 days |
 | `scorecard-sarif` | `Scorecard` | always | 5 days |
+| `bench-results` | `bench-run` | always | 30 days |
 
 Artifacts never contain data: the coverage summary holds only percentages, fuzz inputs grow from our own seed
-corpus, and the data jobs (`clickbench-hits0`, nightly `asan-data` and `arm64`) upload nothing.
+corpus, the benchmark results hold only timings (never query text or results), and the data jobs
+(`clickbench-hits0`, nightly `asan-data` and `arm64`) upload nothing.
 
 ## Caches
 
@@ -234,7 +239,8 @@ enforces them:
   (values are passed through `env:`);
 - caches are written only from `main`;
 - a job with a write permission never runs code from a pull request: `coverage-comment` (`pull-requests: write`),
-  `cache-gc` (`actions: write`, `main` only) and the nightly `report` (`issues: write`) check out nothing from a PR.
+  `cache-gc` (`actions: write`, `main` only), the nightly `report` (`issues: write`) and `bench-publish`
+  (`contents: write` for the `gh-pages` series, pushes to `main` only) check out nothing from a PR.
   The analyses that upload results (`CodeQL`, `Security`, `Scorecard`) hold only `security-events: write` (Scorecard
   also `id-token: write`, on `main`); on fork pull requests GitHub makes their token read-only.
 

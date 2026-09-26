@@ -143,7 +143,6 @@ std::optional<GenColumn> ColumnOf(const arrow::Field& field, bool clickbench) {
     case arrow::Type::INT64:
       integer(std::numeric_limits<int64_t>::min(), std::numeric_limits<int64_t>::max());
       break;
-    case arrow::Type::FLOAT:
     case arrow::Type::DOUBLE:
       c.kind = ValueKind::kDouble;
       break;
@@ -154,6 +153,9 @@ std::optional<GenColumn> ColumnOf(const arrow::Field& field, bool clickbench) {
     case arrow::Type::DATE32:
       c.kind = ValueKind::kDate;
       break;
+    // FLOAT is DOUBLE on antb1 (results, and WHERE in double precision) but FLOAT on DuckDB, which
+    // also compares most literals with it in FLOAT: divergence D11 in docs/sql-subset.md.
+    case arrow::Type::FLOAT:
     default:
       return std::nullopt;  // a type neither engine reads the same way: never referenced
   }
@@ -210,10 +212,7 @@ std::optional<std::string> SampleAt(const arrow::Array& a, int64_t row, const Ge
       return v.has_value() ? std::optional(CanonicalDate(static_cast<int32_t>(*v))) : std::nullopt;
     }
     case ValueKind::kDouble: {
-      const double v =
-          a.type_id() == arrow::Type::FLOAT
-              ? static_cast<double>(static_cast<const arrow::FloatArray&>(a).Value(row))
-              : static_cast<const arrow::DoubleArray&>(a).Value(row);
+      const double v = static_cast<const arrow::DoubleArray&>(a).Value(row);
       return std::isfinite(v) ? std::optional(FixedDouble(v)) : std::nullopt;
     }
     case ValueKind::kVarchar: {

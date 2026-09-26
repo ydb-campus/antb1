@@ -1,0 +1,79 @@
+# VARCHAR values are bytes: unannotated BYTE_ARRAY (edge.s, the hits-like tables) and UTF8 (edge.u,
+# hits_like_required) behave alike. Comparisons, MIN and MAX are byte-wise, so UTF-8 sorts after ASCII.
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE s = ''
+----
+1
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE s <> ''
+----
+9
+
+query I rowsort
+SELECT id FROM edge WHERE s > 'a'
+----
+11
+2
+3
+4
+7
+8
+
+query I rowsort
+SELECT id FROM edge WHERE u >= 'Привет'
+----
+10
+8
+
+query I rowsort
+SELECT id FROM edge WHERE u < 'a'
+----
+0
+9
+
+query I rowsort
+SELECT id FROM edge WHERE s = 'NULL'
+----
+9
+
+query I rowsort
+SELECT id FROM edge WHERE u = '(empty)'
+----
+9
+
+query I rowsort
+SELECT id FROM edge WHERE s = 'naïve café'
+----
+11
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE SearchPhrase = ''
+----
+7995
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE Title >= 'погода'
+----
+267
+
+query I nosort
+SELECT COUNT(*) FROM hits_like_required WHERE Title < 'beta' AND Title > 'alpha'
+----
+247
+
+query II nosort
+SELECT COUNT(*), COUNT(URL) FROM hits_like WHERE URL <> 'https://www.example.org/'
+----
+10000	10000
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE s = 'O''Brien'
+----
+0
+
+query TT nosort
+SELECT MIN(SearchPhrase), MAX(SearchPhrase) FROM hits_like WHERE SearchPhrase <> ''
+----
+alpha	погода погода погода

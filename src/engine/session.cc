@@ -95,12 +95,13 @@ arrow::Result<QueryResult> Session::Execute(std::string_view sql) {
   const auto t0 = Clock::now();
   ARROW_ASSIGN_OR_RAISE(auto op, exec::BuildPhysicalPlan(logical));
   exec::ExecContext ctx{.pool = arrow::default_memory_pool(), .batch_size = options_.batch_size};
-  ARROW_ASSIGN_OR_RAISE(result.table, exec::Drain(*op, ctx));
-  result.timings.execute = Clock::now() - t0;
+  ARROW_ASSIGN_OR_RAISE(auto table, exec::Drain(*op, ctx));
   for (const auto& col : logical.output) {
     result.names.push_back(col.name);
     result.types.push_back(col.type);
   }
+  ARROW_ASSIGN_OR_RAISE(result.table, table->RenameColumns(result.names));
+  result.timings.execute = Clock::now() - t0;
   return result;
 }
 

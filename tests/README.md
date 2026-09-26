@@ -27,11 +27,11 @@ a log. Its own queries (`data/hits0_slice.sql`) and relations (`data/hits_relati
 
 ## What antb1 supports: `slt/supported_features.h`
 
-`kSupportedFeatures` declares the SQL features antb1 answers today (now
-`SELECT COUNT(*) [[AS] alias] FROM <name | 'path'>` in any case, quoting and layout; the binder already accepts
-the whole target grammar, but the executor does not run it yet). The random differential test generates queries
-from it, and the metamorphic relations are active or pending by it. The PR that implements a feature adds it
-there; the tests then demand correct answers for it.
+`kSupportedFeatures` declares the SQL features antb1 answers today: the whole slice grammar of
+`docs/sql-subset.md` (global aggregates, projections, `WHERE` conjunctions, `LIMIT`) over every column type, in any
+case, quoting and layout. The random differential test generates queries from it, and the metamorphic relations are
+active or pending by it. The PR that implements a new feature adds it there; the tests then demand correct answers
+for it.
 
 ## Metamorphic relations (`metamorphic/`)
 
@@ -44,12 +44,12 @@ same answers for batch sizes 1, 7 and 65536. Each relation declares the features
   skipped with the missing features. When antb1 answers every query, the test fails until the features are
   declared, which activates the relation.
 
-Pending relations already cover TLP-lite partitions of WHERE (`<`/`>=`, `=`/`<>`, NULLs through
-`COUNT(col)`), AND symmetry, literal-first comparisons, LIMIT, projections, SUM/MIN/MAX over parts and
-batch sizes. Add a relation with `r.push_back({...})` in `AllRelations()`; the checks (`AllEqual`,
-`FirstEqualsSumOfRest`, `FirstEqualsMinOfRest`, `FirstEqualsMaxOfRest`, `RowCountsEqualFirst`,
-`RowCountsAreMinOf`) are in `relations.h`. `metamorphic.RowCount.MatchesAnIndependentParquetScan` compares
-COUNT(*) with the rows the Parquet library decodes.
+The relations cover TLP-lite partitions of WHERE (`<`/`>=`, `=`/`<>`, NULLs through `COUNT(col)`), SUM, MIN and
+MAX over partitions and over split files, literal folding (a decimal bound equals its integer bound, out-of-range
+bounds), AND symmetry, literal-first comparisons, LIMIT, projections and batch sizes; all of them are active. Add a
+relation with `r.push_back({...})` in `AllRelations()`; the checks (`AllEqual`, `FirstEqualsSumOfRest`,
+`FirstEqualsMinOfRest`, `FirstEqualsMaxOfRest`, `RowCountsEqualFirst`, `RowCountsAreMinOf`) are in `relations.h`.
+`metamorphic.RowCount.MatchesAnIndependentParquetScan` compares COUNT(*) with the rows the Parquet library decodes.
 
 ## CLI goldens (`cli/`)
 

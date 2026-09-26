@@ -72,12 +72,16 @@ std::shared_ptr<arrow::Field> EngineField(const std::shared_ptr<arrow::Field>& s
   return arrow::field(storage->name(), plan::ToArrow(*logical), storage->nullable());
 }
 
+// Every column the override matches (EngineField applies it to all of them, e.g. to both "a" and
+// "A") must be readable as the new type.
 arrow::Status ValidateOverride(const ColumnOverride& ov, const arrow::Schema& storage) {
   const std::string lower = plan::AsciiLower(ov.column);
+  bool matched = false;
   for (const auto& f : storage.fields()) {
     if (plan::AsciiLower(f->name()) != lower) {
       continue;
     }
+    matched = true;
     auto logical = plan::FromArrow(*f->type());
     const bool ok =
         logical.ok() && ov.type == plan::LogicalType::kDate &&
@@ -87,9 +91,11 @@ arrow::Status ValidateOverride(const ColumnOverride& ov, const arrow::Schema& st
       return arrow::Status::Invalid("cannot read column '", f->name(), "' of type ",
                                     f->type()->ToString(), " as ", plan::ToString(ov.type));
     }
-    return arrow::Status::OK();
   }
-  return arrow::Status::Invalid("column type override: no column named '", ov.column, "'");
+  if (!matched) {
+    return arrow::Status::Invalid("column type override: no column named '", ov.column, "'");
+  }
+  return arrow::Status::OK();
 }
 
 // ---- scan: storage arrays -> the engine view (plan::Table::schema()) ----
@@ -299,6 +305,11 @@ class ScanReader final : public arrow::RecordBatchReader {
     ARROW_RETURN_NOT_OK(builder.Open(input));
     parquet::ArrowReaderProperties properties(/*use_threads=*/false);
     properties.set_batch_size(batch_size_);
+    // No pre-buffering (on by default): its read cache keeps every column chunk it has read until
+    // the FileReader closes, so memory would grow with the file (every row group of the scanned
+    // columns) instead of one row group, and its reads would run on Arrow's I/O threads. Local
+    // files gain nothing from coalescing reads.
+    properties.set_pre_buffer(false);
     ARROW_ASSIGN_OR_RAISE(file_reader_, builder.properties(properties)->Build());
     const auto& top_level = file_reader_->manifest().schema_fields;
     std::vector<int> leaves;  // named: a braced list would pick a deprecated overload

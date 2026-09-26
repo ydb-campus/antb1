@@ -1,15 +1,22 @@
 #include "antb1/engine/session.h"
 
+#include <cstddef>
+#include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <arrow/api.h>
 #include <arrow/io/file.h>
 #include <gtest/gtest.h>
 #include <parquet/arrow/writer.h>
 
+#include "antb1/engine/format.h"
 #include "antb1/plan/sql_status.h"
+#include "antb1/plan/types.h"
 
 namespace antb1::engine {
 namespace {
@@ -114,22 +121,172 @@ TEST_F(SessionTest, ExplainShowsTheOptimizedPlan) {
             "    Scan table=t source=parquet(files=1, rows=10) columns=[AdvEngineID, EventDate]\n");
 }
 
-// The binder accepts the whole grammar; the executor answers only COUNT(*) without WHERE so far,
-// so everything else is Unsupported (exit code 4), not an internal error.
-TEST_F(SessionTest, QueriesTheExecutorCannotRunYetAreUnsupported) {
+// The rows of a result as canonical text (engine::FormatValue), one vector per row.
+std::vector<std::vector<std::string>> Rows(const QueryResult& result) {
+  const auto table = result.table->CombineChunks().ValueOrDie();
+  std::vector<std::vector<std::string>> rows;
+  for (int64_t r = 0; r < table->num_rows(); ++r) {
+    std::vector<std::string> row;
+    row.reserve(static_cast<std::size_t>(table->num_columns()));
+    for (int c = 0; c < table->num_columns(); ++c) {
+      row.push_back(FormatValue(*table->column(c)->chunk(0), r,
+                                result.types.at(static_cast<std::size_t>(c))));
+    }
+    rows.push_back(std::move(row));
+  }
+  return rows;
+}
+
+// Every query shape of the grammar runs; results carry the output names (also as the table's
+// field names) and types.
+TEST_F(SessionTest, ExecutesAggregatesProjectionsFiltersAndLimits) {
+  SessionOptions options;
+  options.default_overrides.emplace_back("EventDate", plan::LogicalType::kDate);
+  options.batch_size = 3;
+  auto session = Session::Make(options).ValueOrDie();
+  ASSERT_TRUE(session->RegisterParquet("t", {path_}).ok());
+
+  auto aggregates = session->Execute(
+      "SELECT COUNT(*), SUM(AdvEngineID) AS s, AVG(AdvEngineID), MIN(EventDate), "
+      "MAX(AdvEngineID), COUNT(EventDate) FROM t WHERE AdvEngineID >= 2");
+  ASSERT_TRUE(aggregates.ok()) << aggregates.status().ToString();
+  EXPECT_EQ(aggregates->names,
+            (std::vector<std::string>{"count_star()", "s", "avg(AdvEngineID)", "min(EventDate)",
+                                      "max(AdvEngineID)", "count(EventDate)"}));
+  EXPECT_EQ(aggregates->types, (std::vector<plan::LogicalType>{
+                                   plan::LogicalType::kBigInt, plan::LogicalType::kHugeInt,
+                                   plan::LogicalType::kDouble, plan::LogicalType::kDate,
+                                   plan::LogicalType::kSmallInt, plan::LogicalType::kBigInt}));
+  EXPECT_EQ(aggregates->table->schema()->field(1)->name(), "s");
+  EXPECT_EQ(Rows(*aggregates),
+            (std::vector<std::vector<std::string>>{{"8", "44", "5.5", "2022-01-08", "9", "8"}}));
+
+  auto projection = session->Execute(
+      "SELECT AdvEngineID, EventDate AS d FROM t WHERE AdvEngineID <> 1 AND 5 > AdvEngineID "
+      "LIMIT 3");
+  ASSERT_TRUE(projection.ok()) << projection.status().ToString();
+  EXPECT_EQ(Rows(*projection), (std::vector<std::vector<std::string>>{
+                                   {"0", "2022-01-08"}, {"2", "2022-01-08"}, {"3", "2022-01-08"}}));
+
+  auto star = session->Execute("SELECT * FROM t WHERE AdvEngineID > 8.5");
+  ASSERT_TRUE(star.ok()) << star.status().ToString();
+  EXPECT_EQ(Rows(*star), (std::vector<std::vector<std::string>>{{"9", "2022-01-08"}}));
+
+  // No row passes: COUNT is 0, the other aggregates are NULL; a projection has no rows.
+  auto none = session->Execute(
+      "SELECT COUNT(*), COUNT(AdvEngineID), SUM(AdvEngineID), MAX(EventDate) FROM t "
+      "WHERE AdvEngineID > 100000");
+  ASSERT_TRUE(none.ok()) << none.status().ToString();
+  EXPECT_EQ(Rows(*none), (std::vector<std::vector<std::string>>{{"0", "0", "NULL", "NULL"}}));
+  auto empty = session->Execute("SELECT AdvEngineID FROM t WHERE AdvEngineID = 1.5");
+  ASSERT_TRUE(empty.ok()) << empty.status().ToString();
+  EXPECT_EQ(empty->table->num_rows(), 0);
+  EXPECT_EQ(empty->names, std::vector<std::string>{"AdvEngineID"});
+}
+
+// Writes `values` to a Parquet file as `d` (DOUBLE) and `f` (FLOAT, widened to DOUBLE on read),
+// with `k` (SMALLINT) numbering the rows from `first_k`, in row groups of 2 rows.
+void WriteDoubles(const std::string& path, const std::vector<double>& values, int16_t first_k) {
+  arrow::Int16Builder k;
+  arrow::DoubleBuilder d;
+  arrow::FloatBuilder f;
+  int16_t next = first_k;
+  for (const double v : values) {
+    ASSERT_TRUE(k.Append(next++).ok());
+    ASSERT_TRUE(d.Append(v).ok());
+    ASSERT_TRUE(f.Append(static_cast<float>(v)).ok());
+  }
+  auto table = arrow::Table::Make(
+      arrow::schema({arrow::field("k", arrow::int16()), arrow::field("d", arrow::float64()),
+                     arrow::field("f", arrow::float32())}),
+      {k.Finish().ValueOrDie(), d.Finish().ValueOrDie(), f.Finish().ValueOrDie()});
+  auto out = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+  ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), out, 2).ok());
+  ASSERT_TRUE(out->Close().ok());
+}
+
+// D10: MIN and MAX ignore NaN and are NaN only when every selected value is NaN, whatever the
+// batch size, the file order and the rows WHERE keeps (FLOAT too, read as DOUBLE).
+TEST_F(SessionTest, MinMaxIgnoreNaNAcrossBatchesAndFiles) {
+  constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+  const std::string a = (dir_ / "a.parquet").string();
+  const std::string b = (dir_ / "b.parquet").string();
+  const std::string c = (dir_ / "c.parquet").string();
+  ASSERT_NO_FATAL_FAILURE(WriteDoubles(a, {kNaN, kNaN, kNaN, 5}, 0));  // k 0 to 3
+  ASSERT_NO_FATAL_FAILURE(WriteDoubles(b, {2, kNaN}, 4));              // k 4 and 5
+  ASSERT_NO_FATAL_FAILURE(WriteDoubles(c, {kNaN, kNaN}, 6));           // k 6 and 7
+  const std::vector<std::pair<std::string, std::vector<std::string>>> queries = {
+      {"", {"2", "5", "2", "5"}},
+      {" WHERE k <> 4", {"5", "5", "5", "5"}},  // keeps only the NaN of b
+      {" WHERE k <> 3 AND k <> 4", {"nan", "nan", "nan", "nan"}},
+  };
+  for (const int64_t batch_size : {1, 2, 3, 64 * 1024}) {
+    for (const auto& files :
+         std::vector<std::vector<std::string>>{{a, b, c}, {c, b, a}, {b, c, a}}) {
+      SessionOptions options;
+      options.batch_size = batch_size;
+      auto session = Session::Make(options).ValueOrDie();
+      ASSERT_TRUE(session->RegisterParquet("t", files).ok());
+      for (const auto& [where, expected] : queries) {
+        auto result = session->Execute("SELECT MIN(d), MAX(d), MIN(f), MAX(f) FROM t" + where);
+        ASSERT_TRUE(result.ok()) << result.status().ToString();
+        EXPECT_EQ(Rows(*result), std::vector<std::vector<std::string>>{expected})
+            << "batch size " << batch_size << ", files from " << files.front() << where;
+      }
+    }
+  }
+}
+
+// Divergence D11 (docs/sql-subset.md): a FLOAT column is widened exactly to DOUBLE, so its results
+// are DOUBLE and WHERE compares it in double precision with the literal's nearest double. DuckDB
+// rounds an integer or DECIMAL literal to FLOAT and compares in FLOAT (0.1F = 0.1 and
+// 16777216F = 16777217 hold there); a number it types as DOUBLE (1e-1) compares in DOUBLE, as here.
+TEST_F(SessionTest, FloatColumnsCompareInDoublePrecision) {
+  const std::string path = (dir_ / "floats.parquet").string();
+  arrow::FloatBuilder f;
+  for (const float v : {0.1F, 0.2F, 16777216.0F}) {
+    ASSERT_TRUE(f.Append(v).ok());
+  }
+  ASSERT_TRUE(f.AppendNull().ok());
+  const auto table = arrow::Table::Make(arrow::schema({arrow::field("f", arrow::float32())}),
+                                        {f.Finish().ValueOrDie()});
+  auto out = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+  ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), out, 4).ok());
+  ASSERT_TRUE(out->Close().ok());
+
+  auto session = Session::Make().ValueOrDie();
+  ASSERT_TRUE(session->RegisterParquet("floats", {path}).ok());
+  auto count = [&session](const std::string& where) {
+    auto result = session->Execute("SELECT COUNT(*) FROM floats WHERE " + where);
+    return result.ok() ? Rows(*result).at(0).at(0) : result.status().ToString();
+  };
+  EXPECT_EQ(count("f > 0.1"), "3");         // DuckDB: 2
+  EXPECT_EQ(count("f = 0.1"), "0");         // DuckDB: 1
+  EXPECT_EQ(count("0.1 >= f"), "0");        // DuckDB: 1
+  EXPECT_EQ(count("f = 16777217"), "0");    // DuckDB: 1
+  EXPECT_EQ(count("f < 16777217"), "3");    // DuckDB: 2
+  EXPECT_EQ(count("f > 1e-1"), "3");        // DuckDB: 3
+  EXPECT_EQ(count("f < 16777217e0"), "3");  // DuckDB: 3
+
+  auto values = session->Execute("SELECT f FROM floats WHERE f < 1");
+  ASSERT_TRUE(values.ok()) << values.status().ToString();
+  EXPECT_EQ(values->types, std::vector<plan::LogicalType>{plan::LogicalType::kDouble});
+  EXPECT_EQ(Rows(*values), (std::vector<std::vector<std::string>>{{"0.10000000149011612"},
+                                                                  {"0.20000000298023224"}}));
+}
+
+TEST_F(SessionTest, UnsupportedAndBindErrorsKeepTheirKinds) {
   auto session = Session::Make().ValueOrDie();
   ASSERT_TRUE(session->RegisterParquet("t", {path_}).ok());
   for (const char* sql :
-       {"SELECT * FROM t", "SELECT AdvEngineID FROM t LIMIT 3", "SELECT SUM(AdvEngineID) FROM t",
-        "SELECT COUNT(*) FROM t WHERE AdvEngineID <> 70000", "SELECT COUNT(*) FROM t LIMIT 1"}) {
+       {"SELECT COUNT(*) FROM t GROUP BY AdvEngineID", "SELECT AdvEngineID FROM t ORDER BY 1",
+        "SELECT DISTINCT AdvEngineID FROM t"}) {
     auto result = session->Execute(sql);
-    ASSERT_FALSE(result.ok()) << sql;
     const auto detail = plan::GetSqlError(result.status());
     ASSERT_NE(detail, nullptr) << sql << ": " << result.status().ToString();
     EXPECT_EQ(detail->kind(), plan::SqlErrorDetail::Kind::kUnsupported) << sql;
     EXPECT_TRUE(result.status().IsNotImplemented()) << sql;
   }
-  // Bind errors come first.
   auto bind = session->Execute("SELECT SUM(nope) FROM t");
   const auto detail = plan::GetSqlError(bind.status());
   ASSERT_NE(detail, nullptr) << bind.status().ToString();
@@ -138,6 +295,7 @@ TEST_F(SessionTest, QueriesTheExecutorCannotRunYetAreUnsupported) {
   auto count = session->Execute("SELECT COUNT(*) AS n FROM t");
   ASSERT_TRUE(count.ok()) << count.status().ToString();
   EXPECT_EQ(count->names, std::vector<std::string>{"n"});
+  EXPECT_EQ(Rows(*count), (std::vector<std::vector<std::string>>{{"10"}}));
 }
 
 }  // namespace

@@ -11,7 +11,8 @@
 // The one canonical text form of result values, shared by both engines, and the sqllogictest
 // rendering and comparison built on it:
 //   value text  integers (up to 128 bits) exactly; doubles as the shortest round-trip form ("nan",
-//               "inf", "-inf"); dates YYYY-MM-DD; strings as their bytes. antb1 produces it with
+//               "inf", "-inf"); dates as plan::FormatDate prints them (YYYY-MM-DD, DuckDB's form
+//               outside years 1 to 9999); strings as their bytes. antb1 produces it with
 //               engine::FormatValue; the DuckDB adapter converts its values with the helpers below.
 //   slt cell    NULL; (empty) for ""; \t \n \r \\ escaped; control characters, invalid UTF-8 bytes
 //               and leading/trailing spaces as \xHH; a string that reads NULL or (empty) gets its

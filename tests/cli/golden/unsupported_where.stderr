@@ -1,4 +1,4 @@
-antb1: unsupported error: an aggregate over table data cannot be executed yet: only SELECT COUNT(*) FROM <table> (without WHERE) is answered
-  at line 1, column 8
-  SELECT COUNT(*) FROM t
-         ^^^^^^^^
+antb1: unsupported error: OR is not supported; see docs/sql-subset.md
+  at line 2, column 20
+  WHERE IsMobile = 1 OR IsRefresh = 1
+                     ^^

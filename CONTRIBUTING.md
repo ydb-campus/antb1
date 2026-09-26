@@ -38,6 +38,7 @@ environment, so `pixi run <task>` never needs `-e`; pixi installs a missing envi
 | Every Linux PR gate (ASan/UBSan, clang-tidy, coverage floors, fuzz smoke, GCC leg) | `pixi run check-full` |
 | ClickBench data tests (downloads 122 MB once into `~/.cache/antb1`; redacted output) | `pixi run test-data` |
 | Toolchain, build and data status | `pixi run doctor` |
+| Benchmarks (never gating; [docs/benchmarks.md](docs/benchmarks.md)) | `pixi run bench` · `pixi run bench-clickbench` |
 
 [docs/ci.md](docs/ci.md) maps every CI job to the local command that reproduces it, and
 [docs/testing.md](docs/testing.md) explains how tests are organized.

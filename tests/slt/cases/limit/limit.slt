@@ -1,0 +1,82 @@
+# LIMIT n returns the first n rows (files and row groups are read in order); the scan stops once n rows
+# are out. LIMIT 0 returns no row, also for an aggregate.
+
+query I nosort
+SELECT id FROM edge LIMIT 3
+----
+0
+1
+2
+
+query IT nosort
+SELECT id, s FROM edge WHERE id > 5 LIMIT 2
+----
+6	\x20leading space
+7	x\x01y
+
+query I nosort
+SELECT id FROM edge LIMIT 100
+----
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+
+query I nosort
+SELECT id FROM edge LIMIT 0
+----
+
+query I nosort
+SELECT COUNT(*) FROM edge LIMIT 0
+----
+
+query IR nosort
+SELECT COUNT(*), AVG(d) FROM edge LIMIT 1
+----
+12	91333000455419344
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE id > 3 LIMIT 5
+----
+8
+
+query TT nosort
+SELECT MIN(Title), MAX(Title) FROM hits_like LIMIT 9223372036854775807
+----
+(empty)	погода погода музыка stone river
+
+query ITT nosort
+SELECT WatchID, URL, EventDate FROM hits_like WHERE AdvEngineID <> 0 LIMIT 4
+----
+-1606746365381291834	https://www.example.org/λόγος/87685	2013-07-10
+8032472491296304730	https://www.example.org/погода/68976?q=café	2013-07-14
+1565738412516150104	https://www.example.org/cloud/53175	2013-07-25
+-2176100514861116025	https://www.example.org/violet/98079	2013-07-17
+
+# Across file and row group boundaries: the same first rows as the single file.
+hash-threshold 50
+
+query I nosort first_rows
+SELECT WatchID FROM hits_like LIMIT 2600
+----
+2600 values hashing to 29dd10520f7d5ca1d6677b898a382a13978053d24b36bc64b1e6617f6c2b0f9e
+
+query I nosort first_rows
+SELECT WatchID FROM hits_like_split LIMIT 2600
+----
+2600 values hashing to 29dd10520f7d5ca1d6677b898a382a13978053d24b36bc64b1e6617f6c2b0f9e
+
+query I nosort first_rows
+SELECT WatchID FROM '${FIXTURES}/hits_like_split/part-*.parquet' LIMIT 2600
+----
+2600 values hashing to 29dd10520f7d5ca1d6677b898a382a13978053d24b36bc64b1e6617f6c2b0f9e
+
+hash-threshold 0

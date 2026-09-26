@@ -22,7 +22,7 @@ internals are described next to the code in [tests/README.md](../tests/README.md
 | Fuzzing | `fuzz/` | parser round trip `Parse(ToSql(ast)) == ast`, idempotent unparser, no crash or UB | in use |
 | Coverage floors | `tools/ci/` | line and branch coverage of each module never drops below its floor | in use |
 | ClickBench data tests | `tests/data/` | antb1 against DuckDB on the pinned `hits_0` partition, metamorphic relations on it and the ClickBench ratchet, with redacted output | in use |
-| Benchmark smoke tests | – | micro benchmarks run once to prove they work | planned |
+| Benchmark smoke tests | `bench/` | every micro benchmark runs once (`pixi run release`), so they keep building and running | in use |
 
 Build-level gates run on every PR as well: ASan and UBSan (`pixi run asan`), clang-tidy (`pixi run tidy`), the
 coverage floors (`pixi run coverage`), a libFuzzer smoke run (`pixi run fuzz-smoke`), the GCC 15 compatibility
@@ -50,7 +50,7 @@ table must match it (`pixi run lint` compares them).
 | `fuzz` | in use | `fuzz.sql_parser.smoke`: a short libFuzzer run with a fixed seed (Clang `fuzz` preset only) |
 | `setup` | in use | `fixtures.generate`: writes the Parquet fixtures before any test that needs them |
 | `data` | in use | ClickBench data tests (`data.*`, [below](#clickbench-data-tests)): downloaded data, always redacted; only the `data` and `asan-data` test presets run them |
-| `bench-smoke` | reserved | micro benchmarks run once to prove they work (numbers never gate) |
+| `bench-smoke` | in use | `bench.micro.smoke`: every micro benchmark once (presets with benchmarks: `ci-release`); numbers never gate |
 
 The hermetic test presets (`dev`, `ci`, `ci-asan`, `ci-release`, `ci-gcc`, `coverage`, `tsan`, `ci-shuffle`) exclude
 the `data` and `fuzz` labels. The `fuzz` test preset runs only `fuzz` and `fuzz-replay`.
@@ -67,7 +67,8 @@ the `data` and `fuzz` labels. The `fuzz` test preset runs only `fuzz` and `fuzz-
 - A filtered run still generates the fixtures first: every test that reads them requires the ctest fixture that
   `fixtures.generate` sets up.
 - `pixi run ci`, `pixi run asan`, `pixi run ci-gcc` and `pixi run release` run the same tests in the CI
-  configurations. Each writes JUnit XML to `build/<preset>/junit.xml`.
+  configurations (`release` also builds the micro benchmarks and runs `bench.micro.smoke`). Each writes JUnit XML to
+  `build/<preset>/junit.xml`. Benchmarks themselves are not tests: [benchmarks.md](benchmarks.md).
 - `pixi run tsan` runs the hermetic tests under ThreadSanitizer (`build/tsan`); `pixi run ci-shuffle` runs the tests
   of the `ci` build in random order, each repeated until it fails (at most twice), and writes
   `build/ci/junit-shuffle.xml`.

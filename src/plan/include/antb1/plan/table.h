@@ -31,6 +31,10 @@ class Table {
 
   // One-line description for EXPLAIN, e.g. "parquet(3 files)".
   virtual std::string Describe() const = 0;
+
+  // Bytes of the table's storage (e.g. the sum of its Parquet file sizes), if known; reported by
+  // `antb1 bench` as ClickBench's data_size.
+  virtual std::optional<int64_t> data_size() const { return std::nullopt; }
 };
 
 }  // namespace antb1::plan

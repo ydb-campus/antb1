@@ -1,0 +1,50 @@
+# A table over several files (hits_like_split: 4 files of 1000, 3000, 2500 and 3500 rows with 1024-row row
+# groups) answers like the single file with the same rows (hits_like), and a glob in FROM like the named table.
+
+query IIIRTT nosort all_rows
+SELECT COUNT(*), COUNT(Title), SUM(UserID), AVG(ResolutionWidth), MIN(EventDate), MAX(URL) FROM hits_like
+----
+10000	10000	23021353196360218899981	1397.6722	2013-07-01	https://www.example.org/погода/99800?q=lemon
+
+query IIIRTT nosort all_rows
+SELECT COUNT(*), COUNT(Title), SUM(UserID), AVG(ResolutionWidth), MIN(EventDate), MAX(URL) FROM hits_like_split
+----
+10000	10000	23021353196360218899981	1397.6722	2013-07-01	https://www.example.org/погода/99800?q=lemon
+
+query IIIRTT nosort all_rows
+SELECT COUNT(*), COUNT(Title), SUM(UserID), AVG(ResolutionWidth), MIN(EventDate), MAX(URL) FROM hits_like_required
+----
+10000	10000	23021353196360218899981	1397.6722	2013-07-01	https://www.example.org/погода/99800?q=lemon
+
+query IIIR nosort filtered
+SELECT COUNT(*), SUM(WatchID), MAX(RegionID), AVG(Interests) FROM hits_like WHERE IsMobile = 0 AND AdvEngineID < 30
+----
+4650	-393404952471896684114	19993	8276.406021505376
+
+query IIIR nosort filtered
+SELECT COUNT(*), SUM(WatchID), MAX(RegionID), AVG(Interests) FROM hits_like_split WHERE IsMobile = 0 AND AdvEngineID < 30
+----
+4650	-393404952471896684114	19993	8276.406021505376
+
+query IIIR nosort filtered
+SELECT COUNT(*), SUM(WatchID), MAX(RegionID), AVG(Interests) FROM '${FIXTURES}/hits_like_split/part-*.parquet' WHERE IsMobile = 0 AND AdvEngineID < 30
+----
+4650	-393404952471896684114	19993	8276.406021505376
+
+# One part, and two of the parts through a glob.
+query II nosort
+SELECT COUNT(*), SUM(RegionID) FROM '${FIXTURES}/hits_like_split/part-1.parquet' WHERE RegionID > 10000
+----
+1447	21867971
+
+query IT nosort
+SELECT MAX(UserID), MIN(Title) FROM '${FIXTURES}/hits_like_split/part-[03].parquet'
+----
+9223372036854775807	(empty)
+
+query IT rowsort
+SELECT WatchID, URL FROM hits_like_split WHERE RegionID > 19995
+----
+-7309109776868671579	https://www.example.org/погода/82304?q=погода
+-7707613778036793793	https://www.example.org/gamma/5122
+7682940992676180251	https://www.example.org/river/33245

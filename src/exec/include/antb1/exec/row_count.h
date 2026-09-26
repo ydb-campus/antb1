@@ -17,7 +17,7 @@ class RowCountOperator final : public Operator {
     return schema_;
   }
   arrow::Status Open(ExecContext& ctx) override;
-  arrow::Result<std::shared_ptr<arrow::RecordBatch>> Next() override;
+  arrow::Result<Batch> Next() override;
   arrow::Status Close() override { return arrow::Status::OK(); }
 
  private:

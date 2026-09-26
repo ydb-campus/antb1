@@ -437,7 +437,7 @@ std::vector<Relation> AllRelations() {
                           Q("SELECT\n\tCOUNT ( * ) -- rows\nFROM /* the table */ hits_like ;")},
                .check = AllEqual()});
 
-  // ---- pending: need features beyond COUNT(*) (active once supported_features.h has them) ----
+  // ---- the executor: scans, filters, projections, aggregates, LIMIT ----
   r.push_back(
       {.name = "row_count_vs_scan_count_column",
        .features = {kCountStar, kCountColumn, kIntegerColumns, kTableName},
@@ -523,6 +523,54 @@ std::vector<Relation> AllRelations() {
                           Q("SELECT MAX(URL) FROM '${FIXTURES}/hits_like_split/part-2.parquet'"),
                           Q("SELECT MAX(URL) FROM '${FIXTURES}/hits_like_split/part-3.parquet'")},
                .check = FirstEqualsMaxOfRest()});
+  // Partitions of aggregates: hits_like has no NULL, so two complementary predicates split every
+  // row.
+  r.push_back({.name = "partition_sum_is_sum_of_parts",
+               .features = {kSum, kWhere, kIntegerColumns, kIntegerLiteral, kTableName},
+               .probes = {Q("SELECT SUM(UserID) FROM hits_like"),
+                          Q("SELECT SUM(UserID) FROM hits_like WHERE RegionID < 10000"),
+                          Q("SELECT SUM(UserID) FROM hits_like WHERE RegionID >= 10000")},
+               .check = FirstEqualsSumOfRest()});
+  r.push_back(
+      {.name = "partition_min_is_min_of_parts",
+       .features = {kMin, kWhere, kDateColumns, kVarcharColumns, kStringLiteral, kTableName},
+       .probes = {Q("SELECT MIN(EventDate) FROM hits_like"),
+                  Q("SELECT MIN(EventDate) FROM hits_like WHERE Title < 'm'"),
+                  Q("SELECT MIN(EventDate) FROM hits_like WHERE Title >= 'm'")},
+       .check = FirstEqualsMinOfRest()});
+  r.push_back({.name = "partition_max_is_max_of_parts",
+               .features = {kMax, kWhere, kVarcharColumns, kDateColumns, kDateLiteral, kTableName},
+               .probes = {Q("SELECT MAX(URL) FROM hits_like"),
+                          Q("SELECT MAX(URL) FROM hits_like WHERE EventDate < DATE '2013-07-15'"),
+                          Q("SELECT MAX(URL) FROM hits_like WHERE EventDate >= DATE '2013-07-15'")},
+               .check = FirstEqualsMaxOfRest()});
+  // Literal folding: equivalent predicates select the same rows.
+  r.push_back({.name = "folded_decimal_bound_equals_integer_bound",
+               .features = {kCountStar, kWhere, kLiteralFirst, kIntegerColumns, kIntegerLiteral,
+                            kDecimalLiteral, kTableName},
+               .probes = {Q("SELECT COUNT(*) FROM hits_like WHERE ResolutionWidth >= 1367"),
+                          Q("SELECT COUNT(*) FROM hits_like WHERE ResolutionWidth > 1366.5"),
+                          Q("SELECT COUNT(*) FROM hits_like WHERE 1366.5 < ResolutionWidth")},
+               .check = AllEqual()});
+  r.push_back(
+      {.name = "folded_out_of_range_bound_keeps_non_null_values",
+       .features = {kCountStar, kCountColumn, kWhere, kIntegerColumns, kIntegerLiteral,
+                    kNegativeLiteral, kTableName},
+       .probes =
+           {Q("SELECT COUNT(Interests) FROM hits_like_nulls"),
+            Q("SELECT COUNT(*) FROM hits_like_nulls WHERE Interests < 40000"),
+            Q("SELECT COUNT(*) FROM hits_like_nulls WHERE Interests > -40000"),
+            Q("SELECT COUNT(*) FROM hits_like_nulls WHERE Interests <> 99999999999999999999")},
+       .check = AllEqual()});
+  r.push_back(
+      {.name = "folded_never_true_selects_nothing",
+       .features = {kCountStar, kWhere, kIntegerColumns, kIntegerLiteral, kDecimalLiteral,
+                    kNegativeLiteral, kTableName},
+       .probes = {Q("SELECT COUNT(*) FROM empty"),
+                  Q("SELECT COUNT(*) FROM hits_like WHERE RegionID = 1.5"),
+                  Q("SELECT COUNT(*) FROM hits_like WHERE Interests > 32767.5"),
+                  Q("SELECT COUNT(*) FROM hits_like WHERE EventTime < -9223372036854775809")},
+       .check = AllEqual()});
   const std::string aggregates =
       "SELECT COUNT(*), COUNT(Title), SUM(UserID), AVG(ResolutionWidth), MIN(EventDate), MAX(URL) "
       "FROM ";

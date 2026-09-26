@@ -58,9 +58,14 @@ enum class Feature : std::uint8_t {
   kQuotedIdentifier,  // "quoted" table and column names
   kLayout,            // newlines, tabs, -- and /* */ comments between tokens
   kSemicolon,         // a trailing ';'
+  // Out-of-scope marker: never in kSupportedFeatures and never generated. The harness self-tests
+  // tag
+  // their "pending" canary query with it, so that path stays tested while the slice grammar is
+  // complete.
+  kGroupBy,  // GROUP BY (not supported)
 };
 
-inline constexpr std::size_t kFeatureCount = static_cast<std::size_t>(Feature::kSemicolon) + 1;
+inline constexpr std::size_t kFeatureCount = static_cast<std::size_t>(Feature::kGroupBy) + 1;
 
 constexpr std::string_view FeatureName(Feature feature) {
   switch (feature) {
@@ -124,6 +129,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "layout";
     case Feature::kSemicolon:
       return "semicolon";
+    case Feature::kGroupBy:
+      return "group_by";
   }
   return "?";
 }
@@ -187,14 +194,44 @@ class FeatureSet {
   std::uint64_t bits_ = 0;
 };
 
-// What antb1 answers today: SELECT COUNT(*) [[AS] alias] FROM <name | 'path'> (ClickBench Q0), in
-// any case, quoting and layout. The binder accepts the whole target grammar, but the executor runs
-// only COUNT(*) without WHERE (from metadata) so far. Extend it in the PR that implements a
-// feature.
+// Out-of-scope markers: valid in `-- features:` tags, never generated (see Feature::kGroupBy).
+inline constexpr FeatureSet kNeverGenerated = {Feature::kGroupBy};
+
+// What antb1 answers today: the whole slice grammar of docs/sql-subset.md (global aggregates,
+// projections, WHERE conjunctions of column <op> literal, LIMIT) over every column type, in any
+// case, quoting and layout. Listed feature by feature, so a Feature added to the vocabulary for new
+// grammar stays unsupported until the PR that implements it declares it here.
 inline constexpr FeatureSet kSupportedFeatures = {
-    Feature::kCountStar,        Feature::kAlias,       Feature::kTableName,
-    Feature::kTablePath,        Feature::kKeywordCase, Feature::kIdentifierCase,
-    Feature::kQuotedIdentifier, Feature::kLayout,      Feature::kSemicolon,
+    Feature::kCountStar,
+    Feature::kCountColumn,
+    Feature::kSum,
+    Feature::kAvg,
+    Feature::kMin,
+    Feature::kMax,
+    Feature::kColumns,
+    Feature::kStar,
+    Feature::kMultipleItems,
+    Feature::kAlias,
+    Feature::kIntegerColumns,
+    Feature::kDoubleColumns,
+    Feature::kVarcharColumns,
+    Feature::kDateColumns,
+    Feature::kTableName,
+    Feature::kTablePath,
+    Feature::kWhere,
+    Feature::kWhereAnd,
+    Feature::kLiteralFirst,
+    Feature::kIntegerLiteral,
+    Feature::kDecimalLiteral,
+    Feature::kNegativeLiteral,
+    Feature::kStringLiteral,
+    Feature::kDateLiteral,
+    Feature::kLimit,
+    Feature::kKeywordCase,
+    Feature::kIdentifierCase,
+    Feature::kQuotedIdentifier,
+    Feature::kLayout,
+    Feature::kSemicolon,
 };
 
 }  // namespace antb1::slt

@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
-#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -14,6 +13,8 @@
 #include <system_error>
 #include <utility>
 #include <vector>
+
+#include "antb1/plan/literal.h"
 
 #include "engine.h"
 #include "sha256.h"
@@ -145,10 +146,7 @@ std::string CanonicalDouble(double value) {
 }
 
 std::string CanonicalDate(int32_t days_since_epoch) {
-  const std::chrono::sys_days d{std::chrono::days{days_since_epoch}};
-  const std::chrono::year_month_day ymd{d};
-  return std::format("{:04}-{:02}-{:02}", static_cast<int>(ymd.year()),
-                     static_cast<unsigned>(ymd.month()), static_cast<unsigned>(ymd.day()));
+  return plan::FormatDate(days_since_epoch);  // what engine::FormatValue prints for antb1
 }
 
 std::string SltCell(const std::optional<std::string>& value) {

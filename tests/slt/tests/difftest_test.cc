@@ -40,7 +40,14 @@ ResultSet Ints(std::vector<std::string> values) {
   return r;
 }
 
-// SELECT COUNT(*) [[AS] alias] FROM t: what antb1 answers today (kSupportedFeatures).
+// The model of these tests, independent of what tests/slt/supported_features.h declares today: the
+// "good" antb1 answers exactly SELECT COUNT(*) [[AS] alias] FROM t, in any lexical form.
+constexpr FeatureSet kCountStarOnly = {
+    Feature::kCountStar,        Feature::kAlias,       Feature::kTableName,
+    Feature::kTablePath,        Feature::kKeywordCase, Feature::kIdentifierCase,
+    Feature::kQuotedIdentifier, Feature::kLayout,      Feature::kSemicolon,
+};
+
 bool UsesOnlyCountStar(const std::string& sql) {
   std::string lower = sql;
   std::ranges::transform(lower, lower.begin(), [](char c) {
@@ -68,8 +75,8 @@ std::vector<GenTable> Tables() {
 }
 
 QueryGenerator Generator(unsigned target_percent) {
-  auto gen = QueryGenerator::Make(
-      Tables(), 42, {.supported = kSupportedFeatures, .target_percent = target_percent});
+  auto gen = QueryGenerator::Make(Tables(), 42,
+                                  {.supported = kCountStarOnly, .target_percent = target_percent});
   EXPECT_TRUE(gen.has_value()) << gen.error();
   return *std::move(gen);
 }
@@ -99,7 +106,7 @@ TEST(RunDiff, AgreeingEnginesPassAndUnsupportedTargetQueriesAreCounted) {
   EXPECT_GT(r.stats.unsupported, 0U);
   EXPECT_EQ(r.stats.compared, r.stats.supported);
   for (std::size_t f = 0; f < kFeatureCount; ++f) {
-    if (kSupportedFeatures.Has(static_cast<Feature>(f))) {
+    if (kCountStarOnly.Has(static_cast<Feature>(f))) {
       EXPECT_EQ(r.stats.unsupported_by_feature[f], 0U) << FeatureName(static_cast<Feature>(f));
     }
   }

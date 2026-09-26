@@ -129,13 +129,69 @@ TEST(LiteralTest, ParseDate) {
 
 TEST(LiteralTest, FormatDateRoundTrips) {
   for (const std::string_view text :
-       {"1970-01-01", "1969-12-31", "2022-01-08", "2000-02-29", "0000-01-01", "9999-12-31"}) {
+       {"1970-01-01", "1969-12-31", "2022-01-08", "2000-02-29", "0001-01-01", "9999-12-31"}) {
     const auto days = ParseDate(text);
     EXPECT_EQ(days.has_value() ? FormatDate(*days) : "invalid", text);
   }
-  for (int32_t days = -719528; days <= 2932896; days += 997) {  // 0000-01-01 .. 9999-12-31
+  for (int32_t days = -719162; days <= 2932896; days += 997) {  // 0001-01-01 .. 9999-12-31
     EXPECT_EQ(ParseDate(FormatDate(days)), days) << days;
   }
+}
+
+// Dates outside years 1 to 9999 (e.g. read from a Parquet DATE column) print as DuckDB prints them,
+// for every int32 day number.
+TEST(LiteralTest, FormatDateOutsideTheLiteralRange) {
+  constexpr int32_t kMax = std::numeric_limits<int32_t>::max();
+  EXPECT_EQ(FormatDate(-719163), "0001-12-31 (BC)");  // the day before 0001-01-01
+  EXPECT_EQ(FormatDate(-719528), "0001-01-01 (BC)");  // year 0 is 1 BC
+  EXPECT_EQ(ParseDate("0000-01-01"), -719528);
+  EXPECT_EQ(FormatDate(-1100402), "1044-03-15 (BC)");
+  EXPECT_EQ(FormatDate(2932897), "10000-01-01");
+  EXPECT_EQ(FormatDate(17542962), "50000-12-31");  // beyond std::chrono::year (32767)
+  EXPECT_EQ(FormatDate(kMax - 1), "5881580-07-10");
+  EXPECT_EQ(FormatDate(kMax), "infinity");  // DuckDB's sentinels
+  EXPECT_EQ(FormatDate(-kMax), "-infinity");
+  EXPECT_EQ(FormatDate(-kMax + 1), "5877642-06-25 (BC)");
+  EXPECT_EQ(FormatDate(std::numeric_limits<int32_t>::min()), "5877642-06-23 (BC)");
+}
+
+TEST(LiteralTest, ApproximateNumbers) {
+  // DuckDB reads these as DOUBLE: an exponent, or a decimal wider than DECIMAL(38).
+  for (const std::string_view text :
+       {"1e3", "1E3", "1.5e0", "1.e2", ".5E-1", "1.00000000000000000000000000000000000000001",
+        "0.000000000000000000000000000000000000001", "000000000000000000000000000000000000001.5"}) {
+    EXPECT_TRUE(IsApproximateNumber(text)) << text;
+  }
+  // Exact: integers (of any length) and decimals of at most 38 digits.
+  for (const std::string_view text :
+       {"42", "100000000000000000000000000000000000000000", "1.5", ".5", "5.",
+        "0.0000000000000000000000000000000000001", "9999999999999999999999999999999999999.9"}) {
+    EXPECT_FALSE(IsApproximateNumber(text)) << text;
+  }
+}
+
+TEST(LiteralTest, ExactNumberOf) {
+  const auto summary = [](double value) {
+    const ExactNumber n = ExactNumberOf(value);
+    return std::string(n.negative ? "-" : "") + Summary(n);
+  };
+  EXPECT_EQ(summary(0.0), "0");
+  EXPECT_EQ(summary(-0.0), "0");
+  EXPECT_EQ(summary(1.0), "1");
+  EXPECT_EQ(summary(1.5), "1+");
+  EXPECT_EQ(summary(-1.5), "-1+");
+  EXPECT_EQ(summary(0.25), "0+");
+  EXPECT_EQ(summary(9007199254740992.0), "9007199254740992");
+  EXPECT_EQ(summary(9223372036854775808.0), "9223372036854775808");
+  EXPECT_EQ(summary(0x1p126), "85070591730234615865843651857942052864");
+  EXPECT_EQ(summary(1e38), "99999999999999997748809823456034029568");  // below 10^38
+  EXPECT_EQ(summary(1.0000000000000001e38), "huge");
+  EXPECT_EQ(summary(0x1p127), "huge");
+  EXPECT_EQ(summary(-1e300), "-huge");
+  EXPECT_EQ(summary(std::numeric_limits<double>::infinity()), "huge");
+  EXPECT_EQ(summary(-std::numeric_limits<double>::infinity()), "-huge");
+  EXPECT_EQ(summary(std::numeric_limits<double>::quiet_NaN()), "0");
+  EXPECT_EQ(summary(std::numeric_limits<double>::denorm_min()), "0+");
 }
 
 TEST(LiteralTest, FoldIntegerComparisonTable) {

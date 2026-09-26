@@ -4,11 +4,10 @@ Experimental C++23 analytics engine: SQL-like queries over local Parquet files, 
 
 ## Status
 
-Early bootstrap. The toolchain, build, CI, the module skeleton and the test harness (DuckDB as the oracle, plus data
-tests on the first ClickBench partition) are in place, and the engine answers `SELECT COUNT(*) FROM <table>`
-(ClickBench Q0) from Parquet footer metadata. Next comes a thin SQL slice (global aggregates, simple `WHERE`,
-`LIMIT`) that passes ClickBench Q0, Q1, Q2, Q3 and Q6. [docs/sql-subset.md](docs/sql-subset.md) lists exactly what
-works today.
+Early and experimental. The first SQL slice works: global aggregates (`COUNT`, exact 128-bit `SUM`, `AVG`, `MIN`,
+`MAX`), projections, `WHERE` conjunctions of `column <op> literal` and `LIMIT` over Parquet files, single-threaded,
+with DuckDB as the test oracle. It answers ClickBench Q0, Q1, Q2, Q3 and Q6 like DuckDB.
+[docs/sql-subset.md](docs/sql-subset.md) lists exactly what works today.
 
 ## Quickstart
 
@@ -38,7 +37,8 @@ pixi run antb1 schema --table hits=/data/clickbench/hits_0.parquet --clickbench
 
 SQL that contains single quotes (for example `FROM '/data/t.parquet'`) must be passed with `-f query.sql` or on
 stdin with `-c -`, because pixi does not escape quotes in forwarded arguments. `--format table|csv|json` selects the
-output format and `--timing` prints the elapsed seconds as the last line on stderr.
+output format and `--timing` prints the elapsed seconds as the last line on stderr. `antb1 bench` runs a query file
+and writes ClickBench's result JSON ([docs/benchmarks.md](docs/benchmarks.md)).
 
 Before opening a pull request, run:
 
@@ -55,6 +55,7 @@ pixi run check        # lint + Clang Debug -Werror build + tests
 - [docs/sql-subset.md](docs/sql-subset.md): grammar, types, semantics, exit codes, ClickBench status
 - [docs/testing.md](docs/testing.md): test layers, labels, hermetic rules, data policy
 - [docs/ci.md](docs/ci.md): workflows, required checks, reproducing CI locally
+- [docs/benchmarks.md](docs/benchmarks.md): micro benchmarks, ClickBench runs, published results
 - [docs/adr/README.md](docs/adr/README.md): architecture decision records
 - [SECURITY.md](SECURITY.md): how to report a vulnerability
 

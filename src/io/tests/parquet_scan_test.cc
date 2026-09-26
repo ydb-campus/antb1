@@ -1,6 +1,7 @@
 // ParquetTable::Scan: batches of the engine view (plan::Table::schema()) over every file, row
 // group and batch in order.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -221,6 +222,51 @@ TEST_F(ParquetScanTest, BatchesHoldAtMostBatchSizeRows) {
     EXPECT_EQ(total, 1000) << batch_size;
     EXPECT_EQ(Int64s(*s.table, 0), NumbersA(0, 1000)) << batch_size;
   }
+}
+
+// A scan holds the data of about one row group at a time, whatever the size of the file. Parquet
+// pre-buffering would read coalesced ranges of up to 32 MiB (here: the whole file) and keep every
+// column chunk it has read until the file is closed.
+TEST_F(ParquetScanTest, HoldsAboutOneRowGroupAtATime) {
+  constexpr int64_t kRowGroups = 32;
+  constexpr int64_t kRowsPerGroup = 64;
+  constexpr std::size_t kValueBytes = 1024;  // distinct values: about 64 KiB per column chunk
+  std::string path;
+  {
+    arrow::BinaryBuilder builder;
+    for (int64_t row = 0; row < kRowGroups * kRowsPerGroup; ++row) {
+      std::string value(kValueBytes, static_cast<char>('a' + (row % 26)));
+      value.replace(0, 20, std::to_string(row));
+      ASSERT_TRUE(builder.Append(value).ok());
+    }
+    const auto data = arrow::Table::Make(arrow::schema({arrow::field("v", arrow::binary())}),
+                                         {builder.Finish().ValueOrDie()});
+    path = Write("wide.parquet", data, kRowsPerGroup);
+  }
+  const auto file_bytes = static_cast<int64_t>(fs::file_size(path));
+  auto table = ParquetTable::Open({path});
+  ASSERT_TRUE(table.ok()) << table.status().ToString();
+
+  const arrow::MemoryPool* pool = arrow::default_memory_pool();
+  const int64_t before = pool->bytes_allocated();
+  int64_t most = before;
+  int64_t batches = 0;
+  {
+    auto reader = (*table)->Scan({0}, kRowsPerGroup);
+    ASSERT_TRUE(reader.ok()) << reader.status().ToString();
+    while (true) {
+      std::shared_ptr<arrow::RecordBatch> batch;
+      ASSERT_TRUE((*reader)->ReadNext(&batch).ok());
+      most = std::max(most, pool->bytes_allocated());
+      if (batch == nullptr) {
+        break;
+      }
+      ++batches;
+    }
+  }
+  EXPECT_EQ(batches, kRowGroups);
+  EXPECT_LT(most - before, file_bytes / 4)
+      << "the scan held " << (most - before) << " bytes of a " << file_bytes << "-byte file";
 }
 
 TEST_F(ParquetScanTest, FilesInSortedOrder) {

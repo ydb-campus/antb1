@@ -71,6 +71,10 @@ TEST_F(ParquetTableTest, GlobSumsRowsInSortedOrder) {
   EXPECT_EQ((*table)->exact_row_count(), 7);
   ASSERT_EQ((*table)->files().size(), 2U);
   EXPECT_LT((*table)->files()[0], (*table)->files()[1]);
+  // data_size is the sum of the file sizes (ClickBench's data_size in `antb1 bench`).
+  const auto bytes = fs::file_size((*table)->files()[0]) + fs::file_size((*table)->files()[1]);
+  EXPECT_EQ((*table)->total_bytes(), static_cast<int64_t>(bytes));
+  EXPECT_EQ((*table)->data_size(), (*table)->total_bytes());
 }
 
 TEST_F(ParquetTableTest, DateOverrideChangesEngineType) {
@@ -88,6 +92,27 @@ TEST_F(ParquetTableTest, InvalidOverrideIsRejected) {
   EXPECT_TRUE(ParquetTable::Open({path}, ParquetTableOptions{.overrides = {{.column = "nope"}}})
                   .status()
                   .IsInvalid());
+}
+
+// An override applies to every column its name matches case-insensitively, so each of them must be
+// readable as the new type (not only the first).
+TEST_F(ParquetTableTest, OverrideIsCheckedAgainstEveryMatchingColumn) {
+  arrow::UInt16Builder days;
+  arrow::StringBuilder text;
+  ASSERT_TRUE(days.Append(15'901).ok());
+  ASSERT_TRUE(text.Append("x").ok());
+  const auto table = arrow::Table::Make(
+      arrow::schema({arrow::field("d", arrow::uint16()), arrow::field("D", arrow::utf8())}),
+      {days.Finish().ValueOrDie(), text.Finish().ValueOrDie()});
+  const std::string path = (dir_ / "cases.parquet").string();
+  auto out = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+  ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), out, 1).ok());
+  ASSERT_TRUE(out->Close().ok());
+
+  const auto opened =
+      ParquetTable::Open({path}, ParquetTableOptions{.overrides = {{.column = "d"}}});
+  ASSERT_TRUE(opened.status().IsInvalid()) << opened.status().ToString();
+  EXPECT_NE(opened.status().message().find("'D'"), std::string::npos) << opened.status().message();
 }
 
 TEST_F(ParquetTableTest, SchemaMismatchIsIOError) {

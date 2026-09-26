@@ -305,7 +305,30 @@ INSTANTIATE_TEST_SUITE_P(
                  RangeOf(LogicalType::kHugeInt).max},
         FoldCase{"h < 100000000000000000000000000000000000000", kIsNotNull},
         FoldCase{"h > -100000000000000000000000000000000000000", kIsNotNull},
-        FoldCase{"h >= 1e38", kFalse}));
+        // 1e38 is a DOUBLE (below 10^38): h >= 99999999999999997748809823456034029568.
+        FoldCase{"h >= 1e38", kCompare, CompareOp::kGe, static_cast<Int128>(1e38)},
+        FoldCase{"h >= 1.0000000000000001e38", kFalse}));
+
+// Numbers that DuckDB reads as DOUBLE (an exponent, or a decimal of more than 38 digits) are
+// rounded to the nearest double first, then folded exactly (divergence D7).
+INSTANTIATE_TEST_SUITE_P(
+    ApproximateNumbers, FoldThroughBinderTest,
+    ::testing::Values(
+        FoldCase{"i16 = 1.0000000000000000000001e0", kCompare, CompareOp::kEq, 1},
+        FoldCase{"i16 = 1.00000000000000000000000000000000000000001", kCompare, CompareOp::kEq, 1},
+        FoldCase{"i16 < 1.00000000000000000000000000000000000000001", kCompare, CompareOp::kLt, 1},
+        FoldCase{"i16 <= 0.99999999999999999999999999999999999999999", kCompare, CompareOp::kLe, 1},
+        FoldCase{"i16 > -0.99999999999999999999999999999999999999999", kCompare, CompareOp::kGt,
+                 -1},
+        FoldCase{"i16 > 1.5e0", kCompare, CompareOp::kGe, 2}, FoldCase{"i16 = 1.5e0", kFalse},
+        FoldCase{"u16 < 65535.9999999999999999999999999999999999999", kIsNotNull},  // < 65536
+        FoldCase{"i64 = 1e3", kCompare, CompareOp::kEq, 1000},
+        FoldCase{"i64 > 9007199254740993e0", kCompare, CompareOp::kGt, 9007199254740992},
+        FoldCase{"i64 >= 9223372036854775808e0", kFalse}, FoldCase{"i64 < 1e400", kIsNotNull},
+        FoldCase{"i64 > -1e400", kIsNotNull}, FoldCase{"i64 = 1e-400", kCompare, CompareOp::kEq, 0},
+        // At most 38 digits: an exact DECIMAL, as in DuckDB.
+        FoldCase{"i16 = 1.0000000000000000000000000000000000001", kFalse},
+        FoldCase{"i16 < 1.0000000000000000000000000000000000001", kCompare, CompareOp::kLe, 1}));
 
 }  // namespace
 }  // namespace antb1::plan

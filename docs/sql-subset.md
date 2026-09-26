@@ -8,29 +8,29 @@ This page is the contract: a PR that changes SQL behavior updates it in the same
 
 ## What works today
 
-The whole grammar below is parsed and bound: names resolve, types are checked and `WHERE` literals are folded
-([Binding](#binding)), and `antb1 explain` prints the optimized logical plan of any such query
-([Logical plans and EXPLAIN](#logical-plans-and-explain)). The executor answers one query shape so far, ClickBench
-Q0:
+Every query of the [grammar](#grammar) below runs: global aggregates, projections (`*` or columns), a `WHERE`
+conjunction of `column <op> literal` comparisons and `LIMIT`, over one table of Parquet files. This covers
+ClickBench Q0, Q1, Q2, Q3 and Q6 (see [ClickBench status](#clickbench-status)).
 
 ```sql
-SELECT COUNT(*) [[AS] alias] FROM <table> [;]
+SELECT COUNT(*), SUM(ResolutionWidth) AS width, AVG(UserID), MAX(EventDate) FROM hits WHERE IsMobile = 1
+SELECT WatchID, URL FROM hits WHERE RegionID < 300 AND SearchPhrase <> '' LIMIT 10
+SELECT * FROM '/data/hits_*.parquet' LIMIT 5
 ```
 
-- `<table>` is a table registered with `--table NAME=PATH[,PATH|GLOB]` (an identifier or a `"quoted identifier"`,
-  matched ASCII case-insensitively) or a string literal with a path or glob, e.g. `FROM '/data/hits_*.parquet'`.
-- The answer comes from the Parquet footers (the sum of their row counts); no data pages are read. The result is one
-  BIGINT column named `count_star()` (or the alias), as in DuckDB.
+- The table is registered with `--table NAME=PATH[,PATH|GLOB]` (an identifier or a `"quoted identifier"`, matched
+  ASCII case-insensitively) or given as a string literal with a path or glob, e.g. `FROM '/data/hits_*.parquet'`.
+- Only the columns a query references are decoded. `COUNT(*)` without `WHERE` is answered from the Parquet footers
+  (no data page is read); under `WHERE` it counts the rows the filter selects without copying them.
+- Result names and types follow DuckDB ([Binding](#binding)); values follow the [Semantics](#semantics) below.
 - `--` line comments, `/* block */` comments and one trailing `;` are allowed.
-- Any other query of the grammar binds, then fails with exit code 4 ("cannot be executed yet") until the executor
-  reads table data: a `WHERE`, plain columns, `*`, the other aggregates or `LIMIT`.
-- Other statements and clauses outside the grammar (`GROUP BY`, `JOIN`, ...) fail with exit code 4 and point at the
-  first unsupported token.
-- Malformed SQL (a syntax error) and SQL that is wrong for the table (a bind error) fail with exit code 1.
+- SQL outside the grammar (`GROUP BY`, `ORDER BY`, `JOIN`, `OR`, functions, ...) fails with exit code 4 and points
+  at the first unsupported token. Malformed SQL (a syntax error) and SQL that is wrong for the table (a bind error)
+  fail with exit code 1.
 
 ```bash
-pixi run antb1 query -c "SELECT COUNT(*) FROM hits" --table hits=/data/clickbench/hits_0.parquet
-pixi run antb1 explain -c "SELECT COUNT(*) FROM hits" --table hits=/data/clickbench/hits_0.parquet
+pixi run antb1 query -f query.sql --table hits=/data/clickbench/hits_0.parquet --clickbench
+pixi run antb1 explain -f query.sql --table hits=/data/clickbench/hits_0.parquet --clickbench
 ```
 
 Globs are allowed in the file-name part of a path only (`/data/hits_*.parquet`, not `/data/*/hits.parquet`) and
@@ -38,8 +38,8 @@ expand to a sorted file list. All files of a table must have the same schema (di
 
 ## Grammar
 
-The parser accepts this grammar and the binder checks it against the tables; the executor implements it step by
-step. Keywords are case-insensitive.
+The parser accepts this grammar, the binder checks it against the tables and the executor runs it. Keywords are
+case-insensitive.
 
 ```ebnf
 statement   = query , [ ";" ] ;
@@ -92,7 +92,7 @@ Literals in `WHERE` must fit the column's type; any other combination is a bind 
 | Column type | Literals | Compared as |
 | --- | --- | --- |
 | SMALLINT, INTEGER, BIGINT, USMALLINT, HUGEINT | integer, decimal | exactly, after folding (below) |
-| DOUBLE | integer, decimal | the nearest double, as in DuckDB; beyond the double range `inf` or `-inf`, below the smallest subnormal `0` |
+| DOUBLE | integer, decimal | the nearest double, as in DuckDB for a DOUBLE column; beyond the double range `inf` or `-inf`, below the smallest subnormal `0`. A FLOAT column is read as DOUBLE and compared the same way, in double precision, where DuckDB compares most literals in FLOAT (divergence D11) |
 | VARCHAR | string | bytes |
 | DATE | string, `DATE` string | a date written exactly `YYYY-MM-DD` (years 0000 to 9999) that exists in the calendar |
 
@@ -101,6 +101,9 @@ A comparison of an integer column with a number is folded exactly at bind time, 
 - A decimal that is not an integer becomes the nearest integer on the side the comparison keeps: `c > 1.5` and
   `c >= 1.5` become `c >= 2`, `c < -1.5` and `c <= -1.5` become `c <= -2`. `c = 1.5` is never true and `c <> 1.5` is
   true for every value. Decimals with an integer value compare as that integer (`c = 2.0`, `c > 1e3`).
+- A number that DuckDB types as DOUBLE, one with an exponent (`1e3`) or a decimal of more than 38 digits (leading
+  zeros count), is first rounded to the nearest double, as in DuckDB, and that double is folded exactly:
+  `c = 1.0000000000000000000001e0` is `c = 1` (divergence D7 for BIGINT values beyond 2^53).
 - A number outside the column type's range (SMALLINT -32768 to 32767, USMALLINT 0 to 65535, INTEGER and BIGINT
   their 32-bit and 64-bit ranges, HUGEINT -(10^38 - 1) to 10^38 - 1) makes the comparison true for every value or
   for none, depending on the operator: `smallint_col < 40000` is always true, `usmallint_col = -1` never.
@@ -137,7 +140,7 @@ Aggregate COUNT(*), SUM(ResolutionWidth)
 | INT64 | int64 | BIGINT | |
 | INT32 annotated INT(16, unsigned) | uint16 | USMALLINT | read as DATE with `--clickbench` (EventDate) or `--column-type COL=DATE` |
 | INT32 annotated DATE | date32 | DATE | |
-| FLOAT | float | DOUBLE | widened on read |
+| FLOAT | float | DOUBLE | widened exactly on read; results and `WHERE` comparisons are DOUBLE (divergence D11) |
 | DOUBLE | double | DOUBLE | |
 | BYTE_ARRAY, unannotated | binary | VARCHAR | compared byte-wise |
 | BYTE_ARRAY annotated STRING (UTF8) | utf8 | VARCHAR | same engine representation as unannotated |
@@ -146,13 +149,13 @@ Aggregate COUNT(*), SUM(ResolutionWidth)
 
 `--column-type COL=DATE` reinterprets a USMALLINT or INTEGER column as days since 1970-01-01; `--clickbench` is a
 shortcut for `EventDate`. Both apply to every table (registered or opened with `FROM 'path'`) that has a column with
-exactly that name; for now `COL` is matched case-sensitively, and tables without the column are left unchanged. The
-test oracle handles `FROM 'path'` differently (divergence D2 below).
+that name, matched ASCII case-insensitively like every column name (all columns it matches must be readable as DATE),
+and tables without the column are left unchanged. The test oracle handles `FROM 'path'` differently (divergence D2
+below).
 
 ## Semantics
 
-The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.md)). Items marked "slice" are
-decided, and the binder already types them, but the executor does not run them yet.
+The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.md)).
 
 - Identifiers: table and column names match ASCII case-insensitively, quoted identifiers included (as in DuckDB).
   Registering two tables whose names differ only in case is a usage error (exit code 2). A name that matches two
@@ -161,16 +164,24 @@ decided, and the binder already types them, but the executor does not run them y
   ([Binding](#binding)). A literal outside the column type's range turns the comparison into constant true or false
   for non-NULL values; NULL values still compare as NULL. A decimal literal compared with an integer column becomes
   an equivalent integer comparison: `c > 1.5` becomes `c >= 2`, and `c = 1.5` is never true.
+- WHERE: the comparisons are evaluated with Arrow's comparison kernels and combined with Kleene AND; a row passes
+  only when every comparison is true, so a comparison that is NULL rejects it. VARCHAR compares byte-wise and DATE
+  chronologically. A predicate folded to never-true reads no data at all.
 - COUNT: `COUNT(*)` counts rows; `COUNT(col)` counts non-NULL values. Both return BIGINT.
-- SUM (slice): over integer columns it accumulates in 128 bits and returns HUGEINT (decimal128(38, 0)), exactly like
-  DuckDB, so it never overflows or wraps. Over DOUBLE it returns DOUBLE.
-- AVG (slice): over integer columns the sum accumulates exactly in 128 bits and is divided by the count once at the
-  end, so the DOUBLE result is accurate to about one ulp (the oracle tests use a tight relative tolerance). Over
-  DOUBLE it returns DOUBLE.
-- MIN and MAX (slice): return the input type; VARCHAR compares byte-wise and DATE chronologically. Under `WHERE` only
-  the selected rows are considered.
+- SUM: over integer columns it accumulates in 128 bits and returns HUGEINT (decimal128(38, 0)), exactly like
+  DuckDB, so it never overflows or wraps; Arrow's 64-bit `sum` kernel is never used. A sum outside HUGEINT's range
+  (only possible over a HUGEINT column) is an execution error (divergence D9). Over DOUBLE it returns DOUBLE, adding
+  the values in row order.
+- AVG: over integer columns the sum accumulates exactly in 128 bits and is divided by the count once at the end, so
+  the DOUBLE result is accurate to about one ulp (the oracle tests use a tight relative tolerance). Over DOUBLE it
+  returns DOUBLE.
+- MIN and MAX: return the input type; VARCHAR compares byte-wise and DATE chronologically. They use Arrow's
+  `min_max` kernel, over only the selected rows under `WHERE` (divergence D10 for NaN).
 - NULL: aggregates skip NULLs. Over zero input rows `COUNT` returns 0 and `SUM`, `AVG`, `MIN` and `MAX` return NULL.
   A predicate that evaluates to NULL rejects the row.
+- LIMIT: the first `n` rows in file and row group order; the scan stops as soon as `n` rows are out. `LIMIT 0`
+  returns no row, also for an aggregate. Without `LIMIT` a projection returns its rows in file order too, but SQL
+  does not promise an order, and the tests compare projections without regard to order.
 - VARCHAR: values are raw bytes. Unannotated BYTE_ARRAY columns (as in ClickBench) are VARCHAR and are never
   validated as UTF-8.
 - Execution: single-threaded, files and row groups in order, 64Ki-row batches; results are deterministic.
@@ -181,11 +192,13 @@ decided, and the binder already types them, but the executor does not run them y
 formatter:
 
 - integers (HUGEINT included) exactly; DOUBLE as the shortest round-trip form (`nan`, `inf`, `-inf` for non-finite
-  values); DATE as `YYYY-MM-DD`; VARCHAR as its raw bytes;
+  values); DATE as `YYYY-MM-DD`, and like DuckDB outside years 1 to 9999: `YYYY-MM-DD (BC)` before year 1, more year
+  digits after 9999, `infinity` and `-infinity` for DuckDB's sentinel day numbers; VARCHAR as its raw bytes;
 - NULL as `NULL` in `table`, an empty field in `csv` and `null` in `json`;
 - `csv` has a header row and RFC 4180 quoting, with LF line endings; `json` is an array of objects, where numbers are
-  JSON numbers except HUGEINT and non-finite doubles, which are strings (exactness), and invalid UTF-8 bytes in
-  strings are written as the text `\xHH`.
+  JSON numbers except HUGEINT and non-finite doubles, which are strings (exactness), and every byte of ill-formed
+  UTF-8 in strings (RFC 3629, so also overlong forms, surrogates and code points above U+10FFFF) is written as the
+  text `\xHH` with lowercase hex digits, so the output is always valid UTF-8; `table` and `csv` write the raw bytes.
 
 `--timing` prints the elapsed seconds in fixed-point notation (for example `0.003620`) as the last line on stderr.
 
@@ -194,10 +207,10 @@ formatter:
 | Code | Meaning | Examples |
 | --- | --- | --- |
 | 0 | success | |
-| 1 | query error: syntax, bind or execution error | `SELECT COUNT(*) FORM t`; an unknown table or column; `SUM` of a VARCHAR column |
+| 1 | query error: syntax, bind or execution error | `SELECT COUNT(*) FORM t`; an unknown table or column; `SUM` of a VARCHAR column; a `SUM` outside HUGEINT's range |
 | 2 | usage error | unknown option; neither or both of `-c` and `-f`; a malformed `--table` or `--column-type`; a column that `--column-type` cannot read as DATE; a table name registered twice |
 | 3 | I/O error | a missing or unreadable file; not a Parquet file; schemas that differ; a glob that matches nothing |
-| 4 | unsupported: valid-looking SQL outside the supported subset | `GROUP BY`; a column of an unsupported type; for now every query but `COUNT(*)` without `WHERE`, which the executor cannot run yet |
+| 4 | unsupported: valid-looking SQL outside the supported subset | `GROUP BY`; `ORDER BY`; `OR`; a function call; a column of an unsupported type |
 | 70 | internal error: anything else, which is a bug | an uncaught exception; an Arrow `NotImplemented` or type error without SQL context |
 
 Exit code 4 is used only for errors that the parser, the binder or the physical planner marks as unsupported
@@ -212,7 +225,9 @@ errors such as an unknown option are always reported as plain text by CLI11):
 {"error":{"kind":"bind","message":"table 'nope' does not exist","offset":21,"length":4,"line":1,"column":22}}
 ```
 
-The kinds are `parse`, `unsupported`, `bind`, `io`, `execution` and `internal`.
+The kinds are `parse`, `unsupported`, `bind`, `io`, `execution`, `internal` and, for command-line errors (exit code 2),
+`usage`. Strings in the error object (and in the `antb1 bench` report) are escaped like `--format json` values, so it is
+valid UTF-8 whatever bytes the SQL holds.
 
 ## Divergences from DuckDB
 
@@ -227,13 +242,13 @@ compare against DuckDB, so an unregistered difference is a bug.
 | D4 | Literal types | a number or a `DATE` literal compared with a VARCHAR column is a bind error | casts the column's values at run time (a conversion error unless every value converts) | as D3; the generator writes strings for VARCHAR columns |
 | D5 | Date literals | a date must be written exactly `YYYY-MM-DD` | also accepts `2013-7-1`, surrounding spaces and a time of day | as D3; the generator writes `YYYY-MM-DD` |
 | D6 | AVG of DATE | `AVG` of a DATE column is a bind error | returns a TIMESTAMP | as D3; the generator averages numeric columns only |
-| D7 | Exponent literals | a number with an exponent (`1e3`) compared with an integer column is compared exactly | reads it as a DOUBLE and compares in DOUBLE, which differs only for values beyond 2^53 | the generator writes no exponents |
+| D7 | DOUBLE literals and BIGINT | a number that DuckDB types as DOUBLE (an exponent, or more than 38 digits) is rounded to the nearest double like in DuckDB, then compared exactly with the integer column | converts BIGINT (and HUGEINT) values to DOUBLE for the comparison, so values beyond 2^53 compare rounded: `i64 >= 9223372036854775808e0` holds for `9223372036854775807` | the `.slt` records with such literals avoid BIGINT values beyond 2^53 (`tests/slt/cases/where/folding.slt`); `plan.ApproximateNumbers/FoldThroughBinderTest.*` pins antb1's folding; the generator writes no exponents |
 | D8 | Result names | an aggregate's argument is quoted when it is not a plain identifier or is a reserved word | also quotes non-reserved keywords (`sum("year")`) | the tests compare values and types, not names |
-
-Known candidates, to be confirmed and registered by the PR that implements the feature:
-
-- FLOAT columns are read as DOUBLE, so values print with double precision; the oracle casts FLOAT to DOUBLE.
-- Arrow's `min_max` ignores NaN, while DuckDB orders NaN above every other value; test fixtures contain no NaN.
+| D9 | HUGEINT range | HUGEINT is decimal128(38, 0): a `SUM` outside -(10^38 - 1) to 10^38 - 1 is an execution error (exit code 1). An integer SUM over BIGINT or smaller types cannot reach it | HUGEINT holds -(2^127 - 1) to 2^127 - 1 | no fixture has a HUGEINT column; `exec.AggregateStateTest.HugeIntSumIsCheckedAgainstTheRange` checks the error |
+| D10 | NaN | MIN and MAX ignore NaN like Arrow's `min_max`, whatever the batch and file boundaries: they return NaN only when every selected non-NULL value is NaN (so only MAX over NaN and other values differs from DuckDB). Arrow's comparison kernels follow IEEE 754: NaN compares unequal to everything, so `d > 1` and `d >= 1` are false for NaN | orders NaN above every other value and equal to itself: MIN and MAX return NaN when it is the extreme, `d > 1` is true for NaN | the fixtures contain no NaN (fixturegen builds doubles from integer ratios); `exec.AggregateStateTest.MinMaxOfDoublesIgnoreNaNInEveryBatchSplit` and `engine.SessionTest.MinMaxIgnoreNaNAcrossBatchesAndFiles` pin antb1's MIN and MAX |
+| D11 | FLOAT columns | read as DOUBLE (widened exactly): results are DOUBLE and print with double precision, and `WHERE` compares in double precision against the literal's nearest double, so a stored FLOAT `0.1` (`0.10000000149011612`) passes `f > 0.1` and fails `f = 0.1` | keeps FLOAT (`MIN`, `MAX` and projections return FLOAT) and rounds an integer literal from -2^127 to 2^128 - 1 or a DECIMAL literal to FLOAT, comparing in FLOAT: the stored `0.1` passes `f = 0.1`, a stored `16777216` passes `f = 16777217` (a long DECIMAL does not always round to the nearest FLOAT: `0.1` written with 24 decimals gives `0.099999994`). A literal it types as DOUBLE (an exponent, a decimal of more than 38 digits or an integer outside that range) compares in DOUBLE, as in antb1 | the random generator never references a FLOAT column (`ColumnOf` in `tests/slt/runner/query_gen.cc`, `harness.LoadGenTables.SkipsFloatColumns`); `engine.SessionTest.FloatColumnsCompareInDoublePrecision` pins antb1's answers; no fixture has a FLOAT column |
+| D12 | Long numbers against DOUBLE | a number compared with a DOUBLE column is the correctly rounded nearest double | converts a DECIMAL literal (at most 38 digits) or a HUGEINT literal to DOUBLE in two steps when its digits exceed 2^53, which can be one ulp off (`9007199254740993.5`) | the generator only writes decimals of at most 2^53 in their digits with at most 22 decimals, where both round the same (`ExactDecimalDouble` in `tests/slt/runner/query_gen.cc`) |
+| D13 | Decimals with many digits against integer columns | compared exactly | compares in a DECIMAL whose width is capped at 38 digits: when the column type's digits plus the literal's decimals exceed 38, a column value with too many integer digits fails the query with a conversion error (`i16 = 1.0000000000000000000000000000000000001` over the value -32768) | the `.slt` records and the generator keep literals short enough; `plan.Binder/FoldThroughBinderTest.*` covers the exact folding |
 
 ## ClickBench status
 
@@ -244,14 +259,14 @@ query text itself is never committed. The data test `data.clickbench.status` (`p
 with DuckDB and fails when the passing queries differ from the ratchet `tests/data/clickbench_status.json`. `pass`
 below means exactly the ratchet (`pixi run lint` compares them); the PR that changes the pass set updates both
 ([testing.md](testing.md#the-clickbench-ratchet)). Every other query must fail cleanly (exit code 4, or a parse or
-bind error); today all of them answer Unsupported.
+bind error); today all of them answer Unsupported with exit code 4.
 
 | Query | Status | Notes |
 | --- | --- | --- |
-| Q0 | pass | answered from the Parquet footer row counts; equal to DuckDB on `hits_0` |
-| Q1 | target | slice |
-| Q2 | target | slice |
-| Q3 | target | slice |
-| Q6 | target | slice |
-| Q19 | not a target | fits the grammar, so it may pass incidentally; recorded only if verified |
-| all others | out of scope | need GROUP BY, ORDER BY, LIKE, functions or other rejected syntax; they must fail cleanly |
+| Q0 | pass | `COUNT(*)`: answered from the Parquet footer row counts |
+| Q1 | pass | `COUNT(*)` under a `WHERE` comparison: the true count of the filter's selection |
+| Q2 | pass | `SUM` (HUGEINT), `COUNT(*)` and `AVG` in one scan of the referenced columns |
+| Q3 | pass | `AVG` of a BIGINT column: exact 128-bit sum, one division |
+| Q6 | pass | `MIN` and `MAX` of `EventDate` read as DATE (`--clickbench`) |
+| Q19 | pass | not a target: a projection under a `WHERE` comparison; fits the grammar and passes incidentally |
+| all others | out of scope | need GROUP BY, ORDER BY, LIKE, functions or other rejected syntax; they fail cleanly with exit code 4 |
