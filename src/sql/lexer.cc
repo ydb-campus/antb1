@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "antb1/common/source_span.h"
+#include "antb1/common/utf8.h"
 #include "antb1/sql/error.h"
 #include "antb1/sql/token.h"
 
@@ -42,37 +43,6 @@ bool IsDigitOfBase(char c, char base) {
     default:  // 'B'
       return c == '0' || c == '1';
   }
-}
-
-// Length of the well-formed UTF-8 encoded character (2-4 bytes) starting at text[i], or 0.
-std::size_t Utf8Length(std::string_view text, std::size_t i) {
-  const auto lead = static_cast<unsigned char>(text[i]);
-  std::size_t length = 0;
-  unsigned char min_second = 0x80;
-  unsigned char max_second = 0xBF;
-  if (lead >= 0xC2 && lead <= 0xDF) {
-    length = 2;
-  } else if (lead >= 0xE0 && lead <= 0xEF) {
-    length = 3;
-    min_second = lead == 0xE0 ? 0xA0 : 0x80;  // no overlong forms
-    max_second = lead == 0xED ? 0x9F : 0xBF;  // no surrogates
-  } else if (lead >= 0xF0 && lead <= 0xF4) {
-    length = 4;
-    min_second = lead == 0xF0 ? 0x90 : 0x80;
-    max_second = lead == 0xF4 ? 0x8F : 0xBF;  // at most U+10FFFF
-  } else {
-    return 0;
-  }
-  if (length > text.size() - i) {
-    return 0;
-  }
-  for (std::size_t k = 1; k < length; ++k) {
-    const auto byte = static_cast<unsigned char>(text[i + k]);
-    if (byte < (k == 1 ? min_second : 0x80) || byte > (k == 1 ? max_second : 0xBF)) {
-      return 0;
-    }
-  }
-  return length;
 }
 
 std::unexpected<ParseError> Error(std::string message, std::size_t offset, std::size_t length) {
@@ -405,7 +375,7 @@ std::expected<Token, ParseError> Lexer::Next() {
       break;
   }
   pos_ = n;
-  if (const std::size_t length = Utf8Length(text, start); length > 0) {
+  if (const std::size_t length = Utf8SequenceLength(text, start); length > 0) {
     return Unsupported("unquoted non-ASCII names are not supported (double-quote the name)", start,
                        length);
   }
