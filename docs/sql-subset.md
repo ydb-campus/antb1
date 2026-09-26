@@ -92,7 +92,7 @@ Literals in `WHERE` must fit the column's type; any other combination is a bind 
 | Column type | Literals | Compared as |
 | --- | --- | --- |
 | SMALLINT, INTEGER, BIGINT, USMALLINT, HUGEINT | integer, decimal | exactly, after folding (below) |
-| DOUBLE | integer, decimal | the nearest double, as in DuckDB; beyond the double range `inf` or `-inf`, below the smallest subnormal `0` |
+| DOUBLE | integer, decimal | the nearest double, as in DuckDB for a DOUBLE column; beyond the double range `inf` or `-inf`, below the smallest subnormal `0`. A FLOAT column is read as DOUBLE and compared the same way, in double precision, where DuckDB compares most literals in FLOAT (divergence D11) |
 | VARCHAR | string | bytes |
 | DATE | string, `DATE` string | a date written exactly `YYYY-MM-DD` (years 0000 to 9999) that exists in the calendar |
 
@@ -140,7 +140,7 @@ Aggregate COUNT(*), SUM(ResolutionWidth)
 | INT64 | int64 | BIGINT | |
 | INT32 annotated INT(16, unsigned) | uint16 | USMALLINT | read as DATE with `--clickbench` (EventDate) or `--column-type COL=DATE` |
 | INT32 annotated DATE | date32 | DATE | |
-| FLOAT | float | DOUBLE | widened on read |
+| FLOAT | float | DOUBLE | widened exactly on read; results and `WHERE` comparisons are DOUBLE (divergence D11) |
 | DOUBLE | double | DOUBLE | |
 | BYTE_ARRAY, unannotated | binary | VARCHAR | compared byte-wise |
 | BYTE_ARRAY annotated STRING (UTF8) | utf8 | VARCHAR | same engine representation as unannotated |
@@ -244,7 +244,7 @@ compare against DuckDB, so an unregistered difference is a bug.
 | D8 | Result names | an aggregate's argument is quoted when it is not a plain identifier or is a reserved word | also quotes non-reserved keywords (`sum("year")`) | the tests compare values and types, not names |
 | D9 | HUGEINT range | HUGEINT is decimal128(38, 0): a `SUM` outside -(10^38 - 1) to 10^38 - 1 is an execution error (exit code 1). An integer SUM over BIGINT or smaller types cannot reach it | HUGEINT holds -(2^127 - 1) to 2^127 - 1 | no fixture has a HUGEINT column; `exec.AggregateStateTest.HugeIntSumIsCheckedAgainstTheRange` checks the error |
 | D10 | NaN | MIN and MAX ignore NaN like Arrow's `min_max`, whatever the batch and file boundaries: they return NaN only when every selected non-NULL value is NaN (so only MAX over NaN and other values differs from DuckDB). Arrow's comparison kernels follow IEEE 754: NaN compares unequal to everything, so `d > 1` and `d >= 1` are false for NaN | orders NaN above every other value and equal to itself: MIN and MAX return NaN when it is the extreme, `d > 1` is true for NaN | the fixtures contain no NaN (fixturegen builds doubles from integer ratios); `exec.AggregateStateTest.MinMaxOfDoublesIgnoreNaNInEveryBatchSplit` and `engine.SessionTest.MinMaxIgnoreNaNAcrossBatchesAndFiles` pin antb1's MIN and MAX |
-| D11 | FLOAT columns | read as DOUBLE: results of FLOAT columns are DOUBLE and print with double precision | keeps FLOAT (`MIN`, `MAX` and projections return FLOAT) | no fixture has a FLOAT column |
+| D11 | FLOAT columns | read as DOUBLE (widened exactly): results are DOUBLE and print with double precision, and `WHERE` compares in double precision against the literal's nearest double, so a stored FLOAT `0.1` (`0.10000000149011612`) passes `f > 0.1` and fails `f = 0.1` | keeps FLOAT (`MIN`, `MAX` and projections return FLOAT) and rounds an integer literal (up to 2^128 - 1) or a DECIMAL literal to FLOAT, comparing in FLOAT: the stored `0.1` passes `f = 0.1`, a stored `16777216` passes `f = 16777217`. A literal it types as DOUBLE (an exponent, a decimal of more than 38 digits or an integer of 2^128 or more) compares in DOUBLE, as in antb1 | the random generator never references a FLOAT column (`ColumnOf` in `tests/slt/runner/query_gen.cc`, `harness.LoadGenTables.SkipsFloatColumns`); `engine.SessionTest.FloatColumnsCompareInDoublePrecision` pins antb1's answers; no fixture has a FLOAT column |
 | D12 | Long numbers against DOUBLE | a number compared with a DOUBLE column is the correctly rounded nearest double | converts a DECIMAL literal (at most 38 digits) or a HUGEINT literal to DOUBLE in two steps when its digits exceed 2^53, which can be one ulp off (`9007199254740993.5`) | the generator only writes decimals of at most 2^53 in their digits with at most 22 decimals, where both round the same (`ExactDecimalDouble` in `tests/slt/runner/query_gen.cc`) |
 | D13 | Decimals with many digits against integer columns | compared exactly | compares in a DECIMAL whose width is capped at 38 digits: when the column type's digits plus the literal's decimals exceed 38, a column value with too many integer digits fails the query with a conversion error (`i16 = 1.0000000000000000000000000000000000001` over the value -32768) | the `.slt` records and the generator keep literals short enough; `plan.Binder/FoldThroughBinderTest.*` covers the exact folding |
 

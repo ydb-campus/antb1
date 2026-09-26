@@ -3,14 +3,19 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <filesystem>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include <arrow/api.h>
+#include <arrow/io/file.h>
 #include <gtest/gtest.h>
+#include <parquet/arrow/writer.h>
 
 #include "canonical.h"
 #include "supported_features.h"
+#include "tables.h"
 
 namespace antb1::slt {
 namespace {
@@ -139,6 +144,42 @@ TEST(QueryGenerator, MakeRejectsWhatCannotBeGenerated) {
   EXPECT_FALSE(
       QueryGenerator::Make(only_paths, 1, {.supported = {Feature::kCountStar, Feature::kTablePath}})
           .has_value());
+}
+
+// antb1 reads FLOAT as DOUBLE, DuckDB keeps FLOAT and compares literals with it in FLOAT
+// (divergence D11): a FLOAT column is never referenced, and its table gets no SELECT *.
+TEST(LoadGenTables, SkipsFloatColumns) {
+  const std::filesystem::path dir =
+      std::filesystem::path(::testing::TempDir()) / "antb1_query_gen_float";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  const std::string path = (dir / "t.parquet").string();
+  arrow::Int32Builder i;
+  arrow::FloatBuilder f;
+  arrow::DoubleBuilder d;
+  for (int v = 0; v < 3; ++v) {
+    ASSERT_TRUE(i.Append(v).ok());
+    ASSERT_TRUE(f.Append(0.1F * static_cast<float>(v)).ok());
+    ASSERT_TRUE(d.Append(0.5 * v).ok());
+  }
+  const auto table = arrow::Table::Make(
+      arrow::schema({arrow::field("i", arrow::int32()), arrow::field("f", arrow::float32()),
+                     arrow::field("d", arrow::float64())}),
+      {i.Finish().ValueOrDie(), f.Finish().ValueOrDie(), d.Finish().ValueOrDie()});
+  auto out = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+  ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), out, 3).ok());
+  ASSERT_TRUE(out->Close().ok());
+
+  const auto tables = LoadGenTables({TableDef{.name = "t", .files = {path}, .patterns = {path}}});
+  ASSERT_TRUE(tables.has_value()) << tables.error();
+  ASSERT_EQ(tables->size(), 1U);
+  std::vector<std::string> names;
+  for (const auto& c : tables->front().columns) {
+    names.push_back(c.name);
+  }
+  EXPECT_EQ(names, (std::vector<std::string>{"i", "d"}));
+  EXPECT_TRUE(tables->front().other_columns);
+  std::filesystem::remove_all(dir);
 }
 
 }  // namespace

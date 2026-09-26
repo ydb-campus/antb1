@@ -212,9 +212,9 @@ TEST_F(SessionTest, MinMaxIgnoreNaNAcrossBatchesAndFiles) {
   const std::string a = (dir_ / "a.parquet").string();
   const std::string b = (dir_ / "b.parquet").string();
   const std::string c = (dir_ / "c.parquet").string();
-  WriteDoubles(a, {kNaN, kNaN, kNaN, 5}, 0);  // k 0 to 3
-  WriteDoubles(b, {2, kNaN}, 4);              // k 4 and 5
-  WriteDoubles(c, {kNaN, kNaN}, 6);           // k 6 and 7
+  ASSERT_NO_FATAL_FAILURE(WriteDoubles(a, {kNaN, kNaN, kNaN, 5}, 0));  // k 0 to 3
+  ASSERT_NO_FATAL_FAILURE(WriteDoubles(b, {2, kNaN}, 4));              // k 4 and 5
+  ASSERT_NO_FATAL_FAILURE(WriteDoubles(c, {kNaN, kNaN}, 6));           // k 6 and 7
   const std::vector<std::pair<std::string, std::vector<std::string>>> queries = {
       {"", {"2", "5", "2", "5"}},
       {" WHERE k <> 4", {"5", "5", "5", "5"}},  // keeps only the NaN of b
@@ -235,6 +235,44 @@ TEST_F(SessionTest, MinMaxIgnoreNaNAcrossBatchesAndFiles) {
       }
     }
   }
+}
+
+// Divergence D11 (docs/sql-subset.md): a FLOAT column is widened exactly to DOUBLE, so its results
+// are DOUBLE and WHERE compares it in double precision with the literal's nearest double. DuckDB
+// rounds an integer or DECIMAL literal to FLOAT and compares in FLOAT (0.1F = 0.1 and
+// 16777216F = 16777217 hold there); a number it types as DOUBLE (1e-1) compares in DOUBLE, as here.
+TEST_F(SessionTest, FloatColumnsCompareInDoublePrecision) {
+  const std::string path = (dir_ / "floats.parquet").string();
+  arrow::FloatBuilder f;
+  for (const float v : {0.1F, 0.2F, 16777216.0F}) {
+    ASSERT_TRUE(f.Append(v).ok());
+  }
+  ASSERT_TRUE(f.AppendNull().ok());
+  const auto table = arrow::Table::Make(arrow::schema({arrow::field("f", arrow::float32())}),
+                                        {f.Finish().ValueOrDie()});
+  auto out = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+  ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), out, 4).ok());
+  ASSERT_TRUE(out->Close().ok());
+
+  auto session = Session::Make().ValueOrDie();
+  ASSERT_TRUE(session->RegisterParquet("floats", {path}).ok());
+  auto count = [&session](const std::string& where) {
+    auto result = session->Execute("SELECT COUNT(*) FROM floats WHERE " + where);
+    return result.ok() ? Rows(*result).at(0).at(0) : result.status().ToString();
+  };
+  EXPECT_EQ(count("f > 0.1"), "3");         // DuckDB: 2
+  EXPECT_EQ(count("f = 0.1"), "0");         // DuckDB: 1
+  EXPECT_EQ(count("0.1 >= f"), "0");        // DuckDB: 1
+  EXPECT_EQ(count("f = 16777217"), "0");    // DuckDB: 1
+  EXPECT_EQ(count("f < 16777217"), "3");    // DuckDB: 2
+  EXPECT_EQ(count("f > 1e-1"), "3");        // DuckDB: 3
+  EXPECT_EQ(count("f < 16777217e0"), "3");  // DuckDB: 3
+
+  auto values = session->Execute("SELECT f FROM floats WHERE f < 1");
+  ASSERT_TRUE(values.ok()) << values.status().ToString();
+  EXPECT_EQ(values->types, std::vector<plan::LogicalType>{plan::LogicalType::kDouble});
+  EXPECT_EQ(Rows(*values), (std::vector<std::vector<std::string>>{{"0.10000000149011612"},
+                                                                  {"0.20000000298023224"}}));
 }
 
 TEST_F(SessionTest, UnsupportedAndBindErrorsKeepTheirKinds) {

@@ -19,8 +19,9 @@
 //
 // Every query is valid SQL for DuckDB with the semantics antb1 targets: literals match the column
 // type (no implicit casts), doubles only get literals that both engines convert to the same double,
-// columns read as DATE through the clickbench option are never used with FROM '<path>' (DuckDB
-// reads the raw file there), and SELECT * on a large table always has a LIMIT.
+// FLOAT columns (DOUBLE on antb1 only, divergence D11) are never referenced, columns read as DATE
+// through the clickbench option are never used with FROM '<path>' (DuckDB reads the raw file
+// there), and SELECT * on a large table always has a LIMIT.
 
 namespace antb1::slt {
 

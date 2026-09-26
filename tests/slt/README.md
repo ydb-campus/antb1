@@ -105,8 +105,9 @@ features, so one case reproduces alone.
   counted per missing feature and reported, not a failure; another query error there is counted as
   `rejected`.
 - DuckDB runs every query: the generator writes only SQL DuckDB accepts with the semantics antb1 targets
-  (typed literals, doubles that both engines parse alike, no clickbench-typed column with `FROM '<path>'`),
-  so a DuckDB error is a generator bug and fails.
+  (typed literals, doubles that both engines parse alike, no FLOAT column (divergence D11 in
+  `docs/sql-subset.md`), no clickbench-typed column with `FROM '<path>'`), so a DuckDB error is a
+  generator bug and fails.
 - A failure prints the seed, the case index, the features, the SQL, at most 5 differing rows and the repro.
 
 ```bash
