@@ -48,6 +48,10 @@ antb1_add_gtest(
     tests/slt_file_test.cc
   LIBS antb1_slt_lib Parquet::parquet_shared
 )
+if(ANTB1_HAVE_DUCKDB)
+  # plan::DuckDbFloatOf against the DuckDB library on seeded random literals.
+  target_sources(antb1_slt_tests PRIVATE tests/float_literal_oracle_test.cc)
+endif()
 
 # Test cases: tests/slt/cases/<area>/<file>.slt -> slt.<area>.<file> (+ oracle.<area>.<file>).
 file(GLOB _areas CONFIGURE_DEPENDS LIST_DIRECTORIES true "${CMAKE_CURRENT_SOURCE_DIR}/cases/*")

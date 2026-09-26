@@ -36,6 +36,16 @@ std::optional<double> ParseDoubleLiteral(std::string_view text, bool negative);
 // digits, DECIMAL's maximum width (leading zeros count, as in DuckDB).
 bool IsApproximateNumber(std::string_view text);
 
+// The FLOAT that DuckDB (1.5.5) turns a numeric literal into when it compares the literal with a
+// FLOAT column, or std::nullopt when DuckDB types the literal as DOUBLE (compared in DOUBLE, as
+// antb1 does for every DOUBLE column). DuckDB types an integer by value (INTEGER, BIGINT, HUGEINT
+// or UHUGEINT; outside -2^127 to 2^128 - 1 DOUBLE) and a decimal as DECIMAL(digits, fraction
+// digits), and it casts with its own arithmetic: BIGINT exactly rounded, HUGEINT and UHUGEINT
+// through a double, a DECIMAL as unscaled / 10^scale in float or, when the unscaled value is
+// beyond 2^24, as div + mod / 10^scale. The result can be +-inf and is not always the FLOAT
+// nearest to the literal (docs/sql-subset.md, "Binding"). `text` is written without its sign.
+std::optional<float> DuckDbFloatOf(std::string_view text, bool negative);
+
 // The exact value of a double: +-inf and magnitudes of 10^38 or more are huge; NaN is zero.
 ExactNumber ExactNumberOf(double value);
 

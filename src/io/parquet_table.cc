@@ -437,6 +437,11 @@ arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> ParquetTable::Scan(
                                       arrow::schema(std::move(engine_fields)), batch_size);
 }
 
+bool ParquetTable::StoredAsFloat(int field) const {
+  return field >= 0 && field < storage_schema_->num_fields() &&
+         storage_schema_->field(field)->type()->id() == arrow::Type::FLOAT;
+}
+
 std::string ParquetTable::Describe() const {
   return std::format("parquet(files={}, rows={})", files_.size(), num_rows_);
 }

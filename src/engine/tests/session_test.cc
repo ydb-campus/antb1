@@ -237,19 +237,23 @@ TEST_F(SessionTest, MinMaxIgnoreNaNAcrossBatchesAndFiles) {
   }
 }
 
-// Divergence D11 (docs/sql-subset.md): a FLOAT column is widened exactly to DOUBLE, so its results
-// are DOUBLE and WHERE compares it in double precision with the literal's nearest double. DuckDB
-// rounds an integer or DECIMAL literal to FLOAT and compares in FLOAT (0.1F = 0.1 and
-// 16777216F = 16777217 hold there); a number it types as DOUBLE (1e-1) compares in DOUBLE, as here.
-TEST_F(SessionTest, FloatColumnsCompareInDoublePrecision) {
+// A FLOAT column is widened exactly to DOUBLE, but WHERE compares it like DuckDB: an integer or
+// DECIMAL literal becomes the FLOAT DuckDB casts it to (0.1F = 0.1 and 16777216F = 16777217 hold);
+// a number DuckDB types as DOUBLE (1e-1) compares in DOUBLE. A DOUBLE column holding the same
+// values still compares with the nearest double. Results stay DOUBLE (divergence D11).
+TEST_F(SessionTest, FloatColumnsCompareLikeDuckDb) {
   const std::string path = (dir_ / "floats.parquet").string();
   arrow::FloatBuilder f;
+  arrow::DoubleBuilder d;
   for (const float v : {0.1F, 0.2F, 16777216.0F}) {
     ASSERT_TRUE(f.Append(v).ok());
+    ASSERT_TRUE(d.Append(static_cast<double>(v)).ok());
   }
   ASSERT_TRUE(f.AppendNull().ok());
-  const auto table = arrow::Table::Make(arrow::schema({arrow::field("f", arrow::float32())}),
-                                        {f.Finish().ValueOrDie()});
+  ASSERT_TRUE(d.AppendNull().ok());
+  const auto table = arrow::Table::Make(
+      arrow::schema({arrow::field("f", arrow::float32()), arrow::field("d", arrow::float64())}),
+      {f.Finish().ValueOrDie(), d.Finish().ValueOrDie()});
   auto out = arrow::io::FileOutputStream::Open(path).ValueOrDie();
   ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), out, 4).ok());
   ASSERT_TRUE(out->Close().ok());
@@ -260,13 +264,18 @@ TEST_F(SessionTest, FloatColumnsCompareInDoublePrecision) {
     auto result = session->Execute("SELECT COUNT(*) FROM floats WHERE " + where);
     return result.ok() ? Rows(*result).at(0).at(0) : result.status().ToString();
   };
-  EXPECT_EQ(count("f > 0.1"), "3");         // DuckDB: 2
-  EXPECT_EQ(count("f = 0.1"), "0");         // DuckDB: 1
-  EXPECT_EQ(count("0.1 >= f"), "0");        // DuckDB: 1
-  EXPECT_EQ(count("f = 16777217"), "0");    // DuckDB: 1
-  EXPECT_EQ(count("f < 16777217"), "3");    // DuckDB: 2
-  EXPECT_EQ(count("f > 1e-1"), "3");        // DuckDB: 3
-  EXPECT_EQ(count("f < 16777217e0"), "3");  // DuckDB: 3
+  // DuckDB's answers.
+  EXPECT_EQ(count("f > 0.1"), "2");
+  EXPECT_EQ(count("f = 0.1"), "1");
+  EXPECT_EQ(count("0.1 >= f"), "1");
+  EXPECT_EQ(count("f = 16777217"), "1");
+  EXPECT_EQ(count("f < 16777217"), "2");
+  EXPECT_EQ(count("f > 1e-1"), "3");
+  EXPECT_EQ(count("f < 16777217e0"), "3");
+  // The DOUBLE column: the nearest double, as before.
+  EXPECT_EQ(count("d = 0.1"), "0");
+  EXPECT_EQ(count("d > 0.1"), "3");
+  EXPECT_EQ(count("d = 16777217"), "0");
 
   auto values = session->Execute("SELECT f FROM floats WHERE f < 1");
   ASSERT_TRUE(values.ok()) << values.status().ToString();

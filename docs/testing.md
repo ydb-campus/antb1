@@ -96,9 +96,10 @@ needs a comment that justifies it and a maintainer's agreement.
 
 `tools/fixturegen` (`antb1-fixturegen`) writes deterministic Parquet files with a hits-shaped schema and synthetic
 values: `hits_like.parquet` (10,000 rows in 4 row groups), `hits_like_nulls.parquet` (the same rows with NULLs),
-`hits_like_split/part-0.parquet` to `part-3.parquet` (the same rows in 4 files), `hits_like_required.parquet`
-(REQUIRED columns and UTF8 strings), `edge.parquet` (type extremes, escapes, empty strings, NULLs) and
-`empty.parquet` (0 rows). The ctest `fixtures.generate` (label `setup`) writes them to `build/<preset>/fixtures`.
+`hits_like_split/part-0.parquet` to `part-3.parquet` (the same rows in 4 files), `hits_like_required.parquet` (REQUIRED
+columns and UTF8 strings), `edge.parquet` (type extremes, escapes, empty strings, NULLs), `floats.parquet` (bit-exact
+FLOAT values: 0.1F and its lower neighbour, 2^24 and 2^100 with their next FLOATs, the FLOAT maximum, +-inf, +-0, NULL)
+and `empty.parquet` (0 rows). The ctest `fixtures.generate` (label `setup`) writes them to `build/<preset>/fixtures`.
 Values come from splitmix64 with integer-only arithmetic (no `<random>` distributions, no libm, no NaN), so every
 platform generates the same data.
 

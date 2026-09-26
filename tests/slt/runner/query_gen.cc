@@ -153,8 +153,8 @@ std::optional<GenColumn> ColumnOf(const arrow::Field& field, bool clickbench) {
     case arrow::Type::DATE32:
       c.kind = ValueKind::kDate;
       break;
-    // FLOAT is DOUBLE on antb1 (results, and WHERE in double precision) but FLOAT on DuckDB, which
-    // also compares most literals with it in FLOAT: divergence D11 in docs/sql-subset.md.
+    // A FLOAT column's results are DOUBLE on antb1 but FLOAT on DuckDB: divergence D11 in
+    // docs/sql-subset.md. (WHERE compares alike; tests/slt/cases/where/float.slt covers it.)
     case arrow::Type::FLOAT:
     default:
       return std::nullopt;  // a type neither engine reads the same way: never referenced

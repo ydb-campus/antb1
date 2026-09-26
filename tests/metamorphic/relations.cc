@@ -182,6 +182,7 @@ constexpr auto kTablePaths = std::to_array<TablePath>({
     {.table = "hits_like_split", .path = "hits_like_split/part-*.parquet"},
     {.table = "hits_like_required", .path = "hits_like_required.parquet"},
     {.table = "edge", .path = "edge.parquet"},
+    {.table = "floats", .path = "floats.parquet"},
     {.table = "empty", .path = "empty.parquet"},
 });
 

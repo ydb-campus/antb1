@@ -1,5 +1,6 @@
 #include "antb1/plan/literal.h"
 
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -227,6 +228,103 @@ TEST(LiteralTest, FoldIntegerComparisonTable) {
   EXPECT_EQ(fold(CompareOp::kGe, "40000", false).kind, kFalse);
   EXPECT_EQ(fold(CompareOp::kGe, "1e50", true).kind, kIsNotNull);
   EXPECT_EQ(fold(CompareOp::kLe, "1e50", false).kind, kIsNotNull);
+}
+
+// Expected values from DuckDB 1.5.5 (`SELECT CAST(<literal> AS FLOAT)::DOUBLE`), compared bit for
+// bit. They include DuckDB's own rounding: 16777217.5 and 0.1 written with 16 or 24 decimals are
+// not the FLOAT nearest to the literal, and a HUGEINT literal is rounded through a double.
+TEST(DuckDbFloatOf, MatchesDuckDbCasts) {
+  constexpr double kInf = std::numeric_limits<double>::infinity();
+  struct Case {
+    std::string_view text;
+    bool negative;
+    double expected;
+  };
+  const std::vector<Case> cases = {
+      {.text = "0", .negative = false, .expected = 0.0},
+      {.text = "1", .negative = false, .expected = 1.0},
+      {.text = "16777216", .negative = false, .expected = 16777216.0},
+      {.text = "16777217", .negative = false, .expected = 16777216.0},
+      {.text = "16777219", .negative = false, .expected = 16777220.0},
+      {.text = "2147483647", .negative = false, .expected = 2147483648.0},
+      {.text = "2147483648", .negative = false, .expected = 2147483648.0},
+      {.text = "2147483648", .negative = true, .expected = -2147483648.0},
+      {.text = "9223372036854775807", .negative = false, .expected = 9.223372036854776e+18},
+      {.text = "9223372036854775808", .negative = true, .expected = -9.223372036854776e+18},
+      {.text = "9223372036854775808", .negative = false, .expected = 9.223372036854776e+18},
+      {.text = "9223372036854775809", .negative = true, .expected = -9.223372036854776e+18},
+      {.text = "18446744073709551615", .negative = false, .expected = 1.8446744073709552e+19},
+      {.text = "18446744073709551616", .negative = false, .expected = 1.8446744073709552e+19},
+      {.text = "18446744073709551616", .negative = true, .expected = -1.8446744073709552e+19},
+      {.text = "18446744073709551617", .negative = true, .expected = -1.8446744073709552e+19},
+      {.text = "1267650675786093127411026624513",
+       .negative = false,
+       .expected = 1.2676506002282294e+30},
+      {.text = "170141183460469231731687303715884105727",
+       .negative = false,
+       .expected = 1.7014118346046923e+38},
+      {.text = "170141183460469231731687303715884105728",
+       .negative = true,
+       .expected = -1.7014118346046923e+38},
+      {.text = "170141183460469231731687303715884105728",
+       .negative = false,
+       .expected = 1.7014118346046923e+38},
+      {.text = "340282366920938463463374607431768211455", .negative = false, .expected = kInf},
+      {.text = "340282356779733661637539395458142568447", .negative = false, .expected = kInf},
+      {.text = "340282356779733661637539395458142568448", .negative = false, .expected = kInf},
+      {.text = "0000000000000000000000000000000000000000001", .negative = false, .expected = 1.0},
+      {.text = "0.1", .negative = false, .expected = 0.10000000149011612},
+      {.text = ".5", .negative = false, .expected = 0.5},
+      {.text = "5.", .negative = false, .expected = 5.0},
+      {.text = "0.0", .negative = false, .expected = 0.0},
+      {.text = "0.0", .negative = true, .expected = 0.0},
+      {.text = "00.5", .negative = false, .expected = 0.5},
+      {.text = "19.99", .negative = false, .expected = 19.989999771118164},
+      {.text = "19.99", .negative = true, .expected = -19.989999771118164},
+      {.text = "3.3", .negative = false, .expected = 3.299999952316284},
+      {.text = "0.3", .negative = false, .expected = 0.30000001192092896},
+      {.text = "1234.5", .negative = false, .expected = 1234.5},
+      {.text = "99.99", .negative = false, .expected = 99.98999786376953},
+      {.text = "16777217.5", .negative = false, .expected = 16777216.0},
+      {.text = "16777217.5", .negative = true, .expected = -16777216.0},
+      {.text = "16777217.0", .negative = false, .expected = 16777216.0},
+      {.text = "16777216.5", .negative = false, .expected = 16777216.0},
+      {.text = "0.100000000000000000000000", .negative = false, .expected = 0.09999999403953552},
+      {.text = "0.100000000000000000000000", .negative = true, .expected = -0.09999999403953552},
+      {.text = "0.1000000000000000", .negative = false, .expected = 0.09999999403953552},
+      {.text = "123456789.123456789", .negative = false, .expected = 123456792.0},
+      {.text = "12345678901234567890.5", .negative = false, .expected = 1.2345679395506094e+19},
+      {.text = "99999999999999999999999999999999999999",
+       .negative = false,
+       .expected = 9.999999680285692e+37},
+      {.text = "9999999999999999999999999999999999999.9",
+       .negative = false,
+       .expected = 9.999999933815813e+36},
+      {.text = "0.0000000000000000000000000000000000001",
+       .negative = false,
+       .expected = 9.99999991097579e-38},
+  };
+  for (const auto& c : cases) {
+    const auto f = DuckDbFloatOf(c.text, c.negative);
+    ASSERT_TRUE(f.has_value()) << (c.negative ? "-" : "") << c.text;
+    const float value = f.value_or(0.0F);
+    EXPECT_EQ(std::bit_cast<uint64_t>(static_cast<double>(value)),
+              std::bit_cast<uint64_t>(c.expected))
+        << (c.negative ? "-" : "") << c.text << ": " << value << " vs " << c.expected;
+  }
+}
+
+// DuckDB types these as DOUBLE, so they are compared in DOUBLE: an exponent, a decimal of more than
+// 38 digits (leading zeros count), an integer beyond 2^128 - 1 or below -2^127.
+TEST(DuckDbFloatOf, DoubleLiteralsAreNotConverted) {
+  EXPECT_FALSE(DuckDbFloatOf("1e3", false).has_value());
+  EXPECT_FALSE(DuckDbFloatOf("1.5E-1", true).has_value());
+  EXPECT_FALSE(DuckDbFloatOf("00000000000000000000000000000000000000000.5", false).has_value());
+  EXPECT_FALSE(DuckDbFloatOf("0.00000000000000000000000000000000000001", false).has_value());
+  EXPECT_FALSE(DuckDbFloatOf("340282366920938463463374607431768211456", false).has_value());
+  EXPECT_FALSE(DuckDbFloatOf("170141183460469231731687303715884105729", true).has_value());
+  EXPECT_FALSE(DuckDbFloatOf("340282356779733661637539395458142568.447", false).has_value());
+  EXPECT_FALSE(DuckDbFloatOf("abc", false).has_value());
 }
 
 }  // namespace

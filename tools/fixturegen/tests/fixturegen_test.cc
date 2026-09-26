@@ -179,7 +179,7 @@ class FixtureFilesTest : public ::testing::Test {
 
 TEST_F(FixtureFilesTest, AreByteIdenticalAcrossRuns) {
   ASSERT_TRUE(WriteAllFixtures(dir_ / "b").ok());
-  ASSERT_EQ(files_.size(), 9U);
+  ASSERT_EQ(files_.size(), 10U);
   for (const auto& f : files_) {
     const std::string a = ReadBytes(dir_ / "a" / f.path);
     ASSERT_FALSE(a.empty()) << f.path;

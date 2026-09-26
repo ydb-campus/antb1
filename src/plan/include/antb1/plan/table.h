@@ -29,6 +29,14 @@ class Table {
   virtual arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> Scan(
       const std::vector<int>& fields, int64_t batch_size) const = 0;
 
+  // Whether top-level field `field` (engine type DOUBLE) is stored as FLOAT and widened on read.
+  // The binder compares such a column with a number the way DuckDB compares a FLOAT column
+  // (plan::DuckDbFloatOf).
+  virtual bool StoredAsFloat(int field) const {
+    static_cast<void>(field);
+    return false;
+  }
+
   // One-line description for EXPLAIN, e.g. "parquet(3 files)".
   virtual std::string Describe() const = 0;
 

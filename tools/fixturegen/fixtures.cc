@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -540,6 +541,43 @@ arrow::Result<std::shared_ptr<arrow::Table>> MakeEdgeTable() {
   return arrow::Table::Make(std::move(schema), {id_array, i16, i32, i64, u16, d_array, s, u});
 }
 
+arrow::Result<std::shared_ptr<arrow::Table>> MakeFloatTable() {
+  // Bit patterns, so the values are the same on every platform.
+  constexpr auto kBits = std::to_array<std::optional<uint32_t>>({
+      0x3DCCCCCDU,  // 0.1F = 0.10000000149011612
+      0x3DCCCCCCU,  // the FLOAT below 0.1F
+      0x3E4CCCCDU,  // 0.2F
+      0x3E99999AU,  // 0.3F
+      0x419FEB85U,  // 19.99F
+      0xC19FEB85U,  // -19.99F
+      0x40533333U,  // 3.3F
+      0x449A5000U,  // 1234.5F
+      0x4B800000U,  // 2^24 = 16777216
+      0x4B800001U,  // 16777218, the FLOAT after 2^24
+      0x71800000U,  // 2^100
+      0x71800001U,  // 2^100 + 2^77, the FLOAT after 2^100
+      0x7F7FFFFFU,  // the FLOAT maximum
+      0x7F800000U,  // +inf
+      0xFF800000U,  // -inf
+      0x00000000U,  // 0
+      0x80000000U,  // -0
+      std::nullopt,
+  });
+  arrow::Int32Builder ids;
+  arrow::FloatBuilder floats;
+  for (std::size_t row = 0; row < kBits.size(); ++row) {
+    ARROW_RETURN_NOT_OK(ids.Append(static_cast<int32_t>(row)));
+    const std::optional<uint32_t>& bits = kBits[row];
+    ARROW_RETURN_NOT_OK(bits.has_value() ? floats.Append(std::bit_cast<float>(*bits))
+                                         : floats.AppendNull());
+  }
+  ARROW_ASSIGN_OR_RAISE(auto id_array, ids.Finish());
+  ARROW_ASSIGN_OR_RAISE(auto f_array, floats.Finish());
+  auto schema = arrow::schema({arrow::field("id", arrow::int32(), /*nullable=*/false),
+                               arrow::field("f", arrow::float32())});
+  return arrow::Table::Make(std::move(schema), {id_array, f_array});
+}
+
 arrow::Status WriteParquet(const arrow::Table& table, const fs::path& path,
                            int64_t row_group_rows) {
   const fs::path tmp = fs::path(path).concat(".tmp");
@@ -606,6 +644,9 @@ arrow::Result<std::vector<FixtureFile>> WriteAllFixtures(const fs::path& dir) {
 
   ARROW_ASSIGN_OR_RAISE(auto edge, MakeEdgeTable());
   ARROW_RETURN_NOT_OK(write(*edge, "edge.parquet", 5));
+
+  ARROW_ASSIGN_OR_RAISE(auto floats, MakeFloatTable());
+  ARROW_RETURN_NOT_OK(write(*floats, "floats.parquet", 8));
 
   ARROW_ASSIGN_OR_RAISE(auto empty, MakeHitsTable(HitsVariant::kPartitioned, Nulls::kNone, 0, 0));
   ARROW_RETURN_NOT_OK(write(*empty, "empty.parquet", kGroup));
