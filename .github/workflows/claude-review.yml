@@ -10,7 +10,8 @@
 #     denied below, so the review only reads files and runs the read-only commands listed in --allowedTools
 #     (hooks disabled; on PRs the action restores .claude/ and CLAUDE.md from the base branch);
 #   - the prompt names only the repository and the PR number, never the title or body.
-# The last step lists the run's outcome and any denied tool calls in the job summary.
+# The last step lists the run's outcome and any denied tool calls in the job summary and in the log (job summaries
+# have no API; `gh run view --log` reads the log).
 # The workflow token is read-only: comments are posted with the Claude GitHub App token (OIDC exchange).
 # Requirements: the Claude GitHub App, the CLAUDE_CODE_OAUTH_TOKEN secret and this file on the default branch.
 name: Claude review
@@ -109,10 +110,11 @@ jobs:
           EXECUTION_FILE: ${{ steps.review.outputs.execution_file }}
         run: |
           python3 - <<'PY'
-          import json, os
+          import json, os, secrets
 
           path = os.environ.get("EXECUTION_FILE", "")
           lines = ["### Claude review run", ""]
+          denials = []
           try:
               with open(path, encoding="utf-8") as f:
                   messages = json.load(f)
@@ -140,7 +142,12 @@ jobs:
                       text = text if len(text) <= 300 else text[:300] + "..."
                       lines.append(f"{d.get('tool_name')}: {text}".replace("```", "'''"))
                   lines.append("```")
-                  print(f"::warning::Claude review: {len(denials)} tool call(s) were denied; see the job summary")
+          report = "\n".join(lines) + "\n"
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
-              f.write("\n".join(lines) + "\n")
+              f.write(report)
+          # Tool inputs come from the model: workflow commands stay off while the report is printed.
+          token = secrets.token_hex(16)
+          print(f"::stop-commands::{token}\n{report}::{token}::", flush=True)
+          if denials:
+              print(f"::warning::Claude review: {len(denials)} tool call(s) were denied; see the job summary or the log")
           PY
