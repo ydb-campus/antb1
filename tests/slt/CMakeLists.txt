@@ -37,6 +37,7 @@ antb1_add_gtest(
   LABEL harness
   PREFIX harness
   SOURCES
+    tests/antb1_engine_test.cc
     tests/canonical_test.cc
     tests/clickbench_test.cc
     tests/comparator_test.cc

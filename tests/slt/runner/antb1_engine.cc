@@ -67,33 +67,40 @@ ColumnClass ClassOf(plan::LogicalType type) {
   return ColumnClass::kText;
 }
 
+}  // namespace
+
 arrow::Result<ResultSet> ToResultSet(const engine::QueryResult& result) {
+  const arrow::Table& table = *result.table;
+  if (std::cmp_not_equal(table.num_columns(), result.types.size())) {
+    return arrow::Status::Invalid("result has ", table.num_columns(), " columns but ",
+                                  result.types.size(), " types");
+  }
   ResultSet out;
   for (const auto type : result.types) {
     out.classes.push_back(ClassOf(type));
     out.type_names.emplace_back(plan::ToString(type));
   }
-  ARROW_ASSIGN_OR_RAISE(auto table, result.table->CombineChunks());
-  if (std::cmp_not_equal(table->num_columns(), result.types.size())) {
-    return arrow::Status::Invalid("result has ", table->num_columns(), " columns but ",
-                                  result.types.size(), " types");
-  }
-  for (int64_t r = 0; r < table->num_rows(); ++r) {
-    std::vector<std::optional<std::string>> row;
-    for (int c = 0; c < table->num_columns(); ++c) {
-      const auto& column = *table->column(c)->chunk(0);
-      if (column.IsNull(r)) {
-        row.emplace_back(std::nullopt);
-      } else {
-        row.emplace_back(engine::FormatValue(column, r, result.types[static_cast<std::size_t>(c)]));
+  const auto nrows = static_cast<std::size_t>(table.num_rows());
+  out.rows.assign(nrows, std::vector<std::optional<std::string>>(result.types.size()));
+  // Chunk by chunk: CombineChunks keeps a binary column over 2 GiB in several chunks.
+  for (int c = 0; c < table.num_columns(); ++c) {
+    const auto uc = static_cast<std::size_t>(c);
+    const auto& column = *table.column(c);
+    if (column.length() != table.num_rows()) {
+      return arrow::Status::Invalid("column ", c, " has ", column.length(),
+                                    " rows but the result has ", table.num_rows());
+    }
+    std::size_t row = 0;
+    for (const auto& chunk : column.chunks()) {
+      for (int64_t i = 0; i < chunk->length(); ++i, ++row) {
+        if (!chunk->IsNull(i)) {
+          out.rows[row][uc] = engine::FormatValue(*chunk, i, result.types[uc]);
+        }
       }
     }
-    out.rows.push_back(std::move(row));
   }
   return out;
 }
-
-}  // namespace
 
 std::expected<std::unique_ptr<Antb1Engine>, std::string> Antb1Engine::Make(
     const std::vector<TableDef>& tables, engine::SessionOptions options) {

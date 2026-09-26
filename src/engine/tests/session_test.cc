@@ -123,16 +123,16 @@ TEST_F(SessionTest, ExplainShowsTheOptimizedPlan) {
 
 // The rows of a result as canonical text (engine::FormatValue), one vector per row.
 std::vector<std::vector<std::string>> Rows(const QueryResult& result) {
-  const auto table = result.table->CombineChunks().ValueOrDie();
-  std::vector<std::vector<std::string>> rows;
-  for (int64_t r = 0; r < table->num_rows(); ++r) {
-    std::vector<std::string> row;
-    row.reserve(static_cast<std::size_t>(table->num_columns()));
-    for (int c = 0; c < table->num_columns(); ++c) {
-      row.push_back(FormatValue(*table->column(c)->chunk(0), r,
-                                result.types.at(static_cast<std::size_t>(c))));
+  const auto& table = *result.table;
+  std::vector<std::vector<std::string>> rows(static_cast<std::size_t>(table.num_rows()));
+  for (int c = 0; c < table.num_columns(); ++c) {
+    std::size_t row = 0;
+    for (const auto& chunk : table.column(c)->chunks()) {
+      for (int64_t i = 0; i < chunk->length(); ++i, ++row) {
+        rows.at(row).push_back(
+            FormatValue(*chunk, i, result.types.at(static_cast<std::size_t>(c))));
+      }
     }
-    rows.push_back(std::move(row));
   }
   return rows;
 }
