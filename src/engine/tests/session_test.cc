@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -181,6 +182,59 @@ TEST_F(SessionTest, ExecutesAggregatesProjectionsFiltersAndLimits) {
   ASSERT_TRUE(empty.ok()) << empty.status().ToString();
   EXPECT_EQ(empty->table->num_rows(), 0);
   EXPECT_EQ(empty->names, std::vector<std::string>{"AdvEngineID"});
+}
+
+// Writes `values` to a Parquet file as `d` (DOUBLE) and `f` (FLOAT, widened to DOUBLE on read),
+// with `k` (SMALLINT) numbering the rows from `first_k`, in row groups of 2 rows.
+void WriteDoubles(const std::string& path, const std::vector<double>& values, int16_t first_k) {
+  arrow::Int16Builder k;
+  arrow::DoubleBuilder d;
+  arrow::FloatBuilder f;
+  int16_t next = first_k;
+  for (const double v : values) {
+    ASSERT_TRUE(k.Append(next++).ok());
+    ASSERT_TRUE(d.Append(v).ok());
+    ASSERT_TRUE(f.Append(static_cast<float>(v)).ok());
+  }
+  auto table = arrow::Table::Make(
+      arrow::schema({arrow::field("k", arrow::int16()), arrow::field("d", arrow::float64()),
+                     arrow::field("f", arrow::float32())}),
+      {k.Finish().ValueOrDie(), d.Finish().ValueOrDie(), f.Finish().ValueOrDie()});
+  auto out = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+  ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), out, 2).ok());
+  ASSERT_TRUE(out->Close().ok());
+}
+
+// D10: MIN and MAX ignore NaN and are NaN only when every selected value is NaN, whatever the
+// batch size, the file order and the rows WHERE keeps (FLOAT too, read as DOUBLE).
+TEST_F(SessionTest, MinMaxIgnoreNaNAcrossBatchesAndFiles) {
+  constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+  const std::string a = (dir_ / "a.parquet").string();
+  const std::string b = (dir_ / "b.parquet").string();
+  const std::string c = (dir_ / "c.parquet").string();
+  WriteDoubles(a, {kNaN, kNaN, kNaN, 5}, 0);  // k 0 to 3
+  WriteDoubles(b, {2, kNaN}, 4);              // k 4 and 5
+  WriteDoubles(c, {kNaN, kNaN}, 6);           // k 6 and 7
+  const std::vector<std::pair<std::string, std::vector<std::string>>> queries = {
+      {"", {"2", "5", "2", "5"}},
+      {" WHERE k <> 4", {"5", "5", "5", "5"}},  // keeps only the NaN of b
+      {" WHERE k <> 3 AND k <> 4", {"nan", "nan", "nan", "nan"}},
+  };
+  for (const int64_t batch_size : {1, 2, 3, 64 * 1024}) {
+    for (const auto& files :
+         std::vector<std::vector<std::string>>{{a, b, c}, {c, b, a}, {b, c, a}}) {
+      SessionOptions options;
+      options.batch_size = batch_size;
+      auto session = Session::Make(options).ValueOrDie();
+      ASSERT_TRUE(session->RegisterParquet("t", files).ok());
+      for (const auto& [where, expected] : queries) {
+        auto result = session->Execute("SELECT MIN(d), MAX(d), MIN(f), MAX(f) FROM t" + where);
+        ASSERT_TRUE(result.ok()) << result.status().ToString();
+        EXPECT_EQ(Rows(*result), std::vector<std::vector<std::string>>{expected})
+            << "batch size " << batch_size << ", files from " << files.front() << where;
+      }
+    }
+  }
 }
 
 TEST_F(SessionTest, UnsupportedAndBindErrorsKeepTheirKinds) {

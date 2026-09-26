@@ -23,7 +23,8 @@
 //   AVG(c)     integers: the exact 128-bit sum divided once by the count (ExactDivideToDouble);
 //              DOUBLE: sum / count. DOUBLE, NULL over no values
 //   MIN/MAX(c) Arrow's min_max over the selected values (VARCHAR byte-wise, DATE chronologically);
-//              the column's type, NULL over no values
+//              NaN is ignored, in every batch split: NaN only when every value is NaN. The
+//              column's type, NULL over no values
 //
 // NULL values are skipped. Arrow's integer "sum" kernel is never used: it wraps at 64 bits.
 

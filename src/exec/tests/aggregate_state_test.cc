@@ -287,6 +287,107 @@ TEST_F(AggregateStateTest, MinMaxOfDatesUnsignedDoublesAndHugeInts) {
   EXPECT_EQ(Text(*huge), "-99999999999999999999");
 }
 
+// One batch of DOUBLE values and its selection (empty: every row).
+struct DoubleBatch {
+  std::vector<std::optional<double>> values;
+  std::vector<std::optional<bool>> selection;
+};
+
+arrow::Status ConsumeBatch(AggregateState& state, const DoubleBatch& batch) {
+  const auto values =
+      testing::ArrayOf<arrow::DoubleBuilder, double>(arrow::float64(), batch.values);
+  const auto selection = batch.selection.empty() ? nullptr : Bools(batch.selection);
+  return state.Consume(*values, selection.get());
+}
+
+// MIN or MAX of DOUBLE over `batches`, fed four ways: in order, in reverse order, one partial state
+// per batch merged in order, and all rows as one batch. The result of each way, by name.
+std::vector<std::pair<std::string, std::string>> MinMaxOfEverySplit(
+    AggKind kind, const std::vector<DoubleBatch>& batches) {
+  auto in_order = Make(kind, LogicalType::kDouble, LogicalType::kDouble);
+  auto reversed = Make(kind, LogicalType::kDouble, LogicalType::kDouble);
+  auto merged = Make(kind, LogicalType::kDouble, LogicalType::kDouble);
+  DoubleBatch whole;
+  for (std::size_t i = 0; i < batches.size(); ++i) {
+    const DoubleBatch& batch = batches[i];
+    EXPECT_TRUE(ConsumeBatch(*in_order, batch).ok());
+    EXPECT_TRUE(ConsumeBatch(*reversed, batches[batches.size() - 1 - i]).ok());
+    auto partial = Make(kind, LogicalType::kDouble, LogicalType::kDouble);
+    EXPECT_TRUE(ConsumeBatch(*partial, batch).ok());
+    EXPECT_TRUE(merged->Merge(*partial).ok());
+    whole.values.insert(whole.values.end(), batch.values.begin(), batch.values.end());
+    if (batch.selection.empty()) {
+      whole.selection.insert(whole.selection.end(), batch.values.size(), true);
+    } else {
+      whole.selection.insert(whole.selection.end(), batch.selection.begin(), batch.selection.end());
+    }
+  }
+  auto single = Make(kind, LogicalType::kDouble, LogicalType::kDouble);
+  EXPECT_TRUE(ConsumeBatch(*single, whole).ok());
+  return {{"in order", Text(*in_order)},
+          {"reversed", Text(*reversed)},
+          {"merged", Text(*merged)},
+          {"one batch", Text(*single)}};
+}
+
+// D10: MIN and MAX ignore NaN like Arrow's min_max and are NaN only when every selected value is
+// NaN, however the rows split into batches, partial states and selections.
+TEST_F(AggregateStateTest, MinMaxOfDoublesIgnoreNaNInEveryBatchSplit) {
+  constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+  struct Case {
+    std::string name;
+    std::vector<DoubleBatch> batches;
+    std::string min;
+    std::string max;
+  };
+  const std::vector<Case> cases = {
+      {.name = "a NaN-only batch, then values",
+       .batches = {{.values = {kNaN, kNaN}}, {.values = {5, 3}}},
+       .min = "3",
+       .max = "5"},
+      {.name = "values, then a NaN-only batch",
+       .batches = {{.values = {5, 3}}, {.values = {kNaN}}},
+       .min = "3",
+       .max = "5"},
+      {.name = "NaN in and around the batches with values",
+       .batches = {{.values = {kNaN, 2, kNaN}},
+                   {.values = {kNaN, std::nullopt}},
+                   {.values = {-1, kNaN}},
+                   {.values = {kNaN}}},
+       .min = "-1",
+       .max = "2"},
+      {.name = "all NaN in several batches, with NULLs",
+       .batches = {{.values = {kNaN}},
+                   {.values = {kNaN, std::nullopt}},
+                   {.values = {std::nullopt}},
+                   {.values = {kNaN, kNaN}}},
+       .min = "nan",
+       .max = "nan"},
+      {.name = "a selection that keeps only NaN, then values",
+       .batches = {{.values = {1, kNaN, 9}, .selection = {false, true, false}}, {.values = {4, 6}}},
+       .min = "4",
+       .max = "6"},
+      {.name = "values, then a selection that keeps only NaN",
+       .batches = {{.values = {4, 6}},
+                   {.values = {1, kNaN, 9}, .selection = {false, true, std::nullopt}}},
+       .min = "4",
+       .max = "6"},
+      {.name = "selections that keep only NaN",
+       .batches = {{.values = {1, kNaN}, .selection = {false, true}},
+                   {.values = {kNaN, 2}, .selection = {true, false}}},
+       .min = "nan",
+       .max = "nan"},
+  };
+  for (const auto& c : cases) {
+    for (const AggKind kind : {AggKind::kMin, AggKind::kMax}) {
+      for (const auto& [way, text] : MinMaxOfEverySplit(kind, c.batches)) {
+        EXPECT_EQ(text, kind == AggKind::kMin ? c.min : c.max)
+            << plan::ToString(kind) << " over " << c.name << ", " << way;
+      }
+    }
+  }
+}
+
 TEST_F(AggregateStateTest, MergeCombinesPartialStates) {
   const auto first = Int64s({4, std::nullopt, 10});
   const auto second = Int64s({-2, 8});

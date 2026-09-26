@@ -1,6 +1,7 @@
 #include "antb1/exec/aggregate_state.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -314,8 +315,15 @@ class DoubleSumState final : public AggregateState {
 
 // ---- MIN and MAX ----
 
+// Whether `scalar` is a DOUBLE NaN (DOUBLE is the engine's only floating-point type).
+bool IsNaN(const arrow::Scalar& scalar) {
+  return scalar.type->id() == arrow::Type::DOUBLE &&
+         std::isnan(static_cast<const arrow::DoubleScalar&>(scalar).value);
+}
+
 // Arrow's min_max over the selected values of each batch (filtered first under WHERE), merged
-// with Arrow's comparison kernels: byte-wise for VARCHAR, chronological for DATE.
+// with Arrow's comparison kernels: byte-wise for VARCHAR, chronological for DATE. NaN is ignored
+// across batches as min_max ignores it within one: NaN only when every value is NaN (D10).
 class MinMaxState final : public AggregateState {
  public:
   MinMaxState(bool min, std::shared_ptr<arrow::DataType> type, arrow::MemoryPool* pool)
@@ -355,12 +363,18 @@ class MinMaxState final : public AggregateState {
   }
 
  private:
-  // Keeps `candidate` if it is valid and beats the current best.
+  // Keeps `candidate` if it is valid and beats the current best. min_max yields NaN for a batch
+  // only when all its selected values are NaN, and every comparison with NaN is false, so NaN is
+  // decided first: any value replaces a NaN best and NaN never replaces another value. The result
+  // then does not depend on how the rows split into batches, files or partial states.
   arrow::Status Offer(const std::shared_ptr<arrow::Scalar>& candidate) {
     if (candidate == nullptr || !candidate->is_valid) {
       return arrow::Status::OK();
     }
-    if (best_ != nullptr) {
+    if (best_ != nullptr && !IsNaN(*best_)) {
+      if (IsNaN(*candidate)) {
+        return arrow::Status::OK();
+      }
       arrow::compute::ExecContext kernels(pool_);
       ARROW_ASSIGN_OR_RAISE(
           const arrow::Datum better,
