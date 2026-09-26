@@ -20,7 +20,8 @@ namespace antb1::cli {
 // kinds of the error report and of `bench`).
 std::string_view ErrorKind(const arrow::Status& status);
 
-// A JSON string literal (quotes, backslashes and control characters escaped; other bytes as is).
+// A JSON string literal, escaped like `--format json` values (engine::JsonEscape): always valid
+// UTF-8, whatever the bytes of an identifier, a path or a --machine name.
 std::string JsonString(std::string_view s);
 
 // ---- antb1 bench: ClickBench-format runs (docs/benchmarks.md) ----

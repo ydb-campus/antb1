@@ -76,10 +76,10 @@ std::size_t Utf8SequenceLength(std::string_view s, std::size_t i) {
   return len;
 }
 
-// JSON string body with control characters escaped and every byte of an ill-formed UTF-8 sequence
-// rendered as the text \xHH, so the output is always valid UTF-8. An ill-formed sequence is
-// escaped one byte at a time: the bytes after its first either start a well-formed sequence or
-// are escaped in turn (a continuation byte never starts one).
+}  // namespace
+
+// An ill-formed sequence is escaped one byte at a time: the bytes after its first either start a
+// well-formed sequence or are escaped in turn (a continuation byte never starts one).
 std::string JsonEscape(std::string_view s) {
   std::string out;
   std::size_t i = 0;
@@ -105,6 +105,8 @@ std::string JsonEscape(std::string_view s) {
   }
   return out;
 }
+
+namespace {
 
 // The canonical text of a value ("NULL" for NULL) and whether it is NULL, which csv and json
 // print differently from a VARCHAR whose bytes are "NULL".

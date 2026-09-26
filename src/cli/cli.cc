@@ -57,20 +57,7 @@ std::string_view ErrorKind(const arrow::Status& status) {
   return "internal";
 }
 
-std::string JsonString(std::string_view s) {
-  std::string out = "\"";
-  for (const char c : s) {
-    if (c == '"' || c == '\\') {
-      out += '\\';
-      out += c;
-    } else if (static_cast<unsigned char>(c) < 0x20) {
-      out += std::format("\\u{:04x}", static_cast<unsigned char>(c));
-    } else {
-      out += c;
-    }
-  }
-  return out + "\"";
-}
+std::string JsonString(std::string_view s) { return "\"" + engine::JsonEscape(s) + "\""; }
 
 namespace {
 

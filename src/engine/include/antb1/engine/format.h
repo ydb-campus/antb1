@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 #include <arrow/array.h>
 #include <arrow/result.h>
@@ -21,5 +22,10 @@ std::string FormatValue(const arrow::Array& column, int64_t row, plan::LogicalTy
 // Renders a whole result: kTable (aligned, for humans), kCsv (RFC 4180, header row), kJson (array
 // of objects; numbers as JSON numbers except HUGEINT, which is a string to keep exactness).
 arrow::Result<std::string> FormatResult(const QueryResult& result, OutputFormat format);
+
+// The body of a JSON string (without the quotes): quotes, backslashes and control characters
+// escaped, and every byte of an ill-formed UTF-8 sequence written as the text \xHH, so the result
+// is always valid UTF-8. Also used by the CLI's error object and bench report.
+std::string JsonEscape(std::string_view s);
 
 }  // namespace antb1::engine

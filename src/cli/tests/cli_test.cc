@@ -148,6 +148,19 @@ TEST_F(CliTest, JsonErrorObject) {
             "\"offset\":21,\"length\":4,\"line\":1,\"column\":22}}\n");
 }
 
+// The error object stays valid UTF-8 JSON when the SQL holds ill-formed UTF-8 (here an overlong
+// NUL in a quoted identifier), escaped like --format json values.
+TEST_F(CliTest, JsonErrorObjectEscapesIllFormedUtf8) {
+  const std::string sql =
+      "SELECT \"a\xC0\x80"
+      "b\" FROM t";
+  auto r = Invoke({"query", "-c", sql, "--table", "t=" + path_, "--format", "json"});
+  EXPECT_EQ(r.code, kExitQueryError);
+  EXPECT_NE(r.err.find(R"("message":"column 'a\\xc0\\x80b' does not exist")"), std::string::npos)
+      << r.err;
+  EXPECT_EQ(r.err.find('\xC0'), std::string::npos) << r.err;
+}
+
 TEST_F(CliTest, UsageAndIoErrors) {
   auto missing_sql = Invoke({"query", "--format", "json"});
   EXPECT_EQ(missing_sql.code, kExitUsage);

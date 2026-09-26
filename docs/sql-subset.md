@@ -225,7 +225,8 @@ errors such as an unknown option are always reported as plain text by CLI11):
 {"error":{"kind":"bind","message":"table 'nope' does not exist","offset":21,"length":4,"line":1,"column":22}}
 ```
 
-The kinds are `parse`, `unsupported`, `bind`, `io`, `execution` and `internal`.
+The kinds are `parse`, `unsupported`, `bind`, `io`, `execution` and `internal`. Strings in the error object (and in
+the `antb1 bench` report) are escaped like `--format json` values, so it is valid UTF-8 whatever bytes the SQL holds.
 
 ## Divergences from DuckDB
 
