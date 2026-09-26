@@ -1,0 +1,1 @@
+{"error":{"kind":"bind","message":"cannot compare INTEGER column 'CounterID' with a string; write a number without quotes","offset":41,"length":3,"line":1,"column":42}}

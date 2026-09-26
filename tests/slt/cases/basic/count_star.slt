@@ -62,3 +62,14 @@ SELECT COUNT(*) FROM hits_like_required
 
 statement ok
 SELECT COUNT(*) FROM hits_like
+
+# An alias only renames the result column.
+query I nosort
+SELECT count(*) AS "Rows" FROM hits_like_split
+----
+10000
+
+query I nosort
+SELECT COUNT(*) n FROM edge;
+----
+12

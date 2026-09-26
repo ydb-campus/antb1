@@ -16,6 +16,7 @@
 #include "antb1/plan/binder.h"
 #include "antb1/plan/catalog.h"
 #include "antb1/plan/explain.h"
+#include "antb1/plan/optimizer.h"
 #include "antb1/plan/sql_status.h"
 #include "antb1/sql/parser.h"
 
@@ -61,9 +62,12 @@ arrow::Result<plan::LogicalPlan> ParseAndBind(std::string_view sql, const plan::
     return plan::ToArrowStatus(stmt.error());
   }
   auto bound = plan::Bind(*stmt, catalog);
+  if (bound.ok()) {
+    *bound = plan::Optimize(*bound);
+  }
   if (timings != nullptr) {
     timings->parse = t1 - t0;
-    timings->bind = Clock::now() - t1;
+    timings->bind = Clock::now() - t1;  // bind and optimize
   }
   return bound;
 }

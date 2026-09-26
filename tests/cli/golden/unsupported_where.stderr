@@ -1,0 +1,4 @@
+antb1: unsupported error: an aggregate over table data cannot be executed yet: only SELECT COUNT(*) FROM <table> (without WHERE) is answered
+  at line 1, column 8
+  SELECT COUNT(*) FROM t
+         ^^^^^^^^

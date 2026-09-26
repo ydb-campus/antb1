@@ -1,6 +1,6 @@
 #include "antb1/plan/catalog.h"
 
-#include <cctype>
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -12,9 +12,19 @@ namespace antb1::plan {
 std::string AsciiLower(std::string_view text) {
   std::string out(text);
   for (char& c : out) {
-    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (c >= 'A' && c <= 'Z') {
+      c = static_cast<char>(c - 'A' + 'a');  // ASCII only, whatever the C locale
+    }
   }
   return out;
+}
+
+bool IsPlainIdentifier(std::string_view name) {
+  const auto word = [](char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+  };
+  const bool starts_with_digit = !name.empty() && name.front() >= '0' && name.front() <= '9';
+  return !name.empty() && !starts_with_digit && std::ranges::all_of(name, word);
 }
 
 arrow::Status Catalog::Register(const std::string& name, const std::shared_ptr<Table>& table) {

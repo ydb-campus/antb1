@@ -40,13 +40,14 @@ ResultSet Ints(std::vector<std::string> values) {
   return r;
 }
 
+// SELECT COUNT(*) [[AS] alias] FROM t: what antb1 answers today (kSupportedFeatures).
 bool UsesOnlyCountStar(const std::string& sql) {
   std::string lower = sql;
   std::ranges::transform(lower, lower.begin(), [](char c) {
     return static_cast<char>(c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c);
   });
   return lower.contains("count") && lower.contains('*') && !lower.contains("where") &&
-         !lower.contains(',') && !lower.contains("limit") && !lower.contains(" a1");
+         !lower.contains(',') && !lower.contains("limit");
 }
 
 ExecResult Unsupported() {

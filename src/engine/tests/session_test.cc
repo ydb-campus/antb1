@@ -97,5 +97,48 @@ TEST_F(SessionTest, ExplainShowsRowCount) {
             "Output: count_star():BIGINT\nRowCount table=t source=parquet(files=1, rows=10)\n");
 }
 
+// Explain shows the optimized plan of every bound query: pruned scans, folded literals.
+TEST_F(SessionTest, ExplainShowsTheOptimizedPlan) {
+  SessionOptions options;
+  options.default_overrides.emplace_back("EventDate", plan::LogicalType::kDate);
+  auto session = Session::Make(options).ValueOrDie();
+  ASSERT_TRUE(session->RegisterParquet("t", {path_}).ok());
+  auto text = session->Explain(
+      "SELECT MIN(EventDate) AS first, SUM(advengineid) FROM t WHERE AdvEngineID > 0.5 AND "
+      "EventDate < '2013-07-16'");
+  ASSERT_TRUE(text.ok()) << text.status().ToString();
+  EXPECT_EQ(*text,
+            "Output: first:DATE sum(advengineid):HUGEINT\n"
+            "Aggregate MIN(EventDate), SUM(AdvEngineID)\n"
+            "  Filter AdvEngineID >= 1 AND EventDate < DATE '2013-07-16'\n"
+            "    Scan table=t source=parquet(files=1, rows=10) columns=[AdvEngineID, EventDate]\n");
+}
+
+// The binder accepts the whole grammar; the executor answers only COUNT(*) without WHERE so far,
+// so everything else is Unsupported (exit code 4), not an internal error.
+TEST_F(SessionTest, QueriesTheExecutorCannotRunYetAreUnsupported) {
+  auto session = Session::Make().ValueOrDie();
+  ASSERT_TRUE(session->RegisterParquet("t", {path_}).ok());
+  for (const char* sql :
+       {"SELECT * FROM t", "SELECT AdvEngineID FROM t LIMIT 3", "SELECT SUM(AdvEngineID) FROM t",
+        "SELECT COUNT(*) FROM t WHERE AdvEngineID <> 70000", "SELECT COUNT(*) FROM t LIMIT 1"}) {
+    auto result = session->Execute(sql);
+    ASSERT_FALSE(result.ok()) << sql;
+    const auto detail = plan::GetSqlError(result.status());
+    ASSERT_NE(detail, nullptr) << sql << ": " << result.status().ToString();
+    EXPECT_EQ(detail->kind(), plan::SqlErrorDetail::Kind::kUnsupported) << sql;
+    EXPECT_TRUE(result.status().IsNotImplemented()) << sql;
+  }
+  // Bind errors come first.
+  auto bind = session->Execute("SELECT SUM(nope) FROM t");
+  const auto detail = plan::GetSqlError(bind.status());
+  ASSERT_NE(detail, nullptr) << bind.status().ToString();
+  EXPECT_EQ(detail->kind(), plan::SqlErrorDetail::Kind::kBind);
+  // COUNT(*) with an alias is still answered from the footers.
+  auto count = session->Execute("SELECT COUNT(*) AS n FROM t");
+  ASSERT_TRUE(count.ok()) << count.status().ToString();
+  EXPECT_EQ(count->names, std::vector<std::string>{"n"});
+}
+
 }  // namespace
 }  // namespace antb1::engine

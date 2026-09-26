@@ -1,0 +1,95 @@
+# SQL that parses but is wrong for the tables: both engines reject it when binding. antb1 answers
+# with a `bind:` error (exit code 1) that points at the offending name or literal, never with
+# Unsupported (docs/sql-subset.md, "Binding").
+
+statement error
+SELECT NoSuchColumn FROM hits_like
+
+statement error
+SELECT COUNT(NoSuchColumn) FROM hits_like
+
+statement error
+SELECT COUNT(*) FROM hits_like WHERE NoSuchColumn = 1
+
+# SUM and AVG need numbers: not VARCHAR, not DATE.
+
+statement error
+SELECT SUM(Title) FROM hits_like
+
+statement error
+SELECT AVG(s) FROM edge
+
+statement error
+SELECT SUM(EventDate) FROM hits_like
+
+# Without GROUP BY, a select list with aggregates cannot also select plain columns.
+
+statement error
+SELECT RegionID, COUNT(*) FROM hits_like
+
+statement error
+SELECT MAX(i16), id FROM edge
+
+# A DATE column compares with dates only; a date string must be a valid date.
+
+statement error
+SELECT COUNT(*) FROM hits_like WHERE EventDate = 15887
+
+statement error
+SELECT COUNT(*) FROM hits_like WHERE EventDate >= 'not a date'
+
+statement error
+SELECT COUNT(*) FROM hits_like WHERE EventDate < DATE '2013-02-30'
+
+# The error kinds and messages antb1 reports.
+
+onlyif antb1
+statement error ^bind: column 'NoSuchColumn' does not exist$
+SELECT NoSuchColumn FROM hits_like
+
+onlyif antb1
+statement error ^bind: SUM needs a numeric column, but 'Title' is VARCHAR$
+SELECT SUM(Title) FROM hits_like
+
+onlyif antb1
+statement error ^bind: AVG needs a numeric column, but 's' is VARCHAR$
+SELECT AVG(s) FROM edge
+
+onlyif antb1
+statement error ^bind: SUM needs a numeric column, but 'EventDate' is DATE$
+SELECT SUM(EventDate) FROM hits_like
+
+onlyif antb1
+statement error ^bind: column 'RegionID' must be inside an aggregate function
+SELECT RegionID, COUNT(*) FROM hits_like
+
+onlyif antb1
+statement error ^bind: cannot compare DATE column 'EventDate' with a number
+SELECT COUNT(*) FROM hits_like WHERE EventDate = 15887
+
+onlyif antb1
+statement error ^bind: invalid date 'not a date': expected YYYY-MM-DD$
+SELECT COUNT(*) FROM hits_like WHERE EventDate >= 'not a date'
+
+onlyif antb1
+statement error ^bind: invalid date
+SELECT COUNT(*) FROM hits_like WHERE EventDate < DATE '2013-02-30'
+
+# Registered divergences (docs/sql-subset.md): antb1 rejects a literal of another type where DuckDB
+# casts it, and accepts dates only as YYYY-MM-DD.
+
+onlyif antb1
+statement error ^bind: cannot compare INTEGER column 'RegionID' with a string
+SELECT COUNT(*) FROM hits_like WHERE RegionID = '42'
+
+onlyif antb1
+statement error ^bind: cannot compare VARCHAR column 'u' with a number
+SELECT COUNT(*) FROM edge WHERE u = 1
+
+onlyif antb1
+statement error ^bind: invalid date '2013-7-1'
+SELECT COUNT(*) FROM hits_like WHERE EventDate = '2013-7-1'
+
+onlyif antb1
+statement error ^bind: AVG needs a numeric column, but 'EventDate' is DATE$
+SELECT AVG(EventDate) FROM hits_like

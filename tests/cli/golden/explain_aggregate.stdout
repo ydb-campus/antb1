@@ -1,0 +1,4 @@
+Output: count_star():BIGINT width:HUGEINT max(EventDate):DATE
+Aggregate COUNT(*), SUM(ResolutionWidth), MAX(EventDate)
+  Filter IsMobile = 1 AND UserAgent >= 2 AND RegionID IS NOT NULL AND EventDate >= DATE '2013-07-10'
+    Scan table=t source=parquet(files=1, rows=10000) columns=[EventDate, RegionID, UserAgent, ResolutionWidth, IsMobile]

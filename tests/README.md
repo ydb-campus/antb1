@@ -27,10 +27,11 @@ a log. Its own queries (`data/hits0_slice.sql`) and relations (`data/hits_relati
 
 ## What antb1 supports: `slt/supported_features.h`
 
-`kSupportedFeatures` declares the SQL features antb1 answers today (now `SELECT COUNT(*) FROM <name | 'path'>`
-in any case, quoting and layout). The random differential test generates queries from it, and the metamorphic
-relations are active or pending by it. The PR that implements a feature adds it there; the tests then demand
-correct answers for it.
+`kSupportedFeatures` declares the SQL features antb1 answers today (now
+`SELECT COUNT(*) [[AS] alias] FROM <name | 'path'>` in any case, quoting and layout; the binder already accepts
+the whole target grammar, but the executor does not run it yet). The random differential test generates queries
+from it, and the metamorphic relations are active or pending by it. The PR that implements a feature adds it
+there; the tests then demand correct answers for it.
 
 ## Metamorphic relations (`metamorphic/`)
 

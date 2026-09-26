@@ -93,7 +93,31 @@ antb1_add_cli_golden(
   unsupported_explain
   EXIT_CODE 4
   STDERR
-  ARGS explain -c "SELECT * FROM t LIMIT 10" --table "${_t}"
+  ARGS explain -c "SELECT * FROM t ORDER BY WatchID LIMIT 10" --table "${_t}"
+)
+antb1_add_cli_golden(
+  unsupported_where
+  EXIT_CODE 4
+  STDERR
+  ARGS query -c "SELECT COUNT(*) FROM t\nWHERE IsMobile = 1" --table "${_t}"
+)
+antb1_add_cli_golden(
+  error_bind_column
+  EXIT_CODE 1
+  STDERR
+  ARGS query -c "SELECT COUNT(*) FROM t WHERE nope = 1" --table "${_t}"
+)
+antb1_add_cli_golden(
+  error_bind_aggregate
+  EXIT_CODE 1
+  STDERR
+  ARGS explain -c "SELECT SUM(Title) FROM t" --table "${_t}"
+)
+antb1_add_cli_golden(
+  error_bind_literal_json
+  EXIT_CODE 1
+  STDERR
+  ARGS query -c "SELECT COUNT(*) FROM t WHERE CounterID = 'x'" --table "${_t}" --format json
 )
 antb1_add_cli_golden(usage_no_command EXIT_CODE 2 STDERR_REGEX "subcommand")
 antb1_add_cli_golden(
@@ -174,6 +198,20 @@ antb1_add_cli_golden(
 antb1_add_cli_golden(
   explain
   ARGS explain -c "${_count}" --table "t=${_f}/hits_like_split/part-*.parquet"
+)
+antb1_add_cli_golden(
+  explain_aggregate
+  ARGS
+    explain
+    --clickbench
+    -c
+    "SELECT COUNT(*), SUM(ResolutionWidth) AS width, MAX(EventDate) FROM t WHERE IsMobile = 1 AND UserAgent > 1.5 AND RegionID < 3000000000 AND EventDate >= '2013-07-10'"
+    --table
+    "${_t}"
+)
+antb1_add_cli_golden(
+  explain_projection
+  ARGS explain -c "SELECT URL, \"title\" AS t FROM t WHERE SearchPhrase <> '' LIMIT 10" --table "${_t}"
 )
 antb1_add_cli_golden(
   version

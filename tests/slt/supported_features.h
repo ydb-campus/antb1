@@ -187,12 +187,14 @@ class FeatureSet {
   std::uint64_t bits_ = 0;
 };
 
-// What antb1 answers today: SELECT COUNT(*) FROM <name | 'path'> (ClickBench Q0), in any case,
-// quoting and layout. Extend it in the PR that implements a feature.
+// What antb1 answers today: SELECT COUNT(*) [[AS] alias] FROM <name | 'path'> (ClickBench Q0), in
+// any case, quoting and layout. The binder accepts the whole target grammar, but the executor runs
+// only COUNT(*) without WHERE (from metadata) so far. Extend it in the PR that implements a
+// feature.
 inline constexpr FeatureSet kSupportedFeatures = {
-    Feature::kCountStar,   Feature::kTableName,      Feature::kTablePath,
-    Feature::kKeywordCase, Feature::kIdentifierCase, Feature::kQuotedIdentifier,
-    Feature::kLayout,      Feature::kSemicolon,
+    Feature::kCountStar,        Feature::kAlias,       Feature::kTableName,
+    Feature::kTablePath,        Feature::kKeywordCase, Feature::kIdentifierCase,
+    Feature::kQuotedIdentifier, Feature::kLayout,      Feature::kSemicolon,
 };
 
 }  // namespace antb1::slt

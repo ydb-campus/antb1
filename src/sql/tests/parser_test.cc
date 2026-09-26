@@ -378,6 +378,28 @@ TEST(ParserTest, StatementSpan) {
   EXPECT_EQ(At(kSql, stmt->span), "SELECT COUNT(*) FROM events");
 }
 
+TEST(ParserTest, StarAndLimitSpans) {
+  constexpr std::string_view kSql = "SELECT /* all */ * FROM events LIMIT -- n\n 10 ;";
+  auto stmt = Parse(kSql);
+  ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
+  EXPECT_EQ(At(kSql, stmt->star_span), "*");
+  EXPECT_EQ(At(kSql, stmt->limit_span), "LIMIT -- n\n 10");
+  auto no_limit = Parse("SELECT a FROM t");
+  ASSERT_TRUE(no_limit.has_value());
+  EXPECT_EQ(no_limit->star_span, SourceSpan{});
+  EXPECT_EQ(no_limit->limit_span, SourceSpan{});
+}
+
+TEST(ParserTest, IsReservedWord) {
+  for (const std::string_view word : {"from", "FROM", "Select", "and", "where", "limit", "null"}) {
+    EXPECT_TRUE(IsReservedWord(word)) << word;
+  }
+  for (const std::string_view word : {"", "x", "date", "count", "sum", "year", "name", "events",
+                                      "from_", "fr om", "é", "a_very_long_identifier_name"}) {
+    EXPECT_FALSE(IsReservedWord(word)) << word;
+  }
+}
+
 TEST(ParserTest, TrailingSemicolon) {
   EXPECT_TRUE(Parse("SELECT a FROM t;").has_value());
   EXPECT_TRUE(Parse("SELECT a FROM t ;\n").has_value());
