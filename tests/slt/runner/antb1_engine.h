@@ -6,12 +6,18 @@
 #include <string_view>
 #include <vector>
 
+#include <arrow/result.h>
+
 #include "antb1/engine/session.h"
 
 #include "engine.h"
 #include "tables.h"
 
 namespace antb1::slt {
+
+// The rows of an antb1 result as canonical text (engine::FormatValue), NULL as std::nullopt.
+// Handles columns of any chunk layout.
+arrow::Result<ResultSet> ToResultSet(const engine::QueryResult& result);
 
 // antb1 through engine::Session. Values are formatted with engine::FormatValue (the canonical
 // text). Session-wide column overrides are the only mechanism the engine offers today, so the
