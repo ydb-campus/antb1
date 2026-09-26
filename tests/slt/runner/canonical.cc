@@ -14,6 +14,7 @@
 #include <utility>
 #include <vector>
 
+#include "antb1/common/utf8.h"
 #include "antb1/plan/literal.h"
 
 #include "engine.h"
@@ -21,38 +22,6 @@
 
 namespace antb1::slt {
 namespace {
-
-// Length of the valid UTF-8 sequence starting at s[i], or 0 (RFC 3629: no overlongs, no
-// surrogates).
-std::size_t Utf8SequenceLength(std::string_view s, std::size_t i) {
-  const auto byte = [&](std::size_t k) { return static_cast<unsigned char>(s[k]); };
-  const unsigned lead = byte(i);
-  std::size_t len = 0;
-  unsigned lo = 0x80;
-  unsigned hi = 0xBF;
-  if (lead >= 0xC2 && lead <= 0xDF) {
-    len = 2;
-  } else if (lead >= 0xE0 && lead <= 0xEF) {
-    len = 3;
-    lo = lead == 0xE0 ? 0xA0 : 0x80;
-    hi = lead == 0xED ? 0x9F : 0xBF;
-  } else if (lead >= 0xF0 && lead <= 0xF4) {
-    len = 4;
-    lo = lead == 0xF0 ? 0x90 : 0x80;
-    hi = lead == 0xF4 ? 0x8F : 0xBF;
-  } else {
-    return 0;
-  }
-  if (i + len > s.size() || byte(i + 1) < lo || byte(i + 1) > hi) {
-    return 0;
-  }
-  for (std::size_t k = 2; k < len; ++k) {
-    if (byte(i + k) < 0x80 || byte(i + k) > 0xBF) {
-      return 0;
-    }
-  }
-  return len;
-}
 
 std::string Hex(unsigned char c) { return std::format("\\x{:02x}", c); }
 

@@ -24,7 +24,8 @@ external libraries it may link. `antb1_add_module()` fails the configure step on
 Responsibilities:
 
 - `common`: invariant checks (`ANTB1_CHECK`, `ANTB1_DCHECK`), checked integer narrowing (`TryNarrow`, `Narrow`),
-  `SourceSpan`, the `Int128` helpers and the version string. Arrow-free.
+  `SourceSpan`, the `Int128` helpers, UTF-8 validation (`Utf8SequenceLength`, shared by the lexer, the JSON output and
+  the test harness) and the version string. Arrow-free.
 - `sql`: lexer, hand-written recursive-descent parser, AST with source spans, canonical unparser (`ToSql`) and
   `EqualIgnoringSpans`. Arrow-free; errors are `std::expected<T, sql::ParseError>`
   ([ADR 0008](adr/0008-parser-and-unparser.md)).
