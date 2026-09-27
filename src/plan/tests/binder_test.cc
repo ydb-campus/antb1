@@ -65,16 +65,31 @@ INSTANTIATE_TEST_SUITE_P(
     ::testing::Values(
         // Parsed but not answered yet: kUnsupported before any other check, even when the
         // table or a column does not exist.
-        ErrorCase{"SELECT i16, COUNT(*) FROM t GROUP BY i16", kUnsupported, "GROUP BY i16",
-                  "GROUP BY is not supported yet"},
-        ErrorCase{"SELECT nope FROM missing GROUP BY nope, \"Nope\"", kUnsupported,
-                  "GROUP BY nope, \"Nope\"", "GROUP BY is not supported yet"},
+        ErrorCase{"SELECT nope FROM missing ORDER BY nope", kUnsupported, "ORDER BY nope",
+                  "ORDER BY is not supported yet"},
         ErrorCase{"SELECT i16 FROM t ORDER BY i16 DESC NULLS FIRST, COUNT(*)", kUnsupported,
                   "ORDER BY i16 DESC NULLS FIRST, COUNT(*)", "ORDER BY is not supported yet"},
         ErrorCase{"SELECT i16 FROM t LIMIT 5 OFFSET 3", kUnsupported, "OFFSET 3",
                   "OFFSET is not supported yet"},
         ErrorCase{"SELECT COUNT(i16), COUNT(DISTINCT i32) FROM t", kUnsupported,
                   "COUNT(DISTINCT i32)", "COUNT(DISTINCT ...) is not supported yet"},
+        // GROUP BY: keys are table columns or aliases of plain select columns; every plain select
+        // column must be a key.
+        ErrorCase{"SELECT i16, i32, COUNT(*) FROM t GROUP BY i16", kBind, "i32",
+                  "column 'i32' must appear in the GROUP BY clause"},
+        ErrorCase{"SELECT * FROM ok GROUP BY i16", kBind, "*",
+                  "column 's' must appear in the GROUP BY clause"},
+        ErrorCase{"SELECT COUNT(*) FROM t GROUP BY nope", kBind, "nope",
+                  "column 'nope' does not exist"},
+        ErrorCase{"SELECT SUM(i16) AS total FROM t GROUP BY total", kBind, "total",
+                  "GROUP BY cannot refer to the aggregate 'total'"},
+        // A repeated alias means its last select item (DuckDB).
+        ErrorCase{"SELECT s AS k, COUNT(*) AS k FROM t GROUP BY k", kBind, "k",
+                  "GROUP BY cannot refer to the aggregate 'k'"},
+        ErrorCase{"SELECT nope FROM missing GROUP BY nope", kBind, "missing",
+                  "table 'missing' does not exist"},
+        ErrorCase{"SELECT i16 FROM t WHERE nope = 1 GROUP BY nope", kBind, "nope",
+                  "column 'nope' does not exist"},
         // Tables.
         ErrorCase{"SELECT COUNT(*) FROM nope", kBind, "nope", "table 'nope' does not exist"},
         ErrorCase{"SELECT COUNT(*) FROM \"nope\"", kBind, "\"nope\"", "does not exist"},
@@ -168,6 +183,71 @@ TEST(BinderTest, CountStarIsAnAggregateOverAScanOfEveryField) {
   EXPECT_EQ(scan.table_name, "t");
   EXPECT_EQ(scan.fields, (std::vector<int>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10}));
   EXPECT_EQ(kSql.substr(scan.span.offset, scan.span.length), "t");
+}
+
+// GroupAggregate outputs the keys, then the aggregates; the Project on top restores the select
+// order, so plain columns point at keys and aggregates follow the keys.
+TEST(BinderTest, GroupByBuildsAGroupAggregateUnderAProject) {
+  const Catalog catalog = MakeCatalog();
+  constexpr std::string_view kSql =
+      "SELECT COUNT(*) AS n, s, SUM(i32) FROM t WHERE i16 > 0 GROUP BY s, i16 LIMIT 3";
+  auto plan = BindSql(kSql, catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  ASSERT_EQ(plan->output.size(), 3U);
+  EXPECT_EQ(plan->output[0].name, "n");
+  EXPECT_EQ(plan->output[1].name, "s");
+  EXPECT_EQ(plan->output[1].type, LogicalType::kVarchar);
+  EXPECT_EQ(plan->output[2].name, "sum(i32)");
+  EXPECT_EQ(plan->output[2].type, LogicalType::kHugeInt);
+  EXPECT_EQ(std::get<LimitNode>(Nth(*plan, 0)).limit, 3);
+  const auto& project = std::get<ProjectNode>(Nth(*plan, 1));
+  ASSERT_EQ(project.columns.size(), 3U);
+  EXPECT_EQ(project.columns[0].index, 2);  // COUNT(*): after the two keys
+  EXPECT_EQ(project.columns[1].index, 0);  // s: the first key
+  EXPECT_EQ(project.columns[2].index, 3);  // SUM(i32)
+  const auto& group = std::get<GroupAggregateNode>(Nth(*plan, 2));
+  ASSERT_EQ(group.keys.size(), 2U);
+  EXPECT_EQ(group.keys[0].name, "s");
+  EXPECT_EQ(group.keys[0].index, 6);
+  EXPECT_EQ(group.keys[1].name, "i16");
+  EXPECT_EQ(group.keys[1].index, 0);
+  ASSERT_EQ(group.aggregates.size(), 2U);
+  EXPECT_EQ(group.aggregates[0].kind, AggKind::kCountStar);
+  EXPECT_EQ(group.aggregates[1].kind, AggKind::kSum);
+  EXPECT_EQ(kSql.substr(group.span.offset, group.span.length), "GROUP BY s, i16");
+  EXPECT_TRUE(std::holds_alternative<FilterNode>(Nth(*plan, 3)));
+  EXPECT_TRUE(std::holds_alternative<ScanNode>(Nth(*plan, 4)));
+}
+
+// A GROUP BY name is a table column first, else the alias of a plain select column (DuckDB);
+// repeated keys, also spelled differently, are one key; a key need not be selected.
+TEST(BinderTest, GroupByAliasesDuplicatesAndUnselectedKeys) {
+  const Catalog catalog = MakeCatalog();
+  auto alias = BindSql("SELECT s AS k, COUNT(*) FROM t GROUP BY k, s, \"S\"", catalog);
+  ASSERT_TRUE(alias.ok()) << alias.status().ToString();
+  const auto& group = std::get<GroupAggregateNode>(Nth(*alias, 1));
+  ASSERT_EQ(group.keys.size(), 1U);
+  EXPECT_EQ(group.keys[0].index, 6);
+  // An alias that is also a column name means the column.
+  auto shadow = BindSql("SELECT i16 AS i32, COUNT(*) FROM t GROUP BY i32, i16", catalog);
+  ASSERT_TRUE(shadow.ok()) << shadow.status().ToString();
+  EXPECT_EQ(std::get<GroupAggregateNode>(Nth(*shadow, 1)).keys.size(), 2U);
+  auto unselected = BindSql("SELECT MAX(d) FROM t GROUP BY dt, u16", catalog);
+  ASSERT_TRUE(unselected.ok()) << unselected.status().ToString();
+  const auto& project = std::get<ProjectNode>(Nth(*unselected, 0));
+  ASSERT_EQ(project.columns.size(), 1U);
+  EXPECT_EQ(project.columns[0].index, 2);
+  auto last_alias = BindSql("SELECT COUNT(*) AS k, s AS k, i16 AS k FROM t GROUP BY k, s", catalog);
+  // k is i16 (the last item named k), so both plain columns are keys.
+  ASSERT_TRUE(last_alias.ok()) << last_alias.status().ToString();
+  EXPECT_EQ(std::get<GroupAggregateNode>(Nth(*last_alias, 1)).keys.size(), 2U);
+  auto last = BindSql("SELECT COUNT(*) AS k, s AS k FROM t GROUP BY k", catalog);
+  ASSERT_TRUE(last.ok()) << last.status().ToString();
+  EXPECT_EQ(std::get<GroupAggregateNode>(Nth(*last, 1)).keys[0].index, 6);
+  auto keys_only = BindSql("SELECT s, i16 FROM t GROUP BY i16, s", catalog);
+  ASSERT_TRUE(keys_only.ok()) << keys_only.status().ToString();
+  EXPECT_TRUE(std::get<GroupAggregateNode>(Nth(*keys_only, 1)).aggregates.empty());
+  EXPECT_EQ(std::get<ProjectNode>(Nth(*keys_only, 0)).columns[0].index, 1);
 }
 
 TEST(BinderTest, SelectStarProjectsEveryColumn) {

@@ -50,6 +50,7 @@ struct NodeNameOf {
   std::string_view operator()(const FilterNode& /*node*/) const { return "Filter"; }
   std::string_view operator()(const ProjectNode& /*node*/) const { return "Project"; }
   std::string_view operator()(const AggregateNode& /*node*/) const { return "Aggregate"; }
+  std::string_view operator()(const GroupAggregateNode& /*node*/) const { return "GroupAggregate"; }
   std::string_view operator()(const LimitNode& /*node*/) const { return "Limit"; }
   std::string_view operator()(const RowCountNode& /*node*/) const { return "RowCount"; }
 };
@@ -59,6 +60,7 @@ struct InputOfNode {
   const LogicalNodePtr* operator()(const FilterNode& node) const { return &node.input; }
   const LogicalNodePtr* operator()(const ProjectNode& node) const { return &node.input; }
   const LogicalNodePtr* operator()(const AggregateNode& node) const { return &node.input; }
+  const LogicalNodePtr* operator()(const GroupAggregateNode& node) const { return &node.input; }
   const LogicalNodePtr* operator()(const LimitNode& node) const { return &node.input; }
   const LogicalNodePtr* operator()(const RowCountNode& /*node*/) const { return nullptr; }
 };

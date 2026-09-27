@@ -16,6 +16,7 @@
 #include "engine.h"
 #include "query_file.h"
 #include "result_diff.h"
+#include "unordered_limit.h"
 
 namespace antb1::slt {
 namespace {
@@ -183,7 +184,12 @@ QueryOutcome Check(const Statement& q, Engine& antb1, Engine& oracle) {
             .label = "DuckDB error",
             .failure = ErrorDiscrepancy("antb1 answers, but DuckDB fails", o.error())};
   }
-  if (auto d = CompareAnswers(*o, *a, SortMode::kRowSort, /*row_count_only=*/false)) {
+  // LIMIT without ORDER BY: any rows of the unlimited answer are right.
+  if (const auto unlimited_sql = UnlimitedSql(q.sql)) {
+    if (auto d = CompareLimited(*o, *a, [&] { return oracle.Execute(*unlimited_sql); })) {
+      return {.outcome = Outcome::kWrong, .label = "wrong answer", .failure = *std::move(d)};
+    }
+  } else if (auto d = CompareAnswers(*o, *a, SortMode::kRowSort, /*row_count_only=*/false)) {
     return {.outcome = Outcome::kWrong, .label = "wrong answer", .failure = *std::move(d)};
   }
   return {.outcome = Outcome::kPass, .label = "pass", .failure = {}};

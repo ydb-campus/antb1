@@ -111,9 +111,10 @@ TEST(QueryGenerator, QueriesRespectTheSemanticsBothEnginesShare) {
   for (uint64_t i = 0; i < 3000; ++i) {
     const auto q = gen.Generate(i);
     const std::string sql = Lower(q.sql);
-    const bool projection = q.features.Has(Feature::kColumns) || q.features.Has(Feature::kStar);
-    EXPECT_EQ(q.sort, projection ? SortMode::kRowSort : SortMode::kNoSort) << q.sql;
-    EXPECT_EQ(q.row_count_only, projection && q.features.Has(Feature::kLimit)) << q.sql;
+    const bool rows = q.features.Has(Feature::kColumns) || q.features.Has(Feature::kStar) ||
+                      q.features.Has(Feature::kGroupBy);
+    EXPECT_EQ(q.sort, rows ? SortMode::kRowSort : SortMode::kNoSort) << q.sql;
+    EXPECT_EQ(q.unordered_limit, rows && q.features.Has(Feature::kLimit)) << q.sql;
     if (q.features.Has(Feature::kTablePath)) {
       // DuckDB reads the raw file there: a column typed through the clickbench option differs.
       EXPECT_FALSE(sql.contains("eventdate") || q.features.Has(Feature::kStar)) << q.sql;

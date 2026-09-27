@@ -76,6 +76,13 @@ struct NodeLine {
   std::string operator()(const AggregateNode& node) const {
     return "Aggregate " + Join(node.aggregates, AggregateText, ", ");
   }
+  std::string operator()(const GroupAggregateNode& node) const {
+    std::string line = "GroupAggregate keys=[" + Join(node.keys, ColumnName, ", ") + "]";
+    if (!node.aggregates.empty()) {
+      line += " " + Join(node.aggregates, AggregateText, ", ");
+    }
+    return line;
+  }
   std::string operator()(const LimitNode& node) const {
     return std::format("Limit {}", node.limit);
   }

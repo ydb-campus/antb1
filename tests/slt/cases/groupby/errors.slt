@@ -1,0 +1,11 @@
+# A plain column of a grouped select list must be a key.
+
+statement error must appear in the GROUP BY clause
+SELECT OS, IsMobile, COUNT(*) FROM hits_like GROUP BY OS
+
+statement error must appear in the GROUP BY clause
+SELECT * FROM edge GROUP BY id
+
+statement error nope
+SELECT COUNT(*) FROM hits_like GROUP BY nope
+

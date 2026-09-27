@@ -94,9 +94,11 @@ agree on `clickbench`, and `FROM '<path>'` also reads `EventDate` as DATE on ant
 ## Random differential test
 
 `antb1-slt diff` generates queries over the tables of `tables.txt`, runs each on antb1 and on DuckDB and
-compares the results with the same comparator (rowsort for projections; for a projection with LIMIT only the
-column types and the row count). The column types must match exactly (`BIGINT`, `HUGEINT`, ...), not only
-their `I`/`R`/`T` class. Query `i` of seed `s` depends only on `s`, `i`, the tables and the supported
+compares the results with the same comparator (rowsort for projections and `GROUP BY`). With a `LIMIT` and no
+`ORDER BY`, any rows of the unlimited answer are right: antb1 must return as many rows as DuckDB, each one a
+distinct row of DuckDB's answer to the same query without the `LIMIT` (`CompareSubset`; the query files of the data
+tests and the ClickBench runner check the same way). The column types must match exactly (`BIGINT`, `HUGEINT`, ...),
+not only their `I`/`R`/`T` class. Query `i` of seed `s` depends only on `s`, `i`, the tables and the supported
 features, so one case reproduces alone.
 
 - 75% of the queries use only the features in `supported_features.h` (`kSupportedFeatures`); the rest

@@ -1,0 +1,75 @@
+# Every aggregate per group: the same semantics as without GROUP BY (exact integer SUM and AVG, NULLs
+# skipped, NULL over a group without values).
+
+query IIIIRTT rowsort
+SELECT OS, COUNT(*), COUNT(Title), SUM(ResolutionWidth), AVG(ResolutionWidth), MIN(EventDate), MAX(URL) FROM hits_like_nulls WHERE OS < 8 GROUP BY OS
+----
+0	78	68	100560	1358.918918918919	2013-07-01	https://www.example.org/погода/76928?q=λόγος
+1	77	71	95980	1391.0144927536232	2013-07-01	https://www.example.org/погода/22072?q=музыка
+2	89	80	107410	1377.051282051282	2013-07-01	https://www.example.org/погода/89216?q=lemon
+3	87	81	118534	1481.675	2013-07-01	https://www.example.org/погода/91296?q=delta
+4	67	63	87376	1409.2903225806451	2013-07-01	https://www.example.org/погода/8888?q=river
+5	62	55	78444	1400.7857142857142	2013-07-01	https://www.example.org/погода/17328?q=omega
+6	80	72	112358	1459.1948051948052	2013-07-01	https://www.example.org/погода/88792?q=pixel
+7	68	64	91024	1492.1967213114754	2013-07-03	https://www.example.org/погода/68288?q=beta
+
+# SUM of BIGINT beyond int64 in a group, and AVG of extremes.
+query IIIRII rowsort
+SELECT i16, SUM(i64), COUNT(i64), AVG(i64), MIN(i64), MAX(i64) FROM edge GROUP BY i16
+----
+-1	-1	1	-1	-1	-1
+-100	-1000000000000000	1	-1e+15	-1000000000000000	-1000000000000000
+-12345	-42	1	-42	-42	-42
+-32768	-9223372036854775808	1	-9223372036854775808	-9223372036854775808	-9223372036854775808
+0	0	1	0	0	0
+1	1	1	1	1	1
+100	1000000000000000	1	1e+15	1000000000000000	1000000000000000
+12345	42	1	42	42	42
+32767	9223372036854775807	1	9223372036854775808	9223372036854775807	9223372036854775807
+7	7	1	7	7	7
+NULL	NULL	0	NULL	NULL	NULL
+
+query TRRRRR rowsort
+SELECT u, SUM(d), AVG(d), MIN(d), MAX(d), AVG(i32) FROM edge GROUP BY u
+----
+(empty)	-0.5	-0.5	-0.5	-0.5	-2147483648
+NULL	-0.3333333333333333	-0.3333333333333333	-0.3333333333333333	-0.3333333333333333	-7
+\x28empty)	NULL	NULL	NULL	NULL	NULL
+a	0.3333333333333333	0.3333333333333333	0.3333333333333333	0.3333333333333333	2147483647
+back\\slash	0.1	0.1	0.1	0.1	1
+line\nbreak	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	-1
+tab\there	0	0	0	0	0
+trailing space\x20	123456789.125	123456789.125	123456789.125	123456789.125	1e+05
+x\x7fy	-9007199254740992	-9007199254740992	-9007199254740992	-9007199254740992	-1e+05
+Привет, мир	9.99999993e-10	9.99999993e-10	9.99999993e-10	9.99999993e-10	7
+日本語	922337203685477632	922337203685477632	922337203685477632	922337203685477632	54321
+
+query TTTII rowsort
+SELECT s, MIN(u), MAX(u), MIN(u16), MAX(i32) FROM edge GROUP BY s
+----
+(empty)	(empty)	(empty)	0	-2147483648
+NULL	日本語	日本語	12	54321
+\x20leading space	trailing space\x20	trailing space\x20	15917	100000
+\x4eULL	\x28empty)	\x28empty)	NULL	NULL
+a	a	a	65535	2147483647
+back\\slash	back\\slash	back\\slash	15887	1
+line\nbreak	line\nbreak	line\nbreak	32768	-1
+naïve café	NULL	NULL	7	-7
+tab\there	tab\there	tab\there	1	0
+x\x01y	x\x7fy	x\x7fy	40000	-100000
+Привет, мир	Привет, мир	Привет, мир	2	7
+
+# A group whose argument values are all NULL.
+query IIIIR rowsort
+SELECT IsMobile, COUNT(SocialAction), SUM(HistoryLength), MIN(HistoryLength), AVG(HistoryLength) FROM hits_like_nulls GROUP BY IsMobile
+----
+0	0	NULL	NULL	NULL
+1	0	NULL	NULL	NULL
+NULL	0	NULL	NULL	NULL
+
+# The aggregates of a grouped query are exactly those without GROUP BY, per group.
+query IIIR rowsort
+SELECT CounterID, SUM(UserID), COUNT(*), AVG(ClientIP) FROM hits_like_split WHERE CounterID < 100 GROUP BY CounterID
+----
+62	566968500224212501132	242	-41145722.13636363
+

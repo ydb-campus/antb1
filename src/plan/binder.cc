@@ -1,5 +1,6 @@
 #include "antb1/plan/binder.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <format>
 #include <memory>
@@ -313,9 +314,14 @@ arrow::Result<Predicate> BindComparison(const sql::Comparison& cmp, const BoundC
 }
 
 struct SelectList {
-  std::vector<BoundColumn> columns;       // a projection: SELECT * or plain columns
-  std::vector<AggregateCall> aggregates;  // or a global aggregation
+  std::vector<BoundColumn> columns;       // SELECT * or plain columns, in select order
+  std::vector<AggregateCall> aggregates;  // aggregates, in select order
   std::vector<OutputColumn> output;
+  // Per output column: an index into `aggregates` (true) or `columns` (false).
+  std::vector<std::pair<bool, std::size_t>> items;
+  std::vector<SourceSpan> column_spans;     // per entry of `columns`: what the error points at
+  std::vector<std::string> column_written;  // per entry of `columns`: the name as written
+  std::vector<std::optional<std::string>> aliases;  // per output column
   SourceSpan span;
 };
 
@@ -327,6 +333,10 @@ arrow::Result<SelectList> BindSelectList(const sql::SelectStatement& stmt,
     for (int i = 0; i < schema.num_fields(); ++i) {
       ARROW_ASSIGN_OR_RAISE(BoundColumn column, columns.Field(i, stmt.star_span));
       list.output.push_back(OutputColumn{.name = column.name, .type = column.type});
+      list.items.emplace_back(false, list.columns.size());
+      list.column_spans.push_back(stmt.star_span);
+      list.column_written.push_back(column.name);
+      list.aliases.emplace_back();
       list.columns.push_back(std::move(column));
     }
     return list;
@@ -341,6 +351,8 @@ arrow::Result<SelectList> BindSelectList(const sql::SelectStatement& stmt,
       ARROW_ASSIGN_OR_RAISE(AggregateCall bound, BindAggregate(*call, columns));
       list.output.push_back(
           OutputColumn{.name = item.alias.value_or(ResultName(*call)), .type = bound.type});
+      list.items.emplace_back(true, list.aggregates.size());
+      list.aliases.push_back(item.alias);
       list.aggregates.push_back(std::move(bound));
       continue;
     }
@@ -349,12 +361,16 @@ arrow::Result<SelectList> BindSelectList(const sql::SelectStatement& stmt,
     // DuckDB names a plain column by its declared name, not as written.
     list.output.push_back(
         OutputColumn{.name = item.alias.value_or(column.name), .type = column.type});
+    list.items.emplace_back(false, list.columns.size());
+    list.column_spans.push_back(ref.span);
+    list.column_written.push_back(ref.name);
+    list.aliases.push_back(item.alias);
     list.columns.push_back(std::move(column));
     if (first_column == nullptr) {
       first_column = &ref;
     }
   }
-  if (!list.aggregates.empty() && first_column != nullptr) {
+  if (stmt.group_by.empty() && !list.aggregates.empty() && first_column != nullptr) {
     return BindError(std::format("column '{}' must be inside an aggregate function: a select list "
                                  "with aggregates cannot also select plain columns (there is no "
                                  "GROUP BY)",
@@ -380,14 +396,64 @@ arrow::Status CheckNotYetSupported(const sql::SelectStatement& stmt) {
       return UnsupportedError("COUNT(DISTINCT ...) is not supported yet", agg->span);
     }
   }
-  if (!stmt.group_by.empty()) {
-    return UnsupportedError("GROUP BY is not supported yet", stmt.group_by_span);
-  }
   if (!stmt.order_by.empty()) {
     return UnsupportedError("ORDER BY is not supported yet", stmt.order_by_span);
   }
   if (stmt.offset.has_value()) {
     return UnsupportedError("OFFSET is not supported yet", stmt.offset_span);
+  }
+  return arrow::Status::OK();
+}
+
+// The GROUP BY keys: a table column, or else the alias of a plain column in the select list (the
+// last item with that alias, as in DuckDB); duplicates are dropped.
+arrow::Result<std::vector<BoundColumn>> BindGroupBy(const sql::SelectStatement& stmt,
+                                                    const Columns& columns,
+                                                    const SelectList& select) {
+  std::vector<BoundColumn> keys;
+  for (const sql::ColumnRef& ref : stmt.group_by) {
+    auto column = columns.Resolve(ref);
+    if (!column.ok()) {
+      const auto detail = GetSqlError(column.status());
+      const std::string wanted = AsciiLower(ref.name);
+      // The last select item with the alias wins, as in DuckDB.
+      for (std::size_t n = select.items.size();
+           n > 0 && detail != nullptr && detail->kind() == SqlErrorDetail::Kind::kBind; --n) {
+        const std::size_t i = n - 1;
+        const auto& alias = select.aliases[i];
+        if (!alias.has_value() || AsciiLower(*alias) != wanted) {
+          continue;
+        }
+        const auto [aggregate, index] = select.items[i];
+        if (aggregate) {
+          return BindError(std::format("GROUP BY cannot refer to the aggregate '{}'", *alias),
+                           ref.span);
+        }
+        column = select.columns[index];
+        break;
+      }
+    }
+    ARROW_RETURN_NOT_OK(column.status());
+    const bool duplicate = std::ranges::any_of(
+        keys, [&](const BoundColumn& key) { return key.index == column->index; });
+    if (!duplicate) {
+      keys.push_back(*std::move(column));
+    }
+  }
+  return keys;
+}
+
+// Every plain column of a grouped select list must be a key (as in DuckDB).
+arrow::Status CheckGrouped(const SelectList& select, const std::vector<BoundColumn>& keys) {
+  for (std::size_t i = 0; i < select.columns.size(); ++i) {
+    const bool key = std::ranges::any_of(
+        keys, [&](const BoundColumn& k) { return k.index == select.columns[i].index; });
+    if (!key) {
+      return BindError(std::format("column '{}' must appear in the GROUP BY clause or be inside an "
+                                   "aggregate function",
+                                   select.column_written[i]),
+                       select.column_spans[i]);
+    }
   }
   return arrow::Status::OK();
 }
@@ -407,6 +473,11 @@ arrow::Result<LogicalPlan> Bind(const sql::SelectStatement& stmt, const Catalog&
     ARROW_ASSIGN_OR_RAISE(Predicate predicate, BindComparison(cmp, column, *table));
     predicates.push_back(std::move(predicate));
   }
+  std::vector<BoundColumn> keys;
+  if (!stmt.group_by.empty()) {
+    ARROW_ASSIGN_OR_RAISE(keys, BindGroupBy(stmt, columns, select));
+    ARROW_RETURN_NOT_OK(CheckGrouped(select, keys));
+  }
   if (stmt.limit.has_value() && *stmt.limit < 0) {
     return BindError("LIMIT must not be negative", stmt.limit_span);
   }
@@ -421,7 +492,30 @@ arrow::Result<LogicalPlan> Bind(const sql::SelectStatement& stmt, const Catalog&
                            .predicates = std::move(predicates),
                            .span = Cover(stmt.where.front().span, stmt.where.back().span)});
   }
-  if (select.aggregates.empty()) {
+  if (!keys.empty()) {
+    // GroupAggregate outputs the keys, then the aggregates; a Project restores the select order.
+    std::vector<BoundColumn> projected;
+    for (std::size_t i = 0; i < select.items.size(); ++i) {
+      const auto [aggregate, index] = select.items[i];
+      if (aggregate) {
+        projected.push_back(BoundColumn{.index = Narrow<int>(keys.size() + index),
+                                        .name = select.output[i].name,
+                                        .type = select.aggregates[index].type});
+        continue;
+      }
+      const BoundColumn& column = select.columns[index];
+      const auto key =
+          std::ranges::find_if(keys, [&](const BoundColumn& k) { return k.index == column.index; });
+      projected.push_back(BoundColumn{
+          .index = Narrow<int>(key - keys.begin()), .name = column.name, .type = column.type});
+    }
+    node = Make(GroupAggregateNode{.input = std::move(node),
+                                   .keys = std::move(keys),
+                                   .aggregates = std::move(select.aggregates),
+                                   .span = stmt.group_by_span});
+    node = Make(ProjectNode{
+        .input = std::move(node), .columns = std::move(projected), .span = select.span});
+  } else if (select.aggregates.empty()) {
     node = Make(ProjectNode{
         .input = std::move(node), .columns = std::move(select.columns), .span = select.span});
   } else {

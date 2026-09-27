@@ -51,18 +51,17 @@ enum class Feature : std::uint8_t {
   kStringLiteral,    // 'text' (also a date as 'YYYY-MM-DD' compared with a DATE column)
   kDateLiteral,      // DATE 'YYYY-MM-DD'
   // LIMIT
-  kLimit,  // LIMIT n
+  kLimit,    // LIMIT n
+  kGroupBy,  // GROUP BY on plain columns
   // Lexical variants
   kKeywordCase,       // keywords in lower or mixed case
   kIdentifierCase,    // table and column names in another case than declared
   kQuotedIdentifier,  // "quoted" table and column names
   kLayout,            // newlines, tabs, -- and /* */ comments between tokens
   kSemicolon,         // a trailing ';'
-  // Out-of-scope markers: never in kSupportedFeatures and never generated. GROUP BY is parsed but
-  // not answered yet; the harness self-tests tag their "pending" canary query with HAVING, which
-  // stays outside the subset, so that path stays tested.
-  kGroupBy,  // GROUP BY (parsed, not answered yet)
-  kHaving,   // HAVING (not supported)
+  // Out-of-scope marker: never in kSupportedFeatures and never generated. The harness self-tests
+  // tag their "pending" canary query with it, so that path stays tested.
+  kHaving,  // HAVING (not supported)
 };
 
 inline constexpr std::size_t kFeatureCount = static_cast<std::size_t>(Feature::kHaving) + 1;
@@ -197,7 +196,7 @@ class FeatureSet {
 };
 
 // Out-of-scope markers: valid in `-- features:` tags, never generated (see Feature::kHaving).
-inline constexpr FeatureSet kNeverGenerated = {Feature::kGroupBy, Feature::kHaving};
+inline constexpr FeatureSet kNeverGenerated = {Feature::kHaving};
 
 // What antb1 answers today: the whole slice grammar of docs/sql-subset.md (global aggregates,
 // projections, WHERE conjunctions of column <op> literal, LIMIT) over every column type, in any
@@ -229,6 +228,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kStringLiteral,
     Feature::kDateLiteral,
     Feature::kLimit,
+    Feature::kGroupBy,
     Feature::kKeywordCase,
     Feature::kIdentifierCase,
     Feature::kQuotedIdentifier,

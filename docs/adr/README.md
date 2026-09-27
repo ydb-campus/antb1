@@ -15,3 +15,4 @@ in the same PR as the change it justifies, and list it below; `pixi run lint` ch
 | [0007](0007-ai-agents.md) | AI coding agents | Accepted |
 | [0008](0008-parser-and-unparser.md) | Hand-written parser with an unparser and a round-trip property | Accepted |
 | [0009](0009-ci-and-governance.md) | CI and repository governance | Accepted |
+| [0010](0010-grouped-aggregation.md) | Grouped aggregation | Accepted |

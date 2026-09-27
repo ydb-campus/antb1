@@ -18,7 +18,7 @@
 
 // Logical plan: a tree of immutable nodes (docs/architecture.md). The binder builds
 //
-//   [Limit] <- Project | Aggregate <- [Filter] <- Scan (every field of the table)
+//   [Limit] <- Project | Aggregate | Project <- GroupAggregate <- [Filter] <- Scan (every field)
 //
 // and plan::Optimize rewrites it (projection pruning, COUNT(*) -> RowCount). New operators are
 // added as new node structs in the LogicalNode variant; every std::visit over it lists each node
@@ -93,11 +93,12 @@ struct ScanNode;
 struct FilterNode;
 struct ProjectNode;
 struct AggregateNode;
+struct GroupAggregateNode;
 struct LimitNode;
 struct RowCountNode;
 
-using LogicalNode =
-    std::variant<ScanNode, FilterNode, ProjectNode, AggregateNode, LimitNode, RowCountNode>;
+using LogicalNode = std::variant<ScanNode, FilterNode, ProjectNode, AggregateNode,
+                                 GroupAggregateNode, LimitNode, RowCountNode>;
 using LogicalNodePtr = std::shared_ptr<const LogicalNode>;
 
 // Reads top-level fields of a table. Output: the fields, in this order.
@@ -130,6 +131,17 @@ struct AggregateNode {
   SourceSpan span;  // the select list
 };
 
+// Grouped aggregation (GROUP BY): one row per distinct combination of the keys (NULL is a key
+// value; a DOUBLE key groups -0.0 with 0.0 and every NaN together, keeping the value first seen).
+// Output: the keys, then one column per call; no row over no input rows. Row order is unspecified
+// (deterministic for a given input in the executor).
+struct GroupAggregateNode {
+  LogicalNodePtr input;
+  std::vector<BoundColumn> keys;  // distinct input columns
+  std::vector<AggregateCall> aggregates;
+  SourceSpan span;  // GROUP BY and its list
+};
+
 // Output: at most `limit` rows of the input.
 struct LimitNode {
   LogicalNodePtr input;
@@ -150,7 +162,7 @@ struct LogicalPlan {
   std::vector<OutputColumn> output;  // result columns of root: names (aliases applied) and types
 };
 
-// "Scan", "Filter", "Project", "Aggregate", "Limit" or "RowCount".
+// "Scan", "Filter", "Project", "Aggregate", "GroupAggregate", "Limit" or "RowCount".
 std::string_view NodeName(const LogicalNode& node);
 
 // The span of the query text a node was bound from.
