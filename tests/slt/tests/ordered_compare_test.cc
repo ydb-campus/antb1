@@ -62,8 +62,15 @@ class Oracle {
   Oracle(std::vector<ColumnClass> classes, std::vector<Row> ranked)
       : classes_(std::move(classes)), ranked_(std::move(ranked)) {}
 
-  ExecResult operator()(std::optional<int64_t> limit) {
+  // Answers "q" and "q LIMIT <n>" (the augmented query of Query()).
+  ExecResult operator()(const std::string& sql) {
     ++runs_;
+    std::optional<int64_t> limit;
+    if (sql.starts_with("q LIMIT ")) {
+      limit = std::stoll(sql.substr(8));
+    } else if (sql != "q") {
+      return std::unexpected(EngineError{.kind = "Parser", .message = "unexpected: " + sql});
+    }
     limits_.push_back(limit);
     std::vector<Row> rows = ranked_;
     if (limit.has_value() && std::cmp_less(*limit, rows.size())) {
@@ -163,13 +170,13 @@ TEST(CompareOrdered, RealValuesAndKeysUseTheTolerance) {
 TEST(CompareOrdered, ReportsOracleFailuresAndBadShapes) {
   const auto answer = Result({kI}, {{"1"}, {"2"}});
   const auto other = Result({kI}, {{"2"}, {"1"}});
-  const auto failing = [](std::optional<int64_t>) -> ExecResult {
+  const auto failing = [](const std::string&) -> ExecResult {
     return std::unexpected(EngineError{.kind = "Binder", .message = "Binder: no"});
   };
   const auto d = CompareOrdered(answer, other, Query(std::nullopt, 0), failing);
   ASSERT_TRUE(d.has_value());
   EXPECT_NE(d.value_or(Discrepancy{}).what.find("DuckDB fails"), std::string::npos);
-  const auto narrow = [&](std::optional<int64_t>) -> ExecResult { return answer; };
+  const auto narrow = [&](const std::string&) -> ExecResult { return answer; };
   const auto shape = CompareOrdered(answer, other, Query(std::nullopt, 0), narrow);
   ASSERT_TRUE(shape.has_value());
   EXPECT_NE(shape.value_or(Discrepancy{}).what.find("harness bug"), std::string::npos);

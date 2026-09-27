@@ -14,6 +14,7 @@
 #include <variant>
 #include <vector>
 
+#include "antb1/common/utf8.h"
 #include "antb1/sql/ast.h"
 #include "antb1/sql/parser.h"
 #include "antb1/sql/unparse.h"
@@ -147,9 +148,166 @@ std::string WithLimit(const OrderedQuery& q, std::optional<int64_t> rows) {
   return rows.has_value() ? std::format("{} LIMIT {}", q.augmented_sql, *rows) : q.augmented_sql;
 }
 
+namespace {
+
+// A canonical cell as a SQL literal; std::nullopt for text the harness cannot write (not UTF-8, or
+// with a NUL byte).
+std::optional<std::string> CellSql(const std::optional<std::string>& cell, char letter) {
+  if (!cell.has_value()) {
+    return "NULL";
+  }
+  const std::string& text = *cell;
+  if (letter == 'I') {
+    return std::format("CAST('{}' AS HUGEINT)", text);
+  }
+  if (letter == 'R') {
+    return std::format("CAST('{}' AS DOUBLE)", text);  // also nan, inf and -inf
+  }
+  std::string out = "'";
+  for (std::size_t i = 0; i < text.size();) {
+    const bool ascii = static_cast<unsigned char>(text[i]) < 0x80;
+    const std::size_t length = ascii ? 1 : Utf8SequenceLength(text, i);
+    if (length == 0 || text[i] == '\0') {
+      return std::nullopt;
+    }
+    for (std::size_t k = 0; k < length; ++k) {
+      out += text[i + k];
+      if (text[i + k] == '\'') {
+        out += '\'';
+      }
+    }
+    i += length;
+  }
+  return out + "'";
+}
+
+// `column` (of the augmented query) as compared with a literal of class `letter`: text classes
+// compare as DuckDB prints them, which is the canonical text (dates too).
+std::string Operand(std::string_view column, char letter) {
+  return letter == 'T' ? std::format("CAST({} AS VARCHAR)", column) : std::string(column);
+}
+
+// The rows of DuckDB's augmented query whose ORDER BY keys equal `key` (a row of it) and whose I
+// and T cells equal those of one of `wanted` (antb1 rows): everything needed to match those rows
+// against a run of ties that is too long to fetch whole. std::nullopt if a value cannot be written
+// as SQL.
+std::optional<std::string> RunMembersSql(const OrderedQuery& q, std::string_view letters,
+                                         std::string_view key_letters, const Cells& key,
+                                         std::size_t width,
+                                         const std::vector<const Cells*>& wanted) {
+  std::string columns;
+  for (std::size_t c = 0; c < width; ++c) {
+    columns += std::format("{}c{}", c == 0 ? "" : ", ", c);
+  }
+  for (std::size_t k = 0; k < key_letters.size(); ++k) {
+    columns += std::format("{}k{}", columns.empty() ? "" : ", ", k);
+  }
+  std::string where;
+  for (std::size_t k = 0; k < key_letters.size(); ++k) {
+    const std::string column = std::format("__antb1_a.k{}", k);
+    const auto literal = CellSql(key[width + k], key_letters[k]);
+    if (!literal.has_value()) {
+      return std::nullopt;
+    }
+    std::string condition;
+    if (!key[width + k].has_value()) {
+      condition = column + " IS NULL";
+    } else if (key_letters[k] == 'R') {
+      condition = std::format(
+          "(isnan({0}) AND isnan({1}) OR {0} = {1} OR abs({0} - {1}) <= {2} + {3} * "
+          "greatest(abs({0}), abs({1})))",
+          column, *literal, kAbsTolerance, kDefaultRelTolerance);
+    } else {
+      condition = std::format("{} = {}", Operand(column, key_letters[k]), *literal);
+    }
+    where += (where.empty() ? "" : " AND ") + condition;
+  }
+  std::vector<std::size_t> exact;
+  for (std::size_t c = 0; c < width; ++c) {
+    if (letters[c] != 'R') {
+      exact.push_back(c);
+    }
+  }
+  if (!exact.empty()) {
+    std::string values;
+    for (const Cells* row : wanted) {
+      std::string tuple;
+      for (const std::size_t c : exact) {
+        const auto literal = CellSql((*row)[c], letters[c]);
+        if (!literal.has_value()) {
+          return std::nullopt;
+        }
+        tuple += (tuple.empty() ? "" : ", ") + *literal;
+      }
+      values += std::format("{}({})", values.empty() ? "" : ", ", tuple);
+    }
+    std::string names;
+    std::string match;
+    for (std::size_t n = 0; n < exact.size(); ++n) {
+      names += std::format("{}v{}", n == 0 ? "" : ", ", n);
+      match += std::format("{}{} IS NOT DISTINCT FROM __antb1_v.v{}", n == 0 ? "" : " AND ",
+                           Operand(std::format("__antb1_a.c{}", exact[n]), letters[exact[n]]), n);
+    }
+    where += std::format("{}EXISTS (SELECT 1 FROM (VALUES {}) AS __antb1_v({}) WHERE {})",
+                         where.empty() ? "" : " AND ", values, names, match);
+  }
+  return std::format("SELECT * FROM ({}) AS __antb1_a({}){}{}", q.augmented_sql, columns,
+                     where.empty() ? "" : " WHERE ", where);
+}
+
+Discrepancy Mismatch(const ResultSet& oracle, const ResultSet& antb1, std::string_view letters,
+                     std::size_t row) {
+  return Discrepancy{
+      .what =
+          "antb1 returns a row that is not one of DuckDB's rows with the ORDER BY keys of its "
+          "position (rows with equal keys may come in any order)",
+      .mismatch = true,
+      .types = std::string(letters),
+      .expected = RenderBlock(oracle, SortMode::kNoSort, 0),
+      .actual = RenderBlock(antb1, SortMode::kNoSort, 0),
+      .first_row = row};
+}
+
+// Rows of `pool` by their run and their exact cells; a matched row leaves its bucket, so a long run
+// of equal rows costs no rescans.
+class Buckets {
+ public:
+  Buckets(const std::vector<Cells>& pool, std::string_view letters)
+      : pool_(pool), letters_(letters) {}
+
+  void Add(std::size_t run, std::size_t row) { buckets_[Key(run, pool_[row])].push_back(row); }
+  // Takes an unused row of `run` equal to `row` (R cells within the tolerance).
+  bool Take(std::size_t run, const Cells& row) {
+    const auto bucket = buckets_.find(Key(run, row));
+    if (bucket == buckets_.end()) {
+      return false;
+    }
+    std::vector<std::size_t>& unused = bucket->second;
+    for (std::size_t k = unused.size(); k > 0; --k) {
+      if (SameCells(pool_[unused[k - 1]], row, 0, letters_)) {
+        unused[k - 1] = unused.back();
+        unused.pop_back();
+        return true;
+      }
+    }
+    return false;
+  }
+
+ private:
+  [[nodiscard]] std::string Key(std::size_t run, const Cells& row) const {
+    return std::to_string(run) + '\x01' + ExactText(row, letters_);
+  }
+
+  const std::vector<Cells>& pool_;
+  std::string_view letters_;
+  std::unordered_map<std::string, std::vector<std::size_t>> buckets_;
+};
+
+}  // namespace
+
 std::optional<Discrepancy> CompareOrdered(
     const ResultSet& oracle, const ResultSet& antb1, const OrderedQuery& q,
-    const std::function<ExecResult(std::optional<int64_t>)>& run) {
+    const std::function<ExecResult(const std::string&)>& run) {
   const std::string letters = Letters(oracle);
   if (letters != Letters(antb1) || oracle.type_names != antb1.type_names ||
       oracle.rows.size() != antb1.rows.size()) {
@@ -162,78 +320,103 @@ std::optional<Discrepancy> CompareOrdered(
   const std::size_t width = letters.size();
   const int64_t window_end =
       q.limit.has_value() ? SaturatingAdd(q.offset, *q.limit) : std::numeric_limits<int64_t>::max();
-
-  // The oracle's ranked rows, up to the end of the run of ties that holds the window's last row.
-  ExecResult ranked;
-  std::string key_letters;
-  std::optional<int64_t> limit;
-  if (window_end < std::numeric_limits<int64_t>::max()) {
-    limit = SaturatingAdd(window_end, std::max(window_end, kMinExtraRows));
-  }
-  while (true) {
-    ranked = run(limit);
-    if (!ranked.has_value()) {
-      return ErrorDiscrepancy("DuckDB fails on the query with its ORDER BY keys selected",
-                              ranked.error());
-    }
-    const std::string all_letters = Letters(*ranked);
+  const auto check_shape = [&](const ResultSet& result) -> std::optional<Discrepancy> {
+    const std::string all_letters = Letters(result);
     if (all_letters.size() != width + q.keys || !all_letters.starts_with(letters)) {
       return Discrepancy{
           .what = std::format("the query with its ORDER BY keys selected has the columns {}, not "
                               "the query's {} and {} key(s) (a harness bug)",
                               all_letters, letters, q.keys)};
     }
-    key_letters = all_letters.substr(width);
+    return std::nullopt;
+  };
+
+  // The oracle's ranked rows, up to the end of the run of ties that holds the window's last row,
+  // or up to q.max_rows (then that run, the last one fetched, may go on: `open_run`).
+  ExecResult ranked;
+  std::string key_letters;
+  bool open_run = false;
+  std::optional<int64_t> limit;
+  if (window_end < std::numeric_limits<int64_t>::max()) {
+    limit = std::min(SaturatingAdd(window_end, std::max(window_end, kMinExtraRows)),
+                     std::max(q.max_rows, window_end + 1));
+  }
+  while (true) {
+    ranked = run(WithLimit(q, limit));
+    if (!ranked.has_value()) {
+      return ErrorDiscrepancy("DuckDB fails on the query with its ORDER BY keys selected",
+                              ranked.error());
+    }
+    if (auto d = check_shape(*ranked)) {
+      return d;
+    }
+    key_letters = Letters(*ranked).substr(width);
     const std::vector<Cells>& rows = ranked->rows;
     if (!limit.has_value() || std::cmp_less(rows.size(), *limit) || window_end == 0 ||
         !SameCells(rows[static_cast<std::size_t>(*limit - 1)],
                    rows[static_cast<std::size_t>(window_end - 1)], width, key_letters)) {
       break;
     }
-    limit = *limit == std::numeric_limits<int64_t>::max() ? std::nullopt
-                                                          : std::optional(SaturatingMul(*limit, 4));
+    if (*limit >= q.max_rows) {
+      open_run = true;
+      break;
+    }
+    limit = std::min(SaturatingMul(*limit, 4), std::max(q.max_rows, window_end + 1));
   }
 
-  // Runs of equal keys, and the rows of each run by their exact cells.
   const std::vector<Cells>& rows = ranked->rows;
   std::vector<std::size_t> run_of(rows.size(), 0);
-  std::unordered_map<std::string, std::vector<std::size_t>> by_run_and_cells;
+  Buckets buckets(rows, letters);
   for (std::size_t j = 0; j < rows.size(); ++j) {
     if (j > 0) {
       run_of[j] = run_of[j - 1] + (SameCells(rows[j - 1], rows[j], width, key_letters) ? 0U : 1U);
     }
-    by_run_and_cells[std::to_string(run_of[j]) + '\x01' + ExactText(rows[j], letters)].push_back(j);
+    buckets.Add(run_of[j], j);
   }
-
+  const std::size_t last_run = rows.empty() ? 0 : run_of.back();
+  std::vector<std::size_t> in_open_run;  // antb1 rows at ranks of the open run
   for (std::size_t i = 0; i < antb1.rows.size(); ++i) {
     const auto rank = static_cast<std::size_t>(SaturatingAdd(q.offset, static_cast<int64_t>(i)));
-    std::optional<std::size_t> match;
-    if (rank < rows.size()) {
-      // A bucket holds the unused rows of one run with the same exact cells: a matched row leaves
-      // it, so a long run of equal rows costs no rescans.
-      const auto bucket = by_run_and_cells.find(std::to_string(run_of[rank]) + '\x01' +
-                                                ExactText(antb1.rows[i], letters));
-      if (bucket != by_run_and_cells.end()) {
-        std::vector<std::size_t>& unused = bucket->second;
-        for (std::size_t k = unused.size(); k > 0 && !match; --k) {
-          if (SameCells(rows[unused[k - 1]], antb1.rows[i], 0, letters)) {
-            match = unused[k - 1];
-            unused[k - 1] = unused.back();
-            unused.pop_back();
-          }
-        }
-      }
+    if (open_run && rank < rows.size() && run_of[rank] == last_run) {
+      in_open_run.push_back(i);
+      continue;
     }
-    if (!match) {
-      return Discrepancy{
-          .what =
-              "antb1 returns a row that is not one of DuckDB's rows with the ORDER BY keys of its "
-              "position (rows with equal keys may come in any order)",
-          .mismatch = true,
-          .types = letters,
-          .expected = RenderBlock(oracle, SortMode::kNoSort, 0),
-          .actual = RenderBlock(antb1, SortMode::kNoSort, 0),
-          .first_row = i};
+    if (rank >= rows.size() || !buckets.Take(run_of[rank], antb1.rows[i])) {
+      return Mismatch(oracle, antb1, letters, i);
+    }
+  }
+  if (in_open_run.empty()) {
+    return std::nullopt;
+  }
+
+  // The run is too long to fetch: fetch only its rows that can match antb1's rows there.
+  std::vector<const Cells*> wanted;
+  wanted.reserve(in_open_run.size());
+  for (const std::size_t i : in_open_run) {
+    wanted.push_back(&antb1.rows[i]);
+  }
+  const auto sql = RunMembersSql(q, letters, key_letters, rows.back(), width, wanted);
+  if (!sql.has_value()) {
+    return Discrepancy{
+        .what = std::format("cannot check the rows at ranks tied beyond the first {} rows: a value "
+                            "is not valid UTF-8 text (a harness limitation)",
+                            rows.size())};
+  }
+  const ExecResult members = run(*sql);
+  if (!members.has_value()) {
+    return ErrorDiscrepancy("DuckDB fails on the query for the rows of a long run of ties",
+                            members.error());
+  }
+  if (auto d = check_shape(*members)) {
+    return d;
+  }
+  Buckets candidates(members->rows, letters);
+  for (std::size_t j = 0; j < members->rows.size(); ++j) {
+    candidates.Add(0, j);
+  }
+  for (const std::size_t i : in_open_run) {
+    if (!candidates.Take(0, antb1.rows[i])) {
+      return Mismatch(oracle, antb1, letters, i);
     }
   }
   return std::nullopt;
@@ -243,9 +426,8 @@ std::optional<Discrepancy> CompareQueryAnswers(std::string_view sql, const Resul
                                                const ResultSet& antb1_answer, Engine& oracle,
                                                bool rows, SortMode sort) {
   if (const auto ordered = MakeOrderedQuery(sql)) {
-    return CompareOrdered(oracle_answer, antb1_answer, *ordered, [&](std::optional<int64_t> n) {
-      return oracle.Execute(WithLimit(*ordered, n));
-    });
+    return CompareOrdered(oracle_answer, antb1_answer, *ordered,
+                          [&](const std::string& query) { return oracle.Execute(query); });
   }
   if (rows) {
     if (const auto unlimited = UnlimitedSql(sql)) {

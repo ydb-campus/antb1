@@ -54,7 +54,7 @@ antb1_add_gtest(
 )
 if(ANTB1_HAVE_DUCKDB)
   # plan::DuckDbFloatOf against the DuckDB library on seeded random literals.
-  target_sources(antb1_slt_tests PRIVATE tests/float_literal_oracle_test.cc)
+  target_sources(antb1_slt_tests PRIVATE tests/float_literal_oracle_test.cc tests/ordered_compare_oracle_test.cc)
 endif()
 
 # Test cases: tests/slt/cases/<area>/<file>.slt -> slt.<area>.<file> (+ oracle.<area>.<file>).

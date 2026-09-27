@@ -27,6 +27,9 @@ struct OrderedQuery {
   std::size_t keys = 0;       // ORDER BY keys, the last columns of the augmented query
   std::optional<int64_t> limit;
   int64_t offset = 0;
+  // The most rows fetched in order: a run of ties at the window's end that goes on beyond them is
+  // checked with a query for the rows that can match antb1's rows there instead.
+  int64_t max_rows = int64_t{1} << 20;
 };
 
 // The augmented form of a query with ORDER BY; std::nullopt without ORDER BY or for text antb1's
@@ -37,12 +40,13 @@ std::optional<OrderedQuery> MakeOrderedQuery(std::string_view sql);
 std::string WithLimit(const OrderedQuery& q, std::optional<int64_t> rows);
 
 // std::nullopt if antb1's answer is a right answer to the ordered query `q`. The oracle's answer
-// `oracle` is compared first (equal rows in equal order are right); only otherwise is the augmented
-// query run, through `run(limit)`, with limits that grow until the run of ties at the window's end
-// is complete.
-std::optional<Discrepancy> CompareOrdered(
-    const ResultSet& oracle, const ResultSet& antb1, const OrderedQuery& q,
-    const std::function<ExecResult(std::optional<int64_t>)>& run);
+// `oracle` is compared first (equal rows in equal order are right); only otherwise are more oracle
+// queries run through `run`: the augmented query with limits that grow until the run of ties at the
+// window's end is complete (at most q.max_rows), and, if that run is longer, one query for the rows
+// of the run that equal antb1's rows there (their exact cells written as SQL literals).
+std::optional<Discrepancy> CompareOrdered(const ResultSet& oracle, const ResultSet& antb1,
+                                          const OrderedQuery& q,
+                                          const std::function<ExecResult(const std::string&)>& run);
 
 // The comparison that fits `sql`: CompareOrdered with ORDER BY; CompareLimited for LIMIT or OFFSET
 // without ORDER BY when `rows` (a projection or GROUP BY: any rows are right); else CompareAnswers
