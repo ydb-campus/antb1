@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790532134379,
+  "lastUpdate": 1790536193873,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -684,6 +684,78 @@ window.BENCHMARK_DATA = {
             "value": 14.438383428571388,
             "unit": "ms/iter",
             "extra": "iterations: 49\ncpu: 14.43776418367347 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "3d41bb42ec5c32852bb257481771db59539d65c7",
+          "message": "feat(sql,exec): like and not like (#27)\n\n## Summary\n\n**`column [NOT] LIKE 'pattern'` in `WHERE`**, with DuckDB's semantics\nand checked against DuckDB.\n\n- **Semantics (probed on DuckDB 1.5.5):**\n- `%` matches any sequence of characters (none included), and `_`\nmatches exactly one UTF-8 character: `'é' LIKE '_'` is true;\n- there is no escape character (`\\` is a literal byte), and the match is\ncase-sensitive;\n  - a NULL value rejects the row for `LIKE` and for `NOT LIKE`;\n  - LIKE on a non-VARCHAR column is a bind error, as in DuckDB.\n- Bytes that are not UTF-8 count as one character each. DuckDB refuses\nto read such text as VARCHAR at all, so this is antb1's own rule, and\nthe docs say so.\n- **Parser:** `LIKE` and `NOT LIKE` become comparisons\n(`CompareOp::kLike`/`kNotLike`), always with the column on the left and\na literal pattern on the right. The unparser round-trips them. These\nstay unsupported (exit code 4): `ILIKE`, `LIKE ... ESCAPE`, a column as\nthe pattern, a literal on the left, and LIKE outside `WHERE`.\n- **Plan:**\n- `Predicate::Kind::kLike`/`kNotLike`, with the pattern as a VARCHAR\nconstant;\n- a pattern of only `%` folds: `LIKE` becomes `IS NOT NULL`, and `NOT\nLIKE` becomes `FALSE`, which reads nothing;\n  - EXPLAIN prints `s LIKE '%x%'`.\n- **Exec (`exec::LikePattern`, `src/exec/like.{h,cc}`):**\n- A pattern without `_` is its literal segments between the `%`s: a\nprefix, a suffix and substrings in order, each found by the leftmost\nsearch. So `'%x%'` is one substring search per row.\n- A pattern with `_` uses a backtracking matcher that steps through\nwhole characters.\n  - `FilterOperator` checks the column type and the pattern at `Open`.\n- **Harness:** `like` is a supported, generated feature. Patterns come\nfrom the ASCII characters of sample values (substrings, prefixes,\nsuffixes and several segments, with `_` inserted) and from edge patterns\n(`%`, `''`, `_`, `\\`, a 2-byte character).\n- **ClickBench: +4 queries pass** (Q20, Q21, Q22, Q23). The ratchet goes\nfrom 30 to 34 of 43.\n- **Docs:**\n- `docs/sql-subset.md`: grammar, the VARCHAR row, LIKE semantics, the\nClickBench table;\n  - `docs/architecture.md`;\n  - a fuzz dictionary entry and a seed.\n\n**Maintainer sign-off needed:** `tests/data/clickbench_status.json` is\nan \"Ask a human first\" path. Unlike PRs 1–4, this change is **not**\ncovered by an approved plan. It adds Q20–Q23; please approve it\nexplicitly in the review.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n\n## Verification\n\n```text\n$ pixi run check-full   (asan passed there; tidy and ci-gcc re-run after their fixes)\nlint: PASS; 100% tests passed out of 1053 (ci, asan, ci-gcc); tidy clean; Coverage gate: PASS; fuzz-smoke 2/2\n$ ANTB1_DIFF_COUNT=20000 pixi run diff-random\nDIFF: PASS seed=2573700789 queries=20000 failed=0 unsupported=0\n$ pixi run test-data\nCLICKBENCH pass=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 19, 20, 21, 22, 23, 24, 25, 26, 30, 31, 32, 33, 36, 37, 38, 41]\n$ ANTB1_HITS_FILES=\"$HOME/.cache/antb1/clickbench/full/hits_*.parquet\" pixi run test-data   # host, all 100 files\n100% tests passed out of 6 (14m13s wall; peak RSS 21.8 GB for one process, DuckDB included)\n```\n\n- **Matcher tests:**\n- the DuckDB-probed cases, and the segment fast path (overlapping prefix\nand suffix, repeated `%`, empty pattern);\n- a 20k-case property test against an independent recursive definition\nover characters, with 2-byte UTF-8 characters and invalid bytes in the\ntext, both with and without `_`;\n  - NULL handling and negation in `Evaluate`.\n- **Operator, plan and SQL tests:**\n- the filter with LIKE and NOT LIKE over NULLs, and malformed predicates\nrejected at `Open`;\n  - binder kinds, `%` folding and bind errors, and EXPLAIN;\n  - parser spans, the rejected forms, and unparse round-trips.\n- **`.slt` (`tests/slt/cases/like/`):** 18 queries plus errors, with\nexpectations written by DuckDB. They cover UTF-8 `_`, the backslash, the\nempty pattern, case, NULLs, `%` folding, multi-file tables, and grouped\nand ordered queries.\n- **Metamorphic:** `COUNT(col)` equals `LIKE p` plus `NOT LIKE p` for 6\npattern shapes over 2 columns with NULLs. A split table's count is the\nsum of its files' counts.\n- **Review:** the `reviewer` agent found no engine problem. It flagged\nthat my first draft used ClickBench query text: a LIKE pattern in a doc\nexample, a unit test and the fuzz seed. I replaced it with invented\nwords before anything was pushed. A scan of all tracked files for\nClickBench queries, WHERE clauses and LIKE patterns now finds nothing.\nIts other P1 is the ratchet sign-off above.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [ ] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: the ratchet needs your approval in this review\n\n## AI assistance\n\n- [x] AI-assisted. Tools and what they did: Claude Code wrote the code,\ntests and docs and ran the verification above; the `reviewer` subagent\nreviewed the diff.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-09-27T22:07:50+03:00",
+          "tree_id": "eec5c9b53eab7dc62c94be0d6a9e72a87393d414",
+          "url": "https://github.com/ydb-campus/antb1/commit/3d41bb42ec5c32852bb257481771db59539d65c7"
+        },
+        "date": 1790536192812,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 2311.992579600625,
+            "unit": "ns/iter",
+            "extra": "iterations: 303892\ncpu: 2311.8723131902125 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 73772.14910053923,
+            "unit": "ns/iter",
+            "extra": "iterations: 9061\ncpu: 73756.13828495752 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 84893.5467992252,
+            "unit": "ns/iter",
+            "extra": "iterations: 8248\ncpu: 84881.25509214356 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 377629.44743934466,
+            "unit": "ns/iter",
+            "extra": "iterations: 1855\ncpu: 377579.7040431269 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 355779.53238866205,
+            "unit": "ns/iter",
+            "extra": "iterations: 1976\ncpu: 355698.4782388665 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2336493.1229235767,
+            "unit": "ns/iter",
+            "extra": "iterations: 301\ncpu: 2335947.4850498345 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 239.74983866666358,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 239.71689499999994 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 11.848000627118559,
+            "unit": "ms/iter",
+            "extra": "iterations: 59\ncpu: 11.846865864406784 ms\nthreads: 1"
           }
         ]
       }
