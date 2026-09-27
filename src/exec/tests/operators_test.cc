@@ -164,7 +164,7 @@ TEST_F(OperatorsTest, FilterComparisonsAndNulls) {
 // malformed IN predicates fail at Open.
 TEST_F(OperatorsTest, FilterIn) {
   const auto x = Column(0, "x", LogicalType::kBigInt);
-  const auto in = [&](Predicate::Kind kind, std::vector<int64_t> values) {
+  const auto in = [&](Predicate::Kind kind, const std::vector<int64_t>& values) {
     Predicate p{.kind = kind, .column = x, .op = CompareOp::kEq, .constant = {}, .span = {}};
     for (const int64_t v : values) {
       p.values.push_back(BigInt(v));

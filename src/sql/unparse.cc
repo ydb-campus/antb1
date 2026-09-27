@@ -78,7 +78,7 @@ std::string ToSql(const SelectStatement& stmt) {
       for (std::size_t k = 0; k < c.list.size(); ++k) {
         sql += (k == 0 ? "(" : ", ") + LiteralSql(c.list[k]);
       }
-      sql += ")";
+      sql += ')';
     } else {
       sql += LiteralSql(c.literal);
     }
