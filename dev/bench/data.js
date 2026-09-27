@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790497074175,
+  "lastUpdate": 1790518094157,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -420,6 +420,66 @@ window.BENCHMARK_DATA = {
             "value": 2584739.490774887,
             "unit": "ns/iter",
             "extra": "iterations: 271\ncpu: 2583604.8044280433 ns\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "04727fa1e29ceae22e677c6074d7d029c4f696c4",
+          "message": "feat(plan,exec): order by, offset and top-n (#21)\n\n## Summary\n\nPR 3 of the approved GROUP BY / ORDER BY / COUNT(DISTINCT) plan: **ORDER\nBY, OFFSET and top-N**, checked against DuckDB. COUNT(DISTINCT) stays\n\"not answered yet\" (exit 4) until PR 4.\n\n- **Binder:**\n- ORDER BY items are a select alias first (the last item with it, also\nover a same-named column, as in DuckDB), else a table column, or an\naggregate call. ASC/DESC and NULLS FIRST/LAST are supported; the default\nis NULLS LAST for both directions (DuckDB).\n  - A projection may order by columns it does not select.\n- A grouped query orders by keys and aggregates. An ORDER BY aggregate\nthat the select list lacks becomes a hidden aggregate of the\n`GroupAggregate`.\n- A global aggregate has one row, so its ORDER BY is only checked and\ngets no Sort.\n- An ORDER BY aggregate makes the query an aggregate query, and plain\ncolumns are then a bind error.\n  - `OFFSET m`, with or without LIMIT, in either order.\n- **Plan:**\n  - New `SortNode` below the final `Project`.\n  - `LimitNode` gets `std::optional limit` and `offset`.\n- New optimizer rule **Limit below Project**, which puts the Limit right\nabove the Sort.\n- EXPLAIN prints `Sort x DESC NULLS LAST, ...` and `Limit 10 OFFSET 5` /\n`Limit ALL OFFSET 1`.\n- **Executor (`src/exec/sort.{h,cc}`):**\n- `RowComparator` gives DuckDB's order: NULL placement independent of\ndirection, NaN above every number, `-0.0 == 0.0`, VARCHAR by bytes,\nHUGEINT exact.\n- `SortBuffer` sorts stably, so tied rows keep input order and a top-N\nequals the window of the full sort. With `limit + offset` it drops rows\nthat cannot make the cut as they arrive and compacts, keeping memory\nO(k).\n- `SortBuffer::Merge` appends another buffer in input order\n(parallel-ready, like the grouped states).\n- The physical planner runs `Limit(Sort)` with a positive limit as one\ntop-N `SortOperator`.\n- `LimitOperator` handles the offset and narrows selections instead of\nmaterializing them.\n- **Fix to #20 found on the full dataset:** `GroupAggregateOperator`\nconcatenated every group's VARCHAR key into one array, and more than 2\nGiB of distinct keys overflowed Arrow's 32-bit binary offsets. It now\nemits one batch per chunk of new groups.\n- **Harness: a tie-aware ordered comparator**\n(`tests/slt/runner/ordered_compare.{h,cc}`):\n- DuckDB runs an augmented query: the original select list plus the\nORDER BY keys (aliases resolved as the binder does), without\nLIMIT/OFFSET. Its limit grows until the run of ties at the window's end\nis complete, capped at 2^20 rows.\n- antb1's row `i` must be a distinct row of the run of equal keys at\nrank `offset + i`.\n- If that run is longer than the cap (millions of groups tied at a count\non the full data), one more query fetches only the run's rows that equal\nantb1's rows there, written as SQL literals. Text that SQL cannot hold\nis reported as a harness limitation, never as a pass.\n- `CompareQueryAnswers` picks ordered, unordered-limit or plain\ncomparison from antb1's own parse of the SQL. The random test, the query\nfiles and the ClickBench runner all use it, so no query text is stored.\n- The generator gains `order_by`, `nulls_order` and `offset`. It sorts\nonly by columns, aliases and aggregates with I/T values: a DOUBLE\nSUM/AVG can differ in the last bits and order near-ties differently.\n- **ClickBench: +16 queries pass** (Q7, 12, 14, 15, 16, 24, 25, 26, 30,\n31, 32, 33, 36, 37, 38, 41). The ratchet goes from 7 to 23 queries.\n- **Docs:**\n- `docs/sql-subset.md`: grammar, Binding, ORDER BY / LIMIT / OFFSET\nsemantics, plan nodes, exit codes, ClickBench table;\n- `docs/architecture.md`, `docs/testing.md`, `tests/slt/README.md`,\n`docs/recipes/write-slt-test.md`;\n  - new **ADR 0011 \"Sorting and top-N\"**.\n\n**Maintainer sign-off needed:**\n- `tests/data/clickbench_status.json` is an \"Ask a human first\" path. It\ngains the 16 queries above, as the approved plan said PR 3 would.\n- ADR 0011 is written as **Accepted**, like ADR 0010 in #20. Please\nconfirm both, or tell me to mark the ADR Proposed.\n- `.agents/skills/write-slt-test/SKILL.md` (a protected path, not\nchanged here) still says \"there is no ORDER BY yet\". It needs the same\none-line update as `docs/recipes/write-slt-test.md`.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [x] fix: bug fix (the GROUP BY key overflow above)\n\n## Verification\n\n```text\n$ pixi run check-full\nlint: PASS; 100% tests passed out of 1007 (ci, asan, coverage, ci-gcc); tidy clean; Coverage gate: PASS; fuzz-smoke passed\n$ ANTB1_DIFF_COUNT=20000 pixi run diff-random\nDIFF: PASS seed=3338235670 queries=20000 failed=0 unsupported=0\n$ pixi run test-data\nCLICKBENCH pass=[0, 1, 2, 3, 6, 7, 12, 14, 15, 16, 17, 19, 24, 25, 26, 30, 31, 32, 33, 36, 37, 38, 41]; 100% tests passed out of 6\n$ ANTB1_HITS_FILES=\"$HOME/.cache/antb1/clickbench/full/hits_*.parquet\" pixi run test-data   # host, all 100 files\n100% tests passed out of 6 (8m20s wall; peak RSS 25.6 GB for one process, DuckDB included)\n```\n\n- **Full data, before the two fixes above:**\n  - Q33 failed with the key-concatenation overflow.\n- The harness took 645 s and 87 GB on Q32, fetching tens of millions of\ntied rows.\n  - antb1 alone on Q32 over all files: 53 s, 16 GB peak RSS.\n- **`exec` unit tests (`sort_test.cc`):**\n- the comparator for every engine type, both directions and both NULL\nplacements, NaN and ±0, bytes;\n- Sort and top-N checked against an independent `std::stable_sort` model\nover random data, for 16 direction/NULL combinations and LIMIT/OFFSET\nwindows around batch and compaction boundaries (INT64_MAX included);\n  - merged buffers (sorted and unsorted parts) equal one buffer;\n- selections, error paths, and LIMIT/OFFSET over selections across\nbatches.\n- **Planner test:** `Limit(Sort)` becomes a top-N `SortOperator`, while\nLIMIT 0 and OFFSET-only keep a `LimitOperator`.\n- **Grouped test:** output comes one batch per chunk of new groups, and\na re-run gives the same batches.\n- **`.slt` (`tests/slt/cases/orderby/`):** 37 queries plus errors, with\nexpectations written by DuckDB (`slt-complete`), run as `slt.*` and\n`oracle.*`. They cover alias precedence, non-selected keys, hidden\naggregates, multi-file tables, DATE, every integer type, VARCHAR bytes\nand OFFSET edges.\n- **Metamorphic:**\n  - sort and top-N are invariant to batch size and file split;\n  - a top-N is the window of the full sort;\n  - a grouped top-N is batch-size invariant.\n- **Comparator self-tests:**\n  - ties in any order and ties at the window edges;\n  - the growing limit;\n  - R tolerance;\n  - oracle failures;\n- the long-run path against the DuckDB library, including wrong rows,\nduplicates, NULLs and non-UTF-8 text.\n- **CLI goldens:** new `explain_order_by` and `query_order_by`.\n`explain_group_by` and `explain_projection` change because the Limit now\nsits below the Project.\n- **Review:** the `reviewer` agent found no P0. Its P1 on missing\nplanner tests is fixed. Its P1 on the ratchet is the sign-off above. Its\nP2 is a follow-up: a full sort without LIMIT gathers output with one\n`AppendArraySlice` per row, where a Take per chunk would be faster.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [ ] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: the ratchet update is in the approved plan; please\nconfirm in review\n\n## AI assistance\n\n- [x] AI-assisted. Tools and what they did: Claude Code wrote the code,\ntests and docs, and ran the verification above; the `reviewer` subagent\nreviewed the diff.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-09-27T17:06:18+03:00",
+          "tree_id": "8b9784a1736371562bcb850f34fdd79a9cf7637c",
+          "url": "https://github.com/ydb-campus/antb1/commit/04727fa1e29ceae22e677c6074d7d029c4f696c4"
+        },
+        "date": 1790518093116,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 3061.7988855116505,
+            "unit": "ns/iter",
+            "extra": "iterations: 228984\ncpu: 3061.4421749991266 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84777.62583056532,
+            "unit": "ns/iter",
+            "extra": "iterations: 7224\ncpu: 84774.99169435218 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222051.61250396594,
+            "unit": "ns/iter",
+            "extra": "iterations: 3151\ncpu: 222033.187559505 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 459712.45494923356,
+            "unit": "ns/iter",
+            "extra": "iterations: 1576\ncpu: 459699.1078680203 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 348260.20895522233,
+            "unit": "ns/iter",
+            "extra": "iterations: 2010\ncpu: 348236.869651741 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2117166.2303030537,
+            "unit": "ns/iter",
+            "extra": "iterations: 330\ncpu: 2117082.0242424244 ns\nthreads: 1"
           }
         ]
       }
