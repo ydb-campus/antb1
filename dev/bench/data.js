@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790437420782,
+  "lastUpdate": 1790468293321,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -300,6 +300,66 @@ window.BENCHMARK_DATA = {
             "value": 2551290.4285714044,
             "unit": "ns/iter",
             "extra": "iterations: 266\ncpu: 2550117.77067669 ns\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "048b4b4e9ebbd65e723b8bea87efe07e37374cb3",
+          "message": "feat(sql): parse group by, order by, offset and count distinct (#19)\n\n## Summary\n\nPR 1 of the approved GROUP BY / ORDER BY / COUNT(DISTINCT) plan (next:\nhash aggregation, then ORDER BY with top-N, then COUNT(DISTINCT)). This\nPR adds the **syntax only**. No query that ran before behaves\ndifferently, and none of the new constructs is answered yet.\n\n- **Parser** (`src/sql`) accepts:\n  - `GROUP BY col, …`;\n- `ORDER BY item, …`, where an item is a column or an aggregate call\nwith optional `ASC`/`DESC` and `NULLS FIRST`/`LAST`;\n  - `LIMIT` and `OFFSET` in either order, as DuckDB does;\n  - `COUNT(DISTINCT col)`.\n\nThe AST gains `group_by`, `order_by`, `offset` (with spans) and\n`AggregateCall::distinct`. `ToSql` prints the canonical form (`LIMIT n\nOFFSET m`), and `EqualIgnoringSpans` covers every new field.\n- **Still parser rejections (exit 4):**\n- positions (`ORDER BY 2`), `ALL`, constants and expressions in GROUP BY\nand ORDER BY;\n- `GROUPING SETS`, an aggregate `FILTER` in ORDER BY, `ORDER BY …\nUSING`;\n  - `SUM`/`AVG`/`MIN`/`MAX(DISTINCT)`;\n  - HAVING.\n\nMalformed forms are syntax errors (exit 1): `GROUP` without `BY`,\n`NULLS` without `FIRST`/`LAST`, `COUNT(DISTINCT *)`, clauses out of\norder. The \"expected …\" hints now list the clauses that can still\nfollow.\n- **Binder** (`CheckNotYetSupported`): rejects `COUNT(DISTINCT …)`, then\nGROUP BY, ORDER BY and OFFSET as `kUnsupported` (exit 4), pointing at\nthe call or clause, **before any other check**. So a new construct can\nnever reach planning or become a bind error.\n- **HAVING replaces GROUP BY as the \"unsupported\" example**, since GROUP\nBY will soon be answered. The swap covers the CLI goldens `unsupported`\n/ `unsupported_explain` (the latter now uses `SELECT DISTINCT`), the\nCLI, bench, session and slt-runner tests, the write-slt-test recipe, and\nthe harness canary. The canary's pending query is now tagged with a new\n`Feature::kHaving` marker (`kGroupBy` stays never-generated until PR 2).\n- **Tests:** the binder-rejected queries are *added* next to the\nparser-rejected ones at binder, session and CLI level, so the new exit-4\npath is covered end to end.\n- **Docs:** `docs/sql-subset.md` covers the grammar, a \"parsed, not\nanswered yet\" paragraph, the Binding precedence rule and the exit-code\ntable. ADR 0008's list of unsupported examples is updated (content only,\nstatus unchanged).\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n\n## Verification\n\n```text\n$ pixi run check-full\nlint: PASS; 100% tests passed out of 930 (ci, asan, coverage, ci-gcc); tidy clean; fuzz-smoke 2/2\n```\n\n- **Parser tests:**\n- new positive tests (the full clause set with spans, OFFSET before\nLIMIT and alone, COUNT(DISTINCT), `nulls`/`first`/`last` still usable as\nnames);\n  - rejection cases for every construct listed above;\n- canonical-form, round-trip and structural-difference cases for each\nnew field.\n- **Property test:** the random AST generator now emits GROUP BY, ORDER\nBY (with aggregates, DESC, NULLS), OFFSET and COUNT(DISTINCT). Token\naccounting counts their commas, parentheses, stars and numbers.\n- **Fuzz:** two new seeds that fully parse. The dictionary moves\nDISTINCT, GROUP BY, ORDER BY and OFFSET to the subset section and adds\nASC, DESC and the NULLS forms.\n- **Review:** the `reviewer` agent ran on the diff. Its findings are all\nfixed:\n- FILTER in ORDER BY and GROUPING SETS were syntax errors instead of\nunsupported;\n  - engine- and CLI-level coverage of the binder rejection was missing;\n  - the Binding docs' precedence rule was out of date.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change\n- [x] Docs updated where behavior, commands or architecture changed\n- [x] No ClickBench-derived data is committed\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer (none changed)\n\n## AI assistance\n\n- [x] AI-assisted. Tools and what they did: Claude Code (Claude Opus\n5.5) implemented PR 1 of the plan the maintainer approved, and ran a\nreviewer agent on the diff.\n- Accountable human (has read and understands the whole diff): @Hor911\n(please confirm before merging)",
+          "timestamp": "2026-09-27T03:16:25+03:00",
+          "tree_id": "ae2420c50c50234ac9fd7d14755e49b30033b0c0",
+          "url": "https://github.com/ydb-campus/antb1/commit/048b4b4e9ebbd65e723b8bea87efe07e37374cb3"
+        },
+        "date": 1790468292751,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 3044.1634142099765,
+            "unit": "ns/iter",
+            "extra": "iterations: 229980\ncpu: 3043.924941299244 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84484.90383631726,
+            "unit": "ns/iter",
+            "extra": "iterations: 7820\ncpu: 84477.4074168798 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 221659.08333333436,
+            "unit": "ns/iter",
+            "extra": "iterations: 3156\ncpu: 221636.4214195185 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 440771.89607097814,
+            "unit": "ns/iter",
+            "extra": "iterations: 1578\ncpu: 440668.9315589355 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 359847.0401647788,
+            "unit": "ns/iter",
+            "extra": "iterations: 1942\ncpu: 359791.5926879503 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2121184.542682936,
+            "unit": "ns/iter",
+            "extra": "iterations: 328\ncpu: 2120988.9908536593 ns\nthreads: 1"
           }
         ]
       }
