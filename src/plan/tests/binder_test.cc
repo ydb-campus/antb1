@@ -493,6 +493,21 @@ TEST(BinderTest, ConstantsAndPositions) {
   EXPECT_EQ(sort.keys[0].column.index, 0);
   EXPECT_TRUE(sort.keys[0].descending);
 
+  // DuckDB types the magnitude as INTEGER when it fits, and names integers by their value.
+  auto integers = BindSql(
+      "SELECT -2147483648, -2147483647, -9223372036854775808, 9223372036854775808, 007, -0 FROM t",
+      catalog);
+  ASSERT_TRUE(integers.ok()) << integers.status().ToString();
+  const auto& out = integers->output;
+  EXPECT_EQ(out[0].type, LogicalType::kBigInt);
+  EXPECT_EQ(out[0].name, "-2147483648");
+  EXPECT_EQ(out[1].type, LogicalType::kInteger);
+  EXPECT_EQ(out[2].type, LogicalType::kBigInt);
+  EXPECT_EQ(out[3].type, LogicalType::kHugeInt);
+  EXPECT_EQ(out[4].name, "7");
+  EXPECT_EQ(out[5].name, "0");
+  EXPECT_EQ(out[5].type, LogicalType::kInteger);
+
   auto grouped = BindSql("SELECT 7, s, COUNT(*) FROM t GROUP BY 1, 2 ORDER BY 3 DESC", catalog);
   ASSERT_TRUE(grouped.ok()) << grouped.status().ToString();
   const auto& group = std::get<GroupAggregateNode>(Nth(*grouped, 2));

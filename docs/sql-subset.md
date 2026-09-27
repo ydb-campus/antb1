@@ -97,10 +97,10 @@ select list, `WHERE`, the `GROUP BY` names, the grouping rule below, `LIMIT`, `O
 - Select list: `*` alone, or plain columns, aggregates and constants. Without `GROUP BY`, aggregates (in the select
   list or in `ORDER BY`) cannot be mixed with plain columns: a bind error at the first plain column (or at `*`).
   Constants mix with anything; with an aggregate (also one only in `ORDER BY`) the query has one row.
-- Constants (as DuckDB types and names them): an integer is INTEGER, BIGINT or HUGEINT by its value and is named as
-  written (`-5`); a string is VARCHAR named with its quotes (`'it''s'`); `DATE '2020-01-02'` is DATE named
-  `CAST('2020-01-02' AS "DATE")`. A decimal (DuckDB's DECIMAL) and an integer beyond HUGEINT's 38 digits are
-  unsupported (exit code 4).
+- Constants (as DuckDB types and names them): an integer is INTEGER when its magnitude fits (so `-2147483648` is
+  BIGINT), else BIGINT or HUGEINT, and is named by its value (`007` is `7`); a string is VARCHAR named with its
+  quotes (`'it''s'`); `DATE '2020-01-02'` is DATE named `CAST('2020-01-02' AS "DATE")`. A decimal (DuckDB's DECIMAL)
+  and an integer beyond HUGEINT's 38 digits are unsupported (exit code 4).
 - Positions: in `GROUP BY` and `ORDER BY` an integer literal names the select item at that position (1-based; `*`
   counts every column); one out of range, a negative one too, is a bind error. `GROUP BY` of an aggregate item is a
   bind error. Any other literal is a constant: in `GROUP BY` it is no key but still makes the query grouped (one group

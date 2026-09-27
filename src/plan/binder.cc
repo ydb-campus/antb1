@@ -429,7 +429,8 @@ bool OrdersByAggregate(const sql::SelectStatement& stmt) {
 }
 
 // A constant select item with DuckDB's type and result name: an integer is INTEGER, BIGINT or
-// HUGEINT by its value and named as written ("-5"); a string is VARCHAR named with its quotes
+// HUGEINT by its value (see below) and named by it ("-5"); a string is VARCHAR named with its
+// quotes
 // ('it''s'); a date is DATE named CAST('2020-01-01' AS "DATE"). A decimal (DuckDB's DECIMAL) and a
 // number DuckDB types as DOUBLE are not supported.
 arrow::Result<std::pair<Constant, std::string>> BindConstant(const sql::Literal& lit) {
@@ -442,17 +443,17 @@ arrow::Result<std::pair<Constant, std::string>> BindConstant(const sql::Literal&
         return UnsupportedError(
             "integer constants outside HUGEINT's range (38 digits) are not supported", lit.span);
       }
+      // DuckDB types the magnitude as INTEGER when it fits (so -2147483648 is not an INTEGER),
+      // else the signed value as BIGINT or HUGEINT, and names the constant by its value (007: 7).
       const Int128 value = exact->negative ? -exact->magnitude : exact->magnitude;
       LogicalType type = LogicalType::kHugeInt;
-      for (const LogicalType narrow : {LogicalType::kInteger, LogicalType::kBigInt}) {
-        const IntegerRange range = RangeOf(narrow);
-        if (value >= range.min && value <= range.max) {
-          type = narrow;
-          break;
-        }
+      const IntegerRange bigint = RangeOf(LogicalType::kBigInt);
+      if (exact->magnitude <= RangeOf(LogicalType::kInteger).max) {
+        type = LogicalType::kInteger;
+      } else if (value >= bigint.min && value <= bigint.max) {
+        type = LogicalType::kBigInt;
       }
-      return std::pair(Constant{.type = type, .value = value},
-                       (lit.negative ? "-" : "") + lit.text);
+      return std::pair(Constant{.type = type, .value = value}, Int128ToString(value));
     }
     case sql::Literal::Kind::kDecimal:
       return UnsupportedError(
