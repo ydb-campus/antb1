@@ -11,6 +11,8 @@
 #include <arrow/api.h>
 #include <gtest/gtest.h>
 
+#include "antb1/exec/limit.h"
+#include "antb1/exec/sort.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/sql_status.h"
 
@@ -91,6 +93,39 @@ TEST_F(PhysicalPlannerTest, LimitOverProjectOverFilterOverScan) {
   EXPECT_EQ(Int64Column(*Run(PlanOf(limit))), (std::vector<std::optional<int64_t>>{2, 3, 4, 5, 6}));
 }
 
+// Limit(Sort) with a positive limit is one top-N SortOperator; LIMIT 0 and OFFSET alone keep a
+// LimitOperator (over a full SortOperator for OFFSET).
+TEST_F(PhysicalPlannerTest, LimitOverSortIsATopN) {
+  const auto table = Table();
+  const auto scan = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}});
+  const auto sort = Node(
+      plan::SortNode{.input = scan,
+                     .keys = {{.column = Column(1, "y", LogicalType::kBigInt), .descending = true},
+                              {.column = Column(0, "x", LogicalType::kBigInt)}}});
+  const auto limited = [&](std::optional<int64_t> limit, int64_t offset) {
+    const auto node = Node(plan::LimitNode{.input = sort, .limit = limit, .offset = offset});
+    return Node(
+        plan::ProjectNode{.input = node, .columns = {Column(0, "x", LogicalType::kBigInt)}});
+  };
+  using Ids = std::vector<std::optional<int64_t>>;
+  // y DESC (NULLs last): x 8 7 5 4 2 1, then 0 3 6 9 (y NULL) by x.
+  EXPECT_EQ(Int64Column(*Run(PlanOf(limited(3, 2)))), (Ids{5, 4, 2}));
+  EXPECT_EQ(Int64Column(*Run(PlanOf(limited(std::nullopt, 6)))), (Ids{0, 3, 6, 9}));
+  EXPECT_EQ(Int64Column(*Run(PlanOf(limited(0, 1)))), Ids{});
+  EXPECT_EQ(Int64Column(*Run(PlanOf(sort, 2))), (Ids{8, 7, 5, 4, 2, 1, 0, 3, 6, 9}));
+
+  // The root operator of Limit(Sort).
+  const auto root = [&](std::optional<int64_t> limit, int64_t offset) {
+    const auto node = Node(plan::LimitNode{.input = sort, .limit = limit, .offset = offset});
+    auto op = BuildPhysicalPlan(PlanOf(node, 2));
+    EXPECT_TRUE(op.ok()) << op.status().ToString();
+    return op.ok() ? *std::move(op) : nullptr;
+  };
+  EXPECT_NE(dynamic_cast<const SortOperator*>(root(3, 2).get()), nullptr);
+  EXPECT_NE(dynamic_cast<const LimitOperator*>(root(0, 0).get()), nullptr);
+  EXPECT_NE(dynamic_cast<const LimitOperator*>(root(std::nullopt, 4).get()), nullptr);
+}
+
 TEST_F(PhysicalPlannerTest, AggregateOverFilteredScanForEveryBatchSize) {
   const auto table = Table();
   const auto scan = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}});
@@ -119,8 +154,8 @@ TEST_F(PhysicalPlannerTest, MalformedPlansAreInvalidNotUnsupported) {
   plan::LogicalPlan no_output{.root = Node(plan::RowCountNode{.table = table}), .output = {}};
   EXPECT_TRUE(BuildPhysicalPlan(no_output).status().IsInvalid());
   const std::vector<plan::LogicalNode> broken = {
-      plan::RowCountNode{}, plan::ScanNode{},      plan::FilterNode{},
-      plan::ProjectNode{},  plan::AggregateNode{}, plan::LimitNode{},
+      plan::RowCountNode{},  plan::ScanNode{},  plan::FilterNode{}, plan::ProjectNode{},
+      plan::AggregateNode{}, plan::LimitNode{}, plan::SortNode{},
   };
   for (const plan::LogicalNode& node : broken) {
     const auto status = BuildPhysicalPlan(PlanOf(Node(node))).status();
