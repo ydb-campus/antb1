@@ -579,6 +579,48 @@ std::vector<Relation> AllRelations() {
     }
     r.push_back(std::move(grouped));
   }
+  // COUNT(DISTINCT): the number of groups of the column (NULL left out by a WHERE that is true for
+  // every value), the same over a split table and for every batch size, also per group.
+  for (const auto& [column, type] : std::to_array<std::pair<std::string_view, slt::Feature>>(
+           {{"RegionID", kIntegerColumns}, {"SearchPhrase", kVarcharColumns}})) {
+    const bool text = type == kVarcharColumns;
+    r.push_back(
+        {.name = std::format("count_distinct_is_group_count_{}", column),
+         .features = {kCountDistinct, kGroupBy, kColumns, kWhere, kTableName, type,
+                      text ? kStringLiteral : kIntegerLiteral, kNegativeLiteral},
+         .probes = {Q(std::format("SELECT COUNT(DISTINCT {}) FROM hits_like_nulls", column)),
+                    Q(std::format("SELECT {0} FROM hits_like_nulls WHERE {0} >= {1} GROUP BY {0}",
+                                  column, text ? "''" : "-2147483648"))},
+         .check = RowCountsEqualFirst()});
+  }
+  {
+    Relation sizes{
+        .name = "count_distinct_batch_size_and_split_invariance",
+        .features = {kCountDistinct, kMultipleItems, kIntegerColumns, kVarcharColumns, kTableName},
+        .probes = {},
+        .check = AllEqual()};
+    constexpr std::string_view kDistinct =
+        "SELECT COUNT(DISTINCT UserID), COUNT(DISTINCT SearchPhrase), COUNT(DISTINCT RegionID) "
+        "FROM ";
+    for (const int64_t batch : kBatchSizes) {
+      sizes.probes.push_back(Q(std::string(kDistinct) + "hits_like_split", batch));
+    }
+    sizes.probes.push_back(Q(std::string(kDistinct) + "hits_like"));
+    r.push_back(std::move(sizes));
+    Relation grouped{.name = "grouped_count_distinct_batch_size_and_split_invariance",
+                     .features = {kCountDistinct, kGroupBy, kColumns, kMultipleItems,
+                                  kIntegerColumns, kVarcharColumns, kTableName},
+                     .probes = {},
+                     .check = AllEqual()};
+    constexpr std::string_view kGroupedDistinct =
+        "SELECT OS, COUNT(DISTINCT UserID), COUNT(DISTINCT URL) FROM {} GROUP BY OS";
+    for (const int64_t batch : kBatchSizes) {
+      grouped.probes.push_back(
+          Q(std::vformat(kGroupedDistinct, std::make_format_args("hits_like_split")), batch));
+    }
+    grouped.probes.push_back(Q(std::vformat(kGroupedDistinct, std::make_format_args("hits_like"))));
+    r.push_back(std::move(grouped));
+  }
   r.push_back({.name = "limit_returns_min_of_n_and_rows",
                .features = {kCountStar, kColumns, kIntegerColumns, kLimit, kTableName},
                .probes = {Q("SELECT COUNT(*) FROM edge"), Q("SELECT id FROM edge LIMIT 0"),

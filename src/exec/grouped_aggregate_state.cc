@@ -15,12 +15,16 @@
 #include <vector>
 
 #include <arrow/api.h>
+#include <arrow/compute/exec.h>
+#include <arrow/compute/row/grouper.h>
 #include <arrow/util/decimal.h>
 
 #include "antb1/common/int128.h"
 #include "antb1/plan/literal.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
+
+#include "double_key.h"
 
 namespace antb1::exec {
 namespace {
@@ -536,10 +540,112 @@ std::unique_ptr<GroupedAggregateState> MinMaxState(bool min, plan::LogicalType i
   return nullptr;
 }
 
+// ---- COUNT(DISTINCT c) ----
+
+// The distinct (group id, value) pairs, as the keys of a grouper: a pair seen for the first time
+// adds one to its group, unless the value is NULL. DOUBLE values are normalized first (-0.0 is 0.0,
+// every NaN one value). Merge feeds the other state's pairs through the group map.
+class GroupedCountDistinct final : public GroupedAggregateState {
+ public:
+  static arrow::Result<std::unique_ptr<GroupedAggregateState>> Make(
+      std::shared_ptr<arrow::DataType> type, arrow::MemoryPool* pool) {
+    auto state =
+        std::unique_ptr<GroupedCountDistinct>(new GroupedCountDistinct(std::move(type), pool));
+    ARROW_ASSIGN_OR_RAISE(
+        state->pairs_,
+        arrow::compute::Grouper::Make({arrow::uint32(), state->type_}, state->kernels_.get()));
+    return state;
+  }
+
+  [[nodiscard]] std::uint32_t num_groups() const override {
+    return static_cast<std::uint32_t>(counts_.size());
+  }
+  void Resize(std::uint32_t num_groups) override { counts_.resize(num_groups, 0); }
+  arrow::Status Consume(const arrow::Array* values, GroupIds ids) override {
+    if (values == nullptr) {
+      return arrow::Status::Invalid("COUNT(DISTINCT) needs an argument column");
+    }
+    ARROW_RETURN_NOT_OK(CheckRows(values, type_.get(), ids, num_groups()));
+    arrow::UInt32Builder groups(pool_);
+    ARROW_RETURN_NOT_OK(groups.AppendValues(ids.data(), static_cast<std::int64_t>(ids.size())));
+    ARROW_ASSIGN_OR_RAISE(auto group_array, groups.Finish());
+    return AddPairs(group_array, arrow::MakeArray(values->data()));
+  }
+  arrow::Status Merge(const GroupedAggregateState& other, GroupIds map) override {
+    ARROW_ASSIGN_OR_RAISE(const auto* same,
+                          SameKind<GroupedCountDistinct>(other, map, num_groups()));
+    if (!same->type_->Equals(*type_)) {
+      return arrow::Status::Invalid("cannot merge COUNT(DISTINCT) of different types");
+    }
+    ARROW_ASSIGN_OR_RAISE(const arrow::compute::ExecBatch uniques, same->pairs_->GetUniques());
+    const auto their_groups =
+        std::static_pointer_cast<arrow::UInt32Array>(uniques.values.at(0).make_array());
+    arrow::UInt32Builder groups(pool_);
+    ARROW_RETURN_NOT_OK(groups.Reserve(their_groups->length()));
+    for (std::int64_t i = 0; i < their_groups->length(); ++i) {
+      groups.UnsafeAppend(map[their_groups->Value(i)]);
+    }
+    ARROW_ASSIGN_OR_RAISE(auto group_array, groups.Finish());
+    return AddPairs(group_array, uniques.values.at(1).make_array());
+  }
+  [[nodiscard]] arrow::Result<std::shared_ptr<arrow::Array>> Finalize(
+      std::uint32_t begin, std::uint32_t end, arrow::MemoryPool* pool) const override {
+    ARROW_ASSIGN_OR_RAISE(const auto counts, GroupRange(counts_, begin, end));
+    return Int64s(counts, pool);
+  }
+
+ private:
+  GroupedCountDistinct(std::shared_ptr<arrow::DataType> type, arrow::MemoryPool* pool)
+      : type_(std::move(type)),
+        pool_(pool),
+        kernels_(std::make_unique<arrow::compute::ExecContext>(pool)) {}
+
+  // Rows of (group id, value); a pair new to the grouper counts once for its group.
+  arrow::Status AddPairs(const std::shared_ptr<arrow::Array>& groups,
+                         std::shared_ptr<arrow::Array> values) {
+    const std::int64_t rows = values->length();
+    if (rows == 0) {
+      return arrow::Status::OK();
+    }
+    if (type_->id() == arrow::Type::DOUBLE) {
+      ARROW_ASSIGN_OR_RAISE(values, NormalizeDoubleKey(values, pool_));
+    }
+    const std::uint32_t before = pairs_->num_groups();
+    const arrow::compute::ExecBatch batch({arrow::Datum(groups), arrow::Datum(values)}, rows);
+    ARROW_ASSIGN_OR_RAISE(const arrow::Datum pair_ids,
+                          pairs_->Consume(arrow::compute::ExecSpan(batch)));
+    const std::uint32_t after = pairs_->num_groups();
+    if (after == before) {
+      return arrow::Status::OK();
+    }
+    const auto ids = std::static_pointer_cast<arrow::UInt32Array>(pair_ids.make_array());
+    const auto& group_ids = static_cast<const arrow::UInt32Array&>(*groups);
+    std::vector<bool> seen(after - before, false);
+    for (std::int64_t i = 0; i < rows; ++i) {
+      const std::uint32_t pair = ids->Value(i);
+      if (pair < before || seen[pair - before]) {
+        continue;
+      }
+      seen[pair - before] = true;
+      if (values->IsValid(i)) {
+        ++counts_[group_ids.Value(i)];
+      }
+    }
+    return arrow::Status::OK();
+  }
+
+  std::shared_ptr<arrow::DataType> type_;
+  arrow::MemoryPool* pool_;
+  std::unique_ptr<arrow::compute::ExecContext> kernels_;
+  std::unique_ptr<arrow::compute::Grouper> pairs_;
+  std::vector<std::int64_t> counts_;
+};
+
 }  // namespace
 
 arrow::Result<std::unique_ptr<GroupedAggregateState>> MakeGroupedAggregateState(
-    plan::AggKind kind, std::optional<plan::LogicalType> input, plan::LogicalType result) {
+    plan::AggKind kind, std::optional<plan::LogicalType> input, plan::LogicalType result,
+    arrow::MemoryPool* pool) {
   const auto invalid = [&] {
     return arrow::Status::Invalid(
         "no grouped aggregate ", plan::ToString(kind), "(",
@@ -579,6 +685,11 @@ arrow::Result<std::unique_ptr<GroupedAggregateState>> MakeGroupedAggregateState(
         return invalid();
       }
       return MinMaxState(kind == plan::AggKind::kMin, *input);
+    case plan::AggKind::kCountDistinct:
+      if (result != plan::LogicalType::kBigInt) {
+        return invalid();
+      }
+      return GroupedCountDistinct::Make(plan::ToArrow(*input), pool);
   }
   return invalid();
 }

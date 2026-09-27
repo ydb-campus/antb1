@@ -1,0 +1,14 @@
+# COUNT(DISTINCT col) is an aggregate: without GROUP BY a plain column next to it is a bind error.
+
+statement error
+SELECT id, COUNT(DISTINCT i16) FROM edge
+
+statement error
+SELECT COUNT(DISTINCT nope) FROM edge
+
+statement error must appear in the GROUP BY clause
+SELECT i16, COUNT(DISTINCT i32) FROM edge GROUP BY i32
+
+onlyif antb1
+statement error ^bind: column 'nope' does not exist$
+SELECT COUNT(DISTINCT nope) FROM edge

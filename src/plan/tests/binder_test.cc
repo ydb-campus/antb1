@@ -63,12 +63,14 @@ constexpr auto kUnsupported = SqlErrorDetail::Kind::kUnsupported;
 INSTANTIATE_TEST_SUITE_P(
     Binder, BindErrorTest,
     ::testing::Values(
-        // Parsed but not answered yet: kUnsupported before any other check, even when the
-        // table or a column does not exist.
-        ErrorCase{"SELECT COUNT(i16), COUNT(DISTINCT i32) FROM t", kUnsupported,
-                  "COUNT(DISTINCT i32)", "COUNT(DISTINCT ...) is not supported yet"},
-        ErrorCase{"SELECT nope FROM missing ORDER BY COUNT(DISTINCT nope)", kUnsupported,
-                  "COUNT(DISTINCT nope)", "COUNT(DISTINCT ...) is not supported yet"},
+        // COUNT(DISTINCT col): the column must exist and have an engine type; it is an aggregate.
+        ErrorCase{"SELECT COUNT(DISTINCT nope) FROM t", kBind, "nope",
+                  "column 'nope' does not exist"},
+        ErrorCase{"SELECT COUNT(DISTINCT bad) FROM t", kUnsupported, "bad", "unsupported type"},
+        ErrorCase{"SELECT i16, COUNT(DISTINCT i32) FROM t", kBind, "i16",
+                  "column 'i16' must be inside an aggregate function"},
+        ErrorCase{"SELECT i16 FROM t ORDER BY COUNT(DISTINCT i32)", kBind, "i16",
+                  "must be inside an aggregate function"},
         // ORDER BY: a select alias (the last one), else a table column; an aggregate makes the
         // query aggregate; a grouped query orders by keys and aggregates only.
         ErrorCase{"SELECT i16 FROM t ORDER BY nope", kBind, "nope", "column 'nope' does not exist"},
@@ -341,6 +343,33 @@ TEST(BinderTest, OrderByInAGlobalAggregateNeedsNoSort) {
   EXPECT_EQ(std::get<LimitNode>(Nth(*plan, 0)).offset, 1);
   const auto& aggregate = std::get<AggregateNode>(Nth(*plan, 1));
   EXPECT_EQ(aggregate.aggregates.size(), 1U);
+}
+
+// COUNT(DISTINCT col) is its own aggregate kind (BIGINT), named like DuckDB; in ORDER BY it reuses
+// an equal select aggregate, and COUNT(col) is not equal to it.
+TEST(BinderTest, CountDistinct) {
+  const Catalog catalog = MakeCatalog();
+  auto plan = BindSql(
+      "SELECT s, COUNT(DISTINCT \"Mixed Case\"), count(distinct I32) AS n FROM t GROUP BY s "
+      "ORDER BY COUNT(DISTINCT i32) DESC, COUNT(i32)",
+      catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  ASSERT_EQ(plan->output.size(), 3U);
+  EXPECT_EQ(plan->output[1].name, "count(DISTINCT \"Mixed Case\")");
+  EXPECT_EQ(plan->output[1].type, LogicalType::kBigInt);
+  EXPECT_EQ(plan->output[2].name, "n");
+  const auto& sort = std::get<SortNode>(Nth(*plan, 1));
+  ASSERT_EQ(sort.keys.size(), 2U);
+  EXPECT_EQ(sort.keys[0].column.index, 2);  // the select's COUNT(DISTINCT i32)
+  EXPECT_EQ(sort.keys[1].column.index, 3);  // COUNT(i32): hidden
+  const auto& group = std::get<GroupAggregateNode>(Nth(*plan, 2));
+  ASSERT_EQ(group.aggregates.size(), 3U);
+  EXPECT_EQ(group.aggregates[0].kind, AggKind::kCountDistinct);
+  EXPECT_EQ(group.aggregates[1].kind, AggKind::kCountDistinct);
+  EXPECT_EQ(group.aggregates[2].kind, AggKind::kCount);
+  auto name = BindSql("SELECT COUNT(DISTINCT \"i32\") FROM t", catalog);
+  ASSERT_TRUE(name.ok()) << name.status().ToString();
+  EXPECT_EQ(name->output[0].name, "count(DISTINCT i32)");
 }
 
 TEST(BinderTest, SelectStarProjectsEveryColumn) {

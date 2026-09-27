@@ -95,6 +95,40 @@ TEST_F(AggregateStateTest, CountSkipsNullsAndUnselectedRows) {
   EXPECT_EQ(Text(*Make(AggKind::kCount, LogicalType::kBigInt, LogicalType::kBigInt)), "0");
 }
 
+// COUNT(DISTINCT) counts distinct non-NULL selected values: -0.0 is 0.0 and every NaN one value
+// (DuckDB), VARCHAR by bytes; 0 over no values; partial states merge without double counting.
+TEST_F(AggregateStateTest, CountDistinctCountsDistinctNonNullValues) {
+  const auto nan = std::numeric_limits<double>::quiet_NaN();
+  const auto doubles = testing::ArrayOf<arrow::DoubleBuilder, double>(
+      arrow::float64(), {0.0, -0.0, nan, -nan, 1.0, std::nullopt, 1.0});
+  auto d = Make(AggKind::kCountDistinct, LogicalType::kDouble, LogicalType::kBigInt);
+  ASSERT_TRUE(d->Consume(*doubles, nullptr).ok());
+  EXPECT_EQ(Text(*d), "3");
+
+  const auto strings = Strings({"a", "b", "a", std::nullopt, "", "B"});
+  auto s = Make(AggKind::kCountDistinct, LogicalType::kVarchar, LogicalType::kBigInt);
+  ASSERT_TRUE(
+      s->Consume(*strings, testing::Bools({true, true, true, true, false, true}).get()).ok());
+  EXPECT_EQ(Text(*s), "3") << "a, b, B; the empty string is not selected";
+
+  auto none = Make(AggKind::kCountDistinct, LogicalType::kBigInt, LogicalType::kBigInt);
+  EXPECT_EQ(Text(*none), "0");
+  ASSERT_TRUE(none->Consume(*Int64s({std::nullopt, std::nullopt}), nullptr).ok());
+  EXPECT_EQ(Text(*none), "0") << "NULLs only";
+
+  auto a = Make(AggKind::kCountDistinct, LogicalType::kBigInt, LogicalType::kBigInt);
+  auto b = Make(AggKind::kCountDistinct, LogicalType::kBigInt, LogicalType::kBigInt);
+  ASSERT_TRUE(a->Consume(*Int64s({1, 2, 3, std::nullopt}), nullptr).ok());
+  ASSERT_TRUE(b->Consume(*Int64s({3, 4, std::nullopt, 1}), nullptr).ok());
+  ASSERT_TRUE(a->Merge(*b).ok());
+  EXPECT_EQ(Text(*a), "4");
+  auto other_type = Make(AggKind::kCountDistinct, LogicalType::kInteger, LogicalType::kBigInt);
+  EXPECT_TRUE(a->Merge(*other_type).IsInvalid());
+  EXPECT_TRUE(
+      a->Merge(*Make(AggKind::kCount, LogicalType::kBigInt, LogicalType::kBigInt)).IsInvalid());
+  EXPECT_TRUE(a->Consume(*Strings({"x"}), nullptr).IsInvalid());
+}
+
 TEST_F(AggregateStateTest, IntegerSumIsExactHugeInt) {
   auto state = Make(AggKind::kSum, LogicalType::kBigInt, LogicalType::kHugeInt);
   ASSERT_TRUE(state->Consume(*Int64s({kI64Max, kI64Max, std::nullopt}), nullptr).ok());
@@ -473,6 +507,9 @@ TEST_F(AggregateStateTest, OnlyTheBindersCombinationsExist) {
   EXPECT_TRUE(invalid(AggKind::kMin, LogicalType::kBigInt, LogicalType::kHugeInt));
   EXPECT_TRUE(invalid(AggKind::kMax, std::nullopt, LogicalType::kBigInt));
   EXPECT_FALSE(invalid(AggKind::kCount, LogicalType::kVarchar, LogicalType::kBigInt));
+  EXPECT_FALSE(invalid(AggKind::kCountDistinct, LogicalType::kDouble, LogicalType::kBigInt));
+  EXPECT_TRUE(invalid(AggKind::kCountDistinct, std::nullopt, LogicalType::kBigInt));
+  EXPECT_TRUE(invalid(AggKind::kCountDistinct, LogicalType::kDate, LogicalType::kDate));
   EXPECT_FALSE(invalid(AggKind::kMax, LogicalType::kVarchar, LogicalType::kVarchar));
 }
 

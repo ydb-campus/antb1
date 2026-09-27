@@ -87,6 +87,13 @@ TEST(ExplainTest, SortAndOffset) {
             "        Scan table=ok source=fake columns=[i16]\n");
 }
 
+TEST(ExplainTest, CountDistinct) {
+  EXPECT_EQ(ExplainSql("SELECT COUNT(DISTINCT s), COUNT(s) FROM ok"),
+            "Output: count(DISTINCT s):BIGINT count(s):BIGINT\n"
+            "Aggregate COUNT(DISTINCT s), COUNT(s)\n"
+            "  Scan table=ok source=fake columns=[s]\n");
+}
+
 TEST(ExplainTest, NamesAndStringsStayOnOneAsciiLine) {
   const auto table = std::make_shared<FakeTable>(
       arrow::schema({arrow::field("a\"b", arrow::binary()), arrow::field("é\n", arrow::int32())}),

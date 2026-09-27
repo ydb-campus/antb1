@@ -3,6 +3,7 @@ antb1_add_module(
   SOURCES
     operator.cc
     row_mask.cc
+    double_key.cc
     aggregate_state.cc
     table_scan.cc
     filter.cc

@@ -29,6 +29,7 @@ enum class Feature : std::uint8_t {
   kAvg,            // AVG(numeric col)
   kMin,            // MIN(col)
   kMax,            // MAX(col)
+  kCountDistinct,  // COUNT(DISTINCT col)
   kColumns,        // plain column references (a projection)
   kStar,           // SELECT *
   kMultipleItems,  // more than one select item
@@ -84,6 +85,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "min";
     case Feature::kMax:
       return "max";
+    case Feature::kCountDistinct:
+      return "count_distinct";
     case Feature::kColumns:
       return "columns";
     case Feature::kStar:
@@ -220,6 +223,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kAvg,
     Feature::kMin,
     Feature::kMax,
+    Feature::kCountDistinct,
     Feature::kColumns,
     Feature::kStar,
     Feature::kMultipleItems,

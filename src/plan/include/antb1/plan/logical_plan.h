@@ -37,9 +37,11 @@ enum class CompareOp : std::uint8_t { kEq, kNe, kLt, kLe, kGt, kGe };
 // "=", "<>", "<", "<=", ">", ">=".
 std::string_view ToString(CompareOp op);
 
-enum class AggKind : std::uint8_t { kCountStar, kCount, kSum, kAvg, kMin, kMax };
+// kCountDistinct is COUNT(DISTINCT col): the number of distinct non-NULL values (a DOUBLE -0.0 is
+// 0.0 and every NaN one value, as in DuckDB).
+enum class AggKind : std::uint8_t { kCountStar, kCount, kSum, kAvg, kMin, kMax, kCountDistinct };
 
-// "COUNT", "SUM", "AVG", "MIN", "MAX" (COUNT for both COUNT(*) and COUNT(col)).
+// "COUNT", "SUM", "AVG", "MIN", "MAX" (COUNT for COUNT(*), COUNT(col) and COUNT(DISTINCT col)).
 std::string_view ToString(AggKind kind);
 
 // A constant of a column's logical type, folded exactly from a SQL literal by the binder.

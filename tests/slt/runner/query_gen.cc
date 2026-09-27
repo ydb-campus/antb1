@@ -242,7 +242,7 @@ void AddSamples(GenColumn& c, const arrow::Array& a) {
 // ---- query building ----
 
 enum class Shape : std::uint8_t { kAggregates, kColumns, kStar };
-enum class Agg : std::uint8_t { kCountStar, kCount, kSum, kAvg, kMin, kMax };
+enum class Agg : std::uint8_t { kCountStar, kCount, kSum, kAvg, kMin, kMax, kCountDistinct };
 
 // Row count above which SELECT * gets a LIMIT (keeps results small).
 constexpr int64_t kStarMaxRows = 50;
@@ -275,6 +275,8 @@ Feature AggFeature(Agg agg) {
       return Feature::kMin;
     case Agg::kMax:
       return Feature::kMax;
+    case Agg::kCountDistinct:
+      return Feature::kCountDistinct;
   }
   return Feature::kCountStar;
 }
@@ -283,6 +285,7 @@ std::string_view AggName(Agg agg) {
   switch (agg) {
     case Agg::kCountStar:
     case Agg::kCount:
+    case Agg::kCountDistinct:
       return "COUNT";
     case Agg::kSum:
       return "SUM";
@@ -445,7 +448,7 @@ class Builder {
     if (allowed_.Has(Feature::kCountStar)) {
       aggs.push_back(Agg::kCountStar);
     }
-    for (const Agg agg : {Agg::kCount, Agg::kMin, Agg::kMax}) {
+    for (const Agg agg : {Agg::kCount, Agg::kMin, Agg::kMax, Agg::kCountDistinct}) {
       if (allowed_.Has(AggFeature(agg)) && !cols.empty()) {
         aggs.push_back(agg);
       }
@@ -618,6 +621,9 @@ class Builder {
     if (arg == nullptr) {
       Symbol("*");
     } else {
+      if (agg == Agg::kCountDistinct) {
+        Keyword("DISTINCT");
+      }
       Column(*arg);
     }
     Symbol(")");
@@ -629,6 +635,7 @@ class Builder {
     switch (agg) {
       case Agg::kCountStar:
       case Agg::kCount:
+      case Agg::kCountDistinct:
         return true;
       case Agg::kSum:
         return arg != nullptr && arg->kind == ValueKind::kInteger;

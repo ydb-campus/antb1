@@ -107,6 +107,7 @@ std::string_view ToString(AggKind kind) {
   switch (kind) {
     case AggKind::kCountStar:
     case AggKind::kCount:
+    case AggKind::kCountDistinct:
       return "COUNT";
     case AggKind::kSum:
       return "SUM";

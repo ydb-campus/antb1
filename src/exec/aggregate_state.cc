@@ -14,6 +14,7 @@
 #include <arrow/compute/api_scalar.h>
 #include <arrow/compute/api_vector.h>
 #include <arrow/compute/exec.h>
+#include <arrow/compute/row/grouper.h>
 #include <arrow/util/decimal.h>
 
 #include "antb1/common/int128.h"
@@ -21,6 +22,7 @@
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
 
+#include "double_key.h"
 #include "row_mask.h"
 
 namespace antb1::exec {
@@ -135,6 +137,72 @@ class CountState final : public AggregateState {
   std::shared_ptr<arrow::DataType> type_;
   arrow::MemoryPool* pool_;
   int64_t count_ = 0;
+};
+
+// ---- COUNT(DISTINCT c) ----
+
+// The distinct selected values, as the keys of a grouper; NULL is a key of its own that the count
+// leaves out. DOUBLE values are normalized first (-0.0 is 0.0, every NaN one value).
+class CountDistinctState final : public AggregateState {
+ public:
+  static arrow::Result<std::unique_ptr<AggregateState>> Make(std::shared_ptr<arrow::DataType> type,
+                                                             arrow::MemoryPool* pool) {
+    auto state = std::unique_ptr<CountDistinctState>(new CountDistinctState(std::move(type), pool));
+    ARROW_ASSIGN_OR_RAISE(state->grouper_,
+                          arrow::compute::Grouper::Make({state->type_}, state->kernels_.get()));
+    return state;
+  }
+
+  arrow::Status Consume(const arrow::Array& values, const arrow::BooleanArray* selection) override {
+    ARROW_RETURN_NOT_OK(CheckInput(values, selection, *type_));
+    std::shared_ptr<arrow::Array> selected = arrow::MakeArray(values.data());
+    if (selection != nullptr) {
+      ARROW_ASSIGN_OR_RAISE(
+          const arrow::Datum filtered,
+          arrow::compute::Filter(selected, *selection, arrow::compute::FilterOptions::Defaults(),
+                                 kernels_.get()));
+      selected = filtered.make_array();
+    }
+    return Add(selected);
+  }
+  arrow::Status Merge(const AggregateState& other) override {
+    ARROW_ASSIGN_OR_RAISE(const auto* same, SameKind<CountDistinctState>(other));
+    if (!same->type_->Equals(*type_)) {
+      return arrow::Status::Invalid("cannot merge COUNT(DISTINCT) of different types");
+    }
+    ARROW_ASSIGN_OR_RAISE(const arrow::compute::ExecBatch uniques, same->grouper_->GetUniques());
+    saw_null_ = saw_null_ || same->saw_null_;
+    return Add(uniques.values.at(0).make_array());
+  }
+  [[nodiscard]] arrow::Result<std::shared_ptr<arrow::Array>> Finalize(
+      arrow::MemoryPool* pool) const override {
+    return OneInt64(static_cast<int64_t>(grouper_->num_groups()) - (saw_null_ ? 1 : 0), pool);
+  }
+
+ private:
+  CountDistinctState(std::shared_ptr<arrow::DataType> type, arrow::MemoryPool* pool)
+      : type_(std::move(type)),
+        pool_(pool),
+        kernels_(std::make_unique<arrow::compute::ExecContext>(pool)) {}
+
+  arrow::Status Add(std::shared_ptr<arrow::Array> values) {
+    if (values->length() == 0) {
+      return arrow::Status::OK();
+    }
+    if (type_->id() == arrow::Type::DOUBLE) {
+      ARROW_ASSIGN_OR_RAISE(values, NormalizeDoubleKey(values, pool_));
+    }
+    saw_null_ = saw_null_ || values->null_count() > 0;
+    const int64_t rows = values->length();
+    const arrow::compute::ExecBatch batch({arrow::Datum(values)}, rows);
+    return grouper_->Consume(arrow::compute::ExecSpan(batch)).status();
+  }
+
+  std::shared_ptr<arrow::DataType> type_;
+  arrow::MemoryPool* pool_;
+  std::unique_ptr<arrow::compute::ExecContext> kernels_;
+  std::unique_ptr<arrow::compute::Grouper> grouper_;
+  bool saw_null_ = false;
 };
 
 // ---- SUM and AVG ----
@@ -465,6 +533,11 @@ arrow::Result<std::unique_ptr<AggregateState>> MakeAggregateState(
       }
       return std::make_unique<MinMaxState>(kind == plan::AggKind::kMin, plan::ToArrow(*input),
                                            pool);
+    case plan::AggKind::kCountDistinct:
+      if (result != plan::LogicalType::kBigInt) {
+        return invalid();
+      }
+      return CountDistinctState::Make(plan::ToArrow(*input), pool);
   }
   return invalid();
 }

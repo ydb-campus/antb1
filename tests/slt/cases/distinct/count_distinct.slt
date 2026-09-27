@@ -1,0 +1,123 @@
+# COUNT(DISTINCT col) (docs/sql-subset.md): the number of distinct non-NULL values, BIGINT, 0 over no
+# values. A DOUBLE -0.0 is 0.0 (and every NaN one value); VARCHAR compares by bytes.
+
+query IIIIIIII nosort
+SELECT COUNT(DISTINCT id), COUNT(DISTINCT i16), COUNT(DISTINCT i32), COUNT(DISTINCT i64), COUNT(DISTINCT u16), COUNT(DISTINCT d), COUNT(DISTINCT s), COUNT(DISTINCT u) FROM edge
+----
+12	10	10	10	10	10	10	10
+
+# -0.0 and 0.0 are one value (a FLOAT column is read as DOUBLE; the count is BIGINT either way).
+
+query II nosort
+SELECT COUNT(DISTINCT f), COUNT(f) FROM floats
+----
+16	17
+
+query I nosort
+SELECT COUNT(DISTINCT f) FROM floats WHERE f < 1
+----
+7
+
+query IIII nosort
+SELECT COUNT(DISTINCT RegionID), COUNT(DISTINCT SearchPhrase), COUNT(DISTINCT EventDate), COUNT(DISTINCT UserID) FROM hits_like WHERE IsMobile = 0
+----
+4247	595	31	4936
+
+# Over several files, and with NULLs.
+
+query II nosort
+SELECT count(distinct UserID), COUNT(DISTINCT "searchphrase") AS phrases FROM hits_like_split
+----
+9999	1103
+
+query II nosort
+SELECT COUNT(DISTINCT RegionID), COUNT(RegionID) FROM hits_like_nulls
+----
+7226	9215
+
+# No rows, no values.
+
+query II nosort
+SELECT COUNT(DISTINCT RegionID), COUNT(DISTINCT Title) FROM hits_like WHERE RegionID < -1
+----
+0	0
+
+query II nosort
+SELECT COUNT(DISTINCT i32), COUNT(DISTINCT s) FROM edge WHERE id = 5
+----
+0	0
+
+# Grouped: per group; a key with only NULL values counts 0.
+
+query II rowsort
+SELECT i16, COUNT(DISTINCT i32) FROM edge GROUP BY i16
+----
+-1	1
+-100	1
+-12345	1
+-32768	1
+0	1
+1	1
+100	1
+12345	0
+32767	1
+7	1
+NULL	1
+
+query III rowsort
+SELECT OS, COUNT(DISTINCT UserID), COUNT(DISTINCT SearchPhrase) FROM hits_like WHERE OS < 20 GROUP BY OS
+----
+0	82	15
+1	82	16
+10	107	22
+11	81	17
+12	87	14
+13	95	21
+14	84	16
+15	77	15
+16	69	13
+17	89	15
+18	88	17
+19	80	20
+2	97	20
+3	93	18
+4	71	8
+5	68	22
+6	92	19
+7	76	11
+8	85	9
+9	85	14
+
+query IIII nosort
+SELECT RegionID, COUNT(DISTINCT UserID) AS u, COUNT(*) AS c, COUNT(DISTINCT SearchPhrase) FROM hits_like_split GROUP BY RegionID ORDER BY u DESC, c DESC, RegionID LIMIT 10
+----
+0	304	304	64
+8830	6	6	2
+7430	5	5	2
+306	4	4	2
+2493	4	4	3
+2812	4	4	2
+3425	4	4	2
+4119	4	4	2
+4357	4	4	2
+4360	4	4	1
+
+query TI nosort
+SELECT EventDate, COUNT(DISTINCT URL) FROM hits_like GROUP BY EventDate ORDER BY COUNT(DISTINCT URL) DESC, EventDate LIMIT 5
+----
+2013-07-02	351
+2013-07-01	348
+2013-07-03	345
+2013-07-11	341
+2013-07-18	338
+
+# ORDER BY a COUNT(DISTINCT) the select list does not have.
+
+query I nosort
+SELECT OS FROM hits_like GROUP BY OS ORDER BY COUNT(DISTINCT RegionID) DESC, OS LIMIT 5
+----
+10
+116
+55
+26
+118

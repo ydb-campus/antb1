@@ -1,6 +1,7 @@
 #include "difftest.h"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -53,8 +54,10 @@ bool UsesOnlyCountStar(const std::string& sql) {
   std::ranges::transform(lower, lower.begin(), [](char c) {
     return static_cast<char>(c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c);
   });
-  return lower.contains("count") && lower.contains('*') && !lower.contains("where") &&
-         !lower.contains(',') && !lower.contains("limit");
+  return lower.contains("count") && lower.contains('*') && !lower.contains(',') &&
+         std::ranges::none_of(std::to_array<std::string_view>(
+                                  {"where", "limit", "offset", "group", "order", "distinct"}),
+                              [&](std::string_view word) { return lower.contains(word); });
 }
 
 ExecResult Unsupported() {
