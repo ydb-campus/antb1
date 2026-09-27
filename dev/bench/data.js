@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790536193873,
+  "lastUpdate": 1790547310416,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -756,6 +756,78 @@ window.BENCHMARK_DATA = {
             "value": 11.848000627118559,
             "unit": "ms/iter",
             "extra": "iterations: 59\ncpu: 11.846865864406784 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "e1c23612a4f87037f7401fbdee05fec157ceb0b1",
+          "message": "feat(sql,exec): in and not in (#28)\n\n## Summary\n\n**`column [NOT] IN (literal, ...)` in `WHERE`**, checked against DuckDB.\nThis is the first of the three PRs agreed before the expressions plan:\nIN, GROUP BY / ORDER BY positions, HAVING.\n\n- **Semantics (probed on DuckDB 1.5.5):**\n- `c IN (v1, v2, ...)` is `c = v1 OR c = v2 OR ...` with Kleene logic,\nand `NOT IN` is its negation, so a NULL value rejects the row for both.\n- Each value is typed and folded exactly like `c = v`. A value no column\nvalue can equal (out of the type's range, or not an integer for an\ninteger column) is dropped.\n  - With no values left, `IN` is `FALSE` and `NOT IN` is `IS NOT NULL`.\n- `-0.0` matches `0.0`. NaN never matches, as for `=`; divergence D10\nnow says so for IN.\n- **DuckDB types the whole list as one type.** When one number in the\nlist is DuckDB-DOUBLE-typed (an exponent, or more than 38 digits), every\nnumber is read as a double:\n- integer columns compare with the nearest doubles (divergence D7,\nextended to IN lists);\n- a FLOAT column then compares in DOUBLE: `f IN (0.1, 1e0)` does not\nmatch the FLOAT `0.1`, while `f IN (0.1, 2)` does.\n- **Parser:** `IN` and `NOT IN` are comparisons with a value list\n(`Comparison::list`); the unparser and `EqualIgnoringSpans` handle it.\n- Rejected with exit code 4: `IN (SELECT ...)`, a column in the list, a\nliteral on the left, and IN outside `WHERE`.\n  - Syntax errors: an empty list, a missing or unclosed parenthesis.\n- **Plan and exec:** `Predicate::Kind::kIn`/`kNotIn` with the folded\n`values`, and EXPLAIN `c IN (1, 2)`. `FilterOperator` computes one Arrow\n`equal` per value combined with `or_kleene`, and `invert` for NOT IN.\n- **Harness:** `in` is a supported, generated feature: 1–4 values made\nby the same literal generator as comparisons, with edges and\nout-of-range values.\n- **ClickBench: +1 query** (Q40). The ratchet goes from 34 to 35 of 43.\n- **Docs:** `docs/sql-subset.md` (grammar, rejected forms, IN semantics,\nD7 and D10, the ClickBench table), `docs/architecture.md`, and a fuzz\nseed.\n- **Also fixed:** a stray comment line left in `binder.cc` by #27.\n\n**Maintainer sign-off needed:** `tests/data/clickbench_status.json` is\nan \"Ask a human first\" path. It adds Q40, and no approved plan covers\nit; please approve it explicitly in the review.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n\n## Verification\n\n```text\n$ pixi run check-full   (asan passed there; tidy, coverage, fuzz-smoke and ci-gcc re-run after the tidy fix)\nlint: PASS; 100% tests passed out of 1076 (ci, asan, ci-gcc); tidy clean; Coverage gate: PASS; fuzz-smoke 2/2\n$ ANTB1_DIFF_COUNT=20000 pixi run diff-random\nDIFF: PASS seed=3166748253 queries=20000 failed=0 unsupported=0\n$ pixi run test-data\nCLICKBENCH pass=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 19, 20, 21, 22, 23, 24, 25, 26, 30, 31, 32, 33, 36, 37, 38, 40, 41]\n$ ANTB1_HITS_FILES=\"$HOME/.cache/antb1/clickbench/full/hits_*.parquet\" pixi run test-data   # host, all 100 files\n100% tests passed out of 6 (14m24s wall; peak RSS 22.7 GB for one process, DuckDB included)\n```\n\n- **Parser:** the parsed list with its span, the rejected and malformed\nforms, and unparse round-trips.\n- **Binder:**\n  - dropped values, and folding with no values left;\n  - type errors per value;\n- DOUBLE-typed lists on integer columns (2^53 + 1 becomes 2^53 only when\nan exponent is in the list).\n- **EXPLAIN** of the folded list.\n- **Filter:** IN and NOT IN over NULLs, and malformed predicates\nrejected at `Open`.\n- **`.slt` (`tests/slt/cases/in/`):** 18 queries plus errors, with\nexpectations written by DuckDB. They cover every integer type with\nout-of-range and fractional values, DOUBLE, VARCHAR, DATE, FLOAT ±0,\nDOUBLE-typed lists over FLOAT and BIGINT, and a grouped query over a\nsplit table.\n- **Metamorphic:** `COUNT(col)` equals IN plus NOT IN, and IN equals the\nsum of the equalities, over three columns with NULLs.\n- **Review:** the `reviewer` agent found that per-value typing differed\nfrom DuckDB for lists with a DOUBLE-typed number (on FLOAT: `f IN (0.1,\n1e0)`). That is fixed and tested as described above. A scan of all\ntracked files for ClickBench queries, WHERE clauses, LIKE patterns and\nIN lists finds nothing.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [ ] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: the ratchet needs your approval in this review\n\n## AI assistance\n\n- [x] AI-assisted. Tools and what they did: Claude Code wrote the code,\ntests and docs and ran the verification above; the `reviewer` subagent\nreviewed the diff.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-09-28T01:13:05+03:00",
+          "tree_id": "a3eb1c3d7f8094ca35ffce0f5be6f0a03d667a63",
+          "url": "https://github.com/ydb-campus/antb1/commit/e1c23612a4f87037f7401fbdee05fec157ceb0b1"
+        },
+        "date": 1790547309839,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 3040.4527429065433,
+            "unit": "ns/iter",
+            "extra": "iterations: 228061\ncpu: 3039.5114114206285 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 85031.20041726284,
+            "unit": "ns/iter",
+            "extra": "iterations: 7669\ncpu: 85006.23718868168 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222119.67226624486,
+            "unit": "ns/iter",
+            "extra": "iterations: 3155\ncpu: 222060.61299524567 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 439639.65726817056,
+            "unit": "ns/iter",
+            "extra": "iterations: 1596\ncpu: 439496.16416040115 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 401281.4090648293,
+            "unit": "ns/iter",
+            "extra": "iterations: 1743\ncpu: 401252.21916236344 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2158656.2215384655,
+            "unit": "ns/iter",
+            "extra": "iterations: 325\ncpu: 2157721.8430769234 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 239.55489999999693,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 239.5048036666664 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.437701104166756,
+            "unit": "ms/iter",
+            "extra": "iterations: 48\ncpu: 14.432680583333338 ms\nthreads: 1"
           }
         ]
       }
