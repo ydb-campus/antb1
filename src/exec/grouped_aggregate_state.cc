@@ -61,16 +61,28 @@ arrow::Result<const State*> SameKind(const GroupedAggregateState& other, GroupId
   return same;
 }
 
-arrow::Result<std::shared_ptr<arrow::Array>> Int64s(const std::vector<std::int64_t>& values,
+// The elements [begin, end) of per-group values, or Invalid for a range outside them.
+template <class T>
+arrow::Result<std::span<const T>> GroupRange(const std::vector<T>& values, std::uint32_t begin,
+                                             std::uint32_t end) {
+  if (begin > end || end > values.size()) {
+    return arrow::Status::Invalid("groups [", begin, ", ", end, ") of a state with ", values.size(),
+                                  " groups");
+  }
+  return std::span<const T>(values).subspan(begin, end - begin);
+}
+
+arrow::Result<std::shared_ptr<arrow::Array>> Int64s(std::span<const std::int64_t> values,
                                                     arrow::MemoryPool* pool) {
   arrow::Int64Builder builder(pool);
-  ARROW_RETURN_NOT_OK(builder.AppendValues(values));
+  ARROW_RETURN_NOT_OK(
+      builder.AppendValues(values.data(), static_cast<std::int64_t>(values.size())));
   return builder.Finish();
 }
 
 // HUGEINT is decimal128(38, 0): +-(10^38 - 1); NULL for a group without values.
-arrow::Result<std::shared_ptr<arrow::Array>> HugeInts(const std::vector<Int128>& sums,
-                                                      const std::vector<std::int64_t>& counts,
+arrow::Result<std::shared_ptr<arrow::Array>> HugeInts(std::span<const Int128> sums,
+                                                      std::span<const std::int64_t> counts,
                                                       arrow::MemoryPool* pool) {
   arrow::Decimal128Builder builder(plan::ToArrow(plan::LogicalType::kHugeInt), pool);
   ARROW_RETURN_NOT_OK(builder.Reserve(static_cast<std::int64_t>(sums.size())));
@@ -93,8 +105,8 @@ arrow::Result<std::shared_ptr<arrow::Array>> HugeInts(const std::vector<Int128>&
 
 // sum / count per group as DOUBLE (exact for integers), NULL for a group without values.
 template <class Sum>
-arrow::Result<std::shared_ptr<arrow::Array>> Averages(const std::vector<Sum>& sums,
-                                                      const std::vector<std::int64_t>& counts,
+arrow::Result<std::shared_ptr<arrow::Array>> Averages(std::span<const Sum> sums,
+                                                      std::span<const std::int64_t> counts,
                                                       arrow::MemoryPool* pool) {
   arrow::DoubleBuilder builder(pool);
   ARROW_RETURN_NOT_OK(builder.Reserve(static_cast<std::int64_t>(sums.size())));
@@ -146,8 +158,9 @@ class GroupedCount final : public GroupedAggregateState {
     return arrow::Status::OK();
   }
   [[nodiscard]] arrow::Result<std::shared_ptr<arrow::Array>> Finalize(
-      arrow::MemoryPool* pool) const override {
-    return Int64s(counts_, pool);
+      std::uint32_t begin, std::uint32_t end, arrow::MemoryPool* pool) const override {
+    ARROW_ASSIGN_OR_RAISE(const auto counts, GroupRange(counts_, begin, end));
+    return Int64s(counts, pool);
   }
 
  private:
@@ -199,8 +212,10 @@ class GroupedIntegerSum final : public GroupedAggregateState {
     return arrow::Status::OK();
   }
   [[nodiscard]] arrow::Result<std::shared_ptr<arrow::Array>> Finalize(
-      arrow::MemoryPool* pool) const override {
-    return average_ ? Averages(sums_, counts_, pool) : HugeInts(sums_, counts_, pool);
+      std::uint32_t begin, std::uint32_t end, arrow::MemoryPool* pool) const override {
+    ARROW_ASSIGN_OR_RAISE(const auto sums, GroupRange(sums_, begin, end));
+    ARROW_ASSIGN_OR_RAISE(const auto counts, GroupRange(counts_, begin, end));
+    return average_ ? Averages(sums, counts, pool) : HugeInts(sums, counts, pool);
   }
 
  private:
@@ -253,8 +268,10 @@ class GroupedHugeIntSum final : public GroupedAggregateState {
     return arrow::Status::OK();
   }
   [[nodiscard]] arrow::Result<std::shared_ptr<arrow::Array>> Finalize(
-      arrow::MemoryPool* pool) const override {
-    return average_ ? Averages(sums_, counts_, pool) : HugeInts(sums_, counts_, pool);
+      std::uint32_t begin, std::uint32_t end, arrow::MemoryPool* pool) const override {
+    ARROW_ASSIGN_OR_RAISE(const auto sums, GroupRange(sums_, begin, end));
+    ARROW_ASSIGN_OR_RAISE(const auto counts, GroupRange(counts_, begin, end));
+    return average_ ? Averages(sums, counts, pool) : HugeInts(sums, counts, pool);
   }
 
  private:
@@ -311,17 +328,19 @@ class GroupedDoubleSum final : public GroupedAggregateState {
     return arrow::Status::OK();
   }
   [[nodiscard]] arrow::Result<std::shared_ptr<arrow::Array>> Finalize(
-      arrow::MemoryPool* pool) const override {
+      std::uint32_t begin, std::uint32_t end, arrow::MemoryPool* pool) const override {
+    ARROW_ASSIGN_OR_RAISE(const auto sums, GroupRange(sums_, begin, end));
+    ARROW_ASSIGN_OR_RAISE(const auto counts, GroupRange(counts_, begin, end));
     if (average_) {
-      return Averages(sums_, counts_, pool);
+      return Averages(sums, counts, pool);
     }
     arrow::DoubleBuilder builder(pool);
-    ARROW_RETURN_NOT_OK(builder.Reserve(static_cast<std::int64_t>(sums_.size())));
-    for (std::size_t g = 0; g < sums_.size(); ++g) {
-      if (counts_[g] == 0) {
+    ARROW_RETURN_NOT_OK(builder.Reserve(static_cast<std::int64_t>(sums.size())));
+    for (std::size_t g = 0; g < sums.size(); ++g) {
+      if (counts[g] == 0) {
         builder.UnsafeAppendNull();
       } else {
-        builder.UnsafeAppend(sums_[g]);
+        builder.UnsafeAppend(sums[g]);
       }
     }
     return builder.Finish();
@@ -422,10 +441,11 @@ class GroupedMinMax final : public GroupedAggregateState {
     return arrow::Status::OK();
   }
   [[nodiscard]] arrow::Result<std::shared_ptr<arrow::Array>> Finalize(
-      arrow::MemoryPool* pool) const override {
+      std::uint32_t begin, std::uint32_t end, arrow::MemoryPool* pool) const override {
+    ARROW_RETURN_NOT_OK(GroupRange(seen_, begin, end).status());
     typename Traits::BuilderType builder(type_, pool);
-    ARROW_RETURN_NOT_OK(builder.Reserve(static_cast<std::int64_t>(seen_.size())));
-    for (std::size_t g = 0; g < seen_.size(); ++g) {
+    ARROW_RETURN_NOT_OK(builder.Reserve(static_cast<std::int64_t>(end - begin)));
+    for (std::size_t g = begin; g < end; ++g) {
       switch (seen_[g]) {
         case Seen::kNothing:
           ARROW_RETURN_NOT_OK(builder.AppendNull());

@@ -23,8 +23,8 @@ namespace antb1::exec {
 // GroupedAggregateState per call. After the input ends it emits the groups in the grouper's id
 // order (deterministic for a given input, not the order of first appearance): the keys of each
 // group as first seen, then one column per call, one batch per input batch that made new groups
-// (so VARCHAR keys are never concatenated past the 2 GiB of one binary array). Over no input rows
-// it emits nothing. Output: plan::ToArrow of each key's and call's type.
+// (so neither VARCHAR keys nor VARCHAR MIN/MAX values are gathered past the 2 GiB of one binary
+// array). Over no input rows it emits nothing. Output: plan::ToArrow of each key's and call's type.
 class GroupAggregateOperator final : public Operator {
  public:
   GroupAggregateOperator(std::unique_ptr<Operator> input, std::vector<plan::BoundColumn> keys,
@@ -56,11 +56,9 @@ class GroupAggregateOperator final : public Operator {
   std::vector<std::vector<std::shared_ptr<arrow::Array>>> first_keys_;  // per key, group order
   std::uint32_t num_groups_ = 0;
   bool done_ = false;
-  // After the input: the finalized aggregates (one array per call, every group), and the next
-  // chunk of first_keys_ to emit with the group it starts at.
-  std::vector<std::shared_ptr<arrow::Array>> finalized_;
+  // After the input: the next chunk of first_keys_ to emit and the group it starts at.
   std::size_t next_chunk_ = 0;
-  std::int64_t next_group_ = 0;
+  std::uint32_t next_group_ = 0;
 };
 
 }  // namespace antb1::exec

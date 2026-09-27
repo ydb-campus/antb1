@@ -90,7 +90,6 @@ arrow::Status GroupAggregateOperator::Open(ExecContext& ctx) {
   pool_ = ctx.pool;
   done_ = false;
   num_groups_ = 0;
-  finalized_.clear();
   next_chunk_ = 0;
   next_group_ = 0;
   states_.clear();
@@ -181,17 +180,19 @@ arrow::Result<Batch> GroupAggregateOperator::Next() {
   }
   if (done_) {
     if (keys_.empty() || next_chunk_ >= first_keys_.front().size()) {
+      states_.clear();
       return Batch{};
     }
     // One batch per chunk of new groups: its keys as first seen, the aggregates of those groups.
-    const std::int64_t rows = first_keys_.front()[next_chunk_]->length();
+    const auto rows = static_cast<std::uint32_t>(first_keys_.front()[next_chunk_]->length());
     arrow::ArrayVector columns;
-    columns.reserve(keys_.size() + finalized_.size());
+    columns.reserve(keys_.size() + states_.size());
     for (auto& chunks : first_keys_) {
       columns.push_back(std::move(chunks[next_chunk_]));
     }
-    for (const auto& aggregate : finalized_) {
-      columns.push_back(aggregate->Slice(next_group_, rows));
+    for (const auto& state : states_) {
+      ARROW_ASSIGN_OR_RAISE(auto column, state->Finalize(next_group_, next_group_ + rows, pool_));
+      columns.push_back(std::move(column));
     }
     ++next_chunk_;
     next_group_ += rows;
@@ -210,10 +211,7 @@ arrow::Result<Batch> GroupAggregateOperator::Next() {
   }
   for (const auto& state : states_) {
     state->Resize(num_groups_);
-    ARROW_ASSIGN_OR_RAISE(auto column, state->Finalize(pool_));
-    finalized_.push_back(std::move(column));
   }
-  states_.clear();
   done_ = true;
   return Next();
 }

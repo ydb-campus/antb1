@@ -203,6 +203,17 @@ TEST_F(GroupedAggregateTest, EveryGroupEqualsTheScalarStateOverItsRows) {
             << "group " << g << ": " << result->Slice(g, 1)->ToString() << " vs "
             << expected->ToString();
       }
+      // Ranges of groups (empty ones too) are the slices of the whole.
+      for (const auto& [begin, end] : std::vector<std::pair<std::uint32_t, std::uint32_t>>{
+               {0, 0}, {0, 3}, {3, 8}, {8, kGroups}, {kGroups, kGroups}, {2, 7}}) {
+        const auto range = grouped->Finalize(begin, end, arrow::default_memory_pool());
+        ASSERT_TRUE(range.ok()) << range.status().ToString();
+        EXPECT_TRUE((*range)->Equals(*result->Slice(begin, end - begin), EqualNans()))
+            << "groups [" << begin << ", " << end << ")";
+      }
+      EXPECT_TRUE(grouped->Finalize(3, 2, arrow::default_memory_pool()).status().IsInvalid());
+      EXPECT_TRUE(
+          grouped->Finalize(0, kGroups + 1, arrow::default_memory_pool()).status().IsInvalid());
     }
   }
 }

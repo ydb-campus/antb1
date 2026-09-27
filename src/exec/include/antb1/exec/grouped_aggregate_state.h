@@ -46,9 +46,17 @@ class GroupedAggregateState {
   // group_map[g] of this state, for every g < other.num_groups().
   virtual arrow::Status Merge(const GroupedAggregateState& other,
                               std::span<const std::uint32_t> group_map) = 0;
-  // One value per group, in group order: an array of plan::ToArrow(result type).
+  // One value per group of [begin, end), in group order: an array of plan::ToArrow(result type).
+  // Invalid unless begin <= end <= num_groups(). Finalizing the groups in ranges keeps each array
+  // small (a VARCHAR MIN or MAX over millions of groups would not fit the 2 GiB of one binary
+  // array).
   [[nodiscard]] virtual arrow::Result<std::shared_ptr<arrow::Array>> Finalize(
-      arrow::MemoryPool* pool) const = 0;
+      std::uint32_t begin, std::uint32_t end, arrow::MemoryPool* pool) const = 0;
+  // Every group.
+  [[nodiscard]] arrow::Result<std::shared_ptr<arrow::Array>> Finalize(
+      arrow::MemoryPool* pool) const {
+    return Finalize(0, num_groups(), pool);
+  }
 };
 
 // The grouped state of `kind` over an argument of type `input` (std::nullopt for COUNT(*))
