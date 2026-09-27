@@ -120,15 +120,23 @@ void CheckTokensAccountedFor(const std::string& sql, const SelectStatement& stmt
   }
   std::size_t aggregates = 0;
   std::size_t count_stars = 0;
-  for (const SelectItem& item : stmt.items) {
-    if (const auto* agg = std::get_if<AggregateCall>(&item.expr); agg != nullptr) {
+  const auto count_aggregate = [&](const SelectExpr& expr) {
+    if (const auto* agg = std::get_if<AggregateCall>(&expr); agg != nullptr) {
       ++aggregates;
       count_stars += agg->kind == AggKind::kCountStar ? 1U : 0U;
     }
+  };
+  for (const SelectItem& item : stmt.items) {
+    count_aggregate(item.expr);
   }
+  for (const OrderItem& item : stmt.order_by) {
+    count_aggregate(item.expr);
+  }
+  const auto separators = [](std::size_t n) { return n == 0 ? 0U : n - 1; };
   std::size_t negatives = 0;
   std::size_t string_literals = stmt.from.kind == TableRef::Kind::kPath ? 1U : 0U;
-  std::size_t number_literals = stmt.limit.has_value() ? 1U : 0U;
+  std::size_t number_literals =
+      (stmt.limit.has_value() ? 1U : 0U) + (stmt.offset.has_value() ? 1U : 0U);
   for (const Comparison& cmp : stmt.where) {
     negatives += cmp.literal.negative ? 1U : 0U;
     const bool numeric =
@@ -136,7 +144,9 @@ void CheckTokensAccountedFor(const std::string& sql, const SelectStatement& stmt
     (numeric ? number_literals : string_literals) += 1;
   }
   const std::string context = testing::PrintToString(sql);
-  EXPECT_EQ(commas, stmt.items.empty() ? 0U : stmt.items.size() - 1) << context;
+  EXPECT_EQ(commas, separators(stmt.items.size()) + separators(stmt.group_by.size()) +
+                        separators(stmt.order_by.size()))
+      << context;
   EXPECT_EQ(and_count, stmt.where.empty() ? 0U : stmt.where.size() - 1) << context;
   EXPECT_EQ(comparisons, stmt.where.size()) << context;
   EXPECT_EQ(left_parens, aggregates) << context;
@@ -177,6 +187,15 @@ void CheckParse(const std::string& sql) {
     ASSERT_TRUE(SpanInside(cmp.column.span, sql));
     ASSERT_TRUE(SpanInside(cmp.literal.span, sql));
   }
+  for (const ColumnRef& column : stmt.group_by) {
+    ASSERT_TRUE(SpanInside(column.span, sql));
+  }
+  for (const OrderItem& item : stmt.order_by) {
+    ASSERT_TRUE(SpanInside(item.span, sql));
+  }
+  ASSERT_TRUE(SpanInside(stmt.group_by_span, sql));
+  ASSERT_TRUE(SpanInside(stmt.order_by_span, sql));
+  ASSERT_TRUE(SpanInside(stmt.offset_span, sql));
   ASSERT_NO_FATAL_FAILURE(CheckTokensAccountedFor(sql, stmt));
   const std::string canonical = ToSql(stmt);
   auto again = Parse(canonical);
@@ -190,8 +209,10 @@ void CheckParse(const std::string& sql) {
 // ---- random token soup ------------------------------------------------------------------------
 
 constexpr auto kStructure = std::to_array<std::string_view>({
-    "SELECT", "select", "FROM", "WHERE", "LIMIT", "AND", "AS", "*",  ",", "(",  ")", ";",
-    "COUNT",  "SUM",    "AVG",  "MIN",   "MAX",   "=",   "<>", "!=", "<", "<=", ">", ">=",
+    "SELECT", "select", "FROM",   "WHERE", "LIMIT", "AND",  "AS",       "*",   ",",
+    "(",      ")",      ";",      "COUNT", "SUM",   "AVG",  "MIN",      "MAX", "=",
+    "<>",     "!=",     "<",      "<=",    ">",     ">=",   "GROUP",    "BY",  "ORDER",
+    "ASC",    "desc",   "OFFSET", "NULLS", "FIRST", "last", "DISTINCT",
 });
 constexpr auto kOperands = std::to_array<std::string_view>({
     "events",
@@ -221,21 +242,20 @@ constexpr auto kOperands = std::to_array<std::string_view>({
     "-",
 });
 constexpr auto kOther = std::to_array<std::string_view>({
-    "OR",       "NOT",       "ISNULL",   "notnull",  "GROUP",
-    "BY",       "ORDER",     "HAVING",   "DISTINCT", "OFFSET",
-    "JOIN",     "UNION",     "WITH",     "LIKE",     "IN",
-    "BETWEEN",  "CASE",      "WHEN",     "THEN",     "END",
-    "IS",       "NULL",      "TRUE",     "FALSE",    "INTERVAL",
-    "CAST",     "TIMESTAMP", "EXISTS",   "ALL",      "OVER",
-    "FILTER",   "INTO",      "LEFT",     "COLLATE",  "lower",
-    ".",        "+",         "/",        "%",        "::",
-    "||",       "'open",     R"("open)", "/* open",  "-- comment\n",
-    "!",        "#",         "~",        "!~",       "!=-",
-    "==",       "<<",        "->",       "?",        "$1",
-    "{",        "0x1F",      "1_000",    "E'x'",     "INT",
-    "EXCLUDE",  "PERCENT",   "USING",    "-- c\r",   "/* /* */ */",
-    "/* /* */", "\xd0\xb8",  "\x01",     "\xff",     "\xc3\x28",
-    "1e",       "12abc",     R"("")",    ":",        "|",
+    "OR",       "NOT",       "ISNULL",   "notnull", "HAVING",
+    "JOIN",     "UNION",     "WITH",     "LIKE",    "IN",
+    "BETWEEN",  "CASE",      "WHEN",     "THEN",    "END",
+    "IS",       "NULL",      "TRUE",     "FALSE",   "INTERVAL",
+    "CAST",     "TIMESTAMP", "EXISTS",   "ALL",     "OVER",
+    "FILTER",   "INTO",      "LEFT",     "COLLATE", "lower",
+    ".",        "+",         "/",        "%",       "::",
+    "||",       "'open",     R"("open)", "/* open", "-- comment\n",
+    "!",        "#",         "~",        "!~",      "!=-",
+    "==",       "<<",        "->",       "?",       "$1",
+    "{",        "0x1F",      "1_000",    "E'x'",    "INT",
+    "EXCLUDE",  "PERCENT",   "USING",    "-- c\r",  "/* /* */ */",
+    "/* /* */", "\xd0\xb8",  "\x01",     "\xff",    "\xc3\x28",
+    "1e",       "12abc",     R"("")",    ":",       "|",
     "[",
 });
 constexpr auto kSeparators = std::to_array<std::string_view>(
@@ -541,22 +561,27 @@ SelectStatement RandomStatement(Rng& rng) {
   static constexpr auto kOps =
       std::to_array<CompareOp>({CompareOp::kEq, CompareOp::kNe, CompareOp::kLt, CompareOp::kLe,
                                 CompareOp::kGt, CompareOp::kGe});
+  static constexpr auto kNulls =
+      std::to_array<NullsOrder>({NullsOrder::kDefault, NullsOrder::kFirst, NullsOrder::kLast});
+  const auto random_expr = [&rng] -> SelectExpr {
+    if (!rng.Percent(50)) {
+      return RandomColumn(rng);
+    }
+    const AggKind kind = rng.Pick(kKinds);
+    AggregateCall agg{.kind = kind};
+    if (kind != AggKind::kCountStar) {
+      agg.arg = RandomColumn(rng);
+      agg.distinct = kind == AggKind::kCount && rng.Percent(30);
+    }
+    return agg;
+  };
   SelectStatement stmt;
   stmt.star = rng.Percent(15);
   if (!stmt.star) {
     const std::size_t items = 1 + rng.Below(5);
     for (std::size_t i = 0; i < items; ++i) {
       SelectItem item;
-      if (rng.Percent(50)) {
-        const AggKind kind = rng.Pick(kKinds);
-        AggregateCall agg{.kind = kind};
-        if (kind != AggKind::kCountStar) {
-          agg.arg = RandomColumn(rng);
-        }
-        item.expr = std::move(agg);
-      } else {
-        item.expr = RandomColumn(rng);
-      }
+      item.expr = random_expr();
       if (rng.Percent(35)) {
         item.alias = RandomBytes(rng, 10, true);
       }
@@ -579,6 +604,22 @@ SelectStatement RandomStatement(Rng& rng) {
   for (std::size_t i = 0; i < conjuncts; ++i) {
     stmt.where.push_back(Comparison{
         .column = RandomColumn(rng), .op = rng.Pick(kOps), .literal = RandomLiteral(rng)});
+  }
+  if (rng.Percent(35)) {
+    const std::size_t keys = 1 + rng.Below(3);
+    for (std::size_t i = 0; i < keys; ++i) {
+      stmt.group_by.push_back(RandomColumn(rng));
+    }
+  }
+  if (rng.Percent(35)) {
+    const std::size_t items = 1 + rng.Below(3);
+    for (std::size_t i = 0; i < items; ++i) {
+      stmt.order_by.push_back(OrderItem{
+          .expr = random_expr(), .descending = rng.Percent(50), .nulls = rng.Pick(kNulls)});
+    }
+  }
+  if (rng.Percent(20)) {
+    stmt.offset = static_cast<std::int64_t>(rng.Below(1000));
   }
   if (rng.Percent(50)) {
     switch (rng.Below(4)) {
@@ -603,7 +644,10 @@ SelectStatement RandomStatement(Rng& rng) {
 std::string LiteralFirstSql(const SelectStatement& stmt) {
   SelectStatement head = stmt;
   head.where.clear();
+  head.group_by.clear();
+  head.order_by.clear();
   head.limit.reset();
+  head.offset.reset();
   std::string sql = ToSql(head);
   for (std::size_t i = 0; i < stmt.where.size(); ++i) {
     // Render "column op literal" through the unparser, then swap the operands around the operator.
@@ -647,9 +691,15 @@ std::string LiteralFirstSql(const SelectStatement& stmt) {
     sql += i == 0 ? " WHERE " : " AND ";
     sql += text.substr(literal_at) + " " + std::string(ToString(mirrored)) + " " + column_text;
   }
-  if (stmt.limit.has_value()) {
-    sql += " LIMIT " + std::to_string(stmt.limit.value_or(0));
-  }
+  // The clauses after WHERE, rendered by the unparser on a statement without a WHERE.
+  SelectStatement tail;
+  tail.star = true;
+  tail.from = TableRef{.kind = TableRef::Kind::kName, .name = "t"};
+  tail.group_by = stmt.group_by;
+  tail.order_by = stmt.order_by;
+  tail.limit = stmt.limit;
+  tail.offset = stmt.offset;
+  sql += ToSql(tail).substr(std::string_view("SELECT * FROM t").size());
   return sql;
 }
 

@@ -66,6 +66,15 @@ TEST(UnparseTest, CanonicalForms) {
            Case{.input = "/* hi */ SELECT a -- x\n FROM t -- y", .canonical = "SELECT a FROM t"},
            Case{.input = "SELECT MIN(ts), MAX(ts), AVG(x) FROM t WHERE ts > date '2020-01-01'",
                 .canonical = "SELECT MIN(ts), MAX(ts), AVG(x) FROM t WHERE ts > DATE '2020-01-01'"},
+           Case{.input = "select a, count(*) c from t group by a order by c desc, a asc limit 5",
+                .canonical = R"(SELECT a, COUNT(*) AS "c" FROM t GROUP BY a ORDER BY c DESC, a )"
+                             "LIMIT 5"},
+           Case{.input = "SELECT a FROM t ORDER BY a nulls first OFFSET 2 LIMIT 3",
+                .canonical = "SELECT a FROM t ORDER BY a NULLS FIRST LIMIT 3 OFFSET 2"},
+           Case{.input = "select count( distinct a ) from t order by count(distinct a) desc nulls "
+                         "last",
+                .canonical = "SELECT COUNT(DISTINCT a) FROM t ORDER BY COUNT(DISTINCT a) DESC "
+                             "NULLS LAST"},
        }) {
     EXPECT_EQ(Canonical(c.input), c.canonical) << c.input;
     ExpectRoundTrip(c.input);
@@ -86,6 +95,10 @@ TEST(UnparseTest, RoundTripsCorpus) {
            "SELECT a FROM t LIMIT 9223372036854775807"sv,
            "SELECT count, sum, date FROM date WHERE date = DATE '2024-01-01'"sv,
            R"(SELECT a AS """" FROM t)"sv,
+           "SELECT a, b, COUNT(*), SUM(x) FROM t WHERE c = 1 GROUP BY a, b ORDER BY COUNT(*) DESC, "
+           "a LIMIT 10 OFFSET 20"sv,
+           R"(SELECT "g", COUNT(DISTINCT "u") FROM t GROUP BY "g" ORDER BY "g" NULLS FIRST)"sv,
+           "SELECT a FROM t OFFSET 5"sv,
        }) {
     ExpectRoundTrip(sql);
   }
@@ -190,7 +203,46 @@ TEST(EqualIgnoringSpansTest, DetectsEveryStructuralDifference) {
   EXPECT_FALSE(EqualIgnoringSpans(*count, *count_col));
 }
 
+TEST(EqualIgnoringSpansTest, DetectsEveryDifferenceInNewClauses) {
+  const std::string_view base =
+      "SELECT a, COUNT(DISTINCT u) FROM t GROUP BY a, b ORDER BY a DESC NULLS FIRST, COUNT(*) "
+      "LIMIT 3 OFFSET 4";
+  for (const std::string_view other : {
+           "SELECT a, COUNT(u) FROM t GROUP BY a, b ORDER BY a DESC NULLS FIRST, COUNT(*) LIMIT 3 "
+           "OFFSET 4"sv,  // not distinct
+           "SELECT a, COUNT(DISTINCT u) FROM t GROUP BY a ORDER BY a DESC NULLS FIRST, COUNT(*) "
+           "LIMIT 3 OFFSET 4"sv,  // group count
+           "SELECT a, COUNT(DISTINCT u) FROM t GROUP BY a, c ORDER BY a DESC NULLS FIRST, "
+           "COUNT(*) LIMIT 3 OFFSET 4"sv,  // group column
+           R"(SELECT a, COUNT(DISTINCT u) FROM t GROUP BY a, "b" ORDER BY a DESC NULLS FIRST, )"
+           "COUNT(*) LIMIT 3 OFFSET 4"sv,  // quoted group column
+           "SELECT a, COUNT(DISTINCT u) FROM t GROUP BY a, b ORDER BY a NULLS FIRST, COUNT(*) "
+           "LIMIT 3 OFFSET 4"sv,  // direction
+           "SELECT a, COUNT(DISTINCT u) FROM t GROUP BY a, b ORDER BY a DESC NULLS LAST, "
+           "COUNT(*) LIMIT 3 OFFSET 4"sv,  // nulls order
+           "SELECT a, COUNT(DISTINCT u) FROM t GROUP BY a, b ORDER BY a DESC, COUNT(*) LIMIT 3 "
+           "OFFSET 4"sv,  // default nulls order
+           "SELECT a, COUNT(DISTINCT u) FROM t GROUP BY a, b ORDER BY a DESC NULLS FIRST, "
+           "SUM(a) LIMIT 3 OFFSET 4"sv,  // order expression
+           "SELECT a, COUNT(DISTINCT u) FROM t GROUP BY a, b ORDER BY a DESC NULLS FIRST LIMIT 3 "
+           "OFFSET 4"sv,  // order count
+           "SELECT a, COUNT(DISTINCT u) FROM t GROUP BY a, b ORDER BY a DESC NULLS FIRST, "
+           "COUNT(*) LIMIT 3 OFFSET 5"sv,  // offset
+           "SELECT a, COUNT(DISTINCT u) FROM t GROUP BY a, b ORDER BY a DESC NULLS FIRST, "
+           "COUNT(*) LIMIT 3"sv,  // no offset
+       }) {
+    auto x = Parse(base);
+    auto y = Parse(other);
+    ASSERT_TRUE(x.has_value()) << x.error().message;
+    ASSERT_TRUE(y.has_value()) << other;
+    EXPECT_FALSE(EqualIgnoringSpans(*x, *y)) << other;
+  }
+}
+
 TEST(AstTest, ToStringNamesKindsAndOperators) {
+  EXPECT_EQ(ToString(NullsOrder::kDefault), "");
+  EXPECT_EQ(ToString(NullsOrder::kFirst), "NULLS FIRST");
+  EXPECT_EQ(ToString(NullsOrder::kLast), "NULLS LAST");
   EXPECT_EQ(ToString(AggKind::kCountStar), "COUNT");
   EXPECT_EQ(ToString(AggKind::kCount), "COUNT");
   EXPECT_EQ(ToString(AggKind::kSum), "SUM");

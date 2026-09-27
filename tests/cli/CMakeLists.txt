@@ -176,7 +176,7 @@ antb1_add_cli_golden(
   unsupported
   EXIT_CODE 4
   STDERR
-  ARGS query -c "SELECT COUNT(*) FROM t GROUP BY CounterID" --table "${_t}"
+  ARGS query -c "SELECT CounterID, COUNT(*) FROM t GROUP BY CounterID HAVING COUNT(*) > 1" --table "${_t}"
 )
 antb1_add_cli_golden(
   unsupported_json
@@ -188,7 +188,7 @@ antb1_add_cli_golden(
   unsupported_explain
   EXIT_CODE 4
   STDERR
-  ARGS explain -c "SELECT * FROM t ORDER BY WatchID LIMIT 10" --table "${_t}"
+  ARGS explain -c "SELECT DISTINCT WatchID FROM t LIMIT 10" --table "${_t}"
 )
 antb1_add_cli_golden(
   unsupported_where

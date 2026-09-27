@@ -134,10 +134,16 @@ TEST_F(CliTest, SqlFromStdinAndFile) {
 }
 
 TEST_F(CliTest, UnsupportedQueryExits4WithCaret) {
-  auto r = Invoke({"query", "-c", "SELECT COUNT(*) FROM t GROUP BY x", "--table", "t=" + path_});
+  auto r = Invoke(
+      {"query", "-c", "SELECT COUNT(*) FROM t HAVING COUNT(*) > 1", "--table", "t=" + path_});
   EXPECT_EQ(r.code, kExitUnsupported);
   EXPECT_NE(r.err.find("unsupported error"), std::string::npos) << r.err;
   EXPECT_NE(r.err.find("^^^^^"), std::string::npos) << r.err;
+  // Parsed but not answered yet: rejected by the binder, also exit code 4, pointing at GROUP BY.
+  r = Invoke({"query", "-c", "SELECT x, COUNT(*) FROM t GROUP BY x", "--table", "t=" + path_});
+  EXPECT_EQ(r.code, kExitUnsupported);
+  EXPECT_NE(r.err.find("GROUP BY is not supported yet"), std::string::npos) << r.err;
+  EXPECT_NE(r.err.find("^^^^^^^^^^"), std::string::npos) << r.err;
 }
 
 TEST_F(CliTest, JsonErrorObject) {
@@ -215,7 +221,7 @@ TEST_F(CliTest, BenchWritesClickBenchJson) {
   const auto queries =
       WriteFile("q.sql",
                 "SELECT COUNT(*) FROM t;\n\n  SELECT MIN(EventDate) FROM t WHERE EventDate > DATE "
-                "'2000-01-01'\r\nSELECT COUNT(*) FROM t GROUP BY EventDate;\n");
+                "'2000-01-01'\r\nSELECT COUNT(*) FROM t HAVING COUNT(*) > 0;\n");
   const auto out = (dir_ / "result.json").string();
   const auto drops = std::make_shared<int>(0);
   std::vector<std::string> args{"bench",      "--clickbench", "--queries", queries, "--table",

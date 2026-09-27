@@ -1,0 +1,1 @@
+SELECT region, COUNT(*) AS n, SUM(amount) FROM sales WHERE amount > 0 GROUP BY region, "Day" ORDER BY n DESC, region NULLS LAST LIMIT 10 OFFSET 5

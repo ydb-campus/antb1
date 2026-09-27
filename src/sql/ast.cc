@@ -1,5 +1,6 @@
 #include "antb1/sql/ast.h"
 
+#include <cstddef>
 #include <string_view>
 #include <variant>
 
@@ -13,7 +14,7 @@ bool Eq(const Literal& a, const Literal& b) {
 }
 
 bool Eq(const AggregateCall& a, const AggregateCall& b) {
-  if (a.kind != b.kind || a.arg.has_value() != b.arg.has_value()) {
+  if (a.kind != b.kind || a.distinct != b.distinct || a.arg.has_value() != b.arg.has_value()) {
     return false;
   }
   return !a.arg.has_value() || Eq(*a.arg, *b.arg);
@@ -48,6 +49,18 @@ std::string_view ToString(AggKind kind) {
   return "?";
 }
 
+std::string_view ToString(NullsOrder nulls) {
+  switch (nulls) {
+    case NullsOrder::kDefault:
+      return "";
+    case NullsOrder::kFirst:
+      return "NULLS FIRST";
+    case NullsOrder::kLast:
+      return "NULLS LAST";
+  }
+  return "?";
+}
+
 std::string_view ToString(CompareOp op) {
   switch (op) {
     case CompareOp::kEq:
@@ -68,9 +81,22 @@ std::string_view ToString(CompareOp op) {
 
 bool EqualIgnoringSpans(const SelectStatement& a, const SelectStatement& b) {
   if (a.star != b.star || a.items.size() != b.items.size() || a.where.size() != b.where.size() ||
-      a.limit != b.limit || a.from.kind != b.from.kind || a.from.name != b.from.name ||
-      a.from.quoted != b.from.quoted) {
+      a.group_by.size() != b.group_by.size() || a.order_by.size() != b.order_by.size() ||
+      a.limit != b.limit || a.offset != b.offset || a.from.kind != b.from.kind ||
+      a.from.name != b.from.name || a.from.quoted != b.from.quoted) {
     return false;
+  }
+  for (std::size_t i = 0; i < a.group_by.size(); ++i) {
+    if (!Eq(a.group_by[i], b.group_by[i])) {
+      return false;
+    }
+  }
+  for (std::size_t i = 0; i < a.order_by.size(); ++i) {
+    if (!Eq(a.order_by[i].expr, b.order_by[i].expr) ||
+        a.order_by[i].descending != b.order_by[i].descending ||
+        a.order_by[i].nulls != b.order_by[i].nulls) {
+      return false;
+    }
   }
   for (std::size_t i = 0; i < a.items.size(); ++i) {
     if (!Eq(a.items[i].expr, b.items[i].expr) || a.items[i].alias != b.items[i].alias) {

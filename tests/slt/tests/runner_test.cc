@@ -50,8 +50,7 @@ ResultSet Ints(std::vector<Row> rows) {
 }
 
 EngineError Unsupported() {
-  return EngineError{
-      .kind = "unsupported", .message = "unsupported: GROUP BY", .unsupported = true};
+  return EngineError{.kind = "unsupported", .message = "unsupported: HAVING", .unsupported = true};
 }
 
 SltFile Parse(std::string_view text) {
@@ -134,10 +133,10 @@ TEST(RunFile, RedactedErrorsPrintOnlyTheKind) {
 
 TEST(RunFile, UnsupportedIsAFailureEvenForStatementError) {
   FakeEngine engine("antb1");
-  engine.Answer("SELECT a FROM t GROUP BY a", std::unexpected(Unsupported()));
+  engine.Answer("SELECT a FROM t HAVING a > 1", std::unexpected(Unsupported()));
   const auto o = RunText(
-      "statement error\nSELECT a FROM t GROUP BY a\n\nquery I\nSELECT a FROM t GROUP BY "
-      "a\n----\n1\n",
+      "statement error\nSELECT a FROM t HAVING a > 1\n\nquery I\nSELECT a FROM t HAVING a > "
+      "1\n----\n1\n",
       engine);
   EXPECT_EQ(o.stats.failed, 2);
   EXPECT_EQ(o.stats.unsupported, 2);

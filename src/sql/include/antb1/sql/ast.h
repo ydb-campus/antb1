@@ -27,6 +27,7 @@ enum class AggKind : std::uint8_t { kCountStar, kCount, kSum, kAvg, kMin, kMax }
 struct AggregateCall {
   AggKind kind = AggKind::kCountStar;
   std::optional<ColumnRef> arg;  // empty only for kCountStar
+  bool distinct = false;         // COUNT(DISTINCT col); only kCount
   SourceSpan span;
 };
 
@@ -57,6 +58,17 @@ struct SelectItem {
   SourceSpan span;                   // expression and alias
 };
 
+// NULLS FIRST / NULLS LAST as written; kDefault when omitted.
+enum class NullsOrder : std::uint8_t { kDefault, kFirst, kLast };
+
+// One ORDER BY item: a column (or a select alias, resolved by the binder) or an aggregate call.
+struct OrderItem {
+  SelectExpr expr;
+  bool descending = false;  // DESC; ASC (written or not) is false
+  NullsOrder nulls = NullsOrder::kDefault;
+  SourceSpan span;  // expression and modifiers
+};
+
 struct TableRef {
   enum class Kind : std::uint8_t { kName, kPath };
   Kind kind = Kind::kName;
@@ -71,13 +83,20 @@ struct SelectStatement {
   std::vector<SelectItem> items;
   TableRef from;
   std::vector<Comparison> where;      // conjunction (AND)
+  std::vector<ColumnRef> group_by;    // GROUP BY columns (a select alias is resolved by the binder)
+  SourceSpan group_by_span;           // GROUP BY and its list (when group_by is not empty)
+  std::vector<OrderItem> order_by;    // ORDER BY items
+  SourceSpan order_by_span;           // ORDER BY and its list (when order_by is not empty)
   std::optional<std::int64_t> limit;  // non-negative
   SourceSpan limit_span;              // LIMIT and its value (when limit)
-  SourceSpan span;                    // SELECT .. last token of the query (without ';')
+  std::optional<std::int64_t> offset;  // non-negative
+  SourceSpan offset_span;              // OFFSET and its value (when offset)
+  SourceSpan span;                     // SELECT .. last token of the query (without ';')
 };
 
 std::string_view ToString(AggKind kind);
 std::string_view ToString(CompareOp op);
+std::string_view ToString(NullsOrder nulls);  // "", "NULLS FIRST" or "NULLS LAST"
 
 bool EqualIgnoringSpans(const SelectStatement& a, const SelectStatement& b);
 

@@ -1,4 +1,4 @@
-antb1: unsupported error: ORDER BY is not supported; see docs/sql-subset.md
-  at line 1, column 17
-  SELECT * FROM t ORDER BY WatchID LIMIT 10
-                  ^^^^^
+antb1: unsupported error: DISTINCT is not supported; see docs/sql-subset.md
+  at line 1, column 8
+  SELECT DISTINCT WatchID FROM t LIMIT 10
+         ^^^^^^^^

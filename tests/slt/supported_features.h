@@ -58,14 +58,14 @@ enum class Feature : std::uint8_t {
   kQuotedIdentifier,  // "quoted" table and column names
   kLayout,            // newlines, tabs, -- and /* */ comments between tokens
   kSemicolon,         // a trailing ';'
-  // Out-of-scope marker: never in kSupportedFeatures and never generated. The harness self-tests
-  // tag
-  // their "pending" canary query with it, so that path stays tested while the slice grammar is
-  // complete.
-  kGroupBy,  // GROUP BY (not supported)
+  // Out-of-scope markers: never in kSupportedFeatures and never generated. GROUP BY is parsed but
+  // not answered yet; the harness self-tests tag their "pending" canary query with HAVING, which
+  // stays outside the subset, so that path stays tested.
+  kGroupBy,  // GROUP BY (parsed, not answered yet)
+  kHaving,   // HAVING (not supported)
 };
 
-inline constexpr std::size_t kFeatureCount = static_cast<std::size_t>(Feature::kGroupBy) + 1;
+inline constexpr std::size_t kFeatureCount = static_cast<std::size_t>(Feature::kHaving) + 1;
 
 constexpr std::string_view FeatureName(Feature feature) {
   switch (feature) {
@@ -131,6 +131,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "semicolon";
     case Feature::kGroupBy:
       return "group_by";
+    case Feature::kHaving:
+      return "having";
   }
   return "?";
 }
@@ -194,8 +196,8 @@ class FeatureSet {
   std::uint64_t bits_ = 0;
 };
 
-// Out-of-scope markers: valid in `-- features:` tags, never generated (see Feature::kGroupBy).
-inline constexpr FeatureSet kNeverGenerated = {Feature::kGroupBy};
+// Out-of-scope markers: valid in `-- features:` tags, never generated (see Feature::kHaving).
+inline constexpr FeatureSet kNeverGenerated = {Feature::kGroupBy, Feature::kHaving};
 
 // What antb1 answers today: the whole slice grammar of docs/sql-subset.md (global aggregates,
 // projections, WHERE conjunctions of column <op> literal, LIMIT) over every column type, in any

@@ -37,9 +37,9 @@ SELECT SUM(a) FROM t_nulls WHERE b >= 2
 ----
 (written by DuckDB)
 
-# GROUP BY is outside the subset: rejected, never answered
+# HAVING is outside the subset: rejected, never answered
 statement error unsupported
-SELECT a, COUNT(*) FROM t GROUP BY a
+SELECT a, COUNT(*) FROM t GROUP BY a HAVING COUNT(*) > 1
 ```
 
 - `query <types> <sort mode>`: one type letter per result column (`I` integer, `R` floating point, `T` text and
