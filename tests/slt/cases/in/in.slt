@@ -1,0 +1,107 @@
+# column [NOT] IN (literal, ...) in WHERE (docs/sql-subset.md): column = v1 OR column = v2 ...; NOT IN is
+# its negation; a NULL value rejects the row for both. Values are typed and folded like `column = value`.
+
+query I rowsort
+SELECT id FROM edge WHERE i16 IN (0, 7, 100, 32767)
+----
+1
+11
+2
+6
+
+query I rowsort
+SELECT id FROM edge WHERE i16 NOT IN (0, 7, 100, 32767)
+----
+0
+10
+3
+4
+7
+9
+
+query I rowsort
+SELECT id FROM edge WHERE i64 IN (9223372036854775807, -9223372036854775808, 42)
+----
+0
+1
+9
+
+# Values no column value can equal are dropped: out of range, or not an integer.
+
+query I rowsort
+SELECT id FROM edge WHERE i16 IN (1.5, 40000, 1)
+----
+4
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i16 IN (1.5, 40000)
+----
+0
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i16 NOT IN (1.5, 40000)
+----
+10
+
+query I rowsort
+SELECT id FROM edge WHERE u16 NOT IN (-1, 0, 65535, 2)
+----
+10
+11
+2
+3
+4
+6
+7
+
+query I rowsort
+SELECT id FROM edge WHERE d IN (0.1, -0.5, 0, 123456789.125)
+----
+0
+2
+4
+6
+
+query I rowsort
+SELECT id FROM edge WHERE u IN ('a', 'tab	here', '', 'nope')
+----
+0
+1
+2
+
+query I rowsort
+SELECT id FROM edge WHERE s NOT IN ('a', '')
+----
+11
+2
+3
+4
+6
+7
+8
+9
+
+# -0.0 equals 0.0 (FLOAT is read as DOUBLE).
+
+query I rowsort
+SELECT id FROM floats WHERE f IN (0, 19.99)
+----
+15
+16
+4
+
+query TI nosort
+SELECT EventDate, COUNT(*) FROM hits_like WHERE EventDate IN (DATE '2013-07-02', '2013-07-15', DATE '2013-08-01') GROUP BY EventDate ORDER BY EventDate
+----
+2013-07-02	362
+2013-07-15	335
+
+query II nosort
+SELECT COUNT(*), COUNT(DISTINCT UserID) FROM hits_like_split WHERE OS IN (1, 2, 3, 4, 5) AND RegionID NOT IN (1, 2)
+----
+411	411
+
+query I nosort
+SELECT COUNT(*) FROM hits_like_nulls WHERE RegionID NOT IN (1)
+----
+9215

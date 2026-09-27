@@ -76,6 +76,8 @@ struct Predicate {
     kCompare,    // column <op> constant
     kLike,       // column LIKE constant (a VARCHAR column and pattern; docs/sql-subset.md)
     kNotLike,    // column NOT LIKE constant
+    kIn,         // column IN (values): column = v1 OR column = v2 ... (Kleene)
+    kNotIn,      // column NOT IN (values): NOT (column IN (values))
     kIsNotNull,  // folded: true for every non-NULL value (NULL still rejects the row)
     kFalse,      // folded: true for no row
   };
@@ -84,6 +86,7 @@ struct Predicate {
   std::optional<BoundColumn> column;  // empty for kFalse
   CompareOp op = CompareOp::kEq;      // kCompare only
   Constant constant;                  // kCompare, kLike and kNotLike; typed as the column
+  std::vector<Constant> values;       // kIn and kNotIn (not empty); typed as the column
   SourceSpan span;                    // the comparison in the query
 };
 

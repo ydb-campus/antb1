@@ -302,8 +302,10 @@ CompareOp Mirror(CompareOp op) {
       return CompareOp::kLe;
     case CompareOp::kEq:
     case CompareOp::kNe:
-    case CompareOp::kLike:  // never mirrored: the pattern must be on the right
+    case CompareOp::kLike:  // never mirrored: the pattern or list must be on the right
     case CompareOp::kNotLike:
+    case CompareOp::kIn:
+    case CompareOp::kNotIn:
       break;
   }
   return op;
@@ -894,6 +896,9 @@ class Parser {
     if (op_token.IsKeyword("LIKE") || (op_token.IsKeyword("NOT") && PeekAt(1).IsKeyword("LIKE"))) {
       return ParseLike(*std::move(lhs));
     }
+    if (op_token.IsKeyword("IN") || (op_token.IsKeyword("NOT") && PeekAt(1).IsKeyword("IN"))) {
+      return ParseIn(*std::move(lhs));
+    }
     const std::optional<CompareOp> op = CompareOpOf(op_token.kind);
     if (!op.has_value()) {
       if (auto error = UnsupportedOperator(); error.has_value()) {
@@ -961,6 +966,58 @@ class Parser {
                       .op = negated ? CompareOp::kNotLike : CompareOp::kLike,
                       .literal = std::move(*pattern),
                       .span = span};
+  }
+
+  // column [NOT] IN (literal, ...), positioned at IN or NOT; `lhs` is the operand before it.
+  Expected<Comparison> ParseIn(Operand lhs) {
+    const bool negated = Peek().IsKeyword("NOT");
+    if (negated) {
+      Take();
+    }
+    Take();  // IN
+    auto* column = std::get_if<ColumnRef>(&lhs);
+    if (column == nullptr) {
+      return Unsupported(SpanOf(lhs), "IN needs a column on the left (column IN (...))");
+    }
+    if (Peek().kind != TokenKind::kLeftParen) {
+      return Syntax(Peek().span, "expected ( after IN, found " + Describe(Peek()));
+    }
+    Take();
+    if (Peek().IsKeyword("SELECT")) {
+      return Unsupported(Peek().span, "IN (subquery) is not supported");
+    }
+    if (Peek().kind == TokenKind::kRightParen) {
+      return Syntax(Peek().span, "expected a value in IN (...), found )");
+    }
+    Comparison comparison{.column = std::move(*column),
+                          .op = negated ? CompareOp::kNotIn : CompareOp::kIn,
+                          .literal = {},
+                          .list = {},
+                          .span = {}};
+    while (true) {
+      auto value = ParseOperand(Context::kWhere);
+      if (!value) {
+        return std::unexpected(std::move(value.error()));
+      }
+      auto* literal = std::get_if<Literal>(&*value);
+      if (literal == nullptr) {
+        return Unsupported(SpanOf(*value), "columns in an IN list are not supported");
+      }
+      comparison.list.push_back(std::move(*literal));
+      if (auto error = UnsupportedOperator(); error.has_value()) {
+        return std::unexpected(std::move(*error));
+      }
+      if (Peek().kind == TokenKind::kRightParen) {
+        break;
+      }
+      if (Peek().kind != TokenKind::kComma) {
+        return Syntax(Peek().span, "expected , or ) in IN (...), found " + Describe(Peek()));
+      }
+      Take();
+    }
+    const SourceSpan close = Take().span;
+    comparison.span = Cover(comparison.column.span, close);
+    return comparison;
   }
 
   // GROUP BY column_ref (',' column_ref)*, positioned at GROUP.

@@ -87,6 +87,14 @@ TEST(ExplainTest, SortAndOffset) {
             "        Scan table=ok source=fake columns=[i16]\n");
 }
 
+TEST(ExplainTest, In) {
+  EXPECT_EQ(ExplainSql("SELECT i16 FROM ok WHERE i16 IN (3, 1.5, 7) AND s NOT IN ('x', 'it''s')"),
+            "Output: i16:SMALLINT\n"
+            "Project i16\n"
+            "  Filter i16 IN (3, 7) AND s NOT IN ('x', 'it''s')\n"
+            "    Scan table=ok source=fake columns=[i16, s]\n");
+}
+
 TEST(ExplainTest, Like) {
   EXPECT_EQ(ExplainSql("SELECT i16 FROM ok WHERE s LIKE '%it''s_%' AND s NOT LIKE ''"),
             "Output: i16:SMALLINT\n"

@@ -37,7 +37,8 @@ class FilterOperator final : public Operator {
   // Per predicate, from Open: the input column (-1 for kFalse) and the constant (kCompare only).
   std::vector<int> columns_;
   std::vector<std::shared_ptr<arrow::Scalar>> constants_;
-  std::vector<std::optional<LikePattern>> patterns_;  // kLike and kNotLike only
+  std::vector<std::optional<LikePattern>> patterns_;                     // kLike and kNotLike only
+  std::vector<std::vector<std::shared_ptr<arrow::Scalar>>> value_sets_;  // kIn and kNotIn only
   bool never_true_ = false;
   arrow::MemoryPool* pool_ = arrow::default_memory_pool();
 };

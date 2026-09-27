@@ -13,6 +13,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -578,6 +579,38 @@ std::vector<Relation> AllRelations() {
             batch));
     }
     r.push_back(std::move(grouped));
+  }
+  // [NOT] IN partitions the non-NULL values of a column, and IN over distinct values counts the
+  // rows equal to each.
+  for (const auto& [column, values, type, literal] :
+       std::to_array<std::tuple<std::string_view, std::string_view, slt::Feature, slt::Feature>>(
+           {{"RegionID", "1, 2, 229, 70000", kIntegerColumns, kIntegerLiteral},
+            {"OS", "1, 3, 5, 7", kIntegerColumns, kIntegerLiteral},
+            {"SearchPhrase", "'', 'a'", kVarcharColumns, kStringLiteral}})) {
+    const slt::FeatureSet features = {kCountStar, kCountColumn, kWhere, kIn,
+                                      kTableName, type,         literal};
+    r.push_back(
+        {.name = std::format("in_partitions_{}", column),
+         .features = features,
+         .probes = {Q(std::format("SELECT COUNT({}) FROM hits_like_nulls", column)),
+                    Q(std::format("SELECT COUNT(*) FROM hits_like_nulls WHERE {} IN ({})", column,
+                                  values)),
+                    Q(std::format("SELECT COUNT(*) FROM hits_like_nulls WHERE {} NOT IN ({})",
+                                  column, values))},
+         .check = FirstEqualsSumOfRest()});
+    Relation sum{.name = std::format("in_is_sum_of_equalities_{}", column),
+                 .features = features,
+                 .probes = {Q(std::format("SELECT COUNT(*) FROM hits_like_nulls WHERE {} IN ({})",
+                                          column, values))},
+                 .check = FirstEqualsSumOfRest()};
+    std::string_view rest = values;
+    while (!rest.empty()) {
+      const std::size_t comma = std::min(rest.find(", "), rest.size());
+      sum.probes.push_back(Q(std::format("SELECT COUNT(*) FROM hits_like_nulls WHERE {} = {}",
+                                         column, rest.substr(0, comma))));
+      rest = comma < rest.size() ? rest.substr(comma + 2) : std::string_view{};
+    }
+    r.push_back(std::move(sum));
   }
   // [NOT] LIKE partitions the non-NULL values of a column (NULL is in neither part), for patterns
   // with %, _, both, and none; the same per file of a split table.

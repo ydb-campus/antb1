@@ -65,6 +65,8 @@ CompareOp ToPlan(sql::CompareOp op) {
       return CompareOp::kGe;
     case sql::CompareOp::kLike:  // bound as Predicate::Kind::kLike, never as a comparison
     case sql::CompareOp::kNotLike:
+    case sql::CompareOp::kIn:  // bound as Predicate::Kind::kIn
+    case sql::CompareOp::kNotIn:
       break;
   }
   return CompareOp::kEq;
@@ -231,7 +233,6 @@ std::string_view LiteralKind(const sql::Literal& lit) {
   return "a literal";
 }
 
-// `column <op> literal`, with the literal folded exactly into the column's type.
 // `column [NOT] LIKE 'pattern'`: a VARCHAR column and a string pattern (DuckDB rejects LIKE on
 // other types). A pattern of only % holds for every value: LIKE folds to IS NOT NULL, NOT LIKE to
 // FALSE.
@@ -262,11 +263,55 @@ arrow::Result<Predicate> BindLike(const sql::Comparison& cmp, const BoundColumn&
   return p;
 }
 
+arrow::Result<Predicate> BindEquality(const sql::Comparison& cmp, const BoundColumn& column,
+                                      const Table& table);
+
+// `column [NOT] IN (v1, ...)`: each value is bound as `column = v` (the same typing and exact
+// folding); a value no column value can equal is dropped. With no value left, IN is FALSE and
+// NOT IN is IS NOT NULL (NULL still rejects the row).
+arrow::Result<Predicate> BindIn(const sql::Comparison& cmp, const BoundColumn& column,
+                                const Table& table) {
+  const bool negated = cmp.op == sql::CompareOp::kNotIn;
+  Predicate p{.kind = negated ? Predicate::Kind::kNotIn : Predicate::Kind::kIn,
+              .column = column,
+              .op = CompareOp::kEq,
+              .constant = {},
+              .values = {},
+              .span = cmp.span};
+  for (const sql::Literal& value : cmp.list) {
+    const sql::Comparison equal{.column = cmp.column,
+                                .op = sql::CompareOp::kEq,
+                                .literal = value,
+                                .list = {},
+                                .span = cmp.span};
+    ARROW_ASSIGN_OR_RAISE(const Predicate one, BindEquality(equal, column, table));
+    if (one.kind == Predicate::Kind::kCompare) {
+      p.values.push_back(one.constant);
+    }
+  }
+  if (p.values.empty()) {
+    p.kind = negated ? Predicate::Kind::kIsNotNull : Predicate::Kind::kFalse;
+    if (!negated) {
+      p.column.reset();  // no row passes, whatever the column holds
+    }
+  }
+  return p;
+}
+
 arrow::Result<Predicate> BindComparison(const sql::Comparison& cmp, const BoundColumn& column,
                                         const Table& table) {
   if (cmp.op == sql::CompareOp::kLike || cmp.op == sql::CompareOp::kNotLike) {
     return BindLike(cmp, column);
   }
+  if (cmp.op == sql::CompareOp::kIn || cmp.op == sql::CompareOp::kNotIn) {
+    return BindIn(cmp, column, table);
+  }
+  return BindEquality(cmp, column, table);
+}
+
+// `column <op> literal`, with the literal folded exactly into the column's type.
+arrow::Result<Predicate> BindEquality(const sql::Comparison& cmp, const BoundColumn& column,
+                                      const Table& table) {
   const sql::Literal& lit = cmp.literal;
   const auto mismatch = [&](std::string_view hint) {
     return BindError(std::format("cannot compare {} column '{}' with {}; {}", ToString(column.type),

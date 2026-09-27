@@ -1,0 +1,8 @@
+# IN values are typed like `column = value`.
+
+statement error
+SELECT COUNT(*) FROM edge WHERE u IN ('a', 1)
+
+onlyif antb1
+statement error ^bind: cannot compare SMALLINT column 'i16' with a string
+SELECT COUNT(*) FROM edge WHERE i16 IN (1, '2')

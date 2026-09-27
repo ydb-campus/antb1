@@ -73,7 +73,15 @@ std::string ToSql(const SelectStatement& stmt) {
   for (std::size_t i = 0; i < stmt.where.size(); ++i) {
     const Comparison& c = stmt.where[i];
     sql += i == 0 ? " WHERE " : " AND ";
-    sql += Column(c.column) + " " + std::string(ToString(c.op)) + " " + LiteralSql(c.literal);
+    sql += Column(c.column) + " " + std::string(ToString(c.op)) + " ";
+    if (c.op == CompareOp::kIn || c.op == CompareOp::kNotIn) {
+      for (std::size_t k = 0; k < c.list.size(); ++k) {
+        sql += (k == 0 ? "(" : ", ") + LiteralSql(c.list[k]);
+      }
+      sql += ")";
+    } else {
+      sql += LiteralSql(c.literal);
+    }
   }
   for (std::size_t i = 0; i < stmt.group_by.size(); ++i) {
     sql += i == 0 ? " GROUP BY " : ", ";
