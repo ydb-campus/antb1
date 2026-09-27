@@ -15,8 +15,9 @@
 
 // Aggregate functions of the grouped aggregation (GROUP BY): the semantics of the scalar states in
 // aggregate_state.h (exact 128-bit integer SUM and AVG, DOUBLE sums in row order, NaN ignored by
-// MIN and MAX unless every value is NaN, NULL values skipped), kept per group. Rows arrive already
-// selected (WHERE applied), each with the id of its group.
+// MIN and MAX unless every value is NaN, NULL values skipped), kept per group; COUNT(DISTINCT)
+// keeps the distinct (group, value) pairs. Rows arrive already selected (WHERE applied), each with
+// the id of its group.
 //
 // Merge folds the groups of another state into this one through a group map. Partial states built
 // over separate parts of the input (for example row groups read by different threads) and merged
@@ -60,8 +61,10 @@ class GroupedAggregateState {
 };
 
 // The grouped state of `kind` over an argument of type `input` (std::nullopt for COUNT(*))
-// producing `result`. Invalid for a combination the binder never produces.
+// producing `result`; `pool` holds the buffers of COUNT(DISTINCT)'s grouper. Invalid for a
+// combination the binder never produces.
 arrow::Result<std::unique_ptr<GroupedAggregateState>> MakeGroupedAggregateState(
-    plan::AggKind kind, std::optional<plan::LogicalType> input, plan::LogicalType result);
+    plan::AggKind kind, std::optional<plan::LogicalType> input, plan::LogicalType result,
+    arrow::MemoryPool* pool = arrow::default_memory_pool());
 
 }  // namespace antb1::exec

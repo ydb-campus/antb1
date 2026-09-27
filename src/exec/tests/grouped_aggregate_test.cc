@@ -7,6 +7,7 @@
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <utility>
@@ -140,7 +141,8 @@ std::vector<Call> CallsOver(LogicalType type) {
       {.kind = AggKind::kCountStar, .input = std::nullopt, .result = LogicalType::kBigInt},
       {.kind = AggKind::kCount, .input = type, .result = LogicalType::kBigInt},
       {.kind = AggKind::kMin, .input = type, .result = type},
-      {.kind = AggKind::kMax, .input = type, .result = type}};
+      {.kind = AggKind::kMax, .input = type, .result = type},
+      {.kind = AggKind::kCountDistinct, .input = type, .result = LogicalType::kBigInt}};
   if (plan::IsNumeric(type)) {
     calls.push_back(
         {.kind = AggKind::kSum,
@@ -214,6 +216,51 @@ TEST_F(GroupedAggregateTest, EveryGroupEqualsTheScalarStateOverItsRows) {
       EXPECT_TRUE(grouped->Finalize(3, 2, arrow::default_memory_pool()).status().IsInvalid());
       EXPECT_TRUE(
           grouped->Finalize(0, kGroups + 1, arrow::default_memory_pool()).status().IsInvalid());
+    }
+  }
+}
+
+// COUNT(DISTINCT) per group against a model: a set of the group's normalized non-NULL values
+// (-0.0 is 0.0, every NaN one value), for every input type, with values repeating across groups.
+TEST_F(GroupedAggregateTest, CountDistinctMatchesASetPerGroup) {
+  constexpr std::size_t kRows = 600;
+  constexpr std::uint32_t kGroups = 7;  // group 6 gets no row
+  Rng rng(42);
+  for (const LogicalType type : kTypes) {
+    SCOPED_TRACE(std::string(plan::ToString(type)));
+    const auto values = RandomColumn(type, kRows, rng);
+    std::vector<std::uint32_t> ids(kRows);
+    std::vector<std::set<std::string>> model(kGroups);
+    for (std::size_t i = 0; i < kRows; ++i) {
+      ids[i] = static_cast<std::uint32_t>(rng.Below(kGroups - 1));
+      const auto row = static_cast<std::int64_t>(i);
+      if (values->IsNull(row)) {
+        continue;
+      }
+      std::string key = values->GetScalar(row).ValueOrDie()->ToString();
+      if (type == LogicalType::kDouble) {
+        const double v = static_cast<const arrow::DoubleArray&>(*values).Value(row);
+        if (std::isnan(v)) {
+          key = "nan";
+        } else if (v == 0.0) {
+          key = "0";  // -0.0 too
+        }
+      }
+      model[ids[i]].insert(key);
+    }
+    auto state = MakeGrouped(
+        {.kind = AggKind::kCountDistinct, .input = type, .result = LogicalType::kBigInt});
+    ASSERT_NE(state, nullptr);
+    state->Resize(kGroups);
+    // In two batches, so that pairs repeat across Consume calls.
+    const std::span<const std::uint32_t> all(ids);
+    ASSERT_TRUE(state->Consume(values->Slice(0, 250).get(), all.first(250)).ok());
+    ASSERT_TRUE(state->Consume(values->Slice(250).get(), all.subspan(250)).ok());
+    const auto result = Finalized(*state);
+    ASSERT_NE(result, nullptr);
+    const auto& counts = static_cast<const arrow::Int64Array&>(*result);
+    for (std::uint32_t g = 0; g < kGroups; ++g) {
+      EXPECT_EQ(counts.Value(g), static_cast<std::int64_t>(model[g].size())) << "group " << g;
     }
   }
 }

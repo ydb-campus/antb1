@@ -18,6 +18,8 @@
 //
 //   COUNT(*)   rows (a true count under WHERE); BIGINT, 0 over no rows
 //   COUNT(c)   non-NULL values; BIGINT, 0 over no rows
+//   COUNT(DISTINCT c)  distinct non-NULL values (DOUBLE: -0.0 is 0.0, every NaN one value);
+//              BIGINT, 0 over no rows
 //   SUM(c)     integers exactly in 128 bits, returned as HUGEINT (decimal128(38, 0)); an overflow
 //              of HUGEINT's range is an ExecutionError. DOUBLE: DOUBLE. NULL over no values
 //   AVG(c)     integers: the exact 128-bit sum divided once by the count (ExactDivideToDouble);

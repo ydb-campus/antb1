@@ -22,6 +22,8 @@
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
 
+#include "double_key.h"
+
 namespace antb1::exec {
 namespace {
 
@@ -36,42 +38,6 @@ std::shared_ptr<arrow::Schema> OutputOf(const std::vector<plan::BoundColumn>& ke
     fields.push_back(arrow::field(std::format("agg{}", i), plan::ToArrow(aggregates[i].type)));
   }
   return arrow::schema(std::move(fields));
-}
-
-// A DOUBLE key column with -0.0 as 0.0 and every NaN as one NaN, so that the grouper, which
-// compares bytes, groups them as DuckDB does. The column itself when nothing needs to change.
-arrow::Result<std::shared_ptr<arrow::Array>> NormalizeDoubleKey(
-    const std::shared_ptr<arrow::Array>& column, arrow::MemoryPool* pool) {
-  const auto& values = static_cast<const arrow::DoubleArray&>(*column);
-  const auto needs_change = [](double v) {
-    return (v == 0.0 && std::signbit(v)) ||
-           (std::isnan(v) &&
-            std::bit_cast<std::uint64_t>(v) !=
-                std::bit_cast<std::uint64_t>(std::numeric_limits<double>::quiet_NaN()));
-  };
-  bool change = false;
-  for (std::int64_t i = 0; i < values.length() && !change; ++i) {
-    change = values.IsValid(i) && needs_change(values.Value(i));
-  }
-  if (!change) {
-    return column;
-  }
-  arrow::DoubleBuilder builder(pool);
-  ARROW_RETURN_NOT_OK(builder.Reserve(values.length()));
-  for (std::int64_t i = 0; i < values.length(); ++i) {
-    if (values.IsNull(i)) {
-      builder.UnsafeAppendNull();
-      continue;
-    }
-    double v = values.Value(i);
-    if (std::isnan(v)) {
-      v = std::numeric_limits<double>::quiet_NaN();
-    } else if (v == 0.0) {
-      v = 0.0;  // -0.0 == 0.0
-    }
-    builder.UnsafeAppend(v);
-  }
-  return builder.Finish();
 }
 
 }  // namespace
@@ -113,7 +79,8 @@ arrow::Status GroupAggregateOperator::Open(ExecContext& ctx) {
       }
       input = call.arg->type;
     }
-    ARROW_ASSIGN_OR_RAISE(auto state, MakeGroupedAggregateState(call.kind, input, call.type));
+    ARROW_ASSIGN_OR_RAISE(auto state,
+                          MakeGroupedAggregateState(call.kind, input, call.type, pool_));
     states_.push_back(std::move(state));
   }
   kernels_ = std::make_unique<arrow::compute::ExecContext>(pool_);

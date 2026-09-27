@@ -139,11 +139,12 @@ TEST_F(CliTest, UnsupportedQueryExits4WithCaret) {
   EXPECT_EQ(r.code, kExitUnsupported);
   EXPECT_NE(r.err.find("unsupported error"), std::string::npos) << r.err;
   EXPECT_NE(r.err.find("^^^^^"), std::string::npos) << r.err;
-  // Parsed but not answered yet: rejected by the binder, also exit code 4, pointing at the call.
-  r = Invoke({"query", "-c", "SELECT COUNT(DISTINCT x) FROM t", "--table", "t=" + path_});
+  // DISTINCT in an aggregate other than COUNT: exit code 4 too, pointing at DISTINCT and its
+  // column.
+  r = Invoke({"query", "-c", "SELECT SUM(DISTINCT x) FROM t", "--table", "t=" + path_});
   EXPECT_EQ(r.code, kExitUnsupported);
-  EXPECT_NE(r.err.find("COUNT(DISTINCT ...) is not supported yet"), std::string::npos) << r.err;
-  EXPECT_NE(r.err.find("^^^^^^^^^^"), std::string::npos) << r.err;
+  EXPECT_NE(r.err.find("SUM(DISTINCT ...) is not supported"), std::string::npos) << r.err;
+  EXPECT_NE(r.err.find("^^^^^^^^"), std::string::npos) << r.err;
 }
 
 TEST_F(CliTest, JsonErrorObject) {

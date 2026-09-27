@@ -52,7 +52,8 @@ std::string AggregateText(const AggregateCall& call) {
   if (!call.arg.has_value()) {
     return "COUNT(*)";
   }
-  return std::format("{}({})", ToString(call.kind), Name(call.arg->name));
+  return std::format("{}({}{})", ToString(call.kind),
+                     call.kind == AggKind::kCountDistinct ? "DISTINCT " : "", Name(call.arg->name));
 }
 
 std::string ColumnName(const BoundColumn& column) { return Name(column.name); }

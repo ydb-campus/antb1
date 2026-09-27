@@ -289,10 +289,7 @@ TEST_F(SessionTest, UnsupportedAndBindErrorsKeepTheirKinds) {
   ASSERT_TRUE(session->RegisterParquet("t", {path_}).ok());
   for (const char* sql :
        {"SELECT COUNT(*) FROM t HAVING COUNT(*) > 0", "SELECT AdvEngineID FROM t ORDER BY 1",
-        // Parsed, rejected by the binder (not answered yet).
-        "SELECT COUNT(DISTINCT AdvEngineID) FROM t",
-        "SELECT AdvEngineID FROM t ORDER BY COUNT(DISTINCT AdvEngineID)",
-        "SELECT DISTINCT AdvEngineID FROM t"}) {
+        "SELECT SUM(DISTINCT AdvEngineID) FROM t", "SELECT DISTINCT AdvEngineID FROM t"}) {
     auto result = session->Execute(sql);
     const auto detail = plan::GetSqlError(result.status());
     ASSERT_NE(detail, nullptr) << sql << ": " << result.status().ToString();

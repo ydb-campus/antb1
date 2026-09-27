@@ -101,12 +101,13 @@ std::string ArgumentName(std::string_view name) {
   return out + "\"";
 }
 
-// count_star(), count(x), sum(x), avg(x), min(x), max(x).
+// count_star(), count(x), count(DISTINCT x), sum(x), avg(x), min(x), max(x).
 std::string ResultName(const sql::AggregateCall& call) {
   if (call.kind == sql::AggKind::kCountStar || !call.arg.has_value()) {
     return "count_star()";
   }
-  return AsciiLower(ToString(ToPlan(call.kind))) + "(" + ArgumentName(call.arg->name) + ")";
+  return AsciiLower(ToString(ToPlan(call.kind))) + "(" + (call.distinct ? "DISTINCT " : "") +
+         ArgumentName(call.arg->name) + ")";
 }
 
 arrow::Result<std::shared_ptr<Table>> ResolveTable(const sql::TableRef& ref,
@@ -209,7 +210,7 @@ arrow::Result<AggregateCall> BindAggregate(const sql::AggregateCall& call, const
   }
   ARROW_ASSIGN_OR_RAISE(BoundColumn arg, columns.Resolve(*call.arg));
   ARROW_ASSIGN_OR_RAISE(bound.type, AggregateType(call, arg));
-  bound.kind = ToPlan(call.kind);
+  bound.kind = call.distinct ? AggKind::kCountDistinct : ToPlan(call.kind);
   bound.arg = std::move(arg);
   return bound;
 }
@@ -399,26 +400,6 @@ arrow::Result<SelectList> BindSelectList(const sql::SelectStatement& stmt,
 
 namespace {
 
-// Syntax the parser accepts but the engine does not answer yet (docs/sql-subset.md); checked before
-// anything else, so such a query is always kUnsupported (exit code 4), never a bind error.
-arrow::Status CheckNotYetSupported(const sql::SelectStatement& stmt) {
-  const auto distinct = [](const sql::SelectExpr& expr) -> const sql::AggregateCall* {
-    const auto* agg = std::get_if<sql::AggregateCall>(&expr);
-    return agg != nullptr && agg->distinct ? agg : nullptr;
-  };
-  for (const sql::SelectItem& item : stmt.items) {
-    if (const auto* agg = distinct(item.expr)) {
-      return UnsupportedError("COUNT(DISTINCT ...) is not supported yet", agg->span);
-    }
-  }
-  for (const sql::OrderItem& item : stmt.order_by) {
-    if (const auto* agg = distinct(item.expr)) {
-      return UnsupportedError("COUNT(DISTINCT ...) is not supported yet", agg->span);
-    }
-  }
-  return arrow::Status::OK();
-}
-
 // The GROUP BY keys: a table column, or else the alias of a plain column in the select list (the
 // last item with that alias, as in DuckDB); duplicates are dropped.
 arrow::Result<std::vector<BoundColumn>> BindGroupBy(const sql::SelectStatement& stmt,
@@ -582,7 +563,6 @@ arrow::Result<std::vector<SortKey>> BindOrderBy(const sql::SelectStatement& stmt
 }  // namespace
 
 arrow::Result<LogicalPlan> Bind(const sql::SelectStatement& stmt, const Catalog& catalog) {
-  ARROW_RETURN_NOT_OK(CheckNotYetSupported(stmt));
   ARROW_ASSIGN_OR_RAISE(auto table, ResolveTable(stmt.from, catalog));
   const arrow::Schema& schema = *table->schema();
   const Columns columns(schema);

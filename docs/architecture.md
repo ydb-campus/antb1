@@ -117,10 +117,12 @@ The aggregate states (`src/exec/include/antb1/exec/aggregate_state.h`) implement
 `Merge` and `Finalize`. `COUNT(*)` is the true count of the selection; `COUNT(col)`, `SUM` and `AVG` walk the runs
 of rows that are both selected and non-NULL (one bitmap AND); integer `SUM` and `AVG` accumulate in `antb1::Int128`
 and `SUM` returns decimal128(38, 0), so nothing wraps at 64 bits; `MIN` and `MAX` run Arrow's `min_max` on the
-filtered values of each batch and keep the best. The grouped states
+filtered values of each batch and keep the best; `COUNT(DISTINCT col)` keeps the distinct values as the keys of an
+Arrow `Grouper` (DOUBLE values normalized like `GROUP BY` keys) and counts them without NULL. The grouped states
 (`src/exec/include/antb1/exec/grouped_aggregate_state.h`) keep the same accumulators per group, fed rows with a group
-id each; their `Merge` folds another state's groups through a group map, so partial results of separate parts of the
-input can be combined ([ADR 0010](adr/0010-grouped-aggregation.md)). Semantics:
+id each (`COUNT(DISTINCT col)`: a `Grouper` over the distinct (group, value) pairs); their `Merge` folds another
+state's groups through a group map, so partial results of separate parts of the input can be combined
+([ADR 0010](adr/0010-grouped-aggregation.md)). Semantics:
 [sql-subset.md](sql-subset.md#semantics).
 
 ## Where to add things
