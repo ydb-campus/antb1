@@ -12,7 +12,8 @@
 #   - the prompt names only the repository and the PR number, never the title or body.
 # The last step lists the run's outcome, any denied tool calls and whether Claude posted its summary in the job
 # summary and in the log (job summaries have no API; `gh run view --log` reads the log). Without a posted summary it
-# prints Claude's last message and fails the job, so an unfinished review never looks like a clean one.
+# prints Claude's last message and fails the job, so an unfinished review never looks like a clean one (a run in
+# which the action skipped Claude, as on a PR that changes this file, only warns).
 # The workflow token is read-only: comments are posted with the Claude GitHub App token (OIDC exchange).
 # Requirements: the Claude GitHub App, the CLAUDE_CODE_OAUTH_TOKEN secret and this file on the default branch.
 name: Claude review
@@ -172,7 +173,10 @@ jobs:
           print(f"::stop-commands::{token}\n{report}::{token}::", flush=True)
           if denials:
               print(f"::warning::Claude review: {len(denials)} tool call(s) were denied; see the job summary or the log")
-          if not summary_posted:
+          if messages is None:
+              # The action skipped Claude (for example on a PR that changes this workflow): no review, no failure.
+              print("::warning::Claude review: Claude did not run; see the job summary or the log")
+          elif not summary_posted:
               # The job fails (it is not a required check), so an unfinished review is not taken for a clean one.
               print("::error::Claude review: the summary comment was not updated; see the job summary or the log")
               raise SystemExit(1)
