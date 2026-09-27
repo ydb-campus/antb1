@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790518094157,
+  "lastUpdate": 1790527855267,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -480,6 +480,66 @@ window.BENCHMARK_DATA = {
             "value": 2117166.2303030537,
             "unit": "ns/iter",
             "extra": "iterations: 330\ncpu: 2117082.0242424244 ns\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "52181bda3cac79aee1e8d1014dac041e2aa2a5a0",
+          "message": "fix(exec): finalize grouped aggregates per output chunk (#22)\n\n## Summary\n\nFollow-up (b) from #21. A grouped VARCHAR `MIN` or `MAX` built its\nresult for all groups as one binary array. More than 2 GiB of result\nstrings (millions of groups with long values) would overflow Arrow's\n32-bit offsets, and the query would fail with an execution error. #21\nalready emits the group keys in several batches. This PR does the same\nfor the aggregate values.\n\n- `GroupedAggregateState::Finalize(begin, end, pool)` returns the values\nof groups `[begin, end)`. It is Invalid unless `begin <= end <=\nnum_groups()`. A non-virtual `Finalize(pool)` covers every group.\n- `GroupAggregateOperator` finalizes each output batch's range of groups\nas it emits the batch. It no longer keeps full-length finalized arrays,\nso it also holds less memory at once.\n\n## Type of change\n\n- [x] fix: bug fix\n\n## Verification\n\n```text\n$ pixi run check-full\nlint: PASS; 100% tests passed out of 1007 (ci, asan, coverage, ci-gcc); tidy clean; Coverage gate: PASS; fuzz-smoke passed\n```\n\n- **New test\n(`exec.GroupedAggregateTest.EveryGroupEqualsTheScalarStateOverItsRows`):**\nfor every aggregate and input type, ranges of groups equal the slices of\nthe whole result. That includes empty ranges and ranges at the ends.\nRanges outside the state are Invalid.\n- `EmitsOneBatchPerChunkOfNewGroups` and the grouped `.slt`, metamorphic\nand random tests pass unchanged.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed: not needed (no behavior\nchange below the limit)\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: none changed\n\n## AI assistance\n\n- [x] AI-assisted. Tools and what they did: Claude Code wrote the change\nand the tests and ran the verification above.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-09-27T19:49:17+03:00",
+          "tree_id": "49c7e88f3d813a264c814e224cb9c4f758b81ca9",
+          "url": "https://github.com/ydb-campus/antb1/commit/52181bda3cac79aee1e8d1014dac041e2aa2a5a0"
+        },
+        "date": 1790527854715,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 2261.137971982777,
+            "unit": "ns/iter",
+            "extra": "iterations: 306526\ncpu: 2260.978452072581 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 73218.74596441699,
+            "unit": "ns/iter",
+            "extra": "iterations: 8487\ncpu: 73202.41981854601 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 84805.54863719064,
+            "unit": "ns/iter",
+            "extra": "iterations: 8255\ncpu: 84787.28310115082 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 376237.30971550953,
+            "unit": "ns/iter",
+            "extra": "iterations: 1863\ncpu: 376159.2463768116 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 354104.9812563319,
+            "unit": "ns/iter",
+            "extra": "iterations: 1974\ncpu: 354041.73708206724 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2195462.647798735,
+            "unit": "ns/iter",
+            "extra": "iterations: 318\ncpu: 2194989.169811321 ns\nthreads: 1"
           }
         ]
       }
