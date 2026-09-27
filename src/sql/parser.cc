@@ -1163,8 +1163,10 @@ class Parser {
     const SourceSpan lhs_span = SpanOfExpr(*lhs);
     std::optional<HavingOperand> operand = AsHavingOperand(*lhs);
     if (AtLike()) {
-      auto like = ParseLike(Context::kHaving, lhs_span, operand.has_value(),
-                            "LIKE needs a column or an aggregate on the left");
+      if (!operand.has_value()) {
+        return Unsupported(lhs_span, "LIKE needs a column or an aggregate on the left");
+      }
+      auto like = ParseLike(Context::kHaving, lhs_span, /*lhs_ok=*/true, {});
       if (!like) {
         return std::unexpected(std::move(like.error()));
       }
@@ -1176,8 +1178,10 @@ class Parser {
                               .span = span};
     }
     if (AtIn()) {
-      auto in = ParseIn(Context::kHaving, lhs_span, operand.has_value(),
-                        "IN needs a column or an aggregate on the left");
+      if (!operand.has_value()) {
+        return Unsupported(lhs_span, "IN needs a column or an aggregate on the left");
+      }
+      auto in = ParseIn(Context::kHaving, lhs_span, /*lhs_ok=*/true, {});
       if (!in) {
         return std::unexpected(std::move(in.error()));
       }
