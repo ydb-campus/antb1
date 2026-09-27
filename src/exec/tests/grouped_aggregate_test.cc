@@ -431,6 +431,39 @@ TEST_F(GroupedAggregateTest, GroupsAcrossBatchesWithSelectionsAndNullKeys) {
             (std::vector<std::string>{"1|2|50", "2|2|25", "NULL|2|30"}));
 }
 
+// The groups come out in one batch per input batch that made new groups, so that VARCHAR keys are
+// never concatenated into one array (binary offsets are 32 bits); the aggregates line up with them.
+TEST_F(GroupedAggregateTest, EmitsOneBatchPerChunkOfNewGroups) {
+  const auto a = Rows({1, 2, 1}, {10, 20, 30});
+  const auto b = Rows({2, 2}, {1, 1});
+  const auto c = Rows({3, 1, 4}, {7, 1, 8});
+  auto source = std::make_unique<ScriptedSource>(
+      a->schema(), std::vector<Batch>{Batch{.data = a}, Batch{.data = b}, Batch{.data = c}});
+  GroupAggregateOperator op(
+      std::move(source), {Column(0, "k", LogicalType::kBigInt)},
+      {plan::AggregateCall{.kind = AggKind::kCountStar, .type = LogicalType::kBigInt}});
+  ExecContext ctx;
+  for (int run = 0; run < 2; ++run) {  // a second run after Open again gives the same batches
+    const auto table = Drain(op, ctx);
+    ASSERT_TRUE(table.ok()) << table.status().ToString();
+    ASSERT_EQ((*table)->column(0)->num_chunks(), 2);
+    EXPECT_EQ((*table)->column(0)->chunk(0)->length(), 2);
+    EXPECT_EQ((*table)->column(0)->chunk(1)->length(), 2);
+    std::vector<std::string> lines;
+    for (std::int64_t r = 0; r < (*table)->num_rows(); ++r) {
+      lines.push_back(
+          testing::Int64Column(**table, 0)[static_cast<std::size_t>(r)]
+              .transform([](std::int64_t v) { return std::to_string(v); })
+              .value_or("NULL") +
+          "|" +
+          std::to_string(
+              testing::Int64Column(**table, 1)[static_cast<std::size_t>(r)].value_or(-1)));
+    }
+    std::ranges::sort(lines);
+    EXPECT_EQ(lines, (std::vector<std::string>{"1|3", "2|3", "3|1", "4|1"}));
+  }
+}
+
 TEST_F(GroupedAggregateTest, NoRowsGiveNoGroups) {
   const auto a = Rows({1, 2}, {1, 2});
   EXPECT_TRUE(RunGroups({}, a->schema()).empty());

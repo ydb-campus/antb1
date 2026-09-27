@@ -90,6 +90,9 @@ arrow::Status GroupAggregateOperator::Open(ExecContext& ctx) {
   pool_ = ctx.pool;
   done_ = false;
   num_groups_ = 0;
+  finalized_.clear();
+  next_chunk_ = 0;
+  next_group_ = 0;
   states_.clear();
   first_keys_.assign(keys_.size(), {});
   if (keys_.empty()) {
@@ -173,11 +176,27 @@ arrow::Status GroupAggregateOperator::Consume(const arrow::RecordBatch& rows) {
 }
 
 arrow::Result<Batch> GroupAggregateOperator::Next() {
-  if (done_) {
-    return Batch{};
-  }
   if (grouper_ == nullptr) {
     return arrow::Status::Invalid("group aggregate: Next() before Open()");
+  }
+  if (done_) {
+    if (keys_.empty() || next_chunk_ >= first_keys_.front().size()) {
+      return Batch{};
+    }
+    // One batch per chunk of new groups: its keys as first seen, the aggregates of those groups.
+    const std::int64_t rows = first_keys_.front()[next_chunk_]->length();
+    arrow::ArrayVector columns;
+    columns.reserve(keys_.size() + finalized_.size());
+    for (auto& chunks : first_keys_) {
+      columns.push_back(std::move(chunks[next_chunk_]));
+    }
+    for (const auto& aggregate : finalized_) {
+      columns.push_back(aggregate->Slice(next_group_, rows));
+    }
+    ++next_chunk_;
+    next_group_ += rows;
+    return Batch{.data = arrow::RecordBatch::Make(schema_, rows, std::move(columns)),
+                 .selection = {}};
   }
   while (true) {
     ARROW_ASSIGN_OR_RAISE(const Batch in, input_->Next());
@@ -189,23 +208,14 @@ arrow::Result<Batch> GroupAggregateOperator::Next() {
       ARROW_RETURN_NOT_OK(Consume(*rows));
     }
   }
-  done_ = true;
-  if (num_groups_ == 0) {
-    return Batch{};
-  }
-  arrow::ArrayVector columns;
-  columns.reserve(keys_.size() + states_.size());
-  for (std::size_t k = 0; k < keys_.size(); ++k) {
-    ARROW_ASSIGN_OR_RAISE(auto column, arrow::Concatenate(first_keys_[k], pool_));
-    columns.push_back(std::move(column));
-  }
   for (const auto& state : states_) {
     state->Resize(num_groups_);
     ARROW_ASSIGN_OR_RAISE(auto column, state->Finalize(pool_));
-    columns.push_back(std::move(column));
+    finalized_.push_back(std::move(column));
   }
-  return Batch{.data = arrow::RecordBatch::Make(schema_, num_groups_, std::move(columns)),
-               .selection = {}};
+  states_.clear();
+  done_ = true;
+  return Next();
 }
 
 }  // namespace antb1::exec
