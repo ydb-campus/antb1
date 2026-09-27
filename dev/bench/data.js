@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790547310416,
+  "lastUpdate": 1790550037068,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -828,6 +828,78 @@ window.BENCHMARK_DATA = {
             "value": 14.437701104166756,
             "unit": "ms/iter",
             "extra": "iterations: 48\ncpu: 14.432680583333338 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "de906d019354fdf222db973fafa4573f497ea44b",
+          "message": "feat(sql,plan): group by and order by positions, and constants (#29)\n\n## Summary\n\nThe second of the three PRs agreed before the expressions plan: **GROUP\nBY and ORDER BY positions, and constant select items**, checked against\nDuckDB. Constants are part of it because the query this unlocks groups\nby the position of a constant (`SELECT 1, col, COUNT(*) ... GROUP BY 1,\ncol`).\n\n- **Constant select items (as DuckDB types and names them):**\n- An integer is INTEGER when its magnitude fits (so `-2147483648` is\nBIGINT), otherwise BIGINT or HUGEINT, and it is named by its value\n(`007` is `7`).\n  - A string is VARCHAR, named with its quotes (`'it''s'`).\n  - A `DATE` literal is DATE, named `CAST('2020-01-02' AS \"DATE\")`.\n- Decimals (DuckDB's DECIMAL) and integers beyond HUGEINT's 38 digits\nare unsupported (exit code 4).\n- Constants mix with columns and aggregates. With an aggregate the query\nhas one row, also when the only aggregate is in ORDER BY: `SELECT 1 FROM\nt ORDER BY COUNT(*)`.\n- **Positions (DuckDB's rules, probed):**\n- An integer literal in `GROUP BY`/`ORDER BY` names a select item\n(1-based; `*` counts every column). Out of range, a negative one\nincluded, is a bind error, and `GROUP BY` of an aggregate item is a bind\nerror.\n- In `GROUP BY` any other literal is a constant: no key, but the query\nis still grouped. `GROUP BY` of constants only is a grouping without\nkeys: one group over rows, none over no rows.\n- In `ORDER BY` a number or string that is not a position is a bind\nerror (\"orders nothing\"), and a DATE literal orders nothing.\n- **Plan:**\n- `ProjectNode` gains optional per-column `constants`; pruning skips\nthem and EXPLAIN prints them.\n  - The binder's select list has three item kinds.\n- A global aggregate gets a Project only when there are constants, so\nexisting plans are unchanged.\n- **Exec:**\n- `ProjectOperator` materializes only the listed columns and adds\nconstant columns (`MakeArrayFromScalar`).\n  - `GroupAggregateOperator` supports zero keys.\n- **Harness:**\n- New generated features `constant` and `position`: constant items,\nGROUP BY keys by position, GROUP BY a constant's position alone, and\nORDER BY positions.\n- The ordered comparator resolves ORDER BY positions to their select\nitems.\n- **ClickBench: +1 query** (Q34). With Q40 from #28, the ratchet goes to\n36 of 43.\n- **Docs:** `docs/sql-subset.md` (grammar, select list, constants,\npositions, result names, exit codes, ClickBench table) and\n`docs/architecture.md`; a fuzz seed.\n\n**Maintainer sign-off needed:** `tests/data/clickbench_status.json` is\nan \"Ask a human first\" path. It adds Q34, and no approved plan covers\nit; please approve it explicitly in the review.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n\n## Verification\n\n```text\n$ pixi run check-full\nlint: PASS; 100% tests passed out of 1089 (ci, asan, coverage, ci-gcc); tidy clean; Coverage gate: PASS; fuzz-smoke 2/2\n$ ANTB1_DIFF_COUNT=20000 pixi run diff-random\nDIFF: PASS seed=3324354851 queries=20000 failed=0 unsupported=0\n$ ANTB1_HITS_FILES=\"$HOME/.cache/antb1/clickbench/full/hits_*.parquet\" pixi run test-data   # host, all 100 files\n100% tests passed out of 6 (14m39s wall; peak RSS 22.5 GB for one process, DuckDB included)\n```\n\n- **Binder:**\n- constant types and names (`-2147483648`, `-9223372036854775808`,\n`9223372036854775808`, `007`, `-0`, strings, dates);\n  - positions in every shape;\n  - GROUP BY of constants only;\n  - the one-row case with an ORDER BY aggregate;\n  - 11 error cases.\n- **Parser and unparser:** literals as select, GROUP BY and ORDER BY\nitems, with round-trips. The token property test now also accounts for\nliterals and IN lists.\n- **Exec:**\n- `ProjectOperator` with constants mixed with columns under a partial\nselection, constants only, and malformed input;\n  - `GroupAggregateOperator` without keys (rows and no rows).\n- **EXPLAIN** of constants and positions.\n- **`.slt` (`tests/slt/cases/positions/`):** 20 queries plus errors,\nwith expectations and exact types written by DuckDB. They cover every\nconstant kind, empty tables, positions in grouped, projected, star and\nglobal queries, and GROUP BY constants.\n- **Review:** the `reviewer` agent found that integer constants were\ntyped and named by their text: `-2147483648` was INTEGER and `007` was\nnamed `007`, while DuckDB gives BIGINT and `7`. That is fixed and\ntested. It also asked for a `ProjectOperator` unit test, which is added.\n- **Also found by the random test before commit:** `SELECT <constant>\nFROM t ORDER BY COUNT(*)` must be one row. The generator had also\ntreated a constants-only select list as a single row.\n- A scan of all tracked files for ClickBench query text finds nothing.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [ ] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: the ratchet needs your approval in this review\n\n## AI assistance\n\n- [x] AI-assisted. Tools and what they did: Claude Code wrote the code,\ntests and docs and ran the verification above; the `reviewer` subagent\nreviewed the diff.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-09-28T01:58:35+03:00",
+          "tree_id": "2ee071a0ba8f42a175352cf9cb1c3e359e67bfb7",
+          "url": "https://github.com/ydb-campus/antb1/commit/de906d019354fdf222db973fafa4573f497ea44b"
+        },
+        "date": 1790550036256,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 3141.3537789934935,
+            "unit": "ns/iter",
+            "extra": "iterations: 217161\ncpu: 3140.5799199672133 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 81620.7912301152,
+            "unit": "ns/iter",
+            "extra": "iterations: 7731\ncpu: 81619.66679601606 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 209920.89572275503,
+            "unit": "ns/iter",
+            "extra": "iterations: 3203\ncpu: 209919.05088979081 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 418081.0115340367,
+            "unit": "ns/iter",
+            "extra": "iterations: 1734\ncpu: 418068.8742791235 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 334490.9085158267,
+            "unit": "ns/iter",
+            "extra": "iterations: 2055\ncpu: 334384.503163017 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 1949940.9665738032,
+            "unit": "ns/iter",
+            "extra": "iterations: 359\ncpu: 1949243.810584959 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 168.24716824999797,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 168.2366617500002 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 13.474197836734563,
+            "unit": "ms/iter",
+            "extra": "iterations: 49\ncpu: 13.473456367346943 ms\nthreads: 1"
           }
         ]
       }
