@@ -35,6 +35,7 @@ struct WithInput {
   LogicalNodePtr operator()(const ProjectNode& node) const { return Replace(node); }
   LogicalNodePtr operator()(const AggregateNode& node) const { return Replace(node); }
   LogicalNodePtr operator()(const GroupAggregateNode& node) const { return Replace(node); }
+  LogicalNodePtr operator()(const SortNode& node) const { return Replace(node); }
   LogicalNodePtr operator()(const LimitNode& node) const { return Replace(node); }
   LogicalNodePtr operator()(const RowCountNode& node) const { return Make(node); }
 };
@@ -49,6 +50,7 @@ struct OutputWidthOf {
   std::size_t operator()(const GroupAggregateNode& node) const {
     return node.keys.size() + node.aggregates.size();
   }
+  std::size_t operator()(const SortNode& node) const { return OutputWidth(*node.input); }
   std::size_t operator()(const LimitNode& node) const { return OutputWidth(*node.input); }
   std::size_t operator()(const RowCountNode& /*node*/) const { return 1; }
 };
@@ -76,7 +78,29 @@ LogicalNodePtr CountStarToRowCount(const LogicalNodePtr& node) {
   return rewritten == *input ? node : std::visit(WithInput{.input = rewritten}, *node);
 }
 
-// ---- rule 2: projection pruning ----
+// ---- rule 2: Limit below Project ----
+
+// Limit(Project(x)) -> Project(Limit(x)): a Project keeps every row, so limiting first gives the
+// same rows, copies only the rows kept, and puts the Limit right above a Sort (top-N).
+LogicalNodePtr LimitBelowProject(const LogicalNodePtr& node) {
+  if (const auto* limit = std::get_if<LimitNode>(node.get())) {
+    if (const auto* project = std::get_if<ProjectNode>(limit->input.get())) {
+      LimitNode below = *limit;
+      below.input = project->input;
+      ProjectNode above = *project;
+      above.input = LimitBelowProject(Make(std::move(below)));
+      return Make(std::move(above));
+    }
+  }
+  const LogicalNodePtr* input = InputOf(*node);
+  if (input == nullptr || *input == nullptr) {
+    return node;
+  }
+  LogicalNodePtr rewritten = LimitBelowProject(*input);
+  return rewritten == *input ? node : std::visit(WithInput{.input = rewritten}, *node);
+}
+
+// ---- rule 3: projection pruning ----
 
 // Old output position -> new output position of a rewritten node; -1 for a dropped column.
 using Remap = std::vector<int>;
@@ -107,8 +131,9 @@ void Renumber(BoundColumn& column, const Remap& remap) {
 Pruned Prune(const LogicalNodePtr& node, std::vector<bool> needed);
 
 // Rewrites a node so that its output keeps at least the positions marked in `needed` (one flag per
-// current output column). Only a Scan drops columns; Filter and Limit pass the request through,
-// Project, Aggregate and GroupAggregate ask their input for exactly what they reference.
+// current output column). Only a Scan drops columns; Filter, Sort and Limit pass the request
+// through (with the columns they reference), Project, Aggregate and GroupAggregate ask their input
+// for exactly what they reference.
 struct Pruner {
   const LogicalNodePtr& node;
   std::vector<bool>& needed;
@@ -200,6 +225,19 @@ struct Pruner {
                   .remap = Identity(group.keys.size() + group.aggregates.size())};
   }
 
+  Pruned operator()(const SortNode& sort) const {
+    for (const SortKey& key : sort.keys) {
+      Need(needed, key.column);
+    }
+    Pruned in = Prune(sort.input, std::move(needed));
+    SortNode out = sort;
+    out.input = in.node;
+    for (SortKey& key : out.keys) {
+      Renumber(key.column, in.remap);
+    }
+    return Pruned{.node = Make(std::move(out)), .remap = std::move(in.remap)};
+  }
+
   Pruned operator()(const LimitNode& limit) const {
     Pruned in = Prune(limit.input, std::move(needed));
     LimitNode out = limit;
@@ -222,7 +260,7 @@ LogicalPlan Optimize(const LogicalPlan& plan) {
   if (plan.root == nullptr) {
     return plan;
   }
-  LogicalNodePtr root = CountStarToRowCount(plan.root);
+  LogicalNodePtr root = LimitBelowProject(CountStarToRowCount(plan.root));
   const std::size_t width = OutputWidth(*root);
   Pruned pruned = Prune(root, std::vector<bool>(width, true));
   return LogicalPlan{.root = std::move(pruned.node), .output = plan.output};

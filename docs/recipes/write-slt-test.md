@@ -43,7 +43,8 @@ SELECT a, COUNT(*) FROM t GROUP BY a HAVING COUNT(*) > 1
 ```
 
 - `query <types> <sort mode>`: one type letter per result column (`I` integer, `R` floating point, `T` text and
-  dates), then `nosort` for a single row or a defined order, `rowsort` for several rows (there is no ORDER BY yet).
+  dates), then `nosort` for a single row or an `ORDER BY` whose keys end with a unique column (rows with equal
+  keys may come in any order), `rowsort` for several rows otherwise.
 - `statement ok` for SQL that must succeed, `statement error <regex>` for SQL that must fail with a matching error.
 - `onlyif antb1` or `skipif duckdb` before a record limits it to one engine. Use them only for a divergence
   registered in [sql-subset.md](../sql-subset.md#divergences-from-duckdb), and put its ID in a comment.

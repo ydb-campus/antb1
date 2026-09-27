@@ -14,6 +14,7 @@
 #include "antb1/exec/project.h"
 #include "antb1/exec/row_count.h"
 #include "antb1/exec/scalar_aggregate.h"
+#include "antb1/exec/sort.h"
 #include "antb1/exec/table_scan.h"
 #include "antb1/plan/logical_plan.h"
 
@@ -53,9 +54,19 @@ struct Builder {
     ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input));
     return std::make_unique<GroupAggregateOperator>(std::move(input), node.keys, node.aggregates);
   }
-  OperatorResult operator()(const plan::LimitNode& node) const {
+  OperatorResult operator()(const plan::SortNode& node) const {
     ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input));
-    return std::make_unique<LimitOperator>(std::move(input), node.limit);
+    return std::make_unique<SortOperator>(std::move(input), node.keys);
+  }
+  OperatorResult operator()(const plan::LimitNode& node) const {
+    // Limit(Sort) with a limit is a top-N: it keeps only limit + offset rows while it reads.
+    const auto* sort = std::get_if<plan::SortNode>(node.input.get());
+    if (sort != nullptr && node.limit.has_value() && *node.limit > 0) {
+      ARROW_ASSIGN_OR_RAISE(auto input, Build(sort->input));
+      return std::make_unique<SortOperator>(std::move(input), sort->keys, node.limit, node.offset);
+    }
+    ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input));
+    return std::make_unique<LimitOperator>(std::move(input), node.limit, node.offset);
   }
   OperatorResult operator()(const plan::RowCountNode& node) const {
     const auto rows = node.table == nullptr ? std::nullopt : node.table->exact_row_count();

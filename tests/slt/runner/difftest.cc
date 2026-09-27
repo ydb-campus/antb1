@@ -11,10 +11,10 @@
 #include <vector>
 
 #include "engine.h"
+#include "ordered_compare.h"
 #include "query_gen.h"
 #include "result_diff.h"
 #include "supported_features.h"
-#include "unordered_limit.h"
 
 namespace antb1::slt {
 namespace {
@@ -62,18 +62,8 @@ CaseResult CheckCase(const GeneratedQuery& q, FeatureSet supported_set, Engine& 
     return Fail(ErrorDiscrepancy(
         std::format("antb1 fails ({} error), DuckDB answers", a.error().kind), a.error()));
   }
-  if (q.unordered_limit) {
-    const auto unlimited_sql = UnlimitedSql(q.sql);
-    if (!unlimited_sql.has_value()) {
-      return Fail(
-          Discrepancy{.what = "cannot drop the LIMIT of the generated SQL (a generator bug)"});
-    }
-    if (auto d = CompareLimited(*o, *a, [&] { return oracle.Execute(*unlimited_sql); })) {
-      return Fail(*std::move(d));
-    }
-    return {};
-  }
-  if (auto d = CompareAnswers(*o, *a, q.sort, /*row_count_only=*/false)) {
+  // q.unordered_limit and q.sort follow from the SQL: CompareQueryAnswers derives the same.
+  if (auto d = CompareQueryAnswers(q.sql, *o, *a, oracle, q.sort == SortMode::kRowSort, q.sort)) {
     return Fail(*std::move(d));
   }
   return {};

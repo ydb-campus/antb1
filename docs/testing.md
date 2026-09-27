@@ -143,8 +143,12 @@ yet carries `onlyif duckdb`; the PR that implements the feature removes the guar
 ## Random differential tests
 
 `antb1-slt diff` generates queries over the tables of `tests/slt/tables.txt`, runs each on antb1 and on DuckDB and
-compares the results and the exact column types. Query `i` of seed `s` depends only on `s`, `i`, the tables and the
-supported features, so a single case reproduces on its own.
+compares the results and the exact column types: without regard to row order for projections and `GROUP BY`, any
+rows of the unlimited answer for a `LIMIT` or `OFFSET` without `ORDER BY`, and in order for `ORDER BY`, where tied
+rows may come in any order, also at the edges of a `LIMIT`/`OFFSET` window (`tests/slt/runner/ordered_compare.h`).
+The generator orders by columns, aliases and aggregates with integer or text values only (a DOUBLE `SUM` or `AVG`
+can differ in its last bits between the engines and so order near-ties differently). Query `i` of seed `s` depends
+only on `s`, `i`, the tables and the supported features, so a single case reproduces on its own.
 
 - ctest `diff.random` (label `diff`) runs 300 queries with a fixed seed on every leg.
 - `pixi run diff-random` runs 2000 queries with a random seed, printed first. `ANTB1_DIFF_SEED` and

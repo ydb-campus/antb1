@@ -6,6 +6,7 @@ add_library(
   runner/canonical.cc
   runner/clickbench.cc
   runner/difftest.cc
+  runner/ordered_compare.cc
   runner/query_file.cc
   runner/query_gen.cc
   runner/result_diff.cc
@@ -43,6 +44,7 @@ antb1_add_gtest(
     tests/clickbench_test.cc
     tests/comparator_test.cc
     tests/limit_compare_test.cc
+    tests/ordered_compare_test.cc
     tests/difftest_test.cc
     tests/query_file_test.cc
     tests/query_gen_test.cc
@@ -52,7 +54,7 @@ antb1_add_gtest(
 )
 if(ANTB1_HAVE_DUCKDB)
   # plan::DuckDbFloatOf against the DuckDB library on seeded random literals.
-  target_sources(antb1_slt_tests PRIVATE tests/float_literal_oracle_test.cc)
+  target_sources(antb1_slt_tests PRIVATE tests/float_literal_oracle_test.cc tests/ordered_compare_oracle_test.cc)
 endif()
 
 # Test cases: tests/slt/cases/<area>/<file>.slt -> slt.<area>.<file> (+ oracle.<area>.<file>).

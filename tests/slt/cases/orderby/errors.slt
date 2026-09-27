@@ -1,0 +1,32 @@
+# ORDER BY names a select alias or a table column; an aggregate makes the query an aggregate query, and
+# an aggregate query orders by its keys and aggregates only.
+
+statement error
+SELECT id FROM edge ORDER BY nope
+
+statement error
+SELECT COUNT(*) FROM edge ORDER BY id
+
+statement error
+SELECT id FROM edge ORDER BY COUNT(*)
+
+statement error
+SELECT * FROM edge ORDER BY MAX(id)
+
+statement error must appear in the GROUP BY clause
+SELECT i16, COUNT(*) FROM edge GROUP BY i16 ORDER BY id
+
+statement error
+SELECT COUNT(*) FROM edge ORDER BY SUM(s)
+
+onlyif antb1
+statement error ^bind: column 'nope' does not exist$
+SELECT id FROM edge ORDER BY nope
+
+onlyif antb1
+statement error ^bind: column 'id' must appear in the GROUP BY clause or be inside an aggregate function$
+SELECT COUNT(*) FROM edge ORDER BY id
+
+onlyif antb1
+statement error ^bind: column 'id' must be inside an aggregate function
+SELECT id FROM edge ORDER BY COUNT(*)

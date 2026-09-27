@@ -1,0 +1,86 @@
+# LIMIT and OFFSET with ORDER BY: the rows [offset, offset + limit) of the order (a top-N in antb1).
+
+query I nosort
+SELECT id FROM edge ORDER BY id LIMIT 3
+----
+0
+1
+2
+
+query I nosort
+SELECT id FROM edge ORDER BY id DESC LIMIT 3 OFFSET 2
+----
+9
+8
+7
+
+query I nosort
+SELECT id FROM edge ORDER BY id OFFSET 9
+----
+9
+10
+11
+
+query I nosort
+SELECT id FROM edge ORDER BY id OFFSET 12
+----
+
+query I nosort
+SELECT id FROM edge ORDER BY id OFFSET 3 LIMIT 2
+----
+3
+4
+
+query I nosort
+SELECT id FROM edge ORDER BY id LIMIT 0 OFFSET 1
+----
+
+query I nosort
+SELECT id FROM edge ORDER BY id LIMIT 9223372036854775807 OFFSET 10
+----
+10
+11
+
+query I nosort
+SELECT id FROM edge ORDER BY i16 NULLS FIRST, id LIMIT 3 OFFSET 1
+----
+8
+0
+10
+
+# Top-N over more rows than a batch holds, and over a filter.
+
+query II nosort
+SELECT WatchID, EventTime FROM hits_like ORDER BY EventTime DESC, WatchID LIMIT 5 OFFSET 100
+----
+-8166126314163177663	1375290241
+-7318317720812016096	1375289849
+8147734406820908320	1375289381
+423943424606327915	1375289012
+-3960511763862697363	1375288990
+
+query I nosort
+SELECT WatchID FROM hits_like WHERE SearchPhrase <> '' ORDER BY WatchID LIMIT 4
+----
+-9222731508449045939
+-9215212496214188606
+-9213670799091192757
+-9211395005841318524
+
+query I nosort
+SELECT WatchID FROM hits_like_split ORDER BY WatchID DESC LIMIT 3 OFFSET 5000
+----
+-19825396465566264
+-21528573440021138
+-21931829326734643
+
+# OFFSET without ORDER BY, and on a single-row aggregate.
+
+query I nosort
+SELECT COUNT(*) FROM hits_like OFFSET 1
+----
+
+query I nosort
+SELECT COUNT(*) FROM hits_like LIMIT 1 OFFSET 0
+----
+10000

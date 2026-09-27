@@ -65,14 +65,26 @@ INSTANTIATE_TEST_SUITE_P(
     ::testing::Values(
         // Parsed but not answered yet: kUnsupported before any other check, even when the
         // table or a column does not exist.
-        ErrorCase{"SELECT nope FROM missing ORDER BY nope", kUnsupported, "ORDER BY nope",
-                  "ORDER BY is not supported yet"},
-        ErrorCase{"SELECT i16 FROM t ORDER BY i16 DESC NULLS FIRST, COUNT(*)", kUnsupported,
-                  "ORDER BY i16 DESC NULLS FIRST, COUNT(*)", "ORDER BY is not supported yet"},
-        ErrorCase{"SELECT i16 FROM t LIMIT 5 OFFSET 3", kUnsupported, "OFFSET 3",
-                  "OFFSET is not supported yet"},
         ErrorCase{"SELECT COUNT(i16), COUNT(DISTINCT i32) FROM t", kUnsupported,
                   "COUNT(DISTINCT i32)", "COUNT(DISTINCT ...) is not supported yet"},
+        ErrorCase{"SELECT nope FROM missing ORDER BY COUNT(DISTINCT nope)", kUnsupported,
+                  "COUNT(DISTINCT nope)", "COUNT(DISTINCT ...) is not supported yet"},
+        // ORDER BY: a select alias (the last one), else a table column; an aggregate makes the
+        // query aggregate; a grouped query orders by keys and aggregates only.
+        ErrorCase{"SELECT i16 FROM t ORDER BY nope", kBind, "nope", "column 'nope' does not exist"},
+        ErrorCase{"SELECT COUNT(*) FROM t ORDER BY SUM(s)", kBind, "SUM(s)", "SUM needs a numeric"},
+        ErrorCase{"SELECT i16 FROM t ORDER BY COUNT(*)", kBind, "i16",
+                  "column 'i16' must be inside an aggregate function"},
+        ErrorCase{"SELECT * FROM ok ORDER BY MAX(i16)", kBind, "*",
+                  "column 'i16' must be inside an aggregate function"},
+        ErrorCase{"SELECT COUNT(*) FROM t ORDER BY i16", kBind, "i16",
+                  "column 'i16' must appear in the GROUP BY clause or be inside an aggregate"},
+        ErrorCase{"SELECT i16 AS x, COUNT(*) FROM t GROUP BY i16 ORDER BY i32 DESC", kBind, "i32",
+                  "column 'i32' must appear in the GROUP BY clause"},
+        ErrorCase{"SELECT s AS i32, i16 AS i32 FROM t GROUP BY s, i16 ORDER BY I32, i64", kBind,
+                  "i64", "column 'i64' must appear in the GROUP BY clause"},
+        ErrorCase{"SELECT i16 FROM t GROUP BY i16 ORDER BY COUNT(bad)", kUnsupported, "bad",
+                  "unsupported type"},
         // GROUP BY: keys are table columns or aliases of plain select columns; every plain select
         // column must be a key.
         ErrorCase{"SELECT i16, i32, COUNT(*) FROM t GROUP BY i16", kBind, "i32",
@@ -248,6 +260,87 @@ TEST(BinderTest, GroupByAliasesDuplicatesAndUnselectedKeys) {
   ASSERT_TRUE(keys_only.ok()) << keys_only.status().ToString();
   EXPECT_TRUE(std::get<GroupAggregateNode>(Nth(*keys_only, 1)).aggregates.empty());
   EXPECT_EQ(std::get<ProjectNode>(Nth(*keys_only, 0)).columns[0].index, 1);
+}
+
+// A projection sorts the table's columns below the Project, so it can order by a column it does
+// not select; a select alias comes before a column of the same name (the last alias wins), and a
+// column already ordered by is not a key again.
+TEST(BinderTest, OrderByInAProjection) {
+  const Catalog catalog = MakeCatalog();
+  constexpr std::string_view kSql =
+      "SELECT i16 AS i32, s FROM t ORDER BY i32 DESC, d NULLS FIRST, I16, s LIMIT 5 OFFSET 2";
+  auto plan = BindSql(kSql, catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  const auto& limit = std::get<LimitNode>(Nth(*plan, 0));
+  EXPECT_EQ(limit.limit, 5);
+  EXPECT_EQ(limit.offset, 2);
+  EXPECT_EQ(kSql.substr(limit.span.offset, limit.span.length), "LIMIT 5 OFFSET 2");
+  EXPECT_TRUE(std::holds_alternative<ProjectNode>(Nth(*plan, 1)));
+  const auto& sort = std::get<SortNode>(Nth(*plan, 2));
+  EXPECT_EQ(kSql.substr(sort.span.offset, sort.span.length),
+            "ORDER BY i32 DESC, d NULLS FIRST, I16, s");
+  ASSERT_EQ(sort.keys.size(), 3U);  // I16 repeats i32 (the alias of i16)
+  EXPECT_EQ(sort.keys[0].column.index, 0);
+  EXPECT_TRUE(sort.keys[0].descending);
+  EXPECT_FALSE(sort.keys[0].nulls_first);
+  EXPECT_EQ(sort.keys[1].column.index, 5);
+  EXPECT_EQ(sort.keys[1].column.type, LogicalType::kDouble);
+  EXPECT_FALSE(sort.keys[1].descending);
+  EXPECT_TRUE(sort.keys[1].nulls_first);
+  EXPECT_EQ(sort.keys[2].column.index, 6);
+  EXPECT_TRUE(std::holds_alternative<ScanNode>(Nth(*plan, 3)));
+
+  auto last_alias = BindSql("SELECT i16 AS x, i32 AS X FROM t ORDER BY x", catalog);
+  ASSERT_TRUE(last_alias.ok()) << last_alias.status().ToString();
+  EXPECT_EQ(std::get<SortNode>(Nth(*last_alias, 1)).keys[0].column.index, 1);
+
+  auto offset = BindSql("SELECT * FROM ok OFFSET 3", catalog);
+  ASSERT_TRUE(offset.ok()) << offset.status().ToString();
+  EXPECT_FALSE(std::get<LimitNode>(Nth(*offset, 0)).limit.has_value());
+  EXPECT_EQ(std::get<LimitNode>(Nth(*offset, 0)).offset, 3);
+  auto no_offset = BindSql("SELECT * FROM ok OFFSET 0", catalog);
+  ASSERT_TRUE(no_offset.ok()) << no_offset.status().ToString();
+  EXPECT_TRUE(std::holds_alternative<ProjectNode>(Nth(*no_offset, 0)));
+}
+
+// A grouped query sorts the GroupAggregate's output (keys, then aggregates): an ORDER BY aggregate
+// equal to a select one reuses it, another one is computed as a hidden aggregate that the Project
+// drops.
+TEST(BinderTest, OrderByInAGroupedQuery) {
+  const Catalog catalog = MakeCatalog();
+  auto plan = BindSql(
+      "SELECT s AS k, COUNT(*) AS n FROM t GROUP BY s, i16 "
+      "ORDER BY count(*), MAX(d) DESC, n, i16, k LIMIT 10",
+      catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  ASSERT_EQ(plan->output.size(), 2U);
+  EXPECT_EQ(std::get<LimitNode>(Nth(*plan, 0)).limit, 10);
+  const auto& project = std::get<ProjectNode>(Nth(*plan, 1));
+  ASSERT_EQ(project.columns.size(), 2U);
+  EXPECT_EQ(project.columns[0].index, 0);
+  EXPECT_EQ(project.columns[1].index, 2);
+  const auto& sort = std::get<SortNode>(Nth(*plan, 2));
+  ASSERT_EQ(sort.keys.size(), 4U);  // n repeats count(*)
+  EXPECT_EQ(sort.keys[0].column.index, 2);
+  EXPECT_EQ(sort.keys[1].column.index, 3);
+  EXPECT_EQ(sort.keys[1].column.name, "max(d)");
+  EXPECT_EQ(sort.keys[1].column.type, LogicalType::kDouble);
+  EXPECT_TRUE(sort.keys[1].descending);
+  EXPECT_EQ(sort.keys[2].column.index, 1);  // i16: the second key
+  EXPECT_EQ(sort.keys[3].column.index, 0);  // k: s, the first key
+  const auto& group = std::get<GroupAggregateNode>(Nth(*plan, 3));
+  ASSERT_EQ(group.aggregates.size(), 2U);
+  EXPECT_EQ(group.aggregates[1].kind, AggKind::kMax);
+}
+
+// Without GROUP BY an aggregate query has one row: ORDER BY is checked, but needs no Sort.
+TEST(BinderTest, OrderByInAGlobalAggregateNeedsNoSort) {
+  const Catalog catalog = MakeCatalog();
+  auto plan = BindSql("SELECT COUNT(*) AS c FROM t ORDER BY c, MAX(s) OFFSET 1", catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  EXPECT_EQ(std::get<LimitNode>(Nth(*plan, 0)).offset, 1);
+  const auto& aggregate = std::get<AggregateNode>(Nth(*plan, 1));
+  EXPECT_EQ(aggregate.aggregates.size(), 1U);
 }
 
 TEST(BinderTest, SelectStarProjectsEveryColumn) {

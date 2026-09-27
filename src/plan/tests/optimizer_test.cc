@@ -59,7 +59,8 @@ TEST(OptimizerTest, ScansReadOnlyReferencedFields) {
   // Fields of t: i16 0, i32 1, i64 2, u16 3, h 4, d 5, s 6, dt 7, bad 8, "Mixed Case" 9, from 10.
   const LogicalPlan plan =
       Optimized("SELECT s, i16, s AS again FROM t WHERE dt > '2013-07-01' AND i16 < 5 LIMIT 3");
-  const auto& project = std::get<ProjectNode>(Nth(plan, 1));
+  const auto& project = std::get<ProjectNode>(Nth(plan, 0));
+  EXPECT_EQ(std::get<LimitNode>(Nth(plan, 1)).limit, 3);  // moved below the Project
   const auto& filter = std::get<FilterNode>(Nth(plan, 2));
   const auto& scan = std::get<ScanNode>(Nth(plan, 3));
   EXPECT_EQ(scan.fields, (std::vector<int>{0, 6, 7}));  // table order

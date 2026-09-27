@@ -1,0 +1,6 @@
+Output: RegionID:INTEGER c:BIGINT
+Project RegionID, c
+  Limit 10 OFFSET 5
+    Sort c DESC NULLS LAST, "max(EventTime)" ASC NULLS FIRST
+      GroupAggregate keys=[RegionID] COUNT(*), MAX(EventTime)
+        Scan table=t source=parquet(files=1, rows=10000) columns=[EventTime, RegionID]

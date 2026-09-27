@@ -47,6 +47,10 @@ void PrintTo(const Relation& r, std::ostream* os);
 
 // Every answer renders to the same rowsorted block (R columns within the slt tolerance).
 Check AllEqual();
+// Every answer has the same rows in the same order (R columns within the slt tolerance).
+Check AllEqualInOrder();
+// Answer 1 equals the rows [offset, offset + limit) of answer 0, in order.
+Check SecondIsWindowOfFirst(int64_t offset, int64_t limit);
 // Single-value answers: a0 == a1 + ... + an (integers, exact; NULL counts as no value).
 Check FirstEqualsSumOfRest();
 // Single-value answers: a0 == the minimum / maximum of the non-NULL a1..an (NULL if all are).

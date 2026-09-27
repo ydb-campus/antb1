@@ -58,15 +58,33 @@ TEST(ExplainTest, AggregatesOverAFilter) {
 TEST(ExplainTest, ProjectionWithLimit) {
   EXPECT_EQ(ExplainSql("SELECT * FROM ok LIMIT 10"),
             "Output: i16:SMALLINT s:VARCHAR\n"
-            "Limit 10\n"
-            "  Project i16, s\n"
+            "Project i16, s\n"
+            "  Limit 10\n"
             "    Scan table=ok source=fake columns=[i16, s]\n");
   EXPECT_EQ(ExplainSql("SELECT s AS \"The S\", I16 FROM OK WHERE i16 >= -32768.5 LIMIT 0"),
             "Output: The S:VARCHAR i16:SMALLINT\n"
-            "Limit 0\n"
-            "  Project s, i16\n"
+            "Project s, i16\n"
+            "  Limit 0\n"
             "    Filter i16 >= -32768\n"
             "      Scan table=OK source=fake columns=[i16, s]\n");
+}
+
+// The Limit moves below the Project, right above the Sort (a top-N in the executor); the Sort
+// reads a column the query does not select and a hidden aggregate.
+TEST(ExplainTest, SortAndOffset) {
+  EXPECT_EQ(ExplainSql("SELECT s FROM ok ORDER BY i16 DESC, s NULLS FIRST LIMIT 3 OFFSET 2"),
+            "Output: s:VARCHAR\n"
+            "Project s\n"
+            "  Limit 3 OFFSET 2\n"
+            "    Sort i16 DESC NULLS LAST, s ASC NULLS FIRST\n"
+            "      Scan table=ok source=fake columns=[i16, s]\n");
+  EXPECT_EQ(ExplainSql("SELECT i16 FROM ok GROUP BY i16 ORDER BY COUNT(*) DESC OFFSET 1"),
+            "Output: i16:SMALLINT\n"
+            "Project i16\n"
+            "  Limit ALL OFFSET 1\n"
+            "    Sort \"count_star()\" DESC NULLS LAST\n"
+            "      GroupAggregate keys=[i16] COUNT(*)\n"
+            "        Scan table=ok source=fake columns=[i16]\n");
 }
 
 TEST(ExplainTest, NamesAndStringsStayOnOneAsciiLine) {

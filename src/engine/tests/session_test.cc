@@ -290,8 +290,8 @@ TEST_F(SessionTest, UnsupportedAndBindErrorsKeepTheirKinds) {
   for (const char* sql :
        {"SELECT COUNT(*) FROM t HAVING COUNT(*) > 0", "SELECT AdvEngineID FROM t ORDER BY 1",
         // Parsed, rejected by the binder (not answered yet).
-        "SELECT AdvEngineID FROM t ORDER BY AdvEngineID",
-        "SELECT AdvEngineID FROM t LIMIT 1 OFFSET 1", "SELECT COUNT(DISTINCT AdvEngineID) FROM t",
+        "SELECT COUNT(DISTINCT AdvEngineID) FROM t",
+        "SELECT AdvEngineID FROM t ORDER BY COUNT(DISTINCT AdvEngineID)",
         "SELECT DISTINCT AdvEngineID FROM t"}) {
     auto result = session->Execute(sql);
     const auto detail = plan::GetSqlError(result.status());

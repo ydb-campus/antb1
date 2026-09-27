@@ -13,9 +13,9 @@
 
 #include "canonical.h"
 #include "engine.h"
+#include "ordered_compare.h"
 #include "result_diff.h"
 #include "supported_features.h"
-#include "unordered_limit.h"
 
 namespace antb1::slt {
 namespace {
@@ -101,11 +101,7 @@ Answer Check(const Statement& s, FeatureSet supported_set, Engine& antb1, Engine
                     e.kind),
         e));
   }
-  if (const auto unlimited_sql = UnlimitedSql(s.sql); unlimited_sql.has_value() && rows) {
-    if (auto d = CompareLimited(*o, *a, [&] { return oracle.Execute(*unlimited_sql); })) {
-      return Failed(*std::move(d));
-    }
-  } else if (auto d = CompareAnswers(*o, *a, sort, /*row_count_only=*/false)) {
+  if (auto d = CompareQueryAnswers(s.sql, *o, *a, oracle, rows, sort)) {
     return Failed(*std::move(d));
   }
   if (!supported) {

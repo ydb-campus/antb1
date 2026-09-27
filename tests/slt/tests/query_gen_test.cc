@@ -113,8 +113,16 @@ TEST(QueryGenerator, QueriesRespectTheSemanticsBothEnginesShare) {
     const std::string sql = Lower(q.sql);
     const bool rows = q.features.Has(Feature::kColumns) || q.features.Has(Feature::kStar) ||
                       q.features.Has(Feature::kGroupBy);
-    EXPECT_EQ(q.sort, rows ? SortMode::kRowSort : SortMode::kNoSort) << q.sql;
-    EXPECT_EQ(q.unordered_limit, rows && q.features.Has(Feature::kLimit)) << q.sql;
+    const bool ordered = q.features.Has(Feature::kOrderBy);
+    EXPECT_EQ(q.sort, rows && !ordered ? SortMode::kRowSort : SortMode::kNoSort) << q.sql;
+    EXPECT_EQ(
+        q.unordered_limit,
+        rows && !ordered && (q.features.Has(Feature::kLimit) || q.features.Has(Feature::kOffset)))
+        << q.sql;
+    if (ordered) {
+      // Sort keys with I or T values only: no AVG, no SUM or MIN/MAX of a DOUBLE column.
+      EXPECT_FALSE(sql.substr(sql.find("order")).contains("avg")) << q.sql;
+    }
     if (q.features.Has(Feature::kTablePath)) {
       // DuckDB reads the raw file there: a column typed through the clickbench option differs.
       EXPECT_FALSE(sql.contains("eventdate") || q.features.Has(Feature::kStar)) << q.sql;

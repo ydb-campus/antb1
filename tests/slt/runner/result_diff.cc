@@ -20,14 +20,6 @@ namespace {
 
 constexpr std::size_t kMaxDiffRows = 5;
 
-std::string Letters(const ResultSet& r) {
-  std::string letters;
-  for (const auto c : r.classes) {
-    letters += ClassLetter(c);
-  }
-  return letters;
-}
-
 std::string Join(const std::vector<std::string>& lines) {
   std::string text;
   for (const auto& line : lines) {
@@ -39,23 +31,6 @@ std::string Join(const std::vector<std::string>& lines) {
 
 bool SameLine(const std::string& e, const std::string& a, std::string_view types, SortMode sort) {
   return !CompareBlocks({e}, {a}, types, sort, kDefaultRelTolerance).has_value();
-}
-
-// The cells of a rendered row (tab-separated) whose class is not R, joined by tabs.
-std::string ExactCells(std::string_view line, std::string_view types) {
-  std::string out;
-  std::size_t column = 0;
-  std::size_t start = 0;
-  while (start <= line.size()) {
-    const std::size_t end = std::min(line.find('\t', start), line.size());
-    if (column >= types.size() || types[column] != 'R') {
-      out.append(line.substr(start, end - start));
-      out += '\t';
-    }
-    ++column;
-    start = end + 1;
-  }
-  return out;
 }
 
 void AppendDifferingRows(const Discrepancy& d, SortMode sort, std::string& out) {
@@ -77,6 +52,30 @@ void AppendDifferingRows(const Discrepancy& d, SortMode sort, std::string& out) 
 }
 
 }  // namespace
+
+std::string Letters(const ResultSet& result) {
+  std::string letters;
+  for (const auto c : result.classes) {
+    letters += ClassLetter(c);
+  }
+  return letters;
+}
+
+std::string ExactCells(std::string_view line, std::string_view types) {
+  std::string out;
+  std::size_t column = 0;
+  std::size_t start = 0;
+  while (start <= line.size()) {
+    const std::size_t end = std::min(line.find('\t', start), line.size());
+    if (column >= types.size() || types[column] != 'R') {
+      out.append(line.substr(start, end - start));
+      out += '\t';
+    }
+    ++column;
+    start = end + 1;
+  }
+  return out;
+}
 
 std::string ColumnTypes(const ResultSet& result) {
   std::string names;

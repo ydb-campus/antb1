@@ -18,11 +18,12 @@
 
 // Logical plan: a tree of immutable nodes (docs/architecture.md). The binder builds
 //
-//   [Limit] <- Project | Aggregate | Project <- GroupAggregate <- [Filter] <- Scan (every field)
+//   [Limit] <- Aggregate | Project <- [Sort] <- [GroupAggregate] <- [Filter] <- Scan (every field)
 //
-// and plan::Optimize rewrites it (projection pruning, COUNT(*) -> RowCount). New operators are
-// added as new node structs in the LogicalNode variant; every std::visit over it lists each node
-// explicitly, so the physical planner and EXPLAIN fail to compile until they handle a new one.
+// and plan::Optimize rewrites it (Limit below Project, projection pruning, COUNT(*) -> RowCount).
+// New operators are added as new node structs in the LogicalNode variant; every std::visit over it
+// lists each node explicitly, so the physical planner and EXPLAIN fail to compile until they handle
+// a new one.
 
 namespace antb1::plan {
 
@@ -94,11 +95,12 @@ struct FilterNode;
 struct ProjectNode;
 struct AggregateNode;
 struct GroupAggregateNode;
+struct SortNode;
 struct LimitNode;
 struct RowCountNode;
 
 using LogicalNode = std::variant<ScanNode, FilterNode, ProjectNode, AggregateNode,
-                                 GroupAggregateNode, LimitNode, RowCountNode>;
+                                 GroupAggregateNode, SortNode, LimitNode, RowCountNode>;
 using LogicalNodePtr = std::shared_ptr<const LogicalNode>;
 
 // Reads top-level fields of a table. Output: the fields, in this order.
@@ -142,11 +144,28 @@ struct GroupAggregateNode {
   SourceSpan span;  // GROUP BY and its list
 };
 
-// Output: at most `limit` rows of the input.
+// One ORDER BY key. Values compare as in DuckDB: VARCHAR by bytes, DOUBLE with -0.0 equal to 0.0
+// and NaN above every number; NULLs come first or last whatever the direction.
+struct SortKey {
+  BoundColumn column;
+  bool descending = false;
+  bool nulls_first = false;  // DuckDB's default: NULLS LAST for ASC and DESC
+};
+
+// Output: the input rows ordered by the keys (the first key first). Rows with equal keys keep no
+// particular order (the executor keeps their input order).
+struct SortNode {
+  LogicalNodePtr input;
+  std::vector<SortKey> keys;  // not empty
+  SourceSpan span;            // ORDER BY and its list
+};
+
+// Output: the input rows after skipping `offset`, at most `limit` of them.
 struct LimitNode {
   LogicalNodePtr input;
-  int64_t limit = 0;  // >= 0
-  SourceSpan span;    // LIMIT n
+  std::optional<int64_t> limit;  // >= 0; none: every row after the offset
+  int64_t offset = 0;            // >= 0
+  SourceSpan span;               // LIMIT n and OFFSET m
 };
 
 // COUNT(*) without WHERE, answered from table metadata (Table::exact_row_count()). Output: one
@@ -162,7 +181,7 @@ struct LogicalPlan {
   std::vector<OutputColumn> output;  // result columns of root: names (aliases applied) and types
 };
 
-// "Scan", "Filter", "Project", "Aggregate", "GroupAggregate", "Limit" or "RowCount".
+// "Scan", "Filter", "Project", "Aggregate", "GroupAggregate", "Sort", "Limit" or "RowCount".
 std::string_view NodeName(const LogicalNode& node);
 
 // The span of the query text a node was bound from.

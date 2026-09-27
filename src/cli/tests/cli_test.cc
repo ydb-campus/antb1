@@ -139,10 +139,10 @@ TEST_F(CliTest, UnsupportedQueryExits4WithCaret) {
   EXPECT_EQ(r.code, kExitUnsupported);
   EXPECT_NE(r.err.find("unsupported error"), std::string::npos) << r.err;
   EXPECT_NE(r.err.find("^^^^^"), std::string::npos) << r.err;
-  // Parsed but not answered yet: rejected by the binder, also exit code 4, pointing at ORDER BY.
-  r = Invoke({"query", "-c", "SELECT x FROM t ORDER BY x", "--table", "t=" + path_});
+  // Parsed but not answered yet: rejected by the binder, also exit code 4, pointing at the call.
+  r = Invoke({"query", "-c", "SELECT COUNT(DISTINCT x) FROM t", "--table", "t=" + path_});
   EXPECT_EQ(r.code, kExitUnsupported);
-  EXPECT_NE(r.err.find("ORDER BY is not supported yet"), std::string::npos) << r.err;
+  EXPECT_NE(r.err.find("COUNT(DISTINCT ...) is not supported yet"), std::string::npos) << r.err;
   EXPECT_NE(r.err.find("^^^^^^^^^^"), std::string::npos) << r.err;
 }
 

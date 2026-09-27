@@ -1,6 +1,6 @@
 Output: n:BIGINT RegionID:INTEGER
-Limit 10
-  Project n, RegionID
+Project n, RegionID
+  Limit 10
     GroupAggregate keys=[RegionID, OS] COUNT(*)
       Filter IsMobile = 1
         Scan table=t source=parquet(files=1, rows=10000) columns=[RegionID, OS, IsMobile]

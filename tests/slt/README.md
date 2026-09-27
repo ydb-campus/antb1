@@ -94,11 +94,17 @@ agree on `clickbench`, and `FROM '<path>'` also reads `EventDate` as DATE on ant
 ## Random differential test
 
 `antb1-slt diff` generates queries over the tables of `tables.txt`, runs each on antb1 and on DuckDB and
-compares the results with the same comparator (rowsort for projections and `GROUP BY`). With a `LIMIT` and no
-`ORDER BY`, any rows of the unlimited answer are right: antb1 must return as many rows as DuckDB, each one a
-distinct row of DuckDB's answer to the same query without the `LIMIT` (`CompareSubset`; the query files of the data
-tests and the ClickBench runner check the same way). The column types must match exactly (`BIGINT`, `HUGEINT`, ...),
-not only their `I`/`R`/`T` class. Query `i` of seed `s` depends only on `s`, `i`, the tables and the supported
+compares the results with the same comparator (rowsort for projections and `GROUP BY`). With a `LIMIT` or
+`OFFSET` and no `ORDER BY`, any rows of the unlimited answer are right: antb1 must return as many rows as DuckDB,
+each one a distinct row of DuckDB's answer to the same query without the `LIMIT` (`CompareSubset`). With `ORDER BY`,
+rows with equal keys may come in any order: DuckDB runs the query with its `ORDER BY` keys appended to the select
+list and without `LIMIT`/`OFFSET` (its limit grows until the run of ties at the window's end is complete), and
+antb1's row `i` must be a distinct row of the run of equal keys at rank `offset + i` (`CompareOrdered`,
+`runner/ordered_compare.h`). At most 2^20 rows are fetched in order: when the run at the window's end goes on
+beyond them (millions of groups tied at a count, say), one more query fetches only the rows of that run whose
+cells equal antb1's rows there, written as SQL literals. The query files of the data tests and the ClickBench
+runner check the same way (`CompareQueryAnswers`). The column types must match exactly (`BIGINT`, `HUGEINT`,
+...), not only their `I`/`R`/`T` class. Query `i` of seed `s` depends only on `s`, `i`, the tables and the supported
 features, so one case reproduces alone.
 
 - 75% of the queries use only the features in `supported_features.h` (`kSupportedFeatures`); the rest
