@@ -54,6 +54,8 @@ TEST(UnparseTest, CanonicalForms) {
                 .canonical = R"(SELECT COUNT(user_id), SUM(amount) AS "total" FROM Events)"},
            Case{.input = R"(SELECT a AS x, "B" "y" FROM t)",
                 .canonical = R"(SELECT a AS "x", "B" AS "y" FROM t)"},
+           Case{.input = "select a from t where a like '%x''%' and b not like '_'",
+                .canonical = "SELECT a FROM t WHERE a LIKE '%x''%' AND b NOT LIKE '_'"},
            Case{.input = "SELECT a FROM t WHERE 5 < a AND b != 'it''s' AND DATE '2024-01-31' >= d",
                 .canonical =
                     "SELECT a FROM t WHERE a > 5 AND b <> 'it''s' AND d <= DATE '2024-01-31'"},

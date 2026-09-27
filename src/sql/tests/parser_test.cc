@@ -385,6 +385,27 @@ TEST(ParserTest, OffsetBeforeLimitAndAlone) {
   EXPECT_EQ(alone->offset, 0);
 }
 
+// column [NOT] LIKE 'pattern' in WHERE, in any case; the span covers the column and the pattern.
+TEST(ParserTest, Like) {
+  constexpr std::string_view kSql =
+      "SELECT a FROM events WHERE url like '%x_%' AND title Not LIKE 'y' AND b = 1";
+  auto stmt = Parse(kSql);
+  ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
+  ASSERT_EQ(stmt->where.size(), 3U);
+  EXPECT_EQ(stmt->where[0].op, CompareOp::kLike);
+  EXPECT_EQ(stmt->where[0].column.name, "url");
+  EXPECT_EQ(stmt->where[0].literal.text, "%x_%");
+  EXPECT_EQ(kSql.substr(stmt->where[0].span.offset, stmt->where[0].span.length), "url like '%x_%'");
+  EXPECT_EQ(stmt->where[1].op, CompareOp::kNotLike);
+  EXPECT_EQ(kSql.substr(stmt->where[1].span.offset, stmt->where[1].span.length),
+            "title Not LIKE 'y'");
+  EXPECT_EQ(stmt->where[2].op, CompareOp::kEq);
+  // A number as the pattern parses; the binder rejects it.
+  auto number = Parse("SELECT a FROM t WHERE b LIKE 5");
+  ASSERT_TRUE(number.has_value()) << number.error().message;
+  EXPECT_EQ(number->where[0].literal.kind, Literal::Kind::kInteger);
+}
+
 TEST(ParserTest, CountDistinct) {
   auto stmt = Parse("SELECT count( distinct user_id ), COUNT(user_id) FROM events");
   ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
@@ -645,10 +666,14 @@ INSTANTIATE_TEST_SUITE_P(
                    "EXCEPT is not supported"},
         RejectCase{"With", "^WITH x AS (SELECT a FROM events) SELECT a FROM x", kUnsupported, 4,
                    "WITH (common table expressions) is not supported"},
-        RejectCase{"Like", "SELECT a FROM events WHERE url ^LIKE '%x%'", kUnsupported, 4,
+        RejectCase{"LikeEscape", "SELECT a FROM events WHERE url LIKE 'x!%' ^ESCAPE '!'",
+                   kUnsupported, 6, "LIKE ... ESCAPE is not supported"},
+        RejectCase{"LikeColumnPattern", "SELECT a FROM events WHERE url LIKE ^title", kUnsupported,
+                   5, "LIKE with a column as the pattern is not supported"},
+        RejectCase{"LikeLiteralLeft", "SELECT a FROM events WHERE ^'x' LIKE url", kUnsupported, 3,
+                   "LIKE needs a column on the left"},
+        RejectCase{"LikeInSelect", "SELECT url ^LIKE '%x%' FROM events", kUnsupported, 4,
                    "LIKE is not supported"},
-        RejectCase{"NotLike", "SELECT a FROM events WHERE url ^NOT LIKE '%x%'", kUnsupported, 3,
-                   "NOT LIKE is not supported"},
         RejectCase{"ILike", "SELECT a FROM events WHERE url ^ILIKE '%x%'", kUnsupported, 5,
                    "ILIKE is not supported"},
         RejectCase{"SimilarTo", "SELECT a FROM events WHERE url ^SIMILAR TO 'x'", kUnsupported, 7,

@@ -7,6 +7,7 @@ antb1_add_module(
     aggregate_state.cc
     table_scan.cc
     filter.cc
+    like.cc
     project.cc
     scalar_aggregate.cc
     grouped_aggregate_state.cc
@@ -30,6 +31,7 @@ if(ANTB1_BUILD_TESTS)
       tests/physical_planner_test.cc
       tests/grouped_aggregate_test.cc
       tests/sort_test.cc
+      tests/like_test.cc
     LIBS ArrowCompute::arrow_compute_shared
   )
 endif()

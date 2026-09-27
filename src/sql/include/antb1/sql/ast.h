@@ -39,7 +39,9 @@ struct Literal {
   SourceSpan span;
 };
 
-enum class CompareOp : std::uint8_t { kEq, kNe, kLt, kLe, kGt, kGe };
+// kLike and kNotLike: column [NOT] LIKE 'pattern' (the pattern is always the literal, on the
+// right).
+enum class CompareOp : std::uint8_t { kEq, kNe, kLt, kLe, kGt, kGe, kLike, kNotLike };
 
 // column <op> literal. A literal-first comparison is normalized by the parser (5 < c -> c > 5);
 // the spans still point at the source text, and `span` covers both operands.

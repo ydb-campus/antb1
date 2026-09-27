@@ -50,11 +50,13 @@ arrow::Status FilterOperator::Open(ExecContext& ctx) {
   pool_ = ctx.pool;
   columns_.clear();
   constants_.clear();
+  patterns_.clear();
   const arrow::Schema& schema = *input_->output_schema();
   for (const plan::Predicate& p : predicates_) {
     if (p.kind == plan::Predicate::Kind::kFalse) {
       columns_.push_back(-1);  // never evaluated: the stream ends before any batch
       constants_.emplace_back();
+      patterns_.emplace_back();
       continue;
     }
     if (!p.column.has_value() || p.column->index < 0 || p.column->index >= schema.num_fields()) {
@@ -70,8 +72,17 @@ arrow::Status FilterOperator::Open(ExecContext& ctx) {
                                       " column with a ", constant->type->ToString(), " constant");
       }
     }
+    std::optional<LikePattern> pattern;
+    if (p.kind == plan::Predicate::Kind::kLike || p.kind == plan::Predicate::Kind::kNotLike) {
+      const auto* text = std::get_if<std::string>(&p.constant.value);
+      if (text == nullptr || schema.field(column)->type()->id() != arrow::Type::BINARY) {
+        return arrow::Status::Invalid("LIKE needs a VARCHAR column and a VARCHAR pattern");
+      }
+      pattern.emplace(*text);
+    }
     columns_.push_back(column);
     constants_.push_back(std::move(constant));
+    patterns_.push_back(std::move(pattern));
   }
   return input_->Open(ctx);
 }
@@ -88,6 +99,11 @@ arrow::Result<std::shared_ptr<arrow::Array>> FilterOperator::Evaluate(
       ARROW_ASSIGN_OR_RAISE(result,
                             arrow::compute::CallFunction(std::string(KernelName(p.op)),
                                                          {column, constants_[i]}, &kernels));
+    } else if (patterns_[i].has_value()) {  // kLike, kNotLike
+      ARROW_ASSIGN_OR_RAISE(
+          result,
+          patterns_[i]->Evaluate(static_cast<const arrow::BinaryArray&>(*batch.column(columns_[i])),
+                                 p.kind == plan::Predicate::Kind::kNotLike, pool_));
     } else {  // kIsNotNull (kFalse never gets here)
       ARROW_ASSIGN_OR_RAISE(result, arrow::compute::CallFunction("is_valid", {column}, &kernels));
     }

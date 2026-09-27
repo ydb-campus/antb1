@@ -579,6 +579,39 @@ std::vector<Relation> AllRelations() {
     }
     r.push_back(std::move(grouped));
   }
+  // [NOT] LIKE partitions the non-NULL values of a column (NULL is in neither part), for patterns
+  // with %, _, both, and none; the same per file of a split table.
+  for (const auto& [name, pattern] :
+       std::to_array<std::pair<std::string_view, std::string_view>>({{"contains", "%a%"},
+                                                                     {"prefix", "http%"},
+                                                                     {"underscore", "%_o_%"},
+                                                                     {"segments", "%e%a%"},
+                                                                     {"exact", ""},
+                                                                     {"single", "_"}})) {
+    for (const std::string_view column : {"Title", "URL"}) {
+      r.push_back(
+          {.name = std::format("like_partitions_{}_{}", column, name),
+           .features = {kCountStar, kCountColumn, kWhere, kLike, kVarcharColumns, kTableName},
+           .probes = {Q(std::format("SELECT COUNT({}) FROM hits_like_nulls", column)),
+                      Q(std::format("SELECT COUNT(*) FROM hits_like_nulls WHERE {} LIKE '{}'",
+                                    column, pattern)),
+                      Q(std::format("SELECT COUNT(*) FROM hits_like_nulls WHERE {} NOT LIKE '{}'",
+                                    column, pattern))},
+           .check = FirstEqualsSumOfRest()});
+    }
+  }
+  r.push_back({.name = "like_split_is_sum_of_parts",
+               .features = {kCountStar, kWhere, kLike, kVarcharColumns, kTableName, kTablePath},
+               .probes = {Q("SELECT COUNT(*) FROM hits_like_split WHERE URL LIKE '%a%b%'"),
+                          Q("SELECT COUNT(*) FROM '${FIXTURES}/hits_like_split/part-0.parquet' "
+                            "WHERE URL LIKE '%a%b%'"),
+                          Q("SELECT COUNT(*) FROM '${FIXTURES}/hits_like_split/part-1.parquet' "
+                            "WHERE URL LIKE '%a%b%'"),
+                          Q("SELECT COUNT(*) FROM '${FIXTURES}/hits_like_split/part-2.parquet' "
+                            "WHERE URL LIKE '%a%b%'"),
+                          Q("SELECT COUNT(*) FROM '${FIXTURES}/hits_like_split/part-3.parquet' "
+                            "WHERE URL LIKE '%a%b%'")},
+               .check = FirstEqualsSumOfRest()});
   // COUNT(DISTINCT): the number of groups of the column (NULL left out by a WHERE that is true for
   // every value), the same over a split table and for every batch size, also per group.
   for (const auto& [column, type] : std::to_array<std::pair<std::string_view, slt::Feature>>(

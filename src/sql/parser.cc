@@ -302,6 +302,8 @@ CompareOp Mirror(CompareOp op) {
       return CompareOp::kLe;
     case CompareOp::kEq:
     case CompareOp::kNe:
+    case CompareOp::kLike:  // never mirrored: the pattern must be on the right
+    case CompareOp::kNotLike:
       break;
   }
   return op;
@@ -889,6 +891,9 @@ class Parser {
       return std::unexpected(std::move(lhs.error()));
     }
     const Token& op_token = Peek();
+    if (op_token.IsKeyword("LIKE") || (op_token.IsKeyword("NOT") && PeekAt(1).IsKeyword("LIKE"))) {
+      return ParseLike(*std::move(lhs));
+    }
     const std::optional<CompareOp> op = CompareOpOf(op_token.kind);
     if (!op.has_value()) {
       if (auto error = UnsupportedOperator(); error.has_value()) {
@@ -926,6 +931,35 @@ class Parser {
     return Comparison{.column = std::move(*rhs_column),
                       .op = Mirror(*op),
                       .literal = std::get<Literal>(std::move(*lhs)),
+                      .span = span};
+  }
+
+  // column [NOT] LIKE 'pattern', positioned at LIKE or NOT; `lhs` is the operand before it.
+  Expected<Comparison> ParseLike(Operand lhs) {
+    const bool negated = Peek().IsKeyword("NOT");
+    if (negated) {
+      Take();
+    }
+    Take();  // LIKE
+    auto rhs = ParseOperand(Context::kWhere);
+    if (!rhs) {
+      return std::unexpected(std::move(rhs.error()));
+    }
+    auto* column = std::get_if<ColumnRef>(&lhs);
+    if (column == nullptr) {
+      return Unsupported(SpanOf(lhs), "LIKE needs a column on the left (column LIKE 'pattern')");
+    }
+    auto* pattern = std::get_if<Literal>(&*rhs);
+    if (pattern == nullptr) {
+      return Unsupported(SpanOf(*rhs), "LIKE with a column as the pattern is not supported");
+    }
+    if (Peek().IsKeyword("ESCAPE")) {
+      return Unsupported(Peek().span, "LIKE ... ESCAPE is not supported");
+    }
+    const SourceSpan span = Cover(column->span, pattern->span);
+    return Comparison{.column = std::move(*column),
+                      .op = negated ? CompareOp::kNotLike : CompareOp::kLike,
+                      .literal = std::move(*pattern),
                       .span = span};
   }
 

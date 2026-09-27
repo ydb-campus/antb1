@@ -87,6 +87,14 @@ TEST(ExplainTest, SortAndOffset) {
             "        Scan table=ok source=fake columns=[i16]\n");
 }
 
+TEST(ExplainTest, Like) {
+  EXPECT_EQ(ExplainSql("SELECT i16 FROM ok WHERE s LIKE '%it''s_%' AND s NOT LIKE ''"),
+            "Output: i16:SMALLINT\n"
+            "Project i16\n"
+            "  Filter s LIKE '%it''s_%' AND s NOT LIKE ''\n"
+            "    Scan table=ok source=fake columns=[i16, s]\n");
+}
+
 TEST(ExplainTest, CountDistinct) {
   EXPECT_EQ(ExplainSql("SELECT COUNT(DISTINCT s), COUNT(s) FROM ok"),
             "Output: count(DISTINCT s):BIGINT count(s):BIGINT\n"
