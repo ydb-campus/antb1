@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <vector>
 
 #include <arrow/type_fwd.h>
@@ -24,7 +25,9 @@ namespace antb1::exec {
 // order (deterministic for a given input, not the order of first appearance): the keys of each
 // group as first seen, then one column per call, one batch per input batch that made new groups
 // (so neither VARCHAR keys nor VARCHAR MIN/MAX values are gathered past the 2 GiB of one binary
-// array). Over no input rows it emits nothing. Output: plan::ToArrow of each key's and call's type.
+// array). Over no input rows it emits nothing. Without keys (GROUP BY constants only) every row is
+// in one group, emitted when there was any row. Output: plan::ToArrow of each key's and call's
+// type.
 class GroupAggregateOperator final : public Operator {
  public:
   GroupAggregateOperator(std::unique_ptr<Operator> input, std::vector<plan::BoundColumn> keys,
@@ -44,6 +47,8 @@ class GroupAggregateOperator final : public Operator {
 
  private:
   arrow::Status Consume(const arrow::RecordBatch& rows);
+  arrow::Status ConsumeAggregates(const arrow::RecordBatch& rows,
+                                  std::span<const std::uint32_t> group_ids);
 
   std::unique_ptr<Operator> input_;
   std::vector<plan::BoundColumn> keys_;
@@ -55,6 +60,8 @@ class GroupAggregateOperator final : public Operator {
   std::vector<std::unique_ptr<GroupedAggregateState>> states_;
   std::vector<std::vector<std::shared_ptr<arrow::Array>>> first_keys_;  // per key, group order
   std::uint32_t num_groups_ = 0;
+  std::vector<std::uint32_t> chunk_groups_;  // the number of new groups of each chunk
+  bool opened_ = false;
   bool done_ = false;
   // After the input: the next chunk of first_keys_ to emit and the group it starts at.
   std::size_t next_chunk_ = 0;

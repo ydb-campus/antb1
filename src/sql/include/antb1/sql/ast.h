@@ -53,7 +53,11 @@ struct Comparison {
   SourceSpan span;
 };
 
-using SelectExpr = std::variant<AggregateCall, ColumnRef>;
+// A select item, an ORDER BY item or (without aggregates) a GROUP BY item. A literal is a constant
+// select item; in GROUP BY and ORDER BY an unsigned integer literal is a position in the select
+// list (1-based) and any other literal a constant.
+using SelectExpr = std::variant<AggregateCall, ColumnRef, Literal>;
+using GroupExpr = std::variant<ColumnRef, Literal>;
 
 struct SelectItem {
   SelectExpr expr;
@@ -64,7 +68,8 @@ struct SelectItem {
 // NULLS FIRST / NULLS LAST as written; kDefault when omitted.
 enum class NullsOrder : std::uint8_t { kDefault, kFirst, kLast };
 
-// One ORDER BY item: a column (or a select alias, resolved by the binder) or an aggregate call.
+// One ORDER BY item: a column (or a select alias, resolved by the binder), an aggregate call, or a
+// literal (a position in the select list, or a constant).
 struct OrderItem {
   SelectExpr expr;
   bool descending = false;  // DESC; ASC (written or not) is false
@@ -85,13 +90,13 @@ struct SelectStatement {
   SourceSpan star_span;  // the '*' (when star)
   std::vector<SelectItem> items;
   TableRef from;
-  std::vector<Comparison> where;      // conjunction (AND)
-  std::vector<ColumnRef> group_by;    // GROUP BY columns (a select alias is resolved by the binder)
-  SourceSpan group_by_span;           // GROUP BY and its list (when group_by is not empty)
-  std::vector<OrderItem> order_by;    // ORDER BY items
-  SourceSpan order_by_span;           // ORDER BY and its list (when order_by is not empty)
-  std::optional<std::int64_t> limit;  // non-negative
-  SourceSpan limit_span;              // LIMIT and its value (when limit)
+  std::vector<Comparison> where;       // conjunction (AND)
+  std::vector<GroupExpr> group_by;     // GROUP BY items (aliases and positions: see the binder)
+  SourceSpan group_by_span;            // GROUP BY and its list (when group_by is not empty)
+  std::vector<OrderItem> order_by;     // ORDER BY items
+  SourceSpan order_by_span;            // ORDER BY and its list (when order_by is not empty)
+  std::optional<std::int64_t> limit;   // non-negative
+  SourceSpan limit_span;               // LIMIT and its value (when limit)
   std::optional<std::int64_t> offset;  // non-negative
   SourceSpan offset_span;              // OFFSET and its value (when offset)
   SourceSpan span;                     // SELECT .. last token of the query (without ';')

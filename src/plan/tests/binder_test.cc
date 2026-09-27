@@ -70,6 +70,24 @@ INSTANTIATE_TEST_SUITE_P(
                   "cannot compare VARCHAR column 's' with a number"},
         ErrorCase{"SELECT COUNT(*) FROM t WHERE dt IN (DATE '2013-02-30')", kBind,
                   "DATE '2013-02-30'", "invalid date"},
+        // Constants and positions.
+        ErrorCase{"SELECT 2.5 FROM t", kUnsupported, "2.5", "decimal constants are not supported"},
+        ErrorCase{"SELECT 100000000000000000000000000000000000000 FROM t", kUnsupported,
+                  "100000000000000000000000000000000000000", "outside HUGEINT's range"},
+        ErrorCase{"SELECT DATE '2020-02-30' FROM t", kBind, "DATE '2020-02-30'", "invalid date"},
+        ErrorCase{"SELECT i16 FROM t ORDER BY 2", kBind, "2",
+                  "ORDER BY position 2 is not between 1 and 1"},
+        ErrorCase{"SELECT i16 FROM t ORDER BY -1", kBind, "-1", "ORDER BY position -1"},
+        ErrorCase{"SELECT i16 FROM t ORDER BY 'x'", kBind, "'x'",
+                  "ORDER BY a non-integer literal orders nothing"},
+        ErrorCase{"SELECT i16, COUNT(*) FROM t GROUP BY 0", kBind, "0",
+                  "GROUP BY position 0 is not between 1 and 2"},
+        ErrorCase{"SELECT i16, COUNT(*) FROM t GROUP BY 2", kBind, "2",
+                  "GROUP BY cannot refer to the aggregate at position 2"},
+        ErrorCase{"SELECT COUNT(*) AS n FROM t GROUP BY n", kBind, "n",
+                  "GROUP BY cannot refer to the aggregate 'n'"},
+        ErrorCase{"SELECT 1, i16 FROM t GROUP BY 1", kBind, "i16",
+                  "column 'i16' must appear in the GROUP BY clause"},
         // [NOT] LIKE: a VARCHAR column and a string pattern (DuckDB rejects LIKE on numbers).
         ErrorCase{"SELECT COUNT(*) FROM t WHERE i16 LIKE '1%'", kBind, "i16",
                   "LIKE needs a VARCHAR column, but 'i16' is SMALLINT"},
@@ -446,6 +464,54 @@ TEST(BinderTest, Like) {
   EXPECT_EQ(predicates[3].kind, Predicate::Kind::kCompare);
   EXPECT_EQ(predicates[4].kind, Predicate::Kind::kFalse);
   EXPECT_FALSE(predicates[4].column.has_value());
+}
+
+// Constant items get DuckDB's types and names and become constants of the Project; positions name
+// select items in GROUP BY and ORDER BY; GROUP BY a constant is a grouping without keys.
+TEST(BinderTest, ConstantsAndPositions) {
+  const Catalog catalog = MakeCatalog();
+  auto plan = BindSql(
+      "SELECT 1, -5 AS m, 3000000000, 'it''s', DATE '2020-01-02', i16 FROM t ORDER BY 6 DESC, 1",
+      catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  ASSERT_EQ(plan->output.size(), 6U);
+  EXPECT_EQ(plan->output[0].name, "1");
+  EXPECT_EQ(plan->output[0].type, LogicalType::kInteger);
+  EXPECT_EQ(plan->output[1].name, "m");
+  EXPECT_EQ(plan->output[2].type, LogicalType::kBigInt);
+  EXPECT_EQ(plan->output[3].name, "'it''s'");
+  EXPECT_EQ(plan->output[3].type, LogicalType::kVarchar);
+  EXPECT_EQ(plan->output[4].name, "CAST('2020-01-02' AS \"DATE\")");
+  EXPECT_EQ(plan->output[4].type, LogicalType::kDate);
+  const auto& project = std::get<ProjectNode>(Nth(*plan, 0));
+  ASSERT_EQ(project.constants.size(), 6U);
+  EXPECT_EQ(std::get<Int128>(project.constants[1].value_or(Constant{}).value), Int128{-5});
+  EXPECT_FALSE(project.constants[5].has_value());
+  EXPECT_EQ(project.columns[5].index, 0);
+  const auto& sort = std::get<SortNode>(Nth(*plan, 1));
+  ASSERT_EQ(sort.keys.size(), 1U);  // ORDER BY 1 is a constant: it orders nothing
+  EXPECT_EQ(sort.keys[0].column.index, 0);
+  EXPECT_TRUE(sort.keys[0].descending);
+
+  auto grouped = BindSql("SELECT 7, s, COUNT(*) FROM t GROUP BY 1, 2 ORDER BY 3 DESC", catalog);
+  ASSERT_TRUE(grouped.ok()) << grouped.status().ToString();
+  const auto& group = std::get<GroupAggregateNode>(Nth(*grouped, 2));
+  ASSERT_EQ(group.keys.size(), 1U);
+  EXPECT_EQ(group.keys[0].index, 6);
+  EXPECT_EQ(std::get<SortNode>(Nth(*grouped, 1)).keys[0].column.index, 1);
+
+  auto constant_only = BindSql("SELECT 1, COUNT(*) FROM t GROUP BY 1", catalog);
+  ASSERT_TRUE(constant_only.ok()) << constant_only.status().ToString();
+  EXPECT_TRUE(std::get<GroupAggregateNode>(Nth(*constant_only, 1)).keys.empty());
+
+  auto global = BindSql("SELECT 1, COUNT(*) FROM t", catalog);
+  ASSERT_TRUE(global.ok()) << global.status().ToString();
+  EXPECT_TRUE(std::holds_alternative<ProjectNode>(Nth(*global, 0)));
+  EXPECT_TRUE(std::holds_alternative<AggregateNode>(Nth(*global, 1)));
+  auto ordered_global = BindSql("SELECT 1 FROM t ORDER BY COUNT(*)", catalog);
+  ASSERT_TRUE(ordered_global.ok()) << ordered_global.status().ToString();
+  EXPECT_TRUE(std::holds_alternative<AggregateNode>(Nth(*ordered_global, 1)))
+      << "an ORDER BY aggregate makes one row";
 }
 
 TEST(BinderTest, SelectStarProjectsEveryColumn) {

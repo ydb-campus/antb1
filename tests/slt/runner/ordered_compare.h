@@ -32,8 +32,9 @@ struct OrderedQuery {
   int64_t max_rows = int64_t{1024} * 1024;
 };
 
-// The augmented form of a query with ORDER BY; std::nullopt without ORDER BY or for text antb1's
-// parser does not accept.
+// The augmented form of a query with ORDER BY (a position is the select item it names);
+// std::nullopt without ORDER BY, for text antb1's parser does not accept, or for a position under
+// SELECT *.
 std::optional<OrderedQuery> MakeOrderedQuery(std::string_view sql);
 
 // `augmented_sql` with LIMIT `rows` (none: as is).

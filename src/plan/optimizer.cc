@@ -169,15 +169,22 @@ struct Pruner {
   }
 
   Pruned operator()(const ProjectNode& project) const {
+    const auto is_constant = [&](std::size_t i) {
+      return !project.constants.empty() && project.constants[i].has_value();
+    };
     std::vector<bool> below(OutputWidth(*project.input), false);
-    for (const BoundColumn& c : project.columns) {
-      Need(below, c);
+    for (std::size_t i = 0; i < project.columns.size(); ++i) {
+      if (!is_constant(i)) {
+        Need(below, project.columns[i]);
+      }
     }
     const Pruned in = Prune(project.input, std::move(below));
     ProjectNode out = project;
     out.input = in.node;
-    for (BoundColumn& c : out.columns) {
-      Renumber(c, in.remap);
+    for (std::size_t i = 0; i < out.columns.size(); ++i) {
+      if (!is_constant(i)) {
+        Renumber(out.columns[i], in.remap);
+      }
     }
     return Pruned{.node = Make(std::move(out)), .remap = Identity(project.columns.size())};
   }

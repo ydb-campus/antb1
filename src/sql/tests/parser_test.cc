@@ -355,8 +355,8 @@ TEST(ParserTest, GroupByOrderByLimitOffset) {
   auto stmt = Parse(sql);
   ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
   ASSERT_EQ(stmt->group_by.size(), 2U);
-  EXPECT_EQ(stmt->group_by[0].name, "a");
-  EXPECT_TRUE(stmt->group_by[1].quoted);
+  EXPECT_EQ(std::get<ColumnRef>(stmt->group_by[0]).name, "a");
+  EXPECT_TRUE(std::get<ColumnRef>(stmt->group_by[1]).quoted);
   EXPECT_EQ(At(sql, stmt->group_by_span), "GROUP BY a, \"B\"");
   ASSERT_EQ(stmt->order_by.size(), 3U);
   EXPECT_EQ(std::get<ColumnRef>(stmt->order_by[0].expr).name, "c");
@@ -424,6 +424,30 @@ TEST(ParserTest, In) {
   EXPECT_EQ(stmt->where[1].op, CompareOp::kNotIn);
   EXPECT_EQ(stmt->where[1].list.size(), 1U);
   EXPECT_EQ(stmt->where[2].op, CompareOp::kEq);
+}
+
+// Literals are select items (constants), and in GROUP BY and ORDER BY positions or constants; the
+// binder tells them apart.
+TEST(ParserTest, ConstantsAndPositions) {
+  const std::string sql =
+      "SELECT 1, -2 AS m, 'x', DATE '2024-01-02', a FROM t GROUP BY 1, a, 'k' ORDER BY 2 DESC, 'z'";
+  auto stmt = Parse(sql);
+  ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
+  ASSERT_EQ(stmt->items.size(), 5U);
+  EXPECT_EQ(std::get<Literal>(stmt->items[0].expr).text, "1");
+  EXPECT_TRUE(std::get<Literal>(stmt->items[1].expr).negative);
+  EXPECT_EQ(stmt->items[1].alias, "m");
+  EXPECT_EQ(At(sql, stmt->items[1].span), "-2 AS m");
+  EXPECT_EQ(std::get<Literal>(stmt->items[2].expr).kind, Literal::Kind::kString);
+  EXPECT_EQ(std::get<Literal>(stmt->items[3].expr).kind, Literal::Kind::kDate);
+  ASSERT_EQ(stmt->group_by.size(), 3U);
+  EXPECT_EQ(std::get<Literal>(stmt->group_by[0]).text, "1");
+  EXPECT_EQ(std::get<ColumnRef>(stmt->group_by[1]).name, "a");
+  EXPECT_EQ(std::get<Literal>(stmt->group_by[2]).kind, Literal::Kind::kString);
+  ASSERT_EQ(stmt->order_by.size(), 2U);
+  EXPECT_EQ(std::get<Literal>(stmt->order_by[0].expr).text, "2");
+  EXPECT_TRUE(stmt->order_by[0].descending);
+  EXPECT_EQ(At(sql, stmt->order_by[0].span), "2 DESC");
 }
 
 TEST(ParserTest, CountDistinct) {
@@ -611,12 +635,8 @@ INSTANTIATE_TEST_SUITE_P(
     ::testing::Values(
         RejectCase{"GroupByWithoutFrom", "SELECT a ^GROUP BY a", kUnsupported, 5,
                    "SELECT without FROM is not supported"},
-        RejectCase{"GroupByPosition", "SELECT a FROM events GROUP BY ^1", kUnsupported, 1,
-                   "GROUP BY positions are not supported"},
         RejectCase{"GroupByAll", "SELECT a FROM events GROUP BY ^ALL", kUnsupported, 3,
                    "GROUP BY ALL is not supported"},
-        RejectCase{"GroupByConstant", "SELECT a FROM events GROUP BY ^'x'", kUnsupported, 3,
-                   "constants in GROUP BY are not supported"},
         RejectCase{"GroupByExpression", "SELECT a FROM events GROUP BY a ^+ 1", kUnsupported, 1,
                    "arithmetic operator '+' is not supported"},
         RejectCase{"GroupByFunction", "SELECT a FROM events GROUP BY ^year(d)", kUnsupported, 4,
@@ -625,12 +645,8 @@ INSTANTIATE_TEST_SUITE_P(
                    kUnsupported, 1, "a trailing comma in GROUP BY is not supported"},
         RejectCase{"HavingAfterGroupBy", "SELECT a FROM events GROUP BY a ^HAVING COUNT(*) > 1",
                    kUnsupported, 6, "HAVING is not supported"},
-        RejectCase{"OrderByPosition", "SELECT a FROM events ORDER BY ^2", kUnsupported, 1,
-                   "ORDER BY positions are not supported"},
         RejectCase{"OrderByAll", "SELECT a FROM events ORDER BY ^ALL", kUnsupported, 3,
                    "ORDER BY ALL is not supported"},
-        RejectCase{"OrderByConstant", "SELECT a FROM events ORDER BY ^'x'", kUnsupported, 3,
-                   "constants in ORDER BY are not supported"},
         RejectCase{"OrderByExpression", "SELECT a FROM events ORDER BY a ^* 2 DESC", kUnsupported,
                    1, "arithmetic operator '*' is not supported"},
         RejectCase{"OrderByTrailingComma", "SELECT a FROM events ORDER BY a DESC^, LIMIT 5",
@@ -841,14 +857,6 @@ INSTANTIATE_TEST_SUITE_P(
                    "SELECT without FROM is not supported"},
         RejectCase{"SelectWithoutFromLimit", "SELECT * ^LIMIT 1", kUnsupported, 5,
                    "SELECT without FROM is not supported"},
-        RejectCase{"SelectConstant", "SELECT ^1 FROM events", kUnsupported, 1,
-                   "constants in the select list are not supported"},
-        RejectCase{"SelectString", "SELECT a, ^'x' FROM events", kUnsupported, 3,
-                   "constants in the select list are not supported"},
-        RejectCase{"SelectDate", "SELECT ^DATE '2024-01-01' FROM events", kUnsupported, 17,
-                   "constants in the select list are not supported"},
-        RejectCase{"SelectNegative", "SELECT ^-1 FROM events", kUnsupported, 2,
-                   "constants in the select list are not supported"},
         RejectCase{"SelectInto", "SELECT a ^INTO copy FROM events", kUnsupported, 4,
                    "SELECT INTO is not supported"},
         RejectCase{"QualifiedColumn", "SELECT e^.a FROM events", kUnsupported, 1,

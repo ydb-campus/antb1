@@ -34,6 +34,7 @@ enum class Feature : std::uint8_t {
   kStar,           // SELECT *
   kMultipleItems,  // more than one select item
   kAlias,          // <item> [AS] alias
+  kConstant,       // a literal select item (an integer, a string or a DATE)
   // Column types a query reads (select list or WHERE); SELECT * reads every column
   kIntegerColumns,  // SMALLINT, INTEGER, BIGINT, USMALLINT
   kDoubleColumns,   // DOUBLE
@@ -54,8 +55,9 @@ enum class Feature : std::uint8_t {
   kStringLiteral,    // 'text' (also a date as 'YYYY-MM-DD' compared with a DATE column)
   kDateLiteral,      // DATE 'YYYY-MM-DD'
   // LIMIT
-  kLimit,    // LIMIT n
-  kGroupBy,  // GROUP BY on plain columns
+  kLimit,     // LIMIT n
+  kGroupBy,   // GROUP BY on plain columns
+  kPosition,  // GROUP BY or ORDER BY a position in the select list
   // ORDER BY
   kOrderBy,     // ORDER BY columns, aliases or aggregates, [ASC | DESC]
   kNullsOrder,  // NULLS FIRST / NULLS LAST
@@ -97,6 +99,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "multiple_items";
     case Feature::kAlias:
       return "alias";
+    case Feature::kConstant:
+      return "constant";
     case Feature::kIntegerColumns:
       return "integer_columns";
     case Feature::kDoubleColumns:
@@ -143,6 +147,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "semicolon";
     case Feature::kGroupBy:
       return "group_by";
+    case Feature::kPosition:
+      return "position";
     case Feature::kOrderBy:
       return "order_by";
     case Feature::kNullsOrder:
@@ -234,6 +240,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kStar,
     Feature::kMultipleItems,
     Feature::kAlias,
+    Feature::kConstant,
     Feature::kIntegerColumns,
     Feature::kDoubleColumns,
     Feature::kVarcharColumns,
@@ -252,6 +259,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kDateLiteral,
     Feature::kLimit,
     Feature::kGroupBy,
+    Feature::kPosition,
     Feature::kOrderBy,
     Feature::kNullsOrder,
     Feature::kOffset,

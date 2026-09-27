@@ -90,7 +90,13 @@ struct NodeLine {
     return "Filter " + Join(node.predicates, PredicateText, " AND ");
   }
   std::string operator()(const ProjectNode& node) const {
-    return "Project " + Join(node.columns, ColumnName, ", ");
+    std::string line = "Project ";
+    for (std::size_t i = 0; i < node.columns.size(); ++i) {
+      line += i == 0 ? "" : ", ";
+      const bool constant = !node.constants.empty() && node.constants[i].has_value();
+      line += constant ? ToString(*node.constants[i]) : ColumnName(node.columns[i]);
+    }
+    return line;
   }
   std::string operator()(const AggregateNode& node) const {
     return "Aggregate " + Join(node.aggregates, AggregateText, ", ");

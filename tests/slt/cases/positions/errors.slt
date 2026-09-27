@@ -1,0 +1,27 @@
+# A position must be between 1 and the number of select items; GROUP BY cannot name an aggregate.
+
+statement error
+SELECT id FROM edge ORDER BY 2
+
+statement error
+SELECT id FROM edge GROUP BY 0
+
+statement error
+SELECT COUNT(*) FROM edge GROUP BY 1
+
+statement error
+SELECT id FROM edge ORDER BY -1
+
+statement error
+SELECT id FROM edge ORDER BY 'x'
+
+statement error
+SELECT id FROM edge ORDER BY 1.5
+
+onlyif antb1
+statement error ^bind: ORDER BY position 2 is not between 1 and 1$
+SELECT id FROM edge ORDER BY 2
+
+onlyif antb1
+statement error ^bind: GROUP BY cannot refer to the aggregate at position 1$
+SELECT COUNT(*) FROM edge GROUP BY 1

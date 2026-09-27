@@ -56,13 +56,11 @@ arrow::Status GroupAggregateOperator::Open(ExecContext& ctx) {
   pool_ = ctx.pool;
   done_ = false;
   num_groups_ = 0;
+  chunk_groups_.clear();
   next_chunk_ = 0;
   next_group_ = 0;
   states_.clear();
   first_keys_.assign(keys_.size(), {});
-  if (keys_.empty()) {
-    return arrow::Status::Invalid("grouped aggregation without keys");
-  }
   const int width = input_->output_schema()->num_fields();
   std::vector<arrow::TypeHolder> key_types;
   for (const plan::BoundColumn& key : keys_) {
@@ -84,12 +82,24 @@ arrow::Status GroupAggregateOperator::Open(ExecContext& ctx) {
     states_.push_back(std::move(state));
   }
   kernels_ = std::make_unique<arrow::compute::ExecContext>(pool_);
-  ARROW_ASSIGN_OR_RAISE(grouper_, arrow::compute::Grouper::Make(key_types, kernels_.get()));
+  grouper_.reset();
+  if (!keys_.empty()) {
+    ARROW_ASSIGN_OR_RAISE(grouper_, arrow::compute::Grouper::Make(key_types, kernels_.get()));
+  }
+  opened_ = true;
   return input_->Open(ctx);
 }
 
 arrow::Status GroupAggregateOperator::Consume(const arrow::RecordBatch& rows) {
   const std::int64_t n = rows.num_rows();
+  if (keys_.empty()) {  // one group of every row
+    if (num_groups_ == 0) {
+      num_groups_ = 1;
+      chunk_groups_.push_back(1);
+    }
+    const std::vector<std::uint32_t> group_ids(static_cast<std::size_t>(n), 0);
+    return ConsumeAggregates(rows, group_ids);
+  }
   std::vector<arrow::Datum> keys;
   keys.reserve(keys_.size());
   for (const plan::BoundColumn& key : keys_) {
@@ -129,8 +139,14 @@ arrow::Status GroupAggregateOperator::Consume(const arrow::RecordBatch& rows) {
                                arrow::compute::TakeOptions::NoBoundsCheck(), kernels_.get()));
       first_keys_[k].push_back(taken.make_array());
     }
+    chunk_groups_.push_back(after - before);
     num_groups_ = after;
   }
+  return ConsumeAggregates(rows, group_ids);
+}
+
+arrow::Status GroupAggregateOperator::ConsumeAggregates(const arrow::RecordBatch& rows,
+                                                        std::span<const std::uint32_t> group_ids) {
   for (std::size_t i = 0; i < aggregates_.size(); ++i) {
     states_[i]->Resize(num_groups_);
     const plan::AggregateCall& call = aggregates_[i];
@@ -142,16 +158,16 @@ arrow::Status GroupAggregateOperator::Consume(const arrow::RecordBatch& rows) {
 }
 
 arrow::Result<Batch> GroupAggregateOperator::Next() {
-  if (grouper_ == nullptr) {
+  if (!opened_) {
     return arrow::Status::Invalid("group aggregate: Next() before Open()");
   }
   if (done_) {
-    if (keys_.empty() || next_chunk_ >= first_keys_.front().size()) {
+    if (next_chunk_ >= chunk_groups_.size()) {
       states_.clear();
       return Batch{};
     }
     // One batch per chunk of new groups: its keys as first seen, the aggregates of those groups.
-    const auto rows = static_cast<std::uint32_t>(first_keys_.front()[next_chunk_]->length());
+    const std::uint32_t rows = chunk_groups_[next_chunk_];
     arrow::ArrayVector columns;
     columns.reserve(keys_.size() + states_.size());
     for (auto& chunks : first_keys_) {

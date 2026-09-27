@@ -137,18 +137,37 @@ void CheckTokensAccountedFor(const std::string& sql, const SelectStatement& stmt
   std::size_t string_literals = stmt.from.kind == TableRef::Kind::kPath ? 1U : 0U;
   std::size_t number_literals =
       (stmt.limit.has_value() ? 1U : 0U) + (stmt.offset.has_value() ? 1U : 0U);
-  for (const Comparison& cmp : stmt.where) {
-    negatives += cmp.literal.negative ? 1U : 0U;
-    const bool numeric =
-        cmp.literal.kind == Literal::Kind::kInteger || cmp.literal.kind == Literal::Kind::kDecimal;
+  const auto count_literal = [&](const Literal& lit) {
+    negatives += lit.negative ? 1U : 0U;
+    const bool numeric = lit.kind == Literal::Kind::kInteger || lit.kind == Literal::Kind::kDecimal;
     (numeric ? number_literals : string_literals) += 1;
+  };
+  std::size_t likes = 0;  // LIKE has no comparison token
+  for (const Comparison& cmp : stmt.where) {
+    likes += cmp.op == CompareOp::kLike || cmp.op == CompareOp::kNotLike ? 1U : 0U;
+    count_literal(cmp.literal);
+  }
+  for (const SelectItem& item : stmt.items) {
+    if (const auto* lit = std::get_if<Literal>(&item.expr)) {
+      count_literal(*lit);
+    }
+  }
+  for (const GroupExpr& expr : stmt.group_by) {
+    if (const auto* lit = std::get_if<Literal>(&expr)) {
+      count_literal(*lit);
+    }
+  }
+  for (const OrderItem& item : stmt.order_by) {
+    if (const auto* lit = std::get_if<Literal>(&item.expr)) {
+      count_literal(*lit);
+    }
   }
   const std::string context = testing::PrintToString(sql);
   EXPECT_EQ(commas, separators(stmt.items.size()) + separators(stmt.group_by.size()) +
                         separators(stmt.order_by.size()))
       << context;
   EXPECT_EQ(and_count, stmt.where.empty() ? 0U : stmt.where.size() - 1) << context;
-  EXPECT_EQ(comparisons, stmt.where.size()) << context;
+  EXPECT_EQ(comparisons, stmt.where.size() - likes) << context;
   EXPECT_EQ(left_parens, aggregates) << context;
   EXPECT_EQ(right_parens, aggregates) << context;
   EXPECT_EQ(stars, (stmt.star ? 1U : 0U) + count_stars) << context;
@@ -187,8 +206,9 @@ void CheckParse(const std::string& sql) {
     ASSERT_TRUE(SpanInside(cmp.column.span, sql));
     ASSERT_TRUE(SpanInside(cmp.literal.span, sql));
   }
-  for (const ColumnRef& column : stmt.group_by) {
-    ASSERT_TRUE(SpanInside(column.span, sql));
+  for (const GroupExpr& expr : stmt.group_by) {
+    const auto* column = std::get_if<ColumnRef>(&expr);
+    ASSERT_TRUE(SpanInside(column != nullptr ? column->span : std::get<Literal>(expr).span, sql));
   }
   for (const OrderItem& item : stmt.order_by) {
     ASSERT_TRUE(SpanInside(item.span, sql));

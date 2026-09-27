@@ -523,6 +523,30 @@ TEST_F(GroupedAggregateTest, EmitsOneBatchPerChunkOfNewGroups) {
   }
 }
 
+// Without keys (GROUP BY constants only) every row is in one group, emitted only over rows.
+TEST_F(GroupedAggregateTest, NoKeysMeanOneGroupOfEveryRow) {
+  const auto a = Rows({1, 2}, {10, 20});
+  const auto b = Rows({3}, {std::nullopt});
+  const auto run = [&](std::vector<Batch> batches) {
+    GroupAggregateOperator op(
+        std::make_unique<ScriptedSource>(a->schema(), std::move(batches)), {},
+        {plan::AggregateCall{.kind = AggKind::kCountStar, .type = LogicalType::kBigInt},
+         plan::AggregateCall{.kind = AggKind::kCount,
+                             .arg = Column(1, "v", LogicalType::kBigInt),
+                             .type = LogicalType::kBigInt}});
+    ExecContext ctx;
+    return Drain(op, ctx);
+  };
+  const auto some = run({Batch{.data = a}, Batch{.data = b}});
+  ASSERT_TRUE(some.ok()) << some.status().ToString();
+  ASSERT_EQ((*some)->num_rows(), 1);
+  EXPECT_EQ(testing::Int64Column(**some, 0), (std::vector<std::optional<std::int64_t>>{3}));
+  EXPECT_EQ(testing::Int64Column(**some, 1), (std::vector<std::optional<std::int64_t>>{2}));
+  const auto none = run({Batch{.data = a, .selection = testing::Bools({false, false})}});
+  ASSERT_TRUE(none.ok()) << none.status().ToString();
+  EXPECT_EQ((*none)->num_rows(), 0);
+}
+
 TEST_F(GroupedAggregateTest, NoRowsGiveNoGroups) {
   const auto a = Rows({1, 2}, {1, 2});
   EXPECT_TRUE(RunGroups({}, a->schema()).empty());
@@ -624,7 +648,7 @@ TEST_F(GroupedAggregateTest, EveryKeyTypeAndBatchSizeInvariance) {
   }
 }
 
-// A malformed operator (a column outside its input, no key, Next() before Open()) is Invalid.
+// A malformed operator (a column outside its input, Next() before Open()) is Invalid.
 TEST_F(GroupedAggregateTest, OperatorRejectsMalformedPlans) {
   const auto a = Rows({1}, {1});
   const auto run = [&](std::vector<plan::BoundColumn> keys,
@@ -635,7 +659,7 @@ TEST_F(GroupedAggregateTest, OperatorRejectsMalformedPlans) {
     return op.Open(ctx);
   };
   const plan::AggregateCall count_star{.kind = AggKind::kCountStar, .type = LogicalType::kBigInt};
-  EXPECT_TRUE(run({}, {count_star}).IsInvalid());
+  EXPECT_TRUE(run({}, {count_star}).ok()) << "no keys: one group of every row";
   EXPECT_TRUE(run({Column(5, "k", LogicalType::kBigInt)}, {count_star}).IsInvalid());
   EXPECT_TRUE(run({Column(0, "k", LogicalType::kBigInt)},
                   {plan::AggregateCall{.kind = AggKind::kSum,

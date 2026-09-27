@@ -103,6 +103,19 @@ TEST(ExplainTest, Like) {
             "    Scan table=ok source=fake columns=[i16, s]\n");
 }
 
+TEST(ExplainTest, ConstantsAndPositions) {
+  EXPECT_EQ(ExplainSql("SELECT 1, 'x', s, COUNT(*) FROM ok GROUP BY 1, 3 ORDER BY 4 DESC"),
+            "Output: 1:INTEGER 'x':VARCHAR s:VARCHAR count_star():BIGINT\n"
+            "Project 1, 'x', s, \"count_star()\"\n"
+            "  Sort \"count_star()\" DESC NULLS LAST\n"
+            "    GroupAggregate keys=[s] COUNT(*)\n"
+            "      Scan table=ok source=fake columns=[s]\n");
+  EXPECT_EQ(ExplainSql("SELECT 2 FROM ok"),
+            "Output: 2:INTEGER\n"
+            "Project 2\n"
+            "  Scan table=ok source=fake columns=[]\n");
+}
+
 TEST(ExplainTest, CountDistinct) {
   EXPECT_EQ(ExplainSql("SELECT COUNT(DISTINCT s), COUNT(s) FROM ok"),
             "Output: count(DISTINCT s):BIGINT count(s):BIGINT\n"

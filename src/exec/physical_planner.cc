@@ -40,11 +40,18 @@ struct Builder {
   OperatorResult operator()(const plan::ProjectNode& node) const {
     ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input));
     std::vector<int> columns;
+    std::vector<std::shared_ptr<arrow::Scalar>> constants;
     columns.reserve(node.columns.size());
-    for (const plan::BoundColumn& c : node.columns) {
-      columns.push_back(c.index);
+    for (std::size_t i = 0; i < node.columns.size(); ++i) {
+      std::shared_ptr<arrow::Scalar> constant;
+      if (!node.constants.empty() && node.constants[i].has_value()) {
+        ARROW_ASSIGN_OR_RAISE(constant, plan::ToArrowScalar(*node.constants[i]));
+      }
+      columns.push_back(node.columns[i].index);
+      constants.push_back(std::move(constant));
     }
-    return std::make_unique<ProjectOperator>(std::move(input), std::move(columns));
+    return std::make_unique<ProjectOperator>(std::move(input), std::move(columns),
+                                             std::move(constants));
   }
   OperatorResult operator()(const plan::AggregateNode& node) const {
     ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input));

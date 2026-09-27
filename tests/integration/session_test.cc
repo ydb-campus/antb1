@@ -129,10 +129,13 @@ TEST(Session, ErrorKindsAtTheBoundary) {
   };
   EXPECT_EQ(kind("SELECT COUNT(*) FROM"), plan::SqlErrorDetail::Kind::kParse);
   EXPECT_EQ(kind("SELECT COUNT(*) FROM no_such_table"), plan::SqlErrorDetail::Kind::kBind);
+  EXPECT_EQ(kind("SELECT SUM(AdvEngineID) FROM hits_like GROUP BY AdvEngineID + 1"),
+            plan::SqlErrorDetail::Kind::kUnsupported);
+  EXPECT_EQ(kind("SELECT COUNT(*) FROM hits_like HAVING COUNT(*) > 1"),
+            plan::SqlErrorDetail::Kind::kUnsupported);
   EXPECT_EQ(kind("SELECT SUM(AdvEngineID) FROM hits_like GROUP BY 1"),
-            plan::SqlErrorDetail::Kind::kUnsupported);
-  EXPECT_EQ(kind("SELECT COUNT(*) FROM hits_like ORDER BY 1"),
-            plan::SqlErrorDetail::Kind::kUnsupported);
+            plan::SqlErrorDetail::Kind::kBind)
+      << "GROUP BY 1 refers to the aggregate";
   EXPECT_TRUE(session->Execute(FromPath(Fixture("no_such_file.parquet"))).status().IsIOError());
   // The session stays usable after every error.
   auto count = Count(*session, "SELECT COUNT(*) FROM hits_like");

@@ -44,6 +44,9 @@ std::string Expr(const SelectExpr& expr) {
     return std::string(ToString(agg->kind)) + "(" + (agg->distinct ? "DISTINCT " : "") +
            (agg->arg ? Column(*agg->arg) : "") + ")";
   }
+  if (const auto* lit = std::get_if<Literal>(&expr)) {
+    return LiteralSql(*lit);
+  }
   return Column(std::get<ColumnRef>(expr));
 }
 
@@ -85,7 +88,8 @@ std::string ToSql(const SelectStatement& stmt) {
   }
   for (std::size_t i = 0; i < stmt.group_by.size(); ++i) {
     sql += i == 0 ? " GROUP BY " : ", ";
-    sql += Column(stmt.group_by[i]);
+    const auto* lit = std::get_if<Literal>(&stmt.group_by[i]);
+    sql += lit != nullptr ? LiteralSql(*lit) : Column(std::get<ColumnRef>(stmt.group_by[i]));
   }
   for (std::size_t i = 0; i < stmt.order_by.size(); ++i) {
     const OrderItem& item = stmt.order_by[i];
