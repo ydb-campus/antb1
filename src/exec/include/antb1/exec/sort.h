@@ -33,14 +33,30 @@ class RowComparator {
 
   [[nodiscard]] const std::shared_ptr<arrow::Schema>& schema() const { return schema_; }
   [[nodiscard]] KeyArrays KeysOf(const arrow::RecordBatch& batch) const;
-  // < 0 if row i of `a` comes before row j of `b`, 0 if they tie, > 0 if it comes after.
-  [[nodiscard]] int Compare(const KeyArrays& a, int64_t i, const KeyArrays& b, int64_t j) const;
+  // < 0 if row i of `a` comes before row j of `b`, 0 if they tie, > 0 if it comes after, by the
+  // keys from `first_key` on.
+  [[nodiscard]] int Compare(const KeyArrays& a, int64_t i, const KeyArrays& b, int64_t j,
+                            std::size_t first_key = 0) const;
+
+  // The first key of a row as two numbers that order rows as the key does: a group (0: NULL first,
+  // 1: a value, 2: NULL last) and, for a value, 64 bits of it in the key's direction. Rows with a
+  // smaller (group, bits) come first; rows with equal ones need Compare, from key 1 on when
+  // prefix_is_exact() (the bits are the whole value), else from key 0.
+  struct Prefix {
+    std::uint64_t bits = 0;
+    std::uint8_t group = 0;
+  };
+  [[nodiscard]] Prefix PrefixOf(const KeyArrays& keys, int64_t row) const;
+  [[nodiscard]] bool prefix_is_exact() const { return keys_.front().exact; }
 
  private:
   using CompareValues = int (*)(const arrow::Array& a, int64_t i, const arrow::Array& b, int64_t j);
+  using PrefixBits = std::uint64_t (*)(const arrow::Array& a, int64_t i);
   struct Key {
     int column = 0;
     CompareValues compare = nullptr;  // both values not NULL, ascending
+    PrefixBits prefix = nullptr;      // a value not NULL, ascending
+    bool exact = false;               // `prefix` orders every value (not only its first bits)
     bool descending = false;
     bool nulls_first = false;
   };

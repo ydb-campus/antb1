@@ -297,6 +297,117 @@ TEST_F(SortTest, MergedBuffersEqualOneBuffer) {
   }
 }
 
+// The first-key prefix never contradicts the comparator: a smaller (group, bits) sorts first, and
+// for an exact prefix equal ones tie on that key, for every engine type, direction and NULL order.
+TEST_F(SortTest, PrefixesAgreeWithTheComparator) {
+  Rng rng(99);
+  const auto pick = [&](std::size_t n) {
+    return static_cast<std::size_t>(rng.Below(static_cast<int64_t>(n)));
+  };
+  std::vector<std::pair<LogicalType, std::shared_ptr<arrow::Array>>> columns;
+  {
+    std::vector<std::optional<int64_t>> v;
+    const std::vector<int64_t> edges = {std::numeric_limits<int64_t>::min(), -1, 0, 1,
+                                        std::numeric_limits<int64_t>::max()};
+    for (int i = 0; i < 64; ++i) {
+      v.emplace_back(i % 9 == 0 ? std::optional<int64_t>{}
+                                : std::optional(edges[pick(edges.size())] + (rng.Below(3) - 1)));
+    }
+    columns.emplace_back(LogicalType::kBigInt, Int64s(v));
+  }
+  {
+    std::vector<std::optional<int16_t>> v;
+    for (int i = 0; i < 64; ++i) {
+      v.emplace_back(i % 9 == 0 ? std::optional<int16_t>{}
+                                : std::optional(static_cast<int16_t>(rng.Below(65536) - 32768)));
+    }
+    columns.emplace_back(LogicalType::kSmallInt,
+                         testing::ArrayOf<arrow::Int16Builder, int16_t>(arrow::int16(), v));
+  }
+  {
+    std::vector<std::optional<uint16_t>> v;
+    for (int i = 0; i < 64; ++i) {
+      v.emplace_back(i % 9 == 0 ? std::optional<uint16_t>{}
+                                : std::optional(static_cast<uint16_t>(rng.Below(65536))));
+    }
+    columns.emplace_back(LogicalType::kUSmallInt,
+                         testing::ArrayOf<arrow::UInt16Builder, uint16_t>(arrow::uint16(), v));
+  }
+  {
+    std::vector<std::optional<double>> v;
+    const std::vector<double> specials = {kNaN,   -kNaN,   kInf, -kInf, 0.0,  -0.0,
+                                          1e-310, -1e-310, 1.5,  -1.5,  1e300};
+    for (int i = 0; i < 64; ++i) {
+      v.emplace_back(i % 9 == 0 ? std::optional<double>{}
+                                : std::optional(specials[pick(specials.size())]));
+    }
+    columns.emplace_back(LogicalType::kDouble, Doubles(v));
+  }
+  {
+    std::vector<std::optional<std::string>> v;
+    const std::vector<std::string> specials = {"",
+                                               "a",
+                                               "ab",
+                                               std::string("a\0", 2),
+                                               std::string("a\0b", 3),
+                                               "abcdefgh",
+                                               "abcdefghi",
+                                               "abcdefgh\x01",
+                                               "\xFF",
+                                               "\x7F",
+                                               "b"};
+    for (int i = 0; i < 64; ++i) {
+      v.emplace_back(i % 9 == 0 ? std::optional<std::string>{}
+                                : std::optional(specials[pick(specials.size())]));
+    }
+    columns.emplace_back(LogicalType::kVarchar, Strings(v));
+  }
+  {
+    arrow::Decimal128Builder decimals(plan::ToArrow(LogicalType::kHugeInt));
+    const std::vector<arrow::Decimal128> specials = {arrow::Decimal128(0),
+                                                     arrow::Decimal128(-1),
+                                                     arrow::Decimal128(1),
+                                                     arrow::Decimal128(1, 0),
+                                                     arrow::Decimal128(1, 5),
+                                                     arrow::Decimal128(-1, 5),
+                                                     arrow::Decimal128::GetMaxValue(38),
+                                                     arrow::Decimal128::GetMaxValue(38).Negate()};
+    for (int i = 0; i < 64; ++i) {
+      ASSERT_TRUE(
+          (i % 9 == 0 ? decimals.AppendNull() : decimals.Append(specials[pick(specials.size())]))
+              .ok());
+    }
+    columns.emplace_back(LogicalType::kHugeInt, decimals.Finish().ValueOrDie());
+  }
+  for (const auto& [type, column] : columns) {
+    const auto batch = WithIds({column});
+    for (unsigned flags = 0; flags < 4; ++flags) {
+      const bool descending = (flags & 1U) != 0;
+      const bool nulls_first = (flags & 2U) != 0;
+      const auto comparator =
+          RowComparator::Make(batch->schema(), {Key(1, type, descending, nulls_first)})
+              .ValueOrDie();
+      const auto keys = comparator.KeysOf(*batch);
+      for (int64_t i = 0; i < batch->num_rows(); ++i) {
+        for (int64_t j = 0; j < batch->num_rows(); ++j) {
+          const auto a = comparator.PrefixOf(keys, i);
+          const auto b = comparator.PrefixOf(keys, j);
+          const int c = comparator.Compare(keys, i, keys, j);
+          const auto pa = std::pair(a.group, a.bits);
+          const auto pb = std::pair(b.group, b.bits);
+          if (pa < pb) {
+            ASSERT_LT(c, 0) << plan::ToString(type) << " flags " << flags << " rows " << i << ", "
+                            << j;
+          } else if (pa == pb && comparator.prefix_is_exact()) {
+            ASSERT_EQ(c, 0) << plan::ToString(type) << " flags " << flags << " rows " << i << ", "
+                            << j;
+          }
+        }
+      }
+    }
+  }
+}
+
 TEST_F(SortTest, ConsumesSelections) {
   const auto batch = WithIds({Int64s({5, 4, 3, 2, 1})});
   auto source = std::make_unique<ScriptedSource>(

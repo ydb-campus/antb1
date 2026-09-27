@@ -26,6 +26,8 @@ pixi run bench --benchmark_repetitions=5 --benchmark_report_aggregates_only=true
 | `BM_NotEqualTrueCount` | `COUNT(*) ... WHERE x <> 0`: Arrow's `not_equal` kernel and the true count of the selection |
 | `BM_Int128AvgAccumulate` | `AVG` over a BIGINT column: exact 128-bit accumulation, one division at the end |
 | `BM_ScanColumn` | decoding one SMALLINT column of a Parquet file through `io::ParquetTable::Scan` in 64Ki-row batches |
+| `BM_SortRows` | `ORDER BY` a random BIGINT over 1Mi rows with a VARCHAR payload, no `LIMIT`: a full sort and the gather of its output (`exec::SortOperator`) |
+| `BM_TopNRows` | the same with `LIMIT 10`: the top-N path, which keeps only the best rows while it reads |
 
 The `ci-release` preset (`pixi run release`, the `macos-release` CI leg) builds the benchmarks too and runs
 `bench.micro.smoke` (label `bench-smoke`): every benchmark for one iteration (`--benchmark_dry_run`), so they keep
