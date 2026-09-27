@@ -511,6 +511,7 @@ class Builder {
     tokens_.clear();
     used_ = FeatureSet{};
     order_aliases_.clear();
+    aggregate_aliases_.clear();
     order_positions_.clear();
     key_positions_.clear();
     constant_positions_.clear();
@@ -553,6 +554,7 @@ class Builder {
       Keyword("BY");
       Position(rng_.Pick(constant_positions_));
     }
+    const bool having = Having(shape, t, cols, numeric, aggs, keys);
     const bool ordered = OrderBy(shape, cols, numeric, aggs, keys);
     const bool limited = Limit(shape == Shape::kStar && t.rows > kStarMaxRows);
     const bool offset = Offset(limited);
@@ -564,9 +566,10 @@ class Builder {
     q.sql = Render();
     q.table = t.name;
     q.features = used_;
-    // A select list of constants only (no aggregate emitted) has a row per table row.
-    const bool rows =
-        shape != Shape::kAggregates || !keys.empty() || constant_group || !aggregate_emitted_;
+    // A select list of constants only (no aggregate emitted) has a row per table row, unless HAVING
+    // makes the query aggregate.
+    const bool rows = shape != Shape::kAggregates || !keys.empty() || constant_group ||
+                      (!aggregate_emitted_ && !having);
     q.sort = rows && !ordered ? SortMode::kRowSort : SortMode::kNoSort;
     q.unordered_limit = rows && !ordered && (limited || offset);
     return q;
@@ -610,6 +613,7 @@ class Builder {
         Symbol(",");
       }
       bool orderable = true;
+      std::optional<std::pair<Agg, const GenColumn*>> call;
       if (allowed_.Has(Feature::kConstant) && rng_.Percent(10)) {
         // A constant item (never a decimal: DuckDB types it DECIMAL, which antb1 lacks).
         static constexpr auto kConstants = std::to_array<std::string_view>(
@@ -640,6 +644,7 @@ class Builder {
         orderable = Orderable(agg, arg);
         Aggregate(agg, arg);
         aggregate_emitted_ = true;
+        call.emplace(agg, arg);
       }
       if (allowed_.Has(Feature::kAlias) && rng_.Percent(15)) {
         used_.Add(Feature::kAlias);
@@ -649,6 +654,9 @@ class Builder {
         std::string alias = std::format("a{}", i + 1);
         if (orderable) {
           order_aliases_.push_back(alias);
+          if (call.has_value()) {
+            aggregate_aliases_.push_back(AggregateAlias{.alias = alias, .call = *call});
+          }
         }
         tokens_.push_back({.kind = Token::Kind::kAlias, .text = std::move(alias)});
       }
@@ -765,6 +773,110 @@ class Builder {
     return true;
   }
 
+  // The values an aggregate with I or T values takes, as a column for MakeLiteral: a count is
+  // between 0 and the row count, an integer SUM gets its argument's literals, MIN and MAX are their
+  // argument.
+  static GenColumn ValuesOf(const GenTable& t, Agg agg, const GenColumn* arg) {
+    switch (agg) {
+      case Agg::kCountStar:
+      case Agg::kCount:
+      case Agg::kCountDistinct:
+        return GenColumn{.name = {}, .kind = ValueKind::kInteger, .min = 0, .max = t.rows};
+      case Agg::kSum:
+      case Agg::kAvg:
+      case Agg::kMin:
+      case Agg::kMax:
+        break;
+    }
+    return *arg;
+  }
+
+  // HAVING 1 or 2 conditions of an aggregate query (AND): a GROUP BY key, an aggregate call with I
+  // or T values or the select alias of one, compared with a literal of its type (or [NOT] LIKE, or
+  // [NOT] IN, as in WHERE). Returns whether it wrote one.
+  bool Having(Shape shape, const GenTable& t, const std::vector<const GenColumn*>& cols,
+              const std::vector<const GenColumn*>& numeric, const std::vector<Agg>& aggs,
+              const std::vector<const GenColumn*>& keys) {
+    if (shape != Shape::kAggregates || !allowed_.Has(Feature::kHaving) || !rng_.Percent(25)) {
+      return false;
+    }
+    struct Operand {
+      const GenColumn* key = nullptr;
+      std::optional<std::pair<Agg, const GenColumn*>> call;
+      std::string alias;
+      GenColumn values;
+    };
+    std::vector<Operand> operands;
+    for (const GenColumn* key : keys) {
+      if (CanLiteral(key->kind)) {
+        operands.push_back(Operand{.key = key, .call = {}, .alias = {}, .values = *key});
+      }
+    }
+    for (const Agg agg : aggs) {
+      const GenColumn* arg = agg == Agg::kCountStar
+                                 ? nullptr
+                                 : rng_.Pick(agg == Agg::kSum || agg == Agg::kAvg ? numeric : cols);
+      GenColumn values = ValuesOf(t, agg, arg);
+      if (Orderable(agg, arg) && CanLiteral(values.kind)) {
+        operands.push_back(Operand{
+            .key = nullptr, .call = std::pair(agg, arg), .alias = {}, .values = std::move(values)});
+      }
+    }
+    for (const AggregateAlias& alias : aggregate_aliases_) {
+      GenColumn values = ValuesOf(t, alias.call.first, alias.call.second);
+      if (CanLiteral(values.kind)) {
+        operands.push_back(
+            Operand{.key = nullptr, .call = {}, .alias = alias.alias, .values = std::move(values)});
+      }
+    }
+    if (operands.empty()) {
+      return false;
+    }
+    used_.Add(Feature::kHaving);
+    Keyword("HAVING");
+    const std::size_t terms = 1 + rng_.Below(2);
+    for (std::size_t i = 0; i < terms; ++i) {
+      if (i > 0) {
+        Keyword("AND");
+      }
+      const Operand& operand = operands[rng_.Below(operands.size())];
+      const auto write_operand = [&] {
+        if (operand.key != nullptr) {
+          Column(*operand.key);
+        } else if (operand.call.has_value()) {
+          Aggregate(operand.call->first, operand.call->second);
+        } else {
+          tokens_.push_back({.kind = Token::Kind::kAlias, .text = operand.alias});
+        }
+      };
+      if (operand.values.kind == ValueKind::kVarchar && allowed_.Has(Feature::kLike) &&
+          rng_.Percent(25)) {
+        write_operand();
+        Like(operand.values);
+        continue;
+      }
+      if (allowed_.Has(Feature::kIn) && rng_.Percent(15)) {
+        write_operand();
+        In(operand.values);
+        continue;
+      }
+      const std::string_view op = rng_.Pick(kOps);
+      Literal lit = MakeLiteral(operand.values);
+      used_.Add(lit.features);
+      if (allowed_.Has(Feature::kLiteralFirst) && rng_.Percent(20)) {
+        used_.Add(Feature::kLiteralFirst);
+        tokens_.insert(tokens_.end(), lit.tokens.begin(), lit.tokens.end());
+        Symbol(Flip(op));
+        write_operand();
+      } else {
+        write_operand();
+        Symbol(op);
+        tokens_.insert(tokens_.end(), lit.tokens.begin(), lit.tokens.end());
+      }
+    }
+    return true;
+  }
+
   // OFFSET m, after (or before) the LIMIT. Returns whether it wrote one.
   bool Offset(bool limited) {
     if (!allowed_.Has(Feature::kOffset) || !rng_.Percent(limited ? 30 : 10)) {
@@ -804,10 +916,12 @@ class Builder {
       }
       const GenColumn& c = *rng_.Pick(comparable);
       if (c.kind == ValueKind::kVarchar && allowed_.Has(Feature::kLike) && rng_.Percent(30)) {
+        Column(c);
         Like(c);
         continue;
       }
       if (allowed_.Has(Feature::kIn) && rng_.Percent(15)) {
+        Column(c);
         In(c);
         continue;
       }
@@ -827,9 +941,9 @@ class Builder {
     }
   }
 
-  // column [NOT] LIKE 'pattern': a part of a sample value between %s, a prefix or a suffix, with
-  // _ now and then, or an edge pattern. Only the ASCII bytes of samples are used, so the SQL text
-  // stays valid UTF-8.
+  // [NOT] LIKE 'pattern' after an operand with the values of `c`: a part of a sample value between
+  // %s, a prefix or a suffix, with _ now and then, or an edge pattern. Only the ASCII bytes of
+  // samples are used, so the SQL text stays valid UTF-8.
   void Like(const GenColumn& c) {
     used_.Add(Feature::kLike);
     std::string sample;
@@ -868,7 +982,6 @@ class Builder {
           break;
       }
     }
-    Column(c);
     if (rng_.Percent(30)) {
       Keyword("NOT");
     }
@@ -876,10 +989,9 @@ class Builder {
     tokens_.push_back({.kind = Token::Kind::kLiteral, .text = SqlString(pattern)});
   }
 
-  // column [NOT] IN (1 to 4 literals of the column's type, as comparisons get them).
+  // [NOT] IN (1 to 4 literals of the type of `c`, as comparisons get them) after an operand.
   void In(const GenColumn& c) {
     used_.Add(Feature::kIn);
-    Column(c);
     if (rng_.Percent(30)) {
       Keyword("NOT");
     }
@@ -1074,7 +1186,12 @@ class Builder {
   FeatureSet allowed_;
   std::vector<Token> tokens_;
   FeatureSet used_;
-  std::vector<std::string> order_aliases_;    // select aliases of items with I or T values
+  std::vector<std::string> order_aliases_;  // select aliases of items with I or T values
+  struct AggregateAlias {
+    std::string alias;
+    std::pair<Agg, const GenColumn*> call;
+  };
+  std::vector<AggregateAlias> aggregate_aliases_;  // those of them that name aggregates
   std::vector<std::size_t> order_positions_;  // positions of items with I or T values (keys too)
   std::vector<std::pair<const GenColumn*, std::size_t>> key_positions_;  // selected GROUP BY keys
   std::vector<std::size_t> constant_positions_;  // positions of constant items

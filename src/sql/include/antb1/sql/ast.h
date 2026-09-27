@@ -59,6 +59,19 @@ struct Comparison {
 using SelectExpr = std::variant<AggregateCall, ColumnRef, Literal>;
 using GroupExpr = std::variant<ColumnRef, Literal>;
 
+// One HAVING condition: an aggregate call or a column (a GROUP BY key or a select alias, resolved
+// by the binder) <op> a literal, with the same operators as WHERE. A literal-first comparison is
+// normalized as in WHERE (5 < COUNT(*) -> COUNT(*) > 5).
+using HavingOperand = std::variant<AggregateCall, ColumnRef>;
+
+struct HavingComparison {
+  HavingOperand operand;
+  CompareOp op = CompareOp::kEq;
+  Literal literal;            // every op but kIn and kNotIn
+  std::vector<Literal> list;  // kIn and kNotIn: the values, in order (at least one)
+  SourceSpan span;
+};
+
 struct SelectItem {
   SelectExpr expr;
   std::optional<std::string> alias;  // as written (quoted aliases unescaped)
@@ -90,16 +103,18 @@ struct SelectStatement {
   SourceSpan star_span;  // the '*' (when star)
   std::vector<SelectItem> items;
   TableRef from;
-  std::vector<Comparison> where;       // conjunction (AND)
-  std::vector<GroupExpr> group_by;     // GROUP BY items (aliases and positions: see the binder)
-  SourceSpan group_by_span;            // GROUP BY and its list (when group_by is not empty)
-  std::vector<OrderItem> order_by;     // ORDER BY items
-  SourceSpan order_by_span;            // ORDER BY and its list (when order_by is not empty)
-  std::optional<std::int64_t> limit;   // non-negative
-  SourceSpan limit_span;               // LIMIT and its value (when limit)
-  std::optional<std::int64_t> offset;  // non-negative
-  SourceSpan offset_span;              // OFFSET and its value (when offset)
-  SourceSpan span;                     // SELECT .. last token of the query (without ';')
+  std::vector<Comparison> where;         // conjunction (AND)
+  std::vector<GroupExpr> group_by;       // GROUP BY items (aliases and positions: see the binder)
+  SourceSpan group_by_span;              // GROUP BY and its list (when group_by is not empty)
+  std::vector<HavingComparison> having;  // conjunction (AND)
+  SourceSpan having_span;                // HAVING and its predicate (when having is not empty)
+  std::vector<OrderItem> order_by;       // ORDER BY items
+  SourceSpan order_by_span;              // ORDER BY and its list (when order_by is not empty)
+  std::optional<std::int64_t> limit;     // non-negative
+  SourceSpan limit_span;                 // LIMIT and its value (when limit)
+  std::optional<std::int64_t> offset;    // non-negative
+  SourceSpan offset_span;                // OFFSET and its value (when offset)
+  SourceSpan span;                       // SELECT .. last token of the query (without ';')
 };
 
 std::string_view ToString(AggKind kind);

@@ -1,0 +1,30 @@
+# HAVING refers to GROUP BY keys and aggregates only; its literals are typed like WHERE's.
+
+statement error
+SELECT i16 FROM edge GROUP BY i16 HAVING i32 > 1
+
+statement error
+SELECT COUNT(*) FROM edge HAVING id > 1
+
+statement error
+SELECT id FROM edge HAVING id > 1
+
+statement error
+SELECT COUNT(*) FROM edge GROUP BY i16 HAVING nope > 1
+
+statement error
+SELECT COUNT(*) FROM edge GROUP BY i16 HAVING COUNT(*) > 'x'
+
+statement error
+SELECT COUNT(*) FROM edge GROUP BY i16 HAVING COUNT(*) LIKE 'x'
+
+statement error
+SELECT COUNT(*) FROM edge GROUP BY i16 HAVING SUM(u) > 1
+
+onlyif antb1
+statement error ^bind: column 'i32' must appear in the GROUP BY clause or be inside an aggregate function$
+SELECT i16 FROM edge GROUP BY i16 HAVING i32 > 1
+
+onlyif antb1
+statement error ^bind: cannot compare BIGINT column 'count_star\(\)' with a string
+SELECT COUNT(*) FROM edge GROUP BY i16 HAVING COUNT(*) > 'x'

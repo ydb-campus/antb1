@@ -176,13 +176,13 @@ antb1_add_cli_golden(
   unsupported
   EXIT_CODE 4
   STDERR
-  ARGS query -c "SELECT CounterID, COUNT(*) FROM t GROUP BY CounterID HAVING COUNT(*) > 1" --table "${_t}"
+  ARGS query -c "SELECT CounterID, COUNT(*) FROM t JOIN u USING (CounterID) GROUP BY CounterID" --table "${_t}"
 )
 antb1_add_cli_golden(
   unsupported_json
   EXIT_CODE 4
   STDERR
-  ARGS query -c "SELECT SUM(AdvEngineID) FROM t HAVING SUM(AdvEngineID) > 0" --table "${_t}" --format json
+  ARGS query -c "SELECT SUM(AdvEngineID) FROM t JOIN u USING (AdvEngineID)" --table "${_t}" --format json
 )
 antb1_add_cli_golden(
   unsupported_explain

@@ -264,7 +264,7 @@ arrow::Result<Predicate> BindLike(const sql::Comparison& cmp, const BoundColumn&
 }
 
 arrow::Result<Predicate> BindEquality(const sql::Comparison& cmp, const BoundColumn& column,
-                                      const Table& table, bool as_double = false);
+                                      bool stored_as_float, bool as_double = false);
 
 // `column [NOT] IN (v1, ...)`: each value is bound as `column = v` (the same typing and exact
 // folding); a value no column value can equal is dropped. With no value left, IN is FALSE and
@@ -273,7 +273,7 @@ arrow::Result<Predicate> BindEquality(const sql::Comparison& cmp, const BoundCol
 // each value is then bound as that DOUBLE would be (integer columns: the nearest double, folded
 // exactly, as divergence D7; a FLOAT column: no FLOAT literals).
 arrow::Result<Predicate> BindIn(const sql::Comparison& cmp, const BoundColumn& column,
-                                const Table& table) {
+                                bool stored_as_float) {
   const bool negated = cmp.op == sql::CompareOp::kNotIn;
   Predicate p{.kind = negated ? Predicate::Kind::kNotIn : Predicate::Kind::kIn,
               .column = column,
@@ -292,7 +292,8 @@ arrow::Result<Predicate> BindIn(const sql::Comparison& cmp, const BoundColumn& c
                                 .literal = value,
                                 .list = {},
                                 .span = cmp.span};
-    ARROW_ASSIGN_OR_RAISE(const Predicate one, BindEquality(equal, column, table, as_double));
+    ARROW_ASSIGN_OR_RAISE(const Predicate one,
+                          BindEquality(equal, column, stored_as_float, as_double));
     if (one.kind == Predicate::Kind::kCompare) {
       p.values.push_back(one.constant);
     }
@@ -306,22 +307,24 @@ arrow::Result<Predicate> BindIn(const sql::Comparison& cmp, const BoundColumn& c
   return p;
 }
 
+// `stored_as_float`: the column holds FLOAT values (widened to DOUBLE), which DuckDB compares in
+// FLOAT.
 arrow::Result<Predicate> BindComparison(const sql::Comparison& cmp, const BoundColumn& column,
-                                        const Table& table) {
+                                        bool stored_as_float) {
   if (cmp.op == sql::CompareOp::kLike || cmp.op == sql::CompareOp::kNotLike) {
     return BindLike(cmp, column);
   }
   if (cmp.op == sql::CompareOp::kIn || cmp.op == sql::CompareOp::kNotIn) {
-    return BindIn(cmp, column, table);
+    return BindIn(cmp, column, stored_as_float);
   }
-  return BindEquality(cmp, column, table);
+  return BindEquality(cmp, column, stored_as_float);
 }
 
 // `column <op> literal`, with the literal folded exactly into the column's type. `as_double`: a
 // number is read as DuckDB reads a DOUBLE-typed one, even when it is not written that way (an IN
 // list with such a number).
 arrow::Result<Predicate> BindEquality(const sql::Comparison& cmp, const BoundColumn& column,
-                                      const Table& table, bool as_double) {
+                                      bool stored_as_float, bool as_double) {
   const sql::Literal& lit = cmp.literal;
   const auto mismatch = [&](std::string_view hint) {
     return BindError(std::format("cannot compare {} column '{}' with {}; {}", ToString(column.type),
@@ -377,7 +380,7 @@ arrow::Result<Predicate> BindEquality(const sql::Comparison& cmp, const BoundCol
       // A FLOAT column: DuckDB casts an integer or DECIMAL literal to FLOAT and compares in FLOAT.
       // Widening that float to double is exact and keeps the order, so comparing the widened
       // column with it gives DuckDB's answer.
-      if (!as_double && table.StoredAsFloat(column.index)) {
+      if (!as_double && stored_as_float) {
         if (const auto f = DuckDbFloatOf(lit.text, lit.negative)) {
           p.constant.value = static_cast<double>(*f);
         }
@@ -421,7 +424,8 @@ struct SelectList {
   SourceSpan span;
 };
 
-// An ORDER BY aggregate makes the query aggregate, like one in the select list (DuckDB).
+// An ORDER BY aggregate makes the query aggregate, like one in the select list (DuckDB); so does
+// HAVING (checked by the callers).
 bool OrdersByAggregate(const sql::SelectStatement& stmt) {
   return std::ranges::any_of(stmt.order_by, [](const sql::OrderItem& item) {
     return std::holds_alternative<sql::AggregateCall>(item.expr);
@@ -495,7 +499,8 @@ arrow::Result<SelectList> BindSelectList(const sql::SelectStatement& stmt,
       list.aliases.emplace_back();
       list.columns.push_back(std::move(column));
     }
-    if (stmt.group_by.empty() && OrdersByAggregate(stmt) && !list.columns.empty()) {
+    if (stmt.group_by.empty() && (OrdersByAggregate(stmt) || !stmt.having.empty()) &&
+        !list.columns.empty()) {
       return BindError(std::format("column '{}' must be inside an aggregate function: a query "
                                    "with aggregates cannot also select plain columns (there is "
                                    "no GROUP BY)",
@@ -540,7 +545,8 @@ arrow::Result<SelectList> BindSelectList(const sql::SelectStatement& stmt,
       first_column = &ref;
     }
   }
-  if (stmt.group_by.empty() && (!list.aggregates.empty() || OrdersByAggregate(stmt)) &&
+  if (stmt.group_by.empty() &&
+      (!list.aggregates.empty() || OrdersByAggregate(stmt) || !stmt.having.empty()) &&
       first_column != nullptr) {
     return BindError(std::format("column '{}' must be inside an aggregate function: a query with "
                                  "aggregates cannot also select plain columns (there is no "
@@ -787,6 +793,103 @@ arrow::Result<std::vector<SortKey>> BindOrderBy(const sql::SelectStatement& stmt
   return sort_keys;
 }
 
+// HAVING conditions as predicates over the node below the Filter: the GroupAggregate's keys and
+// then its aggregates (kGrouped), or the Aggregate's aggregates (kGlobal). An aggregate call not in
+// the select list is added to `aggregates` (a hidden aggregate). A column is a GROUP BY key if the
+// table column is one, else the last select item with that alias (DuckDB): a key or an aggregate.
+arrow::Result<std::vector<Predicate>> BindHaving(const sql::SelectStatement& stmt,
+                                                 const Columns& columns, const Table& table,
+                                                 const SelectList& select,
+                                                 const std::vector<BoundColumn>& keys,
+                                                 std::vector<AggregateCall>& aggregates) {
+  struct Operand {
+    BoundColumn column;
+    bool stored_as_float = false;
+  };
+  const auto aggregate_operand = [&](std::size_t index, std::string name) {
+    const AggregateCall& call = aggregates[index];
+    // DuckDB's MIN and MAX of a FLOAT column are FLOAT; the other aggregates are not.
+    const bool is_float = (call.kind == AggKind::kMin || call.kind == AggKind::kMax) &&
+                          call.arg.has_value() && table.StoredAsFloat(call.arg->index);
+    return Operand{.column = BoundColumn{.index = Narrow<int>(keys.size() + index),
+                                         .name = std::move(name),
+                                         .type = call.type},
+                   .stored_as_float = is_float};
+  };
+  const auto key_operand = [&](const BoundColumn& column) -> std::optional<Operand> {
+    const auto key =
+        std::ranges::find_if(keys, [&](const BoundColumn& k) { return k.index == column.index; });
+    if (key == keys.end()) {
+      return std::nullopt;
+    }
+    return Operand{.column = BoundColumn{.index = Narrow<int>(key - keys.begin()),
+                                         .name = column.name,
+                                         .type = column.type},
+                   .stored_as_float = table.StoredAsFloat(column.index)};
+  };
+  const auto not_grouped = [](std::string_view name, SourceSpan span) {
+    return BindError(std::format("column '{}' must appear in the GROUP BY clause or be inside an "
+                                 "aggregate function",
+                                 name),
+                     span);
+  };
+  const auto resolve = [&](const sql::HavingOperand& operand) -> arrow::Result<Operand> {
+    if (const auto* call = std::get_if<sql::AggregateCall>(&operand)) {
+      ARROW_ASSIGN_OR_RAISE(AggregateCall bound, BindAggregate(*call, columns));
+      const auto same = std::ranges::find_if(
+          aggregates, [&](const AggregateCall& a) { return SameCall(a, bound); });
+      const auto index = Narrow<std::size_t>(same - aggregates.begin());
+      if (same == aggregates.end()) {
+        aggregates.push_back(std::move(bound));  // a hidden aggregate
+      }
+      return aggregate_operand(index, ResultName(*call));
+    }
+    const auto& ref = std::get<sql::ColumnRef>(operand);
+    auto table_column = columns.Resolve(ref);
+    if (table_column.ok()) {
+      if (auto key = key_operand(*table_column)) {
+        return *std::move(key);
+      }
+    }
+    if (const auto alias = FindAlias(select, ref.name)) {
+      const auto [kind, index] = select.items[*alias];
+      switch (kind) {
+        case ItemKind::kAggregate:
+          return aggregate_operand(index, select.output[*alias].name);
+        case ItemKind::kConstant:
+          return UnsupportedError("HAVING on a constant select item is not supported", ref.span);
+        case ItemKind::kColumn:
+          if (auto key = key_operand(select.columns[index])) {
+            return *std::move(key);
+          }
+          return not_grouped(select.column_written[index], ref.span);
+      }
+    }
+    if (!table_column.ok()) {
+      return table_column.status();
+    }
+    return not_grouped(ref.name, ref.span);
+  };
+  std::vector<Predicate> predicates;
+  for (const sql::HavingComparison& condition : stmt.having) {
+    ARROW_ASSIGN_OR_RAISE(const Operand operand, resolve(condition.operand));
+    // The comparison binders read the operand's span from a column reference.
+    const SourceSpan operand_span =
+        std::visit([](const auto& node) { return node.span; }, condition.operand);
+    const sql::Comparison cmp{
+        .column =
+            sql::ColumnRef{.name = operand.column.name, .quoted = false, .span = operand_span},
+        .op = condition.op,
+        .literal = condition.literal,
+        .list = condition.list,
+        .span = condition.span};
+    ARROW_ASSIGN_OR_RAISE(Predicate predicate,
+                          BindComparison(cmp, operand.column, operand.stored_as_float));
+    predicates.push_back(std::move(predicate));
+  }
+  return predicates;
+}
+
 }  // namespace
 
 arrow::Result<LogicalPlan> Bind(const sql::SelectStatement& stmt, const Catalog& catalog) {
@@ -798,7 +901,8 @@ arrow::Result<LogicalPlan> Bind(const sql::SelectStatement& stmt, const Catalog&
   std::vector<Predicate> predicates;
   for (const sql::Comparison& cmp : stmt.where) {
     ARROW_ASSIGN_OR_RAISE(BoundColumn column, columns.Resolve(cmp.column));
-    ARROW_ASSIGN_OR_RAISE(Predicate predicate, BindComparison(cmp, column, *table));
+    ARROW_ASSIGN_OR_RAISE(Predicate predicate,
+                          BindComparison(cmp, column, table->StoredAsFloat(column.index)));
     predicates.push_back(std::move(predicate));
   }
   std::vector<BoundColumn> keys;
@@ -815,9 +919,12 @@ arrow::Result<LogicalPlan> Bind(const sql::SelectStatement& stmt, const Catalog&
   Shape shape = Shape::kGlobal;
   if (!stmt.group_by.empty()) {
     shape = Shape::kGrouped;
-  } else if (select.aggregates.empty() && !OrdersByAggregate(stmt)) {
-    shape = Shape::kProjection;  // an ORDER BY aggregate makes one row, even of constants only
+  } else if (select.aggregates.empty() && !OrdersByAggregate(stmt) && stmt.having.empty()) {
+    shape = Shape::kProjection;  // an ORDER BY aggregate or HAVING makes one row, even of constants
   }
+  const std::size_t select_aggregates = select.aggregates.size();
+  ARROW_ASSIGN_OR_RAISE(std::vector<Predicate> having,
+                        BindHaving(stmt, columns, *table, select, keys, select.aggregates));
   ARROW_ASSIGN_OR_RAISE(std::vector<SortKey> sort_keys,
                         BindOrderBy(stmt, columns, select, shape, keys, select.aggregates));
 
@@ -831,6 +938,13 @@ arrow::Result<LogicalPlan> Bind(const sql::SelectStatement& stmt, const Catalog&
                            .predicates = std::move(predicates),
                            .span = Cover(stmt.where.front().span, stmt.where.back().span)});
   }
+  const auto filter_having = [&] {
+    if (!having.empty()) {
+      node = Make(FilterNode{.input = std::move(node),
+                             .predicates = std::move(having),
+                             .span = Cover(stmt.having.front().span, stmt.having.back().span)});
+    }
+  };
   const auto sort = [&] {
     if (!sort_keys.empty()) {
       node = Make(SortNode{
@@ -867,14 +981,15 @@ arrow::Result<LogicalPlan> Bind(const sql::SelectStatement& stmt, const Catalog&
   };
   switch (shape) {
     case Shape::kGrouped: {
-      // GroupAggregate outputs the keys, then the aggregates (hidden ORDER BY ones last); a Project
-      // restores the select order.
+      // GroupAggregate outputs the keys, then the aggregates (hidden HAVING and ORDER BY ones
+      // last); a Project restores the select order.
       const std::size_t key_count = keys.size();
       const std::vector<BoundColumn> key_columns = keys;
       node = Make(GroupAggregateNode{.input = std::move(node),
                                      .keys = std::move(keys),
                                      .aggregates = std::move(select.aggregates),
                                      .span = stmt.group_by_span});
+      filter_having();
       sort();
       project(
           [&](const BoundColumn& column) {
@@ -889,14 +1004,17 @@ arrow::Result<LogicalPlan> Bind(const sql::SelectStatement& stmt, const Catalog&
       sort();
       project([](const BoundColumn& column) { return column.index; }, 0);
       break;
-    case Shape::kGlobal:
+    case Shape::kGlobal: {
+      const bool hidden = select.aggregates.size() > select_aggregates;
       node = Make(AggregateNode{.input = std::move(node),
                                 .aggregates = std::move(select.aggregates),
                                 .span = select.span});
-      if (!select.constants.empty()) {
+      filter_having();
+      if (!select.constants.empty() || hidden) {
         project([](const BoundColumn& column) { return column.index; }, 0);
       }
       break;
+    }
   }
   const int64_t offset = stmt.offset.value_or(0);
   if (stmt.limit.has_value() || offset > 0) {

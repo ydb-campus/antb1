@@ -254,6 +254,27 @@ Check AllEqual() { return EqualBlocks(slt::SortMode::kRowSort); }
 
 Check AllEqualInOrder() { return EqualBlocks(slt::SortMode::kNoSort); }
 
+Check FirstIsUnionOfRest() {
+  return [](std::span<const ResultSet> answers) -> std::optional<std::string> {
+    if (answers.empty()) {
+      return "no answers";
+    }
+    ResultSet rest = answers[0];
+    rest.rows.clear();
+    for (std::size_t i = 1; i < answers.size(); ++i) {
+      if (answers[i].classes != answers[0].classes) {
+        return std::format("answer {} has other column types than answer 0", i);
+      }
+      rest.rows.insert(rest.rows.end(), answers[i].rows.begin(), answers[i].rows.end());
+    }
+    const std::array<ResultSet, 2> pair = {answers[0], rest};
+    if (auto diff = AllEqual()(pair)) {
+      return std::format("answer 0 vs the rows of the others: {}", *diff);
+    }
+    return std::nullopt;
+  };
+}
+
 Check SecondIsWindowOfFirst(int64_t offset, int64_t limit) {
   return [offset, limit](std::span<const ResultSet> answers) -> std::optional<std::string> {
     if (answers.size() != 2) {
@@ -579,6 +600,47 @@ std::vector<Relation> AllRelations() {
             batch));
     }
     r.push_back(std::move(grouped));
+  }
+  // HAVING partitions the groups by a condition that is never NULL (on a count, or on a key that
+  // has no NULL) and its complement, and filters the same groups whatever the batch size and file
+  // layout.
+  {
+    const slt::FeatureSet having = {kGroupBy,        kHaving,         kCountStar, kSum,
+                                    kColumns,        kMultipleItems,  kAlias,     kIntegerColumns,
+                                    kIntegerLiteral, kDecimalLiteral, kTableName};
+    constexpr std::string_view kGroups =
+        "SELECT OS, COUNT(*) AS c, SUM(ResolutionWidth) FROM hits_like GROUP BY OS";
+    r.push_back({.name = "having_partitions_groups",
+                 .features = having,
+                 .probes = {Q(std::string(kGroups)), Q(std::format("{} HAVING c > 100", kGroups)),
+                            Q(std::format("{} HAVING COUNT(*) <= 100.5", kGroups))},
+                 .check = FirstIsUnionOfRest()});
+    r.push_back({.name = "having_key_partitions_groups",
+                 .features = having,
+                 .probes = {Q(std::string(kGroups)), Q(std::format("{} HAVING OS < 5", kGroups)),
+                            Q(std::format("{} HAVING 5 <= OS", kGroups))},
+                 .check = FirstIsUnionOfRest()});
+    slt::FeatureSet in = having;
+    in.Add(kIn);
+    r.push_back({.name = "having_in_partitions_groups",
+                 .features = in,
+                 .probes = {Q(std::string(kGroups)),
+                            Q(std::format("{} HAVING OS IN (0, 2, 99) AND c > 0", kGroups)),
+                            Q(std::format("{} HAVING OS NOT IN (0, 2, 99)", kGroups))},
+                 .check = FirstIsUnionOfRest()});
+    constexpr std::string_view kFiltered =
+        "SELECT RegionID, COUNT(*) AS c FROM {} WHERE OS < 30 GROUP BY RegionID "
+        "HAVING c >= 3 AND MAX(ResolutionWidth) > 1000";
+    Relation sizes{.name = "having_batch_size_invariance",
+                   .features = {kGroupBy, kHaving, kCountStar, kMax, kColumns, kMultipleItems,
+                                kAlias, kIntegerColumns, kWhere, kIntegerLiteral, kTableName},
+                   .probes = {},
+                   .check = AllEqual()};
+    for (const int64_t batch : kBatchSizes) {
+      sizes.probes.push_back(Q(std::format(kFiltered, "hits_like_split"), batch));
+    }
+    sizes.probes.push_back(Q(std::format(kFiltered, "hits_like")));
+    r.push_back(std::move(sizes));
   }
   // [NOT] IN partitions the non-NULL values of a column, and IN over distinct values counts the
   // rows equal to each.

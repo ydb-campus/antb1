@@ -62,6 +62,8 @@ enum class Feature : std::uint8_t {
   kOrderBy,     // ORDER BY columns, aliases or aggregates, [ASC | DESC]
   kNullsOrder,  // NULLS FIRST / NULLS LAST
   kOffset,      // OFFSET m (with or without LIMIT)
+  // HAVING
+  kHaving,  // HAVING aggregate/key <op> literal [AND ...] (comparisons, LIKE, IN)
   // Lexical variants
   kKeywordCase,       // keywords in lower or mixed case
   kIdentifierCase,    // table and column names in another case than declared
@@ -70,10 +72,10 @@ enum class Feature : std::uint8_t {
   kSemicolon,         // a trailing ';'
   // Out-of-scope marker: never in kSupportedFeatures and never generated. The harness self-tests
   // tag their "pending" canary query with it, so that path stays tested.
-  kHaving,  // HAVING (not supported)
+  kJoin,  // JOIN (not supported)
 };
 
-inline constexpr std::size_t kFeatureCount = static_cast<std::size_t>(Feature::kHaving) + 1;
+inline constexpr std::size_t kFeatureCount = static_cast<std::size_t>(Feature::kJoin) + 1;
 
 constexpr std::string_view FeatureName(Feature feature) {
   switch (feature) {
@@ -157,6 +159,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "offset";
     case Feature::kHaving:
       return "having";
+    case Feature::kJoin:
+      return "join";
   }
   return "?";
 }
@@ -220,8 +224,8 @@ class FeatureSet {
   std::uint64_t bits_ = 0;
 };
 
-// Out-of-scope markers: valid in `-- features:` tags, never generated (see Feature::kHaving).
-inline constexpr FeatureSet kNeverGenerated = {Feature::kHaving};
+// Out-of-scope markers: valid in `-- features:` tags, never generated (see Feature::kJoin).
+inline constexpr FeatureSet kNeverGenerated = {Feature::kJoin};
 
 // What antb1 answers today: the whole slice grammar of docs/sql-subset.md (global and grouped
 // aggregates, projections, WHERE conjunctions of column <op> literal, ORDER BY, LIMIT and OFFSET)
@@ -263,6 +267,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kOrderBy,
     Feature::kNullsOrder,
     Feature::kOffset,
+    Feature::kHaving,
     Feature::kKeywordCase,
     Feature::kIdentifierCase,
     Feature::kQuotedIdentifier,

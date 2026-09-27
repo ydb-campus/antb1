@@ -103,6 +103,25 @@ TEST(ExplainTest, Like) {
             "    Scan table=ok source=fake columns=[i16, s]\n");
 }
 
+// HAVING is a Filter over the aggregation, below the Sort; COUNT(*) without WHERE still becomes a
+// RowCount below it.
+TEST(ExplainTest, Having) {
+  EXPECT_EQ(
+      ExplainSql("SELECT s, COUNT(*) AS n FROM ok GROUP BY s HAVING n > 1 AND MIN(i16) IN (1, "
+                 "2) AND s LIKE 'a%' ORDER BY s LIMIT 5"),
+      "Output: s:VARCHAR n:BIGINT\n"
+      "Project s, n\n"
+      "  Limit 5\n"
+      "    Sort s ASC NULLS LAST\n"
+      "      Filter n > 1 AND \"min(i16)\" IN (1, 2) AND s LIKE 'a%'\n"
+      "        GroupAggregate keys=[s] COUNT(*), MIN(i16)\n"
+      "          Scan table=ok source=fake columns=[i16, s]\n");
+  EXPECT_EQ(ExplainSql("SELECT COUNT(*) FROM ok HAVING COUNT(*) > 1"),
+            "Output: count_star():BIGINT\n"
+            "Filter \"count_star()\" > 1\n"
+            "  RowCount table=ok source=fake\n");
+}
+
 TEST(ExplainTest, ConstantsAndPositions) {
   EXPECT_EQ(ExplainSql("SELECT 1, 'x', s, COUNT(*) FROM ok GROUP BY 1, 3 ORDER BY 4 DESC"),
             "Output: 1:INTEGER 'x':VARCHAR s:VARCHAR count_star():BIGINT\n"

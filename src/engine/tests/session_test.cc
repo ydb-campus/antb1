@@ -288,7 +288,7 @@ TEST_F(SessionTest, UnsupportedAndBindErrorsKeepTheirKinds) {
   auto session = Session::Make().ValueOrDie();
   ASSERT_TRUE(session->RegisterParquet("t", {path_}).ok());
   for (const char* sql :
-       {"SELECT COUNT(*) FROM t HAVING COUNT(*) > 0",
+       {"SELECT COUNT(*) FROM t JOIN u USING (AdvEngineID)",
         "SELECT AdvEngineID FROM t ORDER BY AdvEngineID + 1",
         "SELECT SUM(DISTINCT AdvEngineID) FROM t", "SELECT DISTINCT AdvEngineID FROM t"}) {
     auto result = session->Execute(sql);

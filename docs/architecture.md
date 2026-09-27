@@ -81,7 +81,8 @@ steps (all single-threaded):
    `plan::ToArrowStatus` into an `arrow::Status` that carries a `SqlErrorDetail`.
 4. Bind (`plan::Bind`): table names resolve case-insensitively in the catalog (or `FROM 'path'` opens a file),
    columns resolve against the table's schema, types are checked, and every `WHERE` literal is folded exactly into
-   its column's type ([Binding](sql-subset.md#binding)). The result is a `plan::LogicalPlan`: a tree of immutable
+   its column's type ([Binding](sql-subset.md#binding)); `HAVING` binds the same way against the aggregation's output
+   and becomes a `Filter` above it. The result is a `plan::LogicalPlan`: a tree of immutable
    nodes in a `std::variant` (`Scan`, `Filter`, `Project`, `Aggregate`, `GroupAggregate`, `Sort`, `Limit`,
    `RowCount`) plus the output columns.
 5. Optimize (`plan::Optimize`): `COUNT(*)` without `WHERE` to `RowCount`, `Limit` below `Project`, and projection

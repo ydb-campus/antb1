@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <string_view>
 #include <variant>
+#include <vector>
 
 namespace antb1::sql {
 namespace {
@@ -31,6 +32,28 @@ bool Eq(const SelectExpr& a, const SelectExpr& b) {
     return Eq(*lit, std::get<Literal>(b));
   }
   return Eq(std::get<ColumnRef>(a), std::get<ColumnRef>(b));
+}
+
+bool Eq(const HavingOperand& a, const HavingOperand& b) {
+  if (a.index() != b.index()) {
+    return false;
+  }
+  if (const auto* agg = std::get_if<AggregateCall>(&a)) {
+    return Eq(*agg, std::get<AggregateCall>(b));
+  }
+  return Eq(std::get<ColumnRef>(a), std::get<ColumnRef>(b));
+}
+
+bool Eq(const std::vector<Literal>& a, const std::vector<Literal>& b) {
+  if (a.size() != b.size()) {
+    return false;
+  }
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    if (!Eq(a[i], b[i])) {
+      return false;
+    }
+  }
+  return true;
 }
 
 bool Eq(const GroupExpr& a, const GroupExpr& b) {
@@ -102,13 +125,19 @@ std::string_view ToString(CompareOp op) {
 
 bool EqualIgnoringSpans(const SelectStatement& a, const SelectStatement& b) {
   if (a.star != b.star || a.items.size() != b.items.size() || a.where.size() != b.where.size() ||
-      a.group_by.size() != b.group_by.size() || a.order_by.size() != b.order_by.size() ||
-      a.limit != b.limit || a.offset != b.offset || a.from.kind != b.from.kind ||
-      a.from.name != b.from.name || a.from.quoted != b.from.quoted) {
+      a.group_by.size() != b.group_by.size() || a.having.size() != b.having.size() ||
+      a.order_by.size() != b.order_by.size() || a.limit != b.limit || a.offset != b.offset ||
+      a.from.kind != b.from.kind || a.from.name != b.from.name || a.from.quoted != b.from.quoted) {
     return false;
   }
   for (std::size_t i = 0; i < a.group_by.size(); ++i) {
     if (!Eq(a.group_by[i], b.group_by[i])) {
+      return false;
+    }
+  }
+  for (std::size_t i = 0; i < a.having.size(); ++i) {
+    if (!Eq(a.having[i].operand, b.having[i].operand) || a.having[i].op != b.having[i].op ||
+        !Eq(a.having[i].literal, b.having[i].literal) || !Eq(a.having[i].list, b.having[i].list)) {
       return false;
     }
   }
@@ -126,14 +155,8 @@ bool EqualIgnoringSpans(const SelectStatement& a, const SelectStatement& b) {
   }
   for (std::size_t i = 0; i < a.where.size(); ++i) {
     if (!Eq(a.where[i].column, b.where[i].column) || a.where[i].op != b.where[i].op ||
-        !Eq(a.where[i].literal, b.where[i].literal) ||
-        a.where[i].list.size() != b.where[i].list.size()) {
+        !Eq(a.where[i].literal, b.where[i].literal) || !Eq(a.where[i].list, b.where[i].list)) {
       return false;
-    }
-    for (std::size_t k = 0; k < a.where[i].list.size(); ++k) {
-      if (!Eq(a.where[i].list[k], b.where[i].list[k])) {
-        return false;
-      }
     }
   }
   return true;

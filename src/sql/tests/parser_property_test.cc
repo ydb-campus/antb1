@@ -132,6 +132,11 @@ void CheckTokensAccountedFor(const std::string& sql, const SelectStatement& stmt
   for (const OrderItem& item : stmt.order_by) {
     count_aggregate(item.expr);
   }
+  for (const HavingComparison& cmp : stmt.having) {
+    if (const auto* agg = std::get_if<AggregateCall>(&cmp.operand)) {
+      count_aggregate(*agg);
+    }
+  }
   const auto separators = [](std::size_t n) { return n == 0 ? 0U : n - 1; };
   std::size_t negatives = 0;
   std::size_t string_literals = stmt.from.kind == TableRef::Kind::kPath ? 1U : 0U;
@@ -145,17 +150,24 @@ void CheckTokensAccountedFor(const std::string& sql, const SelectStatement& stmt
   std::size_t likes = 0;  // LIKE and IN have no comparison token
   std::size_t in_lists = 0;
   std::size_t in_commas = 0;
-  for (const Comparison& cmp : stmt.where) {
-    likes += cmp.op == CompareOp::kLike || cmp.op == CompareOp::kNotLike ? 1U : 0U;
-    if (cmp.op == CompareOp::kIn || cmp.op == CompareOp::kNotIn) {
+  const auto count_condition = [&](CompareOp op, const Literal& literal,
+                                   const std::vector<Literal>& list) {
+    likes += op == CompareOp::kLike || op == CompareOp::kNotLike ? 1U : 0U;
+    if (op == CompareOp::kIn || op == CompareOp::kNotIn) {
       ++in_lists;
-      in_commas += separators(cmp.list.size());
-      for (const Literal& lit : cmp.list) {
+      in_commas += separators(list.size());
+      for (const Literal& lit : list) {
         count_literal(lit);
       }
     } else {
-      count_literal(cmp.literal);
+      count_literal(literal);
     }
+  };
+  for (const Comparison& cmp : stmt.where) {
+    count_condition(cmp.op, cmp.literal, cmp.list);
+  }
+  for (const HavingComparison& cmp : stmt.having) {
+    count_condition(cmp.op, cmp.literal, cmp.list);
   }
   for (const SelectItem& item : stmt.items) {
     if (const auto* lit = std::get_if<Literal>(&item.expr)) {
@@ -176,8 +188,8 @@ void CheckTokensAccountedFor(const std::string& sql, const SelectStatement& stmt
   EXPECT_EQ(commas, separators(stmt.items.size()) + separators(stmt.group_by.size()) +
                         separators(stmt.order_by.size()) + in_commas)
       << context;
-  EXPECT_EQ(and_count, stmt.where.empty() ? 0U : stmt.where.size() - 1) << context;
-  EXPECT_EQ(comparisons, stmt.where.size() - likes - in_lists) << context;
+  EXPECT_EQ(and_count, separators(stmt.where.size()) + separators(stmt.having.size())) << context;
+  EXPECT_EQ(comparisons, stmt.where.size() + stmt.having.size() - likes - in_lists) << context;
   EXPECT_EQ(left_parens, aggregates + in_lists) << context;
   EXPECT_EQ(right_parens, aggregates + in_lists) << context;
   EXPECT_EQ(stars, (stmt.star ? 1U : 0U) + count_stars) << context;
@@ -220,10 +232,15 @@ void CheckParse(const std::string& sql) {
     const auto* column = std::get_if<ColumnRef>(&expr);
     ASSERT_TRUE(SpanInside(column != nullptr ? column->span : std::get<Literal>(expr).span, sql));
   }
+  for (const HavingComparison& cmp : stmt.having) {
+    ASSERT_TRUE(SpanInside(cmp.span, sql));
+    ASSERT_TRUE(SpanInside(cmp.literal.span, sql));
+  }
   for (const OrderItem& item : stmt.order_by) {
     ASSERT_TRUE(SpanInside(item.span, sql));
   }
   ASSERT_TRUE(SpanInside(stmt.group_by_span, sql));
+  ASSERT_TRUE(SpanInside(stmt.having_span, sql));
   ASSERT_TRUE(SpanInside(stmt.order_by_span, sql));
   ASSERT_TRUE(SpanInside(stmt.offset_span, sql));
   ASSERT_NO_FATAL_FAILURE(CheckTokensAccountedFor(sql, stmt));
@@ -641,6 +658,19 @@ SelectStatement RandomStatement(Rng& rng) {
       stmt.group_by.emplace_back(RandomColumn(rng));
     }
   }
+  if (rng.Percent(25)) {
+    const std::size_t conditions = 1 + rng.Below(3);
+    for (std::size_t i = 0; i < conditions; ++i) {
+      SelectExpr operand = random_expr();
+      HavingComparison cmp{.op = rng.Pick(kOps), .literal = RandomLiteral(rng)};
+      if (auto* agg = std::get_if<AggregateCall>(&operand)) {
+        cmp.operand = std::move(*agg);
+      } else {
+        cmp.operand = std::get<ColumnRef>(std::move(operand));
+      }
+      stmt.having.push_back(std::move(cmp));
+    }
+  }
   if (rng.Percent(35)) {
     const std::size_t items = 1 + rng.Below(3);
     for (std::size_t i = 0; i < items; ++i) {
@@ -675,6 +705,7 @@ std::string LiteralFirstSql(const SelectStatement& stmt) {
   SelectStatement head = stmt;
   head.where.clear();
   head.group_by.clear();
+  head.having.clear();
   head.order_by.clear();
   head.limit.reset();
   head.offset.reset();
@@ -730,6 +761,7 @@ std::string LiteralFirstSql(const SelectStatement& stmt) {
   tail.star = true;
   tail.from = TableRef{.kind = TableRef::Kind::kName, .name = "t"};
   tail.group_by = stmt.group_by;
+  tail.having = stmt.having;
   tail.order_by = stmt.order_by;
   tail.limit = stmt.limit;
   tail.offset = stmt.offset;
