@@ -1,13 +1,16 @@
 #include "antb1/exec/sort.h"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -61,28 +64,168 @@ int CompareBinary(const arrow::Array& a, int64_t i, const arrow::Array& b, int64
   return static_cast<int>(c > 0) - static_cast<int>(c < 0);
 }
 
-using CompareFn = int (*)(const arrow::Array&, int64_t, const arrow::Array&, int64_t);
+// ---- order-preserving 64-bit prefixes (ascending) ----
 
-std::optional<CompareFn> CompareFor(plan::LogicalType type) {
+template <class ArrayType>
+std::uint64_t SignedPrefix(const arrow::Array& a, int64_t i) {
+  const auto v = static_cast<int64_t>(static_cast<const ArrayType&>(a).Value(i));
+  return static_cast<std::uint64_t>(v) ^ (std::uint64_t{1} << 63U);
+}
+
+std::uint64_t UInt16Prefix(const arrow::Array& a, int64_t i) {
+  return static_cast<const arrow::UInt16Array&>(a).Value(i);
+}
+
+// NaN above every number (and every NaN equal), -0.0 equal to 0.0.
+std::uint64_t DoublePrefix(const arrow::Array& a, int64_t i) {
+  double v = static_cast<const arrow::DoubleArray&>(a).Value(i);
+  if (std::isnan(v)) {
+    return std::numeric_limits<std::uint64_t>::max();
+  }
+  if (v == 0.0) {
+    v = 0.0;
+  }
+  const auto bits = std::bit_cast<std::uint64_t>(v);
+  constexpr std::uint64_t kSign = std::uint64_t{1} << 63U;
+  return (bits & kSign) != 0 ? ~bits : bits | kSign;
+}
+
+// The high 64 bits, as a signed number: not exact.
+std::uint64_t DecimalPrefix(const arrow::Array& a, int64_t i) {
+  const arrow::Decimal128 v(static_cast<const arrow::Decimal128Array&>(a).GetValue(i));
+  return static_cast<std::uint64_t>(v.high_bits()) ^ (std::uint64_t{1} << 63U);
+}
+
+// The first 8 bytes, big-endian, zero-padded: never larger for a smaller string. Not exact.
+std::uint64_t BinaryPrefix(const arrow::Array& a, int64_t i) {
+  const std::string_view v = static_cast<const arrow::BinaryArray&>(a).GetView(i);
+  std::uint64_t bits = 0;
+  for (std::size_t k = 0; k < 8; ++k) {
+    bits = (bits << 8U) | (k < v.size() ? static_cast<unsigned char>(v[k]) : 0U);
+  }
+  return bits;
+}
+
+using CompareFn = int (*)(const arrow::Array&, int64_t, const arrow::Array&, int64_t);
+using PrefixFn = std::uint64_t (*)(const arrow::Array&, int64_t);
+
+struct TypeOrder {
+  CompareFn compare = nullptr;
+  PrefixFn prefix = nullptr;
+  bool exact = false;  // the prefix is the whole value
+};
+
+std::optional<TypeOrder> OrderFor(plan::LogicalType type) {
   switch (type) {
     case plan::LogicalType::kSmallInt:
-      return &ComparePrimitive<arrow::Int16Array>;
+      return TypeOrder{.compare = &ComparePrimitive<arrow::Int16Array>,
+                       .prefix = &SignedPrefix<arrow::Int16Array>,
+                       .exact = true};
     case plan::LogicalType::kInteger:
-      return &ComparePrimitive<arrow::Int32Array>;
+      return TypeOrder{.compare = &ComparePrimitive<arrow::Int32Array>,
+                       .prefix = &SignedPrefix<arrow::Int32Array>,
+                       .exact = true};
     case plan::LogicalType::kBigInt:
-      return &ComparePrimitive<arrow::Int64Array>;
+      return TypeOrder{.compare = &ComparePrimitive<arrow::Int64Array>,
+                       .prefix = &SignedPrefix<arrow::Int64Array>,
+                       .exact = true};
     case plan::LogicalType::kUSmallInt:
-      return &ComparePrimitive<arrow::UInt16Array>;
+      return TypeOrder{
+          .compare = &ComparePrimitive<arrow::UInt16Array>, .prefix = &UInt16Prefix, .exact = true};
     case plan::LogicalType::kDate:
-      return &ComparePrimitive<arrow::Date32Array>;
+      return TypeOrder{.compare = &ComparePrimitive<arrow::Date32Array>,
+                       .prefix = &SignedPrefix<arrow::Date32Array>,
+                       .exact = true};
     case plan::LogicalType::kHugeInt:
-      return &CompareDecimal;
+      return TypeOrder{.compare = &CompareDecimal, .prefix = &DecimalPrefix, .exact = false};
     case plan::LogicalType::kDouble:
-      return &CompareDouble;
+      return TypeOrder{.compare = &CompareDouble, .prefix = &DoublePrefix, .exact = true};
     case plan::LogicalType::kVarchar:
-      return &CompareBinary;
+      return TypeOrder{.compare = &CompareBinary, .prefix = &BinaryPrefix, .exact = false};
   }
   return std::nullopt;
+}
+
+// ---- gathering the rows of several chunks into one array ----
+
+// The rows `refs` of `arrays` (one array per chunk), appended to a builder of their type.
+template <class ArrayType, class BuilderType>
+arrow::Status GatherTyped(const std::vector<const arrow::Array*>& arrays,
+                          std::span<const SortBuffer::RowRef> refs, arrow::ArrayBuilder& out) {
+  auto& builder = static_cast<BuilderType&>(out);
+  ARROW_RETURN_NOT_OK(builder.Reserve(static_cast<int64_t>(refs.size())));
+  if constexpr (std::is_same_v<ArrayType, arrow::BinaryArray>) {
+    int64_t bytes = 0;
+    for (const auto& ref : refs) {
+      bytes += static_cast<const ArrayType&>(*arrays[ref.chunk]).value_length(ref.row);
+    }
+    ARROW_RETURN_NOT_OK(builder.ReserveData(bytes));
+  }
+  for (const auto& ref : refs) {
+    const auto& array = static_cast<const ArrayType&>(*arrays[ref.chunk]);
+    if (array.IsNull(ref.row)) {
+      builder.UnsafeAppendNull();
+    } else if constexpr (std::is_same_v<ArrayType, arrow::BinaryArray>) {
+      builder.UnsafeAppend(array.GetView(ref.row));
+    } else if constexpr (std::is_same_v<ArrayType, arrow::Decimal128Array>) {
+      builder.UnsafeAppend(arrow::Decimal128(array.GetValue(ref.row)));
+    } else {
+      builder.UnsafeAppend(array.Value(ref.row));
+    }
+  }
+  return arrow::Status::OK();
+}
+
+// Any other type: one slice per run of consecutive rows of a chunk.
+arrow::Status GatherSlices(const std::vector<std::shared_ptr<arrow::RecordBatch>>& chunks,
+                           int column, std::span<const SortBuffer::RowRef> refs,
+                           arrow::ArrayBuilder& builder) {
+  ARROW_RETURN_NOT_OK(builder.Reserve(static_cast<int64_t>(refs.size())));
+  std::vector<std::optional<arrow::ArraySpan>> spans(chunks.size());
+  for (std::size_t i = 0; i < refs.size();) {
+    const auto first = refs[i];
+    std::size_t length = 1;
+    while (i + length < refs.size() && refs[i + length].chunk == first.chunk &&
+           refs[i + length].row == first.row + length) {
+      ++length;
+    }
+    auto& span = spans[first.chunk];
+    if (!span.has_value()) {
+      span.emplace(*chunks[first.chunk]->column_data(column));
+    }
+    ARROW_RETURN_NOT_OK(builder.AppendArraySlice(*span, first.row, static_cast<int64_t>(length)));
+    i += length;
+  }
+  return arrow::Status::OK();
+}
+
+arrow::Status Gather(const std::vector<std::shared_ptr<arrow::RecordBatch>>& chunks, int column,
+                     std::span<const SortBuffer::RowRef> refs, arrow::ArrayBuilder& builder) {
+  std::vector<const arrow::Array*> arrays;
+  arrays.reserve(chunks.size());
+  for (const auto& chunk : chunks) {
+    arrays.push_back(chunk->column(column).get());
+  }
+  switch (builder.type()->id()) {
+    case arrow::Type::INT16:
+      return GatherTyped<arrow::Int16Array, arrow::Int16Builder>(arrays, refs, builder);
+    case arrow::Type::INT32:
+      return GatherTyped<arrow::Int32Array, arrow::Int32Builder>(arrays, refs, builder);
+    case arrow::Type::INT64:
+      return GatherTyped<arrow::Int64Array, arrow::Int64Builder>(arrays, refs, builder);
+    case arrow::Type::UINT16:
+      return GatherTyped<arrow::UInt16Array, arrow::UInt16Builder>(arrays, refs, builder);
+    case arrow::Type::DATE32:
+      return GatherTyped<arrow::Date32Array, arrow::Date32Builder>(arrays, refs, builder);
+    case arrow::Type::DOUBLE:
+      return GatherTyped<arrow::DoubleArray, arrow::DoubleBuilder>(arrays, refs, builder);
+    case arrow::Type::DECIMAL128:
+      return GatherTyped<arrow::Decimal128Array, arrow::Decimal128Builder>(arrays, refs, builder);
+    case arrow::Type::BINARY:
+      return GatherTyped<arrow::BinaryArray, arrow::BinaryBuilder>(arrays, refs, builder);
+    default:
+      return GatherSlices(chunks, column, refs, builder);
+  }
 }
 
 // a + b, saturated at INT64_MAX (both non-negative).
@@ -107,14 +250,16 @@ arrow::Result<RowComparator> RowComparator::Make(std::shared_ptr<arrow::Schema> 
     if (column < 0 || column >= schema->num_fields()) {
       return arrow::Status::Invalid("sort key outside its input");
     }
-    const auto compare = CompareFor(key.column.type);
-    if (!compare.has_value() ||
+    const auto order = OrderFor(key.column.type);
+    if (!order.has_value() ||
         !schema->field(column)->type()->Equals(plan::ToArrow(key.column.type))) {
       return arrow::Status::Invalid("sort key of type ", schema->field(column)->type()->ToString(),
                                     " declared as ", plan::ToString(key.column.type));
     }
     bound.push_back(Key{.column = column,
-                        .compare = *compare,
+                        .compare = order->compare,
+                        .prefix = order->prefix,
+                        .exact = order->exact,
                         .descending = key.descending,
                         .nulls_first = key.nulls_first});
   }
@@ -130,8 +275,9 @@ RowComparator::KeyArrays RowComparator::KeysOf(const arrow::RecordBatch& batch) 
   return arrays;
 }
 
-int RowComparator::Compare(const KeyArrays& a, int64_t i, const KeyArrays& b, int64_t j) const {
-  for (std::size_t k = 0; k < keys_.size(); ++k) {
+int RowComparator::Compare(const KeyArrays& a, int64_t i, const KeyArrays& b, int64_t j,
+                           std::size_t first_key) const {
+  for (std::size_t k = first_key; k < keys_.size(); ++k) {
     const Key& key = keys_[k];
     const bool a_null = a[k]->IsNull(i);
     const bool b_null = b[k]->IsNull(j);
@@ -147,6 +293,15 @@ int RowComparator::Compare(const KeyArrays& a, int64_t i, const KeyArrays& b, in
     }
   }
   return 0;
+}
+
+RowComparator::Prefix RowComparator::PrefixOf(const KeyArrays& keys, int64_t row) const {
+  const Key& key = keys_.front();
+  if (keys.front()->IsNull(row)) {
+    return Prefix{.bits = 0, .group = static_cast<std::uint8_t>(key.nulls_first ? 0 : 2)};
+  }
+  const std::uint64_t bits = key.prefix(*keys.front(), row);
+  return Prefix{.bits = key.descending ? ~bits : bits, .group = 1};
 }
 
 // ---- SortBuffer ----
@@ -227,16 +382,44 @@ arrow::Status SortBuffer::Sort(arrow::MemoryPool* pool) {
   if (keep_.has_value()) {
     return Compact(pool);
   }
-  order_.clear();
-  order_.reserve(Narrow<std::size_t>(rows_));
+  // Rows with the prefix of their first key: most comparisons are two integer compares, and the
+  // full comparison runs only for equal prefixes.
+  struct Entry {
+    std::uint64_t bits;
+    RowRef ref;
+    std::uint8_t group;
+  };
+  std::vector<Entry> entries;
+  entries.reserve(Narrow<std::size_t>(rows_));
   for (std::size_t c = 0; c < chunks_.size(); ++c) {
     for (int64_t r = 0; r < chunks_[c]->num_rows(); ++r) {
-      order_.push_back(RowRef{.chunk = Narrow<std::uint32_t>(c), .row = Narrow<std::uint32_t>(r)});
+      const RowComparator::Prefix prefix = comparator_.PrefixOf(chunk_keys_[c], r);
+      entries.push_back(
+          Entry{.bits = prefix.bits,
+                .ref = RowRef{.chunk = Narrow<std::uint32_t>(c), .row = Narrow<std::uint32_t>(r)},
+                .group = prefix.group});
     }
   }
-  std::ranges::stable_sort(order_, [this](const RowRef& a, const RowRef& b) {
-    return comparator_.Compare(chunk_keys_[a.chunk], a.row, chunk_keys_[b.chunk], b.row) < 0;
+  const std::size_t tie_key = comparator_.prefix_is_exact() ? 1 : 0;
+  std::ranges::stable_sort(entries, [this, tie_key](const Entry& a, const Entry& b) {
+    if (a.group != b.group) {
+      return a.group < b.group;
+    }
+    if (a.group != 1) {  // both NULL: the first key ties
+      return comparator_.Compare(chunk_keys_[a.ref.chunk], a.ref.row, chunk_keys_[b.ref.chunk],
+                                 b.ref.row, 1) < 0;
+    }
+    if (a.bits != b.bits) {
+      return a.bits < b.bits;
+    }
+    return comparator_.Compare(chunk_keys_[a.ref.chunk], a.ref.row, chunk_keys_[b.ref.chunk],
+                               b.ref.row, tie_key) < 0;
   });
+  order_.clear();
+  order_.reserve(entries.size());
+  for (const Entry& entry : entries) {
+    order_.push_back(entry.ref);
+  }
   sorted_ = true;
   return arrow::Status::OK();
 }
@@ -281,26 +464,10 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> SortBuffer::Slice(
   columns.reserve(Narrow<std::size_t>(schema.num_fields()));
   for (int c = 0; c < schema.num_fields(); ++c) {
     ARROW_ASSIGN_OR_RAISE(auto builder, arrow::MakeBuilder(schema.field(c)->type(), pool));
-    ARROW_RETURN_NOT_OK(builder->Reserve(end - begin));
-    std::vector<std::optional<arrow::ArraySpan>> spans(chunks_.size());
-    // Runs of consecutive rows of one chunk are appended as one slice.
-    for (int64_t i = begin; i < end;) {
-      const RowRef first = order_[Narrow<std::size_t>(i)];
-      int64_t length = 1;
-      while (i + length < end) {
-        const RowRef next = order_[Narrow<std::size_t>(i + length)];
-        if (next.chunk != first.chunk || next.row != first.row + length) {
-          break;
-        }
-        ++length;
-      }
-      auto& span = spans[first.chunk];
-      if (!span.has_value()) {
-        span.emplace(*chunks_[first.chunk]->column_data(c));
-      }
-      ARROW_RETURN_NOT_OK(builder->AppendArraySlice(*span, first.row, length));
-      i += length;
-    }
+    ARROW_RETURN_NOT_OK(Gather(chunks_, c,
+                               std::span<const RowRef>(order_).subspan(
+                                   Narrow<std::size_t>(begin), Narrow<std::size_t>(end - begin)),
+                               *builder));
     ARROW_ASSIGN_OR_RAISE(auto column, builder->Finish());
     columns.push_back(std::move(column));
   }

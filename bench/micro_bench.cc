@@ -3,10 +3,12 @@
 // the numbers from main. Numbers never gate a PR. Inputs are synthetic (splitmix64), never
 // ClickBench data.
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -20,6 +22,8 @@
 #include <parquet/arrow/writer.h>
 
 #include "antb1/exec/aggregate_state.h"
+#include "antb1/exec/operator.h"
+#include "antb1/exec/sort.h"
 #include "antb1/io/parquet_table.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
@@ -229,6 +233,90 @@ void BM_ScanColumn(benchmark::State& state) {
   state.counters["rows"] = static_cast<double>(rows);
 }
 BENCHMARK(BM_ScanColumn);
+
+// A random BIGINT key and an 8 to 23 byte VARCHAR payload, kRows rows in 64Ki-row batches.
+const arrow::RecordBatchVector& SortInput() {
+  static const arrow::RecordBatchVector batches = [] {
+    arrow::RecordBatchVector out;
+    const auto schema =
+        arrow::schema({arrow::field("k", arrow::int64()), arrow::field("s", arrow::binary())});
+    uint64_t state = 64;
+    for (int64_t start = 0; start < kRows; start += kBatchSize) {
+      arrow::Int64Builder keys;
+      arrow::BinaryBuilder payload;
+      for (int64_t i = 0; i < kBatchSize; ++i) {
+        const uint64_t r = SplitMix64(state);
+        if (!keys.Append(static_cast<int64_t>(r)).ok() ||
+            !payload.Append(std::string(8 + (r % 16U), static_cast<char>('a' + (r % 26U)))).ok()) {
+          return arrow::RecordBatchVector{};
+        }
+      }
+      auto k = keys.Finish();
+      auto s = payload.Finish();
+      if (!k.ok() || !s.ok()) {
+        return arrow::RecordBatchVector{};
+      }
+      out.push_back(arrow::RecordBatch::Make(schema, kBatchSize, {*k, *s}));
+    }
+    return out;
+  }();
+  return batches;
+}
+
+// Emits prepared batches.
+class BatchSource final : public exec::Operator {
+ public:
+  explicit BatchSource(const arrow::RecordBatchVector& batches)
+      : batches_(batches), schema_(batches.front()->schema()) {}
+  [[nodiscard]] const std::shared_ptr<arrow::Schema>& output_schema() const override {
+    return schema_;
+  }
+  arrow::Status Open(exec::ExecContext& /*ctx*/) override {
+    next_ = 0;
+    return arrow::Status::OK();
+  }
+  arrow::Result<exec::Batch> Next() override {
+    if (next_ >= batches_.size()) {
+      return exec::Batch{};
+    }
+    return exec::Batch{.data = batches_[next_++], .selection = {}};
+  }
+  arrow::Status Close() override { return arrow::Status::OK(); }
+
+ private:
+  const arrow::RecordBatchVector& batches_;
+  std::shared_ptr<arrow::Schema> schema_;
+  std::size_t next_ = 0;
+};
+
+// ORDER BY k over kRows rows (without LIMIT: a full sort), and with LIMIT 10 (a top-N).
+void SortRows(benchmark::State& state, std::optional<int64_t> limit) {
+  const auto& batches = SortInput();
+  if (batches.empty()) {
+    state.SkipWithError("cannot build the sort input");
+    return;
+  }
+  const std::vector<plan::SortKey> keys = {
+      {.column = {.index = 0, .name = "k", .type = plan::LogicalType::kBigInt}}};
+  int64_t rows = 0;
+  for (auto _ : state) {
+    exec::SortOperator sort(std::make_unique<BatchSource>(batches), keys, limit);
+    exec::ExecContext ctx;
+    auto table = exec::Drain(sort, ctx);
+    if (!table.ok()) {
+      state.SkipWithError(table.status().ToString());
+      return;
+    }
+    rows = (*table)->num_rows();
+    benchmark::DoNotOptimize(rows);
+  }
+  state.SetItemsProcessed(state.iterations() * kRows);
+  state.counters["rows"] = static_cast<double>(rows);
+}
+void BM_SortRows(benchmark::State& state) { SortRows(state, std::nullopt); }
+BENCHMARK(BM_SortRows)->Unit(benchmark::kMillisecond);
+void BM_TopNRows(benchmark::State& state) { SortRows(state, 10); }
+BENCHMARK(BM_TopNRows)->Unit(benchmark::kMillisecond);
 
 }  // namespace
 }  // namespace antb1::bench
