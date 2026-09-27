@@ -160,6 +160,38 @@ TEST_F(OperatorsTest, FilterComparisonsAndNulls) {
   EXPECT_EQ(Int64Column(*Run(not_null)), (std::vector<std::optional<int64_t>>{1, 3, 4, 5, -6}));
 }
 
+// [NOT] LIKE: NULL rejects the row either way; malformed LIKE predicates fail at Open.
+TEST_F(OperatorsTest, FilterLike) {
+  const auto s = Column(1, "s", LogicalType::kVarchar);
+  const auto like = [&](Predicate::Kind kind, std::string pattern) {
+    return Predicate{.kind = kind,
+                     .column = s,
+                     .op = CompareOp::kEq,
+                     .constant = plan::Constant{.type = LogicalType::kVarchar, .value = pattern},
+                     .span = {}};
+  };
+  using Ids = std::vector<std::optional<int64_t>>;
+  // s: 'a', 'b', '', 'd', NULL, 'f' for x: 1, NULL, 3, 4, 5, -6.
+  FilterOperator one(Scan(Table()), {like(Predicate::Kind::kLike, "_")});
+  EXPECT_EQ(Int64Column(*Run(one)), (Ids{1, std::nullopt, 4, -6}));
+  FilterOperator none(Scan(Table()), {like(Predicate::Kind::kNotLike, "_")});
+  EXPECT_EQ(Int64Column(*Run(none)), (Ids{3}));
+  FilterOperator both(Scan(Table()),
+                      {like(Predicate::Kind::kLike, "%"),
+                       Compare(Column(0, "x", LogicalType::kBigInt), CompareOp::kGe, BigInt(4))});
+  EXPECT_EQ(Int64Column(*Run(both)), (Ids{4})) << "x = 5 has a NULL s: LIKE '%' rejects it";
+
+  ExecContext ctx;
+  Predicate on_integers = like(Predicate::Kind::kLike, "1%");
+  on_integers.column = Column(0, "x", LogicalType::kBigInt);
+  FilterOperator wrong_column(Scan(Table()), {on_integers});
+  EXPECT_TRUE(wrong_column.Open(ctx).IsInvalid());
+  Predicate number = like(Predicate::Kind::kNotLike, "");
+  number.constant = BigInt(1);
+  FilterOperator wrong_pattern(Scan(Table()), {number});
+  EXPECT_TRUE(wrong_pattern.Open(ctx).IsInvalid());
+}
+
 TEST_F(OperatorsTest, FilterConjunctionOverColumnsOfEveryType) {
   const auto s = Column(1, "s", LogicalType::kVarchar);
   FilterOperator filter(

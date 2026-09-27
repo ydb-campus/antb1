@@ -63,6 +63,9 @@ CompareOp ToPlan(sql::CompareOp op) {
       return CompareOp::kGt;
     case sql::CompareOp::kGe:
       return CompareOp::kGe;
+    case sql::CompareOp::kLike:  // bound as Predicate::Kind::kLike, never as a comparison
+    case sql::CompareOp::kNotLike:
+      break;
   }
   return CompareOp::kEq;
 }
@@ -229,8 +232,41 @@ std::string_view LiteralKind(const sql::Literal& lit) {
 }
 
 // `column <op> literal`, with the literal folded exactly into the column's type.
+// `column [NOT] LIKE 'pattern'`: a VARCHAR column and a string pattern (DuckDB rejects LIKE on
+// other types). A pattern of only % holds for every value: LIKE folds to IS NOT NULL, NOT LIKE to
+// FALSE.
+arrow::Result<Predicate> BindLike(const sql::Comparison& cmp, const BoundColumn& column) {
+  const sql::Literal& lit = cmp.literal;
+  const bool negated = cmp.op == sql::CompareOp::kNotLike;
+  if (column.type != LogicalType::kVarchar) {
+    return BindError(std::format("{} needs a VARCHAR column, but '{}' is {}",
+                                 negated ? "NOT LIKE" : "LIKE", column.name, ToString(column.type)),
+                     cmp.column.span);
+  }
+  if (lit.kind != sql::Literal::Kind::kString) {
+    return BindError(std::format("the pattern of {} must be a string literal ('...')",
+                                 negated ? "NOT LIKE" : "LIKE"),
+                     lit.span);
+  }
+  Predicate p{.kind = negated ? Predicate::Kind::kNotLike : Predicate::Kind::kLike,
+              .column = column,
+              .op = CompareOp::kEq,
+              .constant = Constant{.type = LogicalType::kVarchar, .value = lit.text},
+              .span = cmp.span};
+  if (!lit.text.empty() && std::ranges::all_of(lit.text, [](char c) { return c == '%'; })) {
+    p.kind = negated ? Predicate::Kind::kFalse : Predicate::Kind::kIsNotNull;
+    if (negated) {
+      p.column.reset();  // no row passes, whatever the column holds
+    }
+  }
+  return p;
+}
+
 arrow::Result<Predicate> BindComparison(const sql::Comparison& cmp, const BoundColumn& column,
                                         const Table& table) {
+  if (cmp.op == sql::CompareOp::kLike || cmp.op == sql::CompareOp::kNotLike) {
+    return BindLike(cmp, column);
+  }
   const sql::Literal& lit = cmp.literal;
   const auto mismatch = [&](std::string_view hint) {
     return BindError(std::format("cannot compare {} column '{}' with {}; {}", ToString(column.type),

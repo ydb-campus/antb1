@@ -1,0 +1,108 @@
+# column [NOT] LIKE 'pattern' in WHERE (docs/sql-subset.md): % any characters, _ one character (UTF-8),
+# no escape character, case-sensitive; a NULL value rejects the row for LIKE and for NOT LIKE.
+
+query I rowsort
+SELECT id FROM edge WHERE u LIKE '%a%'
+----
+1
+2
+3
+4
+6
+
+query I rowsort
+SELECT id FROM edge WHERE u NOT LIKE '%a%'
+----
+0
+10
+7
+8
+9
+
+query I rowsort
+SELECT id FROM edge WHERE u LIKE '_'
+----
+1
+
+# Привет, мир: six and three 2-byte characters.
+
+query I rowsort
+SELECT id FROM edge WHERE u LIKE '______, ___'
+----
+8
+
+query I rowsort
+SELECT id FROM edge WHERE u LIKE '_____, ___'
+----
+
+query I rowsort
+SELECT id FROM edge WHERE u LIKE '%\%'
+----
+4
+
+query I rowsort
+SELECT id FROM edge WHERE s LIKE 'x_y'
+----
+7
+
+query I rowsort
+SELECT id FROM edge WHERE u LIKE ''
+----
+0
+
+query I rowsort
+SELECT id FROM edge WHERE u LIKE 'A%'
+----
+
+query I rowsort
+SELECT id FROM edge WHERE u like 'tab%' AND i16 >= 0
+----
+2
+
+# A pattern of only % is true for every value (NOT LIKE for none), but NULL still rejects the row.
+
+query II nosort
+SELECT COUNT(*), COUNT(u) FROM edge WHERE u LIKE '%%'
+----
+10	10
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE u NOT LIKE '%'
+----
+0
+
+# Prefixes, suffixes and several segments over a larger table and several files.
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE URL LIKE 'http%'
+----
+9805
+
+query II nosort
+SELECT COUNT(*), COUNT(DISTINCT URL) FROM hits_like_split WHERE URL LIKE 'http_://%' AND URL NOT LIKE '%q%'
+----
+6950	6838
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE Title LIKE '%a%e%' AND SearchPhrase NOT LIKE ''
+----
+648
+
+query TI nosort
+SELECT SearchPhrase, COUNT(*) AS c FROM hits_like WHERE SearchPhrase LIKE '%_a%' GROUP BY SearchPhrase ORDER BY c DESC, SearchPhrase LIMIT 5
+----
+tundra	33
+alpha	27
+maple	26
+omega	26
+beta	24
+
+query I nosort
+SELECT COUNT(*) FROM hits_like_nulls WHERE Title LIKE '%'
+----
+9174
+
+query I nosort
+SELECT COUNT(*) FROM hits_like_nulls WHERE Title NOT LIKE '%o%'
+----
+5400

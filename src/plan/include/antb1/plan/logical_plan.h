@@ -74,6 +74,8 @@ struct BoundColumn {
 struct Predicate {
   enum class Kind : std::uint8_t {
     kCompare,    // column <op> constant
+    kLike,       // column LIKE constant (a VARCHAR column and pattern; docs/sql-subset.md)
+    kNotLike,    // column NOT LIKE constant
     kIsNotNull,  // folded: true for every non-NULL value (NULL still rejects the row)
     kFalse,      // folded: true for no row
   };
@@ -81,7 +83,7 @@ struct Predicate {
   Kind kind = Kind::kCompare;
   std::optional<BoundColumn> column;  // empty for kFalse
   CompareOp op = CompareOp::kEq;      // kCompare only
-  Constant constant;                  // kCompare only; typed as the column
+  Constant constant;                  // kCompare, kLike and kNotLike; typed as the column
   SourceSpan span;                    // the comparison in the query
 };
 

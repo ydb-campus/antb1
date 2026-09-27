@@ -75,6 +75,10 @@ std::string_view ToString(CompareOp op) {
       return ">";
     case CompareOp::kGe:
       return ">=";
+    case CompareOp::kLike:
+      return "LIKE";
+    case CompareOp::kNotLike:
+      return "NOT LIKE";
   }
   return "?";
 }

@@ -1,20 +1,22 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include <arrow/scalar.h>
 
+#include "antb1/exec/like.h"
 #include "antb1/exec/operator.h"
 #include "antb1/plan/logical_plan.h"
 
 namespace antb1::exec {
 
 // Keeps the rows for which every predicate is true, without copying data: each input batch gets a
-// selection (the AND of the comparisons, computed with Arrow's comparison kernels and and_kleene;
-// a NULL comparison rejects the row). Batches without a selected row are skipped, and a batch whose
-// rows all pass keeps no selection. A folded FALSE predicate ends the stream without reading input.
-// Output: the input columns.
+// selection (the AND of the comparisons, computed with Arrow's comparison kernels, LikePattern for
+// [NOT] LIKE, and and_kleene; a NULL comparison rejects the row). Batches without a selected row
+// are skipped, and a batch whose rows all pass keeps no selection. A folded FALSE predicate ends
+// the stream without reading input. Output: the input columns.
 class FilterOperator final : public Operator {
  public:
   FilterOperator(std::unique_ptr<Operator> input, std::vector<plan::Predicate> predicates);
@@ -35,6 +37,7 @@ class FilterOperator final : public Operator {
   // Per predicate, from Open: the input column (-1 for kFalse) and the constant (kCompare only).
   std::vector<int> columns_;
   std::vector<std::shared_ptr<arrow::Scalar>> constants_;
+  std::vector<std::optional<LikePattern>> patterns_;  // kLike and kNotLike only
   bool never_true_ = false;
   arrow::MemoryPool* pool_ = arrow::default_memory_pool();
 };

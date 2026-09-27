@@ -1,0 +1,11 @@
+# LIKE needs a VARCHAR column and a string pattern.
+
+statement error
+SELECT COUNT(*) FROM edge WHERE i16 LIKE '1%'
+
+statement error
+SELECT COUNT(*) FROM hits_like WHERE EventDate LIKE '2013%'
+
+onlyif antb1
+statement error ^bind: LIKE needs a VARCHAR column, but 'i16' is SMALLINT$
+SELECT COUNT(*) FROM edge WHERE i16 LIKE '1%'

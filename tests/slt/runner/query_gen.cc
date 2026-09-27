@@ -745,6 +745,10 @@ class Builder {
         Keyword("AND");
       }
       const GenColumn& c = *rng_.Pick(comparable);
+      if (c.kind == ValueKind::kVarchar && allowed_.Has(Feature::kLike) && rng_.Percent(30)) {
+        Like(c);
+        continue;
+      }
       const std::string_view op = rng_.Pick(kOps);
       Literal lit = MakeLiteral(c);
       used_.Add(lit.features);
@@ -759,6 +763,55 @@ class Builder {
         tokens_.insert(tokens_.end(), lit.tokens.begin(), lit.tokens.end());
       }
     }
+  }
+
+  // column [NOT] LIKE 'pattern': a part of a sample value between %s, a prefix or a suffix, with
+  // _ now and then, or an edge pattern. Only the ASCII bytes of samples are used, so the SQL text
+  // stays valid UTF-8.
+  void Like(const GenColumn& c) {
+    used_.Add(Feature::kLike);
+    std::string sample;
+    if (!c.samples.empty()) {
+      for (const char ch : rng_.Pick(c.samples)) {
+        if (static_cast<unsigned char>(ch) >= 0x20 && static_cast<unsigned char>(ch) < 0x7F &&
+            ch != '%' && ch != '_') {
+          sample += ch;
+        }
+      }
+    }
+    std::string pattern;
+    if (sample.empty() || rng_.Percent(15)) {
+      static constexpr auto kEdges = std::to_array<std::string_view>(
+          {"%", "", "_", "%_%", "%a%", "a%", "%e", "__%", "%\\%", "%\xC3\xA9%", "%.%", "%/%"});
+      pattern = std::string(rng_.Pick(kEdges));
+    } else {
+      const std::size_t begin = rng_.Below(sample.size());
+      const std::size_t length = 1 + rng_.Below(std::min<std::size_t>(6, sample.size() - begin));
+      std::string part = sample.substr(begin, length);
+      if (rng_.Percent(25)) {
+        part[rng_.Below(part.size())] = '_';
+      }
+      switch (rng_.Below(4)) {
+        case 0:
+          pattern = "%" + part + "%";
+          break;
+        case 1:
+          pattern = sample.substr(0, length) + "%";
+          break;
+        case 2:
+          pattern = "%" + sample.substr(sample.size() - length);
+          break;
+        default:
+          pattern = rng_.Percent(50) ? sample : "%" + part + "%" + part + "%";
+          break;
+      }
+    }
+    Column(c);
+    if (rng_.Percent(30)) {
+      Keyword("NOT");
+    }
+    Keyword("LIKE");
+    tokens_.push_back({.kind = Token::Kind::kLiteral, .text = SqlString(pattern)});
   }
 
   bool Limit(bool required) {

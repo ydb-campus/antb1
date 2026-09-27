@@ -9,13 +9,15 @@ This page is the contract: a PR that changes SQL behavior updates it in the same
 ## What works today
 
 Every query of the [grammar](#grammar) below runs: global and grouped (`GROUP BY`) aggregates, `COUNT(DISTINCT ...)`
-included, projections (`*` or columns), a `WHERE` conjunction of `column <op> literal` comparisons, `ORDER BY`,
-`LIMIT` and `OFFSET`, over one table of Parquet files. This covers 30 of the 43 ClickBench queries (see
+included, projections (`*` or columns), a `WHERE` conjunction of `column <op> literal` comparisons and
+`column [NOT] LIKE 'pattern'`, `ORDER BY`, `LIMIT` and `OFFSET`, over one table of Parquet files. This covers 34 of
+the 43 ClickBench queries (see
 [ClickBench status](#clickbench-status)).
 
 ```sql
 SELECT COUNT(*), SUM(ResolutionWidth) AS width, AVG(UserID), MAX(EventDate) FROM hits WHERE IsMobile = 1
 SELECT WatchID, URL FROM hits WHERE RegionID < 300 AND SearchPhrase <> '' LIMIT 10
+SELECT COUNT(*) FROM events WHERE url LIKE '%shop%' AND title NOT LIKE 'Promo_%'
 SELECT RegionID, COUNT(*) AS n, AVG(ResolutionWidth) FROM hits WHERE IsMobile = 1 GROUP BY RegionID
 SELECT OS, COUNT(*) AS n FROM hits GROUP BY OS ORDER BY n DESC, MAX(EventDate) NULLS FIRST LIMIT 10 OFFSET 5
 SELECT * FROM '/data/hits_*.parquet' LIMIT 5
@@ -60,7 +62,8 @@ order_item  = ( agg_call | column_ref ) , [ "ASC" | "DESC" ] , [ "NULLS" , ( "FI
 table_ref   = identifier | string_literal ;
 column_ref  = identifier ;
 predicate   = comparison , { "AND" , comparison } ;
-comparison  = column_ref , cmp_op , literal | literal , cmp_op , column_ref ;
+comparison  = column_ref , cmp_op , literal | literal , cmp_op , column_ref
+            | column_ref , [ "NOT" ] , "LIKE" , string_literal ;
 cmp_op      = "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" ;
 literal     = [ "-" ] , integer | [ "-" ] , decimal | string_literal | "DATE" , string_literal ;
 ```
@@ -75,7 +78,8 @@ Keywords are not reserved by the lexer. A literal-first comparison is normalized
 so are `SUM`, `AVG`, `MIN` and `MAX` with `DISTINCT`.
 
 Outside the grammar, the parser recognizes common SQL and rejects it with exit code 4 and a source span, among others:
-`SELECT DISTINCT`, `HAVING`, joins, `LIKE`, `IN`, `CASE`, arithmetic, function calls other than the five aggregates,
+`SELECT DISTINCT`, `HAVING`, joins, `ILIKE`, `LIKE ... ESCAPE`, `LIKE` outside `WHERE` or with a column as the
+pattern, `IN`, `CASE`, arithmetic, function calls other than the five aggregates,
 `NULL` literals, `IS [NOT] NULL`, `OR` and `NOT`. Malformed SQL inside the subset, such as `SELECT COUNT(*) FORM t`, is
 a syntax error with exit code 1.
 
@@ -115,7 +119,7 @@ Literals in `WHERE` must fit the column's type; any other combination is a bind 
 | --- | --- | --- |
 | SMALLINT, INTEGER, BIGINT, USMALLINT, HUGEINT | integer, decimal | exactly, after folding (below) |
 | DOUBLE | integer, decimal | the nearest double, as in DuckDB for a DOUBLE column; beyond the double range `inf` or `-inf`, below the smallest subnormal `0`. A column stored as FLOAT is compared as DuckDB compares it: an integer or DECIMAL literal becomes the FLOAT that DuckDB casts it to, with DuckDB's rounding (`0.1` is `0.1F`; `16777217.5` and some long spellings of `0.1`, such as 16 or 24 decimals, are not the nearest FLOAT, and HUGEINT literals are rounded through a double), beyond the FLOAT range `inf` or `-inf`; a number DuckDB types as DOUBLE compares with the nearest double |
-| VARCHAR | string | bytes |
+| VARCHAR | string | bytes; `LIKE` and `NOT LIKE` take a string pattern (only a VARCHAR column: LIKE on another type is a bind error, as in DuckDB) |
 | DATE | string, `DATE` string | a date written exactly `YYYY-MM-DD` (years 0000 to 9999) that exists in the calendar |
 
 A comparison of an integer column with a number is folded exactly at bind time, never through a lossy cast:
@@ -202,6 +206,12 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
 - WHERE: the comparisons are evaluated with Arrow's comparison kernels and combined with Kleene AND; a row passes
   only when every comparison is true, so a comparison that is NULL rejects it. VARCHAR compares byte-wise and DATE
   chronologically. A predicate folded to never-true reads no data at all.
+- LIKE: `%` matches any sequence of characters (none included), `_` exactly one character, and every other byte
+  itself; the match is case-sensitive and there is no escape character (`\` is a literal byte), as in DuckDB. A
+  character is a UTF-8 sequence; in bytes that are not UTF-8 (which DuckDB refuses to read as VARCHAR) each byte is
+  one character. `NOT LIKE` is the negation; a NULL value rejects the row for both. A pattern of only `%` folds:
+  `LIKE` to `IS NOT NULL`, `NOT LIKE` to `FALSE`. Patterns without `_` are matched by their literal segments (a
+  prefix, a suffix and substrings in order), the others by backtracking.
 - COUNT: `COUNT(*)` counts rows; `COUNT(col)` counts non-NULL values; `COUNT(DISTINCT col)` counts distinct non-NULL
   values, with DOUBLE `-0.0` equal to `0.0` and every NaN one value (as DuckDB groups them) and VARCHAR by bytes. All
   return BIGINT, 0 over no values.
@@ -332,6 +342,10 @@ bind error); today all of them answer Unsupported with exit code 4.
 | Q16 | pass | `GROUP BY` two columns, ordered by the count descending, top-N |
 | Q17 | pass | `GROUP BY` two columns with `COUNT(*)` and `LIMIT` without `ORDER BY`: any groups are a right answer, compared as a subset of DuckDB's unlimited answer |
 | Q19 | pass | not a target: a projection under a `WHERE` comparison; fits the grammar and passes incidentally |
+| Q20 | pass | `COUNT(*)` under `LIKE '%...%'` |
+| Q21 | pass | `LIKE '%...%'` and a comparison, `GROUP BY` one column with `MIN` and `COUNT(*)`, ordered by the count, top-N |
+| Q22 | pass | `LIKE` and `NOT LIKE` and a comparison, `GROUP BY` one column with `MIN`, `COUNT(*)` and `COUNT(DISTINCT)`, ordered by the count, top-N |
+| Q23 | pass | `SELECT *` under `LIKE '%...%'`, ordered by a column, top-N |
 | Q24 | pass | a projection under `WHERE`, ordered by a column it does not select, top-N |
 | Q25 | pass | a projection under `WHERE`, ordered by the column it selects, top-N |
 | Q26 | pass | a projection under `WHERE`, ordered by a column it does not select and then by the one it selects, top-N |
@@ -343,4 +357,4 @@ bind error); today all of them answer Unsupported with exit code 4.
 | Q37 | pass | `GROUP BY` one column under a `WHERE` conjunction, ordered by the alias of the count, top-N |
 | Q38 | pass | `GROUP BY` one column under a `WHERE` conjunction, ordered by the alias of the count, a window with `OFFSET` |
 | Q41 | pass | `GROUP BY` two columns under a `WHERE` conjunction, ordered by the alias of the count, a window with `OFFSET` |
-| all others | out of scope | need LIKE, functions, expressions, HAVING, `GROUP BY` positions or other rejected syntax; they fail cleanly with exit code 4 |
+| all others | out of scope | need functions, expressions, HAVING, `GROUP BY` positions, `IN` or other rejected syntax; they fail cleanly with exit code 4 |

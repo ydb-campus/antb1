@@ -686,6 +686,8 @@ std::string LiteralFirstSql(const SelectStatement& stmt) {
         break;
       case CompareOp::kEq:
       case CompareOp::kNe:
+      case CompareOp::kLike:  // the generator below never writes LIKE
+      case CompareOp::kNotLike:
         break;
     }
     sql += i == 0 ? " WHERE " : " AND ";

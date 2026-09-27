@@ -87,7 +87,7 @@ TEST(UnlimitedSql, DropsLimitAndOffsetOfUnorderedQueries) {
   EXPECT_EQ(UnlimitedSql("SELECT a FROM t OFFSET 2"), "SELECT a FROM t");
   EXPECT_EQ(UnlimitedSql("SELECT a FROM t"), std::nullopt) << "no LIMIT";
   EXPECT_EQ(UnlimitedSql("SELECT a FROM t ORDER BY a LIMIT 5"), std::nullopt) << "ordered";
-  EXPECT_EQ(UnlimitedSql("SELECT a FROM t WHERE a LIKE 'x' LIMIT 5"), std::nullopt)
+  EXPECT_EQ(UnlimitedSql("SELECT a FROM t WHERE a ILIKE 'x' LIMIT 5"), std::nullopt)
       << "not in antb1's grammar";
 }
 

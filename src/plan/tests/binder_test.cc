@@ -63,6 +63,14 @@ constexpr auto kUnsupported = SqlErrorDetail::Kind::kUnsupported;
 INSTANTIATE_TEST_SUITE_P(
     Binder, BindErrorTest,
     ::testing::Values(
+        // [NOT] LIKE: a VARCHAR column and a string pattern (DuckDB rejects LIKE on numbers).
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE i16 LIKE '1%'", kBind, "i16",
+                  "LIKE needs a VARCHAR column, but 'i16' is SMALLINT"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE dt NOT LIKE '2013%'", kBind, "dt",
+                  "NOT LIKE needs a VARCHAR column"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE s LIKE 5", kBind, "5",
+                  "the pattern of LIKE must be a string literal"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE nope LIKE 'x'", kBind, "nope", "does not exist"},
         // COUNT(DISTINCT col): the column must exist and have an engine type; it is an aggregate.
         ErrorCase{"SELECT COUNT(DISTINCT nope) FROM t", kBind, "nope",
                   "column 'nope' does not exist"},
@@ -370,6 +378,29 @@ TEST(BinderTest, CountDistinct) {
   auto name = BindSql("SELECT COUNT(DISTINCT \"i32\") FROM t", catalog);
   ASSERT_TRUE(name.ok()) << name.status().ToString();
   EXPECT_EQ(name->output[0].name, "count(DISTINCT i32)");
+}
+
+// [NOT] LIKE binds to its own predicate kinds with the pattern as a VARCHAR constant; a pattern of
+// only % folds (LIKE: IS NOT NULL, NOT LIKE: FALSE).
+TEST(BinderTest, Like) {
+  const Catalog catalog = MakeCatalog();
+  auto plan = BindSql(
+      "SELECT COUNT(*) FROM t WHERE s LIKE '%a_%' AND s NOT LIKE '' AND s LIKE '%%' AND "
+      "\"Mixed Case\" > 1 AND s NOT LIKE '%'",
+      catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  const auto& predicates = std::get<FilterNode>(Nth(*plan, 1)).predicates;
+  ASSERT_EQ(predicates.size(), 5U);
+  EXPECT_EQ(predicates[0].kind, Predicate::Kind::kLike);
+  EXPECT_EQ(std::get<std::string>(predicates[0].constant.value), "%a_%");
+  EXPECT_EQ(predicates[0].constant.type, LogicalType::kVarchar);
+  EXPECT_EQ(predicates[0].column.value_or(BoundColumn{}).index, 6);
+  EXPECT_EQ(predicates[1].kind, Predicate::Kind::kNotLike);
+  EXPECT_EQ(std::get<std::string>(predicates[1].constant.value), "");
+  EXPECT_EQ(predicates[2].kind, Predicate::Kind::kIsNotNull);
+  EXPECT_EQ(predicates[3].kind, Predicate::Kind::kCompare);
+  EXPECT_EQ(predicates[4].kind, Predicate::Kind::kFalse);
+  EXPECT_FALSE(predicates[4].column.has_value());
 }
 
 TEST(BinderTest, SelectStarProjectsEveryColumn) {

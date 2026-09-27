@@ -40,6 +40,10 @@ std::string PredicateText(const Predicate& p) {
   switch (p.kind) {
     case Predicate::Kind::kCompare:
       return std::format("{} {} {}", column, ToString(p.op), ToString(p.constant));
+    case Predicate::Kind::kLike:
+      return std::format("{} LIKE {}", column, ToString(p.constant));
+    case Predicate::Kind::kNotLike:
+      return std::format("{} NOT LIKE {}", column, ToString(p.constant));
     case Predicate::Kind::kIsNotNull:
       return column + " IS NOT NULL";
     case Predicate::Kind::kFalse:
