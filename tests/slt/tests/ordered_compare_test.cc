@@ -34,18 +34,23 @@ TEST(MakeOrderedQuery, AppendsTheKeysAndDropsLimitAndOffset) {
       "select a as k, count(*) as c from t group by a order by c desc, K nulls first, max(b) "
       "limit 5 offset 2");
   ASSERT_TRUE(q.has_value());
-  EXPECT_EQ(q->augmented_sql,
+  const OrderedQuery ordered = q.value_or(OrderedQuery{});
+  EXPECT_EQ(ordered.augmented_sql,
             "SELECT a AS \"k\", COUNT(*) AS \"c\", COUNT(*) AS \"__antb1_key0\", a AS "
             "\"__antb1_key1\", MAX(b) AS \"__antb1_key2\" FROM t GROUP BY a ORDER BY c DESC, K "
             "NULLS FIRST, MAX(b)");
-  EXPECT_EQ(q->keys, 3U);
-  EXPECT_EQ(q->limit, 5);
-  EXPECT_EQ(q->offset, 2);
-  EXPECT_EQ(WithLimit(*q, 7), q->augmented_sql + " LIMIT 7");
+  EXPECT_EQ(ordered.keys, 3U);
+  EXPECT_EQ(ordered.limit, 5);
+  EXPECT_EQ(ordered.offset, 2);
+  EXPECT_EQ(WithLimit(ordered, 7), ordered.augmented_sql + " LIMIT 7");
   // The last select item with an alias wins; SELECT * keeps the star.
-  EXPECT_EQ(MakeOrderedQuery("SELECT a AS x, b AS x FROM t ORDER BY x")->augmented_sql,
+  EXPECT_EQ(MakeOrderedQuery("SELECT a AS x, b AS x FROM t ORDER BY x")
+                .value_or(OrderedQuery{})
+                .augmented_sql,
             "SELECT a AS \"x\", b AS \"x\", b AS \"__antb1_key0\" FROM t ORDER BY x");
-  EXPECT_EQ(MakeOrderedQuery("SELECT * FROM t WHERE a > 1 ORDER BY b OFFSET 3")->augmented_sql,
+  EXPECT_EQ(MakeOrderedQuery("SELECT * FROM t WHERE a > 1 ORDER BY b OFFSET 3")
+                .value_or(OrderedQuery{})
+                .augmented_sql,
             "SELECT *, b AS \"__antb1_key0\" FROM t WHERE a > 1 ORDER BY b");
   EXPECT_EQ(MakeOrderedQuery("SELECT a FROM t LIMIT 5"), std::nullopt) << "no ORDER BY";
   EXPECT_EQ(MakeOrderedQuery("SELECT a FROM t ORDER BY a + 1"), std::nullopt) << "not parsed";
@@ -112,7 +117,7 @@ TEST(CompareOrdered, TiesComeInAnyOrder) {
                                      {{"a"}, {"b"}, {"c"}, {"x"}, {"e"}}}) {
     const auto d = CompareOrdered(answer, Result({kT}, rows), query, std::ref(oracle));
     ASSERT_TRUE(d.has_value());
-    EXPECT_TRUE(d->mismatch);
+    EXPECT_TRUE(d.value_or(Discrepancy{}).mismatch);
   }
 }
 
@@ -132,6 +137,7 @@ TEST(CompareOrdered, AnyTiedRowsAtTheWindowEdges) {
 TEST(CompareOrdered, GrowsTheOracleLimitUntilTheLastRunEnds) {
   // 3000 rows with key 0 then one with key 1: LIMIT 1 needs every tied row.
   std::vector<Row> ranked;
+  ranked.reserve(3001);
   for (int i = 0; i < 3000; ++i) {
     ranked.push_back({std::to_string(i), "0"});
   }
@@ -162,11 +168,11 @@ TEST(CompareOrdered, ReportsOracleFailuresAndBadShapes) {
   };
   const auto d = CompareOrdered(answer, other, Query(std::nullopt, 0), failing);
   ASSERT_TRUE(d.has_value());
-  EXPECT_NE(d->what.find("DuckDB fails"), std::string::npos);
+  EXPECT_NE(d.value_or(Discrepancy{}).what.find("DuckDB fails"), std::string::npos);
   const auto narrow = [&](std::optional<int64_t>) -> ExecResult { return answer; };
   const auto shape = CompareOrdered(answer, other, Query(std::nullopt, 0), narrow);
   ASSERT_TRUE(shape.has_value());
-  EXPECT_NE(shape->what.find("harness bug"), std::string::npos);
+  EXPECT_NE(shape.value_or(Discrepancy{}).what.find("harness bug"), std::string::npos);
   auto hugeint = Result({kI}, {{"2"}, {"1"}});
   hugeint.type_names[0] = "HUGEINT";
   EXPECT_TRUE(CompareOrdered(answer, hugeint, Query(std::nullopt, 0), narrow));

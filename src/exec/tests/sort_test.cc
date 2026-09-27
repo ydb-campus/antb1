@@ -64,6 +64,7 @@ std::shared_ptr<arrow::RecordBatch> WithIds(
     const std::vector<std::shared_ptr<arrow::Array>>& cols) {
   const int64_t n = cols.front()->length();
   std::vector<std::optional<int64_t>> ids;
+  ids.reserve(static_cast<std::size_t>(n));
   for (int64_t i = 0; i < n; ++i) {
     ids.emplace_back(i);
   }
@@ -158,10 +159,13 @@ RandomRows MakeRandomRows(int64_t n, Rng& rng) {
   for (int64_t i = 0; i < n; ++i) {
     rows.ints.push_back(rng.Below(6) == 0 ? std::nullopt : std::optional(rng.Below(20) - 10));
     const int64_t pick = rng.Below(10);
-    rows.doubles.push_back(pick == 0  ? std::nullopt
-                           : pick < 4 ? std::optional(specials[static_cast<std::size_t>(
-                                            rng.Below(static_cast<int64_t>(specials.size())))])
-                                      : std::optional(static_cast<double>(rng.Below(8))));
+    std::optional<double> value = static_cast<double>(rng.Below(8));
+    if (pick == 0) {
+      value.reset();
+    } else if (pick < 4) {
+      value = specials[static_cast<std::size_t>(rng.Below(static_cast<int64_t>(specials.size())))];
+    }
+    rows.doubles.push_back(value);
   }
   rows.batch = WithIds({Int64s(rows.ints), Doubles(rows.doubles)});
   return rows;
@@ -172,25 +176,34 @@ Ids ModelOrder(const RandomRows& rows, bool int_desc, bool int_nulls_first, bool
                bool double_nulls_first) {
   // Exactly one of the two values is NULL.
   const auto nulls = [](bool a_null, bool first) { return a_null == first ? -1 : 1; };
+  const auto three_way = [](auto x, auto y) {
+    return static_cast<int>(y < x) - static_cast<int>(x < y);
+  };
   const auto cmp_int = [&](std::size_t a, std::size_t b) {
     const auto& x = rows.ints[a];
     const auto& y = rows.ints[b];
-    if (!x || !y) {
-      return !x && !y ? 0 : nulls(!x, int_nulls_first);
+    if (!x.has_value() && !y.has_value()) {
+      return 0;
     }
-    const int c = *x < *y ? -1 : (*x > *y ? 1 : 0);
+    if (!x.has_value() || !y.has_value()) {
+      return nulls(!x.has_value(), int_nulls_first);
+    }
+    const int c = three_way(*x, *y);
     return int_desc ? -c : c;
   };
   const auto rank = [](double v) { return std::isnan(v) ? 1 : 0; };
   const auto cmp_double = [&](std::size_t a, std::size_t b) {
     const auto& x = rows.doubles[a];
     const auto& y = rows.doubles[b];
-    if (!x || !y) {
-      return !x && !y ? 0 : nulls(!x, double_nulls_first);
+    if (!x.has_value() && !y.has_value()) {
+      return 0;
+    }
+    if (!x.has_value() || !y.has_value()) {
+      return nulls(!x.has_value(), double_nulls_first);
     }
     int c = rank(*x) - rank(*y);
     if (c == 0 && rank(*x) == 0) {
-      c = *x < *y ? -1 : (*x > *y ? 1 : 0);
+      c = three_way(*x, *y);
     }
     return double_desc ? -c : c;
   };
@@ -215,11 +228,11 @@ TEST_F(SortTest, MatchesModelAndTopNMatchesSortWindow) {
   Rng rng(20260927);
   for (const int64_t n : {int64_t{0}, int64_t{1}, int64_t{7}, int64_t{300}, int64_t{9000}}) {
     const RandomRows rows = MakeRandomRows(n, rng);
-    for (int flags = 0; flags < 16; ++flags) {
-      const bool int_desc = (flags & 1) != 0;
-      const bool int_nulls_first = (flags & 2) != 0;
-      const bool double_desc = (flags & 4) != 0;
-      const bool double_nulls_first = (flags & 8) != 0;
+    for (unsigned flags = 0; flags < 16; ++flags) {
+      const bool int_desc = (flags & 1U) != 0;
+      const bool int_nulls_first = (flags & 2U) != 0;
+      const bool double_desc = (flags & 4U) != 0;
+      const bool double_nulls_first = (flags & 8U) != 0;
       const std::vector<SortKey> keys{
           Key(1, LogicalType::kBigInt, int_desc, int_nulls_first),
           Key(2, LogicalType::kDouble, double_desc, double_nulls_first)};
@@ -336,7 +349,7 @@ TEST_F(SortTest, LimitOffsetNarrowsSelections) {
             Batch{.data = a, .selection = testing::Bools({true, false, true, true})},
             Batch{.data = b->Slice(0, 0)},
             Batch{.data = b, .selection = testing::Bools({false, true, true, false})}});
-    auto* raw = source.get();
+    const auto* raw = source.get();
     LimitOperator op(std::move(source), limit, offset);
     ExecContext ctx;
     const auto table = Drain(op, ctx);

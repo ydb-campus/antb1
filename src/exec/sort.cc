@@ -247,7 +247,8 @@ arrow::Status SortBuffer::Compact(arrow::MemoryPool* pool) {
   const arrow::Status sorted = Sort(pool);
   keep_ = keep;
   ARROW_RETURN_NOT_OK(sorted);
-  const int64_t kept = std::min(rows_, *keep_);
+  const int64_t limit = keep.value_or(rows_);
+  const int64_t kept = std::min(rows_, limit);
   ARROW_ASSIGN_OR_RAISE(auto first, Slice(0, kept, pool));
   chunks_.clear();
   chunk_keys_.clear();
@@ -260,7 +261,7 @@ arrow::Status SortBuffer::Compact(arrow::MemoryPool* pool) {
     for (int64_t r = 0; r < kept; ++r) {
       order_.push_back(RowRef{.chunk = 0, .row = Narrow<std::uint32_t>(r)});
     }
-    if (kept == *keep_) {
+    if (kept == limit) {
       threshold_ = order_.back();
     }
   }

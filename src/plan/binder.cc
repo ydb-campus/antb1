@@ -605,9 +605,12 @@ arrow::Result<LogicalPlan> Bind(const sql::SelectStatement& stmt, const Catalog&
   if (stmt.offset.has_value() && *stmt.offset < 0) {
     return BindError("OFFSET must not be negative", stmt.offset_span);
   }
-  const Shape shape = !keys.empty()               ? Shape::kGrouped
-                      : select.aggregates.empty() ? Shape::kProjection
-                                                  : Shape::kGlobal;
+  Shape shape = Shape::kGlobal;
+  if (!keys.empty()) {
+    shape = Shape::kGrouped;
+  } else if (select.aggregates.empty()) {
+    shape = Shape::kProjection;
+  }
   ARROW_ASSIGN_OR_RAISE(std::vector<SortKey> sort_keys,
                         BindOrderBy(stmt, columns, select, shape, keys, select.aggregates));
 

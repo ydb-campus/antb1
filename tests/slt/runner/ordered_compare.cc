@@ -79,9 +79,9 @@ std::string ExactText(const Cells& row, std::string_view letters) {
     if (letters[c] == 'R') {
       continue;
     }
-    if (row[c].has_value()) {
+    if (const auto& cell = row[c]; cell.has_value()) {
       text += '\x02';
-      text += *row[c];
+      text += *cell;
     }
     text += '\x00';
   }
