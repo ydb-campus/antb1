@@ -41,7 +41,8 @@ std::string Expr(const SelectExpr& expr) {
     if (agg->kind == AggKind::kCountStar) {
       return "COUNT(*)";
     }
-    return std::string(ToString(agg->kind)) + "(" + (agg->arg ? Column(*agg->arg) : "") + ")";
+    return std::string(ToString(agg->kind)) + "(" + (agg->distinct ? "DISTINCT " : "") +
+           (agg->arg ? Column(*agg->arg) : "") + ")";
   }
   return Column(std::get<ColumnRef>(expr));
 }
@@ -74,8 +75,26 @@ std::string ToSql(const SelectStatement& stmt) {
     sql += i == 0 ? " WHERE " : " AND ";
     sql += Column(c.column) + " " + std::string(ToString(c.op)) + " " + LiteralSql(c.literal);
   }
+  for (std::size_t i = 0; i < stmt.group_by.size(); ++i) {
+    sql += i == 0 ? " GROUP BY " : ", ";
+    sql += Column(stmt.group_by[i]);
+  }
+  for (std::size_t i = 0; i < stmt.order_by.size(); ++i) {
+    const OrderItem& item = stmt.order_by[i];
+    sql += i == 0 ? " ORDER BY " : ", ";
+    sql += Expr(item.expr);
+    if (item.descending) {
+      sql += " DESC";
+    }
+    if (item.nulls != NullsOrder::kDefault) {
+      sql += " " + std::string(ToString(item.nulls));
+    }
+  }
   if (stmt.limit) {
     sql += " LIMIT " + std::to_string(*stmt.limit);
+  }
+  if (stmt.offset) {
+    sql += " OFFSET " + std::to_string(*stmt.offset);
   }
   return sql;
 }

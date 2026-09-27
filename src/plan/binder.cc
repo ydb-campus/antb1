@@ -366,7 +366,36 @@ arrow::Result<SelectList> BindSelectList(const sql::SelectStatement& stmt,
 
 }  // namespace
 
+namespace {
+
+// Syntax the parser accepts but the engine does not answer yet (docs/sql-subset.md); checked before
+// anything else, so such a query is always kUnsupported (exit code 4), never a bind error.
+arrow::Status CheckNotYetSupported(const sql::SelectStatement& stmt) {
+  const auto distinct = [](const sql::SelectExpr& expr) -> const sql::AggregateCall* {
+    const auto* agg = std::get_if<sql::AggregateCall>(&expr);
+    return agg != nullptr && agg->distinct ? agg : nullptr;
+  };
+  for (const sql::SelectItem& item : stmt.items) {
+    if (const auto* agg = distinct(item.expr)) {
+      return UnsupportedError("COUNT(DISTINCT ...) is not supported yet", agg->span);
+    }
+  }
+  if (!stmt.group_by.empty()) {
+    return UnsupportedError("GROUP BY is not supported yet", stmt.group_by_span);
+  }
+  if (!stmt.order_by.empty()) {
+    return UnsupportedError("ORDER BY is not supported yet", stmt.order_by_span);
+  }
+  if (stmt.offset.has_value()) {
+    return UnsupportedError("OFFSET is not supported yet", stmt.offset_span);
+  }
+  return arrow::Status::OK();
+}
+
+}  // namespace
+
 arrow::Result<LogicalPlan> Bind(const sql::SelectStatement& stmt, const Catalog& catalog) {
+  ARROW_RETURN_NOT_OK(CheckNotYetSupported(stmt));
   ARROW_ASSIGN_OR_RAISE(auto table, ResolveTable(stmt.from, catalog));
   const arrow::Schema& schema = *table->schema();
   const Columns columns(schema);

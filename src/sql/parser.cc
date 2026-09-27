@@ -25,10 +25,14 @@
 // Hand-written recursive-descent parser for the subset in docs/sql-subset.md:
 //
 //   statement   := query [';'] EOF
-//   query       := SELECT select_list FROM table_ref [WHERE predicate] [LIMIT integer]
+//   query       := SELECT select_list FROM table_ref [WHERE predicate]
+//                  [GROUP BY column_ref (',' column_ref)*] [ORDER BY order_item (',' order_item)*]
+//                  [LIMIT integer] [OFFSET integer]      (LIMIT and OFFSET in either order)
 //   select_list := '*' | select_item (',' select_item)*
 //   select_item := (agg_call | column_ref) [[AS] identifier]
-//   agg_call    := COUNT '(' '*' ')' | (COUNT | SUM | AVG | MIN | MAX) '(' column_ref ')'
+//   agg_call    := COUNT '(' '*' ')' | COUNT '(' DISTINCT column_ref ')'
+//                | (COUNT | SUM | AVG | MIN | MAX) '(' column_ref ')'
+//   order_item  := (agg_call | column_ref) [ASC | DESC] [NULLS (FIRST | LAST)]
 //   table_ref   := identifier | quoted_identifier | string_literal
 //   predicate   := comparison (AND comparison)*
 //   comparison  := column_ref cmp_op literal | literal cmp_op column_ref
@@ -50,7 +54,7 @@ using Status = std::expected<void, ParseError>;
 using Operand = std::variant<ColumnRef, Literal>;
 
 // Where an operand is parsed; selects the error wording and whether literals are allowed.
-enum class Context : std::uint8_t { kSelect, kAggregateArg, kWhere };
+enum class Context : std::uint8_t { kSelect, kAggregateArg, kWhere, kGroupBy, kOrderBy };
 
 struct Construct {
   std::string_view keyword;
@@ -88,15 +92,12 @@ constexpr auto kUnsupportedClauses = std::to_array<Construct>({
     {.keyword = "FETCH", .message = "FETCH is not supported"},
     {.keyword = "FOR", .message = "FOR UPDATE/SHARE is not supported"},
     {.keyword = "FULL", .message = "FULL JOIN is not supported"},
-    {.keyword = "GROUP", .message = "GROUP BY is not supported"},
     {.keyword = "HAVING", .message = "HAVING is not supported"},
     {.keyword = "INNER", .message = "INNER JOIN is not supported"},
     {.keyword = "INTERSECT", .message = "INTERSECT is not supported"},
     {.keyword = "JOIN", .message = "JOIN is not supported"},
     {.keyword = "LEFT", .message = "LEFT JOIN is not supported"},
     {.keyword = "NATURAL", .message = "NATURAL JOIN is not supported"},
-    {.keyword = "OFFSET", .message = "OFFSET is not supported"},
-    {.keyword = "ORDER", .message = "ORDER BY is not supported"},
     {.keyword = "OUTER", .message = "OUTER JOIN is not supported"},
     {.keyword = "QUALIFY", .message = "QUALIFY is not supported"},
     {.keyword = "RIGHT", .message = "RIGHT JOIN is not supported"},
@@ -333,20 +334,26 @@ std::unexpected<ParseError> Unsupported(SourceSpan span, std::string_view constr
   return std::unexpected(UnsupportedError(span, construct));
 }
 
+// Keywords that start a clause after the select list, supported or not.
+bool IsClauseKeyword(std::string_view keyword) {
+  return keyword == "FROM" || keyword == "WHERE" || keyword == "GROUP" || keyword == "ORDER" ||
+         keyword == "LIMIT" || keyword == "OFFSET" || keyword == "INTO" ||
+         Find(kUnsupportedClauses, keyword).has_value();
+}
+
 // Tokens that may follow a complete predicate; a bare operand before one of them is a predicate
 // that is not a comparison (WHERE flag, WHERE 1).
 bool EndsPredicate(const Token& token) {
   const std::string keyword = KeywordOf(token);
   return token.kind == TokenKind::kEnd || token.kind == TokenKind::kSemicolon || keyword == "AND" ||
-         keyword == "LIMIT" || Find(kUnsupportedClauses, keyword).has_value();
+         IsClauseKeyword(keyword);
 }
 
-// Tokens that may follow a complete select list; a comma before one of them is a trailing comma.
-bool EndsSelectList(const Token& token) {
-  const std::string keyword = KeywordOf(token);
+// Tokens that may follow a complete list (select list, GROUP BY, ORDER BY); a comma before one of
+// them is a trailing comma.
+bool EndsList(const Token& token) {
   return token.kind == TokenKind::kEnd || token.kind == TokenKind::kSemicolon ||
-         keyword == "FROM" || keyword == "WHERE" || keyword == "LIMIT" || keyword == "INTO" ||
-         Find(kUnsupportedClauses, keyword).has_value();
+         IsClauseKeyword(KeywordOf(token));
 }
 
 std::string_view Expectation(Context context) {
@@ -357,6 +364,10 @@ std::string_view Expectation(Context context) {
       return "a column";
     case Context::kWhere:
       return "a column or a literal";
+    case Context::kGroupBy:
+      return "a column";
+    case Context::kOrderBy:
+      return "a column or an aggregate";
   }
   return "an operand";
 }
@@ -421,17 +432,39 @@ class Parser {
         return std::unexpected(std::move(status.error()));
       }
     }
-    if (Peek().IsKeyword("LIMIT")) {
-      const std::size_t limit_begin = Take().span.offset;
-      auto limit = ParseLimit();
-      if (!limit) {
-        return std::unexpected(std::move(limit.error()));
+    if (Peek().IsKeyword("GROUP")) {
+      if (auto status = ParseGroupBy(stmt); !status) {
+        return std::unexpected(std::move(status.error()));
       }
-      stmt.limit = *limit;
-      stmt.limit_span = SourceSpan{.offset = limit_begin, .length = last_end_ - limit_begin};
+    }
+    if (Peek().IsKeyword("ORDER")) {
+      if (auto status = ParseOrderBy(stmt); !status) {
+        return std::unexpected(std::move(status.error()));
+      }
+    }
+    // LIMIT and OFFSET, each at most once, in either order (as in DuckDB).
+    while (true) {
+      const bool limit = !stmt.limit.has_value() && Peek().IsKeyword("LIMIT");
+      const bool offset = !stmt.offset.has_value() && Peek().IsKeyword("OFFSET");
+      if (!limit && !offset) {
+        break;
+      }
+      const std::size_t clause_begin = Take().span.offset;
+      auto value = ParseLimit(limit ? "LIMIT" : "OFFSET");
+      if (!value) {
+        return std::unexpected(std::move(value.error()));
+      }
+      const SourceSpan span{.offset = clause_begin, .length = last_end_ - clause_begin};
+      if (limit) {
+        stmt.limit = *value;
+        stmt.limit_span = span;
+      } else {
+        stmt.offset = *value;
+        stmt.offset_span = span;
+      }
     }
     stmt.span = SourceSpan{.offset = begin, .length = last_end_ - begin};
-    if (auto status = ParseEnd(!stmt.where.empty(), stmt.limit.has_value()); !status) {
+    if (auto status = ParseEnd(stmt); !status) {
       return std::unexpected(std::move(status.error()));
     }
     return stmt;
@@ -467,7 +500,7 @@ class Parser {
         return {};
       }
       const SourceSpan comma = Take().span;
-      if (EndsSelectList(Peek())) {
+      if (EndsList(Peek())) {
         return Unsupported(comma, "a trailing comma in the select list is not supported");
       }
     }
@@ -541,6 +574,20 @@ class Parser {
   Expected<AggregateCall> ParseAggregate(AggKind kind) {
     const Token name = Take();
     Take();  // '('
+    bool distinct = false;
+    if (Peek().IsKeyword("DISTINCT")) {
+      if (kind != AggKind::kCount) {
+        return Unsupported(Peek().span, std::string(ToString(kind)) +
+                                            "(DISTINCT ...) is not supported (only COUNT(DISTINCT "
+                                            "column))");
+      }
+      Take();
+      distinct = true;
+      const Token& after = Peek();
+      if (after.kind == TokenKind::kStar || after.kind == TokenKind::kRightParen) {
+        return Syntax(after.span, "expected a column after DISTINCT, found " + Describe(after));
+      }
+    }
     const Token& arg = Peek();
     std::optional<ColumnRef> column;
     if (arg.kind == TokenKind::kStar) {
@@ -549,8 +596,6 @@ class Parser {
       }
       Take();
       kind = AggKind::kCountStar;
-    } else if (arg.IsKeyword("DISTINCT")) {
-      return Unsupported(arg.span, "DISTINCT aggregates are not supported");
     } else if (arg.IsKeyword("ALL")) {
       return Unsupported(arg.span, "ALL in aggregate calls is not supported");
     } else if (arg.kind == TokenKind::kRightParen) {
@@ -583,7 +628,8 @@ class Parser {
                                     "(, found " + Describe(close));
     }
     const SourceSpan span = Cover(name.span, Take().span);
-    return AggregateCall{.kind = kind, .arg = std::move(column), .span = span};
+    return AggregateCall{
+        .kind = kind, .arg = std::move(column), .distinct = distinct, .span = span};
   }
 
   // A column reference or a literal; rejects every other expression start.
@@ -674,9 +720,14 @@ class Parser {
         !IsReservedKeyword(keyword) || keyword == "LEFT" || keyword == "RIGHT";
     if (next.kind == TokenKind::kLeftParen && function_like) {
       if (AggregateOf(token).has_value()) {
-        return Syntax(token.span, context == Context::kWhere
-                                      ? "aggregate functions are not allowed in WHERE"
-                                      : "aggregate function calls cannot be nested");
+        switch (context) {
+          case Context::kWhere:
+            return Syntax(token.span, "aggregate functions are not allowed in WHERE");
+          case Context::kGroupBy:
+            return Syntax(token.span, "aggregate functions are not allowed in GROUP BY");
+          default:
+            return Syntax(token.span, "aggregate function calls cannot be nested");
+        }
       }
       return Unsupported(token.span, "function " + Clip(token.text) +
                                          "() is not supported (only COUNT, SUM, AVG, MIN, MAX)");
@@ -754,7 +805,7 @@ class Parser {
       return Unsupported(token.span, "SELECT INTO is not supported");
     }
     if (token.kind == TokenKind::kEnd || token.kind == TokenKind::kSemicolon ||
-        keyword == "WHERE" || keyword == "LIMIT") {
+        IsClauseKeyword(keyword)) {
       return Unsupported(token.span, "SELECT without FROM is not supported");
     }
     return Syntax(token.span, std::string(star ? "expected FROM" : "expected ',' or FROM") +
@@ -878,7 +929,137 @@ class Parser {
                       .span = span};
   }
 
-  Expected<std::int64_t> ParseLimit() {
+  // GROUP BY column_ref (',' column_ref)*, positioned at GROUP.
+  Status ParseGroupBy(SelectStatement& stmt) {
+    const std::size_t begin = Take().span.offset;
+    if (!Peek().IsKeyword("BY")) {
+      return Syntax(Peek().span, "expected BY after GROUP, found " + Describe(Peek()));
+    }
+    Take();
+    if (Peek().IsKeyword("ALL")) {
+      return Unsupported(Peek().span, "GROUP BY ALL is not supported");
+    }
+    if (Peek().IsKeyword("GROUPING") && PeekAt(1).IsKeyword("SETS")) {
+      return Unsupported(Peek().span, "GROUPING SETS are not supported");
+    }
+    while (true) {
+      const Token& token = Peek();
+      if (token.kind == TokenKind::kInteger) {
+        return Unsupported(token.span,
+                           "GROUP BY positions are not supported (write the column name)");
+      }
+      auto operand = ParseOperand(Context::kGroupBy);
+      if (!operand) {
+        return std::unexpected(std::move(operand.error()));
+      }
+      auto* column = std::get_if<ColumnRef>(&*operand);
+      if (column == nullptr) {
+        return Unsupported(SpanOf(*operand), "constants in GROUP BY are not supported");
+      }
+      stmt.group_by.push_back(std::move(*column));
+      if (auto error = UnsupportedOperator(); error.has_value()) {
+        return std::unexpected(std::move(*error));
+      }
+      if (Peek().kind != TokenKind::kComma) {
+        break;
+      }
+      const SourceSpan comma = Take().span;
+      if (EndsList(Peek())) {
+        return Unsupported(comma, "a trailing comma in GROUP BY is not supported");
+      }
+    }
+    stmt.group_by_span = SourceSpan{.offset = begin, .length = last_end_ - begin};
+    return {};
+  }
+
+  // ORDER BY order_item (',' order_item)*, positioned at ORDER.
+  Status ParseOrderBy(SelectStatement& stmt) {
+    const std::size_t begin = Take().span.offset;
+    if (!Peek().IsKeyword("BY")) {
+      return Syntax(Peek().span, "expected BY after ORDER, found " + Describe(Peek()));
+    }
+    Take();
+    if (Peek().IsKeyword("ALL")) {
+      return Unsupported(Peek().span, "ORDER BY ALL is not supported");
+    }
+    while (true) {
+      auto item = ParseOrderItem();
+      if (!item) {
+        return std::unexpected(std::move(item.error()));
+      }
+      stmt.order_by.push_back(std::move(*item));
+      if (Peek().kind != TokenKind::kComma) {
+        break;
+      }
+      const SourceSpan comma = Take().span;
+      if (EndsList(Peek())) {
+        return Unsupported(comma, "a trailing comma in ORDER BY is not supported");
+      }
+    }
+    stmt.order_by_span = SourceSpan{.offset = begin, .length = last_end_ - begin};
+    return {};
+  }
+
+  Expected<OrderItem> ParseOrderItem() {
+    const Token& first = Peek();
+    if (first.kind == TokenKind::kInteger) {
+      return Unsupported(first.span,
+                         "ORDER BY positions are not supported (write the column, alias or "
+                         "aggregate)");
+    }
+    OrderItem item;
+    if (auto agg_kind = AggregateOf(first);
+        agg_kind.has_value() && PeekAt(1).kind == TokenKind::kLeftParen) {
+      auto agg = ParseAggregate(*agg_kind);
+      if (!agg) {
+        return std::unexpected(std::move(agg.error()));
+      }
+      item.span = agg->span;
+      item.expr = std::move(*agg);
+      if (Peek().IsKeyword("FILTER") && PeekAt(1).kind == TokenKind::kLeftParen) {
+        return Unsupported(Peek().span, "aggregate FILTER clauses are not supported");
+      }
+    } else {
+      auto operand = ParseOperand(Context::kOrderBy);
+      if (!operand) {
+        return std::unexpected(std::move(operand.error()));
+      }
+      auto* column = std::get_if<ColumnRef>(&*operand);
+      if (column == nullptr) {
+        return Unsupported(SpanOf(*operand), "constants in ORDER BY are not supported");
+      }
+      item.span = column->span;
+      item.expr = std::move(*column);
+    }
+    if (auto error = UnsupportedOperator(); error.has_value()) {
+      return std::unexpected(std::move(*error));
+    }
+    if (Peek().IsKeyword("USING")) {  // PostgreSQL's ORDER BY a USING <
+      return Unsupported(Peek().span, "ORDER BY ... USING is not supported");
+    }
+    const bool asc = Peek().IsKeyword("ASC");
+    if (asc || Peek().IsKeyword("DESC")) {
+      item.descending = !asc;
+      item.span = Cover(item.span, Take().span);
+    }
+    if (Peek().IsKeyword("NULLS")) {
+      const Token& which = PeekAt(1);
+      if (which.IsKeyword("FIRST")) {
+        item.nulls = NullsOrder::kFirst;
+      } else if (which.IsKeyword("LAST")) {
+        item.nulls = NullsOrder::kLast;
+      } else {
+        return Syntax(which.span, "expected FIRST or LAST after NULLS, found " + Describe(which));
+      }
+      Take();
+      item.span = Cover(item.span, Take().span);
+    }
+    return item;
+  }
+
+  // The integer after LIMIT or OFFSET (`clause`).
+  Expected<std::int64_t> ParseLimit(std::string_view clause) {
+    const std::string name(clause);
     const Token& token = Peek();
     if (token.kind == TokenKind::kInteger) {
       Token digits = Take();
@@ -887,30 +1068,30 @@ class Parser {
       const char* last = first + digits.text.size();
       const auto [ptr, ec] = std::from_chars(first, last, value);
       if (ec != std::errc() || ptr != last) {
-        return Syntax(digits.span, "LIMIT " + Clip(digits.text) +
+        return Syntax(digits.span, name + " " + Clip(digits.text) +
                                        " is out of range (the maximum is 9223372036854775807)");
       }
       const Token& next = Peek();
       if (next.kind == TokenKind::kPercent || next.IsKeyword("PERCENT")) {
-        return Unsupported(next.span, "LIMIT with a percentage is not supported");
+        return Unsupported(next.span, name + " with a percentage is not supported");
       }
       if (auto error = UnsupportedOperator(); error.has_value()) {
         return std::unexpected(std::move(*error));
       }
-      if (Peek().kind == TokenKind::kComma) {
+      if (clause == "LIMIT" && Peek().kind == TokenKind::kComma) {
         return Unsupported(Peek().span, "LIMIT with an offset (LIMIT n, m) is not supported");
       }
       return value;
     }
     const std::string keyword = KeywordOf(token);
     if (keyword == "ALL") {
-      return Unsupported(token.span, "LIMIT ALL is not supported");
+      return Unsupported(token.span, name + " ALL is not supported");
     }
     if (token.kind == TokenKind::kMinus) {
-      return Syntax(token.span, "LIMIT must not be negative");
+      return Syntax(token.span, name + " must not be negative");
     }
     if (token.kind == TokenKind::kDecimal) {  // PostgreSQL and DuckDB round it
-      return Unsupported(token.span, "non-integer LIMIT values are not supported");
+      return Unsupported(token.span, "non-integer " + name + " values are not supported");
     }
     if (auto construct = Find(kUnsupportedOperandKeywords, keyword); construct.has_value()) {
       return Unsupported(token.span, *construct);
@@ -924,19 +1105,19 @@ class Parser {
       case TokenKind::kLeftBracket:
       case TokenKind::kLeftBrace:
         return Unsupported(token.span,
-                           "LIMIT expressions are not supported (LIMIT takes an integer)");
+                           name + " expressions are not supported (" + name + " takes an integer)");
       default:
         break;
     }
     if (token.kind == TokenKind::kIdentifier && PeekAt(1).kind == TokenKind::kLeftParen) {
       return Unsupported(token.span,
-                         "LIMIT expressions are not supported (LIMIT takes an integer)");
+                         name + " expressions are not supported (" + name + " takes an integer)");
     }
     return Syntax(token.span,
-                  "expected a non-negative integer after LIMIT, found " + Describe(token));
+                  "expected a non-negative integer after " + name + ", found " + Describe(token));
   }
 
-  Status ParseEnd(bool has_where, bool has_limit) {
+  Status ParseEnd(const SelectStatement& stmt) {
     const Token& token = Peek();
     if (token.kind == TokenKind::kEnd) {
       return {};
@@ -952,11 +1133,33 @@ class Parser {
     if (auto construct = Find(kUnsupportedClauses, keyword); construct.has_value()) {
       return Unsupported(token.span, *construct);
     }
-    std::string expected = "expected the end of the query";
-    if (!has_limit) {
-      expected = has_where ? "expected AND, LIMIT or the end of the query"
-                           : "expected WHERE, LIMIT or the end of the query";
+    // The clauses that could still follow, in grammar order.
+    const bool grouped_or_later = !stmt.group_by.empty() || !stmt.order_by.empty() ||
+                                  stmt.limit.has_value() || stmt.offset.has_value();
+    const bool ordered_or_later =
+        !stmt.order_by.empty() || stmt.limit.has_value() || stmt.offset.has_value();
+    std::vector<std::string_view> next;
+    if (!grouped_or_later) {
+      next.emplace_back(stmt.where.empty() ? "WHERE" : "AND");
+      next.emplace_back("GROUP BY");
     }
+    if (!ordered_or_later) {
+      next.emplace_back("ORDER BY");
+    }
+    if (!stmt.limit.has_value()) {
+      next.emplace_back("LIMIT");
+    }
+    if (!stmt.offset.has_value()) {
+      next.emplace_back("OFFSET");
+    }
+    std::string expected = "expected ";
+    for (const std::string_view clause : next) {
+      expected += std::string(clause) + ", ";
+    }
+    if (!next.empty()) {
+      expected.replace(expected.size() - 2, 2, " or ");
+    }
+    expected += "the end of the query";
     return Syntax(token.span, "unexpected " + Describe(token) + "; " + expected);
   }
 

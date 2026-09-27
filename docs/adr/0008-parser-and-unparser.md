@@ -20,7 +20,7 @@ Accepted
 - The lexer and a recursive-descent parser are hand-written in `src/sql/`. They return
   `std::expected<SelectStatement, sql::ParseError>`; every AST node carries the source span it came from.
 - Keywords are matched case-insensitively and are not reserved by the lexer. Constructs outside the implemented
-  subset that the parser recognizes (for example `GROUP BY`, `ORDER BY`, `JOIN`) produce `kUnsupported` errors with
+  subset that the parser recognizes (for example `HAVING`, `JOIN`, `OR`) produce `kUnsupported` errors with
   the span of the first offending token.
 - A canonical unparser, `sql::ToSql`, renders an AST as SQL text with upper-case keywords and single spaces, quoting
   identifiers only where the source quoted them.

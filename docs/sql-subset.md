@@ -24,9 +24,10 @@ SELECT * FROM '/data/hits_*.parquet' LIMIT 5
   (no data page is read); under `WHERE` it counts the rows the filter selects without copying them.
 - Result names and types follow DuckDB ([Binding](#binding)); values follow the [Semantics](#semantics) below.
 - `--` line comments, `/* block */` comments and one trailing `;` are allowed.
-- SQL outside the grammar (`GROUP BY`, `ORDER BY`, `JOIN`, `OR`, functions, ...) fails with exit code 4 and points
-  at the first unsupported token. Malformed SQL (a syntax error) and SQL that is wrong for the table (a bind error)
-  fail with exit code 1.
+- SQL outside the grammar (`HAVING`, `JOIN`, `OR`, functions, ...) fails with exit code 4 and points at the first
+  unsupported token. `GROUP BY`, `ORDER BY`, `OFFSET` and `COUNT(DISTINCT ...)` are parsed but not answered yet: they
+  also fail with exit code 4, pointing at the clause. Malformed SQL (a syntax error) and SQL that is wrong for the table
+  (a bind error) fail with exit code 1.
 
 ```bash
 pixi run antb1 query -f query.sql --table hits=/data/clickbench/hits_0.parquet --clickbench
@@ -43,11 +44,17 @@ case-insensitive.
 
 ```ebnf
 statement   = query , [ ";" ] ;
-query       = "SELECT" , select_list , "FROM" , table_ref , [ "WHERE" , predicate ] , [ "LIMIT" , integer ] ;
+query       = "SELECT" , select_list , "FROM" , table_ref , [ "WHERE" , predicate ] ,
+              [ "GROUP" , "BY" , column_ref , { "," , column_ref } ] ,        (* parsed, not answered yet *)
+              [ "ORDER" , "BY" , order_item , { "," , order_item } ] ,        (* parsed, not answered yet *)
+              [ limit_offset ] ;
+limit_offset = "LIMIT" , integer , [ "OFFSET" , integer ] | "OFFSET" , integer , [ "LIMIT" , integer ] ;
 select_list = "*" | select_item , { "," , select_item } ;
 select_item = ( agg_call | column_ref ) , [ [ "AS" ] , identifier ] ;
 agg_call    = "COUNT" , "(" , "*" , ")"
+            | "COUNT" , "(" , "DISTINCT" , column_ref , ")"                   (* parsed, not answered yet *)
             | ( "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" ) , "(" , column_ref , ")" ;
+order_item  = ( agg_call | column_ref ) , [ "ASC" | "DESC" ] , [ "NULLS" , ( "FIRST" | "LAST" ) ] ;
 table_ref   = identifier | string_literal ;
 column_ref  = identifier ;
 predicate   = comparison , { "AND" , comparison } ;
@@ -62,16 +69,23 @@ sequence of digits; a `decimal` is a number with a decimal point, an exponent or
 Keywords are not reserved by the lexer. A literal-first comparison is normalized by the parser (`5 < c` becomes
 `c > 5`).
 
-Outside the grammar, the parser recognizes common SQL and rejects it with exit code 4 and a source span, among
-others: `GROUP BY`, `ORDER BY`, `DISTINCT`, `HAVING`, `OFFSET`, joins, `LIKE`, `IN`, `CASE`, arithmetic, function
-calls other than the five aggregates, `NULL` literals, `IS [NOT] NULL`, `OR` and `NOT`. Malformed SQL inside the
-subset, such as `SELECT COUNT(*) FORM t`, is a syntax error with exit code 1.
+The parser accepts `GROUP BY`, `ORDER BY`, `OFFSET` (any `OFFSET` in the grammar) and `COUNT(DISTINCT column)`, but the
+binder does not answer them yet: such a query fails with exit code 4 (`GROUP BY is not supported yet`), pointing at the
+`COUNT(DISTINCT ...)` call or at the clause ([Binding](#binding)). `GROUP BY` and `ORDER BY` positions (`ORDER BY 2`),
+`ALL`, constants and expressions are rejected by the parser, and so are `SUM`, `AVG`, `MIN` and `MAX` with `DISTINCT`.
+
+Outside the grammar, the parser recognizes common SQL and rejects it with exit code 4 and a source span, among others:
+`SELECT DISTINCT`, `HAVING`, joins, `LIKE`, `IN`, `CASE`, arithmetic, function calls other than the five aggregates,
+`NULL` literals, `IS [NOT] NULL`, `OR` and `NOT`. Malformed SQL inside the subset, such as `SELECT COUNT(*) FORM t`, is
+a syntax error with exit code 1.
 
 ## Binding
 
-The binder (`plan::Bind`) resolves the statement against the table and builds the logical plan. A bind error has
-exit code 1 and points at the offending name, call or literal; the first error in query order wins (the table,
-then the select list, `WHERE` and `LIMIT`).
+The binder (`plan::Bind`) resolves the statement against the table and builds the logical plan. First it rejects the
+syntax that is parsed but not answered yet, before any other check and whatever the table: a `COUNT(DISTINCT ...)` in
+the select list, then `GROUP BY`, `ORDER BY` and `OFFSET`, each with exit code 4. A bind error has exit code 1 and
+points at the offending name, call or literal; the first error in query order wins (the table, then the select list,
+`WHERE` and `LIMIT`).
 
 - Names: table and column names match ASCII case-insensitively, quoted identifiers included (as in DuckDB). An
   unknown table or column is a bind error, and so is a name that matches two columns differing only in case. A
@@ -210,7 +224,7 @@ formatter:
 | 1 | query error: syntax, bind or execution error | `SELECT COUNT(*) FORM t`; an unknown table or column; `SUM` of a VARCHAR column; a `SUM` outside HUGEINT's range |
 | 2 | usage error | unknown option; neither or both of `-c` and `-f`; a malformed `--table` or `--column-type`; a column that `--column-type` cannot read as DATE; a table name registered twice |
 | 3 | I/O error | a missing or unreadable file; not a Parquet file; schemas that differ; a glob that matches nothing |
-| 4 | unsupported: valid-looking SQL outside the supported subset | `GROUP BY`; `ORDER BY`; `OR`; a function call; a column of an unsupported type |
+| 4 | unsupported: valid-looking SQL outside the supported subset | `HAVING`; `OR`; a function call; `GROUP BY`, `ORDER BY`, `OFFSET` and `COUNT(DISTINCT ...)` (not answered yet); a column of an unsupported type |
 | 70 | internal error: anything else, which is a bug | an uncaught exception; an Arrow `NotImplemented` or type error without SQL context |
 
 Exit code 4 is used only for errors that the parser, the binder or the physical planner marks as unsupported

@@ -348,6 +348,63 @@ TEST(ParserTest, Limit) {
   EXPECT_EQ(no_where->limit, std::optional<std::int64_t>(3));
 }
 
+TEST(ParserTest, GroupByOrderByLimitOffset) {
+  const std::string sql =
+      "SELECT a, COUNT(*) AS c FROM events WHERE b = 1 GROUP BY a, \"B\" ORDER BY c DESC, "
+      "SUM(x) NULLS FIRST, a asc nulls last LIMIT 10 OFFSET 5";
+  auto stmt = Parse(sql);
+  ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
+  ASSERT_EQ(stmt->group_by.size(), 2U);
+  EXPECT_EQ(stmt->group_by[0].name, "a");
+  EXPECT_TRUE(stmt->group_by[1].quoted);
+  EXPECT_EQ(At(sql, stmt->group_by_span), "GROUP BY a, \"B\"");
+  ASSERT_EQ(stmt->order_by.size(), 3U);
+  EXPECT_EQ(std::get<ColumnRef>(stmt->order_by[0].expr).name, "c");
+  EXPECT_TRUE(stmt->order_by[0].descending);
+  EXPECT_EQ(stmt->order_by[0].nulls, NullsOrder::kDefault);
+  EXPECT_EQ(std::get<AggregateCall>(stmt->order_by[1].expr).kind, AggKind::kSum);
+  EXPECT_FALSE(stmt->order_by[1].descending);
+  EXPECT_EQ(stmt->order_by[1].nulls, NullsOrder::kFirst);
+  EXPECT_EQ(stmt->order_by[2].nulls, NullsOrder::kLast);
+  EXPECT_EQ(At(sql, stmt->order_by[2].span), "a asc nulls last");
+  EXPECT_EQ(At(sql, stmt->order_by_span), "ORDER BY c DESC, SUM(x) NULLS FIRST, a asc nulls last");
+  EXPECT_EQ(stmt->limit, 10);
+  EXPECT_EQ(stmt->offset, 5);
+  EXPECT_EQ(At(sql, stmt->offset_span), "OFFSET 5");
+  EXPECT_EQ(At(sql, stmt->span), sql);
+}
+
+TEST(ParserTest, OffsetBeforeLimitAndAlone) {
+  auto both = Parse("SELECT a FROM events OFFSET 3 LIMIT 2");
+  ASSERT_TRUE(both.has_value()) << both.error().message;
+  EXPECT_EQ(both->limit, 2);
+  EXPECT_EQ(both->offset, 3);
+  auto alone = Parse("SELECT a FROM events ORDER BY a OFFSET 0");
+  ASSERT_TRUE(alone.has_value()) << alone.error().message;
+  EXPECT_FALSE(alone->limit.has_value());
+  EXPECT_EQ(alone->offset, 0);
+}
+
+TEST(ParserTest, CountDistinct) {
+  auto stmt = Parse("SELECT count( distinct user_id ), COUNT(user_id) FROM events");
+  ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
+  const auto& distinct = std::get<AggregateCall>(stmt->items[0].expr);
+  EXPECT_EQ(distinct.kind, AggKind::kCount);
+  EXPECT_TRUE(distinct.distinct);
+  EXPECT_EQ(ArgName(distinct), "user_id");
+  EXPECT_FALSE(std::get<AggregateCall>(stmt->items[1].expr).distinct);
+}
+
+// NULLS, FIRST and LAST are not reserved: they stay usable as names.
+TEST(ParserTest, OrderByModifierWordsAreNames) {
+  auto stmt = Parse("SELECT nulls, first, last FROM events ORDER BY nulls NULLS LAST, first");
+  ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
+  ASSERT_EQ(stmt->order_by.size(), 2U);
+  EXPECT_EQ(std::get<ColumnRef>(stmt->order_by[0].expr).name, "nulls");
+  EXPECT_EQ(stmt->order_by[0].nulls, NullsOrder::kLast);
+  EXPECT_EQ(std::get<ColumnRef>(stmt->order_by[1].expr).name, "first");
+}
+
 TEST(ParserTest, KeywordsAreCaseInsensitive) {
   auto stmt = Parse("sElEcT cOuNt(*) aS n FrOm events wHeRe a = 1 AnD b = 2 LiMiT 5");
   ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
@@ -511,32 +568,59 @@ constexpr auto kSyntax = ParseError::Kind::kSyntax;
 INSTANTIATE_TEST_SUITE_P(
     Unsupported, RejectTest,
     ::testing::Values(
-        RejectCase{"GroupBy", "SELECT COUNT(*) FROM events ^GROUP BY region", kUnsupported, 5,
-                   "GROUP BY is not supported"},
-        RejectCase{"GroupByAfterWhere", "SELECT COUNT(*) FROM events WHERE a = 1 ^group by a",
-                   kUnsupported, 5, "GROUP BY is not supported"},
         RejectCase{"GroupByWithoutFrom", "SELECT a ^GROUP BY a", kUnsupported, 5,
-                   "GROUP BY is not supported"},
-        RejectCase{"OrderBy", "SELECT a FROM events ^ORDER BY a", kUnsupported, 5,
-                   "ORDER BY is not supported"},
-        RejectCase{"OrderByAfterLimit", "SELECT a FROM events LIMIT 5 ^ORDER BY a", kUnsupported, 5,
-                   "ORDER BY is not supported"},
+                   "SELECT without FROM is not supported"},
+        RejectCase{"GroupByPosition", "SELECT a FROM events GROUP BY ^1", kUnsupported, 1,
+                   "GROUP BY positions are not supported"},
+        RejectCase{"GroupByAll", "SELECT a FROM events GROUP BY ^ALL", kUnsupported, 3,
+                   "GROUP BY ALL is not supported"},
+        RejectCase{"GroupByConstant", "SELECT a FROM events GROUP BY ^'x'", kUnsupported, 3,
+                   "constants in GROUP BY are not supported"},
+        RejectCase{"GroupByExpression", "SELECT a FROM events GROUP BY a ^+ 1", kUnsupported, 1,
+                   "arithmetic operator '+' is not supported"},
+        RejectCase{"GroupByFunction", "SELECT a FROM events GROUP BY ^year(d)", kUnsupported, 4,
+                   "function year() is not supported"},
+        RejectCase{"GroupByTrailingComma", "SELECT a FROM events GROUP BY a^, ORDER BY a",
+                   kUnsupported, 1, "a trailing comma in GROUP BY is not supported"},
+        RejectCase{"HavingAfterGroupBy", "SELECT a FROM events GROUP BY a ^HAVING COUNT(*) > 1",
+                   kUnsupported, 6, "HAVING is not supported"},
+        RejectCase{"OrderByPosition", "SELECT a FROM events ORDER BY ^2", kUnsupported, 1,
+                   "ORDER BY positions are not supported"},
+        RejectCase{"OrderByAll", "SELECT a FROM events ORDER BY ^ALL", kUnsupported, 3,
+                   "ORDER BY ALL is not supported"},
+        RejectCase{"OrderByConstant", "SELECT a FROM events ORDER BY ^'x'", kUnsupported, 3,
+                   "constants in ORDER BY are not supported"},
+        RejectCase{"OrderByExpression", "SELECT a FROM events ORDER BY a ^* 2 DESC", kUnsupported,
+                   1, "arithmetic operator '*' is not supported"},
+        RejectCase{"OrderByTrailingComma", "SELECT a FROM events ORDER BY a DESC^, LIMIT 5",
+                   kUnsupported, 1, "a trailing comma in ORDER BY is not supported"},
+        RejectCase{"OrderByCollate", "SELECT a FROM events ORDER BY a ^COLLATE nocase",
+                   kUnsupported, 7, "COLLATE is not supported"},
+        RejectCase{"OrderByAggregateFilter",
+                   "SELECT a FROM events ORDER BY COUNT(a) ^FILTER (WHERE a = 1)", kUnsupported, 6,
+                   "aggregate FILTER clauses are not supported"},
+        RejectCase{"OrderByUsing", "SELECT a FROM events ORDER BY a ^USING <", kUnsupported, 5,
+                   "ORDER BY ... USING is not supported"},
+        RejectCase{"GroupingSets", "SELECT a FROM events GROUP BY ^GROUPING SETS ((a))",
+                   kUnsupported, 8, "GROUPING SETS are not supported"},
         RejectCase{"OrderByInAggregate", "SELECT SUM(a ^ORDER BY b) FROM events", kUnsupported, 5,
                    "ORDER BY is not supported"},
         RejectCase{"Distinct", "SELECT ^DISTINCT region FROM events", kUnsupported, 8,
                    "DISTINCT is not supported"},
-        RejectCase{"DistinctAggregate", "SELECT COUNT(^distinct user_id) FROM events", kUnsupported,
-                   8, "DISTINCT aggregates are not supported"},
+        RejectCase{"SumDistinct", "SELECT SUM(^distinct user_id) FROM events", kUnsupported, 8,
+                   "SUM(DISTINCT ...) is not supported"},
+        RejectCase{"MaxDistinctInOrderBy", "SELECT a FROM events ORDER BY MAX(^DISTINCT a)",
+                   kUnsupported, 8, "MAX(DISTINCT ...) is not supported"},
         RejectCase{"SelectAll", "SELECT ^ALL a FROM events", kUnsupported, 3,
                    "SELECT ALL is not supported"},
         RejectCase{"AllAggregate", "SELECT COUNT(^ALL a) FROM events", kUnsupported, 3,
                    "ALL in aggregate calls is not supported"},
         RejectCase{"Having", "SELECT COUNT(*) FROM events ^HAVING COUNT(*) > 1", kUnsupported, 6,
                    "HAVING is not supported"},
-        RejectCase{"Offset", "SELECT a FROM events LIMIT 10 ^OFFSET 5", kUnsupported, 6,
-                   "OFFSET is not supported"},
-        RejectCase{"OffsetWithoutLimit", "SELECT a FROM events ^OFFSET 5", kUnsupported, 6,
-                   "OFFSET is not supported"},
+        RejectCase{"OffsetAll", "SELECT a FROM events OFFSET ^ALL", kUnsupported, 3,
+                   "OFFSET ALL is not supported"},
+        RejectCase{"OffsetExpression", "SELECT a FROM events OFFSET ^(1)", kUnsupported, 1,
+                   "OFFSET expressions are not supported (OFFSET takes an integer)"},
         RejectCase{"LimitCommaOffset", "SELECT a FROM events LIMIT 5^, 10", kUnsupported, 1,
                    "LIMIT with an offset (LIMIT n, m) is not supported"},
         RejectCase{"Join", "SELECT a FROM events ^JOIN users ON a = b", kUnsupported, 4,
@@ -919,7 +1003,8 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"DanglingAnd", "SELECT a FROM events WHERE a = 1 AND^", kSyntax, 0,
                    "expected a column or a literal, found end of input"},
         RejectCase{"ChainedComparison", "SELECT a FROM events WHERE a = 1 ^= 2", kSyntax, 1,
-                   "unexpected '='; expected AND, LIMIT or the end of the query"},
+                   "unexpected '='; expected AND, GROUP BY, ORDER BY, LIMIT, OFFSET or the end of "
+                   "the query"},
         RejectCase{"MissingLimit", "SELECT a FROM events LIMIT^", kSyntax, 0,
                    "expected a non-negative integer after LIMIT, found end of input"},
         RejectCase{"NegativeLimit", "SELECT a FROM events LIMIT ^-1", kSyntax, 1,
@@ -929,13 +1014,45 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"LimitHuge", "SELECT a FROM events LIMIT ^123456789012345678901234567890",
                    kSyntax, 30, "LIMIT 123456789012345678901234567890 is out of range"},
         RejectCase{"WhereAfterLimit", "SELECT a FROM events LIMIT 5 ^WHERE a = 1", kSyntax, 5,
-                   "unexpected keyword WHERE; expected the end of the query"},
+                   "unexpected keyword WHERE; expected OFFSET or the end of the query"},
         RejectCase{"DuplicateWhere", "SELECT a FROM events WHERE a = 1 ^WHERE b = 2", kSyntax, 5,
-                   "unexpected keyword WHERE; expected AND, LIMIT or the end of the query"},
+                   "unexpected keyword WHERE; expected AND, GROUP BY, ORDER BY, LIMIT, OFFSET or "
+                   "the end of the "
+                   "query"},
         RejectCase{"DuplicateLimit", "SELECT a FROM events LIMIT 1 ^LIMIT 2", kSyntax, 5,
-                   "unexpected keyword LIMIT; expected the end of the query"},
+                   "unexpected keyword LIMIT; expected OFFSET or the end of the query"},
         RejectCase{"StrayParen", "SELECT a FROM events^)", kSyntax, 1,
-                   "unexpected ')'; expected WHERE, LIMIT or the end of the query"},
+                   "unexpected ')'; expected WHERE, GROUP BY, ORDER BY, LIMIT, OFFSET or the end "
+                   "of the query"},
+        RejectCase{"GroupWithoutBy", "SELECT a FROM events GROUP ^a", kSyntax, 1,
+                   "expected BY after GROUP, found identifier a"},
+        RejectCase{"OrderWithoutBy", "SELECT a FROM events ORDER ^a", kSyntax, 1,
+                   "expected BY after ORDER, found identifier a"},
+        RejectCase{"EmptyGroupBy", "SELECT a FROM events GROUP BY^", kSyntax, 0,
+                   "expected a column, found end of input"},
+        RejectCase{"EmptyOrderBy", "SELECT a FROM events ORDER BY ^LIMIT 1", kSyntax, 5,
+                   "expected a column or an aggregate, found keyword LIMIT"},
+        RejectCase{"GroupByAggregate", "SELECT a FROM events GROUP BY ^COUNT(a)", kSyntax, 5,
+                   "aggregate functions are not allowed in GROUP BY"},
+        RejectCase{"NullsWithoutFirstOrLast", "SELECT a FROM events ORDER BY a NULLS ^LATE",
+                   kSyntax, 4, "expected FIRST or LAST after NULLS, found identifier LATE"},
+        RejectCase{"CountDistinctStar", "SELECT COUNT(DISTINCT ^*) FROM events", kSyntax, 1,
+                   "expected a column after DISTINCT, found '*'"},
+        RejectCase{"CountDistinctEmpty", "SELECT COUNT(DISTINCT ^) FROM events", kSyntax, 1,
+                   "expected a column after DISTINCT, found ')'"},
+        RejectCase{"GroupByAfterOrderBy", "SELECT a FROM events ORDER BY a ^GROUP BY a", kSyntax, 5,
+                   "unexpected keyword GROUP; expected LIMIT, OFFSET or the end of the query"},
+        RejectCase{"WhereAfterGroupBy", "SELECT a FROM events GROUP BY a ^WHERE a = 1", kSyntax, 5,
+                   "unexpected keyword WHERE; expected ORDER BY, LIMIT, OFFSET or the end of the "
+                   "query"},
+        RejectCase{"DuplicateOffset", "SELECT a FROM events OFFSET 1 ^OFFSET 2", kSyntax, 6,
+                   "unexpected keyword OFFSET; expected LIMIT or the end of the query"},
+        RejectCase{"ThirdLimit", "SELECT a FROM events LIMIT 1 OFFSET 2 ^LIMIT 3", kSyntax, 5,
+                   "unexpected keyword LIMIT; expected the end of the query"},
+        RejectCase{"NegativeOffset", "SELECT a FROM events OFFSET ^-1", kSyntax, 1,
+                   "OFFSET must not be negative"},
+        RejectCase{"OrderByAfterLimit", "SELECT a FROM events LIMIT 5 ^ORDER BY a", kSyntax, 5,
+                   "unexpected keyword ORDER; expected OFFSET or the end of the query"},
         RejectCase{"UnterminatedString", "SELECT a FROM events WHERE a = ^'open", kSyntax, 5,
                    "unterminated string literal"},
         RejectCase{"UnterminatedIdentifier", R"(SELECT ^"open FROM events)", kSyntax, 17,
@@ -967,9 +1084,9 @@ INSTANTIATE_TEST_SUITE_P(
     CaseName);
 
 TEST(ParserTest, ExactMessages) {
-  auto group = Parse("SELECT COUNT(*) FROM events GROUP BY region");
-  ASSERT_FALSE(group.has_value());
-  EXPECT_EQ(group.error().message, "GROUP BY is not supported; see docs/sql-subset.md");
+  auto having = Parse("SELECT COUNT(*) FROM events HAVING COUNT(*) > 1");
+  ASSERT_FALSE(having.has_value());
+  EXPECT_EQ(having.error().message, "HAVING is not supported; see docs/sql-subset.md");
   auto limit = Parse("SELECT a FROM events LIMIT 9223372036854775808");
   ASSERT_FALSE(limit.has_value());
   EXPECT_EQ(limit.error().message,

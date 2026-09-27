@@ -63,6 +63,18 @@ constexpr auto kUnsupported = SqlErrorDetail::Kind::kUnsupported;
 INSTANTIATE_TEST_SUITE_P(
     Binder, BindErrorTest,
     ::testing::Values(
+        // Parsed but not answered yet: kUnsupported before any other check, even when the
+        // table or a column does not exist.
+        ErrorCase{"SELECT i16, COUNT(*) FROM t GROUP BY i16", kUnsupported, "GROUP BY i16",
+                  "GROUP BY is not supported yet"},
+        ErrorCase{"SELECT nope FROM missing GROUP BY nope, \"Nope\"", kUnsupported,
+                  "GROUP BY nope, \"Nope\"", "GROUP BY is not supported yet"},
+        ErrorCase{"SELECT i16 FROM t ORDER BY i16 DESC NULLS FIRST, COUNT(*)", kUnsupported,
+                  "ORDER BY i16 DESC NULLS FIRST, COUNT(*)", "ORDER BY is not supported yet"},
+        ErrorCase{"SELECT i16 FROM t LIMIT 5 OFFSET 3", kUnsupported, "OFFSET 3",
+                  "OFFSET is not supported yet"},
+        ErrorCase{"SELECT COUNT(i16), COUNT(DISTINCT i32) FROM t", kUnsupported,
+                  "COUNT(DISTINCT i32)", "COUNT(DISTINCT ...) is not supported yet"},
         // Tables.
         ErrorCase{"SELECT COUNT(*) FROM nope", kBind, "nope", "table 'nope' does not exist"},
         ErrorCase{"SELECT COUNT(*) FROM \"nope\"", kBind, "\"nope\"", "does not exist"},
