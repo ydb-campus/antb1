@@ -53,6 +53,10 @@ enum class Feature : std::uint8_t {
   // LIMIT
   kLimit,    // LIMIT n
   kGroupBy,  // GROUP BY on plain columns
+  // ORDER BY
+  kOrderBy,     // ORDER BY columns, aliases or aggregates, [ASC | DESC]
+  kNullsOrder,  // NULLS FIRST / NULLS LAST
+  kOffset,      // OFFSET m (with or without LIMIT)
   // Lexical variants
   kKeywordCase,       // keywords in lower or mixed case
   kIdentifierCase,    // table and column names in another case than declared
@@ -130,6 +134,12 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "semicolon";
     case Feature::kGroupBy:
       return "group_by";
+    case Feature::kOrderBy:
+      return "order_by";
+    case Feature::kNullsOrder:
+      return "nulls_order";
+    case Feature::kOffset:
+      return "offset";
     case Feature::kHaving:
       return "having";
   }
@@ -198,10 +208,11 @@ class FeatureSet {
 // Out-of-scope markers: valid in `-- features:` tags, never generated (see Feature::kHaving).
 inline constexpr FeatureSet kNeverGenerated = {Feature::kHaving};
 
-// What antb1 answers today: the whole slice grammar of docs/sql-subset.md (global aggregates,
-// projections, WHERE conjunctions of column <op> literal, LIMIT) over every column type, in any
-// case, quoting and layout. Listed feature by feature, so a Feature added to the vocabulary for new
-// grammar stays unsupported until the PR that implements it declares it here.
+// What antb1 answers today: the whole slice grammar of docs/sql-subset.md (global and grouped
+// aggregates, projections, WHERE conjunctions of column <op> literal, ORDER BY, LIMIT and OFFSET)
+// over every column type, in any case, quoting and layout. Listed feature by feature, so a Feature
+// added to the vocabulary for new grammar stays unsupported until the PR that implements it
+// declares it here.
 inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kCountStar,
     Feature::kCountColumn,
@@ -229,6 +240,9 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kDateLiteral,
     Feature::kLimit,
     Feature::kGroupBy,
+    Feature::kOrderBy,
+    Feature::kNullsOrder,
+    Feature::kOffset,
     Feature::kKeywordCase,
     Feature::kIdentifierCase,
     Feature::kQuotedIdentifier,

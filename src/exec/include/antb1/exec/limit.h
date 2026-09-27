@@ -2,17 +2,18 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 
 #include "antb1/exec/operator.h"
 
 namespace antb1::exec {
 
-// Passes on the first `limit` rows of its input (materializing selections) and then stops pulling:
-// the input is never asked for another batch once the limit is reached (LIMIT 0 reads nothing).
-// Output: the input columns.
+// Skips the first `offset` rows of its input, then passes on at most `limit` rows (none: all) and
+// stops pulling: the input is never asked for another batch once the limit is reached (LIMIT 0
+// reads nothing). Selections are narrowed, not materialized. Output: the input columns.
 class LimitOperator final : public Operator {
  public:
-  LimitOperator(std::unique_ptr<Operator> input, int64_t limit);
+  LimitOperator(std::unique_ptr<Operator> input, std::optional<int64_t> limit, int64_t offset = 0);
 
   [[nodiscard]] const std::shared_ptr<arrow::Schema>& output_schema() const override {
     return input_->output_schema();
@@ -23,9 +24,10 @@ class LimitOperator final : public Operator {
 
  private:
   std::unique_ptr<Operator> input_;
-  int64_t limit_;
+  std::optional<int64_t> limit_;
+  int64_t offset_;
+  int64_t skipped_ = 0;
   int64_t emitted_ = 0;
-  arrow::MemoryPool* pool_ = arrow::default_memory_pool();
 };
 
 }  // namespace antb1::exec

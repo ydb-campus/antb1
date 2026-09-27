@@ -56,8 +56,9 @@ struct GeneratedQuery {
   FeatureSet features;                // every feature the SQL uses
   bool target_sample = false;         // drawn from the full target grammar
   SortMode sort = SortMode::kNoSort;  // kRowSort for projections and GROUP BY: SQL has no row order
-  // LIMIT on a projection or GROUP BY (no ORDER BY): any rows of the unlimited answer are right, so
-  // the answer is compared as a subset of DuckDB's answer without the LIMIT (CompareSubset).
+  // LIMIT or OFFSET on a projection or GROUP BY (no ORDER BY): any rows of the unlimited answer are
+  // right, so the answer is compared as a subset of DuckDB's answer without the LIMIT
+  // (CompareSubset).
   bool unordered_limit = false;
 };
 

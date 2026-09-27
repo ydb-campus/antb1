@@ -1,5 +1,5 @@
 Output: URL:VARCHAR t:VARCHAR
-Limit 10
-  Project URL, Title
+Project URL, Title
+  Limit 10
     Filter SearchPhrase <> ''
       Scan table=t source=parquet(files=1, rows=10000) columns=[Title, URL, SearchPhrase]

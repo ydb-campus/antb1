@@ -219,13 +219,9 @@ constexpr auto kSplits = std::to_array<Split>({
      .literal_kind = slt::Feature::kDateLiteral},
 });
 
-}  // namespace
-
-Check AllEqual() {
-  return [](std::span<const ResultSet> answers) -> std::optional<std::string> {
-    const auto render = [](const ResultSet& r) {
-      return slt::RenderBlock(r, slt::SortMode::kRowSort, 0);
-    };
+Check EqualBlocks(slt::SortMode sort) {
+  return [sort](std::span<const ResultSet> answers) -> std::optional<std::string> {
+    const auto render = [sort](const ResultSet& r) { return slt::RenderBlock(r, sort, 0); };
     std::string letters;
     for (const auto c : answers[0].classes) {
       letters += slt::ClassLetter(c);
@@ -240,13 +236,36 @@ Check AllEqual() {
         return std::format("answer {} has column types {}, answer 0 has {}", i, other, letters);
       }
       const auto block = render(answers[i]);
-      if (auto diff = slt::CompareBlocks(first, block, letters, slt::SortMode::kRowSort,
-                                         slt::kDefaultRelTolerance)) {
+      if (auto diff = slt::CompareBlocks(first, block, letters, sort, slt::kDefaultRelTolerance)) {
         const std::size_t row = diff->first_row.value_or(0);
         return std::format("answer {} differs from answer 0: {} (row {}: {} vs {})", i,
                            diff->reason, row, row < first.size() ? first[row] : "(none)",
                            row < block.size() ? block[row] : "(none)");
       }
+    }
+    return std::nullopt;
+  };
+}
+
+}  // namespace
+
+Check AllEqual() { return EqualBlocks(slt::SortMode::kRowSort); }
+
+Check AllEqualInOrder() { return EqualBlocks(slt::SortMode::kNoSort); }
+
+Check SecondIsWindowOfFirst(int64_t offset, int64_t limit) {
+  return [offset, limit](std::span<const ResultSet> answers) -> std::optional<std::string> {
+    if (answers.size() != 2) {
+      return std::format("{} answers, expected 2", answers.size());
+    }
+    ResultSet window = answers[0];
+    const auto begin = std::min(window.rows.size(), static_cast<std::size_t>(offset));
+    const auto end = std::min(window.rows.size(), begin + static_cast<std::size_t>(limit));
+    window.rows = {window.rows.begin() + static_cast<std::ptrdiff_t>(begin),
+                   window.rows.begin() + static_cast<std::ptrdiff_t>(end)};
+    const std::array<ResultSet, 2> pair = {window, answers[1]};
+    if (auto diff = AllEqualInOrder()(pair)) {
+      return std::format("rows [{}, {}) of answer 0 vs answer 1: {}", begin, end, *diff);
     }
     return std::nullopt;
   };
@@ -516,6 +535,50 @@ std::vector<Relation> AllRelations() {
                .probes = {Q("SELECT COUNT(*) FROM hits_like WHERE ResolutionWidth > 1366"),
                           Q("SELECT COUNT(*) FROM hits_like WHERE 1366 < ResolutionWidth")},
                .check = AllEqual()});
+  // ORDER BY (with a unique last key, so that the order is total): the same rows in the same order
+  // whatever the batch size and file layout; a top-N is the window of the full sort.
+  {
+    const slt::FeatureSet sorted = {kOrderBy,        kColumns,  kMultipleItems,  kIntegerColumns,
+                                    kVarcharColumns, kWhere,    kIntegerLiteral, kLimit,
+                                    kOffset,         kTableName};
+    const auto sorted_sql = [](std::string_view table, bool top_n) {
+      return std::format(
+          "SELECT WatchID, OS, URL FROM {} WHERE RegionID < 2000 ORDER BY OS DESC, URL, WatchID{}",
+          table, top_n ? " LIMIT 40 OFFSET 25" : "");
+    };
+    for (const bool top_n : {false, true}) {
+      Relation sizes{.name = std::format("{}_batch_size_invariance", top_n ? "top_n" : "sorted"),
+                     .features = sorted,
+                     .probes = {},
+                     .check = AllEqualInOrder()};
+      for (const int64_t batch : kBatchSizes) {
+        sizes.probes.push_back(Q(sorted_sql("hits_like_split", top_n), batch));
+      }
+      sizes.probes.push_back(Q(sorted_sql("hits_like", top_n)));
+      r.push_back(std::move(sizes));
+    }
+    for (const int64_t batch : kBatchSizes) {
+      r.push_back({.name = std::format("top_n_is_window_of_sort_batch_{}", batch),
+                   .features = sorted,
+                   .probes = {Q(sorted_sql("hits_like_split", false), batch),
+                              Q(sorted_sql("hits_like_split", true), batch)},
+                   .check = SecondIsWindowOfFirst(25, 40)});
+    }
+    const slt::FeatureSet grouped_top_n = {kOrderBy,        kGroupBy,       kCountStar,
+                                           kColumns,        kMultipleItems, kAlias,
+                                           kIntegerColumns, kLimit,         kTableName};
+    Relation grouped{.name = "grouped_top_n_batch_size_invariance",
+                     .features = grouped_top_n,
+                     .probes = {},
+                     .check = AllEqualInOrder()};
+    for (const int64_t batch : kBatchSizes) {
+      grouped.probes.push_back(
+          Q("SELECT RegionID, COUNT(*) AS c FROM hits_like_split GROUP BY RegionID "
+            "ORDER BY c DESC, RegionID LIMIT 15",
+            batch));
+    }
+    r.push_back(std::move(grouped));
+  }
   r.push_back({.name = "limit_returns_min_of_n_and_rows",
                .features = {kCountStar, kColumns, kIntegerColumns, kLimit, kTableName},
                .probes = {Q("SELECT COUNT(*) FROM edge"), Q("SELECT id FROM edge LIMIT 0"),

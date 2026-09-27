@@ -314,6 +314,25 @@ antb1_add_cli_golden(
     "${_t}"
 )
 antb1_add_cli_golden(
+  explain_order_by
+  ARGS
+    explain
+    -c
+    "SELECT RegionID, COUNT(*) AS c FROM t GROUP BY RegionID ORDER BY c DESC, MAX(EventTime) NULLS FIRST LIMIT 10 OFFSET 5"
+    --table
+    "${_t}"
+)
+antb1_add_cli_golden(
+  query_order_by
+  ARGS
+    query
+    --clickbench
+    -c
+    "SELECT WatchID, EventDate FROM t WHERE RegionID < 3000 ORDER BY EventDate DESC, WatchID LIMIT 4 OFFSET 2"
+    --table
+    "${_t}"
+)
+antb1_add_cli_golden(
   explain_projection
   ARGS explain -c "SELECT URL, \"title\" AS t FROM t WHERE SearchPhrase <> '' LIMIT 10" --table "${_t}"
 )

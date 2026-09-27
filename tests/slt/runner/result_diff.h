@@ -32,8 +32,15 @@ struct Discrepancy {
   std::optional<std::size_t> first_row;
 };
 
+// "IT": the class letter of each column of a result.
+std::string Letters(const ResultSet& result);
+
 // "I (BIGINT)": the class letters and the engine type names of a result.
 std::string ColumnTypes(const ResultSet& result);
+
+// The cells of a rendered row (tab-separated) whose class in `types` is not R, each followed by a
+// tab: rows equal within the R tolerance have equal exact cells.
+std::string ExactCells(std::string_view line, std::string_view types);
 
 // std::nullopt if antb1's answer equals the oracle's. `row_count_only`: compare only the number of
 // rows (a projection with LIMIT, where any n rows are right).

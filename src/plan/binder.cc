@@ -325,6 +325,13 @@ struct SelectList {
   SourceSpan span;
 };
 
+// An ORDER BY aggregate makes the query aggregate, like one in the select list (DuckDB).
+bool OrdersByAggregate(const sql::SelectStatement& stmt) {
+  return std::ranges::any_of(stmt.order_by, [](const sql::OrderItem& item) {
+    return std::holds_alternative<sql::AggregateCall>(item.expr);
+  });
+}
+
 arrow::Result<SelectList> BindSelectList(const sql::SelectStatement& stmt,
                                          const arrow::Schema& schema, const Columns& columns) {
   SelectList list;
@@ -338,6 +345,13 @@ arrow::Result<SelectList> BindSelectList(const sql::SelectStatement& stmt,
       list.column_written.push_back(column.name);
       list.aliases.emplace_back();
       list.columns.push_back(std::move(column));
+    }
+    if (stmt.group_by.empty() && OrdersByAggregate(stmt) && !list.columns.empty()) {
+      return BindError(std::format("column '{}' must be inside an aggregate function: a query "
+                                   "with aggregates cannot also select plain columns (there is "
+                                   "no GROUP BY)",
+                                   list.columns.front().name),
+                       stmt.star_span);
     }
     return list;
   }
@@ -370,9 +384,10 @@ arrow::Result<SelectList> BindSelectList(const sql::SelectStatement& stmt,
       first_column = &ref;
     }
   }
-  if (stmt.group_by.empty() && !list.aggregates.empty() && first_column != nullptr) {
-    return BindError(std::format("column '{}' must be inside an aggregate function: a select list "
-                                 "with aggregates cannot also select plain columns (there is no "
+  if (stmt.group_by.empty() && (!list.aggregates.empty() || OrdersByAggregate(stmt)) &&
+      first_column != nullptr) {
+    return BindError(std::format("column '{}' must be inside an aggregate function: a query with "
+                                 "aggregates cannot also select plain columns (there is no "
                                  "GROUP BY)",
                                  first_column->name),
                      first_column->span);
@@ -396,11 +411,10 @@ arrow::Status CheckNotYetSupported(const sql::SelectStatement& stmt) {
       return UnsupportedError("COUNT(DISTINCT ...) is not supported yet", agg->span);
     }
   }
-  if (!stmt.order_by.empty()) {
-    return UnsupportedError("ORDER BY is not supported yet", stmt.order_by_span);
-  }
-  if (stmt.offset.has_value()) {
-    return UnsupportedError("OFFSET is not supported yet", stmt.offset_span);
+  for (const sql::OrderItem& item : stmt.order_by) {
+    if (const auto* agg = distinct(item.expr)) {
+      return UnsupportedError("COUNT(DISTINCT ...) is not supported yet", agg->span);
+    }
   }
   return arrow::Status::OK();
 }
@@ -458,6 +472,113 @@ arrow::Status CheckGrouped(const SelectList& select, const std::vector<BoundColu
   return arrow::Status::OK();
 }
 
+// The last select item with the alias (DuckDB), if any.
+std::optional<std::size_t> FindAlias(const SelectList& select, std::string_view name) {
+  const std::string wanted = AsciiLower(name);
+  for (std::size_t n = select.items.size(); n > 0; --n) {
+    const auto& alias = select.aliases[n - 1];
+    if (alias.has_value() && AsciiLower(*alias) == wanted) {
+      return n - 1;
+    }
+  }
+  return std::nullopt;
+}
+
+bool SameCall(const AggregateCall& a, const AggregateCall& b) {
+  if (a.kind != b.kind || a.arg.has_value() != b.arg.has_value()) {
+    return false;
+  }
+  return !a.arg.has_value() || a.arg->index == b.arg->index;
+}
+
+// How the rows of a query are shaped, which decides what ORDER BY may refer to.
+enum class Shape : std::uint8_t {
+  kProjection,  // no aggregate: any table column
+  kGrouped,     // GROUP BY: keys and aggregates (hidden ones are added)
+  kGlobal,      // aggregates without GROUP BY: one row, so only aggregates
+};
+
+// ORDER BY items resolved against the node below the Sort: the table's columns (kProjection), or
+// the GroupAggregate's keys and then its aggregates (kGrouped, where `aggregates` gains the calls
+// that are not in the select list). kGlobal checks the items and returns no key: one row needs no
+// sort. A select alias comes before a table column, as in DuckDB; a later key on a column already
+// ordered by changes nothing and is dropped.
+arrow::Result<std::vector<SortKey>> BindOrderBy(const sql::SelectStatement& stmt,
+                                                const Columns& columns, const SelectList& select,
+                                                Shape shape, const std::vector<BoundColumn>& keys,
+                                                std::vector<AggregateCall>& aggregates) {
+  const auto not_grouped = [](const sql::ColumnRef& ref) {
+    return BindError(std::format("column '{}' must appear in the GROUP BY clause or be inside an "
+                                 "aggregate function",
+                                 ref.name),
+                     ref.span);
+  };
+  const auto key_of = [&](const BoundColumn& column) -> std::optional<int> {
+    const auto key =
+        std::ranges::find_if(keys, [&](const BoundColumn& k) { return k.index == column.index; });
+    return key == keys.end() ? std::nullopt : std::optional(Narrow<int>(key - keys.begin()));
+  };
+  const auto aggregate_column = [&](std::size_t index, std::string name) {
+    return BoundColumn{.index = Narrow<int>(keys.size() + index),
+                       .name = std::move(name),
+                       .type = aggregates[index].type};
+  };
+  std::vector<SortKey> sort_keys;
+  for (const sql::OrderItem& item : stmt.order_by) {
+    std::optional<BoundColumn> column;
+    if (const auto* call = std::get_if<sql::AggregateCall>(&item.expr)) {
+      ARROW_ASSIGN_OR_RAISE(AggregateCall bound, BindAggregate(*call, columns));
+      if (shape == Shape::kGrouped) {
+        const auto same = std::ranges::find_if(
+            aggregates, [&](const AggregateCall& a) { return SameCall(a, bound); });
+        const auto index = Narrow<std::size_t>(same - aggregates.begin());
+        if (same == aggregates.end()) {
+          aggregates.push_back(std::move(bound));  // a hidden aggregate
+        }
+        column = aggregate_column(index, ResultName(*call));
+      }
+    } else {
+      const auto& ref = std::get<sql::ColumnRef>(item.expr);
+      const auto alias = FindAlias(select, ref.name);
+      if (alias.has_value() && select.items[*alias].first) {
+        // An aggregate of the select list (kGlobal: its only row needs no sort).
+        if (shape == Shape::kGrouped) {
+          column = aggregate_column(select.items[*alias].second, select.output[*alias].name);
+        }
+      } else {
+        BoundColumn table_column;
+        if (alias.has_value()) {
+          table_column = select.columns[select.items[*alias].second];
+        } else {
+          ARROW_ASSIGN_OR_RAISE(table_column, columns.Resolve(ref));
+        }
+        if (shape == Shape::kGlobal) {
+          return not_grouped(ref);
+        }
+        if (shape == Shape::kGrouped) {
+          const auto key = key_of(table_column);
+          if (!key.has_value()) {
+            return not_grouped(ref);
+          }
+          table_column.index = *key;
+        }
+        column = std::move(table_column);
+      }
+    }
+    if (!column.has_value()) {
+      continue;  // kGlobal
+    }
+    const bool repeated = std::ranges::any_of(
+        sort_keys, [&](const SortKey& k) { return k.column.index == column->index; });
+    if (!repeated) {
+      sort_keys.push_back(SortKey{.column = *std::move(column),
+                                  .descending = item.descending,
+                                  .nulls_first = item.nulls == sql::NullsOrder::kFirst});
+    }
+  }
+  return sort_keys;
+}
+
 }  // namespace
 
 arrow::Result<LogicalPlan> Bind(const sql::SelectStatement& stmt, const Catalog& catalog) {
@@ -481,6 +602,14 @@ arrow::Result<LogicalPlan> Bind(const sql::SelectStatement& stmt, const Catalog&
   if (stmt.limit.has_value() && *stmt.limit < 0) {
     return BindError("LIMIT must not be negative", stmt.limit_span);
   }
+  if (stmt.offset.has_value() && *stmt.offset < 0) {
+    return BindError("OFFSET must not be negative", stmt.offset_span);
+  }
+  const Shape shape = !keys.empty()               ? Shape::kGrouped
+                      : select.aggregates.empty() ? Shape::kProjection
+                                                  : Shape::kGlobal;
+  ARROW_ASSIGN_OR_RAISE(std::vector<SortKey> sort_keys,
+                        BindOrderBy(stmt, columns, select, shape, keys, select.aggregates));
 
   ScanNode scan{.table = table, .table_name = stmt.from.name, .fields = {}, .span = stmt.from.span};
   for (int i = 0; i < schema.num_fields(); ++i) {
@@ -492,38 +621,61 @@ arrow::Result<LogicalPlan> Bind(const sql::SelectStatement& stmt, const Catalog&
                            .predicates = std::move(predicates),
                            .span = Cover(stmt.where.front().span, stmt.where.back().span)});
   }
-  if (!keys.empty()) {
-    // GroupAggregate outputs the keys, then the aggregates; a Project restores the select order.
-    std::vector<BoundColumn> projected;
-    for (std::size_t i = 0; i < select.items.size(); ++i) {
-      const auto [aggregate, index] = select.items[i];
-      if (aggregate) {
-        projected.push_back(BoundColumn{.index = Narrow<int>(keys.size() + index),
-                                        .name = select.output[i].name,
-                                        .type = select.aggregates[index].type});
-        continue;
-      }
-      const BoundColumn& column = select.columns[index];
-      const auto key =
-          std::ranges::find_if(keys, [&](const BoundColumn& k) { return k.index == column.index; });
-      projected.push_back(BoundColumn{
-          .index = Narrow<int>(key - keys.begin()), .name = column.name, .type = column.type});
+  const auto sort = [&] {
+    if (!sort_keys.empty()) {
+      node = Make(SortNode{
+          .input = std::move(node), .keys = std::move(sort_keys), .span = stmt.order_by_span});
     }
-    node = Make(GroupAggregateNode{.input = std::move(node),
-                                   .keys = std::move(keys),
-                                   .aggregates = std::move(select.aggregates),
-                                   .span = stmt.group_by_span});
-    node = Make(ProjectNode{
-        .input = std::move(node), .columns = std::move(projected), .span = select.span});
-  } else if (select.aggregates.empty()) {
-    node = Make(ProjectNode{
-        .input = std::move(node), .columns = std::move(select.columns), .span = select.span});
-  } else {
-    node = Make(AggregateNode{
-        .input = std::move(node), .aggregates = std::move(select.aggregates), .span = select.span});
+  };
+  switch (shape) {
+    case Shape::kGrouped: {
+      // GroupAggregate outputs the keys, then the aggregates (hidden ORDER BY ones last); a Project
+      // restores the select order.
+      std::vector<BoundColumn> projected;
+      for (std::size_t i = 0; i < select.items.size(); ++i) {
+        const auto [aggregate, index] = select.items[i];
+        if (aggregate) {
+          projected.push_back(BoundColumn{.index = Narrow<int>(keys.size() + index),
+                                          .name = select.output[i].name,
+                                          .type = select.aggregates[index].type});
+          continue;
+        }
+        const BoundColumn& column = select.columns[index];
+        const auto key = std::ranges::find_if(
+            keys, [&](const BoundColumn& k) { return k.index == column.index; });
+        projected.push_back(BoundColumn{
+            .index = Narrow<int>(key - keys.begin()), .name = column.name, .type = column.type});
+      }
+      node = Make(GroupAggregateNode{.input = std::move(node),
+                                     .keys = std::move(keys),
+                                     .aggregates = std::move(select.aggregates),
+                                     .span = stmt.group_by_span});
+      sort();
+      node = Make(ProjectNode{
+          .input = std::move(node), .columns = std::move(projected), .span = select.span});
+      break;
+    }
+    case Shape::kProjection:
+      sort();
+      node = Make(ProjectNode{
+          .input = std::move(node), .columns = std::move(select.columns), .span = select.span});
+      break;
+    case Shape::kGlobal:
+      node = Make(AggregateNode{.input = std::move(node),
+                                .aggregates = std::move(select.aggregates),
+                                .span = select.span});
+      break;
   }
-  if (stmt.limit.has_value()) {
-    node = Make(LimitNode{.input = std::move(node), .limit = *stmt.limit, .span = stmt.limit_span});
+  const int64_t offset = stmt.offset.value_or(0);
+  if (stmt.limit.has_value() || offset > 0) {
+    SourceSpan span = stmt.limit.has_value() ? stmt.limit_span : stmt.offset_span;
+    if (stmt.limit.has_value() && stmt.offset.has_value()) {
+      span = stmt.limit_span.offset < stmt.offset_span.offset
+                 ? Cover(stmt.limit_span, stmt.offset_span)
+                 : Cover(stmt.offset_span, stmt.limit_span);
+    }
+    node = Make(
+        LimitNode{.input = std::move(node), .limit = stmt.limit, .offset = offset, .span = span});
   }
   return LogicalPlan{.root = std::move(node), .output = std::move(select.output)};
 }

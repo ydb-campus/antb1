@@ -6,6 +6,7 @@ add_library(
   runner/canonical.cc
   runner/clickbench.cc
   runner/difftest.cc
+  runner/ordered_compare.cc
   runner/query_file.cc
   runner/query_gen.cc
   runner/result_diff.cc
@@ -43,6 +44,7 @@ antb1_add_gtest(
     tests/clickbench_test.cc
     tests/comparator_test.cc
     tests/limit_compare_test.cc
+    tests/ordered_compare_test.cc
     tests/difftest_test.cc
     tests/query_file_test.cc
     tests/query_gen_test.cc

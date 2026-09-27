@@ -1,0 +1,460 @@
+# ORDER BY (docs/sql-subset.md): ASC by default, NULLS LAST by default in both directions, VARCHAR by
+# bytes. Rows with equal keys come in no particular order, so every multi-row query here orders by a
+# unique column last.
+
+query II nosort
+SELECT id, i16 FROM edge ORDER BY i16, id
+----
+0	-32768
+10	-12345
+7	-100
+3	-1
+2	0
+4	1
+11	7
+6	100
+9	12345
+1	32767
+5	NULL
+8	NULL
+
+query II nosort
+SELECT id, i16 FROM edge ORDER BY i16 DESC, id
+----
+1	32767
+9	12345
+6	100
+11	7
+4	1
+2	0
+3	-1
+7	-100
+10	-12345
+0	-32768
+5	NULL
+8	NULL
+
+query II nosort
+SELECT id, i16 FROM edge ORDER BY i16 NULLS FIRST, id DESC
+----
+8	NULL
+5	NULL
+0	-32768
+10	-12345
+7	-100
+3	-1
+2	0
+4	1
+11	7
+6	100
+9	12345
+1	32767
+
+query II nosort
+SELECT id, i32 FROM edge ORDER BY i32 DESC NULLS FIRST, id
+----
+5	NULL
+9	NULL
+1	2147483647
+6	100000
+10	54321
+8	7
+4	1
+2	0
+3	-1
+11	-7
+7	-100000
+0	-2147483648
+
+query II nosort
+SELECT id, i64 FROM edge ORDER BY i64 ASC NULLS LAST, id
+----
+0	-9223372036854775808
+7	-1000000000000000
+10	-42
+3	-1
+2	0
+4	1
+11	7
+9	42
+6	1000000000000000
+1	9223372036854775807
+5	NULL
+8	NULL
+
+query II nosort
+SELECT id, u16 FROM edge ORDER BY u16 DESC, id
+----
+1	65535
+7	40000
+3	32768
+6	15917
+4	15887
+10	12
+11	7
+8	2
+2	1
+0	0
+5	NULL
+9	NULL
+
+query IR nosort
+SELECT id, d FROM edge ORDER BY d, id
+----
+7	-9007199254740992
+0	-0.5
+11	-0.3333333333333333
+2	0
+8	9.99999993e-10
+4	0.1
+1	0.3333333333333333
+3	0.6666666666666666
+6	123456789.125
+10	922337203685477632
+5	NULL
+9	NULL
+
+query IT nosort
+SELECT id, s FROM edge ORDER BY s, id
+----
+0	(empty)
+6	\x20leading space
+9	\x4eULL
+1	a
+4	back\\slash
+3	line\nbreak
+11	naïve café
+2	tab\there
+7	x\x01y
+8	Привет, мир
+5	NULL
+10	NULL
+
+query IT nosort
+SELECT id, u FROM edge ORDER BY u DESC, id
+----
+10	日本語
+8	Привет, мир
+7	x\x7fy
+6	trailing space\x20
+2	tab\there
+3	line\nbreak
+4	back\\slash
+1	a
+9	\x28empty)
+0	(empty)
+5	NULL
+11	NULL
+
+# A projection can order by columns it does not select.
+
+query I nosort
+SELECT id FROM edge ORDER BY d DESC, id
+----
+10
+6
+3
+1
+4
+8
+2
+11
+0
+7
+5
+9
+
+query T nosort
+SELECT u FROM edge ORDER BY i32 NULLS FIRST, id
+----
+NULL
+\x28empty)
+(empty)
+x\x7fy
+NULL
+line\nbreak
+tab\there
+back\\slash
+Привет, мир
+日本語
+trailing space\x20
+a
+
+# A select alias comes before a table column of the same name; with two items of one alias, the last.
+
+query II nosort
+SELECT id AS i16, i16 AS id FROM edge ORDER BY i16 DESC
+----
+11	7
+10	-12345
+9	12345
+8	NULL
+7	-100
+6	100
+5	NULL
+4	1
+3	-1
+2	0
+1	32767
+0	-32768
+
+query II nosort
+SELECT i16 AS x, id AS x FROM edge ORDER BY x
+----
+-32768	0
+32767	1
+0	2
+-1	3
+1	4
+NULL	5
+100	6
+-100	7
+NULL	8
+12345	9
+-12345	10
+7	11
+
+query II nosort
+SELECT id, i16 FROM edge ORDER By I16 DESC, "ID"
+----
+1	32767
+9	12345
+6	100
+11	7
+4	1
+2	0
+3	-1
+7	-100
+10	-12345
+0	-32768
+5	NULL
+8	NULL
+
+# SELECT *, WHERE, and a table read from several files.
+
+query IIIIIRTT nosort
+SELECT * FROM edge WHERE id > 2 ORDER BY i64 DESC, id
+----
+6	100	100000	1000000000000000	15917	123456789.125	\x20leading space	trailing space\x20
+9	12345	NULL	42	NULL	NULL	\x4eULL	\x28empty)
+11	7	-7	7	7	-0.3333333333333333	naïve café	NULL
+4	1	1	1	15887	0.1	back\\slash	back\\slash
+3	-1	-1	-1	32768	0.6666666666666666	line\nbreak	line\nbreak
+10	-12345	54321	-42	12	922337203685477632	NULL	日本語
+7	-100	-100000	-1000000000000000	40000	-9007199254740992	x\x01y	x\x7fy
+5	NULL	NULL	NULL	NULL	NULL	NULL	NULL
+8	NULL	7	NULL	2	9.99999993e-10	Привет, мир	Привет, мир
+
+query II nosort
+SELECT WatchID, RegionID FROM hits_like_split WHERE RegionID < 100 ORDER BY RegionID DESC, WatchID LIMIT 12
+----
+-1766967153472275909	99
+-4116633239524032126	98
+8035179356301960050	98
+5383243569507401322	97
+5171600893222480850	91
+-5176248906603386224	90
+-6818330889311328624	88
+-5588254119380069606	88
+-3868465010519228663	87
+480724777462189756	87
+-4745472311785251211	86
+5623050239307023826	85
+
+query TI nosort
+SELECT EventDate, WatchID FROM hits_like ORDER BY EventDate DESC, WatchID LIMIT 5
+----
+2013-07-31	-9168464353029678484
+2013-07-31	-9104910405192239326
+2013-07-31	-9000425214964352462
+2013-07-31	-8992590523968574170
+2013-07-31	-8874443380560365963
+
+# Grouped: by keys, by select aggregates (also through their alias) and by aggregates the select list
+# does not have.
+
+query II nosort
+SELECT RegionID, COUNT(*) AS c FROM hits_like GROUP BY RegionID ORDER BY c DESC, RegionID LIMIT 10
+----
+0	304
+8830	6
+7430	5
+306	4
+2493	4
+2812	4
+3425	4
+4119	4
+4357	4
+4360	4
+
+query I nosort
+SELECT RegionID FROM hits_like GROUP BY RegionID ORDER BY COUNT(*) DESC, RegionID DESC LIMIT 5
+----
+0
+8830
+7430
+19654
+19526
+
+query ITI nosort
+SELECT OS, MIN(SearchPhrase), SUM(ResolutionWidth) FROM hits_like GROUP BY OS ORDER BY sum(ResolutionWidth) DESC, OS
+----
+116	(empty)	156860
+26	(empty)	152896
+89	(empty)	148276
+118	(empty)	141248
+43	(empty)	139864
+3	(empty)	139612
+10	(empty)	139342
+41	(empty)	137490
+73	(empty)	137286
+13	(empty)	136414
+101	(empty)	136414
+68	(empty)	135760
+67	(empty)	135186
+93	(empty)	134778
+110	(empty)	133584
+77	(empty)	133430
+2	(empty)	132234
+55	(empty)	131090
+50	(empty)	130698
+53	(empty)	130480
+6	(empty)	130406
+66	(empty)	130130
+44	(empty)	128914
+46	(empty)	128488
+69	(empty)	128444
+113	(empty)	127956
+76	(empty)	126244
+49	(empty)	126208
+104	(empty)	125562
+12	(empty)	125308
+8	(empty)	124624
+105	(empty)	122502
+111	(empty)	122438
+109	(empty)	122236
+27	(empty)	121992
+79	(empty)	121568
+45	(empty)	121510
+94	(empty)	121372
+17	(empty)	120938
+23	(empty)	120562
+18	(empty)	120072
+54	(empty)	119974
+80	(empty)	119900
+31	(empty)	119740
+61	(empty)	119720
+47	(empty)	119048
+82	(empty)	118238
+56	(empty)	118180
+78	(empty)	118132
+60	(empty)	118014
+9	(empty)	117968
+58	(empty)	117820
+100	(empty)	117594
+42	(empty)	116358
+20	(empty)	116230
+19	(empty)	116008
+87	(empty)	115986
+90	(empty)	115964
+117	(empty)	115822
+14	(empty)	115762
+29	(empty)	115610
+119	(empty)	114394
+75	(empty)	114128
+81	(empty)	113668
+59	(empty)	113528
+95	(empty)	113456
+7	(empty)	113288
+96	(empty)	113166
+71	(empty)	113158
+1	(empty)	113154
+24	(empty)	112108
+98	(empty)	112034
+0	(empty)	111910
+62	(empty)	111274
+92	(empty)	111108
+64	(empty)	110932
+83	(empty)	110452
+65	(empty)	109884
+70	(empty)	109786
+36	(empty)	109758
+88	(empty)	109392
+15	(empty)	108776
+115	(empty)	108692
+103	(empty)	108016
+99	(empty)	107796
+97	(empty)	107696
+85	(empty)	106268
+35	(empty)	105924
+106	(empty)	105448
+11	(empty)	105412
+72	(empty)	104966
+114	(empty)	104890
+107	(empty)	104570
+48	(empty)	104240
+102	(empty)	103994
+112	(empty)	103718
+16	(empty)	102778
+40	(empty)	102290
+39	(empty)	101298
+28	(empty)	100414
+38	(empty)	100314
+86	(empty)	100294
+63	(empty)	100052
+25	(empty)	99950
+4	(empty)	99856
+21	(empty)	99600
+51	(empty)	99388
+22	(empty)	99288
+57	(empty)	98744
+34	(empty)	98192
+37	(empty)	97864
+52	(empty)	97010
+120	(empty)	96666
+33	(empty)	96210
+5	(empty)	94488
+30	(empty)	93808
+74	(empty)	89668
+84	(empty)	89298
+91	(empty)	87942
+32	(empty)	85852
+108	(empty)	81990
+
+query TI nosort
+SELECT EventDate, MAX(RegionID) AS m FROM hits_like WHERE IsMobile = 1 GROUP BY EventDate ORDER BY MIN(WatchID), EventDate LIMIT 7
+----
+2013-07-17	19939
+2013-07-02	19852
+2013-07-19	19610
+2013-07-24	19808
+2013-07-01	19946
+2013-07-04	19727
+2013-07-30	19982
+
+query II nosort
+SELECT i16, COUNT(*) FROM edge GROUP BY i16 ORDER BY i16 NULLS FIRST
+----
+NULL	2
+-32768	1
+-12345	1
+-100	1
+-1	1
+0	1
+1	1
+7	1
+100	1
+12345	1
+32767	1
+
+# Without GROUP BY an aggregate query has one row.
+
+query II nosort
+SELECT COUNT(*) AS c, MAX(id) FROM edge ORDER BY c DESC, MIN(i16)
+----
+12	11
+
+query I nosort
+SELECT COUNT(*) FROM empty ORDER BY COUNT(*)
+----
+0

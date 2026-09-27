@@ -8,15 +8,16 @@ This page is the contract: a PR that changes SQL behavior updates it in the same
 
 ## What works today
 
-Every query of the [grammar](#grammar) below runs, except the parts marked "not answered yet": global and grouped
-(`GROUP BY`) aggregates, projections (`*` or columns), a `WHERE` conjunction of `column <op> literal` comparisons and
-`LIMIT`, over one table of Parquet files. This covers ClickBench Q0, Q1, Q2, Q3, Q6 and Q17 (see
+Every query of the [grammar](#grammar) below runs, except the part marked "not answered yet": global and grouped
+(`GROUP BY`) aggregates, projections (`*` or columns), a `WHERE` conjunction of `column <op> literal` comparisons,
+`ORDER BY`, `LIMIT` and `OFFSET`, over one table of Parquet files. This covers 23 of the 43 ClickBench queries (see
 [ClickBench status](#clickbench-status)).
 
 ```sql
 SELECT COUNT(*), SUM(ResolutionWidth) AS width, AVG(UserID), MAX(EventDate) FROM hits WHERE IsMobile = 1
 SELECT WatchID, URL FROM hits WHERE RegionID < 300 AND SearchPhrase <> '' LIMIT 10
 SELECT RegionID, COUNT(*) AS n, AVG(ResolutionWidth) FROM hits WHERE IsMobile = 1 GROUP BY RegionID
+SELECT OS, COUNT(*) AS n FROM hits GROUP BY OS ORDER BY n DESC, MAX(EventDate) NULLS FIRST LIMIT 10 OFFSET 5
 SELECT * FROM '/data/hits_*.parquet' LIMIT 5
 ```
 
@@ -27,9 +28,8 @@ SELECT * FROM '/data/hits_*.parquet' LIMIT 5
 - Result names and types follow DuckDB ([Binding](#binding)); values follow the [Semantics](#semantics) below.
 - `--` line comments, `/* block */` comments and one trailing `;` are allowed.
 - SQL outside the grammar (`HAVING`, `JOIN`, `OR`, functions, ...) fails with exit code 4 and points at the first
-  unsupported token. `ORDER BY`, `OFFSET` and `COUNT(DISTINCT ...)` are parsed but not answered yet: they also fail with
-  exit code 4, pointing at the clause. Malformed SQL (a syntax error) and SQL that is wrong for the table (a bind error)
-  fail with exit code 1.
+  unsupported token. `COUNT(DISTINCT ...)` is parsed but not answered yet: it also fails with exit code 4, pointing at
+  the call. Malformed SQL (a syntax error) and SQL that is wrong for the table (a bind error) fail with exit code 1.
 
 ```bash
 pixi run antb1 query -f query.sql --table hits=/data/clickbench/hits_0.parquet --clickbench
@@ -48,7 +48,7 @@ case-insensitive.
 statement   = query , [ ";" ] ;
 query       = "SELECT" , select_list , "FROM" , table_ref , [ "WHERE" , predicate ] ,
               [ "GROUP" , "BY" , column_ref , { "," , column_ref } ] ,
-              [ "ORDER" , "BY" , order_item , { "," , order_item } ] ,        (* parsed, not answered yet *)
+              [ "ORDER" , "BY" , order_item , { "," , order_item } ] ,
               [ limit_offset ] ;
 limit_offset = "LIMIT" , integer , [ "OFFSET" , integer ] | "OFFSET" , integer , [ "LIMIT" , integer ] ;
 select_list = "*" | select_item , { "," , select_item } ;
@@ -71,9 +71,9 @@ sequence of digits; a `decimal` is a number with a decimal point, an exponent or
 Keywords are not reserved by the lexer. A literal-first comparison is normalized by the parser (`5 < c` becomes
 `c > 5`).
 
-The parser accepts `ORDER BY`, `OFFSET` (any `OFFSET` in the grammar) and `COUNT(DISTINCT column)`, but the binder does
-not answer them yet: such a query fails with exit code 4 (`ORDER BY is not supported yet`), pointing at the
-`COUNT(DISTINCT ...)` call or at the clause ([Binding](#binding)). `GROUP BY` and `ORDER BY` positions (`ORDER BY 2`),
+The parser accepts `COUNT(DISTINCT column)` (in the select list and in `ORDER BY`), but the binder does not answer it
+yet: such a query fails with exit code 4 (`COUNT(DISTINCT ...) is not supported yet`), pointing at the call
+([Binding](#binding)). `GROUP BY` and `ORDER BY` positions (`ORDER BY 2`),
 `ALL`, constants and expressions are rejected by the parser, and so are `SUM`, `AVG`, `MIN` and `MAX` with `DISTINCT`.
 
 Outside the grammar, the parser recognizes common SQL and rejects it with exit code 4 and a source span, among others:
@@ -85,15 +85,15 @@ a syntax error with exit code 1.
 
 The binder (`plan::Bind`) resolves the statement against the table and builds the logical plan. First it rejects the
 syntax that is parsed but not answered yet, before any other check and whatever the table: a `COUNT(DISTINCT ...)` in
-the select list, then `ORDER BY` and `OFFSET`, each with exit code 4. A bind error has exit code 1 and points at the
-offending name, call or literal; the first error in query order wins (the table, then the select list, `WHERE`, the
-`GROUP BY` names, the grouping rule below, and `LIMIT`).
+the select list or in `ORDER BY`, with exit code 4. A bind error has exit code 1 and points at the offending name,
+call or literal; the first error in query order wins (the table, then the select list, `WHERE`, the `GROUP BY` names,
+the grouping rule below, `LIMIT`, `OFFSET` and the `ORDER BY` items).
 
 - Names: table and column names match ASCII case-insensitively, quoted identifiers included (as in DuckDB). An
   unknown table or column is a bind error, and so is a name that matches two columns differing only in case. A
   column of an unsupported type fails with exit code 4 wherever it is referenced (by `SELECT *` too).
-- Select list: `*` alone, plain columns, or aggregates. Without `GROUP BY`, aggregates cannot be mixed with plain
-  columns: a bind error at the first plain column.
+- Select list: `*` alone, plain columns, or aggregates. Without `GROUP BY`, aggregates (in the select list or in
+  `ORDER BY`) cannot be mixed with plain columns: a bind error at the first plain column (or at `*`).
 - `GROUP BY`: each name is a table column, or else the alias of a plain column of the select list (as in DuckDB; an
   alias of an aggregate is a bind error); a key repeated, also in another spelling, is one key, and a key need not be
   selected. Every plain column of the select list, and every column of `SELECT *`, must be a key: otherwise a bind
@@ -105,7 +105,13 @@ offending name, call or literal; the first error in query order wins (the table,
   `RegionID`); an aggregate is named `count_star()`, `count(x)`, `sum(x)`, `avg(x)`, `min(x)` or `max(x)`, with the
   argument as written in the query, double-quoted when it is not a plain identifier or is a reserved word
   (`sum("from")`). An alias replaces the name.
-- `LIMIT n` takes an integer from 0 to 9223372036854775807.
+- `ORDER BY`: a name is the alias of a select item first (the last item with that alias, as in DuckDB; also when a
+  table column has the same name), else a table column; an aggregate call is computed like a select-list aggregate.
+  A projection may order by any column of the table, selected or not. A grouped query orders by its keys and
+  aggregates (an aggregate the select list lacks is computed and not returned); any other column is a bind error
+  (`column 'b' must appear in the GROUP BY clause or be inside an aggregate function`). An aggregate query without
+  `GROUP BY` has one row, so it may order by aggregates only. A key that repeats an earlier one changes nothing.
+- `LIMIT n` and `OFFSET m` take integers from 0 to 9223372036854775807, in either order.
 
 Literals in `WHERE` must fit the column's type; any other combination is a bind error that points at the literal:
 
@@ -134,9 +140,12 @@ A comparison of an integer column with a number is folded exactly at bind time, 
 
 A bound query is a tree of logical nodes: `Scan` (reads fields of the table), `Filter` (the `WHERE` conjunction),
 `Project` (`*` or the plain columns), `Aggregate` (the aggregates, one output row) or `GroupAggregate` (`GROUP BY`:
-the keys, then the aggregates, one row per group; a `Project` above it restores the select order), and `Limit`. A rule
-optimizer then rewrites it:
+the keys, then the aggregates, one row per group; a `Project` above it restores the select order), `Sort`
+(`ORDER BY`, below the `Project`, so it can use columns and aggregates the query does not return) and `Limit` (with
+its offset). A rule optimizer then rewrites it:
 
+- `Limit` moves below `Project`: a `Project` keeps every row, so the `Limit` copies only the rows it keeps and ends
+  up right above a `Sort`, which the executor runs as a top-N (it keeps only `limit + offset` rows while it reads);
 - projection pruning: `Scan` reads only the columns that the nodes above it use (none for a bare `COUNT(*)`);
 - `COUNT(*)` alone without `WHERE`, over a table whose row count is known without scanning (every Parquet table),
   becomes `RowCount`, answered from the footers.
@@ -150,6 +159,15 @@ Output: count_star():BIGINT width:HUGEINT
 Aggregate COUNT(*), SUM(ResolutionWidth)
   Filter IsMobile = 1 AND UserAgent >= 2 AND RegionID IS NOT NULL
     Scan table=t source=parquet(files=1, rows=10000) columns=[RegionID, UserAgent, ResolutionWidth, IsMobile]
+```
+
+```text
+Output: RegionID:INTEGER c:BIGINT
+Project RegionID, c
+  Limit 10 OFFSET 5
+    Sort c DESC NULLS LAST, "max(EventTime)" ASC NULLS FIRST
+      GroupAggregate keys=[RegionID] COUNT(*), MAX(EventTime)
+        Scan table=t source=parquet(files=1, rows=10000) columns=[EventTime, RegionID]
 ```
 
 ## Types
@@ -205,9 +223,16 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   every NaN together, as DuckDB does, and the group shows the key as first seen. Over zero input rows there is no
   group, so no row. Groups come in no particular order (deterministic in antb1, not the order of first appearance),
   and the tests compare grouped results without regard to order; with `LIMIT` any groups are a right answer.
-- LIMIT: the first `n` rows in file and row group order; the scan stops as soon as `n` rows are out. `LIMIT 0`
-  returns no row, also for an aggregate. Without `LIMIT` a projection returns its rows in file order too, but SQL
-  does not promise an order, and the tests compare projections without regard to order.
+- ORDER BY: rows in the order of the first key, ties broken by the next ones. `ASC` is the default; NULLs come last
+  unless `NULLS FIRST` is written, for `ASC` and `DESC` alike (DuckDB's default). VARCHAR orders by bytes, DATE
+  chronologically, and DOUBLE with `-0.0` equal to `0.0` and NaN above every number (equal to NaN), as in DuckDB.
+  Rows with equal keys come in no particular order (antb1 keeps their input order); the tests accept any order of
+  tied rows, and any of the tied rows at the edges of a `LIMIT`/`OFFSET` window.
+- LIMIT and OFFSET: `OFFSET m` skips the first `m` rows, then `LIMIT n` keeps at most `n`. With `ORDER BY` that is a
+  window of the order. Without it, the first rows in file and row group order: the scan stops as soon as the window
+  is out. `LIMIT 0` returns no row, also for an aggregate. Without `ORDER BY` a projection returns its rows in file
+  order too, but SQL does not promise an order, and the tests compare such results without regard to order (with
+  `LIMIT` or `OFFSET`, any rows of the full answer are right).
 - VARCHAR: values are raw bytes. Unannotated BYTE_ARRAY columns (as in ClickBench) are VARCHAR and are never
   validated as UTF-8.
 - Execution: single-threaded, files and row groups in order, 64Ki-row batches; results are deterministic.
@@ -236,7 +261,7 @@ formatter:
 | 1 | query error: syntax, bind or execution error | `SELECT COUNT(*) FORM t`; an unknown table or column; `SUM` of a VARCHAR column; a `SUM` outside HUGEINT's range |
 | 2 | usage error | unknown option; neither or both of `-c` and `-f`; a malformed `--table` or `--column-type`; a column that `--column-type` cannot read as DATE; a table name registered twice |
 | 3 | I/O error | a missing or unreadable file; not a Parquet file; schemas that differ; a glob that matches nothing |
-| 4 | unsupported: valid-looking SQL outside the supported subset | `HAVING`; `OR`; a function call; `ORDER BY`, `OFFSET` and `COUNT(DISTINCT ...)` (not answered yet); a column of an unsupported type |
+| 4 | unsupported: valid-looking SQL outside the supported subset | `HAVING`; `OR`; a function call; `ORDER BY 2`; `COUNT(DISTINCT ...)` (not answered yet); a column of an unsupported type |
 | 70 | internal error: anything else, which is a bug | an uncaught exception; an Arrow `NotImplemented` or type error without SQL context |
 
 Exit code 4 is used only for errors that the parser, the binder or the physical planner marks as unsupported
@@ -278,7 +303,8 @@ compare against DuckDB, so an unregistered difference is a bug.
 
 ## ClickBench status
 
-The target of the first slice is ClickBench Q0, Q1, Q2, Q3 and Q6, run with `--clickbench`. Query numbers follow
+The target of the first slice was ClickBench Q0, Q1, Q2, Q3 and Q6, run with `--clickbench`; `GROUP BY`, `ORDER BY`
+and `OFFSET` added the queries listed below them. Query numbers follow
 ClickBench's DuckDB/Parquet query file at ClickBench commit `5a56398c975bfd9f328f544894bcb92533ed134c` (0-based); the
 query text itself is never committed. The data test `data.clickbench.status` (`pixi run test-data`, CI job
 `clickbench-hits0`) runs every query on antb1 over the first partition of the `hits` dataset, compares the answers
@@ -294,6 +320,22 @@ bind error); today all of them answer Unsupported with exit code 4.
 | Q2 | pass | `SUM` (HUGEINT), `COUNT(*)` and `AVG` in one scan of the referenced columns |
 | Q3 | pass | `AVG` of a BIGINT column: exact 128-bit sum, one division |
 | Q6 | pass | `MIN` and `MAX` of `EventDate` read as DATE (`--clickbench`) |
+| Q7 | pass | `GROUP BY` one column under `WHERE`, ordered by the count descending, no `LIMIT` |
+| Q12 | pass | `GROUP BY` one column under `WHERE`, ordered by the count descending, top-N |
+| Q14 | pass | `GROUP BY` two columns under `WHERE`, ordered by the count descending, top-N |
+| Q15 | pass | `GROUP BY` one column, ordered by the count descending, top-N |
+| Q16 | pass | `GROUP BY` two columns, ordered by the count descending, top-N |
 | Q17 | pass | `GROUP BY` two columns with `COUNT(*)` and `LIMIT` without `ORDER BY`: any groups are a right answer, compared as a subset of DuckDB's unlimited answer |
 | Q19 | pass | not a target: a projection under a `WHERE` comparison; fits the grammar and passes incidentally |
-| all others | out of scope | need ORDER BY, COUNT(DISTINCT), LIKE, functions or other rejected syntax; they fail cleanly with exit code 4 |
+| Q24 | pass | a projection under `WHERE`, ordered by a column it does not select, top-N |
+| Q25 | pass | a projection under `WHERE`, ordered by the column it selects, top-N |
+| Q26 | pass | a projection under `WHERE`, ordered by a column it does not select and then by the one it selects, top-N |
+| Q30 | pass | `GROUP BY` two columns under `WHERE` with `COUNT(*)`, `SUM` and `AVG`, ordered by the count, top-N |
+| Q31 | pass | `GROUP BY` two columns under `WHERE` with `COUNT(*)`, `SUM` and `AVG`, ordered by the count, top-N |
+| Q32 | pass | `GROUP BY` two columns with `COUNT(*)`, `SUM` and `AVG`, no `WHERE`, ordered by the count, top-N: many groups tie at the cut |
+| Q33 | pass | `GROUP BY` one column, ordered by the count descending, top-N |
+| Q36 | pass | `GROUP BY` one column under a `WHERE` conjunction, ordered by the alias of the count, top-N |
+| Q37 | pass | `GROUP BY` one column under a `WHERE` conjunction, ordered by the alias of the count, top-N |
+| Q38 | pass | `GROUP BY` one column under a `WHERE` conjunction, ordered by the alias of the count, a window with `OFFSET` |
+| Q41 | pass | `GROUP BY` two columns under a `WHERE` conjunction, ordered by the alias of the count, a window with `OFFSET` |
+| all others | out of scope | need COUNT(DISTINCT), LIKE, functions, expressions, HAVING, `GROUP BY` positions or other rejected syntax; they fail cleanly with exit code 4 |

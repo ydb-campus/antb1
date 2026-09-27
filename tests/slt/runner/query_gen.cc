@@ -507,6 +507,7 @@ class Builder {
 
     tokens_.clear();
     used_ = FeatureSet{};
+    order_aliases_.clear();
     Keyword("SELECT");
     SelectList(shape, t, cols, numeric, aggs, selected_keys);
     Keyword("FROM");
@@ -528,7 +529,9 @@ class Builder {
       }
       Column(*keys[i]);
     }
+    const bool ordered = OrderBy(shape, cols, numeric, aggs, keys);
     const bool limited = Limit(shape == Shape::kStar && t.rows > kStarMaxRows);
+    const bool offset = Offset(limited);
     if (allowed_.Has(Feature::kSemicolon) && rng_.Percent(15)) {
       used_.Add(Feature::kSemicolon);
       Symbol(";");
@@ -538,8 +541,8 @@ class Builder {
     q.table = t.name;
     q.features = used_;
     const bool rows = shape != Shape::kAggregates || !keys.empty();
-    q.sort = rows ? SortMode::kRowSort : SortMode::kNoSort;
-    q.unordered_limit = rows && limited;
+    q.sort = rows && !ordered ? SortMode::kRowSort : SortMode::kNoSort;
+    q.unordered_limit = rows && !ordered && (limited || offset);
     return q;
   }
 
@@ -578,32 +581,139 @@ class Builder {
       if (emitted++ > 0) {
         Symbol(",");
       }
+      bool orderable = true;
       if (shape == Shape::kColumns) {
         used_.Add(Feature::kColumns);
         Column(*rng_.Pick(cols));
       } else {
         const Agg agg = rng_.Pick(aggs);
-        used_.Add(AggFeature(agg));
-        Keyword(AggName(agg));
-        Symbol("(");
-        if (agg == Agg::kCountStar) {
-          Symbol("*");
-        } else {
-          Column(*rng_.Pick(agg == Agg::kSum || agg == Agg::kAvg ? numeric : cols));
-        }
-        Symbol(")");
+        const GenColumn* arg =
+            agg == Agg::kCountStar
+                ? nullptr
+                : rng_.Pick(agg == Agg::kSum || agg == Agg::kAvg ? numeric : cols);
+        orderable = Orderable(agg, arg);
+        Aggregate(agg, arg);
       }
       if (allowed_.Has(Feature::kAlias) && rng_.Percent(15)) {
         used_.Add(Feature::kAlias);
         if (rng_.Percent(50)) {
           Keyword("AS");
         }
-        tokens_.push_back({.kind = Token::Kind::kAlias, .text = std::format("a{}", i + 1)});
+        std::string alias = std::format("a{}", i + 1);
+        if (orderable) {
+          order_aliases_.push_back(alias);
+        }
+        tokens_.push_back({.kind = Token::Kind::kAlias, .text = std::move(alias)});
       }
     }
     if (!keys_first) {
       emit_keys();
     }
+  }
+
+  void Aggregate(Agg agg, const GenColumn* arg) {
+    used_.Add(AggFeature(agg));
+    Keyword(AggName(agg));
+    Symbol("(");
+    if (arg == nullptr) {
+      Symbol("*");
+    } else {
+      Column(*arg);
+    }
+    Symbol(")");
+  }
+
+  // Whether the aggregate's values compare exactly in both engines (an I or T result): a sort key
+  // with R values could order near-equal values differently.
+  static bool Orderable(Agg agg, const GenColumn* arg) {
+    switch (agg) {
+      case Agg::kCountStar:
+      case Agg::kCount:
+        return true;
+      case Agg::kSum:
+        return arg != nullptr && arg->kind == ValueKind::kInteger;
+      case Agg::kAvg:
+        return false;
+      case Agg::kMin:
+      case Agg::kMax:
+        return arg != nullptr && arg->kind != ValueKind::kDouble;
+    }
+    return false;
+  }
+
+  // ORDER BY 1 to 3 items: select aliases, and columns (a projection: any column; GROUP BY: its
+  // keys) or aggregates with I or T values (an aggregate query). Returns whether it wrote one.
+  bool OrderBy(Shape shape, const std::vector<const GenColumn*>& cols,
+               const std::vector<const GenColumn*>& numeric, const std::vector<Agg>& aggs,
+               const std::vector<const GenColumn*>& keys) {
+    if (!allowed_.Has(Feature::kOrderBy) || !rng_.Percent(35)) {
+      return false;
+    }
+    const bool aggregate = shape == Shape::kAggregates;
+    const std::vector<const GenColumn*>& columns = aggregate ? keys : cols;
+    std::vector<std::pair<Agg, const GenColumn*>> calls;
+    if (aggregate) {
+      for (const Agg agg : aggs) {
+        if (agg == Agg::kCountStar) {
+          calls.emplace_back(agg, nullptr);
+          continue;
+        }
+        const GenColumn* arg = rng_.Pick(agg == Agg::kSum || agg == Agg::kAvg ? numeric : cols);
+        if (Orderable(agg, arg)) {
+          calls.emplace_back(agg, arg);
+        }
+      }
+    }
+    if (columns.empty() && calls.empty() && order_aliases_.empty()) {
+      return false;
+    }
+    used_.Add(Feature::kOrderBy);
+    Keyword("ORDER");
+    Keyword("BY");
+    const std::size_t items = 1 + rng_.Below(3);
+    for (std::size_t i = 0; i < items; ++i) {
+      if (i > 0) {
+        Symbol(",");
+      }
+      const std::size_t pick = rng_.Below(columns.size() + calls.size() + order_aliases_.size());
+      if (pick < columns.size()) {
+        Column(*columns[pick]);
+      } else if (pick < columns.size() + calls.size()) {
+        const auto& [agg, arg] = calls[pick - columns.size()];
+        Aggregate(agg, arg);
+      } else {
+        tokens_.push_back({.kind = Token::Kind::kAlias,
+                           .text = order_aliases_[pick - columns.size() - calls.size()]});
+      }
+      const std::size_t direction = rng_.Below(10);
+      if (direction < 3) {
+        Keyword("DESC");
+      } else if (direction < 5) {
+        Keyword("ASC");
+      }
+      if (allowed_.Has(Feature::kNullsOrder) && rng_.Percent(20)) {
+        used_.Add(Feature::kNullsOrder);
+        Keyword("NULLS");
+        Keyword(rng_.Percent(50) ? "FIRST" : "LAST");
+      }
+    }
+    return true;
+  }
+
+  // OFFSET m, after (or before) the LIMIT. Returns whether it wrote one.
+  bool Offset(bool limited) {
+    if (!allowed_.Has(Feature::kOffset) || !rng_.Percent(limited ? 30 : 10)) {
+      return false;
+    }
+    static constexpr auto kOffsets = std::to_array<int>({0, 1, 2, 5, 100});
+    used_.Add(Feature::kOffset);
+    std::vector<Token> offset;
+    offset.push_back({.kind = Token::Kind::kKeyword, .text = "OFFSET"});
+    offset.push_back({.kind = Token::Kind::kLiteral, .text = std::to_string(rng_.Pick(kOffsets))});
+    // Before the LIMIT (the parser takes either order) now and then.
+    const auto at = limited && rng_.Percent(20) ? tokens_.end() - 2 : tokens_.end();
+    tokens_.insert(at, offset.begin(), offset.end());
+    return true;
   }
 
   void Where(const std::vector<const GenColumn*>& cols) {
@@ -822,6 +932,7 @@ class Builder {
   FeatureSet allowed_;
   std::vector<Token> tokens_;
   FeatureSet used_;
+  std::vector<std::string> order_aliases_;  // select aliases of items with I or T values
 };
 
 }  // namespace

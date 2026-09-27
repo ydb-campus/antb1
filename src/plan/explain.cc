@@ -57,6 +57,11 @@ std::string AggregateText(const AggregateCall& call) {
 
 std::string ColumnName(const BoundColumn& column) { return Name(column.name); }
 
+std::string SortKeyText(const SortKey& key) {
+  return std::format("{} {} {}", Name(key.column.name), key.descending ? "DESC" : "ASC",
+                     key.nulls_first ? "NULLS FIRST" : "NULLS LAST");
+}
+
 // The line of one node (without its input). One overload per node type: a node type without one
 // fails to compile.
 struct NodeLine {
@@ -83,8 +88,16 @@ struct NodeLine {
     }
     return line;
   }
+  std::string operator()(const SortNode& node) const {
+    return "Sort " + Join(node.keys, SortKeyText, ", ");
+  }
   std::string operator()(const LimitNode& node) const {
-    return std::format("Limit {}", node.limit);
+    std::string line =
+        node.limit.has_value() ? std::format("Limit {}", *node.limit) : std::string("Limit ALL");
+    if (node.offset > 0) {
+      line += std::format(" OFFSET {}", node.offset);
+    }
+    return line;
   }
   std::string operator()(const RowCountNode& node) const {
     return std::format("RowCount table={} source={}", EscapeText(node.table_name, '\0'),

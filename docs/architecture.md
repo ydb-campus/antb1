@@ -40,8 +40,9 @@ Responsibilities:
   engine view: UTF8 and large strings to binary without UTF-8 validation, FLOAT to DOUBLE, a USMALLINT or INTEGER
   column read as DATE to date32. Every Parquet exception and read failure becomes an `IOError` here.
 - `exec`: pull-based, batch-at-a-time physical operators (`TableScan`, `Filter`, `Project`, `ScalarAggregate`,
-  `GroupAggregate`, `Limit`, `RowCount`; see [Execution](#execution)), the exact aggregate states (scalar and
-  grouped), the physical planner and `Drain`. It scans only through `plan::Table` and never depends on `io`.
+  `GroupAggregate`, `Sort`, `Limit`, `RowCount`; see [Execution](#execution)), the exact aggregate states (scalar
+  and grouped), the row comparator and sort buffer, the physical planner and `Drain`. It scans only through
+  `plan::Table` and never depends on `io`.
 - `engine`: `engine::Session` (owns the catalog, calls `arrow::compute::Initialize()`, runs parse, bind, plan and
   execute) and the canonical value formatter used for every output format.
 - `cli`: the CLI11 command line (`query`, `explain`, `schema`, `bench`, `version`), error reporting and exit codes;
@@ -81,12 +82,12 @@ steps (all single-threaded):
 4. Bind (`plan::Bind`): table names resolve case-insensitively in the catalog (or `FROM 'path'` opens a file),
    columns resolve against the table's schema, types are checked, and every `WHERE` literal is folded exactly into
    its column's type ([Binding](sql-subset.md#binding)). The result is a `plan::LogicalPlan`: a tree of immutable
-   nodes in a `std::variant` (`Scan`, `Filter`, `Project`, `Aggregate`, `GroupAggregate`, `Limit`, `RowCount`) plus
-   the output columns.
-5. Optimize (`plan::Optimize`): projection pruning (a `Scan` reads only the fields used above it) and `COUNT(*)`
-   without `WHERE` to `RowCount`.
+   nodes in a `std::variant` (`Scan`, `Filter`, `Project`, `Aggregate`, `GroupAggregate`, `Sort`, `Limit`,
+   `RowCount`) plus the output columns.
+5. Optimize (`plan::Optimize`): `COUNT(*)` without `WHERE` to `RowCount`, `Limit` below `Project`, and projection
+   pruning (a `Scan` reads only the fields used above it).
 6. Physical plan (`exec::BuildPhysicalPlan`): an exhaustive `std::visit` turns each logical node into an operator
-   over the operator of its input.
+   over the operator of its input; a `Limit` over a `Sort` becomes one top-N `SortOperator`.
 7. Drain (`exec::Drain`): `Open`, pull batches with `Next` until the end of the stream, `Close` (also after an
    error); the selected rows of the batches form an `arrow::Table`, and the engine names its columns.
 8. Format (`engine::FormatResult`): `table`, `csv` or `json` output on stdout, built from one canonical value
@@ -108,7 +109,8 @@ into data. Everything runs on one thread, reading files and row groups in order.
 | `ProjectOperator` | `Project` | selects columns and materializes the selected rows with Arrow's `Filter` kernel |
 | `ScalarAggregateOperator` | `Aggregate` | feeds every batch and its selection to one `AggregateState` per call, then emits one row |
 | `GroupAggregateOperator` | `GroupAggregate` | materializes the selected rows, maps their keys to group ids with Arrow's `Grouper` (DOUBLE keys normalized first), feeds one `GroupedAggregateState` per call; after the input, emits one row per group: the keys as first seen, then the aggregates |
-| `LimitOperator` | `Limit` | passes on the first `n` rows and never pulls its input again |
+| `SortOperator` | `Sort`, or `Limit` over `Sort` | reads its whole input into a `SortBuffer`, sorts row references stably with `RowComparator` (DuckDB's order: NULLs last by default, NaN above every number, VARCHAR by bytes) and emits the rows in batches; with a limit it keeps only `limit + offset` rows while it reads (top-N) and emits the window ([ADR 0011](adr/0011-sorting-and-top-n.md)) |
+| `LimitOperator` | `Limit` | skips `offset` rows, passes on at most `limit` rows (narrowing selections, not copying) and then never pulls its input again |
 | `RowCountOperator` | `RowCount` | one BIGINT row from the table's exact row count |
 
 The aggregate states (`src/exec/include/antb1/exec/aggregate_state.h`) implement `Consume(values, selection)`,

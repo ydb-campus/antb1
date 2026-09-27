@@ -11,6 +11,7 @@ antb1_add_module(
     grouped_aggregate_state.cc
     group_aggregate.cc
     limit.cc
+    sort.cc
     row_count.cc
     physical_planner.cc
   PUBLIC_DEPS common plan
@@ -27,6 +28,7 @@ if(ANTB1_BUILD_TESTS)
       tests/row_count_test.cc
       tests/physical_planner_test.cc
       tests/grouped_aggregate_test.cc
+      tests/sort_test.cc
     LIBS ArrowCompute::arrow_compute_shared
   )
 endif()
