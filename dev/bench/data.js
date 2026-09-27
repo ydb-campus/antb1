@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790527855267,
+  "lastUpdate": 1790528065635,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -540,6 +540,78 @@ window.BENCHMARK_DATA = {
             "value": 2195462.647798735,
             "unit": "ns/iter",
             "extra": "iterations: 318\ncpu: 2194989.169811321 ns\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "fc25408f720f605f21c71b146e06042f17440ae0",
+          "message": "perf(exec): sort by a first-key prefix and gather with typed builders (#23)\n\n## Summary\n\nFollow-up (a) from #21, the reviewer's P2 note: a full sort without\n`LIMIT` gathered its output one `AppendArraySlice` call per row. A\nprofile of the new benchmark showed the row comparisons cost more than\nthe gather, about 70% of the time against 15%, so this PR fixes both.\n\n- **Prefix sort:** before sorting, each row gets an order-preserving\n64-bit prefix of its first key (`RowComparator::PrefixOf`) and a NULL\ngroup (NULLs first, a value, NULLs last).\n  - Most comparisons become two integer compares.\n- The full comparator runs only when prefixes tie: from key 1 on when\nthe prefix is the whole value (integers, DATE, DOUBLE), from key 0 for\nHUGEINT (its high 64 bits) and VARCHAR (the first 8 bytes).\n- DOUBLE prefixes keep DuckDB's order: NaN above every number, `-0.0`\nequal to `0.0`. Descending keys invert the bits; the NULL group does not\ndepend on the direction.\n- **Typed gather:** the output is gathered per column with the typed\nbuilder of each engine type. The type is resolved once per column, then\na tight loop runs per row. Binary data is reserved up front. Any other\ntype keeps the per-run slice path.\n- **New micro benchmarks** `BM_SortRows` (full sort) and `BM_TopNRows`\n(`LIMIT 10`): 1Mi rows with a random BIGINT key and a VARCHAR payload.\nBoth are listed in `docs/benchmarks.md`.\n\n| Release `pixi run bench` | before | after |\n| --- | ---: | ---: |\n| `BM_SortRows` (1Mi rows, full sort) | 503 ms | 200 ms |\n| `BM_TopNRows` (LIMIT 10) | 25.5 ms | 14.9 ms |\n\n## Type of change\n\n- [x] perf: performance improvement\n\n## Verification\n\n```text\n$ pixi run check      # after the last commit\nlint: PASS; 100% tests passed out of 1008\n$ pixi run asan / ci-gcc / coverage / fuzz-smoke / tidy\n100% tests passed out of 1008 (asan, ci-gcc); Coverage gate: PASS; fuzz-smoke 2/2; tidy clean\n```\n\n- **New `exec.SortTest.PrefixesAgreeWithTheComparator`:** for every\nengine type, both directions and both NULL orders, and every pair of\nrows, a smaller (group, prefix) sorts first. For exact prefixes, equal\nprefixes tie on the key. The rows include integer edges, NaN of both\nsigns, ±0, ±inf, subnormals, strings with zero bytes and shared 8-byte\nprefixes, and HUGEINT values across the 64-bit boundary.\n- The existing checks pass unchanged:\n- the model-based Sort/top-N test (16 direction/NULL combinations with\nLIMIT/OFFSET windows);\n  - the merge test;\n  - the `.slt` ORDER BY cases;\n  - the metamorphic sort relations.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed: `docs/benchmarks.md`,\n`docs/architecture.md`\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: none changed\n\n## AI assistance\n\n- [x] AI-assisted. Tools and what they did: Claude Code profiled the\nsort, wrote the change, the benchmark and the tests, and ran the\nverification above.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-09-27T19:52:23+03:00",
+          "tree_id": "0032464f3cf6699c4ffab9bcdf4baade920dad3f",
+          "url": "https://github.com/ydb-campus/antb1/commit/fc25408f720f605f21c71b146e06042f17440ae0"
+        },
+        "date": 1790528065103,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 3233.173701201222,
+            "unit": "ns/iter",
+            "extra": "iterations: 216527\ncpu: 3231.458908126931 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84864.13406900196,
+            "unit": "ns/iter",
+            "extra": "iterations: 7884\ncpu: 84827.10692541856 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222029.31630710184,
+            "unit": "ns/iter",
+            "extra": "iterations: 3152\ncpu: 222012.30393401007 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 437442.25595983746,
+            "unit": "ns/iter",
+            "extra": "iterations: 1594\ncpu: 437274.4692597239 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 348948.26321037055,
+            "unit": "ns/iter",
+            "extra": "iterations: 2006\ncpu: 348808.4521435692 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2127005.791410974,
+            "unit": "ns/iter",
+            "extra": "iterations: 326\ncpu: 2126118.9754601247 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 209.23663666666434,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 209.1935283333332 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.374935624999807,
+            "unit": "ms/iter",
+            "extra": "iterations: 48\ncpu: 14.3734615 ms\nthreads: 1"
           }
         ]
       }
