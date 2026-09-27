@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790528065635,
+  "lastUpdate": 1790532134379,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -612,6 +612,78 @@ window.BENCHMARK_DATA = {
             "value": 14.374935624999807,
             "unit": "ms/iter",
             "extra": "iterations: 48\ncpu: 14.3734615 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b7a321594c25d8d9839eed0d2fbea11814ef29ba",
+          "message": "feat(exec): count distinct (#26)\n\n## Summary\n\nPR 4, the last one of the approved GROUP BY / ORDER BY / COUNT(DISTINCT)\nplan: **`COUNT(DISTINCT col)`**, global and grouped, in the select list\nand in `ORDER BY`, checked against DuckDB.\n\n- **Semantics (probed on DuckDB 1.5.5):**\n  - distinct non-NULL values;\n  - DOUBLE `-0.0` equals `0.0`, and every NaN is one value;\n  - VARCHAR compares by bytes;\n  - BIGINT, 0 over no values;\n  - named `count(DISTINCT x)`, with the argument as written.\n- **Plan:**\n- new `AggKind::kCountDistinct`, so every exhaustive switch handles it;\n  - EXPLAIN prints `COUNT(DISTINCT x)`;\n- in `ORDER BY` it reuses an equal select aggregate (a `COUNT(x)` is a\ndifferent aggregate) or becomes a hidden one;\n- the binder's \"not supported yet\" step is gone: nothing parsed is\nunanswered any more;\n- `SUM`, `AVG`, `MIN` and `MAX` with `DISTINCT` stay exit code 4 in the\nparser.\n- **Exec:**\n- global: an Arrow `Grouper` over the selected values; NULL is a key of\nits own, left out of the count;\n- grouped: a `Grouper` over the (group id, value) pairs, where a pair\nseen for the first time adds one to its group unless the value is NULL;\n- both merge (the parallel-ready requirement): `Merge` feeds the other\nstate's distinct values, or its pairs remapped through the group map,\ninto this one;\n- DOUBLE values are normalized like GROUP BY keys: the normalizer moved\nto the private `src/exec/double_key.{h,cc}`;\n  - `MakeGroupedAggregateState` takes the operator's memory pool.\n- **Harness:** `count_distinct` is a supported, generated feature, and\nit is orderable because it is BIGINT. The random test's self-test used a\nfake antb1 that recognized \"COUNT(*) only\" queries by keywords, and\ngenerated ORDER BY / DISTINCT queries could slip through it. Its keyword\nlist is now complete.\n- **ClickBench: +7 queries pass** (Q4, 5, 8, 9, 10, 11, 13). The ratchet\ngoes from 23 to 30 of 43.\n- **Docs:** `docs/sql-subset.md` (grammar, Binding, semantics, exit\ncodes, ClickBench table) and `docs/architecture.md`.\n\n**Maintainer sign-off needed:** `tests/data/clickbench_status.json` is\nan \"Ask a human first\" path. It gains the 7 queries above, as the\napproved plan said PR 4 would.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n\n## Verification\n\n```text\n$ pixi run check / asan / tidy / coverage / fuzz-smoke / ci-gcc   (check-full's legs; tidy re-run after its fix)\nlint: PASS; 100% tests passed out of 1022 (ci, asan, ci-gcc); tidy clean; Coverage gate: PASS; fuzz-smoke 2/2\n$ ANTB1_DIFF_COUNT=20000 pixi run diff-random\nDIFF: PASS seed=325968058 queries=20000 failed=0 unsupported=0\n$ pixi run test-data\nCLICKBENCH pass=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 19, 24, 25, 26, 30, 31, 32, 33, 36, 37, 38, 41]\n$ ANTB1_HITS_FILES=\"$HOME/.cache/antb1/clickbench/full/hits_*.parquet\" pixi run test-data   # host, all 100 files\n100% tests passed out of 6 (10m53s wall; peak RSS 22.5 GB for one process, DuckDB included)\n```\n\n- **`exec` unit tests:**\n- the scalar state on doubles with ±0, NaN of both signs and NULL, on\nstrings with a selection, on NULL-only and empty input, and through\nmerges;\n- the grouped state against an independent model (a set of normalized\nvalues per group) for every column type, across two batches;\n- both states are in the existing grouped tests (equal to the scalar\nstate per group, merge with remapped ids, finalizing ranges);\n  - invalid combinations are rejected.\n- **Plan tests:** result naming (quoted and case-preserved arguments),\nORDER BY reuse versus a hidden `COUNT(x)`, EXPLAIN, and bind errors.\n- **`.slt` (`tests/slt/cases/distinct/`):** 13 queries plus errors, with\nexpectations written by DuckDB. They cover every column type, FLOAT ±0,\nmulti-file and NULL-heavy tables, empty results, and grouped and ordered\nqueries.\n- **Metamorphic:**\n- `COUNT(DISTINCT x)` equals the number of non-NULL groups of `GROUP BY\nx`, for an INTEGER and a VARCHAR column;\n- the global and grouped counts are invariant to batch size and file\nsplit.\n- **Review:** the `reviewer` agent found no P0. Its P1s are the ratchet\nsign-off above, and a note that the maintainer's untracked `result.json`\n(ClickBench bench output) sits in the repo root: it was never staged,\nsince files are added by name.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [ ] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: the ratchet update is in the approved plan; please\nconfirm in review\n\n## AI assistance\n\n- [x] AI-assisted. Tools and what they did: Claude Code wrote the code,\ntests and docs and ran the verification above; the `reviewer` subagent\nreviewed the diff.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-09-27T21:00:18+03:00",
+          "tree_id": "17f277a7ae72dc3db1b9addc3b060608840bea80",
+          "url": "https://github.com/ydb-campus/antb1/commit/b7a321594c25d8d9839eed0d2fbea11814ef29ba"
+        },
+        "date": 1790532133860,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 3069.738721353093,
+            "unit": "ns/iter",
+            "extra": "iterations: 224894\ncpu: 3069.4238263359625 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 85009.57342657236,
+            "unit": "ns/iter",
+            "extra": "iterations: 7293\ncpu: 85006.05004799122 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222391.5063451804,
+            "unit": "ns/iter",
+            "extra": "iterations: 3152\ncpu: 222360.3426395939 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 442300.946902655,
+            "unit": "ns/iter",
+            "extra": "iterations: 1582\ncpu: 442283.97914032877 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 362066.9067357484,
+            "unit": "ns/iter",
+            "extra": "iterations: 1930\ncpu: 362030.85336787545 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2138165.716923088,
+            "unit": "ns/iter",
+            "extra": "iterations: 325\ncpu: 2138092.9076923067 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 220.6457056666693,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 220.61047600000006 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.438383428571388,
+            "unit": "ms/iter",
+            "extra": "iterations: 49\ncpu: 14.43776418367347 ms\nthreads: 1"
           }
         ]
       }
