@@ -81,7 +81,45 @@ SELECT id FROM edge WHERE s NOT IN ('a', '')
 8
 9
 
-# -0.0 equals 0.0 (FLOAT is read as DOUBLE).
+# -0.0 equals 0.0 (FLOAT is read as DOUBLE). DuckDB types an IN list as one type: numbers alone compare
+# with a FLOAT column in FLOAT, but one DOUBLE-typed number (an exponent) makes every value a DOUBLE.
+
+query I rowsort
+SELECT id FROM floats WHERE f IN (0.1, 2)
+----
+0
+
+query I rowsort
+SELECT id FROM floats WHERE f IN (0.1, 1e0)
+----
+
+query I rowsort
+SELECT id FROM floats WHERE f NOT IN (0.1, 1e0, 19.99)
+----
+0
+1
+10
+11
+12
+13
+14
+15
+16
+2
+3
+4
+5
+6
+7
+8
+9
+
+query I rowsort
+SELECT id FROM edge WHERE i64 IN (42, 4.2e1, 1)
+----
+4
+9
+
 
 query I rowsort
 SELECT id FROM floats WHERE f IN (0, 19.99)

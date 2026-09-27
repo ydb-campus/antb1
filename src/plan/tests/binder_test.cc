@@ -410,6 +410,19 @@ TEST(BinderTest, In) {
   EXPECT_FALSE(predicates[3].column.has_value());
   EXPECT_EQ(predicates[4].kind, Predicate::Kind::kIn);
   EXPECT_EQ(std::get<double>(predicates[4].values[0].value), 0.1);
+
+  // DuckDB types the whole list as DOUBLE when one number is DOUBLE-typed (an exponent): every
+  // integer is then the nearest double (2^53 + 1 becomes 2^53), folded exactly as in D7.
+  auto exact = BindSql("SELECT COUNT(*) FROM t WHERE i64 IN (9007199254740993, 1)", catalog);
+  ASSERT_TRUE(exact.ok()) << exact.status().ToString();
+  EXPECT_EQ(std::get<Int128>(std::get<FilterNode>(Nth(*exact, 1)).predicates[0].values[0].value),
+            Int128{9007199254740993});
+  auto doubled = BindSql("SELECT COUNT(*) FROM t WHERE i64 IN (9007199254740993, 1e0)", catalog);
+  ASSERT_TRUE(doubled.ok()) << doubled.status().ToString();
+  const auto& values = std::get<FilterNode>(Nth(*doubled, 1)).predicates[0].values;
+  ASSERT_EQ(values.size(), 2U);
+  EXPECT_EQ(std::get<Int128>(values[0].value), Int128{9007199254740992});
+  EXPECT_EQ(std::get<Int128>(values[1].value), Int128{1});
 }
 
 // [NOT] LIKE binds to its own predicate kinds with the pattern as a VARCHAR constant; a pattern of

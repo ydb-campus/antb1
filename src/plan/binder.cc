@@ -264,11 +264,14 @@ arrow::Result<Predicate> BindLike(const sql::Comparison& cmp, const BoundColumn&
 }
 
 arrow::Result<Predicate> BindEquality(const sql::Comparison& cmp, const BoundColumn& column,
-                                      const Table& table);
+                                      const Table& table, bool as_double = false);
 
 // `column [NOT] IN (v1, ...)`: each value is bound as `column = v` (the same typing and exact
 // folding); a value no column value can equal is dropped. With no value left, IN is FALSE and
-// NOT IN is IS NOT NULL (NULL still rejects the row).
+// NOT IN is IS NOT NULL (NULL still rejects the row). DuckDB gives the list one type: with a
+// number it types as DOUBLE (an exponent, or more than 38 digits) every number is a double, so
+// each value is then bound as that DOUBLE would be (integer columns: the nearest double, folded
+// exactly, as divergence D7; a FLOAT column: no FLOAT literals).
 arrow::Result<Predicate> BindIn(const sql::Comparison& cmp, const BoundColumn& column,
                                 const Table& table) {
   const bool negated = cmp.op == sql::CompareOp::kNotIn;
@@ -278,13 +281,18 @@ arrow::Result<Predicate> BindIn(const sql::Comparison& cmp, const BoundColumn& c
               .constant = {},
               .values = {},
               .span = cmp.span};
+  const bool as_double = std::ranges::any_of(cmp.list, [](const sql::Literal& value) {
+    return (value.kind == sql::Literal::Kind::kInteger ||
+            value.kind == sql::Literal::Kind::kDecimal) &&
+           IsApproximateNumber(value.text);
+  });
   for (const sql::Literal& value : cmp.list) {
     const sql::Comparison equal{.column = cmp.column,
                                 .op = sql::CompareOp::kEq,
                                 .literal = value,
                                 .list = {},
                                 .span = cmp.span};
-    ARROW_ASSIGN_OR_RAISE(const Predicate one, BindEquality(equal, column, table));
+    ARROW_ASSIGN_OR_RAISE(const Predicate one, BindEquality(equal, column, table, as_double));
     if (one.kind == Predicate::Kind::kCompare) {
       p.values.push_back(one.constant);
     }
@@ -309,9 +317,11 @@ arrow::Result<Predicate> BindComparison(const sql::Comparison& cmp, const BoundC
   return BindEquality(cmp, column, table);
 }
 
-// `column <op> literal`, with the literal folded exactly into the column's type.
+// `column <op> literal`, with the literal folded exactly into the column's type. `as_double`: a
+// number is read as DuckDB reads a DOUBLE-typed one, even when it is not written that way (an IN
+// list with such a number).
 arrow::Result<Predicate> BindEquality(const sql::Comparison& cmp, const BoundColumn& column,
-                                      const Table& table) {
+                                      const Table& table, bool as_double) {
   const sql::Literal& lit = cmp.literal;
   const auto mismatch = [&](std::string_view hint) {
     return BindError(std::format("cannot compare {} column '{}' with {}; {}", ToString(column.type),
@@ -335,7 +345,7 @@ arrow::Result<Predicate> BindEquality(const sql::Comparison& cmp, const BoundCol
         return mismatch("write a number without quotes");
       }
       std::optional<ExactNumber> exact;
-      if (IsApproximateNumber(lit.text)) {
+      if (as_double || IsApproximateNumber(lit.text)) {
         // DuckDB reads it as a DOUBLE: compare with the nearest double, exactly (divergence D7).
         const auto value = ParseDoubleLiteral(lit.text, lit.negative);
         exact = value.has_value() ? std::optional(ExactNumberOf(*value)) : std::nullopt;
@@ -367,7 +377,7 @@ arrow::Result<Predicate> BindEquality(const sql::Comparison& cmp, const BoundCol
       // A FLOAT column: DuckDB casts an integer or DECIMAL literal to FLOAT and compares in FLOAT.
       // Widening that float to double is exact and keeps the order, so comparing the widened
       // column with it gives DuckDB's answer.
-      if (table.StoredAsFloat(column.index)) {
+      if (!as_double && table.StoredAsFloat(column.index)) {
         if (const auto f = DuckDbFloatOf(lit.text, lit.negative)) {
           p.constant.value = static_cast<double>(*f);
         }
