@@ -102,9 +102,9 @@ list and without `LIMIT`/`OFFSET` (its limit grows until the run of ties at the 
 antb1's row `i` must be a distinct row of the run of equal keys at rank `offset + i` (`CompareOrdered`,
 `runner/ordered_compare.h`). At most 2^20 rows are fetched in order: when the run at the window's end goes on
 beyond them (millions of groups tied at a count, say), one more query fetches only the rows of that run whose
-cells equal antb1's rows there, written as SQL literals. The query files of the data tests and the ClickBench runner check the same way
-(`CompareQueryAnswers`). The column types must match exactly (`BIGINT`, `HUGEINT`, ...),
-not only their `I`/`R`/`T` class. Query `i` of seed `s` depends only on `s`, `i`, the tables and the supported
+cells equal antb1's rows there, written as SQL literals. The query files of the data tests and the ClickBench
+runner check the same way (`CompareQueryAnswers`). The column types must match exactly (`BIGINT`, `HUGEINT`,
+...), not only their `I`/`R`/`T` class. Query `i` of seed `s` depends only on `s`, `i`, the tables and the supported
 features, so one case reproduces alone.
 
 - 75% of the queries use only the features in `supported_features.h` (`kSupportedFeatures`); the rest

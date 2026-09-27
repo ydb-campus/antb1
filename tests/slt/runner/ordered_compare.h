@@ -29,7 +29,7 @@ struct OrderedQuery {
   int64_t offset = 0;
   // The most rows fetched in order: a run of ties at the window's end that goes on beyond them is
   // checked with a query for the rows that can match antb1's rows there instead.
-  int64_t max_rows = int64_t{1} << 20;
+  int64_t max_rows = int64_t{1024} * 1024;
 };
 
 // The augmented form of a query with ORDER BY; std::nullopt without ORDER BY or for text antb1's

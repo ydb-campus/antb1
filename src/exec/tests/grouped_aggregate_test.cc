@@ -450,6 +450,7 @@ TEST_F(GroupedAggregateTest, EmitsOneBatchPerChunkOfNewGroups) {
     EXPECT_EQ((*table)->column(0)->chunk(0)->length(), 2);
     EXPECT_EQ((*table)->column(0)->chunk(1)->length(), 2);
     std::vector<std::string> lines;
+    lines.reserve(static_cast<std::size_t>((*table)->num_rows()));
     for (std::int64_t r = 0; r < (*table)->num_rows(); ++r) {
       lines.push_back(
           testing::Int64Column(**table, 0)[static_cast<std::size_t>(r)]
