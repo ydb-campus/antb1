@@ -307,16 +307,25 @@ TEST_F(SortTest, PrefixesAgreeWithTheComparator) {
   std::vector<std::pair<LogicalType, std::shared_ptr<arrow::Array>>> columns;
   {
     std::vector<std::optional<int64_t>> v;
-    const std::vector<int64_t> edges = {std::numeric_limits<int64_t>::min(), -1, 0, 1,
+    v.reserve(64);
+    const std::vector<int64_t> edges = {std::numeric_limits<int64_t>::min(),
+                                        std::numeric_limits<int64_t>::min() + 1,
+                                        -2,
+                                        -1,
+                                        0,
+                                        1,
+                                        2,
+                                        std::numeric_limits<int64_t>::max() - 1,
                                         std::numeric_limits<int64_t>::max()};
     for (int i = 0; i < 64; ++i) {
       v.emplace_back(i % 9 == 0 ? std::optional<int64_t>{}
-                                : std::optional(edges[pick(edges.size())] + (rng.Below(3) - 1)));
+                                : std::optional(edges[pick(edges.size())]));
     }
     columns.emplace_back(LogicalType::kBigInt, Int64s(v));
   }
   {
     std::vector<std::optional<int16_t>> v;
+    v.reserve(64);
     for (int i = 0; i < 64; ++i) {
       v.emplace_back(i % 9 == 0 ? std::optional<int16_t>{}
                                 : std::optional(static_cast<int16_t>(rng.Below(65536) - 32768)));
@@ -326,6 +335,7 @@ TEST_F(SortTest, PrefixesAgreeWithTheComparator) {
   }
   {
     std::vector<std::optional<uint16_t>> v;
+    v.reserve(64);
     for (int i = 0; i < 64; ++i) {
       v.emplace_back(i % 9 == 0 ? std::optional<uint16_t>{}
                                 : std::optional(static_cast<uint16_t>(rng.Below(65536))));
@@ -335,6 +345,7 @@ TEST_F(SortTest, PrefixesAgreeWithTheComparator) {
   }
   {
     std::vector<std::optional<double>> v;
+    v.reserve(64);
     const std::vector<double> specials = {kNaN,   -kNaN,   kInf, -kInf, 0.0,  -0.0,
                                           1e-310, -1e-310, 1.5,  -1.5,  1e300};
     for (int i = 0; i < 64; ++i) {
@@ -345,6 +356,7 @@ TEST_F(SortTest, PrefixesAgreeWithTheComparator) {
   }
   {
     std::vector<std::optional<std::string>> v;
+    v.reserve(64);
     const std::vector<std::string> specials = {"",
                                                "a",
                                                "ab",
