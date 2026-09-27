@@ -67,7 +67,7 @@ class Rng {
     z = (z ^ (z >> 27U)) * 0x94D049BB133111EBULL;
     return z ^ (z >> 31U);
   }
-  std::size_t Below(std::size_t n) { return static_cast<std::size_t>(Next() % n); }
+  std::size_t Below(std::size_t n) { return Next() % n; }
 
  private:
   std::uint64_t state_;

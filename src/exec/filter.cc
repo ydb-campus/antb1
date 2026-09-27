@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -99,11 +100,12 @@ arrow::Result<std::shared_ptr<arrow::Array>> FilterOperator::Evaluate(
       ARROW_ASSIGN_OR_RAISE(result,
                             arrow::compute::CallFunction(std::string(KernelName(p.op)),
                                                          {column, constants_[i]}, &kernels));
-    } else if (patterns_[i].has_value()) {  // kLike, kNotLike
+    } else if (const std::optional<LikePattern>& pattern = patterns_[i]; pattern.has_value()) {
+      // kLike, kNotLike
       ARROW_ASSIGN_OR_RAISE(
           result,
-          patterns_[i]->Evaluate(static_cast<const arrow::BinaryArray&>(*batch.column(columns_[i])),
-                                 p.kind == plan::Predicate::Kind::kNotLike, pool_));
+          pattern->Evaluate(static_cast<const arrow::BinaryArray&>(*batch.column(columns_[i])),
+                            p.kind == plan::Predicate::Kind::kNotLike, pool_));
     } else {  // kIsNotNull (kFalse never gets here)
       ARROW_ASSIGN_OR_RAISE(result, arrow::compute::CallFunction("is_valid", {column}, &kernels));
     }
