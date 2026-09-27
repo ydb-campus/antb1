@@ -628,7 +628,7 @@ SelectStatement RandomStatement(Rng& rng) {
   if (rng.Percent(35)) {
     const std::size_t keys = 1 + rng.Below(3);
     for (std::size_t i = 0; i < keys; ++i) {
-      stmt.group_by.push_back(RandomColumn(rng));
+      stmt.group_by.emplace_back(RandomColumn(rng));
     }
   }
   if (rng.Percent(35)) {

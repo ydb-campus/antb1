@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <format>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -93,8 +94,9 @@ struct NodeLine {
     std::string line = "Project ";
     for (std::size_t i = 0; i < node.columns.size(); ++i) {
       line += i == 0 ? "" : ", ";
-      const bool constant = !node.constants.empty() && node.constants[i].has_value();
-      line += constant ? ToString(*node.constants[i]) : ColumnName(node.columns[i]);
+      const std::optional<Constant> constant =
+          node.constants.empty() ? std::nullopt : node.constants[i];
+      line += constant.has_value() ? ToString(*constant) : ColumnName(node.columns[i]);
     }
     return line;
   }

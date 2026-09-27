@@ -44,8 +44,10 @@ struct Builder {
     columns.reserve(node.columns.size());
     for (std::size_t i = 0; i < node.columns.size(); ++i) {
       std::shared_ptr<arrow::Scalar> constant;
-      if (!node.constants.empty() && node.constants[i].has_value()) {
-        ARROW_ASSIGN_OR_RAISE(constant, plan::ToArrowScalar(*node.constants[i]));
+      if (!node.constants.empty()) {
+        if (const std::optional<plan::Constant>& value = node.constants[i]; value.has_value()) {
+          ARROW_ASSIGN_OR_RAISE(constant, plan::ToArrowScalar(*value));
+        }
       }
       columns.push_back(node.columns[i].index);
       constants.push_back(std::move(constant));

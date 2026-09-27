@@ -640,7 +640,8 @@ arrow::Result<std::vector<BoundColumn>> BindGroupBy(const sql::SelectStatement& 
     if (!alias.has_value()) {
       return column.status();
     }
-    ARROW_RETURN_NOT_OK(item_key(*alias, std::format("'{}'", *select.aliases[*alias]), ref.span));
+    ARROW_RETURN_NOT_OK(
+        item_key(*alias, std::format("'{}'", select.aliases[*alias].value_or("")), ref.span));
   }
   return keys;
 }
