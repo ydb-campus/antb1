@@ -142,10 +142,20 @@ void CheckTokensAccountedFor(const std::string& sql, const SelectStatement& stmt
     const bool numeric = lit.kind == Literal::Kind::kInteger || lit.kind == Literal::Kind::kDecimal;
     (numeric ? number_literals : string_literals) += 1;
   };
-  std::size_t likes = 0;  // LIKE has no comparison token
+  std::size_t likes = 0;  // LIKE and IN have no comparison token
+  std::size_t in_lists = 0;
+  std::size_t in_commas = 0;
   for (const Comparison& cmp : stmt.where) {
     likes += cmp.op == CompareOp::kLike || cmp.op == CompareOp::kNotLike ? 1U : 0U;
-    count_literal(cmp.literal);
+    if (cmp.op == CompareOp::kIn || cmp.op == CompareOp::kNotIn) {
+      ++in_lists;
+      in_commas += separators(cmp.list.size());
+      for (const Literal& lit : cmp.list) {
+        count_literal(lit);
+      }
+    } else {
+      count_literal(cmp.literal);
+    }
   }
   for (const SelectItem& item : stmt.items) {
     if (const auto* lit = std::get_if<Literal>(&item.expr)) {
@@ -164,12 +174,12 @@ void CheckTokensAccountedFor(const std::string& sql, const SelectStatement& stmt
   }
   const std::string context = testing::PrintToString(sql);
   EXPECT_EQ(commas, separators(stmt.items.size()) + separators(stmt.group_by.size()) +
-                        separators(stmt.order_by.size()))
+                        separators(stmt.order_by.size()) + in_commas)
       << context;
   EXPECT_EQ(and_count, stmt.where.empty() ? 0U : stmt.where.size() - 1) << context;
-  EXPECT_EQ(comparisons, stmt.where.size() - likes) << context;
-  EXPECT_EQ(left_parens, aggregates) << context;
-  EXPECT_EQ(right_parens, aggregates) << context;
+  EXPECT_EQ(comparisons, stmt.where.size() - likes - in_lists) << context;
+  EXPECT_EQ(left_parens, aggregates + in_lists) << context;
+  EXPECT_EQ(right_parens, aggregates + in_lists) << context;
   EXPECT_EQ(stars, (stmt.star ? 1U : 0U) + count_stars) << context;
   EXPECT_EQ(minuses, negatives) << context;
   EXPECT_EQ(strings, string_literals) << context;
