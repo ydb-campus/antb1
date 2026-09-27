@@ -569,7 +569,7 @@ class GroupedCountDistinct final : public GroupedAggregateState {
     arrow::UInt32Builder groups(pool_);
     ARROW_RETURN_NOT_OK(groups.AppendValues(ids.data(), static_cast<std::int64_t>(ids.size())));
     ARROW_ASSIGN_OR_RAISE(auto group_array, groups.Finish());
-    return AddPairs(std::move(group_array), arrow::MakeArray(values->data()));
+    return AddPairs(group_array, arrow::MakeArray(values->data()));
   }
   arrow::Status Merge(const GroupedAggregateState& other, GroupIds map) override {
     ARROW_ASSIGN_OR_RAISE(const auto* same,
@@ -586,7 +586,7 @@ class GroupedCountDistinct final : public GroupedAggregateState {
       groups.UnsafeAppend(map[their_groups->Value(i)]);
     }
     ARROW_ASSIGN_OR_RAISE(auto group_array, groups.Finish());
-    return AddPairs(std::move(group_array), uniques.values.at(1).make_array());
+    return AddPairs(group_array, uniques.values.at(1).make_array());
   }
   [[nodiscard]] arrow::Result<std::shared_ptr<arrow::Array>> Finalize(
       std::uint32_t begin, std::uint32_t end, arrow::MemoryPool* pool) const override {
@@ -601,7 +601,7 @@ class GroupedCountDistinct final : public GroupedAggregateState {
         kernels_(std::make_unique<arrow::compute::ExecContext>(pool)) {}
 
   // Rows of (group id, value); a pair new to the grouper counts once for its group.
-  arrow::Status AddPairs(std::shared_ptr<arrow::Array> groups,
+  arrow::Status AddPairs(const std::shared_ptr<arrow::Array>& groups,
                          std::shared_ptr<arrow::Array> values) {
     const std::int64_t rows = values->length();
     if (rows == 0) {

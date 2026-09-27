@@ -194,7 +194,7 @@ class CountDistinctState final : public AggregateState {
     }
     saw_null_ = saw_null_ || values->null_count() > 0;
     const int64_t rows = values->length();
-    const arrow::compute::ExecBatch batch({arrow::Datum(std::move(values))}, rows);
+    const arrow::compute::ExecBatch batch({arrow::Datum(values)}, rows);
     return grouper_->Consume(arrow::compute::ExecSpan(batch)).status();
   }
 
