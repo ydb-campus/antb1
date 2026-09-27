@@ -749,6 +749,10 @@ class Builder {
         Like(c);
         continue;
       }
+      if (allowed_.Has(Feature::kIn) && rng_.Percent(15)) {
+        In(c);
+        continue;
+      }
       const std::string_view op = rng_.Pick(kOps);
       Literal lit = MakeLiteral(c);
       used_.Add(lit.features);
@@ -812,6 +816,26 @@ class Builder {
     }
     Keyword("LIKE");
     tokens_.push_back({.kind = Token::Kind::kLiteral, .text = SqlString(pattern)});
+  }
+
+  // column [NOT] IN (1 to 4 literals of the column's type, as comparisons get them).
+  void In(const GenColumn& c) {
+    used_.Add(Feature::kIn);
+    Column(c);
+    if (rng_.Percent(30)) {
+      Keyword("NOT");
+    }
+    Keyword("IN");
+    Symbol("(");
+    for (std::size_t n = 1 + rng_.Below(4), i = 0; i < n; ++i) {
+      if (i > 0) {
+        Symbol(",");
+      }
+      Literal lit = MakeLiteral(c);
+      used_.Add(lit.features);
+      tokens_.insert(tokens_.end(), lit.tokens.begin(), lit.tokens.end());
+    }
+    Symbol(")");
   }
 
   bool Limit(bool required) {

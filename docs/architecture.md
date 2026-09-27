@@ -105,7 +105,7 @@ into data. Everything runs on one thread, reading files and row groups in order.
 | Operator | Logical node | Does |
 | --- | --- | --- |
 | `TableScanOperator` | `Scan` | `plan::Table::Scan` of the referenced fields only, in batches of `ExecContext::batch_size` rows (64Ki) |
-| `FilterOperator` | `Filter` | evaluates every comparison with Arrow's comparison kernels (`equal`, `less`, ...) and `[NOT] LIKE` with `exec::LikePattern` (DuckDB's rules; patterns without `_` match by their literal segments), combines them with `and_kleene`, turns NULL into false and attaches the result as the selection; skips batches without a selected row; a folded `FALSE` ends the stream without reading |
+| `FilterOperator` | `Filter` | evaluates every comparison with Arrow's comparison kernels (`equal`, `less`, ...) and `[NOT] LIKE` with `exec::LikePattern` (DuckDB's rules; patterns without `_` match by their literal segments), `[NOT] IN` as `equal` per value combined with `or_kleene` (and `invert` for NOT IN), combines them with `and_kleene`, turns NULL into false and attaches the result as the selection; skips batches without a selected row; a folded `FALSE` ends the stream without reading |
 | `ProjectOperator` | `Project` | selects columns and materializes the selected rows with Arrow's `Filter` kernel |
 | `ScalarAggregateOperator` | `Aggregate` | feeds every batch and its selection to one `AggregateState` per call, then emits one row |
 | `GroupAggregateOperator` | `GroupAggregate` | materializes the selected rows, maps their keys to group ids with Arrow's `Grouper` (DOUBLE keys normalized first), feeds one `GroupedAggregateState` per call; after the input, emits one row per group: the keys as first seen, then the aggregates |

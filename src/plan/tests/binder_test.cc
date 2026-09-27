@@ -63,6 +63,13 @@ constexpr auto kUnsupported = SqlErrorDetail::Kind::kUnsupported;
 INSTANTIATE_TEST_SUITE_P(
     Binder, BindErrorTest,
     ::testing::Values(
+        // [NOT] IN: each value is typed like `column = value`.
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE i16 IN (1, '2')", kBind, "'2'",
+                  "cannot compare SMALLINT column 'i16' with a string"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE s NOT IN ('a', 1)", kBind, "1",
+                  "cannot compare VARCHAR column 's' with a number"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE dt IN (DATE '2013-02-30')", kBind,
+                  "DATE '2013-02-30'", "invalid date"},
         // [NOT] LIKE: a VARCHAR column and a string pattern (DuckDB rejects LIKE on numbers).
         ErrorCase{"SELECT COUNT(*) FROM t WHERE i16 LIKE '1%'", kBind, "i16",
                   "LIKE needs a VARCHAR column, but 'i16' is SMALLINT"},
@@ -378,6 +385,44 @@ TEST(BinderTest, CountDistinct) {
   auto name = BindSql("SELECT COUNT(DISTINCT \"i32\") FROM t", catalog);
   ASSERT_TRUE(name.ok()) << name.status().ToString();
   EXPECT_EQ(name->output[0].name, "count(DISTINCT i32)");
+}
+
+// [NOT] IN binds each value like `column = value`: values no column value can equal are dropped,
+// and without values IN is FALSE and NOT IN is IS NOT NULL.
+TEST(BinderTest, In) {
+  const Catalog catalog = MakeCatalog();
+  auto plan = BindSql(
+      "SELECT COUNT(*) FROM t WHERE i16 IN (1, 2.5, 40000, -3.0) AND s NOT IN ('a', 'b') AND "
+      "u16 NOT IN (-1, 1.5) AND i32 IN (1.5) AND d IN (0.1)",
+      catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  const auto& predicates = std::get<FilterNode>(Nth(*plan, 1)).predicates;
+  ASSERT_EQ(predicates.size(), 5U);
+  EXPECT_EQ(predicates[0].kind, Predicate::Kind::kIn);
+  ASSERT_EQ(predicates[0].values.size(), 2U);
+  EXPECT_EQ(std::get<Int128>(predicates[0].values[0].value), Int128{1});
+  EXPECT_EQ(std::get<Int128>(predicates[0].values[1].value), Int128{-3});
+  EXPECT_EQ(predicates[0].values[1].type, LogicalType::kSmallInt);
+  EXPECT_EQ(predicates[1].kind, Predicate::Kind::kNotIn);
+  EXPECT_EQ(std::get<std::string>(predicates[1].values[1].value), "b");
+  EXPECT_EQ(predicates[2].kind, Predicate::Kind::kIsNotNull);
+  EXPECT_EQ(predicates[3].kind, Predicate::Kind::kFalse);
+  EXPECT_FALSE(predicates[3].column.has_value());
+  EXPECT_EQ(predicates[4].kind, Predicate::Kind::kIn);
+  EXPECT_EQ(std::get<double>(predicates[4].values[0].value), 0.1);
+
+  // DuckDB types the whole list as DOUBLE when one number is DOUBLE-typed (an exponent): every
+  // integer is then the nearest double (2^53 + 1 becomes 2^53), folded exactly as in D7.
+  auto exact = BindSql("SELECT COUNT(*) FROM t WHERE i64 IN (9007199254740993, 1)", catalog);
+  ASSERT_TRUE(exact.ok()) << exact.status().ToString();
+  EXPECT_EQ(std::get<Int128>(std::get<FilterNode>(Nth(*exact, 1)).predicates[0].values[0].value),
+            Int128{9007199254740993});
+  auto doubled = BindSql("SELECT COUNT(*) FROM t WHERE i64 IN (9007199254740993, 1e0)", catalog);
+  ASSERT_TRUE(doubled.ok()) << doubled.status().ToString();
+  const auto& values = std::get<FilterNode>(Nth(*doubled, 1)).predicates[0].values;
+  ASSERT_EQ(values.size(), 2U);
+  EXPECT_EQ(std::get<Int128>(values[0].value), Int128{9007199254740992});
+  EXPECT_EQ(std::get<Int128>(values[1].value), Int128{1});
 }
 
 // [NOT] LIKE binds to its own predicate kinds with the pattern as a VARCHAR constant; a pattern of

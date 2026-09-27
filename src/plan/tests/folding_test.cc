@@ -107,8 +107,10 @@ bool Accepts(const FoldedComparison& folded, Int128 v) {
       return false;
     case Predicate::Kind::kIsNotNull:
       return true;
-    case Predicate::Kind::kLike:  // integer folding never produces LIKE
+    case Predicate::Kind::kLike:  // integer folding never produces LIKE or IN
     case Predicate::Kind::kNotLike:
+    case Predicate::Kind::kIn:
+    case Predicate::Kind::kNotIn:
       return false;
     case Predicate::Kind::kCompare: {
       int cmp = 0;

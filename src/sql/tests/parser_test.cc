@@ -406,6 +406,26 @@ TEST(ParserTest, Like) {
   EXPECT_EQ(number->where[0].literal.kind, Literal::Kind::kInteger);
 }
 
+// column [NOT] IN (literal, ...) in WHERE; the span runs from the column to the closing paren.
+TEST(ParserTest, In) {
+  constexpr std::string_view kSql =
+      "SELECT a FROM t WHERE b in (1, -2.5, 'x', DATE '2024-01-02') AND c NOT IN ('y') AND d = 1";
+  auto stmt = Parse(kSql);
+  ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
+  ASSERT_EQ(stmt->where.size(), 3U);
+  const Comparison& in = stmt->where[0];
+  EXPECT_EQ(in.op, CompareOp::kIn);
+  ASSERT_EQ(in.list.size(), 4U);
+  EXPECT_EQ(in.list[1].text, "2.5");
+  EXPECT_TRUE(in.list[1].negative);
+  EXPECT_EQ(in.list[2].kind, Literal::Kind::kString);
+  EXPECT_EQ(in.list[3].kind, Literal::Kind::kDate);
+  EXPECT_EQ(kSql.substr(in.span.offset, in.span.length), "b in (1, -2.5, 'x', DATE '2024-01-02')");
+  EXPECT_EQ(stmt->where[1].op, CompareOp::kNotIn);
+  EXPECT_EQ(stmt->where[1].list.size(), 1U);
+  EXPECT_EQ(stmt->where[2].op, CompareOp::kEq);
+}
+
 TEST(ParserTest, CountDistinct) {
   auto stmt = Parse("SELECT count( distinct user_id ), COUNT(user_id) FROM events");
   ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
@@ -678,10 +698,16 @@ INSTANTIATE_TEST_SUITE_P(
                    "ILIKE is not supported"},
         RejectCase{"SimilarTo", "SELECT a FROM events WHERE url ^SIMILAR TO 'x'", kUnsupported, 7,
                    "SIMILAR TO is not supported"},
-        RejectCase{"In", "SELECT a FROM events WHERE region ^IN ('a', 'b')", kUnsupported, 2,
+        RejectCase{"InSubquery", "SELECT a FROM events WHERE region IN (^SELECT b FROM t)",
+                   kUnsupported, 6, "IN (subquery) is not supported"},
+        RejectCase{"InColumn", "SELECT a FROM events WHERE region IN (1, ^b)", kUnsupported, 1,
+                   "columns in an IN list are not supported"},
+        RejectCase{"InLiteralLeft", "SELECT a FROM events WHERE ^1 IN (a)", kUnsupported, 1,
+                   "IN needs a column on the left"},
+        RejectCase{"InInSelect", "SELECT region ^IN ('a') FROM events", kUnsupported, 2,
                    "IN is not supported"},
-        RejectCase{"NotIn", "SELECT a FROM events WHERE region ^not in ('a')", kUnsupported, 3,
-                   "NOT IN is not supported"},
+        RejectCase{"InExpression", "SELECT a FROM events WHERE region IN (1 ^+ 2)", kUnsupported, 1,
+                   "arithmetic operator '+' is not supported"},
         RejectCase{"Between", "SELECT a FROM events WHERE a ^BETWEEN 1 AND 2", kUnsupported, 7,
                    "BETWEEN is not supported"},
         RejectCase{"NotBetween", "SELECT a FROM events WHERE a ^NOT BETWEEN 1 AND 2", kUnsupported,
@@ -981,6 +1007,12 @@ INSTANTIATE_TEST_SUITE_P(
     ::testing::Values(
         RejectCase{"Empty", "^", kSyntax, 0, "empty query; expected SELECT"},
         RejectCase{"OnlyComment", "  -- nothing\n^", kSyntax, 0, "empty query; expected SELECT"},
+        RejectCase{"InEmptyList", "SELECT a FROM t WHERE b IN (^)", kSyntax, 1,
+                   "expected a value in IN (...), found )"},
+        RejectCase{"InWithoutParen", "SELECT a FROM t WHERE b IN ^1", kSyntax, 1,
+                   "expected ( after IN, found"},
+        RejectCase{"InUnclosed", "SELECT a FROM t WHERE b IN (1, 2^", kSyntax, 0,
+                   "expected , or ) in IN (...), found end of input"},
         RejectCase{"OnlySemicolon", "^;", kSyntax, 1, "expected SELECT, found ';'"},
         RejectCase{"Misspelled", "^SELEC a FROM events", kSyntax, 5,
                    "expected SELECT, found identifier SELEC"},

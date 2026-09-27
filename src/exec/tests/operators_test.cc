@@ -160,6 +160,32 @@ TEST_F(OperatorsTest, FilterComparisonsAndNulls) {
   EXPECT_EQ(Int64Column(*Run(not_null)), (std::vector<std::optional<int64_t>>{1, 3, 4, 5, -6}));
 }
 
+// [NOT] IN: equal to any value (Kleene OR), NOT IN its negation; NULL rejects the row either way;
+// malformed IN predicates fail at Open.
+TEST_F(OperatorsTest, FilterIn) {
+  const auto x = Column(0, "x", LogicalType::kBigInt);
+  const auto in = [&](Predicate::Kind kind, const std::vector<int64_t>& values) {
+    Predicate p{.kind = kind, .column = x, .op = CompareOp::kEq, .constant = {}, .span = {}};
+    for (const int64_t v : values) {
+      p.values.push_back(BigInt(v));
+    }
+    return p;
+  };
+  using Ids = std::vector<std::optional<int64_t>>;
+  // x: 1, NULL, 3, 4, 5, -6.
+  FilterOperator some(Scan(Table()), {in(Predicate::Kind::kIn, {3, -6, 9, 3})});
+  EXPECT_EQ(Int64Column(*Run(some)), (Ids{3, -6}));
+  FilterOperator others(Scan(Table()), {in(Predicate::Kind::kNotIn, {3, -6, 9})});
+  EXPECT_EQ(Int64Column(*Run(others)), (Ids{1, 4, 5}));
+  ExecContext ctx;
+  FilterOperator empty(Scan(Table()), {in(Predicate::Kind::kIn, {})});
+  EXPECT_TRUE(empty.Open(ctx).IsInvalid());
+  Predicate wrong_type = in(Predicate::Kind::kIn, {1});
+  wrong_type.values.front() = plan::Constant{.type = LogicalType::kVarchar, .value = "1"};
+  FilterOperator mismatch(Scan(Table()), {wrong_type});
+  EXPECT_TRUE(mismatch.Open(ctx).IsInvalid());
+}
+
 // [NOT] LIKE: NULL rejects the row either way; malformed LIKE predicates fail at Open.
 TEST_F(OperatorsTest, FilterLike) {
   const auto s = Column(1, "s", LogicalType::kVarchar);

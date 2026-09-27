@@ -79,6 +79,10 @@ std::string_view ToString(CompareOp op) {
       return "LIKE";
     case CompareOp::kNotLike:
       return "NOT LIKE";
+    case CompareOp::kIn:
+      return "IN";
+    case CompareOp::kNotIn:
+      return "NOT IN";
   }
   return "?";
 }
@@ -109,8 +113,14 @@ bool EqualIgnoringSpans(const SelectStatement& a, const SelectStatement& b) {
   }
   for (std::size_t i = 0; i < a.where.size(); ++i) {
     if (!Eq(a.where[i].column, b.where[i].column) || a.where[i].op != b.where[i].op ||
-        !Eq(a.where[i].literal, b.where[i].literal)) {
+        !Eq(a.where[i].literal, b.where[i].literal) ||
+        a.where[i].list.size() != b.where[i].list.size()) {
       return false;
+    }
+    for (std::size_t k = 0; k < a.where[i].list.size(); ++k) {
+      if (!Eq(a.where[i].list[k], b.where[i].list[k])) {
+        return false;
+      }
     }
   }
   return true;

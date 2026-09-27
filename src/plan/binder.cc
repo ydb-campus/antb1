@@ -65,6 +65,8 @@ CompareOp ToPlan(sql::CompareOp op) {
       return CompareOp::kGe;
     case sql::CompareOp::kLike:  // bound as Predicate::Kind::kLike, never as a comparison
     case sql::CompareOp::kNotLike:
+    case sql::CompareOp::kIn:  // bound as Predicate::Kind::kIn
+    case sql::CompareOp::kNotIn:
       break;
   }
   return CompareOp::kEq;
@@ -231,7 +233,6 @@ std::string_view LiteralKind(const sql::Literal& lit) {
   return "a literal";
 }
 
-// `column <op> literal`, with the literal folded exactly into the column's type.
 // `column [NOT] LIKE 'pattern'`: a VARCHAR column and a string pattern (DuckDB rejects LIKE on
 // other types). A pattern of only % holds for every value: LIKE folds to IS NOT NULL, NOT LIKE to
 // FALSE.
@@ -262,11 +263,65 @@ arrow::Result<Predicate> BindLike(const sql::Comparison& cmp, const BoundColumn&
   return p;
 }
 
+arrow::Result<Predicate> BindEquality(const sql::Comparison& cmp, const BoundColumn& column,
+                                      const Table& table, bool as_double = false);
+
+// `column [NOT] IN (v1, ...)`: each value is bound as `column = v` (the same typing and exact
+// folding); a value no column value can equal is dropped. With no value left, IN is FALSE and
+// NOT IN is IS NOT NULL (NULL still rejects the row). DuckDB gives the list one type: with a
+// number it types as DOUBLE (an exponent, or more than 38 digits) every number is a double, so
+// each value is then bound as that DOUBLE would be (integer columns: the nearest double, folded
+// exactly, as divergence D7; a FLOAT column: no FLOAT literals).
+arrow::Result<Predicate> BindIn(const sql::Comparison& cmp, const BoundColumn& column,
+                                const Table& table) {
+  const bool negated = cmp.op == sql::CompareOp::kNotIn;
+  Predicate p{.kind = negated ? Predicate::Kind::kNotIn : Predicate::Kind::kIn,
+              .column = column,
+              .op = CompareOp::kEq,
+              .constant = {},
+              .values = {},
+              .span = cmp.span};
+  const bool as_double = std::ranges::any_of(cmp.list, [](const sql::Literal& value) {
+    return (value.kind == sql::Literal::Kind::kInteger ||
+            value.kind == sql::Literal::Kind::kDecimal) &&
+           IsApproximateNumber(value.text);
+  });
+  for (const sql::Literal& value : cmp.list) {
+    const sql::Comparison equal{.column = cmp.column,
+                                .op = sql::CompareOp::kEq,
+                                .literal = value,
+                                .list = {},
+                                .span = cmp.span};
+    ARROW_ASSIGN_OR_RAISE(const Predicate one, BindEquality(equal, column, table, as_double));
+    if (one.kind == Predicate::Kind::kCompare) {
+      p.values.push_back(one.constant);
+    }
+  }
+  if (p.values.empty()) {
+    p.kind = negated ? Predicate::Kind::kIsNotNull : Predicate::Kind::kFalse;
+    if (!negated) {
+      p.column.reset();  // no row passes, whatever the column holds
+    }
+  }
+  return p;
+}
+
 arrow::Result<Predicate> BindComparison(const sql::Comparison& cmp, const BoundColumn& column,
                                         const Table& table) {
   if (cmp.op == sql::CompareOp::kLike || cmp.op == sql::CompareOp::kNotLike) {
     return BindLike(cmp, column);
   }
+  if (cmp.op == sql::CompareOp::kIn || cmp.op == sql::CompareOp::kNotIn) {
+    return BindIn(cmp, column, table);
+  }
+  return BindEquality(cmp, column, table);
+}
+
+// `column <op> literal`, with the literal folded exactly into the column's type. `as_double`: a
+// number is read as DuckDB reads a DOUBLE-typed one, even when it is not written that way (an IN
+// list with such a number).
+arrow::Result<Predicate> BindEquality(const sql::Comparison& cmp, const BoundColumn& column,
+                                      const Table& table, bool as_double) {
   const sql::Literal& lit = cmp.literal;
   const auto mismatch = [&](std::string_view hint) {
     return BindError(std::format("cannot compare {} column '{}' with {}; {}", ToString(column.type),
@@ -290,7 +345,7 @@ arrow::Result<Predicate> BindComparison(const sql::Comparison& cmp, const BoundC
         return mismatch("write a number without quotes");
       }
       std::optional<ExactNumber> exact;
-      if (IsApproximateNumber(lit.text)) {
+      if (as_double || IsApproximateNumber(lit.text)) {
         // DuckDB reads it as a DOUBLE: compare with the nearest double, exactly (divergence D7).
         const auto value = ParseDoubleLiteral(lit.text, lit.negative);
         exact = value.has_value() ? std::optional(ExactNumberOf(*value)) : std::nullopt;
@@ -322,7 +377,7 @@ arrow::Result<Predicate> BindComparison(const sql::Comparison& cmp, const BoundC
       // A FLOAT column: DuckDB casts an integer or DECIMAL literal to FLOAT and compares in FLOAT.
       // Widening that float to double is exact and keeps the order, so comparing the widened
       // column with it gives DuckDB's answer.
-      if (table.StoredAsFloat(column.index)) {
+      if (!as_double && table.StoredAsFloat(column.index)) {
         if (const auto f = DuckDbFloatOf(lit.text, lit.negative)) {
           p.constant.value = static_cast<double>(*f);
         }

@@ -52,12 +52,14 @@ arrow::Status FilterOperator::Open(ExecContext& ctx) {
   columns_.clear();
   constants_.clear();
   patterns_.clear();
+  value_sets_.clear();
   const arrow::Schema& schema = *input_->output_schema();
   for (const plan::Predicate& p : predicates_) {
     if (p.kind == plan::Predicate::Kind::kFalse) {
       columns_.push_back(-1);  // never evaluated: the stream ends before any batch
       constants_.emplace_back();
       patterns_.emplace_back();
+      value_sets_.emplace_back();
       continue;
     }
     if (!p.column.has_value() || p.column->index < 0 || p.column->index >= schema.num_fields()) {
@@ -81,9 +83,25 @@ arrow::Status FilterOperator::Open(ExecContext& ctx) {
       }
       pattern.emplace(*text);
     }
+    std::vector<std::shared_ptr<arrow::Scalar>> values;
+    if (p.kind == plan::Predicate::Kind::kIn || p.kind == plan::Predicate::Kind::kNotIn) {
+      if (p.values.empty()) {
+        return arrow::Status::Invalid("IN without values");
+      }
+      for (const plan::Constant& value : p.values) {
+        ARROW_ASSIGN_OR_RAISE(auto scalar, plan::ToArrowScalar(value));
+        if (!scalar->type->Equals(*schema.field(column)->type())) {
+          return arrow::Status::Invalid("filter compares a ",
+                                        schema.field(column)->type()->ToString(), " column with a ",
+                                        scalar->type->ToString(), " IN value");
+        }
+        values.push_back(std::move(scalar));
+      }
+    }
     columns_.push_back(column);
     constants_.push_back(std::move(constant));
     patterns_.push_back(std::move(pattern));
+    value_sets_.push_back(std::move(values));
   }
   return input_->Open(ctx);
 }
@@ -106,6 +124,22 @@ arrow::Result<std::shared_ptr<arrow::Array>> FilterOperator::Evaluate(
           result,
           pattern->Evaluate(static_cast<const arrow::BinaryArray&>(*batch.column(columns_[i])),
                             p.kind == plan::Predicate::Kind::kNotLike, pool_));
+    } else if (!value_sets_[i].empty()) {  // kIn, kNotIn: equal to any value (Kleene OR)
+      arrow::Datum any;
+      for (const auto& value : value_sets_[i]) {
+        ARROW_ASSIGN_OR_RAISE(arrow::Datum equal,
+                              arrow::compute::CallFunction("equal", {column, value}, &kernels));
+        if (any.is_value()) {
+          ARROW_ASSIGN_OR_RAISE(any,
+                                arrow::compute::CallFunction("or_kleene", {any, equal}, &kernels));
+        } else {
+          any = std::move(equal);
+        }
+      }
+      if (p.kind == plan::Predicate::Kind::kNotIn) {
+        ARROW_ASSIGN_OR_RAISE(any, arrow::compute::CallFunction("invert", {any}, &kernels));
+      }
+      result = std::move(any);
     } else {  // kIsNotNull (kFalse never gets here)
       ARROW_ASSIGN_OR_RAISE(result, arrow::compute::CallFunction("is_valid", {column}, &kernels));
     }

@@ -44,6 +44,15 @@ std::string PredicateText(const Predicate& p) {
       return std::format("{} LIKE {}", column, ToString(p.constant));
     case Predicate::Kind::kNotLike:
       return std::format("{} NOT LIKE {}", column, ToString(p.constant));
+    case Predicate::Kind::kIn:
+    case Predicate::Kind::kNotIn: {
+      std::string values;
+      for (const Constant& value : p.values) {
+        values += (values.empty() ? "" : ", ") + ToString(value);
+      }
+      return std::format("{} {}IN ({})", column, p.kind == Predicate::Kind::kNotIn ? "NOT " : "",
+                         values);
+    }
     case Predicate::Kind::kIsNotNull:
       return column + " IS NOT NULL";
     case Predicate::Kind::kFalse:

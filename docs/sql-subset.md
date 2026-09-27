@@ -9,10 +9,9 @@ This page is the contract: a PR that changes SQL behavior updates it in the same
 ## What works today
 
 Every query of the [grammar](#grammar) below runs: global and grouped (`GROUP BY`) aggregates, `COUNT(DISTINCT ...)`
-included, projections (`*` or columns), a `WHERE` conjunction of `column <op> literal` comparisons and
-`column [NOT] LIKE 'pattern'`, `ORDER BY`, `LIMIT` and `OFFSET`, over one table of Parquet files. This covers 34 of
-the 43 ClickBench queries (see
-[ClickBench status](#clickbench-status)).
+included, projections (`*` or columns), a `WHERE` conjunction of `column <op> literal` comparisons,
+`column [NOT] LIKE 'pattern'` and `column [NOT] IN (literal, ...)`, `ORDER BY`, `LIMIT` and `OFFSET`, over one table
+of Parquet files. This covers 35 of the 43 ClickBench queries (see [ClickBench status](#clickbench-status)).
 
 ```sql
 SELECT COUNT(*), SUM(ResolutionWidth) AS width, AVG(UserID), MAX(EventDate) FROM hits WHERE IsMobile = 1
@@ -63,7 +62,8 @@ table_ref   = identifier | string_literal ;
 column_ref  = identifier ;
 predicate   = comparison , { "AND" , comparison } ;
 comparison  = column_ref , cmp_op , literal | literal , cmp_op , column_ref
-            | column_ref , [ "NOT" ] , "LIKE" , string_literal ;
+            | column_ref , [ "NOT" ] , "LIKE" , string_literal
+            | column_ref , [ "NOT" ] , "IN" , "(" , literal , { "," , literal } , ")" ;
 cmp_op      = "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" ;
 literal     = [ "-" ] , integer | [ "-" ] , decimal | string_literal | "DATE" , string_literal ;
 ```
@@ -79,9 +79,9 @@ so are `SUM`, `AVG`, `MIN` and `MAX` with `DISTINCT`.
 
 Outside the grammar, the parser recognizes common SQL and rejects it with exit code 4 and a source span, among others:
 `SELECT DISTINCT`, `HAVING`, joins, `ILIKE`, `LIKE ... ESCAPE`, `LIKE` outside `WHERE` or with a column as the
-pattern, `IN`, `CASE`, arithmetic, function calls other than the five aggregates,
-`NULL` literals, `IS [NOT] NULL`, `OR` and `NOT`. Malformed SQL inside the subset, such as `SELECT COUNT(*) FORM t`, is
-a syntax error with exit code 1.
+pattern, `IN` with a subquery, a column in its list or a literal on its left, `CASE`, arithmetic, function calls other
+than the five aggregates, `NULL` literals, `IS [NOT] NULL`, `OR` and `NOT`. Malformed SQL inside the subset, such as
+`SELECT COUNT(*) FORM t`, is a syntax error with exit code 1.
 
 ## Binding
 
@@ -206,6 +206,14 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
 - WHERE: the comparisons are evaluated with Arrow's comparison kernels and combined with Kleene AND; a row passes
   only when every comparison is true, so a comparison that is NULL rejects it. VARCHAR compares byte-wise and DATE
   chronologically. A predicate folded to never-true reads no data at all.
+- IN: `c IN (v1, v2, ...)` is `c = v1 OR c = v2 OR ...` with Kleene logic, and `c NOT IN (...)` its negation, so a
+  NULL value rejects the row for both. Each value is typed and folded exactly like `c = v` ([Binding](#binding)); a
+  value that no column value can equal (out of the column type's range, or not an integer for an integer column) is
+  dropped, and without values `IN` is `FALSE` and `NOT IN` is `IS NOT NULL`. DuckDB gives the list one type: when a
+  number in it types as DOUBLE (an exponent, or more than 38 digits), every number is read as a double, so an integer
+  column compares with the nearest doubles (divergence D7) and a FLOAT column in DOUBLE (`f IN (0.1, 1e0)` does not
+  match the FLOAT `0.1`, while `f IN (0.1, 2)` does). NaN is not equal to NaN, as for `=`
+  (divergence D10).
 - LIKE: `%` matches any sequence of characters (none included), `_` exactly one character, and every other byte
   itself; the match is case-sensitive and there is no escape character (`\` is a literal byte), as in DuckDB. A
   character is a UTF-8 sequence; in bytes that are not UTF-8 (which DuckDB refuses to read as VARCHAR) each byte is
@@ -301,10 +309,10 @@ compare against DuckDB, so an unregistered difference is a bug.
 | D4 | Literal types | a number or a `DATE` literal compared with a VARCHAR column is a bind error | casts the column's values at run time (a conversion error unless every value converts) | as D3; the generator writes strings for VARCHAR columns |
 | D5 | Date literals | a date must be written exactly `YYYY-MM-DD` | also accepts `2013-7-1`, surrounding spaces and a time of day | as D3; the generator writes `YYYY-MM-DD` |
 | D6 | AVG of DATE | `AVG` of a DATE column is a bind error | returns a TIMESTAMP | as D3; the generator averages numeric columns only |
-| D7 | DOUBLE literals and BIGINT | a number that DuckDB types as DOUBLE (an exponent, or more than 38 digits) is rounded to the nearest double like in DuckDB, then compared exactly with the integer column | converts BIGINT (and HUGEINT) values to DOUBLE for the comparison, so values beyond 2^53 compare rounded: `i64 >= 9223372036854775808e0` holds for `9223372036854775807` | the `.slt` records with such literals avoid BIGINT values beyond 2^53 (`tests/slt/cases/where/folding.slt`); `plan.ApproximateNumbers/FoldThroughBinderTest.*` pins antb1's folding; the generator writes no exponents |
+| D7 | DOUBLE literals and BIGINT | a number that DuckDB types as DOUBLE (an exponent, or more than 38 digits) is rounded to the nearest double like in DuckDB, then compared exactly with the integer column; in an `IN` list with such a number every value is rounded so | converts BIGINT (and HUGEINT) values to DOUBLE for the comparison, so values beyond 2^53 compare rounded: `i64 >= 9223372036854775808e0` holds for `9223372036854775807` | the `.slt` records with such literals avoid BIGINT values beyond 2^53 (`tests/slt/cases/where/folding.slt`); `plan.ApproximateNumbers/FoldThroughBinderTest.*` pins antb1's folding; the generator writes no exponents |
 | D8 | Result names | an aggregate's argument is quoted when it is not a plain identifier or is a reserved word | also quotes non-reserved keywords (`sum("year")`) | the tests compare values and types, not names |
 | D9 | HUGEINT range | HUGEINT is decimal128(38, 0): a `SUM` outside -(10^38 - 1) to 10^38 - 1 is an execution error (exit code 1). An integer SUM over BIGINT or smaller types cannot reach it | HUGEINT holds -(2^127 - 1) to 2^127 - 1 | no fixture has a HUGEINT column; `exec.AggregateStateTest.HugeIntSumIsCheckedAgainstTheRange` checks the error |
-| D10 | NaN | MIN and MAX ignore NaN like Arrow's `min_max`, whatever the batch and file boundaries: they return NaN only when every selected non-NULL value is NaN (so only MAX over NaN and other values differs from DuckDB). Arrow's comparison kernels follow IEEE 754: NaN compares unequal to everything, so `d > 1` and `d >= 1` are false for NaN | orders NaN above every other value and equal to itself: MIN and MAX return NaN when it is the extreme, `d > 1` is true for NaN | the fixtures contain no NaN (fixturegen builds doubles from integer ratios); `exec.AggregateStateTest.MinMaxOfDoublesIgnoreNaNInEveryBatchSplit` and `engine.SessionTest.MinMaxIgnoreNaNAcrossBatchesAndFiles` pin antb1's MIN and MAX |
+| D10 | NaN | MIN and MAX ignore NaN like Arrow's `min_max`, whatever the batch and file boundaries: they return NaN only when every selected non-NULL value is NaN (so only MAX over NaN and other values differs from DuckDB). Arrow's comparison kernels follow IEEE 754: NaN compares unequal to everything, so `d > 1` and `d >= 1` are false for NaN, and `d IN (...)` never matches it | orders NaN above every other value and equal to itself: MIN and MAX return NaN when it is the extreme, `d > 1` is true for NaN | the fixtures contain no NaN (fixturegen builds doubles from integer ratios); `exec.AggregateStateTest.MinMaxOfDoublesIgnoreNaNInEveryBatchSplit` and `engine.SessionTest.MinMaxIgnoreNaNAcrossBatchesAndFiles` pin antb1's MIN and MAX |
 | D11 | FLOAT columns | read as DOUBLE (widened exactly): results of FLOAT columns are DOUBLE and print with double precision; `WHERE` compares like DuckDB (see Binding) | keeps FLOAT (`MIN`, `MAX` and projections return FLOAT) | the random generator never references a FLOAT column (`ColumnOf` in `tests/slt/runner/query_gen.cc`, `harness.LoadGenTables.SkipsFloatColumns`); `tests/slt/cases/where/float.slt` selects only other columns, and `engine.SessionTest.FloatColumnsCompareLikeDuckDb` pins that results stay DOUBLE |
 | D12 | Long numbers against DOUBLE | a number compared with a DOUBLE column is the correctly rounded nearest double | converts a DECIMAL literal (at most 38 digits) or a HUGEINT literal to DOUBLE in two steps when its digits exceed 2^53, which can be one ulp off (`9007199254740993.5`) | the generator only writes decimals of at most 2^53 in their digits with at most 22 decimals, where both round the same (`ExactDecimalDouble` in `tests/slt/runner/query_gen.cc`) |
 | D13 | Decimals with many digits against integer columns | compared exactly | compares in a DECIMAL whose width is capped at 38 digits: when the column type's digits plus the literal's decimals exceed 38, a column value with too many integer digits fails the query with a conversion error (`i16 = 1.0000000000000000000000000000000000001` over the value -32768) | the `.slt` records and the generator keep literals short enough; `plan.Binder/FoldThroughBinderTest.*` covers the exact folding |
@@ -356,5 +364,6 @@ bind error); today all of them answer Unsupported with exit code 4.
 | Q36 | pass | `GROUP BY` one column under a `WHERE` conjunction, ordered by the alias of the count, top-N |
 | Q37 | pass | `GROUP BY` one column under a `WHERE` conjunction, ordered by the alias of the count, top-N |
 | Q38 | pass | `GROUP BY` one column under a `WHERE` conjunction, ordered by the alias of the count, a window with `OFFSET` |
+| Q40 | pass | a `WHERE` conjunction with `IN` over two values, `GROUP BY` two columns, ordered by the count, a window with `OFFSET` |
 | Q41 | pass | `GROUP BY` two columns under a `WHERE` conjunction, ordered by the alias of the count, a window with `OFFSET` |
-| all others | out of scope | need functions, expressions, HAVING, `GROUP BY` positions, `IN` or other rejected syntax; they fail cleanly with exit code 4 |
+| all others | out of scope | need functions, expressions, HAVING, `GROUP BY` positions or other rejected syntax; they fail cleanly with exit code 4 |
