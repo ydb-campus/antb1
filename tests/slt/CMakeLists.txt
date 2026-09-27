@@ -13,6 +13,7 @@ add_library(
   runner/sha256.cc
   runner/slt_file.cc
   runner/tables.cc
+  runner/unordered_limit.cc
 )
 # SHA-256 hashes every fixture value (harness.fixtures.digest): optimize it in Debug builds too.
 set_source_files_properties(runner/sha256.cc PROPERTIES COMPILE_OPTIONS "-O2")
@@ -41,6 +42,7 @@ antb1_add_gtest(
     tests/canonical_test.cc
     tests/clickbench_test.cc
     tests/comparator_test.cc
+    tests/limit_compare_test.cc
     tests/difftest_test.cc
     tests/query_file_test.cc
     tests/query_gen_test.cc

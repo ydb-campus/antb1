@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -38,6 +39,19 @@ std::string ColumnTypes(const ResultSet& result);
 // rows (a projection with LIMIT, where any n rows are right).
 std::optional<Discrepancy> CompareAnswers(const ResultSet& oracle, const ResultSet& antb1,
                                           SortMode sort, bool row_count_only);
+
+// std::nullopt if antb1's answer is a right answer to a query with LIMIT or OFFSET and no ORDER BY,
+// where any rows of the unlimited answer are right: antb1 has as many rows as the oracle's answer
+// `oracle`, and every one of them is a distinct row of the oracle's `unlimited` answer (a multiset
+// subset; R columns compare with the tolerance of CompareBlocks).
+std::optional<Discrepancy> CompareSubset(const ResultSet& oracle, const ResultSet& unlimited,
+                                         const ResultSet& antb1);
+
+// A LIMIT without ORDER BY, cheaply: equal to the oracle's rows (the common case for projections:
+// both engines scan in file order), or else CompareSubset against `unlimited()`, the oracle's
+// answer without the LIMIT, which is only computed then.
+std::optional<Discrepancy> CompareLimited(const ResultSet& oracle, const ResultSet& antb1,
+                                          const std::function<ExecResult()>& unlimited);
 
 // A failure caused by an engine error: `what` is the one-line summary.
 Discrepancy ErrorDiscrepancy(std::string what, const EngineError& error);

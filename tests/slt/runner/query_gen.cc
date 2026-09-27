@@ -475,10 +475,40 @@ class Builder {
       shape = Shape::kColumns;
     }
 
+    // GROUP BY: 1 or 2 keys of the aggregate shape (no DOUBLE key: both engines group -0.0 with
+    // 0.0, but which of the two a group prints is the first seen, an order the engines need not
+    // share).
+    std::vector<const GenColumn*> keys;
+    if (shape == Shape::kAggregates && allowed_.Has(Feature::kGroupBy)) {
+      std::vector<const GenColumn*> candidates;
+      for (const auto* c : cols) {
+        if (c->kind != ValueKind::kDouble) {
+          candidates.push_back(c);
+        }
+      }
+      if (!candidates.empty() && rng_.Percent(35)) {
+        const std::size_t count = 1 + rng_.Below(2);
+        for (std::size_t i = 0; i < count; ++i) {
+          const GenColumn* key = rng_.Pick(candidates);
+          if (std::ranges::find(keys, key) == keys.end()) {
+            keys.push_back(key);
+          }
+        }
+      }
+    }
+    std::vector<const GenColumn*> selected_keys;
+    if (allowed_.Has(Feature::kColumns)) {
+      for (const auto* key : keys) {
+        if (rng_.Percent(70)) {
+          selected_keys.push_back(key);
+        }
+      }
+    }
+
     tokens_.clear();
     used_ = FeatureSet{};
     Keyword("SELECT");
-    SelectList(shape, t, cols, numeric, aggs);
+    SelectList(shape, t, cols, numeric, aggs, selected_keys);
     Keyword("FROM");
     if (by_path) {
       used_.Add(Feature::kTablePath);
@@ -488,6 +518,16 @@ class Builder {
       tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = t.name});
     }
     Where(cols);
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+      if (i == 0) {
+        used_.Add(Feature::kGroupBy);
+        Keyword("GROUP");
+        Keyword("BY");
+      } else {
+        Symbol(",");
+      }
+      Column(*keys[i]);
+    }
     const bool limited = Limit(shape == Shape::kStar && t.rows > kStarMaxRows);
     if (allowed_.Has(Feature::kSemicolon) && rng_.Percent(15)) {
       used_.Add(Feature::kSemicolon);
@@ -497,13 +537,16 @@ class Builder {
     q.sql = Render();
     q.table = t.name;
     q.features = used_;
-    q.sort = shape == Shape::kAggregates ? SortMode::kNoSort : SortMode::kRowSort;
-    q.row_count_only = shape != Shape::kAggregates && limited;
+    const bool rows = shape != Shape::kAggregates || !keys.empty();
+    q.sort = rows ? SortMode::kRowSort : SortMode::kNoSort;
+    q.unordered_limit = rows && limited;
     return q;
   }
 
+  // `keys`: GROUP BY keys to select too, before or after the aggregates.
   void SelectList(Shape shape, const GenTable& t, const std::vector<const GenColumn*>& cols,
-                  const std::vector<const GenColumn*>& numeric, const std::vector<Agg>& aggs) {
+                  const std::vector<const GenColumn*>& numeric, const std::vector<Agg>& aggs,
+                  const std::vector<const GenColumn*>& keys) {
     if (shape == Shape::kStar) {
       used_.Add(Feature::kStar);
       for (const auto& c : t.columns) {
@@ -517,8 +560,22 @@ class Builder {
       used_.Add(Feature::kMultipleItems);
       items = 2 + rng_.Below(2);
     }
+    std::size_t emitted = 0;
+    const auto emit_keys = [&] {
+      for (const auto* key : keys) {
+        if (emitted++ > 0) {
+          Symbol(",");
+        }
+        used_.Add(Feature::kColumns);
+        Column(*key);
+      }
+    };
+    const bool keys_first = rng_.Percent(60);
+    if (keys_first) {
+      emit_keys();
+    }
     for (std::size_t i = 0; i < items; ++i) {
-      if (i > 0) {
+      if (emitted++ > 0) {
         Symbol(",");
       }
       if (shape == Shape::kColumns) {
@@ -543,6 +600,9 @@ class Builder {
         }
         tokens_.push_back({.kind = Token::Kind::kAlias, .text = std::format("a{}", i + 1)});
       }
+    }
+    if (!keys_first) {
+      emit_keys();
     }
   }
 

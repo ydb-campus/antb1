@@ -290,7 +290,6 @@ TEST_F(SessionTest, UnsupportedAndBindErrorsKeepTheirKinds) {
   for (const char* sql :
        {"SELECT COUNT(*) FROM t HAVING COUNT(*) > 0", "SELECT AdvEngineID FROM t ORDER BY 1",
         // Parsed, rejected by the binder (not answered yet).
-        "SELECT COUNT(*) FROM t GROUP BY AdvEngineID",
         "SELECT AdvEngineID FROM t ORDER BY AdvEngineID",
         "SELECT AdvEngineID FROM t LIMIT 1 OFFSET 1", "SELECT COUNT(DISTINCT AdvEngineID) FROM t",
         "SELECT DISTINCT AdvEngineID FROM t"}) {

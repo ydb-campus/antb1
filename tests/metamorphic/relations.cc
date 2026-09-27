@@ -439,6 +439,37 @@ std::vector<Relation> AllRelations() {
                .check = AllEqual()});
 
   // ---- the executor: scans, filters, projections, aggregates, LIMIT ----
+  // GROUP BY: the same groups and aggregates whatever the batch size and file layout.
+  {
+    const slt::FeatureSet grouped = {kGroupBy,
+                                     kCountStar,
+                                     kSum,
+                                     kMin,
+                                     kMax,
+                                     kColumns,
+                                     kMultipleItems,
+                                     kIntegerColumns,
+                                     kVarcharColumns,
+                                     kWhere,
+                                     kIntegerLiteral,
+                                     kTableName};
+    constexpr std::string_view kGrouped =
+        "SELECT OS, IsMobile, COUNT(*), SUM(ResolutionWidth), MIN(URL), MAX(EventTime) FROM {} "
+        "WHERE OS < 30 GROUP BY OS, IsMobile";
+    Relation sizes{.name = "grouped_batch_size_invariance",
+                   .features = grouped,
+                   .probes = {},
+                   .check = AllEqual()};
+    for (const int64_t batch : kBatchSizes) {
+      sizes.probes.push_back(Q(std::format(kGrouped, "hits_like_split"), batch));
+    }
+    r.push_back(std::move(sizes));
+    r.push_back({.name = "grouped_split_equals_single_file",
+                 .features = grouped,
+                 .probes = {Q(std::format(kGrouped, "hits_like_split")),
+                            Q(std::format(kGrouped, "hits_like"))},
+                 .check = AllEqual()});
+  }
   r.push_back(
       {.name = "row_count_vs_scan_count_column",
        .features = {kCountStar, kCountColumn, kIntegerColumns, kTableName},

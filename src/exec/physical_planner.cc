@@ -9,6 +9,7 @@
 #include <arrow/api.h>
 
 #include "antb1/exec/filter.h"
+#include "antb1/exec/group_aggregate.h"
 #include "antb1/exec/limit.h"
 #include "antb1/exec/project.h"
 #include "antb1/exec/row_count.h"
@@ -47,6 +48,10 @@ struct Builder {
   OperatorResult operator()(const plan::AggregateNode& node) const {
     ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input));
     return std::make_unique<ScalarAggregateOperator>(std::move(input), node.aggregates);
+  }
+  OperatorResult operator()(const plan::GroupAggregateNode& node) const {
+    ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input));
+    return std::make_unique<GroupAggregateOperator>(std::move(input), node.keys, node.aggregates);
   }
   OperatorResult operator()(const plan::LimitNode& node) const {
     ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input));

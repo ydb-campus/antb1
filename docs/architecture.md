@@ -40,8 +40,8 @@ Responsibilities:
   engine view: UTF8 and large strings to binary without UTF-8 validation, FLOAT to DOUBLE, a USMALLINT or INTEGER
   column read as DATE to date32. Every Parquet exception and read failure becomes an `IOError` here.
 - `exec`: pull-based, batch-at-a-time physical operators (`TableScan`, `Filter`, `Project`, `ScalarAggregate`,
-  `Limit`, `RowCount`; see [Execution](#execution)), the exact aggregate states, the physical planner and `Drain`. It
-  scans only through `plan::Table` and never depends on `io`.
+  `GroupAggregate`, `Limit`, `RowCount`; see [Execution](#execution)), the exact aggregate states (scalar and
+  grouped), the physical planner and `Drain`. It scans only through `plan::Table` and never depends on `io`.
 - `engine`: `engine::Session` (owns the catalog, calls `arrow::compute::Initialize()`, runs parse, bind, plan and
   execute) and the canonical value formatter used for every output format.
 - `cli`: the CLI11 command line (`query`, `explain`, `schema`, `bench`, `version`), error reporting and exit codes;
@@ -81,8 +81,8 @@ steps (all single-threaded):
 4. Bind (`plan::Bind`): table names resolve case-insensitively in the catalog (or `FROM 'path'` opens a file),
    columns resolve against the table's schema, types are checked, and every `WHERE` literal is folded exactly into
    its column's type ([Binding](sql-subset.md#binding)). The result is a `plan::LogicalPlan`: a tree of immutable
-   nodes in a `std::variant` (`Scan`, `Filter`, `Project`, `Aggregate`, `Limit`, `RowCount`) plus the output
-   columns.
+   nodes in a `std::variant` (`Scan`, `Filter`, `Project`, `Aggregate`, `GroupAggregate`, `Limit`, `RowCount`) plus
+   the output columns.
 5. Optimize (`plan::Optimize`): projection pruning (a `Scan` reads only the fields used above it) and `COUNT(*)`
    without `WHERE` to `RowCount`.
 6. Physical plan (`exec::BuildPhysicalPlan`): an exhaustive `std::visit` turns each logical node into an operator
@@ -107,6 +107,7 @@ into data. Everything runs on one thread, reading files and row groups in order.
 | `FilterOperator` | `Filter` | evaluates every comparison with Arrow's comparison kernels (`equal`, `less`, ...), combines them with `and_kleene`, turns NULL into false and attaches the result as the selection; skips batches without a selected row; a folded `FALSE` ends the stream without reading |
 | `ProjectOperator` | `Project` | selects columns and materializes the selected rows with Arrow's `Filter` kernel |
 | `ScalarAggregateOperator` | `Aggregate` | feeds every batch and its selection to one `AggregateState` per call, then emits one row |
+| `GroupAggregateOperator` | `GroupAggregate` | materializes the selected rows, maps their keys to group ids with Arrow's `Grouper` (DOUBLE keys normalized first), feeds one `GroupedAggregateState` per call; after the input, emits one row per group: the keys as first seen, then the aggregates |
 | `LimitOperator` | `Limit` | passes on the first `n` rows and never pulls its input again |
 | `RowCountOperator` | `RowCount` | one BIGINT row from the table's exact row count |
 
@@ -114,7 +115,11 @@ The aggregate states (`src/exec/include/antb1/exec/aggregate_state.h`) implement
 `Merge` and `Finalize`. `COUNT(*)` is the true count of the selection; `COUNT(col)`, `SUM` and `AVG` walk the runs
 of rows that are both selected and non-NULL (one bitmap AND); integer `SUM` and `AVG` accumulate in `antb1::Int128`
 and `SUM` returns decimal128(38, 0), so nothing wraps at 64 bits; `MIN` and `MAX` run Arrow's `min_max` on the
-filtered values of each batch and keep the best. Semantics: [sql-subset.md](sql-subset.md#semantics).
+filtered values of each batch and keep the best. The grouped states
+(`src/exec/include/antb1/exec/grouped_aggregate_state.h`) keep the same accumulators per group, fed rows with a group
+id each; their `Merge` folds another state's groups through a group map, so partial results of separate parts of the
+input can be combined ([ADR 0010](adr/0010-grouped-aggregation.md)). Semantics:
+[sql-subset.md](sql-subset.md#semantics).
 
 ## Where to add things
 

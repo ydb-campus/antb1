@@ -34,6 +34,7 @@ struct WithInput {
   LogicalNodePtr operator()(const FilterNode& node) const { return Replace(node); }
   LogicalNodePtr operator()(const ProjectNode& node) const { return Replace(node); }
   LogicalNodePtr operator()(const AggregateNode& node) const { return Replace(node); }
+  LogicalNodePtr operator()(const GroupAggregateNode& node) const { return Replace(node); }
   LogicalNodePtr operator()(const LimitNode& node) const { return Replace(node); }
   LogicalNodePtr operator()(const RowCountNode& node) const { return Make(node); }
 };
@@ -45,6 +46,9 @@ struct OutputWidthOf {
   std::size_t operator()(const FilterNode& node) const { return OutputWidth(*node.input); }
   std::size_t operator()(const ProjectNode& node) const { return node.columns.size(); }
   std::size_t operator()(const AggregateNode& node) const { return node.aggregates.size(); }
+  std::size_t operator()(const GroupAggregateNode& node) const {
+    return node.keys.size() + node.aggregates.size();
+  }
   std::size_t operator()(const LimitNode& node) const { return OutputWidth(*node.input); }
   std::size_t operator()(const RowCountNode& /*node*/) const { return 1; }
 };
@@ -104,7 +108,7 @@ Pruned Prune(const LogicalNodePtr& node, std::vector<bool> needed);
 
 // Rewrites a node so that its output keeps at least the positions marked in `needed` (one flag per
 // current output column). Only a Scan drops columns; Filter and Limit pass the request through,
-// Project and Aggregate ask their input for exactly what they reference.
+// Project, Aggregate and GroupAggregate ask their input for exactly what they reference.
 struct Pruner {
   const LogicalNodePtr& node;
   std::vector<bool>& needed;
@@ -169,6 +173,31 @@ struct Pruner {
       }
     }
     return Pruned{.node = Make(std::move(out)), .remap = Identity(aggregate.aggregates.size())};
+  }
+
+  Pruned operator()(const GroupAggregateNode& group) const {
+    std::vector<bool> below(OutputWidth(*group.input), false);
+    for (const BoundColumn& key : group.keys) {
+      Need(below, key);
+    }
+    for (const AggregateCall& call : group.aggregates) {
+      if (call.arg.has_value()) {
+        Need(below, *call.arg);
+      }
+    }
+    const Pruned in = Prune(group.input, std::move(below));
+    GroupAggregateNode out = group;
+    out.input = in.node;
+    for (BoundColumn& key : out.keys) {
+      Renumber(key, in.remap);
+    }
+    for (AggregateCall& call : out.aggregates) {
+      if (call.arg.has_value()) {
+        Renumber(*call.arg, in.remap);
+      }
+    }
+    return Pruned{.node = Make(std::move(out)),
+                  .remap = Identity(group.keys.size() + group.aggregates.size())};
   }
 
   Pruned operator()(const LimitNode& limit) const {

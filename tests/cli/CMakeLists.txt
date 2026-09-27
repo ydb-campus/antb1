@@ -305,6 +305,15 @@ antb1_add_cli_golden(
     "${_t}"
 )
 antb1_add_cli_golden(
+  explain_group_by
+  ARGS
+    explain
+    -c
+    "SELECT COUNT(*) AS n, RegionID FROM t WHERE IsMobile = 1 GROUP BY RegionID, os LIMIT 10"
+    --table
+    "${_t}"
+)
+antb1_add_cli_golden(
   explain_projection
   ARGS explain -c "SELECT URL, \"title\" AS t FROM t WHERE SearchPhrase <> '' LIMIT 10" --table "${_t}"
 )

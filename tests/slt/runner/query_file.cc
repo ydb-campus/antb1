@@ -15,6 +15,7 @@
 #include "engine.h"
 #include "result_diff.h"
 #include "supported_features.h"
+#include "unordered_limit.h"
 
 namespace antb1::slt {
 namespace {
@@ -64,9 +65,10 @@ Answer Failed(Discrepancy d) {
 Answer Check(const Statement& s, FeatureSet supported_set, Engine& antb1, Engine& oracle) {
   const FeatureSet features = s.features.value_or(FeatureSet{});
   const bool supported = supported_set.Contains(features);
-  const bool projection = features.Has(Feature::kColumns) || features.Has(Feature::kStar);
-  const SortMode sort = projection ? SortMode::kRowSort : SortMode::kNoSort;
-  const bool row_count_only = projection && features.Has(Feature::kLimit);
+  // Projections and GROUP BY give rows in no particular order; with LIMIT any of them are right.
+  const bool rows = features.Has(Feature::kColumns) || features.Has(Feature::kStar) ||
+                    features.Has(Feature::kGroupBy);
+  const SortMode sort = rows ? SortMode::kRowSort : SortMode::kNoSort;
   const auto o = oracle.Execute(s.sql);
   if (!o.has_value()) {
     return Failed(ErrorDiscrepancy("DuckDB rejects the query (the file must be valid DuckDB SQL)",
@@ -99,7 +101,11 @@ Answer Check(const Statement& s, FeatureSet supported_set, Engine& antb1, Engine
                     e.kind),
         e));
   }
-  if (auto d = CompareAnswers(*o, *a, sort, row_count_only)) {
+  if (const auto unlimited_sql = UnlimitedSql(s.sql); unlimited_sql.has_value() && rows) {
+    if (auto d = CompareLimited(*o, *a, [&] { return oracle.Execute(*unlimited_sql); })) {
+      return Failed(*std::move(d));
+    }
+  } else if (auto d = CompareAnswers(*o, *a, sort, /*row_count_only=*/false)) {
     return Failed(*std::move(d));
   }
   if (!supported) {

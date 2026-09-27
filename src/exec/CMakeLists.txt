@@ -8,6 +8,8 @@ antb1_add_module(
     filter.cc
     project.cc
     scalar_aggregate.cc
+    grouped_aggregate_state.cc
+    group_aggregate.cc
     limit.cc
     row_count.cc
     physical_planner.cc
@@ -19,7 +21,12 @@ antb1_add_module(
 if(ANTB1_BUILD_TESTS)
   antb1_add_module_tests(
     exec
-    SOURCES tests/aggregate_state_test.cc tests/operators_test.cc tests/row_count_test.cc tests/physical_planner_test.cc
+    SOURCES
+      tests/aggregate_state_test.cc
+      tests/operators_test.cc
+      tests/row_count_test.cc
+      tests/physical_planner_test.cc
+      tests/grouped_aggregate_test.cc
     LIBS ArrowCompute::arrow_compute_shared
   )
 endif()
