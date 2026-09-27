@@ -30,7 +30,8 @@ repository has no tests/slt directory yet, cover the behavior with unit tests in
 
 1. Pick the area file for the feature (one file per feature area, several small records rather than one big one).
 2. Write records in standard sqllogictest form: `statement ok` or `statement error <regex>`, and
-   `query <types> <sort mode>` followed by the SQL. Use `rowsort` for multi-row results (there is no ORDER BY yet).
+   `query <types> <sort mode>` followed by the SQL. Use `nosort` with an `ORDER BY` whose keys end with a unique
+   column (rows with equal keys may come in any order), otherwise `rowsort` for multi-row results.
 3. Leave the expected block empty and run the completion task (it runs the SQL on DuckDB and writes the results
    below `----`); records that only antb1 runs are flagged for review instead of completed.
 4. Review the generated results: do they match docs/sql-subset.md? A surprising value is a bug in the test or a
