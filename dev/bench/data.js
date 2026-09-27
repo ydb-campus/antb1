@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790468293321,
+  "lastUpdate": 1790497074175,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -360,6 +360,66 @@ window.BENCHMARK_DATA = {
             "value": 2121184.542682936,
             "unit": "ns/iter",
             "extra": "iterations: 328\ncpu: 2120988.9908536593 ns\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "db5a1c6225a444ba44e9592b49236b1ba48efbec",
+          "message": "feat(plan,exec): group by with hash aggregation (#20)\n\n## Summary\n\nPR 2 of the approved GROUP BY / ORDER BY / COUNT(DISTINCT) plan: **GROUP\nBY on plain columns**, checked against DuckDB. ORDER BY, OFFSET and\nCOUNT(DISTINCT) stay \"not answered yet\" (exit 4) until PRs 3 and 4.\n\n- **Binder:**\n- GROUP BY names are table columns, or else the alias of a plain select\ncolumn. When two items share the alias, the last one wins, as in DuckDB.\n  - Duplicate keys are one key, and keys need not be selected.\n- Every plain select column (and every column of `SELECT *`) must be a\nkey; otherwise it's a bind error at that column.\n- Plan: `Scan ← [Filter] ← GroupAggregate(keys, aggregates) ← Project ←\n[Limit]`. The new `GroupAggregateNode` has its own optimizer pruning and\nEXPLAIN line, and the COUNT(*)→RowCount rewrite can never match it.\n- **Executor:**\n- `GroupAggregateOperator` materializes the selected rows and maps their\nkeys to group ids with Arrow's `compute::Grouper` (in\n`libarrow_compute`, no Acero, no new dependency).\n- NULL is a key value. DOUBLE keys are normalized first, so `-0.0`\ngroups with `0.0` and all NaNs group together, as in DuckDB. Each\ngroup's key is output as first seen.\n  - Empty input gives no rows.\n- **`GroupedAggregateState`:** mirrors each scalar state per group:\nexact Int128 SUM/AVG, checked HUGEINT, DOUBLE sums in row order, and\nMIN/MAX with the D10 NaN rule. It is **mergeable through a group map**,\nso a later parallel executor can combine per-row-group partial results\n(the \"parallel-ready\" requirement).\n- **Harness:**\n- `group_by` is a supported, generated feature, and the random generator\nadds 1–2 keys to aggregate queries.\n- **A LIMIT without ORDER BY is now checked properly**\n(`CompareLimited`): an exact comparison first, which is cheap and usual\nfor projections; else antb1's rows must be a multiset subset of DuckDB's\nanswer to the same query without the LIMIT (built with antb1's own\nparser, `UnlimitedSql`). This replaces the old count-only check, which\ncouldn't see wrong values. It is used by the random test, the query\nfiles and the ClickBench runner.\n- **ClickBench: Q17 passes** (GROUP BY + LIMIT without ORDER BY). The\nratchet becomes `[0, 1, 2, 3, 6, 17, 19]`.\n- **Docs:**\n- `docs/sql-subset.md`: grammar, Binding rules, GROUP BY semantics, plan\nnodes, exit codes, ClickBench table;\n  - `docs/architecture.md`;\n  - `tests/slt/README.md`;\n  - new **ADR 0010 \"Grouped aggregation\"**.\n\n**Maintainer sign-off needed:**\n- `tests/data/clickbench_status.json` is an \"Ask a human first\" path. It\ngains 17, as the approved plan said PR 2 would.\n- ADR 0010 is written as **Accepted**, as part of the approved plan.\nPlease confirm both, or tell me to mark the ADR Proposed.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n\n## Verification\n\n```text\n$ pixi run check-full\nlint: PASS; 100% tests passed out of 963 (ci, asan, coverage, ci-gcc); tidy clean; coverage: PASS; fuzz-smoke 2/2\n$ ANTB1_DIFF_COUNT=20000 pixi run diff-random\nDIFF: PASS queries=20000 failed=0 (grouped queries included)\n$ pixi run test-data\nCLICKBENCH pass=[0, 1, 2, 3, 6, 17, 19]; 100% tests passed out of 6\n$ ANTB1_HITS_FILES=\"~/.cache/antb1/clickbench/full/*.parquet\" pixi run test-data   # host, all 100 files\n100% tests passed out of 6 (3m37s wall; peak RSS 6.7 GB across the processes, DuckDB included)\n```\n\n- **`exec` unit tests:**\n- every aggregate × every input type, group by group, equals the scalar\nstate over that group's rows (bit-exact);\n  - merging partial states with remapped ids equals the single pass;\n  - NaN-only groups, also through Merge;\n  - HUGEINT overflow;\n- operator tests for selections, NULL keys, empty input, -0/NaN keys,\nevery key type, and batch-size invariance;\n  - malformed plans.\n- **`.slt` (`tests/slt/cases/groupby/`):** 25 grouped queries whose\nexpectations DuckDB wrote (`slt-complete`), run as `slt.*` and\n`oracle.*`. They cover every key type, NULL keys, FLOAT ±0, multi-file\ntables, alias keys, empty results, every aggregate, and the grouping\nerrors.\n- **Metamorphic:** grouped results are invariant to batch size and to\nfile split.\n- **Comparator self-tests:** subset, multiset, count, R tolerance, lazy\nunlimited query, and `UnlimitedSql`.\n- **EXPLAIN golden:** `explain_group_by`.\n- **Performance of the harness change:** `diff.random` takes 11.8s\n(10.1s before). A first version of the subset check took 69s. It now\ncompares exactly first and indexes rows by their exact cells.\n- **Review:** the `reviewer` agent's DuckDB cross-checks all matched\n(-0/NaN, NULL, empty input, `SELECT *`, shadowing aliases). Its findings\nare fixed:\n  - the last-alias rule for a repeated alias;\n  - self-tests for the new comparator.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change\n- [x] Docs updated where behavior, commands or architecture changed\n- [x] No ClickBench-derived data is committed\n- [ ] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer (`tests/data/clickbench_status.json`: +17 per the\napproved plan; ADR 0010 status)\n\n## AI assistance\n\n- [x] AI-assisted. Tools and what they did: Claude Code (Claude Opus\n5.5) implemented PR 2 of the approved plan and ran a reviewer agent on\nthe diff.\n- Accountable human (has read and understands the whole diff): @Hor911\n(please confirm before merging)",
+          "timestamp": "2026-09-27T11:16:17+03:00",
+          "tree_id": "4857f3b926666f11368ec8cc8aa359bf840dec51",
+          "url": "https://github.com/ydb-campus/antb1/commit/db5a1c6225a444ba44e9592b49236b1ba48efbec"
+        },
+        "date": 1790497073516,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 2763.448638809788,
+            "unit": "ns/iter",
+            "extra": "iterations: 252720\ncpu: 2763.407011712567 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 87785.94515206497,
+            "unit": "ns/iter",
+            "extra": "iterations: 7694\ncpu: 87760.32505848714 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 94664.45851942357,
+            "unit": "ns/iter",
+            "extra": "iterations: 7389\ncpu: 94617.95601569898 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 368938.7167721537,
+            "unit": "ns/iter",
+            "extra": "iterations: 1896\ncpu: 368740.9810126582 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 375228.5780748745,
+            "unit": "ns/iter",
+            "extra": "iterations: 1870\ncpu: 375067.05935828877 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2584739.490774887,
+            "unit": "ns/iter",
+            "extra": "iterations: 271\ncpu: 2583604.8044280433 ns\nthreads: 1"
           }
         ]
       }
