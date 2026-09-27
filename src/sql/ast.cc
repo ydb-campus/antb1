@@ -27,6 +27,19 @@ bool Eq(const SelectExpr& a, const SelectExpr& b) {
   if (const auto* agg = std::get_if<AggregateCall>(&a)) {
     return Eq(*agg, std::get<AggregateCall>(b));
   }
+  if (const auto* lit = std::get_if<Literal>(&a)) {
+    return Eq(*lit, std::get<Literal>(b));
+  }
+  return Eq(std::get<ColumnRef>(a), std::get<ColumnRef>(b));
+}
+
+bool Eq(const GroupExpr& a, const GroupExpr& b) {
+  if (a.index() != b.index()) {
+    return false;
+  }
+  if (const auto* lit = std::get_if<Literal>(&a)) {
+    return Eq(*lit, std::get<Literal>(b));
+  }
   return Eq(std::get<ColumnRef>(a), std::get<ColumnRef>(b));
 }
 

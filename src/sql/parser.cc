@@ -532,12 +532,12 @@ class Parser {
       if (!operand) {
         return std::unexpected(std::move(operand.error()));
       }
-      auto* column = std::get_if<ColumnRef>(&*operand);
-      if (column == nullptr) {
-        return Unsupported(SpanOf(*operand), "constants in the select list are not supported");
+      item.span = SpanOf(*operand);
+      if (auto* column = std::get_if<ColumnRef>(&*operand)) {
+        item.expr = std::move(*column);
+      } else {
+        item.expr = std::get<Literal>(std::move(*operand));
       }
-      item.span = column->span;
-      item.expr = std::move(*column);
     }
     if (auto error = UnsupportedOperator(); error.has_value()) {
       return std::unexpected(std::move(*error));
@@ -1034,20 +1034,15 @@ class Parser {
       return Unsupported(Peek().span, "GROUPING SETS are not supported");
     }
     while (true) {
-      const Token& token = Peek();
-      if (token.kind == TokenKind::kInteger) {
-        return Unsupported(token.span,
-                           "GROUP BY positions are not supported (write the column name)");
-      }
       auto operand = ParseOperand(Context::kGroupBy);
       if (!operand) {
         return std::unexpected(std::move(operand.error()));
       }
-      auto* column = std::get_if<ColumnRef>(&*operand);
-      if (column == nullptr) {
-        return Unsupported(SpanOf(*operand), "constants in GROUP BY are not supported");
+      if (auto* column = std::get_if<ColumnRef>(&*operand)) {
+        stmt.group_by.emplace_back(std::move(*column));
+      } else {
+        stmt.group_by.emplace_back(std::get<Literal>(std::move(*operand)));
       }
-      stmt.group_by.push_back(std::move(*column));
       if (auto error = UnsupportedOperator(); error.has_value()) {
         return std::unexpected(std::move(*error));
       }
@@ -1093,11 +1088,6 @@ class Parser {
 
   Expected<OrderItem> ParseOrderItem() {
     const Token& first = Peek();
-    if (first.kind == TokenKind::kInteger) {
-      return Unsupported(first.span,
-                         "ORDER BY positions are not supported (write the column, alias or "
-                         "aggregate)");
-    }
     OrderItem item;
     if (auto agg_kind = AggregateOf(first);
         agg_kind.has_value() && PeekAt(1).kind == TokenKind::kLeftParen) {
@@ -1115,12 +1105,12 @@ class Parser {
       if (!operand) {
         return std::unexpected(std::move(operand.error()));
       }
-      auto* column = std::get_if<ColumnRef>(&*operand);
-      if (column == nullptr) {
-        return Unsupported(SpanOf(*operand), "constants in ORDER BY are not supported");
+      item.span = SpanOf(*operand);
+      if (auto* column = std::get_if<ColumnRef>(&*operand)) {
+        item.expr = std::move(*column);
+      } else {
+        item.expr = std::get<Literal>(std::move(*operand));
       }
-      item.span = column->span;
-      item.expr = std::move(*column);
     }
     if (auto error = UnsupportedOperator(); error.has_value()) {
       return std::unexpected(std::move(*error));

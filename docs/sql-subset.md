@@ -9,9 +9,10 @@ This page is the contract: a PR that changes SQL behavior updates it in the same
 ## What works today
 
 Every query of the [grammar](#grammar) below runs: global and grouped (`GROUP BY`) aggregates, `COUNT(DISTINCT ...)`
-included, projections (`*` or columns), a `WHERE` conjunction of `column <op> literal` comparisons,
-`column [NOT] LIKE 'pattern'` and `column [NOT] IN (literal, ...)`, `ORDER BY`, `LIMIT` and `OFFSET`, over one table
-of Parquet files. This covers 35 of the 43 ClickBench queries (see [ClickBench status](#clickbench-status)).
+included, projections (`*`, columns or constants), a `WHERE` conjunction of `column <op> literal` comparisons,
+`column [NOT] LIKE 'pattern'` and `column [NOT] IN (literal, ...)`, `GROUP BY` and `ORDER BY` (also by position),
+`LIMIT` and `OFFSET`, over one table of Parquet files. This covers 36 of the 43 ClickBench queries (see
+[ClickBench status](#clickbench-status)).
 
 ```sql
 SELECT COUNT(*), SUM(ResolutionWidth) AS width, AVG(UserID), MAX(EventDate) FROM hits WHERE IsMobile = 1
@@ -48,16 +49,17 @@ case-insensitive.
 ```ebnf
 statement   = query , [ ";" ] ;
 query       = "SELECT" , select_list , "FROM" , table_ref , [ "WHERE" , predicate ] ,
-              [ "GROUP" , "BY" , column_ref , { "," , column_ref } ] ,
+              [ "GROUP" , "BY" , group_item , { "," , group_item } ] ,
               [ "ORDER" , "BY" , order_item , { "," , order_item } ] ,
               [ limit_offset ] ;
 limit_offset = "LIMIT" , integer , [ "OFFSET" , integer ] | "OFFSET" , integer , [ "LIMIT" , integer ] ;
 select_list = "*" | select_item , { "," , select_item } ;
-select_item = ( agg_call | column_ref ) , [ [ "AS" ] , identifier ] ;
+select_item = ( agg_call | column_ref | literal ) , [ [ "AS" ] , identifier ] ;
+group_item  = column_ref | literal ;
 agg_call    = "COUNT" , "(" , "*" , ")"
             | "COUNT" , "(" , "DISTINCT" , column_ref , ")"
             | ( "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" ) , "(" , column_ref , ")" ;
-order_item  = ( agg_call | column_ref ) , [ "ASC" | "DESC" ] , [ "NULLS" , ( "FIRST" | "LAST" ) ] ;
+order_item  = ( agg_call | column_ref | literal ) , [ "ASC" | "DESC" ] , [ "NULLS" , ( "FIRST" | "LAST" ) ] ;
 table_ref   = identifier | string_literal ;
 column_ref  = identifier ;
 predicate   = comparison , { "AND" , comparison } ;
@@ -74,8 +76,8 @@ sequence of digits; a `decimal` is a number with a decimal point, an exponent or
 Keywords are not reserved by the lexer. A literal-first comparison is normalized by the parser (`5 < c` becomes
 `c > 5`).
 
-`GROUP BY` and `ORDER BY` positions (`ORDER BY 2`), `ALL`, constants and expressions are rejected by the parser, and
-so are `SUM`, `AVG`, `MIN` and `MAX` with `DISTINCT`.
+`GROUP BY ALL`, `ORDER BY ALL` and expressions are rejected by the parser, and so are `SUM`, `AVG`, `MIN` and `MAX`
+with `DISTINCT`.
 
 Outside the grammar, the parser recognizes common SQL and rejects it with exit code 4 and a source span, among others:
 `SELECT DISTINCT`, `HAVING`, joins, `ILIKE`, `LIKE ... ESCAPE`, `LIKE` outside `WHERE` or with a column as the
@@ -92,19 +94,30 @@ select list, `WHERE`, the `GROUP BY` names, the grouping rule below, `LIMIT`, `O
 - Names: table and column names match ASCII case-insensitively, quoted identifiers included (as in DuckDB). An
   unknown table or column is a bind error, and so is a name that matches two columns differing only in case. A
   column of an unsupported type fails with exit code 4 wherever it is referenced (by `SELECT *` too).
-- Select list: `*` alone, plain columns, or aggregates. Without `GROUP BY`, aggregates (in the select list or in
-  `ORDER BY`) cannot be mixed with plain columns: a bind error at the first plain column (or at `*`).
+- Select list: `*` alone, or plain columns, aggregates and constants. Without `GROUP BY`, aggregates (in the select
+  list or in `ORDER BY`) cannot be mixed with plain columns: a bind error at the first plain column (or at `*`).
+  Constants mix with anything; with an aggregate (also one only in `ORDER BY`) the query has one row.
+- Constants (as DuckDB types and names them): an integer is INTEGER when its magnitude fits (so `-2147483648` is
+  BIGINT), else BIGINT or HUGEINT, and is named by its value (`007` is `7`); a string is VARCHAR named with its
+  quotes (`'it''s'`); `DATE '2020-01-02'` is DATE named `CAST('2020-01-02' AS "DATE")`. A decimal (DuckDB's DECIMAL)
+  and an integer beyond HUGEINT's 38 digits are unsupported (exit code 4).
+- Positions: in `GROUP BY` and `ORDER BY` an integer literal names the select item at that position (1-based; `*`
+  counts every column); one out of range, a negative one too, is a bind error. `GROUP BY` of an aggregate item is a
+  bind error. Any other literal is a constant: in `GROUP BY` it is no key but still makes the query grouped (one group
+  when there are rows, none otherwise), in `ORDER BY` a number or string is a bind error (it would order nothing,
+  as in DuckDB) and a DATE literal orders nothing. A position naming a constant item groups or orders nothing.
 - `GROUP BY`: each name is a table column, or else the alias of a plain column of the select list (as in DuckDB; an
-  alias of an aggregate is a bind error); a key repeated, also in another spelling, is one key, and a key need not be
-  selected. Every plain column of the select list, and every column of `SELECT *`, must be a key: otherwise a bind
-  error at that column (`column 'b' must appear in the GROUP BY clause or be inside an aggregate function`).
+  alias of an aggregate is a bind error, an alias of a constant is no key); a key repeated, also in another spelling,
+  is one key, and a key need not be selected. Every plain column of the select list, and every column of `SELECT *`,
+  must be a key: otherwise a bind error at that column
+  (`column 'b' must appear in the GROUP BY clause or be inside an aggregate function`).
 - Result types: `COUNT(*)`, `COUNT(col)` and `COUNT(DISTINCT col)` are BIGINT; `SUM` of an integer column is
   HUGEINT and of a DOUBLE column DOUBLE; `AVG` is DOUBLE; `MIN` and `MAX` have the type of their column. `SUM` and
   `AVG` of a VARCHAR or DATE column are bind errors.
 - Result names follow DuckDB: a plain column is named as declared in the table (`SELECT regionid` gives
   `RegionID`); an aggregate is named `count_star()`, `count(x)`, `count(DISTINCT x)`, `sum(x)`, `avg(x)`, `min(x)`
   or `max(x)`, with the argument as written in the query, double-quoted when it is not a plain identifier or is a
-  reserved word (`sum("from")`). An alias replaces the name.
+  reserved word (`sum("from")`). Constants: see above. An alias replaces the name.
 - `ORDER BY`: a name is the alias of a select item first (the last item with that alias, as in DuckDB; also when a
   table column has the same name), else a table column; an aggregate call is computed like a select-list aggregate.
   A projection may order by any column of the table, selected or not. A grouped query orders by its keys and
@@ -277,7 +290,7 @@ formatter:
 | 1 | query error: syntax, bind or execution error | `SELECT COUNT(*) FORM t`; an unknown table or column; `SUM` of a VARCHAR column; a `SUM` outside HUGEINT's range |
 | 2 | usage error | unknown option; neither or both of `-c` and `-f`; a malformed `--table` or `--column-type`; a column that `--column-type` cannot read as DATE; a table name registered twice |
 | 3 | I/O error | a missing or unreadable file; not a Parquet file; schemas that differ; a glob that matches nothing |
-| 4 | unsupported: valid-looking SQL outside the supported subset | `HAVING`; `OR`; a function call; `ORDER BY 2`; `SUM(DISTINCT ...)`; a column of an unsupported type |
+| 4 | unsupported: valid-looking SQL outside the supported subset | `HAVING`; `OR`; a function call; `SELECT 2.5`; `SUM(DISTINCT ...)`; a column of an unsupported type |
 | 70 | internal error: anything else, which is a bug | an uncaught exception; an Arrow `NotImplemented` or type error without SQL context |
 
 Exit code 4 is used only for errors that the parser, the binder or the physical planner marks as unsupported
@@ -361,9 +374,10 @@ bind error); today all of them answer Unsupported with exit code 4.
 | Q31 | pass | `GROUP BY` two columns under `WHERE` with `COUNT(*)`, `SUM` and `AVG`, ordered by the count, top-N |
 | Q32 | pass | `GROUP BY` two columns with `COUNT(*)`, `SUM` and `AVG`, no `WHERE`, ordered by the count, top-N: many groups tie at the cut |
 | Q33 | pass | `GROUP BY` one column, ordered by the count descending, top-N |
+| Q34 | pass | a constant, a column and `COUNT(*)`, `GROUP BY` the constant's position and the column, ordered by the count, top-N |
 | Q36 | pass | `GROUP BY` one column under a `WHERE` conjunction, ordered by the alias of the count, top-N |
 | Q37 | pass | `GROUP BY` one column under a `WHERE` conjunction, ordered by the alias of the count, top-N |
 | Q38 | pass | `GROUP BY` one column under a `WHERE` conjunction, ordered by the alias of the count, a window with `OFFSET` |
 | Q40 | pass | a `WHERE` conjunction with `IN` over two values, `GROUP BY` two columns, ordered by the count, a window with `OFFSET` |
 | Q41 | pass | `GROUP BY` two columns under a `WHERE` conjunction, ordered by the alias of the count, a window with `OFFSET` |
-| all others | out of scope | need functions, expressions, HAVING, `GROUP BY` positions or other rejected syntax; they fail cleanly with exit code 4 |
+| all others | out of scope | need functions, expressions, HAVING or other rejected syntax; they fail cleanly with exit code 4 |

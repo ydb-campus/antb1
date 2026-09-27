@@ -126,10 +126,13 @@ struct FilterNode {
   SourceSpan span;  // the WHERE conjunction
 };
 
-// Output: the listed input columns, in this order.
+// Output: the listed input columns, in this order, and constants. When `constants` is not empty it
+// has one entry per output column, and a set entry replaces columns[i] (whose index is then -1):
+// that output column holds the constant in every row.
 struct ProjectNode {
   LogicalNodePtr input;
   std::vector<BoundColumn> columns;
+  std::vector<std::optional<Constant>> constants;
   SourceSpan span;  // the select list
 };
 
@@ -142,7 +145,8 @@ struct AggregateNode {
 
 // Grouped aggregation (GROUP BY): one row per distinct combination of the keys (NULL is a key
 // value; a DOUBLE key groups -0.0 with 0.0 and every NaN together, keeping the value first seen).
-// Output: the keys, then one column per call; no row over no input rows. Row order is unspecified
+// Output: the keys, then one column per call; no row over no input rows. Without keys (GROUP BY
+// only constants) there is one group when there is any input row. Row order is unspecified
 // (deterministic for a given input in the executor).
 struct GroupAggregateNode {
   LogicalNodePtr input;

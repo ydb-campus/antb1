@@ -1,0 +1,52 @@
+# Constant select items (docs/sql-subset.md): an integer is INTEGER, BIGINT or HUGEINT by its value,
+# a string VARCHAR and a DATE literal DATE; the same value in every row.
+
+query IITTI rowsort
+SELECT 1, -5, 'it''s', DATE '2020-01-02', id FROM edge WHERE id < 3
+----
+1	-5	it's	2020-01-02	0
+1	-5	it's	2020-01-02	1
+1	-5	it's	2020-01-02	2
+
+query IIIIII nosort
+SELECT 3000000000, -2147483648, -99999999999999999999999999999999999999, 007, -2147483647, -9223372036854775808 FROM edge WHERE id = 0
+----
+3000000000	-2147483648	-99999999999999999999999999999999999999	7	-2147483647	-9223372036854775808
+
+# Next to aggregates (no GROUP BY needed), and with an ORDER BY aggregate: one row.
+
+query ITI nosort
+SELECT 1, 'x', COUNT(*) FROM edge
+----
+1	x	12
+
+query I nosort
+SELECT 7 FROM edge ORDER BY COUNT(*)
+----
+7
+
+query I nosort
+SELECT 1 FROM empty
+----
+
+query II nosort
+SELECT 1, COUNT(*) FROM empty
+----
+1	0
+
+# In a grouped query a constant needs no GROUP BY.
+
+query ITI rowsort
+SELECT 42, 'k', i16 FROM edge GROUP BY i16
+----
+42	k	-1
+42	k	-100
+42	k	-12345
+42	k	-32768
+42	k	0
+42	k	1
+42	k	100
+42	k	12345
+42	k	32767
+42	k	7
+42	k	NULL

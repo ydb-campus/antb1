@@ -301,6 +301,37 @@ TEST_F(OperatorsTest, ProjectReordersRepeatsAndMaterializes) {
   EXPECT_TRUE(bad.Open(ctx).IsInvalid());
 }
 
+// Constant columns fill every selected row; only the listed columns are materialized, and a
+// projection of constants only keeps the selected row count.
+TEST_F(OperatorsTest, ProjectConstants) {
+  const auto seven = std::make_shared<arrow::Int64Scalar>(7);
+  const auto text = std::make_shared<arrow::BinaryScalar>(arrow::Buffer::FromString("k"));
+  // x: 1, NULL, 3, 4 | 5, NULL (second batch with a selection of 1 of 2 rows).
+  auto source = Source({Ints({1, std::nullopt, 3, 4}, Bools({true, false, true, true})),
+                        Ints({5, std::nullopt}, Bools({false, true}))});
+  ProjectOperator mixed(std::move(source), {-1, 0, -1}, {seven, nullptr, text});
+  ASSERT_EQ(mixed.output_schema()->num_fields(), 3);
+  EXPECT_TRUE(mixed.output_schema()->field(2)->type()->Equals(arrow::binary()));
+  const auto result = Run(mixed);
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(result->num_rows(), 4);
+  EXPECT_EQ(Int64Column(*result, 0), (std::vector<std::optional<int64_t>>{7, 7, 7, 7}));
+  EXPECT_EQ(Int64Column(*result, 1), (std::vector<std::optional<int64_t>>{1, 3, 4, std::nullopt}));
+  EXPECT_EQ(result->column(2)->GetScalar(3).ValueOrDie()->ToString(), "k");
+
+  ProjectOperator only(Source({Ints({1, 2, 3}, Bools({false, true, false})), Ints({4})}), {-1},
+                       {seven});
+  const auto constants = Run(only);
+  ASSERT_NE(constants, nullptr);
+  EXPECT_EQ(Int64Column(*constants), (std::vector<std::optional<int64_t>>{7, 7}));
+
+  ExecContext ctx;
+  ProjectOperator wrong_size(Source({}), {0, 0}, {nullptr});
+  EXPECT_TRUE(wrong_size.Open(ctx).IsInvalid());
+  ProjectOperator missing_constant(Source({}), {-1});
+  EXPECT_TRUE(missing_constant.Open(ctx).IsInvalid());
+}
+
 TEST_F(OperatorsTest, LimitStopsPullingEarly) {
   for (const auto& [limit, rows, pulls] : std::vector<std::tuple<int64_t, int64_t, int>>{
            {0, 0, 0}, {1, 1, 1}, {2, 2, 1}, {3, 3, 2}, {4, 4, 2}, {5, 5, 3}, {9, 5, 4}}) {

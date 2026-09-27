@@ -58,6 +58,10 @@ TEST(UnparseTest, CanonicalForms) {
                     "select a from t where a in ( 1,-2 , 'x' ) and b not in (date '2024-01-02')",
                 .canonical =
                     "SELECT a FROM t WHERE a IN (1, -2, 'x') AND b NOT IN (DATE '2024-01-02')"},
+           Case{
+               .input = "select 1, -2 m, 'x' , date '2024-01-02' from t group by 1, 'k' order by 2",
+               .canonical = "SELECT 1, -2 AS \"m\", 'x', DATE '2024-01-02' FROM t GROUP BY 1, 'k' "
+                            "ORDER BY 2"},
            Case{.input = "select a from t where a like '%x''%' and b not like '_'",
                 .canonical = "SELECT a FROM t WHERE a LIKE '%x''%' AND b NOT LIKE '_'"},
            Case{.input = "SELECT a FROM t WHERE 5 < a AND b != 'it''s' AND DATE '2024-01-31' >= d",

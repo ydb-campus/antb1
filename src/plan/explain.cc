@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <format>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -90,7 +91,14 @@ struct NodeLine {
     return "Filter " + Join(node.predicates, PredicateText, " AND ");
   }
   std::string operator()(const ProjectNode& node) const {
-    return "Project " + Join(node.columns, ColumnName, ", ");
+    std::string line = "Project ";
+    for (std::size_t i = 0; i < node.columns.size(); ++i) {
+      line += i == 0 ? "" : ", ";
+      const std::optional<Constant> constant =
+          node.constants.empty() ? std::nullopt : node.constants[i];
+      line += constant.has_value() ? ToString(*constant) : ColumnName(node.columns[i]);
+    }
+    return line;
   }
   std::string operator()(const AggregateNode& node) const {
     return "Aggregate " + Join(node.aggregates, AggregateText, ", ");

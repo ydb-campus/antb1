@@ -1,6 +1,7 @@
 #include "query_gen.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstdint>
 #include <filesystem>
@@ -111,8 +112,14 @@ TEST(QueryGenerator, QueriesRespectTheSemanticsBothEnginesShare) {
   for (uint64_t i = 0; i < 3000; ++i) {
     const auto q = gen.Generate(i);
     const std::string sql = Lower(q.sql);
+    const bool aggregate = std::ranges::any_of(
+        std::to_array({Feature::kCountStar, Feature::kCountColumn, Feature::kSum, Feature::kAvg,
+                       Feature::kMin, Feature::kMax, Feature::kCountDistinct}),
+        [&](Feature f) { return q.features.Has(f); });
+    // A select list of constants only is a projection too: a row per table row.
     const bool rows = q.features.Has(Feature::kColumns) || q.features.Has(Feature::kStar) ||
-                      q.features.Has(Feature::kGroupBy);
+                      q.features.Has(Feature::kGroupBy) ||
+                      (q.features.Has(Feature::kConstant) && !aggregate);
     const bool ordered = q.features.Has(Feature::kOrderBy);
     EXPECT_EQ(q.sort, rows && !ordered ? SortMode::kRowSort : SortMode::kNoSort) << q.sql;
     EXPECT_EQ(

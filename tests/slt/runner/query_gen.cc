@@ -511,6 +511,10 @@ class Builder {
     tokens_.clear();
     used_ = FeatureSet{};
     order_aliases_.clear();
+    order_positions_.clear();
+    key_positions_.clear();
+    constant_positions_.clear();
+    aggregate_emitted_ = false;
     Keyword("SELECT");
     SelectList(shape, t, cols, numeric, aggs, selected_keys);
     Keyword("FROM");
@@ -522,6 +526,10 @@ class Builder {
       tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = t.name});
     }
     Where(cols);
+    // GROUP BY a constant's position alone still groups: no row over no input rows.
+    const bool constant_group =
+        shape == Shape::kAggregates && keys.empty() && allowed_.Has(Feature::kGroupBy) &&
+        allowed_.Has(Feature::kPosition) && !constant_positions_.empty() && rng_.Percent(30);
     for (std::size_t i = 0; i < keys.size(); ++i) {
       if (i == 0) {
         used_.Add(Feature::kGroupBy);
@@ -530,7 +538,20 @@ class Builder {
       } else {
         Symbol(",");
       }
-      Column(*keys[i]);
+      const auto selected =
+          std::ranges::find_if(key_positions_, [&](const auto& kp) { return kp.first == keys[i]; });
+      if (selected != key_positions_.end() && allowed_.Has(Feature::kPosition) &&
+          rng_.Percent(40)) {
+        Position(selected->second);
+      } else {
+        Column(*keys[i]);
+      }
+    }
+    if (constant_group) {
+      used_.Add(Feature::kGroupBy);
+      Keyword("GROUP");
+      Keyword("BY");
+      Position(rng_.Pick(constant_positions_));
     }
     const bool ordered = OrderBy(shape, cols, numeric, aggs, keys);
     const bool limited = Limit(shape == Shape::kStar && t.rows > kStarMaxRows);
@@ -543,7 +564,9 @@ class Builder {
     q.sql = Render();
     q.table = t.name;
     q.features = used_;
-    const bool rows = shape != Shape::kAggregates || !keys.empty();
+    // A select list of constants only (no aggregate emitted) has a row per table row.
+    const bool rows =
+        shape != Shape::kAggregates || !keys.empty() || constant_group || !aggregate_emitted_;
     q.sort = rows && !ordered ? SortMode::kRowSort : SortMode::kNoSort;
     q.unordered_limit = rows && !ordered && (limited || offset);
     return q;
@@ -574,6 +597,8 @@ class Builder {
         }
         used_.Add(Feature::kColumns);
         Column(*key);
+        key_positions_.emplace_back(key, emitted);
+        order_positions_.push_back(emitted);
       }
     };
     const bool keys_first = rng_.Percent(60);
@@ -585,7 +610,25 @@ class Builder {
         Symbol(",");
       }
       bool orderable = true;
-      if (shape == Shape::kColumns) {
+      if (allowed_.Has(Feature::kConstant) && rng_.Percent(10)) {
+        // A constant item (never a decimal: DuckDB types it DECIMAL, which antb1 lacks).
+        static constexpr auto kConstants = std::to_array<std::string_view>(
+            {"1", "-7", "42", "3000000000", "'k'", "'it''s'", "DATE '2020-01-02'"});
+        used_.Add(Feature::kConstant);
+        const std::string_view constant = rng_.Pick(kConstants);
+        if (constant.starts_with("DATE ")) {
+          Keyword("DATE");
+          tokens_.push_back(
+              {.kind = Token::Kind::kLiteral, .text = std::string(constant.substr(5))});
+        } else if (constant.starts_with('-')) {
+          Symbol("-");
+          tokens_.push_back(
+              {.kind = Token::Kind::kLiteral, .text = std::string(constant.substr(1))});
+        } else {
+          tokens_.push_back({.kind = Token::Kind::kLiteral, .text = std::string(constant)});
+        }
+        constant_positions_.push_back(emitted);
+      } else if (shape == Shape::kColumns) {
         used_.Add(Feature::kColumns);
         Column(*rng_.Pick(cols));
       } else {
@@ -596,6 +639,7 @@ class Builder {
                 : rng_.Pick(agg == Agg::kSum || agg == Agg::kAvg ? numeric : cols);
         orderable = Orderable(agg, arg);
         Aggregate(agg, arg);
+        aggregate_emitted_ = true;
       }
       if (allowed_.Has(Feature::kAlias) && rng_.Percent(15)) {
         used_.Add(Feature::kAlias);
@@ -608,10 +652,19 @@ class Builder {
         }
         tokens_.push_back({.kind = Token::Kind::kAlias, .text = std::move(alias)});
       }
+      if (orderable) {
+        order_positions_.push_back(emitted);
+      }
     }
     if (!keys_first) {
       emit_keys();
     }
+  }
+
+  // A position in the select list (1-based) as a GROUP BY or ORDER BY item.
+  void Position(std::size_t position) {
+    used_.Add(Feature::kPosition);
+    tokens_.push_back({.kind = Token::Kind::kLiteral, .text = std::to_string(position)});
   }
 
   void Aggregate(Agg agg, const GenColumn* arg) {
@@ -671,7 +724,9 @@ class Builder {
         }
       }
     }
-    if (columns.empty() && calls.empty() && order_aliases_.empty()) {
+    const std::vector<std::size_t> positions =
+        allowed_.Has(Feature::kPosition) ? order_positions_ : std::vector<std::size_t>{};
+    if (columns.empty() && calls.empty() && order_aliases_.empty() && positions.empty()) {
       return false;
     }
     used_.Add(Feature::kOrderBy);
@@ -682,15 +737,18 @@ class Builder {
       if (i > 0) {
         Symbol(",");
       }
-      const std::size_t pick = rng_.Below(columns.size() + calls.size() + order_aliases_.size());
+      const std::size_t pick =
+          rng_.Below(columns.size() + calls.size() + order_aliases_.size() + positions.size());
       if (pick < columns.size()) {
         Column(*columns[pick]);
       } else if (pick < columns.size() + calls.size()) {
         const auto& [agg, arg] = calls[pick - columns.size()];
         Aggregate(agg, arg);
-      } else {
+      } else if (pick < columns.size() + calls.size() + order_aliases_.size()) {
         tokens_.push_back({.kind = Token::Kind::kAlias,
                            .text = order_aliases_[pick - columns.size() - calls.size()]});
+      } else {
+        Position(positions[pick - columns.size() - calls.size() - order_aliases_.size()]);
       }
       const std::size_t direction = rng_.Below(10);
       if (direction < 3) {
@@ -1016,7 +1074,11 @@ class Builder {
   FeatureSet allowed_;
   std::vector<Token> tokens_;
   FeatureSet used_;
-  std::vector<std::string> order_aliases_;  // select aliases of items with I or T values
+  std::vector<std::string> order_aliases_;    // select aliases of items with I or T values
+  std::vector<std::size_t> order_positions_;  // positions of items with I or T values (keys too)
+  std::vector<std::pair<const GenColumn*, std::size_t>> key_positions_;  // selected GROUP BY keys
+  std::vector<std::size_t> constant_positions_;  // positions of constant items
+  bool aggregate_emitted_ = false;  // the select list has an aggregate (constants alone: rows)
 };
 
 }  // namespace

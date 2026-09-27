@@ -1,0 +1,85 @@
+# GROUP BY and ORDER BY positions (1-based, in the select list); any other literal is a constant, which
+# groups nothing and orders nothing, but GROUP BY a constant still makes the query grouped.
+
+query II nosort
+SELECT i16, COUNT(*) FROM edge GROUP BY 1 ORDER BY 2 DESC, 1 NULLS FIRST
+----
+NULL	2
+-32768	1
+-12345	1
+-100	1
+-1	1
+0	1
+1	1
+7	1
+100	1
+12345	1
+32767	1
+
+query IIII nosort
+SELECT 1, OS, IsMobile, COUNT(*) AS c FROM hits_like GROUP BY 1, 2, IsMobile ORDER BY c DESC, 2, 3 LIMIT 5
+----
+1	116	0	58
+1	2	1	57
+1	10	1	57
+1	80	1	56
+1	89	1	55
+
+query I nosort
+SELECT id FROM edge ORDER BY 1 DESC LIMIT 3
+----
+11
+10
+9
+
+query IT nosort
+SELECT id, u FROM edge ORDER BY DATE '2020-01-01', 2 NULLS FIRST, 1
+----
+5	NULL
+11	NULL
+0	(empty)
+9	\x28empty)
+1	a
+4	back\\slash
+3	line\nbreak
+2	tab\there
+6	trailing space\x20
+7	x\x7fy
+8	Привет, мир
+10	日本語
+
+query IIIIIRTT nosort
+SELECT * FROM edge ORDER BY 3 DESC LIMIT 2
+----
+1	32767	2147483647	9223372036854775807	65535	0.3333333333333333	a	a
+6	100	100000	1000000000000000	15917	123456789.125	\x20leading space	trailing space\x20
+
+# GROUP BY a constant alone: one group over rows, none over no rows.
+
+query II nosort
+SELECT 1, COUNT(*) FROM edge GROUP BY 1
+----
+1	12
+
+query II nosort
+SELECT 1, COUNT(*) FROM empty GROUP BY 1
+----
+
+query I nosort
+SELECT COUNT(*) FROM edge GROUP BY 'x'
+----
+12
+
+query TI nosort
+SELECT 'k' AS k, MAX(id) FROM edge GROUP BY k
+----
+k	11
+
+# Positions and aliases mixed with names.
+
+query II nosort
+SELECT i16 AS a, COUNT(*) AS n FROM edge GROUP BY a ORDER BY n DESC, 1 LIMIT 3
+----
+NULL	2
+-32768	1
+-12345	1

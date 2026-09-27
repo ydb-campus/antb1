@@ -1,0 +1,1 @@
+SELECT 1, -2 AS m, 'k', DATE '2024-01-02', region, COUNT(*) FROM events GROUP BY 1, 5 ORDER BY 6 DESC, 2

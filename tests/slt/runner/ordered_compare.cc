@@ -1,6 +1,7 @@
 #include "ordered_compare.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <format>
@@ -9,6 +10,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <unordered_map>
 #include <utility>
 #include <variant>
@@ -112,7 +114,18 @@ std::optional<OrderedQuery> MakeOrderedQuery(std::string_view sql) {
   std::vector<sql::SelectItem> extra;
   for (std::size_t i = 0; i < stmt->order_by.size(); ++i) {
     sql::SelectExpr expr = stmt->order_by[i].expr;
-    if (const auto* ref = std::get_if<sql::ColumnRef>(&expr)) {
+    if (const auto* lit = std::get_if<sql::Literal>(&expr);
+        lit != nullptr && lit->kind == sql::Literal::Kind::kInteger && !lit->negative) {
+      // A position in the select list (1-based); under SELECT * the harness cannot name it.
+      std::size_t position = 0;
+      const auto [end, error] =
+          std::from_chars(lit->text.data(), lit->text.data() + lit->text.size(), position);
+      if (stmt->star || error != std::errc{} || end != lit->text.data() + lit->text.size() ||
+          position == 0 || position > stmt->items.size()) {
+        return std::nullopt;
+      }
+      expr = stmt->items[position - 1].expr;
+    } else if (const auto* ref = std::get_if<sql::ColumnRef>(&expr)) {
       // A select alias comes first (the last item with it), as in the binder and DuckDB.
       const std::string wanted = Lower(ref->name);
       for (std::size_t n = stmt->items.size(); n > 0; --n) {
