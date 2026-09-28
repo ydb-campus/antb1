@@ -157,12 +157,16 @@ std::vector<Call> CallsOver(LogicalType type) {
          .result = plan::IsInteger(type) ? LogicalType::kHugeInt : LogicalType::kDouble});
     calls.push_back({.kind = AggKind::kAvg, .input = type, .result = LogicalType::kDouble});
   }
+  if (type == LogicalType::kDate || type == LogicalType::kTimestamp) {
+    calls.push_back({.kind = AggKind::kAvg, .input = type, .result = LogicalType::kTimestamp});
+  }
   return calls;
 }
 
 constexpr auto kTypes = std::to_array<LogicalType>(
     {LogicalType::kSmallInt, LogicalType::kInteger, LogicalType::kBigInt, LogicalType::kUSmallInt,
-     LogicalType::kHugeInt, LogicalType::kDouble, LogicalType::kVarchar, LogicalType::kDate});
+     LogicalType::kHugeInt, LogicalType::kDouble, LogicalType::kVarchar, LogicalType::kDate,
+     LogicalType::kTimestamp});
 
 std::unique_ptr<GroupedAggregateState> MakeGrouped(const Call& call) {
   auto state = MakeGroupedAggregateState(call.kind, call.input, call.result);
