@@ -1,0 +1,1 @@
+SELECT -(a + 1) * 2 // 3 % 4, CASE WHEN a = 0 AND NOT b <> 1 THEN f(a, 'x') ELSE '' END AS c, extract(minute FROM ts), SUM(a + 7) FROM t WHERE (a = 1 OR b IN (1, 2 * c)) AND lower(s) NOT LIKE '%x%' GROUP BY a - 1, c HAVING COUNT(*) > 1 ORDER BY 2, a * -1 DESC

@@ -23,7 +23,9 @@
 #include "antb1/plan/sql_status.h"
 #include "antb1/plan/types.h"
 #include "antb1/sql/ast.h"
+#include "antb1/sql/error.h"
 #include "antb1/sql/parser.h"
+#include "antb1/sql/unparse.h"
 
 // The binding rules are documented in docs/sql-subset.md and
 // docs/adr/0004-types-null-overflow-semantics.md.
@@ -111,8 +113,260 @@ std::string ResultName(const sql::AggregateCall& call) {
   if (call.kind == sql::AggKind::kCountStar || !call.arg.has_value()) {
     return "count_star()";
   }
+  const sql::ColumnRef* column = call.arg_column();
   return AsciiLower(ToString(ToPlan(call.kind))) + "(" + (call.distinct ? "DISTINCT " : "") +
-         ArgumentName(call.arg->name) + ")";
+         (column != nullptr ? ArgumentName(column->name) : sql::ToSql(**call.arg)) + ")";
+}
+
+// ---- expressions the binder does not answer (yet): kUnsupported at their first token ----
+
+struct Rejection {
+  SourceSpan span;
+  std::string message;
+};
+
+// The first construct of a value expression, in source order, that is not a column, a literal
+// or (where allowed) an aggregate of a column.
+std::optional<Rejection> FirstUnsupported(const sql::Expr& expr);
+
+std::optional<Rejection> FirstUnsupportedIn(const std::vector<sql::Expr>& exprs) {
+  for (const sql::Expr& e : exprs) {
+    if (auto r = FirstUnsupported(e)) {
+      return r;
+    }
+  }
+  return std::nullopt;
+}
+
+SourceSpan Prefix(SourceSpan span, std::size_t length) {
+  return SourceSpan{.offset = span.offset, .length = std::min(span.length, length)};
+}
+
+struct FirstUnsupportedOf {
+  std::optional<Rejection> operator()(const sql::ColumnRef& /*column*/) const {
+    return std::nullopt;
+  }
+  std::optional<Rejection> operator()(const sql::Literal& /*lit*/) const { return std::nullopt; }
+  std::optional<Rejection> operator()(const sql::AggregateCall& call) const {
+    if (!call.arg.has_value() || call.arg_column() != nullptr) {
+      return std::nullopt;
+    }
+    const sql::Expr& arg = **call.arg;
+    if (std::holds_alternative<sql::Literal>(arg)) {
+      return Rejection{.span = arg.span(),
+                       .message = std::string("constant aggregate arguments are not supported") +
+                                  (call.kind == sql::AggKind::kCount ? " (use COUNT(*))" : "")};
+    }
+    if (auto r = FirstUnsupported(arg)) {
+      return r;
+    }
+    return Rejection{.span = arg.span(), .message = "this aggregate argument is not supported"};
+  }
+  std::optional<Rejection> operator()(const sql::UnaryExpr& unary) const {
+    return Rejection{.span = unary.op_span,
+                     .message = unary.op == sql::UnaryOp::kNot
+                                    ? "NOT is not supported"
+                                    : "arithmetic operator '-' is not supported"};
+  }
+  std::optional<Rejection> operator()(const sql::BinaryExpr& binary) const {
+    if (auto r = FirstUnsupported(*binary.left)) {
+      return r;
+    }
+    std::string message;
+    switch (binary.op) {
+      case sql::BinaryOp::kAdd:
+      case sql::BinaryOp::kSubtract:
+      case sql::BinaryOp::kMultiply:
+      case sql::BinaryOp::kDivide:
+      case sql::BinaryOp::kIntegerDivide:
+      case sql::BinaryOp::kModulo:
+        message = std::format("arithmetic operator '{}' is not supported", ToString(binary.op));
+        break;
+      case sql::BinaryOp::kAnd:
+        message = "AND is only supported between conditions of WHERE and HAVING";
+        break;
+      case sql::BinaryOp::kOr:
+        message = "OR is not supported";
+        break;
+      default:
+        message = "comparisons are only supported in WHERE and HAVING";
+        break;
+    }
+    return Rejection{.span = binary.op_span, .message = std::move(message)};
+  }
+  std::optional<Rejection> operator()(const sql::LikeExpr& like) const {
+    if (auto r = FirstUnsupported(*like.operand)) {
+      return r;
+    }
+    return Rejection{.span = like.op_span, .message = "LIKE is only supported in WHERE and HAVING"};
+  }
+  std::optional<Rejection> operator()(const sql::InExpr& in) const {
+    if (auto r = FirstUnsupported(*in.operand)) {
+      return r;
+    }
+    return Rejection{.span = in.op_span, .message = "IN is only supported in WHERE and HAVING"};
+  }
+  std::optional<Rejection> operator()(const sql::FunctionCall& call) const {
+    return Rejection{.span = call.name_span,
+                     .message = std::format("function {}() is not supported (only COUNT, SUM, "
+                                            "AVG, MIN, MAX)",
+                                            Clip(call.name))};
+  }
+  std::optional<Rejection> operator()(const sql::CaseExpr& c) const {
+    return Rejection{.span = Prefix(c.span, 4), .message = "CASE is not supported"};
+  }
+  std::optional<Rejection> operator()(const sql::ExtractExpr& e) const {
+    return Rejection{.span = Prefix(e.span, 7), .message = "EXTRACT is not supported"};
+  }
+};
+
+std::optional<Rejection> FirstUnsupported(const sql::Expr& expr) {
+  return std::visit(FirstUnsupportedOf{}, static_cast<const sql::ExprNode&>(expr));
+}
+
+arrow::Status Reject(const Rejection& r) {
+  return UnsupportedError(r.message + std::string(sql::kUnsupportedHint), r.span);
+}
+
+// A value expression (a select, GROUP BY or ORDER BY item, an aggregate argument): kUnsupported
+// unless it is a column, a literal or an aggregate of a column.
+arrow::Status CheckValue(const sql::Expr& expr) {
+  if (auto r = FirstUnsupported(expr)) {
+    return Reject(*r);
+  }
+  return arrow::Status::OK();
+}
+
+// Why a WHERE (or, with `having`, HAVING) condition is not one the binder answers, or std::nullopt
+// when it is (AsComparison / AsHavingComparison accept it, or a conjunction of such).
+std::optional<Rejection> RejectCondition(const sql::Expr& expr, bool having) {
+  const auto is_operand = [having](const sql::Expr& e) {
+    return std::holds_alternative<sql::ColumnRef>(e) ||
+           (having && std::holds_alternative<sql::AggregateCall>(e));
+  };
+  if (having ? sql::AsHavingComparison(expr).has_value() : sql::AsComparison(expr).has_value()) {
+    if (const auto* like = std::get_if<sql::LikeExpr>(&expr)) {
+      return FirstUnsupported(*like->operand);
+    }
+    if (const auto* in = std::get_if<sql::InExpr>(&expr)) {
+      return FirstUnsupported(*in->operand);
+    }
+    if (const auto* binary = std::get_if<sql::BinaryExpr>(&expr)) {
+      if (auto r = FirstUnsupported(*binary->left)) {
+        return r;
+      }
+      return FirstUnsupported(*binary->right);
+    }
+    return std::nullopt;
+  }
+  const std::string_view operand_kind = having ? "a column or an aggregate" : "a column";
+  if (const auto* binary = std::get_if<sql::BinaryExpr>(&expr)) {
+    switch (binary->op) {
+      case sql::BinaryOp::kAnd:
+        if (auto r = RejectCondition(*binary->left, having)) {
+          return r;
+        }
+        return RejectCondition(*binary->right, having);
+      case sql::BinaryOp::kOr:
+        if (auto r = RejectCondition(*binary->left, having)) {
+          return r;
+        }
+        return Rejection{.span = binary->op_span, .message = "OR is not supported"};
+      case sql::BinaryOp::kEq:
+      case sql::BinaryOp::kNe:
+      case sql::BinaryOp::kLt:
+      case sql::BinaryOp::kLe:
+      case sql::BinaryOp::kGt:
+      case sql::BinaryOp::kGe: {
+        if (auto r = FirstUnsupported(*binary->left)) {
+          return r;
+        }
+        if (auto r = FirstUnsupported(*binary->right)) {
+          return r;
+        }
+        const bool left = is_operand(*binary->left);
+        const bool right = is_operand(*binary->right);
+        std::string message = "this comparison is not supported";
+        if (left && right) {
+          message = having ? "HAVING comparisons of two columns or aggregates are not supported"
+                           : "comparisons between two columns are not supported";
+        } else if (!left && !right) {
+          message = "comparisons between two literals are not supported";
+        }
+        return Rejection{.span = binary->right->span(), .message = std::move(message)};
+      }
+      default:
+        break;
+    }
+  }
+  if (const auto* like = std::get_if<sql::LikeExpr>(&expr)) {
+    if (auto r = FirstUnsupported(*like->operand)) {
+      return r;
+    }
+    if (!is_operand(*like->operand)) {
+      return Rejection{.span = like->operand->span(),
+                       .message = std::format("LIKE needs {} on the left", operand_kind)};
+    }
+    if (auto r = FirstUnsupported(*like->pattern)) {
+      return r;
+    }
+    return Rejection{.span = like->pattern->span(),
+                     .message =
+                         "LIKE with a column or an aggregate as the pattern is not "
+                         "supported"};
+  }
+  if (const auto* in = std::get_if<sql::InExpr>(&expr)) {
+    if (auto r = FirstUnsupported(*in->operand)) {
+      return r;
+    }
+    if (!is_operand(*in->operand)) {
+      return Rejection{.span = in->operand->span(),
+                       .message = std::format("IN needs {} on the left", operand_kind)};
+    }
+    if (auto r = FirstUnsupportedIn(in->list)) {
+      return r;
+    }
+    for (const sql::Expr& value : in->list) {
+      if (!std::holds_alternative<sql::Literal>(value)) {
+        return Rejection{.span = value.span(),
+                         .message = "columns and aggregates in an IN list are not supported"};
+      }
+    }
+  }
+  if (std::holds_alternative<sql::ColumnRef>(expr) || std::holds_alternative<sql::Literal>(expr) ||
+      std::holds_alternative<sql::AggregateCall>(expr)) {
+    if (auto r = FirstUnsupported(expr)) {
+      return r;
+    }
+    return Rejection{.span = expr.span(),
+                     .message = having ? "HAVING conditions other than comparisons (aggregate or "
+                                         "column <op> literal) are not supported"
+                                       : "predicates other than comparisons (column <op> literal) "
+                                         "are not supported"};
+  }
+  if (auto r = FirstUnsupported(expr)) {
+    return r;
+  }
+  return Rejection{.span = expr.span(), .message = "this condition is not supported"};
+}
+
+// The conjuncts of a WHERE or HAVING predicate, with parenthesized AND chains flattened.
+void Conjuncts(const sql::Expr& expr, std::vector<const sql::Expr*>& out) {
+  const auto* binary = std::get_if<sql::BinaryExpr>(&expr);
+  if (binary != nullptr && binary->op == sql::BinaryOp::kAnd) {
+    Conjuncts(*binary->left, out);
+    Conjuncts(*binary->right, out);
+    return;
+  }
+  out.push_back(&expr);
+}
+
+std::vector<const sql::Expr*> Conjuncts(const std::vector<sql::Expr>& predicate) {
+  std::vector<const sql::Expr*> out;
+  for (const sql::Expr& expr : predicate) {
+    Conjuncts(expr, out);
+  }
+  return out;
 }
 
 arrow::Result<std::shared_ptr<Table>> ResolveTable(const sql::TableRef& ref,
@@ -213,7 +467,12 @@ arrow::Result<AggregateCall> BindAggregate(const sql::AggregateCall& call, const
   if (call.kind == sql::AggKind::kCountStar || !call.arg.has_value()) {
     return bound;
   }
-  ARROW_ASSIGN_OR_RAISE(BoundColumn arg, columns.Resolve(*call.arg));
+  ARROW_RETURN_NOT_OK(CheckValue(sql::Expr(call)));
+  const sql::ColumnRef* column = call.arg_column();
+  if (column == nullptr) {
+    return UnsupportedError("this aggregate argument is not supported", call.span);
+  }
+  ARROW_ASSIGN_OR_RAISE(BoundColumn arg, columns.Resolve(*column));
   ARROW_ASSIGN_OR_RAISE(bound.type, AggregateType(call, arg));
   bound.kind = call.distinct ? AggKind::kCountDistinct : ToPlan(call.kind);
   bound.arg = std::move(arg);
@@ -871,7 +1130,12 @@ arrow::Result<std::vector<Predicate>> BindHaving(const sql::SelectStatement& stm
     return not_grouped(ref.name, ref.span);
   };
   std::vector<Predicate> predicates;
-  for (const sql::HavingComparison& condition : stmt.having) {
+  for (const sql::Expr* conjunct : Conjuncts(stmt.having)) {
+    const std::optional<sql::HavingComparison> having = sql::AsHavingComparison(*conjunct);
+    if (!having.has_value()) {
+      return UnsupportedError("this condition is not supported", conjunct->span());
+    }
+    const sql::HavingComparison& condition = *having;
     ARROW_ASSIGN_OR_RAISE(const Operand operand, resolve(condition.operand));
     // The comparison binders read the operand's span from a column reference.
     const SourceSpan operand_span =
@@ -890,19 +1154,49 @@ arrow::Result<std::vector<Predicate>> BindHaving(const sql::SelectStatement& stm
   return predicates;
 }
 
+// Expressions the binder does not answer yet are kUnsupported, reported (like the parser's own
+// kUnsupported errors) before any name is resolved, at the first one in query order.
+arrow::Status CheckSupported(const sql::SelectStatement& stmt) {
+  for (const sql::SelectItem& item : stmt.items) {
+    ARROW_RETURN_NOT_OK(CheckValue(item.expr));
+  }
+  for (const sql::Expr& conjunct : stmt.where) {
+    if (auto r = RejectCondition(conjunct, /*having=*/false)) {
+      return Reject(*r);
+    }
+  }
+  for (const sql::Expr& expr : stmt.group_by) {
+    ARROW_RETURN_NOT_OK(CheckValue(expr));
+  }
+  for (const sql::Expr& conjunct : stmt.having) {
+    if (auto r = RejectCondition(conjunct, /*having=*/true)) {
+      return Reject(*r);
+    }
+  }
+  for (const sql::OrderItem& item : stmt.order_by) {
+    ARROW_RETURN_NOT_OK(CheckValue(item.expr));
+  }
+  return arrow::Status::OK();
+}
+
 }  // namespace
 
 arrow::Result<LogicalPlan> Bind(const sql::SelectStatement& stmt, const Catalog& catalog) {
+  ARROW_RETURN_NOT_OK(CheckSupported(stmt));
   ARROW_ASSIGN_OR_RAISE(auto table, ResolveTable(stmt.from, catalog));
   const arrow::Schema& schema = *table->schema();
   const Columns columns(schema);
   ARROW_ASSIGN_OR_RAISE(SelectList select, BindSelectList(stmt, schema, columns));
 
   std::vector<Predicate> predicates;
-  for (const sql::Comparison& cmp : stmt.where) {
-    ARROW_ASSIGN_OR_RAISE(BoundColumn column, columns.Resolve(cmp.column));
+  for (const sql::Expr* conjunct : Conjuncts(stmt.where)) {
+    const std::optional<sql::Comparison> cmp = sql::AsComparison(*conjunct);
+    if (!cmp.has_value()) {
+      return UnsupportedError("this condition is not supported", conjunct->span());
+    }
+    ARROW_ASSIGN_OR_RAISE(BoundColumn column, columns.Resolve(cmp->column));
     ARROW_ASSIGN_OR_RAISE(Predicate predicate,
-                          BindComparison(cmp, column, table->StoredAsFloat(column.index)));
+                          BindComparison(*cmp, column, table->StoredAsFloat(column.index)));
     predicates.push_back(std::move(predicate));
   }
   std::vector<BoundColumn> keys;
@@ -936,13 +1230,13 @@ arrow::Result<LogicalPlan> Bind(const sql::SelectStatement& stmt, const Catalog&
   if (!predicates.empty()) {
     node = Make(FilterNode{.input = std::move(node),
                            .predicates = std::move(predicates),
-                           .span = Cover(stmt.where.front().span, stmt.where.back().span)});
+                           .span = Cover(stmt.where.front().span(), stmt.where.back().span())});
   }
   const auto filter_having = [&] {
     if (!having.empty()) {
       node = Make(FilterNode{.input = std::move(node),
                              .predicates = std::move(having),
-                             .span = Cover(stmt.having.front().span, stmt.having.back().span)});
+                             .span = Cover(stmt.having.front().span(), stmt.having.back().span())});
     }
   };
   const auto sort = [&] {

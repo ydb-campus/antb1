@@ -44,52 +44,68 @@ expand to a sorted file list. All files of a table must have the same schema (di
 
 ## Grammar
 
-The parser accepts this grammar, the binder checks it against the tables and the executor runs it. Keywords are
-case-insensitive.
+The parser accepts this grammar; the binder answers the part of it described below and checks it against the tables,
+and the executor runs it. Keywords are case-insensitive.
 
 ```ebnf
 statement   = query , [ ";" ] ;
-query       = "SELECT" , select_list , "FROM" , table_ref , [ "WHERE" , predicate ] ,
-              [ "GROUP" , "BY" , group_item , { "," , group_item } ] ,
-              [ "HAVING" , having ] ,
+query       = "SELECT" , select_list , "FROM" , table_ref , [ "WHERE" , expr ] ,
+              [ "GROUP" , "BY" , expr , { "," , expr } ] , [ "HAVING" , expr ] ,
               [ "ORDER" , "BY" , order_item , { "," , order_item } ] ,
               [ limit_offset ] ;
 limit_offset = "LIMIT" , integer , [ "OFFSET" , integer ] | "OFFSET" , integer , [ "LIMIT" , integer ] ;
 select_list = "*" | select_item , { "," , select_item } ;
-select_item = ( agg_call | column_ref | literal ) , [ [ "AS" ] , identifier ] ;
-group_item  = column_ref | literal ;
-agg_call    = "COUNT" , "(" , "*" , ")"
-            | "COUNT" , "(" , "DISTINCT" , column_ref , ")"
-            | ( "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" ) , "(" , column_ref , ")" ;
-order_item  = ( agg_call | column_ref | literal ) , [ "ASC" | "DESC" ] , [ "NULLS" , ( "FIRST" | "LAST" ) ] ;
+select_item = expr , [ [ "AS" ] , identifier ] ;
+order_item  = expr , [ "ASC" | "DESC" ] , [ "NULLS" , ( "FIRST" | "LAST" ) ] ;
 table_ref   = identifier | string_literal ;
-column_ref  = identifier ;
-predicate   = comparison , { "AND" , comparison } ;
-comparison  = column_ref , condition | literal , cmp_op , column_ref ;
-having      = having_cmp , { "AND" , having_cmp } ;
-having_cmp  = ( agg_call | column_ref ) , condition | literal , cmp_op , ( agg_call | column_ref ) ;
-condition   = cmp_op , literal
-            | [ "NOT" ] , "LIKE" , string_literal
-            | [ "NOT" ] , "IN" , "(" , literal , { "," , literal } , ")" ;
+expr        = expr , "OR" , expr | expr , "AND" , expr | "NOT" , expr | condition | sum ;
+condition   = sum , cmp_op , sum
+            | sum , [ "NOT" ] , "LIKE" , sum
+            | sum , [ "NOT" ] , "IN" , "(" , expr , { "," , expr } , ")" ;
+sum         = sum , ( "+" | "-" ) , product | product ;
+product     = product , ( "*" | "/" | "//" | "%" ) , unary | unary ;
+unary       = "-" , unary | primary ;
+primary     = identifier | literal | "(" , expr , ")" | agg_call
+            | identifier , "(" , [ expr , { "," , expr } ] , ")"
+            | "CASE" , [ expr ] , "WHEN" , expr , "THEN" , expr , { "WHEN" , expr , "THEN" , expr } ,
+              [ "ELSE" , expr ] , "END"
+            | "EXTRACT" , "(" , identifier , "FROM" , expr , ")" ;
+agg_call    = "COUNT" , "(" , "*" , ")"
+            | "COUNT" , "(" , "DISTINCT" , expr , ")"
+            | ( "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" ) , "(" , expr , ")" ;
 cmp_op      = "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" ;
 literal     = [ "-" ] , integer | [ "-" ] , decimal | string_literal | "DATE" , string_literal ;
 ```
 
+Operators bind from loosest to tightest: `OR`, `AND`, `NOT`, the comparisons with `LIKE` and `IN` (which do not
+chain: `a = b = c` is unsupported), `+` and `-`, `*`, `/`, `//` and `%`, unary `-`; binary operators are
+left-associative, and parentheses group. An expression may be at most 256 levels deep (operators or parentheses; the
+top-level `AND` chain of `WHERE` and `HAVING` does not count), else it is unsupported. Aggregates are allowed in the
+select list, `HAVING` and `ORDER BY`, and cannot be nested.
+
 Lexical rules: an `identifier` is a letter or `_` followed by letters, digits or `_`, or any text in double quotes
 (`""` escapes a quote); a `string_literal` is text in single quotes (`''` escapes a quote); an `integer` is a
 sequence of digits; a `decimal` is a number with a decimal point, an exponent or both (`1.5`, `.5`, `5.`, `1e3`).
-Keywords are not reserved by the lexer. A literal-first comparison is normalized by the parser (`5 < c` becomes
-`c > 5`, `5 < COUNT(*)` becomes `COUNT(*) > 5`).
+Keywords are not reserved by the lexer.
 
-`GROUP BY ALL`, `ORDER BY ALL` and expressions are rejected by the parser, and so are `SUM`, `AVG`, `MIN` and `MAX`
-with `DISTINCT`.
+**What the binder answers today.** Of the expressions above, antb1 answers:
+
+- select items that are columns, constants (literals) or aggregates of a column;
+- `WHERE` and `HAVING`: a conjunction (`AND`) of `operand <op> literal` in either order, `operand [NOT] LIKE 'pattern'`
+  and `operand [NOT] IN (literal, ...)`, where the operand is a column (in `HAVING` also an aggregate of a column);
+- `GROUP BY` columns and literals (positions and constants), and `ORDER BY` columns, aggregates and literals;
+- any of these in parentheses (`(a)`, `SUM((a))`, `WHERE (a = 1 AND b = 2)`), which group without changing
+  anything.
+
+Every other expression (arithmetic, `OR`, `NOT`, `CASE`, `EXTRACT`, function calls other than the five aggregates, a
+comparison outside `WHERE` and `HAVING`, a comparison of two columns or two literals) parses, and is then rejected by
+the binder with exit code 4 at its first token, before any name is resolved. `GROUP BY ALL` and `ORDER BY ALL` are
+rejected by the parser, and so are `SUM`, `AVG`, `MIN` and `MAX` with `DISTINCT`.
 
 Outside the grammar, the parser recognizes common SQL and rejects it with exit code 4 and a source span, among others:
-`SELECT DISTINCT`, joins, `ILIKE`, `LIKE ... ESCAPE`, `LIKE` outside `WHERE` and `HAVING` or with a column or an
-aggregate as the pattern, `IN` with a subquery, a column or an aggregate in its list or a literal on its left, a
-`HAVING` comparison of two columns or aggregates, `CASE`, arithmetic, function calls other than the five aggregates,
-`NULL` literals, `IS [NOT] NULL`, `OR` and `NOT`. Malformed SQL inside the subset, such as
-`SELECT COUNT(*) FORM t`, is a syntax error with exit code 1.
+`SELECT DISTINCT`, joins, subqueries, `ILIKE`, `LIKE ... ESCAPE`, `NULL` literals, `IS [NOT] NULL`, `BETWEEN`, `CAST`
+and `::`, `||`, window functions and unary `+`. Malformed SQL, such as `SELECT COUNT(*) FORM t`, is a syntax error with
+exit code 1.
 
 ## Binding
 

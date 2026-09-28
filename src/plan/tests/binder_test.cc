@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 
 #include "antb1/common/int128.h"
+#include "antb1/plan/explain.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/sql_status.h"
 #include "antb1/sql/parser.h"
@@ -228,6 +229,120 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT i16 FROM t WHERE s = 1 AND nope = 2", kBind, "1", "VARCHAR"},
         ErrorCase{"SELECT COUNT(*) FROM t WHERE i16 = 1 AND nope = 2", kBind, "nope",
                   "does not exist"}));
+
+// Expressions the parser accepts but the binder does not answer yet: kUnsupported at the first
+// offending token, before any name is resolved.
+INSTANTIATE_TEST_SUITE_P(
+    Expressions, BindErrorTest,
+    ::testing::Values(
+        ErrorCase{R"(SELECT "lower"(url) FROM t)", kUnsupported, R"("lower")",
+                  "function lower() is not supported"},
+        ErrorCase{"SELECT a FROM t GROUP BY a + 1", kUnsupported, "+",
+                  "arithmetic operator '+' is not supported"},
+        ErrorCase{"SELECT a FROM t GROUP BY year(d)", kUnsupported, "year",
+                  "function year() is not supported (only COUNT, SUM, AVG, MIN, MAX)"},
+        ErrorCase{"SELECT a FROM t GROUP BY a HAVING COUNT(*) > 1 OR a = 2", kUnsupported, "OR",
+                  "OR is not supported"},
+        ErrorCase{"SELECT a FROM t GROUP BY a HAVING COUNT(*) > SUM(b)", kUnsupported, "SUM(b)",
+                  "HAVING comparisons of two columns or aggregates are not supported"},
+        ErrorCase{"SELECT a FROM t GROUP BY a HAVING 1 < 2", kUnsupported, "2",
+                  "comparisons between two literals are not supported"},
+        ErrorCase{"SELECT a FROM t GROUP BY a HAVING COUNT(*)", kUnsupported, "COUNT(*)",
+                  "HAVING conditions other than comparisons (aggregate or column <op> literal) are "
+                  "not supported"},
+        ErrorCase{"SELECT a FROM t GROUP BY a HAVING COUNT(*) + 1 > 2", kUnsupported, "+",
+                  "arithmetic operator '+' is not supported"},
+        ErrorCase{"SELECT a FROM t GROUP BY a HAVING MIN(s) LIKE MAX(s)", kUnsupported, "MAX(s)",
+                  "LIKE with a column or an aggregate as the pattern is not supported"},
+        ErrorCase{"SELECT a FROM t GROUP BY a HAVING a IN (1, COUNT(*))", kUnsupported, "COUNT(*)",
+                  "columns and aggregates in an IN list are not supported"},
+        ErrorCase{"SELECT a FROM t GROUP BY a HAVING 'x' LIKE 'y'", kUnsupported, "'x'",
+                  "LIKE needs a column or an aggregate on the left"},
+        ErrorCase{"SELECT a FROM t GROUP BY a HAVING 1 IN (1)", kUnsupported, "1",
+                  "IN needs a column or an aggregate on the left"},
+        ErrorCase{"SELECT a FROM t ORDER BY a * 2 DESC", kUnsupported, "*",
+                  "arithmetic operator '*' is not supported"},
+        ErrorCase{"SELECT a FROM t WHERE url LIKE title", kUnsupported, "title",
+                  "LIKE with a column or an aggregate as the pattern is not supported"},
+        ErrorCase{"SELECT a FROM t WHERE 'x' LIKE url", kUnsupported, "'x'",
+                  "LIKE needs a column on the left"},
+        ErrorCase{"SELECT url LIKE '%x%' FROM t", kUnsupported, "LIKE",
+                  "LIKE is only supported in WHERE and HAVING"},
+        ErrorCase{"SELECT a FROM t WHERE region IN (1, b)", kUnsupported, "b",
+                  "columns and aggregates in an IN list are not supported"},
+        ErrorCase{"SELECT a FROM t WHERE 1 IN (a)", kUnsupported, "1",
+                  "IN needs a column on the left"},
+        ErrorCase{"SELECT region IN ('a') FROM t", kUnsupported, "IN",
+                  "IN is only supported in WHERE and HAVING"},
+        ErrorCase{"SELECT a FROM t WHERE region IN (1 + 2)", kUnsupported, "+",
+                  "arithmetic operator '+' is not supported"},
+        ErrorCase{"SELECT CASE WHEN a = 1 THEN 1 END FROM t", kUnsupported, "CASE",
+                  "CASE is not supported"},
+        ErrorCase{"SELECT a FROM t WHERE a = CASE WHEN b THEN 1 END", kUnsupported, "CASE",
+                  "CASE is not supported"},
+        ErrorCase{"SELECT a FROM t WHERE a = 1 OR b = 2", kUnsupported, "OR",
+                  "OR is not supported"},
+        ErrorCase{"SELECT a FROM t WHERE flag or b = 2", kUnsupported, "flag",
+                  "predicates other than comparisons (column <op> literal) are not supported"},
+        ErrorCase{"SELECT a FROM t WHERE a = 1 AND b = 2 OR c = 3", kUnsupported, "OR",
+                  "OR is not supported"},
+        ErrorCase{"SELECT a FROM t WHERE NOT a = 1", kUnsupported, "NOT", "NOT is not supported"},
+        ErrorCase{"SELECT a FROM t WHERE a = 1 AND NOT b = 2", kUnsupported, "NOT",
+                  "NOT is not supported"},
+        ErrorCase{"SELECT a + 1 FROM t", kUnsupported, "+",
+                  "arithmetic operator '+' is not supported"},
+        ErrorCase{"SELECT a - 1 FROM t", kUnsupported, "-",
+                  "arithmetic operator '-' is not supported"},
+        ErrorCase{"SELECT amount * 2 FROM t", kUnsupported, "*",
+                  "arithmetic operator '*' is not supported"},
+        ErrorCase{"SELECT SUM(a) / COUNT(a) FROM t", kUnsupported, "/",
+                  "arithmetic operator '/' is not supported"},
+        ErrorCase{"SELECT a % 2 FROM t", kUnsupported, "%",
+                  "arithmetic operator '%' is not supported"},
+        ErrorCase{"SELECT a FROM t WHERE a + 1 = 2", kUnsupported, "+",
+                  "arithmetic operator '+' is not supported"},
+        ErrorCase{"SELECT a FROM t WHERE a = 1 * 2", kUnsupported, "*",
+                  "arithmetic operator '*' is not supported"},
+        ErrorCase{"SELECT a FROM t WHERE 1 - 1 = a", kUnsupported, "-",
+                  "arithmetic operator '-' is not supported"},
+        ErrorCase{"SELECT SUM(a * 2) FROM t", kUnsupported, "*",
+                  "arithmetic operator '*' is not supported"},
+        ErrorCase{"SELECT a FROM t WHERE a = -b", kUnsupported, "-",
+                  "arithmetic operator '-' is not supported"},
+        ErrorCase{"SELECT a FROM t WHERE a = - -1", kUnsupported, "-",
+                  "arithmetic operator '-' is not supported"},
+        ErrorCase{"SELECT -a FROM t", kUnsupported, "-",
+                  "arithmetic operator '-' is not supported"},
+        ErrorCase{"SELECT lower(url) FROM t", kUnsupported, "lower",
+                  "function lower() is not supported (only COUNT, SUM, AVG, MIN, MAX)"},
+        ErrorCase{"SELECT a FROM t WHERE length(url) > 5", kUnsupported, "length",
+                  "function length() is not supported (only COUNT, SUM, AVG, MIN, MAX)"},
+        ErrorCase{"SELECT a FROM t WHERE d > now()", kUnsupported, "now",
+                  "function now() is not supported (only COUNT, SUM, AVG, MIN, MAX)"},
+        ErrorCase{"SELECT SUM(abs(a)) FROM t", kUnsupported, "abs",
+                  "function abs() is not supported (only COUNT, SUM, AVG, MIN, MAX)"},
+        ErrorCase{"SELECT left(url, 3) FROM t", kUnsupported, "left",
+                  "function left() is not supported (only COUNT, SUM, AVG, MIN, MAX)"},
+        ErrorCase{"SELECT COUNT(1) FROM t", kUnsupported, "1",
+                  "constant aggregate arguments are not supported (use COUNT(*))"},
+        ErrorCase{"SELECT SUM('x') FROM t", kUnsupported, "'x'",
+                  "constant aggregate arguments are not supported"},
+        ErrorCase{"SELECT a = 1 FROM t", kUnsupported, "=",
+                  "comparisons are only supported in WHERE and HAVING"},
+        ErrorCase{"SELECT a AND b FROM t", kUnsupported, "AND",
+                  "AND is only supported between conditions of WHERE and HAVING"},
+        ErrorCase{"SELECT a FROM t WHERE a = b", kUnsupported, "b",
+                  "comparisons between two columns are not supported"},
+        ErrorCase{"SELECT a FROM t WHERE 1 = 1", kUnsupported, "1",
+                  "comparisons between two literals are not supported"},
+        ErrorCase{"SELECT a FROM t WHERE flag", kUnsupported, "flag",
+                  "predicates other than comparisons (column <op> literal) are not supported"},
+        ErrorCase{"SELECT a FROM t WHERE flag AND a = 1", kUnsupported, "flag",
+                  "predicates other than comparisons (column <op> literal) are not supported"},
+        ErrorCase{"SELECT a FROM t WHERE 1 LIMIT 5", kUnsupported, "1",
+                  "predicates other than comparisons (column <op> literal) are not supported"},
+        ErrorCase{"SELECT a FROM t WHERE flag GROUP BY a", kUnsupported, "flag",
+                  "predicates other than comparisons (column <op> literal) are not supported"}));
 
 TEST(BinderTest, TablesMatchCaseInsensitively) {
   const Catalog catalog = MakeCatalog();
@@ -519,6 +634,21 @@ TEST(BinderTest, CountDistinct) {
   auto name = BindSql("SELECT COUNT(DISTINCT \"i32\") FROM t", catalog);
   ASSERT_TRUE(name.ok()) << name.status().ToString();
   EXPECT_EQ(name->output[0].name, "count(DISTINCT i32)");
+}
+
+// Parentheses group without changing anything: a parenthesized column, aggregate argument or
+// condition binds as without them, and a parenthesized AND is flattened into the conjunction.
+TEST(BinderTest, ParenthesesGroupOnly) {
+  const Catalog catalog = MakeCatalog();
+  auto plain = BindSql(
+      "SELECT i16, SUM(i32) FROM t WHERE i16 = 1 AND s = 'x' AND d > 0 GROUP BY i16", catalog);
+  auto grouped = BindSql(
+      "SELECT (i16), SUM((i32)) FROM t WHERE ((i16 = 1) AND (s = 'x')) AND (d > 0) GROUP BY (i16)",
+      catalog);
+  ASSERT_TRUE(plain.ok()) << plain.status().ToString();
+  ASSERT_TRUE(grouped.ok()) << grouped.status().ToString();
+  EXPECT_EQ(Explain(*plain), Explain(*grouped));
+  EXPECT_EQ(std::get<FilterNode>(Nth(*grouped, 2)).predicates.size(), 3U);
 }
 
 // [NOT] IN binds each value like `column = value`: values no column value can equal are dropped,
