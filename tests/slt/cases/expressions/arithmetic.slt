@@ -252,3 +252,47 @@ SELECT id FROM edge WHERE i64 < d
 0
 10
 3
+
+# Constants move in HAVING and in conditions over the aggregation too (DuckDB's optimizer), so the
+# arithmetic over a key or an aggregate is never computed and 32767 + 30000 never overflows.
+query II rowsort
+SELECT i16, COUNT(*) FROM edge GROUP BY i16 HAVING i16 + 30000 > 5
+----
+-1	1
+-100	1
+-12345	1
+0	1
+1	1
+100	1
+12345	1
+32767	1
+7	1
+
+query II rowsort
+SELECT i16, MIN(i32) FROM edge GROUP BY i16 HAVING MIN(i16) + 30000 > 5 OR i16 < 0
+----
+-1	-1
+-100	-100000
+-12345	54321
+-32768	-2147483648
+0	0
+1	1
+100	100000
+12345	NULL
+32767	2147483647
+7	-7
+
+query II rowsort
+SELECT i16, CASE WHEN i16 + 30000 > 5 THEN 1 END FROM edge GROUP BY i16
+----
+-1	1
+-100	1
+-12345	1
+-32768	NULL
+0	1
+1	1
+100	1
+12345	1
+32767	1
+7	1
+NULL	NULL

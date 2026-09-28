@@ -352,9 +352,10 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   the type's minimum divided by -1 overflows. On DOUBLE, `//` divides (NULL for a zero divisor) and `%` is `fmod`
   (NaN for a zero divisor). NULL operands give NULL. An expression is computed only for the rows that `WHERE` keeps.
   Two rewrites of DuckDB's optimizer are reproduced, so that an overflow fails the same queries: without `GROUP BY`,
-  `SUM(x + c)` (a signed integer `x`, an integer constant `c`) is `SUM(x) + c * COUNT(x)` in HUGEINT; and in `WHERE`,
-  `x + c <op> k`, `x - c <op> k`, `c - x <op> k` and `x * c <op> k` (a signed integer `x`, integer constants, `c`
-  dividing `k` for `*`) compare `x` with a moved constant, repeatedly, while `k` and the new constant fit the type.
+  `SUM(x + c)` (a signed integer `x`, an integer constant `c`) is `SUM(x) + c * COUNT(x)` in HUGEINT; and in every
+  comparison (`WHERE`, `HAVING`, `CASE WHEN`; `x` a column, a key, an aggregate or an alias), `x + c <op> k`,
+  `x - c <op> k`, `c - x <op> k` and `x * c <op> k` (a signed integer `x`, integer constants, `c` dividing `k` for
+  `*`) compare `x` with a moved constant, repeatedly, while `k` and the new constant fit the type.
   The arithmetic is then never computed. Divergence D14 lists what still differs.
 - Timestamps: microseconds since 1970-01-01 00:00:00, without a time zone, printed as DuckDB prints them
   (`2013-07-15 14:00:00`, a fraction without trailing zeros, `0001-12-31 (BC) 23:59:59` before year 1).

@@ -1867,8 +1867,12 @@ class Binder {
     Int128 k = 0;
     Outcome outcome = Outcome::kCompare;
   };
+  // `bind` binds the operand in its scope; `aggregates`: an aggregate call is an operand too (the
+  // output scope of HAVING and of conditions over the aggregation).
+  template <class BindFn>
   arrow::Result<std::optional<Moved>> MoveConstants(const sql::Expr& operand, sql::CompareOp op,
-                                                    const sql::Literal& literal);
+                                                    const sql::Literal& literal, const BindFn& bind,
+                                                    bool aggregates);
   arrow::Result<std::optional<Typed>> ResolveHavingName(const sql::ColumnRef& ref);
   arrow::Status BindHaving();
   arrow::Status BindOrderBy();
@@ -2025,16 +2029,20 @@ arrow::Status Binder::BindSelectList() {
   return arrow::Status::OK();
 }
 
-// DuckDB's constant moving in a WHERE comparison `operand <op> k`, k an integer literal: for a
+// DuckDB's constant moving in a comparison `operand <op> k` (WHERE, HAVING, CASE WHEN, in any
+// scope), k an integer literal: for a
 // signed integer operand x + c, c + x or x - c (c an integer constant, literals folded) the
 // comparison becomes x <op> k - c (or k + c), for c - x it becomes x <mirrored op> c - k, and for
 // x * c (c not 0) x <op> k / c when c divides k (the op mirrored for a negative c), where a
 // non-dividing k makes = FALSE and <> IS NOT NULL. It repeats on x, and stops where k or the new
 // constant is outside the operand's type. So the arithmetic is never computed and never
 // overflows, as in DuckDB. std::nullopt: nothing moved.
+template <class BindFn>
 arrow::Result<std::optional<Binder::Moved>> Binder::MoveConstants(const sql::Expr& operand,
                                                                   sql::CompareOp op,
-                                                                  const sql::Literal& literal) {
+                                                                  const sql::Literal& literal,
+                                                                  const BindFn& bind,
+                                                                  bool aggregates) {
   if (literal.kind != sql::Literal::Kind::kInteger || IsApproximateNumber(literal.text)) {
     return std::nullopt;
   }
@@ -2049,7 +2057,7 @@ arrow::Result<std::optional<Binder::Moved>> Binder::MoveConstants(const sql::Exp
   bool moved = false;
   const bool ordered = op != sql::CompareOp::kEq && op != sql::CompareOp::kNe;
   while (const auto* binary = std::get_if<sql::BinaryExpr>(cur.operand)) {
-    ARROW_ASSIGN_OR_RAISE(const Typed whole, BindInput(*cur.operand));
+    ARROW_ASSIGN_OR_RAISE(const Typed whole, bind(*cur.operand));
     const LogicalType type = whole.expr->type;
     if (!IsSignedInteger(type)) {
       break;
@@ -2061,8 +2069,8 @@ arrow::Result<std::optional<Binder::Moved>> Binder::MoveConstants(const sql::Exp
     }
     const auto right = ConstantValue(*binary->right);
     const auto left = ConstantValue(*binary->left);
-    const bool constant_right = right.has_value() && ReadsColumn(*binary->left);
-    const bool constant_left = left.has_value() && ReadsColumn(*binary->right);
+    const bool constant_right = right.has_value() && ReadsColumn(*binary->left, aggregates);
+    const bool constant_left = left.has_value() && ReadsColumn(*binary->right, aggregates);
     if (!constant_right && !constant_left) {
       break;
     }
@@ -2181,8 +2189,9 @@ arrow::Result<Predicate> Binder::BindConditionWith(const sql::Expr& conjunct, bo
     const sql::Expr& operand_expr = right_literal != nullptr ? *binary.left : *binary.right;
     const sql::Literal& literal = right_literal != nullptr ? *right_literal : *left_literal;
     const sql::CompareOp oriented = right_literal != nullptr ? op : Mirror(op);
-    if (input) {
-      ARROW_ASSIGN_OR_RAISE(const auto moved, MoveConstants(operand_expr, oriented, literal));
+    {
+      ARROW_ASSIGN_OR_RAISE(const auto moved,
+                            MoveConstants(operand_expr, oriented, literal, bind, !input));
       if (moved.has_value()) {
         if (moved->outcome != Moved::Outcome::kCompare) {
           ARROW_ASSIGN_OR_RAISE(const Typed operand, bind(*moved->operand));
