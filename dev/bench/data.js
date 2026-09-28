@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790623162851,
+  "lastUpdate": 1790631874656,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -1476,6 +1476,78 @@ window.BENCHMARK_DATA = {
             "value": 14.369278877551011,
             "unit": "ms/iter",
             "extra": "iterations: 49\ncpu: 14.367663877551028 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "cc150c0e5b0e487737672869143fc2ef0e43ebff",
+          "message": "feat(plan,exec): avg of date and timestamp (#38)\n\n## Summary\n\nFollow-up 2 of 3. **Stacked on #37**: review and merge that first; this\nPR's base then moves to `main`.\n\n`AVG` of a DATE or TIMESTAMP is now a TIMESTAMP, as in DuckDB. Before,\nit was a bind error (divergence D6, which is removed).\n- **What is averaged:** the microseconds, summed exactly in 128 bits. A\nDATE counts as its midnight, and its infinities as the TIMESTAMP ones.\n- **Rounding, as DuckDB does it (checked against DuckDB 1.5.5):** `sum /\ncount` truncated, plus one when `2 * remainder > count`. So a positive\naverage rounds to the nearest microsecond with halves down, and a\nnegative one toward zero (0.667 → 1, 0.5 → 0, -0.667 → 0, -1.75 → -1).\n- **Out of range:** a DATE beyond the TIMESTAMP range fails, as DuckDB's\ncast does.\n- **Implementation:** new scalar and grouped states, `TemporalAvgState`\nand `GroupedTemporalAvg`, with a shared internal helper\n`src/exec/temporal_average.h`.\n- **Generator:** it now averages DATE columns and timestamp expressions\nnow and then.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check\nexit 0\n$ pixi run tidy\nexit 0\n$ ANTB1_DIFF_COUNT=5000 pixi run diff-random\nDIFF: PASS seed=1568367802 queries=5000 failed=0 unsupported=0\n```\n\nChecked by hand against DuckDB, grouped and global: pre-1970 and year-1\ndates, NULL groups, averages of `date_trunc`, and ordering by the\naverage.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change:\n`exec.AggregateStateTest.TemporalAverageRoundsLikeDuckDb` (rounding\ntable from DuckDB, merge, NULL, range error, infinity), binder type\ntest, `.slt` cases in `expressions/timestamps.slt` (answered by DuckDB),\nthe generator\n- [x] Docs updated: `docs/sql-subset.md` (result types, AVG semantics,\nD6 removed)\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [ ] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer (none changed)\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code wrote the change\nand the tests, derived DuckDB's rounding rule from probes, and ran the\nverification.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-09-29T00:41:12+03:00",
+          "tree_id": "b4d1cd03566c0192327d44bf033c78628e31a940",
+          "url": "https://github.com/ydb-campus/antb1/commit/cc150c0e5b0e487737672869143fc2ef0e43ebff"
+        },
+        "date": 1790631873445,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 3721.374836674215,
+            "unit": "ns/iter",
+            "extra": "iterations: 188274\ncpu: 3720.588604905616 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 94301.79377765041,
+            "unit": "ns/iter",
+            "extra": "iterations: 7007\ncpu: 94299.06350792061 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 103299.67634360453,
+            "unit": "ns/iter",
+            "extra": "iterations: 6717\ncpu: 103285.43933303558 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 331032.6930740092,
+            "unit": "ns/iter",
+            "extra": "iterations: 2108\ncpu: 331003.996679317 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 408452.7309941467,
+            "unit": "ns/iter",
+            "extra": "iterations: 1710\ncpu: 408395.54210526345 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2499157.3118279553,
+            "unit": "ns/iter",
+            "extra": "iterations: 279\ncpu: 2498880.609318999 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 188.92380850000023,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 188.89464875000007 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 13.132003018518567,
+            "unit": "ms/iter",
+            "extra": "iterations: 54\ncpu: 13.130919981481476 ms\nthreads: 1"
           }
         ]
       }
