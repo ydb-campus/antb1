@@ -510,6 +510,65 @@ TEST_F(ComputeTest, TimestampFunctions) {
   auto out_of_range = Eval(
       Temporal(plan::Function::kDateTrunc, column, "year", LogicalType::kTimestamp), {*lowest});
   EXPECT_TRUE(out_of_range.status().IsExecutionError()) << out_of_range.status().ToString();
+  // Every other EXTRACT field and date_trunc unit, over values checked against DuckDB 1.5.5:
+  // 2013-01-01 14:05:06.789123, 2021-01-03 (ISO week 53 of 2020), 1969-12-31 23:59:59.5,
+  // 0001-01-01 (BC) (year 0) and 0011-01-01 (BC) (year -10).
+  const auto samples = testing::ArrayOf<arrow::TimestampBuilder, int64_t>(
+      arrow::timestamp(arrow::TimeUnit::MICRO),
+      {1'357'049'106'789'123, 1'609'632'000'000'000, -500'000, -62'167'219'200'000'000,
+       -62'482'752'000'000'000});
+  const auto fields = [&](std::string field) {
+    const LogicalType type = field == "epoch" ? LogicalType::kDouble : LogicalType::kBigInt;
+    auto out = Eval(Temporal(plan::Function::kExtract, column, std::move(field), type), {samples});
+    return out.ok() ? (*out)->ToString() : out.status().ToString();
+  };
+  const auto list = [](std::string_view values) { return "[\n  " + std::string(values) + "\n]"; };
+  EXPECT_EQ(fields("quarter"), list("1,\n  1,\n  4,\n  1,\n  1"));
+  EXPECT_EQ(fields("week"), list("1,\n  53,\n  1,\n  52,\n  1"));
+  EXPECT_EQ(fields("isoyear"), list("2013,\n  2020,\n  1970,\n  -1,\n  -10"));
+  EXPECT_EQ(fields("dow"), list("2,\n  0,\n  3,\n  6,\n  1"));
+  EXPECT_EQ(fields("isodow"), list("2,\n  7,\n  3,\n  6,\n  1"));
+  EXPECT_EQ(fields("doy"), list("1,\n  3,\n  365,\n  1,\n  1"));
+  EXPECT_EQ(fields("millisecond"), list("6789,\n  0,\n  59500,\n  0,\n  0"));
+  EXPECT_EQ(fields("microsecond"), list("6789123,\n  0,\n  59500000,\n  0,\n  0"));
+  EXPECT_EQ(fields("decade"), list("201,\n  202,\n  196,\n  0,\n  -1"));
+  EXPECT_EQ(fields("century"), list("21,\n  21,\n  20,\n  -1,\n  -1"));
+  EXPECT_EQ(fields("millennium"), list("3,\n  3,\n  2,\n  -1,\n  -1"));
+  EXPECT_EQ(fields("epoch"),
+            list("1357049106.789123,\n  1609632000,\n  -0.5,\n  -6.21672192e+10,\n  "
+                 "-6.2482752e+10"));
+  const auto floors = [&](std::string unit) {
+    auto out =
+        Eval(Temporal(plan::Function::kDateTrunc, column, std::move(unit), LogicalType::kTimestamp),
+             {samples});
+    std::vector<std::string> text;
+    if (!out.ok()) {
+      return std::vector<std::string>{out.status().ToString()};
+    }
+    const auto& a = static_cast<const arrow::TimestampArray&>(**out);
+    text.reserve(static_cast<std::size_t>(a.length()));
+    for (int64_t i = 0; i < a.length(); ++i) {
+      text.push_back(plan::FormatTimestamp(a.Value(i)));
+    }
+    return text;
+  };
+  using Texts = std::vector<std::string>;
+  EXPECT_EQ(floors("millisecond"),
+            (Texts{"2013-01-01 14:05:06.789", "2021-01-03 00:00:00", "1969-12-31 23:59:59.5",
+                   "0001-01-01 (BC) 00:00:00", "0011-01-01 (BC) 00:00:00"}));
+  EXPECT_EQ(floors("decade"),
+            (Texts{"2010-01-01 00:00:00", "2020-01-01 00:00:00", "1960-01-01 00:00:00",
+                   "0001-01-01 (BC) 00:00:00", "0011-01-01 (BC) 00:00:00"}))
+      << "the year truncated toward zero, as DuckDB does";
+  EXPECT_EQ(floors("century"),
+            (Texts{"2000-01-01 00:00:00", "2000-01-01 00:00:00", "1900-01-01 00:00:00",
+                   "0001-01-01 (BC) 00:00:00", "0001-01-01 (BC) 00:00:00"}));
+  EXPECT_EQ(floors("millennium"),
+            (Texts{"2000-01-01 00:00:00", "2000-01-01 00:00:00", "1000-01-01 00:00:00",
+                   "0001-01-01 (BC) 00:00:00", "0001-01-01 (BC) 00:00:00"}));
+  EXPECT_EQ(floors("isoyear"),
+            (Texts{"2012-12-31 00:00:00", "2019-12-30 00:00:00", "1969-12-29 00:00:00",
+                   "0002-01-04 (BC) 00:00:00", "0011-01-01 (BC) 00:00:00"}));
   // A DATE: the timestamp of its midnight.
   auto days = testing::ArrayOf<arrow::Date32Builder>(arrow::date32(),
                                                      std::vector<std::optional<int32_t>>{-1});

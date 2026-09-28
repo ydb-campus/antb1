@@ -275,12 +275,14 @@ INSTANTIATE_TEST_SUITE_P(
                   "todatetime() takes 1 argument, not 2"},
         ErrorCase{"SELECT date_trunc(s, dt) FROM t", kUnsupported, "s",
                   "the unit of date_trunc() must be a string literal"},
-        ErrorCase{"SELECT date_trunc('decade', dt) FROM t", kUnsupported, "'decade'",
-                  "date_trunc() with the unit 'decade' is not supported"},
+        ErrorCase{"SELECT date_trunc('fortnight', dt) FROM t", kUnsupported, "'fortnight'",
+                  "date_trunc() with the unit 'fortnight' is not supported"},
         ErrorCase{"SELECT date_trunc('day', s) FROM t", kBind, "s",
                   "date_trunc() needs a TIMESTAMP or DATE, but 's' is VARCHAR"},
-        ErrorCase{"SELECT EXTRACT(dow FROM dt) FROM t", kUnsupported, "dow",
-                  "EXTRACT of dow is not supported"},
+        ErrorCase{"SELECT EXTRACT(julian FROM dt) FROM t", kUnsupported, "julian",
+                  "EXTRACT of julian is not supported"},
+        ErrorCase{"SELECT EXTRACT(dec FROM dt) FROM t", kUnsupported, "dec",
+                  "EXTRACT of dec is not supported"},
         ErrorCase{"SELECT EXTRACT(minute FROM i64) FROM t", kBind, "i64",
                   "EXTRACT needs a TIMESTAMP or DATE, but 'i64' is BIGINT"},
         ErrorCase{"SELECT COUNT(*) FROM t WHERE toDateTime(i64) > 5", kBind, "5",
@@ -1153,6 +1155,25 @@ TEST(BinderTest, TimestampFunctions) {
       << literal_plan;
   EXPECT_NE(literal_plan.find("IN (TIMESTAMP '2013-07-15 14:00:00.5')"), std::string::npos)
       << literal_plan;
+  // DuckDB's date part spellings: synonyms of any case; epoch is DOUBLE; EXTRACT's six keywords
+  // are named in lower case, other spellings as written.
+  auto parts = BindSql(
+      "SELECT EXTRACT(MS FROM toDateTime(i64)), EXTRACT(Epoch FROM dt), EXTRACT(YEARS FROM dt), "
+      "EXTRACT(MONTH FROM dt), date_trunc('Weekday', dt), date_trunc('dec', dt), "
+      "EXTRACT(Quarters FROM dt), EXTRACT(Msec FROM dt) FROM t",
+      catalog);
+  ASSERT_TRUE(parts.ok()) << parts.status().ToString();
+  EXPECT_EQ(parts->output[0].name, "main.date_part('MS', todatetime(i64))");
+  EXPECT_EQ(parts->output[0].type, LogicalType::kBigInt);
+  EXPECT_EQ(parts->output[1].type, LogicalType::kDouble);
+  EXPECT_EQ(parts->output[2].name, "main.date_part('year', dt)")
+      << "a keyword spelling is named by its field";
+  EXPECT_EQ(parts->output[3].name, "main.date_part('month', dt)");
+  EXPECT_EQ(parts->output[4].name, "date_trunc('Weekday', dt)");
+  EXPECT_EQ(parts->output[6].name, "main.date_part('quarter', dt)");
+  EXPECT_EQ(parts->output[7].name, "main.date_part('Msec', dt)");
+  const std::string trunc_plan = Explain(*parts);
+  EXPECT_NE(trunc_plan.find("date_trunc('Weekday', dt)"), std::string::npos) << trunc_plan;
   // AVG of a DATE or TIMESTAMP is a TIMESTAMP, as in DuckDB.
   auto averages = BindSql("SELECT AVG(dt), AVG(toDateTime(i64)) FROM t GROUP BY i16", catalog);
   ASSERT_TRUE(averages.ok()) << averages.status().ToString();

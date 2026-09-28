@@ -269,8 +269,108 @@ arrow::Status ForEachDayTime(const arrow::Array& values, const Each& each, const
 }
 
 // EXTRACT(field FROM value) as DuckDB computes it: the civil field, NULL for an infinity.
+// ISO 8601 week-numbering: the ISO year (astronomical) and week of a day, weeks from Monday.
+int64_t WeekdayFromMonday(int64_t days) { return FloorMod(days + 3, 7); }  // 1970-01-01: Thursday
+int64_t IsoYearOf(int64_t days) { return CivilOf(days - WeekdayFromMonday(days) + 3).year; }
+int64_t IsoWeekOf(int64_t days) {
+  const int64_t thursday = days - WeekdayFromMonday(days) + 3;
+  return ((thursday - DaysOf(CivilOf(thursday).year, 1, 1)) / 7) + 1;
+}
+int64_t IsoYearStart(int64_t iso_year) {  // the Monday of ISO week 1
+  const int64_t january4 = DaysOf(iso_year, 1, 4);
+  return january4 - WeekdayFromMonday(january4);
+}
+
+// DuckDB's century and millennium: 1 to 100 is the first century; before year 1 the count goes
+// down from -1 (years 0 to -99 are century -1).
+int64_t CenturyLike(int64_t year, int64_t span) {
+  return year > 0 ? ((year - 1) / span) + 1 : (year / span) - 1;
+}
+
+// A BIGINT EXTRACT field of a day and time of day (DuckDB's definitions, checked against DuckDB);
+// std::nullopt for an unknown field.
+std::optional<int64_t> IntegerPart(std::string_view field, const DayTime& t) {
+  const CivilDate date = CivilOf(t.days);
+  constexpr int64_t kMicrosPerMinute = 60'000'000;
+  if (field == "year") {
+    return date.year;
+  }
+  if (field == "month") {
+    return date.month;
+  }
+  if (field == "day") {
+    return date.day;
+  }
+  if (field == "hour") {
+    return t.micros / 3'600'000'000;
+  }
+  if (field == "minute") {
+    return (t.micros / kMicrosPerMinute) % 60;
+  }
+  if (field == "second") {
+    return (t.micros / 1'000'000) % 60;
+  }
+  if (field == "millisecond") {  // the seconds too, as DuckDB counts them
+    return (t.micros % kMicrosPerMinute) / 1'000;
+  }
+  if (field == "microsecond") {
+    return t.micros % kMicrosPerMinute;
+  }
+  if (field == "quarter") {
+    return ((date.month - 1) / 3) + 1;
+  }
+  if (field == "week") {
+    return IsoWeekOf(t.days);
+  }
+  if (field == "isoyear") {
+    return IsoYearOf(t.days);
+  }
+  if (field == "dow") {  // 0 is Sunday
+    return FloorMod(t.days + 4, 7);
+  }
+  if (field == "isodow") {  // 1 is Monday, 7 Sunday
+    return WeekdayFromMonday(t.days) + 1;
+  }
+  if (field == "doy") {
+    return t.days - DaysOf(date.year, 1, 1) + 1;
+  }
+  if (field == "decade") {
+    return date.year / 10;
+  }
+  if (field == "century") {
+    return CenturyLike(date.year, 100);
+  }
+  if (field == "millennium") {
+    return CenturyLike(date.year, 1'000);
+  }
+  return std::nullopt;
+}
+
+// EXTRACT(field FROM value) as DuckDB computes it: the civil field (BIGINT; epoch the seconds since
+// 1970 as DOUBLE), NULL for an infinity.
 arrow::Result<ArrayPtr> Extract(const arrow::Array& values, std::string_view field,
                                 arrow::MemoryPool* pool) {
+  const bool date = values.type_id() == arrow::Type::DATE32;
+  std::shared_ptr<arrow::Array> out;
+  if (field == "epoch") {
+    arrow::DoubleBuilder builder(pool);
+    ARROW_RETURN_NOT_OK(builder.Reserve(values.length()));
+    ARROW_RETURN_NOT_OK(ForEachDayTime(
+        values,
+        [&](const std::optional<DayTime>& t, bool /*positive*/) -> arrow::Status {
+          if (!t.has_value()) {
+            builder.UnsafeAppendNull();
+          } else if (date) {  // DuckDB: the whole seconds of the date, as a double
+            builder.UnsafeAppend(static_cast<double>(t->days * 86'400));
+          } else {  // the microseconds of the timestamp (they fit int64) over 10^6
+            builder.UnsafeAppend(static_cast<double>((t->days * kMicrosPerDay) + t->micros) / 1e6);
+          }
+          return arrow::Status::OK();
+        },
+        [&] { builder.UnsafeAppendNull(); }));
+    ARROW_RETURN_NOT_OK(builder.Finish(&out));
+    return out;
+  }
   arrow::Int64Builder builder(pool);
   ARROW_RETURN_NOT_OK(builder.Reserve(values.length()));
   ARROW_RETURN_NOT_OK(ForEachDayTime(
@@ -280,28 +380,14 @@ arrow::Result<ArrayPtr> Extract(const arrow::Array& values, std::string_view fie
           builder.UnsafeAppendNull();
           return arrow::Status::OK();
         }
-        const CivilDate date = CivilOf(t->days);
-        int64_t part = 0;
-        if (field == "year") {
-          part = date.year;
-        } else if (field == "month") {
-          part = date.month;
-        } else if (field == "day") {
-          part = date.day;
-        } else if (field == "hour") {
-          part = t->micros / 3'600'000'000;
-        } else if (field == "minute") {
-          part = (t->micros / 60'000'000) % 60;
-        } else if (field == "second") {
-          part = (t->micros / 1'000'000) % 60;
-        } else {
+        const std::optional<int64_t> part = IntegerPart(field, *t);
+        if (!part.has_value()) {
           return arrow::Status::Invalid("EXTRACT field ", field);
         }
-        builder.UnsafeAppend(part);
+        builder.UnsafeAppend(*part);
         return arrow::Status::OK();
       },
       [&] { builder.UnsafeAppendNull(); }));
-  std::shared_ptr<arrow::Array> out;
   ARROW_RETURN_NOT_OK(builder.Finish(&out));
   return out;
 }
@@ -322,15 +408,33 @@ arrow::Result<ArrayPtr> DateTrunc(const arrow::Array& values, std::string_view u
         int64_t days = t->days;
         int64_t micros = t->micros;
         const CivilDate date = CivilOf(days);
-        if (unit == "second" || unit == "minute" || unit == "hour") {
-          const int64_t step = unit == "second"   ? 1'000'000
-                               : unit == "minute" ? 60'000'000
-                                                  : 3'600'000'000;
+        if (unit == "microsecond" || unit == "millisecond" || unit == "second" ||
+            unit == "minute" || unit == "hour") {
+          int64_t step = 3'600'000'000;
+          if (unit == "microsecond") {
+            step = 1;
+          } else if (unit == "millisecond") {
+            step = 1'000;
+          } else if (unit == "second") {
+            step = 1'000'000;
+          } else if (unit == "minute") {
+            step = 60'000'000;
+          }
           micros -= micros % step;
         } else {
           micros = 0;
+          // DuckDB truncates the (astronomical) year toward zero for decades and longer.
+          const auto years = [&](int64_t span) { return DaysOf((date.year / span) * span, 1, 1); };
           if (unit == "week") {
-            days -= FloorMod(days + 3, 7);  // 1970-01-01 is a Thursday
+            days -= WeekdayFromMonday(days);
+          } else if (unit == "isoyear") {
+            days = IsoYearStart(IsoYearOf(days));
+          } else if (unit == "decade") {
+            days = years(10);
+          } else if (unit == "century") {
+            days = years(100);
+          } else if (unit == "millennium") {
+            days = years(1'000);
           } else if (unit == "month") {
             days = DaysOf(date.year, date.month, 1);
           } else if (unit == "quarter") {
