@@ -63,8 +63,10 @@ Proposed
   - `Limit` above a projection, or top-N `keep`, stops scheduling new parts once the window is decided, as the serial
     scan stops today.
 - **Threads:**
-  - `SessionOptions::threads` sets the size of a `ThreadPool` the `Session` owns. The default is the machine's hardware
-    threads; 1 means the serial path.
+  - `SessionOptions::threads` sets the size of a `ThreadPool` the `Session` owns; 1 means the serial path.
+  - The default is the machine's hardware threads (`std::thread::hardware_concurrency()`), as in DuckDB, whose
+    `threads` setting defaults to all hardware threads. The maintainer chose this on 2026-09-29. The hermetic test
+    presets pin 1, except the `parallel` label, which pins 4.
   - The CLI gets `--threads` for `query`, `explain` and `bench`, and `antb1 bench` records the count in its JSON.
   - Arrow compute kernels keep running inline (no nested parallelism), each worker with its own `compute::ExecContext`.
   - I/O stays synchronous inside a part (no pre-buffering), so memory is about one row group per busy thread plus the
