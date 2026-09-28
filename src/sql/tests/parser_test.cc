@@ -14,6 +14,7 @@
 
 #include "antb1/sql/ast.h"
 #include "antb1/sql/error.h"
+#include "antb1/sql/unparse.h"
 
 namespace antb1::sql {
 namespace {
@@ -31,7 +32,21 @@ const AggregateCall* AggregateOf(const SelectItem& item) {
   return std::get_if<AggregateCall>(&item.expr);
 }
 std::string ArgName(const AggregateCall& agg) {
-  return agg.arg.has_value() ? agg.arg.value_or(ColumnRef{}).name : "<none>";
+  const ColumnRef* column = agg.arg_column();
+  return column != nullptr ? column->name : "<none>";
+}
+
+// The normalized form of a WHERE or HAVING conjunct the test expects to be simple.
+Comparison Cmp(const Expr& expr) {
+  auto cmp = AsComparison(expr);
+  EXPECT_TRUE(cmp.has_value()) << "not a simple comparison";
+  return cmp.value_or(Comparison{});
+}
+
+HavingComparison HavingCmp(const Expr& expr) {
+  auto cmp = AsHavingComparison(expr);
+  EXPECT_TRUE(cmp.has_value()) << "not a simple HAVING comparison";
+  return cmp.value_or(HavingComparison{});
 }
 
 // ---- productions ----------------------------------------------------------------------------
@@ -104,8 +119,9 @@ TEST(ParserTest, EveryAggregate) {
   }
   const AggregateCall* avg = AggregateOf(stmt->items[3]);
   ASSERT_NE(avg, nullptr);
-  EXPECT_TRUE(avg->arg.value_or(ColumnRef{}).quoted);
-  EXPECT_EQ(At(kSql, avg->arg.value_or(ColumnRef{}).span), R"("Amount")");
+  ASSERT_NE(avg->arg_column(), nullptr);
+  EXPECT_TRUE(avg->arg_column()->quoted);
+  EXPECT_EQ(At(kSql, avg->arg_column()->span), R"("Amount")");
 }
 
 TEST(ParserTest, AggregatesAreCaseInsensitiveAndAllowSpaces) {
@@ -168,7 +184,7 @@ TEST(ParserTest, QuotedReservedWordsAreNames) {
   EXPECT_EQ(stmt->from.name, "where");
   EXPECT_TRUE(stmt->from.quoted);
   ASSERT_EQ(stmt->where.size(), 1U);
-  EXPECT_EQ(stmt->where[0].column.name, "limit");
+  EXPECT_EQ(Cmp(stmt->where[0]).column.name, "limit");
 }
 
 TEST(ParserTest, TableReferences) {
@@ -213,7 +229,7 @@ TEST_P(CompareOpTest, ColumnFirst) {
   auto stmt = Parse(sql);
   ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
   ASSERT_EQ(stmt->where.size(), 1U);
-  const Comparison& cmp = stmt->where[0];
+  const Comparison& cmp = Cmp(stmt->where[0]);
   EXPECT_EQ(cmp.op, c.op);
   EXPECT_EQ(cmp.column.name, "amount");
   EXPECT_EQ(cmp.literal.text, "42");
@@ -226,7 +242,7 @@ TEST_P(CompareOpTest, LiteralFirstIsNormalized) {
   auto stmt = Parse(sql);
   ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
   ASSERT_EQ(stmt->where.size(), 1U);
-  const Comparison& cmp = stmt->where[0];
+  const Comparison& cmp = Cmp(stmt->where[0]);
   EXPECT_EQ(cmp.op, c.mirrored);
   EXPECT_EQ(cmp.column.name, "amount");
   EXPECT_EQ(cmp.literal.kind, Literal::Kind::kDecimal);
@@ -266,7 +282,7 @@ TEST_P(LiteralTest, Parses) {
   auto stmt = Parse(sql);
   ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
   ASSERT_EQ(stmt->where.size(), 1U);
-  const Literal& literal = stmt->where[0].literal;
+  const Literal& literal = Cmp(stmt->where[0]).literal;
   EXPECT_EQ(literal.kind, c.kind);
   EXPECT_EQ(literal.negative, c.negative);
   EXPECT_EQ(literal.text, c.value);
@@ -307,9 +323,9 @@ TEST(ParserTest, DateIsAColumnUnlessFollowedByAString) {
   auto stmt = Parse(kSql);
   ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
   ASSERT_EQ(stmt->where.size(), 1U);
-  EXPECT_EQ(stmt->where[0].column.name, "date");
-  EXPECT_EQ(stmt->where[0].literal.kind, Literal::Kind::kDate);
-  EXPECT_EQ(At(kSql, stmt->where[0].literal.span), "DATE '2024-01-01'");
+  EXPECT_EQ(Cmp(stmt->where[0]).column.name, "date");
+  EXPECT_EQ(Cmp(stmt->where[0]).literal.kind, Literal::Kind::kDate);
+  EXPECT_EQ(At(kSql, Cmp(stmt->where[0]).literal.span), "DATE '2024-01-01'");
 }
 
 TEST(ParserTest, ConjunctionOfComparisons) {
@@ -319,14 +335,14 @@ TEST(ParserTest, ConjunctionOfComparisons) {
   auto stmt = Parse(kSql);
   ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
   ASSERT_EQ(stmt->where.size(), 4U);
-  EXPECT_EQ(At(kSql, stmt->where[0].span), "amount > 0");
-  EXPECT_EQ(stmt->where[1].column.name, "region");
-  EXPECT_EQ(stmt->where[1].op, CompareOp::kEq);
-  EXPECT_EQ(At(kSql, stmt->where[1].span), "'north' = region");
-  EXPECT_EQ(stmt->where[2].literal.kind, Literal::Kind::kDate);
-  EXPECT_TRUE(stmt->where[3].column.quoted);
-  EXPECT_EQ(stmt->where[3].op, CompareOp::kNe);
-  EXPECT_TRUE(stmt->where[3].literal.negative);
+  EXPECT_EQ(At(kSql, Cmp(stmt->where[0]).span), "amount > 0");
+  EXPECT_EQ(Cmp(stmt->where[1]).column.name, "region");
+  EXPECT_EQ(Cmp(stmt->where[1]).op, CompareOp::kEq);
+  EXPECT_EQ(At(kSql, Cmp(stmt->where[1]).span), "'north' = region");
+  EXPECT_EQ(Cmp(stmt->where[2]).literal.kind, Literal::Kind::kDate);
+  EXPECT_TRUE(Cmp(stmt->where[3]).column.quoted);
+  EXPECT_EQ(Cmp(stmt->where[3]).op, CompareOp::kNe);
+  EXPECT_TRUE(Cmp(stmt->where[3]).literal.negative);
 }
 
 TEST(ParserTest, Limit) {
@@ -392,18 +408,19 @@ TEST(ParserTest, Like) {
   auto stmt = Parse(kSql);
   ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
   ASSERT_EQ(stmt->where.size(), 3U);
-  EXPECT_EQ(stmt->where[0].op, CompareOp::kLike);
-  EXPECT_EQ(stmt->where[0].column.name, "url");
-  EXPECT_EQ(stmt->where[0].literal.text, "%x_%");
-  EXPECT_EQ(kSql.substr(stmt->where[0].span.offset, stmt->where[0].span.length), "url like '%x_%'");
-  EXPECT_EQ(stmt->where[1].op, CompareOp::kNotLike);
-  EXPECT_EQ(kSql.substr(stmt->where[1].span.offset, stmt->where[1].span.length),
+  EXPECT_EQ(Cmp(stmt->where[0]).op, CompareOp::kLike);
+  EXPECT_EQ(Cmp(stmt->where[0]).column.name, "url");
+  EXPECT_EQ(Cmp(stmt->where[0]).literal.text, "%x_%");
+  EXPECT_EQ(kSql.substr(Cmp(stmt->where[0]).span.offset, Cmp(stmt->where[0]).span.length),
+            "url like '%x_%'");
+  EXPECT_EQ(Cmp(stmt->where[1]).op, CompareOp::kNotLike);
+  EXPECT_EQ(kSql.substr(Cmp(stmt->where[1]).span.offset, Cmp(stmt->where[1]).span.length),
             "title Not LIKE 'y'");
-  EXPECT_EQ(stmt->where[2].op, CompareOp::kEq);
+  EXPECT_EQ(Cmp(stmt->where[2]).op, CompareOp::kEq);
   // A number as the pattern parses; the binder rejects it.
   auto number = Parse("SELECT a FROM t WHERE b LIKE 5");
   ASSERT_TRUE(number.has_value()) << number.error().message;
-  EXPECT_EQ(number->where[0].literal.kind, Literal::Kind::kInteger);
+  EXPECT_EQ(Cmp(number->where[0]).literal.kind, Literal::Kind::kInteger);
 }
 
 // column [NOT] IN (literal, ...) in WHERE; the span runs from the column to the closing paren.
@@ -413,7 +430,7 @@ TEST(ParserTest, In) {
   auto stmt = Parse(kSql);
   ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
   ASSERT_EQ(stmt->where.size(), 3U);
-  const Comparison& in = stmt->where[0];
+  const Comparison& in = Cmp(stmt->where[0]);
   EXPECT_EQ(in.op, CompareOp::kIn);
   ASSERT_EQ(in.list.size(), 4U);
   EXPECT_EQ(in.list[1].text, "2.5");
@@ -421,9 +438,9 @@ TEST(ParserTest, In) {
   EXPECT_EQ(in.list[2].kind, Literal::Kind::kString);
   EXPECT_EQ(in.list[3].kind, Literal::Kind::kDate);
   EXPECT_EQ(kSql.substr(in.span.offset, in.span.length), "b in (1, -2.5, 'x', DATE '2024-01-02')");
-  EXPECT_EQ(stmt->where[1].op, CompareOp::kNotIn);
-  EXPECT_EQ(stmt->where[1].list.size(), 1U);
-  EXPECT_EQ(stmt->where[2].op, CompareOp::kEq);
+  EXPECT_EQ(Cmp(stmt->where[1]).op, CompareOp::kNotIn);
+  EXPECT_EQ(Cmp(stmt->where[1]).list.size(), 1U);
+  EXPECT_EQ(Cmp(stmt->where[2]).op, CompareOp::kEq);
 }
 
 // HAVING: a conjunction of an aggregate or a column <op> literal (comparisons, LIKE, IN), literal
@@ -435,23 +452,23 @@ TEST(ParserTest, Having) {
   auto stmt = Parse(kSql);
   ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
   ASSERT_EQ(stmt->having.size(), 5U);
-  const HavingComparison& count = stmt->having[0];
+  const HavingComparison& count = HavingCmp(stmt->having[0]);
   EXPECT_EQ(std::get<AggregateCall>(count.operand).kind, AggKind::kCountStar);
   EXPECT_EQ(count.op, CompareOp::kGt);
   EXPECT_EQ(count.literal.text, "1");
   EXPECT_EQ(At(kSql, count.span), "count(*) > 1");
-  const HavingComparison& sum = stmt->having[1];
+  const HavingComparison& sum = HavingCmp(stmt->having[1]);
   EXPECT_EQ(std::get<AggregateCall>(sum.operand).kind, AggKind::kSum);
   EXPECT_EQ(sum.op, CompareOp::kLe) << "5 >= SUM(b) is SUM(b) <= 5";
   EXPECT_EQ(At(kSql, sum.span), "5 >= SUM(b)");
-  EXPECT_EQ(std::get<ColumnRef>(stmt->having[2].operand).name, "a");
-  EXPECT_EQ(stmt->having[2].op, CompareOp::kNotLike);
-  EXPECT_EQ(At(kSql, stmt->having[2].span), "a NOT LIKE 'x%'");
-  EXPECT_EQ(stmt->having[3].op, CompareOp::kIn);
-  EXPECT_EQ(stmt->having[3].list.size(), 2U);
-  EXPECT_EQ(At(kSql, stmt->having[3].span), "c IN (1, 2)");
-  EXPECT_EQ(std::get<AggregateCall>(stmt->having[4].operand).kind, AggKind::kMin);
-  EXPECT_EQ(stmt->having[4].op, CompareOp::kLike);
+  EXPECT_EQ(std::get<ColumnRef>(HavingCmp(stmt->having[2]).operand).name, "a");
+  EXPECT_EQ(HavingCmp(stmt->having[2]).op, CompareOp::kNotLike);
+  EXPECT_EQ(At(kSql, HavingCmp(stmt->having[2]).span), "a NOT LIKE 'x%'");
+  EXPECT_EQ(HavingCmp(stmt->having[3]).op, CompareOp::kIn);
+  EXPECT_EQ(HavingCmp(stmt->having[3]).list.size(), 2U);
+  EXPECT_EQ(At(kSql, HavingCmp(stmt->having[3]).span), "c IN (1, 2)");
+  EXPECT_EQ(std::get<AggregateCall>(HavingCmp(stmt->having[4]).operand).kind, AggKind::kMin);
+  EXPECT_EQ(HavingCmp(stmt->having[4]).op, CompareOp::kLike);
   EXPECT_EQ(At(kSql, stmt->having_span),
             "HAVING count(*) > 1 AND 5 >= SUM(b) AND a NOT LIKE 'x%' AND c IN (1, 2) AND MIN(s) "
             "like 'y'");
@@ -461,8 +478,156 @@ TEST(ParserTest, Having) {
   ASSERT_TRUE(global.has_value()) << global.error().message;
   EXPECT_TRUE(global->group_by.empty());
   ASSERT_EQ(global->having.size(), 1U);
-  EXPECT_TRUE(std::get<AggregateCall>(global->having[0].operand).distinct);
-  EXPECT_EQ(global->having[0].op, CompareOp::kNe);
+  EXPECT_TRUE(std::get<AggregateCall>(HavingCmp(global->having[0]).operand).distinct);
+  EXPECT_EQ(HavingCmp(global->having[0]).op, CompareOp::kNe);
+}
+
+// The expression grammar: precedence (OR < AND < NOT < comparisons < + - < * / // % < unary -),
+// left associativity, and parentheses that group without leaving a node.
+TEST(ParserTest, ExpressionPrecedenceAndAssociativity) {
+  const auto canonical = [](std::string_view expr) {
+    auto stmt = Parse("SELECT " + std::string(expr) + " FROM t");
+    EXPECT_TRUE(stmt.has_value()) << expr << ": " << stmt.error().message;
+    return stmt.has_value() ? ToSql(stmt->items[0].expr) : std::string();
+  };
+  EXPECT_EQ(canonical("a + b * c"), "a + b * c");
+  EXPECT_EQ(canonical("(a + b) * c"), "(a + b) * c");
+  EXPECT_EQ(canonical("a - b - c"), "a - b - c");
+  EXPECT_EQ(canonical("a - (b - c)"), "a - (b - c)");
+  EXPECT_EQ(canonical("a // 2 % 3 / 4"), "a // 2 % 3 / 4");
+  EXPECT_EQ(canonical("((a))"), "a");
+  EXPECT_EQ(canonical("-a * b"), "-(a) * b");
+  EXPECT_EQ(canonical("-(a * b)"), "-(a * b)");
+  EXPECT_EQ(canonical("a*-5"), "a * -5") << "a negative literal";
+  EXPECT_EQ(canonical("a = 1 OR b = 2 AND c = 3"), "a = 1 OR b = 2 AND c = 3");
+  EXPECT_EQ(canonical("(a = 1 OR b = 2) AND c = 3"), "(a = 1 OR b = 2) AND c = 3");
+  EXPECT_EQ(canonical("NOT a = 1 AND b"), "NOT a = 1 AND b");
+  EXPECT_EQ(canonical("NOT (a AND b)"), "NOT (a AND b)");
+  EXPECT_EQ(canonical("a + 1 < b * 2"), "a + 1 < b * 2");
+  EXPECT_EQ(canonical("(a < b) = (c < d)"), "(a < b) = (c < d)");
+  EXPECT_FALSE(Parse("SELECT x LIKE 'a' || 'b' FROM t").has_value()) << "|| stays unsupported";
+  auto tree = Parse("SELECT a + b * c FROM t");
+  ASSERT_TRUE(tree.has_value());
+  const auto& add = std::get<BinaryExpr>(tree->items[0].expr);
+  EXPECT_EQ(add.op, BinaryOp::kAdd);
+  EXPECT_EQ(std::get<BinaryExpr>(*add.right).op, BinaryOp::kMultiply);
+  EXPECT_EQ(At("SELECT a + b * c FROM t", add.op_span), "+");
+  EXPECT_EQ(At("SELECT a + b * c FROM t", add.span), "a + b * c");
+}
+
+TEST(ParserTest, FunctionsCaseExtractAndExpressionOperands) {
+  constexpr std::string_view kSql =
+      "SELECT regexp_replace(url, '^x(.*)$', '\\1') AS k, f(), \"Quoted\"(a, 1), "
+      "CASE WHEN a = 0 AND b = 0 THEN c ELSE '' END, CASE a WHEN 1 THEN 'one' END, "
+      "extract(minute FROM ts), SUM(a + 1), COUNT(DISTINCT a % 7) FROM t "
+      "WHERE a + 1 IN (b, 2 * c) AND lower(s) NOT LIKE '%x%' GROUP BY a - 1, k";
+  auto stmt = Parse(kSql);
+  ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
+  ASSERT_EQ(stmt->items.size(), 8U);
+  const auto& replace = std::get<FunctionCall>(stmt->items[0].expr);
+  EXPECT_EQ(replace.name, "regexp_replace");
+  EXPECT_EQ(replace.args.size(), 3U);
+  EXPECT_EQ(At(kSql, replace.name_span), "regexp_replace");
+  EXPECT_TRUE(std::get<FunctionCall>(stmt->items[1].expr).args.empty());
+  EXPECT_TRUE(std::get<FunctionCall>(stmt->items[2].expr).quoted);
+  const auto& searched = std::get<CaseExpr>(stmt->items[3].expr);
+  EXPECT_FALSE(searched.operand.has_value());
+  ASSERT_EQ(searched.branches.size(), 1U);
+  EXPECT_EQ(std::get<BinaryExpr>(*searched.branches[0].when).op, BinaryOp::kAnd);
+  EXPECT_TRUE(searched.otherwise.has_value());
+  const auto& simple = std::get<CaseExpr>(stmt->items[4].expr);
+  EXPECT_TRUE(simple.operand.has_value());
+  EXPECT_FALSE(simple.otherwise.has_value());
+  const auto& extract = std::get<ExtractExpr>(stmt->items[5].expr);
+  EXPECT_EQ(extract.field, "minute");
+  EXPECT_EQ(At(kSql, extract.span), "extract(minute FROM ts)");
+  const auto& sum = std::get<AggregateCall>(stmt->items[6].expr);
+  EXPECT_EQ(sum.arg_column(), nullptr);
+  const Expr* sum_arg = sum.arg.has_value() ? &**sum.arg : nullptr;
+  ASSERT_NE(sum_arg, nullptr);
+  EXPECT_EQ(std::get<BinaryExpr>(*sum_arg).op, BinaryOp::kAdd);
+  EXPECT_TRUE(std::get<AggregateCall>(stmt->items[7].expr).distinct);
+  ASSERT_EQ(stmt->where.size(), 2U);
+  EXPECT_FALSE(AsComparison(stmt->where[0]).has_value()) << "not column <op> literal";
+  EXPECT_EQ(std::get<InExpr>(stmt->where[0]).list.size(), 2U);
+  EXPECT_TRUE(std::get<LikeExpr>(stmt->where[1]).negated);
+  ASSERT_EQ(stmt->group_by.size(), 2U);
+  EXPECT_EQ(std::get<BinaryExpr>(stmt->group_by[0]).op, BinaryOp::kSubtract);
+  auto again = Parse(ToSql(*stmt));
+  ASSERT_TRUE(again.has_value()) << ToSql(*stmt) << ": " << again.error().message;
+  EXPECT_TRUE(EqualIgnoringSpans(*stmt, *again)) << ToSql(*stmt);
+}
+
+// WHERE and HAVING split their top-level AND chain; a parenthesized AND, or an OR at the top,
+// makes one conjunct.
+TEST(ParserTest, PredicatesSplitAtTheirTopLevelAndChain) {
+  auto flat = Parse("SELECT a FROM t WHERE a = 1 AND (b = 2) AND c = 3");
+  ASSERT_TRUE(flat.has_value());
+  EXPECT_EQ(flat->where.size(), 3U);
+  auto nested = Parse("SELECT a FROM t WHERE (a = 1 AND b = 2) AND c = 3");
+  ASSERT_TRUE(nested.has_value());
+  ASSERT_EQ(nested->where.size(), 2U);
+  EXPECT_EQ(std::get<BinaryExpr>(nested->where[0]).op, BinaryOp::kAnd);
+  auto with_or = Parse("SELECT a FROM t WHERE a = 1 AND b = 2 OR c = 3 AND d = 4");
+  ASSERT_TRUE(with_or.has_value());
+  ASSERT_EQ(with_or->where.size(), 1U);
+  const auto& top = std::get<BinaryExpr>(with_or->where[0]);
+  EXPECT_EQ(top.op, BinaryOp::kOr);
+  EXPECT_EQ(std::get<BinaryExpr>(*top.left).op, BinaryOp::kAnd);
+  EXPECT_EQ(std::get<BinaryExpr>(*top.right).op, BinaryOp::kAnd);
+  auto having = Parse("SELECT a FROM t GROUP BY a HAVING COUNT(*) > 1 AND NOT MIN(b) = 2");
+  ASSERT_TRUE(having.has_value());
+  ASSERT_EQ(having->having.size(), 2U);
+  EXPECT_EQ(std::get<UnaryExpr>(having->having[1]).op, UnaryOp::kNot);
+  // A long chain builds no deep tree: it is no deeper than one conjunct.
+  std::string chain = "SELECT a FROM t WHERE a = 0";
+  for (int i = 1; i < 1000; ++i) {
+    chain += " AND a <> " + std::to_string(i);
+  }
+  auto wide = Parse(chain);
+  ASSERT_TRUE(wide.has_value()) << wide.error().message;
+  EXPECT_EQ(wide->where.size(), 1000U);
+}
+
+// Every level of an expression tree counts against the depth limit (256).
+TEST(ParserTest, ExpressionDepthIsLimited) {
+  const auto nested = [](std::size_t depth) {
+    return "SELECT " + std::string(depth, '(') + "a" + std::string(depth, ')') + " FROM t";
+  };
+  EXPECT_TRUE(Parse(nested(200)).has_value());
+  auto deep = Parse(nested(300));
+  ASSERT_FALSE(deep.has_value());
+  EXPECT_EQ(deep.error().kind, ParseError::Kind::kUnsupported);
+  EXPECT_TRUE(deep.error().message.starts_with("expressions deeper than 256 levels"))
+      << deep.error().message;
+  std::string sum = "SELECT a";
+  for (int i = 0; i < 300; ++i) {
+    sum += " + a";
+  }
+  auto chain = Parse(sum + " FROM t");
+  ASSERT_FALSE(chain.has_value()) << "an operator chain is a deep tree too";
+  EXPECT_EQ(chain.error().kind, ParseError::Kind::kUnsupported);
+  std::string ors = "SELECT a FROM t WHERE a = 0";
+  for (int i = 0; i < 300; ++i) {
+    ors += " OR a = 1";
+  }
+  EXPECT_FALSE(Parse(ors).has_value());
+  // An AND chain is free until an OR makes it an operand: then its ANDs count too.
+  std::string and_chain = "SELECT a FROM t WHERE a = 0";
+  for (int i = 0; i < 300; ++i) {
+    and_chain += " AND a = 1";
+  }
+  EXPECT_TRUE(Parse(and_chain).has_value());
+  auto ored = Parse(and_chain + " OR a = 2");
+  ASSERT_FALSE(ored.has_value());
+  EXPECT_EQ(ored.error().kind, ParseError::Kind::kUnsupported);
+  // The depth of one clause does not carry over to the next.
+  std::string then = "SELECT a FROM t WHERE a = 0";
+  for (int i = 0; i < 200; ++i) {
+    then += " OR a = 1";
+  }
+  then += " GROUP BY " + std::string(100, '(') + "a" + std::string(100, ')');
+  EXPECT_TRUE(Parse(then).has_value());
 }
 
 // Literals are select items (constants), and in GROUP BY and ORDER BY positions or constants; the
@@ -576,7 +741,7 @@ TEST(ParserTest, LineCommentEndsAtCarriageReturn) {
     auto stmt = Parse(sql);
     ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
     ASSERT_EQ(stmt->where.size(), 1U) << testing::PrintToString(sql);
-    EXPECT_EQ(stmt->where[0].column.name, "a");
+    EXPECT_EQ(Cmp(stmt->where[0]).column.name, "a");
   }
 }
 
@@ -605,7 +770,7 @@ TEST(ParserTest, IsNullAndNotNullAreNamesOnlyWhereNotOperators) {
   EXPECT_EQ(stmt->items[2].alias, std::optional<std::string>("isnull"));
   EXPECT_EQ(stmt->from.name, "isnull");
   ASSERT_EQ(stmt->where.size(), 1U);
-  EXPECT_EQ(stmt->where[0].column.name, "notnull");
+  EXPECT_EQ(Cmp(stmt->where[0]).column.name, "notnull");
 }
 
 // Operator runs follow PostgreSQL's lexer: '-' after a comparison still starts a negative literal.
@@ -622,7 +787,7 @@ TEST(ParserTest, ComparisonsGluedToNegativeLiterals) {
   const std::array<std::string_view, 8> literals = {"-1",   "-2", "-3", "-.5",
                                                     "-1e3", "-0", "4",  "5"};
   for (std::size_t i = 0; i < ops.size(); ++i) {
-    const Comparison& cmp = stmt->where[i];
+    const Comparison& cmp = Cmp(stmt->where[i]);
     EXPECT_EQ(cmp.op, ops[i]) << i;
     EXPECT_EQ(std::string(cmp.literal.negative ? "-" : "") + cmp.literal.text, literals[i]) << i;
     EXPECT_EQ(At(kSql, cmp.literal.span), literals[i]) << i;
@@ -676,40 +841,13 @@ INSTANTIATE_TEST_SUITE_P(
                    "SELECT without FROM is not supported"},
         RejectCase{"GroupByAll", "SELECT a FROM events GROUP BY ^ALL", kUnsupported, 3,
                    "GROUP BY ALL is not supported"},
-        RejectCase{"GroupByExpression", "SELECT a FROM events GROUP BY a ^+ 1", kUnsupported, 1,
-                   "arithmetic operator '+' is not supported"},
-        RejectCase{"GroupByFunction", "SELECT a FROM events GROUP BY ^year(d)", kUnsupported, 4,
-                   "function year() is not supported"},
         RejectCase{"GroupByTrailingComma", "SELECT a FROM events GROUP BY a^, ORDER BY a",
                    kUnsupported, 1, "a trailing comma in GROUP BY is not supported"},
-        RejectCase{"HavingOr", "SELECT a FROM events GROUP BY a HAVING COUNT(*) > 1 ^OR a = 2",
-                   kUnsupported, 2, "OR is not supported"},
-        RejectCase{"HavingTwoAggregates",
-                   "SELECT a FROM events GROUP BY a HAVING COUNT(*) > ^SUM(b)", kUnsupported, 6,
-                   "HAVING comparisons of two columns or aggregates"},
-        RejectCase{"HavingTwoLiterals", "SELECT a FROM events GROUP BY a HAVING 1 < ^2",
-                   kUnsupported, 1, "comparisons between two literals are not supported"},
-        RejectCase{"HavingBareAggregate", "SELECT a FROM events GROUP BY a HAVING ^COUNT(*)",
-                   kUnsupported, 8, "HAVING conditions other than comparisons"},
-        RejectCase{"HavingExpression", "SELECT a FROM events GROUP BY a HAVING COUNT(*) ^+ 1 > 2",
-                   kUnsupported, 1, "arithmetic operator '+' is not supported"},
-        RejectCase{"HavingAggregatePattern",
-                   "SELECT a FROM events GROUP BY a HAVING MIN(s) LIKE ^MAX(s)", kUnsupported, 3,
-                   "an aggregate is only supported left of LIKE or IN"},
-        RejectCase{"HavingAggregateInList",
-                   "SELECT a FROM events GROUP BY a HAVING a IN (1, ^COUNT(*))", kUnsupported, 5,
-                   "an aggregate is only supported left of LIKE or IN"},
-        RejectCase{"HavingLiteralLike", "SELECT a FROM events GROUP BY a HAVING ^'x' LIKE 'y'",
-                   kUnsupported, 3, "LIKE needs a column or an aggregate on the left"},
-        RejectCase{"HavingLiteralIn", "SELECT a FROM events GROUP BY a HAVING ^1 IN (1)",
-                   kUnsupported, 1, "IN needs a column or an aggregate on the left"},
         RejectCase{"HavingAggregateFilter",
                    "SELECT a FROM events GROUP BY a HAVING COUNT(b) ^FILTER (WHERE b = 1) > 1",
                    kUnsupported, 6, "aggregate FILTER clauses are not supported"},
         RejectCase{"OrderByAll", "SELECT a FROM events ORDER BY ^ALL", kUnsupported, 3,
                    "ORDER BY ALL is not supported"},
-        RejectCase{"OrderByExpression", "SELECT a FROM events ORDER BY a ^* 2 DESC", kUnsupported,
-                   1, "arithmetic operator '*' is not supported"},
         RejectCase{"OrderByTrailingComma", "SELECT a FROM events ORDER BY a DESC^, LIMIT 5",
                    kUnsupported, 1, "a trailing comma in ORDER BY is not supported"},
         RejectCase{"OrderByCollate", "SELECT a FROM events ORDER BY a ^COLLATE nocase",
@@ -727,6 +865,28 @@ INSTANTIATE_TEST_SUITE_P(
                    "DISTINCT is not supported"},
         RejectCase{"SumDistinct", "SELECT SUM(^distinct user_id) FROM events", kUnsupported, 8,
                    "SUM(DISTINCT ...) is not supported"},
+        RejectCase{"FunctionDistinct", "SELECT ^f(DISTINCT a) FROM events", kUnsupported, 1,
+                   "function f() with this argument syntax is not supported"},
+        RejectCase{"FunctionStar", "SELECT ^f(*) FROM events", kUnsupported, 1,
+                   "function f() with this argument syntax is not supported"},
+        RejectCase{"FunctionOrderBy", "SELECT ^string_agg(a ORDER BY a) FROM events", kUnsupported,
+                   10, "function string_agg() with this argument syntax"},
+        RejectCase{"PositionIn", "SELECT ^position('a' IN u) FROM events", kUnsupported, 8,
+                   "function position() with this argument syntax is not supported"},
+        RejectCase{"SubstringFrom", "SELECT ^substring(u FROM 1 FOR 2) FROM events", kUnsupported,
+                   9, "function substring() with this argument syntax is not supported"},
+        RejectCase{"TryCast", "SELECT ^try_cast(a AS BIGINT) FROM events", kUnsupported, 8,
+                   "function try_cast() with this argument syntax is not supported"},
+        RejectCase{"FunctionSyntaxError", "SELECT ^f(a +) FROM events", kUnsupported, 1,
+                   "function f() with this argument syntax is not supported"},
+        RejectCase{"FunctionFilter", "SELECT count_if(a > 0) ^FILTER (WHERE a < 5) FROM events",
+                   kUnsupported, 6, "FILTER clauses are not supported"},
+        RejectCase{"PostfixNotNull", "SELECT a FROM events WHERE a ^NOT NULL", kUnsupported, 3,
+                   "NOT NULL (IS NOT NULL) is not supported"},
+        RejectCase{"PostfixNot", "SELECT a ^NOT b FROM events", kUnsupported, 3,
+                   "NOT is not supported"},
+        RejectCase{"Rollup", "SELECT a FROM events GROUP BY ^ROLLUP (a)", kUnsupported, 6,
+                   "ROLLUP is not supported"},
         RejectCase{"MaxDistinctInOrderBy", "SELECT a FROM events ORDER BY MAX(^DISTINCT a)",
                    kUnsupported, 8, "MAX(DISTINCT ...) is not supported"},
         RejectCase{"SelectAll", "SELECT ^ALL a FROM events", kUnsupported, 3,
@@ -763,36 +923,18 @@ INSTANTIATE_TEST_SUITE_P(
                    "WITH (common table expressions) is not supported"},
         RejectCase{"LikeEscape", "SELECT a FROM events WHERE url LIKE 'x!%' ^ESCAPE '!'",
                    kUnsupported, 6, "LIKE ... ESCAPE is not supported"},
-        RejectCase{"LikeColumnPattern", "SELECT a FROM events WHERE url LIKE ^title", kUnsupported,
-                   5, "LIKE with a column as the pattern is not supported"},
-        RejectCase{"LikeLiteralLeft", "SELECT a FROM events WHERE ^'x' LIKE url", kUnsupported, 3,
-                   "LIKE needs a column on the left"},
-        RejectCase{"LikeInSelect", "SELECT url ^LIKE '%x%' FROM events", kUnsupported, 4,
-                   "LIKE is not supported"},
         RejectCase{"ILike", "SELECT a FROM events WHERE url ^ILIKE '%x%'", kUnsupported, 5,
                    "ILIKE is not supported"},
         RejectCase{"SimilarTo", "SELECT a FROM events WHERE url ^SIMILAR TO 'x'", kUnsupported, 7,
                    "SIMILAR TO is not supported"},
         RejectCase{"InSubquery", "SELECT a FROM events WHERE region IN (^SELECT b FROM t)",
                    kUnsupported, 6, "IN (subquery) is not supported"},
-        RejectCase{"InColumn", "SELECT a FROM events WHERE region IN (1, ^b)", kUnsupported, 1,
-                   "columns in an IN list are not supported"},
-        RejectCase{"InLiteralLeft", "SELECT a FROM events WHERE ^1 IN (a)", kUnsupported, 1,
-                   "IN needs a column on the left"},
-        RejectCase{"InInSelect", "SELECT region ^IN ('a') FROM events", kUnsupported, 2,
-                   "IN is not supported"},
-        RejectCase{"InExpression", "SELECT a FROM events WHERE region IN (1 ^+ 2)", kUnsupported, 1,
-                   "arithmetic operator '+' is not supported"},
         RejectCase{"Between", "SELECT a FROM events WHERE a ^BETWEEN 1 AND 2", kUnsupported, 7,
                    "BETWEEN is not supported"},
         RejectCase{"NotBetween", "SELECT a FROM events WHERE a ^NOT BETWEEN 1 AND 2", kUnsupported,
                    3, "NOT BETWEEN is not supported"},
         RejectCase{"BetweenAfterLiteral", "SELECT a FROM events WHERE 1 ^BETWEEN a AND b",
                    kUnsupported, 7, "BETWEEN is not supported"},
-        RejectCase{"Case", "SELECT ^CASE WHEN a = 1 THEN 1 END FROM events", kUnsupported, 4,
-                   "CASE is not supported"},
-        RejectCase{"CaseInWhere", "SELECT a FROM events WHERE a = ^CASE WHEN b THEN 1 END",
-                   kUnsupported, 4, "CASE is not supported"},
         RejectCase{"IsNull", "SELECT a FROM events WHERE a ^IS NULL", kUnsupported, 2,
                    "IS NULL is not supported"},
         RejectCase{"IsNotNull", "SELECT a FROM events WHERE a ^is not null", kUnsupported, 2,
@@ -809,45 +951,10 @@ INSTANTIATE_TEST_SUITE_P(
                    "NULL literals are not supported"},
         RejectCase{"LimitNull", "SELECT a FROM events LIMIT ^NULL", kUnsupported, 4,
                    "NULL literals are not supported"},
-        RejectCase{"Or", "SELECT a FROM events WHERE a = 1 ^OR b = 2", kUnsupported, 2,
-                   "OR is not supported"},
-        RejectCase{"OrAfterColumn", "SELECT a FROM events WHERE flag ^or b = 2", kUnsupported, 2,
-                   "OR is not supported"},
-        RejectCase{"OrAfterSecondComparison",
-                   "SELECT a FROM events WHERE a = 1 AND b = 2 ^OR c = 3", kUnsupported, 2,
-                   "OR is not supported"},
-        RejectCase{"Not", "SELECT a FROM events WHERE ^NOT a = 1", kUnsupported, 3,
-                   "NOT is not supported"},
-        RejectCase{"NotAfterAnd", "SELECT a FROM events WHERE a = 1 AND ^NOT b = 2", kUnsupported,
-                   3, "NOT is not supported"},
-        RejectCase{"PlusInSelect", "SELECT a ^+ 1 FROM events", kUnsupported, 1,
-                   "arithmetic operator '+' is not supported"},
-        RejectCase{"MinusInSelect", "SELECT a ^- 1 FROM events", kUnsupported, 1,
-                   "arithmetic operator '-' is not supported"},
-        RejectCase{"TimesInSelect", "SELECT amount ^* 2 FROM events", kUnsupported, 1,
-                   "arithmetic operator '*' is not supported"},
-        RejectCase{"DivideInSelect", "SELECT SUM(a) ^/ COUNT(a) FROM events", kUnsupported, 1,
-                   "arithmetic operator '/' is not supported"},
-        RejectCase{"ModuloInSelect", "SELECT a ^% 2 FROM events", kUnsupported, 1,
-                   "arithmetic operator '%' is not supported"},
-        RejectCase{"ArithmeticLeftOfComparison", "SELECT a FROM events WHERE a ^+ 1 = 2",
-                   kUnsupported, 1, "arithmetic operator '+' is not supported"},
-        RejectCase{"ArithmeticRightOfComparison", "SELECT a FROM events WHERE a = 1 ^* 2",
-                   kUnsupported, 1, "arithmetic operator '*' is not supported"},
-        RejectCase{"ArithmeticAfterLiteralFirst", "SELECT a FROM events WHERE 1 ^- 1 = a",
-                   kUnsupported, 1, "arithmetic operator '-' is not supported"},
-        RejectCase{"ArithmeticInAggregate", "SELECT SUM(a ^* 2) FROM events", kUnsupported, 1,
-                   "arithmetic operator '*' is not supported"},
-        RejectCase{"UnaryMinusOnColumn", "SELECT a FROM events WHERE a = ^-b", kUnsupported, 1,
-                   "arithmetic operator '-' is not supported"},
-        RejectCase{"DoubleNegation", "SELECT a FROM events WHERE a = ^- -1", kUnsupported, 1,
-                   "arithmetic operator '-' is not supported"},
         RejectCase{"UnaryPlus", "SELECT a FROM events WHERE a = ^+1", kUnsupported, 1,
-                   "arithmetic operator '+' is not supported"},
-        RejectCase{"UnaryMinusInSelect", "SELECT ^-a FROM events", kUnsupported, 1,
-                   "arithmetic operator '-' is not supported"},
+                   "unary '+' is not supported"},
         RejectCase{"LimitArithmetic", "SELECT a FROM events LIMIT 1 ^+ 1", kUnsupported, 1,
-                   "arithmetic operator '+' is not supported"},
+                   "LIMIT expressions are not supported (LIMIT takes an integer)"},
         RejectCase{"LimitParenthesized", "SELECT a FROM events LIMIT ^(5)", kUnsupported, 1,
                    "LIMIT expressions are not supported"},
         RejectCase{"LimitFunction", "SELECT a FROM events LIMIT ^abs(5)", kUnsupported, 3,
@@ -856,30 +963,12 @@ INSTANTIATE_TEST_SUITE_P(
                    "LIMIT ALL is not supported"},
         RejectCase{"Concat", "SELECT a ^|| b FROM events", kUnsupported, 2,
                    "string concatenation (||) is not supported"},
-        RejectCase{"Function", "SELECT ^lower(url) FROM events", kUnsupported, 5,
-                   "function lower() is not supported"},
-        RejectCase{"FunctionInWhere", "SELECT a FROM events WHERE ^length(url) > 5", kUnsupported,
-                   6, "function length() is not supported"},
-        RejectCase{"FunctionRightOfComparison", "SELECT a FROM events WHERE d > ^now()",
-                   kUnsupported, 3, "function now() is not supported"},
-        RejectCase{"FunctionInAggregate", "SELECT SUM(^abs(a)) FROM events", kUnsupported, 3,
-                   "function abs() is not supported"},
-        RejectCase{"QuotedFunction", R"(SELECT ^"lower"(url) FROM events)", kUnsupported, 7,
-                   "function calls are not supported"},
-        RejectCase{"ReservedWordFunction", "SELECT ^left(url, 3) FROM events", kUnsupported, 4,
-                   "function left() is not supported"},
         RejectCase{"TableFunction", "SELECT * FROM ^read_parquet('x.parquet')", kUnsupported, 12,
                    "table functions are not supported"},
         RejectCase{"SubqueryInFrom", "SELECT a FROM ^(SELECT a FROM events)", kUnsupported, 1,
                    "subqueries in FROM are not supported"},
         RejectCase{"SubqueryInWhere", "SELECT a FROM events WHERE a = ^(SELECT 1)", kUnsupported, 1,
-                   "parenthesized expressions and subqueries are not supported"},
-        RejectCase{"ParenthesizedPredicate", "SELECT a FROM events WHERE ^(a = 1)", kUnsupported, 1,
-                   "parenthesized expressions and subqueries are not supported"},
-        RejectCase{"ParenthesizedColumn", "SELECT ^(a) FROM events", kUnsupported, 1,
-                   "parenthesized expressions and subqueries are not supported"},
-        RejectCase{"ParenthesizedAggregateArg", "SELECT SUM(^(a)) FROM events", kUnsupported, 1,
-                   "parenthesized expressions and subqueries are not supported"},
+                   "subqueries are not supported"},
         RejectCase{"ParenthesizedQuery", "^(SELECT a FROM events)", kUnsupported, 1,
                    "parenthesized queries are not supported"},
         RejectCase{"Exists", "SELECT a FROM events WHERE ^EXISTS (SELECT 1)", kUnsupported, 6,
@@ -938,30 +1027,10 @@ INSTANTIATE_TEST_SUITE_P(
                    "window functions (OVER) are not supported"},
         RejectCase{"Filter", "SELECT COUNT(*) ^FILTER (WHERE a = 1) FROM events", kUnsupported, 6,
                    "aggregate FILTER clauses are not supported"},
-        RejectCase{"CountConstant", "SELECT COUNT(^1) FROM events", kUnsupported, 1,
-                   "constant aggregate arguments are not supported (use COUNT(*))"},
-        RejectCase{"SumConstant", "SELECT SUM(^'x') FROM events", kUnsupported, 3,
-                   "constant aggregate arguments are not supported"},
         RejectCase{"StarWithItems", "SELECT *^, a FROM events", kUnsupported, 1,
                    "combining '*' with other select items is not supported"},
         RejectCase{"ItemsWithStar", "SELECT a, ^* FROM events", kUnsupported, 1,
                    "combining '*' with other select items is not supported"},
-        RejectCase{"ComparisonInSelect", "SELECT a ^= 1 FROM events", kUnsupported, 1,
-                   "comparisons are only supported in WHERE"},
-        RejectCase{"AndInSelect", "SELECT a ^AND b FROM events", kUnsupported, 3,
-                   "AND is only supported between comparisons in WHERE"},
-        RejectCase{"ColumnVsColumn", "SELECT a FROM events WHERE a = ^b", kUnsupported, 1,
-                   "comparisons between two columns are not supported"},
-        RejectCase{"LiteralVsLiteral", "SELECT a FROM events WHERE 1 = ^1", kUnsupported, 1,
-                   "comparisons between two literals are not supported"},
-        RejectCase{"BareColumnPredicate", "SELECT a FROM events WHERE ^flag", kUnsupported, 4,
-                   "predicates other than comparisons (column <op> literal) are not supported"},
-        RejectCase{"BareColumnBeforeAnd", "SELECT a FROM events WHERE ^flag AND a = 1",
-                   kUnsupported, 4, "predicates other than comparisons"},
-        RejectCase{"BareLiteralBeforeLimit", "SELECT a FROM events WHERE ^1 LIMIT 5", kUnsupported,
-                   1, "predicates other than comparisons"},
-        RejectCase{"BareColumnBeforeGroupBy", "SELECT a FROM events WHERE ^flag GROUP BY a",
-                   kUnsupported, 4, "predicates other than comparisons"},
         RejectCase{"Collate", "SELECT a FROM events WHERE a = 'x' ^COLLATE nocase", kUnsupported, 7,
                    "COLLATE is not supported"},
         RejectCase{"Qualify", "SELECT a FROM events ^QUALIFY a = 1", kUnsupported, 7,
@@ -1085,9 +1154,9 @@ INSTANTIATE_TEST_SUITE_P(
                    "expected SELECT, found identifier SELEC"},
         RejectCase{"Number", "^42", kSyntax, 2, "expected SELECT, found integer literal 42"},
         RejectCase{"SelectAlone", "SELECT^", kSyntax, 0,
-                   "expected a column, an aggregate or '*', found end of input"},
+                   "expected an expression or '*', found end of input"},
         RejectCase{"EmptySelectList", "SELECT ^FROM events", kSyntax, 4,
-                   "expected a column, an aggregate or '*', found keyword FROM"},
+                   "expected an expression or '*', found keyword FROM"},
         RejectCase{"MissingTable", "SELECT a FROM^", kSyntax, 0,
                    "expected a table name or a quoted file path, found end of input"},
         RejectCase{"ReservedTable", "SELECT a FROM ^WHERE a = 1", kSyntax, 5,
@@ -1098,7 +1167,7 @@ INSTANTIATE_TEST_SUITE_P(
                    "expected ',' or FROM, found identifier c"},
         RejectCase{"StarStar", "SELECT * ^* FROM events", kSyntax, 1, "expected FROM, found '*'"},
         RejectCase{"ReservedColumn", "SELECT ^order FROM events", kSyntax, 5,
-                   "expected a column, an aggregate or '*', found keyword ORDER"},
+                   "expected an expression or '*', found keyword ORDER"},
         RejectCase{"MissingAlias", "SELECT a AS^", kSyntax, 0,
                    "expected an alias after AS, found end of input"},
         RejectCase{"SumStar", "SELECT SUM(^*) FROM events", kSyntax, 1, "only COUNT accepts '*'"},
@@ -1107,28 +1176,50 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"UnclosedCountStar", "SELECT COUNT(* ^FROM events", kSyntax, 4,
                    "expected ')' to close COUNT(, found keyword FROM"},
         RejectCase{"TwoArguments", "SELECT SUM(a^, b) FROM events", kSyntax, 1,
-                   "expected ')' to close SUM(, found ','"},
+                   "SUM takes one argument"},
         RejectCase{"AggregateWithoutArgument", "SELECT AVG(^FROM) FROM events", kSyntax, 4,
-                   "expected a column, found keyword FROM"},
+                   "expected an expression, found keyword FROM"},
         RejectCase{"NestedAggregate", "SELECT SUM(^COUNT(a)) FROM events", kSyntax, 5,
                    "aggregate function calls cannot be nested"},
         RejectCase{"AggregateInWhere", "SELECT a FROM events WHERE ^COUNT(*) > 1", kSyntax, 5,
                    "aggregate functions are not allowed in WHERE"},
         RejectCase{"EmptyWhere", "SELECT a FROM events WHERE^", kSyntax, 0,
-                   "expected a column or a literal, found end of input"},
+                   "expected an expression, found end of input"},
         RejectCase{"ReservedInWhere", "SELECT a FROM events WHERE ^LIMIT 5", kSyntax, 5,
-                   "expected a column or a literal, found keyword LIMIT"},
+                   "expected an expression, found keyword LIMIT"},
         RejectCase{"MissingOperator", "SELECT a FROM events WHERE a ^b", kSyntax, 1,
-                   "expected a comparison operator (=, <>, !=, <, <=, >, >=), found identifier b"},
+                   "unexpected identifier b; expected AND, GROUP BY, HAVING, ORDER BY, LIMIT, "
+                   "OFFSET or the end of the query"},
         RejectCase{"DoubleEquals", "SELECT a FROM events WHERE a = ^= 1", kSyntax, 1,
-                   "expected a column or a literal, found '='"},
+                   "expected an expression, found '='"},
         RejectCase{"MissingRightOperand", "SELECT a FROM events WHERE a =^", kSyntax, 0,
-                   "expected a column or a literal, found end of input"},
+                   "expected an expression, found end of input"},
         RejectCase{"DanglingAnd", "SELECT a FROM events WHERE a = 1 AND^", kSyntax, 0,
-                   "expected a column or a literal, found end of input"},
-        RejectCase{"ChainedComparison", "SELECT a FROM events WHERE a = 1 ^= 2", kSyntax, 1,
-                   "unexpected '='; expected AND, GROUP BY, HAVING, ORDER BY, LIMIT, OFFSET or the "
-                   "end of the query"},
+                   "expected an expression, found end of input"},
+        RejectCase{"ChainedComparison", "SELECT a FROM events WHERE a = 1 ^= 2", kUnsupported, 1,
+                   "chained comparisons (a = b = c) are not supported"},
+        RejectCase{"ExtractStringField", "SELECT EXTRACT(^'minute' FROM a) FROM events", kSyntax, 8,
+                   "expected a field name in EXTRACT(, found string literal"},
+        RejectCase{"ExtractWithoutFrom", "SELECT EXTRACT(minute ^a) FROM events", kSyntax, 1,
+                   "expected FROM in EXTRACT(field FROM ...), found identifier a"},
+        RejectCase{"ExtractWithoutSource", "SELECT EXTRACT(minute FROM ^) FROM events", kSyntax, 1,
+                   "expected an expression or '*', found ')'"},
+        RejectCase{"ExtractUnclosed", "SELECT EXTRACT(minute FROM a ^b) FROM events", kSyntax, 1,
+                   "expected ) to close EXTRACT(, found identifier b"},
+        RejectCase{"CaseWithoutWhen", "SELECT CASE a ^END FROM events", kSyntax, 3,
+                   "expected WHEN in CASE, found keyword END"},
+        RejectCase{"CaseWithoutThen", "SELECT CASE WHEN a ^END FROM events", kSyntax, 3,
+                   "expected THEN in CASE, found keyword END"},
+        RejectCase{"CaseEmptyWhen", "SELECT CASE WHEN ^THEN 1 END FROM events", kSyntax, 4,
+                   "expected an expression or '*', found keyword THEN"},
+        RejectCase{"CaseEmptyThen", "SELECT CASE WHEN a THEN ^END FROM events", kSyntax, 3,
+                   "expected an expression or '*', found keyword END"},
+        RejectCase{"CaseEmptyElse", "SELECT CASE WHEN a THEN 1 ELSE ^END FROM events", kSyntax, 3,
+                   "expected an expression or '*', found keyword END"},
+        RejectCase{"CaseUnclosed", "SELECT CASE WHEN a THEN 1 ^FROM events", kSyntax, 4,
+                   "expected WHEN, ELSE or END in CASE, found keyword FROM"},
+        RejectCase{"InListEmptyValue", "SELECT a FROM events WHERE a IN (1, ^)", kSyntax, 1,
+                   "expected an expression, found ')'"},
         RejectCase{"MissingLimit", "SELECT a FROM events LIMIT^", kSyntax, 0,
                    "expected a non-negative integer after LIMIT, found end of input"},
         RejectCase{"NegativeLimit", "SELECT a FROM events LIMIT ^-1", kSyntax, 1,
@@ -1152,9 +1243,9 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"OrderWithoutBy", "SELECT a FROM events ORDER ^a", kSyntax, 1,
                    "expected BY after ORDER, found identifier a"},
         RejectCase{"EmptyGroupBy", "SELECT a FROM events GROUP BY^", kSyntax, 0,
-                   "expected a column, found end of input"},
+                   "expected an expression, found end of input"},
         RejectCase{"EmptyOrderBy", "SELECT a FROM events ORDER BY ^LIMIT 1", kSyntax, 5,
-                   "expected a column or an aggregate, found keyword LIMIT"},
+                   "expected an expression, found keyword LIMIT"},
         RejectCase{"GroupByAggregate", "SELECT a FROM events GROUP BY ^COUNT(a)", kSyntax, 5,
                    "aggregate functions are not allowed in GROUP BY"},
         RejectCase{"NullsWithoutFirstOrLast", "SELECT a FROM events ORDER BY a NULLS ^LATE",
@@ -1175,7 +1266,7 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"HavingAfterOrderBy", "SELECT a FROM events ORDER BY a ^HAVING COUNT(*) > 1",
                    kSyntax, 6, "unexpected keyword HAVING; expected LIMIT, OFFSET or the end"},
         RejectCase{"EmptyHaving", "SELECT a FROM events GROUP BY a HAVING^", kSyntax, 0,
-                   "expected an aggregate, a column or a literal, found end of input"},
+                   "expected an expression, found end of input"},
         RejectCase{"DuplicateOffset", "SELECT a FROM events OFFSET 1 ^OFFSET 2", kSyntax, 6,
                    "unexpected keyword OFFSET; expected LIMIT or the end of the query"},
         RejectCase{"ThirdLimit", "SELECT a FROM events LIMIT 1 OFFSET 2 ^LIMIT 3", kSyntax, 5,
@@ -1271,7 +1362,20 @@ TEST(ParserRobustnessTest, MegabyteOfParentheses) {
     auto result = Parse(sql);
     ASSERT_FALSE(result.has_value()) << prefix;
     EXPECT_EQ(result.error().kind, ParseError::Kind::kUnsupported) << prefix;
-    EXPECT_EQ(result.error().span, (SourceSpan{.offset = prefix.size(), .length = 1})) << prefix;
+    // In an expression the parentheses nest up to the depth limit; a query, FROM and LIMIT take
+    // none.
+    const bool expression =
+        !prefix.empty() && !prefix.ends_with("FROM ") && !prefix.ends_with("LIMIT ");
+    const SourceSpan span = result.error().span;
+    EXPECT_EQ(span.length, 1U) << prefix;
+    if (expression) {
+      EXPECT_GT(span.offset, prefix.size()) << prefix;
+      EXPECT_LE(span.offset, prefix.size() + 256) << prefix;
+      EXPECT_TRUE(result.error().message.starts_with("expressions deeper than 256 levels"))
+          << result.error().message;
+    } else {
+      EXPECT_EQ(span.offset, prefix.size()) << prefix;
+    }
   }
   ExpectWellFormedError(std::string(kSize, ')'));
   ExpectWellFormedError("SELECT a FROM t WHERE a = 1" + std::string(kSize, ')'));
@@ -1318,7 +1422,7 @@ TEST(ParserRobustnessTest, EmbeddedNulAndInvalidUtf8) {
   auto string_ok = Parse("SELECT a FROM t WHERE s = 'x\0y'"sv);
   ASSERT_TRUE(string_ok.has_value()) << string_ok.error().message;
   ASSERT_EQ(string_ok->where.size(), 1U);
-  EXPECT_EQ(string_ok->where[0].literal.text, "x\0y"sv);
+  EXPECT_EQ(Cmp(string_ok->where[0]).literal.text, "x\0y"sv);
 
   auto ident_ok = Parse("SELECT \"\xff\xfe\0\" FROM '\xc3\x28.parquet'"sv);
   ASSERT_TRUE(ident_ok.has_value()) << ident_ok.error().message;

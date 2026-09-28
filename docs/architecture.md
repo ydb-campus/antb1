@@ -76,8 +76,9 @@ steps (all single-threaded):
 2. `--table NAME=PATH[,PATH|GLOB]` registers an `io::ParquetTable`: globs expand to a sorted file list, every
    footer is read, schemas must match, and column overrides such as `--clickbench` (EventDate as DATE) apply. No
    data pages are read at this point.
-3. Parse (`sql::Parse`): tokens, then a `SelectStatement` AST with spans. Syntax outside the supported subset is a
-   `kUnsupported` error with the span of the offending token. The engine converts a parse error with
+3. Parse (`sql::Parse`): tokens, then a `SelectStatement` AST with spans; expressions are trees (`sql::Expr`), parsed
+   by precedence climbing with a depth limit. Syntax outside the grammar is a `kUnsupported` error with the span of
+   the offending token. The engine converts a parse error with
    `plan::ToArrowStatus` into an `arrow::Status` that carries a `SqlErrorDetail`.
 4. Bind (`plan::Bind`): table names resolve case-insensitively in the catalog (or `FROM 'path'` opens a file),
    columns resolve against the table's schema, types are checked, and every `WHERE` literal is folded exactly into

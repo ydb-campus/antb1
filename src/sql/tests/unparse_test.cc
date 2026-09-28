@@ -66,7 +66,7 @@ TEST(UnparseTest, CanonicalForms) {
                 .canonical = "SELECT a FROM t WHERE a LIKE '%x''%' AND b NOT LIKE '_'"},
            Case{.input = "SELECT a FROM t WHERE 5 < a AND b != 'it''s' AND DATE '2024-01-31' >= d",
                 .canonical =
-                    "SELECT a FROM t WHERE a > 5 AND b <> 'it''s' AND d <= DATE '2024-01-31'"},
+                    "SELECT a FROM t WHERE 5 < a AND b <> 'it''s' AND DATE '2024-01-31' >= d"},
            Case{.input = "SELECT a FROM t WHERE a = - 1.50 and b >= .5 and c < 1e3 and d > 5.",
                 .canonical = "SELECT a FROM t WHERE a = -1.50 AND b >= .5 AND c < 1e3 AND d > 5."},
            Case{.input = "SELECT a FROM t WHERE a = 007 LIMIT 0000010",
@@ -83,7 +83,7 @@ TEST(UnparseTest, CanonicalForms) {
                 .canonical = "SELECT a FROM t ORDER BY a NULLS FIRST LIMIT 3 OFFSET 2"},
            Case{.input = "select a from t group by a having 1 < count(*) and a not in (2, 3) and "
                          "min(s) like 'x%' order by a",
-                .canonical = "SELECT a FROM t GROUP BY a HAVING COUNT(*) > 1 AND a NOT IN (2, 3) "
+                .canonical = "SELECT a FROM t GROUP BY a HAVING 1 < COUNT(*) AND a NOT IN (2, 3) "
                              "AND MIN(s) LIKE 'x%' ORDER BY a"},
            Case{.input = "select count( distinct a ) from t order by count(distinct a) desc nulls "
                          "last",
@@ -121,13 +121,14 @@ TEST(UnparseTest, RoundTripsCorpus) {
 
 TEST(UnparseTest, RendersFullAst) {
   SelectStatement stmt;
-  stmt.items.push_back(SelectItem{
-      .expr = AggregateCall{.kind = AggKind::kSum, .arg = ColumnRef{.name = "a"}}, .alias = "s"});
+  AggregateCall sum{.kind = AggKind::kSum};
+  sum.arg.emplace(Expr(ColumnRef{.name = "a"}));
+  stmt.items.push_back(SelectItem{.expr = Expr(std::move(sum)), .alias = "s"});
   stmt.from = TableRef{.kind = TableRef::Kind::kName, .name = "t"};
-  stmt.where.push_back(Comparison{
+  stmt.where.push_back(ToExpr(Comparison{
       .column = ColumnRef{.name = "b"},
       .op = CompareOp::kGe,
-      .literal = Literal{.kind = Literal::Kind::kInteger, .negative = true, .text = "5"}});
+      .literal = Literal{.kind = Literal::Kind::kInteger, .negative = true, .text = "5"}}));
   stmt.limit = 10;
   EXPECT_EQ(ToSql(stmt), R"(SELECT SUM(a) AS "s" FROM t WHERE b >= -5 LIMIT 10)");
 }
@@ -147,10 +148,10 @@ TEST(UnparseTest, RendersEveryLiteralKindAndOperator) {
   const std::array<CompareOp, 6> ops{CompareOp::kEq, CompareOp::kNe, CompareOp::kLt,
                                      CompareOp::kLe, CompareOp::kGt, CompareOp::kGe};
   for (std::size_t i = 0; i < ops.size(); ++i) {
-    stmt.where.push_back(
+    stmt.where.push_back(ToExpr(
         Comparison{.column = ColumnRef{.name = "c" + std::to_string(i), .quoted = i % 2 == 1},
                    .op = ops[i],
-                   .literal = literals[i]});
+                   .literal = literals[i]}));
   }
   EXPECT_EQ(ToSql(stmt),
             R"(SELECT * FROM 'x''y.parquet' WHERE c0 = 1 AND "c1" <> -2.5 AND c2 < 'it''s' AND )"
@@ -172,11 +173,11 @@ TEST(UnparseTest, LimitExtremes) {
 
 TEST(EqualIgnoringSpansTest, IgnoresOnlySpans) {
   auto a = Parse("SELECT COUNT(*) AS n, x FROM t WHERE a = 1 AND b < 'z' LIMIT 3");
-  auto b = Parse("select   count( * )  n ,x from t where 1=a and 'z'>b limit 3 ;");
+  auto b = Parse("select   count( * )  n ,x from t where ( a=1 ) and b<'z' limit 3 ;");
   ASSERT_TRUE(a.has_value());
   ASSERT_TRUE(b.has_value());
   EXPECT_NE(a->span, b->span);
-  EXPECT_TRUE(EqualIgnoringSpans(*a, *b));
+  EXPECT_TRUE(EqualIgnoringSpans(*a, *b)) << ToSql(*a) << "\n" << ToSql(*b);
   EXPECT_TRUE(EqualIgnoringSpans(*b, *a));
 }
 
@@ -287,6 +288,93 @@ TEST(AstTest, ToStringNamesKindsAndOperators) {
   EXPECT_EQ(ToString(CompareOp::kLe), "<=");
   EXPECT_EQ(ToString(CompareOp::kGt), ">");
   EXPECT_EQ(ToString(CompareOp::kGe), ">=");
+  EXPECT_EQ(ToString(CompareOp::kLike), "LIKE");
+  EXPECT_EQ(ToString(CompareOp::kNotLike), "NOT LIKE");
+  EXPECT_EQ(ToString(CompareOp::kIn), "IN");
+  EXPECT_EQ(ToString(CompareOp::kNotIn), "NOT IN");
+}
+
+// ToExpr is the inverse of AsComparison / AsHavingComparison, for every operator.
+TEST(AstTest, ToExprInvertsTheNormalizedForms) {
+  const Literal pattern{.kind = Literal::Kind::kString, .negative = false, .text = "a%"};
+  const Literal one{.kind = Literal::Kind::kInteger, .negative = false, .text = "1"};
+  const Literal two{.kind = Literal::Kind::kInteger, .negative = true, .text = "2"};
+  for (const CompareOp op :
+       {CompareOp::kEq, CompareOp::kNe, CompareOp::kLt, CompareOp::kLe, CompareOp::kGt,
+        CompareOp::kGe, CompareOp::kLike, CompareOp::kNotLike, CompareOp::kIn, CompareOp::kNotIn}) {
+    const bool list = op == CompareOp::kIn || op == CompareOp::kNotIn;
+    const bool like = op == CompareOp::kLike || op == CompareOp::kNotLike;
+    const Comparison cmp{.column = ColumnRef{.name = "c"},
+                         .op = op,
+                         .literal = like ? pattern : one,
+                         .list = list ? std::vector<Literal>{one, two} : std::vector<Literal>{}};
+    const auto back = AsComparison(ToExpr(cmp));
+    ASSERT_TRUE(back.has_value()) << ToString(op);
+    EXPECT_EQ(back.value_or(Comparison{}).op, op);
+    EXPECT_EQ(back.value_or(Comparison{}).list.size(), cmp.list.size());
+    AggregateCall count{.kind = AggKind::kCountStar};
+    const HavingComparison having{
+        .operand = count, .op = op, .literal = cmp.literal, .list = cmp.list};
+    const auto having_back = AsHavingComparison(ToExpr(having));
+    ASSERT_TRUE(having_back.has_value()) << ToString(op);
+    EXPECT_TRUE(
+        std::holds_alternative<AggregateCall>(having_back.value_or(HavingComparison{}).operand));
+    EXPECT_EQ(ToSql(ToExpr(having)).substr(0, 8), "COUNT(*)");
+  }
+  // Not simple: two columns, an IN list with a column, an arithmetic operand.
+  auto stmt = Parse("SELECT a FROM t WHERE a = b AND a IN (1, b) AND a + 1 > 2 AND a LIKE b");
+  ASSERT_TRUE(stmt.has_value());
+  for (const Expr& conjunct : stmt->where) {
+    EXPECT_FALSE(AsComparison(conjunct).has_value()) << ToSql(conjunct);
+  }
+}
+
+TEST(AstTest, BoxCopiesDeeply) {
+  Box<Expr> a(Expr(ColumnRef{.name = "a"}));
+  Box<Expr> b(Expr(ColumnRef{.name = "b"}));
+  b = a;
+  std::get<ColumnRef>(*a).name = "changed";
+  EXPECT_EQ(std::get<ColumnRef>(*b).name, "a");
+  const Box<Expr>& self = b;
+  b = self;
+  EXPECT_EQ(std::get<ColumnRef>(*b).name, "a");
+}
+
+// EqualIgnoringSpans tells apart every part of a CASE and of the other expression nodes.
+TEST(EqualIgnoringSpansTest, DetectsDifferencesInExpressions) {
+  const std::string_view base = "CASE a WHEN 1 THEN 'x' ELSE 'y' END";
+  for (const std::string_view other : {
+           "CASE WHEN 1 THEN 'x' ELSE 'y' END"sv,                    // operand
+           "CASE a WHEN 1 THEN 'x' END"sv,                           // else
+           "CASE a WHEN 2 THEN 'x' ELSE 'y' END"sv,                  // when
+           "CASE a WHEN 1 THEN 'z' ELSE 'y' END"sv,                  // then
+           "CASE a WHEN 1 THEN 'x' WHEN 2 THEN 'x' ELSE 'y' END"sv,  // branches
+           "f(a)"sv,                                                 // node kind
+       }) {
+    auto x = Parse("SELECT " + std::string(base) + " FROM t");
+    auto y = Parse("SELECT " + std::string(other) + " FROM t");
+    ASSERT_TRUE(x.has_value() && y.has_value()) << other;
+    EXPECT_FALSE(EqualIgnoringSpans(x->items[0].expr, y->items[0].expr)) << other;
+  }
+  for (const auto& [a, b] : std::to_array<std::pair<std::string_view, std::string_view>>({
+           {"-a", "NOT a"},
+           {"a + b", "a - b"},
+           {"a LIKE 'x'", "a NOT LIKE 'x'"},
+           {"a IN (1)", "a NOT IN (1)"},
+           {"a IN (1)", "a IN (1, 2)"},
+           {"f(a)", "g(a)"},
+           {"f(a)", "\"f\"(a)"},
+           {"f(a)", "f(a, b)"},
+           {"EXTRACT(minute FROM a)", "EXTRACT(hour FROM a)"},
+           {"SUM(a)", "SUM(a + 1)"},
+           {"COUNT(*)", "COUNT(a)"},
+       })) {
+    auto x = Parse("SELECT " + std::string(a) + " FROM t");
+    auto y = Parse("SELECT " + std::string(b) + " FROM t");
+    ASSERT_TRUE(x.has_value() && y.has_value()) << a << " / " << b;
+    EXPECT_FALSE(EqualIgnoringSpans(x->items[0].expr, y->items[0].expr)) << a << " / " << b;
+    EXPECT_TRUE(EqualIgnoringSpans(x->items[0].expr, x->items[0].expr));
+  }
 }
 
 }  // namespace

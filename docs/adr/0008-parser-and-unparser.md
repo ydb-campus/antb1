@@ -20,7 +20,7 @@ Accepted
 - The lexer and a recursive-descent parser are hand-written in `src/sql/`. They return
   `std::expected<SelectStatement, sql::ParseError>`; every AST node carries the source span it came from.
 - Keywords are matched case-insensitively and are not reserved by the lexer. Constructs outside the implemented
-  subset that the parser recognizes (for example `JOIN`, `OR`) produce `kUnsupported` errors with
+  subset that the parser recognizes (for example `JOIN`, window functions) produce `kUnsupported` errors with
   the span of the first offending token.
 - A canonical unparser, `sql::ToSql`, renders an AST as SQL text with upper-case keywords and single spaces, quoting
   identifiers only where the source quoted them.
@@ -37,3 +37,7 @@ Accepted
 - The round-trip property gives the fuzzer a strong oracle without any expected outputs.
 - Every new construct needs code in three places (lexer or parser, AST, unparser), which is acceptable for a small
   grammar; a larger SQL surface in the future may need a new ADR.
+- Update (scalar expressions): the parser accepts the whole expression grammar of
+  [sql-subset.md](../sql-subset.md#grammar) ahead of the engine, and the binder rejects what it does not answer yet
+  with `kUnsupported` at the same kind of span. Expression trees make the parser recursive; an expression depth limit
+  (256 levels) bounds that recursion and every recursive walk of the tree.

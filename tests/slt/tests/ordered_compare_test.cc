@@ -53,7 +53,12 @@ TEST(MakeOrderedQuery, AppendsTheKeysAndDropsLimitAndOffset) {
                 .augmented_sql,
             "SELECT *, b AS \"__antb1_key0\" FROM t WHERE a > 1 ORDER BY b");
   EXPECT_EQ(MakeOrderedQuery("SELECT a FROM t LIMIT 5"), std::nullopt) << "no ORDER BY";
-  EXPECT_EQ(MakeOrderedQuery("SELECT a FROM t ORDER BY a + 1"), std::nullopt) << "not parsed";
+  EXPECT_EQ(MakeOrderedQuery("SELECT a FROM t ORDER BY a || 'x'"), std::nullopt) << "not parsed";
+  EXPECT_EQ(MakeOrderedQuery("SELECT a FROM t ORDER BY a + 1 DESC")
+                .value_or(OrderedQuery{})
+                .augmented_sql,
+            "SELECT a, a + 1 AS \"__antb1_key0\" FROM t ORDER BY a + 1 DESC")
+      << "an expression key";
 }
 
 // The oracle side of `SELECT v FROM t ORDER BY k [LIMIT/OFFSET]` for (v, k) rows in DuckDB's order.

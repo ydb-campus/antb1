@@ -1,0 +1,46 @@
+# Parentheses group expressions (docs/sql-subset.md): a parenthesized column, aggregate argument or
+# condition means the same as without them, and a parenthesized AND is part of the conjunction.
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE (i16 > 0)
+----
+5
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE ((i16 > 0) AND (i32 < 100000)) AND (u LIKE '%a%')
+----
+1
+
+query II nosort
+SELECT SUM((i32)), MAX(((i64))) FROM edge
+----
+54320	9223372036854775807
+
+query I rowsort
+SELECT (id) FROM edge WHERE (((id))) < 3
+----
+0
+1
+2
+
+query II rowsort
+SELECT (OS), COUNT(*) FROM hits_like_nulls WHERE (Title <> '') GROUP BY (OS) HAVING (COUNT(*) > 60)
+----
+10	71
+101	65
+105	62
+113	62
+116	68
+118	63
+3	63
+41	63
+43	61
+46	64
+47	61
+55	65
+65	62
+67	62
+73	62
+77	64
+89	65
+NULL	513
