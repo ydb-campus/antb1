@@ -291,6 +291,11 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT dt + 1 FROM t", kUnsupported, "+", "DATE arithmetic"},
         ErrorCase{"SELECT -u16 FROM t", kUnsupported, "-", "negating a USMALLINT is not supported"},
         ErrorCase{"SELECT h % 2 FROM t", kUnsupported, "%", "'%' in HUGEINT"},
+        ErrorCase{"SELECT SUM(i16) // 2 FROM t", kUnsupported, "//", "'//' in HUGEINT"},
+        ErrorCase{"SELECT SUM(i16) + 1 AS total FROM t GROUP BY total", kBind, "total",
+                  "GROUP BY cannot refer to the aggregate 'total'"},
+        ErrorCase{"SELECT s FROM t GROUP BY s HAVING SUM(i16) + 1 > s", kBind, ">",
+                  "cannot compare"},
         ErrorCase{"SELECT i16 FROM t WHERE i16 + 1 = s", kBind, "=", "cannot compare"},
         ErrorCase{"SELECT i16 FROM t GROUP BY 1 + 1", kUnsupported, "1 + 1",
                   "GROUP BY a constant expression is not supported"},
@@ -704,7 +709,7 @@ TEST(BinderTest, SumOfAnIntegerPlusAConstantIsRewritten) {
 TEST(BinderTest, ExpressionsBelowAndAboveTheAggregation) {
   const Catalog catalog = MakeCatalog();
   auto plan = BindSql(
-      "SELECT i32 - 1 AS k, (i32 - 1) * 2, SUM(i16) * 2 AS s, COUNT(*) FROM t WHERE i16 + 1 > 0 "
+      "SELECT i32 - 1 AS k, (i32 - 1) * 2, SUM(i16) * 2 AS s, COUNT(*) FROM t WHERE i16 // 2 > 0 "
       "GROUP BY i32 - 1 HAVING SUM(i16) + 1 > COUNT(*) ORDER BY -(i32 - 1), s LIMIT 5",
       catalog);
   ASSERT_TRUE(plan.ok()) << plan.status().ToString();
@@ -735,10 +740,10 @@ TEST(BinderTest, ExpressionsBelowAndAboveTheAggregation) {
   ASSERT_EQ(keys.exprs.size(), 1U);
   EXPECT_EQ(keys.exprs[0]->name, "(i32 - 1)");
   const auto& where = std::get<FilterNode>(Nth(*plan, 7));
-  EXPECT_EQ(where.predicates[0].column.value_or(BoundColumn{}).name, "(i16 + 1)");
+  EXPECT_EQ(where.predicates[0].column.value_or(BoundColumn{}).name, "(i16 // 2)");
   const auto& operand = std::get<ComputeNode>(Nth(*plan, 8));
   ASSERT_EQ(operand.exprs.size(), 1U);
-  EXPECT_EQ(operand.exprs[0]->name, "(i16 + 1)");
+  EXPECT_EQ(operand.exprs[0]->name, "(i16 // 2)");
   EXPECT_TRUE(std::holds_alternative<ScanNode>(Nth(*plan, 9)));
 
   // A select item over a non-key column is not grouped.
@@ -762,6 +767,96 @@ TEST(BinderTest, WhereSplitsAroundTheComputation) {
   ASSERT_EQ(scan.predicates.size(), 2U);
   EXPECT_EQ(scan.predicates[0].kind, Predicate::Kind::kCompareColumns);
   EXPECT_EQ(scan.predicates[0].other.value_or(BoundColumn{}).name, "i32");
+}
+
+// DuckDB's constant moving in WHERE: x + c <op> k is x <op> k - c for a signed integer x (and
+// likewise x - c, c + x, c - x, x * c when c divides k), so the arithmetic is never computed;
+// it stops where k or the new constant leaves the type, and never applies to USMALLINT.
+TEST(BinderTest, WhereMovesConstantsLikeDuckDb) {
+  const Catalog catalog = MakeCatalog();
+  struct Case {
+    std::string_view where;
+    std::string_view filter;  // the EXPLAIN line of the only Filter
+  };
+  for (const Case& c : {
+           Case{.where = "i16 + 1 > 0", .filter = "Filter i16 > -1"},
+           Case{.where = "1 + i16 > 0", .filter = "Filter i16 > -1"},
+           Case{.where = "i16 - 1 < 0", .filter = "Filter i16 < 1"},
+           Case{.where = "1 - i16 < 0", .filter = "Filter i16 > 1"},
+           Case{.where = "0 < i16 + (1 + 1)", .filter = "Filter i16 > -2"},
+           Case{.where = "(i16 + 1) * 2 > 0", .filter = "Filter i16 > -1"},
+           Case{.where = "i16 * -2 > 0", .filter = "Filter i16 < 0"},
+           Case{.where = "i16 * 2 = 3", .filter = "Filter FALSE"},
+           Case{.where = "i16 * 2 <> 3", .filter = "Filter i16 IS NOT NULL"},
+           Case{.where = "i16 + 1 >= 32767", .filter = "Filter i16 >= 32766"},
+           Case{.where = "i64 + 1 > 9223372036854775807",
+                .filter = "Filter i64 > 9223372036854775806"},
+           Case{.where = "i16 + 1 > -32768", .filter = "Filter \"(i16 + 1)\" > -32768"},
+           Case{.where = "i16 + 1 > 40000", .filter = "Filter FALSE"},
+           Case{.where = "i16 * 2 > 1", .filter = "Filter \"(i16 * 2)\" > 1"},
+           Case{.where = "i16 * 0 = 0", .filter = "Filter \"(i16 * 0)\" = 0"},
+           Case{.where = "i16 + 1 > 0.5", .filter = "Filter \"(i16 + 1)\" >= 1"},
+           Case{.where = "u16 + 1 > 0", .filter = "Filter \"(u16 + 1)\" > 0"},
+           Case{.where = "d + 1 > 2", .filter = "Filter \"(d + 1)\" > 2"},
+           Case{.where = "i16 // 2 > 0", .filter = "Filter \"(i16 // 2)\" > 0"},
+           Case{.where = "i16 + -(1) > 0", .filter = "Filter i16 > 1"},
+           Case{.where = "i16 + 4 / 2 > 0", .filter = "Filter \"(i16 + (4 / 2))\" > 0"},
+           Case{.where = "i16 + i32 > 0", .filter = "Filter \"(i16 + i32)\" > 0"},
+           Case{.where = "i16 + 1 > 1e0", .filter = "Filter \"(i16 + 1)\" > 1"},
+           Case{.where = "i16 * 2 <= 4", .filter = "Filter i16 <= 2"},
+       }) {
+    const std::string sql = "SELECT COUNT(*) FROM t WHERE " + std::string(c.where);
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    const std::string explain = Explain(*plan);
+    EXPECT_NE(explain.find(std::string(c.filter) + "\n"), std::string::npos) << sql << "\n"
+                                                                             << explain;
+  }
+}
+
+// The sum rewrite follows DuckDB: only without GROUP BY, for SUM(other + c) whatever `other` is
+// (SUM(other) is rewritten again when it can be), counting `other` without its + c layers.
+TEST(BinderTest, SumRewriteScopeLikeDuckDb) {
+  const Catalog catalog = MakeCatalog();
+  auto grouped = BindSql("SELECT SUM(i16 + 1) FROM t GROUP BY i32", catalog);
+  ASSERT_TRUE(grouped.ok()) << grouped.status().ToString();
+  EXPECT_NE(Explain(*grouped).find("SUM(\"(i16 + 1)\")"), std::string::npos) << Explain(*grouped);
+  auto mixed = BindSql("SELECT SUM(i16 + (i16 - i16) + 1), SUM((i16 + 1) + 1) FROM t", catalog);
+  ASSERT_TRUE(mixed.ok()) << mixed.status().ToString();
+  const std::string explain = Explain(*mixed);
+  EXPECT_NE(explain.find("SUM(\"(i16 + (i16 - i16))\")"), std::string::npos) << explain;
+  EXPECT_NE(explain.find("COUNT(i16)"), std::string::npos) << explain;
+  EXPECT_EQ(explain.find("(i16 + 1)\")"), std::string::npos) << "i16 + 1 is never computed\n"
+                                                             << explain;
+  auto having = BindSql("SELECT COUNT(*) FROM t HAVING SUM(i16 + 1) > 0", catalog);
+  ASSERT_TRUE(having.ok()) << having.status().ToString();
+  EXPECT_TRUE(std::holds_alternative<ProjectNode>(Nth(*having, 0)))
+      << "the HAVING column is projected away\n"
+      << Explain(*having);
+}
+
+// Inside ORDER BY and HAVING expressions a select alias is the fallback for a name that is no table
+// column (DuckDB); an alias never refers to itself.
+TEST(BinderTest, AliasesInsideOrderByAndHavingExpressions) {
+  const Catalog catalog = MakeCatalog();
+  for (const std::string_view sql : {
+           "SELECT i16 + 1 AS k FROM t ORDER BY -k",
+           "SELECT i32 AS k, SUM(i16) * 2 AS total FROM t GROUP BY i32 HAVING total + 1 > 0 "
+           "ORDER BY total * k",
+           "SELECT 5 AS five, i16 FROM t ORDER BY i16 * five",
+           "SELECT COUNT(*) AS n FROM t HAVING n * 2 > 1 ORDER BY n + 1",
+       }) {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+  }
+  auto self = BindSql("SELECT k + 1 AS k FROM t ORDER BY -k", catalog);
+  ASSERT_FALSE(self.ok());
+  EXPECT_NE(self.status().message().find("column 'k' does not exist"), std::string::npos);
+  auto table_first = BindSql("SELECT i32 AS i16 FROM t ORDER BY -i16", catalog);
+  ASSERT_TRUE(table_first.ok());
+  EXPECT_NE(Explain(*table_first).find("-(i16)"), std::string::npos)
+      << "inside an expression a table column comes before an alias\n"
+      << Explain(*table_first);
 }
 
 TEST(BinderTest, ParenthesesGroupOnly) {

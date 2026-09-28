@@ -837,6 +837,57 @@ LogicalType CombineIntegers(LogicalType a, LogicalType b) {
   return SignedRank(a) >= SignedRank(b) ? a : b;
 }
 
+bool IsSignedInteger(LogicalType t) {
+  return t == LogicalType::kSmallInt || t == LogicalType::kInteger || t == LogicalType::kBigInt;
+}
+
+// The value of a constant integer expression (integer literals under + - * and unary -), as DuckDB
+// folds it; std::nullopt for anything else or on an overflow.
+std::optional<Int128> ConstantValue(const sql::Expr& expr) {
+  if (const auto* lit = std::get_if<sql::Literal>(&expr)) {
+    if (lit->kind != sql::Literal::Kind::kInteger || IsApproximateNumber(lit->text)) {
+      return std::nullopt;
+    }
+    const auto exact = ParseExactNumber(lit->text, lit->negative);
+    if (!exact.has_value() || exact->huge) {
+      return std::nullopt;
+    }
+    return exact->negative ? -exact->magnitude : exact->magnitude;
+  }
+  if (const auto* unary = std::get_if<sql::UnaryExpr>(&expr);
+      unary != nullptr && unary->op == sql::UnaryOp::kNegate) {
+    const auto v = ConstantValue(*unary->operand);
+    Int128 out = 0;
+    return v.has_value() && !__builtin_sub_overflow(Int128{0}, *v, &out) ? std::optional(out)
+                                                                         : std::nullopt;
+  }
+  const auto* binary = std::get_if<sql::BinaryExpr>(&expr);
+  if (binary == nullptr) {
+    return std::nullopt;
+  }
+  const auto l = ConstantValue(*binary->left);
+  const auto r = ConstantValue(*binary->right);
+  if (!l.has_value() || !r.has_value()) {
+    return std::nullopt;
+  }
+  Int128 out = 0;
+  bool overflow = true;
+  switch (binary->op) {
+    case sql::BinaryOp::kAdd:
+      overflow = __builtin_add_overflow(*l, *r, &out);
+      break;
+    case sql::BinaryOp::kSubtract:
+      overflow = __builtin_sub_overflow(*l, *r, &out);
+      break;
+    case sql::BinaryOp::kMultiply:
+      overflow = __builtin_mul_overflow(*l, *r, &out);
+      break;
+    default:
+      break;
+  }
+  return overflow ? std::nullopt : std::optional(out);
+}
+
 // Whether an integer constant fits an integer type.
 bool Fits(const Expr& constant, LogicalType type) {
   const auto* c = std::get_if<ConstantExpr>(&constant.node);
@@ -1180,56 +1231,46 @@ class Binder {
   // ---- the output scope: the aggregation's keys and aggregates ----
 
   struct SumRewrite {
-    const sql::Expr* core = nullptr;
+    const sql::Expr* other = nullptr;    // SUM(other + constant)
+    const sql::Expr* counted = nullptr;  // `other` without its `+ constant` layers
     Int128 constant = 0;
   };
 
-  // DuckDB's sum rewriter: SUM(core + c1 + c2 ...), the constants integer literals and the sum and
-  // the core of a signed integer type, is SUM(core) + (c1 + c2 ...) * COUNT(core), in HUGEINT: the
-  // additions are never computed, so they never overflow.
+  // DuckDB's sum rewriter, in a query without GROUP BY: SUM(other + c) (either order), c an integer
+  // constant (literals folded) and the sum and `other` of a signed integer type, is
+  // SUM(other) + c * COUNT(other), in HUGEINT: the addition is never computed, so it never
+  // overflows. SUM(other) is rewritten again if it has that shape, and COUNT(other) counts `other`
+  // without its `+ constant` layers (they add no NULL), as DuckDB does.
   arrow::Result<std::optional<SumRewrite>> RewritableSum(const sql::AggregateCall& call) {
-    if (call.kind != sql::AggKind::kSum || call.distinct || !call.arg.has_value()) {
+    if (!stmt_.group_by.empty() || call.kind != sql::AggKind::kSum || call.distinct ||
+        !call.arg.has_value()) {
       return std::nullopt;
     }
-    const auto* top = std::get_if<sql::BinaryExpr>(&**call.arg);
-    if (top == nullptr || top->op != sql::BinaryOp::kAdd) {
+    const auto split =
+        [](const sql::Expr& e) -> std::optional<std::pair<const sql::Expr*, Int128>> {
+      const auto* add = std::get_if<sql::BinaryExpr>(&e);
+      if (add == nullptr || add->op != sql::BinaryOp::kAdd) {
+        return std::nullopt;
+      }
+      if (const auto c = ConstantValue(*add->right); c.has_value() && ReadsColumn(*add->left)) {
+        return std::pair(&*add->left, *c);
+      }
+      if (const auto c = ConstantValue(*add->left); c.has_value() && ReadsColumn(*add->right)) {
+        return std::pair(&*add->right, *c);
+      }
       return std::nullopt;
-    }
-    SumRewrite rewrite;
-    bool simple = true;
-    const auto walk = [&](this const auto& self, const sql::Expr& e) -> void {
-      if (const auto* add = std::get_if<sql::BinaryExpr>(&e);
-          add != nullptr && add->op == sql::BinaryOp::kAdd) {
-        self(*add->left);
-        self(*add->right);
-        return;
-      }
-      if (const auto* lit = std::get_if<sql::Literal>(&e)) {
-        const auto exact =
-            lit->kind == sql::Literal::Kind::kInteger && !IsApproximateNumber(lit->text)
-                ? ParseExactNumber(lit->text, lit->negative)
-                : std::nullopt;
-        const auto sum = exact.has_value() && !exact->huge
-                             ? CheckedAdd(rewrite.constant,
-                                          exact->negative ? -exact->magnitude : exact->magnitude)
-                             : std::nullopt;
-        simple = simple && sum.has_value();
-        rewrite.constant = sum.value_or(0);
-        return;
-      }
-      simple = simple && rewrite.core == nullptr && ReadsColumn(e);
-      rewrite.core = &e;
     };
-    walk(**call.arg);
-    if (!simple || rewrite.core == nullptr) {
+    const auto top = split(**call.arg);
+    if (!top.has_value()) {
       return std::nullopt;
+    }
+    SumRewrite rewrite{.other = top->first, .counted = top->first, .constant = top->second};
+    while (const auto inner = split(*rewrite.counted)) {
+      rewrite.counted = inner->first;
     }
     ARROW_ASSIGN_OR_RAISE(const Typed whole, BindInput(**call.arg));
-    ARROW_ASSIGN_OR_RAISE(const Typed core, BindInput(*rewrite.core));
-    const auto signed_integer = [](LogicalType t) {
-      return t == LogicalType::kSmallInt || t == LogicalType::kInteger || t == LogicalType::kBigInt;
-    };
-    if (!signed_integer(whole.expr->type) || !signed_integer(core.expr->type)) {
+    ARROW_ASSIGN_OR_RAISE(const Typed other, BindInput(*rewrite.other));
+    if (!IsSignedInteger(whole.expr->type) || !IsSignedInteger(other.expr->type)) {
       return std::nullopt;
     }
     return rewrite;
@@ -1242,9 +1283,10 @@ class Binder {
     if (rewrite.has_value()) {
       sql::AggregateCall sum{
           .kind = sql::AggKind::kSum, .arg = {}, .distinct = false, .span = call.span};
-      sum.arg.emplace(*rewrite->core);
-      sql::AggregateCall count = sum;
-      count.kind = sql::AggKind::kCount;
+      sum.arg.emplace(*rewrite->other);
+      sql::AggregateCall count{
+          .kind = sql::AggKind::kCount, .arg = {}, .distinct = false, .span = call.span};
+      count.arg.emplace(*rewrite->counted);
       ARROW_ASSIGN_OR_RAISE(Typed sum_column, AggregateOutput(sum));
       ARROW_ASSIGN_OR_RAISE(Typed count_column, AggregateOutput(count));
       const std::string constant_name = Int128ToString(rewrite->constant);
@@ -1363,6 +1405,15 @@ class Binder {
   arrow::Status BindSelectExpressions();
   // A WHERE or HAVING conjunct as a predicate over the scope's columns.
   arrow::Result<Predicate> BindCondition(const sql::Expr& conjunct, bool having);
+  struct Moved {
+    enum class Outcome : std::uint8_t { kCompare, kFalse, kNotNull };
+    const sql::Expr* operand = nullptr;
+    sql::CompareOp op = sql::CompareOp::kEq;
+    Int128 k = 0;
+    Outcome outcome = Outcome::kCompare;
+  };
+  arrow::Result<std::optional<Moved>> MoveConstants(const sql::Expr& operand, sql::CompareOp op,
+                                                    const sql::Literal& literal);
   arrow::Result<std::optional<Typed>> ResolveHavingName(const sql::ColumnRef& ref);
   arrow::Status BindHaving();
   arrow::Status BindOrderBy();
@@ -1519,6 +1570,98 @@ arrow::Status Binder::BindSelectList() {
   return arrow::Status::OK();
 }
 
+// DuckDB's constant moving in a WHERE comparison `operand <op> k`, k an integer literal: for a
+// signed integer operand x + c, c + x or x - c (c an integer constant, literals folded) the
+// comparison becomes x <op> k - c (or k + c), for c - x it becomes x <mirrored op> c - k, and for
+// x * c (c not 0) x <op> k / c when c divides k (the op mirrored for a negative c), where a
+// non-dividing k makes = FALSE and <> IS NOT NULL. It repeats on x, and stops where k or the new
+// constant is outside the operand's type. So the arithmetic is never computed and never
+// overflows, as in DuckDB. std::nullopt: nothing moved.
+arrow::Result<std::optional<Binder::Moved>> Binder::MoveConstants(const sql::Expr& operand,
+                                                                  sql::CompareOp op,
+                                                                  const sql::Literal& literal) {
+  if (literal.kind != sql::Literal::Kind::kInteger || IsApproximateNumber(literal.text)) {
+    return std::nullopt;
+  }
+  const auto exact = ParseExactNumber(literal.text, literal.negative);
+  if (!exact.has_value() || exact->huge) {
+    return std::nullopt;
+  }
+  Moved cur{.operand = &operand,
+            .op = op,
+            .k = exact->negative ? -exact->magnitude : exact->magnitude,
+            .outcome = Moved::Outcome::kCompare};
+  bool moved = false;
+  const bool ordered = op != sql::CompareOp::kEq && op != sql::CompareOp::kNe;
+  while (const auto* binary = std::get_if<sql::BinaryExpr>(cur.operand)) {
+    ARROW_ASSIGN_OR_RAISE(const Typed whole, BindInput(*cur.operand));
+    const LogicalType type = whole.expr->type;
+    if (!IsSignedInteger(type)) {
+      break;
+    }
+    const IntegerRange range = RangeOf(type);
+    const auto fits = [&](Int128 v) { return v >= range.min && v <= range.max; };
+    if (!fits(cur.k)) {
+      break;
+    }
+    const auto right = ConstantValue(*binary->right);
+    const auto left = ConstantValue(*binary->left);
+    const bool constant_right = right.has_value() && ReadsColumn(*binary->left);
+    const bool constant_left = left.has_value() && ReadsColumn(*binary->right);
+    if (!constant_right && !constant_left) {
+      break;
+    }
+    const sql::Expr* x = constant_right ? &*binary->left : &*binary->right;
+    const Int128 c = constant_right ? *right : *left;
+    Int128 k = 0;
+    sql::CompareOp next = cur.op;
+    bool overflow = false;
+    switch (binary->op) {
+      case sql::BinaryOp::kAdd:
+        overflow = __builtin_sub_overflow(cur.k, c, &k);
+        break;
+      case sql::BinaryOp::kSubtract:
+        if (constant_right) {
+          overflow = __builtin_add_overflow(cur.k, c, &k);
+        } else {
+          overflow = __builtin_sub_overflow(c, cur.k, &k);
+          next = Mirror(cur.op);
+        }
+        break;
+      case sql::BinaryOp::kMultiply:
+        if (c == 0) {
+          overflow = true;  // no move
+        } else if (cur.k % c != 0) {
+          if (ordered) {
+            overflow = true;
+          } else {
+            return Moved{.operand = x,
+                         .op = cur.op,
+                         .k = 0,
+                         .outcome = cur.op == sql::CompareOp::kEq ? Moved::Outcome::kFalse
+                                                                  : Moved::Outcome::kNotNull};
+          }
+        } else {
+          k = cur.k / c;
+          next = c < 0 ? Mirror(cur.op) : cur.op;
+        }
+        break;
+      default:
+        overflow = true;
+        break;
+    }
+    if (overflow || !fits(k)) {
+      break;
+    }
+    cur = Moved{.operand = x, .op = next, .k = k, .outcome = Moved::Outcome::kCompare};
+    moved = true;
+  }
+  if (!moved) {
+    return std::nullopt;
+  }
+  return cur;
+}
+
 // A condition of WHERE (the input scope) or HAVING (the output scope, `having`): an operand
 // <op> literal is folded exactly into the operand's type as for a column; operand <op> operand
 // compares two columns; [NOT] LIKE and [NOT] IN take a literal pattern or list. An operand that is
@@ -1572,11 +1715,31 @@ arrow::Result<Predicate> Binder::BindCondition(const sql::Expr& conjunct, bool h
   const sql::CompareOp op = SqlCompareOp(binary.op);
   const auto* left_literal = std::get_if<sql::Literal>(&*binary.left);
   const auto* right_literal = std::get_if<sql::Literal>(&*binary.right);
-  if (right_literal != nullptr) {
-    return with_literal(*binary.left, op, *right_literal, {}, binary.span);
-  }
-  if (left_literal != nullptr) {
-    return with_literal(*binary.right, Mirror(op), *left_literal, {}, binary.span);
+  if (right_literal != nullptr || left_literal != nullptr) {
+    const sql::Expr& operand_expr = right_literal != nullptr ? *binary.left : *binary.right;
+    const sql::Literal& literal = right_literal != nullptr ? *right_literal : *left_literal;
+    const sql::CompareOp oriented = right_literal != nullptr ? op : Mirror(op);
+    if (!having) {
+      ARROW_ASSIGN_OR_RAISE(const auto moved, MoveConstants(operand_expr, oriented, literal));
+      if (moved.has_value()) {
+        if (moved->outcome != Moved::Outcome::kCompare) {
+          ARROW_ASSIGN_OR_RAISE(const Typed operand, bind(*moved->operand));
+          const bool never = moved->outcome == Moved::Outcome::kFalse;
+          return Predicate{.kind = never ? Predicate::Kind::kFalse : Predicate::Kind::kIsNotNull,
+                           .column = never ? std::nullopt : std::optional(column_of(operand)),
+                           .op = CompareOp::kEq,
+                           .constant = {},
+                           .values = {},
+                           .span = binary.span};
+        }
+        const sql::Literal k{.kind = sql::Literal::Kind::kInteger,
+                             .negative = moved->k < 0,
+                             .text = Int128ToString(moved->k < 0 ? -moved->k : moved->k),
+                             .span = literal.span};
+        return with_literal(*moved->operand, moved->op, k, {}, binary.span);
+      }
+    }
+    return with_literal(operand_expr, oriented, literal, {}, binary.span);
   }
   ARROW_ASSIGN_OR_RAISE(const Typed left, bind(*binary.left));
   ARROW_ASSIGN_OR_RAISE(const Typed right, bind(*binary.right));
@@ -2020,7 +2183,9 @@ LogicalPlan Binder::Assemble() {
       node = Make(AggregateNode{
           .input = std::move(node), .aggregates = select_.aggregates, .span = select_.span});
       above(width);
-      if (!select_.constants.empty() || !select_.exprs.empty() || hidden) {
+      // A Project restores the select list when the Aggregate's output is not it (constants,
+      // expressions, hidden aggregates, or columns computed for HAVING).
+      if (!select_.constants.empty() || !select_.exprs.empty() || hidden || !post_exprs_.empty()) {
         project([](const BoundColumn& column) { return column.index; }, 0);
       }
       break;

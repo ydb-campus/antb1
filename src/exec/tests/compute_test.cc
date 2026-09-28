@@ -13,6 +13,7 @@
 #include <gtest/gtest.h>
 
 #include "antb1/common/int128.h"
+#include "antb1/exec/filter.h"
 #include "antb1/plan/literal.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
@@ -198,6 +199,42 @@ TEST_F(ComputeTest, ComputesOnlyTheSelectedRows) {
   ASSERT_TRUE(table.ok()) << table.status().ToString();
   ASSERT_EQ((*table)->num_rows(), 2);
   EXPECT_EQ((*table)->column(1)->chunk(0)->ToString(), "[\n  2,\n  4\n]");
+}
+
+// Two columns compare in their common type: a BIGINT with a DOUBLE in DOUBLE (a value beyond 2^53
+// rounds, as in DuckDB), a SMALLINT with a USMALLINT in INTEGER; NULL rejects the row.
+TEST_F(ComputeTest, FilterComparesTwoColumns) {
+  const auto ints = Int64s({std::numeric_limits<int64_t>::min(), 1, 3, std::nullopt});
+  const auto doubles = Doubles({0.0, 1.0, 2.5, 1.0});
+  auto schema =
+      arrow::schema({arrow::field("i", arrow::int64()), arrow::field("d", arrow::float64())});
+  const Batch batch{.data = arrow::RecordBatch::Make(schema, 4, {ints, doubles}), .selection = {}};
+  const auto compare = [&](plan::CompareOp op) {
+    return plan::Predicate{.kind = plan::Predicate::Kind::kCompareColumns,
+                           .column = testing::Column(0, "i", LogicalType::kBigInt),
+                           .other = testing::Column(1, "d", LogicalType::kDouble),
+                           .op = op,
+                           .constant = {},
+                           .values = {},
+                           .span = {}};
+  };
+  FilterOperator less(std::make_unique<testing::ScriptedSource>(schema, std::vector<Batch>{batch}),
+                      {compare(plan::CompareOp::kLt)});
+  ExecContext ctx;
+  auto rows = Drain(less, ctx);
+  ASSERT_TRUE(rows.ok()) << rows.status().ToString();
+  EXPECT_EQ(testing::Int64Column(**rows),
+            (std::vector<std::optional<int64_t>>{std::numeric_limits<int64_t>::min()}));
+  FilterOperator equal(std::make_unique<testing::ScriptedSource>(schema, std::vector<Batch>{batch}),
+                       {compare(plan::CompareOp::kEq)});
+  auto same = Drain(equal, ctx);
+  ASSERT_TRUE(same.ok()) << same.status().ToString();
+  EXPECT_EQ(testing::Int64Column(**same), (std::vector<std::optional<int64_t>>{1}));
+  auto bad = compare(plan::CompareOp::kEq);
+  bad.other = testing::Column(5, "nope", LogicalType::kDouble);
+  FilterOperator outside(
+      std::make_unique<testing::ScriptedSource>(schema, std::vector<Batch>{batch}), {bad});
+  EXPECT_TRUE(outside.Open(ctx).IsInvalid());
 }
 
 TEST_F(ComputeTest, ConstantsFillEveryRow) {

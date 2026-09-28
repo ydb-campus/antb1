@@ -103,13 +103,13 @@ TEST(OptimizerTest, CountStarWithWhereReadsOnlyTheFilteredColumns) {
 // A Compute reads only the columns its kept expressions use; an expression nothing above uses is
 // dropped, and a Compute left with none disappears.
 TEST(OptimizerTest, ComputeKeepsOnlyWhatIsUsed) {
-  const LogicalPlan plan = Optimized("SELECT i16 + 1 FROM t WHERE i32 * 2 > 0");
+  const LogicalPlan plan = Optimized("SELECT i16 + 1 FROM t WHERE i32 // 2 > 0");
   EXPECT_EQ(Explain(plan),
             "Output: (i16 + 1):SMALLINT\n"
             "Project \"(i16 + 1)\"\n"
             "  Compute (i16 + 1)\n"
-            "    Filter \"(i32 * 2)\" > 0\n"
-            "      Compute (i32 * 2)\n"
+            "    Filter \"(i32 // 2)\" > 0\n"
+            "      Compute (i32 // 2)\n"
             "        Scan table=t source=fake columns=[i16, i32]\n");
   // The input: Scan(i16, i32) <- Compute(i16 + 1, i32 + 2); only i16 and i16 + 1 are used above.
   const auto catalog = testing::MakeCatalog();

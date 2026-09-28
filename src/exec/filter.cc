@@ -12,6 +12,7 @@
 
 #include <arrow/api.h>
 #include <arrow/compute/api_scalar.h>
+#include <arrow/compute/cast.h>
 #include <arrow/compute/exec.h>
 
 #include "antb1/plan/logical_plan.h"
@@ -123,10 +124,22 @@ arrow::Result<std::shared_ptr<arrow::Array>> FilterOperator::Evaluate(
                             arrow::compute::CallFunction(std::string(KernelName(p.op)),
                                                          {column, constants_[i]}, &kernels));
     } else if (p.kind == plan::Predicate::Kind::kCompareColumns && p.other.has_value()) {
-      // Arrow compares numbers of two types in their common type, as DuckDB does.
-      const arrow::Datum other(batch.column(p.other->index));
+      // Arrow compares numbers of two types in their common type, as DuckDB does; with a DOUBLE
+      // that is DOUBLE, and a BIGINT beyond 2^53 rounds to it (Arrow's implicit cast refuses).
+      arrow::Datum left = column;
+      arrow::Datum right(batch.column(p.other->index));
+      const bool left_double = left.type()->id() == arrow::Type::DOUBLE;
+      const bool right_double = right.type()->id() == arrow::Type::DOUBLE;
+      if (left_double != right_double) {
+        arrow::compute::CastOptions to_double = arrow::compute::CastOptions::Safe(arrow::float64());
+        to_double.allow_float_truncate = true;
+        to_double.allow_decimal_truncate = true;
+        ARROW_ASSIGN_OR_RAISE(
+            (left_double ? right : left),
+            arrow::compute::Cast(left_double ? right : left, to_double, &kernels));
+      }
       ARROW_ASSIGN_OR_RAISE(result, arrow::compute::CallFunction(std::string(KernelName(p.op)),
-                                                                 {column, other}, &kernels));
+                                                                 {left, right}, &kernels));
     } else if (const std::optional<LikePattern>& pattern = patterns_[i]; pattern.has_value()) {
       // kLike, kNotLike
       ARROW_ASSIGN_OR_RAISE(

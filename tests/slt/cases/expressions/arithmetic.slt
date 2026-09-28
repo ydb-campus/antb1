@@ -202,3 +202,53 @@ query II nosort
 SELECT COUNT(*), SUM(ResolutionWidth + 7) - SUM(ResolutionWidth) FROM hits_like
 ----
 10000	70000
+
+# DuckDB's optimizer moves the constant of x + c <op> k (and x - c, c - x, x * c when c divides k)
+# to the literal for a signed integer x: the arithmetic is never computed, so it never overflows.
+query II nosort
+SELECT COUNT(*), SUM(i32 // 1000) FROM edge WHERE i16 + 1 > 0
+----
+6	2147583
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE 1 - i16 < 0 AND (i16 + 1) * 2 > 0 AND i16 * -2 < 0
+----
+4
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i16 * 2 = 3
+----
+0
+
+statement error
+SELECT COUNT(*) FROM edge WHERE i16 * 2 > 1
+
+statement error
+SELECT COUNT(*) FROM edge WHERE u16 + 1 > 0
+
+# The sum rewrite applies without GROUP BY only, to SUM(other + constant) whatever `other` is.
+query I nosort
+SELECT SUM(i16 + (i16 - i16) + 1) FROM edge
+----
+16
+
+statement error
+SELECT SUM(i16 + 1) FROM edge GROUP BY i32
+
+# A computed HAVING operand of a global aggregate; BIGINT against DOUBLE beyond 2^53.
+query I nosort
+SELECT COUNT(*) FROM edge HAVING COUNT(*) + 1 > 1
+----
+12
+
+query I nosort
+SELECT SUM(i16) FROM edge HAVING SUM(i16) * 2 > SUM(i16)
+----
+6
+
+query I rowsort
+SELECT id FROM edge WHERE i64 < d
+----
+0
+10
+3

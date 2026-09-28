@@ -312,8 +312,11 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   and `%` takes the sign of the dividend (`-7 // 2` is -3, `-7 % 2` is -1); both are NULL for a zero divisor, and
   the type's minimum divided by -1 overflows. On DOUBLE, `//` divides (NULL for a zero divisor) and `%` is `fmod`
   (NaN for a zero divisor). NULL operands give NULL. An expression is computed only for the rows that `WHERE` keeps.
-  `SUM(x + c)`, for a signed integer `x` and integer literals `c`, is `SUM(x) + c * COUNT(x)` in HUGEINT, as DuckDB's
-  optimizer rewrites it: `x + c` is never computed, so it never overflows.
+  Two rewrites of DuckDB's optimizer are reproduced, so that an overflow fails the same queries: without `GROUP BY`,
+  `SUM(x + c)` (a signed integer `x`, an integer constant `c`) is `SUM(x) + c * COUNT(x)` in HUGEINT; and in `WHERE`,
+  `x + c <op> k`, `x - c <op> k`, `c - x <op> k` and `x * c <op> k` (a signed integer `x`, integer constants, `c`
+  dividing `k` for `*`) compare `x` with a moved constant, repeatedly, while `k` and the new constant fit the type.
+  The arithmetic is then never computed. Divergence D14 lists what still differs.
 - HAVING: its conditions filter the rows of the aggregation (the groups, or the one row of an aggregate query
   without `GROUP BY`, which it may filter out) before `ORDER BY`, `LIMIT` and `OFFSET`, with the NULL, folding and
   operator rules of `WHERE`: a NULL aggregate (`SUM` of only NULLs) or NULL key rejects the row.
@@ -394,6 +397,7 @@ compare against DuckDB, so an unregistered difference is a bug.
 | D11 | FLOAT columns | read as DOUBLE (widened exactly): results of FLOAT columns are DOUBLE and print with double precision; `WHERE` compares like DuckDB (see Binding); arithmetic on them, and comparing them with other expressions, is unsupported (exit code 4) | keeps FLOAT (`MIN`, `MAX` and projections return FLOAT) | the random generator never references a FLOAT column (`ColumnOf` in `tests/slt/runner/query_gen.cc`, `harness.LoadGenTables.SkipsFloatColumns`); `tests/slt/cases/where/float.slt` selects only other columns, and `engine.SessionTest.FloatColumnsCompareLikeDuckDb` pins that results stay DOUBLE |
 | D12 | Long numbers against DOUBLE | a number compared with a DOUBLE column is the correctly rounded nearest double | converts a DECIMAL literal (at most 38 digits) or a HUGEINT literal to DOUBLE in two steps when its digits exceed 2^53, which can be one ulp off (`9007199254740993.5`) | the generator only writes decimals of at most 2^53 in their digits with at most 22 decimals, where both round the same (`ExactDecimalDouble` in `tests/slt/runner/query_gen.cc`) |
 | D13 | Decimals with many digits against integer columns | compared exactly | compares in a DECIMAL whose width is capped at 38 digits: when the column type's digits plus the literal's decimals exceed 38, a column value with too many integer digits fails the query with a conversion error (`i16 = 1.0000000000000000000000000000000000001` over the value -32768); likewise an integer `SUM` (HUGEINT, 38 digits) in `HAVING` against any decimal fails once the sum has more digits than 38 minus the literal's decimals | the `.slt` records and the generator keep literals short enough; `plan.Binder/FoldThroughBinderTest.*` covers the exact folding |
+| D14 | Overflows DuckDB's optimizer does not avoid | a comparison that folds to always-true or never-true at bind time (a literal outside the operand's type, as in `smallint_col + 1 > 40000`) computes nothing, so it cannot overflow | computes the operand and fails on an overflow ("Overflow in addition of INT16") | the random generator never writes arithmetic that can overflow; `plan.BinderTest.WhereMovesConstantsLikeDuckDb` pins which comparisons move their constants |
 
 ## ClickBench status
 
