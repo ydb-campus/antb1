@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790607046828,
+  "lastUpdate": 1790612795553,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -1332,6 +1332,78 @@ window.BENCHMARK_DATA = {
             "value": 15.0742670638298,
             "unit": "ms/iter",
             "extra": "iterations: 47\ncpu: 15.072331680851061 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "062d58155c42234714057ed76d62418f18bde1a0",
+          "message": "feat(plan,exec): timestamps (#36)\n\n## Summary\n\nThis is PR 5, the last of the approved plan for scalar expressions. It\nadds a computed TIMESTAMP type and the timestamp functions `toDateTime`,\n`EXTRACT` and `date_trunc`. ClickBench goes from 41 to **43 of 43**\n(Q18, Q42); the maintainer signed off on the ratchet change.\n\n**`toDateTime(t)`** is ClickBench's own DuckDB macro `epoch_ms(t *\n1000)`, taken from `duckdb-parquet/create.sql` at the pinned commit\n`5a56398`.\n- The binder binds it as exactly that expression: `t * 1000` is typed\nand checked as arithmetic, so a SMALLINT `t` above 32 overflows as in\nDuckDB.\n- `epoch_ms` fails outside DuckDB's TIMESTAMP range (290309-12-22 BC to\n294247 AD).\n- The test oracle defines the same one-line macro.\n\n**`EXTRACT(field FROM x)` and `date_trunc('unit', x)`** take a TIMESTAMP\nor a DATE.\n- Fields: year, month, day, hour, minute, second. Units: year, quarter,\nmonth, week, day, hour, minute, second (case-insensitive).\n- EXTRACT gives the civil field in astronomical years; date_trunc\nfloors, before 1970 too, with weeks starting on Monday.\n- Both are computed in 64-bit calendar arithmetic over the whole range.\nArrow's temporal kernels keep the year in 16 bits and wrap past year\n32767.\n- An infinite DATE gives NULL (EXTRACT) or stays infinite (date_trunc).\nA result outside the range fails, as in DuckDB.\n- Names match DuckDB: `todatetime(x)`, `main.date_part('minute', x)`,\n`date_trunc('Hour', x)`.\n\n**TIMESTAMP** is `timestamp[us]` and exists only as a computed value; a\nParquet timestamp column stays unsupported.\n- It sorts, groups and aggregates (MIN, MAX, COUNT, COUNT(DISTINCT)).\n- It prints as DuckDB prints it: a trimmed fraction, `(BC)`, ±infinity.\n- Unsupported (exit code 4): TIMESTAMP literals and comparisons with\nliterals, DATE vs TIMESTAMP, TIMESTAMP arithmetic, and mixed CASE\nvalues.\n- D6 now also covers `AVG` of a TIMESTAMP.\n\n**Harness:**\n- The oracle macro, a TIMESTAMP reader and `CanonicalTimestamp`.\n- The generator writes `toDateTime`, `EXTRACT` and `date_trunc` over\ninteger columns whose values times 1000 fit their type, and over DATE\ncolumns. New feature: `timestamps`.\n- `tests/slt/cases/expressions/timestamps.slt` (expected results written\nby DuckDB).\n- Metamorphic relations: EXTRACT(minute) is `(t // 60) % 60`, days per\ndate_trunc('day') equal distinct `t // 86400`, and date_trunc keys are\ninvariant across batch sizes and files.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full          # lint, ci, asan, tidy, coverage (floors kept), fuzz-smoke, ci-gcc\nexit 0                         (final tree; plan branch coverage 89.90%, floor 89.5%)\n$ ANTB1_DIFF_COUNT=20000 pixi run diff-random\nDIFF: PASS seed=3051161949 queries=20000 failed=0 unsupported=0\n$ pixi run test-data           # hits_0, ratchet 43 of 43\n100% tests passed out of 6\n$ ANTB1_HITS_FILES=\"$HOME/.cache/antb1/clickbench/full/hits_*.parquet\" pixi run test-data   # all 100 files\n100% tests passed out of 6\n$ antb1 bench (release build, all 100 files, 2 tries, lukewarm): Q18 27.8 s, 27.2 s; Q42 2.2 s, 2.2 s\n```\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change: binder (types, names, desugaring, errors),\nplan (structure, renumbering and names of condition, CASE and function\nnodes), exec (epoch range, fields and floors incl. large years, BC, DATE\ninfinities), engine formatting, harness canonical text, `.slt`,\nmetamorphic relations, the generator\n- [x] Docs updated: `docs/sql-subset.md` (what works, binding, types,\nsemantics, D6, ClickBench table: all pass), `docs/architecture.md`, ADR\n0012\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006). The oracle's `toDateTime`\nmacro is ClickBench setup, not data\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: `tests/data/clickbench_status.json` (+18, +42) was\napproved by @hor911\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code wrote the change\nand the tests, and ran the verification. The `reviewer` agent found:\n  - Arrow's temporal kernels wrapping years past 32767;\n  - an asymmetric lower bound of DuckDB's TIMESTAMP range;\n  - out-of-range and infinite DATE inputs.\n\nAll are fixed by computing fields and floors in 64-bit calendar\narithmetic, with tests. A second pass compared over 100,000 values\nacross the whole range with DuckDB.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-09-28T19:24:19+03:00",
+          "tree_id": "45ce919212446dd2ba5de00e86793f47c940a199",
+          "url": "https://github.com/ydb-campus/antb1/commit/062d58155c42234714057ed76d62418f18bde1a0"
+        },
+        "date": 1790612794878,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4275.195731483753,
+            "unit": "ns/iter",
+            "extra": "iterations: 166381\ncpu: 4275.09597249686 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84059.5344186637,
+            "unit": "ns/iter",
+            "extra": "iterations: 7801\ncpu: 84045.20599923088 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 221774.1715732826,
+            "unit": "ns/iter",
+            "extra": "iterations: 3159\ncpu: 221703.80816714145 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 437635.5235109664,
+            "unit": "ns/iter",
+            "extra": "iterations: 1595\ncpu: 437615.11410658294 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 401078.01776504633,
+            "unit": "ns/iter",
+            "extra": "iterations: 1745\ncpu: 401065.7667621777 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2122798.012195122,
+            "unit": "ns/iter",
+            "extra": "iterations: 328\ncpu: 2122714.8475609752 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 188.1339699999991,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 188.1164019999999 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.324408000000087,
+            "unit": "ms/iter",
+            "extra": "iterations: 49\ncpu: 14.323975142857142 ms\nthreads: 1"
           }
         ]
       }
