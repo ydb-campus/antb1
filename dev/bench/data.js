@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790567462467,
+  "lastUpdate": 1790583113856,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -1044,6 +1044,78 @@ window.BENCHMARK_DATA = {
             "value": 15.136970782608811,
             "unit": "ms/iter",
             "extra": "iterations: 46\ncpu: 15.134891695652186 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1f116c0bd3faa4a658ae9a30f178c182959c4783",
+          "message": "feat(plan,exec): arithmetic expressions (#32)\n\n## Summary\n\nThis is PR 2 of the approved plan for scalar expressions. It adds\narithmetic: `+ - * / // %` and unary `-`, in the select list, aggregate\narguments, `GROUP BY`, `HAVING`, `ORDER BY` and `WHERE`. ClickBench goes\nfrom 36 to **38 of 43** (Q29, Q35); the maintainer signed off on the\nratchet change.\n\n**Typing** follows DuckDB 1.5.5:\n- An integer literal that fits the other operand's type takes that type\n(`smallint + 1` is SMALLINT).\n- Two integer types give the wider one; USMALLINT with SMALLINT gives\nBIGINT.\n- DOUBLE wins, and `/` is always DOUBLE.\n- The names are DuckDB's: `(a + 1)`, `sum((a + 1))`.\n- Unsupported (exit code 4): DECIMAL arithmetic (a decimal literal with\nan integer), DATE arithmetic, negating a USMALLINT, `//` and `%` of\nHUGEINT, and arithmetic on FLOAT columns (D11).\n\n**Semantics:**\n- Integer `+ - *` and negation compute in the result type, and an\noverflow is an execution error, as in DuckDB. They use Arrow's checked\nkernels.\n- `/` divides in DOUBLE (`x / 0` is ±inf).\n- `//` truncates and `%` takes the sign of the dividend. Both are NULL\nfor a zero divisor. They use own loops, as does HUGEINT arithmetic,\nsince Arrow's decimal kernels widen past 38 digits.\n- Two optimizer rewrites of DuckDB are reproduced, so that an overflow\nfails exactly the queries DuckDB fails:\n- `SUM(x + c)` without `GROUP BY` becomes `SUM(x) + c * COUNT(x)` in\nHUGEINT.\n- In `WHERE`, `x ± c <op> k`, `c - x <op> k` and `x * c <op> k` (when c\ndivides k) move the constant to the literal. This applies for signed\nintegers while the constants fit the type.\n- Divergence D14 records the one remaining difference: a comparison\nantb1 folds to never-true answers where DuckDB overflows.\n\n**Plan** (ADR 0012):\n- A bound `plan::Expr` tree and a new `Compute` node, which appends\ncomputed columns.\n- The node sits in three places: `WHERE` operands before the filter on\nthem; aggregate arguments and `GROUP BY` expressions after that filter;\nselect, `HAVING` and `ORDER BY` expressions above the aggregation.\n- A select or `ORDER BY` expression equal to a `GROUP BY` expression is\nthat key.\n- Inside `ORDER BY` and `HAVING` expressions a select alias is the\nfallback after table columns, as in DuckDB.\n- `WHERE`/`HAVING` can compare two operands, with a new column-to-column\npredicate.\n- The optimizer prunes unused computed columns and moves `Limit` below\n`Compute`.\n\n**Harness:**\n- The random generator writes arithmetic that cannot overflow, using\neach integer column's data range across every file.\n- New `.slt` cases in `tests/slt/cases/expressions/arithmetic.slt`\n(written by DuckDB), and metamorphic relations (the sum rewrite,\nshifting a `WHERE` literal, expression keys across batch sizes and\nfiles).\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full          # lint, ci, asan, tidy, coverage (floors kept), fuzz-smoke, ci-gcc\nexit 0\n$ ANTB1_DIFF_COUNT=20000 pixi run diff-random      (run three times over the PR's commits)\nDIFF: PASS seed=2569736335 queries=20000 failed=0 unsupported=0\n$ pixi run test-data           # hits_0, ratchet with Q29 and Q35\n100% tests passed out of 6\n$ ANTB1_HITS_FILES=\"$HOME/.cache/antb1/clickbench/full/hits_*.parquet\" pixi run test-data   # all 100 files\n100% tests passed out of 6     (16:53, peak RSS 22 GB)\n$ antb1 bench (release build, all 100 files, 2 tries): Q29 0.56 s, Q35 8.6 s\n```\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change: evaluator and column-to-column filter\n(exec), typing, rewrites, constant moving, scopes, aliases and errors\n(binder), Compute pruning and Limit (optimizer), FLOAT columns (engine),\n`.slt`, metamorphic relations, the generator\n- [x] Docs updated: `docs/sql-subset.md` (binding, semantics, D9, D11,\nD14, ClickBench table), `docs/architecture.md`, ADR 0012\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: `tests/data/clickbench_status.json` (+29, +35) was\napproved by @hor911\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code wrote the change\nand the tests, and ran the verification. The `reviewer` agent found two\nP0s (a global aggregate with a computed HAVING operand; BIGINT against\nDOUBLE beyond 2^53) and two divergences from DuckDB's optimizer (the\nscope of the sum rewrite; constant moving in WHERE). All are fixed with\ntests (second commit).\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-09-28T11:09:36+03:00",
+          "tree_id": "24f52adca8e1b15db84c8f9a5d5b66f6a8db3060",
+          "url": "https://github.com/ydb-campus/antb1/commit/1f116c0bd3faa4a658ae9a30f178c182959c4783"
+        },
+        "date": 1790583113243,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4175.3450004180195,
+            "unit": "ns/iter",
+            "extra": "iterations: 167394\ncpu: 4173.962555408199 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 85016.41661333673,
+            "unit": "ns/iter",
+            "extra": "iterations: 7813\ncpu: 84979.30231665172 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222038.38922345956,
+            "unit": "ns/iter",
+            "extra": "iterations: 3155\ncpu: 221944.75435816176 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 440246.1915829071,
+            "unit": "ns/iter",
+            "extra": "iterations: 1592\ncpu: 440083.73429648246 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 348180.7220288398,
+            "unit": "ns/iter",
+            "extra": "iterations: 2011\ncpu: 348081.3635007462 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2112912.466463482,
+            "unit": "ns/iter",
+            "extra": "iterations: 328\ncpu: 2112406.256097562 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 197.33842533333737,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 197.31232800000006 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.364028142856986,
+            "unit": "ms/iter",
+            "extra": "iterations: 49\ncpu: 14.362616755102037 ms\nthreads: 1"
           }
         ]
       }
