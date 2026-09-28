@@ -66,6 +66,10 @@ arrow::Status FilterOperator::Open(ExecContext& ctx) {
       return arrow::Status::Invalid("filter predicate on a column outside its input");
     }
     const int column = p.column->index;
+    if (p.kind == plan::Predicate::Kind::kCompareColumns &&
+        (!p.other.has_value() || p.other->index < 0 || p.other->index >= schema.num_fields())) {
+      return arrow::Status::Invalid("filter compares a column outside its input");
+    }
     std::shared_ptr<arrow::Scalar> constant;
     if (p.kind == plan::Predicate::Kind::kCompare) {
       ARROW_ASSIGN_OR_RAISE(constant, plan::ToArrowScalar(p.constant));
@@ -118,6 +122,11 @@ arrow::Result<std::shared_ptr<arrow::Array>> FilterOperator::Evaluate(
       ARROW_ASSIGN_OR_RAISE(result,
                             arrow::compute::CallFunction(std::string(KernelName(p.op)),
                                                          {column, constants_[i]}, &kernels));
+    } else if (p.kind == plan::Predicate::Kind::kCompareColumns && p.other.has_value()) {
+      // Arrow compares numbers of two types in their common type, as DuckDB does.
+      const arrow::Datum other(batch.column(p.other->index));
+      ARROW_ASSIGN_OR_RAISE(result, arrow::compute::CallFunction(std::string(KernelName(p.op)),
+                                                                 {column, other}, &kernels));
     } else if (const std::optional<LikePattern>& pattern = patterns_[i]; pattern.has_value()) {
       // kLike, kNotLike
       ARROW_ASSIGN_OR_RAISE(

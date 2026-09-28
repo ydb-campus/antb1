@@ -289,7 +289,7 @@ TEST_F(SessionTest, UnsupportedAndBindErrorsKeepTheirKinds) {
   ASSERT_TRUE(session->RegisterParquet("t", {path_}).ok());
   for (const char* sql :
        {"SELECT COUNT(*) FROM t JOIN u USING (AdvEngineID)",
-        "SELECT AdvEngineID FROM t ORDER BY AdvEngineID + 1",
+        "SELECT AdvEngineID FROM t ORDER BY lower(AdvEngineID)",
         "SELECT SUM(DISTINCT AdvEngineID) FROM t", "SELECT DISTINCT AdvEngineID FROM t"}) {
     auto result = session->Execute(sql);
     const auto detail = plan::GetSqlError(result.status());

@@ -39,7 +39,7 @@ Responsibilities:
   about one row group of the scanned columns rather than every chunk read so far) and converts the batches to the
   engine view: UTF8 and large strings to binary without UTF-8 validation, FLOAT to DOUBLE, a USMALLINT or INTEGER
   column read as DATE to date32. Every Parquet exception and read failure becomes an `IOError` here.
-- `exec`: pull-based, batch-at-a-time physical operators (`TableScan`, `Filter`, `Project`, `ScalarAggregate`,
+- `exec`: pull-based, batch-at-a-time physical operators (`TableScan`, `Filter`, `Compute`, `Project`, `ScalarAggregate`,
   `GroupAggregate`, `Sort`, `Limit`, `RowCount`; see [Execution](#execution)), the exact aggregate states (scalar
   and grouped), the row comparator and sort buffer, the physical planner and `Drain`. It scans only through
   `plan::Table` and never depends on `io`.
@@ -84,7 +84,7 @@ steps (all single-threaded):
    columns resolve against the table's schema, types are checked, and every `WHERE` literal is folded exactly into
    its column's type ([Binding](sql-subset.md#binding)); `HAVING` binds the same way against the aggregation's output
    and becomes a `Filter` above it. The result is a `plan::LogicalPlan`: a tree of immutable
-   nodes in a `std::variant` (`Scan`, `Filter`, `Project`, `Aggregate`, `GroupAggregate`, `Sort`, `Limit`,
+   nodes in a `std::variant` (`Scan`, `Filter`, `Compute`, `Project`, `Aggregate`, `GroupAggregate`, `Sort`, `Limit`,
    `RowCount`) plus the output columns.
 5. Optimize (`plan::Optimize`): `COUNT(*)` without `WHERE` to `RowCount`, `Limit` below `Project`, and projection
    pruning (a `Scan` reads only the fields used above it).
@@ -107,7 +107,8 @@ into data. Everything runs on one thread, reading files and row groups in order.
 | Operator | Logical node | Does |
 | --- | --- | --- |
 | `TableScanOperator` | `Scan` | `plan::Table::Scan` of the referenced fields only, in batches of `ExecContext::batch_size` rows (64Ki) |
-| `FilterOperator` | `Filter` | evaluates every comparison with Arrow's comparison kernels (`equal`, `less`, ...) and `[NOT] LIKE` with `exec::LikePattern` (DuckDB's rules; patterns without `_` match by their literal segments), `[NOT] IN` as `equal` per value combined with `or_kleene` (and `invert` for NOT IN), combines them with `and_kleene`, turns NULL into false and attaches the result as the selection; skips batches without a selected row; a folded `FALSE` ends the stream without reading |
+| `FilterOperator` | `Filter` | evaluates every comparison with Arrow's comparison kernels (`equal`, `less`, ...) and `[NOT] LIKE` with `exec::LikePattern` (DuckDB's rules; patterns without `_` match by their literal segments), `[NOT] IN` as `equal` per value combined with `or_kleene` (and `invert` for NOT IN), compares two columns with the same kernels in their common type, combines them with `and_kleene`, turns NULL into false and attaches the result as the selection; skips batches without a selected row; a folded `FALSE` ends the stream without reading |
+| `ComputeOperator` | `Compute` | materializes the selected rows and appends one array per expression (`exec::EvaluateExpr`): Arrow's checked kernels for integer `+ - *` and negation in the result type (an overflow is an execution error), `divide` in DOUBLE, own loops for `//`, `%` and HUGEINT arithmetic ([ADR 0012](adr/0012-scalar-expressions.md)) |
 | `ProjectOperator` | `Project` | selects columns and materializes the selected rows with Arrow's `Filter` kernel; a constant item becomes an array of its value per batch (`MakeArrayFromScalar`) |
 | `ScalarAggregateOperator` | `Aggregate` | feeds every batch and its selection to one `AggregateState` per call, then emits one row |
 | `GroupAggregateOperator` | `GroupAggregate` | materializes the selected rows, maps their keys to group ids with Arrow's `Grouper` (DOUBLE keys normalized first), feeds one `GroupedAggregateState` per call; after the input, emits one row per group: the keys as first seen, then the aggregates; without keys (`GROUP BY` of constants only) every row is in one group |

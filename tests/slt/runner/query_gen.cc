@@ -239,6 +239,47 @@ void AddSamples(GenColumn& c, const arrow::Array& a) {
   }
 }
 
+// Widens the column's data range by the non-NULL values of `a` (an integer array).
+void AddRange(GenColumn& c, const arrow::Array& a) {
+  const auto add = [&c](int64_t v) {
+    c.data_min = std::min(c.data_min.value_or(v), v);
+    c.data_max = std::max(c.data_max.value_or(v), v);
+  };
+  const auto each = [&]<class ArrayType> {
+    const auto& values = static_cast<const ArrayType&>(a);
+    for (int64_t i = 0; i < values.length(); ++i) {
+      if (values.IsValid(i)) {
+        add(static_cast<int64_t>(values.Value(i)));
+      }
+    }
+  };
+  switch (a.type_id()) {
+    case arrow::Type::INT8:
+      each.template operator()<arrow::Int8Array>();
+      break;
+    case arrow::Type::UINT8:
+      each.template operator()<arrow::UInt8Array>();
+      break;
+    case arrow::Type::INT16:
+      each.template operator()<arrow::Int16Array>();
+      break;
+    case arrow::Type::UINT16:
+      each.template operator()<arrow::UInt16Array>();
+      break;
+    case arrow::Type::INT32:
+      each.template operator()<arrow::Int32Array>();
+      break;
+    case arrow::Type::UINT32:
+      each.template operator()<arrow::UInt32Array>();
+      break;
+    case arrow::Type::INT64:
+      each.template operator()<arrow::Int64Array>();
+      break;
+    default:
+      break;
+  }
+}
+
 // ---- query building ----
 
 enum class Shape : std::uint8_t { kAggregates, kColumns, kStar };
@@ -633,8 +674,17 @@ class Builder {
         }
         constant_positions_.push_back(emitted);
       } else if (shape == Shape::kColumns) {
-        used_.Add(Feature::kColumns);
-        Column(*rng_.Pick(cols));
+        const GenColumn& c = *rng_.Pick(cols);
+        std::optional<bool> exact;
+        if (rng_.Percent(20)) {
+          exact = Arithmetic(c);
+        }
+        if (exact.has_value()) {
+          orderable = *exact;
+        } else {
+          used_.Add(Feature::kColumns);
+          Column(c);
+        }
       } else {
         const Agg agg = rng_.Pick(aggs);
         const GenColumn* arg =
@@ -642,7 +692,11 @@ class Builder {
                 ? nullptr
                 : rng_.Pick(agg == Agg::kSum || agg == Agg::kAvg ? numeric : cols);
         orderable = Orderable(agg, arg);
-        Aggregate(agg, arg);
+        const bool arithmetic = arg != nullptr && rng_.Percent(20);
+        const std::optional<bool> exact = Aggregate(agg, arg, arithmetic);
+        if (exact.has_value() && !*exact) {
+          orderable = false;
+        }
         aggregate_emitted_ = true;
         call.emplace(agg, arg);
       }
@@ -675,19 +729,28 @@ class Builder {
     tokens_.push_back({.kind = Token::Kind::kLiteral, .text = std::to_string(position)});
   }
 
-  void Aggregate(Agg agg, const GenColumn* arg) {
+  // `arithmetic`: the argument is an arithmetic expression of the column, when one fits; returns
+  // whether its values are exact then (std::nullopt: the plain column).
+  std::optional<bool> Aggregate(Agg agg, const GenColumn* arg, bool arithmetic = false) {
     used_.Add(AggFeature(agg));
     Keyword(AggName(agg));
     Symbol("(");
+    std::optional<bool> exact;
     if (arg == nullptr) {
       Symbol("*");
     } else {
       if (agg == Agg::kCountDistinct) {
         Keyword("DISTINCT");
       }
-      Column(*arg);
+      if (arithmetic) {
+        exact = Arithmetic(*arg);
+      }
+      if (!exact.has_value()) {
+        Column(*arg);
+      }
     }
     Symbol(")");
+    return exact;
   }
 
   // Whether the aggregate's values compare exactly in both engines (an I or T result): a sort key
@@ -926,6 +989,16 @@ class Builder {
         continue;
       }
       const std::string_view op = rng_.Pick(kOps);
+      if (IsNumeric(c.kind) && rng_.Percent(15)) {
+        if (const std::optional<bool> exact = Arithmetic(c)) {
+          // An exact result takes the column's literals; a DOUBLE one those of a DOUBLE column.
+          Literal lit = MakeLiteral(*exact ? c : GenColumn{.kind = ValueKind::kDouble});
+          used_.Add(lit.features);
+          Symbol(op);
+          tokens_.insert(tokens_.end(), lit.tokens.begin(), lit.tokens.end());
+          continue;
+        }
+      }
       Literal lit = MakeLiteral(c);
       used_.Add(lit.features);
       if (allowed_.Has(Feature::kLiteralFirst) && rng_.Percent(20)) {
@@ -1121,6 +1194,74 @@ class Builder {
     tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.name});
   }
 
+  // A numeric column with a constant under an operator that both engines compute alike and
+  // without an overflow (the column's data range decides): c + k, c - k, c * k, c / k (DOUBLE),
+  // c // k, c % k, -c. Returns whether the result is exact (I values; / and DOUBLE give R), or
+  // std::nullopt when none fits (nothing written).
+  std::optional<bool> Arithmetic(const GenColumn& c) {
+    if (!allowed_.Has(Feature::kArithmetic)) {
+      return std::nullopt;
+    }
+    struct Choice {
+      std::string_view op;
+      std::string literal;  // empty: the unary minus
+      bool exact = true;
+    };
+    std::vector<Choice> choices;
+    const bool integers = allowed_.Has(Feature::kIntegerLiteral);
+    if (c.kind == ValueKind::kDouble) {
+      if (allowed_.Has(Feature::kDecimalLiteral)) {
+        choices.push_back({.op = "+", .literal = "1.5", .exact = false});
+        choices.push_back({.op = "-", .literal = "0.25", .exact = false});
+      }
+      if (integers) {
+        for (const std::string_view op : {"*", "/", "//", "%"}) {
+          choices.push_back({.op = op, .literal = op == "%" ? "3" : "4", .exact = false});
+        }
+      }
+      choices.push_back({.op = "-", .literal = "", .exact = false});
+    } else if (c.kind == ValueKind::kInteger && integers) {
+      for (const int64_t k : {2, 3, 7}) {
+        choices.push_back({.op = "//", .literal = std::to_string(k), .exact = true});
+        choices.push_back({.op = "%", .literal = std::to_string(k), .exact = true});
+      }
+      choices.push_back({.op = "/", .literal = "4", .exact = false});
+      if (c.data_min.has_value() && c.data_max.has_value()) {
+        for (const int64_t k : {1, 7, 100}) {
+          if (*c.data_max <= c.max - k) {
+            choices.push_back({.op = "+", .literal = std::to_string(k), .exact = true});
+          }
+          if (*c.data_min >= c.min + k) {
+            choices.push_back({.op = "-", .literal = std::to_string(k), .exact = true});
+          }
+        }
+        for (const int64_t k : {2, 3}) {
+          if (*c.data_max <= c.max / k && *c.data_min >= c.min / k) {
+            choices.push_back({.op = "*", .literal = std::to_string(k), .exact = true});
+          }
+        }
+        if (c.min < 0 && *c.data_min > c.min) {  // not USMALLINT: DuckDB wraps its negation
+          choices.push_back({.op = "-", .literal = "", .exact = true});
+        }
+      }
+    }
+    if (choices.empty()) {
+      return std::nullopt;
+    }
+    const Choice& pick = rng_.Pick(choices);
+    used_.Add(Feature::kArithmetic);
+    if (pick.literal.empty()) {
+      Symbol("-");
+      Column(c);
+      return pick.exact;
+    }
+    Column(c);
+    Symbol(pick.op);
+    used_.Add(pick.literal.contains('.') ? Feature::kDecimalLiteral : Feature::kIntegerLiteral);
+    tokens_.push_back({.kind = Token::Kind::kLiteral, .text = pick.literal});
+    return pick.exact;
+  }
+
   std::string RandomCase(std::string_view text, bool all_lower) {
     std::string out(text);
     for (char& ch : out) {
@@ -1224,6 +1365,7 @@ std::expected<std::vector<GenTable>, std::string> LoadGenTables(
       return std::unexpected(data.error());
     }
     const arrow::Table& table = **data;
+    std::vector<int> fields;  // per column of t: its field in the file
     for (int i = 0; i < table.num_columns(); ++i) {
       auto column = ColumnOf(*table.schema()->field(i), def.clickbench);
       if (!column.has_value()) {
@@ -1234,6 +1376,22 @@ std::expected<std::vector<GenTable>, std::string> LoadGenTables(
         AddSamples(*column, *table.column(i)->chunk(0));
       }
       t.columns.push_back(std::move(*column));
+      fields.push_back(i);
+    }
+    // The integer columns' value ranges over every file (all files have the first one's schema).
+    for (const auto& f : def.files) {
+      auto file = f == def.files.front() ? data : ReadFile(f);
+      if (!file) {
+        return std::unexpected(file.error());
+      }
+      for (std::size_t k = 0; k < t.columns.size(); ++k) {
+        if (t.columns[k].kind != ValueKind::kInteger || fields[k] >= (*file)->num_columns()) {
+          continue;
+        }
+        for (const auto& chunk : (*file)->column(fields[k])->chunks()) {
+          AddRange(t.columns[k], *chunk);
+        }
+      }
     }
     out.push_back(std::move(t));
   }

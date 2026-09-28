@@ -1,15 +1,20 @@
 #include "antb1/plan/logical_plan.h"
 
+#include <bit>
+#include <cstddef>
 #include <cstdint>
 #include <format>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <variant>
+#include <vector>
 
 #include <arrow/api.h>
 
+#include "antb1/common/check.h"
 #include "antb1/common/int128.h"
 #include "antb1/common/narrow.h"
 #include "antb1/plan/literal.h"
@@ -48,6 +53,7 @@ arrow::Result<std::shared_ptr<arrow::Scalar>> HugeIntScalar(Int128 value) {
 struct NodeNameOf {
   std::string_view operator()(const ScanNode& /*node*/) const { return "Scan"; }
   std::string_view operator()(const FilterNode& /*node*/) const { return "Filter"; }
+  std::string_view operator()(const ComputeNode& /*node*/) const { return "Compute"; }
   std::string_view operator()(const ProjectNode& /*node*/) const { return "Project"; }
   std::string_view operator()(const AggregateNode& /*node*/) const { return "Aggregate"; }
   std::string_view operator()(const GroupAggregateNode& /*node*/) const { return "GroupAggregate"; }
@@ -59,6 +65,7 @@ struct NodeNameOf {
 struct InputOfNode {
   const LogicalNodePtr* operator()(const ScanNode& /*node*/) const { return nullptr; }
   const LogicalNodePtr* operator()(const FilterNode& node) const { return &node.input; }
+  const LogicalNodePtr* operator()(const ComputeNode& node) const { return &node.input; }
   const LogicalNodePtr* operator()(const ProjectNode& node) const { return &node.input; }
   const LogicalNodePtr* operator()(const AggregateNode& node) const { return &node.input; }
   const LogicalNodePtr* operator()(const GroupAggregateNode& node) const { return &node.input; }
@@ -101,6 +108,87 @@ std::string_view ToString(CompareOp op) {
       return ">=";
   }
   return "?";
+}
+
+std::string_view ToString(ArithOp op) {
+  switch (op) {
+    case ArithOp::kAdd:
+      return "+";
+    case ArithOp::kSubtract:
+      return "-";
+    case ArithOp::kMultiply:
+      return "*";
+    case ArithOp::kDivide:
+      return "/";
+    case ArithOp::kIntegerDivide:
+      return "//";
+    case ArithOp::kModulo:
+      return "%";
+  }
+  return "?";
+}
+
+namespace {
+
+bool SameConstant(const Constant& a, const Constant& b) {
+  if (a.type != b.type || a.value.index() != b.value.index()) {
+    return false;
+  }
+  if (const auto* d = std::get_if<double>(&a.value)) {
+    // Bitwise, so that NaN matches itself and -0.0 is not 0.0.
+    return std::bit_cast<std::uint64_t>(*d) ==
+           std::bit_cast<std::uint64_t>(std::get<double>(b.value));
+  }
+  return a.value == b.value;
+}
+
+struct SameNode {
+  const Expr& other;
+  bool operator()(const ColumnExpr& a) const {
+    return std::get<ColumnExpr>(other.node).index == a.index;
+  }
+  bool operator()(const ConstantExpr& a) const {
+    return SameConstant(a.value, std::get<ConstantExpr>(other.node).value);
+  }
+  bool operator()(const ArithExpr& a) const {
+    const auto& b = std::get<ArithExpr>(other.node);
+    return a.op == b.op && SameExpr(*a.left, *b.left) && SameExpr(*a.right, *b.right);
+  }
+  bool operator()(const NegateExpr& a) const {
+    return SameExpr(*a.operand, *std::get<NegateExpr>(other.node).operand);
+  }
+};
+
+}  // namespace
+
+bool SameExpr(const Expr& a, const Expr& b) {
+  return a.type == b.type && a.node.index() == b.node.index() &&
+         std::visit(SameNode{.other = b}, a.node);
+}
+
+ExprPtr Renumber(const ExprPtr& expr, const std::vector<int>& remap) {
+  Expr out = *expr;
+  if (auto* column = std::get_if<ColumnExpr>(&out.node)) {
+    column->index = remap.at(Narrow<std::size_t>(column->index));
+    ANTB1_CHECK(column->index >= 0);
+  } else if (auto* arith = std::get_if<ArithExpr>(&out.node)) {
+    arith->left = Renumber(arith->left, remap);
+    arith->right = Renumber(arith->right, remap);
+  } else if (auto* negate = std::get_if<NegateExpr>(&out.node)) {
+    negate->operand = Renumber(negate->operand, remap);
+  }
+  return std::make_shared<const Expr>(std::move(out));
+}
+
+void CollectColumns(const Expr& expr, std::vector<int>& out) {
+  if (const auto* column = std::get_if<ColumnExpr>(&expr.node)) {
+    out.push_back(column->index);
+  } else if (const auto* arith = std::get_if<ArithExpr>(&expr.node)) {
+    CollectColumns(*arith->left, out);
+    CollectColumns(*arith->right, out);
+  } else if (const auto* negate = std::get_if<NegateExpr>(&expr.node)) {
+    CollectColumns(*negate->operand, out);
+  }
 }
 
 std::string_view ToString(AggKind kind) {

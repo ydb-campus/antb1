@@ -237,31 +237,23 @@ INSTANTIATE_TEST_SUITE_P(
     ::testing::Values(
         ErrorCase{R"(SELECT "lower"(url) FROM t)", kUnsupported, R"("lower")",
                   "function lower() is not supported"},
-        ErrorCase{"SELECT a FROM t GROUP BY a + 1", kUnsupported, "+",
-                  "arithmetic operator '+' is not supported"},
         ErrorCase{"SELECT a FROM t GROUP BY year(d)", kUnsupported, "year",
                   "function year() is not supported (only COUNT, SUM, AVG, MIN, MAX)"},
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING COUNT(*) > 1 OR a = 2", kUnsupported, "OR",
                   "OR is not supported"},
-        ErrorCase{"SELECT a FROM t GROUP BY a HAVING COUNT(*) > SUM(b)", kUnsupported, "SUM(b)",
-                  "HAVING comparisons of two columns or aggregates are not supported"},
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING 1 < 2", kUnsupported, "2",
                   "comparisons between two literals are not supported"},
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING COUNT(*)", kUnsupported, "COUNT(*)",
                   "HAVING conditions other than comparisons (aggregate or column <op> literal) are "
                   "not supported"},
-        ErrorCase{"SELECT a FROM t GROUP BY a HAVING COUNT(*) + 1 > 2", kUnsupported, "+",
-                  "arithmetic operator '+' is not supported"},
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING MIN(s) LIKE MAX(s)", kUnsupported, "MAX(s)",
                   "LIKE with a column or an aggregate as the pattern is not supported"},
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING a IN (1, COUNT(*))", kUnsupported, "COUNT(*)",
-                  "columns and aggregates in an IN list are not supported"},
+                  "only literals are supported in an IN list"},
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING 'x' LIKE 'y'", kUnsupported, "'x'",
                   "LIKE needs a column or an aggregate on the left"},
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING 1 IN (1)", kUnsupported, "1",
                   "IN needs a column or an aggregate on the left"},
-        ErrorCase{"SELECT a FROM t ORDER BY a * 2 DESC", kUnsupported, "*",
-                  "arithmetic operator '*' is not supported"},
         ErrorCase{"SELECT a FROM t WHERE url LIKE title", kUnsupported, "title",
                   "LIKE with a column or an aggregate as the pattern is not supported"},
         ErrorCase{"SELECT a FROM t WHERE 'x' LIKE url", kUnsupported, "'x'",
@@ -269,13 +261,13 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT url LIKE '%x%' FROM t", kUnsupported, "LIKE",
                   "LIKE is only supported in WHERE and HAVING"},
         ErrorCase{"SELECT a FROM t WHERE region IN (1, b)", kUnsupported, "b",
-                  "columns and aggregates in an IN list are not supported"},
+                  "only literals are supported in an IN list"},
         ErrorCase{"SELECT a FROM t WHERE 1 IN (a)", kUnsupported, "1",
                   "IN needs a column on the left"},
         ErrorCase{"SELECT region IN ('a') FROM t", kUnsupported, "IN",
                   "IN is only supported in WHERE and HAVING"},
-        ErrorCase{"SELECT a FROM t WHERE region IN (1 + 2)", kUnsupported, "+",
-                  "arithmetic operator '+' is not supported"},
+        ErrorCase{"SELECT a FROM t WHERE region IN (1 + 2)", kUnsupported, "1 + 2",
+                  "only literals are supported in an IN list"},
         ErrorCase{"SELECT CASE WHEN a = 1 THEN 1 END FROM t", kUnsupported, "CASE",
                   "CASE is not supported"},
         ErrorCase{"SELECT a FROM t WHERE a = CASE WHEN b THEN 1 END", kUnsupported, "CASE",
@@ -289,30 +281,23 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT a FROM t WHERE NOT a = 1", kUnsupported, "NOT", "NOT is not supported"},
         ErrorCase{"SELECT a FROM t WHERE a = 1 AND NOT b = 2", kUnsupported, "NOT",
                   "NOT is not supported"},
-        ErrorCase{"SELECT a + 1 FROM t", kUnsupported, "+",
-                  "arithmetic operator '+' is not supported"},
-        ErrorCase{"SELECT a - 1 FROM t", kUnsupported, "-",
-                  "arithmetic operator '-' is not supported"},
-        ErrorCase{"SELECT amount * 2 FROM t", kUnsupported, "*",
-                  "arithmetic operator '*' is not supported"},
-        ErrorCase{"SELECT SUM(a) / COUNT(a) FROM t", kUnsupported, "/",
-                  "arithmetic operator '/' is not supported"},
-        ErrorCase{"SELECT a % 2 FROM t", kUnsupported, "%",
-                  "arithmetic operator '%' is not supported"},
-        ErrorCase{"SELECT a FROM t WHERE a + 1 = 2", kUnsupported, "+",
-                  "arithmetic operator '+' is not supported"},
-        ErrorCase{"SELECT a FROM t WHERE a = 1 * 2", kUnsupported, "*",
-                  "arithmetic operator '*' is not supported"},
-        ErrorCase{"SELECT a FROM t WHERE 1 - 1 = a", kUnsupported, "-",
-                  "arithmetic operator '-' is not supported"},
-        ErrorCase{"SELECT SUM(a * 2) FROM t", kUnsupported, "*",
-                  "arithmetic operator '*' is not supported"},
-        ErrorCase{"SELECT a FROM t WHERE a = -b", kUnsupported, "-",
-                  "arithmetic operator '-' is not supported"},
-        ErrorCase{"SELECT a FROM t WHERE a = - -1", kUnsupported, "-",
-                  "arithmetic operator '-' is not supported"},
-        ErrorCase{"SELECT -a FROM t", kUnsupported, "-",
-                  "arithmetic operator '-' is not supported"},
+        ErrorCase{"SELECT a FROM t WHERE 1 - 1 = a", kUnsupported, "1 - 1",
+                  "a constant expression in a comparison is not supported"},
+        // Arithmetic: numbers only, no DECIMAL, no DATE arithmetic, no // or % in HUGEINT.
+        ErrorCase{"SELECT s + 1 FROM t", kBind, "+",
+                  "arithmetic operator '+' needs numbers, but 's' is VARCHAR"},
+        ErrorCase{"SELECT -s FROM t", kBind, "-", "needs a number, but 's' is VARCHAR"},
+        ErrorCase{"SELECT i16 * 1.5 FROM t", kUnsupported, "*", "DECIMAL"},
+        ErrorCase{"SELECT dt + 1 FROM t", kUnsupported, "+", "DATE arithmetic"},
+        ErrorCase{"SELECT -u16 FROM t", kUnsupported, "-", "negating a USMALLINT is not supported"},
+        ErrorCase{"SELECT h % 2 FROM t", kUnsupported, "%", "'%' in HUGEINT"},
+        ErrorCase{"SELECT i16 FROM t WHERE i16 + 1 = s", kBind, "=", "cannot compare"},
+        ErrorCase{"SELECT i16 FROM t GROUP BY 1 + 1", kUnsupported, "1 + 1",
+                  "GROUP BY a constant expression is not supported"},
+        ErrorCase{"SELECT i16 FROM t ORDER BY 1 + 1", kUnsupported, "1 + 1",
+                  "ORDER BY a constant expression is not supported"},
+        ErrorCase{"SELECT SUM(1 + 2) FROM t", kUnsupported, "1 + 2",
+                  "constant aggregate arguments are not supported"},
         ErrorCase{"SELECT lower(url) FROM t", kUnsupported, "lower",
                   "function lower() is not supported (only COUNT, SUM, AVG, MIN, MAX)"},
         ErrorCase{"SELECT a FROM t WHERE length(url) > 5", kUnsupported, "length",
@@ -331,8 +316,6 @@ INSTANTIATE_TEST_SUITE_P(
                   "comparisons are only supported in WHERE and HAVING"},
         ErrorCase{"SELECT a AND b FROM t", kUnsupported, "AND",
                   "AND is only supported between conditions of WHERE and HAVING"},
-        ErrorCase{"SELECT a FROM t WHERE a = b", kUnsupported, "b",
-                  "comparisons between two columns are not supported"},
         ErrorCase{"SELECT a FROM t WHERE 1 = 1", kUnsupported, "1",
                   "comparisons between two literals are not supported"},
         ErrorCase{"SELECT a FROM t WHERE flag", kUnsupported, "flag",
@@ -638,6 +621,149 @@ TEST(BinderTest, CountDistinct) {
 
 // Parentheses group without changing anything: a parenthesized column, aggregate argument or
 // condition binds as without them, and a parenthesized AND is flattened into the conjunction.
+// Arithmetic takes DuckDB's result types: an integer literal that fits the other operand's type
+// takes that type, two integer types the wider one (USMALLINT with SMALLINT: BIGINT), DOUBLE wins,
+// and / is always DOUBLE. Names are DuckDB's, fully parenthesized.
+TEST(BinderTest, ArithmeticTypesAndNamesLikeDuckDb) {
+  const Catalog catalog = MakeCatalog();
+  struct Case {
+    std::string_view expr;
+    LogicalType type;
+    std::string_view name;
+  };
+  for (const Case& c : {
+           Case{.expr = "i16 + 1", .type = LogicalType::kSmallInt, .name = "(i16 + 1)"},
+           Case{.expr = "i16 + 40000", .type = LogicalType::kInteger, .name = "(i16 + 40000)"},
+           Case{.expr = "i16 + -32768", .type = LogicalType::kSmallInt, .name = "(i16 + -32768)"},
+           Case{.expr = "i16 - i32", .type = LogicalType::kInteger, .name = "(i16 - i32)"},
+           Case{.expr = "i32 * i64", .type = LogicalType::kBigInt, .name = "(i32 * i64)"},
+           Case{.expr = "u16 + i16", .type = LogicalType::kBigInt, .name = "(u16 + i16)"},
+           Case{.expr = "u16 + i32", .type = LogicalType::kInteger, .name = "(u16 + i32)"},
+           Case{.expr = "u16 * 2", .type = LogicalType::kUSmallInt, .name = "(u16 * 2)"},
+           Case{.expr = "u16 + -1", .type = LogicalType::kInteger, .name = "(u16 + -1)"},
+           Case{.expr = "i16 / 2", .type = LogicalType::kDouble, .name = "(i16 / 2)"},
+           Case{.expr = "i16 / 1.5", .type = LogicalType::kDouble, .name = "(i16 / 1.5)"},
+           Case{.expr = "i16 // 1.5", .type = LogicalType::kDouble, .name = "(i16 // 1.5)"},
+           Case{.expr = "i64 // 2", .type = LogicalType::kBigInt, .name = "(i64 // 2)"},
+           Case{.expr = "i16 % 2", .type = LogicalType::kSmallInt, .name = "(i16 % 2)"},
+           Case{.expr = "d + 1.5", .type = LogicalType::kDouble, .name = "(d + 1.5)"},
+           Case{.expr = "i64 + d", .type = LogicalType::kDouble, .name = "(i64 + d)"},
+           Case{.expr = "i32 + 1e3", .type = LogicalType::kDouble, .name = "(i32 + 1e3)"},
+           Case{.expr = "-i16", .type = LogicalType::kSmallInt, .name = "-(i16)"},
+           Case{.expr = "-(i16 + 1) * 2",
+                .type = LogicalType::kSmallInt,
+                .name = "(-((i16 + 1)) * 2)"},
+           Case{.expr = "1 + 2", .type = LogicalType::kInteger, .name = "(1 + 2)"},
+           Case{.expr = "h + 1", .type = LogicalType::kHugeInt, .name = "(h + 1)"},
+           Case{.expr = "\"Mixed Case\" + 007",
+                .type = LogicalType::kInteger,
+                .name = "(\"Mixed Case\" + 7)"},
+       }) {
+    const std::string sql = "SELECT " + std::string(c.expr) + " FROM t";
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    ASSERT_EQ(plan->output.size(), 1U);
+    EXPECT_EQ(plan->output[0].type, c.type) << sql;
+    EXPECT_EQ(plan->output[0].name, c.name) << sql;
+  }
+}
+
+// DuckDB's sum rewriter: SUM(x + c) is SUM(x) + c * COUNT(x) in HUGEINT for a signed integer x, so
+// x + c is never computed (and never overflows); SUM(x - c), SUM(x * c) and a DOUBLE x are not.
+TEST(BinderTest, SumOfAnIntegerPlusAConstantIsRewritten) {
+  const Catalog catalog = MakeCatalog();
+  auto plan =
+      BindSql("SELECT SUM(i16 + 1), SUM(2 + (i16 + 3)), SUM(i16 - 1), SUM(d + 1) FROM t", catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  EXPECT_EQ(plan->output[0].name, "sum((i16 + 1))");
+  EXPECT_EQ(plan->output[0].type, LogicalType::kHugeInt);
+  EXPECT_EQ(plan->output[1].type, LogicalType::kHugeInt);
+  const auto& project = std::get<ProjectNode>(Nth(*plan, 0));
+  ASSERT_EQ(project.columns.size(), 4U);
+  const auto& post = std::get<ComputeNode>(Nth(*plan, 1));
+  ASSERT_EQ(post.exprs.size(), 2U) << "one expression per rewritten SUM";
+  EXPECT_EQ(post.exprs[0]->name, "sum((i16 + 1))");
+  EXPECT_EQ(post.exprs[1]->name, "sum((2 + (i16 + 3)))");
+  const auto& aggregate = std::get<AggregateNode>(Nth(*plan, 2));
+  // SUM(i16 - 1) and SUM(d + 1) (the select's), then SUM(i16) and COUNT(i16) (hidden, shared by
+  // both rewrites).
+  ASSERT_EQ(aggregate.aggregates.size(), 4U);
+  EXPECT_EQ(aggregate.aggregates[0].arg.value_or(BoundColumn{}).name, "(i16 - 1)");
+  EXPECT_EQ(aggregate.aggregates[2].kind, AggKind::kSum);
+  EXPECT_EQ(aggregate.aggregates[2].arg.value_or(BoundColumn{}).name, "i16");
+  EXPECT_EQ(aggregate.aggregates[3].kind, AggKind::kCount);
+  const auto& input = std::get<ComputeNode>(Nth(*plan, 3));
+  ASSERT_EQ(input.exprs.size(), 2U);  // i16 - 1 and d + 1 are computed
+  EXPECT_EQ(input.exprs[0]->name, "(i16 - 1)");
+  EXPECT_EQ(input.exprs[1]->name, "(d + 1)");
+}
+
+// GROUP BY an expression computes it below the aggregation; a select or ORDER BY expression equal
+// to a key is that key, others over keys and aggregates are computed above the aggregation, as are
+// HAVING and ORDER BY expressions.
+TEST(BinderTest, ExpressionsBelowAndAboveTheAggregation) {
+  const Catalog catalog = MakeCatalog();
+  auto plan = BindSql(
+      "SELECT i32 - 1 AS k, (i32 - 1) * 2, SUM(i16) * 2 AS s, COUNT(*) FROM t WHERE i16 + 1 > 0 "
+      "GROUP BY i32 - 1 HAVING SUM(i16) + 1 > COUNT(*) ORDER BY -(i32 - 1), s LIMIT 5",
+      catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  EXPECT_EQ(plan->output[0].type, LogicalType::kInteger);
+  EXPECT_EQ(plan->output[1].name, "((i32 - 1) * 2)");
+  EXPECT_EQ(plan->output[2].type, LogicalType::kHugeInt);
+  // Limit <- Project <- Sort <- Filter (HAVING) <- Compute <- GroupAggregate <- Compute (the key)
+  // <- Filter (WHERE) <- Compute (its operand) <- Scan.
+  EXPECT_TRUE(std::holds_alternative<LimitNode>(Nth(*plan, 0)));
+  EXPECT_TRUE(std::holds_alternative<ProjectNode>(Nth(*plan, 1)));
+  const auto& sort = std::get<SortNode>(Nth(*plan, 2));
+  ASSERT_EQ(sort.keys.size(), 2U);
+  const auto& having = std::get<FilterNode>(Nth(*plan, 3));
+  ASSERT_EQ(having.predicates.size(), 1U);
+  EXPECT_EQ(having.predicates[0].kind, Predicate::Kind::kCompareColumns);
+  const auto& post = std::get<ComputeNode>(Nth(*plan, 4));
+  std::vector<std::string> names;
+  names.reserve(post.exprs.size());
+  for (const auto& e : post.exprs) {
+    names.push_back(e->name);
+  }
+  EXPECT_EQ(names, (std::vector<std::string>{"((i32 - 1) * 2)", "(sum(i16) * 2)", "(sum(i16) + 1)",
+                                             "-((i32 - 1))"}));
+  const auto& group = std::get<GroupAggregateNode>(Nth(*plan, 5));
+  ASSERT_EQ(group.keys.size(), 1U);
+  EXPECT_EQ(group.keys[0].name, "(i32 - 1)");
+  const auto& keys = std::get<ComputeNode>(Nth(*plan, 6));
+  ASSERT_EQ(keys.exprs.size(), 1U);
+  EXPECT_EQ(keys.exprs[0]->name, "(i32 - 1)");
+  const auto& where = std::get<FilterNode>(Nth(*plan, 7));
+  EXPECT_EQ(where.predicates[0].column.value_or(BoundColumn{}).name, "(i16 + 1)");
+  const auto& operand = std::get<ComputeNode>(Nth(*plan, 8));
+  ASSERT_EQ(operand.exprs.size(), 1U);
+  EXPECT_EQ(operand.exprs[0]->name, "(i16 + 1)");
+  EXPECT_TRUE(std::holds_alternative<ScanNode>(Nth(*plan, 9)));
+
+  // A select item over a non-key column is not grouped.
+  auto ungrouped = BindSql("SELECT i16 + 1, COUNT(*) FROM t GROUP BY i32", catalog);
+  ASSERT_FALSE(ungrouped.ok());
+  EXPECT_EQ(SpanText("SELECT i16 + 1, COUNT(*) FROM t GROUP BY i32", ungrouped.status()), "i16");
+}
+
+// WHERE conditions over table columns only (two columns compared too) filter before any
+// computation; conditions over expressions filter after it.
+TEST(BinderTest, WhereSplitsAroundTheComputation) {
+  const Catalog catalog = MakeCatalog();
+  auto plan = BindSql("SELECT i16 FROM t WHERE i16 < i32 AND 5 < i16 * 2 AND i16 = 1", catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  const auto& computed = std::get<FilterNode>(Nth(*plan, 1));
+  ASSERT_EQ(computed.predicates.size(), 1U);
+  EXPECT_EQ(computed.predicates[0].op, CompareOp::kGt) << "5 < e is e > 5";
+  EXPECT_EQ(computed.predicates[0].constant.type, LogicalType::kSmallInt);
+  EXPECT_TRUE(std::holds_alternative<ComputeNode>(Nth(*plan, 2)));
+  const auto& scan = std::get<FilterNode>(Nth(*plan, 3));
+  ASSERT_EQ(scan.predicates.size(), 2U);
+  EXPECT_EQ(scan.predicates[0].kind, Predicate::Kind::kCompareColumns);
+  EXPECT_EQ(scan.predicates[0].other.value_or(BoundColumn{}).name, "i32");
+}
+
 TEST(BinderTest, ParenthesesGroupOnly) {
   const Catalog catalog = MakeCatalog();
   auto plain = BindSql(

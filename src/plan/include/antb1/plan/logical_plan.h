@@ -18,7 +18,8 @@
 
 // Logical plan: a tree of immutable nodes (docs/architecture.md). The binder builds
 //
-//   [Limit] <- Aggregate | Project <- [Sort] <- [GroupAggregate] <- [Filter] <- Scan (every field)
+//   [Limit] <- [Project] <- [Sort] <- [Filter] <- [Compute] <- [Aggregate | GroupAggregate]
+//     <- [Filter] <- [Compute] <- [Filter] <- Scan (every field)
 //
 // and plan::Optimize rewrites it (Limit below Project, projection pruning, COUNT(*) -> RowCount).
 // New operators are added as new node structs in the LogicalNode variant; every std::visit over it
@@ -63,6 +64,59 @@ std::string ToString(const Constant& constant);
 // The constant as an Arrow scalar of type ToArrow(constant.type).
 arrow::Result<std::shared_ptr<arrow::Scalar>> ToArrowScalar(const Constant& constant);
 
+enum class ArithOp : std::uint8_t {
+  kAdd,
+  kSubtract,
+  kMultiply,
+  kDivide,         // / : DOUBLE division
+  kIntegerDivide,  // // : truncating integer division (on DOUBLE: division)
+  kModulo,         // % : the remainder, with the sign of the dividend
+};
+
+// "+", "-", "*", "/", "//", "%".
+std::string_view ToString(ArithOp op);
+
+struct Expr;
+using ExprPtr = std::shared_ptr<const Expr>;
+
+// A column of the input of the node that evaluates the expression.
+struct ColumnExpr {
+  int index = 0;
+};
+
+struct ConstantExpr {
+  Constant value;  // of the expression's type
+};
+
+// left <op> right, both of the expression's type (the executor casts the operands to it), except
+// kDivide, which computes in DOUBLE whatever the operand types.
+struct ArithExpr {
+  ArithOp op = ArithOp::kAdd;
+  ExprPtr left;
+  ExprPtr right;
+};
+
+struct NegateExpr {
+  ExprPtr operand;
+};
+
+// A scalar expression, typed as DuckDB types it (docs/sql-subset.md). Integer arithmetic is exact
+// in its type: an overflow is an execution error, as in DuckDB.
+struct Expr {
+  std::variant<ColumnExpr, ConstantExpr, ArithExpr, NegateExpr> node;
+  LogicalType type = LogicalType::kBigInt;
+  std::string name;  // DuckDB's result name of the expression, e.g. (a + 1)
+};
+
+// Whether two expressions compute the same values: the same structure, ignoring names.
+bool SameExpr(const Expr& a, const Expr& b);
+
+// The expression with every column index i replaced by remap[i] (which must be >= 0).
+ExprPtr Renumber(const ExprPtr& expr, const std::vector<int>& remap);
+
+// Every input column the expression reads.
+void CollectColumns(const Expr& expr, std::vector<int>& out);
+
 // A column of a node's input.
 struct BoundColumn {
   int index = 0;     // position in the input node's output columns
@@ -73,18 +127,20 @@ struct BoundColumn {
 // One comparison of the WHERE conjunction after exact literal folding (docs/sql-subset.md).
 struct Predicate {
   enum class Kind : std::uint8_t {
-    kCompare,    // column <op> constant
-    kLike,       // column LIKE constant (a VARCHAR column and pattern; docs/sql-subset.md)
-    kNotLike,    // column NOT LIKE constant
-    kIn,         // column IN (values): column = v1 OR column = v2 ... (Kleene)
-    kNotIn,      // column NOT IN (values): NOT (column IN (values))
-    kIsNotNull,  // folded: true for every non-NULL value (NULL still rejects the row)
-    kFalse,      // folded: true for no row
+    kCompare,         // column <op> constant
+    kCompareColumns,  // column <op> other (comparable types, compared as DuckDB compares them)
+    kLike,            // column LIKE constant (a VARCHAR column and pattern; docs/sql-subset.md)
+    kNotLike,         // column NOT LIKE constant
+    kIn,              // column IN (values): column = v1 OR column = v2 ... (Kleene)
+    kNotIn,           // column NOT IN (values): NOT (column IN (values))
+    kIsNotNull,       // folded: true for every non-NULL value (NULL still rejects the row)
+    kFalse,           // folded: true for no row
   };
 
   Kind kind = Kind::kCompare;
   std::optional<BoundColumn> column;  // empty for kFalse
-  CompareOp op = CompareOp::kEq;      // kCompare only
+  std::optional<BoundColumn> other;   // kCompareColumns only
+  CompareOp op = CompareOp::kEq;      // kCompare and kCompareColumns
   Constant constant;                  // kCompare, kLike and kNotLike; typed as the column
   std::vector<Constant> values;       // kIn and kNotIn (not empty); typed as the column
   SourceSpan span;                    // the comparison in the query
@@ -99,6 +155,7 @@ struct AggregateCall {
 
 struct ScanNode;
 struct FilterNode;
+struct ComputeNode;
 struct ProjectNode;
 struct AggregateNode;
 struct GroupAggregateNode;
@@ -106,7 +163,7 @@ struct SortNode;
 struct LimitNode;
 struct RowCountNode;
 
-using LogicalNode = std::variant<ScanNode, FilterNode, ProjectNode, AggregateNode,
+using LogicalNode = std::variant<ScanNode, FilterNode, ComputeNode, ProjectNode, AggregateNode,
                                  GroupAggregateNode, SortNode, LimitNode, RowCountNode>;
 using LogicalNodePtr = std::shared_ptr<const LogicalNode>;
 
@@ -124,6 +181,13 @@ struct FilterNode {
   LogicalNodePtr input;
   std::vector<Predicate> predicates;
   SourceSpan span;  // the WHERE conjunction
+};
+
+// Output: the input columns, then one column per expression (over the input columns), in order.
+struct ComputeNode {
+  LogicalNodePtr input;
+  std::vector<ExprPtr> exprs;  // not empty
+  SourceSpan span;             // the first expression in the query
 };
 
 // Output: the listed input columns, in this order, and constants. When `constants` is not empty it
@@ -192,7 +256,8 @@ struct LogicalPlan {
   std::vector<OutputColumn> output;  // result columns of root: names (aliases applied) and types
 };
 
-// "Scan", "Filter", "Project", "Aggregate", "GroupAggregate", "Sort", "Limit" or "RowCount".
+// "Scan", "Filter", "Compute", "Project", "Aggregate", "GroupAggregate", "Sort", "Limit" or
+// "RowCount".
 std::string_view NodeName(const LogicalNode& node);
 
 // The span of the query text a node was bound from.

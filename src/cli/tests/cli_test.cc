@@ -206,7 +206,7 @@ TEST_F(CliTest, QueriesRunEveryShape) {
   auto r = Invoke({"query", "--clickbench", "-c",
                    "SELECT COUNT(*), MIN(EventDate), SUM(EventDate + 1) FROM t", "--table",
                    "t=" + path_});
-  EXPECT_EQ(r.code, kExitUnsupported) << "arithmetic is outside the subset: " << r.err;
+  EXPECT_EQ(r.code, kExitUnsupported) << "DATE arithmetic is outside the subset: " << r.err;
   r = Invoke({"query", "--clickbench", "-c",
               "SELECT COUNT(*) AS n, MIN(EventDate) FROM t WHERE EventDate >= '2022-01-08'",
               "--table", "t=" + path_, "--format", "csv"});

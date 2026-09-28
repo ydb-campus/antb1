@@ -32,6 +32,7 @@ struct WithInput {
 
   LogicalNodePtr operator()(const ScanNode& node) const { return Make(node); }
   LogicalNodePtr operator()(const FilterNode& node) const { return Replace(node); }
+  LogicalNodePtr operator()(const ComputeNode& node) const { return Replace(node); }
   LogicalNodePtr operator()(const ProjectNode& node) const { return Replace(node); }
   LogicalNodePtr operator()(const AggregateNode& node) const { return Replace(node); }
   LogicalNodePtr operator()(const GroupAggregateNode& node) const { return Replace(node); }
@@ -45,6 +46,9 @@ std::size_t OutputWidth(const LogicalNode& node);
 struct OutputWidthOf {
   std::size_t operator()(const ScanNode& node) const { return node.fields.size(); }
   std::size_t operator()(const FilterNode& node) const { return OutputWidth(*node.input); }
+  std::size_t operator()(const ComputeNode& node) const {
+    return OutputWidth(*node.input) + node.exprs.size();
+  }
   std::size_t operator()(const ProjectNode& node) const { return node.columns.size(); }
   std::size_t operator()(const AggregateNode& node) const { return node.aggregates.size(); }
   std::size_t operator()(const GroupAggregateNode& node) const {
@@ -78,16 +82,24 @@ LogicalNodePtr CountStarToRowCount(const LogicalNodePtr& node) {
   return rewritten == *input ? node : std::visit(WithInput{.input = rewritten}, *node);
 }
 
-// ---- rule 2: Limit below Project ----
+// ---- rule 2: Limit below Project and Compute ----
 
-// Limit(Project(x)) -> Project(Limit(x)): a Project keeps every row, so limiting first gives the
-// same rows, copies only the rows kept, and puts the Limit right above a Sort (top-N).
+// Limit(Project(x)) -> Project(Limit(x)), and likewise for Compute: both keep every row, so
+// limiting first gives the same rows, copies or computes only the rows kept, and puts the Limit
+// right above a Sort (top-N).
 LogicalNodePtr LimitBelowProject(const LogicalNodePtr& node) {
   if (const auto* limit = std::get_if<LimitNode>(node.get())) {
     if (const auto* project = std::get_if<ProjectNode>(limit->input.get())) {
       LimitNode below = *limit;
       below.input = project->input;
       ProjectNode above = *project;
+      above.input = LimitBelowProject(Make(std::move(below)));
+      return Make(std::move(above));
+    }
+    if (const auto* compute = std::get_if<ComputeNode>(limit->input.get())) {
+      LimitNode below = *limit;
+      below.input = compute->input;
+      ComputeNode above = *compute;
       above.input = LimitBelowProject(Make(std::move(below)));
       return Make(std::move(above));
     }
@@ -156,6 +168,9 @@ struct Pruner {
       if (p.column.has_value()) {
         Need(needed, *p.column);
       }
+      if (p.other.has_value()) {
+        Need(needed, *p.other);
+      }
     }
     Pruned in = Prune(filter.input, std::move(needed));
     FilterNode out = filter;
@@ -164,8 +179,42 @@ struct Pruner {
       if (p.column.has_value()) {
         Renumber(*p.column, in.remap);
       }
+      if (p.other.has_value()) {
+        Renumber(*p.other, in.remap);
+      }
     }
     return Pruned{.node = Make(std::move(out)), .remap = std::move(in.remap)};
+  }
+
+  // Keeps the needed input columns and the needed expressions (and what they read).
+  Pruned operator()(const ComputeNode& compute) const {
+    const std::size_t width = OutputWidth(*compute.input);
+    std::vector<bool> below(needed.begin(), needed.begin() + static_cast<std::ptrdiff_t>(width));
+    std::vector<std::size_t> kept;
+    for (std::size_t k = 0; k < compute.exprs.size(); ++k) {
+      if (!needed.at(width + k)) {
+        continue;
+      }
+      kept.push_back(k);
+      std::vector<int> reads;
+      CollectColumns(*compute.exprs[k], reads);
+      for (const int column : reads) {
+        below.at(Narrow<std::size_t>(column)) = true;
+      }
+    }
+    Pruned in = Prune(compute.input, std::move(below));
+    Remap remap = in.remap;
+    remap.resize(width + compute.exprs.size(), -1);
+    if (kept.empty()) {
+      return Pruned{.node = in.node, .remap = std::move(remap)};
+    }
+    ComputeNode out{.input = in.node, .exprs = {}, .span = compute.span};
+    const std::size_t new_width = OutputWidth(*in.node);
+    for (const std::size_t k : kept) {
+      remap[width + k] = Narrow<int>(new_width + out.exprs.size());
+      out.exprs.push_back(plan::Renumber(compute.exprs[k], in.remap));
+    }
+    return Pruned{.node = Make(std::move(out)), .remap = std::move(remap)};
   }
 
   Pruned operator()(const ProjectNode& project) const {

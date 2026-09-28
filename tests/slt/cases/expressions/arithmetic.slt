@@ -1,0 +1,204 @@
+# Arithmetic (docs/sql-subset.md): + - * / // % and unary -, typed as DuckDB types them. Integer
+# operators compute in their result type and fail on an overflow; / is DOUBLE division; // truncates
+# and % takes the sign of the dividend, both NULL for a zero divisor.
+
+query IIII rowsort
+SELECT id, id + 1, id - 100, id * 3 FROM edge
+----
+0	1	-100	0
+1	2	-99	3
+10	11	-90	30
+11	12	-89	33
+2	3	-98	6
+3	4	-97	9
+4	5	-96	12
+5	6	-95	15
+6	7	-94	18
+7	8	-93	21
+8	9	-92	24
+9	10	-91	27
+
+query IIIR rowsort
+SELECT id, id // 3, id % 3, id / 4 FROM edge
+----
+0	0	0	0
+1	0	1	0.25
+10	3	1	2.5
+11	3	2	2.75
+2	0	2	0.5
+3	1	0	0.75
+4	1	1	1
+5	1	2	1.25
+6	2	0	1.5
+7	2	1	1.75
+8	2	2	2
+9	3	0	2.25
+
+query III rowsort
+SELECT id, -id, -(id + 1) * 2 FROM edge WHERE id < 5
+----
+0	0	-2
+1	-1	-4
+2	-2	-6
+3	-3	-8
+4	-4	-10
+
+query II rowsort
+SELECT i32 // 0, i32 % 0 FROM edge WHERE id < 3
+----
+NULL	NULL
+NULL	NULL
+NULL	NULL
+
+query RRR rowsort
+SELECT d + 1.5, d * 2, d / 4 FROM edge WHERE d > -1000 AND d < 1000
+----
+1	-1	-0.125
+1.1666666666666667	-0.6666666666666666	-0.08333333333333333
+1.5	0	0
+1.500000001	1.999999986e-09	2.4999999825e-10
+1.6	0.2	0.025
+1.8333333333333333	0.6666666666666666	0.08333333333333333
+2.1666666666666665	1.3333333333333333	0.16666666666666666
+
+query III rowsort
+SELECT i16, i16 // -7, i16 % -7 FROM edge
+----
+-1	0	-1
+-100	14	-2
+-12345	1763	-4
+-32768	4681	-1
+0	0	0
+1	0	1
+100	-14	2
+12345	-1763	4
+32767	-4681	0
+7	-1	0
+NULL	NULL	NULL
+NULL	NULL	NULL
+
+query II rowsort
+SELECT u16 + 1, u16 * 2 FROM edge WHERE u16 < 1000
+----
+1	0
+13	24
+2	2
+3	4
+8	14
+
+# Mixed types take the wider one, with a literal that fits the other operand's type.
+query II rowsort
+SELECT i16 + i32, u16 + i16 FROM edge WHERE id IN (1, 2, 3) AND i32 < 100000 AND i32 > -100000
+----
+-2	32767
+0	1
+
+# Overflows are errors in both engines.
+statement error
+SELECT i16 + 1 FROM edge
+
+statement error
+SELECT i64 * 2 FROM edge
+
+statement error
+SELECT -i32 FROM edge
+
+# SUM(x + constant) never computes x + constant (DuckDB's sum rewriter): no overflow.
+query IIII nosort
+SELECT SUM(i16 + 1), SUM(1 + (i16 + 1)), SUM(i64 + 1), COUNT(i16) FROM edge
+----
+16	26	16	10
+
+query I nosort
+SELECT SUM(i32 + 2147483647) FROM edge
+----
+21474890790
+
+# Expressions in WHERE, GROUP BY, HAVING and ORDER BY.
+query II rowsort
+SELECT id, i16 FROM edge WHERE i16 + 1 > 5 AND i16 < 32767
+----
+11	7
+6	100
+9	12345
+
+query II rowsort
+SELECT id, i32 FROM edge WHERE i32 < id * 1000
+----
+0	-2147483648
+11	-7
+2	0
+3	-1
+4	1
+7	-100000
+8	7
+
+query III nosort
+SELECT AdvEngineID // 2 AS k, AdvEngineID // 2 * 10, COUNT(*) AS c FROM hits_like GROUP BY AdvEngineID // 2 ORDER BY c DESC, k
+----
+0	0	8988
+15	150	45
+16	160	45
+2	20	44
+25	250	44
+23	230	43
+6	60	40
+22	220	40
+9	90	39
+21	210	39
+29	290	37
+26	260	35
+19	190	34
+20	200	34
+27	270	34
+17	170	33
+28	280	33
+11	110	32
+18	180	32
+4	40	31
+1	10	30
+3	30	30
+10	100	30
+14	140	30
+8	80	29
+24	240	29
+5	50	28
+7	70	28
+12	120	26
+13	130	22
+30	300	16
+
+query II nosort
+SELECT RegionID, SUM(ResolutionWidth) * 2 - 1 AS s FROM hits_like GROUP BY RegionID HAVING SUM(ResolutionWidth) + 1 > 30000 AND COUNT(*) > 1 ORDER BY s DESC, RegionID LIMIT 5
+----
+0	833075
+
+query IR nosort
+SELECT ClientIP, ClientIP / 2 FROM hits_like WHERE ClientIP > 0 ORDER BY ClientIP % 1000, ClientIP LIMIT 5
+----
+854256000	427128000
+865206000	432603000
+921149000	460574500
+1721532000	860766000
+1766656000	883328000
+
+query IIII nosort
+SELECT ClientIP, ClientIP - 1, ClientIP - 2, COUNT(*) AS c FROM hits_like WHERE ClientIP > 0 GROUP BY ClientIP, ClientIP - 1, ClientIP - 2 ORDER BY c DESC, ClientIP LIMIT 5
+----
+132847	132846	132845	1
+331107	331106	331105	1
+676070	676069	676068	1
+1056645	1056644	1056643	1
+1435803	1435802	1435801	1
+
+query I nosort
+SELECT id + 1 AS k FROM edge ORDER BY -k LIMIT 3
+----
+12
+11
+10
+
+query II nosort
+SELECT COUNT(*), SUM(ResolutionWidth + 7) - SUM(ResolutionWidth) FROM hits_like
+----
+10000	70000

@@ -41,6 +41,9 @@ std::string PredicateText(const Predicate& p) {
   switch (p.kind) {
     case Predicate::Kind::kCompare:
       return std::format("{} {} {}", column, ToString(p.op), ToString(p.constant));
+    case Predicate::Kind::kCompareColumns:
+      return std::format("{} {} {}", column, ToString(p.op),
+                         p.other.has_value() ? Name(p.other->name) : "?");
     case Predicate::Kind::kLike:
       return std::format("{} LIKE {}", column, ToString(p.constant));
     case Predicate::Kind::kNotLike:
@@ -89,6 +92,10 @@ struct NodeLine {
   }
   std::string operator()(const FilterNode& node) const {
     return "Filter " + Join(node.predicates, PredicateText, " AND ");
+  }
+  std::string operator()(const ComputeNode& node) const {
+    return "Compute " +
+           Join(node.exprs, [](const ExprPtr& e) { return EscapeText(e->name, '\0'); }, ", ");
   }
   std::string operator()(const ProjectNode& node) const {
     std::string line = "Project ";
