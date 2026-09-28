@@ -211,9 +211,9 @@ TEST_F(AggregateStateTest, TemporalAverageRoundsLikeDuckDb) {
            {-std::numeric_limits<int32_t>::max(), -4610897100027387903},
        })) {
     auto mixed = Make(AggKind::kAvg, LogicalType::kDate, LogicalType::kTimestamp);
-    const auto days =
+    const auto pair =
         testing::ArrayOf<arrow::Date32Builder, int32_t>(arrow::date32(), {first, day_2020});
-    ASSERT_TRUE(mixed->Consume(*days, nullptr).ok());
+    ASSERT_TRUE(mixed->Consume(*pair, nullptr).ok());
     EXPECT_EQ(static_cast<const arrow::TimestampArray&>(*Result(*mixed)).Value(0), average);
   }
   auto both = Make(AggKind::kAvg, LogicalType::kTimestamp, LogicalType::kTimestamp);
