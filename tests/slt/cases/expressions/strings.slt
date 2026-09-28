@@ -76,20 +76,29 @@ SELECT COUNT(*), AVG(strlen(URL)) FROM hits_like WHERE URL <> ''
 ----
 9805	39.106068332483424
 
-# The shapes of ClickBench Q27 and Q28, over the fixture data.
-query IRI nosort
-SELECT CounterID, AVG(strlen(URL)) AS l, COUNT(*) AS c FROM hits_like WHERE URL <> '' GROUP BY CounterID HAVING COUNT(*) > 100 ORDER BY l DESC, CounterID LIMIT 5
+# Grouping by string function results, with aggregates of them and HAVING, over the fixture data.
+query III nosort
+SELECT OS, MAX(strlen(Title)) AS m, SUM(strlen(URL)) AS total FROM hits_like WHERE strlen(URL) > 30 GROUP BY OS ORDER BY total DESC, OS LIMIT 4
 ----
-21062	39.81165919282511	223
-32062	39.77647058823529	255
-9062	39.715328467153284	274
-62	39.71367521367522	234
-25062	39.60775862068966	232
+10	49	4113
+116	48	3983
+118	51	3924
+26	45	3920
 
-query TRIT nosort
-SELECT regexp_replace(Referer, '^https?://(?:www\.)?([^/]+)/.*$', '\1') AS k, AVG(strlen(Referer)) AS l, COUNT(*) AS c, MIN(Referer) FROM hits_like WHERE Referer <> '' GROUP BY k HAVING COUNT(*) > 10 ORDER BY l DESC, k LIMIT 5
+query TII nosort
+SELECT regexp_replace(URL, '^([a-z]+)://.*$', '\1') AS scheme, COUNT(*), MIN(strlen(URL)) FROM hits_like GROUP BY scheme HAVING COUNT(*) > 5 ORDER BY scheme
 ----
-ref.example.org	39.07006048387097	5952	https://ref.example.org/alpha/10344?q=новости
+(empty)	195	0
+https	9805	31
+
+query TIT nosort
+SELECT regexp_replace(Referer, '^[^/]*//[^/]*/([^/?]*).*$', 'seg:\1') AS seg, COUNT(*) AS n, MAX(Referer) FROM hits_like WHERE Referer LIKE 'http%' GROUP BY 1 ORDER BY n DESC, seg LIMIT 5
+----
+seg:дорога	269	https://ref.example.org/дорога/99884?q=orbit
+seg:cloud	268	https://ref.example.org/cloud/99935
+seg:stone	265	https://ref.example.org/stone/99758
+seg:naïve	262	https://ref.example.org/naïve/99791
+seg:pixel	260	https://ref.example.org/pixel/99525
 
 # Assertions see the whole value, not the match alone (\b, \B, ^ and $ inside alternatives).
 query TTTTTT rowsort

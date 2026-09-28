@@ -688,10 +688,10 @@ std::vector<Relation> AllRelations() {
                     Q("SELECT SUM(STRLEN(REGEXP_REPLACE(URL, '^', '\\\\'))) FROM hits_like_nulls")},
          .check = AllEqual()});
     constexpr std::string_view kKeys =
-        "SELECT regexp_replace(Referer, '^https?://([^/]+)/.*$', '\\1') AS k, COUNT(*), "
-        "AVG(strlen(Referer)), MIN(Referer) FROM {} GROUP BY k";
+        "SELECT regexp_replace(Referer, '//([^/?]*)', '<\\1>') AS k, COUNT(*), "
+        "SUM(strlen(Referer)), MAX(Referer) FROM {} GROUP BY k";
     Relation sizes{.name = "regexp_replace_keys_batch_size_invariance",
-                   .features = {kGroupBy, kCountStar, kAvg, kMin, kStringFunctions, kMultipleItems,
+                   .features = {kGroupBy, kCountStar, kSum, kMax, kStringFunctions, kMultipleItems,
                                 kAlias, kVarcharColumns, kStringLiteral, kTableName},
                    .probes = {},
                    .check = AllEqual()};

@@ -303,6 +303,13 @@ struct FirstUnsupportedOf {
                                               "AVG, MIN, MAX, STRLEN and REGEXP_REPLACE)",
                                               Clip(call.name))};
     }
+    if (spec->function == Function::kRegexpReplace && call.args.size() == 4) {
+      // DuckDB's options argument ('g', 'i', ...): valid there, not here.
+      return Rejection{.span = call.args[3].span(),
+                       .message =
+                           "regexp_replace() with options (a fourth argument) is not "
+                           "supported"};
+    }
     if (call.args.size() != spec->args) {
       return std::nullopt;  // a bind error (the binder reports the arity), as in DuckDB
     }

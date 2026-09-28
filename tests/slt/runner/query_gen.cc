@@ -1227,9 +1227,9 @@ class Builder {
       Symbol(")");
       return ValueKind::kInteger;
     }
-    static constexpr auto kPatterns = std::to_array<std::string_view>(
-        {"a", "[0-9]+", "^(.)", "(.)$", "e.", "^https?://(?:www\\.)?([^/]+)/.*$", "\\s+", "e\\B",
-         "(e)$|(e)", "\\b"});
+    static constexpr auto kPatterns =
+        std::to_array<std::string_view>({"a", "[0-9]+", "^(.)", "(.)$", "e.", "^([a-z]+)://([^/]*)",
+                                         "\\s+", "e\\B", "(e)$|(e)", "\\b"});
     static constexpr auto kReplacements =
         std::to_array<std::string_view>({"", "X", "\\1", "<\\0>"});
     used_.Add(Feature::kStringLiteral);
