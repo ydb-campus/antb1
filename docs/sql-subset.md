@@ -342,7 +342,8 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
 - AVG: over integer columns the sum accumulates exactly in 128 bits and is divided by the count once at the end, so
   the DOUBLE result is accurate to about one ulp (the oracle tests use a tight relative tolerance). Over DOUBLE it
   returns DOUBLE. Over DATE and TIMESTAMP it averages the microseconds (a DATE's midnight; its infinities as the
-  TIMESTAMP ones, a DATE beyond the TIMESTAMP range an error) in 128 bits and returns a TIMESTAMP, rounded as DuckDB
+  TIMESTAMP ones, summed as their int64 values as DuckDB sums them, so that with finite values they give a large
+  finite TIMESTAMP; a DATE beyond the TIMESTAMP range an error) in 128 bits and returns a TIMESTAMP, rounded as DuckDB
   rounds: the quotient truncated, one more when twice the remainder exceeds the count (a positive average to the
   nearest microsecond with halves down, a negative one toward zero).
 - MIN and MAX: return the input type; VARCHAR compares byte-wise and DATE chronologically. They use Arrow's
