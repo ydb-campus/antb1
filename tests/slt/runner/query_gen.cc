@@ -701,10 +701,7 @@ class Builder {
         }
       } else {
         const Agg agg = rng_.Pick(aggs);
-        const GenColumn* arg =
-            agg == Agg::kCountStar
-                ? nullptr
-                : rng_.Pick(agg == Agg::kSum || agg == Agg::kAvg ? numeric : cols);
+        const GenColumn* arg = agg == Agg::kCountStar ? nullptr : ArgumentOf(agg, cols, numeric);
         orderable = Orderable(agg, arg);
         const bool arithmetic = arg != nullptr && rng_.Percent(20);
         const std::optional<bool> exact = Aggregate(agg, arg, arithmetic);
@@ -741,6 +738,25 @@ class Builder {
     }
   }
 
+  // A select item's aggregate argument: a number for SUM and AVG, now and then a DATE for AVG
+  // (a TIMESTAMP, as in DuckDB), any column for the others.
+  const GenColumn* ArgumentOf(Agg agg, const std::vector<const GenColumn*>& cols,
+                              const std::vector<const GenColumn*>& numeric) {
+    if (agg == Agg::kAvg && allowed_.Has(Feature::kTimestamps) && rng_.Percent(15)) {
+      std::vector<const GenColumn*> dates;
+      for (const GenColumn* c : cols) {
+        if (c->kind == ValueKind::kDate) {
+          dates.push_back(c);
+        }
+      }
+      if (!dates.empty()) {
+        used_.Add(Feature::kTimestamps);
+        return rng_.Pick(dates);
+      }
+    }
+    return rng_.Pick(agg == Agg::kSum || agg == Agg::kAvg ? numeric : cols);
+  }
+
   // A position in the select list (1-based) as a GROUP BY or ORDER BY item.
   void Position(std::size_t position) {
     used_.Add(Feature::kPosition);
@@ -764,9 +780,9 @@ class Builder {
       if (arithmetic && rng_.Percent(30)) {
         exact = Case(*arg);
       }
-      // SUM and AVG take only EXTRACT's BIGINT.
+      // SUM takes only EXTRACT's BIGINT; AVG a TIMESTAMP too.
       if (arithmetic && !exact.has_value() && rng_.Percent(25) &&
-          Temporal(*arg, /*number=*/agg == Agg::kSum || agg == Agg::kAvg)) {
+          Temporal(*arg, /*number=*/agg == Agg::kSum)) {
         exact = true;
         arg_retyped_ = true;
       }

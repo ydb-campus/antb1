@@ -25,6 +25,7 @@
 #include "antb1/plan/types.h"
 
 #include "double_key.h"
+#include "temporal_average.h"
 
 namespace antb1::exec {
 namespace {
@@ -224,6 +225,62 @@ class GroupedIntegerSum final : public GroupedAggregateState {
 
  private:
   bool average_;
+  std::vector<Int128> sums_;
+  std::vector<std::int64_t> counts_;
+};
+
+// AVG of DATE or TIMESTAMP values per group: a TIMESTAMP, averaged in 128 bits as DuckDB does.
+class GroupedTemporalAvg final : public GroupedAggregateState {
+ public:
+  [[nodiscard]] std::uint32_t num_groups() const override {
+    return static_cast<std::uint32_t>(sums_.size());
+  }
+  void Resize(std::uint32_t num_groups) override {
+    sums_.resize(num_groups, 0);
+    counts_.resize(num_groups, 0);
+  }
+  arrow::Status Consume(const arrow::Array* values, GroupIds ids) override {
+    if (values == nullptr) {
+      return arrow::Status::Invalid("AVG needs an argument column");
+    }
+    ARROW_RETURN_NOT_OK(CheckRows(values, values->type().get(), ids, num_groups()));
+    const bool nulls = values->null_count() != 0;
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+      const auto row = static_cast<std::int64_t>(i);
+      if (nulls && values->IsNull(row)) {
+        continue;
+      }
+      ARROW_ASSIGN_OR_RAISE(const std::int64_t micros, TemporalMicros(*values, row));
+      sums_[ids[i]] += micros;
+      ++counts_[ids[i]];
+    }
+    return arrow::Status::OK();
+  }
+  arrow::Status Merge(const GroupedAggregateState& other, GroupIds map) override {
+    ARROW_ASSIGN_OR_RAISE(const auto* same, SameKind<GroupedTemporalAvg>(other, map, num_groups()));
+    for (std::size_t g = 0; g < map.size(); ++g) {
+      sums_[map[g]] += same->sums_[g];
+      counts_[map[g]] += same->counts_[g];
+    }
+    return arrow::Status::OK();
+  }
+  [[nodiscard]] arrow::Result<std::shared_ptr<arrow::Array>> Finalize(
+      std::uint32_t begin, std::uint32_t end, arrow::MemoryPool* pool) const override {
+    ARROW_ASSIGN_OR_RAISE(const auto sums, GroupRange(sums_, begin, end));
+    ARROW_ASSIGN_OR_RAISE(const auto counts, GroupRange(counts_, begin, end));
+    arrow::TimestampBuilder builder(plan::ToArrow(plan::LogicalType::kTimestamp), pool);
+    ARROW_RETURN_NOT_OK(builder.Reserve(static_cast<std::int64_t>(sums.size())));
+    for (std::size_t g = 0; g < sums.size(); ++g) {
+      if (counts[g] == 0) {
+        builder.UnsafeAppendNull();
+      } else {
+        builder.UnsafeAppend(AverageMicros(sums[g], counts[g]));
+      }
+    }
+    return builder.Finish();
+  }
+
+ private:
   std::vector<Int128> sums_;
   std::vector<std::int64_t> counts_;
 };
@@ -677,6 +734,13 @@ arrow::Result<std::unique_ptr<GroupedAggregateState>> MakeGroupedAggregateState(
     case plan::AggKind::kSum:
     case plan::AggKind::kAvg: {
       const bool average = kind == plan::AggKind::kAvg;
+      if (average &&
+          (*input == plan::LogicalType::kDate || *input == plan::LogicalType::kTimestamp)) {
+        if (result != plan::LogicalType::kTimestamp) {
+          return invalid();
+        }
+        return std::make_unique<GroupedTemporalAvg>();
+      }
       const plan::LogicalType expected = !average && plan::IsInteger(*input)
                                              ? plan::LogicalType::kHugeInt
                                              : plan::LogicalType::kDouble;

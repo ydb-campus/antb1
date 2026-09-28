@@ -24,6 +24,7 @@
 
 #include "double_key.h"
 #include "row_mask.h"
+#include "temporal_average.h"
 
 namespace antb1::exec {
 namespace {
@@ -280,6 +281,55 @@ class IntegerSumState final : public AggregateState {
   int64_t count_ = 0;
 };
 
+// AVG of DATE or TIMESTAMP values: a TIMESTAMP, averaged in 128 bits as DuckDB averages it.
+class TemporalAvgState final : public AggregateState {
+ public:
+  explicit TemporalAvgState(arrow::MemoryPool* pool) : pool_(pool) {}
+
+  arrow::Status Consume(const arrow::Array& values, const arrow::BooleanArray* selection) override {
+    if (values.type_id() != arrow::Type::DATE32 && values.type_id() != arrow::Type::TIMESTAMP) {
+      return arrow::Status::Invalid("AVG of ", values.type()->ToString(), " as a TIMESTAMP");
+    }
+    ARROW_RETURN_NOT_OK(CheckInput(values, selection, *values.type()));
+    ARROW_ASSIGN_OR_RAISE(const RowMask mask,
+                          RowMask::Make(&values, selection, values.length(), pool_));
+    arrow::Status status;
+    mask.ForEachRun([&](int64_t position, int64_t length) {
+      for (int64_t row = position; row < position + length && status.ok(); ++row) {
+        auto micros = TemporalMicros(values, row);
+        if (!micros.ok()) {
+          status = micros.status();
+          return;
+        }
+        sum_ += *micros;
+        ++count_;
+      }
+    });
+    return status;
+  }
+  arrow::Status Merge(const AggregateState& other) override {
+    ARROW_ASSIGN_OR_RAISE(const auto* same, SameKind<TemporalAvgState>(other));
+    sum_ += same->sum_;
+    count_ += same->count_;
+    return arrow::Status::OK();
+  }
+  [[nodiscard]] arrow::Result<std::shared_ptr<arrow::Array>> Finalize(
+      arrow::MemoryPool* pool) const override {
+    arrow::TimestampBuilder builder(plan::ToArrow(plan::LogicalType::kTimestamp), pool);
+    if (count_ == 0) {
+      ARROW_RETURN_NOT_OK(builder.AppendNull());
+    } else {
+      ARROW_RETURN_NOT_OK(builder.Append(AverageMicros(sum_, count_)));
+    }
+    return builder.Finish();
+  }
+
+ private:
+  arrow::MemoryPool* pool_;
+  Int128 sum_ = 0;
+  int64_t count_ = 0;
+};
+
 Int128 HugeIntAt(const arrow::Decimal128Array& values, int64_t row) {
   const arrow::Decimal128 value(values.GetValue(row));
   const UInt128 bits = (static_cast<UInt128>(static_cast<uint64_t>(value.high_bits())) << 64U) |
@@ -520,6 +570,13 @@ arrow::Result<std::unique_ptr<AggregateState>> MakeAggregateState(
     case plan::AggKind::kSum:
     case plan::AggKind::kAvg: {
       const bool average = kind == plan::AggKind::kAvg;
+      if (average &&
+          (*input == plan::LogicalType::kDate || *input == plan::LogicalType::kTimestamp)) {
+        if (result != plan::LogicalType::kTimestamp) {
+          return invalid();
+        }
+        return std::make_unique<TemporalAvgState>(pool);
+      }
       const plan::LogicalType expected = !average && plan::IsInteger(*input)
                                              ? plan::LogicalType::kHugeInt
                                              : plan::LogicalType::kDouble;

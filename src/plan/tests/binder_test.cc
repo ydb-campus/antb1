@@ -193,7 +193,8 @@ INSTANTIATE_TEST_SUITE_P(
                   "SUM needs a numeric column, but 's' is VARCHAR"},
         ErrorCase{"SELECT sum ( DT ) FROM t", kBind, "sum ( DT )", "'dt' is DATE"},
         ErrorCase{"SELECT COUNT(*), AVG(s) AS a FROM t", kBind, "AVG(s)", "AVG needs a numeric"},
-        ErrorCase{"SELECT AVG(dt) FROM t", kBind, "AVG(dt)", "DATE"},
+        ErrorCase{"SELECT SUM(toDateTime(i64)) FROM t", kBind, "SUM(toDateTime(i64))",
+                  "SUM needs a numeric column"},
         // Literals of the wrong type: the span is the literal.
         ErrorCase{"SELECT COUNT(*) FROM t WHERE i16 = '1'", kBind, "'1'",
                   "cannot compare SMALLINT column 'i16' with a string; write a number"},
@@ -282,8 +283,6 @@ INSTANTIATE_TEST_SUITE_P(
                   "EXTRACT of dow is not supported"},
         ErrorCase{"SELECT EXTRACT(minute FROM i64) FROM t", kBind, "i64",
                   "EXTRACT needs a TIMESTAMP or DATE, but 'i64' is BIGINT"},
-        ErrorCase{"SELECT AVG(toDateTime(i64)) FROM t", kBind, "AVG(toDateTime(i64))",
-                  "AVG needs a numeric column"},
         ErrorCase{"SELECT COUNT(*) FROM t WHERE toDateTime(i64) > 5", kUnsupported, "5",
                   "comparing the TIMESTAMP 'todatetime(i64)' with a literal is not supported"},
         ErrorCase{"SELECT COUNT(*) FROM t WHERE toDateTime(i64) > dt", kUnsupported, ">",
@@ -1122,6 +1121,11 @@ TEST(BinderTest, TimestampFunctions) {
     EXPECT_EQ(plan->output[i].name, expected[i].first);
     EXPECT_EQ(plan->output[i].type, expected[i].second) << expected[i].first;
   }
+  // AVG of a DATE or TIMESTAMP is a TIMESTAMP, as in DuckDB.
+  auto averages = BindSql("SELECT AVG(dt), AVG(toDateTime(i64)) FROM t GROUP BY i16", catalog);
+  ASSERT_TRUE(averages.ok()) << averages.status().ToString();
+  EXPECT_EQ(averages->output[0].type, LogicalType::kTimestamp);
+  EXPECT_EQ(averages->output[1].type, LogicalType::kTimestamp);
   // The product keeps the argument's type: SMALLINT * 1000 is SMALLINT (it overflows above 32).
   auto small = BindSql("SELECT toDateTime(i16) FROM t", catalog);
   ASSERT_TRUE(small.ok()) << small.status().ToString();

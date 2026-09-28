@@ -11,7 +11,7 @@ SELECT COUNT(NoSuchColumn) FROM hits_like
 statement error
 SELECT COUNT(*) FROM hits_like WHERE NoSuchColumn = 1
 
-# SUM and AVG need numbers: not VARCHAR, not DATE.
+# SUM needs numbers (not VARCHAR, not DATE); AVG numbers, dates or timestamps.
 
 statement error
 SELECT SUM(Title) FROM hits_like
@@ -89,7 +89,3 @@ SELECT COUNT(*) FROM edge WHERE u = 1
 onlyif antb1
 statement error ^bind: invalid date '2013-7-1'
 SELECT COUNT(*) FROM hits_like WHERE EventDate = '2013-7-1'
-
-onlyif antb1
-statement error ^bind: AVG needs a numeric column, but 'EventDate' is DATE$
-SELECT AVG(EventDate) FROM hits_like
