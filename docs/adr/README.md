@@ -18,3 +18,4 @@ in the same PR as the change it justifies, and list it below; `pixi run lint` ch
 | [0010](0010-grouped-aggregation.md) | Grouped aggregation | Accepted |
 | [0011](0011-sorting-and-top-n.md) | Sorting and top-N | Accepted |
 | [0012](0012-scalar-expressions.md) | Scalar expressions | Accepted |
+| [0013](0013-parallel-execution.md) | Parallel execution over row groups | Proposed |
