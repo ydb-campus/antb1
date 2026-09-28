@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790553795955,
+  "lastUpdate": 1790567462467,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -972,6 +972,78 @@ window.BENCHMARK_DATA = {
             "value": 14.882871382978545,
             "unit": "ms/iter",
             "extra": "iterations: 47\ncpu: 14.876427212765947 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1654767111988c5c279e6144833848c456013acb",
+          "message": "feat(sql): parse scalar expressions (#31)\n\n## Summary\n\nThis is PR 1 of the approved 5-PR plan for scalar expressions (the\ntarget is ClickBench 43/43). The parser now reads expressions as trees,\nand the binder still answers exactly what it did before. The ClickBench\nratchet is unchanged at 36/43.\n\n**Parser (`src/sql`)**\n- `sql::Expr` is a variant of the node kinds, with deep-copying `Box<T>`\nchildren.\n- It is parsed by precedence climbing: `OR` < `AND` < `NOT` <\ncomparisons with `[NOT] LIKE` and `[NOT] IN` (which do not chain) < `+\n-` < `* / // %` < unary `-`.\n- The grammar also covers parentheses, function calls, `CASE` (searched\nand simple), `EXTRACT(field FROM x)`, and aggregates over any argument.\n- **Depth limit (256 levels).** Every level of a tree counts, so\nparsing, copying, comparing, unparsing and destroying stay bounded on\nadversarial input. The top-level `AND` chain of WHERE and HAVING is\ncollected in a loop into conjuncts and does not count, so a\n5,000-conjunct predicate still parses.\n- `ToSql` prints the fewest parentheses the precedence needs, and\n`Parse(ToSql(x)) == x` still holds. The property test now generates\nrandom expression trees and accounts for every token.\n\n**Binder (`src/plan`)**\n- `sql::AsComparison` / `AsHavingComparison` give the normalized form of\na simple condition, with literal-first comparisons mirrored as before.\n- Every other expression is `kUnsupported` (exit code 4) at its first\ntoken. The check runs in a pre-pass before any name is resolved, with\nthe messages the parser used to give; about 50 cases moved from the\nparser tests to the binder tests.\n- New: parentheses only group, so `(a)`, `SUM((a))` and `WHERE (a = 1\nAND b = 2)` are answered. They are checked against DuckDB in\n`tests/slt/cases/where/parentheses.slt`.\n- DuckDB-only argument syntax inside function calls stays exit code 4:\n`position('a' IN s)`, `substring(s FROM 1)`, `try_cast(x AS t)` and\n`FILTER`. So do postfix `NOT` and `NOT NULL`.\n\n**Docs:** `docs/sql-subset.md` (grammar, and what the binder answers\ntoday), `docs/architecture.md`, and an update note in ADR 0008. Fuzz:\ndictionary entries and a corpus seed for expressions.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full          # lint, ci, asan, tidy, coverage (sql floors kept), fuzz-smoke, ci-gcc\nexit 0 (100% tests passed out of 1155; Coverage gate: PASS)\n$ ANTB1_DIFF_COUNT=5000 pixi run diff-random\nDIFF: PASS seed=1510356307 queries=5000 failed=0 unsupported=0\n$ pixi run test-data           # hits_0: the ratchet is unchanged\n100% tests passed out of 6\n```\n\nThe data test did not run over all 100 files: this PR changes parsing,\nnot execution.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change: parser (precedence, CASE, EXTRACT,\nfunctions, conjunct splitting, depth limit, error cases), property test\nover random expression trees, unparser, AST helpers, binder rejections\nand parentheses, `.slt`\n- [x] Docs updated: `docs/sql-subset.md`, `docs/architecture.md`, ADR\n0008 (a note; its status is unchanged)\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: none are changed\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code wrote the change\nand the tests and ran the verification. The `reviewer` agent found no\nwrong results and no stack overflow on 100k-level inputs under ASan; it\nraised three P1s (EXTRACT string fields breaking the round trip, DuckDB\nfunction-argument syntax and postfix NOT exiting 1 instead of 4), all\nfixed with tests.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-09-28T06:49:04+03:00",
+          "tree_id": "f6603534d89dec302c15b144ca8d3fccc01ab643",
+          "url": "https://github.com/ydb-campus/antb1/commit/1654767111988c5c279e6144833848c456013acb"
+        },
+        "date": 1790567461860,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 3993.036372800024,
+            "unit": "ns/iter",
+            "extra": "iterations: 176588\ncpu: 3992.53056266564 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 94569.64588414824,
+            "unit": "ns/iter",
+            "extra": "iterations: 6560\ncpu: 94551.98399390245 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 124828.48788742402,
+            "unit": "ns/iter",
+            "extra": "iterations: 5614\ncpu: 124795.58371927323 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 484899.30055401335,
+            "unit": "ns/iter",
+            "extra": "iterations: 1444\ncpu: 484643.2922437674 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 455379.8639322926,
+            "unit": "ns/iter",
+            "extra": "iterations: 1536\ncpu: 455333.54361979145 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2297211.6568626994,
+            "unit": "ns/iter",
+            "extra": "iterations: 306\ncpu: 2296819.202614382 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 235.08171733333447,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 235.05696366666663 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 15.136970782608811,
+            "unit": "ms/iter",
+            "extra": "iterations: 46\ncpu: 15.134891695652186 ms\nthreads: 1"
           }
         ]
       }
