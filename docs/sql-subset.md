@@ -145,8 +145,9 @@ items).
   must be a key: otherwise a bind error at that column
   (`column 'b' must appear in the GROUP BY clause or be inside an aggregate function`).
 - Result types: `COUNT(*)`, `COUNT(col)` and `COUNT(DISTINCT col)` are BIGINT; `SUM` of an integer column is
-  HUGEINT and of a DOUBLE column DOUBLE; `AVG` is DOUBLE; `MIN` and `MAX` have the type of their column. `SUM` and
-  `AVG` of a VARCHAR or DATE column are bind errors.
+  HUGEINT and of a DOUBLE column DOUBLE; `AVG` of a number is DOUBLE and of a DATE or TIMESTAMP TIMESTAMP, as in
+  DuckDB; `MIN` and `MAX` have the type of their column. `SUM` of a VARCHAR, DATE or TIMESTAMP and `AVG` of a VARCHAR
+  are bind errors.
 - Result names follow DuckDB: a plain column is named as declared in the table (`SELECT regionid` gives
   `RegionID`); an aggregate is named `count_star()`, `count(x)`, `count(DISTINCT x)`, `sum(x)`, `avg(x)`, `min(x)`
   or `max(x)`, with the argument as written in the query, double-quoted when it is not a plain identifier or is a
@@ -335,7 +336,10 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   the values in row order.
 - AVG: over integer columns the sum accumulates exactly in 128 bits and is divided by the count once at the end, so
   the DOUBLE result is accurate to about one ulp (the oracle tests use a tight relative tolerance). Over DOUBLE it
-  returns DOUBLE.
+  returns DOUBLE. Over DATE and TIMESTAMP it averages the microseconds (a DATE's midnight; its infinities as the
+  TIMESTAMP ones, a DATE beyond the TIMESTAMP range an error) in 128 bits and returns a TIMESTAMP, rounded as DuckDB
+  rounds: the quotient truncated, one more when twice the remainder exceeds the count (a positive average to the
+  nearest microsecond with halves down, a negative one toward zero).
 - MIN and MAX: return the input type; VARCHAR compares byte-wise and DATE chronologically. They use Arrow's
   `min_max` kernel, over only the selected rows under `WHERE` (divergence D10 for NaN).
 - NULL: aggregates skip NULLs. Over zero input rows `COUNT` returns 0 and `SUM`, `AVG`, `MIN` and `MAX` return NULL.
@@ -446,7 +450,6 @@ compare against DuckDB, so an unregistered difference is a bug.
 | D3 | Literal types | a string literal compared with a numeric column is a bind error | casts the string to the column's type | `onlyif antb1` records in `tests/slt/cases/basic/bind_errors.slt`; the query generator writes numbers for numeric columns |
 | D4 | Literal types | a number or a `DATE` literal compared with a VARCHAR column is a bind error | casts the column's values at run time (a conversion error unless every value converts) | as D3; the generator writes strings for VARCHAR columns |
 | D5 | Date literals | a date must be written exactly `YYYY-MM-DD` | also accepts `2013-7-1`, surrounding spaces and a time of day | as D3; the generator writes `YYYY-MM-DD` |
-| D6 | AVG of DATE and TIMESTAMP | `AVG` of a DATE or TIMESTAMP value is a bind error | returns a TIMESTAMP | as D3; the generator averages numeric columns only |
 | D7 | DOUBLE literals and BIGINT | a number that DuckDB types as DOUBLE (an exponent, or more than 38 digits) is rounded to the nearest double like in DuckDB, then compared exactly with the integer column; in an `IN` list with such a number every value is rounded so | converts BIGINT (and HUGEINT) values to DOUBLE for the comparison, so values beyond 2^53 compare rounded: `i64 >= 9223372036854775808e0` holds for `9223372036854775807` | the `.slt` records with such literals avoid BIGINT values beyond 2^53 (`tests/slt/cases/where/folding.slt`); `plan.ApproximateNumbers/FoldThroughBinderTest.*` pins antb1's folding; the generator writes no exponents |
 | D8 | Result names | an aggregate's argument is quoted when it is not a plain identifier or is a reserved word | also quotes non-reserved keywords (`sum("year")`) | the tests compare values and types, not names |
 | D9 | HUGEINT range | HUGEINT is decimal128(38, 0): a `SUM`, or arithmetic on a `SUM`, outside -(10^38 - 1) to 10^38 - 1 is an execution error (exit code 1). An integer SUM over BIGINT or smaller types cannot reach it | HUGEINT holds -(2^127 - 1) to 2^127 - 1 | no fixture has a HUGEINT column; `exec.AggregateStateTest.HugeIntSumIsCheckedAgainstTheRange` checks the error |

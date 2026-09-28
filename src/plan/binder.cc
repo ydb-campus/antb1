@@ -787,6 +787,11 @@ arrow::Result<LogicalType> AggregateType(const sql::AggregateCall& call, const B
       return LogicalType::kBigInt;
     case sql::AggKind::kSum:
     case sql::AggKind::kAvg:
+      // DuckDB's AVG of a DATE or TIMESTAMP is a TIMESTAMP.
+      if (call.kind == sql::AggKind::kAvg &&
+          (arg.type == LogicalType::kDate || arg.type == LogicalType::kTimestamp)) {
+        return LogicalType::kTimestamp;
+      }
       if (!IsNumeric(arg.type)) {
         return BindError(std::format("{} needs a numeric column, but '{}' is {}",
                                      ToString(ToPlan(call.kind)), arg.name, ToString(arg.type)),

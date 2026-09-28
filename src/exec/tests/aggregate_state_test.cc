@@ -1,11 +1,13 @@
 #include "antb1/exec/aggregate_state.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -17,6 +19,7 @@
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
 
+#include "../temporal_average.h"
 #include "exec_test_util.h"
 
 namespace antb1::exec {
@@ -153,6 +156,52 @@ TEST_F(AggregateStateTest, IntegerSumIsExactHugeInt) {
       arrow::int32(), {2147483647, 2147483647, -1, std::nullopt, 10});
   ASSERT_TRUE(ints->Consume(*values, Bools({true, true, false, true, true}).get()).ok());
   EXPECT_EQ(Text(*ints), "4294967304");
+}
+
+// AVG of TIMESTAMP (and DATE midnights) rounds as DuckDB's does (values checked against DuckDB
+// 1.5.5): truncated, one more when twice the remainder exceeds the count, so a positive average
+// rounds to nearest (halves down) and a negative one toward zero.
+TEST_F(AggregateStateTest, TemporalAverageRoundsLikeDuckDb) {
+  // {sum, count, average}
+  for (const auto& [sum, count, average] : std::to_array<std::tuple<Int128, int64_t, int64_t>>({
+           {2, 3, 1},
+           {-1, 3, 0},
+           {-2, 3, 0},
+           {-5, 3, -1},
+           {1, 2, 0},
+           {-1, 2, 0},
+           {-3, 2, -1},
+           {5, 4, 1},
+           {7, 4, 2},
+           {-7, 4, -1},
+       })) {
+    EXPECT_EQ(AverageMicros(sum, count), average) << Int128ToString(sum) << " / " << count;
+  }
+  auto dates = Make(AggKind::kAvg, LogicalType::kDate, LogicalType::kTimestamp);
+  const auto days = testing::ArrayOf<arrow::Date32Builder, int32_t>(arrow::date32(), {-1, 0, 0});
+  ASSERT_TRUE(dates->Consume(*days, nullptr).ok());
+  const auto result = Result(*dates);
+  EXPECT_EQ(static_cast<const arrow::TimestampArray&>(*result).Value(0), -28'800'000'000)
+      << "1969-12-31 16:00:00";
+  auto merged = Make(AggKind::kAvg, LogicalType::kDate, LogicalType::kTimestamp);
+  ASSERT_TRUE(merged
+                  ->Consume(*testing::ArrayOf<arrow::Date32Builder, int32_t>(arrow::date32(), {-1}),
+                            nullptr)
+                  .ok());
+  ASSERT_TRUE(dates->Merge(*merged).ok());
+  EXPECT_EQ(static_cast<const arrow::TimestampArray&>(*Result(*dates)).Value(0), -43'200'000'000);
+  auto empty = Make(AggKind::kAvg, LogicalType::kTimestamp, LogicalType::kTimestamp);
+  EXPECT_EQ(Text(*empty), "NULL");
+  // A DATE beyond the TIMESTAMP range fails, as DuckDB's cast does; its infinities do not.
+  auto far = Make(AggKind::kAvg, LogicalType::kDate, LogicalType::kTimestamp);
+  const auto beyond =
+      testing::ArrayOf<arrow::Date32Builder, int32_t>(arrow::date32(), {106'751'992});
+  EXPECT_TRUE(far->Consume(*beyond, nullptr).IsExecutionError());
+  auto infinite = Make(AggKind::kAvg, LogicalType::kDate, LogicalType::kTimestamp);
+  const auto infinity = testing::ArrayOf<arrow::Date32Builder, int32_t>(
+      arrow::date32(), {std::numeric_limits<int32_t>::max()});
+  ASSERT_TRUE(infinite->Consume(*infinity, nullptr).ok());
+  EXPECT_EQ(static_cast<const arrow::TimestampArray&>(*Result(*infinite)).Value(0), kI64Max);
 }
 
 // Narrow types are added in narrow chunks (int32 for 16-bit values); long runs cross many chunks.
