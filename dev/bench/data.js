@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790550037068,
+  "lastUpdate": 1790553795955,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -900,6 +900,78 @@ window.BENCHMARK_DATA = {
             "value": 13.474197836734563,
             "unit": "ms/iter",
             "extra": "iterations: 49\ncpu: 13.473456367346943 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2d50fd7c9611de088090ac4ad918e8332a1d2002",
+          "message": "feat(sql,plan): having (#30)\n\n## Summary\n\nThis PR adds `HAVING`, the last of the three non-expression features\n(after `IN` in #28 and positions and constants in #29).\n\n**What HAVING accepts.** A conjunction of `<aggregate or column> <op>\nliteral`, using the operators `WHERE` has: comparisons, `[NOT] LIKE` and\n`[NOT] IN`. A literal-first comparison is normalized.\n\n**Name resolution** (DuckDB 1.5.5 semantics):\n- An aggregate call reuses an equal select-list aggregate; otherwise it\nis computed as a hidden aggregate.\n- A column is a `GROUP BY` key when the table column of that name is\none. Otherwise it is the last select alias with that name, which may\nname a key or an aggregate.\n- An alias of a constant is unsupported (exit code 4). Any other column\nis a bind error.\n- `HAVING` without `GROUP BY` makes the query one aggregate row, which\nit may filter out. `SELECT a FROM t HAVING a > 0` is a bind error.\n\n**Literal typing.** Literals are typed against the operand's type, as in\n`WHERE`: `COUNT` is BIGINT, an integer `SUM` is HUGEINT, `AVG` is\nDOUBLE. `MIN` and `MAX` of a FLOAT column compare in FLOAT, as DuckDB\ntypes them FLOAT. `SUM` and `AVG` of a FLOAT column compare as DOUBLE.\n\n**Plan.** A `Filter` over the `GroupAggregate` or `Aggregate`, below the\n`Sort`. A `Project` drops hidden aggregates. The existing Filter\noperator, optimizer rules and EXPLAIN handle it unchanged.\n\n**The \"unsupported\" example moves to JOIN.** HAVING was the repository's\nstandard example of unsupported SQL. That role moves to `JOIN`:\n- the CLI and session tests and the `unsupported` goldens;\n- the harness canary query, and `Feature::kJoin`, which replaces\n`kHaving` as the never-generated marker.\n\n**Harness.**\n- The random generator writes `HAVING` on keys, on aggregates with exact\nvalues, and on their aliases.\n- New `.slt` cases in `tests/slt/cases/having/`, whose expectations were\nwritten by DuckDB.\n- New metamorphic relations: `HAVING` and its complement partition the\ngroups (a new `FirstIsUnionOfRest` check), and the same groups are\nfiltered whatever the batch size or file layout.\n\n**Docs.** `docs/sql-subset.md` covers the grammar, binding, error order,\nsemantics and exit codes. Divergence D13 is extended: DuckDB compares a\nHUGEINT `SUM` with a decimal in DECIMAL(38, s), so it can fail with a\nconversion error where antb1 compares exactly.\n\n**ClickBench.** `HAVING` alone unlocks no ClickBench query (Q27 and Q28\nalso need expressions), so the ratchet is unchanged: 36 of 43.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full          # lint, ci, asan, tidy, coverage, fuzz-smoke, ci-gcc\nexit 0\n$ ANTB1_DIFF_COUNT=20000 pixi run diff-random\nDIFF: PASS seed=2213364440 queries=20000 failed=0 unsupported=0\n$ pixi run test-data           # hits_0, ratchet unchanged\n100% tests passed out of 6\n$ ANTB1_HITS_FILES=\"$HOME/.cache/antb1/clickbench/full/hits_*.parquet\" pixi run test-data   # all 100 files\n100% tests passed out of 6     (peak RSS 21 GB)\n```\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change: parser, property, unparser, binder,\nEXPLAIN, `.slt`, metamorphic and the generator\n- [x] Docs updated: `docs/sql-subset.md`, `docs/architecture.md`,\n`docs/recipes/write-slt-test.md`, notes in ADR 0008 and 0010 (statuses\nunchanged)\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: none are changed\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code wrote the change\nand the tests, ran the verification, and ran a read-only review with the\n`reviewer` agent, which found no P0 or P1 problems.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-09-28T03:01:06+03:00",
+          "tree_id": "ee9d9dbaf0b380f517b31a4e40cfd2091551c0ee",
+          "url": "https://github.com/ydb-campus/antb1/commit/2d50fd7c9611de088090ac4ad918e8332a1d2002"
+        },
+        "date": 1790553795215,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 3216.3876652793806,
+            "unit": "ns/iter",
+            "extra": "iterations: 217208\ncpu: 3215.987799712718 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 85048.62467932419,
+            "unit": "ns/iter",
+            "extra": "iterations: 7796\ncpu: 85037.17111339148 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222281.45012706175,
+            "unit": "ns/iter",
+            "extra": "iterations: 3148\ncpu: 222252.5965692503 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 439973.09829867637,
+            "unit": "ns/iter",
+            "extra": "iterations: 1587\ncpu: 439738.20730938873 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 348377.6129675838,
+            "unit": "ns/iter",
+            "extra": "iterations: 2005\ncpu: 348363.18054862827 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2114119.688821725,
+            "unit": "ns/iter",
+            "extra": "iterations: 331\ncpu: 2112991.2326283986 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 189.2244439999994,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 189.13423066666664 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.882871382978545,
+            "unit": "ms/iter",
+            "extra": "iterations: 47\ncpu: 14.876427212765947 ms\nthreads: 1"
           }
         ]
       }
