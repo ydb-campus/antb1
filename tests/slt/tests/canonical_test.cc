@@ -53,6 +53,17 @@ TEST(Canonical, Dates) {
   EXPECT_EQ(CanonicalDate(-1), "1969-12-31");
   EXPECT_EQ(CanonicalDate(-719'163), "0001-12-31 (BC)");
   EXPECT_EQ(CanonicalDate(17'542'962), "50000-12-31");
+  // TIMESTAMP as DuckDB prints it (checked against DuckDB 1.5.5): the fraction without trailing
+  // zeros, the time of day counted forward from midnight before 1970.
+  EXPECT_EQ(CanonicalTimestamp(0), "1970-01-01 00:00:00");
+  EXPECT_EQ(CanonicalTimestamp(1'370'000'000'123'000), "2013-05-31 11:33:20.123");
+  EXPECT_EQ(CanonicalTimestamp(1'370'000'000'120'000), "2013-05-31 11:33:20.12");
+  EXPECT_EQ(CanonicalTimestamp(1'370'000'000'000'001), "2013-05-31 11:33:20.000001");
+  EXPECT_EQ(CanonicalTimestamp(-1), "1969-12-31 23:59:59.999999");
+  EXPECT_EQ(CanonicalTimestamp(-62'135'596'800'000'000 - 1'000'000), "0001-12-31 (BC) 23:59:59");
+  EXPECT_EQ(CanonicalTimestamp(9'223'372'036'854'000'000), "294247-01-10 04:00:54");
+  EXPECT_EQ(CanonicalTimestamp(std::numeric_limits<int64_t>::max()), "infinity");
+  EXPECT_EQ(CanonicalTimestamp(-std::numeric_limits<int64_t>::max()), "-infinity");
 }
 
 // One canonical formatter: engine::FormatValue (antb1) and the helpers the DuckDB adapter uses

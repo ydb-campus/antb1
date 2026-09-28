@@ -118,6 +118,10 @@ std::string CanonicalDate(int32_t days_since_epoch) {
   return plan::FormatDate(days_since_epoch);  // what engine::FormatValue prints for antb1
 }
 
+std::string CanonicalTimestamp(int64_t micros_since_epoch) {
+  return plan::FormatTimestamp(micros_since_epoch);  // likewise
+}
+
 std::string SltCell(const std::optional<std::string>& value) {
   if (!value.has_value()) {
     return "NULL";

@@ -125,6 +125,8 @@ std::string_view TypeName(duckdb_type type) {
       return "DECIMAL";
     case DUCKDB_TYPE_DATE:
       return "DATE";
+    case DUCKDB_TYPE_TIMESTAMP:
+      return "TIMESTAMP";
     case DUCKDB_TYPE_VARCHAR:
       return "VARCHAR";
     case DUCKDB_TYPE_BLOB:
@@ -157,6 +159,7 @@ std::optional<ColumnReader> MakeReader(duckdb_result* result, idx_t column) {
       break;
     case DUCKDB_TYPE_BOOLEAN:
     case DUCKDB_TYPE_DATE:
+    case DUCKDB_TYPE_TIMESTAMP:
     case DUCKDB_TYPE_VARCHAR:
     case DUCKDB_TYPE_BLOB:
       reader.cls = ColumnClass::kText;
@@ -244,6 +247,8 @@ std::string ReadValue(const ColumnReader& reader, void* data, idx_t row) {
       return CanonicalDouble(At<double>(data, row));
     case DUCKDB_TYPE_DATE:
       return CanonicalDate(At<duckdb_date>(data, row).days);
+    case DUCKDB_TYPE_TIMESTAMP:
+      return CanonicalTimestamp(At<duckdb_timestamp>(data, row).micros);
     case DUCKDB_TYPE_VARCHAR:
     case DUCKDB_TYPE_BLOB: {
       auto* strings = static_cast<duckdb_string_t*>(data);
@@ -540,6 +545,8 @@ std::expected<std::unique_ptr<DuckDbEngine>, std::string> DuckDbEngine::Make(
         "CREATE VIEW \"{}\" AS SELECT * {}FROM read_parquet([{}], binary_as_string = true)", t.name,
         t.clickbench ? "REPLACE (make_date(EventDate) AS EventDate) " : "", files));
   }
+  // ClickBench's DuckDB setup (duckdb-parquet/create.sql at the pinned commit, docs/sql-subset.md).
+  setup.emplace_back("CREATE MACRO toDateTime(t) AS epoch_ms(t * 1000)");
   setup.emplace_back("SET lock_configuration = true");
   for (const auto& sql : setup) {
     if (auto result = Query(handles->conn, sql); !result) {

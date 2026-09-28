@@ -274,6 +274,9 @@ std::string ExprName(const sql::Expr& expr) {
   if (const auto* in = std::get_if<sql::InExpr>(&expr)) {
     return InName(*in, in->negated);
   }
+  if (const auto* e = std::get_if<sql::ExtractExpr>(&expr)) {
+    return std::format("main.date_part('{}', {})", AsciiLower(e->field), ExprName(*e->source));
+  }
   if (const auto* call = std::get_if<sql::FunctionCall>(&expr)) {
     std::string args;
     for (const sql::Expr& arg : call->args) {
@@ -316,18 +319,28 @@ std::optional<Rejection> RejectCondition(const sql::Expr& expr, bool having);
 
 // Whether the expression reads a column (or, `aggregates`, calls an aggregate): one that does
 // neither is a constant.
-// The scalar functions the binder answers: a VARCHAR argument, then string literals (the pattern
-// and the replacement of regexp_replace).
+// The scalar functions the binder answers: one value argument, the others string literals (the
+// pattern and the replacement of regexp_replace, the unit of date_trunc). toDateTime is
+// ClickBench's DuckDB macro, epoch_ms(t * 1000).
 struct FunctionSpec {
   std::string_view name;  // lower case, as DuckDB names the result
   Function function;
   std::size_t args;
+  std::size_t value_arg = 0;  // the value argument; the others are string literals
 };
 
 constexpr auto kFunctions = std::to_array<FunctionSpec>({
     {.name = "strlen", .function = Function::kStrlen, .args = 1},
     {.name = "regexp_replace", .function = Function::kRegexpReplace, .args = 3},
+    {.name = "todatetime", .function = Function::kEpochMs, .args = 1},
+    {.name = "date_trunc", .function = Function::kDateTrunc, .args = 2, .value_arg = 1},
 });
+
+// The date_trunc units and EXTRACT fields antb1 answers (DuckDB has more).
+constexpr auto kTruncUnits = std::to_array<std::string_view>(
+    {"year", "quarter", "month", "week", "day", "hour", "minute", "second"});
+constexpr auto kExtractFields =
+    std::to_array<std::string_view>({"year", "month", "day", "hour", "minute", "second"});
 
 std::optional<FunctionSpec> FindFunction(const sql::FunctionCall& call) {
   const std::string name = AsciiLower(call.name);
@@ -358,6 +371,9 @@ bool ReadsColumn(const sql::Expr& expr, bool aggregates = false) {
   if (const auto* in = std::get_if<sql::InExpr>(&expr)) {
     return ReadsColumn(*in->operand, aggregates);
   }
+  if (const auto* e = std::get_if<sql::ExtractExpr>(&expr)) {
+    return ReadsColumn(*e->source, aggregates);
+  }
   if (const auto* c = std::get_if<sql::CaseExpr>(&expr)) {
     const auto reads = [&](const sql::Expr& e) { return ReadsColumn(e, aggregates); };
     return (c->operand.has_value() && reads(**c->operand)) ||
@@ -376,10 +392,6 @@ std::optional<Rejection> FirstUnsupportedIn(const std::vector<sql::Expr>& exprs)
     }
   }
   return std::nullopt;
-}
-
-SourceSpan Prefix(SourceSpan span, std::size_t length) {
-  return SourceSpan{.offset = span.offset, .length = std::min(span.length, length)};
 }
 
 constexpr const char* kConditionsOnly =
@@ -453,7 +465,8 @@ struct FirstUnsupportedOf {
     if (!spec.has_value()) {
       return Rejection{.span = call.name_span,
                        .message = std::format("function {}() is not supported (only COUNT, SUM, "
-                                              "AVG, MIN, MAX, STRLEN and REGEXP_REPLACE)",
+                                              "AVG, MIN, MAX, STRLEN, REGEXP_REPLACE, TODATETIME "
+                                              "and DATE_TRUNC)",
                                               Clip(call.name))};
     }
     if (spec->function == Function::kRegexpReplace && call.args.size() == 4) {
@@ -467,11 +480,24 @@ struct FirstUnsupportedOf {
       return std::nullopt;  // a bind error (the binder reports the arity), as in DuckDB
     }
     for (std::size_t i = 0; i < call.args.size(); ++i) {
-      if (i > 0 && !std::holds_alternative<sql::Literal>(call.args[i])) {
-        return Rejection{.span = call.args[i].span(),
-                         .message = std::format("the arguments of {}() after the first must be "
-                                                "string literals",
-                                                spec->name)};
+      if (i != spec->value_arg && !std::holds_alternative<sql::Literal>(call.args[i])) {
+        return Rejection{
+            .span = call.args[i].span(),
+            .message = spec->value_arg == 0
+                           ? std::format("the arguments of {}() after the first must be string "
+                                         "literals",
+                                         spec->name)
+                           : std::format("the unit of {}() must be a string literal", spec->name)};
+      }
+      if (const auto* unit = std::get_if<sql::Literal>(&call.args[i]);
+          spec->function == Function::kDateTrunc && i == 0 && unit != nullptr &&
+          unit->kind == sql::Literal::Kind::kString &&
+          std::ranges::find(kTruncUnits, AsciiLower(unit->text)) == kTruncUnits.end()) {
+        return Rejection{.span = unit->span,
+                         .message = std::format("date_trunc() with the unit '{}' is not supported "
+                                                "(only year, quarter, month, week, day, hour, "
+                                                "minute and second)",
+                                                Clip(unit->text))};
       }
       // The evaluator anchors the pattern as ^(\C*?)(pattern) and shifts the replacement's groups
       // by two (exec/compute.cc): \8 and \9 would pass RE2's \9, and \Q would quote the ')'.
@@ -529,7 +555,13 @@ struct FirstUnsupportedOf {
     return std::nullopt;
   }
   std::optional<Rejection> operator()(const sql::ExtractExpr& e) const {
-    return Rejection{.span = Prefix(e.span, 7), .message = "EXTRACT is not supported"};
+    if (std::ranges::find(kExtractFields, AsciiLower(e.field)) == kExtractFields.end()) {
+      return Rejection{.span = e.field_span,
+                       .message = std::format("EXTRACT of {} is not supported (only year, month, "
+                                              "day, hour, minute and second)",
+                                              Clip(e.field))};
+    }
+    return FirstUnsupported(*e.source);
   }
 };
 
@@ -945,6 +977,11 @@ arrow::Result<Predicate> BindEquality(const sql::Comparison& cmp, const BoundCol
       return p;
     case LogicalType::kBoolean:
       return UnsupportedError("comparing a condition is not supported", cmp.span);
+    case LogicalType::kTimestamp:
+      return UnsupportedError(
+          std::format("comparing the TIMESTAMP '{}' with a literal is not supported",
+                      Clip(column.name)),
+          lit.span);
     case LogicalType::kDate: {
       if (number) {
         return mismatch("write a date as DATE 'YYYY-MM-DD'");
@@ -1051,6 +1088,9 @@ bool ContainsAggregate(const sql::Expr& expr) {
   }
   if (const auto* in = std::get_if<sql::InExpr>(&expr)) {
     return ContainsAggregate(*in->operand);
+  }
+  if (const auto* e = std::get_if<sql::ExtractExpr>(&expr)) {
+    return ContainsAggregate(*e->source);
   }
   if (const auto* c = std::get_if<sql::CaseExpr>(&expr)) {
     return (c->operand.has_value() && ContainsAggregate(**c->operand)) ||
@@ -1182,10 +1222,11 @@ std::string DescribeOperand(const Typed& t) {
 arrow::Result<LogicalType> ArithType(sql::BinaryOp sql_op, ArithOp op, const Typed& l,
                                      const Typed& r, SourceSpan span) {
   for (const Typed* t : {&l, &r}) {
-    if (t->expr->type == LogicalType::kDate) {
-      return UnsupportedError(
-          std::format("DATE arithmetic ('{}' is DATE) is not supported", Clip(t->expr->name)),
-          span);
+    if (t->expr->type == LogicalType::kDate || t->expr->type == LogicalType::kTimestamp) {
+      const std::string_view type = ToString(t->expr->type);
+      return UnsupportedError(std::format("{} arithmetic ('{}' is {}) is not supported", type,
+                                          Clip(t->expr->name), type),
+                              span);
     }
     if (!IsNumeric(t->expr->type)) {
       return BindError(std::format("arithmetic operator '{}' needs numbers, but {}",
@@ -1464,6 +1505,9 @@ class Binder {
     if (const auto* c = std::get_if<sql::CaseExpr>(&expr)) {
       return BindCase(*c, [this](const sql::Expr& e) { return BindInput(e); }, /*input=*/true);
     }
+    if (const auto* e = std::get_if<sql::ExtractExpr>(&expr)) {
+      return BindExtract(*e, [this](const sql::Expr& x) { return BindInput(x); });
+    }
     return UnsupportedError("this expression is not supported", expr.span());
   }
 
@@ -1479,31 +1523,99 @@ class Binder {
                                    spec->args == 1 ? "" : "s", call.args.size()),
                        call.span);
     }
-    ARROW_ASSIGN_OR_RAISE(Typed first, bind_arg(call.args[0]));
-    if (first.expr->type != LogicalType::kVarchar) {
-      return BindError(
-          std::format("{}() needs a VARCHAR, but {}", spec->name, DescribeOperand(first)),
-          call.args[0].span());
-    }
-    std::string name = std::string(spec->name) + "(" + first.expr->name;
-    FunctionExpr function{.function = spec->function, .args = {std::move(first.expr)}};
-    for (std::size_t i = 1; i < call.args.size(); ++i) {
+    ARROW_ASSIGN_OR_RAISE(Typed value, bind_arg(call.args[spec->value_arg]));
+    std::string name = std::string(spec->name) + "(";
+    std::vector<ExprPtr> literals;
+    for (std::size_t i = 0; i < call.args.size(); ++i) {
+      name += i == 0 ? "" : ", ";
+      if (i == spec->value_arg) {
+        name += value.expr->name;
+        continue;
+      }
       const auto* lit = std::get_if<sql::Literal>(&call.args[i]);
       if (lit == nullptr || lit->kind != sql::Literal::Kind::kString) {
         return BindError(
             std::format("argument {} of {}() must be a string literal", i + 1, spec->name),
             call.args[i].span());
       }
-      name += ", " + LiteralName(*lit);
-      function.args.push_back(std::make_shared<const Expr>(Expr{
-          .node =
-              ConstantExpr{.value = Constant{.type = LogicalType::kVarchar, .value = lit->text}},
+      name += LiteralName(*lit);
+      // date_trunc's unit matches case-insensitively.
+      const std::string text =
+          spec->function == Function::kDateTrunc ? AsciiLower(lit->text) : lit->text;
+      literals.push_back(std::make_shared<const Expr>(Expr{
+          .node = ConstantExpr{.value = Constant{.type = LogicalType::kVarchar, .value = text}},
           .type = LogicalType::kVarchar,
           .name = LiteralName(*lit)}));
     }
-    const LogicalType type =
-        spec->function == Function::kStrlen ? LogicalType::kBigInt : LogicalType::kVarchar;
-    return Leaf(Expr{.node = std::move(function), .type = type, .name = name + ")"});
+    name += ')';
+    const SourceSpan value_span = call.args[spec->value_arg].span();
+    LogicalType type = LogicalType::kVarchar;
+    switch (spec->function) {
+      case Function::kStrlen:
+      case Function::kRegexpReplace:
+        if (value.expr->type != LogicalType::kVarchar) {
+          return BindError(
+              std::format("{}() needs a VARCHAR, but {}", spec->name, DescribeOperand(value)),
+              value_span);
+        }
+        type = spec->function == Function::kStrlen ? LogicalType::kBigInt : LogicalType::kVarchar;
+        break;
+      case Function::kEpochMs: {
+        // toDateTime(t) is epoch_ms(t * 1000): the product is typed and checked as arithmetic.
+        if (!IsInteger(value.expr->type) || value.expr->type == LogicalType::kHugeInt) {
+          return BindError(std::format("toDateTime() needs an integer (seconds), but {}",
+                                       DescribeOperand(value)),
+                           value_span);
+        }
+        const sql::Literal thousand{
+            .kind = sql::Literal::Kind::kInteger, .negative = false, .text = "1000", .span = {}};
+        const sql::BinaryExpr product{.op = sql::BinaryOp::kMultiply,
+                                      .left = sql::Box<sql::Expr>(call.args[0]),
+                                      .right = sql::Box<sql::Expr>(sql::Expr(thousand)),
+                                      .op_span = call.name_span,
+                                      .span = call.span};
+        ARROW_ASSIGN_OR_RAISE(Typed literal, LiteralOperand(thousand));
+        ARROW_ASSIGN_OR_RAISE(value, Arith(product, std::move(value), std::move(literal)));
+        type = LogicalType::kTimestamp;
+        break;
+      }
+      case Function::kDateTrunc:
+        if (value.expr->type != LogicalType::kTimestamp && value.expr->type != LogicalType::kDate) {
+          return BindError(
+              std::format("date_trunc() needs a TIMESTAMP or DATE, but {}", DescribeOperand(value)),
+              value_span);
+        }
+        type = LogicalType::kTimestamp;
+        break;
+      case Function::kExtract:
+        return arrow::Status::Invalid("EXTRACT is no function call");
+    }
+    std::vector<ExprPtr> args{std::move(value.expr)};
+    args.insert(args.end(), literals.begin(), literals.end());
+    return Leaf(Expr{.node = FunctionExpr{.function = spec->function, .args = std::move(args)},
+                     .type = type,
+                     .name = std::move(name)});
+  }
+
+  // EXTRACT(field FROM source): BIGINT of a TIMESTAMP or DATE, named as DuckDB names it.
+  template <class BindArg>
+  arrow::Result<Typed> BindExtract(const sql::ExtractExpr& e, const BindArg& bind_arg) {
+    ARROW_ASSIGN_OR_RAISE(Typed source, bind_arg(*e.source));
+    if (source.expr->type != LogicalType::kTimestamp && source.expr->type != LogicalType::kDate) {
+      return BindError(
+          std::format("EXTRACT needs a TIMESTAMP or DATE, but {}", DescribeOperand(source)),
+          e.source->span());
+    }
+    const std::string field = AsciiLower(e.field);
+    std::string name = std::format("main.date_part('{}', {})", field, source.expr->name);
+    auto field_expr = std::make_shared<const Expr>(
+        Expr{.node = ConstantExpr{.value = Constant{.type = LogicalType::kVarchar, .value = field}},
+             .type = LogicalType::kVarchar,
+             .name = "'" + field + "'"});
+    return Leaf(Expr{.node = FunctionExpr{.function = Function::kExtract,
+                                          .args = {std::move(source.expr), std::move(field_expr)}},
+                     .type = LogicalType::kBigInt,
+                     .name = std::move(name)});
   }
 
   // The column of an input-scope expression: a table column as is, anything else computed (once):
@@ -1693,6 +1805,9 @@ class Binder {
     }
     if (const auto* c = std::get_if<sql::CaseExpr>(&expr)) {
       return BindCase(*c, [this](const sql::Expr& e) { return BindOutput(e); }, /*input=*/false);
+    }
+    if (const auto* e = std::get_if<sql::ExtractExpr>(&expr)) {
+      return BindExtract(*e, [this](const sql::Expr& x) { return BindOutput(x); });
     }
     return UnsupportedError("this expression is not supported", expr.span());
   }
@@ -2092,6 +2207,13 @@ arrow::Result<Predicate> Binder::BindConditionWith(const sql::Expr& conjunct, bo
   }
   ARROW_ASSIGN_OR_RAISE(const Typed left, bind(*binary.left));
   ARROW_ASSIGN_OR_RAISE(const Typed right, bind(*binary.right));
+  const auto temporal = [](LogicalType t) {
+    return t == LogicalType::kDate || t == LogicalType::kTimestamp;
+  };
+  if (left.expr->type != right.expr->type && temporal(left.expr->type) &&
+      temporal(right.expr->type)) {
+    return UnsupportedError("comparing a DATE with a TIMESTAMP is not supported", binary.op_span);
+  }
   if (!Comparable(left.expr->type, right.expr->type)) {
     return BindError(
         std::format("cannot compare {} with {}", DescribeOperand(left), DescribeOperand(right)),
@@ -2184,6 +2306,10 @@ arrow::Result<LogicalType> CaseCommon(LogicalType a, LogicalType b, SourceSpan s
   if (IsNumeric(a) && IsNumeric(b)) {
     return LogicalType::kDouble;
   }
+  if ((a == LogicalType::kDate && b == LogicalType::kTimestamp) ||
+      (a == LogicalType::kTimestamp && b == LogicalType::kDate)) {
+    return UnsupportedError("CASE values of types DATE and TIMESTAMP are not supported", span);
+  }
   return BindError(
       std::format("cannot mix values of type {} and {} in CASE", ToString(a), ToString(b)), span);
 }
@@ -2269,8 +2395,8 @@ arrow::Result<Typed> Binder::BindCase(const sql::CaseExpr& c, const BindFn& bind
                                                                    .value = Int128{*days}}},
                             .type = LogicalType::kDate,
                             .name = values[i].expr->name});
-    } else if (IsNumeric(*type)) {
-      // DuckDB casts the string to the number ('1' next to SMALLINT is 1).
+    } else if (IsNumeric(*type) || *type == LogicalType::kTimestamp) {
+      // DuckDB casts the string to the number ('1' next to SMALLINT is 1) or the TIMESTAMP.
       return UnsupportedError(std::format("a string literal as a CASE value next to {} values is "
                                           "not supported",
                                           ToString(*type)),

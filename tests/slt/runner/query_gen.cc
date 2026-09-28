@@ -684,6 +684,8 @@ class Builder {
         std::optional<bool> exact;
         if (rng_.Percent(8)) {
           exact = Case(c);
+        } else if (rng_.Percent(8) && Temporal(c, /*number=*/false)) {
+          exact = true;
         } else if (c.kind == ValueKind::kVarchar && rng_.Percent(20)) {
           if (StringFunction(c, rng_.Percent(50)).has_value()) {
             exact = true;
@@ -710,9 +712,9 @@ class Builder {
           orderable = false;
         }
         aggregate_emitted_ = true;
-        // A string function changes the argument's values (and strlen its type): HAVING has no
+        // A string or timestamp function changes the argument's values and type: HAVING has no
         // literals for them.
-        if (!exact.has_value() || arg->kind != ValueKind::kVarchar) {
+        if (!arg_retyped_) {
           call.emplace(agg, arg);
         }
       }
@@ -752,6 +754,7 @@ class Builder {
     Keyword(AggName(agg));
     Symbol("(");
     std::optional<bool> exact;
+    arg_retyped_ = false;
     if (arg == nullptr) {
       Symbol("*");
     } else {
@@ -761,10 +764,17 @@ class Builder {
       if (arithmetic && rng_.Percent(30)) {
         exact = Case(*arg);
       }
+      // SUM and AVG take only EXTRACT's BIGINT.
+      if (arithmetic && !exact.has_value() && rng_.Percent(25) &&
+          Temporal(*arg, /*number=*/agg == Agg::kSum || agg == Agg::kAvg)) {
+        exact = true;
+        arg_retyped_ = true;
+      }
       if (arithmetic && !exact.has_value()) {
         if (arg->kind == ValueKind::kVarchar) {
           const std::optional<ValueKind> kind = StringFunction(*arg, rng_.Percent(50));
           exact = kind.has_value() ? std::optional(true) : std::nullopt;
+          arg_retyped_ = exact.has_value();
         } else {
           exact = Arithmetic(*arg);
         }
@@ -1060,6 +1070,13 @@ class Builder {
         return;
       }
       const std::string_view op = rng_.Pick(kOps);
+      if (rng_.Percent(6) && allowed_.Has(Feature::kIntegerLiteral) &&
+          Temporal(c, /*number=*/true)) {
+        used_.Add(Feature::kIntegerLiteral);
+        Symbol(op);
+        tokens_.push_back({.kind = Token::Kind::kLiteral, .text = std::to_string(rng_.Below(60))});
+        return;
+      }
       if (c.kind == ValueKind::kVarchar && rng_.Percent(10) &&
           allowed_.Has(Feature::kIntegerLiteral) && StringFunction(c, true).has_value()) {
         used_.Add(Feature::kIntegerLiteral);
@@ -1270,6 +1287,59 @@ class Builder {
   void Column(const GenColumn& c) {
     used_.Add(TypeFeature(c.kind));
     tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.name});
+  }
+
+  // toDateTime(c) of an integer column (seconds) whose values times 1000 fit its type (both
+  // engines fail on the overflow), or a DATE column; as is (TIMESTAMP), under EXTRACT (BIGINT) or
+  // under date_trunc (TIMESTAMP). `number`: only EXTRACT. Returns whether it wrote one.
+  bool Temporal(const GenColumn& c, bool number) {
+    if (!allowed_.Has(Feature::kTimestamps)) {
+      return false;
+    }
+    const bool date = c.kind == ValueKind::kDate;
+    const bool seconds = c.kind == ValueKind::kInteger && c.data_min.has_value() &&
+                         c.data_max.has_value() && *c.data_max <= c.max / 1000 &&
+                         *c.data_min >= c.min / 1000;
+    if (!date && !seconds) {
+      return false;
+    }
+    used_.Add(Feature::kTimestamps);
+    const auto source = [&] {
+      if (date) {
+        Column(c);
+        return;
+      }
+      Keyword("toDateTime");
+      Symbol("(");
+      Column(c);
+      Symbol(")");
+    };
+    const bool trunc = !number && allowed_.Has(Feature::kStringLiteral) && rng_.Percent(40);
+    if (number || (!trunc && (date || rng_.Percent(50)))) {
+      static constexpr auto kFields =
+          std::to_array<std::string_view>({"year", "month", "day", "hour", "minute", "second"});
+      Keyword("EXTRACT");
+      Symbol("(");
+      Keyword(rng_.Pick(kFields));
+      Keyword("FROM");
+      source();
+      Symbol(")");
+      return true;
+    }
+    if (trunc) {
+      static constexpr auto kUnits = std::to_array<std::string_view>(
+          {"year", "quarter", "month", "week", "day", "hour", "minute", "second"});
+      used_.Add(Feature::kStringLiteral);
+      Keyword("date_trunc");
+      Symbol("(");
+      tokens_.push_back({.kind = Token::Kind::kLiteral, .text = SqlString(rng_.Pick(kUnits))});
+      Symbol(",");
+      source();
+      Symbol(")");
+      return true;
+    }
+    source();
+    return true;
   }
 
   // CASE WHEN <condition> THEN c [WHEN <condition> THEN c or a literal] [ELSE c or a literal] END
@@ -1503,7 +1573,9 @@ class Builder {
   std::vector<Token> tokens_;
   FeatureSet used_;
   std::vector<const GenColumn*> comparable_;  // the query's columns WHERE can compare
-  std::vector<std::string> order_aliases_;    // select aliases of items with I or T values
+  bool arg_retyped_ =
+      false;  // the last Aggregate() wrapped its column in a string or time function
+  std::vector<std::string> order_aliases_;  // select aliases of items with I or T values
   struct AggregateAlias {
     std::string alias;
     std::pair<Agg, const GenColumn*> call;

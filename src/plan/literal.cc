@@ -319,6 +319,31 @@ std::string FormatDate(int32_t days) {
   return std::format("{:04}-{:02}-{:02}", year, month, day);
 }
 
+std::string FormatTimestamp(int64_t micros) {
+  if (micros == std::numeric_limits<int64_t>::max()) {
+    return "infinity";
+  }
+  if (micros == -std::numeric_limits<int64_t>::max()) {
+    return "-infinity";
+  }
+  constexpr int64_t kPerDay = 86'400'000'000;
+  int64_t days = micros / kPerDay;
+  int64_t rest = micros % kPerDay;
+  if (rest < 0) {  // floor: the time of day counts forward from midnight
+    rest += kPerDay;
+    --days;
+  }
+  const int64_t seconds = rest / 1'000'000;
+  std::string out = std::format("{} {:02}:{:02}:{:02}", FormatDate(Narrow<int32_t>(days)),
+                                seconds / 3'600, (seconds / 60) % 60, seconds % 60);
+  if (const int64_t fraction = rest % 1'000'000; fraction != 0) {
+    std::string digits = std::format("{:06}", fraction);
+    digits.erase(digits.find_last_not_of('0') + 1);
+    out += "." + digits;
+  }
+  return out;
+}
+
 IntegerRange RangeOf(LogicalType integer_type) {
   switch (integer_type) {
     case LogicalType::kSmallInt:
@@ -337,6 +362,7 @@ IntegerRange RangeOf(LogicalType integer_type) {
     case LogicalType::kDouble:
     case LogicalType::kVarchar:
     case LogicalType::kDate:
+    case LogicalType::kTimestamp:
     case LogicalType::kBoolean:
       break;
   }

@@ -4,6 +4,8 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <utility>
+#include <variant>
 #include <vector>
 
 #include <arrow/api.h>
@@ -32,6 +34,82 @@ TEST(LogicalPlanTest, OperatorAndAggregateNames) {
   EXPECT_EQ(ToString(AggKind::kAvg), "AVG");
   EXPECT_EQ(ToString(AggKind::kMin), "MIN");
   EXPECT_EQ(ToString(AggKind::kMax), "MAX");
+}
+
+ExprPtr Column(int index, LogicalType type = LogicalType::kSmallInt) {
+  return std::make_shared<const Expr>(
+      Expr{.node = ColumnExpr{.index = index}, .type = type, .name = "c"});
+}
+
+ExprPtr Condition(int index, CompareOp op, Int128 value) {
+  Predicate p{.kind = Predicate::Kind::kCompare,
+              .column = BoundColumn{.index = 0, .name = "o", .type = LogicalType::kSmallInt},
+              .op = op,
+              .constant = Constant{.type = LogicalType::kSmallInt, .value = value},
+              .span = {}};
+  return std::make_shared<const Expr>(
+      Expr{.node = PredicateExpr{.predicate = std::move(p), .operands = {Column(index)}},
+           .type = LogicalType::kBoolean,
+           .name = "p"});
+}
+
+ExprPtr Bool(BoolOp op, std::vector<ExprPtr> args) {
+  return std::make_shared<const Expr>(Expr{.node = BoolExpr{.op = op, .args = std::move(args)},
+                                           .type = LogicalType::kBoolean,
+                                           .name = "b"});
+}
+
+ExprPtr Case(std::vector<ExprPtr> whens, std::vector<ExprPtr> thens, ExprPtr otherwise) {
+  return std::make_shared<const Expr>(Expr{.node = CaseExpr{.whens = std::move(whens),
+                                                            .thens = std::move(thens),
+                                                            .otherwise = std::move(otherwise)},
+                                           .type = LogicalType::kSmallInt,
+                                           .name = "case"});
+}
+
+// Structure, not names: conditions compare their predicate (kind, operator, constants) and
+// operands; CASE its branches and ELSE (a missing one too); every child is renumbered and read.
+TEST(LogicalPlanTest, ConditionAndCaseExpressions) {
+  const auto gt1 = Condition(0, CompareOp::kGt, 1);
+  EXPECT_TRUE(SameExpr(*gt1, *Condition(0, CompareOp::kGt, 1)));
+  EXPECT_FALSE(SameExpr(*gt1, *Condition(0, CompareOp::kGe, 1)));
+  EXPECT_FALSE(SameExpr(*gt1, *Condition(0, CompareOp::kGt, 2)));
+  EXPECT_FALSE(SameExpr(*gt1, *Condition(1, CompareOp::kGt, 1)));
+  const auto any = Bool(BoolOp::kOr, {gt1, Condition(1, CompareOp::kLt, 0)});
+  EXPECT_TRUE(SameExpr(*any, *Bool(BoolOp::kOr, {gt1, Condition(1, CompareOp::kLt, 0)})));
+  EXPECT_FALSE(SameExpr(*any, *Bool(BoolOp::kAnd, {gt1, Condition(1, CompareOp::kLt, 0)})));
+  EXPECT_FALSE(SameExpr(*any, *Bool(BoolOp::kOr, {gt1})));
+  const auto with_else = Case({any}, {Column(2)}, Column(3));
+  const auto without_else = Case({any}, {Column(2)}, nullptr);
+  EXPECT_TRUE(SameExpr(*with_else, *Case({any}, {Column(2)}, Column(3))));
+  EXPECT_FALSE(SameExpr(*with_else, *without_else));
+  EXPECT_TRUE(SameExpr(*without_else, *Case({any}, {Column(2)}, nullptr)));
+  EXPECT_FALSE(SameExpr(*with_else, *Case({gt1}, {Column(2)}, Column(3))));
+
+  std::vector<int> read;
+  CollectColumns(*with_else, read);
+  EXPECT_EQ(read, (std::vector<int>{0, 1, 2, 3}));
+  const auto renumbered = Renumber(without_else, {10, 11, 12, 13});
+  read.clear();
+  CollectColumns(*renumbered, read);
+  EXPECT_EQ(read, (std::vector<int>{10, 11, 12}));
+  EXPECT_EQ(std::get<CaseExpr>(renumbered->node).otherwise, nullptr);
+}
+
+TEST(LogicalPlanTest, FunctionAndTypeNames) {
+  EXPECT_EQ(ToString(Function::kStrlen), "strlen");
+  EXPECT_EQ(ToString(Function::kRegexpReplace), "regexp_replace");
+  EXPECT_EQ(ToString(Function::kEpochMs), "epoch_ms");
+  EXPECT_EQ(ToString(Function::kExtract), "extract");
+  EXPECT_EQ(ToString(Function::kDateTrunc), "date_trunc");
+  EXPECT_EQ(ToString(LogicalType::kTimestamp), "TIMESTAMP");
+  EXPECT_EQ(ToString(LogicalType::kBoolean), "BOOLEAN");
+  EXPECT_TRUE(ToArrow(LogicalType::kTimestamp)->Equals(*arrow::timestamp(arrow::TimeUnit::MICRO)));
+  EXPECT_TRUE(ToArrow(LogicalType::kBoolean)->Equals(*arrow::boolean()));
+  // Neither is a column type: a Parquet timestamp or boolean column stays unsupported.
+  EXPECT_FALSE(FromArrow(*arrow::timestamp(arrow::TimeUnit::MICRO)).ok());
+  EXPECT_FALSE(FromArrow(*arrow::boolean()).ok());
+  EXPECT_FALSE(ToArrowScalar(Constant{.type = LogicalType::kTimestamp, .value = Int128{0}}).ok());
 }
 
 TEST(LogicalPlanTest, ConstantText) {

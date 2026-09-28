@@ -12,8 +12,9 @@ Every query of the [grammar](#grammar) below runs: global and grouped (`GROUP BY
 included, projections (`*`, columns or constants), `WHERE` conditions (`column <op> literal` comparisons,
 `column [NOT] LIKE 'pattern'` and `column [NOT] IN (literal, ...)`, combined with `AND`, `OR` and `NOT`), `GROUP BY`
 and `ORDER BY` (also by position), `HAVING` (the same conditions on aggregates and keys), arithmetic
-(`+ - * / // %` and unary `-`), the string functions `strlen` and `regexp_replace` and `CASE` in every clause,
-`LIMIT` and `OFFSET`, over one table of Parquet files. This covers 41 of the 43 ClickBench queries (see
+(`+ - * / // %` and unary `-`), the string functions `strlen` and `regexp_replace`, the timestamp functions
+`toDateTime`, `EXTRACT` and `date_trunc`, and `CASE` in every clause,
+`LIMIT` and `OFFSET`, over one table of Parquet files. This covers all 43 ClickBench queries (see
 [ClickBench status](#clickbench-status)).
 
 ```sql
@@ -93,7 +94,8 @@ Keywords are not reserved by the lexer.
 **What the binder answers today.** Of the expressions above, antb1 answers:
 
 - value expressions: columns, literals, aggregates, arithmetic (`+ - * / // %`, unary `-`), the functions
-  `strlen(varchar)` and `regexp_replace(varchar, 'pattern', 'replacement')` and `CASE` (both forms, with conditions
+  `strlen(varchar)`, `regexp_replace(varchar, 'pattern', 'replacement')`, `toDateTime(integer)`,
+  `EXTRACT(field FROM timestamp)` and `date_trunc('unit', timestamp)`, and `CASE` (both forms, with conditions
   as below) of them, in the select list, aggregate arguments (not constant ones), `GROUP BY` and `ORDER BY` (literals
   there are positions or constants, see [Binding](#binding));
 - conditions (`WHERE`, `HAVING` and `CASE WHEN`): `operand <op> literal` in either order, `operand <op> operand`,
@@ -103,11 +105,11 @@ Keywords are not reserved by the lexer.
 - any of these in parentheses (`(a)`, `SUM((a))`, `WHERE (a = 1 AND b = 2)`), which group without changing
   anything.
 
-Every other expression (`EXTRACT`, function calls other than the five aggregates, `strlen` and `regexp_replace`, a
-condition used as a value, as in `SELECT a = 1`, a comparison of two constants, a bare column as a condition) parses,
-and is then
-rejected by the binder with exit code 4 at its first token, before any name is resolved. `GROUP BY ALL` and
-`ORDER BY ALL` are rejected by the parser, and so are `SUM`, `AVG`, `MIN` and `MAX` with `DISTINCT`.
+Every other expression (function calls other than the five aggregates and the functions above, `EXTRACT` of other
+fields, a condition used as a value, as in `SELECT a = 1`, a comparison of two constants, a bare column as a
+condition) parses, and is then rejected by the binder with exit code 4 at its first token, before any name is
+resolved. `GROUP BY ALL` and `ORDER BY ALL` are rejected by the parser, and so are `SUM`, `AVG`, `MIN` and `MAX` with
+`DISTINCT`.
 
 Outside the grammar, the parser recognizes common SQL and rejects it with exit code 4 and a source span, among others:
 `SELECT DISTINCT`, joins, subqueries, `ILIKE`, `LIKE ... ESCAPE`, `NULL` literals, `IS [NOT] NULL`, `BETWEEN`, `CAST`
@@ -176,6 +178,16 @@ items).
   optional fourth argument (options), `\Q` in a pattern, `\8` and `\9` in a replacement and any other function are
   unsupported (exit code 4). The result name is
   DuckDB's: `strlen(URL)`, `regexp_replace(URL, '^(.)', '\1')`.
+- Timestamps: `toDateTime(t)` is ClickBench's DuckDB macro `epoch_ms(t * 1000)` (its `duckdb-parquet/create.sql` at
+  the pinned commit; the test oracle defines the same macro): `t * 1000` is typed and checked as arithmetic (so a
+  SMALLINT `t` above 32 overflows, as in DuckDB), and the result is TIMESTAMP. It takes an integer other than
+  HUGEINT; any other type is a bind error. `EXTRACT(field FROM x)` takes a TIMESTAMP or DATE and the fields
+  `year`, `month`, `day`, `hour`, `minute` and `second` (case-insensitive) and is BIGINT; `date_trunc('unit', x)`
+  takes a TIMESTAMP or DATE and the units `year`, `quarter`, `month`, `week`, `day`, `hour`, `minute` and `second`
+  (a string literal, case-insensitive) and is TIMESTAMP. Other fields and units, TIMESTAMP literals, comparing a
+  TIMESTAMP with a literal or with a DATE, TIMESTAMP arithmetic and a string literal next to TIMESTAMP values in
+  `CASE` are unsupported (exit code 4). The result names are DuckDB's: `todatetime(EventTime)`,
+  `main.date_part('minute', todatetime(EventTime))`, `date_trunc('minute', todatetime(EventTime))`.
 - `CASE` (as DuckDB types it): the values (`THEN` and `ELSE`) take their common type, where an integer literal takes
   the other values' integer type when it fits (`CASE WHEN .. THEN smallint_col ELSE 0 END` is SMALLINT), two integer
   types give the wider one (USMALLINT with SMALLINT: INTEGER, unlike arithmetic), DOUBLE with any number DOUBLE, and
@@ -273,6 +285,7 @@ Project RegionID, c
 | BYTE_ARRAY, unannotated | binary | VARCHAR | compared byte-wise |
 | BYTE_ARRAY annotated STRING (UTF8) | utf8 | VARCHAR | same engine representation as unannotated |
 | DECIMAL(38, 0) | decimal128(38, 0) | HUGEINT | also the result type of integer SUM |
+| – | timestamp[us] | TIMESTAMP | only computed (`toDateTime`, `date_trunc`); a Parquet timestamp column is unsupported |
 | anything else | – | unsupported | `antb1 schema` shows `unsupported(<type>)`; a query that uses the column is rejected |
 
 `--column-type COL=DATE` reinterprets a USMALLINT or INTEGER column as days since 1970-01-01; `--clickbench` is a
@@ -343,6 +356,15 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   `x + c <op> k`, `x - c <op> k`, `c - x <op> k` and `x * c <op> k` (a signed integer `x`, integer constants, `c`
   dividing `k` for `*`) compare `x` with a moved constant, repeatedly, while `k` and the new constant fit the type.
   The arithmetic is then never computed. Divergence D14 lists what still differs.
+- Timestamps: microseconds since 1970-01-01 00:00:00, without a time zone, printed as DuckDB prints them
+  (`2013-07-15 14:00:00`, a fraction without trailing zeros, `0001-12-31 (BC) 23:59:59` before year 1).
+  `toDateTime` fails the query when `t * 1000` overflows its type or the time is outside DuckDB's TIMESTAMP range,
+  `290309-12-22 (BC) 00:00:00` to `294247-01-10 04:00:54.775807`, as in DuckDB. `EXTRACT` gives the civil field
+  (the year astronomically: 1 BC is 0) and `date_trunc` rounds down (before 1970 too:
+  `date_trunc('minute', toDateTime(-61))` is `1969-12-31 23:58:00`), in 64-bit calendar arithmetic over the whole
+  range; weeks start on Monday. A DATE is the timestamp of its midnight; `date_trunc` of a DATE whose result is
+  outside the TIMESTAMP range fails the query, and of an infinite DATE is infinite, where `EXTRACT` is NULL.
+  TIMESTAMP values sort, group and aggregate (`MIN`, `MAX`, `COUNT`, `COUNT(DISTINCT)`) like integers.
 - Strings: `strlen` counts bytes. `regexp_replace` replaces the first match only, with RE2 in UTF-8 mode as DuckDB
   runs it (`.` matches one character but no newline); in the replacement `\0` is the match, `\1` to `\9` its groups
   and `\\` a backslash. A replacement RE2 rejects (a group the pattern does not have, a lone or unknown backslash)
@@ -423,7 +445,7 @@ compare against DuckDB, so an unregistered difference is a bug.
 | D3 | Literal types | a string literal compared with a numeric column is a bind error | casts the string to the column's type | `onlyif antb1` records in `tests/slt/cases/basic/bind_errors.slt`; the query generator writes numbers for numeric columns |
 | D4 | Literal types | a number or a `DATE` literal compared with a VARCHAR column is a bind error | casts the column's values at run time (a conversion error unless every value converts) | as D3; the generator writes strings for VARCHAR columns |
 | D5 | Date literals | a date must be written exactly `YYYY-MM-DD` | also accepts `2013-7-1`, surrounding spaces and a time of day | as D3; the generator writes `YYYY-MM-DD` |
-| D6 | AVG of DATE | `AVG` of a DATE column is a bind error | returns a TIMESTAMP | as D3; the generator averages numeric columns only |
+| D6 | AVG of DATE and TIMESTAMP | `AVG` of a DATE or TIMESTAMP value is a bind error | returns a TIMESTAMP | as D3; the generator averages numeric columns only |
 | D7 | DOUBLE literals and BIGINT | a number that DuckDB types as DOUBLE (an exponent, or more than 38 digits) is rounded to the nearest double like in DuckDB, then compared exactly with the integer column; in an `IN` list with such a number every value is rounded so | converts BIGINT (and HUGEINT) values to DOUBLE for the comparison, so values beyond 2^53 compare rounded: `i64 >= 9223372036854775808e0` holds for `9223372036854775807` | the `.slt` records with such literals avoid BIGINT values beyond 2^53 (`tests/slt/cases/where/folding.slt`); `plan.ApproximateNumbers/FoldThroughBinderTest.*` pins antb1's folding; the generator writes no exponents |
 | D8 | Result names | an aggregate's argument is quoted when it is not a plain identifier or is a reserved word | also quotes non-reserved keywords (`sum("year")`) | the tests compare values and types, not names |
 | D9 | HUGEINT range | HUGEINT is decimal128(38, 0): a `SUM`, or arithmetic on a `SUM`, outside -(10^38 - 1) to 10^38 - 1 is an execution error (exit code 1). An integer SUM over BIGINT or smaller types cannot reach it | HUGEINT holds -(2^127 - 1) to 2^127 - 1 | no fixture has a HUGEINT column; `exec.AggregateStateTest.HugeIntSumIsCheckedAgainstTheRange` checks the error |
@@ -445,7 +467,7 @@ query text itself is never committed. The data test `data.clickbench.status` (`p
 with DuckDB and fails when the passing queries differ from the ratchet `tests/data/clickbench_status.json`. `pass`
 below means exactly the ratchet (`pixi run lint` compares them); the PR that changes the pass set updates both
 ([testing.md](testing.md#the-clickbench-ratchet)). Every other query must fail cleanly (exit code 4, or a parse or
-bind error); today all of them answer Unsupported with exit code 4.
+bind error); today there is none: every query passes.
 
 | Query | Status | Notes |
 | --- | --- | --- |
@@ -467,6 +489,7 @@ bind error); today all of them answer Unsupported with exit code 4.
 | Q15 | pass | `GROUP BY` one column, ordered by the count descending, top-N |
 | Q16 | pass | `GROUP BY` two columns, ordered by the count descending, top-N |
 | Q17 | pass | `GROUP BY` two columns with `COUNT(*)` and `LIMIT` without `ORDER BY`: any groups are a right answer, compared as a subset of DuckDB's unlimited answer |
+| Q18 | pass | `EXTRACT(minute FROM toDateTime(...))` grouped by its alias with two columns, ordered by the count, top-N |
 | Q19 | pass | not a target: a projection under a `WHERE` comparison; fits the grammar and passes incidentally |
 | Q20 | pass | `COUNT(*)` under `LIKE '%...%'` |
 | Q21 | pass | `LIKE '%...%'` and a comparison, `GROUP BY` one column with `MIN` and `COUNT(*)`, ordered by the count, top-N |
@@ -490,4 +513,4 @@ bind error); today all of them answer Unsupported with exit code 4.
 | Q39 | pass | `CASE` over an `AND` of two comparisons, grouped by its alias with other columns, under a `WHERE` conjunction, ordered by the count, a window with `OFFSET` |
 | Q40 | pass | a `WHERE` conjunction with `IN` over two values, `GROUP BY` two columns, ordered by the count, a window with `OFFSET` |
 | Q41 | pass | `GROUP BY` two columns under a `WHERE` conjunction, ordered by the alias of the count, a window with `OFFSET` |
-| all others | out of scope | need timestamps (the next PRs of the expressions plan); they fail cleanly with exit code 4 |
+| Q42 | pass | `date_trunc('minute', toDateTime(...))` selected, grouped and ordered by (the same expression, a TIMESTAMP key) under a `WHERE` conjunction, a window with `OFFSET` |

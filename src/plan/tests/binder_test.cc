@@ -238,8 +238,8 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{R"(SELECT "lower"(url) FROM t)", kUnsupported, R"("lower")",
                   "function lower() is not supported"},
         ErrorCase{"SELECT a FROM t GROUP BY year(d)", kUnsupported, "year",
-                  "function year() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN and "
-                  "REGEXP_REPLACE)"},
+                  "function year() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
+                  "REGEXP_REPLACE, TODATETIME and DATE_TRUNC)"},
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING 1 < 2", kUnsupported, "2",
                   "comparisons between two literals are not supported"},
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING COUNT(*)", kUnsupported, "COUNT(*)",
@@ -267,6 +267,30 @@ INSTANTIATE_TEST_SUITE_P(
                   "IN is only supported in conditions (WHERE, HAVING and CASE WHEN)"},
         ErrorCase{"SELECT a FROM t WHERE region IN (1 + 2)", kUnsupported, "1 + 2",
                   "only literals are supported in an IN list"},
+        ErrorCase{"SELECT toDateTime(d) FROM t", kBind, "d",
+                  "toDateTime() needs an integer (seconds), but 'd' is DOUBLE"},
+        ErrorCase{"SELECT toDateTime(h) FROM t", kBind, "h", "toDateTime() needs an integer"},
+        ErrorCase{"SELECT toDateTime(i64, 1) FROM t", kBind, "toDateTime(i64, 1)",
+                  "todatetime() takes 1 argument, not 2"},
+        ErrorCase{"SELECT date_trunc(s, dt) FROM t", kUnsupported, "s",
+                  "the unit of date_trunc() must be a string literal"},
+        ErrorCase{"SELECT date_trunc('decade', dt) FROM t", kUnsupported, "'decade'",
+                  "date_trunc() with the unit 'decade' is not supported"},
+        ErrorCase{"SELECT date_trunc('day', s) FROM t", kBind, "s",
+                  "date_trunc() needs a TIMESTAMP or DATE, but 's' is VARCHAR"},
+        ErrorCase{"SELECT EXTRACT(dow FROM dt) FROM t", kUnsupported, "dow",
+                  "EXTRACT of dow is not supported"},
+        ErrorCase{"SELECT EXTRACT(minute FROM i64) FROM t", kBind, "i64",
+                  "EXTRACT needs a TIMESTAMP or DATE, but 'i64' is BIGINT"},
+        ErrorCase{"SELECT AVG(toDateTime(i64)) FROM t", kBind, "AVG(toDateTime(i64))",
+                  "AVG needs a numeric column"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE toDateTime(i64) > 5", kUnsupported, "5",
+                  "comparing the TIMESTAMP 'todatetime(i64)' with a literal is not supported"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE toDateTime(i64) > dt", kUnsupported, ">",
+                  "comparing a DATE with a TIMESTAMP is not supported"},
+        ErrorCase{"SELECT toDateTime(i64) + 1 FROM t", kUnsupported, "+", "TIMESTAMP arithmetic"},
+        ErrorCase{"SELECT CASE WHEN i16 = 1 THEN toDateTime(i64) ELSE dt END FROM t", kUnsupported,
+                  "dt", "CASE values of types DATE and TIMESTAMP are not supported"},
         ErrorCase{"SELECT CASE WHEN i16 = 1 THEN s ELSE 1 END FROM t", kBind, "1",
                   "cannot mix values of type VARCHAR and INTEGER in CASE"},
         ErrorCase{"SELECT CASE WHEN i16 = 1 THEN dt ELSE 2 END FROM t", kBind, "2",
@@ -339,20 +363,20 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT SUM(1 + 2) FROM t", kUnsupported, "1 + 2",
                   "constant aggregate arguments are not supported"},
         ErrorCase{"SELECT lower(url) FROM t", kUnsupported, "lower",
-                  "function lower() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN and "
-                  "REGEXP_REPLACE)"},
+                  "function lower() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
+                  "REGEXP_REPLACE, TODATETIME and DATE_TRUNC)"},
         ErrorCase{"SELECT a FROM t WHERE length(url) > 5", kUnsupported, "length",
-                  "function length() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN and "
-                  "REGEXP_REPLACE)"},
+                  "function length() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
+                  "REGEXP_REPLACE, TODATETIME and DATE_TRUNC)"},
         ErrorCase{"SELECT a FROM t WHERE d > now()", kUnsupported, "now",
-                  "function now() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN and "
-                  "REGEXP_REPLACE)"},
+                  "function now() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
+                  "REGEXP_REPLACE, TODATETIME and DATE_TRUNC)"},
         ErrorCase{"SELECT SUM(abs(a)) FROM t", kUnsupported, "abs",
-                  "function abs() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN and "
-                  "REGEXP_REPLACE)"},
+                  "function abs() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
+                  "REGEXP_REPLACE, TODATETIME and DATE_TRUNC)"},
         ErrorCase{"SELECT left(url, 3) FROM t", kUnsupported, "left",
-                  "function left() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN and "
-                  "REGEXP_REPLACE)"},
+                  "function left() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
+                  "REGEXP_REPLACE, TODATETIME and DATE_TRUNC)"},
         ErrorCase{"SELECT COUNT(1) FROM t", kUnsupported, "1",
                   "constant aggregate arguments are not supported (use COUNT(*))"},
         ErrorCase{"SELECT SUM('x') FROM t", kUnsupported, "'x'",
@@ -1043,6 +1067,47 @@ TEST(BinderTest, CaseTypes) {
   const std::string explain = Explain(*grouped);
   EXPECT_NE(explain.find("GroupAggregate keys=[\"CASE  WHEN (((i16 = 0) AND (i32 = 0))) THEN (s) "
                          "ELSE '' END\"]"),
+            std::string::npos)
+      << explain;
+}
+
+// toDateTime(t) is ClickBench's macro epoch_ms(t * 1000), the product typed as arithmetic;
+// EXTRACT is BIGINT and date_trunc TIMESTAMP, of a TIMESTAMP or DATE; names are DuckDB's.
+TEST(BinderTest, TimestampFunctions) {
+  const Catalog catalog = MakeCatalog();
+  auto plan = BindSql(
+      "SELECT toDateTime(i64), EXTRACT(MINUTE FROM toDateTime(i64)) AS m, "
+      "DATE_TRUNC('Hour', toDateTime(i64)), date_trunc('month', dt), extract(year FROM dt) FROM t",
+      catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  const std::vector<std::pair<std::string, LogicalType>> expected = {
+      {"todatetime(i64)", LogicalType::kTimestamp},
+      {"m", LogicalType::kBigInt},
+      {"date_trunc('Hour', todatetime(i64))", LogicalType::kTimestamp},
+      {"date_trunc('month', dt)", LogicalType::kTimestamp},
+      {"main.date_part('year', dt)", LogicalType::kBigInt},
+  };
+  ASSERT_EQ(plan->output.size(), expected.size());
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    EXPECT_EQ(plan->output[i].name, expected[i].first);
+    EXPECT_EQ(plan->output[i].type, expected[i].second) << expected[i].first;
+  }
+  // The product keeps the argument's type: SMALLINT * 1000 is SMALLINT (it overflows above 32).
+  auto small = BindSql("SELECT toDateTime(i16) FROM t", catalog);
+  ASSERT_TRUE(small.ok()) << small.status().ToString();
+  const auto& compute = std::get<ComputeNode>(Nth(*small, 1));
+  const auto& epoch = std::get<FunctionExpr>(compute.exprs[0]->node);
+  EXPECT_EQ(epoch.function, Function::kEpochMs);
+  EXPECT_EQ(epoch.args[0]->type, LogicalType::kSmallInt);
+  EXPECT_TRUE(std::holds_alternative<ArithExpr>(epoch.args[0]->node));
+  // A TIMESTAMP key, selected and ordered by the same expression.
+  auto grouped = BindSql(
+      "SELECT date_trunc('minute', toDateTime(i64)) AS m, COUNT(*) FROM t GROUP BY "
+      "date_trunc('minute', toDateTime(i64)) ORDER BY date_trunc('minute', toDateTime(i64))",
+      catalog);
+  ASSERT_TRUE(grouped.ok()) << grouped.status().ToString();
+  const std::string explain = Explain(*grouped);
+  EXPECT_NE(explain.find("GroupAggregate keys=[\"date_trunc('minute', todatetime(i64))\"]"),
             std::string::npos)
       << explain;
 }

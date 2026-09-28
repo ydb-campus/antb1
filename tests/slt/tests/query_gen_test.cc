@@ -122,7 +122,8 @@ TEST(QueryGenerator, QueriesRespectTheSemanticsBothEnginesShare) {
         q.features.Has(Feature::kColumns) || q.features.Has(Feature::kStar) ||
         q.features.Has(Feature::kGroupBy) ||
         ((q.features.Has(Feature::kConstant) || q.features.Has(Feature::kArithmetic) ||
-          q.features.Has(Feature::kStringFunctions) || q.features.Has(Feature::kCase)) &&
+          q.features.Has(Feature::kStringFunctions) || q.features.Has(Feature::kCase) ||
+          q.features.Has(Feature::kTimestamps)) &&
          !aggregate);
     const bool ordered = q.features.Has(Feature::kOrderBy);
     EXPECT_EQ(q.sort, rows && !ordered ? SortMode::kRowSort : SortMode::kNoSort) << q.sql;

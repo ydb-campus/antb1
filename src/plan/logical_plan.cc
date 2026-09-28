@@ -262,6 +262,12 @@ std::string_view ToString(Function function) {
       return "strlen";
     case Function::kRegexpReplace:
       return "regexp_replace";
+    case Function::kEpochMs:
+      return "epoch_ms";
+    case Function::kExtract:
+      return "extract";
+    case Function::kDateTrunc:
+      return "date_trunc";
   }
   return "?";
 }
@@ -317,6 +323,7 @@ arrow::Result<std::shared_ptr<arrow::Scalar>> ToArrowScalar(const Constant& cons
         return HugeIntScalar(*v);
       case LogicalType::kDouble:
       case LogicalType::kVarchar:
+      case LogicalType::kTimestamp:  // no TIMESTAMP literal
       case LogicalType::kBoolean:
         break;
     }
