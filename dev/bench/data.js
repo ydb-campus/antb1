@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790602605671,
+  "lastUpdate": 1790607046828,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -1260,6 +1260,78 @@ window.BENCHMARK_DATA = {
             "value": 14.42510531249989,
             "unit": "ms/iter",
             "extra": "iterations: 48\ncpu: 14.42427685416664 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "62e415a50db9ba86ad176f84fa9cea2887378bf2",
+          "message": "feat(plan,exec): boolean conditions and case (#35)\n\n## Summary\n\nThis is PR 4 of the approved plan for scalar expressions. It adds `AND`,\n`OR` and `NOT` as general conditions (in `WHERE`, `HAVING` and `CASE\nWHEN`) and `CASE` in both forms, in every clause. ClickBench goes from\n40 to **41 of 43** (Q39); the maintainer signed off on the ratchet\nchange.\n\n**Conditions:**\n- Each comparison, `LIKE` and `IN` inside `OR`/`NOT` is bound and folded\nexactly as a `WHERE` comparison.\n- A comparison folded to never or always true keeps its operand, so it\nis still NULL for NULL: `NOT (smallint_col = 1.5)` rejects NULL rows, as\nin DuckDB.\n- A `WHERE`/`HAVING` conjunct with `OR` or `NOT` is computed as a\nBOOLEAN column and filtered with a new `IS TRUE` predicate, so `Filter`\nstays a conjunction over columns.\n- `AND`/`OR` follow three-valued logic and compute a later argument only\nfor rows still undecided, as DuckDB does in the written order.\n- Divergence D16 records where DuckDB differs: it reorders conjunctions\nby its cost model and computes a `NOT`'s argument for every row, so an\noverflow inside a condition can fail in one engine and not the other.\n\n**CASE** (typed as DuckDB 1.5.5 types it):\n- The values take their common type. An integer literal takes the\nothers' integer type when it fits. USMALLINT with SMALLINT gives\nINTEGER, unlike arithmetic. A string literal takes VARCHAR, or DATE next\nto a DATE.\n- VARCHAR or DATE with a number is a bind error, as in DuckDB.\n- Unsupported (exit code 4): a string literal next to numbers (DuckDB\ncasts it), a decimal literal without a DOUBLE value, and a FLOAT column\nvalue (D11).\n- Each condition is computed only for the rows no earlier branch took,\nand each value only for the rows its branch answers, as in DuckDB. So\n`CASE WHEN x < 100 THEN x * 300 END` never overflows on other rows.\n- Names match DuckDB: `CASE WHEN ((a = 1)) THEN (b) ELSE NULL END`.\nInside them, NOT is folded into comparisons and IN, `<>` prints as `!=`,\nchains are flattened, and a DATE literal prints as `CAST('..' AS\n\"DATE\")`.\n\n**Plan and exec:**\n- `LogicalType::kBoolean` is internal, never a table or result column.\n- New `plan::Expr` nodes: `PredicateExpr`, `BoolExpr` and `CaseExpr`\n(ADR 0012 note).\n- The filter's per-predicate evaluation becomes\n`exec::PredicateEvaluator`, shared by `Filter` and `Compute`.\n\n**Harness:**\n- The generator writes compound conditions (`(A OR B AND C)`, `NOT (A)`)\nin `WHERE`/`HAVING` and `CASE` in select items and aggregate arguments.\nNew features: `case` and `boolean_expressions`.\n- New `.slt` files `expressions/boolean.slt` and `expressions/case.slt`\n(expected results written by DuckDB).\n- Metamorphic relations: OR/AND count like union/intersection; NOT\nsplits non-NULL values (folded comparisons included); CASE WHEN p counts\nwhat WHERE p keeps; CASE keys are invariant across batch sizes and\nfiles.\n- The CLI golden `unsupported_where` now uses `IS NULL`, since OR is\nsupported.\n\n**Also:** the data tests' TIMEOUT is raised from 1800 s to 3600 s in\n`tests/data/CMakeLists.txt`. The 100-file status run now answers Q39 on\nboth engines and took over 30 minutes; the hits_0 CI run takes about 5\nminutes.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full          # lint, ci, asan, tidy, coverage (floors kept), fuzz-smoke, ci-gcc\nexit 0                         (final tree)\n$ ANTB1_DIFF_COUNT=20000 pixi run diff-random\nDIFF: PASS seed=1322124570 queries=20000 failed=0 unsupported=0\n$ pixi run test-data           # hits_0, ratchet with Q39\n100% tests passed out of 6\n$ ANTB1_HITS_FILES=\"$HOME/.cache/antb1/clickbench/full/hits_*.parquet\" pixi run test-data   # all 100 files\n100% tests passed out of 6\n$ antb1 bench (release build, all 100 files, 2 tries, lukewarm): Q39 24.7 s, 26.3 s\n```\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change: binder (conditions, folding under NOT,\nCASE typing, names, errors), exec (three-valued and lazy AND/OR, lazy\nCASE, filter IS TRUE), engine (FLOAT in CASE), `.slt`, metamorphic\nrelations, the generator\n- [x] Docs updated: `docs/sql-subset.md` (what works, binding,\nsemantics, exit codes, D16, ClickBench table), `docs/architecture.md`,\nADR 0012\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: `tests/data/clickbench_status.json` (+39) was\napproved by @hor911\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code wrote the change\nand the tests, and ran the verification. The `reviewer` agent (two\npasses) found:\n- eager AND/OR (DuckDB evaluates later arguments only on undecided\nrows);\n  - condition names differing from DuckDB's (including double NOT);\n  - a string literal next to numbers wrongly reported as a bind error;\n  - an untested FLOAT path.\n\n  All are fixed with tests.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-09-28T17:48:37+03:00",
+          "tree_id": "4b6a877e13e39bb26ec44c12bd7b3256607bda26",
+          "url": "https://github.com/ydb-campus/antb1/commit/62e415a50db9ba86ad176f84fa9cea2887378bf2"
+        },
+        "date": 1790607046259,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 3948.398057706787,
+            "unit": "ns/iter",
+            "extra": "iterations: 177934\ncpu: 3947.882051772006 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 94358.25275070786,
+            "unit": "ns/iter",
+            "extra": "iterations: 6362\ncpu: 94351.9860106885 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 124723.55634807466,
+            "unit": "ns/iter",
+            "extra": "iterations: 5608\ncpu: 124705.24304564911 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 486008.0984528821,
+            "unit": "ns/iter",
+            "extra": "iterations: 1422\ncpu: 485961.3699015471 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 455418.7061118374,
+            "unit": "ns/iter",
+            "extra": "iterations: 1538\ncpu: 455232.7373211963 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2254276.8778135143,
+            "unit": "ns/iter",
+            "extra": "iterations: 311\ncpu: 2253641.990353699 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 197.6596876666671,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 197.65763600000005 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 15.0742670638298,
+            "unit": "ms/iter",
+            "extra": "iterations: 47\ncpu: 15.072331680851061 ms\nthreads: 1"
           }
         ]
       }
