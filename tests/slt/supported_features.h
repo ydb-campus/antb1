@@ -35,6 +35,7 @@ enum class Feature : std::uint8_t {
   kMultipleItems,  // more than one select item
   kAlias,          // <item> [AS] alias
   kConstant,       // a literal select item (an integer, a string or a DATE)
+  kArithmetic,     // + - * / // % and unary - of a column and a constant
   // Column types a query reads (select list or WHERE); SELECT * reads every column
   kIntegerColumns,  // SMALLINT, INTEGER, BIGINT, USMALLINT
   kDoubleColumns,   // DOUBLE
@@ -103,6 +104,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "alias";
     case Feature::kConstant:
       return "constant";
+    case Feature::kArithmetic:
+      return "arithmetic";
     case Feature::kIntegerColumns:
       return "integer_columns";
     case Feature::kDoubleColumns:
@@ -245,6 +248,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kMultipleItems,
     Feature::kAlias,
     Feature::kConstant,
+    Feature::kArithmetic,
     Feature::kIntegerColumns,
     Feature::kDoubleColumns,
     Feature::kVarcharColumns,

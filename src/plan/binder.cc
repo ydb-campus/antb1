@@ -108,14 +108,56 @@ std::string ArgumentName(std::string_view name) {
   return out + "\"";
 }
 
-// count_star(), count(x), count(DISTINCT x), sum(x), avg(x), min(x), max(x).
+// DuckDB's name of a literal inside an expression: numbers as their value (a decimal as written),
+// strings quoted.
+std::string LiteralName(const sql::Literal& lit) {
+  switch (lit.kind) {
+    case sql::Literal::Kind::kInteger: {
+      const auto exact = ParseExactNumber(lit.text, lit.negative);
+      if (exact.has_value() && !exact->huge) {
+        return Int128ToString(exact->negative ? -exact->magnitude : exact->magnitude);
+      }
+      break;
+    }
+    case sql::Literal::Kind::kDecimal:
+      break;
+    case sql::Literal::Kind::kString:
+    case sql::Literal::Kind::kDate:
+      return "'" + lit.text + "'";
+  }
+  return (lit.negative ? "-" : "") + lit.text;
+}
+
+std::string ResultName(const sql::AggregateCall& call);
+
+// DuckDB's name of an expression of the binder's subset: (a + 1), -(a), sum((a + 1)).
+std::string ExprName(const sql::Expr& expr) {
+  if (const auto* ref = std::get_if<sql::ColumnRef>(&expr)) {
+    return ArgumentName(ref->name);
+  }
+  if (const auto* lit = std::get_if<sql::Literal>(&expr)) {
+    return LiteralName(*lit);
+  }
+  if (const auto* call = std::get_if<sql::AggregateCall>(&expr)) {
+    return ResultName(*call);
+  }
+  if (const auto* binary = std::get_if<sql::BinaryExpr>(&expr)) {
+    return std::format("({} {} {})", ExprName(*binary->left), sql::ToString(binary->op),
+                       ExprName(*binary->right));
+  }
+  if (const auto* unary = std::get_if<sql::UnaryExpr>(&expr)) {
+    return (unary->op == sql::UnaryOp::kNot ? "(NOT " : "-(") + ExprName(*unary->operand) + ")";
+  }
+  return sql::ToSql(expr);
+}
+
+// count_star(), count(x), count(DISTINCT x), sum(x), avg(x), min(x), max(x), sum((x + 1)).
 std::string ResultName(const sql::AggregateCall& call) {
   if (call.kind == sql::AggKind::kCountStar || !call.arg.has_value()) {
     return "count_star()";
   }
-  const sql::ColumnRef* column = call.arg_column();
   return AsciiLower(ToString(ToPlan(call.kind))) + "(" + (call.distinct ? "DISTINCT " : "") +
-         (column != nullptr ? ArgumentName(column->name) : sql::ToSql(**call.arg)) + ")";
+         ExprName(**call.arg) + ")";
 }
 
 // ---- expressions the binder does not answer (yet): kUnsupported at their first token ----
@@ -128,6 +170,24 @@ struct Rejection {
 // The first construct of a value expression, in source order, that is not a column, a literal
 // or (where allowed) an aggregate of a column.
 std::optional<Rejection> FirstUnsupported(const sql::Expr& expr);
+
+// Whether the expression reads a column (or, `aggregates`, calls an aggregate): one that does
+// neither is a constant.
+bool ReadsColumn(const sql::Expr& expr, bool aggregates = false) {
+  if (std::holds_alternative<sql::ColumnRef>(expr)) {
+    return true;
+  }
+  if (std::holds_alternative<sql::AggregateCall>(expr)) {
+    return aggregates;
+  }
+  if (const auto* binary = std::get_if<sql::BinaryExpr>(&expr)) {
+    return ReadsColumn(*binary->left, aggregates) || ReadsColumn(*binary->right, aggregates);
+  }
+  if (const auto* unary = std::get_if<sql::UnaryExpr>(&expr)) {
+    return ReadsColumn(*unary->operand, aggregates);
+  }
+  return false;
+}
 
 std::optional<Rejection> FirstUnsupportedIn(const std::vector<sql::Expr>& exprs) {
   for (const sql::Expr& e : exprs) {
@@ -152,21 +212,21 @@ struct FirstUnsupportedOf {
       return std::nullopt;
     }
     const sql::Expr& arg = **call.arg;
-    if (std::holds_alternative<sql::Literal>(arg)) {
+    if (auto r = FirstUnsupported(arg)) {
+      return r;
+    }
+    if (!ReadsColumn(arg)) {
       return Rejection{.span = arg.span(),
                        .message = std::string("constant aggregate arguments are not supported") +
                                   (call.kind == sql::AggKind::kCount ? " (use COUNT(*))" : "")};
     }
-    if (auto r = FirstUnsupported(arg)) {
-      return r;
-    }
-    return Rejection{.span = arg.span(), .message = "this aggregate argument is not supported"};
+    return std::nullopt;
   }
   std::optional<Rejection> operator()(const sql::UnaryExpr& unary) const {
-    return Rejection{.span = unary.op_span,
-                     .message = unary.op == sql::UnaryOp::kNot
-                                    ? "NOT is not supported"
-                                    : "arithmetic operator '-' is not supported"};
+    if (unary.op == sql::UnaryOp::kNegate) {
+      return FirstUnsupported(*unary.operand);
+    }
+    return Rejection{.span = unary.op_span, .message = "NOT is not supported"};
   }
   std::optional<Rejection> operator()(const sql::BinaryExpr& binary) const {
     if (auto r = FirstUnsupported(*binary.left)) {
@@ -180,8 +240,7 @@ struct FirstUnsupportedOf {
       case sql::BinaryOp::kDivide:
       case sql::BinaryOp::kIntegerDivide:
       case sql::BinaryOp::kModulo:
-        message = std::format("arithmetic operator '{}' is not supported", ToString(binary.op));
-        break;
+        return FirstUnsupported(*binary.right);
       case sql::BinaryOp::kAnd:
         message = "AND is only supported between conditions of WHERE and HAVING";
         break;
@@ -240,25 +299,9 @@ arrow::Status CheckValue(const sql::Expr& expr) {
 // Why a WHERE (or, with `having`, HAVING) condition is not one the binder answers, or std::nullopt
 // when it is (AsComparison / AsHavingComparison accept it, or a conjunction of such).
 std::optional<Rejection> RejectCondition(const sql::Expr& expr, bool having) {
-  const auto is_operand = [having](const sql::Expr& e) {
-    return std::holds_alternative<sql::ColumnRef>(e) ||
-           (having && std::holds_alternative<sql::AggregateCall>(e));
-  };
-  if (having ? sql::AsHavingComparison(expr).has_value() : sql::AsComparison(expr).has_value()) {
-    if (const auto* like = std::get_if<sql::LikeExpr>(&expr)) {
-      return FirstUnsupported(*like->operand);
-    }
-    if (const auto* in = std::get_if<sql::InExpr>(&expr)) {
-      return FirstUnsupported(*in->operand);
-    }
-    if (const auto* binary = std::get_if<sql::BinaryExpr>(&expr)) {
-      if (auto r = FirstUnsupported(*binary->left)) {
-        return r;
-      }
-      return FirstUnsupported(*binary->right);
-    }
-    return std::nullopt;
-  }
+  // An operand reads a column (in HAVING, or calls an aggregate); the other side of a comparison
+  // is then an operand too, or a literal.
+  const auto is_operand = [having](const sql::Expr& e) { return ReadsColumn(e, having); };
   const std::string_view operand_kind = having ? "a column or an aggregate" : "a column";
   if (const auto* binary = std::get_if<sql::BinaryExpr>(&expr)) {
     switch (binary->op) {
@@ -286,14 +329,19 @@ std::optional<Rejection> RejectCondition(const sql::Expr& expr, bool having) {
         }
         const bool left = is_operand(*binary->left);
         const bool right = is_operand(*binary->right);
-        std::string message = "this comparison is not supported";
-        if (left && right) {
-          message = having ? "HAVING comparisons of two columns or aggregates are not supported"
-                           : "comparisons between two columns are not supported";
-        } else if (!left && !right) {
-          message = "comparisons between two literals are not supported";
+        if (!left && !right) {
+          return Rejection{.span = binary->right->span(),
+                           .message = "comparisons between two literals are not supported"};
         }
-        return Rejection{.span = binary->right->span(), .message = std::move(message)};
+        for (const sql::Expr* side : {&*binary->left, &*binary->right}) {
+          if (!is_operand(*side) && !std::holds_alternative<sql::Literal>(*side)) {
+            return Rejection{.span = side->span(),
+                             .message =
+                                 "a constant expression in a comparison is not supported "
+                                 "(write it as a literal)"};
+          }
+        }
+        return std::nullopt;
       }
       default:
         break;
@@ -306,6 +354,9 @@ std::optional<Rejection> RejectCondition(const sql::Expr& expr, bool having) {
     if (!is_operand(*like->operand)) {
       return Rejection{.span = like->operand->span(),
                        .message = std::format("LIKE needs {} on the left", operand_kind)};
+    }
+    if (std::holds_alternative<sql::Literal>(*like->pattern)) {
+      return std::nullopt;
     }
     if (auto r = FirstUnsupported(*like->pattern)) {
       return r;
@@ -329,23 +380,23 @@ std::optional<Rejection> RejectCondition(const sql::Expr& expr, bool having) {
     for (const sql::Expr& value : in->list) {
       if (!std::holds_alternative<sql::Literal>(value)) {
         return Rejection{.span = value.span(),
-                         .message = "columns and aggregates in an IN list are not supported"};
+                         .message = "only literals are supported in an IN list"};
       }
     }
+    return std::nullopt;
+  }
+  if (auto r = FirstUnsupported(expr)) {
+    return r;
   }
   if (std::holds_alternative<sql::ColumnRef>(expr) || std::holds_alternative<sql::Literal>(expr) ||
-      std::holds_alternative<sql::AggregateCall>(expr)) {
-    if (auto r = FirstUnsupported(expr)) {
-      return r;
-    }
+      std::holds_alternative<sql::AggregateCall>(expr) ||
+      std::holds_alternative<sql::BinaryExpr>(expr) ||
+      std::holds_alternative<sql::UnaryExpr>(expr)) {
     return Rejection{.span = expr.span(),
                      .message = having ? "HAVING conditions other than comparisons (aggregate or "
                                          "column <op> literal) are not supported"
                                        : "predicates other than comparisons (column <op> literal) "
                                          "are not supported"};
-  }
-  if (auto r = FirstUnsupported(expr)) {
-    return r;
   }
   return Rejection{.span = expr.span(), .message = "this condition is not supported"};
 }
@@ -460,23 +511,6 @@ arrow::Result<LogicalType> AggregateType(const sql::AggregateCall& call, const B
       break;
   }
   return arg.type;
-}
-
-arrow::Result<AggregateCall> BindAggregate(const sql::AggregateCall& call, const Columns& columns) {
-  AggregateCall bound{.kind = AggKind::kCountStar, .span = call.span};
-  if (call.kind == sql::AggKind::kCountStar || !call.arg.has_value()) {
-    return bound;
-  }
-  ARROW_RETURN_NOT_OK(CheckValue(sql::Expr(call)));
-  const sql::ColumnRef* column = call.arg_column();
-  if (column == nullptr) {
-    return UnsupportedError("this aggregate argument is not supported", call.span);
-  }
-  ARROW_ASSIGN_OR_RAISE(BoundColumn arg, columns.Resolve(*column));
-  ARROW_ASSIGN_OR_RAISE(bound.type, AggregateType(call, arg));
-  bound.kind = call.distinct ? AggKind::kCountDistinct : ToPlan(call.kind);
-  bound.arg = std::move(arg);
-  return bound;
 }
 
 std::string_view LiteralKind(const sql::Literal& lit) {
@@ -667,15 +701,17 @@ arrow::Result<Predicate> BindEquality(const sql::Comparison& cmp, const BoundCol
   return p;
 }
 
-// What a select item is: a plain column, an aggregate call or a constant.
-enum class ItemKind : std::uint8_t { kColumn, kAggregate, kConstant };
+// What a select item is: a plain column, an aggregate call, a constant or any other expression.
+enum class ItemKind : std::uint8_t { kColumn, kAggregate, kConstant, kExpression };
 
 struct SelectList {
   std::vector<BoundColumn> columns;       // SELECT * or plain columns, in select order
-  std::vector<AggregateCall> aggregates;  // aggregates, in select order
+  std::vector<AggregateCall> aggregates;  // aggregates, in select order (hidden ones appended)
   std::vector<Constant> constants;        // constants, in select order
+  std::vector<const sql::Expr*> exprs;    // other expressions, in select order
+  std::vector<BoundColumn> expr_columns;  // per entry of `exprs`: its column (once bound)
   std::vector<OutputColumn> output;
-  // Per output column: its kind and an index into `columns`, `aggregates` or `constants`.
+  // Per output column: its kind and an index into `columns`, `aggregates`, `constants` or `exprs`.
   std::vector<std::pair<ItemKind, std::size_t>> items;
   std::vector<SourceSpan> column_spans;     // per entry of `columns`: what the error points at
   std::vector<std::string> column_written;  // per entry of `columns`: the name as written
@@ -683,19 +719,10 @@ struct SelectList {
   SourceSpan span;
 };
 
-// An ORDER BY aggregate makes the query aggregate, like one in the select list (DuckDB); so does
-// HAVING (checked by the callers).
-bool OrdersByAggregate(const sql::SelectStatement& stmt) {
-  return std::ranges::any_of(stmt.order_by, [](const sql::OrderItem& item) {
-    return std::holds_alternative<sql::AggregateCall>(item.expr);
-  });
-}
-
 // A constant select item with DuckDB's type and result name: an integer is INTEGER, BIGINT or
 // HUGEINT by its value (see below) and named by it ("-5"); a string is VARCHAR named with its
-// quotes
-// ('it''s'); a date is DATE named CAST('2020-01-01' AS "DATE"). A decimal (DuckDB's DECIMAL) and a
-// number DuckDB types as DOUBLE are not supported.
+// quotes ('it''s'); a date is DATE named CAST('2020-01-01' AS "DATE"). A decimal (DuckDB's
+// DECIMAL) and a number DuckDB types as DOUBLE are not supported.
 arrow::Result<std::pair<Constant, std::string>> BindConstant(const sql::Literal& lit) {
   switch (lit.kind) {
     case sql::Literal::Kind::kInteger: {
@@ -744,81 +771,329 @@ arrow::Result<std::pair<Constant, std::string>> BindConstant(const sql::Literal&
   return UnsupportedError("this constant is not supported", lit.span);
 }
 
-arrow::Result<SelectList> BindSelectList(const sql::SelectStatement& stmt,
-                                         const arrow::Schema& schema, const Columns& columns) {
-  SelectList list;
-  if (stmt.star) {
-    list.span = stmt.star_span;
-    for (int i = 0; i < schema.num_fields(); ++i) {
-      ARROW_ASSIGN_OR_RAISE(BoundColumn column, columns.Field(i, stmt.star_span));
-      list.output.push_back(OutputColumn{.name = column.name, .type = column.type});
-      list.items.emplace_back(ItemKind::kColumn, list.columns.size());
-      list.column_spans.push_back(stmt.star_span);
-      list.column_written.push_back(column.name);
-      list.aliases.emplace_back();
-      list.columns.push_back(std::move(column));
-    }
-    if (stmt.group_by.empty() && (OrdersByAggregate(stmt) || !stmt.having.empty()) &&
-        !list.columns.empty()) {
-      return BindError(std::format("column '{}' must be inside an aggregate function: a query "
-                                   "with aggregates cannot also select plain columns (there is "
-                                   "no GROUP BY)",
-                                   list.columns.front().name),
-                       stmt.star_span);
-    }
-    return list;
+// ---- scalar expressions ----
+
+// Whether the expression contains an aggregate call.
+bool ContainsAggregate(const sql::Expr& expr) {
+  if (std::holds_alternative<sql::AggregateCall>(expr)) {
+    return true;
   }
-  if (stmt.items.empty()) {
-    return BindError("the select list is empty", stmt.span);
+  if (const auto* binary = std::get_if<sql::BinaryExpr>(&expr)) {
+    return ContainsAggregate(*binary->left) || ContainsAggregate(*binary->right);
   }
-  list.span = Cover(stmt.items.front().span, stmt.items.back().span);
-  const sql::ColumnRef* first_column = nullptr;
-  for (const sql::SelectItem& item : stmt.items) {
-    list.aliases.push_back(item.alias);
-    if (const auto* call = std::get_if<sql::AggregateCall>(&item.expr)) {
-      ARROW_ASSIGN_OR_RAISE(AggregateCall bound, BindAggregate(*call, columns));
-      list.output.push_back(
-          OutputColumn{.name = item.alias.value_or(ResultName(*call)), .type = bound.type});
-      list.items.emplace_back(ItemKind::kAggregate, list.aggregates.size());
-      list.aggregates.push_back(std::move(bound));
-      continue;
-    }
-    if (const auto* lit = std::get_if<sql::Literal>(&item.expr)) {
-      ARROW_ASSIGN_OR_RAISE(auto constant, BindConstant(*lit));
-      list.output.push_back(OutputColumn{.name = item.alias.value_or(std::move(constant.second)),
-                                         .type = constant.first.type});
-      list.items.emplace_back(ItemKind::kConstant, list.constants.size());
-      list.constants.push_back(std::move(constant.first));
-      continue;
-    }
-    const auto& ref = std::get<sql::ColumnRef>(item.expr);
-    ARROW_ASSIGN_OR_RAISE(BoundColumn column, columns.Resolve(ref));
-    // DuckDB names a plain column by its declared name, not as written.
-    list.output.push_back(
-        OutputColumn{.name = item.alias.value_or(column.name), .type = column.type});
-    list.items.emplace_back(ItemKind::kColumn, list.columns.size());
-    list.column_spans.push_back(ref.span);
-    list.column_written.push_back(ref.name);
-    list.columns.push_back(std::move(column));
-    if (first_column == nullptr) {
-      first_column = &ref;
-    }
+  if (const auto* unary = std::get_if<sql::UnaryExpr>(&expr)) {
+    return ContainsAggregate(*unary->operand);
   }
-  if (stmt.group_by.empty() &&
-      (!list.aggregates.empty() || OrdersByAggregate(stmt) || !stmt.having.empty()) &&
-      first_column != nullptr) {
-    return BindError(std::format("column '{}' must be inside an aggregate function: a query with "
-                                 "aggregates cannot also select plain columns (there is no "
-                                 "GROUP BY)",
-                                 first_column->name),
-                     first_column->span);
-  }
-  return list;
+  return false;
 }
 
-}  // namespace
+// An expression of the binder's subset, typed, with what DuckDB's typing needs to know of it.
+struct Typed {
+  ExprPtr expr;
+  bool literal = false;          // an integer or decimal literal: DuckDB types it by its context
+  bool decimal = false;          // a decimal literal: DuckDB's DECIMAL
+  bool stored_as_float = false;  // a FLOAT column (read as DOUBLE, divergence D11)
+};
 
-namespace {
+Typed Leaf(Expr expr, bool stored_as_float = false) {
+  return Typed{.expr = std::make_shared<const Expr>(std::move(expr)),
+               .literal = false,
+               .decimal = false,
+               .stored_as_float = stored_as_float};
+}
+
+Typed ColumnLeaf(int index, LogicalType type, std::string name, bool stored_as_float) {
+  return Leaf(Expr{.node = ColumnExpr{.index = index}, .type = type, .name = std::move(name)},
+              stored_as_float);
+}
+
+// The rank of an integer type among the signed ones (USMALLINT: none).
+int SignedRank(LogicalType type) {
+  switch (type) {
+    case LogicalType::kSmallInt:
+      return 1;
+    case LogicalType::kInteger:
+      return 2;
+    case LogicalType::kBigInt:
+      return 3;
+    case LogicalType::kHugeInt:
+      return 4;
+    default:
+      return 0;
+  }
+}
+
+// The type DuckDB computes two integer operands in (neither of them a literal that fits the
+// other's type): the wider signed type, where USMALLINT with SMALLINT is BIGINT and with a wider
+// type that type.
+LogicalType CombineIntegers(LogicalType a, LogicalType b) {
+  if (a == b) {
+    return a;
+  }
+  if (a == LogicalType::kUSmallInt || b == LogicalType::kUSmallInt) {
+    const LogicalType other = a == LogicalType::kUSmallInt ? b : a;
+    return other == LogicalType::kSmallInt ? LogicalType::kBigInt : other;
+  }
+  return SignedRank(a) >= SignedRank(b) ? a : b;
+}
+
+bool IsSignedInteger(LogicalType t) {
+  return t == LogicalType::kSmallInt || t == LogicalType::kInteger || t == LogicalType::kBigInt;
+}
+
+// The value of a constant integer expression (integer literals under + - * and unary -), as DuckDB
+// folds it; std::nullopt for anything else or on an overflow.
+std::optional<Int128> ConstantValue(const sql::Expr& expr) {
+  if (const auto* lit = std::get_if<sql::Literal>(&expr)) {
+    if (lit->kind != sql::Literal::Kind::kInteger || IsApproximateNumber(lit->text)) {
+      return std::nullopt;
+    }
+    const auto exact = ParseExactNumber(lit->text, lit->negative);
+    if (!exact.has_value() || exact->huge) {
+      return std::nullopt;
+    }
+    return exact->negative ? -exact->magnitude : exact->magnitude;
+  }
+  if (const auto* unary = std::get_if<sql::UnaryExpr>(&expr);
+      unary != nullptr && unary->op == sql::UnaryOp::kNegate) {
+    const auto v = ConstantValue(*unary->operand);
+    Int128 out = 0;
+    return v.has_value() && !__builtin_sub_overflow(Int128{0}, *v, &out) ? std::optional(out)
+                                                                         : std::nullopt;
+  }
+  const auto* binary = std::get_if<sql::BinaryExpr>(&expr);
+  if (binary == nullptr) {
+    return std::nullopt;
+  }
+  const auto l = ConstantValue(*binary->left);
+  const auto r = ConstantValue(*binary->right);
+  if (!l.has_value() || !r.has_value()) {
+    return std::nullopt;
+  }
+  Int128 out = 0;
+  bool overflow = true;
+  switch (binary->op) {
+    case sql::BinaryOp::kAdd:
+      overflow = __builtin_add_overflow(*l, *r, &out);
+      break;
+    case sql::BinaryOp::kSubtract:
+      overflow = __builtin_sub_overflow(*l, *r, &out);
+      break;
+    case sql::BinaryOp::kMultiply:
+      overflow = __builtin_mul_overflow(*l, *r, &out);
+      break;
+    default:
+      break;
+  }
+  return overflow ? std::nullopt : std::optional(out);
+}
+
+// Whether an integer constant fits an integer type.
+bool Fits(const Expr& constant, LogicalType type) {
+  const auto* c = std::get_if<ConstantExpr>(&constant.node);
+  const auto* value = c != nullptr ? std::get_if<Int128>(&c->value.value) : nullptr;
+  if (value == nullptr) {
+    return false;
+  }
+  const IntegerRange range = RangeOf(type);
+  return *value >= range.min && *value <= range.max;
+}
+
+std::string DescribeOperand(const Typed& t) {
+  return std::format("'{}' is {}", Clip(t.expr->name), ToString(t.expr->type));
+}
+
+// The type DuckDB gives `l <op> r` (docs/sql-subset.md), or the error for operands it cannot take.
+arrow::Result<LogicalType> ArithType(sql::BinaryOp sql_op, ArithOp op, const Typed& l,
+                                     const Typed& r, SourceSpan span) {
+  for (const Typed* t : {&l, &r}) {
+    if (t->expr->type == LogicalType::kDate) {
+      return UnsupportedError(
+          std::format("DATE arithmetic ('{}' is DATE) is not supported", Clip(t->expr->name)),
+          span);
+    }
+    if (!IsNumeric(t->expr->type)) {
+      return BindError(std::format("arithmetic operator '{}' needs numbers, but {}",
+                                   sql::ToString(sql_op), DescribeOperand(*t)),
+                       span);
+    }
+    if (t->stored_as_float) {
+      return UnsupportedError(
+          std::format("arithmetic on the FLOAT column {} is not supported (antb1 reads FLOAT as "
+                      "DOUBLE, divergence D11)",
+                      Clip(t->expr->name)),
+          span);
+    }
+  }
+  if (op == ArithOp::kDivide) {
+    return LogicalType::kDouble;
+  }
+  // A decimal literal is DuckDB's DECIMAL, not DOUBLE (though antb1 holds its value as a double).
+  const bool any_double = (l.expr->type == LogicalType::kDouble && !l.decimal) ||
+                          (r.expr->type == LogicalType::kDouble && !r.decimal);
+  if ((l.decimal || r.decimal) && !any_double && op != ArithOp::kIntegerDivide) {
+    return UnsupportedError(
+        "arithmetic of a decimal literal with an integer is not supported (DuckDB computes it in "
+        "DECIMAL, which antb1 lacks)",
+        span);
+  }
+  if (any_double || l.decimal || r.decimal) {
+    return LogicalType::kDouble;
+  }
+  LogicalType type = LogicalType::kHugeInt;
+  if (l.literal && !r.literal && Fits(*l.expr, r.expr->type)) {
+    type = r.expr->type;
+  } else if (r.literal && !l.literal && Fits(*r.expr, l.expr->type)) {
+    type = l.expr->type;
+  } else {
+    type = CombineIntegers(l.expr->type, r.expr->type);
+  }
+  if (type == LogicalType::kHugeInt && (op == ArithOp::kIntegerDivide || op == ArithOp::kModulo)) {
+    return UnsupportedError(std::format("'{}' in HUGEINT (integer SUM results) is not supported",
+                                        sql::ToString(sql_op)),
+                            span);
+  }
+  return type;
+}
+
+std::optional<ArithOp> ArithOpOf(sql::BinaryOp op) {
+  switch (op) {
+    case sql::BinaryOp::kAdd:
+      return ArithOp::kAdd;
+    case sql::BinaryOp::kSubtract:
+      return ArithOp::kSubtract;
+    case sql::BinaryOp::kMultiply:
+      return ArithOp::kMultiply;
+    case sql::BinaryOp::kDivide:
+      return ArithOp::kDivide;
+    case sql::BinaryOp::kIntegerDivide:
+      return ArithOp::kIntegerDivide;
+    case sql::BinaryOp::kModulo:
+      return ArithOp::kModulo;
+    default:
+      return std::nullopt;
+  }
+}
+
+// `left <op> right` over typed operands.
+arrow::Result<Typed> Arith(const sql::BinaryExpr& binary, Typed left, Typed right) {
+  const std::optional<ArithOp> op = ArithOpOf(binary.op);
+  if (!op.has_value()) {
+    return UnsupportedError("this operator is not supported here", binary.op_span);
+  }
+  ARROW_ASSIGN_OR_RAISE(const LogicalType type,
+                        ArithType(binary.op, *op, left, right, binary.op_span));
+  std::string name =
+      std::format("({} {} {})", left.expr->name, sql::ToString(binary.op), right.expr->name);
+  return Leaf(Expr{
+      .node = ArithExpr{.op = *op, .left = std::move(left.expr), .right = std::move(right.expr)},
+      .type = type,
+      .name = std::move(name)});
+}
+
+arrow::Result<Typed> Negate(const sql::UnaryExpr& unary, Typed operand) {
+  const LogicalType type = operand.expr->type;
+  if (!IsNumeric(type)) {
+    return BindError(
+        std::format("arithmetic operator '-' needs a number, but {}", DescribeOperand(operand)),
+        unary.op_span);
+  }
+  if (type == LogicalType::kUSmallInt || operand.stored_as_float) {
+    return UnsupportedError(std::format("negating a {} is not supported",
+                                        operand.stored_as_float ? "FLOAT" : ToString(type)),
+                            unary.op_span);
+  }
+  std::string name = "-(" + operand.expr->name + ")";
+  return Leaf(Expr{.node = NegateExpr{.operand = std::move(operand.expr)},
+                   .type = type,
+                   .name = std::move(name)});
+}
+
+// A literal as an expression operand: typed by its value (an integer), DOUBLE (a number DuckDB
+// types as DOUBLE, or a decimal, which DuckDB types DECIMAL: flagged), VARCHAR or DATE.
+arrow::Result<Typed> LiteralOperand(const sql::Literal& lit) {
+  const std::string name = LiteralName(lit);
+  const bool number =
+      lit.kind == sql::Literal::Kind::kInteger || lit.kind == sql::Literal::Kind::kDecimal;
+  if (number && (lit.kind == sql::Literal::Kind::kDecimal || IsApproximateNumber(lit.text))) {
+    const auto value = ParseDoubleLiteral(lit.text, lit.negative);
+    if (!value.has_value()) {
+      return BindError("invalid number " + Clip(lit.text), lit.span);
+    }
+    Typed out = Leaf(
+        Expr{.node = ConstantExpr{.value = Constant{.type = LogicalType::kDouble, .value = *value}},
+             .type = LogicalType::kDouble,
+             .name = name});
+    out.literal = true;
+    out.decimal = !IsApproximateNumber(lit.text);
+    return out;
+  }
+  ARROW_ASSIGN_OR_RAISE(auto constant, BindConstant(lit));
+  const LogicalType type = constant.first.type;
+  Typed out = Leaf(
+      Expr{.node = ConstantExpr{.value = std::move(constant.first)}, .type = type, .name = name});
+  out.literal = number;
+  return out;
+}
+
+bool IsConstantExpr(const Expr& expr) { return std::holds_alternative<ConstantExpr>(expr.node); }
+
+// The comparison of a binary comparison operator (the caller checked that it is one).
+sql::CompareOp SqlCompareOp(sql::BinaryOp op) {
+  switch (op) {
+    case sql::BinaryOp::kNe:
+      return sql::CompareOp::kNe;
+    case sql::BinaryOp::kLt:
+      return sql::CompareOp::kLt;
+    case sql::BinaryOp::kLe:
+      return sql::CompareOp::kLe;
+    case sql::BinaryOp::kGt:
+      return sql::CompareOp::kGt;
+    case sql::BinaryOp::kGe:
+      return sql::CompareOp::kGe;
+    default:
+      return sql::CompareOp::kEq;
+  }
+}
+
+// The operator with swapped operands: 5 < c  <=>  c > 5.
+sql::CompareOp Mirror(sql::CompareOp op) {
+  switch (op) {
+    case sql::CompareOp::kLt:
+      return sql::CompareOp::kGt;
+    case sql::CompareOp::kLe:
+      return sql::CompareOp::kGe;
+    case sql::CompareOp::kGt:
+      return sql::CompareOp::kLt;
+    case sql::CompareOp::kGe:
+      return sql::CompareOp::kLe;
+    default:
+      return op;
+  }
+}
+
+// Whether a comparison between the types is one DuckDB and antb1 make alike: numbers with numbers,
+// VARCHAR with VARCHAR, DATE with DATE.
+bool Comparable(LogicalType a, LogicalType b) { return (IsNumeric(a) && IsNumeric(b)) || a == b; }
+
+// The last select item with the alias (DuckDB), if any.
+std::optional<std::size_t> FindAlias(const SelectList& select, std::string_view name) {
+  const std::string wanted = AsciiLower(name);
+  for (std::size_t n = select.items.size(); n > 0; --n) {
+    const auto& alias = select.aliases[n - 1];
+    if (alias.has_value() && AsciiLower(*alias) == wanted) {
+      return n - 1;
+    }
+  }
+  return std::nullopt;
+}
+
+bool SameCall(const AggregateCall& a, const AggregateCall& b) {
+  if (a.kind != b.kind || a.arg.has_value() != b.arg.has_value()) {
+    return false;
+  }
+  return !a.arg.has_value() || a.arg->index == b.arg->index;
+}
 
 // The select item (0-based) that a GROUP BY or ORDER BY literal refers to: an integer is a position
 // (1-based; out of range, a negative one too, is a bind error, as in DuckDB). Any other literal is
@@ -844,107 +1119,6 @@ arrow::Result<std::optional<std::size_t>> PositionOf(const sql::Literal& lit,
   return static_cast<std::size_t>(exact->magnitude) - 1;
 }
 
-// The GROUP BY keys: a table column, or else the alias of a plain column in the select list (the
-// last item with that alias, as in DuckDB), or a position in the select list; duplicates are
-// dropped. A constant (a constant item, by alias or position, or any other literal) is no key: it
-// still makes the query grouped (one group if there is a row at all).
-arrow::Result<std::vector<BoundColumn>> BindGroupBy(const sql::SelectStatement& stmt,
-                                                    const Columns& columns,
-                                                    const SelectList& select) {
-  std::vector<BoundColumn> keys;
-  const auto add = [&](BoundColumn column) {
-    const bool duplicate = std::ranges::any_of(
-        keys, [&](const BoundColumn& key) { return key.index == column.index; });
-    if (!duplicate) {
-      keys.push_back(std::move(column));
-    }
-  };
-  // Select item i as a key: its column, nothing for a constant, an error for an aggregate.
-  const auto item_key = [&](std::size_t i, std::string_view what,
-                            SourceSpan span) -> arrow::Status {
-    const auto [kind, index] = select.items[i];
-    switch (kind) {
-      case ItemKind::kAggregate:
-        return BindError(std::format("GROUP BY cannot refer to the aggregate {}", what), span);
-      case ItemKind::kConstant:
-        break;
-      case ItemKind::kColumn:
-        add(select.columns[index]);
-        break;
-    }
-    return arrow::Status::OK();
-  };
-  for (const sql::GroupExpr& expr : stmt.group_by) {
-    if (const auto* lit = std::get_if<sql::Literal>(&expr)) {
-      ARROW_ASSIGN_OR_RAISE(const auto position, PositionOf(*lit, select, "GROUP BY"));
-      if (position.has_value()) {
-        ARROW_RETURN_NOT_OK(
-            item_key(*position, std::format("at position {}", *position + 1), lit->span));
-      }
-      continue;
-    }
-    const auto& ref = std::get<sql::ColumnRef>(expr);
-    auto column = columns.Resolve(ref);
-    if (column.ok()) {
-      add(*std::move(column));
-      continue;
-    }
-    const auto detail = GetSqlError(column.status());
-    if (detail == nullptr || detail->kind() != SqlErrorDetail::Kind::kBind) {
-      return column.status();
-    }
-    // The last select item with the alias wins, as in DuckDB.
-    const std::string wanted = AsciiLower(ref.name);
-    std::optional<std::size_t> alias;
-    for (std::size_t n = select.items.size(); n > 0 && !alias.has_value(); --n) {
-      const auto& name = select.aliases[n - 1];
-      if (name.has_value() && AsciiLower(*name) == wanted) {
-        alias = n - 1;
-      }
-    }
-    if (!alias.has_value()) {
-      return column.status();
-    }
-    ARROW_RETURN_NOT_OK(
-        item_key(*alias, std::format("'{}'", select.aliases[*alias].value_or("")), ref.span));
-  }
-  return keys;
-}
-
-// Every plain column of a grouped select list must be a key (as in DuckDB).
-arrow::Status CheckGrouped(const SelectList& select, const std::vector<BoundColumn>& keys) {
-  for (std::size_t i = 0; i < select.columns.size(); ++i) {
-    const bool key = std::ranges::any_of(
-        keys, [&](const BoundColumn& k) { return k.index == select.columns[i].index; });
-    if (!key) {
-      return BindError(std::format("column '{}' must appear in the GROUP BY clause or be inside an "
-                                   "aggregate function",
-                                   select.column_written[i]),
-                       select.column_spans[i]);
-    }
-  }
-  return arrow::Status::OK();
-}
-
-// The last select item with the alias (DuckDB), if any.
-std::optional<std::size_t> FindAlias(const SelectList& select, std::string_view name) {
-  const std::string wanted = AsciiLower(name);
-  for (std::size_t n = select.items.size(); n > 0; --n) {
-    const auto& alias = select.aliases[n - 1];
-    if (alias.has_value() && AsciiLower(*alias) == wanted) {
-      return n - 1;
-    }
-  }
-  return std::nullopt;
-}
-
-bool SameCall(const AggregateCall& a, const AggregateCall& b) {
-  if (a.kind != b.kind || a.arg.has_value() != b.arg.has_value()) {
-    return false;
-  }
-  return !a.arg.has_value() || a.arg->index == b.arg->index;
-}
-
 // How the rows of a query are shaped, which decides what ORDER BY may refer to.
 enum class Shape : std::uint8_t {
   kProjection,  // no aggregate: any table column
@@ -952,206 +1126,1083 @@ enum class Shape : std::uint8_t {
   kGlobal,      // aggregates without GROUP BY: one row, so only aggregates
 };
 
-// ORDER BY items resolved against the node below the Sort: the table's columns (kProjection), or
-// the GroupAggregate's keys and then its aggregates (kGrouped, where `aggregates` gains the calls
-// that are not in the select list). kGlobal checks the items and returns no key: one row needs no
-// sort. A select alias comes before a table column, as in DuckDB; an unsigned integer is a
-// position in the select list; a constant (a constant item, or any other literal) orders nothing;
-// a later key on a column already ordered by changes nothing and is dropped.
-arrow::Result<std::vector<SortKey>> BindOrderBy(const sql::SelectStatement& stmt,
-                                                const Columns& columns, const SelectList& select,
-                                                Shape shape, const std::vector<BoundColumn>& keys,
-                                                std::vector<AggregateCall>& aggregates) {
-  const auto not_grouped = [](std::string_view name, SourceSpan span) {
-    return BindError(std::format("column '{}' must appear in the GROUP BY clause or be inside an "
-                                 "aggregate function",
-                                 name),
-                     span);
-  };
-  const auto key_of = [&](const BoundColumn& column) -> std::optional<int> {
-    const auto key =
-        std::ranges::find_if(keys, [&](const BoundColumn& k) { return k.index == column.index; });
-    return key == keys.end() ? std::nullopt : std::optional(Narrow<int>(key - keys.begin()));
-  };
-  const auto aggregate_column = [&](std::size_t index, std::string name) {
-    return BoundColumn{.index = Narrow<int>(keys.size() + index),
-                       .name = std::move(name),
-                       .type = aggregates[index].type};
-  };
-  // A table column as a sort key of this shape.
-  const auto table_key = [&](BoundColumn column, std::string_view name,
-                             SourceSpan span) -> arrow::Result<std::optional<BoundColumn>> {
-    if (shape == Shape::kGlobal) {
-      return not_grouped(name, span);
-    }
-    if (shape == Shape::kGrouped) {
-      const auto key = key_of(column);
-      if (!key.has_value()) {
-        return not_grouped(name, span);
-      }
-      column.index = *key;
-    }
-    return std::optional(std::move(column));
-  };
-  // Select item i as a sort key (std::nullopt: it orders nothing).
-  const auto item_key = [&](std::size_t i,
-                            SourceSpan span) -> arrow::Result<std::optional<BoundColumn>> {
-    const auto [kind, index] = select.items[i];
-    switch (kind) {
-      case ItemKind::kAggregate:  // kGlobal: its only row needs no sort
-        if (shape == Shape::kGrouped) {
-          return std::optional(aggregate_column(index, select.output[i].name));
-        }
-        return std::nullopt;
-      case ItemKind::kConstant:
-        return std::nullopt;
-      case ItemKind::kColumn:
-        break;
-    }
-    return table_key(select.columns[index], select.column_written[index], span);
-  };
-  std::vector<SortKey> sort_keys;
-  for (const sql::OrderItem& item : stmt.order_by) {
-    std::optional<BoundColumn> column;
-    if (const auto* call = std::get_if<sql::AggregateCall>(&item.expr)) {
-      ARROW_ASSIGN_OR_RAISE(AggregateCall bound, BindAggregate(*call, columns));
-      if (shape == Shape::kGrouped) {
-        const auto same = std::ranges::find_if(
-            aggregates, [&](const AggregateCall& a) { return SameCall(a, bound); });
-        const auto index = Narrow<std::size_t>(same - aggregates.begin());
-        if (same == aggregates.end()) {
-          aggregates.push_back(std::move(bound));  // a hidden aggregate
-        }
-        column = aggregate_column(index, ResultName(*call));
-      }
-    } else if (const auto* lit = std::get_if<sql::Literal>(&item.expr)) {
-      ARROW_ASSIGN_OR_RAISE(const auto position, PositionOf(*lit, select, "ORDER BY"));
-      if (position.has_value()) {
-        ARROW_ASSIGN_OR_RAISE(column, item_key(*position, lit->span));
-      }
-    } else {
-      const auto& ref = std::get<sql::ColumnRef>(item.expr);
-      if (const auto alias = FindAlias(select, ref.name)) {
-        ARROW_ASSIGN_OR_RAISE(column, item_key(*alias, ref.span));
-      } else {
-        ARROW_ASSIGN_OR_RAISE(BoundColumn table_column, columns.Resolve(ref));
-        ARROW_ASSIGN_OR_RAISE(column, table_key(std::move(table_column), ref.name, ref.span));
-      }
-    }
-    if (!column.has_value()) {
-      continue;
-    }
-    const bool repeated = std::ranges::any_of(
-        sort_keys, [&](const SortKey& k) { return k.column.index == column->index; });
-    if (!repeated) {
-      sort_keys.push_back(SortKey{.column = *std::move(column),
-                                  .descending = item.descending,
-                                  .nulls_first = item.nulls == sql::NullsOrder::kFirst});
-    }
-  }
-  return sort_keys;
+// An aggregate anywhere in the select list, HAVING or ORDER BY makes the query aggregate, and so
+// does HAVING itself (DuckDB).
+bool IsAggregateQuery(const sql::SelectStatement& stmt) {
+  return !stmt.having.empty() || std::ranges::any_of(stmt.items, [](const sql::SelectItem& i) {
+    return ContainsAggregate(i.expr);
+  }) || std::ranges::any_of(stmt.order_by, [](const sql::OrderItem& i) {
+    return ContainsAggregate(i.expr);
+  });
 }
 
-// HAVING conditions as predicates over the node below the Filter: the GroupAggregate's keys and
-// then its aggregates (kGrouped), or the Aggregate's aggregates (kGlobal). An aggregate call not in
-// the select list is added to `aggregates` (a hidden aggregate). A column is a GROUP BY key if the
-// table column is one, else the last select item with that alias (DuckDB): a key or an aggregate.
-arrow::Result<std::vector<Predicate>> BindHaving(const sql::SelectStatement& stmt,
-                                                 const Columns& columns, const Table& table,
-                                                 const SelectList& select,
-                                                 const std::vector<BoundColumn>& keys,
-                                                 std::vector<AggregateCall>& aggregates) {
-  struct Operand {
-    BoundColumn column;
-    bool stored_as_float = false;
+// Computed columns are numbered from these bases until the plan is assembled: those of the Compute
+// after the WHERE filter (from kPreBase; the WHERE operands' Compute comes first) and those of the
+// Compute above the aggregation (from kPostBase), whose inputs' widths are only known then.
+constexpr int kPreBase = 4 * 1024 * 1024;
+constexpr int kPostBase = 16 * 1024 * 1024;
+
+class Binder {
+ public:
+  Binder(const sql::SelectStatement& stmt, std::shared_ptr<Table> table)
+      : stmt_(stmt),
+        table_(std::move(table)),
+        schema_(*table_->schema()),
+        columns_(schema_),
+        width_(schema_.num_fields()) {}
+
+  arrow::Result<LogicalPlan> Bind();
+
+ private:
+  // ---- the input scope: the table's columns, and computed columns over them ----
+
+  arrow::Result<Typed> BindInput(const sql::Expr& expr) {
+    if (const auto* ref = std::get_if<sql::ColumnRef>(&expr)) {
+      auto resolved = columns_.Resolve(*ref);
+      if (!resolved.ok() && shape_ == Shape::kProjection) {
+        if (auto alias = AliasFallback(*ref, resolved.status())) {
+          return *std::move(alias);
+        }
+      }
+      ARROW_ASSIGN_OR_RAISE(BoundColumn column, std::move(resolved));
+      return ColumnLeaf(column.index, column.type, ArgumentName(ref->name),
+                        table_->StoredAsFloat(column.index));
+    }
+    if (const auto* lit = std::get_if<sql::Literal>(&expr)) {
+      return LiteralOperand(*lit);
+    }
+    if (const auto* binary = std::get_if<sql::BinaryExpr>(&expr)) {
+      ARROW_ASSIGN_OR_RAISE(Typed left, BindInput(*binary->left));
+      ARROW_ASSIGN_OR_RAISE(Typed right, BindInput(*binary->right));
+      return Arith(*binary, std::move(left), std::move(right));
+    }
+    if (const auto* unary = std::get_if<sql::UnaryExpr>(&expr)) {
+      ARROW_ASSIGN_OR_RAISE(Typed operand, BindInput(*unary->operand));
+      return Negate(*unary, std::move(operand));
+    }
+    if (const auto* call = std::get_if<sql::AggregateCall>(&expr)) {
+      return BindError("aggregate functions are not allowed here", call->span);
+    }
+    return UnsupportedError("this expression is not supported", expr.span());
+  }
+
+  // The column of an input-scope expression: a table column as is, anything else computed (once):
+  // a WHERE operand (`where`) before the WHERE filter on computed columns, anything else after it,
+  // so that it is computed only for the rows WHERE keeps.
+  BoundColumn InputColumn(const Typed& t, bool where = false) {
+    if (const auto* column = std::get_if<ColumnExpr>(&t.expr->node)) {
+      // A table field is named as declared; a computed column (a select item) by its expression.
+      return BoundColumn{
+          .index = column->index,
+          .name = column->index < width_ ? schema_.field(column->index)->name() : t.expr->name,
+          .type = t.expr->type};
+    }
+    std::vector<ExprPtr>& exprs = where ? where_exprs_ : input_exprs_;
+    const auto same =
+        std::ranges::find_if(exprs, [&](const ExprPtr& e) { return SameExpr(*e, *t.expr); });
+    const auto k = Narrow<int>(same - exprs.begin());
+    if (same == exprs.end()) {
+      exprs.push_back(t.expr);
+    }
+    return BoundColumn{
+        .index = (where ? width_ : kPreBase) + k, .name = t.expr->name, .type = t.expr->type};
+  }
+
+  // An aggregate call with its argument bound in the input scope (computed when not a column).
+  arrow::Result<AggregateCall> BindAggregate(const sql::AggregateCall& call) {
+    AggregateCall bound{.kind = AggKind::kCountStar, .span = call.span};
+    if (call.kind == sql::AggKind::kCountStar || !call.arg.has_value()) {
+      return bound;
+    }
+    ARROW_ASSIGN_OR_RAISE(const Typed arg, BindInput(**call.arg));
+    if (arg.stored_as_float) {
+      float_args_.push_back(InputColumn(arg).index);
+    }
+    BoundColumn column = InputColumn(arg);
+    if (call.arg_column() == nullptr) {
+      column.name = arg.expr->name;
+    }
+    ARROW_ASSIGN_OR_RAISE(bound.type, AggregateType(call, column));
+    bound.kind = call.distinct ? AggKind::kCountDistinct : ToPlan(call.kind);
+    bound.arg = std::move(column);
+    return bound;
+  }
+
+  // ---- the output scope: the aggregation's keys and aggregates ----
+
+  struct SumRewrite {
+    const sql::Expr* other = nullptr;    // SUM(other + constant)
+    const sql::Expr* counted = nullptr;  // `other` without its `+ constant` layers
+    Int128 constant = 0;
   };
-  const auto aggregate_operand = [&](std::size_t index, std::string name) {
-    const AggregateCall& call = aggregates[index];
-    // DuckDB's MIN and MAX of a FLOAT column are FLOAT; the other aggregates are not.
-    const bool is_float = (call.kind == AggKind::kMin || call.kind == AggKind::kMax) &&
-                          call.arg.has_value() && table.StoredAsFloat(call.arg->index);
-    return Operand{.column = BoundColumn{.index = Narrow<int>(keys.size() + index),
-                                         .name = std::move(name),
-                                         .type = call.type},
-                   .stored_as_float = is_float};
-  };
-  const auto key_operand = [&](const BoundColumn& column) -> std::optional<Operand> {
-    const auto key =
-        std::ranges::find_if(keys, [&](const BoundColumn& k) { return k.index == column.index; });
-    if (key == keys.end()) {
+
+  // DuckDB's sum rewriter, in a query without GROUP BY: SUM(other + c) (either order), c an integer
+  // constant (literals folded) and the sum and `other` of a signed integer type, is
+  // SUM(other) + c * COUNT(other), in HUGEINT: the addition is never computed, so it never
+  // overflows. SUM(other) is rewritten again if it has that shape, and COUNT(other) counts `other`
+  // without its `+ constant` layers (they add no NULL), as DuckDB does.
+  arrow::Result<std::optional<SumRewrite>> RewritableSum(const sql::AggregateCall& call) {
+    if (!stmt_.group_by.empty() || call.kind != sql::AggKind::kSum || call.distinct ||
+        !call.arg.has_value()) {
       return std::nullopt;
     }
-    return Operand{.column = BoundColumn{.index = Narrow<int>(key - keys.begin()),
-                                         .name = column.name,
-                                         .type = column.type},
-                   .stored_as_float = table.StoredAsFloat(column.index)};
-  };
-  const auto not_grouped = [](std::string_view name, SourceSpan span) {
+    const auto split =
+        [](const sql::Expr& e) -> std::optional<std::pair<const sql::Expr*, Int128>> {
+      const auto* add = std::get_if<sql::BinaryExpr>(&e);
+      if (add == nullptr || add->op != sql::BinaryOp::kAdd) {
+        return std::nullopt;
+      }
+      if (const auto c = ConstantValue(*add->right); c.has_value() && ReadsColumn(*add->left)) {
+        return std::pair(&*add->left, *c);
+      }
+      if (const auto c = ConstantValue(*add->left); c.has_value() && ReadsColumn(*add->right)) {
+        return std::pair(&*add->right, *c);
+      }
+      return std::nullopt;
+    };
+    const auto top = split(**call.arg);
+    if (!top.has_value()) {
+      return std::nullopt;
+    }
+    SumRewrite rewrite{.other = top->first, .counted = top->first, .constant = top->second};
+    while (const auto inner = split(*rewrite.counted)) {
+      rewrite.counted = inner->first;
+    }
+    ARROW_ASSIGN_OR_RAISE(const Typed whole, BindInput(**call.arg));
+    ARROW_ASSIGN_OR_RAISE(const Typed other, BindInput(*rewrite.other));
+    if (!IsSignedInteger(whole.expr->type) || !IsSignedInteger(other.expr->type)) {
+      return std::nullopt;
+    }
+    return rewrite;
+  }
+
+  // The aggregate as an output column (added as a hidden aggregate when the select list lacks it);
+  // a rewritten SUM as its expression over SUM and COUNT.
+  arrow::Result<Typed> AggregateOutput(const sql::AggregateCall& call) {
+    ARROW_ASSIGN_OR_RAISE(const auto rewrite, RewritableSum(call));
+    if (rewrite.has_value()) {
+      sql::AggregateCall sum{
+          .kind = sql::AggKind::kSum, .arg = {}, .distinct = false, .span = call.span};
+      sum.arg.emplace(*rewrite->other);
+      sql::AggregateCall count{
+          .kind = sql::AggKind::kCount, .arg = {}, .distinct = false, .span = call.span};
+      count.arg.emplace(*rewrite->counted);
+      ARROW_ASSIGN_OR_RAISE(Typed sum_column, AggregateOutput(sum));
+      ARROW_ASSIGN_OR_RAISE(Typed count_column, AggregateOutput(count));
+      const std::string constant_name = Int128ToString(rewrite->constant);
+      auto constant = std::make_shared<const Expr>(
+          Expr{.node = ConstantExpr{.value = Constant{.type = LogicalType::kHugeInt,
+                                                      .value = rewrite->constant}},
+               .type = LogicalType::kHugeInt,
+               .name = constant_name});
+      auto product = std::make_shared<const Expr>(
+          Expr{.node = ArithExpr{.op = ArithOp::kMultiply,
+                                 .left = std::move(constant),
+                                 .right = std::move(count_column.expr)},
+               .type = LogicalType::kHugeInt,
+               .name = std::format("({} * {})", constant_name, ResultName(count))});
+      return Leaf(Expr{.node = ArithExpr{.op = ArithOp::kAdd,
+                                         .left = std::move(sum_column.expr),
+                                         .right = std::move(product)},
+                       .type = LogicalType::kHugeInt,
+                       .name = ResultName(call)});
+    }
+    ARROW_ASSIGN_OR_RAISE(AggregateCall bound, BindAggregate(call));
+    const auto same = std::ranges::find_if(
+        select_.aggregates, [&](const AggregateCall& a) { return SameCall(a, bound); });
+    const auto index = Narrow<std::size_t>(same - select_.aggregates.begin());
+    if (same == select_.aggregates.end()) {
+      select_.aggregates.push_back(std::move(bound));
+    }
+    const AggregateCall& agg = select_.aggregates[index];
+    // DuckDB's MIN and MAX of a FLOAT column are FLOAT; the other aggregates are not.
+    const bool is_float = (agg.kind == AggKind::kMin || agg.kind == AggKind::kMax) &&
+                          agg.arg.has_value() &&
+                          std::ranges::find(float_args_, agg.arg->index) != float_args_.end();
+    return ColumnLeaf(Narrow<int>(keys_.size() + index), agg.type, ResultName(call), is_float);
+  }
+
+  static arrow::Status NotGrouped(std::string_view name, SourceSpan span) {
     return BindError(std::format("column '{}' must appear in the GROUP BY clause or be inside an "
                                  "aggregate function",
                                  name),
                      span);
-  };
-  const auto resolve = [&](const sql::HavingOperand& operand) -> arrow::Result<Operand> {
-    if (const auto* call = std::get_if<sql::AggregateCall>(&operand)) {
-      ARROW_ASSIGN_OR_RAISE(AggregateCall bound, BindAggregate(*call, columns));
-      const auto same = std::ranges::find_if(
-          aggregates, [&](const AggregateCall& a) { return SameCall(a, bound); });
-      const auto index = Narrow<std::size_t>(same - aggregates.begin());
-      if (same == aggregates.end()) {
-        aggregates.push_back(std::move(bound));  // a hidden aggregate
-      }
-      return aggregate_operand(index, ResultName(*call));
-    }
-    const auto& ref = std::get<sql::ColumnRef>(operand);
-    auto table_column = columns.Resolve(ref);
-    if (table_column.ok()) {
-      if (auto key = key_operand(*table_column)) {
-        return *std::move(key);
-      }
-    }
-    if (const auto alias = FindAlias(select, ref.name)) {
-      const auto [kind, index] = select.items[*alias];
-      switch (kind) {
-        case ItemKind::kAggregate:
-          return aggregate_operand(index, select.output[*alias].name);
-        case ItemKind::kConstant:
-          return UnsupportedError("HAVING on a constant select item is not supported", ref.span);
-        case ItemKind::kColumn:
-          if (auto key = key_operand(select.columns[index])) {
-            return *std::move(key);
-          }
-          return not_grouped(select.column_written[index], ref.span);
-      }
-    }
-    if (!table_column.ok()) {
-      return table_column.status();
-    }
-    return not_grouped(ref.name, ref.span);
-  };
-  std::vector<Predicate> predicates;
-  for (const sql::Expr* conjunct : Conjuncts(stmt.having)) {
-    const std::optional<sql::HavingComparison> having = sql::AsHavingComparison(*conjunct);
-    if (!having.has_value()) {
-      return UnsupportedError("this condition is not supported", conjunct->span());
-    }
-    const sql::HavingComparison& condition = *having;
-    ARROW_ASSIGN_OR_RAISE(const Operand operand, resolve(condition.operand));
-    // The comparison binders read the operand's span from a column reference.
-    const SourceSpan operand_span =
-        std::visit([](const auto& node) { return node.span; }, condition.operand);
-    const sql::Comparison cmp{
-        .column =
-            sql::ColumnRef{.name = operand.column.name, .quoted = false, .span = operand_span},
-        .op = condition.op,
-        .literal = condition.literal,
-        .list = condition.list,
-        .span = condition.span};
-    ARROW_ASSIGN_OR_RAISE(Predicate predicate,
-                          BindComparison(cmp, operand.column, operand.stored_as_float));
-    predicates.push_back(std::move(predicate));
   }
-  return predicates;
+
+  // An expression over the aggregation's output: a subexpression equal to a GROUP BY key is that
+  // key, an aggregate its column; any other column is a bind error.
+  arrow::Result<Typed> BindOutput(const sql::Expr& expr) {
+    if (!ContainsAggregate(expr) && !std::holds_alternative<sql::Literal>(expr)) {
+      auto input = BindInput(expr);
+      if (input.ok()) {
+        for (std::size_t k = 0; k < key_exprs_.size(); ++k) {
+          if (SameExpr(*input->expr, *key_exprs_[k])) {
+            return ColumnLeaf(Narrow<int>(k), keys_[k].type, input->expr->name,
+                              input->stored_as_float);
+          }
+        }
+      }
+    }
+    if (const auto* call = std::get_if<sql::AggregateCall>(&expr)) {
+      return AggregateOutput(*call);
+    }
+    if (const auto* ref = std::get_if<sql::ColumnRef>(&expr)) {
+      auto resolved = columns_.Resolve(*ref);
+      if (!resolved.ok()) {
+        if (auto alias = AliasFallback(*ref, resolved.status())) {
+          return *std::move(alias);
+        }
+        return resolved.status();
+      }
+      return NotGrouped(ref->name, ref->span);
+    }
+    if (const auto* lit = std::get_if<sql::Literal>(&expr)) {
+      return LiteralOperand(*lit);
+    }
+    if (const auto* binary = std::get_if<sql::BinaryExpr>(&expr)) {
+      ARROW_ASSIGN_OR_RAISE(Typed left, BindOutput(*binary->left));
+      ARROW_ASSIGN_OR_RAISE(Typed right, BindOutput(*binary->right));
+      return Arith(*binary, std::move(left), std::move(right));
+    }
+    if (const auto* unary = std::get_if<sql::UnaryExpr>(&expr)) {
+      ARROW_ASSIGN_OR_RAISE(Typed operand, BindOutput(*unary->operand));
+      return Negate(*unary, std::move(operand));
+    }
+    return UnsupportedError("this expression is not supported", expr.span());
+  }
+
+  // The column of an output-scope expression: an output column as is, anything else computed
+  // above the aggregation (once).
+  BoundColumn OutputColumn(const Typed& t) {
+    if (const auto* column = std::get_if<ColumnExpr>(&t.expr->node)) {
+      return BoundColumn{.index = column->index, .name = t.expr->name, .type = t.expr->type};
+    }
+    const auto same =
+        std::ranges::find_if(post_exprs_, [&](const ExprPtr& e) { return SameExpr(*e, *t.expr); });
+    const auto k = Narrow<int>(same - post_exprs_.begin());
+    if (same == post_exprs_.end()) {
+      post_exprs_.push_back(t.expr);
+    }
+    return BoundColumn{.index = kPostBase + k, .name = t.expr->name, .type = t.expr->type};
+  }
+
+  // An expression of the select list, HAVING or ORDER BY in the query's scope: the input scope of a
+  // projection, else the output scope.
+  arrow::Result<Typed> BindScoped(const sql::Expr& expr) {
+    return shape_ == Shape::kProjection ? BindInput(expr) : BindOutput(expr);
+  }
+
+  BoundColumn ScopedColumn(const Typed& t) {
+    return shape_ == Shape::kProjection ? InputColumn(t) : OutputColumn(t);
+  }
+
+  // ---- clauses ----
+
+  arrow::Status BindSelectList();
+  arrow::Status BindWhere();
+  arrow::Status BindGroupBy();
+  arrow::Status CheckGrouped();
+  arrow::Status BindSelectExpressions();
+  // A WHERE or HAVING conjunct as a predicate over the scope's columns.
+  arrow::Result<Predicate> BindCondition(const sql::Expr& conjunct, bool having);
+  struct Moved {
+    enum class Outcome : std::uint8_t { kCompare, kFalse, kNotNull };
+    const sql::Expr* operand = nullptr;
+    sql::CompareOp op = sql::CompareOp::kEq;
+    Int128 k = 0;
+    Outcome outcome = Outcome::kCompare;
+  };
+  arrow::Result<std::optional<Moved>> MoveConstants(const sql::Expr& operand, sql::CompareOp op,
+                                                    const sql::Literal& literal);
+  arrow::Result<std::optional<Typed>> ResolveHavingName(const sql::ColumnRef& ref);
+  arrow::Status BindHaving();
+  arrow::Status BindOrderBy();
+
+  // Select item i in the query's scope (std::nullopt: a constant).
+  arrow::Result<std::optional<Typed>> ItemOutput(std::size_t i);
+
+  // Inside an ORDER BY or HAVING expression a name that is no table column is the last select item
+  // with that alias, as in DuckDB (a table column comes first there). std::nullopt: no such alias,
+  // or not in such an expression.
+  std::optional<arrow::Result<Typed>> AliasFallback(const sql::ColumnRef& ref,
+                                                    const arrow::Status& resolved) {
+    const auto detail = GetSqlError(resolved);
+    if (!alias_fallback_ || detail == nullptr || detail->kind() != SqlErrorDetail::Kind::kBind) {
+      return std::nullopt;
+    }
+    const auto alias = FindAlias(select_, ref.name);
+    if (!alias.has_value()) {
+      return std::nullopt;
+    }
+    const auto [kind, index] = select_.items[*alias];
+    if (kind == ItemKind::kConstant) {
+      const Constant& constant = select_.constants[index];
+      return Leaf(Expr{.node = ConstantExpr{.value = constant},
+                       .type = constant.type,
+                       .name = select_.output[*alias].name});
+    }
+    if (kind == ItemKind::kExpression) {
+      // The item's expression itself (a computed column cannot be read by a computation), bound as
+      // in the select list: without the fallback, so that an alias never refers to itself.
+      alias_fallback_ = false;
+      auto item = BindScoped(*select_.exprs[index]);
+      alias_fallback_ = true;
+      return item;
+    }
+    auto item = ItemOutput(*alias);
+    if (!item.ok()) {
+      return item.status();
+    }
+    std::optional<Typed> value = *std::move(item);
+    if (!value.has_value()) {
+      return std::nullopt;
+    }
+    return *std::move(value);
+  }
+
+  bool alias_fallback_ = false;  // binding an ORDER BY or HAVING expression
+
+  // The column of an output reference once the aggregation's output width is known.
+  static void Place(BoundColumn& column, int width) {
+    if (column.index >= kPostBase) {
+      column.index = width + (column.index - kPostBase);
+    }
+  }
+
+  LogicalPlan Assemble();
+
+  const sql::SelectStatement& stmt_;
+  std::shared_ptr<Table> table_;
+  const arrow::Schema& schema_;
+  Columns columns_;
+  int width_;  // the Scan's output: every table field
+  SelectList select_;
+  Shape shape_ = Shape::kProjection;
+  std::vector<ExprPtr> where_exprs_;     // WHERE operands, computed over the filtered Scan
+  std::vector<ExprPtr> input_exprs_;     // computed after the WHERE filter on computed columns
+  std::vector<int> float_args_;          // input columns holding FLOAT values
+  std::vector<Predicate> scan_filter_;   // WHERE over the Scan's columns
+  std::vector<Predicate> input_filter_;  // WHERE over computed columns
+  std::vector<BoundColumn> keys_;        // GROUP BY keys, as columns of the input
+  std::vector<ExprPtr> key_exprs_;       // per key: its input-scope expression
+  std::vector<ExprPtr> post_exprs_;      // computed over the aggregation's output
+  std::vector<Predicate> having_;
+  std::vector<SortKey> sort_keys_;
+};
+
+arrow::Status Binder::BindSelectList() {
+  SelectList& list = select_;
+  if (stmt_.star) {
+    list.span = stmt_.star_span;
+    for (int i = 0; i < schema_.num_fields(); ++i) {
+      ARROW_ASSIGN_OR_RAISE(BoundColumn column, columns_.Field(i, stmt_.star_span));
+      list.output.push_back(plan::OutputColumn{.name = column.name, .type = column.type});
+      list.items.emplace_back(ItemKind::kColumn, list.columns.size());
+      list.column_spans.push_back(stmt_.star_span);
+      list.column_written.push_back(column.name);
+      list.aliases.emplace_back();
+      list.columns.push_back(std::move(column));
+    }
+    if (stmt_.group_by.empty() && IsAggregateQuery(stmt_) && !list.columns.empty()) {
+      return BindError(std::format("column '{}' must be inside an aggregate function: a query "
+                                   "with aggregates cannot also select plain columns (there is "
+                                   "no GROUP BY)",
+                                   list.columns.front().name),
+                       stmt_.star_span);
+    }
+    return arrow::Status::OK();
+  }
+  if (stmt_.items.empty()) {
+    return BindError("the select list is empty", stmt_.span);
+  }
+  list.span = Cover(stmt_.items.front().span, stmt_.items.back().span);
+  const sql::ColumnRef* first_column = nullptr;
+  for (const sql::SelectItem& item : stmt_.items) {
+    list.aliases.push_back(item.alias);
+    const auto* call = std::get_if<sql::AggregateCall>(&item.expr);
+    bool rewritten = false;
+    if (call != nullptr) {
+      ARROW_ASSIGN_OR_RAISE(const auto rewrite, RewritableSum(*call));
+      rewritten = rewrite.has_value();
+    }
+    if (call != nullptr && !rewritten) {
+      ARROW_ASSIGN_OR_RAISE(AggregateCall bound, BindAggregate(*call));
+      list.output.push_back(
+          plan::OutputColumn{.name = item.alias.value_or(ResultName(*call)), .type = bound.type});
+      list.items.emplace_back(ItemKind::kAggregate, list.aggregates.size());
+      list.aggregates.push_back(std::move(bound));
+      continue;
+    }
+    if (const auto* lit = std::get_if<sql::Literal>(&item.expr)) {
+      ARROW_ASSIGN_OR_RAISE(auto constant, BindConstant(*lit));
+      list.output.push_back(plan::OutputColumn{
+          .name = item.alias.value_or(std::move(constant.second)), .type = constant.first.type});
+      list.items.emplace_back(ItemKind::kConstant, list.constants.size());
+      list.constants.push_back(std::move(constant.first));
+      continue;
+    }
+    if (const auto* ref = std::get_if<sql::ColumnRef>(&item.expr)) {
+      ARROW_ASSIGN_OR_RAISE(BoundColumn column, columns_.Resolve(*ref));
+      // DuckDB names a plain column by its declared name, not as written.
+      list.output.push_back(
+          plan::OutputColumn{.name = item.alias.value_or(column.name), .type = column.type});
+      list.items.emplace_back(ItemKind::kColumn, list.columns.size());
+      list.column_spans.push_back(ref->span);
+      list.column_written.push_back(ref->name);
+      list.columns.push_back(std::move(column));
+      if (first_column == nullptr) {
+        first_column = ref;
+      }
+      continue;
+    }
+    // Bound once the query's shape and keys are known (BindSelectExpressions).
+    list.output.push_back(plan::OutputColumn{.name = item.alias.value_or(""), .type = {}});
+    list.items.emplace_back(ItemKind::kExpression, list.exprs.size());
+    list.exprs.push_back(&item.expr);
+  }
+  if (stmt_.group_by.empty() && IsAggregateQuery(stmt_) && first_column != nullptr) {
+    return BindError(std::format("column '{}' must be inside an aggregate function: a query with "
+                                 "aggregates cannot also select plain columns (there is no "
+                                 "GROUP BY)",
+                                 first_column->name),
+                     first_column->span);
+  }
+  return arrow::Status::OK();
+}
+
+// DuckDB's constant moving in a WHERE comparison `operand <op> k`, k an integer literal: for a
+// signed integer operand x + c, c + x or x - c (c an integer constant, literals folded) the
+// comparison becomes x <op> k - c (or k + c), for c - x it becomes x <mirrored op> c - k, and for
+// x * c (c not 0) x <op> k / c when c divides k (the op mirrored for a negative c), where a
+// non-dividing k makes = FALSE and <> IS NOT NULL. It repeats on x, and stops where k or the new
+// constant is outside the operand's type. So the arithmetic is never computed and never
+// overflows, as in DuckDB. std::nullopt: nothing moved.
+arrow::Result<std::optional<Binder::Moved>> Binder::MoveConstants(const sql::Expr& operand,
+                                                                  sql::CompareOp op,
+                                                                  const sql::Literal& literal) {
+  if (literal.kind != sql::Literal::Kind::kInteger || IsApproximateNumber(literal.text)) {
+    return std::nullopt;
+  }
+  const auto exact = ParseExactNumber(literal.text, literal.negative);
+  if (!exact.has_value() || exact->huge) {
+    return std::nullopt;
+  }
+  Moved cur{.operand = &operand,
+            .op = op,
+            .k = exact->negative ? -exact->magnitude : exact->magnitude,
+            .outcome = Moved::Outcome::kCompare};
+  bool moved = false;
+  const bool ordered = op != sql::CompareOp::kEq && op != sql::CompareOp::kNe;
+  while (const auto* binary = std::get_if<sql::BinaryExpr>(cur.operand)) {
+    ARROW_ASSIGN_OR_RAISE(const Typed whole, BindInput(*cur.operand));
+    const LogicalType type = whole.expr->type;
+    if (!IsSignedInteger(type)) {
+      break;
+    }
+    const IntegerRange range = RangeOf(type);
+    const auto fits = [&](Int128 v) { return v >= range.min && v <= range.max; };
+    if (!fits(cur.k)) {
+      break;
+    }
+    const auto right = ConstantValue(*binary->right);
+    const auto left = ConstantValue(*binary->left);
+    const bool constant_right = right.has_value() && ReadsColumn(*binary->left);
+    const bool constant_left = left.has_value() && ReadsColumn(*binary->right);
+    if (!constant_right && !constant_left) {
+      break;
+    }
+    const sql::Expr* x = constant_right ? &*binary->left : &*binary->right;
+    const Int128 c = constant_right ? *right : *left;
+    Int128 k = 0;
+    sql::CompareOp next = cur.op;
+    bool overflow = false;
+    switch (binary->op) {
+      case sql::BinaryOp::kAdd:
+        overflow = __builtin_sub_overflow(cur.k, c, &k);
+        break;
+      case sql::BinaryOp::kSubtract:
+        if (constant_right) {
+          overflow = __builtin_add_overflow(cur.k, c, &k);
+        } else {
+          overflow = __builtin_sub_overflow(c, cur.k, &k);
+          next = Mirror(cur.op);
+        }
+        break;
+      case sql::BinaryOp::kMultiply:
+        if (c == 0) {
+          overflow = true;  // no move
+        } else if (cur.k % c != 0) {
+          if (ordered) {
+            overflow = true;
+          } else {
+            return Moved{.operand = x,
+                         .op = cur.op,
+                         .k = 0,
+                         .outcome = cur.op == sql::CompareOp::kEq ? Moved::Outcome::kFalse
+                                                                  : Moved::Outcome::kNotNull};
+          }
+        } else {
+          k = cur.k / c;
+          next = c < 0 ? Mirror(cur.op) : cur.op;
+        }
+        break;
+      default:
+        overflow = true;
+        break;
+    }
+    if (overflow || !fits(k)) {
+      break;
+    }
+    cur = Moved{.operand = x, .op = next, .k = k, .outcome = Moved::Outcome::kCompare};
+    moved = true;
+  }
+  if (!moved) {
+    return std::nullopt;
+  }
+  return cur;
+}
+
+// A condition of WHERE (the input scope) or HAVING (the output scope, `having`): an operand
+// <op> literal is folded exactly into the operand's type as for a column; operand <op> operand
+// compares two columns; [NOT] LIKE and [NOT] IN take a literal pattern or list. An operand that is
+// not a column of the scope is computed.
+arrow::Result<Predicate> Binder::BindCondition(const sql::Expr& conjunct, bool having) {
+  const auto bind = [&](const sql::Expr& e) -> arrow::Result<Typed> {
+    if (having) {
+      if (const auto* ref = std::get_if<sql::ColumnRef>(&e)) {
+        ARROW_ASSIGN_OR_RAISE(auto resolved, ResolveHavingName(*ref));
+        if (resolved.has_value()) {
+          return *std::move(resolved);
+        }
+      }
+      return BindOutput(e);
+    }
+    return BindInput(e);
+  };
+  const auto column_of = [&](const Typed& t) {
+    return having ? OutputColumn(t) : InputColumn(t, /*where=*/true);
+  };
+  // `operand <op> literal` (and the LIKE and IN forms) through the column binders.
+  const auto with_literal = [&](const sql::Expr& operand_expr, sql::CompareOp op,
+                                const sql::Literal& literal, const std::vector<sql::Literal>& list,
+                                SourceSpan span) -> arrow::Result<Predicate> {
+    ARROW_ASSIGN_OR_RAISE(const Typed operand, bind(operand_expr));
+    const BoundColumn column = column_of(operand);
+    // The comparison binders read the operand's name and span from a column reference.
+    const sql::Comparison cmp{
+        .column = sql::ColumnRef{.name = column.name, .quoted = false, .span = operand_expr.span()},
+        .op = op,
+        .literal = literal,
+        .list = list,
+        .span = span};
+    return BindComparison(cmp, column, operand.stored_as_float);
+  };
+  if (const auto* like = std::get_if<sql::LikeExpr>(&conjunct)) {
+    return with_literal(*like->operand,
+                        like->negated ? sql::CompareOp::kNotLike : sql::CompareOp::kLike,
+                        std::get<sql::Literal>(*like->pattern), {}, like->span);
+  }
+  if (const auto* in = std::get_if<sql::InExpr>(&conjunct)) {
+    std::vector<sql::Literal> list;
+    list.reserve(in->list.size());
+    for (const sql::Expr& value : in->list) {
+      list.push_back(std::get<sql::Literal>(value));
+    }
+    return with_literal(*in->operand, in->negated ? sql::CompareOp::kNotIn : sql::CompareOp::kIn,
+                        sql::Literal{}, list, in->span);
+  }
+  const auto& binary = std::get<sql::BinaryExpr>(conjunct);
+  const sql::CompareOp op = SqlCompareOp(binary.op);
+  const auto* left_literal = std::get_if<sql::Literal>(&*binary.left);
+  const auto* right_literal = std::get_if<sql::Literal>(&*binary.right);
+  if (right_literal != nullptr || left_literal != nullptr) {
+    const sql::Expr& operand_expr = right_literal != nullptr ? *binary.left : *binary.right;
+    const sql::Literal& literal = right_literal != nullptr ? *right_literal : *left_literal;
+    const sql::CompareOp oriented = right_literal != nullptr ? op : Mirror(op);
+    if (!having) {
+      ARROW_ASSIGN_OR_RAISE(const auto moved, MoveConstants(operand_expr, oriented, literal));
+      if (moved.has_value()) {
+        if (moved->outcome != Moved::Outcome::kCompare) {
+          ARROW_ASSIGN_OR_RAISE(const Typed operand, bind(*moved->operand));
+          const bool never = moved->outcome == Moved::Outcome::kFalse;
+          return Predicate{.kind = never ? Predicate::Kind::kFalse : Predicate::Kind::kIsNotNull,
+                           .column = never ? std::nullopt : std::optional(column_of(operand)),
+                           .op = CompareOp::kEq,
+                           .constant = {},
+                           .values = {},
+                           .span = binary.span};
+        }
+        const sql::Literal k{.kind = sql::Literal::Kind::kInteger,
+                             .negative = moved->k < 0,
+                             .text = Int128ToString(moved->k < 0 ? -moved->k : moved->k),
+                             .span = literal.span};
+        return with_literal(*moved->operand, moved->op, k, {}, binary.span);
+      }
+    }
+    return with_literal(operand_expr, oriented, literal, {}, binary.span);
+  }
+  ARROW_ASSIGN_OR_RAISE(const Typed left, bind(*binary.left));
+  ARROW_ASSIGN_OR_RAISE(const Typed right, bind(*binary.right));
+  if (!Comparable(left.expr->type, right.expr->type)) {
+    return BindError(
+        std::format("cannot compare {} with {}", DescribeOperand(left), DescribeOperand(right)),
+        binary.op_span);
+  }
+  if (left.stored_as_float || right.stored_as_float) {
+    return UnsupportedError(
+        "comparing a FLOAT column with another expression is not supported (antb1 reads FLOAT as "
+        "DOUBLE, divergence D11)",
+        binary.op_span);
+  }
+  return Predicate{.kind = Predicate::Kind::kCompareColumns,
+                   .column = column_of(left),
+                   .other = column_of(right),
+                   .op = ToPlan(op),
+                   .constant = {},
+                   .values = {},
+                   .span = binary.span};
+}
+
+arrow::Status Binder::BindWhere() {
+  for (const sql::Expr* conjunct : Conjuncts(stmt_.where)) {
+    ARROW_ASSIGN_OR_RAISE(Predicate predicate, BindCondition(*conjunct, /*having=*/false));
+    const bool on_scan = (!predicate.column.has_value() || predicate.column->index < width_) &&
+                         (!predicate.other.has_value() || predicate.other->index < width_);
+    (on_scan ? scan_filter_ : input_filter_).push_back(std::move(predicate));
+  }
+  return arrow::Status::OK();
+}
+
+// The GROUP BY keys: an expression over the table's columns (a table column first), or else the
+// alias of a select item that is not an aggregate (the last item with that alias, as in DuckDB),
+// or a position in the select list; duplicates are dropped. A constant (a constant item, by alias
+// or position, or any other literal) is no key: it still makes the query grouped (one group if
+// there is a row at all).
+arrow::Status Binder::BindGroupBy() {
+  const auto add = [&](const Typed& t) {
+    const bool duplicate = std::ranges::any_of(
+        key_exprs_, [&](const ExprPtr& key) { return SameExpr(*key, *t.expr); });
+    if (!duplicate) {
+      keys_.push_back(InputColumn(t));
+      key_exprs_.push_back(t.expr);
+    }
+  };
+  // Select item i as a key: its expression, nothing for a constant, an error for an aggregate.
+  const auto item_key = [&](std::size_t i, std::string_view what,
+                            SourceSpan span) -> arrow::Status {
+    const auto [kind, index] = select_.items[i];
+    switch (kind) {
+      case ItemKind::kAggregate:
+        return BindError(std::format("GROUP BY cannot refer to the aggregate {}", what), span);
+      case ItemKind::kConstant:
+        break;
+      case ItemKind::kColumn: {
+        const BoundColumn& column = select_.columns[index];
+        add(ColumnLeaf(column.index, column.type, column.name, false));
+        break;
+      }
+      case ItemKind::kExpression: {
+        const sql::Expr& expr = *select_.exprs[index];
+        if (ContainsAggregate(expr)) {
+          return BindError(std::format("GROUP BY cannot refer to the aggregate {}", what), span);
+        }
+        ARROW_ASSIGN_OR_RAISE(const Typed t, BindInput(expr));
+        if (!IsConstantExpr(*t.expr)) {
+          add(t);
+        }
+        break;
+      }
+    }
+    return arrow::Status::OK();
+  };
+  for (const sql::GroupExpr& expr : stmt_.group_by) {
+    if (const auto* lit = std::get_if<sql::Literal>(&expr)) {
+      ARROW_ASSIGN_OR_RAISE(const auto position, PositionOf(*lit, select_, "GROUP BY"));
+      if (position.has_value()) {
+        ARROW_RETURN_NOT_OK(
+            item_key(*position, std::format("at position {}", *position + 1), lit->span));
+      }
+      continue;
+    }
+    if (const auto* ref = std::get_if<sql::ColumnRef>(&expr)) {
+      auto column = columns_.Resolve(*ref);
+      if (column.ok()) {
+        add(ColumnLeaf(column->index, column->type, column->name, false));
+        continue;
+      }
+      const auto detail = GetSqlError(column.status());
+      if (detail == nullptr || detail->kind() != SqlErrorDetail::Kind::kBind) {
+        return column.status();
+      }
+      const auto alias = FindAlias(select_, ref->name);
+      if (!alias.has_value()) {
+        return column.status();
+      }
+      ARROW_RETURN_NOT_OK(
+          item_key(*alias, std::format("'{}'", select_.aliases[*alias].value_or("")), ref->span));
+      continue;
+    }
+    ARROW_ASSIGN_OR_RAISE(const Typed t, BindInput(expr));
+    std::vector<int> reads;
+    CollectColumns(*t.expr, reads);
+    if (reads.empty()) {
+      return UnsupportedError("GROUP BY a constant expression is not supported", expr.span());
+    }
+    add(t);
+  }
+  return arrow::Status::OK();
+}
+
+// Every plain column of a grouped select list must be a key (as in DuckDB).
+arrow::Status Binder::CheckGrouped() {
+  for (std::size_t i = 0; i < select_.columns.size(); ++i) {
+    const Expr column{.node = ColumnExpr{.index = select_.columns[i].index},
+                      .type = select_.columns[i].type,
+                      .name = {}};
+    const bool key =
+        std::ranges::any_of(key_exprs_, [&](const ExprPtr& k) { return SameExpr(*k, column); });
+    if (!key) {
+      return BindError(std::format("column '{}' must appear in the GROUP BY clause or be inside an "
+                                   "aggregate function",
+                                   select_.column_written[i]),
+                       select_.column_spans[i]);
+    }
+  }
+  return arrow::Status::OK();
+}
+
+// The select items that are neither columns, aggregates nor constants, in the query's scope; each
+// gets its column (computed unless it is one already).
+arrow::Status Binder::BindSelectExpressions() {
+  for (std::size_t i = 0; i < select_.items.size(); ++i) {
+    const auto [kind, index] = select_.items[i];
+    if (kind != ItemKind::kExpression) {
+      continue;
+    }
+    ARROW_ASSIGN_OR_RAISE(const Typed t, BindScoped(*select_.exprs[index]));
+    BoundColumn column = ScopedColumn(t);
+    select_.output[i].type = t.expr->type;
+    if (!select_.aliases[i].has_value()) {
+      select_.output[i].name = t.expr->name;
+    }
+    column.name = select_.output[i].name;
+    select_.expr_columns.push_back(std::move(column));
+  }
+  return arrow::Status::OK();
+}
+
+arrow::Result<std::optional<Typed>> Binder::ItemOutput(std::size_t i) {
+  const auto [kind, index] = select_.items[i];
+  switch (kind) {
+    case ItemKind::kConstant:
+      return std::nullopt;
+    case ItemKind::kAggregate:
+      return std::optional(ColumnLeaf(Narrow<int>(keys_.size() + index),
+                                      select_.aggregates[index].type, select_.output[i].name,
+                                      false));
+    case ItemKind::kExpression: {
+      const BoundColumn& column = select_.expr_columns[index];
+      return std::optional(ColumnLeaf(column.index, column.type, column.name, false));
+    }
+    case ItemKind::kColumn:
+      break;
+  }
+  const BoundColumn& column = select_.columns[index];
+  if (shape_ == Shape::kProjection) {
+    return std::optional(
+        ColumnLeaf(column.index, column.type, column.name, table_->StoredAsFloat(column.index)));
+  }
+  for (std::size_t k = 0; k < key_exprs_.size(); ++k) {
+    const auto* key = std::get_if<ColumnExpr>(&key_exprs_[k]->node);
+    if (key != nullptr && key->index == column.index) {
+      return std::optional(ColumnLeaf(Narrow<int>(k), column.type, column.name,
+                                      table_->StoredAsFloat(column.index)));
+    }
+  }
+  return NotGrouped(select_.column_written[index], select_.column_spans[index]);
+}
+
+// A name in HAVING: a table column that is a GROUP BY key first, else the last select item with
+// that alias (DuckDB): a key, an aggregate or an expression. std::nullopt: bind it as any other
+// operand.
+arrow::Result<std::optional<Typed>> Binder::ResolveHavingName(const sql::ColumnRef& ref) {
+  auto table_column = columns_.Resolve(ref);
+  if (table_column.ok()) {
+    for (std::size_t k = 0; k < key_exprs_.size(); ++k) {
+      const auto* key = std::get_if<ColumnExpr>(&key_exprs_[k]->node);
+      if (key != nullptr && key->index == table_column->index) {
+        return std::optional(ColumnLeaf(Narrow<int>(k), table_column->type, table_column->name,
+                                        table_->StoredAsFloat(table_column->index)));
+      }
+    }
+  }
+  const auto alias = FindAlias(select_, ref.name);
+  if (!alias.has_value()) {
+    return std::nullopt;
+  }
+  if (select_.items[*alias].first == ItemKind::kConstant) {
+    return UnsupportedError("HAVING on a constant select item is not supported", ref.span);
+  }
+  ARROW_ASSIGN_OR_RAISE(auto item, ItemOutput(*alias));
+  if (item.has_value() && select_.items[*alias].first == ItemKind::kAggregate) {
+    // DuckDB's MIN and MAX of a FLOAT column are FLOAT.
+    const AggregateCall& agg = select_.aggregates[select_.items[*alias].second];
+    item->stored_as_float = (agg.kind == AggKind::kMin || agg.kind == AggKind::kMax) &&
+                            agg.arg.has_value() &&
+                            std::ranges::find(float_args_, agg.arg->index) != float_args_.end();
+  }
+  return item;
+}
+
+// HAVING conditions as predicates over the aggregation's output (and columns computed over it).
+arrow::Status Binder::BindHaving() {
+  alias_fallback_ = true;
+  for (const sql::Expr* conjunct : Conjuncts(stmt_.having)) {
+    ARROW_ASSIGN_OR_RAISE(Predicate predicate, BindCondition(*conjunct, /*having=*/true));
+    having_.push_back(std::move(predicate));
+  }
+  alias_fallback_ = false;
+  return arrow::Status::OK();
+}
+
+// ORDER BY items in the query's scope. kGlobal checks the items and returns no key: one row needs
+// no sort. A select alias comes before a table column, as in DuckDB; an unsigned integer is a
+// position in the select list; a constant (a constant item, or any other literal) orders nothing;
+// a later key on a column already ordered by changes nothing and is dropped.
+arrow::Status Binder::BindOrderBy() {
+  alias_fallback_ = true;
+  for (const sql::OrderItem& item : stmt_.order_by) {
+    std::optional<Typed> key;
+    if (const auto* lit = std::get_if<sql::Literal>(&item.expr)) {
+      ARROW_ASSIGN_OR_RAISE(const auto position, PositionOf(*lit, select_, "ORDER BY"));
+      if (position.has_value()) {
+        ARROW_ASSIGN_OR_RAISE(key, ItemOutput(*position));
+      }
+    } else if (const auto* ref = std::get_if<sql::ColumnRef>(&item.expr);
+               ref != nullptr && FindAlias(select_, ref->name).has_value()) {
+      const std::size_t alias = FindAlias(select_, ref->name).value_or(0);
+      ARROW_ASSIGN_OR_RAISE(key, ItemOutput(alias));
+    } else {
+      // A global aggregate's only row needs no sort: its ORDER BY items are checked, and computed
+      // or hidden aggregates for them dropped again.
+      const std::size_t aggregates = select_.aggregates.size();
+      const std::size_t posts = post_exprs_.size();
+      ARROW_ASSIGN_OR_RAISE(const Typed t, BindScoped(item.expr));
+      if (shape_ == Shape::kGlobal) {
+        select_.aggregates.resize(aggregates);
+        post_exprs_.resize(posts);
+        continue;
+      }
+      std::vector<int> reads;
+      CollectColumns(*t.expr, reads);
+      if (reads.empty()) {
+        return UnsupportedError("ORDER BY a constant expression is not supported",
+                                item.expr.span());
+      }
+      key = t;
+    }
+    if (!key.has_value() || shape_ == Shape::kGlobal) {
+      continue;
+    }
+    const BoundColumn column = ScopedColumn(*key);
+    const bool repeated = std::ranges::any_of(
+        sort_keys_, [&](const SortKey& k) { return k.column.index == column.index; });
+    if (!repeated) {
+      sort_keys_.push_back(SortKey{.column = column,
+                                   .descending = item.descending,
+                                   .nulls_first = item.nulls == sql::NullsOrder::kFirst});
+    }
+  }
+  return arrow::Status::OK();
+}
+
+arrow::Result<LogicalPlan> Binder::Bind() {
+  ARROW_RETURN_NOT_OK(BindSelectList());
+  ARROW_RETURN_NOT_OK(BindWhere());
+  if (!stmt_.group_by.empty()) {
+    shape_ = Shape::kGrouped;
+    ARROW_RETURN_NOT_OK(BindGroupBy());
+    ARROW_RETURN_NOT_OK(CheckGrouped());
+  } else if (IsAggregateQuery(stmt_) || !select_.aggregates.empty()) {
+    shape_ = Shape::kGlobal;  // an aggregate anywhere or HAVING makes one row, even of constants
+  }
+  if (stmt_.limit.has_value() && *stmt_.limit < 0) {
+    return BindError("LIMIT must not be negative", stmt_.limit_span);
+  }
+  if (stmt_.offset.has_value() && *stmt_.offset < 0) {
+    return BindError("OFFSET must not be negative", stmt_.offset_span);
+  }
+  ARROW_RETURN_NOT_OK(BindSelectExpressions());
+  ARROW_RETURN_NOT_OK(BindHaving());
+  ARROW_RETURN_NOT_OK(BindOrderBy());
+  return Assemble();
+}
+
+LogicalPlan Binder::Assemble() {
+  ScanNode scan{
+      .table = table_, .table_name = stmt_.from.name, .fields = {}, .span = stmt_.from.span};
+  for (int i = 0; i < width_; ++i) {
+    scan.fields.push_back(i);
+  }
+  LogicalNodePtr node = Make(std::move(scan));
+  const SourceSpan where_span = stmt_.where.empty()
+                                    ? SourceSpan{}
+                                    : Cover(stmt_.where.front().span(), stmt_.where.back().span());
+  if (!scan_filter_.empty()) {
+    node = Make(FilterNode{
+        .input = std::move(node), .predicates = std::move(scan_filter_), .span = where_span});
+  }
+  if (!where_exprs_.empty()) {
+    node = Make(ComputeNode{.input = std::move(node), .exprs = where_exprs_, .span = where_span});
+  }
+  if (!input_filter_.empty()) {
+    node = Make(FilterNode{
+        .input = std::move(node), .predicates = std::move(input_filter_), .span = where_span});
+  }
+  // The computed columns after the WHERE filter follow the WHERE operands'.
+  const int pre = width_ + Narrow<int>(where_exprs_.size());
+  const auto place_pre = [pre](BoundColumn& column) {
+    if (column.index >= kPreBase && column.index < kPostBase) {
+      column.index = pre + (column.index - kPreBase);
+    }
+  };
+  for (AggregateCall& call : select_.aggregates) {
+    if (call.arg.has_value()) {
+      place_pre(*call.arg);
+    }
+  }
+  for (BoundColumn& key : keys_) {
+    place_pre(key);
+  }
+  for (BoundColumn& column : select_.expr_columns) {
+    place_pre(column);
+  }
+  for (SortKey& key : sort_keys_) {
+    place_pre(key.column);
+  }
+  if (!input_exprs_.empty()) {
+    node = Make(ComputeNode{.input = std::move(node), .exprs = input_exprs_, .span = select_.span});
+  }
+  // Over the aggregation: computed columns, HAVING, the Sort, then a Project restores the select
+  // order; `width` is the aggregation's output.
+  const auto above = [&](int width) {
+    for (Predicate& p : having_) {
+      if (p.column.has_value()) {
+        Place(*p.column, width);
+      }
+      if (p.other.has_value()) {
+        Place(*p.other, width);
+      }
+    }
+    for (SortKey& key : sort_keys_) {
+      Place(key.column, width);
+    }
+    for (BoundColumn& column : select_.expr_columns) {
+      Place(column, width);
+    }
+    if (!post_exprs_.empty()) {
+      node =
+          Make(ComputeNode{.input = std::move(node), .exprs = post_exprs_, .span = select_.span});
+    }
+    if (!having_.empty()) {
+      node =
+          Make(FilterNode{.input = std::move(node),
+                          .predicates = std::move(having_),
+                          .span = Cover(stmt_.having.front().span(), stmt_.having.back().span())});
+    }
+    if (!sort_keys_.empty()) {
+      node = Make(SortNode{
+          .input = std::move(node), .keys = std::move(sort_keys_), .span = stmt_.order_by_span});
+    }
+  };
+  // The select list over the node below it: a column (at `column_index` in that node), an
+  // aggregate (at `first_aggregate` + its index), a constant or a (computed) expression.
+  const auto project = [&](const auto& column_index, std::size_t first_aggregate) {
+    ProjectNode out{.input = std::move(node), .columns = {}, .constants = {}, .span = select_.span};
+    for (std::size_t i = 0; i < select_.items.size(); ++i) {
+      const auto [kind, index] = select_.items[i];
+      std::optional<Constant> constant;
+      BoundColumn column{
+          .index = -1, .name = select_.output[i].name, .type = select_.output[i].type};
+      switch (kind) {
+        case ItemKind::kColumn:
+          column.index = column_index(select_.columns[index]);
+          column.name = select_.columns[index].name;
+          break;
+        case ItemKind::kAggregate:
+          column.index = Narrow<int>(first_aggregate + index);
+          break;
+        case ItemKind::kConstant:
+          constant = select_.constants[index];
+          break;
+        case ItemKind::kExpression:
+          column.index = select_.expr_columns[index].index;
+          break;
+      }
+      out.columns.push_back(std::move(column));
+      out.constants.push_back(std::move(constant));
+    }
+    if (select_.constants.empty()) {
+      out.constants.clear();
+    }
+    node = Make(std::move(out));
+  };
+  switch (shape_) {
+    case Shape::kGrouped: {
+      // GroupAggregate outputs the keys, then the aggregates (hidden HAVING and ORDER BY ones
+      // last).
+      const std::size_t key_count = keys_.size();
+      const std::vector<ExprPtr> key_exprs = key_exprs_;
+      const int width = Narrow<int>(keys_.size() + select_.aggregates.size());
+      node = Make(GroupAggregateNode{.input = std::move(node),
+                                     .keys = std::move(keys_),
+                                     .aggregates = select_.aggregates,
+                                     .span = stmt_.group_by_span});
+      above(width);
+      project(
+          [&](const BoundColumn& column) {
+            const auto key = std::ranges::find_if(key_exprs, [&](const ExprPtr& k) {
+              const auto* c = std::get_if<ColumnExpr>(&k->node);
+              return c != nullptr && c->index == column.index;
+            });
+            return Narrow<int>(key - key_exprs.begin());
+          },
+          key_count);
+      break;
+    }
+    case Shape::kProjection:
+      above(0);
+      project([](const BoundColumn& column) { return column.index; }, 0);
+      break;
+    case Shape::kGlobal: {
+      const bool hidden =
+          select_.aggregates.size() >
+          static_cast<std::size_t>(std::ranges::count_if(
+              select_.items, [](const auto& item) { return item.first == ItemKind::kAggregate; }));
+      const int width = Narrow<int>(select_.aggregates.size());
+      node = Make(AggregateNode{
+          .input = std::move(node), .aggregates = select_.aggregates, .span = select_.span});
+      above(width);
+      // A Project restores the select list when the Aggregate's output is not it (constants,
+      // expressions, hidden aggregates, or columns computed for HAVING).
+      if (!select_.constants.empty() || !select_.exprs.empty() || hidden || !post_exprs_.empty()) {
+        project([](const BoundColumn& column) { return column.index; }, 0);
+      }
+      break;
+    }
+  }
+  const int64_t offset = stmt_.offset.value_or(0);
+  if (stmt_.limit.has_value() || offset > 0) {
+    SourceSpan span = stmt_.limit.has_value() ? stmt_.limit_span : stmt_.offset_span;
+    if (stmt_.limit.has_value() && stmt_.offset.has_value()) {
+      span = stmt_.limit_span.offset < stmt_.offset_span.offset
+                 ? Cover(stmt_.limit_span, stmt_.offset_span)
+                 : Cover(stmt_.offset_span, stmt_.limit_span);
+    }
+    node = Make(
+        LimitNode{.input = std::move(node), .limit = stmt_.limit, .offset = offset, .span = span});
+  }
+  return LogicalPlan{.root = std::move(node), .output = std::move(select_.output)};
 }
 
 // Expressions the binder does not answer yet are kUnsupported, reported (like the parser's own
@@ -1184,144 +2235,8 @@ arrow::Status CheckSupported(const sql::SelectStatement& stmt) {
 arrow::Result<LogicalPlan> Bind(const sql::SelectStatement& stmt, const Catalog& catalog) {
   ARROW_RETURN_NOT_OK(CheckSupported(stmt));
   ARROW_ASSIGN_OR_RAISE(auto table, ResolveTable(stmt.from, catalog));
-  const arrow::Schema& schema = *table->schema();
-  const Columns columns(schema);
-  ARROW_ASSIGN_OR_RAISE(SelectList select, BindSelectList(stmt, schema, columns));
-
-  std::vector<Predicate> predicates;
-  for (const sql::Expr* conjunct : Conjuncts(stmt.where)) {
-    const std::optional<sql::Comparison> cmp = sql::AsComparison(*conjunct);
-    if (!cmp.has_value()) {
-      return UnsupportedError("this condition is not supported", conjunct->span());
-    }
-    ARROW_ASSIGN_OR_RAISE(BoundColumn column, columns.Resolve(cmp->column));
-    ARROW_ASSIGN_OR_RAISE(Predicate predicate,
-                          BindComparison(*cmp, column, table->StoredAsFloat(column.index)));
-    predicates.push_back(std::move(predicate));
-  }
-  std::vector<BoundColumn> keys;
-  if (!stmt.group_by.empty()) {
-    ARROW_ASSIGN_OR_RAISE(keys, BindGroupBy(stmt, columns, select));
-    ARROW_RETURN_NOT_OK(CheckGrouped(select, keys));
-  }
-  if (stmt.limit.has_value() && *stmt.limit < 0) {
-    return BindError("LIMIT must not be negative", stmt.limit_span);
-  }
-  if (stmt.offset.has_value() && *stmt.offset < 0) {
-    return BindError("OFFSET must not be negative", stmt.offset_span);
-  }
-  Shape shape = Shape::kGlobal;
-  if (!stmt.group_by.empty()) {
-    shape = Shape::kGrouped;
-  } else if (select.aggregates.empty() && !OrdersByAggregate(stmt) && stmt.having.empty()) {
-    shape = Shape::kProjection;  // an ORDER BY aggregate or HAVING makes one row, even of constants
-  }
-  const std::size_t select_aggregates = select.aggregates.size();
-  ARROW_ASSIGN_OR_RAISE(std::vector<Predicate> having,
-                        BindHaving(stmt, columns, *table, select, keys, select.aggregates));
-  ARROW_ASSIGN_OR_RAISE(std::vector<SortKey> sort_keys,
-                        BindOrderBy(stmt, columns, select, shape, keys, select.aggregates));
-
-  ScanNode scan{.table = table, .table_name = stmt.from.name, .fields = {}, .span = stmt.from.span};
-  for (int i = 0; i < schema.num_fields(); ++i) {
-    scan.fields.push_back(i);
-  }
-  LogicalNodePtr node = Make(std::move(scan));
-  if (!predicates.empty()) {
-    node = Make(FilterNode{.input = std::move(node),
-                           .predicates = std::move(predicates),
-                           .span = Cover(stmt.where.front().span(), stmt.where.back().span())});
-  }
-  const auto filter_having = [&] {
-    if (!having.empty()) {
-      node = Make(FilterNode{.input = std::move(node),
-                             .predicates = std::move(having),
-                             .span = Cover(stmt.having.front().span(), stmt.having.back().span())});
-    }
-  };
-  const auto sort = [&] {
-    if (!sort_keys.empty()) {
-      node = Make(SortNode{
-          .input = std::move(node), .keys = std::move(sort_keys), .span = stmt.order_by_span});
-    }
-  };
-  // The select list over the node below it: a column (at `column_index` in that node), an
-  // aggregate (at `first_aggregate` + its index) or a constant, per item.
-  const auto project = [&](const auto& column_index, std::size_t first_aggregate) {
-    ProjectNode out{.input = std::move(node), .columns = {}, .constants = {}, .span = select.span};
-    for (std::size_t i = 0; i < select.items.size(); ++i) {
-      const auto [kind, index] = select.items[i];
-      std::optional<Constant> constant;
-      BoundColumn column{.index = -1, .name = select.output[i].name, .type = select.output[i].type};
-      switch (kind) {
-        case ItemKind::kColumn:
-          column.index = column_index(select.columns[index]);
-          column.name = select.columns[index].name;
-          break;
-        case ItemKind::kAggregate:
-          column.index = Narrow<int>(first_aggregate + index);
-          break;
-        case ItemKind::kConstant:
-          constant = select.constants[index];
-          break;
-      }
-      out.columns.push_back(std::move(column));
-      out.constants.push_back(std::move(constant));
-    }
-    if (select.constants.empty()) {
-      out.constants.clear();
-    }
-    node = Make(std::move(out));
-  };
-  switch (shape) {
-    case Shape::kGrouped: {
-      // GroupAggregate outputs the keys, then the aggregates (hidden HAVING and ORDER BY ones
-      // last); a Project restores the select order.
-      const std::size_t key_count = keys.size();
-      const std::vector<BoundColumn> key_columns = keys;
-      node = Make(GroupAggregateNode{.input = std::move(node),
-                                     .keys = std::move(keys),
-                                     .aggregates = std::move(select.aggregates),
-                                     .span = stmt.group_by_span});
-      filter_having();
-      sort();
-      project(
-          [&](const BoundColumn& column) {
-            const auto key = std::ranges::find_if(
-                key_columns, [&](const BoundColumn& k) { return k.index == column.index; });
-            return Narrow<int>(key - key_columns.begin());
-          },
-          key_count);
-      break;
-    }
-    case Shape::kProjection:
-      sort();
-      project([](const BoundColumn& column) { return column.index; }, 0);
-      break;
-    case Shape::kGlobal: {
-      const bool hidden = select.aggregates.size() > select_aggregates;
-      node = Make(AggregateNode{.input = std::move(node),
-                                .aggregates = std::move(select.aggregates),
-                                .span = select.span});
-      filter_having();
-      if (!select.constants.empty() || hidden) {
-        project([](const BoundColumn& column) { return column.index; }, 0);
-      }
-      break;
-    }
-  }
-  const int64_t offset = stmt.offset.value_or(0);
-  if (stmt.limit.has_value() || offset > 0) {
-    SourceSpan span = stmt.limit.has_value() ? stmt.limit_span : stmt.offset_span;
-    if (stmt.limit.has_value() && stmt.offset.has_value()) {
-      span = stmt.limit_span.offset < stmt.offset_span.offset
-                 ? Cover(stmt.limit_span, stmt.offset_span)
-                 : Cover(stmt.offset_span, stmt.limit_span);
-    }
-    node = Make(
-        LimitNode{.input = std::move(node), .limit = stmt.limit, .offset = offset, .span = span});
-  }
-  return LogicalPlan{.root = std::move(node), .output = std::move(select.output)};
+  Binder binder(stmt, std::move(table));
+  return binder.Bind();
 }
 
 }  // namespace antb1::plan

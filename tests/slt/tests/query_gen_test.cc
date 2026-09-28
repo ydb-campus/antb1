@@ -116,10 +116,12 @@ TEST(QueryGenerator, QueriesRespectTheSemanticsBothEnginesShare) {
         std::to_array({Feature::kCountStar, Feature::kCountColumn, Feature::kSum, Feature::kAvg,
                        Feature::kMin, Feature::kMax, Feature::kCountDistinct}),
         [&](Feature f) { return q.features.Has(f); });
-    // A select list of constants only is a projection too: a row per table row.
-    const bool rows = q.features.Has(Feature::kColumns) || q.features.Has(Feature::kStar) ||
-                      q.features.Has(Feature::kGroupBy) ||
-                      (q.features.Has(Feature::kConstant) && !aggregate);
+    // A select list of constants or arithmetic only is a projection too: a row per table row.
+    const bool rows =
+        q.features.Has(Feature::kColumns) || q.features.Has(Feature::kStar) ||
+        q.features.Has(Feature::kGroupBy) ||
+        ((q.features.Has(Feature::kConstant) || q.features.Has(Feature::kArithmetic)) &&
+         !aggregate);
     const bool ordered = q.features.Has(Feature::kOrderBy);
     EXPECT_EQ(q.sort, rows && !ordered ? SortMode::kRowSort : SortMode::kNoSort) << q.sql;
     EXPECT_EQ(

@@ -34,6 +34,10 @@ struct GenColumn {
   int64_t max = 0;
   bool via_override = false;  // DATE only through the clickbench option: never with FROM '<path>'
   std::vector<std::string> samples;  // canonical text of values in the data, used as literals
+  // kInteger: the range of the values in every file (none if all are NULL): arithmetic stays
+  // inside the type, since both engines fail on an overflow and the test compares answers.
+  std::optional<int64_t> data_min;
+  std::optional<int64_t> data_max;
 };
 
 struct GenTable {

@@ -282,6 +282,23 @@ TEST_F(SessionTest, FloatColumnsCompareLikeDuckDb) {
   EXPECT_EQ(values->types, std::vector<plan::LogicalType>{plan::LogicalType::kDouble});
   EXPECT_EQ(Rows(*values), (std::vector<std::vector<std::string>>{{"0.10000000149011612"},
                                                                   {"0.20000000298023224"}}));
+
+  // Arithmetic on FLOAT columns would compute in DOUBLE, not in FLOAT as DuckDB does: unsupported
+  // (divergence D11), and so is comparing them with another expression. MIN and MAX keep FLOAT,
+  // so a HAVING alias of one compares in FLOAT.
+  for (const char* sql : {"SELECT f + 1 FROM floats", "SELECT -f FROM floats",
+                          "SELECT COUNT(*) FROM floats WHERE f < d"}) {
+    auto result = session->Execute(sql);
+    const auto detail = plan::GetSqlError(result.status());
+    ASSERT_NE(detail, nullptr) << sql << ": " << result.status().ToString();
+    EXPECT_EQ(detail->kind(), plan::SqlErrorDetail::Kind::kUnsupported) << sql;
+  }
+  auto having = session->Execute("SELECT MAX(f) AS m FROM floats HAVING m = 0.2");
+  ASSERT_TRUE(having.ok()) << having.status().ToString();
+  EXPECT_EQ(Rows(*having), (std::vector<std::vector<std::string>>{}));
+  auto grouped = session->Execute("SELECT f, COUNT(*) FROM floats GROUP BY f HAVING f = 0.1");
+  ASSERT_TRUE(grouped.ok()) << grouped.status().ToString();
+  EXPECT_EQ(Rows(*grouped).size(), 1U);
 }
 
 TEST_F(SessionTest, UnsupportedAndBindErrorsKeepTheirKinds) {
@@ -289,7 +306,7 @@ TEST_F(SessionTest, UnsupportedAndBindErrorsKeepTheirKinds) {
   ASSERT_TRUE(session->RegisterParquet("t", {path_}).ok());
   for (const char* sql :
        {"SELECT COUNT(*) FROM t JOIN u USING (AdvEngineID)",
-        "SELECT AdvEngineID FROM t ORDER BY AdvEngineID + 1",
+        "SELECT AdvEngineID FROM t ORDER BY lower(AdvEngineID)",
         "SELECT SUM(DISTINCT AdvEngineID) FROM t", "SELECT DISTINCT AdvEngineID FROM t"}) {
     auto result = session->Execute(sql);
     const auto detail = plan::GetSqlError(result.status());

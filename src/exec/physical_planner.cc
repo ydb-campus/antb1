@@ -8,6 +8,7 @@
 
 #include <arrow/api.h>
 
+#include "antb1/exec/compute.h"
 #include "antb1/exec/filter.h"
 #include "antb1/exec/group_aggregate.h"
 #include "antb1/exec/limit.h"
@@ -36,6 +37,10 @@ struct Builder {
   OperatorResult operator()(const plan::FilterNode& node) const {
     ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input));
     return std::make_unique<FilterOperator>(std::move(input), node.predicates);
+  }
+  OperatorResult operator()(const plan::ComputeNode& node) const {
+    ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input));
+    return std::make_unique<ComputeOperator>(std::move(input), node.exprs);
   }
   OperatorResult operator()(const plan::ProjectNode& node) const {
     ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input));

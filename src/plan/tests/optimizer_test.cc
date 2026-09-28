@@ -100,6 +100,65 @@ TEST(OptimizerTest, CountStarWithWhereReadsOnlyTheFilteredColumns) {
   EXPECT_TRUE(std::get<ScanNode>(Nth(none, 1)).fields.empty());
 }
 
+// A Compute reads only the columns its kept expressions use; an expression nothing above uses is
+// dropped, and a Compute left with none disappears.
+TEST(OptimizerTest, ComputeKeepsOnlyWhatIsUsed) {
+  const LogicalPlan plan = Optimized("SELECT i16 + 1 FROM t WHERE i32 // 2 > 0");
+  EXPECT_EQ(Explain(plan),
+            "Output: (i16 + 1):SMALLINT\n"
+            "Project \"(i16 + 1)\"\n"
+            "  Compute (i16 + 1)\n"
+            "    Filter \"(i32 // 2)\" > 0\n"
+            "      Compute (i32 // 2)\n"
+            "        Scan table=t source=fake columns=[i16, i32]\n");
+  // The input: Scan(i16, i32) <- Compute(i16 + 1, i32 + 2); only i16 and i16 + 1 are used above.
+  const auto catalog = testing::MakeCatalog();
+  auto bound = BindSql("SELECT i16, i16 + 1 FROM t", catalog);
+  ASSERT_TRUE(bound.ok());
+  const auto& project = std::get<ProjectNode>(*bound->root);
+  const auto& compute = std::get<ComputeNode>(*project.input);
+  ComputeNode wider = compute;
+  wider.exprs.push_back(std::make_shared<const Expr>(
+      Expr{.node = ColumnExpr{.index = 2}, .type = LogicalType::kInteger, .name = "unused"}));
+  ProjectNode top = project;
+  top.input = std::make_shared<const LogicalNode>(std::move(wider));
+  const LogicalPlan pruned = Optimize(LogicalPlan{
+      .root = std::make_shared<const LogicalNode>(std::move(top)), .output = bound->output});
+  EXPECT_EQ(Explain(pruned),
+            "Output: i16:SMALLINT (i16 + 1):SMALLINT\n"
+            "Project i16, \"(i16 + 1)\"\n"
+            "  Compute (i16 + 1)\n"
+            "    Scan table=t source=fake columns=[i16]\n");
+  ProjectNode columns_only = project;
+  columns_only.columns.pop_back();
+  const LogicalPlan dropped =
+      Optimize(LogicalPlan{.root = std::make_shared<const LogicalNode>(std::move(columns_only)),
+                           .output = {bound->output[0]}});
+  EXPECT_EQ(Explain(dropped),
+            "Output: i16:SMALLINT\n"
+            "Project i16\n"
+            "  Scan table=t source=fake columns=[i16]\n");
+}
+
+// A Limit moves below a Compute too: only the rows kept are computed.
+TEST(OptimizerTest, LimitMovesBelowCompute) {
+  const LogicalPlan plan = Optimized("SELECT i32 * 2 FROM t ORDER BY i32 LIMIT 3");
+  EXPECT_EQ(Explain(plan),
+            "Output: (i32 * 2):INTEGER\n"
+            "Project \"(i32 * 2)\"\n"
+            "  Limit 3\n"
+            "    Sort i32 ASC NULLS LAST\n"
+            "      Compute (i32 * 2)\n"
+            "        Scan table=t source=fake columns=[i32]\n");
+  const LogicalPlan unordered = Optimized("SELECT i32 * 2 FROM t LIMIT 3");
+  EXPECT_EQ(Explain(unordered),
+            "Output: (i32 * 2):INTEGER\n"
+            "Project \"(i32 * 2)\"\n"
+            "  Compute (i32 * 2)\n"
+            "    Limit 3\n"
+            "      Scan table=t source=fake columns=[i32]\n");
+}
+
 TEST(OptimizerTest, SelectStarKeepsEveryField) {
   const LogicalPlan plan = Optimized("SELECT * FROM ok");
   EXPECT_EQ(std::get<ScanNode>(Nth(plan, 1)).fields, (std::vector<int>{0, 1}));

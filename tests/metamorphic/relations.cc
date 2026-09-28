@@ -642,6 +642,40 @@ std::vector<Relation> AllRelations() {
     sizes.probes.push_back(Q(std::format(kFiltered, "hits_like")));
     r.push_back(std::move(sizes));
   }
+  // Arithmetic: SUM(x + c) is SUM(x) + c * COUNT(x) whether the engine rewrites it or computes the
+  // right side itself; a comparison of x + c with a literal is one of x; expression keys group
+  // alike whatever the batch size and file layout.
+  {
+    const slt::FeatureSet sum_features = {kSum,           kCountColumn,    kArithmetic,
+                                          kMultipleItems, kIntegerColumns, kIntegerLiteral,
+                                          kTableName};
+    r.push_back({.name = "sum_of_column_plus_constant",
+                 .features = sum_features,
+                 .probes = {Q("SELECT SUM(ResolutionWidth + 7), SUM(RegionID + 1) FROM hits_like"),
+                            Q("SELECT SUM(ResolutionWidth) + 7 * COUNT(ResolutionWidth), "
+                              "COUNT(RegionID) + SUM(RegionID) FROM hits_like")},
+                 .check = AllEqual()});
+    r.push_back({.name = "where_arithmetic_shifts_the_literal",
+                 .features = {kCountStar, kWhere, kArithmetic, kIntegerColumns, kIntegerLiteral,
+                              kTableName},
+                 .probes = {Q("SELECT COUNT(*) FROM hits_like_nulls WHERE RegionID + 10 > 1000"),
+                            Q("SELECT COUNT(*) FROM hits_like_nulls WHERE RegionID > 990"),
+                            Q("SELECT COUNT(*) FROM hits_like_nulls WHERE 2 * RegionID >= 1982")},
+                 .check = AllEqual()});
+    constexpr std::string_view kKeys =
+        "SELECT ClientIP - 1, ClientIP // 1000 AS k, COUNT(*), SUM(ResolutionWidth * 2) FROM {} "
+        "WHERE ClientIP > 0 GROUP BY ClientIP - 1, k";
+    Relation sizes{.name = "expression_keys_batch_size_invariance",
+                   .features = {kGroupBy, kCountStar, kSum, kArithmetic, kMultipleItems, kAlias,
+                                kIntegerColumns, kWhere, kIntegerLiteral, kTableName},
+                   .probes = {},
+                   .check = AllEqual()};
+    for (const int64_t batch : kBatchSizes) {
+      sizes.probes.push_back(Q(std::format(kKeys, "hits_like_split"), batch));
+    }
+    sizes.probes.push_back(Q(std::format(kKeys, "hits_like")));
+    r.push_back(std::move(sizes));
+  }
   // [NOT] IN partitions the non-NULL values of a column, and IN over distinct values counts the
   // rows equal to each.
   for (const auto& [column, values, type, literal] :
