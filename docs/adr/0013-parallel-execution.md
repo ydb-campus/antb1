@@ -87,9 +87,20 @@ Proposed
   - Merge cost is small for global aggregates and top-N.
   - It grows with the number of groups times parts for high-cardinality GROUP BY (Q32, Q33). A partitioned (radix) merge
     is the follow-up if profiling shows it matters.
-- **Load balance:** uneven row groups leave threads idle at the tail of a scan. Splitting large row groups into batch
-  ranges (a part is then a row group and a range of its batches) is a follow-up if the tail shows in profiles; the
-  ordered merge does not change.
+- **Cost of the ordered merge:** merging costs the same work in any order. For global aggregates it is one addition
+  per aggregate and part; for GROUP BY it is one insertion per partial group. Keeping the order adds only waiting: a
+  part that finished early waits for the earlier ones. Other threads keep working on later parts until the window is
+  full, so time is lost only when an early part is much slower than those after it. The full data's row groups range
+  from about 1 to 800 thousand rows.
+- **Load balance, in this order** (the maintainer's choice, 2026-09-29):
+  1. Ship the ordered merge with a window of 2× the threads, and measure idle time and query times with
+     `antb1 bench` on the full data at several thread counts.
+  2. If threads idle, split large row groups into batch ranges (a part is then a row group and a range of its
+     batches), so that parts are even. The ordered merge does not change.
+  3. Only if that is not enough, merge out of order for queries whose results do not depend on order: integer sums,
+     counts, MIN and MAX. The order-dependent results keep the ordered merge: DOUBLE sums, the first-seen spelling of
+     a DOUBLE key, and the output order of groups, ties and LIMIT without ORDER BY. Output order would then come from
+     sorting the groups at the end, so answers stay the same for any thread count.
 - **Memory:** it grows with the window and the per-part partial states. High-cardinality grouping holds partial group
   tables for at most the window's parts.
 - **Tests:**
