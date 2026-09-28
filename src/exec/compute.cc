@@ -182,6 +182,181 @@ arrow::Result<ArrayPtr> HugeIntArith(const arrow::Array& left, const arrow::Arra
   return out;
 }
 
+// ---- TIMESTAMP and DATE fields and floors, in 64-bit civil arithmetic (Arrow's temporal kernels
+// keep the year in 16 bits and wrap past 32767; DuckDB's range reaches 294247) ----
+
+constexpr int64_t kMicrosPerDay = 86'400'000'000;
+// DuckDB's lowest TIMESTAMP, 290309-12-22 (BC) 00:00:00; INT64_MAX and -INT64_MAX are its
+// infinities (and INT32_MAX and -INT32_MAX a DATE's).
+constexpr int64_t kMinTimestamp = -9'223'372'022'400'000'000;
+constexpr int64_t kTimestampInfinity = std::numeric_limits<int64_t>::max();
+constexpr int32_t kDateInfinity = std::numeric_limits<int32_t>::max();
+
+int64_t FloorDiv(int64_t a, int64_t b) {
+  return (a / b) - ((a % b != 0 && (a < 0) != (b < 0)) ? 1 : 0);
+}
+int64_t FloorMod(int64_t a, int64_t b) { return a - (FloorDiv(a, b) * b); }
+
+struct CivilDate {
+  int64_t year;  // astronomical: 0 is 1 BC, as DuckDB's EXTRACT gives it
+  int64_t month;
+  int64_t day;
+};
+
+// H. Hinnant's civil_from_days and days_from_civil, in 64 bits (as plan::FormatDate).
+CivilDate CivilOf(int64_t days) {
+  const int64_t z = days + 719'468;
+  const int64_t era = FloorDiv(z, 146'097);
+  const int64_t day_of_era = z - (era * 146'097);
+  const int64_t year_of_era =
+      (day_of_era - (day_of_era / 1'460) + (day_of_era / 36'524) - (day_of_era / 146'096)) / 365;
+  const int64_t day_of_year =
+      day_of_era - ((365 * year_of_era) + (year_of_era / 4) - (year_of_era / 100));
+  const int64_t shifted_month = ((5 * day_of_year) + 2) / 153;  // 0 = March
+  const int64_t day = day_of_year - (((153 * shifted_month) + 2) / 5) + 1;
+  const int64_t month = shifted_month < 10 ? shifted_month + 3 : shifted_month - 9;
+  return {.year = year_of_era + (era * 400) + (month <= 2 ? 1 : 0), .month = month, .day = day};
+}
+
+int64_t DaysOf(int64_t year, int64_t month, int64_t day) {
+  const int64_t y = month <= 2 ? year - 1 : year;
+  const int64_t era = FloorDiv(y, 400);
+  const int64_t year_of_era = y - (era * 400);
+  const int64_t day_of_year = ((((153 * (month > 2 ? month - 3 : month + 9)) + 2) / 5) + day) - 1;
+  const int64_t day_of_era =
+      (year_of_era * 365) + (year_of_era / 4) - (year_of_era / 100) + day_of_year;
+  return (era * 146'097) + day_of_era - 719'468;
+}
+
+// A TIMESTAMP or DATE value as days and microseconds into the day; std::nullopt for an infinity.
+struct DayTime {
+  int64_t days;
+  int64_t micros;  // 0 for a DATE
+};
+
+// The values of a TIMESTAMP or DATE array, row by row (`each(row, day_time or nullopt for an
+// infinity)`), NULL rows skipped (`null(row)`).
+template <class Each, class Null>
+arrow::Status ForEachDayTime(const arrow::Array& values, const Each& each, const Null& null) {
+  const bool date = values.type_id() == arrow::Type::DATE32;
+  if (!date && values.type_id() != arrow::Type::TIMESTAMP) {
+    return arrow::Status::Invalid("a date or time function of ", values.type()->ToString());
+  }
+  for (int64_t i = 0; i < values.length(); ++i) {
+    if (values.IsNull(i)) {
+      null();
+      continue;
+    }
+    if (date) {
+      const int32_t days = static_cast<const arrow::Date32Array&>(values).Value(i);
+      if (days == kDateInfinity || days == -kDateInfinity) {
+        ARROW_RETURN_NOT_OK(each(std::optional<DayTime>(), days > 0));
+        continue;
+      }
+      ARROW_RETURN_NOT_OK(each(std::optional(DayTime{.days = days, .micros = 0}), false));
+      continue;
+    }
+    const int64_t micros = static_cast<const arrow::TimestampArray&>(values).Value(i);
+    if (micros == kTimestampInfinity || micros == -kTimestampInfinity) {
+      ARROW_RETURN_NOT_OK(each(std::optional<DayTime>(), micros > 0));
+      continue;
+    }
+    const int64_t days = FloorDiv(micros, kMicrosPerDay);
+    ARROW_RETURN_NOT_OK(each(
+        std::optional(DayTime{.days = days, .micros = micros - (days * kMicrosPerDay)}), false));
+  }
+  return arrow::Status::OK();
+}
+
+// EXTRACT(field FROM value) as DuckDB computes it: the civil field, NULL for an infinity.
+arrow::Result<ArrayPtr> Extract(const arrow::Array& values, std::string_view field,
+                                arrow::MemoryPool* pool) {
+  arrow::Int64Builder builder(pool);
+  ARROW_RETURN_NOT_OK(builder.Reserve(values.length()));
+  ARROW_RETURN_NOT_OK(ForEachDayTime(
+      values,
+      [&](const std::optional<DayTime>& t, bool /*positive*/) -> arrow::Status {
+        if (!t.has_value()) {
+          builder.UnsafeAppendNull();
+          return arrow::Status::OK();
+        }
+        const CivilDate date = CivilOf(t->days);
+        int64_t part = 0;
+        if (field == "year") {
+          part = date.year;
+        } else if (field == "month") {
+          part = date.month;
+        } else if (field == "day") {
+          part = date.day;
+        } else if (field == "hour") {
+          part = t->micros / 3'600'000'000;
+        } else if (field == "minute") {
+          part = (t->micros / 60'000'000) % 60;
+        } else if (field == "second") {
+          part = (t->micros / 1'000'000) % 60;
+        } else {
+          return arrow::Status::Invalid("EXTRACT field ", field);
+        }
+        builder.UnsafeAppend(part);
+        return arrow::Status::OK();
+      },
+      [&] { builder.UnsafeAppendNull(); }));
+  std::shared_ptr<arrow::Array> out;
+  ARROW_RETURN_NOT_OK(builder.Finish(&out));
+  return out;
+}
+
+// date_trunc('unit', value) as DuckDB computes it: the value floored to the unit (weeks start on
+// Monday), an infinity unchanged, and a result outside the TIMESTAMP range an error.
+arrow::Result<ArrayPtr> DateTrunc(const arrow::Array& values, std::string_view unit,
+                                  arrow::MemoryPool* pool) {
+  arrow::TimestampBuilder builder(plan::ToArrow(plan::LogicalType::kTimestamp), pool);
+  ARROW_RETURN_NOT_OK(builder.Reserve(values.length()));
+  ARROW_RETURN_NOT_OK(ForEachDayTime(
+      values,
+      [&](const std::optional<DayTime>& t, bool positive) -> arrow::Status {
+        if (!t.has_value()) {
+          builder.UnsafeAppend(positive ? kTimestampInfinity : -kTimestampInfinity);
+          return arrow::Status::OK();
+        }
+        int64_t days = t->days;
+        int64_t micros = t->micros;
+        const CivilDate date = CivilOf(days);
+        if (unit == "second" || unit == "minute" || unit == "hour") {
+          const int64_t step = unit == "second"   ? 1'000'000
+                               : unit == "minute" ? 60'000'000
+                                                  : 3'600'000'000;
+          micros -= micros % step;
+        } else {
+          micros = 0;
+          if (unit == "week") {
+            days -= FloorMod(days + 3, 7);  // 1970-01-01 is a Thursday
+          } else if (unit == "month") {
+            days = DaysOf(date.year, date.month, 1);
+          } else if (unit == "quarter") {
+            days = DaysOf(date.year, (((date.month - 1) / 3) * 3) + 1, 1);
+          } else if (unit == "year") {
+            days = DaysOf(date.year, 1, 1);
+          } else if (unit != "day") {
+            return arrow::Status::Invalid("date_trunc unit ", unit);
+          }
+        }
+        int64_t result = 0;
+        if (__builtin_mul_overflow(days, kMicrosPerDay, &result) ||
+            __builtin_add_overflow(result, micros, &result) || result < kMinTimestamp ||
+            result >= kTimestampInfinity) {
+          return arrow::Status::ExecutionError(
+              "date_trunc: the result is not in the TIMESTAMP range");
+        }
+        builder.UnsafeAppend(result);
+        return arrow::Status::OK();
+      },
+      [&] { builder.UnsafeAppendNull(); }));
+  std::shared_ptr<arrow::Array> out;
+  ARROW_RETURN_NOT_OK(builder.Finish(&out));
+  return out;
+}
+
 struct Evaluator {
   const arrow::RecordBatch& batch;
   arrow::MemoryPool* pool;
@@ -235,8 +410,59 @@ struct Evaluator {
       }
       case plan::Function::kRegexpReplace:
         return RegexpReplace(function, text);
+      case plan::Function::kEpochMs:
+        return EpochMs(text);
+      case plan::Function::kExtract: {
+        ARROW_ASSIGN_OR_RAISE(const std::string field, ConstantArg(function, 1));
+        return Extract(*text, field, pool);
+      }
+      case plan::Function::kDateTrunc: {
+        ARROW_ASSIGN_OR_RAISE(const std::string unit, ConstantArg(function, 1));
+        return DateTrunc(*text, unit, pool);
+      }
     }
     return arrow::Status::Invalid("unknown function");
+  }
+
+  // The string constant argument `i` of a function (a field, a unit).
+  static arrow::Result<std::string> ConstantArg(const plan::FunctionExpr& function, std::size_t i) {
+    const auto* constant = i < function.args.size()
+                               ? std::get_if<plan::ConstantExpr>(&function.args[i]->node)
+                               : nullptr;
+    const auto* value =
+        constant != nullptr ? std::get_if<std::string>(&constant->value.value) : nullptr;
+    if (value == nullptr) {
+      return arrow::Status::Invalid(plan::ToString(function.function),
+                                    " takes a constant string argument ", i + 1);
+    }
+    return *value;
+  }
+
+  // epoch_ms: milliseconds to a TIMESTAMP (microseconds), an error outside DuckDB's TIMESTAMP
+  // range (290309-12-22 (BC) 00:00:00 up to the int64 microseconds; DuckDB: "Could not convert
+  // Timestamp(MS) to Timestamp(US)", "Date out of range in timestamp conversion").
+  arrow::Result<ArrayPtr> EpochMs(const ArrayPtr& millis) const {
+    ARROW_ASSIGN_OR_RAISE(const ArrayPtr wide, CastTo(millis, arrow::int64(), ctx));
+    const auto& values = static_cast<const arrow::Int64Array&>(*wide);
+    arrow::TimestampBuilder builder(plan::ToArrow(plan::LogicalType::kTimestamp), pool);
+    ARROW_RETURN_NOT_OK(builder.Reserve(values.length()));
+    constexpr int64_t kMax = std::numeric_limits<int64_t>::max() / 1000;
+    constexpr int64_t kMin = kMinTimestamp / 1000;
+    for (int64_t i = 0; i < values.length(); ++i) {
+      if (values.IsNull(i)) {
+        builder.UnsafeAppendNull();
+        continue;
+      }
+      const int64_t ms = values.Value(i);
+      if (ms > kMax || ms < kMin) {
+        return arrow::Status::ExecutionError("Could not convert epoch_ms ", ms,
+                                             " to a TIMESTAMP: out of range");
+      }
+      builder.UnsafeAppend(ms * 1000);
+    }
+    std::shared_ptr<arrow::Array> out;
+    ARROW_RETURN_NOT_OK(builder.Finish(&out));
+    return out;
   }
 
   // RE2 in UTF-8 mode, as DuckDB runs it: the binary values are viewed as UTF-8 (not validated;

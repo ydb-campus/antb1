@@ -123,6 +123,8 @@ std::string FormatValue(const arrow::Array& column, int64_t row, plan::LogicalTy
       return FormatDouble(Value<arrow::DoubleArray>(column, row));
     case arrow::Type::DATE32:
       return plan::FormatDate(Value<arrow::Date32Array>(column, row));
+    case arrow::Type::TIMESTAMP:
+      return plan::FormatTimestamp(Value<arrow::TimestampArray>(column, row));
     case arrow::Type::BINARY:
       return std::string(static_cast<const arrow::BinaryArray&>(column).GetView(row));
     case arrow::Type::STRING:

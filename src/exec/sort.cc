@@ -142,6 +142,10 @@ std::optional<TypeOrder> OrderFor(plan::LogicalType type) {
       return TypeOrder{.compare = &CompareDouble, .prefix = &DoublePrefix, .exact = true};
     case plan::LogicalType::kVarchar:
       return TypeOrder{.compare = &CompareBinary, .prefix = &BinaryPrefix, .exact = false};
+    case plan::LogicalType::kTimestamp:
+      return TypeOrder{.compare = &ComparePrimitive<arrow::TimestampArray>,
+                       .prefix = &SignedPrefix<arrow::TimestampArray>,
+                       .exact = true};
     case plan::LogicalType::kBoolean:  // never a sort key
       break;
   }
@@ -219,6 +223,8 @@ arrow::Status Gather(const std::vector<std::shared_ptr<arrow::RecordBatch>>& chu
       return GatherTyped<arrow::UInt16Array, arrow::UInt16Builder>(arrays, refs, builder);
     case arrow::Type::DATE32:
       return GatherTyped<arrow::Date32Array, arrow::Date32Builder>(arrays, refs, builder);
+    case arrow::Type::TIMESTAMP:
+      return GatherTyped<arrow::TimestampArray, arrow::TimestampBuilder>(arrays, refs, builder);
     case arrow::Type::DOUBLE:
       return GatherTyped<arrow::DoubleArray, arrow::DoubleBuilder>(arrays, refs, builder);
     case arrow::Type::DECIMAL128:

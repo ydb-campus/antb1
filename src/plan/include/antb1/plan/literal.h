@@ -58,6 +58,11 @@ std::optional<int32_t> ParseDate(std::string_view text);
 // -INT32_MAX as infinity and -infinity.
 std::string FormatDate(int32_t days);
 
+// A TIMESTAMP (microseconds since 1970-01-01 00:00:00) as DuckDB prints it: the date as
+// FormatDate, then HH:MM:SS and the fraction without trailing zeros (2013-07-15 14:00:00.12);
+// infinity and -infinity for DuckDB's infinite values.
+std::string FormatTimestamp(int64_t micros);
+
 // Inclusive value range of an integer logical type; HUGEINT is decimal128(38, 0), so +-(10^38 - 1).
 struct IntegerRange {
   Int128 min = 0;

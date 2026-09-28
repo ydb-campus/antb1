@@ -758,6 +758,41 @@ std::vector<Relation> AllRelations() {
     sizes.probes.push_back(Q(std::format(kKeys, "hits_like")));
     r.push_back(std::move(sizes));
   }
+  // Timestamps: for seconds t >= 0, EXTRACT and date_trunc of toDateTime(t) agree with integer
+  // arithmetic on t; date_trunc keys group alike whatever the batch size and file layout.
+  {
+    r.push_back({.name = "extract_minute_is_seconds_arithmetic",
+                 .features = {kSum, kTimestamps, kArithmetic, kWhere, kIntegerColumns,
+                              kIntegerLiteral, kTableName},
+                 .probes = {Q("SELECT SUM(EXTRACT(minute FROM toDateTime(EventTime))) FROM "
+                              "hits_like_nulls WHERE EventTime >= 0"),
+                            Q("SELECT SUM((EventTime // 60) % 60) FROM hits_like_nulls WHERE "
+                              "EventTime >= 0")},
+                 .check = AllEqual()});
+    r.push_back(
+        {.name = "date_trunc_day_counts_like_whole_days",
+         .features = {kCountDistinct, kTimestamps, kArithmetic, kWhere, kIntegerColumns,
+                      kIntegerLiteral, kStringLiteral, kTableName},
+         .probes = {Q("SELECT COUNT(DISTINCT date_trunc('day', toDateTime(EventTime))) FROM "
+                      "hits_like_nulls WHERE EventTime >= 0"),
+                    Q("SELECT COUNT(DISTINCT EventTime // 86400) FROM hits_like_nulls WHERE "
+                      "EventTime >= 0")},
+         .check = AllEqual()});
+    constexpr std::string_view kKeys =
+        "SELECT date_trunc('hour', toDateTime(EventTime)) AS k, COUNT(*), "
+        "MIN(toDateTime(EventTime)), MAX(EXTRACT(second FROM toDateTime(EventTime))) FROM {} GROUP "
+        "BY k";
+    Relation sizes{.name = "date_trunc_keys_batch_size_invariance",
+                   .features = {kGroupBy, kCountStar, kMin, kMax, kTimestamps, kMultipleItems,
+                                kAlias, kIntegerColumns, kStringLiteral, kTableName},
+                   .probes = {},
+                   .check = AllEqual()};
+    for (const int64_t batch : kBatchSizes) {
+      sizes.probes.push_back(Q(std::format(kKeys, "hits_like_split"), batch));
+    }
+    sizes.probes.push_back(Q(std::format(kKeys, "hits_like")));
+    r.push_back(std::move(sizes));
+  }
   // [NOT] IN partitions the non-NULL values of a column, and IN over distinct values counts the
   // rows equal to each.
   for (const auto& [column, values, type, literal] :

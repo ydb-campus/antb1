@@ -25,6 +25,8 @@ std::string_view ToString(LogicalType type) {
       return "VARCHAR";
     case LogicalType::kDate:
       return "DATE";
+    case LogicalType::kTimestamp:
+      return "TIMESTAMP";
     case LogicalType::kBoolean:
       return "BOOLEAN";
   }
@@ -49,6 +51,8 @@ std::shared_ptr<arrow::DataType> ToArrow(LogicalType type) {
       return arrow::binary();
     case LogicalType::kDate:
       return arrow::date32();
+    case LogicalType::kTimestamp:
+      return arrow::timestamp(arrow::TimeUnit::MICRO);
     case LogicalType::kBoolean:
       return arrow::boolean();
   }

@@ -50,6 +50,16 @@ TEST(FormatValueTest, CanonicalForms) {
   EXPECT_EQ(FormatValue(*dates, 1, LogicalType::kDate), "1970-01-01");
   EXPECT_EQ(FormatValue(*dates, 2, LogicalType::kDate), "1969-12-31");
   EXPECT_EQ(FormatValue(*dates, 3, LogicalType::kDate), "0001-12-31 (BC)");
+
+  // TIMESTAMP as DuckDB prints it: whole seconds without a fraction, a fraction without trailing
+  // zeros, the time of day forward from midnight before 1970.
+  auto timestamps = Make<arrow::TimestampBuilder, int64_t>(
+      arrow::timestamp(arrow::TimeUnit::MICRO),
+      {1'373'896'800'000'000, 1'373'896'800'120'000, -61'000'000}, true);
+  EXPECT_EQ(FormatValue(*timestamps, 0, LogicalType::kTimestamp), "2013-07-15 14:00:00");
+  EXPECT_EQ(FormatValue(*timestamps, 1, LogicalType::kTimestamp), "2013-07-15 14:00:00.12");
+  EXPECT_EQ(FormatValue(*timestamps, 2, LogicalType::kTimestamp), "1969-12-31 23:58:59");
+  EXPECT_EQ(FormatValue(*timestamps, 3, LogicalType::kTimestamp), "NULL");
   EXPECT_EQ(FormatValue(*dates, 4, LogicalType::kDate), "50000-12-31");
   EXPECT_EQ(FormatValue(*dates, 5, LogicalType::kDate), "infinity");
 

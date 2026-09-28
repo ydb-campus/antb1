@@ -39,6 +39,7 @@ enum class Feature : std::uint8_t {
   kStringFunctions,     // strlen(varchar) and regexp_replace(varchar, 'pattern', 'replacement')
   kCase,                // CASE WHEN <condition> THEN .. [ELSE ..] END
   kBooleanExpressions,  // OR, NOT and parenthesized AND in conditions (WHERE, HAVING, CASE WHEN)
+  kTimestamps,          // toDateTime(integer), EXTRACT(field FROM ..) and date_trunc('unit', ..)
   // Column types a query reads (select list or WHERE); SELECT * reads every column
   kIntegerColumns,  // SMALLINT, INTEGER, BIGINT, USMALLINT
   kDoubleColumns,   // DOUBLE
@@ -115,6 +116,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "case";
     case Feature::kBooleanExpressions:
       return "boolean_expressions";
+    case Feature::kTimestamps:
+      return "timestamps";
     case Feature::kIntegerColumns:
       return "integer_columns";
     case Feature::kDoubleColumns:
@@ -261,6 +264,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kStringFunctions,
     Feature::kCase,
     Feature::kBooleanExpressions,
+    Feature::kTimestamps,
     Feature::kIntegerColumns,
     Feature::kDoubleColumns,
     Feature::kVarcharColumns,

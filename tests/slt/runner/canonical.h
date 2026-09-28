@@ -25,6 +25,8 @@ namespace antb1::slt {
 
 std::string CanonicalDouble(double value);
 std::string CanonicalDate(int32_t days_since_epoch);
+// A TIMESTAMP (microseconds since the epoch) as DuckDB prints it (plan::FormatTimestamp).
+std::string CanonicalTimestamp(int64_t micros_since_epoch);
 
 // Escapes one value into an slt cell (see above).
 std::string SltCell(const std::optional<std::string>& value);

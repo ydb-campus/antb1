@@ -420,6 +420,112 @@ TEST_F(ComputeTest, CaseEvaluatesEachBranchOnItsRows) {
   EXPECT_EQ((*none)->ToString(), (*x).ToString());
 }
 
+plan::ExprPtr Temporal(plan::Function function, plan::ExprPtr value, std::string text,
+                       LogicalType type) {
+  return std::make_shared<const plan::Expr>(plan::Expr{
+      .node = plan::FunctionExpr{.function = function,
+                                 .args = {std::move(value), StringConstant(std::move(text))}},
+      .type = type,
+      .name = "f"});
+}
+
+// epoch_ms is exact to the microsecond range and fails beyond it, as DuckDB's conversion does;
+// EXTRACT gives the civil field and date_trunc floors (before 1970 too); a DATE is its midnight.
+TEST_F(ComputeTest, TimestampFunctions) {
+  const auto millis = Int64s({1'373'896'800'000, -61'000, std::nullopt});
+  const auto epoch =
+      Call(plan::Function::kEpochMs, {ColumnAt(0, LogicalType::kBigInt)}, LogicalType::kTimestamp);
+  auto timestamps = Eval(epoch, {millis});
+  ASSERT_TRUE(timestamps.ok()) << timestamps.status().ToString();
+  EXPECT_TRUE((*timestamps)->type()->Equals(*arrow::timestamp(arrow::TimeUnit::MICRO)));
+  const auto& ts = static_cast<const arrow::TimestampArray&>(**timestamps);
+  EXPECT_EQ(ts.Value(0), 1'373'896'800'000'000);
+  EXPECT_EQ(ts.Value(1), -61'000'000);
+  EXPECT_TRUE(ts.IsNull(2));
+  auto beyond = Eval(epoch, {Int64s({9'223'372'036'854'776})});
+  EXPECT_TRUE(beyond.status().IsExecutionError()) << beyond.status().ToString();
+  // DuckDB's range is asymmetric: it starts at 290309-12-22 (BC) 00:00:00.
+  auto lowest = Eval(epoch, {Int64s({-9'223'372'022'400'000})});
+  ASSERT_TRUE(lowest.ok()) << lowest.status().ToString();
+  EXPECT_EQ(plan::FormatTimestamp(static_cast<const arrow::TimestampArray&>(**lowest).Value(0)),
+            "290309-12-22 (BC) 00:00:00");
+  auto below = Eval(epoch, {Int64s({-9'223'372'022'400'001})});
+  EXPECT_TRUE(below.status().IsExecutionError()) << below.status().ToString();
+
+  const auto column = ColumnAt(0, LogicalType::kTimestamp);
+  const auto part = [&](std::string field) {
+    auto out =
+        Eval(Temporal(plan::Function::kExtract, column, std::move(field), LogicalType::kBigInt),
+             {*timestamps});
+    return out.ok() ? (*out)->ToString() : out.status().ToString();
+  };
+  EXPECT_EQ(part("minute"), "[\n  0,\n  58,\n  null\n]");
+  EXPECT_EQ(part("second"), "[\n  0,\n  59,\n  null\n]");
+  EXPECT_EQ(part("year"), "[\n  2013,\n  1969,\n  null\n]");
+  const auto floor = [&](std::string unit) -> std::vector<std::string> {
+    auto out =
+        Eval(Temporal(plan::Function::kDateTrunc, column, std::move(unit), LogicalType::kTimestamp),
+             {*timestamps});
+    if (!out.ok()) {
+      return {out.status().ToString()};
+    }
+    const auto& a = static_cast<const arrow::TimestampArray&>(**out);
+    return {plan::FormatTimestamp(a.Value(0)), plan::FormatTimestamp(a.Value(1))};
+  };
+  EXPECT_EQ(floor("minute"),
+            (std::vector<std::string>{"2013-07-15 14:00:00", "1969-12-31 23:58:00"}));
+  EXPECT_EQ(floor("week"), (std::vector<std::string>{"2013-07-15 00:00:00", "1969-12-29 00:00:00"}))
+      << "weeks start on Monday";
+  EXPECT_EQ(floor("quarter"),
+            (std::vector<std::string>{"2013-07-01 00:00:00", "1969-10-01 00:00:00"}));
+  // Years past 32767 (a millisecond epoch read as seconds; the top of the range) and DATE
+  // infinities: EXTRACT is NULL, date_trunc keeps the infinity.
+  auto far = Eval(epoch, {Int64s({1'373'896'800'000'000, 9'223'372'036'854'000})});
+  ASSERT_TRUE(far.ok()) << far.status().ToString();
+  auto far_year =
+      Eval(Temporal(plan::Function::kExtract, column, "year", LogicalType::kBigInt), {*far});
+  ASSERT_TRUE(far_year.ok()) << far_year.status().ToString();
+  EXPECT_EQ((*far_year)->ToString(), "[\n  45507,\n  294247\n]");
+  auto far_week =
+      Eval(Temporal(plan::Function::kDateTrunc, column, "week", LogicalType::kTimestamp), {*far});
+  ASSERT_TRUE(far_week.ok()) << far_week.status().ToString();
+  EXPECT_EQ(plan::FormatTimestamp(static_cast<const arrow::TimestampArray&>(**far_week).Value(1)),
+            "294247-01-04 00:00:00");
+  auto infinite = testing::ArrayOf<arrow::Date32Builder>(
+      arrow::date32(), std::vector<std::optional<int32_t>>{std::numeric_limits<int32_t>::max(),
+                                                           -std::numeric_limits<int32_t>::max()});
+  const auto date_column = ColumnAt(0, LogicalType::kDate);
+  auto infinite_year = Eval(
+      Temporal(plan::Function::kExtract, date_column, "year", LogicalType::kBigInt), {infinite});
+  ASSERT_TRUE(infinite_year.ok()) << infinite_year.status().ToString();
+  EXPECT_EQ((*infinite_year)->ToString(), "[\n  null,\n  null\n]");
+  auto infinite_day =
+      Eval(Temporal(plan::Function::kDateTrunc, date_column, "day", LogicalType::kTimestamp),
+           {infinite});
+  ASSERT_TRUE(infinite_day.ok()) << infinite_day.status().ToString();
+  const auto& infinite_days = static_cast<const arrow::TimestampArray&>(**infinite_day);
+  EXPECT_EQ(plan::FormatTimestamp(infinite_days.Value(0)), "infinity");
+  EXPECT_EQ(plan::FormatTimestamp(infinite_days.Value(1)), "-infinity");
+  // A result outside the range fails, as DuckDB's conversion does.
+  auto out_of_range = Eval(
+      Temporal(plan::Function::kDateTrunc, column, "year", LogicalType::kTimestamp), {*lowest});
+  EXPECT_TRUE(out_of_range.status().IsExecutionError()) << out_of_range.status().ToString();
+  // A DATE: the timestamp of its midnight.
+  auto days = testing::ArrayOf<arrow::Date32Builder>(arrow::date32(),
+                                                     std::vector<std::optional<int32_t>>{-1});
+  auto month = Eval(Temporal(plan::Function::kDateTrunc, ColumnAt(0, LogicalType::kDate), "month",
+                             LogicalType::kTimestamp),
+                    {days});
+  ASSERT_TRUE(month.ok()) << month.status().ToString();
+  EXPECT_EQ(plan::FormatTimestamp(static_cast<const arrow::TimestampArray&>(**month).Value(0)),
+            "1969-12-01 00:00:00");
+  auto hour = Eval(Temporal(plan::Function::kExtract, ColumnAt(0, LogicalType::kDate), "hour",
+                            LogicalType::kBigInt),
+                   {days});
+  ASSERT_TRUE(hour.ok()) << hour.status().ToString();
+  EXPECT_EQ((*hour)->ToString(), "[\n  0\n]");
+}
+
 TEST_F(ComputeTest, ConstantsFillEveryRow) {
   auto out = Eval(ConstantOf(7, LogicalType::kInteger), {Int16s({1, 2, 3})});
   ASSERT_TRUE(out.ok());

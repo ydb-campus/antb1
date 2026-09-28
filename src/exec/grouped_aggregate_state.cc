@@ -512,6 +512,7 @@ arrow::Result<std::unique_ptr<GroupedAggregateState>> SumState(bool average,
       return std::make_unique<GroupedDoubleSum>(average);
     case plan::LogicalType::kVarchar:
     case plan::LogicalType::kDate:
+    case plan::LogicalType::kTimestamp:
     case plan::LogicalType::kBoolean:
       break;
   }
@@ -537,6 +538,8 @@ std::unique_ptr<GroupedAggregateState> MinMaxState(bool min, plan::LogicalType i
       return std::make_unique<GroupedMinMax<arrow::BinaryType>>(min, std::move(type));
     case plan::LogicalType::kDate:
       return std::make_unique<GroupedMinMax<arrow::Date32Type>>(min, std::move(type));
+    case plan::LogicalType::kTimestamp:
+      return std::make_unique<GroupedMinMax<arrow::TimestampType>>(min, std::move(type));
     case plan::LogicalType::kBoolean:  // never an aggregate argument
       break;
   }

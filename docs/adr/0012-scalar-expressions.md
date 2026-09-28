@@ -34,6 +34,9 @@ Accepted (with the maintainer-approved plan for scalar expressions)
   or a result. A `WHERE` or `HAVING` conjunct with `OR` or `NOT` is computed by a `Compute` and filtered with a new
   `IS TRUE` predicate, so `Filter` stays a conjunction over columns. `CASE` computes each branch only for its rows,
   as DuckDB does, so a guarded overflow never fails.
+  Update: TIMESTAMP (Arrow timestamp[us]) is a computed type, produced by `toDateTime` (ClickBench's DuckDB macro
+  `epoch_ms(t * 1000)`, bound as that expression; the oracle defines the macro the same way) and `date_trunc`, and
+  read by `EXTRACT`; it sorts, groups and aggregates like an integer and prints as DuckDB prints it.
 - **A `Compute` node** appends one column per expression to its input. The binder places one over the (filtered)
   table for `WHERE` operands, aggregate arguments and `GROUP BY` expressions, and one over the aggregation for select,
   `HAVING` and `ORDER BY` expressions over keys and aggregates. Every other operator keeps taking columns, and a
