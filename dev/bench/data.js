@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790612795553,
+  "lastUpdate": 1790623162851,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -1404,6 +1404,78 @@ window.BENCHMARK_DATA = {
             "value": 14.324408000000087,
             "unit": "ms/iter",
             "extra": "iterations: 49\ncpu: 14.323975142857142 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "21fc8ac072f5df5d99629066859488ea9a0472b9",
+          "message": "fix(plan): move constants in having and conditions over aggregates (#37)\n\n## Summary\n\nFollow-up 1 of 3 after the scalar-expressions plan. DuckDB's optimizer\nmoves integer constants in every comparison (`x + c <op> k` becomes `x\n<op> k - c`, and likewise for `-`, `c - x` and `x * c`). antb1 did this\nonly in `WHERE` and in input-scope `CASE WHEN`. In `HAVING`, and in\nconditions over the aggregation (a grouped `CASE WHEN`, `HAVING ... OR\n...`), it computed the arithmetic and failed with an overflow where\nDuckDB answers.\n\nExample, a SMALLINT key with the value 32767: `SELECT x FROM t GROUP BY\nx HAVING x + 30000 > 5` failed with \"Overflow in addition of SMALLINT\";\nnow it answers like DuckDB.\n\nThe fix:\n- `MoveConstants` binds the operand through the scope's own binder\ninstead of always using the input scope.\n- Keys, aggregates and aliases count as operands in the output scope.\n- The call site moves constants in every scope.\n\nThe reviewer of #35 spotted this.\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [x] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check\nexit 0\n$ pixi run tidy\nexit 0\n$ ANTB1_DIFF_COUNT=5000 pixi run diff-random\nDIFF: PASS seed=3957990328 queries=5000 failed=0 unsupported=0\n```\n\nChecked by hand against DuckDB 1.5.5:\n- `HAVING` over a key, over `MIN(x)` and over an alias;\n- `HAVING ... OR ...`;\n- `30000 - x`;\n- `x * 2 = 200`;\n- a grouped `CASE WHEN x + 30000 > 5`.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change:\n`plan.BinderTest.HavingMovesConstantsLikeDuckDb`, three `.slt` cases in\n`expressions/arithmetic.slt` (answered by DuckDB, over a 32767 key)\n- [x] Docs updated: `docs/sql-subset.md` (constant moving in every\ncomparison)\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [ ] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer (none changed)\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code wrote the fix\nand the tests and ran the verification.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-09-28T22:16:55+03:00",
+          "tree_id": "fd91a35822fa8aeb5dddeab74aa1ff1d135eff9e",
+          "url": "https://github.com/ydb-campus/antb1/commit/21fc8ac072f5df5d99629066859488ea9a0472b9"
+        },
+        "date": 1790623162051,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4177.693498099386,
+            "unit": "ns/iter",
+            "extra": "iterations: 166782\ncpu: 4176.507794606132 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 83987.57100362054,
+            "unit": "ns/iter",
+            "extra": "iterations: 7732\ncpu: 83981.96029487843 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222106.6010149085,
+            "unit": "ns/iter",
+            "extra": "iterations: 3153\ncpu: 222086.19029495722 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 437091.74219725805,
+            "unit": "ns/iter",
+            "extra": "iterations: 1602\ncpu: 436928.5362047439 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 402050.5954023001,
+            "unit": "ns/iter",
+            "extra": "iterations: 1740\ncpu: 401911.44080459746 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2123642.1854103534,
+            "unit": "ns/iter",
+            "extra": "iterations: 329\ncpu: 2122804.7082066853 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 189.35238899999973,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 189.34201099999993 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.369278877551011,
+            "unit": "ms/iter",
+            "extra": "iterations: 49\ncpu: 14.367663877551028 ms\nthreads: 1"
           }
         ]
       }
