@@ -33,6 +33,22 @@ SELECT id FROM edge ORDER BY 1 DESC LIMIT 3
 9
 
 query IT nosort
+SELECT id, u FROM edge ORDER BY TIMESTAMP '2020-01-01 10:00:00', 2 NULLS FIRST, 1
+----
+5	NULL
+11	NULL
+0	(empty)
+9	\x28empty)
+1	a
+4	back\\slash
+3	line\nbreak
+2	tab\there
+6	trailing space\x20
+7	x\x7fy
+8	Привет, мир
+10	日本語
+
+query IT nosort
 SELECT id, u FROM edge ORDER BY DATE '2020-01-01', 2 NULLS FIRST, 1
 ----
 5	NULL

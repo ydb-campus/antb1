@@ -123,6 +123,7 @@ std::string LiteralName(const sql::Literal& lit) {
       break;
     case sql::Literal::Kind::kString:
     case sql::Literal::Kind::kDate:
+    case sql::Literal::Kind::kTimestamp:
       return "'" + lit.text + "'";
   }
   return (lit.negative ? "-" : "") + lit.text;
@@ -234,8 +235,13 @@ std::string ExprName(const sql::Expr& expr) {
     return ArgumentName(ref->name);
   }
   if (const auto* lit = std::get_if<sql::Literal>(&expr)) {
-    return lit->kind == sql::Literal::Kind::kDate ? "CAST('" + lit->text + "' AS \"DATE\")"
-                                                  : LiteralName(*lit);
+    if (lit->kind == sql::Literal::Kind::kDate) {
+      return "CAST('" + lit->text + "' AS \"DATE\")";
+    }
+    if (lit->kind == sql::Literal::Kind::kTimestamp) {
+      return "CAST('" + lit->text + "' AS TIMESTAMP)";
+    }
+    return LiteralName(*lit);
   }
   if (const auto* call = std::get_if<sql::AggregateCall>(&expr)) {
     return ResultName(*call);
@@ -807,6 +813,9 @@ arrow::Result<LogicalType> AggregateType(const sql::AggregateCall& call, const B
   return arg.type;
 }
 
+constexpr std::string_view kInvalidTimestamp = "invalid timestamp";
+constexpr std::string_view kTimestampForm = "YYYY-MM-DD[ HH:MM[:SS[.fraction]]]";
+
 std::string_view LiteralKind(const sql::Literal& lit) {
   switch (lit.kind) {
     case sql::Literal::Kind::kInteger:
@@ -816,6 +825,8 @@ std::string_view LiteralKind(const sql::Literal& lit) {
       return "a string";
     case sql::Literal::Kind::kDate:
       return "a DATE literal";
+    case sql::Literal::Kind::kTimestamp:
+      return "a TIMESTAMP literal";
   }
   return "a literal";
 }
@@ -982,14 +993,38 @@ arrow::Result<Predicate> BindEquality(const sql::Comparison& cmp, const BoundCol
       return p;
     case LogicalType::kBoolean:
       return UnsupportedError("comparing a condition is not supported", cmp.span);
-    case LogicalType::kTimestamp:
-      return UnsupportedError(
-          std::format("comparing the TIMESTAMP '{}' with a literal is not supported",
-                      Clip(column.name)),
-          lit.span);
+    case LogicalType::kTimestamp: {
+      // A string or TIMESTAMP literal is the timestamp it spells, a DATE literal its midnight (as
+      // DuckDB casts them); compared exactly.
+      if (number) {
+        return mismatch("write a timestamp as TIMESTAMP 'YYYY-MM-DD HH:MM:SS'");
+      }
+      std::optional<int64_t> micros;
+      if (lit.kind == sql::Literal::Kind::kDate) {
+        if (const auto days = ParseDate(lit.text)) {
+          micros = int64_t{*days} * 86'400'000'000;
+        }
+      } else {
+        micros = ParseTimestamp(lit.text);
+      }
+      if (!micros.has_value()) {
+        return BindError(
+            std::string(kInvalidTimestamp) + " '" + Clip(lit.text) + "': expected " +
+                std::string(lit.kind == sql::Literal::Kind::kDate ? "YYYY-MM-DD" : kTimestampForm),
+            lit.span);
+      }
+      p.constant.value = Int128{*micros};
+      return p;
+    }
     case LogicalType::kDate: {
       if (number) {
         return mismatch("write a date as DATE 'YYYY-MM-DD'");
+      }
+      if (lit.kind == sql::Literal::Kind::kTimestamp) {
+        return UnsupportedError(std::format("comparing the DATE '{}' with a TIMESTAMP literal is "
+                                            "not supported",
+                                            Clip(column.name)),
+                                lit.span);
       }
       const auto days = ParseDate(lit.text);
       if (!days.has_value()) {
@@ -1067,6 +1102,16 @@ arrow::Result<std::pair<Constant, std::string>> BindConstant(const sql::Literal&
       }
       return std::pair(Constant{.type = LogicalType::kDate, .value = Int128{*days}},
                        "CAST('" + lit.text + "' AS \"DATE\")");
+    }
+    case sql::Literal::Kind::kTimestamp: {
+      const auto micros = ParseTimestamp(lit.text);
+      if (!micros.has_value()) {
+        return BindError(std::string(kInvalidTimestamp) + " '" + Clip(lit.text) + "': expected " +
+                             std::string(kTimestampForm),
+                         lit.span);
+      }
+      return std::pair(Constant{.type = LogicalType::kTimestamp, .value = Int128{*micros}},
+                       "CAST('" + lit.text + "' AS TIMESTAMP)");
     }
   }
   return UnsupportedError("this constant is not supported", lit.span);
@@ -1333,7 +1378,11 @@ arrow::Result<Typed> Negate(const sql::UnaryExpr& unary, Typed operand) {
 // A literal as an expression operand: typed by its value (an integer), DOUBLE (a number DuckDB
 // types as DOUBLE, or a decimal, which DuckDB types DECIMAL: flagged), VARCHAR or DATE.
 arrow::Result<Typed> LiteralOperand(const sql::Literal& lit) {
-  const std::string name = LiteralName(lit);
+  // A DATE or TIMESTAMP literal is named as DuckDB names its cast, as in ExprName.
+  const std::string name =
+      lit.kind == sql::Literal::Kind::kDate || lit.kind == sql::Literal::Kind::kTimestamp
+          ? ExprName(sql::Expr(lit))
+          : LiteralName(lit);
   const bool number =
       lit.kind == sql::Literal::Kind::kInteger || lit.kind == sql::Literal::Kind::kDecimal;
   if (number && (lit.kind == sql::Literal::Kind::kDecimal || IsApproximateNumber(lit.text))) {
@@ -1424,7 +1473,8 @@ arrow::Result<std::optional<std::size_t>> PositionOf(const sql::Literal& lit,
                                                      const SelectList& select,
                                                      std::string_view clause) {
   if (lit.kind != sql::Literal::Kind::kInteger || IsApproximateNumber(lit.text)) {
-    if (clause == "ORDER BY" && lit.kind != sql::Literal::Kind::kDate) {
+    if (clause == "ORDER BY" && lit.kind != sql::Literal::Kind::kDate &&
+        lit.kind != sql::Literal::Kind::kTimestamp) {
       return BindError("ORDER BY a non-integer literal orders nothing", lit.span);
     }
     return std::nullopt;
@@ -2409,8 +2459,19 @@ arrow::Result<Typed> Binder::BindCase(const sql::CaseExpr& c, const BindFn& bind
                                                                    .value = Int128{*days}}},
                             .type = LogicalType::kDate,
                             .name = values[i].expr->name});
-    } else if (IsNumeric(*type) || *type == LogicalType::kTimestamp) {
-      // DuckDB casts the string to the number ('1' next to SMALLINT is 1) or the TIMESTAMP.
+    } else if (*type == LogicalType::kTimestamp) {
+      const auto micros = ParseTimestamp(lit.text);
+      if (!micros.has_value()) {
+        return BindError(std::string(kInvalidTimestamp) + " '" + Clip(lit.text) + "': expected " +
+                             std::string(kTimestampForm),
+                         lit.span);
+      }
+      values[i] = Leaf(Expr{.node = ConstantExpr{.value = Constant{.type = LogicalType::kTimestamp,
+                                                                   .value = Int128{*micros}}},
+                            .type = LogicalType::kTimestamp,
+                            .name = values[i].expr->name});
+    } else if (IsNumeric(*type)) {
+      // DuckDB casts the string to the number ('1' next to SMALLINT is 1).
       return UnsupportedError(std::format("a string literal as a CASE value next to {} values is "
                                           "not supported",
                                           ToString(*type)),

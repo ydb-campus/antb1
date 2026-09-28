@@ -388,20 +388,20 @@ constexpr auto kOperands = std::to_array<std::string_view>({
     "-",
 });
 constexpr auto kOther = std::to_array<std::string_view>({
-    "OR",       "NOT",       "ISNULL",   "notnull", "HAVING",
-    "JOIN",     "UNION",     "WITH",     "LIKE",    "IN",
-    "BETWEEN",  "CASE",      "WHEN",     "THEN",    "END",
-    "IS",       "NULL",      "TRUE",     "FALSE",   "INTERVAL",
-    "CAST",     "TIMESTAMP", "EXISTS",   "ALL",     "OVER",
-    "FILTER",   "INTO",      "LEFT",     "COLLATE", "lower",
-    ".",        "+",         "/",        "%",       "::",
-    "||",       "'open",     R"("open)", "/* open", "-- comment\n",
-    "!",        "#",         "~",        "!~",      "!=-",
-    "==",       "<<",        "->",       "?",       "$1",
-    "{",        "0x1F",      "1_000",    "E'x'",    "INT",
-    "EXCLUDE",  "PERCENT",   "USING",    "-- c\r",  "/* /* */ */",
-    "/* /* */", "\xd0\xb8",  "\x01",     "\xff",    "\xc3\x28",
-    "1e",       "12abc",     R"("")",    ":",       "|",
+    "OR",       "NOT",         "ISNULL",   "notnull", "HAVING",
+    "JOIN",     "UNION",       "WITH",     "LIKE",    "IN",
+    "BETWEEN",  "CASE",        "WHEN",     "THEN",    "END",
+    "IS",       "NULL",        "TRUE",     "FALSE",   "INTERVAL",
+    "CAST",     "TIMESTAMPTZ", "EXISTS",   "ALL",     "OVER",
+    "FILTER",   "INTO",        "LEFT",     "COLLATE", "lower",
+    ".",        "+",           "/",        "%",       "::",
+    "||",       "'open",       R"("open)", "/* open", "-- comment\n",
+    "!",        "#",           "~",        "!~",      "!=-",
+    "==",       "<<",          "->",       "?",       "$1",
+    "{",        "0x1F",        "1_000",    "E'x'",    "INT",
+    "EXCLUDE",  "PERCENT",     "USING",    "-- c\r",  "/* /* */ */",
+    "/* /* */", "\xd0\xb8",    "\x01",     "\xff",    "\xc3\x28",
+    "1e",       "12abc",       R"("")",    ":",       "|",
     "[",
 });
 constexpr auto kSeparators = std::to_array<std::string_view>(
@@ -463,6 +463,8 @@ std::vector<std::string_view> Skeleton(Rng& rng) {
         literal = {"-", rng.Pick(kLiterals).substr(0, 2)};
       } else if (rng.Percent(15)) {
         literal = {"DATE", "'2024-01-31'"};
+      } else if (rng.Percent(10)) {
+        literal = {"TIMESTAMP", "'2024-01-31 12:34:56.5'"};
       } else {
         literal = {rng.Pick(kLiterals)};
       }
@@ -693,7 +695,7 @@ Literal RandomLiteral(Rng& rng) {
       literal.text = RandomBytes(rng, 16, false);
       break;
     default:
-      literal.kind = Literal::Kind::kDate;
+      literal.kind = rng.Percent(50) ? Literal::Kind::kDate : Literal::Kind::kTimestamp;
       literal.text = RandomBytes(rng, 12, false);
       break;
   }

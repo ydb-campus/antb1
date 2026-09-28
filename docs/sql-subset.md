@@ -77,7 +77,8 @@ agg_call    = "COUNT" , "(" , "*" , ")"
             | "COUNT" , "(" , "DISTINCT" , expr , ")"
             | ( "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" ) , "(" , expr , ")" ;
 cmp_op      = "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" ;
-literal     = [ "-" ] , integer | [ "-" ] , decimal | string_literal | "DATE" , string_literal ;
+literal     = [ "-" ] , integer | [ "-" ] , decimal | string_literal | "DATE" , string_literal
+            | "TIMESTAMP" , string_literal ;
 ```
 
 Operators bind from loosest to tightest: `OR`, `AND`, `NOT`, the comparisons with `LIKE` and `IN` (which do not
@@ -132,8 +133,9 @@ items).
   `ORDER BY`) or `HAVING` the query has one row.
 - Constants (as DuckDB types and names them): an integer is INTEGER when its magnitude fits (so `-2147483648` is
   BIGINT), else BIGINT or HUGEINT, and is named by its value (`007` is `7`); a string is VARCHAR named with its
-  quotes (`'it''s'`); `DATE '2020-01-02'` is DATE named `CAST('2020-01-02' AS "DATE")`. A decimal (DuckDB's DECIMAL)
-  and an integer beyond HUGEINT's 38 digits are unsupported (exit code 4).
+  quotes (`'it''s'`); `DATE '2020-01-02'` is DATE named `CAST('2020-01-02' AS "DATE")`, and
+  `TIMESTAMP '2020-01-02 10:00:00'` TIMESTAMP named `CAST('2020-01-02 10:00:00' AS TIMESTAMP)`. A decimal (DuckDB's
+  DECIMAL) and an integer beyond HUGEINT's 38 digits are unsupported (exit code 4).
 - Positions: in `GROUP BY` and `ORDER BY` an integer literal names the select item at that position (1-based; `*`
   counts every column); one out of range, a negative one too, is a bind error. `GROUP BY` of an aggregate item is a
   bind error. Any other literal is a constant: in `GROUP BY` it is no key but still makes the query grouped (one group
@@ -185,9 +187,11 @@ items).
   HUGEINT; any other type is a bind error. `EXTRACT(field FROM x)` takes a TIMESTAMP or DATE and the fields
   `year`, `month`, `day`, `hour`, `minute` and `second` (case-insensitive) and is BIGINT; `date_trunc('unit', x)`
   takes a TIMESTAMP or DATE and the units `year`, `quarter`, `month`, `week`, `day`, `hour`, `minute` and `second`
-  (a string literal, case-insensitive) and is TIMESTAMP. Other fields and units, TIMESTAMP literals, comparing a
-  TIMESTAMP with a literal or with a DATE, TIMESTAMP arithmetic and a string literal next to TIMESTAMP values in
-  `CASE` are unsupported (exit code 4). The result names are DuckDB's: `todatetime(EventTime)`,
+  (a string literal, case-insensitive) and is TIMESTAMP. A TIMESTAMP compares with a TIMESTAMP literal, a string
+  literal (the timestamp it spells) or a DATE literal (its midnight), exactly, as DuckDB casts them; in `CASE` a
+  string literal next to TIMESTAMP values is a TIMESTAMP. Comparing a TIMESTAMP with a number is a bind error. Other
+  fields and units, comparing a TIMESTAMP with a DATE operand, a DATE with a TIMESTAMP literal, and TIMESTAMP
+  arithmetic are unsupported (exit code 4). The result names are DuckDB's: `todatetime(EventTime)`,
   `main.date_part('minute', todatetime(EventTime))`, `date_trunc('minute', todatetime(EventTime))`.
 - `CASE` (as DuckDB types it): the values (`THEN` and `ELSE`) take their common type, where an integer literal takes
   the other values' integer type when it fits (`CASE WHEN .. THEN smallint_col ELSE 0 END` is SMALLINT), two integer
@@ -220,6 +224,7 @@ error that points at the literal:
 | DOUBLE | integer, decimal | the nearest double, as in DuckDB for a DOUBLE column; beyond the double range `inf` or `-inf`, below the smallest subnormal `0`. A column stored as FLOAT is compared as DuckDB compares it: an integer or DECIMAL literal becomes the FLOAT that DuckDB casts it to, with DuckDB's rounding (`0.1` is `0.1F`; `16777217.5` and some long spellings of `0.1`, such as 16 or 24 decimals, are not the nearest FLOAT, and HUGEINT literals are rounded through a double), beyond the FLOAT range `inf` or `-inf`; a number DuckDB types as DOUBLE compares with the nearest double |
 | VARCHAR | string | bytes; `LIKE` and `NOT LIKE` take a string pattern (only a VARCHAR column: LIKE on another type is a bind error, as in DuckDB) |
 | DATE | string, `DATE` string | a date written exactly `YYYY-MM-DD` (years 0000 to 9999) that exists in the calendar |
+| TIMESTAMP (an expression) | string, `TIMESTAMP` string, `DATE` string | a timestamp written `YYYY-MM-DD`, optionally followed by a space (or `T`) and `HH:MM` or `HH:MM:SS` (hours 00 to 23) and an optional fraction of up to 9 digits (past the sixth truncated, as in DuckDB), or a DATE's midnight |
 
 A comparison of an integer column with a number is folded exactly at bind time, never through a lossy cast:
 
@@ -286,7 +291,7 @@ Project RegionID, c
 | BYTE_ARRAY, unannotated | binary | VARCHAR | compared byte-wise |
 | BYTE_ARRAY annotated STRING (UTF8) | utf8 | VARCHAR | same engine representation as unannotated |
 | DECIMAL(38, 0) | decimal128(38, 0) | HUGEINT | also the result type of integer SUM |
-| – | timestamp[us] | TIMESTAMP | only computed (`toDateTime`, `date_trunc`); a Parquet timestamp column is unsupported |
+| – | timestamp[us] | TIMESTAMP | only computed (`toDateTime`, `date_trunc`) or a literal; a Parquet timestamp column is unsupported |
 | anything else | – | unsupported | `antb1 schema` shows `unsupported(<type>)`; a query that uses the column is rejected |
 
 `--column-type COL=DATE` reinterprets a USMALLINT or INTEGER column as days since 1970-01-01; `--clickbench` is a
@@ -450,7 +455,7 @@ compare against DuckDB, so an unregistered difference is a bug.
 | D2 | Column-type overrides | `--clickbench` and `--column-type COL=DATE` apply to every table with that column, including tables opened with `FROM '<path>'` | the oracle applies `make_date(EventDate)` only to the named tables with the `clickbench` option in `tests/slt/tables.txt`; `FROM '<path>'` reads the raw integers | the runner rejects a table list where some tables with an `EventDate` column have the option and others do not; the random generator never reads an overridden column through `FROM '<path>'`; `.slt` records read `EventDate` only through table names |
 | D3 | Literal types | a string literal compared with a numeric column is a bind error | casts the string to the column's type | `onlyif antb1` records in `tests/slt/cases/basic/bind_errors.slt`; the query generator writes numbers for numeric columns |
 | D4 | Literal types | a number or a `DATE` literal compared with a VARCHAR column is a bind error | casts the column's values at run time (a conversion error unless every value converts) | as D3; the generator writes strings for VARCHAR columns |
-| D5 | Date literals | a date must be written exactly `YYYY-MM-DD` | also accepts `2013-7-1`, surrounding spaces and a time of day | as D3; the generator writes `YYYY-MM-DD` |
+| D5 | Date and timestamp literals | a date must be written exactly `YYYY-MM-DD`, a timestamp exactly as in the literal table (two-digit fields, one space or `T`, hours 00 to 23) | also accepts `2013-7-1`, surrounding spaces and a time of day for a DATE, and single-digit fields, spaces and `24:00:00` for a TIMESTAMP | as D3; the generator writes `YYYY-MM-DD` and `YYYY-MM-DD HH:MM:SS` |
 | D7 | DOUBLE literals and BIGINT | a number that DuckDB types as DOUBLE (an exponent, or more than 38 digits) is rounded to the nearest double like in DuckDB, then compared exactly with the integer column; in an `IN` list with such a number every value is rounded so | converts BIGINT (and HUGEINT) values to DOUBLE for the comparison, so values beyond 2^53 compare rounded: `i64 >= 9223372036854775808e0` holds for `9223372036854775807` | the `.slt` records with such literals avoid BIGINT values beyond 2^53 (`tests/slt/cases/where/folding.slt`); `plan.ApproximateNumbers/FoldThroughBinderTest.*` pins antb1's folding; the generator writes no exponents |
 | D8 | Result names | an aggregate's argument is quoted when it is not a plain identifier or is a reserved word | also quotes non-reserved keywords (`sum("year")`) | the tests compare values and types, not names |
 | D9 | HUGEINT range | HUGEINT is decimal128(38, 0): a `SUM`, or arithmetic on a `SUM`, outside -(10^38 - 1) to 10^38 - 1 is an execution error (exit code 1). An integer SUM over BIGINT or smaller types cannot reach it | HUGEINT holds -(2^127 - 1) to 2^127 - 1 | no fixture has a HUGEINT column; `exec.AggregateStateTest.HugeIntSumIsCheckedAgainstTheRange` checks the error |

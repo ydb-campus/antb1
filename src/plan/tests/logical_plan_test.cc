@@ -109,7 +109,12 @@ TEST(LogicalPlanTest, FunctionAndTypeNames) {
   // Neither is a column type: a Parquet timestamp or boolean column stays unsupported.
   EXPECT_FALSE(FromArrow(*arrow::timestamp(arrow::TimeUnit::MICRO)).ok());
   EXPECT_FALSE(FromArrow(*arrow::boolean()).ok());
-  EXPECT_FALSE(ToArrowScalar(Constant{.type = LogicalType::kTimestamp, .value = Int128{0}}).ok());
+  auto timestamp = ToArrowScalar(Constant{.type = LogicalType::kTimestamp, .value = Int128{-1}});
+  ASSERT_TRUE(timestamp.ok()) << timestamp.status().ToString();
+  EXPECT_EQ(static_cast<const arrow::TimestampScalar&>(**timestamp).value, -1);
+  EXPECT_EQ(ToString(Constant{.type = LogicalType::kTimestamp, .value = Int128{-1}}),
+            "TIMESTAMP '1969-12-31 23:59:59.999999'");
+  EXPECT_FALSE(ToArrowScalar(Constant{.type = LogicalType::kTimestamp, .value = kInt128Max}).ok());
 }
 
 TEST(LogicalPlanTest, ConstantText) {

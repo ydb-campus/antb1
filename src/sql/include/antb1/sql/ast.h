@@ -55,10 +55,11 @@ struct ColumnRef {
 };
 
 struct Literal {
-  enum class Kind : std::uint8_t { kInteger, kDecimal, kString, kDate };
+  enum class Kind : std::uint8_t { kInteger, kDecimal, kString, kDate, kTimestamp };
   Kind kind = Kind::kInteger;
   bool negative = false;  // leading '-' (integers/decimals only)
-  std::string text;       // number as written without the sign / unescaped string or date text
+  std::string
+      text;  // number as written without the sign / unescaped string, date or timestamp text
   SourceSpan span;
 };
 

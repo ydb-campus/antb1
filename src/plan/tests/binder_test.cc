@@ -283,8 +283,21 @@ INSTANTIATE_TEST_SUITE_P(
                   "EXTRACT of dow is not supported"},
         ErrorCase{"SELECT EXTRACT(minute FROM i64) FROM t", kBind, "i64",
                   "EXTRACT needs a TIMESTAMP or DATE, but 'i64' is BIGINT"},
-        ErrorCase{"SELECT COUNT(*) FROM t WHERE toDateTime(i64) > 5", kUnsupported, "5",
-                  "comparing the TIMESTAMP 'todatetime(i64)' with a literal is not supported"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE toDateTime(i64) > 5", kBind, "5",
+                  "write a timestamp as TIMESTAMP 'YYYY-MM-DD HH:MM:SS'"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE toDateTime(i64) > '2013-7-15'", kBind,
+                  "'2013-7-15'", "invalid timestamp '2013-7-15'"},
+        ErrorCase{"SELECT CASE WHEN i16 = 1 THEN toDateTime(i64) ELSE '2013-7-15' END FROM t",
+                  kBind, "'2013-7-15'", "invalid timestamp '2013-7-15'"},
+        ErrorCase{"SELECT TIMESTAMP '2000-01-01 10:00' + 1 FROM t", kUnsupported, "+",
+                  "TIMESTAMP arithmetic ('CAST('2000-01-01 10:00' AS TIMES"},
+        ErrorCase{"SELECT TIMESTAMP '2013-07-15 24:00:00' FROM t", kBind,
+                  "TIMESTAMP '2013-07-15 24:00:00'", "invalid timestamp"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE dt > TIMESTAMP '2013-07-15 12:00:00'", kUnsupported,
+                  "TIMESTAMP '2013-07-15 12:00:00'",
+                  "comparing the DATE 'dt' with a TIMESTAMP literal is not supported"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE toDateTime(i64) > DATE '2013-02-30'", kBind,
+                  "DATE '2013-02-30'", "invalid timestamp '2013-02-30': expected YYYY-MM-DD"},
         ErrorCase{"SELECT COUNT(*) FROM t WHERE toDateTime(i64) > dt", kUnsupported, ">",
                   "comparing a DATE with a TIMESTAMP is not supported"},
         ErrorCase{"SELECT toDateTime(i64) + 1 FROM t", kUnsupported, "+", "TIMESTAMP arithmetic"},
@@ -1121,6 +1134,25 @@ TEST(BinderTest, TimestampFunctions) {
     EXPECT_EQ(plan->output[i].name, expected[i].first);
     EXPECT_EQ(plan->output[i].type, expected[i].second) << expected[i].first;
   }
+  // TIMESTAMP literals: a constant named as DuckDB names it; a TIMESTAMP compares with a TIMESTAMP,
+  // string or DATE literal (its midnight) exactly.
+  auto literals = BindSql(
+      "SELECT TIMESTAMP '2013-07-15 14:00:00' FROM t WHERE toDateTime(i64) >= '2013-07-15' AND "
+      "toDateTime(i64) < DATE '2013-07-16' AND toDateTime(i64) IN (TIMESTAMP '2013-07-15 "
+      "14:00:00.5')",
+      catalog);
+  ASSERT_TRUE(literals.ok()) << literals.status().ToString();
+  EXPECT_EQ(literals->output[0].name, "CAST('2013-07-15 14:00:00' AS TIMESTAMP)");
+  EXPECT_EQ(literals->output[0].type, LogicalType::kTimestamp);
+  const std::string literal_plan = Explain(*literals);
+  EXPECT_NE(literal_plan.find("\"todatetime(i64)\" >= TIMESTAMP '2013-07-15 00:00:00'"),
+            std::string::npos)
+      << literal_plan;
+  EXPECT_NE(literal_plan.find("\"todatetime(i64)\" < TIMESTAMP '2013-07-16 00:00:00'"),
+            std::string::npos)
+      << literal_plan;
+  EXPECT_NE(literal_plan.find("IN (TIMESTAMP '2013-07-15 14:00:00.5')"), std::string::npos)
+      << literal_plan;
   // AVG of a DATE or TIMESTAMP is a TIMESTAMP, as in DuckDB.
   auto averages = BindSql("SELECT AVG(dt), AVG(toDateTime(i64)) FROM t GROUP BY i16", catalog);
   ASSERT_TRUE(averages.ok()) << averages.status().ToString();

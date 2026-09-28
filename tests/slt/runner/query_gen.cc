@@ -1086,6 +1086,9 @@ class Builder {
         return;
       }
       const std::string_view op = rng_.Pick(kOps);
+      if (rng_.Percent(6) && TimestampComparison(c, op)) {
+        return;
+      }
       if (rng_.Percent(6) && allowed_.Has(Feature::kIntegerLiteral) &&
           Temporal(c, /*number=*/true)) {
         used_.Add(Feature::kIntegerLiteral);
@@ -1303,6 +1306,37 @@ class Builder {
   void Column(const GenColumn& c) {
     used_.Add(TypeFeature(c.kind));
     tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.name});
+  }
+
+  // toDateTime(c) <op> TIMESTAMP '...' for an integer column of seconds whose values times 1000
+  // fit its type, the literal a second inside the column's data range and in years 0001 to 9999
+  // (what a TIMESTAMP literal spells). Returns whether it wrote one.
+  bool TimestampComparison(const GenColumn& c, std::string_view op) {
+    // 0001-01-01 00:00:00: year 0 prints as 0001-01-01 (BC), which a literal does not spell.
+    constexpr int64_t kFirst = -62'135'596'800;
+    constexpr int64_t kLast = 253'402'300'799;  // 9999-12-31 23:59:59
+    if (!allowed_.Has(Feature::kTimestamps) || c.kind != ValueKind::kInteger ||
+        !c.data_min.has_value() || !c.data_max.has_value() || *c.data_max > c.max / 1000 ||
+        *c.data_min < c.min / 1000) {
+      return false;
+    }
+    const int64_t low = std::max(*c.data_min, kFirst);
+    const int64_t high = std::min(*c.data_max, kLast);
+    if (low > high) {
+      return false;
+    }
+    const int64_t seconds =
+        low + static_cast<int64_t>(rng_.Below(static_cast<uint64_t>(high - low) + 1));
+    used_.Add(Feature::kTimestamps);
+    Keyword("toDateTime");
+    Symbol("(");
+    Column(c);
+    Symbol(")");
+    Symbol(op);
+    Keyword("TIMESTAMP");
+    tokens_.push_back({.kind = Token::Kind::kLiteral,
+                       .text = SqlString(CanonicalTimestamp(seconds * 1'000'000))});
+    return true;
   }
 
   // toDateTime(c) of an integer column (seconds) whose values times 1000 fit its type (both

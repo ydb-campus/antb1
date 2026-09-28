@@ -167,7 +167,6 @@ constexpr auto kStarModifiers = std::to_array<Construct>({
 // Typed literals other than DATE '...'.
 constexpr auto kUnsupportedTypedLiterals = std::to_array<Construct>({
     {.keyword = "TIME", .message = "TIME literals are not supported"},
-    {.keyword = "TIMESTAMP", .message = "TIMESTAMP literals are not supported"},
     {.keyword = "TIMESTAMPTZ", .message = "TIMESTAMPTZ literals are not supported"},
 });
 
@@ -815,21 +814,22 @@ class Parser {
     }
     const Token& next = PeekAt(1);
     if (next.kind == TokenKind::kString) {
-      if (keyword == "DATE") {
+      if (keyword == "DATE" || keyword == "TIMESTAMP") {
         const SourceSpan date = Take().span;
         Token text = Take();
-        return Expr(Literal{.kind = Literal::Kind::kDate,
-                            .negative = false,
-                            .text = std::move(text.text),
-                            .span = Cover(date, text.span)});
+        return Expr(
+            Literal{.kind = keyword == "DATE" ? Literal::Kind::kDate : Literal::Kind::kTimestamp,
+                    .negative = false,
+                    .text = std::move(text.text),
+                    .span = Cover(date, text.span)});
       }
       if (auto construct = Find(kUnsupportedTypedLiterals, keyword); construct.has_value()) {
         return Unsupported(token.span, *construct);
       }
       if (!IsReservedKeyword(keyword)) {  // type 'text' (INT '1') or a prefixed string (E'\n')
         return Unsupported(token.span,
-                           "typed literals other than DATE '...' and prefixed strings (E'...') are "
-                           "not supported");
+                           "typed literals other than DATE '...', TIMESTAMP '...' and prefixed "
+                           "strings (E'...') are not supported");
       }
     }
     const bool function_like =

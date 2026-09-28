@@ -293,6 +293,78 @@ std::optional<int32_t> ParseDate(std::string_view text) {
   return Narrow<int32_t>(std::chrono::sys_days{date}.time_since_epoch().count());
 }
 
+std::optional<int64_t> ParseTimestamp(std::string_view text) {
+  if (text.size() < 10) {
+    return std::nullopt;
+  }
+  const auto days = ParseDate(text.substr(0, 10));
+  if (!days.has_value()) {
+    return std::nullopt;
+  }
+  constexpr int64_t kMicrosPerDay = 86'400'000'000;
+  int64_t micros = int64_t{*days} * kMicrosPerDay;
+  std::string_view rest = text.substr(10);
+  if (rest.empty()) {
+    return micros;
+  }
+  if (rest[0] != ' ' && rest[0] != 'T') {
+    return std::nullopt;
+  }
+  rest.remove_prefix(1);
+  // Two digits at the front of `rest`, at most `max`.
+  const auto two_digits = [&rest](int max) -> std::optional<int64_t> {
+    if (rest.size() < 2 || !IsDigit(rest[0]) || !IsDigit(rest[1])) {
+      return std::nullopt;
+    }
+    const int value = ((rest[0] - '0') * 10) + (rest[1] - '0');
+    rest.remove_prefix(2);
+    return value <= max ? std::optional<int64_t>(value) : std::nullopt;
+  };
+  const auto hours = two_digits(23);
+  if (!hours.has_value() || rest.empty() || rest[0] != ':') {
+    return std::nullopt;
+  }
+  rest.remove_prefix(1);
+  const auto minutes = two_digits(59);
+  if (!minutes.has_value()) {
+    return std::nullopt;
+  }
+  int64_t seconds = 0;
+  const bool has_seconds = !rest.empty() && rest[0] == ':';
+  if (has_seconds) {
+    rest.remove_prefix(1);
+    const auto parsed = two_digits(59);
+    if (!parsed.has_value()) {
+      return std::nullopt;
+    }
+    seconds = *parsed;
+  }
+  micros += ((*hours * 3'600) + (*minutes * 60) + seconds) * 1'000'000;
+  if (rest.empty()) {
+    return micros;
+  }
+  if (!has_seconds) {  // a fraction only after the seconds, as DuckDB takes it
+    return std::nullopt;
+  }
+  if (rest[0] != '.' || rest.size() < 2 || rest.size() > 10) {
+    return std::nullopt;
+  }
+  rest.remove_prefix(1);
+  int64_t fraction = 0;
+  for (std::size_t i = 0; i < rest.size(); ++i) {
+    if (!IsDigit(rest[i])) {
+      return std::nullopt;
+    }
+    if (i < 6) {
+      fraction = (fraction * 10) + (rest[i] - '0');
+    }
+  }
+  for (std::size_t i = rest.size(); i < 6; ++i) {
+    fraction *= 10;
+  }
+  return micros + fraction;
+}
+
 std::string FormatDate(int32_t days) {
   if (days == std::numeric_limits<int32_t>::max()) {
     return "infinity";
