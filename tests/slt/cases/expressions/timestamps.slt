@@ -133,3 +133,24 @@ SELECT AVG(toDateTime(i16)) FROM edge WHERE i16 > -30 AND i16 < 30 GROUP BY id %
 ----
 1970-01-01 00:00:00.5
 1970-01-01 00:00:03
+
+# TIMESTAMP literals; a TIMESTAMP compares with a TIMESTAMP, string or DATE literal (its midnight).
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE toDateTime(EventTime) >= TIMESTAMP '2013-07-15 12:30:00' AND toDateTime(EventTime) < '2013-07-20'
+----
+1465
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE date_trunc('day', toDateTime(EventTime)) IN (DATE '2013-07-02', TIMESTAMP '2013-07-03', '2013-07-04T00:00')
+----
+1023
+
+query TT nosort
+SELECT TIMESTAMP '2013-07-15 14:00:00.5', CASE WHEN COUNT(*) > 0 THEN MIN(toDateTime(EventTime)) ELSE '2000-01-01 00:00:00' END FROM hits_like
+----
+2013-07-15 14:00:00.5	2013-07-01 00:00:12
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE toDateTime(EventTime) <> TIMESTAMP '2013-07-15 14:00:00.1234567' AND NOT (toDateTime(EventTime) < TIMESTAMP '2013-07-02T06:00')
+----
+9560

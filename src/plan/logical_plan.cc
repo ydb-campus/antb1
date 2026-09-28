@@ -292,6 +292,11 @@ std::string_view ToString(AggKind kind) {
 
 std::string ToString(const Constant& constant) {
   if (const auto* v = std::get_if<Int128>(&constant.value)) {
+    if (constant.type == LogicalType::kTimestamp) {
+      const auto micros = Int128ToInt64(*v);
+      return micros.has_value() ? "TIMESTAMP '" + FormatTimestamp(*micros) + "'"
+                                : "TIMESTAMP <" + Int128ToString(*v) + " microseconds>";
+    }
     if (constant.type != LogicalType::kDate) {
       return Int128ToString(*v);
     }
@@ -321,9 +326,15 @@ arrow::Result<std::shared_ptr<arrow::Scalar>> ToArrowScalar(const Constant& cons
         return IntegerScalar<arrow::Date32Scalar, int32_t>(*v, type);
       case LogicalType::kHugeInt:
         return HugeIntScalar(*v);
+      case LogicalType::kTimestamp: {
+        const auto micros = Int128ToInt64(*v);
+        if (!micros.has_value()) {
+          break;
+        }
+        return std::make_shared<arrow::TimestampScalar>(*micros, arrow::TimeUnit::MICRO);
+      }
       case LogicalType::kDouble:
       case LogicalType::kVarchar:
-      case LogicalType::kTimestamp:  // no TIMESTAMP literal
       case LogicalType::kBoolean:
         break;
     }

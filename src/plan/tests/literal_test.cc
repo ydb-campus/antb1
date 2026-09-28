@@ -128,6 +128,43 @@ TEST(LiteralTest, ParseDate) {
   }
 }
 
+// TIMESTAMP literal text (DuckDB's values; antb1 takes a strict subset of DuckDB's spellings).
+TEST(LiteralTest, ParseTimestamp) {
+  EXPECT_EQ(ParseTimestamp("1970-01-01"), 0);
+  EXPECT_EQ(ParseTimestamp("1970-01-01 00:00:01"), 1'000'000);
+  EXPECT_EQ(ParseTimestamp("2013-07-15 14:00:00"), 1'373'896'800'000'000);
+  EXPECT_EQ(ParseTimestamp("2013-07-15T14:00"), 1'373'896'800'000'000);
+  EXPECT_EQ(ParseTimestamp("2013-07-15 14:00:00.5"), 1'373'896'800'500'000);
+  EXPECT_EQ(ParseTimestamp("2013-07-15 14:00:00.123456"), 1'373'896'800'123'456);
+  EXPECT_EQ(ParseTimestamp("2013-07-15 14:00:00.1234567"), 1'373'896'800'123'456)
+      << "digits past the sixth are truncated, as in DuckDB";
+  EXPECT_EQ(ParseTimestamp("1969-12-31 23:59:59.999999"), -1);
+  EXPECT_EQ(ParseTimestamp("0000-01-01 00:00:00"), -62'167'219'200'000'000);
+  EXPECT_EQ(ParseTimestamp("9999-12-31 23:59:59"), 253'402'300'799'000'000);
+  for (const std::string_view text : {"",
+                                      "2013-07-15 ",
+                                      "2013-07-15  14:00:00",
+                                      " 2013-07-15 14:00:00",
+                                      "2013-07-15 14:00:00 ",
+                                      "2013-07-15 14",
+                                      "2013-07-15 14:0",
+                                      "2013-07-15 1:02:03",
+                                      "2013-7-15 14:00:00",
+                                      "2013-07-15 24:00:00",
+                                      "2013-07-15 14:60:00",
+                                      "2013-07-15 14:00:60",
+                                      "2013-07-15 14:00:00.",
+                                      "2013-07-15 14:00:00.1234567890",
+                                      "2013-07-15 14:00:00.12a",
+                                      "2013-07-15x14:00:00",
+                                      "2013-02-29 00:00:00",
+                                      "2013-07-15 14:00:00Z",
+                                      "2013-07-15 14:00:00+02",
+                                      "2013-07-15 14:00.5"}) {
+    EXPECT_FALSE(ParseTimestamp(text).has_value()) << text;
+  }
+}
+
 TEST(LiteralTest, FormatDateRoundTrips) {
   for (const std::string_view text :
        {"1970-01-01", "1969-12-31", "2022-01-08", "2000-02-29", "0001-01-01", "9999-12-31"}) {

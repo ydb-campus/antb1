@@ -313,7 +313,11 @@ INSTANTIATE_TEST_SUITE_P(
         LiteralCase{"LowerCaseDate", "date '2024-02-29'", Literal::Kind::kDate, false,
                     "2024-02-29"},
         LiteralCase{"DateWithComment", "DATE /* c */ '2024-03-01'", Literal::Kind::kDate, false,
-                    "2024-03-01"}),
+                    "2024-03-01"},
+        LiteralCase{"Timestamp", "TIMESTAMP '2024-01-31 12:34:56.5'", Literal::Kind::kTimestamp,
+                    false, "2024-01-31 12:34:56.5"},
+        LiteralCase{"LowerCaseTimestamp", "timestamp '2024-02-29'", Literal::Kind::kTimestamp,
+                    false, "2024-02-29"}),
     [](const ::testing::TestParamInfo<LiteralCase>& param_info) {
       return std::string(param_info.param.name);
     });
@@ -993,8 +997,9 @@ INSTANTIATE_TEST_SUITE_P(
                    "CAST (::) is not supported"},
         RejectCase{"CastOperatorInSelect", "SELECT a^::TEXT FROM events", kUnsupported, 2,
                    "CAST (::) is not supported"},
-        RejectCase{"TimestampLiteral", "SELECT a FROM events WHERE ts > ^TIMESTAMP '2024-01-01'",
-                   kUnsupported, 9, "TIMESTAMP literals are not supported"},
+        RejectCase{"TimestampTzLiteral",
+                   "SELECT a FROM events WHERE ts > ^TIMESTAMPTZ '2024-01-01'", kUnsupported, 11,
+                   "TIMESTAMPTZ literals are not supported"},
         RejectCase{"TimeLiteral", "SELECT a FROM events WHERE t > ^time '10:00'", kUnsupported, 4,
                    "TIME literals are not supported"},
         RejectCase{"SelectWithoutFrom", "SELECT a^", kUnsupported, 0,
@@ -1095,8 +1100,8 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"NonAsciiIdentifier", "SELECT ^\xd0\xb8 FROM events", kUnsupported, 2,
                    "unquoted non-ASCII names are not supported (double-quote the name)"},
         RejectCase{"EscapeString", "SELECT a FROM events WHERE a = ^E'x\\n'", kUnsupported, 1,
-                   "typed literals other than DATE '...' and prefixed strings (E'...') are not "
-                   "supported"},
+                   "typed literals other than DATE '...', TIMESTAMP '...' and prefixed strings "
+                   "(E'...') are not supported"},
         RejectCase{"TypedLiteralFirst", "SELECT a FROM events WHERE ^INT '1' = a", kUnsupported, 3,
                    "typed literals other than DATE"},
         RejectCase{"TypedLiteralInSelect", "SELECT ^int4 '1' FROM events", kUnsupported, 4,

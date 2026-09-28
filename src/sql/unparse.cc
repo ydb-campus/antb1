@@ -44,6 +44,8 @@ std::string LiteralSql(const Literal& lit) {
       return Quote(lit.text, '\'');
     case Literal::Kind::kDate:
       return "DATE " + Quote(lit.text, '\'');
+    case Literal::Kind::kTimestamp:
+      return "TIMESTAMP " + Quote(lit.text, '\'');
   }
   return "?";
 }

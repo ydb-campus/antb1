@@ -76,6 +76,8 @@ TEST(UnparseTest, CanonicalForms) {
            Case{.input = "/* hi */ SELECT a -- x\n FROM t -- y", .canonical = "SELECT a FROM t"},
            Case{.input = "SELECT MIN(ts), MAX(ts), AVG(x) FROM t WHERE ts > date '2020-01-01'",
                 .canonical = "SELECT MIN(ts), MAX(ts), AVG(x) FROM t WHERE ts > DATE '2020-01-01'"},
+           Case{.input = "SELECT timestamp '2020-01-01 10:00' FROM t WHERE ts < Timestamp 'x'",
+                .canonical = "SELECT TIMESTAMP '2020-01-01 10:00' FROM t WHERE ts < TIMESTAMP 'x'"},
            Case{.input = "select a, count(*) c from t group by a order by c desc, a asc limit 5",
                 .canonical = R"(SELECT a, COUNT(*) AS "c" FROM t GROUP BY a ORDER BY c DESC, a )"
                              "LIMIT 5"},

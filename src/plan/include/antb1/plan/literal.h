@@ -53,6 +53,12 @@ ExactNumber ExactNumberOf(double value);
 // 9999); std::nullopt for any other text or an invalid date.
 std::optional<int32_t> ParseDate(std::string_view text);
 
+// A TIMESTAMP literal's text as microseconds since 1970-01-01 00:00:00: a date as ParseDate takes
+// it, optionally followed by one space or 'T' and HH:MM or HH:MM:SS (hours 00 to 23) with an
+// optional fraction of 1 to 9 digits (past the sixth truncated, as DuckDB truncates). std::nullopt
+// for any other text.
+std::optional<int64_t> ParseTimestamp(std::string_view text);
+
 // A day number as DuckDB prints a DATE, for every int32: YYYY-MM-DD (years past 9999 with more
 // digits), YYYY-MM-DD (BC) before year 1 (year 0 is 1 BC), and DuckDB's sentinels INT32_MAX and
 // -INT32_MAX as infinity and -infinity.
