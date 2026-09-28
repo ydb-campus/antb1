@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790632912653,
+  "lastUpdate": 1790634141629,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -1620,6 +1620,78 @@ window.BENCHMARK_DATA = {
             "value": 14.319151306122476,
             "unit": "ms/iter",
             "extra": "iterations: 49\ncpu: 14.31804093877551 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "a50762f76e20082f2d4a05140130052c5f33df1b",
+          "message": "feat(plan,exec): more extract fields and date_trunc units (#40)\n\n## Summary\n\nFollow-up 3, part 2 of 2. **Stacked on #39**, which is on #38; merge\nthose first.\n\nThis adds the rest of DuckDB's common date parts.\n- **EXTRACT fields:**\n  - `quarter`, and ISO 8601 `week` and `isoyear`;\n  - `dow` (Sunday is 0), `isodow` (Monday is 1) and `doy`;\n  - `millisecond` and `microsecond`, both including the seconds;\n  - `epoch`, DOUBLE seconds since 1970;\n- `decade`, `century` and `millennium`: `century` counts from year 1 as\ncentury 1, and goes down from -1 before year 1.\n- **date_trunc units:**\n- `millisecond`, `microsecond` and `isoyear` (the Monday of ISO week 1);\n- `decade`, `century` and `millennium`: the year is truncated toward\nzero, DuckDB's quirk (2013 → 2000 for both century and millennium, 150\nBC → 101 BC);\n- `dow`, `isodow` and `doy` truncate to the day, and `epoch` to the\nsecond, as in DuckDB.\n- **Spellings:** DuckDB's spellings are accepted, case-insensitively,\nfrom one table in the binder. Examples: plurals, `y`, `yr`, `mon`, `h`,\n`m`, `s`, `ms`, `msec`, `us`, `w`, `weekofyear`, `dayofweek`, `weekday`,\n`dayofyear`, `c`, `mil`.\n- EXTRACT names a spelling that is a DuckDB keyword by its lower-case\nfield (`Years` → `'year'`) and any other spelling as written, as DuckDB\ndoes.\n- `dec` works for `date_trunc` only, because `EXTRACT(dec ...)` does not\nparse in DuckDB.\n- DuckDB's misspelling `millenium` is left out: the typos linter rejects\nit, and `_typos.toml` is a protected path.\n- **Implementation:** everything is computed in 64-bit civil arithmetic\nin `src/exec/compute.cc`, over the whole TIMESTAMP range and for DATE\ninputs. An infinity gives NULL from EXTRACT and stays infinite through\n`date_trunc`.\n\nValues were checked against DuckDB 1.5.5: every field, unit and\nspelling, including BC and year 0, ISO weeks 52/53 at both year ends,\nleap years, fractions before 1970, the TIMESTAMP extremes, and DATE\nextremes and infinities. The reviewer agent also compared about 190,000\nvalues with DuckDB, and all match.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check\nexit 0\n$ pixi run tidy\nexit 0\n$ pixi run coverage\nCoverage gate: PASS\n$ ANTB1_DIFF_COUNT=20000 pixi run diff-random\nDIFF: PASS seed=1355275055 queries=20000 failed=0 unsupported=0\n$ pixi run test-data           # hits_0, ratchet unchanged at 43 of 43\n100% tests passed out of 6\n```\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change:\n- `exec.ComputeTest.TimestampFunctions` table over DuckDB-probed values;\n  - binder names, types and errors;\n  - `.slt` in `expressions/timestamps.slt` (answered by DuckDB);\n  - generator field and unit lists;\n  - metamorphic relation `extract_dow_is_days_arithmetic`.\n- [x] Docs updated: `docs/sql-subset.md` (fields, units, spellings,\nnaming, semantics)\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [ ] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer (none changed)\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code wrote the change\nand the tests, probed DuckDB for every definition and spelling, and ran\nthe verification. The `reviewer` agent found that EXTRACT names keyword\nspellings by their field (fixed), after comparing about 190k values with\nDuckDB.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-09-29T01:20:01+03:00",
+          "tree_id": "66fcb0b2c3b366b511a7317f67723f89d3e3929a",
+          "url": "https://github.com/ydb-campus/antb1/commit/a50762f76e20082f2d4a05140130052c5f33df1b"
+        },
+        "date": 1790634140577,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 3580.1614734336467,
+            "unit": "ns/iter",
+            "extra": "iterations: 196602\ncpu: 3579.8122653889586 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 90518.96202714425,
+            "unit": "ns/iter",
+            "extra": "iterations: 6926\ncpu: 90515.5879295409 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 98757.58919988602,
+            "unit": "ns/iter",
+            "extra": "iterations: 7074\ncpu: 98749.83644331353 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 330839.2032212224,
+            "unit": "ns/iter",
+            "extra": "iterations: 2111\ncpu: 330787.4310753199 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 401363.81604585034,
+            "unit": "ns/iter",
+            "extra": "iterations: 1745\ncpu: 401266.8693409744 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2396270.874149618,
+            "unit": "ns/iter",
+            "extra": "iterations: 294\ncpu: 2395852.6632653065 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 180.8697109999997,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 180.83811575000007 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 12.62767198181817,
+            "unit": "ms/iter",
+            "extra": "iterations: 55\ncpu: 12.626020399999987 ms\nthreads: 1"
           }
         ]
       }
