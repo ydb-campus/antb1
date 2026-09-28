@@ -886,6 +886,36 @@ TEST(BinderTest, WhereMovesConstantsLikeDuckDb) {
   }
 }
 
+// DuckDB moves constants in every comparison, HAVING and conditions over the aggregation included:
+// over a key, an aggregate or an alias the arithmetic is never computed, so it never overflows.
+TEST(BinderTest, HavingMovesConstantsLikeDuckDb) {
+  const Catalog catalog = MakeCatalog();
+  struct Case {
+    std::string_view sql;
+    std::string_view text;  // a part of EXPLAIN
+  };
+  for (const Case& c : {
+           Case{.sql = "SELECT i16 FROM t GROUP BY i16 HAVING i16 + 30000 > 5",
+                .text = "Filter i16 > -29995\n"},
+           Case{.sql = "SELECT i16, MIN(i16) FROM t GROUP BY i16 HAVING MIN(i16) + 30000 > 5",
+                .text = "Filter \"min(i16)\" > -29995\n"},
+           Case{.sql = "SELECT i16, COUNT(*) AS n FROM t GROUP BY i16 HAVING n * 2 = 3",
+                .text = "Filter FALSE\n"},
+           Case{.sql = "SELECT i16 FROM t GROUP BY i16 HAVING 30000 - i16 < 20000",
+                .text = "Filter i16 > 10000\n"},
+           Case{.sql = "SELECT i16, CASE WHEN i16 + 30000 > 5 THEN 1 END FROM t GROUP BY i16",
+                .text = "Compute CASE  WHEN (((i16 + 30000) > 5)) THEN (1) ELSE NULL END"},
+       }) {
+    auto plan = BindSql(c.sql, catalog);
+    ASSERT_TRUE(plan.ok()) << c.sql << ": " << plan.status().ToString();
+    const std::string explain = Explain(*plan);
+    EXPECT_NE(explain.find(c.text), std::string::npos) << c.sql << "\n" << explain;
+    EXPECT_EQ(explain.find("(i16 + 30000)\n"), std::string::npos)
+        << "no addition computed: " << c.sql << "\n"
+        << explain;
+  }
+}
+
 // The sum rewrite follows DuckDB: only without GROUP BY, for SUM(other + c) whatever `other` is
 // (SUM(other) is rewritten again when it can be), counting `other` without its + c layers.
 TEST(BinderTest, SumRewriteScopeLikeDuckDb) {
