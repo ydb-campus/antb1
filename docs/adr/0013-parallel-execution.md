@@ -95,7 +95,11 @@ Proposed
     DuckDB, and checks that the output is byte-for-byte equal to 1 thread over parts of the fixtures.
   - The fixtures gain multi-row-group files so that parts exist.
   - ThreadSanitizer (`pixi run tsan`) covers these tests.
-  - This adds threads to tests, so it needs the maintainer's approval (AGENTS.md).
+  - The label is part of the regular `pixi run test` and `pixi run check`, with a fixed count of 4 threads, fixed
+    seeds and no timing assertions. `pixi run tsan` (nightly, advisory) covers it as well. The maintainer approved
+    these threads in tests (AGENTS.md asks before adding them) on 2026-09-29. The preset and task changes this needs
+    (`CMakePresets.json`, `pixi.toml`) are protected paths and come for approval with the PR that adds the thread
+    pool.
 - **ADR 0003** moves to Accepted for parallelism once this ADR is accepted. ADRs 0006 and 0010, and architecture.md's
   "one thread" statements, are updated in the PRs that change them.
 
