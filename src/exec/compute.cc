@@ -1,5 +1,6 @@
 #include "antb1/exec/compute.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -20,6 +21,7 @@
 #include <arrow/compute/exec.h>
 
 #include "antb1/common/int128.h"
+#include "antb1/exec/filter.h"
 #include "antb1/plan/literal.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
@@ -342,6 +344,158 @@ struct Evaluator {
                                                     : result.status();
     }
     return result->make_array();
+  }
+
+  // The predicate over its operands' values (operand i is column i of a batch of them).
+  arrow::Result<ArrayPtr> Evaluate(const plan::PredicateExpr& predicate,
+                                   const plan::Expr& /*e*/) const {
+    arrow::FieldVector fields;
+    arrow::ArrayVector columns;
+    for (const plan::ExprPtr& operand : predicate.operands) {
+      ARROW_ASSIGN_OR_RAISE(ArrayPtr values, (*this)(*operand));
+      fields.push_back(arrow::field("o" + std::to_string(fields.size()), values->type()));
+      columns.push_back(std::move(values));
+    }
+    const auto schema = arrow::schema(std::move(fields));
+    const auto operands = arrow::RecordBatch::Make(schema, batch.num_rows(), std::move(columns));
+    ARROW_ASSIGN_OR_RAISE(const auto evaluator,
+                          PredicateEvaluator::Make(predicate.predicate, *schema));
+    ARROW_ASSIGN_OR_RAISE(const arrow::Datum result,
+                          evaluator.Evaluate(*operands, pool, /*kleene=*/true));
+    if (result.is_scalar()) {
+      return arrow::MakeArrayFromScalar(*result.scalar(), batch.num_rows(), pool);
+    }
+    return result.make_array();
+  }
+
+  // AND and OR in three-valued logic (Arrow's _kleene kernels), NOT with NULL for NULL. As in
+  // DuckDB, an argument is computed only for the rows the earlier ones left undecided (AND: not
+  // false, OR: not true), so `x > 100 OR x * x > 0` never computes x * x where x > 100.
+  arrow::Result<ArrayPtr> Evaluate(const plan::BoolExpr& boolean, const plan::Expr& /*e*/) const {
+    if (boolean.args.empty()) {
+      return arrow::Status::Invalid("boolean expression without arguments");
+    }
+    ARROW_ASSIGN_OR_RAISE(ArrayPtr result, (*this)(*boolean.args[0]));
+    if (boolean.op == plan::BoolOp::kNot) {
+      ARROW_ASSIGN_OR_RAISE(const arrow::Datum inverted,
+                            arrow::compute::CallFunction("invert", {result}, ctx));
+      return inverted.make_array();
+    }
+    const bool is_and = boolean.op == plan::BoolOp::kAnd;
+    const std::string function = is_and ? "and_kleene" : "or_kleene";
+    ARROW_ASSIGN_OR_RAISE(const ArrayPtr unknown,
+                          arrow::MakeArrayOfNull(arrow::boolean(), batch.num_rows(), pool));
+    for (std::size_t i = 1; i < boolean.args.size(); ++i) {
+      // Undecided: AND true or NULL so far, OR false or NULL.
+      ARROW_ASSIGN_OR_RAISE(
+          arrow::Datum open,
+          arrow::compute::CallFunction("coalesce", {result, arrow::BooleanScalar(is_and)}, ctx));
+      if (!is_and) {
+        ARROW_ASSIGN_OR_RAISE(open, arrow::compute::CallFunction("invert", {open}, ctx));
+      }
+      const ArrayPtr open_rows = open.make_array();
+      ARROW_ASSIGN_OR_RAISE(
+          const ArrayPtr compact,
+          EvaluateSelected(*boolean.args[i], static_cast<const arrow::BooleanArray&>(*open_rows),
+                           arrow::boolean()));
+      // Decided rows get NULL, which the decided side absorbs (false AND NULL, true OR NULL).
+      ARROW_ASSIGN_OR_RAISE(const ArrayPtr next, Scatter(unknown, open_rows, compact));
+      ARROW_ASSIGN_OR_RAISE(const arrow::Datum both,
+                            arrow::compute::CallFunction(function, {result, next}, ctx));
+      result = both.make_array();
+    }
+    return result;
+  }
+
+  // The values of `expr` in the rows `mask` (no NULLs) selects, in row order; only those rows are
+  // computed, so an expression never fails on a row it does not answer (as in DuckDB's CASE).
+  arrow::Result<ArrayPtr> EvaluateSelected(const plan::Expr& expr, const arrow::BooleanArray& mask,
+                                           const std::shared_ptr<arrow::DataType>& type) const {
+    const int64_t selected = mask.true_count();
+    if (selected == batch.num_rows()) {
+      ARROW_ASSIGN_OR_RAISE(ArrayPtr values, (*this)(expr));
+      return CastTo(values, type, ctx);
+    }
+    if (selected == 0) {
+      return arrow::MakeArrayOfNull(type, 0, pool);
+    }
+    // Only the columns the expression reads are filtered; the others are NULL placeholders.
+    std::vector<int> reads;
+    plan::CollectColumns(expr, reads);
+    arrow::ArrayVector columns;
+    for (int i = 0; i < batch.num_columns(); ++i) {
+      if (std::ranges::find(reads, i) == reads.end()) {
+        ARROW_ASSIGN_OR_RAISE(auto placeholder,
+                              arrow::MakeArrayOfNull(batch.column(i)->type(), selected, pool));
+        columns.push_back(std::move(placeholder));
+        continue;
+      }
+      ARROW_ASSIGN_OR_RAISE(const arrow::Datum rows,
+                            arrow::compute::Filter(batch.column(i), arrow::Datum(mask.Slice(0)),
+                                                   arrow::compute::FilterOptions::Defaults(), ctx));
+      columns.push_back(rows.make_array());
+    }
+    const auto rows = arrow::RecordBatch::Make(batch.schema(), selected, std::move(columns));
+    ARROW_ASSIGN_OR_RAISE(ArrayPtr values,
+                          (Evaluator{.batch = *rows, .pool = pool, .ctx = ctx})(expr));
+    return CastTo(values, type, ctx);
+  }
+
+  // `values` (one per true row of `mask`) put at those rows of `into`.
+  arrow::Result<ArrayPtr> Scatter(const ArrayPtr& into, const ArrayPtr& mask,
+                                  const ArrayPtr& values) const {
+    if (values->length() == 0) {
+      return into;
+    }
+    ARROW_ASSIGN_OR_RAISE(
+        const arrow::Datum out,
+        arrow::compute::CallFunction("replace_with_mask", {into, mask, values}, ctx));
+    return out.make_array();
+  }
+
+  // CASE: branch by branch over the rows no earlier branch took, each WHEN computed only for those
+  // rows and each THEN only for the rows it answers; a NULL condition does not take a row.
+  arrow::Result<ArrayPtr> Evaluate(const plan::CaseExpr& c, const plan::Expr& e) const {
+    if (c.whens.size() != c.thens.size()) {
+      return arrow::Status::Invalid("CASE with ", c.whens.size(), " conditions and ",
+                                    c.thens.size(), " values");
+    }
+    const auto type = plan::ToArrow(e.type);
+    const int64_t n = batch.num_rows();
+    ARROW_ASSIGN_OR_RAISE(ArrayPtr result, arrow::MakeArrayOfNull(type, n, pool));
+    ARROW_ASSIGN_OR_RAISE(ArrayPtr remaining,
+                          arrow::MakeArrayFromScalar(arrow::BooleanScalar(true), n, pool));
+    ARROW_ASSIGN_OR_RAISE(const ArrayPtr no_condition,
+                          arrow::MakeArrayOfNull(arrow::boolean(), n, pool));
+    for (std::size_t i = 0; i < c.whens.size(); ++i) {
+      const auto& open = static_cast<const arrow::BooleanArray&>(*remaining);
+      ARROW_ASSIGN_OR_RAISE(ArrayPtr compact,
+                            EvaluateSelected(*c.whens[i], open, arrow::boolean()));
+      ARROW_ASSIGN_OR_RAISE(const ArrayPtr condition, Scatter(no_condition, remaining, compact));
+      // Taken: the condition is true (NULL counts as false), on an open row.
+      ARROW_ASSIGN_OR_RAISE(
+          const arrow::Datum filled,
+          arrow::compute::CallFunction("coalesce", {condition, arrow::BooleanScalar(false)}, ctx));
+      ARROW_ASSIGN_OR_RAISE(const arrow::Datum taken,
+                            arrow::compute::CallFunction("and", {filled, remaining}, ctx));
+      const ArrayPtr taken_rows = taken.make_array();
+      ARROW_ASSIGN_OR_RAISE(
+          ArrayPtr values,
+          EvaluateSelected(*c.thens[i], static_cast<const arrow::BooleanArray&>(*taken_rows),
+                           type));
+      ARROW_ASSIGN_OR_RAISE(result, Scatter(result, taken_rows, values));
+      ARROW_ASSIGN_OR_RAISE(const arrow::Datum rest,
+                            arrow::compute::CallFunction("and_not", {remaining, taken_rows}, ctx));
+      remaining = rest.make_array();
+    }
+    if (c.otherwise != nullptr) {
+      ARROW_ASSIGN_OR_RAISE(
+          ArrayPtr values,
+          EvaluateSelected(*c.otherwise, static_cast<const arrow::BooleanArray&>(*remaining),
+                           type));
+      ARROW_ASSIGN_OR_RAISE(result, Scatter(result, remaining, values));
+    }
+    return result;
   }
 };
 

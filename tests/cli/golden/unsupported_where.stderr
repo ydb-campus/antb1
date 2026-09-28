@@ -1,4 +1,4 @@
-antb1: unsupported error: OR is not supported; see docs/sql-subset.md
-  at line 2, column 20
-  WHERE IsMobile = 1 OR IsRefresh = 1
-                     ^^
+antb1: unsupported error: IS NULL is not supported; see docs/sql-subset.md
+  at line 2, column 33
+  WHERE IsMobile = 1 OR IsRefresh IS NULL
+                                  ^^

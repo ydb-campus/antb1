@@ -142,6 +142,8 @@ std::optional<TypeOrder> OrderFor(plan::LogicalType type) {
       return TypeOrder{.compare = &CompareDouble, .prefix = &DoublePrefix, .exact = true};
     case plan::LogicalType::kVarchar:
       return TypeOrder{.compare = &CompareBinary, .prefix = &BinaryPrefix, .exact = false};
+    case plan::LogicalType::kBoolean:  // never a sort key
+      break;
   }
   return std::nullopt;
 }

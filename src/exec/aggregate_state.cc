@@ -478,6 +478,7 @@ arrow::Result<std::unique_ptr<AggregateState>> SumState(bool average, plan::Logi
       return std::make_unique<DoubleSumState>(average, pool);
     case plan::LogicalType::kVarchar:
     case plan::LogicalType::kDate:
+    case plan::LogicalType::kBoolean:
       break;
   }
   return arrow::Status::Invalid(average ? "AVG" : "SUM", " of ", plan::ToString(input));

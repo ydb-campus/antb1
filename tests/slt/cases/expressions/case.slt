@@ -1,0 +1,138 @@
+# CASE (docs/sql-subset.md): the first branch whose condition is true (NULL is not), else ELSE or
+# NULL; typed as DuckDB types it (an integer literal takes the others' type when it fits, a string
+# literal takes any type); a value is computed only for the rows its branch answers.
+
+query IT rowsort
+SELECT i16, CASE WHEN i16 > 0 THEN 'pos' WHEN i16 < 0 THEN 'neg' END FROM edge
+----
+-1	neg
+-100	neg
+-12345	neg
+-32768	neg
+0	NULL
+1	pos
+100	pos
+12345	pos
+32767	pos
+7	pos
+NULL	NULL
+NULL	NULL
+
+query II rowsort
+SELECT i16, CASE WHEN i16 < 100 THEN i16 * 300 ELSE 0 END FROM edge WHERE i16 > -100
+----
+-1	-300
+0	0
+1	300
+100	0
+12345	0
+32767	0
+7	2100
+
+query II rowsort
+SELECT i16, CASE WHEN i16 >= -100 AND i16 <= 100 THEN 1 END FROM edge
+----
+-1	1
+-100	1
+-12345	NULL
+-32768	NULL
+0	1
+1	1
+100	1
+12345	NULL
+32767	NULL
+7	1
+NULL	NULL
+NULL	NULL
+
+query III rowsort
+SELECT id, CASE i32 WHEN 1 THEN u16 WHEN -1 THEN i16 ELSE 0 END, CASE id WHEN 1 THEN 10 WHEN 2 THEN 3000000000 END FROM edge
+----
+0	0	NULL
+1	0	10
+10	0	NULL
+11	0	NULL
+2	0	3000000000
+3	-1	NULL
+4	15887	NULL
+5	0	NULL
+6	0	NULL
+7	0	NULL
+8	0	NULL
+9	0	NULL
+
+query IR rowsort
+SELECT id, CASE WHEN id > 2 THEN d ELSE i64 END FROM edge
+----
+0	-9223372036854775808
+1	9223372036854775808
+10	922337203685477632
+11	-0.3333333333333333
+2	0
+3	0.6666666666666666
+4	0.1
+5	NULL
+6	123456789.125
+7	-9007199254740992
+8	9.99999993e-10
+9	NULL
+
+query IT rowsort
+SELECT id, CASE WHEN u LIKE '%a%' OR NOT (id > 3) THEN s ELSE 'none' END FROM edge
+----
+0	(empty)
+1	a
+10	none
+11	none
+2	tab\there
+3	line\nbreak
+4	back\\slash
+5	none
+6	\x20leading space
+7	none
+8	none
+9	none
+
+query TI rowsort
+SELECT CASE WHEN i16 = 0 AND i32 = 0 THEN u ELSE '' END AS k, COUNT(*) FROM edge GROUP BY k
+----
+(empty)	11
+tab\there	1
+
+query IT rowsort
+SELECT CounterID, CASE WHEN SUM(RegionID) > 40000 THEN 'big' WHEN COUNT(*) > 10 THEN 'many' END AS size FROM hits_like WHERE CounterID < 10000 GROUP BY CounterID HAVING size = 'many' OR size = 'big'
+----
+1062	big
+2062	big
+3062	big
+4062	big
+5062	big
+6062	big
+62	big
+7062	big
+8062	big
+9062	big
+
+query TIR nosort
+SELECT CASE WHEN IsMobile = 1 AND OS > 100 THEN 'mobile' WHEN OS IN (1, 2, 3) THEN 'low' ELSE 'other' END AS kind, COUNT(*) AS n, AVG(ResolutionWidth) FROM hits_like GROUP BY kind ORDER BY n DESC, kind
+----
+other	8896	1392.6285971223022
+mobile	832	1445.7908653846155
+low	272	1415.4411764705883
+
+query TII nosort
+SELECT MIN(URL), CASE WHEN IsMobile = 0 THEN OS END AS o, COUNT(*) AS n FROM hits_like GROUP BY o ORDER BY n DESC, o NULLS FIRST LIMIT 5 OFFSET 2
+----
+(empty)	77	54
+https://www.example.org/alpha/46696?q=beta	50	53
+https://www.example.org/alpha/37936?q=дорога	69	53
+https://www.example.org/beta/12561	110	52
+(empty)	10	50
+
+query TTI nosort
+SELECT MIN(CASE WHEN CounterID < 100 THEN EventDate ELSE '2013-07-20' END), MAX(CASE WHEN CounterID < 100 THEN EventDate ELSE '2013-07-20' END), COUNT(DISTINCT CASE WHEN RegionID > 200 THEN EventDate END) FROM hits_like
+----
+2013-07-01	2013-07-31	31
+
+statement error
+SELECT CASE WHEN i16 = 1 THEN u ELSE 1 END FROM edge

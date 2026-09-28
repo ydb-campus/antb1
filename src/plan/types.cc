@@ -25,6 +25,8 @@ std::string_view ToString(LogicalType type) {
       return "VARCHAR";
     case LogicalType::kDate:
       return "DATE";
+    case LogicalType::kBoolean:
+      return "BOOLEAN";
   }
   return "?";
 }
@@ -47,6 +49,8 @@ std::shared_ptr<arrow::DataType> ToArrow(LogicalType type) {
       return arrow::binary();
     case LogicalType::kDate:
       return arrow::date32();
+    case LogicalType::kBoolean:
+      return arrow::boolean();
   }
   return nullptr;
 }

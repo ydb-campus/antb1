@@ -287,7 +287,8 @@ TEST_F(SessionTest, FloatColumnsCompareLikeDuckDb) {
   // (divergence D11), and so is comparing them with another expression. MIN and MAX keep FLOAT,
   // so a HAVING alias of one compares in FLOAT.
   for (const char* sql : {"SELECT f + 1 FROM floats", "SELECT -f FROM floats",
-                          "SELECT COUNT(*) FROM floats WHERE f < d"}) {
+                          "SELECT COUNT(*) FROM floats WHERE f < d",
+                          "SELECT CASE WHEN f > 0 THEN f END FROM floats"}) {
     auto result = session->Execute(sql);
     const auto detail = plan::GetSqlError(result.status());
     ASSERT_NE(detail, nullptr) << sql << ": " << result.status().ToString();

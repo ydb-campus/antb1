@@ -19,6 +19,9 @@ enum class LogicalType : std::uint8_t {
   kDouble,     // float64 (float32 columns are widened)
   kVarchar,    // bytes; compared byte-wise (unannotated Parquet BYTE_ARRAY included)
   kDate,       // date32
+  // A condition's value (bool): only inside a query (a CASE WHEN or a WHERE/HAVING condition that
+  // is computed), never a column of a table or of a result.
+  kBoolean,
 };
 
 std::string_view ToString(LogicalType type);

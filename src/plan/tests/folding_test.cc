@@ -112,6 +112,7 @@ bool Accepts(const FoldedComparison& folded, Int128 v) {
     case Predicate::Kind::kCompareColumns:
     case Predicate::Kind::kIn:
     case Predicate::Kind::kNotIn:
+    case Predicate::Kind::kIsTrue:
       return false;
     case Predicate::Kind::kCompare: {
       int cmp = 0;

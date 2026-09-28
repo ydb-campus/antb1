@@ -549,6 +549,12 @@ class Builder {
       }
     }
 
+    comparable_.clear();
+    for (const auto* c : cols) {
+      if (CanLiteral(c->kind)) {
+        comparable_.push_back(c);
+      }
+    }
     tokens_.clear();
     used_ = FeatureSet{};
     order_aliases_.clear();
@@ -567,7 +573,7 @@ class Builder {
       used_.Add(Feature::kTableName);
       tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = t.name});
     }
-    Where(cols);
+    Where();
     // GROUP BY a constant's position alone still groups: no row over no input rows.
     const bool constant_group =
         shape == Shape::kAggregates && keys.empty() && allowed_.Has(Feature::kGroupBy) &&
@@ -676,7 +682,9 @@ class Builder {
       } else if (shape == Shape::kColumns) {
         const GenColumn& c = *rng_.Pick(cols);
         std::optional<bool> exact;
-        if (c.kind == ValueKind::kVarchar && rng_.Percent(20)) {
+        if (rng_.Percent(8)) {
+          exact = Case(c);
+        } else if (c.kind == ValueKind::kVarchar && rng_.Percent(20)) {
           if (StringFunction(c, rng_.Percent(50)).has_value()) {
             exact = true;
           }
@@ -750,11 +758,16 @@ class Builder {
       if (agg == Agg::kCountDistinct) {
         Keyword("DISTINCT");
       }
-      if (arithmetic && arg->kind == ValueKind::kVarchar) {
-        const std::optional<ValueKind> kind = StringFunction(*arg, rng_.Percent(50));
-        exact = kind.has_value() ? std::optional(true) : std::nullopt;
-      } else if (arithmetic) {
-        exact = Arithmetic(*arg);
+      if (arithmetic && rng_.Percent(30)) {
+        exact = Case(*arg);
+      }
+      if (arithmetic && !exact.has_value()) {
+        if (arg->kind == ValueKind::kVarchar) {
+          const std::optional<ValueKind> kind = StringFunction(*arg, rng_.Percent(50));
+          exact = kind.has_value() ? std::optional(true) : std::nullopt;
+        } else {
+          exact = Arithmetic(*arg);
+        }
       }
       if (!exact.has_value()) {
         Column(*arg);
@@ -908,11 +921,7 @@ class Builder {
     }
     used_.Add(Feature::kHaving);
     Keyword("HAVING");
-    const std::size_t terms = 1 + rng_.Below(2);
-    for (std::size_t i = 0; i < terms; ++i) {
-      if (i > 0) {
-        Keyword("AND");
-      }
+    const auto leaf = [&] {
       const Operand& operand = operands[rng_.Below(operands.size())];
       const auto write_operand = [&] {
         if (operand.key != nullptr) {
@@ -927,12 +936,12 @@ class Builder {
           rng_.Percent(25)) {
         write_operand();
         Like(operand.values);
-        continue;
+        return;
       }
       if (allowed_.Has(Feature::kIn) && rng_.Percent(15)) {
         write_operand();
         In(operand.values);
-        continue;
+        return;
       }
       const std::string_view op = rng_.Pick(kOps);
       Literal lit = MakeLiteral(operand.values);
@@ -947,8 +956,52 @@ class Builder {
         Symbol(op);
         tokens_.insert(tokens_.end(), lit.tokens.begin(), lit.tokens.end());
       }
+    };
+    const std::size_t terms = 1 + rng_.Below(2);
+    for (std::size_t i = 0; i < terms; ++i) {
+      if (i > 0) {
+        Keyword("AND");
+      }
+      Compound(leaf);
     }
     return true;
+  }
+
+  // A condition of `leaf`s: now and then a parenthesized OR/AND mix of two or three of them, or
+  // NOT of one (kBooleanExpressions), else one leaf.
+  template <class Leaf>
+  void Compound(const Leaf& leaf) {
+    if (!allowed_.Has(Feature::kBooleanExpressions) || !rng_.Percent(25)) {
+      leaf();
+      return;
+    }
+    used_.Add(Feature::kBooleanExpressions);
+    const auto maybe_not = [&] {
+      if (rng_.Percent(20)) {
+        Keyword("NOT");
+        Symbol("(");
+        leaf();
+        Symbol(")");
+      } else {
+        leaf();
+      }
+    };
+    if (rng_.Percent(30)) {
+      Keyword("NOT");
+      Symbol("(");
+      leaf();
+      Symbol(")");
+      return;
+    }
+    Symbol("(");
+    const std::size_t n = 2 + rng_.Below(2);
+    for (std::size_t j = 0; j < n; ++j) {
+      if (j > 0) {
+        Keyword(rng_.Percent(60) ? "OR" : "AND");
+      }
+      maybe_not();
+    }
+    Symbol(")");
   }
 
   // OFFSET m, after (or before) the LIMIT. Returns whether it wrote one.
@@ -967,14 +1020,8 @@ class Builder {
     return true;
   }
 
-  void Where(const std::vector<const GenColumn*>& cols) {
-    std::vector<const GenColumn*> comparable;
-    for (const auto* c : cols) {
-      if (CanLiteral(c->kind)) {
-        comparable.push_back(c);
-      }
-    }
-    if (!allowed_.Has(Feature::kWhere) || comparable.empty() || !rng_.Percent(45)) {
+  void Where() {
+    if (!allowed_.Has(Feature::kWhere) || comparable_.empty() || !rng_.Percent(45)) {
       return;
     }
     used_.Add(Feature::kWhere);
@@ -988,16 +1035,29 @@ class Builder {
       if (i > 0) {
         Keyword("AND");
       }
-      const GenColumn& c = *rng_.Pick(comparable);
+      Condition();
+    }
+  }
+
+  // A condition over the table: WHERE's forms, or a compound of them.
+  void Condition() {
+    Compound([this] { WhereLeaf(); });
+  }
+
+  // column <op> literal (in either order, with arithmetic or strlen on the column now and then),
+  // [NOT] LIKE or [NOT] IN over a column comparable_ holds.
+  void WhereLeaf() {
+    {
+      const GenColumn& c = *rng_.Pick(comparable_);
       if (c.kind == ValueKind::kVarchar && allowed_.Has(Feature::kLike) && rng_.Percent(30)) {
         Column(c);
         Like(c);
-        continue;
+        return;
       }
       if (allowed_.Has(Feature::kIn) && rng_.Percent(15)) {
         Column(c);
         In(c);
-        continue;
+        return;
       }
       const std::string_view op = rng_.Pick(kOps);
       if (c.kind == ValueKind::kVarchar && rng_.Percent(10) &&
@@ -1005,7 +1065,7 @@ class Builder {
         used_.Add(Feature::kIntegerLiteral);
         Symbol(op);
         tokens_.push_back({.kind = Token::Kind::kLiteral, .text = std::to_string(rng_.Below(25))});
-        continue;
+        return;
       }
       if (IsNumeric(c.kind) && rng_.Percent(15)) {
         if (const std::optional<bool> exact = Arithmetic(c)) {
@@ -1014,7 +1074,7 @@ class Builder {
           used_.Add(lit.features);
           Symbol(op);
           tokens_.insert(tokens_.end(), lit.tokens.begin(), lit.tokens.end());
-          continue;
+          return;
         }
       }
       Literal lit = MakeLiteral(c);
@@ -1212,6 +1272,71 @@ class Builder {
     tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.name});
   }
 
+  // CASE WHEN <condition> THEN c [WHEN <condition> THEN c or a literal] [ELSE c or a literal] END
+  // over a column: the values share c's kind (a literal of it, as DuckDB types CASE). Returns
+  // whether the result is exact (not DOUBLE), or std::nullopt (nothing written).
+  std::optional<bool> Case(const GenColumn& c) {
+    if (!allowed_.Has(Feature::kCase) || comparable_.empty()) {
+      return std::nullopt;
+    }
+    used_.Add(Feature::kCase);
+    const auto value = [&](bool column) {
+      if (column || !CaseLiteral(c)) {
+        Column(c);
+      }
+    };
+    Keyword("CASE");
+    const std::size_t branches = 1 + rng_.Below(2);
+    for (std::size_t b = 0; b < branches; ++b) {
+      Keyword("WHEN");
+      Condition();
+      Keyword("THEN");
+      value(b == 0 || rng_.Percent(50));
+    }
+    if (rng_.Percent(70)) {
+      Keyword("ELSE");
+      value(rng_.Percent(30));
+    }
+    Keyword("END");
+    return c.kind != ValueKind::kDouble;
+  }
+
+  // A literal of the column's kind for a CASE value; false if none is allowed (nothing written).
+  bool CaseLiteral(const GenColumn& c) {
+    const auto emit = [&](std::string text, Feature feature) {
+      if (!allowed_.Has(feature)) {
+        return false;
+      }
+      used_.Add(feature);
+      tokens_.push_back({.kind = Token::Kind::kLiteral, .text = std::move(text)});
+      return true;
+    };
+    switch (c.kind) {
+      case ValueKind::kInteger: {
+        static constexpr auto kValues = std::to_array<std::string_view>({"0", "7", "100000"});
+        if (rng_.Percent(20) && allowed_.Has(Feature::kNegativeLiteral) &&
+            allowed_.Has(Feature::kIntegerLiteral)) {
+          used_.Add(Feature::kNegativeLiteral);
+          Symbol("-");
+          return emit("1", Feature::kIntegerLiteral);
+        }
+        return emit(std::string(rng_.Pick(kValues)), Feature::kIntegerLiteral);
+      }
+      case ValueKind::kDouble:
+        return rng_.Percent(50) ? emit("0.5", Feature::kDecimalLiteral)
+                                : emit("2", Feature::kIntegerLiteral);
+      case ValueKind::kVarchar:
+        return emit(rng_.Percent(50) ? "''" : "'k'", Feature::kStringLiteral);
+      case ValueKind::kDate:
+        if (rng_.Percent(50) && allowed_.Has(Feature::kDateLiteral)) {
+          Keyword("DATE");
+          return emit("'2013-07-15'", Feature::kDateLiteral);
+        }
+        return emit("'2013-07-16'", Feature::kStringLiteral);
+    }
+    return false;
+  }
+
   // strlen(c) (`length`: an exact BIGINT) or regexp_replace(c, 'pattern', 'replacement') of a
   // VARCHAR column. Returns the result's kind, or std::nullopt (nothing written).
   std::optional<ValueKind> StringFunction(const GenColumn& c, bool length) {
@@ -1377,7 +1502,8 @@ class Builder {
   FeatureSet allowed_;
   std::vector<Token> tokens_;
   FeatureSet used_;
-  std::vector<std::string> order_aliases_;  // select aliases of items with I or T values
+  std::vector<const GenColumn*> comparable_;  // the query's columns WHERE can compare
+  std::vector<std::string> order_aliases_;    // select aliases of items with I or T values
   struct AggregateAlias {
     std::string alias;
     std::pair<Agg, const GenColumn*> call;

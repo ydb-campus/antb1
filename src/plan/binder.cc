@@ -130,23 +130,149 @@ std::string LiteralName(const sql::Literal& lit) {
 
 std::string ResultName(const sql::AggregateCall& call);
 
-// DuckDB's name of an expression of the binder's subset: (a + 1), -(a), sum((a + 1)).
+std::string ExprName(const sql::Expr& expr);
+
+// CASE  WHEN ((a = 1)) THEN (b) ELSE NULL END, as DuckDB names it; the simple form as the searched
+// one.
+std::string CaseName(const sql::CaseExpr& c) {
+  std::string out = "CASE ";
+  for (const sql::CaseBranch& branch : c.branches) {
+    const std::string when = c.operand.has_value() ? std::format("({} = {})", ExprName(**c.operand),
+                                                                 ExprName(*branch.when))
+                                                   : ExprName(*branch.when);
+    out += std::format(" WHEN ({}) THEN ({})", when, ExprName(*branch.then));
+  }
+  return out + " ELSE " + (c.otherwise.has_value() ? ExprName(**c.otherwise) : "NULL") + " END";
+}
+
+bool IsComparison(sql::BinaryOp op) {
+  switch (op) {
+    case sql::BinaryOp::kEq:
+    case sql::BinaryOp::kNe:
+    case sql::BinaryOp::kLt:
+    case sql::BinaryOp::kLe:
+    case sql::BinaryOp::kGt:
+    case sql::BinaryOp::kGe:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// The operator as DuckDB names it (<> is !=).
+std::string_view OperatorName(sql::BinaryOp op) {
+  return op == sql::BinaryOp::kNe ? "!=" : sql::ToString(op);
+}
+
+// The comparison that NOT of `op` is (DuckDB names NOT (a < b) as (a >= b)).
+sql::BinaryOp Negated(sql::BinaryOp op) {
+  switch (op) {
+    case sql::BinaryOp::kEq:
+      return sql::BinaryOp::kNe;
+    case sql::BinaryOp::kNe:
+      return sql::BinaryOp::kEq;
+    case sql::BinaryOp::kLt:
+      return sql::BinaryOp::kGe;
+    case sql::BinaryOp::kLe:
+      return sql::BinaryOp::kGt;
+    case sql::BinaryOp::kGt:
+      return sql::BinaryOp::kLe;
+    case sql::BinaryOp::kGe:
+      return sql::BinaryOp::kLt;
+    default:
+      return op;
+  }
+}
+
+std::string InName(const sql::InExpr& in, bool negated) {
+  std::string values;
+  for (const sql::Expr& value : in.list) {
+    values += (values.empty() ? "" : ", ") + ExprName(value);
+  }
+  return std::format("({} {}IN ({}))", ExprName(*in.operand), negated ? "NOT " : "", values);
+}
+
+// The comparison `expr` is once DuckDB folds its NOTs in (each NOT flips it), or std::nullopt when
+// no comparison is under the NOTs.
+struct ComparisonUnderNots {
+  const sql::Expr* left;
+  sql::BinaryOp op;
+  const sql::Expr* right;
+};
+std::optional<ComparisonUnderNots> FoldNots(const sql::Expr& expr) {
+  if (const auto* binary = std::get_if<sql::BinaryExpr>(&expr);
+      binary != nullptr && IsComparison(binary->op)) {
+    return ComparisonUnderNots{.left = &*binary->left, .op = binary->op, .right = &*binary->right};
+  }
+  if (const auto* unary = std::get_if<sql::UnaryExpr>(&expr);
+      unary != nullptr && unary->op == sql::UnaryOp::kNot) {
+    if (auto inner = FoldNots(*unary->operand)) {
+      inner->op = Negated(inner->op);
+      return inner;
+    }
+  }
+  return std::nullopt;
+}
+
+// NOT of `operand` as DuckDB names it: over a comparison (through any NOTs) the flipped
+// comparison, over IN a NOT IN, else (NOT x).
+std::string NotName(const sql::Expr& operand) {
+  if (const auto folded = FoldNots(operand)) {
+    return std::format("({} {} {})", ExprName(*folded->left), OperatorName(Negated(folded->op)),
+                       ExprName(*folded->right));
+  }
+  if (const auto* in = std::get_if<sql::InExpr>(&operand); in != nullptr && !in->negated) {
+    return InName(*in, /*negated=*/true);
+  }
+  return "(NOT " + ExprName(operand) + ")";
+}
+
+// DuckDB's name of an expression of the binder's subset: (a + 1), -(a), sum((a + 1)); conditions
+// as ((a = 1) OR (b != 2) OR (c IN (1, 2))).
 std::string ExprName(const sql::Expr& expr) {
   if (const auto* ref = std::get_if<sql::ColumnRef>(&expr)) {
     return ArgumentName(ref->name);
   }
   if (const auto* lit = std::get_if<sql::Literal>(&expr)) {
-    return LiteralName(*lit);
+    return lit->kind == sql::Literal::Kind::kDate ? "CAST('" + lit->text + "' AS \"DATE\")"
+                                                  : LiteralName(*lit);
   }
   if (const auto* call = std::get_if<sql::AggregateCall>(&expr)) {
     return ResultName(*call);
   }
+  if (const auto* binary = std::get_if<sql::BinaryExpr>(&expr);
+      binary != nullptr &&
+      (binary->op == sql::BinaryOp::kAnd || binary->op == sql::BinaryOp::kOr)) {
+    // A chain of one operator is one list: ((a) OR (b) OR (c)).
+    std::vector<const sql::Expr*> chain;
+    std::vector<const sql::Expr*> pending{&expr};
+    while (!pending.empty()) {
+      const sql::Expr* e = pending.back();
+      pending.pop_back();
+      const auto* b = std::get_if<sql::BinaryExpr>(e);
+      if (b != nullptr && b->op == binary->op) {
+        pending.push_back(&*b->right);
+        pending.push_back(&*b->left);
+      } else {
+        chain.push_back(e);
+      }
+    }
+    std::string out;
+    for (const sql::Expr* e : chain) {
+      out += (out.empty() ? "(" : std::format(" {} ", sql::ToString(binary->op))) + ExprName(*e);
+    }
+    return out + ")";
+  }
   if (const auto* binary = std::get_if<sql::BinaryExpr>(&expr)) {
-    return std::format("({} {} {})", ExprName(*binary->left), sql::ToString(binary->op),
+    return std::format("({} {} {})", ExprName(*binary->left), OperatorName(binary->op),
                        ExprName(*binary->right));
   }
   if (const auto* unary = std::get_if<sql::UnaryExpr>(&expr)) {
-    return (unary->op == sql::UnaryOp::kNot ? "(NOT " : "-(") + ExprName(*unary->operand) + ")";
+    return unary->op == sql::UnaryOp::kNot ? NotName(*unary->operand)
+                                           : "-(" + ExprName(*unary->operand) + ")";
+  }
+  if (const auto* in = std::get_if<sql::InExpr>(&expr)) {
+    return InName(*in, in->negated);
   }
   if (const auto* call = std::get_if<sql::FunctionCall>(&expr)) {
     std::string args;
@@ -154,6 +280,13 @@ std::string ExprName(const sql::Expr& expr) {
       args += (args.empty() ? "" : ", ") + ExprName(arg);
     }
     return AsciiLower(call->name) + "(" + args + ")";
+  }
+  if (const auto* c = std::get_if<sql::CaseExpr>(&expr)) {
+    return CaseName(*c);
+  }
+  if (const auto* like = std::get_if<sql::LikeExpr>(&expr)) {
+    return std::format("({} {} {})", ExprName(*like->operand), like->negated ? "!~~" : "~~",
+                       ExprName(*like->pattern));
   }
   return sql::ToSql(expr);
 }
@@ -177,6 +310,9 @@ struct Rejection {
 // The first construct of a value expression, in source order, that is not a column, a literal
 // or (where allowed) an aggregate of a column.
 std::optional<Rejection> FirstUnsupported(const sql::Expr& expr);
+
+// Why a condition (WHERE, HAVING, CASE WHEN) is not one the binder answers, or std::nullopt.
+std::optional<Rejection> RejectCondition(const sql::Expr& expr, bool having);
 
 // Whether the expression reads a column (or, `aggregates`, calls an aggregate): one that does
 // neither is a constant.
@@ -216,6 +352,20 @@ bool ReadsColumn(const sql::Expr& expr, bool aggregates = false) {
   if (const auto* unary = std::get_if<sql::UnaryExpr>(&expr)) {
     return ReadsColumn(*unary->operand, aggregates);
   }
+  if (const auto* like = std::get_if<sql::LikeExpr>(&expr)) {
+    return ReadsColumn(*like->operand, aggregates) || ReadsColumn(*like->pattern, aggregates);
+  }
+  if (const auto* in = std::get_if<sql::InExpr>(&expr)) {
+    return ReadsColumn(*in->operand, aggregates);
+  }
+  if (const auto* c = std::get_if<sql::CaseExpr>(&expr)) {
+    const auto reads = [&](const sql::Expr& e) { return ReadsColumn(e, aggregates); };
+    return (c->operand.has_value() && reads(**c->operand)) ||
+           (c->otherwise.has_value() && reads(**c->otherwise)) ||
+           std::ranges::any_of(c->branches, [&](const sql::CaseBranch& b) {
+             return reads(*b.when) || reads(*b.then);
+           });
+  }
   return false;
 }
 
@@ -231,6 +381,9 @@ std::optional<Rejection> FirstUnsupportedIn(const std::vector<sql::Expr>& exprs)
 SourceSpan Prefix(SourceSpan span, std::size_t length) {
   return SourceSpan{.offset = span.offset, .length = std::min(span.length, length)};
 }
+
+constexpr const char* kConditionsOnly =
+    " is only supported in conditions (WHERE, HAVING and CASE WHEN)";
 
 struct FirstUnsupportedOf {
   std::optional<Rejection> operator()(const sql::ColumnRef& /*column*/) const {
@@ -256,7 +409,7 @@ struct FirstUnsupportedOf {
     if (unary.op == sql::UnaryOp::kNegate) {
       return FirstUnsupported(*unary.operand);
     }
-    return Rejection{.span = unary.op_span, .message = "NOT is not supported"};
+    return Rejection{.span = unary.op_span, .message = std::string("NOT") + kConditionsOnly};
   }
   std::optional<Rejection> operator()(const sql::BinaryExpr& binary) const {
     if (auto r = FirstUnsupported(*binary.left)) {
@@ -272,13 +425,13 @@ struct FirstUnsupportedOf {
       case sql::BinaryOp::kModulo:
         return FirstUnsupported(*binary.right);
       case sql::BinaryOp::kAnd:
-        message = "AND is only supported between conditions of WHERE and HAVING";
+        message = std::string("AND") + kConditionsOnly;
         break;
       case sql::BinaryOp::kOr:
-        message = "OR is not supported";
+        message = std::string("OR") + kConditionsOnly;
         break;
       default:
-        message = "comparisons are only supported in WHERE and HAVING";
+        message = "comparisons are only supported in conditions (WHERE, HAVING and CASE WHEN)";
         break;
     }
     return Rejection{.span = binary.op_span, .message = std::move(message)};
@@ -287,13 +440,13 @@ struct FirstUnsupportedOf {
     if (auto r = FirstUnsupported(*like.operand)) {
       return r;
     }
-    return Rejection{.span = like.op_span, .message = "LIKE is only supported in WHERE and HAVING"};
+    return Rejection{.span = like.op_span, .message = std::string("LIKE") + kConditionsOnly};
   }
   std::optional<Rejection> operator()(const sql::InExpr& in) const {
     if (auto r = FirstUnsupported(*in.operand)) {
       return r;
     }
-    return Rejection{.span = in.op_span, .message = "IN is only supported in WHERE and HAVING"};
+    return Rejection{.span = in.op_span, .message = std::string("IN") + kConditionsOnly};
   }
   std::optional<Rejection> operator()(const sql::FunctionCall& call) const {
     const std::optional<FunctionSpec> spec = FindFunction(call);
@@ -345,8 +498,35 @@ struct FirstUnsupportedOf {
     }
     return std::nullopt;
   }
+  // CASE: its values as value expressions, its conditions as those of HAVING (an aggregate is an
+  // operand; the binder rejects it where the scope has none); CASE x WHEN v as x = v.
   std::optional<Rejection> operator()(const sql::CaseExpr& c) const {
-    return Rejection{.span = Prefix(c.span, 4), .message = "CASE is not supported"};
+    if (c.operand.has_value()) {
+      if (auto r = FirstUnsupported(**c.operand)) {
+        return r;
+      }
+    }
+    for (const sql::CaseBranch& branch : c.branches) {
+      if (c.operand.has_value()) {
+        const sql::Expr equal(sql::BinaryExpr{.op = sql::BinaryOp::kEq,
+                                              .left = sql::Box<sql::Expr>(**c.operand),
+                                              .right = sql::Box<sql::Expr>(*branch.when),
+                                              .op_span = branch.when->span(),
+                                              .span = branch.when->span()});
+        if (auto r = RejectCondition(equal, /*having=*/true)) {
+          return r;
+        }
+      } else if (auto r = RejectCondition(*branch.when, /*having=*/true)) {
+        return r;
+      }
+      if (auto r = FirstUnsupported(*branch.then)) {
+        return r;
+      }
+    }
+    if (c.otherwise.has_value()) {
+      return FirstUnsupported(**c.otherwise);
+    }
+    return std::nullopt;
   }
   std::optional<Rejection> operator()(const sql::ExtractExpr& e) const {
     return Rejection{.span = Prefix(e.span, 7), .message = "EXTRACT is not supported"};
@@ -388,7 +568,7 @@ std::optional<Rejection> RejectCondition(const sql::Expr& expr, bool having) {
         if (auto r = RejectCondition(*binary->left, having)) {
           return r;
         }
-        return Rejection{.span = binary->op_span, .message = "OR is not supported"};
+        return RejectCondition(*binary->right, having);
       case sql::BinaryOp::kEq:
       case sql::BinaryOp::kNe:
       case sql::BinaryOp::kLt:
@@ -420,6 +600,10 @@ std::optional<Rejection> RejectCondition(const sql::Expr& expr, bool having) {
       default:
         break;
     }
+  }
+  if (const auto* unary = std::get_if<sql::UnaryExpr>(&expr);
+      unary != nullptr && unary->op == sql::UnaryOp::kNot) {
+    return RejectCondition(*unary->operand, having);
   }
   if (const auto* like = std::get_if<sql::LikeExpr>(&expr)) {
     if (auto r = FirstUnsupported(*like->operand)) {
@@ -467,10 +651,9 @@ std::optional<Rejection> RejectCondition(const sql::Expr& expr, bool having) {
       std::holds_alternative<sql::BinaryExpr>(expr) ||
       std::holds_alternative<sql::UnaryExpr>(expr)) {
     return Rejection{.span = expr.span(),
-                     .message = having ? "HAVING conditions other than comparisons (aggregate or "
-                                         "column <op> literal) are not supported"
-                                       : "predicates other than comparisons (column <op> literal) "
-                                         "are not supported"};
+                     .message =
+                         "conditions other than comparisons, [NOT] LIKE, [NOT] IN, AND, OR "
+                         "and NOT are not supported"};
   }
   return Rejection{.span = expr.span(), .message = "this condition is not supported"};
 }
@@ -760,6 +943,8 @@ arrow::Result<Predicate> BindEquality(const sql::Comparison& cmp, const BoundCol
       }
       p.constant.value = lit.text;
       return p;
+    case LogicalType::kBoolean:
+      return UnsupportedError("comparing a condition is not supported", cmp.span);
     case LogicalType::kDate: {
       if (number) {
         return mismatch("write a date as DATE 'YYYY-MM-DD'");
@@ -860,6 +1045,19 @@ bool ContainsAggregate(const sql::Expr& expr) {
   }
   if (const auto* unary = std::get_if<sql::UnaryExpr>(&expr)) {
     return ContainsAggregate(*unary->operand);
+  }
+  if (const auto* like = std::get_if<sql::LikeExpr>(&expr)) {
+    return ContainsAggregate(*like->operand);
+  }
+  if (const auto* in = std::get_if<sql::InExpr>(&expr)) {
+    return ContainsAggregate(*in->operand);
+  }
+  if (const auto* c = std::get_if<sql::CaseExpr>(&expr)) {
+    return (c->operand.has_value() && ContainsAggregate(**c->operand)) ||
+           (c->otherwise.has_value() && ContainsAggregate(**c->otherwise)) ||
+           std::ranges::any_of(c->branches, [](const sql::CaseBranch& b) {
+             return ContainsAggregate(*b.when) || ContainsAggregate(*b.then);
+           });
   }
   return false;
 }
@@ -1263,6 +1461,9 @@ class Binder {
     if (const auto* call = std::get_if<sql::FunctionCall>(&expr)) {
       return BindFunction(*call, [this](const sql::Expr& e) { return BindInput(e); });
     }
+    if (const auto* c = std::get_if<sql::CaseExpr>(&expr)) {
+      return BindCase(*c, [this](const sql::Expr& e) { return BindInput(e); }, /*input=*/true);
+    }
     return UnsupportedError("this expression is not supported", expr.span());
   }
 
@@ -1490,6 +1691,9 @@ class Binder {
     if (const auto* call = std::get_if<sql::FunctionCall>(&expr)) {
       return BindFunction(*call, [this](const sql::Expr& e) { return BindOutput(e); });
     }
+    if (const auto* c = std::get_if<sql::CaseExpr>(&expr)) {
+      return BindCase(*c, [this](const sql::Expr& e) { return BindOutput(e); }, /*input=*/false);
+    }
     return UnsupportedError("this expression is not supported", expr.span());
   }
 
@@ -1527,6 +1731,20 @@ class Binder {
   arrow::Status BindSelectExpressions();
   // A WHERE or HAVING conjunct as a predicate over the scope's columns.
   arrow::Result<Predicate> BindCondition(const sql::Expr& conjunct, bool having);
+  // BindCondition with the scope's operand binder `bind` and `column_of`, which gives an operand's
+  // column (`input`: the input scope, where constants move). `nested`: inside a boolean
+  // expression, where a folded predicate keeps its operand's column (NULL stays NULL).
+  template <class BindFn, class ColumnOf>
+  arrow::Result<Predicate> BindConditionWith(const sql::Expr& conjunct, bool input,
+                                             const BindFn& bind, const ColumnOf& column_of,
+                                             bool nested);
+  // A condition as a BOOLEAN expression in the scope `bind` binds operands in: AND, OR and NOT
+  // over PredicateExpr leaves (WHERE's forms, folded alike).
+  template <class BindFn>
+  arrow::Result<Typed> BindBool(const sql::Expr& expr, const BindFn& bind, bool input);
+  // CASE with its conditions and values bound in the scope of `bind`, typed as DuckDB types it.
+  template <class BindFn>
+  arrow::Result<Typed> BindCase(const sql::CaseExpr& c, const BindFn& bind, bool input);
   struct Moved {
     enum class Outcome : std::uint8_t { kCompare, kFalse, kNotNull };
     const sql::Expr* operand = nullptr;
@@ -1804,6 +2022,13 @@ arrow::Result<Predicate> Binder::BindCondition(const sql::Expr& conjunct, bool h
   const auto column_of = [&](const Typed& t) {
     return having ? OutputColumn(t) : InputColumn(t, /*where=*/true);
   };
+  return BindConditionWith(conjunct, /*input=*/!having, bind, column_of, /*nested=*/false);
+}
+
+template <class BindFn, class ColumnOf>
+arrow::Result<Predicate> Binder::BindConditionWith(const sql::Expr& conjunct, bool input,
+                                                   const BindFn& bind, const ColumnOf& column_of,
+                                                   bool nested) {
   // `operand <op> literal` (and the LIKE and IN forms) through the column binders.
   const auto with_literal = [&](const sql::Expr& operand_expr, sql::CompareOp op,
                                 const sql::Literal& literal, const std::vector<sql::Literal>& list,
@@ -1841,18 +2066,20 @@ arrow::Result<Predicate> Binder::BindCondition(const sql::Expr& conjunct, bool h
     const sql::Expr& operand_expr = right_literal != nullptr ? *binary.left : *binary.right;
     const sql::Literal& literal = right_literal != nullptr ? *right_literal : *left_literal;
     const sql::CompareOp oriented = right_literal != nullptr ? op : Mirror(op);
-    if (!having) {
+    if (input) {
       ARROW_ASSIGN_OR_RAISE(const auto moved, MoveConstants(operand_expr, oriented, literal));
       if (moved.has_value()) {
         if (moved->outcome != Moved::Outcome::kCompare) {
           ARROW_ASSIGN_OR_RAISE(const Typed operand, bind(*moved->operand));
+          // A top-level FALSE reads nothing; inside an expression it is NULL for a NULL operand.
           const bool never = moved->outcome == Moved::Outcome::kFalse;
-          return Predicate{.kind = never ? Predicate::Kind::kFalse : Predicate::Kind::kIsNotNull,
-                           .column = never ? std::nullopt : std::optional(column_of(operand)),
-                           .op = CompareOp::kEq,
-                           .constant = {},
-                           .values = {},
-                           .span = binary.span};
+          return Predicate{
+              .kind = never ? Predicate::Kind::kFalse : Predicate::Kind::kIsNotNull,
+              .column = never && !nested ? std::nullopt : std::optional(column_of(operand)),
+              .op = CompareOp::kEq,
+              .constant = {},
+              .values = {},
+              .span = binary.span};
         }
         const sql::Literal k{.kind = sql::Literal::Kind::kInteger,
                              .negative = moved->k < 0,
@@ -1885,8 +2112,213 @@ arrow::Result<Predicate> Binder::BindCondition(const sql::Expr& conjunct, bool h
                    .span = binary.span};
 }
 
+template <class BindFn>
+arrow::Result<Typed> Binder::BindBool(const sql::Expr& expr, const BindFn& bind, bool input) {
+  const auto* binary = std::get_if<sql::BinaryExpr>(&expr);
+  if (binary != nullptr &&
+      (binary->op == sql::BinaryOp::kAnd || binary->op == sql::BinaryOp::kOr)) {
+    // A chain of one operator is one node: a AND b AND c.
+    std::vector<const sql::Expr*> chain;
+    std::vector<const sql::Expr*> pending{&expr};
+    while (!pending.empty()) {
+      const sql::Expr* e = pending.back();
+      pending.pop_back();
+      const auto* b = std::get_if<sql::BinaryExpr>(e);
+      if (b != nullptr && b->op == binary->op) {
+        pending.push_back(&*b->right);
+        pending.push_back(&*b->left);
+      } else {
+        chain.push_back(e);
+      }
+    }
+    BoolExpr node{.op = binary->op == sql::BinaryOp::kAnd ? BoolOp::kAnd : BoolOp::kOr, .args = {}};
+    for (const sql::Expr* e : chain) {
+      ARROW_ASSIGN_OR_RAISE(Typed arg, BindBool(*e, bind, input));
+      node.args.push_back(std::move(arg.expr));
+    }
+    return Leaf(
+        Expr{.node = std::move(node), .type = LogicalType::kBoolean, .name = ExprName(expr)});
+  }
+  if (const auto* unary = std::get_if<sql::UnaryExpr>(&expr);
+      unary != nullptr && unary->op == sql::UnaryOp::kNot) {
+    ARROW_ASSIGN_OR_RAISE(Typed arg, BindBool(*unary->operand, bind, input));
+    return Leaf(Expr{.node = BoolExpr{.op = BoolOp::kNot, .args = {std::move(arg.expr)}},
+                     .type = LogicalType::kBoolean,
+                     .name = ExprName(expr)});
+  }
+  std::vector<ExprPtr> operands;
+  const auto column_of = [&](const Typed& t) {
+    operands.push_back(t.expr);
+    return BoundColumn{
+        .index = Narrow<int>(operands.size() - 1), .name = t.expr->name, .type = t.expr->type};
+  };
+  ARROW_ASSIGN_OR_RAISE(Predicate predicate,
+                        BindConditionWith(expr, input, bind, column_of, /*nested=*/true));
+  if (!predicate.column.has_value()) {
+    if (operands.empty()) {
+      return arrow::Status::Invalid("a condition without an operand");
+    }
+    // A folded [NOT] LIKE: NULL for a NULL operand, as the comparison it replaces.
+    predicate.column =
+        BoundColumn{.index = 0, .name = operands[0]->name, .type = operands[0]->type};
+  }
+  return Leaf(Expr{
+      .node = PredicateExpr{.predicate = std::move(predicate), .operands = std::move(operands)},
+      .type = LogicalType::kBoolean,
+      .name = ExprName(expr)});
+}
+
+namespace {
+
+// The type DuckDB gives two CASE values (a string literal takes the other's type elsewhere).
+arrow::Result<LogicalType> CaseCommon(LogicalType a, LogicalType b, SourceSpan span) {
+  if (a == b) {
+    return a;
+  }
+  if (IsInteger(a) && IsInteger(b)) {
+    // Unlike arithmetic, USMALLINT with SMALLINT is INTEGER here.
+    const bool mixed = (a == LogicalType::kUSmallInt && b == LogicalType::kSmallInt) ||
+                       (a == LogicalType::kSmallInt && b == LogicalType::kUSmallInt);
+    return mixed ? LogicalType::kInteger : CombineIntegers(a, b);
+  }
+  if (IsNumeric(a) && IsNumeric(b)) {
+    return LogicalType::kDouble;
+  }
+  return BindError(
+      std::format("cannot mix values of type {} and {} in CASE", ToString(a), ToString(b)), span);
+}
+
+bool IsStringLiteral(const sql::Expr& expr) {
+  const auto* lit = std::get_if<sql::Literal>(&expr);
+  return lit != nullptr && lit->kind == sql::Literal::Kind::kString;
+}
+
+}  // namespace
+
+template <class BindFn>
+arrow::Result<Typed> Binder::BindCase(const sql::CaseExpr& c, const BindFn& bind, bool input) {
+  CaseExpr node;
+  std::vector<Typed> values;
+  std::vector<const sql::Expr*> value_exprs;
+  for (const sql::CaseBranch& branch : c.branches) {
+    Typed when;
+    if (c.operand.has_value()) {
+      const sql::Expr equal(sql::BinaryExpr{.op = sql::BinaryOp::kEq,
+                                            .left = sql::Box<sql::Expr>(**c.operand),
+                                            .right = sql::Box<sql::Expr>(*branch.when),
+                                            .op_span = branch.when->span(),
+                                            .span = branch.when->span()});
+      ARROW_ASSIGN_OR_RAISE(when, BindBool(equal, bind, input));
+    } else {
+      ARROW_ASSIGN_OR_RAISE(when, BindBool(*branch.when, bind, input));
+    }
+    node.whens.push_back(std::move(when.expr));
+    ARROW_ASSIGN_OR_RAISE(Typed then, bind(*branch.then));
+    values.push_back(std::move(then));
+    value_exprs.push_back(&*branch.then);
+  }
+  if (c.otherwise.has_value()) {
+    ARROW_ASSIGN_OR_RAISE(Typed otherwise, bind(**c.otherwise));
+    values.push_back(std::move(otherwise));
+    value_exprs.push_back(&**c.otherwise);
+  }
+  // DuckDB's type: the values' common type, where an integer literal takes the others' integer
+  // type when it fits and a string literal any type (DATE: the date it spells).
+  std::optional<LogicalType> type;
+  for (const bool literals : {false, true}) {
+    for (std::size_t i = 0; i < values.size(); ++i) {
+      const Typed& v = values[i];
+      if (v.literal != literals || IsStringLiteral(*value_exprs[i])) {
+        continue;
+      }
+      const SourceSpan span = value_exprs[i]->span();
+      if (v.stored_as_float) {
+        return UnsupportedError(
+            "a FLOAT column as a CASE value is not supported (antb1 reads FLOAT as DOUBLE, "
+            "divergence D11)",
+            span);
+      }
+      if (v.decimal && type != LogicalType::kDouble) {
+        // With a DOUBLE value DuckDB's CASE is DOUBLE; else DECIMAL.
+        return UnsupportedError(
+            "a decimal literal as a CASE value is not supported (DuckDB types it DECIMAL, which "
+            "antb1 lacks)",
+            span);
+      }
+      if (!type.has_value()) {
+        type = v.expr->type;
+      } else if (!(v.literal && IsInteger(*type) && Fits(*v.expr, *type))) {
+        ARROW_ASSIGN_OR_RAISE(type, CaseCommon(*type, v.expr->type, span));
+      }
+    }
+  }
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    if (!IsStringLiteral(*value_exprs[i])) {
+      continue;
+    }
+    const auto& lit = std::get<sql::Literal>(*value_exprs[i]);
+    if (!type.has_value()) {
+      type = LogicalType::kVarchar;
+    }
+    if (*type == LogicalType::kDate) {
+      const auto days = ParseDate(lit.text);
+      if (!days.has_value()) {
+        return BindError("invalid date '" + Clip(lit.text) + "': expected YYYY-MM-DD", lit.span);
+      }
+      values[i] = Leaf(Expr{.node = ConstantExpr{.value = Constant{.type = LogicalType::kDate,
+                                                                   .value = Int128{*days}}},
+                            .type = LogicalType::kDate,
+                            .name = values[i].expr->name});
+    } else if (IsNumeric(*type)) {
+      // DuckDB casts the string to the number ('1' next to SMALLINT is 1).
+      return UnsupportedError(std::format("a string literal as a CASE value next to {} values is "
+                                          "not supported",
+                                          ToString(*type)),
+                              lit.span);
+    } else if (*type != LogicalType::kVarchar) {
+      ARROW_RETURN_NOT_OK(CaseCommon(*type, LogicalType::kVarchar, lit.span));
+    }
+  }
+  for (std::size_t i = 0; i < c.branches.size(); ++i) {
+    node.thens.push_back(std::move(values[i].expr));
+  }
+  if (c.otherwise.has_value()) {
+    node.otherwise = std::move(values.back().expr);
+  }
+  const LogicalType result = type.value_or(LogicalType::kVarchar);
+  return Leaf(Expr{.node = std::move(node), .type = result, .name = CaseName(c)});
+}
+
+namespace {
+
+// A conjunct that is no single predicate (OR, NOT): computed as a BOOLEAN column.
+bool IsCompound(const sql::Expr& conjunct) {
+  const auto* binary = std::get_if<sql::BinaryExpr>(&conjunct);
+  const auto* unary = std::get_if<sql::UnaryExpr>(&conjunct);
+  return (binary != nullptr && binary->op == sql::BinaryOp::kOr) ||
+         (unary != nullptr && unary->op == sql::UnaryOp::kNot);
+}
+
+Predicate IsTrue(BoundColumn column, SourceSpan span) {
+  return Predicate{.kind = Predicate::Kind::kIsTrue,
+                   .column = std::move(column),
+                   .op = CompareOp::kEq,
+                   .constant = {},
+                   .values = {},
+                   .span = span};
+}
+
+}  // namespace
+
 arrow::Status Binder::BindWhere() {
   for (const sql::Expr* conjunct : Conjuncts(stmt_.where)) {
+    if (IsCompound(*conjunct)) {
+      ARROW_ASSIGN_OR_RAISE(
+          const Typed condition,
+          BindBool(*conjunct, [this](const sql::Expr& e) { return BindInput(e); }, /*input=*/true));
+      input_filter_.push_back(IsTrue(InputColumn(condition, /*where=*/true), conjunct->span()));
+      continue;
+    }
     ARROW_ASSIGN_OR_RAISE(Predicate predicate, BindCondition(*conjunct, /*having=*/false));
     const bool on_scan = (!predicate.column.has_value() || predicate.column->index < width_) &&
                          (!predicate.other.has_value() || predicate.other->index < width_);
@@ -2079,7 +2511,27 @@ arrow::Result<std::optional<Typed>> Binder::ResolveHavingName(const sql::ColumnR
 // HAVING conditions as predicates over the aggregation's output (and columns computed over it).
 arrow::Status Binder::BindHaving() {
   alias_fallback_ = true;
+  // A name binds as in BindCondition: a key or a select alias first. The alias of an expression
+  // item is its expression: the condition is computed next to it, over the aggregation.
+  const auto bind = [&](const sql::Expr& e) -> arrow::Result<Typed> {
+    if (const auto* ref = std::get_if<sql::ColumnRef>(&e)) {
+      ARROW_ASSIGN_OR_RAISE(auto resolved, ResolveHavingName(*ref));
+      if (resolved.has_value()) {
+        const auto* column = std::get_if<ColumnExpr>(&resolved->expr->node);
+        if (column != nullptr && column->index >= kPostBase) {
+          resolved->expr = post_exprs_.at(Narrow<std::size_t>(column->index - kPostBase));
+        }
+        return *std::move(resolved);
+      }
+    }
+    return BindOutput(e);
+  };
   for (const sql::Expr* conjunct : Conjuncts(stmt_.having)) {
+    if (IsCompound(*conjunct)) {
+      ARROW_ASSIGN_OR_RAISE(const Typed condition, BindBool(*conjunct, bind, /*input=*/false));
+      having_.push_back(IsTrue(OutputColumn(condition), conjunct->span()));
+      continue;
+    }
     ARROW_ASSIGN_OR_RAISE(Predicate predicate, BindCondition(*conjunct, /*having=*/true));
     having_.push_back(std::move(predicate));
   }

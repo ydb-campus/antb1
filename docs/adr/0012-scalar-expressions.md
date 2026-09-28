@@ -29,6 +29,11 @@ Accepted (with the maintainer-approved plan for scalar expressions)
   Update: function calls are a `FunctionExpr` node with a fixed list of functions (`strlen`, `regexp_replace`), each
   with its arity, argument types and result type in the binder; a `regexp_replace` pattern and replacement must be
   literals, so the evaluator compiles them once per batch with Arrow's RE2 kernel.
+  Update: conditions are BOOLEAN expressions (`PredicateExpr` leaves bound and folded as `WHERE` comparisons,
+  `BoolExpr` for `AND`/`OR`/`NOT`) and `CASE` a `CaseExpr`; BOOLEAN is an internal type, never a column of a table
+  or a result. A `WHERE` or `HAVING` conjunct with `OR` or `NOT` is computed by a `Compute` and filtered with a new
+  `IS TRUE` predicate, so `Filter` stays a conjunction over columns. `CASE` computes each branch only for its rows,
+  as DuckDB does, so a guarded overflow never fails.
 - **A `Compute` node** appends one column per expression to its input. The binder places one over the (filtered)
   table for `WHERE` operands, aggregate arguments and `GROUP BY` expressions, and one over the aggregation for select,
   `HAVING` and `ORDER BY` expressions over keys and aggregates. Every other operator keeps taking columns, and a
