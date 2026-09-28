@@ -11,8 +11,9 @@ This page is the contract: a PR that changes SQL behavior updates it in the same
 Every query of the [grammar](#grammar) below runs: global and grouped (`GROUP BY`) aggregates, `COUNT(DISTINCT ...)`
 included, projections (`*`, columns or constants), a `WHERE` conjunction of `column <op> literal` comparisons,
 `column [NOT] LIKE 'pattern'` and `column [NOT] IN (literal, ...)`, `GROUP BY` and `ORDER BY` (also by position),
-`HAVING` (the same conditions on aggregates and keys), arithmetic (`+ - * / // %` and unary `-`) in every clause,
-`LIMIT` and `OFFSET`, over one table of Parquet files. This covers 38 of the 43 ClickBench queries (see
+`HAVING` (the same conditions on aggregates and keys), arithmetic (`+ - * / // %` and unary `-`) and the string
+functions `strlen` and `regexp_replace` in every clause, `LIMIT` and `OFFSET`, over one table of Parquet files. This
+covers 40 of the 43 ClickBench queries (see
 [ClickBench status](#clickbench-status)).
 
 ```sql
@@ -31,7 +32,7 @@ SELECT * FROM '/data/hits_*.parquet' LIMIT 5
   (no data page is read); under `WHERE` it counts the rows the filter selects without copying them.
 - Result names and types follow DuckDB ([Binding](#binding)); values follow the [Semantics](#semantics) below.
 - `--` line comments, `/* block */` comments and one trailing `;` are allowed.
-- SQL outside the grammar (`JOIN`, `OR`, functions, ...) fails with exit code 4 and points at the first
+- SQL outside the grammar (`JOIN`, `OR`, other functions, ...) fails with exit code 4 and points at the first
   unsupported token. Malformed SQL (a syntax error) and SQL that is wrong for the table (a bind error) fail with exit
   code 1.
 
@@ -91,7 +92,8 @@ Keywords are not reserved by the lexer.
 
 **What the binder answers today.** Of the expressions above, antb1 answers:
 
-- value expressions: columns, literals, aggregates and arithmetic (`+ - * / // %`, unary `-`) of them, in the select
+- value expressions: columns, literals, aggregates, arithmetic (`+ - * / // %`, unary `-`) and the functions
+  `strlen(varchar)` and `regexp_replace(varchar, 'pattern', 'replacement')` of them, in the select
   list, aggregate arguments (not constant ones), `GROUP BY` and `ORDER BY` (literals there are positions or
   constants, see [Binding](#binding));
 - `WHERE` and `HAVING`: a conjunction (`AND`) of `operand <op> literal` in either order, `operand <op> operand`,
@@ -100,10 +102,10 @@ Keywords are not reserved by the lexer.
 - any of these in parentheses (`(a)`, `SUM((a))`, `WHERE (a = 1 AND b = 2)`), which group without changing
   anything.
 
-Every other expression (`OR`, `NOT`, `CASE`, `EXTRACT`, function calls other than the five aggregates, a comparison
-outside `WHERE` and `HAVING`, a comparison of two constants) parses, and is then rejected by the binder with exit
-code 4 at its first token, before any name is resolved. `GROUP BY ALL` and `ORDER BY ALL` are
-rejected by the parser, and so are `SUM`, `AVG`, `MIN` and `MAX` with `DISTINCT`.
+Every other expression (`OR`, `NOT`, `CASE`, `EXTRACT`, function calls other than the five aggregates, `strlen` and
+`regexp_replace`, a comparison outside `WHERE` and `HAVING`, a comparison of two constants) parses, and is then
+rejected by the binder with exit code 4 at its first token, before any name is resolved. `GROUP BY ALL` and
+`ORDER BY ALL` are rejected by the parser, and so are `SUM`, `AVG`, `MIN` and `MAX` with `DISTINCT`.
 
 Outside the grammar, the parser recognizes common SQL and rejects it with exit code 4 and a source span, among others:
 `SELECT DISTINCT`, joins, subqueries, `ILIKE`, `LIKE ... ESCAPE`, `NULL` literals, `IS [NOT] NULL`, `BETWEEN`, `CAST`
@@ -166,6 +168,12 @@ items).
   USMALLINT (DuckDB wraps it), `//` and `%` of HUGEINT values and arithmetic on FLOAT columns (divergence D11) are
   unsupported; arithmetic on VARCHAR is a bind error. The result name is DuckDB's: `(a + 1)`, `-(a)`,
   `sum((a + 1))`, with columns as written.
+- Functions (names ASCII case-insensitive): `strlen(x)` takes a VARCHAR and is BIGINT; `regexp_replace(x, 'pattern',
+  'replacement')` takes a VARCHAR and two string literals and is VARCHAR. A wrong number of arguments, another type or
+  a non-literal pattern or replacement is a bind error (`strlen() needs a VARCHAR, but 'i16' is SMALLINT`); DuckDB's
+  optional fourth argument (options), `\Q` in a pattern, `\8` and `\9` in a replacement and any other function are
+  unsupported (exit code 4). The result name is
+  DuckDB's: `strlen(URL)`, `regexp_replace(URL, '^(.)', '\1')`.
 - Expressions and keys: a select, `HAVING` or `ORDER BY` expression equal to a `GROUP BY` expression is that key (so
   `SELECT a - 1 ... GROUP BY a - 1` works), and in a grouped query every column must be inside an aggregate or part of
   such a key. Inside an `ORDER BY` or `HAVING` expression a name is a table column first, else a select alias (as in
@@ -317,6 +325,11 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   `x + c <op> k`, `x - c <op> k`, `c - x <op> k` and `x * c <op> k` (a signed integer `x`, integer constants, `c`
   dividing `k` for `*`) compare `x` with a moved constant, repeatedly, while `k` and the new constant fit the type.
   The arithmetic is then never computed. Divergence D14 lists what still differs.
+- Strings: `strlen` counts bytes. `regexp_replace` replaces the first match only, with RE2 in UTF-8 mode as DuckDB
+  runs it (`.` matches one character but no newline); in the replacement `\0` is the match, `\1` to `\9` its groups
+  and `\\` a backslash. A replacement RE2 rejects (a group the pattern does not have, a lone or unknown backslash)
+  leaves the text unchanged, as in DuckDB; an invalid pattern fails the query (exit code 1) when it runs. NULL gives
+  NULL. Bytes that are not UTF-8 are divergence D15.
 - HAVING: its conditions filter the rows of the aggregation (the groups, or the one row of an aggregate query
   without `GROUP BY`, which it may filter out) before `ORDER BY`, `LIMIT` and `OFFSET`, with the NULL, folding and
   operator rules of `WHERE`: a NULL aggregate (`SUM` of only NULLs) or NULL key rejects the row.
@@ -355,10 +368,10 @@ formatter:
 | Code | Meaning | Examples |
 | --- | --- | --- |
 | 0 | success | |
-| 1 | query error: syntax, bind or execution error | `SELECT COUNT(*) FORM t`; an unknown table or column; `SUM` of a VARCHAR column; a `SUM` outside HUGEINT's range |
+| 1 | query error: syntax, bind or execution error | `SELECT COUNT(*) FORM t`; an unknown table or column; `SUM` of a VARCHAR column; a `SUM` outside HUGEINT's range; an invalid `regexp_replace` pattern |
 | 2 | usage error | unknown option; neither or both of `-c` and `-f`; a malformed `--table` or `--column-type`; a column that `--column-type` cannot read as DATE; a table name registered twice |
 | 3 | I/O error | a missing or unreadable file; not a Parquet file; schemas that differ; a glob that matches nothing |
-| 4 | unsupported: valid-looking SQL outside the supported subset | `JOIN`; `OR`; a function call; `SELECT 2.5`; `SUM(DISTINCT ...)`; a column of an unsupported type |
+| 4 | unsupported: valid-looking SQL outside the supported subset | `JOIN`; `OR`; an unknown function; `SELECT 2.5`; `SUM(DISTINCT ...)`; a column of an unsupported type |
 | 70 | internal error: anything else, which is a bug | an uncaught exception; an Arrow `NotImplemented` or type error without SQL context |
 
 Exit code 4 is used only for errors that the parser, the binder or the physical planner marks as unsupported
@@ -398,6 +411,7 @@ compare against DuckDB, so an unregistered difference is a bug.
 | D12 | Long numbers against DOUBLE | a number compared with a DOUBLE column is the correctly rounded nearest double | converts a DECIMAL literal (at most 38 digits) or a HUGEINT literal to DOUBLE in two steps when its digits exceed 2^53, which can be one ulp off (`9007199254740993.5`) | the generator only writes decimals of at most 2^53 in their digits with at most 22 decimals, where both round the same (`ExactDecimalDouble` in `tests/slt/runner/query_gen.cc`) |
 | D13 | Decimals with many digits against integer columns | compared exactly | compares in a DECIMAL whose width is capped at 38 digits: when the column type's digits plus the literal's decimals exceed 38, a column value with too many integer digits fails the query with a conversion error (`i16 = 1.0000000000000000000000000000000000001` over the value -32768); likewise an integer `SUM` (HUGEINT, 38 digits) in `HAVING` against any decimal fails once the sum has more digits than 38 minus the literal's decimals | the `.slt` records and the generator keep literals short enough; `plan.Binder/FoldThroughBinderTest.*` covers the exact folding |
 | D14 | Overflows DuckDB's optimizer does not avoid | a comparison that folds to always-true or never-true at bind time (a literal outside the operand's type, as in `smallint_col + 1 > 40000`) computes nothing, so it cannot overflow | computes the operand and fails on an overflow ("Overflow in addition of INT16") | the random generator never writes arithmetic that can overflow; `plan.BinderTest.WhereMovesConstantsLikeDuckDb` pins which comparisons move their constants |
+| D15 | VARCHAR bytes that are not UTF-8 | answers: `strlen` counts every byte, and `regexp_replace` runs RE2 over the bytes as UTF-8, where an invalid byte never matches (not even `.` or `[^a]`) and stays in the result | cannot read such a value as VARCHAR: reading an unannotated BYTE_ARRAY column (`binary_as_string`) with it fails the query ("Invalid string encoding") | every fixture string is valid UTF-8, so the oracle tests never meet it; `exec.ComputeTest.StringFunctions` pins antb1's behavior |
 
 ## ClickBench status
 
@@ -439,6 +453,8 @@ bind error); today all of them answer Unsupported with exit code 4.
 | Q24 | pass | a projection under `WHERE`, ordered by a column it does not select, top-N |
 | Q25 | pass | a projection under `WHERE`, ordered by the column it selects, top-N |
 | Q26 | pass | a projection under `WHERE`, ordered by a column it does not select and then by the one it selects, top-N |
+| Q27 | pass | `AVG(strlen(...))` grouped by a column under `WHERE`, with `HAVING` on the count, ordered by the average, top-N |
+| Q28 | pass | `regexp_replace` with a group grouped by its alias, `AVG(strlen(...))`, `MIN`, `HAVING` on the count, ordered, top-N |
 | Q29 | pass | 90 `SUM`s of a column plus a constant: DuckDB's sum rewriter, `SUM(x) + c * COUNT(x)` |
 | Q30 | pass | `GROUP BY` two columns under `WHERE` with `COUNT(*)`, `SUM` and `AVG`, ordered by the count, top-N |
 | Q31 | pass | `GROUP BY` two columns under `WHERE` with `COUNT(*)`, `SUM` and `AVG`, ordered by the count, top-N |
@@ -451,4 +467,4 @@ bind error); today all of them answer Unsupported with exit code 4.
 | Q38 | pass | `GROUP BY` one column under a `WHERE` conjunction, ordered by the alias of the count, a window with `OFFSET` |
 | Q40 | pass | a `WHERE` conjunction with `IN` over two values, `GROUP BY` two columns, ordered by the count, a window with `OFFSET` |
 | Q41 | pass | `GROUP BY` two columns under a `WHERE` conjunction, ordered by the alias of the count, a window with `OFFSET` |
-| all others | out of scope | need function calls, `CASE` or timestamps (the next PRs of the expressions plan); they fail cleanly with exit code 4 |
+| all others | out of scope | need `CASE` or timestamps (the next PRs of the expressions plan); they fail cleanly with exit code 4 |

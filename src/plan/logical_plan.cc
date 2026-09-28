@@ -157,6 +157,18 @@ struct SameNode {
   bool operator()(const NegateExpr& a) const {
     return SameExpr(*a.operand, *std::get<NegateExpr>(other.node).operand);
   }
+  bool operator()(const FunctionExpr& a) const {
+    const auto& b = std::get<FunctionExpr>(other.node);
+    if (a.function != b.function || a.args.size() != b.args.size()) {
+      return false;
+    }
+    for (std::size_t i = 0; i < a.args.size(); ++i) {
+      if (!SameExpr(*a.args[i], *b.args[i])) {
+        return false;
+      }
+    }
+    return true;
+  }
 };
 
 }  // namespace
@@ -176,6 +188,10 @@ ExprPtr Renumber(const ExprPtr& expr, const std::vector<int>& remap) {
     arith->right = Renumber(arith->right, remap);
   } else if (auto* negate = std::get_if<NegateExpr>(&out.node)) {
     negate->operand = Renumber(negate->operand, remap);
+  } else if (auto* function = std::get_if<FunctionExpr>(&out.node)) {
+    for (ExprPtr& arg : function->args) {
+      arg = Renumber(arg, remap);
+    }
   }
   return std::make_shared<const Expr>(std::move(out));
 }
@@ -188,7 +204,21 @@ void CollectColumns(const Expr& expr, std::vector<int>& out) {
     CollectColumns(*arith->right, out);
   } else if (const auto* negate = std::get_if<NegateExpr>(&expr.node)) {
     CollectColumns(*negate->operand, out);
+  } else if (const auto* function = std::get_if<FunctionExpr>(&expr.node)) {
+    for (const ExprPtr& arg : function->args) {
+      CollectColumns(*arg, out);
+    }
   }
+}
+
+std::string_view ToString(Function function) {
+  switch (function) {
+    case Function::kStrlen:
+      return "strlen";
+    case Function::kRegexpReplace:
+      return "regexp_replace";
+  }
+  return "?";
 }
 
 std::string_view ToString(AggKind kind) {

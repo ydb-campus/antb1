@@ -676,7 +676,11 @@ class Builder {
       } else if (shape == Shape::kColumns) {
         const GenColumn& c = *rng_.Pick(cols);
         std::optional<bool> exact;
-        if (rng_.Percent(20)) {
+        if (c.kind == ValueKind::kVarchar && rng_.Percent(20)) {
+          if (StringFunction(c, rng_.Percent(50)).has_value()) {
+            exact = true;
+          }
+        } else if (rng_.Percent(20)) {
           exact = Arithmetic(c);
         }
         if (exact.has_value()) {
@@ -698,7 +702,11 @@ class Builder {
           orderable = false;
         }
         aggregate_emitted_ = true;
-        call.emplace(agg, arg);
+        // A string function changes the argument's values (and strlen its type): HAVING has no
+        // literals for them.
+        if (!exact.has_value() || arg->kind != ValueKind::kVarchar) {
+          call.emplace(agg, arg);
+        }
       }
       if (allowed_.Has(Feature::kAlias) && rng_.Percent(15)) {
         used_.Add(Feature::kAlias);
@@ -742,7 +750,10 @@ class Builder {
       if (agg == Agg::kCountDistinct) {
         Keyword("DISTINCT");
       }
-      if (arithmetic) {
+      if (arithmetic && arg->kind == ValueKind::kVarchar) {
+        const std::optional<ValueKind> kind = StringFunction(*arg, rng_.Percent(50));
+        exact = kind.has_value() ? std::optional(true) : std::nullopt;
+      } else if (arithmetic) {
         exact = Arithmetic(*arg);
       }
       if (!exact.has_value()) {
@@ -989,6 +1000,13 @@ class Builder {
         continue;
       }
       const std::string_view op = rng_.Pick(kOps);
+      if (c.kind == ValueKind::kVarchar && rng_.Percent(10) &&
+          allowed_.Has(Feature::kIntegerLiteral) && StringFunction(c, true).has_value()) {
+        used_.Add(Feature::kIntegerLiteral);
+        Symbol(op);
+        tokens_.push_back({.kind = Token::Kind::kLiteral, .text = std::to_string(rng_.Below(25))});
+        continue;
+      }
       if (IsNumeric(c.kind) && rng_.Percent(15)) {
         if (const std::optional<bool> exact = Arithmetic(c)) {
           // An exact result takes the column's literals; a DOUBLE one those of a DOUBLE column.
@@ -1192,6 +1210,38 @@ class Builder {
   void Column(const GenColumn& c) {
     used_.Add(TypeFeature(c.kind));
     tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.name});
+  }
+
+  // strlen(c) (`length`: an exact BIGINT) or regexp_replace(c, 'pattern', 'replacement') of a
+  // VARCHAR column. Returns the result's kind, or std::nullopt (nothing written).
+  std::optional<ValueKind> StringFunction(const GenColumn& c, bool length) {
+    if (!allowed_.Has(Feature::kStringFunctions) || c.kind != ValueKind::kVarchar ||
+        (!length && !allowed_.Has(Feature::kStringLiteral))) {
+      return std::nullopt;
+    }
+    used_.Add(Feature::kStringFunctions);
+    if (length) {
+      Keyword("STRLEN");
+      Symbol("(");
+      Column(c);
+      Symbol(")");
+      return ValueKind::kInteger;
+    }
+    static constexpr auto kPatterns =
+        std::to_array<std::string_view>({"a", "[0-9]+", "^(.)", "(.)$", "e.", "^([a-z]+)://([^/]*)",
+                                         "\\s+", "e\\B", "(e)$|(e)", "\\b"});
+    static constexpr auto kReplacements =
+        std::to_array<std::string_view>({"", "X", "\\1", "<\\0>"});
+    used_.Add(Feature::kStringLiteral);
+    Keyword("REGEXP_REPLACE");
+    Symbol("(");
+    Column(c);
+    Symbol(",");
+    tokens_.push_back({.kind = Token::Kind::kLiteral, .text = SqlString(rng_.Pick(kPatterns))});
+    Symbol(",");
+    tokens_.push_back({.kind = Token::Kind::kLiteral, .text = SqlString(rng_.Pick(kReplacements))});
+    Symbol(")");
+    return ValueKind::kVarchar;
   }
 
   // A numeric column with a constant under an operator that both engines compute alike and

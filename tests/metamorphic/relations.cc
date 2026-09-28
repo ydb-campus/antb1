@@ -676,6 +676,31 @@ std::vector<Relation> AllRelations() {
     sizes.probes.push_back(Q(std::format(kKeys, "hits_like")));
     r.push_back(std::move(sizes));
   }
+  // String functions: inserting one character adds one byte per non-NULL value wherever the match
+  // is; regexp_replace keys group alike whatever the batch size and file layout.
+  {
+    r.push_back(
+        {.name = "regexp_replace_insertion_adds_one_byte",
+         .features = {kSum, kCountColumn, kArithmetic, kStringFunctions, kVarcharColumns,
+                      kStringLiteral, kTableName},
+         .probes = {Q("SELECT SUM(strlen(URL)) + COUNT(URL) FROM hits_like_nulls"),
+                    Q("SELECT SUM(strlen(regexp_replace(URL, '$', 'x'))) FROM hits_like_nulls"),
+                    Q("SELECT SUM(STRLEN(REGEXP_REPLACE(URL, '^', '\\\\'))) FROM hits_like_nulls")},
+         .check = AllEqual()});
+    constexpr std::string_view kKeys =
+        "SELECT regexp_replace(Referer, '//([^/?]*)', '<\\1>') AS k, COUNT(*), "
+        "SUM(strlen(Referer)), MAX(Referer) FROM {} GROUP BY k";
+    Relation sizes{.name = "regexp_replace_keys_batch_size_invariance",
+                   .features = {kGroupBy, kCountStar, kSum, kMax, kStringFunctions, kMultipleItems,
+                                kAlias, kVarcharColumns, kStringLiteral, kTableName},
+                   .probes = {},
+                   .check = AllEqual()};
+    for (const int64_t batch : kBatchSizes) {
+      sizes.probes.push_back(Q(std::format(kKeys, "hits_like_split"), batch));
+    }
+    sizes.probes.push_back(Q(std::format(kKeys, "hits_like")));
+    r.push_back(std::move(sizes));
+  }
   // [NOT] IN partitions the non-NULL values of a column, and IN over distinct values counts the
   // rows equal to each.
   for (const auto& [column, values, type, literal] :

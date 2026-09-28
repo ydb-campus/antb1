@@ -1,0 +1,139 @@
+# String functions (docs/sql-subset.md): strlen(varchar) is its length in bytes (BIGINT);
+# regexp_replace(varchar, pattern, replacement) replaces the first match (RE2, as in DuckDB: `.` is
+# one UTF-8 character and does not match a newline; \0 and \1 in the replacement).
+
+query TII rowsort
+SELECT u, strlen(u), STRLEN(u) * 2 FROM edge
+----
+(empty)	0	0
+NULL	NULL	NULL
+NULL	NULL	NULL
+\x28empty)	7	14
+a	1	2
+back\\slash	10	20
+line\nbreak	10	20
+tab\there	8	16
+trailing space\x20	15	30
+x\x7fy	3	6
+Привет, мир	20	40
+日本語	9	18
+
+query TT rowsort
+SELECT u, regexp_replace(u, 'a|e', 'X') FROM edge
+----
+(empty)	(empty)
+NULL	NULL
+NULL	NULL
+\x28empty)	(Xmpty)
+a	X
+back\\slash	bXck\\slash
+line\nbreak	linX\nbreak
+tab\there	tXb\there
+trailing space\x20	trXiling space\x20
+x\x7fy	x\x7fy
+Привет, мир	Привет, мир
+日本語	日本語
+
+query TT rowsort
+SELECT u, regexp_replace(u, '^(.)(.*)$', '\2\1') FROM edge
+----
+(empty)	(empty)
+NULL	NULL
+NULL	NULL
+\x28empty)	empty)(
+a	a
+back\\slash	ack\\slashb
+line\nbreak	line\nbreak
+tab\there	ab\theret
+trailing space\x20	railing space t
+x\x7fy	\x7fyx
+Привет, мир	ривет, мирП
+日本語	本語日
+
+query TT rowsort
+SELECT u, regexp_replace(u, '...', '<\0>') FROM edge
+----
+(empty)	(empty)
+NULL	NULL
+NULL	NULL
+\x28empty)	<(em>pty)
+a	a
+back\\slash	<bac>k\\slash
+line\nbreak	<lin>e\nbreak
+tab\there	<tab>\there
+trailing space\x20	<tra>iling space\x20
+x\x7fy	<x\x7fy>
+Привет, мир	<При>вет, мир
+日本語	<日本語>
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE strlen(u) > 5 AND regexp_replace(u, ' ', '') LIKE '%a%'
+----
+4
+
+query IR nosort
+SELECT COUNT(*), AVG(strlen(URL)) FROM hits_like WHERE URL <> ''
+----
+9805	39.106068332483424
+
+# Grouping by string function results, with aggregates of them and HAVING, over the fixture data.
+query III nosort
+SELECT OS, MAX(strlen(Title)) AS m, SUM(strlen(URL)) AS total FROM hits_like WHERE strlen(URL) > 30 GROUP BY OS ORDER BY total DESC, OS LIMIT 4
+----
+10	49	4113
+116	48	3983
+118	51	3924
+26	45	3920
+
+query TII nosort
+SELECT regexp_replace(URL, '^([a-z]+)://.*$', '\1') AS scheme, COUNT(*), MIN(strlen(URL)) FROM hits_like GROUP BY scheme HAVING COUNT(*) > 5 ORDER BY scheme
+----
+(empty)	195	0
+https	9805	31
+
+query TIT nosort
+SELECT regexp_replace(Referer, '^[^/]*//[^/]*/([^/?]*).*$', 'seg:\1') AS seg, COUNT(*) AS n, MAX(Referer) FROM hits_like WHERE Referer LIKE 'http%' GROUP BY 1 ORDER BY n DESC, seg LIMIT 5
+----
+seg:дорога	269	https://ref.example.org/дорога/99884?q=orbit
+seg:cloud	268	https://ref.example.org/cloud/99935
+seg:stone	265	https://ref.example.org/stone/99758
+seg:naïve	262	https://ref.example.org/naïve/99791
+seg:pixel	260	https://ref.example.org/pixel/99525
+
+# Assertions see the whole value, not the match alone (\b, \B, ^ and $ inside alternatives).
+query TTTTTT rowsort
+SELECT u, regexp_replace(u, 'a\B', 'Z'), regexp_replace(u, '(a)$|(a)', '[\1]'), regexp_replace(u, '\B(e)|(e)', '[\1]'), regexp_replace(u, '\b', '|'), regexp_replace(u, '(?m)^t|k$', '#') FROM edge
+----
+(empty)	(empty)	(empty)	(empty)	(empty)	(empty)
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+\x28empty)	\x28empty)	\x28empty)	([]mpty)	(|empty)	\x28empty)
+a	a	[a]	a	|a	a
+back\\slash	bZck\\slash	b[]ck\\slash	back\\slash	|back\\slash	back\\slash
+line\nbreak	line\nbreZk	line\nbre[]k	lin[e]\nbreak	|line\nbreak	line\nbrea#
+tab\there	tZb\there	t[]b\there	tab\th[e]re	|tab\there	#ab\there
+trailing space\x20	trZiling space\x20	tr[]iling space\x20	trailing spac[e]\x20	|trailing space\x20	#railing space\x20
+x\x7fy	x\x7fy	x\x7fy	x\x7fy	|x\x7fy	x\x7fy
+Привет, мир	Привет, мир	Привет, мир	Привет, мир	Привет, мир	Привет, мир
+日本語	日本語	日本語	日本語	日本語	日本語
+
+# A replacement RE2 rejects (a group the pattern does not have, a lone or unknown backslash) leaves
+# the text unchanged, as in DuckDB; \\ is one backslash.
+query TTTTT rowsort
+SELECT u, regexp_replace(u, 'a', '\1'), regexp_replace(u, '(a)', '\2'), regexp_replace(u, 'a', 'x\'), regexp_replace(u, 'a', '[\\]') FROM edge
+----
+(empty)	(empty)	(empty)	(empty)	(empty)
+NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL
+\x28empty)	\x28empty)	\x28empty)	\x28empty)	\x28empty)
+a	a	a	a	[\\]
+back\\slash	back\\slash	back\\slash	back\\slash	b[\\]ck\\slash
+line\nbreak	line\nbreak	line\nbreak	line\nbreak	line\nbre[\\]k
+tab\there	tab\there	tab\there	tab\there	t[\\]b\there
+trailing space\x20	trailing space\x20	trailing space\x20	trailing space\x20	tr[\\]iling space\x20
+x\x7fy	x\x7fy	x\x7fy	x\x7fy	x\x7fy
+Привет, мир	Привет, мир	Привет, мир	Привет, мир	Привет, мир
+日本語	日本語	日本語	日本語	日本語
+
+statement error
+SELECT regexp_replace(u, '(', 'x') FROM edge

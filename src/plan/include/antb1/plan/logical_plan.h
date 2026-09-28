@@ -100,10 +100,25 @@ struct NegateExpr {
   ExprPtr operand;
 };
 
+enum class Function : std::uint8_t {
+  kStrlen,         // strlen(varchar): its length in bytes, BIGINT
+  kRegexpReplace,  // regexp_replace(varchar, pattern, replacement): the first match replaced (RE2)
+};
+
+// "strlen", "regexp_replace".
+std::string_view ToString(Function function);
+
+// A scalar function of the arguments (constants where the function needs them: the pattern and
+// the replacement of regexp_replace).
+struct FunctionExpr {
+  Function function = Function::kStrlen;
+  std::vector<ExprPtr> args;
+};
+
 // A scalar expression, typed as DuckDB types it (docs/sql-subset.md). Integer arithmetic is exact
 // in its type: an overflow is an execution error, as in DuckDB.
 struct Expr {
-  std::variant<ColumnExpr, ConstantExpr, ArithExpr, NegateExpr> node;
+  std::variant<ColumnExpr, ConstantExpr, ArithExpr, NegateExpr, FunctionExpr> node;
   LogicalType type = LogicalType::kBigInt;
   std::string name;  // DuckDB's result name of the expression, e.g. (a + 1)
 };
