@@ -78,7 +78,8 @@ Proposed
     serial order.
 - **Semantics that change, documented in docs/sql-subset.md:**
   - DOUBLE `SUM` and `AVG` add per row group, then the row-group sums in order. The value can differ from today's one
-    running sum by rounding, still deterministically. The oracle tests compare DOUBLE with a tolerance.
+    running sum by rounding, still deterministically. The oracle tests compare DOUBLE with a tolerance. The
+    maintainer accepted this on 2026-09-29.
   - Group order and tie order stay unspecified. They are deterministic for a given input, now also across thread counts.
 
 ## Consequences
