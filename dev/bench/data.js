@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790583113856,
+  "lastUpdate": 1790594213129,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -1116,6 +1116,78 @@ window.BENCHMARK_DATA = {
             "value": 14.364028142856986,
             "unit": "ms/iter",
             "extra": "iterations: 49\ncpu: 14.362616755102037 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b95d193aac4cbc362a4beccceb22862584d06d10",
+          "message": "feat(plan,exec): strlen and regexp_replace (#33)\n\n## Summary\n\nThis is PR 3 of the approved plan for scalar expressions. It adds\n`strlen(varchar)` and `regexp_replace(varchar, 'pattern',\n'replacement')` in every clause. ClickBench goes from 38 to **40 of 43**\n(Q27, Q28); the maintainer signed off on the ratchet change.\n\n**Binding** follows DuckDB 1.5.5:\n- `strlen` is BIGINT; `regexp_replace` is VARCHAR and takes two string\nliterals.\n- Names are DuckDB's: `strlen(URL)`, `regexp_replace(s, '^(.)', '\\1')`.\n- A wrong arity, a wrong type or a non-literal argument is a bind error.\n- Unsupported (exit code 4): other functions, DuckDB's fourth argument\n(options), `\\Q` in a pattern, and `\\8` or `\\9` in a replacement.\n\n**Semantics:**\n- `strlen` counts bytes (Arrow `binary_length`).\n- `regexp_replace` replaces the first match with RE2 in UTF-8 mode, like\nDuckDB.\n- An invalid replacement leaves the text unchanged, as in DuckDB (it\nignores `RE2::Replace`'s failure). An invalid pattern is an execution\nerror.\n- Arrow's single-replacement path re-matches the pattern on the matched\nsubstring alone, so `\\b`, `\\B`, `^` and `$` saw the wrong neighbours.\nThe evaluator therefore runs the pattern as `^(\\C*?)(pattern)`, RE2's\nown unanchored search, with the replacement's groups shifted by two. The\npattern is checked alone first, so a pattern that is only valid once\nwrapped still fails.\n- Divergence D15: bytes that are not UTF-8. DuckDB cannot read such a\nVARCHAR at all; antb1 answers.\n\n**Plan:** a `FunctionExpr` node in `plan::Expr` (ADR 0012 note), handled\nby every visitor.\n\n**Harness:**\n- The random generator writes both functions, with context-dependent\npatterns.\n- New `tests/slt/cases/expressions/strings.slt` (expected results\nwritten by DuckDB), and two metamorphic relations: an insertion adds one\nbyte per value; `regexp_replace` keys are invariant across batch sizes\nand files.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full          # lint, ci, asan, tidy, coverage (floors kept), fuzz-smoke, ci-gcc\nexit 0                         (on the first commit; after the review fixes: check and tidy exit 0)\n$ ANTB1_DIFF_COUNT=20000 pixi run diff-random\nDIFF: PASS seed=3304376479 queries=20000 failed=0 unsupported=0\n$ ANTB1_DIFF_COUNT=5000 pixi run diff-random   # after the review fixes\nDIFF: PASS seed=3870478056 queries=5000 failed=0 unsupported=0\n$ ANTB1_HITS_FILES=\"$HOME/.cache/antb1/clickbench/full/hits_*.parquet\" pixi run test-data   # all 100 files\n100% tests passed out of 6\n$ antb1 bench (release build, all 100 files, 2 tries, lukewarm): Q27 15.7 s, Q28 326 s\n  (Q28 on one file: 2.0 s vs DuckDB with threads=1 1.75 s; the regex is most of it)\n```\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change: evaluator (exec), binding, names and\nerrors (binder), `.slt`, metamorphic relations, the generator\n- [x] Docs updated: `docs/sql-subset.md` (grammar notes, binding,\nsemantics, exit codes, D15, ClickBench table), `docs/architecture.md`,\nADR 0012\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: `tests/data/clickbench_status.json` (+27, +28) was\napproved by @hor911\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code wrote the change\nand the tests, and ran the verification. The random differential test\nfound that DuckDB leaves the text unchanged for an invalid replacement.\nThe `reviewer` agent found a P0 (Arrow's single replacement re-matches\non the substring, so context assertions went wrong), test queries too\nclose to ClickBench's, and the options argument's exit code. All are\nfixed with tests.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-09-28T14:14:47+03:00",
+          "tree_id": "c4890118afc2c83ff19c80a46b75ae80eabfa647",
+          "url": "https://github.com/ydb-campus/antb1/commit/b95d193aac4cbc362a4beccceb22862584d06d10"
+        },
+        "date": 1790594212139,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 3812.482221771964,
+            "unit": "ns/iter",
+            "extra": "iterations: 182611\ncpu: 3812.234586087366 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 97303.66351848726,
+            "unit": "ns/iter",
+            "extra": "iterations: 6247\ncpu: 97215.83704178008 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 105020.375858385,
+            "unit": "ns/iter",
+            "extra": "iterations: 6553\ncpu: 104993.65328857012 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 352456.82202111254,
+            "unit": "ns/iter",
+            "extra": "iterations: 1989\ncpu: 352384.49572649575 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 437306.1824953377,
+            "unit": "ns/iter",
+            "extra": "iterations: 1611\ncpu: 437195.0775915577 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2548314.8690909212,
+            "unit": "ns/iter",
+            "extra": "iterations: 275\ncpu: 2547775.2545454535 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 188.01486174999837,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 187.9607162500001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 13.405464538461587,
+            "unit": "ms/iter",
+            "extra": "iterations: 52\ncpu: 13.403133173076927 ms\nthreads: 1"
           }
         ]
       }
