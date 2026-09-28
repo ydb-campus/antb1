@@ -288,6 +288,93 @@ TEST(AstTest, ToStringNamesKindsAndOperators) {
   EXPECT_EQ(ToString(CompareOp::kLe), "<=");
   EXPECT_EQ(ToString(CompareOp::kGt), ">");
   EXPECT_EQ(ToString(CompareOp::kGe), ">=");
+  EXPECT_EQ(ToString(CompareOp::kLike), "LIKE");
+  EXPECT_EQ(ToString(CompareOp::kNotLike), "NOT LIKE");
+  EXPECT_EQ(ToString(CompareOp::kIn), "IN");
+  EXPECT_EQ(ToString(CompareOp::kNotIn), "NOT IN");
+}
+
+// ToExpr is the inverse of AsComparison / AsHavingComparison, for every operator.
+TEST(AstTest, ToExprInvertsTheNormalizedForms) {
+  const Literal pattern{.kind = Literal::Kind::kString, .negative = false, .text = "a%"};
+  const Literal one{.kind = Literal::Kind::kInteger, .negative = false, .text = "1"};
+  const Literal two{.kind = Literal::Kind::kInteger, .negative = true, .text = "2"};
+  for (const CompareOp op :
+       {CompareOp::kEq, CompareOp::kNe, CompareOp::kLt, CompareOp::kLe, CompareOp::kGt,
+        CompareOp::kGe, CompareOp::kLike, CompareOp::kNotLike, CompareOp::kIn, CompareOp::kNotIn}) {
+    const bool list = op == CompareOp::kIn || op == CompareOp::kNotIn;
+    const bool like = op == CompareOp::kLike || op == CompareOp::kNotLike;
+    const Comparison cmp{.column = ColumnRef{.name = "c"},
+                         .op = op,
+                         .literal = like ? pattern : one,
+                         .list = list ? std::vector<Literal>{one, two} : std::vector<Literal>{}};
+    const auto back = AsComparison(ToExpr(cmp));
+    ASSERT_TRUE(back.has_value()) << ToString(op);
+    EXPECT_EQ(back.value_or(Comparison{}).op, op);
+    EXPECT_EQ(back.value_or(Comparison{}).list.size(), cmp.list.size());
+    AggregateCall count{.kind = AggKind::kCountStar};
+    const HavingComparison having{
+        .operand = count, .op = op, .literal = cmp.literal, .list = cmp.list};
+    const auto having_back = AsHavingComparison(ToExpr(having));
+    ASSERT_TRUE(having_back.has_value()) << ToString(op);
+    EXPECT_TRUE(
+        std::holds_alternative<AggregateCall>(having_back.value_or(HavingComparison{}).operand));
+    EXPECT_EQ(ToSql(ToExpr(having)).substr(0, 8), "COUNT(*)");
+  }
+  // Not simple: two columns, an IN list with a column, an arithmetic operand.
+  auto stmt = Parse("SELECT a FROM t WHERE a = b AND a IN (1, b) AND a + 1 > 2 AND a LIKE b");
+  ASSERT_TRUE(stmt.has_value());
+  for (const Expr& conjunct : stmt->where) {
+    EXPECT_FALSE(AsComparison(conjunct).has_value()) << ToSql(conjunct);
+  }
+}
+
+TEST(AstTest, BoxCopiesDeeply) {
+  Box<Expr> a(Expr(ColumnRef{.name = "a"}));
+  Box<Expr> b(Expr(ColumnRef{.name = "b"}));
+  b = a;
+  std::get<ColumnRef>(*a).name = "changed";
+  EXPECT_EQ(std::get<ColumnRef>(*b).name, "a");
+  const Box<Expr>& self = b;
+  b = self;
+  EXPECT_EQ(std::get<ColumnRef>(*b).name, "a");
+}
+
+// EqualIgnoringSpans tells apart every part of a CASE and of the other expression nodes.
+TEST(EqualIgnoringSpansTest, DetectsDifferencesInExpressions) {
+  const std::string_view base = "CASE a WHEN 1 THEN 'x' ELSE 'y' END";
+  for (const std::string_view other : {
+           "CASE WHEN 1 THEN 'x' ELSE 'y' END"sv,                    // operand
+           "CASE a WHEN 1 THEN 'x' END"sv,                           // else
+           "CASE a WHEN 2 THEN 'x' ELSE 'y' END"sv,                  // when
+           "CASE a WHEN 1 THEN 'z' ELSE 'y' END"sv,                  // then
+           "CASE a WHEN 1 THEN 'x' WHEN 2 THEN 'x' ELSE 'y' END"sv,  // branches
+           "f(a)"sv,                                                 // node kind
+       }) {
+    auto x = Parse("SELECT " + std::string(base) + " FROM t");
+    auto y = Parse("SELECT " + std::string(other) + " FROM t");
+    ASSERT_TRUE(x.has_value() && y.has_value()) << other;
+    EXPECT_FALSE(EqualIgnoringSpans(x->items[0].expr, y->items[0].expr)) << other;
+  }
+  for (const auto& [a, b] : std::to_array<std::pair<std::string_view, std::string_view>>({
+           {"-a", "NOT a"},
+           {"a + b", "a - b"},
+           {"a LIKE 'x'", "a NOT LIKE 'x'"},
+           {"a IN (1)", "a NOT IN (1)"},
+           {"a IN (1)", "a IN (1, 2)"},
+           {"f(a)", "g(a)"},
+           {"f(a)", "\"f\"(a)"},
+           {"f(a)", "f(a, b)"},
+           {"EXTRACT(minute FROM a)", "EXTRACT(hour FROM a)"},
+           {"SUM(a)", "SUM(a + 1)"},
+           {"COUNT(*)", "COUNT(a)"},
+       })) {
+    auto x = Parse("SELECT " + std::string(a) + " FROM t");
+    auto y = Parse("SELECT " + std::string(b) + " FROM t");
+    ASSERT_TRUE(x.has_value() && y.has_value()) << a << " / " << b;
+    EXPECT_FALSE(EqualIgnoringSpans(x->items[0].expr, y->items[0].expr)) << a << " / " << b;
+    EXPECT_TRUE(EqualIgnoringSpans(x->items[0].expr, x->items[0].expr));
+  }
 }
 
 }  // namespace

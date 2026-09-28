@@ -44,12 +44,12 @@
 //
 // The parser keeps expressions as written; what the engine answers is the binder's decision. The
 // WHERE and HAVING predicates are split at their top-level AND chain, collected in a loop.
-// Recursion is bounded: every other level of an expression tree counts against kMaxDepth. Tokens
-// are pulled lazily from the lexer (at most three tokens of lookahead), so work and memory stop at
-// the first error whatever the input. Recognized SQL outside the grammar yields kUnsupported at its
-// first offending token and names the construct; anything else yields kSyntax. A lexer error among
-// the tokens the parser looked at wins over the parser's own verdict, which may have been reached
-// on the placeholder end-of-input token.
+// Recursion is bounded: every level of an expression tree (but that chain) counts against
+// kMaxDepth. Tokens are pulled lazily from the lexer (at most three tokens of lookahead), so work
+// and memory stop at the first error whatever the input. Recognized SQL outside the grammar yields
+// kUnsupported at its first offending token and names the construct; anything else yields kSyntax.
+// A lexer error among the tokens the parser looked at wins over the parser's own verdict, which may
+// have been reached on the placeholder end-of-input token.
 
 namespace antb1::sql {
 namespace {
@@ -351,17 +351,7 @@ bool EndsList(const Token& token) {
 }
 
 std::string_view Expectation(Context context) {
-  switch (context) {
-    case Context::kSelect:
-      return "an expression or '*'";
-    case Context::kAggregateArg:
-    case Context::kWhere:
-    case Context::kGroupBy:
-    case Context::kHaving:
-    case Context::kOrderBy:
-      return "an expression";
-  }
-  return "an expression";
+  return context == Context::kSelect ? "an expression or '*'" : "an expression";
 }
 
 ParseError NotAQuery(const Token& token) {
@@ -516,9 +506,6 @@ class Parser {
     }
     SelectItem item{.expr = std::move(*expr), .alias = {}, .span = {}};
     item.span = item.expr.span();
-    if (auto error = UnsupportedOperator(); error.has_value()) {
-      return std::unexpected(std::move(*error));
-    }
     const Token& next = Peek();
     if (next.IsKeyword("AS")) {
       Take();
@@ -627,9 +614,9 @@ class Parser {
       if (precedence == 0 || precedence < min_precedence) {
         return lhs;
       }
-      if (auto error = Deeper(); error.has_value()) {
-        return std::unexpected(std::move(*error));
-      }
+      // One more level for the operator; the right operand's own check (one level deeper) reports
+      // a tree that gets too deep.
+      ++depth_;
       auto combined = ParseInfix(context, *std::move(lhs), precedence);
       if (!combined) {
         return combined;
@@ -939,7 +926,9 @@ class Parser {
         .kind = kind, .arg = std::move(argument), .distinct = distinct, .span = span};
   }
 
-  // name(arg, ...), positioned at the name (the next token is '(').
+  // name(arg, ...), positioned at the name (the next token is '('). Special argument syntax that
+  // DuckDB has for some functions (position('a' IN s), substring(s FROM 1), try_cast(x AS t), ...)
+  // is not a syntax error but an unsupported function call, and so is a FILTER clause.
   Expected<Expr> ParseFunction(Context context) {
     Token name = Take();
     Take();  // '('
@@ -948,31 +937,35 @@ class Parser {
                       .args = {},
                       .name_span = name.span,
                       .span = {}};
-    if (Peek().IsKeyword("DISTINCT") || Peek().IsKeyword("ALL")) {
-      return Unsupported(Peek().span, KeywordOf(Peek()) + " in function calls is not supported");
-    }
-    if (Peek().kind == TokenKind::kStar) {
-      return Unsupported(Peek().span, "'*' as a function argument is not supported");
+    const auto unsupported = [&call] {
+      return Unsupported(call.name_span, "function " + Clip(call.name) +
+                                             "() with this argument syntax is not supported");
+    };
+    if (Peek().IsKeyword("DISTINCT") || Peek().IsKeyword("ALL") ||
+        Peek().kind == TokenKind::kStar) {
+      return unsupported();
     }
     while (Peek().kind != TokenKind::kRightParen) {
       auto arg = ParseExpr(context);
       if (!arg) {
+        if (arg.error().kind == ParseError::Kind::kSyntax && !lex_error_.has_value()) {
+          return unsupported();
+        }
         return arg;
       }
       call.args.push_back(*std::move(arg));
-      if (Peek().IsKeyword("ORDER")) {
-        return Unsupported(Peek().span, "ORDER BY in function calls is not supported");
-      }
       if (Peek().kind == TokenKind::kRightParen) {
         break;
       }
       if (Peek().kind != TokenKind::kComma) {
-        return Syntax(Peek().span,
-                      "expected , or ) in " + Clip(call.name) + "(...), found " + Describe(Peek()));
+        return unsupported();
       }
       Take();
     }
     call.span = Cover(call.name_span, Take().span);
+    if (Peek().IsKeyword("FILTER") && PeekAt(1).kind == TokenKind::kLeftParen) {
+      return Unsupported(Peek().span, "FILTER clauses are not supported");
+    }
     return Expr(std::move(call));
   }
 
@@ -981,7 +974,7 @@ class Parser {
     const SourceSpan begin = Take().span;
     Take();  // '('
     const Token& field = Peek();
-    if (field.kind != TokenKind::kIdentifier && field.kind != TokenKind::kString) {
+    if (field.kind != TokenKind::kIdentifier) {
       return Syntax(field.span, "expected a field name in EXTRACT(, found " + Describe(field));
     }
     Token field_token = Take();
@@ -1094,7 +1087,10 @@ class Parser {
       if (Contains(kNegatableOperators, after)) {
         return UnsupportedError(token.span, "NOT " + after + " is not supported");
       }
-      return SyntaxError(token.span, "unexpected NOT after an operand");
+      if (after == "NULL") {
+        return UnsupportedError(token.span, "NOT NULL (IS NOT NULL) is not supported");
+      }
+      return UnsupportedError(token.span, "NOT is not supported");
     }
     return std::nullopt;
   }
@@ -1103,6 +1099,13 @@ class Parser {
   // a long conjunction builds no deep tree. Should an OR follow, the chain so far (as a tree) is
   // its left operand and the whole predicate is one conjunct.
   Status ParseConjuncts(Context context, std::vector<Expr>& out) {
+    const std::size_t depth = depth_;
+    auto status = ParseConjunctsAtDepth(context, out);
+    depth_ = depth;
+    return status;
+  }
+
+  Status ParseConjunctsAtDepth(Context context, std::vector<Expr>& out) {
     std::vector<Expr> chain;
     while (true) {
       auto conjunct = ParseExpr(context, kNotPrecedence);
@@ -1124,9 +1127,7 @@ class Parser {
       return std::unexpected(std::move(lhs.error()));
     }
     while (Peek().IsKeyword("OR")) {
-      if (auto error = Deeper(); error.has_value()) {
-        return std::unexpected(std::move(*error));
-      }
+      ++depth_;  // checked by the right operand, one level deeper
       const Token op = Take();
       auto rhs = ParseExpr(context, kAndPrecedence);
       if (!rhs) {

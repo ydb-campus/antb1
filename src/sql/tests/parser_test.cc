@@ -612,6 +612,22 @@ TEST(ParserTest, ExpressionDepthIsLimited) {
     ors += " OR a = 1";
   }
   EXPECT_FALSE(Parse(ors).has_value());
+  // An AND chain is free until an OR makes it an operand: then its ANDs count too.
+  std::string and_chain = "SELECT a FROM t WHERE a = 0";
+  for (int i = 0; i < 300; ++i) {
+    and_chain += " AND a = 1";
+  }
+  EXPECT_TRUE(Parse(and_chain).has_value());
+  auto ored = Parse(and_chain + " OR a = 2");
+  ASSERT_FALSE(ored.has_value());
+  EXPECT_EQ(ored.error().kind, ParseError::Kind::kUnsupported);
+  // The depth of one clause does not carry over to the next.
+  std::string then = "SELECT a FROM t WHERE a = 0";
+  for (int i = 0; i < 200; ++i) {
+    then += " OR a = 1";
+  }
+  then += " GROUP BY " + std::string(100, '(') + "a" + std::string(100, ')');
+  EXPECT_TRUE(Parse(then).has_value());
 }
 
 // Literals are select items (constants), and in GROUP BY and ORDER BY positions or constants; the
@@ -849,6 +865,28 @@ INSTANTIATE_TEST_SUITE_P(
                    "DISTINCT is not supported"},
         RejectCase{"SumDistinct", "SELECT SUM(^distinct user_id) FROM events", kUnsupported, 8,
                    "SUM(DISTINCT ...) is not supported"},
+        RejectCase{"FunctionDistinct", "SELECT ^f(DISTINCT a) FROM events", kUnsupported, 1,
+                   "function f() with this argument syntax is not supported"},
+        RejectCase{"FunctionStar", "SELECT ^f(*) FROM events", kUnsupported, 1,
+                   "function f() with this argument syntax is not supported"},
+        RejectCase{"FunctionOrderBy", "SELECT ^string_agg(a ORDER BY a) FROM events", kUnsupported,
+                   10, "function string_agg() with this argument syntax"},
+        RejectCase{"PositionIn", "SELECT ^position('a' IN u) FROM events", kUnsupported, 8,
+                   "function position() with this argument syntax is not supported"},
+        RejectCase{"SubstringFrom", "SELECT ^substring(u FROM 1 FOR 2) FROM events", kUnsupported,
+                   9, "function substring() with this argument syntax is not supported"},
+        RejectCase{"TryCast", "SELECT ^try_cast(a AS BIGINT) FROM events", kUnsupported, 8,
+                   "function try_cast() with this argument syntax is not supported"},
+        RejectCase{"FunctionSyntaxError", "SELECT ^f(a +) FROM events", kUnsupported, 1,
+                   "function f() with this argument syntax is not supported"},
+        RejectCase{"FunctionFilter", "SELECT count_if(a > 0) ^FILTER (WHERE a < 5) FROM events",
+                   kUnsupported, 6, "FILTER clauses are not supported"},
+        RejectCase{"PostfixNotNull", "SELECT a FROM events WHERE a ^NOT NULL", kUnsupported, 3,
+                   "NOT NULL (IS NOT NULL) is not supported"},
+        RejectCase{"PostfixNot", "SELECT a ^NOT b FROM events", kUnsupported, 3,
+                   "NOT is not supported"},
+        RejectCase{"Rollup", "SELECT a FROM events GROUP BY ^ROLLUP (a)", kUnsupported, 6,
+                   "ROLLUP is not supported"},
         RejectCase{"MaxDistinctInOrderBy", "SELECT a FROM events ORDER BY MAX(^DISTINCT a)",
                    kUnsupported, 8, "MAX(DISTINCT ...) is not supported"},
         RejectCase{"SelectAll", "SELECT ^ALL a FROM events", kUnsupported, 3,
@@ -1160,6 +1198,28 @@ INSTANTIATE_TEST_SUITE_P(
                    "expected an expression, found end of input"},
         RejectCase{"ChainedComparison", "SELECT a FROM events WHERE a = 1 ^= 2", kUnsupported, 1,
                    "chained comparisons (a = b = c) are not supported"},
+        RejectCase{"ExtractStringField", "SELECT EXTRACT(^'minute' FROM a) FROM events", kSyntax, 8,
+                   "expected a field name in EXTRACT(, found string literal"},
+        RejectCase{"ExtractWithoutFrom", "SELECT EXTRACT(minute ^a) FROM events", kSyntax, 1,
+                   "expected FROM in EXTRACT(field FROM ...), found identifier a"},
+        RejectCase{"ExtractWithoutSource", "SELECT EXTRACT(minute FROM ^) FROM events", kSyntax, 1,
+                   "expected an expression or '*', found ')'"},
+        RejectCase{"ExtractUnclosed", "SELECT EXTRACT(minute FROM a ^b) FROM events", kSyntax, 1,
+                   "expected ) to close EXTRACT(, found identifier b"},
+        RejectCase{"CaseWithoutWhen", "SELECT CASE a ^END FROM events", kSyntax, 3,
+                   "expected WHEN in CASE, found keyword END"},
+        RejectCase{"CaseWithoutThen", "SELECT CASE WHEN a ^END FROM events", kSyntax, 3,
+                   "expected THEN in CASE, found keyword END"},
+        RejectCase{"CaseEmptyWhen", "SELECT CASE WHEN ^THEN 1 END FROM events", kSyntax, 4,
+                   "expected an expression or '*', found keyword THEN"},
+        RejectCase{"CaseEmptyThen", "SELECT CASE WHEN a THEN ^END FROM events", kSyntax, 3,
+                   "expected an expression or '*', found keyword END"},
+        RejectCase{"CaseEmptyElse", "SELECT CASE WHEN a THEN 1 ELSE ^END FROM events", kSyntax, 3,
+                   "expected an expression or '*', found keyword END"},
+        RejectCase{"CaseUnclosed", "SELECT CASE WHEN a THEN 1 ^FROM events", kSyntax, 4,
+                   "expected WHEN, ELSE or END in CASE, found keyword FROM"},
+        RejectCase{"InListEmptyValue", "SELECT a FROM events WHERE a IN (1, ^)", kSyntax, 1,
+                   "expected an expression, found ')'"},
         RejectCase{"MissingLimit", "SELECT a FROM events LIMIT^", kSyntax, 0,
                    "expected a non-negative integer after LIMIT, found end of input"},
         RejectCase{"NegativeLimit", "SELECT a FROM events LIMIT ^-1", kSyntax, 1,
