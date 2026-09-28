@@ -37,7 +37,7 @@ std::string Join(const std::vector<T>& items, const F& render, std::string_view 
 }
 
 std::string PredicateText(const Predicate& p) {
-  const std::string column = p.column.has_value() ? Name(p.column->name) : "?";
+  std::string column = p.column.has_value() ? Name(p.column->name) : "?";
   switch (p.kind) {
     case Predicate::Kind::kCompare:
       return std::format("{} {} {}", column, ToString(p.op), ToString(p.constant));
@@ -59,6 +59,8 @@ std::string PredicateText(const Predicate& p) {
     }
     case Predicate::Kind::kIsNotNull:
       return column + " IS NOT NULL";
+    case Predicate::Kind::kIsTrue:
+      return column;
     case Predicate::Kind::kFalse:
       break;
   }

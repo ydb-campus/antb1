@@ -62,6 +62,7 @@ ColumnClass ClassOf(plan::LogicalType type) {
       return ColumnClass::kReal;
     case plan::LogicalType::kVarchar:
     case plan::LogicalType::kDate:
+    case plan::LogicalType::kBoolean:  // never a result column
       return ColumnClass::kText;
   }
   return ColumnClass::kText;

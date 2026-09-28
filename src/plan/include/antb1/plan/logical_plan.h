@@ -76,6 +76,36 @@ enum class ArithOp : std::uint8_t {
 // "+", "-", "*", "/", "//", "%".
 std::string_view ToString(ArithOp op);
 
+// A column of a node's input.
+struct BoundColumn {
+  int index = 0;     // position in the input node's output columns
+  std::string name;  // the table column's name as declared in the table schema
+  LogicalType type = LogicalType::kBigInt;
+};
+
+// One comparison of the WHERE conjunction after exact literal folding (docs/sql-subset.md).
+struct Predicate {
+  enum class Kind : std::uint8_t {
+    kCompare,         // column <op> constant
+    kCompareColumns,  // column <op> other (comparable types, compared as DuckDB compares them)
+    kLike,            // column LIKE constant (a VARCHAR column and pattern; docs/sql-subset.md)
+    kNotLike,         // column NOT LIKE constant
+    kIn,              // column IN (values): column = v1 OR column = v2 ... (Kleene)
+    kNotIn,           // column NOT IN (values): NOT (column IN (values))
+    kIsNotNull,       // folded: true for every non-NULL value (NULL still rejects the row)
+    kFalse,           // folded: true for no row (inside an expression: NULL for a NULL column)
+    kIsTrue,          // a BOOLEAN column (a computed condition) is true
+  };
+
+  Kind kind = Kind::kCompare;
+  std::optional<BoundColumn> column;  // empty for kFalse
+  std::optional<BoundColumn> other;   // kCompareColumns only
+  CompareOp op = CompareOp::kEq;      // kCompare and kCompareColumns
+  Constant constant;                  // kCompare, kLike and kNotLike; typed as the column
+  std::vector<Constant> values;       // kIn and kNotIn (not empty); typed as the column
+  SourceSpan span;                    // the comparison in the query
+};
+
 struct Expr;
 using ExprPtr = std::shared_ptr<const Expr>;
 
@@ -115,10 +145,38 @@ struct FunctionExpr {
   std::vector<ExprPtr> args;
 };
 
+// A condition of the binder's WHERE forms (a comparison, [NOT] LIKE, [NOT] IN, folded as in
+// WHERE) inside a boolean expression: its column is operands[0] (index 0) and, for
+// kCompareColumns, its other column operands[1] (index 1). BOOLEAN, with NULL where SQL's
+// three-valued logic has it: a kFalse or kIsNotNull predicate is NULL for a NULL operand.
+struct PredicateExpr {
+  Predicate predicate;
+  std::vector<ExprPtr> operands;
+};
+
+enum class BoolOp : std::uint8_t { kAnd, kOr, kNot };
+
+// AND or OR of two or more BOOLEAN arguments, or NOT of one, in three-valued logic.
+struct BoolExpr {
+  BoolOp op = BoolOp::kAnd;
+  std::vector<ExprPtr> args;
+};
+
+// CASE WHEN whens[0] THEN thens[0] ... ELSE otherwise END: the first branch whose condition is
+// true (a NULL condition is not), else `otherwise` (NULL when it is null). The values are of the
+// expression's type (the executor casts them to it).
+struct CaseExpr {
+  std::vector<ExprPtr> whens;  // BOOLEAN
+  std::vector<ExprPtr> thens;  // as many as whens
+  ExprPtr otherwise;           // may be null
+};
+
 // A scalar expression, typed as DuckDB types it (docs/sql-subset.md). Integer arithmetic is exact
 // in its type: an overflow is an execution error, as in DuckDB.
 struct Expr {
-  std::variant<ColumnExpr, ConstantExpr, ArithExpr, NegateExpr, FunctionExpr> node;
+  std::variant<ColumnExpr, ConstantExpr, ArithExpr, NegateExpr, FunctionExpr, PredicateExpr,
+               BoolExpr, CaseExpr>
+      node;
   LogicalType type = LogicalType::kBigInt;
   std::string name;  // DuckDB's result name of the expression, e.g. (a + 1)
 };
@@ -131,35 +189,6 @@ ExprPtr Renumber(const ExprPtr& expr, const std::vector<int>& remap);
 
 // Every input column the expression reads.
 void CollectColumns(const Expr& expr, std::vector<int>& out);
-
-// A column of a node's input.
-struct BoundColumn {
-  int index = 0;     // position in the input node's output columns
-  std::string name;  // the table column's name as declared in the table schema
-  LogicalType type = LogicalType::kBigInt;
-};
-
-// One comparison of the WHERE conjunction after exact literal folding (docs/sql-subset.md).
-struct Predicate {
-  enum class Kind : std::uint8_t {
-    kCompare,         // column <op> constant
-    kCompareColumns,  // column <op> other (comparable types, compared as DuckDB compares them)
-    kLike,            // column LIKE constant (a VARCHAR column and pattern; docs/sql-subset.md)
-    kNotLike,         // column NOT LIKE constant
-    kIn,              // column IN (values): column = v1 OR column = v2 ... (Kleene)
-    kNotIn,           // column NOT IN (values): NOT (column IN (values))
-    kIsNotNull,       // folded: true for every non-NULL value (NULL still rejects the row)
-    kFalse,           // folded: true for no row
-  };
-
-  Kind kind = Kind::kCompare;
-  std::optional<BoundColumn> column;  // empty for kFalse
-  std::optional<BoundColumn> other;   // kCompareColumns only
-  CompareOp op = CompareOp::kEq;      // kCompare and kCompareColumns
-  Constant constant;                  // kCompare, kLike and kNotLike; typed as the column
-  std::vector<Constant> values;       // kIn and kNotIn (not empty); typed as the column
-  SourceSpan span;                    // the comparison in the query
-};
 
 struct AggregateCall {
   AggKind kind = AggKind::kCountStar;

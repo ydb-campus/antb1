@@ -1,5 +1,6 @@
 #include "antb1/plan/logical_plan.h"
 
+#include <algorithm>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -142,6 +143,18 @@ bool SameConstant(const Constant& a, const Constant& b) {
   return a.value == b.value;
 }
 
+bool SameExprs(const std::vector<ExprPtr>& a, const std::vector<ExprPtr>& b) {
+  return std::ranges::equal(a, b, [](const ExprPtr& x, const ExprPtr& y) {
+    return (x == nullptr) == (y == nullptr) && (x == nullptr || SameExpr(*x, *y));
+  });
+}
+
+bool SamePredicate(const Predicate& a, const Predicate& b) {
+  return a.kind == b.kind && a.op == b.op && SameConstant(a.constant, b.constant) &&
+         std::ranges::equal(a.values, b.values, SameConstant) &&
+         a.column.has_value() == b.column.has_value() && a.other.has_value() == b.other.has_value();
+}
+
 struct SameNode {
   const Expr& other;
   bool operator()(const ColumnExpr& a) const {
@@ -169,7 +182,46 @@ struct SameNode {
     }
     return true;
   }
+  bool operator()(const PredicateExpr& a) const {
+    const auto& b = std::get<PredicateExpr>(other.node);
+    return SamePredicate(a.predicate, b.predicate) && SameExprs(a.operands, b.operands);
+  }
+  bool operator()(const BoolExpr& a) const {
+    const auto& b = std::get<BoolExpr>(other.node);
+    return a.op == b.op && SameExprs(a.args, b.args);
+  }
+  bool operator()(const CaseExpr& a) const {
+    const auto& b = std::get<CaseExpr>(other.node);
+    return SameExprs(a.whens, b.whens) && SameExprs(a.thens, b.thens) &&
+           SameExprs({a.otherwise}, {b.otherwise});
+  }
 };
+
+// The children of an expression node, in order (a null ELSE included).
+std::vector<ExprPtr*> Children(Expr& expr) {
+  std::vector<ExprPtr*> out;
+  const auto all = [&](std::vector<ExprPtr>& exprs) {
+    for (ExprPtr& e : exprs) {
+      out.push_back(&e);
+    }
+  };
+  if (auto* arith = std::get_if<ArithExpr>(&expr.node)) {
+    out = {&arith->left, &arith->right};
+  } else if (auto* negate = std::get_if<NegateExpr>(&expr.node)) {
+    out = {&negate->operand};
+  } else if (auto* function = std::get_if<FunctionExpr>(&expr.node)) {
+    all(function->args);
+  } else if (auto* predicate = std::get_if<PredicateExpr>(&expr.node)) {
+    all(predicate->operands);
+  } else if (auto* boolean = std::get_if<BoolExpr>(&expr.node)) {
+    all(boolean->args);
+  } else if (auto* c = std::get_if<CaseExpr>(&expr.node)) {
+    all(c->whens);
+    all(c->thens);
+    out.push_back(&c->otherwise);
+  }
+  return out;
+}
 
 }  // namespace
 
@@ -183,14 +235,10 @@ ExprPtr Renumber(const ExprPtr& expr, const std::vector<int>& remap) {
   if (auto* column = std::get_if<ColumnExpr>(&out.node)) {
     column->index = remap.at(Narrow<std::size_t>(column->index));
     ANTB1_CHECK(column->index >= 0);
-  } else if (auto* arith = std::get_if<ArithExpr>(&out.node)) {
-    arith->left = Renumber(arith->left, remap);
-    arith->right = Renumber(arith->right, remap);
-  } else if (auto* negate = std::get_if<NegateExpr>(&out.node)) {
-    negate->operand = Renumber(negate->operand, remap);
-  } else if (auto* function = std::get_if<FunctionExpr>(&out.node)) {
-    for (ExprPtr& arg : function->args) {
-      arg = Renumber(arg, remap);
+  }
+  for (ExprPtr* child : Children(out)) {
+    if (*child != nullptr) {
+      *child = Renumber(*child, remap);
     }
   }
   return std::make_shared<const Expr>(std::move(out));
@@ -199,14 +247,11 @@ ExprPtr Renumber(const ExprPtr& expr, const std::vector<int>& remap) {
 void CollectColumns(const Expr& expr, std::vector<int>& out) {
   if (const auto* column = std::get_if<ColumnExpr>(&expr.node)) {
     out.push_back(column->index);
-  } else if (const auto* arith = std::get_if<ArithExpr>(&expr.node)) {
-    CollectColumns(*arith->left, out);
-    CollectColumns(*arith->right, out);
-  } else if (const auto* negate = std::get_if<NegateExpr>(&expr.node)) {
-    CollectColumns(*negate->operand, out);
-  } else if (const auto* function = std::get_if<FunctionExpr>(&expr.node)) {
-    for (const ExprPtr& arg : function->args) {
-      CollectColumns(*arg, out);
+  }
+  Expr copy = expr;  // Children takes a mutable node; the copy shares the children
+  for (const ExprPtr* child : Children(copy)) {
+    if (*child != nullptr) {
+      CollectColumns(**child, out);
     }
   }
 }
@@ -272,6 +317,7 @@ arrow::Result<std::shared_ptr<arrow::Scalar>> ToArrowScalar(const Constant& cons
         return HugeIntScalar(*v);
       case LogicalType::kDouble:
       case LogicalType::kVarchar:
+      case LogicalType::kBoolean:
         break;
     }
   } else if (const auto* d = std::get_if<double>(&constant.value)) {

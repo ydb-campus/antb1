@@ -70,8 +70,9 @@ if(ANTB1_HAVE_DUCKDB)
   list(APPEND _data_tests data.hits0.slice data.clickbench.status)
 endif()
 
-# Generous timeouts: host runs on the full dataset (ANTB1_HITS_FILES) and ASan builds are slow.
+# Generous timeouts: host runs on the full dataset (ANTB1_HITS_FILES; the status test answers every
+# query on both engines, about 30 minutes over the 100 files) and ASan builds are slow.
 set_tests_properties(
   ${_data_tests}
-  PROPERTIES LABELS data FIXTURES_REQUIRED "antb1_hits0;antb1_fixtures" TIMEOUT 1800
+  PROPERTIES LABELS data FIXTURES_REQUIRED "antb1_hits0;antb1_fixtures" TIMEOUT 3600
 )

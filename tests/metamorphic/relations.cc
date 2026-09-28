@@ -701,6 +701,63 @@ std::vector<Relation> AllRelations() {
     sizes.probes.push_back(Q(std::format(kKeys, "hits_like")));
     r.push_back(std::move(sizes));
   }
+  // Boolean conditions: OR and AND count like a union and an intersection; p and NOT p split the
+  // non-NULL values of p's column (NULL is neither, folded comparisons included); CASE WHEN p
+  // counts what WHERE p keeps; CASE keys group alike whatever the batch size and file layout.
+  {
+    constexpr std::string_view kP = "RegionID > 200";
+    constexpr std::string_view kQ = "URL LIKE '%a%'";
+    r.push_back(
+        {.name = "or_and_count_like_union_and_intersection",
+         .features = {kSum, kCase, kBooleanExpressions, kArithmetic, kIntegerColumns,
+                      kVarcharColumns, kIntegerLiteral, kStringLiteral, kLike, kTableName},
+         .probes = {Q(std::format(
+                        "SELECT SUM(CASE WHEN {0} OR {1} THEN 1 ELSE 0 END) + "
+                        "SUM(CASE WHEN {0} AND {1} THEN 1 ELSE 0 END) FROM hits_like_nulls",
+                        kP, kQ)),
+                    Q(std::format("SELECT SUM(CASE WHEN {} THEN 1 ELSE 0 END) + "
+                                  "SUM(CASE WHEN {} THEN 1 ELSE 0 END) FROM hits_like_nulls",
+                                  kP, kQ))},
+         .check = AllEqual()});
+    for (const auto& [suffix, condition] :
+         std::to_array<std::pair<std::string_view, std::string_view>>(
+             {{"compare", "RegionID > 200"},
+              {"never_true", "RegionID = 1.5"},
+              {"arithmetic", "RegionID + 1 < 100000"}})) {
+      r.push_back(
+          {.name = std::format("not_splits_non_null_values_{}", suffix),
+           .features = {kCountStar, kCountColumn, kWhere, kBooleanExpressions, kIntegerColumns,
+                        kIntegerLiteral, kDecimalLiteral, kArithmetic, kTableName},
+           .probes = {Q("SELECT COUNT(RegionID) FROM hits_like_nulls"),
+                      Q(std::format("SELECT COUNT(*) FROM hits_like_nulls WHERE {}", condition)),
+                      Q(std::format("SELECT COUNT(*) FROM hits_like_nulls WHERE NOT ({})",
+                                    condition))},
+           .check = FirstEqualsSumOfRest()});
+    }
+    r.push_back(
+        {.name = "case_counts_what_where_keeps",
+         .features = {kCountStar, kCountColumn, kWhere, kCase, kBooleanExpressions, kIntegerColumns,
+                      kVarcharColumns, kIntegerLiteral, kStringLiteral, kLike, kTableName},
+         .probes = {Q(std::format("SELECT COUNT(*) FROM hits_like_nulls WHERE {} OR {}", kP, kQ)),
+                    Q(std::format("SELECT COUNT(CASE WHEN {} OR {} THEN 1 END) FROM "
+                                  "hits_like_nulls",
+                                  kP, kQ))},
+         .check = AllEqual()});
+    constexpr std::string_view kKeys =
+        "SELECT CASE WHEN IsMobile = 1 AND OS > 100 THEN URL WHEN OS < 10 THEN 'low' ELSE '' END "
+        "AS k, COUNT(*), SUM(RegionID) FROM {} GROUP BY k";
+    Relation sizes{
+        .name = "case_keys_batch_size_invariance",
+        .features = {kGroupBy, kCountStar, kSum, kCase, kBooleanExpressions, kMultipleItems, kAlias,
+                     kIntegerColumns, kVarcharColumns, kIntegerLiteral, kStringLiteral, kTableName},
+        .probes = {},
+        .check = AllEqual()};
+    for (const int64_t batch : kBatchSizes) {
+      sizes.probes.push_back(Q(std::format(kKeys, "hits_like_split"), batch));
+    }
+    sizes.probes.push_back(Q(std::format(kKeys, "hits_like")));
+    r.push_back(std::move(sizes));
+  }
   // [NOT] IN partitions the non-NULL values of a column, and IN over distinct values counts the
   // rows equal to each.
   for (const auto& [column, values, type, literal] :

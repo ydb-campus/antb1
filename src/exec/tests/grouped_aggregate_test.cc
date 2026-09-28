@@ -123,6 +123,9 @@ std::shared_ptr<arrow::Array> RandomColumn(LogicalType type, std::size_t n, Rng&
         status = static_cast<arrow::Date32Builder&>(*builder).Append(
             static_cast<std::int32_t>(rng.Below(40000)) - 20000);
         break;
+      case LogicalType::kBoolean:  // never an aggregate argument
+        status = arrow::Status::Invalid("no BOOLEAN input");
+        break;
     }
     EXPECT_TRUE(status.ok()) << status.ToString();
   }

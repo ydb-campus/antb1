@@ -194,7 +194,7 @@ antb1_add_cli_golden(
   unsupported_where
   EXIT_CODE 4
   STDERR
-  ARGS query -c "SELECT COUNT(*) FROM t\nWHERE IsMobile = 1 OR IsRefresh = 1" --table "${_t}"
+  ARGS query -c "SELECT COUNT(*) FROM t\nWHERE IsMobile = 1 OR IsRefresh IS NULL" --table "${_t}"
 )
 antb1_add_cli_golden(
   error_bind_column

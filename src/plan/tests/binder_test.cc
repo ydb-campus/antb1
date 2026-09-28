@@ -240,12 +240,10 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT a FROM t GROUP BY year(d)", kUnsupported, "year",
                   "function year() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN and "
                   "REGEXP_REPLACE)"},
-        ErrorCase{"SELECT a FROM t GROUP BY a HAVING COUNT(*) > 1 OR a = 2", kUnsupported, "OR",
-                  "OR is not supported"},
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING 1 < 2", kUnsupported, "2",
                   "comparisons between two literals are not supported"},
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING COUNT(*)", kUnsupported, "COUNT(*)",
-                  "HAVING conditions other than comparisons (aggregate or column <op> literal) are "
+                  "conditions other than comparisons, [NOT] LIKE, [NOT] IN, AND, OR and NOT are "
                   "not supported"},
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING MIN(s) LIKE MAX(s)", kUnsupported, "MAX(s)",
                   "LIKE with a column or an aggregate as the pattern is not supported"},
@@ -260,28 +258,43 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT a FROM t WHERE 'x' LIKE url", kUnsupported, "'x'",
                   "LIKE needs a column on the left"},
         ErrorCase{"SELECT url LIKE '%x%' FROM t", kUnsupported, "LIKE",
-                  "LIKE is only supported in WHERE and HAVING"},
+                  "LIKE is only supported in conditions (WHERE, HAVING and CASE WHEN)"},
         ErrorCase{"SELECT a FROM t WHERE region IN (1, b)", kUnsupported, "b",
                   "only literals are supported in an IN list"},
         ErrorCase{"SELECT a FROM t WHERE 1 IN (a)", kUnsupported, "1",
                   "IN needs a column on the left"},
         ErrorCase{"SELECT region IN ('a') FROM t", kUnsupported, "IN",
-                  "IN is only supported in WHERE and HAVING"},
+                  "IN is only supported in conditions (WHERE, HAVING and CASE WHEN)"},
         ErrorCase{"SELECT a FROM t WHERE region IN (1 + 2)", kUnsupported, "1 + 2",
                   "only literals are supported in an IN list"},
-        ErrorCase{"SELECT CASE WHEN a = 1 THEN 1 END FROM t", kUnsupported, "CASE",
-                  "CASE is not supported"},
-        ErrorCase{"SELECT a FROM t WHERE a = CASE WHEN b THEN 1 END", kUnsupported, "CASE",
-                  "CASE is not supported"},
-        ErrorCase{"SELECT a FROM t WHERE a = 1 OR b = 2", kUnsupported, "OR",
-                  "OR is not supported"},
-        ErrorCase{"SELECT a FROM t WHERE flag or b = 2", kUnsupported, "flag",
-                  "predicates other than comparisons (column <op> literal) are not supported"},
-        ErrorCase{"SELECT a FROM t WHERE a = 1 AND b = 2 OR c = 3", kUnsupported, "OR",
-                  "OR is not supported"},
-        ErrorCase{"SELECT a FROM t WHERE NOT a = 1", kUnsupported, "NOT", "NOT is not supported"},
-        ErrorCase{"SELECT a FROM t WHERE a = 1 AND NOT b = 2", kUnsupported, "NOT",
-                  "NOT is not supported"},
+        ErrorCase{"SELECT CASE WHEN i16 = 1 THEN s ELSE 1 END FROM t", kBind, "1",
+                  "cannot mix values of type VARCHAR and INTEGER in CASE"},
+        ErrorCase{"SELECT CASE WHEN i16 = 1 THEN dt ELSE 2 END FROM t", kBind, "2",
+                  "cannot mix values of type DATE and INTEGER in CASE"},
+        ErrorCase{"SELECT CASE WHEN i16 = 1 THEN dt ELSE '2020-13-01' END FROM t", kBind,
+                  "'2020-13-01'", "invalid date '2020-13-01'"},
+        ErrorCase{"SELECT CASE WHEN i16 = 1 THEN '1' ELSE i16 END FROM t", kUnsupported, "'1'",
+                  "a string literal as a CASE value next to SMALLINT values is not supported"},
+        ErrorCase{"SELECT CASE WHEN i16 = 1 THEN i16 ELSE 1.5 END FROM t", kUnsupported, "1.5",
+                  "a decimal literal as a CASE value is not supported"},
+        ErrorCase{"SELECT CASE WHEN i16 = 1 THEN s = 'a' END FROM t", kUnsupported, "=",
+                  "comparisons are only supported in conditions"},
+        ErrorCase{"SELECT CASE WHEN 1 = 1 THEN i16 END FROM t", kUnsupported, "1",
+                  "comparisons between two literals are not supported"},
+        ErrorCase{"SELECT CASE WHEN i16 = 1 THEN i16 END, COUNT(*) FROM t", kBind, "i16",
+                  "must appear in the GROUP BY clause"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE i16 = 1 OR s", kUnsupported, "s",
+                  "conditions other than comparisons"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE i16 = 1 OR s = 1", kBind, "1",
+                  "cannot compare VARCHAR column 's' with"},
+        ErrorCase{
+            "SELECT a FROM t WHERE a = CASE WHEN b THEN 1 END", kUnsupported, "b",
+            "conditions other than comparisons, [NOT] LIKE, [NOT] IN, AND, OR and NOT are not "
+            "supported"},
+        ErrorCase{
+            "SELECT a FROM t WHERE flag or b = 2", kUnsupported, "flag",
+            "conditions other than comparisons, [NOT] LIKE, [NOT] IN, AND, OR and NOT are not "
+            "supported"},
         ErrorCase{"SELECT a FROM t WHERE 1 - 1 = a", kUnsupported, "1 - 1",
                   "a constant expression in a comparison is not supported"},
         // Arithmetic: numbers only, no DECIMAL, no DATE arithmetic, no // or % in HUGEINT.
@@ -345,19 +358,27 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT SUM('x') FROM t", kUnsupported, "'x'",
                   "constant aggregate arguments are not supported"},
         ErrorCase{"SELECT a = 1 FROM t", kUnsupported, "=",
-                  "comparisons are only supported in WHERE and HAVING"},
+                  "comparisons are only supported in conditions (WHERE, HAVING and CASE WHEN)"},
         ErrorCase{"SELECT a AND b FROM t", kUnsupported, "AND",
-                  "AND is only supported between conditions of WHERE and HAVING"},
+                  "AND is only supported in conditions (WHERE, HAVING and CASE WHEN)"},
         ErrorCase{"SELECT a FROM t WHERE 1 = 1", kUnsupported, "1",
                   "comparisons between two literals are not supported"},
-        ErrorCase{"SELECT a FROM t WHERE flag", kUnsupported, "flag",
-                  "predicates other than comparisons (column <op> literal) are not supported"},
-        ErrorCase{"SELECT a FROM t WHERE flag AND a = 1", kUnsupported, "flag",
-                  "predicates other than comparisons (column <op> literal) are not supported"},
-        ErrorCase{"SELECT a FROM t WHERE 1 LIMIT 5", kUnsupported, "1",
-                  "predicates other than comparisons (column <op> literal) are not supported"},
-        ErrorCase{"SELECT a FROM t WHERE flag GROUP BY a", kUnsupported, "flag",
-                  "predicates other than comparisons (column <op> literal) are not supported"}));
+        ErrorCase{
+            "SELECT a FROM t WHERE flag", kUnsupported, "flag",
+            "conditions other than comparisons, [NOT] LIKE, [NOT] IN, AND, OR and NOT are not "
+            "supported"},
+        ErrorCase{
+            "SELECT a FROM t WHERE flag AND a = 1", kUnsupported, "flag",
+            "conditions other than comparisons, [NOT] LIKE, [NOT] IN, AND, OR and NOT are not "
+            "supported"},
+        ErrorCase{
+            "SELECT a FROM t WHERE 1 LIMIT 5", kUnsupported, "1",
+            "conditions other than comparisons, [NOT] LIKE, [NOT] IN, AND, OR and NOT are not "
+            "supported"},
+        ErrorCase{
+            "SELECT a FROM t WHERE flag GROUP BY a", kUnsupported, "flag",
+            "conditions other than comparisons, [NOT] LIKE, [NOT] IN, AND, OR and NOT are not "
+            "supported"}));
 
 TEST(BinderTest, TablesMatchCaseInsensitively) {
   const Catalog catalog = MakeCatalog();
@@ -909,6 +930,121 @@ TEST(BinderTest, StringFunctions) {
   auto where = BindSql("SELECT COUNT(*) FROM t WHERE strlen(s) > 3", catalog);
   ASSERT_TRUE(where.ok());
   EXPECT_EQ(std::get<FilterNode>(Nth(*where, 1)).predicates[0].constant.type, LogicalType::kBigInt);
+}
+
+// OR and NOT conjuncts are BOOLEAN expressions computed right before their filter (IS TRUE on the
+// computed column); their leaves fold like WHERE's comparisons, a never-true one keeping its
+// column so that NOT of it is NULL for NULL. HAVING's are computed over the aggregation.
+TEST(BinderTest, BooleanConditions) {
+  const Catalog catalog = MakeCatalog();
+  auto plan =
+      BindSql("SELECT COUNT(*) FROM t WHERE i32 > 0 AND (i16 = 1 OR s LIKE 'a%' AND NOT (i64 > 3))",
+              catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  std::string explain = Explain(*plan);
+  EXPECT_NE(explain.find("Filter \"((i16 = 1) OR ((s ~~ 'a%') AND (i64 <= 3)))\"\n"
+                         "    Compute ((i16 = 1) OR ((s ~~ 'a%') AND (i64 <= 3)))\n"
+                         "      Filter i32 > 0"),
+            std::string::npos)
+      << explain;
+  auto folded = BindSql("SELECT COUNT(*) FROM t WHERE NOT (i16 = 1.5) OR i16 + 1 > 10", catalog);
+  ASSERT_TRUE(folded.ok()) << folded.status().ToString();
+  const auto& compute = std::get<ComputeNode>(Nth(*folded, 2));
+  ASSERT_EQ(compute.exprs.size(), 1U);
+  const auto& any = std::get<BoolExpr>(compute.exprs[0]->node);
+  ASSERT_EQ(any.args.size(), 2U);
+  const auto& negated = std::get<BoolExpr>(any.args[0]->node);
+  EXPECT_EQ(negated.op, BoolOp::kNot);
+  const auto& never = std::get<PredicateExpr>(negated.args[0]->node);
+  EXPECT_EQ(never.predicate.kind, Predicate::Kind::kFalse);
+  ASSERT_TRUE(never.predicate.column.has_value()) << "NULL for a NULL i16, not FALSE";
+  EXPECT_EQ(never.operands.size(), 1U);
+  const auto& moved = std::get<PredicateExpr>(any.args[1]->node);
+  EXPECT_EQ(moved.predicate.kind, Predicate::Kind::kCompare);
+  EXPECT_EQ(ToString(moved.predicate.constant), "9") << "i16 > 9";
+  ASSERT_EQ(moved.operands.size(), 1U);
+  EXPECT_TRUE(std::holds_alternative<ColumnExpr>(moved.operands[0]->node))
+      << "the constant moved off i16, so the addition is never computed";
+
+  auto having = BindSql(
+      "SELECT i16, COUNT(*) AS n FROM t GROUP BY i16 HAVING n > 1 OR NOT (MIN(s) LIKE 'x%')",
+      catalog);
+  ASSERT_TRUE(having.ok()) << having.status().ToString();
+  explain = Explain(*having);
+  EXPECT_NE(explain.find("Filter \"((n > 1) OR (NOT (min(s) ~~ 'x%')))\"\n"
+                         "    Compute ((n > 1) OR (NOT (min(s) ~~ 'x%')))\n"
+                         "      GroupAggregate"),
+            std::string::npos)
+      << explain;
+}
+
+// CASE is typed as DuckDB types it: the values' common type, where an integer literal takes the
+// others' integer type when it fits, USMALLINT with SMALLINT is INTEGER and a string literal takes
+// any type; the simple form compares with =.
+TEST(BinderTest, CaseTypes) {
+  const Catalog catalog = MakeCatalog();
+  for (const auto& [expr, type] : std::to_array<std::pair<std::string_view, LogicalType>>({
+           {"CASE WHEN i16 = 1 THEN i16 ELSE 0 END", LogicalType::kSmallInt},
+           {"CASE WHEN i16 = 1 THEN i16 ELSE 40000 END", LogicalType::kInteger},
+           {"CASE WHEN i16 = 1 THEN i16 ELSE i32 END", LogicalType::kInteger},
+           {"CASE WHEN i16 = 1 THEN u16 ELSE i16 END", LogicalType::kInteger},
+           {"CASE WHEN i16 = 1 THEN u16 ELSE i64 END", LogicalType::kBigInt},
+           {"CASE WHEN i16 = 1 THEN h ELSE 1 END", LogicalType::kHugeInt},
+           {"CASE WHEN i16 = 1 THEN i64 ELSE d END", LogicalType::kDouble},
+           {"CASE WHEN i16 = 1 THEN i16 ELSE 1e3 END", LogicalType::kDouble},
+           {"CASE WHEN i16 = 1 THEN 0.5 ELSE d END", LogicalType::kDouble},
+           {"CASE WHEN i16 = 1 THEN 1 ELSE 3000000000 END", LogicalType::kBigInt},
+           {"CASE WHEN i16 = 1 THEN 1 END", LogicalType::kInteger},
+           {"CASE WHEN i16 = 1 THEN s ELSE '' END", LogicalType::kVarchar},
+           {"CASE WHEN i16 = 1 THEN 'a' END", LogicalType::kVarchar},
+           {"CASE WHEN i16 = 1 THEN dt ELSE '2020-01-02' END", LogicalType::kDate},
+           {"CASE i16 WHEN 1 THEN dt WHEN 2 THEN DATE '2020-01-01' END", LogicalType::kDate},
+       })) {
+    auto plan = BindSql(std::format("SELECT {} FROM t", expr), catalog);
+    ASSERT_TRUE(plan.ok()) << expr << ": " << plan.status().ToString();
+    EXPECT_EQ(plan->output[0].type, type) << expr;
+  }
+  auto named = BindSql(
+      "SELECT CASE i16 WHEN 1 THEN s END, CASE WHEN i16 > 0 OR i32 < 0 THEN 1 ELSE 2 END FROM t",
+      catalog);
+  ASSERT_TRUE(named.ok()) << named.status().ToString();
+  EXPECT_EQ(named->output[0].name, "CASE  WHEN ((i16 = 1)) THEN (s) ELSE NULL END");
+  // Conditions are named as DuckDB names them: NOT folded into a comparison or IN, <> as !=.
+  for (const auto& [condition, name] :
+       std::to_array<std::pair<std::string_view, std::string_view>>({
+           {"NOT (i16 > 1)", "(i16 <= 1)"},
+           {"NOT (NOT (i16 = 1))", "(i16 = 1)"},
+           {"NOT NOT NOT i16 = 1", "(i16 != 1)"},
+           {"NOT NOT i16 IN (1)", "(NOT (i16 NOT IN (1)))"},
+           {"NOT NOT s LIKE 'a%'", "(NOT (NOT (s ~~ 'a%')))"},
+           {"NOT NOT (i16 = 1 AND i32 = 5)", "(NOT (NOT ((i16 = 1) AND (i32 = 5))))"},
+           {"NOT i16 IN (1, 2)", "(i16 NOT IN (1, 2))"},
+           {"i16 IN (1, 2)", "(i16 IN (1, 2))"},
+           {"NOT (i16 NOT IN (1, 2))", "(NOT (i16 NOT IN (1, 2)))"},
+           {"i16 <> 1", "(i16 != 1)"},
+           {"NOT (s LIKE 'a%')", "(NOT (s ~~ 'a%'))"},
+           {"s NOT LIKE 'a%'", "(s !~~ 'a%')"},
+           {"i16 = 1 OR (i16 = 2 OR i16 = 3)", "((i16 = 1) OR (i16 = 2) OR (i16 = 3))"},
+           {"NOT (i16 = 1 AND i32 = 2)", "(NOT ((i16 = 1) AND (i32 = 2)))"},
+           {"dt > DATE '2020-01-01'", "(dt > CAST('2020-01-01' AS \"DATE\"))"},
+       })) {
+    auto plan = BindSql(std::format("SELECT CASE WHEN {} THEN 1 END FROM t", condition), catalog);
+    ASSERT_TRUE(plan.ok()) << condition << ": " << plan.status().ToString();
+    EXPECT_EQ(plan->output[0].name, std::format("CASE  WHEN ({}) THEN (1) ELSE NULL END", name))
+        << condition;
+  }
+  EXPECT_EQ(named->output[1].name, "CASE  WHEN (((i16 > 0) OR (i32 < 0))) THEN (1) ELSE 2 END");
+  // A CASE key by its alias; aggregates inside a CASE of the output scope.
+  auto grouped = BindSql(
+      "SELECT CASE WHEN i16 = 0 AND i32 = 0 THEN s ELSE '' END AS k, COUNT(*), "
+      "CASE WHEN SUM(i16) > 10 THEN 'many' END FROM t GROUP BY k",
+      catalog);
+  ASSERT_TRUE(grouped.ok()) << grouped.status().ToString();
+  const std::string explain = Explain(*grouped);
+  EXPECT_NE(explain.find("GroupAggregate keys=[\"CASE  WHEN (((i16 = 0) AND (i32 = 0))) THEN (s) "
+                         "ELSE '' END\"]"),
+            std::string::npos)
+      << explain;
 }
 
 TEST(BinderTest, ParenthesesGroupOnly) {

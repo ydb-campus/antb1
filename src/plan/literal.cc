@@ -337,6 +337,7 @@ IntegerRange RangeOf(LogicalType integer_type) {
     case LogicalType::kDouble:
     case LogicalType::kVarchar:
     case LogicalType::kDate:
+    case LogicalType::kBoolean:
       break;
   }
   ANTB1_CHECK(IsInteger(integer_type));

@@ -1,0 +1,106 @@
+# AND, OR and NOT in WHERE and HAVING (docs/sql-subset.md): three-valued logic, where a NULL
+# condition rejects the row; each comparison folds as a plain WHERE comparison does, and a folded
+# one is still NULL for a NULL operand (NOT (i16 = 1.5) is NULL for NULL i16).
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i16 > 0 OR u = 'a'
+----
+5
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE NOT (i16 > 0)
+----
+5
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE NOT (i16 = 1.5)
+----
+10
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE NOT (i16 <> 1.5)
+----
+0
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE NOT (i16 > 40000) OR NOT (u LIKE '%')
+----
+10
+
+query II rowsort
+SELECT id, i16 FROM edge WHERE i16 < 0 OR i16 IN (7, 100) AND NOT (u LIKE 'a%' OR u = '') OR id = 1
+----
+0	-32768
+1	32767
+10	-12345
+3	-1
+6	100
+7	-100
+
+query II rowsort
+SELECT id, i16 FROM edge WHERE (i16 < 0 OR i32 > 0) AND (NOT (id > 8) OR d = 0.1)
+----
+0	-32768
+1	32767
+3	-1
+4	1
+6	100
+7	-100
+8	NULL
+
+query II rowsort
+SELECT id, i16 FROM edge WHERE NOT (i16 IN (1, 7) OR NOT (i32 >= 0)) AND id < 20
+----
+1	32767
+10	-12345
+2	0
+6	100
+
+query II rowsort
+SELECT id, i16 FROM edge WHERE NOT (u NOT IN ('a', 'tab	there') OR u NOT LIKE '%a%')
+----
+1	32767
+
+query II rowsort
+SELECT id, i16 FROM edge WHERE i16 + 1 > 100 OR i16 - 1 < -100 OR i32 = i16
+----
+0	-32768
+1	32767
+10	-12345
+2	0
+3	-1
+4	1
+6	100
+7	-100
+9	12345
+
+# A later AND/OR argument is computed only for the rows the earlier ones leave undecided.
+query I rowsort
+SELECT i16 FROM edge WHERE i16 > 100 OR i16 < -100 OR i16 * i16 >= 0
+----
+-1
+-100
+-12345
+-32768
+0
+1
+100
+12345
+32767
+7
+
+query I rowsort
+SELECT i16 FROM edge WHERE i16 < 100 AND i16 > -100 AND i16 * i16 > 5
+----
+7
+
+# HAVING: over keys, aggregates and select aliases.
+query II rowsort
+SELECT OS, COUNT(*) AS n FROM hits_like GROUP BY OS HAVING n > 350 OR MIN(URL) LIKE 'x%' OR NOT (OS < 120)
+----
+120	74
+
+query I nosort
+SELECT COUNT(*) FROM hits_like HAVING COUNT(*) < 0 OR NOT (SUM(RegionID) < 0)
+----
+10000

@@ -318,6 +318,108 @@ TEST_F(ComputeTest, StringFunctions) {
   EXPECT_EQ(values(*context)[4], "Zbab");
 }
 
+// A condition leaf: `column <op> constant` over operand 0, or a folded kind.
+plan::ExprPtr Condition(plan::Predicate::Kind kind, plan::CompareOp op, Int128 value,
+                        plan::ExprPtr operand) {
+  const LogicalType type = operand->type;
+  plan::Predicate predicate{.kind = kind,
+                            .column = plan::BoundColumn{.index = 0, .name = "o", .type = type},
+                            .op = op,
+                            .constant = plan::Constant{.type = type, .value = value},
+                            .span = {}};
+  return std::make_shared<const plan::Expr>(plan::Expr{
+      .node =
+          plan::PredicateExpr{.predicate = std::move(predicate), .operands = {std::move(operand)}},
+      .type = LogicalType::kBoolean,
+      .name = "p"});
+}
+
+plan::ExprPtr Bool(plan::BoolOp op, std::vector<plan::ExprPtr> args) {
+  return std::make_shared<const plan::Expr>(
+      plan::Expr{.node = plan::BoolExpr{.op = op, .args = std::move(args)},
+                 .type = LogicalType::kBoolean,
+                 .name = "b"});
+}
+
+// AND, OR and NOT in SQL's three-valued logic; a folded leaf (never true, always true for a value)
+// is NULL for a NULL operand, so NOT keeps rejecting NULL.
+TEST_F(ComputeTest, ConditionsAreThreeValued) {
+  using Kind = plan::Predicate::Kind;
+  const auto x = Int16s({1, 5, std::nullopt, -3});
+  const auto column = ColumnAt(0, LogicalType::kSmallInt);
+  const auto gt2 = Condition(Kind::kCompare, plan::CompareOp::kGt, 2, column);
+  const auto lt0 = Condition(Kind::kCompare, plan::CompareOp::kLt, 0, column);
+  const auto show = [&](const plan::ExprPtr& e) {
+    auto out = Eval(e, {x});
+    return out.ok() ? (*out)->ToString() : out.status().ToString();
+  };
+  EXPECT_EQ(show(gt2), "[\n  false,\n  true,\n  null,\n  false\n]");
+  EXPECT_EQ(show(Bool(plan::BoolOp::kOr, {gt2, lt0})), "[\n  false,\n  true,\n  null,\n  true\n]");
+  EXPECT_EQ(show(Bool(plan::BoolOp::kAnd, {gt2, lt0})),
+            "[\n  false,\n  false,\n  null,\n  false\n]");
+  EXPECT_EQ(show(Bool(plan::BoolOp::kNot, {gt2})), "[\n  true,\n  false,\n  null,\n  true\n]");
+  // A later argument is computed only for the rows still undecided, as in DuckDB: x * x (SMALLINT)
+  // overflows for 30000, which x > 100 already decides for OR and x < 100 for AND.
+  const auto wide = Int16s({1, 30000, std::nullopt, -3});
+  const auto square = Condition(Kind::kCompare, plan::CompareOp::kGt, 0,
+                                Arith(ArithOp::kMultiply, column, column, LogicalType::kSmallInt));
+  const auto above = Condition(Kind::kCompare, plan::CompareOp::kGt, 100, column);
+  const auto below = Condition(Kind::kCompare, plan::CompareOp::kLt, 100, column);
+  auto any = Eval(Bool(plan::BoolOp::kOr, {above, square}), {wide});
+  ASSERT_TRUE(any.ok()) << any.status().ToString();
+  EXPECT_EQ((*any)->ToString(), "[\n  true,\n  true,\n  null,\n  true\n]");
+  auto both = Eval(Bool(plan::BoolOp::kAnd, {below, square}), {wide});
+  ASSERT_TRUE(both.ok()) << both.status().ToString();
+  EXPECT_EQ((*both)->ToString(), "[\n  true,\n  false,\n  null,\n  true\n]");
+  auto unguarded = Eval(Bool(plan::BoolOp::kOr, {below, square}), {wide});
+  EXPECT_TRUE(unguarded.status().IsExecutionError()) << "30000 * 30000 is computed here";
+  const auto never = Condition(Kind::kFalse, plan::CompareOp::kEq, 0, column);
+  EXPECT_EQ(show(Bool(plan::BoolOp::kNot, {never})), "[\n  true,\n  true,\n  null,\n  true\n]");
+  const auto always = Condition(Kind::kIsNotNull, plan::CompareOp::kEq, 0, column);
+  EXPECT_EQ(show(always), "[\n  true,\n  true,\n  null,\n  true\n]");
+}
+
+// CASE takes the first branch whose condition is true (NULL is not), else ELSE or NULL; a value is
+// computed only for the rows its branch answers, so a guarded overflow never fails, and a later
+// condition only for the rows no earlier branch took.
+TEST_F(ComputeTest, CaseEvaluatesEachBranchOnItsRows) {
+  using Kind = plan::Predicate::Kind;
+  const auto x = Int16s({1, 30000, std::nullopt, -3, 200});
+  const auto column = ColumnAt(0, LogicalType::kSmallInt);
+  const auto small = Condition(Kind::kCompare, plan::CompareOp::kLt, 100, column);
+  // x * 2 in SMALLINT: 30000 * 2 overflows, so only the rows below 100 may compute it.
+  const auto doubled = Arith(ArithOp::kMultiply, column, ConstantOf(2, LogicalType::kInteger),
+                             LogicalType::kSmallInt);
+  const auto big = Condition(Kind::kCompare, plan::CompareOp::kGt, 10000, column);
+  const auto make = [](std::vector<plan::ExprPtr> whens, std::vector<plan::ExprPtr> thens,
+                       plan::ExprPtr otherwise, LogicalType type) {
+    return std::make_shared<const plan::Expr>(
+        plan::Expr{.node = plan::CaseExpr{.whens = std::move(whens),
+                                          .thens = std::move(thens),
+                                          .otherwise = std::move(otherwise)},
+                   .type = type,
+                   .name = "case"});
+  };
+  auto guarded = Eval(make({small, big}, {doubled, ConstantOf(-1, LogicalType::kInteger)},
+                           ConstantOf(7, LogicalType::kInteger), LogicalType::kSmallInt),
+                      {x});
+  ASSERT_TRUE(guarded.ok()) << guarded.status().ToString();
+  EXPECT_EQ((*guarded)->ToString(), "[\n  2,\n  -1,\n  7,\n  -6,\n  7\n]");
+  auto no_else = Eval(make({big}, {column}, nullptr, LogicalType::kInteger), {x});
+  ASSERT_TRUE(no_else.ok()) << no_else.status().ToString();
+  EXPECT_TRUE((*no_else)->type()->Equals(*arrow::int32()));
+  EXPECT_EQ((*no_else)->ToString(), "[\n  null,\n  30000,\n  null,\n  null,\n  null\n]");
+  // The overflow still fails where the branch answers it.
+  auto overflow = Eval(make({big}, {doubled}, nullptr, LogicalType::kSmallInt), {x});
+  EXPECT_TRUE(overflow.status().IsExecutionError()) << overflow.status().ToString();
+  // No row taken: every value computed for none.
+  auto none = Eval(make({Condition(Kind::kFalse, plan::CompareOp::kEq, 0, column)}, {doubled},
+                        column, LogicalType::kSmallInt),
+                   {x});
+  ASSERT_TRUE(none.ok()) << none.status().ToString();
+  EXPECT_EQ((*none)->ToString(), (*x).ToString());
+}
+
 TEST_F(ComputeTest, ConstantsFillEveryRow) {
   auto out = Eval(ConstantOf(7, LogicalType::kInteger), {Int16s({1, 2, 3})});
   ASSERT_TRUE(out.ok());

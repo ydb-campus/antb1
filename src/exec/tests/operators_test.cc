@@ -8,6 +8,7 @@
 #include <arrow/api.h>
 #include <gtest/gtest.h>
 
+#include "antb1/exec/compute.h"
 #include "antb1/exec/filter.h"
 #include "antb1/exec/limit.h"
 #include "antb1/exec/operator.h"
@@ -187,6 +188,43 @@ TEST_F(OperatorsTest, FilterIn) {
 }
 
 // [NOT] LIKE: NULL rejects the row either way; malformed LIKE predicates fail at Open.
+// IS TRUE keeps the rows whose computed condition is true: false and NULL both reject.
+TEST_F(OperatorsTest, FilterIsTrueOfAComputedCondition) {
+  // x: 1, NULL, 3, 4, 5, -6; the condition x > 3 OR x < 0 is appended as column 2.
+  const auto x = std::make_shared<const plan::Expr>(
+      plan::Expr{.node = plan::ColumnExpr{.index = 0}, .type = LogicalType::kBigInt, .name = "x"});
+  const auto compare = [&](CompareOp op, int64_t value) {
+    Predicate p = Compare(plan::BoundColumn{.index = 0, .name = "x", .type = LogicalType::kBigInt},
+                          op, BigInt(value));
+    return std::make_shared<const plan::Expr>(
+        plan::Expr{.node = plan::PredicateExpr{.predicate = std::move(p), .operands = {x}},
+                   .type = LogicalType::kBoolean,
+                   .name = "p"});
+  };
+  const auto condition = std::make_shared<const plan::Expr>(plan::Expr{
+      .node = plan::BoolExpr{.op = plan::BoolOp::kOr,
+                             .args = {compare(CompareOp::kGt, 3), compare(CompareOp::kLt, 0)}},
+      .type = LogicalType::kBoolean,
+      .name = "c"});
+  auto computed = std::make_unique<ComputeOperator>(Scan(Table()), std::vector{condition});
+  FilterOperator filter(std::move(computed),
+                        {Predicate{.kind = Predicate::Kind::kIsTrue,
+                                   .column = Column(2, "c", LogicalType::kBoolean),
+                                   .op = CompareOp::kEq,
+                                   .constant = {},
+                                   .span = {}}});
+  EXPECT_EQ(Int64Column(*Run(filter)), (std::vector<std::optional<int64_t>>{4, 5, -6}));
+
+  ExecContext ctx;
+  FilterOperator not_boolean(Scan(Table()),
+                             {Predicate{.kind = Predicate::Kind::kIsTrue,
+                                        .column = Column(0, "x", LogicalType::kBigInt),
+                                        .op = CompareOp::kEq,
+                                        .constant = {},
+                                        .span = {}}});
+  EXPECT_TRUE(not_boolean.Open(ctx).IsInvalid());
+}
+
 TEST_F(OperatorsTest, FilterLike) {
   const auto s = Column(1, "s", LogicalType::kVarchar);
   const auto like = [&](Predicate::Kind kind, std::string pattern) {
