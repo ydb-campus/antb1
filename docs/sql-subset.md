@@ -184,10 +184,18 @@ items).
 - Timestamps: `toDateTime(t)` is ClickBench's DuckDB macro `epoch_ms(t * 1000)` (its `duckdb-parquet/create.sql` at
   the pinned commit; the test oracle defines the same macro): `t * 1000` is typed and checked as arithmetic (so a
   SMALLINT `t` above 32 overflows, as in DuckDB), and the result is TIMESTAMP. It takes an integer other than
-  HUGEINT; any other type is a bind error. `EXTRACT(field FROM x)` takes a TIMESTAMP or DATE and the fields
-  `year`, `month`, `day`, `hour`, `minute` and `second` (case-insensitive) and is BIGINT; `date_trunc('unit', x)`
-  takes a TIMESTAMP or DATE and the units `year`, `quarter`, `month`, `week`, `day`, `hour`, `minute` and `second`
-  (a string literal, case-insensitive) and is TIMESTAMP. A TIMESTAMP compares with a TIMESTAMP literal, a string
+  HUGEINT; any other type is a bind error. `EXTRACT(field FROM x)` takes a TIMESTAMP or DATE and is BIGINT (`epoch`:
+  DOUBLE); `date_trunc('unit', x)` takes a TIMESTAMP or DATE and a string literal unit and is TIMESTAMP. Fields and
+  units are DuckDB's, in its spellings (case-insensitive): `year` (`years`, `y`, `yr`, `yrs`), `quarter`(`s`),
+  `month` (`months`, `mon`, `mons`), `week` (`weeks`, `w`, `weekofyear`), `day` (`days`, `d`, `dayofmonth`),
+  `hour` (`hours`, `h`, `hr`, `hrs`), `minute` (`minutes`, `m`, `min`, `mins`), `second` (`seconds`, `s`, `sec`,
+  `secs`), `millisecond` (`milliseconds`, `ms`, `msec`, `msecs`), `microsecond` (`microseconds`, `us`, `usec`,
+  `usecs`), `decade` (`decades`, `decs`; `dec` for `date_trunc` only), `century` (`centuries`, `c`, `cent`),
+  `millennium` (`millennia`, `mil`, `mils`), `isoyear`, `epoch`, and for `EXTRACT` also `dow`
+  (`dayofweek`, `weekday`), `isodow` and `doy` (`dayofyear`), which `date_trunc` takes as `day` (`epoch` as
+  `second`). `EXTRACT` names its field as DuckDB does: a spelling that is a DuckDB keyword (the singular and plural
+  of `year` to `microsecond`, `quarter`, `week`, `decade`, `century` and `millennium`) by its field in lower
+  case, any other as written. A TIMESTAMP compares with a TIMESTAMP literal, a string
   literal (the timestamp it spells) or a DATE literal (its midnight), exactly, as DuckDB casts them; in `CASE` a
   string literal next to TIMESTAMP values is a TIMESTAMP. Comparing a TIMESTAMP with a number is a bind error. Other
   fields and units, comparing a TIMESTAMP with a DATE operand, a DATE with a TIMESTAMP literal, and TIMESTAMP
@@ -371,7 +379,11 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   (`2013-07-15 14:00:00`, a fraction without trailing zeros, `0001-12-31 (BC) 23:59:59` before year 1).
   `toDateTime` fails the query when `t * 1000` overflows its type or the time is outside DuckDB's TIMESTAMP range,
   `290309-12-22 (BC) 00:00:00` to `294247-01-10 04:00:54.775807`, as in DuckDB. `EXTRACT` gives the civil field
-  (the year astronomically: 1 BC is 0) and `date_trunc` rounds down (before 1970 too:
+  (the year astronomically: 1 BC is 0; `week` and `isoyear` are ISO 8601's; `dow` counts from Sunday = 0,
+  `isodow` from Monday = 1; `millisecond` and `microsecond` include the seconds; `epoch` is the seconds since 1970;
+  `decade` is the year / 10, `century` and `millennium` count from year 1 = 1 and go down from -1 before it) and
+  `date_trunc` rounds down (`decade` to `millennium` truncate the year toward zero, as DuckDB does: 2013 is 2000
+  for both century and millennium; `isoyear` gives the Monday of ISO week 1; before 1970 too:
   `date_trunc('minute', toDateTime(-61))` is `1969-12-31 23:58:00`), in 64-bit calendar arithmetic over the whole
   range; weeks start on Monday. A DATE is the timestamp of its midnight; `date_trunc` of a DATE whose result is
   outside the TIMESTAMP range fails the query, and of an infinite DATE is infinite, where `EXTRACT` is NULL.

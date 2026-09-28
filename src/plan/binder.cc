@@ -131,6 +131,104 @@ std::string LiteralName(const sql::Literal& lit) {
 
 std::string ResultName(const sql::AggregateCall& call);
 
+// DuckDB's date part spellings (checked against DuckDB 1.5.5), lower case: the EXTRACT field and
+// the date_trunc unit each one means ("": not one). date_trunc to a day-of-week or day-of-year
+// part is to the day, to epoch to the second; `dec` is a date_trunc unit only (EXTRACT(dec ...)
+// does not parse in DuckDB).
+struct DatePart {
+  std::string_view spelling;
+  std::string_view field;
+  std::string_view unit;
+  bool keyword = false;  // a DuckDB keyword: EXTRACT names it by its field, in lower case
+};
+
+constexpr auto kDateParts = std::to_array<DatePart>({
+    {.spelling = "year", .field = "year", .unit = "year", .keyword = true},
+    {.spelling = "years", .field = "year", .unit = "year", .keyword = true},
+    {.spelling = "y", .field = "year", .unit = "year"},
+    {.spelling = "yr", .field = "year", .unit = "year"},
+    {.spelling = "yrs", .field = "year", .unit = "year"},
+    {.spelling = "month", .field = "month", .unit = "month", .keyword = true},
+    {.spelling = "months", .field = "month", .unit = "month", .keyword = true},
+    {.spelling = "mon", .field = "month", .unit = "month"},
+    {.spelling = "mons", .field = "month", .unit = "month"},
+    {.spelling = "day", .field = "day", .unit = "day", .keyword = true},
+    {.spelling = "days", .field = "day", .unit = "day", .keyword = true},
+    {.spelling = "d", .field = "day", .unit = "day"},
+    {.spelling = "dayofmonth", .field = "day", .unit = "day"},
+    {.spelling = "hour", .field = "hour", .unit = "hour", .keyword = true},
+    {.spelling = "hours", .field = "hour", .unit = "hour", .keyword = true},
+    {.spelling = "h", .field = "hour", .unit = "hour"},
+    {.spelling = "hr", .field = "hour", .unit = "hour"},
+    {.spelling = "hrs", .field = "hour", .unit = "hour"},
+    {.spelling = "minute", .field = "minute", .unit = "minute", .keyword = true},
+    {.spelling = "minutes", .field = "minute", .unit = "minute", .keyword = true},
+    {.spelling = "m", .field = "minute", .unit = "minute"},
+    {.spelling = "min", .field = "minute", .unit = "minute"},
+    {.spelling = "mins", .field = "minute", .unit = "minute"},
+    {.spelling = "second", .field = "second", .unit = "second", .keyword = true},
+    {.spelling = "seconds", .field = "second", .unit = "second", .keyword = true},
+    {.spelling = "s", .field = "second", .unit = "second"},
+    {.spelling = "sec", .field = "second", .unit = "second"},
+    {.spelling = "secs", .field = "second", .unit = "second"},
+    {.spelling = "millisecond", .field = "millisecond", .unit = "millisecond", .keyword = true},
+    {.spelling = "milliseconds", .field = "millisecond", .unit = "millisecond", .keyword = true},
+    {.spelling = "ms", .field = "millisecond", .unit = "millisecond"},
+    {.spelling = "msec", .field = "millisecond", .unit = "millisecond"},
+    {.spelling = "msecs", .field = "millisecond", .unit = "millisecond"},
+    {.spelling = "microsecond", .field = "microsecond", .unit = "microsecond", .keyword = true},
+    {.spelling = "microseconds", .field = "microsecond", .unit = "microsecond", .keyword = true},
+    {.spelling = "us", .field = "microsecond", .unit = "microsecond"},
+    {.spelling = "usec", .field = "microsecond", .unit = "microsecond"},
+    {.spelling = "usecs", .field = "microsecond", .unit = "microsecond"},
+    {.spelling = "quarter", .field = "quarter", .unit = "quarter", .keyword = true},
+    {.spelling = "quarters", .field = "quarter", .unit = "quarter", .keyword = true},
+    {.spelling = "week", .field = "week", .unit = "week", .keyword = true},
+    {.spelling = "weeks", .field = "week", .unit = "week", .keyword = true},
+    {.spelling = "w", .field = "week", .unit = "week"},
+    {.spelling = "weekofyear", .field = "week", .unit = "week"},
+    {.spelling = "dow", .field = "dow", .unit = "day"},
+    {.spelling = "dayofweek", .field = "dow", .unit = "day"},
+    {.spelling = "weekday", .field = "dow", .unit = "day"},
+    {.spelling = "isodow", .field = "isodow", .unit = "day"},
+    {.spelling = "doy", .field = "doy", .unit = "day"},
+    {.spelling = "dayofyear", .field = "doy", .unit = "day"},
+    {.spelling = "isoyear", .field = "isoyear", .unit = "isoyear"},
+    {.spelling = "epoch", .field = "epoch", .unit = "second"},
+    {.spelling = "decade", .field = "decade", .unit = "decade", .keyword = true},
+    {.spelling = "decades", .field = "decade", .unit = "decade", .keyword = true},
+    {.spelling = "dec", .field = "", .unit = "decade"},
+    {.spelling = "decs", .field = "decade", .unit = "decade"},
+    {.spelling = "century", .field = "century", .unit = "century", .keyword = true},
+    {.spelling = "centuries", .field = "century", .unit = "century", .keyword = true},
+    {.spelling = "c", .field = "century", .unit = "century"},
+    {.spelling = "cent", .field = "century", .unit = "century"},
+    {.spelling = "millennium", .field = "millennium", .unit = "millennium", .keyword = true},
+    {.spelling = "millennia", .field = "millennium", .unit = "millennium", .keyword = true},
+    {.spelling = "mil", .field = "millennium", .unit = "millennium"},
+    {.spelling = "mils", .field = "millennium", .unit = "millennium"},
+});
+
+// The date part a spelling (any case) means, or std::nullopt.
+std::optional<DatePart> FindDatePart(std::string_view spelling) {
+  const std::string lower = AsciiLower(spelling);
+  const auto* part = std::ranges::find(kDateParts, lower, &DatePart::spelling);
+  return part == kDateParts.end() ? std::nullopt : std::optional(*part);
+}
+
+// Whether a spelling (any case) is a date_trunc unit.
+bool IsTruncUnit(std::string_view spelling) {
+  const std::optional<DatePart> part = FindDatePart(spelling);
+  return part.has_value() && !part->unit.empty();
+}
+
+// The field of EXTRACT as DuckDB names it: a keyword spelling by its field in lower case
+// (EXTRACT(Years ...) is 'year'), any other spelling as written.
+std::string ExtractFieldName(std::string_view field) {
+  const std::optional<DatePart> part = FindDatePart(field);
+  return part.has_value() && part->keyword ? std::string(part->field) : std::string(field);
+}
+
 std::string ExprName(const sql::Expr& expr);
 
 // CASE  WHEN ((a = 1)) THEN (b) ELSE NULL END, as DuckDB names it; the simple form as the searched
@@ -281,7 +379,8 @@ std::string ExprName(const sql::Expr& expr) {
     return InName(*in, in->negated);
   }
   if (const auto* e = std::get_if<sql::ExtractExpr>(&expr)) {
-    return std::format("main.date_part('{}', {})", AsciiLower(e->field), ExprName(*e->source));
+    return std::format("main.date_part('{}', {})", ExtractFieldName(e->field),
+                       ExprName(*e->source));
   }
   if (const auto* call = std::get_if<sql::FunctionCall>(&expr)) {
     std::string args;
@@ -341,12 +440,6 @@ constexpr auto kFunctions = std::to_array<FunctionSpec>({
     {.name = "todatetime", .function = Function::kEpochMs, .args = 1},
     {.name = "date_trunc", .function = Function::kDateTrunc, .args = 2, .value_arg = 1},
 });
-
-// The date_trunc units and EXTRACT fields antb1 answers (DuckDB has more).
-constexpr auto kTruncUnits = std::to_array<std::string_view>(
-    {"year", "quarter", "month", "week", "day", "hour", "minute", "second"});
-constexpr auto kExtractFields =
-    std::to_array<std::string_view>({"year", "month", "day", "hour", "minute", "second"});
 
 std::optional<FunctionSpec> FindFunction(const sql::FunctionCall& call) {
   const std::string name = AsciiLower(call.name);
@@ -497,12 +590,10 @@ struct FirstUnsupportedOf {
       }
       if (const auto* unit = std::get_if<sql::Literal>(&call.args[i]);
           spec->function == Function::kDateTrunc && i == 0 && unit != nullptr &&
-          unit->kind == sql::Literal::Kind::kString &&
-          std::ranges::find(kTruncUnits, AsciiLower(unit->text)) == kTruncUnits.end()) {
+          unit->kind == sql::Literal::Kind::kString && !IsTruncUnit(unit->text)) {
         return Rejection{.span = unit->span,
                          .message = std::format("date_trunc() with the unit '{}' is not supported "
-                                                "(only year, quarter, month, week, day, hour, "
-                                                "minute and second)",
+                                                "(docs/sql-subset.md lists the units)",
                                                 Clip(unit->text))};
       }
       // The evaluator anchors the pattern as ^(\C*?)(pattern) and shifts the replacement's groups
@@ -561,10 +652,10 @@ struct FirstUnsupportedOf {
     return std::nullopt;
   }
   std::optional<Rejection> operator()(const sql::ExtractExpr& e) const {
-    if (std::ranges::find(kExtractFields, AsciiLower(e.field)) == kExtractFields.end()) {
+    if (const auto part = FindDatePart(e.field); !part.has_value() || part->field.empty()) {
       return Rejection{.span = e.field_span,
-                       .message = std::format("EXTRACT of {} is not supported (only year, month, "
-                                              "day, hour, minute and second)",
+                       .message = std::format("EXTRACT of {} is not supported (docs/sql-subset.md "
+                                              "lists the fields)",
                                               Clip(e.field))};
     }
     return FirstUnsupported(*e.source);
@@ -1594,9 +1685,10 @@ class Binder {
             call.args[i].span());
       }
       name += LiteralName(*lit);
-      // date_trunc's unit matches case-insensitively.
-      const std::string text =
-          spec->function == Function::kDateTrunc ? AsciiLower(lit->text) : lit->text;
+      // date_trunc's unit: the canonical unit its spelling (any case) means.
+      const std::optional<DatePart> part =
+          spec->function == Function::kDateTrunc ? FindDatePart(lit->text) : std::nullopt;
+      const std::string text = part.has_value() ? std::string(part->unit) : lit->text;
       literals.push_back(std::make_shared<const Expr>(Expr{
           .node = ConstantExpr{.value = Constant{.type = LogicalType::kVarchar, .value = text}},
           .type = LogicalType::kVarchar,
@@ -1652,7 +1744,8 @@ class Binder {
                      .name = std::move(name)});
   }
 
-  // EXTRACT(field FROM source): BIGINT of a TIMESTAMP or DATE, named as DuckDB names it.
+  // EXTRACT(field FROM source): BIGINT (epoch: DOUBLE) of a TIMESTAMP or DATE, named as DuckDB
+  // names it.
   template <class BindArg>
   arrow::Result<Typed> BindExtract(const sql::ExtractExpr& e, const BindArg& bind_arg) {
     ARROW_ASSIGN_OR_RAISE(Typed source, bind_arg(*e.source));
@@ -1661,15 +1754,20 @@ class Binder {
           std::format("EXTRACT needs a TIMESTAMP or DATE, but {}", DescribeOperand(source)),
           e.source->span());
     }
-    const std::string field = AsciiLower(e.field);
-    std::string name = std::format("main.date_part('{}', {})", field, source.expr->name);
+    const std::optional<DatePart> part = FindDatePart(e.field);
+    if (!part.has_value() || part->field.empty()) {
+      return UnsupportedError("this EXTRACT field is not supported", e.field_span);
+    }
+    const std::string field(part->field);
+    std::string name =
+        std::format("main.date_part('{}', {})", ExtractFieldName(e.field), source.expr->name);
     auto field_expr = std::make_shared<const Expr>(
         Expr{.node = ConstantExpr{.value = Constant{.type = LogicalType::kVarchar, .value = field}},
              .type = LogicalType::kVarchar,
              .name = "'" + field + "'"});
     return Leaf(Expr{.node = FunctionExpr{.function = Function::kExtract,
                                           .args = {std::move(source.expr), std::move(field_expr)}},
-                     .type = LogicalType::kBigInt,
+                     .type = field == "epoch" ? LogicalType::kDouble : LogicalType::kBigInt,
                      .name = std::move(name)});
   }
 

@@ -154,3 +154,33 @@ query I nosort
 SELECT COUNT(*) FROM hits_like WHERE toDateTime(EventTime) <> TIMESTAMP '2013-07-15 14:00:00.1234567' AND NOT (toDateTime(EventTime) < TIMESTAMP '2013-07-02T06:00')
 ----
 9560
+
+# More date parts, with DuckDB's definitions and spellings: ISO weeks and years, day of week and
+# year, sub-second fields with the seconds, epoch (DOUBLE), and decades to millennia.
+query IIIIII nosort
+SELECT extract(dow FROM toDateTime(EventTime)) AS d, extract(ISODOW FROM toDateTime(EventTime)), extract(week FROM toDateTime(EventTime)), extract(doy FROM EventDate), extract(quarter FROM EventDate), COUNT(*) FROM hits_like GROUP BY 1, 2, 3, 4, 5 ORDER BY 6 DESC, 1, 3, 4 LIMIT 5
+----
+2	2	27	183	3	362
+1	1	27	182	3	353
+3	3	27	184	3	350
+4	4	28	192	3	350
+3	3	28	191	3	340
+
+query IRIII nosort
+SELECT extract(ms FROM TIMESTAMP '2013-01-01 14:05:06.789123'), extract(epoch FROM TIMESTAMP '2013-01-01 14:05:06.789123'), extract(microseconds FROM TIMESTAMP '2013-01-01 14:05:06.789123'), extract(Century FROM DATE '2000-12-31'), extract(isoyear FROM DATE '2021-01-03') FROM hits_like LIMIT 1
+----
+6789	1357049106.789123	6789123	20	2020
+
+query TTTTT nosort
+SELECT date_trunc('decade', MIN(toDateTime(EventTime))), date_trunc('isoyear', MIN(EventDate)), date_trunc('ms', TIMESTAMP '2013-01-01 14:05:06.789123'), date_trunc('dow', MAX(toDateTime(EventTime))), date_trunc('millennium', MAX(EventDate)) FROM hits_like
+----
+2010-01-01 00:00:00	2012-12-31 00:00:00	2013-01-01 14:05:06.789	2013-07-31 00:00:00	2000-01-01 00:00:00
+
+query II nosort
+SELECT extract(week FROM EventDate) AS w, COUNT(*) FROM hits_like GROUP BY w ORDER BY w
+----
+27	2341
+28	2204
+29	2256
+30	2213
+31	986

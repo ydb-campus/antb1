@@ -778,6 +778,14 @@ std::vector<Relation> AllRelations() {
                     Q("SELECT COUNT(DISTINCT EventTime // 86400) FROM hits_like_nulls WHERE "
                       "EventTime >= 0")},
          .check = AllEqual()});
+    r.push_back({.name = "extract_dow_is_days_arithmetic",
+                 .features = {kSum, kTimestamps, kArithmetic, kWhere, kIntegerColumns,
+                              kIntegerLiteral, kTableName},
+                 .probes = {Q("SELECT SUM(EXTRACT(dow FROM toDateTime(EventTime))) FROM "
+                              "hits_like_nulls WHERE EventTime >= 0"),
+                            Q("SELECT SUM((EventTime // 86400 + 4) % 7) FROM hits_like_nulls WHERE "
+                              "EventTime >= 0")},
+                 .check = AllEqual()});
     constexpr std::string_view kKeys =
         "SELECT date_trunc('hour', toDateTime(EventTime)) AS k, COUNT(*), "
         "MIN(toDateTime(EventTime)), MAX(EXTRACT(second FROM toDateTime(EventTime))) FROM {} GROUP "

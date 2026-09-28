@@ -1366,8 +1366,10 @@ class Builder {
     };
     const bool trunc = !number && allowed_.Has(Feature::kStringLiteral) && rng_.Percent(40);
     if (number || (!trunc && (date || rng_.Percent(50)))) {
-      static constexpr auto kFields =
-          std::to_array<std::string_view>({"year", "month", "day", "hour", "minute", "second"});
+      // BIGINT fields only (epoch is a DOUBLE), in a few of DuckDB's spellings.
+      static constexpr auto kFields = std::to_array<std::string_view>(
+          {"year", "month", "day", "hour", "minute", "second", "quarter", "week", "isoyear", "dow",
+           "isodow", "doy", "millisecond", "decade", "century", "millennium", "yrs", "mins"});
       Keyword("EXTRACT");
       Symbol("(");
       Keyword(rng_.Pick(kFields));
@@ -1378,7 +1380,8 @@ class Builder {
     }
     if (trunc) {
       static constexpr auto kUnits = std::to_array<std::string_view>(
-          {"year", "quarter", "month", "week", "day", "hour", "minute", "second"});
+          {"year", "quarter", "month", "week", "day", "hour", "minute", "second", "millisecond",
+           "decade", "century", "millennium", "isoyear", "dow", "epoch", "Hours"});
       used_.Add(Feature::kStringLiteral);
       Keyword("date_trunc");
       Symbol("(");
