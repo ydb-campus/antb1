@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790631874656,
+  "lastUpdate": 1790632912653,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -1548,6 +1548,78 @@ window.BENCHMARK_DATA = {
             "value": 13.132003018518567,
             "unit": "ms/iter",
             "extra": "iterations: 54\ncpu: 13.130919981481476 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "eb6261c5e4a1c86ed29c0f219dd19533f527b02a",
+          "message": "feat(sql,plan): timestamp literals (#39)\n\n## Summary\n\nFollow-up 3, part 1 of 2. **Stacked on #38** (itself on #37); merge\nthose first, and the base then moves to `main`.\n\nThis adds TIMESTAMP literals and literal comparisons for TIMESTAMP\noperands. Before, both were unsupported.\n\n- **Syntax:** `TIMESTAMP 'text'`, parsed like `DATE 'text'`.\n- This is a new `sql::Literal::Kind::kTimestamp` in the public AST (the\napproved follow-up plan).\n  - The unparser, fuzz dictionary and property tests are updated.\n- **Text** (divergence D5 is extended):\n- `YYYY-MM-DD`, optionally a space or `T` and `HH:MM` or `HH:MM:SS`,\nthen optionally a fraction (only after the seconds) of up to 9 digits.\n  - Digits past the sixth are truncated, as in DuckDB.\n- DuckDB also takes single-digit fields, spaces and `24:00:00`; antb1\nmakes those a bind error.\n- **Binding:**\n- The constant is TIMESTAMP, named `CAST('...' AS TIMESTAMP)`, also\ninside expression names.\n- A TIMESTAMP operand compares exactly with a TIMESTAMP literal, a\nstring (the timestamp it spells) or a DATE literal (its midnight), `IN`\nlists included.\n  - In `CASE`, a string literal next to TIMESTAMP values is a TIMESTAMP.\n  - ORDER BY a TIMESTAMP literal orders nothing, like DATE.\n  - EXPLAIN prints `TIMESTAMP '...'` constants.\n- Still unsupported (exit code 4): a DATE operand against a TIMESTAMP\nliteral, DATE vs TIMESTAMP operands, and TIMESTAMP arithmetic. A number\nagainst a TIMESTAMP is a bind error.\n- **Generator:** it writes `toDateTime(c) <op> TIMESTAMP '...'` inside\nthe column's data range.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check\nexit 0\n$ pixi run tidy\nexit 0\n$ pixi run coverage\nCoverage gate: PASS\n$ ANTB1_DIFF_COUNT=20000 pixi run diff-random\nDIFF: PASS seed=2301751714 queries=20000 failed=0 unsupported=0\n$ pixi run test-data           # hits_0, ratchet unchanged at 43 of 43\n100% tests passed out of 6\n```\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change: parser, unparse and round-trip cases;\n`plan.LiteralTest.ParseTimestamp` (accept/reject table); binder names,\ntypes, EXPLAIN and errors; `.slt` in `expressions/timestamps.slt` and\n`positions/positions.slt` (answered by DuckDB); the generator\n- [x] Docs updated: `docs/sql-subset.md` (grammar, constants, literal\ntable, timestamps, types, D5)\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [ ] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer (none changed)\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code wrote the change\nand the tests and ran the verification. The `reviewer` agent found a\nfraction accepted after `HH:MM`, a wrong exit-code sentence in the docs,\ntwo untested paths, a latent generator edge at year 0, and literal\noperand names; all fixed.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-09-29T00:59:37+03:00",
+          "tree_id": "6a995c074eb2012d147276b506e7c6ef935597c8",
+          "url": "https://github.com/ydb-campus/antb1/commit/eb6261c5e4a1c86ed29c0f219dd19533f527b02a"
+        },
+        "date": 1790632911924,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4158.75748451521,
+            "unit": "ns/iter",
+            "extra": "iterations: 168715\ncpu: 4158.364917168005 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 86690.93475102117,
+            "unit": "ns/iter",
+            "extra": "iterations: 7571\ncpu: 86683.85695416722 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 221809.14529914866,
+            "unit": "ns/iter",
+            "extra": "iterations: 3159\ncpu: 221766.09275087045 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 443556.942332093,
+            "unit": "ns/iter",
+            "extra": "iterations: 1578\ncpu: 443470.632446134 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 348180.8891109012,
+            "unit": "ns/iter",
+            "extra": "iterations: 2002\ncpu: 348139.4095904093 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2120051.21450161,
+            "unit": "ns/iter",
+            "extra": "iterations: 331\ncpu: 2119867.3051359523 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 178.855602750005,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 178.8174442499999 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.319151306122476,
+            "unit": "ms/iter",
+            "extra": "iterations: 49\ncpu: 14.31804093877551 ms\nthreads: 1"
           }
         ]
       }
