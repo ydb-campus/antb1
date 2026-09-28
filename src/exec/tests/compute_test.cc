@@ -1,6 +1,7 @@
 #include "antb1/exec/compute.h"
 
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -13,6 +14,7 @@
 #include <gtest/gtest.h>
 
 #include "antb1/common/int128.h"
+#include "antb1/common/narrow.h"
 #include "antb1/exec/filter.h"
 #include "antb1/plan/literal.h"
 #include "antb1/plan/logical_plan.h"
@@ -235,6 +237,85 @@ TEST_F(ComputeTest, FilterComparesTwoColumns) {
   FilterOperator outside(
       std::make_unique<testing::ScriptedSource>(schema, std::vector<Batch>{batch}), {bad});
   EXPECT_TRUE(outside.Open(ctx).IsInvalid());
+}
+
+plan::ExprPtr StringConstant(std::string value) {
+  return std::make_shared<const plan::Expr>(
+      plan::Expr{.node = plan::ConstantExpr{.value = plan::Constant{.type = LogicalType::kVarchar,
+                                                                    .value = std::move(value)}},
+                 .type = LogicalType::kVarchar,
+                 .name = "'...'"});
+}
+
+plan::ExprPtr Call(plan::Function function, std::vector<plan::ExprPtr> args, LogicalType type) {
+  return std::make_shared<const plan::Expr>(
+      plan::Expr{.node = plan::FunctionExpr{.function = function, .args = std::move(args)},
+                 .type = type,
+                 .name = "f"});
+}
+
+// strlen counts bytes; regexp_replace replaces the first match with RE2 in UTF-8 mode (`.` is one
+// character, not a newline), \0 and \1 in the replacement; NULL stays NULL; a bad pattern is an
+// execution error (DuckDB 1.5.5).
+TEST_F(ComputeTest, StringFunctions) {
+  const auto text = testing::Strings({"h\xC3\xA9llo", std::nullopt, "a\nb", "", "abab"});
+  auto lengths = Eval(
+      Call(plan::Function::kStrlen, {ColumnAt(0, LogicalType::kVarchar)}, LogicalType::kBigInt),
+      {text});
+  ASSERT_TRUE(lengths.ok()) << lengths.status().ToString();
+  EXPECT_EQ((*lengths)->ToString(), "[\n  6,\n  null,\n  3,\n  0,\n  4\n]");
+  const auto replace = [&](std::string pattern, std::string replacement) {
+    return Eval(Call(plan::Function::kRegexpReplace,
+                     {ColumnAt(0, LogicalType::kVarchar), StringConstant(std::move(pattern)),
+                      StringConstant(std::move(replacement))},
+                     LogicalType::kVarchar),
+                {text});
+  };
+  const auto values = [](const std::shared_ptr<arrow::Array>& array) {
+    std::vector<std::optional<std::string>> out;
+    const auto& binary = static_cast<const arrow::BinaryArray&>(*array);
+    out.reserve(Narrow<std::size_t>(binary.length()));
+    for (int64_t i = 0; i < binary.length(); ++i) {
+      out.push_back(binary.IsNull(i) ? std::nullopt : std::optional(binary.GetString(i)));
+    }
+    return out;
+  };
+  using Values = std::vector<std::optional<std::string>>;
+  auto dot = replace("h.l", "_");
+  ASSERT_TRUE(dot.ok()) << dot.status().ToString();
+  EXPECT_TRUE((*dot)->type()->Equals(*arrow::binary()));
+  EXPECT_EQ(values(*dot), (Values{"_lo", std::nullopt, "a\nb", "", "abab"}));
+  auto first = replace("(b)", "[\\1\\0]");
+  ASSERT_TRUE(first.ok());
+  EXPECT_EQ(values(*first), (Values{"h\xC3\xA9llo", std::nullopt, "a\n[bb]", "", "a[bb]ab"}));
+  auto newline = replace("a.b", "X");
+  ASSERT_TRUE(newline.ok());
+  EXPECT_EQ(values(*newline)[2], "a\nb") << "`.` does not match a newline";
+  for (const char* invalid : {"\\1", "x\\", "\\q"}) {
+    auto unchanged = replace("a", invalid);
+    ASSERT_TRUE(unchanged.ok()) << invalid << ": " << unchanged.status().ToString();
+    EXPECT_EQ(values(*unchanged), (Values{"h\xC3\xA9llo", std::nullopt, "a\nb", "", "abab"}))
+        << "DuckDB leaves the text unchanged for the replacement " << invalid;
+  }
+  // Divergence D15: RE2 never matches a byte that is not UTF-8, which DuckDB cannot read at all.
+  auto invalid_utf8 =
+      Eval(Call(plan::Function::kRegexpReplace,
+                {ColumnAt(0, LogicalType::kVarchar), StringConstant("[^a]"), StringConstant("X")},
+                LogicalType::kVarchar),
+           {testing::Strings({"a\xFF"
+                              "b"})});
+  ASSERT_TRUE(invalid_utf8.ok()) << invalid_utf8.status().ToString();
+  EXPECT_EQ(values(*invalid_utf8), (Values{"a\xFF"
+                                           "X"}));
+  auto bad = replace("(", "x");
+  EXPECT_TRUE(bad.status().IsExecutionError()) << bad.status().ToString();
+  // Valid once wrapped in (...), but not alone: DuckDB rejects it.
+  auto unbalanced = replace("a)|(b", "x");
+  EXPECT_TRUE(unbalanced.status().IsExecutionError()) << unbalanced.status().ToString();
+  // Assertions see the whole value: \B after the first byte of "abab", not at the match's end.
+  auto context = replace("a\\B", "Z");
+  ASSERT_TRUE(context.ok()) << context.status().ToString();
+  EXPECT_EQ(values(*context)[4], "Zbab");
 }
 
 TEST_F(ComputeTest, ConstantsFillEveryRow) {

@@ -238,7 +238,8 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{R"(SELECT "lower"(url) FROM t)", kUnsupported, R"("lower")",
                   "function lower() is not supported"},
         ErrorCase{"SELECT a FROM t GROUP BY year(d)", kUnsupported, "year",
-                  "function year() is not supported (only COUNT, SUM, AVG, MIN, MAX)"},
+                  "function year() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN and "
+                  "REGEXP_REPLACE)"},
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING COUNT(*) > 1 OR a = 2", kUnsupported, "OR",
                   "OR is not supported"},
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING 1 < 2", kUnsupported, "2",
@@ -292,6 +293,25 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT -u16 FROM t", kUnsupported, "-", "negating a USMALLINT is not supported"},
         ErrorCase{"SELECT h % 2 FROM t", kUnsupported, "%", "'%' in HUGEINT"},
         ErrorCase{"SELECT SUM(i16) // 2 FROM t", kUnsupported, "//", "'//' in HUGEINT"},
+        // String functions: a VARCHAR first argument, literal strings after it.
+        ErrorCase{"SELECT strlen(i16) FROM t", kBind, "i16",
+                  "strlen() needs a VARCHAR, but 'i16' is SMALLINT"},
+        ErrorCase{"SELECT strlen(s, s) FROM t", kBind, "strlen(s, s)",
+                  "strlen() takes 1 argument, not 2"},
+        ErrorCase{"SELECT regexp_replace(s, 'a') FROM t", kBind, "regexp_replace(s, 'a')",
+                  "takes 3 arguments, not 2"},
+        ErrorCase{"SELECT regexp_replace(s, s, 'x') FROM t", kUnsupported, "s",
+                  "the arguments of regexp_replace() after the first must be string literals"},
+        ErrorCase{"SELECT regexp_replace(s, '(a)(b)', '\\8') FROM t", kUnsupported, "'\\8'",
+                  "regexp_replace() with \\8 in the replacement is not supported"},
+        ErrorCase{"SELECT regexp_replace(s, '\\Qa', 'x') FROM t", kUnsupported, "'\\Qa'",
+                  "regexp_replace() with \\Q in the pattern is not supported"},
+        ErrorCase{"SELECT regexp_replace(s, 'a', 1) FROM t", kBind, "1",
+                  "argument 3 of regexp_replace() must be a string literal"},
+        ErrorCase{"SELECT regexp_replace(s, 'a', 'b', 'g') FROM t", kBind,
+                  "regexp_replace(s, 'a', 'b', 'g')", "takes 3 arguments, not 4"},
+        ErrorCase{"SELECT strlen(lower(s)) FROM t", kUnsupported, "lower",
+                  "function lower() is not supported"},
         ErrorCase{"SELECT SUM(i16) + 1 AS total FROM t GROUP BY total", kBind, "total",
                   "GROUP BY cannot refer to the aggregate 'total'"},
         ErrorCase{"SELECT s FROM t GROUP BY s HAVING SUM(i16) + 1 > s", kBind, ">",
@@ -304,15 +324,20 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT SUM(1 + 2) FROM t", kUnsupported, "1 + 2",
                   "constant aggregate arguments are not supported"},
         ErrorCase{"SELECT lower(url) FROM t", kUnsupported, "lower",
-                  "function lower() is not supported (only COUNT, SUM, AVG, MIN, MAX)"},
+                  "function lower() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN and "
+                  "REGEXP_REPLACE)"},
         ErrorCase{"SELECT a FROM t WHERE length(url) > 5", kUnsupported, "length",
-                  "function length() is not supported (only COUNT, SUM, AVG, MIN, MAX)"},
+                  "function length() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN and "
+                  "REGEXP_REPLACE)"},
         ErrorCase{"SELECT a FROM t WHERE d > now()", kUnsupported, "now",
-                  "function now() is not supported (only COUNT, SUM, AVG, MIN, MAX)"},
+                  "function now() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN and "
+                  "REGEXP_REPLACE)"},
         ErrorCase{"SELECT SUM(abs(a)) FROM t", kUnsupported, "abs",
-                  "function abs() is not supported (only COUNT, SUM, AVG, MIN, MAX)"},
+                  "function abs() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN and "
+                  "REGEXP_REPLACE)"},
         ErrorCase{"SELECT left(url, 3) FROM t", kUnsupported, "left",
-                  "function left() is not supported (only COUNT, SUM, AVG, MIN, MAX)"},
+                  "function left() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN and "
+                  "REGEXP_REPLACE)"},
         ErrorCase{"SELECT COUNT(1) FROM t", kUnsupported, "1",
                   "constant aggregate arguments are not supported (use COUNT(*))"},
         ErrorCase{"SELECT SUM('x') FROM t", kUnsupported, "'x'",
@@ -857,6 +882,31 @@ TEST(BinderTest, AliasesInsideOrderByAndHavingExpressions) {
   EXPECT_NE(Explain(*table_first).find("-(i16)"), std::string::npos)
       << "inside an expression a table column comes before an alias\n"
       << Explain(*table_first);
+}
+
+// strlen (BIGINT, bytes) and regexp_replace (VARCHAR) of a VARCHAR, named like DuckDB (the function
+// in lower case); regexp_replace takes a literal pattern and replacement. A GROUP BY alias of a
+// function names its expression, which the select item then reads as the key.
+TEST(BinderTest, StringFunctions) {
+  const Catalog catalog = MakeCatalog();
+  auto plan = BindSql(
+      "SELECT REGEXP_REPLACE(s, '^(.)', '\\1') AS k, AVG(STRLEN(s)), MIN(s) FROM t GROUP BY k "
+      "HAVING COUNT(*) > 1 ORDER BY strlen(k) DESC",
+      catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  EXPECT_EQ(plan->output[0].type, LogicalType::kVarchar);
+  EXPECT_EQ(plan->output[1].name, "avg(strlen(s))");
+  EXPECT_EQ(plan->output[1].type, LogicalType::kDouble);
+  const std::string explain = Explain(*plan);
+  EXPECT_NE(explain.find("GroupAggregate keys=[\"regexp_replace(s, '^(.)', '\\x5C1')\"]"),
+            std::string::npos)
+      << explain;
+  EXPECT_NE(explain.find("Compute strlen(regexp_replace(s, '^(.)', '\\x5C1'))"), std::string::npos)
+      << "strlen over the key, above the aggregation\n"
+      << explain;
+  auto where = BindSql("SELECT COUNT(*) FROM t WHERE strlen(s) > 3", catalog);
+  ASSERT_TRUE(where.ok());
+  EXPECT_EQ(std::get<FilterNode>(Nth(*where, 1)).predicates[0].constant.type, LogicalType::kBigInt);
 }
 
 TEST(BinderTest, ParenthesesGroupOnly) {

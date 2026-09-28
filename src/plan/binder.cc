@@ -148,6 +148,13 @@ std::string ExprName(const sql::Expr& expr) {
   if (const auto* unary = std::get_if<sql::UnaryExpr>(&expr)) {
     return (unary->op == sql::UnaryOp::kNot ? "(NOT " : "-(") + ExprName(*unary->operand) + ")";
   }
+  if (const auto* call = std::get_if<sql::FunctionCall>(&expr)) {
+    std::string args;
+    for (const sql::Expr& arg : call->args) {
+      args += (args.empty() ? "" : ", ") + ExprName(arg);
+    }
+    return AsciiLower(call->name) + "(" + args + ")";
+  }
   return sql::ToSql(expr);
 }
 
@@ -173,9 +180,32 @@ std::optional<Rejection> FirstUnsupported(const sql::Expr& expr);
 
 // Whether the expression reads a column (or, `aggregates`, calls an aggregate): one that does
 // neither is a constant.
+// The scalar functions the binder answers: a VARCHAR argument, then string literals (the pattern
+// and the replacement of regexp_replace).
+struct FunctionSpec {
+  std::string_view name;  // lower case, as DuckDB names the result
+  Function function;
+  std::size_t args;
+};
+
+constexpr auto kFunctions = std::to_array<FunctionSpec>({
+    {.name = "strlen", .function = Function::kStrlen, .args = 1},
+    {.name = "regexp_replace", .function = Function::kRegexpReplace, .args = 3},
+});
+
+std::optional<FunctionSpec> FindFunction(const sql::FunctionCall& call) {
+  const std::string name = AsciiLower(call.name);
+  const auto* spec = std::ranges::find(kFunctions, name, &FunctionSpec::name);
+  return spec == kFunctions.end() ? std::nullopt : std::optional(*spec);
+}
+
 bool ReadsColumn(const sql::Expr& expr, bool aggregates = false) {
   if (std::holds_alternative<sql::ColumnRef>(expr)) {
     return true;
+  }
+  if (const auto* call = std::get_if<sql::FunctionCall>(&expr)) {
+    return std::ranges::any_of(call->args,
+                               [&](const sql::Expr& a) { return ReadsColumn(a, aggregates); });
   }
   if (std::holds_alternative<sql::AggregateCall>(expr)) {
     return aggregates;
@@ -266,10 +296,47 @@ struct FirstUnsupportedOf {
     return Rejection{.span = in.op_span, .message = "IN is only supported in WHERE and HAVING"};
   }
   std::optional<Rejection> operator()(const sql::FunctionCall& call) const {
-    return Rejection{.span = call.name_span,
-                     .message = std::format("function {}() is not supported (only COUNT, SUM, "
-                                            "AVG, MIN, MAX)",
-                                            Clip(call.name))};
+    const std::optional<FunctionSpec> spec = FindFunction(call);
+    if (!spec.has_value()) {
+      return Rejection{.span = call.name_span,
+                       .message = std::format("function {}() is not supported (only COUNT, SUM, "
+                                              "AVG, MIN, MAX, STRLEN and REGEXP_REPLACE)",
+                                              Clip(call.name))};
+    }
+    if (call.args.size() != spec->args) {
+      return std::nullopt;  // a bind error (the binder reports the arity), as in DuckDB
+    }
+    for (std::size_t i = 0; i < call.args.size(); ++i) {
+      if (i > 0 && !std::holds_alternative<sql::Literal>(call.args[i])) {
+        return Rejection{.span = call.args[i].span(),
+                         .message = std::format("the arguments of {}() after the first must be "
+                                                "string literals",
+                                                spec->name)};
+      }
+      // The evaluator anchors the pattern as ^(\C*?)(pattern) and shifts the replacement's groups
+      // by two (exec/compute.cc): \8 and \9 would pass RE2's \9, and \Q would quote the ')'.
+      const auto* lit = std::get_if<sql::Literal>(&call.args[i]);
+      if (spec->function == Function::kRegexpReplace && i > 0 && lit != nullptr) {
+        const std::string_view escapes = i == 1 ? "Q" : "89";
+        for (std::size_t j = 0; j + 1 < lit->text.size(); ++j) {
+          if (lit->text[j] != '\\') {
+            continue;
+          }
+          if (escapes.contains(lit->text[j + 1])) {
+            return Rejection{
+                .span = call.args[i].span(),
+                .message = std::format("regexp_replace() with \\{} in the {} is not "
+                                       "supported",
+                                       lit->text[j + 1], i == 1 ? "pattern" : "replacement")};
+          }
+          ++j;  // the escaped character
+        }
+      }
+      if (auto r = FirstUnsupported(call.args[i])) {
+        return r;
+      }
+    }
+    return std::nullopt;
   }
   std::optional<Rejection> operator()(const sql::CaseExpr& c) const {
     return Rejection{.span = Prefix(c.span, 4), .message = "CASE is not supported"};
@@ -778,6 +845,9 @@ bool ContainsAggregate(const sql::Expr& expr) {
   if (std::holds_alternative<sql::AggregateCall>(expr)) {
     return true;
   }
+  if (const auto* call = std::get_if<sql::FunctionCall>(&expr)) {
+    return std::ranges::any_of(call->args, ContainsAggregate);
+  }
   if (const auto* binary = std::get_if<sql::BinaryExpr>(&expr)) {
     return ContainsAggregate(*binary->left) || ContainsAggregate(*binary->right);
   }
@@ -1183,7 +1253,49 @@ class Binder {
     if (const auto* call = std::get_if<sql::AggregateCall>(&expr)) {
       return BindError("aggregate functions are not allowed here", call->span);
     }
+    if (const auto* call = std::get_if<sql::FunctionCall>(&expr)) {
+      return BindFunction(*call, [this](const sql::Expr& e) { return BindInput(e); });
+    }
     return UnsupportedError("this expression is not supported", expr.span());
+  }
+
+  // A function call with its first argument bound by `bind_arg` (the scope's binder).
+  template <class BindArg>
+  arrow::Result<Typed> BindFunction(const sql::FunctionCall& call, const BindArg& bind_arg) {
+    const std::optional<FunctionSpec> spec = FindFunction(call);
+    if (!spec.has_value()) {
+      return UnsupportedError("this function is not supported", call.name_span);
+    }
+    if (call.args.size() != spec->args) {
+      return BindError(std::format("{}() takes {} argument{}, not {}", spec->name, spec->args,
+                                   spec->args == 1 ? "" : "s", call.args.size()),
+                       call.span);
+    }
+    ARROW_ASSIGN_OR_RAISE(Typed first, bind_arg(call.args[0]));
+    if (first.expr->type != LogicalType::kVarchar) {
+      return BindError(
+          std::format("{}() needs a VARCHAR, but {}", spec->name, DescribeOperand(first)),
+          call.args[0].span());
+    }
+    std::string name = std::string(spec->name) + "(" + first.expr->name;
+    FunctionExpr function{.function = spec->function, .args = {std::move(first.expr)}};
+    for (std::size_t i = 1; i < call.args.size(); ++i) {
+      const auto* lit = std::get_if<sql::Literal>(&call.args[i]);
+      if (lit == nullptr || lit->kind != sql::Literal::Kind::kString) {
+        return BindError(
+            std::format("argument {} of {}() must be a string literal", i + 1, spec->name),
+            call.args[i].span());
+      }
+      name += ", " + LiteralName(*lit);
+      function.args.push_back(std::make_shared<const Expr>(Expr{
+          .node =
+              ConstantExpr{.value = Constant{.type = LogicalType::kVarchar, .value = lit->text}},
+          .type = LogicalType::kVarchar,
+          .name = LiteralName(*lit)}));
+    }
+    const LogicalType type =
+        spec->function == Function::kStrlen ? LogicalType::kBigInt : LogicalType::kVarchar;
+    return Leaf(Expr{.node = std::move(function), .type = type, .name = name + ")"});
   }
 
   // The column of an input-scope expression: a table column as is, anything else computed (once):
@@ -1367,6 +1479,9 @@ class Binder {
     if (const auto* unary = std::get_if<sql::UnaryExpr>(&expr)) {
       ARROW_ASSIGN_OR_RAISE(Typed operand, BindOutput(*unary->operand));
       return Negate(*unary, std::move(operand));
+    }
+    if (const auto* call = std::get_if<sql::FunctionCall>(&expr)) {
+      return BindFunction(*call, [this](const sql::Expr& e) { return BindOutput(e); });
     }
     return UnsupportedError("this expression is not supported", expr.span());
   }

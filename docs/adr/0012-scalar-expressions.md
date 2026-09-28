@@ -26,6 +26,9 @@ Accepted (with the maintainer-approved plan for scalar expressions)
 - **A bound expression tree, `plan::Expr`,** with the node kinds the binder answers (a column of the node's input, a
   constant, arithmetic, negation), each typed with DuckDB's rule and named with DuckDB's result name (`(a + 1)`,
   `sum((a + 1))`). Later PRs of the plan add function calls, `CASE` and timestamps as new node kinds.
+  Update: function calls are a `FunctionExpr` node with a fixed list of functions (`strlen`, `regexp_replace`), each
+  with its arity, argument types and result type in the binder; a `regexp_replace` pattern and replacement must be
+  literals, so the evaluator compiles them once per batch with Arrow's RE2 kernel.
 - **A `Compute` node** appends one column per expression to its input. The binder places one over the (filtered)
   table for `WHERE` operands, aggregate arguments and `GROUP BY` expressions, and one over the aggregation for select,
   `HAVING` and `ORDER BY` expressions over keys and aggregates. Every other operator keeps taking columns, and a

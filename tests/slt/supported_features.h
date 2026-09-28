@@ -23,19 +23,20 @@ namespace antb1::slt {
 
 enum class Feature : std::uint8_t {
   // SELECT list
-  kCountStar,      // COUNT(*)
-  kCountColumn,    // COUNT(col)
-  kSum,            // SUM(numeric col)
-  kAvg,            // AVG(numeric col)
-  kMin,            // MIN(col)
-  kMax,            // MAX(col)
-  kCountDistinct,  // COUNT(DISTINCT col)
-  kColumns,        // plain column references (a projection)
-  kStar,           // SELECT *
-  kMultipleItems,  // more than one select item
-  kAlias,          // <item> [AS] alias
-  kConstant,       // a literal select item (an integer, a string or a DATE)
-  kArithmetic,     // + - * / // % and unary - of a column and a constant
+  kCountStar,        // COUNT(*)
+  kCountColumn,      // COUNT(col)
+  kSum,              // SUM(numeric col)
+  kAvg,              // AVG(numeric col)
+  kMin,              // MIN(col)
+  kMax,              // MAX(col)
+  kCountDistinct,    // COUNT(DISTINCT col)
+  kColumns,          // plain column references (a projection)
+  kStar,             // SELECT *
+  kMultipleItems,    // more than one select item
+  kAlias,            // <item> [AS] alias
+  kConstant,         // a literal select item (an integer, a string or a DATE)
+  kArithmetic,       // + - * / // % and unary - of a column and a constant
+  kStringFunctions,  // strlen(varchar) and regexp_replace(varchar, 'pattern', 'replacement')
   // Column types a query reads (select list or WHERE); SELECT * reads every column
   kIntegerColumns,  // SMALLINT, INTEGER, BIGINT, USMALLINT
   kDoubleColumns,   // DOUBLE
@@ -106,6 +107,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "constant";
     case Feature::kArithmetic:
       return "arithmetic";
+    case Feature::kStringFunctions:
+      return "string_functions";
     case Feature::kIntegerColumns:
       return "integer_columns";
     case Feature::kDoubleColumns:
@@ -249,6 +252,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kAlias,
     Feature::kConstant,
     Feature::kArithmetic,
+    Feature::kStringFunctions,
     Feature::kIntegerColumns,
     Feature::kDoubleColumns,
     Feature::kVarcharColumns,

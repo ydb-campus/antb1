@@ -1,5 +1,6 @@
 #include "antb1/exec/compute.h"
 
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -215,6 +216,93 @@ struct Evaluator {
       return result.status().IsInvalid() ? Overflow("negation", e.type) : result.status();
     }
     return result->make_array();
+  }
+
+  arrow::Result<ArrayPtr> Evaluate(const plan::FunctionExpr& function,
+                                   const plan::Expr& /*e*/) const {
+    if (function.args.empty()) {
+      return arrow::Status::Invalid("function without arguments");
+    }
+    ARROW_ASSIGN_OR_RAISE(ArrayPtr text, (*this)(*function.args[0]));
+    switch (function.function) {
+      case plan::Function::kStrlen: {
+        // Bytes, as DuckDB's strlen counts them (Arrow gives int32 for binary).
+        ARROW_ASSIGN_OR_RAISE(const arrow::Datum length,
+                              arrow::compute::CallFunction("binary_length", {text}, ctx));
+        return CastTo(length.make_array(), arrow::int64(), ctx);
+      }
+      case plan::Function::kRegexpReplace:
+        return RegexpReplace(function, text);
+    }
+    return arrow::Status::Invalid("unknown function");
+  }
+
+  // RE2 in UTF-8 mode, as DuckDB runs it: the binary values are viewed as UTF-8 (not validated;
+  // DuckDB's VARCHAR is valid UTF-8 anyway), the first match replaced, the result bytes again.
+  // DuckDB calls RE2::Replace on the whole value. Arrow's replace_substring_regex with one
+  // replacement re-matches the pattern on the matched substring alone, where \b, \B, ^ and $ see
+  // other neighbors; so the pattern becomes ^(\C*?)(pattern), RE2's own unanchored search (\C is
+  // any byte) with the text before the match in group 1, and every match of it (there is at most
+  // one) is replaced with \1 and the replacement, its groups shifted by two.
+  arrow::Result<ArrayPtr> RegexpReplace(const plan::FunctionExpr& function,
+                                        const ArrayPtr& text) const {
+    if (function.args.size() != 3) {
+      return arrow::Status::Invalid("regexp_replace takes three arguments");
+    }
+    std::array<std::string, 2> pattern_and_replacement;
+    for (std::size_t i = 0; i < 2; ++i) {
+      const auto* constant = std::get_if<plan::ConstantExpr>(&function.args[i + 1]->node);
+      const auto* value =
+          constant != nullptr ? std::get_if<std::string>(&constant->value.value) : nullptr;
+      if (value == nullptr) {
+        return arrow::Status::Invalid("regexp_replace takes a constant pattern and replacement");
+      }
+      pattern_and_replacement[i] = *value;
+    }
+    const auto& [pattern, replacement] = pattern_and_replacement;
+    std::string shifted = "\\1";
+    for (std::size_t i = 0; i < replacement.size(); ++i) {
+      shifted.push_back(replacement[i]);
+      if (replacement[i] != '\\' || i + 1 == replacement.size()) {
+        continue;
+      }
+      const char next = replacement[++i];
+      if (next >= '0' && next <= '7') {
+        shifted.push_back(static_cast<char>(next + 2));
+      } else if (next >= '8' && next <= '9') {
+        return arrow::Status::Invalid("regexp_replace: \\8 and \\9 are rejected by the binder");
+      } else {
+        shifted.push_back(next);  // \\, or an escape RE2 rejects as DuckDB's RE2 does
+      }
+    }
+    arrow::compute::CastOptions to_utf8 = arrow::compute::CastOptions::Unsafe(arrow::utf8());
+    ARROW_ASSIGN_OR_RAISE(const arrow::Datum utf8, arrow::compute::Cast(text, to_utf8, ctx));
+    // The pattern alone first: an invalid one fails as in DuckDB, and a valid one cannot close
+    // the group it is wrapped in.
+    const arrow::compute::ReplaceSubstringOptions check(pattern, "", /*max_replacements=*/-1);
+    // (Over one value: Arrow compiles no pattern for an empty input.)
+    ARROW_ASSIGN_OR_RAISE(const ArrayPtr one,
+                          arrow::MakeArrayFromScalar(arrow::StringScalar(""), 1, pool));
+    auto valid = arrow::compute::CallFunction("replace_substring_regex", {one}, &check, ctx);
+    if (!valid.ok()) {
+      return arrow::Status::ExecutionError("regexp_replace: ", valid.status().message());
+    }
+    const arrow::compute::ReplaceSubstringOptions options("^(\\C*?)(" + pattern + ")", shifted,
+                                                          /*max_replacements=*/-1);
+    auto replaced = arrow::compute::CallFunction("replace_substring_regex", {utf8}, &options, ctx);
+    if (!replaced.ok() && replaced.status().message().starts_with("Invalid replacement string")) {
+      // A replacement RE2 rejects (\1 without a group, a lone backslash): DuckDB ignores
+      // RE2::Replace's failure and returns the text unchanged.
+      return text;
+    }
+    if (!replaced.ok()) {
+      // An invalid pattern: a query error, as in DuckDB (Invalid Input Error).
+      return arrow::Status::ExecutionError("regexp_replace: ", replaced.status().message());
+    }
+    arrow::compute::CastOptions to_binary = arrow::compute::CastOptions::Unsafe(arrow::binary());
+    ARROW_ASSIGN_OR_RAISE(const arrow::Datum bytes,
+                          arrow::compute::Cast(*replaced, to_binary, ctx));
+    return bytes.make_array();
   }
 
   arrow::Result<ArrayPtr> Evaluate(const plan::ArithExpr& arith, const plan::Expr& e) const {
