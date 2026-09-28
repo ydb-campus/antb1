@@ -11,8 +11,8 @@ This page is the contract: a PR that changes SQL behavior updates it in the same
 Every query of the [grammar](#grammar) below runs: global and grouped (`GROUP BY`) aggregates, `COUNT(DISTINCT ...)`
 included, projections (`*`, columns or constants), a `WHERE` conjunction of `column <op> literal` comparisons,
 `column [NOT] LIKE 'pattern'` and `column [NOT] IN (literal, ...)`, `GROUP BY` and `ORDER BY` (also by position),
-`LIMIT` and `OFFSET`, over one table of Parquet files. This covers 36 of the 43 ClickBench queries (see
-[ClickBench status](#clickbench-status)).
+`HAVING` (the same conditions on aggregates and keys), `LIMIT` and `OFFSET`, over one table of Parquet files. This
+covers 36 of the 43 ClickBench queries (see [ClickBench status](#clickbench-status)).
 
 ```sql
 SELECT COUNT(*), SUM(ResolutionWidth) AS width, AVG(UserID), MAX(EventDate) FROM hits WHERE IsMobile = 1
@@ -20,6 +20,7 @@ SELECT WatchID, URL FROM hits WHERE RegionID < 300 AND SearchPhrase <> '' LIMIT 
 SELECT COUNT(*) FROM events WHERE url LIKE '%shop%' AND title NOT LIKE 'Promo_%'
 SELECT RegionID, COUNT(*) AS n, AVG(ResolutionWidth) FROM hits WHERE IsMobile = 1 GROUP BY RegionID
 SELECT OS, COUNT(*) AS n FROM hits GROUP BY OS ORDER BY n DESC, MAX(EventDate) NULLS FIRST LIMIT 10 OFFSET 5
+SELECT CounterID, COUNT(*) AS n FROM hits GROUP BY CounterID HAVING n > 100 AND MIN(URL) LIKE 'http%'
 SELECT * FROM '/data/hits_*.parquet' LIMIT 5
 ```
 
@@ -29,7 +30,7 @@ SELECT * FROM '/data/hits_*.parquet' LIMIT 5
   (no data page is read); under `WHERE` it counts the rows the filter selects without copying them.
 - Result names and types follow DuckDB ([Binding](#binding)); values follow the [Semantics](#semantics) below.
 - `--` line comments, `/* block */` comments and one trailing `;` are allowed.
-- SQL outside the grammar (`HAVING`, `JOIN`, `OR`, functions, ...) fails with exit code 4 and points at the first
+- SQL outside the grammar (`JOIN`, `OR`, functions, ...) fails with exit code 4 and points at the first
   unsupported token. Malformed SQL (a syntax error) and SQL that is wrong for the table (a bind error) fail with exit
   code 1.
 
@@ -50,6 +51,7 @@ case-insensitive.
 statement   = query , [ ";" ] ;
 query       = "SELECT" , select_list , "FROM" , table_ref , [ "WHERE" , predicate ] ,
               [ "GROUP" , "BY" , group_item , { "," , group_item } ] ,
+              [ "HAVING" , having ] ,
               [ "ORDER" , "BY" , order_item , { "," , order_item } ] ,
               [ limit_offset ] ;
 limit_offset = "LIMIT" , integer , [ "OFFSET" , integer ] | "OFFSET" , integer , [ "LIMIT" , integer ] ;
@@ -63,9 +65,12 @@ order_item  = ( agg_call | column_ref | literal ) , [ "ASC" | "DESC" ] , [ "NULL
 table_ref   = identifier | string_literal ;
 column_ref  = identifier ;
 predicate   = comparison , { "AND" , comparison } ;
-comparison  = column_ref , cmp_op , literal | literal , cmp_op , column_ref
-            | column_ref , [ "NOT" ] , "LIKE" , string_literal
-            | column_ref , [ "NOT" ] , "IN" , "(" , literal , { "," , literal } , ")" ;
+comparison  = column_ref , condition | literal , cmp_op , column_ref ;
+having      = having_cmp , { "AND" , having_cmp } ;
+having_cmp  = ( agg_call | column_ref ) , condition | literal , cmp_op , ( agg_call | column_ref ) ;
+condition   = cmp_op , literal
+            | [ "NOT" ] , "LIKE" , string_literal
+            | [ "NOT" ] , "IN" , "(" , literal , { "," , literal } , ")" ;
 cmp_op      = "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" ;
 literal     = [ "-" ] , integer | [ "-" ] , decimal | string_literal | "DATE" , string_literal ;
 ```
@@ -74,29 +79,32 @@ Lexical rules: an `identifier` is a letter or `_` followed by letters, digits or
 (`""` escapes a quote); a `string_literal` is text in single quotes (`''` escapes a quote); an `integer` is a
 sequence of digits; a `decimal` is a number with a decimal point, an exponent or both (`1.5`, `.5`, `5.`, `1e3`).
 Keywords are not reserved by the lexer. A literal-first comparison is normalized by the parser (`5 < c` becomes
-`c > 5`).
+`c > 5`, `5 < COUNT(*)` becomes `COUNT(*) > 5`).
 
 `GROUP BY ALL`, `ORDER BY ALL` and expressions are rejected by the parser, and so are `SUM`, `AVG`, `MIN` and `MAX`
 with `DISTINCT`.
 
 Outside the grammar, the parser recognizes common SQL and rejects it with exit code 4 and a source span, among others:
-`SELECT DISTINCT`, `HAVING`, joins, `ILIKE`, `LIKE ... ESCAPE`, `LIKE` outside `WHERE` or with a column as the
-pattern, `IN` with a subquery, a column in its list or a literal on its left, `CASE`, arithmetic, function calls other
-than the five aggregates, `NULL` literals, `IS [NOT] NULL`, `OR` and `NOT`. Malformed SQL inside the subset, such as
+`SELECT DISTINCT`, joins, `ILIKE`, `LIKE ... ESCAPE`, `LIKE` outside `WHERE` and `HAVING` or with a column or an
+aggregate as the pattern, `IN` with a subquery, a column or an aggregate in its list or a literal on its left, a
+`HAVING` comparison of two columns or aggregates, `CASE`, arithmetic, function calls other than the five aggregates,
+`NULL` literals, `IS [NOT] NULL`, `OR` and `NOT`. Malformed SQL inside the subset, such as
 `SELECT COUNT(*) FORM t`, is a syntax error with exit code 1.
 
 ## Binding
 
 The binder (`plan::Bind`) resolves the statement against the table and builds the logical plan. A bind error has exit
 code 1 and points at the offending name, call or literal; the first error in query order wins (the table, then the
-select list, `WHERE`, the `GROUP BY` names, the grouping rule below, `LIMIT`, `OFFSET` and the `ORDER BY` items).
+select list, `WHERE`, the `GROUP BY` names, the grouping rule below, `LIMIT`, `OFFSET`, `HAVING` and the `ORDER BY`
+items).
 
 - Names: table and column names match ASCII case-insensitively, quoted identifiers included (as in DuckDB). An
   unknown table or column is a bind error, and so is a name that matches two columns differing only in case. A
   column of an unsupported type fails with exit code 4 wherever it is referenced (by `SELECT *` too).
 - Select list: `*` alone, or plain columns, aggregates and constants. Without `GROUP BY`, aggregates (in the select
-  list or in `ORDER BY`) cannot be mixed with plain columns: a bind error at the first plain column (or at `*`).
-  Constants mix with anything; with an aggregate (also one only in `ORDER BY`) the query has one row.
+  list, in `HAVING` or in `ORDER BY`) and `HAVING` itself cannot be mixed with plain columns: a bind error at the
+  first plain column (or at `*`). Constants mix with anything; with an aggregate (also one only in `HAVING` or
+  `ORDER BY`) or `HAVING` the query has one row.
 - Constants (as DuckDB types and names them): an integer is INTEGER when its magnitude fits (so `-2147483648` is
   BIGINT), else BIGINT or HUGEINT, and is named by its value (`007` is `7`); a string is VARCHAR named with its
   quotes (`'it''s'`); `DATE '2020-01-02'` is DATE named `CAST('2020-01-02' AS "DATE")`. A decimal (DuckDB's DECIMAL)
@@ -124,9 +132,17 @@ select list, `WHERE`, the `GROUP BY` names, the grouping rule below, `LIMIT`, `O
   aggregates (an aggregate the select list lacks is computed and not returned); any other column is a bind error
   (`column 'b' must appear in the GROUP BY clause or be inside an aggregate function`). An aggregate query without
   `GROUP BY` has one row, so it may order by aggregates only. A key that repeats an earlier one changes nothing.
+- `HAVING`: an aggregate call is computed like a select-list aggregate (one the select list lacks is computed and
+  not returned). A name is a `GROUP BY` key when the table column of that name is one, else the alias of a select
+  item (the last one with it, as in DuckDB): a key or an aggregate; an alias of a constant is unsupported (exit code
+  4), and any other column is a bind error (`column 'b' must appear in the GROUP BY clause or be inside an aggregate
+  function`). Without `GROUP BY` there are no keys. Literals are typed like those of `WHERE` (below) against the
+  operand's type: `COUNT` is BIGINT, an integer `SUM` HUGEINT, `AVG` and a DOUBLE `SUM` DOUBLE, `MIN` and `MAX` their
+  column's type (and FLOAT for a FLOAT column, as in DuckDB, while its `SUM` and `AVG` are DOUBLE).
 - `LIMIT n` and `OFFSET m` take integers from 0 to 9223372036854775807, in either order.
 
-Literals in `WHERE` must fit the column's type; any other combination is a bind error that points at the literal:
+Literals in `WHERE` and `HAVING` must fit the column's (or the aggregate's) type; any other combination is a bind
+error that points at the literal:
 
 | Column type | Literals | Compared as |
 | --- | --- | --- |
@@ -151,7 +167,8 @@ A comparison of an integer column with a number is folded exactly at bind time, 
 
 ## Logical plans and EXPLAIN
 
-A bound query is a tree of logical nodes: `Scan` (reads fields of the table), `Filter` (the `WHERE` conjunction),
+A bound query is a tree of logical nodes: `Scan` (reads fields of the table), `Filter` (the `WHERE` conjunction, or
+above the aggregation the `HAVING` one),
 `Project` (`*` or the plain columns), `Aggregate` (the aggregates, one output row) or `GroupAggregate` (`GROUP BY`:
 the keys, then the aggregates, one row per group; a `Project` above it restores the select order), `Sort`
 (`ORDER BY`, below the `Project`, so it can use columns and aggregates the query does not return) and `Limit` (with
@@ -252,6 +269,9 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   every NaN together, as DuckDB does, and the group shows the key as first seen. Over zero input rows there is no
   group, so no row. Groups come in no particular order (deterministic in antb1, not the order of first appearance),
   and the tests compare grouped results without regard to order; with `LIMIT` any groups are a right answer.
+- HAVING: its conditions filter the rows of the aggregation (the groups, or the one row of an aggregate query
+  without `GROUP BY`, which it may filter out) before `ORDER BY`, `LIMIT` and `OFFSET`, with the NULL, folding and
+  operator rules of `WHERE`: a NULL aggregate (`SUM` of only NULLs) or NULL key rejects the row.
 - ORDER BY: rows in the order of the first key, ties broken by the next ones. `ASC` is the default; NULLs come last
   unless `NULLS FIRST` is written, for `ASC` and `DESC` alike (DuckDB's default). VARCHAR orders by bytes, DATE
   chronologically, and DOUBLE with `-0.0` equal to `0.0` and NaN above every number (equal to NaN), as in DuckDB.
@@ -290,7 +310,7 @@ formatter:
 | 1 | query error: syntax, bind or execution error | `SELECT COUNT(*) FORM t`; an unknown table or column; `SUM` of a VARCHAR column; a `SUM` outside HUGEINT's range |
 | 2 | usage error | unknown option; neither or both of `-c` and `-f`; a malformed `--table` or `--column-type`; a column that `--column-type` cannot read as DATE; a table name registered twice |
 | 3 | I/O error | a missing or unreadable file; not a Parquet file; schemas that differ; a glob that matches nothing |
-| 4 | unsupported: valid-looking SQL outside the supported subset | `HAVING`; `OR`; a function call; `SELECT 2.5`; `SUM(DISTINCT ...)`; a column of an unsupported type |
+| 4 | unsupported: valid-looking SQL outside the supported subset | `JOIN`; `OR`; a function call; `SELECT 2.5`; `SUM(DISTINCT ...)`; a column of an unsupported type |
 | 70 | internal error: anything else, which is a bug | an uncaught exception; an Arrow `NotImplemented` or type error without SQL context |
 
 Exit code 4 is used only for errors that the parser, the binder or the physical planner marks as unsupported
@@ -328,7 +348,7 @@ compare against DuckDB, so an unregistered difference is a bug.
 | D10 | NaN | MIN and MAX ignore NaN like Arrow's `min_max`, whatever the batch and file boundaries: they return NaN only when every selected non-NULL value is NaN (so only MAX over NaN and other values differs from DuckDB). Arrow's comparison kernels follow IEEE 754: NaN compares unequal to everything, so `d > 1` and `d >= 1` are false for NaN, and `d IN (...)` never matches it | orders NaN above every other value and equal to itself: MIN and MAX return NaN when it is the extreme, `d > 1` is true for NaN | the fixtures contain no NaN (fixturegen builds doubles from integer ratios); `exec.AggregateStateTest.MinMaxOfDoublesIgnoreNaNInEveryBatchSplit` and `engine.SessionTest.MinMaxIgnoreNaNAcrossBatchesAndFiles` pin antb1's MIN and MAX |
 | D11 | FLOAT columns | read as DOUBLE (widened exactly): results of FLOAT columns are DOUBLE and print with double precision; `WHERE` compares like DuckDB (see Binding) | keeps FLOAT (`MIN`, `MAX` and projections return FLOAT) | the random generator never references a FLOAT column (`ColumnOf` in `tests/slt/runner/query_gen.cc`, `harness.LoadGenTables.SkipsFloatColumns`); `tests/slt/cases/where/float.slt` selects only other columns, and `engine.SessionTest.FloatColumnsCompareLikeDuckDb` pins that results stay DOUBLE |
 | D12 | Long numbers against DOUBLE | a number compared with a DOUBLE column is the correctly rounded nearest double | converts a DECIMAL literal (at most 38 digits) or a HUGEINT literal to DOUBLE in two steps when its digits exceed 2^53, which can be one ulp off (`9007199254740993.5`) | the generator only writes decimals of at most 2^53 in their digits with at most 22 decimals, where both round the same (`ExactDecimalDouble` in `tests/slt/runner/query_gen.cc`) |
-| D13 | Decimals with many digits against integer columns | compared exactly | compares in a DECIMAL whose width is capped at 38 digits: when the column type's digits plus the literal's decimals exceed 38, a column value with too many integer digits fails the query with a conversion error (`i16 = 1.0000000000000000000000000000000000001` over the value -32768) | the `.slt` records and the generator keep literals short enough; `plan.Binder/FoldThroughBinderTest.*` covers the exact folding |
+| D13 | Decimals with many digits against integer columns | compared exactly | compares in a DECIMAL whose width is capped at 38 digits: when the column type's digits plus the literal's decimals exceed 38, a column value with too many integer digits fails the query with a conversion error (`i16 = 1.0000000000000000000000000000000000001` over the value -32768); likewise an integer `SUM` (HUGEINT, 38 digits) in `HAVING` against any decimal fails once the sum has more digits than 38 minus the literal's decimals | the `.slt` records and the generator keep literals short enough; `plan.Binder/FoldThroughBinderTest.*` covers the exact folding |
 
 ## ClickBench status
 
@@ -380,4 +400,4 @@ bind error); today all of them answer Unsupported with exit code 4.
 | Q38 | pass | `GROUP BY` one column under a `WHERE` conjunction, ordered by the alias of the count, a window with `OFFSET` |
 | Q40 | pass | a `WHERE` conjunction with `IN` over two values, `GROUP BY` two columns, ordered by the count, a window with `OFFSET` |
 | Q41 | pass | `GROUP BY` two columns under a `WHERE` conjunction, ordered by the alias of the count, a window with `OFFSET` |
-| all others | out of scope | need functions, expressions, HAVING or other rejected syntax; they fail cleanly with exit code 4 |
+| all others | out of scope | need functions or expressions (Q27 and Q28 also `HAVING`, which is supported); they fail cleanly with exit code 4 |

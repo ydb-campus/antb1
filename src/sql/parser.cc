@@ -26,17 +26,22 @@
 //
 //   statement   := query [';'] EOF
 //   query       := SELECT select_list FROM table_ref [WHERE predicate]
-//                  [GROUP BY column_ref (',' column_ref)*] [ORDER BY order_item (',' order_item)*]
+//                  [GROUP BY group_item (',' group_item)*] [HAVING having]
+//                  [ORDER BY order_item (',' order_item)*]
 //                  [LIMIT integer] [OFFSET integer]      (LIMIT and OFFSET in either order)
 //   select_list := '*' | select_item (',' select_item)*
-//   select_item := (agg_call | column_ref) [[AS] identifier]
+//   select_item := (agg_call | column_ref | literal) [[AS] identifier]
+//   group_item  := column_ref | literal
 //   agg_call    := COUNT '(' '*' ')' | COUNT '(' DISTINCT column_ref ')'
 //                | (COUNT | SUM | AVG | MIN | MAX) '(' column_ref ')'
-//   order_item  := (agg_call | column_ref) [ASC | DESC] [NULLS (FIRST | LAST)]
+//   order_item  := (agg_call | column_ref | literal) [ASC | DESC] [NULLS (FIRST | LAST)]
 //   table_ref   := identifier | quoted_identifier | string_literal
 //   predicate   := comparison (AND comparison)*
-//   comparison  := column_ref cmp_op literal | literal cmp_op column_ref
-//   literal     := ['-'] integer | ['-'] decimal | string_literal | DATE string_literal
+//   comparison  := column_ref condition | literal cmp_op column_ref
+//   having      := having_cmp (AND having_cmp)*
+//   having_cmp  := (agg_call | column_ref) condition | literal cmp_op (agg_call | column_ref)
+//   condition   := cmp_op literal | [NOT] LIKE string_literal | [NOT] IN '(' literal (',' literal)*
+//   ')' literal     := ['-'] integer | ['-'] decimal | string_literal | DATE string_literal
 //
 // No production is recursive, so neither is the parser. Tokens are pulled lazily from the lexer
 // (at most three tokens of lookahead), so work and memory stop at the first error whatever the
@@ -54,7 +59,7 @@ using Status = std::expected<void, ParseError>;
 using Operand = std::variant<ColumnRef, Literal>;
 
 // Where an operand is parsed; selects the error wording and whether literals are allowed.
-enum class Context : std::uint8_t { kSelect, kAggregateArg, kWhere, kGroupBy, kOrderBy };
+enum class Context : std::uint8_t { kSelect, kAggregateArg, kWhere, kGroupBy, kHaving, kOrderBy };
 
 struct Construct {
   std::string_view keyword;
@@ -92,7 +97,6 @@ constexpr auto kUnsupportedClauses = std::to_array<Construct>({
     {.keyword = "FETCH", .message = "FETCH is not supported"},
     {.keyword = "FOR", .message = "FOR UPDATE/SHARE is not supported"},
     {.keyword = "FULL", .message = "FULL JOIN is not supported"},
-    {.keyword = "HAVING", .message = "HAVING is not supported"},
     {.keyword = "INNER", .message = "INNER JOIN is not supported"},
     {.keyword = "INTERSECT", .message = "INTERSECT is not supported"},
     {.keyword = "JOIN", .message = "JOIN is not supported"},
@@ -340,8 +344,8 @@ std::unexpected<ParseError> Unsupported(SourceSpan span, std::string_view constr
 
 // Keywords that start a clause after the select list, supported or not.
 bool IsClauseKeyword(std::string_view keyword) {
-  return keyword == "FROM" || keyword == "WHERE" || keyword == "GROUP" || keyword == "ORDER" ||
-         keyword == "LIMIT" || keyword == "OFFSET" || keyword == "INTO" ||
+  return keyword == "FROM" || keyword == "WHERE" || keyword == "GROUP" || keyword == "HAVING" ||
+         keyword == "ORDER" || keyword == "LIMIT" || keyword == "OFFSET" || keyword == "INTO" ||
          Find(kUnsupportedClauses, keyword).has_value();
 }
 
@@ -370,6 +374,8 @@ std::string_view Expectation(Context context) {
       return "a column or a literal";
     case Context::kGroupBy:
       return "a column";
+    case Context::kHaving:
+      return "an aggregate, a column or a literal";
     case Context::kOrderBy:
       return "a column or an aggregate";
   }
@@ -438,6 +444,11 @@ class Parser {
     }
     if (Peek().IsKeyword("GROUP")) {
       if (auto status = ParseGroupBy(stmt); !status) {
+        return std::unexpected(std::move(status.error()));
+      }
+    }
+    if (Peek().IsKeyword("HAVING")) {
+      if (auto status = ParseHaving(stmt); !status) {
         return std::unexpected(std::move(status.error()));
       }
     }
@@ -729,6 +740,8 @@ class Parser {
             return Syntax(token.span, "aggregate functions are not allowed in WHERE");
           case Context::kGroupBy:
             return Syntax(token.span, "aggregate functions are not allowed in GROUP BY");
+          case Context::kHaving:  // a LIKE pattern or an IN value
+            return Unsupported(token.span, "an aggregate is only supported left of LIKE or IN");
           default:
             return Syntax(token.span, "aggregate function calls cannot be nested");
         }
@@ -893,11 +906,31 @@ class Parser {
       return std::unexpected(std::move(lhs.error()));
     }
     const Token& op_token = Peek();
-    if (op_token.IsKeyword("LIKE") || (op_token.IsKeyword("NOT") && PeekAt(1).IsKeyword("LIKE"))) {
-      return ParseLike(*std::move(lhs));
+    auto* column = std::get_if<ColumnRef>(&*lhs);
+    if (AtLike()) {
+      auto like = ParseLike(Context::kWhere, SpanOf(*lhs), column != nullptr,
+                            "LIKE needs a column on the left (column LIKE 'pattern')");
+      if (!like) {
+        return std::unexpected(std::move(like.error()));
+      }
+      const SourceSpan span = Cover(column->span, like->second.span);
+      return Comparison{.column = std::move(*column),
+                        .op = like->first,
+                        .literal = std::move(like->second),
+                        .span = span};
     }
-    if (op_token.IsKeyword("IN") || (op_token.IsKeyword("NOT") && PeekAt(1).IsKeyword("IN"))) {
-      return ParseIn(*std::move(lhs));
+    if (AtIn()) {
+      auto in = ParseIn(Context::kWhere, SpanOf(*lhs), column != nullptr,
+                        "IN needs a column on the left (column IN (...))");
+      if (!in) {
+        return std::unexpected(std::move(in.error()));
+      }
+      const SourceSpan span = Cover(column->span, in->close);
+      return Comparison{.column = std::move(*column),
+                        .op = in->op,
+                        .literal = {},
+                        .list = std::move(in->list),
+                        .span = span};
     }
     const std::optional<CompareOp> op = CompareOpOf(op_token.kind);
     if (!op.has_value()) {
@@ -939,20 +972,29 @@ class Parser {
                       .span = span};
   }
 
-  // column [NOT] LIKE 'pattern', positioned at LIKE or NOT; `lhs` is the operand before it.
-  Expected<Comparison> ParseLike(Operand lhs) {
+  bool AtLike() {
+    return Peek().IsKeyword("LIKE") || (Peek().IsKeyword("NOT") && PeekAt(1).IsKeyword("LIKE"));
+  }
+
+  bool AtIn() {
+    return Peek().IsKeyword("IN") || (Peek().IsKeyword("NOT") && PeekAt(1).IsKeyword("IN"));
+  }
+
+  // [NOT] LIKE 'pattern', positioned at LIKE or NOT, after an operand at `lhs` (`lhs_ok`: one
+  // LIKE accepts, else the error is `lhs_error`). Returns kLike or kNotLike and the pattern.
+  Expected<std::pair<CompareOp, Literal>> ParseLike(Context context, SourceSpan lhs, bool lhs_ok,
+                                                    std::string_view lhs_error) {
     const bool negated = Peek().IsKeyword("NOT");
     if (negated) {
       Take();
     }
     Take();  // LIKE
-    auto rhs = ParseOperand(Context::kWhere);
+    auto rhs = ParseOperand(context);
     if (!rhs) {
       return std::unexpected(std::move(rhs.error()));
     }
-    auto* column = std::get_if<ColumnRef>(&lhs);
-    if (column == nullptr) {
-      return Unsupported(SpanOf(lhs), "LIKE needs a column on the left (column LIKE 'pattern')");
+    if (!lhs_ok) {
+      return Unsupported(lhs, lhs_error);
     }
     auto* pattern = std::get_if<Literal>(&*rhs);
     if (pattern == nullptr) {
@@ -961,23 +1003,25 @@ class Parser {
     if (Peek().IsKeyword("ESCAPE")) {
       return Unsupported(Peek().span, "LIKE ... ESCAPE is not supported");
     }
-    const SourceSpan span = Cover(column->span, pattern->span);
-    return Comparison{.column = std::move(*column),
-                      .op = negated ? CompareOp::kNotLike : CompareOp::kLike,
-                      .literal = std::move(*pattern),
-                      .span = span};
+    return std::pair(negated ? CompareOp::kNotLike : CompareOp::kLike, std::move(*pattern));
   }
 
-  // column [NOT] IN (literal, ...), positioned at IN or NOT; `lhs` is the operand before it.
-  Expected<Comparison> ParseIn(Operand lhs) {
+  struct InList {
+    CompareOp op = CompareOp::kIn;
+    std::vector<Literal> list;
+    SourceSpan close;  // the ')'
+  };
+
+  // [NOT] IN (literal, ...), positioned at IN or NOT, after an operand at `lhs` (as in ParseLike).
+  Expected<InList> ParseIn(Context context, SourceSpan lhs, bool lhs_ok,
+                           std::string_view lhs_error) {
     const bool negated = Peek().IsKeyword("NOT");
     if (negated) {
       Take();
     }
     Take();  // IN
-    auto* column = std::get_if<ColumnRef>(&lhs);
-    if (column == nullptr) {
-      return Unsupported(SpanOf(lhs), "IN needs a column on the left (column IN (...))");
+    if (!lhs_ok) {
+      return Unsupported(lhs, lhs_error);
     }
     if (Peek().kind != TokenKind::kLeftParen) {
       return Syntax(Peek().span, "expected ( after IN, found " + Describe(Peek()));
@@ -989,13 +1033,9 @@ class Parser {
     if (Peek().kind == TokenKind::kRightParen) {
       return Syntax(Peek().span, "expected a value in IN (...), found )");
     }
-    Comparison comparison{.column = std::move(*column),
-                          .op = negated ? CompareOp::kNotIn : CompareOp::kIn,
-                          .literal = {},
-                          .list = {},
-                          .span = {}};
+    InList in{.op = negated ? CompareOp::kNotIn : CompareOp::kIn, .list = {}, .close = {}};
     while (true) {
-      auto value = ParseOperand(Context::kWhere);
+      auto value = ParseOperand(context);
       if (!value) {
         return std::unexpected(std::move(value.error()));
       }
@@ -1003,7 +1043,7 @@ class Parser {
       if (literal == nullptr) {
         return Unsupported(SpanOf(*value), "columns in an IN list are not supported");
       }
-      comparison.list.push_back(std::move(*literal));
+      in.list.push_back(std::move(*literal));
       if (auto error = UnsupportedOperator(); error.has_value()) {
         return std::unexpected(std::move(*error));
       }
@@ -1015,9 +1055,8 @@ class Parser {
       }
       Take();
     }
-    const SourceSpan close = Take().span;
-    comparison.span = Cover(comparison.column.span, close);
-    return comparison;
+    in.close = Take().span;
+    return in;
   }
 
   // GROUP BY column_ref (',' column_ref)*, positioned at GROUP.
@@ -1056,6 +1095,143 @@ class Parser {
     }
     stmt.group_by_span = SourceSpan{.offset = begin, .length = last_end_ - begin};
     return {};
+  }
+
+  // HAVING having_cmp (AND having_cmp)*, positioned at HAVING.
+  Status ParseHaving(SelectStatement& stmt) {
+    const std::size_t begin = Take().span.offset;
+    while (true) {
+      auto comparison = ParseHavingComparison();
+      if (!comparison) {
+        return std::unexpected(std::move(comparison.error()));
+      }
+      stmt.having.push_back(std::move(*comparison));
+      if (auto error = UnsupportedOperator(); error.has_value()) {
+        return std::unexpected(std::move(*error));
+      }
+      if (!Peek().IsKeyword("AND")) {
+        break;
+      }
+      Take();
+    }
+    stmt.having_span = SourceSpan{.offset = begin, .length = last_end_ - begin};
+    return {};
+  }
+
+  // An aggregate call, a column or a literal (a HAVING operand).
+  Expected<SelectExpr> ParseHavingOperand() {
+    if (auto agg_kind = AggregateOf(Peek());
+        agg_kind.has_value() && PeekAt(1).kind == TokenKind::kLeftParen) {
+      auto agg = ParseAggregate(*agg_kind);
+      if (!agg) {
+        return std::unexpected(std::move(agg.error()));
+      }
+      if (Peek().IsKeyword("FILTER") && PeekAt(1).kind == TokenKind::kLeftParen) {
+        return Unsupported(Peek().span, "aggregate FILTER clauses are not supported");
+      }
+      return SelectExpr(std::move(*agg));
+    }
+    auto operand = ParseOperand(Context::kHaving);
+    if (!operand) {
+      return std::unexpected(std::move(operand.error()));
+    }
+    if (auto* column = std::get_if<ColumnRef>(&*operand)) {
+      return SelectExpr(std::move(*column));
+    }
+    return SelectExpr(std::get<Literal>(std::move(*operand)));
+  }
+
+  static SourceSpan SpanOfExpr(const SelectExpr& expr) {
+    return std::visit([](const auto& node) { return node.span; }, expr);
+  }
+
+  static std::optional<HavingOperand> AsHavingOperand(SelectExpr expr) {
+    if (auto* agg = std::get_if<AggregateCall>(&expr)) {
+      return HavingOperand(std::move(*agg));
+    }
+    if (auto* column = std::get_if<ColumnRef>(&expr)) {
+      return HavingOperand(std::move(*column));
+    }
+    return std::nullopt;
+  }
+
+  Expected<HavingComparison> ParseHavingComparison() {
+    auto lhs = ParseHavingOperand();
+    if (!lhs) {
+      return std::unexpected(std::move(lhs.error()));
+    }
+    const SourceSpan lhs_span = SpanOfExpr(*lhs);
+    std::optional<HavingOperand> operand = AsHavingOperand(*lhs);
+    if (AtLike()) {
+      if (!operand.has_value()) {
+        return Unsupported(lhs_span, "LIKE needs a column or an aggregate on the left");
+      }
+      auto like = ParseLike(Context::kHaving, lhs_span, /*lhs_ok=*/true, {});
+      if (!like) {
+        return std::unexpected(std::move(like.error()));
+      }
+      const SourceSpan span = Cover(lhs_span, like->second.span);
+      return HavingComparison{.operand = *std::move(operand),
+                              .op = like->first,
+                              .literal = std::move(like->second),
+                              .list = {},
+                              .span = span};
+    }
+    if (AtIn()) {
+      if (!operand.has_value()) {
+        return Unsupported(lhs_span, "IN needs a column or an aggregate on the left");
+      }
+      auto in = ParseIn(Context::kHaving, lhs_span, /*lhs_ok=*/true, {});
+      if (!in) {
+        return std::unexpected(std::move(in.error()));
+      }
+      return HavingComparison{.operand = *std::move(operand),
+                              .op = in->op,
+                              .literal = {},
+                              .list = std::move(in->list),
+                              .span = Cover(lhs_span, in->close)};
+    }
+    const Token& op_token = Peek();
+    const std::optional<CompareOp> op = CompareOpOf(op_token.kind);
+    if (!op.has_value()) {
+      if (auto error = UnsupportedOperator(); error.has_value()) {
+        return std::unexpected(std::move(*error));
+      }
+      if (EndsPredicate(op_token)) {
+        return Unsupported(lhs_span,
+                           "HAVING conditions other than comparisons (aggregate or column <op> "
+                           "literal) are not supported");
+      }
+      return Syntax(
+          op_token.span,
+          "expected a comparison operator (=, <>, !=, <, <=, >, >=), found " + Describe(op_token));
+    }
+    Take();
+    auto rhs = ParseHavingOperand();
+    if (!rhs) {
+      return std::unexpected(std::move(rhs.error()));
+    }
+    const SourceSpan span = Cover(lhs_span, SpanOfExpr(*rhs));
+    std::optional<HavingOperand> rhs_operand = AsHavingOperand(*rhs);
+    if (operand.has_value() == rhs_operand.has_value()) {
+      return Unsupported(SpanOfExpr(*rhs),
+                         operand.has_value()
+                             ? "HAVING comparisons of two columns or aggregates "
+                               "are not supported"
+                             : "comparisons between two literals are not supported");
+    }
+    if (operand.has_value()) {
+      return HavingComparison{.operand = *std::move(operand),
+                              .op = *op,
+                              .literal = std::get<Literal>(std::move(*rhs)),
+                              .list = {},
+                              .span = span};
+    }
+    return HavingComparison{.operand = *std::move(rhs_operand),
+                            .op = Mirror(*op),
+                            .literal = std::get<Literal>(std::move(*lhs)),
+                            .list = {},
+                            .span = span};
   }
 
   // ORDER BY order_item (',' order_item)*, positioned at ORDER.
@@ -1215,16 +1391,17 @@ class Parser {
       return Unsupported(token.span, *construct);
     }
     // The clauses that could still follow, in grammar order.
-    const bool grouped_or_later = !stmt.group_by.empty() || !stmt.order_by.empty() ||
-                                  stmt.limit.has_value() || stmt.offset.has_value();
     const bool ordered_or_later =
         !stmt.order_by.empty() || stmt.limit.has_value() || stmt.offset.has_value();
+    const bool grouped_or_later =
+        !stmt.group_by.empty() || !stmt.having.empty() || ordered_or_later;
     std::vector<std::string_view> next;
     if (!grouped_or_later) {
       next.emplace_back(stmt.where.empty() ? "WHERE" : "AND");
       next.emplace_back("GROUP BY");
     }
     if (!ordered_or_later) {
+      next.emplace_back(stmt.having.empty() ? "HAVING" : "AND");
       next.emplace_back("ORDER BY");
     }
     if (!stmt.limit.has_value()) {

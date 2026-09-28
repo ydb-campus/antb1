@@ -1,4 +1,4 @@
-antb1: unsupported error: HAVING is not supported; see docs/sql-subset.md
-  at line 1, column 54
-  SELECT CounterID, COUNT(*) FROM t GROUP BY CounterID HAVING COUNT(*) > 1
-                                                       ^^^^^^
+antb1: unsupported error: JOIN is not supported; see docs/sql-subset.md
+  at line 1, column 35
+  SELECT CounterID, COUNT(*) FROM t JOIN u USING (CounterID) GROUP BY CounterID
+                                    ^^^^

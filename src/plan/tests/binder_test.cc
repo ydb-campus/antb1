@@ -137,6 +137,34 @@ INSTANTIATE_TEST_SUITE_P(
                   "table 'missing' does not exist"},
         ErrorCase{"SELECT i16 FROM t WHERE nope = 1 GROUP BY nope", kBind, "nope",
                   "column 'nope' does not exist"},
+        // HAVING: aggregates, GROUP BY keys and select aliases of keys or aggregates; HAVING makes
+        // the query aggregate.
+        ErrorCase{"SELECT i16 FROM t GROUP BY i16 HAVING i32 > 1", kBind, "i32",
+                  "column 'i32' must appear in the GROUP BY clause"},
+        ErrorCase{"SELECT i16 FROM t HAVING i16 > 1", kBind, "i16",
+                  "column 'i16' must be inside an aggregate function"},
+        ErrorCase{"SELECT * FROM ok HAVING COUNT(*) > 1", kBind, "*",
+                  "must be inside an aggregate function"},
+        ErrorCase{"SELECT COUNT(*) FROM t HAVING i16 > 1", kBind, "i16",
+                  "column 'i16' must appear in the GROUP BY clause"},
+        ErrorCase{"SELECT COUNT(*) FROM t GROUP BY i16 HAVING nope > 1", kBind, "nope",
+                  "column 'nope' does not exist"},
+        ErrorCase{"SELECT 5 AS k, COUNT(*) FROM t GROUP BY i16 HAVING k > 1", kUnsupported, "k",
+                  "HAVING on a constant select item is not supported"},
+        ErrorCase{"SELECT COUNT(*) FROM t GROUP BY i16 HAVING COUNT(*) > 'x'", kBind, "'x'",
+                  "cannot compare BIGINT column 'count_star()' with a string"},
+        ErrorCase{"SELECT COUNT(*) AS n FROM t GROUP BY i16 HAVING n = DATE '2020-01-01'", kBind,
+                  "DATE '2020-01-01'", "cannot compare BIGINT column 'n'"},
+        ErrorCase{"SELECT COUNT(*) FROM t GROUP BY i16 HAVING SUM(s) > 1", kBind, "SUM(s)",
+                  "SUM needs a numeric column"},
+        ErrorCase{"SELECT COUNT(*) FROM t GROUP BY i16 HAVING COUNT(*) LIKE 'x'", kBind, "COUNT(*)",
+                  "LIKE needs a VARCHAR column, but 'count_star()' is BIGINT"},
+        ErrorCase{"SELECT COUNT(*) FROM t GROUP BY i16 HAVING MAX(s) NOT LIKE 1", kBind, "1",
+                  "the pattern of NOT LIKE must be a string literal"},
+        ErrorCase{"SELECT COUNT(*) FROM t GROUP BY i16 HAVING MAX(dt) IN (1)", kBind, "1",
+                  "cannot compare DATE column 'max(dt)' with a number"},
+        ErrorCase{"SELECT COUNT(*) FROM t GROUP BY i16 HAVING COUNT(bad) > 1", kUnsupported, "bad",
+                  "unsupported type"},
         // Tables.
         ErrorCase{"SELECT COUNT(*) FROM nope", kBind, "nope", "table 'nope' does not exist"},
         ErrorCase{"SELECT COUNT(*) FROM \"nope\"", kBind, "\"nope\"", "does not exist"},
@@ -366,6 +394,94 @@ TEST(BinderTest, OrderByInAGroupedQuery) {
   const auto& group = std::get<GroupAggregateNode>(Nth(*plan, 3));
   ASSERT_EQ(group.aggregates.size(), 2U);
   EXPECT_EQ(group.aggregates[1].kind, AggKind::kMax);
+}
+
+// HAVING filters the GroupAggregate's output (keys, then aggregates) below the Sort: an aggregate
+// equal to a select one reuses it, another one is a hidden aggregate; a column is a key (a table
+// column that is one comes before an alias) or the alias of a select item.
+TEST(BinderTest, HavingInAGroupedQuery) {
+  const Catalog catalog = MakeCatalog();
+  constexpr std::string_view kSql =
+      "SELECT s, i16 AS i32, COUNT(*) AS c FROM t GROUP BY s, i16 HAVING count(*) > 1 AND "
+      "5 >= SUM(i64) AND i32 IN (1, 2) AND c <> 3 AND MIN(s) LIKE 'a%' AND s = 'x' "
+      "ORDER BY MAX(d) LIMIT 4";
+  auto plan = BindSql(kSql, catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  EXPECT_EQ(std::get<LimitNode>(Nth(*plan, 0)).limit, 4);
+  const auto& project = std::get<ProjectNode>(Nth(*plan, 1));
+  ASSERT_EQ(project.columns.size(), 3U);
+  EXPECT_EQ(project.columns[2].index, 2);
+  const auto& sort = std::get<SortNode>(Nth(*plan, 2));
+  ASSERT_EQ(sort.keys.size(), 1U);
+  EXPECT_EQ(sort.keys[0].column.index, 5);  // MAX(d): hidden, after the HAVING ones
+  const auto& filter = std::get<FilterNode>(Nth(*plan, 3));
+  EXPECT_EQ(kSql.substr(filter.span.offset, filter.span.length),
+            "count(*) > 1 AND 5 >= SUM(i64) AND i32 IN (1, 2) AND c <> 3 AND MIN(s) LIKE 'a%' "
+            "AND s = 'x'");
+  const auto& p = filter.predicates;
+  ASSERT_EQ(p.size(), 6U);
+  const auto column = [](const Predicate& predicate) {
+    return predicate.column.value_or(BoundColumn{});
+  };
+  EXPECT_EQ(column(p[0]).index, 2);  // the select's COUNT(*)
+  EXPECT_EQ(column(p[0]).name, "count_star()");
+  EXPECT_EQ(p[0].op, CompareOp::kGt);
+  EXPECT_EQ(column(p[1]).index, 3);  // SUM(i64): hidden
+  EXPECT_EQ(column(p[1]).type, LogicalType::kHugeInt);
+  EXPECT_EQ(p[1].op, CompareOp::kLe);
+  EXPECT_EQ(p[1].constant.type, LogicalType::kHugeInt);
+  EXPECT_EQ(p[2].kind, Predicate::Kind::kIn);
+  EXPECT_EQ(column(p[2]).index, 1);  // i32: an alias of the key i16 (the column i32 is no key)
+  EXPECT_EQ(p[2].values[0].type, LogicalType::kSmallInt);
+  EXPECT_EQ(column(p[3]).index, 2);  // c: the alias of COUNT(*)
+  EXPECT_EQ(p[4].kind, Predicate::Kind::kLike);
+  EXPECT_EQ(column(p[4]).index, 4);  // MIN(s): hidden
+  EXPECT_EQ(column(p[5]).index, 0);  // s: the first key
+  const auto& group = std::get<GroupAggregateNode>(Nth(*plan, 4));
+  ASSERT_EQ(group.aggregates.size(), 4U);
+  EXPECT_EQ(group.aggregates[1].kind, AggKind::kSum);
+  EXPECT_EQ(group.aggregates[2].kind, AggKind::kMin);
+  EXPECT_EQ(group.aggregates[3].kind, AggKind::kMax);
+
+  // A table column that is a key comes before a select alias of the same name (DuckDB).
+  auto key = BindSql("SELECT COUNT(*) AS i16 FROM t GROUP BY i16 HAVING i16 > 1", catalog);
+  ASSERT_TRUE(key.ok()) << key.status().ToString();
+  const auto& key_filter = std::get<FilterNode>(Nth(*key, 1));
+  EXPECT_EQ(key_filter.predicates[0].column.value_or(BoundColumn{}).index, 0);
+  EXPECT_EQ(key_filter.predicates[0].constant.type, LogicalType::kSmallInt);
+}
+
+// HAVING without GROUP BY makes one row (an aggregate query, even of constants only) and may filter
+// it out; a Project drops the hidden aggregates.
+TEST(BinderTest, HavingInAGlobalAggregate) {
+  const Catalog catalog = MakeCatalog();
+  auto plan = BindSql("SELECT 1 AS one FROM t HAVING COUNT(*) > 0 AND MAX(d) < 1.5", catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  const auto& project = std::get<ProjectNode>(Nth(*plan, 0));
+  ASSERT_EQ(project.columns.size(), 1U);
+  ASSERT_EQ(project.constants.size(), 1U);
+  EXPECT_TRUE(project.constants[0].has_value());
+  const auto& filter = std::get<FilterNode>(Nth(*plan, 1));
+  ASSERT_EQ(filter.predicates.size(), 2U);
+  EXPECT_EQ(filter.predicates[1].column.value_or(BoundColumn{}).index, 1);
+  EXPECT_EQ(std::get<double>(filter.predicates[1].constant.value), 1.5);
+  EXPECT_EQ(std::get<AggregateNode>(Nth(*plan, 2)).aggregates.size(), 2U);
+
+  auto hidden = BindSql("SELECT COUNT(*) AS n FROM t HAVING SUM(i16) >= 0 AND n > 1", catalog);
+  ASSERT_TRUE(hidden.ok()) << hidden.status().ToString();
+  const auto& drop = std::get<ProjectNode>(Nth(*hidden, 0));
+  ASSERT_EQ(drop.columns.size(), 1U);
+  EXPECT_EQ(drop.columns[0].index, 0);
+  const auto& predicates = std::get<FilterNode>(Nth(*hidden, 1)).predicates;
+  EXPECT_EQ(predicates[0].column.value_or(BoundColumn{}).index, 1);
+  EXPECT_EQ(predicates[1].column.value_or(BoundColumn{}).index, 0);
+
+  // No Project when nothing is hidden; a literal outside BIGINT folds as in WHERE.
+  auto plain = BindSql("SELECT COUNT(*) FROM t HAVING COUNT(*) < -9223372036854775809", catalog);
+  ASSERT_TRUE(plain.ok()) << plain.status().ToString();
+  const auto& never = std::get<FilterNode>(Nth(*plain, 0));
+  EXPECT_EQ(never.predicates[0].kind, Predicate::Kind::kFalse);
+  EXPECT_TRUE(std::holds_alternative<AggregateNode>(Nth(*plain, 1)));
 }
 
 // Without GROUP BY an aggregate query has one row: ORDER BY is checked, but needs no Sort.

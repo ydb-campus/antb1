@@ -209,6 +209,11 @@ TEST(Checks, MinMaxRowCountsAndEquality) {
       RowCountsAreMinOf({1, 10})(std::vector{Single("3"), Single("7"), three_rows}).has_value());
   EXPECT_TRUE(RowCountsAreMinOf({2})(std::vector{Single("3"), three_rows}).has_value());
   EXPECT_FALSE(AllEqual()(std::vector{three_rows, three_rows}).has_value());
+  slt::ResultSet two_rows = three_rows;
+  two_rows.rows = {{"3"}, {"1"}};
+  EXPECT_FALSE(FirstIsUnionOfRest()(std::vector{three_rows, two_rows, Single("2")}).has_value());
+  EXPECT_TRUE(FirstIsUnionOfRest()(std::vector{three_rows, two_rows}).has_value());
+  EXPECT_TRUE(FirstIsUnionOfRest()(std::vector{three_rows, three_rows, Single("2")}).has_value());
   EXPECT_TRUE(AllEqual()(std::vector{three_rows, Single("3")}).has_value());
 }
 

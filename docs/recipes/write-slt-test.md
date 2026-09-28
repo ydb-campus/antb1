@@ -37,9 +37,9 @@ SELECT SUM(a) FROM t_nulls WHERE b >= 2
 ----
 (written by DuckDB)
 
-# HAVING is outside the subset: rejected, never answered
-statement error unsupported
-SELECT a, COUNT(*) FROM t GROUP BY a HAVING COUNT(*) > 1
+# A grouped query selects only its keys and aggregates: a bind error in both engines
+statement error must appear in the GROUP BY clause
+SELECT a, b, COUNT(*) FROM t GROUP BY a
 ```
 
 - `query <types> <sort mode>`: one type letter per result column (`I` integer, `R` floating point, `T` text and
@@ -72,7 +72,7 @@ SELECT a, COUNT(*) FROM t GROUP BY a HAVING COUNT(*) > 1
 - Every comparison operator, both operand orders (`5 < c` and `c > 5`), `AND` chains, `LIMIT 0`.
 - Identifier rules: other letter case, quoted identifiers, an unknown column (error record).
 - The rejected neighbors of the feature: SQL that looks similar but is outside the subset must fail with the
-  unsupported error.
+  unsupported error (a unit test: an Unsupported answer fails every `.slt` record, `statement error` too).
 
 ## Never
 

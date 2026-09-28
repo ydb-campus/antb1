@@ -1,0 +1,233 @@
+# HAVING (docs/sql-subset.md): a conjunction of <aggregate or column> <op> literal, with the operators of
+# WHERE (comparisons, [NOT] LIKE, [NOT] IN), filtering the groups after aggregation. An aggregate may be
+# one of the select list or another one; a column is a GROUP BY key (a table column that is a key comes
+# first), else the alias of a key or an aggregate in the select list.
+
+query II rowsort
+SELECT i16, COUNT(*) FROM edge GROUP BY i16 HAVING COUNT(*) > 1
+----
+NULL	2
+
+query II rowsort
+SELECT AdvEngineID, COUNT(*) AS c FROM hits_like GROUP BY AdvEngineID HAVING c >= 500
+----
+0	8968
+
+query I rowsort
+SELECT AdvEngineID FROM hits_like GROUP BY AdvEngineID HAVING 500 <= COUNT(*) AND SUM(ResolutionWidth) > 0
+----
+0
+
+query II rowsort
+SELECT CounterID, COUNT(*) FROM hits_like GROUP BY CounterID HAVING COUNT(*) >= 3
+----
+10062	247
+1062	253
+11062	265
+12062	260
+13062	248
+14062	273
+15062	227
+16062	241
+17062	275
+18062	227
+19062	232
+20062	221
+2062	264
+21062	232
+22062	254
+23062	288
+24062	224
+25062	240
+26062	258
+27062	232
+28062	260
+29062	239
+30062	251
+3062	216
+31062	234
+32062	257
+33062	253
+34062	263
+35062	255
+36062	259
+37062	252
+38062	241
+39062	236
+4062	261
+5062	254
+6062	253
+62	242
+7062	281
+8062	252
+9062	280
+
+query IT rowsort
+SELECT id, u FROM edge GROUP BY id, u HAVING u LIKE '%a%' AND id IN (0, 1, 2, 3, 4, 5)
+----
+1	a
+2	tab\there
+3	line\nbreak
+4	back\\slash
+
+query I rowsort
+SELECT i16 FROM edge GROUP BY i16 HAVING i16 NOT IN (1, 7) AND MIN(u) NOT LIKE 'x%'
+----
+-1
+-12345
+-32768
+0
+100
+12345
+32767
+
+query IR rowsort
+SELECT i16, AVG(d) FROM edge GROUP BY i16 HAVING AVG(d) > 0.5
+----
+-1	0.6666666666666666
+-12345	922337203685477632
+100	123456789.125
+
+query II rowsort
+SELECT i32, SUM(i64) FROM edge GROUP BY i32 HAVING SUM(i64) > 9223372036854775807
+----
+
+query I rowsort
+SELECT id FROM edge GROUP BY id HAVING SUM(i64) <= -9223372036854775808
+----
+0
+
+query I rowsort
+SELECT id FROM edge GROUP BY id HAVING MAX(d) >= 1e308
+----
+
+query TI rowsort
+SELECT MIN(u) AS m, COUNT(DISTINCT i16) FROM edge GROUP BY i32 HAVING COUNT(DISTINCT i16) = 1 AND m <> ''
+----
+\x28empty)	1
+a	1
+back\\slash	1
+line\nbreak	1
+tab\there	1
+trailing space\x20	1
+x\x7fy	1
+日本語	1
+
+# NULL aggregates and keys fail every comparison, NOT IN and NOT LIKE too.
+query II rowsort
+SELECT i16, SUM(i32) FROM edge GROUP BY i16 HAVING SUM(i32) <> 0
+----
+-1	-1
+-100	-100000
+-12345	54321
+-32768	-2147483648
+1	1
+100	100000
+32767	2147483647
+7	-7
+NULL	7
+
+query I rowsort
+SELECT i16 FROM edge GROUP BY i16 HAVING i16 NOT IN (0)
+----
+-1
+-100
+-12345
+-32768
+1
+100
+12345
+32767
+7
+
+# A table column that is a key comes before a select alias of the same name; otherwise the alias names a
+# key or an aggregate.
+query I rowsort
+SELECT COUNT(*) AS i16 FROM edge GROUP BY i16 HAVING i16 > 1
+----
+1
+1
+1
+1
+
+query II rowsort
+SELECT i16 AS id, COUNT(*) AS n FROM edge GROUP BY i16 HAVING id < 100 AND n = 1
+----
+-1	1
+-100	1
+-12345	1
+-32768	1
+0	1
+1	1
+7	1
+
+# Without GROUP BY, HAVING makes the query one aggregate row, which it may filter out.
+query I nosort
+SELECT COUNT(*) FROM edge HAVING COUNT(*) > 100
+----
+
+query I nosort
+SELECT COUNT(*) FROM edge HAVING 100 > COUNT(*)
+----
+12
+
+query IT nosort
+SELECT 7 AS k, 'x' FROM hits_like HAVING SUM(AdvEngineID) >= 0 AND MAX(EventDate) > DATE '2000-01-01'
+----
+7	x
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE id > 100 HAVING MIN(id) = 5
+----
+
+query I nosort
+SELECT COUNT(*) FROM empty HAVING COUNT(*) = 0
+----
+0
+
+# With ORDER BY, LIMIT and OFFSET: the filter comes before the sort.
+query II nosort
+SELECT CounterID, COUNT(*) AS c FROM hits_like WHERE AdvEngineID = 0 GROUP BY CounterID HAVING c > 10 ORDER BY c DESC, CounterID LIMIT 5 OFFSET 1
+----
+9062	252
+7062	250
+17062	247
+2062	244
+34062	243
+
+query I nosort
+SELECT UserID FROM hits_like GROUP BY UserID HAVING COUNT(*) >= 2 ORDER BY SUM(ResolutionWidth) DESC, UserID LIMIT 3
+----
+9223372036854775807
+
+# FLOAT (floats): DuckDB's MIN and MAX of a FLOAT column are FLOAT, compared in FLOAT like the column in
+# WHERE; SUM and AVG are DOUBLE.
+query I rowsort
+SELECT id FROM floats GROUP BY id HAVING MAX(f) = 0.1
+----
+0
+
+query I rowsort
+SELECT id FROM floats GROUP BY id HAVING SUM(f) = 0.1
+----
+
+query I rowsort
+SELECT id FROM floats GROUP BY id HAVING AVG(f) > 0.1 AND MIN(f) IN (0.1, 0.5, 2)
+----
+0
+
+query R rowsort
+SELECT f FROM floats GROUP BY f HAVING f >= 0.1
+----
+0.10000000149011612
+0.20000000298023224
+0.30000001192092896
+1.2676506002282294e+30
+1.2676507513439569e+30
+1234.5
+16777216
+16777218
+19.989999771118164
+3.299999952316284
+3.4028234663852886e+38
+inf

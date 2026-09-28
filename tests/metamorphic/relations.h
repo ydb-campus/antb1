@@ -49,6 +49,9 @@ void PrintTo(const Relation& r, std::ostream* os);
 Check AllEqual();
 // Every answer has the same rows in the same order (R columns within the slt tolerance).
 Check AllEqualInOrder();
+// Answer 0 has exactly the rows of all the other answers together (rowsorted, R columns within the
+// slt tolerance).
+Check FirstIsUnionOfRest();
 // Answer 1 equals the rows [offset, offset + limit) of answer 0, in order.
 Check SecondIsWindowOfFirst(int64_t offset, int64_t limit);
 // Single-value answers: a0 == a1 + ... + an (integers, exact; NULL counts as no value).

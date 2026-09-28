@@ -426,6 +426,45 @@ TEST(ParserTest, In) {
   EXPECT_EQ(stmt->where[2].op, CompareOp::kEq);
 }
 
+// HAVING: a conjunction of an aggregate or a column <op> literal (comparisons, LIKE, IN), literal
+// first normalized as in WHERE; with or without GROUP BY, before ORDER BY.
+TEST(ParserTest, Having) {
+  constexpr std::string_view kSql =
+      "SELECT a, COUNT(*) AS c FROM t GROUP BY a HAVING count(*) > 1 AND 5 >= SUM(b) AND a "
+      "NOT LIKE 'x%' AND c IN (1, 2) AND MIN(s) like 'y' ORDER BY a LIMIT 3";
+  auto stmt = Parse(kSql);
+  ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
+  ASSERT_EQ(stmt->having.size(), 5U);
+  const HavingComparison& count = stmt->having[0];
+  EXPECT_EQ(std::get<AggregateCall>(count.operand).kind, AggKind::kCountStar);
+  EXPECT_EQ(count.op, CompareOp::kGt);
+  EXPECT_EQ(count.literal.text, "1");
+  EXPECT_EQ(At(kSql, count.span), "count(*) > 1");
+  const HavingComparison& sum = stmt->having[1];
+  EXPECT_EQ(std::get<AggregateCall>(sum.operand).kind, AggKind::kSum);
+  EXPECT_EQ(sum.op, CompareOp::kLe) << "5 >= SUM(b) is SUM(b) <= 5";
+  EXPECT_EQ(At(kSql, sum.span), "5 >= SUM(b)");
+  EXPECT_EQ(std::get<ColumnRef>(stmt->having[2].operand).name, "a");
+  EXPECT_EQ(stmt->having[2].op, CompareOp::kNotLike);
+  EXPECT_EQ(At(kSql, stmt->having[2].span), "a NOT LIKE 'x%'");
+  EXPECT_EQ(stmt->having[3].op, CompareOp::kIn);
+  EXPECT_EQ(stmt->having[3].list.size(), 2U);
+  EXPECT_EQ(At(kSql, stmt->having[3].span), "c IN (1, 2)");
+  EXPECT_EQ(std::get<AggregateCall>(stmt->having[4].operand).kind, AggKind::kMin);
+  EXPECT_EQ(stmt->having[4].op, CompareOp::kLike);
+  EXPECT_EQ(At(kSql, stmt->having_span),
+            "HAVING count(*) > 1 AND 5 >= SUM(b) AND a NOT LIKE 'x%' AND c IN (1, 2) AND MIN(s) "
+            "like 'y'");
+  EXPECT_EQ(stmt->order_by.size(), 1U);
+  EXPECT_EQ(stmt->limit, 3);
+  auto global = Parse("SELECT COUNT(*) FROM t WHERE b = 1 HAVING COUNT(DISTINCT b) <> 0");
+  ASSERT_TRUE(global.has_value()) << global.error().message;
+  EXPECT_TRUE(global->group_by.empty());
+  ASSERT_EQ(global->having.size(), 1U);
+  EXPECT_TRUE(std::get<AggregateCall>(global->having[0].operand).distinct);
+  EXPECT_EQ(global->having[0].op, CompareOp::kNe);
+}
+
 // Literals are select items (constants), and in GROUP BY and ORDER BY positions or constants; the
 // binder tells them apart.
 TEST(ParserTest, ConstantsAndPositions) {
@@ -643,8 +682,30 @@ INSTANTIATE_TEST_SUITE_P(
                    "function year() is not supported"},
         RejectCase{"GroupByTrailingComma", "SELECT a FROM events GROUP BY a^, ORDER BY a",
                    kUnsupported, 1, "a trailing comma in GROUP BY is not supported"},
-        RejectCase{"HavingAfterGroupBy", "SELECT a FROM events GROUP BY a ^HAVING COUNT(*) > 1",
-                   kUnsupported, 6, "HAVING is not supported"},
+        RejectCase{"HavingOr", "SELECT a FROM events GROUP BY a HAVING COUNT(*) > 1 ^OR a = 2",
+                   kUnsupported, 2, "OR is not supported"},
+        RejectCase{"HavingTwoAggregates",
+                   "SELECT a FROM events GROUP BY a HAVING COUNT(*) > ^SUM(b)", kUnsupported, 6,
+                   "HAVING comparisons of two columns or aggregates"},
+        RejectCase{"HavingTwoLiterals", "SELECT a FROM events GROUP BY a HAVING 1 < ^2",
+                   kUnsupported, 1, "comparisons between two literals are not supported"},
+        RejectCase{"HavingBareAggregate", "SELECT a FROM events GROUP BY a HAVING ^COUNT(*)",
+                   kUnsupported, 8, "HAVING conditions other than comparisons"},
+        RejectCase{"HavingExpression", "SELECT a FROM events GROUP BY a HAVING COUNT(*) ^+ 1 > 2",
+                   kUnsupported, 1, "arithmetic operator '+' is not supported"},
+        RejectCase{"HavingAggregatePattern",
+                   "SELECT a FROM events GROUP BY a HAVING MIN(s) LIKE ^MAX(s)", kUnsupported, 3,
+                   "an aggregate is only supported left of LIKE or IN"},
+        RejectCase{"HavingAggregateInList",
+                   "SELECT a FROM events GROUP BY a HAVING a IN (1, ^COUNT(*))", kUnsupported, 5,
+                   "an aggregate is only supported left of LIKE or IN"},
+        RejectCase{"HavingLiteralLike", "SELECT a FROM events GROUP BY a HAVING ^'x' LIKE 'y'",
+                   kUnsupported, 3, "LIKE needs a column or an aggregate on the left"},
+        RejectCase{"HavingLiteralIn", "SELECT a FROM events GROUP BY a HAVING ^1 IN (1)",
+                   kUnsupported, 1, "IN needs a column or an aggregate on the left"},
+        RejectCase{"HavingAggregateFilter",
+                   "SELECT a FROM events GROUP BY a HAVING COUNT(b) ^FILTER (WHERE b = 1) > 1",
+                   kUnsupported, 6, "aggregate FILTER clauses are not supported"},
         RejectCase{"OrderByAll", "SELECT a FROM events ORDER BY ^ALL", kUnsupported, 3,
                    "ORDER BY ALL is not supported"},
         RejectCase{"OrderByExpression", "SELECT a FROM events ORDER BY a ^* 2 DESC", kUnsupported,
@@ -672,8 +733,6 @@ INSTANTIATE_TEST_SUITE_P(
                    "SELECT ALL is not supported"},
         RejectCase{"AllAggregate", "SELECT COUNT(^ALL a) FROM events", kUnsupported, 3,
                    "ALL in aggregate calls is not supported"},
-        RejectCase{"Having", "SELECT COUNT(*) FROM events ^HAVING COUNT(*) > 1", kUnsupported, 6,
-                   "HAVING is not supported"},
         RejectCase{"OffsetAll", "SELECT a FROM events OFFSET ^ALL", kUnsupported, 3,
                    "OFFSET ALL is not supported"},
         RejectCase{"OffsetExpression", "SELECT a FROM events OFFSET ^(1)", kUnsupported, 1,
@@ -1068,8 +1127,8 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"DanglingAnd", "SELECT a FROM events WHERE a = 1 AND^", kSyntax, 0,
                    "expected a column or a literal, found end of input"},
         RejectCase{"ChainedComparison", "SELECT a FROM events WHERE a = 1 ^= 2", kSyntax, 1,
-                   "unexpected '='; expected AND, GROUP BY, ORDER BY, LIMIT, OFFSET or the end of "
-                   "the query"},
+                   "unexpected '='; expected AND, GROUP BY, HAVING, ORDER BY, LIMIT, OFFSET or the "
+                   "end of the query"},
         RejectCase{"MissingLimit", "SELECT a FROM events LIMIT^", kSyntax, 0,
                    "expected a non-negative integer after LIMIT, found end of input"},
         RejectCase{"NegativeLimit", "SELECT a FROM events LIMIT ^-1", kSyntax, 1,
@@ -1081,14 +1140,13 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"WhereAfterLimit", "SELECT a FROM events LIMIT 5 ^WHERE a = 1", kSyntax, 5,
                    "unexpected keyword WHERE; expected OFFSET or the end of the query"},
         RejectCase{"DuplicateWhere", "SELECT a FROM events WHERE a = 1 ^WHERE b = 2", kSyntax, 5,
-                   "unexpected keyword WHERE; expected AND, GROUP BY, ORDER BY, LIMIT, OFFSET or "
-                   "the end of the "
-                   "query"},
+                   "unexpected keyword WHERE; expected AND, GROUP BY, HAVING, ORDER BY, LIMIT, "
+                   "OFFSET or the end of the query"},
         RejectCase{"DuplicateLimit", "SELECT a FROM events LIMIT 1 ^LIMIT 2", kSyntax, 5,
                    "unexpected keyword LIMIT; expected OFFSET or the end of the query"},
         RejectCase{"StrayParen", "SELECT a FROM events^)", kSyntax, 1,
-                   "unexpected ')'; expected WHERE, GROUP BY, ORDER BY, LIMIT, OFFSET or the end "
-                   "of the query"},
+                   "unexpected ')'; expected WHERE, GROUP BY, HAVING, ORDER BY, LIMIT, OFFSET or "
+                   "the end of the query"},
         RejectCase{"GroupWithoutBy", "SELECT a FROM events GROUP ^a", kSyntax, 1,
                    "expected BY after GROUP, found identifier a"},
         RejectCase{"OrderWithoutBy", "SELECT a FROM events ORDER ^a", kSyntax, 1,
@@ -1108,8 +1166,16 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"GroupByAfterOrderBy", "SELECT a FROM events ORDER BY a ^GROUP BY a", kSyntax, 5,
                    "unexpected keyword GROUP; expected LIMIT, OFFSET or the end of the query"},
         RejectCase{"WhereAfterGroupBy", "SELECT a FROM events GROUP BY a ^WHERE a = 1", kSyntax, 5,
-                   "unexpected keyword WHERE; expected ORDER BY, LIMIT, OFFSET or the end of the "
-                   "query"},
+                   "unexpected keyword WHERE; expected HAVING, ORDER BY, LIMIT, OFFSET or the end "
+                   "of the query"},
+        RejectCase{"GroupByAfterHaving", "SELECT a FROM events HAVING COUNT(*) > 1 ^GROUP BY a",
+                   kSyntax, 5,
+                   "unexpected keyword GROUP; expected AND, ORDER BY, LIMIT, OFFSET or the end of "
+                   "the query"},
+        RejectCase{"HavingAfterOrderBy", "SELECT a FROM events ORDER BY a ^HAVING COUNT(*) > 1",
+                   kSyntax, 6, "unexpected keyword HAVING; expected LIMIT, OFFSET or the end"},
+        RejectCase{"EmptyHaving", "SELECT a FROM events GROUP BY a HAVING^", kSyntax, 0,
+                   "expected an aggregate, a column or a literal, found end of input"},
         RejectCase{"DuplicateOffset", "SELECT a FROM events OFFSET 1 ^OFFSET 2", kSyntax, 6,
                    "unexpected keyword OFFSET; expected LIMIT or the end of the query"},
         RejectCase{"ThirdLimit", "SELECT a FROM events LIMIT 1 OFFSET 2 ^LIMIT 3", kSyntax, 5,
@@ -1149,9 +1215,9 @@ INSTANTIATE_TEST_SUITE_P(
     CaseName);
 
 TEST(ParserTest, ExactMessages) {
-  auto having = Parse("SELECT COUNT(*) FROM events HAVING COUNT(*) > 1");
-  ASSERT_FALSE(having.has_value());
-  EXPECT_EQ(having.error().message, "HAVING is not supported; see docs/sql-subset.md");
+  auto join = Parse("SELECT COUNT(*) FROM events JOIN users USING (id)");
+  ASSERT_FALSE(join.has_value());
+  EXPECT_EQ(join.error().message, "JOIN is not supported; see docs/sql-subset.md");
   auto limit = Parse("SELECT a FROM events LIMIT 9223372036854775808");
   ASSERT_FALSE(limit.has_value());
   EXPECT_EQ(limit.error().message,

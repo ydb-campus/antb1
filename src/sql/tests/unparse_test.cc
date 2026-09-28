@@ -81,6 +81,10 @@ TEST(UnparseTest, CanonicalForms) {
                              "LIMIT 5"},
            Case{.input = "SELECT a FROM t ORDER BY a nulls first OFFSET 2 LIMIT 3",
                 .canonical = "SELECT a FROM t ORDER BY a NULLS FIRST LIMIT 3 OFFSET 2"},
+           Case{.input = "select a from t group by a having 1 < count(*) and a not in (2, 3) and "
+                         "min(s) like 'x%' order by a",
+                .canonical = "SELECT a FROM t GROUP BY a HAVING COUNT(*) > 1 AND a NOT IN (2, 3) "
+                             "AND MIN(s) LIKE 'x%' ORDER BY a"},
            Case{.input = "select count( distinct a ) from t order by count(distinct a) desc nulls "
                          "last",
                 .canonical = "SELECT COUNT(DISTINCT a) FROM t ORDER BY COUNT(DISTINCT a) DESC "
@@ -109,6 +113,7 @@ TEST(UnparseTest, RoundTripsCorpus) {
            "a LIMIT 10 OFFSET 20"sv,
            R"(SELECT "g", COUNT(DISTINCT "u") FROM t GROUP BY "g" ORDER BY "g" NULLS FIRST)"sv,
            "SELECT a FROM t OFFSET 5"sv,
+           "SELECT COUNT(*) FROM t HAVING SUM(x) >= -1.5 AND COUNT(DISTINCT y) <> 0"sv,
        }) {
     ExpectRoundTrip(sql);
   }
@@ -242,6 +247,23 @@ TEST(EqualIgnoringSpansTest, DetectsEveryDifferenceInNewClauses) {
            "COUNT(*) LIMIT 3"sv,  // no offset
        }) {
     auto x = Parse(base);
+    auto y = Parse(other);
+    ASSERT_TRUE(x.has_value()) << x.error().message;
+    ASSERT_TRUE(y.has_value()) << other;
+    EXPECT_FALSE(EqualIgnoringSpans(*x, *y)) << other;
+  }
+  const std::string_view having_base =
+      "SELECT a FROM t GROUP BY a HAVING COUNT(*) > 1 AND a IN (1, 2)";
+  for (const std::string_view other : {
+           "SELECT a FROM t GROUP BY a HAVING COUNT(*) > 1"sv,                     // count
+           "SELECT a FROM t GROUP BY a HAVING COUNT(a) > 1 AND a IN (1, 2)"sv,     // aggregate
+           "SELECT a FROM t GROUP BY a HAVING b > 1 AND a IN (1, 2)"sv,            // operand kind
+           "SELECT a FROM t GROUP BY a HAVING COUNT(*) >= 1 AND a IN (1, 2)"sv,    // operator
+           "SELECT a FROM t GROUP BY a HAVING COUNT(*) > 2 AND a IN (1, 2)"sv,     // literal
+           "SELECT a FROM t GROUP BY a HAVING COUNT(*) > 1 AND a IN (1, 3)"sv,     // list value
+           "SELECT a FROM t GROUP BY a HAVING COUNT(*) > 1 AND a IN (1, 2, 3)"sv,  // list length
+       }) {
+    auto x = Parse(having_base);
     auto y = Parse(other);
     ASSERT_TRUE(x.has_value()) << x.error().message;
     ASSERT_TRUE(y.has_value()) << other;

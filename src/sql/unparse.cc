@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <string>
 #include <variant>
+#include <vector>
 
 #include "antb1/sql/ast.h"
 
@@ -50,6 +51,18 @@ std::string Expr(const SelectExpr& expr) {
   return Column(std::get<ColumnRef>(expr));
 }
 
+// "<op> <literal>" or "<op> (<literal>, ...)".
+std::string Condition(CompareOp op, const Literal& literal, const std::vector<Literal>& list) {
+  std::string sql = std::string(ToString(op)) + " ";
+  if (op != CompareOp::kIn && op != CompareOp::kNotIn) {
+    return sql + LiteralSql(literal);
+  }
+  for (std::size_t k = 0; k < list.size(); ++k) {
+    sql += (k == 0 ? "(" : ", ") + LiteralSql(list[k]);
+  }
+  return sql + ")";
+}
+
 }  // namespace
 
 std::string ToSql(const SelectStatement& stmt) {
@@ -76,20 +89,19 @@ std::string ToSql(const SelectStatement& stmt) {
   for (std::size_t i = 0; i < stmt.where.size(); ++i) {
     const Comparison& c = stmt.where[i];
     sql += i == 0 ? " WHERE " : " AND ";
-    sql += Column(c.column) + " " + std::string(ToString(c.op)) + " ";
-    if (c.op == CompareOp::kIn || c.op == CompareOp::kNotIn) {
-      for (std::size_t k = 0; k < c.list.size(); ++k) {
-        sql += (k == 0 ? "(" : ", ") + LiteralSql(c.list[k]);
-      }
-      sql += ')';
-    } else {
-      sql += LiteralSql(c.literal);
-    }
+    sql += Column(c.column) + " " + Condition(c.op, c.literal, c.list);
   }
   for (std::size_t i = 0; i < stmt.group_by.size(); ++i) {
     sql += i == 0 ? " GROUP BY " : ", ";
     const auto* lit = std::get_if<Literal>(&stmt.group_by[i]);
     sql += lit != nullptr ? LiteralSql(*lit) : Column(std::get<ColumnRef>(stmt.group_by[i]));
+  }
+  for (std::size_t i = 0; i < stmt.having.size(); ++i) {
+    const HavingComparison& c = stmt.having[i];
+    sql += i == 0 ? " HAVING " : " AND ";
+    const auto* agg = std::get_if<AggregateCall>(&c.operand);
+    sql += (agg != nullptr ? Expr(*agg) : Column(std::get<ColumnRef>(c.operand))) + " " +
+           Condition(c.op, c.literal, c.list);
   }
   for (std::size_t i = 0; i < stmt.order_by.size(); ++i) {
     const OrderItem& item = stmt.order_by[i];
