@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790675290508,
+  "lastUpdate": 1790682645687,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -1908,6 +1908,78 @@ window.BENCHMARK_DATA = {
             "value": 14.429914062499863,
             "unit": "ms/iter",
             "extra": "iterations: 48\ncpu: 14.42814931249999 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "5505f014091f6bac799b6e94e11c815bd460e9a7",
+          "message": "perf(exec): parallel GROUP BY (#45)\n\n## Summary\n\nThis is step 4 of ADR 0013: parallel GROUP BY.\n\n- **Before this PR:** since #43, a GROUP BY over a part pipeline read\nthe part union. Its scan and expressions ran in parallel, but the\ngrouping itself was serial.\n- **Per-part grouping:** each part (row group) is grouped into its own\n`exec::GroupTable` on the pool.\n- **Ordered merge:** the consumer merges the tables in part order,\nthrough `PartScheduler`, with the same window, memory adaptation, OOM\nrerun and error order as before. For each part:\n- its unique normalized keys (`Grouper::GetUniques`), fed through the\nmerged table's grouper, give the group map;\n- a new group keeps the part's first-seen key values (the DOUBLE\n`-0.0`/`0.0` and NaN spelling from the earliest part);\n  - the grouped states merge with `GroupedAggregateState::Merge`.\n- **Bounded chunks:** a merge adds new groups in chunks of at most 64Ki.\nIt takes keys per source chunk and never concatenates a part's keys, so\nno key array (and no `Finalize` range) grows with a part.\n- **`exec::GroupTable`** (private) is the grouping state taken out of\n`GroupAggregateOperator`. That operator keeps its behavior for input\nthat is not a part pipeline.\n\n**Semantics** (docs/sql-subset.md):\n- Results are byte-identical for any thread count.\n- Group order follows the row groups and their batches. It is still\ndeterministic, but not the single-pass order: Arrow's grouper numbers a\nbatch's new groups in its own order. SQL leaves group order open.\n- A grouped DOUBLE `SUM`/`AVG` adds per row group, then in order, as a\nglobal one already did.\n\n## Performance: full ClickBench data, 128 threads, paired A/B\n\nThe host was heavily loaded by other users during the run (load average\nabout 200 on 128 cores). So this is a paired A/B: for each query, the\n#44 binary and this PR's binary each ran 3 tries (best taken),\nalternating which went first. Absolute times are inflated; the ratios\nare what matter.\n\n- **Medium-cardinality GROUP BY:** about 2× faster (Q8-11, Q27, Q35,\nQ42; Q28 1.7×).\n- **Very-high-cardinality GROUP BY** (Q14, Q16, Q18, Q32): neutral to\nslightly slower. With nearly every row its own group, the serial merge\non the consumer re-inserts about every row and dominates. An unloaded\nsingle run earlier showed Q32 +8%.\n- The fix is a radix-partitioned merge, merging partitions in parallel.\nIt is the next step named in ADR 0013.\n- **Differences elsewhere** are on queries this PR does not change, so\nthey are load noise.\n\n<details><summary>Per-query seconds (queries over 0.3 s)</summary>\n\n| Query | main (#44) | this PR | speedup |\n| --- | ---: | ---: | ---: |\n| Q4 | 4.74 | 4.57 | 1.04× |\n| Q5 | 3.38 | 3.43 | 0.98× |\n| Q8 | 11.50 | 6.36 | 1.81× |\n| Q9 | 13.94 | 7.06 | 1.98× |\n| Q10 | 1.79 | 0.72 | 2.49× |\n| Q11 | 1.53 | 0.85 | 1.81× |\n| Q12 | 5.69 | 5.42 | 1.05× |\n| Q13 | 8.77 | 8.45 | 1.04× |\n| Q14 | 5.95 | 7.82 | 0.76× |\n| Q15 | 9.36 | 7.44 | 1.26× |\n| Q16 | 12.95 | 15.27 | 0.85× |\n| Q17 | 25.56 | 18.69 | 1.37× |\n| Q18 | 32.46 | 32.95 | 0.99× |\n| Q20 | 1.12 | 1.12 | 1.00× |\n| Q21 | 1.23 | 1.25 | 0.98× |\n| Q22 | 2.79 | 3.34 | 0.84× |\n| Q23 | 4.74 | 4.81 | 0.99× |\n| Q24 | 0.80 | 0.86 | 0.93× |\n| Q25 | 0.89 | 0.85 | 1.04× |\n| Q26 | 0.87 | 0.84 | 1.03× |\n| Q27 | 1.93 | 0.87 | 2.23× |\n| Q28 | 13.18 | 7.91 | 1.67× |\n| Q30 | 2.88 | 2.30 | 1.25× |\n| Q31 | 4.57 | 4.36 | 1.05× |\n| Q32 | 25.88 | 30.08 | 0.86× |\n| Q33 | 16.53 | 13.93 | 1.19× |\n| Q34 | 16.38 | 13.74 | 1.19× |\n| Q35 | 5.89 | 3.03 | 1.94× |\n| Q36 | 0.78 | 0.85 | 0.92× |\n| Q37 | 0.82 | 0.62 | 1.31× |\n| Q38 | 1.13 | 1.27 | 0.88× |\n| Q39 | 2.63 | 3.22 | 0.82× |\n| Q40 | 0.57 | 0.49 | 1.16× |\n| Q41 | 0.58 | 0.52 | 1.11× |\n| Q42 | 0.76 | 0.34 | 2.25× |\n| **Total (43 queries)** | **245.1** | **216.3** | **1.13×** |\n\n</details>\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [x] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full          # lint, ci, asan, tidy, coverage, fuzz-smoke, ci-gcc\ncheck-full exit 0; Coverage gate: PASS\n$ pixi run tsan\n100% tests passed out of 1323\n$ pixi run test-data\n100% tests passed out of 6\n$ ANTB1_DIFF_COUNT=20000 pixi run diff-random\nDIFF: FAIL seed=4165926010 queries=20000 failed=1 unsupported=0\n```\n\n**The one diff-random failure predates this PR** and is a harness false\npositive, not a wrong answer:\n- **The case:** case 19768 is an ORDER BY on a column where about 8,000\nrows tie, with `OFFSET 5` and no LIMIT. There is no GROUP BY, so this PR\ndoes not touch it.\n- **Same answer:** antb1 and DuckDB return the same row count, the same\nkey runs, and the same five skipped rows.\n- **The flag:** the harness's tie-group check still rejects antb1's\norder.\n- **Also on main:** the same case fails on `main` (#44) built from this\ntree with the change stashed.\n\nIt is recorded as a follow-up to fix in the harness's tie-group\ncomparison.\n\n**New tests** (`src/exec/tests/parallel_test.cc`):\n- Grouping per part and merging equals one pass, as a set of rows:\n- over COUNT(*), COUNT, SUM, VARCHAR MIN, DOUBLE MAX and\nCOUNT(DISTINCT);\n- with DOUBLE keys (NaN and signed zeros), BIGINT+VARCHAR keys, no keys,\nNULL keys and empty parts.\n- The same bytes on 4 threads as on 1, and the key spelling from the\nearliest part (a later part sees the other spelling first).\n- Errors come in part order.\n- Grouped DOUBLE SUM/AVG are byte-identical across thread counts, and\nequal one running sum up to 1e-9 relative.\n- Merging 150k groups from 3 source chunks gives chunks of\n65536/65536/18928 with the part's rows. This fails with a concatenating\nmerge.\n- The existing `parallel` label, the memory-limit tests (the GROUP BY\nplan now goes through `PartGroupAggregate`), slt/oracle and metamorphic\nall pass.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer (none changed)\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code wrote the change\nand tests, ran the verification and the paired A/B. The `reviewer` agent\nfound two problems, both fixed:\n- a merge concatenated a part's keys into one array (the 2 GiB\nbinary-array risk);\n  - grouped DOUBLE SUM/AVG had no end-to-end test.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-09-29T14:47:45+03:00",
+          "tree_id": "9cdc9f2a3d4de35ab3f774dc2f7e1a4cceecb9b3",
+          "url": "https://github.com/ydb-campus/antb1/commit/5505f014091f6bac799b6e94e11c815bd460e9a7"
+        },
+        "date": 1790682644594,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4087.597984511479,
+            "unit": "ns/iter",
+            "extra": "iterations: 171869\ncpu: 4087.4407833873474 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84520.65737103694,
+            "unit": "ns/iter",
+            "extra": "iterations: 7638\ncpu: 84490.94880858864 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222064.433692893,
+            "unit": "ns/iter",
+            "extra": "iterations: 3152\ncpu: 221986.66338832484 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 449901.6789107001,
+            "unit": "ns/iter",
+            "extra": "iterations: 1579\ncpu: 449670.9898670045 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 402830.9688940162,
+            "unit": "ns/iter",
+            "extra": "iterations: 1736\ncpu: 402804.6278801842 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2110101.1807229086,
+            "unit": "ns/iter",
+            "extra": "iterations: 332\ncpu: 2109705.4156626505 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 183.65494933333557,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 183.6325966666668 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.40169440816332,
+            "unit": "ms/iter",
+            "extra": "iterations: 49\ncpu: 14.398958734693867 ms\nthreads: 1"
           }
         ]
       }
