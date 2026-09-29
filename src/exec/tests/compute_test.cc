@@ -16,6 +16,7 @@
 #include "antb1/common/int128.h"
 #include "antb1/common/narrow.h"
 #include "antb1/exec/filter.h"
+#include "antb1/exec/memory_budget.h"
 #include "antb1/plan/literal.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
@@ -252,6 +253,25 @@ plan::ExprPtr Call(plan::Function function, std::vector<plan::ExprPtr> args, Log
       plan::Expr{.node = plan::FunctionExpr{.function = function, .args = std::move(args)},
                  .type = type,
                  .name = "f"});
+}
+
+// regexp_replace keeps running out of memory a memory error (not the execution error of an
+// invalid pattern), so that the query fails with the `memory` kind.
+TEST_F(ComputeTest, RegexpReplaceOutOfMemoryIsAMemoryError) {
+  std::vector<std::optional<std::string>> long_values(64, std::string(std::size_t{64} * 1024, 'a'));
+  const auto text = testing::Strings(long_values);
+  const auto call = [](std::string pattern) {
+    return Call(plan::Function::kRegexpReplace,
+                {ColumnAt(0, LogicalType::kVarchar), StringConstant(std::move(pattern)),
+                 StringConstant("b")},
+                LogicalType::kVarchar);
+  };
+  MemoryBudget budget(int64_t{256} * 1024);  // far below the 4 MiB result
+  const auto oom = EvaluateExpr(*call("a"), *BatchOf({text}), &budget);
+  EXPECT_TRUE(oom.status().IsOutOfMemory()) << oom.status().ToString();
+  const auto invalid = EvaluateExpr(*call("("), *BatchOf({text}), &budget);
+  EXPECT_TRUE(invalid.status().IsExecutionError()) << invalid.status().ToString();
+  EXPECT_EQ(budget.bytes_allocated(), 0);
 }
 
 // strlen counts bytes; regexp_replace replaces the first match with RE2 in UTF-8 mode (`.` is one

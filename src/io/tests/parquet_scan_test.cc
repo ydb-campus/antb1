@@ -267,7 +267,8 @@ TEST_F(ParquetScanTest, BatchesHoldAtMostBatchSizeRows) {
 
 // A scan holds the data of about one row group at a time, whatever the size of the file. Parquet
 // pre-buffering would read coalesced ranges of up to 32 MiB (here: the whole file) and keep every
-// column chunk it has read until the file is closed.
+// column chunk it has read until the file is closed. Everything is allocated from the scan's pool
+// (the query's memory budget), which therefore sees it all.
 TEST_F(ParquetScanTest, HoldsAboutOneRowGroupAtATime) {
   constexpr int64_t kRowGroups = 32;
   constexpr int64_t kRowsPerGroup = 64;
@@ -288,17 +289,17 @@ TEST_F(ParquetScanTest, HoldsAboutOneRowGroupAtATime) {
   auto table = ParquetTable::Open({path});
   ASSERT_TRUE(table.ok()) << table.status().ToString();
 
-  const arrow::MemoryPool* pool = arrow::default_memory_pool();
-  const int64_t before = pool->bytes_allocated();
+  arrow::ProxyMemoryPool pool(arrow::default_memory_pool());
+  const int64_t before = pool.bytes_allocated();
   int64_t most = before;
   int64_t batches = 0;
   {
-    auto reader = (*table)->Scan({0}, kRowsPerGroup);
+    auto reader = (*table)->Scan({0}, kRowsPerGroup, &pool);
     ASSERT_TRUE(reader.ok()) << reader.status().ToString();
     while (true) {
       std::shared_ptr<arrow::RecordBatch> batch;
       ASSERT_TRUE((*reader)->ReadNext(&batch).ok());
-      most = std::max(most, pool->bytes_allocated());
+      most = std::max(most, pool.bytes_allocated());
       if (batch == nullptr) {
         break;
       }
@@ -306,6 +307,8 @@ TEST_F(ParquetScanTest, HoldsAboutOneRowGroupAtATime) {
     }
   }
   EXPECT_EQ(batches, kRowGroups);
+  EXPECT_GT(pool.max_memory(), kRowsPerGroup * int64_t{kValueBytes});  // a row group's values
+  EXPECT_EQ(pool.bytes_allocated(), 0);
   EXPECT_LT(most - before, file_bytes / 4)
       << "the scan held " << (most - before) << " bytes of a " << file_bytes << "-byte file";
 }

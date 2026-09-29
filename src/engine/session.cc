@@ -11,6 +11,7 @@
 #include <arrow/compute/api.h>
 #include <arrow/util/thread_pool.h>
 
+#include "antb1/exec/memory_budget.h"
 #include "antb1/exec/operator.h"
 #include "antb1/exec/physical_planner.h"
 #include "antb1/io/parquet_table.h"
@@ -79,15 +80,25 @@ Session::Session(SessionOptions options)
     : options_(std::move(options)),
       catalog_([opts = options_](const std::string& path) { return OpenParquet(opts, {path}); }) {}
 
-Session::~Session() = default;  // the pool's destructor waits for its threads
+Session::~Session() {
+  if (pool_ != nullptr) {
+    // Waits for the workers, which may still release buffers of the budget.
+    static_cast<void>(pool_->Shutdown(/*wait=*/true));
+    pool_.reset();
+  }
+}
 
 arrow::Result<std::unique_ptr<Session>> Session::Make(SessionOptions options) {
   if (options.threads < 1 || options.threads > kMaxThreads) {
     return arrow::Status::Invalid("the number of threads must be between 1 and ", kMaxThreads,
                                   ", not ", options.threads);
   }
+  if (options.memory_limit.has_value() && *options.memory_limit < 1) {
+    return arrow::Status::Invalid("the memory limit must be positive, not ", *options.memory_limit);
+  }
   ARROW_RETURN_NOT_OK(arrow::compute::Initialize());
   std::unique_ptr<Session> session(new Session(std::move(options)));
+  session->memory_ = std::make_shared<exec::MemoryBudget>(session->options_.memory_limit);
   if (session->options_.threads > 1) {
     ARROW_ASSIGN_OR_RAISE(session->pool_,
                           arrow::internal::ThreadPool::Make(session->options_.threads));
@@ -106,10 +117,12 @@ arrow::Result<QueryResult> Session::Execute(std::string_view sql) {
   ARROW_ASSIGN_OR_RAISE(auto logical, ParseAndBind(sql, catalog_, &result.timings));
   const auto t0 = Clock::now();
   ARROW_ASSIGN_OR_RAISE(auto op, exec::BuildPhysicalPlan(logical));
-  exec::ExecContext ctx{.pool = arrow::default_memory_pool(),
+  result.memory = memory_;
+  exec::ExecContext ctx{.pool = memory_.get(),
                         .batch_size = options_.batch_size,
                         .executor = pool_.get(),
-                        .threads = options_.threads};
+                        .threads = options_.threads,
+                        .budget = memory_.get()};
   ARROW_ASSIGN_OR_RAISE(auto table, exec::Drain(*op, ctx));
   for (const auto& col : logical.output) {
     result.names.push_back(col.name);

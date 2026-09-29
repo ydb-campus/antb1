@@ -39,6 +39,9 @@ class GroupedAggregateState {
   [[nodiscard]] virtual std::uint32_t num_groups() const = 0;
   // Grows the state to `num_groups` groups; new groups have seen no value. Never shrinks.
   virtual void Resize(std::uint32_t num_groups) = 0;
+  // The bytes the state holds outside Arrow buffers (its per-group vectors and VARCHAR values),
+  // which operators charge to their MemoryBudget. Arrow buffers are counted by their pool.
+  [[nodiscard]] virtual std::int64_t memory_usage() const = 0;
   // Adds rows: row i of `values` belongs to group group_ids[i] (< num_groups()). `values` is
   // nullptr for COUNT(*), which counts group_ids.size() rows.
   virtual arrow::Status Consume(const arrow::Array* values,

@@ -8,6 +8,7 @@
 #include <format>
 #include <limits>
 #include <memory>
+#include <new>
 #include <numeric>
 #include <optional>
 #include <span>
@@ -271,8 +272,9 @@ class ScanReader final : public arrow::RecordBatchReader {
   };
 
   ScanReader(std::vector<Segment> segments, std::vector<Column> columns,
-             std::shared_ptr<arrow::Schema> schema, int64_t batch_size)
-      : segments_(std::move(segments)),
+             std::shared_ptr<arrow::Schema> schema, int64_t batch_size, arrow::MemoryPool* pool)
+      : pool_(pool),
+        segments_(std::move(segments)),
         columns_(std::move(columns)),
         schema_(std::move(schema)),
         batch_size_(batch_size) {}
@@ -290,6 +292,10 @@ class ScanReader final : public arrow::RecordBatchReader {
   arrow::Status ReadNext(std::shared_ptr<arrow::RecordBatch>* batch) override {
     try {
       return ReadNextBatch(batch);
+    } catch (const parquet::ParquetStatusException& e) {
+      return FileError(e.status());
+    } catch (const std::bad_alloc&) {
+      return arrow::Status::OutOfMemory("out of memory reading '", current_file_, "'");
     } catch (const parquet::ParquetException& e) {
       return arrow::Status::IOError("cannot read Parquet file '", current_file_, "': ", e.what());
     } catch (const std::exception& e) {
@@ -328,7 +334,8 @@ class ScanReader final : public arrow::RecordBatchReader {
 
   arrow::Status OpenFile(const Segment& segment) {
     current_file_ = segment.path;
-    ARROW_ASSIGN_OR_RAISE(auto input, arrow::io::ReadableFile::Open(segment.path));
+    // The column chunks are read into the pool too.
+    ARROW_ASSIGN_OR_RAISE(auto input, arrow::io::ReadableFile::Open(segment.path, pool_));
     // The footer read at Open locates the column chunks and fixes their types: a file that has
     // since been rewritten must not be decoded with it.
     ARROW_ASSIGN_OR_RAISE(const int64_t size, input->GetSize());
@@ -342,8 +349,8 @@ class ScanReader final : public arrow::RecordBatchReader {
       return arrow::Status::IOError("the file changed after it was opened (its footer differs)");
     }
     parquet::arrow::FileReaderBuilder builder;
-    ARROW_RETURN_NOT_OK(
-        builder.Open(input, parquet::default_reader_properties(), segment.metadata));
+    ARROW_RETURN_NOT_OK(builder.Open(input, parquet::ReaderProperties(pool_), segment.metadata));
+    builder.memory_pool(pool_);
     parquet::ArrowReaderProperties properties(/*use_threads=*/false);
     properties.set_batch_size(batch_size_);
     // No pre-buffering (on by default): its read cache keeps every column chunk it has read until
@@ -368,9 +375,10 @@ class ScanReader final : public arrow::RecordBatchReader {
     file_reader_.reset();
   }
 
-  // Any failure while reading a file is an I/O error naming the file (exit code 3).
+  // Any failure while reading a file is an I/O error naming the file (exit code 3), except running
+  // out of the query's memory, which stays OutOfMemory.
   arrow::Status FileError(const arrow::Status& status) const {
-    if (status.ok()) {
+    if (status.ok() || status.IsOutOfMemory()) {
       return status;
     }
     return arrow::Status::IOError("cannot read Parquet file '", current_file_,
@@ -385,14 +393,14 @@ class ScanReader final : public arrow::RecordBatchReader {
     for (std::size_t i = 0; i < columns_.size(); ++i) {
       const Column& column = columns_[i];
       const std::shared_ptr<arrow::Array>& array = batch.column(Narrow<int>(i));
-      ARROW_ASSIGN_OR_RAISE(
-          auto converted, Convert(array, column.conversion, schema_->field(Narrow<int>(i))->type(),
-                                  arrow::default_memory_pool()));
+      ARROW_ASSIGN_OR_RAISE(auto converted, Convert(array, column.conversion,
+                                                    schema_->field(Narrow<int>(i))->type(), pool_));
       arrays.push_back(std::move(converted));
     }
     return arrow::RecordBatch::Make(schema_, batch.num_rows(), std::move(arrays));
   }
 
+  arrow::MemoryPool* pool_;  // pages, decoded columns and conversions
   std::vector<Segment> segments_;
   std::vector<Column> columns_;
   std::shared_ptr<arrow::Schema> schema_;
@@ -408,7 +416,7 @@ class ScanReader final : public arrow::RecordBatchReader {
 // fields from the storage schema onto the engine view.
 arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> MakeScan(
     std::vector<Segment> segments, const arrow::Schema& storage_schema, const arrow::Schema& schema,
-    const std::vector<int>& fields, int64_t batch_size) {
+    const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool) {
   if (batch_size < 1) {
     return arrow::Status::Invalid("the scan batch size must be positive, not ", batch_size);
   }
@@ -431,7 +439,7 @@ arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> MakeScan(
     engine_fields.push_back(engine);
   }
   return std::make_unique<ScanReader>(std::move(segments), std::move(columns),
-                                      arrow::schema(std::move(engine_fields)), batch_size);
+                                      arrow::schema(std::move(engine_fields)), batch_size, pool);
 }
 
 }  // namespace
@@ -479,8 +487,8 @@ arrow::Result<std::shared_ptr<ParquetTable>> ParquetTable::Open(
   return table;
 }
 
-arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> ParquetTable::Scan(
-    const std::vector<int>& fields, int64_t batch_size) const {
+arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> ParquetTable::DoScan(
+    const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool) const {
   std::vector<Segment> segments;
   segments.reserve(files_.size());
   for (std::size_t file = 0; file < files_.size(); ++file) {
@@ -492,7 +500,7 @@ arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> ParquetTable::Scan(
                                .footer = footers_[file],
                                .row_groups = std::move(row_groups)});
   }
-  return MakeScan(std::move(segments), *storage_schema_, *schema_, fields, batch_size);
+  return MakeScan(std::move(segments), *storage_schema_, *schema_, fields, batch_size, pool);
 }
 
 int64_t ParquetTable::num_parts() const { return Narrow<int64_t>(parts_.size()); }
@@ -504,8 +512,9 @@ std::optional<int64_t> ParquetTable::part_rows(int64_t part) const {
   return parts_[Narrow<std::size_t>(part)].rows;
 }
 
-arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> ParquetTable::ScanPart(
-    int64_t part, const std::vector<int>& fields, int64_t batch_size) const {
+arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> ParquetTable::DoScanPart(
+    int64_t part, const std::vector<int>& fields, int64_t batch_size,
+    arrow::MemoryPool* pool) const {
   if (part < 0 || part >= num_parts()) {
     return arrow::Status::Invalid("scan of part ", part, " of a table with ", num_parts(),
                                   " parts");
@@ -517,7 +526,7 @@ arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> ParquetTable::ScanPart(
                              .bytes = file_bytes_[p.file],
                              .footer = footers_[p.file],
                              .row_groups = std::vector<int>{p.row_group}});
-  return MakeScan(std::move(segments), *storage_schema_, *schema_, fields, batch_size);
+  return MakeScan(std::move(segments), *storage_schema_, *schema_, fields, batch_size, pool);
 }
 
 bool ParquetTable::StoredAsFloat(int field) const {

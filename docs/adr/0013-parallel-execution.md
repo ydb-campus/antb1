@@ -106,10 +106,11 @@ The maintainer asked for this design to be ready for TPC-H: hash joins, and corr
 - **Memory:** the window bounds what is in flight: up to 2 × threads parts' partial states or, under a part union
   (a projection, or a blocking operator without its own sink yet), their whole output, because a part hands on its
   batches only when it is finished. A hash-join build is one table shared read-only by the probe threads, built on
-  the smaller side. A session memory
-  limit (a tracking memory pool; the window shrinks under pressure; a clear out-of-memory error) comes right after the
-  first parallel PR. Spilling (grace hash join, partitioned GROUP BY, external sort) comes after joins, in its own ADR;
-  it never changes a value, only the row order where SQL leaves it open.
+  the smaller side. The session memory limit (`exec::MemoryBudget`: a counting memory pool plus reservations for the
+  operators' own containers; the window halves under pressure and widens again without, and a part that runs out
+  of memory next to others runs again alone; a `memory` error, exit code 1) came
+  right after the first parallel PR. Spilling (grace hash join, partitioned GROUP BY, external sort) comes after
+  joins, in its own ADR; it never changes a value, only the row order where SQL leaves it open.
 
 ## Consequences
 
@@ -152,7 +153,7 @@ The maintainer asked for this design to be ready for TPC-H: hash joins, and corr
    already had multi-row-group files.)
 2. **engine and exec:** the pool, `--threads`, the part pipelines with the global-aggregate sink, the ordered part
    union with LIMIT early stop, the ordered merge window and error order. Tests with the `parallel` label.
-3. **engine and exec:** the session memory limit.
+3. **engine and exec:** the session memory limit (`--memory-limit`, default 80% of physical memory).
 4. **exec:** the GROUP BY sink (grouper merge through group maps, first-seen keys by part).
 5. **exec:** the sort/top-N sink.
 6. **Docs:** ADRs 0003, 0006 and 0010 and the status of this ADR (semantics, architecture.md and benchmarks change

@@ -15,6 +15,7 @@
 #include <arrow/util/thread_pool.h>
 #include <gtest/gtest.h>
 
+#include "antb1/exec/memory_budget.h"
 #include "antb1/exec/physical_planner.h"
 #include "antb1/plan/logical_plan.h"
 
@@ -137,6 +138,77 @@ TEST(PartSchedulerTest, StopWaitsForRunningParts) {
   }
   EXPECT_EQ(started->load(), stopped->load());
   EXPECT_LE(started->load(), 4);
+}
+
+// A part that runs out of memory on the pool is run again alone on the calling thread, the window
+// drops to one part and widens again; the results are the same, in order. Without an executor,
+// running out of memory is the query's error.
+TEST(PartSchedulerTest, OutOfMemoryInParallelFallsBackToOnePartAtATime) {
+  const auto pool = Pool();
+  const std::thread::id caller = std::this_thread::get_id();
+  auto on_caller = std::make_shared<std::vector<int64_t>>();
+  const auto task = [caller, on_caller](int64_t part,
+                                        const std::atomic<bool>&) -> arrow::Result<int64_t> {
+    if (std::this_thread::get_id() == caller) {
+      on_caller->push_back(part);
+      return part;
+    }
+    if (part == 3) {
+      return arrow::Status::OutOfMemory("too much at once");
+    }
+    return part;
+  };
+  PartScheduler<int64_t> scheduler(10, task, pool.get(), 4);
+  for (int64_t part = 0; part < 10; ++part) {
+    auto result = scheduler.Next();
+    ASSERT_TRUE(result.ok()) << part << ": " << result.status().ToString();
+    EXPECT_EQ(*result, part);
+  }
+  EXPECT_EQ(*on_caller, std::vector<int64_t>{3});
+  EXPECT_EQ(scheduler.window(), 4);  // 1 after part 3, then widened by the 6 parts after it
+
+  PartScheduler<int64_t> inline_scheduler(
+      10,
+      [](int64_t part, const std::atomic<bool>&) -> arrow::Result<int64_t> {
+        return part == 3 ? arrow::Result<int64_t>(arrow::Status::OutOfMemory("too much"))
+                         : arrow::Result<int64_t>(part);
+      },
+      nullptr, 4);
+  for (int64_t part = 0; part < 3; ++part) {
+    ASSERT_TRUE(inline_scheduler.Next().ok());
+  }
+  EXPECT_TRUE(inline_scheduler.Next().status().IsOutOfMemory());
+}
+
+// Every part the consumer takes under memory pressure halves the window, down to one part; every
+// part taken without pressure widens it again by one. The results are the same, in order.
+TEST(PartSchedulerTest, PressureNarrowsTheWindow) {
+  const auto pool = Pool();
+  MemoryBudget budget(1000);
+  PartScheduler<int64_t> scheduler(
+      20, [](int64_t part, const std::atomic<bool>&) -> arrow::Result<int64_t> { return part; },
+      pool.get(), 8, &budget);
+  const auto next = [&](int64_t expected) {
+    auto result = scheduler.Next();
+    ASSERT_TRUE(result.ok()) << expected << ": " << result.status().ToString();
+    EXPECT_EQ(*result, expected);
+  };
+  next(0);
+  EXPECT_EQ(scheduler.window(), 8);
+  ASSERT_TRUE(budget.Reserve(600).ok());  // past half the limit
+  int64_t part = 1;
+  for (const int64_t window : {4, 2, 1, 1}) {
+    next(part++);
+    EXPECT_EQ(scheduler.window(), window);
+  }
+  budget.Release(600);
+  for (const int64_t window : {2, 3, 4}) {
+    next(part++);
+    EXPECT_EQ(scheduler.window(), window);
+  }
+  while (part < 20) {
+    next(part++);
+  }
 }
 
 // ---- part operators through the physical planner ----

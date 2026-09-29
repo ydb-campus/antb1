@@ -1,6 +1,6 @@
 antb1_add_module(
   cli
-  SOURCES cli.cc bench.cc
+  SOURCES cli.cc bench.cc memory_size.cc
   PUBLIC_DEPS common
   PRIVATE_DEPS engine
   PUBLIC_LIBS Arrow::arrow_shared

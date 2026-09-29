@@ -416,6 +416,10 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   batches; their results are combined in file and row group order, so a result is the same for any number of
   threads, and deterministic. A DOUBLE `SUM` or `AVG` without `GROUP BY` adds up every row group, then the row
   group sums in order: it can differ from one running sum (and from DuckDB) by rounding.
+- Memory: a query may hold at most `--memory-limit` bytes (default: 80% of physical memory, as DuckDB's
+  `memory_limit`; sizes such as `4GB`, `512MiB` or `50%`): the data it reads and computes and its results. A query
+  that needs more fails with a `memory` error (exit code 1), never with a crash; under pressure it reads fewer row
+  groups at a time, down to one, and a row group that runs out of memory next to others is read again alone.
 
 ## Output formats
 
@@ -438,8 +442,8 @@ formatter:
 | Code | Meaning | Examples |
 | --- | --- | --- |
 | 0 | success | |
-| 1 | query error: syntax, bind or execution error | `SELECT COUNT(*) FORM t`; an unknown table or column; `SUM` of a VARCHAR column; a `SUM` outside HUGEINT's range; an invalid `regexp_replace` pattern |
-| 2 | usage error | unknown option; neither or both of `-c` and `-f`; a malformed `--table` or `--column-type`; a column that `--column-type` cannot read as DATE; a table name registered twice |
+| 1 | query error: syntax, bind, execution or memory error | `SELECT COUNT(*) FORM t`; an unknown table or column; `SUM` of a VARCHAR column; a `SUM` outside HUGEINT's range; an invalid `regexp_replace` pattern; a query that needs more memory than `--memory-limit` |
+| 2 | usage error | unknown option; neither or both of `-c` and `-f`; a malformed `--table`, `--column-type` or `--memory-limit`; a column that `--column-type` cannot read as DATE; a table name registered twice |
 | 3 | I/O error | a missing or unreadable file; not a Parquet file; schemas that differ; a glob that matches nothing |
 | 4 | unsupported: valid-looking SQL outside the supported subset | `JOIN`; `IS NULL`; an unknown function; `SELECT 2.5`; `SUM(DISTINCT ...)`; a column of an unsupported type |
 | 70 | internal error: anything else, which is a bug | an uncaught exception; an Arrow `NotImplemented` or type error without SQL context |
@@ -456,9 +460,9 @@ errors such as an unknown option are always reported as plain text by CLI11):
 {"error":{"kind":"bind","message":"table 'nope' does not exist","offset":21,"length":4,"line":1,"column":22}}
 ```
 
-The kinds are `parse`, `unsupported`, `bind`, `io`, `execution`, `internal` and, for command-line errors (exit code 2),
-`usage`. Strings in the error object (and in the `antb1 bench` report) are escaped like `--format json` values, so it is
-valid UTF-8 whatever bytes the SQL holds.
+The kinds are `parse`, `unsupported`, `bind`, `io`, `execution`, `memory`, `internal` and, for command-line errors (exit
+code 2), `usage`. Strings in the error object (and in the `antb1 bench` report) are escaped like `--format json`
+values, so it is valid UTF-8 whatever bytes the SQL holds.
 
 ## Divergences from DuckDB
 

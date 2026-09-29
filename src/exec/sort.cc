@@ -386,6 +386,22 @@ arrow::Status SortBuffer::Merge(SortBuffer& other, arrow::MemoryPool* pool) {
   return arrow::Status::OK();
 }
 
+int64_t SortBuffer::memory_usage() const {
+  std::size_t bytes = (chunks_.capacity() * sizeof(std::shared_ptr<arrow::RecordBatch>)) +
+                      (chunk_keys_.capacity() * sizeof(RowComparator::KeyArrays)) +
+                      (order_.capacity() * sizeof(RowRef));
+  for (const RowComparator::KeyArrays& keys : chunk_keys_) {
+    bytes += keys.capacity() * sizeof(const arrow::Array*);
+  }
+  return Narrow<int64_t>(bytes);
+}
+
+int64_t SortBuffer::sort_memory() const {
+  // Sort's entries (a 64-bit prefix, a row reference and a group, padded) and the new order.
+  constexpr auto kPerRow = static_cast<int64_t>((3 * sizeof(std::uint64_t)) + sizeof(RowRef));
+  return rows_ * kPerRow;
+}
+
 arrow::Status SortBuffer::Sort(arrow::MemoryPool* pool) {
   if (keep_.has_value()) {
     return Compact(pool);
@@ -496,6 +512,7 @@ arrow::Status SortOperator::Open(ExecContext& ctx) {
     return arrow::Status::Invalid("negative LIMIT or OFFSET");
   }
   pool_ = ctx.pool;
+  memory_.Reset(ctx.budget);
   batch_size_ = std::max<int64_t>(ctx.batch_size, 1);
   ARROW_ASSIGN_OR_RAISE(RowComparator comparator,
                         RowComparator::Make(input_->output_schema(), keys_));
@@ -520,8 +537,11 @@ arrow::Result<Batch> SortOperator::Next() {
       }
       ARROW_ASSIGN_OR_RAISE(auto rows, Materialize(in, pool_));
       ARROW_RETURN_NOT_OK(buffer_->Add(std::move(rows), pool_));
+      ARROW_RETURN_NOT_OK(memory_.Resize(buffer_->memory_usage()));
     }
+    ARROW_RETURN_NOT_OK(memory_.Resize(buffer_->memory_usage() + buffer_->sort_memory()));
     ARROW_RETURN_NOT_OK(buffer_->Sort(pool_));
+    ARROW_RETURN_NOT_OK(memory_.Resize(buffer_->memory_usage()));
     sorted_ = true;
     next_ = std::min(offset_, buffer_->num_rows());
     end_ = limit_.has_value() ? std::min(buffer_->num_rows(), SaturatingAdd(next_, *limit_))
@@ -538,6 +558,7 @@ arrow::Result<Batch> SortOperator::Next() {
 
 arrow::Status SortOperator::Close() {
   buffer_.reset();
+  memory_.Release();
   return input_->Close();
 }
 

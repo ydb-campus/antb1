@@ -361,5 +361,52 @@ TEST_F(SessionTest, ThreadsDoNotChangeResults) {
   EXPECT_EQ(expected[2], (std::vector<std::vector<std::string>>{{"4"}, {"5"}, {"6"}}));
 }
 
+// The memory limit: a query that needs more fails with OutOfMemory; one that fits gives the same
+// result as without a limit; a result keeps its memory valid after the session is gone.
+TEST_F(SessionTest, MemoryLimit) {
+  for (const int64_t limit : {int64_t{0}, int64_t{-5}}) {
+    SessionOptions options;
+    options.memory_limit = limit;
+    EXPECT_TRUE(Session::Make(options).status().IsInvalid()) << limit;
+  }
+  const std::string sql = "SELECT AdvEngineID % 3 AS k, COUNT(*) FROM t GROUP BY k ORDER BY k";
+  const auto run = [&](std::optional<int64_t> limit) {
+    SessionOptions options;
+    options.memory_limit = limit;
+    options.threads = 2;
+    auto session = Session::Make(options).ValueOrDie();
+    EXPECT_TRUE(session->RegisterParquet("t", {path_}).ok());
+    return session->Execute(sql);  // the session is destroyed before the result
+  };
+  const auto unlimited = run(std::nullopt);
+  ASSERT_TRUE(unlimited.ok()) << unlimited.status().ToString();
+  EXPECT_EQ(Rows(*unlimited),
+            (std::vector<std::vector<std::string>>{{"0", "4"}, {"1", "3"}, {"2", "3"}}));
+  const auto fits = run(int64_t{1024} * 1024 * 1024);
+  ASSERT_TRUE(fits.ok()) << fits.status().ToString();
+  EXPECT_EQ(Rows(*fits), Rows(*unlimited));
+  ASSERT_NE(fits->memory, nullptr);
+  EXPECT_GT(fits->memory->bytes_allocated(), 0);  // the result's buffers
+  const auto tiny = run(64);
+  EXPECT_TRUE(tiny.status().IsOutOfMemory()) << tiny.status().ToString();
+  EXPECT_NE(tiny.status().message().find("memory limit of 64 bytes"), std::string::npos);
+}
+
+// A query that fails in its first row group while later ones hold buffers of the session's
+// memory on the pool's threads: destroying the session right away must wait for those threads
+// before the memory goes (ASan checks the frees).
+TEST_F(SessionTest, DestroyedRightAfterAFailedParallelQuery) {
+  for (int i = 0; i < 20; ++i) {
+    SessionOptions options;
+    options.threads = 4;
+    options.memory_limit = int64_t{1024} * 1024 * 1024;
+    auto session = Session::Make(options).ValueOrDie();
+    ASSERT_TRUE(session->RegisterParquet("t", {path_}).ok());
+    // 2 * 2^62 overflows BIGINT in the first row group (AdvEngineID 0..3).
+    const auto failed = session->Execute("SELECT AdvEngineID * 4611686018427387904 FROM t");
+    EXPECT_TRUE(failed.status().IsExecutionError()) << failed.status().ToString();
+  }
+}
+
 }  // namespace
 }  // namespace antb1::engine

@@ -16,8 +16,8 @@
 
 namespace antb1::cli {
 
-// The error kind of a failed status: parse, unsupported, bind, io, execution or internal (the
-// kinds of the error report and of `bench`).
+// The error kind of a failed status: parse, unsupported, bind, io, execution, memory or internal
+// (the kinds of the error report and of `bench`).
 std::string_view ErrorKind(const arrow::Status& status);
 
 // A JSON string literal, escaped like `--format json` values (engine::JsonEscape): always valid
@@ -48,6 +48,7 @@ struct BenchReport {
   int tries = 0;
   int64_t batch_size = 0;
   int threads = 0;
+  std::optional<int64_t> memory_limit;  // std::nullopt: none
   double load_time = 0;
   int64_t data_size = 0;
   std::vector<BenchQuery> queries;

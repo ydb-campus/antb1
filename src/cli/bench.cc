@@ -128,6 +128,9 @@ std::string ClickBenchJson(const BenchReport& report) {
   out += std::format("    \"tries\": {},\n", report.tries);
   out += std::format("    \"batch_size\": {},\n", report.batch_size);
   out += std::format("    \"threads\": {},\n", report.threads);
+  out += std::format("    \"memory_limit\": {},\n", report.memory_limit.has_value()
+                                                        ? std::to_string(*report.memory_limit)
+                                                        : std::string("null"));
   out += std::format("    \"failed\": [{}]\n", failures);
   out += "  }\n}\n";
   return out;

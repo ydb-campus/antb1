@@ -127,7 +127,7 @@ string(APPEND _bench_json "  \"concurrent_qps\": null,\n  \"concurrent_error_rat
 string(APPEND _bench_json "    [[]${_num}, ${_num}[]],\n    [[]${_num}, ${_num}[]],\n")
 string(APPEND _bench_json "    [[]null, null[]],\n    [[]null, null[]]\n  []],\n  \"antb1\": [{]\n")
 string(APPEND _bench_json ".*    \"cache\": \"lukewarm\",\n    \"tries\": 2,\n    \"batch_size\": 65536,\n")
-string(APPEND _bench_json "    \"threads\": 1,\n")
+string(APPEND _bench_json "    \"threads\": 1,\n    \"memory_limit\": [1-9][0-9]*,\n")
 string(APPEND _bench_json "    \"failed\": [[][{]\"query\": 2, \"kind\": \"unsupported\"[}], ")
 string(APPEND _bench_json "[{]\"query\": 3, \"kind\": \"bind\"[}][]]\n  [}]\n[}]$")
 set(_bench_log "^Q0: ${_num} ${_num}\nQ1: ${_num} ${_num}\nQ2: unsupported error\nQ3: bind error\n")
@@ -257,6 +257,18 @@ antb1_add_cli_golden(
   ARGS query --threads 1 -c "SELECT COUNT(*) FROM t WHERE CounterID = 'x'" --table "${_t}" --format json
 )
 antb1_add_cli_golden(usage_no_command EXIT_CODE 2 STDERR_REGEX "subcommand")
+antb1_add_cli_golden(
+  usage_memory_limit
+  EXIT_CODE 2
+  STDERR_REGEX "--memory-limit"
+  ARGS query --threads 1 --memory-limit 12XB -c "${_count}" --table "${_t}"
+)
+antb1_add_cli_golden(
+  error_memory_limit
+  EXIT_CODE 1
+  STDERR_REGEX "^antb1: memory error: the query needs more than the memory limit of 1[.]00 KB [(]--memory-limit[)]$"
+  ARGS query --threads 1 --memory-limit 1KB -c "SELECT URL, COUNT(*) FROM t GROUP BY URL" --table "${_t}"
+)
 antb1_add_cli_golden(
   usage_threads
   EXIT_CODE 2

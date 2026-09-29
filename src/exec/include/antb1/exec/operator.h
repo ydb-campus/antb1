@@ -23,13 +23,19 @@ class Executor;
 
 namespace antb1::exec {
 
+class MemoryBudget;
+
 struct ExecContext {
+  // Every buffer of the query; the session's MemoryBudget when there is one.
   arrow::MemoryPool* pool = arrow::default_memory_pool();
   int64_t batch_size = int64_t{64} * 1024;
   // Runs the parts of a pipeline; nullptr runs them one after another on the calling thread.
   arrow::internal::Executor* executor = nullptr;
   // The executor's threads (1 without one): parts in flight are bounded by twice this.
   int threads = 1;
+  // The budget `pool` counts against (nullptr: no limit, nothing to reserve). Operators reserve
+  // the memory of their own containers here, and parts are started one at a time under pressure.
+  MemoryBudget* budget = nullptr;
 };
 
 // Rows flowing from one operator to the next: the columns and, optionally, a selection. A selection

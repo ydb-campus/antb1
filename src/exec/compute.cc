@@ -617,7 +617,10 @@ struct Evaluator {
                           arrow::MakeArrayFromScalar(arrow::StringScalar(""), 1, pool));
     auto valid = arrow::compute::CallFunction("replace_substring_regex", {one}, &check, ctx);
     if (!valid.ok()) {
-      return arrow::Status::ExecutionError("regexp_replace: ", valid.status().message());
+      // An invalid pattern; running out of memory stays a memory error.
+      return valid.status().IsOutOfMemory()
+                 ? valid.status()
+                 : arrow::Status::ExecutionError("regexp_replace: ", valid.status().message());
     }
     const arrow::compute::ReplaceSubstringOptions options("^(\\C*?)(" + pattern + ")", shifted,
                                                           /*max_replacements=*/-1);
@@ -628,8 +631,11 @@ struct Evaluator {
       return text;
     }
     if (!replaced.ok()) {
-      // An invalid pattern: a query error, as in DuckDB (Invalid Input Error).
-      return arrow::Status::ExecutionError("regexp_replace: ", replaced.status().message());
+      // An invalid pattern: a query error, as in DuckDB (Invalid Input Error). Running out of
+      // memory stays a memory error.
+      return replaced.status().IsOutOfMemory()
+                 ? replaced.status()
+                 : arrow::Status::ExecutionError("regexp_replace: ", replaced.status().message());
     }
     arrow::compute::CastOptions to_binary = arrow::compute::CastOptions::Unsafe(arrow::binary());
     ARROW_ASSIGN_OR_RAISE(const arrow::Datum bytes,
