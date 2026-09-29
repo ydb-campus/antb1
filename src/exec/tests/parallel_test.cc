@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -20,6 +21,8 @@
 
 #include "antb1/exec/memory_budget.h"
 #include "antb1/exec/physical_planner.h"
+#include "antb1/exec/sort.h"
+#include "antb1/exec/table_scan.h"
 #include "antb1/plan/logical_plan.h"
 
 #include "../group_table.h"
@@ -785,6 +788,74 @@ TEST_F(PartOperatorsTest, PartitionMergeErrors) {
   ASSERT_TRUE((*op)->Open(ctx).ok());
   ASSERT_TRUE((*op)->Close().ok());
   EXPECT_TRUE((*op)->Next().status().IsInvalid());
+}
+
+// ORDER BY ... LIMIT over parts keeps each part's first rows and merges them in part order: the
+// window and its tie order are the serial top-N's, byte for byte, on any number of threads, for
+// windows inside, across and past the rows; errors come in part order; memory is budgeted.
+TEST_F(PartOperatorsTest, TopNKeepsEachPartsFirstRows) {
+  const auto pool = Pool();
+  const auto y = Column(2, "y", LogicalType::kBigInt);  // NULL every fifth row: ties at NULL
+  const auto keys = [&](bool descending, bool nulls_first) {
+    return std::vector<plan::SortKey>{
+        {.column = y, .descending = descending, .nulls_first = nulls_first}};
+  };
+  const auto top = [&](const std::shared_ptr<MemoryTable>& table, int64_t limit, int64_t offset,
+                       bool descending, bool nulls_first) {
+    const auto sort =
+        Node(plan::SortNode{.input = Scan(table), .keys = keys(descending, nulls_first)});
+    return PlanOf(Node(plan::LimitNode{.input = sort, .limit = limit, .offset = offset}), 3);
+  };
+  // The reference: the serial top-N SortOperator over one scan of the whole table.
+  const auto serial_top = [&](int64_t limit, int64_t offset, bool descending, bool nulls_first) {
+    SortOperator op(std::make_unique<TableScanOperator>(Table(false), std::vector<int>{0, 1, 2}),
+                    keys(descending, nulls_first), limit, offset);
+    ExecContext ctx{.pool = arrow::default_memory_pool(), .batch_size = 3};
+    return Drain(op, ctx);
+  };
+  for (const auto& [limit, offset] :
+       std::vector<std::pair<int64_t, int64_t>>{{1, 0},
+                                                {5, 3},
+                                                {40, 20},
+                                                {30, 125},
+                                                {10, 200},
+                                                {std::numeric_limits<int64_t>::max(), 110}}) {
+    for (const bool descending : {false, true}) {
+      for (const bool nulls_first : {false, true}) {
+        const auto serial = serial_top(limit, offset, descending, nulls_first);
+        const auto one_thread = Run(top(Table(), limit, offset, descending, nulls_first), nullptr);
+        const auto four_threads =
+            Run(top(Table(), limit, offset, descending, nulls_first), pool.get());
+        ASSERT_TRUE(serial.ok() && one_thread.ok() && four_threads.ok())
+            << serial.status().ToString() << one_thread.status().ToString()
+            << four_threads.status().ToString();
+        EXPECT_TRUE(SameRows(**one_thread, **serial)) << limit << " " << offset;
+        EXPECT_TRUE(SameRows(**four_threads, **one_thread)) << limit << " " << offset;
+      }
+    }
+  }
+  for (arrow::internal::Executor* executor :
+       {static_cast<arrow::internal::Executor*>(nullptr),
+        static_cast<arrow::internal::Executor*>(pool.get())}) {
+    const auto table = Table();
+    table->FailPart(4);
+    const auto failed = Run(top(table, 5, 0, false, false), executor);
+    EXPECT_TRUE(failed.status().IsIOError()) << failed.status().ToString();
+    EXPECT_EQ(failed.status().message(), "part 4 is broken");
+
+    MemoryBudget tiny(512);
+    auto op = BuildPhysicalPlan(top(Table(), 50, 0, false, false));
+    ASSERT_TRUE(op.ok());
+    ExecContext ctx{.pool = &tiny,
+                    .batch_size = 3,
+                    .executor = executor,
+                    .threads = executor == nullptr ? 1 : kThreads,
+                    .budget = &tiny};
+    const auto oom = Drain(**op, ctx);
+    EXPECT_TRUE(oom.status().IsOutOfMemory()) << oom.status().ToString();
+    op->reset();
+    EXPECT_EQ(tiny.bytes_allocated(), 0);
+  }
 }
 
 }  // namespace

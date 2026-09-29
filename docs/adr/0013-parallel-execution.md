@@ -157,7 +157,8 @@ The maintainer asked for this design to be ready for TPC-H: hash joins, and corr
 4. **exec:** the GROUP BY sink (grouper merge through group maps, first-seen keys by part), then its
    radix-partitioned merge: 64 partitions by key hash (a constant, not the thread count), each merging the parts in
    part order, the partitions in parallel.
-5. **exec:** the sort/top-N sink.
+5. **exec:** the top-N sink (every part keeps its first rows, merged in part order). A full `ORDER BY` without
+   `LIMIT` still sorts the part union on one thread; a k-way merge of sorted parts is its follow-up.
 6. **Docs:** ADRs 0003, 0006 and 0010 and the status of this ADR (semantics, architecture.md and benchmarks change
    with the PRs above).
 

@@ -137,6 +137,14 @@ struct Builder {
     // Limit(Sort) with a limit is a top-N: it keeps only limit + offset rows while it reads.
     const auto* sort = std::get_if<plan::SortNode>(node.input.get());
     if (sort != nullptr && node.limit.has_value() && *node.limit > 0) {
+      if (const plan::ScanNode* scan = PipelineScan(sort->input)) {
+        // Every part keeps its own first rows, merged in part order.
+        PartPipeline pipeline = PipelineOf(sort->input);
+        ARROW_ASSIGN_OR_RAISE(auto sample, pipeline(0));
+        return std::make_unique<PartTopNOperator>(std::move(pipeline), scan->table->num_parts(),
+                                                  sample->output_schema(), sort->keys, *node.limit,
+                                                  node.offset);
+      }
       ARROW_ASSIGN_OR_RAISE(auto input, Build(sort->input));
       return std::make_unique<SortOperator>(std::move(input), sort->keys, node.limit, node.offset);
     }
