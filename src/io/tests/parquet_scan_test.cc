@@ -1,5 +1,5 @@
 // ParquetTable::Scan: batches of the engine view (plan::Table::schema()) over every file, row
-// group and batch in order.
+// group and batch in order; ParquetTable::ScanPart: the same for one row group.
 
 #include <algorithm>
 #include <cstddef>
@@ -121,6 +121,47 @@ class ParquetScanTest : public ::testing::Test {
       EXPECT_TRUE(batch->ValidateFull().ok());
       out.batch_rows.push_back(batch->num_rows());
       batches.push_back(std::move(batch));
+    }
+    auto combined = arrow::Table::FromRecordBatches(out.schema, batches);
+    EXPECT_TRUE(combined.ok()) << combined.status().ToString();
+    if (combined.ok()) {
+      auto chunks = (*combined)->CombineChunks();
+      EXPECT_TRUE(chunks.ok());
+      out.table = chunks.ok() ? *chunks : nullptr;
+    }
+    return out;
+  }
+
+  // Every part scanned in order, as one Scanned (batch_rows of all parts).
+  static Scanned ScanParts(const plan::Table& table, const std::vector<int>& fields,
+                           int64_t batch_size) {
+    Scanned out;
+    std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
+    for (int64_t part = 0; part < table.num_parts(); ++part) {
+      auto reader = table.ScanPart(part, fields, batch_size);
+      EXPECT_TRUE(reader.ok()) << part << ": " << reader.status().ToString();
+      if (!reader.ok()) {
+        return out;
+      }
+      out.schema = (*reader)->schema();
+      int64_t rows = 0;
+      while (true) {
+        std::shared_ptr<arrow::RecordBatch> batch;
+        const arrow::Status st = (*reader)->ReadNext(&batch);
+        EXPECT_TRUE(st.ok()) << st.ToString();
+        if (!st.ok() || batch == nullptr) {
+          break;
+        }
+        EXPECT_TRUE(batch->ValidateFull().ok());
+        EXPECT_LE(batch->num_rows(), batch_size);
+        rows += batch->num_rows();
+        out.batch_rows.push_back(batch->num_rows());
+        batches.push_back(std::move(batch));
+      }
+      EXPECT_EQ(rows, table.part_rows(part)) << part;
+    }
+    if (out.schema == nullptr) {
+      return out;
     }
     auto combined = arrow::Table::FromRecordBatches(out.schema, batches);
     EXPECT_TRUE(combined.ok()) << combined.status().ToString();
@@ -540,6 +581,151 @@ TEST_F(ParquetScanTest, ColumnOverridesAreChecked) {
   EXPECT_TRUE(ParquetTable::Open({path}, ParquetTableOptions{.overrides = {{.column = "st"}}})
                   .status()
                   .IsInvalid());
+}
+
+// ---- parts: one per row group with rows, scanned one at a time ----
+
+std::vector<std::optional<int64_t>> PartRows(const plan::Table& table) {
+  std::vector<std::optional<int64_t>> out;
+  out.reserve(static_cast<std::size_t>(table.num_parts()));
+  for (int64_t part = 0; part < table.num_parts(); ++part) {
+    out.push_back(table.part_rows(part));
+  }
+  return out;
+}
+
+TEST_F(ParquetScanTest, PartsAreRowGroupsInFileOrder) {
+  WriteNumbers("part-0.parquet", 0, 10, 3);
+  WriteNumbers("part-1.parquet", 10, 0, 3);  // no rows: no part
+  WriteNumbers("part-2.parquet", 10, 7, 7);
+  WriteNumbers("part-3.parquet", 17, 5, 2);
+  auto table = ParquetTable::Open({(dir_ / "part-*.parquet").string()});
+  ASSERT_TRUE(table.ok()) << table.status().ToString();
+  EXPECT_EQ((*table)->num_parts(), 8);
+  EXPECT_EQ(PartRows(**table), (std::vector<std::optional<int64_t>>{3, 3, 3, 1, 7, 2, 2, 1}));
+  EXPECT_EQ((*table)->exact_row_count(), 22);
+  for (const std::vector<int>& fields :
+       {std::vector<int>{0, 1}, std::vector<int>{1}, std::vector<int>{}}) {
+    for (const int64_t batch_size : {int64_t{1}, int64_t{2}, int64_t{64}}) {
+      const Scanned whole = Scan(**table, fields, batch_size);
+      const Scanned parts = ScanParts(**table, fields, batch_size);
+      ASSERT_NE(whole.table, nullptr);
+      ASSERT_NE(parts.table, nullptr);
+      EXPECT_TRUE(parts.schema->Equals(*whole.schema));
+      EXPECT_EQ(parts.table->num_rows(), 22);
+      EXPECT_TRUE(parts.table->Equals(*whole.table)) << batch_size;
+    }
+  }
+}
+
+// A part converts its columns to the engine view exactly as the scan of the whole table does.
+TEST_F(ParquetScanTest, PartsConvertToTheEngineView) {
+  const std::vector<std::optional<std::string>> strings = {"a", std::nullopt, "", "\xff", "bc"};
+  const std::vector<std::optional<uint16_t>> days = {15887, 0, std::nullopt, 65535, 1};
+  const std::vector<std::optional<float>> floats = {1.5F, std::nullopt, -0.25F, 0.1F, 3e38F};
+  auto data = arrow::Table::Make(
+      arrow::schema({arrow::field("s", arrow::utf8()), arrow::field("l", arrow::large_binary()),
+                     arrow::field("day", arrow::uint16()), arrow::field("f", arrow::float32())}),
+      {Build<arrow::StringBuilder, std::string>(strings),
+       Build<arrow::LargeBinaryBuilder, std::string>(strings),
+       Build<arrow::UInt16Builder, uint16_t>(days), Build<arrow::FloatBuilder, float>(floats)});
+  const std::string path = Write("types.parquet", data, 2, /*store_schema=*/true);
+  auto table = ParquetTable::Open({path}, ParquetTableOptions{.overrides = {{.column = "day"}}});
+  ASSERT_TRUE(table.ok()) << table.status().ToString();
+  EXPECT_EQ(PartRows(**table), (std::vector<std::optional<int64_t>>{2, 2, 1}));
+  for (const int64_t batch_size : {int64_t{1}, int64_t{64}}) {
+    const Scanned whole = Scan(**table, {3, 2, 1, 0}, batch_size);
+    const Scanned parts = ScanParts(**table, {3, 2, 1, 0}, batch_size);
+    ASSERT_NE(parts.table, nullptr);
+    EXPECT_TRUE(parts.schema->Equals(*whole.schema));
+    EXPECT_EQ(parts.schema->field(0)->type()->id(), arrow::Type::DOUBLE);
+    EXPECT_EQ(parts.schema->field(1)->type()->id(), arrow::Type::DATE32);
+    EXPECT_TRUE(parts.table->Equals(*whole.table)) << batch_size;
+    EXPECT_EQ(Bytes(*parts.table, 3), strings);
+  }
+}
+
+TEST_F(ParquetScanTest, TableWithoutRowsHasNoParts) {
+  WriteNumbers("a.parquet", 0, 0, 4);
+  WriteNumbers("b.parquet", 0, 0, 4);
+  auto table = ParquetTable::Open({(dir_ / "*.parquet").string()});
+  ASSERT_TRUE(table.ok()) << table.status().ToString();
+  EXPECT_EQ((*table)->num_parts(), 0);
+  EXPECT_EQ((*table)->part_rows(0), std::nullopt);
+  EXPECT_TRUE((*table)->ScanPart(0, {0}, 8).status().IsInvalid());
+}
+
+TEST_F(ParquetScanTest, InvalidPartRequests) {
+  auto table = ParquetTable::Open({WriteNumbers("a.parquet", 0, 5, 2)});
+  ASSERT_TRUE(table.ok()) << table.status().ToString();
+  ASSERT_EQ((*table)->num_parts(), 3);
+  EXPECT_EQ((*table)->part_rows(-1), std::nullopt);
+  EXPECT_EQ((*table)->part_rows(3), std::nullopt);
+  EXPECT_TRUE((*table)->ScanPart(-1, {0}, 8).status().IsInvalid());
+  EXPECT_TRUE((*table)->ScanPart(3, {0}, 8).status().IsInvalid());
+  EXPECT_TRUE((*table)->ScanPart(1, {2}, 8).status().IsInvalid());
+  EXPECT_TRUE((*table)->ScanPart(1, {0, 0}, 8).status().IsInvalid());
+  EXPECT_TRUE((*table)->ScanPart(1, {0}, 0).status().IsInvalid());
+}
+
+// A scan reads a file with the footer read at Open: a file rewritten since then is an I/O error
+// naming the file, for a part as for the whole table.
+TEST_F(ParquetScanTest, FileChangedAfterOpenIsIOErrorForParts) {
+  const std::string a = WriteNumbers("a.parquet", 0, 4, 2);
+  const std::string b = WriteNumbers("b.parquet", 4, 4, 2);
+  auto table = ParquetTable::Open({a, b});
+  ASSERT_TRUE(table.ok()) << table.status().ToString();
+  ASSERT_EQ((*table)->num_parts(), 4);
+  WriteNumbers("b.parquet", 100, 50, 10);
+  // Parts of a.parquet still read.
+  auto reader = (*table)->ScanPart(1, {0}, 8);
+  ASSERT_TRUE(reader.ok()) << reader.status().ToString();
+  std::shared_ptr<arrow::RecordBatch> batch;
+  ASSERT_TRUE((*reader)->ReadNext(&batch).ok());
+  ASSERT_NE(batch, nullptr);
+  EXPECT_EQ(batch->num_rows(), 2);
+  // Parts of b.parquet do not.
+  reader = (*table)->ScanPart(2, {0}, 8);
+  ASSERT_TRUE(reader.ok()) << reader.status().ToString();
+  const arrow::Status st = (*reader)->ReadNext(&batch);
+  EXPECT_TRUE(st.IsIOError()) << st.ToString();
+  EXPECT_NE(st.message().find("b.parquet"), std::string::npos) << st.ToString();
+  EXPECT_NE(st.message().find("changed"), std::string::npos) << st.ToString();
+}
+
+// A file rewritten with the same size but other values (and so other statistics in its footer)
+// is not decoded with the footer read at Open.
+TEST_F(ParquetScanTest, SameSizeRewriteIsIOError) {
+  const auto write_plain = [&](const std::string& name, int64_t first) {
+    const std::string path = (dir_ / name).string();
+    auto out = arrow::io::FileOutputStream::Open(path);
+    EXPECT_TRUE(out.ok()) << out.status().ToString();
+    const auto properties = parquet::WriterProperties::Builder()
+                                .disable_dictionary()
+                                ->compression(parquet::Compression::UNCOMPRESSED)
+                                ->build();
+    auto data = arrow::Table::Make(arrow::schema({arrow::field("a", arrow::int64())}),
+                                   {Build<arrow::Int64Builder, int64_t>(Sequence(first, 100))});
+    EXPECT_TRUE(
+        parquet::arrow::WriteTable(*data, arrow::default_memory_pool(), *out, 50, properties).ok());
+    EXPECT_TRUE((*out)->Close().ok());
+    return path;
+  };
+  const std::string path = write_plain("a.parquet", 0);
+  const std::string other = write_plain("other.parquet", 1000);
+  ASSERT_EQ(fs::file_size(path), fs::file_size(other));
+  auto table = ParquetTable::Open({path});
+  ASSERT_TRUE(table.ok()) << table.status().ToString();
+  fs::copy_file(other, path, fs::copy_options::overwrite_existing);
+  for (int64_t part = -1; part < (*table)->num_parts(); ++part) {
+    auto reader = part < 0 ? (*table)->Scan({0}, 8) : (*table)->ScanPart(part, {0}, 8);
+    ASSERT_TRUE(reader.ok()) << reader.status().ToString();
+    std::shared_ptr<arrow::RecordBatch> batch;
+    const arrow::Status st = (*reader)->ReadNext(&batch);
+    EXPECT_TRUE(st.IsIOError()) << part << ": " << st.ToString();
+    EXPECT_NE(st.message().find("footer differs"), std::string::npos) << st.ToString();
+    EXPECT_NE(st.message().find("a.parquet"), std::string::npos) << st.ToString();
+  }
 }
 
 }  // namespace
