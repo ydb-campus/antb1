@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790709342325,
+  "lastUpdate": 1790719307705,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -2196,6 +2196,78 @@ window.BENCHMARK_DATA = {
             "value": 14.57294004166639,
             "unit": "ms/iter",
             "extra": "iterations: 48\ncpu: 14.566668395833334 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "fb1d1545baf143b6dd108358b3cdaeadc8120d8d",
+          "message": "perf(io,exec): skip row groups by their statistics (#50)\n\n## Summary\n\nThis is the next ClickBench follow-up after #49: skipping Parquet row\ngroups using the min/max statistics in the footer. It is also groundwork\nfor TPC-H date-range filters.\n\n**The problem:** Q36-Q42 filter on columns the files are sorted by, so\nalmost every row group can be ruled out from its footer statistics.\nantb1 read every row group of the referenced columns anyway.\n\n**The change:**\n- **`plan::Table::part_stats(part, field)`** (new; defaults to\n\"unknown\"). It returns exact `min`/`max` over the non-NULL values plus\n`null_count` and `rows` for a part.\n- **`io::ParquetTable`** fills it from each row group's column-chunk\nstatistics:\n- only for integer-valued engine columns: SMALLINT, INTEGER, BIGINT,\nUSMALLINT, and DATE as day numbers, including the DATE override;\n- the field is mapped to its Parquet **leaf** index through the schema\nmanifest.\n  - **Never used for skipping:**\n- HUGEINT: fixed-length decimal statistics are unreliable across\nwriters.\n    - DOUBLE: NaN may be left out of min/max.\n    - VARCHAR: min/max may be truncated.\n    - Files without statistics.\n- **`exec/part_pruning`** (private) plus the physical planner:\n- **Which predicates are used:** those of the Filters directly on a part\npipeline's scan, with their columns mapped to table fields through\n`ScanNode::fields`.\n- **When a part is skipped:** only when some predicate is false for\n**every** row of it:\n    - `= < <= > >=` against `[min, max]`;\n    - `<>` when every non-NULL value equals the constant;\n    - `IN` with every value outside `[min, max]`;\n    - `FALSE`;\n    - comparisons, `IN` and `IS NOT NULL` over an all-NULL part.\n- **Never skips:** anything else, including column-vs-column\ncomparisons, `NOT IN`, `LIKE`, computed conditions and Filters above a\nCompute.\n  - **How the kept parts are used:**\n- Part union, aggregate, GROUP BY, top-N and `COUNT(DISTINCT)` pipelines\niterate the kept parts in part order.\n- A skipped part contributes exactly what a part with no selected rows\ndid before, so results stay byte-identical for every thread count.\n    - With no part kept, a query behaves as over an empty table.\n- **EXPLAIN and the logical plan are unchanged.** Docs: architecture.md\n(\"Skipping parts\") and ADR 0013 (plan item 6).\n\n## Performance: full ClickBench data, 128 threads, paired A/B\n\nFor each query, the #49 binary and this PR's binary each ran 3 tries\n(best taken), alternating which went first. There were no failed runs.\nTimes are in seconds.\n\n| Query | main (#49) | this PR | speedup |\n| --- | ---: | ---: | ---: |\n| Q19 | 0.030 | 0.022 | 1.37× |\n| Q36 | 0.757 | 0.195 | 3.88× |\n| Q37 | 0.614 | 0.100 | 6.17× |\n| Q38 | 0.662 | 0.101 | 6.58× |\n| Q39 | 1.363 | 0.440 | 3.10× |\n| Q40 | 0.235 | 0.036 | 6.51× |\n| Q41 | 0.218 | 0.032 | 6.74× |\n| Q42 | 0.186 | 0.040 | 4.69× |\n| **Total (43 queries)** | **48.4** | **45.2** | 1.07× |\n\nNo other query moved by more than the run-to-run noise (about 5%).\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [x] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full          # lint, ci, asan, tidy, coverage, fuzz-smoke, ci-gcc\ncheck-full exit 0; Coverage gate: PASS\n$ pixi run tsan\n100% tests passed out of 1336\n$ ANTB1_DIFF_COUNT=20000 pixi run diff-random\nDIFF: PASS seed=3315665945 queries=20000 failed=0 unsupported=0\n$ pixi run test-data\n100% tests passed out of 6\n```\n\n**New tests:**\n- **exec, `FiltersSkipPartsByTheirStatistics`:** a truth table over\nevery operator at and around the min/max edges, `IN`, `<>` and unknown\nstatistics. The expected kept parts are computed from the data.\n- **exec, `NullPartsAndFalseSkipEverything`:** all-NULL parts and\n`FALSE`.\n- **exec, `SkippingMapsScanColumnsToTableFields`:** scan fields in a\ndifferent order than the table fields; a Filter above a Compute does not\nskip.\n- **io, `PartStatisticsOfIntegerColumns`:**\n- integer columns and the DATE override from USMALLINT and INTEGER\n(including dates before 1970);\n  - all-NULL row groups;\n  - HUGEINT, DOUBLE and VARCHAR (none);\n  - a file written without statistics;\n  - out-of-range arguments.\n- **io, `NestedFieldsShiftLeafIndices` (extended):** the statistics come\nfrom the column's own leaf when a struct shifts its leaf index. The\nstruct itself has none.\n- **integration, `Scan.PartStatisticsMatchThePartsRows`:** for every\nfixture, part and field, the reported min, max and NULL count equal\nthose of the part's scanned rows. Other types report none.\n- **engine, `SkippedRowGroupsDoNotChangeAnswers`:** SQL answers on a\nsorted file with many row groups, on 1 and 4 threads. It covers\naggregates, `IN`, top-N, GROUP BY and `COUNT(DISTINCT)` over the kept\nparts only and over no part at all, NULL-only parts, and filters beside\ncomputed conditions.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer (none changed)\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code wrote the code,\ntests and docs, ran the gates and the benchmark, and ran a read-only\nreviewer agent on the diff. Its findings (HUGEINT statistics, the\nuntested leaf mapping, and skipped parts under GROUP BY and top-N) are\nfixed.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-09-30T00:59:24+03:00",
+          "tree_id": "f63ddd0f4c6c7941475924dee215c1662da972c3",
+          "url": "https://github.com/ydb-campus/antb1/commit/fb1d1545baf143b6dd108358b3cdaeadc8120d8d"
+        },
+        "date": 1790719307143,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4281.4928834055645,
+            "unit": "ns/iter",
+            "extra": "iterations: 166723\ncpu: 4281.175980518586 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84469.02076634389,
+            "unit": "ns/iter",
+            "extra": "iterations: 7464\ncpu: 84460.12138263667 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222144.01109702018,
+            "unit": "ns/iter",
+            "extra": "iterations: 3154\ncpu: 222091.95719720988 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 443243.13269841677,
+            "unit": "ns/iter",
+            "extra": "iterations: 1575\ncpu: 443175.04126984114 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 361104.0590979894,
+            "unit": "ns/iter",
+            "extra": "iterations: 1929\ncpu: 361035.76516329695 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2125493.7269938714,
+            "unit": "ns/iter",
+            "extra": "iterations: 326\ncpu: 2125291.2944785296 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 217.28938733333317,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 217.234822 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.849394680850843,
+            "unit": "ms/iter",
+            "extra": "iterations: 47\ncpu: 14.84818185106383 ms\nthreads: 1"
           }
         ]
       }
