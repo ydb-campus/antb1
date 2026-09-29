@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790696381092,
+  "lastUpdate": 1790709342325,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -2124,6 +2124,78 @@ window.BENCHMARK_DATA = {
             "value": 14.507500624999873,
             "unit": "ms/iter",
             "extra": "iterations: 48\ncpu: 14.503771187500014 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c57be667eff4b32dcfd651e30ea1088b950f4d1f",
+          "message": "perf(exec): parallel COUNT(DISTINCT) without GROUP BY (#49)\n\n## Summary\n\nThis is the first ClickBench follow-up after #47: parallel global\n`COUNT(DISTINCT)`.\n\n**The problem:** a global `COUNT(DISTINCT x)` aggregated each part in\nparallel, but merged every part's distinct-value grouper into one on the\nconsumer thread. For high-cardinality columns that merge was serial over\nnearly every value: Q4 took 2.25 s against DuckDB's 0.14 s.\n\n**The rewrite:** a global aggregation whose calls are all\n`COUNT(DISTINCT x)` of one column, over a part pipeline, is now planned\nas `COUNT(key0)` over a `GROUP BY x`. It is done in the physical\nplanner, so the logical plan and EXPLAIN are unchanged.\n- The `GROUP BY x` runs through the partitioned parallel merge of #46.\n- **Equivalence** (confirmed by review):\n- NULL is its own group, and `COUNT` skips it as `COUNT(DISTINCT)` skips\nNULL.\n- DOUBLE keys go through the same `NormalizeDoubleKey`, so -0.0 goes\nwith 0.0 and there is one NaN.\n  - Every key type uses the same Arrow grouper.\n  - An empty input gives one row with 0.\n  - The output schema, names and nullability are unchanged.\n\n**Not rewritten** (they keep today's per-part states):\n- Mixed aggregates and different columns.\n- Grouped `COUNT(DISTINCT)`. The same idea there (`GROUP BY k, x` then\n`GROUP BY k`) sped up Q8 2×, but made Q11 and Q13 1.7-2.8× slower: the\nouter grouping is serial over up to every row. Doing it well needs the\ninner table partitioned by `k` alone, which is a separate change.\n\n## Performance: full ClickBench data, 128 threads, paired A/B on a quiet\nhost\n\nFor each query, the #48 binary and this PR's binary each ran 3 tries\n(best taken), alternating which went first. The load average was 3 at\nthe start.\n\n| Query | main (#48) | this PR | speedup | DuckDB 1.5.5 |\n| --- | ---: | ---: | ---: | ---: |\n| Q4 | 2.25 | 0.44 | 5.13× | 0.14 |\n| Q5 | 1.69 | 0.58 | 2.91× | 0.23 |\n| **Total (43 queries)** | **51.3** | **48.1** | 1.07× | 12.9 |\n\nNo other query moved by more than 8%.\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [x] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full          # lint, ci, asan, tidy, coverage, fuzz-smoke, ci-gcc\ncheck-full exit 0; Coverage gate: PASS\n$ pixi run tsan\n100% tests passed out of 1330\n$ ANTB1_DIFF_COUNT=20000 pixi run diff-random\nDIFF: PASS seed=2329981181 queries=20000 failed=0 unsupported=0\n$ pixi run test-data\n100% tests passed out of 6\n```\n\n**New tests:**\n- **`PartOperatorsTest.CountDistinctAloneIsAParallelGroupBy`:** the\nrewrite equals the serial `ScalarAggregateOperator` with the\n`COUNT(DISTINCT)` state over one scan, byte for byte, on 1 thread and a\n4-thread pool. It covers:\n  - DOUBLE with -0.0, 0.0, both NaN signs and NULL;\n  - BIGINT with NULLs;\n  - VARCHAR;\n  - repeated calls;\n  - no rows.\n- **`PhysicalPlannerTest.CountDistinctAloneBecomesAGroupBy`:** the plan\nshape, which fails if the rewrite is removed. Mixed columns or\naggregates keep the per-part aggregate. It also checks the counts, with\nNULLs.\n- **Existing tests now on the rewritten path:** the slt/oracle\n`COUNT(DISTINCT)` cases, the diff runs and `MemoryLimitTest`'s\n`COUNT(DISTINCT)` plan.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer (none changed)\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code wrote the change\nand tests, and ran the verification and the paired A/B, which found the\ngrouped variant's regressions (dropped). The `reviewer` agent confirmed\nequivalence on every point above. It found that no test would notice the\nrewrite being removed (fixed: the plan-shape test).\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-09-29T22:13:10+03:00",
+          "tree_id": "cad419ee33cdd37383fd9174374c6310ee1fead6",
+          "url": "https://github.com/ydb-campus/antb1/commit/c57be667eff4b32dcfd651e30ea1088b950f4d1f"
+        },
+        "date": 1790709341707,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4074.264595862642,
+            "unit": "ns/iter",
+            "extra": "iterations: 172429\ncpu: 4072.6794390734744 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84117.23396464637,
+            "unit": "ns/iter",
+            "extra": "iterations: 7920\ncpu: 84060.97348484848 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222142.85379004225,
+            "unit": "ns/iter",
+            "extra": "iterations: 3153\ncpu: 222033.4256263875 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 443332.5535264458,
+            "unit": "ns/iter",
+            "extra": "iterations: 1588\ncpu: 443063.8753148616 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 402889.1644623272,
+            "unit": "ns/iter",
+            "extra": "iterations: 1739\ncpu: 402714.66705002857 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2135127.6073619323,
+            "unit": "ns/iter",
+            "extra": "iterations: 326\ncpu: 2134069.162576688 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 224.98784633333457,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 224.96815799999993 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.57294004166639,
+            "unit": "ms/iter",
+            "extra": "iterations: 48\ncpu: 14.566668395833334 ms\nthreads: 1"
           }
         ]
       }
