@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <variant>
@@ -19,7 +20,23 @@
 namespace antb1::plan {
 namespace {
 
+using testing::AllTypesSchema;
 using testing::FakeTable;
+
+// A table that does not split itself is one part: the whole table.
+TEST(TableTest, WholeTableIsOnePartByDefault) {
+  const FakeTable known(AllTypesSchema(), 100);
+  EXPECT_EQ(known.num_parts(), 1);
+  EXPECT_EQ(known.part_rows(0), 100);
+  EXPECT_EQ(known.part_rows(1), std::nullopt);
+  EXPECT_EQ(known.part_rows(-1), std::nullopt);
+  const FakeTable unknown(AllTypesSchema(), std::nullopt);
+  EXPECT_EQ(unknown.part_rows(0), std::nullopt);
+  // Part 0 is Scan (which a FakeTable refuses); any other part is out of range.
+  EXPECT_TRUE(known.ScanPart(0, {0}, 8).status().IsNotImplemented());
+  EXPECT_TRUE(known.ScanPart(1, {0}, 8).status().IsInvalid());
+  EXPECT_TRUE(known.ScanPart(-1, {0}, 8).status().IsInvalid());
+}
 
 TEST(LogicalPlanTest, OperatorAndAggregateNames) {
   EXPECT_EQ(ToString(CompareOp::kEq), "=");

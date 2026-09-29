@@ -8,6 +8,7 @@
 
 #include <arrow/record_batch.h>
 #include <arrow/result.h>
+#include <arrow/status.h>
 #include <arrow/type_fwd.h>
 
 namespace antb1::plan {
@@ -28,6 +29,27 @@ class Table {
   // batch_size rows and columns typed as in schema().
   virtual arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> Scan(
       const std::vector<int>& fields, int64_t batch_size) const = 0;
+
+  // The table split into parts, the units of parallel work (ADR 0013): scanning parts 0 ..
+  // num_parts() - 1 one after another gives the rows of Scan in the same order. A Parquet part is
+  // one row group of one file. A table without rows may have no parts. By default the whole
+  // table is one part.
+  virtual int64_t num_parts() const { return 1; }
+
+  // Rows of part `part` without scanning, if known; std::nullopt for a part out of range.
+  virtual std::optional<int64_t> part_rows(int64_t part) const {
+    return part == 0 ? exact_row_count() : std::nullopt;
+  }
+
+  // Scans the rows of part `part` as Scan does (same fields, batches and errors). Invalid for a
+  // part out of range.
+  virtual arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> ScanPart(
+      int64_t part, const std::vector<int>& fields, int64_t batch_size) const {
+    if (part != 0) {
+      return arrow::Status::Invalid("scan of part ", part, " of a table with 1 part");
+    }
+    return Scan(fields, batch_size);
+  }
 
   // Whether top-level field `field` (engine type DOUBLE) is stored as FLOAT and widened on read.
   // The binder compares such a column with a number the way DuckDB compares a FLOAT column

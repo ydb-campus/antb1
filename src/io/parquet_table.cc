@@ -9,6 +9,7 @@
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <span>
 #include <string>
 #include <utility>
@@ -33,22 +34,41 @@ namespace {
 
 struct FileInfo {
   std::shared_ptr<arrow::Schema> schema;
+  std::shared_ptr<parquet::FileMetaData> metadata;
+  std::shared_ptr<arrow::Buffer> footer;  // as stored (FooterBytes)
+  std::vector<int64_t> row_group_rows;
   int64_t num_rows = 0;
   int64_t bytes = 0;
 };
+
+// The footer as stored at the end of a Parquet file: the serialized FileMetaData (`metadata`,
+// already parsed), its 4-byte length and the magic. It holds the offsets and types of every column
+// chunk, so a scan compares it with the file to decode the file only with the footer it was
+// opened with.
+arrow::Result<std::shared_ptr<arrow::Buffer>> FooterBytes(arrow::io::RandomAccessFile& file,
+                                                          int64_t size,
+                                                          const parquet::FileMetaData& metadata) {
+  const int64_t bytes = int64_t{metadata.size()} + 8;
+  return file.ReadAt(size - bytes, bytes);
+}
 
 arrow::Result<FileInfo> ReadFooter(const std::string& path) {
   try {
     ARROW_ASSIGN_OR_RAISE(auto file, arrow::io::ReadableFile::Open(path));
     ARROW_ASSIGN_OR_RAISE(const int64_t size, file->GetSize());
     auto reader = parquet::ParquetFileReader::Open(file);
-    const std::shared_ptr<parquet::FileMetaData> metadata = reader->metadata();
     FileInfo info;
-    info.num_rows = metadata->num_rows();
+    info.metadata = reader->metadata();
+    info.num_rows = info.metadata->num_rows();
     info.bytes = size;
+    ARROW_ASSIGN_OR_RAISE(info.footer, FooterBytes(*file, size, *info.metadata));
+    info.row_group_rows.reserve(Narrow<std::size_t>(info.metadata->num_row_groups()));
+    for (int row_group = 0; row_group < info.metadata->num_row_groups(); ++row_group) {
+      info.row_group_rows.push_back(info.metadata->RowGroup(row_group)->num_rows());
+    }
     ARROW_RETURN_NOT_OK(parquet::arrow::FromParquetSchema(
-        metadata->schema(), parquet::default_arrow_reader_properties(),
-        metadata->key_value_metadata(), &info.schema));
+        info.metadata->schema(), parquet::default_arrow_reader_properties(),
+        info.metadata->key_value_metadata(), &info.schema));
     return info;
   } catch (const parquet::ParquetException& e) {
     return arrow::Status::IOError("cannot read Parquet file '", path, "': ", e.what());
@@ -232,19 +252,27 @@ void CollectLeaves(const parquet::arrow::SchemaField& field, std::vector<int>& l
   }
 }
 
-// Reads the projected fields of every file in order, one file at a time, as batches of the engine
-// view. Each file's reader is opened when the previous file is exhausted.
+// Row groups of one file that a scan reads, with the file's footer and size as read at Open.
+struct Segment {
+  std::string path;
+  std::shared_ptr<parquet::FileMetaData> metadata;
+  int64_t bytes = 0;
+  std::shared_ptr<arrow::Buffer> footer;  // FooterBytes
+  std::vector<int> row_groups;
+};
+
+// Reads the projected fields of every segment in order, one file at a time, as batches of the
+// engine view. Each segment's reader is opened when the previous segment is exhausted.
 class ScanReader final : public arrow::RecordBatchReader {
  public:
   struct Column {
     int field = 0;                              // top-level field index
-    std::shared_ptr<arrow::DataType> storage;   // as the files store it
     Conversion conversion = Conversion::kNone;  // to schema()->field(i)->type()
   };
 
-  ScanReader(std::vector<std::string> files, std::vector<Column> columns,
+  ScanReader(std::vector<Segment> segments, std::vector<Column> columns,
              std::shared_ptr<arrow::Schema> schema, int64_t batch_size)
-      : files_(std::move(files)),
+      : segments_(std::move(segments)),
         columns_(std::move(columns)),
         schema_(std::move(schema)),
         batch_size_(batch_size) {}
@@ -271,7 +299,7 @@ class ScanReader final : public arrow::RecordBatchReader {
 
   arrow::Status Close() override {
     CloseFile();
-    next_file_ = files_.size();
+    next_segment_ = segments_.size();
     return arrow::Status::OK();
   }
 
@@ -279,11 +307,11 @@ class ScanReader final : public arrow::RecordBatchReader {
   arrow::Status ReadNextBatch(std::shared_ptr<arrow::RecordBatch>* out) {
     while (true) {
       if (batch_reader_ == nullptr) {
-        if (next_file_ >= files_.size()) {
+        if (next_segment_ >= segments_.size()) {
           *out = nullptr;
           return arrow::Status::OK();
         }
-        ARROW_RETURN_NOT_OK(FileError(OpenFile(files_[next_file_++])));
+        ARROW_RETURN_NOT_OK(FileError(OpenFile(segments_[next_segment_++])));
       }
       std::shared_ptr<arrow::RecordBatch> batch;
       ARROW_RETURN_NOT_OK(FileError(batch_reader_->ReadNext(&batch)));
@@ -298,11 +326,24 @@ class ScanReader final : public arrow::RecordBatchReader {
     }
   }
 
-  arrow::Status OpenFile(const std::string& path) {
-    current_file_ = path;
-    ARROW_ASSIGN_OR_RAISE(auto input, arrow::io::ReadableFile::Open(path));
+  arrow::Status OpenFile(const Segment& segment) {
+    current_file_ = segment.path;
+    ARROW_ASSIGN_OR_RAISE(auto input, arrow::io::ReadableFile::Open(segment.path));
+    // The footer read at Open locates the column chunks and fixes their types: a file that has
+    // since been rewritten must not be decoded with it.
+    ARROW_ASSIGN_OR_RAISE(const int64_t size, input->GetSize());
+    if (size != segment.bytes) {
+      return arrow::Status::IOError("the file changed after it was opened (", size, " bytes, was ",
+                                    segment.bytes, ")");
+    }
+    ARROW_ASSIGN_OR_RAISE(const std::shared_ptr<arrow::Buffer> footer,
+                          input->ReadAt(size - segment.footer->size(), segment.footer->size()));
+    if (!footer->Equals(*segment.footer)) {
+      return arrow::Status::IOError("the file changed after it was opened (its footer differs)");
+    }
     parquet::arrow::FileReaderBuilder builder;
-    ARROW_RETURN_NOT_OK(builder.Open(input));
+    ARROW_RETURN_NOT_OK(
+        builder.Open(input, parquet::default_reader_properties(), segment.metadata));
     parquet::ArrowReaderProperties properties(/*use_threads=*/false);
     properties.set_batch_size(batch_size_);
     // No pre-buffering (on by default): its read cache keeps every column chunk it has read until
@@ -315,14 +356,10 @@ class ScanReader final : public arrow::RecordBatchReader {
     std::vector<int> leaves;  // named: a braced list would pick a deprecated overload
     for (const Column& column : columns_) {
       const auto field = Narrow<std::size_t>(column.field);
-      if (field >= top_level.size()) {
-        return arrow::Status::IOError("the file has no field ", column.field);
-      }
-      CollectLeaves(top_level[field], leaves);
+      CollectLeaves(top_level.at(field), leaves);  // the manifest of the footer read at Open
     }
-    std::vector<int> row_groups(Narrow<std::size_t>(file_reader_->num_row_groups()));
-    std::ranges::iota(row_groups, 0);
-    ARROW_ASSIGN_OR_RAISE(batch_reader_, file_reader_->GetRecordBatchReader(row_groups, leaves));
+    ARROW_ASSIGN_OR_RAISE(batch_reader_,
+                          file_reader_->GetRecordBatchReader(segment.row_groups, leaves));
     return arrow::Status::OK();
   }
 
@@ -342,20 +379,12 @@ class ScanReader final : public arrow::RecordBatchReader {
 
   arrow::Result<std::shared_ptr<arrow::RecordBatch>> ToEngine(
       const arrow::RecordBatch& batch) const {
-    if (Narrow<std::size_t>(batch.num_columns()) != columns_.size()) {
-      return FileError(arrow::Status::Invalid("expected ", columns_.size(), " columns, read ",
-                                              batch.num_columns()));
-    }
+    // The footer read at Open fixes the columns and their storage types.
     arrow::ArrayVector arrays;
     arrays.reserve(columns_.size());
     for (std::size_t i = 0; i < columns_.size(); ++i) {
       const Column& column = columns_[i];
       const std::shared_ptr<arrow::Array>& array = batch.column(Narrow<int>(i));
-      if (!array->type()->Equals(*column.storage)) {
-        return FileError(arrow::Status::Invalid(
-            "column ", column.field, " is ", array->type()->ToString(), ", expected ",
-            column.storage->ToString(), " (the file changed after it was opened)"));
-      }
       ARROW_ASSIGN_OR_RAISE(
           auto converted, Convert(array, column.conversion, schema_->field(Narrow<int>(i))->type(),
                                   arrow::default_memory_pool()));
@@ -364,16 +393,46 @@ class ScanReader final : public arrow::RecordBatchReader {
     return arrow::RecordBatch::Make(schema_, batch.num_rows(), std::move(arrays));
   }
 
-  std::vector<std::string> files_;
+  std::vector<Segment> segments_;
   std::vector<Column> columns_;
   std::shared_ptr<arrow::Schema> schema_;
   int64_t batch_size_;
-  std::size_t next_file_ = 0;
+  std::size_t next_segment_ = 0;
   std::string current_file_;
   // A FileReader must outlive the RecordBatchReader it creates: declared first, destroyed last.
   std::unique_ptr<parquet::arrow::FileReader> file_reader_;
   std::unique_ptr<arrow::RecordBatchReader> batch_reader_;
 };
+
+// A reader of the segments' rows for Scan and ScanPart: validates the request and projects the
+// fields from the storage schema onto the engine view.
+arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> MakeScan(
+    std::vector<Segment> segments, const arrow::Schema& storage_schema, const arrow::Schema& schema,
+    const std::vector<int>& fields, int64_t batch_size) {
+  if (batch_size < 1) {
+    return arrow::Status::Invalid("the scan batch size must be positive, not ", batch_size);
+  }
+  std::vector<ScanReader::Column> columns;
+  arrow::FieldVector engine_fields;
+  std::vector<bool> seen(Narrow<std::size_t>(schema.num_fields()), false);
+  for (const int field : fields) {
+    if (field < 0 || field >= schema.num_fields()) {
+      return arrow::Status::Invalid("scan of field ", field, " of a table with ",
+                                    schema.num_fields(), " fields");
+    }
+    if (seen[Narrow<std::size_t>(field)]) {
+      return arrow::Status::Invalid("field ", field, " is scanned twice");
+    }
+    seen[Narrow<std::size_t>(field)] = true;
+    const auto& storage = storage_schema.field(field)->type();
+    const auto& engine = schema.field(field);
+    ARROW_ASSIGN_OR_RAISE(const Conversion conversion, ConversionFor(*storage, *engine->type()));
+    columns.push_back(ScanReader::Column{.field = field, .conversion = conversion});
+    engine_fields.push_back(engine);
+  }
+  return std::make_unique<ScanReader>(std::move(segments), std::move(columns),
+                                      arrow::schema(std::move(engine_fields)), batch_size);
+}
 
 }  // namespace
 
@@ -395,6 +454,17 @@ arrow::Result<std::shared_ptr<ParquetTable>> ParquetTable::Open(
       return arrow::Status::IOError("schema of '", file, "' differs from '", table->files_.front(),
                                     "'");
     }
+    const std::size_t index = table->metadata_.size();
+    for (std::size_t row_group = 0; row_group < info.row_group_rows.size(); ++row_group) {
+      const int64_t rows = info.row_group_rows[row_group];
+      if (rows > 0) {
+        table->parts_.push_back(
+            Part{.file = index, .row_group = Narrow<int>(row_group), .rows = rows});
+      }
+    }
+    table->metadata_.push_back(std::move(info.metadata));
+    table->file_bytes_.push_back(info.bytes);
+    table->footers_.push_back(std::move(info.footer));
     table->num_rows_ += info.num_rows;
     table->total_bytes_ += info.bytes;
   }
@@ -411,30 +481,43 @@ arrow::Result<std::shared_ptr<ParquetTable>> ParquetTable::Open(
 
 arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> ParquetTable::Scan(
     const std::vector<int>& fields, int64_t batch_size) const {
-  if (batch_size < 1) {
-    return arrow::Status::Invalid("the scan batch size must be positive, not ", batch_size);
+  std::vector<Segment> segments;
+  segments.reserve(files_.size());
+  for (std::size_t file = 0; file < files_.size(); ++file) {
+    std::vector<int> row_groups(Narrow<std::size_t>(metadata_[file]->num_row_groups()));
+    std::ranges::iota(row_groups, 0);
+    segments.push_back(Segment{.path = files_[file],
+                               .metadata = metadata_[file],
+                               .bytes = file_bytes_[file],
+                               .footer = footers_[file],
+                               .row_groups = std::move(row_groups)});
   }
-  std::vector<ScanReader::Column> columns;
-  arrow::FieldVector engine_fields;
-  std::vector<bool> seen(Narrow<std::size_t>(schema_->num_fields()), false);
-  for (const int field : fields) {
-    if (field < 0 || field >= schema_->num_fields()) {
-      return arrow::Status::Invalid("scan of field ", field, " of a table with ",
-                                    schema_->num_fields(), " fields");
-    }
-    if (seen[Narrow<std::size_t>(field)]) {
-      return arrow::Status::Invalid("field ", field, " is scanned twice");
-    }
-    seen[Narrow<std::size_t>(field)] = true;
-    const auto& storage = storage_schema_->field(field)->type();
-    const auto& engine = schema_->field(field);
-    ARROW_ASSIGN_OR_RAISE(const Conversion conversion, ConversionFor(*storage, *engine->type()));
-    columns.push_back(
-        ScanReader::Column{.field = field, .storage = storage, .conversion = conversion});
-    engine_fields.push_back(engine);
+  return MakeScan(std::move(segments), *storage_schema_, *schema_, fields, batch_size);
+}
+
+int64_t ParquetTable::num_parts() const { return Narrow<int64_t>(parts_.size()); }
+
+std::optional<int64_t> ParquetTable::part_rows(int64_t part) const {
+  if (part < 0 || part >= num_parts()) {
+    return std::nullopt;
   }
-  return std::make_unique<ScanReader>(files_, std::move(columns),
-                                      arrow::schema(std::move(engine_fields)), batch_size);
+  return parts_[Narrow<std::size_t>(part)].rows;
+}
+
+arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> ParquetTable::ScanPart(
+    int64_t part, const std::vector<int>& fields, int64_t batch_size) const {
+  if (part < 0 || part >= num_parts()) {
+    return arrow::Status::Invalid("scan of part ", part, " of a table with ", num_parts(),
+                                  " parts");
+  }
+  const Part& p = parts_[Narrow<std::size_t>(part)];
+  std::vector<Segment> segments;
+  segments.push_back(Segment{.path = files_[p.file],
+                             .metadata = metadata_[p.file],
+                             .bytes = file_bytes_[p.file],
+                             .footer = footers_[p.file],
+                             .row_groups = std::vector<int>{p.row_group}});
+  return MakeScan(std::move(segments), *storage_schema_, *schema_, fields, batch_size);
 }
 
 bool ParquetTable::StoredAsFloat(int field) const {

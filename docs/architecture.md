@@ -38,7 +38,11 @@ Responsibilities:
   at a time, single-threaded, mapping each field to its Parquet leaf columns, without pre-buffering, so it holds
   about one row group of the scanned columns rather than every chunk read so far) and converts the batches to the
   engine view: UTF8 and large strings to binary without UTF-8 validation, FLOAT to DOUBLE, a USMALLINT or INTEGER
-  column read as DATE to date32. Every Parquet exception and read failure becomes an `IOError` here.
+  column read as DATE to date32. Every Parquet exception and read failure becomes an `IOError` here. The footers
+  read at `Open` are kept and reused by every scan; a file whose size or footer bytes changed since is an
+  `IOError`. The table's parts (`plan::Table::num_parts`, `part_rows`, `ScanPart`), the units of parallel work of
+  [ADR 0013](adr/0013-parallel-execution.md), are its row groups with rows in file order; scanning them one after
+  another gives the rows of `Scan`. Other tables are one part by default.
 - `exec`: pull-based, batch-at-a-time physical operators (`TableScan`, `Filter`, `Compute`, `Project`, `ScalarAggregate`,
   `GroupAggregate`, `Sort`, `Limit`, `RowCount`; see [Execution](#execution)), the exact aggregate states (scalar
   and grouped), the row comparator and sort buffer, the physical planner and `Drain`. It scans only through

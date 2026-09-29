@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -11,6 +12,10 @@
 
 #include "antb1/plan/table.h"
 #include "antb1/plan/types.h"
+
+namespace parquet {
+class FileMetaData;
+}  // namespace parquet
 
 namespace antb1::io {
 
@@ -38,14 +43,22 @@ class ParquetTable final : public plan::Table {
   const std::shared_ptr<arrow::Schema>& schema() const override { return schema_; }
   std::optional<int64_t> exact_row_count() const override { return num_rows_; }
   // Reads the files in order, one at a time and single-threaded (a parquet::arrow::FileReader per
-  // file, every row group; a top-level field maps to its Parquet leaf columns through the file's
-  // schema manifest). Batches have 1..batch_size rows and the engine view of the requested fields
-  // in the requested order: utf8 and large strings become binary without UTF-8 validation, float
-  // becomes double, and a USMALLINT or INTEGER column read as DATE becomes date32. With no fields
-  // the batches only carry row counts. Invalid for a bad or repeated field or batch_size < 1;
-  // IOError when a file cannot be read or no longer matches the schema read at Open.
+  // file over the footer read at Open, every row group; a top-level field maps to its Parquet leaf
+  // columns through the file's schema manifest). Batches have 1..batch_size rows and the engine
+  // view of the requested fields in the requested order: utf8 and large strings become binary
+  // without UTF-8 validation, float becomes double, and a USMALLINT or INTEGER column read as DATE
+  // becomes date32. With no fields the batches only carry row counts. Invalid for a bad or repeated
+  // field or batch_size < 1; IOError when a file cannot be read or changed after Open (its size
+  // differs).
   arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> Scan(const std::vector<int>& fields,
                                                                 int64_t batch_size) const override;
+  // One part per row group with rows, in file and row-group order.
+  int64_t num_parts() const override;
+  // The rows of the part's row group, from the footer.
+  std::optional<int64_t> part_rows(int64_t part) const override;
+  // Reads the part's row group as Scan reads a file.
+  arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> ScanPart(
+      int64_t part, const std::vector<int>& fields, int64_t batch_size) const override;
   std::string Describe() const override;
   // A float column of the files (widened to double on read).
   bool StoredAsFloat(int field) const override;
@@ -56,9 +69,23 @@ class ParquetTable final : public plan::Table {
   [[nodiscard]] int64_t total_bytes() const { return total_bytes_; }
 
  private:
+  // One row group of one file.
+  struct Part {
+    std::size_t file = 0;  // index into files_
+    int row_group = 0;
+    int64_t rows = 0;
+  };
+
   ParquetTable() = default;
 
+  // The footers read at Open are reused by every scan, so a scan never parses a footer and always
+  // reads the row groups and types counted at Open; it checks that the file still ends with the
+  // same footer bytes.
   std::vector<std::string> files_;
+  std::vector<std::shared_ptr<parquet::FileMetaData>> metadata_;  // per file
+  std::vector<int64_t> file_bytes_;                               // per file
+  std::vector<std::shared_ptr<arrow::Buffer>> footers_;           // per file, as stored
+  std::vector<Part> parts_;
   std::shared_ptr<arrow::Schema> storage_schema_;  // as read from the first file
   std::shared_ptr<arrow::Schema> schema_;          // engine view
   int64_t num_rows_ = 0;
