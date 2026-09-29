@@ -2,22 +2,16 @@
 
 #include <cstdint>
 #include <memory>
-#include <span>
 #include <vector>
 
 #include <arrow/type_fwd.h>
 
-#include "antb1/exec/grouped_aggregate_state.h"
-#include "antb1/exec/memory_budget.h"
 #include "antb1/exec/operator.h"
 #include "antb1/plan/logical_plan.h"
 
-namespace arrow::compute {
-class ExecContext;
-class Grouper;
-}  // namespace arrow::compute
-
 namespace antb1::exec {
+
+class GroupTable;  // src/exec/group_table.h
 
 // Grouped aggregation (GROUP BY). Materializes the selected rows of each input batch, maps their
 // keys to group ids with arrow::compute::Grouper (NULL is a key value; DOUBLE keys are normalized
@@ -47,29 +41,14 @@ class GroupAggregateOperator final : public Operator {
   arrow::Status Close() override;
 
  private:
-  arrow::Status Consume(const arrow::RecordBatch& rows);
-  arrow::Status ConsumeAggregates(const arrow::RecordBatch& rows,
-                                  std::span<const std::uint32_t> group_ids);
-  // Charges the states' own containers to the budget.
-  arrow::Status Account();
-
   std::unique_ptr<Operator> input_;
   std::vector<plan::BoundColumn> keys_;
   std::vector<plan::AggregateCall> aggregates_;
   std::shared_ptr<arrow::Schema> schema_;
   arrow::MemoryPool* pool_ = nullptr;
-  std::unique_ptr<arrow::compute::ExecContext> kernels_;
-  std::unique_ptr<arrow::compute::Grouper> grouper_;
-  std::vector<std::unique_ptr<GroupedAggregateState>> states_;
-  std::vector<std::vector<std::shared_ptr<arrow::Array>>> first_keys_;  // per key, group order
-  std::uint32_t num_groups_ = 0;
-  std::vector<std::uint32_t> chunk_groups_;  // the number of new groups of each chunk
+  std::unique_ptr<GroupTable> table_;  // from Open to the end of the output
   bool opened_ = false;
   bool done_ = false;
-  // After the input: the next chunk of first_keys_ to emit and the group it starts at.
-  std::size_t next_chunk_ = 0;
-  std::uint32_t next_group_ = 0;
-  MemoryReservation memory_;  // the states' and chunk_groups_' containers
 };
 
 }  // namespace antb1::exec

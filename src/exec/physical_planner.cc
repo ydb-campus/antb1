@@ -115,6 +115,17 @@ struct Builder {
     return std::make_unique<ScalarAggregateOperator>(std::move(input), node.aggregates);
   }
   OperatorResult operator()(const plan::GroupAggregateNode& node) const {
+    if (const plan::ScanNode* scan = PipelineScan(node.input)) {
+      // Grouped per part, the parts' groups merged in part order.
+      PartPipeline pipeline = PipelineOf(node.input);
+      ARROW_ASSIGN_OR_RAISE(auto sample, pipeline(0));
+      const int width = sample->output_schema()->num_fields();
+      // The output schema, as the serial operator names it.
+      const GroupAggregateOperator serial(std::move(sample), node.keys, node.aggregates);
+      return std::make_unique<PartGroupAggregateOperator>(
+          std::move(pipeline), scan->table->num_parts(), width, node.keys, node.aggregates,
+          serial.output_schema());
+    }
     ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input));
     return std::make_unique<GroupAggregateOperator>(std::move(input), node.keys, node.aggregates);
   }

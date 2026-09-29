@@ -188,4 +188,74 @@ arrow::Status PartAggregateOperator::Close() {
   return arrow::Status::OK();
 }
 
+// ---- PartGroupAggregateOperator ----
+
+PartGroupAggregateOperator::PartGroupAggregateOperator(PartPipeline pipeline, int64_t num_parts,
+                                                       int input_width,
+                                                       std::vector<plan::BoundColumn> keys,
+                                                       std::vector<plan::AggregateCall> aggregates,
+                                                       std::shared_ptr<arrow::Schema> schema)
+    : pipeline_(std::make_shared<const PartPipeline>(std::move(pipeline))),
+      num_parts_(num_parts),
+      input_width_(input_width),
+      keys_(std::move(keys)),
+      aggregates_(std::move(aggregates)),
+      schema_(std::move(schema)) {}
+
+PartGroupAggregateOperator::~PartGroupAggregateOperator() = default;
+
+arrow::Status PartGroupAggregateOperator::Open(ExecContext& ctx) {
+  ARROW_RETURN_NOT_OK(Close());
+  pool_ = ctx.pool;
+  budget_ = ctx.budget;
+  merged_ = false;
+  ARROW_ASSIGN_OR_RAISE(table_, GroupTable::Make(keys_, aggregates_, input_width_, pool_, budget_));
+  auto task = [pipeline = pipeline_, part_ctx = PartContext(ctx), keys = keys_,
+               aggregates = aggregates_, width = input_width_](
+                  int64_t part, const std::atomic<bool>& stop) -> arrow::Result<PartTable> {
+    ARROW_ASSIGN_OR_RAISE(
+        std::shared_ptr<GroupTable> table,
+        GroupTable::Make(keys, aggregates, width, part_ctx.pool, part_ctx.budget));
+    ARROW_RETURN_NOT_OK(
+        RunPart(*pipeline, part, part_ctx, stop, [&](const Batch& batch) -> arrow::Result<bool> {
+          ARROW_ASSIGN_OR_RAISE(const auto rows, Materialize(batch, part_ctx.pool));
+          ARROW_RETURN_NOT_OK(table->Consume(*rows));
+          return true;
+        }));
+    return table;
+  };
+  scheduler_ = std::make_unique<PartScheduler<PartTable>>(num_parts_, std::move(task), ctx.executor,
+                                                          Window(ctx), ctx.budget);
+  return arrow::Status::OK();
+}
+
+arrow::Result<Batch> PartGroupAggregateOperator::Next() {
+  if (table_ == nullptr) {
+    if (merged_) {
+      return Batch{};
+    }
+    return arrow::Status::Invalid("part group aggregate: Next() before Open()");
+  }
+  if (!merged_) {
+    while (!scheduler_->done()) {
+      ARROW_ASSIGN_OR_RAISE(const PartTable part, scheduler_->Next());
+      ARROW_RETURN_NOT_OK(table_->Merge(*part));
+    }
+    merged_ = true;
+    scheduler_.reset();
+  }
+  ARROW_ASSIGN_OR_RAISE(auto chunk, table_->NextChunk(schema_));
+  if (chunk == nullptr) {
+    table_.reset();  // gives the memory back
+    return Batch{};
+  }
+  return Batch{.data = std::move(chunk), .selection = {}};
+}
+
+arrow::Status PartGroupAggregateOperator::Close() {
+  scheduler_.reset();
+  table_.reset();
+  return arrow::Status::OK();
+}
+
 }  // namespace antb1::exec

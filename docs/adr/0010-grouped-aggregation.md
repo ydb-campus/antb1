@@ -33,9 +33,11 @@ Accepted (with the maintainer-approved plan for GROUP BY, ORDER BY and COUNT(DIS
 - **Mergeable states.** `GroupedAggregateState::Merge(other, group_map)` folds another state's groups into this one
   through a group map. Partial states over parts of the input merged in input order give the single-pass result
   (DOUBLE sums up to the rounding of adding partial sums, which is still the same for the same part boundaries).
-  Parallel execution can therefore aggregate row groups independently and merge, without new states.
+  Parallel execution can therefore aggregate row groups independently and merge, without new states. (Done by
+  `PartGroupAggregateOperator` since ADR 0013's GROUP BY step: the merged groups follow the parts' groups in part
+  order.)
 - **In memory, no spilling.** All groups and their accumulators stay in memory; a query with more groups than memory
-  fails. Spilling is left for later, when a workload needs it.
+  fails (with a `memory` error under `--memory-limit`). Spilling is left for later, when a workload needs it.
 
 ## Consequences
 
