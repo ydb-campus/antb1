@@ -133,6 +133,43 @@ TEST(CompareOrdered, TiesComeInAnyOrder) {
   }
 }
 
+// Tied rows whose R values differ by less than the tolerance but are not equal: every antb1 row
+// must find its own oracle row. A greedy first-fit match within the tolerance let the first antb1
+// row take a neighbouring oracle value, and a later row then had none left: a false mismatch (the
+// ClickBench-shaped LocalEventTime / 4 steps by 0.25, about the tolerance at 3.4e8). Exact matches
+// come first now; a foreign value still fails.
+TEST(CompareOrdered, CloseValuesFindTheirOwnRows) {
+  Oracle oracle(
+      {kR, kI},
+      {{"1000000000", "1"}, {"1000000000.75", "1"}, {"1000000001.5", "1"}, {"1000000002.25", "1"}});
+  const auto query = Query(std::nullopt, 0);
+  const auto answer = oracle.Answer(1, 0, std::nullopt);
+  // Not equal position by position (1000000001.5 against 1000000000), a right order of the ties.
+  EXPECT_FALSE(CompareOrdered(
+      answer,
+      Result({kR}, {{"1000000000.75"}, {"1000000001.5"}, {"1000000000"}, {"1000000002.25"}}), query,
+      std::ref(oracle)));
+  // Within the tolerance of its own row (rounding), still right.
+  EXPECT_FALSE(CompareOrdered(
+      answer,
+      Result({kR}, {{"1000000000.7500001"}, {"1000000001.5"}, {"1000000000"}, {"1000000002.25"}}),
+      query, std::ref(oracle)));
+  // No row equal to its oracle row at all (each rounded), in a right order of the ties: the rows
+  // left for the tolerance are matched by value (each to the smallest oracle value within its
+  // tolerance, both in ascending order), not first fit.
+  EXPECT_FALSE(CompareOrdered(answer,
+                              Result({kR}, {{"1000000000.7500001"},
+                                            {"1000000001.5000001"},
+                                            {"1000000000.0000001"},
+                                            {"1000000002.2500001"}}),
+                              query, std::ref(oracle)));
+  const auto d = CompareOrdered(
+      answer, Result({kR}, {{"1000000000.75"}, {"1000000001.5"}, {"1000000000"}, {"1000000009"}}),
+      query, std::ref(oracle));
+  ASSERT_TRUE(d.has_value());
+  EXPECT_TRUE(d.value_or(Discrepancy{}).mismatch);
+}
+
 TEST(CompareOrdered, AnyTiedRowsAtTheWindowEdges) {
   Oracle oracle = Ranked();
   // LIMIT 2 OFFSET 2: ranks 2 and 3 hold key 2, whose run spans ranks 1 to 3.
