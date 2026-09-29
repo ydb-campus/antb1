@@ -123,6 +123,16 @@ when it is reached: the same code, so a result does not depend on the thread cou
 order decides the error. Parts after the point where the consumer stops (a met `LIMIT`) are never started or are
 stopped at their next batch, and their errors are dropped.
 
+**Skipping parts.** The physical planner reads only the parts a pipeline's WHERE can match: for each part it asks
+`plan::Table::part_stats` (for Parquet, the row group's column chunk statistics from the footer: exact min, max and
+NULL count of integer-valued columns, including a DATE read from day numbers, but not HUGEINT, whose decimal
+statistics some writers got wrong) and drops the part when a predicate of
+a `Filter` directly on the scan is false for every row there (`exec::KeptParts`, `src/exec/part_pruning.h`):
+`= < <= > >=` against the min/max, `<>` when every value is the constant, `IN` with every value outside, any
+comparison, `IN` or `IS NOT NULL` on an all-NULL column, and a folded `FALSE`. Unknown statistics (DOUBLE, whose
+min/max may leave NaN out; VARCHAR, whose min/max may be truncated; TIMESTAMP; a file without statistics) never
+skip, so a skipped part never holds a matching row and results do not change.
+
 **Memory.** The `Session` owns an `exec::MemoryBudget` (`--memory-limit`, `engine::SessionOptions::memory_limit`):
 an Arrow memory pool that is `ExecContext::pool` for every query, and that the Parquet reader decodes into
 (`plan::Table::Scan` and `ScanPart` take the pool). It counts every buffer and, through `Reserve`, the containers

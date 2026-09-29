@@ -12,7 +12,18 @@
 #include <arrow/status.h>
 #include <arrow/type_fwd.h>
 
+#include "antb1/common/int128.h"
+
 namespace antb1::plan {
+
+// What a part's footer says about one integer-valued column (integers, USMALLINT, DATE as days
+// since 1970-01-01), for skipping parts that cannot hold a matching row.
+struct PartStats {
+  std::optional<Int128> min;  // over the non-NULL values; empty when every value is NULL
+  std::optional<Int128> max;
+  int64_t null_count = 0;
+  int64_t rows = 0;
+};
 
 // A scannable table as seen by the planner and executor. Implemented by io::ParquetTable (and by
 // in-memory tables in tests). exec never includes io: it scans through this interface.
@@ -52,6 +63,14 @@ class Table {
       int64_t part, const std::vector<int>& fields, int64_t batch_size,
       arrow::MemoryPool* pool = arrow::default_memory_pool()) const {
     return DoScanPart(part, fields, batch_size, pool);
+  }
+
+  // The exact statistics of top-level field `field` in part `part`, if known and integer-valued;
+  // std::nullopt (never skip) by default and for anything not known exactly.
+  virtual std::optional<PartStats> part_stats(int64_t part, int field) const {
+    static_cast<void>(part);
+    static_cast<void>(field);
+    return std::nullopt;
   }
 
   // Whether top-level field `field` (engine type DOUBLE) is stored as FLOAT and widened on read.

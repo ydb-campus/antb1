@@ -905,5 +905,173 @@ TEST_F(PartOperatorsTest, CountDistinctAloneIsAParallelGroupBy) {
   }
 }
 
+// ---- skipping parts by their statistics ----
+
+// A Filter on the scan skips the parts whose statistics rule every row out: with exact statistics
+// of a sorted, contiguous column (x = 0..139 in parts of 7), exactly the parts holding a matching
+// row are read. The results equal a read of every part (statistics off), on any number of
+// threads.
+TEST_F(PartOperatorsTest, FiltersSkipPartsByTheirStatistics) {
+  const auto pool = Pool();
+  const auto x = Column(0, "x", LogicalType::kBigInt);
+  const auto matches = [](const plan::Predicate& predicate, int64_t v) {
+    const auto c = static_cast<int64_t>(std::get<Int128>(predicate.constant.value));
+    if (predicate.kind == plan::Predicate::Kind::kIn) {
+      return std::ranges::any_of(predicate.values, [&](const plan::Constant& value) {
+        return static_cast<int64_t>(std::get<Int128>(value.value)) == v;
+      });
+    }
+    switch (predicate.op) {
+      case plan::CompareOp::kEq:
+        return v == c;
+      case plan::CompareOp::kNe:
+        return v != c;
+      case plan::CompareOp::kLt:
+        return v < c;
+      case plan::CompareOp::kLe:
+        return v <= c;
+      case plan::CompareOp::kGt:
+        return v > c;
+      case plan::CompareOp::kGe:
+        return v >= c;
+    }
+    return false;
+  };
+  std::vector<plan::Predicate> predicates;
+  for (const plan::CompareOp op :
+       {plan::CompareOp::kEq, plan::CompareOp::kNe, plan::CompareOp::kLt, plan::CompareOp::kLe,
+        plan::CompareOp::kGt, plan::CompareOp::kGe}) {
+    for (const int64_t c : {-1, 0, 6, 7, 69, 139, 140}) {
+      predicates.push_back(testing::Compare(x, op, BigInt(c)));
+    }
+  }
+  plan::Predicate in{.kind = plan::Predicate::Kind::kIn, .column = x};
+  in.values = {BigInt(3), BigInt(50), BigInt(500)};
+  predicates.push_back(in);
+  plan::Predicate outside{.kind = plan::Predicate::Kind::kIn, .column = x};
+  outside.values = {BigInt(-5), BigInt(1000)};
+  predicates.push_back(outside);
+  for (const plan::Predicate& predicate : predicates) {
+    const auto plan_over = [&](const std::shared_ptr<MemoryTable>& table) {
+      const auto filter = Node(plan::FilterNode{.input = Scan(table), .predicates = {predicate}});
+      return PlanOf(Node(plan::ProjectNode{.input = filter, .columns = {x}}), 1);
+    };
+    std::vector<int64_t> expected;
+    for (int64_t part = 0; part < kParts; ++part) {
+      for (int64_t v = part * kRows; v < (part + 1) * kRows; ++v) {
+        if (matches(predicate, v)) {
+          expected.push_back(part);
+          break;
+        }
+      }
+    }
+    const auto unpruned_table = Table();
+    unpruned_table->set_stats(false);
+    const auto unpruned = Run(plan_over(unpruned_table), nullptr);
+    ASSERT_TRUE(unpruned.ok());
+    EXPECT_EQ(unpruned_table->scanned_parts().size(), static_cast<std::size_t>(kParts));
+    for (arrow::internal::Executor* executor :
+         {static_cast<arrow::internal::Executor*>(nullptr),
+          static_cast<arrow::internal::Executor*>(pool.get())}) {
+      const auto table = Table();
+      const auto result = Run(plan_over(table), executor);
+      ASSERT_TRUE(result.ok()) << result.status().ToString();
+      EXPECT_TRUE(SameRows(**result, **unpruned));
+      EXPECT_EQ(table->scanned_parts(), expected) << "op " << static_cast<int>(predicate.op)
+                                                  << " kind " << static_cast<int>(predicate.kind);
+    }
+  }
+}
+
+// Parts where the column is NULL on every row match no comparison, IN or IS NOT NULL; a folded
+// FALSE matches no part (a global aggregate over no part still gives its one row).
+TEST_F(PartOperatorsTest, NullPartsAndFalseSkipEverything) {
+  const auto schema = arrow::schema({arrow::field("z", arrow::int64())});
+  arrow::RecordBatchVector batches = {
+      arrow::RecordBatch::Make(schema, 3, {Int64s({1, 2, 3})}),
+      arrow::RecordBatch::Make(schema, 3, {Int64s({std::nullopt, std::nullopt, std::nullopt})}),
+      arrow::RecordBatch::Make(schema, 2, {Int64s({5, std::nullopt})})};
+  const auto z = Column(0, "z", LogicalType::kBigInt);
+  const auto count = [&](const std::shared_ptr<MemoryTable>& table,
+                         std::vector<plan::Predicate> predicates) {
+    const auto scan = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0}});
+    const auto filter = Node(plan::FilterNode{.input = scan, .predicates = std::move(predicates)});
+    return Run(PlanOf(Node(plan::AggregateNode{.input = filter,
+                                               .aggregates = {{.kind = plan::AggKind::kCountStar,
+                                                               .arg = {},
+                                                               .type = LogicalType::kBigInt}}}),
+                      1),
+               nullptr);
+  };
+  plan::Predicate not_null{.kind = plan::Predicate::Kind::kIsNotNull, .column = z};
+  for (const auto& [predicates, rows, parts] :
+       std::vector<std::tuple<std::vector<plan::Predicate>, int64_t, std::vector<int64_t>>>{
+           {{testing::Compare(z, plan::CompareOp::kGe, BigInt(0))}, 4, {0, 2}},
+           {{not_null}, 4, {0, 2}},
+           {{testing::Compare(z, plan::CompareOp::kEq, BigInt(5))}, 1, {2}},
+           {{plan::Predicate{.kind = plan::Predicate::Kind::kFalse}}, 0, {}}}) {
+    const auto table = std::make_shared<MemoryTable>(schema, batches, /*split=*/true);
+    const auto result = count(table, predicates);
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    EXPECT_EQ(Int64Column(**result), (std::vector<std::optional<int64_t>>{rows}));
+    EXPECT_EQ(table->scanned_parts(), parts);
+  }
+}
+
+// A predicate's column is a column of the scan's output, mapped to its table field through the
+// scan's fields: with the scan reading fields {2, 0} (y, x), a filter on column 1 (x) skips by x's
+// statistics, and a filter on column 0 (y) by y's. A Filter above a Compute is not used.
+TEST_F(PartOperatorsTest, SkippingMapsScanColumnsToTableFields) {
+  const auto count = [&](const std::shared_ptr<MemoryTable>& table,
+                         const plan::LogicalNodePtr& filtered) {
+    auto result =
+        Run(PlanOf(Node(plan::AggregateNode{.input = filtered,
+                                            .aggregates = {{.kind = plan::AggKind::kCountStar,
+                                                            .arg = {},
+                                                            .type = LogicalType::kBigInt}}}),
+                   1),
+            nullptr);
+    EXPECT_TRUE(result.ok()) << result.status().ToString();
+    return std::pair(Int64Column(**result).at(0).value_or(-1), table->scanned_parts());
+  };
+  const auto scan_of = [&](const std::shared_ptr<MemoryTable>& table) {
+    return Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {2, 0}});
+  };
+  {
+    const auto table = Table();  // x in part p is 7p .. 7p + 6
+    const auto filter =
+        Node(plan::FilterNode{.input = scan_of(table),
+                              .predicates = {testing::Compare(Column(1, "x", LogicalType::kBigInt),
+                                                              plan::CompareOp::kLt, BigInt(14))}});
+    const auto [rows, parts] = count(table, filter);
+    EXPECT_EQ(rows, 14);
+    EXPECT_EQ(parts, (std::vector<int64_t>{0, 1}));
+  }
+  {
+    const auto table = Table();  // y = x, NULL every fifth row
+    const auto filter =
+        Node(plan::FilterNode{.input = scan_of(table),
+                              .predicates = {testing::Compare(Column(0, "y", LogicalType::kBigInt),
+                                                              plan::CompareOp::kGe, BigInt(133))}});
+    const auto [rows, parts] = count(table, filter);
+    EXPECT_EQ(rows, 6);  // 133 .. 139 without 135
+    EXPECT_EQ(parts, (std::vector<int64_t>{19}));
+  }
+  {
+    const auto table = Table();
+    const auto compute = Node(plan::ComputeNode{
+        .input = scan_of(table),
+        .exprs = {std::make_shared<const plan::Expr>(
+            plan::Expr{.node = plan::ColumnExpr{.index = 1}, .type = LogicalType::kBigInt})}});
+    const auto filter =
+        Node(plan::FilterNode{.input = compute,
+                              .predicates = {testing::Compare(Column(2, "x2", LogicalType::kBigInt),
+                                                              plan::CompareOp::kLt, BigInt(14))}});
+    const auto [rows, parts] = count(table, filter);
+    EXPECT_EQ(rows, 14);
+    EXPECT_EQ(parts.size(), static_cast<std::size_t>(kParts)) << "a Filter above a Compute";
+  }
+}
+
 }  // namespace
 }  // namespace antb1::exec
