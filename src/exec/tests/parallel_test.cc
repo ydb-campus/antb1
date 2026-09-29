@@ -21,6 +21,7 @@
 
 #include "antb1/exec/memory_budget.h"
 #include "antb1/exec/physical_planner.h"
+#include "antb1/exec/scalar_aggregate.h"
 #include "antb1/exec/sort.h"
 #include "antb1/exec/table_scan.h"
 #include "antb1/plan/logical_plan.h"
@@ -855,6 +856,52 @@ TEST_F(PartOperatorsTest, TopNKeepsEachPartsFirstRows) {
     EXPECT_TRUE(oom.status().IsOutOfMemory()) << oom.status().ToString();
     op->reset();
     EXPECT_EQ(tiny.bytes_allocated(), 0);
+  }
+}
+
+// A global aggregation of only COUNT(DISTINCT x) is planned as a GROUP BY of x (merged in parallel,
+// partitioned) and COUNT(x) over the groups: the counts of the serial COUNT(DISTINCT) state, for
+// DOUBLE (-0.0 with 0.0, one NaN), BIGINT with NULLs, VARCHAR, repeated calls and no rows, on any
+// number of threads.
+TEST_F(PartOperatorsTest, CountDistinctAloneIsAParallelGroupBy) {
+  const auto pool = Pool();
+  const std::vector<plan::BoundColumn> columns = {Column(0, "k", LogicalType::kDouble),
+                                                  Column(1, "g", LogicalType::kBigInt),
+                                                  Column(2, "s", LogicalType::kVarchar)};
+  for (const plan::BoundColumn& column : columns) {
+    const std::vector<plan::AggregateCall> calls = {
+        {.kind = plan::AggKind::kCountDistinct, .arg = column, .type = LogicalType::kBigInt},
+        {.kind = plan::AggKind::kCountDistinct, .arg = column, .type = LogicalType::kBigInt}};
+    for (const bool empty : {false, true}) {
+      const auto table = [&](bool split) {
+        if (!empty) {
+          return GroupingTable(split);
+        }
+        const auto full = GroupingTable(false);
+        return std::make_shared<MemoryTable>(full->schema(), arrow::RecordBatchVector{}, split);
+      };
+      ScalarAggregateOperator serial(
+          std::make_unique<TableScanOperator>(table(false), std::vector<int>{0, 1, 2, 3, 4}),
+          calls);
+      ExecContext ctx{.pool = arrow::default_memory_pool(), .batch_size = 3};
+      const auto expected = Drain(serial, ctx);
+      ASSERT_TRUE(expected.ok()) << expected.status().ToString();
+      const auto plan =
+          PlanOf(Node(plan::AggregateNode{
+                     .input = Node(plan::ScanNode{
+                         .table = table(true), .table_name = "t", .fields = {0, 1, 2, 3, 4}}),
+                     .aggregates = calls}),
+                 2);
+      for (arrow::internal::Executor* executor :
+           {static_cast<arrow::internal::Executor*>(nullptr),
+            static_cast<arrow::internal::Executor*>(pool.get())}) {
+        const auto result = Run(plan, executor);
+        ASSERT_TRUE(result.ok()) << result.status().ToString();
+        EXPECT_TRUE(SameRows(**result, **expected)) << column.name << " empty=" << empty << "\n"
+                                                    << (*result)->ToString() << "\n"
+                                                    << (*expected)->ToString();
+      }
+    }
   }
 }
 

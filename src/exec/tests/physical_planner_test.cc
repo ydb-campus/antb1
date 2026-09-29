@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include "antb1/exec/limit.h"
+#include "antb1/exec/scalar_aggregate.h"
 #include "antb1/exec/sort.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/sql_status.h"
@@ -127,6 +128,46 @@ TEST_F(PhysicalPlannerTest, LimitOverSortIsATopN) {
   EXPECT_EQ(root(3, 2)->output_schema()->num_fields(), 2);
   EXPECT_NE(dynamic_cast<const LimitOperator*>(root(0, 0).get()), nullptr);
   EXPECT_NE(dynamic_cast<const LimitOperator*>(root(std::nullopt, 4).get()), nullptr);
+}
+
+// A global aggregation of only COUNT(DISTINCT) of one column over a scan is planned as COUNT over a
+// GROUP BY of that column (a ScalarAggregateOperator root); one mixed with other calls or columns
+// keeps the per-part aggregation (not ScalarAggregateOperator).
+TEST_F(PhysicalPlannerTest, CountDistinctAloneBecomesAGroupBy) {
+  const auto table = Table();
+  const auto scan = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}});
+  const auto x = Column(0, "x", LogicalType::kBigInt);
+  const auto y = Column(1, "y", LogicalType::kBigInt);
+  const auto root = [&](std::vector<plan::AggregateCall> calls) {
+    const std::size_t width = calls.size();
+    auto op = BuildPhysicalPlan(
+        PlanOf(Node(plan::AggregateNode{.input = scan, .aggregates = std::move(calls)}), width));
+    EXPECT_TRUE(op.ok()) << op.status().ToString();
+    return op.ok() ? *std::move(op) : nullptr;
+  };
+  const plan::AggregateCall distinct_x{
+      .kind = plan::AggKind::kCountDistinct, .arg = x, .type = LogicalType::kBigInt};
+  const plan::AggregateCall distinct_y{
+      .kind = plan::AggKind::kCountDistinct, .arg = y, .type = LogicalType::kBigInt};
+  const plan::AggregateCall count_x{
+      .kind = plan::AggKind::kCount, .arg = x, .type = LogicalType::kBigInt};
+  EXPECT_NE(dynamic_cast<const ScalarAggregateOperator*>(root({distinct_x}).get()), nullptr);
+  EXPECT_NE(dynamic_cast<const ScalarAggregateOperator*>(root({distinct_x, distinct_x}).get()),
+            nullptr);
+  EXPECT_EQ(dynamic_cast<const ScalarAggregateOperator*>(root({distinct_x, distinct_y}).get()),
+            nullptr);
+  EXPECT_EQ(dynamic_cast<const ScalarAggregateOperator*>(root({distinct_x, count_x}).get()),
+            nullptr);
+  // The same counts either way: x = 0..9, y with NULLs every third row (6 distinct values).
+  const auto counts = [&](std::vector<plan::AggregateCall> calls) {
+    const std::size_t width = calls.size();
+    return Run(
+        PlanOf(Node(plan::AggregateNode{.input = scan, .aggregates = std::move(calls)}), width));
+  };
+  EXPECT_EQ(Int64Column(*counts({distinct_x}), 0), (std::vector<std::optional<int64_t>>{10}));
+  EXPECT_EQ(Int64Column(*counts({distinct_y}), 0), (std::vector<std::optional<int64_t>>{6}));
+  EXPECT_EQ(Int64Column(*counts({distinct_x, distinct_y}), 1),
+            (std::vector<std::optional<int64_t>>{6}));
 }
 
 TEST_F(PhysicalPlannerTest, AggregateOverFilteredScanForEveryBatchSize) {
