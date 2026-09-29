@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790665353299,
+  "lastUpdate": 1790675290508,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -1836,6 +1836,78 @@ window.BENCHMARK_DATA = {
             "value": 11.700113233333317,
             "unit": "ms/iter",
             "extra": "iterations: 60\ncpu: 11.697951616666662 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "dd7b9d6c5808bd564238ff07461bab95d6a45e71",
+          "message": "feat(exec,engine): memory limit (#44)\n\n## Summary\n\nThis is step 3 of ADR 0013: a session memory limit. Before it, nothing\nbounded a query's memory:\n- a big query grew until `std::bad_alloc`, which on a pool thread\naborted the process;\n- #43's parallel parts multiply the memory in flight;\n- the GROUP BY sink and hash joins will need a budget.\n\n**`exec::MemoryBudget`** (new public header):\n- It is an `arrow::MemoryPool` over the default pool, with an optional\nbyte limit.\n- It counts buffers atomically, charging before it allocates, so\nconcurrent threads never pass the limit together.\n- `Reserve`/`Release` charge memory held outside Arrow buffers.\n- Past the limit, an allocation fails with `Status::OutOfMemory` and\nleaves nothing behind.\n\n**Everything allocates through it:**\n- The `Session` owns one budget. It is `ExecContext::pool` for every\nquery, and `QueryResult::memory` keeps it alive as long as a result's\nbuffers exist.\n- `plan::Table` scans take a pool: non-virtual `Scan`/`ScanPart` over\nthe protected virtuals `DoScan`/`DoScanPart`, so no call site changed.\n- `ParquetTable` reads the file, decodes pages and runs conversions into\nthat pool.\n- Operators charge their own containers through\n`exec::MemoryReservation`:\n- `GroupedAggregateState::memory_usage()` covers the per-group vectors\nand the VARCHAR MIN/MAX heap;\n- `SortBuffer::memory_usage()` and `sort_memory()` cover the row\nreferences and the sort entries.\n\n**Parallel parts adapt instead of failing:**\n- The part scheduler's window halves each time a part is taken above\nhalf the limit, and widens by one below it.\n- A part that runs out of memory next to others does not fail the query.\nThe parts ahead are dropped and rerun when reached, and that part reruns\nalone.\n- Part results are handed over in scheduler-owned slots, so no pool\nthread holds budget memory after a part is dropped.\n- Only the schedule changes: results are identical.\n\n**Errors:**\n- `OutOfMemory` means exit code 1 with kind `memory`, as approved: \"the\nquery needs more than the memory limit of 2.00 GB (--memory-limit)\".\n- It passes unchanged through the Parquet reader and through\n`regexp_replace`.\n- `std::bad_alloc` is caught in part tasks, in `Drain` and in the scan,\nso no exception leaves exec or io.\n- `~Session` waits for the pool's workers before the budget goes.\n\n**Settings:**\n- `engine::SessionOptions::memory_limit`: there is no limit by default\nfor embedders and tests.\n- `antb1 query|bench --memory-limit SIZE` defaults to 80% of physical\nmemory, as DuckDB's `memory_limit`. It takes `4GB`, `1.5GB`, `512MiB`,\n`50%` (1000- or 1024-based units, case-insensitive).\n- The bench JSON records `memory_limit`.\n\n## Full ClickBench data, 128 threads, 128-CPU host\n\n| `--memory-limit` | Time on the answered queries | Same queries, no\nlimit | Failed (memory error, exit 1) |\n| --- | ---: | ---: | --- |\n| default (80% of RAM) | 164.5 s (best of 3) | 164.7 s (#43) | none |\n| 8 GB | 143.3 s | 109.3 s | Q32-34 |\n| 2 GB | 257.7 s | 73.0 s | Q16-18, Q32-34 |\n\n- **Default:** there is no slowdown; no query is more than 20% slower\nthan on #43.\n- **Failed queries:** they are high-cardinality GROUP BYs whose group\nstate alone exceeds the limit. That needs spilling, which is planned\nafter joins.\n- **Why capped runs are slower:** before the adaptive window, degrading\nto one part at a time under pressure made the 8 GB run take 577 s.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full          # lint, ci, asan, tidy, coverage, fuzz-smoke, ci-gcc\ncheck-full exit 0; Coverage gate: PASS\n$ pixi run tsan\n100% tests passed out of 1319 (no ThreadSanitizer reports)\n$ ANTB1_DIFF_COUNT=20000 pixi run diff-random\nDIFF: PASS seed=2896423234 queries=20000 failed=0 unsupported=0\n$ pixi run test-data\n100% tests passed out of 6\n```\n\n**New tests:**\n- **`MemoryBudget`:**\n- the limit, exact accounting, reallocation failure and shrink, and\n`Reserve`/`Release`;\n- a deterministic 4-thread test: each thread holds 20 KiB until all have\ntried, so exactly 64 of 80 1-KiB allocations fit 64 KiB;\n  - `MemoryReservation`.\n- **Sinks:** `memory_usage()` of every grouped state kind and of the\nVARCHAR heap, and of `SortBuffer`.\n- **Operators:** every sink (GROUP BY, sort, filter+projection,\nCOUNT(DISTINCT)) with a tiny limit fails with `OutOfMemory` and gives\neverything back. With a big limit the result equals the unlimited one,\non 1 thread and on a 4-thread pool.\n- **Scheduler:**\n  - the window halves and regrows (deterministic);\n- a part that runs out of memory on the pool is rerun alone and the\nwindow regrows;\n  - under pressure, LIMIT reads only the first part.\n- **regexp_replace:** out of memory stays a memory error, while an\ninvalid pattern stays an execution error. The test fails with the fix\nreverted.\n- **Session:**\n  - thread and limit validation;\n  - a tiny limit gives `OutOfMemory`;\n  - the results survive the session's destruction;\n- 20 sessions destroyed right after a query that failed in its first row\ngroup on 4 threads (checked by ASan).\n- **io:** a scan through a pool counts the whole row group (the scan\ntest now measures that pool).\n- **CLI:** size parsing (units, %, bad input), exit code 1 with kind\n`memory`, a golden for the memory error, a usage golden for a bad size,\nand `memory_limit` in the bench JSON.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer (none changed)\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code designed and\nwrote the change and tests, ran the verification and the full-data runs.\nTwo `reviewer` passes found issues that are fixed here:\n- a use-after-free when a session was destroyed while pool workers still\nheld part buffers;\n  - Parquet column-chunk reads that the budget did not count;\n  - a timing-dependent test;\n- pool threads keeping dropped parts' results alive through Arrow's\nfuture copies;\n  - an untested `regexp_replace` error-kind fix.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-09-29T12:45:43+03:00",
+          "tree_id": "3c763cc3e10d9a237a740eeea6f9cdd0fca95621",
+          "url": "https://github.com/ydb-campus/antb1/commit/dd7b9d6c5808bd564238ff07461bab95d6a45e71"
+        },
+        "date": 1790675289930,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4095.5010497744083,
+            "unit": "ns/iter",
+            "extra": "iterations: 172418\ncpu: 4094.661439060886 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84077.66363393063,
+            "unit": "ns/iter",
+            "extra": "iterations: 7474\ncpu: 84060.09900990101 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222114.02858050022,
+            "unit": "ns/iter",
+            "extra": "iterations: 3149\ncpu: 222036.60685932048 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 437030.2866958174,
+            "unit": "ns/iter",
+            "extra": "iterations: 1601\ncpu: 436893.55715178023 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 401634.3532110097,
+            "unit": "ns/iter",
+            "extra": "iterations: 1744\ncpu: 401521.5487385322 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2128114.281345588,
+            "unit": "ns/iter",
+            "extra": "iterations: 327\ncpu: 2127908.8562691147 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 205.4703879999996,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 205.43252633333313 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.429914062499863,
+            "unit": "ms/iter",
+            "extra": "iterations: 48\ncpu: 14.42814931249999 ms\nthreads: 1"
           }
         ]
       }
