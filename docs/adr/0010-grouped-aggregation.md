@@ -33,9 +33,10 @@ Accepted (with the maintainer-approved plan for GROUP BY, ORDER BY and COUNT(DIS
 - **Mergeable states.** `GroupedAggregateState::Merge(other, group_map)` folds another state's groups into this one
   through a group map. Partial states over parts of the input merged in input order give the single-pass result
   (DOUBLE sums up to the rounding of adding partial sums, which is still the same for the same part boundaries).
-  Parallel execution can therefore aggregate row groups independently and merge, without new states. A map entry
-  `kSkipGroup` leaves a group out, so that a partitioned merge folds each part's state into several states, a
-  subset into each. (Done by
+  Parallel execution can therefore aggregate row groups independently and merge, without new states. A sparse
+  `MergeGroups(other, from, to)` folds only the listed groups (group `from[i]` of the other state into group
+  `to[i]`), so that a partitioned merge folds each part's state into several states, a subset into each, in time
+  proportional to the subset; `Merge(other, map)` is built on it. (Done by
   `PartGroupAggregateOperator` since ADR 0013's GROUP BY step: the merged groups follow the parts' groups in part
   order.)
 - **In memory, no spilling.** All groups and their accumulators stay in memory; a query with more groups than memory
