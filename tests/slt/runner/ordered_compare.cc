@@ -289,11 +289,9 @@ class Buckets {
       : pool_(pool), letters_(letters) {}
 
   void Add(std::size_t run, std::size_t row) { buckets_[Key(run, pool_[row])].push_back(row); }
-  // Takes an unused row of `run` equal to `row`: with `exact`, every cell equal; else R cells
-  // within the tolerance. Match every row exactly first, then the rest within the tolerance:
-  // taking the first row within the tolerance could take another row's exact partner (values a
-  // step apart that is below the tolerance), leaving that row none.
-  bool Take(std::size_t run, const Cells& row, bool exact) {
+  // Takes an unused row of `run` with every cell equal to `row`'s. Rows without one are then
+  // matched within the R tolerance by TakeByValue.
+  bool Take(std::size_t run, const Cells& row) {
     const auto bucket = buckets_.find(Key(run, row));
     if (bucket == buckets_.end()) {
       return false;
@@ -301,10 +299,9 @@ class Buckets {
     std::vector<std::size_t>& unused = bucket->second;
     for (std::size_t k = unused.size(); k > 0; --k) {
       const Cells& candidate = pool_[unused[k - 1]];
-      if (exact ? std::equal(candidate.begin(),
-                             candidate.begin() + static_cast<std::ptrdiff_t>(letters_.size()),
-                             row.begin())
-                : SameCells(candidate, row, 0, letters_)) {
+      if (std::equal(candidate.begin(),
+                     candidate.begin() + static_cast<std::ptrdiff_t>(letters_.size()),
+                     row.begin())) {
         unused[k - 1] = unused.back();
         unused.pop_back();
         return true;
@@ -313,7 +310,83 @@ class Buckets {
     return false;
   }
 
+  // Matches rows left after the exact matches (`rows[k]` at run `runs[k]`) to unused rows within
+  // the R tolerance, and returns the first of them (by k) left without one, if any. In each bucket
+  // the rows and the candidates are taken in ascending order of their R cells, each row the
+  // smallest candidate within its tolerance: for one R column that finds a match for every row
+  // whenever one exists (first fit does not: a row can take the partner of a later row, a value
+  // step below the tolerance away).
+  std::optional<std::size_t> TakeByValue(const std::vector<std::size_t>& runs,
+                                         const std::vector<const Cells*>& rows) {
+    std::unordered_map<std::string, std::vector<std::size_t>> groups;  // bucket -> k
+    std::vector<std::string> order;
+    for (std::size_t k = 0; k < rows.size(); ++k) {
+      std::string key = Key(runs[k], *rows[k]);
+      auto [it, inserted] = groups.try_emplace(key);
+      if (inserted) {
+        order.push_back(std::move(key));
+      }
+      it->second.push_back(k);
+    }
+    std::optional<std::size_t> failed;
+    for (const std::string& key : order) {
+      std::vector<std::size_t>& members = groups[key];
+      const auto bucket = buckets_.find(key);
+      if (bucket == buckets_.end()) {
+        failed = std::min(failed.value_or(members.front()), members.front());
+        continue;
+      }
+      std::vector<std::size_t>& unused = bucket->second;
+      std::ranges::sort(unused, [&](std::size_t a, std::size_t b) {
+        return RValues(pool_[a]) < RValues(pool_[b]);
+      });
+      std::ranges::sort(members, [&](std::size_t a, std::size_t b) {
+        return RValues(*rows[a]) < RValues(*rows[b]);
+      });
+      std::vector<bool> taken(unused.size(), false);
+      for (const std::size_t k : members) {
+        bool found = false;
+        for (std::size_t c = 0; c < unused.size() && !found; ++c) {
+          if (!taken[c] && SameCells(pool_[unused[c]], *rows[k], 0, letters_)) {
+            taken[c] = true;
+            found = true;
+          }
+        }
+        if (!found) {
+          failed = std::min(failed.value_or(k), k);
+        }
+      }
+      std::vector<std::size_t> left;
+      for (std::size_t c = 0; c < unused.size(); ++c) {
+        if (!taken[c]) {
+          left.push_back(unused[c]);
+        }
+      }
+      unused = std::move(left);
+    }
+    return failed;
+  }
+
  private:
+  // The R cells of a row as numbers, NULL (and text that is not a number) first.
+  [[nodiscard]] std::vector<double> RValues(const Cells& row) const {
+    std::vector<double> values;
+    for (std::size_t c = 0; c < letters_.size(); ++c) {
+      if (letters_[c] != 'R') {
+        continue;
+      }
+      double value = -std::numeric_limits<double>::infinity();
+      if (const auto& cell = row[c]; cell.has_value()) {
+        const auto [end, error] = std::from_chars(cell->data(), cell->data() + cell->size(), value);
+        if (error != std::errc{} || end != cell->data() + cell->size()) {
+          value = -std::numeric_limits<double>::infinity();
+        }
+      }
+      values.push_back(value);
+    }
+    return values;
+  }
+
   [[nodiscard]] std::string Key(std::size_t run, const Cells& row) const {
     return std::to_string(run) + '\x01' + ExactText(row, letters_);
   }
@@ -405,14 +478,22 @@ std::optional<Discrepancy> CompareOrdered(
     if (rank >= rows.size()) {
       return Mismatch(oracle, antb1, letters, i);
     }
-    if (!buckets.Take(run_of[rank], antb1.rows[i], /*exact=*/true)) {
+    if (!buckets.Take(run_of[rank], antb1.rows[i])) {
       inexact.push_back(i);
     }
   }
-  for (const std::size_t i : inexact) {
-    const auto rank = static_cast<std::size_t>(SaturatingAdd(q.offset, static_cast<int64_t>(i)));
-    if (!buckets.Take(run_of[rank], antb1.rows[i], /*exact=*/false)) {
-      return Mismatch(oracle, antb1, letters, i);
+  {
+    std::vector<std::size_t> runs;
+    std::vector<const Cells*> left;
+    runs.reserve(inexact.size());
+    left.reserve(inexact.size());
+    for (const std::size_t i : inexact) {
+      runs.push_back(
+          run_of[static_cast<std::size_t>(SaturatingAdd(q.offset, static_cast<int64_t>(i)))]);
+      left.push_back(&antb1.rows[i]);
+    }
+    if (const auto failed = buckets.TakeByValue(runs, left)) {
+      return Mismatch(oracle, antb1, letters, inexact[*failed]);
     }
   }
   if (in_open_run.empty()) {
@@ -446,14 +527,18 @@ std::optional<Discrepancy> CompareOrdered(
   }
   std::vector<std::size_t> inexact_in_run;
   for (const std::size_t i : in_open_run) {
-    if (!candidates.Take(0, antb1.rows[i], /*exact=*/true)) {
+    if (!candidates.Take(0, antb1.rows[i])) {
       inexact_in_run.push_back(i);
     }
   }
+  std::vector<const Cells*> left_in_run;
+  left_in_run.reserve(inexact_in_run.size());
   for (const std::size_t i : inexact_in_run) {
-    if (!candidates.Take(0, antb1.rows[i], /*exact=*/false)) {
-      return Mismatch(oracle, antb1, letters, i);
-    }
+    left_in_run.push_back(&antb1.rows[i]);
+  }
+  if (const auto failed =
+          candidates.TakeByValue(std::vector<std::size_t>(inexact_in_run.size(), 0), left_in_run)) {
+    return Mismatch(oracle, antb1, letters, inexact_in_run[*failed]);
   }
   return std::nullopt;
 }

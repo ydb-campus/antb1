@@ -154,6 +154,15 @@ TEST(CompareOrdered, CloseValuesFindTheirOwnRows) {
       answer,
       Result({kR}, {{"1000000000.7500001"}, {"1000000001.5"}, {"1000000000"}, {"1000000002.25"}}),
       query, std::ref(oracle)));
+  // No row equal to its oracle row at all (each rounded), in a right order of the ties: the rows
+  // left for the tolerance are matched by value (each to the smallest oracle value within its
+  // tolerance, both in ascending order), not first fit.
+  EXPECT_FALSE(CompareOrdered(answer,
+                              Result({kR}, {{"1000000000.7500001"},
+                                            {"1000000001.5000001"},
+                                            {"1000000000.0000001"},
+                                            {"1000000002.2500001"}}),
+                              query, std::ref(oracle)));
   const auto d = CompareOrdered(
       answer, Result({kR}, {{"1000000000.75"}, {"1000000001.5"}, {"1000000000"}, {"1000000009"}}),
       query, std::ref(oracle));
