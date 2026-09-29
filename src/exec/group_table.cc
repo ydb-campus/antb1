@@ -4,8 +4,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -14,6 +16,7 @@
 #include <arrow/compute/api_vector.h>
 #include <arrow/compute/exec.h>
 #include <arrow/compute/row/grouper.h>
+#include <arrow/util/hashing.h>
 
 #include "antb1/exec/grouped_aggregate_state.h"
 #include "antb1/exec/memory_budget.h"
@@ -47,6 +50,43 @@ arrow::Result<std::shared_ptr<arrow::Array>> FirstPositions(std::span<const std:
   arrow::Int64Builder positions(pool);
   ARROW_RETURN_NOT_OK(positions.AppendValues(first));
   return positions.Finish();
+}
+
+// A hash of every row's key values, the same on every run and build of this Arrow version: each
+// value's bytes through Arrow's string hash (a fixed-width value's bytes, a binary value's bytes,
+// a constant for NULL), combined over the keys.
+arrow::Result<std::vector<std::uint64_t>> KeyHashes(const arrow::compute::ExecBatch& keys) {
+  std::vector<std::uint64_t> hashes(static_cast<std::size_t>(keys.length), 0x9E3779B97F4A7C15ULL);
+  for (const arrow::Datum& datum : keys.values) {
+    const std::shared_ptr<arrow::Array> column = datum.make_array();
+    const arrow::DataType& type = *column->type();
+    const int width = type.byte_width();
+    const auto* binary = dynamic_cast<const arrow::BinaryArray*>(column.get());
+    for (std::int64_t row = 0; row < column->length(); ++row) {
+      std::uint64_t value = 0x5BD1E995ULL;  // NULL
+      if (column->IsValid(row)) {
+        if (binary != nullptr) {
+          const std::string_view bytes = binary->GetView(row);
+          value = arrow::internal::ComputeStringHash<0>(bytes.data(),
+                                                        static_cast<std::int64_t>(bytes.size()));
+        } else if (type.id() == arrow::Type::BOOL) {
+          value = static_cast<const arrow::BooleanArray&>(*column).Value(row) ? 1 : 2;
+        } else if (width > 0) {
+          const std::uint8_t* bytes =
+              column->data()->buffers[1]->data() + ((column->offset() + row) * width);
+          value = arrow::internal::ComputeStringHash<0>(bytes, width);
+        } else {
+          return arrow::Status::NotImplemented("GROUP BY partition of a ", type.ToString(), " key");
+        }
+      }
+      auto& hash = hashes[static_cast<std::size_t>(row)];
+      hash = (hash ^ value) * 0x100000001B3ULL;
+    }
+  }
+  for (std::uint64_t& hash : hashes) {
+    hash ^= hash >> 33U;
+  }
+  return hashes;
 }
 
 }  // namespace
@@ -176,7 +216,9 @@ arrow::Status GroupTable::Merge(const GroupTable& part) {
     group_map = IdsOf(*ids);
     const std::uint32_t after = grouper_->num_groups();
     if (after > num_groups_) {
-      ARROW_RETURN_NOT_OK(AddPartGroups(part, group_map, after));
+      std::vector<std::uint32_t> every(group_map.size());
+      std::ranges::iota(every, 0U);
+      ARROW_RETURN_NOT_OK(AddPartGroups(part, every, group_map, after));
     }
   }
   for (std::size_t i = 0; i < states_.size(); ++i) {
@@ -185,15 +227,14 @@ arrow::Status GroupTable::Merge(const GroupTable& part) {
   return Account();
 }
 
-arrow::Status GroupTable::AddPartGroups(const GroupTable& part,
-                                        std::span<const std::uint32_t> group_map,
-                                        std::uint32_t after) {
+arrow::Status GroupTable::AddPartGroups(const GroupTable& part, std::span<const std::uint32_t> from,
+                                        std::span<const std::uint32_t> to, std::uint32_t after) {
   // The part group of each new group (a new group keeps part's first-seen key values), found per
   // id as in Consume.
   std::vector<std::uint32_t> source(after - num_groups_, 0);
-  for (std::uint32_t g = 0; g < group_map.size(); ++g) {
-    if (group_map[g] >= num_groups_) {
-      source[group_map[g] - num_groups_] = g;
+  for (std::size_t i = 0; i < from.size(); ++i) {
+    if (to[i] >= num_groups_) {
+      source[to[i] - num_groups_] = from[i];
     }
   }
   // Where each part group's keys are: its chunk and row there.
@@ -257,6 +298,79 @@ arrow::Status GroupTable::AddPartGroups(const GroupTable& part,
         AddGroups(num_groups_ + static_cast<std::uint32_t>(end - begin), std::move(first)));
   }
   return arrow::Status::OK();
+}
+
+arrow::Status GroupTable::Partition() {
+  partition_groups_.clear();
+  partition_uniques_.clear();
+  if (keys_.empty()) {  // one group at most, one partition
+    partition_groups_.emplace_back();
+    if (num_groups_ > 0) {
+      partition_groups_.front().push_back(0);
+    }
+    return arrow::Status::OK();
+  }
+  partition_groups_.resize(kPartitions);
+  ARROW_ASSIGN_OR_RAISE(const arrow::compute::ExecBatch uniques, grouper_->GetUniques());
+  ARROW_ASSIGN_OR_RAISE(const std::vector<std::uint64_t> hashes, KeyHashes(uniques));
+  for (std::uint32_t g = 0; g < hashes.size(); ++g) {
+    partition_groups_[hashes[g] % kPartitions].push_back(g);
+  }
+  partition_uniques_.reserve(kPartitions);
+  for (const std::vector<std::uint32_t>& groups : partition_groups_) {
+    arrow::UInt32Builder indices(pool_);
+    ARROW_RETURN_NOT_OK(indices.AppendValues(groups));
+    ARROW_ASSIGN_OR_RAISE(const auto rows, indices.Finish());
+    std::vector<arrow::Datum> values;
+    values.reserve(uniques.values.size());
+    for (const arrow::Datum& column : uniques.values) {
+      ARROW_ASSIGN_OR_RAISE(
+          arrow::Datum taken,
+          arrow::compute::Take(column, rows, arrow::compute::TakeOptions::NoBoundsCheck(),
+                               kernels_.get()));
+      values.push_back(std::move(taken));
+    }
+    partition_uniques_.emplace_back(std::move(values), static_cast<std::int64_t>(groups.size()));
+  }
+  return arrow::Status::OK();
+}
+
+arrow::Status GroupTable::MergePartition(const GroupTable& part, std::size_t partition) {
+  if (partition >= part.partition_groups_.size()) {
+    return arrow::Status::Invalid("merge of partition ", partition, " of a table with ",
+                                  part.partition_groups_.size(), " partitions");
+  }
+  const std::vector<std::uint32_t>& groups = part.partition_groups_[partition];
+  if (groups.empty()) {
+    return arrow::Status::OK();
+  }
+  // The partition's groups of part (`groups`) and this table's groups they become (`to`): the
+  // work is proportional to the partition, not to the part.
+  std::vector<std::uint32_t> single;
+  std::shared_ptr<arrow::UInt32Array> ids;
+  std::span<const std::uint32_t> to;
+  if (keys_.empty()) {
+    if (num_groups_ == 0) {
+      ARROW_RETURN_NOT_OK(AddGroups(1, {}));
+    }
+    single.assign(1, 0);
+    to = single;
+  } else {
+    // The partition's groups of part, by their normalized keys, through this table's grouper.
+    ARROW_ASSIGN_OR_RAISE(
+        const arrow::Datum id_datum,
+        grouper_->Consume(arrow::compute::ExecSpan(part.partition_uniques_[partition])));
+    ids = std::static_pointer_cast<arrow::UInt32Array>(id_datum.make_array());
+    to = IdsOf(*ids);
+    const std::uint32_t after = grouper_->num_groups();
+    if (after > num_groups_) {
+      ARROW_RETURN_NOT_OK(AddPartGroups(part, groups, to, after));
+    }
+  }
+  for (std::size_t i = 0; i < states_.size(); ++i) {
+    ARROW_RETURN_NOT_OK(states_[i]->MergeGroups(*part.states_[i], groups, to));
+  }
+  return Account();
 }
 
 arrow::Status GroupTable::Account() {

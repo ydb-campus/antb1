@@ -46,10 +46,14 @@ class GroupedAggregateState {
   // nullptr for COUNT(*), which counts group_ids.size() rows.
   virtual arrow::Status Consume(const arrow::Array* values,
                                 std::span<const std::uint32_t> group_ids) = 0;
-  // Folds group g of `other` (the same aggregate over the same input type) into group
-  // group_map[g] of this state, for every g < other.num_groups().
-  virtual arrow::Status Merge(const GroupedAggregateState& other,
-                              std::span<const std::uint32_t> group_map) = 0;
+  // Folds group from[i] of `other` (the same aggregate over the same input type) into group to[i]
+  // of this state, for every i: a partitioned merge folds a part's groups into several states, a
+  // subset into each, in time proportional to the subset. Invalid for a group out of range.
+  virtual arrow::Status MergeGroups(const GroupedAggregateState& other,
+                                    std::span<const std::uint32_t> from,
+                                    std::span<const std::uint32_t> to) = 0;
+  // Folds every group g of `other` into group group_map[g] of this state.
+  arrow::Status Merge(const GroupedAggregateState& other, std::span<const std::uint32_t> group_map);
   // One value per group of [begin, end), in group order: an array of plan::ToArrow(result type).
   // Invalid unless begin <= end <= num_groups(). Finalizing the groups in ranges keeps each array
   // small (a VARCHAR MIN or MAX over millions of groups would not fit the 2 GiB of one binary
