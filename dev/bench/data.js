@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790659455502,
+  "lastUpdate": 1790665353299,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -1764,6 +1764,78 @@ window.BENCHMARK_DATA = {
             "value": 13.13454052830203,
             "unit": "ms/iter",
             "extra": "iterations: 53\ncpu: 13.128686471698114 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c4be212c890bb5cc81d3b753a1ce01ba7e56c244",
+          "message": "feat(exec,engine): parallel execution over row groups (#43)\n\n## Summary\n\nThis is step 2 of ADR 0013: parallel execution over row groups, designed\nso that hash joins can later reuse the same pipeline and sink framework\n(the ADR's new \"Towards joins\" section).\n\n**How a query runs now:**\n- A **part pipeline** is a chain of `Filter`/`Compute`/`Project` over a\n`Scan`. It runs once per table part (a Parquet row group, #42) on an\nArrow `ThreadPool` owned by the `Session`.\n- Each part gets fresh operator instances, so parts share no mutable\nstate.\n\n**`exec::PartScheduler`:**\n- Hands part results back strictly in part order.\n- At most 2 × threads parts are in flight.\n- The first failing part *in part order* decides the error. Parts after\nthe consumer stops (a met `LIMIT`) are stopped and their errors dropped.\n- With one thread it runs each part inline: the same code path, so\n**results are byte-identical for any thread count**.\n\n**Operators the planner builds:**\n- `PartAggregateOperator` handles a global aggregate over a pipeline:\nper-part `AggregateSet`s, merged in part order.\n`ScalarAggregateOperator` now shares `AggregateSet`.\n- `PartUnionOperator` handles every other pipeline top: batches in part\norder. Under a `LIMIT`, each part stops after `limit + offset` rows, and\nno new parts are scheduled once the limit is met.\n- GROUP BY and ORDER BY still aggregate and sort serially, but read the\nparallel pipeline's output, so their filters and expressions (Q28's\nregex, for example) already run in parallel. Their own sinks are the\nnext PRs.\n\n**Session and CLI:**\n- `SessionOptions::threads` is validated to 1..1024. The library default\nis 1, so embedders and every test harness stay single-threaded unless\nthey ask.\n- `antb1 query` and `antb1 bench` get `--threads N`, defaulting to the\nhardware threads as decided. `bench` records `threads` in its JSON.\n\n**Semantics change:** DOUBLE `SUM`/`AVG` without GROUP BY now add each\nrow group, then the row-group sums in order. This was accepted in the\nADR and is documented in docs/sql-subset.md.\n\n**Approved protected-path edits:**\n- `parallel` added to the label list in `cmake/Antb1Testing.cmake` (lint\nR008).\n- AGENTS.md: the labels list, and the threads-in-tests sentence.\n- A 4-thread pool in the exec unit tests.\n\nNo changes to `CMakePresets.json` or `pixi.toml` were needed.\n\n## Full ClickBench data (100 files, 325 row groups), `antb1 bench\n--tries 1`, 128-CPU host\n\n| Threads | Total, 43 queries | Failed |\n| --- | --- | --- |\n| 1 | 796 s | 0 |\n| 8 | 218 s | 0 |\n| 32 | 172 s | 0 |\n| 128 | 167 s | 0 |\n\n- Scan, filter and expression-bound queries speed up 15-27× on 128\nthreads. For example, Q28 goes from 226 s to 10.4 s, Q23 from 158 s to\n6.8 s, and Q20-22 and Q36-42 improve by about 16-27×.\n- GROUP BY-heavy queries (Q8-9, Q15-18, Q32-35) gain only 1-2×, because\ngrouping is still serial. The GROUP BY sink PR addresses this.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full          # lint, ci, asan, tidy, coverage, fuzz-smoke, ci-gcc\ncheck-full exit 0; Coverage gate: PASS\n$ pixi run tsan\n100% tests passed out of 1303 (no ThreadSanitizer reports)\n$ ANTB1_DIFF_COUNT=20000 pixi run diff-random\nDIFF: PASS seed=2759026187 queries=20000 failed=0 unsupported=0\n$ pixi run test-data\n100% tests passed out of 6 (ClickBench pass set unchanged)\n$ pixi run test -L parallel\n100% tests passed out of 42\n```\n\n**New tests:**\n- **`parallel` label:**\n- `parallel.<area>.<file>` runs every `.slt` case file with `--threads 4\n--same-as-threads 1 --batch-size 1000`: the expectations must hold, and\nevery result must equal the 1-thread result byte for byte, before any\nsorting.\n- `parallel.diff.random` runs 300 random queries against DuckDB with 4\nthreads and 700-row batches, with the same identity check.\n- **Exec unit tests (4-thread pool):** scheduler order, window bound,\nfirst error in part order, stop and wait; aggregates equal to the serial\npath; DOUBLE per-part sums; projection order; LIMIT early stop (bounded\nparts scanned); error order under LIMIT; GROUP BY and sort over the part\nunion.\n- **Session, CLI and harness:** thread validation and 1 vs 4 threads\nidentical; the `--threads 0` usage golden; the bench JSON `threads`\nfield; the CLI goldens pinned to `--threads 1`; the `--same-as-threads`\nwrapper catching any difference (rows, order, types, errors) without\nprinting values.\n\n**Note on the parallel diff seed:** `parallel.diff.random` uses the same\nseed as `diff.random` (20260925). With a new seed (20260929), one\ngenerated query makes **DuckDB itself** leak under ASan. The query is\nMIN of a VARCHAR column with GROUP BY and LIMIT, and the leak is in\nDuckDB's `MinMaxStringState` combine. No antb1 frames appear, so it is a\nbug in the test oracle, not the engine. I did not add a sanitizer\nsuppression, because the suppressions are protected and gates must not\nbe weakened. It is recorded as a follow-up to check upstream.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code designed and\nwrote the change and tests, and ran the verification and benchmarks. The\n`reviewer` agent found no races, lifetime or deadlock problems. It\nflagged a stale DOUBLE SUM line in docs/sql-subset.md and an overstated\nmemory claim in the ADR; both are fixed. Bounding a part union's\nbuffering is taken into the memory-limit PR.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-09-29T10:00:38+03:00",
+          "tree_id": "0901a74b212efc6f2f4c93585ecbd616242c43e4",
+          "url": "https://github.com/ydb-campus/antb1/commit/c4be212c890bb5cc81d3b753a1ce01ba7e56c244"
+        },
+        "date": 1790665352208,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 3271.8121167216505,
+            "unit": "ns/iter",
+            "extra": "iterations: 214596\ncpu: 3271.7965106525744 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 83196.24515491824,
+            "unit": "ns/iter",
+            "extra": "iterations: 8101\ncpu: 83193.12233057649 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 89646.41239994831,
+            "unit": "ns/iter",
+            "extra": "iterations: 7871\ncpu: 89633.02642612117 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 294376.96821413626,
+            "unit": "ns/iter",
+            "extra": "iterations: 2391\ncpu: 294320.1585110834 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 383357.783060109,
+            "unit": "ns/iter",
+            "extra": "iterations: 1830\ncpu: 383354.26885245915 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2106741.205357117,
+            "unit": "ns/iter",
+            "extra": "iterations: 336\ncpu: 2106361.300595238 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 150.7269375,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 150.69781000000003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 11.700113233333317,
+            "unit": "ms/iter",
+            "extra": "iterations: 60\ncpu: 11.697951616666662 ms\nthreads: 1"
           }
         ]
       }
