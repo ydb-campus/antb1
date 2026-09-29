@@ -289,15 +289,22 @@ class Buckets {
       : pool_(pool), letters_(letters) {}
 
   void Add(std::size_t run, std::size_t row) { buckets_[Key(run, pool_[row])].push_back(row); }
-  // Takes an unused row of `run` equal to `row` (R cells within the tolerance).
-  bool Take(std::size_t run, const Cells& row) {
+  // Takes an unused row of `run` equal to `row`: with `exact`, every cell equal; else R cells
+  // within the tolerance. Match every row exactly first, then the rest within the tolerance:
+  // taking the first row within the tolerance could take another row's exact partner (values a
+  // step apart that is below the tolerance), leaving that row none.
+  bool Take(std::size_t run, const Cells& row, bool exact) {
     const auto bucket = buckets_.find(Key(run, row));
     if (bucket == buckets_.end()) {
       return false;
     }
     std::vector<std::size_t>& unused = bucket->second;
     for (std::size_t k = unused.size(); k > 0; --k) {
-      if (SameCells(pool_[unused[k - 1]], row, 0, letters_)) {
+      const Cells& candidate = pool_[unused[k - 1]];
+      if (exact ? std::equal(candidate.begin(),
+                             candidate.begin() + static_cast<std::ptrdiff_t>(letters_.size()),
+                             row.begin())
+                : SameCells(candidate, row, 0, letters_)) {
         unused[k - 1] = unused.back();
         unused.pop_back();
         return true;
@@ -388,13 +395,23 @@ std::optional<Discrepancy> CompareOrdered(
   }
   const std::size_t last_run = rows.empty() ? 0 : run_of.back();
   std::vector<std::size_t> in_open_run;  // antb1 rows at ranks of the open run
+  std::vector<std::size_t> inexact;      // antb1 rows without an exactly equal oracle row
   for (std::size_t i = 0; i < antb1.rows.size(); ++i) {
     const auto rank = static_cast<std::size_t>(SaturatingAdd(q.offset, static_cast<int64_t>(i)));
     if (open_run && rank < rows.size() && run_of[rank] == last_run) {
       in_open_run.push_back(i);
       continue;
     }
-    if (rank >= rows.size() || !buckets.Take(run_of[rank], antb1.rows[i])) {
+    if (rank >= rows.size()) {
+      return Mismatch(oracle, antb1, letters, i);
+    }
+    if (!buckets.Take(run_of[rank], antb1.rows[i], /*exact=*/true)) {
+      inexact.push_back(i);
+    }
+  }
+  for (const std::size_t i : inexact) {
+    const auto rank = static_cast<std::size_t>(SaturatingAdd(q.offset, static_cast<int64_t>(i)));
+    if (!buckets.Take(run_of[rank], antb1.rows[i], /*exact=*/false)) {
       return Mismatch(oracle, antb1, letters, i);
     }
   }
@@ -427,8 +444,14 @@ std::optional<Discrepancy> CompareOrdered(
   for (std::size_t j = 0; j < members->rows.size(); ++j) {
     candidates.Add(0, j);
   }
+  std::vector<std::size_t> inexact_in_run;
   for (const std::size_t i : in_open_run) {
-    if (!candidates.Take(0, antb1.rows[i])) {
+    if (!candidates.Take(0, antb1.rows[i], /*exact=*/true)) {
+      inexact_in_run.push_back(i);
+    }
+  }
+  for (const std::size_t i : inexact_in_run) {
+    if (!candidates.Take(0, antb1.rows[i], /*exact=*/false)) {
       return Mismatch(oracle, antb1, letters, i);
     }
   }
