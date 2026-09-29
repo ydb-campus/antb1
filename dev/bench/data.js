@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790634141629,
+  "lastUpdate": 1790659455502,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -1692,6 +1692,78 @@ window.BENCHMARK_DATA = {
             "value": 12.62767198181817,
             "unit": "ms/iter",
             "extra": "iterations: 55\ncpu: 12.626020399999987 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "69ac9e0c725e5cd2a32a8c458ff8775b5c19fb6e",
+          "message": "feat(io): row-group parts (#42)\n\n## Summary\n\nThis is the first step of parallel execution (ADR 0013), planned with\njoins in mind for later TPC-H work. It adds row-group parts to tables.\nThere is no query behavior change: the executor still uses `Scan`.\n\n- **`plan::Table`** gains:\n  - `num_parts()`: the units of parallel work;\n  - `part_rows(part)`: a part's row count, when known;\n  - `ScanPart(part, fields, batch_size)`: scans one part.\n\nScanning parts `0..n-1` in order gives the rows of `Scan`. By default\nthe whole table is one part.\n- **`io::ParquetTable`**: each row group with rows is one part, in file\nand row-group order. A table without rows has no parts.\n- **Footers:** the footer read at `Open` is kept and reused by every\nscan, whole-table or per part, so no part parses a footer again. Each\nscan compares the file's size and raw footer bytes with the ones read at\n`Open`.\n- A rewritten file is an `IOError` naming the file, including a rewrite\nthat keeps the same size.\n  - Before, each scan re-read the footer and checked the column types.\n- The per-batch type and column-count checks are now true by\nconstruction, so they are removed.\n- **Docs:** `docs/architecture.md` describes parts.\n\nNext PR: the thread pool, `--threads`, the global-aggregate and\ncollector sinks with the ordered window, and a memory budget.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full\nCoverage gate: PASS (io: lines 92.06%, branches 87.30%)\ncheck-full exit 0 (lint, ci, asan, tidy, coverage, fuzz-smoke, ci-gcc)\n$ pixi run test-data\n100% tests passed out of 6\n```\n\nNew tests in `src/io/tests/parquet_scan_test.cc`:\n- the parts, read in order, equal `Scan`. This covers several files, an\nempty file, column subsets, batch sizes 1, 2 and 64, and every\nengine-view conversion;\n- `part_rows` matches the rows each part returns;\n- a table without rows has no parts;\n- out-of-range parts and bad requests are rejected;\n- a file rewritten after `Open`, including a same-size rewrite with\nother values, is an `IOError` for both `Scan` and `ScanPart`.\n\nA plan test covers the single-part defaults.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer (none changed)\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code wrote the change\nand the tests and ran the verification. The `reviewer` agent found one\nproblem, now fixed: with footers kept from `Open`, a same-size rewrite\nof a file would have been decoded with the stale footer. Scans now\ncompare the raw footer bytes.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-09-29T08:22:18+03:00",
+          "tree_id": "8be8ec6a0c2809b73fd29822135376f9b316b8dd",
+          "url": "https://github.com/ydb-campus/antb1/commit/69ac9e0c725e5cd2a32a8c458ff8775b5c19fb6e"
+        },
+        "date": 1790659454991,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 3730.8880581263634,
+            "unit": "ns/iter",
+            "extra": "iterations: 189518\ncpu: 3730.723308603932 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 94207.32026425331,
+            "unit": "ns/iter",
+            "extra": "iterations: 6963\ncpu: 94181.43774235247 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 103375.0088875709,
+            "unit": "ns/iter",
+            "extra": "iterations: 6751\ncpu: 103346.85483632058 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 334844.4273381315,
+            "unit": "ns/iter",
+            "extra": "iterations: 2085\ncpu: 334737.74964028754 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 416906.15673421405,
+            "unit": "ns/iter",
+            "extra": "iterations: 1678\ncpu: 416807.83790226496 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2470306.915194349,
+            "unit": "ns/iter",
+            "extra": "iterations: 283\ncpu: 2469631.8727915175 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 176.91316025000248,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 176.8861639999999 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 13.13454052830203,
+            "unit": "ms/iter",
+            "extra": "iterations: 53\ncpu: 13.128686471698114 ms\nthreads: 1"
           }
         ]
       }
