@@ -416,7 +416,7 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   batches; their results are combined in file and row group order, so a result is the same for any number of
   threads, and deterministic. A DOUBLE `SUM` or `AVG` adds up every row group (per group with `GROUP BY`),
   then the row group sums in order: it can differ from one running sum (and from DuckDB) by rounding. The order of
-  the groups of a `GROUP BY` follows the row groups and their batches, the same for any number of threads.
+  the groups of a `GROUP BY` follows a hash of their keys and the row groups, the same for any number of threads.
 - Memory: a query may hold at most `--memory-limit` bytes (default: 80% of physical memory, as DuckDB's
   `memory_limit`; sizes such as `4GB`, `512MiB` or `50%`): the data it reads and computes and its results. A query
   that needs more fails with a `memory` error (exit code 1), never with a crash; under pressure it reads fewer row

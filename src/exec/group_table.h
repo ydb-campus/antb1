@@ -6,6 +6,7 @@
 #include <span>
 #include <vector>
 
+#include <arrow/compute/exec.h>
 #include <arrow/memory_pool.h>
 #include <arrow/record_batch.h>
 #include <arrow/result.h>
@@ -35,6 +36,9 @@ class GroupTable {
  public:
   // The most new groups a Merge adds as one chunk (one output batch).
   static constexpr std::size_t kMaxMergeChunk = std::size_t{64} * 1024;
+  // The partitions of a partitioned merge: a constant, never the number of threads, so that the
+  // result is the same for any number of threads.
+  static constexpr std::size_t kPartitions = 64;
 
   // Checks the keys and calls against an input `input_width` columns wide.
   static arrow::Result<std::unique_ptr<GroupTable>> Make(
@@ -52,6 +56,18 @@ class GroupTable {
   // table's): a group new to this table keeps part's first-seen key values; states merge.
   arrow::Status Merge(const GroupTable& part);
 
+  // Splits the groups into partitions by a hash of their (normalized) keys, after the last
+  // Consume of a part table: kPartitions partitions, or one without keys.
+  arrow::Status Partition();
+  [[nodiscard]] std::size_t num_partitions() const { return partition_groups_.size(); }
+  // After Partition: the groups of partition `partition`, in group order.
+  [[nodiscard]] const std::vector<std::uint32_t>& partition_groups(std::size_t partition) const {
+    return partition_groups_.at(partition);
+  }
+  // Adds the groups of partition `partition` of `part` (partitioned) as Merge adds all of them.
+  // Tables that merge different partitions of the same parts can run on different threads.
+  arrow::Status MergePartition(const GroupTable& part, std::size_t partition);
+
   [[nodiscard]] std::uint32_t num_groups() const { return num_groups_; }
   // The next chunk of groups as one batch (the keys as first seen, then one column per call, in
   // `schema`), or nullptr after the last. Moves the keys out: call it after the last Consume or
@@ -65,10 +81,10 @@ class GroupTable {
 
   // Numbers `rows` groups new from num_groups_ on (a new chunk) and gives every state room.
   arrow::Status AddGroups(std::uint32_t after, std::vector<std::shared_ptr<arrow::Array>> keys);
-  // Adds the groups new since num_groups_ (up to `after`) that `part`'s groups map to through
-  // `group_map`, with part's first-seen keys, in chunks of at most kMaxMergeChunk groups.
-  arrow::Status AddPartGroups(const GroupTable& part, std::span<const std::uint32_t> group_map,
-                              std::uint32_t after);
+  // Adds the groups new since num_groups_ (up to `after`) that part's groups from[i] become
+  // (to[i]), with part's first-seen keys, in chunks of at most kMaxMergeChunk groups.
+  arrow::Status AddPartGroups(const GroupTable& part, std::span<const std::uint32_t> from,
+                              std::span<const std::uint32_t> to, std::uint32_t after);
   arrow::Status Account();
 
   std::vector<plan::BoundColumn> keys_;
@@ -83,6 +99,9 @@ class GroupTable {
   std::size_t next_chunk_ = 0;  // NextChunk: the next chunk and the group it starts at
   std::uint32_t next_group_ = 0;
   MemoryReservation memory_;  // the states' and chunk_groups_' containers
+  // After Partition: each partition's groups, and their unique normalized keys.
+  std::vector<std::vector<std::uint32_t>> partition_groups_;
+  std::vector<arrow::compute::ExecBatch> partition_uniques_;
 };
 
 }  // namespace antb1::exec

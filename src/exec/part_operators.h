@@ -84,8 +84,12 @@ class PartAggregateOperator final : public Operator {
 };
 
 // Grouped aggregation over a part pipeline: every part is grouped into its own GroupTable on the
-// executor, and the tables are merged in part order into one, whose groups are then emitted as
-// GroupAggregateOperator emits them. Output: as GroupAggregateOperator.
+// executor and split into partitions by the hash of its keys (GroupTable::Partition). The parts are
+// merged in part order into one table per partition; a part's partitions merge in parallel on the
+// executor, each partition's table touched by one task at a time. Then the partitions' groups are
+// emitted, partition by partition, as GroupAggregateOperator emits them. The partitions are a
+// constant, so the result is the same for any number of threads. Output: as
+// GroupAggregateOperator.
 class PartGroupAggregateOperator final : public Operator {
  public:
   PartGroupAggregateOperator(PartPipeline pipeline, int64_t num_parts, int input_width,
@@ -112,8 +116,15 @@ class PartGroupAggregateOperator final : public Operator {
   std::shared_ptr<arrow::Schema> schema_;
   arrow::MemoryPool* pool_ = arrow::default_memory_pool();
   MemoryBudget* budget_ = nullptr;
-  std::unique_ptr<GroupTable> table_;  // the merged groups, until emitted
+  arrow::internal::Executor* executor_ = nullptr;
+  // The merged groups of each partition (created with the first part), until emitted.
+  std::vector<std::unique_ptr<GroupTable>> tables_;
+  std::size_t next_table_ = 0;  // the partition being emitted
+  bool opened_ = false;
   bool merged_ = false;
+
+  // Merges a part's partitions into tables_, on the executor when there is one.
+  arrow::Status MergePart(const GroupTable& part);
   std::unique_ptr<PartScheduler<PartTable>> scheduler_;
 };
 

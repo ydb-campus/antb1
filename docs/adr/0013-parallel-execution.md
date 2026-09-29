@@ -154,8 +154,9 @@ The maintainer asked for this design to be ready for TPC-H: hash joins, and corr
 2. **engine and exec:** the pool, `--threads`, the part pipelines with the global-aggregate sink, the ordered part
    union with LIMIT early stop, the ordered merge window and error order. Tests with the `parallel` label.
 3. **engine and exec:** the session memory limit (`--memory-limit`, default 80% of physical memory).
-4. **exec:** the GROUP BY sink (grouper merge through group maps, first-seen keys by part). The merge is serial: a
-   radix-partitioned merge is the next step for high-cardinality GROUP BY.
+4. **exec:** the GROUP BY sink (grouper merge through group maps, first-seen keys by part), then its
+   radix-partitioned merge: 64 partitions by key hash (a constant, not the thread count), each merging the parts in
+   part order, the partitions in parallel.
 5. **exec:** the sort/top-N sink.
 6. **Docs:** ADRs 0003, 0006 and 0010 and the status of this ADR (semantics, architecture.md and benchmarks change
    with the PRs above).

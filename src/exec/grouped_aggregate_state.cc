@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <numeric>
 #include <optional>
 #include <span>
 #include <string>
@@ -15,6 +17,7 @@
 #include <vector>
 
 #include <arrow/api.h>
+#include <arrow/compute/api_vector.h>
 #include <arrow/compute/exec.h>
 #include <arrow/compute/row/grouper.h>
 #include <arrow/util/decimal.h>
@@ -57,18 +60,20 @@ std::int64_t VectorBytes(const Vectors&... vectors) {
 }
 
 template <class State>
-arrow::Result<const State*> SameKind(const GroupedAggregateState& other, GroupIds group_map,
+arrow::Result<const State*> SameKind(const GroupedAggregateState& other, GroupIds from, GroupIds to,
                                      std::uint32_t num_groups) {
   const auto* same = dynamic_cast<const State*>(&other);
   if (same == nullptr) {
     return arrow::Status::Invalid("cannot merge states of different aggregates");
   }
-  if (group_map.size() != other.num_groups()) {
-    return arrow::Status::Invalid("a group map of ", group_map.size(), " entries for ",
-                                  other.num_groups(), " groups");
+  if (from.size() != to.size()) {
+    return arrow::Status::Invalid("a merge of ", from.size(), " groups into ", to.size());
   }
-  if (!group_map.empty() && std::ranges::max(group_map) >= num_groups) {
-    return arrow::Status::Invalid("group map points outside the ", num_groups, " groups");
+  for (std::size_t i = 0; i < from.size(); ++i) {
+    if (from[i] >= other.num_groups() || to[i] >= num_groups) {
+      return arrow::Status::Invalid("a merge of group ", from[i], " of ", other.num_groups(),
+                                    " into group ", to[i], " of ", num_groups);
+    }
   }
   return same;
 }
@@ -163,10 +168,11 @@ class GroupedCount final : public GroupedAggregateState {
     }
     return arrow::Status::OK();
   }
-  arrow::Status Merge(const GroupedAggregateState& other, GroupIds map) override {
-    ARROW_ASSIGN_OR_RAISE(const auto* same, SameKind<GroupedCount>(other, map, num_groups()));
-    for (std::size_t g = 0; g < map.size(); ++g) {
-      counts_[map[g]] += same->counts_[g];
+  arrow::Status MergeGroups(const GroupedAggregateState& other, GroupIds from,
+                            GroupIds to) override {
+    ARROW_ASSIGN_OR_RAISE(const auto* same, SameKind<GroupedCount>(other, from, to, num_groups()));
+    for (std::size_t i = 0; i < from.size(); ++i) {
+      counts_[to[i]] += same->counts_[from[i]];
     }
     return arrow::Status::OK();
   }
@@ -217,11 +223,13 @@ class GroupedIntegerSum final : public GroupedAggregateState {
     }
     return arrow::Status::OK();
   }
-  arrow::Status Merge(const GroupedAggregateState& other, GroupIds map) override {
-    ARROW_ASSIGN_OR_RAISE(const auto* same, SameKind<GroupedIntegerSum>(other, map, num_groups()));
-    for (std::size_t g = 0; g < map.size(); ++g) {
-      sums_[map[g]] += same->sums_[g];
-      counts_[map[g]] += same->counts_[g];
+  arrow::Status MergeGroups(const GroupedAggregateState& other, GroupIds from,
+                            GroupIds to) override {
+    ARROW_ASSIGN_OR_RAISE(const auto* same,
+                          SameKind<GroupedIntegerSum>(other, from, to, num_groups()));
+    for (std::size_t i = 0; i < from.size(); ++i) {
+      sums_[to[i]] += same->sums_[from[i]];
+      counts_[to[i]] += same->counts_[from[i]];
     }
     return arrow::Status::OK();
   }
@@ -266,11 +274,13 @@ class GroupedTemporalAvg final : public GroupedAggregateState {
     }
     return arrow::Status::OK();
   }
-  arrow::Status Merge(const GroupedAggregateState& other, GroupIds map) override {
-    ARROW_ASSIGN_OR_RAISE(const auto* same, SameKind<GroupedTemporalAvg>(other, map, num_groups()));
-    for (std::size_t g = 0; g < map.size(); ++g) {
-      sums_[map[g]] += same->sums_[g];
-      counts_[map[g]] += same->counts_[g];
+  arrow::Status MergeGroups(const GroupedAggregateState& other, GroupIds from,
+                            GroupIds to) override {
+    ARROW_ASSIGN_OR_RAISE(const auto* same,
+                          SameKind<GroupedTemporalAvg>(other, from, to, num_groups()));
+    for (std::size_t i = 0; i < from.size(); ++i) {
+      sums_[to[i]] += same->sums_[from[i]];
+      counts_[to[i]] += same->counts_[from[i]];
     }
     return arrow::Status::OK();
   }
@@ -332,10 +342,12 @@ class GroupedHugeIntSum final : public GroupedAggregateState {
     }
     return arrow::Status::OK();
   }
-  arrow::Status Merge(const GroupedAggregateState& other, GroupIds map) override {
-    ARROW_ASSIGN_OR_RAISE(const auto* same, SameKind<GroupedHugeIntSum>(other, map, num_groups()));
-    for (std::size_t g = 0; g < map.size(); ++g) {
-      ARROW_RETURN_NOT_OK(Add(map[g], same->sums_[g], same->counts_[g]));
+  arrow::Status MergeGroups(const GroupedAggregateState& other, GroupIds from,
+                            GroupIds to) override {
+    ARROW_ASSIGN_OR_RAISE(const auto* same,
+                          SameKind<GroupedHugeIntSum>(other, from, to, num_groups()));
+    for (std::size_t i = 0; i < from.size(); ++i) {
+      ARROW_RETURN_NOT_OK(Add(to[i], same->sums_[from[i]], same->counts_[from[i]]));
     }
     return arrow::Status::OK();
   }
@@ -392,11 +404,13 @@ class GroupedDoubleSum final : public GroupedAggregateState {
     }
     return arrow::Status::OK();
   }
-  arrow::Status Merge(const GroupedAggregateState& other, GroupIds map) override {
-    ARROW_ASSIGN_OR_RAISE(const auto* same, SameKind<GroupedDoubleSum>(other, map, num_groups()));
-    for (std::size_t g = 0; g < map.size(); ++g) {
-      sums_[map[g]] += same->sums_[g];
-      counts_[map[g]] += same->counts_[g];
+  arrow::Status MergeGroups(const GroupedAggregateState& other, GroupIds from,
+                            GroupIds to) override {
+    ARROW_ASSIGN_OR_RAISE(const auto* same,
+                          SameKind<GroupedDoubleSum>(other, from, to, num_groups()));
+    for (std::size_t i = 0; i < from.size(); ++i) {
+      sums_[to[i]] += same->sums_[from[i]];
+      counts_[to[i]] += same->counts_[from[i]];
     }
     return arrow::Status::OK();
   }
@@ -502,16 +516,18 @@ class GroupedMinMax final : public GroupedAggregateState {
     }
     return arrow::Status::OK();
   }
-  arrow::Status Merge(const GroupedAggregateState& other, GroupIds map) override {
-    ARROW_ASSIGN_OR_RAISE(const auto* same, SameKind<GroupedMinMax>(other, map, num_groups()));
+  arrow::Status MergeGroups(const GroupedAggregateState& other, GroupIds from,
+                            GroupIds to) override {
+    ARROW_ASSIGN_OR_RAISE(const auto* same, SameKind<GroupedMinMax>(other, from, to, num_groups()));
     if (same->min_ != min_) {
       return arrow::Status::Invalid("cannot merge MIN with MAX");
     }
-    for (std::size_t g = 0; g < map.size(); ++g) {
+    for (std::size_t i = 0; i < from.size(); ++i) {
+      const std::uint32_t g = from[i];
       if (same->seen_[g] == Seen::kValue) {
-        Offer(map[g], Traits::View(same->best_[g]));
-      } else if (same->seen_[g] == Seen::kNaN && seen_[map[g]] == Seen::kNothing) {
-        seen_[map[g]] = Seen::kNaN;
+        Offer(to[i], Traits::View(same->best_[g]));
+      } else if (same->seen_[g] == Seen::kNaN && seen_[to[i]] == Seen::kNothing) {
+        seen_[to[i]] = Seen::kNaN;
       }
     }
     return arrow::Status::OK();
@@ -665,22 +681,33 @@ class GroupedCountDistinct final : public GroupedAggregateState {
     ARROW_ASSIGN_OR_RAISE(auto group_array, groups.Finish());
     return AddPairs(group_array, arrow::MakeArray(values->data()));
   }
-  arrow::Status Merge(const GroupedAggregateState& other, GroupIds map) override {
+  arrow::Status MergeGroups(const GroupedAggregateState& other, GroupIds from,
+                            GroupIds to) override {
     ARROW_ASSIGN_OR_RAISE(const auto* same,
-                          SameKind<GroupedCountDistinct>(other, map, num_groups()));
+                          SameKind<GroupedCountDistinct>(other, from, to, num_groups()));
     if (!same->type_->Equals(*type_)) {
       return arrow::Status::Invalid("cannot merge COUNT(DISTINCT) of different types");
     }
-    ARROW_ASSIGN_OR_RAISE(const arrow::compute::ExecBatch uniques, same->pairs_->GetUniques());
-    const auto their_groups =
-        std::static_pointer_cast<arrow::UInt32Array>(uniques.values.at(0).make_array());
+    ARROW_ASSIGN_OR_RAISE(const Pairs* pairs, same->PairsByGroup());
+    // The pairs of the merged groups, in the order of `from`.
     arrow::UInt32Builder groups(pool_);
-    ARROW_RETURN_NOT_OK(groups.Reserve(their_groups->length()));
-    for (std::int64_t i = 0; i < their_groups->length(); ++i) {
-      groups.UnsafeAppend(map[their_groups->Value(i)]);
+    arrow::Int64Builder rows(pool_);
+    for (std::size_t i = 0; i < from.size(); ++i) {
+      for (std::int64_t k = pairs->start[from[i]]; k < pairs->start[from[i] + 1]; ++k) {
+        ARROW_RETURN_NOT_OK(groups.Append(to[i]));
+        ARROW_RETURN_NOT_OK(rows.Append(pairs->order[static_cast<std::size_t>(k)]));
+      }
+    }
+    if (groups.length() == 0) {
+      return arrow::Status::OK();
     }
     ARROW_ASSIGN_OR_RAISE(auto group_array, groups.Finish());
-    return AddPairs(group_array, uniques.values.at(1).make_array());
+    ARROW_ASSIGN_OR_RAISE(const auto row_array, rows.Finish());
+    ARROW_ASSIGN_OR_RAISE(
+        const arrow::Datum values,
+        arrow::compute::Take(pairs->values, row_array, arrow::compute::TakeOptions::NoBoundsCheck(),
+                             kernels_.get()));
+    return AddPairs(group_array, values.make_array());
   }
   [[nodiscard]] arrow::Result<std::shared_ptr<arrow::Array>> Finalize(
       std::uint32_t begin, std::uint32_t end, arrow::MemoryPool* pool) const override {
@@ -731,11 +758,60 @@ class GroupedCountDistinct final : public GroupedAggregateState {
   std::shared_ptr<arrow::DataType> type_;
   arrow::MemoryPool* pool_;
   std::unique_ptr<arrow::compute::ExecContext> kernels_;
+  // The distinct pairs of a state merged into others, by group: computed once, then read by the
+  // merges, possibly from several threads at once (a partitioned merge reads each part's state
+  // from every partition).
+  struct Pairs {
+    std::shared_ptr<arrow::Array> values;  // the pairs' values
+    std::vector<std::int64_t> order;       // pair rows sorted by group
+    std::vector<std::int64_t> start;       // group g's pairs: order[start[g] .. start[g + 1])
+  };
+  arrow::Result<const Pairs*> PairsByGroup() const {
+    std::call_once(pairs_once_, [this] {
+      auto uniques = pairs_->GetUniques();
+      if (!uniques.ok()) {
+        pairs_status_ = uniques.status();
+        return;
+      }
+      const auto groups =
+          std::static_pointer_cast<arrow::UInt32Array>(uniques->values.at(0).make_array());
+      by_group_.values = uniques->values.at(1).make_array();
+      by_group_.start.assign(counts_.size() + 1, 0);
+      for (std::int64_t i = 0; i < groups->length(); ++i) {
+        ++by_group_.start[groups->Value(i) + 1];
+      }
+      for (std::size_t g = 1; g < by_group_.start.size(); ++g) {
+        by_group_.start[g] += by_group_.start[g - 1];
+      }
+      by_group_.order.resize(static_cast<std::size_t>(groups->length()));
+      std::vector<std::int64_t> next(by_group_.start.begin(), by_group_.start.end() - 1);
+      for (std::int64_t i = 0; i < groups->length(); ++i) {
+        by_group_.order[static_cast<std::size_t>(next[groups->Value(i)]++)] = i;
+      }
+    });
+    ARROW_RETURN_NOT_OK(pairs_status_);
+    return &by_group_;
+  }
+
   std::unique_ptr<arrow::compute::Grouper> pairs_;
   std::vector<std::int64_t> counts_;
+  mutable std::once_flag pairs_once_;
+  mutable arrow::Status pairs_status_;
+  mutable Pairs by_group_;
 };
 
 }  // namespace
+
+arrow::Status GroupedAggregateState::Merge(const GroupedAggregateState& other,
+                                           std::span<const std::uint32_t> group_map) {
+  if (group_map.size() != other.num_groups()) {
+    return arrow::Status::Invalid("a group map of ", group_map.size(), " entries for ",
+                                  other.num_groups(), " groups");
+  }
+  std::vector<std::uint32_t> from(group_map.size());
+  std::ranges::iota(from, 0U);
+  return MergeGroups(other, from, group_map);
+}
 
 arrow::Result<std::unique_ptr<GroupedAggregateState>> MakeGroupedAggregateState(
     plan::AggKind kind, std::optional<plan::LogicalType> input, plan::LogicalType result,

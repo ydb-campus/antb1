@@ -5,11 +5,14 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <new>
 #include <optional>
 #include <utility>
 #include <vector>
 
 #include <arrow/api.h>
+#include <arrow/util/future.h>
+#include <arrow/util/thread_pool.h>
 
 #include "antb1/exec/operator.h"
 #include "antb1/plan/logical_plan.h"
@@ -208,8 +211,9 @@ arrow::Status PartGroupAggregateOperator::Open(ExecContext& ctx) {
   ARROW_RETURN_NOT_OK(Close());
   pool_ = ctx.pool;
   budget_ = ctx.budget;
+  executor_ = ctx.executor;
   merged_ = false;
-  ARROW_ASSIGN_OR_RAISE(table_, GroupTable::Make(keys_, aggregates_, input_width_, pool_, budget_));
+  opened_ = true;
   auto task = [pipeline = pipeline_, part_ctx = PartContext(ctx), keys = keys_,
                aggregates = aggregates_, width = input_width_](
                   int64_t part, const std::atomic<bool>& stop) -> arrow::Result<PartTable> {
@@ -222,6 +226,7 @@ arrow::Status PartGroupAggregateOperator::Open(ExecContext& ctx) {
           ARROW_RETURN_NOT_OK(table->Consume(*rows));
           return true;
         }));
+    ARROW_RETURN_NOT_OK(table->Partition());  // on the worker, not on the merging thread
     return table;
   };
   scheduler_ = std::make_unique<PartScheduler<PartTable>>(num_parts_, std::move(task), ctx.executor,
@@ -229,32 +234,82 @@ arrow::Status PartGroupAggregateOperator::Open(ExecContext& ctx) {
   return arrow::Status::OK();
 }
 
-arrow::Result<Batch> PartGroupAggregateOperator::Next() {
-  if (table_ == nullptr) {
-    if (merged_) {
-      return Batch{};
+arrow::Status PartGroupAggregateOperator::MergePart(const GroupTable& part) {
+  const std::size_t partitions = part.num_partitions();
+  if (tables_.empty()) {
+    tables_.reserve(partitions);
+    for (std::size_t p = 0; p < partitions; ++p) {
+      ARROW_ASSIGN_OR_RAISE(auto table,
+                            GroupTable::Make(keys_, aggregates_, input_width_, pool_, budget_));
+      tables_.push_back(std::move(table));
     }
-    return arrow::Status::Invalid("part group aggregate: Next() before Open()");
+  }
+  if (tables_.size() != partitions) {
+    return arrow::Status::Invalid("a part of ", partitions, " partitions for ", tables_.size());
+  }
+  if (executor_ == nullptr || partitions == 1) {
+    for (std::size_t p = 0; p < partitions; ++p) {
+      ARROW_RETURN_NOT_OK(tables_[p]->MergePartition(part, p));
+    }
+    return arrow::Status::OK();
+  }
+  // Partitions are disjoint: each merges on the executor, and all finish before the next part.
+  std::vector<arrow::Future<>> merges;
+  merges.reserve(partitions);
+  arrow::Status submitted;
+  for (std::size_t p = 0; p < partitions && submitted.ok(); ++p) {
+    GroupTable* table = tables_[p].get();
+    auto merge = executor_->Submit([table, &part, p] -> arrow::Status {
+      try {
+        return table->MergePartition(part, p);
+      } catch (const std::bad_alloc&) {
+        return arrow::Status::OutOfMemory("out of memory while merging groups");
+      }
+    });
+    if (merge.ok()) {
+      merges.push_back(std::move(*merge));
+    } else {
+      submitted = merge.status();
+    }
+  }
+  arrow::Status status = submitted;
+  for (const arrow::Future<>& merge : merges) {  // every merge ends before `part` can go
+    const arrow::Status merged = merge.status();
+    if (status.ok()) {
+      status = merged;  // the first failed partition, in partition order
+    }
+  }
+  return status;
+}
+
+arrow::Result<Batch> PartGroupAggregateOperator::Next() {
+  if (!opened_) {
+    return arrow::Status::Invalid("part group aggregate: Next() before Open() or after Close()");
   }
   if (!merged_) {
     while (!scheduler_->done()) {
       ARROW_ASSIGN_OR_RAISE(const PartTable part, scheduler_->Next());
-      ARROW_RETURN_NOT_OK(table_->Merge(*part));
+      ARROW_RETURN_NOT_OK(MergePart(*part));
     }
     merged_ = true;
     scheduler_.reset();
   }
-  ARROW_ASSIGN_OR_RAISE(auto chunk, table_->NextChunk(schema_));
-  if (chunk == nullptr) {
-    table_.reset();  // gives the memory back
-    return Batch{};
+  while (next_table_ < tables_.size()) {
+    ARROW_ASSIGN_OR_RAISE(auto chunk, tables_[next_table_]->NextChunk(schema_));
+    if (chunk != nullptr) {
+      return Batch{.data = std::move(chunk), .selection = {}};
+    }
+    tables_[next_table_].reset();  // gives the memory back
+    ++next_table_;
   }
-  return Batch{.data = std::move(chunk), .selection = {}};
+  return Batch{};
 }
 
 arrow::Status PartGroupAggregateOperator::Close() {
   scheduler_.reset();
-  table_.reset();
+  tables_.clear();
+  next_table_ = 0;
+  opened_ = false;
   return arrow::Status::OK();
 }
 

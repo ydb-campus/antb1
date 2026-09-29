@@ -10,6 +10,7 @@
 #include <set>
 #include <span>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -325,6 +326,67 @@ TEST_F(GroupedAggregateTest, MergingPartialStatesGivesTheSinglePassResult) {
       } else {
         EXPECT_TRUE(a->Equals(*b, EqualNans())) << a->ToString() << " vs " << b->ToString();
       }
+    }
+  }
+}
+
+// MergeGroups folds a subset of groups: a state split by a partitioned merge into two (even groups
+// into one, odd into the other, merged at the same time from two threads, as the partitions of a
+// part merge) gives each group of the single state exactly once.
+TEST_F(GroupedAggregateTest, MergingSubsetsOfGroups) {
+  constexpr std::size_t kRows = 300;
+  constexpr std::uint32_t kGroups = 6;
+  Rng rng(11);
+  for (const LogicalType type : kTypes) {
+    const auto values = RandomColumn(type, kRows, rng);
+    std::vector<std::uint32_t> ids(kRows);
+    for (auto& id : ids) {
+      id = static_cast<std::uint32_t>(rng.Below(kGroups));
+    }
+    for (const Call& call : CallsOver(type)) {
+      SCOPED_TRACE(std::string(plan::ToString(call.kind)) + " of " +
+                   std::string(plan::ToString(type)));
+      auto part = MakeGrouped(call);
+      part->Resize(kGroups);
+      ASSERT_TRUE(part->Consume(call.input ? values.get() : nullptr, ids).ok());
+      auto even = MakeGrouped(call);
+      auto odd = MakeGrouped(call);
+      even->Resize(kGroups / 2);
+      odd->Resize(kGroups / 2);
+      const std::vector<std::uint32_t> evens = {4, 0, 2};  // in any order
+      const std::vector<std::uint32_t> odds = {1, 3, 5};
+      const std::vector<std::uint32_t> to_even = {2, 0, 1};
+      const std::vector<std::uint32_t> to_odd = {0, 1, 2};
+      arrow::Status even_status;
+      arrow::Status odd_status;
+      std::thread even_thread([&] { even_status = even->MergeGroups(*part, evens, to_even); });
+      std::thread odd_thread([&] { odd_status = odd->MergeGroups(*part, odds, to_odd); });
+      even_thread.join();
+      odd_thread.join();
+      ASSERT_TRUE(even_status.ok()) << even_status.ToString();
+      ASSERT_TRUE(odd_status.ok()) << odd_status.ToString();
+      const auto all = Finalized(*part);
+      const auto pick = [&](const std::vector<std::int64_t>& rows) {
+        arrow::Int64Builder builder;
+        EXPECT_TRUE(builder.AppendValues(rows).ok());
+        return arrow::compute::Take(all, builder.Finish().ValueOrDie()).ValueOrDie().make_array();
+      };
+      const auto expected_even = pick({0, 2, 4});
+      const auto expected_odd = pick({1, 3, 5});
+      EXPECT_TRUE(Finalized(*even)->Equals(*expected_even, EqualNans()))
+          << Finalized(*even)->ToString() << " vs " << expected_even->ToString();
+      EXPECT_TRUE(Finalized(*odd)->Equals(*expected_odd, EqualNans()))
+          << Finalized(*odd)->ToString() << " vs " << expected_odd->ToString();
+      // Groups out of range, and lists of different lengths, are Invalid.
+      EXPECT_TRUE(
+          even->MergeGroups(*part, std::vector<std::uint32_t>{6}, std::vector<std::uint32_t>{0})
+              .IsInvalid());
+      EXPECT_TRUE(
+          even->MergeGroups(*part, std::vector<std::uint32_t>{0}, std::vector<std::uint32_t>{3})
+              .IsInvalid());
+      EXPECT_TRUE(
+          even->MergeGroups(*part, std::vector<std::uint32_t>{0, 1}, std::vector<std::uint32_t>{0})
+              .IsInvalid());
     }
   }
 }

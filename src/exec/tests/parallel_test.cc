@@ -705,5 +705,87 @@ TEST_F(PartOperatorsTest, MergedGroupsComeInBoundedChunks) {
   EXPECT_TRUE(SameRows(*SortedRows(a), *SortedRows(b)));
 }
 
+// The partition of a group depends only on its key: the same on every run and build (with this
+// Arrow version), whatever the order of the groups or the number of threads. A change here changes
+// the order of GROUP BY results; update the golden only on purpose.
+TEST_F(PartOperatorsTest, PartitionsFollowTheKeyHash) {
+  const auto partitions_of = [](const plan::BoundColumn& key,
+                                const std::shared_ptr<arrow::Array>& column) {
+    auto table = GroupTable::Make({key}, {}, 1, arrow::default_memory_pool(), nullptr);
+    EXPECT_TRUE(table.ok());
+    const auto batch = arrow::RecordBatch::Make(arrow::schema({arrow::field("k", column->type())}),
+                                                column->length(), {column});
+    EXPECT_TRUE((*table)->Consume(*batch).ok());
+    EXPECT_TRUE((*table)->Partition().ok());
+    EXPECT_EQ((*table)->num_partitions(), GroupTable::kPartitions);
+    std::vector<std::size_t> out(static_cast<std::size_t>(column->length()));
+    for (std::size_t p = 0; p < GroupTable::kPartitions; ++p) {
+      for (const std::uint32_t group : (*table)->partition_groups(p)) {
+        out.at(group) = p;
+      }
+    }
+    return out;
+  };
+  const auto ints = partitions_of(Column(0, "k", LogicalType::kBigInt),
+                                  Int64s({1, 2, 3, 1000000, -5, std::nullopt}));
+  const auto strings =
+      partitions_of(Column(0, "k", LogicalType::kVarchar),
+                    testing::Strings({"a", "b", "", "https://example.org", std::nullopt}));
+  std::string golden;
+  for (const std::size_t p : ints) {
+    golden += std::to_string(p) + " ";
+  }
+  golden += "| ";
+  for (const std::size_t p : strings) {
+    golden += std::to_string(p) + " ";
+  }
+  EXPECT_EQ(golden, "24 13 0 22 60 12 | 26 30 37 35 12 ");
+}
+
+// A partition merge that fails on the executor (here: a HUGEINT sum past its range, reached only
+// when two parts' sums are added) fails the query with the same error on any number of threads;
+// a bad partition is Invalid; the operator is Invalid after Close.
+TEST_F(PartOperatorsTest, PartitionMergeErrors) {
+  const auto pool = Pool();
+  const auto schema = arrow::schema(
+      {arrow::field("k", arrow::int64()), arrow::field("h", arrow::decimal128(38, 0))});
+  arrow::RecordBatchVector batches;
+  for (int part = 0; part < 2; ++part) {
+    arrow::Decimal128Builder h(arrow::decimal128(38, 0));
+    ASSERT_TRUE(h.Append(arrow::Decimal128("60000000000000000000000000000000000000")).ok());
+    batches.push_back(arrow::RecordBatch::Make(schema, 1, {Int64s({1}), h.Finish().ValueOrDie()}));
+  }
+  const auto table = std::make_shared<MemoryTable>(schema, batches, /*split=*/true);
+  const auto plan =
+      PlanOf(Node(plan::GroupAggregateNode{
+                 .input = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}}),
+                 .keys = {Column(0, "k", LogicalType::kBigInt)},
+                 .aggregates = {{.kind = plan::AggKind::kSum,
+                                 .arg = Column(1, "h", LogicalType::kHugeInt),
+                                 .type = LogicalType::kHugeInt}}}),
+             2);
+  const auto serial = Run(plan, nullptr);
+  const auto parallel = Run(plan, pool.get());
+  EXPECT_TRUE(serial.status().IsExecutionError()) << serial.status().ToString();
+  EXPECT_EQ(parallel.status().ToString(), serial.status().ToString());
+
+  auto part = GroupTable::Make({Column(0, "k", LogicalType::kBigInt)}, {}, 2,
+                               arrow::default_memory_pool(), nullptr);
+  ASSERT_TRUE(part.ok());
+  ASSERT_TRUE((*part)->Consume(*batches[0]).ok());
+  ASSERT_TRUE((*part)->Partition().ok());
+  auto merged = GroupTable::Make({Column(0, "k", LogicalType::kBigInt)}, {}, 2,
+                                 arrow::default_memory_pool(), nullptr);
+  ASSERT_TRUE(merged.ok());
+  EXPECT_TRUE((*merged)->MergePartition(**part, GroupTable::kPartitions).IsInvalid());
+
+  auto op = BuildPhysicalPlan(plan);
+  ASSERT_TRUE(op.ok());
+  ExecContext ctx;
+  ASSERT_TRUE((*op)->Open(ctx).ok());
+  ASSERT_TRUE((*op)->Close().ok());
+  EXPECT_TRUE((*op)->Next().status().IsInvalid());
+}
+
 }  // namespace
 }  // namespace antb1::exec
