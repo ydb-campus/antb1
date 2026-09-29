@@ -22,8 +22,11 @@ namespace {
 
 // A part runs single-threaded: its operators never see the executor.
 ExecContext PartContext(const ExecContext& ctx) {
-  return ExecContext{
-      .pool = ctx.pool, .batch_size = ctx.batch_size, .executor = nullptr, .threads = 1};
+  return ExecContext{.pool = ctx.pool,
+                     .batch_size = ctx.batch_size,
+                     .executor = nullptr,
+                     .threads = 1,
+                     .budget = ctx.budget};
 }
 
 // The number of parts that may run ahead of the consumer.
@@ -99,7 +102,7 @@ arrow::Status PartUnionOperator::Open(ExecContext& ctx) {
     return batches;
   };
   scheduler_ = std::make_unique<PartScheduler<PartBatches>>(num_parts_, std::move(task),
-                                                            ctx.executor, Window(ctx));
+                                                            ctx.executor, Window(ctx), ctx.budget);
   return arrow::Status::OK();
 }
 
@@ -158,7 +161,7 @@ arrow::Status PartAggregateOperator::Open(ExecContext& ctx) {
     return shared;
   };
   scheduler_ = std::make_unique<PartScheduler<PartStates>>(num_parts_, std::move(task),
-                                                           ctx.executor, Window(ctx));
+                                                           ctx.executor, Window(ctx), ctx.budget);
   return arrow::Status::OK();
 }
 

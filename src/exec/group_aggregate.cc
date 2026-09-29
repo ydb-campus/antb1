@@ -54,6 +54,7 @@ GroupAggregateOperator::~GroupAggregateOperator() = default;
 
 arrow::Status GroupAggregateOperator::Open(ExecContext& ctx) {
   pool_ = ctx.pool;
+  memory_.Reset(ctx.budget);
   done_ = false;
   num_groups_ = 0;
   chunk_groups_.clear();
@@ -154,7 +155,21 @@ arrow::Status GroupAggregateOperator::ConsumeAggregates(const arrow::RecordBatch
         call.arg.has_value() ? rows.column(call.arg->index).get() : nullptr;
     ARROW_RETURN_NOT_OK(states_[i]->Consume(values, group_ids));
   }
-  return arrow::Status::OK();
+  return Account();
+}
+
+arrow::Status GroupAggregateOperator::Account() {
+  auto bytes = static_cast<std::int64_t>(chunk_groups_.capacity() * sizeof(std::uint32_t));
+  for (const auto& state : states_) {
+    bytes += state->memory_usage();
+  }
+  return memory_.Resize(bytes);
+}
+
+arrow::Status GroupAggregateOperator::Close() {
+  states_.clear();
+  memory_.Release();
+  return input_->Close();
 }
 
 arrow::Result<Batch> GroupAggregateOperator::Next() {
@@ -164,6 +179,7 @@ arrow::Result<Batch> GroupAggregateOperator::Next() {
   if (done_) {
     if (next_chunk_ >= chunk_groups_.size()) {
       states_.clear();
+      memory_.Release();
       return Batch{};
     }
     // One batch per chunk of new groups: its keys as first seen, the aggregates of those groups.
@@ -195,6 +211,7 @@ arrow::Result<Batch> GroupAggregateOperator::Next() {
   for (const auto& state : states_) {
     state->Resize(num_groups_);
   }
+  ARROW_RETURN_NOT_OK(Account());
   done_ = true;
   return Next();
 }

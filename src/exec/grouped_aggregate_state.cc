@@ -49,6 +49,13 @@ arrow::Status CheckRows(const arrow::Array* values, const arrow::DataType* expec
   return arrow::Status::OK();
 }
 
+// The bytes of vectors' storage (capacity), for memory_usage().
+template <class... Vectors>
+std::int64_t VectorBytes(const Vectors&... vectors) {
+  return (... +
+          static_cast<std::int64_t>(vectors.capacity() * sizeof(typename Vectors::value_type)));
+}
+
 template <class State>
 arrow::Result<const State*> SameKind(const GroupedAggregateState& other, GroupIds group_map,
                                      std::uint32_t num_groups) {
@@ -138,6 +145,7 @@ class GroupedCount final : public GroupedAggregateState {
     return static_cast<std::uint32_t>(counts_.size());
   }
   void Resize(std::uint32_t num_groups) override { counts_.resize(num_groups, 0); }
+  [[nodiscard]] std::int64_t memory_usage() const override { return VectorBytes(counts_); }
   arrow::Status Consume(const arrow::Array* values, GroupIds ids) override {
     if ((type_ == nullptr) != (values == nullptr)) {
       return arrow::Status::Invalid(type_ == nullptr ? "COUNT(*) takes no argument column"
@@ -191,6 +199,7 @@ class GroupedIntegerSum final : public GroupedAggregateState {
     sums_.resize(num_groups, 0);
     counts_.resize(num_groups, 0);
   }
+  [[nodiscard]] std::int64_t memory_usage() const override { return VectorBytes(sums_, counts_); }
   arrow::Status Consume(const arrow::Array* values, GroupIds ids) override {
     if (values == nullptr) {
       return arrow::Status::Invalid("SUM needs an argument column");
@@ -239,6 +248,7 @@ class GroupedTemporalAvg final : public GroupedAggregateState {
     sums_.resize(num_groups, 0);
     counts_.resize(num_groups, 0);
   }
+  [[nodiscard]] std::int64_t memory_usage() const override { return VectorBytes(sums_, counts_); }
   arrow::Status Consume(const arrow::Array* values, GroupIds ids) override {
     if (values == nullptr) {
       return arrow::Status::Invalid("AVG needs an argument column");
@@ -305,6 +315,7 @@ class GroupedHugeIntSum final : public GroupedAggregateState {
     sums_.resize(num_groups, 0);
     counts_.resize(num_groups, 0);
   }
+  [[nodiscard]] std::int64_t memory_usage() const override { return VectorBytes(sums_, counts_); }
   arrow::Status Consume(const arrow::Array* values, GroupIds ids) override {
     if (values == nullptr) {
       return arrow::Status::Invalid("SUM needs an argument column");
@@ -364,6 +375,7 @@ class GroupedDoubleSum final : public GroupedAggregateState {
     sums_.resize(num_groups, 0);
     counts_.resize(num_groups, 0);
   }
+  [[nodiscard]] std::int64_t memory_usage() const override { return VectorBytes(sums_, counts_); }
   arrow::Status Consume(const arrow::Array* values, GroupIds ids) override {
     if (values == nullptr) {
       return arrow::Status::Invalid("SUM needs an argument column");
@@ -471,6 +483,9 @@ class GroupedMinMax final : public GroupedAggregateState {
     best_.resize(num_groups);
     seen_.resize(num_groups, Seen::kNothing);
   }
+  [[nodiscard]] std::int64_t memory_usage() const override {
+    return VectorBytes(best_, seen_) + heap_;
+  }
   arrow::Status Consume(const arrow::Array* values, GroupIds ids) override {
     if (values == nullptr) {
       return arrow::Status::Invalid("MIN and MAX need an argument column");
@@ -542,14 +557,29 @@ class GroupedMinMax final : public GroupedAggregateState {
         return;
       }
     }
-    best_[group] = Traits::Store(value);
+    if constexpr (std::is_same_v<typename Traits::Stored, std::string>) {
+      heap_ -= HeapBytes(best_[group]);
+      best_[group] = Traits::Store(value);
+      heap_ += HeapBytes(best_[group]);
+    } else {
+      best_[group] = Traits::Store(value);
+    }
     seen_[group] = Seen::kValue;
+  }
+
+  // The bytes a stored VARCHAR holds outside its std::string (none within the small-string
+  // buffer).
+  static std::int64_t HeapBytes(const std::string& value) {
+    return value.capacity() > std::string().capacity()
+               ? static_cast<std::int64_t>(value.capacity()) + 1
+               : 0;
   }
 
   bool min_;
   std::shared_ptr<arrow::DataType> type_;
   std::vector<typename Traits::Stored> best_;
   std::vector<Seen> seen_;
+  std::int64_t heap_ = 0;  // HeapBytes of the VARCHAR values in best_
 };
 
 arrow::Result<std::unique_ptr<GroupedAggregateState>> SumState(bool average,
@@ -624,6 +654,7 @@ class GroupedCountDistinct final : public GroupedAggregateState {
     return static_cast<std::uint32_t>(counts_.size());
   }
   void Resize(std::uint32_t num_groups) override { counts_.resize(num_groups, 0); }
+  [[nodiscard]] std::int64_t memory_usage() const override { return VectorBytes(counts_); }
   arrow::Status Consume(const arrow::Array* values, GroupIds ids) override {
     if (values == nullptr) {
       return arrow::Status::Invalid("COUNT(DISTINCT) needs an argument column");

@@ -30,11 +30,14 @@ class FakeTable final : public Table {
 
   const std::shared_ptr<arrow::Schema>& schema() const override { return schema_; }
   std::optional<int64_t> exact_row_count() const override { return rows_; }
-  arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> Scan(
-      const std::vector<int>& /*fields*/, int64_t /*batch_size*/) const override {
+  std::string Describe() const override { return "fake"; }
+
+ protected:
+  arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScan(
+      const std::vector<int>& /*fields*/, int64_t /*batch_size*/,
+      arrow::MemoryPool* /*pool*/) const override {
     return arrow::Status::NotImplemented("fake tables cannot be scanned");
   }
-  std::string Describe() const override { return "fake"; }
 
  private:
   std::shared_ptr<arrow::Schema> schema_;

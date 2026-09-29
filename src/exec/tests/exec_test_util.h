@@ -116,34 +116,12 @@ class MemoryTable final : public plan::Table {
     }
     return rows;
   }
-  arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> Scan(const std::vector<int>& fields,
-                                                                int64_t batch_size) const override {
-    ++scans_;
-    return Read(batches_, fields, batch_size);
-  }
   int64_t num_parts() const override { return split_ ? static_cast<int64_t>(batches_.size()) : 1; }
   std::optional<int64_t> part_rows(int64_t part) const override {
     if (!split_) {
       return plan::Table::part_rows(part);
     }
     return part >= 0 && part < num_parts() ? std::optional(Batch(part)->num_rows()) : std::nullopt;
-  }
-  arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> ScanPart(
-      int64_t part, const std::vector<int>& fields, int64_t batch_size) const override {
-    if (!split_) {
-      return plan::Table::ScanPart(part, fields, batch_size);
-    }
-    if (part < 0 || part >= num_parts()) {
-      return arrow::Status::Invalid("no part ", part);
-    }
-    {
-      const std::scoped_lock lock(mutex_);
-      scanned_parts_.push_back(part);
-    }
-    if (failing_part_ == part) {
-      return arrow::Status::IOError("part ", part, " is broken");
-    }
-    return Read({Batch(part)}, fields, batch_size);
   }
   std::string Describe() const override { return "memory"; }
 
@@ -157,6 +135,32 @@ class MemoryTable final : public plan::Table {
   }
   // ScanPart(part) fails with an IOError naming the part.
   void FailPart(int64_t part) { failing_part_ = part; }
+
+ protected:
+  arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScan(
+      const std::vector<int>& fields, int64_t batch_size,
+      arrow::MemoryPool* /*pool*/) const override {
+    ++scans_;
+    return Read(batches_, fields, batch_size);
+  }
+  arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScanPart(
+      int64_t part, const std::vector<int>& fields, int64_t batch_size,
+      arrow::MemoryPool* pool) const override {
+    if (!split_) {
+      return plan::Table::DoScanPart(part, fields, batch_size, pool);
+    }
+    if (part < 0 || part >= num_parts()) {
+      return arrow::Status::Invalid("no part ", part);
+    }
+    {
+      const std::scoped_lock lock(mutex_);
+      scanned_parts_.push_back(part);
+    }
+    if (failing_part_ == part) {
+      return arrow::Status::IOError("part ", part, " is broken");
+    }
+    return Read({Batch(part)}, fields, batch_size);
+  }
 
  private:
   [[nodiscard]] const std::shared_ptr<arrow::RecordBatch>& Batch(int64_t part) const {

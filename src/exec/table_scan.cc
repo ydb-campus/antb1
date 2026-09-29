@@ -36,9 +36,9 @@ TableScanOperator::TableScanOperator(std::shared_ptr<plan::Table> table, std::ve
 
 arrow::Status TableScanOperator::Open(ExecContext& ctx) {
   if (part_.has_value()) {
-    ARROW_ASSIGN_OR_RAISE(reader_, table_->ScanPart(*part_, fields_, ctx.batch_size));
+    ARROW_ASSIGN_OR_RAISE(reader_, table_->ScanPart(*part_, fields_, ctx.batch_size, ctx.pool));
   } else {
-    ARROW_ASSIGN_OR_RAISE(reader_, table_->Scan(fields_, ctx.batch_size));
+    ARROW_ASSIGN_OR_RAISE(reader_, table_->Scan(fields_, ctx.batch_size, ctx.pool));
   }
   return arrow::Status::OK();
 }

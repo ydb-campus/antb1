@@ -2,6 +2,7 @@ antb1_add_module(
   exec
   SOURCES
     operator.cc
+    memory_budget.cc
     row_mask.cc
     double_key.cc
     aggregate_state.cc
@@ -37,6 +38,7 @@ if(ANTB1_BUILD_TESTS)
       tests/sort_test.cc
       tests/like_test.cc
       tests/parallel_test.cc
+      tests/memory_test.cc
     LIBS ArrowCompute::arrow_compute_shared
   )
 endif()

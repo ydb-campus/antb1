@@ -47,6 +47,7 @@ antb1 bench --queries queries.sql --table hits=/data/hits_0.parquet --clickbench
 - `--tries N` (default 3) runs of every query; `--out FILE` (`-` for stdout) the JSON.
 - `--threads N` (default: the hardware threads) threads that run the row groups of every query, as for
   `antb1 query`; the JSON records it.
+- `--memory-limit SIZE` (default: 80% of physical memory) as for `antb1 query`; the JSON records it in bytes.
 - `--machine TEXT` describes the machine (default: operating system, architecture and CPU count of the host);
   `--git-sha SHA` records the commit of the build.
 - `--drop-caches` (Linux) drops the page cache before the first run of every query, with
@@ -87,6 +88,7 @@ The JSON (timings shortened):
     "tries": 3,
     "batch_size": 65536,
     "threads": 16,
+    "memory_limit": 54975581388,
     "failed": [{"query": 1, "kind": "unsupported"}]
   }
 }

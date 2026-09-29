@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <new>
 #include <utility>
 
 #include <arrow/api.h>
@@ -48,11 +49,21 @@ arrow::Result<arrow::RecordBatchVector> PullAll(Operator& op, arrow::MemoryPool*
   }
 }
 
+// PullAll, with running out of memory outside the budget (std::bad_alloc from a container) as an
+// OutOfMemory status: no exception leaves exec.
+arrow::Result<arrow::RecordBatchVector> PullAllChecked(Operator& op, arrow::MemoryPool* pool) {
+  try {
+    return PullAll(op, pool);
+  } catch (const std::bad_alloc&) {
+    return arrow::Status::OutOfMemory("out of memory");
+  }
+}
+
 }  // namespace
 
 arrow::Result<std::shared_ptr<arrow::Table>> Drain(Operator& op, ExecContext& ctx) {
   ARROW_RETURN_NOT_OK(op.Open(ctx));
-  auto batches = PullAll(op, ctx.pool);
+  auto batches = PullAllChecked(op, ctx.pool);
   const arrow::Status closed = op.Close();  // also after a failure: release files and readers
   ARROW_RETURN_NOT_OK(batches.status());
   ARROW_RETURN_NOT_OK(closed);

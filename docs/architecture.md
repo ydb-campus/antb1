@@ -121,6 +121,20 @@ when it is reached: the same code, so a result does not depend on the thread cou
 order decides the error. Parts after the point where the consumer stops (a met `LIMIT`) are never started or are
 stopped at their next batch, and their errors are dropped.
 
+**Memory.** The `Session` owns an `exec::MemoryBudget` (`--memory-limit`, `engine::SessionOptions::memory_limit`):
+an Arrow memory pool that is `ExecContext::pool` for every query, and that the Parquet reader decodes into
+(`plan::Table::Scan` and `ScanPart` take the pool). It counts every buffer and, through `Reserve`, the containers
+operators keep outside Arrow buffers: the grouped aggregate states (`GroupedAggregateState::memory_usage`) and the
+sort buffer's row references (`SortBuffer::memory_usage`, plus `sort_memory` while it sorts), each held in an
+`exec::MemoryReservation` that gives the bytes back on `Close`. The count is atomic and checked before an
+allocation, so threads never pass the limit together; past it, an allocation fails with `Status::OutOfMemory` and
+nothing is left behind. A result keeps the budget alive (`QueryResult::memory`) as long as its buffers exist. The
+part scheduler's window adapts to the budget: every part taken above half of the limit halves it, every part taken
+below widens it by one, and above half no new part starts while another is in flight. A part that runs out of memory
+next to others does not fail the query: the parts ahead are dropped (and run again when reached) and it runs again
+alone. A `std::bad_alloc` from a
+container (outside the budget's view) is caught in the part tasks and in `Drain` and becomes `OutOfMemory` too.
+
 | Operator | Logical node | Does |
 | --- | --- | --- |
 | `TableScanOperator` | `Scan` | `plan::Table::ScanPart` (in a part pipeline) or `Scan` of the referenced fields only, in batches of `ExecContext::batch_size` rows (64Ki) |

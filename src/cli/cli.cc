@@ -11,6 +11,7 @@
 #include <istream>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <ostream>
 #include <span>
 #include <sstream>
@@ -34,6 +35,7 @@
 #include "antb1/plan/types.h"
 
 #include "cli_internal.h"
+#include "memory_size.h"
 #include <spawn.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -57,6 +59,9 @@ std::string_view ErrorKind(const arrow::Status& status) {
   if (status.IsExecutionError() || status.IsInvalid()) {
     return "execution";
   }
+  if (status.IsOutOfMemory()) {
+    return "memory";
+  }
   return "internal";
 }
 
@@ -73,6 +78,8 @@ struct Inputs {
   std::string format = "table";
   bool timing = false;
   int threads = 1;  // --threads (query and bench)
+  // --memory-limit (query and bench); std::nullopt for commands that run no query.
+  std::optional<std::string> memory_limit;
   BenchSettings bench;
 };
 
@@ -80,6 +87,22 @@ struct Inputs {
 int DefaultThreads() {
   const auto hardware = static_cast<int64_t>(std::thread::hardware_concurrency());
   return Narrow<int>(std::clamp<int64_t>(hardware, 1, engine::Session::kMaxThreads));
+}
+
+// --memory-limit, 80% of physical memory by default, as DuckDB's `memory_limit`.
+void AddMemoryLimitOption(CLI::App* cmd, Inputs& in) {
+  auto* option = cmd->add_option(
+      "--memory-limit", in.memory_limit,
+      "Memory a query may use, e.g. 4GB, 512MiB or 50% (default: 80% of physical memory); a "
+      "query that needs more fails with a memory error");
+  if (PhysicalMemory().has_value()) {  // else no limit by default
+    option->default_val("80%");
+  }
+  option->type_name("SIZE")->check([](const std::string& value) -> std::string {
+    return ParseMemorySize(value, PhysicalMemory()).has_value()
+               ? std::string()
+               : "expects a size such as 4GB, 512MiB or 50%, got '" + value + "'";
+  });
 }
 
 void AddThreadsOption(CLI::App* cmd, Inputs& in) {
@@ -166,6 +189,9 @@ arrow::Result<std::string> ReadSql(const Inputs& in, std::istream& stdin_stream)
 arrow::Result<std::unique_ptr<engine::Session>> MakeSession(const Inputs& in) {
   engine::SessionOptions options;
   options.threads = in.threads;
+  if (in.memory_limit.has_value()) {
+    options.memory_limit = ParseMemorySize(*in.memory_limit, PhysicalMemory());
+  }
   if (in.clickbench) {
     options.default_overrides.emplace_back("EventDate", plan::LogicalType::kDate);
   }
@@ -226,6 +252,7 @@ int Bench(engine::Session& session, const Inputs& in, double load_time, const Cl
                      .git_sha = in.bench.git_sha,
                      .batch_size = engine::SessionOptions{}.batch_size,
                      .threads = in.threads,
+                     .memory_limit = session.options().memory_limit,
                      .load_time = load_time};
   for (const auto& spec : in.tables) {
     const auto table = session.catalog().Find(spec.substr(0, spec.find('=')));
@@ -247,7 +274,7 @@ int ExitCodeFor(const arrow::Status& status) {
   if (status.IsIOError()) {
     return kExitIo;
   }
-  if (status.IsExecutionError() || status.IsInvalid()) {
+  if (status.IsExecutionError() || status.IsInvalid() || status.IsOutOfMemory()) {
     return kExitQueryError;
   }
   return kExitInternal;
@@ -267,6 +294,7 @@ int RunCli(std::span<const std::string> args, std::istream& in_stream, std::ostr
       ->check(CLI::IsMember({"table", "csv", "json"}));
   query->add_flag("--timing", in.timing, "Print elapsed seconds as the last stderr line");
   AddThreadsOption(query, in);
+  AddMemoryLimitOption(query, in);
 
   auto* explain = app.add_subcommand("explain", "Print the logical plan of a query");
   AddSqlOptions(explain, in);
@@ -292,6 +320,7 @@ int RunCli(std::span<const std::string> args, std::istream& in_stream, std::ostr
   bench->add_flag("--drop-caches", in.bench.drop_caches,
                   "Drop the page cache (sudo -n) before the first try of every query (Linux)");
   AddThreadsOption(bench, in);
+  AddMemoryLimitOption(bench, in);
 
   const auto* version = app.add_subcommand("version", "Print version information");
 

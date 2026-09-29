@@ -11,6 +11,7 @@
 #include <arrow/status.h>
 #include <arrow/type_fwd.h>
 
+#include "antb1/exec/memory_budget.h"
 #include "antb1/exec/operator.h"
 #include "antb1/plan/logical_plan.h"
 
@@ -93,6 +94,11 @@ class SortBuffer {
 
   // The number of rows (after Sort: the sorted rows).
   [[nodiscard]] int64_t num_rows() const { return rows_; }
+  // The bytes held outside Arrow buffers (the rows' batches are counted by their pool): the
+  // per-chunk vectors and the sorted row references.
+  [[nodiscard]] int64_t memory_usage() const;
+  // At most the bytes Sort holds on top of memory_usage() while it sorts.
+  [[nodiscard]] int64_t sort_memory() const;
   // Rows [begin, end) of the sorted order as one batch; call after Sort.
   [[nodiscard]] arrow::Result<std::shared_ptr<arrow::RecordBatch>> Slice(
       int64_t begin, int64_t end, arrow::MemoryPool* pool) const;
@@ -132,6 +138,7 @@ class SortOperator final : public Operator {
   std::optional<int64_t> limit_;
   int64_t offset_ = 0;
   arrow::MemoryPool* pool_ = arrow::default_memory_pool();
+  MemoryReservation memory_;  // the buffer's own containers
   int64_t batch_size_ = 1;
   std::unique_ptr<SortBuffer> buffer_;
   int64_t next_ = 0;  // the next sorted row to emit

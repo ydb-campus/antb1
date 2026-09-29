@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -19,6 +20,8 @@
 
 #include "antb1/common/version.h"
 #include "antb1/plan/sql_status.h"
+
+#include "../memory_size.h"
 
 namespace antb1::cli {
 namespace {
@@ -109,9 +112,27 @@ TEST(ExitCodeTest, Mapping) {
   EXPECT_EQ(ExitCodeFor(plan::BindError("x", {})), kExitQueryError);
   EXPECT_EQ(ExitCodeFor(arrow::Status::IOError("x")), kExitIo);
   EXPECT_EQ(ExitCodeFor(arrow::Status::ExecutionError("overflow")), kExitQueryError);
+  EXPECT_EQ(ExitCodeFor(arrow::Status::OutOfMemory("limit")), kExitQueryError);
   // A bare NotImplemented (e.g. a missing kernel) is a bug, not an "unsupported query".
   EXPECT_EQ(ExitCodeFor(arrow::Status::NotImplemented("kernel")), kExitInternal);
   EXPECT_EQ(ExitCodeFor(arrow::Status::TypeError("x")), kExitInternal);
+}
+
+TEST(MemorySizeTest, Parses) {
+  const std::optional<int64_t> physical = int64_t{16} * 1000 * 1000 * 1000;
+  EXPECT_EQ(ParseMemorySize("123", physical), 123);
+  EXPECT_EQ(ParseMemorySize(" 500KB ", physical), 500'000);
+  EXPECT_EQ(ParseMemorySize("1.5gb", physical), 1'500'000'000);
+  EXPECT_EQ(ParseMemorySize("2GiB", physical), int64_t{2} * 1024 * 1024 * 1024);
+  EXPECT_EQ(ParseMemorySize("1 TiB", physical), int64_t{1024} * 1024 * 1024 * 1024);
+  EXPECT_EQ(ParseMemorySize("10mb", physical), 10'000'000);
+  EXPECT_EQ(ParseMemorySize("64B", physical), 64);
+  EXPECT_EQ(ParseMemorySize("80%", physical), int64_t{12'800'000'000});
+  EXPECT_EQ(ParseMemorySize("50%", std::nullopt), std::nullopt);
+  for (const char* bad : {"", "GB", "-1GB", "0", "0.5", "12XB", "101%", "1e30", "nan", "4 G B"}) {
+    EXPECT_EQ(ParseMemorySize(bad, physical), std::nullopt) << bad;
+  }
+  EXPECT_GT(PhysicalMemory().value_or(0), 0);
 }
 
 TEST_F(CliTest, QueryCountStarJson) {
@@ -225,10 +246,10 @@ TEST_F(CliTest, BenchWritesClickBenchJson) {
                 "'2000-01-01'\r\nSELECT COUNT(*) FROM t JOIN u USING (x);\n");
   const auto out = (dir_ / "result.json").string();
   const auto drops = std::make_shared<int>(0);
-  std::vector<std::string> args{"bench",      "--clickbench", "--queries", queries,  "--table",
-                                "t=" + path_, "--tries",      "2",         "--out",  out,
-                                "--machine",  "test machine", "--git-sha", "abc123", "--threads",
-                                "1"};
+  std::vector<std::string> args{"bench",      "--clickbench",   "--queries", queries,  "--table",
+                                "t=" + path_, "--tries",        "2",         "--out",  out,
+                                "--machine",  "test machine",   "--git-sha", "abc123", "--threads",
+                                "1",          "--memory-limit", "4GB"};
   if (kCanDropCaches) {
     args.emplace_back("--drop-caches");
   }
@@ -271,6 +292,7 @@ TEST_F(CliTest, BenchWritesClickBenchJson) {
     "tries": 2,
     "batch_size": 65536,
     "threads": 1,
+    "memory_limit": 4000000000,
     "failed": [{{"query": 2, "kind": "unsupported"}}]
   }}
 }}

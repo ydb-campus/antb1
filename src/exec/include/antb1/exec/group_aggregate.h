@@ -8,6 +8,7 @@
 #include <arrow/type_fwd.h>
 
 #include "antb1/exec/grouped_aggregate_state.h"
+#include "antb1/exec/memory_budget.h"
 #include "antb1/exec/operator.h"
 #include "antb1/plan/logical_plan.h"
 
@@ -43,12 +44,14 @@ class GroupAggregateOperator final : public Operator {
   }
   arrow::Status Open(ExecContext& ctx) override;
   arrow::Result<Batch> Next() override;
-  arrow::Status Close() override { return input_->Close(); }
+  arrow::Status Close() override;
 
  private:
   arrow::Status Consume(const arrow::RecordBatch& rows);
   arrow::Status ConsumeAggregates(const arrow::RecordBatch& rows,
                                   std::span<const std::uint32_t> group_ids);
+  // Charges the states' own containers to the budget.
+  arrow::Status Account();
 
   std::unique_ptr<Operator> input_;
   std::vector<plan::BoundColumn> keys_;
@@ -66,6 +69,7 @@ class GroupAggregateOperator final : public Operator {
   // After the input: the next chunk of first_keys_ to emit and the group it starts at.
   std::size_t next_chunk_ = 0;
   std::uint32_t next_group_ = 0;
+  MemoryReservation memory_;  // the states' and chunk_groups_' containers
 };
 
 }  // namespace antb1::exec
