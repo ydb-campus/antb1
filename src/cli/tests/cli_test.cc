@@ -225,9 +225,10 @@ TEST_F(CliTest, BenchWritesClickBenchJson) {
                 "'2000-01-01'\r\nSELECT COUNT(*) FROM t JOIN u USING (x);\n");
   const auto out = (dir_ / "result.json").string();
   const auto drops = std::make_shared<int>(0);
-  std::vector<std::string> args{"bench",      "--clickbench", "--queries", queries, "--table",
-                                "t=" + path_, "--tries",      "2",         "--out", out,
-                                "--machine",  "test machine", "--git-sha", "abc123"};
+  std::vector<std::string> args{"bench",      "--clickbench", "--queries", queries,  "--table",
+                                "t=" + path_, "--tries",      "2",         "--out",  out,
+                                "--machine",  "test machine", "--git-sha", "abc123", "--threads",
+                                "1"};
   if (kCanDropCaches) {
     args.emplace_back("--drop-caches");
   }
@@ -269,6 +270,7 @@ TEST_F(CliTest, BenchWritesClickBenchJson) {
     "cache": "{}",
     "tries": 2,
     "batch_size": 65536,
+    "threads": 1,
     "failed": [{{"query": 2, "kind": "unsupported"}}]
   }}
 }}

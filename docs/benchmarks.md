@@ -45,6 +45,8 @@ antb1 bench --queries queries.sql --table hits=/data/hits_0.parquet --clickbench
   0 as ClickBench does.
 - `--table NAME=PATH[,PATH|GLOB]`, `--clickbench` and `--column-type` work as for `antb1 query`.
 - `--tries N` (default 3) runs of every query; `--out FILE` (`-` for stdout) the JSON.
+- `--threads N` (default: the hardware threads) threads that run the row groups of every query, as for
+  `antb1 query`; the JSON records it.
 - `--machine TEXT` describes the machine (default: operating system, architecture and CPU count of the host);
   `--git-sha SHA` records the commit of the build.
 - `--drop-caches` (Linux) drops the page cache before the first run of every query, with
@@ -84,6 +86,7 @@ The JSON (timings shortened):
     "cache": "lukewarm",
     "tries": 3,
     "batch_size": 65536,
+    "threads": 16,
     "failed": [{"query": 1, "kind": "unsupported"}]
   }
 }

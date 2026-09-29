@@ -1,5 +1,5 @@
 # Test registration helpers. Labels (docs/testing.md, R008): unit integration slt oracle diff metamorphic cli
-# harness fuzz-replay fuzz bench-smoke data setup.
+# parallel harness fuzz-replay fuzz bench-smoke data setup.
 include_guard(GLOBAL)
 
 # Parquet fixtures written by the `fixtures.generate` test (tools/fixturegen); tests that read them declare

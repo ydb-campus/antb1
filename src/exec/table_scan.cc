@@ -1,6 +1,8 @@
 #include "antb1/exec/table_scan.h"
 
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -25,11 +27,19 @@ std::shared_ptr<arrow::Schema> FieldsOf(const plan::Table& table, const std::vec
 
 }  // namespace
 
-TableScanOperator::TableScanOperator(std::shared_ptr<plan::Table> table, std::vector<int> fields)
-    : table_(std::move(table)), fields_(std::move(fields)), schema_(FieldsOf(*table_, fields_)) {}
+TableScanOperator::TableScanOperator(std::shared_ptr<plan::Table> table, std::vector<int> fields,
+                                     std::optional<int64_t> part)
+    : table_(std::move(table)),
+      fields_(std::move(fields)),
+      part_(part),
+      schema_(FieldsOf(*table_, fields_)) {}
 
 arrow::Status TableScanOperator::Open(ExecContext& ctx) {
-  ARROW_ASSIGN_OR_RAISE(reader_, table_->Scan(fields_, ctx.batch_size));
+  if (part_.has_value()) {
+    ARROW_ASSIGN_OR_RAISE(reader_, table_->ScanPart(*part_, fields_, ctx.batch_size));
+  } else {
+    ARROW_ASSIGN_OR_RAISE(reader_, table_->Scan(fields_, ctx.batch_size));
+  }
   return arrow::Status::OK();
 }
 

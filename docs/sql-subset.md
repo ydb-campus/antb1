@@ -345,8 +345,9 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   return BIGINT, 0 over no values.
 - SUM: over integer columns it accumulates in 128 bits and returns HUGEINT (decimal128(38, 0)), exactly like
   DuckDB, so it never overflows or wraps; Arrow's 64-bit `sum` kernel is never used. A sum outside HUGEINT's range
-  (only possible over a HUGEINT column) is an execution error (divergence D9). Over DOUBLE it returns DOUBLE, adding
-  the values in row order.
+  (only possible over a HUGEINT column) is an execution error (divergence D9). Over DOUBLE it returns DOUBLE: with
+  `GROUP BY` it adds the values in row order; without, it adds each row group's values, then the row group sums in
+  order (the same for any number of threads; see Execution below). DOUBLE `AVG` sums the same way.
 - AVG: over integer columns the sum accumulates exactly in 128 bits and is divided by the count once at the end, so
   the DOUBLE result is accurate to about one ulp (the oracle tests use a tight relative tolerance). Over DOUBLE it
   returns DOUBLE. Over DATE and TIMESTAMP it averages the microseconds (a DATE's midnight; its infinities as the
@@ -411,7 +412,10 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   `LIMIT` or `OFFSET`, any rows of the full answer are right).
 - VARCHAR: values are raw bytes. Unannotated BYTE_ARRAY columns (as in ClickBench) are VARCHAR and are never
   validated as UTF-8.
-- Execution: single-threaded, files and row groups in order, 64Ki-row batches; results are deterministic.
+- Execution: the row groups of a query run on `--threads` threads (default: the hardware threads), 64Ki-row
+  batches; their results are combined in file and row group order, so a result is the same for any number of
+  threads, and deterministic. A DOUBLE `SUM` or `AVG` without `GROUP BY` adds up every row group, then the row
+  group sums in order: it can differ from one running sum (and from DuckDB) by rounding.
 
 ## Output formats
 

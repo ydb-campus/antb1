@@ -37,6 +37,8 @@
 
 #include <CLI/CLI.hpp>
 
+#include "antb1/engine/session.h"
+
 #include "antb1_engine.h"
 #include "clickbench.h"
 #include "difftest.h"
@@ -69,6 +71,11 @@ struct Args {
   std::string test_name;
   std::string mutate = "none";
   bool redact = false;
+  // antb1 engine::SessionOptions; --same-as-threads also runs every query with that many threads
+  // and requires identical results.
+  int threads = 1;
+  int64_t batch_size = engine::SessionOptions{}.batch_size;
+  std::optional<int> same_as_threads;
   std::vector<std::string> files;
   // diff
   uint64_t seed = 0;
@@ -155,11 +162,23 @@ std::expected<std::unique_ptr<Engine>, std::string> MakeEngine(std::string_view 
                                                                const std::vector<TableDef>& tables,
                                                                const Args& args) {
   if (name == "antb1") {
-    auto engine = Antb1Engine::Make(tables);
+    engine::SessionOptions options;
+    options.threads = args.threads;
+    options.batch_size = args.batch_size;
+    auto engine = Antb1Engine::Make(tables, options);
     if (!engine) {
       return std::unexpected(engine.error());
     }
-    return std::unique_ptr<Engine>(std::move(*engine));
+    if (!args.same_as_threads.has_value()) {
+      return std::unique_ptr<Engine>(std::move(*engine));
+    }
+    options.threads = *args.same_as_threads;
+    auto reference = Antb1Engine::Make(tables, options);
+    if (!reference) {
+      return std::unexpected(reference.error());
+    }
+    return MakeSameResultEngine(std::move(*engine), std::move(*reference),
+                                std::format("{} thread(s)", *args.same_as_threads));
   }
 #ifdef ANTB1_SLT_HAVE_DUCKDB
   auto engine = DuckDbEngine::Make(tables, args.fixtures, args.temp_dir);
@@ -277,6 +296,13 @@ void AddSetup(CLI::App* cmd, Args& args) {
   cmd->add_option("--temp-dir", args.temp_dir,
                   "DuckDB temp directory (default: <fixtures>/../slt-tmp)");
   cmd->add_option("--test-name", args.test_name, "ctest name, for the repro line");
+  cmd->add_option("--threads", args.threads, "antb1: threads of the engine (default 1)")
+      ->check(CLI::Range(1, engine::Session::kMaxThreads));
+  cmd->add_option("--batch-size", args.batch_size, "antb1: rows per batch (default 65536)")
+      ->check(CLI::Range(int64_t{1}, int64_t{1'073'741'824}));
+  cmd->add_option("--same-as-threads", args.same_as_threads,
+                  "antb1: also run every query with this many threads; results must be identical")
+      ->check(CLI::Range(1, engine::Session::kMaxThreads));
 }
 
 void AddCommon(CLI::App* cmd, Args& args) {

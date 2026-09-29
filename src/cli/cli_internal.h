@@ -47,6 +47,7 @@ struct BenchReport {
   bool cold = false;  // page cache dropped before every query's first try
   int tries = 0;
   int64_t batch_size = 0;
+  int threads = 0;
   double load_time = 0;
   int64_t data_size = 0;
   std::vector<BenchQuery> queries;

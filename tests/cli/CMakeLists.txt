@@ -8,35 +8,47 @@ set(_count "SELECT COUNT(*) FROM t")
 # ---- output formats ----
 antb1_add_cli_golden(
   query_table
-  ARGS query -c "${_count}" --table "${_t}"
+  ARGS query --threads 1 -c "${_count}" --table "${_t}"
 )
 antb1_add_cli_golden(
   query_csv
-  ARGS query -c "${_count}" --table "${_t}" --format csv
+  ARGS query --threads 1 -c "${_count}" --table "${_t}" --format csv
 )
 antb1_add_cli_golden(
   query_json
-  ARGS query -c "${_count}" --table "${_t}" --format json
+  ARGS query --threads 1 -c "${_count}" --table "${_t}" --format json
 )
 antb1_add_cli_golden(
   query_empty_table
-  ARGS query -c "${_count}" --table "t=${_f}/empty.parquet" --format csv
+  ARGS query --threads 1 -c "${_count}" --table "t=${_f}/empty.parquet" --format csv
 )
 
 # ---- results of every query shape (our own queries over the fixtures) ----
 set(_aggregates "SELECT COUNT(*), COUNT(Title), SUM(UserID), AVG(ResolutionWidth), MIN(EventDate), MAX(URL) FROM t")
 antb1_add_cli_golden(
   query_aggregates
-  ARGS query --clickbench -c "${_aggregates}" --table "${_t}"
+  ARGS query --threads 1 --clickbench -c "${_aggregates}" --table "${_t}"
 )
 antb1_add_cli_golden(
   query_aggregates_json
-  ARGS query --clickbench -c "${_aggregates} WHERE RegionID < 5000 AND IsMobile <> 0" --table "${_t}" --format json
+  ARGS
+    query
+    --threads
+    1
+    --clickbench
+    -c
+    "${_aggregates} WHERE RegionID < 5000 AND IsMobile <> 0"
+    --table
+    "${_t}"
+    --format
+    json
 )
 antb1_add_cli_golden(
   query_aggregates_empty
   ARGS
     query
+    --threads
+    1
     -c
     "SELECT COUNT(*), COUNT(Title), SUM(RegionID) AS s, AVG(RegionID), MIN(Title), MAX(WatchID) FROM t WHERE RegionID > 70000"
     --table
@@ -46,12 +58,23 @@ antb1_add_cli_golden(
 )
 antb1_add_cli_golden(
   query_aggregates_empty_json
-  ARGS query -c "SELECT COUNT(*), SUM(RegionID), MIN(Title) FROM t WHERE RegionID = 1.5" --table "${_t}" --format json
+  ARGS
+    query
+    --threads
+    1
+    -c
+    "SELECT COUNT(*), SUM(RegionID), MIN(Title) FROM t WHERE RegionID = 1.5"
+    --table
+    "${_t}"
+    --format
+    json
 )
 antb1_add_cli_golden(
   query_projection
   ARGS
     query
+    --threads
+    1
     --clickbench
     -c
     "SELECT WatchID, EventDate, ResolutionWidth AS width, SearchPhrase FROM t WHERE SearchPhrase <> '' AND RegionID < 3000 LIMIT 4"
@@ -60,12 +83,14 @@ antb1_add_cli_golden(
 )
 antb1_add_cli_golden(
   query_projection_csv
-  ARGS query -c "SELECT id, i64, d, s FROM t WHERE id <= 4" --table "t=${_f}/edge.parquet" --format csv
+  ARGS query --threads 1 -c "SELECT id, i64, d, s FROM t WHERE id <= 4" --table "t=${_f}/edge.parquet" --format csv
 )
 antb1_add_cli_golden(
   query_projection_json
   ARGS
     query
+    --threads
+    1
     -c
     "SELECT id, i64, d, s, u FROM edge WHERE id >= 5 AND id <> 7 LIMIT 4"
     --table
@@ -75,11 +100,18 @@ antb1_add_cli_golden(
 )
 antb1_add_cli_golden(
   query_limit_zero
-  ARGS query -c "SELECT Title FROM t LIMIT 0" --table "${_t}" --format csv
+  ARGS query --threads 1 -c "SELECT Title FROM t LIMIT 0" --table "${_t}" --format csv
 )
 antb1_add_cli_golden(
   query_edge_aggregates
-  ARGS query -c "SELECT SUM(i64), SUM(u16), AVG(i64), MAX(d), MIN(s) FROM edge" --table "edge=${_f}/edge.parquet"
+  ARGS
+    query
+    --threads
+    1
+    -c
+    "SELECT SUM(i64), SUM(u16), AVG(i64), MAX(d), MIN(s) FROM edge"
+    --table
+    "edge=${_f}/edge.parquet"
 )
 
 # ---- bench: ClickBench-format JSON (docs/benchmarks.md); timings vary, so regexes ----
@@ -95,6 +127,7 @@ string(APPEND _bench_json "  \"concurrent_qps\": null,\n  \"concurrent_error_rat
 string(APPEND _bench_json "    [[]${_num}, ${_num}[]],\n    [[]${_num}, ${_num}[]],\n")
 string(APPEND _bench_json "    [[]null, null[]],\n    [[]null, null[]]\n  []],\n  \"antb1\": [{]\n")
 string(APPEND _bench_json ".*    \"cache\": \"lukewarm\",\n    \"tries\": 2,\n    \"batch_size\": 65536,\n")
+string(APPEND _bench_json "    \"threads\": 1,\n")
 string(APPEND _bench_json "    \"failed\": [[][{]\"query\": 2, \"kind\": \"unsupported\"[}], ")
 string(APPEND _bench_json "[{]\"query\": 3, \"kind\": \"bind\"[}][]]\n  [}]\n[}]$")
 set(_bench_log "^Q0: ${_num} ${_num}\nQ1: ${_num} ${_num}\nQ2: unsupported error\nQ3: bind error\n")
@@ -103,39 +136,41 @@ antb1_add_cli_golden(
   bench
   STDOUT_REGEX "${_bench_json}"
   STDERR_REGEX "${_bench_log}"
-  ARGS bench --clickbench --queries "${_sql}/bench.sql" --table "${_t}" --tries 2 --out -
+  ARGS bench --threads 1 --clickbench --queries "${_sql}/bench.sql" --table "${_t}" --tries 2 --out -
 )
 antb1_add_cli_golden(
   bench_missing_queries
   EXIT_CODE 3
   STDERR_REGEX "^antb1: io error: cannot read the query file '[$][{]FIXTURES[}]/no_such[.]sql'$"
-  ARGS bench --queries "${_f}/no_such.sql" --table "${_t}" --out -
+  ARGS bench --threads 1 --queries "${_f}/no_such.sql" --table "${_t}" --out -
 )
 antb1_add_cli_golden(
   usage_bench_tries
   EXIT_CODE 2
   STDERR_REGEX "--tries"
-  ARGS bench --queries "${_sql}/bench.sql" --table "${_t}" --tries 0 --out -
+  ARGS bench --threads 1 --queries "${_sql}/bench.sql" --table "${_t}" --tries 0 --out -
 )
 
 # ---- SQL sources and table forms ----
 antb1_add_cli_golden(
   query_file
-  ARGS query -f "${_sql}/count_star.sql" --table "${_t}" --format csv
+  ARGS query --threads 1 -f "${_sql}/count_star.sql" --table "${_t}" --format csv
 )
 antb1_add_cli_golden(
   query_stdin
   INPUT "${_sql}/count_star.sql"
-  ARGS query -c - --table "${_t}" --format csv
+  ARGS query --threads 1 -c - --table "${_t}" --format csv
 )
 antb1_add_cli_golden(
   query_table_glob
-  ARGS query -c "${_count}" --table "t=${_f}/hits_like_split/part-*.parquet" --format csv
+  ARGS query --threads 1 -c "${_count}" --table "t=${_f}/hits_like_split/part-*.parquet" --format csv
 )
 antb1_add_cli_golden(
   query_table_list
   ARGS
     query
+    --threads
+    1
     -c
     "${_count}"
     --table
@@ -145,11 +180,11 @@ antb1_add_cli_golden(
 )
 antb1_add_cli_golden(
   query_from_path
-  ARGS query -c "SELECT COUNT(*) FROM '${_f}/hits_like_split/part-[12].parquet'" --format csv
+  ARGS query --threads 1 -c "SELECT COUNT(*) FROM '${_f}/hits_like_split/part-[12].parquet'" --format csv
 )
 antb1_add_cli_golden(
   query_timing
-  ARGS query -c "${_count}" --table "${_t}" --format csv --timing
+  ARGS query --threads 1 -c "${_count}" --table "${_t}" --format csv --timing
   STDERR_REGEX "^[0-9]+[.][0-9][0-9][0-9][0-9][0-9][0-9]$"
 )
 
@@ -158,31 +193,38 @@ antb1_add_cli_golden(
   error_parse
   EXIT_CODE 1
   STDERR
-  ARGS query -c "SELECT COUNT(*) FROM" --table "${_t}"
+  ARGS query --threads 1 -c "SELECT COUNT(*) FROM" --table "${_t}"
 )
 antb1_add_cli_golden(
   error_bind
   EXIT_CODE 1
   STDERR
-  ARGS query -c "SELECT COUNT(*) FROM nope" --table "${_t}"
+  ARGS query --threads 1 -c "SELECT COUNT(*) FROM nope" --table "${_t}"
 )
 antb1_add_cli_golden(
   error_bind_json
   EXIT_CODE 1
   STDERR
-  ARGS query -c "SELECT COUNT(*)\nFROM nope" --table "${_t}" --format json
+  ARGS query --threads 1 -c "SELECT COUNT(*)\nFROM nope" --table "${_t}" --format json
 )
 antb1_add_cli_golden(
   unsupported
   EXIT_CODE 4
   STDERR
-  ARGS query -c "SELECT CounterID, COUNT(*) FROM t JOIN u USING (CounterID) GROUP BY CounterID" --table "${_t}"
+  ARGS
+    query
+    --threads
+    1
+    -c
+    "SELECT CounterID, COUNT(*) FROM t JOIN u USING (CounterID) GROUP BY CounterID"
+    --table
+    "${_t}"
 )
 antb1_add_cli_golden(
   unsupported_json
   EXIT_CODE 4
   STDERR
-  ARGS query -c "SELECT SUM(AdvEngineID) FROM t JOIN u USING (AdvEngineID)" --table "${_t}" --format json
+  ARGS query --threads 1 -c "SELECT SUM(AdvEngineID) FROM t JOIN u USING (AdvEngineID)" --table "${_t}" --format json
 )
 antb1_add_cli_golden(
   unsupported_explain
@@ -194,13 +236,13 @@ antb1_add_cli_golden(
   unsupported_where
   EXIT_CODE 4
   STDERR
-  ARGS query -c "SELECT COUNT(*) FROM t\nWHERE IsMobile = 1 OR IsRefresh IS NULL" --table "${_t}"
+  ARGS query --threads 1 -c "SELECT COUNT(*) FROM t\nWHERE IsMobile = 1 OR IsRefresh IS NULL" --table "${_t}"
 )
 antb1_add_cli_golden(
   error_bind_column
   EXIT_CODE 1
   STDERR
-  ARGS query -c "SELECT COUNT(*) FROM t WHERE nope = 1" --table "${_t}"
+  ARGS query --threads 1 -c "SELECT COUNT(*) FROM t WHERE nope = 1" --table "${_t}"
 )
 antb1_add_cli_golden(
   error_bind_aggregate
@@ -212,27 +254,38 @@ antb1_add_cli_golden(
   error_bind_literal_json
   EXIT_CODE 1
   STDERR
-  ARGS query -c "SELECT COUNT(*) FROM t WHERE CounterID = 'x'" --table "${_t}" --format json
+  ARGS query --threads 1 -c "SELECT COUNT(*) FROM t WHERE CounterID = 'x'" --table "${_t}" --format json
 )
 antb1_add_cli_golden(usage_no_command EXIT_CODE 2 STDERR_REGEX "subcommand")
+antb1_add_cli_golden(
+  usage_threads
+  EXIT_CODE 2
+  STDERR_REGEX "--threads"
+  ARGS query --threads 0 -c "${_count}" --table "${_t}"
+)
 antb1_add_cli_golden(
   usage_bad_format
   EXIT_CODE 2
   STDERR_REGEX "--format"
-  ARGS query -c "${_count}" --format xml
+  ARGS query --threads 1 -c "${_count}" --format xml
 )
-antb1_add_cli_golden(usage_no_sql EXIT_CODE 2 STDERR_REGEX "pass exactly one of" ARGS query --table "${_t}")
+antb1_add_cli_golden(
+  usage_no_sql
+  EXIT_CODE 2
+  STDERR_REGEX "pass exactly one of"
+  ARGS query --threads 1 --table "${_t}"
+)
 antb1_add_cli_golden(
   usage_two_sql_sources
   EXIT_CODE 2
   STDERR_REGEX "pass exactly one of"
-  ARGS query -c "${_count}" -f "${_sql}/count_star.sql" --table "${_t}"
+  ARGS query --threads 1 -c "${_count}" -f "${_sql}/count_star.sql" --table "${_t}"
 )
 antb1_add_cli_golden(
   usage_bad_table_spec
   EXIT_CODE 2
   STDERR_REGEX "--table expects NAME=PATH"
-  ARGS query -c "${_count}" --table t
+  ARGS query --threads 1 -c "${_count}" --table t
 )
 antb1_add_cli_golden(
   usage_bad_column_type
@@ -244,43 +297,43 @@ antb1_add_cli_golden(
   io_missing_table_file
   EXIT_CODE 3
   STDERR_REGEX "^antb1: io error: .*[$][{]FIXTURES[}]/no_such[.]parquet"
-  ARGS query -c "${_count}" --table "t=${_f}/no_such.parquet"
+  ARGS query --threads 1 -c "${_count}" --table "t=${_f}/no_such.parquet"
 )
 antb1_add_cli_golden(
   io_missing_table_file_json
   EXIT_CODE 3
   STDERR_REGEX "^[{]\"error\":[{]\"kind\":\"io\",\"message\":\".*no_such[.]parquet.*\"[}][}]$"
-  ARGS query -c "${_count}" --table "t=${_f}/no_such.parquet" --format json
+  ARGS query --threads 1 -c "${_count}" --table "t=${_f}/no_such.parquet" --format json
 )
 antb1_add_cli_golden(
   io_missing_from_path
   EXIT_CODE 3
   STDERR_REGEX "^antb1: io error: .*[$][{]FIXTURES[}]/no_such[.]parquet"
-  ARGS query -c "SELECT COUNT(*) FROM '${_f}/no_such.parquet'"
+  ARGS query --threads 1 -c "SELECT COUNT(*) FROM '${_f}/no_such.parquet'"
 )
 antb1_add_cli_golden(
   io_not_parquet
   EXIT_CODE 3
   STDERR_REGEX "^antb1: io error: cannot read Parquet file '[$][{]SOURCE[}]/tests/cli/sql/count_star[.]sql'"
-  ARGS query -c "${_count}" --table "t=${_sql}/count_star.sql"
+  ARGS query --threads 1 -c "${_count}" --table "t=${_sql}/count_star.sql"
 )
 antb1_add_cli_golden(
   io_no_glob_match
   EXIT_CODE 3
   STDERR
-  ARGS query -c "${_count}" --table "t=${_f}/hits_like_split/none-*.parquet"
+  ARGS query --threads 1 -c "${_count}" --table "t=${_f}/hits_like_split/none-*.parquet"
 )
 antb1_add_cli_golden(
   io_schema_mismatch
   EXIT_CODE 3
   STDERR
-  ARGS query -c "${_count}" --table "t=${_f}/hits_like.parquet,${_f}/edge.parquet"
+  ARGS query --threads 1 -c "${_count}" --table "t=${_f}/hits_like.parquet,${_f}/edge.parquet"
 )
 antb1_add_cli_golden(
   io_missing_sql_file
   EXIT_CODE 3
   STDERR
-  ARGS query -f "${_f}/no_such.sql" --table "${_t}"
+  ARGS query --threads 1 -f "${_f}/no_such.sql" --table "${_t}"
 )
 
 # ---- schema, explain, version ----
@@ -326,6 +379,8 @@ antb1_add_cli_golden(
   query_order_by
   ARGS
     query
+    --threads
+    1
     --clickbench
     -c
     "SELECT WatchID, EventDate FROM t WHERE RegionID < 3000 ORDER BY EventDate DESC, WatchID LIMIT 4 OFFSET 2"

@@ -80,15 +80,15 @@ Every CI job name contains the command that reproduces it (docs/ci.md). SQL cont
 ## Testing
 
 - Unit tests live in `src/<module>/tests/*_test.cc` (`antb1_add_module_tests`, named `<module>.<Suite>.<Case>`, label
-  `unit`); cross-module suites and the harness live in `tests/` ([tests/README.md](tests/README.md)). Labels in use:
-  `unit` `integration` `slt` `oracle` `diff` `metamorphic` `cli` `harness` `fuzz-replay` `setup` (hermetic), `fuzz`
-  (`pixi run fuzz-smoke`), `bench-smoke` (`pixi run release`) and `data` (`pixi run test-data`). See docs/testing.md.
+  `unit`); cross-module suites and the harness live in `tests/` ([tests/README.md](tests/README.md)). Labels:
+  `unit` `integration` `slt` `oracle` `diff` `parallel` `metamorphic` `cli` `harness` `fuzz-replay` `setup` (hermetic),
+  `fuzz` (`pixi run fuzz-smoke`), `bench-smoke` (`pixi run release`), `data` (`pixi run test-data`); docs/testing.md.
 - SQL behavior goes into `tests/slt/cases/<area>/*.slt`: write the SQL, let `pixi run slt-complete` write the expected
   blocks from DuckDB, review the diff. Declare a newly answered feature in `tests/slt/supported_features.h`; when the
   ClickBench pass set changes, update `tests/data/clickbench_status.json` and the docs/sql-subset.md table with it.
 - Hermetic: no network, fixed seeds, no sleeps or wall-clock dependence, no absolute paths, only our own tables and
-  queries. Tests write only under `::testing::TempDir()`; the one exception is `fixtures.generate`, which writes the
-  shared Parquet fixtures to `build/<preset>/fixtures` (read-only for all other tests). Presets pin locale, TZ, threads.
+  queries. Tests write only under `::testing::TempDir()`, except `fixtures.generate` (read-only shared fixtures in
+  `build/<preset>/fixtures`). Presets pin locale, TZ; the engine runs 1 thread (4: `parallel`, exec parallel tests).
 - After an intended CLI output change run `ANTB1_UPDATE_GOLDENS=1 pixi run test -L cli` and review the diff. A fuzzer
   crash: commit its minimized input to `fuzz/regressions/` with the fix (`fuzz/regressions/README.md`).
 - `pixi run test` ends with `ANTB1-TESTS: PASS` or `ANTB1-TESTS: FAIL` and prints a repro command on failure. A crash,

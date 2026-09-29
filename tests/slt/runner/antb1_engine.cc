@@ -1,11 +1,13 @@
 #include "antb1_engine.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <format>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -149,6 +151,73 @@ ExecResult Antb1Engine::Execute(const std::string& sql) {
                                        .internal = true});
   }
   return std::move(*rows);
+}
+
+namespace {
+
+class SameResultEngine final : public Engine {
+ public:
+  SameResultEngine(std::unique_ptr<Engine> engine, std::unique_ptr<Engine> reference,
+                   std::string reference_name)
+      : engine_(std::move(engine)),
+        reference_(std::move(reference)),
+        reference_name_(std::move(reference_name)) {}
+
+  [[nodiscard]] std::string_view name() const override { return engine_->name(); }
+
+  ExecResult Execute(const std::string& sql) override {
+    ExecResult result = engine_->Execute(sql);
+    const ExecResult reference = reference_->Execute(sql);
+    const std::optional<std::string> difference = Difference(result, reference);
+    if (!difference.has_value()) {
+      return result;
+    }
+    return std::unexpected(EngineError{
+        .kind = "internal",
+        .message = std::format("internal: the result differs from the result with {}: {}",
+                               reference_name_, *difference),
+        .unsupported = false,
+        .internal = true});
+  }
+
+ private:
+  // Where two results differ (no values), or std::nullopt if they are identical.
+  static std::optional<std::string> Difference(const ExecResult& a, const ExecResult& b) {
+    if (a.has_value() != b.has_value()) {
+      return a.has_value() ? "only the reference failed" : "only this run failed";
+    }
+    if (!a.has_value()) {
+      if (a.error().kind != b.error().kind || a.error().message != b.error().message) {
+        return std::format("other errors ({} vs {})", a.error().kind, b.error().kind);
+      }
+      return std::nullopt;
+    }
+    if (a->classes != b->classes || a->type_names != b->type_names) {
+      return "other column types";
+    }
+    if (a->rows.size() != b->rows.size()) {
+      return std::format("{} rows vs {}", a->rows.size(), b->rows.size());
+    }
+    for (std::size_t row = 0; row < a->rows.size(); ++row) {
+      if (a->rows[row] != b->rows[row]) {
+        return std::format("row {} differs", row);
+      }
+    }
+    return std::nullopt;
+  }
+
+  std::unique_ptr<Engine> engine_;
+  std::unique_ptr<Engine> reference_;
+  std::string reference_name_;
+};
+
+}  // namespace
+
+std::unique_ptr<Engine> MakeSameResultEngine(std::unique_ptr<Engine> engine,
+                                             std::unique_ptr<Engine> reference,
+                                             std::string reference_name) {
+  return std::make_unique<SameResultEngine>(std::move(engine), std::move(reference),
+                                            std::move(reference_name));
 }
 
 }  // namespace antb1::slt

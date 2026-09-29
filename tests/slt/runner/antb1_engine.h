@@ -37,4 +37,12 @@ class Antb1Engine final : public Engine {
   std::unique_ptr<engine::Session> session_;
 };
 
+// Runs every query on `engine` and on `reference`, the same engine with another number of threads
+// (antb1-slt --same-as-threads), and returns engine's result. A query whose results or errors
+// differ in any byte, before any sorting, is an internal error: answers must not depend on the
+// thread count (docs/adr/0013-parallel-execution.md). The message names no value.
+std::unique_ptr<Engine> MakeSameResultEngine(std::unique_ptr<Engine> engine,
+                                             std::unique_ptr<Engine> reference,
+                                             std::string reference_name);
+
 }  // namespace antb1::slt

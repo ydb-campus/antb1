@@ -1,9 +1,12 @@
 #include "antb1_engine.h"
 
 #include <cstdint>
+#include <expected>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include <arrow/api.h>
@@ -99,6 +102,63 @@ TEST(ToResultSet, ColumnLengthDiffersFromTheTable) {
 TEST(ToResultSet, ColumnCountDiffersFromTheTypes) {
   auto rows = ToResultSet(Result({{Ints({1})}}, {LogicalType::kBigInt, LogicalType::kBigInt}));
   EXPECT_TRUE(rows.status().IsInvalid()) << rows.status();
+}
+
+// An engine that returns a fixed result or error for every query.
+class FixedEngine final : public Engine {
+ public:
+  explicit FixedEngine(ExecResult result) : result_(std::move(result)) {}
+  [[nodiscard]] std::string_view name() const override { return "antb1"; }
+  ExecResult Execute(const std::string& /*sql*/) override { return result_; }
+
+ private:
+  ExecResult result_;
+};
+
+ResultSet Rows(std::vector<Row> rows) {
+  return ResultSet{
+      .classes = {ColumnClass::kInteger}, .type_names = {"BIGINT"}, .rows = std::move(rows)};
+}
+
+// --same-as-threads: any difference from the reference engine, in rows, row order, types or
+// errors, is an internal error that names no value; identical results pass through.
+TEST(SameResultEngineTest, AnyDifferenceIsAnInternalError) {
+  const auto check = [](ExecResult a, ExecResult b) {
+    auto engine = MakeSameResultEngine(std::make_unique<FixedEngine>(std::move(a)),
+                                       std::make_unique<FixedEngine>(std::move(b)), "1 thread(s)");
+    EXPECT_EQ(engine->name(), "antb1");
+    return engine->Execute("SELECT 1");
+  };
+  const EngineError bind{
+      .kind = "bind", .message = "bind: no such column", .unsupported = false, .internal = false};
+  const ExecResult same = check(Rows({{"1"}, {"2"}}), Rows({{"1"}, {"2"}}));
+  ASSERT_TRUE(same.has_value());
+  EXPECT_EQ(same->rows, (std::vector<Row>{{"1"}, {"2"}}));
+  const ExecResult same_error = check(std::unexpected(bind), std::unexpected(bind));
+  ASSERT_FALSE(same_error.has_value());
+  EXPECT_EQ(same_error.error().kind, "bind");
+
+  EngineError other = bind;
+  other.message = "bind: another message";
+  for (const auto& [a, b] : std::vector<std::pair<ExecResult, ExecResult>>{
+           {Rows({{"1"}, {"2"}}), Rows({{"2"}, {"1"}})},
+           {Rows({{"1"}}), Rows({{"1"}, {"1"}})},
+           {Rows({{"secret"}}), Rows({{std::nullopt}})},
+           {Rows({{"1"}}), std::unexpected(bind)},
+           {std::unexpected(bind), Rows({{"1"}})},
+           {std::unexpected(bind), std::unexpected(other)},
+       }) {
+    const ExecResult result = check(a, b);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(result.error().internal);
+    EXPECT_NE(result.error().message.find("differs from the result with 1 thread(s)"),
+              std::string::npos)
+        << result.error().message;
+    EXPECT_EQ(result.error().message.find("secret"), std::string::npos);
+  }
+  ResultSet text = Rows({{"1"}});
+  text.classes = {ColumnClass::kText};
+  EXPECT_FALSE(check(Rows({{"1"}}), text).has_value());
 }
 
 }  // namespace
