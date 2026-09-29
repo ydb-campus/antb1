@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790693590632,
+  "lastUpdate": 1790696381092,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -2052,6 +2052,78 @@ window.BENCHMARK_DATA = {
             "value": 14.462210666666605,
             "unit": "ms/iter",
             "extra": "iterations: 48\ncpu: 14.461259062499991 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "4c2c662e773f05eba6bc19515b55d6e141049f0f",
+          "message": "perf(exec): parallel top-N (#47)\n\n## Summary\n\nThis is step 5 of ADR 0013: the top-N sink.\n\n**Before this PR:** `ORDER BY ... LIMIT n` over a part pipeline sent\nevery filtered row, all columns, from the part union to one serial top-N\n`SortOperator`.\n\n**Now,** with the new `PartTopNOperator` (planned for `Limit(Sort)` with\na positive limit over a part pipeline):\n- Each part keeps its first `limit + offset` rows in its own\n`SortBuffer`, sorted and compacted on its worker.\n- The consumer merges those small buffers in part order\n(`SortBuffer::Merge`), sorts again keeping `limit + offset`, and emits\nthe window.\n\n**Exactness:**\n- `SortBuffer` is stable, and a compacted buffer's order is a valid\ninput order for its rows. Merging parts in part order therefore gives\nexactly the rows and tie order of the serial top-N over the part union,\nbyte-identical for any number of threads.\n- A row a part drops has at least `limit + offset` rows before it in\nthat part's stable order, so the serial top-N could never keep it\neither.\n\n**Memory:** each part's rows carry their own `MemoryReservation` until\nthey are merged, including while they wait in the scheduler's window.\n\n**Out of scope:** a full `ORDER BY` without `LIMIT` still sorts the part\nunion on one thread. A k-way merge of sorted parts is noted in ADR 0013\nas the follow-up. `LIMIT 0`, a limit without ORDER BY, and a sort over\nnon-pipeline input (e.g. over a GROUP BY) keep their existing operators.\n\n## Performance: full ClickBench data, 128 threads, paired A/B on a quiet\nhost\n\nFor each query, the #46 binary and this PR's binary each ran 3 tries\n(best taken), alternating which went first. The load average was 3 at\nthe start.\n\n- **The top-N queries:** Q24 3.97×, Q25 5.02×, Q26 3.88× (0.73 s → 0.18\ns).\n- **Q23** is a `SELECT *` top-N: 1.11×. Decoding all of its columns\ndominates, so it needs late materialization (read the sort and filter\ncolumns first, then only the winning rows), a separate follow-up.\n- **Everything else** is unchanged within noise. The total is 53.5 s →\n51.2 s.\n\n<details><summary>Per-query seconds (queries over 0.3 s)</summary>\n\n| Query | main (#46) | this PR | speedup |\n| --- | ---: | ---: | ---: |\n| Q4 | 2.27 | 2.27 | 1.00× |\n| Q5 | 1.70 | 1.69 | 1.00× |\n| Q8 | 1.63 | 1.63 | 1.00× |\n| Q9 | 1.71 | 1.70 | 1.01× |\n| Q10 | 0.42 | 0.41 | 1.02× |\n| Q11 | 0.43 | 0.43 | 1.01× |\n| Q12 | 0.72 | 0.73 | 0.98× |\n| Q13 | 1.16 | 1.15 | 1.01× |\n| Q14 | 0.89 | 0.90 | 0.99× |\n| Q15 | 0.71 | 0.71 | 1.00× |\n| Q16 | 1.46 | 1.47 | 1.00× |\n| Q17 | 1.11 | 1.14 | 0.98× |\n| Q18 | 2.69 | 2.67 | 1.01× |\n| Q20 | 0.63 | 0.63 | 1.00× |\n| Q21 | 0.78 | 0.76 | 1.03× |\n| Q22 | 1.37 | 1.37 | 1.00× |\n| Q23 | 4.29 | 3.86 | 1.11× |\n| Q24 | 0.73 | 0.18 | 3.97× |\n| Q25 | 0.74 | 0.15 | 5.02× |\n| Q26 | 0.73 | 0.19 | 3.88× |\n| Q27 | 0.88 | 0.90 | 0.98× |\n| Q28 | 6.41 | 6.42 | 1.00× |\n| Q30 | 0.96 | 0.95 | 1.01× |\n| Q31 | 1.60 | 1.58 | 1.02× |\n| Q32 | 6.85 | 6.85 | 1.00× |\n| Q33 | 2.59 | 2.56 | 1.01× |\n| Q34 | 2.56 | 2.53 | 1.01× |\n| Q35 | 1.23 | 1.20 | 1.03× |\n| Q36 | 0.77 | 0.76 | 1.02× |\n| Q37 | 0.58 | 0.59 | 0.98× |\n| Q38 | 0.62 | 0.65 | 0.95× |\n| Q39 | 1.39 | 1.31 | 1.06× |\n| **Total (43 queries)** | **53.5** | **51.2** | **1.04×** |\n\n</details>\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [x] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full          # lint, ci, asan, tidy, coverage, fuzz-smoke, ci-gcc\ncheck-full exit 0; Coverage gate: PASS\n$ pixi run tsan\n100% tests passed out of 1327\n$ ANTB1_DIFF_COUNT=20000 pixi run diff-random\nDIFF: PASS seed=3426846718 queries=20000 failed=0 unsupported=0\n$ pixi run test-data\n100% tests passed out of 6\n```\n\n**New test `PartOperatorsTest.TopNKeepsEachPartsFirstRows`:**\n- **Coverage:** windows inside, across and past the rows (`LIMIT 1`, `5\nOFFSET 3`, `40 OFFSET 20`, `30 OFFSET 125`, `10 OFFSET 200`, `INT64_MAX\nOFFSET 110`), ascending and descending, with NULLs first and last (NULL\nties span parts).\n- **Reference:** each case is compared with the serial `SortOperator`\ntop-N over one scan of the whole table, byte for byte, and 4 threads\nwith 1.\n- **Errors and memory:** errors come in part order, and a tiny budget\nfails with OutOfMemory and gives every byte back.\n\nThe existing `.slt` case `LIMIT 9223372036854775807 OFFSET 10` caught an\noverflow in the first version; the window arithmetic now saturates.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer (none changed)\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code wrote the change\nand tests, ran the verification and the paired A/B. The `reviewer` agent\nconfirmed the exactness argument and found that a finished part's buffer\nleft the memory budget while it waited to be merged (fixed: the\nreservation now lives with the buffer). It also found that the test's\n\"serial\" reference was itself a one-part `PartTopNOperator` (fixed: it\nis now the real `SortOperator`).\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-09-29T18:37:16+03:00",
+          "tree_id": "642c03962fdeb10f4c5cf09da292b5ed1d91f146",
+          "url": "https://github.com/ydb-campus/antb1/commit/4c2c662e773f05eba6bc19515b55d6e141049f0f"
+        },
+        "date": 1790696379474,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4156.403981110582,
+            "unit": "ns/iter",
+            "extra": "iterations: 167290\ncpu: 4155.990148843326 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84455.67729855406,
+            "unit": "ns/iter",
+            "extra": "iterations: 7744\ncpu: 84447.328125 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222254.25166825554,
+            "unit": "ns/iter",
+            "extra": "iterations: 3147\ncpu: 222179.94756911337 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 444657.5618330243,
+            "unit": "ns/iter",
+            "extra": "iterations: 1593\ncpu: 444546.0257376022 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 401647.9582843733,
+            "unit": "ns/iter",
+            "extra": "iterations: 1702\ncpu: 401553.98648648657 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2133414.0823170966,
+            "unit": "ns/iter",
+            "extra": "iterations: 328\ncpu: 2132907.6219512206 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 217.62349266666567,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 217.58804966666673 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.507500624999873,
+            "unit": "ms/iter",
+            "extra": "iterations: 48\ncpu: 14.503771187500014 ms\nthreads: 1"
           }
         ]
       }
