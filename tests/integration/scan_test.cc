@@ -2,17 +2,21 @@
 // odd batch sizes; the hits-like variants (split into files, REQUIRED + UTF8) scan to the same
 // values.
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <arrow/api.h>
 #include <gtest/gtest.h>
 
+#include "antb1/common/int128.h"
 #include "antb1/io/parquet_table.h"
 #include "antb1/plan/types.h"
 
@@ -132,6 +136,95 @@ TEST(Scan, ProjectionsReadOnlyTheRequestedFieldsInOrder) {
   ASSERT_NE(none, nullptr);
   EXPECT_EQ(none->num_columns(), 0);
   EXPECT_EQ(none->num_rows(), 10'000);
+}
+
+// The value of row i of an integer-valued engine column (SMALLINT, INTEGER, BIGINT, USMALLINT,
+// DATE as days).
+Int128 IntegerAt(const arrow::Array& column, int64_t i) {
+  switch (column.type_id()) {
+    case arrow::Type::INT16:
+      return static_cast<const arrow::Int16Array&>(column).Value(i);
+    case arrow::Type::INT32:
+      return static_cast<const arrow::Int32Array&>(column).Value(i);
+    case arrow::Type::INT64:
+      return static_cast<const arrow::Int64Array&>(column).Value(i);
+    case arrow::Type::UINT16:
+      return static_cast<const arrow::UInt16Array&>(column).Value(i);
+    case arrow::Type::DATE32:
+      return static_cast<const arrow::Date32Array&>(column).Value(i);
+    default:
+      ADD_FAILURE() << "not integer-valued: " << column.type()->ToString();
+      return 0;
+  }
+}
+
+// Statistics for skipping parts (plan::Table::part_stats) are exact wherever a fixture's footer
+// gives them: for every table, part and field that has them, the part's rows hold exactly that
+// NULL count and, over the non-NULL values, that min and max. Fields of other types give none.
+TEST(Scan, PartStatisticsMatchThePartsRows) {
+  int64_t checked = 0;
+  for (const auto& [file, clickbench] :
+       std::vector<std::pair<std::string_view, bool>>{{"hits_like.parquet", true},
+                                                      {"hits_like_nulls.parquet", true},
+                                                      {"hits_like_required.parquet", true},
+                                                      {"hits_like_split/part-*.parquet", true},
+                                                      {"edge.parquet", false},
+                                                      {"floats.parquet", false}}) {
+    const auto table = OpenFixture(file, clickbench);
+    ASSERT_NE(table, nullptr);
+    for (int field = 0; field < table->schema()->num_fields(); ++field) {
+      const auto type = plan::FromArrow(*table->schema()->field(field)->type());
+      const bool integer_valued =
+          type.ok() && ((plan::IsInteger(*type) && *type != plan::LogicalType::kHugeInt) ||
+                        *type == plan::LogicalType::kDate);
+      for (int64_t part = 0; part < table->num_parts(); ++part) {
+        const auto stats = table->part_stats(part, field);
+        if (!integer_valued) {
+          EXPECT_FALSE(stats.has_value()) << file << " field " << field;
+          continue;
+        }
+        if (!stats.has_value()) {
+          continue;
+        }
+        auto reader = table->ScanPart(part, {field}, 1024);
+        ASSERT_TRUE(reader.ok()) << reader.status().ToString();
+        std::optional<Int128> min;
+        std::optional<Int128> max;
+        int64_t nulls = 0;
+        int64_t rows = 0;
+        while (true) {
+          std::shared_ptr<arrow::RecordBatch> batch;
+          ASSERT_TRUE((*reader)->ReadNext(&batch).ok());
+          if (batch == nullptr) {
+            break;
+          }
+          const auto& column = *batch->column(0);
+          rows += column.length();
+          for (int64_t i = 0; i < column.length(); ++i) {
+            if (column.IsNull(i)) {
+              ++nulls;
+              continue;
+            }
+            const Int128 v = IntegerAt(column, i);
+            min = min.has_value() ? std::min(*min, v) : v;
+            max = max.has_value() ? std::max(*max, v) : v;
+          }
+        }
+        EXPECT_EQ(stats.value().rows, rows) << file << " " << part << " " << field;
+        EXPECT_EQ(stats.value().null_count, nulls) << file << " " << part << " " << field;
+        EXPECT_EQ(stats.value().min, min) << file << " " << part << " " << field;
+        EXPECT_EQ(stats.value().max, max) << file << " " << part << " " << field;
+        ++checked;
+      }
+    }
+  }
+  EXPECT_GT(checked, 50) << "the fixtures have integer columns with statistics";
+  const auto edge = OpenFixture("edge.parquet");
+  ASSERT_NE(edge, nullptr);
+  for (const auto& [part, field] : std::vector<std::pair<int64_t, int>>{
+           {-1, 0}, {edge->num_parts(), 0}, {0, -1}, {0, edge->schema()->num_fields()}}) {
+    EXPECT_FALSE(edge->part_stats(part, field).has_value()) << part << " " << field;
+  }
 }
 
 }  // namespace

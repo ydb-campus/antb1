@@ -135,6 +135,29 @@ class MemoryTable final : public plan::Table {
   }
   // ScanPart(part) fails with an IOError naming the part.
   void FailPart(int64_t part) { failing_part_ = part; }
+  // With `split`: exact statistics of the BIGINT columns (plan::Table::part_stats), unless turned
+  // off here.
+  void set_stats(bool stats) { stats_ = stats; }
+  std::optional<plan::PartStats> part_stats(int64_t part, int field) const override {
+    if (!split_ || !stats_ || part < 0 || part >= num_parts() || field < 0 ||
+        field >= schema_->num_fields() ||
+        schema_->field(field)->type()->id() != arrow::Type::INT64) {
+      return std::nullopt;
+    }
+    const auto& values = static_cast<const arrow::Int64Array&>(*Batch(part)->column(field));
+    plan::PartStats stats{
+        .min = std::nullopt, .max = std::nullopt, .null_count = 0, .rows = values.length()};
+    for (int64_t i = 0; i < values.length(); ++i) {
+      if (values.IsNull(i)) {
+        ++stats.null_count;
+        continue;
+      }
+      const Int128 v = values.Value(i);
+      stats.min = stats.min.has_value() ? std::min(*stats.min, v) : v;
+      stats.max = stats.max.has_value() ? std::max(*stats.max, v) : v;
+    }
+    return stats;
+  }
 
  protected:
   arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScan(
@@ -197,6 +220,7 @@ class MemoryTable final : public plan::Table {
   arrow::RecordBatchVector batches_;
   bool split_ = false;
   std::optional<int64_t> failing_part_;
+  bool stats_ = true;
   mutable std::atomic<int> scans_ = 0;
   mutable std::mutex mutex_;
   mutable std::vector<int64_t> scanned_parts_;

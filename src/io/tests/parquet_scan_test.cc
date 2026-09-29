@@ -10,6 +10,7 @@
 #include <numeric>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -19,6 +20,7 @@
 #include <parquet/arrow/writer.h>
 #include <parquet/properties.h>
 
+#include "antb1/common/int128.h"
 #include "antb1/io/parquet_table.h"
 #include "antb1/plan/types.h"
 
@@ -378,6 +380,16 @@ TEST_F(ParquetScanTest, NestedFieldsShiftLeafIndices) {
   ASSERT_NE(both.table, nullptr);
   EXPECT_EQ(both.schema->field(1)->type()->id(), arrow::Type::STRUCT);
   EXPECT_EQ(Int64s(*both.table, 0), (std::vector<std::optional<int64_t>>{7, 8, 9}));
+  // Statistics come from z's own leaf (leaf 2), not from leaf 1 (st.y); the struct has none.
+  for (const auto& [part, min, max] :
+       std::vector<std::tuple<int64_t, int64_t, int64_t>>{{0, 7, 8}, {1, 9, 9}}) {
+    const auto stats = (*table)->part_stats(part, 1);
+    ASSERT_TRUE(stats.has_value()) << part;
+    const plan::PartStats got = stats.value_or(plan::PartStats{});
+    EXPECT_EQ(got.min, std::optional<Int128>(min)) << part;
+    EXPECT_EQ(got.max, std::optional<Int128>(max)) << part;
+    EXPECT_FALSE((*table)->part_stats(part, 0).has_value()) << part;
+  }
 }
 
 // Storage types become the engine view: strings -> binary (never validated as UTF-8), FLOAT ->
@@ -729,6 +741,78 @@ TEST_F(ParquetScanTest, SameSizeRewriteIsIOError) {
     EXPECT_NE(st.message().find("footer differs"), std::string::npos) << st.ToString();
     EXPECT_NE(st.message().find("a.parquet"), std::string::npos) << st.ToString();
   }
+}
+
+// Statistics of a part (a row group) for skipping it: exact min, max and NULL count for
+// integer-valued columns, in the engine view (a USMALLINT day number read as DATE keeps its value);
+// nothing for other types, for a file written without statistics, or out of range.
+TEST_F(ParquetScanTest, PartStatisticsOfIntegerColumns) {
+  std::vector<std::optional<int64_t>> id;
+  std::vector<std::optional<uint16_t>> day;
+  std::vector<std::optional<int64_t>> sparse;  // NULL in the whole second row group
+  std::vector<std::optional<double>> real;
+  std::vector<std::optional<std::string>> text;
+  std::vector<std::optional<int32_t>> days;  // INTEGER day numbers, read as DATE
+  arrow::Decimal128Builder huge(arrow::decimal128(38, 0));
+  for (int64_t i = 0; i < 9; ++i) {
+    days.emplace_back(static_cast<int32_t>(-3 + i));
+    ASSERT_TRUE(huge.Append(arrow::Decimal128(-(i + 1))).ok());
+    id.emplace_back(100 + i);
+    day.emplace_back(static_cast<uint16_t>(15000 + (i * 2)));
+    sparse.push_back(i >= 3 && i < 6 ? std::nullopt : std::optional<int64_t>(-i));
+    real.emplace_back(static_cast<double>(i) / 2);
+    text.emplace_back(std::string(1, static_cast<char>('a' + i)));
+  }
+  const auto data = arrow::Table::Make(
+      arrow::schema({arrow::field("id", arrow::int64()), arrow::field("day", arrow::uint16()),
+                     arrow::field("sparse", arrow::int64()), arrow::field("real", arrow::float64()),
+                     arrow::field("text", arrow::utf8()), arrow::field("days", arrow::int32()),
+                     arrow::field("huge", arrow::decimal128(38, 0))}),
+      {Build<arrow::Int64Builder, int64_t>(id), Build<arrow::UInt16Builder, uint16_t>(day),
+       Build<arrow::Int64Builder, int64_t>(sparse), Build<arrow::DoubleBuilder, double>(real),
+       Build<arrow::StringBuilder, std::string>(text), Build<arrow::Int32Builder, int32_t>(days),
+       huge.Finish().ValueOrDie()});
+  const std::string path = Write("stats.parquet", data, 3);
+  auto table = ParquetTable::Open(
+      {path}, ParquetTableOptions{.overrides = {{.column = "day"}, {.column = "days"}}});
+  ASSERT_TRUE(table.ok()) << table.status().ToString();
+  ASSERT_EQ((*table)->num_parts(), 3);
+  const auto stats = [&](int64_t part, int field) { return (*table)->part_stats(part, field); };
+  const auto expect = [&](int64_t part, int field, std::optional<int64_t> min,
+                          std::optional<int64_t> max, int64_t nulls) {
+    const auto got = stats(part, field);
+    ASSERT_TRUE(got.has_value()) << part << " " << field;
+    const plan::PartStats& s = got.value();
+    EXPECT_EQ(s.min, min.has_value() ? std::optional<Int128>(*min) : std::nullopt);
+    EXPECT_EQ(s.max, max.has_value() ? std::optional<Int128>(*max) : std::nullopt);
+    EXPECT_EQ(s.null_count, nulls);
+    EXPECT_EQ(s.rows, 3);
+  };
+  expect(1, 0, 103, 105, 0);
+  expect(2, 1, 15012, 15016, 0);  // DATE read from USMALLINT day numbers
+  expect(0, 5, -3, -1, 0);        // DATE read from INTEGER day numbers, before 1970
+  expect(0, 2, -2, 0, 0);
+  expect(1, 2, std::nullopt, std::nullopt, 3);  // every value NULL
+  EXPECT_FALSE(stats(0, 6).has_value()) << "HUGEINT: decimal statistics are not trusted";
+  EXPECT_FALSE(stats(0, 3).has_value()) << "DOUBLE: NaN may be missing from min/max";
+  EXPECT_FALSE(stats(0, 4).has_value()) << "VARCHAR: min/max may be truncated";
+  EXPECT_FALSE(stats(3, 0).has_value());
+  EXPECT_FALSE(stats(-1, 0).has_value());
+  EXPECT_FALSE(stats(0, 7).has_value());
+
+  // A file written without statistics never skips.
+  const std::string bare = (dir_ / "bare.parquet").string();
+  {
+    auto out = arrow::io::FileOutputStream::Open(bare);
+    ASSERT_TRUE(out.ok());
+    const auto properties = parquet::WriterProperties::Builder().disable_statistics()->build();
+    ASSERT_TRUE(
+        parquet::arrow::WriteTable(*data, arrow::default_memory_pool(), *out, 3, properties).ok());
+    ASSERT_TRUE((*out)->Close().ok());
+  }
+  auto plain = ParquetTable::Open({bare});
+  ASSERT_TRUE(plain.ok()) << plain.status().ToString();
+  EXPECT_FALSE((*plain)->part_stats(0, 0).has_value());
 }
 
 }  // namespace

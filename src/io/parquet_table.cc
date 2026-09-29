@@ -24,7 +24,9 @@
 #include <parquet/file_reader.h>
 #include <parquet/metadata.h>
 #include <parquet/properties.h>
+#include <parquet/statistics.h>
 
+#include "antb1/common/int128.h"
 #include "antb1/common/narrow.h"
 #include "antb1/io/glob.h"
 #include "antb1/plan/catalog.h"
@@ -442,6 +444,25 @@ arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> MakeScan(
                                       arrow::schema(std::move(engine_fields)), batch_size, pool);
 }
 
+// The value of a statistics scalar of a column whose engine type is integer-valued: SMALLINT,
+// INTEGER, BIGINT, USMALLINT or DATE (also read from day numbers); std::nullopt for anything else.
+std::optional<Int128> IntegerOf(const arrow::Scalar& scalar) {
+  switch (scalar.type->id()) {
+    case arrow::Type::INT16:
+      return Int128{static_cast<const arrow::Int16Scalar&>(scalar).value};
+    case arrow::Type::INT32:
+      return Int128{static_cast<const arrow::Int32Scalar&>(scalar).value};
+    case arrow::Type::INT64:
+      return Int128{static_cast<const arrow::Int64Scalar&>(scalar).value};
+    case arrow::Type::UINT16:
+      return Int128{static_cast<const arrow::UInt16Scalar&>(scalar).value};
+    case arrow::Type::DATE32:
+      return Int128{static_cast<const arrow::Date32Scalar&>(scalar).value};
+    default:
+      return std::nullopt;
+  }
+}
+
 }  // namespace
 
 arrow::Result<std::shared_ptr<ParquetTable>> ParquetTable::Open(
@@ -484,6 +505,21 @@ arrow::Result<std::shared_ptr<ParquetTable>> ParquetTable::Open(
     fields.push_back(EngineField(f, options));
   }
   table->schema_ = arrow::schema(std::move(fields));
+  table->leaf_of_field_.assign(Narrow<std::size_t>(table->schema_->num_fields()), -1);
+  if (!table->metadata_.empty()) {
+    const auto& first = table->metadata_.front();
+    parquet::arrow::SchemaManifest manifest;
+    if (parquet::arrow::SchemaManifest::Make(first->schema(), first->key_value_metadata(),
+                                             parquet::default_arrow_reader_properties(), &manifest)
+            .ok()) {
+      for (std::size_t f = 0; f < manifest.schema_fields.size() && f < table->leaf_of_field_.size();
+           ++f) {
+        if (manifest.schema_fields[f].is_leaf()) {
+          table->leaf_of_field_[f] = manifest.schema_fields[f].column_index;
+        }
+      }
+    }
+  }
   return table;
 }
 
@@ -510,6 +546,50 @@ std::optional<int64_t> ParquetTable::part_rows(int64_t part) const {
     return std::nullopt;
   }
   return parts_[Narrow<std::size_t>(part)].rows;
+}
+
+std::optional<plan::PartStats> ParquetTable::part_stats(int64_t part, int field) const {
+  if (part < 0 || part >= num_parts() || field < 0 || field >= schema_->num_fields()) {
+    return std::nullopt;
+  }
+  const int leaf = leaf_of_field_[Narrow<std::size_t>(field)];
+  // The schema is the engine view, so its types always convert.
+  const plan::LogicalType engine =
+      plan::FromArrow(*schema_->field(field)->type()).ValueOr(plan::LogicalType::kVarchar);
+  // HUGEINT is left out: it is stored as a fixed-length byte array, whose decimal statistics some
+  // writers got wrong (compared as unsigned bytes) in ways a reader cannot always detect.
+  const bool integer_valued = (plan::IsInteger(engine) && engine != plan::LogicalType::kHugeInt) ||
+                              engine == plan::LogicalType::kDate;
+  if (leaf < 0 || !integer_valued) {
+    return std::nullopt;
+  }
+  const Part& p = parts_[Narrow<std::size_t>(part)];
+  try {
+    const auto chunk = metadata_[p.file]->RowGroup(p.row_group)->ColumnChunk(leaf);
+    const std::shared_ptr<parquet::Statistics> stats = chunk->statistics();
+    // statistics() is null when there are none or the writer is known to get them wrong.
+    if (stats == nullptr || !stats->HasNullCount()) {
+      return std::nullopt;
+    }
+    plan::PartStats out{.min = std::nullopt,
+                        .max = std::nullopt,
+                        .null_count = stats->null_count(),
+                        .rows = p.rows};
+    if (out.null_count >= out.rows) {
+      return out;  // every value NULL
+    }
+    std::shared_ptr<arrow::Scalar> min;
+    std::shared_ptr<arrow::Scalar> max;
+    if (stats->HasMinMax() && parquet::arrow::StatisticsAsScalars(*stats, &min, &max).ok()) {
+      out.min = IntegerOf(*min);
+      out.max = IntegerOf(*max);
+    }
+    // Without both (or with min above max, which no valid file has) the part is never skipped.
+    return out.min.has_value() && out.max.has_value() && *out.min <= *out.max ? std::optional(out)
+                                                                              : std::nullopt;
+  } catch (const std::exception&) {
+    return std::nullopt;  // no usable statistics: never skip
+  }
 }
 
 arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> ParquetTable::DoScanPart(

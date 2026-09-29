@@ -14,6 +14,7 @@ antb1_add_module(
     scalar_aggregate.cc
     aggregate_set.cc
     part_operators.cc
+    part_pruning.cc
     group_table.cc
     grouped_aggregate_state.cc
     group_aggregate.cc

@@ -21,6 +21,7 @@
 #include "antb1/plan/logical_plan.h"
 
 #include "part_operators.h"
+#include "part_pruning.h"
 
 namespace antb1::exec {
 namespace {
@@ -52,17 +53,60 @@ const plan::ScanNode* PipelineScan(const plan::LogicalNodePtr& node) {
   return nullptr;
 }
 
-// Builds the pipeline of every part from the pipeline's top node.
-PartPipeline PipelineOf(const plan::LogicalNodePtr& node) {
-  return [node](int64_t part) { return Build(node, part); };
+// The predicates of the Filters directly on the scan of a part pipeline (below any Compute or
+// Project): their columns are the scan's output columns.
+std::vector<plan::Predicate> FiltersOnScan(const plan::LogicalNodePtr& node) {
+  std::vector<const plan::LogicalNode*> chain;  // top to scan
+  for (const plan::LogicalNode* n = node.get(); n != nullptr;) {
+    chain.push_back(n);
+    if (const auto* filter = std::get_if<plan::FilterNode>(n)) {
+      n = filter->input.get();
+    } else if (const auto* compute = std::get_if<plan::ComputeNode>(n)) {
+      n = compute->input.get();
+    } else if (const auto* project = std::get_if<plan::ProjectNode>(n)) {
+      n = project->input.get();
+    } else {
+      break;
+    }
+  }
+  std::vector<plan::Predicate> predicates;
+  for (std::size_t i = chain.size(); i-- > 1;) {  // from just above the scan up
+    const auto* filter = std::get_if<plan::FilterNode>(chain[i - 1]);
+    if (filter == nullptr) {
+      break;
+    }
+    predicates.insert(predicates.end(), filter->predicates.begin(), filter->predicates.end());
+  }
+  return predicates;
+}
+
+// The pipelines of the parts a part pipeline reads: every part of the scan's table but those its
+// filters rule out by their statistics (part_pruning.h), in part order, numbered 0 .. count - 1.
+struct Parts {
+  PartPipeline pipeline;
+  int64_t count = 0;
+};
+
+Parts PartsOf(const plan::LogicalNodePtr& node, const plan::ScanNode& scan) {
+  auto kept = std::make_shared<const std::vector<int64_t>>(
+      KeptParts(*scan.table, scan.fields, FiltersOnScan(node)));
+  const auto count = static_cast<int64_t>(kept->size());
+  return Parts{.pipeline =
+                   [node, kept](int64_t i) {
+                     // Past the kept parts only for the schema sample, which is never opened.
+                     const int64_t part =
+                         std::cmp_less(i, kept->size()) ? (*kept)[static_cast<std::size_t>(i)] : i;
+                     return Build(node, part);
+                   },
+               .count = count};
 }
 
 // A part pipeline's batches in part order, at most row_cap selected rows per part.
 OperatorResult BuildPartUnion(const plan::LogicalNodePtr& node, const plan::ScanNode& scan,
                               std::optional<int64_t> row_cap) {
-  PartPipeline pipeline = PipelineOf(node);
-  ARROW_ASSIGN_OR_RAISE(auto sample, pipeline(0));  // for the output schema; never opened
-  return std::make_unique<PartUnionOperator>(std::move(pipeline), scan.table->num_parts(),
+  Parts parts = PartsOf(node, scan);
+  ARROW_ASSIGN_OR_RAISE(auto sample, parts.pipeline(0));  // for the output schema; never opened
+  return std::make_unique<PartUnionOperator>(std::move(parts.pipeline), parts.count,
                                              sample->output_schema(), row_cap);
 }
 
@@ -144,9 +188,9 @@ struct Builder {
     }
     if (const plan::ScanNode* scan = PipelineScan(node.input)) {
       // Aggregated per part, the parts' states merged in part order.
-      PartPipeline pipeline = PipelineOf(node.input);
-      ARROW_ASSIGN_OR_RAISE(auto sample, pipeline(0));
-      return std::make_unique<PartAggregateOperator>(std::move(pipeline), scan->table->num_parts(),
+      Parts parts = PartsOf(node.input, *scan);
+      ARROW_ASSIGN_OR_RAISE(auto sample, parts.pipeline(0));
+      return std::make_unique<PartAggregateOperator>(std::move(parts.pipeline), parts.count,
                                                      sample->output_schema()->num_fields(),
                                                      node.aggregates);
     }
@@ -156,14 +200,14 @@ struct Builder {
   OperatorResult operator()(const plan::GroupAggregateNode& node) const {
     if (const plan::ScanNode* scan = PipelineScan(node.input)) {
       // Grouped per part, the parts' groups merged in part order.
-      PartPipeline pipeline = PipelineOf(node.input);
-      ARROW_ASSIGN_OR_RAISE(auto sample, pipeline(0));
+      Parts parts = PartsOf(node.input, *scan);
+      ARROW_ASSIGN_OR_RAISE(auto sample, parts.pipeline(0));
       const int width = sample->output_schema()->num_fields();
       // The output schema, as the serial operator names it.
       const GroupAggregateOperator serial(std::move(sample), node.keys, node.aggregates);
-      return std::make_unique<PartGroupAggregateOperator>(
-          std::move(pipeline), scan->table->num_parts(), width, node.keys, node.aggregates,
-          serial.output_schema());
+      return std::make_unique<PartGroupAggregateOperator>(std::move(parts.pipeline), parts.count,
+                                                          width, node.keys, node.aggregates,
+                                                          serial.output_schema());
     }
     ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input));
     return std::make_unique<GroupAggregateOperator>(std::move(input), node.keys, node.aggregates);
@@ -178,9 +222,9 @@ struct Builder {
     if (sort != nullptr && node.limit.has_value() && *node.limit > 0) {
       if (const plan::ScanNode* scan = PipelineScan(sort->input)) {
         // Every part keeps its own first rows, merged in part order.
-        PartPipeline pipeline = PipelineOf(sort->input);
-        ARROW_ASSIGN_OR_RAISE(auto sample, pipeline(0));
-        return std::make_unique<PartTopNOperator>(std::move(pipeline), scan->table->num_parts(),
+        Parts parts = PartsOf(sort->input, *scan);
+        ARROW_ASSIGN_OR_RAISE(auto sample, parts.pipeline(0));
+        return std::make_unique<PartTopNOperator>(std::move(parts.pipeline), parts.count,
                                                   sample->output_schema(), sort->keys, *node.limit,
                                                   node.offset);
       }

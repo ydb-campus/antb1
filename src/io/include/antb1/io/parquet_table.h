@@ -46,6 +46,10 @@ class ParquetTable final : public plan::Table {
   int64_t num_parts() const override;
   // The rows of the part's row group, from the footer.
   std::optional<int64_t> part_rows(int64_t part) const override;
+  // From the row group's column chunk statistics in the footer: only for a primitive field whose
+  // engine type is integer-valued (integers but HUGEINT, USMALLINT, DATE) and whose chunk has valid
+  // statistics with min/max and a null count; std::nullopt otherwise (never skip).
+  std::optional<plan::PartStats> part_stats(int64_t part, int field) const override;
   std::string Describe() const override;
   // A float column of the files (widened to double on read).
   bool StoredAsFloat(int field) const override;
@@ -89,6 +93,7 @@ class ParquetTable final : public plan::Table {
   std::vector<int64_t> file_bytes_;                               // per file
   std::vector<std::shared_ptr<arrow::Buffer>> footers_;           // per file, as stored
   std::vector<Part> parts_;
+  std::vector<int> leaf_of_field_;  // a top-level field's Parquet leaf column; -1 if nested
   std::shared_ptr<arrow::Schema> storage_schema_;  // as read from the first file
   std::shared_ptr<arrow::Schema> schema_;          // engine view
   int64_t num_rows_ = 0;

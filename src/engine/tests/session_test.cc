@@ -408,5 +408,58 @@ TEST_F(SessionTest, DestroyedRightAfterAFailedParallelQuery) {
   }
 }
 
+// Row groups ruled out by their statistics are skipped without changing any answer: a file sorted
+// by id in row groups of 100 rows, with a NULL-only row group in `v`.
+TEST_F(SessionTest, SkippedRowGroupsDoNotChangeAnswers) {
+  const std::string sorted = (dir_ / "sorted.parquet").string();
+  {
+    arrow::Int64Builder id;
+    arrow::Int64Builder v;
+    for (int64_t i = 0; i < 1000; ++i) {
+      ASSERT_TRUE(id.Append(i).ok());
+      ASSERT_TRUE((i >= 300 && i < 400 ? v.AppendNull() : v.Append(i % 7)).ok());
+    }
+    auto table = arrow::Table::Make(
+        arrow::schema({arrow::field("id", arrow::int64()), arrow::field("v", arrow::int64())}),
+        {id.Finish().ValueOrDie(), v.Finish().ValueOrDie()});
+    auto out = arrow::io::FileOutputStream::Open(sorted).ValueOrDie();
+    ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), out, 100).ok());
+    ASSERT_TRUE(out->Close().ok());
+  }
+  for (const int threads : {1, 4}) {
+    SessionOptions options;
+    options.threads = threads;
+    auto session = Session::Make(options).ValueOrDie();
+    ASSERT_TRUE(session->RegisterParquet("s", {sorted}).ok());
+    const auto rows = [&](const std::string& sql) {
+      auto result = session->Execute(sql);
+      EXPECT_TRUE(result.ok()) << sql << ": " << result.status().ToString();
+      return result.ok() ? Rows(*result) : std::vector<std::vector<std::string>>{};
+    };
+    using R = std::vector<std::vector<std::string>>;
+    EXPECT_EQ(rows("SELECT COUNT(*), MIN(id), MAX(id) FROM s WHERE id >= 250 AND id < 260"),
+              (R{{"10", "250", "259"}}));
+    EXPECT_EQ(rows("SELECT id FROM s WHERE id IN (5, 777, 5000) ORDER BY id"), (R{{"5"}, {"777"}}));
+    EXPECT_EQ(rows("SELECT COUNT(*) FROM s WHERE id > 999"), (R{{"0"}}));
+    EXPECT_EQ(rows("SELECT COUNT(*) FROM s WHERE v = 3 AND id >= 300 AND id < 400"), (R{{"0"}}));
+    EXPECT_EQ(rows("SELECT COUNT(*), SUM(id) FROM s WHERE v >= 0"), (R{{"900", "464550"}}));
+    EXPECT_EQ(rows("SELECT id FROM s WHERE id <> 0 ORDER BY id LIMIT 2"), (R{{"1"}, {"2"}}));
+    // GROUP BY, top-N and COUNT(DISTINCT) over kept parts only, and over none.
+    EXPECT_EQ(
+        rows("SELECT v, COUNT(*) FROM s WHERE id >= 250 AND id < 260 GROUP BY v ORDER BY v"),
+        (R{{"0", "2"}, {"1", "1"}, {"2", "1"}, {"3", "1"}, {"4", "1"}, {"5", "2"}, {"6", "2"}}));
+    EXPECT_EQ(rows("SELECT id FROM s WHERE id >= 850 ORDER BY id DESC LIMIT 2"),
+              (R{{"999"}, {"998"}}));
+    EXPECT_EQ(rows("SELECT COUNT(DISTINCT v) FROM s WHERE id >= 850"), (R{{"7"}}));
+    EXPECT_EQ(rows("SELECT v, COUNT(*) FROM s WHERE id > 999 GROUP BY v"), R{});
+    EXPECT_EQ(rows("SELECT id FROM s WHERE id > 999 ORDER BY id LIMIT 3"), R{});
+    EXPECT_EQ(rows("SELECT COUNT(DISTINCT v) FROM s WHERE id > 999"), (R{{"0"}}));
+    // Filters on v alone (table field 1 is the scan's column 0) and next to a computed condition.
+    EXPECT_EQ(rows("SELECT COUNT(*) FROM s WHERE v = 3"), (R{{"129"}}));
+    EXPECT_EQ(rows("SELECT COUNT(*) FROM s WHERE v >= 7"), (R{{"0"}}));
+    EXPECT_EQ(rows("SELECT COUNT(*) FROM s WHERE id + v > 5 AND id < 50"), (R{{"47"}}));
+  }
+}
+
 }  // namespace
 }  // namespace antb1::engine
