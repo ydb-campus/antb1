@@ -2,8 +2,10 @@
 // and the part operators the physical planner builds, on one thread and on a 4-thread pool.
 
 #include <atomic>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -12,6 +14,7 @@
 #include <vector>
 
 #include <arrow/api.h>
+#include <arrow/compute/api.h>
 #include <arrow/util/thread_pool.h>
 #include <gtest/gtest.h>
 
@@ -19,6 +22,7 @@
 #include "antb1/exec/physical_planner.h"
 #include "antb1/plan/logical_plan.h"
 
+#include "../group_table.h"
 #include "../part_scheduler.h"
 #include "exec_test_util.h"
 
@@ -400,8 +404,38 @@ TEST_F(PartOperatorsTest, ErrorsFollowPartOrder) {
   }
 }
 
-// Blocking operators other than a global aggregate read the part union: grouping and sorting see
-// the parts' rows in part order, so their results are the same on any number of threads.
+// Whether two tables hold the same values in the same order, NaN equal to NaN.
+bool SameRows(const arrow::Table& a, const arrow::Table& b) {
+  if (!a.schema()->Equals(*b.schema()) || a.num_rows() != b.num_rows()) {
+    return false;
+  }
+  const auto options = arrow::EqualOptions::Defaults().nans_equal(true);
+  for (int c = 0; c < a.num_columns(); ++c) {
+    if (!a.column(c)->Equals(*b.column(c), options)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// The rows of a table sorted by all its columns, for comparing results whose row order SQL
+// leaves open.
+std::shared_ptr<arrow::Table> SortedRows(const std::shared_ptr<arrow::Table>& table) {
+  std::vector<arrow::compute::SortKey> keys;
+  for (const auto& field : table->schema()->fields()) {
+    keys.emplace_back(field->name());
+  }
+  const auto indices = arrow::compute::SortIndices(arrow::Datum(table),
+                                                   arrow::compute::SortOptions(std::move(keys)));
+  EXPECT_TRUE(indices.ok()) << indices.status().ToString();
+  const auto sorted = arrow::compute::Take(table, *indices);
+  EXPECT_TRUE(sorted.ok()) << sorted.status().ToString();
+  return sorted->table();
+}
+
+// Grouping runs per part and merges the parts' groups in part order; sorting reads the part union.
+// Both give the same result on any number of threads, byte for byte, and the serial operators'
+// rows (the group order follows the parts' batches, which SQL leaves open).
 TEST_F(PartOperatorsTest, GroupingAndSortingReadThePartsInOrder) {
   const auto pool = Pool();
   const auto y = Column(2, "y", LogicalType::kBigInt);
@@ -419,19 +453,256 @@ TEST_F(PartOperatorsTest, GroupingAndSortingReadThePartsInOrder) {
     const auto top = Node(plan::LimitNode{.input = sort, .limit = 30});
     return Node(plan::ProjectNode{.input = top, .columns = {x}});
   };
-  const auto same_as_serial = [&](const auto& shape, std::size_t width) {
+  const auto same_as_serial = [&](const auto& shape, std::size_t width, bool ordered) {
     const auto serial = Run(PlanOf(shape(Scan(Table(/*split=*/false))), width), nullptr);
     ASSERT_TRUE(serial.ok()) << serial.status().ToString();
-    for (arrow::internal::Executor* executor :
-         {static_cast<arrow::internal::Executor*>(nullptr),
-          static_cast<arrow::internal::Executor*>(pool.get())}) {
-      const auto result = Run(PlanOf(shape(Scan(Table())), width), executor);
-      ASSERT_TRUE(result.ok()) << result.status().ToString();
-      EXPECT_TRUE((*result)->Equals(**serial)) << (*result)->ToString();
+    const auto one_thread = Run(PlanOf(shape(Scan(Table())), width), nullptr);
+    ASSERT_TRUE(one_thread.ok()) << one_thread.status().ToString();
+    const auto four_threads = Run(PlanOf(shape(Scan(Table())), width), pool.get());
+    ASSERT_TRUE(four_threads.ok()) << four_threads.status().ToString();
+    EXPECT_TRUE((*four_threads)->Equals(**one_thread)) << (*four_threads)->ToString();
+    if (ordered) {
+      EXPECT_TRUE((*one_thread)->Equals(**serial)) << (*one_thread)->ToString();
+    } else {
+      EXPECT_TRUE(SortedRows(*one_thread)->Equals(*SortedRows(*serial)));
     }
   };
-  same_as_serial(grouped, 2);
-  same_as_serial(sorted, 1);
+  same_as_serial(grouped, 2, /*ordered=*/false);
+  same_as_serial(sorted, 1, /*ordered=*/true);
+}
+
+// ---- GROUP BY per part ----
+
+// A table of `parts` parts: key k (DOUBLE, with -0.0, 0.0 and NaNs of both signs, and NULL),
+// group g (BIGINT, NULL every seventh row), s (VARCHAR) and v (BIGINT).
+std::shared_ptr<MemoryTable> GroupingTable(bool split) {
+  const auto schema =
+      arrow::schema({arrow::field("k", arrow::float64()), arrow::field("g", arrow::int64()),
+                     arrow::field("s", arrow::binary()), arrow::field("v", arrow::int64()),
+                     arrow::field("d", arrow::float64())});
+  const std::vector<double> doubles = {-0.0, 1.5, 0.0, std::nan(""), -std::nan(""), 2.5, 1.5};
+  arrow::RecordBatchVector batches;
+  for (int64_t part = 0; part < 12; ++part) {
+    arrow::DoubleBuilder k;
+    std::vector<std::optional<int64_t>> g;
+    std::vector<std::optional<std::string>> str;
+    std::vector<std::optional<int64_t>> v;
+    arrow::DoubleBuilder d;
+    const int64_t rows = part % 4 == 3 ? 0 : 9;  // some parts are empty
+    for (int64_t i = 0; i < rows; ++i) {
+      const int64_t row = (part * 9) + i;
+      EXPECT_TRUE(
+          (row % 11 == 0 ? k.AppendNull() : k.Append(doubles[static_cast<std::size_t>(row % 7)]))
+              .ok());
+      g.push_back(row % 7 == 0 ? std::nullopt : std::optional<int64_t>((row * 5) % 13));
+      str.emplace_back(std::string(1, static_cast<char>('a' + (row % 5))));
+      v.emplace_back(row);
+      EXPECT_TRUE(d.Append(static_cast<double>(row) * 0.1).ok());  // sums round by order
+    }
+    batches.push_back(
+        arrow::RecordBatch::Make(schema, rows,
+                                 {k.Finish().ValueOrDie(), Int64s(g), testing::Strings(str),
+                                  Int64s(v), d.Finish().ValueOrDie()}));
+  }
+  if (!split) {
+    auto combined = arrow::Table::FromRecordBatches(schema, batches).ValueOrDie();
+    auto one = combined->CombineChunksToBatch().ValueOrDie();
+    return std::make_shared<MemoryTable>(schema, arrow::RecordBatchVector{one}, false);
+  }
+  return std::make_shared<MemoryTable>(schema, std::move(batches), true);
+}
+
+// Grouping per part and merging the parts in order gives the groups of one pass (as a set of
+// rows) for every aggregate and key type, NULL keys, no keys and empty parts; the same rows in the
+// same order on any number of threads; and a DOUBLE key keeps its spelling from the earliest part.
+TEST_F(PartOperatorsTest, GroupingPerPartMergesInPartOrder) {
+  const auto pool = Pool();
+  const auto k = Column(0, "k", LogicalType::kDouble);
+  const auto g = Column(1, "g", LogicalType::kBigInt);
+  const auto str = Column(2, "s", LogicalType::kVarchar);
+  const auto v = Column(3, "v", LogicalType::kBigInt);
+  const std::vector<plan::AggregateCall> calls = {
+      {.kind = plan::AggKind::kCountStar, .arg = {}, .type = LogicalType::kBigInt},
+      {.kind = plan::AggKind::kCount, .arg = g, .type = LogicalType::kBigInt},
+      {.kind = plan::AggKind::kSum, .arg = v, .type = LogicalType::kHugeInt},
+      {.kind = plan::AggKind::kMin, .arg = str, .type = LogicalType::kVarchar},
+      {.kind = plan::AggKind::kMax, .arg = k, .type = LogicalType::kDouble},
+      {.kind = plan::AggKind::kCountDistinct, .arg = str, .type = LogicalType::kBigInt}};
+  for (const std::vector<plan::BoundColumn>& keys :
+       {std::vector<plan::BoundColumn>{k}, std::vector<plan::BoundColumn>{g, str},
+        std::vector<plan::BoundColumn>{}}) {
+    const auto grouped = [&](const std::shared_ptr<MemoryTable>& table) {
+      const auto scan =
+          Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1, 2, 3}});
+      return PlanOf(
+          Node(plan::GroupAggregateNode{.input = scan, .keys = keys, .aggregates = calls}),
+          keys.size() + calls.size());
+    };
+    const auto serial = Run(grouped(GroupingTable(false)), nullptr);
+    ASSERT_TRUE(serial.ok()) << serial.status().ToString();
+    const auto one_thread = Run(grouped(GroupingTable(true)), nullptr);
+    ASSERT_TRUE(one_thread.ok()) << one_thread.status().ToString();
+    const auto four_threads = Run(grouped(GroupingTable(true)), pool.get());
+    ASSERT_TRUE(four_threads.ok()) << four_threads.status().ToString();
+    EXPECT_TRUE(SameRows(**four_threads, **one_thread)) << keys.size();
+    EXPECT_TRUE(SameRows(*SortedRows(*one_thread), *SortedRows(*serial)))
+        << keys.size() << "\n"
+        << (*one_thread)->ToString() << "\n"
+        << (*serial)->ToString();
+  }
+  // Row 2 (0.0) comes before row 7 (-0.0), row 3 (NaN) before row 4 (-NaN): the groups keep the
+  // first spelling.
+  const auto scan =
+      Node(plan::ScanNode{.table = GroupingTable(true), .table_name = "t", .fields = {0}});
+  const auto result =
+      Run(PlanOf(Node(plan::GroupAggregateNode{.input = scan,
+                                               .keys = {Column(0, "k", LogicalType::kDouble)},
+                                               .aggregates = {{.kind = plan::AggKind::kCountStar,
+                                                               .arg = {},
+                                                               .type = LogicalType::kBigInt}}}),
+                 2),
+          pool.get());
+  ASSERT_TRUE(result.ok()) << result.status().ToString();
+  const auto keys = (*result)->column(0);
+  int zeros = 0;
+  int nans = 0;
+  for (const auto& chunk : keys->chunks()) {
+    const auto& values = static_cast<const arrow::DoubleArray&>(*chunk);
+    for (int64_t i = 0; i < values.length(); ++i) {
+      if (values.IsNull(i)) {
+        continue;
+      }
+      if (values.Value(i) == 0) {
+        ++zeros;
+        EXPECT_FALSE(std::signbit(values.Value(i))) << "0.0 comes first";
+      }
+      if (std::isnan(values.Value(i))) {
+        ++nans;
+        EXPECT_FALSE(std::signbit(values.Value(i))) << "NaN comes before -NaN";
+      }
+    }
+  }
+  EXPECT_EQ(zeros, 1);
+  EXPECT_EQ(nans, 1);
+}
+
+TEST_F(PartOperatorsTest, GroupingErrorsFollowPartOrder) {
+  const auto pool = Pool();
+  for (arrow::internal::Executor* executor :
+       {static_cast<arrow::internal::Executor*>(nullptr),
+        static_cast<arrow::internal::Executor*>(pool.get())}) {
+    const auto table = Table();
+    table->FailPart(5);
+    const auto grouped = Node(plan::GroupAggregateNode{
+        .input = Scan(table),
+        .keys = {Column(2, "y", LogicalType::kBigInt)},
+        .aggregates = {
+            {.kind = plan::AggKind::kCountStar, .arg = {}, .type = LogicalType::kBigInt}}});
+    const auto failed = Run(PlanOf(grouped, 2), executor);
+    EXPECT_TRUE(failed.status().IsIOError()) << failed.status().ToString();
+    EXPECT_EQ(failed.status().message(), "part 5 is broken");
+  }
+}
+
+// A grouped DOUBLE SUM or AVG adds per part, then the parts in order: the same bytes on any number
+// of threads, and one running sum up to rounding.
+TEST_F(PartOperatorsTest, GroupedDoubleSumsAddPerPart) {
+  const auto pool = Pool();
+  const auto d = Column(4, "d", LogicalType::kDouble);
+  const auto grouped = [&](const std::shared_ptr<MemoryTable>& table) {
+    const auto scan =
+        Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1, 2, 3, 4}});
+    return PlanOf(
+        Node(plan::GroupAggregateNode{
+            .input = scan,
+            .keys = {Column(1, "g", LogicalType::kBigInt)},
+            .aggregates = {{.kind = plan::AggKind::kSum, .arg = d, .type = LogicalType::kDouble},
+                           {.kind = plan::AggKind::kAvg, .arg = d, .type = LogicalType::kDouble}}}),
+        3);
+  };
+  const auto serial = Run(grouped(GroupingTable(false)), nullptr);
+  const auto one_thread = Run(grouped(GroupingTable(true)), nullptr);
+  const auto four_threads = Run(grouped(GroupingTable(true)), pool.get());
+  ASSERT_TRUE(serial.ok() && one_thread.ok() && four_threads.ok());
+  EXPECT_TRUE(SameRows(**four_threads, **one_thread));
+  // Per key, the sums agree with the running sums up to rounding.
+  const auto sums_by_key = [](const arrow::Table& table) {
+    std::map<std::optional<int64_t>, std::pair<double, double>> out;
+    const auto combined = table.CombineChunksToBatch().ValueOrDie();
+    const auto& keys = static_cast<const arrow::Int64Array&>(*combined->column(0));
+    const auto& sums = static_cast<const arrow::DoubleArray&>(*combined->column(1));
+    const auto& avgs = static_cast<const arrow::DoubleArray&>(*combined->column(2));
+    for (int64_t i = 0; i < combined->num_rows(); ++i) {
+      out[keys.IsNull(i) ? std::nullopt : std::optional(keys.Value(i))] = {sums.Value(i),
+                                                                           avgs.Value(i)};
+    }
+    return out;
+  };
+  const auto parts = sums_by_key(**one_thread);
+  const auto running = sums_by_key(**serial);
+  ASSERT_EQ(parts.size(), running.size());
+  for (const auto& [key, values] : parts) {
+    const auto& expected = running.at(key);
+    EXPECT_NEAR(values.first, expected.first, 1e-9 * std::abs(expected.first));
+    EXPECT_NEAR(values.second, expected.second, 1e-9 * std::abs(expected.second));
+  }
+}
+
+// A merge adds a part's new groups in chunks of at most GroupTable::kMaxMergeChunk, taking each
+// group's keys from the part's chunk that holds them: no array grows with the part.
+TEST_F(PartOperatorsTest, MergedGroupsComeInBoundedChunks) {
+  const auto x = Column(0, "x", LogicalType::kBigInt);
+  const auto s = Column(1, "s", LogicalType::kVarchar);
+  const std::vector<plan::AggregateCall> calls = {
+      {.kind = plan::AggKind::kCountStar, .arg = {}, .type = LogicalType::kBigInt}};
+  const auto schema =
+      arrow::schema({arrow::field("key0", arrow::int64()), arrow::field("key1", arrow::binary()),
+                     arrow::field("agg0", arrow::int64())});
+  auto part = GroupTable::Make({x, s}, calls, 2, arrow::default_memory_pool(), nullptr);
+  ASSERT_TRUE(part.ok()) << part.status().ToString();
+  constexpr int64_t kGroups = 150'000;
+  constexpr int64_t kBatch = 50'000;
+  for (int64_t start = 0; start < kGroups; start += kBatch) {  // three chunks of new groups
+    std::vector<std::optional<int64_t>> xs;
+    std::vector<std::optional<std::string>> ss;
+    xs.reserve(kBatch);
+    ss.reserve(kBatch);
+    for (int64_t i = start; i < start + kBatch; ++i) {
+      xs.emplace_back(kGroups - i);
+      ss.emplace_back(std::to_string(i % 97));
+    }
+    const auto batch = arrow::RecordBatch::Make(
+        arrow::schema({arrow::field("x", arrow::int64()), arrow::field("s", arrow::binary())}),
+        kBatch, {Int64s(xs), testing::Strings(ss)});
+    ASSERT_TRUE((*part)->Consume(*batch).ok());
+  }
+  auto merged = GroupTable::Make({x, s}, calls, 2, arrow::default_memory_pool(), nullptr);
+  ASSERT_TRUE(merged.ok());
+  ASSERT_TRUE((*merged)->Merge(**part).ok());
+  EXPECT_EQ((*merged)->num_groups(), kGroups);
+  const auto drain = [&](GroupTable& table) {
+    arrow::RecordBatchVector out;
+    while (true) {
+      auto chunk = table.NextChunk(schema);
+      EXPECT_TRUE(chunk.ok()) << chunk.status().ToString();
+      if (!chunk.ok() || *chunk == nullptr) {
+        return out;
+      }
+      EXPECT_TRUE((*chunk)->ValidateFull().ok());
+      out.push_back(*chunk);
+    }
+  };
+  const arrow::RecordBatchVector chunks = drain(**merged);
+  std::vector<int64_t> sizes;
+  sizes.reserve(chunks.size());
+  for (const auto& chunk : chunks) {
+    sizes.push_back(chunk->num_rows());
+  }
+  EXPECT_EQ(sizes, (std::vector<int64_t>{65536, 65536, 18928}));
+  // The same groups, keys and counts as the part itself.
+  const auto a = arrow::Table::FromRecordBatches(schema, chunks).ValueOrDie();
+  const auto b = arrow::Table::FromRecordBatches(schema, drain(**part)).ValueOrDie();
+  EXPECT_TRUE(SameRows(*SortedRows(a), *SortedRows(b)));
 }
 
 }  // namespace
