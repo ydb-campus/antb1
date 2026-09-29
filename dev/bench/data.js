@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790682645687,
+  "lastUpdate": 1790693590632,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -1980,6 +1980,78 @@ window.BENCHMARK_DATA = {
             "value": 14.40169440816332,
             "unit": "ms/iter",
             "extra": "iterations: 49\ncpu: 14.398958734693867 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "573baf37182ce4054566368772afe4a7b6fd6bc0",
+          "message": "perf(exec): partitioned GROUP BY merge (#46)\n\n## Summary\n\nThis is the follow-up named in ADR 0013 to #45's GROUP BY sink: a\nradix-partitioned merge.\n\n**The problem:** #45 grouped each row group in parallel, but merged the\npart tables on one thread. For high-cardinality keys that merge\nre-inserted about every row, so Q14/16/18/32 did not improve.\n\n**Partitioning** (`exec::GroupTable::Partition`, on the part's worker\nthread):\n- The part's groups are split into **64 partitions**.\n- The partition is a seed-free hash of the normalized keys:\n`arrow::internal::ComputeStringHash` over each value's bytes, a constant\nfor NULL, combined over keys.\n- The unique keys are sliced per partition.\n- 64 is a constant, never the thread count, so results stay\nbyte-identical for any number of threads.\n\n**Merge** (`PartGroupAggregateOperator`):\n- The consumer keeps one `GroupTable` per partition.\n- For each part, in part order through `PartScheduler` (unchanged), it\nmerges the part's partitions in parallel on the pool and waits for all\nof them. Each partition table is touched by one task at a time, and the\nfirst failed partition in partition order decides the error.\n- Groups are emitted partition by partition. Group order is still\ndeterministic and thread-count independent; docs/sql-subset.md says it\nfollows a key hash, and SQL leaves it open.\n\n**`GroupedAggregateState::MergeGroups(other, from, to)`** (public\nheader): a sparse merge whose time is proportional to the merged groups.\n`Merge(other, map)` is now a non-virtual wrapper over it.\n\n**COUNT(DISTINCT):** it builds its distinct pairs by group once\n(`std::call_once`) and merges only the requested groups' pairs. This\nmakes it safe and cheap for the 64 partitions that read the same part\nstate at the same time.\n\n## Performance: full ClickBench data, 128 threads, paired A/B on a quiet\nhost\n\nFor each query, the #45 binary and this PR's binary each ran 3 tries\n(best taken), alternating which went first. The load average was 7 at\nthe start and 39 at the end.\n\n- **Total:** 133.3 s → 53.1 s, 2.5× faster. DuckDB takes 12.9 s, so the\ngap went from 12.8× (#43) to about 4×.\n- **High-cardinality GROUP BY:** 3.0-6.5× faster: Q12-18, and Q32-34\n(Q18: 16.9 s → 2.6 s; Q32: 25.6 s → 6.8 s).\n- **Medium-cardinality GROUP BY:** about 2× (Q8-9, Q30-31, Q35).\n- **Low-cardinality GROUP BY after a selective filter** (Q21, Q22):\n0.91-0.92×. The 64 partitions add a fixed per-part overhead there. The\nabsolute cost is about 0.1 s.\n\n<details><summary>Per-query seconds (queries over 0.3 s)</summary>\n\n| Query | main (#45) | this PR | speedup | DuckDB 1.5.5 |\n| --- | ---: | ---: | ---: | ---: |\n| Q4 | 2.27 | 2.27 | 1.00× | 0.14 |\n| Q5 | 1.68 | 1.69 | 0.99× | 0.23 |\n| Q8 | 3.01 | 1.62 | 1.85× | 0.19 |\n| Q9 | 2.98 | 1.68 | 1.77× | 0.21 |\n| Q12 | 2.47 | 0.72 | 3.43× | 0.25 |\n| Q13 | 3.97 | 1.16 | 3.41× | 0.29 |\n| Q14 | 2.71 | 0.90 | 3.03× | 0.22 |\n| Q15 | 3.35 | 0.69 | 4.86× | 0.19 |\n| Q16 | 7.29 | 1.43 | 5.10× | 0.40 |\n| Q17 | 7.12 | 1.13 | 6.28× | 0.37 |\n| Q18 | 16.93 | 2.61 | 6.49× | 0.69 |\n| Q20 | 0.63 | 0.63 | 0.99× | 0.34 |\n| Q21 | 0.69 | 0.76 | 0.91× | 0.28 |\n| Q22 | 1.29 | 1.41 | 0.92× | 0.57 |\n| Q23 | 4.16 | 4.18 | 1.00× | 0.48 |\n| Q24 | 0.74 | 0.75 | 0.99× | 0.21 |\n| Q25 | 0.73 | 0.72 | 1.01× | 0.14 |\n| Q26 | 0.74 | 0.74 | 1.01× | 0.09 |\n| Q27 | 0.83 | 0.88 | 0.94× | 0.37 |\n| Q28 | 7.03 | 6.42 | 1.09× | 2.80 |\n| Q30 | 1.98 | 0.98 | 2.03× | 0.26 |\n| Q31 | 3.77 | 1.59 | 2.37× | 0.36 |\n| Q32 | 25.57 | 6.83 | 3.75× | 0.77 |\n| Q33 | 12.19 | 2.54 | 4.79× | 0.78 |\n| Q34 | 12.11 | 2.53 | 4.79× | 1.01 |\n| Q35 | 2.63 | 1.22 | 2.15× | 0.24 |\n| Q36 | 0.78 | 0.75 | 1.05× | 0.13 |\n| Q37 | 0.55 | 0.58 | 0.94× | 0.10 |\n| Q38 | 0.62 | 0.64 | 0.97× | 0.07 |\n| Q39 | 1.46 | 1.38 | 1.06× | 0.24 |\n| **Total (43 queries)** | **133.3** | **53.1** | **2.51×** | **12.9** |\n\n</details>\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [x] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full          # lint, ci, asan, tidy, coverage, fuzz-smoke, ci-gcc\ncheck-full exit 0; Coverage gate: PASS\n$ pixi run tsan\n100% tests passed out of 1326\n$ ANTB1_DIFF_COUNT=20000 pixi run diff-random\nDIFF: PASS seed=3851070685 queries=20000 failed=0 unsupported=0\n$ pixi run test-data\n100% tests passed out of 6\n```\n\n**New tests:**\n- **`MergeGroups` for every state kind and key type:** a part state is\nsplit into even and odd groups, merged from two threads at once, and\neach group comes out exactly once. Out-of-range groups and mismatched\nlists are Invalid.\n- **The partition hash is pinned by a golden:** fixed keys map to fixed\npartitions (NULL to the same one for every key type). A change would\nchange GROUP BY output order, so it must be deliberate.\n- **Merge errors:**\n- a HUGEINT SUM that overflows only when two parts merge fails with the\nsame error on 1 and 4 threads;\n  - an out-of-range partition is Invalid;\n  - `Next()` after `Close()` is Invalid.\n- **Existing GROUP BY tests** now run through the partitioned merge:\npart vs single-pass equality over all aggregates and key types, 4\nthreads vs 1, key spelling, errors, grouped DOUBLE sums, and bounded\nchunks. So do the `parallel` label and the memory-limit tests.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer (none changed)\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code wrote the change\nand tests, ran the verification and the paired A/B. The pool tests\ncaught a race: concurrent `GetUniques` on a part's COUNT(DISTINCT)\ngrouper. The `reviewer` agent found three problems, all fixed:\n  - `Next()` after `Close()` dereferenced a null scheduler;\n  - the merge error path was untested;\n- the skip-sentinel map made each partition scan all of a part's groups,\nwhich is now replaced by the sparse `MergeGroups`.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-09-29T17:50:38+03:00",
+          "tree_id": "f51a43547d7f848d5691c8afc6916e87c59aad28",
+          "url": "https://github.com/ydb-campus/antb1/commit/573baf37182ce4054566368772afe4a7b6fd6bc0"
+        },
+        "date": 1790693589827,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4093.060569373508,
+            "unit": "ns/iter",
+            "extra": "iterations: 168501\ncpu: 4092.2793751965864 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84658.38798026936,
+            "unit": "ns/iter",
+            "extra": "iterations: 7704\ncpu: 84653.67328660436 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222320.84934982486,
+            "unit": "ns/iter",
+            "extra": "iterations: 3153\ncpu: 222314.94576593715 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 440558.9805153957,
+            "unit": "ns/iter",
+            "extra": "iterations: 1591\ncpu: 440533.5964802009 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 401010.88665132027,
+            "unit": "ns/iter",
+            "extra": "iterations: 1738\ncpu: 400959.65132336 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2130678.889908259,
+            "unit": "ns/iter",
+            "extra": "iterations: 327\ncpu: 2130602.299694188 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 196.07981200000305,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 196.07369733333346 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.462210666666605,
+            "unit": "ms/iter",
+            "extra": "iterations: 48\ncpu: 14.461259062499991 ms\nthreads: 1"
           }
         ]
       }
