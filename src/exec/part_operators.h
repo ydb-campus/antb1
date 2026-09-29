@@ -11,6 +11,7 @@
 #include <arrow/type_fwd.h>
 
 #include "antb1/exec/operator.h"
+#include "antb1/exec/sort.h"
 #include "antb1/plan/logical_plan.h"
 
 #include "aggregate_set.h"
@@ -126,6 +127,53 @@ class PartGroupAggregateOperator final : public Operator {
   // Merges a part's partitions into tables_, on the executor when there is one.
   arrow::Status MergePart(const GroupTable& part);
   std::unique_ptr<PartScheduler<PartTable>> scheduler_;
+};
+
+// ORDER BY with a LIMIT (top-N) over a part pipeline: every part keeps its first limit + offset
+// rows of the order in its own SortBuffer on the executor, and the buffers are merged in part order
+// into one, which keeps the first limit + offset rows again. Ties keep their input order, parts in
+// part order: exactly the rows and order of SortOperator's top-N over the part union, for any
+// number of threads. Output: the window [offset, offset + limit) of the order, in the pipeline's
+// schema.
+class PartTopNOperator final : public Operator {
+ public:
+  PartTopNOperator(PartPipeline pipeline, int64_t num_parts, std::shared_ptr<arrow::Schema> schema,
+                   std::vector<plan::SortKey> keys, int64_t limit, int64_t offset);
+  ~PartTopNOperator() override;
+
+  [[nodiscard]] const std::shared_ptr<arrow::Schema>& output_schema() const override {
+    return schema_;
+  }
+  arrow::Status Open(ExecContext& ctx) override;
+  arrow::Result<Batch> Next() override;
+  arrow::Status Close() override;
+
+ private:
+  // A part's first rows, and the reservation of the buffer's own containers, which lasts until
+  // the part is merged (while it waits in the scheduler's window, too).
+  struct PartRows {
+    PartRows(SortBuffer rows, MemoryBudget* budget) : buffer(std::move(rows)) {
+      memory.Reset(budget);
+    }
+    SortBuffer buffer;
+    MemoryReservation memory;
+  };
+  using PartBuffer = std::shared_ptr<PartRows>;
+
+  std::shared_ptr<const PartPipeline> pipeline_;
+  int64_t num_parts_;
+  std::shared_ptr<arrow::Schema> schema_;
+  std::vector<plan::SortKey> keys_;
+  int64_t limit_;
+  int64_t offset_;
+  arrow::MemoryPool* pool_ = arrow::default_memory_pool();
+  int64_t batch_size_ = 1;
+  std::unique_ptr<SortBuffer> merged_;  // the parts' first rows, until emitted
+  MemoryReservation memory_;            // merged_'s own containers
+  bool sorted_ = false;
+  int64_t next_ = 0;  // the next sorted row to emit
+  int64_t end_ = 0;   // one past the last
+  std::unique_ptr<PartScheduler<PartBuffer>> scheduler_;
 };
 
 }  // namespace antb1::exec

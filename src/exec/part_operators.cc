@@ -1,9 +1,11 @@
 #include "part_operators.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <new>
 #include <optional>
@@ -15,6 +17,7 @@
 #include <arrow/util/thread_pool.h>
 
 #include "antb1/exec/operator.h"
+#include "antb1/exec/sort.h"
 #include "antb1/plan/logical_plan.h"
 
 #include "aggregate_set.h"
@@ -310,6 +313,99 @@ arrow::Status PartGroupAggregateOperator::Close() {
   tables_.clear();
   next_table_ = 0;
   opened_ = false;
+  return arrow::Status::OK();
+}
+
+// ---- PartTopNOperator ----
+
+PartTopNOperator::PartTopNOperator(PartPipeline pipeline, int64_t num_parts,
+                                   std::shared_ptr<arrow::Schema> schema,
+                                   std::vector<plan::SortKey> keys, int64_t limit, int64_t offset)
+    : pipeline_(std::make_shared<const PartPipeline>(std::move(pipeline))),
+      num_parts_(num_parts),
+      schema_(std::move(schema)),
+      keys_(std::move(keys)),
+      limit_(limit),
+      offset_(offset) {}
+
+PartTopNOperator::~PartTopNOperator() = default;
+
+arrow::Status PartTopNOperator::Open(ExecContext& ctx) {
+  ARROW_RETURN_NOT_OK(Close());
+  if (keys_.empty()) {
+    return arrow::Status::Invalid("sort without keys");
+  }
+  if (limit_ < 1 || offset_ < 0) {
+    return arrow::Status::Invalid("a top-N needs a positive LIMIT and no negative OFFSET");
+  }
+  pool_ = ctx.pool;
+  batch_size_ = std::max<int64_t>(ctx.batch_size, 1);
+  int64_t keep = 0;
+  if (__builtin_add_overflow(limit_, offset_, &keep)) {
+    keep = std::numeric_limits<int64_t>::max();
+  }
+  ARROW_ASSIGN_OR_RAISE(RowComparator comparator, RowComparator::Make(schema_, keys_));
+  merged_ = std::make_unique<SortBuffer>(std::move(comparator), keep);
+  memory_.Reset(ctx.budget);
+  sorted_ = false;
+  next_ = 0;
+  end_ = 0;
+  auto task = [pipeline = pipeline_, part_ctx = PartContext(ctx), schema = schema_, keys = keys_,
+               keep](int64_t part, const std::atomic<bool>& stop) -> arrow::Result<PartBuffer> {
+    ARROW_ASSIGN_OR_RAISE(RowComparator part_comparator, RowComparator::Make(schema, keys));
+    auto rows =
+        std::make_shared<PartRows>(SortBuffer(std::move(part_comparator), keep), part_ctx.budget);
+    SortBuffer& buffer = rows->buffer;
+    ARROW_RETURN_NOT_OK(
+        RunPart(*pipeline, part, part_ctx, stop, [&](const Batch& batch) -> arrow::Result<bool> {
+          ARROW_ASSIGN_OR_RAISE(auto data, Materialize(batch, part_ctx.pool));
+          ARROW_RETURN_NOT_OK(buffer.Add(std::move(data), part_ctx.pool));
+          ARROW_RETURN_NOT_OK(rows->memory.Resize(buffer.memory_usage()));
+          return true;
+        }));
+    ARROW_RETURN_NOT_OK(rows->memory.Resize(buffer.memory_usage() + buffer.sort_memory()));
+    ARROW_RETURN_NOT_OK(buffer.Sort(part_ctx.pool));  // keeps the part's first `keep` rows
+    ARROW_RETURN_NOT_OK(rows->memory.Resize(buffer.memory_usage()));
+    return rows;
+  };
+  scheduler_ = std::make_unique<PartScheduler<PartBuffer>>(num_parts_, std::move(task),
+                                                           ctx.executor, Window(ctx), ctx.budget);
+  return arrow::Status::OK();
+}
+
+arrow::Result<Batch> PartTopNOperator::Next() {
+  if (merged_ == nullptr) {
+    return arrow::Status::Invalid("top-N: Next() before Open() or after Close()");
+  }
+  if (!sorted_) {
+    while (!scheduler_->done()) {
+      ARROW_ASSIGN_OR_RAISE(const PartBuffer part, scheduler_->Next());
+      ARROW_RETURN_NOT_OK(merged_->Merge(part->buffer, pool_));  // after the earlier parts' rows
+      ARROW_RETURN_NOT_OK(memory_.Resize(merged_->memory_usage()));
+    }
+    scheduler_.reset();
+    ARROW_RETURN_NOT_OK(memory_.Resize(merged_->memory_usage() + merged_->sort_memory()));
+    ARROW_RETURN_NOT_OK(merged_->Sort(pool_));
+    ARROW_RETURN_NOT_OK(memory_.Resize(merged_->memory_usage()));
+    sorted_ = true;
+    next_ = std::min(offset_, merged_->num_rows());
+    int64_t end = 0;
+    end_ = __builtin_add_overflow(next_, limit_, &end) ? merged_->num_rows()
+                                                       : std::min(merged_->num_rows(), end);
+  }
+  if (next_ >= end_) {
+    return Batch{};
+  }
+  const int64_t stop = end_ - next_ > batch_size_ ? next_ + batch_size_ : end_;
+  ARROW_ASSIGN_OR_RAISE(auto rows, merged_->Slice(next_, stop, pool_));
+  next_ = stop;
+  return Batch{.data = std::move(rows), .selection = {}};
+}
+
+arrow::Status PartTopNOperator::Close() {
+  scheduler_.reset();
+  merged_.reset();
+  memory_.Release();
   return arrow::Status::OK();
 }
 

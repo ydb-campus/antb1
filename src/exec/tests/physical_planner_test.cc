@@ -121,7 +121,10 @@ TEST_F(PhysicalPlannerTest, LimitOverSortIsATopN) {
     EXPECT_TRUE(op.ok()) << op.status().ToString();
     return op.ok() ? *std::move(op) : nullptr;
   };
-  EXPECT_NE(dynamic_cast<const SortOperator*>(root(3, 2).get()), nullptr);
+  // Over a part pipeline (here a scan), a top-N keeps each part's first rows: PartTopNOperator.
+  EXPECT_EQ(dynamic_cast<const LimitOperator*>(root(3, 2).get()), nullptr);
+  EXPECT_EQ(dynamic_cast<const SortOperator*>(root(3, 2).get()), nullptr);
+  EXPECT_EQ(root(3, 2)->output_schema()->num_fields(), 2);
   EXPECT_NE(dynamic_cast<const LimitOperator*>(root(0, 0).get()), nullptr);
   EXPECT_NE(dynamic_cast<const LimitOperator*>(root(std::nullopt, 4).get()), nullptr);
 }
