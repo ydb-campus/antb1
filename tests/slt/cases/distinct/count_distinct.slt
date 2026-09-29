@@ -121,3 +121,47 @@ SELECT OS FROM hits_like GROUP BY OS ORDER BY COUNT(DISTINCT RegionID) DESC, OS 
 55
 26
 118
+
+# Two levels (docs/adr/0014-two-level-aggregation.md): several distinct columns, other calls, a
+# key with few values (each value's groups spread over the partitions), several keys, a DATE key.
+
+query IIIIII rowsort
+SELECT IsMobile, COUNT(DISTINCT UserID), COUNT(DISTINCT SearchPhrase), COUNT(*), MAX(RegionID), COUNT(DISTINCT UserID) FROM hits_like_split GROUP BY IsMobile
+----
+0	4936	595	4936	19994	4936
+1	5064	640	5064	19998	5064
+
+query TIIIT rowsort
+SELECT EventDate, IsMobile, COUNT(DISTINCT RegionID), SUM(RegionID), MIN(SearchPhrase) FROM hits_like_nulls WHERE EventDate < DATE '2013-07-05' GROUP BY EventDate, IsMobile
+----
+2013-07-01	0	141	1357457	(empty)
+2013-07-01	1	144	1407946	(empty)
+2013-07-01	NULL	20	210706	(empty)
+2013-07-02	0	133	1347038	(empty)
+2013-07-02	1	143	1400058	(empty)
+2013-07-02	NULL	20	197510	(empty)
+2013-07-03	0	132	1244842	(empty)
+2013-07-03	1	141	1458905	(empty)
+2013-07-03	NULL	20	187244	(empty)
+2013-07-04	0	107	1085000	(empty)
+2013-07-04	1	129	1194528	(empty)
+2013-07-04	NULL	21	227904	(empty)
+
+query TIR nosort
+SELECT SearchPhrase, COUNT(DISTINCT UserID) AS u, AVG(RegionID) FROM hits_like_split WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY u DESC, SearchPhrase LIMIT 5
+----
+violet	35	10774.828571428572
+книга	35	10339.771428571428
+green	34	8259.264705882353
+river	34	9151.970588235294
+tundra	33	9573.212121212122
+
+query III nosort
+SELECT COUNT(DISTINCT UserID), COUNT(DISTINCT RegionID), COUNT(*) FROM hits_like_split WHERE RegionID > 100
+----
+9639	7649	9640
+
+query III nosort
+SELECT COUNT(DISTINCT UserID), COUNT(DISTINCT RegionID), MIN(RegionID) FROM hits_like_split WHERE RegionID < -1
+----
+0	0	NULL

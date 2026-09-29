@@ -161,7 +161,9 @@ The maintainer asked for this design to be ready for TPC-H: hash joins, and corr
    `LIMIT` still sorts the part union on one thread; a k-way merge of sorted parts is its follow-up.
 6. **io and exec** (follow-up): skipping parts by their footer statistics (integer-valued columns, predicates
    directly on the scan), before the parts are scheduled.
-7. **Docs:** ADRs 0003, 0006 and 0010 and the status of this ADR (semantics, architecture.md and benchmarks change
+7. **exec** (follow-up, [ADR 0014](0014-two-level-aggregation.md)): `COUNT(DISTINCT)` in two levels, with the
+   heavy keys' groups spread over the partitions.
+8. **Docs:** ADRs 0003, 0006 and 0010 and the status of this ADR (semantics, architecture.md and benchmarks change
    with the PRs above).
 
 ## Alternatives considered

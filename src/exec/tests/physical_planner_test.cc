@@ -17,6 +17,7 @@
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/sql_status.h"
 
+#include "../part_operators.h"
 #include "exec_test_util.h"
 
 namespace antb1::exec {
@@ -168,6 +169,74 @@ TEST_F(PhysicalPlannerTest, CountDistinctAloneBecomesAGroupBy) {
   EXPECT_EQ(Int64Column(*counts({distinct_y}), 0), (std::vector<std::optional<int64_t>>{6}));
   EXPECT_EQ(Int64Column(*counts({distinct_x, distinct_y}), 1),
             (std::vector<std::optional<int64_t>>{6}));
+}
+
+// An aggregation with COUNT(DISTINCT) over a scan runs in two levels (ADR 0014) when its calls
+// allow it, grouped or global (but a global COUNT(DISTINCT) of one column alone, which is a GROUP
+// BY); otherwise the per-part GROUP BY or aggregate: a DOUBLE key, a DOUBLE SUM, a distinct
+// column that is a key.
+TEST_F(PhysicalPlannerTest, CountDistinctRunsInTwoLevels) {
+  const auto schema =
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("x", arrow::int64()),
+                     arrow::field("d", arrow::float64())});
+  arrow::DoubleBuilder d;
+  ASSERT_TRUE(d.AppendValues({0.5, -0.0, 0.0, 1.5}).ok());
+  const auto table = std::make_shared<MemoryTable>(
+      schema,
+      arrow::RecordBatchVector{arrow::RecordBatch::Make(
+          schema, 4, {Int64s({1, 1, 2, std::nullopt}), Int64s({5, 6, 5, 7}), *d.Finish()})},
+      true);
+  const auto scan = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1, 2}});
+  const auto k = Column(0, "k", LogicalType::kBigInt);
+  const auto x = Column(1, "x", LogicalType::kBigInt);
+  const auto dbl = Column(2, "d", LogicalType::kDouble);
+  const plan::AggregateCall distinct_x{
+      .kind = plan::AggKind::kCountDistinct, .arg = x, .type = LogicalType::kBigInt};
+  const plan::AggregateCall distinct_d{
+      .kind = plan::AggKind::kCountDistinct, .arg = dbl, .type = LogicalType::kBigInt};
+  const plan::AggregateCall distinct_k{
+      .kind = plan::AggKind::kCountDistinct, .arg = k, .type = LogicalType::kBigInt};
+  const plan::AggregateCall sum_d{
+      .kind = plan::AggKind::kSum, .arg = dbl, .type = LogicalType::kDouble};
+  const plan::AggregateCall max_x{
+      .kind = plan::AggKind::kMax, .arg = x, .type = LogicalType::kBigInt};
+  const auto grouped = [&](std::vector<plan::BoundColumn> keys,
+                           std::vector<plan::AggregateCall> calls) {
+    const std::size_t width = keys.size() + calls.size();
+    auto op = BuildPhysicalPlan(
+        PlanOf(Node(plan::GroupAggregateNode{
+                   .input = scan, .keys = std::move(keys), .aggregates = std::move(calls)}),
+               width));
+    EXPECT_TRUE(op.ok()) << op.status().ToString();
+    return op.ok() ? *std::move(op) : nullptr;
+  };
+  const auto global = [&](std::vector<plan::AggregateCall> calls) {
+    const std::size_t width = calls.size();
+    auto op = BuildPhysicalPlan(
+        PlanOf(Node(plan::AggregateNode{.input = scan, .aggregates = std::move(calls)}), width));
+    EXPECT_TRUE(op.ok()) << op.status().ToString();
+    return op.ok() ? *std::move(op) : nullptr;
+  };
+  const auto two_level = [](const std::unique_ptr<Operator>& op) {
+    return dynamic_cast<const PartTwoLevelAggregateOperator*>(op.get()) != nullptr;
+  };
+  EXPECT_TRUE(two_level(grouped({k}, {distinct_x})));
+  EXPECT_TRUE(two_level(grouped({k}, {distinct_x, distinct_d, max_x})));
+  EXPECT_TRUE(two_level(global({distinct_x, distinct_d})));
+  EXPECT_TRUE(two_level(global({distinct_x, max_x})));
+  EXPECT_FALSE(two_level(global({distinct_x})));  // a GROUP BY x, then COUNT
+  EXPECT_FALSE(two_level(grouped({dbl}, {distinct_x})));
+  EXPECT_FALSE(two_level(grouped({k}, {distinct_x, sum_d})));
+  EXPECT_FALSE(two_level(grouped({k}, {distinct_k})));
+  EXPECT_NE(dynamic_cast<const PartGroupAggregateOperator*>(grouped({k}, {distinct_k}).get()),
+            nullptr);
+  EXPECT_NE(dynamic_cast<const PartAggregateOperator*>(global({distinct_x, sum_d}).get()), nullptr);
+  // COUNT(DISTINCT d) counts -0.0 with 0.0: 3 values; 3 values of x; MAX(x) = 7.
+  const auto result = Run(PlanOf(
+      Node(plan::AggregateNode{.input = scan, .aggregates = {distinct_x, distinct_d, max_x}}), 3));
+  EXPECT_EQ(Int64Column(*result, 0), (std::vector<std::optional<int64_t>>{3}));
+  EXPECT_EQ(Int64Column(*result, 1), (std::vector<std::optional<int64_t>>{3}));
+  EXPECT_EQ(Int64Column(*result, 2), (std::vector<std::optional<int64_t>>{7}));
 }
 
 TEST_F(PhysicalPlannerTest, AggregateOverFilteredScanForEveryBatchSize) {

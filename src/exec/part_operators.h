@@ -16,6 +16,7 @@
 
 #include "aggregate_set.h"
 #include "group_table.h"
+#include "outer_groups.h"
 #include "part_scheduler.h"
 
 // The operators that run a pipeline once per table part (docs/adr/0013-parallel-execution.md). A
@@ -127,6 +128,95 @@ class PartGroupAggregateOperator final : public Operator {
   // Merges a part's partitions into tables_, on the executor when there is one.
   arrow::Status MergePart(const GroupTable& part);
   std::unique_ptr<PartScheduler<PartTable>> scheduler_;
+};
+
+// Whether PartTwoLevelAggregateOperator runs an aggregation by `keys` (none: a global one) with
+// `calls`: some COUNT(DISTINCT) call whose column is not a key, no DOUBLE key, and every other call
+// independent of the order its rows merge in (COUNT, integer SUM and AVG, DATE and TIMESTAMP AVG,
+// MIN and MAX but of DOUBLE), so that the result is the serial one exactly.
+bool TwoLevelAggregation(const std::vector<plan::BoundColumn>& keys,
+                         const std::vector<plan::AggregateCall>& calls);
+
+// The input rows (by part_rows) the two-level aggregation samples its heavy keys from.
+inline constexpr int64_t kTwoLevelSampleRows = int64_t{4} * 1000 * 1000;
+
+// An aggregation with COUNT(DISTINCT) over a part pipeline in two levels
+// (docs/adr/0014-two-level-aggregation.md): an inner GROUP BY of the keys K and each distinct
+// column x (one inner table per column, plus a plain table by K for the other calls), then an outer
+// GROUP BY K over the inner groups, which counts each column's inner groups with a non-NULL x.
+// Every part groups into its own inner tables on the executor. The first `sample_parts` parts
+// decide the heavy keys (a K with a large share of the sample's inner groups, HeavyHitters). Every
+// table splits into GroupTable::kPartitions partitions by the hash of K, but the inner groups of a
+// heavy K by the hash of K and x, so that no partition holds most of the pairs. Parts merge in part
+// order, a part's partitions in parallel; then each partition groups its inner groups by K in
+// parallel. The groups of a light K are complete in their partition; those of a heavy K are merged
+// across the partitions, in partition order. Output: the light groups partition by partition, then
+// the heavy ones; the columns of GroupAggregateOperator (`global`: of ScalarAggregateOperator, one
+// row even without input). The same for any number of threads.
+class PartTwoLevelAggregateOperator final : public Operator {
+ public:
+  PartTwoLevelAggregateOperator(PartPipeline pipeline, int64_t num_parts, int64_t sample_parts,
+                                int input_width, std::vector<plan::BoundColumn> keys,
+                                std::vector<plan::AggregateCall> aggregates,
+                                std::shared_ptr<arrow::Schema> schema, bool global);
+  ~PartTwoLevelAggregateOperator() override;
+
+  [[nodiscard]] const std::shared_ptr<arrow::Schema>& output_schema() const override {
+    return schema_;
+  }
+  arrow::Status Open(ExecContext& ctx) override;
+  arrow::Result<Batch> Next() override;
+  arrow::Status Close() override;
+
+ private:
+  // A part's inner tables: one per distinct column, then the plain table if there are plain calls.
+  // A sampled part also has the hash of K of every group of its distinct tables, table after
+  // table (computed on its worker).
+  struct InnerPart {
+    std::vector<std::unique_ptr<GroupTable>> tables;
+    std::vector<std::uint64_t> key_hashes;
+  };
+  using PartTables = std::shared_ptr<InnerPart>;
+
+  // Runs every part and both levels.
+  arrow::Status Aggregate();
+  // Merges a part's partitions into tables_, on the executor when there is one.
+  arrow::Status MergePart(const std::vector<std::unique_ptr<GroupTable>>& part);
+  // The outer groups of partition `partition`: the light ones as output batches (rows_), the
+  // heavy ones left for the merge across partitions.
+  arrow::Status Outer(std::size_t partition);
+
+  std::shared_ptr<const PartPipeline> pipeline_;
+  int64_t num_parts_;
+  int64_t sample_parts_;
+  int input_width_;
+  std::vector<plan::BoundColumn> keys_;
+  std::vector<plan::AggregateCall> aggregates_;
+  std::shared_ptr<arrow::Schema> schema_;
+  bool global_;
+  std::vector<plan::BoundColumn> distinct_;   // the distinct columns, in order of first use
+  std::vector<plan::AggregateCall> plain_;    // the other calls
+  std::vector<OuterSlot> slots_;              // per call: its count or plain state
+  std::vector<plan::LogicalType> key_types_;  // K's
+  arrow::MemoryPool* pool_ = arrow::default_memory_pool();
+  MemoryBudget* budget_ = nullptr;
+  arrow::internal::Executor* executor_ = nullptr;
+  ExecContext part_ctx_;
+  int64_t window_ = 1;
+  bool opened_ = false;
+  bool aggregated_ = false;
+  std::vector<std::uint64_t> heavy_;  // the hashes of the heavy K, sorted
+  // Per inner table, per partition: the merged inner groups, until their partition's outer step.
+  std::vector<std::vector<std::unique_ptr<GroupTable>>> tables_;
+  // Per partition: the outer groups and which of them are heavy, until merged.
+  std::vector<std::unique_ptr<OuterGroups>> outer_;
+  std::vector<std::vector<std::uint32_t>> heavy_groups_;
+  // The output: per partition, its light groups' batches; then the heavy K's groups.
+  std::vector<std::vector<std::shared_ptr<arrow::RecordBatch>>> rows_;
+  std::unique_ptr<OuterGroups> heavy_table_;
+  std::size_t next_partition_ = 0;  // emitting: the partition (rows_.size(): heavy_table_),
+  std::size_t next_rows_ = 0;       // its next batch,
+  std::uint32_t next_group_ = 0;    // or the first heavy group of the next chunk
 };
 
 // ORDER BY with a LIMIT (top-N) over a part pipeline: every part keeps its first limit + offset
