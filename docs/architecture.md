@@ -93,7 +93,9 @@ steps (only step 7 uses more than one thread):
 5. Optimize (`plan::Optimize`): `COUNT(*)` without `WHERE` to `RowCount`, `Limit` below `Project`, and projection
    pruning (a `Scan` reads only the fields used above it).
 6. Physical plan (`exec::BuildPhysicalPlan`): an exhaustive `std::visit` turns each logical node into an operator
-   over the operator of its input; a `Limit` over a `Sort` becomes one top-N `SortOperator`. The chain of `Filter`,
+   over the operator of its input; a `Limit` over a `Sort` becomes one top-N `SortOperator`. A global aggregation
+   whose calls are all `COUNT(DISTINCT x)` of one column over a part pipeline becomes a `GroupAggregate` by `x`
+   (merged in parallel, partitioned) with `COUNT(x)` over its groups. The chain of `Filter`,
    `Compute` and `Project` nodes over a `Scan` is a part pipeline, built once per table part (see
    [Execution](#execution)).
 7. Drain (`exec::Drain`): `Open`, pull batches with `Next` until the end of the stream, `Close` (also after an

@@ -66,6 +66,36 @@ OperatorResult BuildPartUnion(const plan::LogicalNodePtr& node, const plan::Scan
                                              sample->output_schema(), row_cap);
 }
 
+// The column every call counts distinctly, when every call is COUNT(DISTINCT) of the same column.
+// A global aggregation of only such calls is planned as a GROUP BY of that column, which merges in
+// parallel (partitioned); a grouped one keeps its COUNT(DISTINCT) states: grouping by the keys and
+// the column would leave the outer grouping serial over up to every row.
+std::optional<plan::BoundColumn> OnlyDistinctColumn(const std::vector<plan::AggregateCall>& calls) {
+  if (calls.empty() || !calls.front().arg.has_value()) {
+    return std::nullopt;
+  }
+  const plan::BoundColumn& first = *calls.front().arg;
+  for (const plan::AggregateCall& call : calls) {
+    if (call.kind != plan::AggKind::kCountDistinct || !call.arg.has_value() ||
+        call.arg->index != first.index) {
+      return std::nullopt;
+    }
+  }
+  return first;
+}
+
+// The calls counting the distinct column `x`, over a GROUP BY by x: COUNT(key0), which skips the
+// NULL group as COUNT(DISTINCT) skips NULL.
+std::vector<plan::AggregateCall> CountsOfKey(const std::vector<plan::AggregateCall>& calls,
+                                             const plan::BoundColumn& x) {
+  std::vector<plan::AggregateCall> counts = calls;
+  for (plan::AggregateCall& call : counts) {
+    call.kind = plan::AggKind::kCount;
+    call.arg = plan::BoundColumn{.index = 0, .name = x.name, .type = x.type};
+  }
+  return counts;
+}
+
 // One overload per logical node type: a node type without one fails to compile.
 struct Builder {
   std::optional<int64_t> part;  // inside the pipeline of this part
@@ -103,6 +133,15 @@ struct Builder {
                                              std::move(constants));
   }
   OperatorResult operator()(const plan::AggregateNode& node) const {
+    if (const auto x = OnlyDistinctColumn(node.aggregates);
+        x.has_value() && PipelineScan(node.input) != nullptr) {
+      // COUNT(DISTINCT x) only: the rows grouped by x in parallel (partitioned GROUP BY), then
+      // COUNT(x) over the groups. The same DOUBLE normalization groups x as COUNT(DISTINCT) does.
+      const auto groups = std::make_shared<const plan::LogicalNode>(
+          plan::GroupAggregateNode{.input = node.input, .keys = {*x}, .aggregates = {}});
+      return (*this)(plan::AggregateNode{
+          .input = groups, .aggregates = CountsOfKey(node.aggregates, *x), .span = node.span});
+    }
     if (const plan::ScanNode* scan = PipelineScan(node.input)) {
       // Aggregated per part, the parts' states merged in part order.
       PartPipeline pipeline = PipelineOf(node.input);
