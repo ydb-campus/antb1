@@ -65,6 +65,37 @@ foreach(area_dir IN LISTS _areas)
   endif()
 endforeach()
 
+# Parallel execution (label parallel, docs/adr/0013-parallel-execution.md): every case file on 4 engine threads,
+# with batches of 1000 rows so that parts span several batches. Every result must equal the 1-thread result
+# byte for byte, before any sorting (antb1-slt --same-as-threads), and the expectations as usual.
+foreach(area_dir IN LISTS _areas)
+  if(IS_DIRECTORY "${area_dir}")
+    get_filename_component(_area "${area_dir}" NAME)
+    file(GLOB _files CONFIGURE_DEPENDS "${area_dir}/*.slt")
+    foreach(file IN LISTS _files)
+      get_filename_component(_stem "${file}" NAME_WE)
+      set(_name "parallel.${_area}.${_stem}")
+      antb1_slt_args(
+        _args
+        ${_name}
+        --engine
+        antb1
+        --threads
+        4
+        --same-as-threads
+        1
+        --batch-size
+        1000
+      )
+      add_test(NAME ${_name} COMMAND antb1-slt run ${_args} "${file}")
+      set_tests_properties(
+        ${_name}
+        PROPERTIES LABELS parallel FIXTURES_REQUIRED antb1_fixtures TIMEOUT 300
+      )
+    endforeach()
+  endif()
+endforeach()
+
 # Harness self-tests: selftest/mutate.slt passes as is (slt.selftest.mutate), and every corruption of the
 # antb1 results must make the runner fail with exit code 1 and a FAIL line.
 antb1_add_slt_suite(DIR selftest)
@@ -151,6 +182,26 @@ if(ANTB1_HAVE_DUCKDB)
   set_tests_properties(
     diff.random
     PROPERTIES LABELS diff FIXTURES_REQUIRED antb1_fixtures TIMEOUT 300
+  )
+  # The same queries (seed) on 4 threads with 700-row batches: DuckDB's answers, and the 1-thread results byte for
+  # byte. (Seed 20260929 makes DuckDB itself leak under ASan: MIN of VARCHAR with GROUP BY and LIMIT.)
+  antb1_slt_args(
+    _args
+    parallel.diff.random
+    --threads
+    4
+    --same-as-threads
+    1
+    --batch-size
+    700
+  )
+  add_test(
+    NAME parallel.diff.random
+    COMMAND antb1-slt diff ${_args} --seed 20260925 --count 300
+  )
+  set_tests_properties(
+    parallel.diff.random
+    PROPERTIES LABELS parallel FIXTURES_REQUIRED antb1_fixtures TIMEOUT 300
   )
 
   # Self-tests: the differential test must catch every corruption of antb1's results.

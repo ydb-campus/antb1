@@ -73,7 +73,7 @@ Every module except `common` may also depend on `common` directly; those edges a
 ## Query lifecycle
 
 A query such as `antb1 query -c "SELECT COUNT(*) FROM t" --table "t=/data/part_*.parquet"` runs through these
-steps (all single-threaded):
+steps (only step 7 uses more than one thread):
 
 1. `cli` parses the command line, reads the SQL (`-c`, `-c -` for stdin, or `-f`) and creates an `engine::Session`,
    which calls `arrow::compute::Initialize()`.
@@ -93,9 +93,12 @@ steps (all single-threaded):
 5. Optimize (`plan::Optimize`): `COUNT(*)` without `WHERE` to `RowCount`, `Limit` below `Project`, and projection
    pruning (a `Scan` reads only the fields used above it).
 6. Physical plan (`exec::BuildPhysicalPlan`): an exhaustive `std::visit` turns each logical node into an operator
-   over the operator of its input; a `Limit` over a `Sort` becomes one top-N `SortOperator`.
+   over the operator of its input; a `Limit` over a `Sort` becomes one top-N `SortOperator`. The chain of `Filter`,
+   `Compute` and `Project` nodes over a `Scan` is a part pipeline, built once per table part (see
+   [Execution](#execution)).
 7. Drain (`exec::Drain`): `Open`, pull batches with `Next` until the end of the stream, `Close` (also after an
-   error); the selected rows of the batches form an `arrow::Table`, and the engine names its columns.
+   error); the selected rows of the batches form an `arrow::Table`, and the engine names its columns. The part
+   pipelines run on the session's thread pool (`--threads`, `engine::SessionOptions::threads`).
 8. Format (`engine::FormatResult`): `table`, `csv` or `json` output on stdout, built from one canonical value
    formatter. With `--timing`, the elapsed seconds are the last line on stderr.
 
@@ -106,15 +109,27 @@ steps (all single-threaded):
 
 Operators pull `exec::Batch`es from their input: an Arrow record batch and an optional selection, a boolean array
 without NULLs that marks the rows taking part. A filter never copies data, and only a projection turns a selection
-into data. Everything runs on one thread, reading files and row groups in order.
+into data. Every operator instance is used by one thread.
+
+**Parts** ([ADR 0013](adr/0013-parallel-execution.md)). A table is split into parts (`plan::Table::num_parts`,
+`ScanPart`): the row groups of a Parquet table. The pipeline below the first blocking operator, a chain of `Filter`,
+`Compute` and `Project` over a `Scan`, is built once per part with a `TableScanOperator` of that part, so parts share
+no operator state. `exec::PartScheduler` runs the parts on `ExecContext::executor` (an Arrow `ThreadPool` the
+`Session` owns when it has more than one thread) and hands their results back strictly in part order. At most
+2 × threads parts are running or finished but not yet taken. With one thread, each part runs on the calling thread
+when it is reached: the same code, so a result does not depend on the thread count. The first failing part in part
+order decides the error. Parts after the point where the consumer stops (a met `LIMIT`) are never started or are
+stopped at their next batch, and their errors are dropped.
 
 | Operator | Logical node | Does |
 | --- | --- | --- |
-| `TableScanOperator` | `Scan` | `plan::Table::Scan` of the referenced fields only, in batches of `ExecContext::batch_size` rows (64Ki) |
+| `TableScanOperator` | `Scan` | `plan::Table::ScanPart` (in a part pipeline) or `Scan` of the referenced fields only, in batches of `ExecContext::batch_size` rows (64Ki) |
+| `PartUnionOperator` | the top of a part pipeline | the batches of every part in part order, parts computed ahead on the pool; under a `Limit`, each part stops after `limit + offset` selected rows |
+| `PartAggregateOperator` | `Aggregate` over a part pipeline | aggregates every part into its own `AggregateState`s on the pool, then merges them in part order and emits one row |
 | `FilterOperator` | `Filter` | evaluates every comparison with Arrow's comparison kernels (`equal`, `less`, ...) and `[NOT] LIKE` with `exec::LikePattern` (DuckDB's rules; patterns without `_` match by their literal segments), `[NOT] IN` as `equal` per value combined with `or_kleene` (and `invert` for NOT IN), compares two columns with the same kernels in their common type, combines them with `and_kleene`, keeps the rows of a computed BOOLEAN condition (`IS TRUE`, for `OR` and `NOT`), turns NULL into false and attaches the result as the selection (one `exec::PredicateEvaluator` per predicate, shared with `Compute`); skips batches without a selected row; a folded `FALSE` ends the stream without reading |
 | `ComputeOperator` | `Compute` | materializes the selected rows and appends one array per expression (`exec::EvaluateExpr`): Arrow's checked kernels for integer `+ - *` and negation in the result type (an overflow is an execution error), `divide` in DOUBLE, own loops for `//`, `%` and HUGEINT arithmetic, `binary_length` for `strlen`, `replace_substring_regex` (RE2) for `regexp_replace`, a checked loop for `epoch_ms` (`toDateTime`), own 64-bit civil-calendar loops for `EXTRACT` and `date_trunc` (DuckDB's whole TIMESTAMP range; infinities kept or NULL), the filter's predicate evaluation for comparisons inside conditions, `and_kleene`/`or_kleene`/`invert` for `AND`/`OR`/`NOT`, and `CASE` branch by branch, each condition and value computed only for its rows (`Filter`, then `replace_with_mask`) ([ADR 0012](adr/0012-scalar-expressions.md)) |
 | `ProjectOperator` | `Project` | selects columns and materializes the selected rows with Arrow's `Filter` kernel; a constant item becomes an array of its value per batch (`MakeArrayFromScalar`) |
-| `ScalarAggregateOperator` | `Aggregate` | feeds every batch and its selection to one `AggregateState` per call, then emits one row |
+| `ScalarAggregateOperator` | `Aggregate` over other input | feeds every batch and its selection to one `AggregateState` per call, then emits one row |
 | `GroupAggregateOperator` | `GroupAggregate` | materializes the selected rows, maps their keys to group ids with Arrow's `Grouper` (DOUBLE keys normalized first), feeds one `GroupedAggregateState` per call; after the input, emits one row per group: the keys as first seen, then the aggregates; without keys (`GROUP BY` of constants only) every row is in one group |
 | `SortOperator` | `Sort`, or `Limit` over `Sort` | reads its whole input into a `SortBuffer`, sorts row references stably with `RowComparator` (DuckDB's order: NULLs last by default, NaN above every number, VARCHAR by bytes; each row carries an order-preserving 64-bit prefix of its first key, so most comparisons are integer compares) and emits the rows in batches, gathered column by column with typed builders; with a limit it keeps only `limit + offset` rows while it reads (top-N) and emits the window ([ADR 0011](adr/0011-sorting-and-top-n.md)) |
 | `LimitOperator` | `Limit` | skips `offset` rows, passes on at most `limit` rows (narrowing selections, not copying) and then never pulls its input again |

@@ -1,5 +1,6 @@
 #include "antb1/cli/cli.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -16,6 +17,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -23,6 +25,7 @@
 #include <arrow/api.h>
 #include <arrow/util/config.h>
 
+#include "antb1/common/narrow.h"
 #include "antb1/common/source_span.h"
 #include "antb1/common/version.h"
 #include "antb1/engine/format.h"
@@ -69,8 +72,22 @@ struct Inputs {
   std::string file;     // -f
   std::string format = "table";
   bool timing = false;
+  int threads = 1;  // --threads (query and bench)
   BenchSettings bench;
 };
+
+// The default of --threads: the machine's hardware threads, as DuckDB's `threads` setting.
+int DefaultThreads() {
+  const auto hardware = static_cast<int64_t>(std::thread::hardware_concurrency());
+  return Narrow<int>(std::clamp<int64_t>(hardware, 1, engine::Session::kMaxThreads));
+}
+
+void AddThreadsOption(CLI::App* cmd, Inputs& in) {
+  cmd->add_option("--threads", in.threads,
+                  "Threads that run the row groups of a query (default: the hardware threads)")
+      ->default_val(DefaultThreads())
+      ->check(CLI::Range(1, engine::Session::kMaxThreads));
+}
 
 // The real implementations of the hooks that `hooks` leaves empty.
 CliHooks WithDefaults(CliHooks hooks) {
@@ -148,6 +165,7 @@ arrow::Result<std::string> ReadSql(const Inputs& in, std::istream& stdin_stream)
 
 arrow::Result<std::unique_ptr<engine::Session>> MakeSession(const Inputs& in) {
   engine::SessionOptions options;
+  options.threads = in.threads;
   if (in.clickbench) {
     options.default_overrides.emplace_back("EventDate", plan::LogicalType::kDate);
   }
@@ -207,6 +225,7 @@ int Bench(engine::Session& session, const Inputs& in, double load_time, const Cl
                      .machine = in.bench.machine.empty() ? DefaultMachine() : in.bench.machine,
                      .git_sha = in.bench.git_sha,
                      .batch_size = engine::SessionOptions{}.batch_size,
+                     .threads = in.threads,
                      .load_time = load_time};
   for (const auto& spec : in.tables) {
     const auto table = session.catalog().Find(spec.substr(0, spec.find('=')));
@@ -247,6 +266,7 @@ int RunCli(std::span<const std::string> args, std::istream& in_stream, std::ostr
   query->add_option("--format", in.format, "Output format")
       ->check(CLI::IsMember({"table", "csv", "json"}));
   query->add_flag("--timing", in.timing, "Print elapsed seconds as the last stderr line");
+  AddThreadsOption(query, in);
 
   auto* explain = app.add_subcommand("explain", "Print the logical plan of a query");
   AddSqlOptions(explain, in);
@@ -271,6 +291,7 @@ int RunCli(std::span<const std::string> args, std::istream& in_stream, std::ostr
   bench->add_option("--git-sha", in.bench.git_sha, "Commit of the build, recorded in the JSON");
   bench->add_flag("--drop-caches", in.bench.drop_caches,
                   "Drop the page cache (sudo -n) before the first try of every query (Linux)");
+  AddThreadsOption(bench, in);
 
   const auto* version = app.add_subcommand("version", "Print version information");
 

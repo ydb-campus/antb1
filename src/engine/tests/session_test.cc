@@ -326,5 +326,40 @@ TEST_F(SessionTest, UnsupportedAndBindErrorsKeepTheirKinds) {
   EXPECT_EQ(Rows(*count), (std::vector<std::vector<std::string>>{{"10"}}));
 }
 
+// The thread count is checked; the row groups of a query run on the session's threads, and the
+// result is the same for any number of them.
+TEST_F(SessionTest, ThreadsDoNotChangeResults) {
+  for (const int threads : {0, -1, Session::kMaxThreads + 1}) {
+    SessionOptions options;
+    options.threads = threads;
+    EXPECT_TRUE(Session::Make(options).status().IsInvalid()) << threads;
+  }
+  const std::vector<std::string> queries = {
+      "SELECT COUNT(*), SUM(AdvEngineID), AVG(AdvEngineID) FROM t WHERE AdvEngineID > 1",
+      "SELECT AdvEngineID, AdvEngineID * 2 FROM t WHERE AdvEngineID <> 5",
+      "SELECT AdvEngineID FROM t LIMIT 3 OFFSET 4",
+      "SELECT AdvEngineID % 3 AS k, COUNT(*) FROM t GROUP BY k",
+      "SELECT AdvEngineID FROM t ORDER BY AdvEngineID DESC LIMIT 4",
+  };
+  std::vector<std::vector<std::vector<std::string>>> expected;
+  for (const int threads : {1, 4}) {
+    SessionOptions options;
+    options.threads = threads;
+    options.batch_size = 3;
+    auto session = Session::Make(options).ValueOrDie();
+    ASSERT_TRUE(session->RegisterParquet("t", {path_}).ok());
+    for (std::size_t i = 0; i < queries.size(); ++i) {
+      auto result = session->Execute(queries[i]);
+      ASSERT_TRUE(result.ok()) << queries[i] << ": " << result.status().ToString();
+      if (threads == 1) {
+        expected.push_back(Rows(*result));
+      } else {
+        EXPECT_EQ(Rows(*result), expected[i]) << queries[i];
+      }
+    }
+  }
+  EXPECT_EQ(expected[2], (std::vector<std::vector<std::string>>{{"4"}, {"5"}, {"6"}}));
+}
+
 }  // namespace
 }  // namespace antb1::engine

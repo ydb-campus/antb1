@@ -37,12 +37,11 @@ Proposed
 
 - **The unit of work is a part, one row group of one file.**
   - `plan::Table` gains:
-    - `Parts()`: the parts in file and row-group order, with row counts;
+    - `num_parts()` and `part_rows(part)`: the parts in file and row-group order, with row counts;
     - `ScanPart(part, fields, batch_size)`: a reader of that row group's fields.
   - `ParquetTable` keeps each file's `FileMetaData` from `Open`, so opening a part does not re-read the footer. It opens
     a `FileReader` per part, which outlives its reader as today.
   - `MemoryTable` and the test tables are one part.
-  - `Scan` stays the serial path.
 - **The plan splits at its first blocking operator.**
   - The pipeline below it is `Scan <- [Filter] <- [Compute] <- [Project]`. It is built once per part by the physical
     planner over `ScanPart`, and runs on the pool.
@@ -52,6 +51,12 @@ Proposed
     - `Sort`: a `SortBuffer`, with top-N `keep`;
     - for a plan without one, an ordered collector with the `Limit`.
   - The sink takes a partial result per part. Everything above the sink stays serial, over its small input.
+  - **Every scan runs through parts, also on one thread:** with one thread, each part runs on the calling thread when
+    the merge reaches it. That is the same code and the same partial results, so answers are byte-identical for any
+    thread count, DOUBLE sums included.
+  - Until a blocking operator has its own sink, it reads the pipeline's batches in part order from a part union: the
+    pipeline below it already runs in parallel (for example the expressions below a GROUP BY), and its own work stays
+    serial.
 - **Partial results are merged in part order, whatever the thread count and schedule.**
   - A part's partial result is merged into the global one once every earlier part's result is merged.
   - Results that finish early wait in a window, bounded at twice the thread count. The scheduler does not start a part
@@ -63,11 +68,13 @@ Proposed
   - `Limit` above a projection, or top-N `keep`, stops scheduling new parts once the window is decided, as the serial
     scan stops today.
 - **Threads:**
-  - `SessionOptions::threads` sets the size of a `ThreadPool` the `Session` owns; 1 means the serial path.
-  - The default is the machine's hardware threads (`std::thread::hardware_concurrency()`), as in DuckDB, whose
-    `threads` setting defaults to all hardware threads. The maintainer chose this on 2026-09-29. The hermetic test
-    presets pin 1, except the `parallel` label, which pins 4.
-  - The CLI gets `--threads` for `query`, `explain` and `bench`, and `antb1 bench` records the count in its JSON.
+  - `SessionOptions::threads` sets the size of a `ThreadPool` the `Session` owns (none for 1 thread).
+  - The CLI's `--threads` defaults to the machine's hardware threads (`std::thread::hardware_concurrency()`), as in
+    DuckDB, whose `threads` setting defaults to all hardware threads. The maintainer chose this on 2026-09-29. The
+    library default stays 1, so embedders and the test harnesses are single-threaded unless they ask; the `parallel`
+    label uses 4.
+  - The CLI gets `--threads` for `query` and `bench`, and `antb1 bench` records the count in its JSON. `explain`
+    prints the logical plan and executes nothing, so it has no `--threads`.
   - Arrow compute kernels keep running inline (no nested parallelism), each worker with its own `compute::ExecContext`.
   - I/O stays synchronous inside a part (no pre-buffering), so memory is about one row group per busy thread plus the
     window.
@@ -81,6 +88,28 @@ Proposed
     running sum by rounding, still deterministically. The oracle tests compare DOUBLE with a tolerance. The
     maintainer accepted this on 2026-09-29.
   - Group order and tie order stay unspecified. They are deterministic for a given input, now also across thread counts.
+
+## Towards joins (amendment, 2026-09-29)
+
+The maintainer asked for this design to be ready for TPC-H: hash joins, and correlated subqueries.
+
+- **A physical plan becomes a DAG of pipelines.** A pipeline has a source (a table's parts, or a finished sink's
+  output), streaming operators (`Filter`, `Compute`, `Project`, later a hash-join probe) and a sink (aggregate,
+  grouped aggregate, sort/top-N, the ordered collector, later a hash-join build). A pipeline runs once the sinks it
+  reads are finished: a probe pipeline after its builds.
+- **A table read by two pipelines is scanned twice, never buffered** (a self-join, a CTE used twice, a decorrelated
+  subquery over the outer table). Only the sinks hold data.
+- **Order stays deterministic:** a build holds its rows in part order and a probe keeps the probe side's part order,
+  so a join's output does not depend on the thread count either.
+- **Correlated subqueries** are decorrelated by the binder into semi, anti and aggregate joins; the executor never
+  runs a subquery per row.
+- **Memory:** the window bounds what is in flight: up to 2 × threads parts' partial states or, under a part union
+  (a projection, or a blocking operator without its own sink yet), their whole output, because a part hands on its
+  batches only when it is finished. A hash-join build is one table shared read-only by the probe threads, built on
+  the smaller side. A session memory
+  limit (a tracking memory pool; the window shrinks under pressure; a clear out-of-memory error) comes right after the
+  first parallel PR. Spilling (grace hash join, partitioned GROUP BY, external sort) comes after joins, in its own ADR;
+  it never changes a value, only the row order where SQL leaves it open.
 
 ## Consequences
 
@@ -119,12 +148,15 @@ Proposed
 
 ## Plan (one PR each, measured with `antb1 bench` on the full data)
 
-1. **io:** `Table::Parts`/`ScanPart`, `FileMetaData` reuse, multi-row-group fixtures. No behavior change.
-2. **engine and exec:** the pool, `--threads`, the part pipeline with the global-aggregate sink and the ordered merge
-   window, and error order. Tests with the `parallel` label (after approval).
-3. **exec:** the GROUP BY sink (grouper merge through group maps, first-seen keys by part).
-4. **exec:** the sort/top-N sink and the ordered projection with LIMIT early stop.
-5. **Docs:** semantics (DOUBLE sums per row group), architecture.md, ADRs 0003, 0006 and 0010, and benchmarks.
+1. **io** (#42): `Table::num_parts`/`part_rows`/`ScanPart`, `FileMetaData` reuse. No behavior change. (The fixtures
+   already had multi-row-group files.)
+2. **engine and exec:** the pool, `--threads`, the part pipelines with the global-aggregate sink, the ordered part
+   union with LIMIT early stop, the ordered merge window and error order. Tests with the `parallel` label.
+3. **engine and exec:** the session memory limit.
+4. **exec:** the GROUP BY sink (grouper merge through group maps, first-seen keys by part).
+5. **exec:** the sort/top-N sink.
+6. **Docs:** ADRs 0003, 0006 and 0010 and the status of this ADR (semantics, architecture.md and benchmarks change
+   with the PRs above).
 
 ## Alternatives considered
 

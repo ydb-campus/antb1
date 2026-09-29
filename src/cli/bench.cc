@@ -127,6 +127,7 @@ std::string ClickBenchJson(const BenchReport& report) {
   out += std::format("    \"cache\": \"{}\",\n", report.cold ? "cold" : "lukewarm");
   out += std::format("    \"tries\": {},\n", report.tries);
   out += std::format("    \"batch_size\": {},\n", report.batch_size);
+  out += std::format("    \"threads\": {},\n", report.threads);
   out += std::format("    \"failed\": [{}]\n", failures);
   out += "  }\n}\n";
   return out;

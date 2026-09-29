@@ -1,8 +1,11 @@
 #pragma once
 
+#include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <utility>
@@ -96,11 +99,14 @@ class VectorReader final : public arrow::RecordBatchReader {
   std::size_t next_ = 0;
 };
 
-// An in-memory table: fixed batches, re-sliced to the scan's batch size; counts its scans.
+// An in-memory table: fixed batches, re-sliced to the scan's batch size; counts its scans. With
+// `split`, every batch is a part (plan::Table::ScanPart); the table records which parts were
+// scanned and can make one part fail. Safe to scan from several threads.
 class MemoryTable final : public plan::Table {
  public:
-  MemoryTable(std::shared_ptr<arrow::Schema> schema, arrow::RecordBatchVector batches)
-      : schema_(std::move(schema)), batches_(std::move(batches)) {}
+  MemoryTable(std::shared_ptr<arrow::Schema> schema, arrow::RecordBatchVector batches,
+              bool split = false)
+      : schema_(std::move(schema)), batches_(std::move(batches)), split_(split) {}
 
   const std::shared_ptr<arrow::Schema>& schema() const override { return schema_; }
   std::optional<int64_t> exact_row_count() const override {
@@ -113,6 +119,53 @@ class MemoryTable final : public plan::Table {
   arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> Scan(const std::vector<int>& fields,
                                                                 int64_t batch_size) const override {
     ++scans_;
+    return Read(batches_, fields, batch_size);
+  }
+  int64_t num_parts() const override { return split_ ? static_cast<int64_t>(batches_.size()) : 1; }
+  std::optional<int64_t> part_rows(int64_t part) const override {
+    if (!split_) {
+      return plan::Table::part_rows(part);
+    }
+    return part >= 0 && part < num_parts() ? std::optional(Batch(part)->num_rows()) : std::nullopt;
+  }
+  arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> ScanPart(
+      int64_t part, const std::vector<int>& fields, int64_t batch_size) const override {
+    if (!split_) {
+      return plan::Table::ScanPart(part, fields, batch_size);
+    }
+    if (part < 0 || part >= num_parts()) {
+      return arrow::Status::Invalid("no part ", part);
+    }
+    {
+      const std::scoped_lock lock(mutex_);
+      scanned_parts_.push_back(part);
+    }
+    if (failing_part_ == part) {
+      return arrow::Status::IOError("part ", part, " is broken");
+    }
+    return Read({Batch(part)}, fields, batch_size);
+  }
+  std::string Describe() const override { return "memory"; }
+
+  [[nodiscard]] int scans() const { return scans_; }
+  // The parts ScanPart was called for, sorted.
+  [[nodiscard]] std::vector<int64_t> scanned_parts() const {
+    const std::scoped_lock lock(mutex_);
+    std::vector<int64_t> out = scanned_parts_;
+    std::ranges::sort(out);
+    return out;
+  }
+  // ScanPart(part) fails with an IOError naming the part.
+  void FailPart(int64_t part) { failing_part_ = part; }
+
+ private:
+  [[nodiscard]] const std::shared_ptr<arrow::RecordBatch>& Batch(int64_t part) const {
+    return batches_[static_cast<std::size_t>(part)];
+  }
+
+  arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> Read(
+      const arrow::RecordBatchVector& batches, const std::vector<int>& fields,
+      int64_t batch_size) const {
     arrow::FieldVector out_fields;
     for (const int f : fields) {
       if (f < 0 || f >= schema_->num_fields()) {
@@ -123,7 +176,7 @@ class MemoryTable final : public plan::Table {
     }
     auto out_schema = arrow::schema(out_fields);
     arrow::RecordBatchVector out;
-    for (const auto& b : batches_) {
+    for (const auto& b : batches) {
       for (int64_t start = 0; start < b->num_rows(); start += batch_size) {
         const auto slice = b->Slice(start, batch_size);
         arrow::ArrayVector columns;
@@ -135,14 +188,14 @@ class MemoryTable final : public plan::Table {
     }
     return std::make_unique<VectorReader>(std::move(out_schema), std::move(out));
   }
-  std::string Describe() const override { return "memory"; }
 
-  [[nodiscard]] int scans() const { return scans_; }
-
- private:
   std::shared_ptr<arrow::Schema> schema_;
   arrow::RecordBatchVector batches_;
-  mutable int scans_ = 0;
+  bool split_ = false;
+  std::optional<int64_t> failing_part_;
+  mutable std::atomic<int> scans_ = 0;
+  mutable std::mutex mutex_;
+  mutable std::vector<int64_t> scanned_parts_;
 };
 
 // A source operator that emits prepared batches (with optional selections) and counts the calls.

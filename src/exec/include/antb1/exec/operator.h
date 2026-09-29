@@ -10,15 +10,26 @@
 #include <arrow/status.h>
 #include <arrow/table.h>
 
-// Pull-based, batch-at-a-time physical operators (docs/adr/0003-engine-architecture.md). Execution
-// is single-threaded and deterministic: every operator pulls its input in order. Operators that
-// call Arrow compute kernels need arrow::compute::Initialize() (engine::Session::Make calls it).
+// Pull-based, batch-at-a-time physical operators (docs/adr/0003-engine-architecture.md). Every
+// operator instance is used by one thread and pulls its input in order. The pipelines below the
+// first blocking operator run once per table part, on ExecContext::executor when there is one, and
+// their results are combined in part order (docs/adr/0013-parallel-execution.md): the result does
+// not depend on the number of threads. Operators that call Arrow compute kernels need
+// arrow::compute::Initialize() (engine::Session::Make calls it).
+
+namespace arrow::internal {
+class Executor;
+}  // namespace arrow::internal
 
 namespace antb1::exec {
 
 struct ExecContext {
   arrow::MemoryPool* pool = arrow::default_memory_pool();
   int64_t batch_size = int64_t{64} * 1024;
+  // Runs the parts of a pipeline; nullptr runs them one after another on the calling thread.
+  arrow::internal::Executor* executor = nullptr;
+  // The executor's threads (1 without one): parts in flight are bounded by twice this.
+  int threads = 1;
 };
 
 // Rows flowing from one operator to the next: the columns and, optionally, a selection. A selection

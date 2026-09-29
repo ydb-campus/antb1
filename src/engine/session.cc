@@ -9,6 +9,7 @@
 
 #include <arrow/api.h>
 #include <arrow/compute/api.h>
+#include <arrow/util/thread_pool.h>
 
 #include "antb1/exec/operator.h"
 #include "antb1/exec/physical_planner.h"
@@ -78,9 +79,20 @@ Session::Session(SessionOptions options)
     : options_(std::move(options)),
       catalog_([opts = options_](const std::string& path) { return OpenParquet(opts, {path}); }) {}
 
+Session::~Session() = default;  // the pool's destructor waits for its threads
+
 arrow::Result<std::unique_ptr<Session>> Session::Make(SessionOptions options) {
+  if (options.threads < 1 || options.threads > kMaxThreads) {
+    return arrow::Status::Invalid("the number of threads must be between 1 and ", kMaxThreads,
+                                  ", not ", options.threads);
+  }
   ARROW_RETURN_NOT_OK(arrow::compute::Initialize());
-  return std::unique_ptr<Session>(new Session(std::move(options)));
+  std::unique_ptr<Session> session(new Session(std::move(options)));
+  if (session->options_.threads > 1) {
+    ARROW_ASSIGN_OR_RAISE(session->pool_,
+                          arrow::internal::ThreadPool::Make(session->options_.threads));
+  }
+  return session;
 }
 
 arrow::Status Session::RegisterParquet(const std::string& name,
@@ -94,7 +106,10 @@ arrow::Result<QueryResult> Session::Execute(std::string_view sql) {
   ARROW_ASSIGN_OR_RAISE(auto logical, ParseAndBind(sql, catalog_, &result.timings));
   const auto t0 = Clock::now();
   ARROW_ASSIGN_OR_RAISE(auto op, exec::BuildPhysicalPlan(logical));
-  exec::ExecContext ctx{.pool = arrow::default_memory_pool(), .batch_size = options_.batch_size};
+  exec::ExecContext ctx{.pool = arrow::default_memory_pool(),
+                        .batch_size = options_.batch_size,
+                        .executor = pool_.get(),
+                        .threads = options_.threads};
   ARROW_ASSIGN_OR_RAISE(auto table, exec::Drain(*op, ctx));
   for (const auto& col : logical.output) {
     result.names.push_back(col.name);

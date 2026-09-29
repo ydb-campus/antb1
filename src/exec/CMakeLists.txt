@@ -11,6 +11,8 @@ antb1_add_module(
     like.cc
     project.cc
     scalar_aggregate.cc
+    aggregate_set.cc
+    part_operators.cc
     grouped_aggregate_state.cc
     group_aggregate.cc
     limit.cc
@@ -34,6 +36,7 @@ if(ANTB1_BUILD_TESTS)
       tests/grouped_aggregate_test.cc
       tests/sort_test.cc
       tests/like_test.cc
+      tests/parallel_test.cc
     LIBS ArrowCompute::arrow_compute_shared
   )
 endif()
