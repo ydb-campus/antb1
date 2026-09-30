@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790758808864,
+  "lastUpdate": 1790767641771,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -2556,6 +2556,78 @@ window.BENCHMARK_DATA = {
             "value": 11.777687233332776,
             "unit": "ms/iter",
             "extra": "iterations: 60\ncpu: 11.77542645000001 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "3469588119b292a8a0b638cc8e83db5a4f5c33d5",
+          "message": "perf(exec): route rows of non-reducing parts straight to the partitions (#55)\n\n## Summary\n\nThis is fix 4 of the antb1 vs DuckDB comparison: **skip per-part\npre-aggregation when it does not reduce**.\n\n**The problem:** in a GROUP BY with about one group per row (Q32: 100 M\ngroups from 100 M rows), each part inserts every row into its own table,\nsplits that table by key hash, and then every group is inserted again\ninto its partition's table (keys copied, states merged). The per-part\nwork is almost pure overhead.\n\n**The change** (exec only; results unchanged):\n- **Routing:** a part aggregates its first **4096 rows** (or its first\nbatch, if smaller) in its own table. If they make more groups than\n**3/4** of those rows, the part routes its other rows straight to the\npartitions.\n- `GroupTable::RouteRows` splits them by the **same key hash** as\n`Partition()`, with DOUBLE keys normalized, using one stable Take and\none slice per partition.\n- Each lane merges the part's own groups first, then consumes its routed\nrows in input order. So first-seen keys, tie rules and COUNT(DISTINCT)\nare exactly as before.\n- The decision depends only on the data and the batch size, never on\nthreads. Waiting for 4096 rows keeps a selective WHERE (a few rows per\nbatch) from triggering it (reviewer finding).\n- Plans with a DOUBLE SUM/AVG (rounding follows the parts) or a HUGEINT\nSUM/AVG (the overflow check follows the order of additions) keep the\nparts' own tables.\n- **Joined output chunks:** `GroupTable::NextChunk` now joins\nconsecutive small chunks of new groups, up to 64Ki groups and 16 MiB of\nkeys, and finalizes each state once per range.\n- Rows merged a few at a time otherwise made about 100,000 tiny output\nbatches (Q30: 20,627 before routing, 100,320 with it), and the top-N\nabove them paid per batch.\n- The byte bound keeps VARCHAR keys far from Arrow's 2 GiB binary limit,\nwith a test.\n- This also speeds up plain GROUP BYs (Q30, Q31) by giving the top-N\nfewer batches.\n- **Profile:** `raw_parts` and `raw_rows` in `explain --analyze`.\n- **Docs:** architecture.md (the PartGroupAggregate row), an ADR 0013\namendment (plan item 4), and the sql-subset.md metric list.\n\n## Performance\n\nThese are paired runs against main (#54), full data, 128 threads, using\nthe layout-robust method (each binary from 3 path lengths, best of 3,\nmedian), during the threshold sweep. The host load rose from 10 to 60\nduring these runs; the pairs alternate, but small differences are noise.\n\n| Query | main | ¾ threshold (this PR) | never route (joined chunks\nonly) |\n| --- | ---: | ---: | ---: |\n| Q32 | 3.54 | **2.54 (1.39×)** | 3.51 |\n| Q18 | 2.06 | 1.93 (1.07×) | 2.09 |\n| Q16 | 1.09 | 1.03 (1.06×) | 1.03 |\n| Q30 | 0.63 | 0.57 (1.10×) | 0.54 |\n| Q31 | 0.84 | 0.80 (1.05×) | 0.75 |\n| Q33 | 2.11 | 2.12 | 2.12 |\n| Q34 | 2.10 | 2.13 | 2.10 |\n\n**Q33 and Q34 (GROUP BY a long string) don't change.**\n- Their parts do reduce within the first 4096 rows: Q34 routes only 2 of\n325 parts.\n- Their time is the largest row groups, each aggregated on one thread.\nThat's a separate fix: splitting large row groups (ADR 0013's\nload-balance list).\n\n**Still to do:** a final all-query A/B on a quiet host. The host has\nbeen saturated by another workload (load 150-190) since this build. I'll\nadd the table here before merge.\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [x] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full          # lint, ci, asan, tidy, coverage, fuzz-smoke, ci-gcc\ncheck-full exit 0; 100% tests passed out of 1377; Coverage gate: PASS\n$ pixi run tsan\n100% tests passed out of 1377\n$ ANTB1_DIFF_COUNT=20000 pixi run diff-random\nDIFF: PASS seed=2399248164 queries=20000 failed=0 unsupported=0\nDIFF: PASS seed=2355773739 queries=20000 failed=0 unsupported=0\n$ pixi run test-data\n100% tests passed out of 6\n```\n\nAbout the diff runs: two earlier diff runs reported 13 and 16 failures.\nEvery one was DuckDB's \"No files found\" for the fixtures: another test\nrun was regenerating `build/dev/fixtures` at the same time. Rerun alone,\nboth seeds pass with 0 failures.\n\n**New tests:**\n- **`PartOperatorsTest.RoutedRowsGiveTheSameGroups`:** the result equals\nthe serial GROUP BY (as a set) and is byte-identical on 1 and 4 threads,\nwith exact `raw_parts` counts.\n- Keys: unique keys, two keys, few keys, a DOUBLE key with\n-0.0/0.0/NaN/NULL, DOUBLE with unique, VARCHAR with unique.\n- Calls: COUNT(*), COUNT, integer SUM, VARCHAR MIN, DOUBLE MAX,\nCOUNT(DISTINCT).\n  - A DOUBLE SUM keeps the parts' own tables.\n  - A selective filter never routes.\n- **`PartOperatorsTest.RoutedRowsFollowTheirGroupsPartition`:** routed\nrows land in the partition of their group, DOUBLE keys included.\n- **`GroupedAggregateTest.LargeKeyChunksStaySeparate`:** the byte bound\non joined keys. `EmitsOneBatchPerChunkOfNewGroups` is updated: small\nchunks are now joined.\n- **slt `groupby/routed.slt`:** 3 queries with expectations from `pixi\nrun slt-complete`. The `parallel.*` run reads batches of 1000 rows, so\nthe fixture's 1024-row parts route rows.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer (none changed)\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code profiled with\n`explain --analyze`, swept the threshold, and wrote the code, tests and\ndocs. It ran the gates and a read-only reviewer agent on the diff. The\nreviewer found no P0 or P1 issues; its P2 and notes are addressed:\n  - the decision waits for 4096 rows;\n  - HUGEINT sums are excluded;\n  - a stale comment is fixed.\n\nOne suggestion was not taken: charging routed rows to a reservation.\nThey are already Arrow buffers of the budgeted pool, so a reservation\nwould count them twice.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-09-30T14:24:55+03:00",
+          "tree_id": "61ffd46fdfc3d339609d5d46a7f4a10dd353823a",
+          "url": "https://github.com/ydb-campus/antb1/commit/3469588119b292a8a0b638cc8e83db5a4f5c33d5"
+        },
+        "date": 1790767641165,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 3992.347782674532,
+            "unit": "ns/iter",
+            "extra": "iterations: 174264\ncpu: 3991.4217049993113 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 94339.91687657441,
+            "unit": "ns/iter",
+            "extra": "iterations: 7146\ncpu: 94302.02071088721 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 124723.27923118151,
+            "unit": "ns/iter",
+            "extra": "iterations: 5619\ncpu: 124654.34347748711 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 486209.1444444457,
+            "unit": "ns/iter",
+            "extra": "iterations: 1440\ncpu: 485914.19999999984 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 455043.9109811556,
+            "unit": "ns/iter",
+            "extra": "iterations: 1539\ncpu: 455005.8167641324 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2227226.4126984156,
+            "unit": "ns/iter",
+            "extra": "iterations: 315\ncpu: 2226938.8158730175 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 201.8456493333313,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 201.81764833333352 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 15.105987652173988,
+            "unit": "ms/iter",
+            "extra": "iterations: 46\ncpu: 15.105285847826098 ms\nthreads: 1"
           }
         ]
       }
