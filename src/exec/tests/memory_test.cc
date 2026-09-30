@@ -280,6 +280,15 @@ class MemoryLimitTest : public testing::ExecTest {
                                                         .arg = s,
                                                         .type = LogicalType::kBigInt}}}),
                1));
+    // Two levels (ADR 0014): inner tables by x and s, outer groups by x.
+    plans.push_back(PlanOf(
+        Node(plan::GroupAggregateNode{
+            .input = scan,
+            .keys = {x},
+            .aggregates =
+                {{.kind = plan::AggKind::kCountDistinct, .arg = s, .type = LogicalType::kBigInt},
+                 {.kind = plan::AggKind::kMax, .arg = s, .type = LogicalType::kVarchar}}}),
+        3));
     return plans;
   }
 };

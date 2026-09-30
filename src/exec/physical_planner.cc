@@ -85,12 +85,21 @@ std::vector<plan::Predicate> FiltersOnScan(const plan::LogicalNodePtr& node) {
 struct Parts {
   PartPipeline pipeline;
   int64_t count = 0;
+  // The first parts that hold kTwoLevelSampleRows rows by the table's part_rows (all of them if
+  // they hold fewer): chosen from metadata, so never by the number of threads.
+  int64_t sample = 0;
 };
 
 Parts PartsOf(const plan::LogicalNodePtr& node, const plan::ScanNode& scan) {
   auto kept = std::make_shared<const std::vector<int64_t>>(
       KeptParts(*scan.table, scan.fields, FiltersOnScan(node)));
   const auto count = static_cast<int64_t>(kept->size());
+  int64_t sample = 0;
+  int64_t rows = 0;
+  while (sample < count && rows < kTwoLevelSampleRows) {
+    rows += scan.table->part_rows((*kept)[static_cast<std::size_t>(sample)]).value_or(0);
+    ++sample;
+  }
   return Parts{.pipeline =
                    [node, kept](int64_t i) {
                      // Past the kept parts only for the schema sample, which is never opened.
@@ -98,7 +107,8 @@ Parts PartsOf(const plan::LogicalNodePtr& node, const plan::ScanNode& scan) {
                          std::cmp_less(i, kept->size()) ? (*kept)[static_cast<std::size_t>(i)] : i;
                      return Build(node, part);
                    },
-               .count = count};
+               .count = count,
+               .sample = sample};
 }
 
 // A part pipeline's batches in part order, at most row_cap selected rows per part.
@@ -112,8 +122,8 @@ OperatorResult BuildPartUnion(const plan::LogicalNodePtr& node, const plan::Scan
 
 // The column every call counts distinctly, when every call is COUNT(DISTINCT) of the same column.
 // A global aggregation of only such calls is planned as a GROUP BY of that column, which merges in
-// parallel (partitioned); a grouped one keeps its COUNT(DISTINCT) states: grouping by the keys and
-// the column would leave the outer grouping serial over up to every row.
+// parallel (partitioned); other aggregations with COUNT(DISTINCT) run in two levels
+// (TwoLevelAggregation) when they can.
 std::optional<plan::BoundColumn> OnlyDistinctColumn(const std::vector<plan::AggregateCall>& calls) {
   if (calls.empty() || !calls.front().arg.has_value()) {
     return std::nullopt;
@@ -187,11 +197,20 @@ struct Builder {
           .input = groups, .aggregates = CountsOfKey(node.aggregates, *x), .span = node.span});
     }
     if (const plan::ScanNode* scan = PipelineScan(node.input)) {
-      // Aggregated per part, the parts' states merged in part order.
       Parts parts = PartsOf(node.input, *scan);
       ARROW_ASSIGN_OR_RAISE(auto sample, parts.pipeline(0));
-      return std::make_unique<PartAggregateOperator>(std::move(parts.pipeline), parts.count,
-                                                     sample->output_schema()->num_fields(),
+      const int width = sample->output_schema()->num_fields();
+      if (TwoLevelAggregation({}, node.aggregates)) {
+        // COUNT(DISTINCT) of several columns, or with other calls: grouped by each column in
+        // parallel, then counted.
+        const ScalarAggregateOperator serial(std::move(sample), node.aggregates);
+        return std::make_unique<PartTwoLevelAggregateOperator>(
+            std::move(parts.pipeline), parts.count, parts.sample, width,
+            std::vector<plan::BoundColumn>{}, node.aggregates, serial.output_schema(),
+            /*global=*/true);
+      }
+      // Aggregated per part, the parts' states merged in part order.
+      return std::make_unique<PartAggregateOperator>(std::move(parts.pipeline), parts.count, width,
                                                      node.aggregates);
     }
     ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input));
@@ -205,6 +224,13 @@ struct Builder {
       const int width = sample->output_schema()->num_fields();
       // The output schema, as the serial operator names it.
       const GroupAggregateOperator serial(std::move(sample), node.keys, node.aggregates);
+      if (TwoLevelAggregation(node.keys, node.aggregates)) {
+        // COUNT(DISTINCT): an inner GROUP BY of the keys and each distinct column, an outer one
+        // of the keys, both partitioned with the heavy keys spread (ADR 0014).
+        return std::make_unique<PartTwoLevelAggregateOperator>(
+            std::move(parts.pipeline), parts.count, parts.sample, width, node.keys, node.aggregates,
+            serial.output_schema(), /*global=*/false);
+      }
       return std::make_unique<PartGroupAggregateOperator>(std::move(parts.pipeline), parts.count,
                                                           width, node.keys, node.aggregates,
                                                           serial.output_schema());

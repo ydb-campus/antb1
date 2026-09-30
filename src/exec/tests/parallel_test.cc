@@ -9,6 +9,9 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <ranges>
+#include <set>
+#include <span>
 #include <string>
 #include <thread>
 #include <utility>
@@ -19,6 +22,7 @@
 #include <arrow/util/thread_pool.h>
 #include <gtest/gtest.h>
 
+#include "antb1/exec/group_aggregate.h"
 #include "antb1/exec/memory_budget.h"
 #include "antb1/exec/physical_planner.h"
 #include "antb1/exec/scalar_aggregate.h"
@@ -27,6 +31,7 @@
 #include "antb1/plan/logical_plan.h"
 
 #include "../group_table.h"
+#include "../part_operators.h"
 #include "../part_scheduler.h"
 #include "exec_test_util.h"
 
@@ -903,6 +908,236 @@ TEST_F(PartOperatorsTest, CountDistinctAloneIsAParallelGroupBy) {
       }
     }
   }
+}
+
+// ---- two-level aggregation (docs/adr/0014-two-level-aggregation.md) ----
+
+// 16 parts of 40 rows (every fifth part empty): k (BIGINT, 1 in a third of the rows: a heavy key;
+// NULL every ninth), s (VARCHAR, 4 values), day (DATE), x (BIGINT, NULL every 13th), y (VARCHAR,
+// NULL every 17th), v (BIGINT, negative and positive).
+std::shared_ptr<MemoryTable> TwoLevelTable(bool split, bool empty = false) {
+  const auto schema =
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("s", arrow::binary()),
+                     arrow::field("day", arrow::date32()), arrow::field("x", arrow::int64()),
+                     arrow::field("y", arrow::binary()), arrow::field("v", arrow::int64())});
+  arrow::RecordBatchVector batches;
+  for (int64_t part = 0; part < (empty ? 0 : 16); ++part) {
+    std::vector<std::optional<int64_t>> k;
+    std::vector<std::optional<std::string>> str;
+    arrow::Date32Builder day;
+    std::vector<std::optional<int64_t>> x;
+    std::vector<std::optional<std::string>> y;
+    std::vector<std::optional<int64_t>> v;
+    const int64_t rows = part % 5 == 4 ? 0 : 40;
+    for (int64_t i = 0; i < rows; ++i) {
+      const int64_t r = (part * 40) + i;
+      std::optional<int64_t> key = r % 3 == 0 ? 1 : (r * 7) % 23;
+      if (r % 9 == 0) {
+        key.reset();
+      }
+      k.push_back(key);
+      str.emplace_back(std::string(1, static_cast<char>('a' + (r % 4))));
+      EXPECT_TRUE(day.Append(static_cast<int32_t>(r % 5)).ok());
+      x.push_back(r % 13 == 0 ? std::nullopt : std::optional<int64_t>((r * 31) % 97));
+      y.push_back(r % 17 == 0 ? std::nullopt : std::optional<std::string>(std::to_string(r % 29)));
+      v.emplace_back(r - 200);
+    }
+    batches.push_back(
+        arrow::RecordBatch::Make(schema, rows,
+                                 {Int64s(k), testing::Strings(str), day.Finish().ValueOrDie(),
+                                  Int64s(x), testing::Strings(y), Int64s(v)}));
+  }
+  if (!split) {
+    auto combined = arrow::Table::FromRecordBatches(schema, batches).ValueOrDie();
+    auto one = combined->CombineChunksToBatch().ValueOrDie();
+    return std::make_shared<MemoryTable>(schema, arrow::RecordBatchVector{one}, false);
+  }
+  return std::make_shared<MemoryTable>(schema, std::move(batches), true);
+}
+
+// The two-level operator over every part of `table`, sampling its first `sample_parts` parts.
+arrow::Result<std::shared_ptr<arrow::Table>> RunTwoLevel(
+    const std::shared_ptr<MemoryTable>& table, int64_t sample_parts,
+    const std::vector<plan::BoundColumn>& keys, const std::vector<plan::AggregateCall>& calls,
+    arrow::internal::Executor* executor) {
+  const std::vector<int> fields = {0, 1, 2, 3, 4, 5};
+  PartPipeline pipeline = [table,
+                           fields](int64_t part) -> arrow::Result<std::unique_ptr<Operator>> {
+    return std::make_unique<TableScanOperator>(table, fields, part);
+  };
+  std::shared_ptr<arrow::Schema> schema;
+  if (keys.empty()) {
+    schema = ScalarAggregateOperator(std::make_unique<TableScanOperator>(table, fields), calls)
+                 .output_schema();
+  } else {
+    schema = GroupAggregateOperator(std::make_unique<TableScanOperator>(table, fields), keys, calls)
+                 .output_schema();
+  }
+  PartTwoLevelAggregateOperator op(std::move(pipeline), table->num_parts(), sample_parts, 6, keys,
+                                   calls, schema, keys.empty());
+  ExecContext ctx{.pool = arrow::default_memory_pool(),
+                  .batch_size = 3,
+                  .executor = executor,
+                  .threads = executor == nullptr ? 1 : kThreads};
+  return Drain(op, ctx);
+}
+
+// The two levels give the rows of the serial GroupAggregateOperator (as a set) and, without keys,
+// of ScalarAggregateOperator: COUNT(DISTINCT) of two columns (one of them twice, NULLs skipped)
+// with COUNT(*), COUNT, integer SUM and AVG, VARCHAR MIN and BIGINT MAX, by a skewed BIGINT key
+// (heavy, with NULL), two keys, a VARCHAR key, a DATE key and none; for a sample of no part, some
+// parts and every part; with no rows. The same rows in the same order on any number of threads.
+TEST_F(PartOperatorsTest, TwoLevelAggregationIsTheSerialOne) {
+  const auto pool = Pool();
+  const auto k = Column(0, "k", LogicalType::kBigInt);
+  const auto str = Column(1, "s", LogicalType::kVarchar);
+  const auto day = Column(2, "day", LogicalType::kDate);
+  const auto x = Column(3, "x", LogicalType::kBigInt);
+  const auto y = Column(4, "y", LogicalType::kVarchar);
+  const auto v = Column(5, "v", LogicalType::kBigInt);
+  const std::vector<plan::AggregateCall> calls = {
+      {.kind = plan::AggKind::kCountDistinct, .arg = x, .type = LogicalType::kBigInt},
+      {.kind = plan::AggKind::kCountStar, .arg = {}, .type = LogicalType::kBigInt},
+      {.kind = plan::AggKind::kCountDistinct, .arg = y, .type = LogicalType::kBigInt},
+      {.kind = plan::AggKind::kSum, .arg = v, .type = LogicalType::kHugeInt},
+      {.kind = plan::AggKind::kCountDistinct, .arg = x, .type = LogicalType::kBigInt},
+      {.kind = plan::AggKind::kCount, .arg = y, .type = LogicalType::kBigInt},
+      {.kind = plan::AggKind::kAvg, .arg = v, .type = LogicalType::kDouble},
+      {.kind = plan::AggKind::kMin, .arg = str, .type = LogicalType::kVarchar},
+      {.kind = plan::AggKind::kMax, .arg = v, .type = LogicalType::kBigInt}};
+  const std::vector<int> fields = {0, 1, 2, 3, 4, 5};
+  for (const std::vector<plan::BoundColumn>& keys :
+       {std::vector<plan::BoundColumn>{k}, std::vector<plan::BoundColumn>{k, str},
+        std::vector<plan::BoundColumn>{str}, std::vector<plan::BoundColumn>{day},
+        std::vector<plan::BoundColumn>{}}) {
+    ASSERT_TRUE(TwoLevelAggregation(keys, calls));
+    for (const bool empty : {false, true}) {
+      ExecContext ctx{.pool = arrow::default_memory_pool(), .batch_size = 3};
+      std::unique_ptr<Operator> serial;
+      auto scan = std::make_unique<TableScanOperator>(TwoLevelTable(false, empty), fields);
+      if (keys.empty()) {
+        serial = std::make_unique<ScalarAggregateOperator>(std::move(scan), calls);
+      } else {
+        serial = std::make_unique<GroupAggregateOperator>(std::move(scan), keys, calls);
+      }
+      const auto expected = Drain(*serial, ctx);
+      ASSERT_TRUE(expected.ok()) << expected.status().ToString();
+      for (const int64_t sample : {0, 3, 16}) {
+        const auto one_thread =
+            RunTwoLevel(TwoLevelTable(true, empty), sample, keys, calls, nullptr);
+        ASSERT_TRUE(one_thread.ok()) << one_thread.status().ToString();
+        const auto four_threads =
+            RunTwoLevel(TwoLevelTable(true, empty), sample, keys, calls, pool.get());
+        ASSERT_TRUE(four_threads.ok()) << four_threads.status().ToString();
+        EXPECT_TRUE(SameRows(**four_threads, **one_thread)) << keys.size() << " " << sample;
+        EXPECT_TRUE(SameRows(*SortedRows(*one_thread), *SortedRows(*expected)))
+            << keys.size() << " sample " << sample << " empty " << empty << "\n"
+            << (*one_thread)->ToString() << "\n"
+            << (*expected)->ToString();
+      }
+    }
+  }
+}
+
+// Which aggregations run in two levels: some COUNT(DISTINCT) of a column that is not a key, no
+// DOUBLE key, and only calls whose merge order cannot change their result.
+TEST_F(PartOperatorsTest, TwoLevelAggregationNeedsOrderIndependentCalls) {
+  const auto k = Column(0, "k", LogicalType::kBigInt);
+  const auto d = Column(1, "d", LogicalType::kDouble);
+  const auto x = Column(2, "x", LogicalType::kBigInt);
+  const auto h = Column(3, "h", LogicalType::kHugeInt);
+  const auto ts = Column(4, "ts", LogicalType::kTimestamp);
+  const auto call = [](plan::AggKind kind, std::optional<plan::BoundColumn> arg, LogicalType type) {
+    return plan::AggregateCall{.kind = kind, .arg = std::move(arg), .type = type};
+  };
+  const auto distinct = call(plan::AggKind::kCountDistinct, x, LogicalType::kBigInt);
+  EXPECT_TRUE(TwoLevelAggregation({k}, {distinct}));
+  EXPECT_TRUE(TwoLevelAggregation({}, {distinct}));
+  EXPECT_TRUE(
+      TwoLevelAggregation({k}, {distinct, call(plan::AggKind::kAvg, ts, LogicalType::kTimestamp),
+                                call(plan::AggKind::kCount, d, LogicalType::kBigInt),
+                                call(plan::AggKind::kCountDistinct, d, LogicalType::kBigInt)}));
+  EXPECT_FALSE(
+      TwoLevelAggregation({k}, {call(plan::AggKind::kCountStar, {}, LogicalType::kBigInt)}))
+      << "no COUNT(DISTINCT)";
+  EXPECT_FALSE(TwoLevelAggregation({x}, {distinct})) << "the distinct column is a key";
+  EXPECT_FALSE(TwoLevelAggregation({d}, {distinct})) << "a DOUBLE key";
+  EXPECT_FALSE(
+      TwoLevelAggregation({k}, {distinct, call(plan::AggKind::kSum, d, LogicalType::kDouble)}));
+  EXPECT_FALSE(
+      TwoLevelAggregation({k}, {distinct, call(plan::AggKind::kAvg, d, LogicalType::kDouble)}));
+  EXPECT_FALSE(
+      TwoLevelAggregation({k}, {distinct, call(plan::AggKind::kMin, d, LogicalType::kDouble)}));
+  EXPECT_FALSE(
+      TwoLevelAggregation({k}, {distinct, call(plan::AggKind::kSum, h, LogicalType::kHugeInt)}));
+}
+
+// A two-level partition sends a group by the hash of its first keys, or by the hash of all its
+// keys when the first keys' hash is heavy: a pure function of the keys, so the same group goes to
+// the same partition from every part.
+TEST_F(PartOperatorsTest, HeavyKeysSpreadOverThePartitions) {
+  const auto k = Column(0, "k", LogicalType::kBigInt);
+  const auto x = Column(1, "x", LogicalType::kBigInt);
+  const auto schema =
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("x", arrow::int64())});
+  std::vector<std::optional<int64_t>> ks;
+  std::vector<std::optional<int64_t>> xs;
+  for (int64_t i = 0; i < 400; ++i) {
+    ks.emplace_back(i % 4 == 0 ? 7 : i % 5);  // 7 in a quarter of the rows
+    xs.emplace_back(i);
+  }
+  const auto batch = arrow::RecordBatch::Make(schema, 400, {Int64s(ks), Int64s(xs)});
+  const auto partitions_of = [&](std::span<const std::uint64_t> heavy) {
+    auto table = GroupTable::Make({k, x}, {}, 2, arrow::default_memory_pool(), nullptr,
+                                  /*first_keys=*/false);
+    EXPECT_TRUE(table.ok());
+    EXPECT_TRUE((*table)->Consume(*batch).ok());
+    EXPECT_TRUE((*table)->Partition(1, heavy).ok());
+    // Per partition, the distinct values of k in it.
+    std::vector<std::set<int64_t>> keys((*table)->num_partitions());
+    const auto uniques = (*table)->uniques();
+    EXPECT_TRUE(uniques.ok());
+    const auto values =
+        std::static_pointer_cast<arrow::Int64Array>(uniques->values[0].make_array());
+    for (std::size_t p = 0; p < keys.size(); ++p) {
+      for (const std::uint32_t g : (*table)->partition_groups(p)) {
+        keys[p].insert(values->Value(g));
+      }
+    }
+    return keys;
+  };
+  const auto count = [](const std::vector<std::set<int64_t>>& keys, int64_t key) {
+    return std::ranges::count_if(keys, [&](const auto& in) { return in.contains(key); });
+  };
+  const auto light = partitions_of({});
+  for (int64_t key : {0, 1, 2, 3, 4, 7}) {
+    EXPECT_EQ(count(light, key), 1) << key;  // every key in one partition
+  }
+  // The hash of k = 7 alone, as the table computes it.
+  auto single = GroupTable::Make({k}, {}, 2, arrow::default_memory_pool(), nullptr, false);
+  ASSERT_TRUE(single.ok());
+  const auto seven = arrow::RecordBatch::Make(schema, 1, {Int64s({7}), Int64s({0})});
+  ASSERT_TRUE((*single)->Consume(*seven).ok());
+  const auto hash = (*single)->PrefixHashes(1);
+  ASSERT_TRUE(hash.ok());
+  const auto spread = partitions_of(*hash);
+  EXPECT_GT(count(spread, 7), 30) << "100 (7, x) groups over 64 partitions";
+  for (int64_t key : {0, 1, 2, 3, 4}) {
+    EXPECT_EQ(count(spread, key), 1) << key;
+  }
+  EXPECT_EQ(partitions_of(*hash), spread) << "the same partitions every time";
+  // Without outer keys (a global aggregation) the empty prefix is heavy: groups spread by x.
+  auto by_x = GroupTable::Make({x}, {}, 2, arrow::default_memory_pool(), nullptr, false);
+  ASSERT_TRUE(by_x.ok());
+  ASSERT_TRUE((*by_x)->Consume(*batch).ok());
+  const auto empty_prefix = KeyHashes(arrow::compute::ExecBatch({}, 1));
+  ASSERT_TRUE(empty_prefix.ok());
+  ASSERT_TRUE((*by_x)->Partition(0, *empty_prefix).ok());
+  EXPECT_GT(
+      std::ranges::count_if(std::views::iota(std::size_t{0}, (*by_x)->num_partitions()),
+                            [&](std::size_t p) { return !(*by_x)->partition_groups(p).empty(); }),
+      50)
+      << "400 values of x over 64 partitions";
 }
 
 // ---- skipping parts by their statistics ----

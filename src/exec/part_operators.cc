@@ -8,6 +8,7 @@
 #include <limits>
 #include <memory>
 #include <new>
+#include <numeric>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -16,11 +17,14 @@
 #include <arrow/util/future.h>
 #include <arrow/util/thread_pool.h>
 
+#include "antb1/common/check.h"
 #include "antb1/exec/operator.h"
 #include "antb1/exec/sort.h"
 #include "antb1/plan/logical_plan.h"
 
 #include "aggregate_set.h"
+#include "heavy_hitters.h"
+#include "outer_groups.h"
 #include "part_scheduler.h"
 
 namespace antb1::exec {
@@ -74,6 +78,44 @@ arrow::Status RunPart(const PartPipeline& pipeline, int64_t part, ExecContext ct
   arrow::Status closed = op->Close();
   ARROW_RETURN_NOT_OK(status);
   return closed;
+}
+
+// Runs fn(0) .. fn(n - 1) on the executor (here, one after another, without one) and waits for all
+// of them: the first failure in index order decides the status.
+arrow::Status ForEach(arrow::internal::Executor* executor, std::size_t n,
+                      const std::function<arrow::Status(std::size_t)>& fn) {
+  const auto guarded = [&fn](std::size_t i) -> arrow::Status {
+    try {
+      return fn(i);
+    } catch (const std::bad_alloc&) {
+      return arrow::Status::OutOfMemory("out of memory while merging groups");
+    }
+  };
+  if (executor == nullptr || n <= 1) {
+    for (std::size_t i = 0; i < n; ++i) {
+      ARROW_RETURN_NOT_OK(guarded(i));
+    }
+    return arrow::Status::OK();
+  }
+  std::vector<arrow::Future<>> tasks;
+  tasks.reserve(n);
+  arrow::Status submitted;
+  for (std::size_t i = 0; i < n && submitted.ok(); ++i) {
+    auto task = executor->Submit([&guarded, i] { return guarded(i); });
+    if (task.ok()) {
+      tasks.push_back(std::move(*task));
+    } else {
+      submitted = task.status();
+    }
+  }
+  arrow::Status status = submitted;
+  for (const arrow::Future<>& task : tasks) {  // every task ends before its inputs can go
+    const arrow::Status done = task.status();
+    if (status.ok()) {
+      status = done;
+    }
+  }
+  return status;
 }
 
 }  // namespace
@@ -250,39 +292,9 @@ arrow::Status PartGroupAggregateOperator::MergePart(const GroupTable& part) {
   if (tables_.size() != partitions) {
     return arrow::Status::Invalid("a part of ", partitions, " partitions for ", tables_.size());
   }
-  if (executor_ == nullptr || partitions == 1) {
-    for (std::size_t p = 0; p < partitions; ++p) {
-      ARROW_RETURN_NOT_OK(tables_[p]->MergePartition(part, p));
-    }
-    return arrow::Status::OK();
-  }
   // Partitions are disjoint: each merges on the executor, and all finish before the next part.
-  std::vector<arrow::Future<>> merges;
-  merges.reserve(partitions);
-  arrow::Status submitted;
-  for (std::size_t p = 0; p < partitions && submitted.ok(); ++p) {
-    GroupTable* table = tables_[p].get();
-    auto merge = executor_->Submit([table, &part, p] -> arrow::Status {
-      try {
-        return table->MergePartition(part, p);
-      } catch (const std::bad_alloc&) {
-        return arrow::Status::OutOfMemory("out of memory while merging groups");
-      }
-    });
-    if (merge.ok()) {
-      merges.push_back(std::move(*merge));
-    } else {
-      submitted = merge.status();
-    }
-  }
-  arrow::Status status = submitted;
-  for (const arrow::Future<>& merge : merges) {  // every merge ends before `part` can go
-    const arrow::Status merged = merge.status();
-    if (status.ok()) {
-      status = merged;  // the first failed partition, in partition order
-    }
-  }
-  return status;
+  return ForEach(executor_, partitions,
+                 [&](std::size_t p) { return tables_[p]->MergePartition(part, p); });
 }
 
 arrow::Result<Batch> PartGroupAggregateOperator::Next() {
@@ -312,6 +324,351 @@ arrow::Status PartGroupAggregateOperator::Close() {
   scheduler_.reset();
   tables_.clear();
   next_table_ = 0;
+  opened_ = false;
+  return arrow::Status::OK();
+}
+
+// ---- PartTwoLevelAggregateOperator ----
+
+namespace {
+
+// The summary of the sample's K hashes: every K with more than 1 / (2 * kPartitions) of the
+// sample's inner groups is heavy (it would take more than half a fair partition's share).
+constexpr std::size_t kHeavyCounters = 512;
+constexpr double kHeavyShare = 1.0 / (2.0 * static_cast<double>(GroupTable::kPartitions));
+
+// What every part builds its inner tables from.
+struct InnerSpec {
+  std::vector<plan::BoundColumn> keys;
+  std::vector<plan::BoundColumn> distinct;
+  std::vector<plan::AggregateCall> plain;
+  int width = 0;
+};
+
+// One inner table per distinct column (keys K and the column, no calls), then the plain table (K,
+// the plain calls) if there are plain calls. They keep no first-seen keys: the outer level reads
+// their normalized keys, and no key it outputs is DOUBLE.
+arrow::Result<std::vector<std::unique_ptr<GroupTable>>> MakeInnerTables(const InnerSpec& spec,
+                                                                        arrow::MemoryPool* pool,
+                                                                        MemoryBudget* budget) {
+  std::vector<std::unique_ptr<GroupTable>> tables;
+  for (const plan::BoundColumn& column : spec.distinct) {
+    std::vector<plan::BoundColumn> keys = spec.keys;
+    keys.push_back(column);
+    ARROW_ASSIGN_OR_RAISE(auto table, GroupTable::Make(std::move(keys), {}, spec.width, pool,
+                                                       budget, /*first_keys=*/false));
+    tables.push_back(std::move(table));
+  }
+  if (!spec.plain.empty()) {
+    ARROW_ASSIGN_OR_RAISE(auto table, GroupTable::Make(spec.keys, spec.plain, spec.width, pool,
+                                                       budget, /*first_keys=*/false));
+    tables.push_back(std::move(table));
+  }
+  return tables;
+}
+
+}  // namespace
+
+bool TwoLevelAggregation(const std::vector<plan::BoundColumn>& keys,
+                         const std::vector<plan::AggregateCall>& calls) {
+  if (std::ranges::any_of(keys, [](const plan::BoundColumn& key) {
+        return key.type == plan::LogicalType::kDouble;
+      })) {
+    return false;
+  }
+  const auto exact_integer = [](plan::LogicalType type) {
+    return plan::IsInteger(type) && type != plan::LogicalType::kHugeInt;
+  };
+  bool distinct = false;
+  for (const plan::AggregateCall& call : calls) {
+    const std::optional<plan::LogicalType> input =
+        call.arg.has_value() ? std::optional(call.arg->type) : std::nullopt;
+    bool order_independent = false;
+    if (call.kind == plan::AggKind::kCountDistinct) {
+      order_independent =
+          call.arg.has_value() && std::ranges::none_of(keys, [&](const plan::BoundColumn& key) {
+            return key.index == call.arg->index;
+          });
+      distinct = true;
+    } else if (call.kind == plan::AggKind::kCountStar || call.kind == plan::AggKind::kCount) {
+      order_independent = true;
+    } else if (call.kind == plan::AggKind::kMin || call.kind == plan::AggKind::kMax) {
+      // -0.0 and 0.0 compare equal: which one a DOUBLE MIN keeps depends on the order.
+      order_independent = input.has_value() && *input != plan::LogicalType::kDouble;
+    } else if (call.kind == plan::AggKind::kSum) {
+      order_independent = input.has_value() && exact_integer(*input);
+    } else if (call.kind == plan::AggKind::kAvg) {
+      order_independent =
+          input.has_value() && (exact_integer(*input) || *input == plan::LogicalType::kDate ||
+                                *input == plan::LogicalType::kTimestamp);
+    }
+    if (!order_independent) {
+      return false;
+    }
+  }
+  return distinct;
+}
+
+PartTwoLevelAggregateOperator::PartTwoLevelAggregateOperator(
+    PartPipeline pipeline, int64_t num_parts, int64_t sample_parts, int input_width,
+    std::vector<plan::BoundColumn> keys, std::vector<plan::AggregateCall> aggregates,
+    std::shared_ptr<arrow::Schema> schema, bool global)
+    : pipeline_(std::make_shared<const PartPipeline>(std::move(pipeline))),
+      num_parts_(num_parts),
+      sample_parts_(sample_parts),
+      input_width_(input_width),
+      keys_(std::move(keys)),
+      aggregates_(std::move(aggregates)),
+      schema_(std::move(schema)),
+      global_(global) {
+  for (const plan::BoundColumn& key : keys_) {
+    key_types_.push_back(key.type);
+  }
+  for (const plan::AggregateCall& call : aggregates_) {
+    if (call.kind == plan::AggKind::kCountDistinct && call.arg.has_value()) {
+      auto it = std::ranges::find_if(distinct_, [&](const plan::BoundColumn& column) {
+        return column.index == call.arg->index;
+      });
+      if (it == distinct_.end()) {
+        distinct_.push_back(*call.arg);
+        it = distinct_.end() - 1;
+      }
+      slots_.push_back(
+          OuterSlot{.distinct = true, .index = static_cast<std::size_t>(it - distinct_.begin())});
+    } else {
+      plain_.push_back(call);
+      slots_.push_back(OuterSlot{.distinct = false, .index = plain_.size() - 1});
+    }
+  }
+}
+
+PartTwoLevelAggregateOperator::~PartTwoLevelAggregateOperator() = default;
+
+arrow::Status PartTwoLevelAggregateOperator::Open(ExecContext& ctx) {
+  ARROW_RETURN_NOT_OK(Close());
+  if (!TwoLevelAggregation(keys_, aggregates_) || (global_ && !keys_.empty())) {
+    return arrow::Status::Invalid("a two-level aggregation of calls it cannot run");
+  }
+  pool_ = ctx.pool;
+  budget_ = ctx.budget;
+  executor_ = ctx.executor;
+  part_ctx_ = PartContext(ctx);
+  window_ = Window(ctx);
+  opened_ = true;
+  return arrow::Status::OK();
+}
+
+arrow::Status PartTwoLevelAggregateOperator::MergePart(
+    const std::vector<std::unique_ptr<GroupTable>>& part) {
+  ANTB1_CHECK(part.size() == tables_.size());
+  return ForEach(executor_, GroupTable::kPartitions, [&](std::size_t p) -> arrow::Status {
+    for (std::size_t t = 0; t < part.size(); ++t) {
+      if (p < part[t]->num_partitions()) {  // a plain table without keys has one partition
+        ARROW_RETURN_NOT_OK(tables_[t][p]->MergePartition(*part[t], p));
+      }
+    }
+    return arrow::Status::OK();
+  });
+}
+
+arrow::Status PartTwoLevelAggregateOperator::Outer(std::size_t partition) {
+  ARROW_ASSIGN_OR_RAISE(auto outer,
+                        OuterGroups::Make(key_types_, distinct_.size(), plain_, pool_, budget_));
+  for (std::size_t t = 0; t < tables_.size(); ++t) {
+    const std::unique_ptr<GroupTable> inner = std::move(tables_[t][partition]);  // freed here
+    if (t < distinct_.size()) {
+      ARROW_ASSIGN_OR_RAISE(const arrow::compute::ExecBatch uniques, inner->uniques());
+      ARROW_RETURN_NOT_OK(outer->AddDistinct(t, uniques));
+    } else {
+      ARROW_RETURN_NOT_OK(outer->AddPlain(*inner));
+    }
+  }
+  // Without keys the one group is heavy: its inner groups are in every partition.
+  std::vector<bool> heavy(outer->num_groups(), keys_.empty());
+  if (!keys_.empty() && !heavy_.empty()) {
+    ARROW_ASSIGN_OR_RAISE(const std::vector<std::uint64_t> hashes, outer->Hashes());
+    for (std::size_t g = 0; g < hashes.size(); ++g) {
+      heavy[g] = std::ranges::binary_search(heavy_, hashes[g]);
+    }
+  }
+  // The light groups' rows, in chunks of at most kMaxMergeChunk groups.
+  const std::uint32_t groups = outer->num_groups();
+  for (std::uint32_t begin = 0; begin < groups;) {
+    const auto end = static_cast<std::uint32_t>(
+        std::min<std::size_t>(groups, begin + GroupTable::kMaxMergeChunk));
+    std::vector<std::uint32_t> chunk;
+    chunk.reserve(end - begin);
+    for (std::uint32_t g = begin; g < end; ++g) {
+      (heavy[g] ? heavy_groups_[partition] : chunk).push_back(g);
+    }
+    if (!chunk.empty()) {
+      ARROW_ASSIGN_OR_RAISE(auto batch, outer->Rows(begin, end, chunk, slots_, schema_, !global_));
+      rows_[partition].push_back(std::move(batch));
+    }
+    begin = end;
+  }
+  outer_[partition] = std::move(outer);
+  return arrow::Status::OK();
+}
+
+arrow::Status PartTwoLevelAggregateOperator::Aggregate() {
+  const auto spec = std::make_shared<const InnerSpec>(
+      InnerSpec{.keys = keys_, .distinct = distinct_, .plain = plain_, .width = input_width_});
+  const std::size_t prefix = keys_.size();
+  // The parts from `first` on. A sampled part hashes its K; the others are partitioned by the
+  // heavy keys. Both on the worker, not on the merging thread.
+  const auto run = [&](int64_t first, int64_t count,
+                       std::shared_ptr<const std::vector<std::uint64_t>> heavy_keys) {
+    auto task = [pipeline = pipeline_, part_ctx = part_ctx_, spec, first, prefix,
+                 heavy = std::move(heavy_keys)](
+                    int64_t i, const std::atomic<bool>& stop) -> arrow::Result<PartTables> {
+      auto part = std::make_shared<InnerPart>();
+      ARROW_ASSIGN_OR_RAISE(part->tables, MakeInnerTables(*spec, part_ctx.pool, part_ctx.budget));
+      ARROW_RETURN_NOT_OK(RunPart(
+          *pipeline, first + i, part_ctx, stop, [&](const Batch& batch) -> arrow::Result<bool> {
+            ARROW_ASSIGN_OR_RAISE(const auto rows, Materialize(batch, part_ctx.pool));
+            for (const auto& table : part->tables) {
+              ARROW_RETURN_NOT_OK(table->Consume(*rows));
+            }
+            return true;
+          }));
+      if (heavy != nullptr) {
+        for (const auto& table : part->tables) {
+          ARROW_RETURN_NOT_OK(table->Partition(prefix, *heavy));
+        }
+      } else if (prefix > 0) {
+        for (std::size_t t = 0; t < spec->distinct.size(); ++t) {
+          ARROW_ASSIGN_OR_RAISE(const std::vector<std::uint64_t> hashes,
+                                part->tables[t]->PrefixHashes(prefix));
+          part->key_hashes.insert(part->key_hashes.end(), hashes.begin(), hashes.end());
+        }
+      }
+      return part;
+    };
+    return std::make_unique<PartScheduler<PartTables>>(count, std::move(task), executor_, window_,
+                                                       budget_);
+  };
+
+  // Per inner table, one merged table per partition.
+  tables_.clear();
+  for (std::size_t p = 0; p < GroupTable::kPartitions; ++p) {
+    ARROW_ASSIGN_OR_RAISE(auto made, MakeInnerTables(*spec, pool_, budget_));
+    tables_.resize(made.size());
+    for (std::size_t t = 0; t < made.size(); ++t) {
+      tables_[t].push_back(std::move(made[t]));
+    }
+  }
+
+  // The sample: its parts in part order decide the heavy keys, then partition and merge.
+  const int64_t sample = std::clamp<int64_t>(sample_parts_, 0, num_parts_);
+  std::vector<PartTables> sampled;
+  {
+    auto scheduler = run(0, sample, nullptr);
+    while (!scheduler->done()) {
+      ARROW_ASSIGN_OR_RAISE(PartTables part, scheduler->Next());
+      sampled.push_back(std::move(part));
+    }
+  }
+  heavy_.clear();
+  if (keys_.empty()) {
+    // The one outer group is heavy: every table spreads its groups by the hash of its column.
+    ARROW_ASSIGN_OR_RAISE(heavy_, KeyHashes(arrow::compute::ExecBatch({}, 1)));
+  } else {
+    HeavyHitters summary(kHeavyCounters);
+    for (const PartTables& part : sampled) {
+      for (const std::uint64_t hash : part->key_hashes) {
+        summary.Add(hash);
+      }
+      part->key_hashes = {};
+    }
+    heavy_ = summary.Above(kHeavyShare);
+  }
+  ARROW_RETURN_NOT_OK(ForEach(executor_, sampled.size(), [&](std::size_t i) -> arrow::Status {
+    for (const auto& table : sampled[i]->tables) {
+      ARROW_RETURN_NOT_OK(table->Partition(prefix, heavy_));
+    }
+    return arrow::Status::OK();
+  }));
+  for (PartTables& part : sampled) {
+    ARROW_RETURN_NOT_OK(MergePart(part->tables));
+    part.reset();  // gives the memory back
+  }
+  sampled.clear();
+
+  // The other parts, partitioned on their workers.
+  {
+    auto scheduler = run(sample, num_parts_ - sample,
+                         std::make_shared<const std::vector<std::uint64_t>>(heavy_));
+    while (!scheduler->done()) {
+      ARROW_ASSIGN_OR_RAISE(const PartTables part, scheduler->Next());
+      ARROW_RETURN_NOT_OK(MergePart(part->tables));
+    }
+  }
+
+  // The outer level, partitions in parallel; then the heavy K's groups across the partitions.
+  outer_.clear();
+  outer_.resize(GroupTable::kPartitions);
+  heavy_groups_.assign(GroupTable::kPartitions, {});
+  rows_.assign(GroupTable::kPartitions, {});
+  ARROW_RETURN_NOT_OK(
+      ForEach(executor_, GroupTable::kPartitions, [&](std::size_t p) { return Outer(p); }));
+  tables_.clear();
+  ARROW_ASSIGN_OR_RAISE(heavy_table_,
+                        OuterGroups::Make(key_types_, distinct_.size(), plain_, pool_, budget_));
+  for (std::size_t p = 0; p < GroupTable::kPartitions; ++p) {
+    ARROW_RETURN_NOT_OK(heavy_table_->Merge(*outer_[p], heavy_groups_[p]));
+    outer_[p].reset();  // gives the memory back
+  }
+  outer_.clear();
+  heavy_groups_.clear();
+  if (global_) {
+    ARROW_RETURN_NOT_OK(heavy_table_->EnsureGroup());
+  }
+  return arrow::Status::OK();
+}
+
+arrow::Result<Batch> PartTwoLevelAggregateOperator::Next() {
+  if (!opened_) {
+    return arrow::Status::Invalid("two-level aggregate: Next() before Open() or after Close()");
+  }
+  if (!aggregated_) {
+    ARROW_RETURN_NOT_OK(Aggregate());
+    aggregated_ = true;
+  }
+  for (; next_partition_ < rows_.size(); ++next_partition_, next_rows_ = 0) {
+    std::vector<std::shared_ptr<arrow::RecordBatch>>& rows = rows_[next_partition_];
+    if (next_rows_ < rows.size()) {
+      return Batch{.data = std::move(rows[next_rows_++]), .selection = {}};
+    }
+    rows = {};
+  }
+  const std::uint32_t groups = heavy_table_ == nullptr ? 0 : heavy_table_->num_groups();
+  if (next_group_ < groups) {
+    const std::uint32_t begin = next_group_;
+    const auto end = static_cast<std::uint32_t>(
+        std::min<std::size_t>(groups, begin + GroupTable::kMaxMergeChunk));
+    next_group_ = end;
+    std::vector<std::uint32_t> chunk(end - begin);
+    std::ranges::iota(chunk, begin);
+    ARROW_ASSIGN_OR_RAISE(auto rows,
+                          heavy_table_->Rows(begin, end, chunk, slots_, schema_, !global_));
+    return Batch{.data = std::move(rows), .selection = {}};
+  }
+  heavy_table_.reset();  // gives the memory back
+  return Batch{};
+}
+
+arrow::Status PartTwoLevelAggregateOperator::Close() {
+  tables_.clear();
+  outer_.clear();
+  heavy_groups_.clear();
+  rows_.clear();
+  heavy_table_.reset();
+  heavy_.clear();
+  next_partition_ = 0;
+  next_rows_ = 0;
+  next_group_ = 0;
+  aggregated_ = false;
   opened_ = false;
   return arrow::Status::OK();
 }
