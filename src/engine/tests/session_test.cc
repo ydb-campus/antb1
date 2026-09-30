@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <format>
 #include <limits>
 #include <memory>
 #include <string>
@@ -102,6 +103,70 @@ TEST_F(SessionTest, ExplainShowsRowCount) {
   ASSERT_TRUE(text.ok()) << text.status().ToString();
   EXPECT_EQ(*text,
             "Output: count_star():BIGINT\nRowCount table=t source=parquet(files=1, rows=10)\n");
+}
+
+// ExplainAnalyze runs the query (the rows of Execute, dropped) and profiles every physical
+// operator: the text has the Output and Total lines, then one line per operator with its rows and
+// time in brackets; the JSON is one object; errors are those of Execute. The same counts on 1 and
+// 4 threads.
+TEST_F(SessionTest, ExplainAnalyzeProfilesTheQuery) {
+  const std::string sql =
+      "SELECT AdvEngineID, COUNT(*) FROM t WHERE AdvEngineID > 2 GROUP BY AdvEngineID "
+      "ORDER BY AdvEngineID LIMIT 5";
+  std::string counts;
+  for (const int threads : {1, 4}) {
+    auto session = Session::Make({.threads = threads}).ValueOrDie();
+    ASSERT_TRUE(session->RegisterParquet("t", {path_}).ok());
+    const auto result = session->Execute(sql);
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    const auto profile = session->ExplainAnalyze(sql);
+    ASSERT_TRUE(profile.ok()) << profile.status().ToString();
+    EXPECT_EQ(profile->rows, result->table->num_rows());
+    EXPECT_EQ(profile->threads, threads);
+    EXPECT_GT(profile->peak_memory, 0);
+    EXPECT_EQ(profile->output, "Output: AdvEngineID:SMALLINT count_star():BIGINT");
+
+    const std::string text = FormatProfile(*profile, ProfileFormat::kText);
+    std::vector<std::string> lines;
+    for (std::size_t start = 0; start < text.size();) {
+      const std::size_t end = text.find('\n', start);
+      lines.push_back(text.substr(start, end - start));
+      start = end + 1;
+    }
+    ASSERT_GE(lines.size(), 5U) << text;
+    EXPECT_EQ(lines[0], profile->output);
+    EXPECT_TRUE(lines[1].starts_with("Total: time=")) << lines[1];
+    EXPECT_NE(lines[1].find(std::format(" rows=5 peak_memory=")), std::string::npos) << lines[1];
+    std::string these;
+    for (std::size_t i = 2; i < lines.size(); ++i) {
+      EXPECT_NE(lines[i].find("  [rows="), std::string::npos) << lines[i];
+      EXPECT_TRUE(lines[i].ends_with(']')) << lines[i];
+      // The operator and its rows, which do not depend on the threads.
+      const std::size_t rows = lines[i].find("[rows=");
+      these += lines[i].substr(0, lines[i].find_first_not_of(' ')) +
+               lines[i].substr(lines[i].find_first_not_of(' '),
+                               lines[i].find(' ', lines[i].find_first_not_of(' ')) -
+                                   lines[i].find_first_not_of(' ')) +
+               " " + lines[i].substr(rows, lines[i].find(' ', rows) - rows) + "\n";
+    }
+    if (counts.empty()) {
+      counts = these;
+      EXPECT_NE(counts.find("PartGroupAggregate [rows=7"), std::string::npos) << counts;
+    } else {
+      EXPECT_EQ(these, counts);
+    }
+
+    const std::string json = FormatProfile(*profile, ProfileFormat::kJson);
+    EXPECT_TRUE(json.starts_with(R"({"output":"Output: AdvEngineID:SMALLINT)")) << json;
+    EXPECT_NE(json.find(std::format(R"("rows":5,"peak_memory_bytes":)")), std::string::npos);
+    EXPECT_NE(json.find(std::format(R"("threads":{},"plan":{{"name":)", threads)),
+              std::string::npos)
+        << json;
+    EXPECT_TRUE(json.ends_with("]}}\n")) << json;
+
+    EXPECT_EQ(session->ExplainAnalyze("SELECT nope FROM t").status().ToString(),
+              session->Execute("SELECT nope FROM t").status().ToString());
+  }
 }
 
 // Explain shows the optimized plan of every bound query: pruned scans, folded literals.

@@ -58,6 +58,12 @@ time to register the tables (reading the Parquet footers) and `data_size` the su
 query that fails gets `null` for every run and is listed in `antb1.failed` with its error kind. Progress goes to
 stderr: one line per query with its number and timings, or its error kind; never query text or results.
 
+To see where one query's time goes, run it with `antb1 explain --analyze` (same `--table`, `--clickbench`,
+`--threads` and `--memory-limit`): every physical operator with its rows, times, part waits and merge phases
+([sql-subset.md](sql-subset.md#explain---analyze), [ADR 0015](adr/0015-query-profiles.md)). `--format json` is for
+scripts. The plan text shows column names and the query's constants: keep it out of anything committed for
+ClickBench queries.
+
 The JSON (timings shortened):
 
 ```json

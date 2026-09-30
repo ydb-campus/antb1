@@ -145,12 +145,18 @@ void Render(const LogicalNode& node, std::size_t depth, std::string& out) {
 
 }  // namespace
 
-std::string Explain(const LogicalPlan& plan) {
+std::string ExplainNode(const LogicalNode& node) { return std::visit(NodeLine{}, node); }
+
+std::string ExplainOutput(const LogicalPlan& plan) {
   std::string out = "Output:";
   for (const auto& col : plan.output) {
     out += std::format(" {}:{}", EscapeText(col.name, '\0'), ToString(col.type));
   }
-  out += '\n';
+  return out;
+}
+
+std::string Explain(const LogicalPlan& plan) {
+  std::string out = ExplainOutput(plan) + '\n';
   if (plan.root != nullptr) {
     Render(*plan.root, 0, out);
   }

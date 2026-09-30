@@ -1,0 +1,1 @@
+{"error":{"kind":"bind","message":"column 'nope' does not exist","offset":7,"length":4,"line":1,"column":8}}

@@ -77,7 +77,9 @@ struct Inputs {
   std::string file;     // -f
   std::string format = "table";
   bool timing = false;
-  int threads = 1;  // --threads (query and bench)
+  bool analyze = false;                 // explain --analyze
+  std::string profile_format = "text";  // explain --analyze --format
+  int threads = 1;                      // --threads (query and bench)
   // --memory-limit (query and bench); std::nullopt for commands that run no query.
   std::optional<std::string> memory_limit;
   BenchSettings bench;
@@ -296,9 +298,21 @@ int RunCli(std::span<const std::string> args, std::istream& in_stream, std::ostr
   AddThreadsOption(query, in);
   AddMemoryLimitOption(query, in);
 
-  auto* explain = app.add_subcommand("explain", "Print the logical plan of a query");
+  auto* explain = app.add_subcommand(
+      "explain",
+      "Print the logical plan of a query; with --analyze, run it and print its profiled "
+      "physical plan");
   AddSqlOptions(explain, in);
   AddTableOptions(explain, in);
+  auto* analyze = explain->add_flag(
+      "--analyze", in.analyze,
+      "Run the query (dropping its rows) and print every physical operator with its rows, times "
+      "and metrics");
+  explain->add_option("--format", in.profile_format, "Profile format (with --analyze)")
+      ->check(CLI::IsMember({"text", "json"}))
+      ->needs(analyze);
+  AddThreadsOption(explain, in);
+  AddMemoryLimitOption(explain, in);
 
   auto* schema = app.add_subcommand("schema", "Print the columns of the registered tables");
   AddTableOptions(schema, in);
@@ -334,6 +348,10 @@ int RunCli(std::span<const std::string> args, std::istream& in_stream, std::ostr
   } catch (const CLI::ParseError& e) {
     const int code = app.exit(e, out, err);
     return code == 0 ? kExitOk : kExitUsage;
+  }
+
+  if (explain->parsed() && in.analyze) {
+    in.format = in.profile_format;  // errors as JSON with --format json, as `query` prints them
   }
 
   if (version->parsed()) {
@@ -376,6 +394,17 @@ int RunCli(std::span<const std::string> args, std::istream& in_stream, std::ostr
             << '\n';
       }
     }
+    return kExitOk;
+  }
+
+  if (explain->parsed() && in.analyze) {
+    auto profile = (*session)->ExplainAnalyze(sql);
+    if (!profile.ok()) {
+      return Fail(profile.status(), sql, in, err);
+    }
+    out << engine::FormatProfile(*profile, in.profile_format == "json"
+                                               ? engine::ProfileFormat::kJson
+                                               : engine::ProfileFormat::kText);
     return kExitOk;
   }
 

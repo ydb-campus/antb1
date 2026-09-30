@@ -19,4 +19,9 @@ namespace antb1::plan {
 // outside printable ASCII as \xHH.
 std::string Explain(const LogicalPlan& plan);
 
+// The line of one node (without its inputs), as Explain shows it.
+std::string ExplainNode(const LogicalNode& node);
+// The "Output:" line of a plan (without its newline), as Explain shows it.
+std::string ExplainOutput(const LogicalPlan& plan);
+
 }  // namespace antb1::plan

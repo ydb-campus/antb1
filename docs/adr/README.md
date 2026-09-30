@@ -20,3 +20,4 @@ in the same PR as the change it justifies, and list it below; `pixi run lint` ch
 | [0012](0012-scalar-expressions.md) | Scalar expressions | Accepted |
 | [0013](0013-parallel-execution.md) | Parallel execution over row groups | Proposed |
 | [0014](0014-two-level-aggregation.md) | Two-level aggregation with skew-aware partitioning | Proposed |
+| [0015](0015-query-profiles.md) | Query profiles and `explain --analyze` | Proposed |

@@ -106,7 +106,10 @@ steps (only step 7 uses more than one thread):
 8. Format (`engine::FormatResult`): `table`, `csv` or `json` output on stdout, built from one canonical value
    formatter. With `--timing`, the elapsed seconds are the last line on stderr.
 
-`antb1 explain` stops after step 5 and prints the optimized logical plan. Any error travels up as an
+`antb1 explain` stops after step 5 and prints the optimized logical plan. `antb1 explain --analyze` builds the physical
+plan with a profile root (`exec::ProfileNode`; each operator wrapped in `exec::ProfiledOperator`, a part pipeline
+profiled once per part into the same nodes), runs it, drops the rows and prints the profile
+(`engine::FormatProfile`, [ADR 0015](adr/0015-query-profiles.md)). Any error travels up as an
 `arrow::Status`, and `cli` maps it to an exit code (see [the SQL subset](sql-subset.md#exit-codes)).
 
 ## Execution
@@ -188,7 +191,7 @@ state's groups through a group map, so partial results of separate parts of the 
 | Name resolution or type rules | `src/plan/binder.cc`, `src/plan/types.cc` | [sql-subset.md](sql-subset.md), [ADR 0004](adr/0004-types-null-overflow-semantics.md) if semantics change |
 | A logical plan node | the variant in `src/plan/include/antb1/plan/logical_plan.h`; the compiler then points at every `std::visit` to extend (physical planner, optimizer, EXPLAIN) | tests in `src/plan/tests/` and `src/exec/tests/` |
 | An optimizer rule | `src/plan/optimizer.cc` | tests in `src/plan/tests/optimizer_test.cc`, an EXPLAIN golden in `tests/cli/` |
-| A physical operator | `src/exec/` | tests in `src/exec/tests/` |
+| A physical operator | `src/exec/`; its name in the physical planner (`Builder::Name`), and metrics for its phases through `profile()` and `ProfileTimer` | tests in `src/exec/tests/` |
 | A SQL feature antb1 now answers | the modules above | `.slt` records in `tests/slt/cases/` (`pixi run slt-complete`), the feature in `tests/slt/supported_features.h`, [sql-subset.md](sql-subset.md); when `pixi run test-data` reports a new ClickBench pass, the ratchet `tests/data/clickbench_status.json` and the status table |
 | A table source or file format | a new `plan::Table` implementation in `src/io/` | an ADR if it needs a new dependency |
 | A CLI flag or subcommand | `src/cli/cli.cc` | tests in `src/cli/tests/`, CLI goldens in `tests/cli/`, [sql-subset.md](sql-subset.md) |

@@ -1,6 +1,6 @@
 antb1_add_module(
   engine
-  SOURCES session.cc format.cc
+  SOURCES session.cc format.cc profile_format.cc
   PUBLIC_DEPS common plan
   PRIVATE_DEPS sql io exec
   PUBLIC_LIBS Arrow::arrow_shared

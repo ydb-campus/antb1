@@ -14,6 +14,7 @@
 #include "antb1/exec/memory_budget.h"
 #include "antb1/exec/operator.h"
 #include "antb1/exec/physical_planner.h"
+#include "antb1/exec/profile.h"
 #include "antb1/io/parquet_table.h"
 #include "antb1/plan/binder.h"
 #include "antb1/plan/catalog.h"
@@ -136,6 +137,29 @@ arrow::Result<QueryResult> Session::Execute(std::string_view sql) {
 arrow::Result<std::string> Session::Explain(std::string_view sql) {
   ARROW_ASSIGN_OR_RAISE(auto logical, ParseAndBind(sql, catalog_, nullptr));
   return plan::Explain(logical);
+}
+
+arrow::Result<QueryProfile> Session::ExplainAnalyze(std::string_view sql) {
+  ARROW_ASSIGN_OR_RAISE(auto logical, ParseAndBind(sql, catalog_, nullptr));
+  QueryProfile profile;
+  profile.output = plan::ExplainOutput(logical);
+  profile.root = std::make_shared<exec::ProfileNode>();
+  profile.threads = options_.threads;
+  memory_->ResetPeak();
+  const auto t0 = Clock::now();
+  {
+    ARROW_ASSIGN_OR_RAISE(auto op, exec::BuildPhysicalPlan(logical, profile.root.get()));
+    exec::ExecContext ctx{.pool = memory_.get(),
+                          .batch_size = options_.batch_size,
+                          .executor = pool_.get(),
+                          .threads = options_.threads,
+                          .budget = memory_.get()};
+    ARROW_ASSIGN_OR_RAISE(auto table, exec::Drain(*op, ctx));
+    profile.rows = table->num_rows();
+  }
+  profile.time = Clock::now() - t0;
+  profile.peak_memory = memory_->max_memory();
+  return profile;
 }
 
 }  // namespace antb1::engine
