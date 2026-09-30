@@ -308,6 +308,26 @@ TEST_F(ComputeTest, StringFunctions) {
   auto first = replace("(b)", "[\\1\\0]");
   ASSERT_TRUE(first.ok());
   EXPECT_EQ(values(*first), (Values{"h\xC3\xA9llo", std::nullopt, "a\n[bb]", "", "a[bb]ab"}));
+  // Each distinct value is replaced once and the results go back to every row: repeated values,
+  // NULLs and values without a match in one batch.
+  const auto repeated =
+      testing::Strings({"abab", std::nullopt, "abab", "xyz", "", "abab", std::nullopt, "xyz", "b"});
+  auto once = Eval(
+      Call(plan::Function::kRegexpReplace,
+           {ColumnAt(0, LogicalType::kVarchar), StringConstant("(b)"), StringConstant("<\\1>")},
+           LogicalType::kVarchar),
+      {repeated});
+  ASSERT_TRUE(once.ok()) << once.status().ToString();
+  EXPECT_EQ(values(*once), (Values{"a<b>ab", std::nullopt, "a<b>ab", "xyz", "", "a<b>ab",
+                                   std::nullopt, "xyz", "<b>"}));
+  // A batch of NULLs only (no distinct value to replace) stays NULL.
+  auto nulls = Eval(
+      Call(plan::Function::kRegexpReplace,
+           {ColumnAt(0, LogicalType::kVarchar), StringConstant("(b)"), StringConstant("<\\1>")},
+           LogicalType::kVarchar),
+      {testing::Strings({std::nullopt, std::nullopt})});
+  ASSERT_TRUE(nulls.ok()) << nulls.status().ToString();
+  EXPECT_EQ(values(*nulls), (Values{std::nullopt, std::nullopt}));
   auto newline = replace("a.b", "X");
   ASSERT_TRUE(newline.ok());
   EXPECT_EQ(values(*newline)[2], "a\nb") << "`.` does not match a newline";

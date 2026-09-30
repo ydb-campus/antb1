@@ -624,7 +624,16 @@ struct Evaluator {
     }
     const arrow::compute::ReplaceSubstringOptions options("^(\\C*?)(" + pattern + ")", shifted,
                                                           /*max_replacements=*/-1);
-    auto replaced = arrow::compute::CallFunction("replace_substring_regex", {utf8}, &options, ctx);
+    // Each distinct value once: the values of a batch repeat (URLs, referrer URLs), and the regex
+    // is far dearer than hashing. The results go back to their rows with one Take (NULL stays
+    // NULL).
+    ARROW_ASSIGN_OR_RAISE(const arrow::Datum encoded,
+                          arrow::compute::DictionaryEncode(
+                              utf8, arrow::compute::DictionaryEncodeOptions::Defaults(), ctx));
+    const std::shared_ptr<arrow::Array> encoded_array = encoded.make_array();
+    const auto& dictionary = static_cast<const arrow::DictionaryArray&>(*encoded_array);
+    auto replaced = arrow::compute::CallFunction("replace_substring_regex",
+                                                 {dictionary.dictionary()}, &options, ctx);
     if (!replaced.ok() && replaced.status().message().starts_with("Invalid replacement string")) {
       // A replacement RE2 rejects (\1 without a group, a lone backslash): DuckDB ignores
       // RE2::Replace's failure and returns the text unchanged.
@@ -637,9 +646,11 @@ struct Evaluator {
                  ? replaced.status()
                  : arrow::Status::ExecutionError("regexp_replace: ", replaced.status().message());
     }
+    ARROW_ASSIGN_OR_RAISE(const arrow::Datum rows,
+                          arrow::compute::Take(*replaced, dictionary.indices(),
+                                               arrow::compute::TakeOptions::NoBoundsCheck(), ctx));
     arrow::compute::CastOptions to_binary = arrow::compute::CastOptions::Unsafe(arrow::binary());
-    ARROW_ASSIGN_OR_RAISE(const arrow::Datum bytes,
-                          arrow::compute::Cast(*replaced, to_binary, ctx));
+    ARROW_ASSIGN_OR_RAISE(const arrow::Datum bytes, arrow::compute::Cast(rows, to_binary, ctx));
     return bytes.make_array();
   }
 

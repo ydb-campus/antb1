@@ -434,7 +434,8 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   runs it (`.` matches one character but no newline); in the replacement `\0` is the match, `\1` to `\9` its groups
   and `\\` a backslash. A replacement RE2 rejects (a group the pattern does not have, a lone or unknown backslash)
   leaves the text unchanged, as in DuckDB; an invalid pattern fails the query (exit code 1) when it runs. NULL gives
-  NULL. Bytes that are not UTF-8 are divergence D15.
+  NULL. Bytes that are not UTF-8 are divergence D15. It evaluates the pattern once per distinct
+  value of a batch (values repeat within a batch), which only changes the speed.
 - CASE: the first branch whose condition is true (a NULL condition is not) gives the value, else `ELSE`, else NULL.
   As in DuckDB, a condition is computed only for the rows no earlier branch took and a value only for the rows its
   branch answers, so `CASE WHEN x < 100 THEN x * 1000 END` never overflows on the other rows.
