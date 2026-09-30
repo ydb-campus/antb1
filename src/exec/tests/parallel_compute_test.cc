@@ -63,7 +63,7 @@ std::vector<Batch> Batches(std::size_t count, const std::vector<std::size_t>& ov
     std::vector<std::optional<int64_t>> values;
     std::vector<std::optional<bool>> selected;
     for (int64_t i = 0; i < rows; ++i) {
-      values.emplace_back(static_cast<int64_t>(b) * rows + i);
+      values.emplace_back((static_cast<int64_t>(b) * rows) + i);
       selected.emplace_back(i % 2 == 0);
     }
     values[3] = std::nullopt;

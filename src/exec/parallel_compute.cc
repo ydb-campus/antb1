@@ -70,7 +70,7 @@ arrow::Status ParallelComputeOperator::Open(ExecContext& ctx) {
   return input_->Open(ctx);
 }
 
-arrow::Status ParallelComputeOperator::Submit(Entry& entry) {
+arrow::Result<arrow::Future<>> ParallelComputeOperator::Submit(Entry& entry) {
   // The task holds the shared state and a copy of the input's references only until it has run.
   ARROW_ASSIGN_OR_RAISE(arrow::Future<> done,
                         executor_->Submit([shared = shared_, id = entry.id, batch = entry.input,
@@ -78,9 +78,9 @@ arrow::Status ParallelComputeOperator::Submit(Entry& entry) {
                           shared->ComputeIntoSlot(id, std::move(batch), pool);
                           return arrow::Status::OK();
                         }));
-  entry.done = std::move(done);
+  entry.done = done;
   ++in_flight_;
-  return arrow::Status::OK();
+  return done;
 }
 
 arrow::Status ParallelComputeOperator::Fill() {
@@ -95,7 +95,7 @@ arrow::Status ParallelComputeOperator::Fill() {
       return arrow::Status::OK();
     }
     if (!entry.done.has_value()) {
-      ARROW_RETURN_NOT_OK(Submit(entry));
+      ARROW_RETURN_NOT_OK(Submit(entry).status());
     }
   }
   while (!input_done_ && room()) {
@@ -110,14 +110,14 @@ arrow::Status ParallelComputeOperator::Fill() {
       break;
     }
     entries_.push_back(Entry{.id = next_id_++, .input = *std::move(in), .done = {}});
-    ARROW_RETURN_NOT_OK(Submit(entries_.back()));
+    ARROW_RETURN_NOT_OK(Submit(entries_.back()).status());
   }
   return arrow::Status::OK();
 }
 
 arrow::Result<Batch> ParallelComputeOperator::Next() {
   if (executor_ == nullptr) {
-    ARROW_ASSIGN_OR_RAISE(const Batch in, input_->Next());
+    ARROW_ASSIGN_OR_RAISE(Batch in, input_->Next());
     if (in.end()) {
       return in;
     }
@@ -129,10 +129,13 @@ arrow::Result<Batch> ParallelComputeOperator::Next() {
     return Batch{};
   }
   Entry& front = entries_.front();
-  if (!front.done.has_value()) {
-    ARROW_RETURN_NOT_OK(Submit(front));
+  arrow::Future<> done;
+  if (front.done.has_value()) {
+    done = *front.done;
+  } else {
+    ARROW_ASSIGN_OR_RAISE(done, Submit(front));
   }
-  front.done->Wait();
+  done.Wait();
   --in_flight_;
   front.done.reset();
   arrow::Result<Batch> result = shared_->TakeSlot(front.id);

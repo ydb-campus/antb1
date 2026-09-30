@@ -89,7 +89,8 @@ class ParallelComputeOperator final : public Operator {
     std::optional<arrow::Future<>> done;  // empty: not submitted
   };
 
-  arrow::Status Submit(Entry& entry);
+  // Starts computing `entry` on the executor; its future completes once its result is in a slot.
+  arrow::Result<arrow::Future<>> Submit(Entry& entry);
   // Submits the entries not in flight and reads the input ahead, while the window allows.
   arrow::Status Fill();
   // Waits for the batches in flight and releases their results; the entries stay, unsubmitted.
