@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790805268505,
+  "lastUpdate": 1790811148311,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -2916,6 +2916,78 @@ window.BENCHMARK_DATA = {
             "value": 14.385626693878322,
             "unit": "ms/iter",
             "extra": "iterations: 49\ncpu: 14.384285897959186 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "35247e98f430ec081d3de9fefdb247b3feee2e77",
+          "message": "perf(exec): top-N per partition of a grouped aggregation (#61)\n\n## Summary\n\n**What changes:** for `ORDER BY ... LIMIT` directly over a partitioned\n`GROUP BY` (`Limit` over `Sort` over `GroupAggregate`), each of the\naggregation's 64 partitions keeps only its first `limit + offset` rows\nin the top-N's order, in parallel, as it builds its rows. The top-N\nabove (`SortOperator`, unchanged) then reads at most 64 × `limit +\noffset` rows instead of every group.\n\n**Why:**\n- A scaling measurement (antb1 vs DuckDB at 1, 16 and 128 threads)\nshowed Q32 only 1.35× slower than DuckDB on one thread but 3.2× on 128.\nantb1 kept about 33 threads busy on average, DuckDB 73.\n- `explain --analyze` showed why: a serial top-N over all 100 M groups\n(0.87 s), fed by building 100 M output rows to keep 10.\n\n**Same result, ties included:**\n- A row in the top `k` of all groups, stably sorted with partitions in\norder, has fewer than `k` rows before it in its own partition, so its\npartition keeps it.\n- Each partition's kept rows are stably sorted, and the partitions still\ncome in order. So the stable top-N above returns the same rows in the\nsame order.\n- `LIMIT 0` is excluded, and `keep` saturates at INT64_MAX. A partition\nwith no more than `keep` rows passes them unchanged, since the stable\nsort above gives the same order.\n\n**Where it applies:**\n- **Only `PartGroupAggregateOperator`.** The two-level COUNT(DISTINCT)\naggregation and the serial `GroupAggregateOperator` are unchanged, as\nare plans with HAVING, a Compute or a Project between the Sort and the\naggregation.\n- **Planner:** it passes a `PartitionTopN` (sort keys, keep) through a\nnew `Build` parameter.\n- **The per-partition step** is `KeepFirstRows`: a `SortBuffer` with\nthat keep, its containers reserved on the budget as `PartTopNOperator`\ndoes.\n\n`explain --analyze` shows `top-N per partition keep=N` on the\naggregation. ADR 0011 and docs/architecture.md are amended.\n\n## Performance: full data, 128 threads\n\n**Paired A/B against main (#60):** a process per query, each binary from\n3 path lengths, best of 3 tries per path, median of the 3.\n\n| | main | this PR | speedup |\n| --- | ---: | ---: | ---: |\n| **Q32** | 2.439 | 1.611 | **1.51×** |\n| Q15 | 0.492 | 0.353 | 1.39× |\n| Q18 | 1.823 | 1.333 | 1.37× |\n| Q16 | 0.966 | 0.768 | 1.26× |\n| Q31 | 0.765 | 0.652 | 1.17× |\n| Q12, Q14, Q30, Q33, Q34 | | | 1.08-1.09× |\n| **Total (43 queries)** | **24.23** | **21.90** | **1.106×** |\n\nNo query is slower by more than 4%.\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [x] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full          # lint, ci, asan, tidy, coverage, fuzz-smoke, ci-gcc\ncheck-full exit 0; 100% tests passed out of 1400; Coverage gate: PASS (exec 96.63% lines, 86.28% branches)\n$ pixi run tsan\n100% tests passed out of 1400\n$ ANTB1_DIFF_COUNT=20000 pixi run diff-random\nDIFF: PASS seed=3914648504 queries=20000 failed=0 unsupported=0\n$ pixi run test-data\n100% tests passed out of 6\n```\n\n**Tests:**\n- **`PartOperatorsTest.GroupedTopNIsTheTopNOfAllGroups`:** the planned\ntop-N equals rows `[offset, offset + limit)` of the same GROUP BY sorted\nwithout a limit, on 1 and 4 threads.\n- **Data:** 1500 groups in 12 parts, so about 23 per partition, with a\nNULL group.\n- **Orders:** COUNT ascending (every group but NULL ties, so the first\nrows all come from the first partition), COUNT descending, two keys, the\ngroup key ASC NULLS FIRST, and DESC.\n  - **Limit/offset pairs:** up to an offset past all groups.\n- **Mutation-checked:** keeping one row fewer per partition fails it. My\nfirst version of the test passed that mutation, and the data was changed\nuntil it failed.\n- **`PartOperatorsTest.KeepFirstRowsIsAStableTopOfThePartition`:** the\nstable order of ties, the pass-through of small partitions, and out of\nmemory at three budgets, each failing inside the helper with nothing\nleft allocated.\n- **`tests/slt/cases/orderby/group_top_n.slt`**, expectations from\nDuckDB: GROUP BY ... ORDER BY ... LIMIT/OFFSET on parallel parts, with\nNULLs, two keys, and an offset.\n- **Updated expectations:** `ProfileTest` (the aggregation's detail) and\nthe `cli.explain_analyze` regex (the aggregation now emits 64 × keep\nrows).\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer (none changed)\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Claude Code:\n  - measured the scaling against DuckDB and profiled Q32;\n  - wrote the change, its tests and the doc amendments;\n  - ran the gates and the A/B.\n\nA read-only reviewer agent confirmed the correctness argument. It found\nthree issues, all fixed:\n- a test whose out-of-memory check never reached the new code, now a\ndirect test of `KeepFirstRows`;\n  - unreserved sort-buffer containers;\n  - a needless sort of partitions with at most `keep` rows.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-10-01T02:29:59+03:00",
+          "tree_id": "758e38f0161d2de339f0889343b34fcb3c41932e",
+          "url": "https://github.com/ydb-campus/antb1/commit/35247e98f430ec081d3de9fefdb247b3feee2e77"
+        },
+        "date": 1790811147840,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 3986.8437645008394,
+            "unit": "ns/iter",
+            "extra": "iterations: 176714\ncpu: 3985.707340674763 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 94524.99986002284,
+            "unit": "ns/iter",
+            "extra": "iterations: 7144\ncpu: 94487.68868980961 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 124654.69642539576,
+            "unit": "ns/iter",
+            "extra": "iterations: 5623\ncpu: 124574.10368130899 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 486637.095006931,
+            "unit": "ns/iter",
+            "extra": "iterations: 1442\ncpu: 486332.8016643549 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 458318.69759895554,
+            "unit": "ns/iter",
+            "extra": "iterations: 1541\ncpu: 458246.19013627485 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2242000.9807073805,
+            "unit": "ns/iter",
+            "extra": "iterations: 311\ncpu: 2241725.286173634 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 201.79792499999868,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 201.7700523333333 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 15.39998104347849,
+            "unit": "ms/iter",
+            "extra": "iterations: 46\ncpu: 15.397688000000015 ms\nthreads: 1"
           }
         ]
       }
