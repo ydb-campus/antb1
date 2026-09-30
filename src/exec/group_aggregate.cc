@@ -77,7 +77,8 @@ arrow::Result<Batch> GroupAggregateOperator::Next() {
     }
     done_ = true;
   }
-  // One batch per chunk of new groups: its keys as first seen, the aggregates of those groups.
+  // Chunks of new groups, joined (GroupTable::NextChunk): their keys as first seen, the aggregates
+  // of those groups.
   ARROW_ASSIGN_OR_RAISE(auto chunk, table_->NextChunk(schema_));
   if (chunk == nullptr) {
     table_.reset();  // gives the memory back

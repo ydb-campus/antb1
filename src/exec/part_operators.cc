@@ -253,6 +253,28 @@ arrow::Status PartAggregateOperator::Close() {
   return arrow::Status::OK();
 }
 
+namespace {
+
+// Whether a part's rows may go straight to the partitions (unaggregated) when its own table does
+// not reduce them: with keys, and without a DOUBLE SUM or AVG, whose rounding follows the parts
+// (docs/adr/0013-parallel-execution.md), or a HUGEINT one.
+bool MayRouteRows(const std::vector<plan::BoundColumn>& keys,
+                  const std::vector<plan::AggregateCall>& calls) {
+  return !keys.empty() && std::ranges::none_of(calls, [](const plan::AggregateCall& call) {
+    // HUGEINT sums check for overflow at every addition, so the grouping of the additions decides
+    // whether a query fails.
+    return (call.kind == plan::AggKind::kSum || call.kind == plan::AggKind::kAvg) &&
+           call.arg.has_value() &&
+           (call.arg->type == plan::LogicalType::kDouble ||
+            call.arg->type == plan::LogicalType::kHugeInt);
+  });
+}
+
+// The rows a part aggregates on its own before it decides whether to route the rest.
+constexpr int64_t kRouteDecisionRows = 4096;
+
+}  // namespace
+
 // ---- PartGroupAggregateOperator ----
 
 PartGroupAggregateOperator::PartGroupAggregateOperator(PartPipeline pipeline, int64_t num_parts,
@@ -279,20 +301,54 @@ arrow::Status PartGroupAggregateOperator::Open(ExecContext& ctx) {
   merged_ = false;
   opened_ = true;
   auto task = [pipeline = pipeline_, part_ctx = PartContext(ctx), keys = keys_,
-               aggregates = aggregates_, width = input_width_, profile = profile()](
+               aggregates = aggregates_, width = input_width_, profile = profile(),
+               may_route = MayRouteRows(keys_, aggregates_)](
                   int64_t part, const std::atomic<bool>& stop) -> arrow::Result<PartTable> {
     const ProfileTimer part_time(profile, "part_time");
+    auto groups = std::make_shared<PartGroups>();
     ARROW_ASSIGN_OR_RAISE(
-        std::shared_ptr<GroupTable> table,
-        GroupTable::Make(keys, aggregates, width, part_ctx.pool, part_ctx.budget));
+        groups->table, GroupTable::Make(keys, aggregates, width, part_ctx.pool, part_ctx.budget));
+    GroupTable& table = *groups->table;
+    // After its first kRouteDecisionRows rows (or batch), a part whose groups are more than 3/4 of
+    // its rows stops aggregating on its own: its other rows go straight to the partitions.
+    // The decision waits for enough rows (a selective filter can leave a batch a few rows, which
+    // never reduce), and is made once, from the part's data alone.
+    const int64_t decide_after = std::min<int64_t>(kRouteDecisionRows, part_ctx.batch_size);
+    bool decided = !may_route;
+    int64_t consumed = 0;
+    bool route = false;
+    int64_t routed = 0;
     ARROW_RETURN_NOT_OK(
         RunPart(*pipeline, part, part_ctx, stop, [&](const Batch& batch) -> arrow::Result<bool> {
           ARROW_ASSIGN_OR_RAISE(const auto rows, Materialize(batch, part_ctx.pool));
-          ARROW_RETURN_NOT_OK(table->Consume(*rows));
+          if (route) {
+            // Routed rows are Arrow buffers of the query's pool: the budget counts them.
+            ARROW_ASSIGN_OR_RAISE(auto split, table.RouteRows(*rows));
+            for (std::size_t p = 0; p < split.size(); ++p) {
+              if (split[p]->num_rows() > 0) {
+                groups->rows[p].push_back(std::move(split[p]));
+              }
+            }
+            routed += rows->num_rows();
+            return true;
+          }
+          ARROW_RETURN_NOT_OK(table.Consume(*rows));
+          consumed += rows->num_rows();
+          if (!decided && consumed >= decide_after) {
+            decided = true;
+            if (int64_t{table.num_groups()} * 4 > consumed * 3) {
+              route = true;
+              groups->rows.resize(GroupTable::kPartitions);
+            }
+          }
           return true;
         }));
-    ARROW_RETURN_NOT_OK(table->Partition());  // on the worker, not on the merging thread
-    return table;
+    ARROW_RETURN_NOT_OK(table.Partition());  // on the worker, not on the merging thread
+    if (profile != nullptr && routed > 0) {
+      profile->Add("raw_parts", MetricUnit::kCount, 1);
+      profile->Add("raw_rows", MetricUnit::kCount, routed);
+    }
+    return groups;
   };
   scheduler_ = std::make_unique<PartScheduler<PartTable>>(num_parts_, std::move(task), ctx.executor,
                                                           Window(ctx), ctx.budget);
@@ -318,7 +374,7 @@ arrow::Status PartGroupAggregateOperator::Merge() {
       status = part.status();
       break;
     }
-    const std::size_t partitions = (*part)->num_partitions();
+    const std::size_t partitions = (*part)->table->num_partitions();
     if (lanes == nullptr) {
       tables_.reserve(partitions);
       for (std::size_t p = 0; p < partitions; ++p) {
@@ -329,8 +385,14 @@ arrow::Status PartGroupAggregateOperator::Merge() {
       lanes = std::make_unique<PartitionLanes>(partitions, executor_, window_, budget_);
     }
     ANTB1_CHECK(tables_.size() == partitions);
-    status = lanes->Add(index, [this, table = *std::move(part)](std::size_t p) {
-      return tables_[p]->MergePartition(*table, p);
+    status = lanes->Add(index, [this, groups = *std::move(part)](std::size_t p) -> arrow::Status {
+      ARROW_RETURN_NOT_OK(tables_[p]->MergePartition(*groups->table, p));
+      if (p < groups->rows.size()) {  // the part's other rows, after its first batch's groups
+        for (const auto& rows : groups->rows[p]) {
+          ARROW_RETURN_NOT_OK(tables_[p]->Consume(*rows));
+        }
+      }
+      return arrow::Status::OK();
     });
     if (!status.ok()) {
       break;

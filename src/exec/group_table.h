@@ -42,6 +42,8 @@ class GroupTable {
  public:
   // The most new groups a Merge adds as one chunk (one output batch).
   static constexpr std::size_t kMaxMergeChunk = std::size_t{64} * 1024;
+  // The most key bytes NextChunk joins from several chunks into one batch.
+  static constexpr int64_t kMaxJoinedKeyBytes = int64_t{16} * 1024 * 1024;
   // The partitions of a partitioned merge: a constant, never the number of threads, so that the
   // result is the same for any number of threads.
   static constexpr std::size_t kPartitions = 64;
@@ -73,6 +75,11 @@ class GroupTable {
   // docs/adr/0014-two-level-aggregation.md). A pure function of each group's keys, so every part
   // puts a group in the same partition.
   arrow::Status Partition(std::size_t prefix, std::span<const std::uint64_t> heavy);
+  // The rows of `rows` (a batch of this table's input) split as Partition splits their groups:
+  // per partition (kPartitions), the rows whose keys' group Partition() puts there, in input order.
+  // For a table with keys; DOUBLE keys are normalized for the hash, as the grouper does.
+  arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> RouteRows(
+      const arrow::RecordBatch& rows) const;
   // The hash (KeyHashes) of each group's first `prefix` keys, in group order (with keys only).
   [[nodiscard]] arrow::Result<std::vector<std::uint64_t>> PrefixHashes(std::size_t prefix) const;
   // Each group's normalized keys, in group order (with keys only).
@@ -89,9 +96,10 @@ class GroupTable {
   arrow::Status MergePartition(const GroupTable& part, std::size_t partition);
 
   [[nodiscard]] std::uint32_t num_groups() const { return num_groups_; }
-  // The next chunk of groups as one batch (the keys as first seen, then one column per call, in
-  // `schema`), or nullptr after the last. Moves the keys out: call it after the last Consume or
-  // Merge.
+  // The next groups as one batch (the keys as first seen, then one column per call, in `schema`),
+  // or nullptr after the last: a chunk of new groups, joined with the chunks after it up to
+  // kMaxMergeChunk groups and kMaxJoinedKeyBytes of keys. Moves the keys out: call it after the
+  // last Consume or Merge.
   arrow::Result<std::shared_ptr<arrow::RecordBatch>> NextChunk(
       const std::shared_ptr<arrow::Schema>& schema);
 
