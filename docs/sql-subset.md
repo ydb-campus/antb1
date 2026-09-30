@@ -262,6 +262,11 @@ its offset). A rule optimizer then rewrites it:
 
 - `Limit` moves below `Project`: a `Project` keeps every row, so the `Limit` copies only the rows it keeps and ends
   up right above a `Sort`, which the executor runs as a top-N (it keeps only `limit + offset` rows while it reads);
+- a `GROUP BY` key computed only from other keys, none of them DOUBLE (`GROUP BY x, x + 1`), is dropped from the
+  `GroupAggregate` and computed once per group in a `Compute` above it, with a `Project` restoring the output: the
+  same groups with fewer keys to hash ([ADR 0018](adr/0018-dependent-group-keys.md)). Not under a `LIMIT` without
+  `ORDER BY`, which reads only some groups: every group's keys are computed, so an overflow in any of them still
+  fails the query;
 - projection pruning: `Scan` reads only the columns that the nodes above it use (none for a bare `COUNT(*)`);
 - `COUNT(*)` alone without `WHERE`, over a table whose row count is known without scanning (every Parquet table),
   becomes `RowCount`, answered from the footers.

@@ -1,0 +1,8 @@
+Output: RegionID:INTEGER (RegionID + 10):INTEGER n:BIGINT
+Project RegionID, "(RegionID + 10)", n
+  Limit 5
+    Sort n DESC NULLS LAST
+      Project RegionID, "(RegionID + 10)", "COUNT(*)"
+        Compute (RegionID + 10)
+          GroupAggregate keys=[RegionID] COUNT(*)
+            Scan table=t source=parquet(files=1, rows=10000) columns=[RegionID]

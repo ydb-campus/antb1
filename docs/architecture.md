@@ -90,8 +90,10 @@ steps (only step 7 uses more than one thread):
    and becomes a `Filter` above it. The result is a `plan::LogicalPlan`: a tree of immutable
    nodes in a `std::variant` (`Scan`, `Filter`, `Compute`, `Project`, `Aggregate`, `GroupAggregate`, `Sort`, `Limit`,
    `RowCount`) plus the output columns.
-5. Optimize (`plan::Optimize`): `COUNT(*)` without `WHERE` to `RowCount`, `Limit` below `Project`, and projection
-   pruning (a `Scan` reads only the fields used above it).
+5. Optimize (`plan::Optimize`): `COUNT(*)` without `WHERE` to `RowCount`; a `GROUP BY` key computed only from other
+   (not DOUBLE) keys is dropped from the `GroupAggregate` and computed once per group above it, unless a `Limit`
+   without a `Sort` reads it (ADR 0018);
+   `Limit` below `Project`; and projection pruning (a `Scan` reads only the fields used above it).
 6. Physical plan (`exec::BuildPhysicalPlan`): an exhaustive `std::visit` turns each logical node into an operator
    over the operator of its input; a `Limit` over a `Sort` becomes one top-N `SortOperator`. A global aggregation
    whose calls are all `COUNT(DISTINCT x)` of one column over a part pipeline becomes a `GroupAggregate` by `x`
