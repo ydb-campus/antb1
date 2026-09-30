@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <format>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -38,7 +39,7 @@ using OperatorResult = arrow::Result<std::unique_ptr<Operator>>;
 // operators over it; with one, the node is inside the pipeline of that part. With a profile node
 // (`slot`), the operator is profiled into it (profile.h) and its inputs into its children.
 OperatorResult Build(const plan::LogicalNodePtr& node, std::optional<int64_t> part = std::nullopt,
-                     ProfileNode* slot = nullptr);
+                     ProfileNode* slot = nullptr, const LateScan* late = nullptr);
 // The operator profiled into `slot` (with the node's EXPLAIN line when it has no detail yet); the
 // operator itself without a slot.
 OperatorResult Profiled(OperatorResult op, const plan::LogicalNodePtr& node, ProfileNode* slot);
@@ -96,6 +97,7 @@ std::vector<plan::Predicate> FiltersOnScan(const plan::LogicalNodePtr& node) {
 struct Parts {
   PartPipeline pipeline;
   int64_t count = 0;
+  std::shared_ptr<const std::vector<int64_t>> kept;  // the table part of each part number
   // The first parts that hold kTwoLevelSampleRows rows by the table's part_rows (all of them if
   // they hold fewer): chosen from metadata, so never by the number of threads.
   int64_t sample = 0;
@@ -103,8 +105,11 @@ struct Parts {
 
 // With a profile node of the operator that consumes the parts (`consumer`), the pipeline is
 // profiled into its first child, once per part, and the parts read and skipped are counted.
+// With `late` (the late columns of the pipeline's scan and its row-id column), every part's scan
+// is narrow (LateScan), numbered by the part's number.
 Parts PartsOf(const plan::LogicalNodePtr& node, const plan::ScanNode& scan,
-              ProfileNode* consumer = nullptr) {
+              ProfileNode* consumer = nullptr,
+              const std::shared_ptr<const LateScan>& late = nullptr) {
   auto kept = std::make_shared<const std::vector<int64_t>>(
       KeptParts(*scan.table, scan.fields, FiltersOnScan(node)));
   const auto count = static_cast<int64_t>(kept->size());
@@ -121,13 +126,19 @@ Parts PartsOf(const plan::LogicalNodePtr& node, const plan::ScanNode& scan,
     ++sample;
   }
   return Parts{.pipeline =
-                   [node, kept, pipeline](int64_t i) {
+                   [node, kept, pipeline, late](int64_t i) {
                      // Past the kept parts only for the schema sample, which is never opened.
                      const int64_t part =
                          std::cmp_less(i, kept->size()) ? (*kept)[static_cast<std::size_t>(i)] : i;
-                     return Build(node, part, pipeline);
+                     if (late == nullptr) {
+                       return Build(node, part, pipeline);
+                     }
+                     LateScan numbered = *late;
+                     numbered.ordinal = i;
+                     return Build(node, part, pipeline, &numbered);
                    },
                .count = count,
+               .kept = kept,
                .sample = sample};
 }
 
@@ -175,10 +186,70 @@ std::vector<plan::AggregateCall> CountsOfKey(const std::vector<plan::AggregateCa
   return counts;
 }
 
+// The most rows a late top-N fetches the late columns of (limit + offset).
+constexpr int64_t kMaxLateRows = int64_t{64} * 1024;
+
+// The late columns of a part pipeline under a top-N (ADR 0016): the scan's columns that no Filter,
+// no Compute expression and no sort key reads, when the pipeline is Filters and Computes over the
+// scan (they pass the scan's columns through at their positions); the first of them carries the row
+// ids. std::nullopt when no column is late or the pipeline has another node.
+std::optional<LateScan> LateSplit(const plan::LogicalNodePtr& top, const plan::ScanNode& scan,
+                                  const std::vector<plan::SortKey>& keys) {
+  const std::size_t width = scan.fields.size();
+  std::vector<bool> early(width, false);
+  const auto read = [&](int column) {
+    if (column >= 0 && std::cmp_less(column, width)) {
+      early[static_cast<std::size_t>(column)] = true;
+    }
+  };
+  for (const plan::SortKey& key : keys) {
+    read(key.column.index);
+  }
+  for (const plan::LogicalNode* n = top.get(); n != nullptr;) {
+    if (std::holds_alternative<plan::ScanNode>(*n)) {
+      break;
+    }
+    if (const auto* filter = std::get_if<plan::FilterNode>(n)) {
+      for (const plan::Predicate& predicate : filter->predicates) {
+        if (predicate.column.has_value()) {
+          read(predicate.column->index);
+        }
+        if (predicate.other.has_value()) {
+          read(predicate.other->index);
+        }
+      }
+      n = filter->input.get();
+    } else if (const auto* compute = std::get_if<plan::ComputeNode>(n)) {
+      for (const plan::ExprPtr& expr : compute->exprs) {
+        std::vector<int> columns;
+        plan::CollectColumns(*expr, columns);
+        for (const int column : columns) {
+          read(column);
+        }
+      }
+      n = compute->input.get();
+    } else {
+      return std::nullopt;  // a Project (or other node) renumbers the columns
+    }
+  }
+  LateScan late{.late = std::vector<bool>(width, false), .row_id = -1, .ordinal = 0};
+  for (std::size_t i = 0; i < width; ++i) {
+    late.late[i] = !early[i];
+    if (late.late[i] && late.row_id < 0) {
+      late.row_id = static_cast<int>(i);
+    }
+  }
+  if (late.row_id < 0) {
+    return std::nullopt;
+  }
+  return late;
+}
+
 // One overload per logical node type: a node type without one fails to compile.
 struct Builder {
-  std::optional<int64_t> part;  // inside the pipeline of this part
-  ProfileNode* slot = nullptr;  // the profile node of the operator built (nullptr: no profile)
+  std::optional<int64_t> part;     // inside the pipeline of this part
+  ProfileNode* slot = nullptr;     // the profile node of the operator built (nullptr: no profile)
+  const LateScan* late = nullptr;  // the narrow scan of the part pipeline (late materialization)
 
   // The profile node of the operator's input (per part as the operator is). A node's name, detail
   // and per-part flag are written by the first build of its plan (at planning time, before the
@@ -207,16 +278,18 @@ struct Builder {
       return arrow::Status::Invalid("scan without a table");
     }
     Name("Scan");
-    return std::make_unique<TableScanOperator>(node.table, node.fields, part);
+    return std::make_unique<TableScanOperator>(
+        node.table, node.fields, part,
+        late == nullptr ? std::nullopt : std::optional<LateScan>(*late));
   }
   OperatorResult operator()(const plan::FilterNode& node) const {
     Name("Filter");
-    ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input, part, Input()));
+    ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input, part, Input(), late));
     return std::make_unique<FilterOperator>(std::move(input), node.predicates);
   }
   OperatorResult operator()(const plan::ComputeNode& node) const {
     Name("Compute");
-    ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input, part, Input()));
+    ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input, part, Input(), late));
     return std::make_unique<ComputeOperator>(std::move(input), node.exprs);
   }
   OperatorResult operator()(const plan::ProjectNode& node) const {
@@ -312,6 +385,36 @@ struct Builder {
         Name("PartTopN", detail);
         Parts parts = PartsOf(sort->input, *scan, slot);
         ARROW_ASSIGN_OR_RAISE(auto sample, parts.pipeline(0));
+        int64_t keep = 0;
+        if (__builtin_add_overflow(*node.limit, node.offset, &keep)) {
+          keep = std::numeric_limits<int64_t>::max();
+        }
+        // Late materialization (ADR 0016): the parts read only the columns the pipeline and the
+        // keys use, when at most half of the parts can own a row of the result.
+        if (auto split = LateSplit(sort->input, *scan, sort->keys);
+            split.has_value() && keep <= kMaxLateRows && keep <= parts.count / 2) {
+          const auto spec = std::make_shared<const LateScan>(std::move(*split));
+          Parts narrow = PartsOf(sort->input, *scan, slot, spec);
+          ARROW_ASSIGN_OR_RAISE(auto narrow_sample, narrow.pipeline(0));
+          LateColumns columns{.table = scan->table,
+                              .slots = {},
+                              .fields = {},
+                              .row_id = spec->row_id,
+                              .parts = narrow.kept,
+                              .narrow_schema = narrow_sample->output_schema()};
+          for (std::size_t i = 0; i < spec->late.size(); ++i) {
+            if (spec->late[i]) {
+              columns.slots.push_back(static_cast<int>(i));
+              columns.fields.push_back(scan->fields[i]);
+            }
+          }
+          if (slot != nullptr) {
+            slot->set_detail(std::format("{} late={} columns", detail, columns.slots.size()));
+          }
+          return std::make_unique<PartTopNOperator>(std::move(narrow.pipeline), narrow.count,
+                                                    sample->output_schema(), sort->keys,
+                                                    *node.limit, node.offset, std::move(columns));
+        }
         return std::make_unique<PartTopNOperator>(std::move(parts.pipeline), parts.count,
                                                   sample->output_schema(), sort->keys, *node.limit,
                                                   node.offset);
@@ -360,7 +463,7 @@ OperatorResult Profiled(OperatorResult op, const plan::LogicalNodePtr& node, Pro
 }
 
 OperatorResult Build(const plan::LogicalNodePtr& node, std::optional<int64_t> part,
-                     ProfileNode* slot) {
+                     ProfileNode* slot, const LateScan* late) {
   if (node == nullptr) {
     return arrow::Status::Invalid("logical plan node without its input");
   }
@@ -369,7 +472,7 @@ OperatorResult Build(const plan::LogicalNodePtr& node, std::optional<int64_t> pa
       return Profiled(BuildPartUnion(node, *scan, std::nullopt, slot), node, slot);
     }
   }
-  return Profiled(std::visit(Builder{.part = part, .slot = slot}, *node), node, slot);
+  return Profiled(std::visit(Builder{.part = part, .slot = slot, .late = late}, *node), node, slot);
 }
 
 }  // namespace

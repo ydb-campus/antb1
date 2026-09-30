@@ -38,6 +38,8 @@ Accepted (with the maintainer-approved plan for GROUP BY, ORDER BY and COUNT(DIS
 
 ## Consequences
 
+- Follow-up: a top-N over table parts reads the columns only the result needs for the result's rows alone
+  ([ADR 0016](0016-late-materialization.md)).
 - `ORDER BY` on columns, aliases and aggregates, `ASC`/`DESC`, `NULLS FIRST`/`LAST`, `LIMIT` and `OFFSET` answer like
   DuckDB up to the order of tied rows.
 - The test harness accepts any order of tied rows: it runs an augmented query on DuckDB (the `ORDER BY` keys

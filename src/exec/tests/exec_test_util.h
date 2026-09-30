@@ -135,6 +135,8 @@ class MemoryTable final : public plan::Table {
   }
   // ScanPart(part) fails with an IOError naming the part.
   void FailPart(int64_t part) { failing_part_ = part; }
+  // ScanPart of `field` (with any other fields) fails with an IOError naming the field.
+  void FailField(int field) { failing_field_ = field; }
   // With `split`: exact statistics of the BIGINT columns (plan::Table::part_stats), unless turned
   // off here.
   void set_stats(bool stats) { stats_ = stats; }
@@ -182,6 +184,9 @@ class MemoryTable final : public plan::Table {
     if (failing_part_ == part) {
       return arrow::Status::IOError("part ", part, " is broken");
     }
+    if (failing_field_.has_value() && std::ranges::find(fields, *failing_field_) != fields.end()) {
+      return arrow::Status::IOError("field ", *failing_field_, " is broken");
+    }
     return Read({Batch(part)}, fields, batch_size);
   }
 
@@ -220,6 +225,7 @@ class MemoryTable final : public plan::Table {
   arrow::RecordBatchVector batches_;
   bool split_ = false;
   std::optional<int64_t> failing_part_;
+  std::optional<int> failing_field_;
   bool stats_ = true;
   mutable std::atomic<int> scans_ = 0;
   mutable std::mutex mutex_;

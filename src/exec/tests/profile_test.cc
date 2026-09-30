@@ -207,7 +207,8 @@ TEST_F(ProfileTest, EveryOperatorIsNamed) {
     EXPECT_EQ(Counts(*top_profile),
               "PartTopN rows=2 runs=1 parts=20 skipped=0\n"
               "  Scan rows=140 runs=20 per_part\n");
-    EXPECT_EQ(top_profile->detail(), "Sort x DESC NULLS LAST Limit 2");
+    EXPECT_EQ(top_profile->detail(), "Sort x DESC NULLS LAST Limit 2 late=1 columns");
+    EXPECT_EQ(MetricOf(*top_profile, "late_columns"), 1);
     EXPECT_TRUE(MetricOf(*top_profile, "merge").has_value());
 
     const auto two_level_profile = Profile(two_level, executor);
