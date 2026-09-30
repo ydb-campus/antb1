@@ -31,7 +31,7 @@ agent. Maps: [architecture](docs/architecture.md) · [SQL subset](docs/sql-subse
 
 | Goal | Command |
 | --- | --- |
-| Configure / incremental Debug build (`build/<preset>`, preset `dev`); run the dev CLI | `pixi run configure` · `pixi run build` · `pixi run antb1 query -c "SELECT COUNT(*) FROM t" --table t=/data/t.parquet` |
+| Configure / incremental Debug build (`build/<preset>`, preset `dev`); run the dev CLI; profile one query (per-operator rows, times, part waits; docs/sql-subset.md) | `pixi run configure` · `pixi run build` · `pixi run antb1 query -c "SELECT COUNT(*) FROM t" --table t=/data/t.parquet` · `pixi run antb1 explain --analyze -f q.sql --table t=/data/t.parquet` |
 | Hermetic tests (allowlisted ctest args) | `pixi run test` · `pixi run test -R '^sql\.'` · `pixi run test -L slt` · `pixi run test --rerun-failed` |
 | Format everything in place; lint and repo drift checks (read-only; CI `lint`) | `pixi run fmt` · `pixi run lint` |
 | Required before every PR: `lint` + `ci` (Clang Debug `-Werror` + tests) | `pixi run check` |
