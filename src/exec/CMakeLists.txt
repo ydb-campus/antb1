@@ -9,6 +9,7 @@ antb1_add_module(
     table_scan.cc
     filter.cc
     compute.cc
+    parallel_compute.cc
     like.cc
     project.cc
     scalar_aggregate.cc
@@ -39,6 +40,7 @@ if(ANTB1_BUILD_TESTS)
       tests/aggregate_state_test.cc
       tests/operators_test.cc
       tests/compute_test.cc
+      tests/parallel_compute_test.cc
       tests/row_count_test.cc
       tests/physical_planner_test.cc
       tests/grouped_aggregate_test.cc
