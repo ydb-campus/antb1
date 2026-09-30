@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790799016044,
+  "lastUpdate": 1790805268505,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -2844,6 +2844,78 @@ window.BENCHMARK_DATA = {
             "value": 14.449292687499948,
             "unit": "ms/iter",
             "extra": "iterations: 48\ncpu: 14.446731125000001 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "cc887a06a76f063da07f63a196fcc347887db011",
+          "message": "perf(exec): compute batches in parallel over a whole input (#60)\n\n## Summary\n\n**What changes:** a `Compute` over a whole input (an aggregation or a\nsort) now computes its batches in parallel on the session's pool. It\nuses `ParallelComputeOperator` (private,\n`src/exec/parallel_compute.{h,cc}`), which the physical planner picks\nfor a Compute outside a part pipeline. Inside part pipelines the parts\nare already parallel, and `ComputeOperator` stays.\n\n**Why:** since #59, Q35 groups by one key and computes the three dropped\nkeys once per group. That is a Compute over 9.8 M groups, which ran\nserially and took about 0.3 s of the query's 0.68 s.\n\n**Semantics are the serial Compute's:**\n- **Order:** batches come back strictly in input order, so the output is\nidentical.\n- **Errors:** the first error in batch order is reported, after the\nbatches before it.\n- **An input failure** is held and returned after the batches read\nbefore it, including their errors.\n- **A batch read ahead but never returned** (a Limit above stopped)\nnever reports its error, just as the serial Compute never computes it.\n\n**Memory, following the part scheduler (#44):**\n- The window starts at `threads` batches. Every batch taken under\npressure halves it, and every other one widens it by one. Under\npressure, no batch starts while another is in flight.\n- A batch that runs out of memory on a worker is computed again alone on\nthe consumer thread. The batches in flight are dropped and computed\nagain when reached. Only a failure alone fails the query.\n- A task's `std::bad_alloc` becomes `OutOfMemory`, as in every other\nexecutor task.\n- Results go into slots that the consumer thread takes or clears, so no\nbuffer is freed on a worker after the consumer has moved on.\n\n`ComputeOperator` now shares `ComputedSchema` and `ComputeBatch` with\nthe new operator. ADR 0013's decision text (\"everything above the sink\nstays serial\") and docs/architecture.md (step 7 and the operator table)\nare amended.\n\n## Performance: full data, 128 threads\n\n**Paired A/B against main (#59):** a process per query, each binary from\n3 path lengths, best of 3 tries per path, median of the 3.\n\n| | main | this PR | speedup |\n| --- | ---: | ---: | ---: |\n| **Q35** | 0.681 | 0.381 | **1.79×** |\n| **Total (43 queries)** | **24.36** | **24.20** | 1.007× |\n\nNo other query moves by more than 4%; none of them has a large Compute\nabove an aggregation.\n\n**Q35 across the two PRs:** 0.85 s → 0.38 s. DuckDB takes 0.23 s and\nClickHouse 0.12 s.\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [x] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full          # lint, ci, asan, tidy, coverage, fuzz-smoke, ci-gcc\ncheck-full exit 0; 100% tests passed out of 1395; Coverage gate: PASS (exec 96.63% lines, 86.22% branches; parallel_compute.cc 95.92% lines)\n$ pixi run tsan\n100% tests passed out of 1395\n$ ANTB1_DIFF_COUNT=20000 pixi run diff-random\nDIFF: PASS seed=2196248912 queries=20000 failed=0 unsupported=0\n$ pixi run test-data\n100% tests passed out of 6\n```\n\nThe diff-random and test-data runs were on 044fac9. Only tidy fixes\nfollowed: Submit returns its future, one const, one pair of parentheses.\ncheck-full and tsan ran on the final commit.\n\n**Tests: `src/exec/tests/parallel_compute_test.cc`**\n- **Same batches in order,** without and with an executor.\n- **Errors:** the first failing batch in order, with later failing\nbatches never returned; and the input's failure after the batches before\nit and their errors.\n- **Early close with batches in flight,** then Open again.\n- **Memory:**\n- under pressure one batch at a time (never more than one read ahead),\nwith the same output;\n  - a tiny budget fails with OutOfMemory, and every byte comes back;\n- **deterministic retry:** a pool that fails every allocation off the\nconsumer thread makes every batch run out of memory on a worker, also at\nwindow 1 with nothing in flight. Each batch is computed again alone, the\noutput is the serial one, and the budget ends at 0. A retry that still\nfails, fails the query.\n- **The operator choice** (`physical_planner_test`):\nParallelComputeOperator over a sort, ComputeOperator over a scan (a part\npipeline).\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer (none changed)\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Claude Code wrote the operator, its tests and the doc\namendments, and ran the gates and the A/B. Two rounds of a read-only\nreviewer agent shaped it:\n  - **First round:**\n    - a P0: `bad_alloc` on a worker would abort the process;\n    - results freed on workers;\n    - no out-of-memory retry;\n    - missing memory and planner tests;\n    - the ADR text.\n- **Second round:** the retry condition checked the state at take time\ninstead of at run time, and the retry test was not deterministic.\n\n  All are fixed as described above.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-10-01T00:51:45+03:00",
+          "tree_id": "fd5751b0771b0a7686174f78efbab12f492ffd00",
+          "url": "https://github.com/ydb-campus/antb1/commit/cc887a06a76f063da07f63a196fcc347887db011"
+        },
+        "date": 1790805267412,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4067.2870860505986,
+            "unit": "ns/iter",
+            "extra": "iterations: 172666\ncpu: 4066.950928381963 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 85529.3693768064,
+            "unit": "ns/iter",
+            "extra": "iterations: 7269\ncpu: 85519.47833264549 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222150.2209523795,
+            "unit": "ns/iter",
+            "extra": "iterations: 3150\ncpu: 222139.05587301584 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 438548.73918496043,
+            "unit": "ns/iter",
+            "extra": "iterations: 1595\ncpu: 438511.237617555 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 350060.93167083425,
+            "unit": "ns/iter",
+            "extra": "iterations: 2005\ncpu: 349970.85586034873 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2131198.8553845994,
+            "unit": "ns/iter",
+            "extra": "iterations: 325\ncpu: 2130062.3999999994 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 204.18013033332727,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 204.11885899999996 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.385626693878322,
+            "unit": "ms/iter",
+            "extra": "iterations: 49\ncpu: 14.384285897959186 ms\nthreads: 1"
           }
         ]
       }
