@@ -86,6 +86,21 @@ class PartAggregateOperator final : public Operator {
   std::unique_ptr<PartScheduler<PartStates>> scheduler_;
 };
 
+// The top-N above a grouped aggregation (Limit over Sort directly over it): the sort keys, over the
+// aggregation's output, and the rows the top-N needs (limit + offset).
+struct PartitionTopN {
+  std::vector<plan::SortKey> keys;
+  int64_t keep = 0;
+};
+
+// The first `keep` rows of `rows` in `comparator`'s order (a stable sort: ties keep their order),
+// as one batch; `rows` unchanged when they hold at most `keep` rows (a stable sort above gives the
+// same order). The sort buffer's own containers are reserved on `budget` while it works; nothing
+// is left reserved or allocated when it fails.
+arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> KeepFirstRows(
+    std::vector<std::shared_ptr<arrow::RecordBatch>> rows, const RowComparator& comparator,
+    int64_t keep, arrow::MemoryPool* pool, MemoryBudget* budget);
+
 // Grouped aggregation over a part pipeline: every part is grouped into its own GroupTable on the
 // executor and split into partitions by the hash of its keys (GroupTable::Partition). The parts are
 // merged in part order into one table per partition, each partition in its own lane on the
@@ -93,13 +108,17 @@ class PartAggregateOperator final : public Operator {
 // built in parallel, as many partitions at a time as threads (one under memory pressure), and
 // emitted partition by partition, as GroupAggregateOperator emits them. The partitions are a
 // constant, so the result is the same for any number of threads. Output: as
-// GroupAggregateOperator.
+// GroupAggregateOperator. With a PartitionTopN (a top-N above it), each partition keeps only its
+// first `keep` rows in the top-N's order (a stable sort, SortBuffer) as it builds them, in
+// parallel: the top-N above then reads at most 64 * keep rows, and picks the rows and the order it
+// would have picked from all of them (ties stay in partition order, then in group order).
 class PartGroupAggregateOperator final : public Operator {
  public:
   PartGroupAggregateOperator(PartPipeline pipeline, int64_t num_parts, int input_width,
                              std::vector<plan::BoundColumn> keys,
                              std::vector<plan::AggregateCall> aggregates,
-                             std::shared_ptr<arrow::Schema> schema);
+                             std::shared_ptr<arrow::Schema> schema,
+                             std::optional<PartitionTopN> top_n = std::nullopt);
   ~PartGroupAggregateOperator() override;
 
   [[nodiscard]] const std::shared_ptr<arrow::Schema>& output_schema() const override {
@@ -124,6 +143,8 @@ class PartGroupAggregateOperator final : public Operator {
   std::vector<plan::BoundColumn> keys_;
   std::vector<plan::AggregateCall> aggregates_;
   std::shared_ptr<arrow::Schema> schema_;
+  std::optional<PartitionTopN> top_n_;
+  std::optional<RowComparator> comparator_;  // with top_n_: its order, over schema_
   arrow::MemoryPool* pool_ = arrow::default_memory_pool();
   MemoryBudget* budget_ = nullptr;
   arrow::internal::Executor* executor_ = nullptr;

@@ -915,6 +915,150 @@ TEST_F(PartOperatorsTest, TopNKeepsEachPartsFirstRows) {
   }
 }
 
+// ORDER BY ... LIMIT over a partitioned GROUP BY: each partition keeps only its first rows in the
+// top-N's order (PartitionTopN), and the result, ties in their order included, is the top-N of
+// every group: rows [offset, offset + limit) of the stably sorted groups, on any number of threads.
+TEST_F(PartOperatorsTest, GroupedTopNIsTheTopNOfAllGroups) {
+  const auto pool = Pool();
+  // Many groups per partition (so that a partition drops rows): 12 parts of 250 rows, x = 0..2999,
+  // y = x % 1500 (NULL where it is a multiple of 7), so 1 to 3 rows per group and many ties.
+  const auto table = [] {
+    const auto schema =
+        arrow::schema({arrow::field("x", arrow::int64()), arrow::field("d", arrow::float64()),
+                       arrow::field("y", arrow::int64())});
+    arrow::RecordBatchVector batches;
+    for (int64_t part = 0; part < 12; ++part) {
+      std::vector<std::optional<int64_t>> xs;
+      std::vector<std::optional<int64_t>> ys;
+      arrow::DoubleBuilder d;
+      for (int64_t i = 0; i < 250; ++i) {
+        const int64_t v = (part * 250) + i;
+        xs.emplace_back(v);
+        ys.emplace_back((v % 1500) % 7 == 0 ? std::nullopt : std::optional((v * 7) % 1500));
+        EXPECT_TRUE(d.Append(0.5).ok());
+      }
+      batches.push_back(
+          arrow::RecordBatch::Make(schema, 250, {Int64s(xs), d.Finish().ValueOrDie(), Int64s(ys)}));
+    }
+    return std::make_shared<MemoryTable>(schema, std::move(batches), /*split=*/true);
+  };
+  const auto x = Column(0, "x", LogicalType::kBigInt);
+  const auto y = Column(2, "y", LogicalType::kBigInt);
+  const auto grouped = [&](const std::shared_ptr<MemoryTable>& t) {
+    return Node(plan::GroupAggregateNode{
+        .input = Scan(t),
+        .keys = {y},
+        .aggregates = {{.kind = plan::AggKind::kCountStar, .arg = {}, .type = LogicalType::kBigInt},
+                       {.kind = plan::AggKind::kMin, .arg = x, .type = LogicalType::kBigInt}}});
+  };
+  // Over the aggregation's output: y 0, COUNT(*) 1, MIN(x) 2. COUNT(*) is 1 to 3 (the NULL group
+  // more): most groups tie on it.
+  const auto key = Column(0, "y", LogicalType::kBigInt);
+  const auto count = Column(1, "c", LogicalType::kBigInt);
+  const auto low = Column(2, "m", LogicalType::kBigInt);
+  // COUNT(*) ascending: every group but the NULL one ties, so the first rows all come from the
+  // first partition, which must keep all of them.
+  const std::vector<std::vector<plan::SortKey>> orders = {
+      {{.column = count}},
+      {{.column = count, .descending = true}},
+      {{.column = count}, {.column = low, .descending = true}},
+      {{.column = key, .nulls_first = true}},
+      {{.column = key, .descending = true}}};
+  for (const auto& order : orders) {
+    const auto sorted =
+        Run(PlanOf(Node(plan::SortNode{.input = grouped(table()), .keys = order}), 3), pool.get());
+    ASSERT_TRUE(sorted.ok()) << sorted.status().ToString();
+    for (const auto& [limit, offset] : std::vector<std::pair<int64_t, int64_t>>{
+             {1, 0}, {3, 2}, {10, 0}, {40, 30}, {50, 1300}, {10, 2000}}) {
+      const auto plan =
+          PlanOf(Node(plan::LimitNode{
+                     .input = Node(plan::SortNode{.input = grouped(table()), .keys = order}),
+                     .limit = limit,
+                     .offset = offset}),
+                 3);
+      const int64_t begin = std::min(offset, (*sorted)->num_rows());
+      const auto expected = (*sorted)->Slice(begin, limit);
+      for (arrow::internal::Executor* executor :
+           {static_cast<arrow::internal::Executor*>(nullptr),
+            static_cast<arrow::internal::Executor*>(pool.get())}) {
+        const auto result = Run(plan, executor);
+        ASSERT_TRUE(result.ok()) << result.status().ToString();
+        EXPECT_TRUE(SameRows(**result, *expected))
+            << order.size() << " keys, limit " << limit << " offset " << offset << "\n"
+            << (*result)->ToString() << "\nexpected\n"
+            << expected->ToString();
+      }
+    }
+  }
+  // Out of memory: the query fails and every byte comes back.
+  for (arrow::internal::Executor* executor :
+       {static_cast<arrow::internal::Executor*>(nullptr),
+        static_cast<arrow::internal::Executor*>(pool.get())}) {
+    MemoryBudget tiny(512);
+    auto op = BuildPhysicalPlan(
+        PlanOf(Node(plan::LimitNode{
+                   .input = Node(plan::SortNode{.input = grouped(table()), .keys = orders.front()}),
+                   .limit = 5}),
+               3));
+    ASSERT_TRUE(op.ok());
+    ExecContext ctx{.pool = &tiny,
+                    .batch_size = 3,
+                    .executor = executor,
+                    .threads = executor == nullptr ? 1 : kThreads,
+                    .budget = &tiny};
+    const auto oom = Drain(**op, ctx);
+    EXPECT_TRUE(oom.status().IsOutOfMemory()) << oom.status().ToString();
+    op->reset();
+    EXPECT_EQ(tiny.bytes_allocated(), 0);
+  }
+}
+
+// A partition's first rows: the stable top of its rows, or its rows unchanged when they are
+// few; out of memory it fails and leaves nothing behind.
+TEST_F(PartOperatorsTest, KeepFirstRowsIsAStableTopOfThePartition) {
+  const auto schema =
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("i", arrow::int64())});
+  // k = i % 4 over i = 0..999 in chunks of 100: many ties on k.
+  const auto chunks = [&] {
+    std::vector<std::shared_ptr<arrow::RecordBatch>> out;
+    for (int64_t c = 0; c < 10; ++c) {
+      std::vector<std::optional<int64_t>> k;
+      std::vector<std::optional<int64_t>> i;
+      for (int64_t r = 0; r < 100; ++r) {
+        k.emplace_back(((c * 100) + r) % 4);
+        i.emplace_back((c * 100) + r);
+      }
+      out.push_back(arrow::RecordBatch::Make(schema, 100, {Int64s(k), Int64s(i)}));
+    }
+    return out;
+  };
+  auto comparator = RowComparator::Make(
+      schema, {plan::SortKey{.column = Column(0, "k", LogicalType::kBigInt), .descending = true}});
+  ASSERT_TRUE(comparator.ok());
+  // The first 30 rows: k = 3, in their order (i = 3, 7, 11, ...).
+  auto top = KeepFirstRows(chunks(), *comparator, 30, arrow::default_memory_pool(), nullptr);
+  ASSERT_TRUE(top.ok()) << top.status().ToString();
+  ASSERT_EQ(top->size(), 1U);
+  ASSERT_EQ(top->front()->num_rows(), 30);
+  const auto& ids = static_cast<const arrow::Int64Array&>(*top->front()->column(1));
+  for (int64_t r = 0; r < 30; ++r) {
+    EXPECT_EQ(ids.Value(r), 3 + (4 * r));
+  }
+  // At most `keep` rows: unchanged.
+  const auto all = chunks();
+  auto unchanged = KeepFirstRows(all, *comparator, 1000, arrow::default_memory_pool(), nullptr);
+  ASSERT_TRUE(unchanged.ok());
+  ASSERT_EQ(unchanged->size(), all.size());
+  EXPECT_EQ(unchanged->front().get(), all.front().get());
+  // Out of memory (the sort buffer's containers on the budget, or the kept rows on the pool).
+  for (const int64_t limit : {int64_t{64}, int64_t{4096}, int64_t{20000}}) {
+    MemoryBudget budget(limit);
+    auto failed = KeepFirstRows(chunks(), *comparator, 30, &budget, &budget);
+    EXPECT_TRUE(failed.status().IsOutOfMemory()) << limit << ": " << failed.status().ToString();
+    EXPECT_EQ(budget.bytes_allocated(), 0) << limit;
+  }
+}
+
 // A global aggregation of only COUNT(DISTINCT x) is planned as a GROUP BY of x (merged in parallel,
 // partitioned) and COUNT(x) over the groups: the counts of the serial COUNT(DISTINCT) state, for
 // DOUBLE (-0.0 with 0.0, one NaN), BIGINT with NULLs, VARCHAR, repeated calls and no rows, on any

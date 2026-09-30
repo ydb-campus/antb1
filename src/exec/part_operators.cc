@@ -281,18 +281,23 @@ PartGroupAggregateOperator::PartGroupAggregateOperator(PartPipeline pipeline, in
                                                        int input_width,
                                                        std::vector<plan::BoundColumn> keys,
                                                        std::vector<plan::AggregateCall> aggregates,
-                                                       std::shared_ptr<arrow::Schema> schema)
+                                                       std::shared_ptr<arrow::Schema> schema,
+                                                       std::optional<PartitionTopN> top_n)
     : pipeline_(std::make_shared<const PartPipeline>(std::move(pipeline))),
       num_parts_(num_parts),
       input_width_(input_width),
       keys_(std::move(keys)),
       aggregates_(std::move(aggregates)),
-      schema_(std::move(schema)) {}
+      schema_(std::move(schema)),
+      top_n_(std::move(top_n)) {}
 
 PartGroupAggregateOperator::~PartGroupAggregateOperator() = default;
 
 arrow::Status PartGroupAggregateOperator::Open(ExecContext& ctx) {
   ARROW_RETURN_NOT_OK(Close());
+  if (top_n_.has_value() && !comparator_.has_value()) {
+    ARROW_ASSIGN_OR_RAISE(comparator_, RowComparator::Make(schema_, top_n_->keys));
+  }
   pool_ = ctx.pool;
   budget_ = ctx.budget;
   executor_ = ctx.executor;
@@ -457,8 +462,39 @@ arrow::Status PartGroupAggregateOperator::BuildRows() {
       rows_[p].push_back(std::move(chunk));
     }
     tables_[p].reset();
+    if (top_n_.has_value() && comparator_.has_value()) {
+      // Only the partition's first rows in the top-N's order go on; the others are freed here.
+      ARROW_ASSIGN_OR_RAISE(
+          rows_[p], KeepFirstRows(std::move(rows_[p]), *comparator_, top_n_->keep, pool_, budget_));
+    }
     return arrow::Status::OK();
   });
+}
+
+arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> KeepFirstRows(
+    std::vector<std::shared_ptr<arrow::RecordBatch>> rows, const RowComparator& comparator,
+    int64_t keep, arrow::MemoryPool* pool, MemoryBudget* budget) {
+  int64_t total = 0;
+  for (const auto& chunk : rows) {
+    total += chunk->num_rows();
+  }
+  if (total <= keep) {
+    return rows;
+  }
+  SortBuffer buffer(comparator, keep);
+  MemoryReservation memory;
+  memory.Reset(budget);
+  for (auto& chunk : rows) {
+    ARROW_RETURN_NOT_OK(buffer.Add(std::move(chunk), pool));
+    ARROW_RETURN_NOT_OK(memory.Resize(buffer.memory_usage()));
+  }
+  rows.clear();
+  ARROW_RETURN_NOT_OK(memory.Resize(buffer.memory_usage() + buffer.sort_memory()));
+  ARROW_RETURN_NOT_OK(buffer.Sort(pool));
+  ARROW_RETURN_NOT_OK(memory.Resize(buffer.memory_usage()));
+  ARROW_ASSIGN_OR_RAISE(auto kept, buffer.Slice(0, buffer.num_rows(), pool));
+  rows.push_back(std::move(kept));
+  return rows;
 }
 
 arrow::Status PartGroupAggregateOperator::Close() {

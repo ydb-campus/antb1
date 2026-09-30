@@ -35,6 +35,13 @@ Accepted (with the maintainer-approved plan for GROUP BY, ORDER BY and COUNT(DIS
 - **Mergeable.** `SortBuffer::Merge` appends another buffer's rows as if they came later in the input, so buffers
   filled from consecutive parts of the input (row groups) and merged in input order give the single-buffer result.
 - **In memory, no spilling.** A sort without a limit holds its whole input.
+- **A top-N over a partitioned GROUP BY** (amended 2026-10-01): for `Limit` over `Sort` right over a
+  `GroupAggregate` that runs partitioned (ADR 0013), each of its 64 partitions keeps only its first `limit + offset`
+  rows in the top-N's order (a `SortBuffer` with that keep), in parallel, as it builds them; the top-N reads at
+  most 64 × `limit + offset` rows. A row in the top of all groups is in the top of its own partition, and the
+  partitions come in order with their kept rows stably sorted, so the result is the same rows in the same order,
+  ties included. On the full ClickBench data Q32 (100 M groups) went from 2.43 s to 1.60 s: the serial top-N over
+  every group and the building of rows no one reads are gone.
 
 ## Consequences
 

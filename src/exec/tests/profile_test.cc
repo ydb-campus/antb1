@@ -136,7 +136,7 @@ TEST_F(ProfileTest, TheProfileMirrorsThePhysicalPlan) {
     EXPECT_EQ(root->detail(), "Sort g DESC NULLS LAST Limit 2");
     ASSERT_EQ(root->children().size(), 1U);
     const ProfileNode& aggregate = *root->children()[0];
-    EXPECT_EQ(aggregate.detail(), "GroupAggregate keys=[g] COUNT(*)");
+    EXPECT_EQ(aggregate.detail(), "GroupAggregate keys=[g] COUNT(*) top-N per partition keep=2");
     EXPECT_TRUE(MetricOf(aggregate, "wait").has_value());
     EXPECT_TRUE(MetricOf(aggregate, "part_time").has_value());
     EXPECT_GE(root->time().count(), 0);
