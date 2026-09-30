@@ -1,7 +1,10 @@
 #include "antb1/plan/optimizer.h"
 
+#include <algorithm>
 #include <cstddef>
+#include <format>
 #include <memory>
+#include <string>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -82,7 +85,110 @@ LogicalNodePtr CountStarToRowCount(const LogicalNodePtr& node) {
   return rewritten == *input ? node : std::visit(WithInput{.input = rewritten}, *node);
 }
 
-// ---- rule 2: Limit below Project and Compute ----
+// ---- rule 2: GROUP BY keys that are functions of other keys ----
+
+// A key computed from other keys alone (docs/adr/0018-dependent-group-keys.md) cannot split or
+// merge groups: GroupAggregate(k, f(k)) over Compute becomes
+// Project(Compute(f)(GroupAggregate(k))), which gives the same rows in the same output order,
+// hashes fewer keys and computes f once per group. A key is dependent when it is an expression of
+// the Compute right below the GroupAggregate that reads at least one column, and every column it
+// reads is a key passed through that Compute and not DOUBLE (a DOUBLE key groups -0.0 with 0.0 and
+// every NaN together, which a function of it could tell apart). Nothing sits between the Compute
+// and the GroupAggregate, so the expression sees the same values either way: an error (an overflow)
+// happens for the same input.
+// The name of an aggregate's output column, as EXPLAIN shows the call: COUNT(*), SUM(x).
+std::string CallName(const AggregateCall& call) {
+  if (!call.arg.has_value()) {
+    return "COUNT(*)";
+  }
+  return std::format("{}({}{})", ToString(call.kind),
+                     call.kind == AggKind::kCountDistinct ? "DISTINCT " : "", call.arg->name);
+}
+
+LogicalNodePtr GroupByDeterminingKeys(const GroupAggregateNode& group) {
+  const auto* compute = std::get_if<ComputeNode>(group.input.get());
+  if (compute == nullptr) {
+    return nullptr;
+  }
+  const auto width = Narrow<int>(OutputWidth(*compute->input));
+  // The keys each key position reads, and whether it is dependent.
+  std::vector<bool> dependent(group.keys.size(), false);
+  for (std::size_t k = 0; k < group.keys.size(); ++k) {
+    const int index = group.keys[k].index;
+    if (index < width) {
+      continue;
+    }
+    const Expr& expr = *compute->exprs.at(Narrow<std::size_t>(index - width));
+    std::vector<int> reads;
+    CollectColumns(expr, reads);
+    dependent[k] = !reads.empty() && std::ranges::all_of(reads, [&](int column) {
+      return column < width && std::ranges::any_of(
+                                   group.keys,
+                                   [&](const BoundColumn& key) {
+                                     return key.index == column && key.type != LogicalType::kDouble;
+                                   });
+    });
+  }
+  if (std::ranges::none_of(dependent, [](bool d) { return d; })) {
+    return nullptr;
+  }
+  // The GroupAggregate by the determining keys; `position` maps an input column that is a kept
+  // key to its output position.
+  GroupAggregateNode kept = group;
+  kept.keys.clear();
+  std::vector<int> position(Narrow<std::size_t>(width), -1);
+  for (std::size_t k = 0; k < group.keys.size(); ++k) {
+    if (!dependent[k]) {
+      if (group.keys[k].index < width) {
+        position[Narrow<std::size_t>(group.keys[k].index)] = Narrow<int>(kept.keys.size());
+      }
+      kept.keys.push_back(group.keys[k]);
+    }
+  }
+  const std::size_t kept_width = kept.keys.size() + kept.aggregates.size();
+  // The dependent keys over its output, in key order.
+  ComputeNode above{.input = Make(std::move(kept)), .exprs = {}, .span = compute->span};
+  ProjectNode out{.input = nullptr, .columns = {}, .constants = {}, .span = group.span};
+  int next_kept = 0;
+  for (std::size_t k = 0; k < group.keys.size(); ++k) {
+    BoundColumn column = group.keys[k];
+    if (dependent[k]) {
+      const ExprPtr& expr = compute->exprs.at(Narrow<std::size_t>(column.index - width));
+      column.index = Narrow<int>(kept_width + above.exprs.size());
+      above.exprs.push_back(Renumber(expr, position));
+    } else {
+      column.index = next_kept++;
+    }
+    out.columns.push_back(std::move(column));
+  }
+  for (std::size_t i = 0; i < group.aggregates.size(); ++i) {
+    const AggregateCall& call = group.aggregates[i];
+    out.columns.push_back(BoundColumn{.index = Narrow<int>(static_cast<std::size_t>(next_kept) + i),
+                                      .name = CallName(call),
+                                      .type = call.type});
+  }
+  out.input = Make(std::move(above));
+  return Make(std::move(out));
+}
+
+LogicalNodePtr DependentKeys(const LogicalNodePtr& node) {
+  const LogicalNodePtr* input = InputOf(*node);
+  LogicalNodePtr current = node;
+  if (input != nullptr && *input != nullptr) {
+    LogicalNodePtr rewritten = DependentKeys(*input);
+    if (rewritten != *input) {
+      current = std::visit(WithInput{.input = rewritten}, *node);
+    }
+  }
+  if (const auto* group = std::get_if<GroupAggregateNode>(current.get())) {
+    if (LogicalNodePtr rewritten = GroupByDeterminingKeys(*group); rewritten != nullptr) {
+      return rewritten;
+    }
+  }
+  return current;
+}
+
+// ---- rule 3: Limit below Project and Compute ----
 
 // Limit(Project(x)) -> Project(Limit(x)), and likewise for Compute: both keep every row, so
 // limiting first gives the same rows, copies or computes only the rows kept, and puts the Limit
@@ -112,7 +218,7 @@ LogicalNodePtr LimitBelowProject(const LogicalNodePtr& node) {
   return rewritten == *input ? node : std::visit(WithInput{.input = rewritten}, *node);
 }
 
-// ---- rule 3: projection pruning ----
+// ---- rule 4: projection pruning ----
 
 // Old output position -> new output position of a rewritten node; -1 for a dropped column.
 using Remap = std::vector<int>;
@@ -316,7 +422,7 @@ LogicalPlan Optimize(const LogicalPlan& plan) {
   if (plan.root == nullptr) {
     return plan;
   }
-  LogicalNodePtr root = LimitBelowProject(CountStarToRowCount(plan.root));
+  LogicalNodePtr root = LimitBelowProject(DependentKeys(CountStarToRowCount(plan.root)));
   const std::size_t width = OutputWidth(*root);
   Pruned pruned = Prune(root, std::vector<bool>(width, true));
   return LogicalPlan{.root = std::move(pruned.node), .output = plan.output};

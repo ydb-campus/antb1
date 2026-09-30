@@ -379,6 +379,15 @@ antb1_add_cli_golden(
     "${_t}"
 )
 antb1_add_cli_golden(
+  explain_dependent_keys
+  ARGS
+    explain
+    -c
+    "SELECT RegionID, RegionID + 10, COUNT(*) AS n FROM t GROUP BY RegionID, RegionID + 10 ORDER BY n DESC LIMIT 5"
+    --table
+    "${_t}"
+)
+antb1_add_cli_golden(
   explain_order_by
   ARGS
     explain

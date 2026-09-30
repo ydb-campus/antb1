@@ -23,3 +23,4 @@ in the same PR as the change it justifies, and list it below; `pixi run lint` ch
 | [0015](0015-query-profiles.md) | Query profiles and `explain --analyze` | Proposed |
 | [0016](0016-late-materialization.md) | Late materialization of top-N columns | Proposed |
 | [0017](0017-allocator-keeps-memory.md) | The allocator keeps the memory a query frees | Proposed |
+| [0018](0018-dependent-group-keys.md) | GROUP BY keys that are functions of other keys | Proposed |

@@ -21,7 +21,8 @@
 //   [Limit] <- [Project] <- [Sort] <- [Filter] <- [Compute] <- [Aggregate | GroupAggregate]
 //     <- [Filter] <- [Compute] <- [Filter] <- Scan (every field)
 //
-// and plan::Optimize rewrites it (Limit below Project, projection pruning, COUNT(*) -> RowCount).
+// and plan::Optimize rewrites it (COUNT(*) -> RowCount, GROUP BY keys that are functions of
+// other keys, Limit below Project, projection pruning).
 // New operators are added as new node structs in the LogicalNode variant; every std::visit over it
 // lists each node explicitly, so the physical planner and EXPLAIN fail to compile until they handle
 // a new one.

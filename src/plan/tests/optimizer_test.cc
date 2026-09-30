@@ -168,10 +168,74 @@ TEST(OptimizerTest, IsIdempotentAndKeepsTheOutput) {
   for (const char* sql :
        {"SELECT COUNT(*) FROM t", "SELECT * FROM ok WHERE s = 'x' LIMIT 2",
         "SELECT AVG(i32), MAX(dt) FROM t WHERE dt >= DATE '2013-07-01' AND d < 0.5",
-        "SELECT i64, dt FROM u WHERE i64 > 9223372036854775807"}) {
+        "SELECT i64, dt FROM u WHERE i64 > 9223372036854775807",
+        "SELECT i32 - 1, COUNT(*) AS c FROM t GROUP BY i32, i32 - 1 ORDER BY c DESC LIMIT 3"}) {
     const LogicalPlan once = Optimized(sql);
     const LogicalPlan twice = Optimize(once);
     EXPECT_EQ(Explain(twice), Explain(once)) << sql;
+  }
+}
+
+// A GROUP BY key computed only from other keys is dropped from the GroupAggregate and computed
+// once per group above it (docs/adr/0018-dependent-group-keys.md); the output is unchanged.
+TEST(OptimizerTest, GroupsByTheKeysThatDetermineTheOthers) {
+  const LogicalPlan plan =
+      Optimized("SELECT i32, i32 - 1, i32 * 2, COUNT(*) FROM t GROUP BY i32, i32 - 1, i32 * 2");
+  EXPECT_EQ(Explain(plan),
+            "Output: i32:INTEGER (i32 - 1):INTEGER (i32 * 2):INTEGER count_star():BIGINT\n"
+            "Project i32, \"(i32 - 1)\", \"(i32 * 2)\", \"count_star()\"\n"
+            "  Project i32, \"(i32 - 1)\", \"(i32 * 2)\", \"COUNT(*)\"\n"
+            "    Compute (i32 - 1), (i32 * 2)\n"
+            "      GroupAggregate keys=[i32] COUNT(*)\n"
+            "        Scan table=t source=fake columns=[i32]\n");
+  // Under ORDER BY ... LIMIT the Limit stays right above the Sort (top-N).
+  const LogicalPlan top = Optimized(
+      "SELECT i32 - 1, COUNT(*) AS c FROM t GROUP BY i32, i32 - 1 ORDER BY c DESC LIMIT 3");
+  EXPECT_EQ(Explain(top),
+            "Output: (i32 - 1):INTEGER c:BIGINT\n"
+            "Project \"(i32 - 1)\", c\n"
+            "  Limit 3\n"
+            "    Sort c DESC NULLS LAST\n"
+            "      Project i32, \"(i32 - 1)\", \"COUNT(*)\"\n"
+            "        Compute (i32 - 1)\n"
+            "          GroupAggregate keys=[i32] COUNT(*)\n"
+            "            Scan table=t source=fake columns=[i32]\n");
+  // A VARCHAR key, HAVING on the dependent key, and a key that is not the first one.
+  const LogicalPlan having =
+      Optimized("SELECT s, strlen(s), SUM(i16) FROM t GROUP BY s, strlen(s) HAVING strlen(s) > 1");
+  EXPECT_EQ(Explain(having),
+            "Output: s:VARCHAR strlen(s):BIGINT sum(i16):HUGEINT\n"
+            "Project s, \"strlen(s)\", \"sum(i16)\"\n"
+            "  Filter \"strlen(s)\" > 1\n"
+            "    Project s, \"strlen(s)\", \"SUM(i16)\"\n"
+            "      Compute strlen(s)\n"
+            "        GroupAggregate keys=[s] SUM(i16)\n"
+            "          Scan table=t source=fake columns=[i16, s]\n");
+  const LogicalPlan second =
+      Optimized("SELECT i32, i16 + 1, COUNT(*) FROM t GROUP BY i32, i16, i16 + 1");
+  EXPECT_EQ(Explain(second),
+            "Output: i32:INTEGER (i16 + 1):SMALLINT count_star():BIGINT\n"
+            "Project i32, \"(i16 + 1)\", \"count_star()\"\n"
+            "  Project i32, i16, \"(i16 + 1)\", \"COUNT(*)\"\n"
+            "    Compute (i16 + 1)\n"
+            "      GroupAggregate keys=[i32, i16] COUNT(*)\n"
+            "        Scan table=t source=fake columns=[i16, i32]\n");
+}
+
+TEST(OptimizerTest, KeepsKeysThatOtherKeysDoNotDetermine) {
+  // Over a DOUBLE key (-0.0 and 0.0 are one group; a function of them may differ); over a column
+  // that is not a key; plain columns only; an expression of a column that is not a key.
+  for (const auto& [sql, keys] :
+       {std::pair{"SELECT d, d + 1, COUNT(*) FROM t GROUP BY d, d + 1", 2U},
+        std::pair{"SELECT i32 + i16, COUNT(*) FROM t GROUP BY i32, i32 + i16", 2U},
+        std::pair{"SELECT i32, i16, COUNT(*) FROM t GROUP BY i32, i16", 2U},
+        std::pair{"SELECT i32 + 1, COUNT(*) FROM t GROUP BY i32 + 1", 1U}}) {
+    const LogicalPlan plan = Optimized(sql);
+    ASSERT_NE(plan.root, nullptr);
+    const auto& project = std::get<ProjectNode>(*plan.root);
+    const auto* group = std::get_if<GroupAggregateNode>(project.input.get());
+    ASSERT_NE(group, nullptr) << sql << "\n" << Explain(plan);
+    EXPECT_EQ(group->keys.size(), keys) << sql << "\n" << Explain(plan);
   }
 }
 
