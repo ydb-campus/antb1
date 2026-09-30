@@ -26,6 +26,8 @@
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
 
+#include "parallel_compute.h"
+
 namespace antb1::exec {
 namespace {
 
@@ -870,10 +872,29 @@ arrow::Result<std::shared_ptr<arrow::Array>> EvaluateExpr(const plan::Expr& expr
   return values;
 }
 
+std::shared_ptr<arrow::Schema> ComputedSchema(const arrow::Schema& input,
+                                              const std::vector<plan::ExprPtr>& exprs) {
+  return arrow::schema(ComputedFields(input, exprs));
+}
+
+arrow::Result<Batch> ComputeBatch(const Batch& in, const std::vector<plan::ExprPtr>& exprs,
+                                  const std::shared_ptr<arrow::Schema>& schema,
+                                  arrow::MemoryPool* pool) {
+  // Only the selected rows are computed: an expression never fails on a row a filter dropped.
+  ARROW_ASSIGN_OR_RAISE(auto rows, Materialize(in, pool));
+  arrow::ArrayVector columns = rows->columns();
+  for (const plan::ExprPtr& expr : exprs) {
+    ARROW_ASSIGN_OR_RAISE(auto values, EvaluateExpr(*expr, *rows, pool));
+    columns.push_back(std::move(values));
+  }
+  return Batch{.data = arrow::RecordBatch::Make(schema, rows->num_rows(), std::move(columns)),
+               .selection = {}};
+}
+
 ComputeOperator::ComputeOperator(std::unique_ptr<Operator> input, std::vector<plan::ExprPtr> exprs)
     : input_(std::move(input)),
       exprs_(std::move(exprs)),
-      schema_(arrow::schema(ComputedFields(*input_->output_schema(), exprs_))) {}
+      schema_(ComputedSchema(*input_->output_schema(), exprs_)) {}
 
 arrow::Status ComputeOperator::Open(ExecContext& ctx) {
   pool_ = ctx.pool;
@@ -885,15 +906,7 @@ arrow::Result<Batch> ComputeOperator::Next() {
   if (in.end()) {
     return in;
   }
-  // Only the selected rows are computed: an expression never fails on a row a filter dropped.
-  ARROW_ASSIGN_OR_RAISE(auto rows, Materialize(in, pool_));
-  arrow::ArrayVector columns = rows->columns();
-  for (const plan::ExprPtr& expr : exprs_) {
-    ARROW_ASSIGN_OR_RAISE(auto values, EvaluateExpr(*expr, *rows, pool_));
-    columns.push_back(std::move(values));
-  }
-  return Batch{.data = arrow::RecordBatch::Make(schema_, rows->num_rows(), std::move(columns)),
-               .selection = {}};
+  return ComputeBatch(in, exprs_, schema_, pool_);
 }
 
 }  // namespace antb1::exec

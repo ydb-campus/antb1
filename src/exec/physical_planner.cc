@@ -26,6 +26,7 @@
 #include "antb1/plan/explain.h"
 #include "antb1/plan/logical_plan.h"
 
+#include "parallel_compute.h"
 #include "part_operators.h"
 #include "part_pruning.h"
 #include "profiled_operator.h"
@@ -290,6 +291,9 @@ struct Builder {
   OperatorResult operator()(const plan::ComputeNode& node) const {
     Name("Compute");
     ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input, part, Input(), late));
+    if (!part.has_value()) {  // over a whole input (an aggregation, a sort): batches in parallel
+      return std::make_unique<ParallelComputeOperator>(std::move(input), node.exprs);
+    }
     return std::make_unique<ComputeOperator>(std::move(input), node.exprs);
   }
   OperatorResult operator()(const plan::ProjectNode& node) const {

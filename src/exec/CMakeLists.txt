@@ -9,6 +9,7 @@ antb1_add_module(
     table_scan.cc
     filter.cc
     compute.cc
+    parallel_compute.cc
     like.cc
     project.cc
     scalar_aggregate.cc
