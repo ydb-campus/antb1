@@ -54,7 +54,8 @@ Proposed
     a `Compute` (`ParallelComputeOperator`, amended 2026-09-30): over a large aggregation (millions of groups, as
     when GROUP BY keys computed from other keys move above it, ADR 0018) it computes its batches on the pool, in
     order, so its output and its first error are those of the serial one. It follows the part scheduler's memory
-    rules: a window of batches that halves under pressure and an out-of-memory retry alone.
+    rules: a window of batches that halves under pressure, and a batch out of memory on a worker computed again
+    alone.
   - **Every scan runs through parts, also on one thread:** with one thread, each part runs on the calling thread when
     the merge reaches it. That is the same code and the same partial results, so answers are byte-identical for any
     thread count, DOUBLE sums included.

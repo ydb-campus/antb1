@@ -1,11 +1,13 @@
 #include "../parallel_compute.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -225,31 +227,89 @@ TEST_F(ParallelComputeTest, OutOfMemoryAloneFailsAndFreesEverything) {
   EXPECT_EQ(tiny.bytes_allocated(), 0);
 }
 
-// Several batches at once need more than the budget, one alone fits: the batch that runs out
-// of memory is computed again alone, and the output is the same.
-TEST_F(ParallelComputeTest, OutOfMemoryNextToOthersComputesTheBatchAgainAlone) {
+// A pool that fails every allocation off the thread that made it (the consumer's): every batch
+// computed on a worker runs out of memory, and only a batch computed again alone succeeds.
+class WorkerFailingPool final : public arrow::MemoryPool {
+ public:
+  explicit WorkerFailingPool(arrow::MemoryPool* backend) : backend_(backend) {}
+
+  arrow::Status Allocate(int64_t size, int64_t alignment, uint8_t** out) override {
+    if (std::this_thread::get_id() != owner_) {
+      failures_.fetch_add(1);
+      return arrow::Status::OutOfMemory("worker allocation");
+    }
+    return backend_->Allocate(size, alignment, out);
+  }
+  arrow::Status Reallocate(int64_t old_size, int64_t new_size, int64_t alignment,
+                           uint8_t** ptr) override {
+    if (std::this_thread::get_id() != owner_) {
+      failures_.fetch_add(1);
+      return arrow::Status::OutOfMemory("worker allocation");
+    }
+    return backend_->Reallocate(old_size, new_size, alignment, ptr);
+  }
+  void Free(uint8_t* buffer, int64_t size, int64_t alignment) override {
+    backend_->Free(buffer, size, alignment);
+  }
+  int64_t bytes_allocated() const override { return backend_->bytes_allocated(); }
+  int64_t total_bytes_allocated() const override { return backend_->total_bytes_allocated(); }
+  int64_t num_allocations() const override { return backend_->num_allocations(); }
+  std::string backend_name() const override { return backend_->backend_name(); }
+
+  [[nodiscard]] int failures() const { return failures_.load(); }
+
+ private:
+  arrow::MemoryPool* backend_;
+  std::thread::id owner_ = std::this_thread::get_id();
+  std::atomic<int> failures_ = 0;
+};
+
+// Every batch runs out of memory on a worker, also once the window is 1 and nothing else is in
+// flight: each is computed again alone, and the output is ComputeOperator's.
+TEST_F(ParallelComputeTest, OutOfMemoryOnAWorkerComputesTheBatchAgainAlone) {
   auto pool = arrow::internal::ThreadPool::Make(4);
   ASSERT_TRUE(pool.ok());
-  constexpr int64_t kRows = 10000;  // about 80 KB computed per batch (half the rows selected)
-  const Output serial = Serial(Batches(12, {}, kRows));
-  MemoryBudget budget(int64_t{200} * 1024);
+  const Output serial = Serial(Batches(12, {}, 1000));
+  MemoryBudget budget(std::nullopt);
+  WorkerFailingPool failing(&budget);
   {
-    ParallelComputeOperator op(std::make_unique<ScriptedSource>(Schema(), Batches(12, {}, kRows)),
+    ParallelComputeOperator op(std::make_unique<ScriptedSource>(Schema(), Batches(12, {}, 1000)),
                                PlusOne());
-    ExecContext ctx{.pool = &budget, .executor = pool->get(), .threads = 4, .budget = &budget};
+    ExecContext ctx{.pool = &failing, .executor = pool->get(), .threads = 4, .budget = &budget};
     ASSERT_TRUE(op.Open(ctx).ok());
     for (std::size_t i = 0; i < serial.batches.size(); ++i) {
-      auto batch = op.Next();  // each batch is released before the next one is taken
+      auto batch = op.Next();
       ASSERT_TRUE(batch.ok()) << "batch " << i << ": " << batch.status().ToString();
       ASSERT_FALSE(batch->end());
       EXPECT_TRUE(batch->data->Equals(*serial.batches[i])) << "batch " << i;
+      EXPECT_EQ(op.window(), 1U);
     }
     auto end = op.Next();
     ASSERT_TRUE(end.ok());
     EXPECT_TRUE(end->end());
     EXPECT_TRUE(op.Close().ok());
   }
+  EXPECT_GE(failing.failures(), 12);  // every batch failed on a worker first
   EXPECT_EQ(budget.bytes_allocated(), 0);
+}
+
+// Out of memory alone, the batch computed again also fails: the query fails with it.
+TEST_F(ParallelComputeTest, OutOfMemoryAloneFailsAfterTheRetry) {
+  auto pool = arrow::internal::ThreadPool::Make(4);
+  ASSERT_TRUE(pool.ok());
+  MemoryBudget tiny(64);
+  WorkerFailingPool failing(&tiny);
+  {
+    ParallelComputeOperator op(std::make_unique<ScriptedSource>(Schema(), Batches(4, {}, 1000)),
+                               PlusOne());
+    ExecContext ctx{.pool = &failing, .executor = pool->get(), .threads = 4, .budget = &tiny};
+    ASSERT_TRUE(op.Open(ctx).ok());
+    auto batch = op.Next();
+    ASSERT_FALSE(batch.ok());
+    EXPECT_TRUE(batch.status().IsOutOfMemory()) << batch.status().ToString();
+    EXPECT_TRUE(op.Close().ok());
+  }
+  EXPECT_EQ(tiny.bytes_allocated(), 0);
 }
 
 }  // namespace

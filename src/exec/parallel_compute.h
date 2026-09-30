@@ -42,10 +42,11 @@ arrow::Result<Batch> ComputeBatch(const Batch& in, const std::vector<plan::ExprP
 // Memory, as the part scheduler (part_scheduler.h): the batches in flight start at `threads`;
 // every batch taken under pressure (MemoryBudget::under_pressure) halves the window, every other
 // one widens it by one; under pressure no batch starts while another is in flight. A batch that
-// runs out of memory next to others does not fail the query yet: the batches ahead are dropped
+// runs out of memory on a worker does not fail the query yet: the batches ahead are dropped
 // (they are computed again when reached), the window becomes 1, and the batch is computed again
-// alone on the consumer's thread. A task's std::bad_alloc is an OutOfMemory status. Results are
-// released on the consumer's thread (Next, Close, the destructor), never on a worker.
+// alone on the consumer's thread; only that failure fails the query. A task's std::bad_alloc is an
+// OutOfMemory status. Results are released on the consumer's thread (Next, Close, the destructor),
+// never on a worker.
 class ParallelComputeOperator final : public Operator {
  public:
   ParallelComputeOperator(std::unique_ptr<Operator> input, std::vector<plan::ExprPtr> exprs);

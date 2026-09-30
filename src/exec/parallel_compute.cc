@@ -136,9 +136,10 @@ arrow::Result<Batch> ParallelComputeOperator::Next() {
   --in_flight_;
   front.done.reset();
   arrow::Result<Batch> result = shared_->TakeSlot(front.id);
-  if (!result.ok() && result.status().IsOutOfMemory() && (in_flight_ > 0 || window_ > 1)) {
-    // Out of memory next to other batches: drop them (their memory with them; they are
-    // computed again when reached) and compute this one alone.
+  if (!result.ok() && result.status().IsOutOfMemory()) {
+    // Out of memory on a worker, maybe next to other batches (taken since, or still in flight):
+    // drop those in flight (their memory with them; they are computed again when reached) and
+    // compute this one alone here. Only a failure alone fails the query.
     Drop();
     window_ = 1;
     result = shared_->Compute(front.input, pool_);
