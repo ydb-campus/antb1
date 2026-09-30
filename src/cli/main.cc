@@ -5,7 +5,10 @@
 
 #include "antb1/cli/cli.h"
 
+#include "allocator.h"
+
 int main(int argc, char** argv) {
+  antb1::cli::RestartForAllocator(argv);  // returns unless the process restarts
   try {
     const std::vector<std::string> args(argv, argv + argc);
     return antb1::cli::RunCli(args, std::cin, std::cout, std::cerr);

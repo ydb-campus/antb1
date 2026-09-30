@@ -52,6 +52,8 @@ antb1 bench --queries queries.sql --table hits=/data/hits_0.parquet --clickbench
   `--git-sha SHA` records the commit of the build.
 - `--drop-caches` (Linux) drops the page cache before the first run of every query, with
   `sudo -n sh -c 'sync && echo 3 > /proc/sys/vm/drop_caches'`; without it the runs are lukewarm.
+- The allocator: on Linux `antb1` runs with `MIMALLOC_PURGE_DELAY=-1` unless it is set (ADR 0017), so freed memory
+  stays with the process between runs. Set it (e.g. to `1000`) to measure with mimalloc's default.
 
 Each run times `Session::Execute` (parse, bind, optimize and execute, without printing the result). `load_time` is the
 time to register the tables (reading the Parquet footers) and `data_size` the sum of their Parquet file sizes. A

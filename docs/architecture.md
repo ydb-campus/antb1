@@ -154,6 +154,12 @@ before the consumer waits for them to merge, and they finish merging before a pa
 `std::bad_alloc` from a container (outside the budget's view) is caught in the part tasks and in `Drain` and becomes
 `OutOfMemory` too.
 
+The budget's pool is Arrow's default pool, mimalloc. On Linux the `antb1` executable restarts itself once with
+`MIMALLOC_PURGE_DELAY=-1` (`cli::RestartForAllocator`, ADR 0017), so that mimalloc keeps the memory a query frees
+instead of returning it to the system and faulting it back in: unless the variable is set (a value the user set
+wins) or `ARROW_DEFAULT_MEMORY_POOL` names another pool. The process then keeps its peak resident memory until it
+exits; the budget, which counts allocations, is unchanged.
+
 | Operator | Logical node | Does |
 | --- | --- | --- |
 | `TableScanOperator` | `Scan` | `plan::Table::ScanPart` (in a part pipeline) or `Scan` of the referenced fields only, in batches of `ExecContext::batch_size` rows (64Ki) |
