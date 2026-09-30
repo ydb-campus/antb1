@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790751255348,
+  "lastUpdate": 1790758808864,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -2484,6 +2484,78 @@ window.BENCHMARK_DATA = {
             "value": 11.705413881355945,
             "unit": "ms/iter",
             "extra": "iterations: 59\ncpu: 11.704694694915254 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "354e0577e959aa97120a0b90954da51ca7393f49",
+          "message": "perf(exec): late materialization of top-N columns (#54)\n\n## Summary\n\nThis is fix 2 of the antb1 vs DuckDB comparison: **late materialization\nfor top-N**. The design is in the new **ADR 0016** (status Proposed). It\nalso answers the earlier question of who decides when to use it.\n\n**The problem, from `antb1 explain --analyze` on Q23** (full data, 128\nthreads; query numbers and metadata only):\n- The part pipeline decoded every column of the table (105) in every row\ngroup (325): 431-502 s of CPU summed over the parts.\n- The filter and the top-N merge cost almost nothing next to that, and\nthe result is a handful of rows.\n\n**The change** (exec only; the logical plan, the optimizer and plain\nEXPLAIN are unchanged):\n- **Which columns are late:** for `Limit(Sort(part pipeline))`, where\nthe pipeline is Filter and Compute nodes over a Scan, the planner\n(`LateSplit`) marks late every scan column that no filter predicate, no\ncomputation and no sort key reads.\n- **When it applies:** when `limit + offset ≤ kept parts / 2` (after\nstatistics pruning) and ≤ 65536. So at least half of the late decoding\nis saved. The planner decides from metadata; a cost-based choice waits\nfor column statistics.\n- **Narrow scan** (`LateScan` in `TableScanOperator`):\n  - Each part reads only the early columns.\n- Late columns become `arrow::NullArray` placeholders, which cost no\nbuffers and no decoding.\n- One of them carries each row's id: the part number times 2^32, plus\nthe position in the part.\n- Filter, Compute and the part top-N buffers carry the narrow rows\nunchanged. Sort and tie order are the same: input order within a part,\nthen part order.\n- **Fetch** (`PartTopNOperator::Fetch`): after the merge, the output\nwindow's rows are grouped by part.\n- One task per (part, late column) runs on the executor: it reads that\ncolumn of that part and takes the rows.\n  - The values go back in window order with the original schema.\n- **Profile:** `explain --analyze` shows `late=N columns` and the\nmetrics `late_columns`, `late_parts` and `late_fetch`.\n- **Docs:** ADR 0016 (new) and its index row, a pointer in ADR 0011, the\nPartTopN row of architecture.md, and a sql-subset.md optimizer note.\n\n**Q23 in `explain --analyze`, before and after:**\n\n| | main | this PR |\n| --- | ---: | ---: |\n| Query time | 4.98 s | 1.08 s |\n| Scan CPU (summed over parts) | 431 s | 45 s |\n| Peak memory | 21.4 GB | 3.6 GB |\n| Late fetch | - | 103 columns from 7 of 325 parts, 141 ms |\n\n## Performance: paired A/B against main (#53), full data, 128 threads\n\nThis uses a new layout-robust method. After #53 we found that the length\nof the binary's path (argv[0], which shifts the stack) alone moves Q4 by\nabout 15%. So each binary now runs from 3 paths of different lengths\n(best of 3 tries each), and the median is kept; the binaries alternate.\n- Q0-Q26 ran on a quiet host.\n- Q27-Q42 were rerun after another workload pushed the host load to 180\nduring the first run.\n\n| Query | main | this PR | speedup |\n| --- | ---: | ---: | ---: |\n| **Q23** | 3.945 | 0.866 | **4.55×** |\n| Q24-Q26 (top-N, every column early) | 0.15-0.19 | same | within 3% |\n| Every other query | | | within 6%, most within 3% |\n\nQ24-Q26 read only columns their filters or keys use, so nothing is late;\nas expected, they are unchanged. The total over all 43 queries dropped\nby about 3 s, which is Q23.\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [x] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full          # lint, ci, asan, tidy, coverage, fuzz-smoke, ci-gcc\ncheck-full exit 0; 100% tests passed out of 1371 (ci, asan, ci-gcc, coverage); Coverage gate: PASS\n$ pixi run tsan\n100% tests passed out of 1371\n$ ANTB1_DIFF_COUNT=20000 pixi run diff-random\nDIFF: PASS seed=3886143830 queries=20000 failed=0 unsupported=0\n$ pixi run test-data\n100% tests passed out of 6\n```\n\n(The diff and data runs were on the code before the clang-tidy style\nfixes, which rewrote the row-id encoding from shifts to arithmetic with\nthe same values. check-full and tsan ran on the final code.)\n\n**New tests:**\n- **`PartOperatorsTest.TopNFetchesLateColumns`:** 25 late and plain\nplans over a wide 16-part table.\n- The plans: every column type with NULLs, ties on the key, a filter\nwith statistics-pruned parts, a filter with no rows, a computed key, and\na grid of (limit, offset) windows inside, across and past the rows.\n  - Each result is byte-identical to the plain top-N on 1 and 4 threads.\n- Failures pass through: a failed part read, and a failed late fetch (a\nnew `MemoryTable::FailField` hook).\n- **`PartOperatorsTest.NarrowScanCarriesRowIds`:** NULL placeholders,\nrow ids across batches, invalid settings.\n- **`PartOperatorsTest.LateTopNChecksItsColumns`:** malformed\n`LateColumns` fail to open.\n- **`PhysicalPlannerTest.TopNReadsUnusedColumnsLate`:**\n  - The rule applies at `keep` ≤ half the parts and not above.\n  - Only unread columns are late.\n- It does not apply when every column is read, or when a Project inside\nthe pipeline renumbers columns.\n- **slt `orderby/late.slt`:** 4 queries on the multi-file fixture, with\nexpected results from `pixi run slt-complete`. The `parallel.*` label\nruns them on 4 threads.\n- **Profile test:** the PartTopN detail now says `late=1 columns`.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer (none changed)\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code profiled Q23\nwith `explain --analyze`, wrote the code, tests, ADR and docs, ran the\ngates and the A/B, and ran a read-only reviewer agent on the diff. The\nreviewer found no P0 issues and two P1s, both fixed:\n- ClickBench-derived figures (a selectivity and the query's shape) in\nthe ADR draft were replaced by metadata counts;\n  - the late top-N's validation is now tested.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-09-30T11:57:57+03:00",
+          "tree_id": "6fa5e6abf19c07fff4ed0b1f01a02ecc8c82efe4",
+          "url": "https://github.com/ydb-campus/antb1/commit/354e0577e959aa97120a0b90954da51ca7393f49"
+        },
+        "date": 1790758807155,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 3126.883834482311,
+            "unit": "ns/iter",
+            "extra": "iterations: 213609\ncpu: 3126.1338894896758 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 73465.27910221631,
+            "unit": "ns/iter",
+            "extra": "iterations: 8599\ncpu: 73442.80637283405 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 84723.44553258817,
+            "unit": "ns/iter",
+            "extra": "iterations: 8271\ncpu: 84713.38181598356 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 375812.19903431396,
+            "unit": "ns/iter",
+            "extra": "iterations: 1864\ncpu: 375656.1893776822 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 355151.86002018413,
+            "unit": "ns/iter",
+            "extra": "iterations: 1986\ncpu: 355076.49144008034 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2176106.82608685,
+            "unit": "ns/iter",
+            "extra": "iterations: 322\ncpu: 2175570.6739130425 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 180.20651624999573,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 180.16205775000006 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 11.777687233332776,
+            "unit": "ms/iter",
+            "extra": "iterations: 60\ncpu: 11.77542645000001 ms\nthreads: 1"
           }
         ]
       }
