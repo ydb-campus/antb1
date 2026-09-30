@@ -1410,7 +1410,7 @@ TEST_F(PartOperatorsTest, RoutedRowsGiveTheSameGroups) {
         auto op = BuildPhysicalPlan(plan, profile);
         EXPECT_TRUE(op.ok()) << op.status().ToString();
         ExecContext ctx{.pool = arrow::default_memory_pool(),
-                        .batch_size = 8,
+                        .batch_size = 32,
                         .executor = executor,
                         .threads = executor == nullptr ? 1 : kThreads};
         return Drain(**op, ctx);
@@ -1426,11 +1426,13 @@ TEST_F(PartOperatorsTest, RoutedRowsGiveTheSameGroups) {
   struct Case {
     std::vector<plan::BoundColumn> keys;
     std::vector<plan::AggregateCall> calls;
-    int64_t routed;  // parts that route rows: 40 rows in batches of 8, 9 parts with rows
+    int64_t routed;  // parts that route rows: 40 rows in batches of 32, 9 parts with rows
     std::vector<plan::Predicate> filter;
   };
-  // A selective filter leaves batches of a row or two: the decision waits for 8 rows (a batch), so
-  // few keys never route, whatever the first batch looks like.
+  // A part routes when its first batch (32 rows) makes more groups than 1/4 of its rows: u (nearly
+  // distinct) does, k (5 values) and d (4 groups) do not. A selective filter leaves batches of a
+  // row or two: the decision waits for 32 rows, so no part routes, whatever the first batch looks
+  // like.
   const std::vector<plan::Predicate> selective = {
       testing::Compare(v, plan::CompareOp::kEq, BigInt(3))};
   std::vector<plan::AggregateCall> with_double_sum = calls;
@@ -1445,7 +1447,7 @@ TEST_F(PartOperatorsTest, RoutedRowsGiveTheSameGroups) {
                                    {.keys = {k}, .calls = calls, .routed = 0, .filter = selective},
                                    {.keys = {u}, .calls = calls, .routed = 0, .filter = selective}};
   for (const Case& c : cases) {
-    ExecContext ctx{.pool = arrow::default_memory_pool(), .batch_size = 8};
+    ExecContext ctx{.pool = arrow::default_memory_pool(), .batch_size = 32};
     std::unique_ptr<Operator> source =
         std::make_unique<TableScanOperator>(RoutedTable(false), std::vector<int>{0, 1, 2, 3, 4});
     if (!c.filter.empty()) {

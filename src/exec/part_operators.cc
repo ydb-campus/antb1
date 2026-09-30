@@ -270,8 +270,10 @@ bool MayRouteRows(const std::vector<plan::BoundColumn>& keys,
   });
 }
 
-// The rows a part aggregates on its own before it decides whether to route the rest.
-constexpr int64_t kRouteDecisionRows = 4096;
+// The rows a part aggregates on its own before it decides whether to route the rest: one batch of
+// the default size, so that the decision sees the part's repetition (its first few thousand rows
+// look more distinct than the part).
+constexpr int64_t kRouteDecisionRows = int64_t{64} * 1024;
 
 }  // namespace
 
@@ -314,10 +316,12 @@ arrow::Status PartGroupAggregateOperator::Open(ExecContext& ctx) {
     ARROW_ASSIGN_OR_RAISE(
         groups->table, GroupTable::Make(keys, aggregates, width, part_ctx.pool, part_ctx.budget));
     GroupTable& table = *groups->table;
-    // After its first kRouteDecisionRows rows (or batch), a part whose groups are more than 3/4 of
-    // its rows stops aggregating on its own: its other rows go straight to the partitions.
-    // The decision waits for enough rows (a selective filter can leave a batch a few rows, which
-    // never reduce), and is made once, from the part's data alone.
+    // After its first kRouteDecisionRows rows (or batch), a part whose groups are more than 1/4 of
+    // its rows stops aggregating on its own: its other rows go straight to the partitions. A part
+    // that reduces less than 4 to 1 would insert most of its groups twice (its table, then the
+    // partition's), which costs more than inserting its rows once in the partitions. The decision
+    // waits for enough rows (a selective filter can leave a batch a few rows, which never reduce),
+    // and is made once, from the part's data alone.
     const int64_t decide_after = std::min<int64_t>(kRouteDecisionRows, part_ctx.batch_size);
     bool decided = !may_route;
     int64_t consumed = 0;
@@ -341,7 +345,7 @@ arrow::Status PartGroupAggregateOperator::Open(ExecContext& ctx) {
           consumed += rows->num_rows();
           if (!decided && consumed >= decide_after) {
             decided = true;
-            if (int64_t{table.num_groups()} * 4 > consumed * 3) {
+            if (int64_t{table.num_groups()} * 4 > consumed) {
               route = true;
               groups->rows.resize(GroupTable::kPartitions);
             }
