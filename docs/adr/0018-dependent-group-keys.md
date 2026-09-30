@@ -38,6 +38,10 @@ Proposed
     the group has those values.
   - *Errors:* the expression sees the same set of key values either way. Nothing sits between that `Compute` and the
     `GroupAggregate`, so an overflow happens for the same input.
+- **Not under a `LIMIT` without a `Sort` in between.** The nodes above would stop reading after the rows they need,
+  so the dependent keys would be computed for some groups only, and an overflow in another group would no longer
+  fail the query. The rule walks down from the root and skips a `GroupAggregate` when a `Limit` is above it with no
+  `Sort` in between. A `Sort` reads every row, so `ORDER BY ... LIMIT` keeps the rewrite.
 - **Not done: computing the dependent keys above the Sort and Limit.** It would evaluate them for the rows kept only,
   but an overflow in a group outside the result would then no longer fail the query, while DuckDB fails it.
 
@@ -51,5 +55,6 @@ Proposed
 - **Tests:**
   - optimizer tests: the rewrite and the cases it leaves alone;
   - `tests/slt/cases/groupby/dependent_keys.slt` against DuckDB: NULL keys, VARCHAR, HAVING and ORDER BY on a
-    dependent key, COUNT(DISTINCT), parallel parts, a DOUBLE key, an overflow;
+    dependent key, COUNT(DISTINCT), parallel parts, a DOUBLE key, an overflow (also under a LIMIT, with and without
+    ORDER BY);
   - an EXPLAIN golden.

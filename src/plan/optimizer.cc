@@ -171,17 +171,28 @@ LogicalNodePtr GroupByDeterminingKeys(const GroupAggregateNode& group) {
   return Make(std::move(out));
 }
 
-LogicalNodePtr DependentKeys(const LogicalNodePtr& node) {
+// Rewrites every GroupAggregate whose whole output is read. Under a Limit with no Sort in between,
+// the nodes above stop reading after the rows they need: a key computed above the GroupAggregate
+// would then be computed for those groups only, and an error (an overflow) in another group would
+// no longer fail the query, as it does when every row computes it. A Sort reads everything.
+LogicalNodePtr DependentKeys(const LogicalNodePtr& node, bool limited) {
+  if (std::holds_alternative<LimitNode>(*node)) {
+    limited = true;
+  } else if (std::holds_alternative<SortNode>(*node)) {
+    limited = false;
+  }
+  const bool group = std::holds_alternative<GroupAggregateNode>(*node);
   const LogicalNodePtr* input = InputOf(*node);
   LogicalNodePtr current = node;
   if (input != nullptr && *input != nullptr) {
-    LogicalNodePtr rewritten = DependentKeys(*input);
+    LogicalNodePtr rewritten = DependentKeys(*input, limited && !group);
     if (rewritten != *input) {
       current = std::visit(WithInput{.input = rewritten}, *node);
     }
   }
-  if (const auto* group = std::get_if<GroupAggregateNode>(current.get())) {
-    if (LogicalNodePtr rewritten = GroupByDeterminingKeys(*group); rewritten != nullptr) {
+  if (const auto* aggregate = std::get_if<GroupAggregateNode>(current.get());
+      aggregate != nullptr && !limited) {
+    if (LogicalNodePtr rewritten = GroupByDeterminingKeys(*aggregate); rewritten != nullptr) {
       return rewritten;
     }
   }
@@ -422,7 +433,8 @@ LogicalPlan Optimize(const LogicalPlan& plan) {
   if (plan.root == nullptr) {
     return plan;
   }
-  LogicalNodePtr root = LimitBelowProject(DependentKeys(CountStarToRowCount(plan.root)));
+  LogicalNodePtr root =
+      LimitBelowProject(DependentKeys(CountStarToRowCount(plan.root), /*limited=*/false));
   const std::size_t width = OutputWidth(*root);
   Pruned pruned = Prune(root, std::vector<bool>(width, true));
   return LogicalPlan{.root = std::move(pruned.node), .output = plan.output};

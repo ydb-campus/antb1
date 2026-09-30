@@ -169,7 +169,8 @@ TEST(OptimizerTest, IsIdempotentAndKeepsTheOutput) {
        {"SELECT COUNT(*) FROM t", "SELECT * FROM ok WHERE s = 'x' LIMIT 2",
         "SELECT AVG(i32), MAX(dt) FROM t WHERE dt >= DATE '2013-07-01' AND d < 0.5",
         "SELECT i64, dt FROM u WHERE i64 > 9223372036854775807",
-        "SELECT i32 - 1, COUNT(*) AS c FROM t GROUP BY i32, i32 - 1 ORDER BY c DESC LIMIT 3"}) {
+        "SELECT i32 - 1, COUNT(*) AS c FROM t GROUP BY i32, i32 - 1 ORDER BY c DESC LIMIT 3",
+        "SELECT i32, i32 + 1, COUNT(*) FROM t GROUP BY i32, i32 + 1 LIMIT 1"}) {
     const LogicalPlan once = Optimized(sql);
     const LogicalPlan twice = Optimize(once);
     EXPECT_EQ(Explain(twice), Explain(once)) << sql;
@@ -220,6 +221,28 @@ TEST(OptimizerTest, GroupsByTheKeysThatDetermineTheOthers) {
             "    Compute (i16 + 1)\n"
             "      GroupAggregate keys=[i32, i16] COUNT(*)\n"
             "        Scan table=t source=fake columns=[i16, i32]\n");
+}
+
+// Under a LIMIT without ORDER BY the nodes above stop reading early: a key computed above the
+// GroupAggregate would skip the other groups, and so their errors. It stays a key.
+TEST(OptimizerTest, KeepsDependentKeysUnderALimitWithoutASort) {
+  for (const char* sql : {"SELECT i32, i32 + 1, COUNT(*) FROM t GROUP BY i32, i32 + 1 LIMIT 1",
+                          "SELECT i32 + 1, COUNT(*) AS c FROM t GROUP BY i32, i32 + 1 HAVING c > 1 "
+                          "LIMIT 2 OFFSET 1"}) {
+    const LogicalPlan plan = Optimized(sql);
+    ASSERT_NE(plan.root, nullptr);
+    bool found = false;
+    for (LogicalNodePtr node = plan.root; node != nullptr;) {
+      if (const auto* group = std::get_if<GroupAggregateNode>(node.get())) {
+        EXPECT_EQ(group->keys.size(), 2U) << sql << "\n" << Explain(plan);
+        found = true;
+        break;
+      }
+      const LogicalNodePtr* input = InputOf(*node);
+      node = input == nullptr ? nullptr : *input;
+    }
+    EXPECT_TRUE(found) << sql << "\n" << Explain(plan);
+  }
 }
 
 TEST(OptimizerTest, KeepsKeysThatOtherKeysDoNotDetermine) {

@@ -93,3 +93,11 @@ NULL	NULL	2
 # An overflow in a dependent key is an error, as when every key is hashed.
 statement error
 SELECT i32, i32 + 1, COUNT(*) FROM edge GROUP BY i32, i32 + 1
+
+# The same under a LIMIT without ORDER BY: every group's keys are still computed.
+statement error
+SELECT i32, i32 + 1, COUNT(*) FROM edge GROUP BY i32, i32 + 1 LIMIT 1
+
+# ORDER BY ... LIMIT reads every group before the Limit: still an error.
+statement error
+SELECT i32, i32 + 1, COUNT(*) AS c FROM edge GROUP BY i32, i32 + 1 ORDER BY c LIMIT 1
