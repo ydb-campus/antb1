@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790773547828,
+  "lastUpdate": 1790790205851,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -2700,6 +2700,78 @@ window.BENCHMARK_DATA = {
             "value": 9.938553000000486,
             "unit": "ms/iter",
             "extra": "iterations: 74\ncpu: 9.936944459459466 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "5337c479a4721bdf184b57e1c8e6feabad31a775",
+          "message": "perf(cli): keep freed allocator memory in the process (#57)\n\n## Summary\n\n**What changes:** on Linux, `antb1` restarts itself once at start-up\nwith `MIMALLOC_PURGE_DELAY=-1`. mimalloc, Arrow's default memory pool,\nthen keeps the memory a query frees instead of returning it to the\nsystem and faulting it back in. At 128 threads those page faults contend\nin the kernel.\n\n**Why a restart:**\n- mimalloc reads its options when `libarrow` loads, before `main`.\n- Arrow does not export `mi_option_set`.\n- An executable's `.preinit_array` runs early enough, but glibc resets\nthe environment after it.\n\nAll three were verified with `MIMALLOC_VERBOSE=1` (ADR 0017).\n\n**The restart** (`src/cli/allocator.{h,cc}`, first thing in `main`):\n- `execve(\"/proc/self/exe\", argv, environ + MIMALLOC_PURGE_DELAY=-1)`\nkeeps the same pid, arguments and open files, stdin included.\n- Only the new process gets the setting. There is no `setenv`, so a\nfailed exec leaves the running process unchanged.\n\nIt happens only when all of these hold:\n- the process was started as `antb1` itself: `/proc/self/exe` and\n`argv[0]` have the same file name. Run through the dynamic loader or an\nemulator they don't, and it runs without the setting.\n- `MIMALLOC_PURGE_DELAY` is unset. A value the user sets wins, and the\nrestarted process has it, so it never restarts twice.\n- Arrow's default pool is mimalloc: `ARROW_DEFAULT_MEMORY_POOL` is unset\nor `mimalloc`.\n\n**Costs:**\n- The CLI starts once more, about 26 ms. `antb1 bench` times queries\ninside the process, so its numbers don't include it.\n- The process keeps its peak resident memory until it exits.\n`--memory-limit` is unchanged, because the budget counts Arrow\nallocations.\n\n**Alternatives measured and rejected** (full data, 128 threads, the same\nbinary, all 43 queries):\n\n| | total |\n| --- | ---: |\n| mimalloc, today | 25.9-26.1 s |\n| **mimalloc, `MIMALLOC_PURGE_DELAY=-1`** | **24.6-24.7 s** |\n| gperftools tcmalloc 2.18.1, 8 KiB pages | 26.9 s |\n| tcmalloc, 256 KiB pages | 32.1 s |\n| tcmalloc, 256 KiB pages, 4 GiB thread cache | 25.2 s |\n| Arrow jemalloc / system pools | up to 2.7× slower on single queries;\n20-100 s of kernel CPU per query |\n\nThe 256 KiB tcmalloc wins the high-cardinality GROUP BYs (Q32 2.12 s)\nbut loses 15-18% on the scan-heavy queries (Q20-Q22, Q27).\n\n## Performance: full data, 128 threads\n\n**Paired A/B against main:** a process per query, each binary from 3\npath lengths, best of 3 tries per path, median of the 3.\n\n| | main | this PR | speedup |\n| --- | ---: | ---: | ---: |\n| **Total (43 queries)** | **25.60** | **24.66** | **1.038×** |\n| Q32 | 2.648 | 2.437 | 1.09× |\n| Q13 | 0.642 | 0.607 | 1.06× |\n| Q16 | 1.041 | 0.978 | 1.06× |\n| Q18 | 1.915 | 1.819 | 1.05× |\n| Q21 | 0.738 | 0.706 | 1.05× |\n| Q23 | 0.861 | 0.818 | 1.05× |\n| Q34 | 2.108 | 2.010 | 1.05× |\n\nNo query is more than 2% slower (Q30: 0.565 → 0.577).\n\n**In one process over all 43 queries** (the setting through the\nenvironment on the same binary, 3 runs), the gain is 5.4%: 25.98 → 24.57\ns. Kernel CPU per run halves, from about 480 s to 220-245 s. Q36 gains\n22% there, and Q32 and Q39 about 14%.\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [x] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full          # lint, ci, asan, tidy, coverage, fuzz-smoke, ci-gcc\ncheck-full exit 0; 100% tests passed out of 1379; Coverage gate: PASS (cli 94.39% lines, 86.69% branches)\n$ pixi run tsan\n100% tests passed out of 1379\n$ pixi run test-data\n100% tests passed out of 6\n```\n\n**Manual checks:**\n- `MIMALLOC_VERBOSE=1 antb1 query ...` shows `purge_delay: 1000` from\nthe first process, then `-1` from the restarted one.\n- `MIMALLOC_PURGE_DELAY=7` is kept.\n- `ARROW_DEFAULT_MEMORY_POOL=jemalloc` runs one `execve`, so there is no\nrestart.\n- `/lib64/ld-linux-x86-64.so.2 antb1 query ...` runs normally, without\nthe restart.\n\n**Tests:**\n- `AllocatorTest`: the restart decision (unset, set, empty, other pools)\nand `IsSameProgram` (PATH, relative and absolute paths, the loader, an\nemulator, a renamed link).\n- The 63 CLI golden tests run through the restart in the dev, ci, ci-gcc\nand coverage presets, including the stdin test. The sanitizer presets\nuse the system pool, so they don't restart.\n- The random DuckDB differential run was not repeated: the engine is\nunchanged.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer (none changed)\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Claude Code:\n- profiled the scan-bound queries, including thread scaling, per-part\ntimelines and kernel time;\n- measured the allocator alternatives, including a source build of\ngperftools with 256 KiB pages, kept outside the repo;\n- wrote the change, its tests and ADR 0017, and ran the gates and the\nA/B.\n\nA read-only reviewer agent found no P0 or P1 issues. From its notes,\nthis PR adds the dynamic-loader guard and corrects the ADR's claim about\nthe sanitizer presets. The switch from `setenv` to `execve` came from\nclang-tidy's thread-safety check.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-09-30T20:40:52+03:00",
+          "tree_id": "b04c2c9a6c73972a01cf6c7b16a99fdbb5dcf17c",
+          "url": "https://github.com/ydb-campus/antb1/commit/5337c479a4721bdf184b57e1c8e6feabad31a775"
+        },
+        "date": 1790790204701,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4134.441027678857,
+            "unit": "ns/iter",
+            "extra": "iterations: 168613\ncpu: 4134.277315509479 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84632.12659863147,
+            "unit": "ns/iter",
+            "extra": "iterations: 7741\ncpu: 84626.97093398788 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 221512.5393862681,
+            "unit": "ns/iter",
+            "extra": "iterations: 3161\ncpu: 221451.21037646313 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 441199.36988028634,
+            "unit": "ns/iter",
+            "extra": "iterations: 1587\ncpu: 441104.66036546906 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 347607.5879721723,
+            "unit": "ns/iter",
+            "extra": "iterations: 2012\ncpu: 347546.2072564614 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2117688.8398792,
+            "unit": "ns/iter",
+            "extra": "iterations: 331\ncpu: 2117523.141993957 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 178.15031125000047,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 178.11589124999983 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.487045265306213,
+            "unit": "ms/iter",
+            "extra": "iterations: 49\ncpu: 14.486045408163264 ms\nthreads: 1"
           }
         ]
       }
