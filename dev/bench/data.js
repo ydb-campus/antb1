@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790719307705,
+  "lastUpdate": 1790735020755,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -2268,6 +2268,78 @@ window.BENCHMARK_DATA = {
             "value": 14.849394680850843,
             "unit": "ms/iter",
             "extra": "iterations: 47\ncpu: 14.84818185106383 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "855aede93855bb399b1b4bf768b5daeb7870b6ed",
+          "message": "perf(exec): two-level grouped count(distinct) (#51)\n\n## Summary\n\nThis PR speeds up aggregations with `COUNT(DISTINCT)` by running them in\ntwo levels. The design is in the new **ADR 0014** (status Proposed); the\nplan was agreed on 2026-09-30.\n\n**The problem** (profiled on the full data at 128 threads): grouped\n`COUNT(DISTINCT x) ... GROUP BY K` kept its distinct pairs in a\nper-group state, merged in 64 partitions by `hash(K)`. Two costs:\n- **Skew:** all pairs of one K land in one partition. On Q8 the busiest\npartition did about 6.7× the average work while the other 63 waited.\n- **A serial step:** every part's pairs were sorted by group\n(`PairsByGroup`, about 0.4 s in total on Q8) under a `call_once` that\nthe other 63 partition tasks waited on.\n\n**The change: `PartTwoLevelAggregateOperator`** (exec only; the logical\nplan and EXPLAIN are unchanged)\n- **Inner level:** each part builds one `GroupTable` per distinct column\n(K ∪ {x_i}) plus a plain table by K for the other calls. Rows are never\ncopied, unlike Expand.\n- **Heavy keys:**\n- A sample of the first parts (≥ 4M rows, chosen from `part_rows`\nmetadata, never by the thread count) feeds a Misra–Gries summary\n(`HeavyHitters`) of `hash(K)`.\n- A K is heavy when it may hold more than 1/128 of the sample's inner\ngroups.\n- **Partitioning** (`GroupTable::Partition(prefix, heavy)`, a pure\nfunction of each group's keys):\n  - a light K goes to `hash(K)` in every table;\n  - a heavy K is spread by `hash(K, x_i)`.\n- **Outer level** (`OuterGroups`), per partition in parallel:\n  - group by K;\n- `COUNT(DISTINCT x_i)` is the number of inner groups with a non-NULL\nx_i;\n  - plain states merge through `MergeGroups`;\n  - the light groups' output rows are built in the same step.\n- **Heavy merge:** the heavy K's partial groups merge serially across\npartitions in partition order. The counts add exactly, because each (K,\nx_i) lives in exactly one partition.\n- **When it applies** (`TwoLevelAggregation`):\n  - some `COUNT(DISTINCT)` of a non-key column;\n  - no DOUBLE key;\n- every other call independent of its merge order: COUNT, integer\nSUM/AVG, DATE/TIMESTAMP AVG, and MIN/MAX of anything but DOUBLE.\n\nSeveral distinct columns and global aggregations are included; a global\n`COUNT(DISTINCT x)` alone keeps the #49 rewrite. Everything else keeps\nthe existing operators.\n- **Also:** the partitioned GROUP BY merge now takes one Take per key\ncolumn, then zero-copy slices, instead of 64 Takes. This speeds up every\nparallel GROUP BY with many small parts.\n- **Invariants:** internal ones in the new code are `ANTB1_CHECK`s\n(programming errors), not runtime statuses.\n\nResults are byte-identical for any number of threads: constant\npartitions, a fixed hash, a metadata-chosen sample, and merges in part\nand partition order. They match the serial operators; the row order\ndiffers, as SQL allows.\n\n## Performance: full ClickBench data, 128 threads, paired A/B against\nmain (#50)\n\nBest of 3 per query per binary, alternating which ran first. The host\nwas busy (load average 50-70), so small differences are noise.\n\n| Query | main | this PR | speedup |\n| --- | ---: | ---: | ---: |\n| Q8 | 1.637 | 0.889 | 1.84× |\n| Q9 | 1.704 | 0.953 | 1.79× |\n| Q10 | 0.414 | 0.235 | 1.76× |\n| Q11 | 0.421 | 0.254 | 1.66× |\n| Q13 | 1.184 | 0.877 | 1.35× |\n| Q21 (GROUP BY, single Take) | 1.043 | 0.781 | 1.34× |\n| Q22 | 1.947 | 1.708 | 1.14× |\n| **Total (43 queries)** | **47.2** | **44.0** | 1.07× |\n\nNo query got slower beyond run-to-run noise (queries under 0.2 s vary by\nabout ±8%).\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [x] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full          # lint, ci, asan, tidy, coverage, fuzz-smoke, ci-gcc\ncheck-full exit 0; Coverage gate: PASS\n$ pixi run tsan\n100% tests passed out of 1342\n$ ANTB1_DIFF_COUNT=20000 pixi run diff-random\nDIFF: PASS seed=2894401062 queries=20000 failed=0 unsupported=0\n$ pixi run test-data\n100% tests passed out of 6\n```\n\n**New tests:**\n- **exec, `TwoLevelAggregationIsTheSerialOne`:** the operator equals the\nserial `GroupAggregateOperator`/`ScalarAggregateOperator` rows, and is\nbyte-identical on 1 and 4 threads.\n- Keys: a skewed BIGINT key with NULL, two keys, a VARCHAR key, a DATE\nkey, and none.\n- Calls: two distinct columns (one repeated) with COUNT(*), COUNT, SUM,\nAVG, MIN and MAX.\n  - Samples of 0, 3 and all 16 parts; empty parts; no rows.\n- **exec, `TwoLevelAggregationNeedsOrderIndependentCalls`:** the\neligibility rules.\n- **exec, `HeavyKeysSpreadOverThePartitions`:**\n- light keys land in exactly one partition, heavy keys in many,\ndeterministically;\n  - with no keys, the groups spread by the column.\n- **exec, `HeavyHittersTest`:** the Misra–Gries guarantees and\ndeterminism.\n- **exec, `PhysicalPlannerTest.CountDistinctRunsInTwoLevels`:** the plan\nshapes, including every fallback (DOUBLE key, DOUBLE SUM, a distinct\ncolumn that is a key, a single global distinct column).\n- **exec, `MemoryLimitTest`:** a two-level plan fails cleanly past the\nmemory limit.\n- **slt, `distinct/count_distinct.slt`:** 5 cases, with expectations\nfrom `pixi run slt-complete`:\n  - two distinct columns with other calls under a low-cardinality key;\n  - DATE and multi-key grouping;\n  - a high-cardinality VARCHAR key;\n- a global aggregation with several distinct columns, and one with no\nrows.\n\n  The `parallel.*` label runs them on 4 threads against 1 thread.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer (none changed)\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code profiled the\nmerge, wrote the code, tests, ADR and docs, ran the gates and the\nbenchmark, and ran a read-only reviewer agent on the diff. The reviewer\nfound no P0/P1 issues. Its P2 is fixed: a global aggregation did not\nspread its groups over the partitions.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-09-30T05:21:07+03:00",
+          "tree_id": "c2eb9069ac22d8508282a8951d917e5d2f43b9a4",
+          "url": "https://github.com/ydb-campus/antb1/commit/855aede93855bb399b1b4bf768b5daeb7870b6ed"
+        },
+        "date": 1790735020215,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4172.0540034810165,
+            "unit": "ns/iter",
+            "extra": "iterations: 168341\ncpu: 4170.705971807224 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84338.24329453458,
+            "unit": "ns/iter",
+            "extra": "iterations: 7904\ncpu: 84328.40270748988 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 221884.9990491322,
+            "unit": "ns/iter",
+            "extra": "iterations: 3155\ncpu: 221871.97527733748 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 439560.1797323182,
+            "unit": "ns/iter",
+            "extra": "iterations: 1569\ncpu: 439528.25175270875 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 361282.4678332522,
+            "unit": "ns/iter",
+            "extra": "iterations: 1943\ncpu: 361154.7081832218 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2101785.8484848756,
+            "unit": "ns/iter",
+            "extra": "iterations: 330\ncpu: 2101583.7575757587 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 184.55039075000457,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 184.54106925000002 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.865616234042717,
+            "unit": "ms/iter",
+            "extra": "iterations: 47\ncpu: 14.863896276595744 ms\nthreads: 1"
           }
         ]
       }
