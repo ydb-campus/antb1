@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790735020755,
+  "lastUpdate": 1790746556533,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -2340,6 +2340,78 @@ window.BENCHMARK_DATA = {
             "value": 14.865616234042717,
             "unit": "ms/iter",
             "extra": "iterations: 47\ncpu: 14.863896276595744 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b78d502ad708425e533c41330c341332936c6864",
+          "message": "perf(exec): merge group partitions without per-part barriers (#52)\n\n## Summary\n\nThis is fix 1 of the antb1 vs DuckDB comparison. That comparison found\nantb1 3.5× behind DuckDB in total, with GROUP BY queries keeping far\nfewer threads busy (Q32: 14× against DuckDB's 43×).\n\n**The problem, measured on the full data at 128 threads:**\n- Every part's merge ran its 64 partition tasks and then waited for all\nof them before the next part could start.\n- Summed over the 325 parts, the slowest partition took 3.6× the mean on\nQ32 and 8× on Q8. The other partitions idled.\n- After the merge, one thread finalized and emitted every group: 4.3 s\nof Q32's 8.2 s.\n\n**The change** (`exec` only; results unchanged):\n- **Partition lanes** (`src/exec/partition_lanes.{h,cc}`,\n`PartitionLanes`): each partition merges the parts in part order in its\nown lane, a serial queue drained by one executor task at a time.\n  - `Add(part)` hands a part to every lane and returns without waiting.\n  - A part is freed once every lane has merged it.\n- Back-pressure: at most `window` parts wait to be merged, and one under\nmemory pressure.\n- Errors: the failure of the smallest (part, partition) wins, and it is\ncombined with the scheduler's failures so the earliest failing part is\nreported, whatever the timing. `bad_alloc` becomes `OutOfMemory`.\n- Without an executor, a part merges into lane 0, 1, ... on the calling\nthread, as before.\n- Used by `PartGroupAggregateOperator` and\n`PartTwoLevelAggregateOperator`.\n- **Parallel output:** `PartGroupAggregateOperator` builds the\npartitions' rows in parallel, as many partitions at a time as threads,\none under memory pressure so the rows built ahead stay bounded. They are\nemitted in partition order as before.\n- **Out-of-memory retry:** `PartScheduler::set_before_retry` lets both\noperators wait for their lanes to finish before a part that ran out of\nmemory runs again alone. The retry then has the headroom it had before\n(reviewer finding).\n- **Partition count stays 64.** 128 and 256 partitions were 10-60%\nslower, because every part then pays more small merges.\n- Docs: ADR 0013 (amended plan item, no status change), ADR 0014\nwording, and architecture.md (operator row, memory section).\n\n## Performance: full ClickBench data, 128 threads, paired A/B against\nmain (#51)\n\nBest of 3 per query per binary, alternating which ran first.\n\n| Query | #51 | this PR | speedup |\n| --- | ---: | ---: | ---: |\n| Q7 | 0.097 | 0.035 | 2.74× |\n| Q8 | 0.877 | 0.332 | 2.64× |\n| Q9 | 0.947 | 0.407 | 2.33× |\n| Q32 | 6.812 | 3.461 | 1.97× |\n| Q31 | 1.551 | 0.822 | 1.89× |\n| Q10 | 0.222 | 0.143 | 1.55× |\n| Q11 | 0.251 | 0.161 | 1.56× |\n| Q30 | 0.946 | 0.607 | 1.56× |\n| Q4 | 0.428 | 0.316 | 1.36× |\n| Q13 | 0.860 | 0.635 | 1.35× |\n| Q16 | 1.390 | 1.057 | 1.32× |\n| Q15 | 0.675 | 0.516 | 1.31× |\n| Q14 | 0.868 | 0.661 | 1.31× |\n| Q17 | 1.068 | 0.821 | 1.30× |\n| Q18 | 2.568 | 2.028 | 1.27× |\n| Q5 | 0.565 | 0.447 | 1.26× |\n| Q12 | 0.687 | 0.556 | 1.24× |\n| Q33 | 2.500 | 2.092 | 1.19× |\n| Q34 | 2.532 | 2.113 | 1.20× |\n| Q35 | 1.106 | 0.954 | 1.16× |\n| **Total (43 queries)** | **42.7** | **33.3** | 1.28× |\n\nNo query got slower beyond run-to-run noise.\n\n**Against DuckDB 1.5.5** (same setup): antb1 went from 42.8 s to 33.2 s\nagainst DuckDB's 12.2 s, so the gap is now 2.7×, down from 3.5×. Q8 now\nkeeps 32 threads busy, up from 15.\n\nWhere Q32's remaining time goes (measured after this change, quiet host;\nQ32 has about 100 million groups, one per row):\n\n| Phase | Time |\n| --- | ---: |\n| Reading and grouping the parts, until the last part is taken | 2.5 s |\n| Lanes still merging after the last part | 1.1 s |\n| Building the output rows | 0.4 s |\n| ORDER BY … LIMIT above it, on one thread | 1.0 s |\n\nThe profile is dominated by hash-table inserts and state merges. Each\ngroup is hashed twice (in its part, then in the merge), because per-part\npre-aggregation cannot reduce one-group-per-row data. Skipping\npre-aggregation there is the larger follow-up; a per-partition top-N is\nthe smaller one.\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [x] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full          # lint, ci, asan, tidy, coverage, fuzz-smoke, ci-gcc\nlint PASS; ci, asan, ci-gcc: 100% tests passed out of 1350; tidy clean; fuzz-smoke 2/2\ncoverage: PASS on rerun (see note)\n$ pixi run tsan\n100% tests passed out of 1350\n$ ANTB1_DIFF_COUNT=20000 pixi run diff-random\nDIFF: PASS seed=94908035 queries=20000 failed=0 unsupported=0\n$ pixi run test-data\n100% tests passed out of 6\n```\n\n**Coverage note:** one coverage run reported io branch coverage 86.42%\nagainst the 86.6% floor. This PR does not touch io. A rerun gave 86.79%\n(230/265), the same as on #51.\n- Diffing the two runs' lcov shows three io branches in\n`parquet_table.cc` flipping between covered and uncovered from run to\nrun.\n- io sits exactly at its floor, so one lost branch fails the gate.\n- The floor is unchanged. The flakiness probably belongs in its own\nissue.\n\n**New tests:**\n- **`PartitionLanesTest`,** on 1 thread and the 4-thread pool:\n  - every lane merges the parts in order;\n  - without an executor, lanes run inline in partition order;\n  - a slow lane holds back no other;\n- pending parts stay bounded (and at 1 under pressure), and merge\nfunctions are released;\n  - the earliest (part, lane) failure wins over 20 runs;\n  - `bad_alloc` becomes `OutOfMemory`;\n  - a failed submit on a shut-down pool fails the lane.\n- **`PartOperatorsTest.MergeAndReadFailuresFollowPartOrder`:** a HUGEINT\nmerge overflow plus a failed read at earlier and later parts. The same\nerror is reported on 1 and 4 threads.\n-\n**`PartSchedulerTest.OutOfMemoryInParallelFallsBackToOnePartAtATime`:**\nthe retry hook runs exactly once, before the rerun.\n- **`MemoryLimitTest.SinksGiveTheSameResultsUnderPressure`:** every sink\nplan above half of the limit gives the unlimited results. This covers\none-at-a-time merges and row building.\n- **Existing tests:** the grouping and two-level tests are\nbyte-identical across thread counts, including the `parallel.*` slt.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer (none changed)\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code benchmarked\nagainst DuckDB, profiled, and wrote the code, tests and docs. It ran the\ngates and the A/B, and ran a read-only reviewer agent on the diff. The\nreviewer found no P0 issues. Both P1s are fixed:\n  - the out-of-memory retry now waits for the lanes;\n- tests were added for the submit-failure, merge-versus-read error order\nand pressure paths.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-09-30T08:33:41+03:00",
+          "tree_id": "35d51dfa97aada3e641774ae51fdb1cd2fea2434",
+          "url": "https://github.com/ydb-campus/antb1/commit/b78d502ad708425e533c41330c341332936c6864"
+        },
+        "date": 1790746555451,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 3086.06541644468,
+            "unit": "ns/iter",
+            "extra": "iterations: 227053\ncpu: 3085.869946664435 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 73209.41861958258,
+            "unit": "ns/iter",
+            "extra": "iterations: 9345\ncpu: 73202.61391118245 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 84704.33611716377,
+            "unit": "ns/iter",
+            "extra": "iterations: 8262\ncpu: 84672.04103122733 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 376208.63412016764,
+            "unit": "ns/iter",
+            "extra": "iterations: 1864\ncpu: 376061.35515021475 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 353561.0223523204,
+            "unit": "ns/iter",
+            "extra": "iterations: 1879\ncpu: 353505.4167110165 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2190792.5440251073,
+            "unit": "ns/iter",
+            "extra": "iterations: 318\ncpu: 2190548.4748427696 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 202.38349733333885,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 202.342686 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 11.713955283333158,
+            "unit": "ms/iter",
+            "extra": "iterations: 60\ncpu: 11.712748633333328 ms\nthreads: 1"
           }
         ]
       }
