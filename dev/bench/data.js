@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790746556533,
+  "lastUpdate": 1790751255348,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -2412,6 +2412,78 @@ window.BENCHMARK_DATA = {
             "value": 11.713955283333158,
             "unit": "ms/iter",
             "extra": "iterations: 60\ncpu: 11.712748633333328 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "7afc13b65b5fff1e1411249642fb24a4c3a7ee53",
+          "message": "feat(cli,exec): explain --analyze with per-operator profiles (#53)\n\n## Summary\n\n`antb1 explain --analyze` runs a query, drops its rows, and prints every\n**physical** operator with what it did. The design is in the new **ADR\n0015** (status Proposed).\n\n**Why:** the performance work (the DuckDB comparison, #51 and #52) kept\nneeding timers patched into operators by hand, rebuilt and thrown away.\nOnce that misled us: the ORDER BY LIMIT above Q32's GROUP BY was taken\nfor most of its remaining time, and it measured at a fifth.\n\n**Scope** (the maintainer's choice, 2026-09-30): a CLI flag only, with\ntext plus `--format json`. The SQL `EXPLAIN [ANALYZE]` statement is\ndeferred; the parser still rejects the keyword.\n\n**Output on a hermetic fixture** (4 files, 11 row groups):\n\n```text\n$ antb1 explain --analyze --threads 1 -c \"SELECT RegionID, COUNT(*) AS c FROM t WHERE IsMobile = 1 GROUP BY RegionID ORDER BY c DESC, RegionID LIMIT 3\" --table t=hits_like_split/part-*.parquet\nOutput: RegionID:INTEGER c:BIGINT\nTotal: time=39.106ms rows=3 peak_memory=4.59 MB threads=1\nProject RegionID, c  [rows=3 batches=1 time=38.946ms self=0.007ms]\n  TopN Sort c DESC NULLS LAST, RegionID ASC NULLS LAST Limit 3  [rows=3 batches=1 time=38.939ms self=11.831ms sort=0.011ms]\n    PartGroupAggregate GroupAggregate keys=[RegionID] COUNT(*)  [rows=4357 batches=698 time=27.108ms parts=11 skipped=0 part_time=6.161ms wait=6.185ms lanes_tail=0.001ms build=2.297ms groups=4357]\n      Filter IsMobile = 1  [rows=5064 batches=11 parts=11 time=2.075ms (summed over parts) self=0.288ms]\n        Scan table=t source=parquet(files=4, rows=10000) columns=[RegionID, IsMobile]  [rows=10000 batches=11 parts=11 time=1.787ms (summed over parts)]\n```\n\nThe physical plan shows what the logical EXPLAIN hides: part pipelines,\npruned parts, the top-N, and the COUNT(DISTINCT) and two-level rewrites.\n\n**Checked against the Q32 investigation** (full data, 128 threads,\nrelease build; operator names and numbers only):\n\n| Measure | Manual timers | `explain --analyze` |\n| --- | ---: | ---: |\n| Lanes merging after the last part | 1.09 s | 1.109 s |\n| Row building | 0.39 s | 0.375 s |\n| TopN on one thread | 1.0 s | 0.971 s (self) |\n| Waiting for parts | 2.5 s | 2.563 s |\n\n**Design:**\n- **Profile tree:** `exec::ProfileNode` (public `profile.h`), one node\nper physical operator.\n  - Atomic counters: rows, batches, time, runs.\n  - Named metrics (counts, durations, bytes) under a mutex.\n- Text from `plan::ExplainNode`, which is the logical EXPLAIN line\nrefactored out; `antb1 explain` output is unchanged.\n- **Zero cost when off:** only `BuildPhysicalPlan(plan, root)` with a\nroot profiles.\n- It wraps each operator in the private `ProfiledOperator`, which times\nOpen, Next and Close and counts batches.\n- It hands the node to the operator through `Operator::set_profile`, so\nthe operator can add its own metrics.\n  - Without a root there is no wrapper and no clock read.\n- **Part pipelines:** their nodes are created by the plan-time sample\nbuild. Every part's operators add into the same nodes from any thread.\n- Workers only read a node's name, detail and per-part flag. The\nreviewer caught a race there, now fixed.\n- Counts don't depend on the thread count, except under a LIMIT (it\nstops parts that already started) and after an out-of-memory retry. The\ndocs say so.\n- **Metrics:**\n- part operators: `parts`, `skipped` by statistics, `part_time`, `wait`;\n  - GROUP BY: `lanes_tail`, `build`, `groups`;\n  - two-level: `sample_parts`, `heavy_keys`, `outer`, `heavy_groups`;\n  - `merge` for PartAggregate and PartTopN, and `sort`;\n  - query peak memory via a new `MemoryBudget::ResetPeak`.\n- **Engine and CLI:**\n- engine: `Session::ExplainAnalyze` gives a `QueryProfile`;\n`FormatProfile` renders text or JSON.\n- CLI: `explain --analyze` with `--threads`, `--memory-limit` and\n`--format text|json` (`--format` only with `--analyze`, else exit 2).\nJSON output also gives JSON errors.\n- **Docs:** ADR 0015, sql-subset.md (an `explain --analyze` section),\narchitecture.md (pipeline, and \"Where to add things\": an operator names\nitself and adds metrics), benchmarks.md (profiling a ClickBench query\nwithout committing its plan text).\n\n**Left for later** (listed in the ADR): per-operator peak memory,\nprofiles in `antb1 bench` JSON, the SQL `EXPLAIN` statement.\n\n**Needs your approval, not included:** one row of the AGENTS.md command\ntable, to mention `antb1 explain --analyze` next to the dev CLI command.\nAGENTS.md is a protected path.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full          # lint, ci, asan, tidy, coverage, fuzz-smoke, ci-gcc\ncheck-full exit 0; 100% tests passed out of 1364 (ci, asan, ci-gcc); Coverage gate: PASS\n$ pixi run tsan\n100% tests passed out of 1364\n$ ANTB1_DIFF_COUNT=20000 pixi run diff-random\nDIFF: PASS seed=1128002589 queries=20000 failed=0 unsupported=0\n$ pixi run test-data\n100% tests passed out of 6\n```\n\n(The tsan, diff and data runs were on the code before three clang-tidy\nstyle fixes: a `ranges::any_of`, a char overload and a `reserve`.\ncheck-full ran on the final code.)\n\n**Overhead with profiling off:** a paired A/B against #52 on all 43\nqueries came out at 39.45 s against 38.64 s, with scattered changes in\nboth directions. The host was saturated by another workload during it\n(load average up to 155), so this doesn't show overhead either way. I'll\nrerun it on a quiet host and add the table here before merge. By\nconstruction nothing changes when profiling is off: no wrapper, and only\na null check at phase boundaries.\n\n**New tests:**\n- **`ProfileTest`** (exec), on 1 and 4 threads unless noted:\n- the tree mirrors the physical plan, with exact counts, pruned parts\nand details;\n- every operator is named, with its metrics: PartTopN, grouped and\nglobal two-level, a serial GROUP BY, Sort and ScalarAggregate over\nanother aggregation;\n- a LIMIT stops parts: the limit's rows are exact and the parts' counts\nbounded;\n  - a failing part passes its status through, and its runs are counted;\n  - nothing is wrapped without a root;\n  - nodes add up correctly across threads.\n- **`MemoryBudgetTest.ResetPeakStartsFromTheBytesInUse`.**\n- **`SessionTest.ExplainAnalyzeProfilesTheQuery`** (engine): the rows of\nExecute, text and JSON structure, the same counts on 1 and 4 threads,\nand errors equal to Execute's.\n- **CLI goldens:**\n- `explain_analyze` and `explain_analyze_json`, with times and memory\nmatched by regex;\n- `explain_analyze_bind_error` and `explain_analyze_json_error` (the\nJSON error object);\n  - `usage_explain_format_needs_analyze` (exit 2).\n- The plain `explain` goldens are unchanged.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed (the AGENTS.md row awaits\napproval, see above)\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer (none changed)\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code wrote the code,\ntests, ADR and docs, ran the gates, and ran a read-only reviewer agent\non the diff. The reviewer found one P0 and three P1s, all fixed:\n  - a data race on the shared profile nodes' names;\n  - an overclaimed \"exact on any thread count\";\n  - JSON errors printed as text;\n  - missing tests.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-09-30T09:52:12+03:00",
+          "tree_id": "fc3c6e1078efe9f1ec356e8490d400e429bf933e",
+          "url": "https://github.com/ydb-campus/antb1/commit/7afc13b65b5fff1e1411249642fb24a4c3a7ee53"
+        },
+        "date": 1790751254740,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 3319.822028365768,
+            "unit": "ns/iter",
+            "extra": "iterations: 211382\ncpu: 3319.325373021354 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 86447.61796160508,
+            "unit": "ns/iter",
+            "extra": "iterations: 7761\ncpu: 86442.9684319031 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 95415.87460470288,
+            "unit": "ns/iter",
+            "extra": "iterations: 7273\ncpu: 95410.84353086757 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 300074.14614703716,
+            "unit": "ns/iter",
+            "extra": "iterations: 2258\ncpu: 300065.3737821082 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 392844.57418987167,
+            "unit": "ns/iter",
+            "extra": "iterations: 1759\ncpu: 392830.77146105724 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2207622.7232704517,
+            "unit": "ns/iter",
+            "extra": "iterations: 318\ncpu: 2207481.188679246 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 164.51187749999718,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 164.49952374999998 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 11.705413881355945,
+            "unit": "ms/iter",
+            "extra": "iterations: 59\ncpu: 11.704694694915254 ms\nthreads: 1"
           }
         ]
       }
