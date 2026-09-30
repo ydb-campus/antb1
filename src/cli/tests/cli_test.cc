@@ -10,6 +10,7 @@
 #include <regex>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <arrow/api.h>
@@ -21,6 +22,7 @@
 #include "antb1/common/version.h"
 #include "antb1/plan/sql_status.h"
 
+#include "../allocator.h"
 #include "../memory_size.h"
 
 namespace antb1::cli {
@@ -354,6 +356,48 @@ TEST_F(CliTest, BenchFailuresAndExitCodes) {
   EXPECT_EQ(Invoke({"bench", "--queries", io_queries, "--out", "-", "--tries", "0"}).code,
             kExitUsage);
   EXPECT_EQ(Invoke({"bench", "--queries", io_queries}).code, kExitUsage) << "--out is required";
+}
+
+// A lookup over the given variables only.
+EnvLookup FakeEnv(std::vector<std::pair<std::string, std::string>> env) {
+  return [vars = std::move(env)](std::string_view name) -> const char* {
+    for (const auto& [key, value] : vars) {
+      if (key == name) {
+        return value.c_str();
+      }
+    }
+    return nullptr;
+  };
+}
+
+TEST(AllocatorTest, RestartsOnlyWhenMimallocKeepsItsDefaults) {
+#ifdef __linux__
+  EXPECT_TRUE(NeedsAllocatorRestart(FakeEnv({})));
+  EXPECT_TRUE(NeedsAllocatorRestart(FakeEnv({{"ARROW_DEFAULT_MEMORY_POOL", "mimalloc"}})));
+  EXPECT_TRUE(NeedsAllocatorRestart(FakeEnv({{"MIMALLOC_VERBOSE", "1"}})));
+#else
+  EXPECT_FALSE(NeedsAllocatorRestart(FakeEnv({})));
+#endif
+  // A value the user set wins, and a restarted process has one: never a second restart.
+  EXPECT_FALSE(NeedsAllocatorRestart(FakeEnv({{"MIMALLOC_PURGE_DELAY", "-1"}})));
+  EXPECT_FALSE(NeedsAllocatorRestart(FakeEnv({{"MIMALLOC_PURGE_DELAY", "1000"}})));
+  EXPECT_FALSE(NeedsAllocatorRestart(FakeEnv({{"MIMALLOC_PURGE_DELAY", ""}})));
+  // Another pool than mimalloc: the setting would change nothing.
+  EXPECT_FALSE(NeedsAllocatorRestart(FakeEnv({{"ARROW_DEFAULT_MEMORY_POOL", "jemalloc"}})));
+  EXPECT_FALSE(NeedsAllocatorRestart(FakeEnv({{"ARROW_DEFAULT_MEMORY_POOL", "system"}})));
+}
+
+TEST(AllocatorTest, RestartsOnlyTheProgramItself) {
+  EXPECT_TRUE(IsSameProgram("/opt/antb1/bin/antb1", "antb1"));  // found on PATH
+  EXPECT_TRUE(IsSameProgram("/opt/antb1/bin/antb1", "./bin/antb1"));
+  EXPECT_TRUE(IsSameProgram("/opt/antb1/bin/antb1", "/opt/antb1/bin/antb1"));
+  // Through the dynamic loader or an emulator /proc/self/exe is that program.
+  EXPECT_FALSE(IsSameProgram("/usr/lib64/ld-linux-x86-64.so.2", "./antb1"));
+  EXPECT_FALSE(IsSameProgram("/usr/bin/qemu-x86_64", "antb1"));
+  // A link of another name: no restart (the process runs as it is).
+  EXPECT_FALSE(IsSameProgram("/opt/antb1/bin/antb1", "/usr/local/bin/antb1-dev"));
+  EXPECT_FALSE(IsSameProgram("/opt/antb1/bin/antb1", ""));
+  EXPECT_FALSE(IsSameProgram("/opt/antb1/bin/antb1", "dir/"));
 }
 
 TEST(RunCommandTest, ExitStatusAndErrors) {
