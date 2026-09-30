@@ -27,6 +27,6 @@ bool IsSameProgram(std::string_view exe, std::string_view argv0);
 // when NeedsAllocatorRestart and IsSameProgram: mimalloc reads its options when Arrow is loaded,
 // before main, so a process cannot change them for itself. Returns only when no restart is needed
 // or it failed; the process then runs with mimalloc's defaults.
-void RestartForAllocator(char** argv);
+void RestartForAllocator(char* const* argv);
 
 }  // namespace antb1::cli

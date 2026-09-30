@@ -29,15 +29,16 @@ Proposed
 ## Decision
 
 - **On Linux, the `antb1` executable restarts itself once with `MIMALLOC_PURGE_DELAY=-1`** (`cli::RestartForAllocator`,
-  first thing in `main`): `execv("/proc/self/exe", argv)`, the same arguments and open files (stdin included).
+  first thing in `main`): `execve("/proc/self/exe", argv, ...)`, the same arguments and open files (stdin included).
 - **When it restarts:** only when all of these hold:
   - the process was started as `antb1` itself: `/proc/self/exe` and `argv[0]` have the same file name (through the
     dynamic loader or an emulator they do not);
   - `MIMALLOC_PURGE_DELAY` is unset: a value the user set wins, and the restarted process has it, so it never restarts
     twice;
   - Arrow's default pool is mimalloc (`ARROW_DEFAULT_MEMORY_POOL` unset or `mimalloc`).
-- **Setting it first:** the variable is set before the exec, so a failed exec never loops. The process goes on with
-  mimalloc's defaults.
+- **Only the new process gets it:** the exec passes the environment plus the setting (`execve`); nothing in the running
+  process changes, so a failed exec leaves it as it was, with mimalloc's defaults. No `setenv`, which is not
+  thread-safe.
 - **Where it does not apply:** the library modules, the test binaries and other platforms are unchanged.
 
 ## Consequences

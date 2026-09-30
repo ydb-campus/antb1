@@ -371,7 +371,7 @@ EnvLookup FakeEnv(std::vector<std::pair<std::string, std::string>> env) {
 }
 
 TEST(AllocatorTest, RestartsOnlyWhenMimallocKeepsItsDefaults) {
-#if defined(__linux__)
+#ifdef __linux__
   EXPECT_TRUE(NeedsAllocatorRestart(FakeEnv({})));
   EXPECT_TRUE(NeedsAllocatorRestart(FakeEnv({{"ARROW_DEFAULT_MEMORY_POOL", "mimalloc"}})));
   EXPECT_TRUE(NeedsAllocatorRestart(FakeEnv({{"MIMALLOC_VERBOSE", "1"}})));
