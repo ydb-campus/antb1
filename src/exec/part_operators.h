@@ -93,6 +93,14 @@ struct PartitionTopN {
   int64_t keep = 0;
 };
 
+// The first `keep` rows of `rows` in `comparator`'s order (a stable sort: ties keep their order),
+// as one batch; `rows` unchanged when they hold at most `keep` rows (a stable sort above gives the
+// same order). The sort buffer's own containers are reserved on `budget` while it works; nothing
+// is left reserved or allocated when it fails.
+arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> KeepFirstRows(
+    std::vector<std::shared_ptr<arrow::RecordBatch>> rows, const RowComparator& comparator,
+    int64_t keep, arrow::MemoryPool* pool, MemoryBudget* budget);
+
 // Grouped aggregation over a part pipeline: every part is grouped into its own GroupTable on the
 // executor and split into partitions by the hash of its keys (GroupTable::Partition). The parts are
 // merged in part order into one table per partition, each partition in its own lane on the

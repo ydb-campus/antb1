@@ -1013,6 +1013,52 @@ TEST_F(PartOperatorsTest, GroupedTopNIsTheTopNOfAllGroups) {
   }
 }
 
+// A partition's first rows: the stable top of its rows, or its rows unchanged when they are
+// few; out of memory it fails and leaves nothing behind.
+TEST_F(PartOperatorsTest, KeepFirstRowsIsAStableTopOfThePartition) {
+  const auto schema =
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("i", arrow::int64())});
+  // k = i % 4 over i = 0..999 in chunks of 100: many ties on k.
+  const auto chunks = [&] {
+    std::vector<std::shared_ptr<arrow::RecordBatch>> out;
+    for (int64_t c = 0; c < 10; ++c) {
+      std::vector<std::optional<int64_t>> k;
+      std::vector<std::optional<int64_t>> i;
+      for (int64_t r = 0; r < 100; ++r) {
+        k.emplace_back(((c * 100) + r) % 4);
+        i.emplace_back((c * 100) + r);
+      }
+      out.push_back(arrow::RecordBatch::Make(schema, 100, {Int64s(k), Int64s(i)}));
+    }
+    return out;
+  };
+  auto comparator = RowComparator::Make(
+      schema, {plan::SortKey{.column = Column(0, "k", LogicalType::kBigInt), .descending = true}});
+  ASSERT_TRUE(comparator.ok());
+  // The first 30 rows: k = 3, in their order (i = 3, 7, 11, ...).
+  auto top = KeepFirstRows(chunks(), *comparator, 30, arrow::default_memory_pool(), nullptr);
+  ASSERT_TRUE(top.ok()) << top.status().ToString();
+  ASSERT_EQ(top->size(), 1U);
+  ASSERT_EQ(top->front()->num_rows(), 30);
+  const auto& ids = static_cast<const arrow::Int64Array&>(*top->front()->column(1));
+  for (int64_t r = 0; r < 30; ++r) {
+    EXPECT_EQ(ids.Value(r), 3 + (4 * r));
+  }
+  // At most `keep` rows: unchanged.
+  const auto all = chunks();
+  auto unchanged = KeepFirstRows(all, *comparator, 1000, arrow::default_memory_pool(), nullptr);
+  ASSERT_TRUE(unchanged.ok());
+  ASSERT_EQ(unchanged->size(), all.size());
+  EXPECT_EQ(unchanged->front().get(), all.front().get());
+  // Out of memory (the sort buffer's containers on the budget, or the kept rows on the pool).
+  for (const int64_t limit : {int64_t{64}, int64_t{4096}, int64_t{20000}}) {
+    MemoryBudget budget(limit);
+    auto failed = KeepFirstRows(chunks(), *comparator, 30, &budget, &budget);
+    EXPECT_TRUE(failed.status().IsOutOfMemory()) << limit << ": " << failed.status().ToString();
+    EXPECT_EQ(budget.bytes_allocated(), 0) << limit;
+  }
+}
+
 // A global aggregation of only COUNT(DISTINCT x) is planned as a GROUP BY of x (merged in parallel,
 // partitioned) and COUNT(x) over the groups: the counts of the serial COUNT(DISTINCT) state, for
 // DOUBLE (-0.0 with 0.0, one NaN), BIGINT with NULLs, VARCHAR, repeated calls and no rows, on any

@@ -464,19 +464,37 @@ arrow::Status PartGroupAggregateOperator::BuildRows() {
     tables_[p].reset();
     if (top_n_.has_value() && comparator_.has_value()) {
       // Only the partition's first rows in the top-N's order go on; the others are freed here.
-      SortBuffer buffer(*comparator_, top_n_->keep);
-      for (auto& chunk : rows_[p]) {
-        ARROW_RETURN_NOT_OK(buffer.Add(std::move(chunk), pool_));
-      }
-      rows_[p].clear();
-      ARROW_RETURN_NOT_OK(buffer.Sort(pool_));
-      if (buffer.num_rows() > 0) {
-        ARROW_ASSIGN_OR_RAISE(auto kept, buffer.Slice(0, buffer.num_rows(), pool_));
-        rows_[p].push_back(std::move(kept));
-      }
+      ARROW_ASSIGN_OR_RAISE(
+          rows_[p], KeepFirstRows(std::move(rows_[p]), *comparator_, top_n_->keep, pool_, budget_));
     }
     return arrow::Status::OK();
   });
+}
+
+arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> KeepFirstRows(
+    std::vector<std::shared_ptr<arrow::RecordBatch>> rows, const RowComparator& comparator,
+    int64_t keep, arrow::MemoryPool* pool, MemoryBudget* budget) {
+  int64_t total = 0;
+  for (const auto& chunk : rows) {
+    total += chunk->num_rows();
+  }
+  if (total <= keep) {
+    return rows;
+  }
+  SortBuffer buffer(comparator, keep);
+  MemoryReservation memory;
+  memory.Reset(budget);
+  for (auto& chunk : rows) {
+    ARROW_RETURN_NOT_OK(buffer.Add(std::move(chunk), pool));
+    ARROW_RETURN_NOT_OK(memory.Resize(buffer.memory_usage()));
+  }
+  rows.clear();
+  ARROW_RETURN_NOT_OK(memory.Resize(buffer.memory_usage() + buffer.sort_memory()));
+  ARROW_RETURN_NOT_OK(buffer.Sort(pool));
+  ARROW_RETURN_NOT_OK(memory.Resize(buffer.memory_usage()));
+  ARROW_ASSIGN_OR_RAISE(auto kept, buffer.Slice(0, buffer.num_rows(), pool));
+  rows.push_back(std::move(kept));
+  return rows;
 }
 
 arrow::Status PartGroupAggregateOperator::Close() {
