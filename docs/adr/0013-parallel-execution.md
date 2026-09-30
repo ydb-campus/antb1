@@ -156,7 +156,10 @@ The maintainer asked for this design to be ready for TPC-H: hash joins, and corr
 3. **engine and exec:** the session memory limit (`--memory-limit`, default 80% of physical memory).
 4. **exec:** the GROUP BY sink (grouper merge through group maps, first-seen keys by part), then its
    radix-partitioned merge: 64 partitions by key hash (a constant, not the thread count), each merging the parts in
-   part order, the partitions in parallel.
+   part order, the partitions in parallel. Amended 2026-09-30: each partition merges in its own lane
+   (`exec::PartitionLanes`) instead of all partitions of a part finishing before the next part starts. A slow
+   partition then holds back no other: on Q32 the per-part waits cost 3.6× the mean partition time. Then the
+   partitions' rows are built in parallel, as many at a time as threads.
 5. **exec:** the top-N sink (every part keeps its first rows, merged in part order). A full `ORDER BY` without
    `LIMIT` still sorts the part union on one thread; a k-way merge of sorted parts is its follow-up.
 6. **io and exec** (follow-up): skipping parts by their footer statistics (integer-valued columns, predicates

@@ -321,6 +321,30 @@ TEST_F(MemoryLimitTest, SinksFailCleanlyPastTheLimit) {
   }
 }
 
+// Above half of the limit (under pressure) the sinks still give the unlimited results: parts and
+// merges go one at a time, and a GROUP BY builds its rows one partition at a time.
+TEST_F(MemoryLimitTest, SinksGiveTheSameResultsUnderPressure) {
+  auto pool = arrow::internal::ThreadPool::Make(4);
+  ASSERT_TRUE(pool.ok());
+  for (arrow::internal::Executor* executor :
+       {static_cast<arrow::internal::Executor*>(nullptr),
+        static_cast<arrow::internal::Executor*>(pool->get())}) {
+    const auto plans = Plans(Table());
+    for (std::size_t i = 0; i < plans.size(); ++i) {
+      MemoryBudget unlimited(std::nullopt);
+      const auto expected = Run(plans[i], unlimited, executor);
+      ASSERT_TRUE(expected.ok()) << i << ": " << expected.status().ToString();
+      MemoryBudget pressed(kGiB);
+      ASSERT_TRUE(pressed.Reserve((kGiB / 2) + 1).ok());
+      ASSERT_TRUE(pressed.under_pressure());
+      const auto result = Run(plans[i], pressed, executor);
+      ASSERT_TRUE(result.ok()) << i << ": " << result.status().ToString();
+      EXPECT_TRUE((*result)->Equals(**expected)) << i;
+      pressed.Release((kGiB / 2) + 1);
+    }
+  }
+}
+
 // Under pressure a part starts only when no other is in flight: a LIMIT met in the first part
 // reads at most the next one, whatever the window.
 TEST_F(MemoryLimitTest, PartsStartOneAtATimeUnderPressure) {

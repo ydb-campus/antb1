@@ -88,6 +88,13 @@ class PartScheduler {
   // The parts that may be in flight now (with an executor).
   [[nodiscard]] int64_t window() const { return window_; }
 
+  // Called before a part that ran out of memory runs again alone, once the parts ahead are
+  // dropped: the consumer frees what it can (e.g. waits for its merges), so that the part gets the
+  // memory it would have had.
+  void set_before_retry(std::function<void()> before_retry) {
+    before_retry_ = std::move(before_retry);
+  }
+
   // No more parts: running tasks see `stop`, and are waited for; their results are released here.
   void Stop() {
     stopped_ = true;
@@ -159,6 +166,9 @@ class PartScheduler {
     shared_->stop = false;  // no task runs any more
     next_submit_ = next_result_ + 1;
     window_ = 1;
+    if (before_retry_) {
+      before_retry_();
+    }
     return shared_->Run(next_result_);
   }
 
@@ -198,6 +208,7 @@ class PartScheduler {
   int64_t next_submit_ = 0;  // with an executor: the next part to submit
   int64_t next_result_ = 0;  // the next part whose result Next() returns
   bool stopped_ = false;
+  std::function<void()> before_retry_;
   // With an executor: parts next_result_ .. next_submit_ - 1, submitted and not yet taken.
   std::deque<arrow::Future<>> in_flight_;
 };

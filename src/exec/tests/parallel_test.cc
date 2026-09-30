@@ -180,6 +180,19 @@ TEST(PartSchedulerTest, OutOfMemoryInParallelFallsBackToOnePartAtATime) {
   EXPECT_EQ(*on_caller, std::vector<int64_t>{3});
   EXPECT_EQ(scheduler.window(), 4);  // 1 after part 3, then widened by the 6 parts after it
 
+  // The consumer frees what it holds before the part runs again alone, once.
+  on_caller->clear();
+  int retries = 0;
+  PartScheduler<int64_t> hooked(10, task, pool.get(), 4);
+  hooked.set_before_retry([&] {
+    EXPECT_TRUE(on_caller->empty()) << "before the part runs again";
+    ++retries;
+  });
+  for (int64_t part = 0; part < 10; ++part) {
+    ASSERT_TRUE(hooked.Next().ok());
+  }
+  EXPECT_EQ(retries, 1);
+
   PartScheduler<int64_t> inline_scheduler(
       10,
       [](int64_t part, const std::atomic<bool>&) -> arrow::Result<int64_t> {
@@ -794,6 +807,42 @@ TEST_F(PartOperatorsTest, PartitionMergeErrors) {
   ASSERT_TRUE((*op)->Open(ctx).ok());
   ASSERT_TRUE((*op)->Close().ok());
   EXPECT_TRUE((*op)->Next().status().IsInvalid());
+}
+
+// A merge failure (a HUGEINT sum overflowing when part 1 merges into part 0) and a failed read of
+// part i: the query reports the earlier part's failure, the same on any number of threads.
+TEST_F(PartOperatorsTest, MergeAndReadFailuresFollowPartOrder) {
+  const auto pool = Pool();
+  const auto schema = arrow::schema(
+      {arrow::field("k", arrow::int64()), arrow::field("h", arrow::decimal128(38, 0))});
+  arrow::RecordBatchVector batches;
+  for (int part = 0; part < 6; ++part) {
+    arrow::Decimal128Builder h(arrow::decimal128(38, 0));
+    ASSERT_TRUE(h.Append(arrow::Decimal128("60000000000000000000000000000000000000")).ok());
+    batches.push_back(arrow::RecordBatch::Make(schema, 1, {Int64s({1}), h.Finish().ValueOrDie()}));
+  }
+  for (const int64_t failing : {0, 1, 3, 5}) {
+    const auto table = std::make_shared<MemoryTable>(schema, batches, /*split=*/true);
+    table->FailPart(failing);
+    const auto plan = PlanOf(
+        Node(plan::GroupAggregateNode{
+            .input = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}}),
+            .keys = {Column(0, "k", LogicalType::kBigInt)},
+            .aggregates = {{.kind = plan::AggKind::kSum,
+                            .arg = Column(1, "h", LogicalType::kHugeInt),
+                            .type = LogicalType::kHugeInt}}}),
+        2);
+    const auto serial = Run(plan, nullptr);
+    const auto parallel = Run(plan, pool.get());
+    // Parts 0 and 1 fail to read before part 1 would merge; later reads come after the overflow.
+    if (failing <= 1) {
+      EXPECT_FALSE(serial.status().IsExecutionError()) << serial.status().ToString();
+    } else {
+      EXPECT_TRUE(serial.status().IsExecutionError())
+          << failing << ": " << serial.status().ToString();
+    }
+    EXPECT_EQ(parallel.status().ToString(), serial.status().ToString()) << failing;
+  }
 }
 
 // ORDER BY ... LIMIT over parts keeps each part's first rows and merges them in part order: the
