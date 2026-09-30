@@ -40,6 +40,7 @@ SELECT * FROM '/data/hits_*.parquet' LIMIT 5
 ```bash
 pixi run antb1 query -f query.sql --table hits=/data/clickbench/hits_0.parquet --clickbench
 pixi run antb1 explain -f query.sql --table hits=/data/clickbench/hits_0.parquet --clickbench
+pixi run antb1 explain --analyze -f query.sql --table hits=/data/clickbench/hits_0.parquet --clickbench
 ```
 
 Globs are allowed in the file-name part of a path only (`/data/hits_*.parquet`, not `/data/*/hits.parquet`) and
@@ -283,6 +284,41 @@ Project RegionID, c
     Sort c DESC NULLS LAST, "max(EventTime)" ASC NULLS FIRST
       GroupAggregate keys=[RegionID] COUNT(*), MAX(EventTime)
         Scan table=t source=parquet(files=1, rows=10000) columns=[EventTime, RegionID]
+```
+
+### `explain --analyze`
+
+`antb1 explain --analyze` runs the query, drops its rows, and prints the physical plan with what each operator did
+([ADR 0015](adr/0015-query-profiles.md)). It takes `--threads`, `--memory-limit` and `--format text|json` (`--format`
+only with `--analyze`); its errors and exit codes are those of `antb1 query`.
+
+- The text starts with the `Output:` line and a `Total:` line (time, result rows, peak memory, threads).
+- Then comes one line per physical operator, root first, indented as EXPLAIN: its name, its logical node's EXPLAIN
+  text (without a first word that repeats the name), and in brackets:
+  - `rows` and `batches` it returned;
+  - its `time`, or for an operator of a part pipeline, `parts=N` and its time summed over the parts;
+  - `self`, its time without the inputs that ran inside it;
+  - its metrics.
+- Metrics:
+  - `parts`, `skipped` (by statistics);
+  - `part_time` (the part tasks' time, summed);
+  - `wait` (for parts);
+  - `merge`, `lanes_tail` (merging after the last part), `build` (output rows), `outer`;
+  - `sort`, `groups`, and `sample_parts`, `heavy_keys`, `heavy_groups` of a two-level aggregation.
+- The counts do not depend on the number of threads, except under a `LIMIT` (it stops parts that already started,
+  and how many depends on the threads) and after a part ran out of memory next to others (it runs again alone). The
+  times do depend on the threads.
+- With `--format json`, errors are JSON objects, as with `antb1 query --format json`.
+- `--format json` prints the same as one object, times in nanoseconds and memory in bytes.
+
+```text
+Output: RegionID:INTEGER c:BIGINT
+Total: time=39.106ms rows=3 peak_memory=4.59 MB threads=1
+Project RegionID, c  [rows=3 batches=1 time=38.946ms self=0.007ms]
+  TopN Sort c DESC NULLS LAST, RegionID ASC NULLS LAST Limit 3  [rows=3 batches=1 time=38.939ms self=11.831ms sort=0.011ms]
+    PartGroupAggregate GroupAggregate keys=[RegionID] COUNT(*)  [rows=4357 batches=698 time=27.108ms parts=11 skipped=0 part_time=6.161ms wait=6.185ms lanes_tail=0.001ms build=2.297ms groups=4357]
+      Filter IsMobile = 1  [rows=5064 batches=11 parts=11 time=2.075ms (summed over parts) self=0.288ms]
+        Scan table=t source=parquet(files=4, rows=10000) columns=[RegionID, IsMobile]  [rows=10000 batches=11 parts=11 time=1.787ms (summed over parts)]
 ```
 
 ## Types

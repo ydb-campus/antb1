@@ -24,6 +24,7 @@ class Executor;
 namespace antb1::exec {
 
 class MemoryBudget;
+class ProfileNode;
 
 struct ExecContext {
   // Every buffer of the query; the session's MemoryBudget when there is one.
@@ -68,6 +69,16 @@ class Operator {
   virtual arrow::Result<Batch> Next() = 0;
   // Releases the resources of the run; closes the inputs.
   virtual arrow::Status Close() = 0;
+
+  // The node the operator adds its own metrics to (profile.h), set by the physical planner when
+  // the query is profiled; nullptr otherwise.
+  void set_profile(ProfileNode* profile) { profile_ = profile; }
+
+ protected:
+  [[nodiscard]] ProfileNode* profile() const { return profile_; }
+
+ private:
+  ProfileNode* profile_ = nullptr;
 };
 
 // The selected rows of a batch, without a selection (the data itself when every row is selected).

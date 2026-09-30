@@ -204,6 +204,20 @@ TEST(GroupedStateMemoryTest, GrowsWithGroupsAndVarcharValues) {
 
 // ---- operators on a budget ----
 
+// ResetPeak starts a new peak from the bytes in use.
+TEST(MemoryBudgetTest, ResetPeakStartsFromTheBytesInUse) {
+  MemoryBudget budget(std::nullopt);
+  ASSERT_TRUE(budget.Reserve(100).ok());
+  ASSERT_TRUE(budget.Reserve(50).ok());
+  budget.Release(120);
+  EXPECT_EQ(budget.max_memory(), 150);
+  budget.ResetPeak();
+  EXPECT_EQ(budget.max_memory(), 30);
+  ASSERT_TRUE(budget.Reserve(10).ok());
+  EXPECT_EQ(budget.max_memory(), 40);
+  budget.Release(40);
+}
+
 class MemoryLimitTest : public testing::ExecTest {
  protected:
   // 20 parts of 50 rows: x = 0..999, s = a 100-byte string per row.

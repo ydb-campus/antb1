@@ -16,6 +16,8 @@ antb1_add_module(
     part_operators.cc
     part_pruning.cc
     partition_lanes.cc
+    profile.cc
+    profiled_operator.cc
     heavy_hitters.cc
     outer_groups.cc
     group_table.cc
@@ -45,6 +47,7 @@ if(ANTB1_BUILD_TESTS)
       tests/parallel_test.cc
       tests/heavy_hitters_test.cc
       tests/partition_lanes_test.cc
+      tests/profile_test.cc
       tests/memory_test.cc
     LIBS ArrowCompute::arrow_compute_shared
   )

@@ -21,6 +21,7 @@
 
 #include "antb1/common/narrow.h"
 #include "antb1/exec/operator.h"
+#include "antb1/exec/profile.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
 
@@ -540,6 +541,7 @@ arrow::Result<Batch> SortOperator::Next() {
       ARROW_RETURN_NOT_OK(memory_.Resize(buffer_->memory_usage()));
     }
     ARROW_RETURN_NOT_OK(memory_.Resize(buffer_->memory_usage() + buffer_->sort_memory()));
+    const ProfileTimer sort(profile(), "sort");
     ARROW_RETURN_NOT_OK(buffer_->Sort(pool_));
     ARROW_RETURN_NOT_OK(memory_.Resize(buffer_->memory_usage()));
     sorted_ = true;

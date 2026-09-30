@@ -403,6 +403,78 @@ antb1_add_cli_golden(
   explain_projection
   ARGS explain -c "SELECT URL, \"title\" AS t FROM t WHERE SearchPhrase <> '' LIMIT 10" --table "${_t}"
 )
+# explain --analyze: counts are exact on any number of threads, times and memory vary (regexes).
+set(_d "[0-9]+[.][0-9][0-9][0-9]m?s")
+set(_mem "[0-9.]+ [KMGT]?B")
+set(_split "t=${_f}/hits_like_split/part-*.parquet")
+string(
+  CONCAT _explain_analyze
+  "^Output: RegionID:INTEGER c:BIGINT\n"
+  "Total: time=${_d} rows=3 peak_memory=${_mem} threads=4\n"
+  "Project RegionID, c  [[]rows=3 batches=1 time=${_d} self=${_d}[]]\n"
+  "  TopN Sort c DESC NULLS LAST, RegionID ASC NULLS LAST Limit 3  "
+  "[[]rows=3 batches=1 time=${_d} self=${_d} sort=${_d}[]]\n"
+  "    PartGroupAggregate GroupAggregate keys=[[]RegionID[]] COUNT[(][*][)]  "
+  "[[]rows=4357 batches=[0-9]+ time=${_d} parts=11 skipped=0 part_time=${_d} wait=${_d} "
+  "lanes_tail=${_d} build=${_d} groups=4357[]]\n"
+  "      Filter IsMobile = 1  [[]rows=5064 batches=11 parts=11 time=${_d} [(]summed over parts[)] "
+  "self=${_d}[]]\n"
+  "        Scan table=t source=parquet[(]files=4, rows=10000[)] columns=[[]RegionID, IsMobile[]]  "
+  "[[]rows=10000 batches=11 parts=11 time=${_d} [(]summed over parts[)][]]$"
+)
+antb1_add_cli_golden(
+  explain_analyze
+  STDOUT_REGEX "${_explain_analyze}"
+  ARGS
+    explain
+    --analyze
+    --threads
+    4
+    -c
+    "SELECT RegionID, COUNT(*) AS c FROM t WHERE IsMobile = 1 GROUP BY RegionID ORDER BY c DESC, RegionID LIMIT 3"
+    --table
+    "${_split}"
+)
+set(_n "[0-9]+")
+string(
+  CONCAT _explain_analyze_json
+  "^[{]\"output\":\"Output: count_star[(][)]:BIGINT\",\"time_ns\":${_n},\"rows\":1,"
+  "\"peak_memory_bytes\":${_n},\"threads\":1,\"plan\":"
+  "[{]\"name\":\"PartAggregate\",\"detail\":\"Aggregate COUNT[(][*][)]\",\"per_part\":false,"
+  "\"runs\":1,\"rows\":1,\"batches\":1,\"time_ns\":${_n},\"self_time_ns\":${_n},"
+  "\"metrics\":[{]\"parts\":11,\"skipped\":0,\"part_time_ns\":${_n},\"wait_ns\":${_n},"
+  "\"merge_ns\":${_n}[}],\"inputs\":[[]"
+  "[{]\"name\":\"Filter\",\"detail\":\"Filter RegionID > 100\",\"per_part\":true,\"runs\":11,"
+  "\"rows\":9640,\"batches\":11,\"time_ns\":${_n},\"self_time_ns\":${_n},\"metrics\":[{][}],"
+  "\"inputs\":[[]"
+  "[{]\"name\":\"Scan\",\"detail\":\"Scan table=t source=parquet[(]files=4, rows=10000[)] "
+  "columns=[[]RegionID[]]\",\"per_part\":true,\"runs\":11,\"rows\":10000,\"batches\":11,"
+  "\"time_ns\":${_n},\"self_time_ns\":${_n},\"metrics\":[{][}],\"inputs\":[[][]]"
+  "[}][]][}][]][}][}]$"
+)
+antb1_add_cli_golden(
+  explain_analyze_json
+  STDOUT_REGEX "${_explain_analyze_json}"
+  ARGS explain --analyze --threads 1 --format json -c "SELECT COUNT(*) FROM t WHERE RegionID > 100" --table "${_split}"
+)
+antb1_add_cli_golden(
+  explain_analyze_bind_error
+  EXIT_CODE 1
+  STDERR
+  ARGS explain --analyze --threads 1 -c "SELECT nope FROM t" --table "${_t}"
+)
+antb1_add_cli_golden(
+  explain_analyze_json_error
+  EXIT_CODE 1
+  STDERR
+  ARGS explain --analyze --format json --threads 1 -c "SELECT nope FROM t" --table "${_t}"
+)
+antb1_add_cli_golden(
+  usage_explain_format_needs_analyze
+  EXIT_CODE 2
+  STDERR_REGEX "--format requires --analyze"
+  ARGS explain --format json -c "${_count}" --table "${_t}"
+)
 antb1_add_cli_golden(
   version
   STDOUT_REGEX "^antb1 [0-9]+[.][0-9]+[.][0-9]+[^ ]* [(]Apache Arrow [0-9]+[.][0-9]+[.][0-9]+[)]$"

@@ -21,6 +21,7 @@ class ThreadPool;
 
 namespace antb1::exec {
 class MemoryBudget;
+class ProfileNode;
 }  // namespace antb1::exec
 
 namespace antb1::engine {
@@ -55,6 +56,16 @@ struct QueryResult {
   QueryTimings timings;
 };
 
+// One profiled run of a query (`antb1 explain --analyze`, docs/adr/0015-query-profiles.md).
+struct QueryProfile {
+  std::string output;                       // the plan's "Output:" line, as EXPLAIN shows it
+  std::shared_ptr<exec::ProfileNode> root;  // the physical operators, root first
+  std::chrono::nanoseconds time{0};         // physical planning and execution
+  int64_t rows = 0;                         // result rows (discarded)
+  int64_t peak_memory = 0;                  // the most bytes the session held during the run
+  int threads = 1;
+};
+
 // Entry point of the engine: owns the catalog and the thread pool, parses/binds/executes SQL.
 // Not thread-safe: one query at a time.
 class Session {
@@ -76,6 +87,8 @@ class Session {
 
   arrow::Result<QueryResult> Execute(std::string_view sql);
   arrow::Result<std::string> Explain(std::string_view sql);
+  // Runs the query with every physical operator profiled; the result rows are dropped.
+  arrow::Result<QueryProfile> ExplainAnalyze(std::string_view sql);
 
   [[nodiscard]] const plan::Catalog& catalog() const { return catalog_; }
   [[nodiscard]] const SessionOptions& options() const { return options_; }

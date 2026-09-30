@@ -19,6 +19,7 @@
 
 #include "antb1/common/check.h"
 #include "antb1/exec/operator.h"
+#include "antb1/exec/profile.h"
 #include "antb1/exec/sort.h"
 #include "antb1/plan/logical_plan.h"
 
@@ -135,8 +136,10 @@ PartUnionOperator::~PartUnionOperator() = default;
 
 arrow::Status PartUnionOperator::Open(ExecContext& ctx) {
   ARROW_RETURN_NOT_OK(Close());
-  auto task = [pipeline = pipeline_, part_ctx = PartContext(ctx), cap = row_cap_](
-                  int64_t part, const std::atomic<bool>& stop) -> arrow::Result<PartBatches> {
+  auto task = [pipeline = pipeline_, part_ctx = PartContext(ctx), cap = row_cap_,
+               profile = profile()](int64_t part,
+                                    const std::atomic<bool>& stop) -> arrow::Result<PartBatches> {
+    const ProfileTimer part_time(profile, "part_time");
     auto batches = std::make_shared<std::vector<Batch>>();
     int64_t rows = 0;
     if (cap.has_value() && *cap <= 0) {
@@ -168,7 +171,10 @@ arrow::Result<Batch> PartUnionOperator::Next() {
     if (scheduler_->done()) {
       return Batch{};
     }
-    ARROW_ASSIGN_OR_RAISE(current_, scheduler_->Next());
+    {
+      const ProfileTimer wait(profile(), "wait");
+      ARROW_ASSIGN_OR_RAISE(current_, scheduler_->Next());
+    }
   }
 }
 
@@ -197,8 +203,9 @@ arrow::Status PartAggregateOperator::Open(ExecContext& ctx) {
   pool_ = ctx.pool;
   done_ = false;
   auto task = [pipeline = pipeline_, part_ctx = PartContext(ctx), aggregates = aggregates_,
-               width = input_width_](int64_t part,
-                                     const std::atomic<bool>& stop) -> arrow::Result<PartStates> {
+               width = input_width_, profile = profile()](
+                  int64_t part, const std::atomic<bool>& stop) -> arrow::Result<PartStates> {
+    const ProfileTimer part_time(profile, "part_time");
     ARROW_ASSIGN_OR_RAISE(AggregateSet states,
                           AggregateSet::Make(*aggregates, width, part_ctx.pool));
     auto shared = std::make_shared<AggregateSet>(std::move(states));
@@ -223,7 +230,12 @@ arrow::Result<Batch> PartAggregateOperator::Next() {
   }
   ARROW_ASSIGN_OR_RAISE(AggregateSet total, AggregateSet::Make(*aggregates_, input_width_, pool_));
   while (!scheduler_->done()) {
-    ARROW_ASSIGN_OR_RAISE(const PartStates part, scheduler_->Next());
+    PartStates part;
+    {
+      const ProfileTimer wait(profile(), "wait");
+      ARROW_ASSIGN_OR_RAISE(part, scheduler_->Next());
+    }
+    const ProfileTimer merge(profile(), "merge");
     ARROW_RETURN_NOT_OK(total.Merge(*part));
   }
   done_ = true;
@@ -263,8 +275,9 @@ arrow::Status PartGroupAggregateOperator::Open(ExecContext& ctx) {
   merged_ = false;
   opened_ = true;
   auto task = [pipeline = pipeline_, part_ctx = PartContext(ctx), keys = keys_,
-               aggregates = aggregates_, width = input_width_](
+               aggregates = aggregates_, width = input_width_, profile = profile()](
                   int64_t part, const std::atomic<bool>& stop) -> arrow::Result<PartTable> {
+    const ProfileTimer part_time(profile, "part_time");
     ARROW_ASSIGN_OR_RAISE(
         std::shared_ptr<GroupTable> table,
         GroupTable::Make(keys, aggregates, width, part_ctx.pool, part_ctx.budget));
@@ -293,7 +306,10 @@ arrow::Status PartGroupAggregateOperator::Merge() {
   });
   arrow::Status status;
   for (int64_t index = 0; !scheduler_->done(); ++index) {
-    arrow::Result<PartTable> part = scheduler_->Next();
+    arrow::Result<PartTable> part = [&] {
+      const ProfileTimer wait(profile(), "wait");
+      return scheduler_->Next();
+    }();
     if (!part.ok()) {
       status = part.status();
       break;
@@ -319,6 +335,7 @@ arrow::Status PartGroupAggregateOperator::Merge() {
   scheduler_->set_before_retry(nullptr);
   // A merge failure is of an earlier part than any failure of the scheduler seen after it.
   if (lanes != nullptr) {
+    const ProfileTimer tail(profile(), "lanes_tail");  // merging after the last part came
     ARROW_RETURN_NOT_OK(lanes->Finish());
   }
   return status;
@@ -333,9 +350,17 @@ arrow::Result<Batch> PartGroupAggregateOperator::Next() {
     merged_ = true;
     scheduler_.reset();
     rows_.assign(tables_.size(), {});
+    if (profile() != nullptr) {
+      int64_t groups = 0;
+      for (const auto& table : tables_) {
+        groups += table->num_groups();
+      }
+      profile()->Add("groups", MetricUnit::kCount, groups);
+    }
   }
   for (; next_table_ < rows_.size(); ++next_table_, next_chunk_ = 0) {
     if (next_table_ == built_) {
+      const ProfileTimer build(profile(), "build");
       ARROW_RETURN_NOT_OK(BuildRows());
     }
     std::vector<std::shared_ptr<arrow::RecordBatch>>& rows = rows_[next_table_];
@@ -573,8 +598,9 @@ arrow::Status PartTwoLevelAggregateOperator::Aggregate() {
   const auto run = [&](int64_t first, int64_t count,
                        std::shared_ptr<const std::vector<std::uint64_t>> heavy_keys) {
     auto task = [pipeline = pipeline_, part_ctx = part_ctx_, spec, first, prefix,
-                 heavy = std::move(heavy_keys)](
+                 heavy = std::move(heavy_keys), profile = profile()](
                     int64_t i, const std::atomic<bool>& stop) -> arrow::Result<PartTables> {
+      const ProfileTimer part_time(profile, "part_time");
       auto part = std::make_shared<InnerPart>();
       ARROW_ASSIGN_OR_RAISE(part->tables, MakeInnerTables(*spec, part_ctx.pool, part_ctx.budget));
       ARROW_RETURN_NOT_OK(RunPart(
@@ -618,7 +644,11 @@ arrow::Status PartTwoLevelAggregateOperator::Aggregate() {
   {
     auto scheduler = run(0, sample, nullptr);
     while (!scheduler->done()) {
-      ARROW_ASSIGN_OR_RAISE(PartTables part, scheduler->Next());
+      PartTables part;
+      {
+        const ProfileTimer wait(profile(), "wait");
+        ARROW_ASSIGN_OR_RAISE(part, scheduler->Next());
+      }
       sampled.push_back(std::move(part));
     }
   }
@@ -635,6 +665,10 @@ arrow::Status PartTwoLevelAggregateOperator::Aggregate() {
       part->key_hashes = {};
     }
     heavy_ = summary.Above(kHeavyShare);
+    if (profile() != nullptr) {
+      profile()->Add("sample_parts", MetricUnit::kCount, sample);
+      profile()->Add("heavy_keys", MetricUnit::kCount, static_cast<int64_t>(heavy_.size()));
+    }
   }
   ARROW_RETURN_NOT_OK(ForEach(executor_, sampled.size(), [&](std::size_t i) -> arrow::Status {
     for (const auto& table : sampled[i]->tables) {
@@ -660,7 +694,10 @@ arrow::Status PartTwoLevelAggregateOperator::Aggregate() {
     // A part that runs out of memory runs again alone once the earlier parts are merged and freed.
     scheduler->set_before_retry([&lanes] { lanes.Wait(); });
     while (!scheduler->done()) {
-      arrow::Result<PartTables> part = scheduler->Next();
+      arrow::Result<PartTables> part = [&] {
+        const ProfileTimer wait(profile(), "wait");
+        return scheduler->Next();
+      }();
       if (!part.ok()) {
         status = part.status();
         break;
@@ -672,7 +709,10 @@ arrow::Status PartTwoLevelAggregateOperator::Aggregate() {
     }
   }
   // A merge failure is of an earlier part than any failure of the scheduler seen after it.
-  ARROW_RETURN_NOT_OK(lanes.Finish());
+  {
+    const ProfileTimer tail(profile(), "lanes_tail");  // merging after the last part came
+    ARROW_RETURN_NOT_OK(lanes.Finish());
+  }
   ARROW_RETURN_NOT_OK(status);
 
   // The outer level, partitions in parallel; then the heavy K's groups across the partitions.
@@ -680,12 +720,18 @@ arrow::Status PartTwoLevelAggregateOperator::Aggregate() {
   outer_.resize(GroupTable::kPartitions);
   heavy_groups_.assign(GroupTable::kPartitions, {});
   rows_.assign(GroupTable::kPartitions, {});
-  ARROW_RETURN_NOT_OK(
-      ForEach(executor_, GroupTable::kPartitions, [&](std::size_t p) { return Outer(p); }));
+  {
+    const ProfileTimer outer(profile(), "outer");
+    ARROW_RETURN_NOT_OK(
+        ForEach(executor_, GroupTable::kPartitions, [&](std::size_t p) { return Outer(p); }));
+  }
   tables_.clear();
   ARROW_ASSIGN_OR_RAISE(heavy_table_,
                         OuterGroups::Make(key_types_, distinct_.size(), plain_, pool_, budget_));
+  int64_t light = 0;
   for (std::size_t p = 0; p < GroupTable::kPartitions; ++p) {
+    light += static_cast<int64_t>(outer_[p]->num_groups()) -
+             static_cast<int64_t>(heavy_groups_[p].size());
     ARROW_RETURN_NOT_OK(heavy_table_->Merge(*outer_[p], heavy_groups_[p]));
     outer_[p].reset();  // gives the memory back
   }
@@ -693,6 +739,10 @@ arrow::Status PartTwoLevelAggregateOperator::Aggregate() {
   heavy_groups_.clear();
   if (global_) {
     ARROW_RETURN_NOT_OK(heavy_table_->EnsureGroup());
+  }
+  if (profile() != nullptr) {
+    profile()->Add("groups", MetricUnit::kCount, light + heavy_table_->num_groups());
+    profile()->Add("heavy_groups", MetricUnit::kCount, heavy_table_->num_groups());
   }
   return arrow::Status::OK();
 }
@@ -778,7 +828,9 @@ arrow::Status PartTopNOperator::Open(ExecContext& ctx) {
   next_ = 0;
   end_ = 0;
   auto task = [pipeline = pipeline_, part_ctx = PartContext(ctx), schema = schema_, keys = keys_,
-               keep](int64_t part, const std::atomic<bool>& stop) -> arrow::Result<PartBuffer> {
+               keep, profile = profile()](
+                  int64_t part, const std::atomic<bool>& stop) -> arrow::Result<PartBuffer> {
+    const ProfileTimer part_time(profile, "part_time");
     ARROW_ASSIGN_OR_RAISE(RowComparator part_comparator, RowComparator::Make(schema, keys));
     auto rows =
         std::make_shared<PartRows>(SortBuffer(std::move(part_comparator), keep), part_ctx.budget);
@@ -806,7 +858,12 @@ arrow::Result<Batch> PartTopNOperator::Next() {
   }
   if (!sorted_) {
     while (!scheduler_->done()) {
-      ARROW_ASSIGN_OR_RAISE(const PartBuffer part, scheduler_->Next());
+      PartBuffer part;
+      {
+        const ProfileTimer wait(profile(), "wait");
+        ARROW_ASSIGN_OR_RAISE(part, scheduler_->Next());
+      }
+      const ProfileTimer merge(profile(), "merge");
       ARROW_RETURN_NOT_OK(merged_->Merge(part->buffer, pool_));  // after the earlier parts' rows
       ARROW_RETURN_NOT_OK(memory_.Resize(merged_->memory_usage()));
     }

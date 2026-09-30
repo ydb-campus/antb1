@@ -34,6 +34,10 @@ class MemoryBudget final : public arrow::MemoryPool {
   int64_t bytes_allocated() const override { return used_.load(std::memory_order_relaxed); }
   // The most bytes in use at once.
   int64_t max_memory() const override { return peak_.load(std::memory_order_relaxed); }
+  // Starts a new peak from the bytes in use now (a profiled query's own peak).
+  void ResetPeak() {
+    peak_.store(used_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+  }
   int64_t total_bytes_allocated() const override { return total_.load(std::memory_order_relaxed); }
   int64_t num_allocations() const override { return count_.load(std::memory_order_relaxed); }
   std::string backend_name() const override { return backend_->backend_name(); }
