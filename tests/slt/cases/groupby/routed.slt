@@ -1,0 +1,29 @@
+# GROUP BY keys with nearly one group per row: a part whose first batch hardly reduces sends its
+# other rows straight to the partitions (the parallel run reads in batches of 1000 rows). The
+# groups are those of any other plan.
+
+query II nosort
+SELECT WatchID, COUNT(*) AS c FROM hits_like_split GROUP BY WatchID ORDER BY c DESC, WatchID LIMIT 5
+----
+-9223372036854775808	1
+-9222731508449045939	1
+-9221648886445140287	1
+-9221484110054234133	1
+-9219525906035539994	1
+
+query IIIT nosort
+SELECT UserID, COUNT(*) AS c, SUM(RegionID), MIN(URL) FROM hits_like_split GROUP BY UserID ORDER BY c DESC, UserID LIMIT 5
+----
+9223372036854775807	2	17198	https://www.example.org/beta/11977
+-9223372036854775808	1	3233	https://www.example.org/музыка/24763
+386056098584291	1	5922	https://www.example.org/green/56232?q=музыка
+806893882316698	1	13285	https://www.example.org/quick/91233
+3139869338429733	1	2174	https://www.example.org/pixel/7805
+
+query IIII nosort
+SELECT ClientIP, WatchID, COUNT(DISTINCT RegionID), MAX(EventTime) FROM hits_like_split WHERE IsMobile = 0 GROUP BY ClientIP, WatchID ORDER BY ClientIP, WatchID LIMIT 4
+----
+-2147394735	6266443962735311760	1	1374720206
+-2147366745	2551153951090850344	1	1374480400
+-2146467647	5073986116658473423	1	1374849039
+-2144392656	-1268719675450093174	1	1372721710

@@ -16,6 +16,7 @@
 #include <arrow/compute/api_vector.h>
 #include <arrow/compute/exec.h>
 #include <arrow/compute/row/grouper.h>
+#include <arrow/util/byte_size.h>
 #include <arrow/util/hashing.h>
 
 #include "antb1/common/check.h"
@@ -316,6 +317,55 @@ arrow::Result<std::vector<std::uint64_t>> GroupTable::PrefixHashes(std::size_t p
   return KeyHashes(keys);
 }
 
+arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> GroupTable::RouteRows(
+    const arrow::RecordBatch& rows) const {
+  ANTB1_CHECK(!keys_.empty());
+  std::vector<arrow::Datum> keys;
+  keys.reserve(keys_.size());
+  for (const plan::BoundColumn& key : keys_) {
+    std::shared_ptr<arrow::Array> column = rows.column(key.index);
+    if (key.type == plan::LogicalType::kDouble) {
+      ARROW_ASSIGN_OR_RAISE(column, NormalizeDoubleKey(column, pool_));
+    }
+    keys.emplace_back(std::move(column));
+  }
+  ARROW_ASSIGN_OR_RAISE(const std::vector<std::uint64_t> hashes,
+                        KeyHashes(arrow::compute::ExecBatch(std::move(keys), rows.num_rows())));
+  // The rows in partition order (a stable counting sort), one Take, then a slice per partition.
+  std::vector<std::int64_t> start(kPartitions + 1, 0);
+  for (const std::uint64_t hash : hashes) {
+    ++start[(hash % kPartitions) + 1];
+  }
+  for (std::size_t p = 1; p <= kPartitions; ++p) {
+    start[p] += start[p - 1];
+  }
+  std::vector<std::int64_t> next(start.begin(), start.end() - 1);
+  std::vector<std::int64_t> order(hashes.size());
+  for (std::size_t r = 0; r < hashes.size(); ++r) {
+    order[static_cast<std::size_t>(next[hashes[r] % kPartitions]++)] = static_cast<std::int64_t>(r);
+  }
+  arrow::Int64Builder indices(pool_);
+  ARROW_RETURN_NOT_OK(indices.AppendValues(order));
+  ARROW_ASSIGN_OR_RAISE(const auto positions, indices.Finish());
+  arrow::ArrayVector columns;
+  columns.reserve(static_cast<std::size_t>(rows.num_columns()));
+  for (const auto& column : rows.columns()) {
+    ARROW_ASSIGN_OR_RAISE(
+        const arrow::Datum taken,
+        arrow::compute::Take(column, positions, arrow::compute::TakeOptions::NoBoundsCheck(),
+                             kernels_.get()));
+    columns.push_back(taken.make_array());
+  }
+  const std::shared_ptr<arrow::RecordBatch> sorted =
+      arrow::RecordBatch::Make(rows.schema(), rows.num_rows(), std::move(columns));
+  std::vector<std::shared_ptr<arrow::RecordBatch>> out;
+  out.reserve(kPartitions);
+  for (std::size_t p = 0; p < kPartitions; ++p) {
+    out.push_back(sorted->Slice(start[p], start[p + 1] - start[p]));
+  }
+  return out;
+}
+
 arrow::Result<arrow::compute::ExecBatch> GroupTable::uniques() const {
   ANTB1_CHECK(grouper_ != nullptr);
   return grouper_->GetUniques();
@@ -434,17 +484,44 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> GroupTable::NextChunk(
   if (next_chunk_ >= chunk_groups_.size()) {
     return nullptr;
   }
-  const std::uint32_t rows = chunk_groups_[next_chunk_];
+  // Consecutive chunks together, up to kMaxMergeChunk groups and kMaxJoinedKeyBytes of keys (chunks
+  // of a few groups each come from rows consumed a few at a time): their keys joined, every state
+  // finalized once over the range. The byte bound keeps a joined VARCHAR key far from the 2 GiB of
+  // one binary array.
+  std::size_t end = next_chunk_;
+  std::uint32_t rows = 0;
+  int64_t bytes = 0;
+  while (end < chunk_groups_.size()) {
+    int64_t chunk_bytes = 0;
+    for (const auto& chunks : first_keys_) {
+      chunk_bytes += arrow::util::TotalBufferSize(*chunks[end]);
+    }
+    if (end > next_chunk_ &&
+        (rows + chunk_groups_[end] > kMaxMergeChunk || bytes + chunk_bytes > kMaxJoinedKeyBytes)) {
+      break;
+    }
+    rows += chunk_groups_[end];
+    bytes += chunk_bytes;
+    ++end;
+  }
   arrow::ArrayVector columns;
   columns.reserve(keys_.size() + states_.size());
   for (auto& chunks : first_keys_) {
-    columns.push_back(std::move(chunks[next_chunk_]));
+    if (end - next_chunk_ == 1) {
+      columns.push_back(std::move(chunks[next_chunk_]));
+      continue;
+    }
+    arrow::ArrayVector pieces(
+        std::make_move_iterator(chunks.begin() + static_cast<std::ptrdiff_t>(next_chunk_)),
+        std::make_move_iterator(chunks.begin() + static_cast<std::ptrdiff_t>(end)));
+    ARROW_ASSIGN_OR_RAISE(auto joined, arrow::Concatenate(pieces, pool_));
+    columns.push_back(std::move(joined));
   }
   for (const auto& state : states_) {
     ARROW_ASSIGN_OR_RAISE(auto column, state->Finalize(next_group_, next_group_ + rows, pool_));
     columns.push_back(std::move(column));
   }
-  ++next_chunk_;
+  next_chunk_ = end;
   next_group_ += rows;
   return arrow::RecordBatch::Make(schema, rows, std::move(columns));
 }

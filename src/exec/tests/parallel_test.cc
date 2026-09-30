@@ -22,6 +22,7 @@
 #include <arrow/util/thread_pool.h>
 #include <gtest/gtest.h>
 
+#include "antb1/exec/filter.h"
 #include "antb1/exec/group_aggregate.h"
 #include "antb1/exec/memory_budget.h"
 #include "antb1/exec/physical_planner.h"
@@ -1188,6 +1189,174 @@ TEST_F(PartOperatorsTest, HeavyKeysSpreadOverThePartitions) {
                             [&](std::size_t p) { return !(*by_x)->partition_groups(p).empty(); }),
       50)
       << "400 values of x over 64 partitions";
+}
+
+// ---- rows routed past the parts' own tables ----
+
+// 12 parts of 40 rows (every fourth empty): u (BIGINT, unique per row: parts that do not reduce),
+// k (BIGINT, 5 values), d (DOUBLE key with -0.0, 0.0, NaN, NULL), s (VARCHAR), v (BIGINT).
+std::shared_ptr<MemoryTable> RoutedTable(bool split) {
+  const auto schema =
+      arrow::schema({arrow::field("u", arrow::int64()), arrow::field("k", arrow::int64()),
+                     arrow::field("d", arrow::float64()), arrow::field("s", arrow::binary()),
+                     arrow::field("v", arrow::int64())});
+  const std::vector<double> doubles = {-0.0, 0.0, std::nan(""), 1.5, -std::nan("")};
+  arrow::RecordBatchVector batches;
+  for (int64_t part = 0; part < 12; ++part) {
+    std::vector<std::optional<int64_t>> u;
+    std::vector<std::optional<int64_t>> k;
+    arrow::DoubleBuilder d;
+    std::vector<std::optional<std::string>> str;
+    std::vector<std::optional<int64_t>> v;
+    const int64_t rows = part % 4 == 3 ? 0 : 40;
+    for (int64_t i = 0; i < rows; ++i) {
+      const int64_t r = (part * 40) + i;
+      u.push_back(r % 17 == 0 ? std::nullopt : std::optional<int64_t>(r));
+      k.emplace_back(r % 5);
+      EXPECT_TRUE(
+          (r % 13 == 0 ? d.AppendNull() : d.Append(doubles[static_cast<std::size_t>(r % 5)])).ok());
+      str.emplace_back("s" + std::to_string(r % 7));
+      v.emplace_back(r % 11);
+    }
+    batches.push_back(arrow::RecordBatch::Make(
+        schema, rows,
+        {Int64s(u), Int64s(k), d.Finish().ValueOrDie(), testing::Strings(str), Int64s(v)}));
+  }
+  if (!split) {
+    auto combined = arrow::Table::FromRecordBatches(schema, batches).ValueOrDie();
+    auto one = combined->CombineChunksToBatch().ValueOrDie();
+    return std::make_shared<MemoryTable>(schema, arrow::RecordBatchVector{one}, false);
+  }
+  return std::make_shared<MemoryTable>(schema, std::move(batches), true);
+}
+
+// A part whose first batch hardly reduces sends its other rows straight to the partitions: the
+// groups are those of the serial GROUP BY (as a set) and the same on any number of threads, byte
+// for byte, for unique and repeated keys, DOUBLE keys (-0.0 with 0.0, one NaN), NULL keys and every
+// order-independent call; a DOUBLE SUM keeps the parts' own tables. The parts that routed rows are
+// counted exactly.
+TEST_F(PartOperatorsTest, RoutedRowsGiveTheSameGroups) {
+  const auto pool = Pool();
+  const auto u = Column(0, "u", LogicalType::kBigInt);
+  const auto k = Column(1, "k", LogicalType::kBigInt);
+  const auto d = Column(2, "d", LogicalType::kDouble);
+  const auto str = Column(3, "s", LogicalType::kVarchar);
+  const auto v = Column(4, "v", LogicalType::kBigInt);
+  const std::vector<plan::AggregateCall> calls = {
+      {.kind = plan::AggKind::kCountStar, .arg = {}, .type = LogicalType::kBigInt},
+      {.kind = plan::AggKind::kCount, .arg = u, .type = LogicalType::kBigInt},
+      {.kind = plan::AggKind::kSum, .arg = v, .type = LogicalType::kHugeInt},
+      {.kind = plan::AggKind::kMin, .arg = str, .type = LogicalType::kVarchar},
+      {.kind = plan::AggKind::kMax, .arg = d, .type = LogicalType::kDouble},
+      {.kind = plan::AggKind::kCountDistinct, .arg = v, .type = LogicalType::kBigInt}};
+  const plan::AggregateCall double_sum{
+      .kind = plan::AggKind::kSum, .arg = d, .type = LogicalType::kDouble};
+  const auto run =
+      [&](const std::shared_ptr<MemoryTable>& table, const std::vector<plan::BoundColumn>& keys,
+          const std::vector<plan::AggregateCall>& aggregates, arrow::internal::Executor* executor,
+          ProfileNode* profile, const std::vector<plan::Predicate>& filter) {
+        plan::LogicalNodePtr input =
+            Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1, 2, 3, 4}});
+        if (!filter.empty()) {
+          input = Node(plan::FilterNode{.input = input, .predicates = filter});
+        }
+        const auto plan = PlanOf(
+            Node(plan::GroupAggregateNode{.input = input, .keys = keys, .aggregates = aggregates}),
+            keys.size() + aggregates.size());
+        auto op = BuildPhysicalPlan(plan, profile);
+        EXPECT_TRUE(op.ok()) << op.status().ToString();
+        ExecContext ctx{.pool = arrow::default_memory_pool(),
+                        .batch_size = 8,
+                        .executor = executor,
+                        .threads = executor == nullptr ? 1 : kThreads};
+        return Drain(**op, ctx);
+      };
+  const auto raw_parts = [](const ProfileNode& root) -> int64_t {
+    for (const ProfileMetric& metric : root.metrics()) {
+      if (metric.name == "raw_parts") {
+        return metric.value;
+      }
+    }
+    return 0;
+  };
+  struct Case {
+    std::vector<plan::BoundColumn> keys;
+    std::vector<plan::AggregateCall> calls;
+    int64_t routed;  // parts that route rows: 40 rows in batches of 8, 9 parts with rows
+    std::vector<plan::Predicate> filter;
+  };
+  // A selective filter leaves batches of a row or two: the decision waits for 8 rows (a batch), so
+  // few keys never route, whatever the first batch looks like.
+  const std::vector<plan::Predicate> selective = {
+      testing::Compare(v, plan::CompareOp::kEq, BigInt(3))};
+  std::vector<plan::AggregateCall> with_double_sum = calls;
+  with_double_sum.push_back(double_sum);
+  const std::vector<Case> cases = {{.keys = {u}, .calls = calls, .routed = 9},
+                                   {.keys = {u, k}, .calls = calls, .routed = 9},
+                                   {.keys = {k}, .calls = calls, .routed = 0},
+                                   {.keys = {d}, .calls = calls, .routed = 0},
+                                   {.keys = {d, u}, .calls = calls, .routed = 9},
+                                   {.keys = {str, u}, .calls = calls, .routed = 9},
+                                   {.keys = {u}, .calls = with_double_sum, .routed = 0},
+                                   {.keys = {k}, .calls = calls, .routed = 0, .filter = selective},
+                                   {.keys = {u}, .calls = calls, .routed = 0, .filter = selective}};
+  for (const Case& c : cases) {
+    ExecContext ctx{.pool = arrow::default_memory_pool(), .batch_size = 8};
+    std::unique_ptr<Operator> source =
+        std::make_unique<TableScanOperator>(RoutedTable(false), std::vector<int>{0, 1, 2, 3, 4});
+    if (!c.filter.empty()) {
+      source = std::make_unique<FilterOperator>(std::move(source), c.filter);
+    }
+    GroupAggregateOperator serial(std::move(source), c.keys, c.calls);
+    const auto expected = Drain(serial, ctx);
+    ASSERT_TRUE(expected.ok()) << expected.status().ToString();
+    ProfileNode one_profile;
+    const auto one = run(RoutedTable(true), c.keys, c.calls, nullptr, &one_profile, c.filter);
+    ProfileNode four_profile;
+    const auto four = run(RoutedTable(true), c.keys, c.calls, pool.get(), &four_profile, c.filter);
+    ASSERT_TRUE(one.ok()) << one.status().ToString();
+    ASSERT_TRUE(four.ok()) << four.status().ToString();
+    EXPECT_TRUE(SameRows(**four, **one)) << c.keys.size() << " keys";
+    EXPECT_TRUE(SameRows(*SortedRows(*one), *SortedRows(*expected)))
+        << c.keys.size() << " keys, " << c.calls.size() << " calls\n"
+        << (*one)->ToString() << "\n"
+        << (*expected)->ToString();
+    EXPECT_EQ(raw_parts(one_profile), c.routed) << c.keys.size() << " keys";
+    EXPECT_EQ(raw_parts(four_profile), c.routed) << c.keys.size() << " keys";
+  }
+}
+
+// Routed rows go to the partition that Partition() gives their keys' group, DOUBLE keys
+// normalized (-0.0 with 0.0, every NaN together).
+TEST_F(PartOperatorsTest, RoutedRowsFollowTheirGroupsPartition) {
+  const auto table = RoutedTable(true);
+  const std::vector<plan::BoundColumn> keys = {Column(2, "d", LogicalType::kDouble),
+                                               Column(1, "k", LogicalType::kBigInt)};
+  auto reader = table->ScanPart(0, {0, 1, 2, 3, 4}, 1024);
+  ASSERT_TRUE(reader.ok());
+  std::shared_ptr<arrow::RecordBatch> rows;
+  ASSERT_TRUE((*reader)->ReadNext(&rows).ok());
+  auto grouped = GroupTable::Make(keys, {}, 5, arrow::default_memory_pool(), nullptr);
+  ASSERT_TRUE(grouped.ok());
+  ASSERT_TRUE((*grouped)->Consume(*rows).ok());
+  ASSERT_TRUE((*grouped)->Partition().ok());
+  const auto routed = (*grouped)->RouteRows(*rows);
+  ASSERT_TRUE(routed.ok()) << routed.status().ToString();
+  ASSERT_EQ(routed->size(), GroupTable::kPartitions);
+  int64_t total = 0;
+  for (std::size_t p = 0; p < GroupTable::kPartitions; ++p) {
+    const auto& part_rows = (*routed)[p];
+    total += part_rows->num_rows();
+    // Every routed row's group is one of the groups Partition() put in partition p.
+    auto check = GroupTable::Make(keys, {}, 5, arrow::default_memory_pool(), nullptr);
+    ASSERT_TRUE(check.ok());
+    if (part_rows->num_rows() == 0) {
+      continue;
+    }
+    ASSERT_TRUE((*check)->Consume(*part_rows).ok());
+    EXPECT_EQ((*check)->num_groups(), (*grouped)->partition_groups(p).size()) << p;
+  }
+  EXPECT_EQ(total, rows->num_rows());
 }
 
 // ---- late materialization of top-N (docs/adr/0016-late-materialization.md) ----

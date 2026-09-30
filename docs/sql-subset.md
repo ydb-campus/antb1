@@ -304,6 +304,8 @@ only with `--analyze`); its errors and exit codes are those of `antb1 query`.
   - its metrics.
 - Metrics:
   - `parts`, `skipped` (by statistics);
+  - `raw_parts`, `raw_rows` (a GROUP BY's parts that sent rows straight to the partitions, because their first
+    rows hardly reduced);
   - `part_time` (the part tasks' time, summed);
   - `wait` (for parts);
   - `merge`, `lanes_tail` (merging after the last part), `build` (output rows), `outer`;

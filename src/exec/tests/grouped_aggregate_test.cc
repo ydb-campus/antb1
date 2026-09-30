@@ -26,6 +26,7 @@
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
 
+#include "../group_table.h"
 #include "exec_test_util.h"
 
 namespace antb1::exec {
@@ -562,8 +563,9 @@ TEST_F(GroupedAggregateTest, GroupsAcrossBatchesWithSelectionsAndNullKeys) {
             (std::vector<std::string>{"1|2|50", "2|2|25", "NULL|2|30"}));
 }
 
-// The groups come out in one batch per input batch that made new groups, so that VARCHAR keys are
-// never concatenated into one array (binary offsets are 32 bits); the aggregates line up with them.
+// The chunks of new groups (one per input batch that made some) come out joined, up to
+// kMaxMergeChunk groups and kMaxJoinedKeyBytes of keys, so that VARCHAR keys never grow near the
+// 2 GiB of one array (binary offsets are 32 bits); the aggregates line up with them.
 TEST_F(GroupedAggregateTest, EmitsOneBatchPerChunkOfNewGroups) {
   const auto a = Rows({1, 2, 1}, {10, 20, 30});
   const auto b = Rows({2, 2}, {1, 1});
@@ -577,9 +579,8 @@ TEST_F(GroupedAggregateTest, EmitsOneBatchPerChunkOfNewGroups) {
   for (int run = 0; run < 2; ++run) {  // a second run after Open again gives the same batches
     const auto table = Drain(op, ctx);
     ASSERT_TRUE(table.ok()) << table.status().ToString();
-    ASSERT_EQ((*table)->column(0)->num_chunks(), 2);
-    EXPECT_EQ((*table)->column(0)->chunk(0)->length(), 2);
-    EXPECT_EQ((*table)->column(0)->chunk(1)->length(), 2);
+    ASSERT_EQ((*table)->column(0)->num_chunks(), 1) << "two small chunks joined";
+    EXPECT_EQ((*table)->column(0)->chunk(0)->length(), 4);
     std::vector<std::string> lines;
     lines.reserve(static_cast<std::size_t>((*table)->num_rows()));
     for (std::int64_t r = 0; r < (*table)->num_rows(); ++r) {
@@ -594,6 +595,26 @@ TEST_F(GroupedAggregateTest, EmitsOneBatchPerChunkOfNewGroups) {
     std::ranges::sort(lines);
     EXPECT_EQ(lines, (std::vector<std::string>{"1|3", "2|3", "3|1", "4|1"}));
   }
+}
+
+// Chunks whose keys are large are not joined past kMaxJoinedKeyBytes.
+TEST_F(GroupedAggregateTest, LargeKeyChunksStaySeparate) {
+  const auto schema = arrow::schema({arrow::field("s", arrow::binary())});
+  const std::string big(static_cast<std::size_t>(GroupTable::kMaxJoinedKeyBytes / 2) + 1, 'x');
+  std::vector<Batch> batches;
+  for (const char tail : {'a', 'b', 'c'}) {
+    batches.push_back(
+        Batch{.data = arrow::RecordBatch::Make(schema, 1, {testing::Strings({big + tail})})});
+  }
+  GroupAggregateOperator op(
+      std::make_unique<ScriptedSource>(schema, std::move(batches)),
+      {Column(0, "s", LogicalType::kVarchar)},
+      {plan::AggregateCall{.kind = AggKind::kCountStar, .type = LogicalType::kBigInt}});
+  ExecContext ctx;
+  const auto table = Drain(op, ctx);
+  ASSERT_TRUE(table.ok()) << table.status().ToString();
+  EXPECT_EQ((*table)->num_rows(), 3);
+  EXPECT_EQ((*table)->column(0)->num_chunks(), 3) << "each chunk over half of the byte bound";
 }
 
 // Without keys (GROUP BY constants only) every row is in one group, emitted only over rows.

@@ -159,7 +159,11 @@ The maintainer asked for this design to be ready for TPC-H: hash joins, and corr
    part order, the partitions in parallel. Amended 2026-09-30: each partition merges in its own lane
    (`exec::PartitionLanes`) instead of all partitions of a part finishing before the next part starts. A slow
    partition then holds back no other: on Q32 the per-part waits cost 3.6× the mean partition time. Then the
-   partitions' rows are built in parallel, as many at a time as threads.
+   partitions' rows are built in parallel, as many at a time as threads. Amended again 2026-09-30: a part whose
+   first 4096 rows hardly reduce (more groups than 3/4 of them) sends its other rows straight to the partitions,
+   which aggregate them after the part's own groups. Part order and the results stay as before; plans with a
+   DOUBLE SUM or AVG (their rounding follows the parts) or a HUGEINT one (its overflow check follows the order of
+   the additions) keep the parts' own tables.
 5. **exec:** the top-N sink (every part keeps its first rows, merged in part order). A full `ORDER BY` without
    `LIMIT` still sorts the part union on one thread; a k-way merge of sorted parts is its follow-up.
 6. **io and exec** (follow-up): skipping parts by their footer statistics (integer-valued columns, predicates

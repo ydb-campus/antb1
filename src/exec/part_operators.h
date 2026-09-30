@@ -110,7 +110,13 @@ class PartGroupAggregateOperator final : public Operator {
   arrow::Status Close() override;
 
  private:
-  using PartTable = std::shared_ptr<GroupTable>;
+  // A part's groups: its own table (partitioned), and, when the part stopped aggregating on its own
+  // (its first batch hardly reduced), the rest of its rows routed to the partitions.
+  struct PartGroups {
+    std::shared_ptr<GroupTable> table;
+    std::vector<std::vector<std::shared_ptr<arrow::RecordBatch>>> rows;  // per partition, or empty
+  };
+  using PartTable = std::shared_ptr<PartGroups>;
 
   std::shared_ptr<const PartPipeline> pipeline_;
   int64_t num_parts_;
