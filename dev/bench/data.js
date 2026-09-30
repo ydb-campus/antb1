@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790767641771,
+  "lastUpdate": 1790773547828,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -2628,6 +2628,78 @@ window.BENCHMARK_DATA = {
             "value": 15.105987652173988,
             "unit": "ms/iter",
             "extra": "iterations: 46\ncpu: 15.105285847826098 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "6f09d2d549821bf8adc5ceeaf686fc3da44e51c2",
+          "message": "perf(exec): regexp_replace once per distinct value of a batch (#56)\n\n## Summary\n\nThis is fix 3 of the antb1 vs DuckDB comparison, **rescoped** with the\nmaintainer on 2026-09-30.\n\n**Why rescoped:** the original fix 3 would evaluate LIKE, regex and\ngrouping on Parquet dictionaries. The footers show that the large string\ncolumns (URL, Title, Referer, OriginalURL) are mostly plain-encoded: the\ndictionary fills about 1 MB early in each row group and the writer falls\nback to plain pages. Dictionary-page evaluation would have barely\nhelped.\n\n**What `explain --analyze` showed** (full data, 128 threads):\n- The LIKE queries (Q20-Q22) spend about 85% of their CPU **decoding**\nthe strings (snappy, plain byte arrays). LIKE itself is about 15%.\n- Q28 spends **81%** of its CPU (316 s summed over parts) in\n`regexp_replace`, in RE2's capture-group engine, about 3.9 µs per row.\n- Values repeat heavily within a batch; about a quarter of the values in\na row group are distinct (measured locally).\n\n**The change** (`src/exec/compute.cc`, `RegexpReplace`):\n- The batch's values are dictionary-encoded with\n`arrow::compute::DictionaryEncode`.\n- The regex runs on the distinct values only.\n- `Take` puts the results back on their rows.\n\nNULLs keep NULL indices; values are hashed as raw bytes, so invalid\nUTF-8 behaves as before (divergence D15); the invalid-pattern and\ninvalid-replacement paths are unchanged. Results are unchanged. Q28's\nregex CPU falls from 317 s to 141 s.\n\n## Performance: full data, 128 threads, paired A/B against main (#55)\n\n**Method:** layout-robust. Each binary runs from 3 path lengths, best of\n3 tries each, and the median is kept.\n\n| Query | main | this PR | speedup | DuckDB 1.5.5 |\n| --- | ---: | ---: | ---: | ---: |\n| **Q28** | 5.835 | 2.636 | **2.21×** | ~2.8 |\n| **Total (43 queries)** | **29.44** | **26.16** | 1.13× | |\n\nQ28 is now faster than DuckDB.\n\nEvery other query is within ±5%. Q5, Q24 and Q26 first showed 0.88-0.91×\nwhile the host load rose to about 55 from another workload. They don't\nuse `regexp_replace`, and a quiet rerun put them within 2-3% (Q5 0.442\nvs 0.450, Q24 0.191 vs 0.198, Q26 0.193 vs 0.197).\n\n**Not in this PR:** the LIKE queries. Their cost is decoding, not\nmatching, so a faster LIKE can save at most about 15%. What would help\nthem is skipping the decode of other columns in row groups where the\nfilter matches nothing; that is a separate change.\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [x] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full          # lint, ci, asan, tidy, coverage, fuzz-smoke, ci-gcc\ncheck-full exit 0; 100% tests passed out of 1377; Coverage gate: PASS\n$ pixi run tsan\n100% tests passed out of 1377\n$ ANTB1_DIFF_COUNT=20000 pixi run diff-random\nDIFF: PASS seed=840978341 queries=20000 failed=0 unsupported=0\n$ pixi run test-data\n100% tests passed out of 6\n```\n\n(The all-NULL test was added after this run. `pixi run test -R\nStringFunctions` and `pixi run tidy` pass with it.)\n\n**Tests:**\n- **`ComputeTest.StringFunctions`** gains:\n- a batch with repeated values, NULLs, values without a match, `\"\"` and\na single-character value;\n- an all-NULL batch, which leaves the dictionary empty (a reviewer\nsuggestion).\n- **The existing regexp cases** still pass: the metamorphic\n`regexp_replace_*` relations, including batch-size invariance, and the\ninvalid pattern and replacement cases.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer (none changed)\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code read the Parquet\nfooters, profiled with `explain --analyze` and `perf`, wrote the change\nand tests, and ran the gates and the A/B. A read-only reviewer agent\nfound no P0/P1 issues; its optional all-NULL test is added.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-09-30T16:03:37+03:00",
+          "tree_id": "6b53ca261cd8f1a376e0041510627521128a86df",
+          "url": "https://github.com/ydb-campus/antb1/commit/6f09d2d549821bf8adc5ceeaf686fc3da44e51c2"
+        },
+        "date": 1790773546761,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 2460.8223666261706,
+            "unit": "ns/iter",
+            "extra": "iterations: 282233\ncpu: 2460.4408378892617 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 73514.40157056453,
+            "unit": "ns/iter",
+            "extra": "iterations: 9296\ncpu: 73507.7673192771 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 77128.27487630086,
+            "unit": "ns/iter",
+            "extra": "iterations: 9095\ncpu: 77110.84771852668 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 271234.08077671326,
+            "unit": "ns/iter",
+            "extra": "iterations: 2575\ncpu: 271219.4027184465 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 319170.4869922383,
+            "unit": "ns/iter",
+            "extra": "iterations: 2191\ncpu: 319143.3929712461 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 1906843.2712328578,
+            "unit": "ns/iter",
+            "extra": "iterations: 365\ncpu: 1906492.0657534257 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 154.26966019999782,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 154.22810120000003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 9.938553000000486,
+            "unit": "ms/iter",
+            "extra": "iterations: 74\ncpu: 9.936944459459466 ms\nthreads: 1"
           }
         ]
       }
