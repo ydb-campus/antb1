@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790790205851,
+  "lastUpdate": 1790799016044,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -2772,6 +2772,78 @@ window.BENCHMARK_DATA = {
             "value": 14.487045265306213,
             "unit": "ms/iter",
             "extra": "iterations: 49\ncpu: 14.486045408163264 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2fe31ba9cd76d46150729fe4e773fb04aa3d167b",
+          "message": "perf(plan): group by the keys that determine the others (#59)\n\n## Summary\n\n**What changes:** a new optimizer rule drops a GROUP BY key that is\ncomputed only from other keys. It computes that key once per group in a\n`Compute` above the `GroupAggregate`, with a `Project` restoring the\noutput columns (ADR 0018). `GROUP BY x, x + 1, x * 2` groups by `x`\nalone: the same groups, fewer keys to hash.\n\n**Where it applies:** a key is dropped when all of these hold:\n- it is an expression of the `Compute` right below the `GroupAggregate`\nand reads at least one column;\n- every column it reads is a key passed through that `Compute`;\n- none of those keys is DOUBLE. A DOUBLE key groups -0.0 with 0.0 and\nevery NaN together, and a function of it (`1 / d`) could tell them\napart.\n\n**Exactness:**\n- **Groups:** a key that is a function of other keys cannot split or\nmerge groups.\n- **Values:** computed from the group's first-seen values of the kept\nkeys. Those aren't DOUBLE, so every row of the group has them.\n- **NULL:** a NULL key gives a NULL expression, as before.\n- **Errors:** the expressions see the same set of key values, so an\noverflow fails the query exactly when it did before.\n\n**Where it doesn't apply:** under a `LIMIT` with no `ORDER BY` in\nbetween. The nodes above would stop reading after the rows they need, so\nthe dropped keys would be computed for some groups only. An overflow in\nanother group would then no longer fail the query, while DuckDB fails\nit. A `Sort` reads every group, so `ORDER BY ... LIMIT` keeps the\nrewrite. A second reviewer pass confirmed no other operator above a\n`GroupAggregate` stops reading early.\n\n**Why:** Q35 (four keys, one column and arithmetic of it, about 9.8 M\ngroups) took 0.85 s, against 0.23 s in DuckDB and 0.12 s in ClickHouse,\nwhich drops such keys too. `explain --analyze` put about 48 of its 59.5\ns of part CPU into hashing and aggregating the keys.\n\n**Follow-up:** recomputing the dropped keys over 9.8 M groups is a\nserial `Compute`, about 0.3 s of Q35. A parallel `Compute` over\nmaterialized input should remove most of it, taking Q35 toward 0.4 s.\nThat will be a separate executor PR. Moving the recomputation above the\nSort/Limit is not an option, for the error reason above.\n\n## Performance: full data, 128 threads\n\n**Paired A/B against main (#57):** a process per query, each binary from\n3 path lengths, best of 3 tries per path, median of the 3.\n\n| | main | this PR | speedup |\n| --- | ---: | ---: | ---: |\n| **Q35** | 0.822 / 0.862 | 0.680 / 0.687 | **1.21× / 1.25×** (all-query\nrun / quiet rerun) |\n| **Total (43 queries)** | **24.69** | **24.47** | **1.009×** |\n\nOther queries are unchanged, since none has such keys. Q15 and Q25 moved\n±5-8% while the host load rose to about 50. Neither has a key the rule\napplies to, and a quiet rerun put both within 3% (Q15 0.503 vs 0.494,\nQ25 0.151 vs 0.146).\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [x] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full          # lint, ci, asan, tidy, coverage, fuzz-smoke, ci-gcc\ncheck-full exit 0; 100% tests passed out of 1386; Coverage gate: PASS (plan 95.70% lines, 90.40% branches)\n$ pixi run tsan\n100% tests passed out of 1386\n$ ANTB1_DIFF_COUNT=20000 pixi run diff-random\nDIFF: PASS seed=2349312846 queries=20000 failed=0 unsupported=0\n$ pixi run test-data\n100% tests passed out of 6\n```\n\n**Tests:**\n- **`OptimizerTest`:**\n- The rewrite's EXPLAIN shape: integer keys, ORDER BY ... LIMIT with the\nLimit still right above the Sort, a VARCHAR key with HAVING, and a\ndetermining key that isn't the first key.\n- The cases it leaves alone: a DOUBLE key, a non-key column, plain\ncolumns, an expression of a column that isn't a key, and a LIMIT without\nORDER BY, with and without HAVING and OFFSET.\n  - Idempotence.\n- **`tests/slt/cases/groupby/dependent_keys.slt`**, expectations from\nDuckDB (`pixi run slt-complete`):\n  - NULL keys, VARCHAR with `strlen`, several dependent keys;\n- ORDER BY and HAVING on a dependent key, a select list with only the\ndependent key;\n- COUNT(DISTINCT) (two-level aggregation), parallel parts, a DOUBLE key;\n- overflow errors: without LIMIT, under a plain LIMIT, and under ORDER\nBY ... LIMIT.\n- **The plain-LIMIT overflow test fails without the fix:** the first\ncommit's binary returned a row with exit 0.\n- **The EXPLAIN golden** `cli.explain_dependent_keys`.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer (none changed)\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Claude Code:\n  - profiled Q35, Q36 and Q39 with `explain --analyze`;\n  - measured the potential by grouping by the single column locally;\n- planned the rule (plan approved), wrote it with its tests and ADR\n0018, and ran the gates and the A/B.\n\nA read-only reviewer agent found a P0: the plain-LIMIT error case, now\nfixed with a test that fails without the fix. It also found a missing\nrule entry in docs/sql-subset.md, now added. A second review of the fix\nfound no P0 or P1.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-09-30T23:07:36+03:00",
+          "tree_id": "b8ec70acc06aa0d5526c600da9a0471c93e0f8f1",
+          "url": "https://github.com/ydb-campus/antb1/commit/2fe31ba9cd76d46150729fe4e773fb04aa3d167b"
+        },
+        "date": 1790799014793,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4121.672210187918,
+            "unit": "ns/iter",
+            "extra": "iterations: 171732\ncpu: 4121.295763165863 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 85059.99743589654,
+            "unit": "ns/iter",
+            "extra": "iterations: 7800\ncpu: 85052.59423076926 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 221789.76228209372,
+            "unit": "ns/iter",
+            "extra": "iterations: 3155\ncpu: 221730.0782884311 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 441004.99937146663,
+            "unit": "ns/iter",
+            "extra": "iterations: 1591\ncpu: 440975.28095537407 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 348956.7427860731,
+            "unit": "ns/iter",
+            "extra": "iterations: 2010\ncpu: 348903.4970149253 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2139795.2286584834,
+            "unit": "ns/iter",
+            "extra": "iterations: 328\ncpu: 2139540.8963414636 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 198.56583266666425,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 198.55021000000022 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.449292687499948,
+            "unit": "ms/iter",
+            "extra": "iterations: 48\ncpu: 14.446731125000001 ms\nthreads: 1"
           }
         ]
       }
