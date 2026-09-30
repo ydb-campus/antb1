@@ -387,6 +387,19 @@ TEST(AllocatorTest, RestartsOnlyWhenMimallocKeepsItsDefaults) {
   EXPECT_FALSE(NeedsAllocatorRestart(FakeEnv({{"ARROW_DEFAULT_MEMORY_POOL", "system"}})));
 }
 
+TEST(AllocatorTest, RestartsOnlyTheProgramItself) {
+  EXPECT_TRUE(IsSameProgram("/opt/antb1/bin/antb1", "antb1"));  // found on PATH
+  EXPECT_TRUE(IsSameProgram("/opt/antb1/bin/antb1", "./bin/antb1"));
+  EXPECT_TRUE(IsSameProgram("/opt/antb1/bin/antb1", "/opt/antb1/bin/antb1"));
+  // Through the dynamic loader or an emulator /proc/self/exe is that program.
+  EXPECT_FALSE(IsSameProgram("/usr/lib64/ld-linux-x86-64.so.2", "./antb1"));
+  EXPECT_FALSE(IsSameProgram("/usr/bin/qemu-x86_64", "antb1"));
+  // A link of another name: no restart (the process runs as it is).
+  EXPECT_FALSE(IsSameProgram("/opt/antb1/bin/antb1", "/usr/local/bin/antb1-dev"));
+  EXPECT_FALSE(IsSameProgram("/opt/antb1/bin/antb1", ""));
+  EXPECT_FALSE(IsSameProgram("/opt/antb1/bin/antb1", "dir/"));
+}
+
 TEST(RunCommandTest, ExitStatusAndErrors) {
   EXPECT_TRUE(RunCommand({"true"}).ok());
   const auto failed = RunCommand({"false"});

@@ -17,10 +17,16 @@ using EnvLookup = std::function<const char*(std::string_view name)>;
 // default pool is mimalloc (ARROW_DEFAULT_MEMORY_POOL unset or "mimalloc").
 bool NeedsAllocatorRestart(const EnvLookup& env);
 
+// Whether `argv0` names the executable `exe` (the path /proc/self/exe links to): the same file
+// name. Not so when a program runs through the dynamic loader or an emulator (exe is then that
+// program), nor through a link of another name (then there is no restart; the process runs as it
+// is).
+bool IsSameProgram(std::string_view exe, std::string_view argv0);
+
 // Restarts the process (the same executable, arguments and open files) with MIMALLOC_PURGE_DELAY=-1
-// when NeedsAllocatorRestart: mimalloc reads its options when Arrow is loaded, before main, so a
-// process cannot change them for itself. Returns only when no restart is needed or it failed; the
-// process then runs with mimalloc's defaults.
+// when NeedsAllocatorRestart and IsSameProgram: mimalloc reads its options when Arrow is loaded,
+// before main, so a process cannot change them for itself. Returns only when no restart is needed
+// or it failed; the process then runs with mimalloc's defaults.
 void RestartForAllocator(char** argv);
 
 }  // namespace antb1::cli

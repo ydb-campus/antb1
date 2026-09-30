@@ -30,7 +30,8 @@ Proposed
 
 - **On Linux, the `antb1` executable restarts itself once with `MIMALLOC_PURGE_DELAY=-1`** (`cli::RestartForAllocator`,
   first thing in `main`): `execv("/proc/self/exe", argv)`, the same arguments and open files (stdin included).
-- **When it restarts:** only when `MIMALLOC_PURGE_DELAY` is unset (a value the user set wins; the restarted process has
+- **When it restarts:** only when the process was started as `antb1` itself (`/proc/self/exe` and `argv[0]` have the
+  same file name; through the dynamic loader or an emulator they do not), when `MIMALLOC_PURGE_DELAY` is unset (a value the user set wins; the restarted process has
   it, so it never restarts twice) and Arrow's default pool is mimalloc (`ARROW_DEFAULT_MEMORY_POOL` unset or
   `mimalloc`).
 - **Setting it first:** the variable is set before the exec, so a failed exec never loops. The process goes on with
@@ -45,7 +46,7 @@ Proposed
 - **Resident memory:** the process keeps its peak memory until it exits, rather than returning it between queries.
   `--memory-limit` is unchanged: the budget counts Arrow allocations, not resident pages. Set
   `MIMALLOC_PURGE_DELAY` (e.g. to `1000`) to get mimalloc's behavior back.
-- **Tests:** the decision is a pure function with unit tests. Every CLI golden test runs through the restart: they
-  pass arguments and stdin.
+- **Tests:** the decisions are pure functions with unit tests. The CLI golden tests run through the restart (except
+  under the sanitizer presets, which use the system pool): they pass arguments and stdin.
 - **Later:** if Arrow exposes mimalloc's options, or antb1 gets its own pool, an in-process setting replaces the
   restart.
