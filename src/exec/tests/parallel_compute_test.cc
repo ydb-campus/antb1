@@ -15,6 +15,7 @@
 
 #include "antb1/common/int128.h"
 #include "antb1/exec/compute.h"
+#include "antb1/exec/memory_budget.h"
 #include "antb1/exec/operator.h"
 #include "antb1/plan/logical_plan.h"
 
@@ -51,15 +52,16 @@ std::shared_ptr<arrow::Schema> Schema() {
   return arrow::schema({arrow::field("c", arrow::int64())});
 }
 
-// `count` batches of 10 rows (values 10 * b + i); every third batch has a selection, and the
+// `count` batches of `rows` rows (values rows * b + i); every third batch has a selection, and the
 // batches in `overflowing` hold kMax in a selected row.
-std::vector<Batch> Batches(std::size_t count, const std::vector<std::size_t>& overflowing = {}) {
+std::vector<Batch> Batches(std::size_t count, const std::vector<std::size_t>& overflowing = {},
+                           int64_t rows = 10) {
   std::vector<Batch> batches;
   for (std::size_t b = 0; b < count; ++b) {
     std::vector<std::optional<int64_t>> values;
     std::vector<std::optional<bool>> selected;
-    for (int64_t i = 0; i < 10; ++i) {
-      values.emplace_back(static_cast<int64_t>(b) * 10 + i);
+    for (int64_t i = 0; i < rows; ++i) {
+      values.emplace_back(static_cast<int64_t>(b) * rows + i);
       selected.emplace_back(i % 2 == 0);
     }
     values[3] = std::nullopt;
@@ -67,7 +69,7 @@ std::vector<Batch> Batches(std::size_t count, const std::vector<std::size_t>& ov
       values[4] = kMax;
     }
     batches.push_back(
-        Batch{.data = arrow::RecordBatch::Make(Schema(), 10, arrow::ArrayVector{Int64s(values)}),
+        Batch{.data = arrow::RecordBatch::Make(Schema(), rows, arrow::ArrayVector{Int64s(values)}),
               .selection = b % 3 == 0 ? Bools(selected) : nullptr});
   }
   return batches;
@@ -175,6 +177,79 @@ TEST_F(ParallelComputeTest, ClosesWithBatchesInFlight) {
   const Output again = Drain(op, pool->get());
   EXPECT_EQ(again.batches.size(), 50U);
   EXPECT_FALSE(again.status.ok());
+}
+
+// Under memory pressure one batch is computed at a time; the output is the same.
+TEST_F(ParallelComputeTest, ComputesOneBatchAtATimeUnderPressure) {
+  auto pool = arrow::internal::ThreadPool::Make(4);
+  ASSERT_TRUE(pool.ok());
+  MemoryBudget budget(1000);
+  ASSERT_TRUE(budget.Reserve(600).ok());
+  ASSERT_TRUE(budget.under_pressure());
+  auto source = std::make_unique<ScriptedSource>(Schema(), Batches(20));
+  const ScriptedSource* scripted = source.get();
+  ParallelComputeOperator op(std::move(source), PlusOne());
+  ExecContext ctx{.executor = pool->get(), .threads = 4, .budget = &budget};
+  ASSERT_TRUE(op.Open(ctx).ok());
+  const Output serial = Serial(Batches(20));
+  for (std::size_t i = 0; i < serial.batches.size(); ++i) {
+    auto batch = op.Next();
+    ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+    ASSERT_FALSE(batch->end());
+    EXPECT_TRUE(batch->data->Equals(*serial.batches[i])) << "batch " << i;
+    EXPECT_LE(static_cast<std::size_t>(scripted->pulls()), i + 2);  // never more than one ahead
+    EXPECT_LE(op.window(), i == 0 ? 2U : 1U);  // halved by every batch taken under pressure
+  }
+  auto end = op.Next();
+  ASSERT_TRUE(end.ok());
+  EXPECT_TRUE(end->end());
+  EXPECT_TRUE(op.Close().ok());
+  budget.Release(600);
+}
+
+// Out of memory alone: the query fails with OutOfMemory and every byte comes back.
+TEST_F(ParallelComputeTest, OutOfMemoryAloneFailsAndFreesEverything) {
+  auto pool = arrow::internal::ThreadPool::Make(4);
+  ASSERT_TRUE(pool.ok());
+  MemoryBudget tiny(64);
+  {
+    ParallelComputeOperator op(std::make_unique<ScriptedSource>(Schema(), Batches(20, {}, 1000)),
+                               PlusOne());
+    ExecContext ctx{.pool = &tiny, .executor = pool->get(), .threads = 4, .budget = &tiny};
+    ASSERT_TRUE(op.Open(ctx).ok());
+    auto batch = op.Next();
+    ASSERT_FALSE(batch.ok());
+    EXPECT_TRUE(batch.status().IsOutOfMemory()) << batch.status().ToString();
+    EXPECT_TRUE(op.Close().ok());
+  }
+  EXPECT_EQ(tiny.bytes_allocated(), 0);
+}
+
+// Several batches at once need more than the budget, one alone fits: the batch that runs out
+// of memory is computed again alone, and the output is the same.
+TEST_F(ParallelComputeTest, OutOfMemoryNextToOthersComputesTheBatchAgainAlone) {
+  auto pool = arrow::internal::ThreadPool::Make(4);
+  ASSERT_TRUE(pool.ok());
+  constexpr int64_t kRows = 10000;  // about 80 KB computed per batch (half the rows selected)
+  const Output serial = Serial(Batches(12, {}, kRows));
+  MemoryBudget budget(int64_t{200} * 1024);
+  {
+    ParallelComputeOperator op(std::make_unique<ScriptedSource>(Schema(), Batches(12, {}, kRows)),
+                               PlusOne());
+    ExecContext ctx{.pool = &budget, .executor = pool->get(), .threads = 4, .budget = &budget};
+    ASSERT_TRUE(op.Open(ctx).ok());
+    for (std::size_t i = 0; i < serial.batches.size(); ++i) {
+      auto batch = op.Next();  // each batch is released before the next one is taken
+      ASSERT_TRUE(batch.ok()) << "batch " << i << ": " << batch.status().ToString();
+      ASSERT_FALSE(batch->end());
+      EXPECT_TRUE(batch->data->Equals(*serial.batches[i])) << "batch " << i;
+    }
+    auto end = op.Next();
+    ASSERT_TRUE(end.ok());
+    EXPECT_TRUE(end->end());
+    EXPECT_TRUE(op.Close().ok());
+  }
+  EXPECT_EQ(budget.bytes_allocated(), 0);
 }
 
 }  // namespace

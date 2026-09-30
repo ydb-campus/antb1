@@ -18,6 +18,7 @@
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/sql_status.h"
 
+#include "../parallel_compute.h"
 #include "../part_operators.h"
 #include "exec_test_util.h"
 
@@ -318,6 +319,38 @@ TEST_F(PhysicalPlannerTest, AggregateOverFilteredScanForEveryBatchSize) {
     EXPECT_EQ(Int64Column(*result, 1), (std::vector<std::optional<int64_t>>{4}));  // 1 2 4 5
     EXPECT_EQ(Int64Column(*result, 2), (std::vector<std::optional<int64_t>>{50}));
   }
+}
+
+// A Compute over a whole input (here a sort) computes its batches in parallel; one inside a part
+// pipeline (over the scan) stays ComputeOperator: the parts are the parallelism there.
+TEST_F(PhysicalPlannerTest, ComputeOverAWholeInputIsParallel) {
+  const auto table = Table();
+  const auto scan = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0}});
+  const auto plus_one = std::make_shared<const plan::Expr>(
+      plan::Expr{.node = plan::ArithExpr{.op = plan::ArithOp::kAdd,
+                                         .left = std::make_shared<const plan::Expr>(
+                                             plan::Expr{.node = plan::ColumnExpr{.index = 0},
+                                                        .type = LogicalType::kBigInt,
+                                                        .name = "x"}),
+                                         .right = std::make_shared<const plan::Expr>(plan::Expr{
+                                             .node = plan::ConstantExpr{.value = BigInt(1)},
+                                             .type = LogicalType::kBigInt,
+                                             .name = "1"})},
+                 .type = LogicalType::kBigInt,
+                 .name = "x + 1"});
+  const auto sort = Node(plan::SortNode{
+      .input = scan, .keys = {plan::SortKey{.column = Column(0, "x", LogicalType::kBigInt)}}});
+  const auto above = Node(plan::ComputeNode{.input = sort, .exprs = {plus_one}});
+  const auto parallel = BuildPhysicalPlan(PlanOf(above, 2));
+  ASSERT_TRUE(parallel.ok()) << parallel.status().ToString();
+  EXPECT_NE(dynamic_cast<const ParallelComputeOperator*>(parallel->get()), nullptr);
+  const auto over_scan =
+      BuildPhysicalPlan(PlanOf(Node(plan::ComputeNode{.input = scan, .exprs = {plus_one}}), 2));
+  ASSERT_TRUE(over_scan.ok()) << over_scan.status().ToString();
+  EXPECT_EQ(dynamic_cast<const ParallelComputeOperator*>(over_scan->get()), nullptr);
+  const auto result = Run(PlanOf(above, 2));
+  EXPECT_EQ(Int64Column(*result, 1),
+            (std::vector<std::optional<int64_t>>{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}));
 }
 
 TEST_F(PhysicalPlannerTest, MalformedPlansAreInvalidNotUnsupported) {
