@@ -49,8 +49,8 @@ Proposed
   - Table i spreads a heavy K by `hash(K, x_i) % 64`.
   - The plain table always uses `hash(K)`: after the per-part pre-aggregation it has one group per K per part.
   - A hash collision only makes an extra K heavy, which is still correct.
-- **The inner merge is the existing one:** `MergePartition` of every table, parts in part order, a part's partitions
-  in parallel.
+- **The inner merge is the existing one:** `MergePartition` of every table, parts in part order, each partition in
+  its own lane (`PartitionLanes`, ADR 0013).
   - The sample's tables are partitioned after the barrier, in parallel.
   - Later parts partition on their workers.
 - **The outer level runs per partition, in parallel (`OuterGroups`).**

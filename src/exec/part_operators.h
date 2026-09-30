@@ -18,6 +18,7 @@
 #include "group_table.h"
 #include "outer_groups.h"
 #include "part_scheduler.h"
+#include "partition_lanes.h"
 
 // The operators that run a pipeline once per table part (docs/adr/0013-parallel-execution.md). A
 // part pipeline is a chain of streaming operators over a TableScanOperator of one part; the
@@ -87,9 +88,10 @@ class PartAggregateOperator final : public Operator {
 
 // Grouped aggregation over a part pipeline: every part is grouped into its own GroupTable on the
 // executor and split into partitions by the hash of its keys (GroupTable::Partition). The parts are
-// merged in part order into one table per partition; a part's partitions merge in parallel on the
-// executor, each partition's table touched by one task at a time. Then the partitions' groups are
-// emitted, partition by partition, as GroupAggregateOperator emits them. The partitions are a
+// merged in part order into one table per partition, each partition in its own lane on the
+// executor (PartitionLanes): a partition never waits for another. Then the partitions' rows are
+// built in parallel, as many partitions at a time as threads (one under memory pressure), and
+// emitted partition by partition, as GroupAggregateOperator emits them. The partitions are a
 // constant, so the result is the same for any number of threads. Output: as
 // GroupAggregateOperator.
 class PartGroupAggregateOperator final : public Operator {
@@ -121,12 +123,20 @@ class PartGroupAggregateOperator final : public Operator {
   arrow::internal::Executor* executor_ = nullptr;
   // The merged groups of each partition (created with the first part), until emitted.
   std::vector<std::unique_ptr<GroupTable>> tables_;
+  // After the merge: every partition's rows, built in parallel, until emitted.
+  std::vector<std::vector<std::shared_ptr<arrow::RecordBatch>>> rows_;
   std::size_t next_table_ = 0;  // the partition being emitted
+  std::size_t next_chunk_ = 0;  // and its next batch
+  std::size_t built_ = 0;       // the partitions whose rows are built
+  std::size_t threads_ = 1;
   bool opened_ = false;
   bool merged_ = false;
 
-  // Merges a part's partitions into tables_, on the executor when there is one.
-  arrow::Status MergePart(const GroupTable& part);
+  // Runs every part and merges it into tables_, each partition in its own lane (PartitionLanes).
+  arrow::Status Merge();
+  // Builds the rows of the next partitions (from built_ on) in parallel.
+  arrow::Status BuildRows();
+  int64_t window_ = 1;
   std::unique_ptr<PartScheduler<PartTable>> scheduler_;
 };
 
@@ -148,7 +158,8 @@ inline constexpr int64_t kTwoLevelSampleRows = int64_t{4} * 1000 * 1000;
 // decide the heavy keys (a K with a large share of the sample's inner groups, HeavyHitters). Every
 // table splits into GroupTable::kPartitions partitions by the hash of K, but the inner groups of a
 // heavy K by the hash of K and x, so that no partition holds most of the pairs. Parts merge in part
-// order, a part's partitions in parallel; then each partition groups its inner groups by K in
+// order, each partition in its own lane (PartitionLanes); then each partition groups its inner
+// groups by K in
 // parallel. The groups of a light K are complete in their partition; those of a heavy K are merged
 // across the partitions, in partition order. Output: the light groups partition by partition, then
 // the heavy ones; the columns of GroupAggregateOperator (`global`: of ScalarAggregateOperator, one
@@ -180,8 +191,8 @@ class PartTwoLevelAggregateOperator final : public Operator {
 
   // Runs every part and both levels.
   arrow::Status Aggregate();
-  // Merges a part's partitions into tables_, on the executor when there is one.
-  arrow::Status MergePart(const std::vector<std::unique_ptr<GroupTable>>& part);
+  // The merge of a part's partition p into tables_[*][p], for PartitionLanes.
+  PartitionLanes::Merge MergeOf(PartTables inner);
   // The outer groups of partition `partition`: the light ones as output batches (rows_), the
   // heavy ones left for the merge across partitions.
   arrow::Status Outer(std::size_t partition);

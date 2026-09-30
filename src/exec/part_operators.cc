@@ -26,6 +26,7 @@
 #include "heavy_hitters.h"
 #include "outer_groups.h"
 #include "part_scheduler.h"
+#include "partition_lanes.h"
 
 namespace antb1::exec {
 namespace {
@@ -257,6 +258,8 @@ arrow::Status PartGroupAggregateOperator::Open(ExecContext& ctx) {
   pool_ = ctx.pool;
   budget_ = ctx.budget;
   executor_ = ctx.executor;
+  window_ = Window(ctx);
+  threads_ = ctx.executor == nullptr ? 1 : static_cast<std::size_t>(std::max(ctx.threads, 1));
   merged_ = false;
   opened_ = true;
   auto task = [pipeline = pipeline_, part_ctx = PartContext(ctx), keys = keys_,
@@ -279,22 +282,46 @@ arrow::Status PartGroupAggregateOperator::Open(ExecContext& ctx) {
   return arrow::Status::OK();
 }
 
-arrow::Status PartGroupAggregateOperator::MergePart(const GroupTable& part) {
-  const std::size_t partitions = part.num_partitions();
-  if (tables_.empty()) {
-    tables_.reserve(partitions);
-    for (std::size_t p = 0; p < partitions; ++p) {
-      ARROW_ASSIGN_OR_RAISE(auto table,
-                            GroupTable::Make(keys_, aggregates_, input_width_, pool_, budget_));
-      tables_.push_back(std::move(table));
+arrow::Status PartGroupAggregateOperator::Merge() {
+  // Partitions are disjoint: each merges the parts in part order in its own lane.
+  std::unique_ptr<PartitionLanes> lanes;
+  // A part that runs out of memory runs again alone once the earlier parts are merged and freed.
+  scheduler_->set_before_retry([&lanes] {
+    if (lanes != nullptr) {
+      lanes->Wait();
+    }
+  });
+  arrow::Status status;
+  for (int64_t index = 0; !scheduler_->done(); ++index) {
+    arrow::Result<PartTable> part = scheduler_->Next();
+    if (!part.ok()) {
+      status = part.status();
+      break;
+    }
+    const std::size_t partitions = (*part)->num_partitions();
+    if (lanes == nullptr) {
+      tables_.reserve(partitions);
+      for (std::size_t p = 0; p < partitions; ++p) {
+        ARROW_ASSIGN_OR_RAISE(auto table,
+                              GroupTable::Make(keys_, aggregates_, input_width_, pool_, budget_));
+        tables_.push_back(std::move(table));
+      }
+      lanes = std::make_unique<PartitionLanes>(partitions, executor_, window_, budget_);
+    }
+    ANTB1_CHECK(tables_.size() == partitions);
+    status = lanes->Add(index, [this, table = *std::move(part)](std::size_t p) {
+      return tables_[p]->MergePartition(*table, p);
+    });
+    if (!status.ok()) {
+      break;
     }
   }
-  if (tables_.size() != partitions) {
-    return arrow::Status::Invalid("a part of ", partitions, " partitions for ", tables_.size());
+  scheduler_->set_before_retry(nullptr);
+  // A merge failure is of an earlier part than any failure of the scheduler seen after it.
+  if (lanes != nullptr) {
+    ARROW_RETURN_NOT_OK(lanes->Finish());
   }
-  // Partitions are disjoint: each merges on the executor, and all finish before the next part.
-  return ForEach(executor_, partitions,
-                 [&](std::size_t p) { return tables_[p]->MergePartition(part, p); });
+  return status;
 }
 
 arrow::Result<Batch> PartGroupAggregateOperator::Next() {
@@ -302,28 +329,54 @@ arrow::Result<Batch> PartGroupAggregateOperator::Next() {
     return arrow::Status::Invalid("part group aggregate: Next() before Open() or after Close()");
   }
   if (!merged_) {
-    while (!scheduler_->done()) {
-      ARROW_ASSIGN_OR_RAISE(const PartTable part, scheduler_->Next());
-      ARROW_RETURN_NOT_OK(MergePart(*part));
-    }
+    ARROW_RETURN_NOT_OK(Merge());
     merged_ = true;
     scheduler_.reset();
+    rows_.assign(tables_.size(), {});
   }
-  while (next_table_ < tables_.size()) {
-    ARROW_ASSIGN_OR_RAISE(auto chunk, tables_[next_table_]->NextChunk(schema_));
-    if (chunk != nullptr) {
-      return Batch{.data = std::move(chunk), .selection = {}};
+  for (; next_table_ < rows_.size(); ++next_table_, next_chunk_ = 0) {
+    if (next_table_ == built_) {
+      ARROW_RETURN_NOT_OK(BuildRows());
     }
-    tables_[next_table_].reset();  // gives the memory back
-    ++next_table_;
+    std::vector<std::shared_ptr<arrow::RecordBatch>>& rows = rows_[next_table_];
+    if (next_chunk_ < rows.size()) {
+      return Batch{.data = std::move(rows[next_chunk_++]), .selection = {}};
+    }
+    rows = {};  // gives the memory back
   }
   return Batch{};
+}
+
+arrow::Status PartGroupAggregateOperator::BuildRows() {
+  // The next partitions' rows, in parallel: as many partitions as threads (one under memory
+  // pressure), so that the rows built ahead of the consumer stay bounded. Each table goes once
+  // its rows are built.
+  const bool pressure = budget_ != nullptr && budget_->under_pressure();
+  const std::size_t wave = pressure ? 1 : std::max<std::size_t>(1, threads_);
+  const std::size_t first = built_;
+  const std::size_t count = std::min(wave, tables_.size() - first);
+  built_ += count;
+  return ForEach(executor_, count, [this, first](std::size_t i) -> arrow::Status {
+    const std::size_t p = first + i;
+    while (true) {
+      ARROW_ASSIGN_OR_RAISE(auto chunk, tables_[p]->NextChunk(schema_));
+      if (chunk == nullptr) {
+        break;
+      }
+      rows_[p].push_back(std::move(chunk));
+    }
+    tables_[p].reset();
+    return arrow::Status::OK();
+  });
 }
 
 arrow::Status PartGroupAggregateOperator::Close() {
   scheduler_.reset();
   tables_.clear();
+  rows_.clear();
   next_table_ = 0;
+  next_chunk_ = 0;
+  built_ = 0;
   opened_ = false;
   return arrow::Status::OK();
 }
@@ -458,17 +511,17 @@ arrow::Status PartTwoLevelAggregateOperator::Open(ExecContext& ctx) {
   return arrow::Status::OK();
 }
 
-arrow::Status PartTwoLevelAggregateOperator::MergePart(
-    const std::vector<std::unique_ptr<GroupTable>>& part) {
-  ANTB1_CHECK(part.size() == tables_.size());
-  return ForEach(executor_, GroupTable::kPartitions, [&](std::size_t p) -> arrow::Status {
-    for (std::size_t t = 0; t < part.size(); ++t) {
-      if (p < part[t]->num_partitions()) {  // a plain table without keys has one partition
-        ARROW_RETURN_NOT_OK(tables_[t][p]->MergePartition(*part[t], p));
+PartitionLanes::Merge PartTwoLevelAggregateOperator::MergeOf(PartTables inner) {
+  ANTB1_CHECK(inner->tables.size() == tables_.size());
+  return [this, part = std::move(inner)](std::size_t p) -> arrow::Status {
+    const std::vector<std::unique_ptr<GroupTable>>& tables = part->tables;
+    for (std::size_t t = 0; t < tables.size(); ++t) {
+      if (p < tables[t]->num_partitions()) {  // a plain table without keys has one partition
+        ARROW_RETURN_NOT_OK(tables_[t][p]->MergePartition(*tables[t], p));
       }
     }
     return arrow::Status::OK();
-  });
+  };
 }
 
 arrow::Status PartTwoLevelAggregateOperator::Outer(std::size_t partition) {
@@ -589,21 +642,38 @@ arrow::Status PartTwoLevelAggregateOperator::Aggregate() {
     }
     return arrow::Status::OK();
   }));
+  // Every part merges in part order, each partition in its own lane: the sample's parts, then the
+  // others, partitioned on their workers.
+  PartitionLanes lanes(GroupTable::kPartitions, executor_, window_, budget_);
+  int64_t index = 0;
+  arrow::Status status;
   for (PartTables& part : sampled) {
-    ARROW_RETURN_NOT_OK(MergePart(part->tables));
-    part.reset();  // gives the memory back
-  }
-  sampled.clear();
-
-  // The other parts, partitioned on their workers.
-  {
-    auto scheduler = run(sample, num_parts_ - sample,
-                         std::make_shared<const std::vector<std::uint64_t>>(heavy_));
-    while (!scheduler->done()) {
-      ARROW_ASSIGN_OR_RAISE(const PartTables part, scheduler->Next());
-      ARROW_RETURN_NOT_OK(MergePart(part->tables));
+    status = lanes.Add(index++, MergeOf(std::move(part)));  // the lanes free it once merged
+    if (!status.ok()) {
+      break;
     }
   }
+  sampled.clear();
+  if (status.ok()) {
+    auto scheduler = run(sample, num_parts_ - sample,
+                         std::make_shared<const std::vector<std::uint64_t>>(heavy_));
+    // A part that runs out of memory runs again alone once the earlier parts are merged and freed.
+    scheduler->set_before_retry([&lanes] { lanes.Wait(); });
+    while (!scheduler->done()) {
+      arrow::Result<PartTables> part = scheduler->Next();
+      if (!part.ok()) {
+        status = part.status();
+        break;
+      }
+      status = lanes.Add(index++, MergeOf(*std::move(part)));
+      if (!status.ok()) {
+        break;
+      }
+    }
+  }
+  // A merge failure is of an earlier part than any failure of the scheduler seen after it.
+  ARROW_RETURN_NOT_OK(lanes.Finish());
+  ARROW_RETURN_NOT_OK(status);
 
   // The outer level, partitions in parallel; then the heavy K's groups across the partitions.
   outer_.clear();
