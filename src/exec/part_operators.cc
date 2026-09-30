@@ -281,18 +281,23 @@ PartGroupAggregateOperator::PartGroupAggregateOperator(PartPipeline pipeline, in
                                                        int input_width,
                                                        std::vector<plan::BoundColumn> keys,
                                                        std::vector<plan::AggregateCall> aggregates,
-                                                       std::shared_ptr<arrow::Schema> schema)
+                                                       std::shared_ptr<arrow::Schema> schema,
+                                                       std::optional<PartitionTopN> top_n)
     : pipeline_(std::make_shared<const PartPipeline>(std::move(pipeline))),
       num_parts_(num_parts),
       input_width_(input_width),
       keys_(std::move(keys)),
       aggregates_(std::move(aggregates)),
-      schema_(std::move(schema)) {}
+      schema_(std::move(schema)),
+      top_n_(std::move(top_n)) {}
 
 PartGroupAggregateOperator::~PartGroupAggregateOperator() = default;
 
 arrow::Status PartGroupAggregateOperator::Open(ExecContext& ctx) {
   ARROW_RETURN_NOT_OK(Close());
+  if (top_n_.has_value() && !comparator_.has_value()) {
+    ARROW_ASSIGN_OR_RAISE(comparator_, RowComparator::Make(schema_, top_n_->keys));
+  }
   pool_ = ctx.pool;
   budget_ = ctx.budget;
   executor_ = ctx.executor;
@@ -457,6 +462,19 @@ arrow::Status PartGroupAggregateOperator::BuildRows() {
       rows_[p].push_back(std::move(chunk));
     }
     tables_[p].reset();
+    if (top_n_.has_value() && comparator_.has_value()) {
+      // Only the partition's first rows in the top-N's order go on; the others are freed here.
+      SortBuffer buffer(*comparator_, top_n_->keep);
+      for (auto& chunk : rows_[p]) {
+        ARROW_RETURN_NOT_OK(buffer.Add(std::move(chunk), pool_));
+      }
+      rows_[p].clear();
+      ARROW_RETURN_NOT_OK(buffer.Sort(pool_));
+      if (buffer.num_rows() > 0) {
+        ARROW_ASSIGN_OR_RAISE(auto kept, buffer.Slice(0, buffer.num_rows(), pool_));
+        rows_[p].push_back(std::move(kept));
+      }
+    }
     return arrow::Status::OK();
   });
 }

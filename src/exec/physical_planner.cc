@@ -39,8 +39,11 @@ using OperatorResult = arrow::Result<std::unique_ptr<Operator>>;
 // Builds a node's operators. Without a part, a part pipeline (PipelineScan) becomes the part
 // operators over it; with one, the node is inside the pipeline of that part. With a profile node
 // (`slot`), the operator is profiled into it (profile.h) and its inputs into its children.
+// With `top_n` (a top-N right above `node`), a partitioned grouped aggregation keeps only each
+// partition's first rows in its order (PartitionTopN).
 OperatorResult Build(const plan::LogicalNodePtr& node, std::optional<int64_t> part = std::nullopt,
-                     ProfileNode* slot = nullptr, const LateScan* late = nullptr);
+                     ProfileNode* slot = nullptr, const LateScan* late = nullptr,
+                     const PartitionTopN* top_n = nullptr);
 // The operator profiled into `slot` (with the node's EXPLAIN line when it has no detail yet); the
 // operator itself without a slot.
 OperatorResult Profiled(OperatorResult op, const plan::LogicalNodePtr& node, ProfileNode* slot);
@@ -251,6 +254,7 @@ struct Builder {
   std::optional<int64_t> part;     // inside the pipeline of this part
   ProfileNode* slot = nullptr;     // the profile node of the operator built (nullptr: no profile)
   const LateScan* late = nullptr;  // the narrow scan of the part pipeline (late materialization)
+  const PartitionTopN* top_n = nullptr;  // a top-N right above this node
 
   // The profile node of the operator's input (per part as the operator is). A node's name, detail
   // and per-part flag are written by the first build of its plan (at planning time, before the
@@ -364,10 +368,14 @@ struct Builder {
             std::move(parts.pipeline), parts.count, parts.sample, width, node.keys, node.aggregates,
             serial.output_schema(), /*global=*/false);
       }
-      Name("PartGroupAggregate");
-      return std::make_unique<PartGroupAggregateOperator>(std::move(parts.pipeline), parts.count,
-                                                          width, node.keys, node.aggregates,
-                                                          serial.output_schema());
+      Name("PartGroupAggregate",
+           top_n == nullptr ? std::string()
+                            : std::format("{} top-N per partition keep={}",
+                                          plan::ExplainNode(plan::LogicalNode(node)), top_n->keep));
+      return std::make_unique<PartGroupAggregateOperator>(
+          std::move(parts.pipeline), parts.count, width, node.keys, node.aggregates,
+          serial.output_schema(),
+          top_n == nullptr ? std::nullopt : std::optional<PartitionTopN>(*top_n));
     }
     Name("GroupAggregate");
     ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input, std::nullopt, Input()));
@@ -424,6 +432,18 @@ struct Builder {
                                                   node.offset);
       }
       Name("TopN", detail);
+      if (std::holds_alternative<plan::GroupAggregateNode>(*sort->input)) {
+        // A partitioned GROUP BY below keeps only each partition's first rows (in parallel).
+        int64_t keep = 0;
+        if (__builtin_add_overflow(*node.limit, node.offset, &keep)) {
+          keep = std::numeric_limits<int64_t>::max();
+        }
+        const PartitionTopN partition_top_n{.keys = sort->keys, .keep = keep};
+        ARROW_ASSIGN_OR_RAISE(auto input,
+                              Build(sort->input, std::nullopt, Input(), nullptr, &partition_top_n));
+        return std::make_unique<SortOperator>(std::move(input), sort->keys, node.limit,
+                                              node.offset);
+      }
       ARROW_ASSIGN_OR_RAISE(auto input, Build(sort->input, std::nullopt, Input()));
       return std::make_unique<SortOperator>(std::move(input), sort->keys, node.limit, node.offset);
     }
@@ -467,7 +487,7 @@ OperatorResult Profiled(OperatorResult op, const plan::LogicalNodePtr& node, Pro
 }
 
 OperatorResult Build(const plan::LogicalNodePtr& node, std::optional<int64_t> part,
-                     ProfileNode* slot, const LateScan* late) {
+                     ProfileNode* slot, const LateScan* late, const PartitionTopN* top_n) {
   if (node == nullptr) {
     return arrow::Status::Invalid("logical plan node without its input");
   }
@@ -476,7 +496,9 @@ OperatorResult Build(const plan::LogicalNodePtr& node, std::optional<int64_t> pa
       return Profiled(BuildPartUnion(node, *scan, std::nullopt, slot), node, slot);
     }
   }
-  return Profiled(std::visit(Builder{.part = part, .slot = slot, .late = late}, *node), node, slot);
+  return Profiled(
+      std::visit(Builder{.part = part, .slot = slot, .late = late, .top_n = top_n}, *node), node,
+      slot);
 }
 
 }  // namespace

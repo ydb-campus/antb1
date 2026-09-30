@@ -1,0 +1,170 @@
+# ORDER BY ... LIMIT over a GROUP BY: each partition of the aggregation keeps only its first rows
+# in the top-N's order, and the top-N picks from those (docs/adr/0011-sorting-and-top-n.md). The
+# rows are those of sorting every group.
+
+query II nosort
+SELECT UserID, COUNT(*) AS c FROM hits_like_split GROUP BY UserID ORDER BY c DESC, UserID LIMIT 5
+----
+9223372036854775807	2
+-9223372036854775808	1
+386056098584291	1
+806893882316698	1
+3139869338429733	1
+
+query II nosort
+SELECT UserID, COUNT(*) AS c FROM hits_like_split GROUP BY UserID ORDER BY c DESC, UserID LIMIT 4 OFFSET 3000
+----
+1352933567315323775	1
+1353141830839239171	1
+1353323344675940665	1
+1354087595029117100	1
+
+query ITI nosort
+SELECT RegionID, MIN(URL), COUNT(*) AS c FROM hits_like_nulls GROUP BY RegionID ORDER BY c DESC, RegionID NULLS FIRST LIMIT 6
+----
+NULL	(empty)	785
+0	(empty)	276
+8830	(empty)	6
+7430	https://www.example.org/naïve/83807	5
+306	https://www.example.org/cloud/70023	4
+2493	https://www.example.org/green/3416?q=alpha	4
+
+query III nosort
+SELECT CounterID, RegionID, SUM(ResolutionWidth) AS w FROM hits_like_split GROUP BY CounterID, RegionID ORDER BY w DESC, CounterID, RegionID LIMIT 5 OFFSET 2
+----
+15062	0	17932
+4062	0	16248
+28062	0	15350
+35062	0	15094
+37062	0	14796
+
+query TI nosort
+SELECT SearchPhrase, COUNT(*) AS c FROM hits_like_split WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c, SearchPhrase DESC LIMIT 3
+----
+погода погода погода	1
+погода погода новости	1
+погода погода	1
+
+# A LIMIT past the groups: every group after the first two, sorted.
+query II nosort
+SELECT OS, COUNT(*) AS c FROM hits_like GROUP BY OS ORDER BY c DESC, OS LIMIT 1000 OFFSET 2
+----
+118	103
+73	102
+26	100
+55	100
+43	99
+89	99
+2	97
+41	97
+13	95
+93	95
+101	95
+67	94
+110	94
+3	93
+77	93
+6	92
+66	92
+69	92
+46	90
+79	90
+82	90
+17	89
+24	89
+31	89
+80	89
+87	89
+105	89
+113	89
+18	88
+23	88
+49	88
+61	88
+76	88
+96	88
+12	87
+50	87
+56	87
+68	87
+117	87
+27	86
+44	86
+53	86
+92	86
+94	86
+111	86
+8	85
+9	85
+85	85
+14	84
+29	84
+54	84
+62	84
+65	84
+71	84
+78	83
+95	83
+115	83
+0	82
+1	82
+47	82
+58	82
+70	82
+81	82
+90	82
+104	82
+11	81
+42	81
+48	81
+60	81
+98	81
+100	81
+19	80
+36	80
+45	80
+59	80
+119	80
+40	79
+97	79
+28	78
+88	78
+103	78
+106	78
+107	78
+109	78
+15	77
+64	77
+75	77
+7	76
+20	76
+57	75
+83	75
+52	74
+63	74
+99	74
+120	74
+21	73
+22	73
+25	73
+35	73
+72	73
+102	73
+37	72
+91	72
+112	72
+4	71
+51	71
+74	71
+86	71
+38	70
+39	70
+114	70
+16	69
+5	68
+30	68
+33	68
+34	68
+32	67
+84	66
+108	58
