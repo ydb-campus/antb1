@@ -25,6 +25,7 @@
 #include "antb1/exec/group_aggregate.h"
 #include "antb1/exec/memory_budget.h"
 #include "antb1/exec/physical_planner.h"
+#include "antb1/exec/profile.h"
 #include "antb1/exec/scalar_aggregate.h"
 #include "antb1/exec/sort.h"
 #include "antb1/exec/table_scan.h"
@@ -1187,6 +1188,204 @@ TEST_F(PartOperatorsTest, HeavyKeysSpreadOverThePartitions) {
                             [&](std::size_t p) { return !(*by_x)->partition_groups(p).empty(); }),
       50)
       << "400 values of x over 64 partitions";
+}
+
+// ---- late materialization of top-N (docs/adr/0016-late-materialization.md) ----
+
+// 16 parts of 25 rows (every sixth part empty): k (BIGINT, ties: r % 13, NULL every 11th), s
+// (VARCHAR, NULL every 7th), d (DOUBLE), day (DATE), v (BIGINT, r).
+std::shared_ptr<MemoryTable> WideTable(bool split) {
+  const auto schema =
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("s", arrow::binary()),
+                     arrow::field("d", arrow::float64()), arrow::field("day", arrow::date32()),
+                     arrow::field("v", arrow::int64())});
+  arrow::RecordBatchVector batches;
+  for (int64_t part = 0; part < 16; ++part) {
+    std::vector<std::optional<int64_t>> k;
+    std::vector<std::optional<std::string>> str;
+    arrow::DoubleBuilder d;
+    arrow::Date32Builder day;
+    std::vector<std::optional<int64_t>> v;
+    const int64_t rows = part % 6 == 5 ? 0 : 25;
+    for (int64_t i = 0; i < rows; ++i) {
+      const int64_t r = (part * 25) + i;
+      k.push_back(r % 11 == 0 ? std::nullopt : std::optional<int64_t>(r % 13));
+      str.push_back(r % 7 == 0 ? std::nullopt
+                               : std::optional<std::string>("s" + std::to_string(r)));
+      EXPECT_TRUE(d.Append(static_cast<double>(r) / 4).ok());
+      EXPECT_TRUE(day.Append(static_cast<int32_t>(r % 100)).ok());
+      v.emplace_back(r);
+    }
+    batches.push_back(
+        arrow::RecordBatch::Make(schema, rows,
+                                 {Int64s(k), testing::Strings(str), d.Finish().ValueOrDie(),
+                                  day.Finish().ValueOrDie(), Int64s(v)}));
+  }
+  if (!split) {
+    auto combined = arrow::Table::FromRecordBatches(schema, batches).ValueOrDie();
+    auto one = combined->CombineChunksToBatch().ValueOrDie();
+    return std::make_shared<MemoryTable>(schema, arrow::RecordBatchVector{one}, false);
+  }
+  return std::make_shared<MemoryTable>(schema, std::move(batches), true);
+}
+
+// A narrow scan of a part reads only the early columns: a late column is a NullArray of the
+// batch's length, the row-id column carries RowId(ordinal, position in the part), across batches;
+// a row-id column that is not late, or no part, is invalid.
+TEST_F(PartOperatorsTest, NarrowScanCarriesRowIds) {
+  const auto table = WideTable(true);
+  const std::vector<int> fields = {0, 1, 2, 3, 4};
+  TableScanOperator narrow(
+      table, fields, 2,
+      LateScan{.late = {false, true, true, false, true}, .row_id = 1, .ordinal = 7});
+  TableScanOperator plain(table, fields, 2);
+  ExecContext ctx{.pool = arrow::default_memory_pool(), .batch_size = 3};
+  const auto narrowed = Drain(narrow, ctx);
+  const auto full = Drain(plain, ctx);
+  ASSERT_TRUE(narrowed.ok()) << narrowed.status().ToString();
+  ASSERT_TRUE(full.ok());
+  ASSERT_EQ((*narrowed)->num_rows(), 25);
+  EXPECT_EQ((*narrowed)->schema()->field(1)->type()->id(), arrow::Type::INT64);
+  EXPECT_EQ((*narrowed)->schema()->field(2)->type()->id(), arrow::Type::NA);
+  EXPECT_EQ((*narrowed)->schema()->field(4)->type()->id(), arrow::Type::NA);
+  EXPECT_TRUE((*narrowed)->column(0)->Equals(*(*full)->column(0)));
+  EXPECT_TRUE((*narrowed)->column(3)->Equals(*(*full)->column(3)));
+  std::vector<std::optional<int64_t>> ids;
+  ids.reserve(25);
+  for (int64_t r = 0; r < 25; ++r) {
+    ids.emplace_back(RowId(7, r));
+  }
+  EXPECT_EQ(Int64Column(**narrowed, 1), ids);
+  EXPECT_EQ((*narrowed)->column(2)->null_count(), 25);
+
+  TableScanOperator early_id(table, fields, 2,
+                             LateScan{.late = {false, true, true, false, true}, .row_id = 0});
+  EXPECT_TRUE(early_id.Open(ctx).IsInvalid());
+  TableScanOperator whole(table, fields, std::nullopt,
+                          LateScan{.late = {false, true, true, false, true}, .row_id = 1});
+  EXPECT_TRUE(whole.Open(ctx).IsInvalid());
+}
+
+// A late top-N needs its late columns: without them, with a row-id slot out of range or not
+// BIGINT, Open is invalid.
+TEST_F(PartOperatorsTest, LateTopNChecksItsColumns) {
+  const auto table = WideTable(true);
+  const std::vector<int> fields = {0, 1, 2, 3, 4};
+  const auto schema = TableScanOperator(table, fields).output_schema();
+  const auto narrow_schema =
+      TableScanOperator(table, fields, 0,
+                        LateScan{.late = {false, true, true, true, true}, .row_id = 1})
+          .output_schema();
+  const PartPipeline pipeline = [table,
+                                 fields](int64_t part) -> arrow::Result<std::unique_ptr<Operator>> {
+    return std::make_unique<TableScanOperator>(table, fields, part);
+  };
+  const LateColumns good{
+      .table = table,
+      .slots = {1, 2, 3, 4},
+      .fields = {1, 2, 3, 4},
+      .row_id = 1,
+      .parts = std::make_shared<const std::vector<int64_t>>(std::vector<int64_t>{0, 1, 2}),
+      .narrow_schema = narrow_schema};
+  std::vector<LateColumns> bad(4, good);
+  bad[0].slots.clear();
+  bad[0].fields.clear();
+  bad[1].row_id = 9;
+  bad[2].row_id = 2;  // DOUBLE in the table's schema: not a row-id column
+  bad[2].narrow_schema = schema;
+  bad[3].parts = nullptr;
+  ExecContext ctx{.pool = arrow::default_memory_pool(), .batch_size = 3};
+  for (std::size_t i = 0; i < bad.size(); ++i) {
+    PartTopNOperator op(pipeline, 3, schema, {{.column = Column(0, "k", LogicalType::kBigInt)}}, 2,
+                        0, bad[i]);
+    EXPECT_TRUE(op.Open(ctx).IsInvalid()) << i;
+  }
+  PartTopNOperator ok(pipeline, 3, schema, {{.column = Column(0, "k", LogicalType::kBigInt)}}, 2, 0,
+                      good);
+  EXPECT_TRUE(ok.Open(ctx).ok());
+  EXPECT_TRUE(ok.Close().ok());
+}
+
+// A top-N whose other columns are fetched late gives the rows of the plain top-N (one part, so no
+// late materialization), byte for byte, on any number of threads: every column type with NULLs,
+// ties on the key, a filter, a computed key, windows inside, across and past the rows, and no
+// row at all. Failures of a part or of the late fetch pass through.
+TEST_F(PartOperatorsTest, TopNFetchesLateColumns) {
+  const auto pool = Pool();
+  const auto k = Column(0, "k", LogicalType::kBigInt);
+  const auto v = Column(4, "v", LogicalType::kBigInt);
+  const auto shapes = [&](const std::shared_ptr<MemoryTable>& table) {
+    const auto scan =
+        Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1, 2, 3, 4}});
+    const auto filter = Node(plan::FilterNode{
+        .input = scan, .predicates = {testing::Compare(v, plan::CompareOp::kGe, BigInt(120))}});
+    const auto none = Node(plan::FilterNode{
+        .input = scan, .predicates = {testing::Compare(v, plan::CompareOp::kLt, BigInt(0))}});
+    const auto compute = Node(plan::ComputeNode{
+        .input = scan,
+        .exprs = {std::make_shared<const plan::Expr>(plan::Expr{
+            .node = plan::ColumnExpr{.index = 4}, .type = LogicalType::kBigInt, .name = "v2"})}});
+    return std::vector<std::pair<plan::LogicalNodePtr, std::vector<plan::SortKey>>>{
+        {scan, {{.column = k, .descending = false, .nulls_first = false}}},
+        {scan, {{.column = k, .descending = true, .nulls_first = true}}},
+        {filter, {{.column = k, .descending = true, .nulls_first = false}}},
+        {none, {{.column = k}}},
+        {compute, {{.column = Column(5, "v2", LogicalType::kBigInt), .descending = true}}}};
+  };
+  const auto wide = shapes(WideTable(true));
+  const auto one = shapes(WideTable(false));
+  int late_plans = 0;  // the rule applies when limit + offset <= half of the parts read
+  for (std::size_t shape = 0; shape < wide.size(); ++shape) {
+    for (const auto& [limit, offset] :
+         std::vector<std::pair<int64_t, int64_t>>{{1, 0}, {3, 0}, {4, 2}, {6, 2}, {2, 7}}) {
+      const auto top = [&](const auto& input) {
+        const std::size_t width =
+            input.first == wide[4].first || input.first == one[4].first ? 6 : 5;
+        return PlanOf(Node(plan::LimitNode{
+                          .input = Node(plan::SortNode{.input = input.first, .keys = input.second}),
+                          .limit = limit,
+                          .offset = offset}),
+                      width);
+      };
+      const auto expected = Run(top(one[shape]), nullptr);
+      ASSERT_TRUE(expected.ok()) << expected.status().ToString();
+      ProfileNode root;
+      auto late = BuildPhysicalPlan(top(wide[shape]), &root);
+      ASSERT_TRUE(late.ok()) << late.status().ToString();
+      late_plans += root.detail().contains(" late=") ? 1 : 0;
+      for (arrow::internal::Executor* executor :
+           {static_cast<arrow::internal::Executor*>(nullptr),
+            static_cast<arrow::internal::Executor*>(pool.get())}) {
+        const auto result = Run(top(wide[shape]), executor);
+        ASSERT_TRUE(result.ok()) << result.status().ToString();
+        EXPECT_TRUE(SameRows(**result, **expected))
+            << "shape " << shape << " limit " << limit << " offset " << offset << "\n"
+            << (*result)->ToString() << "\n"
+            << (*expected)->ToString();
+      }
+    }
+  }
+  EXPECT_GE(late_plans, 15) << "of 25 plans";
+  const auto top_of = [&](const std::shared_ptr<MemoryTable>& table) {
+    return PlanOf(
+        Node(plan::LimitNode{.input = Node(plan::SortNode{.input = shapes(table)[0].first,
+                                                          .keys = shapes(table)[0].second}),
+                             .limit = 2,
+                             .offset = 0}),
+        5);
+  };
+  for (arrow::internal::Executor* executor :
+       {static_cast<arrow::internal::Executor*>(nullptr),
+        static_cast<arrow::internal::Executor*>(pool.get())}) {
+    const auto broken_part = WideTable(true);
+    broken_part->FailPart(3);
+    EXPECT_TRUE(Run(top_of(broken_part), executor).status().IsIOError());
+    const auto broken_fetch = WideTable(true);
+    broken_fetch->FailField(1);  // a late column: read by the fetch only
+    const auto fetched = Run(top_of(broken_fetch), executor);
+    EXPECT_TRUE(fetched.status().IsIOError()) << fetched.status().ToString();
+    EXPECT_NE(fetched.status().message().find("field 1"), std::string::npos);
+  }
 }
 
 // ---- skipping parts by their statistics ----

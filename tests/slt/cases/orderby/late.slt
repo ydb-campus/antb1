@@ -1,0 +1,33 @@
+# Late materialization of top-N (docs/adr/0016-late-materialization.md): with LIMIT + OFFSET at most
+# half of the row groups read, the columns that no filter and no ORDER BY key reads are read only
+# for the rows of the result. The rows are those of any other plan.
+
+query ITIT nosort
+SELECT WatchID, Title, RegionID, URL FROM hits_like_split WHERE SearchPhrase <> '' ORDER BY EventTime DESC, WatchID LIMIT 4
+----
+-7402699741552753388	(empty)	1999	https://www.example.org/книга/71666
+1504511544316964438	(empty)	16848	https://www.example.org/музыка/34707
+3015883405820229002	green omega delta omega	1503	https://www.example.org/музыка/63531
+1162710868739246301	maple stone cloud beta	16062	https://www.example.org/river/91333
+
+query ITI nosort
+SELECT WatchID, Title, RegionID FROM hits_like_split WHERE IsMobile = 1 ORDER BY EventTime, WatchID LIMIT 2 OFFSET 3
+----
+7302740321058891491	(empty)	17971
+7428716458754895743	(empty)	19113
+
+query ITI nosort
+SELECT WatchID, SearchPhrase, UserID FROM hits_like_split ORDER BY WatchID DESC LIMIT 5
+----
+9223372036854775807	(empty)	9223372036854775807
+9223213519914264496	(empty)	1130292731657897963
+9220750761623575838	(empty)	1580917315368054933
+9220258428497617730	lemon quick	369217957222409467
+9219560897835632538	(empty)	339854513787651988
+
+query IT nosort
+SELECT UserID, URL FROM hits_like_split WHERE URL LIKE '%a%' ORDER BY ResolutionWidth + 1, WatchID LIMIT 3
+----
+1866631339698459070	https://www.example.org/погода/11584?q=beta
+883893638585008810	https://www.example.org/river/54957
+1430581814839957941	https://www.example.org/café/2382

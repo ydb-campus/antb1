@@ -265,6 +265,9 @@ its offset). A rule optimizer then rewrites it:
 - projection pruning: `Scan` reads only the columns that the nodes above it use (none for a bare `COUNT(*)`);
 - `COUNT(*)` alone without `WHERE`, over a table whose row count is known without scanning (every Parquet table),
   becomes `RowCount`, answered from the footers.
+- (execution, not a plan rule) an `ORDER BY ... LIMIT` over a table reads first only the columns its `WHERE` and its
+  keys use, and the other columns only for the rows of the result, when `LIMIT + OFFSET` is at most half of the row
+  groups read ([ADR 0016](adr/0016-late-materialization.md)); `antb1 explain --analyze` shows `late=N columns`.
 
 `antb1 explain` prints the optimized plan: an `Output:` line with the result names and types, then one line per
 node from the root down, each input indented by two more spaces. Names that are not plain identifiers are

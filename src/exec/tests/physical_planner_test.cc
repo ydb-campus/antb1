@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include "antb1/exec/limit.h"
+#include "antb1/exec/profile.h"
 #include "antb1/exec/scalar_aggregate.h"
 #include "antb1/exec/sort.h"
 #include "antb1/plan/logical_plan.h"
@@ -237,6 +238,64 @@ TEST_F(PhysicalPlannerTest, CountDistinctRunsInTwoLevels) {
   EXPECT_EQ(Int64Column(*result, 0), (std::vector<std::optional<int64_t>>{3}));
   EXPECT_EQ(Int64Column(*result, 1), (std::vector<std::optional<int64_t>>{3}));
   EXPECT_EQ(Int64Column(*result, 2), (std::vector<std::optional<int64_t>>{7}));
+}
+
+// A top-N reads late the columns that no filter, computation or key uses (ADR 0016), when
+// limit + offset is at most half of the parts; not with a Project inside the pipeline, nor when
+// every column is read.
+TEST_F(PhysicalPlannerTest, TopNReadsUnusedColumnsLate) {
+  const auto schema =
+      arrow::schema({arrow::field("x", arrow::int64()), arrow::field("y", arrow::int64()),
+                     arrow::field("z", arrow::int64())});
+  arrow::RecordBatchVector batches;
+  for (int64_t part = 0; part < 10; ++part) {
+    batches.push_back(arrow::RecordBatch::Make(
+        schema, 1, {Int64s({part}), Int64s({part * 10}), Int64s({part * 100})}));
+  }
+  const auto table = std::make_shared<MemoryTable>(schema, std::move(batches), true);
+  const auto x = Column(0, "x", LogicalType::kBigInt);
+  const auto y = Column(1, "y", LogicalType::kBigInt);
+  const auto z = Column(2, "z", LogicalType::kBigInt);
+  const auto scan = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1, 2}});
+  const auto detail = [&](const plan::LogicalNodePtr& input, const plan::BoundColumn& key,
+                          int64_t limit, std::size_t width = 3) {
+    ProfileNode root;
+    auto op = BuildPhysicalPlan(
+        PlanOf(Node(plan::LimitNode{
+                   .input = Node(plan::SortNode{.input = input, .keys = {{.column = key}}}),
+                   .limit = limit,
+                   .offset = 0}),
+               width),
+        &root);
+    EXPECT_TRUE(op.ok()) << op.status().ToString();
+    return root.detail();
+  };
+  EXPECT_EQ(detail(scan, x, 2), "Sort x ASC NULLS LAST Limit 2 late=2 columns");
+  EXPECT_EQ(detail(scan, x, 5), "Sort x ASC NULLS LAST Limit 5 late=2 columns");
+  EXPECT_EQ(detail(scan, x, 6), "Sort x ASC NULLS LAST Limit 6") << "more than half of the parts";
+  const auto filter = Node(plan::FilterNode{
+      .input = scan,
+      .predicates = {testing::Compare(z, plan::CompareOp::kGe, testing::BigInt(0))}});
+  EXPECT_EQ(detail(filter, y, 2), "Sort y ASC NULLS LAST Limit 2 late=1 columns");
+  const auto compute = Node(
+      plan::ComputeNode{.input = filter,
+                        .exprs = {std::make_shared<const plan::Expr>(plan::Expr{
+                            .node = plan::ColumnExpr{.index = 0}, .type = LogicalType::kBigInt})}});
+  EXPECT_EQ(detail(compute, y, 2, 4), "Sort y ASC NULLS LAST Limit 2") << "every column is read";
+  const auto project = Node(plan::ProjectNode{.input = scan, .columns = {z, x}});
+  EXPECT_EQ(detail(project, Column(1, "x", LogicalType::kBigInt), 2, 2),
+            "Sort x ASC NULLS LAST Limit 2")
+      << "a Project renumbers the columns";
+  // The rows are those of the plain top-N.
+  const auto rows = Run(PlanOf(
+      Node(plan::LimitNode{
+          .input = Node(plan::SortNode{.input = scan, .keys = {{.column = y, .descending = true}}}),
+          .limit = 3,
+          .offset = 1}),
+      3));
+  ASSERT_NE(rows, nullptr);
+  EXPECT_EQ(Int64Column(*rows, 0), (std::vector<std::optional<int64_t>>{8, 7, 6}));
+  EXPECT_EQ(Int64Column(*rows, 2), (std::vector<std::optional<int64_t>>{800, 700, 600}));
 }
 
 TEST_F(PhysicalPlannerTest, AggregateOverFilteredScanForEveryBatchSize) {

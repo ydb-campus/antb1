@@ -236,10 +236,25 @@ class PartTwoLevelAggregateOperator final : public Operator {
 // part order: exactly the rows and order of SortOperator's top-N over the part union, for any
 // number of threads. Output: the window [offset, offset + limit) of the order, in the pipeline's
 // schema.
+// Late materialization of a top-N (docs/adr/0016-late-materialization.md): the part pipelines scan
+// narrowly (LateScan), so their rows hold NULL placeholders in the late columns and row ids in one
+// of them; the top-N keeps and orders those rows; then the late columns of the window's rows are
+// read from their parts (one task per part and column, on the executor) and put in place.
+struct LateColumns {
+  std::shared_ptr<plan::Table> table;
+  std::vector<int> slots;   // the late output columns
+  std::vector<int> fields;  // the table field of each
+  int row_id = -1;          // the slot that carries the row ids through the pipeline
+  // The table part of each part number (the parts the pipeline reads, in order).
+  std::shared_ptr<const std::vector<int64_t>> parts;
+  std::shared_ptr<arrow::Schema> narrow_schema;  // of the narrow pipeline's rows
+};
+
 class PartTopNOperator final : public Operator {
  public:
   PartTopNOperator(PartPipeline pipeline, int64_t num_parts, std::shared_ptr<arrow::Schema> schema,
-                   std::vector<plan::SortKey> keys, int64_t limit, int64_t offset);
+                   std::vector<plan::SortKey> keys, int64_t limit, int64_t offset,
+                   std::optional<LateColumns> late = std::nullopt);
   ~PartTopNOperator() override;
 
   [[nodiscard]] const std::shared_ptr<arrow::Schema>& output_schema() const override {
@@ -269,12 +284,21 @@ class PartTopNOperator final : public Operator {
   int64_t offset_;
   arrow::MemoryPool* pool_ = arrow::default_memory_pool();
   int64_t batch_size_ = 1;
+  std::optional<LateColumns> late_;
+  arrow::internal::Executor* executor_ = nullptr;
   std::unique_ptr<SortBuffer> merged_;  // the parts' first rows, until emitted
   MemoryReservation memory_;            // merged_'s own containers
   bool sorted_ = false;
   int64_t next_ = 0;  // the next sorted row to emit
   int64_t end_ = 0;   // one past the last
+  // With late_: the window's rows with their late columns, emitted from next_ - offset on.
+  std::shared_ptr<arrow::RecordBatch> window_;
+  int64_t window_start_ = 0;
   std::unique_ptr<PartScheduler<PartBuffer>> scheduler_;
+
+  // The window's narrow rows with their late columns read from their parts.
+  arrow::Result<std::shared_ptr<arrow::RecordBatch>> Fetch(const arrow::RecordBatch& window,
+                                                           const LateColumns& late);
 };
 
 }  // namespace antb1::exec

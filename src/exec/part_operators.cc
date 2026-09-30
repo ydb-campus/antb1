@@ -10,10 +10,13 @@
 #include <new>
 #include <numeric>
 #include <optional>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include <arrow/api.h>
+#include <arrow/array/concatenate.h>
+#include <arrow/compute/api_vector.h>
 #include <arrow/util/future.h>
 #include <arrow/util/thread_pool.h>
 
@@ -21,6 +24,7 @@
 #include "antb1/exec/operator.h"
 #include "antb1/exec/profile.h"
 #include "antb1/exec/sort.h"
+#include "antb1/exec/table_scan.h"
 #include "antb1/plan/logical_plan.h"
 
 #include "aggregate_set.h"
@@ -797,13 +801,15 @@ arrow::Status PartTwoLevelAggregateOperator::Close() {
 
 PartTopNOperator::PartTopNOperator(PartPipeline pipeline, int64_t num_parts,
                                    std::shared_ptr<arrow::Schema> schema,
-                                   std::vector<plan::SortKey> keys, int64_t limit, int64_t offset)
+                                   std::vector<plan::SortKey> keys, int64_t limit, int64_t offset,
+                                   std::optional<LateColumns> late)
     : pipeline_(std::make_shared<const PartPipeline>(std::move(pipeline))),
       num_parts_(num_parts),
       schema_(std::move(schema)),
       keys_(std::move(keys)),
       limit_(limit),
-      offset_(offset) {}
+      offset_(offset),
+      late_(std::move(late)) {}
 
 PartTopNOperator::~PartTopNOperator() = default;
 
@@ -816,19 +822,34 @@ arrow::Status PartTopNOperator::Open(ExecContext& ctx) {
     return arrow::Status::Invalid("a top-N needs a positive LIMIT and no negative OFFSET");
   }
   pool_ = ctx.pool;
+  executor_ = ctx.executor;
   batch_size_ = std::max<int64_t>(ctx.batch_size, 1);
   int64_t keep = 0;
   if (__builtin_add_overflow(limit_, offset_, &keep)) {
     keep = std::numeric_limits<int64_t>::max();
   }
-  ARROW_ASSIGN_OR_RAISE(RowComparator comparator, RowComparator::Make(schema_, keys_));
+  // The rows the parts keep: the narrow pipeline's with late columns.
+  const std::shared_ptr<arrow::Schema>& rows_schema =
+      late_.has_value() ? late_->narrow_schema : schema_;
+  if (late_.has_value()) {
+    const LateColumns& late = late_.value();
+    if (late.table == nullptr || late.parts == nullptr || late.slots.empty() ||
+        late.slots.size() != late.fields.size() || rows_schema == nullptr ||
+        rows_schema->num_fields() != schema_->num_fields() || late.row_id < 0 ||
+        late.row_id >= rows_schema->num_fields() ||
+        rows_schema->field(late.row_id)->type()->id() != arrow::Type::INT64) {
+      return arrow::Status::Invalid("a late top-N without its late columns");
+    }
+  }
+  ARROW_ASSIGN_OR_RAISE(RowComparator comparator, RowComparator::Make(rows_schema, keys_));
   merged_ = std::make_unique<SortBuffer>(std::move(comparator), keep);
   memory_.Reset(ctx.budget);
   sorted_ = false;
   next_ = 0;
   end_ = 0;
-  auto task = [pipeline = pipeline_, part_ctx = PartContext(ctx), schema = schema_, keys = keys_,
-               keep, profile = profile()](
+  window_.reset();
+  auto task = [pipeline = pipeline_, part_ctx = PartContext(ctx), schema = rows_schema,
+               keys = keys_, keep, profile = profile()](
                   int64_t part, const std::atomic<bool>& stop) -> arrow::Result<PartBuffer> {
     const ProfileTimer part_time(profile, "part_time");
     ARROW_ASSIGN_OR_RAISE(RowComparator part_comparator, RowComparator::Make(schema, keys));
@@ -881,14 +902,128 @@ arrow::Result<Batch> PartTopNOperator::Next() {
     return Batch{};
   }
   const int64_t stop = end_ - next_ > batch_size_ ? next_ + batch_size_ : end_;
+  if (late_.has_value()) {
+    if (window_ == nullptr) {  // the whole window at once: its late columns in one fetch
+      const int64_t begin = next_;
+      ARROW_ASSIGN_OR_RAISE(auto narrow, merged_->Slice(begin, end_, pool_));
+      ARROW_ASSIGN_OR_RAISE(window_, Fetch(*narrow, late_.value()));
+      window_start_ = begin;
+    }
+    auto rows = window_->Slice(next_ - window_start_, stop - next_);
+    next_ = stop;
+    return Batch{.data = std::move(rows), .selection = {}};
+  }
   ARROW_ASSIGN_OR_RAISE(auto rows, merged_->Slice(next_, stop, pool_));
   next_ = stop;
   return Batch{.data = std::move(rows), .selection = {}};
 }
 
+arrow::Result<std::shared_ptr<arrow::RecordBatch>> PartTopNOperator::Fetch(
+    const arrow::RecordBatch& window, const LateColumns& late) {
+  const ProfileTimer fetch(profile(), "late_fetch");
+  const int64_t rows = window.num_rows();
+  const auto& ids = static_cast<const arrow::Int64Array&>(*window.column(late.row_id));
+  // The window's rows by part, the parts in order of their first row.
+  std::vector<int64_t> ordinals;
+  std::vector<std::vector<int64_t>> offsets;  // per part, the rows' positions in the part
+  std::vector<std::vector<int64_t>> members;  // per part, the rows' positions in the window
+  std::unordered_map<int64_t, std::size_t> group_of;
+  for (int64_t r = 0; r < rows; ++r) {
+    const int64_t id = ids.Value(r);
+    const int64_t ordinal = RowIdOrdinal(id);
+    if (ordinal < 0 || std::cmp_greater_equal(ordinal, late.parts->size())) {
+      return arrow::Status::Invalid("a row id of part ", ordinal, " of ", late.parts->size());
+    }
+    const auto [it, added] = group_of.try_emplace(ordinal, ordinals.size());
+    if (added) {
+      ordinals.push_back(ordinal);
+      offsets.emplace_back();
+      members.emplace_back();
+    }
+    offsets[it->second].push_back(RowIdOffset(id));
+    members[it->second].push_back(r);
+  }
+  // Where each window row lands when the parts' rows are put one part after another.
+  std::vector<int64_t> order(static_cast<std::size_t>(rows));
+  int64_t position = 0;
+  for (const std::vector<int64_t>& part : members) {
+    for (const int64_t r : part) {
+      order[static_cast<std::size_t>(r)] = position++;
+    }
+  }
+  if (profile() != nullptr) {
+    profile()->Add("late_columns", MetricUnit::kCount, static_cast<int64_t>(late.slots.size()));
+    profile()->Add("late_parts", MetricUnit::kCount, static_cast<int64_t>(ordinals.size()));
+  }
+  // One task per part and late column: the column of that part, then its rows.
+  const std::size_t columns = late.slots.size();
+  std::vector<std::shared_ptr<arrow::Array>> pieces(ordinals.size() * columns);
+  arrow::compute::ExecContext kernels(pool_);
+  ARROW_RETURN_NOT_OK(ForEach(executor_, pieces.size(), [&](std::size_t task) -> arrow::Status {
+    const std::size_t part = task / columns;
+    const std::size_t column = task % columns;
+    ARROW_ASSIGN_OR_RAISE(
+        auto reader, late.table->ScanPart((*late.parts)[static_cast<std::size_t>(ordinals[part])],
+                                          {late.fields[column]}, batch_size_, pool_));
+    arrow::ArrayVector read;
+    while (true) {
+      std::shared_ptr<arrow::RecordBatch> batch;
+      ARROW_RETURN_NOT_OK(reader->ReadNext(&batch));
+      if (batch == nullptr) {
+        break;
+      }
+      read.push_back(batch->column(0));
+    }
+    ARROW_RETURN_NOT_OK(reader->Close());
+    if (read.empty()) {
+      return arrow::Status::IOError("part ", ordinals[part], " has no rows to fetch");
+    }
+    ARROW_ASSIGN_OR_RAISE(
+        auto whole, read.size() == 1 ? arrow::Result<std::shared_ptr<arrow::Array>>(read.front())
+                                     : arrow::Concatenate(read, pool_));
+    arrow::Int64Builder indices(pool_);
+    ARROW_RETURN_NOT_OK(indices.AppendValues(offsets[part]));
+    ARROW_ASSIGN_OR_RAISE(auto positions, indices.Finish());
+    arrow::compute::ExecContext task_kernels(pool_);
+    ARROW_ASSIGN_OR_RAISE(
+        const arrow::Datum taken,
+        arrow::compute::Take(whole, positions, arrow::compute::TakeOptions::BoundsCheck(),
+                             &task_kernels));
+    pieces[task] = taken.make_array();
+    return arrow::Status::OK();
+  }));
+  arrow::ArrayVector out = window.columns();
+  arrow::Int64Builder order_builder(pool_);
+  ARROW_RETURN_NOT_OK(order_builder.AppendValues(order));
+  ARROW_ASSIGN_OR_RAISE(auto window_order, order_builder.Finish());
+  for (std::size_t column = 0; column < columns; ++column) {
+    arrow::ArrayVector parts;
+    parts.reserve(ordinals.size());
+    for (std::size_t part = 0; part < ordinals.size(); ++part) {
+      parts.push_back(pieces[(part * columns) + column]);
+    }
+    std::shared_ptr<arrow::Array> joined;
+    if (parts.empty()) {
+      ARROW_ASSIGN_OR_RAISE(
+          joined, arrow::MakeEmptyArray(schema_->field(late.slots[column])->type(), pool_));
+    } else if (parts.size() == 1) {
+      joined = parts.front();
+    } else {
+      ARROW_ASSIGN_OR_RAISE(joined, arrow::Concatenate(parts, pool_));
+    }
+    ARROW_ASSIGN_OR_RAISE(
+        const arrow::Datum placed,
+        arrow::compute::Take(joined, window_order, arrow::compute::TakeOptions::NoBoundsCheck(),
+                             &kernels));
+    out[static_cast<std::size_t>(late.slots[column])] = placed.make_array();
+  }
+  return arrow::RecordBatch::Make(schema_, rows, std::move(out));
+}
+
 arrow::Status PartTopNOperator::Close() {
   scheduler_.reset();
   merged_.reset();
+  window_.reset();
   memory_.Release();
   return arrow::Status::OK();
 }
