@@ -30,17 +30,20 @@ Proposed
 
 - **On Linux, the `antb1` executable restarts itself once with `MIMALLOC_PURGE_DELAY=-1`** (`cli::RestartForAllocator`,
   first thing in `main`): `execv("/proc/self/exe", argv)`, the same arguments and open files (stdin included).
-- **When it restarts:** only when the process was started as `antb1` itself (`/proc/self/exe` and `argv[0]` have the
-  same file name; through the dynamic loader or an emulator they do not), when `MIMALLOC_PURGE_DELAY` is unset (a value the user set wins; the restarted process has
-  it, so it never restarts twice) and Arrow's default pool is mimalloc (`ARROW_DEFAULT_MEMORY_POOL` unset or
-  `mimalloc`).
+- **When it restarts:** only when all of these hold:
+  - the process was started as `antb1` itself: `/proc/self/exe` and `argv[0]` have the same file name (through the
+    dynamic loader or an emulator they do not);
+  - `MIMALLOC_PURGE_DELAY` is unset: a value the user set wins, and the restarted process has it, so it never restarts
+    twice;
+  - Arrow's default pool is mimalloc (`ARROW_DEFAULT_MEMORY_POOL` unset or `mimalloc`).
 - **Setting it first:** the variable is set before the exec, so a failed exec never loops. The process goes on with
   mimalloc's defaults.
 - **Where it does not apply:** the library modules, the test binaries and other platforms are unchanged.
 
 ## Consequences
 
-- **Faster queries:** 5% on the 43 queries, most on high-cardinality GROUP BYs and short GROUP BYs.
+- **Faster queries:** 5.4% on the 43 queries in one process (`antb1 bench` over all of them), 3.8% with a process per
+  query; most on high-cardinality GROUP BYs (Q32: 9%).
 - **Start-up:** the CLI starts one more time, about 26 ms. `antb1 bench` times queries inside the process, so its
   numbers do not include it.
 - **Resident memory:** the process keeps its peak memory until it exits, rather than returning it between queries.
