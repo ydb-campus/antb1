@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790811148311,
+  "lastUpdate": 1790833521578,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -2988,6 +2988,78 @@ window.BENCHMARK_DATA = {
             "value": 15.39998104347849,
             "unit": "ms/iter",
             "extra": "iterations: 46\ncpu: 15.397688000000015 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ad652b7e6abdf268b84789fb1dfdbbafb5548baf",
+          "message": "perf(exec): route parts that reduce less than 4 to 1 (#62)\n\n## Summary\n\n**What changes:** two constants of the #55 rule that sends a part's rows\nstraight to the partitions (\"routing\") when its own hash table does not\nreduce them.\n\n- **Threshold:** a part routes when its groups are more than **1/4** of\nits rows (was 3/4).\n- **Decision point:** a part decides after **64Ki** rows have reached\nits table (was 4096). Without a filter, nothing changes here: the\ndecision already came after the first batch, since the point is capped\nat the batch size. Under a filter that leaves small batches, the part\nnow waits for 64Ki kept rows instead of deciding on its first few\nthousand.\n\n**Why:** a single-thread `explain --analyze` of Q16 and Q33 (2× slower\nthan DuckDB even on one thread) shows the merge into the partitions\ncosting about as much as the parts' own aggregation:\n\n| one thread | scan | parts' aggregation | merge into partitions | build\n|\n| --- | ---: | ---: | ---: | ---: |\n| Q16 (24 M groups) | 4.5 s | ~9.4 s | ~8.0 s | 0.8 s |\n| Q33 (18 M groups) | 11.2 s | ~13.5 s | ~12.0 s | 1.0 s |\n\n**The cost argument:**\n- **Double insertion:** every group is inserted twice, in its part's\ntable and then in its partition's. A routed part inserts each row once.\n- **Who routed:** under the 3/4 rule only 2-3 of 325 parts routed.\n- **Where it pays:** a sweep on the same binary showed routing pays from\nabout 1/4 on. Routing every part is worse, because Q15 and Q35 still\ngain from local aggregation.\n- **Why wait for 64Ki rows:** with a filter, the first few thousand rows\nlook more distinct than the part. The 1/4 threshold with the old point\nmade Q30 11% slower, and the new point turns that into a gain.\n\nResults are unchanged: routing is exact (#55), its DOUBLE SUM/AVG and\nHUGEINT exclusions are unchanged, and the decision depends only on the\npart's data and the batch size.\n\n## Performance: full data, 128 threads\n\n**Paired A/B against main (#61):** a process per query, each binary from\n3 path lengths, best of 3 tries per path, median of the 3.\n\n| | main | this PR | speedup |\n| --- | ---: | ---: | ---: |\n| Q36 | 0.215 | 0.163 | 1.32× |\n| Q34 | 1.960 | 1.571 | 1.25× |\n| Q33 | 1.845 | 1.484 | 1.24× |\n| Q39 | 0.452 | 0.370 | 1.22× |\n| Q18 | 1.333 | 1.174 | 1.13× |\n| Q16, Q17, Q30, Q12, Q38 | | | 1.04-1.07× |\n| **Total (43 queries)** | **22.16** | **20.93** | **1.059×** |\n\nNo query is more than 4% slower.\n\n**Threshold and decision-point sweep** (10 GROUP BY queries, totals):\n3/4 after 4096 rows 9.25 s; 1/4 after 4096 8.36 s (Q30 +11%); 1/2 after\n64Ki 8.88 s; **1/4 after 64Ki 8.26 s**.\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [x] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full          # on 82213c1 (the code change); later commits change tests and docs only\ncheck-full exit 0; 100% tests passed out of 1400; Coverage gate: PASS (exec 96.63% lines, 86.31% branches)\n$ ANTB1_DIFF_COUNT=20000 pixi run diff-random\nDIFF: PASS seed=2633072822 queries=20000 failed=0 unsupported=0\n$ pixi run test-data\n100% tests passed out of 6\n$ pixi run check && pixi run tidy && pixi run tsan   # on the test commit 1a82e04\nlint: PASS; 100% tests passed out of 1401; tidy clean; tsan: 100% tests passed out of 1401\n$ pixi run ci-gcc                                    # on the final commit 3fbb153\n100% tests passed out of 1401\n```\n\nThe first CI run failed the GCC leg: a test constant `kRows` shadowed\nthe fixture's member (GCC's `-Wshadow`; Clang does not warn). It is\nrenamed in 3fbb153.\n\n```text\n```\n\n**Tests:**\n- **`RoutedRowsGiveTheSameGroups`** now runs in batches of 32 rows (it\nwas 8), because 5 values in 8 rows exceed 1/4. It adds two cases on\neither side of the new threshold, so going back to 3/4 fails it:\n  - v (11 values in 32 rows) routes;\n  - s (7 values) does not.\n- **`RoutingDecidesAfterSixtyFourKiRowsReachTheTable`:** batches of\n128Ki rows, of which a filter keeps 1 in 16. A key distinct within the\nfirst batch's kept rows but repeating every 8192 of them does not route,\nwhile a 40000-value key does. Going back to the 4096-row point fails it.\n\nBoth mutations were checked.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer (none changed)\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Claude Code:\n- measured antb1 against DuckDB at 1, 16 and 128 threads, and profiled\nQ16 and Q33 on one thread;\n  - swept the threshold and decision point;\n- wrote the change, its tests and the ADR 0013 amendment, and ran the\ngates and the A/B.\n\nA read-only reviewer agent found that the updated test pinned neither\nconstant. The two new tests above do, both mutation-checked. It also\nfound inexact doc wording about the decision point, now fixed.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-10-01T08:43:01+03:00",
+          "tree_id": "a77673403804584ac2e4c1e87fe7621ab588f5fc",
+          "url": "https://github.com/ydb-campus/antb1/commit/ad652b7e6abdf268b84789fb1dfdbbafb5548baf"
+        },
+        "date": 1790833520510,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 3981.043458748527,
+            "unit": "ns/iter",
+            "extra": "iterations: 176029\ncpu: 3980.185338779406 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 94563.73751281117,
+            "unit": "ns/iter",
+            "extra": "iterations: 6827\ncpu: 94523.18793027684 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 124527.11981484415,
+            "unit": "ns/iter",
+            "extra": "iterations: 5617\ncpu: 124523.71212390954 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 484516.1641273964,
+            "unit": "ns/iter",
+            "extra": "iterations: 1444\ncpu: 484379.48130193906 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 456349.8907672436,
+            "unit": "ns/iter",
+            "extra": "iterations: 1538\ncpu: 456199.1495448638 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2240934.217252361,
+            "unit": "ns/iter",
+            "extra": "iterations: 313\ncpu: 2240513.3801916926 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 198.47381366666164,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 198.43977900000007 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 15.15085147826149,
+            "unit": "ms/iter",
+            "extra": "iterations: 46\ncpu: 15.148832239130439 ms\nthreads: 1"
           }
         ]
       }
