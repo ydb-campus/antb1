@@ -135,6 +135,9 @@ std::shared_ptr<arrow::Table> MakeTable() {
   arrow::BinaryBuilder bin;
   arrow::Date32Builder date;
   arrow::Int32Builder days;  // read as DATE by an override
+  arrow::Int64Builder required_i64;
+  arrow::StringBuilder required_s;
+  arrow::UInt16Builder event_date;  // USMALLINT read as DATE (--clickbench's EventDate)
   for (int64_t r = 0; r < kRows; ++r) {
     const auto null = [&](int shift) { return (r + shift) % 7 == 0; };
     EXPECT_TRUE(
@@ -156,6 +159,12 @@ std::shared_ptr<arrow::Table> MakeTable() {
     EXPECT_TRUE(
         (null(1) ? date.AppendNull() : date.Append(static_cast<int32_t>(19000 + (r % 400)))).ok());
     EXPECT_TRUE((null(2) ? days.AppendNull() : days.Append(static_cast<int32_t>(18000 + r))).ok());
+    EXPECT_TRUE(required_i64.Append((r * 7919) % 100003).ok());
+    EXPECT_TRUE(
+        required_s.Append(r % 9 == 0 ? std::string() : "req-" + std::to_string(r % 61)).ok());
+    EXPECT_TRUE((null(3) ? event_date.AppendNull()
+                         : event_date.Append(static_cast<uint16_t>(15000 + (r % 300))))
+                    .ok());
   }
   const auto finish = [](auto& builder) { return builder.Finish().ValueOrDie(); };
   return arrow::Table::Make(
@@ -163,9 +172,13 @@ std::shared_ptr<arrow::Table> MakeTable() {
                      arrow::field("u16", arrow::uint16()), arrow::field("i64", arrow::int64()),
                      arrow::field("f32", arrow::float32()), arrow::field("f64", arrow::float64()),
                      arrow::field("s", arrow::utf8()), arrow::field("b", arrow::binary()),
-                     arrow::field("d", arrow::date32()), arrow::field("days", arrow::int32())}),
+                     arrow::field("d", arrow::date32()), arrow::field("days", arrow::int32()),
+                     arrow::field("ri64", arrow::int64(), /*nullable=*/false),
+                     arrow::field("rs", arrow::utf8(), /*nullable=*/false),
+                     arrow::field("ed", arrow::uint16())}),
       {finish(i16), finish(i32), finish(u16), finish(i64), finish(f32), finish(f64), finish(utf8),
-       finish(bin), finish(date), finish(days)});
+       finish(bin), finish(date), finish(days), finish(required_i64), finish(required_s),
+       finish(event_date)});
 }
 
 enum class Encoding : std::uint8_t { kDictionary, kPlain, kDictionaryFallback };
@@ -207,6 +220,7 @@ class ParquetFilterTest : public ::testing::TestWithParam<Encoding> {
   static std::shared_ptr<ParquetTable> Open(const std::string& path) {
     ParquetTableOptions options;
     options.overrides.push_back({.column = "days", .type = plan::LogicalType::kDate});
+    options.overrides.push_back({.column = "ed", .type = plan::LogicalType::kDate});
     auto table = ParquetTable::Open({path}, options);
     EXPECT_TRUE(table.ok()) << table.status().ToString();
     return *table;
@@ -301,12 +315,18 @@ std::vector<Case> Cases() {
        {2, 9},
        {[](const Value& v) { return !v.null && v.integer > 30000; }, not_null}},
       {"int64", {3}, {[](const Value& v) { return !v.null && v.integer % 7 == 1; }}},
+      {"required_int64", {10}, {[](const Value& v) { return !v.null && v.integer % 5 == 2; }}},
+      {"required_string", {11}, {[](const Value& v) { return !v.null && v.text.ends_with("1"); }}},
+      {"required_and_nullable",
+       {11, 6},
+       {[](const Value& v) { return !v.null && !v.text.empty(); }, not_null}},
+      {"usmallint_as_date", {12}, {[](const Value& v) { return !v.null && v.integer % 3 == 0; }}},
   };
 }
 
 TEST_P(ParquetFilterTest, ReturnsTheRowsThatPassAsAScanWithoutAFilter) {
   const auto table = Open(Write(GetParam()));
-  const std::vector<int> fields = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+  const std::vector<int> fields = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
   ASSERT_TRUE(table->supports_scan_filter(fields));
   ASSERT_GE(table->num_parts(), 3);
   for (const Case& c : Cases()) {
@@ -422,6 +442,60 @@ TEST_F(ParquetFilterErrorsTest, FilterErrorsAndChangedFiles) {
   const arrow::Status io = (*changed)->ReadNext(&batch);
   EXPECT_TRUE(io.IsIOError()) << io.ToString();
   EXPECT_NE(io.message().find("t.parquet"), std::string::npos) << io.ToString();
+}
+
+// A corrupt data page (the file's size and footer unchanged): an I/O error naming the file, from a
+// filter's column and from another column.
+TEST_F(ParquetFilterErrorsTest, CorruptPagesAreIOErrors) {
+  const std::string path = Write(Encoding::kPlain);
+  const auto table = Open(path);
+  {
+    // The first column chunk starts right after the 4-byte magic "PAR1".
+    std::fstream file(path, std::ios::in | std::ios::out | std::ios::binary);
+    file.seekp(4);
+    const std::string garbage(64, '\xFF');
+    file.write(garbage.data(), static_cast<std::streamsize>(garbage.size()));
+  }
+  const auto keep = std::vector<Predicate>{[](const Value&) { return true; }};
+  // Field 0 (i16, the first chunk) as the filter's column, then as another column.
+  for (const auto& [fields, column] :
+       {std::pair{std::vector<int>{0, 6}, 0}, std::pair{std::vector<int>{6, 0}, 0}}) {
+    auto filter = std::make_shared<TestFilter>(std::vector<int>{column}, keep);
+    auto reader = table->ScanPart(0, fields, 100, arrow::default_memory_pool(), filter);
+    ASSERT_TRUE(reader.ok()) << reader.status().ToString();
+    arrow::Status st;
+    std::shared_ptr<arrow::RecordBatch> batch;
+    do {
+      st = (*reader)->ReadNext(&batch);
+    } while (st.ok() && batch != nullptr);
+    EXPECT_TRUE(st.IsIOError()) << st.ToString();
+    EXPECT_NE(st.message().find("t.parquet"), std::string::npos) << st.ToString();
+  }
+}
+
+// Parts of a second file: each read with its own file's footer.
+TEST_F(ParquetFilterErrorsTest, PartsOfEveryFile) {
+  const std::string first = Write(Encoding::kDictionary);
+  const std::string second = (dir_ / "u.parquet").string();
+  fs::copy_file(first, second);
+  ParquetTableOptions options;
+  options.overrides.push_back({.column = "days", .type = plan::LogicalType::kDate});
+  options.overrides.push_back({.column = "ed", .type = plan::LogicalType::kDate});
+  auto table = ParquetTable::Open({first, second}, options);
+  ASSERT_TRUE(table.ok()) << table.status().ToString();
+  const std::vector<int> fields = {6, 3, 12};
+  const std::vector<Predicate> predicates = {
+      [](const Value& v) { return !v.null && v.text.find('3') != std::string_view::npos; }};
+  int64_t rows = 0;
+  for (int64_t part = 0; part < (*table)->num_parts(); ++part) {
+    const auto all = Drain(**(*table)->ScanPart(part, fields, 256), 256);
+    auto filter = std::make_shared<TestFilter>(std::vector<int>{0}, predicates);
+    const auto got =
+        Drain(**(*table)->ScanPart(part, fields, 256, arrow::default_memory_pool(), filter), 256);
+    EXPECT_TRUE(got->Equals(*Expected(*all, {0}, predicates))) << part;
+    rows += got->num_rows();
+  }
+  EXPECT_GT(rows, 0);
 }
 
 }  // namespace

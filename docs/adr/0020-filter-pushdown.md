@@ -60,12 +60,13 @@ Proposed
   - **The filter's columns first:** fixed-width columns are decoded whole and the filter applied. String columns are
     decoded page piece by page piece; the filter is applied to the piece's views, and the values of the rows still
     selected are copied.
-  - **Then every other column:** only the rows that pass are copied (strings from views); a batch with none is
-    skipped without decoding.
+  - **Then every other column:** only the rows that pass are copied (strings from views). A batch with none is
+    skipped: nothing is copied, though a page that is skipped only in part is still decompressed and decoded.
   - **Errors:** as the high-level path reports them (an IOError naming the file, OutOfMemory, the footer checks). A
     filter's own errors pass through.
-  - **Fallback:** other column types (nested, BOOLEAN, TIMESTAMP, HUGEINT) are not supported, and the high-level path
-    reads them as before.
+  - **Fallback:** other column types (nested, BOOLEAN, TIMESTAMP, HUGEINT) are not supported.
+    `supports_scan_filter` needs every scanned column to be supported, so a scan with one such column is not
+    filtered at all, and the high-level path reads it as before.
 - **The executor** pushes the predicates of a part pipeline's scan into the scan, in a separate change. The logical
   plan and EXPLAIN are unchanged; the Filter operator keeps only what was not pushed.
 - **Not pushed (first version):** late materialization's narrow scans (ADR 0016), whose row ids count the part's
@@ -78,8 +79,12 @@ Proposed
   - the values of rows that fail are never copied, for every column, whatever its type;
   - batches with no passing row skip their other columns.
 - **Two read paths in `io`:** the high-level one for unfiltered scans and unsupported types, and the filtered one.
-  The io tests check that a filtered scan returns exactly the unfiltered scan's rows that pass, for every supported
-  type, NULLs, dictionary, plain and fallback encodings, pages smaller than a batch, and batch sizes from 1 row.
+  The io tests check that a filtered scan returns exactly the unfiltered scan's rows that pass, for:
+  - every supported type, required and nullable columns, and the DATE overrides;
+  - dictionary, plain and fallback encodings, pages smaller than a batch, and batch sizes from 1 row;
+  - parts of several files.
+
+  They also check that a corrupt page is an IOError naming the file.
 - **Follow-ups:**
   - evaluating string predicates once per dictionary entry for dictionary-encoded chunks;
   - skipping pages by statistics (granularity 2);

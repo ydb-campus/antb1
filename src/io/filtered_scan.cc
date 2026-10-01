@@ -185,7 +185,8 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
   FilteredScanReader& operator=(const FilteredScanReader&) = delete;
   FilteredScanReader(FilteredScanReader&&) = delete;
   FilteredScanReader& operator=(FilteredScanReader&&) = delete;
-  ~FilteredScanReader() override = default;
+  // The column readers go before the file reader they read from.
+  ~FilteredScanReader() override { static_cast<void>(Close()); }
 
   using arrow::RecordBatchReader::ReadNext;
 
@@ -273,7 +274,7 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
       ColumnState& state = columns_[p];
       const int index = filter_index_[p];
       if (state.column.physical == Physical::kByteArray) {
-        candidates[p] = std::make_unique<Candidates>();
+        candidates[p] = std::make_unique<Candidates>(pool_);
         ARROW_RETURN_NOT_OK(FilterStrings(state, index, rows, selected, *candidates[p]));
       } else {
         ARROW_ASSIGN_OR_RAISE(whole[p], ReadFixed(state, rows, nullptr, 0));
@@ -316,35 +317,34 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
   // The values a filter's string column kept for the rows still selected after its own
   // predicates: the rows (in order) and their values.
   struct Candidates {
-    std::vector<int64_t> rows;
-    std::vector<int64_t> offsets{0};
-    std::vector<char> bytes;
-    std::vector<bool> nulls;
+    explicit Candidates(arrow::MemoryPool* pool) : values(pool) {}
 
-    void Add(int64_t row, const std::string_view* value) {
+    std::vector<int64_t> rows;
+    arrow::BinaryBuilder values;  // in the query's pool, so that the budget sees the bytes
+
+    arrow::Status Add(int64_t row, const std::string_view* value) {
       rows.push_back(row);
-      nulls.push_back(value == nullptr);
-      if (value != nullptr) {
-        bytes.insert(bytes.end(), value->begin(), value->end());
-      }
-      offsets.push_back(static_cast<int64_t>(bytes.size()));
+      return value == nullptr ? values.AppendNull()
+                              : values.Append(value->data(), Narrow<int32_t>(value->size()));
     }
 
     // The values of the rows selected in the end.
     arrow::Result<std::shared_ptr<arrow::Array>> Finish(const std::uint8_t* selected, int64_t count,
-                                                        arrow::MemoryPool* pool) const {
+                                                        arrow::MemoryPool* pool) {
+      ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Array> kept, values.Finish());
+      if (std::cmp_equal(rows.size(), count)) {
+        return kept;  // no later column rejected any of them
+      }
+      const auto& strings = static_cast<const arrow::BinaryArray&>(*kept);
       arrow::BinaryBuilder builder(pool);
       ARROW_RETURN_NOT_OK(builder.Reserve(count));
       for (std::size_t i = 0; i < rows.size(); ++i) {
         if (!BitAt(selected, rows[i])) {
           continue;
         }
-        if (nulls[i]) {
-          ARROW_RETURN_NOT_OK(builder.AppendNull());
-        } else {
-          ARROW_RETURN_NOT_OK(builder.Append(bytes.data() + offsets[i],
-                                             Narrow<int32_t>(offsets[i + 1] - offsets[i])));
-        }
+        const auto at = static_cast<int64_t>(i);
+        ARROW_RETURN_NOT_OK(strings.IsNull(at) ? builder.AppendNull()
+                                               : builder.Append(strings.GetView(at)));
       }
       return builder.Finish();
     }
@@ -369,7 +369,8 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
       for (int64_t i = 0; i < piece; ++i) {
         if (BitAt(selected, done + i)) {
           const bool present = !piece_nulls_ || BitAt(piece_valid_.data(), i);
-          kept.Add(done + i, present ? &views_[static_cast<std::size_t>(i)] : nullptr);
+          ARROW_RETURN_NOT_OK(
+              kept.Add(done + i, present ? &views_[static_cast<std::size_t>(i)] : nullptr));
         }
       }
       done += piece;
@@ -542,7 +543,7 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
   arrow::MemoryPool* pool_;
   std::shared_ptr<const plan::ScanFilter> filter_;
   std::vector<int> filter_index_;  // per column: its position in filter_->columns(), or -1
-  // The reader of the file outlives its row group's and columns' readers.
+  // The reader of the file outlives its row group's and columns' readers (Close, the destructor).
   std::unique_ptr<parquet::ParquetFileReader> file_reader_;
   std::shared_ptr<parquet::RowGroupReader> row_group_;
   int64_t rows_left_ = 0;
