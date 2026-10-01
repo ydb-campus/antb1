@@ -1484,20 +1484,21 @@ TEST_F(PartOperatorsTest, RoutedRowsGiveTheSameGroups) {
 // of 64Ki) does not route, though the first batch alone would have; a key with 40000 values does.
 // One part of 1120000 rows.
 TEST_F(PartOperatorsTest, RoutingDecidesAfterSixtyFourKiRowsReachTheTable) {
-  constexpr int64_t kRows = int64_t{16} * 70000;
+  constexpr int64_t kTableRows = int64_t{16} * 70000;
   const auto raw_parts_of = [&](int64_t values) {
     const auto schema =
         arrow::schema({arrow::field("k", arrow::int64()), arrow::field("m", arrow::int64())});
     std::vector<std::optional<int64_t>> k;
     std::vector<std::optional<int64_t>> m;
-    for (int64_t r = 0; r < kRows; ++r) {
+    for (int64_t r = 0; r < kTableRows; ++r) {
       k.emplace_back((r / 16) % values);
       m.emplace_back(r % 16);
     }
-    const auto table = std::make_shared<MemoryTable>(
-        schema,
-        arrow::RecordBatchVector{arrow::RecordBatch::Make(schema, kRows, {Int64s(k), Int64s(m)})},
-        /*split=*/true);
+    const auto table =
+        std::make_shared<MemoryTable>(schema,
+                                      arrow::RecordBatchVector{arrow::RecordBatch::Make(
+                                          schema, kTableRows, {Int64s(k), Int64s(m)})},
+                                      /*split=*/true);
     const auto scan = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}});
     const auto kept =
         Node(plan::FilterNode{.input = scan,
