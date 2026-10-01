@@ -574,7 +574,7 @@ TEST_F(ParquetFilterErrorsTest, OutOfMemoryAnywhere) {
             200);
   bool succeeded = false;
   int failures = 0;
-  for (int64_t cap = 0; cap < (int64_t{8} << 20) && !succeeded; cap = (cap * 3 / 2) + 1024) {
+  for (int64_t cap = 0; cap < int64_t{8} * 1024 * 1024 && !succeeded; cap = (cap * 3 / 2) + 1024) {
     CappedPool pool(cap);
     {
       auto reader = table->ScanPart(
@@ -691,7 +691,13 @@ TEST_F(ParquetFilterErrorsTest, ReadableLeavesAndRequests) {
 
   // MakeFilteredScan: one row group, filter columns among the scanned fields, each once.
   const auto keep = std::vector<Predicate>{[](const Value&) { return true; }};
-  const auto column = *FilteredColumnOf(*metadata, 0, *arrow::int32(), *arrow::int32());
+  const std::optional<FilteredColumn> readable =
+      FilteredColumnOf(*metadata, 0, *arrow::int32(), *arrow::int32());
+  ASSERT_TRUE(readable.has_value());
+  if (!readable.has_value()) {
+    return;
+  }
+  const FilteredColumn& column = *readable;
   const auto schema = arrow::schema({arrow::field("i32", arrow::int32())});
   const auto make = [&](std::vector<int> row_groups, std::vector<int> filtered, int64_t batch) {
     return MakeFilteredScan(
