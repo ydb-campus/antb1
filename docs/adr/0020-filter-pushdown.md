@@ -92,14 +92,7 @@ Proposed
   - parts of several files.
 
   They also check that a corrupt page is an IOError naming the file.
-- **Deferred** until a dataset needs them. The ClickBench files do not, as a footer survey of all 100 files showed
-  (2026-10-01; metadata only):
-  - **Skipping pages by statistics (granularity 2):**
-    - no file has a page index (column or offset index);
-    - every integer and date column the queries filter on has one data page per row group;
-    - so there is nothing finer than a row group to skip.
-
-    Files written with page indexes and smaller pages would gain from it.
-  - **Evaluating string predicates once per dictionary entry** for dictionary-encoded pages: the writer falls back to
-    plain encoding once a dictionary fills, so only 17-29% of the URL, Title and Referer rows are in dictionary
-    pages (69% for SearchPhrase).
+- **Deferred** until a dataset needs them (the ClickBench files have no page index and large pages, and their long
+  strings are mostly plain-encoded, so neither would gain much there):
+  - **skipping pages by statistics** (granularity 2), for files written with page indexes and smaller pages;
+  - **evaluating string predicates once per dictionary entry** for dictionary-encoded pages.

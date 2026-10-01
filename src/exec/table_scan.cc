@@ -137,16 +137,18 @@ arrow::Result<Batch> TableScanOperator::Narrow(const arrow::RecordBatch& read,
   const int64_t rows = read.num_rows();
   // A filtered scan reports the rows' positions in the part (increasing); else they follow on.
   const arrow::Int64Array* positions = nullptr;
+  bool in_range = offset_ + rows <= kRowIdParts * 2;
   if (positioned_) {
-    const arrow::Array& column = *read.column(read.num_columns() - 1);
-    if (column.type_id() != arrow::Type::INT64 || column.null_count() > 0) {
+    if (std::cmp_not_equal(read.num_columns(), read_.size() + 1) ||
+        read.column(read.num_columns() - 1)->type_id() != arrow::Type::INT64 ||
+        read.column(read.num_columns() - 1)->null_count() > 0) {
       return arrow::Status::Invalid("a filtered narrow scan without row positions");
     }
-    positions = &static_cast<const arrow::Int64Array&>(column);
+    positions = &static_cast<const arrow::Int64Array&>(*read.column(read.num_columns() - 1));
+    in_range =
+        rows == 0 || (positions->Value(0) >= 0 && positions->Value(rows - 1) < kRowIdParts * 2);
   }
-  const int64_t last =
-      positions != nullptr ? (rows == 0 ? 0 : positions->Value(rows - 1) + 1) : offset_ + rows;
-  if (last > kRowIdParts * 2 || (positions != nullptr && rows > 0 && positions->Value(0) < 0)) {
+  if (!in_range) {
     return arrow::Status::Invalid("a part of more than 2^32 rows has no row ids");
   }
   arrow::ArrayVector columns;

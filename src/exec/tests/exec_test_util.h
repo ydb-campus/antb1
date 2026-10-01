@@ -230,9 +230,9 @@ class MemoryTable final : public plan::Table {
         for (int64_t i = 0; i < rows; ++i) {
           ARROW_RETURN_NOT_OK(all.Append(first + i));
         }
-        ARROW_ASSIGN_OR_RAISE(auto column, all.Finish());
-        ARROW_ASSIGN_OR_RAISE(batch, batch->AddColumn(batch->num_columns(), schema->fields().back(),
-                                                      std::move(column)));
+        ARROW_ASSIGN_OR_RAISE(const auto column, all.Finish());
+        ARROW_ASSIGN_OR_RAISE(
+            batch, batch->AddColumn(batch->num_columns(), schema->fields().back(), column));
       }
       first += rows;
       ARROW_ASSIGN_OR_RAISE(auto selected, arrow::AllocateEmptyBitmap(rows, pool));
