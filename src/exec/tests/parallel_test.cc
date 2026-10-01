@@ -1437,7 +1437,11 @@ TEST_F(PartOperatorsTest, RoutedRowsGiveTheSameGroups) {
       testing::Compare(v, plan::CompareOp::kEq, BigInt(3))};
   std::vector<plan::AggregateCall> with_double_sum = calls;
   with_double_sum.push_back(double_sum);
+  // v (11 values in 32 rows) routes: 11 groups are more than 1/4 of 32 (they were not more than
+  // 3/4). s (7 values) does not.
   const std::vector<Case> cases = {{.keys = {u}, .calls = calls, .routed = 9},
+                                   {.keys = {v}, .calls = calls, .routed = 9},
+                                   {.keys = {str}, .calls = calls, .routed = 0},
                                    {.keys = {u, k}, .calls = calls, .routed = 9},
                                    {.keys = {k}, .calls = calls, .routed = 0},
                                    {.keys = {d}, .calls = calls, .routed = 0},
@@ -1474,6 +1478,56 @@ TEST_F(PartOperatorsTest, RoutedRowsGiveTheSameGroups) {
 
 // Routed rows go to the partition that Partition() gives their keys' group, DOUBLE keys
 // normalized (-0.0 with 0.0, every NaN together).
+// A part decides after 64Ki rows have reached its table (kRouteDecisionRows), not after a first
+// batch that a filter left small: in batches of 128Ki rows of which a filter keeps 1 in 16 (8192
+// per batch), a key distinct within each batch's kept rows but repeating every 8192 of them (1/8
+// of 64Ki) does not route, though the first batch alone would have; a key with 40000 values does.
+// One part of 1120000 rows.
+TEST_F(PartOperatorsTest, RoutingDecidesAfterSixtyFourKiRowsReachTheTable) {
+  constexpr int64_t kRows = int64_t{16} * 70000;
+  const auto raw_parts_of = [&](int64_t values) {
+    const auto schema =
+        arrow::schema({arrow::field("k", arrow::int64()), arrow::field("m", arrow::int64())});
+    std::vector<std::optional<int64_t>> k;
+    std::vector<std::optional<int64_t>> m;
+    for (int64_t r = 0; r < kRows; ++r) {
+      k.emplace_back((r / 16) % values);
+      m.emplace_back(r % 16);
+    }
+    const auto table = std::make_shared<MemoryTable>(
+        schema,
+        arrow::RecordBatchVector{arrow::RecordBatch::Make(schema, kRows, {Int64s(k), Int64s(m)})},
+        /*split=*/true);
+    const auto scan = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}});
+    const auto kept =
+        Node(plan::FilterNode{.input = scan,
+                              .predicates = {testing::Compare(Column(1, "m", LogicalType::kBigInt),
+                                                              plan::CompareOp::kEq, BigInt(0))}});
+    const auto plan =
+        PlanOf(Node(plan::GroupAggregateNode{.input = kept,
+                                             .keys = {Column(0, "k", LogicalType::kBigInt)},
+                                             .aggregates = {{.kind = plan::AggKind::kCountStar,
+                                                             .arg = {},
+                                                             .type = LogicalType::kBigInt}}}),
+               2);
+    ProfileNode profile;
+    auto op = BuildPhysicalPlan(plan, &profile);
+    EXPECT_TRUE(op.ok()) << op.status().ToString();
+    ExecContext ctx{.pool = arrow::default_memory_pool(), .batch_size = int64_t{128} * 1024};
+    const auto result = Drain(**op, ctx);
+    EXPECT_TRUE(result.ok()) << result.status().ToString();
+    EXPECT_EQ((*result)->num_rows(), values);
+    for (const ProfileMetric& metric : profile.metrics()) {
+      if (metric.name == "raw_parts") {
+        return metric.value;
+      }
+    }
+    return int64_t{0};
+  };
+  EXPECT_EQ(raw_parts_of(8192), 0);   // 8192 groups in 65536 kept rows: 1/8
+  EXPECT_EQ(raw_parts_of(40000), 1);  // 40000 groups in 65536 kept rows: more than 1/4
+}
+
 TEST_F(PartOperatorsTest, RoutedRowsFollowTheirGroupsPartition) {
   const auto table = RoutedTable(true);
   const std::vector<plan::BoundColumn> keys = {Column(2, "d", LogicalType::kDouble),
