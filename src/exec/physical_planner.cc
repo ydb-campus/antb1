@@ -250,6 +250,21 @@ std::optional<LateScan> LateSplit(const plan::LogicalNodePtr& top, const plan::S
   return late;
 }
 
+// The fields a part pipeline's scan reads: all of them, or with `late` (a narrow scan) the early
+// ones.
+std::vector<int> ReadFields(const plan::ScanNode& scan, const LateScan* late) {
+  if (late == nullptr) {
+    return scan.fields;
+  }
+  std::vector<int> read;
+  for (std::size_t i = 0; i < scan.fields.size(); ++i) {
+    if (i >= late->late.size() || !late->late[i]) {
+      read.push_back(scan.fields[i]);
+    }
+  }
+  return read;
+}
+
 // One overload per logical node type: a node type without one fails to compile.
 struct Builder {
   std::optional<int64_t> part;     // inside the pipeline of this part
@@ -291,8 +306,8 @@ struct Builder {
   OperatorResult operator()(const plan::FilterNode& node) const {
     Name("Filter");
     if (const auto* scan = std::get_if<plan::ScanNode>(node.input.get());
-        scan != nullptr && scan->table != nullptr && part.has_value() && late == nullptr &&
-        scan->table->supports_scan_filter(scan->fields)) {
+        scan != nullptr && scan->table != nullptr && part.has_value() &&
+        scan->table->supports_scan_filter(ReadFields(*scan, late))) {
       // Filter pushdown (ADR 0020): the scan applies the predicates it can while it decodes.
       std::vector<plan::Predicate> pushed;
       std::vector<plan::Predicate> rest;
@@ -309,10 +324,13 @@ struct Builder {
                                              plan::ExplainNode(*node.input), pushed.size(),
                                              pushed.size() == 1 ? "" : "s"));
         }
-        ARROW_ASSIGN_OR_RAISE(auto input, Profiled(std::make_unique<TableScanOperator>(
-                                                       scan->table, scan->fields, part,
-                                                       std::nullopt, std::move(pushed)),
-                                                   node.input, input_slot));
+        ARROW_ASSIGN_OR_RAISE(
+            auto input,
+            Profiled(std::make_unique<TableScanOperator>(
+                         scan->table, scan->fields, part,
+                         late == nullptr ? std::nullopt : std::optional<LateScan>(*late),
+                         std::move(pushed)),
+                     node.input, input_slot));
         return std::make_unique<FilterOperator>(std::move(input), std::move(rest));
       }
     }

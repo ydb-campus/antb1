@@ -104,15 +104,47 @@ TEST_F(OperatorsTest, TableScanReadsTheFieldsInBatches) {
   // A bad field fails at Open.
   TableScanOperator bad(table, {7});
   EXPECT_TRUE(bad.Open(ctx).IsInvalid());
-  // Only the full scan of a part applies predicates.
+  // Only the scan of a part applies predicates.
   const plan::Predicate not_null{.kind = plan::Predicate::Kind::kIsNotNull,
                                  .column = testing::Column(0, "s", plan::LogicalType::kVarchar),
                                  .span = {}};
   TableScanOperator whole(table, {1, 0}, std::nullopt, std::nullopt, {not_null});
   EXPECT_TRUE(whole.Open(ctx).IsInvalid());
-  TableScanOperator narrow(table, {1, 0}, 0,
-                           LateScan{.late = {false, true}, .row_id = 1, .ordinal = 0}, {not_null});
-  EXPECT_TRUE(narrow.Open(ctx).IsInvalid());
+}
+
+// A narrow scan with pushed predicates reads only its early columns, filtered, and takes its row
+// ids from the positions in the part of the rows that passed; a predicate on a late column is
+// Invalid.
+TEST_F(OperatorsTest, FilteredNarrowScanNumbersTheRowsThatPass) {
+  const auto schema =
+      arrow::schema({arrow::field("x", arrow::int64()), arrow::field("s", arrow::binary())});
+  auto split = std::make_shared<MemoryTable>(
+      schema,
+      arrow::RecordBatchVector{
+          arrow::RecordBatch::Make(schema, 4,
+                                   {Int64s({1, std::nullopt, 3, 4}), Strings({"a", "b", "", "d"})}),
+          arrow::RecordBatch::Make(schema, 2, {Int64s({5, -6}), Strings({std::nullopt, "f"})})},
+      /*split=*/true);
+  const LateScan late{.late = {false, true}, .row_id = 1, .ordinal = 3};
+  const auto x = testing::Column(0, "x", plan::LogicalType::kBigInt);
+  for (const int64_t batch_size : {1, 2, 64}) {
+    TableScanOperator narrow(split, {0, 1}, 0, late,
+                             {Compare(x, plan::CompareOp::kGe, testing::BigInt(3))});
+    const auto rows = Run(narrow, batch_size);
+    ASSERT_NE(rows, nullptr);
+    EXPECT_EQ(Int64Column(*rows, 0), (std::vector<std::optional<int64_t>>{3, 4}));
+    EXPECT_EQ(Int64Column(*rows, 1),
+              (std::vector<std::optional<int64_t>>{RowId(3, 2), RowId(3, 3)}))
+        << "batch_size=" << batch_size;
+  }
+  EXPECT_EQ(split->filtered_scans(), 3);
+  TableScanOperator on_late(
+      split, {0, 1}, 0, late,
+      {plan::Predicate{.kind = plan::Predicate::Kind::kIsNotNull,
+                       .column = testing::Column(1, "s", plan::LogicalType::kVarchar),
+                       .span = {}}});
+  ExecContext ctx{.pool = arrow::default_memory_pool(), .batch_size = 4};
+  EXPECT_TRUE(on_late.Open(ctx).IsInvalid());
 }
 
 TEST_F(OperatorsTest, TableScanRenamesButNeverRetypes) {

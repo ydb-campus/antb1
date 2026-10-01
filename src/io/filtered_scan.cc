@@ -217,12 +217,14 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
  public:
   FilteredScanReader(Segment segment, std::vector<FilteredColumn> columns,
                      std::shared_ptr<arrow::Schema> schema, int64_t batch_size,
-                     arrow::MemoryPool* pool, std::shared_ptr<const plan::ScanFilter> filter)
+                     arrow::MemoryPool* pool, std::shared_ptr<const plan::ScanFilter> filter,
+                     bool positions)
       : segment_(std::move(segment)),
         schema_(std::move(schema)),
         batch_size_(batch_size),
         pool_(pool),
-        filter_(std::move(filter)) {
+        filter_(std::move(filter)),
+        positions_(positions) {
     for (FilteredColumn& column : columns) {
       columns_.push_back(ColumnState{.column = std::move(column),
                                      .max_def = 0,
@@ -311,7 +313,9 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
     while (rows_left_ > 0) {
       const int64_t rows = std::min(batch_size_, rows_left_);
       rows_left_ -= rows;
-      ARROW_ASSIGN_OR_RAISE(*out, ReadBatch(rows));
+      const int64_t first = next_row_;
+      next_row_ += rows;
+      ARROW_ASSIGN_OR_RAISE(*out, ReadBatch(rows, first));
       if (*out != nullptr) {
         return arrow::Status::OK();
       }
@@ -319,9 +323,9 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
     return arrow::Status::OK();
   }
 
-  // The next `rows` rows: the filter's columns first, then the rows that pass of every column;
-  // nullptr when none passes.
-  arrow::Result<std::shared_ptr<arrow::RecordBatch>> ReadBatch(int64_t rows) {
+  // The next `rows` rows, from row `first` of the row group on: the filter's columns first, then
+  // the rows that pass of every column; nullptr when none passes.
+  arrow::Result<std::shared_ptr<arrow::RecordBatch>> ReadBatch(int64_t rows, int64_t first) {
     ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Buffer> selection,
                           arrow::AllocateBitmap(rows, pool_));
     std::uint8_t* selected = selection->mutable_data();
@@ -374,7 +378,29 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
     if (count == 0) {
       return nullptr;
     }
+    if (positions_) {
+      ARROW_ASSIGN_OR_RAISE(auto position, Positions(selected, rows, count, first));
+      arrays.push_back(std::move(position));
+    }
     return arrow::RecordBatch::Make(schema_, count, std::move(arrays));
+  }
+
+  // The positions in the row group of the `count` selected rows of a batch of `rows` rows whose
+  // first row is at `first`.
+  arrow::Result<std::shared_ptr<arrow::Array>> Positions(const std::uint8_t* selected, int64_t rows,
+                                                         int64_t count, int64_t first) const {
+    ARROW_ASSIGN_OR_RAISE(
+        std::shared_ptr<arrow::Buffer> values,
+        arrow::AllocateBuffer(count * static_cast<int64_t>(sizeof(int64_t)), pool_));
+    auto* out = values->mutable_data_as<int64_t>();
+    int64_t at = 0;
+    arrow::internal::VisitSetBitRunsVoid(selected, 0, rows, [&](int64_t row, int64_t length) {
+      for (int64_t i = 0; i < length; ++i) {
+        out[at++] = first + row + i;
+      }
+    });
+    return arrow::MakeArray(
+        arrow::ArrayData::Make(arrow::int64(), count, {nullptr, std::move(values)}, 0));
   }
 
   // The values a filter's string column kept for the rows still selected after its own
@@ -615,11 +641,13 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
   int64_t batch_size_;
   arrow::MemoryPool* pool_;
   std::shared_ptr<const plan::ScanFilter> filter_;
+  bool positions_ = false;         // a last column with the rows' positions in the row group
   std::vector<int> filter_index_;  // per column: its position in filter_->columns(), or -1
   // The reader of the file outlives its row group's and columns' readers (Close, the destructor).
   std::unique_ptr<parquet::ParquetFileReader> file_reader_;
   std::shared_ptr<parquet::RowGroupReader> row_group_;
   int64_t rows_left_ = 0;
+  int64_t next_row_ = 0;  // the position in the row group of the next batch's first row
   bool opened_ = false;
   bool closed_ = false;
   // The current piece of a string column.
@@ -688,7 +716,8 @@ std::optional<FilteredColumn> FilteredColumnOf(const parquet::FileMetaData& meta
 
 arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> MakeFilteredScan(
     Segment segment, std::vector<FilteredColumn> columns, std::shared_ptr<arrow::Schema> schema,
-    int64_t batch_size, arrow::MemoryPool* pool, std::shared_ptr<const plan::ScanFilter> filter) {
+    int64_t batch_size, arrow::MemoryPool* pool, std::shared_ptr<const plan::ScanFilter> filter,
+    bool positions) {
   if (batch_size < 1) {
     return arrow::Status::Invalid("the scan batch size must be positive, not ", batch_size);
   }
@@ -703,9 +732,14 @@ arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> MakeFilteredScan(
     }
     seen[static_cast<std::size_t>(column)] = true;
   }
+  if (positions) {
+    ARROW_ASSIGN_OR_RAISE(
+        schema, schema->AddField(schema->num_fields(),
+                                 arrow::field("position", arrow::int64(), /*nullable=*/false)));
+  }
   return std::make_unique<FilteredScanReader>(std::move(segment), std::move(columns),
                                               std::move(schema), batch_size, pool,
-                                              std::move(filter));
+                                              std::move(filter), positions);
 }
 
 }  // namespace antb1::io

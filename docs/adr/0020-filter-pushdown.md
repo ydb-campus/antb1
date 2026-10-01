@@ -74,8 +74,10 @@ Proposed
     and bytewise comparisons.
   - The logical plan and EXPLAIN are unchanged; the Filter operator keeps only what was not pushed, and
     `explain --analyze` shows the count on the `Scan`.
-- **Not pushed (first version):** late materialization's narrow scans (ADR 0016), whose row ids count the part's
-  rows. Predicates over two columns, or over computed values, stay in the Filter operator.
+- **Late materialization's narrow scans** (ADR 0016) are filtered too, on their early columns. Their row ids name a
+  row's position in the part, which a filtered scan no longer gives by counting, so a filtered `ScanPart` can report
+  them: with `positions`, every batch ends with a `position` column (INT64), each row's position in the part.
+- **Not pushed:** predicates over two columns, or over computed values, stay in the Filter operator.
 
 ## Consequences
 
@@ -90,7 +92,14 @@ Proposed
   - parts of several files.
 
   They also check that a corrupt page is an IOError naming the file.
-- **Follow-ups:**
-  - evaluating string predicates once per dictionary entry for dictionary-encoded chunks;
-  - skipping pages by statistics (granularity 2);
-  - pushdown into late materialization's scans, with the scan reporting the positions of the rows that pass.
+- **Deferred** until a dataset needs them. The ClickBench files do not, as a footer survey of all 100 files showed
+  (2026-10-01; metadata only):
+  - **Skipping pages by statistics (granularity 2):**
+    - no file has a page index (column or offset index);
+    - every integer and date column the queries filter on has one data page per row group;
+    - so there is nothing finer than a row group to skip.
+
+    Files written with page indexes and smaller pages would gain from it.
+  - **Evaluating string predicates once per dictionary entry** for dictionary-encoded pages: the writer falls back to
+    plain encoding once a dictionary fills, so only 17-29% of the URL, Title and Referer rows are in dictionary
+    pages (69% for SearchPhrase).

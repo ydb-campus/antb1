@@ -42,9 +42,12 @@ std::optional<FilteredColumn> FilteredColumnOf(const parquet::FileMetaData& meta
 // of at most `batch_size` rows and returns only the rows that pass `filter`: for every batch, the
 // filter's columns are decoded first and the filter applied to them as they are decoded (strings
 // as views into the decoded pages, not copied); then only the rows that pass are copied into the
-// batch, for every column. A batch that loses every row is not returned. Batches have `schema`.
+// batch, for every column. A batch that loses every row is not returned. Batches have `schema`,
+// and with `positions` one more column, `position` (INT64, not null): each row's position in the
+// row group (plan::Table::ScanPart).
 arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> MakeFilteredScan(
     Segment segment, std::vector<FilteredColumn> columns, std::shared_ptr<arrow::Schema> schema,
-    int64_t batch_size, arrow::MemoryPool* pool, std::shared_ptr<const plan::ScanFilter> filter);
+    int64_t batch_size, arrow::MemoryPool* pool, std::shared_ptr<const plan::ScanFilter> filter,
+    bool positions = false);
 
 }  // namespace antb1::io

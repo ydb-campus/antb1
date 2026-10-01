@@ -409,27 +409,49 @@ TEST_F(PhysicalPlannerTest, FilterPredicatesArePushedIntoTheScan) {
   EXPECT_TRUE(table->scanned_parts().empty());
 }
 
-// The narrow scans of late materialization (ADR 0016) count the rows of their part: their filters
-// stay in the Filter operator.
-TEST_F(PhysicalPlannerTest, LateScansAreNotFiltered) {
-  const auto table = Table(/*split=*/true);
+// The narrow scans of late materialization (ADR 0016) apply the pushed predicates on their early
+// columns too, and take their row ids from the positions the table reports: the late columns
+// fetched are those of the rows that passed, whatever batches the filter emptied.
+TEST_F(PhysicalPlannerTest, LateScansAreFiltered) {
   const auto x = Column(0, "x", LogicalType::kBigInt);
-  const auto scan = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}});
-  const auto filter = Node(plan::FilterNode{
-      .input = scan, .predicates = {testing::Compare(x, plan::CompareOp::kGe, BigInt(5))}});
-  const auto top = PlanOf(
-      Node(plan::LimitNode{.input = Node(plan::SortNode{.input = filter, .keys = {{.column = x}}}),
-                           .limit = 1,
-                           .offset = 0}),
-      2);
-  ProfileNode root;
-  ASSERT_TRUE(BuildPhysicalPlan(top, &root).ok());
-  ASSERT_TRUE(root.detail().ends_with("late=1 columns")) << root.detail();
-  const auto rows = Run(top);
-  ASSERT_NE(rows, nullptr);
-  EXPECT_EQ(Int64Column(*rows, 0), (std::vector<std::optional<int64_t>>{5}));
-  EXPECT_EQ(Int64Column(*rows, 1), (std::vector<std::optional<int64_t>>{50}));
-  EXPECT_EQ(table->filtered_scans(), 0);
+  // x >= 6 AND x <> 6: the first match, x = 7, is the last row of part 1.
+  const std::vector<plan::Predicate> predicates = {
+      testing::Compare(x, plan::CompareOp::kGe, BigInt(6)),
+      testing::Compare(x, plan::CompareOp::kNe, BigInt(6))};
+  for (const bool pushdown : {true, false}) {
+    const auto table = Table(/*split=*/true);
+    table->set_scan_filter(pushdown);
+    const auto scan = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}});
+    const auto filter = Node(plan::FilterNode{.input = scan, .predicates = predicates});
+    for (const bool descending : {false, true}) {
+      const auto top =
+          PlanOf(Node(plan::LimitNode{
+                     .input = Node(plan::SortNode{
+                         .input = filter, .keys = {{.column = x, .descending = descending}}}),
+                     .limit = 1,
+                     .offset = 0}),
+                 2);
+      ProfileNode root;
+      ASSERT_TRUE(BuildPhysicalPlan(top, &root).ok());
+      ASSERT_TRUE(root.detail().ends_with("late=1 columns")) << root.detail();
+      ASSERT_EQ(root.children().size(), 1U);
+      const ProfileNode& scan_slot = *root.children()[0]->children()[0];
+      EXPECT_EQ(scan_slot.name(), "Scan");
+      EXPECT_EQ(scan_slot.detail().ends_with(", 2 pushed predicates"), pushdown)
+          << scan_slot.detail();
+      for (const int64_t batch_size : {1, 3, 64}) {
+        const auto rows = Run(top, batch_size);
+        ASSERT_NE(rows, nullptr);
+        EXPECT_EQ(Int64Column(*rows, 0), (std::vector<std::optional<int64_t>>{descending ? 9 : 7}))
+            << "pushdown=" << pushdown << " batch_size=" << batch_size;
+        EXPECT_EQ(
+            Int64Column(*rows, 1),
+            (std::vector<std::optional<int64_t>>{descending ? std::nullopt : std::optional(70)}))
+            << "pushdown=" << pushdown << " batch_size=" << batch_size;
+      }
+    }
+    EXPECT_EQ(table->filtered_scans() > 0, pushdown);
+  }
 }
 
 TEST_F(PhysicalPlannerTest, MalformedPlansAreInvalidNotUnsupported) {

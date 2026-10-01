@@ -152,8 +152,9 @@ table supports it for the scanned columns (`plan::Table::supports_scan_filter`):
 `exec::MakeScanFilter` (`src/exec/include/antb1/exec/scan_filter.h`) and the table returns only the rows that pass ([ADR
 0020](adr/0020-filter-pushdown.md)). Fixed-width columns are evaluated with the `Filter`'s own `PredicateEvaluator`,
 VARCHAR columns on views into the decoded pages, with the same results. The `Filter` keeps the other predicates
-(comparisons of two columns, computed conditions). Not pushed: the narrow scans of late materialization, whose row
-ids count the part's rows, and a `Filter` with a folded `FALSE`, which reads nothing.
+(comparisons of two columns, computed conditions); with a folded `FALSE`, which reads nothing, it keeps them all.
+The narrow scans of late materialization are filtered too, on their early columns: the table reports each passing
+row's position in the part (`ScanPart` with `positions`), and the row ids are made from those.
 
 **Memory.** The `Session` owns an `exec::MemoryBudget` (`--memory-limit`, `engine::SessionOptions::memory_limit`):
 an Arrow memory pool that is `ExecContext::pool` for every query, and that the Parquet reader decodes into

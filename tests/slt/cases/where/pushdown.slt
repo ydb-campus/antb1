@@ -61,3 +61,26 @@ SELECT id FROM edge WHERE i16 + 1 > 5 AND u LIKE '%a%'
 ----
 1
 6
+
+# ORDER BY ... LIMIT over many columns reads the others late (ADR 0016): the narrow scans apply the
+# pushed predicates too, and the late columns are fetched for the rows that passed.
+query ITIIT nosort
+SELECT WatchID, URL, RegionID, UserID, Title FROM hits_like_split WHERE URL LIKE '%a%' AND Title NOT LIKE '%e%' ORDER BY WatchID DESC LIMIT 3
+----
+9212122800141472458	https://www.example.org/музыка/32843	2406	3881049585678188308	(empty)
+9193841655296274472	https://www.example.org/музыка/89427	10283	3136959092979175248	(empty)
+9193453154819129306	https://www.example.org/stone/94342	2435	379201151179453805	(empty)
+
+query TTTI nosort
+SELECT EventDate, SearchPhrase, URL, ResolutionWidth FROM hits_like_split WHERE SearchPhrase IN ('alpha', 'green') AND RegionID > 100 ORDER BY ResolutionWidth, URL LIMIT 4
+----
+2013-07-11	alpha	https://www.example.org/delta/46283	0
+2013-07-05	alpha	https://www.example.org/lemon/88035	0
+2013-07-30	alpha	https://www.example.org/orbit/30162	0
+2013-07-20	green	https://www.example.org/музыка/54195	0
+
+query ITT nosort
+SELECT RegionID, Title, URL FROM hits_like_nulls WHERE Title LIKE '%o%' AND UserID <> 0 ORDER BY RegionID, URL, WatchID LIMIT 2 OFFSET 1
+----
+0	violet quick naïve дорога	(empty)
+0	cloud alpha	https://www.example.org/alpha/3032?q=pixel
