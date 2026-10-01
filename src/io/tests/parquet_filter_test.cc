@@ -1,0 +1,428 @@
+// ParquetTable::ScanPart with a plan::ScanFilter (docs/adr/0020-filter-pushdown.md): the rows of
+// the part that pass the filter, as ScanPart without one returns them, in the same order.
+
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <arrow/api.h>
+#include <arrow/io/file.h>
+#include <arrow/util/bit_util.h>
+#include <gtest/gtest.h>
+#include <parquet/arrow/writer.h>
+#include <parquet/properties.h>
+
+#include "antb1/io/parquet_table.h"
+#include "antb1/plan/table.h"
+
+namespace antb1::io {
+namespace {
+
+namespace fs = std::filesystem;
+
+// A value of a row, as a filter in these tests sees it.
+struct Value {
+  bool null = true;
+  int64_t integer = 0;    // integer and DATE columns
+  double real = 0;        // DOUBLE columns
+  std::string_view text;  // VARCHAR columns
+};
+
+using Predicate = std::function<bool(const Value&)>;
+
+// One predicate per filtered column, applied as a table must apply a ScanFilter.
+class TestFilter final : public plan::ScanFilter {
+ public:
+  TestFilter(std::vector<int> columns, std::vector<Predicate> predicates)
+      : columns_(std::move(columns)), predicates_(std::move(predicates)) {}
+
+  [[nodiscard]] const std::vector<int>& columns() const override { return columns_; }
+
+  arrow::Status Apply(int column, const plan::ScanValues& values, int64_t offset,
+                      std::uint8_t* selected) const override {
+    if (column < 0 || static_cast<std::size_t>(column) >= predicates_.size()) {
+      return arrow::Status::Invalid("no such filter column");
+    }
+    if (fail_) {
+      return arrow::Status::Invalid("the filter failed");
+    }
+    for (int64_t i = 0; i < values.rows; ++i) {
+      const auto bit = static_cast<std::uint64_t>(offset + i);
+      if (!arrow::bit_util::GetBit(selected, bit)) {
+        continue;
+      }
+      const Value v = values.array != nullptr ? ValueOf(*values.array, i) : StringOf(values, i);
+      if (!predicates_[static_cast<std::size_t>(column)](v)) {
+        arrow::bit_util::ClearBit(selected, offset + i);
+      }
+    }
+    return arrow::Status::OK();
+  }
+
+  void Fail() { fail_ = true; }
+
+  static Value ValueOf(const arrow::Array& array, int64_t i) {
+    Value v;
+    if (array.IsNull(i)) {
+      return v;
+    }
+    v.null = false;
+    switch (array.type_id()) {
+      case arrow::Type::INT16:
+        v.integer = static_cast<const arrow::Int16Array&>(array).Value(i);
+        break;
+      case arrow::Type::UINT16:
+        v.integer = static_cast<const arrow::UInt16Array&>(array).Value(i);
+        break;
+      case arrow::Type::INT32:
+        v.integer = static_cast<const arrow::Int32Array&>(array).Value(i);
+        break;
+      case arrow::Type::DATE32:
+        v.integer = static_cast<const arrow::Date32Array&>(array).Value(i);
+        break;
+      case arrow::Type::INT64:
+        v.integer = static_cast<const arrow::Int64Array&>(array).Value(i);
+        break;
+      case arrow::Type::DOUBLE:
+        v.real = static_cast<const arrow::DoubleArray&>(array).Value(i);
+        break;
+      case arrow::Type::BINARY:
+        v.text = static_cast<const arrow::BinaryArray&>(array).GetView(i);
+        break;
+      default:
+        break;
+    }
+    return v;
+  }
+
+ private:
+  static Value StringOf(const plan::ScanValues& values, int64_t i) {
+    Value v;
+    if (values.validity != nullptr &&
+        !arrow::bit_util::GetBit(values.validity, static_cast<std::uint64_t>(i))) {
+      return v;
+    }
+    v.null = false;
+    v.text = values.strings[static_cast<std::size_t>(i)];
+    return v;
+  }
+
+  std::vector<int> columns_;
+  std::vector<Predicate> predicates_;
+  bool fail_ = false;
+};
+
+constexpr int64_t kRows = 3000;
+
+// Columns of every type the filtered path reads, NULL every 7th row (shifted per column), with
+// repeated, empty and long strings.
+std::shared_ptr<arrow::Table> MakeTable() {
+  arrow::Int16Builder i16;
+  arrow::Int32Builder i32;
+  arrow::UInt16Builder u16;
+  arrow::Int64Builder i64;
+  arrow::FloatBuilder f32;
+  arrow::DoubleBuilder f64;
+  arrow::StringBuilder utf8;
+  arrow::BinaryBuilder bin;
+  arrow::Date32Builder date;
+  arrow::Int32Builder days;  // read as DATE by an override
+  for (int64_t r = 0; r < kRows; ++r) {
+    const auto null = [&](int shift) { return (r + shift) % 7 == 0; };
+    EXPECT_TRUE(
+        (null(0) ? i16.AppendNull() : i16.Append(static_cast<int16_t>((r * 37) % 30000 - 15000)))
+            .ok());
+    EXPECT_TRUE(
+        (null(1) ? i32.AppendNull() : i32.Append(static_cast<int32_t>(r * 101 - 70000))).ok());
+    EXPECT_TRUE(
+        (null(2) ? u16.AppendNull() : u16.Append(static_cast<uint16_t>((r * 13) % 65000))).ok());
+    EXPECT_TRUE((null(3) ? i64.AppendNull() : i64.Append((r * 1000003) - 9000000000LL)).ok());
+    EXPECT_TRUE((null(4) ? f32.AppendNull() : f32.Append(static_cast<float>(r) / 3.0F)).ok());
+    EXPECT_TRUE((null(5) ? f64.AppendNull() : f64.Append(static_cast<double>(r) * -0.5)).ok());
+    std::string text = r % 5 == 0 ? std::string() : "row-" + std::to_string(r % 97);
+    if (r % 11 == 0) {
+      text += std::string(300, 'x');
+    }
+    EXPECT_TRUE((null(6) ? utf8.AppendNull() : utf8.Append(text)).ok());
+    EXPECT_TRUE((null(0) ? bin.AppendNull() : bin.Append("b" + std::to_string(r % 13))).ok());
+    EXPECT_TRUE(
+        (null(1) ? date.AppendNull() : date.Append(static_cast<int32_t>(19000 + (r % 400)))).ok());
+    EXPECT_TRUE((null(2) ? days.AppendNull() : days.Append(static_cast<int32_t>(18000 + r))).ok());
+  }
+  const auto finish = [](auto& builder) { return builder.Finish().ValueOrDie(); };
+  return arrow::Table::Make(
+      arrow::schema({arrow::field("i16", arrow::int16()), arrow::field("i32", arrow::int32()),
+                     arrow::field("u16", arrow::uint16()), arrow::field("i64", arrow::int64()),
+                     arrow::field("f32", arrow::float32()), arrow::field("f64", arrow::float64()),
+                     arrow::field("s", arrow::utf8()), arrow::field("b", arrow::binary()),
+                     arrow::field("d", arrow::date32()), arrow::field("days", arrow::int32())}),
+      {finish(i16), finish(i32), finish(u16), finish(i64), finish(f32), finish(f64), finish(utf8),
+       finish(bin), finish(date), finish(days)});
+}
+
+enum class Encoding : std::uint8_t { kDictionary, kPlain, kDictionaryFallback };
+
+class ParquetFilterTest : public ::testing::TestWithParam<Encoding> {
+ protected:
+  void SetUp() override {
+    const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
+    std::string name = info->name();
+    for (char& c : name) {
+      if (c == '/') {
+        c = '_';
+      }
+    }
+    dir_ = fs::path(::testing::TempDir()) / "antb1_io_filter" / name;
+    fs::remove_all(dir_);
+    fs::create_directories(dir_);
+  }
+  void TearDown() override { fs::remove_all(dir_); }
+
+  // The table in row groups of 1100 rows and data pages of about 1 KiB.
+  std::string Write(Encoding encoding) {
+    const std::string path = (dir_ / "t.parquet").string();
+    auto out = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+    parquet::WriterProperties::Builder props;
+    props.data_pagesize(1024)->write_batch_size(64);
+    if (encoding == Encoding::kPlain) {
+      props.disable_dictionary();
+    } else if (encoding == Encoding::kDictionaryFallback) {
+      props.dictionary_pagesize_limit(256);
+    }
+    EXPECT_TRUE(parquet::arrow::WriteTable(*MakeTable(), arrow::default_memory_pool(), out, 1100,
+                                           props.build())
+                    .ok());
+    EXPECT_TRUE(out->Close().ok());
+    return path;
+  }
+
+  static std::shared_ptr<ParquetTable> Open(const std::string& path) {
+    ParquetTableOptions options;
+    options.overrides.push_back({.column = "days", .type = plan::LogicalType::kDate});
+    auto table = ParquetTable::Open({path}, options);
+    EXPECT_TRUE(table.ok()) << table.status().ToString();
+    return *table;
+  }
+
+  // Every batch of a reader, combined; the batches' sizes checked against `batch_size`.
+  static std::shared_ptr<arrow::Table> Drain(arrow::RecordBatchReader& reader, int64_t batch_size) {
+    arrow::RecordBatchVector batches;
+    while (true) {
+      std::shared_ptr<arrow::RecordBatch> batch;
+      const arrow::Status status = reader.ReadNext(&batch);
+      EXPECT_TRUE(status.ok()) << status.ToString();
+      if (!status.ok() || batch == nullptr) {
+        break;
+      }
+      EXPECT_GT(batch->num_rows(), 0);
+      EXPECT_LE(batch->num_rows(), batch_size);
+      batches.push_back(std::move(batch));
+    }
+    return arrow::Table::FromRecordBatches(reader.schema(), batches).ValueOrDie();
+  }
+
+  fs::path dir_;
+};
+
+// The rows of `all` (an unfiltered scan) that pass `predicates` on `columns`.
+std::shared_ptr<arrow::Table> Expected(const arrow::Table& all, const std::vector<int>& columns,
+                                       const std::vector<Predicate>& predicates) {
+  const auto combined = all.CombineChunksToBatch().ValueOrDie();
+  arrow::BooleanBuilder mask;
+  for (int64_t r = 0; r < combined->num_rows(); ++r) {
+    bool pass = true;
+    for (std::size_t k = 0; k < columns.size(); ++k) {
+      pass = pass && predicates[k](TestFilter::ValueOf(*combined->column(columns[k]), r));
+    }
+    EXPECT_TRUE(mask.Append(pass).ok());
+  }
+  const auto filter = mask.Finish().ValueOrDie();
+  arrow::ArrayVector arrays;
+  int64_t rows = 0;
+  for (const auto& column : combined->columns()) {
+    // A filter by hand: the rows whose mask is true.
+    std::vector<int64_t> keep;
+    const auto& m = static_cast<const arrow::BooleanArray&>(*filter);
+    for (int64_t r = 0; r < m.length(); ++r) {
+      if (m.Value(r)) {
+        keep.push_back(r);
+      }
+    }
+    rows = static_cast<int64_t>(keep.size());
+    std::unique_ptr<arrow::ArrayBuilder> builder;
+    EXPECT_TRUE(arrow::MakeBuilder(arrow::default_memory_pool(), column->type(), &builder).ok());
+    for (const int64_t r : keep) {
+      EXPECT_TRUE(builder->AppendArraySlice(*column->data(), r, 1).ok());
+    }
+    arrays.push_back(builder->Finish().ValueOrDie());
+  }
+  return arrow::Table::Make(all.schema(), arrays, rows);
+}
+
+struct Case {
+  std::string name;
+  std::vector<int> columns;  // positions in the scanned fields
+  std::vector<Predicate> predicates;
+};
+
+std::vector<Case> Cases() {
+  const auto not_null = [](const Value& v) { return !v.null; };
+  return {
+      {"keep_all", {0}, {[](const Value&) { return true; }}},
+      {"keep_none", {6}, {[](const Value&) { return false; }}},
+      {"string_contains", {6}, {[](const Value& v) {
+         return !v.null && v.text.find("-1") != std::string_view::npos;
+       }}},
+      {"string_null", {6}, {[](const Value& v) { return v.null; }}},
+      {"long_strings", {6}, {[](const Value& v) { return !v.null && v.text.size() > 100; }}},
+      {"empty_strings", {6}, {[](const Value& v) { return !v.null && v.text.empty(); }}},
+      {"integer_mod", {1}, {[](const Value& v) { return !v.null && v.integer % 3 == 0; }}},
+      {"int16_and_binary",
+       {0, 7},
+       {[](const Value& v) { return !v.null && v.integer > 0; },
+        [](const Value& v) { return !v.null && v.text == "b5"; }}},
+      {"two_strings",
+       {6, 7},
+       {[](const Value& v) { return !v.null && v.text.starts_with("row-1"); }, not_null}},
+      {"date_and_double",
+       {8, 5},
+       {[](const Value& v) { return !v.null && v.integer % 2 == 0; },
+        [](const Value& v) { return !v.null && v.real < -100; }}},
+      {"float_widened", {4}, {[](const Value& v) { return !v.null && v.real > 500.25; }}},
+      {"uint16_and_override",
+       {2, 9},
+       {[](const Value& v) { return !v.null && v.integer > 30000; }, not_null}},
+      {"int64", {3}, {[](const Value& v) { return !v.null && v.integer % 7 == 1; }}},
+  };
+}
+
+TEST_P(ParquetFilterTest, ReturnsTheRowsThatPassAsAScanWithoutAFilter) {
+  const auto table = Open(Write(GetParam()));
+  const std::vector<int> fields = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+  ASSERT_TRUE(table->supports_scan_filter(fields));
+  ASSERT_GE(table->num_parts(), 3);
+  for (const Case& c : Cases()) {
+    for (const int64_t batch_size : {int64_t{1}, int64_t{7}, int64_t{1000}, int64_t{65536}}) {
+      if (batch_size == 1 && c.name != "string_contains" && c.name != "date_and_double") {
+        continue;  // one row a batch is slow: a few cases are enough
+      }
+      for (int64_t part = 0; part < table->num_parts(); ++part) {
+        auto plain = table->ScanPart(part, fields, batch_size);
+        ASSERT_TRUE(plain.ok()) << plain.status().ToString();
+        const auto all = Drain(**plain, batch_size);
+        auto filter = std::make_shared<TestFilter>(c.columns, c.predicates);
+        auto filtered =
+            table->ScanPart(part, fields, batch_size, arrow::default_memory_pool(), filter);
+        ASSERT_TRUE(filtered.ok()) << filtered.status().ToString();
+        const auto got = Drain(**filtered, batch_size);
+        const auto expected = Expected(*all, c.columns, c.predicates);
+        ASSERT_TRUE(got->schema()->Equals(*all->schema()));
+        EXPECT_TRUE(got->Equals(*expected))
+            << c.name << " batch " << batch_size << " part " << part << ": " << got->num_rows()
+            << " rows, expected " << expected->num_rows();
+      }
+    }
+  }
+}
+
+// A projection in another order, a filter on a column not output first, and no column at all
+// but the filter's (rows counted only through a filter column).
+TEST_P(ParquetFilterTest, AnyProjection) {
+  const auto table = Open(Write(GetParam()));
+  const std::vector<int> fields = {7, 3, 6};
+  ASSERT_TRUE(table->supports_scan_filter(fields));
+  const std::vector<Predicate> predicates = {
+      [](const Value& v) { return !v.null && v.text.find('1') != std::string_view::npos; }};
+  for (int64_t part = 0; part < table->num_parts(); ++part) {
+    const auto all = Drain(**table->ScanPart(part, fields, 500), 500);
+    auto filter = std::make_shared<TestFilter>(std::vector<int>{2}, predicates);
+    const auto got =
+        Drain(**table->ScanPart(part, fields, 500, arrow::default_memory_pool(), filter), 500);
+    EXPECT_TRUE(got->Equals(*Expected(*all, {2}, predicates)));
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(Encodings, ParquetFilterTest,
+                         ::testing::Values(Encoding::kDictionary, Encoding::kPlain,
+                                           Encoding::kDictionaryFallback));
+
+class ParquetFilterErrorsTest : public ParquetFilterTest {};
+
+TEST_F(ParquetFilterErrorsTest, UnsupportedColumnsAndBadRequests) {
+  // A BOOLEAN and a TIMESTAMP column: not read by the filtered path.
+  const std::string path = (dir_ / "other.parquet").string();
+  arrow::BooleanBuilder flag;
+  arrow::TimestampBuilder ts(arrow::timestamp(arrow::TimeUnit::MICRO),
+                             arrow::default_memory_pool());
+  arrow::Int64Builder n;
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_TRUE(flag.Append(i % 2 == 0).ok());
+    ASSERT_TRUE(ts.Append(i).ok());
+    ASSERT_TRUE(n.Append(i).ok());
+  }
+  const auto t = arrow::Table::Make(
+      arrow::schema({arrow::field("flag", arrow::boolean()),
+                     arrow::field("ts", arrow::timestamp(arrow::TimeUnit::MICRO)),
+                     arrow::field("n", arrow::int64())}),
+      {flag.Finish().ValueOrDie(), ts.Finish().ValueOrDie(), n.Finish().ValueOrDie()});
+  auto out = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+  ASSERT_TRUE(parquet::arrow::WriteTable(*t, arrow::default_memory_pool(), out, 10).ok());
+  ASSERT_TRUE(out->Close().ok());
+  auto table = ParquetTable::Open({path});
+  ASSERT_TRUE(table.ok());
+  EXPECT_FALSE((*table)->supports_scan_filter({0}));
+  EXPECT_FALSE((*table)->supports_scan_filter({1}));
+  EXPECT_TRUE((*table)->supports_scan_filter({2}));
+  EXPECT_FALSE((*table)->supports_scan_filter({2, 7}));
+  auto filter = std::make_shared<TestFilter>(
+      std::vector<int>{0}, std::vector<Predicate>{[](const Value&) { return true; }});
+  EXPECT_TRUE((*table)
+                  ->ScanPart(0, {0}, 10, arrow::default_memory_pool(), filter)
+                  .status()
+                  .IsNotImplemented());
+  EXPECT_TRUE(
+      (*table)->ScanPart(5, {2}, 10, arrow::default_memory_pool(), filter).status().IsInvalid());
+  EXPECT_TRUE(
+      (*table)->ScanPart(0, {2}, 0, arrow::default_memory_pool(), filter).status().IsInvalid());
+  auto beyond = std::make_shared<TestFilter>(
+      std::vector<int>{3}, std::vector<Predicate>{[](const Value&) { return true; }});
+  EXPECT_TRUE(
+      (*table)->ScanPart(0, {2}, 10, arrow::default_memory_pool(), beyond).status().IsInvalid());
+}
+
+TEST_F(ParquetFilterErrorsTest, FilterErrorsAndChangedFiles) {
+  const std::string path = Write(Encoding::kDictionary);
+  const auto table = Open(path);
+  auto filter = std::make_shared<TestFilter>(
+      std::vector<int>{0}, std::vector<Predicate>{[](const Value&) { return true; }});
+  filter->Fail();
+  auto reader = table->ScanPart(0, {6}, 100, arrow::default_memory_pool(), filter);
+  ASSERT_TRUE(reader.ok());
+  std::shared_ptr<arrow::RecordBatch> batch;
+  const arrow::Status failed = (*reader)->ReadNext(&batch);
+  EXPECT_TRUE(failed.IsInvalid()) << failed.ToString();
+  EXPECT_EQ(failed.message(), "the filter failed");
+  // The file rewritten after Open: an I/O error naming it.
+  {
+    std::ofstream append(path, std::ios::app | std::ios::binary);
+    append << "junk";
+  }
+  auto ok_filter = std::make_shared<TestFilter>(
+      std::vector<int>{0}, std::vector<Predicate>{[](const Value&) { return true; }});
+  auto changed = table->ScanPart(0, {6}, 100, arrow::default_memory_pool(), ok_filter);
+  ASSERT_TRUE(changed.ok());
+  const arrow::Status io = (*changed)->ReadNext(&batch);
+  EXPECT_TRUE(io.IsIOError()) << io.ToString();
+  EXPECT_NE(io.message().find("t.parquet"), std::string::npos) << io.ToString();
+}
+
+}  // namespace
+}  // namespace antb1::io

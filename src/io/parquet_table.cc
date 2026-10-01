@@ -32,6 +32,9 @@
 #include "antb1/plan/catalog.h"
 #include "antb1/plan/types.h"
 
+#include "filtered_scan.h"
+#include "scan_segment.h"
+
 namespace antb1::io {
 namespace {
 
@@ -255,15 +258,6 @@ void CollectLeaves(const parquet::arrow::SchemaField& field, std::vector<int>& l
   }
 }
 
-// Row groups of one file that a scan reads, with the file's footer and size as read at Open.
-struct Segment {
-  std::string path;
-  std::shared_ptr<parquet::FileMetaData> metadata;
-  int64_t bytes = 0;
-  std::shared_ptr<arrow::Buffer> footer;  // FooterBytes
-  std::vector<int> row_groups;
-};
-
 // Reads the projected fields of every segment in order, one file at a time, as batches of the
 // engine view. Each segment's reader is opened when the previous segment is exhausted.
 class ScanReader final : public arrow::RecordBatchReader {
@@ -337,19 +331,7 @@ class ScanReader final : public arrow::RecordBatchReader {
   arrow::Status OpenFile(const Segment& segment) {
     current_file_ = segment.path;
     // The column chunks are read into the pool too.
-    ARROW_ASSIGN_OR_RAISE(auto input, arrow::io::ReadableFile::Open(segment.path, pool_));
-    // The footer read at Open locates the column chunks and fixes their types: a file that has
-    // since been rewritten must not be decoded with it.
-    ARROW_ASSIGN_OR_RAISE(const int64_t size, input->GetSize());
-    if (size != segment.bytes) {
-      return arrow::Status::IOError("the file changed after it was opened (", size, " bytes, was ",
-                                    segment.bytes, ")");
-    }
-    ARROW_ASSIGN_OR_RAISE(const std::shared_ptr<arrow::Buffer> footer,
-                          input->ReadAt(size - segment.footer->size(), segment.footer->size()));
-    if (!footer->Equals(*segment.footer)) {
-      return arrow::Status::IOError("the file changed after it was opened (its footer differs)");
-    }
+    ARROW_ASSIGN_OR_RAISE(auto input, OpenSegmentFile(segment, pool_));
     parquet::arrow::FileReaderBuilder builder;
     ARROW_RETURN_NOT_OK(builder.Open(input, parquet::ReaderProperties(pool_), segment.metadata));
     builder.memory_pool(pool_);
@@ -464,6 +446,22 @@ std::optional<Int128> IntegerOf(const arrow::Scalar& scalar) {
 }
 
 }  // namespace
+
+arrow::Result<std::shared_ptr<arrow::io::ReadableFile>> OpenSegmentFile(const Segment& segment,
+                                                                        arrow::MemoryPool* pool) {
+  ARROW_ASSIGN_OR_RAISE(auto input, arrow::io::ReadableFile::Open(segment.path, pool));
+  ARROW_ASSIGN_OR_RAISE(const int64_t size, input->GetSize());
+  if (size != segment.bytes) {
+    return arrow::Status::IOError("the file changed after it was opened (", size, " bytes, was ",
+                                  segment.bytes, ")");
+  }
+  ARROW_ASSIGN_OR_RAISE(const std::shared_ptr<arrow::Buffer> footer,
+                        input->ReadAt(size - segment.footer->size(), segment.footer->size()));
+  if (!footer->Equals(*segment.footer)) {
+    return arrow::Status::IOError("the file changed after it was opened (its footer differs)");
+  }
+  return input;
+}
 
 arrow::Result<std::shared_ptr<ParquetTable>> ParquetTable::Open(
     const std::vector<std::string>& paths, const ParquetTableOptions& options) {
@@ -607,6 +605,58 @@ arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> ParquetTable::DoScanPar
                              .footer = footers_[p.file],
                              .row_groups = std::vector<int>{p.row_group}});
   return MakeScan(std::move(segments), *storage_schema_, *schema_, fields, batch_size, pool);
+}
+
+bool ParquetTable::supports_scan_filter(const std::vector<int>& fields) const {
+  if (metadata_.empty()) {
+    return false;
+  }
+  for (const int field : fields) {
+    if (field < 0 || field >= schema_->num_fields()) {
+      return false;
+    }
+    if (!FilteredColumnOf(*metadata_.front(), leaf_of_field_[Narrow<std::size_t>(field)],
+                          *storage_schema_->field(field)->type(), *schema_->field(field)->type())
+             .has_value()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> ParquetTable::DoScanPartFiltered(
+    int64_t part, const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool,
+    std::shared_ptr<const plan::ScanFilter> filter) const {
+  if (part < 0 || part >= num_parts()) {
+    return arrow::Status::Invalid("scan of part ", part, " of a table with ", num_parts(),
+                                  " parts");
+  }
+  const Part& p = parts_[Narrow<std::size_t>(part)];
+  std::vector<FilteredColumn> columns;
+  arrow::FieldVector engine_fields;
+  std::vector<bool> seen(Narrow<std::size_t>(schema_->num_fields()), false);
+  for (const int field : fields) {
+    if (field < 0 || field >= schema_->num_fields() || seen[Narrow<std::size_t>(field)]) {
+      return arrow::Status::Invalid("invalid or repeated field ", field, " in a filtered scan");
+    }
+    seen[Narrow<std::size_t>(field)] = true;
+    // Every file has the schema of the first (checked at Open), and so the same leaves.
+    std::optional<FilteredColumn> column =
+        FilteredColumnOf(*metadata_[p.file], leaf_of_field_[Narrow<std::size_t>(field)],
+                         *storage_schema_->field(field)->type(), *schema_->field(field)->type());
+    if (!column.has_value()) {
+      return arrow::Status::NotImplemented("a filtered scan cannot read field ", field);
+    }
+    columns.push_back(*std::move(column));
+    engine_fields.push_back(schema_->field(field));
+  }
+  return MakeFilteredScan(Segment{.path = files_[p.file],
+                                  .metadata = metadata_[p.file],
+                                  .bytes = file_bytes_[p.file],
+                                  .footer = footers_[p.file],
+                                  .row_groups = std::vector<int>{p.row_group}},
+                          std::move(columns), arrow::schema(std::move(engine_fields)), batch_size,
+                          pool, std::move(filter));
 }
 
 bool ParquetTable::StoredAsFloat(int field) const {

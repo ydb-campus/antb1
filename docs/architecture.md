@@ -42,7 +42,11 @@ Responsibilities:
   read at `Open` are kept and reused by every scan; a file whose size or footer bytes changed since is an
   `IOError`. The table's parts (`plan::Table::num_parts`, `part_rows`, `ScanPart`), the units of parallel work of
   [ADR 0013](adr/0013-parallel-execution.md), are its row groups with rows in file order; scanning them one after
-  another gives the rows of `Scan`. Other tables are one part by default.
+  another gives the rows of `Scan`. Other tables are one part by default. A part can also be scanned with a
+  `plan::ScanFilter` (filter pushdown, [ADR 0020](adr/0020-filter-pushdown.md)): for flat integer, DATE, DOUBLE and
+  VARCHAR columns (`supports_scan_filter`), `src/io/filtered_scan.cc` reads the row group through Parquet's column
+  readers, applies the filter to the filter's columns as it decodes them (strings as views into the decoded pages,
+  piece by piece) and copies only the rows that pass, for every column.
 - `exec`: pull-based, batch-at-a-time physical operators (`TableScan`, `Filter`, `Compute`, `Project`, `ScalarAggregate`,
   `GroupAggregate`, `Sort`, `Limit`, `RowCount`; see [Execution](#execution)), the exact aggregate states (scalar
   and grouped), the row comparator and sort buffer, the physical planner and `Drain`. It scans only through

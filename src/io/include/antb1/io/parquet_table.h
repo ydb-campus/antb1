@@ -53,6 +53,9 @@ class ParquetTable final : public plan::Table {
   std::string Describe() const override;
   // A float column of the files (widened to double on read).
   bool StoredAsFloat(int field) const override;
+  // The filtered path (docs/adr/0020-filter-pushdown.md) reads flat INT16, INT32, USMALLINT,
+  // DATE, BIGINT, DOUBLE (also stored as FLOAT) and VARCHAR columns.
+  [[nodiscard]] bool supports_scan_filter(const std::vector<int>& fields) const override;
   // The sum of the file sizes (total_bytes()).
   std::optional<int64_t> data_size() const override { return total_bytes_; }
 
@@ -74,6 +77,12 @@ class ParquetTable final : public plan::Table {
   arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScanPart(
       int64_t part, const std::vector<int>& fields, int64_t batch_size,
       arrow::MemoryPool* pool) const override;
+  // ScanPart with a filter: the row group through Parquet's column readers, the filter's columns
+  // first (strings as views into the decoded pages), then only the rows that pass of every
+  // column (filtered_scan.h).
+  arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScanPartFiltered(
+      int64_t part, const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool,
+      std::shared_ptr<const plan::ScanFilter> filter) const override;
 
  private:
   // One row group of one file.
