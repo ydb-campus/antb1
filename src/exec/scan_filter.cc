@@ -14,6 +14,7 @@
 
 #include <arrow/api.h>
 #include <arrow/util/bit_util.h>
+#include <arrow/util/bitmap_ops.h>
 
 #include "antb1/exec/filter.h"
 #include "antb1/exec/like.h"
@@ -179,12 +180,18 @@ class PredicateScanFilter final : public plan::ScanFilter {
                             result.is_array()
                                 ? arrow::Result<std::shared_ptr<arrow::Array>>(result.make_array())
                                 : arrow::MakeArrayFromScalar(*result.scalar(), values.rows, pool_));
-      const auto& mask = static_cast<const arrow::BooleanArray&>(*passed);
-      for (int64_t i = 0; i < values.rows; ++i) {
-        if (BitAt(selected, offset + i) && (mask.IsNull(i) || !mask.Value(i))) {
-          arrow::bit_util::ClearBit(selected, offset + i);
-        }
+      // selected &= value, and &= validity where the result has NULLs (NULL fails).
+      const arrow::ArrayData& mask = *passed->data();
+      ARROW_ASSIGN_OR_RAISE(auto kept, arrow::AllocateEmptyBitmap(values.rows, pool_));
+      arrow::internal::BitmapAnd(selected, offset, mask.buffers[1]->data(), mask.offset,
+                                 values.rows, 0, kept->mutable_data());
+      if (passed->null_count() > 0) {
+        ARROW_ASSIGN_OR_RAISE(auto valid, arrow::AllocateEmptyBitmap(values.rows, pool_));
+        arrow::internal::BitmapAnd(kept->data(), 0, mask.buffers[0]->data(), mask.offset,
+                                   values.rows, 0, valid->mutable_data());
+        kept = std::move(valid);
       }
+      arrow::internal::CopyBitmap(kept->data(), 0, values.rows, selected, offset);
     }
     return arrow::Status::OK();
   }

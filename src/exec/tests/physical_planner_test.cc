@@ -34,8 +34,9 @@ using testing::MemoryTable;
 
 class PhysicalPlannerTest : public testing::ExecTest {
  protected:
-  // x = 0..9 in batches of 4, 4 and 2; y = 10 * x, NULL where x is a multiple of 3.
-  static std::shared_ptr<MemoryTable> Table() {
+  // x = 0..9 in batches of 4, 4 and 2; y = 10 * x, NULL where x is a multiple of 3. With `split`,
+  // each batch is a part.
+  static std::shared_ptr<MemoryTable> Table(bool split = false) {
     const auto schema =
         arrow::schema({arrow::field("x", arrow::int64()), arrow::field("y", arrow::int64())});
     arrow::RecordBatchVector batches;
@@ -49,7 +50,7 @@ class PhysicalPlannerTest : public testing::ExecTest {
       }
       batches.push_back(arrow::RecordBatch::Make(schema, rows, {Int64s(x), Int64s(y)}));
     }
-    return std::make_shared<MemoryTable>(schema, std::move(batches));
+    return std::make_shared<MemoryTable>(schema, std::move(batches), split);
   }
 
   static plan::LogicalNodePtr Node(plan::LogicalNode node) {
@@ -351,6 +352,84 @@ TEST_F(PhysicalPlannerTest, ComputeOverAWholeInputIsParallel) {
   const auto result = Run(PlanOf(above, 2));
   EXPECT_EQ(Int64Column(*result, 1),
             (std::vector<std::optional<int64_t>>{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}));
+}
+
+// The predicates of a Filter directly over the scan of a part pipeline that read one column are
+// applied by the scan (ADR 0020), when the table supports it; the others stay in the Filter. The
+// rows are the same either way.
+TEST_F(PhysicalPlannerTest, FilterPredicatesArePushedIntoTheScan) {
+  const auto x = Column(0, "x", LogicalType::kBigInt);
+  const auto y = Column(1, "y", LogicalType::kBigInt);
+  plan::Predicate below = testing::Compare(x, plan::CompareOp::kLt, BigInt(0));
+  below.kind = plan::Predicate::Kind::kCompareColumns;  // x < y
+  below.other = y;
+  const plan::Predicate not_null{
+      .kind = plan::Predicate::Kind::kIsNotNull, .column = y, .span = {}};
+  const auto plan_of = [&](const std::shared_ptr<MemoryTable>& table,
+                           std::vector<plan::Predicate> predicates) {
+    const auto scan = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}});
+    return PlanOf(Node(plan::FilterNode{.input = scan, .predicates = std::move(predicates)}), 2);
+  };
+  const std::vector<plan::Predicate> predicates = {
+      testing::Compare(x, plan::CompareOp::kGe, BigInt(2)), below, not_null};
+  for (const bool pushdown : {true, false}) {
+    const auto table = Table(/*split=*/true);
+    table->set_scan_filter(pushdown);
+    for (const int64_t batch_size : {1, 3, 64}) {
+      const auto rows = Run(plan_of(table, predicates), batch_size);
+      ASSERT_NE(rows, nullptr);
+      EXPECT_EQ(Int64Column(*rows, 0), (std::vector<std::optional<int64_t>>{2, 4, 5, 7, 8}))
+          << "pushdown=" << pushdown << " batch_size=" << batch_size;
+    }
+    EXPECT_EQ(table->filtered_scans(), pushdown ? 9 : 0) << "3 parts, 3 batch sizes";
+    ProfileNode root;
+    ASSERT_TRUE(BuildPhysicalPlan(plan_of(table, predicates), &root).ok());
+    ASSERT_EQ(root.children().size(), 1U);
+    const ProfileNode& filter = *root.children()[0];
+    EXPECT_EQ(filter.name(), "Filter");
+    ASSERT_EQ(filter.children().size(), 1U);
+    EXPECT_EQ(filter.children()[0]->name(), "Scan");
+    EXPECT_EQ(filter.children()[0]->detail().ends_with(", 2 pushed predicates"), pushdown)
+        << filter.children()[0]->detail();
+  }
+  // One predicate: singular. Only a comparison of two columns: nothing to push.
+  auto table = Table(/*split=*/true);
+  ProfileNode one;
+  ASSERT_TRUE(BuildPhysicalPlan(plan_of(table, {not_null}), &one).ok());
+  EXPECT_TRUE(one.children()[0]->children()[0]->detail().ends_with(", 1 pushed predicate"));
+  ASSERT_NE(Run(plan_of(table, {below})), nullptr);
+  EXPECT_EQ(table->filtered_scans(), 0);
+  // A FALSE predicate ends the stream before anything is read: nothing is pushed, nor scanned.
+  const plan::Predicate never{.kind = plan::Predicate::Kind::kFalse, .span = {}};
+  table = Table(/*split=*/true);
+  const auto none = Run(plan_of(table, {not_null, never}));
+  ASSERT_NE(none, nullptr);
+  EXPECT_EQ(none->num_rows(), 0);
+  EXPECT_EQ(table->filtered_scans(), 0);
+  EXPECT_TRUE(table->scanned_parts().empty());
+}
+
+// The narrow scans of late materialization (ADR 0016) count the rows of their part: their filters
+// stay in the Filter operator.
+TEST_F(PhysicalPlannerTest, LateScansAreNotFiltered) {
+  const auto table = Table(/*split=*/true);
+  const auto x = Column(0, "x", LogicalType::kBigInt);
+  const auto scan = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}});
+  const auto filter = Node(plan::FilterNode{
+      .input = scan, .predicates = {testing::Compare(x, plan::CompareOp::kGe, BigInt(5))}});
+  const auto top = PlanOf(
+      Node(plan::LimitNode{.input = Node(plan::SortNode{.input = filter, .keys = {{.column = x}}}),
+                           .limit = 1,
+                           .offset = 0}),
+      2);
+  ProfileNode root;
+  ASSERT_TRUE(BuildPhysicalPlan(top, &root).ok());
+  ASSERT_TRUE(root.detail().ends_with("late=1 columns")) << root.detail();
+  const auto rows = Run(top);
+  ASSERT_NE(rows, nullptr);
+  EXPECT_EQ(Int64Column(*rows, 0), (std::vector<std::optional<int64_t>>{5}));
+  EXPECT_EQ(Int64Column(*rows, 1), (std::vector<std::optional<int64_t>>{50}));
+  EXPECT_EQ(table->filtered_scans(), 0);
 }
 
 TEST_F(PhysicalPlannerTest, MalformedPlansAreInvalidNotUnsupported) {

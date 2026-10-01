@@ -307,6 +307,9 @@ only with `--analyze`); its errors and exit codes are those of `antb1 query`.
   - its `time`, or for an operator of a part pipeline, `parts=N` and its time summed over the parts;
   - `self`, its time without the inputs that ran inside it;
   - its metrics.
+- A `Scan` that applies predicates of the `Filter` above it while it reads (filter pushdown,
+  [ADR 0020](adr/0020-filter-pushdown.md)) says so after its EXPLAIN text, `, N pushed predicates`; its `rows` are
+  then those that passed them.
 - Metrics:
   - `parts`, `skipped` (by statistics);
   - `raw_parts`, `raw_rows` (a GROUP BY's parts that sent rows straight to the partitions, because their first

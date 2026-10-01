@@ -11,11 +11,14 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 #include <arrow/api.h>
+#include <arrow/util/bit_run_reader.h>
 #include <arrow/util/bit_util.h>
+#include <arrow/util/bitmap_ops.h>
 #include <parquet/column_reader.h>
 #include <parquet/exception.h>
 #include <parquet/file_reader.h>
@@ -39,32 +42,42 @@ void SetBitAt(std::uint8_t* bits, int64_t i) { arrow::bit_util::SetBit(bits, i);
 int WidthOf(const arrow::DataType& type) { return type.bit_width() / 8; }
 
 // A batch's rows of one column, decoded: definition levels (when the column has NULLs) and the
-// values of its non-NULL rows, densely.
+// values of its non-NULL rows, densely, in a buffer of the scan's pool that an array may take over
+// (FixedArray).
 template <class Value>
 struct Decoded {
   std::vector<int16_t> levels;
-  std::vector<Value> values;
+  std::shared_ptr<arrow::ResizableBuffer> values;
   int64_t rows = 0;
   int64_t values_read = 0;
 };
 
 // Reads `rows` rows of a column (a flat leaf with max definition level `max_def`).
 template <class Reader, class Value>
-arrow::Status ReadRows(Reader& reader, int16_t max_def, int64_t rows, Decoded<Value>& out) {
-  out.levels.resize(static_cast<std::size_t>(rows));
-  out.values.resize(static_cast<std::size_t>(rows));
+arrow::Status ReadRows(Reader& reader, int16_t max_def, int64_t rows, Decoded<Value>& out,
+                       arrow::MemoryPool* pool) {
+  if (max_def > 0) {
+    out.levels.resize(static_cast<std::size_t>(rows));
+  }
+  const int64_t bytes = rows * static_cast<int64_t>(sizeof(Value));
+  if (out.values == nullptr || out.values.use_count() > 1) {  // the last batch's array holds it
+    ARROW_ASSIGN_OR_RAISE(out.values, arrow::AllocateResizableBuffer(bytes, pool));
+  } else {
+    ARROW_RETURN_NOT_OK(out.values->Resize(bytes, /*shrink_to_fit=*/false));
+  }
   out.rows = 0;
   out.values_read = 0;
+  Value* values = out.values->template mutable_data_as<Value>();
   while (out.rows < rows) {
-    int64_t values = 0;
+    int64_t read = 0;
     const int64_t levels =
         reader.ReadBatch(rows - out.rows, max_def > 0 ? out.levels.data() + out.rows : nullptr,
-                         nullptr, out.values.data() + out.values_read, &values);
+                         nullptr, values + out.values_read, &read);
     if (levels <= 0) {
       return arrow::Status::IOError("a column chunk holds fewer rows than its row group");
     }
     out.rows += levels;
-    out.values_read += values;
+    out.values_read += read;
   }
   return arrow::Status::OK();
 }
@@ -82,6 +95,64 @@ arrow::Status SkipRows(Reader& reader, int64_t rows) {
   return arrow::Status::OK();
 }
 
+// Whether the engine type `id` stores a physical `Value` as it is.
+template <class Value>
+bool SameRepresentation(arrow::Type::type id) {
+  if constexpr (std::is_same_v<Value, int32_t>) {
+    return id == arrow::Type::INT32 || id == arrow::Type::DATE32;
+  } else if constexpr (std::is_same_v<Value, int64_t>) {
+    return id == arrow::Type::INT64;
+  } else if constexpr (std::is_same_v<Value, double>) {
+    return id == arrow::Type::DOUBLE;
+  } else {
+    return false;
+  }
+}
+
+// Stores the rows of `decoded` (all, or with `selected` only those whose bit is set) as `Out`
+// values from `out` on; `valid` (nullptr: the column has no NULLs) gets their validity. Returns the
+// number of NULLs stored.
+template <class Out, class Value>
+int64_t StoreRows(const Decoded<Value>& decoded, int16_t max_def, const std::uint8_t* selected,
+                  Out* out, std::uint8_t* valid) {
+  const Value* values = decoded.values->template data_as<Value>();
+  if (max_def == 0 || decoded.values_read == decoded.rows) {  // no NULL: value i is row i
+    if (selected == nullptr) {
+      for (int64_t row = 0; row < decoded.rows; ++row) {
+        out[row] = static_cast<Out>(values[row]);
+      }
+    } else {
+      int64_t at = 0;
+      arrow::internal::VisitSetBitRunsVoid(selected, 0, decoded.rows,
+                                           [&](int64_t position, int64_t length) {
+                                             for (int64_t i = 0; i < length; ++i) {
+                                               out[at + i] = static_cast<Out>(values[position + i]);
+                                             }
+                                             at += length;
+                                           });
+    }
+    return 0;
+  }
+  int64_t at = 0;
+  int64_t next_value = 0;
+  int64_t nulls = 0;
+  for (int64_t row = 0; row < decoded.rows; ++row) {
+    const bool present = decoded.levels[static_cast<std::size_t>(row)] == max_def;
+    if (selected == nullptr || BitAt(selected, row)) {
+      if (present) {
+        out[at] = static_cast<Out>(values[next_value]);
+        SetBitAt(valid, at);
+      } else {
+        out[at] = Out{};
+        ++nulls;
+      }
+      ++at;
+    }
+    next_value += present ? 1 : 0;
+  }
+  return nulls;
+}
+
 // The engine array of `decoded` (every row, NULLs where the levels say so); with `selected`, only
 // the rows whose bit is set (`count` of them).
 template <class Value>
@@ -90,63 +161,39 @@ arrow::Result<std::shared_ptr<arrow::Array>> FixedArray(
     const std::uint8_t* selected, int64_t count, arrow::MemoryPool* pool) {
   const int64_t length = selected == nullptr ? decoded.rows : count;
   const int width = WidthOf(*type);
+  if (selected == nullptr && (max_def == 0 || decoded.values_read == decoded.rows) &&
+      SameRepresentation<Value>(type->id())) {
+    // Every row, none NULL, stored as the engine stores it: the decoded values are the array.
+    return arrow::MakeArray(arrow::ArrayData::Make(type, length, {nullptr, decoded.values}, 0));
+  }
   ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Buffer> values,
                         arrow::AllocateBuffer(length * width, pool));
-  std::uint8_t* out = values->mutable_data();
   std::shared_ptr<arrow::Buffer> validity;
   std::uint8_t* valid = nullptr;
-  int64_t nulls = 0;
-  if (max_def > 0) {
+  if (max_def > 0 && decoded.values_read < decoded.rows) {
     ARROW_ASSIGN_OR_RAISE(validity, arrow::AllocateEmptyBitmap(length, pool));
     valid = validity->mutable_data();
   }
-  const auto store = [&](int64_t at, const Value* v) {
-    std::uint8_t* p = out + (at * width);
-    if (v == nullptr) {
-      std::memset(p, 0, static_cast<std::size_t>(width));
-      return;
-    }
-    switch (type->id()) {
-      case arrow::Type::INT16: {
-        const auto x = static_cast<int16_t>(*v);
-        std::memcpy(p, &x, sizeof(x));
-        break;
-      }
-      case arrow::Type::UINT16: {
-        const auto x = static_cast<uint16_t>(*v);
-        std::memcpy(p, &x, sizeof(x));
-        break;
-      }
-      case arrow::Type::DOUBLE: {
-        const auto x = static_cast<double>(*v);
-        std::memcpy(p, &x, sizeof(x));
-        break;
-      }
-      default:  // INT32, DATE32, INT64: the stored value as it is
-        std::memcpy(p, v, sizeof(Value));
-        break;
-    }
-  };
-  int64_t at = 0;
-  int64_t next_value = 0;
-  for (int64_t row = 0; row < decoded.rows; ++row) {
-    const bool present = max_def == 0 || decoded.levels[static_cast<std::size_t>(row)] == max_def;
-    const Value* v = present ? &decoded.values[static_cast<std::size_t>(next_value)] : nullptr;
-    if (present) {
-      ++next_value;
-    }
-    if (selected != nullptr && !BitAt(selected, row)) {
-      continue;
-    }
-    store(at, v);
-    if (valid != nullptr) {
-      if (present) {
-        SetBitAt(valid, at);
-      } else {
-        ++nulls;
-      }
-    }
-    ++at;
+  int64_t nulls = 0;
+  switch (type->id()) {
+    case arrow::Type::INT16:
+      nulls = StoreRows(decoded, max_def, selected, values->mutable_data_as<int16_t>(), valid);
+      break;
+    case arrow::Type::UINT16:
+      nulls = StoreRows(decoded, max_def, selected, values->mutable_data_as<uint16_t>(), valid);
+      break;
+    case arrow::Type::INT32:
+    case arrow::Type::DATE32:
+      nulls = StoreRows(decoded, max_def, selected, values->mutable_data_as<int32_t>(), valid);
+      break;
+    case arrow::Type::INT64:
+      nulls = StoreRows(decoded, max_def, selected, values->mutable_data_as<int64_t>(), valid);
+      break;
+    case arrow::Type::DOUBLE:
+      nulls = StoreRows(decoded, max_def, selected, values->mutable_data_as<double>(), valid);
+      break;
+    default:
+      return arrow::Status::Invalid("a filtered scan cannot store ", type->ToString());
   }
   if (nulls == 0) {
     validity = nullptr;
@@ -159,6 +206,11 @@ struct ColumnState {
   FilteredColumn column;
   int16_t max_def = 0;
   std::shared_ptr<parquet::ColumnReader> reader;
+  // The last batch read, of the column's physical type (kept: the next batch reuses its memory).
+  Decoded<int32_t> int32s;
+  Decoded<int64_t> int64s;
+  Decoded<float> floats;
+  Decoded<double> doubles;
 };
 
 class FilteredScanReader final : public arrow::RecordBatchReader {
@@ -172,7 +224,13 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
         pool_(pool),
         filter_(std::move(filter)) {
     for (FilteredColumn& column : columns) {
-      columns_.push_back(ColumnState{.column = std::move(column), .max_def = 0, .reader = nullptr});
+      columns_.push_back(ColumnState{.column = std::move(column),
+                                     .max_def = 0,
+                                     .reader = nullptr,
+                                     .int32s = {},
+                                     .int64s = {},
+                                     .floats = {},
+                                     .doubles = {}});
     }
     filter_index_.assign(columns_.size(), -1);
     const std::vector<int>& filtered = filter_->columns();
@@ -275,6 +333,7 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
       const int index = filter_index_[p];
       if (state.column.physical == Physical::kByteArray) {
         candidates[p] = std::make_unique<Candidates>(pool_);
+        ARROW_RETURN_NOT_OK(candidates[p]->Reserve(rows));
         ARROW_RETURN_NOT_OK(FilterStrings(state, index, rows, selected, *candidates[p]));
       } else {
         ARROW_ASSIGN_OR_RAISE(whole[p], ReadFixed(state, rows, nullptr, 0));
@@ -319,13 +378,14 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
   struct Candidates {
     explicit Candidates(arrow::MemoryPool* pool) : values(pool) {}
 
+    // Room for `rows` values.
+    arrow::Status Reserve(int64_t count) {
+      rows.reserve(static_cast<std::size_t>(count));
+      return values.Reserve(count);
+    }
+
     std::vector<int64_t> rows;
     arrow::BinaryBuilder values;  // in the query's pool, so that the budget sees the bytes
-
-    arrow::Status Add(int64_t row, const std::string_view* value) {
-      rows.push_back(row);
-      return value == nullptr ? values.AppendNull() : values.Append(*value);
-    }
 
     // The values of the rows selected in the end.
     arrow::Result<std::shared_ptr<arrow::Array>> Finish(const std::uint8_t* selected, int64_t count,
@@ -365,11 +425,15 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
                                           .validity = piece_nulls_ ? piece_valid_.data() : nullptr,
                                           .rows = piece},
                          done, selected));
+      ARROW_RETURN_NOT_OK(kept.values.ReserveData(SelectedBytes(selected, done)));
       for (int64_t i = 0; i < piece; ++i) {
         if (BitAt(selected, done + i)) {
-          const bool present = !piece_nulls_ || BitAt(piece_valid_.data(), i);
-          ARROW_RETURN_NOT_OK(
-              kept.Add(done + i, present ? &views_[static_cast<std::size_t>(i)] : nullptr));
+          kept.rows.push_back(done + i);
+          if (piece_nulls_ && !BitAt(piece_valid_.data(), i)) {
+            kept.values.UnsafeAppendNull();
+          } else {
+            kept.values.UnsafeAppend(views_[static_cast<std::size_t>(i)]);
+          }
         }
       }
       done += piece;
@@ -388,20 +452,31 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
     while (done < rows) {
       ARROW_RETURN_NOT_OK(ReadStringPiece(reader, state.max_def, rows - done));
       const auto piece = static_cast<int64_t>(views_.size());
+      ARROW_RETURN_NOT_OK(builder.ReserveData(SelectedBytes(selected, done)));
       for (int64_t i = 0; i < piece; ++i) {
         if (!BitAt(selected, done + i)) {
           continue;
         }
         if (piece_nulls_ && !BitAt(piece_valid_.data(), i)) {
-          ARROW_RETURN_NOT_OK(builder.AppendNull());
+          builder.UnsafeAppendNull();
         } else {
-          const std::string_view v = views_[static_cast<std::size_t>(i)];
-          ARROW_RETURN_NOT_OK(builder.Append(v));
+          builder.UnsafeAppend(views_[static_cast<std::size_t>(i)]);
         }
       }
       done += piece;
     }
     return builder.Finish();
+  }
+
+  // The bytes of the values of the piece in views_ whose rows (from `first` on) are selected.
+  [[nodiscard]] int64_t SelectedBytes(const std::uint8_t* selected, int64_t first) const {
+    int64_t bytes = 0;
+    for (std::size_t i = 0; i < views_.size(); ++i) {
+      if (BitAt(selected, first + static_cast<int64_t>(i))) {
+        bytes += static_cast<int64_t>(views_[i].size());  // a NULL row's view is empty
+      }
+    }
+    return bytes;
   }
 
   // Reads the next piece (at most `rows` rows, within one page) of a string column into views_,
@@ -443,28 +518,24 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
     const auto& type = state.column.engine;
     switch (state.column.physical) {
       case Physical::kInt32: {
-        Decoded<int32_t> d;
-        ARROW_RETURN_NOT_OK(
-            ReadRows(static_cast<parquet::Int32Reader&>(*state.reader), state.max_def, rows, d));
-        return FixedArray(d, state.max_def, type, selected, count, pool_);
+        ARROW_RETURN_NOT_OK(ReadRows(static_cast<parquet::Int32Reader&>(*state.reader),
+                                     state.max_def, rows, state.int32s, pool_));
+        return FixedArray(state.int32s, state.max_def, type, selected, count, pool_);
       }
       case Physical::kInt64: {
-        Decoded<int64_t> d;
-        ARROW_RETURN_NOT_OK(
-            ReadRows(static_cast<parquet::Int64Reader&>(*state.reader), state.max_def, rows, d));
-        return FixedArray(d, state.max_def, type, selected, count, pool_);
+        ARROW_RETURN_NOT_OK(ReadRows(static_cast<parquet::Int64Reader&>(*state.reader),
+                                     state.max_def, rows, state.int64s, pool_));
+        return FixedArray(state.int64s, state.max_def, type, selected, count, pool_);
       }
       case Physical::kFloat: {
-        Decoded<float> d;
-        ARROW_RETURN_NOT_OK(
-            ReadRows(static_cast<parquet::FloatReader&>(*state.reader), state.max_def, rows, d));
-        return FixedArray(d, state.max_def, type, selected, count, pool_);
+        ARROW_RETURN_NOT_OK(ReadRows(static_cast<parquet::FloatReader&>(*state.reader),
+                                     state.max_def, rows, state.floats, pool_));
+        return FixedArray(state.floats, state.max_def, type, selected, count, pool_);
       }
       case Physical::kDouble: {
-        Decoded<double> d;
-        ARROW_RETURN_NOT_OK(
-            ReadRows(static_cast<parquet::DoubleReader&>(*state.reader), state.max_def, rows, d));
-        return FixedArray(d, state.max_def, type, selected, count, pool_);
+        ARROW_RETURN_NOT_OK(ReadRows(static_cast<parquet::DoubleReader&>(*state.reader),
+                                     state.max_def, rows, state.doubles, pool_));
+        return FixedArray(state.doubles, state.max_def, type, selected, count, pool_);
       }
       case Physical::kByteArray:
         break;
@@ -484,24 +555,23 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
     if (array.null_count() > 0) {
       ARROW_ASSIGN_OR_RAISE(validity, arrow::AllocateEmptyBitmap(count, pool_));
     }
-    const std::uint8_t* in = array.data()->buffers[1]->data();
+    const arrow::ArrayData& data = *array.data();
+    const std::uint8_t* in = data.buffers[1]->data() + (data.offset * width);
+    const std::uint8_t* in_valid = data.buffers[0] == nullptr ? nullptr : data.buffers[0]->data();
     int64_t at = 0;
-    int64_t null_count = 0;
-    for (int64_t row = 0; row < array.length(); ++row) {
-      if (!BitAt(selected, row)) {
-        continue;
-      }
-      std::memcpy(values->mutable_data() + (at * width), in + (row * width),
-                  static_cast<std::size_t>(width));
-      if (validity != nullptr) {
-        if (array.IsValid(row)) {
-          SetBitAt(validity->mutable_data(), at);
-        } else {
-          ++null_count;
-        }
-      }
-      ++at;
-    }
+    // Runs of selected rows: one copy each, of the values and of their validity.
+    arrow::internal::VisitSetBitRunsVoid(
+        selected, 0, array.length(), [&](int64_t row, int64_t length) {
+          std::memcpy(values->mutable_data() + (at * width), in + (row * width),
+                      static_cast<std::size_t>(length * width));
+          if (validity != nullptr) {
+            arrow::internal::CopyBitmap(in_valid, data.offset + row, length,
+                                        validity->mutable_data(), at);
+          }
+          at += length;
+        });
+    const int64_t null_count =
+        validity == nullptr ? 0 : count - arrow::internal::CountSetBits(validity->data(), 0, count);
     if (null_count == 0) {
       validity = nullptr;
     }
