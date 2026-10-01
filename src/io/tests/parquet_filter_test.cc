@@ -141,10 +141,10 @@ std::shared_ptr<arrow::Table> MakeTable() {
   for (int64_t r = 0; r < kRows; ++r) {
     const auto null = [&](int shift) { return (r + shift) % 7 == 0; };
     EXPECT_TRUE(
-        (null(0) ? i16.AppendNull() : i16.Append(static_cast<int16_t>((r * 37) % 30000 - 15000)))
+        (null(0) ? i16.AppendNull() : i16.Append(static_cast<int16_t>(((r * 37) % 30000) - 15000)))
             .ok());
     EXPECT_TRUE(
-        (null(1) ? i32.AppendNull() : i32.Append(static_cast<int32_t>(r * 101 - 70000))).ok());
+        (null(1) ? i32.AppendNull() : i32.Append(static_cast<int32_t>((r * 101) - 70000))).ok());
     EXPECT_TRUE(
         (null(2) ? u16.AppendNull() : u16.Append(static_cast<uint16_t>((r * 13) % 65000))).ok());
     EXPECT_TRUE((null(3) ? i64.AppendNull() : i64.Append((r * 1000003) - 9000000000LL)).ok());
@@ -289,38 +289,58 @@ struct Case {
 
 std::vector<Case> Cases() {
   const auto not_null = [](const Value& v) { return !v.null; };
+  const auto contains = [](std::string_view needle) {
+    return [needle](const Value& v) { return !v.null && v.text.contains(needle); };
+  };
   return {
-      {"keep_all", {0}, {[](const Value&) { return true; }}},
-      {"keep_none", {6}, {[](const Value&) { return false; }}},
-      {"string_contains", {6}, {[](const Value& v) {
-         return !v.null && v.text.find("-1") != std::string_view::npos;
-       }}},
-      {"string_null", {6}, {[](const Value& v) { return v.null; }}},
-      {"long_strings", {6}, {[](const Value& v) { return !v.null && v.text.size() > 100; }}},
-      {"empty_strings", {6}, {[](const Value& v) { return !v.null && v.text.empty(); }}},
-      {"integer_mod", {1}, {[](const Value& v) { return !v.null && v.integer % 3 == 0; }}},
-      {"int16_and_binary",
-       {0, 7},
-       {[](const Value& v) { return !v.null && v.integer > 0; },
-        [](const Value& v) { return !v.null && v.text == "b5"; }}},
-      {"two_strings",
-       {6, 7},
-       {[](const Value& v) { return !v.null && v.text.starts_with("row-1"); }, not_null}},
-      {"date_and_double",
-       {8, 5},
-       {[](const Value& v) { return !v.null && v.integer % 2 == 0; },
-        [](const Value& v) { return !v.null && v.real < -100; }}},
-      {"float_widened", {4}, {[](const Value& v) { return !v.null && v.real > 500.25; }}},
-      {"uint16_and_override",
-       {2, 9},
-       {[](const Value& v) { return !v.null && v.integer > 30000; }, not_null}},
-      {"int64", {3}, {[](const Value& v) { return !v.null && v.integer % 7 == 1; }}},
-      {"required_int64", {10}, {[](const Value& v) { return !v.null && v.integer % 5 == 2; }}},
-      {"required_string", {11}, {[](const Value& v) { return !v.null && v.text.ends_with("1"); }}},
-      {"required_and_nullable",
-       {11, 6},
-       {[](const Value& v) { return !v.null && !v.text.empty(); }, not_null}},
-      {"usmallint_as_date", {12}, {[](const Value& v) { return !v.null && v.integer % 3 == 0; }}},
+      {.name = "keep_all", .columns = {0}, .predicates = {[](const Value&) { return true; }}},
+      {.name = "keep_none", .columns = {6}, .predicates = {[](const Value&) { return false; }}},
+      {.name = "string_contains", .columns = {6}, .predicates = {contains("-1")}},
+      {.name = "string_null", .columns = {6}, .predicates = {[](const Value& v) {
+                                                return v.null;
+                                              }}},
+      {.name = "long_strings", .columns = {6}, .predicates = {[](const Value& v) {
+                                                 return !v.null && v.text.size() > 100;
+                                               }}},
+      {.name = "empty_strings", .columns = {6}, .predicates = {[](const Value& v) {
+                                                  return !v.null && v.text.empty();
+                                                }}},
+      {.name = "integer_mod", .columns = {1}, .predicates = {[](const Value& v) {
+                                                return !v.null && v.integer % 3 == 0;
+                                              }}},
+      {.name = "int16_and_binary",
+       .columns = {0, 7},
+       .predicates = {[](const Value& v) { return !v.null && v.integer > 0; },
+                      [](const Value& v) { return !v.null && v.text == "b5"; }}},
+      {.name = "two_strings",
+       .columns = {6, 7},
+       .predicates = {[](const Value& v) { return !v.null && v.text.starts_with("row-1"); },
+                      not_null}},
+      {.name = "date_and_double",
+       .columns = {8, 5},
+       .predicates = {[](const Value& v) { return !v.null && v.integer % 2 == 0; },
+                      [](const Value& v) { return !v.null && v.real < -100; }}},
+      {.name = "float_widened", .columns = {4}, .predicates = {[](const Value& v) {
+                                                  return !v.null && v.real > 500.25;
+                                                }}},
+      {.name = "uint16_and_override",
+       .columns = {2, 9},
+       .predicates = {[](const Value& v) { return !v.null && v.integer > 30000; }, not_null}},
+      {.name = "int64", .columns = {3}, .predicates = {[](const Value& v) {
+                                          return !v.null && v.integer % 7 == 1;
+                                        }}},
+      {.name = "required_int64", .columns = {10}, .predicates = {[](const Value& v) {
+                                                    return !v.null && v.integer % 5 == 2;
+                                                  }}},
+      {.name = "required_string", .columns = {11}, .predicates = {[](const Value& v) {
+                                                     return !v.null && v.text.ends_with('1');
+                                                   }}},
+      {.name = "required_and_nullable",
+       .columns = {11, 6},
+       .predicates = {[](const Value& v) { return !v.null && !v.text.empty(); }, not_null}},
+      {.name = "usmallint_as_date", .columns = {12}, .predicates = {[](const Value& v) {
+                                                       return !v.null && v.integer % 3 == 0;
+                                                     }}},
   };
 }
 
@@ -360,7 +380,7 @@ TEST_P(ParquetFilterTest, AnyProjection) {
   const std::vector<int> fields = {7, 3, 6};
   ASSERT_TRUE(table->supports_scan_filter(fields));
   const std::vector<Predicate> predicates = {
-      [](const Value& v) { return !v.null && v.text.find('1') != std::string_view::npos; }};
+      [](const Value& v) { return !v.null && v.text.contains('1'); }};
   for (int64_t part = 0; part < table->num_parts(); ++part) {
     const auto all = Drain(**table->ScanPart(part, fields, 500), 500);
     auto filter = std::make_shared<TestFilter>(std::vector<int>{2}, predicates);
@@ -485,7 +505,7 @@ TEST_F(ParquetFilterErrorsTest, PartsOfEveryFile) {
   ASSERT_TRUE(table.ok()) << table.status().ToString();
   const std::vector<int> fields = {6, 3, 12};
   const std::vector<Predicate> predicates = {
-      [](const Value& v) { return !v.null && v.text.find('3') != std::string_view::npos; }};
+      [](const Value& v) { return !v.null && v.text.contains('3'); }};
   int64_t rows = 0;
   for (int64_t part = 0; part < (*table)->num_parts(); ++part) {
     const auto all = Drain(**(*table)->ScanPart(part, fields, 256), 256);

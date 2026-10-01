@@ -324,8 +324,7 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
 
     arrow::Status Add(int64_t row, const std::string_view* value) {
       rows.push_back(row);
-      return value == nullptr ? values.AppendNull()
-                              : values.Append(value->data(), Narrow<int32_t>(value->size()));
+      return value == nullptr ? values.AppendNull() : values.Append(*value);
     }
 
     // The values of the rows selected in the end.
@@ -397,7 +396,7 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
           ARROW_RETURN_NOT_OK(builder.AppendNull());
         } else {
           const std::string_view v = views_[static_cast<std::size_t>(i)];
-          ARROW_RETURN_NOT_OK(builder.Append(v.data(), Narrow<int32_t>(v.size())));
+          ARROW_RETURN_NOT_OK(builder.Append(v));
         }
       }
       done += piece;
@@ -487,7 +486,7 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
     }
     const std::uint8_t* in = array.data()->buffers[1]->data();
     int64_t at = 0;
-    int64_t nulls = 0;
+    int64_t null_count = 0;
     for (int64_t row = 0; row < array.length(); ++row) {
       if (!BitAt(selected, row)) {
         continue;
@@ -498,19 +497,19 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
         if (array.IsValid(row)) {
           SetBitAt(validity->mutable_data(), at);
         } else {
-          ++nulls;
+          ++null_count;
         }
       }
       ++at;
     }
-    if (nulls == 0) {
+    if (null_count == 0) {
       validity = nullptr;
     }
-    return arrow::MakeArray(
-        arrow::ArrayData::Make(state.column.engine, count, {validity, values}, nulls));
+    return arrow::MakeArray(arrow::ArrayData::Make(state.column.engine, /*length=*/count,
+                                                   {validity, values}, null_count));
   }
 
-  arrow::Status Skip(ColumnState& state, int64_t rows) {
+  static arrow::Status Skip(ColumnState& state, int64_t rows) {
     switch (state.column.physical) {
       case Physical::kInt32:
         return SkipRows(static_cast<parquet::Int32Reader&>(*state.reader), rows);
@@ -529,7 +528,7 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
   // A failure while reading the file is an I/O error naming it (exit code 3), except running out
   // of the query's memory; the filter's own errors pass through unchanged.
   arrow::Status FileError(const arrow::Status& status) const {
-    if (!status.IsIOError() || status.message().find(segment_.path) != std::string::npos) {
+    if (!status.IsIOError() || status.message().contains(segment_.path)) {
       return status;
     }
     return arrow::Status::IOError("cannot read Parquet file '", segment_.path,

@@ -611,22 +611,17 @@ bool ParquetTable::supports_scan_filter(const std::vector<int>& fields) const {
   if (metadata_.empty()) {
     return false;
   }
-  for (const int field : fields) {
-    if (field < 0 || field >= schema_->num_fields()) {
-      return false;
-    }
-    if (!FilteredColumnOf(*metadata_.front(), leaf_of_field_[Narrow<std::size_t>(field)],
-                          *storage_schema_->field(field)->type(), *schema_->field(field)->type())
-             .has_value()) {
-      return false;
-    }
-  }
-  return true;
+  return std::ranges::all_of(fields, [&](int field) {
+    return field >= 0 && field < schema_->num_fields() &&
+           FilteredColumnOf(*metadata_.front(), leaf_of_field_[Narrow<std::size_t>(field)],
+                            *storage_schema_->field(field)->type(), *schema_->field(field)->type())
+               .has_value();
+  });
 }
 
 arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> ParquetTable::DoScanPartFiltered(
     int64_t part, const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool,
-    std::shared_ptr<const plan::ScanFilter> filter) const {
+    const std::shared_ptr<const plan::ScanFilter>& filter) const {
   if (part < 0 || part >= num_parts()) {
     return arrow::Status::Invalid("scan of part ", part, " of a table with ", num_parts(),
                                   " parts");
@@ -656,7 +651,7 @@ arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> ParquetTable::DoScanPar
                                   .footer = footers_[p.file],
                                   .row_groups = std::vector<int>{p.row_group}},
                           std::move(columns), arrow::schema(std::move(engine_fields)), batch_size,
-                          pool, std::move(filter));
+                          pool, filter);
 }
 
 bool ParquetTable::StoredAsFloat(int field) const {

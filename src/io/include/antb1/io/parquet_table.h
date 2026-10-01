@@ -82,7 +82,7 @@ class ParquetTable final : public plan::Table {
   // column (filtered_scan.h).
   arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScanPartFiltered(
       int64_t part, const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool,
-      std::shared_ptr<const plan::ScanFilter> filter) const override;
+      const std::shared_ptr<const plan::ScanFilter>& filter) const override;
 
  private:
   // One row group of one file.

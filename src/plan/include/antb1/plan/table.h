@@ -112,11 +112,11 @@ class Table {
   // supports_scan_filter(fields) is false.
   arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> ScanPart(
       int64_t part, const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool,
-      std::shared_ptr<const ScanFilter> filter) const {
+      const std::shared_ptr<const ScanFilter>& filter) const {
     if (filter == nullptr) {
       return DoScanPart(part, fields, batch_size, pool);
     }
-    return DoScanPartFiltered(part, fields, batch_size, pool, std::move(filter));
+    return DoScanPartFiltered(part, fields, batch_size, pool, filter);
   }
 
   // The exact statistics of top-level field `field` in part `part`, if known and integer-valued;
@@ -156,13 +156,8 @@ class Table {
   }
   // ScanPart with a filter, for tables that support it.
   virtual arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScanPartFiltered(
-      int64_t part, const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool,
-      std::shared_ptr<const ScanFilter> filter) const {
-    static_cast<void>(part);
-    static_cast<void>(fields);
-    static_cast<void>(batch_size);
-    static_cast<void>(pool);
-    static_cast<void>(filter);
+      int64_t /*part*/, const std::vector<int>& /*fields*/, int64_t /*batch_size*/,
+      arrow::MemoryPool* /*pool*/, const std::shared_ptr<const ScanFilter>& /*filter*/) const {
     return arrow::Status::NotImplemented("this table cannot filter while it scans");
   }
 };
