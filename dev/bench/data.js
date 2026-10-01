@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790866077229,
+  "lastUpdate": 1790876672549,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -3228,6 +3228,90 @@ window.BENCHMARK_DATA = {
             "value": 8.900860192307702,
             "unit": "ms/iter",
             "extra": "iterations: 78\ncpu: 8.900133666666664 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "6e523d5ff721888393170df5d95f8b512c3adcd3",
+          "message": "perf(exec,io): push WHERE predicates into late-materialization scans (#66)\n\n## Summary\n\nThis PR makes the narrow scans of late materialization (ADR 0016) apply\npushed WHERE predicates too. These are the scans that `ORDER BY ...\nLIMIT` uses over many columns, and #65 left them out. This is the ADR\n0020 follow-up for row ids.\n\n**Why they were left out:** a narrow scan's row ids name each row's\nposition in its part, and the scan counted rows to get them. A pushed\nfilter drops rows, so the count no longer gives the position.\n\n**Result:** Q23 (`SELECT *` with a URL LIKE, `ORDER BY ... LIMIT 10`)\ngoes from 0.82 s to 0.56 s (1.47×) at 128 threads. Its URL LIKE now runs\non views into the decoded pages, as Q20-Q22 do since #65.\n\n**`plan` (`table.h`):** the filtered `ScanPart` takes `positions`. With\nit, every batch ends with a `position` column (INT64, not null) holding\neach row's position in the part. Positions increase. Asking for\npositions without a filter is Invalid.\n\n**`io` (`filtered_scan.cc`):** the reader tracks each batch's first row\nin the row group and builds the positions from the selection's set-bit\nruns, allocating from the pool. A batch the filter empties still\nadvances the position.\n\n**`exec`:**\n- **`TableScanOperator`:** a narrow scan with pushed predicates re-binds\nthem from output positions to the early columns it reads\n(`NarrowFilter`). A predicate on a late column is Invalid. The scan asks\nthe table for positions and makes the row ids from them.\n- The positions column must be last, INT64 and without NULLs, and its\nvalues must lie in `[0, 2^32)`. Anything else is Invalid.\n- **Planner:** the `Filter` builder now pushes into narrow scans too,\nchecking `supports_scan_filter` on the fields actually read\n(`ReadFields`).\n- **`PartTopNOperator::Fetch`:** unchanged. It already fetches late\ncolumns by row id.\n\n**Docs:**\n- **ADR 0020:** narrow scans are filtered, with the positions contract.\nPage skipping by statistics and per-dictionary-entry evaluation are now\nmarked deferred until a dataset needs them: the ClickBench files have no\npage index and large pages, and their long strings are mostly\nplain-encoded.\n- **ADR 0016:** a line on filtered narrow scans.\n- **`docs/architecture.md`:** the \"Filtering while scanning\" paragraph.\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [x] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full          # lint, ci, asan, tidy, coverage, fuzz-smoke, ci-gcc (final commit 0041e61)\ncheck-full exit 0; 100% tests passed out of 1426; Coverage gate: PASS\n$ pixi run tsan                # 7c91ec0; only a test was tidied after it\n100% tests passed out of 1426\n$ ANTB1_DIFF_COUNT=20000 pixi run diff-random   # cc9a5e8; later commits add checks and tests only\nDIFF: PASS seed=704071166 queries=20000 failed=0 unsupported=0\n$ pixi run test-data\n100% tests passed out of 6\n```\n\n**Speed:** a paired A/B of release builds against main 1e38331 (#65),\nall 43 ClickBench queries at 128 threads (3 binary paths × best of 3,\nmedians):\n- **Q23:** 0.818 s → 0.557 s, and 0.820 s → 0.558 s on a re-run.\n- **Total:** 20.24 s → 19.87 s.\n- **Other queries:** only Q23 runs a filtered narrow scan, so nothing\nelse should change. In the full run a few were 3-6% apart either way. I\nre-ran every query that was more than 3% slower, and all came back\nwithin ±3% of main: Q1, Q5, Q12, Q21, Q24, Q32.\n\n**Tests:**\n- **io parity (`parquet_filter_test.cc`):** with `positions`, every\nfilter case, encoding, batch size (1 to 64Ki) and part must give the\nunfiltered rows that pass, plus their positions in the part. The OOM\nsweep runs with positions, and positions without a filter are Invalid. A\nmutation that drops the batch's first-row offset fails the test.\n- **`OperatorsTest`:**\n- **`FilteredNarrowScanNumbersTheRowsThatPass`:** row ids are the\npassing rows' positions at batch sizes 1, 2 and 64, including emptied\nbatches. A predicate on a late column is Invalid.\n- **`FilteredNarrowScanChecksThePositions`:** a stub table returns\nbatches without positions, with non-INT64, NULL, negative or past-2^32\npositions, or with INT64 max. All of these are Invalid.\n- **`PhysicalPlannerTest.LateScansAreFiltered`:** the plan stays late\nand the narrow Scan shows `2 pushed predicates`. The results, late\ncolumns included, equal those without pushdown, for ASC and DESC at\nbatch sizes 1, 3 and 64.\n- **`MemoryTable`:** reports positions, so the exec, parallel and\nprofile tests cover the path.\n- **`where/pushdown.slt`:** three `ORDER BY ... LIMIT` queries that take\nthe late path (checked with `explain --analyze`). Expectations come from\nDuckDB.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer (none touched)\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code wrote the code,\ntests and docs, measured the change and ran the gates.\n  - A read-only reviewer agent found no P0.\n- It raised two P1s about the change, both done: survey figures came out\nof the ADR, and tests were added for the narrow scan's position checks\n(with an overflow-safe bound).\n- Its third P1 was an untracked local file, which is not part of the PR.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-10-01T20:42:15+03:00",
+          "tree_id": "02126bb69ee9062833a5b5755ac2258a89a41d10",
+          "url": "https://github.com/ydb-campus/antb1/commit/6e523d5ff721888393170df5d95f8b512c3adcd3"
+        },
+        "date": 1790876671789,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 2694.7603808081026,
+            "unit": "ns/iter",
+            "extra": "iterations: 280036\ncpu: 2694.0161872045023 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 73317.93909799261,
+            "unit": "ns/iter",
+            "extra": "iterations: 9113\ncpu: 73295.372434983 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 76910.80771782328,
+            "unit": "ns/iter",
+            "extra": "iterations: 9044\ncpu: 76909.72036709423 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 270476.6360108678,
+            "unit": "ns/iter",
+            "extra": "iterations: 2577\ncpu: 270451.8711680248 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 321257.84210525407,
+            "unit": "ns/iter",
+            "extra": "iterations: 2185\ncpu: 321250.6118993135 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 1912498.9247911405,
+            "unit": "ns/iter",
+            "extra": "iterations: 359\ncpu: 1912201.571030639 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 41.92175244444406,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 41.898662111111086 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 37.309189888888895,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 37.28911661111114 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 155.3821309999961,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 155.1969390000001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 9.706669249999955,
+            "unit": "ms/iter",
+            "extra": "iterations: 72\ncpu: 9.70454188888888 ms\nthreads: 1"
           }
         ]
       }
