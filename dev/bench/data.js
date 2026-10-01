@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790859356427,
+  "lastUpdate": 1790866077229,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -3144,6 +3144,90 @@ window.BENCHMARK_DATA = {
             "value": 14.397367510203864,
             "unit": "ms/iter",
             "extra": "iterations: 49\ncpu: 14.3970258367347 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1e38331ecba14c29a5376dd7b1fd84dbc0b832d6",
+          "message": "perf(exec): push WHERE predicates on scan columns into the scan (#65)\n\n## Summary\n\nThis is the executor side of filter pushdown into the scan (ADR 0020,\n`docs/adr/0020-filter-pushdown.md`; the io side is #64). The WHERE\npredicates on scan columns are now applied while the scan decodes:\nstrings are matched on views into the decoded pages, and only the rows\nthat pass are copied.\n\n**Result:** the 43 ClickBench queries went from 21.09 s to 19.50 s at\n128 threads (−7.5%). Q20-Q22 (LIKE over long strings) are 1.57-1.75×\nfaster.\n\n**`exec` (`src/exec/scan_filter.{h,cc}`, new):**\n- **`PushableToScan`:** a predicate is pushed when it reads one column\nagainst literals: `<op>`, `[NOT] IN`, `[NOT] LIKE`, `IS NOT NULL`. These\nstay in the `Filter`:\n  - comparisons of two columns;\n  - `IS TRUE` of a computed condition;\n- a folded `FALSE` (the Filter ends the stream without reading\nanything).\n- **`MakeScanFilter`** implements `plan::ScanFilter`, with the same rows\nas `FilterOperator`:\n- **fixed-width columns:** the Filter's own `PredicateEvaluator` on the\none-column array, combined into the selection with bitmap ANDs (NULL\nfails);\n- **VARCHAR views:** `LikePattern::Matches`, bytewise `<op>` (unsigned,\nas Arrow's kernels), IN / NOT IN by binary search, and validity for\nNULL.\n- **`TableScanOperator`** takes the pushed predicates and builds the\nfilter at `Open`, so its kernels allocate from the query's pool.\n- **Physical planner:** a `Filter` directly over the scan of a part\npipeline pushes what it can when the table `supports_scan_filter` the\nscanned fields, and keeps the rest.\n- Not pushed: late materialization's narrow scans (ADR 0016), whose row\nids count the part's rows.\n  - `KeptParts` (row groups by statistics) is unchanged and runs first.\n- **`explain --analyze`:** the `Scan` line ends with `, N pushed\npredicates`, and its `rows` are those that passed.\n\n**`io` (`src/io/filtered_scan.cc`), speedups to #64's read path:** a\nfirst A/B showed a constant ~20 ms regression on queries that read few\nrow groups (Q1, Q7, Q19, Q40-Q42). Profiling put it in the fixed-width\npath, which now:\n- decodes straight into a pool buffer, which becomes the array when no\nrow is NULL (no second copy);\n- converts with one type dispatch per batch, not per row;\n- compacts selected rows by runs (`VisitSetBitRunsVoid`, `CopyBitmap`),\nnot row by row;\n- reserves string builders per piece and appends unchecked.\n\nIt also gives the decode buffers back to the pool at `Close`.\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [x] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full          # lint, ci, asan, tidy, coverage, fuzz-smoke, ci-gcc (final commit f7cad91)\ncheck-full exit 0; 100% tests passed out of 1424; Coverage gate: PASS\n$ pixi run tsan\n100% tests passed out of 1424\n$ ANTB1_DIFF_COUNT=20000 pixi run diff-random\nDIFF: PASS seed=3711224658 queries=20000 failed=0 unsupported=0\n$ pixi run test-data\n100% tests passed out of 6\n```\n\n**Speed:** a paired A/B of release builds against main 97d2e2d, all 43\nClickBench queries on the full data at 128 threads (3 binary paths ×\nbest of 3, medians, alternating order):\n- **Total:** 21.09 s → 19.50 s.\n- **Faster by more than 5%:**\n\n  | Queries | Change |\n  | --- | --- |\n  | Q20, Q21, Q22 | −40%, −36%, −43% |\n  | Q27, Q38 | −27%, −24% |\n  | Q1, Q36, Q37, Q39 | −12% to −22% |\n  | Q7, Q19, Q26, Q29 | −6% to −12% |\n\n- **Slower by more than 3%:**\n- Q5: +3.7% in the full run, −0.2% on a re-run. It has no WHERE, so this\nis noise.\n- Q12 (a string `<>` filter feeding a GROUP BY): +3.9% in the full run,\nthen +0.1% and +2.0% on re-runs, at 128 threads only. On 1 thread it is\n16% faster (9.81 s → 8.26 s), and on 16 threads 6% faster. Its profile\nat 128 threads shows more time in the shared memory budget's counters.\n\n**Tests:**\n- **`src/exec/tests/scan_filter_test.cc` (new):** the scan filter must\nkeep exactly the rows the Filter operator keeps, for:\n  - every pushed kind and every comparison operator;\n- BIGINT, INTEGER, DOUBLE (NaN, ±0, ±inf) and VARCHAR (bytes above 0x7f,\nempty strings, with and without NULLs);\n  - LIKE patterns with `%`/`_`, IN with NaN, and conjunctions;\n  - views in pieces of 1, 3 and 64 rows, at selection offsets 0 and 5.\n\nIt also checks malformed predicates and values (errors, nothing cleared)\nand `columns()` order. Mutations of a string comparison, of view NULL\nhandling and of fixed-width NULL handling each fail it.\n- **Planner (`physical_planner_test.cc`):**\n- pushed vs kept predicates, with the same rows with and without\npushdown at batch sizes 1, 3 and 64;\n  - the profile detail;\n  - nothing pushed with only a column comparison;\n  - `FALSE`: nothing pushed or scanned;\n  - late scans are not filtered.\n- **`TableScanOperator`:** predicates without a part, or with a late\nscan, are Invalid.\n- **`MemoryTable`** (exec tests) now applies scan filters as a Parquet\ntable does: VARCHAR as views, 3 rows at a time. So every exec, parallel\nand profile test with a split table runs through pushdown.\n- **`tests/slt/cases/where/pushdown.slt` (new):** pushed and kept\npredicates mixed over parts, NULLs and every column type. Expectations\nfrom DuckDB (`pixi run slt-complete`).\n- **Changed expectations:** the profile test and the two\n`explain_analyze` CLI goldens now show the pushed count and the Scan's\npassing rows.\n\n**Docs:** ADR 0020 (the executor bullet; status unchanged),\n`docs/architecture.md` (\"Filtering while scanning\"),\n`docs/sql-subset.md` (`explain --analyze`).\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer (none touched)\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code wrote the code,\ntests and docs, profiled and measured the change, and ran the gates. A\nread-only reviewer agent found no P0/P1 in the code.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-10-01T17:46:04+03:00",
+          "tree_id": "294c110298aa27d44d96732e829f2d943454bf6f",
+          "url": "https://github.com/ydb-campus/antb1/commit/1e38331ecba14c29a5376dd7b1fd84dbc0b832d6"
+        },
+        "date": 1790866076849,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 2275.197033242222,
+            "unit": "ns/iter",
+            "extra": "iterations: 332619\ncpu: 2275.117007747603 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 65424.40746382325,
+            "unit": "ns/iter",
+            "extra": "iterations: 10504\ncpu: 65420.595392231546 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 72588.23191686295,
+            "unit": "ns/iter",
+            "extra": "iterations: 9719\ncpu: 72580.587509003 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 264321.608897481,
+            "unit": "ns/iter",
+            "extra": "iterations: 2585\ncpu: 264300.7036750484 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 267827.5385474845,
+            "unit": "ns/iter",
+            "extra": "iterations: 2685\ncpu: 267802.59031657374 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 1548903.6638477987,
+            "unit": "ns/iter",
+            "extra": "iterations: 473\ncpu: 1548741.401691332 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 31.055285363636514,
+            "unit": "ms/iter",
+            "extra": "iterations: 22\ncpu: 31.047742863636348 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 30.120144916666664,
+            "unit": "ms/iter",
+            "extra": "iterations: 24\ncpu: 30.11560108333333 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 136.74122920000116,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 136.70694579999994 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 8.900860192307702,
+            "unit": "ms/iter",
+            "extra": "iterations: 78\ncpu: 8.900133666666664 ms\nthreads: 1"
           }
         ]
       }
