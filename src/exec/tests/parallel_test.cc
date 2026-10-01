@@ -283,10 +283,11 @@ class PartOperatorsTest : public testing::ExecTest {
 
   // Runs the plan on `executor` (nullptr: one thread) in batches of 3 rows.
   static arrow::Result<std::shared_ptr<arrow::Table>> Run(const plan::LogicalPlan& plan,
-                                                          arrow::internal::Executor* executor) {
+                                                          arrow::internal::Executor* executor,
+                                                          int64_t batch_size = 3) {
     ARROW_ASSIGN_OR_RAISE(auto op, BuildPhysicalPlan(plan));
     ExecContext ctx{.pool = arrow::default_memory_pool(),
-                    .batch_size = 3,
+                    .batch_size = batch_size,
                     .executor = executor,
                     .threads = executor == nullptr ? 1 : kThreads};
     return Drain(*op, ctx);
@@ -920,6 +921,10 @@ TEST_F(PartOperatorsTest, TopNKeepsEachPartsFirstRows) {
 // every group: rows [offset, offset + limit) of the stably sorted groups, on any number of threads.
 TEST_F(PartOperatorsTest, GroupedTopNIsTheTopNOfAllGroups) {
   const auto pool = Pool();
+  // Batches of 50 rows, not 3: about 120 plans run over 3000 rows, which under ASan must stay well
+  // inside the test timeout. The partitions' groups, not the batches, decide what a partition
+  // drops.
+  constexpr int64_t kBatch = 50;
   // Many groups per partition (so that a partition drops rows): 12 parts of 250 rows, x = 0..2999,
   // y = x % 1500 (NULL where it is a multiple of 7), so 1 to 3 rows per group and many ties.
   const auto table = [] {
@@ -966,7 +971,8 @@ TEST_F(PartOperatorsTest, GroupedTopNIsTheTopNOfAllGroups) {
       {{.column = key, .descending = true}}};
   for (const auto& order : orders) {
     const auto sorted =
-        Run(PlanOf(Node(plan::SortNode{.input = grouped(table()), .keys = order}), 3), pool.get());
+        Run(PlanOf(Node(plan::SortNode{.input = grouped(table()), .keys = order}), 3), pool.get(),
+            kBatch);
     ASSERT_TRUE(sorted.ok()) << sorted.status().ToString();
     for (const auto& [limit, offset] : std::vector<std::pair<int64_t, int64_t>>{
              {1, 0}, {3, 2}, {10, 0}, {40, 30}, {50, 1300}, {10, 2000}}) {
@@ -981,7 +987,7 @@ TEST_F(PartOperatorsTest, GroupedTopNIsTheTopNOfAllGroups) {
       for (arrow::internal::Executor* executor :
            {static_cast<arrow::internal::Executor*>(nullptr),
             static_cast<arrow::internal::Executor*>(pool.get())}) {
-        const auto result = Run(plan, executor);
+        const auto result = Run(plan, executor, kBatch);
         ASSERT_TRUE(result.ok()) << result.status().ToString();
         EXPECT_TRUE(SameRows(**result, *expected))
             << order.size() << " keys, limit " << limit << " offset " << offset << "\n"
