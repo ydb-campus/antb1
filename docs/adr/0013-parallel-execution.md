@@ -168,7 +168,10 @@ The maintainer asked for this design to be ready for TPC-H: hash joins, and corr
    first 4096 rows hardly reduce (more groups than 3/4 of them) sends its other rows straight to the partitions,
    which aggregate them after the part's own groups. Part order and the results stay as before; plans with a
    DOUBLE SUM or AVG (their rounding follows the parts) or a HUGEINT one (its overflow check follows the order of
-   the additions) keep the parts' own tables.
+   the additions) keep the parts' own tables. Amended 2026-10-01: the part decides after its first 65536 rows (a batch,
+   not 4096, whose groups overstate the part's) and routes when its groups are more than 1/4 of its rows (not
+   3/4): a part that reduces less than 4 to 1 inserts most groups twice, which costs more than inserting its rows
+   once. On the full data Q33 and Q34 went 1.84 s → 1.49 s.
 5. **exec:** the top-N sink (every part keeps its first rows, merged in part order). A full `ORDER BY` without
    `LIMIT` still sorts the part union on one thread; a k-way merge of sorted parts is its follow-up.
 6. **io and exec** (follow-up): skipping parts by their footer statistics (integer-valued columns, predicates
