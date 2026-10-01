@@ -34,8 +34,6 @@ arrow::Status MemoryBudget::Allocate(int64_t size, int64_t alignment, uint8_t** 
     Uncharge(size);
     return status;
   }
-  total_.fetch_add(size, std::memory_order_relaxed);
-  count_.fetch_add(1, std::memory_order_relaxed);
   return status;
 }
 
@@ -54,10 +52,7 @@ arrow::Status MemoryBudget::Reallocate(int64_t old_size, int64_t new_size, int64
   }
   if (growth < 0) {
     Uncharge(-growth);
-  } else {
-    total_.fetch_add(growth, std::memory_order_relaxed);
   }
-  count_.fetch_add(1, std::memory_order_relaxed);
   return status;
 }
 

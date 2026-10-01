@@ -15,7 +15,9 @@ namespace antb1::exec {
 // for their own containers (Reserve), against an optional limit. An allocation or reservation
 // that would pass the limit fails with Status::OutOfMemory and leaves nothing behind; the count
 // is atomic, so concurrent threads never pass the limit together. Thread-safe. Buffers must not
-// outlive the budget (hold it by std::shared_ptr).
+// outlive the budget (hold it by std::shared_ptr). An allocation updates one shared counter (and
+// the peak when it grows): the statistics a budget does not need for its limit, total bytes and
+// number of allocations, are its backend's.
 class MemoryBudget final : public arrow::MemoryPool {
  public:
   explicit MemoryBudget(std::optional<int64_t> limit,
@@ -38,8 +40,8 @@ class MemoryBudget final : public arrow::MemoryPool {
   void ResetPeak() {
     peak_.store(used_.load(std::memory_order_relaxed), std::memory_order_relaxed);
   }
-  int64_t total_bytes_allocated() const override { return total_.load(std::memory_order_relaxed); }
-  int64_t num_allocations() const override { return count_.load(std::memory_order_relaxed); }
+  int64_t total_bytes_allocated() const override { return backend_->total_bytes_allocated(); }
+  int64_t num_allocations() const override { return backend_->num_allocations(); }
   std::string backend_name() const override { return backend_->backend_name(); }
 
   // Charges `bytes` of memory held outside Arrow buffers (e.g. the vectors of a grouped
@@ -59,10 +61,10 @@ class MemoryBudget final : public arrow::MemoryPool {
 
   std::optional<int64_t> limit_;
   arrow::MemoryPool* backend_;
-  std::atomic<int64_t> used_ = 0;
-  std::atomic<int64_t> peak_ = 0;
-  std::atomic<int64_t> total_ = 0;
-  std::atomic<int64_t> count_ = 0;
+  // Each on a cache line of its own: every thread's allocations update used_, and peak_ only
+  // while it grows.
+  alignas(64) std::atomic<int64_t> used_ = 0;
+  alignas(64) std::atomic<int64_t> peak_ = 0;
 };
 
 // The bytes an operator's own containers hold, charged to a budget: Resize(total) reserves the

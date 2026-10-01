@@ -37,7 +37,8 @@ constexpr int64_t kGiB = int64_t{1024} * 1024 * 1024;
 // ---- MemoryBudget ----
 
 TEST(MemoryBudgetTest, CountsBuffersAndReservationsAgainstTheLimit) {
-  MemoryBudget budget(1000);
+  arrow::ProxyMemoryPool backend(arrow::default_memory_pool());
+  MemoryBudget budget(1000, &backend);
   EXPECT_EQ(budget.limit(), 1000);
   uint8_t* a = nullptr;
   ASSERT_TRUE(budget.Allocate(600, &a).ok());
@@ -60,7 +61,11 @@ TEST(MemoryBudgetTest, CountsBuffersAndReservationsAgainstTheLimit) {
   budget.Free(a, 100);
   EXPECT_EQ(budget.bytes_allocated(), 0);
   EXPECT_EQ(budget.max_memory(), 1000);
-  EXPECT_EQ(budget.num_allocations(), 2);
+  // Totals are the backend's: what reached it. The refused requests did not; Arrow counts the one
+  // allocation (a shrinking reallocation adds no allocation and no bytes).
+  EXPECT_EQ(budget.num_allocations(), backend.num_allocations());
+  EXPECT_EQ(budget.total_bytes_allocated(), backend.total_bytes_allocated());
+  EXPECT_EQ(budget.num_allocations(), 1);
   EXPECT_EQ(budget.total_bytes_allocated(), 600);
   EXPECT_FALSE(budget.backend_name().empty());
   EXPECT_TRUE(budget.Reserve(0).ok());
