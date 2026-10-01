@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790876672549,
+  "lastUpdate": 1790877398775,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -3312,6 +3312,90 @@ window.BENCHMARK_DATA = {
             "value": 9.706669249999955,
             "unit": "ms/iter",
             "extra": "iterations: 72\ncpu: 9.70454188888888 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "875379c27fe60f5536c9433adfbdeefde02f64f7",
+          "message": "test(exec): run the grouped top-N test in larger batches to fit the ASan timeout (#67)\n\n## Summary\n\n`exec.PartOperatorsTest.GroupedTopNIsTheTopNOfAllGroups` (from #61)\ntimed out in `clang-asan` on #66, at 120 s. That test does not touch\n#66's code; a re-run passed.\n- **Already near the limit:** it takes 68 s on main's CI ASan runs, and\n30 s locally, while its sibling tests take at most 4 s.\n- **A slow runner:** on #66's first attempt every test ran about 2×\nslower (the whole suite 285 s vs 161 s), which pushed this one over the\ntimeout.\n\n**Why it is slow:** it runs about 120 plans (5 orders × 6 limit/offset\npairs × serial and parallel) over 3000 rows in batches of 3 rows, so\neach plan reads about 1000 batches.\n\n**The change:** this test now runs its plans in batches of 50 rows.\n`Run` gets an optional `batch_size`, default 3, so other tests are\nunchanged. The orders, limits, offsets, executors and assertions are the\nsame. What a partition drops is decided by its groups, not by batch\nsize, and the out-of-memory part still uses batches of 3.\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [x] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full          # lint, ci, asan, tidy, coverage, fuzz-smoke, ci-gcc\ncheck-full exit 0; 100% tests passed out of 1424; Coverage gate: PASS\nASan time of the test (local junit): 29.9 s -> 6.5 s; dev build 1.3 s\n```\n\n**The test still catches the bug it was written for:** passing `keep -\n1` to `KeepFirstRows` in `PartGroupAggregateOperator` fails it.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer (none touched)\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code found the cause\nin the CI logs, made the change, checked it with the mutation above and\nran the gates.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-10-01T20:53:55+03:00",
+          "tree_id": "d8d254e7cda97a29e4fa529781f6744e0aefa3f7",
+          "url": "https://github.com/ydb-campus/antb1/commit/875379c27fe60f5536c9433adfbdeefde02f64f7"
+        },
+        "date": 1790877397937,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4024.928897731892,
+            "unit": "ns/iter",
+            "extra": "iterations: 174903\ncpu: 4024.2387094560986 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 94530.11910426682,
+            "unit": "ns/iter",
+            "extra": "iterations: 7145\ncpu: 94520.80181945417 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 124909.1745946871,
+            "unit": "ns/iter",
+            "extra": "iterations: 5613\ncpu: 124895.6274719402 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 485916.5392088758,
+            "unit": "ns/iter",
+            "extra": "iterations: 1441\ncpu: 485635.20610687067 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 456629.2426805449,
+            "unit": "ns/iter",
+            "extra": "iterations: 1537\ncpu: 456448.638256344 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2250713.1993568805,
+            "unit": "ns/iter",
+            "extra": "iterations: 311\ncpu: 2249826.742765274 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 52.107899769230066,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 52.0989026153846 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 48.19884935714315,
+            "unit": "ms/iter",
+            "extra": "iterations: 14\ncpu: 48.17185407142859 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 230.0027439999989,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 229.95865533333298 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 15.06264636170267,
+            "unit": "ms/iter",
+            "extra": "iterations: 47\ncpu: 15.060442595744675 ms\nthreads: 1"
           }
         ]
       }
