@@ -8,6 +8,7 @@ antb1_add_module(
     aggregate_state.cc
     table_scan.cc
     filter.cc
+    scan_filter.cc
     compute.cc
     parallel_compute.cc
     like.cc
@@ -46,6 +47,7 @@ if(ANTB1_BUILD_TESTS)
       tests/grouped_aggregate_test.cc
       tests/sort_test.cc
       tests/like_test.cc
+      tests/scan_filter_test.cc
       tests/parallel_test.cc
       tests/heavy_hitters_test.cc
       tests/partition_lanes_test.cc

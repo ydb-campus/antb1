@@ -7,12 +7,17 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 #include <arrow/api.h>
+#include <arrow/compute/api_vector.h>
+#include <arrow/compute/exec.h>
 #include <arrow/compute/initialize.h>
+#include <arrow/util/bit_util.h>
 #include <gtest/gtest.h>
 
 #include "antb1/exec/operator.h"
@@ -101,7 +106,8 @@ class VectorReader final : public arrow::RecordBatchReader {
 
 // An in-memory table: fixed batches, re-sliced to the scan's batch size; counts its scans. With
 // `split`, every batch is a part (plan::Table::ScanPart); the table records which parts were
-// scanned and can make one part fail. Safe to scan from several threads.
+// scanned, can make one part fail, and applies scan filters as a Parquet table does (VARCHAR
+// columns as views, a few rows at a time). Safe to scan from several threads.
 class MemoryTable final : public plan::Table {
  public:
   MemoryTable(std::shared_ptr<arrow::Schema> schema, arrow::RecordBatchVector batches,
@@ -140,6 +146,13 @@ class MemoryTable final : public plan::Table {
   // With `split`: exact statistics of the BIGINT columns (plan::Table::part_stats), unless turned
   // off here.
   void set_stats(bool stats) { stats_ = stats; }
+  // With `split`: whether the table applies scan filters (on unless turned off here), and how
+  // many filtered scans of a part it made.
+  void set_scan_filter(bool on) { scan_filter_ = on; }
+  bool supports_scan_filter(const std::vector<int>& /*fields*/) const override {
+    return split_ && scan_filter_;
+  }
+  [[nodiscard]] int filtered_scans() const { return filtered_scans_; }
   std::optional<plan::PartStats> part_stats(int64_t part, int field) const override {
     if (!split_ || !stats_ || part < 0 || part >= num_parts() || field < 0 ||
         field >= schema_->num_fields() ||
@@ -189,6 +202,68 @@ class MemoryTable final : public plan::Table {
     }
     return Read({Batch(part)}, fields, batch_size);
   }
+  arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScanPartFiltered(
+      int64_t part, const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool,
+      const std::shared_ptr<const plan::ScanFilter>& filter) const override {
+    if (!split_ || !scan_filter_) {
+      return plan::Table::DoScanPartFiltered(part, fields, batch_size, pool, filter);
+    }
+    ++filtered_scans_;
+    ARROW_ASSIGN_OR_RAISE(auto reader, DoScanPart(part, fields, batch_size, pool));
+    arrow::RecordBatchVector out;
+    while (true) {
+      std::shared_ptr<arrow::RecordBatch> batch;
+      ARROW_RETURN_NOT_OK(reader->ReadNext(&batch));
+      if (batch == nullptr) {
+        break;
+      }
+      const int64_t rows = batch->num_rows();
+      ARROW_ASSIGN_OR_RAISE(auto selected, arrow::AllocateEmptyBitmap(rows, pool));
+      arrow::bit_util::SetBitsTo(selected->mutable_data(), 0, rows, true);
+      for (std::size_t k = 0; k < filter->columns().size(); ++k) {
+        const int column = static_cast<int>(k);
+        const auto& values = batch->column(filter->columns()[k]);
+        if (values->type_id() != arrow::Type::BINARY) {
+          ARROW_RETURN_NOT_OK(filter->Apply(
+              column,
+              plan::ScanValues{.array = values, .strings = {}, .validity = nullptr, .rows = rows},
+              0, selected->mutable_data()));
+          continue;
+        }
+        const auto& strings = static_cast<const arrow::BinaryArray&>(*values);
+        constexpr int64_t kPiece = 3;  // rows per call, as a Parquet table applies a page piece
+        for (int64_t start = 0; start < rows; start += kPiece) {
+          const int64_t n = std::min(kPiece, rows - start);
+          std::vector<std::string_view> views;
+          std::vector<std::uint8_t> valid(1, 0);
+          for (int64_t i = 0; i < n; ++i) {
+            views.push_back(strings.IsNull(start + i) ? std::string_view()
+                                                      : strings.GetView(start + i));
+            if (strings.IsValid(start + i)) {
+              arrow::bit_util::SetBit(valid.data(), i);
+            }
+          }
+          ARROW_RETURN_NOT_OK(filter->Apply(
+              column,
+              plan::ScanValues{.array = nullptr,
+                               .strings = std::span<const std::string_view>(views),
+                               .validity = strings.null_count() > 0 ? valid.data() : nullptr,
+                               .rows = n},
+              start, selected->mutable_data()));
+        }
+      }
+      const auto mask = std::make_shared<arrow::BooleanArray>(rows, std::move(selected));
+      // The rows that pass are copied into `pool`, as a Parquet table copies them.
+      arrow::compute::ExecContext kernels(pool);
+      ARROW_ASSIGN_OR_RAISE(
+          const arrow::Datum kept,
+          arrow::compute::Filter(batch, mask, arrow::compute::FilterOptions::Defaults(), &kernels));
+      if (kept.record_batch()->num_rows() > 0) {
+        out.push_back(kept.record_batch());
+      }
+    }
+    return std::make_unique<VectorReader>(reader->schema(), std::move(out));
+  }
 
  private:
   [[nodiscard]] const std::shared_ptr<arrow::RecordBatch>& Batch(int64_t part) const {
@@ -227,6 +302,8 @@ class MemoryTable final : public plan::Table {
   std::optional<int64_t> failing_part_;
   std::optional<int> failing_field_;
   bool stats_ = true;
+  bool scan_filter_ = true;
+  mutable std::atomic<int> filtered_scans_ = 0;
   mutable std::atomic<int> scans_ = 0;
   mutable std::mutex mutex_;
   mutable std::vector<int64_t> scanned_parts_;

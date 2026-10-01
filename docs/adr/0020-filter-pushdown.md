@@ -67,8 +67,13 @@ Proposed
   - **Fallback:** other column types (nested, BOOLEAN, TIMESTAMP, HUGEINT) are not supported.
     `supports_scan_filter` needs every scanned column to be supported, so a scan with one such column is not
     filtered at all, and the high-level path reads it as before.
-- **The executor** pushes the predicates of a part pipeline's scan into the scan, in a separate change. The logical
-  plan and EXPLAIN are unchanged; the Filter operator keeps only what was not pushed.
+- **The executor** pushes the predicates of a `Filter` directly over a part pipeline's scan into the scan, in a
+  separate change (`exec::MakeScanFilter`, `src/exec/include/antb1/exec/scan_filter.h`): those that read one
+  column against literals (`<op>`, `[NOT] IN`, `[NOT] LIKE`, `IS NOT NULL`).
+  - Fixed-width columns are evaluated with the Filter operator's own evaluator, VARCHAR views with LIKE's matcher
+    and bytewise comparisons.
+  - The logical plan and EXPLAIN are unchanged; the Filter operator keeps only what was not pushed, and
+    `explain --analyze` shows the count on the `Scan`.
 - **Not pushed (first version):** late materialization's narrow scans (ADR 0016), whose row ids count the part's
   rows. Predicates over two columns, or over computed values, stay in the Filter operator.
 

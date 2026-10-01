@@ -428,8 +428,8 @@ string(
   "lanes_tail=${_d} build=${_d} groups=4357[]]\n"
   "      Filter IsMobile = 1  [[]rows=5064 batches=11 parts=11 time=${_d} [(]summed over parts[)] "
   "self=${_d}[]]\n"
-  "        Scan table=t source=parquet[(]files=4, rows=10000[)] columns=[[]RegionID, IsMobile[]]  "
-  "[[]rows=10000 batches=11 parts=11 time=${_d} [(]summed over parts[)][]]$"
+  "        Scan table=t source=parquet[(]files=4, rows=10000[)] columns=[[]RegionID, IsMobile[]], "
+  "1 pushed predicate  [[]rows=5064 batches=11 parts=11 time=${_d} [(]summed over parts[)][]]$"
 )
 antb1_add_cli_golden(
   explain_analyze
@@ -457,7 +457,7 @@ string(
   "\"rows\":9640,\"batches\":11,\"time_ns\":${_n},\"self_time_ns\":${_n},\"metrics\":[{][}],"
   "\"inputs\":[[]"
   "[{]\"name\":\"Scan\",\"detail\":\"Scan table=t source=parquet[(]files=4, rows=10000[)] "
-  "columns=[[]RegionID[]]\",\"per_part\":true,\"runs\":11,\"rows\":10000,\"batches\":11,"
+  "columns=[[]RegionID[]], 1 pushed predicate\",\"per_part\":true,\"runs\":11,\"rows\":9640,\"batches\":11,"
   "\"time_ns\":${_n},\"self_time_ns\":${_n},\"metrics\":[{][}],\"inputs\":[[][]]"
   "[}][]][}][]][}][}]$"
 )

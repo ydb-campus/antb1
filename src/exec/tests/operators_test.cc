@@ -104,6 +104,15 @@ TEST_F(OperatorsTest, TableScanReadsTheFieldsInBatches) {
   // A bad field fails at Open.
   TableScanOperator bad(table, {7});
   EXPECT_TRUE(bad.Open(ctx).IsInvalid());
+  // Only the full scan of a part applies predicates.
+  const plan::Predicate not_null{.kind = plan::Predicate::Kind::kIsNotNull,
+                                 .column = testing::Column(0, "s", plan::LogicalType::kVarchar),
+                                 .span = {}};
+  TableScanOperator whole(table, {1, 0}, std::nullopt, std::nullopt, {not_null});
+  EXPECT_TRUE(whole.Open(ctx).IsInvalid());
+  TableScanOperator narrow(table, {1, 0}, 0,
+                           LateScan{.late = {false, true}, .row_id = 1, .ordinal = 0}, {not_null});
+  EXPECT_TRUE(narrow.Open(ctx).IsInvalid());
 }
 
 TEST_F(OperatorsTest, TableScanRenamesButNeverRetypes) {

@@ -21,6 +21,7 @@
 #include "antb1/exec/project.h"
 #include "antb1/exec/row_count.h"
 #include "antb1/exec/scalar_aggregate.h"
+#include "antb1/exec/scan_filter.h"
 #include "antb1/exec/sort.h"
 #include "antb1/exec/table_scan.h"
 #include "antb1/plan/explain.h"
@@ -289,6 +290,32 @@ struct Builder {
   }
   OperatorResult operator()(const plan::FilterNode& node) const {
     Name("Filter");
+    if (const auto* scan = std::get_if<plan::ScanNode>(node.input.get());
+        scan != nullptr && scan->table != nullptr && part.has_value() && late == nullptr &&
+        scan->table->supports_scan_filter(scan->fields)) {
+      // Filter pushdown (ADR 0020): the scan applies the predicates it can while it decodes.
+      std::vector<plan::Predicate> pushed;
+      std::vector<plan::Predicate> rest;
+      for (const plan::Predicate& predicate : node.predicates) {
+        (PushableToScan(predicate) ? pushed : rest).push_back(predicate);
+      }
+      if (!pushed.empty() && std::ranges::none_of(rest, [](const plan::Predicate& p) {
+            return p.kind == plan::Predicate::Kind::kFalse;
+          })) {
+        ProfileNode* input_slot = Input();
+        if (input_slot != nullptr && input_slot->name().empty()) {
+          input_slot->set_name("Scan");
+          input_slot->set_detail(std::format("{}, {} pushed predicate{}",
+                                             plan::ExplainNode(*node.input), pushed.size(),
+                                             pushed.size() == 1 ? "" : "s"));
+        }
+        ARROW_ASSIGN_OR_RAISE(auto input, Profiled(std::make_unique<TableScanOperator>(
+                                                       scan->table, scan->fields, part,
+                                                       std::nullopt, std::move(pushed)),
+                                                   node.input, input_slot));
+        return std::make_unique<FilterOperator>(std::move(input), std::move(rest));
+      }
+    }
     ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input, part, Input(), late));
     return std::make_unique<FilterOperator>(std::move(input), node.predicates);
   }

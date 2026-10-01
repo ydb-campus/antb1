@@ -8,6 +8,7 @@
 #include <arrow/record_batch.h>
 
 #include "antb1/exec/operator.h"
+#include "antb1/plan/logical_plan.h"
 #include "antb1/plan/table.h"
 
 namespace antb1::exec {
@@ -33,12 +34,15 @@ constexpr int64_t RowIdOffset(int64_t id) { return id % (kRowIdParts * 2); }
 // Reads the given top-level fields of a table (plan::Table::Scan), or of one of its parts
 // (plan::Table::ScanPart), in batches of at most ExecContext::batch_size rows. Only the referenced
 // fields are decoded; with no fields the batches carry row counts only. Output: the fields, in the
-// given order. With `late` (a part only), the late fields are not read (LateScan).
+// given order. With `late` (a part only), the late fields are not read (LateScan). With `pushed`
+// (a part only, without `late`), the table applies those WHERE predicates on the fields while it
+// scans (PushableToScan, docs/adr/0020-filter-pushdown.md): only the rows that pass are returned.
 class TableScanOperator final : public Operator {
  public:
   TableScanOperator(std::shared_ptr<plan::Table> table, std::vector<int> fields,
                     std::optional<int64_t> part = std::nullopt,
-                    std::optional<LateScan> late = std::nullopt);
+                    std::optional<LateScan> late = std::nullopt,
+                    std::vector<plan::Predicate> pushed = {});
 
   [[nodiscard]] const std::shared_ptr<arrow::Schema>& output_schema() const override {
     return schema_;
@@ -52,6 +56,7 @@ class TableScanOperator final : public Operator {
   std::vector<int> fields_;
   std::optional<int64_t> part_;
   std::optional<LateScan> late_;
+  std::vector<plan::Predicate> pushed_;
   std::vector<int> read_;  // the fields read: fields_ but the late ones
   std::shared_ptr<arrow::Schema> schema_;
   std::unique_ptr<arrow::RecordBatchReader> reader_;
