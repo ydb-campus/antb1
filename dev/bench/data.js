@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790877398775,
+  "lastUpdate": 1790885950363,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -3396,6 +3396,90 @@ window.BENCHMARK_DATA = {
             "value": 15.06264636170267,
             "unit": "ms/iter",
             "extra": "iterations: 47\ncpu: 15.060442595744675 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "59a7422ee0e63b95eca806d597bcadd3580e663d",
+          "message": "perf(exec): one shared counter update per memory budget allocation (#68)\n\n## Summary\n\nAt 128 threads the session's memory budget (`exec::MemoryBudget`) showed\nup in profiles of string-heavy GROUP BYs. Charge, Allocate and Free\ntogether took about 5% of the time.\n\nEvery Arrow allocation in a query went through three atomic\nread-modify-writes on one cache line shared by all threads: bytes in\nuse, total bytes allocated and the allocation count, plus a load and\nsometimes a compare-and-swap of the peak.\n\n**The change:**\n- **One counter per allocation.** An allocation or reallocation now\nupdates only `used_`, which the limit needs, plus `peak_` while it\ngrows.\n- **The totals come from the backend.** `total_bytes_allocated()` and\n`num_allocations()` return the backend pool's statistics, which Arrow's\npool keeps anyway. Nothing in the engine, CLI, bench or profiles reads\nthem through a budget, so only a test changes.\n- **Semantic change:** with the default backend these two numbers are\nnow process-wide, not per budget. The header says so.\n- **Separate cache lines.** `used_` and `peak_` each get their own\n(`alignas(64)`).\n- **Unchanged:** the limit, the OutOfMemory behavior, the peak,\n`ResetPeak` and `under_pressure`.\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [x] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full          # lint, ci, asan, tidy, coverage, fuzz-smoke, ci-gcc (final commit)\ncheck-full exit 0; 100% tests passed out of 1426; Coverage gate: PASS\n$ pixi run tsan                # the first commit; only the test changed after it\nno failures\n```\n\n**Test (`memory_test.cc`):** the budget now runs over its own\n`arrow::ProxyMemoryPool`, so the backend's totals are exact. The test\nchecks that the budget reports the backend's numbers: 1 allocation and\n600 bytes. The two refused requests (over the limit) never reach the\nbackend. A mutation that lets a refused request reach the backend fails\nthe test.\n\n**Speed:** paired A/B of release builds against main 875379c, all 43\nClickBench queries at 128 threads (3 binary paths × best of 3, medians).\nThe shared host was busy during some passes, so totals vary between\nruns.\n\n| Run | main | this PR | Change |\n| --- | ---: | ---: | ---: |\n| Upper bound: a build with no accounting at all | 18.96 s | 18.59 s |\n−1.9% |\n| This change, first run | 18.97 s | 18.65 s | **−1.7%** |\n| This change, final commit (Q32–Q34, Q38, Q1, Q6 re-run after a\nbusy-host pass) | 19.73 s | 19.47 s | **−1.3%** |\n\n- **Faster by 5–14%:** Q12, Q14, Q15, Q16, Q17, Q36, and Q5 in the first\nrun.\n- **Slower:** nothing beyond noise. The re-runs of Q32–Q34 are within\n±2%, and Q1, Q6, Q19 and Q38 differ by under 1 ms.\n\nPer-thread memory credit, which would remove the last shared update, was\nconsidered and not done: at most about 0.2% more would be left to gain.\nIt would also make the limit, the peak and the \"every byte back\" tests\ninexact by up to threads × chunk.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed (internal statistics; the\nheader comment says it)\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer (none touched)\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code measured the\nupper bound and the variant, made the change and the test, and ran the\ngates. A read-only reviewer agent found no P0. Its P1, that the adjusted\ntest was too weak, is fixed: the test now asserts exact backend totals\nand fails on the mutation above.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-10-01T23:16:51+03:00",
+          "tree_id": "d4edf57c02e3f0fe49d21be04e9352b97c87f722",
+          "url": "https://github.com/ydb-campus/antb1/commit/59a7422ee0e63b95eca806d597bcadd3580e663d"
+        },
+        "date": 1790885949331,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 3120.5148335160284,
+            "unit": "ns/iter",
+            "extra": "iterations: 222604\ncpu: 3120.258252322509 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 73062.36276204862,
+            "unit": "ns/iter",
+            "extra": "iterations: 9254\ncpu: 73044.35476550683 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 84650.5559051314,
+            "unit": "ns/iter",
+            "extra": "iterations: 8264\ncpu: 84635.38952081316 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 375693.2286634476,
+            "unit": "ns/iter",
+            "extra": "iterations: 1863\ncpu: 375589.07514761144 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 353314.8876008017,
+            "unit": "ns/iter",
+            "extra": "iterations: 1984\ncpu: 353222.34022177436 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2170416.59752323,
+            "unit": "ns/iter",
+            "extra": "iterations: 323\ncpu: 2169246.8328173365 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 42.31927823529451,
+            "unit": "ms/iter",
+            "extra": "iterations: 17\ncpu: 42.31633794117648 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 38.94172026315795,
+            "unit": "ms/iter",
+            "extra": "iterations: 19\ncpu: 38.92230799999998 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 171.8434990000013,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 171.81195049999997 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 11.717151483333529,
+            "unit": "ms/iter",
+            "extra": "iterations: 60\ncpu: 11.715150299999996 ms\nthreads: 1"
           }
         ]
       }
