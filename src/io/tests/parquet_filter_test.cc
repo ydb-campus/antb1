@@ -1,11 +1,13 @@
 // ParquetTable::ScanPart with a plan::ScanFilter (docs/adr/0020-filter-pushdown.md): the rows of
 // the part that pass the filter, as ScanPart without one returns them, in the same order.
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -18,10 +20,13 @@
 #include <arrow/util/bit_util.h>
 #include <gtest/gtest.h>
 #include <parquet/arrow/writer.h>
+#include <parquet/file_reader.h>
 #include <parquet/properties.h>
 
 #include "antb1/io/parquet_table.h"
 #include "antb1/plan/table.h"
+
+#include "../filtered_scan.h"
 
 namespace antb1::io {
 namespace {
@@ -516,6 +521,196 @@ TEST_F(ParquetFilterErrorsTest, PartsOfEveryFile) {
     rows += got->num_rows();
   }
   EXPECT_GT(rows, 0);
+}
+
+// A pool that fails every allocation that would take it past `cap` bytes in use.
+class CappedPool final : public arrow::MemoryPool {
+ public:
+  explicit CappedPool(int64_t cap) : cap_(cap) {}
+  arrow::Status Allocate(int64_t size, int64_t alignment, uint8_t** out) override {
+    if (used_ + size > cap_) {
+      return arrow::Status::OutOfMemory("capped at ", cap_);
+    }
+    ARROW_RETURN_NOT_OK(backend_->Allocate(size, alignment, out));
+    used_ += size;
+    return arrow::Status::OK();
+  }
+  arrow::Status Reallocate(int64_t old_size, int64_t new_size, int64_t alignment,
+                           uint8_t** ptr) override {
+    if (used_ - old_size + new_size > cap_) {
+      return arrow::Status::OutOfMemory("capped at ", cap_);
+    }
+    ARROW_RETURN_NOT_OK(backend_->Reallocate(old_size, new_size, alignment, ptr));
+    used_ += new_size - old_size;
+    return arrow::Status::OK();
+  }
+  void Free(uint8_t* buffer, int64_t size, int64_t alignment) override {
+    backend_->Free(buffer, size, alignment);
+    used_ -= size;
+  }
+  [[nodiscard]] int64_t bytes_allocated() const override { return used_; }
+  [[nodiscard]] int64_t total_bytes_allocated() const override { return used_; }
+  [[nodiscard]] int64_t num_allocations() const override { return 0; }
+  [[nodiscard]] std::string backend_name() const override { return "capped"; }
+
+ private:
+  arrow::MemoryPool* backend_ = arrow::default_memory_pool();
+  int64_t cap_;
+  int64_t used_ = 0;
+};
+
+// Out of memory anywhere in a filtered scan (pages, decoded values, the filter's kept strings,
+// the output): an OutOfMemory status, never a crash, and every byte given back; with enough
+// memory the rows are those of the unlimited scan.
+TEST_F(ParquetFilterErrorsTest, OutOfMemoryAnywhere) {
+  const auto table = Open(Write(Encoding::kDictionaryFallback));
+  const std::vector<int> fields = {6, 3, 11, 12, 5};
+  const std::vector<Predicate> predicates = {
+      [](const Value& v) { return !v.null && v.text.contains('1'); },
+      [](const Value& v) { return !v.null && v.integer % 2 == 0; }};
+  const auto full =
+      Drain(**table->ScanPart(0, fields, 200, arrow::default_memory_pool(),
+                              std::make_shared<TestFilter>(std::vector<int>{0, 1}, predicates)),
+            200);
+  bool succeeded = false;
+  int failures = 0;
+  for (int64_t cap = 0; cap < (int64_t{8} << 20) && !succeeded; cap = (cap * 3 / 2) + 1024) {
+    CappedPool pool(cap);
+    {
+      auto reader = table->ScanPart(
+          0, fields, 200, &pool, std::make_shared<TestFilter>(std::vector<int>{0, 1}, predicates));
+      ASSERT_TRUE(reader.ok()) << reader.status().ToString();
+      arrow::RecordBatchVector batches;
+      arrow::Status st;
+      while (true) {
+        std::shared_ptr<arrow::RecordBatch> batch;
+        st = (*reader)->ReadNext(&batch);
+        if (!st.ok() || batch == nullptr) {
+          break;
+        }
+        batches.push_back(std::move(batch));
+      }
+      if (st.ok()) {
+        succeeded = true;
+        const auto got = arrow::Table::FromRecordBatches((*reader)->schema(), batches).ValueOrDie();
+        EXPECT_TRUE(got->Equals(*full)) << cap;
+      } else {
+        ++failures;
+        EXPECT_TRUE(st.IsOutOfMemory() || st.IsIOError()) << cap << ": " << st.ToString();
+      }
+    }
+    EXPECT_EQ(pool.bytes_allocated(), 0) << cap;
+  }
+  EXPECT_TRUE(succeeded);
+  EXPECT_GT(failures, 3);
+}
+
+// A filter's failure on a fixed-width column; Close, then the stream has ended.
+TEST_F(ParquetFilterErrorsTest, FixedWidthFilterErrorsAndClose) {
+  const auto table = Open(Write(Encoding::kPlain));
+  auto failing = std::make_shared<TestFilter>(
+      std::vector<int>{1}, std::vector<Predicate>{[](const Value&) { return true; }});
+  failing->Fail();
+  auto reader = table->ScanPart(0, {6, 3}, 100, arrow::default_memory_pool(), failing);
+  ASSERT_TRUE(reader.ok());
+  std::shared_ptr<arrow::RecordBatch> batch;
+  EXPECT_TRUE((*reader)->ReadNext(&batch).IsInvalid());
+  auto keep = std::make_shared<TestFilter>(
+      std::vector<int>{1}, std::vector<Predicate>{[](const Value&) { return true; }});
+  auto closed = table->ScanPart(0, {6, 3}, 100, arrow::default_memory_pool(), keep);
+  ASSERT_TRUE(closed.ok());
+  ASSERT_TRUE((*closed)->ReadNext(&batch).ok());
+  EXPECT_NE(batch, nullptr);
+  ASSERT_TRUE((*closed)->Close().ok());
+  ASSERT_TRUE((*closed)->ReadNext(&batch).ok());
+  EXPECT_EQ(batch, nullptr);
+}
+
+// Which leaves the filtered path reads (FilteredColumnOf), and MakeFilteredScan's checks.
+TEST_F(ParquetFilterErrorsTest, ReadableLeavesAndRequests) {
+  // Leaves: 0 i32 (INT32), 1 l64 (INT64), 2 f (FLOAT), 3 d (DOUBLE), 4 s (BYTE_ARRAY),
+  // 5 the list's element (repeated), 6 the struct's field (definition level 2).
+  arrow::Int32Builder i32;
+  arrow::Int64Builder l64;
+  arrow::FloatBuilder f;
+  arrow::DoubleBuilder d;
+  arrow::StringBuilder text;
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_TRUE(i32.Append(i).ok());
+    ASSERT_TRUE(l64.Append(i).ok());
+    ASSERT_TRUE(f.Append(static_cast<float>(i)).ok());
+    ASSERT_TRUE(d.Append(i).ok());
+    ASSERT_TRUE(text.Append("x").ok());
+  }
+  const auto int32s = [](const std::vector<int32_t>& v) {
+    arrow::Int32Builder b;
+    EXPECT_TRUE(b.AppendValues(v).ok());
+    return std::static_pointer_cast<arrow::Int32Array>(b.Finish().ValueOrDie());
+  };
+  auto values = int32s({1, 2, 3, 4});
+  auto list = arrow::ListArray::FromArrays(*int32s({0, 1, 2, 3, 4}), *values).ValueOrDie();
+  auto inner = int32s({5, 6, 7, 8});
+  auto structs =
+      arrow::StructArray::Make({inner}, {arrow::field("v", arrow::int32())}).ValueOrDie();
+  const auto t = arrow::Table::Make(
+      arrow::schema({arrow::field("i32", arrow::int32()), arrow::field("l64", arrow::int64()),
+                     arrow::field("f", arrow::float32()), arrow::field("d", arrow::float64()),
+                     arrow::field("s", arrow::utf8()), arrow::field("l", list->type()),
+                     arrow::field("st", structs->type())}),
+      {i32.Finish().ValueOrDie(), l64.Finish().ValueOrDie(), f.Finish().ValueOrDie(),
+       d.Finish().ValueOrDie(), text.Finish().ValueOrDie(), list, structs});
+  const std::string path = (dir_ / "leaves.parquet").string();
+  {
+    auto out = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+    ASSERT_TRUE(parquet::arrow::WriteTable(*t, arrow::default_memory_pool(), out, 4).ok());
+    ASSERT_TRUE(out->Close().ok());
+  }
+  const auto metadata = parquet::ParquetFileReader::OpenFile(path)->metadata();
+  const auto ok = [&](int leaf, const auto& storage, const auto& engine) {
+    return FilteredColumnOf(*metadata, leaf, *storage, *engine).has_value();
+  };
+  EXPECT_TRUE(ok(0, arrow::int32(), arrow::int32()));
+  EXPECT_TRUE(ok(0, arrow::int32(), arrow::date32()));
+  EXPECT_FALSE(ok(0, arrow::int16(), arrow::int32()));   // storage and engine differ
+  EXPECT_FALSE(ok(1, arrow::int32(), arrow::int32()));   // physical INT64
+  EXPECT_FALSE(ok(1, arrow::int64(), arrow::date32()));  // DATE from INT64
+  EXPECT_TRUE(ok(1, arrow::int64(), arrow::int64()));
+  EXPECT_FALSE(ok(0, arrow::int64(), arrow::int64()));  // physical INT32
+  EXPECT_TRUE(ok(2, arrow::float32(), arrow::float64()));
+  EXPECT_FALSE(ok(3, arrow::float32(), arrow::float64()));  // physical DOUBLE
+  EXPECT_TRUE(ok(3, arrow::float64(), arrow::float64()));
+  EXPECT_FALSE(ok(2, arrow::float64(), arrow::float64()));  // physical FLOAT
+  EXPECT_TRUE(ok(4, arrow::utf8(), arrow::binary()));
+  EXPECT_FALSE(ok(0, arrow::binary(), arrow::binary()));  // physical INT32
+  EXPECT_FALSE(ok(4, arrow::large_utf8(), arrow::binary()));
+  EXPECT_FALSE(ok(4, arrow::utf8(), arrow::boolean()));
+  EXPECT_FALSE(ok(5, arrow::int32(), arrow::int32()));  // repeated
+  EXPECT_FALSE(ok(6, arrow::int32(), arrow::int32()));  // nested: definition level 2
+  EXPECT_FALSE(ok(-1, arrow::int32(), arrow::int32()));
+  EXPECT_FALSE(ok(metadata->num_columns(), arrow::int32(), arrow::int32()));
+
+  // MakeFilteredScan: one row group, filter columns among the scanned fields, each once.
+  const auto keep = std::vector<Predicate>{[](const Value&) { return true; }};
+  const auto column = *FilteredColumnOf(*metadata, 0, *arrow::int32(), *arrow::int32());
+  const auto schema = arrow::schema({arrow::field("i32", arrow::int32())});
+  const auto make = [&](std::vector<int> row_groups, std::vector<int> filtered, int64_t batch) {
+    return MakeFilteredScan(
+               Segment{.path = path,
+                       .metadata = metadata,
+                       .bytes = 0,
+                       .footer = nullptr,
+                       .row_groups = std::move(row_groups)},
+               {column}, schema, batch, arrow::default_memory_pool(),
+               std::make_shared<TestFilter>(std::move(filtered),
+                                            std::vector<Predicate>(filtered.size(), keep[0])))
+        .status();
+  };
+  EXPECT_TRUE(make({0, 0}, {0}, 10).IsInvalid());
+  EXPECT_TRUE(make({0}, {1}, 10).IsInvalid());
+  EXPECT_TRUE(make({0}, {-1}, 10).IsInvalid());
+  EXPECT_TRUE(make({0}, {0, 0}, 10).IsInvalid());
+  EXPECT_TRUE(make({0}, {0}, 0).IsInvalid());
+  EXPECT_TRUE(make({0}, {0}, 10).ok());
 }
 
 }  // namespace
