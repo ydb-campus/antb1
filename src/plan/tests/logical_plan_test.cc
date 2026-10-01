@@ -13,6 +13,7 @@
 #include <gtest/gtest.h>
 
 #include "antb1/common/int128.h"
+#include "antb1/plan/table.h"
 #include "antb1/plan/types.h"
 
 #include "plan_test_util.h"
@@ -229,6 +230,31 @@ TEST(LogicalPlanTest, NodeNamesSpansAndInputs) {
       EXPECT_EQ(*input, scan) << name;
     }
   }
+}
+
+// The defaults of plan::Table for scans with a filter: no table filters unless it says so; a scan
+// without a filter is the plain scan.
+TEST(TableTest, FilteredScansAreOptIn) {
+  class KeepAll final : public ScanFilter {
+   public:
+    [[nodiscard]] const std::vector<int>& columns() const override { return columns_; }
+    arrow::Status Apply(int /*column*/, const ScanValues& /*values*/, int64_t /*offset*/,
+                        std::uint8_t* /*selected*/) const override {
+      return arrow::Status::OK();
+    }
+
+   private:
+    std::vector<int> columns_{0};
+  };
+  const testing::FakeTable table(testing::AllTypesSchema(), 10);
+  EXPECT_FALSE(table.supports_scan_filter({0}));
+  const auto plain = table.ScanPart(0, {0}, 10, arrow::default_memory_pool(), nullptr);
+  EXPECT_TRUE(plain.status().IsNotImplemented());
+  EXPECT_EQ(plain.status().message(), "fake tables cannot be scanned");  // forwarded to DoScan
+  const auto filtered =
+      table.ScanPart(0, {0}, 10, arrow::default_memory_pool(), std::make_shared<KeepAll>());
+  EXPECT_TRUE(filtered.status().IsNotImplemented());
+  EXPECT_EQ(filtered.status().message(), "this table cannot filter while it scans");
 }
 
 }  // namespace

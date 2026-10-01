@@ -18,6 +18,7 @@
 #include <arrow/api.h>
 #include <arrow/compute/api.h>
 #include <arrow/io/file.h>
+#include <arrow/util/bit_util.h>
 #include <benchmark/benchmark.h>
 #include <parquet/arrow/writer.h>
 
@@ -26,6 +27,7 @@
 #include "antb1/exec/sort.h"
 #include "antb1/io/parquet_table.h"
 #include "antb1/plan/logical_plan.h"
+#include "antb1/plan/table.h"
 #include "antb1/plan/types.h"
 #include "antb1/sql/parser.h"
 
@@ -234,6 +236,107 @@ void BM_ScanColumn(benchmark::State& state) {
 }
 BENCHMARK(BM_ScanColumn);
 
+// ---- A string filter: decoded into arrays then matched, against filtered in the scan ----
+
+// A Parquet file of URL-like strings (about 60 bytes, 1 in 50 contains "/7/") in 64Ki-row row
+// groups, written once per run (empty path if that fails).
+std::filesystem::path UrlFilePath() {
+  return std::filesystem::temp_directory_path() /
+         ("antb1-bench-urls-" + std::to_string(::getpid()) + ".parquet");
+}
+
+const std::filesystem::path& UrlFile() {
+  static const std::filesystem::path path = [] {
+    auto file = UrlFilePath();
+    arrow::StringBuilder urls;
+    for (int64_t r = 0; r < kRows; ++r) {
+      const int64_t page = (r * 2654435761LL) % 100000;
+      const std::string url = "https://www.example.org/section/" + std::to_string(r % 50) + "/" +
+                              std::to_string(page) + "?utm_source=bench";
+      if (!urls.Append(url).ok()) {
+        return std::filesystem::path();
+      }
+    }
+    const auto table = arrow::Table::Make(arrow::schema({arrow::field("u", arrow::utf8())}),
+                                          {urls.Finish().ValueOrDie()});
+    auto out = arrow::io::FileOutputStream::Open(file.string());
+    if (!out.ok() ||
+        !parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), *out, kBatchSize).ok() ||
+        !(*out)->Close().ok()) {
+      return std::filesystem::path();
+    }
+    return file;
+  }();
+  return path;
+}
+
+bool HasNeedle(std::string_view text) { return text.find("/7/") != std::string_view::npos; }
+
+// Keeps the rows whose string contains "/7/".
+class NeedleFilter final : public plan::ScanFilter {
+ public:
+  [[nodiscard]] const std::vector<int>& columns() const override { return columns_; }
+  arrow::Status Apply(int /*column*/, const plan::ScanValues& values, int64_t offset,
+                      std::uint8_t* selected) const override {
+    for (int64_t i = 0; i < values.rows; ++i) {
+      if (!HasNeedle(values.strings[static_cast<std::size_t>(i)])) {
+        arrow::bit_util::ClearBit(selected, offset + i);
+      }
+    }
+    return arrow::Status::OK();
+  }
+
+ private:
+  std::vector<int> columns_{0};
+};
+
+void ScanUrls(benchmark::State& state, bool pushed) {
+  const auto& file = UrlFile();
+  auto table = file.empty() ? arrow::Result<std::shared_ptr<io::ParquetTable>>(
+                                  arrow::Status::IOError("cannot write the URL file"))
+                            : io::ParquetTable::Open({file.string()});
+  if (!table.ok()) {
+    state.SkipWithError(table.status().ToString());
+    return;
+  }
+  const auto filter = std::make_shared<NeedleFilter>();
+  int64_t matches = 0;
+  for (auto _ : state) {
+    matches = 0;
+    for (int64_t part = 0; part < (*table)->num_parts(); ++part) {
+      auto reader =
+          pushed ? (*table)->ScanPart(part, {0}, kBatchSize, arrow::default_memory_pool(), filter)
+                 : (*table)->ScanPart(part, {0}, kBatchSize);
+      if (!reader.ok()) {
+        state.SkipWithError(reader.status().ToString());
+        return;
+      }
+      std::shared_ptr<arrow::RecordBatch> batch;
+      while ((*reader)->ReadNext(&batch).ok() && batch != nullptr) {
+        if (pushed) {
+          matches += batch->num_rows();
+          continue;
+        }
+        const auto& urls = static_cast<const arrow::BinaryArray&>(*batch->column(0));
+        for (int64_t i = 0; i < urls.length(); ++i) {
+          matches += HasNeedle(urls.GetView(i)) ? 1 : 0;
+        }
+      }
+    }
+    benchmark::DoNotOptimize(matches);
+  }
+  state.SetItemsProcessed(state.iterations() * kRows);
+  state.counters["matches"] = static_cast<double>(matches);
+}
+
+// io::ParquetTable::ScanPart, then the filter over the BinaryArray (today's path).
+void BM_StringFilterAfterScan(benchmark::State& state) { ScanUrls(state, false); }
+BENCHMARK(BM_StringFilterAfterScan)->Unit(benchmark::kMillisecond);
+
+// io::ParquetTable::ScanPart with the filter pushed into the scan (ADR 0020).
+void BM_StringFilterInScan(benchmark::State& state) { ScanUrls(state, true); }
+BENCHMARK(BM_StringFilterInScan)->Unit(benchmark::kMillisecond);
+
 // A random BIGINT key and an 8 to 23 byte VARCHAR payload, kRows rows in 64Ki-row batches.
 const arrow::RecordBatchVector& SortInput() {
   static const arrow::RecordBatchVector batches = [] {
@@ -333,5 +436,6 @@ int main(int argc, char** argv) {
   benchmark::Shutdown();
   std::error_code ec;
   std::filesystem::remove(antb1::bench::ScanFilePath(), ec);  // if BM_ScanColumn wrote it
+  std::filesystem::remove(antb1::bench::UrlFilePath(), ec);   // if the string filters wrote it
   return 0;
 }

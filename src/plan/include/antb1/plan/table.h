@@ -3,7 +3,9 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <arrow/memory_pool.h>
@@ -23,6 +25,39 @@ struct PartStats {
   std::optional<Int128> max;
   int64_t null_count = 0;
   int64_t rows = 0;
+};
+
+// The values of one column of a scan, as a table decoded them and before it copies them into a
+// batch (docs/adr/0020-filter-pushdown.md): a column of a fixed-width engine type as an Arrow array
+// of that type; a VARCHAR column as one view per row into the table's own buffers (an empty view
+// where the row is NULL) and the rows' validity. The views are valid only during the call they are
+// passed to.
+struct ScanValues {
+  std::shared_ptr<arrow::Array> array;        // fixed-width columns; nullptr for VARCHAR
+  std::span<const std::string_view> strings;  // VARCHAR: one view per row
+  const std::uint8_t* validity = nullptr;     // VARCHAR: a bit per row, 1 where not NULL;
+                                              // nullptr: no row is NULL
+  int64_t rows = 0;
+};
+
+// Predicates a table applies while it scans, before it copies the values it decoded (filter
+// pushdown, docs/adr/0020-filter-pushdown.md). Every predicate reads one column, and the rows that
+// pass are those for which every predicate is true (SQL's WHERE: NULL fails). Implemented by exec,
+// applied by tables that support it (Table::supports_scan_filter). Thread-safe: the parts of a
+// query apply one filter concurrently.
+class ScanFilter {
+ public:
+  virtual ~ScanFilter() = default;
+
+  // The columns it reads: positions in the scan's field list, each once.
+  [[nodiscard]] virtual const std::vector<int>& columns() const = 0;
+
+  // Clears the bits of `selected` (one bit per row of the batch, bit `offset` for values' first
+  // row) of the rows that fail the predicates of column `column` (a position of columns()). A
+  // table may call it with the values of a column in several pieces, and may skip rows whose bit
+  // is already clear.
+  virtual arrow::Status Apply(int column, const ScanValues& values, int64_t offset,
+                              std::uint8_t* selected) const = 0;
 };
 
 // A scannable table as seen by the planner and executor. Implemented by io::ParquetTable (and by
@@ -65,6 +100,25 @@ class Table {
     return DoScanPart(part, fields, batch_size, pool);
   }
 
+  // Whether ScanPart can apply a ScanFilter while it scans these top-level fields.
+  [[nodiscard]] virtual bool supports_scan_filter(const std::vector<int>& fields) const {
+    static_cast<void>(fields);
+    return false;
+  }
+
+  // Scans the rows of part `part` that pass `filter` (whose columns are positions in `fields`), as
+  // ScanPart does, but only those rows, in the same order: the same batches but for the rows left
+  // out (a batch may lose every row and is then not returned). NotImplemented where
+  // supports_scan_filter(fields) is false.
+  arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> ScanPart(
+      int64_t part, const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool,
+      const std::shared_ptr<const ScanFilter>& filter) const {
+    if (filter == nullptr) {
+      return DoScanPart(part, fields, batch_size, pool);
+    }
+    return DoScanPartFiltered(part, fields, batch_size, pool, filter);
+  }
+
   // The exact statistics of top-level field `field` in part `part`, if known and integer-valued;
   // std::nullopt (never skip) by default and for anything not known exactly.
   virtual std::optional<PartStats> part_stats(int64_t part, int field) const {
@@ -99,6 +153,12 @@ class Table {
       return arrow::Status::Invalid("scan of part ", part, " of a table with 1 part");
     }
     return DoScan(fields, batch_size, pool);
+  }
+  // ScanPart with a filter, for tables that support it.
+  virtual arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScanPartFiltered(
+      int64_t /*part*/, const std::vector<int>& /*fields*/, int64_t /*batch_size*/,
+      arrow::MemoryPool* /*pool*/, const std::shared_ptr<const ScanFilter>& /*filter*/) const {
+    return arrow::Status::NotImplemented("this table cannot filter while it scans");
   }
 };
 
