@@ -193,13 +193,13 @@ TEST_F(OperatorsTest, FilteredNarrowScanChecksThePositions) {
     EXPECT_TRUE(narrow.Open(ctx).ok());
     return narrow.Next().status();
   };
-  const auto with = [](std::shared_ptr<arrow::Array> positions) {
+  const auto with = [](const std::shared_ptr<arrow::Array>& positions) {
     return arrow::RecordBatch::Make(arrow::schema({arrow::field("x", arrow::int64()),
                                                    arrow::field("position", positions->type())}),
-                                    2, {Int64s({1, 2}), std::move(positions)});
+                                    2, {Int64s({1, 2}), positions});
   };
   EXPECT_TRUE(run(with(Int64s({0, 1}))).ok());
-  EXPECT_TRUE(run(with(Int64s({kRowIdParts * 2 - 2, kRowIdParts * 2 - 1}))).ok());
+  EXPECT_TRUE(run(with(Int64s({(kRowIdParts * 2) - 2, (kRowIdParts * 2) - 1}))).ok());
   EXPECT_TRUE(run(arrow::RecordBatch::Make(arrow::schema({arrow::field("x", arrow::int64())}), 2,
                                            {Int64s({1, 2})}))
                   .IsInvalid())
