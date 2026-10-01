@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790833521578,
+  "lastUpdate": 1790859356427,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -3060,6 +3060,90 @@ window.BENCHMARK_DATA = {
             "value": 15.15085147826149,
             "unit": "ms/iter",
             "extra": "iterations: 46\ncpu: 15.148832239130439 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "97d2e2dc70b3f83f2c5e5d83521c5b8d3876a5a1",
+          "message": "feat(io,plan): scans that apply a row filter on decoded values (#64)\n\n## Summary\n\nThis is the io side of filter pushdown into the scan (ADR 0020,\n`docs/adr/0020-filter-pushdown.md`).\n\n**What it adds:**\n- **An interface:** a scan can apply a row filter while it decodes, and\ncopy only the rows that pass.\n- **The Parquet implementation** of that interface.\n- **No planner change:** nothing in the engine uses it yet, so query\nresults and speed do not change. The executor side comes in the next PR.\n\n**Why:** the string scans (Q20-Q22) are bound by memory traffic.\n- Arrow's high-level Parquet reader copies every string into a\n`BinaryArray`, which the filter then reads again.\n- Decoding through Parquet's column readers instead gives\n`parquet::ByteArray` views into the decompressed pages.\n- Matching on those views was 1.31-1.88× faster on one thread and\n**1.59-2.18× on 128 threads** for URL, Title and SearchPhrase (a local\nexperiment on the full ClickBench data). Decompression is the same\neither way.\n- This is the third granularity of pushing WHERE predicates down: row\ngroups by footer statistics exist (#50); pages by statistics are later;\nrows on decoded values are this.\n\n**`plan` (`table.h`):** the interface lives here, so `exec` implements\nthe predicates and `io` applies them, with no new module edge and\nnothing moved.\n- **`ScanValues`:** a column's decoded values. Fixed-width columns are\nan Arrow array; VARCHAR columns are a `std::string_view` per row plus\nvalidity, valid during the call only.\n- **`ScanFilter`:** `columns()`, and `Apply(column, values, offset,\nselected)`, which clears the bits of the rows that fail that column's\npredicates.\n- **One column at a time:** pushed predicates each read one column and\nare ANDed.\n- **Piece by piece:** a string view is valid only until its column\nreader reads its next page, and the pages of different columns do not\nline up.\n- **`Table::supports_scan_filter(fields)`** (false by default), and a\n`ScanPart` overload with a filter that returns only the rows that pass,\nin part order.\n\n**`io`:**\n- **`src/io/filtered_scan.{h,cc}`:** `ParquetFileReader` →\n`RowGroupReader` → `TypedColumnReader`, for flat INT16, INT32,\nUSMALLINT, DATE (including the USMALLINT/INTEGER overrides), BIGINT,\nDOUBLE (also stored as FLOAT) and VARCHAR columns. Per batch:\n- **the filter's columns first:** fixed-width whole; strings piece by\npiece, keeping the bytes of the rows still selected in the query's pool;\n  - **then every other column:** only the rows that pass are copied;\n  - **a batch with no passing row** is skipped.\n- **Errors:** as the high-level path reports them: an IOError naming the\nfile, OutOfMemory, the footer checks. A filter's own errors pass\nthrough.\n- **`ParquetTable`:** `supports_scan_filter` is true only when every\nscanned column is supported, and `DoScanPartFiltered` dispatches to the\nnew reader. The segment and footer checks move to\n`src/io/scan_segment.h`, shared by both paths.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full          # lint, ci, asan, tidy, coverage, fuzz-smoke, ci-gcc (final commit 1dddcc4)\ncheck-full exit 0; 100% tests passed out of 1415; Coverage gate: PASS (io 95.37% lines, 88.43% branches; plan 95.71%, 90.37%)\n$ pixi run tsan                                 # 13c8fc6; only test lint fixes followed\n100% tests passed out of 1415\n$ ANTB1_DIFF_COUNT=20000 pixi run diff-random   # e63e8c5; no engine behavior changes in this PR\nDIFF: PASS seed=3029943232 queries=20000 failed=0 unsupported=0\n$ pixi run test-data\n100% tests passed out of 6\n$ pixi run bench --benchmark_filter=StringFilter    # one thread, 1 Mi URL-like strings\nBM_StringFilterAfterScan 141 ms   BM_StringFilterInScan 107 ms   (1.32×, the same 20972 matches)\n```\n\n**Tests (`src/io/tests/parquet_filter_test.cc`):**\n- **Parity:** a filtered `ScanPart` must equal the unfiltered scan's\nrows that pass, byte for byte. It covers:\n- every supported type, required and nullable columns, and the DATE\noverrides;\n- dictionary, plain and dictionary-fallback encodings, 1 KiB pages, and\nbatch sizes of 1, 7, 1000 and 64Ki;\n- filters that keep none, some or all rows, on one or two columns, with\nNULLs;\n  - another projection order, and parts of two files.\n- **Errors and limits:**\n- out of memory at every point of a scan, by sweeping a capped pool: an\nOutOfMemory status, every byte given back, and the right rows once\nmemory suffices;\n  - filter errors on string and fixed-width columns;\n- a corrupt data page, an IOError naming the file, from a filter column\nand from another;\n  - a file changed after Open;\n  - unsupported columns (BOOLEAN, TIMESTAMP, repeated, nested);\n- `FilteredColumnOf`'s type and physical-type checks, and invalid\nrequests.\n- **Mutation-checked:** skipping the filter on strings, and ignoring the\nselection, both fail.\n- **`plan` (`TableTest.FilteredScansAreOptIn`):** a scan without a\nfilter forwards to the plain scan; filtering is NotImplemented unless a\ntable opts in.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer (none changed)\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Claude Code:\n- measured the string scans (hardware counters, the BINARY_VIEW probe,\nand the low-level-reader experiment);\n- planned this in plan mode (approved), and wrote the interface, the\nreader, the tests, a micro benchmark and ADR 0020;\n  - ran the gates.\n\nA read-only reviewer agent checked conversions, levels and Skip\nsemantics, view lifetimes, alignment and error mapping, and found no\ncorrectness issue. It found five test gaps, all added: required columns,\nUSMALLINT dates, corrupt pages, several files and `plan`'s defaults. Its\nnotes are done too: kept strings in the query's pool, the readers'\ndestruction order, and ADR wording. CI-style gates then added\nout-of-memory and readable-leaf tests to keep io's branch coverage above\nits floor.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-10-01T15:53:10+03:00",
+          "tree_id": "eeab98724042d843ae67bedd41b3ea01331eda8d",
+          "url": "https://github.com/ydb-campus/antb1/commit/97d2e2dc70b3f83f2c5e5d83521c5b8d3876a5a1"
+        },
+        "date": 1790859355633,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4168.470131857765,
+            "unit": "ns/iter",
+            "extra": "iterations: 169880\ncpu: 4168.030568636685 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84374.05381579012,
+            "unit": "ns/iter",
+            "extra": "iterations: 7600\ncpu: 84367.60671052632 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222639.48744836758,
+            "unit": "ns/iter",
+            "extra": "iterations: 3147\ncpu: 222624.48331744506 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 444453.8827629802,
+            "unit": "ns/iter",
+            "extra": "iterations: 1578\ncpu: 444432.52091254736 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 402634.06563039235,
+            "unit": "ns/iter",
+            "extra": "iterations: 1737\ncpu: 402481.86010362714 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2100556.536363697,
+            "unit": "ns/iter",
+            "extra": "iterations: 330\ncpu: 2099998.9424242424 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 51.48396692307791,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 51.475985 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 34.6910423500006,
+            "unit": "ms/iter",
+            "extra": "iterations: 20\ncpu: 34.681732899999986 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 212.68901566666423,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 212.67271666666684 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.397367510203864,
+            "unit": "ms/iter",
+            "extra": "iterations: 49\ncpu: 14.3970258367347 ms\nthreads: 1"
           }
         ]
       }
