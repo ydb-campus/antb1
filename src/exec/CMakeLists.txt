@@ -8,6 +8,7 @@ antb1_add_module(
     aggregate_state.cc
     table_scan.cc
     filter.cc
+    scan_filter.cc
     compute.cc
     parallel_compute.cc
     like.cc

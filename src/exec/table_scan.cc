@@ -9,6 +9,8 @@
 
 #include <arrow/api.h>
 
+#include "antb1/exec/scan_filter.h"
+#include "antb1/plan/logical_plan.h"
 #include "antb1/plan/table.h"
 
 namespace antb1::exec {
@@ -36,11 +38,13 @@ std::shared_ptr<arrow::Schema> FieldsOf(const plan::Table& table, const std::vec
 }  // namespace
 
 TableScanOperator::TableScanOperator(std::shared_ptr<plan::Table> table, std::vector<int> fields,
-                                     std::optional<int64_t> part, std::optional<LateScan> late)
+                                     std::optional<int64_t> part, std::optional<LateScan> late,
+                                     std::vector<plan::Predicate> pushed)
     : table_(std::move(table)),
       fields_(std::move(fields)),
       part_(part),
       late_(std::move(late)),
+      pushed_(std::move(pushed)),
       schema_(FieldsOf(*table_, fields_, late_)) {
   for (std::size_t i = 0; i < fields_.size(); ++i) {
     if (!late_.has_value() || i >= late_->late.size() || !late_->late[i]) {
@@ -52,6 +56,9 @@ TableScanOperator::TableScanOperator(std::shared_ptr<plan::Table> table, std::ve
 arrow::Status TableScanOperator::Open(ExecContext& ctx) {
   offset_ = 0;
   pool_ = ctx.pool;
+  if (!pushed_.empty() && (!part_.has_value() || late_.has_value())) {
+    return arrow::Status::Invalid("only the full scan of a part applies predicates");
+  }
   if (late_.has_value()) {
     const LateScan& late = late_.value();
     if (!part_.has_value() || late.late.size() != fields_.size() || late.row_id < 0 ||
@@ -62,7 +69,12 @@ arrow::Status TableScanOperator::Open(ExecContext& ctx) {
     }
     ARROW_ASSIGN_OR_RAISE(reader_, table_->ScanPart(*part_, read_, ctx.batch_size, ctx.pool));
   } else if (part_.has_value()) {
-    ARROW_ASSIGN_OR_RAISE(reader_, table_->ScanPart(*part_, fields_, ctx.batch_size, ctx.pool));
+    std::shared_ptr<const plan::ScanFilter> filter;
+    if (!pushed_.empty()) {
+      ARROW_ASSIGN_OR_RAISE(filter, MakeScanFilter(pushed_, *schema_, ctx.pool));
+    }
+    ARROW_ASSIGN_OR_RAISE(reader_,
+                          table_->ScanPart(*part_, fields_, ctx.batch_size, ctx.pool, filter));
   } else {
     ARROW_ASSIGN_OR_RAISE(reader_, table_->Scan(fields_, ctx.batch_size, ctx.pool));
   }

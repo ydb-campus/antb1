@@ -104,7 +104,8 @@ std::string Counts(const ProfileNode& node, int depth = 0) {
 
 // ORDER BY key0 DESC LIMIT 2 over GROUP BY g over WHERE x >= 72: a top-N over the partitioned
 // GROUP BY over a per-part filter and scan. The filter's statistics skip the first 10 parts
-// (x < 70); the scan reads the other 70 rows, the filter keeps 68, in 5 groups.
+// (x < 70); the scan reads the other 70 rows and applies the filter (pushed down), 68 pass, in 5
+// groups.
 TEST_F(ProfileTest, TheProfileMirrorsThePhysicalPlan) {
   auto pool = arrow::internal::ThreadPool::Make(4);
   ASSERT_TRUE(pool.ok());
@@ -127,7 +128,7 @@ TEST_F(ProfileTest, TheProfileMirrorsThePhysicalPlan) {
       "TopN rows=2 runs=1\n"
       "  PartGroupAggregate rows=5 runs=1 parts=10 skipped=10 groups=5\n"
       "    Filter rows=68 runs=10 per_part\n"
-      "      Scan rows=70 runs=10 per_part\n";
+      "      Scan rows=68 runs=10 per_part\n";
   for (arrow::internal::Executor* executor :
        {static_cast<arrow::internal::Executor*>(nullptr),
         static_cast<arrow::internal::Executor*>(pool->get())}) {
@@ -140,6 +141,10 @@ TEST_F(ProfileTest, TheProfileMirrorsThePhysicalPlan) {
     EXPECT_TRUE(MetricOf(aggregate, "wait").has_value());
     EXPECT_TRUE(MetricOf(aggregate, "part_time").has_value());
     EXPECT_GE(root->time().count(), 0);
+    ASSERT_EQ(aggregate.children().size(), 1U);
+    ASSERT_EQ(aggregate.children()[0]->children().size(), 1U);
+    EXPECT_EQ(aggregate.children()[0]->children()[0]->detail(),
+              "Scan table=t source=memory columns=[x, g], 1 pushed predicate");
   }
 }
 
