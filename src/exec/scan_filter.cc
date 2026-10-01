@@ -89,43 +89,49 @@ class StringPredicate {
 
   void Apply(const plan::ScanValues& values, int64_t offset, std::uint8_t* selected) const {
     const std::string_view c = constant_;
+    const auto keep = [&](const auto& test) { KeepStrings(values, offset, selected, test); };
     switch (kind_) {
       case Kind::kCompare:
         switch (op_) {
           case plan::CompareOp::kEq:
-            return KeepStrings(values, offset, selected,
-                               [c](std::string_view v) { return v == c; });
+            keep([c](std::string_view v) { return v == c; });
+            break;
           case plan::CompareOp::kNe:
-            return KeepStrings(values, offset, selected,
-                               [c](std::string_view v) { return v != c; });
+            keep([c](std::string_view v) { return v != c; });
+            break;
           case plan::CompareOp::kLt:
-            return KeepStrings(values, offset, selected, [c](std::string_view v) { return v < c; });
+            keep([c](std::string_view v) { return v < c; });
+            break;
           case plan::CompareOp::kLe:
-            return KeepStrings(values, offset, selected,
-                               [c](std::string_view v) { return v <= c; });
+            keep([c](std::string_view v) { return v <= c; });
+            break;
           case plan::CompareOp::kGt:
-            return KeepStrings(values, offset, selected, [c](std::string_view v) { return v > c; });
+            keep([c](std::string_view v) { return v > c; });
+            break;
           case plan::CompareOp::kGe:
-            return KeepStrings(values, offset, selected,
-                               [c](std::string_view v) { return v >= c; });
+            keep([c](std::string_view v) { return v >= c; });
+            break;
         }
-        return;
+        break;
       case Kind::kLike:
-        return KeepStrings(values, offset, selected,
-                           [this](std::string_view v) { return pattern_->Matches(v); });
+        keep([this](std::string_view v) { return pattern_->Matches(v); });
+        break;
       case Kind::kNotLike:
-        return KeepStrings(values, offset, selected,
-                           [this](std::string_view v) { return !pattern_->Matches(v); });
+        keep([this](std::string_view v) { return !pattern_->Matches(v); });
+        break;
       case Kind::kIn:
-        return KeepStrings(values, offset, selected, [this](std::string_view v) {
+        keep([this](std::string_view v) {
           return std::ranges::binary_search(values_, v, std::less<>());
         });
+        break;
       case Kind::kNotIn:
-        return KeepStrings(values, offset, selected, [this](std::string_view v) {
+        keep([this](std::string_view v) {
           return !std::ranges::binary_search(values_, v, std::less<>());
         });
+        break;
       default:  // kIsNotNull: NULL fails
-        return KeepStrings(values, offset, selected, [](std::string_view) { return true; });
+        keep([](std::string_view) { return true; });
+        break;
     }
   }
 
@@ -227,7 +233,7 @@ arrow::Result<std::shared_ptr<const plan::ScanFilter>> MakeScanFilter(
   std::vector<int> columns;
   std::vector<ColumnPredicates> per_column;
   for (const plan::Predicate& p : predicates) {
-    if (!PushableToScan(p)) {
+    if (!PushableToScan(p) || !p.column.has_value()) {
       return arrow::Status::Invalid("a predicate the scan cannot apply");
     }
     const int index = p.column->index;
@@ -251,7 +257,7 @@ arrow::Result<std::shared_ptr<const plan::ScanFilter>> MakeScanFilter(
       c.on_strings.push_back(std::move(string));
     } else {
       plan::Predicate alone = p;  // over the column alone
-      alone.column->index = 0;
+      alone.column = plan::BoundColumn{.index = 0, .name = p.column->name, .type = p.column->type};
       ARROW_ASSIGN_OR_RAISE(PredicateEvaluator evaluator,
                             PredicateEvaluator::Make(alone, *c.schema));
       c.fixed.push_back(std::move(evaluator));

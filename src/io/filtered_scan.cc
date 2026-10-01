@@ -67,7 +67,7 @@ arrow::Status ReadRows(Reader& reader, int16_t max_def, int64_t rows, Decoded<Va
   }
   out.rows = 0;
   out.values_read = 0;
-  Value* values = out.values->template mutable_data_as<Value>();
+  auto* values = out.values->template mutable_data_as<Value>();
   while (out.rows < rows) {
     int64_t read = 0;
     const int64_t levels =
@@ -115,7 +115,7 @@ bool SameRepresentation(arrow::Type::type id) {
 template <class Out, class Value>
 int64_t StoreRows(const Decoded<Value>& decoded, int16_t max_def, const std::uint8_t* selected,
                   Out* out, std::uint8_t* valid) {
-  const Value* values = decoded.values->template data_as<Value>();
+  const auto* values = decoded.values->template data_as<Value>();
   if (max_def == 0 || decoded.values_read == decoded.rows) {  // no NULL: value i is row i
     if (selected == nullptr) {
       for (int64_t row = 0; row < decoded.rows; ++row) {
@@ -271,6 +271,10 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
   arrow::Status Close() override {
     for (ColumnState& state : columns_) {
       state.reader.reset();
+      state.int32s = {};  // the decoded buffers go back to the pool
+      state.int64s = {};
+      state.floats = {};
+      state.doubles = {};
     }
     row_group_.reset();
     file_reader_.reset();

@@ -4,10 +4,10 @@
 # mix both kinds over several parts (hits_like_split), NULLs (hits_like_nulls) and every column
 # type (edge).
 
-query IIT nosort
-SELECT COUNT(*), MIN(RegionID), MAX(URL) FROM hits_like_split WHERE URL LIKE '%a%' AND Title NOT LIKE '%e%' AND RegionID > 100
+query TII nosort
+SELECT MAX(URL), COUNT(*), MIN(RegionID) FROM hits_like_split WHERE URL LIKE '%a%' AND Title NOT LIKE '%e%' AND RegionID > 100
 ----
-3943	101	https://www.example.org/погода/99688?q=quick
+https://www.example.org/погода/99688?q=quick	3943	101
 
 query TI nosort
 SELECT SearchPhrase, COUNT(*) AS c FROM hits_like_split WHERE SearchPhrase <> '' AND SearchPhrase < 'm' GROUP BY SearchPhrase ORDER BY c DESC, SearchPhrase LIMIT 5

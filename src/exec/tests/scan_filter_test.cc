@@ -1,8 +1,10 @@
 #include "antb1/exec/scan_filter.h"
 
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -32,8 +34,8 @@ using testing::Column;
 using testing::Int64s;
 using testing::Strings;
 
-constexpr CompareOp kOps[] = {CompareOp::kEq, CompareOp::kNe, CompareOp::kLt,
-                              CompareOp::kLe, CompareOp::kGt, CompareOp::kGe};
+constexpr std::array<CompareOp, 6> kOps = {CompareOp::kEq, CompareOp::kNe, CompareOp::kLt,
+                                           CompareOp::kLe, CompareOp::kGt, CompareOp::kGe};
 
 class ScanFilterTest : public testing::ExecTest {
  protected:
@@ -55,7 +57,7 @@ class ScanFilterTest : public testing::ExecTest {
                                                    1};
     const std::vector<std::optional<std::string>> s = {
         "",    "a", "ab",         std::nullopt, "abc", "b", "\xff", "\xc3\xa9t\xc3\xa9",
-        "a%b", "_", std::nullopt, "abcabc",     "ba"};
+        "a%b", "_", std::nullopt, "abcabc",     "bc"};
     const auto rows = static_cast<int64_t>(b.size());
     arrow::Int32Builder i;
     arrow::DoubleBuilder d;
@@ -181,6 +183,7 @@ class ScanFilterTest : public testing::ExecTest {
       }
     }
     std::vector<bool> keep;
+    keep.reserve(static_cast<std::size_t>(rows));
     for (int64_t r = 0; r < rows; ++r) {
       keep.push_back(
           arrow::bit_util::GetBit(selected.data(), static_cast<std::uint64_t>(shift + r)));
@@ -217,8 +220,9 @@ TEST_F(ScanFilterTest, KeepsTheRowsTheFilterOperatorKeeps) {
                name + " DOUBLE NaN");
     for (const std::string& c : {std::string(), std::string("ab"), std::string("\xff"),
                                  std::string("b"), std::string("a")}) {
-      ExpectSame({testing::Compare(S(), op, Text(c))}, name + " VARCHAR " + c);
-      ExpectSame({testing::Compare(N(), op, Text(c))}, name + " VARCHAR without NULLs " + c);
+      ExpectSame({testing::Compare(S(), op, Text(c))}, std::format("{} VARCHAR {}", name, c));
+      ExpectSame({testing::Compare(N(), op, Text(c))},
+                 std::format("{} VARCHAR without NULLs {}", name, c));
     }
   }
   for (const bool negated : {false, true}) {
@@ -227,8 +231,9 @@ TEST_F(ScanFilterTest, KeepsTheRowsTheFilterOperatorKeeps) {
          {std::string("a%"), std::string("%b%"), std::string("_"), std::string("%c"),
           std::string("a_c"), std::string("%"), std::string(), std::string("\xff%"),
           std::string("_t_"), std::string("a%b%c")}) {
-      ExpectSame({Like(S(), pattern, negated)}, name + "LIKE " + pattern);
-      ExpectSame({Like(N(), pattern, negated)}, name + "LIKE without NULLs " + pattern);
+      ExpectSame({Like(S(), pattern, negated)}, std::format("{}LIKE {}", name, pattern));
+      ExpectSame({Like(N(), pattern, negated)},
+                 std::format("{}LIKE without NULLs {}", name, pattern));
     }
     ExpectSame({In(S(), {Text("a"), Text("\xff"), Text("b")}, negated)}, name + "IN VARCHAR");
     ExpectSame({In(S(), {Text("zzz")}, negated)}, name + "IN VARCHAR none");

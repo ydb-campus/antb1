@@ -149,7 +149,7 @@ skip, so a skipped part never holds a matching row and results do not change.
 **Filtering while scanning.** Within the parts it reads, the scan applies the predicates of that `Filter` that read
 one column against literals (`<op>`, `[NOT] IN`, `[NOT] LIKE`, `IS NOT NULL`; `exec::PushableToScan`), when the
 table supports it for the scanned columns (`plan::Table::supports_scan_filter`): the `TableScanOperator` builds an
-`exec::MakeScanFilter` (`src/exec/scan_filter.h`) and the table returns only the rows that pass ([ADR
+`exec::MakeScanFilter` (`src/exec/include/antb1/exec/scan_filter.h`) and the table returns only the rows that pass ([ADR
 0020](adr/0020-filter-pushdown.md)). Fixed-width columns are evaluated with the `Filter`'s own `PredicateEvaluator`,
 VARCHAR columns on views into the decoded pages, with the same results. The `Filter` keeps the other predicates
 (comparisons of two columns, computed conditions). Not pushed: the narrow scans of late materialization, whose row
