@@ -286,6 +286,18 @@ std::shared_ptr<arrow::Table> Expected(const arrow::Table& all, const std::vecto
   return arrow::Table::Make(all.schema(), arrays, rows);
 }
 
+// `all` with one more column, `position`: 0, 1, ... (the rows' positions in the part).
+std::shared_ptr<arrow::Table> WithPositions(const arrow::Table& all) {
+  arrow::Int64Builder positions;
+  for (int64_t r = 0; r < all.num_rows(); ++r) {
+    EXPECT_TRUE(positions.Append(r).ok());
+  }
+  return all
+      .AddColumn(all.num_columns(), arrow::field("position", arrow::int64(), /*nullable=*/false),
+                 std::make_shared<arrow::ChunkedArray>(positions.Finish().ValueOrDie()))
+      .ValueOrDie();
+}
+
 struct Case {
   std::string name;
   std::vector<int> columns;  // positions in the scanned fields
@@ -373,6 +385,17 @@ TEST_P(ParquetFilterTest, ReturnsTheRowsThatPassAsAScanWithoutAFilter) {
         EXPECT_TRUE(got->Equals(*expected))
             << c.name << " batch " << batch_size << " part " << part << ": " << got->num_rows()
             << " rows, expected " << expected->num_rows();
+        // With positions: the same rows, and each one's position in the part.
+        auto positioned = table->ScanPart(part, fields, batch_size, arrow::default_memory_pool(),
+                                          filter, /*positions=*/true);
+        ASSERT_TRUE(positioned.ok()) << positioned.status().ToString();
+        const auto got_positions = Drain(**positioned, batch_size);
+        const auto numbered = WithPositions(*all);
+        const auto expected_positions = Expected(*numbered, c.columns, c.predicates);
+        ASSERT_TRUE(got_positions->schema()->Equals(*numbered->schema()))
+            << got_positions->schema()->ToString();
+        EXPECT_TRUE(got_positions->Equals(*expected_positions))
+            << c.name << " with positions, batch " << batch_size << " part " << part;
       }
     }
   }
@@ -437,6 +460,11 @@ TEST_F(ParquetFilterErrorsTest, UnsupportedColumnsAndBadRequests) {
       (*table)->ScanPart(5, {2}, 10, arrow::default_memory_pool(), filter).status().IsInvalid());
   EXPECT_TRUE(
       (*table)->ScanPart(0, {2}, 0, arrow::default_memory_pool(), filter).status().IsInvalid());
+  EXPECT_TRUE((*table)
+                  ->ScanPart(0, {2}, 10, arrow::default_memory_pool(), nullptr, /*positions=*/true)
+                  .status()
+                  .IsInvalid())
+      << "positions without a filter";
   auto beyond = std::make_shared<TestFilter>(
       std::vector<int>{3}, std::vector<Predicate>{[](const Value&) { return true; }});
   EXPECT_TRUE(
@@ -560,8 +588,8 @@ class CappedPool final : public arrow::MemoryPool {
 };
 
 // Out of memory anywhere in a filtered scan (pages, decoded values, the filter's kept strings,
-// the output): an OutOfMemory status, never a crash, and every byte given back; with enough
-// memory the rows are those of the unlimited scan.
+// the output, the rows' positions): an OutOfMemory status, never a crash, and every byte given
+// back; with enough memory the rows are those of the unlimited scan.
 TEST_F(ParquetFilterErrorsTest, OutOfMemoryAnywhere) {
   const auto table = Open(Write(Encoding::kDictionaryFallback));
   const std::vector<int> fields = {6, 3, 11, 12, 5};
@@ -570,7 +598,8 @@ TEST_F(ParquetFilterErrorsTest, OutOfMemoryAnywhere) {
       [](const Value& v) { return !v.null && v.integer % 2 == 0; }};
   const auto full =
       Drain(**table->ScanPart(0, fields, 200, arrow::default_memory_pool(),
-                              std::make_shared<TestFilter>(std::vector<int>{0, 1}, predicates)),
+                              std::make_shared<TestFilter>(std::vector<int>{0, 1}, predicates),
+                              /*positions=*/true),
             200);
   bool succeeded = false;
   int failures = 0;
@@ -578,7 +607,8 @@ TEST_F(ParquetFilterErrorsTest, OutOfMemoryAnywhere) {
     CappedPool pool(cap);
     {
       auto reader = table->ScanPart(
-          0, fields, 200, &pool, std::make_shared<TestFilter>(std::vector<int>{0, 1}, predicates));
+          0, fields, 200, &pool, std::make_shared<TestFilter>(std::vector<int>{0, 1}, predicates),
+          /*positions=*/true);
       ASSERT_TRUE(reader.ok()) << reader.status().ToString();
       arrow::RecordBatchVector batches;
       arrow::Status st;

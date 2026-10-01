@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -104,15 +105,110 @@ TEST_F(OperatorsTest, TableScanReadsTheFieldsInBatches) {
   // A bad field fails at Open.
   TableScanOperator bad(table, {7});
   EXPECT_TRUE(bad.Open(ctx).IsInvalid());
-  // Only the full scan of a part applies predicates.
+  // Only the scan of a part applies predicates.
   const plan::Predicate not_null{.kind = plan::Predicate::Kind::kIsNotNull,
                                  .column = testing::Column(0, "s", plan::LogicalType::kVarchar),
                                  .span = {}};
   TableScanOperator whole(table, {1, 0}, std::nullopt, std::nullopt, {not_null});
   EXPECT_TRUE(whole.Open(ctx).IsInvalid());
-  TableScanOperator narrow(table, {1, 0}, 0,
-                           LateScan{.late = {false, true}, .row_id = 1, .ordinal = 0}, {not_null});
-  EXPECT_TRUE(narrow.Open(ctx).IsInvalid());
+}
+
+// A narrow scan with pushed predicates reads only its early columns, filtered, and takes its row
+// ids from the positions in the part of the rows that passed; a predicate on a late column is
+// Invalid.
+TEST_F(OperatorsTest, FilteredNarrowScanNumbersTheRowsThatPass) {
+  const auto schema =
+      arrow::schema({arrow::field("x", arrow::int64()), arrow::field("s", arrow::binary())});
+  auto split = std::make_shared<MemoryTable>(
+      schema,
+      arrow::RecordBatchVector{
+          arrow::RecordBatch::Make(schema, 4,
+                                   {Int64s({1, std::nullopt, 3, 4}), Strings({"a", "b", "", "d"})}),
+          arrow::RecordBatch::Make(schema, 2, {Int64s({5, -6}), Strings({std::nullopt, "f"})})},
+      /*split=*/true);
+  const LateScan late{.late = {false, true}, .row_id = 1, .ordinal = 3};
+  const auto x = testing::Column(0, "x", plan::LogicalType::kBigInt);
+  for (const int64_t batch_size : {1, 2, 64}) {
+    TableScanOperator narrow(split, {0, 1}, 0, late,
+                             {Compare(x, plan::CompareOp::kGe, testing::BigInt(3))});
+    const auto rows = Run(narrow, batch_size);
+    ASSERT_NE(rows, nullptr);
+    EXPECT_EQ(Int64Column(*rows, 0), (std::vector<std::optional<int64_t>>{3, 4}));
+    EXPECT_EQ(Int64Column(*rows, 1),
+              (std::vector<std::optional<int64_t>>{RowId(3, 2), RowId(3, 3)}))
+        << "batch_size=" << batch_size;
+  }
+  EXPECT_EQ(split->filtered_scans(), 3);
+  TableScanOperator on_late(
+      split, {0, 1}, 0, late,
+      {plan::Predicate{.kind = plan::Predicate::Kind::kIsNotNull,
+                       .column = testing::Column(1, "s", plan::LogicalType::kVarchar),
+                       .span = {}}});
+  ExecContext ctx{.pool = arrow::default_memory_pool(), .batch_size = 4};
+  EXPECT_TRUE(on_late.Open(ctx).IsInvalid());
+}
+
+// A table whose filtered scans return prepared batches as they are, to check what a narrow scan
+// accepts as row positions.
+class PreparedFilteredTable final : public plan::Table {
+ public:
+  PreparedFilteredTable(std::shared_ptr<arrow::Schema> schema, arrow::RecordBatchVector batches)
+      : schema_(std::move(schema)), batches_(std::move(batches)) {}
+
+  const std::shared_ptr<arrow::Schema>& schema() const override { return schema_; }
+  std::optional<int64_t> exact_row_count() const override { return std::nullopt; }
+  bool supports_scan_filter(const std::vector<int>& /*fields*/) const override { return true; }
+  std::string Describe() const override { return "prepared"; }
+
+ protected:
+  arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScan(
+      const std::vector<int>& /*fields*/, int64_t /*batch_size*/,
+      arrow::MemoryPool* /*pool*/) const override {
+    return arrow::Status::NotImplemented("prepared batches are for filtered scans");
+  }
+  arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScanPartFiltered(
+      int64_t /*part*/, const std::vector<int>& /*fields*/, int64_t /*batch_size*/,
+      arrow::MemoryPool* /*pool*/, const std::shared_ptr<const plan::ScanFilter>& /*filter*/,
+      bool /*positions*/) const override {
+    return std::make_unique<testing::VectorReader>(batches_.front()->schema(), batches_);
+  }
+
+ private:
+  std::shared_ptr<arrow::Schema> schema_;
+  arrow::RecordBatchVector batches_;
+};
+
+// A filtered narrow scan needs the positions as the last column, INT64 without NULLs, and within
+// a part's 2^32 rows; anything else is Invalid.
+TEST_F(OperatorsTest, FilteredNarrowScanChecksThePositions) {
+  const auto schema =
+      arrow::schema({arrow::field("x", arrow::int64()), arrow::field("s", arrow::binary())});
+  const auto x = testing::Column(0, "x", plan::LogicalType::kBigInt);
+  const auto run = [&](const std::shared_ptr<arrow::RecordBatch>& batch) {
+    auto table = std::make_shared<PreparedFilteredTable>(schema, arrow::RecordBatchVector{batch});
+    TableScanOperator narrow(table, {0, 1}, 0,
+                             LateScan{.late = {false, true}, .row_id = 1, .ordinal = 0},
+                             {Compare(x, plan::CompareOp::kGe, testing::BigInt(0))});
+    ExecContext ctx{.pool = arrow::default_memory_pool(), .batch_size = 4};
+    EXPECT_TRUE(narrow.Open(ctx).ok());
+    return narrow.Next().status();
+  };
+  const auto with = [](const std::shared_ptr<arrow::Array>& positions) {
+    return arrow::RecordBatch::Make(arrow::schema({arrow::field("x", arrow::int64()),
+                                                   arrow::field("position", positions->type())}),
+                                    2, {Int64s({1, 2}), positions});
+  };
+  EXPECT_TRUE(run(with(Int64s({0, 1}))).ok());
+  EXPECT_TRUE(run(with(Int64s({(kRowIdParts * 2) - 2, (kRowIdParts * 2) - 1}))).ok());
+  EXPECT_TRUE(run(arrow::RecordBatch::Make(arrow::schema({arrow::field("x", arrow::int64())}), 2,
+                                           {Int64s({1, 2})}))
+                  .IsInvalid())
+      << "no positions";
+  EXPECT_TRUE(run(with(Strings({"0", "1"}))).IsInvalid()) << "not INT64";
+  EXPECT_TRUE(run(with(Int64s({0, std::nullopt}))).IsInvalid()) << "a NULL position";
+  EXPECT_TRUE(run(with(Int64s({-1, 0}))).IsInvalid()) << "a negative position";
+  EXPECT_TRUE(run(with(Int64s({1, kRowIdParts * 2}))).IsInvalid()) << "past 2^32 rows";
+  EXPECT_TRUE(run(with(Int64s({1, std::numeric_limits<int64_t>::max()}))).IsInvalid());
 }
 
 TEST_F(OperatorsTest, TableScanRenamesButNeverRetypes) {

@@ -43,6 +43,8 @@ Proposed
   - The first late column carries instead each row's id, `(part number << 32) | position in the part`.
   - The part top-N buffers keep these narrow rows, with the same sort and tie order as today: input order within a part,
     then part order. So the chosen rows and their order are unchanged.
+  - With filter pushdown ([ADR 0020](0020-filter-pushdown.md)), the narrow scan applies the pushed predicates on its
+    early columns, and the table reports the positions of the rows that pass, from which it makes their ids.
 - **The fetch:** after the merge, the operator reads the late columns for the rows of the output window
   `[offset, offset + limit)`:
   - It groups the rows by part.

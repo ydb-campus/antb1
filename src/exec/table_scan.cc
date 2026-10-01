@@ -56,8 +56,9 @@ TableScanOperator::TableScanOperator(std::shared_ptr<plan::Table> table, std::ve
 arrow::Status TableScanOperator::Open(ExecContext& ctx) {
   offset_ = 0;
   pool_ = ctx.pool;
-  if (!pushed_.empty() && (!part_.has_value() || late_.has_value())) {
-    return arrow::Status::Invalid("only the full scan of a part applies predicates");
+  positioned_ = false;
+  if (!pushed_.empty() && !part_.has_value()) {
+    return arrow::Status::Invalid("only the scan of a part applies predicates");
   }
   if (late_.has_value()) {
     const LateScan& late = late_.value();
@@ -67,7 +68,16 @@ arrow::Status TableScanOperator::Open(ExecContext& ctx) {
         late.ordinal >= kRowIdParts) {
       return arrow::Status::Invalid("a narrow scan of a part needs its late columns and row id");
     }
-    ARROW_ASSIGN_OR_RAISE(reader_, table_->ScanPart(*part_, read_, ctx.batch_size, ctx.pool));
+    if (pushed_.empty()) {
+      ARROW_ASSIGN_OR_RAISE(reader_, table_->ScanPart(*part_, read_, ctx.batch_size, ctx.pool));
+    } else {
+      // The predicates read output columns; the scan reads only the early ones (read_), and
+      // reports the positions of the rows that pass for their row ids.
+      ARROW_ASSIGN_OR_RAISE(auto filter, NarrowFilter(late, ctx.pool));
+      ARROW_ASSIGN_OR_RAISE(reader_, table_->ScanPart(*part_, read_, ctx.batch_size, ctx.pool,
+                                                      filter, /*positions=*/true));
+      positioned_ = true;
+    }
   } else if (part_.has_value()) {
     std::shared_ptr<const plan::ScanFilter> filter;
     if (!pushed_.empty()) {
@@ -100,10 +110,45 @@ arrow::Result<Batch> TableScanOperator::Next() {
   return Batch{.data = std::move(batch), .selection = {}};
 }
 
+arrow::Result<std::shared_ptr<const plan::ScanFilter>> TableScanOperator::NarrowFilter(
+    const LateScan& late, arrow::MemoryPool* pool) const {
+  std::vector<int> read_index(fields_.size(), -1);  // per output column: its position in read_
+  arrow::FieldVector read_fields;
+  for (std::size_t i = 0; i < fields_.size(); ++i) {
+    if (!late.late[i]) {
+      read_index[i] = static_cast<int>(read_fields.size());
+      read_fields.push_back(schema_->field(static_cast<int>(i)));
+    }
+  }
+  std::vector<plan::Predicate> rebound = pushed_;
+  for (plan::Predicate& p : rebound) {
+    if (!p.column.has_value() || p.column->index < 0 ||
+        std::cmp_greater_equal(p.column->index, fields_.size()) ||
+        read_index[static_cast<std::size_t>(p.column->index)] < 0) {
+      return arrow::Status::Invalid("a narrow scan applies predicates on its early columns only");
+    }
+    p.column->index = read_index[static_cast<std::size_t>(p.column->index)];
+  }
+  return MakeScanFilter(rebound, *arrow::schema(std::move(read_fields)), pool);
+}
+
 arrow::Result<Batch> TableScanOperator::Narrow(const arrow::RecordBatch& read,
                                                const LateScan& late) {
   const int64_t rows = read.num_rows();
-  if (offset_ + rows > kRowIdParts * 2) {
+  // A filtered scan reports the rows' positions in the part (increasing); else they follow on.
+  const arrow::Int64Array* positions = nullptr;
+  bool in_range = offset_ + rows <= kRowIdParts * 2;
+  if (positioned_) {
+    if (std::cmp_not_equal(read.num_columns(), read_.size() + 1) ||
+        read.column(read.num_columns() - 1)->type_id() != arrow::Type::INT64 ||
+        read.column(read.num_columns() - 1)->null_count() > 0) {
+      return arrow::Status::Invalid("a filtered narrow scan without row positions");
+    }
+    positions = &static_cast<const arrow::Int64Array&>(*read.column(read.num_columns() - 1));
+    in_range =
+        rows == 0 || (positions->Value(0) >= 0 && positions->Value(rows - 1) < kRowIdParts * 2);
+  }
+  if (!in_range) {
     return arrow::Status::Invalid("a part of more than 2^32 rows has no row ids");
   }
   arrow::ArrayVector columns;
@@ -116,7 +161,8 @@ arrow::Result<Batch> TableScanOperator::Narrow(const arrow::RecordBatch& read,
       arrow::Int64Builder ids(pool_);
       ARROW_RETURN_NOT_OK(ids.Reserve(rows));
       for (int64_t r = 0; r < rows; ++r) {
-        ids.UnsafeAppend(RowId(late.ordinal, offset_ + r));
+        ids.UnsafeAppend(
+            RowId(late.ordinal, positions != nullptr ? positions->Value(r) : offset_ + r));
       }
       ARROW_ASSIGN_OR_RAISE(auto array, ids.Finish());
       columns.push_back(std::move(array));

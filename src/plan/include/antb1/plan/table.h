@@ -108,15 +108,20 @@ class Table {
 
   // Scans the rows of part `part` that pass `filter` (whose columns are positions in `fields`), as
   // ScanPart does, but only those rows, in the same order: the same batches but for the rows left
-  // out (a batch may lose every row and is then not returned). NotImplemented where
-  // supports_scan_filter(fields) is false.
+  // out (a batch may lose every row and is then not returned). With `positions`, the batches have
+  // one more column after the fields, `position` (INT64, not null): each row's position in the
+  // part, counting every row of the part (they increase). NotImplemented where
+  // supports_scan_filter(fields) is false; Invalid for `positions` without a filter.
   arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> ScanPart(
       int64_t part, const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool,
-      const std::shared_ptr<const ScanFilter>& filter) const {
+      const std::shared_ptr<const ScanFilter>& filter, bool positions = false) const {
     if (filter == nullptr) {
+      if (positions) {
+        return arrow::Status::Invalid("a scan reports row positions only with a filter");
+      }
       return DoScanPart(part, fields, batch_size, pool);
     }
-    return DoScanPartFiltered(part, fields, batch_size, pool, filter);
+    return DoScanPartFiltered(part, fields, batch_size, pool, filter, positions);
   }
 
   // The exact statistics of top-level field `field` in part `part`, if known and integer-valued;
@@ -157,7 +162,8 @@ class Table {
   // ScanPart with a filter, for tables that support it.
   virtual arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScanPartFiltered(
       int64_t /*part*/, const std::vector<int>& /*fields*/, int64_t /*batch_size*/,
-      arrow::MemoryPool* /*pool*/, const std::shared_ptr<const ScanFilter>& /*filter*/) const {
+      arrow::MemoryPool* /*pool*/, const std::shared_ptr<const ScanFilter>& /*filter*/,
+      bool /*positions*/) const {
     return arrow::Status::NotImplemented("this table cannot filter while it scans");
   }
 };

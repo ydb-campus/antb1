@@ -74,8 +74,10 @@ Proposed
     and bytewise comparisons.
   - The logical plan and EXPLAIN are unchanged; the Filter operator keeps only what was not pushed, and
     `explain --analyze` shows the count on the `Scan`.
-- **Not pushed (first version):** late materialization's narrow scans (ADR 0016), whose row ids count the part's
-  rows. Predicates over two columns, or over computed values, stay in the Filter operator.
+- **Late materialization's narrow scans** (ADR 0016) are filtered too, on their early columns. Their row ids name a
+  row's position in the part, which a filtered scan no longer gives by counting, so a filtered `ScanPart` can report
+  them: with `positions`, every batch ends with a `position` column (INT64), each row's position in the part.
+- **Not pushed:** predicates over two columns, or over computed values, stay in the Filter operator.
 
 ## Consequences
 
@@ -90,7 +92,7 @@ Proposed
   - parts of several files.
 
   They also check that a corrupt page is an IOError naming the file.
-- **Follow-ups:**
-  - evaluating string predicates once per dictionary entry for dictionary-encoded chunks;
-  - skipping pages by statistics (granularity 2);
-  - pushdown into late materialization's scans, with the scan reporting the positions of the rows that pass.
+- **Deferred** until a dataset needs them (the ClickBench files have no page index and large pages, and their long
+  strings are mostly plain-encoded, so neither would gain much there):
+  - **skipping pages by statistics** (granularity 2), for files written with page indexes and smaller pages;
+  - **evaluating string predicates once per dictionary entry** for dictionary-encoded pages.

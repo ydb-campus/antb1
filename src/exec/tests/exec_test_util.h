@@ -204,13 +204,20 @@ class MemoryTable final : public plan::Table {
   }
   arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScanPartFiltered(
       int64_t part, const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool,
-      const std::shared_ptr<const plan::ScanFilter>& filter) const override {
+      const std::shared_ptr<const plan::ScanFilter>& filter, bool positions) const override {
     if (!split_ || !scan_filter_) {
-      return plan::Table::DoScanPartFiltered(part, fields, batch_size, pool, filter);
+      return plan::Table::DoScanPartFiltered(part, fields, batch_size, pool, filter, positions);
     }
     ++filtered_scans_;
     ARROW_ASSIGN_OR_RAISE(auto reader, DoScanPart(part, fields, batch_size, pool));
+    auto schema = reader->schema();
+    if (positions) {
+      ARROW_ASSIGN_OR_RAISE(
+          schema, schema->AddField(schema->num_fields(),
+                                   arrow::field("position", arrow::int64(), /*nullable=*/false)));
+    }
     arrow::RecordBatchVector out;
+    int64_t first = 0;  // the position in the part of the batch's first row
     while (true) {
       std::shared_ptr<arrow::RecordBatch> batch;
       ARROW_RETURN_NOT_OK(reader->ReadNext(&batch));
@@ -218,6 +225,16 @@ class MemoryTable final : public plan::Table {
         break;
       }
       const int64_t rows = batch->num_rows();
+      if (positions) {
+        arrow::Int64Builder all(pool);
+        for (int64_t i = 0; i < rows; ++i) {
+          ARROW_RETURN_NOT_OK(all.Append(first + i));
+        }
+        ARROW_ASSIGN_OR_RAISE(const auto column, all.Finish());
+        ARROW_ASSIGN_OR_RAISE(
+            batch, batch->AddColumn(batch->num_columns(), schema->fields().back(), column));
+      }
+      first += rows;
       ARROW_ASSIGN_OR_RAISE(auto selected, arrow::AllocateEmptyBitmap(rows, pool));
       arrow::bit_util::SetBitsTo(selected->mutable_data(), 0, rows, true);
       for (std::size_t k = 0; k < filter->columns().size(); ++k) {
@@ -262,7 +279,7 @@ class MemoryTable final : public plan::Table {
         out.push_back(kept.record_batch());
       }
     }
-    return std::make_unique<VectorReader>(reader->schema(), std::move(out));
+    return std::make_unique<VectorReader>(std::move(schema), std::move(out));
   }
 
  private:

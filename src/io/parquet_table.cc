@@ -621,7 +621,7 @@ bool ParquetTable::supports_scan_filter(const std::vector<int>& fields) const {
 
 arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> ParquetTable::DoScanPartFiltered(
     int64_t part, const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool,
-    const std::shared_ptr<const plan::ScanFilter>& filter) const {
+    const std::shared_ptr<const plan::ScanFilter>& filter, bool positions) const {
   if (part < 0 || part >= num_parts()) {
     return arrow::Status::Invalid("scan of part ", part, " of a table with ", num_parts(),
                                   " parts");
@@ -651,7 +651,7 @@ arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> ParquetTable::DoScanPar
                                   .footer = footers_[p.file],
                                   .row_groups = std::vector<int>{p.row_group}},
                           std::move(columns), arrow::schema(std::move(engine_fields)), batch_size,
-                          pool, filter);
+                          pool, filter, positions);
 }
 
 bool ParquetTable::StoredAsFloat(int field) const {
