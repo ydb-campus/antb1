@@ -110,7 +110,8 @@ Values come from splitmix64 with integer-only arithmetic (no `<random>` distribu
 platform generates the same data.
 
 `harness.fixtures.digest` compares the generated files with `tests/fixtures/fixtures.digest`, a logical digest
-(schema, row groups and values; not compression or page layout), on every leg, macOS included. After an intended
+(schema, row groups and values; not compression or page layout), on every leg, macOS included. It skips the
+top-level `tpch/` directory, where the data derived from TPC-H is generated at test time. After an intended
 change of the generator, run the tests once (they regenerate the fixtures, and the digest test fails), rewrite the
 digest, regenerate the `.slt` expectations and the CLI goldens, and review every diff:
 
@@ -173,7 +174,17 @@ ANTB1_DIFF_SEED=7 ANTB1_DIFF_COUNT=20000 pixi run diff-random   # a longer run
 ```
 
 The reproduction holds while `tests/slt/supported_features.h`, the generator and the tables are unchanged. Once
-the bug is fixed, add the query to an `.slt` file (with `pixi run slt-complete`) so that it stays covered.
+the bug is fixed, add the query to an `.slt` file (with `pixi run slt-complete`) so that it stays covered. A run over
+another tables file prints its own command line with `--only <case>` instead of the `pixi run diff-random` line.
+
+## Stored answers
+
+`antb1-slt answers` checks answers that DuckDB stored next to their queries, for data, queries and answers
+generated together at test time. It runs numbered queries (`q01.sql`, `q02.sql`, ...) on the DuckDB oracle and
+compares each result with the stored answer of the same number: the column count, then the cells by the oracle's
+column class (DECIMAL by value, since a stored answer may drop trailing zeros), and the rows in order or, reported as
+such, in another order. Its output is always redacted; `--show-values` prints the SQL and the rows in a local run
+and is refused on GitHub Actions. Details: [tests/slt/README.md](../tests/slt/README.md#stored-answers-answers).
 
 ## Metamorphic tests
 
@@ -199,9 +210,10 @@ Exit codes are never rewritten: change `EXIT_CODE` in `tests/cli/CMakeLists.txt`
 
 The `harness` label proves that the harness catches failures: every corruption of antb1's answers (`--mutate`) must
 make the slt runner and the differential test fail; `--redact` output never contains SQL, values or error messages
-(the canaries in `tests/slt/canary/`); the golden comparison catches changed output and exit codes; the fuzz replay
-catches a broken unparser; the fixtures match their digest. A change to the harness comes with a self-test that
-fails without it.
+(the canaries in `tests/slt/canary/`), and neither does the output of `answers` or of a run over tables marked
+`redact` in their tables file, which is redacted without `--redact`; the golden comparison catches changed output and
+exit codes; the fuzz replay catches a broken unparser; the fixtures match their digest. A change to the harness
+comes with a self-test that fails without it.
 
 ## Coverage
 
@@ -392,6 +404,7 @@ loads extensions. Never commit or paste TPC-H data, answers, query text in any d
 output of those queries; refer to queries by number. The smoke test `harness.tpch.extension` (label `harness`, in
 `tests/tpch/`) checks that the extension loads. The package is installed on Linux only (pixi cannot re-sign the
 osx-arm64 build), so these tests run on Linux and are not registered on macOS. Installing the `default` or `gcc`
-environment on Linux, also on CI runners, installs dbgen and accepts its EULA. This workload is derived from the TPC-H
-Benchmark and is not comparable to published TPC-H Benchmark results, as this implementation does not comply with all
-requirements of the TPC-H Benchmark.
+environment on Linux, also on CI runners, installs dbgen and accepts its EULA. Timings of these queries may appear
+anywhere, CI logs included, but never as TPC-H Benchmark results: no TPC metrics such as QphH, no comparison with
+official TPC results. This workload is derived from the TPC-H Benchmark and is not comparable to published TPC-H
+Benchmark results, as this implementation does not comply with all requirements of the TPC-H Benchmark.

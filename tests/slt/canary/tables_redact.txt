@@ -1,0 +1,3 @@
+# Tables of the self-tests of the `redact` option (harness.*.redact_table): the sentinel table of tables.txt,
+# marked `redact`, so every report is redacted without --redact.
+antb1_canary_table  edge.parquet  redact

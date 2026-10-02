@@ -228,6 +228,10 @@ arrow::Result<std::vector<FileDigest>> DigestDirectory(const fs::path& dir) {
   std::vector<std::pair<std::string, fs::path>> files;
   std::error_code ec;
   for (fs::recursive_directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+    if (it.depth() == 0 && it->path().filename() == kSkippedDirectory && it->is_directory(ec)) {
+      it.disable_recursion_pending();
+      continue;
+    }
     if (it->is_regular_file(ec) && it->path().extension() == ".parquet") {
       files.emplace_back(it->path().lexically_relative(dir).generic_string(), it->path());
     }

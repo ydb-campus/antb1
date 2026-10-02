@@ -75,9 +75,14 @@ void Report(const GeneratedQuery& q, uint64_t seed, bool supported, const Discre
                      supported ? "supported features" : "target grammar sample", d.what);
   out += std::format("  features: {}\n", q.features.Names());
   AppendDiscrepancy(d, q.sql, q.sort, options.redact, out);
+  if (!options.pixi_repro && options.command.empty()) {
+    return;
+  }
   out += options.redact ? "  repro (unredacted, prints values; run it locally):\n" : "  repro:\n";
-  out += std::format("    ANTB1_DIFF_SEED={} ANTB1_DIFF_ONLY={} pixi run diff-random\n", seed,
-                     q.index);
+  if (options.pixi_repro) {
+    out += std::format("    ANTB1_DIFF_SEED={} ANTB1_DIFF_ONLY={} pixi run diff-random\n", seed,
+                       q.index);
+  }
   if (!options.command.empty()) {
     out += std::format("    {} --only {}\n", options.command, q.index);
   }
@@ -156,11 +161,19 @@ DiffStats RunDiff(const QueryGenerator& generator, Engine& antb1, Engine& oracle
     for (const uint64_t c : stats.rejected_cases) {
       cases += std::format("{}{}", cases.empty() ? "" : " ", c);
     }
+    std::string see;
+    if (options.pixi_repro) {
+      see = std::format(
+          "; see one with ANTB1_DIFF_SEED={} ANTB1_DIFF_ONLY=<case> pixi run "
+          "diff-random",
+          generator.seed());
+    } else if (!options.command.empty()) {
+      see = std::format("; see one with {} --only <case>", options.command);
+    }
     out += std::format(
         "antb1-slt diff: NOTE: antb1 rejected {} target-grammar quer{} with a query error instead "
-        "of Unsupported (not failures; first cases: {}; see one with ANTB1_DIFF_SEED={} "
-        "ANTB1_DIFF_ONLY=<case> pixi run diff-random)\n",
-        stats.rejected, stats.rejected == 1 ? "y" : "ies", cases, generator.seed());
+        "of Unsupported (not failures; first cases: {}{})\n",
+        stats.rejected, stats.rejected == 1 ? "y" : "ies", cases, see);
   }
   if (stats.answered_outside > 0) {
     out += std::format(

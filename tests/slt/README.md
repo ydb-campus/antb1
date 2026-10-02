@@ -10,7 +10,8 @@ test oracle. DuckDB writes the expectations (`pixi run slt-complete`); humans re
 - `selftest/`: harness self-tests. `mutate.slt` and `redact_canary.slt` must pass as they are, and must
   fail under `--mutate` (`harness.slt.mutate.<kind>`, `harness.slt.redact`). `lockdown.slt` checks the
   DuckDB lockdown.
-- `canary/`: redaction canaries that fail on purpose (`harness.slt.redact_sentinels`, `harness.diff.redact`).
+- `canary/`: redaction canaries that fail on purpose (`harness.slt.redact_sentinels`, `harness.diff.redact`), and
+  `tables_redact.txt` and `redact_table.slt` for the self-tests of the `redact` option (`harness.*.redact_table`).
 - `tables.txt`: the tables every file can query, registered identically on both engines.
 - `supported_features.h`: the SQL features antb1 answers today (see "Random differential test").
 - `runner/`: the runner (`antb1_slt_lib` and `antb1-slt`); `tests/`: its unit tests (label `harness`).
@@ -90,7 +91,9 @@ DuckDB runs in memory through its C API with `threads=1`, no extension autoinsta
 access limited to the fixtures directory, temp files under `build/`, and a locked configuration. A record
 runs one statement, and only `SELECT`, `EXPLAIN`, `SET` or `LOAD`: the oracle refuses anything else
 (`COPY`, `ATTACH`, `EXPORT`, DDL, DML) with a `Permission Error` before it runs, so no record writes next
-to the shared fixtures or changes state for later records (`selftest/lockdown.slt` checks it). Each
+to the shared fixtures or changes state for later records (`selftest/lockdown.slt` checks it). It never
+loads an extension either: DuckDB refuses `LOAD`, by name or by path, once external access is off, so the oracle
+cannot run TPC's dbgen, the `tpch` extension of `tests/tpch`. Each
 table is `CREATE VIEW <name> AS SELECT * FROM read_parquet([...], binary_as_string=true)`; tables with
 the `clickbench` option replace `EventDate` with `make_date(EventDate)`.
 
@@ -150,11 +153,43 @@ The ClickBench data tests (`tests/data`, label `data`) use two more subcommands:
 `canary/canary_queries.sql` and `canary/status_pass_*.json` drive their self-tests (`harness.queries.*`,
 `harness.clickbench.*`).
 
-## Options for data tests
+## Stored answers: `answers`
+
+`antb1-slt answers --queries DIR --answers DIR` checks answers that DuckDB stored next to their queries, for data,
+queries and answers generated together at test time (the data derived from TPC-H). It runs the numbered queries
+of one directory (`q01.sql`, `q02.sql`, ...: one statement each in the format of `runner/query_file.h`, numbered from
+1 without gaps) on the DuckDB oracle and compares each result with the answer of the same number in the other
+directory (`q01.csv`, ...; `runner/answers.h`). An answer is a header line and one line per row, with `|` between
+fields, an empty field for NULL and nothing trimmed.
+
+- Only the number of columns is compared, never the header's names.
+- Cells compare by the oracle's column class: `I` and `T` exactly, `R` within the tolerance, `D` by value.
+- Rows compare in order. Rows that are equal only in another order pass, reported as `pass (rows in another order)`.
+
+`D` compares by value here, although `.slt` records compare DECIMAL text exactly. An `.slt` expectation is the text
+of DuckDB's result, so its exact text also pins the scale (`DECIMAL(15,2)` prints `17.00`). A stored answer comes
+from another writer, which may drop the trailing zeros (`17`), and the column types are not part of its text.
+
+The output is always redacted: per query `Q<n>: pass`, or a failure with the error kind, the row counts, the first
+differing row and the sha256 of both blocks (`answer` and `DuckDB`). `--mutate` corrupts DuckDB's results. The
+self-tests `harness.answers.*` write our own queries over the canary table and their answers into the build tree,
+because lint R009 keeps files named like `q01.sql` out of the repository.
+
+## Redaction and other options
 
 - `--redact` never prints values or SQL: only the record id, column types, row counts, the first
-  differing row and the sha256 of each side's block (`harness.slt.redact` guards it).
+  differing row and the sha256 of each side's block (`harness.slt.redact` guards it). `diff --list`, which prints
+  the generated SQL, is refused with it.
+- The `redact` option of a table in the tables file (`runner/tables.h`), for data that must never be printed,
+  makes every run redacted without `--redact`. `diff --list` and `complete`, which print or write values, are
+  refused (`harness.*.redact_table`).
+- `--show-values` lifts the redaction of `redact` tables and of `answers` for a local repro
+  (`harness.answers.show_values`): the repro command of a redacted failure carries it. It is refused when
+  `GITHUB_ACTIONS=true` (`harness.answers.show_values_on_ci`), because CI logs are public. An explicit `--redact`
+  always wins (`harness.queries.redact_wins`).
 - `--mutate <kind>` corrupts antb1 results (`value`, `null`, `drop-row`, `extra-row`, `extra-column`,
   `error`, `unsupported`, `succeed`, `canary`); the self-tests prove that each one is caught.
 
-Both options work for `run`, `diff`, `queries` and `clickbench`.
+`--redact` and `--mutate` work for `run`, `diff`, `queries` and `clickbench`; `answers` takes `--mutate`, and
+`--show-values` works for all five. The `pixi run diff-random` repro of a `diff` failure is printed only for the
+tables of that task (`tables.txt`); every failure also prints its exact command line with `--only`.
