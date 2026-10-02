@@ -69,6 +69,22 @@ std::optional<Int128> ParseInt128(std::string_view text) {
   return value;
 }
 
+// A DECIMAL's canonical text ("-0.25", ".500", "17": plan::FormatDecimal) as its unscaled value and
+// its number of fraction digits, the scale; std::nullopt for any other text.
+std::optional<std::pair<Int128, std::size_t>> ParseDecimal(std::string_view text) {
+  const std::size_t point = text.find('.');
+  if (point == std::string_view::npos) {
+    const auto value = ParseInt128(text);
+    return value.has_value() ? std::optional(std::pair(*value, std::size_t{0})) : std::nullopt;
+  }
+  const std::string_view fraction = text.substr(point + 1);
+  const auto value = ParseInt128(std::string(text.substr(0, point)) + std::string(fraction));
+  if (!value.has_value() || fraction.empty()) {
+    return std::nullopt;
+  }
+  return std::pair(*value, fraction.size());
+}
+
 template <class T>
 int ThreeWay(const T& a, const T& b) {
   if (a < b) {
@@ -108,6 +124,14 @@ std::optional<int> CompareValues(const Value& a, const Value& b) {
     }
     case ColumnClass::kText:  // bytes (char_traits<char> compares as unsigned char); dates sort too
       return a.text->compare(*b.text);
+    case ColumnClass::kDecimal: {  // by value within one type: the unscaled values at one scale
+      const auto x = ParseDecimal(*a.text);
+      const auto y = ParseDecimal(*b.text);
+      if (!x.has_value() || !y.has_value() || x->second != y->second) {
+        return std::nullopt;
+      }
+      return ThreeWay(x->first, y->first);
+    }
   }
   return std::nullopt;
 }

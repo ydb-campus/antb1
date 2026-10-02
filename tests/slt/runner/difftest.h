@@ -21,10 +21,10 @@
 //     set: counted as "rejected" and listed, not a failure (the target grammar promises
 //     Unsupported there; the sql unit tests own that contract);
 //   - any other antb1 error (internal errors always), a DuckDB error, different column types
-//     (the engine type names, e.g. HUGEINT vs BIGINT, not only I/R/T) or different results: a
-//     failure. The generator only writes SQL that DuckDB accepts, so the
-//     oracle runs every query, also those antb1 does not support (a DuckDB error is a generator
-//     bug).
+//     (the engine type names, e.g. HUGEINT vs BIGINT or DECIMAL(15,2) vs DECIMAL(16,2), not only
+//     I/R/D/T) or different results: a failure. The generator only writes SQL that DuckDB
+//     accepts, so the oracle runs every query, also those antb1 does not support (a DuckDB error
+//     is a generator bug).
 // A failure prints the seed, the case index, the features, the SQL, at most 5 differing rows and
 // the repro `ANTB1_DIFF_SEED=<seed> ANTB1_DIFF_ONLY=<index> pixi run diff-random`. With `redact`
 // it prints no SQL and no values: only features, column types, row counts, the first differing

@@ -14,15 +14,13 @@
 #include "canonical.h"
 
 // The sqllogictest subset of antb1-slt (tests/slt/README.md):
-//   statement ok | statement error [regex]      SQL lines up to a blank line
-//   query <I|R|T...> [nosort|rowsort|valuesort] [label]
-//                                               SQL lines, "----", expected lines up to a blank
-//                                               line
-//   skipif <engine> | onlyif <engine>           conditions of the next record (engine:
-//   antb1|duckdb) halt                                        stop the file (with a condition: for
-//   that engine only) hash-threshold <n>                          hash results with more than n
-//   values (0: never) # comment                                   "# tol <rel>" sets the R
-//   tolerance of the next query
+// - statement ok | statement error [regex]: SQL lines up to a blank line.
+// - query <I|R|D|T...> [nosort|rowsort|valuesort] [label]: SQL lines, "----", then the expected
+//   lines up to a blank line.
+// - skipif <engine> | onlyif <engine> (antb1 or duckdb): conditions of the next record.
+// - halt: stop the file (with a condition: for that engine only).
+// - hash-threshold <n>: hash results with more than n values (0: never).
+// - # comment; "# tol <rel>" sets the R tolerance of the next query.
 
 namespace antb1::slt {
 
@@ -42,7 +40,7 @@ struct Record {
   std::string sql;
   std::string error_regex;   // statement error
   std::regex error_pattern;  // error_regex compiled (ParseSlt rejects invalid regexes)
-  std::string types;         // query: one of I, R, T per column
+  std::string types;         // query: one of I, R, D, T per column
   SortMode sort = SortMode::kNoSort;
   std::string label;
   std::optional<double> tolerance;  // "# tol <rel>" before the record
@@ -66,6 +64,11 @@ struct SltFile {
 };
 
 inline constexpr std::array<std::string_view, 2> kEngineNames{"antb1", "duckdb"};
+
+// Why `sort` cannot check a record whose columns have the classes `types`, or std::nullopt.
+// valuesort loses the columns: with an R column, every value compares within the tolerance, so
+// it refuses D columns next to R ones.
+std::optional<std::string> SortModeProblem(std::string_view types, SortMode sort);
 
 // Parses the text of an .slt file; the error names path:line.
 std::expected<SltFile, std::string> ParseSlt(const std::string& path, std::string_view text);

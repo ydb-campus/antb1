@@ -3,6 +3,7 @@
 
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -60,6 +61,36 @@ TEST(CompareSubset, RealColumnsMatchWithinTheTolerance) {
   EXPECT_FALSE(CompareSubset(oracle, unlimited, Result(ir, {{"2", "1000000001"}})));
   EXPECT_TRUE(CompareSubset(oracle, unlimited, Result(ir, {{"2", "1000000100"}})));
   EXPECT_TRUE(CompareSubset(oracle, unlimited, Result(ir, {{"3", "0.3"}}))) << "the I cell differs";
+}
+
+TEST(CompareSubset, DecimalColumnsMatchExactly) {
+  // (BIGINT, DECIMAL(12,2)) or (BIGINT, DOUBLE) rows.
+  const auto rows = [](ColumnClass cls, std::vector<Row> values, std::string type) {
+    return ResultSet{.classes = {ColumnClass::kInteger, cls},
+                     .type_names = {"BIGINT", std::move(type)},
+                     .rows = std::move(values)};
+  };
+  const auto decimals = [&](std::vector<Row> values, std::string type = "DECIMAL(12,2)") {
+    return rows(ColumnClass::kDecimal, std::move(values), std::move(type));
+  };
+  const auto reals = [&](std::vector<Row> values) {
+    return rows(ColumnClass::kReal, std::move(values), "DOUBLE");
+  };
+  const std::vector<Row> all = {{"1", "1234567890.12"}, {"2", "-0.25"}};
+  const auto oracle = decimals({{"1", "1234567890.12"}});
+  EXPECT_FALSE(CompareSubset(oracle, decimals(all), decimals({{"2", "-0.25"}})));
+  // A wrong last digit or scale fails as D and passes as R; so does a missing leading zero.
+  for (const std::string_view wrong : {"1234567890.13", "1234567890.120", "1234567890.1"}) {
+    EXPECT_TRUE(CompareSubset(oracle, decimals(all), decimals({{"1", std::string(wrong)}})))
+        << wrong;
+    EXPECT_FALSE(CompareSubset(reals({{"1", "1234567890.12"}}), reals(all),
+                               reals({{"1", std::string(wrong)}})))
+        << wrong;
+  }
+  EXPECT_TRUE(CompareSubset(oracle, decimals(all), decimals({{"2", "-.25"}})));
+  EXPECT_TRUE(
+      CompareSubset(oracle, decimals(all), decimals({{"1", "1234567890.12"}}, "DECIMAL(13,2)")))
+      << "a wider type";
 }
 
 TEST(CompareLimited, RunsTheUnlimitedQueryOnlyWhenTheRowsDiffer) {

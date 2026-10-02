@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -28,6 +29,7 @@ ResultSet Result(std::vector<ColumnClass> classes, std::vector<Row> rows) {
 constexpr auto kI = ColumnClass::kInteger;
 constexpr auto kR = ColumnClass::kReal;
 constexpr auto kT = ColumnClass::kText;
+constexpr auto kD = ColumnClass::kDecimal;
 
 TEST(MakeOrderedQuery, AppendsTheKeysAndDropsLimitAndOffset) {
   const auto q = MakeOrderedQuery(
@@ -207,6 +209,42 @@ TEST(CompareOrdered, RealValuesAndKeysUseTheTolerance) {
   EXPECT_FALSE(
       CompareOrdered(answer, Result({kR}, {{"2.5000000000000004"}}), query, std::ref(oracle)));
   EXPECT_TRUE(CompareOrdered(answer, Result({kR}, {{"9"}}), query, std::ref(oracle)));
+}
+
+TEST(CompareOrdered, DecimalValuesCompareExactly) {
+  // (value, key) rows: two DECIMAL values tied on key 1, then one more.
+  Oracle oracle({kD, kI}, {{"1234567890.12", "1"}, {"-0.25", "1"}, {".500", "2"}});
+  const auto query = Query(std::nullopt, 0);
+  const auto answer = oracle.Answer(1, 0, std::nullopt);
+  EXPECT_FALSE(CompareOrdered(answer, Result({kD}, {{"-0.25"}, {"1234567890.12"}, {".500"}}), query,
+                              std::ref(oracle)))
+      << "ties in any order";
+  // A wrong last digit or scale is another value.
+  for (const std::string_view wrong : {"1234567890.13", "1234567890.120"}) {
+    const auto d = CompareOrdered(answer, Result({kD}, {{"-0.25"}, {std::string(wrong)}, {".500"}}),
+                                  query, std::ref(oracle));
+    ASSERT_TRUE(d.has_value()) << wrong;
+    EXPECT_TRUE(d.value_or(Discrepancy{}).mismatch) << wrong;
+  }
+  // As R values, the same wrong cent is within the tolerance.
+  Oracle real({kR, kI}, {{"1234567890.12", "1"}, {"-0.25", "1"}, {"0.5", "2"}});
+  EXPECT_FALSE(CompareOrdered(real.Answer(1, 0, std::nullopt),
+                              Result({kR}, {{"-0.25"}, {"1234567890.13"}, {"0.5"}}), query,
+                              std::ref(real)));
+}
+
+TEST(CompareOrdered, DecimalKeysWithinTheRealToleranceAreDifferentRuns) {
+  // Keys 1234567890.12 and 1234567890.13: one run of ties as R keys, two runs as D keys, so the
+  // order of rows 1 and 2 is fixed.
+  const auto query = Query(std::nullopt, 0);
+  Oracle real({kI, kR}, {{"1", "1234567890.12"}, {"2", "1234567890.13"}});
+  EXPECT_FALSE(CompareOrdered(real.Answer(1, 0, std::nullopt), Result({kI}, {{"2"}, {"1"}}), query,
+                              std::ref(real)));
+  Oracle decimal({kI, kD}, {{"1", "1234567890.12"}, {"2", "1234567890.13"}});
+  const auto d = CompareOrdered(decimal.Answer(1, 0, std::nullopt), Result({kI}, {{"2"}, {"1"}}),
+                                query, std::ref(decimal));
+  ASSERT_TRUE(d.has_value());
+  EXPECT_TRUE(d.value_or(Discrepancy{}).mismatch);
 }
 
 TEST(CompareOrdered, ReportsOracleFailuresAndBadShapes) {

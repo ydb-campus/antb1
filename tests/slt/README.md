@@ -57,8 +57,12 @@ In an expected block each row is one line; the cells of a row are separated by a
 - `statement ok` / `statement error [regex]`: the statement must succeed / fail. The regex (ECMAScript) is
   searched in the error text: antb1 reports `<kind>: <message>` with kind `parse`, `bind`, `io` or
   `execution`; DuckDB reports its own text (`Catalog Error: ...`). A regex usually needs `onlyif`.
-- `query <types> [nosort|rowsort|valuesort] [label]`: one letter per column, `I` integer, `R` real, `T` text
-  (dates too). The engine's column types must match. Queries with the same label must return the same result.
+- `query <types> [nosort|rowsort|valuesort] [label]`: one letter per column, `I` integer, `R` real, `D` decimal (a
+  `DECIMAL(p,s)` of any scale), `T` text (dates too). The engine's column classes must match. A record does not check
+  type names: a DECIMAL's text shows its scale, but `DECIMAL(15,2)` and `DECIMAL(18,2)` print alike (the diff,
+  query-file and ClickBench runs compare type names). `valuesort` refuses a record with both `R` and `D` columns: it
+  loses the columns, so every value would compare within the R tolerance. Queries with the same label must return the
+  same result.
 - `skipif <engine>` / `onlyif <engine>` (engine `antb1` or `duckdb`) guard the next record.
 - `halt` stops the file (for one engine when guarded); `hash-threshold <n>` hashes results with more than
   `n` values (0: never), except results with an R column.
@@ -72,11 +76,13 @@ errors never satisfy `statement error`.
 
 ## Canonical values
 
-Both engines produce the same canonical text (`runner/canonical.h`): integers exactly (SUM is a 128-bit
-HUGEINT), doubles as the shortest round-trip form, dates as `YYYY-MM-DD`, strings as bytes. Cells are
-escaped: `NULL`, `(empty)` for the empty string, `\t` `\n` `\r` `\\`, and `\xHH` for control characters,
-invalid UTF-8 bytes and leading or trailing spaces. `I` and `T` compare exactly; `R` compares with
-relative tolerance 1e-9 plus absolute 1e-12 (`# tol` overrides the relative part).
+Both engines produce the same canonical text (`runner/canonical.h`): integers exactly (SUM is a 128-bit HUGEINT),
+doubles as the shortest round-trip form, decimals as DuckDB prints them (exactly s digits after the point, and a leading
+`0` only when p > s, [ADR 0021](../../docs/adr/0021-decimal-semantics.md) rule 15: `DECIMAL(15,2)` prints `17.00` and
+`-0.25`, `DECIMAL(3,3)` prints `.500`), dates as `YYYY-MM-DD`, strings as bytes. Cells are escaped: `NULL`, `(empty)`
+for the empty string, `\t` `\n` `\r` `\\`, and `\xHH` for control characters, invalid UTF-8 bytes and leading or
+trailing spaces. `I`, `D` and `T` compare exactly; `R` compares with relative tolerance 1e-9 plus absolute 1e-12
+(`# tol` overrides the relative part).
 
 ## The DuckDB oracle
 
@@ -102,10 +108,11 @@ list and without `LIMIT`/`OFFSET` (its limit grows until the run of ties at the 
 antb1's row `i` must be a distinct row of the run of equal keys at rank `offset + i` (`CompareOrdered`,
 `runner/ordered_compare.h`). At most 2^20 rows are fetched in order: when the run at the window's end goes on
 beyond them (millions of groups tied at a count, say), one more query fetches only the rows of that run whose
-cells equal antb1's rows there, written as SQL literals. The query files of the data tests and the ClickBench
+cells equal antb1's rows there, written as SQL literals (`D` and `T` cells compare with the column's text as DuckDB
+prints it, so a DECIMAL literal is never rounded or respelled). The query files of the data tests and the ClickBench
 runner check the same way (`CompareQueryAnswers`). The column types must match exactly (`BIGINT`, `HUGEINT`,
-...), not only their `I`/`R`/`T` class. Query `i` of seed `s` depends only on `s`, `i`, the tables and the supported
-features, so one case reproduces alone.
+`DECIMAL(15,2)`, ...), not only their `I`/`R`/`D`/`T` class. Query `i` of seed `s` depends only on `s`, `i`, the tables
+and the supported features, so one case reproduces alone.
 
 - 75% of the queries use only the features in `supported_features.h` (`kSupportedFeatures`); the rest
   sample the full target grammar of `docs/sql-subset.md` (`--target-percent`).

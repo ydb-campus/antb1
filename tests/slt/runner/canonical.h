@@ -6,14 +6,18 @@
 #include <string_view>
 #include <vector>
 
+#include "antb1/common/int128.h"
+
 #include "engine.h"
 
 // The one canonical text form of result values, shared by both engines, and the sqllogictest
 // rendering and comparison built on it:
 //   value text  integers (up to 128 bits) exactly; doubles as the shortest round-trip form ("nan",
-//               "inf", "-inf"); dates as plan::FormatDate prints them (YYYY-MM-DD, DuckDB's form
-//               outside years 1 to 9999); strings as their bytes. antb1 produces it with
-//               engine::FormatValue; the DuckDB adapter converts its values with the helpers below.
+//               "inf", "-inf"); decimals as plan::FormatDecimal prints them, as DuckDB does
+//               (DECIMAL(15,2): 17.00, -0.25; DECIMAL(3,3): .500); dates as plan::FormatDate prints
+//               them (YYYY-MM-DD, DuckDB's form outside years 1 to 9999); strings as their bytes.
+//               antb1 produces it with engine::FormatValue; the DuckDB adapter converts its values
+//               with the helpers below.
 //   slt cell    NULL; (empty) for ""; \t \n \r \\ escaped; control characters, invalid UTF-8 bytes
 //               and leading/trailing spaces as \xHH; a string that reads NULL or (empty) gets its
 //               first byte escaped, so every cell is unambiguous.
@@ -27,6 +31,8 @@ std::string CanonicalDouble(double value);
 std::string CanonicalDate(int32_t days_since_epoch);
 // A TIMESTAMP (microseconds since the epoch) as DuckDB prints it (plan::FormatTimestamp).
 std::string CanonicalTimestamp(int64_t micros_since_epoch);
+// A DECIMAL(width, scale) value (unscaled / 10^scale) as DuckDB prints it (plan::FormatDecimal).
+std::string CanonicalDecimal(Int128 unscaled, uint8_t width, uint8_t scale);
 
 // Escapes one value into an slt cell (see above).
 std::string SltCell(const std::optional<std::string>& value);
@@ -45,8 +51,10 @@ struct BlockDiff {
   std::optional<std::size_t> first_row;  // first differing line of the block
 };
 
-// Compares an expected block with a rendered actual block. I and T cells compare exactly; R cells
-// (types[i] == 'R') compare numerically: |a - b| <= 1e-12 + rel_tolerance * max(|a|, |b|).
+// Compares an expected block with a rendered actual block. I, D and T cells compare exactly; R
+// cells (types[i] == 'R') compare numerically: |a - b| <= 1e-12 + rel_tolerance * max(|a|, |b|).
+// valuesort loses the columns, so with an R column every value compares numerically (the parser
+// refuses valuesort for records with both R and D columns).
 std::optional<BlockDiff> CompareBlocks(const std::vector<std::string>& expected,
                                        const std::vector<std::string>& actual,
                                        std::string_view types, SortMode sort, double rel_tolerance);

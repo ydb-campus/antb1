@@ -127,7 +127,7 @@ std::optional<Discrepancy> CompareSubset(const ResultSet& oracle, const ResultSe
   auto pool = RenderBlock(unlimited, SortMode::kRowSort, 0);
   auto actual = RenderBlock(antb1, SortMode::kRowSort, 0);
   std::vector<bool> used(pool.size(), false);
-  // Rows by the text of their exact (I and T) cells, for the matches within the R tolerance.
+  // Rows by the text of their exact (I, D and T) cells, for the matches within the R tolerance.
   std::unordered_map<std::string, std::vector<std::size_t>> by_exact_cells;
   if (letters.contains('R')) {
     for (std::size_t j = 0; j < pool.size(); ++j) {

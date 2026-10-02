@@ -230,9 +230,10 @@ class Parser {
   std::expected<void, std::string> QueryHeader(std::size_t i,
                                                const std::vector<std::string_view>& words,
                                                Record& record) const {
-    if (words.size() < 2 || words.size() > 4 ||
-        !std::ranges::all_of(words[1], [](char c) { return c == 'I' || c == 'R' || c == 'T'; })) {
-      return Error(i, "expected 'query <I|R|T...> [nosort|rowsort|valuesort] [label]'");
+    if (words.size() < 2 || words.size() > 4 || !std::ranges::all_of(words[1], [](char c) {
+          return c == 'I' || c == 'R' || c == 'D' || c == 'T';
+        })) {
+      return Error(i, "expected 'query <I|R|D|T...> [nosort|rowsort|valuesort] [label]'");
     }
     record.kind = RecordKind::kQuery;
     record.types = std::string(words[1]);
@@ -243,6 +244,9 @@ class Parser {
             i, std::format("unknown sort mode '{}' (nosort, rowsort or valuesort)", words[2]));
       }
       record.sort = *sort;
+      if (const auto problem = SortModeProblem(record.types, record.sort)) {
+        return Error(i, *problem);
+      }
     }
     if (words.size() == 4) {
       record.label = std::string(words[3]);
@@ -276,6 +280,14 @@ bool Record::RunsOn(std::string_view engine) const {
     return false;
   }
   return !std::ranges::contains(skipif, engine);
+}
+
+std::optional<std::string> SortModeProblem(std::string_view types, SortMode sort) {
+  if (sort == SortMode::kValueSort && types.contains('R') && types.contains('D')) {
+    return "valuesort compares every value within the R tolerance, so D columns would not compare "
+           "exactly: use rowsort or nosort";
+  }
+  return std::nullopt;
 }
 
 std::expected<SltFile, std::string> ParseSlt(const std::string& path, std::string_view text) {

@@ -4,6 +4,7 @@
 #include <map>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -74,7 +75,10 @@ TEST(ParseSlt, RejectsMalformedFiles) {
   const std::map<std::string, std::string> cases = {
       {"frobnicate\n", "f.slt:1: unknown or malformed directive 'frobnicate'"},
       {"query X\nSELECT 1\n",
-       "f.slt:1: expected 'query <I|R|T...> [nosort|rowsort|valuesort] [label]'"},
+       "f.slt:1: expected 'query <I|R|D|T...> [nosort|rowsort|valuesort] [label]'"},
+      {"query DR valuesort\nSELECT 1\n",
+       "f.slt:1: valuesort compares every value within the R tolerance, so D columns would not "
+       "compare exactly: use rowsort or nosort"},
       {"query I sideways\nSELECT 1\n",
        "f.slt:1: unknown sort mode 'sideways' (nosort, rowsort or valuesort)"},
       {"onlyif mysql\nstatement ok\nSELECT 1\n",
@@ -97,6 +101,21 @@ TEST(ParseSlt, RejectsMalformedFiles) {
   auto bad_regex = ParseSlt("f.slt", "statement error ([\nSELECT 1\n");
   ASSERT_FALSE(bad_regex.has_value());
   EXPECT_TRUE(bad_regex.error().starts_with("f.slt:1: invalid error regex")) << bad_regex.error();
+}
+
+TEST(ParseSlt, ReadsDecimalColumns) {
+  auto file = ParseSlt("f.slt",
+                       "query ID\nSELECT 1, 1.50\n----\n1\t1.50\n\n"
+                       "query DT valuesort\nSELECT 1.5, 'a'\n----\n1.5\na\n\n"
+                       "query RD rowsort\nSELECT 0.5::DOUBLE, 1.5\n");
+  ASSERT_TRUE(file.has_value()) << file.error();
+  ASSERT_EQ(file->records.size(), 3U);
+  EXPECT_EQ(file->records[0].types, "ID");
+  EXPECT_EQ(file->records[0].expected, (std::vector<std::string>{"1\t1.50"}));
+  EXPECT_EQ(file->records[1].types, "DT");  // valuesort without an R column stays exact
+  EXPECT_EQ(file->records[1].sort, SortMode::kValueSort);
+  EXPECT_EQ(file->records[2].types, "RD");
+  EXPECT_EQ(file->records[2].sort, SortMode::kRowSort);
 }
 
 TEST(RewriteSlt, ReplacesBlocksAndKeepsEverythingElse) {

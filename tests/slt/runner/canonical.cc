@@ -98,6 +98,8 @@ char ClassLetter(ColumnClass c) {
       return 'R';
     case ColumnClass::kText:
       return 'T';
+    case ColumnClass::kDecimal:
+      return 'D';
   }
   return '?';
 }
@@ -120,6 +122,10 @@ std::string CanonicalDate(int32_t days_since_epoch) {
 
 std::string CanonicalTimestamp(int64_t micros_since_epoch) {
   return plan::FormatTimestamp(micros_since_epoch);  // likewise
+}
+
+std::string CanonicalDecimal(Int128 unscaled, uint8_t width, uint8_t scale) {
+  return plan::FormatDecimal(unscaled, width, scale);  // likewise (ADR 0021, rule 15)
 }
 
 std::string SltCell(const std::optional<std::string>& value) {

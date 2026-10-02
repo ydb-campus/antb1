@@ -122,6 +122,13 @@ slt::ResultSet Single(std::string value) {
                         .rows = {{std::move(value)}}};
 }
 
+// A single DECIMAL value in its canonical text (plan::FormatDecimal).
+slt::ResultSet SingleDecimal(std::string value) {
+  return slt::ResultSet{.classes = {slt::ColumnClass::kDecimal},
+                        .type_names = {"DECIMAL(4,2)"},
+                        .rows = {{std::move(value)}}};
+}
+
 slt::ExecResult UnsupportedAnswer() {
   return std::unexpected(slt::EngineError{
       .kind = "unsupported", .message = "unsupported: WHERE", .unsupported = true});
@@ -215,6 +222,27 @@ TEST(Checks, MinMaxRowCountsAndEquality) {
   EXPECT_TRUE(FirstIsUnionOfRest()(std::vector{three_rows, two_rows}).has_value());
   EXPECT_TRUE(FirstIsUnionOfRest()(std::vector{three_rows, three_rows, Single("2")}).has_value());
   EXPECT_TRUE(AllEqual()(std::vector{three_rows, Single("3")}).has_value());
+}
+
+TEST(Checks, DecimalMinMaxCompareByValue) {
+  // By value, not as text: 10.00 > 9.99, -0.25 < 0.00 and -.500 < .500.
+  EXPECT_FALSE(FirstEqualsMaxOfRest()(std::vector{SingleDecimal("10.00"), SingleDecimal("9.99"),
+                                                  SingleDecimal("10.00")})
+                   .has_value());
+  EXPECT_FALSE(FirstEqualsMinOfRest()(std::vector{SingleDecimal("-0.25"), SingleDecimal("0.00"),
+                                                  SingleDecimal("-0.25")})
+                   .has_value());
+  EXPECT_FALSE(FirstEqualsMinOfRest()(std::vector{SingleDecimal("-.500"), SingleDecimal(".500"),
+                                                  SingleDecimal("-.500")})
+                   .has_value());
+  EXPECT_TRUE(FirstEqualsMaxOfRest()(
+                  std::vector{SingleDecimal("9.99"), SingleDecimal("9.99"), SingleDecimal("10.00")})
+                  .has_value());
+  // Values of one DECIMAL type have one scale; texts at two scales do not compare.
+  EXPECT_EQ(FirstEqualsMaxOfRest()(
+                std::vector{SingleDecimal("1.50"), SingleDecimal("1.50"), SingleDecimal("1.5")})
+                .value_or(""),
+            "answer 2 (1.5) does not compare with 1.50");
 }
 
 TEST(RelationList, IsWellFormed) {

@@ -3,12 +3,15 @@
 
 #include <optional>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
 
 #include "canonical.h"
 #include "engine.h"
+#include "result_diff.h"
 #include "sha256.h"
 
 namespace antb1::slt {
@@ -56,6 +59,53 @@ TEST(Comparator, IntegerAndTextColumnsNeverUseTheTolerance) {
   EXPECT_FALSE(Equal({"7\t1000000000"}, {"8\t1000000000"}, "IR"));
   EXPECT_FALSE(Equal({"1000000000\t7"}, {"1000000001\t7"}, "IR"));
   EXPECT_FALSE(Equal({"1\t2"}, {"1"}, "IR")) << "a missing cell";
+}
+
+TEST(Comparator, DecimalColumnsNeverUseTheTolerance) {
+  // As R values, a wrong cent on ten integer digits is within the tolerance (1e-12 + 1e-9 * 1.2e9
+  // is more than 1), and a wrong scale is the same double.
+  EXPECT_TRUE(Equal({"1234567890.12"}, {"1234567890.13"}, "R"));
+  EXPECT_TRUE(Equal({"1234567890.12"}, {"1234567890.120"}, "R"));
+  EXPECT_FALSE(Equal({"1234567890.12"}, {"1234567890.13"}, "D")) << "the last digit";
+  EXPECT_FALSE(Equal({"1234567890.12"}, {"1234567890.120"}, "D")) << "the scale";
+  EXPECT_FALSE(Equal({"1234567890.12"}, {"1234567890.1"}, "D")) << "the scale";
+  EXPECT_FALSE(Equal({".500"}, {"0.500"}, "D")) << "the leading zero: the width";
+  EXPECT_TRUE(Equal({"7\t1234567890.12\t0.5"}, {"7\t1234567890.12\t0.50000000001"}, "IDR"));
+  EXPECT_FALSE(Equal({"7\t1234567890.12\t0.5"}, {"7\t1234567890.13\t0.5"}, "IDR"));
+  EXPECT_FALSE(Equal({"1.50", "a"}, {"1.5", "a"}, "DT", SortMode::kValueSort))
+      << "valuesort without an R column stays exact";
+}
+
+TEST(CompareAnswers, DecimalTextAndTypeNamesCompareExactly) {
+  const auto answer = [](ColumnClass cls, std::string type, std::string value) {
+    return ResultSet{
+        .classes = {cls}, .type_names = {std::move(type)}, .rows = {{std::move(value)}}};
+  };
+  const ResultSet oracle = answer(ColumnClass::kDecimal, "DECIMAL(12,2)", "1234567890.12");
+  EXPECT_FALSE(CompareAnswers(oracle,
+                              answer(ColumnClass::kDecimal, "DECIMAL(12,2)", "1234567890.12"),
+                              SortMode::kNoSort, false));
+  for (const std::string_view wrong : {"1234567890.13", "1234567890.120", "1234567890.1"}) {
+    const auto d =
+        CompareAnswers(oracle, answer(ColumnClass::kDecimal, "DECIMAL(12,2)", std::string(wrong)),
+                       SortMode::kNoSort, false);
+    ASSERT_TRUE(d.has_value()) << wrong;
+    EXPECT_TRUE(d.value_or(Discrepancy{}).mismatch) << wrong;
+  }
+  EXPECT_EQ(CompareAnswers(oracle, answer(ColumnClass::kDecimal, "DECIMAL(13,2)", "1234567890.12"),
+                           SortMode::kNoSort, false)
+                .value_or(Discrepancy{})
+                .what,
+            "column types differ: DuckDB D (DECIMAL(12,2)), antb1 D (DECIMAL(13,2))");
+  EXPECT_EQ(CompareAnswers(oracle, answer(ColumnClass::kReal, "DOUBLE", "1234567890.12"),
+                           SortMode::kNoSort, false)
+                .value_or(Discrepancy{})
+                .what,
+            "column types differ: DuckDB D (DECIMAL(12,2)), antb1 R (DOUBLE)");
+  // Between R columns, the same wrong cent passes.
+  EXPECT_FALSE(CompareAnswers(answer(ColumnClass::kReal, "DOUBLE", "1234567890.12"),
+                              answer(ColumnClass::kReal, "DOUBLE", "1234567890.13"),
+                              SortMode::kNoSort, false));
 }
 
 TEST(Comparator, SortModes) {

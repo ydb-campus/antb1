@@ -416,6 +416,28 @@ std::string FormatTimestamp(int64_t micros) {
   return out;
 }
 
+std::string FormatDecimal(Int128 unscaled, uint8_t width, uint8_t scale) {
+  std::string digits = Int128ToString(unscaled);
+  if (scale == 0) {
+    return digits;
+  }
+  const bool negative = unscaled < 0;
+  if (negative) {
+    digits.erase(0, 1);  // the '-'
+  }
+  const std::size_t fraction_digits = scale;
+  if (digits.size() < fraction_digits) {
+    digits.insert(0, fraction_digits - digits.size(), '0');
+  }
+  const std::size_t integer_digits = digits.size() - fraction_digits;
+  std::string_view integer = std::string_view(digits).substr(0, integer_digits);
+  if (integer.empty() && width > scale) {
+    integer = "0";
+  }
+  return std::format("{}{}.{}", negative ? "-" : "", integer,
+                     std::string_view(digits).substr(integer_digits));
+}
+
 IntegerRange RangeOf(LogicalType integer_type) {
   switch (integer_type.id()) {
     case LogicalType::kSmallInt:

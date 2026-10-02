@@ -13,14 +13,17 @@
 
 namespace antb1::slt {
 
-// sqllogictest column classes: I integer, R real (compared with a tolerance), T text (dates too).
-enum class ColumnClass : std::uint8_t { kInteger, kReal, kText };
+// sqllogictest column classes: I integer, R real (compared with a tolerance), T text (dates too),
+// D decimal (a DECIMAL(p,s) of any scale, compared exactly).
+enum class ColumnClass : std::uint8_t { kInteger, kReal, kText, kDecimal };
 
 char ClassLetter(ColumnClass c);
 
 struct ResultSet {
   std::vector<ColumnClass> classes;
-  std::vector<std::string> type_names;  // engine type names, for messages (e.g. BIGINT, HUGEINT)
+  // Engine type names (e.g. BIGINT, HUGEINT, DECIMAL(15,2)), for messages; the diff, query-file and
+  // ClickBench comparisons require them to match.
+  std::vector<std::string> type_names;
   // Canonical text of every value (canonical.h); std::nullopt is SQL NULL.
   std::vector<std::vector<std::optional<std::string>>> rows;
 };

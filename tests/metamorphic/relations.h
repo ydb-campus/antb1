@@ -56,7 +56,8 @@ Check FirstIsUnionOfRest();
 Check SecondIsWindowOfFirst(int64_t offset, int64_t limit);
 // Single-value answers: a0 == a1 + ... + an (integers, exact; NULL counts as no value).
 Check FirstEqualsSumOfRest();
-// Single-value answers: a0 == the minimum / maximum of the non-NULL a1..an (NULL if all are).
+// Single-value answers: a0 == the minimum / maximum of the non-NULL a1..an (NULL if all are), by
+// value (DECIMAL values at one scale; values that do not compare violate the check).
 Check FirstEqualsMinOfRest();
 Check FirstEqualsMaxOfRest();
 // a0 is a single integer n; every other answer has exactly n rows.
