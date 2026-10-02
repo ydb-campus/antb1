@@ -8,7 +8,9 @@
 #include <ostream>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <variant>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -509,6 +511,10 @@ TEST(ParserTest, ExpressionPrecedenceAndAssociativity) {
   EXPECT_EQ(canonical("NOT (a AND b)"), "NOT (a AND b)");
   EXPECT_EQ(canonical("a + 1 < b * 2"), "a + 1 < b * 2");
   EXPECT_EQ(canonical("(a < b) = (c < d)"), "(a < b) = (c < d)");
+  EXPECT_EQ(canonical("-a::INT"), "-(CAST(a AS INT))") << "'::' binds tighter than the minus";
+  EXPECT_EQ(canonical("a + b::int"), "a + CAST(b AS INT)");
+  EXPECT_EQ(canonical("(a + b)::INT * c"), "CAST(a + b AS INT) * c");
+  EXPECT_EQ(canonical("NOT a::BOOLEAN"), "NOT CAST(a AS BOOLEAN)");
   EXPECT_FALSE(Parse("SELECT x LIKE 'a' || 'b' FROM t").has_value()) << "|| stays unsupported";
   auto tree = Parse("SELECT a + b * c FROM t");
   ASSERT_TRUE(tree.has_value());
@@ -560,6 +566,88 @@ TEST(ParserTest, FunctionsCaseExtractAndExpressionOperands) {
   auto again = Parse(ToSql(*stmt));
   ASSERT_TRUE(again.has_value()) << ToSql(*stmt) << ": " << again.error().message;
   EXPECT_TRUE(EqualIgnoringSpans(*stmt, *again)) << ToSql(*stmt);
+}
+
+// CAST(x AS T), TRY_CAST(x AS T) and x::T are one node: the type upper-cased with its integer
+// parameters as written, the spelling not recorded. '::' applies to any primary expression, and a
+// cast's span starts at the primary's first token.
+TEST(ParserTest, Casts) {
+  constexpr std::string_view kSql =
+      "SELECT CAST(a AS decimal( 15 ,2 )) AS x, try_cast(b as date), c::int, "
+      "(a + 1)::BIGINT::Varchar, COUNT(*)::BIGINT, CASE WHEN a = 1 THEN 2 END::INTEGER, "
+      "DATE '2024-01-01'::VARCHAR, SUM(a::BIGINT), try_cast, x::DATE d FROM t "
+      "WHERE d >= '2024-01-31'::Date AND e IN (CAST('2024-01-01' AS DATE), 1)";
+  auto stmt = Parse(kSql);
+  ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
+  ASSERT_EQ(stmt->items.size(), 10U);
+  const auto cast_of = [&](const Expr& e) -> const CastExpr& { return std::get<CastExpr>(e); };
+  const CastExpr& decimal = cast_of(stmt->items[0].expr);
+  EXPECT_EQ(decimal.type, "DECIMAL");
+  EXPECT_EQ(decimal.type_params, (std::vector<std::string>{"15", "2"}));
+  EXPECT_FALSE(decimal.try_cast);
+  EXPECT_EQ(At(kSql, decimal.op_span), "CAST");
+  EXPECT_EQ(At(kSql, decimal.type_span), "decimal( 15 ,2 )");
+  EXPECT_EQ(At(kSql, decimal.span), "CAST(a AS decimal( 15 ,2 ))");
+  EXPECT_EQ(stmt->items[0].alias, std::optional<std::string>("x"));
+  const CastExpr& try_date = cast_of(stmt->items[1].expr);
+  EXPECT_TRUE(try_date.try_cast);
+  EXPECT_EQ(try_date.type, "DATE");
+  EXPECT_EQ(At(kSql, try_date.op_span), "try_cast");
+  const CastExpr& operator_int = cast_of(stmt->items[2].expr);
+  EXPECT_EQ(operator_int.type, "INT");
+  EXPECT_EQ(At(kSql, operator_int.op_span), "::");
+  EXPECT_EQ(At(kSql, operator_int.span), "c::int");
+  const CastExpr& chain = cast_of(stmt->items[3].expr);
+  EXPECT_EQ(chain.type, "VARCHAR");
+  const CastExpr& inner = cast_of(*chain.operand);
+  EXPECT_EQ(inner.type, "BIGINT");
+  EXPECT_TRUE(std::holds_alternative<BinaryExpr>(*inner.operand));
+  EXPECT_EQ(At(kSql, inner.span), "(a + 1)::BIGINT");
+  EXPECT_EQ(At(kSql, chain.span), "(a + 1)::BIGINT::Varchar");
+  EXPECT_TRUE(std::holds_alternative<AggregateCall>(*cast_of(stmt->items[4].expr).operand));
+  EXPECT_TRUE(std::holds_alternative<CaseExpr>(*cast_of(stmt->items[5].expr).operand));
+  EXPECT_EQ(std::get<Literal>(*cast_of(stmt->items[6].expr).operand).kind, Literal::Kind::kDate);
+  const auto& sum = std::get<AggregateCall>(stmt->items[7].expr);
+  const Expr* sum_arg = sum.arg.has_value() ? &**sum.arg : nullptr;
+  ASSERT_NE(sum_arg, nullptr);
+  EXPECT_TRUE(std::holds_alternative<CastExpr>(*sum_arg));
+  EXPECT_EQ(std::get<ColumnRef>(stmt->items[8].expr).name, "try_cast");
+  EXPECT_EQ(cast_of(stmt->items[9].expr).type, "DATE");
+  EXPECT_EQ(stmt->items[9].alias, std::optional<std::string>("d"));
+  ASSERT_EQ(stmt->where.size(), 2U);
+  const auto& ge = std::get<BinaryExpr>(stmt->where[0]);
+  EXPECT_EQ(std::get<Literal>(*cast_of(*ge.right).operand).text, "2024-01-31");
+  EXPECT_TRUE(std::holds_alternative<CastExpr>(std::get<InExpr>(stmt->where[1]).list.at(0)));
+  auto again = Parse(ToSql(*stmt));
+  ASSERT_TRUE(again.has_value()) << ToSql(*stmt) << ": " << again.error().message;
+  EXPECT_TRUE(EqualIgnoringSpans(*stmt, *again)) << ToSql(*stmt);
+}
+
+// A minus is not folded into a number that '::' follows: -1::INTEGER is -(CAST(1 AS INTEGER)), as
+// in DuckDB, while (-1)::INTEGER and CAST(-1 AS INTEGER) cast the negative literal.
+TEST(ParserTest, MinusBeforeCastIsNotFoldedIntoTheNumber) {
+  const auto item = [](std::string_view expr) {
+    auto stmt = Parse("SELECT " + std::string(expr) + " FROM t");
+    EXPECT_TRUE(stmt.has_value()) << expr << ": " << stmt.error().message;
+    return stmt.has_value() ? stmt->items.at(0).expr : Expr(ColumnRef{});
+  };
+  const Expr minus = item("-1::INTEGER");
+  const auto& unary = std::get<UnaryExpr>(minus);
+  EXPECT_EQ(unary.op, UnaryOp::kNegate);
+  const auto& one = std::get<Literal>(*std::get<CastExpr>(*unary.operand).operand);
+  EXPECT_FALSE(one.negative);
+  EXPECT_EQ(one.text, "1");
+  EXPECT_EQ(ToSql(minus), "-(CAST(1 AS INTEGER))");
+  EXPECT_TRUE(EqualIgnoringSpans(item("(-1)::INTEGER"), item("CAST(-1 AS INTEGER)")));
+  EXPECT_TRUE(std::get<Literal>(*std::get<CastExpr>(item("(-1)::INTEGER")).operand).negative);
+  EXPECT_EQ(ToSql(item("- 1.5e3::DOUBLE")), "-(CAST(1.5e3 AS DOUBLE))");
+  EXPECT_EQ(ToSql(item("a-1::INT")), "a - CAST(1 AS INT)");
+  EXPECT_EQ(ToSql(item("- -1::INT")), "-(-(CAST(1 AS INT)))");
+  EXPECT_TRUE(std::get<Literal>(item("-1")).negative);  // without '::' the minus still folds
+  EXPECT_EQ(ToSql(item("-1 + 2")), "-1 + 2");
+  auto where = Parse("SELECT a FROM t WHERE a<=-1::INT");
+  ASSERT_TRUE(where.has_value()) << where.error().message;
+  EXPECT_EQ(ToSql(where->where.at(0)), "a <= -(CAST(1 AS INT))");
 }
 
 // WHERE and HAVING split their top-level AND chain; a parenthesized AND, or an OR at the top,
@@ -632,6 +720,54 @@ TEST(ParserTest, ExpressionDepthIsLimited) {
   }
   then += " GROUP BY " + std::string(100, '(') + "a" + std::string(100, ')');
   EXPECT_TRUE(Parse(then).has_value());
+}
+
+// The levels that the canonical form adds count too (x::T is CAST(x AS T), -x is -(x)), so that
+// the canonical form of every accepted query parses.
+TEST(ParserTest, CanonicalLevelsCountAgainstTheDepthLimit) {
+  const auto calls = [](std::size_t n, std::string_view before, std::string_view after) {
+    std::string sql = "SELECT " + std::string(before);
+    for (std::size_t i = 0; i < n; ++i) {
+      sql += "f(";
+    }
+    sql += "a" + std::string(n, ')') + std::string(after) + " FROM t";
+    return sql;
+  };
+  const auto depth_error = [](const std::string& sql) {
+    auto result = Parse(sql);
+    return !result.has_value() && result.error().kind == ParseError::Kind::kUnsupported &&
+           result.error().message.starts_with("expressions deeper than 256 levels");
+  };
+  for (const auto& [before, after] : {std::pair<std::string_view, std::string_view>{"", "::INT"},
+                                      std::pair<std::string_view, std::string_view>{"-", ""}}) {
+    const std::string fits = calls(254 - before.size(), before, after);
+    auto stmt = Parse(fits);
+    ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
+    auto again = Parse(ToSql(*stmt));
+    ASSERT_TRUE(again.has_value()) << again.error().message;
+    EXPECT_TRUE(EqualIgnoringSpans(*stmt, *again));
+    EXPECT_TRUE(depth_error(calls(255 - before.size(), before, after))) << before << after;
+  }
+  EXPECT_TRUE(Parse(calls(255, "", "")).has_value()) << "no cast: one level less";
+  // A minus before parentheses adds no level: its canonical form keeps them.
+  const std::string parenthesized = calls(253, "-(", ")");
+  auto negated = Parse(parenthesized);
+  ASSERT_TRUE(negated.has_value()) << negated.error().message;
+  EXPECT_EQ(ToSql(*negated), parenthesized);
+  EXPECT_TRUE(depth_error(calls(254, "-(", ")")));
+  std::string chain = "SELECT a";
+  for (int i = 0; i < 300; ++i) {
+    chain += "::INT";
+  }
+  auto chained = Parse(chain + " FROM t");
+  ASSERT_FALSE(chained.has_value());
+  EXPECT_TRUE(depth_error(chain + " FROM t"));
+  EXPECT_EQ(chained.error().span.offset, std::string("SELECT a").size() + (std::size_t{255} * 5));
+  std::string casts = "SELECT ";
+  for (int i = 0; i < 300; ++i) {
+    casts += "CAST(";
+  }
+  EXPECT_TRUE(depth_error(casts + "a"));
 }
 
 // Literals are select items (constants), and in GROUP BY and ORDER BY positions or constants; the
@@ -879,8 +1015,6 @@ INSTANTIATE_TEST_SUITE_P(
                    "function position() with this argument syntax is not supported"},
         RejectCase{"SubstringFrom", "SELECT ^substring(u FROM 1 FOR 2) FROM events", kUnsupported,
                    9, "function substring() with this argument syntax is not supported"},
-        RejectCase{"TryCast", "SELECT ^try_cast(a AS BIGINT) FROM events", kUnsupported, 8,
-                   "function try_cast() with this argument syntax is not supported"},
         RejectCase{"FunctionSyntaxError", "SELECT ^f(a +) FROM events", kUnsupported, 1,
                    "function f() with this argument syntax is not supported"},
         RejectCase{"FunctionFilter", "SELECT count_if(a > 0) ^FILTER (WHERE a < 5) FROM events",
@@ -989,14 +1123,42 @@ INSTANTIATE_TEST_SUITE_P(
                    "boolean literals (TRUE/FALSE) are not supported"},
         RejectCase{"Interval", "SELECT a FROM events WHERE d > ^INTERVAL '1 day'", kUnsupported, 8,
                    "INTERVAL is not supported"},
-        RejectCase{"Cast", "SELECT ^CAST(a AS BIGINT) FROM events", kUnsupported, 4,
-                   "CAST is not supported"},
-        RejectCase{"CastInWhere", "SELECT a FROM events WHERE a = ^cast('1' AS INT)", kUnsupported,
-                   4, "CAST is not supported"},
-        RejectCase{"CastOperator", "SELECT a FROM events WHERE a^::BIGINT = 1", kUnsupported, 2,
-                   "CAST (::) is not supported"},
-        RejectCase{"CastOperatorInSelect", "SELECT a^::TEXT FROM events", kUnsupported, 2,
-                   "CAST (::) is not supported"},
+        RejectCase{"CastQuotedType", R"(SELECT CAST(a AS ^"DATE") FROM events)", kUnsupported, 6,
+                   "quoted type names are not supported"},
+        RejectCase{"CastOperatorQuotedType", R"(SELECT a::^"int" FROM events)", kUnsupported, 5,
+                   "quoted type names are not supported"},
+        RejectCase{"CastInterval", "SELECT CAST(a AS ^INTERVAL) FROM events", kUnsupported, 8,
+                   "CAST to INTERVAL is not supported"},
+        RejectCase{"CastUnion", "SELECT a::^union FROM events", kUnsupported, 5,
+                   "CAST to UNION is not supported"},
+        RejectCase{"CastDoublePrecision", "SELECT a FROM events WHERE b::^DOUBLE PRECISION > 1",
+                   kUnsupported, 16, "type names of more than one word are not supported"},
+        RejectCase{"CastTimestampWithTimeZone",
+                   "SELECT CAST(a AS ^TIMESTAMP WITH TIME ZONE) FROM events", kUnsupported, 14,
+                   "type names of more than one word are not supported"},
+        RejectCase{"CastTimestampParamsWithTimeZone",
+                   "SELECT CAST(a AS ^TIMESTAMP(3) WITH TIME ZONE) FROM events", kUnsupported, 17,
+                   "type names of more than one word are not supported"},
+        RejectCase{"CastCharacterVarying", "SELECT a::^character varying(3) FROM events",
+                   kUnsupported, 17, "type names of more than one word are not supported"},
+        RejectCase{"CastArray", "SELECT CAST(a AS INT^[]) FROM events", kUnsupported, 1,
+                   "array types are not supported"},
+        RejectCase{"CastArrayKeyword", "SELECT CAST(a AS INT ^ARRAY) FROM events", kUnsupported, 5,
+                   "array types are not supported"},
+        RejectCase{"CastNameParameter", "SELECT CAST(a AS DECIMAL(^p)) FROM events", kUnsupported,
+                   1, "type parameters other than integers are not supported"},
+        RejectCase{"CastStructType", "SELECT CAST(a AS STRUCT(^x INT)) FROM events", kUnsupported,
+                   1, "type parameters other than integers are not supported"},
+        RejectCase{"CastEnumType", "SELECT CAST(a AS ENUM(^'x')) FROM events", kUnsupported, 3,
+                   "type parameters other than integers are not supported"},
+        RejectCase{"CastQualifiedType", "SELECT CAST(a AS main^.int) FROM events", kUnsupported, 1,
+                   "qualified type names are not supported"},
+        RejectCase{"CastOfAnInCondition", "SELECT a FROM events WHERE a IN (1)^::BOOLEAN",
+                   kUnsupported, 2, "CAST (::) of an IN condition is not supported"},
+        RejectCase{"LimitCastOperator", "SELECT a FROM events LIMIT 5^::INT", kUnsupported, 2,
+                   "LIMIT expressions are not supported"},
+        RejectCase{"LimitCast", "SELECT a FROM events LIMIT ^CAST(5 AS INT)", kUnsupported, 4,
+                   "LIMIT expressions are not supported"},
         RejectCase{"TimestampTzLiteral",
                    "SELECT a FROM events WHERE ts > ^TIMESTAMPTZ '2024-01-01'", kUnsupported, 11,
                    "TIMESTAMPTZ literals are not supported"},
@@ -1307,7 +1469,33 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"LexerErrorWinsOnceReached", "SELECT a FROM events WHERE 5 ^'open", kSyntax, 5,
                    "unterminated string literal"},
         RejectCase{"LexerErrorAfterSemicolon", "SELECT a FROM events; ^'open", kSyntax, 5,
-                   "unterminated string literal"}),
+                   "unterminated string literal"},
+        RejectCase{"CastWithoutAs", "SELECT CAST(a^) FROM events", kSyntax, 1,
+                   "expected AS in CAST(x AS type), found ')'"},
+        RejectCase{"CastTypeWithoutAs", "SELECT CAST(a ^BIGINT) FROM events", kSyntax, 6,
+                   "expected AS in CAST(x AS type), found identifier BIGINT"},
+        RejectCase{"CastComma", "SELECT CAST(a^, BIGINT) FROM events", kSyntax, 1,
+                   "expected AS in CAST(x AS type), found ','"},
+        RejectCase{"TryCastWithoutAs", "SELECT TRY_CAST(a^) FROM events", kSyntax, 1,
+                   "expected AS in TRY_CAST(x AS type), found ')'"},
+        RejectCase{"CastWithoutType", "SELECT CAST(a AS ^) FROM events", kSyntax, 1,
+                   "expected a type name, found ')'"},
+        RejectCase{"CastNumberType", "SELECT CAST(a AS ^5) FROM events", kSyntax, 1,
+                   "expected a type name, found integer literal 5"},
+        RejectCase{"CastReservedType", "SELECT CAST(a AS ^FROM) FROM events", kSyntax, 4,
+                   "expected a type name, found keyword FROM"},
+        RejectCase{"CastOperatorWithoutType", "SELECT a:: ^FROM events", kSyntax, 4,
+                   "expected a type name, found keyword FROM"},
+        RejectCase{"CastTwoTypes", "SELECT CAST(a AS INT ^b) FROM events", kSyntax, 1,
+                   "expected ) to close CAST(, found identifier b"},
+        RejectCase{"CastUnclosed", "SELECT CAST(a AS INT ^FROM events", kSyntax, 4,
+                   "expected ) to close CAST(, found keyword FROM"},
+        RejectCase{"CastEmptyParameters", "SELECT CAST(a AS DECIMAL(^)) FROM events", kSyntax, 1,
+                   "expected a type parameter, found ')'"},
+        RejectCase{"CastParametersWithoutComma", "SELECT CAST(a AS DECIMAL(15 ^2)) FROM events",
+                   kSyntax, 1, "expected , or ) after a type parameter, found integer literal 2"},
+        RejectCase{"BareCast", "SELECT ^CAST FROM events", kSyntax, 4,
+                   "expected an expression or '*', found keyword CAST"}),
     CaseName);
 
 TEST(ParserTest, ExactMessages) {
@@ -1402,6 +1590,14 @@ TEST(ParserRobustnessTest, MegabyteInputs) {
     nots += "NOT ";
   }
   ExpectWellFormedError(nots);
+  std::string casts = "SELECT a";
+  std::string calls = "SELECT ";
+  for (std::size_t i = 0; i < kSize / 5; ++i) {
+    casts += "::a";
+    calls += "CAST(";
+  }
+  ExpectWellFormedError(casts);
+  ExpectWellFormedError(calls);
 
   // Large but valid inputs parse in linear time.
   const std::string long_name(kSize, 'n');

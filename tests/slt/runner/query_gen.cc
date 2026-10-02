@@ -451,9 +451,35 @@ class Builder {
       case ValueKind::kVarchar:
         return allowed_.Has(Feature::kStringLiteral);
       case ValueKind::kDate:
-        return allowed_.Has(Feature::kDateLiteral) || allowed_.Has(Feature::kStringLiteral);
+        return allowed_.Has(Feature::kDateLiteral) || allowed_.Has(Feature::kCastDate) ||
+               allowed_.Has(Feature::kStringLiteral);
     }
     return false;
+  }
+
+  // Appends the date `quoted` (a string literal) typed DATE: DATE 'd' for `spelling` 0 and 1,
+  // CAST('d' AS DATE) for 2 and 'd'::DATE for 3, among the spellings `allowed_` permits (the
+  // keyword without kCastDate). Returns whether it wrote a cast.
+  bool TypedDate(std::vector<Token>& out, std::string quoted, std::size_t spelling) const {
+    if (!allowed_.Has(Feature::kCastDate) ||
+        (spelling < 2 && allowed_.Has(Feature::kDateLiteral))) {
+      out.push_back({.kind = Token::Kind::kKeyword, .text = "DATE"});
+      out.push_back({.kind = Token::Kind::kLiteral, .text = std::move(quoted)});
+      return false;
+    }
+    if (spelling % 2 == 0) {
+      out.push_back({.kind = Token::Kind::kKeyword, .text = "CAST"});
+      out.push_back({.kind = Token::Kind::kSymbol, .text = "("});
+      out.push_back({.kind = Token::Kind::kLiteral, .text = std::move(quoted)});
+      out.push_back({.kind = Token::Kind::kKeyword, .text = "AS"});
+      out.push_back({.kind = Token::Kind::kKeyword, .text = "DATE"});
+      out.push_back({.kind = Token::Kind::kSymbol, .text = ")"});
+    } else {
+      out.push_back({.kind = Token::Kind::kLiteral, .text = std::move(quoted)});
+      out.push_back({.kind = Token::Kind::kSymbol, .text = "::"});
+      out.push_back({.kind = Token::Kind::kKeyword, .text = "DATE"});
+    }
+    return true;
   }
 
   // By name or by path (as rolled; the other form if the rolled one admits no query).
@@ -666,11 +692,14 @@ class Builder {
         static constexpr auto kConstants = std::to_array<std::string_view>(
             {"1", "-7", "42", "3000000000", "'k'", "'it''s'", "DATE '2020-01-02'"});
         used_.Add(Feature::kConstant);
-        const std::string_view constant = rng_.Pick(kConstants);
+        // One roll picks the constant as Pick did (the roll modulo the size) and the spelling of
+        // the date, so that every seed keeps generating the queries it did before kCastDate.
+        const std::size_t roll = rng_.Below(4 * kConstants.size());
+        const std::string_view constant = kConstants[roll % kConstants.size()];
         if (constant.starts_with("DATE ")) {
-          Keyword("DATE");
-          tokens_.push_back(
-              {.kind = Token::Kind::kLiteral, .text = std::string(constant.substr(5))});
+          if (TypedDate(tokens_, std::string(constant.substr(5)), roll / kConstants.size())) {
+            used_.Add(Feature::kCastDate);
+          }
         } else if (constant.starts_with('-')) {
           Symbol("-");
           tokens_.push_back(
@@ -1283,11 +1312,15 @@ class Builder {
         const std::string text = !c.samples.empty() && rng_.Percent(60)
                                      ? rng_.Pick(c.samples)
                                      : std::string(rng_.Pick(kEdges));
-        const bool date_keyword = allowed_.Has(Feature::kDateLiteral) &&
-                                  (!allowed_.Has(Feature::kStringLiteral) || rng_.Percent(70));
-        if (date_keyword) {
-          lit.tokens.push_back({.kind = Token::Kind::kKeyword, .text = "DATE"});
-          single(SqlString(text), Feature::kDateLiteral);
+        // A typed date 70% of the time: the roll modulo 100 is the old Percent(70) roll, and the
+        // rest picks the spelling (see the constants in SelectList).
+        const bool typed = allowed_.Has(Feature::kDateLiteral) || allowed_.Has(Feature::kCastDate);
+        const std::size_t roll =
+            typed && allowed_.Has(Feature::kStringLiteral) ? rng_.Below(400) : 0;
+        if (typed && roll % 100 < 70) {
+          lit.features.Add(TypedDate(lit.tokens, SqlString(text), roll / 100)
+                               ? Feature::kCastDate
+                               : Feature::kDateLiteral);
         } else {
           single(SqlString(text), Feature::kStringLiteral);
         }
@@ -1450,12 +1483,17 @@ class Builder {
                                 : emit("2", Feature::kIntegerLiteral);
       case ValueKind::kVarchar:
         return emit(rng_.Percent(50) ? "''" : "'k'", Feature::kStringLiteral);
-      case ValueKind::kDate:
-        if (rng_.Percent(50) && allowed_.Has(Feature::kDateLiteral)) {
-          Keyword("DATE");
-          return emit("'2013-07-15'", Feature::kDateLiteral);
+      case ValueKind::kDate: {
+        // As in MakeLiteral: the roll modulo 100 is the old Percent(50) roll.
+        const std::size_t roll = rng_.Below(400);
+        if (roll % 100 < 50 &&
+            (allowed_.Has(Feature::kDateLiteral) || allowed_.Has(Feature::kCastDate))) {
+          used_.Add(TypedDate(tokens_, "'2013-07-15'", roll / 100) ? Feature::kCastDate
+                                                                   : Feature::kDateLiteral);
+          return true;
         }
         return emit("'2013-07-16'", Feature::kStringLiteral);
+      }
     }
     return false;
   }
@@ -1587,7 +1625,8 @@ class Builder {
       const Token& tok = tokens_[i];
       if (i > 0) {
         const bool spaced = tok.text != "(" && tok.text != ")" && tok.text != "," &&
-                            tok.text != ";" && tokens_[i - 1].text != "(";
+                            tok.text != ";" && tok.text != "::" && tokens_[i - 1].text != "(" &&
+                            tokens_[i - 1].text != "::";
         std::string_view gap = spaced ? " " : "";
         if (layout) {
           gap = spaced ? rng_.Pick(kSpaced) : rng_.Pick(kTight);

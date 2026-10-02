@@ -1,0 +1,1 @@
+SELECT CAST('2020-01-02' AS DATE), d FROM t WHERE d >= '2024-01-31'::date AND CAST('2013-07-01' AS DATE) < d AND d IN ('2020-01-02'::DATE, cast('2020-01-03' as Date))

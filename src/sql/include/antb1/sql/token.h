@@ -30,7 +30,7 @@ enum class TokenKind : std::uint8_t {
   kLessEqual,     // <=
   kGreater,       // >
   kGreaterEqual,  // >=
-  kDoubleColon,   // :: (cast; lexed only so the parser can reject it as unsupported)
+  kDoubleColon,   // :: (cast)
   kConcat,        // || (concatenation; lexed only so the parser can reject it as unsupported)
   // The kinds below are lexed only so the parser can reject them as unsupported.
   kOperator,     // any other PostgreSQL-style operator (~, !~, ^, &, |, <<, ==, ->, ?, ...)

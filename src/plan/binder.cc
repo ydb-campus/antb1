@@ -31,9 +31,9 @@
 // docs/adr/0004-types-null-overflow-semantics.md.
 //
 // A function that answers for every kind of expression node visits the node with a struct of one
-// overload per kind (FirstUnsupportedOf, RejectConditionOf, ReadsColumnOf, ContainsAggregateOf,
-// ExprNameOf, BindInputOf, BindOutputOf, BindConditionOf), so a new kind fails to compile until
-// each one handles it.
+// overload per kind (FoldDateCastsOf, FirstUnsupportedOf, RejectConditionOf, ReadsColumnOf,
+// ContainsAggregateOf, ExprNameOf, BindInputOf, BindOutputOf, BindConditionOf), so a new kind fails
+// to compile until each one handles it.
 
 namespace antb1::plan {
 namespace {
@@ -331,6 +331,17 @@ std::string NotName(const sql::Expr& operand) {
   return "(NOT " + ExprName(operand) + ")";
 }
 
+// The type of a cast as ToSql writes it: DECIMAL(15, 2).
+std::string TypeText(const sql::CastExpr& cast) {
+  std::string out = cast.type;
+  for (std::size_t i = 0; i < cast.type_params.size(); ++i) {
+    out += (i == 0 ? "(" : ", ") + cast.type_params[i];
+  }
+  return cast.type_params.empty() ? out : out + ")";
+}
+
+[[noreturn]] void UnfoldedCast();
+
 // DuckDB's name of an expression of the binder's subset: (a + 1), -(a), sum((a + 1)); conditions
 // as ((a = 1) OR (b != 2) OR (c IN (1, 2))).
 struct ExprNameOf {
@@ -390,6 +401,7 @@ struct ExprNameOf {
   std::string operator()(const sql::ExtractExpr& e) const {
     return std::format("main.date_part('{}', {})", ExtractFieldName(e.field), ExprName(*e.source));
   }
+  std::string operator()(const sql::CastExpr& /*cast*/) const { UnfoldedCast(); }
 };
 
 std::string ExprName(const sql::Expr& expr) {
@@ -475,6 +487,9 @@ struct ReadsColumnOf {
            });
   }
   bool operator()(const sql::ExtractExpr& e) const { return ReadsColumn(*e.source, aggregates); }
+  bool operator()(const sql::CastExpr& cast) const {
+    return ReadsColumn(*cast.operand, aggregates);
+  }
 };
 
 bool ReadsColumn(const sql::Expr& expr, bool aggregates) {
@@ -658,6 +673,25 @@ struct FirstUnsupportedOf {
     }
     return FirstUnsupported(*e.source);
   }
+  // Every cast that FoldDateCasts left: all but CAST('YYYY-MM-DD' AS DATE), in source order.
+  std::optional<Rejection> operator()(const sql::CastExpr& cast) const {
+    if (cast.try_cast) {
+      return Rejection{.span = cast.op_span, .message = "TRY_CAST is not supported"};
+    }
+    if (auto r = FirstUnsupported(*cast.operand)) {
+      return r;
+    }
+    if (cast.type != "DATE" || !cast.type_params.empty()) {
+      return Rejection{.span = cast.type_span,
+                       .message = std::format("CAST to {} is not supported (only a string literal "
+                                              "cast to DATE is)",
+                                              Clip(TypeText(cast)))};
+    }
+    return Rejection{.span = cast.operand->span(),
+                     .message =
+                         "CAST to DATE is only supported for a string literal "
+                         "('YYYY-MM-DD')"};
+  }
 };
 
 std::optional<Rejection> FirstUnsupported(const sql::Expr& expr) {
@@ -802,6 +836,9 @@ struct RejectConditionOf {
     return NotACondition(kThisCondition);
   }
   std::optional<Rejection> operator()(const sql::ExtractExpr& /*e*/) const {
+    return NotACondition(kThisCondition);
+  }
+  std::optional<Rejection> operator()(const sql::CastExpr& /*cast*/) const {
     return NotACondition(kThisCondition);
   }
 };
@@ -1284,6 +1321,7 @@ struct ContainsAggregateOf {
            });
   }
   bool operator()(const sql::ExtractExpr& e) const { return ContainsAggregate(*e.source); }
+  bool operator()(const sql::CastExpr& cast) const { return ContainsAggregate(*cast.operand); }
 };
 
 bool ContainsAggregate(const sql::Expr& expr) {
@@ -1554,6 +1592,10 @@ bool IsConstantExpr(const Expr& expr) { return std::holds_alternative<ConstantEx
 //   BindConditionWith binds a leaf.
 [[noreturn]] void ConditionAsOperand() { ANTB1_CHECK(false); }
 [[noreturn]] void NotAConditionLeaf() { ANTB1_CHECK(false); }
+// - UnfoldedCast: FoldDateCasts turned the casts the binder answers into DATE literals, and
+//   CheckSupported rejected every other one, except in the arguments of a call with the wrong
+//   number of them, which BindFunction rejects before it binds or names an argument.
+[[noreturn]] void UnfoldedCast() { ANTB1_CHECK(false); }
 
 // The comparison of a binary comparison operator (any other operator is no condition leaf).
 sql::CompareOp SqlCompareOp(sql::BinaryOp op) {
@@ -1710,6 +1752,7 @@ class Binder {
     arrow::Result<Typed> operator()(const sql::ExtractExpr& e) const {
       return binder.BindExtract(e, [this](const sql::Expr& x) { return binder.BindInput(x); });
     }
+    arrow::Result<Typed> operator()(const sql::CastExpr& /*cast*/) const { UnfoldedCast(); }
   };
 
   arrow::Result<Typed> BindInput(const sql::Expr& expr) {
@@ -2030,6 +2073,7 @@ class Binder {
     arrow::Result<Typed> operator()(const sql::ExtractExpr& e) const {
       return binder.BindExtract(e, [this](const sql::Expr& x) { return binder.BindOutput(x); });
     }
+    arrow::Result<Typed> operator()(const sql::CastExpr& /*cast*/) const { UnfoldedCast(); }
   };
 
   // An expression over the aggregation's output: a subexpression equal to a GROUP BY key is that
@@ -2501,6 +2545,7 @@ struct Binder::BindConditionOf {
   }
   arrow::Result<Predicate> operator()(const sql::CaseExpr& /*c*/) const { NotAConditionLeaf(); }
   arrow::Result<Predicate> operator()(const sql::ExtractExpr& /*e*/) const { NotAConditionLeaf(); }
+  arrow::Result<Predicate> operator()(const sql::CastExpr& /*cast*/) const { UnfoldedCast(); }
 };
 
 template <class BindFn, class ColumnOf>
@@ -3157,6 +3202,91 @@ LogicalPlan Binder::Assemble() {
   return LogicalPlan{.root = std::move(node), .output = std::move(select_.output)};
 }
 
+// CAST('YYYY-MM-DD' AS DATE) and 'YYYY-MM-DD'::DATE are the literal DATE 'YYYY-MM-DD' in DuckDB,
+// with the same name and value: the literal, spanning the cast. std::nullopt for any other cast,
+// which CheckSupported rejects.
+std::optional<sql::Literal> DateLiteralOf(const sql::CastExpr& cast) {
+  const auto* lit = std::get_if<sql::Literal>(&*cast.operand);
+  if (cast.try_cast || cast.type != "DATE" || !cast.type_params.empty() || lit == nullptr ||
+      lit->kind != sql::Literal::Kind::kString) {
+    return std::nullopt;
+  }
+  return sql::Literal{
+      .kind = sql::Literal::Kind::kDate, .negative = false, .text = lit->text, .span = cast.span};
+}
+
+void FoldDateCasts(sql::Expr& expr);
+
+struct FoldDateCastsOf {
+  void operator()(sql::ColumnRef& /*column*/) const {}
+  void operator()(sql::Literal& /*lit*/) const {}
+  void operator()(sql::AggregateCall& call) const {
+    if (call.arg.has_value()) {
+      FoldDateCasts(**call.arg);
+    }
+  }
+  void operator()(sql::UnaryExpr& unary) const { FoldDateCasts(*unary.operand); }
+  void operator()(sql::BinaryExpr& binary) const {
+    FoldDateCasts(*binary.left);
+    FoldDateCasts(*binary.right);
+  }
+  void operator()(sql::LikeExpr& like) const {
+    FoldDateCasts(*like.operand);
+    FoldDateCasts(*like.pattern);
+  }
+  void operator()(sql::InExpr& in) const {
+    FoldDateCasts(*in.operand);
+    for (sql::Expr& value : in.list) {
+      FoldDateCasts(value);
+    }
+  }
+  void operator()(sql::FunctionCall& call) const {
+    for (sql::Expr& arg : call.args) {
+      FoldDateCasts(arg);
+    }
+  }
+  void operator()(sql::CaseExpr& c) const {
+    if (c.operand.has_value()) {
+      FoldDateCasts(**c.operand);
+    }
+    for (sql::CaseBranch& branch : c.branches) {
+      FoldDateCasts(*branch.when);
+      FoldDateCasts(*branch.then);
+    }
+    if (c.otherwise.has_value()) {
+      FoldDateCasts(**c.otherwise);
+    }
+  }
+  void operator()(sql::ExtractExpr& e) const { FoldDateCasts(*e.source); }
+  void operator()(sql::CastExpr& cast) const { FoldDateCasts(*cast.operand); }
+};
+
+// Every date cast of a string literal in `expr` as its DATE literal, innermost first (a cast of
+// that literal again stays a cast).
+void FoldDateCasts(sql::Expr& expr) {
+  std::visit(FoldDateCastsOf{}, static_cast<sql::ExprNode&>(expr));
+  if (const auto* cast = std::get_if<sql::CastExpr>(&expr)) {
+    if (std::optional<sql::Literal> date = DateLiteralOf(*cast)) {
+      expr = sql::Expr(*std::move(date));
+    }
+  }
+}
+
+sql::SelectStatement FoldDateCasts(sql::SelectStatement stmt) {
+  for (sql::SelectItem& item : stmt.items) {
+    FoldDateCasts(item.expr);
+  }
+  for (std::vector<sql::Expr>* clause : {&stmt.where, &stmt.group_by, &stmt.having}) {
+    for (sql::Expr& expr : *clause) {
+      FoldDateCasts(expr);
+    }
+  }
+  for (sql::OrderItem& item : stmt.order_by) {
+    FoldDateCasts(item.expr);
+  }
+  return stmt;
+}
+
 // Expressions the binder does not answer yet are kUnsupported, reported (like the parser's own
 // kUnsupported errors) before any name is resolved, at the first one in query order.
 arrow::Status CheckSupported(const sql::SelectStatement& stmt) {
@@ -3185,10 +3315,11 @@ arrow::Status CheckSupported(const sql::SelectStatement& stmt) {
 }  // namespace
 
 arrow::Result<LogicalPlan> Bind(const sql::SelectStatement& stmt, const Catalog& catalog) {
-  ARROW_RETURN_NOT_OK(CheckSupported(stmt));
-  ARROW_ASSIGN_OR_RAISE(auto table, ResolveTable(stmt.from, catalog));
+  const sql::SelectStatement folded = FoldDateCasts(stmt);  // the binder refers to it
+  ARROW_RETURN_NOT_OK(CheckSupported(folded));
+  ARROW_ASSIGN_OR_RAISE(auto table, ResolveTable(folded.from, catalog));
   ColumnIdSource ids;
-  Binder binder(stmt, std::move(table), ids);
+  Binder binder(folded, std::move(table), ids);
   ARROW_ASSIGN_OR_RAISE(LogicalPlan plan, binder.Bind());
   return ResolvePositions(plan);  // the binder refers to columns by id (ADR 0022)
 }

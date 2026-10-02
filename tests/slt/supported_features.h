@@ -61,6 +61,7 @@ enum class Feature : std::uint8_t {
   kNegativeLiteral,  // -42, -4.25
   kStringLiteral,    // 'text' (also a date as 'YYYY-MM-DD' compared with a DATE column)
   kDateLiteral,      // DATE 'YYYY-MM-DD'
+  kCastDate,  // CAST('YYYY-MM-DD' AS DATE) and 'YYYY-MM-DD'::DATE, wherever DATE 'YYYY-MM-DD' is
   // LIMIT
   kLimit,     // LIMIT n
   kGroupBy,   // GROUP BY on plain columns
@@ -155,6 +156,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "string_literal";
     case Feature::kDateLiteral:
       return "date_literal";
+    case Feature::kCastDate:
+      return "cast_date";
     case Feature::kLimit:
       return "limit";
     case Feature::kKeywordCase:
@@ -288,6 +291,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kNegativeLiteral,
     Feature::kStringLiteral,
     Feature::kDateLiteral,
+    Feature::kCastDate,
     Feature::kLimit,
     Feature::kGroupBy,
     Feature::kPosition,

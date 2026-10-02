@@ -34,22 +34,26 @@
 //   order_item  := expr [ASC | DESC] [NULLS (FIRST | LAST)]
 //   table_ref   := identifier | quoted_identifier | string_literal
 //   expr        := precedence climbing over, from loosest to tightest: OR; AND; NOT; comparisons,
-//                  [NOT] LIKE and [NOT] IN (not chained); + -; * / // %; unary -; primary
+//                  [NOT] LIKE and [NOT] IN (not chained); + -; * / // %; unary -; postfix
+//   postfix     := primary ('::' type)*
 //   primary     := column_ref | literal | '(' expr ')' | agg_call | name '(' [expr (',' expr)*] ')'
 //                | CASE [expr] (WHEN expr THEN expr)+ [ELSE expr] END | EXTRACT '(' field FROM expr
-//                ')'
+//                ')' | (CAST | TRY_CAST) '(' expr AS type ')'
 //   agg_call    := COUNT '(' '*' ')' | COUNT '(' DISTINCT expr ')'
 //                | (COUNT | SUM | AVG | MIN | MAX) '(' expr ')'
-//   literal     := ['-'] integer | ['-'] decimal | string_literal | DATE string_literal
+//   literal     := ['-'] integer | ['-'] decimal | string_literal | (DATE | TIMESTAMP)
+//                  string_literal          ('-' joins the number only when no '::' follows it)
+//   type        := name ['(' integer (',' integer)* ')']
 //
 // The parser keeps expressions as written; what the engine answers is the binder's decision. The
 // WHERE and HAVING predicates are split at their top-level AND chain, collected in a loop.
 // Recursion is bounded: every level of an expression tree (but that chain) counts against
-// kMaxDepth. Tokens are pulled lazily from the lexer (at most three tokens of lookahead), so work
-// and memory stop at the first error whatever the input. Recognized SQL outside the grammar yields
-// kUnsupported at its first offending token and names the construct; anything else yields kSyntax.
-// A lexer error among the tokens the parser looked at wins over the parser's own verdict, which may
-// have been reached on the placeholder end-of-input token.
+// kMaxDepth, and so do the levels that the canonical form of a cast or a unary minus adds (ToSql
+// writes x::T as CAST(x AS T) and -x as -(x)). Tokens are pulled lazily from the lexer (at most
+// three tokens of lookahead), so work and memory stop at the first error whatever the input.
+// Recognized SQL outside the grammar yields kUnsupported at its first offending token and names the
+// construct; anything else yields kSyntax. A lexer error among the tokens the parser looked at wins
+// over the parser's own verdict, which may have been reached on the placeholder end-of-input token.
 
 namespace antb1::sql {
 namespace {
@@ -127,7 +131,6 @@ constexpr auto kUnsupportedOperandKeywords = std::to_array<Construct>({
     {.keyword = "ALL", .message = "ALL (quantified comparisons) is not supported"},
     {.keyword = "ANY", .message = "ANY (quantified comparisons) is not supported"},
     {.keyword = "ARRAY", .message = "ARRAY is not supported"},
-    {.keyword = "CAST", .message = "CAST is not supported"},
     {.keyword = "EXISTS", .message = "EXISTS (subqueries) is not supported"},
     {.keyword = "FALSE", .message = "boolean literals (TRUE/FALSE) are not supported"},
     {.keyword = "INTERVAL", .message = "INTERVAL is not supported"},
@@ -170,7 +173,28 @@ constexpr auto kUnsupportedTypedLiterals = std::to_array<Construct>({
     {.keyword = "TIMESTAMPTZ", .message = "TIMESTAMPTZ literals are not supported"},
 });
 
+// Type names of two or more words (DuckDB): their first two words.
+struct WordPair {
+  std::string_view first;
+  std::string_view second;
+};
+constexpr auto kMultiWordTypes = std::to_array<WordPair>({
+    {.first = "BIT", .second = "VARYING"},
+    {.first = "CHAR", .second = "VARYING"},
+    {.first = "CHARACTER", .second = "VARYING"},
+    {.first = "DOUBLE", .second = "PRECISION"},
+    {.first = "NATIONAL", .second = "CHAR"},
+    {.first = "NATIONAL", .second = "CHARACTER"},
+    {.first = "NCHAR", .second = "VARYING"},
+    {.first = "TIME", .second = "WITH"},
+    {.first = "TIME", .second = "WITHOUT"},
+    {.first = "TIMESTAMP", .second = "WITH"},
+    {.first = "TIMESTAMP", .second = "WITHOUT"},
+});
+
 constexpr bool FitsKeywordLength(std::string_view word) { return word.size() <= kMaxKeywordLength; }
+static_assert(std::ranges::all_of(kMultiWordTypes, FitsKeywordLength, &WordPair::first));
+static_assert(std::ranges::all_of(kMultiWordTypes, FitsKeywordLength, &WordPair::second));
 static_assert(std::ranges::all_of(kReservedWords, FitsKeywordLength));
 static_assert(std::ranges::all_of(kOtherStatements, FitsKeywordLength));
 static_assert(std::ranges::all_of(kNegatableOperators, FitsKeywordLength));
@@ -197,18 +221,22 @@ bool Contains(std::span<const std::string_view> words, std::string_view keyword)
   return std::ranges::find(words, keyword) != words.end();
 }
 
-// Upper-cased text of an unquoted identifier short enough to be a keyword; "" otherwise.
-std::string KeywordOf(const Token& token) {
-  if (token.kind != TokenKind::kIdentifier || token.text.size() > kMaxKeywordLength) {
-    return {};
-  }
-  std::string upper = token.text;
+std::string AsciiUpper(std::string_view text) {
+  std::string upper(text);
   for (char& c : upper) {
     if (c >= 'a' && c <= 'z') {
       c = static_cast<char>(c - 'a' + 'A');
     }
   }
   return upper;
+}
+
+// Upper-cased text of an unquoted identifier short enough to be a keyword; "" otherwise.
+std::string KeywordOf(const Token& token) {
+  if (token.kind != TokenKind::kIdentifier || token.text.size() > kMaxKeywordLength) {
+    return {};
+  }
+  return AsciiUpper(token.text);
 }
 
 bool IsReservedKeyword(std::string_view keyword) {
@@ -581,11 +609,25 @@ class Parser {
   // (copying, comparing, unparsing, binding, destroying).
   std::optional<ParseError> Deeper() {
     if (++depth_ > kMaxDepth) {
-      return UnsupportedError(Peek().span, std::format("expressions deeper than {} levels "
-                                                       "(operators or parentheses) are not "
-                                                       "supported",
-                                                       kMaxDepth));
+      return DepthError(Peek().span);
     }
+    peak_ = std::max(peak_, depth_);
+    return std::nullopt;
+  }
+
+  static ParseError DepthError(SourceSpan span) {
+    return UnsupportedError(span, std::format("expressions deeper than {} levels (operators or "
+                                              "parentheses) are not supported",
+                                              kMaxDepth));
+  }
+
+  // One more level for everything parsed since `outer_peak` was saved (the canonical form of the
+  // node at `span` wraps it), or the depth error at `span`; then the outer peak includes it.
+  std::optional<ParseError> CanonicalLevel(std::size_t outer_peak, SourceSpan span) {
+    if (++peak_ > kMaxDepth) {
+      return DepthError(span);
+    }
+    peak_ = std::max(outer_peak, peak_);
     return std::nullopt;
   }
 
@@ -719,7 +761,9 @@ class Parser {
     }
     if (token.kind == TokenKind::kMinus) {
       const TokenKind next = PeekAt(1).kind;
-      if (next == TokenKind::kInteger || next == TokenKind::kDecimal) {
+      // -1::INTEGER is -(CAST(1 AS INTEGER)), as in DuckDB: '::' binds tighter than the minus.
+      if ((next == TokenKind::kInteger || next == TokenKind::kDecimal) &&
+          PeekAt(2).kind != TokenKind::kDoubleColon) {
         const SourceSpan minus = Take().span;
         Token digits = Take();
         return Expr(Literal{.kind = LiteralKindOf(next),
@@ -728,9 +772,20 @@ class Parser {
                             .span = Cover(minus, digits.span)});
       }
       const SourceSpan op = Take().span;
+      const bool open = Peek().kind == TokenKind::kLeftParen;
+      const std::size_t open_offset = Peek().span.offset;
+      const std::size_t outer_peak = std::exchange(peak_, depth_);
       auto operand = ParseExpr(context, kUnaryPrecedence);
       if (!operand) {
         return operand;
+      }
+      // ToSql writes -(operand): one level more, unless the operand is written in parentheses
+      // already (its node then starts inside them; a cast of a parenthesized operand starts at
+      // the '(' and gets parentheses anew).
+      if (open && operand->span().offset != open_offset) {
+        peak_ = std::max(outer_peak, peak_);
+      } else if (auto error = CanonicalLevel(outer_peak, op); error.has_value()) {
+        return std::unexpected(std::move(*error));
       }
       const SourceSpan span = Cover(op, operand->span());
       return Expr(UnaryExpr{.op = UnaryOp::kNegate,
@@ -741,7 +796,36 @@ class Parser {
     if (token.kind == TokenKind::kPlus) {
       return Unsupported(token.span, "unary '+' is not supported");
     }
-    return ParsePrimary(context);
+    return ParsePostfix(context);
+  }
+
+  // A primary expression and its casts with '::' (x::T::U), which bind tighter than any operator.
+  // A cast's span starts at the primary's first token, its '(' included.
+  Expected<Expr> ParsePostfix(Context context) {
+    const std::size_t begin = Peek().span.offset;
+    const std::size_t outer_peak = std::exchange(peak_, depth_);
+    auto expr = ParsePrimary(context);
+    while (expr && Peek().kind == TokenKind::kDoubleColon) {
+      const SourceSpan op = Peek().span;
+      // ToSql writes CAST(<operand> AS T): one level more for the operand.
+      if (++peak_ > kMaxDepth) {
+        return std::unexpected(DepthError(op));
+      }
+      Take();
+      auto type = ParseTypeName();
+      if (!type) {
+        return std::unexpected(std::move(type.error()));
+      }
+      expr = Expr(CastExpr{.operand = Box<Expr>(*std::move(expr)),
+                           .type = std::move(type->name),
+                           .type_params = std::move(type->params),
+                           .try_cast = false,
+                           .op_span = op,
+                           .type_span = type->span,
+                           .span = SourceSpan{.offset = begin, .length = last_end_ - begin}});
+    }
+    peak_ = std::max(outer_peak, peak_);
+    return expr;
   }
 
   Expected<Expr> ParsePrimary(Context context) {
@@ -813,6 +897,9 @@ class Parser {
       return ParseCase(context);
     }
     const Token& next = PeekAt(1);
+    if ((keyword == "CAST" || keyword == "TRY_CAST") && next.kind == TokenKind::kLeftParen) {
+      return ParseCast(context);
+    }
     if (next.kind == TokenKind::kString) {
       if (keyword == "DATE" || keyword == "TIMESTAMP") {
         const SourceSpan date = Take().span;
@@ -927,8 +1014,8 @@ class Parser {
   }
 
   // name(arg, ...), positioned at the name (the next token is '('). Special argument syntax that
-  // DuckDB has for some functions (position('a' IN s), substring(s FROM 1), try_cast(x AS t), ...)
-  // is not a syntax error but an unsupported function call, and so is a FILTER clause.
+  // DuckDB has for some functions (position('a' IN s), substring(s FROM 1), ...) is not a syntax
+  // error but an unsupported function call, and so is a FILTER clause.
   Expected<Expr> ParseFunction(Context context) {
     Token name = Take();
     Take();  // '('
@@ -997,6 +1084,114 @@ class Parser {
                             .span = span});
   }
 
+  // CAST(operand AS type) or TRY_CAST(operand AS type), positioned at the keyword (the next token
+  // is '(').
+  Expected<Expr> ParseCast(Context context) {
+    const Token keyword = Take();
+    const std::string name = KeywordOf(keyword);
+    Take();  // '('
+    auto operand = ParseExpr(context);
+    if (!operand) {
+      return operand;
+    }
+    if (!Peek().IsKeyword("AS")) {
+      return Syntax(Peek().span,
+                    "expected AS in " + name + "(x AS type), found " + Describe(Peek()));
+    }
+    Take();
+    auto type = ParseTypeName();
+    if (!type) {
+      return std::unexpected(std::move(type.error()));
+    }
+    if (Peek().kind != TokenKind::kRightParen) {
+      return Syntax(Peek().span, "expected ) to close " + name + "(, found " + Describe(Peek()));
+    }
+    const SourceSpan span = Cover(keyword.span, Take().span);
+    return Expr(CastExpr{.operand = Box<Expr>(*std::move(operand)),
+                         .type = std::move(type->name),
+                         .type_params = std::move(type->params),
+                         .try_cast = name == "TRY_CAST",
+                         .op_span = keyword.span,
+                         .type_span = type->span,
+                         .span = span});
+  }
+
+  struct TypeName {
+    std::string name;  // upper-cased
+    std::vector<std::string> params;
+    SourceSpan span;
+  };
+
+  // The second word of a type name of several words (DOUBLE PRECISION), the error at both words.
+  std::optional<ParseError> MultiWordType(std::string_view first, SourceSpan first_span) {
+    const Token& next = Peek();
+    const std::string second = KeywordOf(next);
+    const bool pair = std::ranges::any_of(
+        kMultiWordTypes, [&](const WordPair& p) { return p.first == first && p.second == second; });
+    if (!pair) {
+      return std::nullopt;
+    }
+    return UnsupportedError(Cover(first_span, next.span),
+                            "type names of more than one word are not supported");
+  }
+
+  // The type of a cast, after AS or '::': a name with optional integer parameters, DECIMAL(15, 2).
+  // DuckDB's other type syntax is unsupported; anything else is a syntax error.
+  Expected<TypeName> ParseTypeName() {
+    const Token& token = Peek();
+    if (token.kind == TokenKind::kQuotedIdentifier) {
+      return Unsupported(token.span, "quoted type names are not supported");
+    }
+    if (token.kind != TokenKind::kIdentifier) {
+      return Syntax(token.span, "expected a type name, found " + Describe(token));
+    }
+    const std::string keyword = KeywordOf(token);
+    if (keyword == "INTERVAL" || keyword == "UNION") {
+      return Unsupported(token.span, "CAST to " + keyword + " is not supported");
+    }
+    if (IsReservedKeyword(keyword)) {
+      return Syntax(token.span, "expected a type name, found keyword " + keyword);
+    }
+    const Token name = Take();
+    TypeName out{.name = AsciiUpper(name.text), .params = {}, .span = name.span};
+    if (auto error = MultiWordType(out.name, name.span); error.has_value()) {
+      return std::unexpected(std::move(*error));
+    }
+    if (Peek().kind == TokenKind::kLeftParen) {
+      Take();
+      while (true) {
+        const Token& param = Peek();
+        if (param.kind == TokenKind::kRightParen || param.kind == TokenKind::kComma ||
+            param.kind == TokenKind::kSemicolon || param.kind == TokenKind::kEnd) {
+          return Syntax(param.span, "expected a type parameter, found " + Describe(param));
+        }
+        if (param.kind != TokenKind::kInteger) {
+          return Unsupported(param.span, "type parameters other than integers are not supported");
+        }
+        out.params.push_back(Take().text);
+        if (Peek().kind == TokenKind::kRightParen) {
+          out.span = Cover(out.span, Take().span);
+          break;
+        }
+        if (Peek().kind != TokenKind::kComma) {
+          return Syntax(Peek().span,
+                        "expected , or ) after a type parameter, found " + Describe(Peek()));
+        }
+        Take();
+      }
+      if (auto error = MultiWordType(out.name, name.span); error.has_value()) {
+        return std::unexpected(std::move(*error));  // TIMESTAMP(3) WITH TIME ZONE
+      }
+    }
+    if (Peek().kind == TokenKind::kLeftBracket || Peek().IsKeyword("ARRAY")) {
+      return Unsupported(Peek().span, "array types are not supported");
+    }
+    if (Peek().kind == TokenKind::kDot) {
+      return Unsupported(Peek().span, "qualified type names are not supported");
+    }
+    return out;
+  }
+
   // CASE [operand] WHEN .. THEN .. [...] [ELSE ..] END, positioned at CASE.
   Expected<Expr> ParseCase(Context context) {
     const SourceSpan begin = Take().span;
@@ -1050,7 +1245,7 @@ class Parser {
       case TokenKind::kConcat:
         return UnsupportedError(token.span, "string concatenation (||) is not supported");
       case TokenKind::kDoubleColon:
-        return UnsupportedError(token.span, "CAST (::) is not supported");
+        return UnsupportedError(token.span, "CAST (::) of an IN condition is not supported");
       case TokenKind::kDot:
         return UnsupportedError(token.span, "qualified names (a.b) are not supported");
       case TokenKind::kOperator:
@@ -1347,6 +1542,7 @@ class Parser {
       }
       if (next.kind == TokenKind::kPlus || next.kind == TokenKind::kMinus ||
           next.kind == TokenKind::kStar || next.kind == TokenKind::kSlash ||
+          next.kind == TokenKind::kDoubleColon ||
           (next.kind == TokenKind::kOperator && next.text == "//")) {
         return Unsupported(next.span,
                            name + " expressions are not supported (" + name + " takes an integer)");
@@ -1475,6 +1671,7 @@ class Parser {
   std::optional<ParseError> lex_error_;
   std::size_t last_end_ = 0;
   std::size_t depth_ = 0;  // levels of the expression being parsed
+  std::size_t peak_ = 0;   // the deepest level reached, with the levels the canonical form adds
 };
 
 }  // namespace

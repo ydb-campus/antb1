@@ -449,6 +449,101 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT a FROM t WHERE url IN ('x', lower(title))", kUnsupported, "lower",
                   "function lower() is not supported"}));
 
+// Casts: CAST('YYYY-MM-DD' AS DATE) and 'YYYY-MM-DD'::DATE are DATE literals spanning the cast,
+// with their bind errors (D4, D5); every other cast is kUnsupported, before any name is resolved.
+INSTANTIATE_TEST_SUITE_P(
+    Casts, BindErrorTest,
+    ::testing::Values(
+        ErrorCase{"SELECT CAST('2020-02-30' AS DATE) FROM t", kBind, "CAST('2020-02-30' AS DATE)",
+                  "invalid date '2020-02-30'"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE dt = '2013-7-1'::date", kBind, "'2013-7-1'::date",
+                  "invalid date '2013-7-1': expected YYYY-MM-DD"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE dt IN ('2013-07-01 00:00:00'::DATE)", kBind,
+                  "'2013-07-01 00:00:00'::DATE", "expected YYYY-MM-DD"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE s = CAST('2013-07-01' AS DATE)", kBind,
+                  "CAST('2013-07-01' AS DATE)",
+                  "cannot compare VARCHAR column 's' with a DATE literal"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE '2013-07-01'::DATE < i64", kBind,
+                  "'2013-07-01'::DATE", "cannot compare BIGINT column 'i64' with a DATE literal"},
+        ErrorCase{"SELECT CAST('2013-07-01' AS DATE) + 1 FROM t", kUnsupported, "+",
+                  "DATE arithmetic"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE '2013-07-01'::DATE", kUnsupported,
+                  "'2013-07-01'::DATE", "conditions other than comparisons"},
+        ErrorCase{"SELECT -CAST('2013-07-01' AS DATE) FROM t", kBind, "-",
+                  "arithmetic operator '-' needs a number, but 'CAST('2013-07-01' AS \"DATE\")' is "
+                  "DATE"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE s LIKE CAST('2013-07-01' AS DATE)", kBind,
+                  "CAST('2013-07-01' AS DATE)", "the pattern of LIKE must be a string literal"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE '2013-07-01'::DATE LIKE 'x'", kUnsupported,
+                  "'2013-07-01'::DATE", "LIKE needs a column on the left"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE '2013-07-01'::DATE IN (dt)", kUnsupported,
+                  "'2013-07-01'::DATE", "IN needs a column on the left"},
+        // Every other cast, at its first unsupported part in source order.
+        ErrorCase{"SELECT TRY_CAST('2013-07-01' AS DATE) FROM t", kUnsupported, "TRY_CAST",
+                  "TRY_CAST is not supported"},
+        ErrorCase{"SELECT try_cast(lower(nope) AS INT) FROM t", kUnsupported, "try_cast",
+                  "TRY_CAST is not supported"},
+        ErrorCase{"SELECT CAST(i16 AS BIGINT) FROM t", kUnsupported, "BIGINT",
+                  "CAST to BIGINT is not supported (only a string literal cast to DATE is)"},
+        ErrorCase{"SELECT nope::varchar FROM t", kUnsupported, "varchar",
+                  "CAST to VARCHAR is not supported"},
+        ErrorCase{"SELECT CAST(h AS decimal(15,2)) FROM t", kUnsupported, "decimal(15,2)",
+                  "CAST to DECIMAL(15, 2) is not supported"},
+        ErrorCase{"SELECT CAST('2013-07-01' AS DATE(3)) FROM t", kUnsupported, "DATE(3)",
+                  "CAST to DATE(3) is not supported"},
+        ErrorCase{"SELECT CAST(dt AS DATE) FROM t", kUnsupported, "dt",
+                  "CAST to DATE is only supported for a string literal ('YYYY-MM-DD')"},
+        ErrorCase{"SELECT CAST(DATE '2013-07-01' AS DATE) FROM t", kUnsupported,
+                  "DATE '2013-07-01'", "CAST to DATE is only supported for a string literal"},
+        ErrorCase{"SELECT '2013-07-01'::DATE::DATE FROM t", kUnsupported, "'2013-07-01'::DATE",
+                  "CAST to DATE is only supported for a string literal"},
+        ErrorCase{"SELECT CAST(20130701 AS DATE) FROM t", kUnsupported, "20130701",
+                  "CAST to DATE is only supported for a string literal"},
+        ErrorCase{"SELECT CAST(lower(s) AS INT) FROM t", kUnsupported, "lower",
+                  "function lower() is not supported"},
+        ErrorCase{"SELECT (i16 = 1)::VARCHAR FROM t", kUnsupported, "=",
+                  "comparisons are only supported in conditions"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE CAST(i16 AS VARCHAR) = '1'", kUnsupported,
+                  "VARCHAR", "CAST to VARCHAR is not supported"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE CAST(i16 AS BOOLEAN)", kUnsupported, "BOOLEAN",
+                  "CAST to BOOLEAN is not supported"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE i16 IN (1, 2::INT)", kUnsupported, "INT",
+                  "CAST to INT is not supported"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE s LIKE 'x%'::VARCHAR", kUnsupported, "VARCHAR",
+                  "CAST to VARCHAR is not supported"},
+        ErrorCase{"SELECT i16 FROM t GROUP BY i16::INT", kUnsupported, "INT",
+                  "CAST to INT is not supported"},
+        ErrorCase{"SELECT i16 FROM t ORDER BY CAST(i16 AS BIGINT) DESC", kUnsupported, "BIGINT",
+                  "CAST to BIGINT is not supported"},
+        ErrorCase{"SELECT SUM(i16::BIGINT) FROM t", kUnsupported, "BIGINT",
+                  "CAST to BIGINT is not supported"},
+        ErrorCase{"SELECT COUNT(*) FROM t GROUP BY i16 HAVING SUM(i16)::BIGINT > 1", kUnsupported,
+                  "BIGINT", "CAST to BIGINT is not supported"},
+        ErrorCase{"SELECT CASE WHEN i16 = 1 THEN CAST(i16 AS INT) END FROM t", kUnsupported, "INT",
+                  "CAST to INT is not supported"},
+        ErrorCase{"SELECT EXTRACT(year FROM CAST(i64 AS TIMESTAMP)) FROM t", kUnsupported,
+                  "TIMESTAMP", "CAST to TIMESTAMP is not supported"},
+        ErrorCase{"SELECT date_trunc('day'::VARCHAR, dt) FROM t", kUnsupported, "'day'::VARCHAR",
+                  "the unit of date_trunc() must be a string literal"},
+        // A call with the wrong number of arguments is a bind error whatever its arguments
+        // (CheckSupported does not look into them): the binder still sees the casts in them.
+        ErrorCase{"SELECT strlen(s::VARCHAR, 1) FROM t", kBind, "strlen(s::VARCHAR, 1)",
+                  "strlen() takes 1 argument, not 2"},
+        ErrorCase{"SELECT i16, strlen(MAX(s)::VARCHAR, 1) FROM t", kBind, "i16",
+                  "column 'i16' must be inside an aggregate function"},
+        ErrorCase{"SELECT SUM(strlen(s::VARCHAR, 1)) FROM t", kBind, "strlen(s::VARCHAR, 1)",
+                  "strlen() takes 1 argument, not 2"},
+        ErrorCase{"SELECT SUM(strlen('x'::VARCHAR, 1)) FROM t", kUnsupported,
+                  "strlen('x'::VARCHAR, 1)", "constant aggregate arguments are not supported"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE strlen(s::VARCHAR, 1) > 1", kBind,
+                  "strlen(s::VARCHAR, 1)", "strlen() takes 1 argument, not 2"},
+        ErrorCase{"SELECT COUNT(*) FROM t GROUP BY i16 HAVING strlen(MAX(s)::VARCHAR, 1) > 1",
+                  kBind, "strlen(MAX(s)::VARCHAR, 1)", "strlen() takes 1 argument, not 2"},
+        ErrorCase{"SELECT CASE WHEN i16 = 1 THEN strlen(s::VARCHAR, 1) END FROM t", kBind,
+                  "strlen(s::VARCHAR, 1)", "strlen() takes 1 argument, not 2"},
+        ErrorCase{"SELECT i16 FROM t ORDER BY strlen(s::VARCHAR, 1)", kBind,
+                  "strlen(s::VARCHAR, 1)", "strlen() takes 1 argument, not 2"}));
+
 TEST(BinderTest, TablesMatchCaseInsensitively) {
   const Catalog catalog = MakeCatalog();
   for (const char* sql :
@@ -1406,6 +1501,72 @@ TEST(BinderTest, ConstantsAndPositions) {
   ASSERT_TRUE(ordered_global.ok()) << ordered_global.status().ToString();
   EXPECT_TRUE(std::holds_alternative<AggregateNode>(Nth(*ordered_global, 1)))
       << "an ORDER BY aggregate makes one row";
+}
+
+// CAST('YYYY-MM-DD' AS DATE) and 'YYYY-MM-DD'::DATE are the DATE literal, as in DuckDB, which names
+// all three CAST('YYYY-MM-DD' AS "DATE"): the same plan in every clause.
+TEST(BinderTest, DateCastsAreDateLiterals) {
+  const Catalog catalog = MakeCatalog();
+  struct Case {
+    std::string_view literal;
+    std::string_view cast;
+  };
+  for (const Case& c : {
+           Case{.literal = "SELECT DATE '2020-01-02', dt FROM t WHERE dt >= DATE '2013-07-01' AND "
+                           "DATE '2013-07-15' > dt",
+                .cast = "SELECT CAST('2020-01-02' AS DATE), dt FROM t WHERE dt >= "
+                        "'2013-07-01'::date AND cast('2013-07-15' as Date) > dt"},
+           Case{.literal = "SELECT COUNT(*) FROM t WHERE dt IN (DATE '2013-07-01', DATE "
+                           "'2013-07-02') AND (dt NOT IN (DATE '2013-07-03') OR dt <> DATE "
+                           "'2013-07-04')",
+                .cast = "SELECT COUNT(*) FROM t WHERE dt IN ('2013-07-01'::DATE, CAST('2013-07-02' "
+                        "AS DATE)) AND (dt NOT IN (('2013-07-03')::DATE) OR dt <> "
+                        "(CAST('2013-07-04' AS DATE)))"},
+           Case{.literal = "SELECT i16, MIN(dt) FROM t GROUP BY i16 HAVING MAX(dt) < DATE "
+                           "'2013-07-15' OR MIN(dt) IN (DATE '2013-07-01')",
+                .cast = "SELECT i16, MIN(dt) FROM t GROUP BY i16 HAVING MAX(dt) < "
+                        "'2013-07-15'::DATE OR MIN(dt) IN (CAST('2013-07-01' AS DATE))"},
+           Case{.literal = "SELECT CASE WHEN i16 = 1 THEN dt ELSE DATE '2013-07-01' END, CASE dt "
+                           "WHEN DATE '2013-07-02' THEN 1 END FROM t",
+                .cast = "SELECT CASE WHEN i16 = 1 THEN dt ELSE '2013-07-01'::DATE END, CASE dt "
+                        "WHEN CAST('2013-07-02' AS DATE) THEN 1 END FROM t"},
+           Case{.literal = "SELECT CASE WHEN i16 = 1 THEN DATE '2013-07-01' ELSE dt END, CASE DATE "
+                           "'2013-07-02' WHEN dt THEN 1 END FROM t",
+                .cast = "SELECT CASE WHEN i16 = 1 THEN '2013-07-01'::DATE ELSE dt END, CASE "
+                        "CAST('2013-07-02' AS DATE) WHEN dt THEN 1 END FROM t"},
+           Case{.literal = "SELECT MAX(CASE WHEN i16 = 1 THEN dt ELSE DATE '2013-07-01' END), "
+                           "EXTRACT(year FROM DATE '2013-07-15'), date_trunc('month', DATE "
+                           "'2013-07-15') FROM t",
+                .cast = "SELECT MAX(CASE WHEN i16 = 1 THEN dt ELSE '2013-07-01'::DATE END), "
+                        "EXTRACT(year FROM CAST('2013-07-15' AS DATE)), date_trunc('month', "
+                        "'2013-07-15'::DATE) FROM t"},
+           Case{.literal = "SELECT DATE '2020-01-02' AS k, s, COUNT(*) FROM t GROUP BY DATE "
+                           "'2020-01-02', s ORDER BY DATE '2024-01-31', 3 DESC",
+                .cast = "SELECT '2020-01-02'::DATE AS k, s, COUNT(*) FROM t GROUP BY "
+                        "CAST('2020-01-02' AS DATE), s ORDER BY '2024-01-31'::DATE, 3 DESC"},
+           Case{.literal = "SELECT toDateTime(i64) FROM t WHERE toDateTime(i64) >= DATE "
+                           "'2013-07-15' ORDER BY 1 LIMIT 3",
+                .cast = "SELECT toDateTime(i64) FROM t WHERE toDateTime(i64) >= "
+                        "CAST('2013-07-15' AS DATE) ORDER BY 1 LIMIT 3"},
+       }) {
+    auto literal = BindSql(c.literal, catalog);
+    auto cast = BindSql(c.cast, catalog);
+    ASSERT_TRUE(literal.ok()) << c.literal << ": " << literal.status().ToString();
+    ASSERT_TRUE(cast.ok()) << c.cast << ": " << cast.status().ToString();
+    EXPECT_EQ(Explain(*cast), Explain(*literal)) << c.cast;
+  }
+
+  constexpr std::string_view kSql = "SELECT '2020-01-02'::DATE, CAST('2024-01-31' AS DATE) FROM t";
+  auto plan = BindSql(kSql, catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  ASSERT_EQ(plan->output.size(), 2U);
+  EXPECT_EQ(plan->output[0].name, "CAST('2020-01-02' AS \"DATE\")");
+  EXPECT_EQ(plan->output[0].type, LogicalType::kDate);
+  EXPECT_EQ(plan->output[1].name, "CAST('2024-01-31' AS \"DATE\")");
+  const auto& project = std::get<ProjectNode>(Nth(*plan, 0));
+  ASSERT_EQ(project.constants.size(), 2U);
+  EXPECT_EQ(std::get<Int128>(project.constants[0].value_or(Constant{}).value), Int128{18263});
+  EXPECT_EQ(std::get<Int128>(project.constants[1].value_or(Constant{}).value), Int128{19753});
 }
 
 TEST(BinderTest, SelectStarProjectsEveryColumn) {

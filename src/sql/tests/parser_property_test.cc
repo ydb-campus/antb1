@@ -7,7 +7,9 @@
 //      ast and ToSql is idempotent; a comparison written literal-first normalizes like the
 //      column-first one.
 
+#include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -76,6 +78,7 @@ struct Counts {
   std::size_t integer_divides = 0;
   std::size_t strings = 0;
   std::size_t numbers = 0;
+  std::size_t casts = 0;  // CAST( / TRY_CAST( or '::'
 };
 
 std::size_t Separators(std::size_t n) { return n == 0 ? 0U : n - 1; }
@@ -170,6 +173,14 @@ struct CountOf {
     ++c.parens;
     Count(*e.source, c);
   }
+  // The parentheses of CAST( are not counted: x::T has none. The type's parameters have theirs.
+  void operator()(const CastExpr& cast) const {
+    ++c.casts;
+    c.numbers += cast.type_params.size();
+    c.commas += Separators(cast.type_params.size());
+    c.parens += cast.type_params.empty() ? 0U : 1U;
+    Count(*cast.operand, c);
+  }
 };
 
 void Count(const Expr& expr, Counts& c) {
@@ -185,11 +196,21 @@ void CheckTokensAccountedFor(const std::string& sql, const SelectStatement& stmt
   Counts seen;
   std::size_t left_parens = 0;
   std::size_t right_parens = 0;
-  for (const Token& token : *tokens) {
+  for (std::size_t i = 0; i < tokens->size(); ++i) {
+    const Token& token = (*tokens)[i];
     switch (token.kind) {
       case TokenKind::kIdentifier:
         seen.and_count += token.IsKeyword("AND") ? 1U : 0U;
         seen.or_count += token.IsKeyword("OR") ? 1U : 0U;
+        // A name followed by '(' is a call or a cast.
+        seen.casts += (token.IsKeyword("CAST") || token.IsKeyword("TRY_CAST")) &&
+                              i + 1 < tokens->size() &&
+                              (*tokens)[i + 1].kind == TokenKind::kLeftParen
+                          ? 1U
+                          : 0U;
+        break;
+      case TokenKind::kDoubleColon:
+        ++seen.casts;
         break;
       case TokenKind::kQuotedIdentifier:
       case TokenKind::kSemicolon:
@@ -278,6 +299,7 @@ void CheckTokensAccountedFor(const std::string& sql, const SelectStatement& stmt
   EXPECT_EQ(seen.integer_divides, want.integer_divides) << context;
   EXPECT_EQ(seen.strings, want.strings) << context;
   EXPECT_EQ(seen.numbers, want.numbers) << context;
+  EXPECT_EQ(seen.casts, want.casts) << context;
 }
 
 // Every span of the expression lies inside the query.
@@ -306,6 +328,22 @@ void CheckSpans(const Expr& expr, const std::string& sql) {
     }
   } else if (const auto* agg = std::get_if<AggregateCall>(&expr); agg != nullptr && agg->arg) {
     CheckSpans(**agg->arg, sql);
+  } else if (const auto* cast = std::get_if<CastExpr>(&expr)) {
+    ASSERT_TRUE(SpanInside(cast->op_span, sql));
+    ASSERT_TRUE(SpanInside(cast->type_span, sql));
+    std::string op = sql.substr(cast->op_span.offset, cast->op_span.length);
+    std::string type = sql.substr(cast->type_span.offset, cast->type_span.length);
+    for (std::string* text : {&op, &type}) {
+      std::ranges::transform(*text, text->begin(),
+                             [](unsigned char ch) { return static_cast<char>(std::toupper(ch)); });
+    }
+    if (cast->try_cast) {
+      ASSERT_EQ(op, "TRY_CAST");
+    } else {
+      ASSERT_TRUE(op == "CAST" || op == "::") << op;
+    }
+    ASSERT_TRUE(type.starts_with(cast->type)) << type;
+    CheckSpans(*cast->operand, sql);
   }
 }
 
@@ -388,21 +426,21 @@ constexpr auto kOperands = std::to_array<std::string_view>({
     "-",
 });
 constexpr auto kOther = std::to_array<std::string_view>({
-    "OR",       "NOT",         "ISNULL",   "notnull", "HAVING",
-    "JOIN",     "UNION",       "WITH",     "LIKE",    "IN",
-    "BETWEEN",  "CASE",        "WHEN",     "THEN",    "END",
-    "IS",       "NULL",        "TRUE",     "FALSE",   "INTERVAL",
-    "CAST",     "TIMESTAMPTZ", "EXISTS",   "ALL",     "OVER",
-    "FILTER",   "INTO",        "LEFT",     "COLLATE", "lower",
-    ".",        "+",           "/",        "%",       "::",
-    "||",       "'open",       R"("open)", "/* open", "-- comment\n",
-    "!",        "#",           "~",        "!~",      "!=-",
-    "==",       "<<",          "->",       "?",       "$1",
-    "{",        "0x1F",        "1_000",    "E'x'",    "INT",
-    "EXCLUDE",  "PERCENT",     "USING",    "-- c\r",  "/* /* */ */",
-    "/* /* */", "\xd0\xb8",    "\x01",     "\xff",    "\xc3\x28",
-    "1e",       "12abc",       R"("")",    ":",       "|",
-    "[",
+    "OR",       "NOT",         "ISNULL",    "notnull", "HAVING",
+    "JOIN",     "UNION",       "WITH",      "LIKE",    "IN",
+    "BETWEEN",  "CASE",        "WHEN",      "THEN",    "END",
+    "IS",       "NULL",        "TRUE",      "FALSE",   "INTERVAL",
+    "CAST",     "TIMESTAMPTZ", "EXISTS",    "ALL",     "OVER",
+    "FILTER",   "INTO",        "LEFT",      "COLLATE", "lower",
+    ".",        "+",           "/",         "%",       "::",
+    "||",       "'open",       R"("open)",  "/* open", "-- comment\n",
+    "!",        "#",           "~",         "!~",      "!=-",
+    "==",       "<<",          "->",        "?",       "$1",
+    "{",        "0x1F",        "1_000",     "E'x'",    "INT",
+    "EXCLUDE",  "PERCENT",     "USING",     "-- c\r",  "/* /* */ */",
+    "/* /* */", "\xd0\xb8",    "\x01",      "\xff",    "\xc3\x28",
+    "1e",       "12abc",       R"("")",     ":",       "|",
+    "[",        "TRY_CAST",    "PRECISION",
 });
 constexpr auto kSeparators = std::to_array<std::string_view>(
     {" ", " ", " ", "", "\n", "\t", "/**/", "--\n", "\r", "--\r", "/*/**/*/"});
@@ -441,6 +479,9 @@ std::vector<std::string_view> Skeleton(Rng& rng) {
         const std::string_view agg = rng.Pick(kAggregates);
         tokens.insert(tokens.end(),
                       {agg, "(", agg.size() == 5 && rng.Percent(50) ? "*" : rng.Pick(kNames), ")"});
+      } else if (rng.Percent(10)) {
+        tokens.insert(tokens.end(), {"CAST", "(", rng.Pick(kNames), "AS", "DECIMAL", "(", "15", ",",
+                                     "2", ")", ")"});
       } else {
         tokens.push_back(rng.Pick(kNames));
       }
@@ -463,6 +504,10 @@ std::vector<std::string_view> Skeleton(Rng& rng) {
         literal = {"-", rng.Pick(kLiterals).substr(0, 2)};
       } else if (rng.Percent(15)) {
         literal = {"DATE", "'2024-01-31'"};
+      } else if (rng.Percent(10)) {
+        literal = rng.Percent(50) ? std::vector<std::string_view>{"CAST", "(",    "'2024-01-31'",
+                                                                  "AS",   "DATE", ")"}
+                                  : std::vector<std::string_view>{"'2024-01-31'", "::", "date"};
       } else if (rng.Percent(10)) {
         literal = {"TIMESTAMP", "'2024-01-31 12:34:56.5'"};
       } else {
@@ -567,6 +612,8 @@ constexpr auto kCorpus = std::to_array<std::string_view>({
     R"(SELECT MIN(ts), MAX(ts) FROM "Events" WHERE ts >= DATE '2024-01-01' LIMIT 5;)",
     "SELECT AVG(price) p FROM sales WHERE -1.5 < price AND 'x' <> sku",
     "select count(user_id) from events where user_id != 7 -- trailing\n",
+    "SELECT CAST(amount AS DECIMAL(15, 2)) FROM sales WHERE day >= '2024-01-31'::date AND "
+    "-1::INTEGER < amount",
 });
 
 std::string Mutate(Rng& rng, std::string sql) {
@@ -715,7 +762,9 @@ Expr RandomExpr(Rng& rng, std::size_t depth, bool aggregates) {
   static constexpr auto kFunctions =
       std::to_array<std::string_view>({"strlen", "regexp_replace", "f", "date_trunc", "abs"});
   const auto sub = [&](bool agg) { return Box<Expr>(RandomExpr(rng, depth - 1, agg)); };
-  const std::size_t roll = depth == 0 ? rng.Below(2) : rng.Below(11);
+  static constexpr auto kTypes =
+      std::to_array<std::string_view>({"DATE", "INTEGER", "BIGINT", "VARCHAR", "DECIMAL", "T_1"});
+  const std::size_t roll = depth == 0 ? rng.Below(2) : rng.Below(12);
   switch (roll) {
     case 0:
       return Expr(RandomColumn(rng));
@@ -763,6 +812,19 @@ Expr RandomExpr(Rng& rng, std::size_t depth, bool aggregates) {
         in.list.push_back(RandomExpr(rng, depth - 1, aggregates));
       }
       return Expr(std::move(in));
+    }
+    case 10: {
+      CastExpr cast{.operand = sub(aggregates),
+                    .type = std::string(rng.Pick(kTypes)),
+                    .type_params = {},
+                    .try_cast = rng.Percent(20),
+                    .op_span = {},
+                    .type_span = {},
+                    .span = {}};
+      for (std::size_t n = rng.Below(3); n > 0; --n) {
+        cast.type_params.push_back(RandomDigits(rng, 3));
+      }
+      return Expr(std::move(cast));
     }
     case 9: {
       FunctionCall call{.name = std::string(rng.Pick(kFunctions)),
