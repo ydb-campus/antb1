@@ -47,7 +47,9 @@ at one layer.
   logical plan. `src/plan/types.cc` holds the logical types and their Arrow mapping.
 - A new kind of expression node (an alternative of `sql::ExprNode`) fails to compile until every binder visitor
   handles it: `FirstUnsupportedOf`, `RejectConditionOf`, `ReadsColumnOf`, `ContainsAggregateOf`, `ExprNameOf`,
-  `BindInputOf` and `BindOutputOf`. Until the binder answers the node, the first two reject it with `kUnsupported`.
+  `BindInputOf`, `BindOutputOf` and `BindConditionOf`. Until the binder answers the node, the first two reject it
+  with `kUnsupported`. `BindConditionOf` binds every condition leaf that `RejectConditionOf` admits; any other node
+  reaching it fails an `ANTB1_CHECK`.
 - Compare column and literal exactly at bind time: an out-of-range literal becomes constant true or false for
   non-NULL values (NULLs stay NULL), and a decimal literal against an integer column becomes an equivalent integer
   comparison ([sql-subset.md](../sql-subset.md#semantics)).

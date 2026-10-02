@@ -32,7 +32,8 @@
 //
 // A function that answers for every kind of expression node visits the node with a struct of one
 // overload per kind (FirstUnsupportedOf, RejectConditionOf, ReadsColumnOf, ContainsAggregateOf,
-// ExprNameOf, BindInputOf, BindOutputOf), so a new kind fails to compile until each one handles it.
+// ExprNameOf, BindInputOf, BindOutputOf, BindConditionOf), so a new kind fails to compile until
+// each one handles it.
 
 namespace antb1::plan {
 namespace {
@@ -1520,9 +1521,20 @@ arrow::Result<Typed> LiteralOperand(const sql::Literal& lit) {
 
 bool IsConstantExpr(const Expr& expr) { return std::holds_alternative<ConstantExpr>(expr.node); }
 
-// The comparison of a binary comparison operator (the caller checked that it is one).
+// A node that the checks before binding never admit where a binder visits it (programming errors):
+// - ConditionAsOperand: [NOT] LIKE and [NOT] IN are conditions. CheckSupported admits them only
+//   where BindConditionWith binds them, never where BindInput or BindOutput binds an operand.
+// - NotAConditionLeaf: a condition leaf is a comparison, [NOT] LIKE or [NOT] IN. RejectCondition
+//   admits no other, and Conjuncts and BindBool take AND, OR and NOT apart before
+//   BindConditionWith binds a leaf.
+[[noreturn]] void ConditionAsOperand() { ANTB1_CHECK(false); }
+[[noreturn]] void NotAConditionLeaf() { ANTB1_CHECK(false); }
+
+// The comparison of a binary comparison operator (any other operator is no condition leaf).
 sql::CompareOp SqlCompareOp(sql::BinaryOp op) {
   switch (op) {
+    case sql::BinaryOp::kEq:
+      return sql::CompareOp::kEq;
     case sql::BinaryOp::kNe:
       return sql::CompareOp::kNe;
     case sql::BinaryOp::kLt:
@@ -1533,9 +1545,10 @@ sql::CompareOp SqlCompareOp(sql::BinaryOp op) {
       return sql::CompareOp::kGt;
     case sql::BinaryOp::kGe:
       return sql::CompareOp::kGe;
-    default:
-      return sql::CompareOp::kEq;
+    default:  // arithmetic, AND, OR
+      break;
   }
+  NotAConditionLeaf();
 }
 
 // The operator with swapped operands: 5 < c  <=>  c > 5.
@@ -1624,10 +1637,6 @@ bool IsAggregateQuery(const sql::SelectStatement& stmt) {
 // Compute above the aggregation (from kPostBase), whose inputs' widths are only known then.
 constexpr int kPreBase = 4 * 1024 * 1024;
 constexpr int kPostBase = 16 * 1024 * 1024;
-
-// [NOT] LIKE and [NOT] IN are conditions: CheckSupported admits them only where BindConditionWith
-// binds them, never where BindInput or BindOutput binds an operand.
-[[noreturn]] void ConditionAsOperand() { ANTB1_CHECK(false); }
 
 class Binder {
  public:
@@ -2044,6 +2053,9 @@ class Binder {
   arrow::Result<Predicate> BindConditionWith(const sql::Expr& conjunct, bool input,
                                              const BindFn& bind, const ColumnOf& column_of,
                                              bool nested);
+  // BindConditionWith's visitor over the condition leaves.
+  template <class BindFn, class ColumnOf>
+  struct BindConditionOf;
   // A condition as a BOOLEAN expression in the scope `bind` binds operands in: AND, OR and NOT
   // over PredicateExpr leaves (WHERE's forms, folded alike).
   template <class BindFn>
@@ -2339,14 +2351,21 @@ arrow::Result<Predicate> Binder::BindCondition(const sql::Expr& conjunct, bool h
   return BindConditionWith(conjunct, /*input=*/!having, bind, column_of, /*nested=*/false);
 }
 
+// BindConditionWith's visitor: the condition leaves that RejectCondition admits ([NOT] LIKE,
+// [NOT] IN and the comparisons) as predicates. Any other kind of node is no leaf.
 template <class BindFn, class ColumnOf>
-arrow::Result<Predicate> Binder::BindConditionWith(const sql::Expr& conjunct, bool input,
-                                                   const BindFn& bind, const ColumnOf& column_of,
-                                                   bool nested) {
+struct Binder::BindConditionOf {
+  Binder& binder;
+  const BindFn& bind;
+  const ColumnOf& column_of;
+  bool input = false;
+  bool nested = false;
+
   // `operand <op> literal` (and the LIKE and IN forms) through the column binders.
-  const auto with_literal = [&](const sql::Expr& operand_expr, sql::CompareOp op,
-                                const sql::Literal& literal, const std::vector<sql::Literal>& list,
-                                SourceSpan span) -> arrow::Result<Predicate> {
+  arrow::Result<Predicate> WithLiteral(const sql::Expr& operand_expr, sql::CompareOp op,
+                                       const sql::Literal& literal,
+                                       const std::vector<sql::Literal>& list,
+                                       SourceSpan span) const {
     ARROW_ASSIGN_OR_RAISE(const Typed operand, bind(operand_expr));
     const BoundColumn column = column_of(operand);
     // The comparison binders read the operand's name and span from a column reference.
@@ -2357,81 +2376,106 @@ arrow::Result<Predicate> Binder::BindConditionWith(const sql::Expr& conjunct, bo
         .list = list,
         .span = span};
     return BindComparison(cmp, column, operand.stored_as_float);
-  };
-  if (const auto* like = std::get_if<sql::LikeExpr>(&conjunct)) {
-    return with_literal(*like->operand,
-                        like->negated ? sql::CompareOp::kNotLike : sql::CompareOp::kLike,
-                        std::get<sql::Literal>(*like->pattern), {}, like->span);
   }
-  if (const auto* in = std::get_if<sql::InExpr>(&conjunct)) {
+
+  arrow::Result<Predicate> operator()(const sql::LikeExpr& like) const {
+    return WithLiteral(*like.operand,
+                       like.negated ? sql::CompareOp::kNotLike : sql::CompareOp::kLike,
+                       std::get<sql::Literal>(*like.pattern), {}, like.span);
+  }
+  arrow::Result<Predicate> operator()(const sql::InExpr& in) const {
     std::vector<sql::Literal> list;
-    list.reserve(in->list.size());
-    for (const sql::Expr& value : in->list) {
+    list.reserve(in.list.size());
+    for (const sql::Expr& value : in.list) {
       list.push_back(std::get<sql::Literal>(value));
     }
-    return with_literal(*in->operand, in->negated ? sql::CompareOp::kNotIn : sql::CompareOp::kIn,
-                        sql::Literal{}, list, in->span);
+    return WithLiteral(*in.operand, in.negated ? sql::CompareOp::kNotIn : sql::CompareOp::kIn,
+                       sql::Literal{}, list, in.span);
   }
-  const auto& binary = std::get<sql::BinaryExpr>(conjunct);
-  const sql::CompareOp op = SqlCompareOp(binary.op);
-  const auto* left_literal = std::get_if<sql::Literal>(&*binary.left);
-  const auto* right_literal = std::get_if<sql::Literal>(&*binary.right);
-  if (right_literal != nullptr || left_literal != nullptr) {
-    const sql::Expr& operand_expr = right_literal != nullptr ? *binary.left : *binary.right;
-    const sql::Literal& literal = right_literal != nullptr ? *right_literal : *left_literal;
-    const sql::CompareOp oriented = right_literal != nullptr ? op : Mirror(op);
-    {
-      ARROW_ASSIGN_OR_RAISE(const auto moved,
-                            MoveConstants(operand_expr, oriented, literal, bind, !input));
-      if (moved.has_value()) {
-        if (moved->outcome != Moved::Outcome::kCompare) {
-          ARROW_ASSIGN_OR_RAISE(const Typed operand, bind(*moved->operand));
-          // A top-level FALSE reads nothing; inside an expression it is NULL for a NULL operand.
-          const bool never = moved->outcome == Moved::Outcome::kFalse;
-          return Predicate{
-              .kind = never ? Predicate::Kind::kFalse : Predicate::Kind::kIsNotNull,
-              .column = never && !nested ? std::nullopt : std::optional(column_of(operand)),
-              .op = CompareOp::kEq,
-              .constant = {},
-              .values = {},
-              .span = binary.span};
+  arrow::Result<Predicate> operator()(const sql::BinaryExpr& binary) const {
+    const sql::CompareOp op = SqlCompareOp(binary.op);
+    const auto* left_literal = std::get_if<sql::Literal>(&*binary.left);
+    const auto* right_literal = std::get_if<sql::Literal>(&*binary.right);
+    if (right_literal != nullptr || left_literal != nullptr) {
+      const sql::Expr& operand_expr = right_literal != nullptr ? *binary.left : *binary.right;
+      const sql::Literal& literal = right_literal != nullptr ? *right_literal : *left_literal;
+      const sql::CompareOp oriented = right_literal != nullptr ? op : Mirror(op);
+      {
+        ARROW_ASSIGN_OR_RAISE(const auto moved,
+                              binder.MoveConstants(operand_expr, oriented, literal, bind, !input));
+        if (moved.has_value()) {
+          if (moved->outcome != Moved::Outcome::kCompare) {
+            ARROW_ASSIGN_OR_RAISE(const Typed operand, bind(*moved->operand));
+            // A top-level FALSE reads nothing; inside an expression it is NULL for a NULL operand.
+            const bool never = moved->outcome == Moved::Outcome::kFalse;
+            return Predicate{
+                .kind = never ? Predicate::Kind::kFalse : Predicate::Kind::kIsNotNull,
+                .column = never && !nested ? std::nullopt : std::optional(column_of(operand)),
+                .op = CompareOp::kEq,
+                .constant = {},
+                .values = {},
+                .span = binary.span};
+          }
+          const sql::Literal k{.kind = sql::Literal::Kind::kInteger,
+                               .negative = moved->k < 0,
+                               .text = Int128ToString(moved->k < 0 ? -moved->k : moved->k),
+                               .span = literal.span};
+          return WithLiteral(*moved->operand, moved->op, k, {}, binary.span);
         }
-        const sql::Literal k{.kind = sql::Literal::Kind::kInteger,
-                             .negative = moved->k < 0,
-                             .text = Int128ToString(moved->k < 0 ? -moved->k : moved->k),
-                             .span = literal.span};
-        return with_literal(*moved->operand, moved->op, k, {}, binary.span);
       }
+      return WithLiteral(operand_expr, oriented, literal, {}, binary.span);
     }
-    return with_literal(operand_expr, oriented, literal, {}, binary.span);
+    ARROW_ASSIGN_OR_RAISE(const Typed left, bind(*binary.left));
+    ARROW_ASSIGN_OR_RAISE(const Typed right, bind(*binary.right));
+    const auto temporal = [](LogicalType t) {
+      return t == LogicalType::kDate || t == LogicalType::kTimestamp;
+    };
+    if (left.expr->type != right.expr->type && temporal(left.expr->type) &&
+        temporal(right.expr->type)) {
+      return UnsupportedError("comparing a DATE with a TIMESTAMP is not supported", binary.op_span);
+    }
+    if (!Comparable(left.expr->type, right.expr->type)) {
+      return BindError(
+          std::format("cannot compare {} with {}", DescribeOperand(left), DescribeOperand(right)),
+          binary.op_span);
+    }
+    if (left.stored_as_float || right.stored_as_float) {
+      return UnsupportedError(
+          "comparing a FLOAT column with another expression is not supported (antb1 reads FLOAT as "
+          "DOUBLE, divergence D11)",
+          binary.op_span);
+    }
+    return Predicate{.kind = Predicate::Kind::kCompareColumns,
+                     .column = column_of(left),
+                     .other = column_of(right),
+                     .op = ToPlan(op),
+                     .constant = {},
+                     .values = {},
+                     .span = binary.span};
   }
-  ARROW_ASSIGN_OR_RAISE(const Typed left, bind(*binary.left));
-  ARROW_ASSIGN_OR_RAISE(const Typed right, bind(*binary.right));
-  const auto temporal = [](LogicalType t) {
-    return t == LogicalType::kDate || t == LogicalType::kTimestamp;
-  };
-  if (left.expr->type != right.expr->type && temporal(left.expr->type) &&
-      temporal(right.expr->type)) {
-    return UnsupportedError("comparing a DATE with a TIMESTAMP is not supported", binary.op_span);
+  arrow::Result<Predicate> operator()(const sql::ColumnRef& /*ref*/) const { NotAConditionLeaf(); }
+  arrow::Result<Predicate> operator()(const sql::Literal& /*lit*/) const { NotAConditionLeaf(); }
+  arrow::Result<Predicate> operator()(const sql::AggregateCall& /*call*/) const {
+    NotAConditionLeaf();
   }
-  if (!Comparable(left.expr->type, right.expr->type)) {
-    return BindError(
-        std::format("cannot compare {} with {}", DescribeOperand(left), DescribeOperand(right)),
-        binary.op_span);
+  arrow::Result<Predicate> operator()(const sql::UnaryExpr& /*unary*/) const {
+    NotAConditionLeaf();
   }
-  if (left.stored_as_float || right.stored_as_float) {
-    return UnsupportedError(
-        "comparing a FLOAT column with another expression is not supported (antb1 reads FLOAT as "
-        "DOUBLE, divergence D11)",
-        binary.op_span);
+  arrow::Result<Predicate> operator()(const sql::FunctionCall& /*call*/) const {
+    NotAConditionLeaf();
   }
-  return Predicate{.kind = Predicate::Kind::kCompareColumns,
-                   .column = column_of(left),
-                   .other = column_of(right),
-                   .op = ToPlan(op),
-                   .constant = {},
-                   .values = {},
-                   .span = binary.span};
+  arrow::Result<Predicate> operator()(const sql::CaseExpr& /*c*/) const { NotAConditionLeaf(); }
+  arrow::Result<Predicate> operator()(const sql::ExtractExpr& /*e*/) const { NotAConditionLeaf(); }
+};
+
+template <class BindFn, class ColumnOf>
+arrow::Result<Predicate> Binder::BindConditionWith(const sql::Expr& conjunct, bool input,
+                                                   const BindFn& bind, const ColumnOf& column_of,
+                                                   bool nested) {
+  return std::visit(
+      BindConditionOf<BindFn, ColumnOf>{
+          .binder = *this, .bind = bind, .column_of = column_of, .input = input, .nested = nested},
+      static_cast<const sql::ExprNode&>(conjunct));
 }
 
 template <class BindFn>
