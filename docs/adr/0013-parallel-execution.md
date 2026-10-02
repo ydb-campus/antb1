@@ -111,8 +111,8 @@ joins, and correlated subqueries. ADR 0022 designs the joins and amends this sec
   its input's parts; a probe keeps the probe side's part order, so a join's output does not depend on the thread
   count.
 - **Subqueries:** the binder plans an uncorrelated subquery directly as a join: semi, null-aware anti, or a one-row
-  join (amended 2026-10-02, ADR 0022). Correlated subqueries are decorrelated by the binder into semi, anti and
-  aggregate joins; the executor never runs a subquery per row.
+  join (amended 2026-10-02, ADR 0022). Correlated subqueries are the subject of a later ADR (0023); the executor
+  never runs a subquery per row.
 - **Memory:** the window bounds what is in flight: up to 2 × threads parts' partial states or, under a part union
   (a projection, or a blocking operator without its own sink yet), their whole output, because a part hands on its
   batches only when it is finished. A hash-join build is one table shared read-only by the probe threads. An inner

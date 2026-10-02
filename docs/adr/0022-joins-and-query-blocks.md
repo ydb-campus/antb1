@@ -71,8 +71,10 @@ Proposed
   connector to the items before it: a comma, `CROSS JOIN`, `[INNER] JOIN ... ON` or `LEFT [OUTER] JOIN ... ON`. As
   in DuckDB, a JOIN binds tighter than a comma and associates to the left, so the items from the last comma up to a
   LEFT JOIN form its left input. Without nested joins (parenthesized ones, or a JOIN whose ON comes after a later
-  JOIN) this represents every FROM clause, and nothing recurses: a long chain of joins cannot overflow the stack when
-  it is copied, compared, printed or bound. The grammar grows by these rules (in the notation of docs/sql-subset.md):
+  JOIN) this represents every FROM clause, and no walk of the AST recurses along the list: a long chain of joins
+  cannot overflow the stack when it is copied, compared or printed. The plan that the binder builds from it is a tree
+  of joins whose walks recurse per node; the relation limit below is what keeps every such walk bounded. The grammar
+  grows by these rules (in the notation of docs/sql-subset.md):
 
   ```ebnf
   statement  = query , [ ";" ] ;
@@ -90,39 +92,61 @@ Proposed
   condition  = (* as today *) | sum , [ "NOT" ] , "IN" , "(" , block , ")" | "EXISTS" , "(" , block , ")" ;
   ```
 
-- **ON conditions** are split into conjuncts like WHERE. The ON conjuncts of an inner join behave as WHERE conjuncts
-  (rule 10 below); a LEFT JOIN keeps its ON with the join (see the logical plan). ON gets an aggregate-placement
-  context of its own, in which an aggregate is an error.
+- **ON conditions** are split into conjuncts like WHERE, and their names resolve in the FROM items up to their own
+  JOIN, never in a later one (rule 10 below). The ON conjuncts of an inner join then behave as WHERE conjuncts; a
+  LEFT JOIN keeps its ON with the join (see the logical plan). ON gets an aggregate-placement context of its own, in
+  which an aggregate is an error.
 - **Nested query blocks:** derived tables, WITH lists, scalar subqueries, `[NOT] IN (query)` and `EXISTS (query)`
   parse as blocks of their own (`NOT EXISTS` through the prefix `NOT`).
   - Each block starts fresh aggregate-placement contexts: an aggregate in the select list of a subquery inside WHERE
     is legal.
   - Every nested block counts against the depth limit of 256 levels, together with the expressions around it, so
-    neither the parser nor any recursive walk of the tree can overflow the stack.
+    neither the parser nor any recursive walk of the AST can overflow the stack.
+  - **At most 256 relations per query.** The depth limit bounds the AST, not the plan that the binder builds from it:
+    a FROM list becomes a left-deep tree of joins and each CTE reference a sub-plan of its own, and every walk of the
+    plan recurses per node (the optimizer passes, EXPLAIN, the physical planner, the operators' `Next` calls and the
+    plan's destruction). Before anything is bound, `CheckSupported` counts the FROM items of every block as
+    relations, those of a CTE's body once per reference to the CTE (an unreferenced CTE is never bound, as in
+    DuckDB). Each CTE's count is computed once, so counting stays linear, and a query of more than 256 relations
+    exits 4, like the depth limit. Every block has a FROM item, so the count bounds the subqueries too, and with them
+    the size and depth of every plan. The largest of the 22 queries joins 8 relations in one block, far below the
+    limit.
   - The doubly parenthesized `x IN ((query))` exits 4: DuckDB reads it as an IN subquery, while `x IN ((query), 3)`
     is a list that holds a scalar subquery. `(WITH ...)` inside an expression exits 4 too.
 - **Names follow DuckDB 1.5.5,** as the research checked them against it. The binder implements them in steps (see
-  the Plan): rules 1-6 in J2b; 7 and 8 in J4 (8 inside subqueries in J5); 9, 12 and 13 in J5; 11 in J6; and the three
-  parts of rule 10 in J2b, J4 and J6.
-  1. Each FROM item is one binding, named by its alias, else by its table's name, its CTE's name or its path's file
-     stem (`FROM 'dir/t.parquet'` binds as `t`). Names match ASCII case-insensitively.
+  the Plan): rules 1-6 in J2b (rule 1's CTEs and derived tables in J4); 7 and 8 in J4 (8 inside subqueries in J5);
+  9, 12 and 13 in J5; 11 in J6; and the three parts of rule 10 (the scope of an ON, lateral references and a LEFT
+  JOIN ON that reads outside the join) in J2b, J4 and J6.
+  1. Each FROM item is one binding, and names match ASCII case-insensitively. A binding is named by its alias, else as
+     DuckDB names it:
+     - a table or a CTE by its name;
+     - a path by its file name up to the first dot, leading dots skipped: `FROM 'dir/a.b.parquet'` binds as `a`;
+     - a path with a glob character (`*`, `?` or `[`) by its whole text: `FROM 'dir/t*.parquet'` binds as
+       `"dir/t*.parquet"`;
+     - the derived tables of a block that have no alias, in FROM order, as `unnamed_subquery`, `unnamed_subquery2`,
+       `unnamed_subquery3` and so on.
   2. An alias hides the table's name: with `FROM t AS a`, the name `t.x` is a bind error.
-  3. Two bindings may have the same name (`FROM t, t`); only a qualified reference to that name is ambiguous, a bind
-     error.
+  3. Two bindings may have the same name (`FROM t, t`). A qualified reference `t.x` then resolves to the one of them
+     that has a column `x`, and is ambiguous, a bind error, when both have one.
   4. An unqualified column found in two bindings is ambiguous, a bind error that names the qualified candidates. Two
      columns whose names differ only in case stay ambiguous, as today.
-  5. `SELECT *` returns every binding's columns in FROM order, duplicates included.
+  5. `SELECT *` returns every binding's columns in FROM order, duplicates included. When two bindings of the same name
+     share a column name, `*` is a bind error (`SELECT * FROM t, t`), like the qualified reference to that column
+     (rule 3).
   6. A plain column item `a.x` is named `x`; inside an expression the qualifier stays as written: `sum(a.x)`,
      `(a.x + 1)`.
   7. A derived table's output names are de-duplicated (`x`, `x_1`). A column alias list may be shorter than the
-     select list; a longer one is a bind error. A derived table needs no alias. A column alias list after a table
-     name, a CTE name or a path exits 4 (DuckDB renames a table's leading columns).
+     select list; a longer one is a bind error. A derived table needs no alias (rule 1 names it). A column alias list
+     after a table name, a CTE name or a path exits 4 (DuckDB renames a table's leading columns).
   8. A CTE hides a catalog table of the same name and is visible inside subqueries.
   9. A name resolves in the innermost block that has it; a name found only in an enclosing block is a correlation
      (ADR 0023; until then it exits 4, never the bind error "does not exist").
-  10. DuckDB answers an inner ON that reads a comma sibling (`a, b JOIN c ON a.x = c.x`) and an implicitly lateral
-      derived table. antb1 treats inner ON conjuncts as WHERE conjuncts, which gives the same answers, and exits 4
-      for a lateral reference and for a LEFT JOIN ON that reads outside the join.
+  10. Within its block, an ON resolves names only in the FROM items up to and including its own JOIN, earlier comma
+      siblings included (DuckDB answers `a, b JOIN c ON a.x = c.x`). A name that only a later item has is a bind
+      error there, as in DuckDB (`a JOIN b ON b.x = c.x JOIN c ON a.y = c.y`), or a correlation when an enclosing
+      block has it (rule 9); a later item's column never makes a name in an ON ambiguous. Once bound, inner ON
+      conjuncts are treated as WHERE conjuncts, which gives DuckDB's answers. DuckDB also answers an implicitly lateral
+      derived table; antb1 exits 4 for a lateral reference and for a LEFT JOIN ON that reads outside the join.
   11. A LEFT JOIN ON conjunct that reads only the right input filters that input, not the join's result.
   12. Scalar subqueries: their rules for columns and rows are under the uncorrelated subqueries below.
   13. A scalar subquery's result is named by its text in parentheses; the tests compare values and types, not names
@@ -186,8 +210,9 @@ Proposed
   and adds the columns of the keys and residuals; EXPLAIN renders both inputs, with qualified column names. The
   physical planner rejects a kind with `kUnsupported` until J1b (inner) or E2 (the others) implements it.
 - **Inner blocks.** The FROM items that commas, `CROSS JOIN` and `INNER JOIN` connect form an inner block, and their
-  ON conjuncts join the block's WHERE conjuncts. A LEFT JOIN with its two inputs is one fixed unit: a single relation
-  of the enclosing block, while each of its inputs is planned as an inner block of its own.
+  ON conjuncts, bound in the scope of their ON (rule 10), join the block's WHERE conjuncts. A LEFT JOIN with its two
+  inputs is one fixed unit: a single relation of the enclosing block, while each of its inputs is planned as an inner
+  block of its own.
 - **WHERE classification (J2b).** Each conjunct goes by the relations of its block that it reads, which ids give
   directly, also through the `Compute` that an OR or NOT conjunct is lowered into; a binding inside a fixed unit
   counts as the unit:
@@ -249,7 +274,8 @@ Proposed
   - The ON condition stays with the join. ON conjuncts that read only the right input are pushed into it (rule 11),
     equalities between the two inputs are keys as in WHERE, and every other ON conjunct is a residual of the join,
     even one that reads only the left input: a left row that fails it is padded, not dropped. An ON conjunct that
-    reads a binding outside the join's two inputs exits 4.
+    reads a binding outside the join's two inputs (a comma sibling before them; later items are out of its scope,
+    rule 10) exits 4.
   - A LEFT JOIN without a key between its two inputs (an ON with no equality between them, or only ones whose common
     type is DOUBLE) exits 4, as a disconnected inner graph does: E1's table and E2's candidate pairs need a key.
   - A WHERE conjunct that reads only the preserved side goes below the join as usual; one that reads the
@@ -260,6 +286,9 @@ Proposed
   - Each derived table and each CTE reference is bound as its own sub-plan with its own scope, and is one binding of
     its block. A CTE referenced twice is bound twice and scanned twice, as ADR 0013 scans a table that two pipelines
     read; the per-part determinism makes both copies identical.
+  - Binding every reference anew multiplies the work along a chain of CTEs: when each CTE joins the previous one with
+    itself, 30 of them bind 2^30 copies of the first. The relation limit (at most 256 per query) counts a CTE's body
+    at each reference, so such a chain exits 4 before any sub-plan is bound.
   - Names follow rules 7 and 8, and a lateral reference to a sibling FROM item exits 4. An aggregate over an
     aggregate uses the existing serial operators.
   - A sub-plan without a sink (a select-project-join block) streams into its consumer's pipeline. One that ends in a
@@ -375,13 +404,15 @@ Proposed
 - **Exit codes.** A join or subquery outside this design exits 4 until a query needs it: USING, NATURAL, RIGHT and
   FULL joins, DuckDB's SEMI, ANTI, ASOF and POSITIONAL joins, LATERAL, nested joins (parenthesized ones, and a JOIN
   followed by another JOIN before its ON), `schema.table` in FROM, `t.*`, `a.b.c`, a column alias list after a table,
-  CTE or path, WITH RECURSIVE, MATERIALIZED, a disconnected join graph (a cross product), a LEFT JOIN without a key,
-  an IN or NOT IN subquery whose common type with its left operand is DOUBLE, a subquery that is not a top-level
-  conjunct (under OR, in CASE, in a select list, in a LEFT JOIN's ON), an uncorrelated EXISTS, a scalar subquery
-  other than an ungrouped aggregate without HAVING, LIMIT or OFFSET (others can return no row, or several, which
-  needs DuckDB's run-time error), a lateral reference, a LEFT JOIN ON that reads outside the join and, until
-  ADR 0023, an outer reference. DuckDB's bind errors stay bind errors (exit code 1): an ambiguous name, a table name
-  that its alias hides, a column alias list longer than the select list, a scalar subquery with two columns.
+  CTE or path, WITH RECURSIVE, MATERIALIZED, more than 256 relations in a query (a CTE's body counted at each
+  reference), a disconnected join graph (a cross product), a LEFT JOIN without a key, an IN or NOT IN subquery whose
+  common type with its left operand is DOUBLE, a subquery that is not a top-level conjunct (under OR, in CASE, in a
+  select list, in a LEFT JOIN's ON), an uncorrelated EXISTS, a scalar subquery other than an ungrouped aggregate
+  without HAVING, LIMIT or OFFSET (others can return no row, or several, which needs DuckDB's run-time error), a
+  lateral reference, a LEFT JOIN ON that reads outside the join and, until ADR 0023, an outer reference. DuckDB's
+  bind errors stay bind errors (exit code 1): an ambiguous name, `*` over two bindings of the same name that share a
+  column name, a table name that its alias hides, a name in an ON that only a later FROM item has, a column alias
+  list longer than the select list, a scalar subquery with two columns.
 - **Correct plans that are not the fastest,** each deferred until its trigger:
   - DOUBLE join keys, until a user or generated query joins on DOUBLE columns;
   - cost-based join order (dynamic programming, selectivity estimates, equivalence edges, key ranges carried across
@@ -445,15 +476,18 @@ docs/sql-subset.md sections it changes.
 - **J2a, refactor(plan): name scopes in the binder.** Scopes of bindings, with single-table behavior unchanged.
 - **T1, test(diff): generate joins along foreign keys.** Joins of two and three tables in the random generator, as
   comma joins and as JOIN ... ON, with aliases and qualified names.
-- **J2b, feat(plan): inner joins of the tables in from.** Rules 1-6, the WHERE classification, the connectivity
-  check, and the join order and build sides from footer statistics with distinct-count hints. Q3, Q5, Q10, Q12 and
-  Q14 pass.
+- **J2b, feat(plan): inner joins of the tables in from.** Rules 1-6, the scope of an ON (rule 10), the relation
+  limit, the WHERE classification, the connectivity check, and the join order and build sides from footer statistics
+  with distinct-count hints. Its `.slt` cases cover the bind errors of these rules, among them `*` over two bindings
+  of the same name that share a column name and an ON that reads a later FROM item. Q3, Q5, Q10, Q12 and Q14 pass.
 - **E2, feat(exec): semi, anti, null-aware anti, left outer and one-row joins.** Residuals over candidate pairs,
   builds of distinct keys, NULL padding of every type and the one-row join.
 - **T2, test(diff): generate derived tables, ctes, left joins and uncorrelated subqueries.** With their metamorphic
   relations, pending until the engine supports them.
 - **J3, feat(plan): factor conjuncts shared by every branch of an or.** Q19 passes.
-- **J4, feat(plan): derived tables and common table expressions.** Sub-plans with rules 7 and 8. Q7, Q8 and Q9 pass.
+- **J4, feat(plan): derived tables and common table expressions.** Sub-plans with rules 7 and 8 and rule 1's names
+  for CTEs and derived tables, and a CTE's body counted against the relation limit at each reference. Q7, Q8 and Q9
+  pass.
 - **J5, feat(plan): uncorrelated subqueries as joins.** IN, both spellings of NOT IN and scalar subqueries, with
   rules 9 and 12-13, and CTEs visible inside subqueries (rule 8); outer references exit 4. Q11, Q15, Q16 and Q18
   pass.
@@ -489,9 +523,9 @@ docs/sql-subset.md sections it changes.
   correlated ones to ADR 0023's dependent joins and its unnesting pass. Rejected.
 - **Joins over positions, without column ids** (decision C6): the first join would arrive about one PR earlier, but
   the multi-table binder and the pruning would be rewritten for ids anyway, before ordering or unnesting. Rejected.
-- **A recursive join tree in the AST:** every walk of the AST would recurse along the joins, and a long chain could
-  overflow the stack. The flat list covers every FROM clause without nested joins (parenthesized, or a JOIN whose ON
-  comes after a later JOIN). Rejected.
+- **A recursive join tree in the AST:** every walk of the AST would recurse along the joins, so a long chain could
+  overflow the stack before the binder's relation limit applies. The flat list covers every FROM clause without
+  nested joins (parenthesized, or a JOIN whose ON comes after a later JOIN). Rejected.
 
 This workload is derived from the TPC-H Benchmark and is not comparable to published TPC-H Benchmark results, as
 this implementation does not comply with all requirements of the TPC-H Benchmark.
