@@ -104,6 +104,7 @@
       "Edit(/scripts/ctest.sh)",
       "Edit(/scripts/agent-setup.sh)",
       "Edit(/tests/data/clickbench_status.json)",
+      "Edit(/tests/data/tpch_status.json)",
       "Edit(/scripts/lint.sh)",
       "Edit(/scripts/fmt.sh)",
       "Edit(/tools/sanitizers/**)",

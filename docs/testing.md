@@ -375,14 +375,15 @@ Debug build with tests), `asan`, `tidy`, `coverage`, `fuzz-smoke` and `ci-gcc`. 
 
 ## Data policy
 
-Nothing derived from ClickBench is ever committed: no Parquet files or samples, no query text and no result values.
-No file larger than 1 MiB is committed either. `pixi run lint` rejects data files (`*.parquet`, `*.arrow`,
-`*.feather`, `*.csv.gz`, `queries.sql`) and any other file over 1 MiB except `pixi.lock`; authors and reviewers
-check the rest. Fixtures, `.slt` queries, golden files and fuzz seeds are our own. The data tests download the pinned
-`hits` partition and query file into a cache outside the repository, redact their output (query ids, column types,
-row counts and hashes only) and never upload data or logs as CI artifacts; committed are only pins, our own
-queries and the pass/fail ratchet. The full policy is
-[ADR 0006](adr/0006-test-strategy-and-data-policy.md).
+Nothing derived from ClickBench is ever committed: no Parquet files or samples, no query text and no result values. No
+file larger than 1 MiB is committed either. `pixi run lint` rejects data files (`*.parquet`, `*.arrow`, `*.feather`,
+`*.csv.gz`, `queries.sql`), the TPC-H material it can recognize (dbgen tables `*.tbl` and `*.tbl.*`, the distribution
+file `dists.dss`, query and answer files named like DuckDB's or the TPC kit's: `q01.sql`, `q01.csv`, `q1.out`, `q1.ans`,
+and any file that carries the TPC legend) and any other file over 1 MiB except `pixi.lock`; authors and reviewers check
+the rest. Fixtures, `.slt` queries, golden files and fuzz seeds are our own. The data tests download the pinned `hits`
+partition and query file into a cache outside the repository, redact their output (query ids, column types, row counts
+and hashes only) and never upload data or logs as CI artifacts; committed are only pins, our own queries and the
+pass/fail ratchet. The full policy is [ADR 0006](adr/0006-test-strategy-and-data-policy.md).
 
 The data derived from TPC-H follows the same model with one difference: nothing is downloaded. The pinned conda-forge
 package `duckdb-extension-tpch` (TPC's dbgen, under the TPC EULA v2.2) generates the data, the query texts and DuckDB's

@@ -26,6 +26,8 @@ environment, why it is needed, and the alternatives you ruled out. Continue only
   `default` and `gcc` environments), compilers into their environment's feature, lint tools into `lint`.
 - DuckDB is a test oracle only and is never linked into `src/`. A new external library for a module also needs the
   module allow-list in `cmake/Antb1Modules.cmake` and an ADR.
+- `duckdb-extension-tpch` (TPC's dbgen) depends on one exact `libduckdb` build: update it together with
+  `libduckdb-devel` and `duckdb-cli`, never alone (ADR 0006).
 - GitHub Actions are pinned to a full commit SHA with a `# vX.Y.Z` comment and must be allowed by
   `tools/github/allowed-actions.json`; a new or bumped action is a `.github/` change for a maintainer.
 

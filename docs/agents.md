@@ -40,7 +40,7 @@ a separate job with only `pull-requests: write` posts its comment. The lock upda
   audit once per PR, and a full review on `@codex review`) and Copilot (only when requested). None of them runs
   again on every push.
 - All of them apply the AGENTS.md "Code Review Rules": concrete, high-confidence problems with a failure scenario, no
-  formatting comments, no ClickBench data values.
+  formatting comments, no ClickBench data values and nothing derived from TPC-H.
 - They are advisory and never approve. Claude and Codex post comments, Copilot's reviews are comment reviews, and
   the repository does not let GitHub Actions approve pull requests. Merging still needs `CI OK`, `PR title` and one
   human approval.

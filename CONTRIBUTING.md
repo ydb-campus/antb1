@@ -96,14 +96,14 @@ guide).
 
 - Disclose AI assistance in the PR template. The human who opens or merges the PR is accountable for it.
 - AI reviews are advisory. They never approve a PR and never replace the required human approval.
-- Never paste secrets, private data or anything derived from ClickBench into prompts, issues or PRs.
+- Never paste secrets, private data or anything derived from ClickBench or TPC-H into prompts, issues or PRs.
 
 ## Data policy
 
-Nothing derived from ClickBench (Parquet files, samples, query text, result values) is ever committed, and no file
-larger than 1 MiB may be committed. Tests generate their own data; the ClickBench data tests download the pinned
-files into a cache outside the repository and redact their output. See
-[docs/adr/0006-test-strategy-and-data-policy.md](docs/adr/0006-test-strategy-and-data-policy.md) and
+Nothing derived from ClickBench (Parquet files, samples, query text, result values) or from TPC-H (data, query text in
+any dialect, answers, TPC tools) is ever committed, and no file larger than 1 MiB may be committed. Tests generate their
+own data; the ClickBench data tests download the pinned files into a cache outside the repository and redact their
+output. See [docs/adr/0006-test-strategy-and-data-policy.md](docs/adr/0006-test-strategy-and-data-policy.md) and
 [docs/testing.md](docs/testing.md#clickbench-data-tests).
 
 ## Optional git hooks

@@ -23,7 +23,8 @@ docs/testing.md are the rules; read them first.
 - Hermetic: no network, no absolute paths, no sleeps or wall-clock time, fixed seeds, single thread. Write files only
   under `::testing::TempDir()` in a directory unique to the test (several tests run in parallel), and build the
   Parquet data in the test itself (see `src/engine/tests/session_test.cc`).
-- Never use ClickBench-derived data or query text, and never commit data files.
+- Never use ClickBench-derived data or query text, never write TPC-H query text or fragments of it into a test (the
+  TPC-H-derived data and queries are generated at test time), and never commit data files.
 - Test the error path too: the error kind, the source span and, for the CLI, the exit code.
 - A regression test must fail without the fix: check that, then restore the fix.
 - Never edit a path listed under "Ask a human first" in AGENTS.md (for example `cmake/`, `CMakePresets.json`,

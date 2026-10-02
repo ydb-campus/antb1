@@ -77,7 +77,7 @@ SELECT a, b, COUNT(*) FROM t GROUP BY a
 ## Never
 
 - Hand-edit an expected block, or copy results from anywhere other than the completion task.
-- Use ClickBench data, samples or query text, or commit data files.
+- Use ClickBench data, samples or query text, write TPC-H query text or fragments of it, or commit data files.
 - Delete, skip or loosen a failing record to get green.
 - Change the fixture generator's output casually: every expectation depends on it. The fixture schema and the
   generator's digest are protected by tests; a change there is a separate, reviewed PR.

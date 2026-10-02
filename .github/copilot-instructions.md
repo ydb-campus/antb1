@@ -21,6 +21,8 @@ compiler; GCC 15 runs a compatibility leg.
 - Every behavior change ships with tests; unit tests live in `src/<module>/tests/`.
 - Never commit or quote ClickBench-derived data, query text or result values, or any file over 1 MiB. Never
   hand-edit `pixi.lock`.
+- Never commit or quote anything derived from TPC-H (query text or fragments, data, answers, TPC tools); tests
+  generate it at test time and refer to queries by number.
 - `src/common` and `src/sql` never include Arrow; `exec` never uses `io`; module edges live in
   `cmake/Antb1Modules.cmake`.
 - Do not edit the paths listed under "Ask a human first" in AGENTS.md; describe the change you need instead.
