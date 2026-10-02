@@ -1,5 +1,6 @@
 #pragma once
 
+#include <bitset>
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
@@ -17,7 +18,8 @@
 //     is pending and must still get at least one Unsupported answer.
 //
 // A slice PR that implements a feature adds it to kSupportedFeatures in the same PR. New grammar
-// gets a new Feature, a name in FeatureName() and generator support in runner/query_gen.cc.
+// gets a new Feature (above the out-of-scope marker), a name in FeatureName() and generator support
+// in runner/query_gen.cc.
 
 namespace antb1::slt {
 
@@ -75,12 +77,15 @@ enum class Feature : std::uint8_t {
   kQuotedIdentifier,  // "quoted" table and column names
   kLayout,            // newlines, tabs, -- and /* */ comments between tokens
   kSemicolon,         // a trailing ';'
-  // Out-of-scope marker: never in kSupportedFeatures and never generated. The harness self-tests
-  // tag their "pending" canary query with it, so that path stays tested.
-  kJoin,  // JOIN (not supported)
+  // Out-of-scope marker, the last Feature (new ones go above it): never in kSupportedFeatures and
+  // never generated. The harness self-tests tag their "pending" canary query with it, so that path
+  // stays tested.
+  kWindowFunctions,  // f(...) OVER (...), out of scope for good
 };
 
-inline constexpr std::size_t kFeatureCount = static_cast<std::size_t>(Feature::kJoin) + 1;
+// The number of features: the marker is the last one (checked below FeatureName()).
+inline constexpr std::size_t kFeatureCount =
+    static_cast<std::size_t>(Feature::kWindowFunctions) + 1;
 
 constexpr std::string_view FeatureName(Feature feature) {
   switch (feature) {
@@ -174,73 +179,75 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "offset";
     case Feature::kHaving:
       return "having";
-    case Feature::kJoin:
-      return "join";
+    case Feature::kWindowFunctions:
+      return "window_functions";
   }
   return "?";
 }
 
-class FeatureSet {
+// kFeatureCount counts every Feature: no enumerator follows the marker (the switch above names
+// every enumerator, -Wswitch).
+static_assert(FeatureName(static_cast<Feature>(kFeatureCount)) == "?",
+              "a Feature follows kWindowFunctions: declare new features above the marker");
+
+// A set of the values 0 .. N - 1 of the feature enum F, one bit each, for any N: FeatureSet below,
+// and a wider enum in tests/supported_features_test.cc. Names() spells a member with
+// FeatureName(F), found by argument-dependent lookup.
+template <typename F, std::size_t N>
+class BasicFeatureSet {
  public:
-  constexpr FeatureSet() = default;
-  constexpr FeatureSet(std::initializer_list<Feature> features) {
-    for (const Feature f : features) {
+  constexpr BasicFeatureSet() = default;
+  constexpr BasicFeatureSet(std::initializer_list<F> features) {
+    for (const F f : features) {
       Add(f);
     }
   }
 
-  static constexpr FeatureSet All() {
-    FeatureSet all;
-    for (std::size_t i = 0; i < kFeatureCount; ++i) {
-      all.Add(static_cast<Feature>(i));
-    }
+  static constexpr BasicFeatureSet All() {
+    BasicFeatureSet all;
+    all.bits_.set();
     return all;
   }
 
-  constexpr void Add(Feature f) { bits_ |= Bit(f); }
-  constexpr void Add(FeatureSet other) { bits_ |= other.bits_; }
-  [[nodiscard]] constexpr bool Has(Feature f) const { return (bits_ & Bit(f)) != 0; }
+  constexpr void Add(F f) { bits_.set(Index(f)); }
+  constexpr void Add(BasicFeatureSet other) { bits_ |= other.bits_; }
+  [[nodiscard]] constexpr bool Has(F f) const { return bits_.test(Index(f)); }
   // Whether every feature of `other` is in this set.
-  [[nodiscard]] constexpr bool Contains(FeatureSet other) const {
-    return (other.bits_ & ~bits_) == 0;
+  [[nodiscard]] constexpr bool Contains(BasicFeatureSet other) const {
+    return (other.bits_ & ~bits_).none();
   }
-  [[nodiscard]] constexpr FeatureSet Minus(FeatureSet other) const {
-    FeatureSet out;
+  [[nodiscard]] constexpr BasicFeatureSet Minus(BasicFeatureSet other) const {
+    BasicFeatureSet out;
     out.bits_ = bits_ & ~other.bits_;
     return out;
   }
-  [[nodiscard]] constexpr bool empty() const { return bits_ == 0; }
-  [[nodiscard]] constexpr std::size_t size() const {
-    std::size_t n = 0;
-    for (std::size_t i = 0; i < kFeatureCount; ++i) {
-      n += Has(static_cast<Feature>(i)) ? 1U : 0U;
-    }
-    return n;
-  }
-  friend constexpr bool operator==(FeatureSet, FeatureSet) = default;
+  [[nodiscard]] constexpr bool empty() const { return bits_.none(); }
+  [[nodiscard]] constexpr std::size_t size() const { return bits_.count(); }
+  friend constexpr bool operator==(BasicFeatureSet, BasicFeatureSet) = default;
 
   // "count_star, table_name" (declaration order); "none" for the empty set.
   [[nodiscard]] std::string Names() const {
     std::string out;
-    for (std::size_t i = 0; i < kFeatureCount; ++i) {
-      const auto f = static_cast<Feature>(i);
-      if (Has(f)) {
-        out += (out.empty() ? "" : ", ") + std::string(FeatureName(f));
+    for (std::size_t i = 0; i < N; ++i) {
+      if (bits_.test(i)) {
+        out += out.empty() ? "" : ", ";
+        out += FeatureName(static_cast<F>(i));
       }
     }
     return out.empty() ? "none" : out;
   }
 
  private:
-  static constexpr std::uint64_t Bit(Feature f) {
-    return std::uint64_t{1} << static_cast<unsigned>(f);
-  }
+  // std::bitset::set and test throw std::out_of_range for a value of N or more.
+  static constexpr std::size_t Index(F f) { return static_cast<std::size_t>(f); }
 
-  std::uint64_t bits_ = 0;
+  std::bitset<N> bits_;
 };
 
-// Out-of-scope markers: valid in `-- features:` tags, never generated (see Feature::kJoin).
-inline constexpr FeatureSet kNeverGenerated = {Feature::kJoin};
+using FeatureSet = BasicFeatureSet<Feature, kFeatureCount>;
+
+// Out-of-scope markers, valid in `-- features:` tags and never generated (see the Feature enum).
+inline constexpr FeatureSet kNeverGenerated = {Feature::kWindowFunctions};
 
 // What antb1 answers today: the whole slice grammar of docs/sql-subset.md (global and grouped
 // aggregates, projections, WHERE conjunctions of column <op> literal, ORDER BY, LIMIT and OFFSET)
@@ -294,5 +301,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kLayout,
     Feature::kSemicolon,
 };
+static_assert(kSupportedFeatures.Minus(kNeverGenerated) == kSupportedFeatures,
+              "kSupportedFeatures must not declare an out-of-scope marker (kNeverGenerated)");
 
 }  // namespace antb1::slt

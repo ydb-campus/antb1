@@ -53,7 +53,7 @@ EngineError FromStatus(const arrow::Status& status) {
 }
 
 ColumnClass ClassOf(plan::LogicalType type) {
-  switch (type) {
+  switch (type.id()) {
     case plan::LogicalType::kSmallInt:
     case plan::LogicalType::kInteger:
     case plan::LogicalType::kBigInt:

@@ -117,7 +117,7 @@ struct TypeOrder {
 };
 
 std::optional<TypeOrder> OrderFor(plan::LogicalType type) {
-  switch (type) {
+  switch (type.id()) {
     case plan::LogicalType::kSmallInt:
       return TypeOrder{.compare = &ComparePrimitive<arrow::Int16Array>,
                        .prefix = &SignedPrefix<arrow::Int16Array>,

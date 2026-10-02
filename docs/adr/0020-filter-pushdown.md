@@ -67,6 +67,9 @@ Proposed
   - **Fallback:** other column types (nested, BOOLEAN, TIMESTAMP, HUGEINT) are not supported.
     `supports_scan_filter` needs every scanned column to be supported, so a scan with one such column is not
     filtered at all, and the high-level path reads it as before.
+    Update (2026-10-02): DECIMAL columns ([ADR 0021](0021-decimal-semantics.md)) are not supported either. A scan
+    that reads one gets no pushdown, and a predicate on one skips no row group (part statistics cover only
+    integer-valued columns), until the decimal64 item of ADR 0021.
 - **The executor** pushes the predicates of a `Filter` directly over a part pipeline's scan into the scan, in a
   separate change (`exec::MakeScanFilter`, `src/exec/include/antb1/exec/scan_filter.h`): those that read one
   column against literals (`<op>`, `[NOT] IN`, `[NOT] LIKE`, `IS NOT NULL`).
