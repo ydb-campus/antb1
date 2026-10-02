@@ -27,6 +27,9 @@ antb1 follows DuckDB's semantics for everything in the supported subset:
   (raw bytes, byte-wise comparison, for both unannotated and UTF8 BYTE_ARRAY), DATE and HUGEINT, as listed in
   [sql-subset.md](../sql-subset.md#types). Other types are unsupported, and queries that use them are rejected.
   `EventDate` is read as DATE with `--clickbench`, or any USMALLINT or INTEGER column with `--column-type COL=DATE`.
+  Update (2026-10-02): [ADR 0021](0021-decimal-semantics.md) specifies DECIMAL(p,s) as DuckDB types, computes and
+  prints it. With it, a Parquet DECIMAL(38,0) column reads as DECIMAL(38,0) instead of HUGEINT, and HUGEINT stays
+  the type of integer SUM.
 - Literals are folded exactly at bind time. A literal outside the column type's range makes the comparison constant
   true or false for non-NULL values while NULL stays NULL; a decimal literal against an integer column becomes an
   equivalent integer comparison (`c > 1.5` becomes `c >= 2`; `c = 1.5` is never true). No comparison goes through a
