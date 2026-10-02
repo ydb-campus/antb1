@@ -447,9 +447,14 @@ CompleteStats CompleteFile(const SltFile& file, Engine& oracle, Engine& antb1,
       problem(r, engine.name(), "query failed: " + result.error().message);
       continue;
     }
+    const std::string letters = Letters(*result);
+    if (const auto why = SortModeProblem(letters, r.sort)) {
+      problem(r, engine.name(), *why);  // rewritten, the record would no longer parse
+      continue;
+    }
     BlockUpdate update{.lines = RenderBlock(*result, r.sort, flow->hash_threshold),
                        .new_types = std::nullopt};
-    if (const std::string letters = Letters(*result); letters != r.types) {
+    if (letters != r.types) {
       out +=
           std::format("NOTE {}:{}: column types {} -> {}\n", file.path, r.line, r.types, letters);
       update.new_types = letters;

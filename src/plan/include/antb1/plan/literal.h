@@ -69,6 +69,13 @@ std::string FormatDate(int32_t days);
 // infinity and -infinity for DuckDB's infinite values.
 std::string FormatTimestamp(int64_t micros);
 
+// A DECIMAL(width, scale) value, unscaled / 10^scale, as DuckDB prints it (ADR 0021, rule 15):
+// exactly `scale` digits after the point, a '-' for a negative value, and a leading 0 only when
+// width > scale. 1700 and -25 as DECIMAL(15,2) are 17.00 and -0.25, 500 as DECIMAL(3,3) is .500,
+// and a DECIMAL(p,0) has no point. Any Int128 is accepted: a value with more digits than `width`
+// prints all of them.
+std::string FormatDecimal(Int128 unscaled, uint8_t width, uint8_t scale);
+
 // Inclusive value range of an integer logical type; HUGEINT is decimal128(38, 0), so +-(10^38 - 1).
 struct IntegerRange {
   Int128 min = 0;

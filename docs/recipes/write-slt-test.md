@@ -25,7 +25,7 @@ yet, it describes it in words; use the exact task name from the AGENTS.md comman
 - Tables come from the committed fixture generator: deterministic, synthetic, hits-shaped data plus edge-case tables
   (NULLs, several files, empty tables). They are identical on Linux and macOS. Nothing comes from ClickBench.
 - Expected results are written by DuckDB through a completion task. Nobody types or edits them.
-- Integers and text compare exactly; floating-point values compare with a tight relative tolerance.
+- Integers, decimals and text compare exactly; floating-point values compare with a tight relative tolerance.
 - A failure prints the file and line, the SQL, the expected and actual rows and a command that reproduces it.
 
 ## Record format
@@ -42,8 +42,8 @@ statement error must appear in the GROUP BY clause
 SELECT a, b, COUNT(*) FROM t GROUP BY a
 ```
 
-- `query <types> <sort mode>`: one type letter per result column (`I` integer, `R` floating point, `T` text and
-  dates), then `nosort` for a single row or an `ORDER BY` whose keys end with a unique column (rows with equal
+- `query <types> <sort mode>`: one type letter per result column (`I` integer, `R` floating point, `D` decimal, `T`
+  text and dates), then `nosort` for a single row or an `ORDER BY` whose keys end with a unique column (rows with equal
   keys may come in any order), `rowsort` for several rows otherwise.
 - `statement ok` for SQL that must succeed, `statement error <regex>` for SQL that must fail with a matching error.
 - `onlyif antb1` or `skipif duckdb` before a record limits it to one engine. Use them only for a divergence

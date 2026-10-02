@@ -193,6 +193,46 @@ TEST(LiteralTest, FormatDateOutsideTheLiteralRange) {
   EXPECT_EQ(FormatDate(std::numeric_limits<int32_t>::min()), "5877642-06-23 (BC)");
 }
 
+// 10^digits - 1, the largest unscaled value of a DECIMAL of that width.
+Int128 MaxUnscaled(int digits) {
+  Int128 value = 0;
+  for (int i = 0; i < digits; ++i) {
+    value = (value * 10) + 9;
+  }
+  return value;
+}
+
+TEST(LiteralTest, FormatDecimal) {
+  EXPECT_EQ(FormatDecimal(1700, 15, 2), "17.00");
+  EXPECT_EQ(FormatDecimal(-25, 15, 2), "-0.25");
+  EXPECT_EQ(FormatDecimal(0, 15, 2), "0.00");
+  EXPECT_EQ(FormatDecimal(500, 3, 3), ".500");
+  EXPECT_EQ(FormatDecimal(-500, 3, 3), "-.500");
+  EXPECT_EQ(FormatDecimal(0, 3, 3), ".000");
+  EXPECT_EQ(FormatDecimal(5, 1, 1), ".5");
+  EXPECT_EQ(FormatDecimal(-5, 2, 2), "-.05");
+  EXPECT_EQ(FormatDecimal(5, 2, 1), "0.5");
+  EXPECT_EQ(FormatDecimal(-5, 3, 2), "-0.05");
+  EXPECT_EQ(FormatDecimal(-12, 4, 0), "-12");
+  EXPECT_EQ(FormatDecimal(0, 4, 0), "0");
+  EXPECT_EQ(FormatDecimal(123'456'789'012, 12, 2), "1234567890.12");
+  // 38 digits, the widest DECIMAL.
+  const Int128 max = MaxUnscaled(38);
+  EXPECT_EQ(FormatDecimal(max, 38, 0), std::string(38, '9'));
+  EXPECT_EQ(FormatDecimal(-max, 38, 10), "-" + std::string(28, '9') + "." + std::string(10, '9'));
+  EXPECT_EQ(FormatDecimal(max, 38, 38), "." + std::string(38, '9'));
+  EXPECT_EQ(FormatDecimal(1, 38, 38), "." + std::string(37, '0') + "1");
+  EXPECT_EQ(FormatDecimal(-1, 38, 37), "-0." + std::string(36, '0') + "1");
+}
+
+TEST(LiteralTest, FormatDecimalIsTotal) {
+  // Values with more digits than their width (DuckDB never makes them) keep every digit.
+  EXPECT_EQ(FormatDecimal(12'345, 3, 1), "1234.5");
+  EXPECT_EQ(FormatDecimal(15, 1, 1), "1.5");
+  EXPECT_EQ(FormatDecimal(kInt128Min, 38, 2), "-1701411834604692317316873037158841057.28");
+  EXPECT_EQ(FormatDecimal(kInt128Max, 38, 38), "1.70141183460469231731687303715884105727");
+}
+
 TEST(LiteralTest, ApproximateNumbers) {
   // DuckDB reads these as DOUBLE: an exponent, or a decimal wider than DECIMAL(38).
   for (const std::string_view text :

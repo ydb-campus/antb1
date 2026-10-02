@@ -163,8 +163,9 @@ std::string WithLimit(const OrderedQuery& q, std::optional<int64_t> rows) {
 
 namespace {
 
-// A canonical cell as a SQL literal; std::nullopt for text the harness cannot write (not UTF-8, or
-// with a NUL byte).
+// A canonical cell as a SQL literal: I as a HUGEINT, R as a DOUBLE, D and T as a string (Operand
+// compares those with the column's text); std::nullopt for text the harness cannot write (not
+// UTF-8, or with a NUL byte).
 std::optional<std::string> CellSql(const std::optional<std::string>& cell, char letter) {
   if (!cell.has_value()) {
     return "NULL";
@@ -194,14 +195,17 @@ std::optional<std::string> CellSql(const std::optional<std::string>& cell, char 
   return out + "'";
 }
 
-// `column` (of the augmented query) as compared with a literal of class `letter`: text classes
-// compare as DuckDB prints them, which is the canonical text (dates too).
+// `column` (of the augmented query) as compared with a literal of class `letter`: T and D columns
+// compare as DuckDB prints them, which is the canonical text (dates and decimals too). A DECIMAL
+// compared with a string would instead cast the string to the DECIMAL, which rounds ('0.55'
+// equals 0.6), fails on text that does not fit and accepts other spellings ('-.05' for -0.05).
 std::string Operand(std::string_view column, char letter) {
-  return letter == 'T' ? std::format("CAST({} AS VARCHAR)", column) : std::string(column);
+  return letter == 'T' || letter == 'D' ? std::format("CAST({} AS VARCHAR)", column)
+                                        : std::string(column);
 }
 
-// The rows of DuckDB's augmented query whose ORDER BY keys equal `key` (a row of it) and whose I
-// and T cells equal those of one of `wanted` (antb1 rows): everything needed to match those rows
+// The rows of DuckDB's augmented query whose ORDER BY keys equal `key` (a row of it) and whose I,
+// D and T cells equal those of one of `wanted` (antb1 rows): everything needed to match those rows
 // against a run of ties that is too long to fetch whole. std::nullopt if a value cannot be written
 // as SQL.
 std::optional<std::string> RunMembersSql(const OrderedQuery& q, std::string_view letters,

@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
-#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -88,6 +87,7 @@ class DataChunk {
 struct ColumnReader {
   duckdb_type type = DUCKDB_TYPE_INVALID;
   duckdb_type storage = DUCKDB_TYPE_INVALID;  // DECIMAL: the physical integer type
+  uint8_t width = 0;                          // DECIMAL
   uint8_t scale = 0;                          // DECIMAL
   ColumnClass cls = ColumnClass::kText;
   std::string type_name;
@@ -141,6 +141,7 @@ std::optional<ColumnReader> MakeReader(duckdb_result* result, idx_t column) {
   ColumnReader reader;
   reader.type = duckdb_get_type_id(logical);
   if (reader.type == DUCKDB_TYPE_DECIMAL) {
+    reader.width = duckdb_decimal_width(logical);
     reader.scale = duckdb_decimal_scale(logical);
     reader.storage = duckdb_decimal_internal_type(logical);
   }
@@ -154,8 +155,9 @@ std::optional<ColumnReader> MakeReader(duckdb_result* result, idx_t column) {
     case DUCKDB_TYPE_DOUBLE:
       reader.cls = ColumnClass::kReal;
       break;
-    case DUCKDB_TYPE_DECIMAL:
-      reader.cls = reader.scale > 0 ? ColumnClass::kReal : ColumnClass::kInteger;
+    case DUCKDB_TYPE_DECIMAL:  // exact at every scale, named with its width and scale
+      reader.cls = ColumnClass::kDecimal;
+      reader.type_name = std::format("DECIMAL({},{})", reader.width, reader.scale);
       break;
     case DUCKDB_TYPE_BOOLEAN:
     case DUCKDB_TYPE_DATE:
@@ -187,27 +189,6 @@ std::string UInt128Text(UInt128 value) {
 Int128 FromHugeint(duckdb_hugeint v) {
   return static_cast<Int128>((static_cast<UInt128>(static_cast<uint64_t>(v.upper)) << 64U) |
                              v.lower);
-}
-
-// Exact decimal text of value / 10^scale, then the canonical double (R columns compare
-// numerically).
-std::string DecimalText(Int128 value, uint8_t scale) {
-  if (scale == 0) {
-    return Int128ToString(value);
-  }
-  std::string digits = Int128ToString(value);
-  const bool negative = digits.starts_with('-');
-  if (negative) {
-    digits.erase(0, 1);
-  }
-  if (digits.size() <= scale) {
-    digits.insert(0, scale + 1 - digits.size(), '0');
-  }
-  digits.insert(digits.size() - scale, ".");
-  const std::string text = (negative ? "-" : "") + digits;
-  double parsed = 0;
-  std::from_chars(text.data(), text.data() + text.size(), parsed);
-  return CanonicalDouble(parsed);
 }
 
 template <class T>
@@ -254,17 +235,25 @@ std::string ReadValue(const ColumnReader& reader, void* data, idx_t row) {
       auto* strings = static_cast<duckdb_string_t*>(data);
       return {duckdb_string_t_data(&strings[row]), duckdb_string_t_length(strings[row])};
     }
-    case DUCKDB_TYPE_DECIMAL:
+    case DUCKDB_TYPE_DECIMAL: {
+      // The unscaled value, read as the physical type DuckDB reports.
+      Int128 unscaled = 0;
       switch (reader.storage) {
         case DUCKDB_TYPE_SMALLINT:
-          return DecimalText(At<int16_t>(data, row), reader.scale);
+          unscaled = At<int16_t>(data, row);
+          break;
         case DUCKDB_TYPE_INTEGER:
-          return DecimalText(At<int32_t>(data, row), reader.scale);
+          unscaled = At<int32_t>(data, row);
+          break;
         case DUCKDB_TYPE_BIGINT:
-          return DecimalText(At<int64_t>(data, row), reader.scale);
+          unscaled = At<int64_t>(data, row);
+          break;
         default:
-          return DecimalText(FromHugeint(At<duckdb_hugeint>(data, row)), reader.scale);
+          unscaled = FromHugeint(At<duckdb_hugeint>(data, row));
+          break;
       }
+      return CanonicalDecimal(unscaled, reader.width, reader.scale);
+    }
     default:
       return "?";
   }

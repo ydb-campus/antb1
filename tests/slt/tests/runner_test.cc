@@ -49,6 +49,12 @@ ResultSet Ints(std::vector<Row> rows) {
       .classes = {ColumnClass::kInteger}, .type_names = {"BIGINT"}, .rows = std::move(rows)};
 }
 
+// One DECIMAL column (DECIMAL(12,2) by default) or another class with its type name.
+ResultSet Decimals(std::vector<Row> rows, ColumnClass cls = ColumnClass::kDecimal,
+                   std::string type = "DECIMAL(12,2)") {
+  return ResultSet{.classes = {cls}, .type_names = {std::move(type)}, .rows = std::move(rows)};
+}
+
 EngineError Unsupported() {
   return EngineError{.kind = "unsupported", .message = "unsupported: OVER", .unsupported = true};
 }
@@ -203,22 +209,110 @@ TEST(RunFile, HashThresholdAndLabels) {
 }
 
 TEST(RunFile, EveryMutationIsCaught) {
-  constexpr std::string_view kFile =
-      "query I nosort\nSELECT COUNT(*) FROM t\n----\n31337\n\n"
-      "statement ok\nSELECT COUNT(*) FROM t\n\n"
-      "statement error\nSELECT nope\n";
-  for (const auto* name : {"value", "null", "drop-row", "extra-row", "extra-column", "error",
-                           "unsupported", "succeed", "canary"}) {
-    FakeEngine engine("antb1");
-    engine.Answer("SELECT COUNT(*) FROM t", Ints({{"31337"}}));
-    EXPECT_EQ(RunText(kFile, engine).stats.failed, 0);
-    const auto mutation = ParseMutation(name);
-    ASSERT_TRUE(mutation.has_value()) << name;
-    auto mutating = MakeMutatingEngine(engine, mutation.value_or(Mutation::kNone));
-    const auto o = RunText(kFile, *mutating);
-    EXPECT_GT(o.stats.failed, 0) << name << "\n" << o.out;
+  // On an integer record and on a DECIMAL one, where a value mutation (an appended digit) only
+  // changes the scale.
+  const std::vector<std::pair<std::string, ResultSet>> queries = {
+      {"query I nosort\nSELECT COUNT(*) FROM t\n----\n31337\n\n", Ints({{"31337"}})},
+      {"query D nosort\nSELECT COUNT(*) FROM t\n----\n1234567890.12\n\n",
+       Decimals({{"1234567890.12"}})}};
+  for (const auto& [query, answer] : queries) {
+    const std::string file =
+        query + "statement ok\nSELECT COUNT(*) FROM t\n\nstatement error\nSELECT nope\n";
+    for (const auto* name : {"value", "null", "drop-row", "extra-row", "extra-column", "error",
+                             "unsupported", "succeed", "canary"}) {
+      FakeEngine engine("antb1");
+      engine.Answer("SELECT COUNT(*) FROM t", answer);
+      EXPECT_EQ(RunText(file, engine).stats.failed, 0);
+      const auto mutation = ParseMutation(name);
+      ASSERT_TRUE(mutation.has_value()) << name;
+      auto mutating = MakeMutatingEngine(engine, mutation.value_or(Mutation::kNone));
+      const auto o = RunText(file, *mutating);
+      EXPECT_GT(o.stats.failed, 0) << name << "\n" << o.out;
+    }
   }
   EXPECT_FALSE(ParseMutation("sideways").has_value());
+}
+
+// A sum of money with ten integer digits.
+constexpr std::string_view kTotal =
+    "query D nosort\n"
+    "SELECT total FROM t\n"
+    "----\n"
+    "1234567890.12\n";
+
+TEST(RunFile, DecimalValuesCompareExactly) {
+  // A wrong last digit, a wrong scale and a missing leading zero all fail.
+  for (const std::string_view wrong : {"1234567890.13", "1234567890.120", "1234567890.1"}) {
+    FakeEngine engine("antb1");
+    engine.Answer("SELECT total FROM t", Decimals({{std::string(wrong)}}));
+    const auto o = RunText(kTotal, engine);
+    EXPECT_EQ(o.stats.failed, 1) << wrong;
+    EXPECT_NE(o.out.find("result mismatch: values differ"), std::string::npos) << o.out;
+  }
+  FakeEngine zero("antb1");
+  zero.Answer("SELECT total FROM t", Decimals({{"-.25"}}, ColumnClass::kDecimal, "DECIMAL(3,2)"));
+  EXPECT_EQ(RunText("query D nosort\nSELECT total FROM t\n----\n-0.25\n", zero).stats.failed, 1);
+  // The same wrong cent passes in an R record: the hole that D closes.
+  FakeEngine real("antb1");
+  real.Answer("SELECT total FROM t", Decimals({{"1234567890.13"}}, ColumnClass::kReal, "DOUBLE"));
+  EXPECT_EQ(
+      RunText("query R nosort\nSELECT total FROM t\n----\n1234567890.12\n", real).stats.failed, 0);
+  // A DOUBLE answer to a D record fails on its column type.
+  const auto o = RunText(kTotal, real);
+  EXPECT_NE(o.out.find("column types differ: expected D, got R (DOUBLE)"), std::string::npos)
+      << o.out;
+}
+
+TEST(RunFile, DecimalResultsAreHashedAboveTheThreshold) {
+  // Unlike R results, D results are hashed, and one digit changes the hash.
+  const auto right = Decimals({{"1234567890.12"}, {"-0.25"}});
+  const auto block = RenderBlock(right, SortMode::kRowSort, 1);
+  ASSERT_EQ(block.size(), 1U);
+  EXPECT_TRUE(block[0].starts_with("2 values hashing to ")) << block[0];
+  auto file = Parse("hash-threshold 1\n\nquery D rowsort\nSELECT total FROM t\n----\n1\n");
+  file.records[1].expected = block;
+  FakeEngine engine("antb1");
+  engine.Answer("SELECT total FROM t", right);
+  std::string out;
+  EXPECT_EQ(RunFile(file, engine, RunOptions{}, out).failed, 0) << out;
+  engine.Answer("SELECT total FROM t", Decimals({{"1234567890.13"}, {"-0.25"}}));
+  out.clear();
+  EXPECT_EQ(RunFile(file, engine, RunOptions{}, out).failed, 1);
+  EXPECT_NE(out.find("hashed results differ"), std::string::npos) << out;
+}
+
+TEST(CompleteFile, WritesDecimalRecordsWithTheirLetterAndText) {
+  FakeEngine oracle("duckdb");
+  FakeEngine antb1("antb1");
+  oracle.Answer("SELECT total FROM t", Decimals({{"17.00"}, {"-0.25"}}));
+  const auto file = Parse("query R rowsort\nSELECT total FROM t\n----\n17\n-0.25\n");
+  std::string text;
+  std::string out;
+  CompleteFile(file, oracle, antb1, text, out);
+  EXPECT_EQ(text, "query D rowsort\nSELECT total FROM t\n----\n-0.25\n17.00\n");
+  EXPECT_NE(out.find("NOTE t.slt:1: column types R -> D"), std::string::npos) << out;
+}
+
+TEST(CompleteFile, KeepsValuesortRecordsThatWouldGetRealAndDecimalColumns) {
+  // valuesort cannot check a DECIMAL next to a DOUBLE (SortModeProblem): rewritten as
+  // `query RD valuesort`, the record would no longer parse, so it is an error and stays as it is.
+  FakeEngine oracle("duckdb");
+  FakeEngine antb1("antb1");
+  oracle.Answer("SELECT AVG(d), 0.5 FROM t",
+                ResultSet{.classes = {ColumnClass::kReal, ColumnClass::kDecimal},
+                          .type_names = {"DOUBLE", "DECIMAL(2,1)"},
+                          .rows = {{"1.5", "0.5"}}});
+  const std::string text = "query RR valuesort\nSELECT AVG(d), 0.5 FROM t\n----\n0.5\n1.5\n";
+  std::string new_text;
+  std::string out;
+  const auto stats = CompleteFile(Parse(text), oracle, antb1, new_text, out);
+  EXPECT_EQ(stats.errors, 1);
+  EXPECT_EQ(stats.queries, 0);
+  EXPECT_EQ(new_text, text);
+  EXPECT_NE(out.find("ERROR t.slt:1: query RR valuesort [duckdb]: valuesort compares every value "
+                     "within the R tolerance"),
+            std::string::npos)
+      << out;
 }
 
 TEST(CompleteFile, WritesBlocksFromTheOracleAndFlagsAntb1OnlyRecords) {

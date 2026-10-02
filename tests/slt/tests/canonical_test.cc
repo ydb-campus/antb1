@@ -66,6 +66,17 @@ TEST(Canonical, Dates) {
   EXPECT_EQ(CanonicalTimestamp(-std::numeric_limits<int64_t>::max()), "-infinity");
 }
 
+TEST(Canonical, Decimals) {
+  // As DuckDB prints DECIMAL(width, scale) (plan::FormatDecimal): a leading zero only when the
+  // width exceeds the scale.
+  EXPECT_EQ(CanonicalDecimal(1700, 15, 2), "17.00");
+  EXPECT_EQ(CanonicalDecimal(-25, 15, 2), "-0.25");
+  EXPECT_EQ(CanonicalDecimal(500, 3, 3), ".500");
+  EXPECT_EQ(CanonicalDecimal(-500, 3, 3), "-.500");
+  EXPECT_EQ(CanonicalDecimal(0, 3, 3), ".000");
+  EXPECT_EQ(CanonicalDecimal(42, 2, 0), "42");
+}
+
 // One canonical formatter: engine::FormatValue (antb1) and the helpers the DuckDB adapter uses
 // agree.
 TEST(Canonical, AgreesWithEngineFormatValue) {
@@ -143,6 +154,10 @@ TEST(RenderBlock, HashesAboveTheThresholdButNeverRealColumns) {
   EXPECT_TRUE(ParseHashLine(hashed[0]).has_value());
   const auto reals = Result({ColumnClass::kReal}, {{"1.5"}, {"2.5"}, {"3.5"}});
   EXPECT_EQ(RenderBlock(reals, SortMode::kNoSort, 2).size(), 3U);
+  const auto decimals = Result({ColumnClass::kDecimal}, {{"1.50"}, {"2.50"}, {"3.50"}});
+  EXPECT_EQ(RenderBlock(decimals, SortMode::kNoSort, 2),
+            (std::vector<std::string>{"3 values hashing to " + Sha256Hex("1.50\n2.50\n3.50\n")}))
+      << "exact, so hashed";
 }
 
 TEST(CompareBlocks, ExactForIntegersAndText) {

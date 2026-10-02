@@ -13,7 +13,8 @@
 // Comparison of antb1's answer with the DuckDB oracle's answer to the same query, and the failure
 // report shared by `antb1-slt diff`, `queries` and `clickbench`. Answers compare like slt records
 // (canonical.h): the column classes and the engine type names must be equal (e.g. an integer SUM
-// is HUGEINT, as in DuckDB), I and T cells exactly, R cells with a relative tolerance of 1e-9.
+// is HUGEINT and a DECIMAL is DECIMAL(p,s), as in DuckDB), I, D and T cells exactly, R cells with a
+// relative tolerance of 1e-9.
 //
 // A redacted report (data tests) never prints SQL, values or error messages: only error kinds,
 // column types, row counts, the first differing row and the sha256 of each side's canonical block.
@@ -26,7 +27,7 @@ struct Discrepancy {
   std::string detail;     // unredacted details (error messages)
   std::string redacted;   // details that are safe to print in redacted mode (error kinds)
   bool mismatch = false;  // the result blocks below differ
-  std::string types;      // I/R/T per column (R compares with a tolerance)
+  std::string types;      // I/R/D/T per column (R compares with a tolerance)
   std::vector<std::string> expected;  // DuckDB's block
   std::vector<std::string> actual;    // antb1's block
   std::optional<std::size_t> first_row;
