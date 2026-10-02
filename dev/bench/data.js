@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790931216125,
+  "lastUpdate": 1790933999242,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -3732,6 +3732,90 @@ window.BENCHMARK_DATA = {
             "value": 11.666079233332974,
             "unit": "ms/iter",
             "extra": "iterations: 60\ncpu: 11.66533989999999 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "aca4997e338a838551c19114f3ff18c3054cc34f",
+          "message": "refactor(plan): logical types with width and scale (#76)\n\n## Summary\n\n`plan::LogicalType` becomes a small value type with an id, a width and a\nscale, instead of an enum. DECIMAL(p,s)\n(ADR 0021, PR #72) needs the two parameters. This PR makes room for them\nwithout changing behavior, so the DECIMAL\nPRs (D2 to D4) do not have to touch every user of the type again. It is\nPR D1 of the roadmap for the queries derived\nfrom TPC-H that the maintainers approved on 2026-10-02.\n\n- **The type** (`src/plan/include/antb1/plan/types.h`). A class with an\nid, a width and a scale (`std::uint8_t`\neach). The 10 type ids keep their order and comments in a nested `enum\nclass Id`, and `using enum Id` keeps\n`LogicalType::kBigInt` working. Every type has width and scale 0. No\nconstructor takes a width and a scale yet:\n  D2 adds `Decimal(p, s)` together with its users and tests.\n- **Conversions.** An id converts to a type implicitly (`constexpr\nexplicit(false) LogicalType(Id)`), which is what\nthe existing uses of `LogicalType::kX` need. A type gives its id only\nthrough `id()`.\n- **Comparison.** Two types are equal when their ids, widths and scales\nare. `type == LogicalType::kBigInt` compares\nthe id only: it asks for the type's kind. While every width and scale is\n0, both mean what `==` meant before.\n- **Switches.** The 13 switches on a type now switch on `type.id()`,\nwith one-line edits: `types.cc` (3),\n`literal.cc`, `logical_plan.cc`, `binder.cc` (2), `sort.cc`,\n`aggregate_state.cc`, `grouped_aggregate_state.cc`\n(2), `grouped_aggregate_test.cc` and the SLT runner's `antb1_engine.cc`.\nThe case labels stay, `-Wswitch` still\nrejects a missing case, and a forgotten `switch (type)` does not\ncompile.\n- **Printing.** A hidden friend `operator<<` writes `ToString(type)`.\ngtest failure messages now show `BIGINT`\n  instead of `1-byte object <02>`, for types and for ids.\n\n**One change against the roadmap text.** The roadmap said \"an implicit\nconversion to the type id so that switch\nstatements keep compiling\". clang-tidy 23, as configured here, rejects\nthat shape twice:\n\n- `misc-explicit-constructor` flags an implicit conversion operator\n(`'operator Id' must be marked explicit`);\n- `bugprone-switch-missing-default-case` flags every switch on a class\nvalue, and adding `default:` would lose the\n  `-Wswitch` check.\n\nSo the conversion goes the other way, from id to type, and the switches\nname `id()`. clang-tidy accepts an\n`explicit(false)` constructor, so the PR has no NOLINT.\n\n**Not changed.** `ToString`, `ToArrow`, `FromArrow`, `IsInteger` and\n`IsNumeric` keep their signatures; `ToString`\nbecomes an owning string in D2, which prints DECIMAL(p,s). No golden,\n`.slt`, EXPLAIN or error-message expectation\nchanges, and the docs describe SQL types, not the C++ type.\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [x] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run test -R '^plan\\.TypesTest\\.'\n100% tests passed out of 8\nANTB1-TESTS: PASS preset=dev\n\n$ pixi run check-full          # on 66be240\nlint: PASS\nci        100% tests passed out of 1445 (main has 1440; this adds the 5 new type tests)\nasan      100% tests passed out of 1445\ntidy      passed\ncoverage  100% tests passed out of 1445; Coverage gate: PASS\nfuzz      100% tests passed out of 2\nci-gcc    100% tests passed out of 1445\nEXIT CODE: 0\n\n$ pixi run test-data           # on 66be240: the ClickBench answers and the ratchet are unchanged\n100% tests passed out of 6\n```\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed): `src/plan/tests/types_test.cc`\npins the names of all 10 types, width and scale 0, the default\n(SMALLINT, as a value-initialized enum was), `==`\nand `!=` between types and between a type and an id in both orders,\nprinting, and `static_assert`s on constexpr\nuse, trivial copying and the one-way conversion.\n`RoundTripsThroughArrow` now compares whole types: its loop\n  variable is a `LogicalType`, not `auto`, which would be an `Id`.\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed: not\n  needed, no behavior changes\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: none touched\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code wrote the plan,\nwhich a maintainer approved, then the change\nand the tests, and ran the gates. Before the change, a planning agent\ncompiled the design into every translation\nunit with Clang 23 and GCC 15, ran clang-tidy over them, and checked\nthat a missing case and a forgotten\n`switch (type)` both fail the build. A read-only reviewer agent found no\nP0 or P1 problems in the diff. It\nsuggested one test fix, which is included: the check that the test table\nlists every type would have\nmissed an id added after BOOLEAN, as D2 adds DECIMAL. An exhaustive\nswitch in the test now makes a new id\n  extend the table.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-10-02T12:37:41+03:00",
+          "tree_id": "263f3604b84ac7b3659fca98fe2729ffd2515806",
+          "url": "https://github.com/ydb-campus/antb1/commit/aca4997e338a838551c19114f3ff18c3054cc34f"
+        },
+        "date": 1790933998820,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 3119.2959648024002,
+            "unit": "ns/iter",
+            "extra": "iterations: 225243\ncpu: 3118.896276465861 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 73411.01679743611,
+            "unit": "ns/iter",
+            "extra": "iterations: 9049\ncpu: 73389.88540170185 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 84724.82924174693,
+            "unit": "ns/iter",
+            "extra": "iterations: 8269\ncpu: 84700.84847018989 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 376447.7602150572,
+            "unit": "ns/iter",
+            "extra": "iterations: 1860\ncpu: 376322.59946236544 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 352838.5914357647,
+            "unit": "ns/iter",
+            "extra": "iterations: 1985\ncpu: 352708.08110831206 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2190547.0282131513,
+            "unit": "ns/iter",
+            "extra": "iterations: 319\ncpu: 2189820.241379312 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 44.41928886666536,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 44.41309499999999 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 39.2275105555563,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 39.216333777777805 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 219.26963433332958,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 219.23944433333335 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 11.750885916666695,
+            "unit": "ms/iter",
+            "extra": "iterations: 60\ncpu: 11.750302750000005 ms\nthreads: 1"
           }
         ]
       }
