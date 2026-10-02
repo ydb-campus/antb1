@@ -53,6 +53,8 @@ Proposed
   - inner, semi and anti joins, with keys of one common type and residuals evaluated over candidate pairs;
   - sub-plans with their own scopes, linked to the scope of the enclosing block and resolved innermost first (its rule
     9), so an inner table shadows an outer one with the same name;
+  - the relation limit: at most 256 relations per query, counted before binding with a CTE's body at each reference,
+    which bounds the size and depth of every plan, a subquery's included, and so every recursive walk of a plan;
   - uncorrelated subqueries planned directly as joins; until this ADR's PRs, a name found only in an enclosing block
     exits 4 rather than failing with the bind error "does not exist";
   - stable column ids (roadmap PRs P1 and P2): every column has a plan-unique id that keeps its identity when a rewrite
@@ -60,8 +62,8 @@ Proposed
 - **What is missing:**
   - `plan::Optimize` returns a `LogicalPlan` and cannot fail (`src/plan/include/antb1/plan/optimizer.h`), so only the
     parser and the binder can reject a query today, while unnesting has to see a bound subquery to decide.
-  - [ADR 0013](0013-parallel-execution.md)'s "Towards joins" said that the binder decorrelates correlated subqueries;
-    this ADR amends it.
+  - [ADR 0013](0013-parallel-execution.md)'s "Towards joins" no longer says how correlated subqueries are planned:
+    ADR 0022 replaced its decorrelation in the binder with a pointer to this ADR, which amends that section.
 - **The executor's rules** (ADR 0013, amended by ADR 0022): a table read by two pipelines is scanned twice, never
   buffered; a build feeds exactly one probe pipeline; plans depend on metadata only, so EXPLAIN and every answer are
   the same for any thread count.
@@ -84,7 +86,9 @@ work: mark and single dependent-join kinds, and lifting those rejections.
 ### Binding (U1)
 
 - **Outer references** resolve through the scope chain, innermost first (ADR 0022's rule 9). A name that no FROM item
-  of the subquery's block has, but an enclosing block has, is an outer reference to that block's column, by its id.
+  in its scope has, but an enclosing block has, is an outer reference to that block's column, by its id. The scope is
+  the subquery's block, or for a name in an ON only the FROM items up to its own JOIN (ADR 0022's rule 10): a name
+  there that only a later item of the block has is an outer reference when an enclosing block has it, as in DuckDB.
 - **Free variables over column ids.** The free variables of a plan are the ids that its expressions read and none of
   its nodes outputs (the formalization's F(R)). With ids they need no references by depth and position, and they stay
   valid when a rewrite moves a column. A subquery is correlated when its plan, nested subqueries included, has free
@@ -111,10 +115,11 @@ work: mark and single dependent-join kinds, and lifting those rejections.
   (ADR 0022). In HAVING a correlated subquery exits 4: its outer references would read the outer block's groups, not
   its rows, and no query of the workload needs that. Every other placement already exits 4 (ADR 0022).
 - **Outer references only in WHERE, one block out.** An outer reference may appear only in the WHERE conjuncts of its
-  subquery's own block, and may name only a column of the block that directly encloses the subquery. Anywhere else (its
-  select list, an aggregate's argument included, GROUP BY, ORDER BY, a LEFT JOIN's ON, a derived table), and when it
-  skips a block, it exits 4 at the reference's span: the binder knows where the name appears and which scope resolved
-  it. An ORDER BY without LIMIT changes no result of a correlated subquery and is dropped.
+  subquery's own block, an inner join's ON conjuncts included (ADR 0022's rule 10), and may name only a column of the
+  block that directly encloses the subquery. Anywhere else (its select list, an aggregate's argument included, GROUP BY,
+  ORDER BY, a LEFT JOIN's ON, a derived table), and when it skips a block, it exits 4 at the reference's span: the
+  binder knows where the name appears and which scope resolved it. An ORDER BY without LIMIT changes no result of a
+  correlated subquery and is dropped.
 - **A fallible Optimize.** `plan::Optimize` returns `arrow::Result<LogicalPlan>`, and the session propagates its error,
   so a query that the pass rejects exits 4 in `query`, `explain` and `explain --analyze` alike. The unnesting pass runs
   first. A dependent join that it leaves, which only a bug in the pass can do, fails Optimize with an internal error
@@ -129,6 +134,10 @@ work: mark and single dependent-join kinds, and lifting those rejections.
 - **The test of a rewrite is the formalization's Lemma 3.1:** a path applies only when, after its rewrite, the new
   join's right input has no free variables. Since the binder rejects an outer reference that skips a block, every free
   variable of a right input is a column of its left input.
+- **Within the relation limit.** The pass never copies a sub-plan: both paths only move, rewrite or drop conjuncts,
+  drop a select list, and turn an aggregate into a grouped one and the dependent join into a join. So the unnested
+  plan reads the same relations as the bound one, and ADR 0022's relation limit, counted before binding, bounds the
+  pass and every walk after it.
 - **In U1 the pass rejects every dependent join.** U2 adds Path 1 and U3 adds Path 2.
 
 ### Path 1: correlated selections pulled up (EXISTS and NOT EXISTS, U2)
@@ -137,9 +146,11 @@ work: mark and single dependent-join kinds, and lifting those rejections.
   GROUP BY, HAVING, LIMIT or OFFSET exits 4. An aggregate without GROUP BY returns a row even over no input, so such
   an EXISTS is always true and a semi join would drop rows; GROUP BY, HAVING, LIMIT and OFFSET would have to act per
   binding, which neither path does.
-- **EXISTS skips only the expansion and type checks of `*`.** Inside `EXISTS (query)` the binder does not expand `*`, so
-  a table with a column of a type that antb1 cannot read still works there. Every other select item is bound as usual: a
-  bind error stays a bind error, as in DuckDB, and an aggregate makes the block an aggregate query, which exits 4.
+- **Inside EXISTS, `*` is checked but not expanded.** The binder applies ADR 0022's rule 5 to it (`*` over two
+  bindings of the same name that share a column name is a bind error there too, as in DuckDB), but neither expands it
+  into columns nor checks their types: a table with a column of a type that antb1 cannot read still works there.
+  Every other select item is bound as usual: a bind error stays a bind error, as in DuckDB, and an aggregate makes the
+  block an aggregate query, which exits 4.
 - **The pull-up** (Lemma 4.8, then Lemma 3.1): the block's select list is dropped, since the semi or anti join reads
   none of its columns, and the conjuncts of the block's top filter move into the join, which becomes a semi join
   (EXISTS) or a plain anti join (NOT EXISTS, which has no NULL case, unlike NOT IN). Its build side is the subquery
@@ -297,7 +308,9 @@ hand reach it without Optimize, as ADR 0022's join kinds do before E2.
     and NOT EXISTS with non-equality residuals and outer-only conjuncts, and correlated aggregates over empty groups, a
     CASE over an aggregate included. U2 and U3 un-guard what they implement.
   - Named tests on those fixtures, never on the queries: an EXISTS that an inner join would count twice, the COUNT
-    bug (exit 4), a NOT EXISTS with an outer-only conjunct, NULL keys on either side, and every exit-4 shape.
+    bug (exit 4), a NOT EXISTS with an outer-only conjunct, NULL keys on either side, an outer reference in an ON
+    whose name a later FROM item of the subquery's block also has, `*` over two bindings of the same name inside
+    EXISTS (a bind error), and every exit-4 shape.
   - The random generator learns key-correlated EXISTS and NOT EXISTS, with an optional non-equality residual, and
     correlated SUM, AVG, MIN and MAX under NULL-rejecting comparisons (T3), before U2 and U3, so that the differential
     tests compare them from those PRs on. Two metamorphic relations are enforced from then: a correlated query
@@ -346,8 +359,9 @@ together with ADRs 0013, 0021 and 0022, once all 22 queries pass (decision C14).
 - **The general algorithm with a duplicate-free domain now:** it covers every shape, COUNT and OR included. But the
   domain is the outer side's result, read twice. Under ADR 0013 that needs one build probed by several pipelines
   (DuckDB's delim join; deferred by ADR 0022) or an outer side computed twice, keys that treat NULL as equal, and
-  optimizer passes that understand shared nodes. No query of the workload needs it, because the two cases cover all
-  six. Deferred; the dependent join and the top-down pass are its starting point.
+  optimizer passes that understand shared nodes; an outer side computed twice is a copy that ADR 0022's relation
+  limit, counted before binding, would have to count too. No query of the workload needs it, because the two cases
+  cover all six. Deferred; the dependent join and the top-down pass are its starting point.
 - **Mark and single joins:** a mark join appends a three-valued "has a match" column, so that a subquery can sit
   under OR, in CASE or in a select list, and correlated IN and NOT IN get their NULL semantics; a single join pads
   like a left join and fails on a second match, for scalar subqueries that are not aggregates. They need new join
