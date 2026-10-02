@@ -14,6 +14,7 @@
 #include <arrow/result.h>
 #include <arrow/type.h>
 
+#include "antb1/common/check.h"
 #include "antb1/common/int128.h"
 #include "antb1/common/narrow.h"
 #include "antb1/common/source_span.h"
@@ -25,10 +26,13 @@
 #include "antb1/sql/ast.h"
 #include "antb1/sql/error.h"
 #include "antb1/sql/parser.h"
-#include "antb1/sql/unparse.h"
 
 // The binding rules are documented in docs/sql-subset.md and
 // docs/adr/0004-types-null-overflow-semantics.md.
+//
+// A function that answers for every kind of expression node visits the node with a struct of one
+// overload per kind (FirstUnsupportedOf, RejectConditionOf, ReadsColumnOf, ContainsAggregateOf,
+// ExprNameOf, BindInputOf, BindOutputOf), so a new kind fails to compile until each one handles it.
 
 namespace antb1::plan {
 namespace {
@@ -328,33 +332,35 @@ std::string NotName(const sql::Expr& operand) {
 
 // DuckDB's name of an expression of the binder's subset: (a + 1), -(a), sum((a + 1)); conditions
 // as ((a = 1) OR (b != 2) OR (c IN (1, 2))).
-std::string ExprName(const sql::Expr& expr) {
-  if (const auto* ref = std::get_if<sql::ColumnRef>(&expr)) {
-    return ArgumentName(ref->name);
-  }
-  if (const auto* lit = std::get_if<sql::Literal>(&expr)) {
-    if (lit->kind == sql::Literal::Kind::kDate) {
-      return "CAST('" + lit->text + "' AS \"DATE\")";
+struct ExprNameOf {
+  std::string operator()(const sql::ColumnRef& ref) const { return ArgumentName(ref.name); }
+  std::string operator()(const sql::Literal& lit) const {
+    if (lit.kind == sql::Literal::Kind::kDate) {
+      return "CAST('" + lit.text + "' AS \"DATE\")";
     }
-    if (lit->kind == sql::Literal::Kind::kTimestamp) {
-      return "CAST('" + lit->text + "' AS TIMESTAMP)";
+    if (lit.kind == sql::Literal::Kind::kTimestamp) {
+      return "CAST('" + lit.text + "' AS TIMESTAMP)";
     }
-    return LiteralName(*lit);
+    return LiteralName(lit);
   }
-  if (const auto* call = std::get_if<sql::AggregateCall>(&expr)) {
-    return ResultName(*call);
+  std::string operator()(const sql::AggregateCall& call) const { return ResultName(call); }
+  std::string operator()(const sql::UnaryExpr& unary) const {
+    return unary.op == sql::UnaryOp::kNot ? NotName(*unary.operand)
+                                          : "-(" + ExprName(*unary.operand) + ")";
   }
-  if (const auto* binary = std::get_if<sql::BinaryExpr>(&expr);
-      binary != nullptr &&
-      (binary->op == sql::BinaryOp::kAnd || binary->op == sql::BinaryOp::kOr)) {
+  std::string operator()(const sql::BinaryExpr& binary) const {
+    if (binary.op != sql::BinaryOp::kAnd && binary.op != sql::BinaryOp::kOr) {
+      return std::format("({} {} {})", ExprName(*binary.left), OperatorName(binary.op),
+                         ExprName(*binary.right));
+    }
     // A chain of one operator is one list: ((a) OR (b) OR (c)).
     std::vector<const sql::Expr*> chain;
-    std::vector<const sql::Expr*> pending{&expr};
+    std::vector<const sql::Expr*> pending{&*binary.right, &*binary.left};
     while (!pending.empty()) {
       const sql::Expr* e = pending.back();
       pending.pop_back();
       const auto* b = std::get_if<sql::BinaryExpr>(e);
-      if (b != nullptr && b->op == binary->op) {
+      if (b != nullptr && b->op == binary.op) {
         pending.push_back(&*b->right);
         pending.push_back(&*b->left);
       } else {
@@ -363,40 +369,30 @@ std::string ExprName(const sql::Expr& expr) {
     }
     std::string out;
     for (const sql::Expr* e : chain) {
-      out += (out.empty() ? "(" : std::format(" {} ", sql::ToString(binary->op))) + ExprName(*e);
+      out += (out.empty() ? "(" : std::format(" {} ", sql::ToString(binary.op))) + ExprName(*e);
     }
     return out + ")";
   }
-  if (const auto* binary = std::get_if<sql::BinaryExpr>(&expr)) {
-    return std::format("({} {} {})", ExprName(*binary->left), OperatorName(binary->op),
-                       ExprName(*binary->right));
+  std::string operator()(const sql::LikeExpr& like) const {
+    return std::format("({} {} {})", ExprName(*like.operand), like.negated ? "!~~" : "~~",
+                       ExprName(*like.pattern));
   }
-  if (const auto* unary = std::get_if<sql::UnaryExpr>(&expr)) {
-    return unary->op == sql::UnaryOp::kNot ? NotName(*unary->operand)
-                                           : "-(" + ExprName(*unary->operand) + ")";
-  }
-  if (const auto* in = std::get_if<sql::InExpr>(&expr)) {
-    return InName(*in, in->negated);
-  }
-  if (const auto* e = std::get_if<sql::ExtractExpr>(&expr)) {
-    return std::format("main.date_part('{}', {})", ExtractFieldName(e->field),
-                       ExprName(*e->source));
-  }
-  if (const auto* call = std::get_if<sql::FunctionCall>(&expr)) {
+  std::string operator()(const sql::InExpr& in) const { return InName(in, in.negated); }
+  std::string operator()(const sql::FunctionCall& call) const {
     std::string args;
-    for (const sql::Expr& arg : call->args) {
+    for (const sql::Expr& arg : call.args) {
       args += (args.empty() ? "" : ", ") + ExprName(arg);
     }
-    return AsciiLower(call->name) + "(" + args + ")";
+    return AsciiLower(call.name) + "(" + args + ")";
   }
-  if (const auto* c = std::get_if<sql::CaseExpr>(&expr)) {
-    return CaseName(*c);
+  std::string operator()(const sql::CaseExpr& c) const { return CaseName(c); }
+  std::string operator()(const sql::ExtractExpr& e) const {
+    return std::format("main.date_part('{}', {})", ExtractFieldName(e.field), ExprName(*e.source));
   }
-  if (const auto* like = std::get_if<sql::LikeExpr>(&expr)) {
-    return std::format("({} {} {})", ExprName(*like->operand), like->negated ? "!~~" : "~~",
-                       ExprName(*like->pattern));
-  }
-  return sql::ToSql(expr);
+};
+
+std::string ExprName(const sql::Expr& expr) {
+  return std::visit(ExprNameOf{}, static_cast<const sql::ExprNode&>(expr));
 }
 
 // count_star(), count(x), count(DISTINCT x), sum(x), avg(x), min(x), max(x), sum((x + 1)).
@@ -424,6 +420,8 @@ std::optional<Rejection> RejectCondition(const sql::Expr& expr, bool having);
 
 // Whether the expression reads a column (or, `aggregates`, calls an aggregate): one that does
 // neither is a constant.
+bool ReadsColumn(const sql::Expr& expr, bool aggregates = false);
+
 // The scalar functions the binder answers: one value argument, the others string literals (the
 // pattern and the replacement of regexp_replace, the unit of date_trunc). toDateTime is
 // ClickBench's DuckDB macro, epoch_ms(t * 1000).
@@ -447,41 +445,40 @@ std::optional<FunctionSpec> FindFunction(const sql::FunctionCall& call) {
   return spec == kFunctions.end() ? std::nullopt : std::optional(*spec);
 }
 
-bool ReadsColumn(const sql::Expr& expr, bool aggregates = false) {
-  if (std::holds_alternative<sql::ColumnRef>(expr)) {
-    return true;
+struct ReadsColumnOf {
+  bool aggregates = false;
+
+  bool operator()(const sql::ColumnRef& /*column*/) const { return true; }
+  bool operator()(const sql::Literal& /*lit*/) const { return false; }
+  bool operator()(const sql::AggregateCall& /*call*/) const { return aggregates; }
+  bool operator()(const sql::UnaryExpr& unary) const {
+    return ReadsColumn(*unary.operand, aggregates);
   }
-  if (const auto* call = std::get_if<sql::FunctionCall>(&expr)) {
-    return std::ranges::any_of(call->args,
-                               [&](const sql::Expr& a) { return ReadsColumn(a, aggregates); });
+  bool operator()(const sql::BinaryExpr& binary) const {
+    return ReadsColumn(*binary.left, aggregates) || ReadsColumn(*binary.right, aggregates);
   }
-  if (std::holds_alternative<sql::AggregateCall>(expr)) {
-    return aggregates;
+  bool operator()(const sql::LikeExpr& like) const {
+    return ReadsColumn(*like.operand, aggregates) || ReadsColumn(*like.pattern, aggregates);
   }
-  if (const auto* binary = std::get_if<sql::BinaryExpr>(&expr)) {
-    return ReadsColumn(*binary->left, aggregates) || ReadsColumn(*binary->right, aggregates);
+  bool operator()(const sql::InExpr& in) const { return ReadsColumn(*in.operand, aggregates); }
+  bool operator()(const sql::FunctionCall& call) const {
+    return std::ranges::any_of(call.args,
+                               [this](const sql::Expr& a) { return ReadsColumn(a, aggregates); });
   }
-  if (const auto* unary = std::get_if<sql::UnaryExpr>(&expr)) {
-    return ReadsColumn(*unary->operand, aggregates);
-  }
-  if (const auto* like = std::get_if<sql::LikeExpr>(&expr)) {
-    return ReadsColumn(*like->operand, aggregates) || ReadsColumn(*like->pattern, aggregates);
-  }
-  if (const auto* in = std::get_if<sql::InExpr>(&expr)) {
-    return ReadsColumn(*in->operand, aggregates);
-  }
-  if (const auto* e = std::get_if<sql::ExtractExpr>(&expr)) {
-    return ReadsColumn(*e->source, aggregates);
-  }
-  if (const auto* c = std::get_if<sql::CaseExpr>(&expr)) {
-    const auto reads = [&](const sql::Expr& e) { return ReadsColumn(e, aggregates); };
-    return (c->operand.has_value() && reads(**c->operand)) ||
-           (c->otherwise.has_value() && reads(**c->otherwise)) ||
-           std::ranges::any_of(c->branches, [&](const sql::CaseBranch& b) {
+  bool operator()(const sql::CaseExpr& c) const {
+    const auto reads = [this](const sql::Expr& e) { return ReadsColumn(e, aggregates); };
+    return (c.operand.has_value() && reads(**c.operand)) ||
+           (c.otherwise.has_value() && reads(**c.otherwise)) ||
+           std::ranges::any_of(c.branches, [&](const sql::CaseBranch& b) {
              return reads(*b.when) || reads(*b.then);
            });
   }
-  return false;
+  bool operator()(const sql::ExtractExpr& e) const { return ReadsColumn(*e.source, aggregates); }
+};
+
+bool ReadsColumn(const sql::Expr& expr, bool aggregates) {
+  return std::visit(ReadsColumnOf{.aggregates = aggregates},
+                    static_cast<const sql::ExprNode&>(expr));
 }
 
 std::optional<Rejection> FirstUnsupportedIn(const std::vector<sql::Expr>& exprs) {
@@ -679,45 +676,73 @@ arrow::Status CheckValue(const sql::Expr& expr) {
   return arrow::Status::OK();
 }
 
+constexpr std::string_view kOtherConditions =
+    "conditions other than comparisons, [NOT] LIKE, [NOT] IN, AND, OR and NOT are not supported";
+constexpr std::string_view kThisCondition = "this condition is not supported";
+
 // Why a WHERE (or, with `having`, HAVING) condition is not one the binder answers, or std::nullopt
 // when it is (AsComparison / AsHavingComparison accept it, or a conjunction of such).
-std::optional<Rejection> RejectCondition(const sql::Expr& expr, bool having) {
+struct RejectConditionOf {
+  const sql::Expr& expr;  // the condition
+  bool having = false;
+
   // An operand reads a column (in HAVING, or calls an aggregate); the other side of a comparison
   // is then an operand too, or a literal.
-  const auto is_operand = [having](const sql::Expr& e) { return ReadsColumn(e, having); };
-  const std::string_view operand_kind = having ? "a column or an aggregate" : "a column";
-  if (const auto* binary = std::get_if<sql::BinaryExpr>(&expr)) {
-    switch (binary->op) {
+  bool IsOperand(const sql::Expr& e) const { return ReadsColumn(e, having); }
+  std::string_view OperandKind() const { return having ? "a column or an aggregate" : "a column"; }
+
+  // `expr` is no condition the binder answers: the first construct in it that is not supported
+  // anywhere, else `message`, at the whole of `expr`.
+  std::optional<Rejection> NotACondition(std::string_view message) const {
+    if (auto r = FirstUnsupported(expr)) {
+      return r;
+    }
+    return Rejection{.span = expr.span(), .message = std::string(message)};
+  }
+
+  std::optional<Rejection> operator()(const sql::ColumnRef& /*column*/) const {
+    return NotACondition(kOtherConditions);
+  }
+  std::optional<Rejection> operator()(const sql::Literal& /*lit*/) const {
+    return NotACondition(kOtherConditions);
+  }
+  std::optional<Rejection> operator()(const sql::AggregateCall& /*call*/) const {
+    return NotACondition(kOtherConditions);
+  }
+  std::optional<Rejection> operator()(const sql::UnaryExpr& unary) const {
+    if (unary.op == sql::UnaryOp::kNot) {
+      return RejectCondition(*unary.operand, having);
+    }
+    return NotACondition(kOtherConditions);
+  }
+  std::optional<Rejection> operator()(const sql::BinaryExpr& binary) const {
+    switch (binary.op) {
       case sql::BinaryOp::kAnd:
-        if (auto r = RejectCondition(*binary->left, having)) {
-          return r;
-        }
-        return RejectCondition(*binary->right, having);
       case sql::BinaryOp::kOr:
-        if (auto r = RejectCondition(*binary->left, having)) {
+        if (auto r = RejectCondition(*binary.left, having)) {
           return r;
         }
-        return RejectCondition(*binary->right, having);
+        return RejectCondition(*binary.right, having);
       case sql::BinaryOp::kEq:
       case sql::BinaryOp::kNe:
       case sql::BinaryOp::kLt:
       case sql::BinaryOp::kLe:
       case sql::BinaryOp::kGt:
       case sql::BinaryOp::kGe: {
-        if (auto r = FirstUnsupported(*binary->left)) {
+        if (auto r = FirstUnsupported(*binary.left)) {
           return r;
         }
-        if (auto r = FirstUnsupported(*binary->right)) {
+        if (auto r = FirstUnsupported(*binary.right)) {
           return r;
         }
-        const bool left = is_operand(*binary->left);
-        const bool right = is_operand(*binary->right);
+        const bool left = IsOperand(*binary.left);
+        const bool right = IsOperand(*binary.right);
         if (!left && !right) {
-          return Rejection{.span = binary->right->span(),
+          return Rejection{.span = binary.right->span(),
                            .message = "comparisons between two literals are not supported"};
         }
-        for (const sql::Expr* side : {&*binary->left, &*binary->right}) {
-          if (!is_operand(*side) && !std::holds_alternative<sql::Literal>(*side)) {
+        for (const sql::Expr* side : {&*binary.left, &*binary.right}) {
+          if (!IsOperand(*side) && !std::holds_alternative<sql::Literal>(*side)) {
             return Rejection{.span = side->span(),
                              .message =
                                  "a constant expression in a comparison is not supported "
@@ -726,45 +751,42 @@ std::optional<Rejection> RejectCondition(const sql::Expr& expr, bool having) {
         }
         return std::nullopt;
       }
-      default:
+      default:  // arithmetic
         break;
     }
+    return NotACondition(kOtherConditions);
   }
-  if (const auto* unary = std::get_if<sql::UnaryExpr>(&expr);
-      unary != nullptr && unary->op == sql::UnaryOp::kNot) {
-    return RejectCondition(*unary->operand, having);
-  }
-  if (const auto* like = std::get_if<sql::LikeExpr>(&expr)) {
-    if (auto r = FirstUnsupported(*like->operand)) {
+  std::optional<Rejection> operator()(const sql::LikeExpr& like) const {
+    if (auto r = FirstUnsupported(*like.operand)) {
       return r;
     }
-    if (!is_operand(*like->operand)) {
-      return Rejection{.span = like->operand->span(),
-                       .message = std::format("LIKE needs {} on the left", operand_kind)};
+    if (!IsOperand(*like.operand)) {
+      return Rejection{.span = like.operand->span(),
+                       .message = std::format("LIKE needs {} on the left", OperandKind())};
     }
-    if (std::holds_alternative<sql::Literal>(*like->pattern)) {
+    if (std::holds_alternative<sql::Literal>(*like.pattern)) {
       return std::nullopt;
     }
-    if (auto r = FirstUnsupported(*like->pattern)) {
+    if (auto r = FirstUnsupported(*like.pattern)) {
       return r;
     }
-    return Rejection{.span = like->pattern->span(),
+    return Rejection{.span = like.pattern->span(),
                      .message =
                          "LIKE with a column or an aggregate as the pattern is not "
                          "supported"};
   }
-  if (const auto* in = std::get_if<sql::InExpr>(&expr)) {
-    if (auto r = FirstUnsupported(*in->operand)) {
+  std::optional<Rejection> operator()(const sql::InExpr& in) const {
+    if (auto r = FirstUnsupported(*in.operand)) {
       return r;
     }
-    if (!is_operand(*in->operand)) {
-      return Rejection{.span = in->operand->span(),
-                       .message = std::format("IN needs {} on the left", operand_kind)};
+    if (!IsOperand(*in.operand)) {
+      return Rejection{.span = in.operand->span(),
+                       .message = std::format("IN needs {} on the left", OperandKind())};
     }
-    if (auto r = FirstUnsupportedIn(in->list)) {
+    if (auto r = FirstUnsupportedIn(in.list)) {
       return r;
     }
-    for (const sql::Expr& value : in->list) {
+    for (const sql::Expr& value : in.list) {
       if (!std::holds_alternative<sql::Literal>(value)) {
         return Rejection{.span = value.span(),
                          .message = "only literals are supported in an IN list"};
@@ -772,19 +794,20 @@ std::optional<Rejection> RejectCondition(const sql::Expr& expr, bool having) {
     }
     return std::nullopt;
   }
-  if (auto r = FirstUnsupported(expr)) {
-    return r;
+  std::optional<Rejection> operator()(const sql::FunctionCall& /*call*/) const {
+    return NotACondition(kThisCondition);
   }
-  if (std::holds_alternative<sql::ColumnRef>(expr) || std::holds_alternative<sql::Literal>(expr) ||
-      std::holds_alternative<sql::AggregateCall>(expr) ||
-      std::holds_alternative<sql::BinaryExpr>(expr) ||
-      std::holds_alternative<sql::UnaryExpr>(expr)) {
-    return Rejection{.span = expr.span(),
-                     .message =
-                         "conditions other than comparisons, [NOT] LIKE, [NOT] IN, AND, OR "
-                         "and NOT are not supported"};
+  std::optional<Rejection> operator()(const sql::CaseExpr& /*c*/) const {
+    return NotACondition(kThisCondition);
   }
-  return Rejection{.span = expr.span(), .message = "this condition is not supported"};
+  std::optional<Rejection> operator()(const sql::ExtractExpr& /*e*/) const {
+    return NotACondition(kThisCondition);
+  }
+};
+
+std::optional<Rejection> RejectCondition(const sql::Expr& expr, bool having) {
+  return std::visit(RejectConditionOf{.expr = expr, .having = having},
+                    static_cast<const sql::ExprNode&>(expr));
 }
 
 // The conjuncts of a WHERE or HAVING predicate, with parenthesized AND chains flattened.
@@ -1211,36 +1234,34 @@ arrow::Result<std::pair<Constant, std::string>> BindConstant(const sql::Literal&
 // ---- scalar expressions ----
 
 // Whether the expression contains an aggregate call.
-bool ContainsAggregate(const sql::Expr& expr) {
-  if (std::holds_alternative<sql::AggregateCall>(expr)) {
-    return true;
+bool ContainsAggregate(const sql::Expr& expr);
+
+struct ContainsAggregateOf {
+  bool operator()(const sql::ColumnRef& /*column*/) const { return false; }
+  bool operator()(const sql::Literal& /*lit*/) const { return false; }
+  bool operator()(const sql::AggregateCall& /*call*/) const { return true; }
+  bool operator()(const sql::UnaryExpr& unary) const { return ContainsAggregate(*unary.operand); }
+  bool operator()(const sql::BinaryExpr& binary) const {
+    return ContainsAggregate(*binary.left) || ContainsAggregate(*binary.right);
   }
-  if (const auto* call = std::get_if<sql::FunctionCall>(&expr)) {
-    return std::ranges::any_of(call->args, ContainsAggregate);
+  // A LIKE pattern and the values of an IN list are literals (RejectCondition).
+  bool operator()(const sql::LikeExpr& like) const { return ContainsAggregate(*like.operand); }
+  bool operator()(const sql::InExpr& in) const { return ContainsAggregate(*in.operand); }
+  bool operator()(const sql::FunctionCall& call) const {
+    return std::ranges::any_of(call.args, ContainsAggregate);
   }
-  if (const auto* binary = std::get_if<sql::BinaryExpr>(&expr)) {
-    return ContainsAggregate(*binary->left) || ContainsAggregate(*binary->right);
-  }
-  if (const auto* unary = std::get_if<sql::UnaryExpr>(&expr)) {
-    return ContainsAggregate(*unary->operand);
-  }
-  if (const auto* like = std::get_if<sql::LikeExpr>(&expr)) {
-    return ContainsAggregate(*like->operand);
-  }
-  if (const auto* in = std::get_if<sql::InExpr>(&expr)) {
-    return ContainsAggregate(*in->operand);
-  }
-  if (const auto* e = std::get_if<sql::ExtractExpr>(&expr)) {
-    return ContainsAggregate(*e->source);
-  }
-  if (const auto* c = std::get_if<sql::CaseExpr>(&expr)) {
-    return (c->operand.has_value() && ContainsAggregate(**c->operand)) ||
-           (c->otherwise.has_value() && ContainsAggregate(**c->otherwise)) ||
-           std::ranges::any_of(c->branches, [](const sql::CaseBranch& b) {
+  bool operator()(const sql::CaseExpr& c) const {
+    return (c.operand.has_value() && ContainsAggregate(**c.operand)) ||
+           (c.otherwise.has_value() && ContainsAggregate(**c.otherwise)) ||
+           std::ranges::any_of(c.branches, [](const sql::CaseBranch& b) {
              return ContainsAggregate(*b.when) || ContainsAggregate(*b.then);
            });
   }
-  return false;
+  bool operator()(const sql::ExtractExpr& e) const { return ContainsAggregate(*e.source); }
+};
+
+bool ContainsAggregate(const sql::Expr& expr) {
+  return std::visit(ContainsAggregateOf{}, static_cast<const sql::ExprNode&>(expr));
 }
 
 // An expression of the binder's subset, typed, with what DuckDB's typing needs to know of it.
@@ -1604,6 +1625,10 @@ bool IsAggregateQuery(const sql::SelectStatement& stmt) {
 constexpr int kPreBase = 4 * 1024 * 1024;
 constexpr int kPostBase = 16 * 1024 * 1024;
 
+// [NOT] LIKE and [NOT] IN are conditions: CheckSupported admits them only where BindConditionWith
+// binds them, never where BindInput or BindOutput binds an operand.
+[[noreturn]] void ConditionAsOperand() { ANTB1_CHECK(false); }
+
 class Binder {
  public:
   Binder(const sql::SelectStatement& stmt, std::shared_ptr<Table> table)
@@ -1618,43 +1643,49 @@ class Binder {
  private:
   // ---- the input scope: the table's columns, and computed columns over them ----
 
-  arrow::Result<Typed> BindInput(const sql::Expr& expr) {
-    if (const auto* ref = std::get_if<sql::ColumnRef>(&expr)) {
-      auto resolved = columns_.Resolve(*ref);
-      if (!resolved.ok() && shape_ == Shape::kProjection) {
-        if (auto alias = AliasFallback(*ref, resolved.status())) {
+  struct BindInputOf {
+    Binder& binder;
+
+    arrow::Result<Typed> operator()(const sql::ColumnRef& ref) const {
+      auto resolved = binder.columns_.Resolve(ref);
+      if (!resolved.ok() && binder.shape_ == Shape::kProjection) {
+        if (auto alias = binder.AliasFallback(ref, resolved.status())) {
           return *std::move(alias);
         }
       }
       ARROW_ASSIGN_OR_RAISE(BoundColumn column, std::move(resolved));
-      return ColumnLeaf(column.index, column.type, ArgumentName(ref->name),
-                        table_->StoredAsFloat(column.index));
+      return ColumnLeaf(column.index, column.type, ArgumentName(ref.name),
+                        binder.table_->StoredAsFloat(column.index));
     }
-    if (const auto* lit = std::get_if<sql::Literal>(&expr)) {
-      return LiteralOperand(*lit);
+    arrow::Result<Typed> operator()(const sql::Literal& lit) const { return LiteralOperand(lit); }
+    arrow::Result<Typed> operator()(const sql::AggregateCall& call) const {
+      return BindError("aggregate functions are not allowed here", call.span);
     }
-    if (const auto* binary = std::get_if<sql::BinaryExpr>(&expr)) {
-      ARROW_ASSIGN_OR_RAISE(Typed left, BindInput(*binary->left));
-      ARROW_ASSIGN_OR_RAISE(Typed right, BindInput(*binary->right));
-      return Arith(*binary, std::move(left), std::move(right));
+    arrow::Result<Typed> operator()(const sql::UnaryExpr& unary) const {
+      ARROW_ASSIGN_OR_RAISE(Typed operand, binder.BindInput(*unary.operand));
+      return Negate(unary, std::move(operand));
     }
-    if (const auto* unary = std::get_if<sql::UnaryExpr>(&expr)) {
-      ARROW_ASSIGN_OR_RAISE(Typed operand, BindInput(*unary->operand));
-      return Negate(*unary, std::move(operand));
+    arrow::Result<Typed> operator()(const sql::BinaryExpr& binary) const {
+      ARROW_ASSIGN_OR_RAISE(Typed left, binder.BindInput(*binary.left));
+      ARROW_ASSIGN_OR_RAISE(Typed right, binder.BindInput(*binary.right));
+      return Arith(binary, std::move(left), std::move(right));
     }
-    if (const auto* call = std::get_if<sql::AggregateCall>(&expr)) {
-      return BindError("aggregate functions are not allowed here", call->span);
+    arrow::Result<Typed> operator()(const sql::LikeExpr& /*like*/) const { ConditionAsOperand(); }
+    arrow::Result<Typed> operator()(const sql::InExpr& /*in*/) const { ConditionAsOperand(); }
+    arrow::Result<Typed> operator()(const sql::FunctionCall& call) const {
+      return binder.BindFunction(call, [this](const sql::Expr& e) { return binder.BindInput(e); });
     }
-    if (const auto* call = std::get_if<sql::FunctionCall>(&expr)) {
-      return BindFunction(*call, [this](const sql::Expr& e) { return BindInput(e); });
+    arrow::Result<Typed> operator()(const sql::CaseExpr& c) const {
+      return binder.BindCase(
+          c, [this](const sql::Expr& e) { return binder.BindInput(e); }, /*input=*/true);
     }
-    if (const auto* c = std::get_if<sql::CaseExpr>(&expr)) {
-      return BindCase(*c, [this](const sql::Expr& e) { return BindInput(e); }, /*input=*/true);
+    arrow::Result<Typed> operator()(const sql::ExtractExpr& e) const {
+      return binder.BindExtract(e, [this](const sql::Expr& x) { return binder.BindInput(x); });
     }
-    if (const auto* e = std::get_if<sql::ExtractExpr>(&expr)) {
-      return BindExtract(*e, [this](const sql::Expr& x) { return BindInput(x); });
-    }
-    return UnsupportedError("this expression is not supported", expr.span());
+  };
+
+  arrow::Result<Typed> BindInput(const sql::Expr& expr) {
+    return std::visit(BindInputOf{.binder = *this}, static_cast<const sql::ExprNode&>(expr));
   }
 
   // A function call with its first argument bound by `bind_arg` (the scope's binder).
@@ -1914,6 +1945,47 @@ class Binder {
                      span);
   }
 
+  // An expression over the aggregation's output that is no GROUP BY key (see BindOutput).
+  struct BindOutputOf {
+    Binder& binder;
+
+    arrow::Result<Typed> operator()(const sql::ColumnRef& ref) const {
+      auto resolved = binder.columns_.Resolve(ref);
+      if (!resolved.ok()) {
+        if (auto alias = binder.AliasFallback(ref, resolved.status())) {
+          return *std::move(alias);
+        }
+        return resolved.status();
+      }
+      return NotGrouped(ref.name, ref.span);
+    }
+    arrow::Result<Typed> operator()(const sql::Literal& lit) const { return LiteralOperand(lit); }
+    arrow::Result<Typed> operator()(const sql::AggregateCall& call) const {
+      return binder.AggregateOutput(call);
+    }
+    arrow::Result<Typed> operator()(const sql::UnaryExpr& unary) const {
+      ARROW_ASSIGN_OR_RAISE(Typed operand, binder.BindOutput(*unary.operand));
+      return Negate(unary, std::move(operand));
+    }
+    arrow::Result<Typed> operator()(const sql::BinaryExpr& binary) const {
+      ARROW_ASSIGN_OR_RAISE(Typed left, binder.BindOutput(*binary.left));
+      ARROW_ASSIGN_OR_RAISE(Typed right, binder.BindOutput(*binary.right));
+      return Arith(binary, std::move(left), std::move(right));
+    }
+    arrow::Result<Typed> operator()(const sql::LikeExpr& /*like*/) const { ConditionAsOperand(); }
+    arrow::Result<Typed> operator()(const sql::InExpr& /*in*/) const { ConditionAsOperand(); }
+    arrow::Result<Typed> operator()(const sql::FunctionCall& call) const {
+      return binder.BindFunction(call, [this](const sql::Expr& e) { return binder.BindOutput(e); });
+    }
+    arrow::Result<Typed> operator()(const sql::CaseExpr& c) const {
+      return binder.BindCase(
+          c, [this](const sql::Expr& e) { return binder.BindOutput(e); }, /*input=*/false);
+    }
+    arrow::Result<Typed> operator()(const sql::ExtractExpr& e) const {
+      return binder.BindExtract(e, [this](const sql::Expr& x) { return binder.BindOutput(x); });
+    }
+  };
+
   // An expression over the aggregation's output: a subexpression equal to a GROUP BY key is that
   // key, an aggregate its column; any other column is a bind error.
   arrow::Result<Typed> BindOutput(const sql::Expr& expr) {
@@ -1928,41 +2000,7 @@ class Binder {
         }
       }
     }
-    if (const auto* call = std::get_if<sql::AggregateCall>(&expr)) {
-      return AggregateOutput(*call);
-    }
-    if (const auto* ref = std::get_if<sql::ColumnRef>(&expr)) {
-      auto resolved = columns_.Resolve(*ref);
-      if (!resolved.ok()) {
-        if (auto alias = AliasFallback(*ref, resolved.status())) {
-          return *std::move(alias);
-        }
-        return resolved.status();
-      }
-      return NotGrouped(ref->name, ref->span);
-    }
-    if (const auto* lit = std::get_if<sql::Literal>(&expr)) {
-      return LiteralOperand(*lit);
-    }
-    if (const auto* binary = std::get_if<sql::BinaryExpr>(&expr)) {
-      ARROW_ASSIGN_OR_RAISE(Typed left, BindOutput(*binary->left));
-      ARROW_ASSIGN_OR_RAISE(Typed right, BindOutput(*binary->right));
-      return Arith(*binary, std::move(left), std::move(right));
-    }
-    if (const auto* unary = std::get_if<sql::UnaryExpr>(&expr)) {
-      ARROW_ASSIGN_OR_RAISE(Typed operand, BindOutput(*unary->operand));
-      return Negate(*unary, std::move(operand));
-    }
-    if (const auto* call = std::get_if<sql::FunctionCall>(&expr)) {
-      return BindFunction(*call, [this](const sql::Expr& e) { return BindOutput(e); });
-    }
-    if (const auto* c = std::get_if<sql::CaseExpr>(&expr)) {
-      return BindCase(*c, [this](const sql::Expr& e) { return BindOutput(e); }, /*input=*/false);
-    }
-    if (const auto* e = std::get_if<sql::ExtractExpr>(&expr)) {
-      return BindExtract(*e, [this](const sql::Expr& x) { return BindOutput(x); });
-    }
-    return UnsupportedError("this expression is not supported", expr.span());
+    return std::visit(BindOutputOf{.binder = *this}, static_cast<const sql::ExprNode&>(expr));
   }
 
   // The column of an output-scope expression: an output column as is, anything else computed
