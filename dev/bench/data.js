@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790933999242,
+  "lastUpdate": 1790940110432,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -3816,6 +3816,90 @@ window.BENCHMARK_DATA = {
             "value": 11.750885916666695,
             "unit": "ms/iter",
             "extra": "iterations: 60\ncpu: 11.750302750000005 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "900d7573af88ec386af3ad518ca562803c989c81",
+          "message": "test(harness): compare decimal results exactly (#77)\n\n## Summary\n\nThe SLT harness compares DuckDB's DECIMAL results as doubles: the DuckDB\nadapter turns a DECIMAL with a scale into a\ndouble of class `R`, compared within a relative 1e-9, and names its type\na bare `DECIMAL`. On a value with ten integer\ndigits that tolerance is more than a whole unit, so a wrong cent passes,\nand so do a wrong scale and a wrong width.\nADR 0021 requires exact comparison before any DECIMAL engine code. This\nis PR H5 of the roadmap for the queries derived\nfrom TPC-H; the DECIMAL engine PRs D2 to D4 build on it.\n\n- **`plan::FormatDecimal`** (`src/plan/include/antb1/plan/literal.h`).\nIt prints a DECIMAL(width, scale) as DuckDB\ndoes (ADR 0021, rule 15): exactly `scale` digits after the point, `-`\nfor a negative value, and a leading `0` only\nwhen width > scale. Examples: `17.00`, `-0.25`, `.500`, `-.500`, `.000`,\n`42`. It accepts any `Int128` and never drops\na digit. The harness uses it now; D2 uses it for antb1's own output and\nfor EXPLAIN constants.\n- **A fourth result class, `D`** (`tests/slt/runner/engine.h`). It\ncompares exactly in every path; only `R` ever had a\ntolerance. The DuckDB adapter maps every DECIMAL to it, scale 0\nincluded, because D2 reads a Parquet DECIMAL(38,0) as\nDECIMAL(38,0). It reads the width too, names the type `DECIMAL(p,s)` and\nwrites the exact text instead of a rounded\n  double.\n- **Long runs of ties** (`ordered_compare.cc`). When a run of ties at a\nLIMIT cut is too long to fetch, one query\nchecks antb1's rows against it. `D` cells now compare there as DuckDB's\ntext of the column (`CAST(col AS VARCHAR)`),\nlike `T` cells. Compared with a DECIMAL, DuckDB 1.5.5 casts a string to\nthe DECIMAL, and the cast does three things\n  (probed):\n  - it rounds: `'0.55'` equals 0.6;\n  - it fails on text that does not fit;\n  - it accepts other spellings: `'-.05'` matches -0.05.\n- **`.slt` files.**\n  - `query` accepts `D`.\n- `valuesort` refuses a record with both `R` and `D` columns. valuesort\nloses the columns, so every value would\n    compare within the R tolerance.\n- `slt-complete` reports such a record as an error instead of writing a\nheader that the parser would refuse\n    (`SortModeProblem`, shared by both).\n- **Metamorphic checks** compare DECIMAL values by value: the unscaled\nintegers, at one scale.\n- **Docs:** `tests/slt/README.md` covers the letters, the valuesort\nrule, the canonical text, type names and the\nlong-run text comparison. `docs/recipes/write-slt-test.md` and the code\ncomments that list the classes are updated\n  too.\n\n**The hole, shown by the tests.** `1234567890.12` against\n`1234567890.13` passes as `R`: the tolerance,\n1e-12 + 1e-9 × 1.2e9, is more than a whole unit. The wrong scale\n`1234567890.120` is the same double and passes too.\nAs `D`, both fail in every path:\n- `.slt` blocks (`CompareBlocks`, `RunFile`, hashed blocks included);\n- `CompareAnswers`, which also compares the `DECIMAL(p,s)` names;\n- `CompareSubset`;\n- `CompareOrdered`, where keys 0.01 apart are two runs of ties as `D`\nand one run as `R`.\n\n**Not changed.** antb1 produces no DECIMAL yet. `antb1_engine.cc`'s\n`ClassOf`, `plan::ToString` and\n`engine::FormatValue` stay as they are; D2 maps antb1's DECIMAL to `D`\nand prints it with `FormatDecimal`. No existing\nexpectation changes:\n- `slt-complete` leaves all 48 `.slt` files unchanged and prints no\n`NOTE` line;\n- with DuckDB 1.5.5, `DESCRIBE` over all 522 query records and 10,300\ngenerated differential queries shows no DECIMAL\n  column;\n- every ClickBench query already compares type names and passes.\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [x] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run test -R '^plan\\.LiteralTest\\.FormatDecimal'\n100% tests passed out of 2\n\n$ pixi run slt-complete\n48 files: \"unchanged\"; no NOTE line\n\n$ pixi run check-full          # on e5ab561\nlint: PASS\nci        100% tests passed out of 1465 (main has 1446; this adds 19)\nasan      100% tests passed out of 1465\ntidy      passed\ncoverage  100% tests passed out of 1465; Coverage gate: PASS\nfuzz      100% tests passed out of 2\nci-gcc    100% tests passed out of 1465\nEXIT CODE: 0\n\n$ pixi run test-data           # on e5ab561: the ClickBench answers and type names are unchanged\n100% tests passed out of 6\n```\n\nMutation checks:\n- **Without `D` in `Operand`:** `WrongDecimalsInALongRunFail` and\n`LongRunMembersMatchDecimalsAsText` fail. The second\n  sees the members query return rows 3 and 12 instead of row 3.\n- **With a `FormatDecimal` that always prints the leading `0`:** both\n`DuckDbEngineTest` cases fail.\n`DecimalTextIsDuckDbsVarcharText` compares the adapter's text with\nDuckDB's own `CAST(d AS VARCHAR)` at the edges of\nevery physical width (widths 1, 4, 5, 9, 10, 18, 19 and 38, scales 0, 1,\nhalf and full).\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed):\n  - `plan.LiteralTest.FormatDecimal*`;\n  - `harness.DuckDbEngineTest.*` (new, against the DuckDB library);\n- D cases in the `Comparator`, `CompareAnswers`, `CompareSubset`,\n`CompareOrdered`, `RunFile`, `CompleteFile`,\n    `ParseSlt`, `Canonical` and `OrderedCompareOracleTest` suites;\n  - `metamorphic.Checks.DecimalMinMaxCompareByValue`.\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: none are touched\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did:\n- Claude Code wrote the plan, which a maintainer approved, then the\nchange and the tests, and ran the gates and the\n    mutation checks above.\n- Exploration agents mapped the harness and checked with DuckDB 1.5.5\nthat no record, generated query or ClickBench\n    query returns a DECIMAL.\n- A design agent probed DuckDB's DECIMAL text and comparison semantics,\nincluding a randomized round trip of 26\n    (p,s) pairs × 405 values with no mismatch.\n- A review workflow had four reviewers (formatter and adapter,\ncomparators, tests, repo rules and docs), each\nfinding checked by an adversarial verifier. It confirmed three P3\nfindings, two of them the same, and all are\n    fixed:\n- `slt-complete` could write a `query RD valuesort` header that the\nparser then refuses;\n- an oracle test promised a text comparison that only one of its rows\nchecked.\n\nOne finding was refuted: a GCC 15 `-Wrange-loop-construct` error in\nthree tests, which `check-full` had already\n    caught and which was fixed before the review ended.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-10-02T14:19:03+03:00",
+          "tree_id": "cd803fe34ea831c5be7a0547f39bf517f35f2462",
+          "url": "https://github.com/ydb-campus/antb1/commit/900d7573af88ec386af3ad518ca562803c989c81"
+        },
+        "date": 1790940109854,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4257.757705079162,
+            "unit": "ns/iter",
+            "extra": "iterations: 164729\ncpu: 4257.310698177005 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84890.51406649394,
+            "unit": "ns/iter",
+            "extra": "iterations: 7820\ncpu: 84881.8216112532 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222080.2343255238,
+            "unit": "ns/iter",
+            "extra": "iterations: 3158\ncpu: 221958.17701076635 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 439849.295483063,
+            "unit": "ns/iter",
+            "extra": "iterations: 1594\ncpu: 439725.84378920955 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 350197.69134568376,
+            "unit": "ns/iter",
+            "extra": "iterations: 1999\ncpu: 349992.68834417185 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2114825.0332326265,
+            "unit": "ns/iter",
+            "extra": "iterations: 331\ncpu: 2114627.1117824754 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 52.87889000000125,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 52.86110184615378 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 45.58558866666734,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 45.58294279999995 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 225.74157800000685,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 225.69469933333332 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.435819291666855,
+            "unit": "ms/iter",
+            "extra": "iterations: 48\ncpu: 14.434704687499966 ms\nthreads: 1"
           }
         ]
       }
