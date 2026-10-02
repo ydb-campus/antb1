@@ -21,8 +21,9 @@ Proposed
 - **The global form was solved in #49** as a `GROUP BY x` with `COUNT` on top.
   - The same rewrite for the grouped form (`GROUP BY K, x`, then `GROUP BY K`) made Q11 and Q13 1.7-2.8× slower: the
     outer grouping was serial over up to every inner group.
-- **Later work needs the same shape.** Derived tables, decorrelated subqueries (the queries derived from TPC-H) and
-  several `COUNT(DISTINCT)` columns all come down to an outer GROUP BY K over an inner GROUP BY K ∪ X.
+- **Later work needs the same shape.** Derived tables, decorrelated subqueries (for the queries of
+  [ADR 0022](0022-joins-and-query-blocks.md)) and several `COUNT(DISTINCT)` columns all come down to an outer
+  GROUP BY K over an inner GROUP BY K ∪ X.
 
 ## Decision
 

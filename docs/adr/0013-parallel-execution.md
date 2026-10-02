@@ -96,8 +96,8 @@ Proposed
 
 ## Towards joins (amendment, 2026-09-29)
 
-The maintainer asked for this design to be ready for the queries derived from TPC-H: hash joins, and correlated
-subqueries. [ADR 0022](0022-joins-and-query-blocks.md) designs the joins and amends this section where marked.
+The maintainer asked for this design to be ready for the queries of [ADR 0022](0022-joins-and-query-blocks.md): hash
+joins, and correlated subqueries. ADR 0022 designs the joins and amends this section where marked.
 
 - **A physical plan becomes a DAG of pipelines.** A pipeline has a source (a table's parts, or a finished sink's
   output), streaming operators (`Filter`, `Compute`, `Project`, later a hash-join probe) and a sink (aggregate,
@@ -110,8 +110,9 @@ subqueries. [ADR 0022](0022-joins-and-query-blocks.md) designs the joins and ame
   in (part, row) order within each partition, so a key's matches come in part order and the build depends only on
   its input's parts; a probe keeps the probe side's part order, so a join's output does not depend on the thread
   count.
-- **Correlated subqueries** are decorrelated by the binder into semi, anti and aggregate joins; the executor never
-  runs a subquery per row.
+- **Subqueries:** the binder plans an uncorrelated subquery directly as a join: semi, null-aware anti, or a one-row
+  join (amended 2026-10-02, ADR 0022). Correlated subqueries are decorrelated by the binder into semi, anti and
+  aggregate joins; the executor never runs a subquery per row.
 - **Memory:** the window bounds what is in flight: up to 2 × threads parts' partial states or, under a part union
   (a projection, or a blocking operator without its own sink yet), their whole output, because a part hands on its
   batches only when it is finished. A hash-join build is one table shared read-only by the probe threads. An inner
@@ -123,7 +124,7 @@ subqueries. [ADR 0022](0022-joins-and-query-blocks.md) designs the joins and ame
   right after the first parallel PR. Finished builds are charged to the budget and stay pinned until their probe
   pipeline finishes; excluding them from the pressure measure is deferred until a memory test or a run at SF 10 or
   above shows serialized probes. Spilling (grace hash join, partitioned GROUP BY, external sort) follows the
-  correctness work on the TPC-H-derived queries and starts on its trigger, in its own ADR; it never changes a value,
+  correctness work on the queries of ADR 0022 and starts on its trigger, in its own ADR; it never changes a value,
   only the row order where SQL leaves it open (amended 2026-10-02, ADR 0022).
 
 ## Consequences
@@ -198,7 +199,7 @@ subqueries. [ADR 0022](0022-joins-and-query-blocks.md) designs the joins and ame
 - **Static contiguous ranges of parts per thread:** deterministic for a thread count but not across counts, and it
   load-balances poorly across uneven row groups.
 - **Exchange operators and push-based pipelines (Volcano exchange, DuckDB-style push):** more general, for joins and
-  deeper plans, but antb1's plans have one scan and at most one blocking operator below small serial tops. Answered
-  for joins, which is ADR 0003's pull-versus-push question (amended 2026-10-02, ADR 0022): pull pipelines stay.
-  Builds are prepared on the consumer thread in post-order before the probe's scheduler starts, never from a part
-  task, and there are no exchange operators.
+  deeper plans, but antb1's plans have one scan and at most one blocking operator below small serial tops. ADR 0003's
+  pull-versus-push question is answered for joins (amended 2026-10-02, ADR 0022): pull pipelines stay. Builds are
+  prepared on the consumer thread in post-order before the probe's scheduler starts, never from a part task, and
+  there are no exchange operators.
