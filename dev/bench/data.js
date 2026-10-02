@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790885950363,
+  "lastUpdate": 1790924042865,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -3480,6 +3480,90 @@ window.BENCHMARK_DATA = {
             "value": 11.717151483333529,
             "unit": "ms/iter",
             "extra": "iterations: 60\ncpu: 11.715150299999996 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "e296fa4b42de73cf0951f5a3195f2161428c6ccb",
+          "message": "refactor(plan): exhaustive binder visitors over the sql ast (#69)\n\n## Summary\n\nIn `src/plan/binder.cc`, seven functions used to dispatch on the kind of\nan SQL expression node with `std::get_if` chains. They ended in a silent\ndefault or, in one case, a `std::get` that throws. They now visit the\nnode with a struct of one overload per kind, as `FirstUnsupportedOf`\nalready did:\n\n| Function | Default before | Now |\n| --- | --- | --- |\n| `ReadsColumn` | `false` (a new node that reads a column would look\nconstant) | `ReadsColumnOf` |\n| `ContainsAggregate` | `false` | `ContainsAggregateOf` |\n| `ExprName` | `sql::ToSql` | `ExprNameOf` |\n| `RejectCondition` | catch-all messages chosen by `holds_alternative`\ntests | `RejectConditionOf` |\n| `BindInput`, `BindOutput` | \"this expression is not supported\" |\nnested `BindInputOf`, `BindOutputOf` |\n| `BindConditionWith` | `std::get<sql::BinaryExpr>`, which throws\n`std::bad_variant_access` | nested `BindConditionOf` |\n\nA new kind of node is now a compile error at each of these sites instead\nof a silent default. The planned new kinds are CAST (S1), BETWEEN (S2)\nand subqueries (S4). Two decisions the compiler will now force:\n\n- J5 needs `ContainsAggregate` not to descend into subqueries.\n- Once `RejectConditionOf` admits BETWEEN as a condition,\n`BindConditionOf` must bind it. Before this PR the build passed, and\n`std::get` threw out of `plan::Bind`, which ends in `std::terminate`.\n\nBehavior does not change: every kind keeps its result, error message and\nspan. A few unreachable cases change form. Each is now an `ANTB1_CHECK`\nin a `[[noreturn]]` helper:\n\n- **`ConditionAsOperand()`.** It covers `[NOT] LIKE` and `[NOT] IN`\nreaching `BindInput` or `BindOutput`. Before, they fell through to the\n`kUnsupported` fallback there. But `CheckSupported` admits them only as\nconditions, and `BindConditionWith` binds only their operand.\n- **`NotAConditionLeaf()`.** It covers any node in `BindConditionOf`\nother than a comparison, `[NOT] LIKE` or `[NOT] IN`. `RejectCondition`\nadmits no other leaf, and `Conjuncts` and `BindBool` take AND, OR and\nNOT apart first. `SqlCompareOp` used to map any other operator to `=`\nwithout a word. It now lists `=` with the other comparisons and fails\nthe same check for the rest.\n- **Aggregates in `BindInputOf`.** It keeps its explicit bind error for\nan aggregate. That case is unreachable too, because the parser rejects\naggregates in WHERE, GROUP BY and aggregate arguments. But it is a\nspecific message, not a silent default.\n\nThe tests were written first and passed against main's binder before the\nrefactor:\n\n- **11 new error cases.** They cover:\n  - each kind of node as a whole WHERE condition, also under AND and OR;\n- constructs the binder does not answer inside a LIKE or IN operand,\npattern or list.\n\n  Most of these `RejectCondition` paths had no test.\n- **`BinderTest.AggregatesInsideCaseAndExtract`.** It covers:\n- aggregates in a CASE operand, THEN or ELSE value, and under EXTRACT\n(no test had sent EXTRACT through `BindOutput`);\n  - EXTRACT of a GROUP BY key;\n- a CASE operand read as a column (an aggregate of it is not a\nconstant).\n\nSmaller edits:\n\n- The `ReadsColumn` comment had lost its declaration (it sat above\n`FunctionSpec`); the forward declaration is back under it.\n- The identical AND and OR cases of `RejectCondition` are merged.\n- `antb1/sql/unparse.h` is no longer included; only the `ToSql` fallback\nused it.\n- `docs/recipes/add-sql-feature.md` lists the visitors that a new node\nkind must extend. It also says that `BindConditionOf` binds every\ncondition leaf that `RejectConditionOf` admits.\n\n### Dispatch sites left as they are\n\n- **Recognizers.** For each one, the default answer is correct for any\nother kind of node. A new kind can therefore leave them incomplete, but\nnever wrong:\n- `Conjuncts` (the AND chain), `IsCompound` (OR, NOT) and the AND/OR/NOT\nsplit in `BindBool`: any other node is one predicate.\n- `FoldNots`/`NotName`: DuckDB's special names for NOT over a comparison\nor IN. Any other operand gets `(NOT x)`, with `x` named by the\nexhaustive `ExprName`.\n- `ConstantValue`, the split in `RewritableSum`, and `MoveConstants`:\ninteger constant arithmetic. An unknown node is never folded or\nrewritten. S2 plans to extend `ConstantValue`.\n- Literal tests: `holds_alternative<sql::Literal>`, `IsStringLiteral`,\nand the function-argument checks.\n- **Clause-level special cases** in `BindSelectList`, `BindGroupBy`,\n`BindOrderBy` and the HAVING name lookups. They handle literals\n(positions, constants), column refs (aliases) and top-level aggregates\nfirst. Everything else goes through\n`BindInput`/`BindOutput`/`BindScoped`, which are now exhaustive.\n- **`std::get<sql::Literal>` on a LIKE pattern and on IN list values**\nin `BindConditionOf`. They read the shape that `RejectConditionOf`\nchecks right before (a literal pattern, a list of literals), not the\nkind of the leaf.\n- **Switches over `sql::BinaryOp` with `default:`.** They dispatch on\noperators, not node kinds, and the planned additions are node kinds. In\nclang source-based coverage every `case` label is a branch, so listing\neach operator would add branches that no test reaches. `SqlCompareOp`\nkeeps its `default:` too, but that default now fails a check instead of\nanswering `=`.\n\nNo issue: roadmap PR P0 (TPC-H, wave 1).\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [x] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n# The new tests against main's binder.cc (only binder_test.cc changed)\n$ pixi run test -R '^plan\\.'\n100% tests passed out of 364\nANTB1-TESTS: PASS preset=dev junit=build/dev/junit.xml\n\n# On fa7fe64 (head, after the review fix)\n$ pixi run test\n100% tests passed out of 1438\nANTB1-TESTS: PASS preset=dev junit=build/dev/junit.xml\n\n$ pixi run check-full          # check (lint + ci) + asan + tidy + coverage + fuzz-smoke + ci-gcc\nlint: PASS\nci:         100% tests passed out of 1438\nasan:       100% tests passed out of 1438\ntidy:       no diagnostics\ncoverage:   | `plan` | 95.84% (3981/4154) | 93.5% | 90.95% (2341/2574) | 89.5% | ok |\n            Coverage gate: PASS ... coverage: PASS\nfuzz-smoke: 100% tests passed out of 2\nci-gcc:     100% tests passed out of 1438\nEXIT CODE: 0\n\n$ pixi run test-data\nfetch-data: hits_0.parquet: ok (cached, size and sha256 match the pin)\n6/6 Test #1439: data.clickbench.status ...........   Passed\n100% tests passed out of 6\n\n# plan coverage for comparison\nmain 59a7422:  | `plan` | 95.79% (3981/4156) | 93.5% | 90.49% (2425/2680) | 89.5% | ok |\naa3aec1:       | `plan` | 96.26% (3990/4145) | 93.5% | 91.03% (2343/2574) | 89.5% | ok |\n```\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests); it ran as part of `pixi run check-full`\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed). The new `ANTB1_CHECK` paths cannot be reached from\nSQL, so they have no test.\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed: one recipe bullet, no\nbehavior change\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: none changed\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did:\n- **Claude Code** wrote the refactor, the tests, the review fix and this\ndescription. It measured coverage before and after, checked that the new\ntests pass on main's binder, and ran every gate listed above on the\nfinal commit.\n- **First review: Claude Code's code-review agent.** It read the first\ncommit and traced every node kind through the old and new code. It also\nchecked that `ConditionAsOperand()` cannot be reached from SQL. It had\nno findings.\n- **Second review: a read-only reviewer agent.** It found one P2:\n`BindConditionWith` still dispatched with an if-chain. Its last case,\n`std::get<sql::BinaryExpr>`, throws instead of failing to compile, so a\nnew condition such as BETWEEN would build and then terminate the\nprocess. `SqlCompareOp` also mapped any non-comparison operator to `=`.\n- **Second commit.** Claude Code fixed the P2 in a second commit: the\n`BindConditionOf` visitor, `NotAConditionLeaf()`, and an `SqlCompareOp`\nthat fails a check. It also named the visitor in the binder.cc header\ncomment and the recipe.\n  - Neither reviewer ran any commands.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-10-02T09:51:19+03:00",
+          "tree_id": "e9116c7b412a9bfcd486931f416318ebaa7ffbe6",
+          "url": "https://github.com/ydb-campus/antb1/commit/e296fa4b42de73cf0951f5a3195f2161428c6ccb"
+        },
+        "date": 1790924041759,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4004.0558317465657,
+            "unit": "ns/iter",
+            "extra": "iterations: 175402\ncpu: 4003.967166851005 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 94579.96078431347,
+            "unit": "ns/iter",
+            "extra": "iterations: 7038\ncpu: 94571.99218527992 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 124924.12861736513,
+            "unit": "ns/iter",
+            "extra": "iterations: 5598\ncpu: 124863.94462307969 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 488919.7382271499,
+            "unit": "ns/iter",
+            "extra": "iterations: 1444\ncpu: 488841.3864265929 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 455950.0501302068,
+            "unit": "ns/iter",
+            "extra": "iterations: 1536\ncpu: 455769.251953125 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2227683.735668778,
+            "unit": "ns/iter",
+            "extra": "iterations: 314\ncpu: 2226666.859872611 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 52.75415376923084,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 52.74792638461534 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 48.80679500000034,
+            "unit": "ms/iter",
+            "extra": "iterations: 14\ncpu: 48.7798657857143 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 230.54129433333514,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 230.5235570000003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 15.096884608695404,
+            "unit": "ms/iter",
+            "extra": "iterations: 46\ncpu: 15.094829608695672 ms\nthreads: 1"
           }
         ]
       }
