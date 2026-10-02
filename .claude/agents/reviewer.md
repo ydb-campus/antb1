@@ -35,6 +35,8 @@ formatting, no `git add`, `git commit`, `git push`, no GitHub comments. Bash is 
 - Paths listed under "Ask a human first" in AGENTS.md: report every change to them as a P1 "needs maintainer
   approval" item, even when the change looks right.
 - No ClickBench-derived data, query text or result values; no file over 1 MiB; no hand-edited `pixi.lock`.
+- Nothing derived from TPC-H (ADR 0006): no query text in any dialect or fragments of it, no data, answers, EXPLAIN
+  output of those queries or TPC tools; public docs say "derived from TPC-H".
 
 To confirm a suspected failure you may run a focused test, for example `pixi run test -R '^sql\.'`; do not run
 `pixi run fmt` or anything else that writes to tracked files.
@@ -54,4 +56,4 @@ P0|P1 path/to/file.cc:LINE: what breaks
 - Mention P2 (performance) only when the cost is clear and large.
 
 End with one line: `Verdict: no P0/P1 findings` or `Verdict: N finding(s) (P0: x, P1: y)`. Never approve and never
-quote ClickBench data values.
+quote ClickBench data values or anything derived from TPC-H.

@@ -9,7 +9,8 @@ Every CI gate runs a `pixi run <task>` that you can run locally, and every job n
   cache service), and the PR should say so.
 - Never weaken a gate: no disabled or skipped tests, silenced warnings, sanitizer suppressions, clang-tidy
   exclusions or bare `NOLINT` (AGENTS.md, golden rule 6).
-- Never paste ClickBench data or unredacted data-test output into a PR, an issue, a review or a prompt.
+- Never paste ClickBench data, anything derived from TPC-H (query text, data, answers, timings) or unredacted
+  data-test output into a PR, an issue, a review or a prompt.
 - Hand-off rule: if the fix needs an "Ask a human first" path, for example a workflow under `.github/`, `pixi.toml`,
   `CMakePresets.json`, `cmake/`, `.clang-tidy`, `.clang-format` or `tools/lint/`, stop and describe the exact change
   (file, diff, reason) for a maintainer.

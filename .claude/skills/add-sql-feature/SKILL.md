@@ -17,8 +17,8 @@ Step-by-step details, file map and examples: [docs/recipes/add-sql-feature.md](.
 - `common` and `sql` stay Arrow-free and return `std::expected`; `exec` never uses `io`.
 - Integer SUM and AVG accumulate in `antb1::Int128`; literals are folded exactly at bind time.
 - If a step needs an "Ask a human first" path (AGENTS.md), for example a new module edge in
-  `cmake/Antb1Modules.cmake`, a dependency or task in `pixi.toml`, or the ClickBench ratchet
-  `tests/data/clickbench_status.json`: stop and hand off with the exact change (file, diff, reason) for a maintainer.
+  `cmake/Antb1Modules.cmake`, a dependency or task in `pixi.toml`, or a ratchet (`tests/data/clickbench_status.json`,
+  `tests/data/tpch_status.json`): stop and hand off with the exact change (file, diff, reason) for a maintainer.
 
 ## Steps
 
@@ -35,8 +35,10 @@ Step-by-step details, file map and examples: [docs/recipes/add-sql-feature.md](.
 7. Engine and CLI: `src/engine/` (session, formatter) and `src/cli/` (flags, exit codes), with tests.
 8. SQL logic tests: once the test-harness PR has landed, add `.slt` cases whose expectations DuckDB writes (skill
    write-slt-test). Until then the unit tests above carry the coverage.
-9. ClickBench: a feature that changes which queries pass also changes the ratchet and the docs status table in the
-   same PR. The ratchet is protected: hand off (skill clickbench-data).
+9. ClickBench and the queries derived from TPC-H: a feature that changes which queries pass also changes that ratchet
+   and its docs status table in the same PR. Ratchets are protected: hand off with the exact change (for ClickBench,
+   skill clickbench-data). Never write TPC-H query text or fragments of it into a test or a doc; refer to the queries
+   by number.
 10. Verify: `pixi run test -R '^(sql|plan|exec|engine|cli)\.'`, then `pixi run check`; add `pixi run check-full`
     for `io`/`exec` memory or ownership changes. Run the `reviewer` subagent (Claude Code) on the diff.
 11. PR: title like `feat(sql): add IN lists`, verification commands and results in the template.

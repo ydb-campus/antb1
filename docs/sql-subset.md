@@ -15,7 +15,8 @@ and `ORDER BY` (also by position), `HAVING` (the same conditions on aggregates a
 (`+ - * / // %` and unary `-`), the string functions `strlen` and `regexp_replace`, the timestamp functions
 `toDateTime`, `EXTRACT` and `date_trunc`, and `CASE` in every clause,
 `LIMIT` and `OFFSET`, over one table of Parquet files. This covers all 43 ClickBench queries (see
-[ClickBench status](#clickbench-status)).
+[ClickBench status](#clickbench-status)). None of the 22 queries derived from TPC-H passes yet (see
+[Queries derived from TPC-H](#queries-derived-from-tpc-h)).
 
 ```sql
 SELECT COUNT(*), SUM(ResolutionWidth) AS width, AVG(UserID), MAX(EventDate) FROM hits WHERE IsMobile = 1
@@ -595,3 +596,43 @@ bind error); today there is none: every query passes.
 | Q40 | pass | a `WHERE` conjunction with `IN` over two values, `GROUP BY` two columns, ordered by the count, a window with `OFFSET` |
 | Q41 | pass | `GROUP BY` two columns under a `WHERE` conjunction, ordered by the alias of the count, a window with `OFFSET` |
 | Q42 | pass | `date_trunc('minute', toDateTime(...))` selected, grouped and ordered by (the same expression, a TIMESTAMP key) under a `WHERE` conjunction, a window with `OFFSET` |
+
+## Queries derived from TPC-H
+
+The second workload is the 22 queries derived from TPC-H, in DuckDB's dialect, as the pinned conda-forge package
+`duckdb-extension-tpch` provides them. Their text, the data and the answers are generated at test time and never
+committed ([ADR 0006](adr/0006-test-strategy-and-data-policy.md)); queries are referred to by their number (1-based).
+The ratchet `tests/data/tpch_status.json` lists the queries verified to pass, and `pass` below means exactly the
+ratchet (`pixi run lint` compares them); the PR that makes a query pass updates both. A query that does not pass must
+fail cleanly with exit code 4 (unsupported). Today none passes; the plan is recorded in ADRs 0021 (DECIMAL), 0022
+(joins, query blocks and uncorrelated subqueries) and 0023 (correlated subqueries). The tests that generate the data
+and enforce the ratchet come with the next harness PRs. The last column names the work whose PR completes the query;
+most queries also need the DECIMAL work of ADR 0021 before it.
+
+| Query | Status | Completed by |
+| --- | --- | --- |
+| Q1 | unsupported (exit code 4) | DECIMAL arithmetic, SUM and AVG (ADR 0021) |
+| Q2 | unsupported (exit code 4) | correlated scalar aggregates (ADR 0023) |
+| Q3 | unsupported (exit code 4) | inner joins (ADR 0022) |
+| Q4 | unsupported (exit code 4) | correlated EXISTS and NOT EXISTS (ADR 0023) |
+| Q5 | unsupported (exit code 4) | inner joins (ADR 0022) |
+| Q6 | unsupported (exit code 4) | DECIMAL arithmetic, SUM and AVG (ADR 0021) |
+| Q7 | unsupported (exit code 4) | derived tables (ADR 0022) |
+| Q8 | unsupported (exit code 4) | derived tables (ADR 0022) |
+| Q9 | unsupported (exit code 4) | derived tables (ADR 0022) |
+| Q10 | unsupported (exit code 4) | inner joins (ADR 0022) |
+| Q11 | unsupported (exit code 4) | uncorrelated subqueries as joins (ADR 0022) |
+| Q12 | unsupported (exit code 4) | inner joins (ADR 0022) |
+| Q13 | unsupported (exit code 4) | LEFT JOIN (ADR 0022) |
+| Q14 | unsupported (exit code 4) | inner joins (ADR 0022) |
+| Q15 | unsupported (exit code 4) | uncorrelated subqueries as joins (ADR 0022) |
+| Q16 | unsupported (exit code 4) | uncorrelated subqueries as joins (ADR 0022) |
+| Q17 | unsupported (exit code 4) | correlated scalar aggregates (ADR 0023) |
+| Q18 | unsupported (exit code 4) | uncorrelated subqueries as joins (ADR 0022) |
+| Q19 | unsupported (exit code 4) | OR factoring for joins (ADR 0022) |
+| Q20 | unsupported (exit code 4) | correlated scalar aggregates (ADR 0023) |
+| Q21 | unsupported (exit code 4) | correlated EXISTS and NOT EXISTS (ADR 0023) |
+| Q22 | unsupported (exit code 4) | correlated EXISTS and NOT EXISTS (ADR 0023) |
+
+This workload is derived from the TPC-H Benchmark and is not comparable to published TPC-H Benchmark results, as this
+implementation does not comply with all requirements of the TPC-H Benchmark.
