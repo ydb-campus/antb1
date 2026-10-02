@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790979637119,
+  "lastUpdate": 1790985542006,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -4068,6 +4068,90 @@ window.BENCHMARK_DATA = {
             "value": 14.373980081632926,
             "unit": "ms/iter",
             "extra": "iterations: 49\ncpu: 14.372559306122442 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9fef75f95c1bd4a71810035c878c0bd06c88958a",
+          "message": "feat(sql,plan): fold casts of string literals to date (#82)\n\n## Summary\n\nDates can now be written as casts: `CAST('2013-07-01' AS DATE)` and\n`'2013-07-01'::DATE` work wherever\n`DATE '2013-07-01'` does. This is PR S1 of the roadmap for the queries\nderived from TPC-H. Twelve of their 22 texts\nwrite dates this way, and until now the parser rejected `CAST` and `::`\nwith exit code 4. S2 (`BETWEEN`) and D3\n(DECIMAL arithmetic) build on it. No query flips yet: each still stops\nat a later unsupported construct.\n\n**Parser** (`src/sql`):\n\n- `CAST(x AS T)`, `TRY_CAST(x AS T)` and `x::T` parse into one new node,\n`CastExpr`. The type name is stored\nupper-cased, with its integer parameters (`DECIMAL(15, 2)`). The node\ndoes not record which spelling was used:\n  `ToSql` writes `CAST(x AS T)`, so `x::T` round-trips to the same AST.\n- `::` binds tighter than every operator. It applies to any primary, so\n`(a + 1)::T`, `SUM(x)::T` and `x::T::U`\nwork. A minus joins a number only when no `::` follows, so `-1::INTEGER`\nis `-(CAST(1 AS INTEGER))`, as in DuckDB.\n- `CAST` stays reserved; `TRY_CAST` stays an ordinary name (`SELECT\ntry_cast FROM t` still works), as in DuckDB.\n- Exit code 4, valid in DuckDB: quoted and qualified type names,\nmulti-word types (`DOUBLE PRECISION`,\n`TIMESTAMP WITH TIME ZONE`, `CHARACTER VARYING`, ...), arrays (`[]`,\n`ARRAY`), `INTERVAL` and `UNION`, type\nparameters other than integers, a cast of an `IN` condition, a cast in\n`LIMIT`.\n- Syntax error (exit code 1), malformed: a missing `AS` or `)`, a type\nthat is not a name, empty or broken\nparameters, a bare `CAST`. Each error points at its first offending\ntoken.\n- **Depth.** The 256-level limit now also counts the levels that\n`ToSql`'s canonical form adds: one for each `::`,\nwhose canonical form is `CAST(...)`, and one for each unary minus\nwritten without parentheses (`-(...)`). This\nfixes a round-trip violation on main: `-f(f(...(a)...))` with 254 calls\nparsed, but its canonical form did not.\nThe input is now in `fuzz/regressions/negate-canonical-form-too-deep`.\nTwo older gaps of the same kind remain and\nget their own fix: a WHERE or HAVING conjunct that is a chain of about\n251 ORs (`ToSql` parenthesizes it), and NOT\nas the right operand of an operator over a deep operand (`ToSql` writes\n`(NOT ...)`).\n\n**Binder** (`src/plan/binder.cc`):\n\n- `Bind` first folds a copy of the statement (`FoldDateCasts`). Every\n`CAST('<string>' AS DATE)` without\nparameters, in any clause and at any depth, becomes the DATE literal,\nspanning the cast. DuckDB 1.5.5 treats the\nthree spellings alike and names them all `CAST('...' AS \"DATE\")`. So\neverything the binder does with a DATE\n  literal applies unchanged:\n  - comparisons, either side first;\n  - `IN` lists, `HAVING` and `CASE` values;\n  - select constants and their names;\n  - a timestamp compared with the date's midnight;\n  - constants in `GROUP BY` and `ORDER BY`;\n  - D4 and D5, and the invalid-date bind error, now at the cast.\n- `CheckSupported` rejects every other cast with exit code 4 before any\nname is resolved: `TRY_CAST` at its keyword,\nanother type or a type with parameters at the type, and any other\noperand (a column, `DATE '...'`, a cast) at the\n  operand.\n- One path reaches the binder with a cast still in it: the arguments of\na call with the wrong number of arguments.\nThat stays a bind error, as before. `ReadsColumn` and\n`ContainsAggregate` look through the cast, so the same error\ncomes first as without it. The binder's visitors mark a cast as\nunreachable (`ANTB1_CHECK`), like their other\n  unreachable nodes.\n\n**Generator, fuzzing and docs:**\n\n- A new feature `cast_date` covers both spellings, and the random\ngenerator writes some DATE literals and constants\n  as casts.\n- The spelling comes from the draw that already chose between `DATE\n'...'` and `'...'`. That draw now has a range\nof 4 × N instead of N, and its value modulo N is the old draw. So every\nseed generates the same queries as\n    before, apart from the spelling.\n- Checked over 5000 queries each for seeds 1, 7 and 20260925: 52, 70 and\n56 queries now use a cast, and none\n    differs in anything else.\n- A metamorphic relation checks that the four spellings of a date select\nthe same rows.\n- Fuzzing: dictionary entries and three seeds (`cast_date.sql`,\n`cast_operator.sql`, `cast_types.sql`).\n- `docs/sql-subset.md`: the grammar (`postfix`, cast primaries, `type`),\nthe precedence and depth rules, the lexical\nrule for `-1::T`, the binder's subset, the rejected type forms,\nconstants, the literal table, exit codes, D4 and\n  D5.\n\n**Tests:**\n\n- `parser_test`: the five old cast rejections became acceptance tests\n(AST, spans, `op_span`, `type_span`, chains,\nparenthesized operands, aggregates and `CASE` under `::`, aliases,\n`try_cast` as a column). Also:\n  - `MinusBeforeCastIsNotFoldedIntoTheNumber` and the precedence cases;\n  - every rejected neighbour above, with its kind and span;\n- the depth limit: the deepest input that still parses round-trips, and\none level more is rejected, for `::`, for\nthe unary minus, and for a minus before parentheses (which adds no\nlevel);\n  - megabyte inputs.\n- `parser_property_test`:\n- token accounting: each `::`, and each `CAST` or `TRY_CAST` followed by\n`(`, counts one cast;\n  - span checks;\n- casts in the skeleton queries, the random expressions and the token\nsoup.\n- `unparse_test`: canonical forms, the corpus round trip, and the AST\ndifferences (`TRY_CAST`, the type, the\n  parameters; never the spelling).\n- `binder_test`:\n- `Binder/Casts`: 42 error cases, kind and span. They cover every\nrejected cast in every clause, the arity paths\n    above, D4, D5, invalid dates and DATE arithmetic.\n- `DateCastsAreDateLiterals`: the same EXPLAIN as `DATE '...'` in\n`WHERE` (either side first), `IN`, `NOT IN`,\n`HAVING`, `CASE` (both forms), select constants, `GROUP BY`, `ORDER BY`,\n`EXTRACT`, `date_trunc`, aggregate\n    arguments and a timestamp comparison. Also the names and constants.\n- I checked that these tests catch 19 injected breakages of the fold and\nof the two look-through helpers: the fold\nskipping the select list, `HAVING`, `ORDER BY` or any node kind it\nwalks, folding `TRY_CAST` or a type with\n    parameters, and the literal keeping the string's span.\n- `folding_test`: the DATE constants of every spelling, either side\nfirst.\n- `tests/slt/cases/where/cast_date.slt`: comparisons, `IN` and `NOT IN`,\n`HAVING` on `MIN` and `MAX`, constants,\n`CASE`, `GROUP BY` and `ORDER BY` constants, timestamps, `EXTRACT` and\n`date_trunc`, and the empty and split\ntables. It also has invalid dates as `statement error`, plus `onlyif\nantb1` records for D4 and D5. The expected\nblocks were written by `pixi run slt-complete`; no other `.slt` file\nchanged.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full                  # on 6a7cabc\nlint: PASS\nci        100% tests passed out of 1601\nasan      100% tests passed out of 1601\ntidy      passed\ncoverage  100% tests passed out of 1601; Coverage gate: PASS\nfuzz      100% tests passed out of 2\nci-gcc    100% tests passed out of 1601\n\n$ ANTB1_DIFF_SEED=7 ANTB1_DIFF_COUNT=20000 pixi run diff-random\n                                       # on 7d6cf4a (6a7cabc adds one test and two tidy fixes)\nDIFF: PASS seed=7 queries=20000 failed=0 unsupported=0\n\n$ pixi run slt-complete && git status --short tests/slt\n?? tests/slt/cases/where/cast_date.slt    # no other .slt file changed\n\n$ pixi run antb1 query -f q.sql --table t=build/dev/fixtures/hits_like.parquet --clickbench\nEventDate >= CAST('2013-07-15' AS DATE) AND EventDate < '2013-07-16'::date   exit 0\nTRY_CAST('2013-07-15' AS DATE)                                               exit 4\nEventDate = '2013-02-30'::DATE                                               exit 1 (invalid date)\nCAST(RegionID AS BIGINT)                                                     exit 4\n\nGenerated queries before and after (local script, SQL not shown), 5000 per seed:\nseed 1: 52 spell a date as a cast; seed 7: 70; seed 20260925: 56; none differs otherwise\n```\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: none\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code implemented the\nmaintainer-approved plan. It compared the\ngenerated queries before and after locally, and a reviewer agent\nreviewed the diff.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-10-03T02:56:54+03:00",
+          "tree_id": "f5b3e5296b91d6c1485a7b890dc8e57f1d3bcbb4",
+          "url": "https://github.com/ydb-campus/antb1/commit/9fef75f95c1bd4a71810035c878c0bd06c88958a"
+        },
+        "date": 1790985541151,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 3608.842634300999,
+            "unit": "ns/iter",
+            "extra": "iterations: 194693\ncpu: 3608.6955771393946 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 82121.19436620087,
+            "unit": "ns/iter",
+            "extra": "iterations: 8165\ncpu: 82090.65217391304 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 88563.95548811533,
+            "unit": "ns/iter",
+            "extra": "iterations: 7908\ncpu: 88558.32460799192 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 286794.4461920602,
+            "unit": "ns/iter",
+            "extra": "iterations: 2416\ncpu: 286776.0865066225 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 364043.3104166914,
+            "unit": "ns/iter",
+            "extra": "iterations: 1920\ncpu: 363910.2692708336 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2091969.0628741994,
+            "unit": "ns/iter",
+            "extra": "iterations: 334\ncpu: 2091906.1047904205 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 43.8407003750001,
+            "unit": "ms/iter",
+            "extra": "iterations: 16\ncpu: 43.83190025 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 38.8411415555557,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 38.838688888888896 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 146.518340500009,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 146.51553475000023 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 11.27161254838656,
+            "unit": "ms/iter",
+            "extra": "iterations: 62\ncpu: 11.271235064516134 ms\nthreads: 1"
           }
         ]
       }
