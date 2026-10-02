@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790924053658,
+  "lastUpdate": 1790931216125,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -3648,6 +3648,90 @@ window.BENCHMARK_DATA = {
             "value": 8.700679975609695,
             "unit": "ms/iter",
             "extra": "iterations: 82\ncpu: 8.699446219512193 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "5831b8d724b24e093d9f8aec29ad0a6c35905cc2",
+          "message": "build(deps): add duckdb-extension-tpch for TPC-H-derived test data (#71)\n\n## Summary\n\nAdds the conda-forge package `duckdb-extension-tpch` (DuckDB's tpch\nextension, which contains TPC's dbgen under\nthe TPC EULA v2.2) as the source of the data derived from TPC-H. This is\nPR H1 of the roadmap for the queries\nderived from TPC-H that the maintainers approved on 2026-10-02. It\nfollows decisions C1 (this package),\nC2 (nothing derived from TPC-H is committed), C20 (check the macOS\nbuild) and C23 (accept the EULA exposure of\ninstalling dbgen, as DuckDB and DataFusion do).\n\n- **pixi.toml and pixi.lock.** `duckdb-extension-tpch = \"1.5.*\"` is a\ndependency of the default feature on Linux only\n(`[target.linux-64.dependencies]` and\n`[target.linux-aarch64.dependencies]`). I regenerated the lock with\n  pixi 0.81.0 (`pixi lock`). The diff only adds the extension, at 1.5.5:\n  - linux-64 `hd2095e1_0`, also in the `gcc` environment;\n  - linux-aarch64 `h4154aff_0`.\n\nEach build depends on exactly the libduckdb build that is already\nlocked; nothing else moves.\n- **cmake/Antb1Dependencies.cmake.** CMake finds the duckdb CLI and\nexactly one tpch extension in the prefix that\nholds libduckdb, so all three have the same DuckDB version, and sets\n`ANTB1_HAVE_TPCH`. With\n`ANTB1_WITH_DUCKDB=ON` (every preset), configure stops with\n`FATAL_ERROR` on Linux when either is missing, so\nthe TPC-H tests cannot silently disappear. On macOS they are not\nregistered (next point).\n- **tests/tpch/ (new suite), with `harness.tpch.extension` (label\n`harness`).** The test loads the unsigned extension\ninto the duckdb CLI by absolute path. DuckDB runs as everywhere in the\ntests: one thread, no extension auto-install\nor auto-load, `-no-init`. The test checks that the extension provides\nthe 22 query texts and that the output is\nexactly that count, so no query text reaches the log. The path is\nabsolute because DuckDB searches\n`~/.duckdb/extensions` before the environment (I checked with strace).\nThe extension is unsigned because\n  conda-forge cannot sign DuckDB extensions.\n- **scripts/doctor.sh.** `pixi run doctor` now reports the extension, in\nthe text and the JSON output.\n- **ADR 0006 amendment, \"Data policy for the data derived from TPC-H\".**\nIt covers:\n  - the source;\n- what is never committed or pasted: data, answers, TPC tools, and query\ntext in any dialect, fragments included;\n  - what may be committed;\n- how the data is generated: a separate, locked-down duckdb CLI process;\nthe oracle never loads extensions;\n  - redacted output with no timings;\n- naming: \"derived from TPC-H\", plus the TPC disclaimer wherever the\nworkload is described or numbers are shown.\n\nThe Context, DuckDB and hermetic bullets are updated to match. ADR 0006\nstays Accepted.\n- **Other docs.** docs/testing.md, tests/README.md and CONTRIBUTING.md\ndescribe the suite. They also say that\ninstalling the `default` or `gcc` environment, CI runners included,\ninstalls dbgen and accepts its EULA; `lint`\n  does not contain it.\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [x] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi lock\n+ (conda) duckdb-extension-tpch 1.5.5 hd2095e1_0 (linux-64, default and gcc), h6111c0a_0 (osx-arm64), h4154aff_0 (linux-aarch64)\npixi.lock | 41 +++ (nothing else changes)\n\n$ pixi run test -R '^harness\\.tpch\\.extension$'\nANTB1-TESTS: PASS preset=dev\n\n$ pixi run doctor\ntpch extension  present (.../.pixi/envs/default/duckdb/extensions/v1.5.5/linux_amd64/tpch.duckdb_extension)\n\n$ pixi run check-full          # on the final commit ed12aa7 (Linux-only extension)\nlint: PASS\nci        100% tests passed out of 1427\nasan      100% tests passed out of 1427\ntidy      passed\ncoverage  100% tests passed out of 1427; Coverage gate: PASS\nfuzz      100% tests passed out of 2\nci-gcc    100% tests passed out of 1427\nEXIT CODE: 0\n\n$ pixi run check-full          # on 36a398d (before the Linux-only change)\nlint: PASS\nci        100% tests passed out of 1427\nasan      100% tests passed out of 1427\ntidy      passed\ncoverage  100% tests passed out of 1427; Coverage gate: PASS\nfuzz      100% tests passed out of 2\nci-gcc    100% tests passed out of 1427\nEXIT CODE: 0\n```\n\n**macOS.** The first CI run showed that pixi cannot install the\nosx-arm64 build. The extension file carries a\nprefix placeholder and DuckDB's metadata trailer after its Mach-O image.\npixi must re-sign the file after replacing\nthe prefix, and signing fails on that trailer (\"failed to sign Apple\nbinary\"). Following decision C20, the\npackage is now Linux-only (ed12aa7): the lock drops only the osx-arm64\nrecord, and on macOS CMake leaves the\nTPC-H tests out instead of failing. ADR 0006, docs/testing.md,\ntests/README.md and CONTRIBUTING.md say so. A\nreport to conda-forge's duckdb feedstock is the way back to macOS. I\nhave not filed it; tell me if you want me\nto. linux-aarch64 is covered by the first nightly run after the merge.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed): `harness.tpch.extension`\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: `pixi.toml`, `pixi.lock`\n  and `cmake/` are listed in the roadmap's approvals for H1\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code found the\npackage, checked that its builds match the locked\nlibduckdb on all three platforms, wrote the change and ran the gates. A\nread-only reviewer agent found four real\n  problems, all fixed in 36a398d:\n  - the smoke test ran DuckDB with the default thread count;\n  - the docs implied that `lint` contains dbgen;\n- the testing guide's TPC-H paragraph lacked the disclaimer that the\nADR's naming rule asks for;\n  - tests/README.md and docs/testing.md did not list the new suite.\n\n  It also flagged the three protected paths for maintainer approval.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-10-02T11:50:29+03:00",
+          "tree_id": "907f3ad5c2774d23b0a1d2f1f8edc5c997decaa2",
+          "url": "https://github.com/ydb-campus/antb1/commit/5831b8d724b24e093d9f8aec29ad0a6c35905cc2"
+        },
+        "date": 1790931215398,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 3134.8706421444276,
+            "unit": "ns/iter",
+            "extra": "iterations: 223906\ncpu: 3134.6476691111448 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 73012.5130154327,
+            "unit": "ns/iter",
+            "extra": "iterations: 8682\ncpu: 72966.74844505875 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 84557.87193427754,
+            "unit": "ns/iter",
+            "extra": "iterations: 8277\ncpu: 84553.64008698807 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 375677.4313304715,
+            "unit": "ns/iter",
+            "extra": "iterations: 1864\ncpu: 375639.05418454943 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 352874.3024193453,
+            "unit": "ns/iter",
+            "extra": "iterations: 1984\ncpu: 352690.80342741916 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2186987.164086658,
+            "unit": "ns/iter",
+            "extra": "iterations: 323\ncpu: 2186718.383900928 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 42.28023841176476,
+            "unit": "ms/iter",
+            "extra": "iterations: 17\ncpu: 42.2690208823529 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 37.75306005263103,
+            "unit": "ms/iter",
+            "extra": "iterations: 19\ncpu: 37.752324736842134 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 188.42057149999647,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 188.41055974999986 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 11.666079233332974,
+            "unit": "ms/iter",
+            "extra": "iterations: 60\ncpu: 11.66533989999999 ms\nthreads: 1"
           }
         ]
       }
