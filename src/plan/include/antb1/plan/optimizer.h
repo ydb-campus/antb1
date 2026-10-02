@@ -12,11 +12,10 @@ namespace antb1::plan {
 //     (docs/adr/0018-dependent-group-keys.md): the same groups, fewer keys to hash.
 //  3. Limit below Project and Compute, so that it sits right above a Sort (top-N).
 //  4. Projection pruning: every Scan reads only the fields that the nodes above it reference
-//     (possibly none), Computes keep only the expressions used, and the column indices above them
-//     are renumbered.
-// Last, plan::ResolvePositions sets every column index from the column ids (ADR 0022); until the
-// rules work on ids, CheckPositions first verifies that their indices are those positions.
-// The result has the same output columns (and column ids) and the same answer as the input plan.
+//     (possibly none), and Computes keep only the expressions used.
+// The rules find columns by their ids and ignore the input's indices; last, plan::ResolvePositions
+// sets every index from the ids (ADR 0022). The result has the same output columns (and column
+// ids) and the same answer as the input plan.
 LogicalPlan Optimize(const LogicalPlan& plan);
 
 }  // namespace antb1::plan

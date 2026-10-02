@@ -59,6 +59,13 @@ ExprPtr Column(int index, LogicalType type = LogicalType::kSmallInt) {
       Expr{.node = ColumnExpr{.index = index}, .type = type, .name = "c"});
 }
 
+// A column of the binder's and the optimizer's plans: one with an id.
+ExprPtr ColumnWithId(std::uint32_t id, int index) {
+  return std::make_shared<const Expr>(Expr{.node = ColumnExpr{.index = index, .id = ColumnId{id}},
+                                           .type = LogicalType::kSmallInt,
+                                           .name = "c"});
+}
+
 ExprPtr Condition(int index, CompareOp op, Int128 value) {
   Predicate p{.kind = Predicate::Kind::kCompare,
               .column = BoundColumn{.index = 0, .name = "o", .type = LogicalType::kSmallInt},
@@ -86,7 +93,7 @@ ExprPtr Case(std::vector<ExprPtr> whens, std::vector<ExprPtr> thens, ExprPtr oth
 }
 
 // Structure, not names: conditions compare their predicate (kind, operator, constants) and
-// operands; CASE its branches and ELSE (a missing one too); every child is renumbered and read.
+// operands; CASE its branches and ELSE (a missing one too); every child is mapped and read.
 TEST(LogicalPlanTest, ConditionAndCaseExpressions) {
   const auto gt1 = Condition(0, CompareOp::kGt, 1);
   EXPECT_TRUE(SameExpr(*gt1, *Condition(0, CompareOp::kGt, 1)));
@@ -107,11 +114,49 @@ TEST(LogicalPlanTest, ConditionAndCaseExpressions) {
   std::vector<int> read;
   CollectColumns(*with_else, read);
   EXPECT_EQ(read, (std::vector<int>{0, 1, 2, 3}));
-  const auto renumbered = Renumber(without_else, {10, 11, 12, 13});
+  const auto mapped = MapColumns(without_else, [](ColumnExpr column) {
+    column.index += 10;
+    return column;
+  });
   read.clear();
-  CollectColumns(*renumbered, read);
+  CollectColumns(*mapped, read);
   EXPECT_EQ(read, (std::vector<int>{10, 11, 12}));
-  EXPECT_EQ(std::get<CaseExpr>(renumbered->node).otherwise, nullptr);
+  EXPECT_EQ(std::get<CaseExpr>(mapped->node).otherwise, nullptr);
+}
+
+// Columns with ids are the same column when their ids are: their positions are not compared (they
+// are set from the ids at the end of Bind and Optimize). Only columns without ids, those of the
+// executor's positional plans, compare by position; a column with an id is never one without.
+TEST(LogicalPlanTest, ColumnsAreTheSameByTheirIds) {
+  EXPECT_TRUE(SameExpr(*ColumnWithId(7, 0), *ColumnWithId(7, 3)));
+  EXPECT_FALSE(SameExpr(*ColumnWithId(7, 0), *ColumnWithId(8, 0)));
+  EXPECT_FALSE(SameExpr(*ColumnWithId(7, 0), *Column(0)));
+  EXPECT_FALSE(SameExpr(*Column(0), *ColumnWithId(7, 0)));
+  EXPECT_TRUE(SameExpr(*Column(2), *Column(2)));
+  EXPECT_FALSE(SameExpr(*Column(2), *Column(3)));
+  const auto with_ids = Case({ColumnWithId(5, 0)}, {ColumnWithId(6, 1)}, ColumnWithId(7, 2));
+  EXPECT_TRUE(
+      SameExpr(*with_ids, *Case({ColumnWithId(5, 9)}, {ColumnWithId(6, 9)}, ColumnWithId(7, 9))));
+  EXPECT_FALSE(
+      SameExpr(*with_ids, *Case({ColumnWithId(5, 0)}, {ColumnWithId(6, 1)}, ColumnWithId(8, 2))));
+}
+
+// The ids of what an expression reads: a PredicateExpr's operands, never the operand-local columns
+// of its predicate (which have no id).
+TEST(LogicalPlanTest, CollectsTheIdsAnExpressionReads) {
+  Predicate p{.kind = Predicate::Kind::kCompareColumns,
+              .column = BoundColumn{.index = 0, .name = "o", .type = LogicalType::kSmallInt},
+              .other = BoundColumn{.index = 1, .name = "p", .type = LogicalType::kSmallInt},
+              .op = CompareOp::kLt,
+              .span = {}};
+  const auto condition = std::make_shared<const Expr>(
+      Expr{.node = PredicateExpr{.predicate = std::move(p),
+                                 .operands = {ColumnWithId(4, 0), ColumnWithId(9, 1)}},
+           .type = LogicalType::kBoolean,
+           .name = "p"});
+  std::vector<ColumnId> ids;
+  CollectColumnIds(*Case({condition}, {ColumnWithId(2, 5)}, ColumnWithId(4, 0)), ids);
+  EXPECT_EQ(ids, (std::vector<ColumnId>{ColumnId{4}, ColumnId{9}, ColumnId{2}, ColumnId{4}}));
 }
 
 TEST(LogicalPlanTest, FunctionAndTypeNames) {

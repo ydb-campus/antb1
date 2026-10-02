@@ -1697,8 +1697,122 @@ TEST(BinderTest, DuplicateRegistrationFails) {
   EXPECT_TRUE(catalog.Register("x", nullptr).IsInvalid());
 }
 
-// Every column a bound plan creates has its own id, and the binder's positions are the positions of
-// the ids (ADR 0022).
+// The double constants of the comparisons of every Filter, from the root down.
+std::vector<double> FilterConstants(const LogicalPlan& plan) {
+  std::vector<double> out;
+  for (const LogicalNode* node = plan.root.get(); node != nullptr;) {
+    if (const auto* filter = std::get_if<FilterNode>(node)) {
+      for (const Predicate& p : filter->predicates) {
+        if (const auto* value = std::get_if<double>(&p.constant.value)) {
+          out.push_back(*value);
+        }
+      }
+    }
+    const LogicalNodePtr* input = InputOf(*node);
+    node = input == nullptr ? nullptr : input->get();
+  }
+  return out;
+}
+
+// A FLOAT column (read as DOUBLE) compares with a number as DuckDB compares a FLOAT, and DuckDB's
+// MIN and MAX of it are FLOAT (divergence D11). The binder finds a column's field by the column's
+// id, also for a GROUP BY key (whose output column is no field) and an alias. With f at field 0, a
+// position read as a field number would make the other columns FLOAT too.
+TEST(BinderTest, FloatColumnsByColumnId) {
+  Catalog catalog;
+  ASSERT_TRUE(catalog
+                  .Register("tf", std::make_shared<FakeTable>(
+                                      arrow::schema({arrow::field("f", arrow::float32()),
+                                                     arrow::field("d", arrow::float64()),
+                                                     arrow::field("k", arrow::int32())}),
+                                      10, std::vector<int>{0}))
+                  .ok());
+  const auto as_float = static_cast<double>(0.1F);
+  ASSERT_NE(as_float, 0.1);
+  for (const auto& [sql, constants] : {
+           std::pair{"SELECT COUNT(*) FROM tf WHERE f = 0.1 AND d = 0.1",
+                     std::vector<double>{as_float, 0.1}},
+           std::pair{"SELECT MIN(f), MAX(d) FROM tf HAVING MIN(f) = 0.1 AND MAX(d) = 0.1",
+                     std::vector<double>{as_float, 0.1}},
+           std::pair{"SELECT MAX(f) AS m, MIN(d) AS n FROM tf HAVING m = 0.1 AND n = 0.1",
+                     std::vector<double>{as_float, 0.1}},
+           std::pair{"SELECT f, d, COUNT(*) FROM tf GROUP BY f, d HAVING f = 0.1 AND d = 0.1",
+                     std::vector<double>{as_float, 0.1}},
+           std::pair{"SELECT f AS g, k, COUNT(*) FROM tf GROUP BY f, k HAVING g = 0.1",
+                     std::vector<double>{as_float}},
+           std::pair{"SELECT MIN(d + 1), SUM(f) FROM tf HAVING MIN(d + 1) = 0.1 AND SUM(f) = 0.1",
+                     std::vector<double>{0.1, 0.1}},
+       }) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    EXPECT_EQ(FilterConstants(*plan), constants) << sql;
+  }
+  for (const char* sql : {"SELECT f + 1 FROM tf", "SELECT -f FROM tf"}) {
+    const auto plan = BindSql(sql, catalog);
+    ASSERT_FALSE(plan.ok()) << sql;
+    const auto detail = GetSqlError(plan.status());
+    ASSERT_NE(detail, nullptr) << sql;
+    EXPECT_EQ(detail->kind(), SqlErrorDetail::Kind::kUnsupported) << sql;
+  }
+}
+
+// ORDER BY a select item by name, alias or position: a column already ordered by is no key again,
+// whichever way it is named; a computed item is its computed column.
+TEST(BinderTest, OrderByComputedItemsByColumnId) {
+  const Catalog catalog = MakeCatalog();
+  auto plan = BindSql("SELECT i16 + 1 AS x, i16 FROM t ORDER BY i16, x, 1, 2, i16 + 1", catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  const auto& sort = std::get<SortNode>(Nth(*plan, 1));
+  ASSERT_EQ(sort.keys.size(), 2U);
+  EXPECT_EQ(sort.keys[0].column.name, "i16");
+  EXPECT_EQ(sort.keys[0].column.index, 0);  // the Scan's field i16
+  const auto& compute = std::get<ComputeNode>(Nth(*plan, 2));
+  ASSERT_EQ(compute.ids.size(), 1U);
+  EXPECT_EQ(sort.keys[1].column.id, compute.ids[0]);
+  EXPECT_EQ(sort.keys[1].column.name, "x");  // a computed column, not field 0
+  EXPECT_EQ(sort.keys[1].column.index, 11);  // after the 11 fields
+}
+
+// Aggregates with the same kind are the same call when their arguments are the same column: MAX of
+// a field and MAX of an expression of it are two calls, each reused by ORDER BY.
+TEST(BinderTest, AggregatesOfAFieldAndOfAnExpressionDiffer) {
+  const Catalog catalog = MakeCatalog();
+  auto plan =
+      BindSql("SELECT s, MAX(i16), MAX(i16 + 1) FROM t GROUP BY s ORDER BY MAX(i16 + 1), MAX(i16)",
+              catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  const auto& sort = std::get<SortNode>(Nth(*plan, 1));
+  const auto& group = std::get<GroupAggregateNode>(Nth(*plan, 2));
+  ASSERT_EQ(group.aggregates.size(), 2U);
+  ASSERT_EQ(sort.keys.size(), 2U);
+  EXPECT_EQ(sort.keys[0].column.id, group.aggregates[1].id);
+  EXPECT_EQ(sort.keys[0].column.index, 2);
+  EXPECT_EQ(sort.keys[1].column.id, group.aggregates[0].id);
+  EXPECT_EQ(sort.keys[1].column.index, 1);
+}
+
+// In a HAVING condition with OR, the alias of an item computed over the aggregation is the item's
+// expression, computed again inside the condition: a Compute's expressions read only its input.
+TEST(BinderTest, HavingAliasOfAComputedItemInsideOr) {
+  const Catalog catalog = MakeCatalog();
+  auto plan = BindSql(
+      "SELECT i16, CASE WHEN COUNT(*) > 1 THEN 'many' END AS size FROM t GROUP BY i16 "
+      "HAVING size = 'many' OR size = 'few'",
+      catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  const auto& compute = std::get<ComputeNode>(Nth(*plan, 2));
+  ASSERT_EQ(compute.exprs.size(), 2U);  // the CASE item and the condition
+  const auto& condition = std::get<BoolExpr>(compute.exprs[1]->node);
+  ASSERT_EQ(condition.args.size(), 2U);
+  for (const ExprPtr& arg : condition.args) {
+    const auto& predicate = std::get<PredicateExpr>(arg->node);
+    ASSERT_EQ(predicate.operands.size(), 1U);
+    EXPECT_TRUE(std::holds_alternative<CaseExpr>(predicate.operands[0]->node));
+  }
+}
+
+// Every column a bound plan creates has its own id, and Bind resolves every position from the ids
+// (ADR 0022).
 TEST(BinderTest, ColumnIdsAreUniqueAndResolve) {
   const auto catalog = MakeCatalog();
   constexpr const char* kGrouped =

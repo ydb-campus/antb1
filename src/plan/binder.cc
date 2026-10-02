@@ -874,8 +874,17 @@ class Columns {
   // The column of field `index`.
   [[nodiscard]] ColumnId Id(int index) const { return ids_.at(Narrow<std::size_t>(index)); }
 
-  // The column as an index into the Scan's output (the binder's Scan reads every field in schema
-  // order, so this is the field index).
+  // The field that column `id` is, if it is one (and not a computed column).
+  [[nodiscard]] std::optional<int> FieldOf(ColumnId id) const {
+    const auto it = std::ranges::find(ids_, id);
+    if (it == ids_.end()) {
+      return std::nullopt;
+    }
+    return Narrow<int>(it - ids_.begin());
+  }
+
+  // The column of the field that `ref` names, by its id (plan::ResolvePositions sets its position
+  // at the end).
   [[nodiscard]] arrow::Result<BoundColumn> Resolve(const sql::ColumnRef& ref) const {
     const std::string wanted = AsciiLower(ref.name);
     std::optional<int> found;
@@ -908,7 +917,7 @@ class Columns {
                                           field->type()->ToString()),
                               span);
     }
-    return BoundColumn{.index = index, .id = Id(index), .name = field->name(), .type = *type};
+    return BoundColumn{.id = Id(index), .name = field->name(), .type = *type};
   }
 
  private:
@@ -1296,10 +1305,9 @@ Typed Leaf(Expr expr, bool stored_as_float = false) {
                .stored_as_float = stored_as_float};
 }
 
-Typed ColumnLeaf(int index, ColumnId id, LogicalType type, std::string name, bool stored_as_float) {
-  return Leaf(
-      Expr{.node = ColumnExpr{.index = index, .id = id}, .type = type, .name = std::move(name)},
-      stored_as_float);
+Typed ColumnLeaf(ColumnId id, LogicalType type, std::string name, bool stored_as_float) {
+  return Leaf(Expr{.node = ColumnExpr{.id = id}, .type = type, .name = std::move(name)},
+              stored_as_float);
 }
 
 // The rank of an integer type among the signed ones (USMALLINT: none).
@@ -1604,7 +1612,7 @@ bool SameCall(const AggregateCall& a, const AggregateCall& b) {
   if (a.kind != b.kind || a.arg.has_value() != b.arg.has_value()) {
     return false;
   }
-  return !a.arg.has_value() || a.arg->index == b.arg->index;
+  return !a.arg.has_value() || a.arg->id == b.arg->id;
 }
 
 // The select item (0-based) that a GROUP BY or ORDER BY literal refers to: an integer is a position
@@ -1649,12 +1657,6 @@ bool IsAggregateQuery(const sql::SelectStatement& stmt) {
   });
 }
 
-// Computed columns are numbered from these bases until the plan is assembled: those of the Compute
-// after the WHERE filter (from kPreBase; the WHERE operands' Compute comes first) and those of the
-// Compute above the aggregation (from kPostBase), whose inputs' widths are only known then.
-constexpr int kPreBase = 4 * 1024 * 1024;
-constexpr int kPostBase = 16 * 1024 * 1024;
-
 class Binder {
  public:
   Binder(const sql::SelectStatement& stmt, std::shared_ptr<Table> table, ColumnIdSource& ids)
@@ -1662,7 +1664,6 @@ class Binder {
         table_(std::move(table)),
         schema_(*table_->schema()),
         columns_(schema_, ids),
-        width_(schema_.num_fields()),
         ids_(ids) {}
 
   arrow::Result<LogicalPlan> Bind();
@@ -1681,8 +1682,8 @@ class Binder {
         }
       }
       ARROW_ASSIGN_OR_RAISE(BoundColumn column, std::move(resolved));
-      return ColumnLeaf(column.index, column.id, column.type, ArgumentName(ref.name),
-                        binder.table_->StoredAsFloat(column.index));
+      return ColumnLeaf(column.id, column.type, ArgumentName(ref.name),
+                        binder.StoredAsFloat(column.id));
     }
     arrow::Result<Typed> operator()(const sql::Literal& lit) const { return LiteralOperand(lit); }
     arrow::Result<Typed> operator()(const sql::AggregateCall& call) const {
@@ -1835,11 +1836,10 @@ class Binder {
   BoundColumn InputColumn(const Typed& t, bool where = false) {
     if (const auto* column = std::get_if<ColumnExpr>(&t.expr->node)) {
       // A table field is named as declared; a computed column (a select item) by its expression.
-      return BoundColumn{
-          .index = column->index,
-          .id = column->id,
-          .name = column->index < width_ ? schema_.field(column->index)->name() : t.expr->name,
-          .type = t.expr->type};
+      const std::optional<int> field = columns_.FieldOf(column->id);
+      return BoundColumn{.id = column->id,
+                         .name = field.has_value() ? schema_.field(*field)->name() : t.expr->name,
+                         .type = t.expr->type};
     }
     std::vector<ExprPtr>& exprs = where ? where_exprs_ : input_exprs_;
     std::vector<ColumnId>& ids = where ? where_ids_ : input_ids_;
@@ -1850,10 +1850,7 @@ class Binder {
       exprs.push_back(t.expr);
       ids.push_back(ids_.Next());
     }
-    return BoundColumn{.index = (where ? width_ : kPreBase) + Narrow<int>(k),
-                       .id = ids[k],
-                       .name = t.expr->name,
-                       .type = t.expr->type};
+    return BoundColumn{.id = ids[k], .name = t.expr->name, .type = t.expr->type};
   }
 
   // An aggregate call with its argument bound in the input scope (computed when not a column).
@@ -1863,9 +1860,6 @@ class Binder {
       return bound;
     }
     ARROW_ASSIGN_OR_RAISE(const Typed arg, BindInput(**call.arg));
-    if (arg.stored_as_float) {
-      float_args_.push_back(InputColumn(arg).index);
-    }
     BoundColumn column = InputColumn(arg);
     if (call.arg_column() == nullptr) {
       column.name = arg.expr->name;
@@ -1964,12 +1958,30 @@ class Binder {
       select_.aggregates.push_back(std::move(bound));
     }
     const AggregateCall& agg = select_.aggregates[index];
-    // DuckDB's MIN and MAX of a FLOAT column are FLOAT; the other aggregates are not.
-    const bool is_float = (agg.kind == AggKind::kMin || agg.kind == AggKind::kMax) &&
-                          agg.arg.has_value() &&
-                          std::ranges::find(float_args_, agg.arg->index) != float_args_.end();
-    return ColumnLeaf(Narrow<int>(keys_.size() + index), agg.id, agg.type, ResultName(call),
-                      is_float);
+    return ColumnLeaf(agg.id, agg.type, ResultName(call), FloatResult(agg));
+  }
+
+  // Whether column `id` is a table field stored as FLOAT (read as DOUBLE, divergence D11).
+  [[nodiscard]] bool StoredAsFloat(ColumnId id) const {
+    const std::optional<int> field = columns_.FieldOf(id);
+    return field.has_value() && table_->StoredAsFloat(*field);
+  }
+
+  // DuckDB's MIN and MAX of a FLOAT column are FLOAT; the other aggregates are not.
+  [[nodiscard]] bool FloatResult(const AggregateCall& agg) const {
+    return (agg.kind == AggKind::kMin || agg.kind == AggKind::kMax) && agg.arg.has_value() &&
+           StoredAsFloat(agg.arg->id);
+  }
+
+  // The GROUP BY key that is table column `id`, if one is.
+  [[nodiscard]] std::optional<std::size_t> KeyOf(ColumnId id) const {
+    for (std::size_t k = 0; k < key_exprs_.size(); ++k) {
+      const auto* key = std::get_if<ColumnExpr>(&key_exprs_[k]->node);
+      if (key != nullptr && key->id == id) {
+        return k;
+      }
+    }
+    return std::nullopt;
   }
 
   static arrow::Status NotGrouped(std::string_view name, SourceSpan span) {
@@ -2028,7 +2040,7 @@ class Binder {
       if (input.ok()) {
         for (std::size_t k = 0; k < key_exprs_.size(); ++k) {
           if (SameExpr(*input->expr, *key_exprs_[k])) {
-            return ColumnLeaf(Narrow<int>(k), key_ids_[k], keys_[k].type, input->expr->name,
+            return ColumnLeaf(key_ids_[k], keys_[k].type, input->expr->name,
                               input->stored_as_float);
           }
         }
@@ -2041,8 +2053,7 @@ class Binder {
   // above the aggregation (once).
   BoundColumn OutputColumn(const Typed& t) {
     if (const auto* column = std::get_if<ColumnExpr>(&t.expr->node)) {
-      return BoundColumn{
-          .index = column->index, .id = column->id, .name = t.expr->name, .type = t.expr->type};
+      return BoundColumn{.id = column->id, .name = t.expr->name, .type = t.expr->type};
     }
     const auto same =
         std::ranges::find_if(post_exprs_, [&](const ExprPtr& e) { return SameExpr(*e, *t.expr); });
@@ -2051,10 +2062,7 @@ class Binder {
       post_exprs_.push_back(t.expr);
       post_ids_.push_back(ids_.Next());
     }
-    return BoundColumn{.index = kPostBase + Narrow<int>(k),
-                       .id = post_ids_[k],
-                       .name = t.expr->name,
-                       .type = t.expr->type};
+    return BoundColumn{.id = post_ids_[k], .name = t.expr->name, .type = t.expr->type};
   }
 
   // An expression of the select list, HAVING or ORDER BY in the query's scope: the input scope of a
@@ -2154,20 +2162,12 @@ class Binder {
 
   bool alias_fallback_ = false;  // binding an ORDER BY or HAVING expression
 
-  // The column of an output reference once the aggregation's output width is known.
-  static void Place(BoundColumn& column, int width) {
-    if (column.index >= kPostBase) {
-      column.index = width + (column.index - kPostBase);
-    }
-  }
-
   LogicalPlan Assemble();
 
   const sql::SelectStatement& stmt_;
   std::shared_ptr<Table> table_;
   const arrow::Schema& schema_;
   Columns columns_;
-  int width_;  // the Scan's output: every table field
   ColumnIdSource& ids_;
   SelectList select_;
   Shape shape_ = Shape::kProjection;
@@ -2175,7 +2175,6 @@ class Binder {
   std::vector<ColumnId> where_ids_;      // per WHERE operand: its column
   std::vector<ExprPtr> input_exprs_;     // computed after the WHERE filter on computed columns
   std::vector<ColumnId> input_ids_;      // per input expression: its column
-  std::vector<int> float_args_;          // input columns holding FLOAT values
   std::vector<Predicate> scan_filter_;   // WHERE over the Scan's columns
   std::vector<Predicate> input_filter_;  // WHERE over computed columns
   std::vector<BoundColumn> keys_;        // GROUP BY keys, as columns of the input
@@ -2737,8 +2736,9 @@ arrow::Status Binder::BindWhere() {
       continue;
     }
     ARROW_ASSIGN_OR_RAISE(Predicate predicate, BindCondition(*conjunct, /*having=*/false));
-    const bool on_scan = (!predicate.column.has_value() || predicate.column->index < width_) &&
-                         (!predicate.other.has_value() || predicate.other->index < width_);
+    const bool on_scan =
+        (!predicate.column.has_value() || columns_.FieldOf(predicate.column->id).has_value()) &&
+        (!predicate.other.has_value() || columns_.FieldOf(predicate.other->id).has_value());
     (on_scan ? scan_filter_ : input_filter_).push_back(std::move(predicate));
   }
   return arrow::Status::OK();
@@ -2770,7 +2770,7 @@ arrow::Status Binder::BindGroupBy() {
         break;
       case ItemKind::kColumn: {
         const BoundColumn& column = select_.columns[index];
-        add(ColumnLeaf(column.index, column.id, column.type, column.name, false));
+        add(ColumnLeaf(column.id, column.type, column.name, false));
         break;
       }
       case ItemKind::kExpression: {
@@ -2799,7 +2799,7 @@ arrow::Status Binder::BindGroupBy() {
     if (const auto* ref = std::get_if<sql::ColumnRef>(&expr)) {
       auto column = columns_.Resolve(*ref);
       if (column.ok()) {
-        add(ColumnLeaf(column->index, column->id, column->type, column->name, false));
+        add(ColumnLeaf(column->id, column->type, column->name, false));
         continue;
       }
       const auto detail = GetSqlError(column.status());
@@ -2815,8 +2815,8 @@ arrow::Status Binder::BindGroupBy() {
       continue;
     }
     ARROW_ASSIGN_OR_RAISE(const Typed t, BindInput(expr));
-    std::vector<int> reads;
-    CollectColumns(*t.expr, reads);
+    std::vector<ColumnId> reads;
+    CollectColumnIds(*t.expr, reads);
     if (reads.empty()) {
       return UnsupportedError("GROUP BY a constant expression is not supported", expr.span());
     }
@@ -2828,12 +2828,7 @@ arrow::Status Binder::BindGroupBy() {
 // Every plain column of a grouped select list must be a key (as in DuckDB).
 arrow::Status Binder::CheckGrouped() {
   for (std::size_t i = 0; i < select_.columns.size(); ++i) {
-    const Expr column{.node = ColumnExpr{.index = select_.columns[i].index},
-                      .type = select_.columns[i].type,
-                      .name = {}};
-    const bool key =
-        std::ranges::any_of(key_exprs_, [&](const ExprPtr& k) { return SameExpr(*k, column); });
-    if (!key) {
+    if (!KeyOf(select_.columns[i].id).has_value()) {
       return BindError(std::format("column '{}' must appear in the GROUP BY clause or be inside an "
                                    "aggregate function",
                                    select_.column_written[i]),
@@ -2869,27 +2864,22 @@ arrow::Result<std::optional<Typed>> Binder::ItemOutput(std::size_t i) {
     case ItemKind::kConstant:
       return std::nullopt;
     case ItemKind::kAggregate:
-      return std::optional(ColumnLeaf(Narrow<int>(keys_.size() + index),
-                                      select_.aggregates[index].id, select_.aggregates[index].type,
+      return std::optional(ColumnLeaf(select_.aggregates[index].id, select_.aggregates[index].type,
                                       select_.output[i].name, false));
     case ItemKind::kExpression: {
       const BoundColumn& column = select_.expr_columns[index];
-      return std::optional(ColumnLeaf(column.index, column.id, column.type, column.name, false));
+      return std::optional(ColumnLeaf(column.id, column.type, column.name, false));
     }
     case ItemKind::kColumn:
       break;
   }
   const BoundColumn& column = select_.columns[index];
   if (shape_ == Shape::kProjection) {
-    return std::optional(ColumnLeaf(column.index, column.id, column.type, column.name,
-                                    table_->StoredAsFloat(column.index)));
+    return std::optional(ColumnLeaf(column.id, column.type, column.name, StoredAsFloat(column.id)));
   }
-  for (std::size_t k = 0; k < key_exprs_.size(); ++k) {
-    const auto* key = std::get_if<ColumnExpr>(&key_exprs_[k]->node);
-    if (key != nullptr && key->index == column.index) {
-      return std::optional(ColumnLeaf(Narrow<int>(k), key_ids_[k], column.type, column.name,
-                                      table_->StoredAsFloat(column.index)));
-    }
+  if (const std::optional<std::size_t> k = KeyOf(column.id)) {
+    return std::optional(
+        ColumnLeaf(key_ids_[*k], column.type, column.name, StoredAsFloat(column.id)));
   }
   return NotGrouped(select_.column_written[index], select_.column_spans[index]);
 }
@@ -2900,13 +2890,9 @@ arrow::Result<std::optional<Typed>> Binder::ItemOutput(std::size_t i) {
 arrow::Result<std::optional<Typed>> Binder::ResolveHavingName(const sql::ColumnRef& ref) {
   auto table_column = columns_.Resolve(ref);
   if (table_column.ok()) {
-    for (std::size_t k = 0; k < key_exprs_.size(); ++k) {
-      const auto* key = std::get_if<ColumnExpr>(&key_exprs_[k]->node);
-      if (key != nullptr && key->index == table_column->index) {
-        return std::optional(ColumnLeaf(Narrow<int>(k), key_ids_[k], table_column->type,
-                                        table_column->name,
-                                        table_->StoredAsFloat(table_column->index)));
-      }
+    if (const std::optional<std::size_t> k = KeyOf(table_column->id)) {
+      return std::optional(ColumnLeaf(key_ids_[*k], table_column->type, table_column->name,
+                                      StoredAsFloat(table_column->id)));
     }
   }
   const auto alias = FindAlias(select_, ref.name);
@@ -2919,10 +2905,7 @@ arrow::Result<std::optional<Typed>> Binder::ResolveHavingName(const sql::ColumnR
   ARROW_ASSIGN_OR_RAISE(auto item, ItemOutput(*alias));
   if (item.has_value() && select_.items[*alias].first == ItemKind::kAggregate) {
     // DuckDB's MIN and MAX of a FLOAT column are FLOAT.
-    const AggregateCall& agg = select_.aggregates[select_.items[*alias].second];
-    item->stored_as_float = (agg.kind == AggKind::kMin || agg.kind == AggKind::kMax) &&
-                            agg.arg.has_value() &&
-                            std::ranges::find(float_args_, agg.arg->index) != float_args_.end();
+    item->stored_as_float = FloatResult(select_.aggregates[select_.items[*alias].second]);
   }
   return item;
 }
@@ -2937,8 +2920,10 @@ arrow::Status Binder::BindHaving() {
       ARROW_ASSIGN_OR_RAISE(auto resolved, ResolveHavingName(*ref));
       if (resolved.has_value()) {
         const auto* column = std::get_if<ColumnExpr>(&resolved->expr->node);
-        if (column != nullptr && column->index >= kPostBase) {
-          resolved->expr = post_exprs_.at(Narrow<std::size_t>(column->index - kPostBase));
+        const auto post =
+            column == nullptr ? post_ids_.end() : std::ranges::find(post_ids_, column->id);
+        if (post != post_ids_.end()) {
+          resolved->expr = post_exprs_.at(Narrow<std::size_t>(post - post_ids_.begin()));
         }
         return *std::move(resolved);
       }
@@ -2987,8 +2972,8 @@ arrow::Status Binder::BindOrderBy() {
         post_ids_.resize(posts);
         continue;
       }
-      std::vector<int> reads;
-      CollectColumns(*t.expr, reads);
+      std::vector<ColumnId> reads;
+      CollectColumnIds(*t.expr, reads);
       if (reads.empty()) {
         return UnsupportedError("ORDER BY a constant expression is not supported",
                                 item.expr.span());
@@ -2999,8 +2984,8 @@ arrow::Status Binder::BindOrderBy() {
       continue;
     }
     const BoundColumn column = ScopedColumn(*key);
-    const bool repeated = std::ranges::any_of(
-        sort_keys_, [&](const SortKey& k) { return k.column.index == column.index; });
+    const bool repeated =
+        std::ranges::any_of(sort_keys_, [&](const SortKey& k) { return k.column.id == column.id; });
     if (!repeated) {
       sort_keys_.push_back(SortKey{.column = column,
                                    .descending = item.descending,
@@ -3038,7 +3023,7 @@ LogicalPlan Binder::Assemble() {
                 .fields = {},
                 .ids = {},
                 .span = stmt_.from.span};
-  for (int i = 0; i < width_; ++i) {
+  for (int i = 0; i < schema_.num_fields(); ++i) {
     scan.fields.push_back(i);
     scan.ids.push_back(columns_.Id(i));
   }
@@ -3058,48 +3043,13 @@ LogicalPlan Binder::Assemble() {
     node = Make(FilterNode{
         .input = std::move(node), .predicates = std::move(input_filter_), .span = where_span});
   }
-  // The computed columns after the WHERE filter follow the WHERE operands'.
-  const int pre = width_ + Narrow<int>(where_exprs_.size());
-  const auto place_pre = [pre](BoundColumn& column) {
-    if (column.index >= kPreBase && column.index < kPostBase) {
-      column.index = pre + (column.index - kPreBase);
-    }
-  };
-  for (AggregateCall& call : select_.aggregates) {
-    if (call.arg.has_value()) {
-      place_pre(*call.arg);
-    }
-  }
-  for (BoundColumn& key : keys_) {
-    place_pre(key);
-  }
-  for (BoundColumn& column : select_.expr_columns) {
-    place_pre(column);
-  }
-  for (SortKey& key : sort_keys_) {
-    place_pre(key.column);
-  }
   if (!input_exprs_.empty()) {
     node = Make(ComputeNode{
         .input = std::move(node), .exprs = input_exprs_, .ids = input_ids_, .span = select_.span});
   }
   // Over the aggregation: computed columns, HAVING, the Sort, then a Project restores the select
-  // order; `width` is the aggregation's output.
-  const auto above = [&](int width) {
-    for (Predicate& p : having_) {
-      if (p.column.has_value()) {
-        Place(*p.column, width);
-      }
-      if (p.other.has_value()) {
-        Place(*p.other, width);
-      }
-    }
-    for (SortKey& key : sort_keys_) {
-      Place(key.column, width);
-    }
-    for (BoundColumn& column : select_.expr_columns) {
-      Place(column, width);
-    }
+  // order.
+  const auto above = [&] {
     if (!post_exprs_.empty()) {
       node = Make(ComputeNode{
           .input = std::move(node), .exprs = post_exprs_, .ids = post_ids_, .span = select_.span});
@@ -3115,10 +3065,10 @@ LogicalPlan Binder::Assemble() {
           .input = std::move(node), .keys = std::move(sort_keys_), .span = stmt_.order_by_span});
     }
   };
-  // The select list over the node below it: a column (at the position and with the id that
-  // `column_of` gives in that node), an aggregate (at `first_aggregate` + its index), a constant or
-  // a (computed) expression. Every output column is a new column.
-  const auto project = [&](const auto& column_of, std::size_t first_aggregate) {
+  // The select list over the node below it: a table column (the column that `column_of` gives
+  // for it in that node), an aggregate (its call's column), a constant or a (computed) expression.
+  // Every output column is a new column.
+  const auto project = [&](const auto& column_of) {
     ProjectNode out{
         .input = std::move(node), .columns = {}, .constants = {}, .ids = {}, .span = select_.span};
     for (std::size_t i = 0; i < select_.items.size(); ++i) {
@@ -3129,22 +3079,17 @@ LogicalPlan Binder::Assemble() {
                          .name = select_.output[i].name,
                          .type = select_.output[i].type};
       switch (kind) {
-        case ItemKind::kColumn: {
-          const auto [position, id] = column_of(select_.columns[index]);
-          column.index = position;
-          column.id = id;
+        case ItemKind::kColumn:
+          column.id = column_of(select_.columns[index].id);
           column.name = select_.columns[index].name;
           break;
-        }
         case ItemKind::kAggregate:
-          column.index = Narrow<int>(first_aggregate + index);
           column.id = select_.aggregates[index].id;
           break;
         case ItemKind::kConstant:
           constant = select_.constants[index];
           break;
         case ItemKind::kExpression:
-          column.index = select_.expr_columns[index].index;
           column.id = select_.expr_columns[index].id;
           break;
       }
@@ -3162,46 +3107,32 @@ LogicalPlan Binder::Assemble() {
     case Shape::kGrouped: {
       // GroupAggregate outputs the keys, then the aggregates (hidden HAVING and ORDER BY ones
       // last).
-      const std::size_t key_count = keys_.size();
-      const std::vector<ExprPtr> key_exprs = key_exprs_;
-      const std::vector<ColumnId> key_ids = key_ids_;
-      const int width = Narrow<int>(keys_.size() + select_.aggregates.size());
       node = Make(GroupAggregateNode{.input = std::move(node),
                                      .keys = std::move(keys_),
                                      .key_ids = key_ids_,
                                      .aggregates = select_.aggregates,
                                      .span = stmt_.group_by_span});
-      above(width);
-      // A plain column is the key it groups by (CheckGrouped).
-      project(
-          [&](const BoundColumn& column) {
-            const auto key = std::ranges::find_if(key_exprs, [&](const ExprPtr& k) {
-              const auto* c = std::get_if<ColumnExpr>(&k->node);
-              return c != nullptr && c->index == column.index;
-            });
-            const auto k = Narrow<std::size_t>(key - key_exprs.begin());
-            return std::pair(Narrow<int>(k), key_ids.at(k));
-          },
-          key_count);
+      above();
+      // A plain column is the key it groups by (CheckGrouped made sure there is one).
+      project([&](ColumnId field) { return key_ids_.at(KeyOf(field).value_or(key_ids_.size())); });
       break;
     }
     case Shape::kProjection:
-      above(0);
-      project([](const BoundColumn& column) { return std::pair(column.index, column.id); }, 0);
+      above();
+      project([](ColumnId field) { return field; });
       break;
     case Shape::kGlobal: {
       const bool hidden =
           select_.aggregates.size() >
           static_cast<std::size_t>(std::ranges::count_if(
               select_.items, [](const auto& item) { return item.first == ItemKind::kAggregate; }));
-      const int width = Narrow<int>(select_.aggregates.size());
       node = Make(AggregateNode{
           .input = std::move(node), .aggregates = select_.aggregates, .span = select_.span});
-      above(width);
+      above();
       // A Project restores the select list when the Aggregate's output is not it (constants,
       // expressions, hidden aggregates, or columns computed for HAVING).
       if (!select_.constants.empty() || !select_.exprs.empty() || hidden || !post_exprs_.empty()) {
-        project([](const BoundColumn& column) { return std::pair(column.index, column.id); }, 0);
+        project([](ColumnId column) { return column; });
       } else {
         for (std::size_t i = 0; i < select_.items.size(); ++i) {
           select_.output[i].id = select_.aggregates[select_.items[i].second].id;  // the call itself
@@ -3222,7 +3153,7 @@ LogicalPlan Binder::Assemble() {
         LimitNode{.input = std::move(node), .limit = stmt_.limit, .offset = offset, .span = span});
   }
   // The output ids were recorded where the columns were made (the Project, or the Aggregate's
-  // calls): CheckPositions compares them with what the root outputs.
+  // calls); ResolvePositions checks them against what the root outputs.
   return LogicalPlan{.root = std::move(node), .output = std::move(select_.output)};
 }
 
@@ -3259,8 +3190,7 @@ arrow::Result<LogicalPlan> Bind(const sql::SelectStatement& stmt, const Catalog&
   ColumnIdSource ids;
   Binder binder(stmt, std::move(table), ids);
   ARROW_ASSIGN_OR_RAISE(LogicalPlan plan, binder.Bind());
-  CheckPositions(plan);  // the binder's positions are the positions of the ids (ADR 0022, P1)
-  return plan;
+  return ResolvePositions(plan);  // the binder refers to columns by id (ADR 0022)
 }
 
 }  // namespace antb1::plan

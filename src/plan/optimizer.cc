@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cstddef>
 #include <format>
+#include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <utility>
 #include <variant>
@@ -14,7 +16,8 @@
 #include "antb1/plan/logical_plan.h"
 
 // Every std::visit below uses a visitor with one overload per node type, so a new node type fails
-// to compile until each rule handles it.
+// to compile until each rule handles it. The rules find columns by their ids and never read or set
+// a position: plan::ResolvePositions sets every position at the end (ADR 0022).
 
 namespace antb1::plan {
 namespace {
@@ -43,26 +46,6 @@ struct WithInput {
   LogicalNodePtr operator()(const LimitNode& node) const { return Replace(node); }
   LogicalNodePtr operator()(const RowCountNode& node) const { return Make(node); }
 };
-
-std::size_t OutputWidth(const LogicalNode& node);
-
-struct OutputWidthOf {
-  std::size_t operator()(const ScanNode& node) const { return node.fields.size(); }
-  std::size_t operator()(const FilterNode& node) const { return OutputWidth(*node.input); }
-  std::size_t operator()(const ComputeNode& node) const {
-    return OutputWidth(*node.input) + node.exprs.size();
-  }
-  std::size_t operator()(const ProjectNode& node) const { return node.columns.size(); }
-  std::size_t operator()(const AggregateNode& node) const { return node.aggregates.size(); }
-  std::size_t operator()(const GroupAggregateNode& node) const {
-    return node.keys.size() + node.aggregates.size();
-  }
-  std::size_t operator()(const SortNode& node) const { return OutputWidth(*node.input); }
-  std::size_t operator()(const LimitNode& node) const { return OutputWidth(*node.input); }
-  std::size_t operator()(const RowCountNode& /*node*/) const { return 1; }
-};
-
-std::size_t OutputWidth(const LogicalNode& node) { return std::visit(OutputWidthOf{}, node); }
 
 // ---- rule 1: COUNT(*) without WHERE -> RowCount ----
 
@@ -106,80 +89,74 @@ std::string CallName(const AggregateCall& call) {
                      call.kind == AggKind::kCountDistinct ? "DISTINCT " : "", call.arg->name);
 }
 
+// The expression of `compute` that defines column `id`; nullptr if the column passes through.
+const ExprPtr* ComputedBy(const ComputeNode& compute, ColumnId id) {
+  const auto it = std::ranges::find(compute.ids, id);
+  if (it == compute.ids.end()) {
+    return nullptr;
+  }
+  return &compute.exprs.at(Narrow<std::size_t>(it - compute.ids.begin()));
+}
+
 LogicalNodePtr GroupByDeterminingKeys(const GroupAggregateNode& group) {
   const auto* compute = std::get_if<ComputeNode>(group.input.get());
   if (compute == nullptr) {
     return nullptr;
   }
-  const auto width = Narrow<int>(OutputWidth(*compute->input));
-  // The keys each key position reads, and whether it is dependent.
+  // Whether each key is dependent: computed by the Compute from keys alone. An expression of the
+  // Compute reads only the Compute's input, so a key it reads is passed through.
   std::vector<bool> dependent(group.keys.size(), false);
   for (std::size_t k = 0; k < group.keys.size(); ++k) {
-    const int index = group.keys[k].index;
-    if (index < width) {
+    const ExprPtr* expr = ComputedBy(*compute, group.keys[k].id);
+    if (expr == nullptr) {
       continue;
     }
-    const Expr& expr = *compute->exprs.at(Narrow<std::size_t>(index - width));
-    std::vector<int> reads;
-    CollectColumns(expr, reads);
-    dependent[k] = !reads.empty() && std::ranges::all_of(reads, [&](int column) {
-      return column < width && std::ranges::any_of(
-                                   group.keys,
-                                   [&](const BoundColumn& key) {
-                                     return key.index == column && key.type != LogicalType::kDouble;
-                                   });
+    std::vector<ColumnId> reads;
+    CollectColumnIds(**expr, reads);
+    dependent[k] = !reads.empty() && std::ranges::all_of(reads, [&](ColumnId read) {
+      return std::ranges::any_of(group.keys, [&](const BoundColumn& key) {
+        return key.id == read && key.type != LogicalType::kDouble;
+      });
     });
   }
   if (std::ranges::none_of(dependent, [](bool d) { return d; })) {
     return nullptr;
   }
-  // The GroupAggregate by the determining keys; `position` and `id` map an input column that is a
-  // kept key to its output position and column.
+  // The GroupAggregate by the determining keys; `output` maps the input column of a kept key to the
+  // key's output column.
   GroupAggregateNode kept = group;
   kept.keys.clear();
   kept.key_ids.clear();
-  std::vector<int> position(Narrow<std::size_t>(width), -1);
-  std::vector<ColumnId> id(Narrow<std::size_t>(width), kNoColumnId);
+  std::map<ColumnId, ColumnId> output;
   for (std::size_t k = 0; k < group.keys.size(); ++k) {
     if (!dependent[k]) {
-      if (group.keys[k].index < width) {
-        position[Narrow<std::size_t>(group.keys[k].index)] = Narrow<int>(kept.keys.size());
-        id[Narrow<std::size_t>(group.keys[k].index)] = group.key_ids.at(k);
-      }
+      output.emplace(group.keys[k].id, group.key_ids.at(k));
       kept.keys.push_back(group.keys[k]);
       kept.key_ids.push_back(group.key_ids.at(k));
     }
   }
-  const std::size_t kept_width = kept.keys.size() + kept.aggregates.size();
   // The dependent keys over its output, in key order, each the column it was as a key; the Project
   // passes every column through, so the nodes above read the same columns as before.
   ComputeNode above{.input = Make(std::move(kept)), .exprs = {}, .ids = {}, .span = compute->span};
   ProjectNode out{.input = nullptr, .columns = {}, .constants = {}, .ids = {}, .span = group.span};
-  int next_kept = 0;
   for (std::size_t k = 0; k < group.keys.size(); ++k) {
     BoundColumn column = group.keys[k];
     column.id = group.key_ids.at(k);
     if (dependent[k]) {
-      const ExprPtr& expr = compute->exprs.at(Narrow<std::size_t>(group.keys[k].index - width));
-      column.index = Narrow<int>(kept_width + above.exprs.size());
-      above.exprs.push_back(MapColumns(expr, [&](const ColumnExpr& read) {
-        const auto at = Narrow<std::size_t>(read.index);
-        ANTB1_CHECK(position.at(at) >= 0);
-        return ColumnExpr{.index = position.at(at), .id = id.at(at)};
-      }));
+      above.exprs.push_back(
+          MapColumns(*ComputedBy(*compute, group.keys[k].id), [&](ColumnExpr read) {
+            const auto key = output.find(read.id);
+            ANTB1_CHECK(key != output.end());
+            read.id = key->second;
+            return read;
+          }));
       above.ids.push_back(column.id);
-    } else {
-      column.index = next_kept++;
     }
     out.ids.push_back(column.id);
     out.columns.push_back(std::move(column));
   }
-  for (std::size_t i = 0; i < group.aggregates.size(); ++i) {
-    const AggregateCall& call = group.aggregates[i];
-    out.columns.push_back(BoundColumn{.index = Narrow<int>(static_cast<std::size_t>(next_kept) + i),
-                                      .id = call.id,
-                                      .name = CallName(call),
-                                      .type = call.type});
+  for (const AggregateCall& call : group.aggregates) {
+    out.columns.push_back(BoundColumn{.id = call.id, .name = CallName(call), .type = call.type});
     out.ids.push_back(call.id);
   }
   out.input = Make(std::move(above));
@@ -246,58 +223,42 @@ LogicalNodePtr LimitBelowProject(const LogicalNodePtr& node) {
 
 // ---- rule 4: projection pruning ----
 
-// Old output position -> new output position of a rewritten node; -1 for a dropped column.
-using Remap = std::vector<int>;
+// The columns a node's output must keep, by id. Ids of columns the node does not output match
+// nothing (ids are unique in the plan).
+using Needed = std::set<ColumnId>;
 
-struct Pruned {
-  LogicalNodePtr node;
-  Remap remap;
-};
+void Need(Needed& needed, const BoundColumn& column) { needed.insert(column.id); }
 
-Remap Identity(std::size_t width) {
-  Remap remap(width);
-  for (std::size_t i = 0; i < width; ++i) {
-    remap[i] = Narrow<int>(i);
-  }
-  return remap;
-}
+LogicalNodePtr Prune(const LogicalNodePtr& node, Needed needed);
 
-void Need(std::vector<bool>& needed, const BoundColumn& column) {
-  needed.at(Narrow<std::size_t>(column.index)) = true;
-}
-
-void Renumber(BoundColumn& column, const Remap& remap) {
-  const int to = remap.at(Narrow<std::size_t>(column.index));
-  ANTB1_CHECK(to >= 0);
-  column.index = to;
-}
-
-Pruned Prune(const LogicalNodePtr& node, std::vector<bool> needed);
-
-// Rewrites a node so that its output keeps at least the positions marked in `needed` (one flag per
-// current output column). Only a Scan drops columns; Filter, Sort and Limit pass the request
-// through (with the columns they reference), Project, Aggregate and GroupAggregate ask their input
-// for exactly what they reference.
+// Rewrites a node so that its output keeps at least the columns in `needed`. Only a Scan drops
+// columns (fields) and only a Compute drops expressions, keeping their order; Filter, Sort and
+// Limit pass the request through (with the columns they read), Project, Aggregate and
+// GroupAggregate ask their input for exactly what they read.
 struct Pruner {
   const LogicalNodePtr& node;
-  std::vector<bool>& needed;
+  Needed& needed;
 
-  Pruned operator()(const ScanNode& scan) const {
+  // `node` over its input pruned to `below`.
+  [[nodiscard]] LogicalNodePtr Over(Needed below) const {
+    const LogicalNodePtr input = Prune(*InputOf(*node), std::move(below));
+    return std::visit(WithInput{.input = input}, *node);
+  }
+
+  LogicalNodePtr operator()(const ScanNode& scan) const {
     ScanNode out = scan;
     out.fields.clear();
     out.ids.clear();
-    Remap remap(scan.fields.size(), -1);
     for (std::size_t i = 0; i < scan.fields.size(); ++i) {
-      if (needed.at(i)) {
-        remap[i] = Narrow<int>(out.fields.size());
+      if (needed.contains(scan.ids.at(i))) {
         out.fields.push_back(scan.fields[i]);
         out.ids.push_back(scan.ids.at(i));
       }
     }
-    return Pruned{.node = Make(std::move(out)), .remap = std::move(remap)};
+    return Make(std::move(out));
   }
 
-  Pruned operator()(const FilterNode& filter) const {
+  LogicalNodePtr operator()(const FilterNode& filter) const {
     for (const Predicate& p : filter.predicates) {
       if (p.column.has_value()) {
         Need(needed, *p.column);
@@ -306,93 +267,47 @@ struct Pruner {
         Need(needed, *p.other);
       }
     }
-    Pruned in = Prune(filter.input, std::move(needed));
-    FilterNode out = filter;
-    out.input = in.node;
-    for (Predicate& p : out.predicates) {
-      if (p.column.has_value()) {
-        Renumber(*p.column, in.remap);
-      }
-      if (p.other.has_value()) {
-        Renumber(*p.other, in.remap);
-      }
-    }
-    return Pruned{.node = Make(std::move(out)), .remap = std::move(in.remap)};
+    return Over(std::move(needed));
   }
 
-  // Keeps the needed input columns and the needed expressions (and what they read).
-  Pruned operator()(const ComputeNode& compute) const {
-    const std::size_t width = OutputWidth(*compute.input);
-    std::vector<bool> below(needed.begin(), needed.begin() + static_cast<std::ptrdiff_t>(width));
-    std::vector<std::size_t> kept;
+  // Keeps the needed expressions; the input keeps the needed columns and what they read.
+  LogicalNodePtr operator()(const ComputeNode& compute) const {
+    ComputeNode out{.input = nullptr, .exprs = {}, .ids = {}, .span = compute.span};
     for (std::size_t k = 0; k < compute.exprs.size(); ++k) {
-      if (!needed.at(width + k)) {
-        continue;
-      }
-      kept.push_back(k);
-      std::vector<int> reads;
-      CollectColumns(*compute.exprs[k], reads);
-      for (const int column : reads) {
-        below.at(Narrow<std::size_t>(column)) = true;
+      if (needed.contains(compute.ids.at(k))) {
+        std::vector<ColumnId> reads;
+        CollectColumnIds(*compute.exprs[k], reads);
+        needed.insert(reads.begin(), reads.end());
+        out.exprs.push_back(compute.exprs[k]);
+        out.ids.push_back(compute.ids.at(k));
       }
     }
-    Pruned in = Prune(compute.input, std::move(below));
-    Remap remap = in.remap;
-    remap.resize(width + compute.exprs.size(), -1);
-    if (kept.empty()) {
-      return Pruned{.node = in.node, .remap = std::move(remap)};
-    }
-    ComputeNode out{.input = in.node, .exprs = {}, .ids = {}, .span = compute.span};
-    const std::size_t new_width = OutputWidth(*in.node);
-    for (const std::size_t k : kept) {
-      remap[width + k] = Narrow<int>(new_width + out.exprs.size());
-      out.exprs.push_back(plan::Renumber(compute.exprs[k], in.remap));
-      out.ids.push_back(compute.ids.at(k));
-    }
-    return Pruned{.node = Make(std::move(out)), .remap = std::move(remap)};
+    out.input = Prune(compute.input, std::move(needed));
+    return out.exprs.empty() ? out.input : Make(std::move(out));
   }
 
-  Pruned operator()(const ProjectNode& project) const {
-    const auto is_constant = [&](std::size_t i) {
-      return !project.constants.empty() && project.constants[i].has_value();
-    };
-    std::vector<bool> below(OutputWidth(*project.input), false);
+  LogicalNodePtr operator()(const ProjectNode& project) const {
+    Needed below;
     for (std::size_t i = 0; i < project.columns.size(); ++i) {
-      if (!is_constant(i)) {
+      if (project.constants.empty() || !project.constants[i].has_value()) {
         Need(below, project.columns[i]);
       }
     }
-    const Pruned in = Prune(project.input, std::move(below));
-    ProjectNode out = project;
-    out.input = in.node;
-    for (std::size_t i = 0; i < out.columns.size(); ++i) {
-      if (!is_constant(i)) {
-        Renumber(out.columns[i], in.remap);
-      }
-    }
-    return Pruned{.node = Make(std::move(out)), .remap = Identity(project.columns.size())};
+    return Over(std::move(below));
   }
 
-  Pruned operator()(const AggregateNode& aggregate) const {
-    std::vector<bool> below(OutputWidth(*aggregate.input), false);
+  LogicalNodePtr operator()(const AggregateNode& aggregate) const {
+    Needed below;
     for (const AggregateCall& call : aggregate.aggregates) {
       if (call.arg.has_value()) {
         Need(below, *call.arg);
       }
     }
-    const Pruned in = Prune(aggregate.input, std::move(below));
-    AggregateNode out = aggregate;
-    out.input = in.node;
-    for (AggregateCall& call : out.aggregates) {
-      if (call.arg.has_value()) {
-        Renumber(*call.arg, in.remap);
-      }
-    }
-    return Pruned{.node = Make(std::move(out)), .remap = Identity(aggregate.aggregates.size())};
+    return Over(std::move(below));
   }
 
-  Pruned operator()(const GroupAggregateNode& group) const {
-    std::vector<bool> below(OutputWidth(*group.input), false);
+  LogicalNodePtr operator()(const GroupAggregateNode& group) const {
+    Needed below;
     for (const BoundColumn& key : group.keys) {
       Need(below, key);
     }
@@ -401,47 +316,22 @@ struct Pruner {
         Need(below, *call.arg);
       }
     }
-    const Pruned in = Prune(group.input, std::move(below));
-    GroupAggregateNode out = group;
-    out.input = in.node;
-    for (BoundColumn& key : out.keys) {
-      Renumber(key, in.remap);
-    }
-    for (AggregateCall& call : out.aggregates) {
-      if (call.arg.has_value()) {
-        Renumber(*call.arg, in.remap);
-      }
-    }
-    return Pruned{.node = Make(std::move(out)),
-                  .remap = Identity(group.keys.size() + group.aggregates.size())};
+    return Over(std::move(below));
   }
 
-  Pruned operator()(const SortNode& sort) const {
+  LogicalNodePtr operator()(const SortNode& sort) const {
     for (const SortKey& key : sort.keys) {
       Need(needed, key.column);
     }
-    Pruned in = Prune(sort.input, std::move(needed));
-    SortNode out = sort;
-    out.input = in.node;
-    for (SortKey& key : out.keys) {
-      Renumber(key.column, in.remap);
-    }
-    return Pruned{.node = Make(std::move(out)), .remap = std::move(in.remap)};
+    return Over(std::move(needed));
   }
 
-  Pruned operator()(const LimitNode& limit) const {
-    Pruned in = Prune(limit.input, std::move(needed));
-    LimitNode out = limit;
-    out.input = in.node;
-    return Pruned{.node = Make(std::move(out)), .remap = std::move(in.remap)};
-  }
+  LogicalNodePtr operator()(const LimitNode& /*limit*/) const { return Over(std::move(needed)); }
 
-  Pruned operator()(const RowCountNode& /*rows*/) const {
-    return Pruned{.node = node, .remap = Identity(1)};
-  }
+  LogicalNodePtr operator()(const RowCountNode& /*rows*/) const { return node; }
 };
 
-Pruned Prune(const LogicalNodePtr& node, std::vector<bool> needed) {
+LogicalNodePtr Prune(const LogicalNodePtr& node, Needed needed) {
   return std::visit(Pruner{.node = node, .needed = needed}, *node);
 }
 
@@ -453,11 +343,9 @@ LogicalPlan Optimize(const LogicalPlan& plan) {
   }
   LogicalNodePtr root =
       LimitBelowProject(DependentKeys(CountStarToRowCount(plan.root), /*limited=*/false));
-  const std::size_t width = OutputWidth(*root);
-  Pruned pruned = Prune(root, std::vector<bool>(width, true));
-  const LogicalPlan optimized{.root = std::move(pruned.node), .output = plan.output};
-  CheckPositions(optimized);  // the rules' positions are the positions of the ids (ADR 0022, P1)
-  return ResolvePositions(optimized);
+  const std::vector<ColumnId> output = OutputIds(*root);
+  root = Prune(root, Needed(output.begin(), output.end()));
+  return ResolvePositions({.root = std::move(root), .output = plan.output});
 }
 
 }  // namespace antb1::plan
