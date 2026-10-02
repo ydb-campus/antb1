@@ -9,10 +9,10 @@ Proposed
 ## Context
 
 - **17 of the 22 queries derived from TPC-H need DECIMAL:** Q1-Q3, Q5-Q11, Q14, Q15, Q17-Q20 and Q22 (query numbers
-  in this ADR are theirs, not ClickBench's). Every DECIMAL column of the TPC-H-derived tables (prices, quantities,
-  discounts, taxes, balances and costs) is DECIMAL(15,2), and DuckDB writes them as INT64. The queries compute with
-  these columns, sum and average them, compare them with literals, with each other and with averages, group and sort
-  by them and print them.
+  in this ADR are theirs, not ClickBench's). Every DECIMAL column of the tables derived from TPC-H (prices,
+  quantities, discounts, taxes, balances and costs) is DECIMAL(15,2), and DuckDB writes them as INT64. The queries
+  compute with these columns, sum and average them, compare them with literals, with each other and with averages,
+  group and sort by them and print them.
 - **Some answers hinge on the last digit or bit:**
   - Q2 and Q15 test DECIMAL values for equality with independently computed aggregates;
   - Q11 and Q20 compare DECIMALs of different scales, or a DECIMAL with an integer column;
@@ -23,19 +23,21 @@ Proposed
     DECIMAL(38,0), which reads as HUGEINT: HUGEINT is decimal128(38,0) and stands for DECIMAL(38,0), limited to 38
     digits (divergence D9).
   - A decimal literal is accepted only where no DECIMAL value reaches the result: compared with an integer operand
-    (folded exactly, [ADR 0004](0004-types-null-overflow-semantics.md)) or a DOUBLE operand, and in arithmetic or
-    CASE next to a DOUBLE. As a select constant, with an integer operand or as another CASE value it exits 4.
+    (folded exactly, [ADR 0004](0004-types-null-overflow-semantics.md)), a DOUBLE operand or a FLOAT column, in `/`
+    and `//` (both give DOUBLE), and in arithmetic or CASE next to a DOUBLE. As a select constant, with an integer
+    operand in `+`, `-`, `*` or `%`, or as another CASE value it exits 4.
 - **The harness hides wrong cents.** The test runner's DuckDB adapter reads a DECIMAL with a scale as a DOUBLE of
   class R, compared within a relative 1e-9, and names its type a bare `DECIMAL`
   (`tests/slt/runner/duckdb_engine.cc`). On a value with ten integer digits that tolerance is at least one whole
   unit, a hundred cents, and a wrong width or scale passes as well.
 - **DuckDB's rules are its own.** The oracle is DuckDB 1.5.5, the locked libduckdb. Its DECIMAL typing is neither the
-  SQL standard's nor Arrow's: widths are capped at 18 digits while every input fits in 64 bits, division gives
+  SQL standard's nor Arrow's: widths are capped at 18 digits while every input has at most 18 digits, division gives
   DOUBLE, and CASE and comparisons take different common types. Every rule below was probed with DuckDB 1.5.5 on our
   own data, and its formulas were read in DuckDB's source.
 - **Storage:**
-  - Arrow reads every Parquet DECIMAL (INT32, INT64 or FIXED_LEN_BYTE_ARRAY) as decimal128(p,s) by default. Reading
-    p ≤ 18 as decimal64 is a reader option, which a file's ARROW:schema overrides.
+  - Arrow reads every Parquet DECIMAL (INT32, INT64, FIXED_LEN_BYTE_ARRAY or BYTE_ARRAY) as decimal128(p,s) by
+    default, and DuckDB reads all four as DECIMAL(p,s). Reading p ≤ 18 as decimal64 is a reader option, which a
+    file's ARROW:schema overrides.
   - antb1's HUGEINT already runs on decimal128: Int128 arithmetic with range checks, exact sums, sorting, top-N,
     grouping and MIN/MAX.
   - Arrow 25 has no decimal32 or decimal64 arithmetic kernels.
@@ -44,9 +46,10 @@ Proposed
 
 ## Decision
 
-antb1 follows DuckDB 1.5.5 for DECIMAL. This amends ADR 0004's list of types and ADR 0012's list of unsupported
-constructs; both keep their status. In the rules, p is the width (precision) and s the scale. The examples use a
-table of our own: `price` and `qty` DECIMAL(15,2), `rate` DECIMAL(5,3), `n` INTEGER, `b` BIGINT and `d` DOUBLE.
+antb1 follows DuckDB 1.5.5 for DECIMAL. This amends ADR 0004's list of types and its nearest double for a decimal
+literal against a DOUBLE operand, and ADR 0012's list of unsupported constructs; both keep their status. In the
+rules, p is the width (precision) and s the scale. The examples use a table of our own: `price` and `qty`
+DECIMAL(15,2), `rate` DECIMAL(5,3), `n` INTEGER, `b` BIGINT and `d` DOUBLE.
 
 1. **Type.** DECIMAL(p,s), with 1 ≤ p ≤ 38 and 0 ≤ s ≤ p, holds an unscaled integer v with |v| ≤ 10^p - 1 and
    stands for v / 10^s. It is named `DECIMAL(p,s)` without spaces, as DuckDB prints it, in `antb1 schema`, EXPLAIN
@@ -88,7 +91,7 @@ table of our own: `price` and `qty` DECIMAL(15,2), `rate` DECIMAL(5,3), `n` INTE
      (`Casting value "…" to type DECIMAL(18,2) failed: value is out of range!`).
 
    Nothing falls back to DOUBLE: `price * qty` fails as soon as an unscaled product needs more than 18 digits, in
-   both engines.
+   both engines, unless a comparison around it folds to a constant (rule 11, divergence D14).
 8. **`/` and `//`** give DOUBLE.
    - A DECIMAL operand becomes a double as DuckDB converts it: v / 10^s when |v| ≤ 2^53 or s = 0, otherwise
      (v div 10^s) + (v mod 10^s) / 10^s, where div and mod truncate toward zero and each part is converted on its
@@ -113,7 +116,8 @@ table of our own: `price` and `qty` DECIMAL(15,2), `rate` DECIMAL(5,3), `n` INTE
     - **With a literal:** folded exactly into the operand's (p,s) at bind time, as integer columns are folded today
       (ADR 0004). `price < 12.345` becomes `price <= 12.34`, `price >= 12.345` becomes `price >= 12.35`, and
       `price = 12.345` is never true. A literal beyond the type's range makes the comparison constant, NULL still
-      rejected. Folding is never an error. An IN list of literals is folded value by value.
+      rejected, and the operand is then not computed (divergence D14). Folding is never an error. An IN list of
+      literals is folded value by value.
     - **Two operands that are not literals,** DECIMAL with DECIMAL or with an integer (`price < rate`, `price = b`):
       compared exactly by value.
     - **Both give DuckDB's rows wherever DuckDB answers.** DuckDB compares in rule 10's type, which is exact below
@@ -121,18 +125,30 @@ table of our own: `price` and `qty` DECIMAL(15,2), `rate` DECIMAL(5,3), `n` INTE
       extended).
     - **With a DOUBLE operand, or a literal that DuckDB types as DOUBLE:** compared in DOUBLE after rule 8's
       conversion (`price < 2.5e1`). An IN list with such a literal compares every value in DOUBLE.
-    - **Other operands:** a FLOAT column next to a DECIMAL stays unsupported (divergence D11); a string, DATE or
-      VARCHAR operand is a bind error, as for every other number (divergence D3).
-12. **SUM** of DECIMAL(p,s) is DECIMAL(38,s), summed exactly in Int128 (the HUGEINT sum states), so it depends on
-    neither the thread count, nor the parts, nor the order of the rows. Over no rows it is NULL. `SUM(price)` and
-    `SUM(price * n)` are DECIMAL(38,2), `SUM(rate)` is DECIMAL(38,3). A sum beyond 10^38 - 1 in magnitude is an
-    execution error (exit code 1), as for HUGEINT (D9); DuckDB returns up to 39 digits until its 128-bit sum
-    overflows, a new divergence.
+    - **A decimal literal against a DOUBLE operand** is a DECIMAL too (rule 3), so it is converted as in rule 8, as
+      DuckDB does, and no longer to the nearest double as ADR 0004 has it: `d = 9007199254740993.5` compares with
+      9007199254740992.0, not 9007199254740994.0. Divergence D12 then keeps only HUGEINT literals (in D4).
+    - **With a FLOAT column:** a decimal literal keeps ADR 0004's FLOAT rule (plan::DuckDbFloatOf); only a DECIMAL
+      that is not a literal next to a FLOAT column stays unsupported (divergence D11).
+    - **Other operands:** a string literal is a bind error (divergence D3); a DATE or VARCHAR operand is a bind
+      error, as in DuckDB.
+12. **SUM** of DECIMAL(p,s) is DECIMAL(38,s), summed exactly in Int128 (the HUGEINT sum states), so its value
+    depends on neither the thread count, nor the parts, nor the order of the rows. Over no rows it is NULL.
+    `SUM(price)` and `SUM(price * n)` are DECIMAL(38,2), `SUM(rate)` is DECIMAL(38,3). A sum beyond 10^38 - 1 in
+    magnitude is an execution error (exit code 1), as for HUGEINT (D9); DuckDB returns up to 39 digits until its
+    128-bit sum overflows, a new divergence. In both engines a partial sum beyond the 128-bit range fails, as for
+    HUGEINT, so with values near 10^38 whether a sum fails can depend on the order of the rows and the parts.
 13. **AVG** of DECIMAL(p,s) is DOUBLE. `AVG(price)` is computed as DuckDB computes it, with the same C types:
-    - the exact sum, converted to `long double`, divided by the count times 10^s (also in `long double`, with 10^s
-      first rounded to a double), then rounded to double; for p ≤ 4 DuckDB computes the same in double;
+    - the exact sum, converted to `long double` with DuckDB's 128-bit formula (lower + upper × 2^64 from its two
+      64-bit halves, with upper = -1 handled separately, as `src/plan/literal.cc` already does in double), divided
+      by the count times 10^s (also in `long double`, with 10^s first rounded to a double), then rounded to double;
+      for p ≤ 4 DuckDB computes the same in double;
     - `long double` differs by platform (x87 80-bit on x86-64 Linux, 64-bit on arm64 macOS) exactly as it does in
       DuckDB's own build, so the two engines agree to the bit on each platform, and no AVG divergence is registered;
+    - the formula rounds once on x86-64 but can round twice on arm64 macOS, where a direct conversion of the Int128
+      would be one ulp off: the AVG of the single DECIMAL(38,0) value 27670116110564329473 (2^64 + 2^63 + 2049) is
+      27670116110564327424.0 on both platforms, while a direct conversion gives 27670116110564331520.0 on arm64, a
+      test case for the macos-release leg;
     - on x86-64, an emulation of this formula matched DuckDB on 1,800 random sets (scales 2 to 6, up to 36 digits),
       where the correctly rounded mean missed one.
 14. **MIN and MAX** keep the type (`MIN(rate)` is DECIMAL(5,3)); COUNT and COUNT(DISTINCT) are BIGINT. Over no rows
@@ -142,9 +158,11 @@ table of our own: `price` and `qty` DECIMAL(15,2), `rate` DECIMAL(5,3), `n` INTE
     prints no point. `--format json` writes a DECIMAL as a string, like HUGEINT. EXPLAIN constants and the test
     harness's canonical text use the same formatter.
 16. **Keys:** GROUP BY, ORDER BY, top-N and COUNT(DISTINCT) compare DECIMAL values by value within their one type,
-    which is the order of the unscaled integers; NULL behaves as for other types. A join key across two DECIMAL types
-    is first cast to their comparison type (rule 10), as DuckDB does (`price = rate` as a key compares in
-    DECIMAL(16,3)); a DECIMAL and a DOUBLE never form a key.
+    which is the order of the unscaled integers; NULL behaves as for other types. A join key that pairs a DECIMAL
+    with another DECIMAL or an integer type compares by value, as in rule 11: both sides are cast to rule 10's type
+    (`price = rate` as a key compares in DECIMAL(16,3)), and at the 38-digit cap a value that does not fit matches
+    no row, where DuckDB fails with a conversion error (D13). A DECIMAL against a DOUBLE compares in DOUBLE, so it
+    is a key only where DOUBLE keys are.
 17. **CAST,** when general CAST arrives (it is deferred):
     - DECIMAL to a smaller scale, and DECIMAL to an integer, round half away from zero: 1.005 and -1.005 become 1.01
       and -1.01 as DECIMAL(15,2), and -2.5 becomes -3 as INTEGER;
@@ -154,8 +172,9 @@ table of our own: `price` and `qty` DECIMAL(15,2), `rate` DECIMAL(5,3), `n` INTE
     - a value out of range is a conversion error, and DECIMAL without (p,s) is DECIMAL(18,3).
 18. **No integer-only rewrites.** ADR 0012 and the binder reproduce two rewrites of DuckDB's optimizer: `SUM(x + c)`
     as `SUM(x) + c * COUNT(x)`, and constant moving in comparisons (`x + c <op> k` compares `x` with `k - c`). Both
-    stay for signed integers, because DuckDB applies neither to DECIMAL: `SUM(price + 7)` adds 7 on every row, and
-    `price + 7 > 12` computes the addition, so an overflow there fails in both engines.
+    stay for signed integers, because DuckDB applies neither to DECIMAL: `SUM(price * qty + 7)` adds 7 on every row,
+    and `price * qty + 7 > 12` computes the addition, both in DECIMAL(18,4), so an overflow of that addition fails in
+    both engines (unless rule 11 folds the comparison to a constant, D14).
 
 **Storage:**
 
@@ -171,9 +190,14 @@ table of our own: `price` and `qty` DECIMAL(15,2), `rate` DECIMAL(5,3), `n` INTE
 
 - **Divergences,** registered in [sql-subset.md](../sql-subset.md#divergences-from-duckdb) by the PR that implements
   each rule:
+  - D12, narrowed: a decimal literal compared with a DOUBLE operand is converted as DuckDB converts it (rule 11), so
+    D12 keeps only HUGEINT literals;
   - D13, extended: antb1 compares exactly where DuckDB casts to a DECIMAL capped at 38 digits and fails with a
-    conversion error, as for `price < 1.0000000000000000000000000000000000001` (DuckDB casts `price` to
-    DECIMAL(38,37)) or a DECIMAL(38,2) against a DECIMAL(38,12) past 26 integer digits;
+    conversion error, in comparisons and join keys alike, as for `price < 1.0000000000000000000000000000000000001`
+    (DuckDB casts `price` to DECIMAL(38,37)) or a DECIMAL(38,2) against a DECIMAL(38,12) past 26 integer digits;
+  - D14, extended to DECIMAL operands: a comparison that rule 11 folds to a constant computes nothing. Over a row
+    whose product needs more than 18 digits, `price * qty > 100000000000000000000` returns no rows, where DuckDB
+    computes the product and fails (`Overflow in multiplication of DECIMAL(18)`);
   - new: a DECIMAL SUM beyond 38 digits is an error.
 
   The unregistered difference of reading a Parquet DECIMAL(38,0) column as HUGEINT goes away, and AVG needs no
@@ -182,19 +206,21 @@ table of our own: `price` and `qty` DECIMAL(15,2), `rate` DECIMAL(5,3), `n` INTE
   before any DECIMAL engine code lands, since the DOUBLE tolerance would let a wrong cent pass.
 - **Filter pushdown is lost for scans that read a DECIMAL column,** until the decimal64 item. ADR 0020 needs every
   read column to be filterable, so such a scan is not filtered at all, and a predicate on a DECIMAL column skips no
-  row group, because part statistics cover integer-valued columns only. Most scans of the TPC-H-derived queries read
-  DECIMAL columns, so they run unfiltered until then. Answers are unaffected.
+  row group, because part statistics cover integer-valued columns only. Most scans of the queries derived from
+  TPC-H read DECIMAL columns, so they run unfiltered until then. Answers are unaffected.
 - **Cost:** a DECIMAL of up to 18 digits takes 16 bytes and Int128 arithmetic instead of 8 bytes and int64. Accepted
   until decimal64.
 - **Every slice fails cleanly.** Each code PR rejects the DECIMAL contexts it does not implement yet with
-  kUnsupported (exit code 4), each with a test: the ratchet of the TPC-H-derived queries counts only exit code 4 as
-  a clean failure.
+  kUnsupported (exit code 4), each with a test: the ratchet of the queries derived from TPC-H counts only exit code
+  4 as a clean failure.
 - **Tests:**
   - plan: tables of result types that cover every rule, both caps, the scale-38 bind error and an integer literal
-    as a CASE value; literal widths; folding up and down in scale, out of range and with extra digits;
+    as a CASE value; literal widths; folding up and down in scale, out of range and with extra digits; a decimal
+    literal against a DOUBLE column beyond 2^53;
   - exec: kernels at 10^18 - 1 and 10^38 - 1, `%` signs and zero divisors, the two-step conversion, and SUM, AVG,
-    MIN and MAX in global, grouped and merged forms at 1 and 4 threads;
-  - io: INT32, INT64 and FIXED_LEN_BYTE_ARRAY columns, with and without an ARROW:schema, and DECIMAL(38,0);
+    MIN and MAX in global, grouped and merged forms at 1 and 4 threads, with rule 13's AVG case;
+  - io: INT32, INT64, FIXED_LEN_BYTE_ARRAY and BYTE_ARRAY columns, with and without an ARROW:schema, and
+    DECIMAL(38,0);
   - `.slt` records whose expectations come from DuckDB, over a fixture of our own with NULLs, negative and
     near-maximum values and several row groups;
   - the random generator: DECIMAL columns, literals and arithmetic that cannot overflow, with exact type names.
@@ -203,15 +229,16 @@ table of our own: `price` and `qty` DECIMAL(15,2), `rate` DECIMAL(5,3), `n` INTE
 
 ## Plan
 
-One PR each, in this order; each engine PR documents its rules in docs/sql-subset.md and rejects the rest with exit
-code 4.
+One PR each. H5 and D1 land in either order (D1 changes no behavior), both before D2; then D2, D3 and D4 in this
+order. Each engine PR documents its rules in docs/sql-subset.md and rejects the rest with exit code 4.
 
-1. **H5,** test(harness): compare decimal results exactly. Rule 15's text and exact type names, before engine code.
-2. **D1,** refactor(plan): logical types with width and scale. The type carries (p,s); no behavior change.
-3. **D2,** feat(plan,io,exec,engine): decimal columns. Rules 1, 2, 14-16; rule 11 for literals and same-type operands.
-4. **D3,** feat(plan,exec): decimal arithmetic, sum and avg. Rules 4-7, 12, 13 and 18.
-5. **D4,** feat(plan,exec): decimal literals, division and mixed comparisons. Rules 3 and 8-11.
-6. **decimal64 (deferred):** decimal64 for p ≤ 18, with DECIMAL in the filtered scan and in part statistics.
+- **H5,** test(harness): compare decimal results exactly. Rule 15's text and exact type names, before engine code.
+- **D1,** refactor(plan): logical types with width and scale. The type carries (p,s); no behavior change.
+- **D2,** feat(plan,io,exec,engine): decimal columns. Rules 1, 2, 14-16 (join keys come with the joins); rule 11 for
+  literals and same-type operands.
+- **D3,** feat(plan,exec): decimal arithmetic, sum and avg. Rules 4-7, 12, 13 and 18.
+- **D4,** feat(plan,exec): decimal literals, division and mixed comparisons. Rules 3 and 8-11.
+- **decimal64 (deferred):** decimal64 for p ≤ 18, with DECIMAL in the filtered scan and in part statistics.
 
 ## Alternatives considered
 
