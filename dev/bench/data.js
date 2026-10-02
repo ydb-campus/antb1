@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790924042865,
+  "lastUpdate": 1790924053658,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -3564,6 +3564,90 @@ window.BENCHMARK_DATA = {
             "value": 15.096884608695404,
             "unit": "ms/iter",
             "extra": "iterations: 46\ncpu: 15.094829608695672 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "78afad1bf19de545fc787ebd14e096325e501153",
+          "message": "test: make a window function the standard unsupported example (#70)\n\n## Summary\n\n`JOIN ... USING` was the standard example of SQL that antb1 recognizes\nbut does not answer (exit code 4). It appeared in the CLI goldens, the\ncli, session, parser and runner tests, `tests/cli/sql/bench.sql`, the\npending SLT canary and `docs/sql-subset.md`. Later PRs of the roadmap\nfor the queries derived from TPC-H make joins supported, so this PR\n(roadmap S0) moves every such example to a window function, which stays\nout of scope.\n\nThe parser rejects `OVER` before any name is resolved, as it rejects\n`JOIN` today. The JOIN examples all joined a table `u` that was never\nregistered, so they also checked that unsupported SQL exits 4, not 1,\nwhen a name is unknown. The new examples keep that check: they read a\ntable that is not registered, or a column that does not exist.\n\nThe PR also replaces the harness's never-generated marker\n`Feature::kJoin` with `Feature::kWindowFunctions` (`window_functions`).\nIt widens `FeatureSet` from a 64-bit mask to a `std::bitset` sized by\nthe feature count. 46 features exist and about 20 more are coming; with\nthe mask, a 65th feature would make `1 << f` undefined.\n\n**Examples moved**\n- The `unsupported` and `unsupported_json` CLI goldens\n(`tests/cli/CMakeLists.txt`) and `tests/cli/sql/bench.sql` read the\nunregistered table `u`.\n- `src/cli/tests/cli_test.cc` reads `u`.\n- `tests/integration/session_test.cc` reads `no_such_table`. Without\n`OVER`, the same table is a bind error two lines earlier in that test.\n- `src/engine/tests/session_test.cc` reads the unknown column `nope`.\nThe same test later expects `SUM(nope)` to be a bind error.\n- `src/sql/tests/parser_test.cc` (`ExactMessages`) and\n`tests/slt/tests/runner_test.cc`.\n- `tests/slt/canary/canary_queries.sql` still reads the registered\ntable, because DuckDB has to answer it. It is still pending (`compared=1\npending=1`).\n- The two exit-code-4 examples in `docs/sql-subset.md`. Joins stay in\nits list of rejected constructs.\n\n**Feature set** (`tests/slt/supported_features.h`)\n- `FeatureSet` is now `BasicFeatureSet<Feature, kFeatureCount>`, a class\ntemplate over `std::bitset<N>` with the same interface. `Names()` finds\n`FeatureName` by argument-dependent lookup.\n- One `static_assert` checks that no `Feature` follows the marker, so\n`kFeatureCount` counts every feature.\n- A second `static_assert` checks that `kSupportedFeatures` declares no\nout-of-scope marker.\n- I checked locally that each `static_assert` fails the build when its\nrule is broken, then reverted.\n\n**New tests** (`tests/slt/tests/supported_features_test.cc`)\n- `harness.FeatureSet.HoldsMoreThan64Features` covers a 70-value enum on\nboth sides of the 64-bit boundary, including at compile time.\n- `harness.FeatureSet.NamesFollowDeclarationOrder` covers `Names()` and\n`All()` of the real set.\n\n**Reviewed golden diff**\n- `unsupported.stderr` now has the message `window functions (OVER) are\nnot supported; see docs/sql-subset.md`, at line 1, column 32. The SQL\nline is `SELECT CounterID, row_number() OVER (ORDER BY CounterID) FROM\nu`, with the caret under `OVER`.\n- `unsupported_json.stderr` has the same message, with\n`\"offset\":24,\"length\":4,\"line\":1,\"column\":25`.\n\n**Left as they are**\n- ADR 0008:23: the roadmap moves its example in J0 and S3.\n- The comment in `src/sql/include/antb1/sql/parser.h` and the\nJOIN-specific parser rejection cases. Both stay accurate until S3 parses\njoins.\n- The fuzz seed `fuzz/corpus/sql_parser/join.sql`.\n\nPart of the approved TPC-H roadmap (S0, wave 1). There is no tracking\nissue.\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [x] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\nAll results below are on 40a4ca4. The last commit, cdced25, only keeps\n`JOIN` in the list of unsupported SQL in\n`docs/sql-subset.md` until joins land; `pixi run lint` and `pixi run\ncheck` pass on it (100% of 1428 tests).\n\n```text\n$ pixi run antb1 query --threads 1 -c \"SELECT row_number() OVER () FROM no_such_table\" --table t=build/dev/fixtures/hits_like.parquet\nantb1: unsupported error: window functions (OVER) are not supported; see docs/sql-subset.md\nexit code 4    (same for FROM u, and for the unknown column nope FROM t)\n\n$ ANTB1_UPDATE_GOLDENS=1 pixi run test -L cli\n100% tests passed out of 65\nANTB1-TESTS: PASS preset=dev junit=build/dev/junit.xml\n# golden diff against main: only tests/cli/golden/unsupported.stderr and unsupported_json.stderr (reviewed);\n# on the final commit this run changed nothing\n\n$ pixi run test -L cli\n100% tests passed out of 65\nANTB1-TESTS: PASS preset=dev junit=build/dev/junit.xml\n\n$ pixi run check-full\nlint: PASS\n[ci]        100% tests passed out of 1428\n[ci-asan]   100% tests passed out of 1428\n[tidy]      build preset \"tidy\" finished with no findings (-Werror)\n[coverage]  100% tests passed out of 1428\n            Coverage gate: PASS (floors: `tools/ci/coverage_thresholds.json`; they only go up).\n            coverage: PASS\n[fuzz]      100% tests passed out of 2\n[ci-gcc]    100% tests passed out of 1428\nEXIT CODE: 0\n```\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests); it ran as part of `pixi run check-full` above\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer (none touched)\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code implemented the\nchange (PR S0 of the roadmap for the queries derived from TPC-H).\n- It checked that `OVER` exits 4 before name resolution, edited the\ntests, docs and harness, regenerated and reviewed the CLI goldens, and\nran every gate above.\n- First review: the project's `reviewer` subagent could not be launched\nfrom that workflow session, so Claude Code's `code-review` skill (high\neffort) reviewed the branch diff instead. It reported 7 findings.\n- Applied 3: a `static_assert` that no out-of-scope marker is supported,\nwhich replaces a runtime test; a deterministic `OVER (ORDER BY id)` in\nthe canary query; and a comment that no longer hard-codes the feature\ncount.\n- Declined 3, and the fourth later: \"the docs no longer mention joins\"\nwas first declined because the grammar still shows a single table, but\ncdced25 keeps `JOIN` in the list of unsupported SQL anyway until joins\nland. Splitting the PR, and dropping the template together with its >64\ntest, conflict with the approved S0 scope. Unchecked\n`bitset::operator[]` was declined because checked access keeps\nout-of-range values defined at negligible cost.\n- Second review: a read-only Claude Code reviewer agent reviewed the\nbranch at 17365c4 and reported one P1 finding. The window-function\nexamples read only the registered table and known columns, so no test\nchecked any more that unsupported SQL exits 4 before any name is\nresolved. Every JOIN example had checked that.\n- Fixed in 40a4ca4 at all seven places the finding lists. The goldens,\n`bench.sql`, both CLI unit tests and the integration test now read an\nunregistered table. The engine test reads an unknown column. All gates\nwere rerun on 40a4ca4.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-10-02T09:51:35+03:00",
+          "tree_id": "de114fe86eda6a85e4ba4ec9be3cd013859a4f6a",
+          "url": "https://github.com/ydb-campus/antb1/commit/78afad1bf19de545fc787ebd14e096325e501153"
+        },
+        "date": 1790924053260,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 2179.721951709253,
+            "unit": "ns/iter",
+            "extra": "iterations: 318736\ncpu: 2179.531891596808 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 66215.31727857591,
+            "unit": "ns/iter",
+            "extra": "iterations: 10568\ncpu: 66183.45486373961 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 70399.37023445392,
+            "unit": "ns/iter",
+            "extra": "iterations: 9810\ncpu: 70387.91804281343 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 256021.74280509737,
+            "unit": "ns/iter",
+            "extra": "iterations: 2745\ncpu: 255998.41020036422 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 254510.3714077866,
+            "unit": "ns/iter",
+            "extra": "iterations: 2749\ncpu: 254479.49872680972 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 1437444.1334702242,
+            "unit": "ns/iter",
+            "extra": "iterations: 487\ncpu: 1437248.0616016423 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 30.10260008695646,
+            "unit": "ms/iter",
+            "extra": "iterations: 23\ncpu: 30.096698652173906 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 28.569030666666606,
+            "unit": "ms/iter",
+            "extra": "iterations: 24\ncpu: 28.565732499999978 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 150.3315602000015,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 150.30100059999984 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 8.700679975609695,
+            "unit": "ms/iter",
+            "extra": "iterations: 82\ncpu: 8.699446219512193 ms\nthreads: 1"
           }
         ]
       }
