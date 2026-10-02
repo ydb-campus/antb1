@@ -66,7 +66,7 @@ std::shared_ptr<arrow::Array> RandomColumn(LogicalType type, std::size_t n, Rng&
     }
     const std::uint64_t pick = rng.Below(16);
     arrow::Status status;
-    switch (type) {
+    switch (type.id()) {
       case LogicalType::kSmallInt: {
         auto v = static_cast<std::int16_t>(static_cast<int>(rng.Below(2001)) - 1000);
         if (pick < 2) {
