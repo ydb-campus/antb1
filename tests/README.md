@@ -78,10 +78,15 @@ Exit codes are never rewritten: change `EXIT_CODE` in `cli/CMakeLists.txt` delib
   make the slt runner and the differential test fail, with the expected report.
 - `harness.slt.redact`, `harness.slt.redact_sentinels`, `harness.diff.redact`: with `--redact` a failure
   report never prints SQL, values, error messages or regexes; the sentinel files are in `slt/canary/`.
+- `harness.*.redact_table`: over a table marked `redact` (`slt/canary/tables_redact.txt`) every report is redacted
+  without `--redact`, and `diff --list` and `complete` are refused.
+- `harness.answers.*`: `antb1-slt answers` accepts DuckDB's stored answers in their own spelling, catches every
+  corrupted result in a redacted report, and refuses `--show-values` on GitHub Actions.
 - `harness.cli.changed_stdout`, `harness.cli.changed_exit_code`: the golden comparison catches changes.
 - `harness.fixtures.digest`: the fixtures this build generated match `fixtures/fixtures.digest`, a logical
   digest (schema, row groups, values; not compression or page layout), so Linux and macOS generate the same
-  data. After an intended generator change:
+  data. The top-level `tpch/` directory of the data derived from TPC-H is skipped. After an intended generator
+  change:
 
   ```bash
   build/dev/bin/antb1-fixture-digest --write tests/fixtures/fixtures.digest build/dev/fixtures

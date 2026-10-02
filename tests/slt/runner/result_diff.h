@@ -64,10 +64,16 @@ std::optional<Discrepancy> CompareLimited(const ResultSet& oracle, const ResultS
 // A failure caused by an engine error: `what` is the one-line summary.
 Discrepancy ErrorDiscrepancy(std::string what, const EngineError& error);
 
+// The names of the two sides in a report: the expected block and the actual one.
+struct SideLabels {
+  std::string_view expected = "DuckDB";
+  std::string_view actual = "antb1";
+};
+
 // Appends the body of a failure report, each line indented by two spaces. Redacted: the error kind,
 // the row counts, the first differing row and both sha256 hashes. Otherwise: the details, `sql`
 // and at most 5 differing rows.
 void AppendDiscrepancy(const Discrepancy& d, std::string_view sql, SortMode sort, bool redact,
-                       std::string& out);
+                       std::string& out, SideLabels labels = {});
 
 }  // namespace antb1::slt

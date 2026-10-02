@@ -1,0 +1,8 @@
+# Redaction self-test of the `redact` table option (harness.slt.redact_table; not a test case): run over
+# canary/tables_redact.txt without --redact, and with --mutate canary, which makes antb1's first value a sentinel.
+# The report must print neither the SQL nor a value.
+
+query I nosort
+SELECT COUNT(*) /* ANTB1_CANARY_SQL */ FROM antb1_canary_table
+----
+12

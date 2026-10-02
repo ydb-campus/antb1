@@ -33,9 +33,11 @@ bool SameLine(const std::string& e, const std::string& a, std::string_view types
   return !CompareBlocks({e}, {a}, types, sort, kDefaultRelTolerance).has_value();
 }
 
-void AppendDifferingRows(const Discrepancy& d, SortMode sort, std::string& out) {
-  out += std::format("  DuckDB: {} row(s), antb1: {} row(s); differing rows (at most {}):\n",
-                     d.expected.size(), d.actual.size(), kMaxDiffRows);
+void AppendDifferingRows(const Discrepancy& d, SortMode sort, SideLabels labels, std::string& out) {
+  out +=
+      std::format("  {}: {} row(s), {}: {} row(s); differing rows (at most {}):\n", labels.expected,
+                  d.expected.size(), labels.actual, d.actual.size(), kMaxDiffRows);
+  const std::size_t width = std::max(labels.expected.size(), labels.actual.size());
   std::size_t shown = 0;
   const std::size_t n = std::max(d.expected.size(), d.actual.size());
   for (std::size_t i = 0; i < n && shown < kMaxDiffRows; ++i) {
@@ -45,8 +47,10 @@ void AppendDifferingRows(const Discrepancy& d, SortMode sort, std::string& out) 
       continue;
     }
     const std::string label = std::format("row {}:", i);
-    out += std::format("    {} DuckDB {}\n", label, has_e ? d.expected[i] : "(no row)");
-    out += std::format("    {:{}} antb1  {}\n", "", label.size(), has_a ? d.actual[i] : "(no row)");
+    out += std::format("    {} {:{}} {}\n", label, labels.expected, width,
+                       has_e ? d.expected[i] : "(no row)");
+    out += std::format("    {:{}} {:{}} {}\n", "", label.size(), labels.actual, width,
+                       has_a ? d.actual[i] : "(no row)");
     ++shown;
   }
 }
@@ -187,18 +191,21 @@ Discrepancy ErrorDiscrepancy(std::string what, const EngineError& error) {
 }
 
 void AppendDiscrepancy(const Discrepancy& d, std::string_view sql, SortMode sort, bool redact,
-                       std::string& out) {
+                       std::string& out, SideLabels labels) {
   if (redact) {
     if (!d.redacted.empty()) {
       out += "  " + d.redacted + "\n";
     }
     if (d.mismatch) {
-      out += std::format("  rows: DuckDB {}, antb1 {}", d.expected.size(), d.actual.size());
+      out += std::format("  rows: {} {}, {} {}", labels.expected, d.expected.size(), labels.actual,
+                         d.actual.size());
       if (d.first_row.has_value()) {
         out += std::format("; first differing row: {}", *d.first_row);
       }
-      out += std::format("\n  sha256: DuckDB {}\n          antb1  {}\n",
-                         Sha256Hex(Join(d.expected)), Sha256Hex(Join(d.actual)));
+      const std::size_t width = std::max(labels.expected.size(), labels.actual.size());
+      out +=
+          std::format("\n  sha256: {:{}} {}\n          {:{}} {}\n", labels.expected, width,
+                      Sha256Hex(Join(d.expected)), labels.actual, width, Sha256Hex(Join(d.actual)));
     }
     return;
   }
@@ -215,7 +222,7 @@ void AppendDiscrepancy(const Discrepancy& d, std::string_view sql, SortMode sort
     pos = end + 1;
   }
   if (d.mismatch) {
-    AppendDifferingRows(d, sort, out);
+    AppendDifferingRows(d, sort, labels, out);
   }
 }
 

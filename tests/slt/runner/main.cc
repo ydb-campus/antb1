@@ -8,10 +8,16 @@
 //   antb1-slt queries --fixtures DIR --tables FILE [--redact] [--only LINE] [--mutate KIND] FILE
 //   antb1-slt clickbench --fixtures DIR --tables FILE --status FILE [--redact] [--only N]
 //                        [--mutate KIND] QUERIES
+//   antb1-slt answers --fixtures DIR --tables FILE --queries DIR --answers DIR [--only N]
+//                     [--mutate KIND]
 //   antb1-slt version
 //
 // `queries` and `clickbench` run the ClickBench data tests (tests/data): see query_file.h and
-// clickbench.h.
+// clickbench.h. `answers` checks stored answers against the DuckDB oracle (answers.h).
+//
+// Redaction: --redact, a table with the `redact` option (tables.h) and `answers` print no values
+// and no SQL. --show-values lifts the last two for a local repro; it is refused when
+// GITHUB_ACTIONS=true, as CI logs are public.
 //
 // Exit codes: 0 every record (query) passed, 1 failures, 2 usage or .slt syntax error, 3 setup
 // error (tables, fixtures, engine), 70 internal error.
@@ -39,6 +45,7 @@
 
 #include "antb1/engine/session.h"
 
+#include "answers.h"
 #include "antb1_engine.h"
 #include "clickbench.h"
 #include "difftest.h"
@@ -71,6 +78,7 @@ struct Args {
   std::string test_name;
   std::string mutate = "none";
   bool redact = false;
+  bool show_values = false;
   // antb1 engine::SessionOptions; --same-as-threads also runs every query with that many threads
   // and requires identical results.
   int threads = 1;
@@ -87,6 +95,9 @@ struct Args {
   // queries, clickbench
   std::string query_file;
   std::string status;
+  // answers
+  std::string queries_dir;
+  std::string answers_dir;
 };
 
 std::string ShellQuote(std::string_view arg) {
@@ -103,12 +114,13 @@ std::string ShellQuote(std::string_view arg) {
   return out + "'";
 }
 
-// The command line of this run without --redact and --only (diff repro lines add their own).
-std::string CommandLine(std::span<char*> argv) {
+// The command line of this run without --redact, --show-values and --only (repro lines add their
+// own --only), with --show-values when the run is redacted without --redact (`show_values`).
+std::string CommandLine(std::span<char*> argv, bool show_values) {
   std::string command;
   for (std::size_t i = 0; i < argv.size(); ++i) {
     const std::string_view arg = argv[i];
-    if (arg == "--redact" || arg.starts_with("--only=")) {
+    if (arg == "--redact" || arg == "--show-values" || arg.starts_with("--only=")) {
       continue;
     }
     if (arg == "--only") {
@@ -117,12 +129,28 @@ std::string CommandLine(std::span<char*> argv) {
     }
     command += (command.empty() ? "" : " ") + ShellQuote(arg);
   }
-  return command;
+  return show_values ? command + " --show-values" : command;
 }
 
-// The command line of this run without --redact, plus the ctest invocation when known.
-std::string Repro(std::span<char*> argv, const Args& args) {
-  std::string command = "    " + CommandLine(argv) + "\n";
+// GITHUB_ACTIONS=true in main's environment `envp` (std::getenv is not thread-safe).
+bool OnGitHubActions(char* const* envp) {
+  for (char* const* entry = envp; entry != nullptr && *entry != nullptr; ++entry) {
+    if (std::string_view(*entry) == "GITHUB_ACTIONS=true") {
+      return true;
+    }
+  }
+  return false;
+}
+
+// The tables file of `pixi run diff-random` (scripts/diff-random.sh).
+bool IsDiffRandomTables(const std::string& tables) {
+  const std::string path = fs::path(tables).lexically_normal().generic_string();
+  return path == "tests/slt/tables.txt" || path.ends_with("/tests/slt/tables.txt");
+}
+
+// The command line of the run (CommandLine), plus the ctest invocation when known.
+std::string Repro(const std::string& command_line, const Args& args) {
+  std::string command = "    " + command_line + "\n";
   if (!args.test_name.empty()) {
     std::string regex;
     for (const char c : args.test_name) {
@@ -211,7 +239,7 @@ std::expected<Loaded, std::string> Load(const std::string& path, const Args& arg
   return Loaded{.text = std::move(*text), .file = std::move(*file)};
 }
 
-int Run(const Args& args, const std::vector<TableDef>& tables, std::span<char*> argv) {
+int Run(const Args& args, const std::vector<TableDef>& tables, const std::string& command) {
   const auto mutation = ParseMutation(args.mutate);
   if (!mutation.has_value()) {
     std::println(stderr, "antb1-slt: unknown --mutate kind '{}' (known: {})", args.mutate,
@@ -222,7 +250,7 @@ int Run(const Args& args, const std::vector<TableDef>& tables, std::span<char*> 
     std::println(stderr, "antb1-slt: --mutate corrupts antb1 results; use it with --engine antb1");
     return kExitUsage;
   }
-  const RunOptions options{.redact = args.redact, .repro = Repro(argv, args)};
+  const RunOptions options{.redact = args.redact, .repro = Repro(command, args)};
   RunStats total;
   for (const auto& path : args.files) {
     auto loaded = Load(path, args);
@@ -303,6 +331,9 @@ void AddSetup(CLI::App* cmd, Args& args) {
   cmd->add_option("--same-as-threads", args.same_as_threads,
                   "antb1: also run every query with this many threads; results must be identical")
       ->check(CLI::Range(1, engine::Session::kMaxThreads));
+  cmd->add_flag("--show-values", args.show_values,
+                "Print values and SQL also for tables marked `redact` and for `answers` (local "
+                "repro only; refused when GITHUB_ACTIONS=true)");
 }
 
 void AddCommon(CLI::App* cmd, Args& args) {
@@ -310,7 +341,7 @@ void AddCommon(CLI::App* cmd, Args& args) {
   cmd->add_option("files", args.files, ".slt files")->required();
 }
 
-int Diff(const Args& args, std::vector<TableDef> tables, std::span<char*> argv) {
+int Diff(const Args& args, std::vector<TableDef> tables, const std::string& command) {
   const auto mutation = ParseMutation(args.mutate);
   if (!mutation.has_value()) {
     std::println(stderr, "antb1-slt: unknown --mutate kind '{}' (known: {})", args.mutate,
@@ -365,8 +396,11 @@ int Diff(const Args& args, std::vector<TableDef> tables, std::span<char*> argv) 
   if (*mutation != Mutation::kNone) {
     mutating = MakeMutatingEngine(**antb1, *mutation);
   }
-  const DiffOptions options{
-      .count = args.count, .only = args.only, .redact = args.redact, .command = CommandLine(argv)};
+  const DiffOptions options{.count = args.count,
+                            .only = args.only,
+                            .redact = args.redact,
+                            .pixi_repro = IsDiffRandomTables(args.tables),
+                            .command = command};
   std::string out;
   const DiffStats stats =
       RunDiff(*generator, mutating ? *mutating : **antb1, **oracle, options, out);
@@ -411,7 +445,7 @@ std::expected<std::vector<Statement>, std::string> LoadStatements(const std::str
   return statements;
 }
 
-int Queries(const Args& args, const std::vector<TableDef>& tables, std::span<char*> argv) {
+int Queries(const Args& args, const std::vector<TableDef>& tables, const std::string& command) {
   auto statements = LoadStatements(args.query_file);
   if (!statements) {
     std::println(stderr, "{}", statements.error());
@@ -430,8 +464,7 @@ int Queries(const Args& args, const std::vector<TableDef>& tables, std::span<cha
     std::println(stderr, "antb1-slt: {}", !antb1 ? antb1.error() : oracle.error());
     return kExitSetup;
   }
-  const QueryFileOptions options{
-      .redact = args.redact, .only_line = args.only, .command = CommandLine(argv)};
+  const QueryFileOptions options{.redact = args.redact, .only_line = args.only, .command = command};
   std::string out;
   const QueryFileStats stats = RunQueryFile(args.query_file, *statements, kSupportedFeatures,
                                             antb1->get(), **oracle, options, out);
@@ -439,7 +472,7 @@ int Queries(const Args& args, const std::vector<TableDef>& tables, std::span<cha
   return stats.failed == 0 ? 0 : kExitFailed;
 }
 
-int ClickBench(const Args& args, const std::vector<TableDef>& tables, std::span<char*> argv) {
+int ClickBench(const Args& args, const std::vector<TableDef>& tables, const std::string& command) {
   auto queries = LoadStatements(args.query_file);
   if (!queries) {
     std::println(stderr, "{}", queries.error());
@@ -461,10 +494,8 @@ int ClickBench(const Args& args, const std::vector<TableDef>& tables, std::span<
     std::println(stderr, "antb1-slt: {}", !antb1 ? antb1.error() : oracle.error());
     return kExitSetup;
   }
-  const ClickBenchOptions options{.redact = args.redact,
-                                  .only = args.only,
-                                  .status_path = args.status,
-                                  .command = CommandLine(argv)};
+  const ClickBenchOptions options{
+      .redact = args.redact, .only = args.only, .status_path = args.status, .command = command};
   std::string out;
   const ClickBenchStats stats =
       RunClickBench(*queries, *status, antb1->get(), **oracle, options, out);
@@ -472,7 +503,35 @@ int ClickBench(const Args& args, const std::vector<TableDef>& tables, std::span<
   return stats.failed == 0 ? 0 : kExitFailed;
 }
 
-int Main(std::span<char*> argv) {
+int Answers(const Args& args, const std::vector<TableDef>& tables, const std::string& command) {
+  const auto mutation = ParseMutation(args.mutate);
+  if (!mutation.has_value()) {
+    std::println(stderr, "antb1-slt: unknown --mutate kind '{}' (known: {})", args.mutate,
+                 kMutationNames);
+    return kExitUsage;
+  }
+  auto queries = LoadAnswerQueries(args.queries_dir, args.answers_dir, args.redact);
+  if (!queries) {
+    std::println(stderr, "antb1-slt: {}", queries.error());
+    return kExitSetup;
+  }
+  auto oracle = MakeEngine("duckdb", tables, args);
+  if (!oracle) {
+    std::println(stderr, "antb1-slt: {}", oracle.error());
+    return kExitSetup;
+  }
+  std::unique_ptr<Engine> mutating;
+  if (*mutation != Mutation::kNone) {
+    mutating = MakeMutatingEngine(**oracle, *mutation);
+  }
+  const AnswersOptions options{.redact = args.redact, .only = args.only, .command = command};
+  std::string out;
+  const AnswersStats stats = RunAnswers(*queries, mutating ? *mutating : **oracle, options, out);
+  std::print("{}", out);
+  return stats.failed == 0 ? 0 : kExitFailed;
+}
+
+int Main(std::span<char*> argv, bool github_actions) {
   CLI::App app{"antb1-slt: sqllogictest runner (antb1 engine, DuckDB oracle)", "antb1-slt"};
   app.require_subcommand(1);
   Args args;
@@ -522,11 +581,26 @@ int Main(std::span<char*> argv) {
       "Never print values or query text (only query numbers, types, counts, sha256)");
   clickbench->add_option("--only", args.only, "Run only Q<n> (repro)");
   clickbench->add_option("--mutate", args.mutate, "Corrupt antb1 results (harness self-tests)");
+  auto* answers = app.add_subcommand(
+      "answers", "Check stored answers (qNN.csv) against DuckDB's results to the queries qNN.sql");
+  AddSetup(answers, args);
+  answers->add_option("--queries", args.queries_dir, "Directory of q01.sql, q02.sql, ...")
+      ->required();
+  answers->add_option("--answers", args.answers_dir, "Directory of q01.csv, q02.csv, ...")
+      ->required();
+  answers->add_option("--only", args.only, "Run only Q<n> (repro)");
+  answers->add_option("--mutate", args.mutate, "Corrupt DuckDB's results (harness self-tests)");
   const auto* version = app.add_subcommand("version", "Print the DuckDB version the oracle uses");
   try {
     app.parse(static_cast<int>(argv.size()), argv.data());
   } catch (const CLI::ParseError& e) {
     return app.exit(e) == 0 ? 0 : kExitUsage;
+  }
+  if (args.show_values && github_actions) {
+    std::println(stderr,
+                 "antb1-slt: --show-values prints values and query text; it is refused when "
+                 "GITHUB_ACTIONS=true, as CI logs are public");
+    return kExitUsage;
   }
   if (version->parsed()) {
 #ifdef ANTB1_SLT_HAVE_DUCKDB
@@ -549,24 +623,46 @@ int Main(std::span<char*> argv) {
     std::println(stderr, "antb1-slt: {}", tables.error());
     return kExitSetup;
   }
+  // Redacted unless --show-values: tables marked `redact`, and `answers`.
+  const bool redacted_data = answers->parsed() || std::ranges::any_of(*tables, &TableDef::redact);
+  if (redacted_data && complete->parsed()) {
+    std::println(stderr,
+                 "antb1-slt: complete writes values into .slt files; it is refused for tables "
+                 "marked `redact` in {}",
+                 args.tables);
+    return kExitUsage;
+  }
+  args.redact = args.redact || (redacted_data && !args.show_values);
+  if (diff->parsed() && args.list && args.redact) {
+    std::println(stderr,
+                 "antb1-slt: diff --list prints the generated SQL, which holds values of the "
+                 "tables; it is refused in a redacted run (--redact, or tables marked `redact` "
+                 "without --show-values)");
+    return kExitUsage;
+  }
+  const std::string command = CommandLine(argv, redacted_data);
   if (diff->parsed()) {
-    return Diff(args, *tables, argv);
+    return Diff(args, *tables, command);
   }
   if (queries->parsed()) {
-    return Queries(args, *tables, argv);
+    return Queries(args, *tables, command);
   }
   if (clickbench->parsed()) {
-    return ClickBench(args, *tables, argv);
+    return ClickBench(args, *tables, command);
   }
-  return complete->parsed() ? Complete(args, *tables) : Run(args, *tables, argv);
+  if (answers->parsed()) {
+    return Answers(args, *tables, command);
+  }
+  return complete->parsed() ? Complete(args, *tables) : Run(args, *tables, command);
 }
 
 }  // namespace
 }  // namespace antb1::slt
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv, char* const* envp) {
   try {
-    return antb1::slt::Main(std::span(argv, static_cast<std::size_t>(argc)));
+    return antb1::slt::Main(std::span(argv, static_cast<std::size_t>(argc)),
+                            antb1::slt::OnGitHubActions(envp));
   } catch (const std::exception& e) {
     std::fputs("antb1-slt: internal error: ", stderr);  // C stdio: cannot throw again
     std::fputs(e.what(), stderr);

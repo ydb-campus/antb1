@@ -135,6 +135,30 @@ TEST(RunDiff, MismatchPrintsSeedCaseSqlRowsAndRepro) {
   EXPECT_NE(r.out.find("DIFF: FAIL"), std::string::npos);
 }
 
+// Over other tables than those of `pixi run diff-random`, only the command line reproduces a case.
+TEST(RunDiff, OtherTablesReproduceWithTheCommandLineOnly) {
+  const auto gen = Generator(40);
+  const auto parse_error = [](const std::string& sql) {
+    return UsesOnlyCountStar(sql) ? ExecResult(Ints({"13"}))
+                                  : ExecResult(std::unexpected(EngineError{
+                                        .kind = "parse", .message = "parse: expected FROM"}));
+  };
+  DiffOptions options{.count = 50, .pixi_repro = false, .command = "antb1-slt diff --seed 42"};
+  DiffRun r = Diff(gen, parse_error, Oracle, options);
+  EXPECT_GT(r.stats.failed, 0U);
+  EXPECT_GT(r.stats.rejected, 0U);
+  EXPECT_NE(r.out.find("  repro:\n    antb1-slt diff --seed 42 --only "), std::string::npos)
+      << r.out;
+  EXPECT_NE(r.out.find("; see one with antb1-slt diff --seed 42 --only <case>)"), std::string::npos)
+      << r.out;
+  EXPECT_FALSE(r.out.contains("pixi run diff-random")) << r.out;
+  // Without a command line there is nothing to print.
+  options.command.clear();
+  r = Diff(gen, parse_error, Oracle, options);
+  EXPECT_FALSE(r.out.contains("repro")) << r.out;
+  EXPECT_FALSE(r.out.contains("see one with")) << r.out;
+}
+
 TEST(RunDiff, EngineTypesMustMatchNotOnlyTheColumnClass) {
   const auto gen = Generator(0);
   const DiffRun r = Diff(gen,
