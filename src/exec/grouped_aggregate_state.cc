@@ -600,7 +600,7 @@ class GroupedMinMax final : public GroupedAggregateState {
 
 arrow::Result<std::unique_ptr<GroupedAggregateState>> SumState(bool average,
                                                                plan::LogicalType input) {
-  switch (input) {
+  switch (input.id()) {
     case plan::LogicalType::kSmallInt:
       return std::make_unique<GroupedIntegerSum<arrow::Int16Type>>(average);
     case plan::LogicalType::kInteger:
@@ -624,7 +624,7 @@ arrow::Result<std::unique_ptr<GroupedAggregateState>> SumState(bool average,
 
 std::unique_ptr<GroupedAggregateState> MinMaxState(bool min, plan::LogicalType input) {
   auto type = plan::ToArrow(input);
-  switch (input) {
+  switch (input.id()) {
     case plan::LogicalType::kSmallInt:
       return std::make_unique<GroupedMinMax<arrow::Int16Type>>(min, std::move(type));
     case plan::LogicalType::kInteger:

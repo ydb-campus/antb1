@@ -1051,7 +1051,7 @@ arrow::Result<Predicate> BindEquality(const sql::Comparison& cmp, const BoundCol
               .op = ToPlan(cmp.op),
               .constant = Constant{.type = column.type, .value = Int128{0}},
               .span = cmp.span};
-  switch (column.type) {
+  switch (column.type.id()) {
     case LogicalType::kSmallInt:
     case LogicalType::kInteger:
     case LogicalType::kBigInt:
@@ -1287,7 +1287,7 @@ Typed ColumnLeaf(int index, LogicalType type, std::string name, bool stored_as_f
 
 // The rank of an integer type among the signed ones (USMALLINT: none).
 int SignedRank(LogicalType type) {
-  switch (type) {
+  switch (type.id()) {
     case LogicalType::kSmallInt:
       return 1;
     case LogicalType::kInteger:
