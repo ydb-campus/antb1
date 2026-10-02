@@ -95,11 +95,16 @@ steps (only step 7 uses more than one thread):
    its column's type ([Binding](sql-subset.md#binding)); `HAVING` binds the same way against the aggregation's output
    and becomes a `Filter` above it. The result is a `plan::LogicalPlan`: a tree of immutable
    nodes in a `std::variant` (`Scan`, `Filter`, `Compute`, `Project`, `Aggregate`, `GroupAggregate`, `Sort`, `Limit`,
-   `RowCount`) plus the output columns.
+   `RowCount`) plus the output columns. Every column gets a `plan::ColumnId` where it is created (a field, a computed
+   expression, an aggregate call or key, a select item), and a column reference names the column it reads by id and
+   by its position in the input ([ADR 0022](adr/0022-joins-and-query-blocks.md)).
 5. Optimize (`plan::Optimize`): `COUNT(*)` without `WHERE` to `RowCount`; a `GROUP BY` key computed only from other
    (not DOUBLE) keys is dropped from the `GroupAggregate` and computed once per group above it, unless a `Limit`
    without a `Sort` reads it (ADR 0018);
-   `Limit` below `Project`; and projection pruning (a `Scan` reads only the fields used above it).
+   `Limit` below `Project`; and projection pruning (a `Scan` reads only the fields used above it). Columns keep their
+   ids through every rule, and the last step, `plan::ResolvePositions`, sets every position from the ids. Until the
+   rules work on ids, `Bind` and `Optimize` both check that the positions they compute are those of the ids
+   (`plan::CheckPositions`, always on).
 6. Physical plan (`exec::BuildPhysicalPlan`): an exhaustive `std::visit` turns each logical node into an operator
    over the operator of its input; a `Limit` over a `Sort` becomes one top-N `SortOperator` (over a partitioned
    `GROUP BY`, each partition first keeps its own top rows, ADR 0011). A global aggregation

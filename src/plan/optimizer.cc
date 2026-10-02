@@ -74,6 +74,7 @@ LogicalNodePtr CountStarToRowCount(const LogicalNodePtr& node) {
         scan->table->exact_row_count().has_value()) {
       return Make(RowCountNode{.table = scan->table,
                                .table_name = scan->table_name,
+                               .id = agg->aggregates.front().id,
                                .span = agg->aggregates.front().span});
     }
   }
@@ -132,40 +133,54 @@ LogicalNodePtr GroupByDeterminingKeys(const GroupAggregateNode& group) {
   if (std::ranges::none_of(dependent, [](bool d) { return d; })) {
     return nullptr;
   }
-  // The GroupAggregate by the determining keys; `position` maps an input column that is a kept
-  // key to its output position.
+  // The GroupAggregate by the determining keys; `position` and `id` map an input column that is a
+  // kept key to its output position and column.
   GroupAggregateNode kept = group;
   kept.keys.clear();
+  kept.key_ids.clear();
   std::vector<int> position(Narrow<std::size_t>(width), -1);
+  std::vector<ColumnId> id(Narrow<std::size_t>(width), kNoColumnId);
   for (std::size_t k = 0; k < group.keys.size(); ++k) {
     if (!dependent[k]) {
       if (group.keys[k].index < width) {
         position[Narrow<std::size_t>(group.keys[k].index)] = Narrow<int>(kept.keys.size());
+        id[Narrow<std::size_t>(group.keys[k].index)] = group.key_ids.at(k);
       }
       kept.keys.push_back(group.keys[k]);
+      kept.key_ids.push_back(group.key_ids.at(k));
     }
   }
   const std::size_t kept_width = kept.keys.size() + kept.aggregates.size();
-  // The dependent keys over its output, in key order.
-  ComputeNode above{.input = Make(std::move(kept)), .exprs = {}, .span = compute->span};
-  ProjectNode out{.input = nullptr, .columns = {}, .constants = {}, .span = group.span};
+  // The dependent keys over its output, in key order, each the column it was as a key; the Project
+  // passes every column through, so the nodes above read the same columns as before.
+  ComputeNode above{.input = Make(std::move(kept)), .exprs = {}, .ids = {}, .span = compute->span};
+  ProjectNode out{.input = nullptr, .columns = {}, .constants = {}, .ids = {}, .span = group.span};
   int next_kept = 0;
   for (std::size_t k = 0; k < group.keys.size(); ++k) {
     BoundColumn column = group.keys[k];
+    column.id = group.key_ids.at(k);
     if (dependent[k]) {
-      const ExprPtr& expr = compute->exprs.at(Narrow<std::size_t>(column.index - width));
+      const ExprPtr& expr = compute->exprs.at(Narrow<std::size_t>(group.keys[k].index - width));
       column.index = Narrow<int>(kept_width + above.exprs.size());
-      above.exprs.push_back(Renumber(expr, position));
+      above.exprs.push_back(MapColumns(expr, [&](const ColumnExpr& read) {
+        const auto at = Narrow<std::size_t>(read.index);
+        ANTB1_CHECK(position.at(at) >= 0);
+        return ColumnExpr{.index = position.at(at), .id = id.at(at)};
+      }));
+      above.ids.push_back(column.id);
     } else {
       column.index = next_kept++;
     }
+    out.ids.push_back(column.id);
     out.columns.push_back(std::move(column));
   }
   for (std::size_t i = 0; i < group.aggregates.size(); ++i) {
     const AggregateCall& call = group.aggregates[i];
     out.columns.push_back(BoundColumn{.index = Narrow<int>(static_cast<std::size_t>(next_kept) + i),
+                                      .id = call.id,
                                       .name = CallName(call),
                                       .type = call.type});
+    out.ids.push_back(call.id);
   }
   out.input = Make(std::move(above));
   return Make(std::move(out));
@@ -270,11 +285,13 @@ struct Pruner {
   Pruned operator()(const ScanNode& scan) const {
     ScanNode out = scan;
     out.fields.clear();
+    out.ids.clear();
     Remap remap(scan.fields.size(), -1);
     for (std::size_t i = 0; i < scan.fields.size(); ++i) {
       if (needed.at(i)) {
         remap[i] = Narrow<int>(out.fields.size());
         out.fields.push_back(scan.fields[i]);
+        out.ids.push_back(scan.ids.at(i));
       }
     }
     return Pruned{.node = Make(std::move(out)), .remap = std::move(remap)};
@@ -325,11 +342,12 @@ struct Pruner {
     if (kept.empty()) {
       return Pruned{.node = in.node, .remap = std::move(remap)};
     }
-    ComputeNode out{.input = in.node, .exprs = {}, .span = compute.span};
+    ComputeNode out{.input = in.node, .exprs = {}, .ids = {}, .span = compute.span};
     const std::size_t new_width = OutputWidth(*in.node);
     for (const std::size_t k : kept) {
       remap[width + k] = Narrow<int>(new_width + out.exprs.size());
       out.exprs.push_back(plan::Renumber(compute.exprs[k], in.remap));
+      out.ids.push_back(compute.ids.at(k));
     }
     return Pruned{.node = Make(std::move(out)), .remap = std::move(remap)};
   }
@@ -437,7 +455,9 @@ LogicalPlan Optimize(const LogicalPlan& plan) {
       LimitBelowProject(DependentKeys(CountStarToRowCount(plan.root), /*limited=*/false));
   const std::size_t width = OutputWidth(*root);
   Pruned pruned = Prune(root, std::vector<bool>(width, true));
-  return LogicalPlan{.root = std::move(pruned.node), .output = plan.output};
+  const LogicalPlan optimized{.root = std::move(pruned.node), .output = plan.output};
+  CheckPositions(optimized);  // the rules' positions are the positions of the ids (ADR 0022, P1)
+  return ResolvePositions(optimized);
 }
 
 }  // namespace antb1::plan

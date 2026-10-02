@@ -1,8 +1,10 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
+#include <source_location>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -19,19 +21,33 @@
 // Logical plan: a tree of immutable nodes (docs/architecture.md). The binder builds
 //
 //   [Limit] <- [Project] <- [Sort] <- [Filter] <- [Compute] <- [Aggregate | GroupAggregate]
-//     <- [Filter] <- [Compute] <- [Filter] <- Scan (every field)
+//     <- [Compute] <- [Filter] <- [Compute] <- [Filter] <- Scan (every field)
 //
 // and plan::Optimize rewrites it (COUNT(*) -> RowCount, GROUP BY keys that are functions of
 // other keys, Limit below Project, projection pruning).
+//
+// Every column has a plan-unique ColumnId, defined once by the node that creates it (see
+// OutputIds); a column reference (BoundColumn, ColumnExpr) names the column it reads by its id and
+// by its `index`, the position in the input's output, which plan::ResolvePositions computes from
+// the ids (ADR 0022).
 // New operators are added as new node structs in the LogicalNode variant; every std::visit over it
 // lists each node explicitly, so the physical planner and EXPLAIN fail to compile until they handle
 // a new one.
 
 namespace antb1::plan {
 
+// The identity of a column in a plan: minted from 1 per query, in binding order. A column keeps
+// its id when its position changes; Filter, Sort and Limit pass their input's ids through.
+enum class ColumnId : std::uint32_t {};
+
+// No column: the reference of a Project constant, the operand-local columns of a PredicateExpr,
+// and the references of the executor's positional plans.
+inline constexpr ColumnId kNoColumnId{};
+
 struct OutputColumn {
   std::string name;
   LogicalType type = LogicalType::kBigInt;
+  ColumnId id = kNoColumnId;  // the root's output column
 };
 
 enum class CompareOp : std::uint8_t { kEq, kNe, kLt, kLe, kGt, kGe };
@@ -79,8 +95,9 @@ std::string_view ToString(ArithOp op);
 
 // A column of a node's input.
 struct BoundColumn {
-  int index = 0;     // position in the input node's output columns
-  std::string name;  // the table column's name as declared in the table schema
+  int index = 0;              // position in the input node's output columns
+  ColumnId id = kNoColumnId;  // the column read
+  std::string name;           // the table column's name as declared in the table schema
   LogicalType type = LogicalType::kBigInt;
 };
 
@@ -113,6 +130,7 @@ using ExprPtr = std::shared_ptr<const Expr>;
 // A column of the input of the node that evaluates the expression.
 struct ColumnExpr {
   int index = 0;
+  ColumnId id = kNoColumnId;
 };
 
 struct ConstantExpr {
@@ -191,6 +209,10 @@ bool SameExpr(const Expr& a, const Expr& b);
 // The expression with every column index i replaced by remap[i] (which must be >= 0).
 ExprPtr Renumber(const ExprPtr& expr, const std::vector<int>& remap);
 
+// The expression with every column replaced by f(column); the same pointer when no column changes.
+// The operand-local columns of a PredicateExpr's predicate are no ColumnExpr and stay as they are.
+ExprPtr MapColumns(const ExprPtr& expr, const std::function<ColumnExpr(const ColumnExpr&)>& f);
+
 // Every input column the expression reads.
 void CollectColumns(const Expr& expr, std::vector<int>& out);
 
@@ -198,6 +220,7 @@ struct AggregateCall {
   AggKind kind = AggKind::kCountStar;
   std::optional<BoundColumn> arg;           // empty for COUNT(*)
   LogicalType type = LogicalType::kBigInt;  // result type
+  ColumnId id = kNoColumnId;                // the result column
   SourceSpan span;                          // the call in the query
 };
 
@@ -218,9 +241,10 @@ using LogicalNodePtr = std::shared_ptr<const LogicalNode>;
 // Reads top-level fields of a table. Output: the fields, in this order.
 struct ScanNode {
   std::shared_ptr<Table> table;
-  std::string table_name;   // the FROM reference: the name as written, or the path
-  std::vector<int> fields;  // indices into table->schema()
-  SourceSpan span;          // the FROM reference
+  std::string table_name;     // the FROM reference: the name as written, or the path
+  std::vector<int> fields;    // indices into table->schema()
+  std::vector<ColumnId> ids;  // per field: its column
+  SourceSpan span;            // the FROM reference
 };
 
 // Keeps the rows for which every predicate is true (a NULL comparison rejects the row). Output:
@@ -235,17 +259,21 @@ struct FilterNode {
 struct ComputeNode {
   LogicalNodePtr input;
   std::vector<ExprPtr> exprs;  // not empty
+  std::vector<ColumnId> ids;   // per expression: its column
   SourceSpan span;             // the first expression in the query
 };
 
 // Output: the listed input columns, in this order, and constants. When `constants` is not empty it
-// has one entry per output column, and a set entry replaces columns[i] (whose index is then -1):
-// that output column holds the constant in every row.
+// has one entry per output column, and a set entry replaces columns[i] (then with index -1 and id
+// kNoColumnId): that output column holds the constant in every row. `ids` names the
+// output columns: the binder's are new columns; a column whose id is the id it reads passes it
+// through (the optimizer's reordering Project).
 struct ProjectNode {
   LogicalNodePtr input;
   std::vector<BoundColumn> columns;
   std::vector<std::optional<Constant>> constants;
-  SourceSpan span;  // the select list
+  std::vector<ColumnId> ids;  // per output column
+  SourceSpan span;            // the select list
 };
 
 // Global aggregation (no GROUP BY). Output: one row with one column per call.
@@ -259,10 +287,12 @@ struct AggregateNode {
 // value; a DOUBLE key groups -0.0 with 0.0 and every NaN together, keeping the value first seen).
 // Output: the keys, then one column per call; no row over no input rows. Without keys (GROUP BY
 // only constants) there is one group when there is any input row. Row order is unspecified
-// (deterministic for a given input in the executor).
+// (deterministic for a given input in the executor). A key's output is a new column (`key_ids`):
+// it is not the input column it groups by (one value per group, merged as above).
 struct GroupAggregateNode {
   LogicalNodePtr input;
   std::vector<BoundColumn> keys;  // distinct input columns
+  std::vector<ColumnId> key_ids;  // per key: its output column
   std::vector<AggregateCall> aggregates;
   SourceSpan span;  // GROUP BY and its list
 };
@@ -296,12 +326,14 @@ struct LimitNode {
 struct RowCountNode {
   std::shared_ptr<Table> table;
   std::string table_name;
-  SourceSpan span;  // the COUNT(*) call
+  ColumnId id = kNoColumnId;  // the COUNT(*) column
+  SourceSpan span;            // the COUNT(*) call
 };
 
 struct LogicalPlan {
   LogicalNodePtr root;
-  std::vector<OutputColumn> output;  // result columns of root: names (aliases applied) and types
+  // Result columns of root: names (aliases applied), types and ids (OutputIds(*root)).
+  std::vector<OutputColumn> output;
 };
 
 // "Scan", "Filter", "Compute", "Project", "Aggregate", "GroupAggregate", "Sort", "Limit" or
@@ -313,5 +345,30 @@ SourceSpan SpanOf(const LogicalNode& node);
 
 // The input of a node; nullptr for leaves (Scan, RowCount).
 const LogicalNodePtr* InputOf(const LogicalNode& node);
+
+// The ids of a node's output columns, in order. A node defines new columns where it creates them:
+// Scan (`ids`), Compute (its input's ids, then `ids`), Project (`ids`), Aggregate (each call's id),
+// GroupAggregate (`key_ids`, then each call's id) and RowCount (`id`); Filter, Sort and Limit
+// output their input's ids.
+std::vector<ColumnId> OutputIds(const LogicalNode& node);
+
+// The plan with every reference's index set to the position of its id in the ids it reads (its
+// input's output ids); unchanged nodes keep their pointers, so the result of a resolved plan is the
+// plan itself. The last step of plan::Optimize. A plan that breaks an invariant (see
+// PositionMismatch) is a programming error: the process aborts with a description that names node
+// kinds, ids and positions only.
+LogicalPlan ResolvePositions(const LogicalPlan& plan);
+
+// Why the plan is not resolved, or std::nullopt: the first broken invariant (a reference without an
+// id, or whose id is not exactly once among the ids it reads; a column defined twice in the plan,
+// or without an id; a list of ids whose length differs from its columns'; output ids that are not
+// the root's), else the first index that differs from its resolved position, e.g. "Filter: column
+// #12 is at 3, not 4". The binder and the optimizer still compute positions themselves; Bind and
+// Optimize abort when this finds a difference (ADR 0022, PR P1).
+std::optional<std::string> PositionMismatch(const LogicalPlan& plan);
+
+// Aborts with the PositionMismatch description, if there is one, reported at the caller.
+void CheckPositions(const LogicalPlan& plan,
+                    std::source_location location = std::source_location::current());
 
 }  // namespace antb1::plan

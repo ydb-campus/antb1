@@ -7,6 +7,7 @@
 #include <memory>
 #include <optional>
 #include <ostream>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -1694,6 +1695,45 @@ TEST(BinderTest, DuplicateRegistrationFails) {
   ASSERT_TRUE(catalog.Register("t", table).ok());
   EXPECT_TRUE(catalog.Register("T", table).IsAlreadyExists());
   EXPECT_TRUE(catalog.Register("x", nullptr).IsInvalid());
+}
+
+// Every column a bound plan creates has its own id, and the binder's positions are the positions of
+// the ids (ADR 0022).
+TEST(BinderTest, ColumnIdsAreUniqueAndResolve) {
+  const auto catalog = MakeCatalog();
+  constexpr const char* kGrouped =
+      "SELECT i32, i32 + 1, SUM(i32 + 1) FROM t GROUP BY i32, i32 + 1 HAVING SUM(i32 + 1) > 2 "
+      "ORDER BY 2";
+  for (const char* sql :
+       {"SELECT * FROM ok",
+        "SELECT i16 + 1, s FROM t WHERE i32 // 2 > 0 AND (i16 > 1 OR NOT s = 'x')", kGrouped,
+        "SELECT SUM(i32 + 1), COUNT(*) FROM t HAVING SUM(i32 + 1) > 0",
+        "SELECT 1, 'a', i16 FROM t ORDER BY i16 LIMIT 2"}) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql;
+    std::vector<ColumnId> output;
+    for (const OutputColumn& column : plan->output) {
+      output.push_back(column.id);
+    }
+    EXPECT_EQ(output, OutputIds(*plan->root)) << sql;
+  }
+
+  // A column the select list reads twice gives two output columns; a constant reads no column.
+  auto twice = BindSql("SELECT s, i16, s, 1 FROM t", catalog);
+  ASSERT_TRUE(twice.ok());
+  const auto& project = std::get<ProjectNode>(*twice->root);
+  EXPECT_EQ(project.columns.at(0).id, project.columns.at(2).id);
+  EXPECT_EQ(project.columns.at(3).id, kNoColumnId);
+  EXPECT_EQ(std::set<ColumnId>(project.ids.begin(), project.ids.end()).size(), 4U);
+
+  // A GROUP BY key's output is a new column (one value per group), which the select list reads.
+  auto grouped = BindSql("SELECT i32, COUNT(*) FROM t GROUP BY i32", catalog);
+  ASSERT_TRUE(grouped.ok());
+  const auto& group = std::get<GroupAggregateNode>(Nth(*grouped, 1));
+  ASSERT_EQ(group.key_ids.size(), 1U);
+  EXPECT_NE(group.key_ids[0], group.keys.at(0).id);
+  EXPECT_EQ(std::get<ProjectNode>(*grouped->root).columns.at(0).id, group.key_ids[0]);
 }
 
 }  // namespace
