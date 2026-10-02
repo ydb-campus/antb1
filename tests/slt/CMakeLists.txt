@@ -2,6 +2,7 @@
 add_library(
   antb1_slt_lib
   STATIC
+  runner/answers.cc
   runner/antb1_engine.cc
   runner/canonical.cc
   runner/clickbench.cc
@@ -39,6 +40,7 @@ antb1_add_gtest(
   LABEL harness
   PREFIX harness
   SOURCES
+    tests/answers_test.cc
     tests/antb1_engine_test.cc
     tests/canonical_test.cc
     tests/clickbench_test.cc
@@ -51,6 +53,7 @@ antb1_add_gtest(
     tests/runner_test.cc
     tests/slt_file_test.cc
     tests/supported_features_test.cc
+    tests/tables_test.cc
   LIBS antb1_slt_lib Parquet::parquet_shared
 )
 if(ANTB1_HAVE_DUCKDB)
@@ -342,6 +345,247 @@ if(ANTB1_HAVE_DUCKDB)
       COMMAND $<TARGET_FILE:antb1-slt> clickbench ${_args} "${_queries}"
     )
   endforeach()
+
+  # `antb1-slt answers` (runner/answers.h) on our own queries over the canary table and their answers, written
+  # into the build tree (lint R009 keeps files named like q01.sql out of the repository). Each answer is spelled
+  # as a check must accept it: a DECIMAL without its trailing zeros (Q2), rows in another order (Q3), NULL as an
+  # empty field (Q4). The run passes; with --mutate canary every query fails, and the report, redacted without
+  # --redact, prints no SQL and no value. --show-values prints them (here our own canary values, so the test unsets
+  # GITHUB_ACTIONS) and is refused on GitHub Actions.
+  set(_answers_dir "${CMAKE_CURRENT_BINARY_DIR}/answers-canary")
+  file(WRITE "${_answers_dir}/queries/q01.sql" "SELECT COUNT(*) /* ANTB1_CANARY_SQL */ FROM antb1_canary_table;\n")
+  file(WRITE "${_answers_dir}/answers/q01.csv" "count_star()\n12\n")
+  file(
+    WRITE "${_answers_dir}/queries/q02.sql"
+    "SELECT SUM(CAST(id AS DECIMAL(15,2))) AS total FROM antb1_canary_table;\n"
+  )
+  file(WRITE "${_answers_dir}/answers/q02.csv" "total\n66\n")
+  file(
+    WRITE "${_answers_dir}/queries/q03.sql"
+    "SELECT id, 'antb1_canary_text' AS t FROM antb1_canary_table WHERE id < 3;\n"
+  )
+  file(WRITE "${_answers_dir}/answers/q03.csv" "id|t\n2|antb1_canary_text\n1|antb1_canary_text\n0|antb1_canary_text\n")
+  file(
+    WRITE "${_answers_dir}/queries/q04.sql"
+    "SELECT CAST(NULL AS INTEGER) AS n FROM antb1_canary_table WHERE id = 0;\n"
+  )
+  file(WRITE "${_answers_dir}/answers/q04.csv" "n\n\n")
+  set(_answers_args --queries "${_answers_dir}/queries" --answers "${_answers_dir}/answers")
+  set(_cases pass redact show_values show_values_on_ci)
+  set(_opts_pass "")
+  set(_exit_pass 0)
+  set(
+    _require_pass
+    "Q1: pass\n"
+    "Q2: pass\n"
+    "Q3: pass \\(rows in another order\\)\n"
+    "Q4: pass\n"
+    "ANSWERS: PASS queries=4 passed=4 reordered=1 failed=0"
+  )
+  set(_opts_redact --mutate canary)
+  set(_exit_redact 1)
+  set(
+    _require_redact
+    "FAIL Q1: result mismatch: values differ"
+    "sha256: answer [0-9a-f]+"
+    "--show-values --only 1\n"
+    "ANSWERS: FAIL queries=4 passed=0 reordered=0 failed=4"
+  )
+  set(
+    _opts_show_values
+    --mutate
+    canary
+    --show-values
+    --only
+    1
+  )
+  set(_exit_show_values 1)
+  set(
+    _require_show_values
+    "FAIL Q1: result mismatch: values differ\n  SQL:\n    SELECT COUNT\\(\\*\\) /\\* ANTB1_CANARY_SQL \\*/ FROM antb1_canary_table\n"
+    "row 0: answer 12\n +DuckDB ANTB1_CANARY_VALUE\n"
+    "  repro:\n.* --show-values --only 1\n"
+  )
+  set(_opts_show_values_on_ci --show-values)
+  set(_exit_show_values_on_ci 2)
+  set(_require_show_values_on_ci "--show-values .*refused when GITHUB_ACTIONS=true")
+  foreach(case IN LISTS _cases)
+    set(_name harness.answers.${case})
+    antb1_slt_args(_args ${_name} ${_canary_tables} ${_answers_args} ${_opts_${case}})
+    set(_forbid ${_redacted_forbid})
+    if(case STREQUAL "show_values")
+      set(_forbid "")
+    endif()
+    antb1_add_expect_test(
+      ${_name}
+      LABELS harness
+      FIXTURES_REQUIRED antb1_fixtures
+      EXIT_CODE ${_exit_${case}}
+      REQUIRE ${_require_${case}} ${_forbid}
+      COMMAND $<TARGET_FILE:antb1-slt> answers ${_args}
+    )
+  endforeach()
+  set_tests_properties(harness.answers.show_values PROPERTIES ENVIRONMENT_MODIFICATION "GITHUB_ACTIONS=unset:")
+  set_tests_properties(harness.answers.show_values_on_ci PROPERTIES ENVIRONMENT "GITHUB_ACTIONS=true")
+
+  # The `redact` option of a tables file (runner/tables.h): canary/tables_redact.txt marks the canary table, so every
+  # report is redacted without --redact and its repro adds --show-values; an explicit --redact wins over
+  # --show-values; `diff --list` (also with --redact over any tables) and `complete` are refused.
+  set(_redact_tables TABLES "${CMAKE_CURRENT_SOURCE_DIR}/canary/tables_redact.txt")
+  set(_name harness.slt.redact_table)
+  antb1_slt_args(
+    _args
+    ${_name}
+    ${_redact_tables}
+    --engine
+    antb1
+    --mutate
+    canary
+  )
+  antb1_add_expect_test(
+    ${_name}
+    LABELS harness
+    FIXTURES_REQUIRED antb1_fixtures
+    REQUIRE
+      "FAIL .*redact_table\\.slt:[0-9]+: query I nosort \\[antb1\\]: result mismatch"
+      "sha256: expected [0-9a-f]+"
+      "--show-values\n"
+      "SLT: FAIL "
+      ${_redacted_forbid}
+    COMMAND $<TARGET_FILE:antb1-slt> run ${_args} "${CMAKE_CURRENT_SOURCE_DIR}/canary/redact_table.slt"
+  )
+  set(_name harness.clickbench.redact_table)
+  antb1_slt_args(
+    _args
+    ${_name}
+    ${_redact_tables}
+    --status
+    "${CMAKE_CURRENT_SOURCE_DIR}/canary/status_pass_q0.json"
+    --mutate
+    canary
+  )
+  antb1_add_expect_test(
+    ${_name}
+    LABELS harness
+    FIXTURES_REQUIRED antb1_fixtures
+    REQUIRE
+      "FAIL Q0: result mismatch"
+      "sha256: DuckDB [0-9a-f]+"
+      "--show-values --only 0\n"
+      "CLICKBENCH: FAIL "
+      ${_redacted_forbid}
+    COMMAND $<TARGET_FILE:antb1-slt> clickbench ${_args} "${_queries}"
+  )
+  set(_name harness.queries.redact_wins)
+  antb1_slt_args(
+    _args
+    ${_name}
+    ${_redact_tables}
+    --redact
+    --show-values
+    --mutate
+    canary
+  )
+  antb1_add_expect_test(
+    ${_name}
+    LABELS harness
+    FIXTURES_REQUIRED antb1_fixtures
+    REQUIRE
+      "FAIL .*canary_queries\\.sql:[0-9]+: result mismatch"
+      "sha256: DuckDB [0-9a-f]+"
+      "QUERIES: FAIL "
+      ${_redacted_forbid}
+    COMMAND $<TARGET_FILE:antb1-slt> queries ${_args} "${_queries}"
+  )
+  set_tests_properties(${_name} PROPERTIES ENVIRONMENT_MODIFICATION "GITHUB_ACTIONS=unset:")
+  set(_name harness.diff.redact.list)
+  antb1_slt_args(
+    _args
+    ${_name}
+    --seed
+    1
+    --count
+    12
+    --redact
+    --list
+  )
+  antb1_add_expect_test(
+    ${_name}
+    LABELS harness
+    FIXTURES_REQUIRED antb1_fixtures
+    EXIT_CODE 2
+    REQUIRE "diff --list prints the generated SQL" ${_redacted_forbid}
+    COMMAND $<TARGET_FILE:antb1-slt> diff ${_args}
+  )
+  set(_name harness.diff.redact_table)
+  antb1_slt_args(
+    _args
+    ${_name}
+    ${_redact_tables}
+    --seed
+    1
+    --count
+    12
+    --mutate
+    canary
+  )
+  antb1_add_expect_test(
+    ${_name}
+    LABELS harness
+    FIXTURES_REQUIRED antb1_fixtures
+    REQUIRE
+      "FAIL diff case [0-9]+ \\(seed 1, supported features\\): result mismatch"
+      "sha256: DuckDB [0-9a-f]+"
+      "--show-values --only [0-9]+\n"
+      "DIFF: FAIL "
+    FORBID "${_canary_regex}" "[sS][eE][lL][eE][cC][tT]" "pixi run diff-random"
+    COMMAND $<TARGET_FILE:antb1-slt> diff ${_args}
+  )
+  set(_name harness.diff.redact_table.list)
+  antb1_slt_args(
+    _args
+    ${_name}
+    ${_redact_tables}
+    --seed
+    1
+    --count
+    12
+    --list
+  )
+  antb1_add_expect_test(
+    ${_name}
+    LABELS harness
+    FIXTURES_REQUIRED antb1_fixtures
+    EXIT_CODE 2
+    REQUIRE "diff --list prints the generated SQL" ${_redacted_forbid}
+    COMMAND $<TARGET_FILE:antb1-slt> diff ${_args}
+  )
+  set(_name harness.queries.redact_table)
+  antb1_slt_args(_args ${_name} ${_redact_tables} --mutate canary)
+  antb1_add_expect_test(
+    ${_name}
+    LABELS harness
+    FIXTURES_REQUIRED antb1_fixtures
+    REQUIRE
+      "FAIL .*canary_queries\\.sql:[0-9]+: result mismatch"
+      "sha256: DuckDB [0-9a-f]+"
+      "QUERIES: FAIL "
+      ${_redacted_forbid}
+    COMMAND $<TARGET_FILE:antb1-slt> queries ${_args} "${_queries}"
+  )
+  # On a copy in the build tree: a regression must not rewrite a source file.
+  set(_complete_file "${CMAKE_CURRENT_BINARY_DIR}/redact-table-complete.slt")
+  configure_file(selftest/redact_canary.slt "${_complete_file}" COPYONLY)
+  set(_name harness.complete.redact_table)
+  antb1_slt_args(_args ${_name} ${_redact_tables})
+  antb1_add_expect_test(
+    ${_name}
+    LABELS harness
+    FIXTURES_REQUIRED antb1_fixtures
+    EXIT_CODE 2
+    REQUIRE "complete writes values into .slt files; it is refused for tables marked `redact`"
+    COMMAND $<TARGET_FILE:antb1-slt> complete ${_args} "${_complete_file}"
+  )
 endif()
 
 antb1_add_slt_complete_target()

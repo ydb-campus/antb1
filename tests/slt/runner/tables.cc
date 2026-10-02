@@ -19,6 +19,10 @@ namespace {
 
 namespace fs = std::filesystem;
 
+// The tests that write the fixtures, for the hint of a missing file.
+constexpr std::string_view kFixtureTests =
+    "the fixtures.generate test writes them, and fixtures.tpch those under tpch/";
+
 std::vector<std::string> Split(std::string_view text, std::string_view separators) {
   std::vector<std::string> parts;
   std::size_t pos = 0;
@@ -54,7 +58,8 @@ std::expected<std::vector<TableDef>, std::string> LoadTables(const fs::path& tab
     if (words.size() < 2) {
       return std::unexpected(where + ": expected '<name> <file>[,<file>...] [option...]'");
     }
-    TableDef table{.name = words[0], .files = {}, .patterns = {}, .clickbench = false};
+    TableDef table{
+        .name = words[0], .files = {}, .patterns = {}, .clickbench = false, .redact = false};
     const bool duplicate = std::ranges::any_of(tables, [&](const TableDef& t) {
       return plan::AsciiLower(t.name) == plan::AsciiLower(table.name);
     });
@@ -67,17 +72,14 @@ std::expected<std::vector<TableDef>, std::string> LoadTables(const fs::path& tab
           fs::absolute(fixtures_dir / pattern, absolute_ec).lexically_normal().string());
       auto files = io::ExpandGlob((fixtures_dir / pattern).string());
       if (!files.ok()) {
-        return std::unexpected(
-            std::format("{}: {} (run `pixi run test`: the fixtures.generate test writes them)",
-                        where, files.status().message()));
+        return std::unexpected(std::format("{}: {} (run `pixi run test`: {})", where,
+                                           files.status().message(), kFixtureTests));
       }
       for (const auto& f : *files) {
         std::error_code ec;
         if (!fs::is_regular_file(f, ec)) {
-          return std::unexpected(
-              std::format("{}: fixture '{}' not found (run `pixi run test`: the "
-                          "fixtures.generate test writes it)",
-                          where, f));
+          return std::unexpected(std::format("{}: fixture '{}' not found (run `pixi run test`: {})",
+                                             where, f, kFixtureTests));
         }
         table.files.push_back(fs::absolute(f, ec).string());
       }
@@ -85,9 +87,11 @@ std::expected<std::vector<TableDef>, std::string> LoadTables(const fs::path& tab
     for (std::size_t i = 2; i < words.size(); ++i) {
       if (words[i] == "clickbench") {
         table.clickbench = true;
+      } else if (words[i] == "redact") {
+        table.redact = true;
       } else {
         return std::unexpected(
-            std::format("{}: unknown option '{}' (known: clickbench)", where, words[i]));
+            std::format("{}: unknown option '{}' (known: clickbench, redact)", where, words[i]));
       }
     }
     tables.push_back(std::move(table));

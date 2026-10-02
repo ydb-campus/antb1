@@ -26,9 +26,10 @@
 //     accepts, so the oracle runs every query, also those antb1 does not support (a DuckDB error
 //     is a generator bug).
 // A failure prints the seed, the case index, the features, the SQL, at most 5 differing rows and
-// the repro `ANTB1_DIFF_SEED=<seed> ANTB1_DIFF_ONLY=<index> pixi run diff-random`. With `redact`
-// it prints no SQL and no values: only features, column types, row counts, the first differing
-// row and the sha256 of each side's canonical block.
+// the repro: `ANTB1_DIFF_SEED=<seed> ANTB1_DIFF_ONLY=<index> pixi run diff-random` over the tables
+// of that task, and the command line with `--only <index>`. With `redact` it prints no SQL and no
+// values: only features, column types, row counts, the first differing row and the sha256 of each
+// side's canonical block.
 
 namespace antb1::slt {
 
@@ -36,6 +37,9 @@ struct DiffOptions {
   uint64_t count = 0;
   std::optional<uint64_t> only;  // run just this query index
   bool redact = false;
+  // The tables are those of `pixi run diff-random` (tests/slt/tables.txt), which then reproduces
+  // a case with ANTB1_DIFF_SEED and ANTB1_DIFF_ONLY.
+  bool pixi_repro = true;
   std::string command;        // the antb1-slt command line without --redact and --only (repro)
   uint64_t max_reports = 10;  // failures reported in full; the rest are only counted
 };

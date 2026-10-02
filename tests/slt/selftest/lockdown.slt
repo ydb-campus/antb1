@@ -38,6 +38,17 @@ onlyif duckdb
 statement error ^Permission Error:
 INSTALL httpfs
 
+# No extension loads either, by name (from DuckDB's extension directory) or by path: the oracle
+# never runs TPC's dbgen (the tpch extension of tests/tpch) or any other extension.
+
+onlyif duckdb
+statement error ^Permission Error: Loading external extensions is disabled
+LOAD tpch
+
+onlyif duckdb
+statement error ^Permission Error: Loading external extensions is disabled
+LOAD '${FIXTURES}/lockdown-canary.duckdb_extension'
+
 # The oracle's statement check: writes and state changes are refused before they run, also inside
 # the allowed directories.
 
