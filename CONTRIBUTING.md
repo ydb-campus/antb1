@@ -24,6 +24,12 @@ environment, so `pixi run <task>` never needs `-e`; pixi installs a missing envi
 `pixi.toml` and `pixi.lock` define the toolchain. Never edit `pixi.lock` by hand; a maintainer re-locks with pixi
 0.81.0 when dependencies change.
 
+On Linux, the `default` and `gcc` environments include `duckdb-extension-tpch` (`lint` does not), which contains TPC's
+dbgen under the TPC End User License Agreement v2.2. The tests use it only to generate data derived from TPC-H at test
+time. Installing such an environment, on your machine or on a CI runner, installs it and accepts that EULA; nothing
+derived from TPC-H is ever committed ([ADR 0006](docs/adr/0006-test-strategy-and-data-policy.md)). pixi cannot install
+the package on macOS, so the TPC-H-derived tests run on Linux only.
+
 ## Everyday commands
 
 | Goal | Command |
