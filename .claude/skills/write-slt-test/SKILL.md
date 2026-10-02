@@ -19,12 +19,12 @@ repository has no tests/slt directory yet, cover the behavior with unit tests in
 - Expected results are written by DuckDB, the oracle ([ADR 0006](../../../docs/adr/0006-test-strategy-and-data-policy.md)).
   Never type or edit an expected block by hand; regenerate it and review the diff.
 - Tables come from the committed fixture generator only (synthetic, deterministic data). Never use ClickBench data,
-  samples or query text, and never commit data files.
+  samples or query text, never write TPC-H query text or fragments of it, and never commit data files.
 - Engine-specific records (`onlyif antb1`, `skipif duckdb`) are allowed only for a divergence registered in
   docs/sql-subset.md, with its ID in a comment.
 - Test the rejections too: SQL outside the subset must fail with the unsupported error, not return rows.
-- If a step needs an "Ask a human first" path (AGENTS.md), for example a new pixi task, a CMake preset or the
-  ClickBench ratchet: stop and hand off with the exact change (file, diff, reason) for a maintainer.
+- If a step needs an "Ask a human first" path (AGENTS.md), for example a new pixi task, a CMake preset or a
+  ratchet (ClickBench or TPC-H-derived): stop and hand off with the exact change (file, diff, reason) for a maintainer.
 
 ## Workflow (after the harness PR)
 

@@ -150,7 +150,8 @@ BASELINE: dict[str, str] = {
         `cmake/`, `tools/github/**`, `tools/lint/**`, `tools/data/**`, `tools/ci/coverage_thresholds.json`,
         `.pre-commit-config.yaml`, `.clang-format`, `.clang-tidy`, `tests/.clang-tidy`, `scripts/ctest.sh`,
         `scripts/agent-setup.sh`, `tests/data/clickbench_status.json`, `scripts/lint.sh`, `scripts/fmt.sh`,
-        `tools/sanitizers/`, `.markdownlint-cli2.yaml`, `_typos.toml`, `ruff.toml`, `.gersemirc`, `tombi.toml`.
+        `tools/sanitizers/`, `.markdownlint-cli2.yaml`, `_typos.toml`, `ruff.toml`, `.gersemirc`, `tombi.toml`,
+        `tests/data/tpch_status.json`.
 
         ## Code Review Rules
 
@@ -648,6 +649,20 @@ def test_r009_data_and_large_files(repo: Path) -> None:
     assert paths == {"tests/x/hits.parquet", "tests/x/HITS_1.Parquet", "tools/data/queries.sql", "q07.csv", "big.bin"}
 
 
+def test_r009_tpch_material(repo: Path) -> None:
+    # dbgen tables, its distribution file and the answer files of the TPC kit and of DuckDB never belong in the repo.
+    write(
+        repo, {"t/lineitem.tbl": "1|2|", "t/orders.tbl.3": "1|", "t/dists.dss": "x", "a/q1.out": "1", "a/q22.ans": "1"}
+    )
+    write(repo, {"t/notes.md": "ok", "a/q123.out": "ok", "a/sq1.out": "ok"})
+    legend = " ".join(("THE", "TPC", "SOFTWARE", "IS", "AVAILABLE", "WITHOUT", "CHARGE", "FROM", "TPC."))
+    write(repo, {"src/dbgen.c": f"/*\n * {legend}\n */\nint x;\n", "docs/eula.md": "the TPC software, free"})
+    out = findings(repo, "R009")
+    paths = {f.path for f in out}
+    assert paths == {"t/lineitem.tbl", "t/orders.tbl.3", "t/dists.dss", "a/q1.out", "a/q22.ans", "src/dbgen.c"}
+    assert [f.line for f in out if f.path == "src/dbgen.c"] == [2]
+
+
 # --- R010 ------------------------------------------------------------------------------------------------------------
 
 
@@ -741,6 +756,52 @@ def test_r011_skipped_without_ratchet(repo: Path) -> None:
     (repo / "tests/data/clickbench_status.json").unlink()
     (repo / "docs/sql-subset.md").write_text("# SQL\n", encoding="utf-8")
     assert findings(repo, "R011") == []
+
+
+TPCH_SECTION = """
+    ## ClickBench status
+
+    | Query | Status |
+    |---|---|
+    | Q0 | pass |
+    | Q1 | fail |
+
+    ## Queries derived from TPC-H
+
+    | Query | Status |
+    |---|---|
+    | Q1 | pass |
+    | Q2 | unsupported |
+"""
+
+
+def test_r011_tpch_ratchet(repo: Path) -> None:
+    doc = "# SQL subset\n" + textwrap.dedent(TPCH_SECTION)
+    write(repo, {"docs/sql-subset.md": doc, "tests/data/tpch_status.json": '{"pass": [1]}'})
+    assert findings(repo, "R011") == []
+    (repo / "tests/data/tpch_status.json").write_text('{"pass": [1, 2]}', encoding="utf-8")
+    out = findings(repo, "R011")
+    assert [(f.line, f.message) for f in out] == [
+        (
+            12,  # the table's header row
+            "`Queries derived from TPC-H` table passes [1], the ratchet (tests/data/tpch_status.json) [1, 2]",
+        )
+    ]
+
+
+def test_r011_tpch_table_is_found_by_its_heading(repo: Path) -> None:
+    # The TPC-H table before the ClickBench one: each ratchet still reads the table under its own heading.
+    clickbench, tpch = TPCH_SECTION.split("    ## Queries derived from TPC-H\n")
+    doc = "# SQL subset\n" + textwrap.dedent("    ## Queries derived from TPC-H\n" + tpch) + textwrap.dedent(clickbench)
+    write(repo, {"docs/sql-subset.md": doc, "tests/data/tpch_status.json": '{"pass": [1]}'})
+    assert findings(repo, "R011") == []
+
+
+def test_r011_tpch_ratchet_needs_its_section(repo: Path) -> None:
+    write(repo, {"tests/data/tpch_status.json": '{"pass": []}'})
+    assert "no `Queries derived from TPC-H` section with a status table" in messages(repo, "R011")
+    write(repo, {"tests/data/tpch_status.json": "[1]"})
+    assert "tests/data/tpch_status.json:1: R011 not a JSON object with a `pass` list" in messages(repo, "R011")
 
 
 # --- R012 ------------------------------------------------------------------------------------------------------------
