@@ -14,7 +14,9 @@ namespace antb1::plan {
 //  4. Projection pruning: every Scan reads only the fields that the nodes above it reference
 //     (possibly none), Computes keep only the expressions used, and the column indices above them
 //     are renumbered.
-// The result has the same output columns and the same answer as the input plan.
+// Last, plan::ResolvePositions sets every column index from the column ids (ADR 0022); until the
+// rules work on ids, CheckPositions first verifies that their indices are those positions.
+// The result has the same output columns (and column ids) and the same answer as the input plan.
 LogicalPlan Optimize(const LogicalPlan& plan);
 
 }  // namespace antb1::plan

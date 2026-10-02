@@ -1,5 +1,7 @@
 #include "antb1/plan/optimizer.h"
 
+#include <algorithm>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -119,7 +121,11 @@ TEST(OptimizerTest, ComputeKeepsOnlyWhatIsUsed) {
   const auto& compute = std::get<ComputeNode>(*project.input);
   ComputeNode wider = compute;
   wider.exprs.push_back(std::make_shared<const Expr>(
-      Expr{.node = ColumnExpr{.index = 2}, .type = LogicalType::kInteger, .name = "unused"}));
+      Expr{.node = ColumnExpr{.index = 2, .id = std::get<ScanNode>(*compute.input).ids.at(2)},
+           .type = LogicalType::kInteger,
+           .name = "unused"}));
+  // A new column: an id above every id of the plan (the Project's are the last minted).
+  wider.ids.push_back(ColumnId{std::to_underlying(std::ranges::max(OutputIds(project))) + 1});
   ProjectNode top = project;
   top.input = std::make_shared<const LogicalNode>(std::move(wider));
   const LogicalPlan pruned = Optimize(LogicalPlan{
@@ -131,6 +137,7 @@ TEST(OptimizerTest, ComputeKeepsOnlyWhatIsUsed) {
             "    Scan table=t source=fake columns=[i16]\n");
   ProjectNode columns_only = project;
   columns_only.columns.pop_back();
+  columns_only.ids.pop_back();
   const LogicalPlan dropped =
       Optimize(LogicalPlan{.root = std::make_shared<const LogicalNode>(std::move(columns_only)),
                            .output = {bound->output[0]}});
@@ -221,6 +228,51 @@ TEST(OptimizerTest, GroupsByTheKeysThatDetermineTheOthers) {
             "    Compute (i16 + 1)\n"
             "      GroupAggregate keys=[i32, i16] COUNT(*)\n"
             "        Scan table=t source=fake columns=[i16, i32]\n");
+}
+
+// Every rule keeps the column ids (ADR 0022): those of the output, those that the nodes above a
+// rewritten node read, and those of the fields that a pruned Scan keeps.
+TEST(OptimizerTest, KeepsTheColumnIds) {
+  static const Catalog catalog = MakeCatalog();
+  for (const char* sql :
+       {"SELECT i16 + 1 FROM t WHERE i32 // 2 > 0", "SELECT COUNT(*) FROM t HAVING COUNT(*) > 1",
+        "SELECT i32, i32 + 1, SUM(i32 + 1) FROM t GROUP BY i32, i32 + 1",
+        "SELECT s, strlen(s), SUM(i16) FROM t GROUP BY s, strlen(s) HAVING strlen(s) > 1",
+        "SELECT i32 * 2 FROM t ORDER BY i32 LIMIT 3", "SELECT * FROM ok WHERE s = 'x' LIMIT 2"}) {
+    auto bound = BindSql(sql, catalog);
+    ASSERT_TRUE(bound.ok()) << sql;
+    const LogicalPlan optimized = Optimize(*bound);
+    EXPECT_EQ(PositionMismatch(optimized), std::nullopt) << sql;
+    EXPECT_EQ(OutputIds(*optimized.root), OutputIds(*bound->root)) << sql;
+  }
+
+  auto field = BindSql("SELECT i32 FROM t", catalog);
+  ASSERT_TRUE(field.ok());
+  const LogicalPlan pruned = Optimize(*field);
+  const auto& scan = std::get<ScanNode>(Nth(pruned, 1));
+  EXPECT_EQ(scan.fields, (std::vector<int>{1}));
+  EXPECT_EQ(scan.ids, (std::vector<ColumnId>{std::get<ScanNode>(Nth(*field, 1)).ids.at(1)}));
+
+  // RowCount is the COUNT(*) column it replaces: HAVING above it still reads it.
+  auto counted = BindSql("SELECT COUNT(*) FROM t HAVING COUNT(*) > 1", catalog);
+  ASSERT_TRUE(counted.ok());
+  const LogicalPlan rows = Optimize(*counted);
+  const auto& having = std::get<FilterNode>(*rows.root);
+  const auto& count = std::get<RowCountNode>(*having.input);
+  EXPECT_EQ(count.id, std::get<AggregateNode>(Nth(*counted, 1)).aggregates.at(0).id);
+  EXPECT_EQ(having.predicates.at(0).column.value_or(BoundColumn{}).id, count.id);
+
+  // The dependent key keeps its column, computed above the GroupAggregate, and the Project that
+  // restores the order passes the GroupAggregate's columns through.
+  auto grouped = BindSql("SELECT i32, i32 - 1, COUNT(*) FROM t GROUP BY i32, i32 - 1", catalog);
+  ASSERT_TRUE(grouped.ok());
+  const std::vector<ColumnId> group_ids = OutputIds(Nth(*grouped, 1));
+  ASSERT_EQ(group_ids.size(), 3U);
+  const LogicalPlan reduced = Optimize(*grouped);
+  EXPECT_EQ(std::get<ProjectNode>(Nth(reduced, 1)).ids, group_ids);
+  EXPECT_EQ(std::get<ComputeNode>(Nth(reduced, 2)).ids, (std::vector<ColumnId>{group_ids[1]}));
+  EXPECT_EQ(std::get<GroupAggregateNode>(Nth(reduced, 3)).key_ids,
+            (std::vector<ColumnId>{group_ids[0]}));
 }
 
 // Under a LIMIT without ORDER BY the nodes above stop reading early: a key computed above the

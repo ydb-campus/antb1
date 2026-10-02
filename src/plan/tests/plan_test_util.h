@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <memory>
 #include <optional>
+#include <ostream>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -19,6 +20,13 @@
 #include "antb1/sql/parser.h"
 
 // In-memory tables and helpers shared by the plan unit tests.
+
+namespace antb1::plan {
+
+// gtest prints a column id as EXPLAIN-like text: #7.
+inline void PrintTo(ColumnId id, std::ostream* os) { *os << '#' << std::to_underlying(id); }
+
+}  // namespace antb1::plan
 
 namespace antb1::plan::testing {
 

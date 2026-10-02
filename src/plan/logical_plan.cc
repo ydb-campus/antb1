@@ -5,8 +5,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <format>
+#include <functional>
+#include <iterator>
 #include <memory>
 #include <optional>
+#include <set>
+#include <source_location>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -231,17 +235,33 @@ bool SameExpr(const Expr& a, const Expr& b) {
 }
 
 ExprPtr Renumber(const ExprPtr& expr, const std::vector<int>& remap) {
+  return MapColumns(expr, [&remap](const ColumnExpr& column) {
+    ColumnExpr out = column;
+    out.index = remap.at(Narrow<std::size_t>(column.index));
+    ANTB1_CHECK(out.index >= 0);
+    return out;
+  });
+}
+
+ExprPtr MapColumns(const ExprPtr& expr, const std::function<ColumnExpr(const ColumnExpr&)>& f) {
   Expr out = *expr;
+  bool changed = false;
   if (auto* column = std::get_if<ColumnExpr>(&out.node)) {
-    column->index = remap.at(Narrow<std::size_t>(column->index));
-    ANTB1_CHECK(column->index >= 0);
+    const ColumnExpr mapped = f(*column);
+    changed = mapped.index != column->index || mapped.id != column->id;
+    *column = mapped;
   }
   for (ExprPtr* child : Children(out)) {
-    if (*child != nullptr) {
-      *child = Renumber(*child, remap);
+    if (*child == nullptr) {
+      continue;
+    }
+    ExprPtr mapped = MapColumns(*child, f);
+    if (mapped != *child) {
+      *child = std::move(mapped);
+      changed = true;
     }
   }
-  return std::make_shared<const Expr>(std::move(out));
+  return changed ? std::make_shared<const Expr>(std::move(out)) : expr;
 }
 
 void CollectColumns(const Expr& expr, std::vector<int>& out) {
@@ -356,5 +376,313 @@ SourceSpan SpanOf(const LogicalNode& node) {
 }
 
 const LogicalNodePtr* InputOf(const LogicalNode& node) { return std::visit(InputOfNode{}, node); }
+
+namespace {
+
+std::vector<ColumnId> CallIds(std::vector<ColumnId> ids, const std::vector<AggregateCall>& calls) {
+  ids.reserve(ids.size() + calls.size());
+  for (const AggregateCall& call : calls) {
+    ids.push_back(call.id);
+  }
+  return ids;
+}
+
+struct OutputIdsOf {
+  std::vector<ColumnId> operator()(const ScanNode& node) const { return node.ids; }
+  std::vector<ColumnId> operator()(const FilterNode& node) const { return OutputIds(*node.input); }
+  std::vector<ColumnId> operator()(const ComputeNode& node) const {
+    std::vector<ColumnId> ids = OutputIds(*node.input);
+    ids.insert(ids.end(), node.ids.begin(), node.ids.end());
+    return ids;
+  }
+  std::vector<ColumnId> operator()(const ProjectNode& node) const { return node.ids; }
+  std::vector<ColumnId> operator()(const AggregateNode& node) const {
+    return CallIds({}, node.aggregates);
+  }
+  std::vector<ColumnId> operator()(const GroupAggregateNode& node) const {
+    return CallIds(node.key_ids, node.aggregates);
+  }
+  std::vector<ColumnId> operator()(const SortNode& node) const { return OutputIds(*node.input); }
+  std::vector<ColumnId> operator()(const LimitNode& node) const { return OutputIds(*node.input); }
+  std::vector<ColumnId> operator()(const RowCountNode& node) const { return {node.id}; }
+};
+
+std::string IdText(ColumnId id) { return std::format("#{}", std::to_underlying(id)); }
+
+template <class Node>
+LogicalNodePtr MakeNode(Node node) {
+  return std::make_shared<const LogicalNode>(std::move(node));
+}
+
+// The walk of ResolvePositions and PositionMismatch: the plan rebuilt bottom-up with every index
+// set from the ids, each node with its output ids. It remembers the first broken invariant and the
+// first index that differs from its resolved position; its messages name node kinds, ids and
+// positions only (they reach the logs of the data tests, which never show data).
+class Resolver {
+ public:
+  struct Resolved {
+    LogicalNodePtr node;        // the same pointer when nothing changed
+    std::vector<ColumnId> ids;  // its output columns
+  };
+
+  // One overload of Visit per node type: a node type without one fails to compile.
+  Resolved Walk(const LogicalNodePtr& node) {
+    return std::visit([&](const auto& n) { return Visit(node, n); }, *node);
+  }
+
+  void CheckOutput(const std::vector<OutputColumn>& output, const std::vector<ColumnId>& ids) {
+    if (output.size() != ids.size()) {
+      Fail(std::format("output: {} columns, but the root outputs {}", output.size(), ids.size()));
+      return;
+    }
+    for (std::size_t i = 0; i < output.size(); ++i) {
+      if (output[i].id != ids[i]) {
+        Fail(std::format("output: column {} is {}, but the root outputs {}", i,
+                         IdText(output[i].id), IdText(ids[i])));
+        return;
+      }
+    }
+  }
+
+  [[nodiscard]] const std::optional<std::string>& failure() const { return failure_; }
+
+  // The first broken invariant, else the first index that differs from its resolved position.
+  [[nodiscard]] std::optional<std::string> Problem() const {
+    return failure_.has_value() ? failure_ : difference_;
+  }
+
+ private:
+  void Fail(std::string message) {
+    if (!failure_.has_value()) {
+      failure_ = std::move(message);
+    }
+  }
+
+  // A column created by `node`: it has an id that no other column of the plan has.
+  void Define(std::string_view node, ColumnId id) {
+    if (id == kNoColumnId) {
+      Fail(std::format("{}: a column without an id", node));
+    } else if (!defined_.insert(id).second) {
+      Fail(std::format("{}: column {} is defined twice", node, IdText(id)));
+    }
+  }
+
+  void CheckSize(std::string_view node, std::string_view what, std::size_t ids,
+                 std::size_t columns) {
+    if (ids != columns) {
+      Fail(std::format("{}: {} ids for {} {}", node, ids, columns, what));
+    }
+  }
+
+  // Sets `index` to the position of `id` among `ids`; true when it changed.
+  bool Resolve(std::string_view node, int& index, ColumnId id, const std::vector<ColumnId>& ids) {
+    if (id == kNoColumnId) {
+      Fail(std::format("{}: a reference without an id", node));
+      return false;
+    }
+    const auto first = std::ranges::find(ids, id);
+    if (first == ids.end()) {
+      Fail(std::format("{}: column {} is not in its input", node, IdText(id)));
+      return false;
+    }
+    if (std::ranges::find(std::next(first), ids.end(), id) != ids.end()) {
+      Fail(std::format("{}: column {} is in its input twice", node, IdText(id)));
+      return false;
+    }
+    const auto position = Narrow<int>(first - ids.begin());
+    if (position == index) {
+      return false;
+    }
+    if (!difference_.has_value()) {
+      difference_ =
+          std::format("{}: column {} is at {}, not {}", node, IdText(id), position, index);
+    }
+    index = position;
+    return true;
+  }
+
+  bool Resolve(std::string_view node, BoundColumn& column, const std::vector<ColumnId>& ids) {
+    return Resolve(node, column.index, column.id, ids);
+  }
+
+  bool Resolve(std::string_view node, std::optional<BoundColumn>& column,
+               const std::vector<ColumnId>& ids) {
+    return column.has_value() && Resolve(node, *column, ids);
+  }
+
+  Resolved Visit(const LogicalNodePtr& self, const ScanNode& scan) {
+    CheckSize("Scan", "fields", scan.ids.size(), scan.fields.size());
+    for (const ColumnId id : scan.ids) {
+      Define("Scan", id);
+    }
+    return {.node = self, .ids = scan.ids};
+  }
+
+  Resolved Visit(const LogicalNodePtr& self, const FilterNode& filter) {
+    Resolved input = Walk(filter.input);
+    FilterNode out = filter;
+    bool changed = input.node != filter.input;
+    out.input = input.node;
+    for (Predicate& predicate : out.predicates) {
+      if (Resolve("Filter", predicate.column, input.ids)) {
+        changed = true;
+      }
+      if (Resolve("Filter", predicate.other, input.ids)) {
+        changed = true;
+      }
+    }
+    return {.node = changed ? MakeNode(std::move(out)) : self, .ids = std::move(input.ids)};
+  }
+
+  Resolved Visit(const LogicalNodePtr& self, const ComputeNode& compute) {
+    Resolved input = Walk(compute.input);
+    CheckSize("Compute", "expressions", compute.ids.size(), compute.exprs.size());
+    ComputeNode out = compute;
+    bool changed = input.node != compute.input;
+    out.input = input.node;
+    for (ExprPtr& expr : out.exprs) {
+      ExprPtr resolved = MapColumns(expr, [&](const ColumnExpr& column) {
+        ColumnExpr leaf = column;
+        Resolve("Compute", leaf.index, leaf.id, input.ids);
+        return leaf;
+      });
+      if (resolved != expr) {
+        expr = std::move(resolved);
+        changed = true;
+      }
+    }
+    for (const ColumnId id : compute.ids) {
+      Define("Compute", id);
+    }
+    std::vector<ColumnId> ids = std::move(input.ids);
+    ids.insert(ids.end(), compute.ids.begin(), compute.ids.end());
+    return {.node = changed ? MakeNode(std::move(out)) : self, .ids = std::move(ids)};
+  }
+
+  Resolved Visit(const LogicalNodePtr& self, const ProjectNode& project) {
+    Resolved input = Walk(project.input);
+    CheckSize("Project", "columns", project.ids.size(), project.columns.size());
+    ProjectNode out = project;
+    bool changed = input.node != project.input;
+    out.input = input.node;
+    for (std::size_t i = 0; i < out.columns.size(); ++i) {
+      const bool constant = i < out.constants.size() && out.constants[i].has_value();
+      if (!constant && Resolve("Project", out.columns[i], input.ids)) {
+        changed = true;
+      }
+      // A column that keeps the id it reads passes it through; any other is a new column.
+      if (i < project.ids.size() &&
+          (project.ids[i] != project.columns[i].id || project.ids[i] == kNoColumnId)) {
+        Define("Project", project.ids[i]);
+      }
+    }
+    return {.node = changed ? MakeNode(std::move(out)) : self, .ids = project.ids};
+  }
+
+  Resolved Visit(const LogicalNodePtr& self, const AggregateNode& aggregate) {
+    Resolved input = Walk(aggregate.input);
+    AggregateNode out = aggregate;
+    bool changed = input.node != aggregate.input;
+    out.input = input.node;
+    for (AggregateCall& call : out.aggregates) {
+      if (Resolve("Aggregate", call.arg, input.ids)) {
+        changed = true;
+      }
+      Define("Aggregate", call.id);
+    }
+    return {.node = changed ? MakeNode(std::move(out)) : self,
+            .ids = CallIds({}, aggregate.aggregates)};
+  }
+
+  Resolved Visit(const LogicalNodePtr& self, const GroupAggregateNode& group) {
+    Resolved input = Walk(group.input);
+    CheckSize("GroupAggregate", "keys", group.key_ids.size(), group.keys.size());
+    GroupAggregateNode out = group;
+    bool changed = input.node != group.input;
+    out.input = input.node;
+    for (BoundColumn& key : out.keys) {
+      if (Resolve("GroupAggregate", key, input.ids)) {
+        changed = true;
+      }
+    }
+    for (const ColumnId id : group.key_ids) {
+      Define("GroupAggregate", id);
+    }
+    for (AggregateCall& call : out.aggregates) {
+      if (Resolve("GroupAggregate", call.arg, input.ids)) {
+        changed = true;
+      }
+      Define("GroupAggregate", call.id);
+    }
+    return {.node = changed ? MakeNode(std::move(out)) : self,
+            .ids = CallIds(group.key_ids, group.aggregates)};
+  }
+
+  Resolved Visit(const LogicalNodePtr& self, const SortNode& sort) {
+    Resolved input = Walk(sort.input);
+    SortNode out = sort;
+    bool changed = input.node != sort.input;
+    out.input = input.node;
+    for (SortKey& key : out.keys) {
+      if (Resolve("Sort", key.column, input.ids)) {
+        changed = true;
+      }
+    }
+    return {.node = changed ? MakeNode(std::move(out)) : self, .ids = std::move(input.ids)};
+  }
+
+  Resolved Visit(const LogicalNodePtr& self, const LimitNode& limit) {
+    Resolved input = Walk(limit.input);
+    if (input.node == limit.input) {
+      return {.node = self, .ids = std::move(input.ids)};
+    }
+    LimitNode out = limit;
+    out.input = input.node;
+    return {.node = MakeNode(std::move(out)), .ids = std::move(input.ids)};
+  }
+
+  Resolved Visit(const LogicalNodePtr& self, const RowCountNode& count) {
+    Define("RowCount", count.id);
+    return {.node = self, .ids = {count.id}};
+  }
+
+  std::set<ColumnId> defined_;
+  std::optional<std::string> failure_;
+  std::optional<std::string> difference_;
+};
+
+}  // namespace
+
+std::vector<ColumnId> OutputIds(const LogicalNode& node) { return std::visit(OutputIdsOf{}, node); }
+
+LogicalPlan ResolvePositions(const LogicalPlan& plan) {
+  if (plan.root == nullptr) {
+    return plan;
+  }
+  Resolver resolver;
+  Resolver::Resolved root = resolver.Walk(plan.root);
+  resolver.CheckOutput(plan.output, root.ids);
+  if (resolver.failure().has_value()) {
+    internal::CheckFailed(
+        resolver.failure()->c_str());  // a programming error: see PositionMismatch
+  }
+  return LogicalPlan{.root = std::move(root.node), .output = plan.output};
+}
+
+std::optional<std::string> PositionMismatch(const LogicalPlan& plan) {
+  if (plan.root == nullptr) {
+    return std::nullopt;
+  }
+  Resolver resolver;
+  const Resolver::Resolved root = resolver.Walk(plan.root);
+  resolver.CheckOutput(plan.output, root.ids);
+  return resolver.Problem();
+}
+
+void CheckPositions(const LogicalPlan& plan, std::source_location location) {
+  if (const auto problem = PositionMismatch(plan)) {
+    internal::CheckFailed(problem->c_str(), location);
+  }
+}
 
 }  // namespace antb1::plan
