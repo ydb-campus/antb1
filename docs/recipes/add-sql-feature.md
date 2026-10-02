@@ -17,8 +17,9 @@ at one layer.
 - Plan first (plan mode in Claude Code) when the change touches a public header (`src/*/include/`) or more than one
   module, which most SQL features do.
 - Hand-off rule: a new module edge or external library (`cmake/Antb1Modules.cmake`), a new dependency or task
-  (`pixi.toml`), a preset (`CMakePresets.json`) or the ClickBench ratchet (`tests/data/clickbench_status.json`) is
-  an "Ask a human first" path. Stop and describe the exact change for a maintainer instead of making it.
+  (`pixi.toml`), a preset (`CMakePresets.json`) or a ratchet (`tests/data/clickbench_status.json`,
+  `tests/data/tpch_status.json`) is an "Ask a human first" path. Stop and describe the exact change for a maintainer
+  instead of making it.
 
 ## 1. Specify
 
@@ -80,12 +81,15 @@ at one layer.
 - `src/cli/cli.cc` maps errors to exit codes: 4 only for `kUnsupported`, any other `NotImplemented` is 70. Test new
   flags, formats and exit codes in `src/cli/tests/cli_test.cc`.
 
-## 7. SQL logic tests and ClickBench
+## 7. SQL logic tests and the ratchets
 
 - After the test-harness PR, add `.slt` cases for the feature ([write-slt-test](write-slt-test.md)); DuckDB writes
   the expected results.
 - If the feature changes which ClickBench queries pass, follow [clickbench-data](clickbench-data.md): the ratchet
   and the status table in sql-subset.md change together, and the ratchet needs a maintainer.
+- The queries derived from TPC-H work the same way: `tests/data/tpch_status.json` and the "Queries derived from
+  TPC-H" table in sql-subset.md change together, in the PR that makes a query pass, with a maintainer. Never write
+  their query text, or fragments of it, into a test, a doc or a PR; refer to them by number.
 
 ## 8. Verify and open the PR
 

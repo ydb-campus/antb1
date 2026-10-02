@@ -115,7 +115,7 @@ updates, and anything that adds network access or threads to tests.
 ## Code Review Rules
 Report only concrete, high-confidence problems with a failure scenario: `file:line`, what breaks, how to fix it.
 Never approve. Skip formatting and lint findings (CI enforces them). Priorities: P0 wrong results, UB, security;
-P1 missing tests, boundary violations; P2 performance. Never quote ClickBench data values.
+P1 missing tests, boundary violations; P2 performance. Never quote ClickBench data or anything derived from TPC-H.
 ### Correctness
 
 - Unchecked `arrow::Status`/`Result`, `ValueOrDie()`/`ValueUnsafe()` outside tests, ignored `std::expected` errors.

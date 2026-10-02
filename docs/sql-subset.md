@@ -606,9 +606,10 @@ The ratchet `tests/data/tpch_status.json` lists the queries verified to pass, an
 ratchet (`pixi run lint` compares them); the PR that makes a query pass updates both. A query that does not pass must
 fail cleanly with exit code 4 (unsupported). Today none passes; the plan is recorded in ADRs 0021 (DECIMAL), 0022
 (joins, query blocks and uncorrelated subqueries) and 0023 (correlated subqueries). The tests that generate the data
-and enforce the ratchet come with the next harness PRs.
+and enforce the ratchet come with the next harness PRs. The last column names the work whose PR completes the query;
+most queries also need the DECIMAL work of ADR 0021 before it.
 
-| Query | Status | Planned with |
+| Query | Status | Completed by |
 | --- | --- | --- |
 | Q1 | unsupported (exit code 4) | DECIMAL arithmetic, SUM and AVG (ADR 0021) |
 | Q2 | unsupported (exit code 4) | correlated scalar aggregates (ADR 0023) |

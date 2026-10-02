@@ -36,8 +36,9 @@ Step-by-step details, file map and examples: [docs/recipes/add-sql-feature.md](.
 8. SQL logic tests: once the test-harness PR has landed, add `.slt` cases whose expectations DuckDB writes (skill
    write-slt-test). Until then the unit tests above carry the coverage.
 9. ClickBench and the queries derived from TPC-H: a feature that changes which queries pass also changes that ratchet
-   and its docs status table in the same PR. Ratchets are protected: hand off (skill clickbench-data). Never write
-   TPC-H query text or fragments of it into a test or a doc; refer to the queries by number.
+   and its docs status table in the same PR. Ratchets are protected: hand off with the exact change (for ClickBench,
+   skill clickbench-data). Never write TPC-H query text or fragments of it into a test or a doc; refer to the queries
+   by number.
 10. Verify: `pixi run test -R '^(sql|plan|exec|engine|cli)\.'`, then `pixi run check`; add `pixi run check-full`
     for `io`/`exec` memory or ownership changes. Run the `reviewer` subagent (Claude Code) on the diff.
 11. PR: title like `feat(sql): add IN lists`, verification commands and results in the template.

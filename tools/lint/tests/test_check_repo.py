@@ -654,13 +654,23 @@ def test_r009_tpch_material(repo: Path) -> None:
     write(
         repo, {"t/lineitem.tbl": "1|2|", "t/orders.tbl.3": "1|", "t/dists.dss": "x", "a/q1.out": "1", "a/q22.ans": "1"}
     )
-    write(repo, {"t/notes.md": "ok", "a/q123.out": "ok", "a/sq1.out": "ok"})
-    legend = " ".join(("THE", "TPC", "SOFTWARE", "IS", "AVAILABLE", "WITHOUT", "CHARGE", "FROM", "TPC."))
-    write(repo, {"src/dbgen.c": f"/*\n * {legend}\n */\nint x;\n", "docs/eula.md": "the TPC software, free"})
+    write(repo, {"t/notes.md": "ok", "a/q123.out": "ok", "a/sq1.out": "ok", "tests/cli/sql/q7.sql": "SELECT 1;"})
+    write(repo, {"tpch/q07.sql": "SELECT 1;"})  # DuckDB's name for its query files
+    # The legend as the kit's EULA file carries it, wrapped over two lines; a lower-case mention is not the legend.
+    legend = " ".join(("THE", "TPC", "SOFTWARE", "IS", "AVAILABLE")) + "\n" + " ".join(("WITHOUT", "CHARGE", "FROM"))
+    write(repo, {"third_party/EULA.txt": f"License\n\n{legend} TPC.\n", "docs/eula.md": "the TPC software, free"})
     out = findings(repo, "R009")
     paths = {f.path for f in out}
-    assert paths == {"t/lineitem.tbl", "t/orders.tbl.3", "t/dists.dss", "a/q1.out", "a/q22.ans", "src/dbgen.c"}
-    assert [f.line for f in out if f.path == "src/dbgen.c"] == [2]
+    assert paths == {
+        "t/lineitem.tbl",
+        "t/orders.tbl.3",
+        "t/dists.dss",
+        "a/q1.out",
+        "a/q22.ans",
+        "tpch/q07.sql",
+        "third_party/EULA.txt",
+    }
+    assert [f.line for f in out if f.path == "third_party/EULA.txt"] == [3]
 
 
 # --- R010 ------------------------------------------------------------------------------------------------------------
@@ -800,8 +810,29 @@ def test_r011_tpch_table_is_found_by_its_heading(repo: Path) -> None:
 def test_r011_tpch_ratchet_needs_its_section(repo: Path) -> None:
     write(repo, {"tests/data/tpch_status.json": '{"pass": []}'})
     assert "no `Queries derived from TPC-H` section with a status table" in messages(repo, "R011")
+    # The heading alone is not enough: the finding points at it.
+    append(repo, "docs/sql-subset.md", "\n## Queries derived from TPC-H\n\nNo table yet.\n")
+    out = findings(repo, "R011")
+    assert [(f.line, f.message[:41]) for f in out] == [(7, "no `Queries derived from TPC-H` section w")]
     write(repo, {"tests/data/tpch_status.json": "[1]"})
     assert "tests/data/tpch_status.json:1: R011 not a JSON object with a `pass` list" in messages(repo, "R011")
+
+
+@pytest.mark.parametrize("path", ["tests/data/tpch_status.json", "tests/data/clickbench_status.json"])
+@pytest.mark.parametrize("content", ['{"pass": null}', '{"pass": 5}', '{"other": []}', '"x"'])
+def test_r011_ratchet_without_a_pass_list(repo: Path, path: str, content: str) -> None:
+    write(repo, {"docs/sql-subset.md": "# SQL subset\n" + textwrap.dedent(TPCH_SECTION)})
+    write(repo, {"tests/data/tpch_status.json": '{"pass": [1]}', path: content})
+    assert f"{path}:1: R011 not a JSON object with a `pass` list" in messages(repo, "R011")
+
+
+def test_r011_clickbench_mismatch_points_at_its_table(repo: Path) -> None:
+    write(repo, {"docs/sql-subset.md": "# SQL subset\n" + textwrap.dedent(TPCH_SECTION)})
+    write(repo, {"tests/data/tpch_status.json": '{"pass": [1]}', "tests/data/clickbench_status.json": '{"pass": [1]}'})
+    out = findings(repo, "R011")
+    assert [(f.line, f.message) for f in out] == [
+        (5, "ClickBench status table passes [0], the ratchet (tests/data/clickbench_status.json) [1]")
+    ]
 
 
 # --- R012 ------------------------------------------------------------------------------------------------------------

@@ -17,8 +17,8 @@ Usage: python tools/lint/check_repo.py [--root DIR] [--only R001,R007]
   R007  docs/architecture.md module table == cmake/Antb1Modules.cmake; `#include` scan of src/ (a module may include
         itself, its allowed deps and what they re-export through PUBLIC_DEPS; tests: every module it can reach).
   R008  ctest labels comment in cmake/Antb1Testing.cmake == docs/testing.md labels table.
-  R009  no data files (Parquet, ClickBench queries, TPC-H tables and answers, TPC tool files or the TPC legend) and
-        no file over 1 MiB except pixi.lock.
+  R009  no data files (Parquet, ClickBench queries, dbgen tables and its distribution file, query and answer files
+        named like DuckDB's or the TPC kit's, files carrying the TPC legend) and no file over 1 MiB except pixi.lock.
   R010  workflow hardening (permissions, timeouts, SHA pins, persist-credentials, triggers, setup-pixi cache key,
         no `${{ github.event.* }}`/`${{ github.head_ref }}` in `run:`); `data` tests use `--redact`.
   R011  ClickBench ratchet `pass` list == docs/sql-subset.md status table; its `clickbench_commit` is the commit
@@ -108,11 +108,13 @@ SETUP_PIXI_CACHE_KEY = "pixi-${{ hashFiles('pixi.lock') }}-"
 LOCK_FIRST_LINE = "version: 7"
 MAX_FILE_BYTES = 1024 * 1024
 LARGE_FILES_ALLOWED = frozenset({"pixi.lock"})
-# Data files, plus TPC-H tables (*.tbl), the dbgen distribution file and answer files (DuckDB's q01.csv, the TPC
-# kit's q1.out): ADR 0006 keeps everything derived from ClickBench or TPC-H out of the repository.
+# Data files, plus dbgen's tables (*.tbl) and distribution file, and query and answer files named like DuckDB's
+# (q01.sql, q01.csv) or the TPC kit's (q1.out): ADR 0006 keeps everything derived from ClickBench or TPC-H out of the
+# repository. Query templates and dbgen sources under other names are left to authors and reviewers.
 DATA_FILE_GLOBS = ("*.parquet", "*.arrow", "*.feather", "*.csv.gz", "queries.sql", "*.tbl", "*.tbl.*", "dists.dss")
-DATA_FILE_RE = re.compile(r"q\d\d\.csv|q\d{1,2}\.(?:out|ans)")
-# The legend that the TPC EULA puts on its software. Assembled at run time, so this file does not match itself.
+DATA_FILE_RE = re.compile(r"q\d\d\.(?:csv|sql)|q\d{1,2}\.(?:out|ans)")
+# The legend that the TPC EULA requires on redistributed TPC software (the kit carries it in its EULA file). Assembled
+# at run time, so this file does not match itself.
 TPC_LEGEND_RE = re.compile(r"\s+".join(("THE", "TPC", "SOFTWARE", "IS", "AVAILABLE", "WITHOUT", "CHARGE")))
 TPCH_STATUS_PATH = "tests/data/tpch_status.json"
 TPCH_STATUS_HEADING = "Queries derived from TPC-H"
@@ -1452,11 +1454,8 @@ def check_r011(ctx: Ctx) -> None:
     if status_text is None:
         return
     path = "tests/data/clickbench_status.json"
-    try:
-        status = json.loads(status_text)
-        raw = status.get("pass", [])
-        ratchet = {q for q in (query_number(str(v)) for v in raw) if q is not None}
-    except (json.JSONDecodeError, AttributeError):
+    status, ratchet = ratchet_of(status_text)
+    if ratchet is None:
         repo.add("R011", path, 1, "not a JSON object with a `pass` list", "fix the JSON")
         return
     check_ratchet_commit(ctx, path, status_text, str(status.get("clickbench_commit", "")))
@@ -1480,6 +1479,18 @@ def check_r011(ctx: Ctx) -> None:
             f"ClickBench status table passes {sorted(passing)}, the ratchet ({path}) {sorted(ratchet)}",
             "update both in the same PR",
         )
+
+
+def ratchet_of(status_text: str) -> tuple[dict[str, Any], set[int] | None]:
+    """The status object and the query numbers of its `pass` list (None unless it is an object with a list)."""
+    try:
+        status = json.loads(status_text)
+    except json.JSONDecodeError:
+        return {}, None
+    raw = status.get("pass") if isinstance(status, dict) else None
+    if not isinstance(raw, list):
+        return status if isinstance(status, dict) else {}, None
+    return status, {q for q in (query_number(str(v)) for v in raw) if q is not None}
 
 
 def status_table(text: str) -> MdTable | None:
@@ -1507,10 +1518,8 @@ def check_tpch_ratchet(ctx: Ctx) -> None:
     status_text = repo.text(TPCH_STATUS_PATH)
     if status_text is None:
         return
-    try:
-        raw = json.loads(status_text).get("pass", [])
-        ratchet = {q for q in (query_number(str(v)) for v in raw) if q is not None}
-    except (json.JSONDecodeError, AttributeError):
+    _, ratchet = ratchet_of(status_text)
+    if ratchet is None:
         repo.add("R011", TPCH_STATUS_PATH, 1, "not a JSON object with a `pass` list", "fix the JSON")
         return
     section = md_section(repo.text("docs/sql-subset.md") or "", TPCH_STATUS_HEADING)
