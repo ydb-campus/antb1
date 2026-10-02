@@ -51,7 +51,8 @@ if(ANTB1_BUILD_TESTS AND NOT ANTB1_FUZZ_ONLY)
 
   # Data derived from TPC-H (ADR 0006): a separate duckdb CLI process loads TPC's dbgen from the pinned
   # duckdb-extension-tpch package by absolute path; the oracle itself never loads extensions. Both come from the
-  # prefix that holds libduckdb, so their DuckDB versions match. Required wherever the oracle is required (ON).
+  # prefix that holds libduckdb, so their DuckDB versions match. Required wherever the oracle is required (ON), except
+  # on macOS: pixi cannot install the package there (pixi.toml), so the TPC-H-derived tests run on Linux only.
   set(ANTB1_HAVE_TPCH OFF)
   if(ANTB1_HAVE_DUCKDB)
     get_filename_component(_antb1_duckdb_prefix "${ANTB1_DUCKDB_LIBRARY}" DIRECTORY)
@@ -63,7 +64,7 @@ if(ANTB1_BUILD_TESTS AND NOT ANTB1_FUZZ_ONLY)
       set(ANTB1_TPCH_EXTENSION "${_antb1_tpch_extension}")
       set(ANTB1_HAVE_TPCH ON)
       message(STATUS "antb1: TPC-H dbgen extension ${ANTB1_TPCH_EXTENSION}")
-    elseif(ANTB1_WITH_DUCKDB STREQUAL "ON")
+    elseif(ANTB1_WITH_DUCKDB STREQUAL "ON" AND NOT APPLE)
       message(
         FATAL_ERROR
         "ANTB1_WITH_DUCKDB=ON, but the duckdb CLI or exactly one tpch extension was not found in ${_antb1_duckdb_prefix}"

@@ -387,9 +387,10 @@ queries and the pass/fail ratchet. The full policy is
 The data derived from TPC-H follows the same model with one difference: nothing is downloaded. The pinned conda-forge
 package `duckdb-extension-tpch` (TPC's dbgen, under the TPC EULA v2.2) generates the data, the query texts and DuckDB's
 answers at test time into the build tree. A separate duckdb CLI process loads it by absolute path; the oracle never
-loads extensions. Never commit or paste TPC-H data, answers, query text in any dialect (fragments included) or
-EXPLAIN output of those queries; refer to queries by number. The smoke test `harness.tpch.extension` (label
-`harness`, in `tests/tpch/`) checks that the extension loads. Installing the `default` or `gcc` environment, also on
-CI runners, installs dbgen and accepts its EULA. This workload is derived from the TPC-H Benchmark and is not
-comparable to published TPC-H Benchmark results, as this implementation does not comply with all requirements of the
-TPC-H Benchmark.
+loads extensions. Never commit or paste TPC-H data, answers, query text in any dialect (fragments included) or EXPLAIN
+output of those queries; refer to queries by number. The smoke test `harness.tpch.extension` (label `harness`, in
+`tests/tpch/`) checks that the extension loads. The package is installed on Linux only (pixi cannot re-sign the
+osx-arm64 build), so these tests run on Linux and are not registered on macOS. Installing the `default` or `gcc`
+environment on Linux, also on CI runners, installs dbgen and accepts its EULA. This workload is derived from the TPC-H
+Benchmark and is not comparable to published TPC-H Benchmark results, as this implementation does not comply with all
+requirements of the TPC-H Benchmark.

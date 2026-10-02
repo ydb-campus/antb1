@@ -325,7 +325,6 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/compiler-rt23-23.1.2-hdb3d66b_0.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/curl-8.22.0-h6651222_0.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/duckdb-cli-1.5.5-h6111c0a_0.conda
-      - conda: https://conda.anaconda.org/conda-forge/osx-arm64/duckdb-extension-tpch-1.5.5-h6111c0a_0.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/gflags-2.3.1-h784d473_0.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/glog-0.7.1-h6f9ecc1_1.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/gtest-1.18.0-h3feff0a_1.conda
@@ -5879,18 +5878,6 @@ packages:
   run_exports: {}
   size: 236444
   timestamp: 1789628711635
-- conda: https://conda.anaconda.org/conda-forge/osx-arm64/duckdb-extension-tpch-1.5.5-h6111c0a_0.conda
-  sha256: d1869c5b0bcf06e62f8b259ad0593083b46581c0f7c4b603270b661bf16da1ad
-  md5: 457962562c8f423b362b4a7242e5c7f3
-  depends:
-  - __osx >=11.0
-  - libcxx >=21
-  - libduckdb 1.5.5 he4423df_0
-  license: MIT
-  license_family: MIT
-  run_exports: {}
-  size: 3058113
-  timestamp: 1789628806704
 - conda: https://conda.anaconda.org/conda-forge/osx-arm64/gflags-2.3.1-h784d473_0.conda
   sha256: 3028f8f857d438444d3fb56c9c74d46699cb04e676c6575747cf3ad8d9a308b1
   md5: 96aea99abfaf8d1e7731c03e3f70fb02

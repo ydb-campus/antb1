@@ -15,7 +15,7 @@ time (ADR 0006).
 | `cli/` | `cli.<case>` | `cli` | stdout, stderr and exit code of the `antb1` binary |
 | `slt/`, `harness/`, `cli/` | `harness.*` | `harness` | the harness itself: mutations, redaction, digest |
 | `data/` | `data.*` | `data` | ClickBench data tests on downloaded data, redacted (`pixi run test-data` only) |
-| `tpch/` | `harness.tpch.*` | `harness` | the pinned dbgen extension for the data derived from TPC-H loads |
+| `tpch/` | `harness.tpch.*` | `harness` | the pinned dbgen extension for the data derived from TPC-H loads (Linux only) |
 
 ```bash
 pixi run test -L diff          # one label
