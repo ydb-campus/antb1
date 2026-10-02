@@ -2,7 +2,9 @@
 
 antb1 is a small, single-process SQL engine over Parquet files. It is split into seven C++23 static libraries
 (modules) and one binary, `antb1`. This page describes the code as it is today; the engine design beyond the first
-SQL slice is still open (see [ADR 0003](adr/0003-engine-architecture.md)).
+SQL slice is still open (see [ADR 0003](adr/0003-engine-architecture.md)). Joins, derived tables, common table
+expressions and uncorrelated subqueries are designed in [ADR 0022](adr/0022-joins-and-query-blocks.md) and not built
+yet: the steps below change with the PRs that build them.
 
 ## Modules
 

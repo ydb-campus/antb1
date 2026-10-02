@@ -96,26 +96,35 @@ Proposed
 
 ## Towards joins (amendment, 2026-09-29)
 
-The maintainer asked for this design to be ready for TPC-H: hash joins, and correlated subqueries.
+The maintainer asked for this design to be ready for the queries derived from TPC-H: hash joins, and correlated
+subqueries. [ADR 0022](0022-joins-and-query-blocks.md) designs the joins and amends this section where marked.
 
 - **A physical plan becomes a DAG of pipelines.** A pipeline has a source (a table's parts, or a finished sink's
   output), streaming operators (`Filter`, `Compute`, `Project`, later a hash-join probe) and a sink (aggregate,
   grouped aggregate, sort/top-N, the ordered collector, later a hash-join build). A pipeline runs once the sinks it
   reads are finished: a probe pipeline after its builds.
 - **A table read by two pipelines is scanned twice, never buffered** (a self-join, a CTE used twice, a decorrelated
-  subquery over the outer table). Only the sinks hold data.
-- **Order stays deterministic:** a build holds its rows in part order and a probe keeps the probe side's part order,
-  so a join's output does not depend on the thread count either.
+  subquery over the outer table). Only the sinks hold data. Until a later ADR, a build feeds exactly one probe
+  pipeline; the unnesting paths of ADR 0023 need no buffered outer side (amended 2026-10-02, ADR 0022).
+- **Order stays deterministic** (amended 2026-10-02, ADR 0022): a build is partitioned by key hash and keeps its rows
+  in (part, row) order within each partition, so a key's matches come in part order and the build depends only on
+  its input's parts; a probe keeps the probe side's part order, so a join's output does not depend on the thread
+  count.
 - **Correlated subqueries** are decorrelated by the binder into semi, anti and aggregate joins; the executor never
   runs a subquery per row.
 - **Memory:** the window bounds what is in flight: up to 2 × threads parts' partial states or, under a part union
   (a projection, or a blocking operator without its own sink yet), their whole output, because a part hands on its
-  batches only when it is finished. A hash-join build is one table shared read-only by the probe threads, built on
-  the smaller side. The session memory limit (`exec::MemoryBudget`: a counting memory pool plus reservations for the
-  operators' own containers; the window halves under pressure and widens again without, and a part that runs out
-  of memory next to others runs again alone; a `memory` error, exit code 1) came
-  right after the first parallel PR. Spilling (grace hash join, partitioned GROUP BY, external sort) comes after
-  joins, in its own ADR; it never changes a value, only the row order where SQL leaves it open.
+  batches only when it is finished. A hash-join build is one table shared read-only by the probe threads. An inner
+  join builds on the side with the smaller footer row count; an outer, semi or anti join builds on the side whose
+  rows it does not preserve, until build-side output gets its own ADR. The plan depends on metadata only, never on
+  the thread count (amended 2026-10-02, ADR 0022). The session memory limit (`exec::MemoryBudget`: a counting memory
+  pool plus reservations for the operators' own containers; the window halves under pressure and widens again
+  without, and a part that runs out of memory next to others runs again alone; a `memory` error, exit code 1) came
+  right after the first parallel PR. Finished builds are charged to the budget and stay pinned until their probe
+  pipeline finishes; excluding them from the pressure measure is deferred until a memory test or a run at SF 10 or
+  above shows serialized probes. Spilling (grace hash join, partitioned GROUP BY, external sort) follows the
+  correctness work on the TPC-H-derived queries and starts on its trigger, in its own ADR; it never changes a value,
+  only the row order where SQL leaves it open (amended 2026-10-02, ADR 0022).
 
 ## Consequences
 
@@ -189,5 +198,7 @@ The maintainer asked for this design to be ready for TPC-H: hash joins, and corr
 - **Static contiguous ranges of parts per thread:** deterministic for a thread count but not across counts, and it
   load-balances poorly across uneven row groups.
 - **Exchange operators and push-based pipelines (Volcano exchange, DuckDB-style push):** more general, for joins and
-  deeper plans, but antb1's plans have one scan and at most one blocking operator below small serial tops. Revisit with
-  joins (ADR 0003's pull-versus-push question).
+  deeper plans, but antb1's plans have one scan and at most one blocking operator below small serial tops. Answered
+  for joins, which is ADR 0003's pull-versus-push question (amended 2026-10-02, ADR 0022): pull pipelines stay.
+  Builds are prepared on the consumer thread in post-order before the probe's scheduler starts, never from a part
+  task, and there are no exchange operators.

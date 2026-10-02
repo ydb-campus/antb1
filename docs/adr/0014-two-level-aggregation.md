@@ -21,8 +21,8 @@ Proposed
 - **The global form was solved in #49** as a `GROUP BY x` with `COUNT` on top.
   - The same rewrite for the grouped form (`GROUP BY K, x`, then `GROUP BY K`) made Q11 and Q13 1.7-2.8× slower: the
     outer grouping was serial over up to every inner group.
-- **Later work needs the same shape.** Derived tables, decorrelated subqueries (TPC-H) and several `COUNT(DISTINCT)`
-  columns all come down to an outer GROUP BY K over an inner GROUP BY K ∪ X.
+- **Later work needs the same shape.** Derived tables, decorrelated subqueries (the queries derived from TPC-H) and
+  several `COUNT(DISTINCT)` columns all come down to an outer GROUP BY K over an inner GROUP BY K ∪ X.
 
 ## Decision
 
@@ -91,7 +91,8 @@ Proposed
 - **Memory:** the inner tables and outer groups are charged to the budget (their groupers through the pool, their
   vectors through reservations), and the part scheduler's OOM retry applies to both runs of parts.
 - **Reuse:** derived tables and decorrelation can build an outer aggregation over an inner GROUP BY with the same
-  operator. Persistent statistics (Count-Min sketches, HyperLogLog) come with joins and can replace the sample.
+  operator. Joins plan from footer statistics; persistent sketches come with cost-based join ordering if footers
+  prove insufficient, with their own storage decision (amended 2026-10-02, [ADR 0022](0022-joins-and-query-blocks.md)).
 
 ## Alternatives considered
 
