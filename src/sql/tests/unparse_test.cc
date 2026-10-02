@@ -91,6 +91,23 @@ TEST(UnparseTest, CanonicalForms) {
                          "last",
                 .canonical = "SELECT COUNT(DISTINCT a) FROM t ORDER BY COUNT(DISTINCT a) DESC "
                              "NULLS LAST"},
+           // Both spellings of a cast print as CAST; a minus before a cast is not part of the
+           // number.
+           Case{.input = "select a :: int, -1::integer, (-1)::integer, - 1.5::decimal(4,1) from t",
+                .canonical = "SELECT CAST(a AS INT), -(CAST(1 AS INTEGER)), CAST(-1 AS INTEGER), "
+                             "-(CAST(1.5 AS DECIMAL(4, 1))) FROM t"},
+           Case{.input = "select cast ( d as date ) , try_cast(a as Decimal( 15 , 2 )) x from t "
+                         "where d >= '2024-01-31'::Date and d < cast('2024-02-01' as date)",
+                .canonical =
+                    "SELECT CAST(d AS DATE), TRY_CAST(a AS DECIMAL(15, 2)) AS \"x\" FROM t "
+                    "WHERE d >= CAST('2024-01-31' AS DATE) AND d < "
+                    "CAST('2024-02-01' AS DATE)"},
+           Case{.input =
+                    "select a::varchar::date, (a + 1)::bigint, sum(x)::double, not b::boolean, "
+                    "cast(a = 1 or b as boolean), try_cast, try_cast::int from t",
+                .canonical = "SELECT CAST(CAST(a AS VARCHAR) AS DATE), CAST(a + 1 AS BIGINT), "
+                             "CAST(SUM(x) AS DOUBLE), NOT CAST(b AS BOOLEAN), "
+                             "CAST(a = 1 OR b AS BOOLEAN), try_cast, CAST(try_cast AS INT) FROM t"},
        }) {
     EXPECT_EQ(Canonical(c.input), c.canonical) << c.input;
     ExpectRoundTrip(c.input);
@@ -116,6 +133,14 @@ TEST(UnparseTest, RoundTripsCorpus) {
            R"(SELECT "g", COUNT(DISTINCT "u") FROM t GROUP BY "g" ORDER BY "g" NULLS FIRST)"sv,
            "SELECT a FROM t OFFSET 5"sv,
            "SELECT COUNT(*) FROM t HAVING SUM(x) >= -1.5 AND COUNT(DISTINCT y) <> 0"sv,
+           "SELECT CAST(a AS INT), a::BIGINT, TRY_CAST(a AS DECIMAL(15, 2)) FROM t WHERE d >= "
+           "'2024-01-31'::DATE"sv,
+           "SELECT -a::INT, -(1)::INT, (-1)::INT, -1::INT, - -a::INT, -(a)::INT FROM t"sv,
+           "SELECT a FROM t WHERE CAST('2020-01-02' AS DATE) < d AND d IN ('2020-01-02'::DATE, "
+           "CAST('2024-01-31' AS DATE))"sv,
+           "SELECT CASE WHEN a > 0 THEN 1 END::INT, EXTRACT(year FROM d)::INT, f(a)::INT, "
+           "COUNT(*)::BIGINT FROM t GROUP BY a::VARCHAR ORDER BY 1::INT"sv,
+           "SELECT CAST(CAST(a AS VARCHAR) AS DATE), CAST(a = 1 OR b AS BOOLEAN), x::T_1 FROM t"sv,
        }) {
     ExpectRoundTrip(sql);
   }
@@ -370,6 +395,14 @@ TEST(EqualIgnoringSpansTest, DetectsDifferencesInExpressions) {
            {"EXTRACT(minute FROM a)", "EXTRACT(hour FROM a)"},
            {"SUM(a)", "SUM(a + 1)"},
            {"COUNT(*)", "COUNT(a)"},
+           {"CAST(a AS INT)", "TRY_CAST(a AS INT)"},
+           {"CAST(a AS INT)", "CAST(a AS BIGINT)"},
+           {"CAST(a AS INT)", "CAST(b AS INT)"},
+           {"CAST(a AS INT)", "a"},
+           {"a::INT::INT", "a::INT"},
+           {"CAST(a AS DECIMAL(15, 2))", "CAST(a AS DECIMAL(15, 3))"},
+           {"CAST(a AS DECIMAL(15))", "CAST(a AS DECIMAL(15, 2))"},
+           {"CAST(a AS DECIMAL)", "CAST(a AS DECIMAL(15))"},
        })) {
     auto x = Parse("SELECT " + std::string(a) + " FROM t");
     auto y = Parse("SELECT " + std::string(b) + " FROM t");
@@ -377,6 +410,11 @@ TEST(EqualIgnoringSpansTest, DetectsDifferencesInExpressions) {
     EXPECT_FALSE(EqualIgnoringSpans(x->items[0].expr, y->items[0].expr)) << a << " / " << b;
     EXPECT_TRUE(EqualIgnoringSpans(x->items[0].expr, x->items[0].expr));
   }
+  // The spelling of a cast is not recorded, and type names are upper-cased.
+  auto cast = Parse("SELECT CAST(a AS DECIMAL(15, 2)) FROM t");
+  auto colons = Parse("SELECT a::decimal(15,2) FROM t");
+  ASSERT_TRUE(cast.has_value() && colons.has_value());
+  EXPECT_TRUE(EqualIgnoringSpans(cast->items[0].expr, colons->items[0].expr));
 }
 
 }  // namespace

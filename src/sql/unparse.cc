@@ -155,6 +155,17 @@ struct SqlOf {
   std::string operator()(const ExtractExpr& e) const {
     return "EXTRACT(" + e.field + " FROM " + Sql(*e.source, kOr) + ")";
   }
+  // Both spellings as CAST: x::T reads back as the same node.
+  std::string operator()(const CastExpr& cast) const {
+    std::string type = cast.type;
+    for (std::size_t i = 0; i < cast.type_params.size(); ++i) {
+      type += (i == 0 ? "(" : ", ") + cast.type_params[i];
+    }
+    if (!cast.type_params.empty()) {
+      type += ')';
+    }
+    return (cast.try_cast ? "TRY_CAST(" : "CAST(") + Sql(*cast.operand, kOr) + " AS " + type + ")";
+  }
 };
 
 std::string Sql(const Expr& expr) {

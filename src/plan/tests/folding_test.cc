@@ -337,5 +337,19 @@ INSTANTIATE_TEST_SUITE_P(
         FoldCase{"i16 = 1.0000000000000000000000000000000000001", kFalse},
         FoldCase{"i16 < 1.0000000000000000000000000000000000001", kCompare, CompareOp::kLe, 1}));
 
+// A date cast of a string literal is the DATE literal (days since 1970-01-01), in either spelling
+// and on either side.
+INSTANTIATE_TEST_SUITE_P(
+    DateCasts, FoldThroughBinderTest,
+    ::testing::Values(FoldCase{"dt = DATE '2013-07-01'", kCompare, CompareOp::kEq, 15887},
+                      FoldCase{"dt = CAST('2013-07-01' AS DATE)", kCompare, CompareOp::kEq, 15887},
+                      FoldCase{"dt = '2013-07-01'::DATE", kCompare, CompareOp::kEq, 15887},
+                      FoldCase{"dt >= cast('1970-01-01' as Date)", kCompare, CompareOp::kGe, 0},
+                      FoldCase{"dt < '1969-12-31' :: date", kCompare, CompareOp::kLt, -1},
+                      FoldCase{"CAST('2024-01-31' AS DATE) < dt", kCompare, CompareOp::kGt, 19753},
+                      FoldCase{"'2020-01-02'::DATE >= dt", kCompare, CompareOp::kLe, 18263},
+                      FoldCase{"dt <> ('2020-01-02')::DATE", kCompare, CompareOp::kNe, 18263},
+                      FoldCase{"(('2020-01-02'::DATE)) = dt", kCompare, CompareOp::kEq, 18263}));
+
 }  // namespace
 }  // namespace antb1::plan
