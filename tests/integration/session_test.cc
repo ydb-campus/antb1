@@ -131,8 +131,9 @@ TEST(Session, ErrorKindsAtTheBoundary) {
   EXPECT_EQ(kind("SELECT COUNT(*) FROM no_such_table"), plan::SqlErrorDetail::Kind::kBind);
   EXPECT_EQ(kind("SELECT SUM(AdvEngineID) FROM hits_like GROUP BY lower(URL)"),
             plan::SqlErrorDetail::Kind::kUnsupported);
-  EXPECT_EQ(kind("SELECT row_number() OVER () FROM hits_like"),
-            plan::SqlErrorDetail::Kind::kUnsupported);
+  EXPECT_EQ(kind("SELECT row_number() OVER () FROM no_such_table"),
+            plan::SqlErrorDetail::Kind::kUnsupported)
+      << "unsupported SQL is rejected before any name is resolved";
   EXPECT_EQ(kind("SELECT SUM(AdvEngineID) FROM hits_like GROUP BY 1"),
             plan::SqlErrorDetail::Kind::kBind)
       << "GROUP BY 1 refers to the aggregate";

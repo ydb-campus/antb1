@@ -207,17 +207,18 @@ antb1_add_cli_golden(
   STDERR
   ARGS query --threads 1 -c "SELECT COUNT(*)\nFROM nope" --table "${_t}" --format json
 )
+# Table u is not registered: unsupported SQL exits 4 before any name is resolved.
 antb1_add_cli_golden(
   unsupported
   EXIT_CODE 4
   STDERR
-  ARGS query --threads 1 -c "SELECT CounterID, row_number() OVER (ORDER BY CounterID) FROM t" --table "${_t}"
+  ARGS query --threads 1 -c "SELECT CounterID, row_number() OVER (ORDER BY CounterID) FROM u" --table "${_t}"
 )
 antb1_add_cli_golden(
   unsupported_json
   EXIT_CODE 4
   STDERR
-  ARGS query --threads 1 -c "SELECT SUM(AdvEngineID) OVER () FROM t" --table "${_t}" --format json
+  ARGS query --threads 1 -c "SELECT SUM(AdvEngineID) OVER () FROM u" --table "${_t}" --format json
 )
 antb1_add_cli_golden(
   unsupported_explain

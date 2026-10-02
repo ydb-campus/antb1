@@ -370,8 +370,10 @@ TEST_F(SessionTest, FloatColumnsCompareLikeDuckDb) {
 TEST_F(SessionTest, UnsupportedAndBindErrorsKeepTheirKinds) {
   auto session = Session::Make().ValueOrDie();
   ASSERT_TRUE(session->RegisterParquet("t", {path_}).ok());
+  // Column nope does not exist (SUM(nope) below is a bind error), but unsupported SQL is
+  // rejected before any name is resolved.
   for (const char* sql :
-       {"SELECT AdvEngineID, row_number() OVER () FROM t",
+       {"SELECT nope, row_number() OVER () FROM t",
         "SELECT AdvEngineID FROM t ORDER BY lower(AdvEngineID)",
         "SELECT SUM(DISTINCT AdvEngineID) FROM t", "SELECT DISTINCT AdvEngineID FROM t"}) {
     auto result = session->Execute(sql);
