@@ -32,6 +32,7 @@ gtest = "1.18.*"
 benchmark = "1.9.*"
 libduckdb-devel = "1.5.*"                           # DuckDB C API: TEST ORACLE ONLY, never linked into src/
 duckdb-cli = "1.5.*"
+duckdb-extension-tpch = "1.5.*"                     # TPC's dbgen (TPC EULA): TPC-H-derived test data only (ADR 0006)
 
 # ---- clang toolchain -> env `default` (primary compiler on every platform) ----
 [feature.clang.dependencies]

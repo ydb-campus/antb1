@@ -48,6 +48,31 @@ if(ANTB1_BUILD_TESTS AND NOT ANTB1_FUZZ_ONLY)
   else()
     message(STATUS "antb1: DuckDB oracle disabled; oracle tests are not registered (ANTB1_WITH_DUCKDB=OFF)")
   endif()
+
+  # Data derived from TPC-H (ADR 0006): a separate duckdb CLI process loads TPC's dbgen from the pinned
+  # duckdb-extension-tpch package by absolute path; the oracle itself never loads extensions. Both come from the
+  # prefix that holds libduckdb, so their DuckDB versions match. Required wherever the oracle is required (ON).
+  set(ANTB1_HAVE_TPCH OFF)
+  if(ANTB1_HAVE_DUCKDB)
+    get_filename_component(_antb1_duckdb_prefix "${ANTB1_DUCKDB_LIBRARY}" DIRECTORY)
+    get_filename_component(_antb1_duckdb_prefix "${_antb1_duckdb_prefix}" DIRECTORY)
+    find_program(ANTB1_DUCKDB_CLI duckdb PATHS "${_antb1_duckdb_prefix}/bin" NO_DEFAULT_PATH)
+    file(GLOB _antb1_tpch_extension "${_antb1_duckdb_prefix}/duckdb/extensions/v*/*/tpch.duckdb_extension")
+    list(LENGTH _antb1_tpch_extension _antb1_tpch_count)
+    if(ANTB1_DUCKDB_CLI AND _antb1_tpch_count EQUAL 1)
+      set(ANTB1_TPCH_EXTENSION "${_antb1_tpch_extension}")
+      set(ANTB1_HAVE_TPCH ON)
+      message(STATUS "antb1: TPC-H dbgen extension ${ANTB1_TPCH_EXTENSION}")
+    elseif(ANTB1_WITH_DUCKDB STREQUAL "ON")
+      message(
+        FATAL_ERROR
+        "ANTB1_WITH_DUCKDB=ON, but the duckdb CLI or exactly one tpch extension was not found in ${_antb1_duckdb_prefix}"
+        " (pixi: duckdb-cli, duckdb-extension-tpch)"
+      )
+    else()
+      message(STATUS "antb1: duckdb CLI or tpch extension not found; TPC-H-derived tests are not registered")
+    endif()
+  endif()
 endif()
 if(ANTB1_BUILD_BENCHMARKS AND NOT ANTB1_FUZZ_ONLY)
   find_package(benchmark CONFIG REQUIRED) # benchmark::benchmark
