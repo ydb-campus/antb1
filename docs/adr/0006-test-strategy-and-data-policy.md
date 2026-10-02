@@ -77,15 +77,16 @@ Data policy for the data derived from TPC-H (amendment, 2026-10-02):
   auto-install and auto-load off, the pinned extension loaded by absolute path (DuckDB would search the home directory
   first), then locked down (allowed directories, no external access, configuration locked) before writing. The
   smoke test `harness.tpch.extension` checks that the extension loads.
-- **Output:** TPC-H-derived tests run redacted like the data tests (query number, hashes and a local repro command)
-  and print no timings in CI, whose logs and artifacts are public.
+- **Output:** TPC-H-derived tests run redacted like the data tests (query number, hashes and a local repro command):
+  never query text, data or answers, because CI logs and artifacts are public. They may print timings (see Naming).
 - **Naming:** every public mention says "derived from TPC-H". Material that describes the workload or presents its
   numbers also carries this disclaimer verbatim: "This workload is
   derived from the TPC-H Benchmark and is not comparable to published TPC-H Benchmark results, as this implementation
-  does not comply with all requirements of the TPC-H Benchmark." Numbers are per-query seconds and their geometric
-  mean, never TPC metrics, never compared with official results, with the deviations and the machine listed. Before
-  any number leaves the repository, the maintainers decide whether to ask the TPC for permission (TPC Policies
-  8.1.4).
+  does not comply with all requirements of the TPC-H Benchmark." Its numbers (timings: per-query seconds, their
+  geometric mean, test durations) are never presented as TPC-H Benchmark results: no TPC metrics (QphH, QppH, QthH,
+  $/kQphH) and no comparison with official TPC results. Published benchmark numbers list the deviations and the
+  machine. On 2026-10-02 the maintainers allowed such numbers in every public place (CI logs and artifacts, pull
+  requests, benchmark reports) without asking the TPC first (TPC Policies 8.1.4).
 
 ## Consequences
 

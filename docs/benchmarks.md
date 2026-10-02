@@ -136,6 +136,15 @@ For the full dataset (100 partitions, about 14.7 GB, host only), point `ANTB1_HI
 Never commit ClickBench data, query text, results or result files, and never upload them as CI artifacts
 ([ADR 0006](adr/0006-test-strategy-and-data-policy.md)); the result JSON holds only timings, so it may be uploaded.
 
+## Queries derived from TPC-H
+
+No benchmark runs them yet. When one does, its numbers (per-query seconds and their geometric mean) may be published
+like the ClickBench timings, but never as TPC-H Benchmark results: no TPC metrics (QphH, QppH, QthH, $/kQphH), no
+comparison with official TPC results, the deviations and the machine listed, and next to them this disclaimer
+([ADR 0006](adr/0006-test-strategy-and-data-policy.md)): "This workload is derived from the TPC-H Benchmark and is not
+comparable to published TPC-H Benchmark results, as this implementation does not comply with all requirements of the
+TPC-H Benchmark."
+
 ## CI: `bench.yml`
 
 | Job | Runs on | What it does |

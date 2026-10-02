@@ -96,7 +96,9 @@ jobs:
                `confirmed: true`: start with the priority (P0 or P1), then what breaks, the failure scenario and
                the fix. No comments on formatting, lint or style (CI enforces them), no praise, no restated diff.
                Never quote ClickBench data values (rows, query results or answers) or anything derived from
-               TPC-H (query text or fragments, data, answers, timings).
+               TPC-H (query text or fragments, data, answers). Flag a timing of the TPC-H-derived queries
+               presented as a TPC-H Benchmark result (TPC metrics such as QphH, or a comparison with official
+               TPC results).
             4. Summary. Finish by updating your tracking comment with mcp__github_comment__update_claude_comment,
                replacing the checklist with:
                - first line: `**Claude review:** N problem(s) found` or `**Claude review:** no problems found`;
