@@ -97,7 +97,8 @@ Proposed
 ## Towards joins (amendment, 2026-09-29)
 
 The maintainer asked for this design to be ready for the queries of [ADR 0022](0022-joins-and-query-blocks.md): hash
-joins, and correlated subqueries. ADR 0022 designs the joins and amends this section where marked.
+joins, and correlated subqueries. ADR 0022 designs the joins and [ADR 0023](0023-unnesting.md) the correlated
+subqueries; both amend this section where marked.
 
 - **A physical plan becomes a DAG of pipelines.** A pipeline has a source (a table's parts, or a finished sink's
   output), streaming operators (`Filter`, `Compute`, `Project`, later a hash-join probe) and a sink (aggregate,
@@ -110,9 +111,10 @@ joins, and correlated subqueries. ADR 0022 designs the joins and amends this sec
   in (part, row) order within each partition, so a key's matches come in part order and the build depends only on
   its input's parts; a probe keeps the probe side's part order, so a join's output does not depend on the thread
   count.
-- **Subqueries:** the binder plans an uncorrelated subquery directly as a join: semi, null-aware anti, or a one-row
-  join (amended 2026-10-02, ADR 0022). Correlated subqueries are decorrelated by the binder into semi, anti and
-  aggregate joins; the executor never runs a subquery per row.
+- **Subqueries** (amended 2026-10-02, ADRs 0022 and 0023): the binder plans an uncorrelated subquery directly as a
+  join (semi, null-aware anti, or a one-row join) and a correlated one as a dependent join; the first optimizer pass
+  (ADR 0023) replaces every dependent join with joins or rejects the query as unsupported (exit code 4), so
+  `plan::Optimize` can fail. The executor never runs a subquery per row.
 - **Memory:** the window bounds what is in flight: up to 2 × threads parts' partial states or, under a part union
   (a projection, or a blocking operator without its own sink yet), their whole output, because a part hands on its
   batches only when it is finished. A hash-join build is one table shared read-only by the probe threads. An inner

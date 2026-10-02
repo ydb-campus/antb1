@@ -29,3 +29,4 @@ A design ADR may land first, in a docs-only PR, when the maintainer asks for it 
 | [0019](0019-own-aggregation-hash-table.md) | An aggregation hash table of our own, scheduled for later | Proposed (deferred) |
 | [0020](0020-filter-pushdown.md) | Filter pushdown into the scan | Proposed |
 | [0022](0022-joins-and-query-blocks.md) | Joins, query blocks and uncorrelated subqueries | Proposed |
+| [0023](0023-unnesting.md) | Correlated subqueries as dependent joins, unnested by the optimizer | Proposed |
