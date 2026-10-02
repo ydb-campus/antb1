@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790940110432,
+  "lastUpdate": 1790945063049,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -3900,6 +3900,90 @@ window.BENCHMARK_DATA = {
             "value": 14.435819291666855,
             "unit": "ms/iter",
             "extra": "iterations: 48\ncpu: 14.434704687499966 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "774c8d1b890a64a6bf4cd1ea6d84c27ef2862064",
+          "message": "refactor(plan): stable column ids (#78)\n\n## Summary\n\nEvery column of a logical plan gets a `plan::ColumnId` where it is\ncreated, and every column reference names the\ncolumn it reads by id as well as by position. This is PR P1 of the\nroadmap for the queries derived from TPC-H and\nthe first half of ADR 0022's \"Logical plan\" section: join ordering,\npushdown into either input, pruning across two\ninputs, sub-plans and ADR 0023's free variables all need a column to\nkeep its identity when its position changes, so\nids come before any join code (decision C6). P1 changes no answer, no\nEXPLAIN output and no golden.\n\n**The id model** (`src/plan/include/antb1/plan/logical_plan.h`):\n\n| Node | Defines | `OutputIds(node)` |\n| --- | --- | --- |\n| Scan | one id per field (`ids`) | `ids` |\n| Filter, Sort, Limit | nothing | the input's |\n| Compute | one id per expression (`ids`) | the input's, then `ids` |\n| Project | one id per output column (`ids`) | `ids` |\n| Aggregate | one id per call (`AggregateCall::id`) | the call ids |\n| GroupAggregate | a new id per key (`key_ids`) and per call |\n`key_ids`, then the call ids |\n| RowCount | `id`, the COUNT(*) column it replaces | `{id}` |\n\n- **References.** `BoundColumn::id` and `ColumnExpr::id` sit next to\n`index`. Project constants and the\noperand-local columns of a `PredicateExpr` have no id. Ids never go on\n`Expr`: one `ExprPtr` is shared between\n  binder lists and nested as an operand.\n- **The type.** `enum class ColumnId : std::uint32_t`, minted from 1 per\nquery, with `kNoColumnId` = 0. There is no\narithmetic and no implicit conversion; `<` and `std::hash` work, for\nP2's sets and maps.\n- **A GROUP BY key's output is a new column.** A DOUBLE key merges -0.0\nwith 0.0 and every NaN, and ROLLUP would make\nkeys NULL, so the value above the aggregation is not the input column. A\nlater rule that moves a predicate across\nthe aggregation therefore has to map ids explicitly and cannot do it\nsilently.\n- **Project ids.** The binder gives every select item a new id (`SELECT\ns, s AS t` outputs two columns, as derived\ntables will need). The Project that the optimizer inserts to restore an\norder passes its input's ids through.\n- **`plan.output` carries the ids**, which must be the root's; every\noptimizer rule keeps them.\n\n**API.**\n- `OutputIds(node)`.\n- `MapColumns(expr, f)`, which returns the same pointer when nothing\nchanges; `Renumber` wraps it.\n- `ResolvePositions(plan)`: a bottom-up walk, copy-on-change and\ntherefore idempotent, that sets every index from the\nids. It is the last step of `plan::Optimize`, and it never goes through\n`InputOf`, so J1a can add two-input nodes.\n- `PositionMismatch(plan)`: the first broken invariant, else the first\nindex that differs from its resolved\n  position, e.g. `Filter: column #12 is at 3, not 4`.\n- `CheckPositions(plan)`: aborts with that text, reported at the caller.\n\n**P1 keeps every position computation the binder and the optimizer do\ntoday** (the `kPreBase`/`kPostBase` bands,\n`Place`, `place_pre`, Remap, Renumber) and assigns the ids alongside\nthem, where the columns are created:\n- the binder: the field ids when the table is bound,\n`InputColumn`/`OutputColumn` for computed columns, the\n  aggregate calls, the GROUP BY keys, the select items;\n- the optimizer: RowCount takes the COUNT(*) id, the dependent-key\nrewrite maps the moved expressions' ids to the\nkept keys' output ids and keeps every id the nodes above read, and\npruning keeps `ids` in step with fields and\n  expressions.\n\n`Bind` and `Optimize` then check that their positions are the positions\nof the ids. **The check is always on, not\ndebug-only:** the ClickBench data tests run on the RelWithDebInfo build,\nwhere `ANTB1_DCHECK` compiles away. It costs\nmicroseconds per query on plans of about ten nodes, and its messages\nname node kinds, ids and positions only, so data\ntest logs stay redacted. P2 moves the optimizer rules onto ids, deletes\nthe bands and the remapping, and with them\nthis check; `ResolvePositions` stays.\n\n**Left positional for P2**, which moves them to ids: `SameCall`, the\nfield-name choice in `InputColumn`,\n`float_args_`, the WHERE split by `index < width_`, `CheckGrouped`'s\ntemporary expression, the key lookups,\n`BindHaving`'s `kPostBase` substitution, the ORDER BY deduplication and\n`SameExpr`.\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [x] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run test -R '^plan\\.'\n100% tests passed out of 380\n\n$ pixi run check-full          # on 0a311af\nlint: PASS\nci        100% tests passed out of 1474 (main has 1465; this adds 9)\nasan      100% tests passed out of 1474\ntidy      passed\ncoverage  100% tests passed out of 1474; Coverage gate: PASS\nfuzz      100% tests passed out of 2\nci-gcc    100% tests passed out of 1474\nEXIT CODE: 0\n\n$ pixi run test-data           # on 0a311af: the check also runs in this RelWithDebInfo build\n100% tests passed out of 6\n\n$ ANTB1_DIFF_SEED=2 ANTB1_DIFF_COUNT=20000 pixi run diff-random      # on 0a311af\nDIFF: PASS seed=2 queries=20000 failed=0 unsupported=0\n$ ANTB1_DIFF_SEED=1 ANTB1_DIFF_COUNT=20000 pixi run diff-random      # on the first version\nDIFF: PASS seed=1 queries=20000 failed=0 unsupported=0\n```\n\n**The check is not tautological.** Moving the binder's `place_pre`\nrelocation by one (not committed) makes 15 plan\ntests abort in `Bind` with messages like `Project: column #12 is at 11,\nnot 12`.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed):\n- `plan.ColumnIdsTest.*` (new): `OutputIds` for every node kind,\n`ResolvePositions` over every kind of reference\n(operand-local columns untouched, constants skipped), idempotence, every\n`PositionMismatch` message, and the\n    aborts;\n- `plan.BinderTest.ColumnIdsAreUniqueAndResolve` and\n`plan.OptimizerTest.KeepsTheColumnIds`;\n- beyond them, the check runs on every plan of the plan, engine, CLI,\nslt, parallel, diff, metamorphic and\n    ClickBench suites.\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed:\n  `docs/architecture.md` (Bind and Optimize) and the header comments\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: none are touched\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did:\n- Claude Code wrote the plan, which a maintainer approved, then the\nchange and the tests, and ran the gates and the\n    mutation check above.\n- Three exploration agents mapped the plan's column references, the\nbinder's index bands and the plan's consumers.\n- Two independent design agents, one aiming for the smallest P1 and one\nfor P2 and the join PRs, were reconciled\ninto the approved plan: fresh GROUP BY key ids from the second, the\nbinder's own comparisons left to P2 from the\n    first.\n- A review workflow had three reviewers (binder ids, optimizer and\nresolver, tests and conventions), each finding\nchecked by an adversarial verifier. Through the dev CLI, the reviewers\nran about 27,000 handwritten and random\nqueries and about 4,900 optimizer-focused probes; none aborted. They\nconfirmed four P3 findings, all fixed:\n- `Bind`'s output-id check compared the root with ids copied from it;\nthe binder now records the output ids\n      where it makes the columns;\n- no test showed that `Optimize` runs the check; a death test does now;\n    - the resolver's Aggregate-argument path was untested;\n    - `PositionMismatch`'s precedence was untested.\n- The first `check-full` also caught clang-tidy findings in the new\ntests (an unchecked optional, a split string\n    literal in a braced list); they are fixed.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-10-02T15:41:46+03:00",
+          "tree_id": "44aeccade2d93926a15240df6f6feb22180baebb",
+          "url": "https://github.com/ydb-campus/antb1/commit/774c8d1b890a64a6bf4cd1ea6d84c27ef2862064"
+        },
+        "date": 1790945061923,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 3948.1404227485946,
+            "unit": "ns/iter",
+            "extra": "iterations: 174288\ncpu: 3947.3428750114754 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 94464.10458069056,
+            "unit": "ns/iter",
+            "extra": "iterations: 7095\ncpu: 94456.49260042286 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 124685.49866381449,
+            "unit": "ns/iter",
+            "extra": "iterations: 5613\ncpu: 124679.60591484053 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 484302.7425605454,
+            "unit": "ns/iter",
+            "extra": "iterations: 1445\ncpu: 484264.1868512113 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 455577.84970722406,
+            "unit": "ns/iter",
+            "extra": "iterations: 1537\ncpu: 455572.1548471049 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2242286.8730158163,
+            "unit": "ns/iter",
+            "extra": "iterations: 315\ncpu: 2242026.044444444 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 53.27124369999865,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 53.275449099999946 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 47.68298080000098,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 47.67209639999995 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 221.57015833333085,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 221.49909833333345 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 15.042697630434532,
+            "unit": "ms/iter",
+            "extra": "iterations: 46\ncpu: 15.041573543478261 ms\nthreads: 1"
           }
         ]
       }
