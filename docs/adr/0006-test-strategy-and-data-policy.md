@@ -57,10 +57,11 @@ Data policy:
 Data policy for the data derived from TPC-H (amendment, 2026-10-02):
 
 - **Source:** the conda-forge package `duckdb-extension-tpch`, locked at the same version and build as `libduckdb`.
-  It contains TPC's dbgen under the TPC EULA v2.2. Installing the pixi environment, on a contributor's machine, an
-  agent's or a hosted CI runner, installs it and accepts that EULA; the maintainers accepted this exposure, as DuckDB
-  and DataFusion do. Correctness is judged by the live DuckDB oracle on the same files, never by TPC's official
-  answers: the extension's text columns differ from the reference dbgen.
+  It contains TPC's dbgen under the TPC EULA v2.2. Installing the `default` or `gcc` environment (the `lint`
+  environment does not contain it), on a contributor's machine, an agent's or a hosted CI runner, installs it and
+  accepts that EULA; the maintainers accepted this exposure, as DuckDB and DataFusion do. Correctness is judged by
+  the live DuckDB oracle on the same files, never by TPC's official answers: the extension's text columns differ from
+  the reference dbgen.
 - **Never committed or pasted** (repository files, commit messages, PR and issue text, CI logs and artifacts): data at
   any scale factor; answer sets (TPC's, DuckDB's or ours); TPC tools and their data files (dbgen, qgen, the
   distribution file, query templates); query text in any dialect, fragments included; EXPLAIN output of those queries;
@@ -75,7 +76,8 @@ Data policy for the data derived from TPC-H (amendment, 2026-10-02):
   smoke test `harness.tpch.extension` checks that the extension loads.
 - **Output:** TPC-H-derived tests run redacted like the data tests (query number, hashes and a local repro command)
   and print no timings in CI, whose logs and artifacts are public.
-- **Naming:** public material says "derived from TPC-H" and carries this disclaimer verbatim: "This workload is
+- **Naming:** every public mention says "derived from TPC-H". Material that describes the workload or presents its
+  numbers also carries this disclaimer verbatim: "This workload is
   derived from the TPC-H Benchmark and is not comparable to published TPC-H Benchmark results, as this implementation
   does not comply with all requirements of the TPC-H Benchmark." Numbers are per-query seconds and their geometric
   mean, never TPC metrics, never compared with official results, with the deviations and the machine listed. Before
@@ -90,6 +92,7 @@ Data policy for the data derived from TPC-H (amendment, 2026-10-02):
   on redacted output instead.
 - Contributors must run the data tests locally to see unredacted details of a mismatch.
 - The status file and the docs table must change together, which the lint checks enforce.
-- (2026-10-02) Every environment contains TPC's dbgen and its EULA applies to every installation. The
+- (2026-10-02) The `default` and `gcc` environments contain TPC's dbgen, and its EULA applies to every installation of
+  them. The
   TPC-H-derived tests depend on an unsigned extension and on the conda-forge build matching `libduckdb`; the
   extension and `libduckdb` must be updated together.

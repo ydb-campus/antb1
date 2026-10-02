@@ -5,8 +5,9 @@ if(NOT ANTB1_HAVE_TPCH)
 endif()
 
 # The pinned extension loads into the duckdb CLI of the same prefix by absolute path (unsigned: conda-forge cannot
-# sign DuckDB extensions) and provides the 22 query texts. The output must be exactly the count. No semicolons in the
-# SQL: CMake would split the argument there.
+# sign DuckDB extensions) and provides the 22 query texts. DuckDB runs as everywhere in the tests: one thread, no
+# extension auto-install or auto-load. The output must be exactly the count. No semicolons in the SQL: CMake would
+# split the argument there.
 antb1_add_expect_test(
   harness.tpch.extension
   COMMAND
@@ -15,6 +16,13 @@ antb1_add_expect_test(
     -no-init
     -noheader
     -list
+    -bail
+    -cmd
+    "SET threads = 1"
+    -cmd
+    "SET autoinstall_known_extensions = false"
+    -cmd
+    "SET autoload_known_extensions = false"
     -cmd
     "LOAD '${ANTB1_TPCH_EXTENSION}'"
     -c

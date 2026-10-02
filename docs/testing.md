@@ -18,7 +18,7 @@ internals are described next to the code in [tests/README.md](../tests/README.md
 | Random differential tests | `tests/slt/runner/` | seeded generated queries, antb1 against DuckDB | in use |
 | Metamorphic tests | `tests/metamorphic/` | relations between answers: split files, path vs name, batch sizes, predicate partitions | in use |
 | CLI golden tests | `tests/cli/` | stdout, stderr and exit code of the `antb1` binary, including EXPLAIN output | in use |
-| Harness self-tests | `tests/harness/`, `tests/slt/`, `tests/cli/`, `fuzz/`, `tools/fixturegen/` | a deliberately wrong engine is caught, redaction leaks nothing, fixtures match their digest | in use |
+| Harness self-tests | `tests/harness/`, `tests/slt/`, `tests/cli/`, `tests/tpch/`, `fuzz/`, `tools/fixturegen/` | a deliberately wrong engine is caught, redaction leaks nothing, fixtures match their digest | in use |
 | Fuzzing | `fuzz/` | parser round trip `Parse(ToSql(ast)) == ast`, idempotent unparser, no crash or UB | in use |
 | Coverage floors | `tools/ci/` | line and branch coverage of each module never drops below its floor | in use |
 | ClickBench data tests | `tests/data/` | antb1 against DuckDB on the pinned `hits_0` partition, metamorphic relations on it and the ClickBench ratchet, with redacted output | in use |
@@ -389,5 +389,7 @@ package `duckdb-extension-tpch` (TPC's dbgen, under the TPC EULA v2.2) generates
 answers at test time into the build tree. A separate duckdb CLI process loads it by absolute path; the oracle never
 loads extensions. Never commit or paste TPC-H data, answers, query text in any dialect (fragments included) or
 EXPLAIN output of those queries; refer to queries by number. The smoke test `harness.tpch.extension` (label
-`harness`) checks that the extension loads. Installing the pixi environment, also on CI runners, installs dbgen and
-accepts its EULA.
+`harness`, in `tests/tpch/`) checks that the extension loads. Installing the `default` or `gcc` environment, also on
+CI runners, installs dbgen and accepts its EULA. This workload is derived from the TPC-H Benchmark and is not
+comparable to published TPC-H Benchmark results, as this implementation does not comply with all requirements of the
+TPC-H Benchmark.
