@@ -416,7 +416,37 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{
             "SELECT a FROM t WHERE flag GROUP BY a", kUnsupported, "flag",
             "conditions other than comparisons, [NOT] LIKE, [NOT] IN, AND, OR and NOT are not "
-            "supported"}));
+            "supported"},
+        // Each kind of expression that is no condition, also under AND and OR, and what the binder
+        // does not answer inside a condition's operands.
+        ErrorCase{
+            "SELECT a FROM t WHERE (flag AND a = 1) OR a = 2", kUnsupported, "flag",
+            "conditions other than comparisons, [NOT] LIKE, [NOT] IN, AND, OR and NOT are not "
+            "supported"},
+        ErrorCase{
+            "SELECT a FROM t WHERE a + 1", kUnsupported, "a + 1",
+            "conditions other than comparisons, [NOT] LIKE, [NOT] IN, AND, OR and NOT are not "
+            "supported"},
+        ErrorCase{
+            "SELECT a FROM t WHERE -a", kUnsupported, "-a",
+            "conditions other than comparisons, [NOT] LIKE, [NOT] IN, AND, OR and NOT are not "
+            "supported"},
+        ErrorCase{"SELECT a FROM t WHERE strlen(url)", kUnsupported, "strlen(url)",
+                  "this condition is not supported"},
+        ErrorCase{"SELECT a FROM t WHERE CASE WHEN a = 1 THEN b END", kUnsupported,
+                  "CASE WHEN a = 1 THEN b END", "this condition is not supported"},
+        ErrorCase{"SELECT a FROM t WHERE EXTRACT(year FROM dt)", kUnsupported,
+                  "EXTRACT(year FROM dt)", "this condition is not supported"},
+        ErrorCase{"SELECT a FROM t WHERE lower(url)", kUnsupported, "lower",
+                  "function lower() is not supported"},
+        ErrorCase{"SELECT a FROM t WHERE lower(url) LIKE 'x%'", kUnsupported, "lower",
+                  "function lower() is not supported"},
+        ErrorCase{"SELECT a FROM t WHERE url LIKE lower(title)", kUnsupported, "lower",
+                  "function lower() is not supported"},
+        ErrorCase{"SELECT a FROM t WHERE lower(url) IN ('x')", kUnsupported, "lower",
+                  "function lower() is not supported"},
+        ErrorCase{"SELECT a FROM t WHERE url IN ('x', lower(title))", kUnsupported, "lower",
+                  "function lower() is not supported"}));
 
 TEST(BinderTest, TablesMatchCaseInsensitively) {
   const Catalog catalog = MakeCatalog();
@@ -1197,6 +1227,47 @@ TEST(BinderTest, TimestampFunctions) {
   EXPECT_NE(explain.find("GroupAggregate keys=[\"date_trunc('minute', todatetime(i64))\"]"),
             std::string::npos)
       << explain;
+}
+
+// An aggregate in a CASE operand, THEN or ELSE value, or in the source of EXTRACT makes the
+// expression one over the aggregation, computed above it, where EXTRACT of a key reads the key. A
+// CASE operand is read like any other operand: an aggregate of a CASE over a column is no constant.
+TEST(BinderTest, AggregatesInsideCaseAndExtract) {
+  const Catalog catalog = MakeCatalog();
+  auto plan = BindSql(
+      "SELECT CASE MAX(i16) WHEN 1 THEN 'one' END, CASE WHEN i16 = 1 THEN MAX(i32) END, "
+      "CASE WHEN i16 = 1 THEN 0 ELSE MAX(i32) END, EXTRACT(year FROM dt), "
+      "EXTRACT(month FROM MAX(dt)) FROM t GROUP BY i16, dt",
+      catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  const std::vector<std::pair<std::string, LogicalType>> expected = {
+      {"CASE  WHEN ((max(i16) = 1)) THEN ('one') ELSE NULL END", LogicalType::kVarchar},
+      {"CASE  WHEN ((i16 = 1)) THEN (max(i32)) ELSE NULL END", LogicalType::kInteger},
+      {"CASE  WHEN ((i16 = 1)) THEN (0) ELSE max(i32) END", LogicalType::kInteger},
+      {"main.date_part('year', dt)", LogicalType::kBigInt},
+      {"main.date_part('month', max(dt))", LogicalType::kBigInt},
+  };
+  ASSERT_EQ(plan->output.size(), expected.size());
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    EXPECT_EQ(plan->output[i].name, expected[i].first) << i;
+    EXPECT_EQ(plan->output[i].type, expected[i].second) << expected[i].first;
+  }
+  // Project <- Compute (the five expressions) <- GroupAggregate <- Scan.
+  EXPECT_TRUE(std::holds_alternative<ProjectNode>(Nth(*plan, 0)));
+  EXPECT_EQ(std::get<ComputeNode>(Nth(*plan, 1)).exprs.size(), expected.size());
+  const auto& group = std::get<GroupAggregateNode>(Nth(*plan, 2));
+  EXPECT_EQ(group.keys.size(), 2U);
+  EXPECT_EQ(group.aggregates.size(), 3U) << "max(i16), max(i32) once, max(dt)";
+  EXPECT_TRUE(std::holds_alternative<ScanNode>(Nth(*plan, 3)));
+
+  auto sums = BindSql(
+      "SELECT SUM(CASE i16 WHEN 1 THEN 1 END), SUM(CASE 1 WHEN i16 THEN 1 END) FROM t", catalog);
+  ASSERT_TRUE(sums.ok()) << sums.status().ToString();
+  ASSERT_EQ(sums->output.size(), 2U);
+  EXPECT_EQ(sums->output[0].name, "sum(CASE  WHEN ((i16 = 1)) THEN (1) ELSE NULL END)");
+  EXPECT_EQ(sums->output[1].name, "sum(CASE  WHEN ((1 = i16)) THEN (1) ELSE NULL END)");
+  EXPECT_EQ(sums->output[0].type, LogicalType::kHugeInt);
+  EXPECT_EQ(sums->output[1].type, LogicalType::kHugeInt);
 }
 
 TEST(BinderTest, ParenthesesGroupOnly) {
