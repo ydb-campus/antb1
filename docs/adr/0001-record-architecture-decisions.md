@@ -26,6 +26,9 @@ and Consequences.
   supersedes it, and the old one only gets its status updated.
 - An ADR is written in the same PR as the change it justifies. Changes under `docs/adr/` request review from the
   maintainers (CODEOWNERS), and status changes need a maintainer's approval.
+  Update (2026-10-02): the one exception is a design ADR that the maintainer asks for ahead of the code, which may
+  land first, in a docs-only PR, before the PRs that implement it ([ADR 0013](0013-parallel-execution.md),
+  [ADR 0019](0019-own-aggregation-hash-table.md), [ADR 0021](0021-decimal-semantics.md)).
 
 ## Consequences
 

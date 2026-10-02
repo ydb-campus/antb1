@@ -1,8 +1,10 @@
 # Cross-module tests
 
 Module unit tests live in `src/<module>/tests/` (label `unit`). This directory holds the suites that span
-modules. Every suite reads the Parquet fixtures of `tools/fixturegen`: the ctest `fixtures.generate` (label
-`setup`) writes them to `build/<preset>/fixtures` before any test that needs them, also in filtered runs.
+modules. Every suite except `tpch/` reads the Parquet fixtures of `tools/fixturegen`: the ctest `fixtures.generate`
+(label `setup`) writes them to `build/<preset>/fixtures` before any test that needs them, also in filtered runs. The
+`tpch/` suite works on data derived from TPC-H that the pinned `duckdb-extension-tpch` package generates at test
+time (ADR 0006).
 
 | Directory | ctest names | Label | What it checks |
 |---|---|---|---|
@@ -13,6 +15,7 @@ modules. Every suite reads the Parquet fixtures of `tools/fixturegen`: the ctest
 | `cli/` | `cli.<case>` | `cli` | stdout, stderr and exit code of the `antb1` binary |
 | `slt/`, `harness/`, `cli/` | `harness.*` | `harness` | the harness itself: mutations, redaction, digest |
 | `data/` | `data.*` | `data` | ClickBench data tests on downloaded data, redacted (`pixi run test-data` only) |
+| `tpch/` | `harness.tpch.*` | `harness` | the pinned dbgen extension for the data derived from TPC-H loads (Linux only) |
 
 ```bash
 pixi run test -L diff          # one label
@@ -86,3 +89,5 @@ Exit codes are never rewritten: change `EXIT_CODE` in `cli/CMakeLists.txt` delib
 
 - `harness.<Suite>.<Case>`: unit tests of the runner, comparator, query generator, differential test,
   fixture generator and digest.
+- `harness.tpch.extension`: the pinned `duckdb-extension-tpch` package loads into the duckdb CLI by absolute path
+  (one thread, no extension auto-install or auto-load) and provides the 22 query texts derived from TPC-H.

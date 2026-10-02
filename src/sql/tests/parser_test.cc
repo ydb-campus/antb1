@@ -1311,9 +1311,10 @@ INSTANTIATE_TEST_SUITE_P(
     CaseName);
 
 TEST(ParserTest, ExactMessages) {
-  auto join = Parse("SELECT COUNT(*) FROM events JOIN users USING (id)");
-  ASSERT_FALSE(join.has_value());
-  EXPECT_EQ(join.error().message, "JOIN is not supported; see docs/sql-subset.md");
+  auto window_function = Parse("SELECT row_number() OVER () FROM events");
+  ASSERT_FALSE(window_function.has_value());
+  EXPECT_EQ(window_function.error().message,
+            "window functions (OVER) are not supported; see docs/sql-subset.md");
   auto limit = Parse("SELECT a FROM events LIMIT 9223372036854775808");
   ASSERT_FALSE(limit.has_value());
   EXPECT_EQ(limit.error().message,

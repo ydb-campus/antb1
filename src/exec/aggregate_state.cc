@@ -513,7 +513,7 @@ class MinMaxState final : public AggregateState {
 
 arrow::Result<std::unique_ptr<AggregateState>> SumState(bool average, plan::LogicalType input,
                                                         arrow::MemoryPool* pool) {
-  switch (input) {
+  switch (input.id()) {
     case plan::LogicalType::kSmallInt:
       return std::make_unique<IntegerSumState<arrow::Int16Type>>(average, pool);
     case plan::LogicalType::kInteger:

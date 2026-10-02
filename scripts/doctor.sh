@@ -18,10 +18,16 @@ dev_build=$([ -f "$root/build/dev/build.ninja" ] && echo configured || echo not-
 last_pass=$([ -f "$root/build/dev/.antb1-last-pass" ] && date -r "$root/build/dev/.antb1-last-pass" -u +%FT%TZ || echo never)
 data_dir="${ANTB1_DATA_DIR:-$HOME/.cache/antb1/clickbench}"
 hits0=$([ -f "$data_dir/hits_0.parquet" ] && echo present || echo absent)
+# TPC's dbgen for the TPC-H-derived test data (ADR 0006), from the pinned duckdb-extension-tpch package.
+tpch_ext=""
+for f in "${CONDA_PREFIX:-}"/duckdb/extensions/v*/*/tpch.duckdb_extension; do
+  [ -f "$f" ] && tpch_ext="$f" && break
+done
+tpch=$([ -n "$tpch_ext" ] && echo present || echo absent)
 if [ $json -eq 1 ]; then
-  printf '{"pixi":"%s","env":"%s","envs_installed":"%s","lock_version":"%s","cxx":"%s","cmake":"%s","arrow":"%s","build_dev":"%s","last_full_test_pass":"%s","hits_0":"%s","data_dir":"%s"}\n' \
+  printf '{"pixi":"%s","env":"%s","envs_installed":"%s","lock_version":"%s","cxx":"%s","cmake":"%s","arrow":"%s","build_dev":"%s","last_full_test_pass":"%s","hits_0":"%s","data_dir":"%s","tpch_extension":"%s"}\n' \
     "$pixi_version" "${PIXI_ENVIRONMENT_NAME:-}" "$envs" "$lock_version" "$cxx" "$cmake_v" "$arrow_v" \
-    "$dev_build" "$last_pass" "$hits0" "$data_dir"
+    "$dev_build" "$last_pass" "$hits0" "$data_dir" "$tpch"
 else
   cat <<EOT
 pixi            $pixi_version (lock file version $lock_version)
@@ -31,5 +37,6 @@ cmake           $cmake_v
 arrow           $arrow_v
 build/dev       $dev_build; last full passing 'pixi run test': $last_pass
 hits_0.parquet  $hits0 ($data_dir)
+tpch extension  $tpch${tpch_ext:+ ($tpch_ext)}
 EOT
 fi

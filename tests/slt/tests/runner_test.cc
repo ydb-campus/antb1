@@ -50,7 +50,7 @@ ResultSet Ints(std::vector<Row> rows) {
 }
 
 EngineError Unsupported() {
-  return EngineError{.kind = "unsupported", .message = "unsupported: JOIN", .unsupported = true};
+  return EngineError{.kind = "unsupported", .message = "unsupported: OVER", .unsupported = true};
 }
 
 SltFile Parse(std::string_view text) {
@@ -133,10 +133,10 @@ TEST(RunFile, RedactedErrorsPrintOnlyTheKind) {
 
 TEST(RunFile, UnsupportedIsAFailureEvenForStatementError) {
   FakeEngine engine("antb1");
-  engine.Answer("SELECT a FROM t JOIN u USING (a)", std::unexpected(Unsupported()));
+  engine.Answer("SELECT row_number() OVER () FROM t", std::unexpected(Unsupported()));
   const auto o = RunText(
-      "statement error\nSELECT a FROM t JOIN u USING (a)\n\nquery I\nSELECT a FROM t JOIN u USING "
-      "(a)\n----\n1\n",
+      "statement error\nSELECT row_number() OVER () FROM t\n\nquery I\nSELECT row_number() OVER () "
+      "FROM t\n----\n1\n",
       engine);
   EXPECT_EQ(o.stats.failed, 2);
   EXPECT_EQ(o.stats.unsupported, 2);

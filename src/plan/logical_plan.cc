@@ -313,7 +313,7 @@ std::string ToString(const Constant& constant) {
 arrow::Result<std::shared_ptr<arrow::Scalar>> ToArrowScalar(const Constant& constant) {
   const LogicalType type = constant.type;
   if (const auto* v = std::get_if<Int128>(&constant.value)) {
-    switch (type) {
+    switch (type.id()) {
       case LogicalType::kSmallInt:
         return IntegerScalar<arrow::Int16Scalar, int16_t>(*v, type);
       case LogicalType::kInteger:
