@@ -392,6 +392,7 @@ loads extensions. Never commit or paste TPC-H data, answers, query text in any d
 output of those queries; refer to queries by number. The smoke test `harness.tpch.extension` (label `harness`, in
 `tests/tpch/`) checks that the extension loads. The package is installed on Linux only (pixi cannot re-sign the
 osx-arm64 build), so these tests run on Linux and are not registered on macOS. Installing the `default` or `gcc`
-environment on Linux, also on CI runners, installs dbgen and accepts its EULA. This workload is derived from the TPC-H
-Benchmark and is not comparable to published TPC-H Benchmark results, as this implementation does not comply with all
-requirements of the TPC-H Benchmark.
+environment on Linux, also on CI runners, installs dbgen and accepts its EULA. Timings of these queries may appear
+anywhere, CI logs included, but never as TPC-H Benchmark results: no TPC metrics such as QphH, no comparison with
+official TPC results. This workload is derived from the TPC-H Benchmark and is not comparable to published TPC-H
+Benchmark results, as this implementation does not comply with all requirements of the TPC-H Benchmark.
