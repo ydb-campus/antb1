@@ -417,7 +417,7 @@ std::string FormatTimestamp(int64_t micros) {
 }
 
 IntegerRange RangeOf(LogicalType integer_type) {
-  switch (integer_type) {
+  switch (integer_type.id()) {
     case LogicalType::kSmallInt:
       return {.min = std::numeric_limits<int16_t>::min(),
               .max = std::numeric_limits<int16_t>::max()};

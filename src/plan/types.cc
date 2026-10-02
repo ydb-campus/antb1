@@ -1,6 +1,7 @@
 #include "antb1/plan/types.h"
 
 #include <memory>
+#include <ostream>
 #include <string_view>
 
 #include <arrow/api.h>
@@ -8,7 +9,7 @@
 namespace antb1::plan {
 
 std::string_view ToString(LogicalType type) {
-  switch (type) {
+  switch (type.id()) {
     case LogicalType::kSmallInt:
       return "SMALLINT";
     case LogicalType::kInteger:
@@ -33,8 +34,10 @@ std::string_view ToString(LogicalType type) {
   return "?";
 }
 
+std::ostream& operator<<(std::ostream& os, LogicalType type) { return os << ToString(type); }
+
 std::shared_ptr<arrow::DataType> ToArrow(LogicalType type) {
-  switch (type) {
+  switch (type.id()) {
     case LogicalType::kSmallInt:
       return arrow::int16();
     case LogicalType::kInteger:
@@ -93,7 +96,7 @@ arrow::Result<LogicalType> FromArrow(const arrow::DataType& type) {
 }
 
 bool IsInteger(LogicalType type) {
-  switch (type) {
+  switch (type.id()) {
     case LogicalType::kSmallInt:
     case LogicalType::kInteger:
     case LogicalType::kBigInt:

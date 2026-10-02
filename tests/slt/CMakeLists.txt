@@ -50,6 +50,7 @@ antb1_add_gtest(
     tests/query_gen_test.cc
     tests/runner_test.cc
     tests/slt_file_test.cc
+    tests/supported_features_test.cc
   LIBS antb1_slt_lib Parquet::parquet_shared
 )
 if(ANTB1_HAVE_DUCKDB)
