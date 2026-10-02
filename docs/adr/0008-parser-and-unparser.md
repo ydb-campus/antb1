@@ -41,3 +41,18 @@ Accepted
   [sql-subset.md](../sql-subset.md#grammar) ahead of the engine, and the binder rejects what it does not answer yet
   with `kUnsupported` at the same kind of span. Expression trees make the parser recursive; an expression depth limit
   (256 levels) bounds that recursion and every recursive walk of the tree.
+- Update (joins and subqueries, 2026-10-02): [ADR 0022](0022-joins-and-query-blocks.md) is the new ADR that the
+  larger SQL surface needs. It designs the grammar of joins and nested query blocks:
+  - the FROM clause is a flat list of items, each with its connector (a comma, `CROSS JOIN`, `INNER JOIN ... ON` or
+    `LEFT JOIN ... ON`), not a recursive join tree; nested joins (parenthesized ones, or a JOIN whose ON follows a
+    later JOIN) stay unsupported;
+  - the words that DuckDB refuses as an implicit table alias (`SEMI`, `ANTI`, `ASOF`, `POSITIONAL` and others) are
+    never read as aliases: each gets its own `kUnsupported` error, or a syntax error where DuckDB gives one;
+  - `sql::ToSql` prints every table alias as a quoted `AS "a"`, so DuckDB never reads an alias as a keyword;
+  - nested query blocks (derived tables, CTEs and subqueries) count against the 256-level depth limit, together with
+    the expressions around them;
+  - every canonical form is SQL that DuckDB parses with the same meaning, because the oracle tests send `sql::ToSql`
+    output to DuckDB.
+
+  `JOIN` stops being the standard example of a recognized but unsupported construct: window functions replace it in
+  the tests and goldens (roadmap PR S0).

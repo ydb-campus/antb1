@@ -5,7 +5,7 @@ This directory records the architecturally significant decisions of antb1 in Mic
 in the same PR as the change it justifies, and list it below; `pixi run lint` checks that this index is complete.
 
 The one exception, from ADR 0001's update of 2026-10-02: a design ADR that the maintainer asks for ahead of the code
-may land first, in a docs-only PR (0013, 0019, 0021).
+may land first, in a docs-only PR (0013, 0019, 0021, 0022).
 
 | ADR | Title | Status |
 | --- | --- | --- |
@@ -30,3 +30,4 @@ may land first, in a docs-only PR (0013, 0019, 0021).
 | [0019](0019-own-aggregation-hash-table.md) | An aggregation hash table of our own, scheduled for later | Proposed (deferred) |
 | [0020](0020-filter-pushdown.md) | Filter pushdown into the scan | Proposed |
 | [0021](0021-decimal-semantics.md) | DECIMAL semantics as in DuckDB | Proposed |
+| [0022](0022-joins-and-query-blocks.md) | Joins, query blocks and uncorrelated subqueries | Proposed |

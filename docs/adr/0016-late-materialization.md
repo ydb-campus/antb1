@@ -68,10 +68,13 @@ Proposed
   - A Project inside the part pipeline, a serial top-N (not over parts), and ORDER BY without LIMIT keep reading every
     column.
   - Filters over computed columns are unaffected: they are early by construction.
+  - Joins (amended 2026-10-02, [ADR 0022](0022-joins-and-query-blocks.md)): late materialization declines over a part
+    pipeline that holds a hash-join probe, which then reads every column, until the "late reads for joins" item below
+    adds probe-side late columns. Late build-side columns would need row ids for each table.
 - **Later:**
   - statistics-driven choices;
   - late materialization after a filter without an ORDER BY (a LIMIT alone already stops early);
-  - late reads for joins.
+  - late reads for joins, probe-side late columns first.
 
 ## Alternatives considered
 
