@@ -27,6 +27,9 @@ antb1 follows DuckDB's semantics for everything in the supported subset:
   (raw bytes, byte-wise comparison, for both unannotated and UTF8 BYTE_ARRAY), DATE and HUGEINT, as listed in
   [sql-subset.md](../sql-subset.md#types). Other types are unsupported, and queries that use them are rejected.
   `EventDate` is read as DATE with `--clickbench`, or any USMALLINT or INTEGER column with `--column-type COL=DATE`.
+  Update (2026-10-02): [ADR 0021](0021-decimal-semantics.md) specifies DECIMAL(p,s) the way DuckDB types, computes
+  and prints it. With it, a Parquet DECIMAL(38,0) column reads as DECIMAL(38,0) instead of HUGEINT, and HUGEINT
+  stays the type of integer SUM.
 - Literals are folded exactly at bind time. A literal outside the column type's range makes the comparison constant
   true or false for non-NULL values while NULL stays NULL; a decimal literal against an integer column becomes an
   equivalent integer comparison (`c > 1.5` becomes `c >= 2`; `c = 1.5` is never true). No comparison goes through a
@@ -38,6 +41,11 @@ antb1 follows DuckDB's semantics for everything in the supported subset:
   literal of another kind than its column (a string for a number, a number for a VARCHAR or DATE, a date for anything
   but DATE) is a bind error, and dates are written exactly `YYYY-MM-DD`: stricter than DuckDB, which casts, and
   registered as divergences in [sql-subset.md](../sql-subset.md#divergences-from-duckdb).
+  Update (2026-10-02): under [ADR 0021](0021-decimal-semantics.md), a decimal literal compared with a DOUBLE operand
+  is converted as DuckDB converts a DECIMAL, not to the nearest double, so divergence D12 keeps only HUGEINT
+  literals. A DECIMAL operand is an exception to the exact folding above, as in DuckDB: compared with a DOUBLE
+  operand or with a number that DuckDB types as DOUBLE, it is converted to DOUBLE as DuckDB converts it, a lossy
+  cast, and such a number is not folded exactly (`price = 1e-1` holds for a DECIMAL(15,2) `price` of 0.10).
 - Result types are fixed at bind time: COUNT is BIGINT, integer SUM is HUGEINT, SUM of DOUBLE and every AVG are
   DOUBLE, MIN and MAX keep their column's type; SUM and AVG of VARCHAR or DATE are bind errors.
 - Integer SUM accumulates in 128 bits (`antb1::Int128`) and returns HUGEINT, represented as Arrow

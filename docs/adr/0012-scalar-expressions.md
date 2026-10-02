@@ -53,6 +53,8 @@ Accepted (with the maintainer-approved plan for scalar expressions)
 - **What stays unsupported:** DECIMAL arithmetic (a decimal literal with an integer; antb1 has no DECIMAL type),
   DATE arithmetic, negating a USMALLINT (DuckDB wraps it), `//` and `%` in HUGEINT, and arithmetic on FLOAT columns
   (antb1 reads FLOAT as DOUBLE, divergence D11).
+  Update (2026-10-02): DECIMAL arithmetic is specified by [ADR 0021](0021-decimal-semantics.md). Neither of DuckDB's
+  integer-only rewrites, the sum rewriter above and constant moving in comparisons, applies to DECIMAL.
 
 ## Consequences
 

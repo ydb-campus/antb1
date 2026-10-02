@@ -4,6 +4,9 @@ This directory records the architecturally significant decisions of antb1 in Mic
 ([ADR 0001](0001-record-architecture-decisions.md)). Add a new record as `<NNNN>-<short-title>.md` with the next number,
 in the same PR as the change it justifies, and list it below; `pixi run lint` checks that this index is complete.
 
+The one exception, from ADR 0001's update of 2026-10-02: a design ADR that the maintainer asks for ahead of the code
+may land first, in a docs-only PR (0013, 0019, 0021).
+
 | ADR | Title | Status |
 | --- | --- | --- |
 | [0001](0001-record-architecture-decisions.md) | Record architecture decisions | Accepted |
@@ -26,3 +29,4 @@ in the same PR as the change it justifies, and list it below; `pixi run lint` ch
 | [0018](0018-dependent-group-keys.md) | GROUP BY keys that are functions of other keys | Proposed |
 | [0019](0019-own-aggregation-hash-table.md) | An aggregation hash table of our own, scheduled for later | Proposed (deferred) |
 | [0020](0020-filter-pushdown.md) | Filter pushdown into the scan | Proposed |
+| [0021](0021-decimal-semantics.md) | DECIMAL semantics as in DuckDB | Proposed |
