@@ -33,9 +33,9 @@ SELECT * FROM '/data/hits_*.parquet' LIMIT 5
   (no data page is read); under `WHERE` it counts the rows the filter selects without copying them.
 - Result names and types follow DuckDB ([Binding](#binding)); values follow the [Semantics](#semantics) below.
 - `--` line comments, `/* block */` comments and one trailing `;` are allowed.
-- SQL outside the grammar (a window function such as `row_number() OVER ()`, `IS NULL`, other functions, ...) fails
-  with exit code 4 and points at the first unsupported token. Malformed SQL (a syntax error) and SQL that is wrong for
-  the table (a bind error) fail with exit code 1.
+- SQL outside the grammar (`JOIN`, a window function such as `row_number() OVER ()`, `IS NULL`, other functions, ...)
+  fails with exit code 4 and points at the first unsupported token. Malformed SQL (a syntax error) and SQL that is
+  wrong for the table (a bind error) fail with exit code 1.
 
 ```bash
 pixi run antb1 query -f query.sql --table hits=/data/clickbench/hits_0.parquet --clickbench
