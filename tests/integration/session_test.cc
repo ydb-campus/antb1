@@ -131,7 +131,7 @@ TEST(Session, ErrorKindsAtTheBoundary) {
   EXPECT_EQ(kind("SELECT COUNT(*) FROM no_such_table"), plan::SqlErrorDetail::Kind::kBind);
   EXPECT_EQ(kind("SELECT SUM(AdvEngineID) FROM hits_like GROUP BY lower(URL)"),
             plan::SqlErrorDetail::Kind::kUnsupported);
-  EXPECT_EQ(kind("SELECT COUNT(*) FROM hits_like JOIN u USING (x)"),
+  EXPECT_EQ(kind("SELECT row_number() OVER () FROM hits_like"),
             plan::SqlErrorDetail::Kind::kUnsupported);
   EXPECT_EQ(kind("SELECT SUM(AdvEngineID) FROM hits_like GROUP BY 1"),
             plan::SqlErrorDetail::Kind::kBind)

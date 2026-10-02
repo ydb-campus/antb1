@@ -33,9 +33,9 @@ SELECT * FROM '/data/hits_*.parquet' LIMIT 5
   (no data page is read); under `WHERE` it counts the rows the filter selects without copying them.
 - Result names and types follow DuckDB ([Binding](#binding)); values follow the [Semantics](#semantics) below.
 - `--` line comments, `/* block */` comments and one trailing `;` are allowed.
-- SQL outside the grammar (`JOIN`, `IS NULL`, other functions, ...) fails with exit code 4 and points at the first
-  unsupported token. Malformed SQL (a syntax error) and SQL that is wrong for the table (a bind error) fail with exit
-  code 1.
+- SQL outside the grammar (a window function such as `row_number() OVER ()`, `IS NULL`, other functions, ...) fails
+  with exit code 4 and points at the first unsupported token. Malformed SQL (a syntax error) and SQL that is wrong for
+  the table (a bind error) fail with exit code 1.
 
 ```bash
 pixi run antb1 query -f query.sql --table hits=/data/clickbench/hits_0.parquet --clickbench
@@ -496,7 +496,7 @@ formatter:
 | 1 | query error: syntax, bind, execution or memory error | `SELECT COUNT(*) FORM t`; an unknown table or column; `SUM` of a VARCHAR column; a `SUM` outside HUGEINT's range; an invalid `regexp_replace` pattern; a query that needs more memory than `--memory-limit` |
 | 2 | usage error | unknown option; neither or both of `-c` and `-f`; a malformed `--table`, `--column-type` or `--memory-limit`; a column that `--column-type` cannot read as DATE; a table name registered twice |
 | 3 | I/O error | a missing or unreadable file; not a Parquet file; schemas that differ; a glob that matches nothing |
-| 4 | unsupported: valid-looking SQL outside the supported subset | `JOIN`; `IS NULL`; an unknown function; `SELECT 2.5`; `SUM(DISTINCT ...)`; a column of an unsupported type |
+| 4 | unsupported: valid-looking SQL outside the supported subset | `row_number() OVER ()`; `IS NULL`; an unknown function; `SELECT 2.5`; `SUM(DISTINCT ...)`; a column of an unsupported type |
 | 70 | internal error: anything else, which is a bug | an uncaught exception; an Arrow `NotImplemented` or type error without SQL context |
 
 Exit code 4 is used only for errors that the parser, the binder or the physical planner marks as unsupported

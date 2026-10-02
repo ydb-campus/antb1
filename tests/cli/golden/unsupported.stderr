@@ -1,4 +1,4 @@
-antb1: unsupported error: JOIN is not supported; see docs/sql-subset.md
-  at line 1, column 35
-  SELECT CounterID, COUNT(*) FROM t JOIN u USING (CounterID) GROUP BY CounterID
-                                    ^^^^
+antb1: unsupported error: window functions (OVER) are not supported; see docs/sql-subset.md
+  at line 1, column 32
+  SELECT CounterID, row_number() OVER (ORDER BY CounterID) FROM t
+                                 ^^^^

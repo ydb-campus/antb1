@@ -157,8 +157,7 @@ TEST_F(CliTest, SqlFromStdinAndFile) {
 }
 
 TEST_F(CliTest, UnsupportedQueryExits4WithCaret) {
-  auto r =
-      Invoke({"query", "-c", "SELECT COUNT(*) FROM t JOIN u USING (x)", "--table", "t=" + path_});
+  auto r = Invoke({"query", "-c", "SELECT row_number() OVER () FROM t", "--table", "t=" + path_});
   EXPECT_EQ(r.code, kExitUnsupported);
   EXPECT_NE(r.err.find("unsupported error"), std::string::npos) << r.err;
   EXPECT_NE(r.err.find("^^^^"), std::string::npos) << r.err;
@@ -245,7 +244,7 @@ TEST_F(CliTest, BenchWritesClickBenchJson) {
   const auto queries =
       WriteFile("q.sql",
                 "SELECT COUNT(*) FROM t;\n\n  SELECT MIN(EventDate) FROM t WHERE EventDate > DATE "
-                "'2000-01-01'\r\nSELECT COUNT(*) FROM t JOIN u USING (x);\n");
+                "'2000-01-01'\r\nSELECT row_number() OVER () FROM t;\n");
   const auto out = (dir_ / "result.json").string();
   const auto drops = std::make_shared<int>(0);
   std::vector<std::string> args{"bench",      "--clickbench",   "--queries", queries,  "--table",
