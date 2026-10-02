@@ -77,7 +77,9 @@ Proposed
 Decision C5: Neumann's top-down approach, staged. The binder plans a correlated subquery as a dependent join, and the
 first pass of `plan::Optimize` replaces each dependent join with ordinary joins through one of the two cases that need
 no domain, or rejects the query with exit code 4. The general algorithm can be added to that pass later without a
-change to the binder.
+change to the binder for the shapes the binder already plans as dependent joins. Placements under OR, in CASE or in a
+select list, correlated subqueries in HAVING, and outer references outside WHERE or across blocks also need binder
+work: mark and single dependent-join kinds, and lifting those rejections.
 
 ### Binding (U1)
 
@@ -339,8 +341,8 @@ together with ADRs 0013, 0021 and 0022, once all 22 queries pass (decision C14).
 - **Kim- and Dayal-style rewrites in the binder** (W. Kim, ACM TODS 1982; U. Dayal, VLDB 1987): one rewrite per
   subquery shape, applied while binding. Fewer lines for the six queries, but each new shape adds binder code that a
   general approach would throw away, the binder is the file that most roadmap PRs edit already, and each rewrite has
-  to avoid the COUNT bug by hand. A dependent join keeps the binder general: the pass can add cases, or the general
-  algorithm, without touching it. Rejected (decision C5).
+  to avoid the COUNT bug by hand. With a dependent join, new cases and the general algorithm go into the pass for
+  every shape the binder already plans; only new placements need binder work. Rejected (decision C5).
 - **The general algorithm with a duplicate-free domain now:** it covers every shape, COUNT and OR included. But the
   domain is the outer side's result, read twice. Under ADR 0013 that needs one build probed by several pipelines
   (DuckDB's delim join; deferred by ADR 0022) or an outer side computed twice, keys that treat NULL as equal, and
