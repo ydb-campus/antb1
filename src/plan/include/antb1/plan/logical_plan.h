@@ -28,8 +28,9 @@
 //
 // Every column has a plan-unique ColumnId, defined once by the node that creates it (see
 // OutputIds); a column reference (BoundColumn, ColumnExpr) names the column it reads by its id and
-// by its `index`, the position in the input's output, which plan::ResolvePositions computes from
-// the ids (ADR 0022).
+// by its `index`, the position in the input's output. The binder and the optimizer work on ids
+// only, and plan::ResolvePositions, the last step of plan::Bind and plan::Optimize, computes every
+// index from the ids (ADR 0022); the executor reads indices only.
 // New operators are added as new node structs in the LogicalNode variant; every std::visit over it
 // lists each node explicitly, so the physical planner and EXPLAIN fail to compile until they handle
 // a new one.
@@ -95,7 +96,7 @@ std::string_view ToString(ArithOp op);
 
 // A column of a node's input.
 struct BoundColumn {
-  int index = 0;              // position in the input node's output columns
+  int index = 0;              // position in the input's output columns (ResolvePositions: of `id`)
   ColumnId id = kNoColumnId;  // the column read
   std::string name;           // the table column's name as declared in the table schema
   LogicalType type = LogicalType::kBigInt;
@@ -129,8 +130,8 @@ using ExprPtr = std::shared_ptr<const Expr>;
 
 // A column of the input of the node that evaluates the expression.
 struct ColumnExpr {
-  int index = 0;
-  ColumnId id = kNoColumnId;
+  int index = 0;              // position in that input (ResolvePositions: of `id`)
+  ColumnId id = kNoColumnId;  // the column read
 };
 
 struct ConstantExpr {
@@ -203,18 +204,20 @@ struct Expr {
   std::string name;  // DuckDB's result name of the expression, e.g. (a + 1)
 };
 
-// Whether two expressions compute the same values: the same structure, ignoring names.
+// Whether two expressions compute the same values: the same structure, ignoring names. Columns are
+// the same when they have the same id; only columns without ids (the executor's positional plans)
+// compare by index.
 bool SameExpr(const Expr& a, const Expr& b);
-
-// The expression with every column index i replaced by remap[i] (which must be >= 0).
-ExprPtr Renumber(const ExprPtr& expr, const std::vector<int>& remap);
 
 // The expression with every column replaced by f(column); the same pointer when no column changes.
 // The operand-local columns of a PredicateExpr's predicate are no ColumnExpr and stay as they are.
 ExprPtr MapColumns(const ExprPtr& expr, const std::function<ColumnExpr(const ColumnExpr&)>& f);
 
-// Every input column the expression reads.
+// Every input column the expression reads, by position (the executor's view).
 void CollectColumns(const Expr& expr, std::vector<int>& out);
+
+// Every input column the expression reads, by id (the binder's and the optimizer's view).
+void CollectColumnIds(const Expr& expr, std::vector<ColumnId>& out);
 
 struct AggregateCall {
   AggKind kind = AggKind::kCountStar;
@@ -354,21 +357,18 @@ std::vector<ColumnId> OutputIds(const LogicalNode& node);
 
 // The plan with every reference's index set to the position of its id in the ids it reads (its
 // input's output ids); unchanged nodes keep their pointers, so the result of a resolved plan is the
-// plan itself. The last step of plan::Optimize. A plan that breaks an invariant (see
-// PositionMismatch) is a programming error: the process aborts with a description that names node
-// kinds, ids and positions only.
-LogicalPlan ResolvePositions(const LogicalPlan& plan);
+// plan itself. The last step of plan::Bind and plan::Optimize, which refer to columns by id only
+// (ADR 0022). A plan that breaks an invariant (see PositionMismatch) is a programming error: the
+// process aborts, reported at the caller, with a description that names node kinds, ids and
+// positions only.
+LogicalPlan ResolvePositions(const LogicalPlan& plan,
+                             std::source_location location = std::source_location::current());
 
 // Why the plan is not resolved, or std::nullopt: the first broken invariant (a reference without an
 // id, or whose id is not exactly once among the ids it reads; a column defined twice in the plan,
 // or without an id; a list of ids whose length differs from its columns'; output ids that are not
 // the root's), else the first index that differs from its resolved position, e.g. "Filter: column
-// #12 is at 3, not 4". The binder and the optimizer still compute positions themselves; Bind and
-// Optimize abort when this finds a difference (ADR 0022, PR P1).
+// #12 is at 3, not 4".
 std::optional<std::string> PositionMismatch(const LogicalPlan& plan);
-
-// Aborts with the PositionMismatch description, if there is one, reported at the caller.
-void CheckPositions(const LogicalPlan& plan,
-                    std::source_location location = std::source_location::current());
 
 }  // namespace antb1::plan

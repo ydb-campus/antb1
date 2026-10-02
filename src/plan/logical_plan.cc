@@ -162,7 +162,8 @@ bool SamePredicate(const Predicate& a, const Predicate& b) {
 struct SameNode {
   const Expr& other;
   bool operator()(const ColumnExpr& a) const {
-    return std::get<ColumnExpr>(other.node).index == a.index;
+    const auto& b = std::get<ColumnExpr>(other.node);
+    return a.id == b.id && (a.id != kNoColumnId || a.index == b.index);
   }
   bool operator()(const ConstantExpr& a) const {
     return SameConstant(a.value, std::get<ConstantExpr>(other.node).value);
@@ -234,15 +235,6 @@ bool SameExpr(const Expr& a, const Expr& b) {
          std::visit(SameNode{.other = b}, a.node);
 }
 
-ExprPtr Renumber(const ExprPtr& expr, const std::vector<int>& remap) {
-  return MapColumns(expr, [&remap](const ColumnExpr& column) {
-    ColumnExpr out = column;
-    out.index = remap.at(Narrow<std::size_t>(column.index));
-    ANTB1_CHECK(out.index >= 0);
-    return out;
-  });
-}
-
 ExprPtr MapColumns(const ExprPtr& expr, const std::function<ColumnExpr(const ColumnExpr&)>& f) {
   Expr out = *expr;
   bool changed = false;
@@ -272,6 +264,18 @@ void CollectColumns(const Expr& expr, std::vector<int>& out) {
   for (const ExprPtr* child : Children(copy)) {
     if (*child != nullptr) {
       CollectColumns(**child, out);
+    }
+  }
+}
+
+void CollectColumnIds(const Expr& expr, std::vector<ColumnId>& out) {
+  if (const auto* column = std::get_if<ColumnExpr>(&expr.node)) {
+    out.push_back(column->id);
+  }
+  Expr copy = expr;  // Children takes a mutable node; the copy shares the children
+  for (const ExprPtr* child : Children(copy)) {
+    if (*child != nullptr) {
+      CollectColumnIds(**child, out);
     }
   }
 }
@@ -655,7 +659,7 @@ class Resolver {
 
 std::vector<ColumnId> OutputIds(const LogicalNode& node) { return std::visit(OutputIdsOf{}, node); }
 
-LogicalPlan ResolvePositions(const LogicalPlan& plan) {
+LogicalPlan ResolvePositions(const LogicalPlan& plan, std::source_location location) {
   if (plan.root == nullptr) {
     return plan;
   }
@@ -663,8 +667,8 @@ LogicalPlan ResolvePositions(const LogicalPlan& plan) {
   Resolver::Resolved root = resolver.Walk(plan.root);
   resolver.CheckOutput(plan.output, root.ids);
   if (resolver.failure().has_value()) {
-    internal::CheckFailed(
-        resolver.failure()->c_str());  // a programming error: see PositionMismatch
+    // A programming error: see PositionMismatch.
+    internal::CheckFailed(resolver.failure()->c_str(), location);
   }
   return LogicalPlan{.root = std::move(root.node), .output = plan.output};
 }
@@ -677,12 +681,6 @@ std::optional<std::string> PositionMismatch(const LogicalPlan& plan) {
   const Resolver::Resolved root = resolver.Walk(plan.root);
   resolver.CheckOutput(plan.output, root.ids);
   return resolver.Problem();
-}
-
-void CheckPositions(const LogicalPlan& plan, std::source_location location) {
-  if (const auto problem = PositionMismatch(plan)) {
-    internal::CheckFailed(problem->c_str(), location);
-  }
 }
 
 }  // namespace antb1::plan

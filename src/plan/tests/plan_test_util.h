@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
@@ -30,14 +31,19 @@ inline void PrintTo(ColumnId id, std::ostream* os) { *os << '#' << std::to_under
 
 namespace antb1::plan::testing {
 
-// A table with a schema and an optional exact row count; it cannot be scanned.
+// A table with a schema, an optional exact row count and the fields stored as FLOAT; it cannot be
+// scanned.
 class FakeTable final : public Table {
  public:
-  FakeTable(std::shared_ptr<arrow::Schema> schema, std::optional<int64_t> rows)
-      : schema_(std::move(schema)), rows_(rows) {}
+  FakeTable(std::shared_ptr<arrow::Schema> schema, std::optional<int64_t> rows,
+            std::vector<int> float_fields = {})
+      : schema_(std::move(schema)), rows_(rows), float_fields_(std::move(float_fields)) {}
 
   const std::shared_ptr<arrow::Schema>& schema() const override { return schema_; }
   std::optional<int64_t> exact_row_count() const override { return rows_; }
+  bool StoredAsFloat(int field) const override {
+    return std::ranges::contains(float_fields_, field);
+  }
   std::string Describe() const override { return "fake"; }
 
  protected:
@@ -50,6 +56,7 @@ class FakeTable final : public Table {
  private:
   std::shared_ptr<arrow::Schema> schema_;
   std::optional<int64_t> rows_;
+  std::vector<int> float_fields_;
 };
 
 // Every engine type, an unsupported column and two names that need quoting:

@@ -271,12 +271,21 @@ TEST(ColumnIdsTest, PositionMismatchReportsBrokenInvariantsFirst) {
             "Scan: column #1 is defined twice");
 }
 
+// Optimize's rules find columns by their ids and leave positions to ResolvePositions, its last
+// step: an index that is not its column's position is set to it.
+TEST(ColumnIdsTest, OptimizeResolvesStaleIndexes) {
+  const LogicalPlan optimized = Optimize(FilterPlan(Column(kC, 0)));  // #3 is at 2, not 0
+  const auto* filter = std::get_if<FilterNode>(optimized.root.get());
+  ASSERT_NE(filter, nullptr);
+  EXPECT_EQ(filter->predicates.at(0).column.value_or(BoundColumn{}).index, 2);
+  EXPECT_EQ(PositionMismatch(optimized), std::nullopt);
+}
+
 TEST(ColumnIdsDeathTest, BrokenPlansAbort) {
   EXPECT_DEATH(ResolvePositions(FilterPlan(Column(ColumnId{99}, 0))),
                "Filter: column #99 is not in its input");
-  EXPECT_DEATH(CheckPositions(FilterPlan(Column(kC, 0))), "Filter: column #3 is at 2, not 0");
-  // Optimize checks the positions its rules computed before it resolves them.
-  EXPECT_DEATH(Optimize(FilterPlan(Column(kC, 0))), "Filter: column #3 is at 2, not 0");
+  EXPECT_DEATH(Optimize(FilterPlan(Column(ColumnId{99}, 0))),
+               "Filter: column #99 is not in its input");
 }
 
 }  // namespace

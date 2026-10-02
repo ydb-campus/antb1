@@ -1,6 +1,8 @@
 #include "antb1/plan/optimizer.h"
 
 #include <algorithm>
+#include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -311,6 +313,142 @@ TEST(OptimizerTest, KeepsKeysThatOtherKeysDoNotDetermine) {
     const auto* group = std::get_if<GroupAggregateNode>(project.input.get());
     ASSERT_NE(group, nullptr) << sql << "\n" << Explain(plan);
     EXPECT_EQ(group->keys.size(), keys) << sql << "\n" << Explain(plan);
+  }
+}
+
+// The plan with every column reference that has an id at position f(id, position): Project
+// constants and the operand-local columns of a PredicateExpr (no ids) stay as they are.
+struct MapReferences {
+  const std::function<int(ColumnId, int)>& f;
+
+  [[nodiscard]] LogicalNodePtr Map(const LogicalNodePtr& node) const {
+    return std::visit(*this, *node);
+  }
+  void Column(BoundColumn& column) const {
+    if (column.id != kNoColumnId) {
+      column.index = f(column.id, column.index);
+    }
+  }
+  void Column(std::optional<BoundColumn>& column) const {
+    if (column.has_value()) {
+      Column(*column);
+    }
+  }
+  [[nodiscard]] ExprPtr Expression(const ExprPtr& expr) const {
+    return MapColumns(expr, [this](ColumnExpr column) {
+      if (column.id != kNoColumnId) {
+        column.index = f(column.id, column.index);
+      }
+      return column;
+    });
+  }
+  template <class Node>
+  [[nodiscard]] LogicalNodePtr Over(Node node) const {
+    node.input = Map(node.input);
+    return std::make_shared<const LogicalNode>(std::move(node));
+  }
+
+  LogicalNodePtr operator()(const ScanNode& node) const {
+    return std::make_shared<const LogicalNode>(node);
+  }
+  LogicalNodePtr operator()(FilterNode node) const {
+    for (Predicate& p : node.predicates) {
+      Column(p.column);
+      Column(p.other);
+    }
+    return Over(std::move(node));
+  }
+  LogicalNodePtr operator()(ComputeNode node) const {
+    for (ExprPtr& expr : node.exprs) {
+      expr = Expression(expr);
+    }
+    return Over(std::move(node));
+  }
+  LogicalNodePtr operator()(ProjectNode node) const {
+    for (BoundColumn& column : node.columns) {
+      Column(column);
+    }
+    return Over(std::move(node));
+  }
+  LogicalNodePtr operator()(AggregateNode node) const {
+    for (AggregateCall& call : node.aggregates) {
+      Column(call.arg);
+    }
+    return Over(std::move(node));
+  }
+  LogicalNodePtr operator()(GroupAggregateNode node) const {
+    for (BoundColumn& key : node.keys) {
+      Column(key);
+    }
+    for (AggregateCall& call : node.aggregates) {
+      Column(call.arg);
+    }
+    return Over(std::move(node));
+  }
+  LogicalNodePtr operator()(SortNode node) const {
+    for (SortKey& key : node.keys) {
+      Column(key.column);
+    }
+    return Over(std::move(node));
+  }
+  LogicalNodePtr operator()(LimitNode node) const { return Over(std::move(node)); }
+  LogicalNodePtr operator()(const RowCountNode& node) const {
+    return std::make_shared<const LogicalNode>(node);
+  }
+};
+
+// The id and the position of every column reference that has an id, from the root down.
+std::vector<std::pair<ColumnId, int>> References(const LogicalPlan& plan) {
+  std::vector<std::pair<ColumnId, int>> out;
+  const std::function<int(ColumnId, int)> record = [&out](ColumnId id, int index) {
+    out.emplace_back(id, index);
+    return index;
+  };
+  (void)MapReferences{.f = record}.Map(plan.root);
+  return out;
+}
+
+// The rules find columns by their ids and never read a position (ADR 0022): with every position of
+// the bound plan wrong, Optimize gives the same plan, positions included.
+TEST(OptimizerTest, RulesReadColumnIdsNotPositions) {
+  static const Catalog catalog = MakeCatalog();
+  constexpr const char* kHavingAlias =
+      "SELECT i16, CASE WHEN COUNT(*) > 1 THEN 'many' END AS size FROM t GROUP BY i16 "
+      "HAVING size = 'many' OR size = 'few'";
+  for (const char* sql : {
+           "SELECT COUNT(*) FROM t HAVING COUNT(*) > 1",
+           "SELECT s, i16, s AS again FROM t WHERE dt > '2013-07-01' AND i16 < 5 LIMIT 3",
+           "SELECT i16 + 1 FROM t WHERE i32 // 2 > 0",
+           "SELECT i32 * 2 FROM t LIMIT 3",
+           "SELECT i32, i32 - 1, i32 * 2, COUNT(*) FROM t GROUP BY i32, i32 - 1, i32 * 2",
+           "SELECT i32 - 1, COUNT(*) AS c FROM t GROUP BY i32, i32 - 1 ORDER BY c DESC LIMIT 3",
+           "SELECT s, strlen(s), SUM(i16) FROM t GROUP BY s, strlen(s) HAVING strlen(s) > 1",
+           "SELECT i32, i16 + 1, COUNT(*) FROM t GROUP BY i32, i16, i16 + 1",
+           "SELECT i32, i32 + 1, SUM(i32 + 1) FROM t GROUP BY i32, i32 + 1",
+           "SELECT i32, i32 + 1, COUNT(*) FROM t GROUP BY i32, i32 + 1 LIMIT 1",
+           "SELECT MAX(\"from\"), COUNT(*), SUM(d), MIN(d) FROM u",
+           "SELECT i16, 42, 'x' AS c, i16 * 2 FROM t WHERE i16 > 0 OR i32 < 5 ORDER BY 4",
+           "SELECT CASE WHEN i16 > 0 THEN s ELSE 'neg' END AS c FROM t ORDER BY c LIMIT 5",
+           "SELECT SUM(i32) + 1, COUNT(*) FROM t HAVING SUM(i32) > 5 OR COUNT(*) < 2",
+           kHavingAlias,
+       }) {
+    auto bound = BindSql(sql, catalog);
+    ASSERT_TRUE(bound.ok()) << sql << ": " << bound.status().ToString();
+    const LogicalPlan expected = Optimize(*bound);
+    for (const int position : {0, 999}) {
+      const std::function<int(ColumnId, int)> scramble = [position](ColumnId, int) {
+        return position;
+      };
+      const LogicalPlan scrambled{.root = MapReferences{.f = scramble}.Map(bound->root),
+                                  .output = bound->output};
+      if (position == 999) {  // no plan here has that many columns
+        ASSERT_NE(References(scrambled), References(*bound)) << sql;
+      }
+      const LogicalPlan optimized = Optimize(scrambled);
+      EXPECT_EQ(Explain(optimized), Explain(expected)) << sql;
+      EXPECT_EQ(References(optimized), References(expected)) << sql;
+      EXPECT_EQ(PositionMismatch(optimized), std::nullopt) << sql;
+    }
   }
 }
 
