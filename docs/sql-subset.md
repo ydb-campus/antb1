@@ -605,9 +605,10 @@ committed ([ADR 0006](adr/0006-test-strategy-and-data-policy.md)); queries are r
 The ratchet `tests/data/tpch_status.json` lists the queries verified to pass, and `pass` below means exactly the
 ratchet (`pixi run lint` compares them); the PR that makes a query pass updates both. A query that does not pass must
 fail cleanly with exit code 4 (unsupported). Today none passes; the plan is recorded in ADRs 0021 (DECIMAL), 0022
-(joins, query blocks and uncorrelated subqueries) and 0023 (correlated subqueries). The tests that generate the data
-and enforce the ratchet come with the next harness PRs. The last column names the work whose PR completes the query;
-most queries also need the DECIMAL work of ADR 0021 before it.
+(joins, query blocks and uncorrelated subqueries) and 0023 (correlated subqueries). `tests/tpch/` generates the data
+at test time ([testing.md](testing.md#data-derived-from-tpc-h)); the test that enforces the ratchet comes with the
+next harness PR. The last column names the work whose PR completes the query; most queries also need the DECIMAL
+work of ADR 0021 before it.
 
 | Query | Status | Completed by |
 | --- | --- | --- |

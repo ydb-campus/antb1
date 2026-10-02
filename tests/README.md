@@ -4,7 +4,8 @@ Module unit tests live in `src/<module>/tests/` (label `unit`). This directory h
 modules. Every suite except `tpch/` reads the Parquet fixtures of `tools/fixturegen`: the ctest `fixtures.generate`
 (label `setup`) writes them to `build/<preset>/fixtures` before any test that needs them, also in filtered runs. The
 `tpch/` suite works on data derived from TPC-H that the pinned `duckdb-extension-tpch` package generates at test
-time (ADR 0006).
+time: the ctest `fixtures.tpch` (label `setup`) writes it to `build/<preset>/fixtures/tpch` (ADR 0006,
+[docs/testing.md](../docs/testing.md#data-derived-from-tpc-h)).
 
 | Directory | ctest names | Label | What it checks |
 |---|---|---|---|
@@ -15,7 +16,7 @@ time (ADR 0006).
 | `cli/` | `cli.<case>` | `cli` | stdout, stderr and exit code of the `antb1` binary |
 | `slt/`, `harness/`, `cli/` | `harness.*` | `harness` | the harness itself: mutations, redaction, digest |
 | `data/` | `data.*` | `data` | ClickBench data tests on downloaded data, redacted (`pixi run test-data` only) |
-| `tpch/` | `harness.tpch.*` | `harness` | the pinned dbgen extension for the data derived from TPC-H loads (Linux only) |
+| `tpch/` | `harness.tpch.*`, `diff.tpch`, `parallel.diff.tpch` | `harness`, `diff`, `parallel` | the data derived from TPC-H (Linux only, redacted): DuckDB's answers on the generated files, antb1 against DuckDB on generated queries over them |
 
 ```bash
 pixi run test -L diff          # one label
@@ -96,3 +97,9 @@ Exit codes are never rewritten: change `EXIT_CODE` in `cli/CMakeLists.txt` delib
   fixture generator and digest.
 - `harness.tpch.extension`: the pinned `duckdb-extension-tpch` package loads into the duckdb CLI by absolute path
   (one thread, no extension auto-install or auto-load) and provides the 22 query texts derived from TPC-H.
+- `harness.tpch.answers.sf0_01`, `harness.tpch.answers.sf0_1`: the 22 queries derived from TPC-H on the DuckDB oracle
+  equal DuckDB's stored answers on the generated files; `harness.tpch.answers.redact`: with `--mutate canary` every
+  query fails and the report leaks nothing; `harness.tpch.drift`: query texts that differ from
+  `tpch/queries.sha256` fail with numbers and digests only; `harness.tpch.generate.*` and
+  `harness.tpch.run_redacted.*`: the generator and `tpch/run_redacted.cmake` print nothing but numbers, kinds and
+  `SUMMARY:` lines when something fails.
