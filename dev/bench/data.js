@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790945063049,
+  "lastUpdate": 1790979637119,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -3984,6 +3984,90 @@ window.BENCHMARK_DATA = {
             "value": 15.042697630434532,
             "unit": "ms/iter",
             "extra": "iterations: 46\ncpu: 15.041573543478261 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "02f399728cea86f781c88cc98cdc6909f64e3f82",
+          "message": "refactor(plan): optimizer rules on column ids (#81)\n\n## Summary\n\nThe binder and every optimizer rule now refer to columns by id only.\nThis is PR P2 of the roadmap for the queries\nderived from TPC-H, the second half of ADR 0022's \"stable column ids\".\nP1 (#78) gave every column an id and checked\nthe positions the binder and the optimizer still computed. P2 removes\nthat position bookkeeping: positions are\nderived data, which `plan::ResolvePositions` sets from the ids at the\nend of both `Bind` and `Optimize`. The executor\nkeeps reading positions and is untouched. J1a's joins can now move\ncolumns between inputs without renumbering them.\n\nPlans do not change. The EXPLAIN goldens, every binder index assertion\nand every answer stay the same. Locally, before\nand after this PR, EXPLAIN gives byte-identical output for:\n\n- all 624 `.slt` records;\n- all 43 ClickBench queries;\n- 9000 queries of the random differential test (seeds 1, 2 and\n20260925).\n\n**Optimizer** (`src/plan/optimizer.cc`):\n\n- **Projection pruning** keeps a set of needed column ids instead of\nper-position flags:\n  - a Scan keeps its needed fields in table order;\n- a Compute keeps its needed expressions in order, and its input needs\nthe same set plus what those expressions\n    read (a Compute left without expressions disappears, as before);\n- Filter and Sort add the columns they read; Project, Aggregate and\nGroupAggregate ask their input for exactly\n    what they read.\n\n  `Remap`, the two `Renumber`s and `OutputWidth` are gone.\n- **Dependent GROUP BY keys** (ADR 0018) are found by id. A key is\ndependent when the Compute below defines it, it\nreads at least one column, and every column it reads is a non-DOUBLE\nkey. The rewrite maps those reads from each\n  key's input column to its output column.\n- `CountStarToRowCount` and the Limit pushdown read no columns and are\nunchanged.\n- `Optimize` ends with `ResolvePositions`, so its rules never read or\nset a position.\n\n**Binder** (`src/plan/binder.cc`):\n\n- **Deleted:** the `kPreBase`/`kPostBase` index bands with `Place` and\n`place_pre`, `width_`, the output-scope\n  position arithmetic, and `ColumnLeaf`'s index parameter.\n- **These compare ids now:** `SameCall`, the WHERE split, the GROUP BY\nkey lookups (`KeyOf`), `BindHaving`'s\nsubstitution of a computed item inside OR/NOT (looked up in\n`post_ids_`), the ORDER BY deduplication, and the\n  field-name choice and FLOAT checks.\n  - `Columns::FieldOf` maps a column id to its field.\n  - `StoredAsFloat(ColumnId)` and `FloatResult` replace `float_args_`.\n- A FLOAT key is checked through the field's id, never the key's output\ncolumn.\n- `Bind` returns `ResolvePositions(plan)`. An unresolved index keeps its\ndefault 0 until then. The only positional\nwrites left are the operand-local columns of a `PredicateExpr` and the\n-1 of Project constants.\n\n**logical_plan:**\n\n- `SameExpr` compares columns by id, and by index only when neither has\none (the executor's plans).\n- New `CollectColumnIds`.\n- `ResolvePositions` takes the caller's `std::source_location`, so an\nabort names `Bind` or `Optimize`.\n- `CheckPositions` and the public `Renumber` are deleted.\n\n**Tests:**\n\n- `OptimizerTest.RulesReadColumnIdsNotPositions`: every id-carrying\nposition of 15 bound plans is set to 0, then to\n999, before `Optimize`. The result must be the same EXPLAIN, the same\n(id, position) of every reference, and no\n`PositionMismatch`. The plans cover dependent keys, pruning, Limit\npushdown, compound WHERE and HAVING, CASE,\nconstants and global aggregates. This test fails on main's positional\noptimizer, once its `CheckPositions` abort\n  is removed.\n- `BinderTest.FloatColumnsByColumnId`: `FakeTable` can now mark fields\nas FLOAT, and `f` is at field 0. FLOAT\nfolding is exact through WHERE, HAVING on `MIN`/`MAX`, aliases and GROUP\nBY keys, and `f + 1` and `-f` still exit\n4. A position read as a field number, or a FLOAT check through a key's\noutput column, fails the test.\n- `BinderTest.OrderByComputedItemsByColumnId`,\n`AggregatesOfAFieldAndOfAnExpressionDiffer` and\n`HavingAliasOfAComputedItemInsideOr` cover the deduplications and the\nHAVING substitution. Before this PR only\n  `.slt` files covered them, or nothing did.\n- I checked that the binder tests catch three injected regressions: a\nFLOAT check through a key's output id,\n  `SameCall` by index, and the ORDER BY deduplication by index.\n- `ColumnIdsTest.OptimizeResolvesStaleIndexes` replaces the death test\nthat relied on `CheckPositions`. A broken\n  invariant still aborts through `Optimize`.\n- `LogicalPlanTest`: `SameExpr` with ids and `CollectColumnIds`.\n\n**Docs:** `logical_plan.h`, `optimizer.h`, `binder.h` (its plan-shape\ncomment was stale) and `docs/architecture.md`.\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [x] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check                       # on b2306ba\nlint: PASS\nci        100% tests passed out of 1482 (main has 1474; this adds 8)\n\n$ pixi run check-full                  # on 3b080f5 (b2306ba adds a comment and one test assertion)\nlint: PASS\nci        100% tests passed out of 1482\nasan      100% tests passed out of 1482\ntidy      passed\ncoverage  100% tests passed out of 1482; Coverage gate: PASS\nfuzz      100% tests passed out of 2\nci-gcc    100% tests passed out of 1482\n\n$ pixi run test-data                   # ClickBench hits_0\n100% tests passed out of 6\n\n$ ANTB1_DIFF_SEED=1 ANTB1_DIFF_COUNT=20000 pixi run diff-random\nDIFF: PASS seed=1 queries=20000 failed=0 unsupported=0\n$ ANTB1_DIFF_SEED=2 ANTB1_DIFF_COUNT=20000 pixi run diff-random\nDIFF: PASS seed=2 queries=20000 failed=0 unsupported=0\n\nEXPLAIN on main and on this branch (local script, plans not shown):\nslt: 624 queries, 624 identical; clickbench: 43 queries, 43 identical\ndiff seeds 1, 2, 20260925: 3000 queries each, all identical\n```\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: none\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code implemented the\nmaintainer-approved plan, compared EXPLAIN\n  before and after locally, and a reviewer agent reviewed the diff.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-10-03T01:17:47+03:00",
+          "tree_id": "3ae7a1fd2932c2f5d93a3f599a51f1f111c5f64e",
+          "url": "https://github.com/ydb-campus/antb1/commit/02f399728cea86f781c88cc98cdc6909f64e3f82"
+        },
+        "date": 1790979636130,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4251.569636983924,
+            "unit": "ns/iter",
+            "extra": "iterations: 164180\ncpu: 4251.40291752954 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84114.88118431176,
+            "unit": "ns/iter",
+            "extra": "iterations: 7802\ncpu: 84072.3296590618 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222187.1413595923,
+            "unit": "ns/iter",
+            "extra": "iterations: 3148\ncpu: 222107.24110546382 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 443454.57097590953,
+            "unit": "ns/iter",
+            "extra": "iterations: 1578\ncpu: 443422.76932826353 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 401786.950631449,
+            "unit": "ns/iter",
+            "extra": "iterations: 1742\ncpu: 401778.81745120574 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2082440.565476198,
+            "unit": "ns/iter",
+            "extra": "iterations: 336\ncpu: 2082225.577380951 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 53.05663115384636,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 53.052652538461594 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 44.39654593750042,
+            "unit": "ms/iter",
+            "extra": "iterations: 16\ncpu: 44.39116931250003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 186.0276522500044,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 186.02165149999993 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.373980081632926,
+            "unit": "ms/iter",
+            "extra": "iterations: 49\ncpu: 14.372559306122442 ms\nthreads: 1"
           }
         ]
       }
