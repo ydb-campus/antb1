@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791030900999,
+  "lastUpdate": 1791037262575,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -4320,6 +4320,90 @@ window.BENCHMARK_DATA = {
             "value": 8.496649876543279,
             "unit": "ms/iter",
             "extra": "iterations: 81\ncpu: 8.495638641975304 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "7967aa57edcbb2f4c3da07e39775c5bbf5bce494",
+          "message": "fix(sql): count the canonical form's levels for or predicates and not operands (#87)\n\n## Summary\n\nSome statements parsed within the 256-level depth limit while their\ncanonical form (`ToSql`) did not, so\n`Parse(ToSql(x))`, the round trip the fuzzer and the property tests\ncheck, failed. This is a small non-roadmap fix\nthat the maintainer approved. S1's review found the gap and the handoff\nrecorded it as a follow-up; S1 counted only\nthe levels added by `::` and unary minus. Both remaining families\nreproduce on main:\n\n- **A top-level OR in WHERE or HAVING.** The parser keeps the predicate\nas one conjunct and counts its AND chain\nspecially (each conjunct from the clause's base depth). `ToSql` wrapped\nit in parentheses, and re-parsing that is\ndeeper. The gap grows with the length of the AND chain before the OR: on\nmain, 54 ANDs before a 50-deep conjunct\nalready break the round trip. Fix (`src/sql/unparse.cc`): a WHERE or\nHAVING predicate that is a single conjunct,\nother than an AND, is written without parentheses. It then reads back\nthe way it was parsed, so its levels match\nby construction. `WHERE (a OR b) AND c` keeps its parentheses. DuckDB\nreads `WHERE a AND b OR c` with the same\n  meaning; the slt runner's `ordered_compare` sends this text to DuckDB.\n- **NOT as the right operand** of a comparison, arithmetic, a LIKE\npattern or a BETWEEN bound. The parser accepts\n`a = NOT b`, and `ToSql` writes `a = (NOT b)`: one level per NOT, so a\nchain `a = NOT a = NOT ...` gains about n/3\nlevels. Fix (`src/sql/parser.cc`): such a NOT counts one canonical\nlevel, with S1's `peak_`/`CanonicalLevel`\npattern. A NOT that is a unary minus's operand is not counted twice,\nbecause `ToSql` writes `-(NOT x)`.\n\n**Tests:**\n\n- `ParserTest.CanonicalFormStaysWithinTheDepthLimit` sweeps each family\nup to the limit and checks that every\naccepted statement round-trips, and that from the first rejection on\nevery n is the depth error. Families:\n  - OR chains in WHERE and HAVING;\n  - a long AND chain then a deep conjunct then OR, varying each part;\n- NOT after `=`, `+`, LIKE, both BETWEEN bounds, after a minus's\noperand, and as a minus's operand.\n\nEach NOT family's bare spelling must be rejected at the same n as its\nparenthesized twin. With the fix reverted,\n  every family fails.\n- `UnparseTest.CanonicalForms`: the bare OR predicate (WHERE and\nHAVING), an OR conjunct next to others, and NOT\n  operands. S2's BETWEEN case loses its outer parentheses.\n- Two regressions in `fuzz/regressions/` (an OR chain and a NOT chain).\nBoth fail with main's `antb1-fuzz-replay`\n  and pass with the fix.\n\n**Docs:** the depth paragraph of `docs/sql-subset.md` and the parser's\nheader comment.\n\nFor the maintainer: the reviewer agent also found an older crash on\nmain, outside this diff. An operator chain's left\noperand is checked only at its own starting depth. So a query that nests\n120 parentheses, each followed by 120 `+`\noperators, passes the 256-level check but builds a tree thousands of\nlevels deep, and `antb1 explain` segfaults on\nit. As you decided, that gets its own fix PR.\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [x] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full                  # on ca605b1\nlint: PASS\nci        100% tests passed out of 1673\nasan      100% tests passed out of 1673\ntidy      passed\ncoverage  100% tests passed out of 1673; Coverage gate: PASS\nfuzz      100% tests passed out of 2\nci-gcc    100% tests passed out of 1673\n$ ANTB1_FUZZ_SECONDS=600 pixi run fuzz # on e3f6f83\nstat::average_exec_per_sec: 7467\nfuzz: PASS\n$ ANTB1_DIFF_SEED=7 ANTB1_DIFF_COUNT=20000 pixi run diff-random   # on e3f6f83\nDIFF: PASS seed=7 queries=20000 failed=0 unsupported=0\n```\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: none\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code implemented the\nmaintainer-approved plan (parser, unparser,\ntests, fuzz regressions, docs), and a reviewer agent reviewed the diff\n(its two minor points are in ca605b1).\n- Accountable human (has read and understands the whole diff): @hor911\n\n---------\n\nCo-authored-by: Claude <noreply@anthropic.com>",
+          "timestamp": "2026-10-03T17:18:07+03:00",
+          "tree_id": "e91c7d9ec099d63b40929806cf03ff2deceeb50b",
+          "url": "https://github.com/ydb-campus/antb1/commit/7967aa57edcbb2f4c3da07e39775c5bbf5bce494"
+        },
+        "date": 1791037261918,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4451.395658804053,
+            "unit": "ns/iter",
+            "extra": "iterations: 156731\ncpu: 4451.239135844217 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 85348.93565932599,
+            "unit": "ns/iter",
+            "extra": "iterations: 7538\ncpu: 85342.600557177 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222378.14562798134,
+            "unit": "ns/iter",
+            "extra": "iterations: 3145\ncpu: 222362.46136724952 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 442097.6407337069,
+            "unit": "ns/iter",
+            "extra": "iterations: 1581\ncpu: 442061.1227071473 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 348079.8950051002,
+            "unit": "ns/iter",
+            "extra": "iterations: 1962\ncpu: 348000.50407747226 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2101688.867469934,
+            "unit": "ns/iter",
+            "extra": "iterations: 332\ncpu: 2101558.9487951812 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 53.40089130769107,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 53.395509384615394 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 44.81102962500039,
+            "unit": "ms/iter",
+            "extra": "iterations: 16\ncpu: 44.7926125 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 184.713406500002,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 184.70323049999982 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.81120068085106,
+            "unit": "ms/iter",
+            "extra": "iterations: 47\ncpu: 14.809246425531901 ms\nthreads: 1"
           }
         ]
       }
