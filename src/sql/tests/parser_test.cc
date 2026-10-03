@@ -429,6 +429,51 @@ TEST(ParserTest, Like) {
   EXPECT_EQ(Cmp(number->where[0]).literal.kind, Literal::Kind::kInteger);
 }
 
+// x [NOT] BETWEEN low AND high at comparison precedence: its bounds are additive expressions, so
+// the AND is BETWEEN's own and the conjunction around it still splits; NOT x BETWEEN and
+// x NOT BETWEEN are different trees.
+TEST(ParserTest, Between) {
+  constexpr std::string_view kSql =
+      "SELECT a FROM t WHERE b between 1 AND c + 2 AND d NOT BETWEEN 'x' AND 'y' AND "
+      "NOT e BETWEEN -1 AND 2 * 3 AND f = 1";
+  auto stmt = Parse(kSql);
+  ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
+  ASSERT_EQ(stmt->where.size(), 4U);
+  const auto text = [&](SourceSpan span) { return kSql.substr(span.offset, span.length); };
+
+  const auto* plain = std::get_if<BetweenExpr>(&stmt->where.front());
+  ASSERT_NE(plain, nullptr);
+  EXPECT_FALSE(plain->negated);
+  EXPECT_EQ(text(plain->span), "b between 1 AND c + 2");
+  EXPECT_EQ(text(plain->op_span), "between");
+  EXPECT_EQ(text(plain->operand->span()), "b");
+  EXPECT_EQ(text(plain->low->span()), "1");
+  EXPECT_TRUE(std::holds_alternative<BinaryExpr>(*plain->high));
+
+  const auto* negated = std::get_if<BetweenExpr>(&stmt->where[1]);
+  ASSERT_NE(negated, nullptr);
+  EXPECT_TRUE(negated->negated);
+  EXPECT_EQ(text(negated->op_span), "NOT BETWEEN");
+  EXPECT_EQ(text(negated->span), "d NOT BETWEEN 'x' AND 'y'");
+
+  const auto* not_expr = std::get_if<UnaryExpr>(&stmt->where[2]);
+  ASSERT_NE(not_expr, nullptr);
+  EXPECT_EQ(not_expr->op, UnaryOp::kNot);
+  const auto* under_not = std::get_if<BetweenExpr>(&*not_expr->operand);
+  ASSERT_NE(under_not, nullptr);
+  EXPECT_FALSE(under_not->negated);
+  EXPECT_EQ(text(under_not->span), "e BETWEEN -1 AND 2 * 3");
+  EXPECT_FALSE(EqualIgnoringSpans(stmt->where[1], stmt->where[2]));
+  EXPECT_EQ(Cmp(stmt->where[3]).op, CompareOp::kEq);
+
+  // Under OR, in CASE, and with parenthesized bounds; a comparison is not a bound.
+  for (const char* sql : {"SELECT a FROM t WHERE b BETWEEN 1 AND 2 OR c BETWEEN (1 = 1) AND 3",
+                          "SELECT CASE WHEN b BETWEEN 1 AND 2 THEN 1 END FROM t",
+                          "SELECT a FROM t WHERE b BETWEEN (c AND d) AND 2"}) {
+    EXPECT_TRUE(Parse(sql).has_value()) << sql;
+  }
+}
+
 // column [NOT] IN (literal, ...) in WHERE; the span runs from the column to the closing paren.
 TEST(ParserTest, In) {
   constexpr std::string_view kSql =
@@ -1067,12 +1112,10 @@ INSTANTIATE_TEST_SUITE_P(
                    "SIMILAR TO is not supported"},
         RejectCase{"InSubquery", "SELECT a FROM events WHERE region IN (^SELECT b FROM t)",
                    kUnsupported, 6, "IN (subquery) is not supported"},
-        RejectCase{"Between", "SELECT a FROM events WHERE a ^BETWEEN 1 AND 2", kUnsupported, 7,
-                   "BETWEEN is not supported"},
-        RejectCase{"NotBetween", "SELECT a FROM events WHERE a ^NOT BETWEEN 1 AND 2", kUnsupported,
-                   3, "NOT BETWEEN is not supported"},
-        RejectCase{"BetweenAfterLiteral", "SELECT a FROM events WHERE 1 ^BETWEEN a AND b",
-                   kUnsupported, 7, "BETWEEN is not supported"},
+        RejectCase{"ComparisonAfterBetween", "SELECT a FROM events WHERE a BETWEEN 1 AND 2 ^= b",
+                   kUnsupported, 1, "chained comparisons (a = b = c) are not supported"},
+        RejectCase{"BetweenAfterComparison", "SELECT a FROM events WHERE a = b ^BETWEEN 1 AND 2",
+                   kUnsupported, 7, "chained comparisons (a = b = c) are not supported"},
         RejectCase{"IsNull", "SELECT a FROM events WHERE a ^IS NULL", kUnsupported, 2,
                    "IS NULL is not supported"},
         RejectCase{"IsNotNull", "SELECT a FROM events WHERE a ^is not null", kUnsupported, 2,
@@ -1310,6 +1353,10 @@ INSTANTIATE_TEST_SUITE_P(
     ::testing::Values(
         RejectCase{"Empty", "^", kSyntax, 0, "empty query; expected SELECT"},
         RejectCase{"OnlyComment", "  -- nothing\n^", kSyntax, 0, "empty query; expected SELECT"},
+        RejectCase{"BetweenWithoutAnd", "SELECT a FROM t WHERE b BETWEEN 1 ^OR 2", kSyntax, 2,
+                   "expected AND in BETWEEN, found keyword OR"},
+        RejectCase{"BetweenWithoutHigh", "SELECT a FROM t WHERE b BETWEEN 1 AND ^", kSyntax, 0,
+                   "expected"},
         RejectCase{"InEmptyList", "SELECT a FROM t WHERE b IN (^)", kSyntax, 1,
                    "expected a value in IN (...), found )"},
         RejectCase{"InWithoutParen", "SELECT a FROM t WHERE b IN ^1", kSyntax, 1,

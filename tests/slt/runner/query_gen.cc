@@ -1114,7 +1114,12 @@ class Builder {
         In(c);
         return;
       }
-      const std::string_view op = rng_.Pick(kOps);
+      // One draw picks the operator (roll % 7, as Pick did) and, with kBetween, now and then a
+      // [NOT] BETWEEN instead of the plain comparison below (roll / 7), so that every seed keeps
+      // generating the queries it did before kBetween, apart from those.
+      const std::size_t op_roll = rng_.Below(kOps.size() * 10);
+      const std::string_view op = kOps[op_roll % kOps.size()];
+      const std::size_t between = op_roll / kOps.size();  // 1: BETWEEN, 2: NOT BETWEEN
       if (rng_.Percent(6) && TimestampComparison(c, op)) {
         return;
       }
@@ -1144,7 +1149,12 @@ class Builder {
       }
       Literal lit = MakeLiteral(c);
       used_.Add(lit.features);
-      if (allowed_.Has(Feature::kLiteralFirst) && rng_.Percent(20)) {
+      const bool literal_first = allowed_.Has(Feature::kLiteralFirst) && rng_.Percent(20);
+      if (allowed_.Has(Feature::kBetween) && (between == 1 || between == 2)) {
+        Between(c, lit, /*negated=*/between == 2);
+        return;
+      }
+      if (literal_first) {
         used_.Add(Feature::kLiteralFirst);
         tokens_.insert(tokens_.end(), lit.tokens.begin(), lit.tokens.end());
         Symbol(Flip(op));
@@ -1155,6 +1165,29 @@ class Builder {
         tokens_.insert(tokens_.end(), lit.tokens.begin(), lit.tokens.end());
       }
     }
+  }
+
+  // c [NOT] BETWEEN lit AND high. The upper bound comes from the literal without another draw: an
+  // integer plus 5, any other literal itself (a single-value range).
+  void Between(const GenColumn& c, const Literal& lit, bool negated) {
+    used_.Add(Feature::kBetween);
+    Column(c);
+    if (negated) {
+      Keyword("NOT");
+    }
+    Keyword("BETWEEN");
+    tokens_.insert(tokens_.end(), lit.tokens.begin(), lit.tokens.end());
+    Keyword("AND");
+    std::vector<Token> high = lit.tokens;
+    if (high.size() == 1 && high[0].kind == Token::Kind::kLiteral) {
+      const std::string& text = high[0].text;
+      int64_t value = 0;
+      const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+      if (error == std::errc{} && end == text.data() + text.size() && value < 1'000'000'000) {
+        high[0].text = std::to_string(value + 5);
+      }
+    }
+    tokens_.insert(tokens_.end(), high.begin(), high.end());
   }
 
   // [NOT] LIKE 'pattern' after an operand with the values of `c`: a part of a sample value between

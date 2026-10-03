@@ -82,7 +82,8 @@ int Precedence(const Expr& expr) {
   if (const auto* unary = std::get_if<UnaryExpr>(&expr)) {
     return unary->op == UnaryOp::kNot ? kNot : kUnary;
   }
-  if (std::holds_alternative<LikeExpr>(expr) || std::holds_alternative<InExpr>(expr)) {
+  if (std::holds_alternative<LikeExpr>(expr) || std::holds_alternative<InExpr>(expr) ||
+      std::holds_alternative<BetweenExpr>(expr)) {
     return kComparison;
   }
   return kPrimary;
@@ -135,6 +136,11 @@ struct SqlOf {
   std::string operator()(const InExpr& in) const {
     return Sql(*in.operand, kComparison + 1) + (in.negated ? " NOT IN (" : " IN (") +
            List(in.list) + ")";
+  }
+  std::string operator()(const BetweenExpr& between) const {
+    return Sql(*between.operand, kComparison + 1) +
+           (between.negated ? " NOT BETWEEN " : " BETWEEN ") + Sql(*between.low, kComparison + 1) +
+           " AND " + Sql(*between.high, kComparison + 1);
   }
   std::string operator()(const FunctionCall& call) const {
     return (call.quoted ? Quote(call.name, '"') : call.name) + "(" + List(call.args) + ")";

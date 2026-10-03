@@ -55,6 +55,7 @@ enum class Feature : std::uint8_t {
   kWhereAnd,         // several comparisons joined by AND
   kLike,             // VARCHAR column [NOT] LIKE 'pattern' in WHERE
   kIn,               // column [NOT] IN (literal, ...) in WHERE
+  kBetween,          // column [NOT] BETWEEN literal AND literal in WHERE
   kLiteralFirst,     // literal <op> column
   kIntegerLiteral,   // 42
   kDecimalLiteral,   // 4.25
@@ -148,6 +149,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "literal_first";
     case Feature::kIntegerLiteral:
       return "integer_literal";
+    case Feature::kBetween:
+      return "between";
     case Feature::kDecimalLiteral:
       return "decimal_literal";
     case Feature::kNegativeLiteral:
@@ -285,6 +288,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kWhereAnd,
     Feature::kLike,
     Feature::kIn,
+    Feature::kBetween,
     Feature::kLiteralFirst,
     Feature::kIntegerLiteral,
     Feature::kDecimalLiteral,

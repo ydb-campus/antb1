@@ -245,7 +245,8 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING 1 < 2", kUnsupported, "2",
                   "comparisons between two literals are not supported"},
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING COUNT(*)", kUnsupported, "COUNT(*)",
-                  "conditions other than comparisons, [NOT] LIKE, [NOT] IN, AND, OR and NOT are "
+                  "conditions other than comparisons, [NOT] LIKE, [NOT] IN, [NOT] BETWEEN, AND, OR "
+                  "and NOT are "
                   "not supported"},
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING MIN(s) LIKE MAX(s)", kUnsupported, "MAX(s)",
                   "LIKE with a column or an aggregate as the pattern is not supported"},
@@ -326,16 +327,69 @@ INSTANTIATE_TEST_SUITE_P(
                   "conditions other than comparisons"},
         ErrorCase{"SELECT COUNT(*) FROM t WHERE i16 = 1 OR s = 1", kBind, "1",
                   "cannot compare VARCHAR column 's' with"},
-        ErrorCase{
-            "SELECT a FROM t WHERE a = CASE WHEN b THEN 1 END", kUnsupported, "b",
-            "conditions other than comparisons, [NOT] LIKE, [NOT] IN, AND, OR and NOT are not "
-            "supported"},
-        ErrorCase{
-            "SELECT a FROM t WHERE flag or b = 2", kUnsupported, "flag",
-            "conditions other than comparisons, [NOT] LIKE, [NOT] IN, AND, OR and NOT are not "
-            "supported"},
-        ErrorCase{"SELECT a FROM t WHERE 1 - 1 = a", kUnsupported, "1 - 1",
+        ErrorCase{"SELECT a FROM t WHERE a = CASE WHEN b THEN 1 END", kUnsupported, "b",
+                  "conditions other than comparisons, [NOT] LIKE, [NOT] IN, [NOT] BETWEEN, AND, OR "
+                  "and NOT are not "
+                  "supported"},
+        ErrorCase{"SELECT a FROM t WHERE flag or b = 2", kUnsupported, "flag",
+                  "conditions other than comparisons, [NOT] LIKE, [NOT] IN, [NOT] BETWEEN, AND, OR "
+                  "and NOT are not "
+                  "supported"},
+        ErrorCase{"SELECT i32 FROM t WHERE 1 // 1 = i32", kUnsupported, "1 // 1",
+                  "a constant expression in a comparison is not supported (only integer literals "
+                  "under +, - and * are folded)"},
+        ErrorCase{"SELECT i32 FROM t WHERE i32 > 2 * 1.5", kUnsupported, "2 * 1.5",
                   "a constant expression in a comparison is not supported"},
+        // Constant integer arithmetic folds in DuckDB's types; an overflow is a bind error at
+        // the operation (DuckDB raises it at execution: divergence D17).
+        ErrorCase{"SELECT i32 FROM t WHERE i32 > 2147483647 + 1", kBind, "2147483647 + 1",
+                  "Overflow in addition of INTEGER"},
+        ErrorCase{"SELECT i32 FROM t WHERE i32 BETWEEN 1 AND 3 * 1000000000", kBind,
+                  "3 * 1000000000", "Overflow in multiplication of INTEGER"},
+        ErrorCase{"SELECT i32 FROM t WHERE i32 < -(-9223372036854775807 - 1) - 1", kBind,
+                  "-(-9223372036854775807 - 1", "Overflow in negation of BIGINT"},
+        // HUGEINT constants stop at 38 digits (DuckDB's at 2^127 - 1): exit code 4, not an
+        // overflow.
+        ErrorCase{"SELECT i32 FROM t WHERE h > 99999999999999999999999999999999999999 + 1",
+                  kUnsupported, "99999999999999999999999999999999999999 + 1",
+                  "integer constants outside HUGEINT's range (38 digits) are not supported"},
+        ErrorCase{"SELECT i32 FROM t WHERE i32 > 100000000000000000000000000000000000000 - 1",
+                  kUnsupported, "100000000000000000000000000000000000000",
+                  "integer constants outside HUGEINT's range (38 digits) are not supported"},
+        // DuckDB compares a DOUBLE and a BIGINT BETWEEN all in DOUBLE, antb1 pairwise.
+        ErrorCase{"SELECT i32 FROM t WHERE i64 BETWEEN 1e0 AND 9223372036854775806", kUnsupported,
+                  "BETWEEN", "BETWEEN of a DOUBLE value and a BIGINT, HUGEINT or FLOAT value"},
+        ErrorCase{"SELECT i32 FROM t WHERE i64 NOT BETWEEN d AND 5", kUnsupported, "NOT BETWEEN",
+                  "BETWEEN of a DOUBLE value and a BIGINT, HUGEINT or FLOAT value"},
+        ErrorCase{"SELECT i32 FROM t WHERE i64 BETWEEN 1 AND d", kUnsupported, "BETWEEN",
+                  "BETWEEN of a DOUBLE value and a BIGINT, HUGEINT or FLOAT value"},
+        ErrorCase{"SELECT i32 FROM t WHERE i32 BETWEEN 1e0 AND 2147483648 * 2", kUnsupported,
+                  "BETWEEN", "BETWEEN of a DOUBLE value and a BIGINT, HUGEINT or FLOAT value"},
+        // A decimal literal against an integer value is exact on its own, rounded in DOUBLE.
+        ErrorCase{"SELECT i32 FROM t WHERE i32 BETWEEN 1.00000000000000000001 AND 1e1",
+                  kUnsupported, "BETWEEN", "a decimal literal and an integer value"},
+        ErrorCase{"SELECT i32 FROM t WHERE i32 BETWEEN 1.5 AND d", kUnsupported, "BETWEEN",
+                  "a decimal literal and an integer value"},
+        // An integer literal of 39 digits is HUGEINT or DOUBLE in DuckDB.
+        ErrorCase{"SELECT i32 FROM t WHERE i32 BETWEEN -1000000000000000000000000000000000000000 "
+                  "AND 5",
+                  kUnsupported, "BETWEEN", "BETWEEN of a DOUBLE value"},
+        ErrorCase{"SELECT i16 FROM t GROUP BY i16 HAVING SUM(i64) BETWEEN 0 AND 1e0", kUnsupported,
+                  "BETWEEN", "BETWEEN of a DOUBLE value and a BIGINT, HUGEINT or FLOAT value"},
+        // Pairwise, the string compares with both; DuckDB rejects the mix when binding.
+        ErrorCase{"SELECT i32 FROM t WHERE '2020-01-01' BETWEEN s AND dt", kBind, "BETWEEN",
+                  "Cannot mix values of type VARCHAR and DATE in BETWEEN clause"},
+        ErrorCase{"SELECT i32 FROM t WHERE '2020-01-01' NOT BETWEEN dt AND s", kBind, "NOT BETWEEN",
+                  "Cannot mix values of type VARCHAR and DATE in BETWEEN clause"},
+        // DuckDB folds every minus of a literal into it: -(-(-9223372036854775808)) is a BIGINT.
+        ErrorCase{"SELECT i32 FROM t WHERE i64 = -(-(-9223372036854775808)) - 1", kBind,
+                  "-(-(-9223372036854775808)) - 1", "Overflow in subtraction of BIGINT"},
+        ErrorCase{"SELECT i32 FROM t WHERE 1 BETWEEN 0 AND 2", kUnsupported, "0",
+                  "comparisons between two literals are not supported"},
+        ErrorCase{"SELECT i32 FROM t WHERE i32 BETWEEN i16 AND s", kBind, "BETWEEN",
+                  "cannot compare"},
+        ErrorCase{"SELECT i32 BETWEEN 1 AND 2 FROM t", kUnsupported, "BETWEEN",
+                  "BETWEEN is only supported in conditions"},
         // Arithmetic: numbers only, no DECIMAL, no DATE arithmetic, no // or % in HUGEINT.
         ErrorCase{"SELECT s + 1 FROM t", kBind, "+",
                   "arithmetic operator '+' needs numbers, but 's' is VARCHAR"},
@@ -402,36 +456,36 @@ INSTANTIATE_TEST_SUITE_P(
                   "AND is only supported in conditions (WHERE, HAVING and CASE WHEN)"},
         ErrorCase{"SELECT a FROM t WHERE 1 = 1", kUnsupported, "1",
                   "comparisons between two literals are not supported"},
-        ErrorCase{
-            "SELECT a FROM t WHERE flag", kUnsupported, "flag",
-            "conditions other than comparisons, [NOT] LIKE, [NOT] IN, AND, OR and NOT are not "
-            "supported"},
-        ErrorCase{
-            "SELECT a FROM t WHERE flag AND a = 1", kUnsupported, "flag",
-            "conditions other than comparisons, [NOT] LIKE, [NOT] IN, AND, OR and NOT are not "
-            "supported"},
-        ErrorCase{
-            "SELECT a FROM t WHERE 1 LIMIT 5", kUnsupported, "1",
-            "conditions other than comparisons, [NOT] LIKE, [NOT] IN, AND, OR and NOT are not "
-            "supported"},
-        ErrorCase{
-            "SELECT a FROM t WHERE flag GROUP BY a", kUnsupported, "flag",
-            "conditions other than comparisons, [NOT] LIKE, [NOT] IN, AND, OR and NOT are not "
-            "supported"},
+        ErrorCase{"SELECT a FROM t WHERE flag", kUnsupported, "flag",
+                  "conditions other than comparisons, [NOT] LIKE, [NOT] IN, [NOT] BETWEEN, AND, OR "
+                  "and NOT are not "
+                  "supported"},
+        ErrorCase{"SELECT a FROM t WHERE flag AND a = 1", kUnsupported, "flag",
+                  "conditions other than comparisons, [NOT] LIKE, [NOT] IN, [NOT] BETWEEN, AND, OR "
+                  "and NOT are not "
+                  "supported"},
+        ErrorCase{"SELECT a FROM t WHERE 1 LIMIT 5", kUnsupported, "1",
+                  "conditions other than comparisons, [NOT] LIKE, [NOT] IN, [NOT] BETWEEN, AND, OR "
+                  "and NOT are not "
+                  "supported"},
+        ErrorCase{"SELECT a FROM t WHERE flag GROUP BY a", kUnsupported, "flag",
+                  "conditions other than comparisons, [NOT] LIKE, [NOT] IN, [NOT] BETWEEN, AND, OR "
+                  "and NOT are not "
+                  "supported"},
         // Each kind of expression that is no condition, also under AND and OR, and what the binder
         // does not answer inside a condition's operands.
-        ErrorCase{
-            "SELECT a FROM t WHERE (flag AND a = 1) OR a = 2", kUnsupported, "flag",
-            "conditions other than comparisons, [NOT] LIKE, [NOT] IN, AND, OR and NOT are not "
-            "supported"},
-        ErrorCase{
-            "SELECT a FROM t WHERE a + 1", kUnsupported, "a + 1",
-            "conditions other than comparisons, [NOT] LIKE, [NOT] IN, AND, OR and NOT are not "
-            "supported"},
-        ErrorCase{
-            "SELECT a FROM t WHERE -a", kUnsupported, "-a",
-            "conditions other than comparisons, [NOT] LIKE, [NOT] IN, AND, OR and NOT are not "
-            "supported"},
+        ErrorCase{"SELECT a FROM t WHERE (flag AND a = 1) OR a = 2", kUnsupported, "flag",
+                  "conditions other than comparisons, [NOT] LIKE, [NOT] IN, [NOT] BETWEEN, AND, OR "
+                  "and NOT are not "
+                  "supported"},
+        ErrorCase{"SELECT a FROM t WHERE a + 1", kUnsupported, "a + 1",
+                  "conditions other than comparisons, [NOT] LIKE, [NOT] IN, [NOT] BETWEEN, AND, OR "
+                  "and NOT are not "
+                  "supported"},
+        ErrorCase{"SELECT a FROM t WHERE -a", kUnsupported, "-a",
+                  "conditions other than comparisons, [NOT] LIKE, [NOT] IN, [NOT] BETWEEN, AND, OR "
+                  "and NOT are not "
+                  "supported"},
         ErrorCase{"SELECT a FROM t WHERE strlen(url)", kUnsupported, "strlen(url)",
                   "this condition is not supported"},
         ErrorCase{"SELECT a FROM t WHERE CASE WHEN a = 1 THEN b END", kUnsupported,
@@ -1023,6 +1077,77 @@ TEST(BinderTest, WhereMovesConstantsLikeDuckDb) {
     const std::string explain = Explain(*plan);
     EXPECT_NE(explain.find(std::string(c.filter) + "\n"), std::string::npos) << sql << "\n"
                                                                              << explain;
+  }
+}
+
+// A plain BETWEEN in WHERE or HAVING splits into its two comparisons, each folded exactly (so a
+// scan filter); NOT BETWEEN, NOT (x BETWEEN ...) and BETWEEN under OR or in CASE are compound
+// conditions, named as DuckDB names them. A constant integer expression on a side folds to its
+// value.
+TEST(BinderTest, BetweenAndConstantOperands) {
+  const Catalog catalog = MakeCatalog();
+  struct Case {
+    std::string_view sql;
+    std::string_view text;  // a part of EXPLAIN
+  };
+  for (const Case& c : {
+           Case{.sql = "SELECT COUNT(*) FROM t WHERE i16 BETWEEN 1 AND 5",
+                .text = "Filter i16 >= 1 AND i16 <= 5\n"},
+           Case{.sql = "SELECT COUNT(*) FROM t WHERE i16 BETWEEN 1 AND 5 AND i32 = 2",
+                .text = "Filter i16 >= 1 AND i16 <= 5 AND i32 = 2\n"},
+           Case{.sql = "SELECT COUNT(*) FROM t WHERE (i32 = 2 AND i16 BETWEEN -1 AND 40000)",
+                .text = "Filter i32 = 2 AND i16 >= -1 AND i16 IS NOT NULL\n"},
+           Case{.sql = "SELECT COUNT(*) FROM t WHERE i16 BETWEEN 40000 AND 50000",
+                .text = "Filter FALSE"},
+           Case{.sql = "SELECT COUNT(*) FROM t WHERE dt BETWEEN DATE '2013-07-01' AND "
+                       "CAST('2013-07-31' AS DATE)",
+                .text = "Filter dt >= DATE '2013-07-01' AND dt <= DATE '2013-07-31'\n"},
+           Case{.sql = "SELECT COUNT(*) FROM t WHERE i16 + 1 BETWEEN 2 * 3 AND 10 - 1",
+                .text = "Filter i16 >= 5 AND i16 <= 8\n"},
+           // 2147483648 is a BIGINT, so the addition is in BIGINT (2147483647 + 1 overflows
+           // INTEGER).
+           Case{.sql = "SELECT COUNT(*) FROM t WHERE i64 < 2147483648 + 1",
+                .text = "Filter i64 < 2147483649\n"},
+           // DuckDB types a literal INTEGER by its magnitude: -2147483648 is a BIGINT.
+           Case{.sql = "SELECT COUNT(*) FROM t WHERE i64 > -2147483648 - 1",
+                .text = "Filter i64 > -2147483649\n"},
+           Case{.sql = "SELECT COUNT(*) FROM t WHERE i64 = -2147483648 * -1",
+                .text = "Filter i64 = 2147483648\n"},
+           // DuckDB folds the minus of a literal into it: -(-9223372036854775808) is a HUGEINT.
+           Case{.sql = "SELECT COUNT(*) FROM t WHERE i64 < -(-9223372036854775808)",
+                .text = "Filter i64 IS NOT NULL\n"},
+           Case{.sql = "SELECT COUNT(*) FROM t WHERE h = -(-(9223372036854775808))",
+                .text = "Filter h = 9223372036854775808\n"},
+           Case{.sql = "SELECT COUNT(*) FROM t WHERE h > -(-9223372036854775808) - 1",
+                .text = "Filter h > 9223372036854775807\n"},
+           // A DOUBLE operand makes both comparisons DOUBLE, as DuckDB's common type.
+           Case{.sql = "SELECT COUNT(*) FROM t WHERE d BETWEEN -9007199254740993 AND i64",
+                .text = "Filter d >= -9007199254740992 AND d <= i64\n"},
+           Case{.sql = "SELECT COUNT(*) FROM t WHERE d BETWEEN 1 AND 2147483647",
+                .text = "Filter d >= 1 AND d <= 2147483647\n"},
+           Case{.sql = "SELECT COUNT(*) FROM t WHERE -(3) * -(2) = i32",
+                .text = "Filter i32 = 6\n"},
+           Case{.sql = "SELECT COUNT(*) FROM t WHERE i32 BETWEEN i16 AND i64",
+                .text = "Filter i32 >= i16 AND i32 <= i64\n"},
+           Case{.sql = "SELECT COUNT(*) FROM t WHERE i16 NOT BETWEEN 1 AND 5",
+                .text = "Compute (NOT (i16 BETWEEN 1 AND 5))\n"},
+           Case{.sql = "SELECT COUNT(*) FROM t WHERE NOT i16 BETWEEN 1 AND 5",
+                .text = "Compute (NOT (i16 BETWEEN 1 AND 5))\n"},
+           Case{.sql = "SELECT COUNT(*) FROM t WHERE i16 BETWEEN 1 AND 5 OR i32 = 1",
+                .text = "Compute ((i16 BETWEEN 1 AND 5) OR (i32 = 1))\n"},
+           Case{.sql = "SELECT COUNT(*) FROM t WHERE i16 BETWEEN 1 AND 2 + 3 OR i32 = 1",
+                .text = "Compute ((i16 BETWEEN 1 AND (2 + 3)) OR (i32 = 1))\n"},
+           Case{.sql = "SELECT CASE WHEN i16 BETWEEN 1 AND 5 THEN 1 END FROM t",
+                .text = "CASE  WHEN ((i16 BETWEEN 1 AND 5)) THEN (1) ELSE NULL END"},
+           Case{.sql = "SELECT i16 FROM t GROUP BY i16 HAVING COUNT(*) BETWEEN 2 AND 3",
+                .text = "Filter \"count_star()\" >= 2 AND \"count_star()\" <= 3\n"},
+           Case{.sql = "SELECT i16 FROM t GROUP BY i16 HAVING COUNT(*) NOT BETWEEN 2 AND 3",
+                .text = "(NOT (count_star() BETWEEN 2 AND 3))"},
+       }) {
+    auto plan = BindSql(c.sql, catalog);
+    ASSERT_TRUE(plan.ok()) << c.sql << ": " << plan.status().ToString();
+    const std::string explain = Explain(*plan);
+    EXPECT_NE(explain.find(c.text), std::string::npos) << c.sql << "\n" << explain;
   }
 }
 
@@ -1908,7 +2033,15 @@ TEST(BinderTest, FloatColumnsByColumnId) {
     ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
     EXPECT_EQ(FilterConstants(*plan), constants) << sql;
   }
-  for (const char* sql : {"SELECT f + 1 FROM tf", "SELECT -f FROM tf"}) {
+  // Without a DOUBLE value, DuckDB compares a FLOAT BETWEEN in FLOAT as antb1 does.
+  auto between = BindSql("SELECT COUNT(*) FROM tf WHERE f BETWEEN 0.1 AND 0.1", catalog);
+  ASSERT_TRUE(between.ok()) << between.status().ToString();
+  EXPECT_EQ(FilterConstants(*between), (std::vector<double>{as_float, as_float}));
+  // With one, DuckDB compares all three in DOUBLE: unsupported.
+  for (const char* sql : {"SELECT f + 1 FROM tf", "SELECT -f FROM tf",
+                          "SELECT COUNT(*) FROM tf WHERE f BETWEEN 0.7 AND 1e0",
+                          "SELECT COUNT(*) FROM tf WHERE f BETWEEN 16777217 AND d",
+                          "SELECT COUNT(*) FROM tf WHERE f NOT BETWEEN 1 AND 1e10"}) {
     const auto plan = BindSql(sql, catalog);
     ASSERT_FALSE(plan.ok()) << sql;
     const auto detail = GetSqlError(plan.status());

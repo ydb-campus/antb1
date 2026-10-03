@@ -34,7 +34,8 @@
 //   order_item  := expr [ASC | DESC] [NULLS (FIRST | LAST)]
 //   table_ref   := identifier | quoted_identifier | string_literal
 //   expr        := precedence climbing over, from loosest to tightest: OR; AND; NOT; comparisons,
-//                  [NOT] LIKE and [NOT] IN (not chained); + -; * / // %; unary -; postfix
+//                  [NOT] LIKE, [NOT] IN and [NOT] BETWEEN (not chained); + -; * / // %; unary -;
+//                  postfix. BETWEEN's bounds are additive expressions, so it consumes its own AND.
 //   postfix     := primary ('::' type)*
 //   primary     := column_ref | literal | '(' expr ')' | agg_call | name '(' [expr (',' expr)*] ')'
 //                | CASE [expr] (WHEN expr THEN expr)+ [ELSE expr] END | EXTRACT '(' field FROM expr
@@ -142,7 +143,6 @@ constexpr auto kUnsupportedOperandKeywords = std::to_array<Construct>({
 // Keywords that continue a complete operand into an expression outside the subset. They are
 // checked before an implicit alias, so "SELECT a ISNULL FROM t" is never read as "a AS isnull".
 constexpr auto kUnsupportedOperatorKeywords = std::to_array<Construct>({
-    {.keyword = "BETWEEN", .message = "BETWEEN is not supported"},
     {.keyword = "COLLATE", .message = "COLLATE is not supported"},
     {.keyword = "ILIKE", .message = "ILIKE is not supported"},
     {.keyword = "ISNULL", .message = "ISNULL is not supported"},
@@ -594,12 +594,12 @@ class Parser {
     if (keyword == "AND") {
       return kAndPrecedence;
     }
-    if (keyword == "LIKE" || keyword == "IN") {
+    if (keyword == "LIKE" || keyword == "IN" || keyword == "BETWEEN") {
       return kComparisonPrecedence;
     }
     if (keyword == "NOT") {
       const std::string after = KeywordOf(PeekAt(1));
-      return after == "LIKE" || after == "IN" ? kComparisonPrecedence : 0;
+      return after == "LIKE" || after == "IN" || after == "BETWEEN" ? kComparisonPrecedence : 0;
     }
     return 0;
   }
@@ -673,7 +673,7 @@ class Parser {
   // The operator at the next token applied to `lhs`.
   Expected<Expr> ParseInfix(Context context, Expr lhs, int precedence) {
     const std::string keyword = KeywordOf(Peek());
-    if (keyword == "LIKE" || keyword == "IN" || keyword == "NOT") {
+    if (keyword == "LIKE" || keyword == "IN" || keyword == "BETWEEN" || keyword == "NOT") {
       const bool negated = keyword == "NOT";
       const SourceSpan first = Take().span;
       const Token op =
@@ -694,6 +694,9 @@ class Parser {
                              .op_span = op_span,
                              .span = span});
       }
+      if (op.IsKeyword("BETWEEN")) {
+        return ParseBetween(context, std::move(lhs), negated, op_span);
+      }
       return ParseInList(context, std::move(lhs), negated, op_span);
     }
     const Token op = Take();
@@ -707,6 +710,30 @@ class Parser {
                            .right = Box<Expr>(*std::move(rhs)),
                            .op_span = op.span,
                            .span = span});
+  }
+
+  // low AND high, positioned after [NOT] BETWEEN. The bounds bind tighter than comparisons (as the
+  // LIKE pattern does), so the AND is BETWEEN's own, and a conjunction may follow.
+  Expected<Expr> ParseBetween(Context context, Expr lhs, bool negated, SourceSpan op_span) {
+    auto low = ParseExpr(context, kAdditivePrecedence);
+    if (!low) {
+      return low;
+    }
+    if (!Peek().IsKeyword("AND")) {
+      return Syntax(Peek().span, "expected AND in BETWEEN, found " + Describe(Peek()));
+    }
+    Take();
+    auto high = ParseExpr(context, kAdditivePrecedence);
+    if (!high) {
+      return high;
+    }
+    const SourceSpan span = Cover(lhs.span(), high->span());
+    return Expr(BetweenExpr{.operand = Box<Expr>(std::move(lhs)),
+                            .low = Box<Expr>(*std::move(low)),
+                            .high = Box<Expr>(*std::move(high)),
+                            .negated = negated,
+                            .op_span = op_span,
+                            .span = span});
   }
 
   // IN (value, ...), positioned at '(' after [NOT] IN.
@@ -1276,7 +1303,7 @@ class Parser {
     }
     if (keyword == "NOT") {
       const std::string after = KeywordOf(PeekAt(1));
-      if (after == "LIKE" || after == "IN") {
+      if (after == "LIKE" || after == "IN" || after == "BETWEEN") {
         return std::nullopt;
       }
       if (Contains(kNegatableOperators, after)) {
