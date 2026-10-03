@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 
@@ -47,6 +48,43 @@ double ExactDivideToDouble(Int128 numerator, int64_t denominator) {
   const auto whole = static_cast<long double>(quotient);
   const long double frac = static_cast<long double>(remainder) / static_cast<long double>(den);
   return static_cast<double>(whole + frac);
+}
+
+namespace {
+
+// DuckDB's Hugeint::TryCast to a floating type (CastBigintToFloating), from the two's-complement
+// halves of the value, with its special case for a negative upper half of -1.
+template <class Real>
+Real DuckDbHugeintToReal(Int128 value) {
+  const auto bits = static_cast<UInt128>(value);
+  const auto lower = static_cast<uint64_t>(bits);
+  const auto upper = static_cast<int64_t>(static_cast<uint64_t>(bits >> 64U));
+  constexpr uint64_t kUint64Max = std::numeric_limits<uint64_t>::max();
+  if (upper == -1) {
+    return -static_cast<Real>(kUint64Max - lower) - 1;
+  }
+  return static_cast<Real>(lower) +
+         (static_cast<Real>(upper) * (static_cast<Real>(kUint64Max) + 1));
+}
+
+}  // namespace
+
+double DuckDbDecimalAverage(Int128 sum, int64_t count, int width, int scale) {
+  ANTB1_CHECK(count > 0 && scale >= 0 && scale <= 38);
+  Int128 power = 1;
+  for (int i = 0; i < scale; ++i) {
+    power *= 10;
+  }
+  // DuckDB's AverageDecimalBindData holds 10^scale as a double.
+  const auto power_of_ten = DuckDbHugeintToReal<double>(power);
+  if (width <= 4) {
+    // DuckDB sums a 16-bit DECIMAL in int64 and divides in double.
+    const double divisor = static_cast<double>(count) * power_of_ten;
+    return static_cast<double>(static_cast<int64_t>(sum)) / divisor;
+  }
+  const long double divisor =
+      static_cast<long double>(count) * static_cast<long double>(power_of_ten);
+  return static_cast<double>(DuckDbHugeintToReal<long double>(sum) / divisor);
 }
 
 }  // namespace antb1
