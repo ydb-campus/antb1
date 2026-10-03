@@ -206,7 +206,7 @@ std::string UnscaledText(const arrow::Array& array) {
   return out;
 }
 
-plan::ExprPtr Named(plan::ExprPtr expr, std::string name) {
+plan::ExprPtr Named(const plan::ExprPtr& expr, std::string name) {
   plan::Expr copy = *expr;
   copy.name = std::move(name);
   return std::make_shared<const plan::Expr>(std::move(copy));
