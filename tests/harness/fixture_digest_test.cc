@@ -113,6 +113,31 @@ TEST_F(FixtureDigest, SeesValuesNullsTypesAndRowGroups) {
   EXPECT_EQ(base.data_sha256, types.data_sha256) << "the same bytes";
 }
 
+// A decimal's digest is its unscaled value, whatever the physical storage (INT32 or FLBA); a change
+// in either 64-bit half is seen.
+TEST_F(FixtureDigest, HashesDecimalsByValue) {
+  const auto make = [](const arrow::Decimal128& last) {
+    arrow::Decimal128Builder builder(arrow::decimal128(9, 2));
+    EXPECT_TRUE(builder.Append(arrow::Decimal128(-12345)).ok());
+    EXPECT_TRUE(builder.AppendNull().ok());
+    EXPECT_TRUE(builder.Append(last).ok());
+    auto schema = arrow::schema({arrow::field("d", arrow::decimal128(9, 2))});
+    return arrow::Table::Make(schema, {builder.Finish().ValueOrDie()});
+  };
+  const auto as_integer = parquet::WriterProperties::Builder()
+                              .enable_store_decimal_as_integer()
+                              ->compression(parquet::Compression::SNAPPY)
+                              ->build();
+  const FileDigest flba = Write("flba.parquet", *make(arrow::Decimal128(999)), 10, Snappy());
+  const FileDigest int32 = Write("int32.parquet", *make(arrow::Decimal128(999)), 10, as_integer);
+  const FileDigest low = Write("low.parquet", *make(arrow::Decimal128(998)), 10, Snappy());
+  const FileDigest negative = Write("neg.parquet", *make(arrow::Decimal128(-999)), 10, Snappy());
+  EXPECT_NE(flba.schema_sha256, int32.schema_sha256) << "FIXED_LEN_BYTE_ARRAY vs INT32";
+  EXPECT_EQ(flba.data_sha256, int32.data_sha256);
+  EXPECT_NE(flba.data_sha256, low.data_sha256);
+  EXPECT_NE(flba.data_sha256, negative.data_sha256);
+}
+
 TEST_F(FixtureDigest, ComparesDigestTexts) {
   const FileDigest a = Write("a.parquet", *MakeTable(), 40, Snappy());
   FileDigest changed = a;
