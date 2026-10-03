@@ -61,6 +61,28 @@ arrow::Result<ArrayPtr> CastTo(const ArrayPtr& values, const std::shared_ptr<arr
   if (values->type()->Equals(*type)) {
     return values;
   }
+  // A DECIMAL (or HUGEINT) to DOUBLE converts as DuckDB converts it (ADR 0021 rule 8), which is
+  // not Arrow's cast.
+  if (values->type_id() == arrow::Type::DECIMAL128 && type->id() == arrow::Type::DOUBLE) {
+    const auto& decimals = static_cast<const arrow::Decimal128Array&>(*values);
+    const auto& decimal_type = static_cast<const arrow::Decimal128Type&>(*values->type());
+    arrow::DoubleBuilder builder(ctx != nullptr ? ctx->memory_pool() : arrow::default_memory_pool());
+    ARROW_RETURN_NOT_OK(builder.Reserve(decimals.length()));
+    for (int64_t i = 0; i < decimals.length(); ++i) {
+      if (decimals.IsNull(i)) {
+        builder.UnsafeAppendNull();
+      } else {
+        const arrow::Decimal128 d(decimals.GetValue(i));
+        const auto bits =
+            (static_cast<UInt128>(static_cast<uint64_t>(d.high_bits())) << 64U) | d.low_bits();
+        builder.UnsafeAppend(DuckDbDecimalToDouble(static_cast<Int128>(bits),
+                                                   decimal_type.precision(), decimal_type.scale()));
+      }
+    }
+    std::shared_ptr<arrow::Array> out;
+    ARROW_RETURN_NOT_OK(builder.Finish(&out));
+    return out;
+  }
   // Integer casts only widen, or narrow a constant that fits; to DOUBLE a BIGINT beyond 2^53
   // rounds to the nearest double, as in DuckDB.
   arrow::compute::CastOptions options = arrow::compute::CastOptions::Safe();
@@ -298,10 +320,10 @@ arrow::Status DecimalOverflow(plan::ArithOp op, Int128 x, Int128 y, plan::Logica
                                        hint);
 }
 
-// `left <op> right` in the DECIMAL `result`, the operands already rescaled for + and - (the caller
-// computes and rescales the left operand before it computes the right one, as DuckDB does), * over
-// the unscaled values (the scales add up); every result must fit the result's width (only a width
-// capped to 18 or 38 can overflow).
+// `left <op> right` in the DECIMAL `result`, the operands already rescaled for +, - and % (the
+// caller computes and rescales the left operand before it computes the right one, as DuckDB does),
+// * over the unscaled values (the scales add up); every result must fit the result's width (only a
+// width capped to 18 or 38 can overflow; % never does).
 arrow::Result<ArrayPtr> DecimalArith(const DecimalOperand& left, const DecimalOperand& right,
                                      plan::ArithOp op, plan::LogicalType result,
                                      arrow::MemoryPool* pool) {
@@ -325,9 +347,20 @@ arrow::Result<ArrayPtr> DecimalArith(const DecimalOperand& left, const DecimalOp
       case plan::ArithOp::kSubtract:
         overflow = __builtin_sub_overflow(x, y, &value);
         break;
-      default:
+      case plan::ArithOp::kMultiply:
         overflow = __builtin_mul_overflow(x, y, &value);
         break;
+      case plan::ArithOp::kModulo:
+        // The dividend's sign, NULL for a zero divisor (rule 9); |value| < |y| always fits.
+        if (y == 0) {
+          builder.UnsafeAppendNull();
+          continue;
+        }
+        value = x % y;
+        break;
+      default:
+        return arrow::Status::Invalid("DECIMAL arithmetic has no operator ",
+                                      static_cast<int>(op));
     }
     if (overflow || value < range.min || value > range.max) {
       return DecimalOverflow(op, x, y, result);
@@ -835,8 +868,8 @@ struct Evaluator {
 
   arrow::Result<ArrayPtr> Evaluate(const plan::ArithExpr& arith, const plan::Expr& e) const {
     if (e.type == plan::LogicalType::kDecimal) {
-      // Each operand in its own type (DECIMAL(38,0) and HUGEINT share an Arrow type); for + and -
-      // the left one is computed and rescaled before the right one is computed, as in DuckDB.
+      // Each operand in its own type (DECIMAL(38,0) and HUGEINT share an Arrow type); for +, - and
+      // % the left one is computed and rescaled before the right one is computed, as in DuckDB.
       const auto operand = [&](const plan::Expr& expr) -> arrow::Result<DecimalOperand> {
         ARROW_ASSIGN_OR_RAISE(ArrayPtr values, (*this)(expr));
         const std::string column =

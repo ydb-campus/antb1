@@ -354,6 +354,52 @@ TEST_F(ComputeTest, DecimalOperandsInDuckDbOrder) {
                   .starts_with("Overflow in multiplication of DECIMAL(18)"));
 }
 
+// / and // of a DECIMAL are DOUBLE (ADR 0021 rule 8): the DECIMAL converts as DuckDB converts it
+// (beyond 2^53 div + mod / 10^s, not the nearest double), / follows IEEE and // is NULL for a zero
+// divisor. % computes in the common DECIMAL (rule 9): the operands rescaled to its scale, the
+// dividend's sign, NULL for a zero divisor.
+TEST_F(ComputeTest, DecimalDivisionAndModulo) {
+  const LogicalType p = LogicalType::Decimal(15, 2);
+  const auto price = Decimals(p, {"1700", "-25", std::nullopt, "0", "-725"});
+  const auto divisor = Int64s({3, 0, 1, 0, 2});
+  auto divided = Eval(Arith(ArithOp::kDivide, ColumnAt(0, p), ColumnAt(1, LogicalType::kBigInt),
+                            LogicalType::kDouble),
+                      {price, divisor});
+  ASSERT_TRUE(divided.ok()) << divided.status().ToString();
+  const auto& d = static_cast<const arrow::DoubleArray&>(**divided);
+  EXPECT_EQ(d.Value(0), 17.0 / 3);
+  EXPECT_TRUE(std::isinf(d.Value(1)) && d.Value(1) < 0);
+  EXPECT_TRUE(d.IsNull(2));
+  EXPECT_TRUE(std::isnan(d.Value(3)));
+  EXPECT_EQ(d.Value(4), -3.625);
+  auto quotient = Eval(Arith(ArithOp::kIntegerDivide, ColumnAt(0, p),
+                             ColumnAt(1, LogicalType::kBigInt), LogicalType::kDouble),
+                       {price, divisor});
+  ASSERT_TRUE(quotient.ok()) << quotient.status().ToString();
+  EXPECT_EQ((*quotient)->ToString(),
+            "[\n  5.666666666666667,\n  null,\n  null,\n  null,\n  -3.625\n]");
+  // DuckDB's conversion, not the nearest double (1.99489722791017e+16).
+  const LogicalType wide = LogicalType::Decimal(18, 1);
+  auto converted = Eval(Arith(ArithOp::kDivide, ColumnAt(0, wide),
+                              ConstantOf(1, LogicalType::kInteger), LogicalType::kDouble),
+                        {Decimals(wide, {"199489722791016982"})});
+  ASSERT_TRUE(converted.ok()) << converted.status().ToString();
+  EXPECT_EQ(static_cast<const arrow::DoubleArray&>(**converted).Value(0), 1.9948972279101696e+16);
+  // p % 2 is DECIMAL(15,2): 17.00 % 2, -0.25 % 0 (NULL), NULL, 0.00 % 0 (NULL), -7.25 % 2.
+  auto remainder = Eval(Arith(ArithOp::kModulo, ColumnAt(0, p), ColumnAt(1, LogicalType::kBigInt),
+                              LogicalType::Decimal(21, 2)),
+                        {price, divisor});
+  ASSERT_TRUE(remainder.ok()) << remainder.status().ToString();
+  EXPECT_EQ(UnscaledText(**remainder), "decimal128(21, 2): 200 null null null -125");
+  // Scales differ: 17.00 % 0.0005 and -0.25 % -0.0003 in DECIMAL(17,4) (p % r).
+  const LogicalType r = LogicalType::Decimal(9, 4);
+  auto mixed =
+      Eval(Arith(ArithOp::kModulo, ColumnAt(0, p), ColumnAt(1, r), LogicalType::Decimal(17, 4)),
+           {Decimals(p, {"1700", "-25"}), Decimals(r, {"5", "-3"})});
+  ASSERT_TRUE(mixed.ok()) << mixed.status().ToString();
+  EXPECT_EQ(UnscaledText(**mixed), "decimal128(17, 4): 0 -1");
+}
+
 // A Compute appends its columns to the selected rows only: a row a filter dropped is never
 // computed, so it cannot overflow.
 TEST_F(ComputeTest, ComputesOnlyTheSelectedRows) {

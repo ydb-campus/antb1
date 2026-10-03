@@ -39,6 +39,16 @@ std::optional<double> ParseDoubleLiteral(std::string_view text, bool negative);
 // digits, DECIMAL's maximum width (leading zeros count, as in DuckDB).
 bool IsApproximateNumber(std::string_view text);
 
+// A decimal literal as DuckDB types it (ADR 0021 rule 3): a number with a point, no exponent and at
+// most 38 digits is DECIMAL(digits, digits after the point), leading zeros included and the sign
+// not ("007.50" is DECIMAL(5,2) with the unscaled value 750, "5." DECIMAL(1,0)). std::nullopt for
+// any other number. `text` is written without its sign.
+struct DecimalLiteral {
+  LogicalType type;
+  Int128 unscaled = 0;
+};
+std::optional<DecimalLiteral> ParseDecimalLiteral(std::string_view text, bool negative);
+
 // The FLOAT that DuckDB (1.5.5) turns a numeric literal into when it compares the literal with a
 // FLOAT column, or std::nullopt when DuckDB types the literal as DOUBLE (compared in DOUBLE, as
 // antb1 does for every DOUBLE column). DuckDB types an integer by value (INTEGER, BIGINT, HUGEINT

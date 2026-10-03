@@ -404,5 +404,46 @@ TEST(DuckDbFloatOf, DoubleLiteralsAreNotConverted) {
   EXPECT_FALSE(DuckDbFloatOf("abc", false).has_value());
 }
 
+// DuckDB 1.5.5's types of decimal literals (typeof): every digit counts, leading zeros too, and
+// the sign does not; an exponent, more than 38 digits or no point is not a DECIMAL literal.
+TEST(ParseDecimalLiteral, TypesLikeDuckDb) {
+  struct Case {
+    std::string_view text;
+    bool negative;
+    int width;
+    int scale;
+    std::string_view unscaled;
+  };
+  for (const Case& c : {
+           Case{.text = "2.5", .negative = false, .width = 2, .scale = 1, .unscaled = "25"},
+           Case{.text = ".125", .negative = false, .width = 3, .scale = 3, .unscaled = "125"},
+           Case{.text = "007.50", .negative = false, .width = 5, .scale = 2, .unscaled = "750"},
+           Case{.text = "5.", .negative = false, .width = 1, .scale = 0, .unscaled = "5"},
+           Case{.text = "0.5", .negative = true, .width = 2, .scale = 1, .unscaled = "-5"},
+           Case{.text = "0.0", .negative = true, .width = 2, .scale = 1, .unscaled = "0"},
+           Case{.text = "1234567890123456789012345678901234567.8",
+                .negative = true,
+                .width = 38,
+                .scale = 1,
+                .unscaled = "-12345678901234567890123456789012345678"},
+           Case{.text = ".00000000000000000000000000000000000001",
+                .negative = false,
+                .width = 38,
+                .scale = 38,
+                .unscaled = "1"},
+       }) {
+    const auto decimal = ParseDecimalLiteral(c.text, c.negative);
+    ASSERT_TRUE(decimal.has_value()) << c.text;
+    EXPECT_EQ(decimal->type, LogicalType::Decimal(static_cast<std::uint8_t>(c.width),
+                                                  static_cast<std::uint8_t>(c.scale)))
+        << c.text;
+    EXPECT_EQ(Int128ToString(decimal->unscaled), c.unscaled) << c.text;
+  }
+  EXPECT_FALSE(ParseDecimalLiteral("25", false).has_value());
+  EXPECT_FALSE(ParseDecimalLiteral("2.5e0", false).has_value());
+  EXPECT_FALSE(ParseDecimalLiteral("12345678901234567890123456789012345678.5", false).has_value());
+  EXPECT_FALSE(ParseDecimalLiteral("1.2.3", false).has_value());
+}
+
 }  // namespace
 }  // namespace antb1::plan

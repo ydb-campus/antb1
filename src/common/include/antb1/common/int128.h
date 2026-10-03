@@ -46,4 +46,17 @@ double ExactDivideToDouble(Int128 numerator, int64_t denominator);
 // double is the platform's, as in DuckDB's own build.
 double DuckDbDecimalAverage(Int128 sum, int64_t count, int width, int scale);
 
+// DuckDB's cast of a HUGEINT to DOUBLE (Hugeint::TryCast, CastBigintToFloating): lower + upper *
+// 2^64 from the two's-complement halves, with its special case for an upper half of -1.
+double DuckDbHugeintToDouble(Int128 value);
+
+// DuckDB's cast of a DECIMAL(width, scale) with the unscaled value `unscaled` to DOUBLE or FLOAT
+// (TryCastDecimalToFloatingPoint, ADR 0021 rule 8): the storage integer (int64 up to 18 digits,
+// else the 128-bit formula above) divided by 10^scale when the width is at most 4, the scale 0 or
+// |unscaled| at most 2^53 (2^24 for FLOAT); otherwise (unscaled div 10^scale) + (unscaled mod
+// 10^scale) / 10^scale, truncating toward zero, each part converted on its own. Not always
+// correctly rounded.
+double DuckDbDecimalToDouble(Int128 unscaled, int width, int scale);
+float DuckDbDecimalToFloat(Int128 unscaled, int width, int scale);
+
 }  // namespace antb1

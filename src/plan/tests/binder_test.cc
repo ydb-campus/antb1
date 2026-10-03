@@ -73,7 +73,8 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT COUNT(*) FROM t WHERE dt IN (DATE '2013-02-30')", kBind,
                   "DATE '2013-02-30'", "invalid date"},
         // Constants and positions.
-        ErrorCase{"SELECT 2.5 FROM t", kUnsupported, "2.5", "decimal constants are not supported"},
+        ErrorCase{"SELECT 1e3 FROM t", kUnsupported, "1e3",
+                  "a number with an exponent or more than 38 digits as a constant"},
         ErrorCase{"SELECT 100000000000000000000000000000000000000 FROM t", kUnsupported,
                   "100000000000000000000000000000000000000", "outside HUGEINT's range"},
         ErrorCase{"SELECT DATE '2020-02-30' FROM t", kBind, "DATE '2020-02-30'", "invalid date"},
@@ -316,7 +317,7 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT CASE WHEN i16 = 1 THEN '1' ELSE i16 END FROM t", kUnsupported, "'1'",
                   "a string literal as a CASE value next to SMALLINT values is not supported"},
         ErrorCase{"SELECT CASE WHEN i16 = 1 THEN i16 ELSE 1.5 END FROM t", kUnsupported, "1.5",
-                  "a decimal literal as a CASE value is not supported"},
+                  "a decimal literal as a CASE value is supported only next to a DOUBLE value"},
         ErrorCase{"SELECT CASE WHEN i16 = 1 THEN s = 'a' END FROM t", kUnsupported, "=",
                   "comparisons are only supported in conditions"},
         ErrorCase{"SELECT CASE WHEN 1 = 1 THEN i16 END FROM t", kUnsupported, "1",
@@ -394,23 +395,16 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT s + 1 FROM t", kBind, "+",
                   "arithmetic operator '+' needs numbers, but 's' is VARCHAR"},
         ErrorCase{"SELECT -s FROM t", kBind, "-", "needs a number, but 's' is VARCHAR"},
-        ErrorCase{"SELECT i16 * 1.5 FROM t", kUnsupported, "*", "DECIMAL"},
         ErrorCase{"SELECT dt + 1 FROM t", kUnsupported, "+", "DATE arithmetic"},
         ErrorCase{"SELECT -u16 FROM t", kUnsupported, "-", "negating a USMALLINT is not supported"},
         ErrorCase{"SELECT SUM(i64) % 2 FROM t", kUnsupported, "%", "'%' in HUGEINT"},
         // DECIMAL (ADR 0021): only comparisons with literals and same-type DECIMALs, keys, MIN,
         // MAX and COUNT; every other context is unsupported until D3 and D4.
-        // DECIMAL: / // %, decimal literals and DOUBLE operands in arithmetic wait for D4.
-        ErrorCase{"SELECT h % 2 FROM t", kUnsupported, "%",
-                  "'%' of a DECIMAL ('h' is DECIMAL(38,0)) is not supported"},
-        ErrorCase{"SELECT p / 2 FROM dec", kUnsupported, "/", "'/' of a DECIMAL"},
-        ErrorCase{"SELECT i // p FROM dec", kUnsupported, "//", "'//' of a DECIMAL ('p' is"},
-        ErrorCase{"SELECT p + 1.5 FROM dec", kUnsupported, "+",
-                  "arithmetic of a DECIMAL with a decimal literal"},
-        ErrorCase{"SELECT p * 1e0 FROM dec", kUnsupported, "*",
-                  "arithmetic of a DECIMAL with a DOUBLE ('1e0' is DOUBLE)"},
-        ErrorCase{"SELECT -(p * q) - 1.5 FROM dec", kUnsupported, "-",
-                  "arithmetic of a DECIMAL with a decimal literal"},
+        // DECIMAL %: DuckDB computes it in DOUBLE beyond 38 digits (D4b).
+        ErrorCase{"SELECT h % 0.5 FROM t", kUnsupported, "%",
+                  "'%' of DECIMAL(38,0) and DECIMAL(2,1) is not supported"},
+        ErrorCase{"SELECT SUM(i64) % 2.5 FROM t", kUnsupported, "%",
+                  "'%' of DECIMAL(38,0) and DECIMAL(2,1) is not supported"},
         ErrorCase{"SELECT p + 'x' FROM dec", kBind, "+", "needs numbers"},
         ErrorCase{"SELECT z * z * z * z FROM dec", kBind, "*",
                   "Needed scale 40 to accurately represent the multiplication result"},
@@ -1029,6 +1023,68 @@ TEST(BinderTest, DecimalArithmeticTypesLikeDuckDb) {
     ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
     ASSERT_EQ(plan->output.size(), 1U);
     EXPECT_EQ(plan->output[0].type, c.type) << sql << ": " << ToString(plan->output[0].type);
+  }
+}
+
+// Decimal literals, / // % and DOUBLE operands as DuckDB types them (ADR 0021 rules 3, 8 and 9,
+// each probed with DuckDB 1.5.5): a decimal literal is DECIMAL(digits, fraction digits), leading
+// zeros included, and named by its value; / and // with a DECIMAL are DOUBLE, as is anything with a
+// DOUBLE; % takes the common type without a cap to 18 digits.
+TEST(BinderTest, DecimalLiteralsAndDivisionTypesLikeDuckDb) {
+  const Catalog catalog = MakeCatalog();
+  struct Case {
+    std::string_view expr;
+    LogicalType type;
+    std::string_view name;
+  };
+  const auto dec = [](int width, int scale) {
+    return LogicalType::Decimal(static_cast<std::uint8_t>(width), static_cast<std::uint8_t>(scale));
+  };
+  for (const Case& c : {
+           Case{.expr = "2.5", .type = dec(2, 1), .name = "2.5"},
+           Case{.expr = ".125", .type = dec(3, 3), .name = ".125"},
+           Case{.expr = "007.50", .type = dec(5, 2), .name = "7.50"},
+           Case{.expr = "5.", .type = dec(1, 0), .name = "5"},
+           Case{.expr = "-0.5", .type = dec(2, 1), .name = "-0.5"},
+           Case{.expr = "12345678901234567890123456789012345678.5 + 0",
+                .type = LogicalType::kDouble,
+                .name = "(12345678901234567890123456789012345678.5 + 0)"},
+           Case{.expr = "i + 1.5", .type = dec(12, 1), .name = "(i + 1.5)"},
+           Case{.expr = "s16 + 1.5", .type = dec(7, 1), .name = "(s16 + 1.5)"},
+           Case{.expr = "i - 2.25", .type = dec(13, 2), .name = "(i - 2.25)"},
+           Case{.expr = "b * 1.5", .type = dec(21, 1), .name = "(b * 1.5)"},
+           Case{.expr = "1.5 + 2", .type = dec(12, 1), .name = "(1.5 + 2)"},
+           Case{.expr = "1.5 * 2.25", .type = dec(5, 3), .name = "(1.5 * 2.25)"},
+           Case{.expr = "-(1.5)", .type = dec(2, 1), .name = "-(1.5)"},
+           Case{.expr = "p + 0.5", .type = dec(16, 2), .name = "(p + 0.5)"},
+           Case{.expr = "p * 1.5", .type = dec(17, 3), .name = "(p * 1.5)"},
+           Case{.expr = "e + 0.00005", .type = dec(18, 8), .name = "(e + 0.00005)"},
+           Case{.expr = "p - 007.50", .type = dec(16, 2), .name = "(p - 7.50)"},
+           Case{.expr = "SUM(i) + 1.5", .type = dec(38, 1), .name = "(sum(i) + 1.5)"},
+           Case{.expr = "p / 2", .type = LogicalType::kDouble, .name = "(p / 2)"},
+           Case{.expr = "p // 2", .type = LogicalType::kDouble, .name = "(p // 2)"},
+           Case{.expr = "i // 1.5", .type = LogicalType::kDouble, .name = "(i // 1.5)"},
+           Case{.expr = "i / 1.5", .type = LogicalType::kDouble, .name = "(i / 1.5)"},
+           Case{.expr = "p // r", .type = LogicalType::kDouble, .name = "(p // r)"},
+           Case{.expr = "p + f", .type = LogicalType::kDouble, .name = "(p + f)"},
+           Case{.expr = "p * f", .type = LogicalType::kDouble, .name = "(p * f)"},
+           Case{.expr = "f % p", .type = LogicalType::kDouble, .name = "(f % p)"},
+           Case{.expr = "f + 1.5", .type = LogicalType::kDouble, .name = "(f + 1.5)"},
+           Case{.expr = "p % 7", .type = dec(15, 2), .name = "(p % 7)"},
+           Case{.expr = "p % q", .type = dec(15, 2), .name = "(p % q)"},
+           Case{.expr = "p % r", .type = dec(17, 4), .name = "(p % r)"},
+           Case{.expr = "e % g", .type = dec(20, 10), .name = "(e % g)"},
+           Case{.expr = "i % 2.5", .type = dec(11, 1), .name = "(i % 2.5)"},
+           Case{.expr = "b % 2.5", .type = dec(20, 1), .name = "(b % 2.5)"},
+           Case{.expr = "z % 7", .type = dec(38, 10), .name = "(z % 7)"},
+           Case{.expr = "7 % 2.5", .type = dec(11, 1), .name = "(7 % 2.5)"},
+       }) {
+    const std::string sql = "SELECT " + std::string(c.expr) + " FROM dec";
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    ASSERT_EQ(plan->output.size(), 1U);
+    EXPECT_EQ(plan->output[0].type, c.type) << sql << ": " << ToString(plan->output[0].type);
+    EXPECT_EQ(plan->output[0].name, c.name) << sql;
   }
 }
 
@@ -2002,6 +2058,12 @@ TEST(BinderTest, NonIntegerConstants) {
   EXPECT_EQ(real("d > 1e3"), 1000.0);
   EXPECT_EQ(real("d < 9007199254740993"), 9007199254740992.0);
   EXPECT_EQ(real("d < 0.1"), 0.1);
+  // A decimal literal is DuckDB's DECIMAL, converted as DuckDB converts one (ADR 0021 rule 8),
+  // which is not always the nearest double (that is 9007199254740994 here): div + mod / 10^scale
+  // beyond 2^53, at most 18 digits and beyond (values from DuckDB 1.5.5).
+  EXPECT_EQ(real("d = 9007199254740993.5"), 9007199254740992.0);
+  EXPECT_EQ(real("d < 19948972279101698.2"), 1.9948972279101696e+16);
+  EXPECT_EQ(real("d >= 60719098953061412.540"), 6.071909895306141e+16);
   EXPECT_EQ(real("d < 1e400"), std::numeric_limits<double>::infinity());
   EXPECT_EQ(real("d > -1e400"), -std::numeric_limits<double>::infinity());
   EXPECT_EQ(real("d > 1e-400"), 0.0);
