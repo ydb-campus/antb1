@@ -77,6 +77,45 @@ std::expected<std::string, std::string> ReadFile(const std::string& path) {
   return text;
 }
 
+// An error unless `numbers` (of the q<nn>.sql files of `dir`) are 1, 2, 3, ... without gaps.
+std::expected<void, std::string> CheckNumbering(const fs::path& dir,
+                                                const std::vector<int>& numbers) {
+  if (numbers.empty()) {
+    return std::unexpected(
+        std::format("no queries ({}, ...) in '{}'", FileName(1, ".sql"), dir.string()));
+  }
+  int expected = 0;
+  for (const int n : numbers) {
+    if (n != ++expected) {
+      return std::unexpected(
+          std::format("'{}' is missing: the queries are numbered from 1 without gaps",
+                      (dir / FileName(expected, ".sql")).string()));
+    }
+  }
+  return {};
+}
+
+// The one statement of a query file. A parse error may quote the file (an unknown feature
+// name): with `redact` the error names the file only.
+std::expected<Statement, std::string> ReadQuery(const std::string& path, bool redact) {
+  auto text = ReadFile(path);
+  if (!text.has_value()) {
+    return std::unexpected(text.error());
+  }
+  auto statements = ParseSqlFile(path, *text);
+  if (!statements.has_value()) {
+    return std::unexpected(redact ? std::format("'{}': not a query file (runner/query_file.h); "
+                                                "run with --show-values locally to see why",
+                                                path)
+                                  : statements.error());
+  }
+  if (statements->size() != 1) {
+    return std::unexpected(
+        std::format("'{}': {} statements, expected one", path, statements->size()));
+  }
+  return std::move(statements->front());
+}
+
 // The fields of one line of answer text: '|' separated, an empty field is NULL.
 std::vector<std::optional<std::string>> Fields(std::string_view line) {
   std::vector<std::optional<std::string>> fields;
@@ -135,17 +174,8 @@ std::expected<std::vector<AnswerQuery>, std::string> LoadAnswerQueries(const fs:
   if (!answers.has_value()) {
     return std::unexpected(answers.error());
   }
-  if (queries->empty()) {
-    return std::unexpected(
-        std::format("no queries ({}, ...) in '{}'", FileName(1, ".sql"), queries_dir.string()));
-  }
-  int expected = 0;
-  for (const int n : *queries) {
-    if (n != ++expected) {
-      return std::unexpected(
-          std::format("'{}' is missing: the queries are numbered from 1 without gaps",
-                      (queries_dir / FileName(expected, ".sql")).string()));
-    }
+  if (auto numbered = CheckNumbering(queries_dir, *queries); !numbered.has_value()) {
+    return std::unexpected(numbered.error());
   }
   for (const int n : *answers) {
     if (!std::ranges::binary_search(*queries, n)) {
@@ -165,30 +195,37 @@ std::expected<std::vector<AnswerQuery>, std::string> LoadAnswerQueries(const fs:
       return std::unexpected(
           std::format("no answer '{}' for the query '{}'", q.answer_path, q.query_path));
     }
-    auto text = ReadFile(q.query_path);
-    if (!text.has_value()) {
-      return std::unexpected(text.error());
+    auto statement = ReadQuery(q.query_path, redact);
+    if (!statement.has_value()) {
+      return std::unexpected(statement.error());
     }
-    auto statements = ParseSqlFile(q.query_path, *text);
-    if (!statements.has_value()) {
-      // A parse error may quote the file (an unknown feature name).
-      return std::unexpected(
-          redact ? std::format("'{}': not a query file (runner/query_file.h); run with "
-                               "--show-values locally to see why",
-                               q.query_path)
-                 : statements.error());
-    }
-    if (statements->size() != 1) {
-      return std::unexpected(
-          std::format("'{}': {} statements, expected one", q.query_path, statements->size()));
-    }
-    q.statement = std::move(statements->front());
+    q.statement = *std::move(statement);
     auto answer = ReadFile(q.answer_path);
     if (!answer.has_value()) {
       return std::unexpected(answer.error());
     }
     q.answer = *std::move(answer);
     out.push_back(std::move(q));
+  }
+  return out;
+}
+
+std::expected<std::vector<Statement>, std::string> LoadNumberedQueries(const fs::path& dir,
+                                                                       bool redact) {
+  const auto numbers = ListNumbered(dir, ".sql");
+  if (!numbers.has_value()) {
+    return std::unexpected(numbers.error());
+  }
+  if (auto numbered = CheckNumbering(dir, *numbers); !numbered.has_value()) {
+    return std::unexpected(numbered.error());
+  }
+  std::vector<Statement> out;
+  for (const int n : *numbers) {
+    auto statement = ReadQuery((dir / FileName(n, ".sql")).string(), redact);
+    if (!statement.has_value()) {
+      return std::unexpected(statement.error());
+    }
+    out.push_back(*std::move(statement));
   }
   return out;
 }
