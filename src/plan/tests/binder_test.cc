@@ -414,6 +414,8 @@ INSTANTIATE_TEST_SUITE_P(
                   "with a number with an exponent or more than 38 digits"},
         ErrorCase{"SELECT COUNT(*) FROM dec WHERE p IN (2e0, 1)", kUnsupported, "2e0",
                   "with a number with an exponent or more than 38 digits"},
+        ErrorCase{"SELECT COUNT(*) FROM dec WHERE p NOT IN (1, 2, 2e0)", kUnsupported, "2e0",
+                  "with a number with an exponent or more than 38 digits"},
         ErrorCase{"SELECT COUNT(*) FROM dec WHERE p < 100000000000000000000000000000000000000",
                   kUnsupported, "100000000000000000000000000000000000000",
                   "with a number with an exponent or more than 38 digits"},

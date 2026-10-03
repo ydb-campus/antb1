@@ -171,6 +171,38 @@ TEST(QueryGenerator, QueriesRespectTheSemanticsBothEnginesShare) {
   }
 }
 
+// A DECIMAL of 38 digits with few integer digits: no literal (a BETWEEN bound included) has more
+// integer digits than p - s, which would leave DuckDB's 38-digit common type (divergence D13).
+TEST(QueryGenerator, DecimalLiteralsStayWithinTheColumnsDigits) {
+  GenTable t{.name = "t", .path = {}, .rows = 10, .columns = {}};
+  t.columns = {{.name = "n",
+                .kind = ValueKind::kDecimal,
+                .samples = {"99999999." + std::string(30, '0'), "-1.5" + std::string(29, '0')},
+                .precision = 38,
+                .scale = 30}};
+  auto gen = QueryGenerator::Make({t}, 5, {.supported = kSupportedFeatures, .target_percent = 0});
+  ASSERT_TRUE(gen.has_value()) << gen.error();
+  static const std::regex kNumber(R"re([0-9]+(\.[0-9]+)?)re");
+  int betweens = 0;
+  for (uint64_t i = 0; i < 3000; ++i) {
+    const std::string sql = Lower(gen->Generate(i).sql);
+    betweens += sql.contains("between") ? 1 : 0;
+    // Layout comments hold no digits; the table and column names none either.
+    for (auto it = std::sregex_iterator(sql.begin(), sql.end(), kNumber);
+         it != std::sregex_iterator(); ++it) {
+      const std::string number = it->str();
+      const std::size_t integer_digits =
+          number.find('.') == std::string::npos ? number.size() : number.find('.');
+      // LIMIT and OFFSET counts and select positions are small, the select constant 3000000000 is
+      // no literal of n; every literal of n has at most 8 integer digits.
+      if (number != "3000000000") {
+        EXPECT_LE(integer_digits, 8U) << sql;
+      }
+    }
+  }
+  EXPECT_GT(betweens, 10);
+}
+
 TEST(QueryGenerator, MakeRejectsWhatCannotBeGenerated) {
   EXPECT_FALSE(QueryGenerator::Make({}, 1, {}).has_value());
   EXPECT_FALSE(QueryGenerator::Make(Tables(), 1, {.supported = {Feature::kCountStar}}).has_value())

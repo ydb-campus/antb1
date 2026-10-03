@@ -1197,9 +1197,9 @@ arrow::Result<Predicate> BindEquality(const sql::Comparison& cmp, const BoundCol
       if (!number) {
         return mismatch("write a number without quotes");
       }
+      // Not `as_double`: in an IN list each approximate value fails here itself, at its own span.
       const auto unshifted = ParseExactNumber(lit.text, lit.negative);
-      if (as_double || IsApproximateNumber(lit.text) ||
-          (unshifted.has_value() && unshifted->huge)) {
+      if (IsApproximateNumber(lit.text) || (unshifted.has_value() && unshifted->huge)) {
         // DuckDB compares in DOUBLE (an exponent, a decimal of more than 38 digits) or in a capped
         // DECIMAL (an integer of 39 digits, a HUGEINT) then (ADR 0021 rule 11), not supported yet.
         return UnsupportedError(std::format("comparing the {} column '{}' with a number with an "
