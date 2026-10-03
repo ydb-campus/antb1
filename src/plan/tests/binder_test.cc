@@ -348,6 +348,34 @@ INSTANTIATE_TEST_SUITE_P(
                   "3 * 1000000000", "Overflow in multiplication of INTEGER"},
         ErrorCase{"SELECT i32 FROM t WHERE i32 < -(-9223372036854775807 - 1) - 1", kBind,
                   "-(-9223372036854775807 - 1", "Overflow in negation of BIGINT"},
+        // HUGEINT constants stop at 38 digits (DuckDB's at 2^127 - 1): exit code 4, not an
+        // overflow.
+        ErrorCase{"SELECT i32 FROM t WHERE h > 99999999999999999999999999999999999999 + 1",
+                  kUnsupported, "99999999999999999999999999999999999999 + 1",
+                  "integer constants outside HUGEINT's range (38 digits) are not supported"},
+        ErrorCase{"SELECT i32 FROM t WHERE i32 > 100000000000000000000000000000000000000 - 1",
+                  kUnsupported, "100000000000000000000000000000000000000",
+                  "integer constants outside HUGEINT's range (38 digits) are not supported"},
+        // DuckDB compares a DOUBLE and a BIGINT BETWEEN all in DOUBLE, antb1 pairwise.
+        ErrorCase{"SELECT i32 FROM t WHERE i64 BETWEEN 1e0 AND 9223372036854775806", kUnsupported,
+                  "BETWEEN", "BETWEEN of a DOUBLE value and a BIGINT, HUGEINT or FLOAT value"},
+        ErrorCase{"SELECT i32 FROM t WHERE i64 NOT BETWEEN d AND 5", kUnsupported, "NOT BETWEEN",
+                  "BETWEEN of a DOUBLE value and a BIGINT, HUGEINT or FLOAT value"},
+        ErrorCase{"SELECT i32 FROM t WHERE d BETWEEN 1 AND 3000000000", kUnsupported, "BETWEEN",
+                  "BETWEEN of a DOUBLE value and a BIGINT, HUGEINT or FLOAT value"},
+        ErrorCase{"SELECT i32 FROM t WHERE d BETWEEN 1 AND 2147483648 * 2", kUnsupported, "BETWEEN",
+                  "BETWEEN of a DOUBLE value and a BIGINT, HUGEINT or FLOAT value"},
+        // A decimal literal against an integer value is exact on its own, rounded in DOUBLE.
+        ErrorCase{"SELECT i32 FROM t WHERE i32 BETWEEN 1.00000000000000000001 AND 1e1",
+                  kUnsupported, "BETWEEN", "a decimal literal and an integer value"},
+        ErrorCase{"SELECT i32 FROM t WHERE i32 BETWEEN 1.5 AND d", kUnsupported, "BETWEEN",
+                  "a decimal literal and an integer value"},
+        // An integer literal of 39 digits is HUGEINT or DOUBLE in DuckDB.
+        ErrorCase{"SELECT i32 FROM t WHERE i32 BETWEEN -1000000000000000000000000000000000000000 "
+                  "AND 5",
+                  kUnsupported, "BETWEEN", "BETWEEN of a DOUBLE value"},
+        ErrorCase{"SELECT i16 FROM t GROUP BY i16 HAVING SUM(i64) BETWEEN 0 AND 1e0", kUnsupported,
+                  "BETWEEN", "BETWEEN of a DOUBLE value and a BIGINT, HUGEINT or FLOAT value"},
         ErrorCase{"SELECT i32 FROM t WHERE 1 BETWEEN 0 AND 2", kUnsupported, "0",
                   "comparisons between two literals are not supported"},
         ErrorCase{"SELECT i32 FROM t WHERE i32 BETWEEN i16 AND s", kBind, "BETWEEN",
@@ -1072,6 +1100,13 @@ TEST(BinderTest, BetweenAndConstantOperands) {
            // INTEGER).
            Case{.sql = "SELECT COUNT(*) FROM t WHERE i64 < 2147483648 + 1",
                 .text = "Filter i64 < 2147483649\n"},
+           // DuckDB types a literal INTEGER by its magnitude: -2147483648 is a BIGINT.
+           Case{.sql = "SELECT COUNT(*) FROM t WHERE i64 > -2147483648 - 1",
+                .text = "Filter i64 > -2147483649\n"},
+           Case{.sql = "SELECT COUNT(*) FROM t WHERE i64 = -2147483648 * -1",
+                .text = "Filter i64 = 2147483648\n"},
+           Case{.sql = "SELECT COUNT(*) FROM t WHERE d BETWEEN 1 AND 2147483647",
+                .text = "Filter d >= 1 AND d <= 2147483647\n"},
            Case{.sql = "SELECT COUNT(*) FROM t WHERE -(3) * -(2) = i32",
                 .text = "Filter i32 = 6\n"},
            Case{.sql = "SELECT COUNT(*) FROM t WHERE i32 BETWEEN i16 AND i64",
@@ -1980,7 +2015,15 @@ TEST(BinderTest, FloatColumnsByColumnId) {
     ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
     EXPECT_EQ(FilterConstants(*plan), constants) << sql;
   }
-  for (const char* sql : {"SELECT f + 1 FROM tf", "SELECT -f FROM tf"}) {
+  // Without a DOUBLE value, DuckDB compares a FLOAT BETWEEN in FLOAT as antb1 does.
+  auto between = BindSql("SELECT COUNT(*) FROM tf WHERE f BETWEEN 0.1 AND 0.1", catalog);
+  ASSERT_TRUE(between.ok()) << between.status().ToString();
+  EXPECT_EQ(FilterConstants(*between), (std::vector<double>{as_float, as_float}));
+  // With one, DuckDB compares all three in DOUBLE: unsupported.
+  for (const char* sql : {"SELECT f + 1 FROM tf", "SELECT -f FROM tf",
+                          "SELECT COUNT(*) FROM tf WHERE f BETWEEN 0.7 AND 1e0",
+                          "SELECT COUNT(*) FROM tf WHERE f BETWEEN 16777217 AND d",
+                          "SELECT COUNT(*) FROM tf WHERE f NOT BETWEEN 1 AND 1e10"}) {
     const auto plan = BindSql(sql, catalog);
     ASSERT_FALSE(plan.ok()) << sql;
     const auto detail = GetSqlError(plan.status());

@@ -1481,6 +1481,9 @@ std::optional<Int128> ConstantValue(const sql::Expr& expr) {
 // A constant integer expression (integer literals under unary -, +, - and *) folded as DuckDB
 // types it: a literal INTEGER, BIGINT or HUGEINT by its value, an operation in the wider type of
 // its operands. std::nullopt for any other expression; an error for a value outside its type.
+constexpr std::string_view kHugeIntConstants =
+    "integer constants outside HUGEINT's range (38 digits) are not supported";
+
 struct TypedConstant {
   Int128 value = 0;
   LogicalType type = LogicalType::kInteger;
@@ -1495,25 +1498,38 @@ std::optional<arrow::Result<TypedConstant>> FoldTyped(const sql::Expr& expr) {
       return std::nullopt;
     }
     const auto exact = ParseExactNumber(lit->text, lit->negative);
-    if (!exact.has_value() || exact->huge || exact->fraction) {
+    if (!exact.has_value() || exact->fraction) {
       return std::nullopt;
     }
+    if (exact->huge || exact->magnitude > RangeOf(LogicalType::kHugeInt).max) {
+      return arrow::Result<TypedConstant>(
+          UnsupportedError(std::string(kHugeIntConstants), lit->span));
+    }
+    // As BindConstant: INTEGER by the magnitude, else BIGINT or HUGEINT by the signed value.
     const Int128 value = exact->negative ? -exact->magnitude : exact->magnitude;
+    const IntegerRange bigint = RangeOf(LogicalType::kBigInt);
     LogicalType type = LogicalType::kHugeInt;
-    for (const LogicalType t : {LogicalType::kInteger, LogicalType::kBigInt}) {
-      const IntegerRange range = RangeOf(t);
-      if (value >= range.min && value <= range.max) {
-        type = t;
-        break;
-      }
+    if (exact->magnitude <= RangeOf(LogicalType::kInteger).max) {
+      type = LogicalType::kInteger;
+    } else if (value >= bigint.min && value <= bigint.max) {
+      type = LogicalType::kBigInt;
     }
     return arrow::Result<TypedConstant>(TypedConstant{.value = value, .type = type});
   }
+  // DuckDB's HUGEINT reaches 2^127 - 1, antb1's 38 digits: a HUGEINT result outside them is
+  // unsupported rather than an overflow.
+  const auto overflow_error = [](LogicalType type, std::string_view what,
+                                 SourceSpan span) -> arrow::Status {
+    if (type == LogicalType::kHugeInt) {
+      return UnsupportedError(std::string(kHugeIntConstants), span);
+    }
+    return BindError(std::format("Overflow in {} of {}", what, ToString(type)), span);
+  };
   const auto fits = [&](Int128 value, LogicalType type, std::string_view what,
                         SourceSpan span) -> arrow::Result<TypedConstant> {
     const IntegerRange range = RangeOf(type);
     if (value < range.min || value > range.max) {
-      return BindError(std::format("Overflow in {} of {}", what, ToString(type)), span);
+      return overflow_error(type, what, span);
     }
     return TypedConstant{.value = value, .type = type};
   };
@@ -1563,8 +1579,7 @@ std::optional<arrow::Result<TypedConstant>> FoldTyped(const sql::Expr& expr) {
       break;
   }
   if (overflow) {
-    return arrow::Result<TypedConstant>(
-        BindError(std::format("Overflow in {} of {}", what, ToString(type)), binary->span));
+    return arrow::Result<TypedConstant>(overflow_error(type, what, binary->span));
   }
   return fits(out, type, what, binary->span);
 }
@@ -2735,6 +2750,69 @@ arrow::Result<Predicate> Binder::BindConditionWith(const sql::Expr& conjunct, bo
       static_cast<const sql::ExprNode&>(conjunct));
 }
 
+namespace {
+
+// DuckDB compares x BETWEEN lo AND hi with one common type of the three values, while antb1
+// compares x >= lo and x <= hi each in its own. They differ only when that type is DOUBLE (a
+// DOUBLE column or an approximate literal, which an exponent or more than 38 digits makes) and a
+// value does not compare in DOUBLE as it does on its own: a BIGINT or HUGEINT value (a column,
+// or a constant of that type), a FLOAT column, or a decimal literal against an integer value.
+// Such a BETWEEN is unsupported.
+template <class BindFn>
+arrow::Status CheckBetweenTypes(const sql::BetweenExpr& between, const BindFn& bind) {
+  bool any_double = false;
+  bool any_wide = false;
+  bool any_float = false;
+  bool any_decimal = false;
+  bool any_integer = false;
+  const auto wide = [](LogicalType t) {
+    return t == LogicalType::kBigInt || t == LogicalType::kHugeInt;
+  };
+  for (const sql::Expr* value : {&*between.operand, &*between.low, &*between.high}) {
+    if (const auto* lit = std::get_if<sql::Literal>(value)) {
+      const bool number =
+          lit->kind == sql::Literal::Kind::kInteger || lit->kind == sql::Literal::Kind::kDecimal;
+      if (number && IsApproximateNumber(lit->text)) {
+        any_double = true;
+      } else if (lit->kind == sql::Literal::Kind::kDecimal) {
+        any_decimal = true;
+      } else if (lit->kind == sql::Literal::Kind::kInteger) {
+        const auto exact = ParseExactNumber(lit->text, lit->negative);
+        const bool huge = !exact.has_value() || exact->huge;
+        // 38 digits or more: HUGEINT or DOUBLE in DuckDB; antb1 treats it as both.
+        any_double = any_double || huge;
+        any_wide = any_wide || huge || exact->magnitude > RangeOf(LogicalType::kInteger).max;
+      }
+      continue;
+    }
+    if (IsConstantInteger(*value)) {
+      auto folded = FoldTyped(*value);
+      any_wide = any_wide || (folded.has_value() && folded->ok() && wide((*folded)->type));
+      continue;
+    }
+    ARROW_ASSIGN_OR_RAISE(const Typed typed, bind(*value));
+    const LogicalType type = typed.expr->type;
+    if (typed.stored_as_float) {
+      any_float = true;
+    } else if (type == LogicalType::kDouble) {
+      any_double = true;
+    } else if (IsInteger(type)) {
+      any_integer = true;
+      any_wide = any_wide || wide(type);
+    }
+  }
+  if (any_double && (any_wide || any_float || (any_decimal && any_integer))) {
+    return UnsupportedError(
+        "BETWEEN of a DOUBLE value and a BIGINT, HUGEINT or FLOAT value, or of a DOUBLE value, a "
+        "decimal literal and an integer value, is not supported (DuckDB compares all three in "
+        "DOUBLE)",
+        between.op_span);
+  }
+  return arrow::Status::OK();
+}
+
+}  // namespace
+
 template <class BindFn>
 arrow::Result<Typed> Binder::BindBool(const sql::Expr& expr, const BindFn& bind, bool input) {
   const auto* binary = std::get_if<sql::BinaryExpr>(&expr);
@@ -2764,6 +2842,7 @@ arrow::Result<Typed> Binder::BindBool(const sql::Expr& expr, const BindFn& bind,
   }
   if (const auto* between = std::get_if<sql::BetweenExpr>(&expr)) {
     // operand >= low AND operand <= high, under a NOT when negated; named as DuckDB names it.
+    ARROW_RETURN_NOT_OK(CheckBetweenTypes(*between, bind));
     BoolExpr both{.op = BoolOp::kAnd, .args = {}};
     for (const sql::Expr& comparison : BetweenComparisons(*between)) {
       ARROW_ASSIGN_OR_RAISE(Typed arg, BindBool(comparison, bind, input));
@@ -2950,10 +3029,11 @@ namespace {
 bool IsCompound(const sql::Expr& conjunct) {
   const auto* binary = std::get_if<sql::BinaryExpr>(&conjunct);
   const auto* unary = std::get_if<sql::UnaryExpr>(&conjunct);
-  // A BETWEEN left here is negated (SplitBetweens split the others into their comparisons).
+  // A plain BETWEEN is two conjuncts (its comparisons), a NOT BETWEEN one compound condition.
+  const auto* between = std::get_if<sql::BetweenExpr>(&conjunct);
   return (binary != nullptr && binary->op == sql::BinaryOp::kOr) ||
          (unary != nullptr && unary->op == sql::UnaryOp::kNot) ||
-         std::holds_alternative<sql::BetweenExpr>(conjunct);
+         (between != nullptr && between->negated);
 }
 
 Predicate IsTrue(BoundColumn column, SourceSpan span) {
@@ -2976,11 +3056,25 @@ arrow::Status Binder::BindWhere() {
       input_filter_.push_back(IsTrue(InputColumn(condition, /*where=*/true), conjunct->span()));
       continue;
     }
-    ARROW_ASSIGN_OR_RAISE(Predicate predicate, BindCondition(*conjunct, /*having=*/false));
-    const bool on_scan =
-        (!predicate.column.has_value() || columns_.FieldOf(predicate.column->id).has_value()) &&
-        (!predicate.other.has_value() || columns_.FieldOf(predicate.other->id).has_value());
-    (on_scan ? scan_filter_ : input_filter_).push_back(std::move(predicate));
+    // A plain BETWEEN is its two comparisons, each folded and pushed into the scan where it can.
+    std::vector<sql::Expr> comparisons;
+    if (const auto* between = std::get_if<sql::BetweenExpr>(conjunct)) {
+      ARROW_RETURN_NOT_OK(
+          CheckBetweenTypes(*between, [this](const sql::Expr& e) { return BindInput(e); }));
+      for (sql::Expr& comparison : BetweenComparisons(*between)) {
+        comparisons.push_back(std::move(comparison));
+      }
+    }
+    const std::vector<const sql::Expr*> parts =
+        comparisons.empty() ? std::vector<const sql::Expr*>{conjunct}
+                            : std::vector<const sql::Expr*>{&comparisons[0], &comparisons[1]};
+    for (const sql::Expr* part : parts) {
+      ARROW_ASSIGN_OR_RAISE(Predicate predicate, BindCondition(*part, /*having=*/false));
+      const bool on_scan =
+          (!predicate.column.has_value() || columns_.FieldOf(predicate.column->id).has_value()) &&
+          (!predicate.other.has_value() || columns_.FieldOf(predicate.other->id).has_value());
+      (on_scan ? scan_filter_ : input_filter_).push_back(std::move(predicate));
+    }
   }
   return arrow::Status::OK();
 }
@@ -3175,6 +3269,14 @@ arrow::Status Binder::BindHaving() {
     if (IsCompound(*conjunct)) {
       ARROW_ASSIGN_OR_RAISE(const Typed condition, BindBool(*conjunct, bind, /*input=*/false));
       having_.push_back(IsTrue(OutputColumn(condition), conjunct->span()));
+      continue;
+    }
+    if (const auto* between = std::get_if<sql::BetweenExpr>(conjunct)) {
+      ARROW_RETURN_NOT_OK(CheckBetweenTypes(*between, bind));
+      for (const sql::Expr& comparison : BetweenComparisons(*between)) {
+        ARROW_ASSIGN_OR_RAISE(Predicate predicate, BindCondition(comparison, /*having=*/true));
+        having_.push_back(std::move(predicate));
+      }
       continue;
     }
     ARROW_ASSIGN_OR_RAISE(Predicate predicate, BindCondition(*conjunct, /*having=*/true));
@@ -3488,38 +3590,6 @@ sql::SelectStatement FoldDateCasts(sql::SelectStatement stmt) {
   return stmt;
 }
 
-// A BETWEEN in the AND chain of a WHERE or HAVING conjunct as its two comparisons (operand >= low
-// AND operand <= high), so that each is a conjunct of its own: folded exactly, and pushed into the
-// scan where it can be. A negated BETWEEN, and one under OR or NOT, stays (BindBool binds it).
-void SplitBetweens(sql::Expr& expr) {
-  if (auto* binary = std::get_if<sql::BinaryExpr>(&expr);
-      binary != nullptr && binary->op == sql::BinaryOp::kAnd) {
-    SplitBetweens(*binary->left);
-    SplitBetweens(*binary->right);
-    return;
-  }
-  if (const auto* between = std::get_if<sql::BetweenExpr>(&expr);
-      between != nullptr && !between->negated) {
-    auto [low, high] = BetweenComparisons(*between);
-    const SourceSpan span = between->span;
-    const SourceSpan op_span = between->op_span;
-    expr = sql::Expr(sql::BinaryExpr{.op = sql::BinaryOp::kAnd,
-                                     .left = sql::Box<sql::Expr>(std::move(low)),
-                                     .right = sql::Box<sql::Expr>(std::move(high)),
-                                     .op_span = op_span,
-                                     .span = span});
-  }
-}
-
-sql::SelectStatement SplitBetweens(sql::SelectStatement stmt) {
-  for (std::vector<sql::Expr>* clause : {&stmt.where, &stmt.having}) {
-    for (sql::Expr& expr : *clause) {
-      SplitBetweens(expr);
-    }
-  }
-  return stmt;
-}
-
 // Expressions the binder does not answer yet are kUnsupported, reported (like the parser's own
 // kUnsupported errors) before any name is resolved, at the first one in query order.
 arrow::Status CheckSupported(const sql::SelectStatement& stmt) {
@@ -3548,8 +3618,7 @@ arrow::Status CheckSupported(const sql::SelectStatement& stmt) {
 }  // namespace
 
 arrow::Result<LogicalPlan> Bind(const sql::SelectStatement& stmt, const Catalog& catalog) {
-  const sql::SelectStatement folded =
-      SplitBetweens(FoldDateCasts(stmt));  // the binder refers to it
+  const sql::SelectStatement folded = FoldDateCasts(stmt);  // the binder refers to it
   ARROW_RETURN_NOT_OK(CheckSupported(folded));
   ARROW_ASSIGN_OR_RAISE(auto table, ResolveTable(folded.from, catalog));
   ColumnIdSource ids;
