@@ -62,6 +62,10 @@ TEST(UnparseTest, CanonicalForms) {
                .input = "select 1, -2 m, 'x' , date '2024-01-02' from t group by 1, 'k' order by 2",
                .canonical = "SELECT 1, -2 AS \"m\", 'x', DATE '2024-01-02' FROM t GROUP BY 1, 'k' "
                             "ORDER BY 2"},
+           Case{.input = "select a from t where a between 1 and b + 2 and not c not between 'x' "
+                         "and (d - 1) or e between -1 and (2 * 3)",
+                .canonical = "SELECT a FROM t WHERE (a BETWEEN 1 AND b + 2 AND NOT c NOT BETWEEN "
+                             "'x' AND d - 1 OR e BETWEEN -1 AND 2 * 3)"},
            Case{.input = "select a from t where a like '%x''%' and b not like '_'",
                 .canonical = "SELECT a FROM t WHERE a LIKE '%x''%' AND b NOT LIKE '_'"},
            Case{.input = "SELECT a FROM t WHERE 5 < a AND b != 'it''s' AND DATE '2024-01-31' >= d",
@@ -389,6 +393,10 @@ TEST(EqualIgnoringSpansTest, DetectsDifferencesInExpressions) {
            {"a LIKE 'x'", "a NOT LIKE 'x'"},
            {"a IN (1)", "a NOT IN (1)"},
            {"a IN (1)", "a IN (1, 2)"},
+           {"a BETWEEN 1 AND 2", "a NOT BETWEEN 1 AND 2"},
+           {"a BETWEEN 1 AND 2", "a BETWEEN 1 AND 3"},
+           {"a BETWEEN 1 AND 2", "a BETWEEN 0 AND 2"},
+           {"a BETWEEN 1 AND 2", "b BETWEEN 1 AND 2"},
            {"f(a)", "g(a)"},
            {"f(a)", "\"f\"(a)"},
            {"f(a)", "f(a, b)"},

@@ -128,6 +128,16 @@ struct InExpr {
   SourceSpan span;     // operand .. ')'
 };
 
+// operand [NOT] BETWEEN low AND high
+struct BetweenExpr {
+  Box<Expr> operand;
+  Box<Expr> low;
+  Box<Expr> high;
+  bool negated = false;
+  SourceSpan op_span;  // [NOT] BETWEEN
+  SourceSpan span;     // operand .. high
+};
+
 // name(arg, ...): any function other than the five aggregates.
 struct FunctionCall {
   std::string name;  // as written
@@ -172,15 +182,15 @@ struct CastExpr {
 };
 
 using ExprNode = std::variant<ColumnRef, Literal, AggregateCall, UnaryExpr, BinaryExpr, LikeExpr,
-                              InExpr, FunctionCall, CaseExpr, ExtractExpr, CastExpr>;
+                              InExpr, BetweenExpr, FunctionCall, CaseExpr, ExtractExpr, CastExpr>;
 
 template <class T>
 concept ExprNodeKind =
     std::is_same_v<T, ColumnRef> || std::is_same_v<T, Literal> ||
     std::is_same_v<T, AggregateCall> || std::is_same_v<T, UnaryExpr> ||
     std::is_same_v<T, BinaryExpr> || std::is_same_v<T, LikeExpr> || std::is_same_v<T, InExpr> ||
-    std::is_same_v<T, FunctionCall> || std::is_same_v<T, CaseExpr> ||
-    std::is_same_v<T, ExtractExpr> || std::is_same_v<T, CastExpr>;
+    std::is_same_v<T, BetweenExpr> || std::is_same_v<T, FunctionCall> ||
+    std::is_same_v<T, CaseExpr> || std::is_same_v<T, ExtractExpr> || std::is_same_v<T, CastExpr>;
 
 // An expression: a variant of its node kinds (std::get, std::get_if and std::visit apply). It
 // converts only from its node kinds: variant's catch-all converting constructor would make every

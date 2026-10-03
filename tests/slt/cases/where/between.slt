@@ -1,0 +1,277 @@
+# [NOT] BETWEEN (docs/sql-subset.md): x BETWEEN lo AND hi is lo <= x AND x <= hi, both bounds inclusive; a plain
+# BETWEEN in WHERE or HAVING splits into its two comparisons (pushed into the scan), NOT BETWEEN, NOT (x BETWEEN ...)
+# and BETWEEN under OR or in CASE are compound conditions. A side of a comparison may be constant integer
+# arithmetic, folded in DuckDB's types.
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE RegionID BETWEEN 100 AND 200
+----
+54
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE RegionID between 200 and 100
+----
+0
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE RegionID BETWEEN 150 AND 150
+----
+1
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE RegionID NOT BETWEEN 100 AND 200
+----
+9946
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE NOT RegionID BETWEEN 100 AND 200
+----
+9946
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE NOT (RegionID NOT BETWEEN 100 AND 200)
+----
+54
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE RegionID BETWEEN 100 AND 200 AND UserAgent = 2
+----
+0
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE (RegionID BETWEEN 100 AND 200 AND UserAgent BETWEEN 1 AND 3)
+----
+0
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE RegionID BETWEEN 100 AND 200 OR RegionID BETWEEN 1000 AND 2000
+----
+551
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE RegionID + 1 BETWEEN 2 * 50 AND 4 * 50 - 1
+----
+55
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE 100 + 5 <= RegionID AND RegionID < -(-300)
+----
+93
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE EventDate BETWEEN DATE '2013-07-10' AND CAST('2013-07-12' AS DATE)
+----
+1007
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE EventDate NOT BETWEEN '2013-07-02'::DATE AND '2013-07-30'::DATE
+----
+676
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE URL BETWEEN 'http://a' AND 'http://m'
+----
+0
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE Title NOT BETWEEN 'A' AND 'Z'
+----
+10000
+
+query I nosort
+SELECT COUNT(*) FROM hits_like_nulls WHERE RegionID BETWEEN 100 AND 200
+----
+48
+
+query I nosort
+SELECT COUNT(*) FROM hits_like_nulls WHERE RegionID NOT BETWEEN 100 AND 200
+----
+9167
+
+query I nosort
+SELECT COUNT(*) FROM hits_like_nulls WHERE NOT (RegionID BETWEEN 100 AND 200) OR RegionID = 150
+----
+9168
+
+query I nosort
+SELECT COUNT(*) FROM hits_like_split WHERE RegionID BETWEEN 100 AND 200
+----
+54
+
+query I nosort
+SELECT COUNT(*) FROM empty WHERE RegionID BETWEEN 1 AND 2
+----
+0
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i64 BETWEEN -9223372036854775808 AND 9223372036854775807
+----
+10
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i16 BETWEEN -40000 AND 40000
+----
+10
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i32 BETWEEN i16 AND i64
+----
+5
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE d BETWEEN -1.5 AND 1e3
+----
+7
+
+query II rowsort
+SELECT UserAgent, COUNT(*) FROM hits_like GROUP BY UserAgent HAVING COUNT(*) BETWEEN 100 AND 2000
+----
+0	191
+1	167
+10	169
+11	173
+12	160
+13	155
+14	193
+15	149
+16	165
+17	155
+18	161
+19	173
+2	158
+20	182
+21	143
+22	155
+23	159
+24	182
+25	156
+26	156
+27	154
+28	168
+29	161
+3	170
+30	146
+31	154
+32	164
+33	155
+34	187
+35	181
+36	142
+37	152
+38	161
+39	176
+4	176
+40	177
+41	172
+42	188
+43	167
+44	147
+45	183
+46	163
+47	158
+48	172
+49	152
+5	151
+50	155
+51	155
+52	157
+53	187
+54	166
+55	182
+56	176
+57	156
+58	164
+59	135
+6	157
+60	156
+7	141
+8	161
+9	173
+
+query II rowsort
+SELECT UserAgent, COUNT(*) FROM hits_like GROUP BY UserAgent HAVING COUNT(*) NOT BETWEEN 100 AND 2000
+----
+
+query II rowsort
+SELECT UserAgent, CASE WHEN COUNT(*) BETWEEN 100 AND 2000 THEN 1 ELSE 0 END FROM hits_like GROUP BY UserAgent
+----
+0	1
+1	1
+10	1
+11	1
+12	1
+13	1
+14	1
+15	1
+16	1
+17	1
+18	1
+19	1
+2	1
+20	1
+21	1
+22	1
+23	1
+24	1
+25	1
+26	1
+27	1
+28	1
+29	1
+3	1
+30	1
+31	1
+32	1
+33	1
+34	1
+35	1
+36	1
+37	1
+38	1
+39	1
+4	1
+40	1
+41	1
+42	1
+43	1
+44	1
+45	1
+46	1
+47	1
+48	1
+49	1
+5	1
+50	1
+51	1
+52	1
+53	1
+54	1
+55	1
+56	1
+57	1
+58	1
+59	1
+6	1
+60	1
+7	1
+8	1
+9	1
+
+query T rowsort
+SELECT CASE WHEN RegionID BETWEEN 100 AND 200 THEN 'in' WHEN RegionID NOT BETWEEN 0 AND 1000 THEN 'far' END FROM hits_like_nulls GROUP BY 1
+----
+NULL
+far
+in
+
+statement error
+SELECT COUNT(*) FROM hits_like WHERE RegionID > 2147483647 + 1
+
+# DuckDB raises the overflow only when a row computes it, so it answers over an empty table: divergence D17.
+onlyif antb1
+statement error ^bind: Overflow in addition of INTEGER
+SELECT COUNT(*) FROM empty WHERE RegionID > 2147483647 + 1
+
+onlyif antb1
+statement error ^bind: cannot compare
+SELECT COUNT(*) FROM hits_like WHERE RegionID BETWEEN 1 AND 'x'

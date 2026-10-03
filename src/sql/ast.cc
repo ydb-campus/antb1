@@ -60,6 +60,11 @@ bool Eq(const InExpr& a, const InExpr& b) {
   return a.negated == b.negated && Eq(*a.operand, *b.operand) && Eq(a.list, b.list);
 }
 
+bool Eq(const BetweenExpr& a, const BetweenExpr& b) {
+  return a.negated == b.negated && Eq(*a.operand, *b.operand) && Eq(*a.low, *b.low) &&
+         Eq(*a.high, *b.high);
+}
+
 bool Eq(const FunctionCall& a, const FunctionCall& b) {
   return a.name == b.name && a.quoted == b.quoted && Eq(a.args, b.args);
 }

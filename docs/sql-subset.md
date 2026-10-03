@@ -10,7 +10,8 @@ This page is the contract: a PR that changes SQL behavior updates it in the same
 
 Every query of the [grammar](#grammar) below runs: global and grouped (`GROUP BY`) aggregates, `COUNT(DISTINCT ...)`
 included, projections (`*`, columns or constants), `WHERE` conditions (`column <op> literal` comparisons,
-`column [NOT] LIKE 'pattern'` and `column [NOT] IN (literal, ...)`, combined with `AND`, `OR` and `NOT`), `GROUP BY`
+`column [NOT] LIKE 'pattern'`, `column [NOT] IN (literal, ...)` and `column [NOT] BETWEEN low AND high`, combined
+with `AND`, `OR` and `NOT`, with constant integer arithmetic folded on a side), `GROUP BY`
 and `ORDER BY` (also by position), `HAVING` (the same conditions on aggregates and keys), arithmetic
 (`+ - * / // %` and unary `-`), the string functions `strlen` and `regexp_replace`, the timestamp functions
 `toDateTime`, `EXTRACT` and `date_trunc`, and `CASE` in every clause, dates written as casts
@@ -66,7 +67,8 @@ table_ref   = identifier | string_literal ;
 expr        = expr , "OR" , expr | expr , "AND" , expr | "NOT" , expr | condition | sum ;
 condition   = sum , cmp_op , sum
             | sum , [ "NOT" ] , "LIKE" , sum
-            | sum , [ "NOT" ] , "IN" , "(" , expr , { "," , expr } , ")" ;
+            | sum , [ "NOT" ] , "IN" , "(" , expr , { "," , expr } , ")"
+            | sum , [ "NOT" ] , "BETWEEN" , sum , "AND" , sum ;
 sum         = sum , ( "+" | "-" ) , product | product ;
 product     = product , ( "*" | "/" | "//" | "%" ) , unary | unary ;
 unary       = "-" , unary | postfix ;
@@ -86,12 +88,14 @@ literal     = [ "-" ] , integer | [ "-" ] , decimal | string_literal | "DATE" , 
             | "TIMESTAMP" , string_literal ;
 ```
 
-Operators bind from loosest to tightest: `OR`, `AND`, `NOT`, the comparisons with `LIKE` and `IN` (which do not
-chain: `a = b = c` is unsupported), `+` and `-`, `*`, `/`, `//` and `%`, unary `-`, `::`; binary operators are
-left-associative, and parentheses group. An expression may be at most 256 levels deep (operators or parentheses; the
-top-level `AND` chain of `WHERE` and `HAVING` does not count), else it is unsupported. A `::` and a unary `-` count one
-level more, as they do in the canonical form `CAST(x AS T)` and `-(x)` (a `-` before a parenthesized operand does
-not). Aggregates are allowed in the select list, `HAVING` and `ORDER BY`, and cannot be nested.
+Operators bind from loosest to tightest: `OR`, `AND`, `NOT`, the comparisons with `LIKE`, `IN` and `BETWEEN` (which do
+not chain: `a = b = c` and `a BETWEEN 1 AND 2 = b` are unsupported; the bounds of `BETWEEN` bind like the operand of
+`+`, so its `AND` is its own and `a BETWEEN 1 AND 2 AND b = 3` is two conjuncts), `+` and `-`, `*`, `/`, `//` and `%`,
+unary `-`, `::`; binary operators are left-associative, and parentheses group. An expression may be at most 256 levels
+deep (operators or parentheses; the top-level `AND` chain of `WHERE` and `HAVING` does not count), else it is
+unsupported. A `::` and a unary `-` count one level more, as they do in the canonical form `CAST(x AS T)` and `-(x)` (a
+`-` before a parenthesized operand does not). Aggregates are allowed in the select list, `HAVING` and `ORDER BY`, and
+cannot be nested.
 
 Lexical rules: an `identifier` is a letter or `_` followed by letters, digits or `_`, or any text in double quotes
 (`""` escapes a quote); a `string_literal` is text in single quotes (`''` escapes a quote); an `integer` is a
@@ -111,9 +115,17 @@ are the same expression.
   as below) of them, in the select list, aggregate arguments (not constant ones), `GROUP BY` and `ORDER BY` (literals
   there are positions or constants, see [Binding](#binding));
 - conditions (`WHERE`, `HAVING` and `CASE WHEN`): `operand <op> literal` in either order, `operand <op> operand`,
-  `operand [NOT] LIKE 'pattern'` and `operand [NOT] IN (literal, ...)`, where an operand is a value expression that
-  reads a column (in `HAVING`, and in a `CASE` of an aggregate query, also one over aggregates), combined with
-  `AND`, `OR` and `NOT`;
+  `operand [NOT] LIKE 'pattern'`, `operand [NOT] IN (literal, ...)` and `operand [NOT] BETWEEN low AND high`
+  (`low <= operand AND operand <= high`, each bound a literal or an operand), where an operand is a value
+  expression that reads a column (in `HAVING`, and in a `CASE` of an aggregate query, also one over aggregates),
+  combined with `AND`, `OR` and `NOT`. Instead of a literal, a comparison or a bound may be a constant integer
+  expression: integer literals under unary `-`, `+`, `-` and `*` (`a > 2 * 1000`), folded to its value in DuckDB's
+  types (each literal `INTEGER`, `BIGINT` or `HUGEINT` by its value, each operation in the wider type of its
+  operands); one that overflows its type is a bind error (exit code 1, divergence D17). Other constant expressions
+  (`/`, `//`, `%`, decimals) are unsupported. A plain `BETWEEN` in the `AND` chain of `WHERE` or `HAVING` is its two
+  comparisons, each folded and, over a table column, pushed into the scan like any comparison; `NOT BETWEEN`,
+  `NOT (a BETWEEN ...)` and `BETWEEN` under `OR` or in `CASE` are compound conditions. DuckDB's names apply:
+  `(a BETWEEN 1 AND 2)`, and both negations `(NOT (a BETWEEN 1 AND 2))`;
 - any of these in parentheses (`(a)`, `SUM((a))`, `WHERE (a = 1 AND b = 2)`), which group without changing
   anything.
 
@@ -124,7 +136,7 @@ rejected by the binder with exit code 4 at its first unsupported token, before a
 and `ORDER BY ALL` are rejected by the parser, and so are `SUM`, `AVG`, `MIN` and `MAX` with `DISTINCT`.
 
 Outside the grammar, the parser recognizes common SQL and rejects it with exit code 4 and a source span, among others:
-`SELECT DISTINCT`, joins, subqueries, `ILIKE`, `LIKE ... ESCAPE`, `NULL` literals, `IS [NOT] NULL`, `BETWEEN`, `||`,
+`SELECT DISTINCT`, joins, subqueries, `ILIKE`, `LIKE ... ESCAPE`, `NULL` literals, `IS [NOT] NULL`, `||`,
 window functions, unary `+`, and in casts quoted or qualified type names, type names of several words
 (`DOUBLE PRECISION`, `TIMESTAMP WITH TIME ZONE`), array types, `INTERVAL` and `UNION` types and type parameters other
 than integers. Malformed SQL, such as `SELECT COUNT(*) FORM t`, is a syntax error with exit code 1.
@@ -398,6 +410,9 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   only when every comparison is true, so a comparison that is NULL rejects it. `OR` and `NOT` follow SQL's
   three-valued logic too (`NULL OR TRUE` is true, `NOT NULL` is NULL); a comparison folded to always or never true
   is still NULL for a NULL operand there, so `NOT (smallint_col = 1.5)` rejects NULL and keeps every other row.
+- BETWEEN: `a BETWEEN lo AND hi` is `lo <= a AND a <= hi` in three-valued logic, both bounds inclusive: a range with
+  `lo > hi` matches nothing, and a NULL operand (or a NULL bound column) makes it NULL, which rejects the row;
+  `a NOT BETWEEN lo AND hi` is its negation, so it rejects that row too.
   An argument of `AND` or `OR` is computed only for the rows the earlier ones leave undecided (`x > 100 OR x * x > 0`
   never computes `x * x` where `x > 100`), as DuckDB does for the same order (divergence D16).
   VARCHAR compares byte-wise and DATE chronologically. A predicate folded to never-true reads no data at all.
@@ -563,6 +578,7 @@ compare against DuckDB, so an unregistered difference is a bug.
 | D14 | Overflows DuckDB's optimizer does not avoid | a comparison that folds to always-true or never-true at bind time (a literal outside the operand's type, as in `smallint_col + 1 > 40000`) computes nothing, so it cannot overflow | computes the operand and fails on an overflow ("Overflow in addition of INT16") | the random generator never writes arithmetic that can overflow; `plan.BinderTest.WhereMovesConstantsLikeDuckDb` pins which comparisons move their constants |
 | D15 | VARCHAR bytes that are not UTF-8 | answers: `strlen` counts every byte, and `regexp_replace` runs RE2 over the bytes as UTF-8, where an invalid byte never matches (not even `.` or `[^a]`) and stays in the result | cannot read such a value as VARCHAR: reading an unannotated BYTE_ARRAY column (`binary_as_string`) with it fails the query ("Invalid string encoding") | every fixture string is valid UTF-8, so the oracle tests never meet it; `exec.ComputeTest.StringFunctions` pins antb1's behavior |
 | D16 | Evaluation order in conditions | computes the arguments of `AND` and `OR` in the order written, each only for the rows still undecided, and a WHERE conjunct's operands for every row; so an overflow inside a condition fails exactly when a row reaches it in that order | may reorder conjunctions by its cost model, and computes the argument of a `NOT` for every row, so an overflow can fail in one engine and not the other (`NOT (x < 100 AND x * x > 0)` fails in DuckDB) | the random generator never writes arithmetic that can overflow; `exec.ComputeTest.ConditionsAreThreeValued` pins antb1's order |
+| D17 | Overflows in constant expressions | a constant integer expression on a side of a comparison or a `BETWEEN` bound that overflows its type (`a > 2147483647 + 1`) is a bind error, whatever the table holds | raises the overflow only when a row computes it: an empty table, or one whose rows another conjunct rejects first, answers | `plan.Expressions/BindErrorTest` pins the errors; `tests/slt/cases/where/between.slt` has the error on a table both engines fail on and, `onlyif antb1`, on the empty table |
 
 ## ClickBench status
 

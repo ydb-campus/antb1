@@ -438,6 +438,13 @@ antb1_add_cli_golden(
     --table
     "${_split}"
 )
+# A plain BETWEEN is two comparisons, both pushed into the scan (and used for part pruning).
+antb1_add_cli_golden(
+  explain_analyze_between
+  STDOUT_REGEX
+    "Filter RegionID >= 100 AND RegionID <= 200  [[][^]]*[]]\n +Scan table=t source=parquet[(]files=4, rows=10000[)] columns=[[]RegionID[]], 2 pushed predicates  [[]rows=[0-9]+ "
+  ARGS explain --analyze --threads 4 -c "SELECT COUNT(*) FROM t WHERE RegionID BETWEEN 100 AND 200" --table "${_split}"
+)
 set(_n "[0-9]+")
 string(
   CONCAT _explain_analyze_json

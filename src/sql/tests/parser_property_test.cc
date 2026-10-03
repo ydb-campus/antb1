@@ -153,6 +153,13 @@ struct CountOf {
     Count(*in.operand, c);
     CountAll(in.list, c);
   }
+  // BETWEEN's own AND is an AND token.
+  void operator()(const BetweenExpr& between) const {
+    ++c.and_count;
+    Count(*between.operand, c);
+    Count(*between.low, c);
+    Count(*between.high, c);
+  }
   void operator()(const FunctionCall& call) const {
     ++c.parens;
     CountAll(call.args, c);
@@ -797,6 +804,14 @@ Expr RandomExpr(Rng& rng, std::size_t depth, bool aggregates) {
                             .op_span = {},
                             .span = {}});
     case 7:
+      if (rng.Percent(30)) {
+        return Expr(BetweenExpr{.operand = sub(aggregates),
+                                .low = sub(aggregates),
+                                .high = sub(aggregates),
+                                .negated = rng.Percent(40),
+                                .op_span = {},
+                                .span = {}});
+      }
       return Expr(LikeExpr{.operand = sub(aggregates),
                            .pattern = sub(aggregates),
                            .negated = rng.Percent(40),
