@@ -202,6 +202,6 @@ because lint R009 keeps files named like `q01.sql` out of the repository.
   `error`, `unsupported`, `succeed`, `canary`); the self-tests prove that each one is caught.
 
 `--redact` and `--mutate` work for `run`, `diff`, `queries` and `clickbench`; `answers` and `tpch` take `--mutate`
-(`tpch` is always redacted through its tables), and `--show-values` works for all six. The `pixi run diff-random`
+(`tpch` is always redacted, whatever its tables file says), and `--show-values` works for all six. The `pixi run diff-random`
 repro of a `diff` failure is printed only for the tables of that task (`tables.txt`); every failure also prints its
 exact command line with `--only`.

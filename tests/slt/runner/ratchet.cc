@@ -72,8 +72,10 @@ class StatusReader {
     if (pos_ != text_.size()) {
       return Error("text after the object");
     }
-    if (!have_pass || (!commit_key_.empty() && !have_commit)) {  // with a commit key
-      return Error(std::format(R"(needs the keys "{}" and "pass")", commit_key_));
+    if (!have_pass || (!commit_key_.empty() && !have_commit)) {
+      return Error(commit_key_.empty()
+                       ? std::string(R"(needs the key "pass")")
+                       : std::format(R"(needs the keys "{}" and "pass")", commit_key_));
     }
     if (!std::ranges::is_sorted(status.pass) ||
         std::ranges::adjacent_find(status.pass) != status.pass.end()) {

@@ -149,7 +149,7 @@ endforeach()
 # I/O or execution error fails the test, as do an unexpected pass and an unexpected fail. Both scale factors read
 # the same ratchet, so a query passes at both or the test fails at one, and the parallel run (4 threads, batches of
 # 1000 rows) must equal the 1-thread run byte for byte. Each query logs "Q<n>: running" first, so a timeout names
-# it. ANTB1_TPCH_TIMES=1 adds each query's seconds (a local run; ctest and CI never set it).
+# it. ANTB1_TPCH_TIMES=1 in the environment of a local run adds each query's seconds; no preset or CI job sets it.
 set(_status "${PROJECT_SOURCE_DIR}/tests/data/tpch_status.json")
 foreach(kind IN ITEMS sf0_01 sf0_1 parallel)
   if(kind STREQUAL "parallel")

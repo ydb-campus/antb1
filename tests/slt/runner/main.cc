@@ -737,8 +737,10 @@ int Main(std::span<char*> argv, const Environment& env) {
     std::println(stderr, "antb1-slt: {}", tables.error());
     return kExitSetup;
   }
-  // Redacted unless --show-values: tables marked `redact`, and `answers`.
-  const bool redacted_data = answers->parsed() || std::ranges::any_of(*tables, &TableDef::redact);
+  // Redacted unless --show-values: tables marked `redact`, `answers` and `tpch`.
+  // `tpch` too: its queries are derived from TPC-H, whatever the tables file says.
+  const bool redacted_data =
+      answers->parsed() || tpch->parsed() || std::ranges::any_of(*tables, &TableDef::redact);
   if (redacted_data && complete->parsed()) {
     std::println(stderr,
                  "antb1-slt: complete writes values into .slt files; it is refused for tables "

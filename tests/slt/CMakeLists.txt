@@ -510,6 +510,8 @@ if(ANTB1_HAVE_DUCKDB)
       REQUIRE ${_require} ${_redacted_forbid}
       COMMAND $<TARGET_FILE:antb1-slt> tpch ${_args}
     )
+    # Their output must not depend on a developer's ANTB1_TPCH_TIMES (ctest passes the environment through).
+    set_tests_properties(${_name} PROPERTIES ENVIRONMENT_MODIFICATION "ANTB1_TPCH_TIMES=unset:")
   endforeach()
 
   # The `redact` option of a tables file (runner/tables.h): canary/tables_redact.txt marks the canary table, so every

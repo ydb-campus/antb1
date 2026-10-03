@@ -416,8 +416,9 @@ makes a query pass adds it to the ratchet and to the table in [sql-subset.md](sq
 
 Each query is logged as `Q<n>: running` before it runs, and `run_redacted.cmake` stops the run 30 seconds before
 the ctest timeout (900 seconds), so the log of a run that hangs names the query. `ANTB1_TPCH_TIMES=1` adds each
-query's seconds and the geometric mean of the passing queries to a local run; ctest and CI never set it. A failure
-prints the query number, hashes and an unredacted repro command to run locally.
+query's seconds and the geometric mean of the passing queries when set in the environment of a local run
+(`ANTB1_TPCH_TIMES=1 pixi run test -R 'tpch\.status'`); no preset and no CI job sets it, and the self-tests unset
+it. A failure prints the query number, hashes and an unredacted repro command to run locally.
 
 The seed of the differential test is fixed. DuckDB 1.5.5 leaks the state of a string `MIN` or `MAX` over many groups
 without `ORDER BY`, so a new seed is checked with `pixi run asan` first, and one whose queries make DuckDB leak is
