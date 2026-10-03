@@ -1,5 +1,6 @@
 #include "antb1/sql/ast.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <optional>
 #include <string_view>
@@ -414,6 +415,73 @@ std::string_view ToString(BinaryOp op) {
 }
 
 bool EqualIgnoringSpans(const Expr& a, const Expr& b) { return Eq(a, b); }
+
+namespace {
+
+// One level for the node over its deepest child.
+struct DepthOf {
+  static std::size_t Of(const Expr& e) { return Depth(e); }
+  static std::size_t Of(const std::optional<Box<Expr>>& e) { return e ? Depth(**e) : 0; }
+
+  std::size_t operator()(const ColumnRef& /*c*/) const { return 1; }
+  std::size_t operator()(const Literal& /*l*/) const { return 1; }
+  std::size_t operator()(const AggregateCall& a) const { return 1 + Of(a.arg); }
+  std::size_t operator()(const UnaryExpr& u) const { return 1 + Of(*u.operand); }
+  std::size_t operator()(const BinaryExpr& b) const {
+    return 1 + std::max(Of(*b.left), Of(*b.right));
+  }
+  std::size_t operator()(const LikeExpr& l) const {
+    return 1 + std::max(Of(*l.operand), Of(*l.pattern));
+  }
+  std::size_t operator()(const InExpr& in) const {
+    std::size_t deepest = Of(*in.operand);
+    for (const Expr& value : in.list) {
+      deepest = std::max(deepest, Of(value));
+    }
+    return 1 + deepest;
+  }
+  std::size_t operator()(const BetweenExpr& b) const {
+    return 1 + std::max({Of(*b.operand), Of(*b.low), Of(*b.high)});
+  }
+  std::size_t operator()(const FunctionCall& f) const {
+    std::size_t deepest = 0;
+    for (const Expr& arg : f.args) {
+      deepest = std::max(deepest, Of(arg));
+    }
+    return 1 + deepest;
+  }
+  std::size_t operator()(const CaseExpr& c) const {
+    std::size_t deepest = std::max(Of(c.operand), Of(c.otherwise));
+    for (const CaseBranch& branch : c.branches) {
+      deepest = std::max({deepest, Of(*branch.when), Of(*branch.then)});
+    }
+    return 1 + deepest;
+  }
+  std::size_t operator()(const ExtractExpr& e) const { return 1 + Of(*e.source); }
+  std::size_t operator()(const CastExpr& c) const { return 1 + Of(*c.operand); }
+};
+
+}  // namespace
+
+std::size_t Depth(const Expr& expr) {
+  return std::visit(DepthOf{}, static_cast<const ExprNode&>(expr));
+}
+
+std::size_t Depth(const SelectStatement& stmt) {
+  std::size_t deepest = 0;
+  for (const SelectItem& item : stmt.items) {
+    deepest = std::max(deepest, Depth(item.expr));
+  }
+  for (const std::vector<Expr>* list : {&stmt.where, &stmt.group_by, &stmt.having}) {
+    for (const Expr& e : *list) {
+      deepest = std::max(deepest, Depth(e));
+    }
+  }
+  for (const OrderItem& item : stmt.order_by) {
+    deepest = std::max(deepest, Depth(item.expr));
+  }
+  return deepest;
+}
 
 bool EqualIgnoringSpans(const SelectStatement& a, const SelectStatement& b) {
   if (a.star != b.star || a.items.size() != b.items.size() ||

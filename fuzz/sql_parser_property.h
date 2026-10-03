@@ -6,6 +6,8 @@
 //   2. if Parse succeeds, the canonical text ToSql(ast) parses again,
 //   3. to a statement that is EqualIgnoringSpans to ast,
 //   4. and ToSql is idempotent: ToSql(Parse(ToSql(ast))) == ToSql(ast).
+//   5. and no expression tree of ast is deeper than sql::kMaxExpressionDepth, so the recursive code
+//      that walks trees stays within its stack.
 // Rejecting an input (a syntax error or Unsupported) is never a violation.
 
 #include <cstddef>
@@ -50,6 +52,10 @@ inline std::string SqlParserPropertyViolation(std::string_view input,
   const auto ast = sql::Parse(input);
   if (!ast) {
     return {};
+  }
+  if (const std::size_t depth = sql::Depth(*ast); depth > sql::kMaxExpressionDepth) {
+    return std::format("an expression tree is {} levels deep (limit {})", depth,
+                       sql::kMaxExpressionDepth);
   }
   const std::string text = unparse(*ast);
   const auto again = sql::Parse(text);
