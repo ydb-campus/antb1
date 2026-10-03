@@ -169,7 +169,7 @@ LogicalNodePtr DependentKeys(const LogicalNodePtr& node, bool limited) {
     limited = false;
   }
   const bool group = std::holds_alternative<GroupAggregateNode>(*node);
-  const LogicalNodePtr current = MapInputs(
+  LogicalNodePtr current = MapInputs(
       node, [&](const LogicalNodePtr& input) { return DependentKeys(input, limited && !group); });
   if (const auto* aggregate = std::get_if<GroupAggregateNode>(current.get());
       aggregate != nullptr && !limited) {

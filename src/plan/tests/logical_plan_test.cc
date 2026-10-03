@@ -285,6 +285,7 @@ TEST(LogicalPlanTest, NodeNamesSpansAndInputs) {
 
     // WithInputs: a copy of the node, its span and its other fields kept, over new inputs.
     std::vector<LogicalNodePtr> replaced;
+    replaced.reserve(inputs.size());
     for (std::size_t k = 0; k < inputs.size(); ++k) {
       replaced.push_back(
           std::make_shared<const LogicalNode>(ScanNode{.table = table, .span = span(20 + k)}));

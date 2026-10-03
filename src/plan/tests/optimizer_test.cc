@@ -484,12 +484,12 @@ LogicalNodePtr FourFields(std::uint32_t first) {
 
 // Field `field` of FourFields(first).
 BoundColumn FieldOf(std::uint32_t first, int field) {
-  static const std::vector<std::pair<std::string, LogicalType>> kFields = {
+  const std::vector<std::pair<std::string, LogicalType>> fields = {
       {"i16", LogicalType::kSmallInt},
       {"i32", LogicalType::kInteger},
       {"i64", LogicalType::kBigInt},
       {"u16", LogicalType::kUSmallInt}};
-  const auto& [name, type] = kFields.at(static_cast<std::size_t>(field));
+  const auto& [name, type] = fields.at(static_cast<std::size_t>(field));
   return BoundColumn{.index = 0,
                      .id = ColumnId{first + static_cast<std::uint32_t>(field)},
                      .name = name,
@@ -615,7 +615,7 @@ TEST(OptimizerTest, CountStarInsideAJoinInputBecomesRowCount) {
       .aggregates = {AggregateCall{.kind = AggKind::kCountStar, .id = ColumnId{30}}},
       .span = {}})));
   EXPECT_TRUE(std::holds_alternative<AggregateNode>(*above.root)) << Explain(above);
-  const JoinNode* join_below = Find<JoinNode>(above.root);
+  const auto* join_below = Find<JoinNode>(above.root);
   ASSERT_NE(join_below, nullptr);
   EXPECT_EQ(std::get<ScanNode>(*join_below->left).fields, (std::vector<int>{1})) << "the key";
   EXPECT_EQ(std::get<ScanNode>(*join_below->right).fields, (std::vector<int>{1}));
