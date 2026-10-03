@@ -1,0 +1,6 @@
+Output: id:INTEGER p:DECIMAL(15,2)
+Project id, p
+  Limit 3
+    Sort p ASC NULLS LAST
+      Filter p <= 12.34 AND d38_10 > -0.5000000000 AND d9_2 IN (1.25, 5.00)
+        Scan table=d source=parquet(files=1, rows=40) columns=[id, d9_2, d38_10, p]
