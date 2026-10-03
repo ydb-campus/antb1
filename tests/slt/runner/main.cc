@@ -439,10 +439,15 @@ int Diff(const Args& args, std::vector<TableDef> tables, const std::string& comm
   if (*mutation != Mutation::kNone) {
     mutating = MakeMutatingEngine(**antb1, *mutation);
   }
+  std::string pixi_args;
+  for (const auto& name : args.only_tables) {
+    pixi_args += " --table " + name;
+  }
   const DiffOptions options{.count = args.count,
                             .only = args.only,
                             .redact = args.redact,
                             .pixi_repro = IsDiffRandomTables(args.tables),
+                            .pixi_args = pixi_args,
                             .command = command};
   std::string out;
   const DiffStats stats =

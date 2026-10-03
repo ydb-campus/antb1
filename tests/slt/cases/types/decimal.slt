@@ -234,6 +234,50 @@ SELECT COUNT(*) FROM decimals WHERE p > 0 OR q < 0
 ----
 24
 
+# Folded literals under OR and NOT keep three-valued logic: a NULL p stays NULL.
+
+query I rowsort
+SELECT id FROM decimals WHERE p = 59.975 OR id = 1
+----
+1
+
+query I nosort
+SELECT COUNT(*) FROM decimals WHERE NOT (p <> 59.975)
+----
+0
+
+query I nosort
+SELECT COUNT(*) FROM decimals WHERE NOT (p = 59.975)
+----
+32
+
+# HAVING folds into the aggregate's own scale.
+
+query DI rowsort
+SELECT d9_2, COUNT(*) FROM decimals GROUP BY d9_2 HAVING MAX(p) < 59.975
+----
+-1.25	3
+-2.50	2
+-3.75	3
+-5.00	3
+-6.25	4
+-9999999.99	1
+0.00	4
+1.25	3
+2.50	2
+3.75	2
+9999999.99	1
+
+query DD rowsort
+SELECT d18_4, MIN(q) FROM decimals GROUP BY d18_4 HAVING MIN(q) >= -59.975 AND MAX(d38_10) > 0.0000000001
+----
+-3.0003	-59.97
+1.0001	19.99
+2.0002	39.98
+4.0004	79.96
+5.0005	99.95
+NULL	39.98
+
 # Two columns of the same DECIMAL(p,s) compare by value.
 
 query I rowsort

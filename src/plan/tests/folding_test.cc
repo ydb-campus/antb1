@@ -233,6 +233,7 @@ void PrintTo(const FoldCase& c, std::ostream* os) { *os << c.where; }
 
 class FoldThroughBinderTest : public ::testing::TestWithParam<FoldCase> {};
 class FoldDecimalTest : public ::testing::TestWithParam<FoldCase> {};
+class FoldHavingTest : public ::testing::TestWithParam<FoldCase> {};
 
 TEST_P(FoldThroughBinderTest, Folds) {
   const FoldCase& c = GetParam();
@@ -402,6 +403,44 @@ INSTANTIATE_TEST_SUITE_P(
                       FoldCase{"'2020-01-02'::DATE >= dt", kCompare, CompareOp::kLe, 18263},
                       FoldCase{"dt <> ('2020-01-02')::DATE", kCompare, CompareOp::kNe, 18263},
                       FoldCase{"(('2020-01-02'::DATE)) = dt", kCompare, CompareOp::kEq, 18263}));
+
+// HAVING folds into the aggregate's type the same way: an integer SUM is HUGEINT, with the range
+// +-(10^38 - 1), and MIN and MAX of a DECIMAL keep the column's (p,s).
+TEST_P(FoldHavingTest, Folds) {
+  const FoldCase& c = GetParam();
+  const Catalog catalog = MakeCatalog();
+  const std::string sql = "SELECT COUNT(*) FROM dec HAVING " + std::string(c.where);
+  auto plan = BindSql(sql, catalog);
+  ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+  const Predicate& p = std::get<FilterNode>(Nth(*plan, 1)).predicates.at(0);
+  EXPECT_EQ(p.kind, c.kind);
+  EXPECT_EQ(p.column.has_value(), c.kind != Predicate::Kind::kFalse);
+  if (c.kind == Predicate::Kind::kCompare) {
+    EXPECT_EQ(p.op, c.op);
+    EXPECT_EQ(Int128ToString(std::get<Int128>(p.constant.value)), Int128ToString(c.value));
+    ASSERT_TRUE(p.column.has_value());
+    if (p.column.has_value()) {
+      EXPECT_EQ(p.constant.type, p.column->type);
+    }
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Binder, FoldHavingTest,
+    ::testing::Values(
+        // HUGEINT (an integer SUM): +-(10^38 - 1).
+        FoldCase{"SUM(i) = 99999999999999999999999999999999999999", kCompare, CompareOp::kEq,
+                 RangeOf(LogicalType::kHugeInt).max},
+        FoldCase{"SUM(i) < 100000000000000000000000000000000000000", kIsNotNull},
+        FoldCase{"SUM(i) > -100000000000000000000000000000000000000", kIsNotNull},
+        // 1e38 is a DOUBLE (below 10^38): SUM(i) >= 99999999999999997748809823456034029568.
+        FoldCase{"SUM(i) >= 1e38", kCompare, CompareOp::kGe, static_cast<Int128>(1e38)},
+        FoldCase{"SUM(i) >= 1.0000000000000001e38", kFalse},
+        // MIN and MAX of DECIMAL(15,2) and DECIMAL(38,10): the column's scale.
+        FoldCase{"MAX(p) < 12.345", kCompare, CompareOp::kLe, 1234},
+        FoldCase{"MIN(p) >= -12.345", kCompare, CompareOp::kGe, -1234},
+        FoldCase{"MIN(p) <> 0.001", kIsNotNull}, FoldCase{"MAX(z) = 0.00000000001", kFalse},
+        FoldCase{"MAX(z) > 0.00000000001", kCompare, CompareOp::kGe, 1}));
 
 }  // namespace
 }  // namespace antb1::plan

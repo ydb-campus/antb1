@@ -200,6 +200,12 @@ TEST(LogicalPlanTest, ConstantText) {
                               .value = std::string("a\tb\\c\x7f\xC3\xA9\0", 9)}),
             R"('a\x09b\x5Cc\x7F\xC3\xA9\x00')");
   EXPECT_EQ(ToString(Constant{.type = LogicalType::kVarchar, .value = std::string()}), "''");
+  // A DECIMAL is its unscaled value printed with the type's scale, as DuckDB prints it.
+  EXPECT_EQ(ToString(Constant{.type = LogicalType::Decimal(15, 2), .value = Int128{-25}}), "-0.25");
+  EXPECT_EQ(ToString(Constant{.type = LogicalType::Decimal(15, 2), .value = Int128{1700}}),
+            "17.00");
+  EXPECT_EQ(ToString(Constant{.type = LogicalType::Decimal(3, 3), .value = Int128{500}}), ".500");
+  EXPECT_EQ(ToString(Constant{.type = LogicalType::Decimal(38, 0), .value = Int128{-7}}), "-7");
 }
 
 TEST(LogicalPlanTest, ArrowScalars) {
@@ -235,6 +241,11 @@ TEST(LogicalPlanTest, ArrowScalars) {
   ASSERT_TRUE(s->type->Equals(*arrow::decimal128(38, 0)));
   EXPECT_EQ(static_cast<const arrow::Decimal128Scalar&>(*s).value.ToIntegerString(),
             Int128ToString(big));
+  // A DECIMAL constant carries its own (p,s), so it compares with the column at the same scale.
+  s = scalar({.type = LogicalType::Decimal(15, 2), .value = Int128{-1234}});
+  ASSERT_NE(s, nullptr);
+  ASSERT_TRUE(s->type->Equals(*arrow::decimal128(15, 2)));
+  EXPECT_EQ(static_cast<const arrow::Decimal128Scalar&>(*s).value.ToIntegerString(), "-1234");
 }
 
 TEST(LogicalPlanTest, ArrowScalarErrors) {
@@ -243,6 +254,11 @@ TEST(LogicalPlanTest, ArrowScalarErrors) {
   EXPECT_TRUE(invalid({.type = LogicalType::kUSmallInt, .value = Int128{-1}}));
   EXPECT_TRUE(invalid({.type = LogicalType::kBigInt, .value = kInt128Max}));
   EXPECT_TRUE(invalid({.type = LogicalType::kHugeInt, .value = kInt128Max}));
+  // A DECIMAL(p,s) holds at most p digits: 10^15 is outside DECIMAL(15,2).
+  EXPECT_TRUE(
+      invalid({.type = LogicalType::Decimal(15, 2), .value = Int128{1'000'000'000'000'000}}));
+  EXPECT_FALSE(
+      invalid({.type = LogicalType::Decimal(15, 2), .value = Int128{999'999'999'999'999}}));
   EXPECT_TRUE(
       invalid({.type = LogicalType::kDate, .value = Int128{1'099'511'627'776}}));  // 2^40 days
   EXPECT_TRUE(invalid({.type = LogicalType::kDouble, .value = Int128{1}}));

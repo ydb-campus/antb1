@@ -40,6 +40,9 @@ struct DiffOptions {
   // The tables are those of `pixi run diff-random` (tests/slt/tables.txt), which then reproduces
   // a case with ANTB1_DIFF_SEED and ANTB1_DIFF_ONLY.
   bool pixi_repro = true;
+  // Arguments after `pixi run diff-random` in that repro: the `--table` filter of a run over some
+  // of those tables, which the script forwards, so the repro generates over the same tables.
+  std::string pixi_args;
   std::string command;        // the antb1-slt command line without --redact and --only (repro)
   uint64_t max_reports = 10;  // failures reported in full; the rest are only counted
 };
