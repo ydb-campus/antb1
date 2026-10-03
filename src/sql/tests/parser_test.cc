@@ -768,8 +768,6 @@ TEST(ParserTest, ExpressionDepthIsLimited) {
   EXPECT_TRUE(Parse(then).has_value());
 }
 
-// The levels that the canonical form adds count too (x::T is CAST(x AS T), -x is -(x)), so that
-// the canonical form of every accepted query parses.
 // The first n at which `sql(n)` is rejected, after checking that every accepted n round-trips
 // through the canonical form within the depth limit and that every n from there on is the depth
 // error. 0 when none up to `max` is rejected.
@@ -889,6 +887,14 @@ TEST(ParserTest, CanonicalFormStaysWithinTheDepthLimit) {
                         return where("a BETWEEN 0 AND " + Repeat("(NOT a BETWEEN 0 AND ", n) + "a" +
                                      std::string(n, ')'));
                       }},
+           // A NOT after a minus's operand is not the minus's operand: it counts.
+           Family{
+               .name = "after minus",
+               .bare = [&](std::size_t n) { return where("-a = " + Repeat("NOT -a = ", n) + "a"); },
+               .parenthesized =
+                   [&](std::size_t n) {
+                     return where("-a = " + Repeat("(NOT -a = ", n) + "a" + std::string(n, ')'));
+                   }},
            Family{.name = "minus",
                   .bare = [](std::size_t n) { return "SELECT " + Repeat("-NOT ", n) + "a FROM t"; },
                   .parenthesized =
@@ -903,6 +909,8 @@ TEST(ParserTest, CanonicalFormStaysWithinTheDepthLimit) {
   }
 }
 
+// The levels that the canonical form adds count too (x::T is CAST(x AS T), -x is -(x)), so that
+// the canonical form of every accepted query parses.
 TEST(ParserTest, CanonicalLevelsCountAgainstTheDepthLimit) {
   const auto calls = [](std::size_t n, std::string_view before, std::string_view after) {
     std::string sql = "SELECT " + std::string(before);
