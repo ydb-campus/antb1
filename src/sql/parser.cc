@@ -1400,6 +1400,9 @@ class Parser {
       // Like the AND chain: each OR is the new root one level below the clause, over the tree so
       // far and its right operand, both one level down.
       const std::size_t lhs_peak = peak_;
+      if (lhs_peak + 1 > kMaxDepth) {
+        return std::unexpected(DepthError(op.span));  // before the right operand: first error wins
+      }
       peak_ = depth_;
       auto rhs = ParseExpr(context, kAndPrecedence);
       if (!rhs) {

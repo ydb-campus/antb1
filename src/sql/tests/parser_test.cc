@@ -1,5 +1,6 @@
 #include "antb1/sql/parser.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -773,19 +774,43 @@ TEST(ParserTest, ExpressionDepthIsLimited) {
 // error. 0 when none up to `max` is rejected.
 std::size_t FirstTooDeep(const std::function<std::string(std::size_t)>& sql,
                          std::size_t max = 400) {
-  std::size_t first = 0;
-  for (std::size_t n = 1; n <= max; ++n) {
-    const std::string text = sql(n);
-    auto stmt = Parse(text);
-    if (first != 0) {
-      EXPECT_FALSE(stmt.has_value()) << "accepted after a rejection: n=" << n;
+  const auto accepted = [&](std::size_t n) { return Parse(sql(n)).has_value(); };
+  // Acceptance shrinks as n grows: find the first rejected n by bisection (a sweep of every n
+  // costs quadratic time, too slow under the sanitizers), then check the window around it and a
+  // sample below it.
+  if (accepted(max)) {
+    ADD_FAILURE() << "nothing rejected up to n=" << max;
+    return 0;
+  }
+  std::size_t lo = 0;    // accepted, or 0
+  std::size_t hi = max;  // rejected
+  while (hi - lo > 1) {
+    const std::size_t mid = lo + ((hi - lo) / 2);
+    (accepted(mid) ? lo : hi) = mid;
+  }
+  const std::size_t first = hi;
+  for (std::size_t n = first; n <= std::min(max, first + 3); ++n) {
+    auto stmt = Parse(sql(n));
+    if (stmt.has_value()) {
+      ADD_FAILURE() << "accepted after a rejection: n=" << n;
       continue;
     }
+    EXPECT_EQ(stmt.error().kind, ParseError::Kind::kUnsupported) << stmt.error().message;
+    EXPECT_TRUE(stmt.error().message.starts_with("expressions deeper than 256 levels"))
+        << stmt.error().message;
+  }
+  std::vector<std::size_t> below;
+  for (std::size_t n = 1; n < first; n = (n * 2) + 1) {
+    below.push_back(n);
+  }
+  for (std::size_t n = first > 4 ? first - 4 : 1; n < first; ++n) {
+    below.push_back(n);
+  }
+  for (const std::size_t n : below) {
+    auto stmt = Parse(sql(n));
     if (!stmt.has_value()) {
-      EXPECT_EQ(stmt.error().kind, ParseError::Kind::kUnsupported) << stmt.error().message;
-      EXPECT_TRUE(stmt.error().message.starts_with("expressions deeper than 256 levels"))
-          << stmt.error().message;
-      first = n;
+      ADD_FAILURE() << "rejected below the first rejection " << first << ": n=" << n << ": "
+                    << stmt.error().message;
       continue;
     }
     EXPECT_LE(Depth(*stmt), kMaxExpressionDepth) << "n=" << n;
@@ -794,7 +819,7 @@ std::size_t FirstTooDeep(const std::function<std::string(std::size_t)>& sql,
     if (!again.has_value()) {
       ADD_FAILURE() << "n=" << n
                     << ": the canonical form does not parse: " << again.error().message;
-      return 0;
+      continue;
     }
     EXPECT_TRUE(EqualIgnoringSpans(*stmt, *again)) << "n=" << n;
     EXPECT_EQ(ToSql(*again), canonical) << "n=" << n;
