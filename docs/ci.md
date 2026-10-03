@@ -190,7 +190,9 @@ measurements are recorded here once enough runs exist.
 
 Artifacts never contain data: the coverage summary holds only percentages, fuzz inputs grow from our own seed
 corpus, the benchmark results hold only timings (never query text or results), and the data jobs
-(`clickbench-hits0`, nightly `asan-data` and `arm64`) upload nothing.
+(`clickbench-hits0`, nightly `asan-data` and `arm64`) upload nothing. The `logs-<job>` files hold the output of the
+tests over the data derived from TPC-H, which is redacted like the data tests' (query numbers, counts and hashes;
+[testing.md](testing.md#data-derived-from-tpc-h)); the generated data stays in the build tree.
 
 ## Caches
 

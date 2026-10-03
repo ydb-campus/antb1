@@ -1,0 +1,10 @@
+# The tables derived from TPC-H at scale factor 0.1, written at test time by tests/tpch/generate.cmake (fixtures.tpch)
+# and never committed (ADR 0006). `redact`: no value of them is ever printed (tests/slt/runner/tables.h).
+customer  tpch/sf0_1/customer.parquet  redact
+lineitem  tpch/sf0_1/lineitem.parquet  redact
+nation    tpch/sf0_1/nation.parquet  redact
+orders    tpch/sf0_1/orders.parquet  redact
+part      tpch/sf0_1/part.parquet  redact
+partsupp  tpch/sf0_1/partsupp.parquet  redact
+region    tpch/sf0_1/region.parquet  redact
+supplier  tpch/sf0_1/supplier.parquet  redact
