@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791057383149,
+  "lastUpdate": 1791070165045,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -4572,6 +4572,90 @@ window.BENCHMARK_DATA = {
             "value": 14.346001714285677,
             "unit": "ms/iter",
             "extra": "iterations: 49\ncpu: 14.344388183673445 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "3a309355a24c2cccb787263cef9fbc1639bc11fe",
+          "message": "feat(plan,exec): decimal arithmetic, sum and avg (#90)\n\n## Summary\n\nDECIMAL `+`, `-`, `*` and unary `-`, SUM and AVG, typed and computed as\nin DuckDB 1.5.5. This is PR D3 of the roadmap\nfor the queries derived from TPC-H (types track, [ADR\n0021](docs/adr/0021-decimal-semantics.md) rules 4 to 7, 12, 13\nand 18). **Q1 and Q6 now pass** (equal to DuckDB at SF 0.01 and 0.1, at\n1 and 4 threads): `tests/data/tpch_status.json`\nlists `[1, 6]` (the maintainer approved this change of an \"Ask a human\nfirst\" path in the planning session) and the\ndocs table marks both `pass`. The other 20 queries still exit 4.\n\n**Types** (binder, `DecimalArithType`; every rule probed with DuckDB's\n`typeof`):\n\n- an integer operand counts as DECIMAL(5,0) (SMALLINT, USMALLINT),\n(10,0) (INTEGER; an integer literal does not\n  shrink), (19,0) (BIGINT) or (38,0) (HUGEINT);\n- `+`/`-`: s = max(s1, s2), p = max(p1 - s1, p2 - s2) + s + 1; `*`: s =\ns1 + s2, p = p1 + p2; beyond 18 digits from two\noperands of at most 18 the width is 18 (for `*` only while s < 18),\nbeyond 38 it is 38; a scale beyond 38 is a bind\nerror with DuckDB's \"Needed scale ...\" message; unary `-` keeps the\ntype;\n- SUM of DECIMAL(p,s) is DECIMAL(38,s); AVG is DOUBLE.\n\n**Execution** (`src/exec/compute.cc`, aggregate states):\n\n- `DecimalArith` reads each operand in its own type. For `+` and `-` the\nleft operand is computed and rescaled to the\nresult before the right one is computed, as in DuckDB. `*` multiplies\nthe unscaled values. Every result is checked\n  against 10^p - 1.\n- DuckDB's exact error texts (probed):\n- `Overflow in addition|subtract|multiplication of DECIMAL(18|38) (x op\ny)` with DuckDB's per-case hint;\n- `Casting value \"...\" to type DECIMAL(p,s) failed: value is out of\nrange!` (decimal source) and\n`Could not cast value N to DECIMAL(p,s)` (integer source), with ` when\ncasting from source column X` for a\n    column operand.\n- Unary `-` fails with `Overflow in negation of DECIMAL(p,s)` on the\n128-bit minimum, a value a file can hold beyond\n  its declared width (nothing checks the width on read).\n- SUM reuses the checked Int128 HUGEINT states, generalised to DECIMAL\ninput: an exact DECIMAL(38,s), the same at any\n  thread count.\n- AVG uses DuckDB's formula, `DuckDbDecimalAverage` in `src/common`: the\nsum as a long double from its two 64-bit\nhalves (lower + upper × 2^64), divided by count × double(10^s) in long\ndouble (double for p ≤ 4).\n- It is verified bit for bit against DuckDB on 9 cases, including 5\nwhere the correctly rounded mean differs.\n- The unit test carries the expected values for both x87 and 64-bit long\ndouble, since `long double` differs by\n    platform (as in DuckDB's own build).\n- `MayRouteRows` treats a SUM/AVG of a DECIMAL wider than 18 digits like\nHUGEINT (checked adds).\n\n**No integer-only rewrites** (rule 18): the `SUM(x + c)` rewrite and\nconstant moving stay for signed integers; tests\npin that DECIMAL gets neither.\n\n**Still exit 4** (D4 lifts them): `/`, `//` and `%` of a DECIMAL, a\ndecimal literal or DOUBLE in DECIMAL arithmetic,\nDECIMAL CASE values, and mixed-type comparisons.\n\n**Tests:**\n\n- plan: a result-type table (rules 4 to 6, both caps, every integer\nwidth), error cases, folding over computed\n  DECIMALs and DECIMAL sums in HAVING, and the no-rewrite test;\n- exec: kernels at both caps with DuckDB's messages, rescale errors with\nand without a source column, the operand\norder, the negation of the 128-bit minimum, and SUM/AVG states (range\nand 128-bit errors, merge, NULL over no rows);\nthe grouped random-equality tests now include DECIMAL SUM/AVG, and the\nrouted-rows test pins `MayRouteRows` for a\n  DECIMAL SUM/AVG wider and narrower than 18 digits;\n- common: `DuckDbDecimalAverage`;\n- `tests/slt/cases/types/decimal_arithmetic.slt` (expected blocks from\n`pixi run slt-complete`, also at 4 threads):\nvalues, folding, SUM/AVG/GROUP BY/HAVING/ORDER BY, the overflow and cast\nerrors on both engines, divergence D18, and\n  the remaining exit-4 cases;\n- generator: DECIMAL columns get a data range. SUM/AVG of a DECIMAL is\ndrawn only when its sum over every row fits 38\ndigits. `+ k`, `- k`, `* k` and unary `-` are drawn only when the capped\ntype cannot overflow (the sum included).\nUnit tests pin these guards and the data range read from the files.\n`diff.random` is unchanged; `diff.decimal` and\n  `diff.tpch` change by design.\n\n**Docs** (`docs/sql-subset.md`): DECIMAL arithmetic typing, errors, SUM\nand AVG, HAVING literal types, the exit-4 list,\nD14 extended, and two new divergences:\n\n- D18: a DECIMAL SUM beyond 38 digits is an error, where DuckDB returns\n39 digits.\n- D19: with several failing rows, an overflow or cast error can name\nanother row's values than DuckDB's (batch size\nand ADR 0018's dependent keys); the exit code and whether a query fails\nare the same.\n\nFor the maintainer:\n\n- Differences from the approved plan:\n- I wrote that `diff.tpch` would be unchanged. It changes, because the\nTPC-H-derived tables' DECIMAL columns can now\n    be summed.\n  - D19 is new, from the reviewer agent's findings.\n- `tests/data/tpch_status.json` needs your CODEOWNERS review.\n- Size L (23 files, about 1,400 lines). The split review you asked for\nfound one P0: negating the 128-bit minimum was\nundefined behavior, in the kernel and in the generator's data range. It\nalso found missing tests for the routing\nrule and the generator's overflow guards, and a docs sentence moved out\nof the general arithmetic bullet. All are\n  fixed in eb06c31.\n\nThis workload is derived from the TPC-H Benchmark and is not comparable\nto published TPC-H Benchmark results, as this\nimplementation does not comply with all requirements of the TPC-H\nBenchmark.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full                  # on eb06c31 (the head)\nlint: PASS\n100% tests passed out of 1763          # ci (clang Debug -Werror)\n100% tests passed out of 1763          # asan (ASan + UBSan)\n                                       # tidy: clean\ncoverage: PASS\n100% tests passed out of 2             # fuzz-smoke\n100% tests passed out of 1763          # ci-gcc\n$ ANTB1_DIFF_SEED=7 ANTB1_DIFF_COUNT=20000 pixi run diff-random   # on 6853e3e (generation unchanged since)\nDIFF: PASS seed=7 queries=20000 failed=0 unsupported=0\n$ ANTB1_DIFF_SEED=<1..3> ANTB1_DIFF_COUNT=5000 pixi run diff-random --table decimals --target-percent 50\nDIFF: PASS seed=1 queries=5000 failed=0 unsupported=0   # likewise seeds 2 and 3\n$ pixi run test -R 'tpch.status'       # redacted: Q1 pass, Q6 pass, 20 unsupported, at SF 0.01, 0.1 and 4 threads\nANTB1-TESTS: PASS\n```\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: `tests/data/tpch_status.json`\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code implemented the\nmaintainer-approved plan (binder, exec kernels\nand aggregate states, DuckDB's AVG formula, tests, generator, docs)\nafter probing DuckDB 1.5.5 for its types, error\ntexts and AVG rounding; a reviewer agent reviewed the diff (its findings\nare fixed in 0c9d171), then once more as a\nsplit review in four parts (plan; exec and common; tests and harness;\ndocs), whose findings are fixed in eb06c31.\n- Accountable human (has read and understands the whole diff): @hor911\n\n---------\n\nCo-authored-by: Claude <noreply@anthropic.com>",
+          "timestamp": "2026-10-04T02:26:28+03:00",
+          "tree_id": "475f40e5d1ed6366409863247dae7bd65f7e4ff7",
+          "url": "https://github.com/ydb-campus/antb1/commit/3a309355a24c2cccb787263cef9fbc1639bc11fe"
+        },
+        "date": 1791070164611,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4553.752052684316,
+            "unit": "ns/iter",
+            "extra": "iterations: 153214\ncpu: 4553.008354327932 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 85262.99971707804,
+            "unit": "ns/iter",
+            "extra": "iterations: 7069\ncpu: 85200.36596406845 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222461.10476188848,
+            "unit": "ns/iter",
+            "extra": "iterations: 3150\ncpu: 222356.4444444445 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 439914.74085753364,
+            "unit": "ns/iter",
+            "extra": "iterations: 1586\ncpu: 439653.875157629 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 401741.5226881006,
+            "unit": "ns/iter",
+            "extra": "iterations: 1741\ncpu: 401700.8144744398 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2102062.2012011623,
+            "unit": "ns/iter",
+            "extra": "iterations: 333\ncpu: 2101788.1861861865 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 53.16678899999753,
+            "unit": "ms/iter",
+            "extra": "iterations: 12\ncpu: 53.142182833333315 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 48.826945733333105,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 48.81412973333337 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 241.74649466666173,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 241.72282533333285 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.455204625000087,
+            "unit": "ms/iter",
+            "extra": "iterations: 48\ncpu: 14.45203389583331 ms\nthreads: 1"
           }
         ]
       }
