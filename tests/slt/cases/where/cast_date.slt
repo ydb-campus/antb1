@@ -1,0 +1,163 @@
+# Date casts (docs/sql-subset.md): CAST('YYYY-MM-DD' AS DATE) and 'YYYY-MM-DD'::DATE are the literal
+# DATE 'YYYY-MM-DD' in every clause, in any case and on either side of a comparison. EventDate (uint16 days)
+# reads as DATE through the `clickbench` option of tests/slt/tables.txt.
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE EventDate = CAST('2013-07-15' AS DATE)
+----
+335
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE EventDate >= '2013-07-10'::DATE AND EventDate < cast('2013-07-20' as date)
+----
+3227
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE '2013-07-04'::date >= EventDate
+----
+1376
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE CAST('2013-07-30' AS DATE) < EventDate OR EventDate <= ('2013-07-01')::Date
+----
+676
+
+query I nosort
+SELECT COUNT(*) FROM hits_like_nulls WHERE EventDate IN ('2013-07-01'::DATE, CAST('2013-07-31' AS DATE), DATE '2013-07-15')
+----
+941
+
+query I nosort
+SELECT COUNT(*) FROM hits_like_nulls WHERE EventDate NOT IN ('2013-07-01'::DATE, CAST('2013-07-31' AS DATE))
+----
+8604
+
+query TI rowsort
+SELECT EventDate, COUNT(*) FROM hits_like_split WHERE EventDate > '2013-07-27'::DATE GROUP BY EventDate
+----
+2013-07-28	335
+2013-07-29	336
+2013-07-30	327
+2013-07-31	323
+
+query ITT rowsort
+SELECT AdvEngineID, MIN(EventDate), MAX(EventDate) FROM hits_like GROUP BY AdvEngineID HAVING MIN(EventDate) <= CAST('2013-07-01' AS DATE) AND MAX(EventDate) >= '2013-07-31'::DATE
+----
+0	2013-07-01	2013-07-31
+12	2013-07-01	2013-07-31
+20	2013-07-01	2013-07-31
+27	2013-07-01	2013-07-31
+33	2013-07-01	2013-07-31
+34	2013-07-01	2013-07-31
+35	2013-07-01	2013-07-31
+40	2013-07-01	2013-07-31
+43	2013-07-01	2013-07-31
+48	2013-07-01	2013-07-31
+5	2013-07-01	2013-07-31
+57	2013-07-01	2013-07-31
+6	2013-07-01	2013-07-31
+
+query IT nosort
+SELECT AdvEngineID, MAX(EventDate) FROM hits_like WHERE EventDate < '2013-07-02'::DATE GROUP BY AdvEngineID ORDER BY '2013-07-15'::DATE, AdvEngineID
+----
+0	2013-07-01
+3	2013-07-01
+5	2013-07-01
+6	2013-07-01
+7	2013-07-01
+9	2013-07-01
+10	2013-07-01
+12	2013-07-01
+14	2013-07-01
+16	2013-07-01
+20	2013-07-01
+27	2013-07-01
+33	2013-07-01
+34	2013-07-01
+35	2013-07-01
+39	2013-07-01
+40	2013-07-01
+42	2013-07-01
+43	2013-07-01
+45	2013-07-01
+48	2013-07-01
+49	2013-07-01
+55	2013-07-01
+56	2013-07-01
+57	2013-07-01
+59	2013-07-01
+
+# Constants: DuckDB names a cast like the DATE literal, CAST('2020-01-02' AS "DATE").
+
+query TTT nosort
+SELECT CAST('2020-01-02' AS DATE), '2024-01-31'::date AS d, DATE '2013-07-15' FROM hits_like LIMIT 2
+----
+2020-01-02	2024-01-31	2013-07-15
+2020-01-02	2024-01-31	2013-07-15
+
+query TI nosort
+SELECT '2020-01-02'::DATE, COUNT(*) FROM hits_like GROUP BY '2020-01-02'::DATE
+----
+2020-01-02	10000
+
+query TI nosort
+SELECT CAST('2020-01-02' AS DATE) AS k, COUNT(*) FROM hits_like_split GROUP BY 1
+----
+2020-01-02	10000
+
+query TI rowsort
+SELECT CASE WHEN EventDate < '2013-07-03'::DATE THEN CAST('2013-07-01' AS DATE) ELSE EventDate END AS d, COUNT(*) FROM hits_like WHERE EventDate < DATE '2013-07-06' GROUP BY d
+----
+2013-07-01	715
+2013-07-03	350
+2013-07-04	311
+2013-07-05	320
+
+query I nosort
+SELECT COUNT(CASE EventDate WHEN '2013-07-15'::DATE THEN 1 END) FROM hits_like
+----
+335
+
+# Timestamps: a date cast compared with a timestamp is its midnight.
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE toDateTime(EventTime) >= CAST('2013-07-15' AS DATE) AND toDateTime(EventTime) < '2013-07-16'::DATE
+----
+335
+
+query TII nosort
+SELECT date_trunc('month', '2013-07-15'::DATE), EXTRACT(year FROM '2013-07-15'::DATE), EXTRACT(day FROM CAST('2013-07-15' AS DATE)) FROM hits_like LIMIT 1
+----
+2013-07-01 00:00:00	2013	15
+
+# The empty table and a table of several files.
+
+query IT nosort
+SELECT COUNT(*), MAX(EventDate) FROM empty WHERE EventDate >= '2013-07-01'::DATE
+----
+0	NULL
+
+query TT nosort
+SELECT MIN(EventDate), MAX(EventDate) FROM hits_like_split WHERE AdvEngineID <> 0 AND EventDate > CAST('2013-07-05' AS DATE)
+----
+2013-07-06	2013-07-31
+
+# An invalid date fails in both engines.
+
+statement error
+SELECT COUNT(*) FROM hits_like WHERE EventDate = CAST('2013-02-30' AS DATE)
+
+statement error
+SELECT '2013-13-01'::DATE FROM hits_like
+
+# D5 (docs/sql-subset.md): a date is written exactly YYYY-MM-DD; DuckDB also accepts 2013-7-1.
+
+onlyif antb1
+statement error ^bind: invalid date '2013-7-1': expected YYYY-MM-DD
+SELECT COUNT(*) FROM hits_like WHERE EventDate = '2013-7-1'::DATE
+
+# D4: a DATE compared with a VARCHAR column is a bind error; DuckDB casts the column's values.
+
+onlyif antb1
+statement error ^bind: cannot compare VARCHAR column 'Title' with a DATE literal
+SELECT COUNT(*) FROM hits_like WHERE Title = CAST('2013-07-01' AS DATE)

@@ -13,10 +13,10 @@ included, projections (`*`, columns or constants), `WHERE` conditions (`column <
 `column [NOT] LIKE 'pattern'` and `column [NOT] IN (literal, ...)`, combined with `AND`, `OR` and `NOT`), `GROUP BY`
 and `ORDER BY` (also by position), `HAVING` (the same conditions on aggregates and keys), arithmetic
 (`+ - * / // %` and unary `-`), the string functions `strlen` and `regexp_replace`, the timestamp functions
-`toDateTime`, `EXTRACT` and `date_trunc`, and `CASE` in every clause,
-`LIMIT` and `OFFSET`, over one table of Parquet files. This covers all 43 ClickBench queries (see
-[ClickBench status](#clickbench-status)). None of the 22 queries derived from TPC-H passes yet (see
-[Queries derived from TPC-H](#queries-derived-from-tpc-h)).
+`toDateTime`, `EXTRACT` and `date_trunc`, and `CASE` in every clause, dates written as casts
+(`CAST('2013-07-01' AS DATE)`, `'2013-07-01'::DATE`), `LIMIT` and `OFFSET`, over one table of Parquet files. This
+covers all 43 ClickBench queries (see [ClickBench status](#clickbench-status)). None of the 22 queries derived from
+TPC-H passes yet (see [Queries derived from TPC-H](#queries-derived-from-tpc-h)).
 
 ```sql
 SELECT COUNT(*), SUM(ResolutionWidth) AS width, AVG(UserID), MAX(EventDate) FROM hits WHERE IsMobile = 1
@@ -69,12 +69,15 @@ condition   = sum , cmp_op , sum
             | sum , [ "NOT" ] , "IN" , "(" , expr , { "," , expr } , ")" ;
 sum         = sum , ( "+" | "-" ) , product | product ;
 product     = product , ( "*" | "/" | "//" | "%" ) , unary | unary ;
-unary       = "-" , unary | primary ;
+unary       = "-" , unary | postfix ;
+postfix     = primary , { "::" , type } ;
 primary     = identifier | literal | "(" , expr , ")" | agg_call
             | identifier , "(" , [ expr , { "," , expr } ] , ")"
             | "CASE" , [ expr ] , "WHEN" , expr , "THEN" , expr , { "WHEN" , expr , "THEN" , expr } ,
               [ "ELSE" , expr ] , "END"
-            | "EXTRACT" , "(" , identifier , "FROM" , expr , ")" ;
+            | "EXTRACT" , "(" , identifier , "FROM" , expr , ")"
+            | ( "CAST" | "TRY_CAST" ) , "(" , expr , "AS" , type , ")" ;
+type        = identifier , [ "(" , integer , { "," , integer } , ")" ] ;
 agg_call    = "COUNT" , "(" , "*" , ")"
             | "COUNT" , "(" , "DISTINCT" , expr , ")"
             | ( "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" ) , "(" , expr , ")" ;
@@ -84,18 +87,24 @@ literal     = [ "-" ] , integer | [ "-" ] , decimal | string_literal | "DATE" , 
 ```
 
 Operators bind from loosest to tightest: `OR`, `AND`, `NOT`, the comparisons with `LIKE` and `IN` (which do not
-chain: `a = b = c` is unsupported), `+` and `-`, `*`, `/`, `//` and `%`, unary `-`; binary operators are
+chain: `a = b = c` is unsupported), `+` and `-`, `*`, `/`, `//` and `%`, unary `-`, `::`; binary operators are
 left-associative, and parentheses group. An expression may be at most 256 levels deep (operators or parentheses; the
-top-level `AND` chain of `WHERE` and `HAVING` does not count), else it is unsupported. Aggregates are allowed in the
-select list, `HAVING` and `ORDER BY`, and cannot be nested.
+top-level `AND` chain of `WHERE` and `HAVING` does not count), else it is unsupported. A `::` and a unary `-` count one
+level more, as they do in the canonical form `CAST(x AS T)` and `-(x)` (a `-` before a parenthesized operand does
+not). Aggregates are allowed in the select list, `HAVING` and `ORDER BY`, and cannot be nested.
 
 Lexical rules: an `identifier` is a letter or `_` followed by letters, digits or `_`, or any text in double quotes
 (`""` escapes a quote); a `string_literal` is text in single quotes (`''` escapes a quote); an `integer` is a
 sequence of digits; a `decimal` is a number with a decimal point, an exponent or both (`1.5`, `.5`, `5.`, `1e3`).
-Keywords are not reserved by the lexer.
+Keywords are not reserved by the lexer. A `-` directly before a number makes a negative literal, except when `::`
+follows the number: `-1::INTEGER` is `-(CAST(1 AS INTEGER))`, as in DuckDB. The `identifier` of a `type` is unquoted
+and case-insensitive (`date` is `DATE`); its parameters are integers (`DECIMAL(15, 2)`). `CAST(x AS T)` and `x::T`
+are the same expression.
 
 **What the binder answers today.** Of the expressions above, antb1 answers:
 
+- date casts: `CAST('YYYY-MM-DD' AS DATE)` and `'YYYY-MM-DD'::DATE` are the literal `DATE 'YYYY-MM-DD'`
+  wherever it may stand, as in DuckDB (which names all three `CAST('YYYY-MM-DD' AS "DATE")`);
 - value expressions: columns, literals, aggregates, arithmetic (`+ - * / // %`, unary `-`), the functions
   `strlen(varchar)`, `regexp_replace(varchar, 'pattern', 'replacement')`, `toDateTime(integer)`,
   `EXTRACT(field FROM timestamp)` and `date_trunc('unit', timestamp)`, and `CASE` (both forms, with conditions
@@ -110,14 +119,15 @@ Keywords are not reserved by the lexer.
 
 Every other expression (function calls other than the five aggregates and the functions above, `EXTRACT` of other
 fields, a condition used as a value, as in `SELECT a = 1`, a comparison of two constants, a bare column as a
-condition) parses, and is then rejected by the binder with exit code 4 at its first token, before any name is
-resolved. `GROUP BY ALL` and `ORDER BY ALL` are rejected by the parser, and so are `SUM`, `AVG`, `MIN` and `MAX` with
-`DISTINCT`.
+condition, `TRY_CAST` and every other cast, such as `CAST(a AS BIGINT)` or `CAST(d AS DATE)`) parses, and is then
+rejected by the binder with exit code 4 at its first unsupported token, before any name is resolved. `GROUP BY ALL`
+and `ORDER BY ALL` are rejected by the parser, and so are `SUM`, `AVG`, `MIN` and `MAX` with `DISTINCT`.
 
 Outside the grammar, the parser recognizes common SQL and rejects it with exit code 4 and a source span, among others:
-`SELECT DISTINCT`, joins, subqueries, `ILIKE`, `LIKE ... ESCAPE`, `NULL` literals, `IS [NOT] NULL`, `BETWEEN`, `CAST`
-and `::`, `||`, window functions and unary `+`. Malformed SQL, such as `SELECT COUNT(*) FORM t`, is a syntax error with
-exit code 1.
+`SELECT DISTINCT`, joins, subqueries, `ILIKE`, `LIKE ... ESCAPE`, `NULL` literals, `IS [NOT] NULL`, `BETWEEN`, `||`,
+window functions, unary `+`, and in casts quoted or qualified type names, type names of several words
+(`DOUBLE PRECISION`, `TIMESTAMP WITH TIME ZONE`), array types, `INTERVAL` and `UNION` types and type parameters other
+than integers. Malformed SQL, such as `SELECT COUNT(*) FORM t`, is a syntax error with exit code 1.
 
 ## Binding
 
@@ -135,7 +145,8 @@ items).
   `ORDER BY`) or `HAVING` the query has one row.
 - Constants (as DuckDB types and names them): an integer is INTEGER when its magnitude fits (so `-2147483648` is
   BIGINT), else BIGINT or HUGEINT, and is named by its value (`007` is `7`); a string is VARCHAR named with its
-  quotes (`'it''s'`); `DATE '2020-01-02'` is DATE named `CAST('2020-01-02' AS "DATE")`, and
+  quotes (`'it''s'`); `DATE '2020-01-02'` is DATE named `CAST('2020-01-02' AS "DATE")` (so are
+  `CAST('2020-01-02' AS DATE)` and `'2020-01-02'::DATE`), and
   `TIMESTAMP '2020-01-02 10:00:00'` TIMESTAMP named `CAST('2020-01-02 10:00:00' AS TIMESTAMP)`. A decimal (DuckDB's
   DECIMAL) and an integer beyond HUGEINT's 38 digits are unsupported (exit code 4).
 - Positions: in `GROUP BY` and `ORDER BY` an integer literal names the select item at that position (1-based; `*`
@@ -233,8 +244,8 @@ error that points at the literal:
 | SMALLINT, INTEGER, BIGINT, USMALLINT, HUGEINT | integer, decimal | exactly, after folding (below) |
 | DOUBLE | integer, decimal | the nearest double, as in DuckDB for a DOUBLE column; beyond the double range `inf` or `-inf`, below the smallest subnormal `0`. A column stored as FLOAT is compared as DuckDB compares it: an integer or DECIMAL literal becomes the FLOAT that DuckDB casts it to, with DuckDB's rounding (`0.1` is `0.1F`; `16777217.5` and some long spellings of `0.1`, such as 16 or 24 decimals, are not the nearest FLOAT, and HUGEINT literals are rounded through a double), beyond the FLOAT range `inf` or `-inf`; a number DuckDB types as DOUBLE compares with the nearest double |
 | VARCHAR | string | bytes; `LIKE` and `NOT LIKE` take a string pattern (only a VARCHAR column: LIKE on another type is a bind error, as in DuckDB) |
-| DATE | string, `DATE` string | a date written exactly `YYYY-MM-DD` (years 0000 to 9999) that exists in the calendar |
-| TIMESTAMP (an expression) | string, `TIMESTAMP` string, `DATE` string | a timestamp written `YYYY-MM-DD`, optionally followed by a space (or `T`) and `HH:MM` or `HH:MM:SS` (hours 00 to 23) and an optional fraction of up to 9 digits (past the sixth truncated, as in DuckDB), or a DATE's midnight |
+| DATE | string, `DATE` string, date cast | a date written exactly `YYYY-MM-DD` (years 0000 to 9999) that exists in the calendar |
+| TIMESTAMP (an expression) | string, `TIMESTAMP` string, `DATE` string, date cast | a timestamp written `YYYY-MM-DD`, optionally followed by a space (or `T`) and `HH:MM` or `HH:MM:SS` (hours 00 to 23) and an optional fraction of up to 9 digits (past the sixth truncated, as in DuckDB), or a DATE's midnight |
 
 A comparison of an integer column with a number is folded exactly at bind time, never through a lossy cast:
 
@@ -497,7 +508,7 @@ formatter:
 | 1 | query error: syntax, bind, execution or memory error | `SELECT COUNT(*) FORM t`; an unknown table or column; `SUM` of a VARCHAR column; a `SUM` outside HUGEINT's range; an invalid `regexp_replace` pattern; a query that needs more memory than `--memory-limit` |
 | 2 | usage error | unknown option; neither or both of `-c` and `-f`; a malformed `--table`, `--column-type` or `--memory-limit`; a column that `--column-type` cannot read as DATE; a table name registered twice |
 | 3 | I/O error | a missing or unreadable file; not a Parquet file; schemas that differ; a glob that matches nothing |
-| 4 | unsupported: valid-looking SQL outside the supported subset | `row_number() OVER ()`; `IS NULL`; an unknown function; `SELECT 2.5`; `SUM(DISTINCT ...)`; a column of an unsupported type |
+| 4 | unsupported: valid-looking SQL outside the supported subset | `row_number() OVER ()`; `IS NULL`; an unknown function; `SELECT 2.5`; `SUM(DISTINCT ...)`; `CAST(a AS BIGINT)`; a column of an unsupported type |
 | 70 | internal error: anything else, which is a bug | an uncaught exception; an Arrow `NotImplemented` or type error without SQL context |
 
 Exit code 4 is used only for errors that the parser, the binder or the physical planner marks as unsupported
@@ -526,8 +537,8 @@ compare against DuckDB, so an unregistered difference is a bug.
 | D1 | Files with different schemas | a table (or a `FROM '<glob>'`) whose files have different Parquet schemas is an I/O error, exit code 3: `schema of '<file>' differs from '<first file>'` | `read_parquet` over the same files reads them and answers | an `onlyif antb1` record in `tests/slt/cases/basic/errors.slt`; `integration.ParquetErrors.*` (mismatched and mixed schemas); the CLI golden `io_schema_mismatch`; every table in `tests/slt/tables.txt` has a single schema |
 | D2 | Column-type overrides | `--clickbench` and `--column-type COL=DATE` apply to every table with that column, including tables opened with `FROM '<path>'` | the oracle applies `make_date(EventDate)` only to the named tables with the `clickbench` option in `tests/slt/tables.txt`; `FROM '<path>'` reads the raw integers | the runner rejects a table list where some tables with an `EventDate` column have the option and others do not; the random generator never reads an overridden column through `FROM '<path>'`; `.slt` records read `EventDate` only through table names |
 | D3 | Literal types | a string literal compared with a numeric column is a bind error | casts the string to the column's type | `onlyif antb1` records in `tests/slt/cases/basic/bind_errors.slt`; the query generator writes numbers for numeric columns |
-| D4 | Literal types | a number or a `DATE` literal compared with a VARCHAR column is a bind error | casts the column's values at run time (a conversion error unless every value converts) | as D3; the generator writes strings for VARCHAR columns |
-| D5 | Date and timestamp literals | a date must be written exactly `YYYY-MM-DD`, a timestamp exactly as in the literal table (two-digit fields, one space or `T`, hours 00 to 23) | also accepts `2013-7-1`, surrounding spaces and a time of day for a DATE, and single-digit fields, spaces and `24:00:00` for a TIMESTAMP | as D3; the generator writes `YYYY-MM-DD` and `YYYY-MM-DD HH:MM:SS` |
+| D4 | Literal types | a number or a `DATE` literal (also written as a cast) compared with a VARCHAR column is a bind error | casts the column's values at run time (a conversion error unless every value converts) | as D3, and in `tests/slt/cases/where/cast_date.slt`; the generator writes strings for VARCHAR columns |
+| D5 | Date and timestamp literals | a date must be written exactly `YYYY-MM-DD` (also in a cast to DATE), a timestamp exactly as in the literal table (two-digit fields, one space or `T`, hours 00 to 23) | also accepts `2013-7-1`, surrounding spaces and a time of day for a DATE, and single-digit fields, spaces and `24:00:00` for a TIMESTAMP | as D4; the generator writes `YYYY-MM-DD` and `YYYY-MM-DD HH:MM:SS` |
 | D7 | DOUBLE literals and BIGINT | a number that DuckDB types as DOUBLE (an exponent, or more than 38 digits) is rounded to the nearest double like in DuckDB, then compared exactly with the integer column; in an `IN` list with such a number every value is rounded so | converts BIGINT (and HUGEINT) values to DOUBLE for the comparison, so values beyond 2^53 compare rounded: `i64 >= 9223372036854775808e0` holds for `9223372036854775807` | the `.slt` records with such literals avoid BIGINT values beyond 2^53 (`tests/slt/cases/where/folding.slt`); `plan.ApproximateNumbers/FoldThroughBinderTest.*` pins antb1's folding; the generator writes no exponents |
 | D8 | Result names | an aggregate's argument is quoted when it is not a plain identifier or is a reserved word | also quotes non-reserved keywords (`sum("year")`) | the tests compare values and types, not names |
 | D9 | HUGEINT range | HUGEINT is decimal128(38, 0): a `SUM`, or arithmetic on a `SUM`, outside -(10^38 - 1) to 10^38 - 1 is an execution error (exit code 1). An integer SUM over BIGINT or smaller types cannot reach it | HUGEINT holds -(2^127 - 1) to 2^127 - 1 | no fixture has a HUGEINT column; `exec.AggregateStateTest.HugeIntSumIsCheckedAgainstTheRange` checks the error |

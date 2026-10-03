@@ -1019,6 +1019,25 @@ std::vector<Relation> AllRelations() {
                   Q("SELECT COUNT(*) FROM hits_like WHERE Interests > 32767.5"),
                   Q("SELECT COUNT(*) FROM hits_like WHERE EventTime < -9223372036854775809")},
        .check = AllEqual()});
+  // The spellings of a date (DuckDB types all four as the DATE) select the same rows.
+  r.push_back({.name = "date_spellings_select_the_same_rows",
+               .features = {kCountStar, kColumns, kMultipleItems, kGroupBy, kWhere, kWhereAnd,
+                            kLiteralFirst, kDateColumns, kStringLiteral, kDateLiteral, kCastDate,
+                            kTableName},
+               .probes = {Q("SELECT EventDate, COUNT(*) FROM hits_like WHERE EventDate >= DATE "
+                            "'2013-07-15' AND EventDate <> DATE '2013-07-20' GROUP BY EventDate"),
+                          Q("SELECT EventDate, COUNT(*) FROM hits_like WHERE EventDate >= "
+                            "'2013-07-15' AND EventDate <> '2013-07-20' GROUP BY EventDate"),
+                          Q("SELECT EventDate, COUNT(*) FROM hits_like WHERE EventDate >= "
+                            "CAST('2013-07-15' AS DATE) AND EventDate <> CAST('2013-07-20' AS "
+                            "DATE) GROUP BY EventDate"),
+                          Q("SELECT EventDate, COUNT(*) FROM hits_like WHERE EventDate >= "
+                            "'2013-07-15'::date AND EventDate <> '2013-07-20'::DATE GROUP BY "
+                            "EventDate"),
+                          Q("SELECT EventDate, COUNT(*) FROM hits_like WHERE CAST('2013-07-15' AS "
+                            "DATE) <= EventDate AND '2013-07-20'::DATE <> EventDate GROUP BY "
+                            "EventDate")},
+               .check = AllEqual()});
   const std::string aggregates =
       "SELECT COUNT(*), COUNT(Title), SUM(UserID), AVG(ResolutionWidth), MIN(EventDate), MAX(URL) "
       "FROM ";

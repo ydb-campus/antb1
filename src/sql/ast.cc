@@ -82,6 +82,12 @@ bool Eq(const ExtractExpr& a, const ExtractExpr& b) {
   return a.field == b.field && Eq(*a.source, *b.source);
 }
 
+// The spelling (CAST or ::) is no part of the node: both are the same cast.
+bool Eq(const CastExpr& a, const CastExpr& b) {
+  return a.try_cast == b.try_cast && a.type == b.type && a.type_params == b.type_params &&
+         Eq(*a.operand, *b.operand);
+}
+
 bool Eq(const Expr& a, const Expr& b) {
   if (a.index() != b.index()) {
     return false;

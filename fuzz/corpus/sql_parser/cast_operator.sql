@@ -1,0 +1,1 @@
+SELECT a::INTEGER, -1::BIGINT, (-1)::int, - a :: int, (a + 1)::VARCHAR::DATE, SUM(x)::DOUBLE, CASE WHEN a > 0 THEN 1 END::INT FROM t GROUP BY a::INT ORDER BY 1::INT

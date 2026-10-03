@@ -158,15 +158,29 @@ struct ExtractExpr {
   SourceSpan span;
 };
 
+// CAST(operand AS type), TRY_CAST(operand AS type) and operand::type: one node for both spellings,
+// which ToSql writes as CAST. `type` is the type's name upper-cased, `type_params` its integer
+// parameters as written: DECIMAL(15, 2) is "DECIMAL" {"15", "2"}.
+struct CastExpr {
+  Box<Expr> operand;
+  std::string type;
+  std::vector<std::string> type_params;
+  bool try_cast = false;
+  SourceSpan op_span;    // CAST, TRY_CAST or '::'
+  SourceSpan type_span;  // the type's name through its ')'
+  SourceSpan span;       // CAST .. ')', or the operand's first token .. the type
+};
+
 using ExprNode = std::variant<ColumnRef, Literal, AggregateCall, UnaryExpr, BinaryExpr, LikeExpr,
-                              InExpr, FunctionCall, CaseExpr, ExtractExpr>;
+                              InExpr, FunctionCall, CaseExpr, ExtractExpr, CastExpr>;
 
 template <class T>
-concept ExprNodeKind = std::is_same_v<T, ColumnRef> || std::is_same_v<T, Literal> ||
-                       std::is_same_v<T, AggregateCall> || std::is_same_v<T, UnaryExpr> ||
-                       std::is_same_v<T, BinaryExpr> || std::is_same_v<T, LikeExpr> ||
-                       std::is_same_v<T, InExpr> || std::is_same_v<T, FunctionCall> ||
-                       std::is_same_v<T, CaseExpr> || std::is_same_v<T, ExtractExpr>;
+concept ExprNodeKind =
+    std::is_same_v<T, ColumnRef> || std::is_same_v<T, Literal> ||
+    std::is_same_v<T, AggregateCall> || std::is_same_v<T, UnaryExpr> ||
+    std::is_same_v<T, BinaryExpr> || std::is_same_v<T, LikeExpr> || std::is_same_v<T, InExpr> ||
+    std::is_same_v<T, FunctionCall> || std::is_same_v<T, CaseExpr> ||
+    std::is_same_v<T, ExtractExpr> || std::is_same_v<T, CastExpr>;
 
 // An expression: a variant of its node kinds (std::get, std::get_if and std::visit apply). It
 // converts only from its node kinds: variant's catch-all converting constructor would make every
