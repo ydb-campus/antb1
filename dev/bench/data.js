@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791042611553,
+  "lastUpdate": 1791057383149,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -4488,6 +4488,90 @@ window.BENCHMARK_DATA = {
             "value": 14.400751551020175,
             "unit": "ms/iter",
             "extra": "iterations: 49\ncpu: 14.39982040816328 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "7bdac2b07d3b05ae617e07b840d4cc03ff96bf7b",
+          "message": "feat(plan,io,exec,engine): decimal columns (#89)\n\n## Summary\n\nParquet DECIMAL(p,s) columns with p ≤ 38 become readable as a new engine\ntype, `DECIMAL(p,s)`, with a deliberately\nsmall supported surface; every other DECIMAL context exits 4 with a\ntest, so D3 (SUM, AVG, arithmetic) and D4 (mixed\ntypes, DOUBLE) can lift them. This is PR D2 of the roadmap for the\nqueries derived from TPC-H (types track,\n[ADR 0021](docs/adr/0021-decimal-semantics.md) rules 1, 2, 11 in part,\n14, 15 and 16). No query flips: the 22\nTPC-H-derived queries still exit 4 (the ratchet passes), so\n`tests/data/tpch_status.json` is unchanged.\n\n**Breaking change** (ADR 0021 rule 2): a DECIMAL(38,0) column used to\nread as HUGEINT and now reads as\n`DECIMAL(38,0)`. That changes its type name (`antb1 schema`, EXPLAIN,\nJSON), its output (a JSON string, as before)\nand what it supports (`SUM` of it was HUGEINT, now exit 4). HUGEINT\nstays the type of integer `SUM` and of integer\nliterals beyond BIGINT.\n\n**Supported:**\n\n- Reading INT32-, INT64-, FIXED_LEN_BYTE_ARRAY- and BYTE_ARRAY-stored\ndecimals, with or without an ARROW:schema.\n`io` widens decimal32, decimal64 and decimal256 (p ≤ 38) to\ndecimal128(p,s) through the `kConversionRules` table.\n  p > 38 stays an unsupported column.\n- Type names `DECIMAL(p,s)`; output through `plan::FormatDecimal`\n(`17.00`, `-0.25`, `.500`), a string in JSON.\n- Comparisons with integer and decimal literals, `IN` and `BETWEEN`:\nfolded exactly into the column's scale\n(`ParseExactNumber` with a scale shift, then the existing\n`FoldIntegerComparison` with a range of ±(10^p - 1)). On\nDECIMAL(15,2), `p <= 12.345` is `p <= 12.34`, `p >= 12.345` is `p >=\n12.35`, and `p = 12.345` is never true.\n- Two DECIMAL columns of the same (p,s) compare by value.\n- `ORDER BY`, top-N, `GROUP BY`, `COUNT(DISTINCT)`, `MIN` and `MAX` by\nthe unscaled value; `MIN` and `MAX` keep the\n  type, `COUNT` is BIGINT.\n\n**Exit code 4** (each with a binder test): `SUM`, `AVG`, arithmetic,\nunary `-`, DECIMAL `CASE` values, a DECIMAL\ncompared with another type (an integer or DOUBLE expression, another\n(p,s)) or with a number with an exponent or more\nthan 38 digits.\n\n**Scan pushdown and part pruning stay off for DECIMAL** (ADR 0021): a\nscan that reads a DECIMAL column applies no\npredicate itself, and a DECIMAL condition skips no row group. New io\ntests pin both.\n\n**IsNumeric / IsInteger audit.** Both stay false for DECIMAL, so the 24\nnon-test call sites reject or skip it:\n\n- binder (11): the aggregate typing, arithmetic, negation, `Comparable`\nand CASE typing sites now meet a DECIMAL\ncheck first, which raises the exit-4 error instead of a bind error. The\nconstant-folding and `IN`-typing sites\n  never see a DECIMAL operand.\n- exec (6): compute's integer arithmetic paths are not reached (no\nDECIMAL arithmetic binds); `part_operators` and\n`part_pruning` keep DECIMAL out of part statistics; the SUM state\nrefuses DECIMAL with `Invalid`, MIN/MAX accept it.\n- io (1), engine (1), plan types and literal (3): part statistics off;\nJSON writes a string; `RangeOf` gets an\n  explicit DECIMAL case.\n\n`ToString(LogicalType)` now returns `std::string` (the name is\ncomputed), a public header change in `plan`.\n\n**Tests:**\n\n- plan: types, literal folding at the scale and precision boundaries\n(`Binder/FoldDecimalTest`), every exit-4\n  context, EXPLAIN constants.\n- io: every storage with and without ARROW:schema, BYTE_ARRAY written\nwith the low-level writer, no statistics and no\n  scan filter for INT32/INT64 decimals.\n- exec: sort keys, grouped and ungrouped MIN, MAX and COUNT DISTINCT;\nengine: output formats.\n- The fixture `decimals.parquet` (DECIMAL(9,2) as INT32, (18,4) and\n(15,2) as INT64, (38,10) and (38,0) as\nFIXED_LEN_BYTE_ARRAY, 40 rows in 5 row groups), and fixture-digest\nsupport for decimal128.\n- `tests/slt/cases/types/decimal.slt` (expected blocks from `pixi run\nslt-complete`, also run on 4 threads; folded\nliterals under OR, NOT and in HAVING), and a DECIMAL record of\ndivergence D3 in `bind_errors.slt`.\n- HAVING folding into HUGEINT (an integer `SUM`) and into MIN/MAX of a\nDECIMAL (`Binder/FoldHavingTest`); DECIMAL\n  constants as Arrow scalars and in EXPLAIN text (`LogicalPlanTest`).\n- CLI goldens: `schema_decimals`, `explain_decimal`,\n`query_decimals_json`.\n- The random generator learns DECIMAL columns (`kDecimalColumns`): only\nliteral comparisons, keys, `MIN`, `MAX` and\n`COUNT`, with literals that keep DuckDB's common DECIMAL within 38\ndigits. `diff.random` now names its tables, so its\nqueries do not change; the new `diff.decimal` covers the decimals table.\nA failing run over some tables prints a\n  `pixi run diff-random --table ...` repro with the same filter.\n\n**Docs:** `docs/sql-subset.md` (types table, folding, semantics,\nEXPLAIN, output, exit codes, divergences D3, D9 and\nD13) and `docs/testing.md`. ADR 0021 stays Proposed: a status change is\nyours.\n\nFor the maintainer:\n\n- Differences from the approved plan:\n- `IS [NOT] NULL` and `SELECT DISTINCT` are unsupported for every type,\nso the slt file does not use them.\n- No DECIMAL record in `selftest/mutate.slt`: the mutation corrupts\nevery record at once, so the new record would\nprove nothing; `runner_test`'s `DecimalValuesCompareExactly` already\npins exact D cells.\n  - D14 needed no change, since there is no DECIMAL arithmetic yet.\n- D13 now covers DECIMAL columns too. When a literal has more decimals\nthan the column and the total passes 38\ndigits, DuckDB fails with a conversion error where antb1 answers exactly\n(`d38_10 > 0.00000000001`).\n`decimal.slt` pins both answers; antb1's two expected blocks were\nchecked against equivalent DuckDB queries.\n- Size L (about 50 files, 1,600 lines). The split review you asked for\nfound no P0 and no wrong results; its\nfindings were missing tests, a wrong docs sentence about HUGEINT\noverflow and an inexact repro line, all fixed.\n\nThis workload is derived from the TPC-H Benchmark and is not comparable\nto published TPC-H Benchmark results, as this\nimplementation does not comply with all requirements of the TPC-H\nBenchmark.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [x] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full                  # on 8bef439 (the head)\nlint: PASS\n100% tests passed out of 1740          # ci (clang Debug -Werror)\n100% tests passed out of 1740          # asan (ASan + UBSan)\n                                       # tidy: clean\ncoverage: PASS\n100% tests passed out of 2             # fuzz-smoke\n100% tests passed out of 1740          # ci-gcc\n$ ANTB1_DIFF_SEED=7 ANTB1_DIFF_COUNT=20000 pixi run diff-random   # on e7df080 (generation unchanged since)\nDIFF: PASS seed=7 queries=20000 failed=0 unsupported=0\n$ ANTB1_DIFF_SEED=<1..3> ANTB1_DIFF_COUNT=5000 pixi run diff-random --table decimals --target-percent 50\nDIFF: PASS seed=1 queries=5000 failed=0 unsupported=0   # likewise seeds 2 and 3\n```\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: none\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code implemented the\nmaintainer-approved plan (type, io, binder,\nexec, engine, fixture, tests, generator, docs), and a reviewer agent\nreviewed the diff twice (its findings are fixed\nin b97e1ff and e7df080), then once more as a split review in four parts\n(plan; io, exec and engine; tests and\n  harness; docs), whose findings are fixed in dfe9dfb and 8bef439.\n- Accountable human (has read and understands the whole diff): @hor911\n\n---------\n\nCo-authored-by: Claude <noreply@anthropic.com>",
+          "timestamp": "2026-10-03T22:53:39+03:00",
+          "tree_id": "eb81e1828282bd5e8f6d62b3286a0700188a1d25",
+          "url": "https://github.com/ydb-campus/antb1/commit/7bdac2b07d3b05ae617e07b840d4cc03ff96bf7b"
+        },
+        "date": 1791057382630,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4517.552826089843,
+            "unit": "ns/iter",
+            "extra": "iterations: 155586\ncpu: 4516.923810625635 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84961.83527132006,
+            "unit": "ns/iter",
+            "extra": "iterations: 7740\ncpu: 84921.90167958659 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 221969.1189567449,
+            "unit": "ns/iter",
+            "extra": "iterations: 3144\ncpu: 221859.72932569974 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 439476.98745294055,
+            "unit": "ns/iter",
+            "extra": "iterations: 1594\ncpu: 439413.68757841876 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 348660.9874999971,
+            "unit": "ns/iter",
+            "extra": "iterations: 2000\ncpu: 348631.8114999998 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2099472.8648649305,
+            "unit": "ns/iter",
+            "extra": "iterations: 333\ncpu: 2099342.630630629 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 51.49879338461442,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 51.48799530769231 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 46.96265679999859,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 46.939676133333386 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 198.90797299999954,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 198.88209933333317 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.346001714285677,
+            "unit": "ms/iter",
+            "extra": "iterations: 49\ncpu: 14.344388183673445 ms\nthreads: 1"
           }
         ]
       }
