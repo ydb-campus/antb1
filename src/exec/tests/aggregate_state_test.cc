@@ -414,15 +414,72 @@ TEST_F(AggregateStateTest, MinMaxAndCountDistinctOfDecimals) {
   ASSERT_TRUE(distinct->Consume(*values, nullptr).ok());
   EXPECT_EQ(Text(*distinct), "3");
 
-  // Only the input's own (p,s) is a MIN/MAX result; SUM and AVG of DECIMAL do not exist yet (D3).
+  // Only the input's own (p,s) is a MIN/MAX result; SUM is DECIMAL(38,s) and AVG DOUBLE.
   const auto invalid = [](AggKind kind, LogicalType input, LogicalType result) {
     return MakeAggregateState(kind, input, result).status().IsInvalid();
   };
   EXPECT_TRUE(invalid(AggKind::kMin, type, LogicalType::Decimal(18, 2)));
   EXPECT_TRUE(invalid(AggKind::kMax, type, LogicalType::Decimal(15, 3)));
   EXPECT_TRUE(invalid(AggKind::kSum, type, LogicalType::kHugeInt));
-  EXPECT_TRUE(invalid(AggKind::kSum, type, LogicalType::Decimal(38, 2)));
-  EXPECT_TRUE(invalid(AggKind::kAvg, type, LogicalType::kDouble));
+  EXPECT_TRUE(invalid(AggKind::kSum, type, LogicalType::Decimal(38, 3)));
+  EXPECT_FALSE(invalid(AggKind::kSum, type, LogicalType::Decimal(38, 2)));
+  EXPECT_TRUE(invalid(AggKind::kAvg, type, LogicalType::Decimal(38, 2)));
+  EXPECT_FALSE(invalid(AggKind::kAvg, type, LogicalType::kDouble));
+}
+
+std::shared_ptr<arrow::Array> DecimalsOf(LogicalType type,
+                                         const std::vector<std::optional<std::string>>& unscaled) {
+  arrow::Decimal128Builder builder(plan::ToArrow(type));
+  for (const auto& v : unscaled) {
+    EXPECT_TRUE(
+        (v.has_value() ? builder.Append(arrow::Decimal128(*v)) : builder.AppendNull()).ok());
+  }
+  return builder.Finish().ValueOrDie();
+}
+
+// SUM of a DECIMAL(p,s) is an exact DECIMAL(38,s) (ADR 0021 rule 12), NULL over no values, checked
+// against 10^38 - 1 at the end and against 128 bits at every addition (also when merging); AVG is
+// DuckDB's DOUBLE (rule 13).
+TEST_F(AggregateStateTest, SumAndAvgOfDecimals) {
+  const LogicalType p = LogicalType::Decimal(15, 2);
+  const auto values = DecimalsOf(p, {"1700", std::nullopt, "-25", "999999999999999"});
+  auto sum = Make(AggKind::kSum, p, LogicalType::Decimal(38, 2));
+  ASSERT_TRUE(sum->Consume(*values, Bools({true, true, true, false}).get()).ok());
+  EXPECT_EQ(Text(*sum), "1675");
+  EXPECT_TRUE(Result(*sum)->type()->Equals(arrow::decimal128(38, 2)));
+  auto other = Make(AggKind::kSum, p, LogicalType::Decimal(38, 2));
+  ASSERT_TRUE(other->Consume(*values, nullptr).ok());
+  ASSERT_TRUE(sum->Merge(*other).ok());
+  EXPECT_EQ(Text(*sum), "1000000000003349");
+  auto none = Make(AggKind::kSum, p, LogicalType::Decimal(38, 2));
+  EXPECT_EQ(Text(*none), "NULL");
+
+  auto avg = Make(AggKind::kAvg, p, LogicalType::kDouble);
+  ASSERT_TRUE(avg->Consume(*values, Bools({true, true, true, false}).get()).ok());
+  EXPECT_EQ(Text(*avg), "8.375");  // (17.00 - 0.25) / 2
+
+  // Beyond 38 digits: an error at the end; beyond 128 bits: at the addition.
+  const LogicalType d38 = LogicalType::Decimal(38, 0);
+  const std::string max38(38, '9');
+  auto big = Make(AggKind::kSum, d38, LogicalType::Decimal(38, 0));
+  ASSERT_TRUE(big->Consume(*DecimalsOf(d38, {max38, "1"}), nullptr).ok());
+  const auto out = big->Finalize(arrow::default_memory_pool());
+  EXPECT_TRUE(out.status().IsExecutionError()) << out.status().ToString();
+  EXPECT_EQ(out.status().message(),
+            "SUM overflow: the result is outside the range of DECIMAL(38,0) (38 decimal digits)");
+  auto bits = Make(AggKind::kSum, d38, LogicalType::Decimal(38, 0));
+  const auto status = bits->Consume(*DecimalsOf(d38, {max38, max38}), nullptr);
+  EXPECT_EQ(status.message(), "SUM overflow: the sum of a DECIMAL(38,0) column exceeds 128 bits");
+  auto avg_bits = Make(AggKind::kAvg, d38, LogicalType::kDouble);
+  ASSERT_TRUE(avg_bits->Consume(*DecimalsOf(d38, {max38}), nullptr).ok());
+  auto avg_more = Make(AggKind::kAvg, d38, LogicalType::kDouble);
+  ASSERT_TRUE(avg_more->Consume(*DecimalsOf(d38, {max38}), nullptr).ok());
+  EXPECT_EQ(avg_bits->Merge(*avg_more).message(),
+            "AVG overflow: the sum of a DECIMAL(38,0) column exceeds 128 bits");
+  // AVG of a single DECIMAL(38,0) value: DuckDB's halves, not a direct conversion (rule 13).
+  auto halves = Make(AggKind::kAvg, d38, LogicalType::kDouble);
+  ASSERT_TRUE(halves->Consume(*DecimalsOf(d38, {"27670116110564329473"}), nullptr).ok());
+  EXPECT_EQ(Text(*halves), "2.7670116110564327e+19");
 }
 
 // One batch of DOUBLE values and its selection (empty: every row).

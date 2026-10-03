@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <limits>
 #include <memory>
 #include <string>
@@ -178,6 +179,160 @@ arrow::Result<ArrayPtr> HugeIntArith(const arrow::Array& left, const arrow::Arra
       return Overflow(r == nullptr ? "negation" : Verb(op), plan::LogicalType::kHugeInt);
     }
     builder.UnsafeAppend(FromInt128(result));
+  }
+  std::shared_ptr<arrow::Array> out;
+  ARROW_RETURN_NOT_OK(builder.Finish(&out));
+  return out;
+}
+
+// ---- DECIMAL + - * and negation (ADR 0021 rules 5 to 7), exact in Int128 ----
+
+// One operand of DECIMAL arithmetic: its unscaled values (0 where NULL), validity and type, and its
+// name when it is a column (DuckDB names that column in a failed cast).
+struct DecimalOperand {
+  std::vector<Int128> values;
+  const arrow::Array* array = nullptr;
+  ArrayPtr owner;  // keeps `array` alive
+  plan::LogicalType type;
+  std::string column;
+};
+
+arrow::Result<DecimalOperand> ReadDecimalOperand(const arrow::Array& array, plan::LogicalType type,
+                                                 std::string column) {
+  DecimalOperand operand{.values = std::vector<Int128>(static_cast<std::size_t>(array.length())),
+                         .array = &array,
+                         .type = type,
+                         .column = std::move(column)};
+  const auto read = [&]<class ArrayType> {
+    const auto& typed = static_cast<const ArrayType&>(array);
+    for (int64_t i = 0; i < typed.length(); ++i) {
+      if (typed.IsValid(i)) {
+        if constexpr (std::is_same_v<ArrayType, arrow::Decimal128Array>) {
+          operand.values[static_cast<std::size_t>(i)] =
+              ToInt128(arrow::Decimal128(typed.GetValue(i)));
+        } else {
+          operand.values[static_cast<std::size_t>(i)] = typed.Value(i);
+        }
+      }
+    }
+  };
+  switch (array.type_id()) {
+    case arrow::Type::INT16:
+      read.template operator()<arrow::Int16Array>();
+      break;
+    case arrow::Type::UINT16:
+      read.template operator()<arrow::UInt16Array>();
+      break;
+    case arrow::Type::INT32:
+      read.template operator()<arrow::Int32Array>();
+      break;
+    case arrow::Type::INT64:
+      read.template operator()<arrow::Int64Array>();
+      break;
+    case arrow::Type::DECIMAL128:
+      read.template operator()<arrow::Decimal128Array>();
+      break;
+    default:
+      return arrow::Status::Invalid("DECIMAL arithmetic over ", array.type()->ToString());
+  }
+  return operand;
+}
+
+// Rescales the operand to the result's scale, as DuckDB casts it to the result type first (for +
+// and
+// -): every value must fit the result's width, else DuckDB's conversion error for the first that
+// does not.
+arrow::Status RescaleOperand(DecimalOperand& operand, plan::LogicalType result) {
+  const bool decimal = operand.type == plan::LogicalType::kDecimal;
+  const int from_scale = decimal ? operand.type.scale() : 0;
+  const int to_scale = result.scale();
+  Int128 factor = 1;
+  for (int k = from_scale; k < to_scale; ++k) {
+    factor *= 10;  // at most 10^38
+  }
+  const plan::IntegerRange range = plan::RangeOf(result);
+  for (std::size_t i = 0; i < operand.values.size(); ++i) {
+    if (operand.array->IsNull(static_cast<int64_t>(i))) {
+      continue;
+    }
+    Int128 scaled = 0;
+    if (__builtin_mul_overflow(operand.values[i], factor, &scaled) || scaled < range.min ||
+        scaled > range.max) {
+      const std::string target = std::format("DECIMAL({},{})", result.width(), result.scale());
+      const std::string suffix =
+          operand.column.empty() ? "" : " when casting from source column " + operand.column;
+      if (decimal) {
+        return arrow::Status::ExecutionError(
+            "Casting value \"",
+            plan::FormatDecimal(operand.values[i], operand.type.width(), operand.type.scale()),
+            "\" to type ", target, " failed: value is out of range!", suffix);
+      }
+      return arrow::Status::ExecutionError(
+          "Could not cast value ", Int128ToString(operand.values[i]), " to ", target, suffix);
+    }
+    operand.values[i] = scaled;
+  }
+  return arrow::Status::OK();
+}
+
+// DuckDB's overflow error: its 64-bit DECIMAL (a width capped to 18) or 128-bit one (to 38).
+arrow::Status DecimalOverflow(plan::ArithOp op, Int128 x, Int128 y, plan::LogicalType result) {
+  const int width = result.width() <= 18 ? 18 : 38;
+  std::string_view verb = "addition";
+  std::string_view symbol = "+";
+  if (op == plan::ArithOp::kSubtract) {
+    verb = "subtract";  // DuckDB's word
+    symbol = "-";
+  } else if (op == plan::ArithOp::kMultiply) {
+    verb = "multiplication";
+    symbol = "*";
+  }
+  std::string_view hint = ";";
+  if (width == 18) {
+    hint = ". You might want to add an explicit cast to a bigger decimal.";
+  } else if (op == plan::ArithOp::kMultiply) {
+    hint = ". You might want to add an explicit cast to a decimal with a smaller scale.";
+  }
+  return arrow::Status::ExecutionError("Overflow in ", verb, " of DECIMAL(", width, ") (",
+                                       Int128ToString(x), " ", symbol, " ", Int128ToString(y), ")",
+                                       hint);
+}
+
+// `left <op> right` in the DECIMAL `result`, the operands already rescaled for + and - (the caller
+// computes and rescales the left operand before it computes the right one, as DuckDB does), * over
+// the unscaled values (the scales add up); every result must fit the result's width (only a width
+// capped to 18 or 38 can overflow).
+arrow::Result<ArrayPtr> DecimalArith(const DecimalOperand& left, const DecimalOperand& right,
+                                     plan::ArithOp op, plan::LogicalType result,
+                                     arrow::MemoryPool* pool) {
+  const plan::IntegerRange range = plan::RangeOf(result);
+  arrow::Decimal128Builder builder(plan::ToArrow(result), pool);
+  ARROW_RETURN_NOT_OK(builder.Reserve(left.array->length()));
+  for (std::size_t i = 0; i < left.values.size(); ++i) {
+    const auto row = static_cast<int64_t>(i);
+    if (left.array->IsNull(row) || right.array->IsNull(row)) {
+      builder.UnsafeAppendNull();
+      continue;
+    }
+    const Int128 x = left.values[i];
+    const Int128 y = right.values[i];
+    Int128 value = 0;
+    bool overflow = false;
+    switch (op) {
+      case plan::ArithOp::kAdd:
+        overflow = __builtin_add_overflow(x, y, &value);
+        break;
+      case plan::ArithOp::kSubtract:
+        overflow = __builtin_sub_overflow(x, y, &value);
+        break;
+      default:
+        overflow = __builtin_mul_overflow(x, y, &value);
+        break;
+    }
+    if (overflow || value < range.min || value > range.max) {
+      return DecimalOverflow(op, x, y, result);
+    }
+    builder.UnsafeAppend(FromInt128(value));
   }
   std::shared_ptr<arrow::Array> out;
   ARROW_RETURN_NOT_OK(builder.Finish(&out));
@@ -488,6 +643,28 @@ struct Evaluator {
 
   arrow::Result<ArrayPtr> Evaluate(const plan::NegateExpr& negate, const plan::Expr& e) const {
     ARROW_ASSIGN_OR_RAISE(ArrayPtr operand, (*this)(*negate.operand));
+    if (e.type == plan::LogicalType::kDecimal) {
+      // The type is kept, and its range is symmetric. A file may still hold a value beyond its
+      // declared width (nothing checks it on read), so the 128-bit minimum is an overflow, not UB.
+      ARROW_ASSIGN_OR_RAISE(DecimalOperand values, ReadDecimalOperand(*operand, e.type, {}));
+      arrow::Decimal128Builder builder(plan::ToArrow(e.type), pool);
+      ARROW_RETURN_NOT_OK(builder.Reserve(operand->length()));
+      for (int64_t i = 0; i < operand->length(); ++i) {
+        if (operand->IsNull(i)) {
+          builder.UnsafeAppendNull();
+          continue;
+        }
+        Int128 negated = 0;
+        if (__builtin_sub_overflow(Int128{0}, values.values[static_cast<std::size_t>(i)],
+                                   &negated)) {
+          return Overflow("negation", e.type);
+        }
+        builder.UnsafeAppend(FromInt128(negated));
+      }
+      std::shared_ptr<arrow::Array> out;
+      ARROW_RETURN_NOT_OK(builder.Finish(&out));
+      return out;
+    }
     ARROW_ASSIGN_OR_RAISE(operand, CastTo(operand, plan::ToArrow(e.type), ctx));
     if (e.type == plan::LogicalType::kHugeInt) {
       return HugeIntArith(*operand, nullptr, plan::ArithOp::kSubtract, pool);
@@ -657,6 +834,24 @@ struct Evaluator {
   }
 
   arrow::Result<ArrayPtr> Evaluate(const plan::ArithExpr& arith, const plan::Expr& e) const {
+    if (e.type == plan::LogicalType::kDecimal) {
+      // Each operand in its own type (DECIMAL(38,0) and HUGEINT share an Arrow type); for + and -
+      // the left one is computed and rescaled before the right one is computed, as in DuckDB.
+      const auto operand = [&](const plan::Expr& expr) -> arrow::Result<DecimalOperand> {
+        ARROW_ASSIGN_OR_RAISE(ArrayPtr values, (*this)(expr));
+        const std::string column =
+            std::holds_alternative<plan::ColumnExpr>(expr.node) ? expr.name : std::string();
+        ARROW_ASSIGN_OR_RAISE(DecimalOperand read, ReadDecimalOperand(*values, expr.type, column));
+        read.owner = std::move(values);
+        if (arith.op != plan::ArithOp::kMultiply) {
+          ARROW_RETURN_NOT_OK(RescaleOperand(read, e.type));
+        }
+        return read;
+      };
+      ARROW_ASSIGN_OR_RAISE(const DecimalOperand l, operand(*arith.left));
+      ARROW_ASSIGN_OR_RAISE(const DecimalOperand r, operand(*arith.right));
+      return DecimalArith(l, r, arith.op, e.type, pool);
+    }
     ARROW_ASSIGN_OR_RAISE(ArrayPtr left, (*this)(*arith.left));
     ARROW_ASSIGN_OR_RAISE(ArrayPtr right, (*this)(*arith.right));
     const auto type = plan::ToArrow(e.type);

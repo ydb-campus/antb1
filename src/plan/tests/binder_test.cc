@@ -390,7 +390,7 @@ INSTANTIATE_TEST_SUITE_P(
                   "cannot compare"},
         ErrorCase{"SELECT i32 BETWEEN 1 AND 2 FROM t", kUnsupported, "BETWEEN",
                   "BETWEEN is only supported in conditions"},
-        // Arithmetic: numbers only, no DECIMAL, no DATE arithmetic, no // or % in HUGEINT.
+        // Arithmetic: numbers only, no DATE arithmetic, no // or % in HUGEINT.
         ErrorCase{"SELECT s + 1 FROM t", kBind, "+",
                   "arithmetic operator '+' needs numbers, but 's' is VARCHAR"},
         ErrorCase{"SELECT -s FROM t", kBind, "-", "needs a number, but 's' is VARCHAR"},
@@ -400,12 +400,22 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT SUM(i64) % 2 FROM t", kUnsupported, "%", "'%' in HUGEINT"},
         // DECIMAL (ADR 0021): only comparisons with literals and same-type DECIMALs, keys, MIN,
         // MAX and COUNT; every other context is unsupported until D3 and D4.
-        ErrorCase{"SELECT h % 2 FROM t", kUnsupported, "%", "DECIMAL arithmetic"},
-        ErrorCase{"SELECT p + 1 FROM dec", kUnsupported, "+", "DECIMAL arithmetic ('p' is"},
-        ErrorCase{"SELECT -p FROM dec", kUnsupported, "-", "negating a DECIMAL"},
-        ErrorCase{"SELECT SUM(p) FROM dec", kUnsupported, "SUM(p)",
-                  "SUM of a DECIMAL ('p' is DECIMAL(15,2)) is not supported"},
-        ErrorCase{"SELECT AVG(z) FROM dec", kUnsupported, "AVG(z)", "AVG of a DECIMAL"},
+        // DECIMAL: / // %, decimal literals and DOUBLE operands in arithmetic wait for D4.
+        ErrorCase{"SELECT h % 2 FROM t", kUnsupported, "%",
+                  "'%' of a DECIMAL ('h' is DECIMAL(38,0)) is not supported"},
+        ErrorCase{"SELECT p / 2 FROM dec", kUnsupported, "/", "'/' of a DECIMAL"},
+        ErrorCase{"SELECT i // p FROM dec", kUnsupported, "//", "'//' of a DECIMAL ('p' is"},
+        ErrorCase{"SELECT p + 1.5 FROM dec", kUnsupported, "+",
+                  "arithmetic of a DECIMAL with a decimal literal"},
+        ErrorCase{"SELECT p * 1e0 FROM dec", kUnsupported, "*",
+                  "arithmetic of a DECIMAL with a DOUBLE ('1e0' is DOUBLE)"},
+        ErrorCase{"SELECT -(p * q) - 1.5 FROM dec", kUnsupported, "-",
+                  "arithmetic of a DECIMAL with a decimal literal"},
+        ErrorCase{"SELECT p + 'x' FROM dec", kBind, "+", "needs numbers"},
+        ErrorCase{"SELECT z * z * z * z FROM dec", kBind, "*",
+                  "Needed scale 40 to accurately represent the multiplication result"},
+        ErrorCase{"SELECT COUNT(*) FROM dec HAVING SUM(p) = MAX(p)", kUnsupported, "=",
+                  "only DECIMAL values of the same precision and scale compare"},
         ErrorCase{"SELECT COUNT(*) FROM dec WHERE p = r", kUnsupported, "=",
                   "only DECIMAL values of the same precision and scale compare"},
         ErrorCase{"SELECT COUNT(*) FROM dec WHERE i < p", kUnsupported, "<",
@@ -964,6 +974,75 @@ TEST(BinderTest, ArithmeticTypesAndNamesLikeDuckDb) {
     EXPECT_EQ(plan->output[0].type, c.type) << sql;
     EXPECT_EQ(plan->output[0].name, c.name) << sql;
   }
+}
+
+// DuckDB's DECIMAL arithmetic types (ADR 0021 rules 4 to 6, each probed with DuckDB 1.5.5): an
+// integer counts as DECIMAL(5,0), (10,0), (19,0) or (38,0) by its type, a literal too; + and -
+// keep the larger scale and one more digit, * adds both; beyond 18 digits from two operands of at
+// most 18 the width is 18 (for *, unless the scale reaches 18), beyond 38 it is 38.
+TEST(BinderTest, DecimalArithmeticTypesLikeDuckDb) {
+  const Catalog catalog = MakeCatalog();
+  struct Case {
+    std::string_view expr;
+    LogicalType type;
+  };
+  const auto dec = [](int width, int scale) {
+    return LogicalType::Decimal(static_cast<std::uint8_t>(width), static_cast<std::uint8_t>(scale));
+  };
+  for (const Case& c : {
+           Case{.expr = "p + q", .type = dec(16, 2)},
+           Case{.expr = "p - r", .type = dec(18, 4)},
+           Case{.expr = "p * q", .type = dec(18, 4)},
+           Case{.expr = "p * r", .type = dec(18, 6)},
+           Case{.expr = "r * r", .type = dec(18, 8)},
+           Case{.expr = "p + i", .type = dec(16, 2)},
+           Case{.expr = "i * r", .type = dec(18, 4)},
+           Case{.expr = "r - i", .type = dec(15, 4)},
+           Case{.expr = "s16 + r", .type = dec(10, 4)},
+           Case{.expr = "u16 * r", .type = dec(14, 4)},
+           Case{.expr = "b - r", .type = dec(24, 4)},
+           Case{.expr = "p * b", .type = dec(34, 2)},
+           Case{.expr = "p + 7", .type = dec(16, 2)},
+           Case{.expr = "7 * r", .type = dec(18, 4)},
+           Case{.expr = "p * 3000000000", .type = dec(34, 2)},
+           Case{.expr = "p * 100000000000000000000", .type = dec(38, 2)},
+           Case{.expr = "z + i", .type = dec(38, 10)},
+           Case{.expr = "z * p", .type = dec(38, 12)},
+           Case{.expr = "z * z", .type = dec(38, 20)},
+           Case{.expr = "e + g", .type = dec(18, 10)},
+           Case{.expr = "e * g", .type = dec(36, 18)},
+           Case{.expr = "g * g", .type = dec(36, 20)},
+           Case{.expr = "p * q * r", .type = dec(18, 8)},
+           Case{.expr = "-p", .type = dec(15, 2)},
+           Case{.expr = "-(p * q)", .type = dec(18, 4)},
+           Case{.expr = "SUM(p)", .type = dec(38, 2)},
+           Case{.expr = "SUM(p * q)", .type = dec(38, 4)},
+           Case{.expr = "SUM(z)", .type = dec(38, 10)},
+           Case{.expr = "AVG(r)", .type = LogicalType::kDouble},
+           Case{.expr = "MIN(p) + 1", .type = dec(16, 2)},
+           Case{.expr = "SUM(p) + 1", .type = dec(38, 2)},
+           Case{.expr = "SUM(p) * 2", .type = dec(38, 2)},
+           Case{.expr = "SUM(i) + MIN(p)", .type = dec(38, 2)},
+       }) {
+    const std::string sql = "SELECT " + std::string(c.expr) + " FROM dec";
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    ASSERT_EQ(plan->output.size(), 1U);
+    EXPECT_EQ(plan->output[0].type, c.type) << sql << ": " << ToString(plan->output[0].type);
+  }
+}
+
+// No integer-only rewrite applies to DECIMAL (ADR 0021 rule 18): SUM(p + 1) sums p + 1, and
+// p + 1 > 2 compares p + 1 (DuckDB moves neither).
+TEST(BinderTest, DecimalIsNotRewrittenLikeIntegers) {
+  const Catalog catalog = MakeCatalog();
+  auto sum = BindSql("SELECT SUM(p + 1) FROM dec", catalog);
+  ASSERT_TRUE(sum.ok()) << sum.status().ToString();
+  EXPECT_EQ(sum->output[0].type, LogicalType::Decimal(38, 2));
+  EXPECT_TRUE(Explain(*sum).contains("Aggregate SUM(\"(p + 1)\")")) << Explain(*sum);
+  auto moved = BindSql("SELECT COUNT(*) FROM dec WHERE p + 1 > 2", catalog);
+  ASSERT_TRUE(moved.ok()) << moved.status().ToString();
+  EXPECT_TRUE(Explain(*moved).contains("Filter \"(p + 1)\" > 2.00")) << Explain(*moved);
 }
 
 // DuckDB's sum rewriter: SUM(x + c) is SUM(x) + c * COUNT(x) in HUGEINT for a signed integer x, so

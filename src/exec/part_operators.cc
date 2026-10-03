@@ -257,16 +257,19 @@ namespace {
 
 // Whether a part's rows may go straight to the partitions (unaggregated) when its own table does
 // not reduce them: with keys, and without a DOUBLE SUM or AVG, whose rounding follows the parts
-// (docs/adr/0013-parallel-execution.md), or a HUGEINT one.
+// (docs/adr/0013-parallel-execution.md), or a HUGEINT one or one of a DECIMAL beyond 18 digits.
 bool MayRouteRows(const std::vector<plan::BoundColumn>& keys,
                   const std::vector<plan::AggregateCall>& calls) {
   return !keys.empty() && std::ranges::none_of(calls, [](const plan::AggregateCall& call) {
-    // HUGEINT sums check for overflow at every addition, so the grouping of the additions decides
-    // whether a query fails.
-    return (call.kind == plan::AggKind::kSum || call.kind == plan::AggKind::kAvg) &&
-           call.arg.has_value() &&
-           (call.arg->type == plan::LogicalType::kDouble ||
-            call.arg->type == plan::LogicalType::kHugeInt);
+    // These sums check for a 128-bit overflow at every addition, so the grouping of the additions
+    // decides whether a query fails (values of at most 18 digits cannot reach it).
+    if ((call.kind != plan::AggKind::kSum && call.kind != plan::AggKind::kAvg) ||
+        !call.arg.has_value()) {
+      return false;
+    }
+    const plan::LogicalType type = call.arg->type;
+    return type == plan::LogicalType::kDouble || type == plan::LogicalType::kHugeInt ||
+           (type == plan::LogicalType::kDecimal && type.width() > 18);
   });
 }
 

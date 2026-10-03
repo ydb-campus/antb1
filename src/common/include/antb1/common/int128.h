@@ -39,4 +39,11 @@ inline std::optional<Int128> CheckedAdd(Int128 a, Int128 b) {
 // relative tolerance.
 double ExactDivideToDouble(Int128 numerator, int64_t denominator);
 
+// DuckDB's AVG of `count` (> 0) DECIMAL(width, scale) values from the exact sum of their unscaled
+// values (ADR 0021 rule 13): the sum as a long double from its two 64-bit halves (lower + upper *
+// 2^64), divided in long double by count * 10^scale (10^scale first converted to a double the same
+// way), then rounded to double; in double for a width up to 4 (DuckDB's 16-bit DECIMAL). long
+// double is the platform's, as in DuckDB's own build.
+double DuckDbDecimalAverage(Int128 sum, int64_t count, int width, int scale);
+
 }  // namespace antb1

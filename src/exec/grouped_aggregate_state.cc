@@ -97,25 +97,44 @@ arrow::Result<std::shared_ptr<arrow::Array>> Int64s(std::span<const std::int64_t
   return builder.Finish();
 }
 
-// HUGEINT is decimal128(38, 0): +-(10^38 - 1); NULL for a group without values.
+// Exact sums as their 38-digit type, HUGEINT or DECIMAL(38, s) (decimal128 within +-(10^38 - 1));
+// NULL for a group without values.
 arrow::Result<std::shared_ptr<arrow::Array>> HugeInts(std::span<const Int128> sums,
                                                       std::span<const std::int64_t> counts,
+                                                      plan::LogicalType type,
                                                       arrow::MemoryPool* pool) {
-  arrow::Decimal128Builder builder(plan::ToArrow(plan::LogicalType::kHugeInt), pool);
+  arrow::Decimal128Builder builder(plan::ToArrow(type), pool);
   ARROW_RETURN_NOT_OK(builder.Reserve(static_cast<std::int64_t>(sums.size())));
-  const plan::IntegerRange range = plan::RangeOf(plan::LogicalType::kHugeInt);
+  const plan::IntegerRange range = plan::RangeOf(type);
   for (std::size_t g = 0; g < sums.size(); ++g) {
     if (counts[g] == 0) {
       builder.UnsafeAppendNull();
       continue;
     }
     if (sums[g] < range.min || sums[g] > range.max) {
-      return arrow::Status::ExecutionError(
-          "SUM overflow: the result is outside the range of HUGEINT (38 decimal digits)");
+      return arrow::Status::ExecutionError("SUM overflow: the result is outside the range of ",
+                                           plan::ToString(type), " (38 decimal digits)");
     }
     const auto bits = static_cast<UInt128>(sums[g]);
     builder.UnsafeAppend(arrow::Decimal128(static_cast<std::int64_t>(bits >> 64U),
                                            static_cast<std::uint64_t>(bits)));
+  }
+  return builder.Finish();
+}
+
+// DuckDB's AVG of a DECIMAL per group (DuckDbDecimalAverage), NULL for a group without values.
+arrow::Result<std::shared_ptr<arrow::Array>> DecimalAverages(std::span<const Int128> sums,
+                                                             std::span<const std::int64_t> counts,
+                                                             plan::LogicalType input,
+                                                             arrow::MemoryPool* pool) {
+  arrow::DoubleBuilder builder(pool);
+  ARROW_RETURN_NOT_OK(builder.Reserve(static_cast<std::int64_t>(sums.size())));
+  for (std::size_t g = 0; g < sums.size(); ++g) {
+    if (counts[g] == 0) {
+      builder.UnsafeAppendNull();
+    } else {
+      builder.UnsafeAppend(DuckDbDecimalAverage(sums[g], counts[g], input.width(), input.scale()));
+    }
   }
   return builder.Finish();
 }
@@ -237,7 +256,8 @@ class GroupedIntegerSum final : public GroupedAggregateState {
       std::uint32_t begin, std::uint32_t end, arrow::MemoryPool* pool) const override {
     ARROW_ASSIGN_OR_RAISE(const auto sums, GroupRange(sums_, begin, end));
     ARROW_ASSIGN_OR_RAISE(const auto counts, GroupRange(counts_, begin, end));
-    return average_ ? Averages(sums, counts, pool) : HugeInts(sums, counts, pool);
+    return average_ ? Averages(sums, counts, pool)
+                    : HugeInts(sums, counts, plan::LogicalType::kHugeInt, pool);
   }
 
  private:
@@ -313,10 +333,11 @@ Int128 HugeIntAt(const arrow::Decimal128Array& values, std::int64_t row) {
   return static_cast<Int128>(bits);
 }
 
-// SUM or AVG of a HUGEINT column: every addition is checked.
+// SUM or AVG of a HUGEINT or DECIMAL argument (decimal128): every addition is checked. A
+// DECIMAL(p,s) sums to DECIMAL(38,s) and averages as DuckDB does.
 class GroupedHugeIntSum final : public GroupedAggregateState {
  public:
-  explicit GroupedHugeIntSum(bool average) : average_(average) {}
+  GroupedHugeIntSum(bool average, plan::LogicalType input) : average_(average), input_(input) {}
 
   [[nodiscard]] std::uint32_t num_groups() const override {
     return static_cast<std::uint32_t>(sums_.size());
@@ -330,8 +351,7 @@ class GroupedHugeIntSum final : public GroupedAggregateState {
     if (values == nullptr) {
       return arrow::Status::Invalid("SUM needs an argument column");
     }
-    ARROW_RETURN_NOT_OK(
-        CheckRows(values, plan::ToArrow(plan::LogicalType::kHugeInt).get(), ids, num_groups()));
+    ARROW_RETURN_NOT_OK(CheckRows(values, plan::ToArrow(input_).get(), ids, num_groups()));
     const auto& decimals = static_cast<const arrow::Decimal128Array&>(*values);
     for (std::size_t i = 0; i < ids.size(); ++i) {
       const auto row = static_cast<std::int64_t>(i);
@@ -355,15 +375,23 @@ class GroupedHugeIntSum final : public GroupedAggregateState {
       std::uint32_t begin, std::uint32_t end, arrow::MemoryPool* pool) const override {
     ARROW_ASSIGN_OR_RAISE(const auto sums, GroupRange(sums_, begin, end));
     ARROW_ASSIGN_OR_RAISE(const auto counts, GroupRange(counts_, begin, end));
-    return average_ ? Averages(sums, counts, pool) : HugeInts(sums, counts, pool);
+    if (input_ != plan::LogicalType::kDecimal) {
+      return average_ ? Averages(sums, counts, pool)
+                      : HugeInts(sums, counts, plan::LogicalType::kHugeInt, pool);
+    }
+    return average_ ? DecimalAverages(sums, counts, input_, pool)
+                    : HugeInts(sums, counts,
+                               plan::LogicalType::Decimal(plan::LogicalType::kMaxDecimalWidth,
+                                                          input_.scale()),
+                               pool);
   }
 
  private:
   arrow::Status Add(std::uint32_t group, Int128 value, std::int64_t count) {
     const auto next = CheckedAdd(sums_[group], value);
     if (!next.has_value()) {
-      return arrow::Status::ExecutionError(
-          average_ ? "AVG" : "SUM", " overflow: the sum of a HUGEINT column exceeds 128 bits");
+      return arrow::Status::ExecutionError(average_ ? "AVG" : "SUM", " overflow: the sum of a ",
+                                           plan::ToString(input_), " column exceeds 128 bits");
     }
     sums_[group] = *next;
     counts_[group] += count;
@@ -371,6 +399,7 @@ class GroupedHugeIntSum final : public GroupedAggregateState {
   }
 
   bool average_;
+  plan::LogicalType input_;
   std::vector<Int128> sums_;
   std::vector<std::int64_t> counts_;
 };
@@ -610,10 +639,10 @@ arrow::Result<std::unique_ptr<GroupedAggregateState>> SumState(bool average,
     case plan::LogicalType::kUSmallInt:
       return std::make_unique<GroupedIntegerSum<arrow::UInt16Type>>(average);
     case plan::LogicalType::kHugeInt:
-      return std::make_unique<GroupedHugeIntSum>(average);
+    case plan::LogicalType::kDecimal:
+      return std::make_unique<GroupedHugeIntSum>(average, input);
     case plan::LogicalType::kDouble:
       return std::make_unique<GroupedDoubleSum>(average);
-    case plan::LogicalType::kDecimal:  // SUM and AVG of DECIMAL are unsupported (D3)
     case plan::LogicalType::kVarchar:
     case plan::LogicalType::kDate:
     case plan::LogicalType::kTimestamp:
@@ -849,10 +878,13 @@ arrow::Result<std::unique_ptr<GroupedAggregateState>> MakeGroupedAggregateState(
         }
         return std::make_unique<GroupedTemporalAvg>();
       }
-      const plan::LogicalType expected = !average && plan::IsInteger(*input)
-                                             ? plan::LogicalType::kHugeInt
-                                             : plan::LogicalType::kDouble;
-      if (!plan::IsNumeric(*input) || result != expected) {
+      plan::LogicalType expected = !average && plan::IsInteger(*input) ? plan::LogicalType::kHugeInt
+                                                                       : plan::LogicalType::kDouble;
+      const bool decimal = *input == plan::LogicalType::kDecimal;
+      if (decimal && !average) {
+        expected = plan::LogicalType::Decimal(plan::LogicalType::kMaxDecimalWidth, input->scale());
+      }
+      if ((!plan::IsNumeric(*input) && !decimal) || result != expected) {
         return invalid();
       }
       return SumState(average, *input);

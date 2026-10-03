@@ -16,8 +16,8 @@ and `ORDER BY` (also by position), `HAVING` (the same conditions on aggregates a
 (`+ - * / // %` and unary `-`), the string functions `strlen` and `regexp_replace`, the timestamp functions
 `toDateTime`, `EXTRACT` and `date_trunc`, and `CASE` in every clause, dates written as casts
 (`CAST('2013-07-01' AS DATE)`, `'2013-07-01'::DATE`), `LIMIT` and `OFFSET`, over one table of Parquet files. This
-covers all 43 ClickBench queries (see [ClickBench status](#clickbench-status)). None of the 22 queries derived from
-TPC-H passes yet (see [Queries derived from TPC-H](#queries-derived-from-tpc-h)).
+covers all 43 ClickBench queries (see [ClickBench status](#clickbench-status)). Of the 22 queries derived from
+TPC-H, Q1 and Q6 pass (see [Queries derived from TPC-H](#queries-derived-from-tpc-h)).
 
 ```sql
 SELECT COUNT(*), SUM(ResolutionWidth) AS width, AVG(UserID), MAX(EventDate) FROM hits WHERE IsMobile = 1
@@ -202,8 +202,9 @@ items).
   item (the last one with it, as in DuckDB): a key or an aggregate; an alias of a constant is unsupported (exit code
   4), and any other column is a bind error (`column 'b' must appear in the GROUP BY clause or be inside an aggregate
   function`). Without `GROUP BY` there are no keys. Literals are typed like those of `WHERE` (below) against the
-  operand's type: `COUNT` is BIGINT, an integer `SUM` HUGEINT, `AVG` and a DOUBLE `SUM` DOUBLE, `MIN` and `MAX` their
-  column's type (and FLOAT for a FLOAT column, as in DuckDB, while its `SUM` and `AVG` are DOUBLE).
+  operand's type: `COUNT` is BIGINT, an integer `SUM` HUGEINT, a DECIMAL(p,s) `SUM` DECIMAL(38,s), `AVG` and a
+  DOUBLE `SUM` DOUBLE, `MIN` and `MAX` their column's type (and FLOAT for a FLOAT column, as in DuckDB, while its
+  `SUM` and `AVG` are DOUBLE).
 - Arithmetic (as DuckDB types it): an integer literal operand that fits the other operand's integer type takes that
   type (`smallint_col + 1` is SMALLINT, `smallint_col + 40000` INTEGER); two integer types give the wider one, where
   USMALLINT with SMALLINT gives BIGINT; an integer literal alone is INTEGER, BIGINT or HUGEINT by its value; DOUBLE
@@ -212,6 +213,16 @@ items).
   USMALLINT (DuckDB wraps it), `//` and `%` of HUGEINT values and arithmetic on FLOAT columns (divergence D11) are
   unsupported; arithmetic on VARCHAR is a bind error. The result name is DuckDB's: `(a + 1)`, `-(a)`,
   `sum((a + 1))`, with columns as written.
+- DECIMAL arithmetic ([ADR 0021](adr/0021-decimal-semantics.md) rules 4 to 6): `+`, `-` and `*` of a DECIMAL with a
+  DECIMAL or an integer, which counts as DECIMAL(5,0) (SMALLINT, USMALLINT), DECIMAL(10,0) (INTEGER, and an integer
+  literal that fits it: `7` does not shrink), DECIMAL(19,0) (BIGINT) or DECIMAL(38,0) (HUGEINT). `+` and `-` keep the
+  larger scale s and give max(p1 - s1, p2 - s2) + s + 1 digits; `*` adds the scales and the widths. A width beyond
+  18 from two operands of at most 18 digits is 18 (for `*`, unless the scale reaches 18), and beyond 38 it is 38:
+  DECIMAL(15,2) `+` DECIMAL(15,2) is DECIMAL(16,2), `*` is DECIMAL(18,4), DECIMAL(15,2) `*` BIGINT is DECIMAL(34,2),
+  DECIMAL(38,10) `*` DECIMAL(38,10) is DECIMAL(38,20), and a scale beyond 38 is a bind error with DuckDB's message
+  (`Needed scale 40 to accurately represent the multiplication result, ...`). Unary `-` keeps the type. `/`, `//`
+  and `%` of a DECIMAL, a decimal literal or a DOUBLE next to a DECIMAL, and DECIMAL `CASE` values are unsupported
+  (exit code 4).
 - Functions (names ASCII case-insensitive): `strlen(x)` takes a VARCHAR and is BIGINT; `regexp_replace(x, 'pattern',
   'replacement')` takes a VARCHAR and two string literals and is VARCHAR. A wrong number of arguments, another type or
   a non-literal pattern or replacement is a bind error (`strlen() needs a VARCHAR, but 'i16' is SMALLINT`); DuckDB's
@@ -529,12 +540,25 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
 - DECIMAL: a DECIMAL(p,s) value is an exact integer of at most p digits, the unscaled value, times 10^-s
   ([ADR 0021](adr/0021-decimal-semantics.md)). Comparisons with numbers (`=`, `<>`, `<`, `IN`, `BETWEEN`), `ORDER BY`,
   `GROUP BY`, `COUNT(DISTINCT)`, `MIN` and `MAX` use the unscaled value; `MIN` and `MAX` keep DECIMAL(p,s), `COUNT`
-  is BIGINT. Two DECIMAL columns compare only when both are the same DECIMAL(p,s). Not supported yet (exit code 4):
-  `SUM`, `AVG`, arithmetic and unary `-` on a DECIMAL, a DECIMAL as a `CASE` value, and comparing a DECIMAL with
-  another type (an integer or DOUBLE expression, a DECIMAL of another precision or scale, a number DuckDB types as
-  DOUBLE). A scan that reads a DECIMAL column applies no predicate itself, so every `WHERE` condition of that scan
-  is evaluated by the `Filter` (`explain --analyze` shows no pushed predicate), and a condition on a DECIMAL column
-  skips no row group ([ADR 0021](adr/0021-decimal-semantics.md)).
+  is BIGINT. Two DECIMAL operands compare only when both are the same DECIMAL(p,s). `+`, `-` and `*` compute exactly
+  in their result type (Binding): an operand of `+` or `-` with a smaller scale is first rescaled to it, and a value
+  that does not fit fails the query with DuckDB's conversion error (`Casting value "..." to type DECIMAL(38,10)
+  failed: value is out of range! when casting from source column d`, or `Could not cast value ... to DECIMAL(...)`
+  for an integer); a result beyond the width, which only a width capped to 18 or 38 can reach, fails with DuckDB's
+  overflow error (`Overflow in addition of DECIMAL(18) (a + b). You might want to add an explicit cast to a bigger
+  decimal.`, likewise `subtract` and `multiplication`). Both are execution errors (exit code 1). As in DuckDB, the
+  left operand is computed and rescaled before the right one, then the operation; with several failing rows the
+  error can name another row than DuckDB's (divergence D19). `SUM` of a
+  DECIMAL(p,s) is an exact DECIMAL(38,s): the same for any number of threads, NULL over no values, and a sum beyond
+  38 digits is an execution error (divergence D18). `AVG` is DOUBLE, computed as DuckDB computes it: the exact sum,
+  as a `long double` from its two 64-bit halves, divided by the count times 10^s (in `double` for a width up to 4),
+  so it agrees with DuckDB to the bit on each platform, even where that is not the correctly rounded mean. Not
+  supported yet (exit code 4): `/`, `//` and `%` of a DECIMAL, a decimal literal or DOUBLE in DECIMAL arithmetic, a
+  DECIMAL as a `CASE` value, and comparing a DECIMAL with another type (an integer or DOUBLE expression, a DECIMAL of
+  another precision or scale, a number DuckDB types as DOUBLE). A scan that reads a DECIMAL column applies no
+  predicate itself, so every `WHERE` condition of that scan is evaluated by the `Filter` (`explain --analyze` shows
+  no pushed predicate), and a condition on a DECIMAL column skips no row group
+  ([ADR 0021](adr/0021-decimal-semantics.md)).
 - Execution: the row groups of a query run on `--threads` threads (default: the hardware threads), 64Ki-row
   batches; their results are combined in file and row group order, so a result is the same for any number of
   threads, and deterministic. A DOUBLE `SUM` or `AVG` adds up every row group (per group with `GROUP BY`),
@@ -571,7 +595,7 @@ formatter:
 | 1 | query error: syntax, bind, execution or memory error | `SELECT COUNT(*) FORM t`; an unknown table or column; `SUM` of a VARCHAR column; a `SUM`, or arithmetic on a `SUM`, outside HUGEINT's range; an invalid `regexp_replace` pattern; a query that needs more memory than `--memory-limit` |
 | 2 | usage error | unknown option; neither or both of `-c` and `-f`; a malformed `--table`, `--column-type` or `--memory-limit`; a column that `--column-type` cannot read as DATE; a table name registered twice |
 | 3 | I/O error | a missing or unreadable file; not a Parquet file; schemas that differ; a glob that matches nothing |
-| 4 | unsupported: valid-looking SQL outside the supported subset | `row_number() OVER ()`; `IS NULL`; an unknown function; `SELECT 2.5`; `SUM(DISTINCT ...)`; `CAST(a AS BIGINT)`; `SUM` of a DECIMAL column; a column of an unsupported type |
+| 4 | unsupported: valid-looking SQL outside the supported subset | `row_number() OVER ()`; `IS NULL`; an unknown function; `SELECT 2.5`; `SUM(DISTINCT ...)`; `CAST(a AS BIGINT)`; `/` of a DECIMAL column; a column of an unsupported type |
 | 70 | internal error: anything else, which is a bug | an uncaught exception; an Arrow `NotImplemented` or type error without SQL context |
 
 Exit code 4 is used only for errors that the parser, the binder or the physical planner marks as unsupported
@@ -609,10 +633,12 @@ compare against DuckDB, so an unregistered difference is a bug.
 | D11 | FLOAT columns | read as DOUBLE (widened exactly): results of FLOAT columns are DOUBLE and print with double precision; `WHERE` compares like DuckDB (see Binding); arithmetic on them, and comparing them with other expressions, is unsupported (exit code 4) | keeps FLOAT (`MIN`, `MAX` and projections return FLOAT) | the random generator never references a FLOAT column (`ColumnOf` in `tests/slt/runner/query_gen.cc`, `harness.LoadGenTables.SkipsFloatColumns`); `tests/slt/cases/where/float.slt` selects only other columns, and `engine.SessionTest.FloatColumnsCompareLikeDuckDb` pins that results stay DOUBLE |
 | D12 | Long numbers against DOUBLE | a number compared with a DOUBLE column is the correctly rounded nearest double | converts a DECIMAL literal (at most 38 digits) or a HUGEINT literal to DOUBLE in two steps when its digits exceed 2^53, which can be one ulp off (`9007199254740993.5`) | the generator only writes decimals of at most 2^53 in their digits with at most 22 decimals, where both round the same (`ExactDecimalDouble` in `tests/slt/runner/query_gen.cc`) |
 | D13 | Decimals with many digits against integer and DECIMAL columns | compared exactly | compares in a DECIMAL whose width is capped at 38 digits: when the column type's digits plus the literal's decimals exceed 38, a column value with too many integer digits fails the query with a conversion error (`i16 = 1.0000000000000000000000000000000000001` over the value -32768); likewise an integer `SUM` (HUGEINT, 38 digits) in `HAVING` against any decimal fails once the sum has more digits than 38 minus the literal's decimals, and a DECIMAL(p,s) column against a literal with more than s decimals or more than p - s integer digits once their total exceeds 38 (`d38_10 > 0.00000000001` over a value of 28 integer digits) | the `.slt` records and the generator keep literals short enough (`DecimalText` in `tests/slt/runner/query_gen.cc`), and `tests/slt/cases/types/decimal.slt` pins both answers; `plan.Binder/FoldThroughBinderTest.*` and `plan.Binder/FoldDecimalTest.*` cover the exact folding |
-| D14 | Overflows DuckDB's optimizer does not avoid | a comparison that folds to always-true or never-true at bind time (a literal outside the operand's type, as in `smallint_col + 1 > 40000`) computes nothing, so it cannot overflow | computes the operand and fails on an overflow ("Overflow in addition of INT16") | the random generator never writes arithmetic that can overflow; `plan.BinderTest.WhereMovesConstantsLikeDuckDb` pins which comparisons move their constants |
+| D14 | Overflows DuckDB's optimizer does not avoid | a comparison that folds to always-true or never-true at bind time (a literal outside the operand's type, as in `smallint_col + 1 > 40000`, or a DECIMAL result's, as in `price * qty > 100000000000000000000` on DECIMAL(15,2) columns) computes nothing, so it cannot overflow | computes the operand and fails on an overflow ("Overflow in addition of INT16") | the random generator never writes arithmetic that can overflow; `plan.BinderTest.WhereMovesConstantsLikeDuckDb` pins which comparisons move their constants |
 | D15 | VARCHAR bytes that are not UTF-8 | answers: `strlen` counts every byte, and `regexp_replace` runs RE2 over the bytes as UTF-8, where an invalid byte never matches (not even `.` or `[^a]`) and stays in the result | cannot read such a value as VARCHAR: reading an unannotated BYTE_ARRAY column (`binary_as_string`) with it fails the query ("Invalid string encoding") | every fixture string is valid UTF-8, so the oracle tests never meet it; `exec.ComputeTest.StringFunctions` pins antb1's behavior |
 | D16 | Evaluation order in conditions | computes the arguments of `AND` and `OR` in the order written, each only for the rows still undecided, and a WHERE conjunct's operands for every row; so an overflow inside a condition fails exactly when a row reaches it in that order | may reorder conjunctions by its cost model, and computes the argument of a `NOT` for every row, so an overflow can fail in one engine and not the other (`NOT (x < 100 AND x * x > 0)` fails in DuckDB) | the random generator never writes arithmetic that can overflow; `exec.ComputeTest.ConditionsAreThreeValued` pins antb1's order |
 | D17 | Overflows in constant expressions | a constant integer expression on a side of a comparison or a `BETWEEN` bound that overflows its type (`a > 2147483647 + 1`) is a bind error, whatever the table holds | raises the overflow only when a row computes it: an empty table, or one whose rows another conjunct rejects first, answers | `plan.Expressions/BindErrorTest` pins the errors; `tests/slt/cases/where/between.slt` has the error on a table both engines fail on and, `onlyif antb1`, on the empty table |
+| D18 | DECIMAL SUM beyond 38 digits | a `SUM` of a DECIMAL(p,s) whose result has more than 38 digits is an execution error (`SUM overflow: the result is outside the range of DECIMAL(38,s) (38 decimal digits)`), as for HUGEINT (D9) | returns up to 39 digits until its 128-bit sum overflows | `tests/slt/cases/types/decimal_arithmetic.slt` pins both answers; the generator sums only DECIMAL columns whose sum over every row fits 38 digits |
+| D19 | Which failing row an error names | the overflow and cast errors of DECIMAL arithmetic print the values of the first failing row of a 64Ki-row batch (each operand, then the operation); a dependent `GROUP BY` key (ADR 0018) is computed per group, in group order | evaluates 2048-row vectors, and every key per row: with several failing rows the message can show another row's values; the exit code and whether a query fails are the same | the `.slt` records match the error text without the values; `exec.ComputeTest.DecimalOperandsInDuckDbOrder` pins the operand order |
 
 ## ClickBench status
 
@@ -679,7 +705,7 @@ The second workload is the 22 queries derived from TPC-H, in DuckDB's dialect, a
 committed ([ADR 0006](adr/0006-test-strategy-and-data-policy.md)); queries are referred to by their number (1-based).
 The ratchet `tests/data/tpch_status.json` lists the queries verified to pass, and `pass` below means exactly the
 ratchet (`pixi run lint` compares them); the PR that makes a query pass updates both. A query that does not pass must
-fail cleanly with exit code 4 (unsupported). Today none passes; the plan is recorded in ADRs 0021 (DECIMAL), 0022
+fail cleanly with exit code 4 (unsupported). Today Q1 and Q6 pass; the plan is recorded in ADRs 0021 (DECIMAL), 0022
 (joins, query blocks and uncorrelated subqueries) and 0023 (correlated subqueries). `tests/tpch/` generates the data
 at test time ([testing.md](testing.md#data-derived-from-tpc-h)), and `tpch.status.sf0_01`, `tpch.status.sf0_1` and
 `parallel.tpch.status.sf0_1` enforce the ratchet
@@ -688,12 +714,12 @@ completes the query; most queries also need the DECIMAL work of ADR 0021 before 
 
 | Query | Status | Completed by |
 | --- | --- | --- |
-| Q1 | unsupported (exit code 4) | DECIMAL arithmetic, SUM and AVG (ADR 0021) |
+| Q1 | pass | DECIMAL arithmetic, SUM and AVG (ADR 0021) |
 | Q2 | unsupported (exit code 4) | correlated scalar aggregates (ADR 0023) |
 | Q3 | unsupported (exit code 4) | inner joins (ADR 0022) |
 | Q4 | unsupported (exit code 4) | correlated EXISTS and NOT EXISTS (ADR 0023) |
 | Q5 | unsupported (exit code 4) | inner joins (ADR 0022) |
-| Q6 | unsupported (exit code 4) | DECIMAL arithmetic, SUM and AVG (ADR 0021) |
+| Q6 | pass | DECIMAL arithmetic, SUM and AVG (ADR 0021) |
 | Q7 | unsupported (exit code 4) | derived tables (ADR 0022) |
 | Q8 | unsupported (exit code 4) | derived tables (ADR 0022) |
 | Q9 | unsupported (exit code 4) | derived tables (ADR 0022) |

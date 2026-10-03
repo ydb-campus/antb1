@@ -64,18 +64,20 @@ arrow::Result<std::shared_ptr<arrow::Array>> OneDouble(std::optional<double> val
   return builder.Finish();
 }
 
-// HUGEINT is decimal128(38, 0): +-(10^38 - 1).
-arrow::Result<std::shared_ptr<arrow::Array>> OneHugeInt(std::optional<Int128> value,
-                                                        arrow::MemoryPool* pool) {
-  arrow::Decimal128Builder builder(plan::ToArrow(plan::LogicalType::kHugeInt), pool);
+// An exact sum as its 38-digit type: HUGEINT, or DECIMAL(38, s) for a DECIMAL argument (both
+// decimal128 within +-(10^38 - 1)).
+arrow::Result<std::shared_ptr<arrow::Array>> OneSum(std::optional<Int128> value,
+                                                    plan::LogicalType type,
+                                                    arrow::MemoryPool* pool) {
+  arrow::Decimal128Builder builder(plan::ToArrow(type), pool);
   if (!value.has_value()) {
     ARROW_RETURN_NOT_OK(builder.AppendNull());
     return builder.Finish();
   }
-  const plan::IntegerRange range = plan::RangeOf(plan::LogicalType::kHugeInt);
+  const plan::IntegerRange range = plan::RangeOf(type);
   if (*value < range.min || *value > range.max) {
-    return arrow::Status::ExecutionError(
-        "SUM overflow: the result is outside the range of HUGEINT (38 decimal digits)");
+    return arrow::Status::ExecutionError("SUM overflow: the result is outside the range of ",
+                                         plan::ToString(type), " (38 decimal digits)");
   }
   const auto bits = static_cast<UInt128>(*value);
   ARROW_RETURN_NOT_OK(builder.Append(
@@ -271,7 +273,8 @@ class IntegerSumState final : public AggregateState {
       return OneDouble(
           count_ == 0 ? std::nullopt : std::optional(ExactDivideToDouble(sum_, count_)), pool);
     }
-    return OneHugeInt(count_ == 0 ? std::nullopt : std::optional(sum_), pool);
+    return OneSum(count_ == 0 ? std::nullopt : std::optional(sum_), plan::LogicalType::kHugeInt,
+                  pool);
   }
 
  private:
@@ -337,13 +340,15 @@ Int128 HugeIntAt(const arrow::Decimal128Array& values, int64_t row) {
   return static_cast<Int128>(bits);
 }
 
-// SUM or AVG of a HUGEINT column: every addition is checked.
+// SUM or AVG of a HUGEINT or DECIMAL argument (decimal128): every addition is checked. A
+// DECIMAL(p,s) sums to DECIMAL(38,s), and averages as DuckDB does (DuckDbDecimalAverage).
 class HugeIntSumState final : public AggregateState {
  public:
-  HugeIntSumState(bool average, arrow::MemoryPool* pool) : average_(average), pool_(pool) {}
+  HugeIntSumState(bool average, plan::LogicalType input, arrow::MemoryPool* pool)
+      : average_(average), input_(input), pool_(pool) {}
 
   arrow::Status Consume(const arrow::Array& values, const arrow::BooleanArray* selection) override {
-    ARROW_RETURN_NOT_OK(CheckInput(values, selection, *plan::ToArrow(plan::LogicalType::kHugeInt)));
+    ARROW_RETURN_NOT_OK(CheckInput(values, selection, *plan::ToArrow(input_)));
     ARROW_ASSIGN_OR_RAISE(const RowMask mask,
                           RowMask::Make(&values, selection, values.length(), pool_));
     const auto& decimals = static_cast<const arrow::Decimal128Array&>(values);
@@ -373,20 +378,29 @@ class HugeIntSumState final : public AggregateState {
   }
   [[nodiscard]] arrow::Result<std::shared_ptr<arrow::Array>> Finalize(
       arrow::MemoryPool* pool) const override {
+    const bool decimal = input_ == plan::LogicalType::kDecimal;
     if (average_) {
-      return OneDouble(
-          count_ == 0 ? std::nullopt : std::optional(ExactDivideToDouble(sum_, count_)), pool);
+      if (count_ == 0) {
+        return OneDouble(std::nullopt, pool);
+      }
+      return OneDouble(decimal ? DuckDbDecimalAverage(sum_, count_, input_.width(), input_.scale())
+                               : ExactDivideToDouble(sum_, count_),
+                       pool);
     }
-    return OneHugeInt(count_ == 0 ? std::nullopt : std::optional(sum_), pool);
+    const plan::LogicalType result =
+        decimal ? plan::LogicalType::Decimal(plan::LogicalType::kMaxDecimalWidth, input_.scale())
+                : plan::LogicalType::kHugeInt;
+    return OneSum(count_ == 0 ? std::nullopt : std::optional(sum_), result, pool);
   }
 
  private:
   [[nodiscard]] arrow::Status Overflow() const {
-    return arrow::Status::ExecutionError(average_ ? "AVG" : "SUM",
-                                         " overflow: the sum of a HUGEINT column exceeds 128 bits");
+    return arrow::Status::ExecutionError(average_ ? "AVG" : "SUM", " overflow: the sum of a ",
+                                         plan::ToString(input_), " column exceeds 128 bits");
   }
 
   bool average_;
+  plan::LogicalType input_;
   arrow::MemoryPool* pool_;
   Int128 sum_ = 0;
   int64_t count_ = 0;
@@ -523,10 +537,10 @@ arrow::Result<std::unique_ptr<AggregateState>> SumState(bool average, plan::Logi
     case plan::LogicalType::kUSmallInt:
       return std::make_unique<IntegerSumState<arrow::UInt16Type>>(average, pool);
     case plan::LogicalType::kHugeInt:
-      return std::make_unique<HugeIntSumState>(average, pool);
+    case plan::LogicalType::kDecimal:
+      return std::make_unique<HugeIntSumState>(average, input, pool);
     case plan::LogicalType::kDouble:
       return std::make_unique<DoubleSumState>(average, pool);
-    case plan::LogicalType::kDecimal:  // SUM and AVG of DECIMAL are unsupported (D3)
     case plan::LogicalType::kVarchar:
     case plan::LogicalType::kDate:
     case plan::LogicalType::kTimestamp:
@@ -577,10 +591,13 @@ arrow::Result<std::unique_ptr<AggregateState>> MakeAggregateState(
         }
         return std::make_unique<TemporalAvgState>(pool);
       }
-      const plan::LogicalType expected = !average && plan::IsInteger(*input)
-                                             ? plan::LogicalType::kHugeInt
-                                             : plan::LogicalType::kDouble;
-      if (!plan::IsNumeric(*input) || result != expected) {
+      plan::LogicalType expected = !average && plan::IsInteger(*input) ? plan::LogicalType::kHugeInt
+                                                                       : plan::LogicalType::kDouble;
+      const bool decimal = *input == plan::LogicalType::kDecimal;
+      if (decimal && !average) {
+        expected = plan::LogicalType::Decimal(plan::LogicalType::kMaxDecimalWidth, input->scale());
+      }
+      if ((!plan::IsNumeric(*input) && !decimal) || result != expected) {
         return invalid();
       }
       return SumState(average, *input, pool);

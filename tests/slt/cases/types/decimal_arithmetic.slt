@@ -1,0 +1,245 @@
+# DECIMAL arithmetic, SUM and AVG (ADR 0021 rules 4 to 7, 12, 13 and 18; docs/sql-subset.md). + - * take DuckDB's
+# types: an integer counts as DECIMAL(5,0), (10,0), (19,0) or (38,0), widths beyond 18 digits from two operands of at
+# most 18 are capped to 18, beyond 38 to 38, and a value past the capped width is an error with DuckDB's message. SUM is
+# an exact DECIMAL(38,s), AVG a DOUBLE as DuckDB computes it. Rows 0 to 13 of decimals hold the columns' extremes, so
+# the value records read rows 14 and up.
+
+query IDDDDDDDD nosort
+SELECT id, p + q, p - d9_2, p * q, d9_2 * d9_2, p + id, id * p, -p, -d38_10 FROM decimals WHERE id >= 14 ORDER BY id
+----
+14	NULL	NULL	NULL	25.0000	NULL	NULL	NULL	4.0000000004
+15	0.00	0.00	0.0000	0.0000	15.00	0.00	0.00	0.0000000000
+16	179.91	74.96	7992.0020	25.0000	95.96	1279.36	-79.96	-4.0000000004
+17	NULL	NULL	NULL	NULL	-42.97	-1019.49	59.97	3.0000000003
+18	39.98	18.74	399.6001	1.5625	37.99	359.82	-19.99	-1.0000000001
+19	NULL	NULL	NULL	39.0625	NULL	NULL	NULL	-5.0000000005
+20	-39.98	-37.48	0.0000	6.2500	-19.98	-799.60	39.98	NULL
+21	79.96	37.48	1598.4004	6.2500	60.98	839.58	-39.98	-2.0000000002
+22	-179.91	-93.70	7992.0020	39.0625	-77.95	-2198.90	99.95	5.0000000005
+23	0.00	-18.74	-399.6001	1.5625	3.01	-459.77	19.99	1.0000000001
+24	NULL	NULL	NULL	NULL	NULL	NULL	NULL	-3.0000000003
+25	NULL	-74.96	NULL	25.0000	-54.96	-1999.00	79.96	4.0000000004
+26	39.98	0.00	0.0000	0.0000	26.00	0.00	0.00	0.0000000000
+27	159.92	74.96	6393.6016	25.0000	106.96	2158.92	-79.96	-4.0000000004
+28	-99.95	-56.22	2397.6006	14.0625	-31.97	-1679.16	59.97	3.0000000003
+29	NULL	NULL	NULL	1.5625	NULL	NULL	NULL	NULL
+30	199.90	93.70	9990.0025	39.0625	129.95	2998.50	-99.95	-5.0000000005
+31	-59.97	NULL	799.2002	NULL	-8.98	-1239.38	39.98	2.0000000002
+32	119.94	37.48	3196.8008	6.2500	71.98	1279.36	-39.98	-2.0000000002
+33	NULL	-93.70	NULL	39.0625	-66.95	-3298.35	99.95	5.0000000005
+34	NULL	NULL	NULL	1.5625	NULL	NULL	NULL	1.0000000001
+35	159.92	56.22	5994.0015	14.0625	94.97	2098.95	-59.97	-3.0000000003
+36	-159.92	-74.96	6393.6016	25.0000	-43.96	-2878.56	79.96	4.0000000004
+37	19.99	0.00	0.0000	0.0000	37.00	0.00	0.00	0.0000000000
+38	199.90	NULL	9590.4024	NULL	117.96	3038.48	-79.96	NULL
+39	NULL	NULL	NULL	14.0625	NULL	NULL	NULL	3.0000000003
+
+query IDDDDD nosort
+SELECT id, p + d18_4, d18_4 * p, d38_10 * p, d38_10 + d38_0, d9_2 * 3000000000 FROM decimals WHERE id >= 30 ORDER BY id
+----
+30	104.9505	499.799975	499.750000049975	NULL	18750000000.00
+31	-41.9802	79.967996	79.960000007996	-200000000000000000002.0000000002	NULL
+32	41.9802	79.967996	79.960000007996	200000000000000000002.0000000002	7500000000.00
+33	NULL	NULL	499.750000049975	-500000000000000000005.0000000005	-18750000000.00
+34	NULL	NULL	NULL	-100000000000000000001.0000000001	-3750000000.00
+35	62.9703	179.927991	179.910000017991	300000000000000000003.0000000003	11250000000.00
+36	-83.9604	319.871984	319.840000031984	NULL	-15000000000.00
+37	0.0000	0.000000	0.000000000000	0.0000000000	0.00
+38	83.9604	319.871984	NULL	NULL	NULL
+39	NULL	NULL	NULL	-300000000000000000003.0000000003	-11250000000.00
+
+query IDD nosort
+SELECT id, p * q * d9_2, (p + 7) * (q - id) FROM decimals WHERE id >= 30 ORDER BY id
+----
+30	62437.515625	7481.1525
+31	NULL	1681.6502
+32	7992.002000	2253.1608
+33	NULL	NULL
+34	NULL	NULL
+35	22477.505625	4349.7015
+36	-31968.008000	8460.4416
+37	0.000000	-119.0700
+38	NULL	7125.5024
+39	NULL	NULL
+
+# Comparisons over computed DECIMALs fold the literal into the result's scale.
+
+query I rowsort
+SELECT id FROM decimals WHERE p * id > 1000
+----
+10
+16
+27
+30
+32
+35
+38
+
+query I rowsort
+SELECT id FROM decimals WHERE p + 1 > 20.995 AND id >= 14
+----
+16
+21
+27
+30
+32
+35
+38
+
+query I nosort
+SELECT COUNT(*) FROM decimals WHERE -p <= -59.97
+----
+10
+
+query I nosort
+SELECT COUNT(*) FROM decimals WHERE p - q < 0 OR d9_2 * 2 = 2.50
+----
+19
+
+# SUM and AVG: over every row (the extremes cancel), over computed values, and over no rows.
+
+query DDDDDD nosort
+SELECT SUM(p), SUM(q), SUM(d9_2), SUM(d18_4), SUM(d38_10), SUM(d38_0) FROM decimals
+----
+-39.98	819.59	-10.00	99999999999990.9990	-5.0000000005	-500000000000000000000
+
+query RRRR nosort
+SELECT AVG(p), AVG(d9_2), AVG(d18_4), AVG(d38_10) FROM decimals
+----
+-1.249375	-0.29411764705882354	2857142857142.6	-0.14285714287142856
+
+query DDR nosort
+SELECT SUM(p * q), SUM(d9_2 + id), AVG(p - q) FROM decimals WHERE id >= 14
+----
+62337.6156	572.75	-19.99
+
+query DR nosort
+SELECT SUM(p), AVG(p) FROM decimals WHERE id > 100
+----
+NULL	NULL
+
+query IDRD nosort
+SELECT id % 4 AS g, SUM(p), AVG(q), SUM(d9_2 * 2) FROM decimals GROUP BY g ORDER BY g
+----
+0	-79.96	1000000000017.99	-10.00
+1	-79.96	-1999999999952.022	19999997.48
+2	10000000000099.94	25.987	-20000017.48
+3	-9999999999980.00	13.993	10.00
+
+query ID rowsort
+SELECT id % 3, SUM(p) FROM decimals GROUP BY id % 3 HAVING SUM(p) > 0
+----
+1	9999999999860.06
+
+query DD nosort
+SELECT d9_2, SUM(q) AS s FROM decimals WHERE id >= 14 GROUP BY d9_2 ORDER BY s DESC, d9_2 NULLS FIRST LIMIT 5
+----
+6.25	219.89
+5.00	179.91
+NULL	159.92
+2.50	119.94
+3.75	99.95
+
+query DD rowsort
+SELECT d18_4, SUM(p) + MIN(p) FROM decimals WHERE id >= 14 GROUP BY d18_4 HAVING SUM(q) <= 59.97
+----
+-1.0001	-39.98
+-2.0002	-119.94
+-3.0003	-179.91
+-4.0004	-239.88
+-5.0005	-199.90
+0.0000	0.00
+
+# No integer-only rewrite: SUM(p + 1) adds 1 to every value, p + 1 > 2 computes p + 1 (rule 18).
+
+query DI nosort
+SELECT SUM(p + 1), COUNT(p) FROM decimals
+----
+-7.98	32
+
+query I nosort
+SELECT COUNT(*) FROM decimals WHERE p + 1 > 2
+----
+14
+
+# Overflows past a capped width, and a rescaled operand that does not fit, fail with DuckDB's messages.
+
+statement error Overflow in multiplication of DECIMAL\(18\)
+SELECT d18_4 * d18_4 FROM decimals
+
+statement error Overflow in addition of DECIMAL\(18\)
+SELECT d18_4 + d18_4 FROM decimals
+
+statement error Overflow in subtract of DECIMAL\(18\)
+SELECT d18_4 - (-d18_4) FROM decimals
+
+statement error Overflow in addition of DECIMAL\(38\)
+SELECT d38_0 + d38_0 FROM decimals
+
+statement error Overflow in multiplication of DECIMAL\(38\)
+SELECT d38_0 * d38_0 FROM decimals
+
+statement error Casting value "99999999999999999999999999999999999999" to type DECIMAL\(38,10\) failed: value is out of range!
+SELECT d38_0 + d38_10 FROM decimals
+
+statement error Needed scale 40 to accurately represent the multiplication result
+SELECT d38_10 * d38_10 * d38_10 * d38_10 FROM decimals
+
+# A SUM beyond 38 digits: antb1 fails, DuckDB returns 39 digits (a divergence, docs/sql-subset.md).
+
+onlyif antb1
+statement error SUM overflow: the result is outside the range of DECIMAL\(38,0\)
+SELECT SUM(d38_0) FROM decimals WHERE id = 7 OR id = 8
+
+onlyif duckdb
+query D nosort
+SELECT SUM(d38_0) FROM decimals WHERE id = 7 OR id = 8
+----
+100000000000000000099999999999999999999
+
+# Not supported yet (exit 4): / // % of a DECIMAL and decimal literals in arithmetic.
+
+onlyif duckdb
+query R rowsort
+SELECT p / 2 FROM decimals WHERE id >= 30
+----
+-19.99
+-39.98
+-49.975
+0
+19.99
+29.985
+39.98
+49.975
+NULL
+NULL
+
+onlyif duckdb
+query D rowsort
+SELECT p % 7 FROM decimals WHERE id >= 30
+----
+-1.95
+-2.96
+-4.98
+0.00
+1.95
+2.96
+3.97
+4.98
+NULL
+NULL
+
+onlyif duckdb
+query D rowsort
+SELECT p + 0.5 FROM decimals WHERE id >= 30
+----
+-39.48
+-79.46
+-99.45
+0.50
+100.45
+40.48
+60.47
+80.46
+NULL
+NULL

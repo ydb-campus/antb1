@@ -1020,11 +1020,11 @@ arrow::Result<LogicalType> AggregateType(const sql::AggregateCall& call, const B
           (arg.type == LogicalType::kDate || arg.type == LogicalType::kTimestamp)) {
         return LogicalType::kTimestamp;
       }
+      // DuckDB's SUM of a DECIMAL(p,s) is DECIMAL(38,s), exact; its AVG is DOUBLE (ADR 0021).
       if (arg.type == LogicalType::kDecimal) {
-        return UnsupportedError(
-            std::format("{} of a DECIMAL ('{}' is {}) is not supported",
-                        ToString(ToPlan(call.kind)), Clip(arg.name), ToString(arg.type)),
-            call.span);
+        return call.kind == sql::AggKind::kSum
+                   ? LogicalType::Decimal(LogicalType::kMaxDecimalWidth, arg.type.scale())
+                   : LogicalType::kDouble;
       }
       if (!IsNumeric(arg.type)) {
         return BindError(std::format("{} needs a numeric column, but '{}' is {}",
@@ -1671,6 +1671,79 @@ std::string DescribeOperand(const Typed& t) {
   return std::format("'{}' is {}", Clip(t.expr->name), ToString(t.expr->type));
 }
 
+// An integer type as the DECIMAL DuckDB computes it in next to a DECIMAL (ADR 0021 rule 4): by its
+// type, so a literal does not shrink to fit (7 is INTEGER, DECIMAL(10,0)).
+LogicalType DecimalOfInteger(LogicalType type) {
+  switch (type.id()) {
+    case LogicalType::kSmallInt:
+    case LogicalType::kUSmallInt:
+      return LogicalType::Decimal(5, 0);
+    case LogicalType::kInteger:
+      return LogicalType::Decimal(10, 0);
+    case LogicalType::kBigInt:
+      return LogicalType::Decimal(19, 0);
+    default:
+      break;
+  }
+  return LogicalType::Decimal(LogicalType::kMaxDecimalWidth, 0);  // HUGEINT
+}
+
+// DuckDB's type of `l <op> r` for + - * with a DECIMAL operand and the other a DECIMAL or an
+// integer (ADR 0021 rules 4 to 6): the width beyond 18 digits is capped to 18 while both operands
+// have at most 18 (DuckDB computes them in 64 bits), and to 38 beyond that.
+arrow::Result<LogicalType> DecimalArithType(ArithOp op, const Typed& l, const Typed& r,
+                                            SourceSpan span) {
+  for (const Typed* t : {&l, &r}) {
+    if (t->decimal) {
+      return UnsupportedError(
+          "arithmetic of a DECIMAL with a decimal literal is not supported (ADR 0021, D4)", span);
+    }
+    if (t->expr->type == LogicalType::kDouble) {
+      return UnsupportedError(
+          std::format("arithmetic of a DECIMAL with a DOUBLE ({}) is not supported (ADR 0021, D4)",
+                      DescribeOperand(*t)),
+          span);
+    }
+  }
+  const auto decimal = [](LogicalType t) {
+    return t == LogicalType::kDecimal ? t : DecimalOfInteger(t);
+  };
+  const LogicalType a = decimal(l.expr->type);
+  const LogicalType b = decimal(r.expr->type);
+  const int pa = a.width();
+  const int pb = b.width();
+  const int sa = a.scale();
+  const int sb = b.scale();
+  constexpr int kMax = LogicalType::kMaxDecimalWidth;
+  constexpr int kSmall = 18;  // DuckDB's 64-bit DECIMAL
+  int width = 0;
+  int scale = 0;
+  if (op == ArithOp::kMultiply) {
+    scale = sa + sb;
+    if (scale > kMax) {
+      return BindError(std::format("Needed scale {} to accurately represent the multiplication "
+                                   "result, but this is out of range of the DECIMAL type. Max "
+                                   "scale is 38; could not perform an accurate multiplication. "
+                                   "Either add a cast to DOUBLE, or add an explicit cast to a "
+                                   "decimal with a lower scale.",
+                                   scale),
+                       span);
+    }
+    width = pa + pb;
+    if (width > kSmall && pa <= kSmall && pb <= kSmall && scale < kSmall) {
+      width = kSmall;
+    }
+  } else {
+    scale = std::max(sa, sb);
+    width = std::max(pa - sa, pb - sb) + scale + 1;
+    if (width > kSmall && pa <= kSmall && pb <= kSmall) {
+      width = kSmall;
+    }
+  }
+  width = std::min(width, kMax);
+  return LogicalType::Decimal(Narrow<std::uint8_t>(width), Narrow<std::uint8_t>(scale));
+}
+
 // The type DuckDB gives `l <op> r` (docs/sql-subset.md), or the error for operands it cannot take.
 arrow::Result<LogicalType> ArithType(sql::BinaryOp sql_op, ArithOp op, const Typed& l,
                                      const Typed& r, SourceSpan span) {
@@ -1681,10 +1754,15 @@ arrow::Result<LogicalType> ArithType(sql::BinaryOp sql_op, ArithOp op, const Typ
                                           Clip(t->expr->name), type),
                               span);
     }
+    if (t->expr->type == LogicalType::kDecimal &&
+        (op == ArithOp::kDivide || op == ArithOp::kIntegerDivide || op == ArithOp::kModulo)) {
+      return UnsupportedError(
+          std::format("'{}' of a DECIMAL ('{}' is {}) is not supported", sql::ToString(sql_op),
+                      Clip(t->expr->name), ToString(t->expr->type)),
+          span);
+    }
     if (t->expr->type == LogicalType::kDecimal) {
-      return UnsupportedError(std::format("DECIMAL arithmetic ('{}' is {}) is not supported",
-                                          Clip(t->expr->name), ToString(t->expr->type)),
-                              span);
+      continue;
     }
     if (!IsNumeric(t->expr->type)) {
       return BindError(std::format("arithmetic operator '{}' needs numbers, but {}",
@@ -1701,6 +1779,9 @@ arrow::Result<LogicalType> ArithType(sql::BinaryOp sql_op, ArithOp op, const Typ
   }
   if (op == ArithOp::kDivide) {
     return LogicalType::kDouble;
+  }
+  if (l.expr->type == LogicalType::kDecimal || r.expr->type == LogicalType::kDecimal) {
+    return DecimalArithType(op, l, r, span);
   }
   // A decimal literal is DuckDB's DECIMAL, not DOUBLE (though antb1 holds its value as a double).
   const bool any_double = (l.expr->type == LogicalType::kDouble && !l.decimal) ||
@@ -1766,13 +1847,8 @@ arrow::Result<Typed> Arith(const sql::BinaryExpr& binary, Typed left, Typed righ
 }
 
 arrow::Result<Typed> Negate(const sql::UnaryExpr& unary, Typed operand) {
-  const LogicalType type = operand.expr->type;
-  if (type == LogicalType::kDecimal) {
-    return UnsupportedError(
-        std::format("negating a DECIMAL ({}) is not supported", DescribeOperand(operand)),
-        unary.op_span);
-  }
-  if (!IsNumeric(type)) {
+  const LogicalType type = operand.expr->type;  // a DECIMAL keeps its type, as in DuckDB
+  if (!IsNumeric(type) && type != LogicalType::kDecimal) {
     return BindError(
         std::format("arithmetic operator '-' needs a number, but {}", DescribeOperand(operand)),
         unary.op_span);

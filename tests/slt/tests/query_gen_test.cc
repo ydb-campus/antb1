@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <regex>
 #include <string>
 #include <utility>
@@ -122,6 +123,8 @@ TEST(QueryGenerator, TargetSamplesCoverTheWholeGrammar) {
 
 TEST(QueryGenerator, QueriesRespectTheSemanticsBothEnginesShare) {
   const auto gen = Make(3, {.supported = kSupportedFeatures, .target_percent = 100});
+  int decimal_sums = 0;
+  int decimal_arithmetics = 0;
   for (uint64_t i = 0; i < 3000; ++i) {
     const auto q = gen.Generate(i);
     const std::string sql = Lower(q.sql);
@@ -155,13 +158,18 @@ TEST(QueryGenerator, QueriesRespectTheSemanticsBothEnginesShare) {
     if (q.features.Has(Feature::kStar) && q.table == "big") {
       EXPECT_TRUE(q.features.Has(Feature::kLimit)) << q.sql;
     }
-    // DECIMAL columns: no SUM, AVG, arithmetic or CASE values yet (exit 4 on antb1), and no literal
-    // with more than 10 fraction digits (w's scale; m has spare digits), which DuckDB would compare
-    // in a DECIMAL capped at 38 digits (divergence D13). Layout comments could hide a match.
+    // DECIMAL columns: no / // % or CASE values yet, and arithmetic only with integer constants
+    // (exit 4 on antb1, D4); no literal with more than 10 fraction digits (w's scale; m has spare
+    // digits), which DuckDB would compare in a DECIMAL capped at 38 digits (divergence D13). Layout
+    // comments could hide a match.
     if (!q.features.Has(Feature::kLayout)) {
       static const std::regex decimal_misuse(
-          R"re((sum|avg)\( ?"?[mw]"?\)|"?\b[mw]\b"? ?(\+|-|\*|/|%)|then "?[mw]\b|else "?[mw]\b|- "?[mw]\b)re");
+          R"re("?\b[mw]\b"? ?(/|%)|then "?[mw]\b|else "?[mw]\b|"?\b[mw]\b"? ?[-+*] ?[0-9]+\.)re");
       EXPECT_FALSE(std::regex_search(sql, decimal_misuse)) << q.sql;
+      static const std::regex decimal_sum(R"re((sum|avg)\( ?"?[mw]"?\))re");
+      static const std::regex decimal_arithmetic(R"re("?\b[mw]\b"? ?[-+*] ?[0-9]+\b)re");
+      decimal_sums += std::regex_search(sql, decimal_sum) ? 1 : 0;
+      decimal_arithmetics += std::regex_search(sql, decimal_arithmetic) ? 1 : 0;
     }
     static const std::regex long_fraction(R"re(\.[0-9]{11})re");
     EXPECT_FALSE(std::regex_search(sql, long_fraction)) << q.sql;
@@ -169,10 +177,10 @@ TEST(QueryGenerator, QueriesRespectTheSemanticsBothEnginesShare) {
     EXPECT_FALSE(q.sql.contains("0.1000000000000000055511151231257827")) << q.sql;
     EXPECT_FALSE(q.sql.contains("it's")) << "quotes in string literals are doubled: " << q.sql;
   }
+  EXPECT_GT(decimal_sums, 10) << "SUM and AVG of DECIMAL columns";
+  EXPECT_GT(decimal_arithmetics, 10) << "DECIMAL arithmetic with integer constants";
 }
 
-// A DECIMAL of 38 digits with few integer digits: no literal (a BETWEEN bound included) has more
-// integer digits than p - s, which would leave DuckDB's 38-digit common type (divergence D13).
 TEST(QueryGenerator, DecimalLiteralsStayWithinTheColumnsDigits) {
   GenTable t{.name = "t", .path = {}, .rows = 10, .columns = {}};
   t.columns = {{.name = "n",
@@ -200,6 +208,73 @@ TEST(QueryGenerator, DecimalLiteralsStayWithinTheColumnsDigits) {
     }
   }
   EXPECT_GT(betweens, 10);
+}
+
+// The data range of a DECIMAL column keeps its SUM and arithmetic inside their types (an overflow
+// fails both engines, a SUM beyond 38 digits only antb1, D18): h (DECIMAL(38,0) at its largest
+// value) gets neither SUM, AVG nor a constant, only unary -; x (DECIMAL(18,4), capped to 18
+// digits by * k) gets + k and SUM but not * 2; y (DECIMAL(38,10), 10^38 - 10^12 at most, one
+// row) gets + 1 and + 7 but not + 100, which needs one more digit than DECIMAL(38,10) holds.
+TEST(QueryGenerator, DecimalDataRangesKeepSumsAndArithmeticInTheirTypes) {
+  Int128 digits38 = 1;
+  for (int i = 0; i < 38; ++i) {
+    digits38 *= 10;
+  }
+  digits38 -= 1;  // 10^38 - 1
+  GenTable full{.name = "full", .path = {}, .rows = 10, .columns = {}};
+  full.columns = {{.name = "h",
+                   .kind = ValueKind::kDecimal,
+                   .samples = {"5"},
+                   .precision = 38,
+                   .scale = 0,
+                   .abs_max = digits38},
+                  {.name = "x",
+                   .kind = ValueKind::kDecimal,
+                   .samples = {"1.5000"},
+                   .precision = 18,
+                   .scale = 4,
+                   .abs_max = Int128{600'000'000'000'000'000}}};
+  GenTable one{.name = "one", .path = {}, .rows = 1, .columns = {}};
+  one.columns = {{.name = "y",
+                  .kind = ValueKind::kDecimal,
+                  .samples = {"2.0000000000"},
+                  .precision = 38,
+                  .scale = 10,
+                  .abs_max = digits38 + 1 - Int128{1'000'000'000'000}}};
+  auto gen = QueryGenerator::Make({full, one}, 11,
+                                  {.supported = kSupportedFeatures, .target_percent = 100});
+  ASSERT_TRUE(gen.has_value()) << gen.error();
+  static const std::regex h_sum(R"re((sum|avg)\((distinct )?"?h\b)re");
+  static const std::regex h_constant(R"re("?\bh\b"? ?[-+*] ?[0-9])re");
+  static const std::regex h_negated(R"re(- ?"?h\b)re");
+  static const std::regex x_times(R"re("?\bx\b"? ?\* ?[0-9])re");
+  static const std::regex x_plus(R"re("?\bx\b"? ?[-+] ?[0-9])re");
+  static const std::regex x_sum(R"re((sum|avg)\( ?"?x\b)re");
+  static const std::regex y_hundred(R"re("?\by\b"? ?[-+] ?100\b)re");
+  static const std::regex y_small(R"re("?\by\b"? ?[-+] ?[17]\b)re");
+  int h_negations = 0;
+  int x_additions = 0;
+  int x_sums = 0;
+  int y_additions = 0;
+  for (uint64_t i = 0; i < 5000; ++i) {
+    const auto q = gen->Generate(i);
+    if (q.features.Has(Feature::kLayout)) {
+      continue;  // layout comments could split a match
+    }
+    const std::string sql = Lower(q.sql);
+    EXPECT_FALSE(std::regex_search(sql, h_sum)) << q.sql;
+    EXPECT_FALSE(std::regex_search(sql, h_constant)) << q.sql;
+    EXPECT_FALSE(std::regex_search(sql, x_times)) << q.sql;
+    EXPECT_FALSE(std::regex_search(sql, y_hundred)) << q.sql;
+    h_negations += std::regex_search(sql, h_negated) ? 1 : 0;
+    x_additions += std::regex_search(sql, x_plus) ? 1 : 0;
+    x_sums += std::regex_search(sql, x_sum) ? 1 : 0;
+    y_additions += std::regex_search(sql, y_small) ? 1 : 0;
+  }
+  EXPECT_GT(h_negations, 10);
+  EXPECT_GT(x_additions, 10);
+  EXPECT_GT(x_sums, 10);
+  EXPECT_GT(y_additions, 10);
 }
 
 TEST(QueryGenerator, MakeRejectsWhatCannotBeGenerated) {
@@ -258,8 +333,12 @@ TEST(LoadGenTables, SkipsFloatColumns) {
 }
 
 // A DECIMAL column keeps its precision and scale, and its samples are literals with a digit before
-// the point; a DECIMAL beyond 38 digits is skipped like a FLOAT.
+// the point, and its data range the largest magnitude (none when every value is NULL; the largest
+// Int128 for the 128-bit minimum, which a file may hold); a DECIMAL beyond 38 digits is skipped
+// like a FLOAT.
 TEST(LoadGenTables, ReadsDecimalColumns) {
+  // 2^127: arrow::Decimal128 keeps its low 128 bits, the 128-bit minimum.
+  const std::string int128_min_text = "170141183460469231731687303715884105728";
   const std::filesystem::path dir =
       std::filesystem::path(::testing::TempDir()) / "antb1_query_gen_decimal";
   std::filesystem::remove_all(dir);
@@ -267,26 +346,39 @@ TEST(LoadGenTables, ReadsDecimalColumns) {
   const std::string path = (dir / "t.parquet").string();
   arrow::Decimal128Builder small(arrow::decimal128(9, 2));
   arrow::Decimal256Builder wide(arrow::decimal256(40, 0));
+  arrow::Decimal128Builder nulls(arrow::decimal128(9, 2));
+  arrow::Decimal128Builder minimum(arrow::decimal128(38, 0));
   for (const int64_t v : {5, -1234, 0, 100}) {
     ASSERT_TRUE(small.Append(arrow::Decimal128(v)).ok());
     ASSERT_TRUE(wide.Append(arrow::Decimal256(v)).ok());
+    ASSERT_TRUE(nulls.AppendNull().ok());
+    ASSERT_TRUE(
+        minimum.Append(v == 0 ? arrow::Decimal128(int128_min_text) : arrow::Decimal128(v)).ok());
   }
   const auto table =
       arrow::Table::Make(arrow::schema({arrow::field("p", arrow::decimal128(9, 2)),
-                                        arrow::field("w", arrow::decimal256(40, 0))}),
-                         {small.Finish().ValueOrDie(), wide.Finish().ValueOrDie()});
+                                        arrow::field("w", arrow::decimal256(40, 0)),
+                                        arrow::field("n", arrow::decimal128(9, 2)),
+                                        arrow::field("m", arrow::decimal128(38, 0))}),
+                         {small.Finish().ValueOrDie(), wide.Finish().ValueOrDie(),
+                          nulls.Finish().ValueOrDie(), minimum.Finish().ValueOrDie()});
   auto out = arrow::io::FileOutputStream::Open(path).ValueOrDie();
   ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), out, 4).ok());
   ASSERT_TRUE(out->Close().ok());
 
   const auto tables = LoadGenTables({TableDef{.name = "t", .files = {path}, .patterns = {path}}});
   ASSERT_TRUE(tables.has_value()) << tables.error();
-  ASSERT_EQ(tables->front().columns.size(), 1U);
+  ASSERT_EQ(tables->front().columns.size(), 3U);
   const GenColumn& p = tables->front().columns.front();
   EXPECT_EQ(p.kind, ValueKind::kDecimal);
   EXPECT_EQ(p.precision, 9);
   EXPECT_EQ(p.scale, 2);
   EXPECT_EQ(p.samples, (std::vector<std::string>{"0.05", "-12.34", "0.00", "1.00"}));
+  EXPECT_EQ(p.abs_max, std::optional<Int128>(1234));
+  EXPECT_EQ(tables->front().columns[1].name, "n");
+  EXPECT_FALSE(tables->front().columns[1].abs_max.has_value());
+  EXPECT_EQ(tables->front().columns[2].name, "m");
+  EXPECT_EQ(tables->front().columns[2].abs_max, std::optional<Int128>(kInt128Max));
   EXPECT_TRUE(tables->front().other_columns);
   std::filesystem::remove_all(dir);
 }

@@ -325,7 +325,12 @@ TEST_P(FoldDecimalTest, Folds) {
   const std::string sql = "SELECT COUNT(*) FROM dec WHERE " + std::string(c.where);
   auto plan = BindSql(sql, catalog);
   ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
-  const Predicate& p = std::get<FilterNode>(Nth(*plan, 1)).predicates.at(0);
+  // The Filter is below the Aggregate, and below a Compute for a computed operand.
+  int depth = 1;
+  while (!std::holds_alternative<FilterNode>(Nth(*plan, depth))) {
+    ++depth;
+  }
+  const Predicate& p = std::get<FilterNode>(Nth(*plan, depth)).predicates.at(0);
   EXPECT_EQ(p.kind, c.kind);
   EXPECT_EQ(p.column.has_value(), c.kind != Predicate::Kind::kFalse);
   if (c.kind == Predicate::Kind::kCompare) {
@@ -367,7 +372,12 @@ INSTANTIATE_TEST_SUITE_P(
         FoldCase{"z = 1234567890123456789012345678.0123456789", kCompare, CompareOp::kEq,
                  (Int128{1234567890123456789} * Int128{1'000'000'000'000'000'000} * 10) +
                      Int128{123456780123456789}},
-        FoldCase{"z > 10000000000000000000000000000", kFalse}));
+        FoldCase{"z > 10000000000000000000000000000", kFalse},
+        // Computed operands fold into their own type: p * q is DECIMAL(18,4), -p DECIMAL(15,2).
+        FoldCase{"p * q > 100", kCompare, CompareOp::kGt, 1000000},
+        FoldCase{"p * q <= 0.00001", kCompare, CompareOp::kLe, 0},
+        FoldCase{"-p < -1.5", kCompare, CompareOp::kLt, -150},
+        FoldCase{"p + i >= 99999999999999.995", kFalse}));
 
 // Numbers that DuckDB reads as DOUBLE (an exponent, or a decimal of more than 38 digits) are
 // rounded to the nearest double first, then folded exactly (divergence D7).
@@ -440,7 +450,12 @@ INSTANTIATE_TEST_SUITE_P(
         FoldCase{"MAX(p) < 12.345", kCompare, CompareOp::kLe, 1234},
         FoldCase{"MIN(p) >= -12.345", kCompare, CompareOp::kGe, -1234},
         FoldCase{"MIN(p) <> 0.001", kIsNotNull}, FoldCase{"MAX(z) = 0.00000000001", kFalse},
-        FoldCase{"MAX(z) > 0.00000000001", kCompare, CompareOp::kGe, 1}));
+        FoldCase{"MAX(z) > 0.00000000001", kCompare, CompareOp::kGe, 1},
+        // SUM of a DECIMAL(p,s) is DECIMAL(38,s).
+        FoldCase{"SUM(p) > 1.5", kCompare, CompareOp::kGt, 150},
+        FoldCase{"SUM(p) <= 12.345", kCompare, CompareOp::kLe, 1234},
+        FoldCase{"SUM(r) = 0.00005", kFalse},
+        FoldCase{"SUM(p) < 1000000000000000000000000000000000000", kIsNotNull}));
 
 }  // namespace
 }  // namespace antb1::plan

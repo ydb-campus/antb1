@@ -175,6 +175,12 @@ std::vector<Call> CallsOver(LogicalType type) {
   if (type == LogicalType::kDate || type == LogicalType::kTimestamp) {
     calls.push_back({.kind = AggKind::kAvg, .input = type, .result = LogicalType::kTimestamp});
   }
+  if (type == LogicalType::kDecimal) {
+    calls.push_back({.kind = AggKind::kSum,
+                     .input = type,
+                     .result = LogicalType::Decimal(LogicalType::kMaxDecimalWidth, type.scale())});
+    calls.push_back({.kind = AggKind::kAvg, .input = type, .result = LogicalType::kDouble});
+  }
   return calls;
 }
 

@@ -185,6 +185,175 @@ TEST_F(ComputeTest, HugeIntArithmetic) {
   EXPECT_EQ((*product)->ToString(), "[\n  3,\n  6\n]");
 }
 
+std::shared_ptr<arrow::Array> Decimals(LogicalType type,
+                                       const std::vector<std::optional<std::string>>& unscaled) {
+  arrow::Decimal128Builder builder(plan::ToArrow(type));
+  for (const auto& v : unscaled) {
+    EXPECT_TRUE(
+        (v.has_value() ? builder.Append(arrow::Decimal128(*v)) : builder.AppendNull()).ok());
+  }
+  return builder.Finish().ValueOrDie();
+}
+
+// The unscaled values of a decimal128 array ("null" for NULL), and its type.
+std::string UnscaledText(const arrow::Array& array) {
+  std::string out = array.type()->ToString() + ":";
+  const auto& d = static_cast<const arrow::Decimal128Array&>(array);
+  for (int64_t i = 0; i < d.length(); ++i) {
+    out += " " +
+           (d.IsNull(i) ? std::string("null") : arrow::Decimal128(d.GetValue(i)).ToIntegerString());
+  }
+  return out;
+}
+
+plan::ExprPtr Named(const plan::ExprPtr& expr, std::string name) {
+  plan::Expr copy = *expr;
+  copy.name = std::move(name);
+  return std::make_shared<const plan::Expr>(std::move(copy));
+}
+
+// DECIMAL + and - rescale both operands to the result's scale, * multiplies the unscaled values;
+// only a width capped to 18 or 38 can overflow, with DuckDB 1.5.5's messages (ADR 0021 rule 7).
+TEST_F(ComputeTest, DecimalArithmetic) {
+  const LogicalType p = LogicalType::Decimal(15, 2);
+  const LogicalType r = LogicalType::Decimal(9, 4);
+  const auto price = Decimals(p, {"1700", "-25", std::nullopt, "999999999999999"});
+  const auto rate = Decimals(r, {"5", "-10000", "1", "999999999"});
+  // p + r is DECIMAL(18,4): 17.00 + 0.0005, -0.25 - 1.0000, NULL, 9999999999999.99 + 99999.9999.
+  auto sum = Eval(Arith(ArithOp::kAdd, ColumnAt(0, p), ColumnAt(1, r), LogicalType::Decimal(18, 4)),
+                  {price, rate});
+  ASSERT_TRUE(sum.ok()) << sum.status().ToString();
+  EXPECT_EQ(UnscaledText(**sum), "decimal128(18, 4): 170005 -12500 null 100000000999999899");
+  auto difference =
+      Eval(Arith(ArithOp::kSubtract, ColumnAt(1, r), ColumnAt(0, p), LogicalType::Decimal(18, 4)),
+           {price, rate});
+  ASSERT_TRUE(difference.ok()) << difference.status().ToString();
+  EXPECT_EQ(UnscaledText(**difference), "decimal128(18, 4): -169995 -7500 null -99999998999999901");
+  // p * r is DECIMAL(18,6), capped from 24: the last row needs 24 digits.
+  const auto product =
+      Arith(ArithOp::kMultiply, ColumnAt(0, p), ColumnAt(1, r), LogicalType::Decimal(18, 6));
+  auto first = Eval(product, {price->Slice(0, 3), rate->Slice(0, 3)});
+  ASSERT_TRUE(first.ok()) << first.status().ToString();
+  EXPECT_EQ(UnscaledText(**first), "decimal128(18, 6): 8500 250000 null");
+  EXPECT_EQ(Eval(product, {price, rate}).status().message(),
+            "Overflow in multiplication of DECIMAL(18) (999999999999999 * 999999999). You might "
+            "want to add an explicit cast to a bigger decimal.");
+  // An integer operand counts as DECIMAL(k,0): p + 7 is DECIMAL(16,2).
+  auto plus_int = Eval(Arith(ArithOp::kAdd, ColumnAt(0, p), ConstantOf(7, LogicalType::kInteger),
+                             LogicalType::Decimal(16, 2)),
+                       {price});
+  ASSERT_TRUE(plus_int.ok()) << plus_int.status().ToString();
+  EXPECT_EQ(UnscaledText(**plus_int), "decimal128(16, 2): 2400 675 null 1000000000000699");
+  // Negation keeps the type.
+  const auto negate = std::make_shared<const plan::Expr>(
+      plan::Expr{.node = plan::NegateExpr{.operand = ColumnAt(0, p)}, .type = p, .name = "-c"});
+  auto negated = Eval(negate, {price});
+  ASSERT_TRUE(negated.ok()) << negated.status().ToString();
+  EXPECT_EQ(UnscaledText(**negated), "decimal128(15, 2): -1700 25 null -999999999999999");
+  // A file may hold a value beyond the declared width: the 128-bit minimum fails, it is not UB.
+  const LogicalType d38 = LogicalType::Decimal(38, 0);
+  const auto minimum = Decimals(d38, {"-170141183460469231731687303715884105728"});
+  const auto negate38 = std::make_shared<const plan::Expr>(
+      plan::Expr{.node = plan::NegateExpr{.operand = ColumnAt(0, d38)}, .type = d38, .name = "-c"});
+  EXPECT_EQ(Eval(negate38, {minimum}).status().message(), "Overflow in negation of DECIMAL(38,0)");
+}
+
+// Overflows at both caps and failed rescales, with DuckDB 1.5.5's messages: + and - check
+// |v| <= 10^p - 1 (not the 64-bit range), * also beyond 128 bits; a rescaled operand that does not
+// fit fails first, naming the column it comes from.
+TEST_F(ComputeTest, DecimalArithmeticErrors) {
+  const LogicalType d18 = LogicalType::Decimal(18, 0);
+  const auto big = Decimals(d18, {"600000000000000000"});
+  EXPECT_EQ(
+      Eval(Arith(ArithOp::kAdd, ColumnAt(0, d18), ColumnAt(0, d18), d18), {big}).status().message(),
+      "Overflow in addition of DECIMAL(18) (600000000000000000 + 600000000000000000). You "
+      "might want to add an explicit cast to a bigger decimal.");
+  const auto negative = Decimals(d18, {"-600000000000000000"});
+  EXPECT_EQ(
+      Eval(Arith(ArithOp::kSubtract, ColumnAt(0, d18), ColumnAt(1, d18), d18), {big, negative})
+          .status()
+          .message(),
+      "Overflow in subtract of DECIMAL(18) (600000000000000000 - -600000000000000000). You "
+      "might want to add an explicit cast to a bigger decimal.");
+  const LogicalType d38 = LogicalType::Decimal(38, 0);
+  const auto huge = Decimals(d38, {"60000000000000000000000000000000000000"});
+  EXPECT_EQ(Eval(Arith(ArithOp::kAdd, ColumnAt(0, d38), ColumnAt(0, d38), d38), {huge})
+                .status()
+                .message(),
+            "Overflow in addition of DECIMAL(38) (60000000000000000000000000000000000000 + "
+            "60000000000000000000000000000000000000);");
+  const auto twenty = Decimals(d38, {"-100000000000000000000"});
+  EXPECT_EQ(Eval(Arith(ArithOp::kMultiply, ColumnAt(0, d38), ColumnAt(0, d38), d38), {twenty})
+                .status()
+                .message(),
+            "Overflow in multiplication of DECIMAL(38) (-100000000000000000000 * "
+            "-100000000000000000000). You might want to add an explicit cast to a decimal with a "
+            "smaller scale.");
+  // Beyond 128 bits, still DuckDB's overflow.
+  const auto max38 = Decimals(d38, {std::string(38, '9')});
+  EXPECT_TRUE(Eval(Arith(ArithOp::kMultiply, ColumnAt(0, d38), ColumnAt(0, d38), d38), {max38})
+                  .status()
+                  .message()
+                  .starts_with("Overflow in multiplication of DECIMAL(38)"));
+  // d38_0 + d38_10 is DECIMAL(38,10): the DECIMAL(38,0) operand does not fit after rescaling.
+  const LogicalType d38_10 = LogicalType::Decimal(38, 10);
+  const auto small = Decimals(d38_10, {"1"});
+  const auto result = LogicalType::Decimal(38, 10);
+  EXPECT_EQ(
+      Eval(Arith(ArithOp::kAdd, Named(ColumnAt(0, d38), "d38_0"), ColumnAt(1, d38_10), result),
+           {max38, small})
+          .status()
+          .message(),
+      "Casting value \"99999999999999999999999999999999999999\" to type DECIMAL(38,10) "
+      "failed: value is out of range! when casting from source column d38_0");
+  // Not a column: no source column; a scaled value prints with its scale.
+  const LogicalType d18_1 = LogicalType::Decimal(18, 1);
+  const auto scaled = Decimals(d18_1, {"123456789012345675"});
+  const auto cents = Decimals(LogicalType::Decimal(2, 2), {"1"});
+  EXPECT_EQ(Eval(Arith(ArithOp::kAdd,
+                       Arith(ArithOp::kMultiply, ColumnAt(0, d18_1),
+                             ConstantOf(1, LogicalType::kSmallInt), LogicalType::Decimal(18, 1)),
+                       ColumnAt(1, LogicalType::Decimal(2, 2)), LogicalType::Decimal(18, 2)),
+                 {scaled, cents})
+                .status()
+                .message(),
+            "Casting value \"12345678901234567.5\" to type DECIMAL(18,2) failed: value is out of "
+            "range!");
+  // An integer operand that does not fit: DuckDB's integer cast message.
+  const auto ints = testing::ArrayOf<arrow::Int32Builder>(
+      arrow::int32(), std::vector<std::optional<int32_t>>{std::numeric_limits<int32_t>::min()});
+  const LogicalType d18_10 = LogicalType::Decimal(18, 10);
+  EXPECT_EQ(Eval(Arith(ArithOp::kAdd, Named(ColumnAt(0, LogicalType::kInteger), "i32"),
+                       ColumnAt(1, d18_10), d18_10),
+                 {ints, Decimals(d18_10, {"1"})})
+                .status()
+                .message(),
+            "Could not cast value -2147483648 to DECIMAL(18,10) when casting from source column "
+            "i32");
+}
+
+// The left operand of + and - is computed and rescaled before the right one is computed, as in
+// DuckDB 1.5.5: here its failed rescale is reported, not the right operand's overflow.
+TEST_F(ComputeTest, DecimalOperandsInDuckDbOrder) {
+  const LogicalType e = LogicalType::Decimal(18, 4);
+  Int128 big = 1;
+  for (int i = 0; i < 32; ++i) {
+    big *= 10;
+  }
+  const auto left = Arith(ArithOp::kMultiply, ColumnAt(0, LogicalType::kBigInt),
+                          ConstantOf(big, LogicalType::kHugeInt), LogicalType::kHugeInt);
+  const auto right =
+      Arith(ArithOp::kMultiply, ColumnAt(1, e), ColumnAt(1, e), LogicalType::Decimal(18, 8));
+  const auto sum = Arith(ArithOp::kAdd, left, right, LogicalType::Decimal(38, 8));
+  EXPECT_EQ(Eval(sum, {Int64s({1}), Decimals(e, {"1200000000000000"})}).status().message(),
+            "Could not cast value 100000000000000000000000000000000 to DECIMAL(38,8)");
+  // The right operand alone overflows.
+  EXPECT_TRUE(Eval(right, {Int64s({1}), Decimals(e, {"1200000000000000"})})
+                  .status()
+                  .message()
+                  .starts_with("Overflow in multiplication of DECIMAL(18)"));
+}
+
 // A Compute appends its columns to the selected rows only: a row a filter dropped is never
 // computed, so it cannot overflow.
 TEST_F(ComputeTest, ComputesOnlyTheSelectedRows) {
