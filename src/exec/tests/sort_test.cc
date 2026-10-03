@@ -108,6 +108,12 @@ TEST_F(SortTest, EveryEngineType) {
   ASSERT_TRUE(decimals.Append(arrow::Decimal128::GetMaxValue(38).Negate()).ok());
   ASSERT_TRUE(decimals.AppendNull().ok());
   ASSERT_TRUE(decimals.Append(hugeint(-1)).ok());
+  // DECIMAL(15,2) orders by the unscaled value: 17.00, -0.25, NULL, -999999999999.99.
+  arrow::Decimal128Builder scaled(plan::ToArrow(LogicalType::Decimal(15, 2)));
+  ASSERT_TRUE(scaled.Append(hugeint(1700)).ok());
+  ASSERT_TRUE(scaled.Append(hugeint(-25)).ok());
+  ASSERT_TRUE(scaled.AppendNull().ok());
+  ASSERT_TRUE(scaled.Append(hugeint(-99999999999999)).ok());
   const auto batch = WithIds({
       testing::ArrayOf<arrow::Int16Builder, int16_t>(arrow::int16(), {3, -4, std::nullopt, 0}),
       testing::ArrayOf<arrow::Int32Builder, int32_t>(arrow::int32(), {3, -4, std::nullopt, 0}),
@@ -115,12 +121,15 @@ TEST_F(SortTest, EveryEngineType) {
                                                        {65535, 1, std::nullopt, 0}),
       testing::ArrayOf<arrow::Date32Builder, int32_t>(arrow::date32(), {3, -4, std::nullopt, 0}),
       decimals.Finish().ValueOrDie(),
+      scaled.Finish().ValueOrDie(),
   });
   EXPECT_EQ(SortedIds(batch, {Key(1, LogicalType::kSmallInt)}), (Ids{1, 3, 0, 2}));
   EXPECT_EQ(SortedIds(batch, {Key(2, LogicalType::kInteger)}), (Ids{1, 3, 0, 2}));
   EXPECT_EQ(SortedIds(batch, {Key(3, LogicalType::kUSmallInt)}), (Ids{3, 1, 0, 2}));
   EXPECT_EQ(SortedIds(batch, {Key(4, LogicalType::kDate)}), (Ids{1, 3, 0, 2}));
   EXPECT_EQ(SortedIds(batch, {Key(5, LogicalType::kHugeInt)}), (Ids{1, 3, 0, 2}));
+  EXPECT_EQ(SortedIds(batch, {Key(6, LogicalType::Decimal(15, 2))}), (Ids{3, 1, 0, 2}));
+  EXPECT_EQ(SortedIds(batch, {Key(6, LogicalType::Decimal(15, 2), true)}), (Ids{0, 1, 3, 2}));
 }
 
 TEST_F(SortTest, LaterKeysBreakTies) {

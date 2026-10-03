@@ -60,6 +60,8 @@ ColumnClass ClassOf(plan::LogicalType type) {
     case plan::LogicalType::kUSmallInt:
     case plan::LogicalType::kHugeInt:
       return ColumnClass::kInteger;
+    case plan::LogicalType::kDecimal:
+      return ColumnClass::kDecimal;
     case plan::LogicalType::kDouble:
       return ColumnClass::kReal;
     case plan::LogicalType::kVarchar:

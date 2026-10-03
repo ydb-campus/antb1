@@ -1,14 +1,18 @@
 #include "antb1/plan/types.h"
 
+#include <cstdint>
+#include <format>
 #include <memory>
 #include <ostream>
-#include <string_view>
+#include <string>
 
 #include <arrow/api.h>
 
+#include "antb1/common/narrow.h"
+
 namespace antb1::plan {
 
-std::string_view ToString(LogicalType type) {
+std::string ToString(LogicalType type) {
   switch (type.id()) {
     case LogicalType::kSmallInt:
       return "SMALLINT";
@@ -20,6 +24,8 @@ std::string_view ToString(LogicalType type) {
       return "USMALLINT";
     case LogicalType::kHugeInt:
       return "HUGEINT";
+    case LogicalType::kDecimal:
+      return std::format("DECIMAL({},{})", type.width(), type.scale());
     case LogicalType::kDouble:
       return "DOUBLE";
     case LogicalType::kVarchar:
@@ -48,6 +54,8 @@ std::shared_ptr<arrow::DataType> ToArrow(LogicalType type) {
       return arrow::uint16();
     case LogicalType::kHugeInt:
       return arrow::decimal128(38, 0);
+    case LogicalType::kDecimal:
+      return arrow::decimal128(type.width(), type.scale());
     case LogicalType::kDouble:
       return arrow::float64();
     case LogicalType::kVarchar:
@@ -82,10 +90,17 @@ arrow::Result<LogicalType> FromArrow(const arrow::DataType& type) {
       return LogicalType::kVarchar;
     case arrow::Type::DATE32:
       return LogicalType::kDate;
-    case arrow::Type::DECIMAL128: {
-      const auto& dec = static_cast<const arrow::Decimal128Type&>(type);
-      if (dec.precision() == 38 && dec.scale() == 0) {
-        return LogicalType::kHugeInt;
+    // Any decimal of at most 38 digits is DECIMAL(p, s), DECIMAL(38, 0) included (ADR 0021 rule
+    // 2); io reads decimal32, decimal64 and decimal256 columns as decimal128.
+    case arrow::Type::DECIMAL32:
+    case arrow::Type::DECIMAL64:
+    case arrow::Type::DECIMAL128:
+    case arrow::Type::DECIMAL256: {
+      const auto& dec = static_cast<const arrow::DecimalType&>(type);
+      if (dec.precision() >= 1 && dec.precision() <= LogicalType::kMaxDecimalWidth &&
+          dec.scale() >= 0 && dec.scale() <= dec.precision()) {
+        return LogicalType::Decimal(Narrow<std::uint8_t>(dec.precision()),
+                                    Narrow<std::uint8_t>(dec.scale()));
       }
       break;
     }

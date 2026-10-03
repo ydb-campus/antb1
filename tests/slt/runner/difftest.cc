@@ -80,8 +80,8 @@ void Report(const GeneratedQuery& q, uint64_t seed, bool supported, const Discre
   }
   out += options.redact ? "  repro (unredacted, prints values; run it locally):\n" : "  repro:\n";
   if (options.pixi_repro) {
-    out += std::format("    ANTB1_DIFF_SEED={} ANTB1_DIFF_ONLY={} pixi run diff-random\n", seed,
-                       q.index);
+    out += std::format("    ANTB1_DIFF_SEED={} ANTB1_DIFF_ONLY={} pixi run diff-random{}\n", seed,
+                       q.index, options.pixi_args);
   }
   if (!options.command.empty()) {
     out += std::format("    {} --only {}\n", options.command, q.index);
@@ -165,8 +165,8 @@ DiffStats RunDiff(const QueryGenerator& generator, Engine& antb1, Engine& oracle
     if (options.pixi_repro) {
       see = std::format(
           "; see one with ANTB1_DIFF_SEED={} ANTB1_DIFF_ONLY=<case> pixi run "
-          "diff-random",
-          generator.seed());
+          "diff-random{}",
+          generator.seed(), options.pixi_args);
     } else if (!options.command.empty()) {
       see = std::format("; see one with {} --only <case>", options.command);
     }

@@ -43,15 +43,17 @@ arrow::Result<std::shared_ptr<arrow::Scalar>> IntegerScalar(Int128 value, Logica
   return std::make_shared<ScalarType>(*narrow);
 }
 
-arrow::Result<std::shared_ptr<arrow::Scalar>> HugeIntScalar(Int128 value) {
-  const IntegerRange range = RangeOf(LogicalType::kHugeInt);
+// A HUGEINT, or a DECIMAL(p, s) from its unscaled value: a decimal128 scalar of the type's own
+// precision and scale.
+arrow::Result<std::shared_ptr<arrow::Scalar>> Decimal128Scalar(Int128 value, LogicalType type) {
+  const IntegerRange range = RangeOf(type);
   if (value < range.min || value > range.max) {
-    return arrow::Status::Invalid("constant ", Int128ToString(value),
-                                  " is outside the range of HUGEINT");
+    return arrow::Status::Invalid("constant ", Int128ToString(value), " is outside the range of ",
+                                  ToString(type));
   }
   const auto bits = static_cast<UInt128>(value);
   const arrow::Decimal128 decimal(static_cast<int64_t>(bits >> 64U), static_cast<uint64_t>(bits));
-  return std::make_shared<arrow::Decimal128Scalar>(decimal, ToArrow(LogicalType::kHugeInt));
+  return std::make_shared<arrow::Decimal128Scalar>(decimal, ToArrow(type));
 }
 
 // One overload per node type: a node type without one fails to compile.
@@ -386,6 +388,9 @@ std::string ToString(const Constant& constant) {
       return micros.has_value() ? "TIMESTAMP '" + FormatTimestamp(*micros) + "'"
                                 : "TIMESTAMP <" + Int128ToString(*v) + " microseconds>";
     }
+    if (constant.type == LogicalType::kDecimal) {
+      return FormatDecimal(*v, constant.type.width(), constant.type.scale());
+    }
     if (constant.type != LogicalType::kDate) {
       return Int128ToString(*v);
     }
@@ -414,7 +419,8 @@ arrow::Result<std::shared_ptr<arrow::Scalar>> ToArrowScalar(const Constant& cons
       case LogicalType::kDate:
         return IntegerScalar<arrow::Date32Scalar, int32_t>(*v, type);
       case LogicalType::kHugeInt:
-        return HugeIntScalar(*v);
+      case LogicalType::kDecimal:
+        return Decimal128Scalar(*v, type);
       case LogicalType::kTimestamp: {
         const auto micros = Int128ToInt64(*v);
         if (!micros.has_value()) {

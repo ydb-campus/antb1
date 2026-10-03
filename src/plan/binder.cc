@@ -1020,6 +1020,12 @@ arrow::Result<LogicalType> AggregateType(const sql::AggregateCall& call, const B
           (arg.type == LogicalType::kDate || arg.type == LogicalType::kTimestamp)) {
         return LogicalType::kTimestamp;
       }
+      if (arg.type == LogicalType::kDecimal) {
+        return UnsupportedError(
+            std::format("{} of a DECIMAL ('{}' is {}) is not supported",
+                        ToString(ToPlan(call.kind)), Clip(arg.name), ToString(arg.type)),
+            call.span);
+      }
       if (!IsNumeric(arg.type)) {
         return BindError(std::format("{} needs a numeric column, but '{}' is {}",
                                      ToString(ToPlan(call.kind)), arg.name, ToString(arg.type)),
@@ -1184,6 +1190,35 @@ arrow::Result<Predicate> BindEquality(const sql::Comparison& cmp, const BoundCol
       p.constant.value = folded.value;
       if (folded.kind == Predicate::Kind::kFalse) {
         p.column.reset();  // no row passes, whatever the column holds
+      }
+      return p;
+    }
+    case LogicalType::kDecimal: {
+      if (!number) {
+        return mismatch("write a number without quotes");
+      }
+      // Not `as_double`: in an IN list each approximate value fails here itself, at its own span.
+      const auto unshifted = ParseExactNumber(lit.text, lit.negative);
+      if (IsApproximateNumber(lit.text) || (unshifted.has_value() && unshifted->huge)) {
+        // DuckDB compares in DOUBLE (an exponent, a decimal of more than 38 digits) or in a capped
+        // DECIMAL (an integer of 39 digits, a HUGEINT) then (ADR 0021 rule 11), not supported yet.
+        return UnsupportedError(std::format("comparing the {} column '{}' with a number with an "
+                                            "exponent or more than 38 digits is not supported",
+                                            ToString(column.type), Clip(column.name)),
+                                lit.span);
+      }
+      // The literal in the column's scale, folded exactly like an integer literal into an integer
+      // column: 1.5 in DECIMAL(15,2) is 150, and x <= 12.345 is x <= 12.34 (ADR 0021 rule 11).
+      const auto exact = ParseExactNumber(lit.text, lit.negative, column.type.scale());
+      if (!exact.has_value()) {
+        return BindError("invalid number " + Clip(lit.text), lit.span);
+      }
+      const FoldedComparison folded = FoldIntegerComparison(p.op, *exact, RangeOf(column.type));
+      p.kind = folded.kind;
+      p.op = folded.op;
+      p.constant.value = folded.value;
+      if (folded.kind == Predicate::Kind::kFalse) {
+        p.column.reset();
       }
       return p;
     }
@@ -1641,9 +1676,14 @@ arrow::Result<LogicalType> ArithType(sql::BinaryOp sql_op, ArithOp op, const Typ
                                      const Typed& r, SourceSpan span) {
   for (const Typed* t : {&l, &r}) {
     if (t->expr->type == LogicalType::kDate || t->expr->type == LogicalType::kTimestamp) {
-      const std::string_view type = ToString(t->expr->type);
+      const std::string type = ToString(t->expr->type);
       return UnsupportedError(std::format("{} arithmetic ('{}' is {}) is not supported", type,
                                           Clip(t->expr->name), type),
+                              span);
+    }
+    if (t->expr->type == LogicalType::kDecimal) {
+      return UnsupportedError(std::format("DECIMAL arithmetic ('{}' is {}) is not supported",
+                                          Clip(t->expr->name), ToString(t->expr->type)),
                               span);
     }
     if (!IsNumeric(t->expr->type)) {
@@ -1727,6 +1767,11 @@ arrow::Result<Typed> Arith(const sql::BinaryExpr& binary, Typed left, Typed righ
 
 arrow::Result<Typed> Negate(const sql::UnaryExpr& unary, Typed operand) {
   const LogicalType type = operand.expr->type;
+  if (type == LogicalType::kDecimal) {
+    return UnsupportedError(
+        std::format("negating a DECIMAL ({}) is not supported", DescribeOperand(operand)),
+        unary.op_span);
+  }
   if (!IsNumeric(type)) {
     return BindError(
         std::format("arithmetic operator '-' needs a number, but {}", DescribeOperand(operand)),
@@ -2723,6 +2768,16 @@ struct Binder::BindConditionOf {
         temporal(right.expr->type)) {
       return UnsupportedError("comparing a DATE with a TIMESTAMP is not supported", binary.op_span);
     }
+    // A DECIMAL compares with a DECIMAL of the same precision and scale only (ADR 0021 rule 11;
+    // the common type of other pairs comes with D4).
+    if ((left.expr->type == LogicalType::kDecimal || right.expr->type == LogicalType::kDecimal) &&
+        left.expr->type != right.expr->type) {
+      return UnsupportedError(
+          std::format("comparing {} with {} is not supported (only DECIMAL values of the same "
+                      "precision and scale compare)",
+                      DescribeOperand(left), DescribeOperand(right)),
+          binary.op_span);
+    }
     if (!Comparable(left.expr->type, right.expr->type)) {
       return BindError(
           std::format("cannot compare {} with {}", DescribeOperand(left), DescribeOperand(right)),
@@ -2929,6 +2984,9 @@ namespace {
 
 // The type DuckDB gives two CASE values (a string literal takes the other's type elsewhere).
 arrow::Result<LogicalType> CaseCommon(LogicalType a, LogicalType b, SourceSpan span) {
+  if (a == LogicalType::kDecimal || b == LogicalType::kDecimal) {
+    return UnsupportedError("DECIMAL CASE values are not supported", span);
+  }
   if (a == b) {
     return a;
   }
@@ -2998,6 +3056,9 @@ arrow::Result<Typed> Binder::BindCase(const sql::CaseExpr& c, const BindFn& bind
             "a FLOAT column as a CASE value is not supported (antb1 reads FLOAT as DOUBLE, "
             "divergence D11)",
             span);
+      }
+      if (v.expr->type == LogicalType::kDecimal) {
+        return UnsupportedError("DECIMAL CASE values are not supported", span);
       }
       if (v.decimal && type != LogicalType::kDouble) {
         // With a DOUBLE value DuckDB's CASE is DOUBLE; else DECIMAL.

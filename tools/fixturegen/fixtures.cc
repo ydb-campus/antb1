@@ -468,8 +468,13 @@ arrow::Result<std::shared_ptr<arrow::Array>> EdgeColumn(const EdgeColumnValues<T
   return builder.Finish();
 }
 
+// DECIMALs of at most 9 digits are stored as INT32 and of at most 18 as INT64, wider ones as
+// FIXED_LEN_BYTE_ARRAY: the decimals fixture covers every storage a reader meets.
 std::shared_ptr<parquet::WriterProperties> WriterProperties() {
-  return parquet::WriterProperties::Builder().compression(parquet::Compression::SNAPPY)->build();
+  return parquet::WriterProperties::Builder()
+      .compression(parquet::Compression::SNAPPY)
+      ->enable_store_decimal_as_integer()
+      ->build();
 }
 
 std::shared_ptr<parquet::ArrowWriterProperties> ArrowWriterProperties() {
@@ -578,6 +583,97 @@ arrow::Result<std::shared_ptr<arrow::Table>> MakeFloatTable() {
   return arrow::Table::Make(std::move(schema), {id_array, f_array});
 }
 
+arrow::Result<std::shared_ptr<arrow::Table>> MakeDecimalTable() {
+  constexpr int kRows = 40;
+  // 10^n - 1, the largest unscaled value of n digits.
+  const auto max_of = [](int digits) { return arrow::Decimal128::GetMaxValue(digits); };
+  struct Column {
+    std::string name;
+    int precision;
+    int scale;
+    int null_every;  // row % null_every == null_at is NULL
+    int null_at;
+    // The unscaled value of row i from a small repeated base value; rows max_row and max_row + 1
+    // hold the precision's extremes.
+    int max_row;
+    arrow::Decimal128 step;
+  };
+  const std::vector<Column> columns = {
+      {.name = "d9_2",
+       .precision = 9,
+       .scale = 2,
+       .null_every = 7,
+       .null_at = 3,
+       .max_row = 1,
+       .step = arrow::Decimal128(125)},
+      {.name = "d18_4",
+       .precision = 18,
+       .scale = 4,
+       .null_every = 7,
+       .null_at = 5,
+       .max_row = 4,
+       .step = arrow::Decimal128(10001)},
+      {.name = "d38_10",
+       .precision = 38,
+       .scale = 10,
+       .null_every = 9,
+       .null_at = 2,
+       .max_row = 6,
+       .step = arrow::Decimal128("10000000001")},
+      {.name = "d38_0",
+       .precision = 38,
+       .scale = 0,
+       .null_every = 6,
+       .null_at = 0,
+       .max_row = 8,
+       .step = arrow::Decimal128("100000000000000000000")},
+      {.name = "p",
+       .precision = 15,
+       .scale = 2,
+       .null_every = 5,
+       .null_at = 4,
+       .max_row = 10,
+       .step = arrow::Decimal128(1999)},
+      {.name = "q",
+       .precision = 15,
+       .scale = 2,
+       .null_every = 8,
+       .null_at = 1,
+       .max_row = 12,
+       .step = arrow::Decimal128(1999)},
+  };
+  arrow::Int32Builder ids;
+  arrow::FieldVector fields = {arrow::field("id", arrow::int32(), /*nullable=*/false)};
+  arrow::ArrayVector arrays;
+  for (int i = 0; i < kRows; ++i) {
+    ARROW_RETURN_NOT_OK(ids.Append(i));
+  }
+  ARROW_ASSIGN_OR_RAISE(auto id_array, ids.Finish());
+  arrays.push_back(id_array);
+  for (std::size_t c = 0; c < columns.size(); ++c) {
+    const Column& col = columns[c];
+    const auto type = arrow::decimal128(col.precision, col.scale);
+    arrow::Decimal128Builder builder(type);
+    for (int i = 0; i < kRows; ++i) {
+      if (i % col.null_every == col.null_at) {
+        ARROW_RETURN_NOT_OK(builder.AppendNull());
+      } else if (i == col.max_row || i == col.max_row + 1) {
+        const arrow::Decimal128 max = max_of(col.precision);
+        const arrow::Decimal128 value = i == col.max_row ? max : arrow::Decimal128(-max);
+        ARROW_RETURN_NOT_OK(builder.Append(value));
+      } else {
+        // Few distinct values (keys repeat), negatives and zero; q differs from p in some rows.
+        const int base = ((i * 37) % 11) - 5 + (c == 5 ? i % 3 : 0);
+        ARROW_RETURN_NOT_OK(builder.Append(arrow::Decimal128(col.step * arrow::Decimal128(base))));
+      }
+    }
+    ARROW_ASSIGN_OR_RAISE(auto array, builder.Finish());
+    fields.push_back(arrow::field(col.name, type));
+    arrays.push_back(array);
+  }
+  return arrow::Table::Make(arrow::schema(fields), arrays);
+}
+
 arrow::Status WriteParquet(const arrow::Table& table, const fs::path& path,
                            int64_t row_group_rows) {
   const fs::path tmp = fs::path(path).concat(".tmp");
@@ -647,6 +743,9 @@ arrow::Result<std::vector<FixtureFile>> WriteAllFixtures(const fs::path& dir) {
 
   ARROW_ASSIGN_OR_RAISE(auto floats, MakeFloatTable());
   ARROW_RETURN_NOT_OK(write(*floats, "floats.parquet", 8));
+
+  ARROW_ASSIGN_OR_RAISE(auto decimals, MakeDecimalTable());
+  ARROW_RETURN_NOT_OK(write(*decimals, "decimals.parquet", 8));
 
   ARROW_ASSIGN_OR_RAISE(auto empty, MakeHitsTable(HitsVariant::kPartitioned, Nulls::kNone, 0, 0));
   ARROW_RETURN_NOT_OK(write(*empty, "empty.parquet", kGroup));

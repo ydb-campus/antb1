@@ -14,6 +14,7 @@
 #include <arrow/api.h>
 #include <arrow/util/decimal.h>
 
+#include "antb1/common/int128.h"
 #include "antb1/common/utf8.h"
 #include "antb1/plan/literal.h"
 
@@ -37,6 +38,7 @@ auto Value(const arrow::Array& column, int64_t row) {
   return static_cast<const ArrayType&>(column).Value(row);
 }
 
+// HUGEINT and DECIMAL are strings, to keep them exact (DECIMAL is no IsNumeric type).
 bool IsJsonNumber(plan::LogicalType type) {
   return plan::IsNumeric(type) && type != plan::LogicalType::kHugeInt;
 }
@@ -115,6 +117,11 @@ std::string FormatValue(const arrow::Array& column, int64_t row, plan::LogicalTy
       return std::to_string(Value<arrow::UInt16Array>(column, row));
     case arrow::Type::DECIMAL128: {
       const arrow::Decimal128 v(static_cast<const arrow::Decimal128Array&>(column).GetValue(row));
+      if (type == plan::LogicalType::kDecimal) {  // DuckDB's form: 17.00, .500 (ADR 0021 rule 15)
+        const auto unscaled = static_cast<Int128>(
+            (static_cast<UInt128>(static_cast<uint64_t>(v.high_bits())) << 64U) | v.low_bits());
+        return plan::FormatDecimal(unscaled, type.width(), type.scale());
+      }
       return v.ToIntegerString();
     }
     case arrow::Type::FLOAT:

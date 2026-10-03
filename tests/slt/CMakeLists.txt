@@ -182,15 +182,43 @@ antb1_add_expect_test(
 )
 
 # Random differential test (label diff): antb1 vs DuckDB on generated queries (runner/difftest.h),
-# with a fixed seed. `pixi run diff-random` runs more (ANTB1_DIFF_SEED, ANTB1_DIFF_COUNT).
+# with a fixed seed. `pixi run diff-random` runs more (ANTB1_DIFF_SEED, ANTB1_DIFF_COUNT) over every table.
+# diff.random names its tables (a table added to tables.txt would change every query of the seed);
+# diff.decimal covers the DECIMAL columns of decimals.parquet with its own seed.
+set(
+  _diff_tables
+  --table
+  hits_like
+  --table
+  hits_like_nulls
+  --table
+  hits_like_split
+  --table
+  hits_like_required
+  --table
+  edge
+  --table
+  floats
+  --table
+  empty
+)
 if(ANTB1_HAVE_DUCKDB)
   antb1_slt_args(_args diff.random)
   add_test(
     NAME diff.random
-    COMMAND antb1-slt diff ${_args} --seed 20260925 --count 300
+    COMMAND antb1-slt diff ${_args} ${_diff_tables} --seed 20260925 --count 300
   )
   set_tests_properties(
     diff.random
+    PROPERTIES LABELS diff FIXTURES_REQUIRED antb1_fixtures TIMEOUT 300
+  )
+  antb1_slt_args(_args diff.decimal)
+  add_test(
+    NAME diff.decimal
+    COMMAND antb1-slt diff ${_args} --table decimals --seed 20261003 --count 300
+  )
+  set_tests_properties(
+    diff.decimal
     PROPERTIES LABELS diff FIXTURES_REQUIRED antb1_fixtures TIMEOUT 300
   )
   # The same queries (seed) on 4 threads with 700-row batches: DuckDB's answers, and the 1-thread results byte for
@@ -207,7 +235,7 @@ if(ANTB1_HAVE_DUCKDB)
   )
   add_test(
     NAME parallel.diff.random
-    COMMAND antb1-slt diff ${_args} --seed 20260925 --count 300
+    COMMAND antb1-slt diff ${_args} ${_diff_tables} --seed 20260925 --count 300
   )
   set_tests_properties(
     parallel.diff.random

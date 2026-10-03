@@ -43,7 +43,7 @@ table must match it (`pixi run lint` compares them).
 | `integration` | in use | cross-module gtest suites in `tests/integration/` (`integration.*`), including invalid Parquet inputs |
 | `slt` | in use | sqllogictest files run against antb1 (`slt.<area>.<file>`) |
 | `oracle` | in use | the same `.slt` files checked against DuckDB (`oracle.<area>.<file>`) |
-| `diff` | in use | `diff.random` and `diff.tpch`: seeded random differential queries against DuckDB (fixed seeds, 300 queries each; the second over the data derived from TPC-H) |
+| `diff` | in use | `diff.random`, `diff.decimal` and `diff.tpch`: seeded random differential queries against DuckDB (fixed seeds, 300 queries each; `diff.random` over the tables it names, so a new table does not change its queries, `diff.decimal` over `decimals`, `diff.tpch` over the data derived from TPC-H) |
 | `parallel` | in use | parallel execution on 4 engine threads ([ADR 0013](adr/0013-parallel-execution.md)): every `.slt` case file (`parallel.<area>.<file>`) and 300 random differential queries (`parallel.diff.random`, `parallel.diff.tpch`), in 1000- and 700-row batches; every result must also equal the 1-thread result byte for byte (`antb1-slt --same-as-threads 1`) |
 | `metamorphic` | in use | metamorphic relations on the generated fixtures (`metamorphic.*`) |
 | `cli` | in use | golden tests of the `antb1` command line (`cli.<case>`): output formats, errors, exit codes, EXPLAIN |
@@ -106,8 +106,10 @@ needs a comment that justifies it and a maintainer's agreement.
 values: `hits_like.parquet` (10,000 rows in 4 row groups), `hits_like_nulls.parquet` (the same rows with NULLs),
 `hits_like_split/part-0.parquet` to `part-3.parquet` (the same rows in 4 files), `hits_like_required.parquet` (REQUIRED
 columns and UTF8 strings), `edge.parquet` (type extremes, escapes, empty strings, NULLs), `floats.parquet` (bit-exact
-FLOAT values: 0.1F and its lower neighbour, 2^24 and 2^100 with their next FLOATs, the FLOAT maximum, +-inf, +-0, NULL)
-and `empty.parquet` (0 rows). The ctest `fixtures.generate` (label `setup`) writes them to `build/<preset>/fixtures`.
+FLOAT values: 0.1F and its lower neighbour, 2^24 and 2^100 with their next FLOATs, the FLOAT maximum, +-inf, +-0, NULL),
+`decimals.parquet` (DECIMAL(9,2) stored as INT32, (18,4) and (15,2) as INT64, (38,10) and (38,0) as
+FIXED_LEN_BYTE_ARRAY: negatives, NULLs and each precision's extremes, 40 rows in 5 row groups) and `empty.parquet`
+(0 rows). The ctest `fixtures.generate` (label `setup`) writes them to `build/<preset>/fixtures`.
 Values come from splitmix64 with integer-only arithmetic (no `<random>` distributions, no libm, no NaN), so every
 platform generates the same data.
 
@@ -159,7 +161,8 @@ The generator orders by columns, aliases and aggregates with integer or text val
 can differ in its last bits between the engines and so order near-ties differently). Query `i` of seed `s` depends
 only on `s`, `i`, the tables and the supported features, so a single case reproduces on its own.
 
-- ctest `diff.random` (label `diff`) runs 300 queries with a fixed seed on every leg.
+- ctest `diff.random` (label `diff`) runs 300 queries with a fixed seed on every leg, over the tables it names in
+  `tests/slt/CMakeLists.txt`; `diff.decimal` runs 300 more over `decimals`.
 - `pixi run diff-random` runs 2000 queries with a random seed, printed first. `ANTB1_DIFF_SEED` and
   `ANTB1_DIFF_COUNT` set the seed and the count. Extra arguments go to `antb1-slt diff`: `--list` prints the queries
   without running them, `--table NAME` restricts the tables, `--target-percent P` sets the share of queries that

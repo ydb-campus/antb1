@@ -266,6 +266,7 @@ error that points at the literal:
 | Column type | Literals | Compared as |
 | --- | --- | --- |
 | SMALLINT, INTEGER, BIGINT, USMALLINT, HUGEINT | integer, decimal | exactly, after folding (below) |
+| DECIMAL(p,s) | integer, decimal | exactly, after folding into the column's scale (below); a number DuckDB types as DOUBLE is unsupported (exit code 4) |
 | DOUBLE | integer, decimal | the nearest double, as in DuckDB for a DOUBLE column; beyond the double range `inf` or `-inf`, below the smallest subnormal `0`. A column stored as FLOAT is compared as DuckDB compares it: an integer or DECIMAL literal becomes the FLOAT that DuckDB casts it to, with DuckDB's rounding (`0.1` is `0.1F`; `16777217.5` and some long spellings of `0.1`, such as 16 or 24 decimals, are not the nearest FLOAT, and HUGEINT literals are rounded through a double), beyond the FLOAT range `inf` or `-inf`; a number DuckDB types as DOUBLE compares with the nearest double |
 | VARCHAR | string | bytes; `LIKE` and `NOT LIKE` take a string pattern (only a VARCHAR column: LIKE on another type is a bind error, as in DuckDB) |
 | DATE | string, `DATE` string, date cast | a date written exactly `YYYY-MM-DD` (years 0000 to 9999) that exists in the calendar |
@@ -284,6 +285,12 @@ A comparison of an integer column with a number is folded exactly at bind time, 
   for none, depending on the operator: `smallint_col < 40000` is always true, `usmallint_col = -1` never.
 - A comparison that is true for every value still rejects NULL: EXPLAIN shows it as `c IS NOT NULL`. One that is
   never true shows as `FALSE` and reads no column.
+- A DECIMAL(p,s) column folds the same way in units of its scale: the number is multiplied by 10^s exactly, a
+  remainder moves it to the side the comparison keeps, and the range is -(10^p - 1) to 10^p - 1 units. On
+  DECIMAL(15,2), `c <= 12.345` becomes `c <= 12.34`, `c >= 12.345` becomes `c >= 12.35`, `c = 12.345` is never true,
+  and `c < 10000000000000` is true for every value. DuckDB compares in a DECIMAL capped at 38 digits instead
+  (divergence D13). A number DuckDB types as DOUBLE (an exponent, or more than 38 digits) is unsupported for a
+  DECIMAL column (exit code 4), as is a comparison with an expression of another type.
 
 ## Logical plans and EXPLAIN
 
@@ -316,7 +323,8 @@ implements its kind. A rule optimizer then rewrites the plan, through both input
 
 `antb1 explain` prints the optimized plan: an `Output:` line with the result names and types, then one line per
 node from the root down, each input indented by two more spaces. Names that are not plain identifiers are
-double-quoted, and bytes outside printable ASCII are written as `\xHH`:
+double-quoted, and bytes outside printable ASCII are written as `\xHH`. A folded constant prints in its operand's
+type: against a DECIMAL column with the column's scale (`p <= 12.34`, `d IN (1.25, 5.00)`):
 
 ```text
 Output: count_star():BIGINT width:HUGEINT
@@ -397,7 +405,9 @@ Project RegionID, c  [rows=3 batches=1 time=38.946ms self=0.007ms]
 | DOUBLE | double | DOUBLE | |
 | BYTE_ARRAY, unannotated | binary | VARCHAR | compared byte-wise |
 | BYTE_ARRAY annotated STRING (UTF8) | utf8 | VARCHAR | same engine representation as unannotated |
-| DECIMAL(38, 0) | decimal128(38, 0) | HUGEINT | also the result type of integer SUM |
+| DECIMAL(p, s), p ≤ 38 (stored as INT32, INT64, FIXED_LEN_BYTE_ARRAY or BYTE_ARRAY) | decimal128(p, s); decimal32, decimal64 and decimal256 (an ARROW:schema may give them) are widened exactly on read | DECIMAL(p,s) | the exact unscaled value with scale s (Semantics); a DECIMAL(38, 0) column is DECIMAL(38,0), no longer HUGEINT ([ADR 0021](adr/0021-decimal-semantics.md) rule 2) |
+| DECIMAL(p, s), p > 38 | – | unsupported | |
+| – | decimal128(38, 0) | HUGEINT | only computed: the result type of integer SUM, and of integer literals beyond BIGINT |
 | – | timestamp[us] | TIMESTAMP | only computed (`toDateTime`, `date_trunc`) or a literal; a Parquet timestamp column is unsupported |
 | anything else | – | unsupported | `antb1 schema` shows `unsupported(<type>)`; a query that uses the column is rejected |
 
@@ -446,10 +456,11 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   values, with DOUBLE `-0.0` equal to `0.0` and every NaN one value (as DuckDB groups them) and VARCHAR by bytes. All
   return BIGINT, 0 over no values.
 - SUM: over integer columns it accumulates in 128 bits and returns HUGEINT (decimal128(38, 0)), exactly like
-  DuckDB, so it never overflows or wraps; Arrow's 64-bit `sum` kernel is never used. A sum outside HUGEINT's range
-  (only possible over a HUGEINT column) is an execution error (divergence D9). Over DOUBLE it returns DOUBLE: it adds each
-  row group's values (of each group), then the row group sums in order (the same for any number of threads; see
-  Execution below). DOUBLE `AVG` sums the same way.
+  DuckDB, so it never overflows or wraps; Arrow's 64-bit `sum` kernel is never used. A result outside HUGEINT's
+  range is an execution error (divergence D9); no column is HUGEINT, so only a `SUM` of a HUGEINT expression (one
+  with an integer literal beyond BIGINT) or arithmetic on a `SUM` can reach it.
+  Over DOUBLE it returns DOUBLE: it adds each row group's values (of each group), then the row group sums in order
+  (the same for any number of threads; see Execution below). DOUBLE `AVG` sums the same way.
 - AVG: over integer columns the sum accumulates exactly in 128 bits and is divided by the count once at the end, so
   the DOUBLE result is accurate to about one ulp (the oracle tests use a tight relative tolerance). Over DOUBLE it
   returns DOUBLE. Over DATE and TIMESTAMP it averages the microseconds (a DATE's midnight; its infinities as the
@@ -515,6 +526,15 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   `LIMIT` or `OFFSET`, any rows of the full answer are right).
 - VARCHAR: values are raw bytes. Unannotated BYTE_ARRAY columns (as in ClickBench) are VARCHAR and are never
   validated as UTF-8.
+- DECIMAL: a DECIMAL(p,s) value is an exact integer of at most p digits, the unscaled value, times 10^-s
+  ([ADR 0021](adr/0021-decimal-semantics.md)). Comparisons with numbers (`=`, `<>`, `<`, `IN`, `BETWEEN`), `ORDER BY`,
+  `GROUP BY`, `COUNT(DISTINCT)`, `MIN` and `MAX` use the unscaled value; `MIN` and `MAX` keep DECIMAL(p,s), `COUNT`
+  is BIGINT. Two DECIMAL columns compare only when both are the same DECIMAL(p,s). Not supported yet (exit code 4):
+  `SUM`, `AVG`, arithmetic and unary `-` on a DECIMAL, a DECIMAL as a `CASE` value, and comparing a DECIMAL with
+  another type (an integer or DOUBLE expression, a DECIMAL of another precision or scale, a number DuckDB types as
+  DOUBLE). A scan that reads a DECIMAL column applies no predicate itself, so every `WHERE` condition of that scan
+  is evaluated by the `Filter` (`explain --analyze` shows no pushed predicate), and a condition on a DECIMAL column
+  skips no row group ([ADR 0021](adr/0021-decimal-semantics.md)).
 - Execution: the row groups of a query run on `--threads` threads (default: the hardware threads), 64Ki-row
   batches; their results are combined in file and row group order, so a result is the same for any number of
   threads, and deterministic. A DOUBLE `SUM` or `AVG` adds up every row group (per group with `GROUP BY`),
@@ -530,12 +550,14 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
 `antb1 query --format table|csv|json` (default `table`). Every format renders values with the same canonical
 formatter:
 
-- integers (HUGEINT included) exactly; DOUBLE as the shortest round-trip form (`nan`, `inf`, `-inf` for non-finite
-  values); DATE as `YYYY-MM-DD`, and like DuckDB outside years 1 to 9999: `YYYY-MM-DD (BC)` before year 1, more year
-  digits after 9999, `infinity` and `-infinity` for DuckDB's sentinel day numbers; VARCHAR as its raw bytes;
+- integers (HUGEINT included) exactly; DECIMAL(p,s) as DuckDB prints it, with exactly s digits after the point and a
+  leading `0` only when p > s (`17.00`, `-0.25`; DECIMAL(3,3) `.500`); DOUBLE as the shortest round-trip form
+  (`nan`, `inf`, `-inf` for non-finite values); DATE as `YYYY-MM-DD`, and like DuckDB outside years 1 to 9999:
+  `YYYY-MM-DD (BC)` before year 1, more year digits after 9999, `infinity` and `-infinity` for DuckDB's sentinel
+  day numbers; VARCHAR as its raw bytes;
 - NULL as `NULL` in `table`, an empty field in `csv` and `null` in `json`;
 - `csv` has a header row and RFC 4180 quoting, with LF line endings; `json` is an array of objects, where numbers are
-  JSON numbers except HUGEINT and non-finite doubles, which are strings (exactness), and every byte of ill-formed
+  JSON numbers except HUGEINT, DECIMAL and non-finite doubles, which are strings (exactness), and every byte of ill-formed
   UTF-8 in strings (RFC 3629, so also overlong forms, surrogates and code points above U+10FFFF) is written as the
   text `\xHH` with lowercase hex digits, so the output is always valid UTF-8; `table` and `csv` write the raw bytes.
 
@@ -546,10 +568,10 @@ formatter:
 | Code | Meaning | Examples |
 | --- | --- | --- |
 | 0 | success | |
-| 1 | query error: syntax, bind, execution or memory error | `SELECT COUNT(*) FORM t`; an unknown table or column; `SUM` of a VARCHAR column; a `SUM` outside HUGEINT's range; an invalid `regexp_replace` pattern; a query that needs more memory than `--memory-limit` |
+| 1 | query error: syntax, bind, execution or memory error | `SELECT COUNT(*) FORM t`; an unknown table or column; `SUM` of a VARCHAR column; a `SUM`, or arithmetic on a `SUM`, outside HUGEINT's range; an invalid `regexp_replace` pattern; a query that needs more memory than `--memory-limit` |
 | 2 | usage error | unknown option; neither or both of `-c` and `-f`; a malformed `--table`, `--column-type` or `--memory-limit`; a column that `--column-type` cannot read as DATE; a table name registered twice |
 | 3 | I/O error | a missing or unreadable file; not a Parquet file; schemas that differ; a glob that matches nothing |
-| 4 | unsupported: valid-looking SQL outside the supported subset | `row_number() OVER ()`; `IS NULL`; an unknown function; `SELECT 2.5`; `SUM(DISTINCT ...)`; `CAST(a AS BIGINT)`; a column of an unsupported type |
+| 4 | unsupported: valid-looking SQL outside the supported subset | `row_number() OVER ()`; `IS NULL`; an unknown function; `SELECT 2.5`; `SUM(DISTINCT ...)`; `CAST(a AS BIGINT)`; `SUM` of a DECIMAL column; a column of an unsupported type |
 | 70 | internal error: anything else, which is a bug | an uncaught exception; an Arrow `NotImplemented` or type error without SQL context |
 
 Exit code 4 is used only for errors that the parser, the binder or the physical planner marks as unsupported
@@ -577,16 +599,16 @@ compare against DuckDB, so an unregistered difference is a bug.
 | --- | --- | --- | --- | --- |
 | D1 | Files with different schemas | a table (or a `FROM '<glob>'`) whose files have different Parquet schemas is an I/O error, exit code 3: `schema of '<file>' differs from '<first file>'` | `read_parquet` over the same files reads them and answers | an `onlyif antb1` record in `tests/slt/cases/basic/errors.slt`; `integration.ParquetErrors.*` (mismatched and mixed schemas); the CLI golden `io_schema_mismatch`; every table in `tests/slt/tables.txt` has a single schema |
 | D2 | Column-type overrides | `--clickbench` and `--column-type COL=DATE` apply to every table with that column, including tables opened with `FROM '<path>'` | the oracle applies `make_date(EventDate)` only to the named tables with the `clickbench` option in `tests/slt/tables.txt`; `FROM '<path>'` reads the raw integers | the runner rejects a table list where some tables with an `EventDate` column have the option and others do not; the random generator never reads an overridden column through `FROM '<path>'`; `.slt` records read `EventDate` only through table names |
-| D3 | Literal types | a string literal compared with a numeric column is a bind error | casts the string to the column's type | `onlyif antb1` records in `tests/slt/cases/basic/bind_errors.slt`; the query generator writes numbers for numeric columns |
+| D3 | Literal types | a string literal compared with a numeric or DECIMAL column is a bind error | casts the string to the column's type | `onlyif antb1` records in `tests/slt/cases/basic/bind_errors.slt`; the query generator writes numbers for numeric and DECIMAL columns |
 | D4 | Literal types | a number or a `DATE` literal (also written as a cast) compared with a VARCHAR column is a bind error | casts the column's values at run time (a conversion error unless every value converts) | as D3, and in `tests/slt/cases/where/cast_date.slt`; the generator writes strings for VARCHAR columns |
 | D5 | Date and timestamp literals | a date must be written exactly `YYYY-MM-DD` (also in a cast to DATE), a timestamp exactly as in the literal table (two-digit fields, one space or `T`, hours 00 to 23) | also accepts `2013-7-1`, surrounding spaces and a time of day for a DATE, and single-digit fields, spaces and `24:00:00` for a TIMESTAMP | as D4; the generator writes `YYYY-MM-DD` and `YYYY-MM-DD HH:MM:SS` |
 | D7 | DOUBLE literals and BIGINT | a number that DuckDB types as DOUBLE (an exponent, or more than 38 digits) is rounded to the nearest double like in DuckDB, then compared exactly with the integer column; in an `IN` list with such a number every value is rounded so | converts BIGINT (and HUGEINT) values to DOUBLE for the comparison, so values beyond 2^53 compare rounded: `i64 >= 9223372036854775808e0` holds for `9223372036854775807` | the `.slt` records with such literals avoid BIGINT values beyond 2^53 (`tests/slt/cases/where/folding.slt`); `plan.ApproximateNumbers/FoldThroughBinderTest.*` pins antb1's folding; the generator writes no exponents |
 | D8 | Result names | an aggregate's argument is quoted when it is not a plain identifier or is a reserved word | also quotes non-reserved keywords (`sum("year")`) | the tests compare values and types, not names |
-| D9 | HUGEINT range | HUGEINT is decimal128(38, 0): a `SUM`, or arithmetic on a `SUM`, outside -(10^38 - 1) to 10^38 - 1 is an execution error (exit code 1). An integer SUM over BIGINT or smaller types cannot reach it | HUGEINT holds -(2^127 - 1) to 2^127 - 1 | no fixture has a HUGEINT column; `exec.AggregateStateTest.HugeIntSumIsCheckedAgainstTheRange` checks the error |
+| D9 | HUGEINT range | HUGEINT is decimal128(38, 0): a `SUM`, or arithmetic on a `SUM`, outside -(10^38 - 1) to 10^38 - 1 is an execution error (exit code 1). An integer SUM over BIGINT or smaller types cannot reach it | HUGEINT holds -(2^127 - 1) to 2^127 - 1 | no column is HUGEINT (a DECIMAL(38, 0) column is DECIMAL); `exec.AggregateStateTest.HugeIntSumIsCheckedAgainstTheRange` checks the error |
 | D10 | NaN | MIN and MAX ignore NaN like Arrow's `min_max`, whatever the batch and file boundaries: they return NaN only when every selected non-NULL value is NaN (so only MAX over NaN and other values differs from DuckDB). Arrow's comparison kernels follow IEEE 754: NaN compares unequal to everything, so `d > 1` and `d >= 1` are false for NaN, and `d IN (...)` never matches it | orders NaN above every other value and equal to itself: MIN and MAX return NaN when it is the extreme, `d > 1` is true for NaN | the fixtures contain no NaN (fixturegen builds doubles from integer ratios); `exec.AggregateStateTest.MinMaxOfDoublesIgnoreNaNInEveryBatchSplit` and `engine.SessionTest.MinMaxIgnoreNaNAcrossBatchesAndFiles` pin antb1's MIN and MAX |
 | D11 | FLOAT columns | read as DOUBLE (widened exactly): results of FLOAT columns are DOUBLE and print with double precision; `WHERE` compares like DuckDB (see Binding); arithmetic on them, and comparing them with other expressions, is unsupported (exit code 4) | keeps FLOAT (`MIN`, `MAX` and projections return FLOAT) | the random generator never references a FLOAT column (`ColumnOf` in `tests/slt/runner/query_gen.cc`, `harness.LoadGenTables.SkipsFloatColumns`); `tests/slt/cases/where/float.slt` selects only other columns, and `engine.SessionTest.FloatColumnsCompareLikeDuckDb` pins that results stay DOUBLE |
 | D12 | Long numbers against DOUBLE | a number compared with a DOUBLE column is the correctly rounded nearest double | converts a DECIMAL literal (at most 38 digits) or a HUGEINT literal to DOUBLE in two steps when its digits exceed 2^53, which can be one ulp off (`9007199254740993.5`) | the generator only writes decimals of at most 2^53 in their digits with at most 22 decimals, where both round the same (`ExactDecimalDouble` in `tests/slt/runner/query_gen.cc`) |
-| D13 | Decimals with many digits against integer columns | compared exactly | compares in a DECIMAL whose width is capped at 38 digits: when the column type's digits plus the literal's decimals exceed 38, a column value with too many integer digits fails the query with a conversion error (`i16 = 1.0000000000000000000000000000000000001` over the value -32768); likewise an integer `SUM` (HUGEINT, 38 digits) in `HAVING` against any decimal fails once the sum has more digits than 38 minus the literal's decimals | the `.slt` records and the generator keep literals short enough; `plan.Binder/FoldThroughBinderTest.*` covers the exact folding |
+| D13 | Decimals with many digits against integer and DECIMAL columns | compared exactly | compares in a DECIMAL whose width is capped at 38 digits: when the column type's digits plus the literal's decimals exceed 38, a column value with too many integer digits fails the query with a conversion error (`i16 = 1.0000000000000000000000000000000000001` over the value -32768); likewise an integer `SUM` (HUGEINT, 38 digits) in `HAVING` against any decimal fails once the sum has more digits than 38 minus the literal's decimals, and a DECIMAL(p,s) column against a literal with more than s decimals or more than p - s integer digits once their total exceeds 38 (`d38_10 > 0.00000000001` over a value of 28 integer digits) | the `.slt` records and the generator keep literals short enough (`DecimalText` in `tests/slt/runner/query_gen.cc`), and `tests/slt/cases/types/decimal.slt` pins both answers; `plan.Binder/FoldThroughBinderTest.*` and `plan.Binder/FoldDecimalTest.*` cover the exact folding |
 | D14 | Overflows DuckDB's optimizer does not avoid | a comparison that folds to always-true or never-true at bind time (a literal outside the operand's type, as in `smallint_col + 1 > 40000`) computes nothing, so it cannot overflow | computes the operand and fails on an overflow ("Overflow in addition of INT16") | the random generator never writes arithmetic that can overflow; `plan.BinderTest.WhereMovesConstantsLikeDuckDb` pins which comparisons move their constants |
 | D15 | VARCHAR bytes that are not UTF-8 | answers: `strlen` counts every byte, and `regexp_replace` runs RE2 over the bytes as UTF-8, where an invalid byte never matches (not even `.` or `[^a]`) and stays in the result | cannot read such a value as VARCHAR: reading an unannotated BYTE_ARRAY column (`binary_as_string`) with it fails the query ("Invalid string encoding") | every fixture string is valid UTF-8, so the oracle tests never meet it; `exec.ComputeTest.StringFunctions` pins antb1's behavior |
 | D16 | Evaluation order in conditions | computes the arguments of `AND` and `OR` in the order written, each only for the rows still undecided, and a WHERE conjunct's operands for every row; so an overflow inside a condition fails exactly when a row reaches it in that order | may reorder conjunctions by its cost model, and computes the argument of a `NOT` for every row, so an overflow can fail in one engine and not the other (`NOT (x < 100 AND x * x > 0)` fails in DuckDB) | the random generator never writes arithmetic that can overflow; `exec.ComputeTest.ConditionsAreThreeValued` pins antb1's order |

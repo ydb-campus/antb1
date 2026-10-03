@@ -62,6 +62,13 @@ arrow::Result<std::shared_ptr<arrow::Table>> MakeEdgeTable();
 // next FLOAT, the FLOAT maximum, +-inf, +-0 and NULL. Columns: id (INTEGER) f (FLOAT).
 arrow::Result<std::shared_ptr<arrow::Table>> MakeFloatTable();
 
+// DECIMAL columns of every Parquet storage (fixtures.cc writes them as integers where they fit):
+// d9_2 DECIMAL(9,2) (INT32), d18_4 DECIMAL(18,4) (INT64), d38_10 DECIMAL(38,10) and d38_0
+// DECIMAL(38,0) (FIXED_LEN_BYTE_ARRAY), p and q DECIMAL(15,2) (INT64, for comparisons between
+// columns), with NULLs, negatives, zero, the precision's extremes and repeated values for keys.
+// 40 rows; id (INTEGER) numbers them.
+arrow::Result<std::shared_ptr<arrow::Table>> MakeDecimalTable();
+
 // Writes table as Parquet: SNAPPY, row groups of at most row_group_rows rows, no stored
 // ARROW:schema. Writes to a temporary file first, then renames it (readers never see partial
 // files).
@@ -81,6 +88,7 @@ struct FixtureFile {
 //   hits_like_required.parquet   the same rows, REQUIRED columns and UTF8 strings (single-file
 //   layout) edge.parquet                 MakeEdgeTable() empty.parquet                the
 //   partitioned hits schema, 0 rows floats.parquet               MakeFloatTable()
+//   decimals.parquet             MakeDecimalTable(), 5 row groups
 arrow::Result<std::vector<FixtureFile>> WriteAllFixtures(const std::filesystem::path& dir);
 
 // Compares the Parquet schema (column path, physical type, logical type, converted type,

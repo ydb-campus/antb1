@@ -52,7 +52,7 @@ Int128 DigitsValue(std::string_view digits) {
 
 }  // namespace
 
-std::optional<ExactNumber> ParseExactNumber(std::string_view text, bool negative) {
+std::optional<ExactNumber> ParseExactNumber(std::string_view text, bool negative, int64_t shift) {
   std::size_t pos = 0;
   const auto digits = [&text, &pos] {
     const std::size_t begin = pos;
@@ -99,7 +99,7 @@ std::optional<ExactNumber> ParseExactNumber(std::string_view text, bool negative
   }
   number.negative = negative;
   const std::string_view sig = std::string_view(significand).substr(first);
-  const int64_t scale = exponent - Narrow<int64_t>(fraction_part.size());
+  const int64_t scale = exponent + shift - Narrow<int64_t>(fraction_part.size());
   const int64_t integer_digits = Narrow<int64_t>(sig.size()) + scale;
   if (integer_digits > kMaxIntegerDigits) {
     number.huge = true;
@@ -453,6 +453,10 @@ IntegerRange RangeOf(LogicalType integer_type) {
       return {.min = 0, .max = std::numeric_limits<uint16_t>::max()};
     case LogicalType::kHugeInt:
       return {.min = -kHugeIntMax, .max = kHugeIntMax};
+    case LogicalType::kDecimal: {
+      const Int128 max = Pow10(integer_type.width()) - 1;
+      return {.min = -max, .max = max};
+    }
     case LogicalType::kDouble:
     case LogicalType::kVarchar:
     case LogicalType::kDate:
@@ -460,7 +464,7 @@ IntegerRange RangeOf(LogicalType integer_type) {
     case LogicalType::kBoolean:
       break;
   }
-  ANTB1_CHECK(IsInteger(integer_type));
+  ANTB1_CHECK(IsInteger(integer_type) || integer_type == LogicalType::kDecimal);
   return {};
 }
 

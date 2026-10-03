@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <regex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -27,8 +29,9 @@ std::string Lower(std::string s) {
   return s;
 }
 
-// A small table (path form allowed) and a large one, with one column of every kind; EventDate is
-// DATE only through the clickbench option.
+// A small table (path form allowed) and a large one, with one column of every kind (two DECIMALs:
+// one with spare digits, one at the 38-digit cap); EventDate is DATE only through the clickbench
+// option.
 std::vector<GenTable> Tables() {
   GenTable small{.name = "small", .path = "/data/small.parquet", .rows = 12, .columns = {}};
   small.columns = {
@@ -45,6 +48,16 @@ std::vector<GenTable> Tables() {
        .kind = ValueKind::kDate,
        .via_override = true,
        .samples = {"2013-07-02"}},
+      {.name = "m",
+       .kind = ValueKind::kDecimal,
+       .samples = {"17.00", "-0.25", "0.05"},
+       .precision = 15,
+       .scale = 2},
+      {.name = "w",
+       .kind = ValueKind::kDecimal,
+       .samples = {"-5.0000000005", "0.0000000000"},
+       .precision = 38,
+       .scale = 10},
   };
   GenTable big = small;
   big.name = "big";
@@ -142,10 +155,51 @@ TEST(QueryGenerator, QueriesRespectTheSemanticsBothEnginesShare) {
     if (q.features.Has(Feature::kStar) && q.table == "big") {
       EXPECT_TRUE(q.features.Has(Feature::kLimit)) << q.sql;
     }
+    // DECIMAL columns: no SUM, AVG, arithmetic or CASE values yet (exit 4 on antb1), and no literal
+    // with more than 10 fraction digits (w's scale; m has spare digits), which DuckDB would compare
+    // in a DECIMAL capped at 38 digits (divergence D13). Layout comments could hide a match.
+    if (!q.features.Has(Feature::kLayout)) {
+      static const std::regex decimal_misuse(
+          R"re((sum|avg)\( ?"?[mw]"?\)|"?\b[mw]\b"? ?(\+|-|\*|/|%)|then "?[mw]\b|else "?[mw]\b|- "?[mw]\b)re");
+      EXPECT_FALSE(std::regex_search(sql, decimal_misuse)) << q.sql;
+    }
+    static const std::regex long_fraction(R"re(\.[0-9]{11})re");
+    EXPECT_FALSE(std::regex_search(sql, long_fraction)) << q.sql;
     // Doubles only get literals that both engines convert to the same value.
     EXPECT_FALSE(q.sql.contains("0.1000000000000000055511151231257827")) << q.sql;
     EXPECT_FALSE(q.sql.contains("it's")) << "quotes in string literals are doubled: " << q.sql;
   }
+}
+
+// A DECIMAL of 38 digits with few integer digits: no literal (a BETWEEN bound included) has more
+// integer digits than p - s, which would leave DuckDB's 38-digit common type (divergence D13).
+TEST(QueryGenerator, DecimalLiteralsStayWithinTheColumnsDigits) {
+  GenTable t{.name = "t", .path = {}, .rows = 10, .columns = {}};
+  t.columns = {{.name = "n",
+                .kind = ValueKind::kDecimal,
+                .samples = {"99999999." + std::string(30, '0'), "-1.5" + std::string(29, '0')},
+                .precision = 38,
+                .scale = 30}};
+  auto gen = QueryGenerator::Make({t}, 5, {.supported = kSupportedFeatures, .target_percent = 0});
+  ASSERT_TRUE(gen.has_value()) << gen.error();
+  static const std::regex number_pattern(R"re([0-9]+(\.[0-9]+)?)re");
+  int betweens = 0;
+  for (uint64_t i = 0; i < 3000; ++i) {
+    const std::string sql = Lower(gen->Generate(i).sql);
+    betweens += sql.contains("between") ? 1 : 0;
+    // Layout comments hold no digits; the table and column names none either.
+    for (auto it = std::sregex_iterator(sql.begin(), sql.end(), number_pattern);
+         it != std::sregex_iterator(); ++it) {
+      const std::string number = it->str();
+      const std::size_t integer_digits = number.contains('.') ? number.find('.') : number.size();
+      // LIMIT and OFFSET counts and select positions are small, the select constant 3000000000 is
+      // no literal of n; every literal of n has at most 8 integer digits.
+      if (number != "3000000000") {
+        EXPECT_LE(integer_digits, 8U) << sql;
+      }
+    }
+  }
+  EXPECT_GT(betweens, 10);
 }
 
 TEST(QueryGenerator, MakeRejectsWhatCannotBeGenerated) {
@@ -199,6 +253,40 @@ TEST(LoadGenTables, SkipsFloatColumns) {
     names.push_back(c.name);
   }
   EXPECT_EQ(names, (std::vector<std::string>{"i", "d"}));
+  EXPECT_TRUE(tables->front().other_columns);
+  std::filesystem::remove_all(dir);
+}
+
+// A DECIMAL column keeps its precision and scale, and its samples are literals with a digit before
+// the point; a DECIMAL beyond 38 digits is skipped like a FLOAT.
+TEST(LoadGenTables, ReadsDecimalColumns) {
+  const std::filesystem::path dir =
+      std::filesystem::path(::testing::TempDir()) / "antb1_query_gen_decimal";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  const std::string path = (dir / "t.parquet").string();
+  arrow::Decimal128Builder small(arrow::decimal128(9, 2));
+  arrow::Decimal256Builder wide(arrow::decimal256(40, 0));
+  for (const int64_t v : {5, -1234, 0, 100}) {
+    ASSERT_TRUE(small.Append(arrow::Decimal128(v)).ok());
+    ASSERT_TRUE(wide.Append(arrow::Decimal256(v)).ok());
+  }
+  const auto table =
+      arrow::Table::Make(arrow::schema({arrow::field("p", arrow::decimal128(9, 2)),
+                                        arrow::field("w", arrow::decimal256(40, 0))}),
+                         {small.Finish().ValueOrDie(), wide.Finish().ValueOrDie()});
+  auto out = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+  ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), out, 4).ok());
+  ASSERT_TRUE(out->Close().ok());
+
+  const auto tables = LoadGenTables({TableDef{.name = "t", .files = {path}, .patterns = {path}}});
+  ASSERT_TRUE(tables.has_value()) << tables.error();
+  ASSERT_EQ(tables->front().columns.size(), 1U);
+  const GenColumn& p = tables->front().columns.front();
+  EXPECT_EQ(p.kind, ValueKind::kDecimal);
+  EXPECT_EQ(p.precision, 9);
+  EXPECT_EQ(p.scale, 2);
+  EXPECT_EQ(p.samples, (std::vector<std::string>{"0.05", "-12.34", "0.00", "1.00"}));
   EXPECT_TRUE(tables->front().other_columns);
   std::filesystem::remove_all(dir);
 }

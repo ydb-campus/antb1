@@ -99,6 +99,19 @@ antb1_add_cli_golden(
     json
 )
 antb1_add_cli_golden(
+  query_decimals_json
+  ARGS
+    query
+    --threads
+    1
+    -c
+    "SELECT id, d9_2, d38_10, d38_0, MAX(p) FROM d WHERE id < 10 GROUP BY id, d9_2, d38_10, d38_0 ORDER BY id LIMIT 4"
+    --table
+    "d=${_f}/decimals.parquet"
+    --format
+    json
+)
+antb1_add_cli_golden(
   query_limit_zero
   ARGS query --threads 1 -c "SELECT Title FROM t LIMIT 0" --table "${_t}" --format csv
 )
@@ -357,6 +370,7 @@ antb1_add_cli_golden(
   schema_column_type
   ARGS schema --column-type u16=DATE --table "edge=${_f}/edge.parquet"
 )
+antb1_add_cli_golden(schema_decimals ARGS schema --table "d=${_f}/decimals.parquet")
 antb1_add_cli_golden(
   explain
   ARGS explain -c "${_count}" --table "t=${_f}/hits_like_split/part-*.parquet"
@@ -370,6 +384,15 @@ antb1_add_cli_golden(
     "SELECT COUNT(*), SUM(ResolutionWidth) AS width, MAX(EventDate) FROM t WHERE IsMobile = 1 AND UserAgent > 1.5 AND RegionID < 3000000000 AND EventDate >= '2013-07-10'"
     --table
     "${_t}"
+)
+antb1_add_cli_golden(
+  explain_decimal
+  ARGS
+    explain
+    -c
+    "SELECT id, p FROM d WHERE p <= 12.345 AND d38_10 > -0.5 AND d9_2 IN (1.25, 5) ORDER BY p LIMIT 3"
+    --table
+    "d=${_f}/decimals.parquet"
 )
 antb1_add_cli_golden(
   explain_group_by

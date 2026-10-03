@@ -7,4 +7,5 @@ hits_like_split     hits_like_split/part-*.parquet     clickbench
 hits_like_required  hits_like_required.parquet         clickbench
 edge                edge.parquet
 floats              floats.parquet
+decimals            decimals.parquet
 empty               empty.parquet                      clickbench

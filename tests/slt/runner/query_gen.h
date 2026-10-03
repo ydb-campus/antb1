@@ -21,11 +21,13 @@
 // type (no implicit casts), doubles only get literals that both engines convert to the same double,
 // FLOAT columns (results are DOUBLE on antb1 only, divergence D11) are never referenced, columns
 // read as DATE through the clickbench option are never used with FROM '<path>' (DuckDB reads the
-// raw file there), and SELECT * on a large table always has a LIMIT.
+// raw file there), SELECT * on a large table always has a LIMIT, and a DECIMAL column is only
+// compared with literals of its own digits (no SUM, AVG, arithmetic or CASE values yet), which keep
+// DuckDB's common DECIMAL type within 38 digits (divergence D13).
 
 namespace antb1::slt {
 
-enum class ValueKind : std::uint8_t { kInteger, kDouble, kVarchar, kDate };
+enum class ValueKind : std::uint8_t { kInteger, kDouble, kVarchar, kDate, kDecimal };
 
 struct GenColumn {
   std::string name;
@@ -38,6 +40,8 @@ struct GenColumn {
   // inside the type, since both engines fail on an overflow and the test compares answers.
   std::optional<int64_t> data_min;
   std::optional<int64_t> data_max;
+  int precision = 0;  // kDecimal: DECIMAL(precision, scale)
+  int scale = 0;
 };
 
 struct GenTable {

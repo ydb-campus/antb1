@@ -19,10 +19,12 @@
 #include <arrow/util/decimal.h>
 #include <gtest/gtest.h>
 
+#include "antb1/common/int128.h"
 #include "antb1/exec/aggregate_state.h"
 #include "antb1/exec/group_aggregate.h"
 #include "antb1/exec/grouped_aggregate_state.h"
 #include "antb1/exec/operator.h"
+#include "antb1/plan/literal.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
 
@@ -102,6 +104,17 @@ std::shared_ptr<arrow::Array> RandomColumn(LogicalType type, std::size_t n, Rng&
         status = static_cast<arrow::Decimal128Builder&>(*builder).Append(bounded);
         break;
       }
+      case LogicalType::kDecimal: {  // within the precision, the extremes included
+        const Int128 max = plan::RangeOf(type).max;
+        Int128 v = static_cast<Int128>(static_cast<std::int64_t>(rng.Next())) % (max + 1);
+        if (pick < 2) {
+          v = pick == 0 ? -max : max;
+        }
+        const auto bits = static_cast<UInt128>(v);
+        status = static_cast<arrow::Decimal128Builder&>(*builder).Append(arrow::Decimal128(
+            static_cast<std::int64_t>(bits >> 64U), static_cast<std::uint64_t>(bits)));
+        break;
+      }
       case LogicalType::kDouble: {
         constexpr auto kSpecial =
             std::to_array<double>({std::numeric_limits<double>::quiet_NaN(), -0.0, 0.0,
@@ -168,7 +181,7 @@ std::vector<Call> CallsOver(LogicalType type) {
 constexpr auto kTypes = std::to_array<LogicalType>(
     {LogicalType::kSmallInt, LogicalType::kInteger, LogicalType::kBigInt, LogicalType::kUSmallInt,
      LogicalType::kHugeInt, LogicalType::kDouble, LogicalType::kVarchar, LogicalType::kDate,
-     LogicalType::kTimestamp});
+     LogicalType::kTimestamp, LogicalType::Decimal(15, 2)});
 
 std::unique_ptr<GroupedAggregateState> MakeGrouped(const Call& call) {
   auto state = MakeGroupedAggregateState(call.kind, call.input, call.result);
@@ -197,8 +210,7 @@ TEST_F(GroupedAggregateTest, EveryGroupEqualsTheScalarStateOverItsRows) {
       id = static_cast<std::uint32_t>(rng.Below(kGroups - 1));
     }
     for (const Call& call : CallsOver(type)) {
-      SCOPED_TRACE(std::string(plan::ToString(call.kind)) + " of " +
-                   std::string(plan::ToString(type)));
+      SCOPED_TRACE(std::string(plan::ToString(call.kind)) + " of " + plan::ToString(type));
       auto grouped = MakeGrouped(call);
       ASSERT_NE(grouped, nullptr);
       grouped->Resize(kGroups);
@@ -240,7 +252,7 @@ TEST_F(GroupedAggregateTest, CountDistinctMatchesASetPerGroup) {
   constexpr std::uint32_t kGroups = 7;  // group 6 gets no row
   Rng rng(42);
   for (const LogicalType type : kTypes) {
-    SCOPED_TRACE(std::string(plan::ToString(type)));
+    SCOPED_TRACE(plan::ToString(type));
     const auto values = RandomColumn(type, kRows, rng);
     std::vector<std::uint32_t> ids(kRows);
     std::vector<std::set<std::string>> model(kGroups);
@@ -291,8 +303,7 @@ TEST_F(GroupedAggregateTest, MergingPartialStatesGivesTheSinglePassResult) {
       id = static_cast<std::uint32_t>(rng.Below(kGroups));
     }
     for (const Call& call : CallsOver(type)) {
-      SCOPED_TRACE(std::string(plan::ToString(call.kind)) + " of " +
-                   std::string(plan::ToString(type)));
+      SCOPED_TRACE(std::string(plan::ToString(call.kind)) + " of " + plan::ToString(type));
       auto single = MakeGrouped(call);
       single->Resize(kGroups);
       ASSERT_TRUE(single->Consume(call.input ? values.get() : nullptr, ids).ok());
@@ -345,8 +356,7 @@ TEST_F(GroupedAggregateTest, MergingSubsetsOfGroups) {
       id = static_cast<std::uint32_t>(rng.Below(kGroups));
     }
     for (const Call& call : CallsOver(type)) {
-      SCOPED_TRACE(std::string(plan::ToString(call.kind)) + " of " +
-                   std::string(plan::ToString(type)));
+      SCOPED_TRACE(std::string(plan::ToString(call.kind)) + " of " + plan::ToString(type));
       auto part = MakeGrouped(call);
       part->Resize(kGroups);
       ASSERT_TRUE(part->Consume(call.input ? values.get() : nullptr, ids).ok());
@@ -689,7 +699,7 @@ TEST_F(GroupedAggregateTest, EveryKeyTypeAndBatchSizeInvariance) {
   arrow::FieldVector fields;
   arrow::ArrayVector columns;
   for (const LogicalType type : kTypes) {
-    fields.push_back(arrow::field(std::string(plan::ToString(type)), plan::ToArrow(type)));
+    fields.push_back(arrow::field(plan::ToString(type), plan::ToArrow(type)));
     // Few distinct values per column: keep only rng.Below(3)-derived repeats.
     auto column = RandomColumn(type, kRows, rng);
     std::vector<std::int64_t> small(kRows);
@@ -704,7 +714,7 @@ TEST_F(GroupedAggregateTest, EveryKeyTypeAndBatchSizeInvariance) {
   const auto schema = arrow::schema(fields);
   const auto batch = arrow::RecordBatch::Make(schema, kRows, columns);
   std::vector<plan::BoundColumn> keys;
-  for (std::size_t k = 0; k < kTypes.size(); k += 3) {  // three keys of other types
+  for (std::size_t k = 0; k < kTypes.size(); k += 3) {  // keys of several types
     keys.push_back(Column(static_cast<int>(k), fields.at(k)->name(), kTypes.at(k)));
   }
   std::vector<std::string> first;
@@ -728,7 +738,9 @@ TEST_F(GroupedAggregateTest, EveryKeyTypeAndBatchSizeInvariance) {
       for (int c = 0; c < table->num_columns(); ++c) {
         line += table->column(c)->GetScalar(r).ValueOrDie()->ToString() + "|";
       }
-      total += static_cast<const arrow::Int64Array&>(*table->column(3)->chunk(0)).Value(r);
+      const auto count_column = static_cast<int>(keys.size());  // COUNT(*) follows the keys
+      total +=
+          static_cast<const arrow::Int64Array&>(*table->column(count_column)->chunk(0)).Value(r);
       lines.push_back(line);
     }
     std::ranges::sort(lines);

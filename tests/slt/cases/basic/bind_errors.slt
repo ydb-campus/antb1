@@ -83,6 +83,17 @@ statement error ^bind: cannot compare INTEGER column 'RegionID' with a string
 SELECT COUNT(*) FROM hits_like WHERE RegionID = '42'
 
 onlyif antb1
+statement error ^bind: cannot compare DECIMAL\(15,2\) column 'p' with a string
+SELECT COUNT(*) FROM decimals WHERE p = '59.97'
+
+# DuckDB casts the string to the column's DECIMAL.
+onlyif duckdb
+query I nosort
+SELECT COUNT(*) FROM decimals WHERE p = '59.97'
+----
+3
+
+onlyif antb1
 statement error ^bind: cannot compare VARCHAR column 'u' with a number
 SELECT COUNT(*) FROM edge WHERE u = 1
 

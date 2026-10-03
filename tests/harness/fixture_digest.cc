@@ -97,6 +97,11 @@ void HashValues(const arrow::Array& array, Hasher& h) {
       AddNumber(h, std::bit_cast<uint64_t>(typed.Value(i)), 'd', ';', 16);
     } else if constexpr (std::is_same_v<ArrayType, arrow::FloatArray>) {
       AddNumber(h, std::bit_cast<uint32_t>(typed.Value(i)), 'f', ';', 16);
+    } else if constexpr (std::is_same_v<ArrayType, arrow::Decimal128Array>) {
+      // The unscaled value as its two 64-bit halves; the precision and scale are in the schema.
+      const arrow::Decimal128 v(typed.GetValue(i));
+      AddNumber(h, static_cast<uint64_t>(v.high_bits()), 'x', ':', 16);
+      AddNumber(h, v.low_bits(), 'x', ';', 16);
     } else if constexpr (std::is_base_of_v<arrow::BinaryArray, ArrayType>) {
       const std::string_view v = typed.GetView(i);
       AddNumber(h, v.size(), 'b', ':');
@@ -142,6 +147,9 @@ arrow::Status HashArray(const arrow::Array& array, Hasher& h) {
       break;
     case arrow::Type::DOUBLE:
       HashValues<arrow::DoubleArray>(array, h);
+      break;
+    case arrow::Type::DECIMAL128:
+      HashValues<arrow::Decimal128Array>(array, h);
       break;
     case arrow::Type::BINARY:
       HashValues<arrow::BinaryArray>(array, h);

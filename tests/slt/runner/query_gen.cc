@@ -153,6 +153,13 @@ std::optional<GenColumn> ColumnOf(const arrow::Field& field, bool clickbench) {
     case arrow::Type::DATE32:
       c.kind = ValueKind::kDate;
       break;
+    case arrow::Type::DECIMAL128: {
+      const auto& decimal = static_cast<const arrow::Decimal128Type&>(*field.type());
+      c.kind = ValueKind::kDecimal;
+      c.precision = decimal.precision();
+      c.scale = decimal.scale();
+      break;
+    }
     // A FLOAT column's results are DOUBLE on antb1 but FLOAT on DuckDB: divergence D11 in
     // docs/sql-subset.md. (WHERE compares alike; tests/slt/cases/where/float.slt covers it.)
     case arrow::Type::FLOAT:
@@ -198,6 +205,23 @@ std::string FixedDouble(double value) {
   return ec == std::errc{} ? std::string(buf.data(), end) : std::string("0");
 }
 
+// An unscaled DECIMAL value ("-1234") as a literal of `scale` fraction digits ("-12.34", "0.05"):
+// always with a digit before the point, which every SQL dialect reads.
+std::string DecimalLiteralText(std::string unscaled, int scale) {
+  const bool negative = unscaled.starts_with('-');
+  if (negative) {
+    unscaled.erase(0, 1);
+  }
+  const auto digits = static_cast<std::size_t>(scale);
+  if (unscaled.size() <= digits) {
+    unscaled.insert(0, digits + 1 - unscaled.size(), '0');
+  }
+  if (digits > 0) {
+    unscaled.insert(unscaled.size() - digits, ".");
+  }
+  return negative ? "-" + unscaled : unscaled;
+}
+
 std::optional<std::string> SampleAt(const arrow::Array& a, int64_t row, const GenColumn& c) {
   if (a.IsNull(row)) {
     return std::nullopt;
@@ -214,6 +238,10 @@ std::optional<std::string> SampleAt(const arrow::Array& a, int64_t row, const Ge
     case ValueKind::kDouble: {
       const double v = static_cast<const arrow::DoubleArray&>(a).Value(row);
       return std::isfinite(v) ? std::optional(FixedDouble(v)) : std::nullopt;
+    }
+    case ValueKind::kDecimal: {
+      const arrow::Decimal128 v(static_cast<const arrow::Decimal128Array&>(a).GetValue(row));
+      return DecimalLiteralText(v.ToIntegerString(), c.scale);
     }
     case ValueKind::kVarchar: {
       std::string v(static_cast<const arrow::BinaryArray&>(a).GetView(row));
@@ -298,6 +326,8 @@ Feature TypeFeature(ValueKind kind) {
       return Feature::kVarcharColumns;
     case ValueKind::kDate:
       return Feature::kDateColumns;
+    case ValueKind::kDecimal:
+      return Feature::kDecimalColumns;
   }
   return Feature::kIntegerColumns;
 }
@@ -453,6 +483,8 @@ class Builder {
       case ValueKind::kDate:
         return allowed_.Has(Feature::kDateLiteral) || allowed_.Has(Feature::kCastDate) ||
                allowed_.Has(Feature::kStringLiteral);
+      case ValueKind::kDecimal:  // an integer always fits DuckDB's common type (DecimalText)
+        return allowed_.Has(Feature::kIntegerLiteral);
     }
     return false;
   }
@@ -1168,7 +1200,9 @@ class Builder {
   }
 
   // c [NOT] BETWEEN lit AND high. The upper bound comes from the literal without another draw: an
-  // integer plus 5, any other literal itself (a single-value range).
+  // integer plus 5, any other literal itself (a single-value range). Not plus 5 for a DECIMAL of
+  // more than 36 digits: one more integer digit could leave DuckDB's 38-digit common type
+  // (DecimalText).
   void Between(const GenColumn& c, const Literal& lit, bool negated) {
     used_.Add(Feature::kBetween);
     Column(c);
@@ -1179,7 +1213,8 @@ class Builder {
     tokens_.insert(tokens_.end(), lit.tokens.begin(), lit.tokens.end());
     Keyword("AND");
     std::vector<Token> high = lit.tokens;
-    if (high.size() == 1 && high[0].kind == Token::Kind::kLiteral) {
+    if (high.size() == 1 && high[0].kind == Token::Kind::kLiteral &&
+        (c.kind != ValueKind::kDecimal || c.precision <= 36)) {
       const std::string& text = high[0].text;
       int64_t value = 0;
       const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
@@ -1297,6 +1332,35 @@ class Builder {
     return std::string(rng_.Pick(kEdges));
   }
 
+  // A literal for a DECIMAL(p,s) column: a sample value, the type's extremes, 0 and +-1, an
+  // integer part, and, for p <= 36 only, one more integer digit (out of range) or one more fraction
+  // digit (between two values). DuckDB compares in one DECIMAL of max(integer digits) + max(scale)
+  // digits, capped at 38: within the cap it is exact, beyond it a column value fails the cast
+  // (divergence D13). With p <= 36, two literals with a spare digit each stay within 38 digits
+  // (an IN list shares one type), and an integer literal's type (INTEGER, BIGINT, HUGEINT) only
+  // shortens the integer digits the cap leaves to 38 - s >= p - s.
+  std::string DecimalText(const GenColumn& c) {
+    const auto int_digits = static_cast<std::size_t>(c.precision - c.scale);
+    const auto scale = static_cast<std::size_t>(c.scale);
+    const bool spare = c.precision <= 36;
+    const std::string fraction = scale > 0 ? "." + std::string(scale, '9') : "";
+    const std::string max = (int_digits > 0 ? std::string(int_digits, '9') : "0") + fraction;
+    const std::string sample = c.samples.empty() ? std::string("0") : rng_.Pick(c.samples);
+    std::vector<std::string> choices = {sample, sample, sample, max, "-" + max, "0"};
+    if (int_digits > 0) {
+      choices.emplace_back("1");
+      choices.emplace_back("-1");
+      choices.push_back(sample.substr(0, sample.find('.')));  // its integer part
+    }
+    if (spare) {
+      const std::string outside = "1" + std::string(int_digits, '0');
+      choices.push_back(outside);
+      choices.push_back("-" + outside);
+      choices.push_back(sample + (scale > 0 ? "5" : ".5"));
+    }
+    return rng_.Pick(choices);
+  }
+
   Literal MakeLiteral(const GenColumn& c) {
     Literal lit;
     auto single = [&lit](std::string text, Feature feature) {
@@ -1320,6 +1384,25 @@ class Builder {
         }
         if (text.starts_with('-') && !allowed_.Has(Feature::kNegativeLiteral)) {
           text = text.contains('.') ? "0.5" : "0";
+        }
+        if (text.starts_with('-')) {
+          lit.features.Add(Feature::kNegativeLiteral);
+        }
+        const Feature kind =
+            text.contains('.') ? Feature::kDecimalLiteral : Feature::kIntegerLiteral;
+        single(std::move(text), kind);
+        break;
+      }
+      case ValueKind::kDecimal: {
+        std::string text = DecimalText(c);
+        if (text.starts_with('-') && !allowed_.Has(Feature::kNegativeLiteral)) {
+          text.erase(0, 1);
+        }
+        if (text.contains('.') && !allowed_.Has(Feature::kDecimalLiteral)) {
+          text.resize(text.find('.'));  // the integer part (CanLiteral: integers are allowed)
+        }
+        if (text == "-0") {
+          text = "0";
         }
         if (text.starts_with('-')) {
           lit.features.Add(Feature::kNegativeLiteral);
@@ -1465,7 +1548,8 @@ class Builder {
   // over a column: the values share c's kind (a literal of it, as DuckDB types CASE). Returns
   // whether the result is exact (not DOUBLE), or std::nullopt (nothing written).
   std::optional<bool> Case(const GenColumn& c) {
-    if (!allowed_.Has(Feature::kCase) || comparable_.empty()) {
+    // DECIMAL CASE values are unsupported until roadmap PR D3 (ADR 0021).
+    if (!allowed_.Has(Feature::kCase) || comparable_.empty() || c.kind == ValueKind::kDecimal) {
       return std::nullopt;
     }
     used_.Add(Feature::kCase);
@@ -1516,6 +1600,8 @@ class Builder {
                                 : emit("2", Feature::kIntegerLiteral);
       case ValueKind::kVarchar:
         return emit(rng_.Percent(50) ? "''" : "'k'", Feature::kStringLiteral);
+      case ValueKind::kDecimal:  // never: Case() skips DECIMAL
+        return false;
       case ValueKind::kDate: {
         // As in MakeLiteral: the roll modulo 100 is the old Percent(50) roll.
         const std::size_t roll = rng_.Below(400);

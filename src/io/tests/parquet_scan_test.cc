@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <memory>
 #include <numeric>
@@ -18,7 +19,11 @@
 #include <arrow/io/file.h>
 #include <gtest/gtest.h>
 #include <parquet/arrow/writer.h>
+#include <parquet/column_writer.h>
+#include <parquet/file_writer.h>
 #include <parquet/properties.h>
+#include <parquet/schema.h>
+#include <parquet/types.h>
 
 #include "antb1/common/int128.h"
 #include "antb1/io/parquet_table.h"
@@ -71,7 +76,8 @@ class ParquetScanTest : public ::testing::Test {
   void TearDown() override { fs::remove_all(dir_); }
 
   std::string Write(const std::string& name, const std::shared_ptr<arrow::Table>& table,
-                    int64_t row_group_rows, bool store_schema = false) {
+                    int64_t row_group_rows, bool store_schema = false,
+                    bool decimals_as_integers = false) {
     const std::string path = (dir_ / name).string();
     auto out = arrow::io::FileOutputStream::Open(path);
     EXPECT_TRUE(out.ok()) << out.status().ToString();
@@ -79,9 +85,13 @@ class ParquetScanTest : public ::testing::Test {
     if (store_schema) {
       arrow_props.store_schema();
     }
+    parquet::WriterProperties::Builder props;
+    if (decimals_as_integers) {
+      props.enable_store_decimal_as_integer();  // INT32 up to 9 digits, INT64 up to 18
+    }
     const arrow::Status st =
         parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), *out, row_group_rows,
-                                   parquet::default_writer_properties(), arrow_props.build());
+                                   props.build(), arrow_props.build());
     EXPECT_TRUE(st.ok()) << st.ToString();
     EXPECT_TRUE((*out)->Close().ok());
     return path;
@@ -177,6 +187,16 @@ class ParquetScanTest : public ::testing::Test {
 
   fs::path dir_;
 };
+
+// Each value of a column as Arrow's scalar text ("null" for NULL).
+std::vector<std::string> Texts(const arrow::Table& table, int column) {
+  std::vector<std::string> out;
+  out.reserve(static_cast<std::size_t>(table.num_rows()));
+  for (int64_t r = 0; r < table.num_rows(); ++r) {
+    out.push_back(table.column(column)->GetScalar(r).ValueOrDie()->ToString());
+  }
+  return out;
+}
 
 std::vector<std::optional<int64_t>> Int64s(const arrow::Table& table, int column) {
   std::vector<std::optional<int64_t>> out;
@@ -453,6 +473,88 @@ TEST_F(ParquetScanTest, ConvertsToTheEngineView) {
               (std::vector<std::optional<int64_t>>{-32768, 32767, std::nullopt, 0, -1}));
     EXPECT_EQ(Int64s(*s.table, 7),
               (std::vector<std::optional<int64_t>>{-1, std::nullopt, 0, 2932896, -719528}));
+  }
+}
+
+// A DECIMAL column of at most 38 digits reads as decimal128(p, s) whatever its Parquet storage
+// (INT32, INT64 or FIXED_LEN_BYTE_ARRAY) and whatever an ARROW:schema restores (decimal32,
+// decimal64, decimal128 or decimal256): the engine's DECIMAL(p, s) (ADR 0021). Wider decimals stay
+// unsupported.
+TEST_F(ParquetScanTest, ReadsEveryDecimalStorage) {
+  arrow::Decimal32Builder d9(arrow::decimal32(9, 2));
+  arrow::Decimal64Builder d18(arrow::decimal64(18, 4));
+  arrow::Decimal128Builder d38(arrow::decimal128(38, 10));
+  arrow::Decimal256Builder d256(arrow::decimal256(38, 0));
+  arrow::Decimal128Builder d15(arrow::decimal128(15, 2));
+  arrow::Decimal256Builder wide(arrow::decimal256(40, 0));
+  const auto ok = [](const arrow::Status& st) { ASSERT_TRUE(st.ok()) << st.ToString(); };
+  const std::string nines38(38, '9');
+  ok(d9.Append(arrow::Decimal32(999999999)));
+  ok(d9.AppendNull());
+  ok(d9.Append(arrow::Decimal32(-999999999)));
+  ok(d9.Append(arrow::Decimal32(-5)));
+  ok(d18.Append(arrow::Decimal64(999999999999999999)));
+  ok(d18.Append(arrow::Decimal64(-1)));
+  ok(d18.AppendNull());
+  ok(d18.Append(arrow::Decimal64(-999999999999999999)));
+  ok(d38.Append(arrow::Decimal128(nines38)));
+  ok(d38.Append(arrow::Decimal128("-" + nines38)));
+  ok(d38.Append(arrow::Decimal128(0)));
+  ok(d38.AppendNull());
+  ok(d256.AppendNull());
+  ok(d256.Append(arrow::Decimal256("-" + nines38)));
+  ok(d256.Append(arrow::Decimal256(nines38)));
+  ok(d256.Append(arrow::Decimal256(7)));
+  ok(d15.Append(arrow::Decimal128(-12345)));
+  ok(d15.Append(arrow::Decimal128(999999999999999)));
+  ok(d15.Append(arrow::Decimal128(0)));
+  ok(d15.AppendNull());
+  for (int i = 0; i < 4; ++i) {
+    ok(wide.Append(arrow::Decimal256(i)));
+  }
+  const auto data = arrow::Table::Make(
+      arrow::schema({arrow::field("d9", arrow::decimal32(9, 2)),
+                     arrow::field("d18", arrow::decimal64(18, 4)),
+                     arrow::field("d38", arrow::decimal128(38, 10)),
+                     arrow::field("d256", arrow::decimal256(38, 0)),
+                     arrow::field("d15", arrow::decimal128(15, 2)),
+                     arrow::field("wide", arrow::decimal256(40, 0))}),
+      {d9.Finish().ValueOrDie(), d18.Finish().ValueOrDie(), d38.Finish().ValueOrDie(),
+       d256.Finish().ValueOrDie(), d15.Finish().ValueOrDie(), wide.Finish().ValueOrDie()});
+  const std::vector<std::shared_ptr<arrow::DataType>> engine_types = {
+      arrow::decimal128(9, 2), arrow::decimal128(18, 4), arrow::decimal128(38, 10),
+      arrow::decimal128(38, 0), arrow::decimal128(15, 2)};
+  const std::vector<std::vector<std::string>> expected = {
+      {"9999999.99", "null", "-9999999.99", "-0.05"},
+      {"99999999999999.9999", "-0.0001", "null", "-99999999999999.9999"},
+      {"9999999999999999999999999999.9999999999", "-9999999999999999999999999999.9999999999",
+       "0E-10", "null"},
+      {"null", "-" + nines38, nines38, "7"},
+      {"-123.45", "9999999999999.99", "0.00", "null"}};
+  for (const bool store_schema : {false, true}) {
+    for (const bool as_integers : {false, true}) {
+      SCOPED_TRACE(std::format("ARROW:schema {}, integer storage {}", store_schema, as_integers));
+      const std::string path =
+          Write(std::format("decimals_{}_{}.parquet", store_schema, as_integers), data, 2,
+                store_schema, as_integers);
+      auto table = ParquetTable::Open({path}, ParquetTableOptions{});
+      ASSERT_TRUE(table.ok()) << table.status().ToString();
+      const auto& schema = *(*table)->schema();
+      for (std::size_t i = 0; i < engine_types.size(); ++i) {
+        EXPECT_TRUE(schema.field(static_cast<int>(i))->type()->Equals(*engine_types[i]))
+            << i << ": " << schema.field(static_cast<int>(i))->type()->ToString();
+      }
+      EXPECT_FALSE(plan::FromArrow(*schema.field(5)->type()).ok())
+          << "a 40-digit decimal stays unsupported";
+      for (const int64_t batch_size : {int64_t{1}, int64_t{3}}) {
+        const Scanned s = Scan(**table, {0, 1, 2, 3, 4}, batch_size);
+        ASSERT_NE(s.table, nullptr);
+        for (int c = 0; c < 5; ++c) {
+          EXPECT_EQ(Texts(*s.table, c), expected[static_cast<std::size_t>(c)])
+              << c << " " << batch_size;
+        }
+      }
+    }
   }
 }
 
@@ -743,6 +845,41 @@ TEST_F(ParquetScanTest, SameSizeRewriteIsIOError) {
   }
 }
 
+// A DECIMAL stored as BYTE_ARRAY (big-endian two's complement of any length, which other writers
+// than Arrow's produce) reads as decimal128(p, s) too.
+TEST_F(ParquetScanTest, ReadsByteArrayDecimals) {
+  using parquet::schema::GroupNode;
+  using parquet::schema::PrimitiveNode;
+  const auto node =
+      PrimitiveNode::Make("d", parquet::Repetition::OPTIONAL, parquet::LogicalType::Decimal(9, 2),
+                          parquet::Type::BYTE_ARRAY);
+  const auto schema = std::static_pointer_cast<GroupNode>(
+      GroupNode::Make("schema", parquet::Repetition::REQUIRED, {node}));
+  const std::string path = (dir_ / "byte_array_decimals.parquet").string();
+  {
+    auto out = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+    auto writer = parquet::ParquetFileWriter::Open(out, schema);
+    auto* column = static_cast<parquet::ByteArrayWriter*>(writer->AppendRowGroup()->NextColumn());
+    const std::vector<uint8_t> a = {0x30, 0x39};              // 12345
+    const std::vector<uint8_t> b = {0xFB};                    // -5
+    const std::vector<uint8_t> c = {0x05, 0xF5, 0xE0, 0xFF};  // 99999999
+    const std::vector<parquet::ByteArray> values = {
+        parquet::ByteArray(static_cast<uint32_t>(a.size()), a.data()),
+        parquet::ByteArray(static_cast<uint32_t>(b.size()), b.data()),
+        parquet::ByteArray(static_cast<uint32_t>(c.size()), c.data())};
+    const std::vector<int16_t> definition = {1, 1, 0, 1};
+    column->WriteBatch(4, definition.data(), nullptr, values.data());
+    writer->Close();
+    ASSERT_TRUE(out->Close().ok());
+  }
+  auto table = ParquetTable::Open({path}, ParquetTableOptions{});
+  ASSERT_TRUE(table.ok()) << table.status().ToString();
+  EXPECT_TRUE((*table)->schema()->field(0)->type()->Equals(*arrow::decimal128(9, 2)));
+  const Scanned s = Scan(**table, {0}, 3);
+  ASSERT_NE(s.table, nullptr);
+  EXPECT_EQ(Texts(*s.table, 0), (std::vector<std::string>{"123.45", "-0.05", "null", "999999.99"}));
+}
+
 // Statistics of a part (a row group) for skipping it: exact min, max and NULL count for
 // integer-valued columns, in the engine view (a USMALLINT day number read as DATE keeps its value);
 // nothing for other types, for a file written without statistics, or out of range.
@@ -754,9 +891,13 @@ TEST_F(ParquetScanTest, PartStatisticsOfIntegerColumns) {
   std::vector<std::optional<std::string>> text;
   std::vector<std::optional<int32_t>> days;  // INTEGER day numbers, read as DATE
   arrow::Decimal128Builder huge(arrow::decimal128(38, 0));
+  arrow::Decimal128Builder small(arrow::decimal128(9, 2));  // stored as INT32
+  arrow::Decimal128Builder mid(arrow::decimal128(15, 2));   // stored as INT64
   for (int64_t i = 0; i < 9; ++i) {
     days.emplace_back(static_cast<int32_t>(-3 + i));
     ASSERT_TRUE(huge.Append(arrow::Decimal128(-(i + 1))).ok());
+    ASSERT_TRUE(small.Append(arrow::Decimal128(i * 125)).ok());
+    ASSERT_TRUE(mid.Append(arrow::Decimal128(-i * 1999)).ok());
     id.emplace_back(100 + i);
     day.emplace_back(static_cast<uint16_t>(15000 + (i * 2)));
     sparse.push_back(i >= 3 && i < 6 ? std::nullopt : std::optional<int64_t>(-i));
@@ -767,12 +908,15 @@ TEST_F(ParquetScanTest, PartStatisticsOfIntegerColumns) {
       arrow::schema({arrow::field("id", arrow::int64()), arrow::field("day", arrow::uint16()),
                      arrow::field("sparse", arrow::int64()), arrow::field("real", arrow::float64()),
                      arrow::field("text", arrow::utf8()), arrow::field("days", arrow::int32()),
-                     arrow::field("huge", arrow::decimal128(38, 0))}),
+                     arrow::field("huge", arrow::decimal128(38, 0)),
+                     arrow::field("small", arrow::decimal128(9, 2)),
+                     arrow::field("mid", arrow::decimal128(15, 2))}),
       {Build<arrow::Int64Builder, int64_t>(id), Build<arrow::UInt16Builder, uint16_t>(day),
        Build<arrow::Int64Builder, int64_t>(sparse), Build<arrow::DoubleBuilder, double>(real),
        Build<arrow::StringBuilder, std::string>(text), Build<arrow::Int32Builder, int32_t>(days),
-       huge.Finish().ValueOrDie()});
-  const std::string path = Write("stats.parquet", data, 3);
+       huge.Finish().ValueOrDie(), small.Finish().ValueOrDie(), mid.Finish().ValueOrDie()});
+  const std::string path = Write("stats.parquet", data, 3, /*store_schema=*/false,
+                                 /*decimals_as_integers=*/true);
   auto table = ParquetTable::Open(
       {path}, ParquetTableOptions{.overrides = {{.column = "day"}, {.column = "days"}}});
   ASSERT_TRUE(table.ok()) << table.status().ToString();
@@ -793,12 +937,16 @@ TEST_F(ParquetScanTest, PartStatisticsOfIntegerColumns) {
   expect(0, 5, -3, -1, 0);        // DATE read from INTEGER day numbers, before 1970
   expect(0, 2, -2, 0, 0);
   expect(1, 2, std::nullopt, std::nullopt, 3);  // every value NULL
-  EXPECT_FALSE(stats(0, 6).has_value()) << "HUGEINT: decimal statistics are not trusted";
+  // DECIMAL: no part statistics (ADR 0021), also when stored as INT32 or INT64, whose Parquet
+  // statistics are plain integers of the unscaled values.
+  EXPECT_FALSE(stats(0, 6).has_value()) << "DECIMAL(38,0)";
+  EXPECT_FALSE(stats(0, 7).has_value()) << "DECIMAL(9,2) as INT32";
+  EXPECT_FALSE(stats(0, 8).has_value()) << "DECIMAL(15,2) as INT64";
   EXPECT_FALSE(stats(0, 3).has_value()) << "DOUBLE: NaN may be missing from min/max";
   EXPECT_FALSE(stats(0, 4).has_value()) << "VARCHAR: min/max may be truncated";
   EXPECT_FALSE(stats(3, 0).has_value());
   EXPECT_FALSE(stats(-1, 0).has_value());
-  EXPECT_FALSE(stats(0, 7).has_value());
+  EXPECT_FALSE(stats(0, 9).has_value());
 
   // A file written without statistics never skips.
   const std::string bare = (dir_ / "bare.parquet").string();

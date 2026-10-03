@@ -132,6 +132,9 @@ enum class Conversion : std::uint8_t {
   kLargeToBinary,   // large_utf8 / large_binary -> binary (64-bit to 32-bit offsets)
   kUInt16ToDate32,  // ClickBench EventDate read as DATE
   kFloatToDouble,
+  kDecimal32To128,   // a decimal of at most 38 digits that an ARROW:schema restores narrower or
+  kDecimal64To128,   // wider than decimal128 (ADR 0021): the engine reads every DECIMAL(p, s) as
+  kDecimal256To128,  // decimal128(p, s)
 };
 
 struct ConversionRule {
@@ -155,6 +158,15 @@ constexpr auto kConversionRules = std::to_array<ConversionRule>({
     {.storage = arrow::Type::FLOAT,
      .engine = arrow::Type::DOUBLE,
      .conversion = Conversion::kFloatToDouble},
+    {.storage = arrow::Type::DECIMAL32,
+     .engine = arrow::Type::DECIMAL128,
+     .conversion = Conversion::kDecimal32To128},
+    {.storage = arrow::Type::DECIMAL64,
+     .engine = arrow::Type::DECIMAL128,
+     .conversion = Conversion::kDecimal64To128},
+    {.storage = arrow::Type::DECIMAL256,
+     .engine = arrow::Type::DECIMAL128,
+     .conversion = Conversion::kDecimal256To128},
     // Column overrides (--column-type COL=DATE, --clickbench).
     {.storage = arrow::Type::INT32, .engine = arrow::Type::DATE32, .conversion = Conversion::kView},
     {.storage = arrow::Type::UINT16,
@@ -190,6 +202,26 @@ arrow::Result<std::shared_ptr<arrow::Array>> Widen(const arrow::ArrayData& data,
   const std::span<const In> in(data.GetValues<In>(1, 0), Narrow<std::size_t>(end));
   for (auto i = Narrow<std::size_t>(data.offset); i < in.size(); ++i) {
     out[i] = static_cast<Out>(in[i]);
+  }
+  return arrow::MakeArray(arrow::ArrayData::Make(type, data.length, {data.buffers[0], values},
+                                                 data.null_count, data.offset));
+}
+
+// decimal256 -> decimal128 of the same precision and scale: a value of at most 38 digits is its low
+// 128 bits (two's complement, little-endian words), keeping the validity bitmap and the offset.
+arrow::Result<std::shared_ptr<arrow::Array>> Decimal256To128(
+    const arrow::ArrayData& data, const std::shared_ptr<arrow::DataType>& type,
+    arrow::MemoryPool* pool) {
+  constexpr std::size_t kIn = 32;
+  constexpr std::size_t kOut = 16;
+  const int64_t end = data.offset + data.length;
+  ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Buffer> values,
+                        arrow::AllocateBuffer(end * Narrow<int64_t>(kOut), pool));
+  const std::span<uint8_t> out = values->mutable_span_as<uint8_t>();
+  std::ranges::fill(out, uint8_t{0});
+  const std::span<const uint8_t> in(data.GetValues<uint8_t>(1, 0), Narrow<std::size_t>(end) * kIn);
+  for (auto i = Narrow<std::size_t>(data.offset); i < Narrow<std::size_t>(end); ++i) {
+    std::ranges::copy(in.subspan(i * kIn, kOut), out.subspan(i * kOut, kOut).begin());
   }
   return arrow::MakeArray(arrow::ArrayData::Make(type, data.length, {data.buffers[0], values},
                                                  data.null_count, data.offset));
@@ -243,6 +275,12 @@ arrow::Result<std::shared_ptr<arrow::Array>> Convert(const std::shared_ptr<arrow
       return Widen<uint16_t, int32_t>(*array->data(), type, pool);
     case Conversion::kFloatToDouble:
       return Widen<float, double>(*array->data(), type, pool);
+    case Conversion::kDecimal32To128:
+      return Widen<int32_t, arrow::Decimal128>(*array->data(), type, pool);
+    case Conversion::kDecimal64To128:
+      return Widen<int64_t, arrow::Decimal128>(*array->data(), type, pool);
+    case Conversion::kDecimal256To128:
+      return Decimal256To128(*array->data(), type, pool);
   }
   return arrow::Status::Invalid("unknown conversion");
 }
@@ -554,8 +592,9 @@ std::optional<plan::PartStats> ParquetTable::part_stats(int64_t part, int field)
   // The schema is the engine view, so its types always convert.
   const plan::LogicalType engine =
       plan::FromArrow(*schema_->field(field)->type()).ValueOr(plan::LogicalType::kVarchar);
-  // HUGEINT is left out: it is stored as a fixed-length byte array, whose decimal statistics some
-  // writers got wrong (compared as unsigned bytes) in ways a reader cannot always detect.
+  // DECIMAL is left out (not an integer type; ADR 0021): a FIXED_LEN_BYTE_ARRAY decimal's
+  // statistics some writers got wrong (compared as unsigned bytes) in ways a reader cannot always
+  // detect. No column is HUGEINT; the check below keeps it out as well.
   const bool integer_valued = (plan::IsInteger(engine) && engine != plan::LogicalType::kHugeInt) ||
                               engine == plan::LogicalType::kDate;
   if (leaf < 0 || !integer_valued) {

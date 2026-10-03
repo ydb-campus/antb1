@@ -613,6 +613,7 @@ arrow::Result<std::unique_ptr<GroupedAggregateState>> SumState(bool average,
       return std::make_unique<GroupedHugeIntSum>(average);
     case plan::LogicalType::kDouble:
       return std::make_unique<GroupedDoubleSum>(average);
+    case plan::LogicalType::kDecimal:  // SUM and AVG of DECIMAL are unsupported (D3)
     case plan::LogicalType::kVarchar:
     case plan::LogicalType::kDate:
     case plan::LogicalType::kTimestamp:
@@ -634,6 +635,7 @@ std::unique_ptr<GroupedAggregateState> MinMaxState(bool min, plan::LogicalType i
     case plan::LogicalType::kUSmallInt:
       return std::make_unique<GroupedMinMax<arrow::UInt16Type>>(min, std::move(type));
     case plan::LogicalType::kHugeInt:
+    case plan::LogicalType::kDecimal:  // decimal128 of the column's own precision and scale
       return std::make_unique<GroupedMinMax<arrow::Decimal128Type>>(min, std::move(type));
     case plan::LogicalType::kDouble:
       return std::make_unique<GroupedMinMax<arrow::DoubleType>>(min, std::move(type));
@@ -817,10 +819,9 @@ arrow::Result<std::unique_ptr<GroupedAggregateState>> MakeGroupedAggregateState(
     plan::AggKind kind, std::optional<plan::LogicalType> input, plan::LogicalType result,
     arrow::MemoryPool* pool) {
   const auto invalid = [&] {
-    return arrow::Status::Invalid(
-        "no grouped aggregate ", plan::ToString(kind), "(",
-        input.has_value() ? plan::ToString(*input) : std::string_view("*"), ") -> ",
-        plan::ToString(result));
+    return arrow::Status::Invalid("no grouped aggregate ", plan::ToString(kind), "(",
+                                  input.has_value() ? plan::ToString(*input) : std::string("*"),
+                                  ") -> ", plan::ToString(result));
   };
   if (kind == plan::AggKind::kCountStar) {
     if (input.has_value() || result != plan::LogicalType::kBigInt) {

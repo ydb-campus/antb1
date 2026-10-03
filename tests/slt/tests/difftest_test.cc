@@ -135,6 +135,19 @@ TEST(RunDiff, MismatchPrintsSeedCaseSqlRowsAndRepro) {
   EXPECT_NE(r.out.find("DIFF: FAIL"), std::string::npos);
 }
 
+// A run over some of the tables of `pixi run diff-random` (`--table`) reproduces a case with the
+// same filter, so the repro generates the query that failed.
+TEST(RunDiff, SomeTablesReproduceWithTheirFilter) {
+  const auto gen = Generator(0);
+  const DiffRun r = Diff(gen, [](const std::string&) { return ExecResult(Ints({"13"})); }, Oracle,
+                         {.count = 1, .pixi_args = " --table decimals"});
+  EXPECT_EQ(r.stats.failed, 1U);
+  EXPECT_NE(
+      r.out.find("ANTB1_DIFF_SEED=42 ANTB1_DIFF_ONLY=0 pixi run diff-random --table decimals\n"),
+      std::string::npos)
+      << r.out;
+}
+
 // Over other tables than those of `pixi run diff-random`, only the command line reproduces a case.
 TEST(RunDiff, OtherTablesReproduceWithTheCommandLineOnly) {
   const auto gen = Generator(40);
