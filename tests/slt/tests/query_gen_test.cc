@@ -159,12 +159,12 @@ TEST(QueryGenerator, QueriesRespectTheSemanticsBothEnginesShare) {
     // with more than 10 fraction digits (w's scale; m has spare digits), which DuckDB would compare
     // in a DECIMAL capped at 38 digits (divergence D13). Layout comments could hide a match.
     if (!q.features.Has(Feature::kLayout)) {
-      static const std::regex kDecimalMisuse(
+      static const std::regex decimal_misuse(
           R"re((sum|avg)\( ?"?[mw]"?\)|"?\b[mw]\b"? ?(\+|-|\*|/|%)|then "?[mw]\b|else "?[mw]\b|- "?[mw]\b)re");
-      EXPECT_FALSE(std::regex_search(sql, kDecimalMisuse)) << q.sql;
+      EXPECT_FALSE(std::regex_search(sql, decimal_misuse)) << q.sql;
     }
-    static const std::regex kLongFraction(R"re(\.[0-9]{11})re");
-    EXPECT_FALSE(std::regex_search(sql, kLongFraction)) << q.sql;
+    static const std::regex long_fraction(R"re(\.[0-9]{11})re");
+    EXPECT_FALSE(std::regex_search(sql, long_fraction)) << q.sql;
     // Doubles only get literals that both engines convert to the same value.
     EXPECT_FALSE(q.sql.contains("0.1000000000000000055511151231257827")) << q.sql;
     EXPECT_FALSE(q.sql.contains("it's")) << "quotes in string literals are doubled: " << q.sql;
@@ -182,17 +182,16 @@ TEST(QueryGenerator, DecimalLiteralsStayWithinTheColumnsDigits) {
                 .scale = 30}};
   auto gen = QueryGenerator::Make({t}, 5, {.supported = kSupportedFeatures, .target_percent = 0});
   ASSERT_TRUE(gen.has_value()) << gen.error();
-  static const std::regex kNumber(R"re([0-9]+(\.[0-9]+)?)re");
+  static const std::regex number_pattern(R"re([0-9]+(\.[0-9]+)?)re");
   int betweens = 0;
   for (uint64_t i = 0; i < 3000; ++i) {
     const std::string sql = Lower(gen->Generate(i).sql);
     betweens += sql.contains("between") ? 1 : 0;
     // Layout comments hold no digits; the table and column names none either.
-    for (auto it = std::sregex_iterator(sql.begin(), sql.end(), kNumber);
+    for (auto it = std::sregex_iterator(sql.begin(), sql.end(), number_pattern);
          it != std::sregex_iterator(); ++it) {
       const std::string number = it->str();
-      const std::size_t integer_digits =
-          number.find('.') == std::string::npos ? number.size() : number.find('.');
+      const std::size_t integer_digits = number.contains('.') ? number.find('.') : number.size();
       // LIMIT and OFFSET counts and select positions are small, the select constant 3000000000 is
       // no literal of n; every literal of n has at most 8 integer digits.
       if (number != "3000000000") {

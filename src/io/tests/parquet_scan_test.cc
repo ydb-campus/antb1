@@ -188,6 +188,16 @@ class ParquetScanTest : public ::testing::Test {
   fs::path dir_;
 };
 
+// Each value of a column as Arrow's scalar text ("null" for NULL).
+std::vector<std::string> Texts(const arrow::Table& table, int column) {
+  std::vector<std::string> out;
+  out.reserve(static_cast<std::size_t>(table.num_rows()));
+  for (int64_t r = 0; r < table.num_rows(); ++r) {
+    out.push_back(table.column(column)->GetScalar(r).ValueOrDie()->ToString());
+  }
+  return out;
+}
+
 std::vector<std::optional<int64_t>> Int64s(const arrow::Table& table, int column) {
   std::vector<std::optional<int64_t>> out;
   if (table.num_rows() == 0) {
@@ -540,11 +550,8 @@ TEST_F(ParquetScanTest, ReadsEveryDecimalStorage) {
         const Scanned s = Scan(**table, {0, 1, 2, 3, 4}, batch_size);
         ASSERT_NE(s.table, nullptr);
         for (int c = 0; c < 5; ++c) {
-          std::vector<std::string> got;
-          for (int64_t r = 0; r < s.table->num_rows(); ++r) {
-            got.push_back(s.table->column(c)->GetScalar(r).ValueOrDie()->ToString());
-          }
-          EXPECT_EQ(got, expected[static_cast<std::size_t>(c)]) << c << " " << batch_size;
+          EXPECT_EQ(Texts(*s.table, c), expected[static_cast<std::size_t>(c)])
+              << c << " " << batch_size;
         }
       }
     }
@@ -870,11 +877,7 @@ TEST_F(ParquetScanTest, ReadsByteArrayDecimals) {
   EXPECT_TRUE((*table)->schema()->field(0)->type()->Equals(*arrow::decimal128(9, 2)));
   const Scanned s = Scan(**table, {0}, 3);
   ASSERT_NE(s.table, nullptr);
-  std::vector<std::string> got;
-  for (int64_t r = 0; r < s.table->num_rows(); ++r) {
-    got.push_back(s.table->column(0)->GetScalar(r).ValueOrDie()->ToString());
-  }
-  EXPECT_EQ(got, (std::vector<std::string>{"123.45", "-0.05", "null", "999999.99"}));
+  EXPECT_EQ(Texts(*s.table, 0), (std::vector<std::string>{"123.45", "-0.05", "null", "999999.99"}));
 }
 
 // Statistics of a part (a row group) for skipping it: exact min, max and NULL count for

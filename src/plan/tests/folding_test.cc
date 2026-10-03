@@ -330,7 +330,10 @@ TEST_P(FoldDecimalTest, Folds) {
   if (c.kind == Predicate::Kind::kCompare) {
     EXPECT_EQ(p.op, c.op);
     EXPECT_EQ(Int128ToString(std::get<Int128>(p.constant.value)), Int128ToString(c.value));
-    EXPECT_EQ(p.constant.type, p.column->type);
+    ASSERT_TRUE(p.column.has_value());
+    if (p.column.has_value()) {
+      EXPECT_EQ(p.constant.type, p.column->type);
+    }
   }
 }
 
