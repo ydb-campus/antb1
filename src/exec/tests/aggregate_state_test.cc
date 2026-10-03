@@ -389,6 +389,40 @@ TEST_F(AggregateStateTest, MinMaxOfDatesUnsignedDoublesAndHugeInts) {
   EXPECT_EQ(Text(*huge), "-99999999999999999999");
 }
 
+// A DECIMAL(15,2) column of unscaled values; MIN and MAX keep the type, and the result carries its (p,s).
+TEST_F(AggregateStateTest, MinMaxAndCountDistinctOfDecimals) {
+  const LogicalType type = LogicalType::Decimal(15, 2);
+  arrow::Decimal128Builder builder(plan::ToArrow(type));
+  const std::vector<std::optional<int64_t>> unscaled = {1700, std::nullopt, -25, 1700,
+                                                        -99999999999999};
+  for (const std::optional<int64_t>& v : unscaled) {
+    ASSERT_TRUE((v.has_value() ? builder.Append(arrow::Decimal128(*v)) : builder.AppendNull()).ok());
+  }
+  const auto values = builder.Finish().ValueOrDie();
+  const auto selection = Bools({true, true, true, true, false});
+
+  auto min = Make(AggKind::kMin, type, type);
+  ASSERT_TRUE(min->Consume(*values, selection.get()).ok());
+  EXPECT_EQ(Text(*min), "-25");
+  EXPECT_TRUE(Result(*min)->type()->Equals(arrow::decimal128(15, 2)));
+  auto max = Make(AggKind::kMax, type, type);
+  ASSERT_TRUE(max->Consume(*values, nullptr).ok());
+  EXPECT_EQ(Text(*max), "1700");
+  auto distinct = Make(AggKind::kCountDistinct, type, LogicalType::kBigInt);
+  ASSERT_TRUE(distinct->Consume(*values, nullptr).ok());
+  EXPECT_EQ(Text(*distinct), "3");
+
+  // Only the input's own (p,s) is a MIN/MAX result; SUM and AVG of DECIMAL do not exist yet (D3).
+  const auto invalid = [](AggKind kind, LogicalType input, LogicalType result) {
+    return MakeAggregateState(kind, input, result).status().IsInvalid();
+  };
+  EXPECT_TRUE(invalid(AggKind::kMin, type, LogicalType::Decimal(18, 2)));
+  EXPECT_TRUE(invalid(AggKind::kMax, type, LogicalType::Decimal(15, 3)));
+  EXPECT_TRUE(invalid(AggKind::kSum, type, LogicalType::kHugeInt));
+  EXPECT_TRUE(invalid(AggKind::kSum, type, LogicalType::Decimal(38, 2)));
+  EXPECT_TRUE(invalid(AggKind::kAvg, type, LogicalType::kDouble));
+}
+
 // One batch of DOUBLE values and its selection (empty: every row).
 struct DoubleBatch {
   std::vector<std::optional<double>> values;
