@@ -94,8 +94,10 @@ not chain: `a = b = c` and `a BETWEEN 1 AND 2 = b` are unsupported; the bounds o
 unary `-`, `::`; binary operators are left-associative, and parentheses group. An expression may be at most 256 levels
 deep (operators or parentheses; the top-level `AND` chain of `WHERE` and `HAVING` does not count), else it is
 unsupported. A `::` and a unary `-` count one level more, as they do in the canonical form `CAST(x AS T)` and `-(x)` (a
-`-` before a parenthesized operand does not). Aggregates are allowed in the select list, `HAVING` and `ORDER BY`, and
-cannot be nested.
+`-` before a parenthesized operand does not), and so does a `NOT` that is the right operand of a comparison or of
+arithmetic, a `LIKE` pattern or a `BETWEEN` bound (`a = NOT b` is `a = (NOT b)`). The canonical form writes a `WHERE` or
+`HAVING` predicate with a top-level `OR` without parentheses, so it reads back as it was parsed. Aggregates are allowed
+in the select list, `HAVING` and `ORDER BY`, and cannot be nested.
 
 Lexical rules: an `identifier` is a letter or `_` followed by letters, digits or `_`, or any text in double quotes
 (`""` escapes a quote); a `string_literal` is text in single quotes (`''` escapes a quote); an `integer` is a

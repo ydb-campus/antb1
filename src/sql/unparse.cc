@@ -179,8 +179,16 @@ std::string Sql(const Expr& expr) {
 }
 
 // A predicate split into conjuncts; a conjunct that is itself an AND or OR is parenthesized, so it
-// reads back as one conjunct.
+// reads back as one conjunct. A sole conjunct other than an AND (the parser's form of a predicate
+// with a top-level OR) is written bare: it reads back the way it was parsed, so its canonical form
+// is no deeper than the input.
 std::string Conjuncts(const std::vector<Expr>& conjuncts) {
+  if (conjuncts.size() == 1) {
+    const auto* binary = std::get_if<BinaryExpr>(&conjuncts.front());
+    if (binary == nullptr || binary->op != BinaryOp::kAnd) {
+      return Sql(conjuncts.front(), kOr);
+    }
+  }
   std::string out;
   for (std::size_t i = 0; i < conjuncts.size(); ++i) {
     out += (i == 0 ? "" : " AND ") + Sql(conjuncts[i], kNot);

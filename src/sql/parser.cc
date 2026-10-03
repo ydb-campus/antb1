@@ -49,9 +49,11 @@
 // The parser keeps expressions as written; what the engine answers is the binder's decision. The
 // WHERE and HAVING predicates are split at their top-level AND chain, collected in a loop.
 // Recursion is bounded: every level of an expression tree (but that chain) counts against
-// kMaxDepth, and so do the levels that the canonical form of a cast or a unary minus adds (ToSql
-// writes x::T as CAST(x AS T) and -x as -(x)). Tokens are pulled lazily from the lexer (at most
-// three tokens of lookahead), so work and memory stop at the first error whatever the input.
+// kMaxDepth, and so do the levels that the canonical form of a cast, a unary minus or a NOT
+// operand adds (ToSql writes x::T as CAST(x AS T), -x as -(x) and a = NOT b as a = (NOT b)); a
+// predicate with a top-level OR is written bare, so it reads back as it was parsed. Tokens are
+// pulled lazily from the lexer (at most three tokens of lookahead), so work and memory stop at the
+// first error whatever the input.
 // Recognized SQL outside the grammar yields kUnsupported at its first offending token and names the
 // construct; anything else yields kSyntax. A lexer error among the tokens the parser looked at wins
 // over the parser's own verdict, which may have been reached on the placeholder end-of-input token.
@@ -643,7 +645,7 @@ class Parser {
     if (auto error = Deeper(); error.has_value()) {
       return std::unexpected(std::move(*error));
     }
-    auto lhs = ParsePrefix(context);
+    auto lhs = ParsePrefix(context, min_precedence);
     if (!lhs) {
       return lhs;
     }
@@ -771,14 +773,25 @@ class Parser {
     return Expr(std::move(in));
   }
 
-  // NOT expr, - expr, or a primary expression.
-  Expected<Expr> ParsePrefix(Context context) {
+  // NOT expr, - expr, or a primary expression, in a frame that binds at `min_precedence`.
+  Expected<Expr> ParsePrefix(Context context, int min_precedence) {
     const Token& token = Peek();
     if (token.IsKeyword("NOT")) {
       const SourceSpan op = Take().span;
+      // Where NOT binds tighter than NOT does (the right operand of a comparison or of arithmetic,
+      // a LIKE pattern, a BETWEEN bound), ToSql writes (NOT x): one level more, unless a unary
+      // minus already wraps it as -(NOT x).
+      const bool wrapped = min_precedence > kNotPrecedence && !minus_operand_;
+      minus_operand_ = false;
+      const std::size_t outer_peak = std::exchange(peak_, depth_);
       auto operand = ParseExpr(context, kNotPrecedence);
       if (!operand) {
         return operand;
+      }
+      if (!wrapped) {
+        peak_ = std::max(outer_peak, peak_);
+      } else if (auto error = CanonicalLevel(outer_peak, op); error.has_value()) {
+        return std::unexpected(std::move(*error));
       }
       const SourceSpan span = Cover(op, operand->span());
       return Expr(UnaryExpr{.op = UnaryOp::kNot,
@@ -786,6 +799,7 @@ class Parser {
                             .op_span = op,
                             .span = span});
     }
+    minus_operand_ = false;
     if (token.kind == TokenKind::kMinus) {
       const TokenKind next = PeekAt(1).kind;
       // -1::INTEGER is -(CAST(1 AS INTEGER)), as in DuckDB: '::' binds tighter than the minus.
@@ -802,7 +816,9 @@ class Parser {
       const bool open = Peek().kind == TokenKind::kLeftParen;
       const std::size_t open_offset = Peek().span.offset;
       const std::size_t outer_peak = std::exchange(peak_, depth_);
+      minus_operand_ = true;
       auto operand = ParseExpr(context, kUnaryPrecedence);
+      minus_operand_ = false;
       if (!operand) {
         return operand;
       }
@@ -1699,6 +1715,7 @@ class Parser {
   std::size_t last_end_ = 0;
   std::size_t depth_ = 0;  // levels of the expression being parsed
   std::size_t peak_ = 0;   // the deepest level reached, with the levels the canonical form adds
+  bool minus_operand_ = false;  // the next prefix is a unary minus's operand, which -(x) wraps
 };
 
 }  // namespace
