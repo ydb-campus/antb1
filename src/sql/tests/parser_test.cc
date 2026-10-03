@@ -1,5 +1,6 @@
 #include "antb1/sql/parser.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -773,27 +774,52 @@ TEST(ParserTest, ExpressionDepthIsLimited) {
 // error. 0 when none up to `max` is rejected.
 std::size_t FirstTooDeep(const std::function<std::string(std::size_t)>& sql,
                          std::size_t max = 400) {
-  std::size_t first = 0;
-  for (std::size_t n = 1; n <= max; ++n) {
-    const std::string text = sql(n);
-    auto stmt = Parse(text);
-    if (first != 0) {
-      EXPECT_FALSE(stmt.has_value()) << "accepted after a rejection: n=" << n;
+  const auto accepted = [&](std::size_t n) { return Parse(sql(n)).has_value(); };
+  // Acceptance shrinks as n grows: find the first rejected n by bisection (a sweep of every n
+  // costs quadratic time, too slow under the sanitizers), then check the window around it and a
+  // sample below it.
+  if (accepted(max)) {
+    ADD_FAILURE() << "nothing rejected up to n=" << max;
+    return 0;
+  }
+  std::size_t lo = 0;    // accepted, or 0
+  std::size_t hi = max;  // rejected
+  while (hi - lo > 1) {
+    const std::size_t mid = lo + ((hi - lo) / 2);
+    (accepted(mid) ? lo : hi) = mid;
+  }
+  const std::size_t first = hi;
+  for (std::size_t n = first; n <= std::min(max, first + 3); ++n) {
+    auto stmt = Parse(sql(n));
+    if (stmt.has_value()) {
+      ADD_FAILURE() << "accepted after a rejection: n=" << n;
       continue;
     }
+    EXPECT_EQ(stmt.error().kind, ParseError::Kind::kUnsupported) << stmt.error().message;
+    EXPECT_TRUE(stmt.error().message.starts_with("expressions deeper than 256 levels"))
+        << stmt.error().message;
+  }
+  std::vector<std::size_t> below;
+  for (std::size_t n = 1; n < first; n = (n * 2) + 1) {
+    below.push_back(n);
+  }
+  for (std::size_t n = first > 4 ? first - 4 : 1; n < first; ++n) {
+    below.push_back(n);
+  }
+  for (const std::size_t n : below) {
+    auto stmt = Parse(sql(n));
     if (!stmt.has_value()) {
-      EXPECT_EQ(stmt.error().kind, ParseError::Kind::kUnsupported) << stmt.error().message;
-      EXPECT_TRUE(stmt.error().message.starts_with("expressions deeper than 256 levels"))
-          << stmt.error().message;
-      first = n;
+      ADD_FAILURE() << "rejected below the first rejection " << first << ": n=" << n << ": "
+                    << stmt.error().message;
       continue;
     }
+    EXPECT_LE(Depth(*stmt), kMaxExpressionDepth) << "n=" << n;
     const std::string canonical = ToSql(*stmt);
     auto again = Parse(canonical);
     if (!again.has_value()) {
       ADD_FAILURE() << "n=" << n
                     << ": the canonical form does not parse: " << again.error().message;
-      return 0;
+      continue;
     }
     EXPECT_TRUE(EqualIgnoringSpans(*stmt, *again)) << "n=" << n;
     EXPECT_EQ(ToSql(*again), canonical) << "n=" << n;
@@ -906,6 +932,53 @@ TEST(ParserTest, CanonicalFormStaysWithinTheDepthLimit) {
     const std::size_t bare = FirstTooDeep(f.bare);
     EXPECT_NE(bare, 0U) << f.name;
     EXPECT_EQ(bare, FirstTooDeep(f.parenthesized)) << f.name;
+  }
+}
+
+// Every level of the tree counts, also where a chain's operators push its left operand (and its
+// earlier right operands) down: without parentheses or casts, the deepest accepted tree has exactly
+// kMaxExpressionDepth levels.
+TEST(ParserTest, OperatorChainsCountTheirOperandsDepth) {
+  const auto calls = [](std::size_t k) { return Repeat("f(", k) + "a" + std::string(k, ')'); };
+  const auto select = [](const std::string& expr) { return "SELECT " + expr + " FROM t"; };
+  const auto where = [](const std::string& predicate) {
+    return "SELECT a FROM t WHERE " + predicate;
+  };
+  const auto having = [](const std::string& predicate) {
+    return "SELECT a FROM t GROUP BY a HAVING " + predicate;
+  };
+  const std::vector<std::pair<std::string_view, std::function<std::string(std::size_t)>>> exact = {
+      {"deep left operand", [&](std::size_t n) { return select(calls(200) + Repeat(" + 1", n)); }},
+      {"deep early right operand",
+       [&](std::size_t n) { return select("a + " + calls(200) + Repeat(" + 1", n)); }},
+      {"long chain, deep last operand",
+       [&](std::size_t n) { return select("a" + Repeat(" + 1", 100) + " + " + calls(n)); }},
+      {"deep conjunct, ANDs, OR",
+       [&](std::size_t n) { return where(calls(200) + " = 1" + Repeat(" AND a", n) + " OR b"); }},
+      {"ANDs, deep conjunct, OR",
+       [&](std::size_t n) { return where(Repeat("a AND ", n) + calls(200) + " = 1 OR b"); }},
+      {"OR chain after a deep conjunct",
+       [&](std::size_t n) { return having(calls(200) + " = 1" + Repeat(" OR a = 1", n)); }},
+  };
+  for (const auto& [name, sql] : exact) {
+    const std::size_t first = FirstTooDeep(sql);
+    ASSERT_GT(first, 1U) << name;
+    auto deepest = Parse(sql(first - 1));
+    ASSERT_TRUE(deepest.has_value()) << name;
+    EXPECT_EQ(Depth(*deepest), kMaxExpressionDepth) << name;
+  }
+  // Parentheses, casts and minuses count levels that are no nodes: those trees stay shallower.
+  for (const auto& sql : std::vector<std::function<std::string(std::size_t)>>{
+           [](std::size_t n) {
+             std::string text = "SELECT " + std::string(n, '(') + "a";
+             for (std::size_t i = 0; i < n; ++i) {
+               text += ")" + Repeat(" + 1", n);
+             }
+             return text + " FROM t";
+           },
+           [&](std::size_t n) { return select("-" + calls(100) + "::INT" + Repeat(" * 2", n)); },
+       }) {
+    EXPECT_NE(FirstTooDeep(sql), 0U);
   }
 }
 

@@ -294,4 +294,11 @@ std::string_view ToString(NullsOrder nulls);  // "", "NULLS FIRST" or "NULLS LAS
 bool EqualIgnoringSpans(const Expr& a, const Expr& b);
 bool EqualIgnoringSpans(const SelectStatement& a, const SelectStatement& b);
 
+// The levels of an expression tree: the nodes on its longest path from the root to a leaf (a leaf
+// alone is 1). The parser accepts no tree deeper than kMaxExpressionDepth (parser.h).
+std::size_t Depth(const Expr& expr);
+// The deepest expression tree of a statement (its select items, WHERE and HAVING conjuncts and
+// GROUP BY and ORDER BY items); 0 when it has none.
+std::size_t Depth(const SelectStatement& stmt);
+
 }  // namespace antb1::sql

@@ -226,6 +226,14 @@ antb1_add_cli_golden(
   STDERR
   ARGS explain -c "SELECT DISTINCT WatchID FROM t LIMIT 10" --table "${_t}"
 )
+# Nested parentheses, each closed by a chain of 120 operators: a tree thousands of levels deep that the depth
+# limit once let through (it overflowed the stack); now the depth error at the operator that is too deep.
+antb1_add_cli_golden(
+  unsupported_deep_operator_chains
+  EXIT_CODE 4
+  STDERR
+  ARGS explain -f "${_sql}/deep_operator_chains.sql" --table "${_t}"
+)
 antb1_add_cli_golden(
   unsupported_where
   EXIT_CODE 4

@@ -78,7 +78,7 @@ constexpr int kMultiplicativePrecedence = 6;
 constexpr int kUnaryPrecedence = 7;
 
 // The deepest expression tree the parser builds.
-constexpr std::size_t kMaxDepth = 256;
+constexpr std::size_t kMaxDepth = kMaxExpressionDepth;
 
 struct Construct {
   std::string_view keyword;
@@ -633,11 +633,25 @@ class Parser {
     return std::nullopt;
   }
 
-  // An expression whose operators all bind at least as tightly as `min_precedence`.
+  // A new root over a subtree whose deepest level was `lower_peak`, next to what was parsed since
+  // (whose peak is the current one): the subtree moves one level down. The depth error at `span`
+  // when that is too deep.
+  std::optional<ParseError> Lifted(std::size_t lower_peak, SourceSpan span) {
+    if (lower_peak + 1 > kMaxDepth) {
+      return DepthError(span);
+    }
+    peak_ = std::max(lower_peak + 1, peak_);
+    return std::nullopt;
+  }
+
+  // An expression whose operators all bind at least as tightly as `min_precedence`, one level
+  // below the current one; afterwards the peak includes its tree.
   Expected<Expr> ParseExpr(Context context, int min_precedence = kOrPrecedence) {
     const std::size_t depth = depth_;
+    const std::size_t outer_peak = peak_;
     auto result = ParseExprAtDepth(context, min_precedence);
     depth_ = depth;
+    peak_ = std::max(outer_peak, peak_);
     return result;
   }
 
@@ -645,6 +659,7 @@ class Parser {
     if (auto error = Deeper(); error.has_value()) {
       return std::unexpected(std::move(*error));
     }
+    peak_ = depth_;  // the deepest level of this frame's tree so far
     auto lhs = ParsePrefix(context, min_precedence);
     if (!lhs) {
       return lhs;
@@ -657,12 +672,20 @@ class Parser {
       if (precedence == 0 || precedence < min_precedence) {
         return lhs;
       }
-      // One more level for the operator; the right operand's own check (one level deeper) reports
-      // a tree that gets too deep.
-      ++depth_;
+      // The operator becomes the root at this level: the tree so far moves one level down, and
+      // the right operand is parsed as its child (one level deeper).
+      const SourceSpan op = Peek().span;
+      const std::size_t lhs_peak = peak_;
+      if (lhs_peak + 1 > kMaxDepth) {
+        return std::unexpected(DepthError(op));  // before the right operand: the first error wins
+      }
+      peak_ = depth_;
       auto combined = ParseInfix(context, *std::move(lhs), precedence);
       if (!combined) {
         return combined;
+      }
+      if (auto error = Lifted(lhs_peak, op); error.has_value()) {
+        return std::unexpected(std::move(*error));
       }
       lhs = std::move(combined);
       // Comparisons do not chain (a = b = c), as in PostgreSQL.
@@ -1338,38 +1361,55 @@ class Parser {
   // its left operand and the whole predicate is one conjunct.
   Status ParseConjuncts(Context context, std::vector<Expr>& out) {
     const std::size_t depth = depth_;
+    const std::size_t outer_peak = peak_;
     auto status = ParseConjunctsAtDepth(context, out);
     depth_ = depth;
+    peak_ = std::max(outer_peak, peak_);
     return status;
   }
 
   Status ParseConjunctsAtDepth(Context context, std::vector<Expr>& out) {
+    // Each conjunct is its own tree, one level below the clause; its peak is kept in case an OR
+    // makes the chain one tree.
     std::vector<Expr> chain;
+    std::vector<std::size_t> peaks;
     while (true) {
+      peak_ = depth_;
       auto conjunct = ParseExpr(context, kNotPrecedence);
       if (!conjunct) {
         return std::unexpected(std::move(conjunct.error()));
       }
       chain.push_back(*std::move(conjunct));
+      peaks.push_back(peak_);
       if (!Peek().IsKeyword("AND")) {
         break;
       }
       Take();
     }
     if (!Peek().IsKeyword("OR")) {
+      peak_ = std::ranges::max(peaks);
       std::ranges::move(chain, std::back_inserter(out));
       return {};
     }
-    auto lhs = Conjunction(std::move(chain));
+    auto lhs = Conjunction(std::move(chain), peaks);
     if (!lhs) {
       return std::unexpected(std::move(lhs.error()));
     }
     while (Peek().IsKeyword("OR")) {
-      ++depth_;  // checked by the right operand, one level deeper
       const Token op = Take();
+      // Like the AND chain: each OR is the new root one level below the clause, over the tree so
+      // far and its right operand, both one level down.
+      const std::size_t lhs_peak = peak_;
+      if (lhs_peak + 1 > kMaxDepth) {
+        return std::unexpected(DepthError(op.span));  // before the right operand: first error wins
+      }
+      peak_ = depth_;
       auto rhs = ParseExpr(context, kAndPrecedence);
       if (!rhs) {
         return std::unexpected(std::move(rhs.error()));
+      }
+      if (auto error = Lifted(std::max(lhs_peak, peak_), op.span); error.has_value()) {
+        return std::unexpected(std::move(*error));
       }
       const SourceSpan span = Cover(lhs->span(), rhs->span());
       lhs = Expr(BinaryExpr{.op = BinaryOp::kOr,
@@ -1382,11 +1422,15 @@ class Parser {
     return {};
   }
 
-  // The AND of `chain` as a left-deep tree; every AND counts against the depth limit.
-  Expected<Expr> Conjunction(std::vector<Expr> chain) {
+  // The AND of `chain` as a left-deep tree, from the conjuncts' peaks (`peaks`): each AND is the
+  // new root one level below the clause, over the tree so far and the next conjunct, both one
+  // level down. Leaves the tree's peak.
+  Expected<Expr> Conjunction(std::vector<Expr> chain, const std::vector<std::size_t>& peaks) {
     Expr tree = std::move(chain.front());
+    peak_ = peaks.front();
     for (std::size_t i = 1; i < chain.size(); ++i) {
-      if (auto error = Deeper(); error.has_value()) {
+      const std::size_t lower = std::max(peak_, peaks[i]);
+      if (auto error = Lifted(lower, chain[i].span()); error.has_value()) {
         return std::unexpected(std::move(*error));
       }
       const SourceSpan span = Cover(tree.span(), chain[i].span());
