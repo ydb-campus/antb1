@@ -26,6 +26,7 @@
 #include "antb1/exec/table_scan.h"
 #include "antb1/plan/explain.h"
 #include "antb1/plan/logical_plan.h"
+#include "antb1/plan/sql_status.h"
 
 #include "parallel_compute.h"
 #include "part_operators.h"
@@ -50,7 +51,8 @@ OperatorResult Build(const plan::LogicalNodePtr& node, std::optional<int64_t> pa
 OperatorResult Profiled(OperatorResult op, const plan::LogicalNodePtr& node, ProfileNode* slot);
 
 // The scan at the bottom of a part pipeline, a chain of streaming nodes over a scan; nullptr if
-// `node` is not the top of one.
+// `node` is not the top of one. A Join ends the chain, as does any node but Filter, Compute and
+// Project; so do FiltersOnScan and LateSplit.
 const plan::ScanNode* PipelineScan(const plan::LogicalNodePtr& node) {
   const plan::LogicalNode* n = node.get();
   while (n != nullptr) {
@@ -517,6 +519,11 @@ struct Builder {
     }
     Name("RowCount");
     return std::make_unique<RowCountOperator>("count_star()", *rows);
+  }
+  OperatorResult operator()(const plan::JoinNode& node) const {
+    // Exit code 4 until the hash join (ADR 0022: J1b for inner joins, E2 for the other kinds).
+    return plan::UnsupportedError(
+        std::format("{} joins are not supported yet", plan::ToString(node.kind)), node.span);
   }
 };
 

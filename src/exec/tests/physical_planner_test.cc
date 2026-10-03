@@ -5,6 +5,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -452,6 +453,70 @@ TEST_F(PhysicalPlannerTest, LateScansAreFiltered) {
     }
     EXPECT_EQ(table->filtered_scans() > 0, pushdown);
   }
+}
+
+// No operator answers a join until the hash join (J1b, E2): every kind is rejected with exit code
+// 4, at the join's span, also below every other node (PipelineScan, FiltersOnScan and LateSplit
+// stop at a join, so no part pipeline runs over one).
+TEST_F(PhysicalPlannerTest, JoinsAreUnsupported) {
+  const auto table = Table(/*split=*/true);
+  const auto scan = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}});
+  const plan::BoundColumn x{.index = 0, .name = "x", .type = LogicalType::kBigInt};
+  const SourceSpan span{.offset = 7, .length = 4};
+  const auto join_of = [&](plan::JoinKind kind) {
+    return Node(plan::JoinNode{.kind = kind,
+                               .left = scan,
+                               .right = scan,
+                               .keys = {plan::JoinKey{.left = x, .right = x}},
+                               .residual = {},
+                               .build = plan::BuildSide::kRight,
+                               .span = span});
+  };
+  const auto expect_unsupported = [&](const plan::LogicalNodePtr& root, std::string_view kind) {
+    const auto status = BuildPhysicalPlan(PlanOf(root)).status();
+    const auto detail = plan::GetSqlError(status);
+    ASSERT_NE(detail, nullptr) << plan::NodeName(*root) << ": " << status.ToString();
+    EXPECT_EQ(detail->kind(), plan::SqlErrorDetail::Kind::kUnsupported);
+    EXPECT_EQ(detail->span(), span);
+    EXPECT_EQ(status.message(), std::string(kind) + " joins are not supported yet");
+  };
+  for (const auto& [kind, name] :
+       {std::pair{plan::JoinKind::kInner, "INNER"}, std::pair{plan::JoinKind::kLeft, "LEFT"},
+        std::pair{plan::JoinKind::kSemi, "SEMI"}, std::pair{plan::JoinKind::kAnti, "ANTI"},
+        std::pair{plan::JoinKind::kNullAwareAnti, "NULL-AWARE ANTI"},
+        std::pair{plan::JoinKind::kOneRow, "ONE-ROW"}}) {
+    expect_unsupported(join_of(kind), name);
+  }
+
+  const auto join = join_of(plan::JoinKind::kInner);
+  const auto is_not_null = plan::Predicate{.kind = plan::Predicate::Kind::kIsNotNull, .column = x};
+  const auto filter = Node(plan::FilterNode{.input = join, .predicates = {is_not_null}});
+  const auto sort = Node(plan::SortNode{.input = join, .keys = {plan::SortKey{.column = x}}});
+  const plan::AggregateCall sum{.kind = plan::AggKind::kSum, .arg = x};
+  const plan::AggregateCall distinct{.kind = plan::AggKind::kCountDistinct, .arg = x};
+  const auto one = std::make_shared<const plan::Expr>(
+      plan::Expr{.node = plan::ConstantExpr{.value = plan::Constant{}}, .name = "1"});
+  for (const plan::LogicalNodePtr& root : {
+           filter,
+           Node(plan::ComputeNode{.input = join, .exprs = {one}}),
+           Node(plan::ProjectNode{.input = join, .columns = {x}}),
+           Node(plan::AggregateNode{.input = join, .aggregates = {sum}}),
+           Node(plan::AggregateNode{.input = filter, .aggregates = {sum}}),
+           Node(plan::AggregateNode{.input = join, .aggregates = {distinct}}),
+           Node(plan::GroupAggregateNode{.input = join, .keys = {x}, .aggregates = {sum}}),
+           Node(plan::GroupAggregateNode{.input = filter, .keys = {x}, .aggregates = {sum}}),
+           sort,
+           Node(plan::LimitNode{.input = join, .limit = 3}),
+           Node(plan::LimitNode{.input = filter, .limit = 3}),
+           Node(plan::LimitNode{.input = sort, .limit = 3}),
+       }) {
+    expect_unsupported(root, "INNER");
+  }
+  // With a profile too.
+  ProfileNode profile;
+  const auto profiled = plan::GetSqlError(BuildPhysicalPlan(PlanOf(filter), &profile).status());
+  ASSERT_NE(profiled, nullptr);
+  EXPECT_EQ(profiled->kind(), plan::SqlErrorDetail::Kind::kUnsupported);
 }
 
 TEST_F(PhysicalPlannerTest, MalformedPlansAreInvalidNotUnsupported) {

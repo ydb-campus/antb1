@@ -65,18 +65,55 @@ struct NodeNameOf {
   std::string_view operator()(const SortNode& /*node*/) const { return "Sort"; }
   std::string_view operator()(const LimitNode& /*node*/) const { return "Limit"; }
   std::string_view operator()(const RowCountNode& /*node*/) const { return "RowCount"; }
+  std::string_view operator()(const JoinNode& /*node*/) const { return "Join"; }
 };
 
-struct InputOfNode {
-  const LogicalNodePtr* operator()(const ScanNode& /*node*/) const { return nullptr; }
-  const LogicalNodePtr* operator()(const FilterNode& node) const { return &node.input; }
-  const LogicalNodePtr* operator()(const ComputeNode& node) const { return &node.input; }
-  const LogicalNodePtr* operator()(const ProjectNode& node) const { return &node.input; }
-  const LogicalNodePtr* operator()(const AggregateNode& node) const { return &node.input; }
-  const LogicalNodePtr* operator()(const GroupAggregateNode& node) const { return &node.input; }
-  const LogicalNodePtr* operator()(const SortNode& node) const { return &node.input; }
-  const LogicalNodePtr* operator()(const LimitNode& node) const { return &node.input; }
-  const LogicalNodePtr* operator()(const RowCountNode& /*node*/) const { return nullptr; }
+struct InputsOfNode {
+  std::vector<LogicalNodePtr> operator()(const ScanNode& /*node*/) const { return {}; }
+  std::vector<LogicalNodePtr> operator()(const FilterNode& node) const { return {node.input}; }
+  std::vector<LogicalNodePtr> operator()(const ComputeNode& node) const { return {node.input}; }
+  std::vector<LogicalNodePtr> operator()(const ProjectNode& node) const { return {node.input}; }
+  std::vector<LogicalNodePtr> operator()(const AggregateNode& node) const { return {node.input}; }
+  std::vector<LogicalNodePtr> operator()(const GroupAggregateNode& node) const {
+    return {node.input};
+  }
+  std::vector<LogicalNodePtr> operator()(const SortNode& node) const { return {node.input}; }
+  std::vector<LogicalNodePtr> operator()(const LimitNode& node) const { return {node.input}; }
+  std::vector<LogicalNodePtr> operator()(const RowCountNode& /*node*/) const { return {}; }
+  std::vector<LogicalNodePtr> operator()(const JoinNode& node) const {
+    return {node.left, node.right};
+  }
+};
+
+// A copy of a node over `inputs` (as many as InputsOfNode returns).
+struct WithInputsOfNode {
+  std::vector<LogicalNodePtr>& inputs;
+
+  template <class Node>
+  LogicalNodePtr Single(Node node) const {
+    node.input = std::move(inputs[0]);
+    return std::make_shared<const LogicalNode>(std::move(node));
+  }
+
+  LogicalNodePtr operator()(const ScanNode& node) const {
+    return std::make_shared<const LogicalNode>(node);
+  }
+  LogicalNodePtr operator()(const FilterNode& node) const { return Single(node); }
+  LogicalNodePtr operator()(const ComputeNode& node) const { return Single(node); }
+  LogicalNodePtr operator()(const ProjectNode& node) const { return Single(node); }
+  LogicalNodePtr operator()(const AggregateNode& node) const { return Single(node); }
+  LogicalNodePtr operator()(const GroupAggregateNode& node) const { return Single(node); }
+  LogicalNodePtr operator()(const SortNode& node) const { return Single(node); }
+  LogicalNodePtr operator()(const LimitNode& node) const { return Single(node); }
+  LogicalNodePtr operator()(const RowCountNode& node) const {
+    return std::make_shared<const LogicalNode>(node);
+  }
+  LogicalNodePtr operator()(const JoinNode& node) const {
+    JoinNode out = node;
+    out.left = std::move(inputs[0]);
+    out.right = std::move(inputs[1]);
+    return std::make_shared<const LogicalNode>(std::move(out));
+  }
 };
 
 }  // namespace
@@ -296,6 +333,34 @@ std::string_view ToString(Function function) {
   return "?";
 }
 
+std::string_view ToString(JoinKind kind) {
+  switch (kind) {
+    case JoinKind::kInner:
+      return "INNER";
+    case JoinKind::kLeft:
+      return "LEFT";
+    case JoinKind::kSemi:
+      return "SEMI";
+    case JoinKind::kAnti:
+      return "ANTI";
+    case JoinKind::kNullAwareAnti:
+      return "NULL-AWARE ANTI";
+    case JoinKind::kOneRow:
+      return "ONE-ROW";
+  }
+  return "?";
+}
+
+std::string_view ToString(BuildSide side) {
+  switch (side) {
+    case BuildSide::kLeft:
+      return "left";
+    case BuildSide::kRight:
+      return "right";
+  }
+  return "?";
+}
+
 std::string_view ToString(AggKind kind) {
   switch (kind) {
     case AggKind::kCountStar:
@@ -379,7 +444,14 @@ SourceSpan SpanOf(const LogicalNode& node) {
   return std::visit([](const auto& n) { return n.span; }, node);
 }
 
-const LogicalNodePtr* InputOf(const LogicalNode& node) { return std::visit(InputOfNode{}, node); }
+std::vector<LogicalNodePtr> InputsOf(const LogicalNode& node) {
+  return std::visit(InputsOfNode{}, node);
+}
+
+LogicalNodePtr WithInputs(const LogicalNode& node, std::vector<LogicalNodePtr> inputs) {
+  ANTB1_CHECK(inputs.size() == InputsOf(node).size());
+  return std::visit(WithInputsOfNode{.inputs = inputs}, node);
+}
 
 namespace {
 
@@ -389,6 +461,23 @@ std::vector<ColumnId> CallIds(std::vector<ColumnId> ids, const std::vector<Aggre
     ids.push_back(call.id);
   }
   return ids;
+}
+
+// The output ids of a join of `kind` over inputs with these output ids.
+std::vector<ColumnId> JoinIds(JoinKind kind, std::vector<ColumnId> left,
+                              const std::vector<ColumnId>& right) {
+  switch (kind) {
+    case JoinKind::kInner:
+    case JoinKind::kLeft:
+    case JoinKind::kOneRow:
+      left.insert(left.end(), right.begin(), right.end());
+      return left;
+    case JoinKind::kSemi:
+    case JoinKind::kAnti:
+    case JoinKind::kNullAwareAnti:
+      return left;
+  }
+  return left;
 }
 
 struct OutputIdsOf {
@@ -409,6 +498,9 @@ struct OutputIdsOf {
   std::vector<ColumnId> operator()(const SortNode& node) const { return OutputIds(*node.input); }
   std::vector<ColumnId> operator()(const LimitNode& node) const { return OutputIds(*node.input); }
   std::vector<ColumnId> operator()(const RowCountNode& node) const { return {node.id}; }
+  std::vector<ColumnId> operator()(const JoinNode& node) const {
+    return JoinIds(node.kind, OutputIds(*node.left), OutputIds(*node.right));
+  }
 };
 
 std::string IdText(ColumnId id) { return std::format("#{}", std::to_underlying(id)); }
@@ -648,6 +740,56 @@ class Resolver {
   Resolved Visit(const LogicalNodePtr& self, const RowCountNode& count) {
     Define("RowCount", count.id);
     return {.node = self, .ids = {count.id}};
+  }
+
+  // Keys resolve against their own input, residual columns against the left input's ids, then
+  // the right input's.
+  Resolved Visit(const LogicalNodePtr& self, const JoinNode& join) {
+    Resolved left = Walk(join.left);
+    Resolved right = Walk(join.right);
+    const bool one_row = join.kind == JoinKind::kOneRow;
+    if (one_row && !join.keys.empty()) {
+      Fail(std::format("Join: {} join with {} keys", ToString(join.kind), join.keys.size()));
+    } else if (!one_row && join.keys.empty()) {
+      Fail(std::format("Join: {} join without keys", ToString(join.kind)));
+    }
+    if (join.build == BuildSide::kLeft && join.kind != JoinKind::kInner) {
+      Fail(std::format("Join: {} join builds on its left input", ToString(join.kind)));
+    }
+    JoinNode out = join;
+    bool changed = left.node != join.left || right.node != join.right;
+    out.left = left.node;
+    out.right = right.node;
+    for (JoinKey& key : out.keys) {
+      if (key.left.type != key.right.type) {
+        Fail(std::format("Join: key {} = {} has two types, {} and {}", IdText(key.left.id),
+                         IdText(key.right.id), ToString(key.left.type), ToString(key.right.type)));
+      }
+      if (Resolve("Join", key.left, left.ids)) {
+        changed = true;
+      }
+      if (Resolve("Join", key.right, right.ids)) {
+        changed = true;
+      }
+    }
+    std::vector<ColumnId> both = left.ids;
+    both.insert(both.end(), right.ids.begin(), right.ids.end());
+    for (ExprPtr& conjunct : out.residual) {
+      if (conjunct->type != LogicalType::kBoolean) {
+        Fail(std::format("Join: a residual of type {}", ToString(conjunct->type)));
+      }
+      ExprPtr resolved = MapColumns(conjunct, [&](const ColumnExpr& column) {
+        ColumnExpr leaf = column;
+        Resolve("Join", leaf.index, leaf.id, both);
+        return leaf;
+      });
+      if (resolved != conjunct) {
+        conjunct = std::move(resolved);
+        changed = true;
+      }
+    }
+    return {.node = changed ? MakeNode(std::move(out)) : self,
+            .ids = JoinIds(join.kind, std::move(left.ids), right.ids)};
   }
 
   std::set<ColumnId> defined_;

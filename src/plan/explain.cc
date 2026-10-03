@@ -36,14 +36,22 @@ std::string Join(const std::vector<T>& items, const F& render, std::string_view 
   return out;
 }
 
+// A column as qualifier.name, or its name alone without a qualifier.
+std::string ColumnName(const BoundColumn& column) {
+  if (column.qualifier.empty()) {
+    return Name(column.name);
+  }
+  return Name(column.qualifier) + "." + Name(column.name);
+}
+
 std::string PredicateText(const Predicate& p) {
-  std::string column = p.column.has_value() ? Name(p.column->name) : "?";
+  std::string column = p.column.has_value() ? ColumnName(*p.column) : "?";
   switch (p.kind) {
     case Predicate::Kind::kCompare:
       return std::format("{} {} {}", column, ToString(p.op), ToString(p.constant));
     case Predicate::Kind::kCompareColumns:
       return std::format("{} {} {}", column, ToString(p.op),
-                         p.other.has_value() ? Name(p.other->name) : "?");
+                         p.other.has_value() ? ColumnName(*p.other) : "?");
     case Predicate::Kind::kLike:
       return std::format("{} LIKE {}", column, ToString(p.constant));
     case Predicate::Kind::kNotLike:
@@ -72,13 +80,12 @@ std::string AggregateText(const AggregateCall& call) {
     return "COUNT(*)";
   }
   return std::format("{}({}{})", ToString(call.kind),
-                     call.kind == AggKind::kCountDistinct ? "DISTINCT " : "", Name(call.arg->name));
+                     call.kind == AggKind::kCountDistinct ? "DISTINCT " : "",
+                     ColumnName(*call.arg));
 }
 
-std::string ColumnName(const BoundColumn& column) { return Name(column.name); }
-
 std::string SortKeyText(const SortKey& key) {
-  return std::format("{} {} {}", Name(key.column.name), key.descending ? "DESC" : "ASC",
+  return std::format("{} {} {}", ColumnName(key.column), key.descending ? "DESC" : "ASC",
                      key.nulls_first ? "NULLS FIRST" : "NULLS LAST");
 }
 
@@ -134,12 +141,29 @@ struct NodeLine {
     return std::format("RowCount table={} source={}", EscapeText(node.table_name, '\0'),
                        node.table->Describe());
   }
+  std::string operator()(const JoinNode& node) const {
+    std::string line = std::format(
+        "Join {} build={} keys=[{}]", ToString(node.kind), ToString(node.build),
+        Join(
+            node.keys,
+            [](const JoinKey& key) { return ColumnName(key.left) + " = " + ColumnName(key.right); },
+            ", "));
+    if (!node.residual.empty()) {
+      line += " residual=[" +
+              Join(
+                  node.residual, [](const ExprPtr& e) { return EscapeText(e->name, '\0'); }, ", ") +
+              "]";
+    }
+    return line;
+  }
 };
 
 void Render(const LogicalNode& node, std::size_t depth, std::string& out) {
   out += std::string(2 * depth, ' ') + std::visit(NodeLine{}, node) + '\n';
-  if (const LogicalNodePtr* input = InputOf(node); input != nullptr && *input != nullptr) {
-    Render(**input, depth + 1, out);
+  for (const LogicalNodePtr& input : InputsOf(node)) {  // a Join's left input, then its right one
+    if (input != nullptr) {
+      Render(*input, depth + 1, out);
+    }
   }
 }
 

@@ -1,6 +1,8 @@
 #include "antb1/plan/optimizer.h"
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -292,8 +294,8 @@ TEST(OptimizerTest, KeepsDependentKeysUnderALimitWithoutASort) {
         found = true;
         break;
       }
-      const LogicalNodePtr* input = InputOf(*node);
-      node = input == nullptr ? nullptr : *input;
+      const std::vector<LogicalNodePtr> inputs = InputsOf(*node);
+      node = inputs.empty() ? nullptr : inputs[0];
     }
     EXPECT_TRUE(found) << sql << "\n" << Explain(plan);
   }
@@ -395,6 +397,18 @@ struct MapReferences {
   LogicalNodePtr operator()(const RowCountNode& node) const {
     return std::make_shared<const LogicalNode>(node);
   }
+  LogicalNodePtr operator()(JoinNode node) const {
+    for (JoinKey& key : node.keys) {
+      Column(key.left);
+      Column(key.right);
+    }
+    for (ExprPtr& conjunct : node.residual) {
+      conjunct = Expression(conjunct);
+    }
+    node.left = Map(node.left);
+    node.right = Map(node.right);
+    return std::make_shared<const LogicalNode>(std::move(node));
+  }
 };
 
 // The id and the position of every column reference that has an id, from the root down.
@@ -449,6 +463,236 @@ TEST(OptimizerTest, RulesReadColumnIdsNotPositions) {
       EXPECT_EQ(References(optimized), References(expected)) << sql;
       EXPECT_EQ(PositionMismatch(optimized), std::nullopt) << sql;
     }
+  }
+}
+
+// ---- joins (hand-built plans: no SQL produces a join yet) ----
+
+LogicalNodePtr Node(LogicalNode node) {
+  return std::make_shared<const LogicalNode>(std::move(node));
+}
+
+// A Scan of fields 0-3 of AllTypesSchema (i16, i32, i64, u16) as columns first .. first + 3.
+LogicalNodePtr FourFields(std::uint32_t first) {
+  return Node(ScanNode{
+      .table = std::make_shared<testing::FakeTable>(testing::AllTypesSchema(), 10),
+      .table_name = "t" + std::to_string(first),
+      .fields = {0, 1, 2, 3},
+      .ids = {ColumnId{first}, ColumnId{first + 1}, ColumnId{first + 2}, ColumnId{first + 3}},
+      .span = {}});
+}
+
+// Field `field` of FourFields(first).
+BoundColumn FieldOf(std::uint32_t first, int field) {
+  static const std::vector<std::pair<std::string, LogicalType>> kFields = {
+      {"i16", LogicalType::kSmallInt},
+      {"i32", LogicalType::kInteger},
+      {"i64", LogicalType::kBigInt},
+      {"u16", LogicalType::kUSmallInt}};
+  const auto& [name, type] = kFields.at(static_cast<std::size_t>(field));
+  return BoundColumn{.index = 0,
+                     .id = ColumnId{first + static_cast<std::uint32_t>(field)},
+                     .name = name,
+                     .type = type,
+                     .qualifier = "t" + std::to_string(first)};
+}
+
+ExprPtr Ref(const BoundColumn& column) {
+  return std::make_shared<const Expr>(Expr{.node = ColumnExpr{.index = 0, .id = column.id},
+                                           .type = column.type,
+                                           .name = column.qualifier + "." + column.name});
+}
+
+// a < b over two INTEGER columns, as a BOOLEAN residual.
+ExprPtr Less(const BoundColumn& a, const BoundColumn& b) {
+  return std::make_shared<const Expr>(Expr{
+      .node =
+          PredicateExpr{.predicate = Predicate{.kind = Predicate::Kind::kCompareColumns,
+                                               .column = BoundColumn{.index = 0, .type = a.type},
+                                               .other = BoundColumn{.index = 1, .type = b.type},
+                                               .op = CompareOp::kLt},
+                        .operands = {Ref(a), Ref(b)}},
+      .type = LogicalType::kBoolean,
+      .name = "(" + a.qualifier + "." + a.name + " < " + b.qualifier + "." + b.name + ")"});
+}
+
+LogicalPlan PlanOver(LogicalNodePtr root) {
+  std::vector<OutputColumn> output;
+  for (const ColumnId id : OutputIds(*root)) {
+    output.push_back(OutputColumn{.name = "c", .type = LogicalType::kBigInt, .id = id});
+  }
+  return LogicalPlan{.root = std::move(root), .output = std::move(output)};
+}
+
+// A Project of `columns` over a join of FourFields(1) and FourFields(11) on t1.i32 = t11.i32.
+LogicalPlan ProjectOverJoin(JoinKind kind, const std::vector<BoundColumn>& columns,
+                            std::vector<ExprPtr> residual = {}) {
+  ProjectNode project{
+      .input = Node(JoinNode{.kind = kind,
+                             .left = FourFields(1),
+                             .right = FourFields(11),
+                             .keys = {JoinKey{.left = FieldOf(1, 1), .right = FieldOf(11, 1)}},
+                             .residual = std::move(residual),
+                             .build = BuildSide::kRight,
+                             .span = {}}),
+      .columns = columns,
+      .constants = {},
+      .ids = {},
+      .span = {}};
+  for (std::size_t i = 0; i < columns.size(); ++i) {
+    project.ids.push_back(ColumnId{100 + static_cast<std::uint32_t>(i)});
+  }
+  return PlanOver(Node(std::move(project)));
+}
+
+// The first node of type T, depth first (left input before right).
+template <class T>
+const T* Find(const LogicalNodePtr& node) {
+  if (node == nullptr) {
+    return nullptr;
+  }
+  if (const auto* found = std::get_if<T>(node.get())) {
+    return found;
+  }
+  for (const LogicalNodePtr& input : InputsOf(*node)) {
+    if (const T* found = Find<T>(input)) {
+      return found;
+    }
+  }
+  return nullptr;
+}
+
+const JoinNode& JoinBelowProject(const LogicalPlan& plan) {
+  return std::get<JoinNode>(*std::get<ProjectNode>(*plan.root).input);
+}
+
+// Each input keeps the columns needed above, the keys and the residual's columns, in field order.
+TEST(OptimizerTest, PrunesThroughBothInputsOfAJoin) {
+  const LogicalPlan plan = Optimize(ProjectOverJoin(
+      JoinKind::kInner, {FieldOf(11, 3), FieldOf(1, 0)}, {Less(FieldOf(1, 2), FieldOf(11, 2))}));
+  EXPECT_EQ(PositionMismatch(plan), std::nullopt);
+  const JoinNode& join = JoinBelowProject(plan);
+  EXPECT_EQ(std::get<ScanNode>(*join.left).fields, (std::vector<int>{0, 1, 2}));
+  EXPECT_EQ(std::get<ScanNode>(*join.right).fields, (std::vector<int>{1, 2, 3}));
+  // Positions after pruning: the keys in their own input, the residual over both.
+  EXPECT_EQ(join.keys[0].left.index, 1);
+  EXPECT_EQ(join.keys[0].right.index, 0);
+  const auto& residual = std::get<PredicateExpr>(join.residual[0]->node);
+  EXPECT_EQ(std::get<ColumnExpr>(residual.operands[0]->node).index, 2);
+  EXPECT_EQ(std::get<ColumnExpr>(residual.operands[1]->node).index, 4);
+  const auto& project = std::get<ProjectNode>(*plan.root);
+  EXPECT_EQ(project.columns[0].index, 5) << "t11.u16, after the 3 left columns";
+  EXPECT_EQ(project.columns[1].index, 0);
+  EXPECT_EQ(Explain(Optimize(plan)), Explain(plan)) << "idempotent";
+
+  // A semi join outputs its left input only: the right input keeps just its key.
+  const LogicalPlan semi = Optimize(ProjectOverJoin(JoinKind::kSemi, {FieldOf(1, 3)}));
+  EXPECT_EQ(PositionMismatch(semi), std::nullopt);
+  EXPECT_EQ(std::get<ScanNode>(*JoinBelowProject(semi).left).fields, (std::vector<int>{1, 3}));
+  EXPECT_EQ(std::get<ScanNode>(*JoinBelowProject(semi).right).fields, (std::vector<int>{1}));
+}
+
+// COUNT(*) of a whole table inside a join input still becomes RowCount; above a join it does not.
+TEST(OptimizerTest, CountStarInsideAJoinInputBecomesRowCount) {
+  const LogicalNodePtr count = Node(
+      AggregateNode{.input = FourFields(11),
+                    .aggregates = {AggregateCall{.kind = AggKind::kCountStar, .id = ColumnId{20}}},
+                    .span = {}});
+  const LogicalPlan plan = Optimize(PlanOver(Node(JoinNode{.kind = JoinKind::kOneRow,
+                                                           .left = FourFields(1),
+                                                           .right = count,
+                                                           .keys = {},
+                                                           .residual = {},
+                                                           .build = BuildSide::kRight,
+                                                           .span = {}})));
+  EXPECT_EQ(PositionMismatch(plan), std::nullopt);
+  const auto& join = std::get<JoinNode>(*plan.root);
+  EXPECT_TRUE(std::holds_alternative<RowCountNode>(*join.right)) << Explain(plan);
+  EXPECT_EQ(std::get<ScanNode>(*join.left).fields, (std::vector<int>{0, 1, 2, 3}));
+
+  const LogicalPlan above = Optimize(PlanOver(Node(AggregateNode{
+      .input = std::get<ProjectNode>(*ProjectOverJoin(JoinKind::kInner, {}).root).input,
+      .aggregates = {AggregateCall{.kind = AggKind::kCountStar, .id = ColumnId{30}}},
+      .span = {}})));
+  EXPECT_TRUE(std::holds_alternative<AggregateNode>(*above.root)) << Explain(above);
+  const JoinNode* join_below = Find<JoinNode>(above.root);
+  ASSERT_NE(join_below, nullptr);
+  EXPECT_EQ(std::get<ScanNode>(*join_below->left).fields, (std::vector<int>{1})) << "the key";
+  EXPECT_EQ(std::get<ScanNode>(*join_below->right).fields, (std::vector<int>{1}));
+}
+
+// The rules reach a join's inputs: dependent GROUP BY keys inside the right input are rewritten,
+// but not under a Limit above the join (conservative: a probe may stop early), and a Limit moves
+// below a Project down to the join, never through it.
+TEST(OptimizerTest, RulesReachBothInputsOfAJoin) {
+  static const Catalog catalog = MakeCatalog();
+  auto grouped = BindSql("SELECT i16, i16 + 1, COUNT(*) FROM t GROUP BY i16, i16 + 1", catalog);
+  ASSERT_TRUE(grouped.ok()) << grouped.status().ToString();
+  ASSERT_LT(std::to_underlying(OutputIds(*grouped->root).back()), 100U) << "ids below 100";
+  BoundColumn right_key = FieldOf(1, 0);  // i16 SMALLINT, like the subplan's first column
+  right_key.id = OutputIds(*grouped->root).front();
+  right_key.qualifier.clear();
+  const LogicalNodePtr join =
+      Node(JoinNode{.kind = JoinKind::kSemi,
+                    .left = FourFields(101),
+                    .right = grouped->root,
+                    .keys = {JoinKey{.left = FieldOf(101, 0), .right = right_key}},
+                    .residual = {},
+                    .build = BuildSide::kRight,
+                    .span = {}});
+  const LogicalPlan plain = Optimize(PlanOver(join));
+  EXPECT_EQ(PositionMismatch(plain), std::nullopt);
+  const auto* group = Find<GroupAggregateNode>(plain.root);
+  ASSERT_NE(group, nullptr);
+  EXPECT_EQ(group->keys.size(), 1U) << Explain(plain);
+
+  const LogicalPlan limited =
+      Optimize(PlanOver(Node(LimitNode{.input = join, .limit = 3, .offset = 0, .span = {}})));
+  EXPECT_EQ(PositionMismatch(limited), std::nullopt);
+  group = Find<GroupAggregateNode>(limited.root);
+  ASSERT_NE(group, nullptr);
+  EXPECT_EQ(group->keys.size(), 2U) << Explain(limited);
+
+  // Limit(Project(Join)): the Limit moves below the Project and stays above the Join.
+  const LogicalPlan project = ProjectOverJoin(JoinKind::kInner, {FieldOf(1, 0)});
+  const LogicalPlan moved = Optimize(
+      PlanOver(Node(LimitNode{.input = project.root, .limit = 2, .offset = 0, .span = {}})));
+  EXPECT_EQ(PositionMismatch(moved), std::nullopt);
+  const auto& above = std::get<ProjectNode>(*moved.root);
+  const auto& limit = std::get<LimitNode>(*above.input);
+  EXPECT_TRUE(std::holds_alternative<JoinNode>(*limit.input)) << Explain(moved);
+
+  // Inside an input: Limit(Project(Scan)) of the right input becomes Project(Limit(Scan)).
+  auto limited_right = BindSql("SELECT i16 FROM t LIMIT 3", catalog);
+  ASSERT_TRUE(limited_right.ok()) << limited_right.status().ToString();
+  right_key.id = OutputIds(*limited_right->root).front();
+  const LogicalPlan inner = Optimize(
+      PlanOver(Node(JoinNode{.kind = JoinKind::kInner,
+                             .left = FourFields(101),
+                             .right = limited_right->root,
+                             .keys = {JoinKey{.left = FieldOf(101, 0), .right = right_key}},
+                             .residual = {},
+                             .build = BuildSide::kLeft,
+                             .span = {}})));
+  EXPECT_EQ(PositionMismatch(inner), std::nullopt);
+  const auto& right = std::get<ProjectNode>(*std::get<JoinNode>(*inner.root).right);
+  EXPECT_TRUE(std::holds_alternative<LimitNode>(*right.input)) << Explain(inner);
+}
+
+// As RulesReadColumnIdsNotPositions, over a join: every position wrong, the same plan.
+TEST(OptimizerTest, JoinRulesReadColumnIdsNotPositions) {
+  const LogicalPlan bound = ProjectOverJoin(JoinKind::kInner, {FieldOf(11, 3), FieldOf(1, 0)},
+                                            {Less(FieldOf(1, 2), FieldOf(11, 2))});
+  const LogicalPlan expected = Optimize(bound);
+  for (const int position : {0, 999}) {
+    const std::function<int(ColumnId, int)> scramble = [position](ColumnId, int) {
+      return position;
+    };
+    const LogicalPlan scrambled{.root = MapReferences{.f = scramble}.Map(bound.root),
+                                .output = bound.output};
+    const LogicalPlan optimized = Optimize(scrambled);
+    EXPECT_EQ(Explain(optimized), Explain(expected));
+    EXPECT_EQ(References(optimized), References(expected));
   }
 }
 

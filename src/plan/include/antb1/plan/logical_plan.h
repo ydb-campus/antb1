@@ -23,8 +23,9 @@
 //   [Limit] <- [Project] <- [Sort] <- [Filter] <- [Compute] <- [Aggregate | GroupAggregate]
 //     <- [Compute] <- [Filter] <- [Compute] <- [Filter] <- Scan (every field)
 //
-// and plan::Optimize rewrites it (COUNT(*) -> RowCount, GROUP BY keys that are functions of
-// other keys, Limit below Project, projection pruning).
+// A Join has two inputs (ADR 0022); no SQL produces one yet, and every walk of a plan visits every
+// input of a node (InputsOf). plan::Optimize rewrites it (COUNT(*) -> RowCount, GROUP BY keys that
+// are functions of other keys, Limit below Project, projection pruning).
 //
 // Every column has a plan-unique ColumnId, defined once by the node that creates it (see
 // OutputIds); a column reference (BoundColumn, ColumnExpr) names the column it reads by its id and
@@ -100,6 +101,7 @@ struct BoundColumn {
   ColumnId id = kNoColumnId;  // the column read
   std::string name;           // the table column's name as declared in the table schema
   LogicalType type = LogicalType::kBigInt;
+  std::string qualifier;  // the name of the column's binding (EXPLAIN: qualifier.name); "": none
 };
 
 // One comparison of the WHERE conjunction after exact literal folding (docs/sql-subset.md).
@@ -236,9 +238,10 @@ struct GroupAggregateNode;
 struct SortNode;
 struct LimitNode;
 struct RowCountNode;
+struct JoinNode;
 
 using LogicalNode = std::variant<ScanNode, FilterNode, ComputeNode, ProjectNode, AggregateNode,
-                                 GroupAggregateNode, SortNode, LimitNode, RowCountNode>;
+                                 GroupAggregateNode, SortNode, LimitNode, RowCountNode, JoinNode>;
 using LogicalNodePtr = std::shared_ptr<const LogicalNode>;
 
 // Reads top-level fields of a table. Output: the fields, in this order.
@@ -333,26 +336,74 @@ struct RowCountNode {
   SourceSpan span;            // the COUNT(*) call
 };
 
+// The kinds of joins (ADR 0022). A match is a pair of a left and a right row with equal keys whose
+// residual is true; a NULL key never matches.
+enum class JoinKind : std::uint8_t {
+  kInner,          // every match
+  kLeft,           // every match, and each left row without one, padded with NULLs
+  kSemi,           // each left row with a match, once
+  kAnti,           // each left row without a match
+  kNullAwareAnti,  // as SQL's NOT IN: no left row when the right has a NULL key; every left row
+                   // when it is empty; else each left row with a non-NULL key and no match
+  kOneRow,         // each left row with the right input's single row (no keys)
+};
+
+// "INNER", "LEFT", "SEMI", "ANTI", "NULL-AWARE ANTI", "ONE-ROW".
+std::string_view ToString(JoinKind kind);
+
+// The input a join builds its hash table on; the other is probed.
+enum class BuildSide : std::uint8_t { kLeft, kRight };
+
+// "left", "right".
+std::string_view ToString(BuildSide side);
+
+// One key of a join: a column of the left input and one of the right input, of one type.
+struct JoinKey {
+  BoundColumn left;   // of the left input
+  BoundColumn right;  // of the right input
+};
+
+// A join of two inputs. Output: inner, left and one-row joins output the left input's columns,
+// then the right input's; semi, anti and null-aware anti joins the left input's only. Every kind
+// but one-row has at least one key, and one-row has none. Only an inner join may build on its
+// left input (ADR 0022: the others build on the side whose rows they do not preserve).
+struct JoinNode {
+  JoinKind kind = JoinKind::kInner;
+  LogicalNodePtr left;
+  LogicalNodePtr right;
+  std::vector<JoinKey> keys;
+  // BOOLEAN conjuncts over the left input's columns, then the right input's (their `index`: the
+  // position in that concatenation); every one must be true for a match.
+  std::vector<ExprPtr> residual;
+  BuildSide build = BuildSide::kRight;
+  SourceSpan span;  // the join in the query
+};
+
 struct LogicalPlan {
   LogicalNodePtr root;
   // Result columns of root: names (aliases applied), types and ids (OutputIds(*root)).
   std::vector<OutputColumn> output;
 };
 
-// "Scan", "Filter", "Compute", "Project", "Aggregate", "GroupAggregate", "Sort", "Limit" or
-// "RowCount".
+// "Scan", "Filter", "Compute", "Project", "Aggregate", "GroupAggregate", "Sort", "Limit",
+// "RowCount" or "Join".
 std::string_view NodeName(const LogicalNode& node);
 
 // The span of the query text a node was bound from.
 SourceSpan SpanOf(const LogicalNode& node);
 
-// The input of a node; nullptr for leaves (Scan, RowCount).
-const LogicalNodePtr* InputOf(const LogicalNode& node);
+// The inputs of a node, in order: none for leaves (Scan, RowCount), left then right for a Join, and
+// one for the others.
+std::vector<LogicalNodePtr> InputsOf(const LogicalNode& node);
+
+// A copy of the node over other inputs, in the order of InputsOf. A count that differs from the
+// node's is a programming error (the process aborts).
+LogicalNodePtr WithInputs(const LogicalNode& node, std::vector<LogicalNodePtr> inputs);
 
 // The ids of a node's output columns, in order. A node defines new columns where it creates them:
 // Scan (`ids`), Compute (its input's ids, then `ids`), Project (`ids`), Aggregate (each call's id),
 // GroupAggregate (`key_ids`, then each call's id) and RowCount (`id`); Filter, Sort and Limit
-// output their input's ids.
+// output their input's ids, and a Join its inputs' ids (see JoinNode).
 std::vector<ColumnId> OutputIds(const LogicalNode& node);
 
 // The plan with every reference's index set to the position of its id in the ids it reads (its
@@ -367,8 +418,9 @@ LogicalPlan ResolvePositions(const LogicalPlan& plan,
 // Why the plan is not resolved, or std::nullopt: the first broken invariant (a reference without an
 // id, or whose id is not exactly once among the ids it reads; a column defined twice in the plan,
 // or without an id; a list of ids whose length differs from its columns'; output ids that are not
-// the root's), else the first index that differs from its resolved position, e.g. "Filter: column
-// #12 is at 3, not 4".
+// the root's; a join key of two types, a join without keys or a one-row join with keys, a residual
+// that is not BOOLEAN, a build side the join's kind does not allow), else the first index that
+// differs from its resolved position, e.g. "Filter: column #12 is at 3, not 4".
 std::optional<std::string> PositionMismatch(const LogicalPlan& plan);
 
 }  // namespace antb1::plan

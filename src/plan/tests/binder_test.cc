@@ -1869,8 +1869,8 @@ std::vector<double> FilterConstants(const LogicalPlan& plan) {
         }
       }
     }
-    const LogicalNodePtr* input = InputOf(*node);
-    node = input == nullptr ? nullptr : input->get();
+    const std::vector<LogicalNodePtr> inputs = InputsOf(*node);
+    node = inputs.empty() ? nullptr : inputs[0].get();
   }
   return out;
 }

@@ -270,7 +270,10 @@ above the aggregation the `HAVING` one), `Compute` (appends one computed column 
 `Project` (`*` or the plain columns), `Aggregate` (the aggregates, one output row) or `GroupAggregate` (`GROUP BY`:
 the keys, then the aggregates, one row per group; a `Project` above it restores the select order), `Sort`
 (`ORDER BY`, below the `Project`, so it can use columns and aggregates the query does not return) and `Limit` (with
-its offset). A rule optimizer then rewrites it:
+its offset). A `Join` has two inputs ([ADR 0022](adr/0022-joins-and-query-blocks.md)): its kind (inner, left, semi,
+anti, null-aware anti or one-row), key pairs of one type each, residual conditions over both inputs and the input it
+builds on. No query produces a `Join` yet, and the executor rejects a plan with one with exit code 4 until it
+implements its kind. A rule optimizer then rewrites the plan, through both inputs of every `Join`:
 
 - `Limit` moves below `Project`: a `Project` keeps every row, so the `Limit` copies only the rows it keeps and ends
   up right above a `Sort`, which the executor runs as a top-N (it keeps only `limit + offset` rows while it reads);
@@ -279,7 +282,8 @@ its offset). A rule optimizer then rewrites it:
   same groups with fewer keys to hash ([ADR 0018](adr/0018-dependent-group-keys.md)). Not under a `LIMIT` without
   `ORDER BY`, which reads only some groups: every group's keys are computed, so an overflow in any of them still
   fails the query;
-- projection pruning: `Scan` reads only the columns that the nodes above it use (none for a bare `COUNT(*)`);
+- projection pruning: `Scan` reads only the columns that the nodes above it use (none for a bare `COUNT(*)`); each
+  input of a `Join` keeps the columns used above it and the join's key and residual columns;
 - `COUNT(*)` alone without `WHERE`, over a table whose row count is known without scanning (every Parquet table),
   becomes `RowCount`, answered from the footers.
 - (execution, not a plan rule) an `ORDER BY ... LIMIT` over a table reads first only the columns its `WHERE` and its
@@ -304,6 +308,16 @@ Project RegionID, c
     Sort c DESC NULLS LAST, "max(EventTime)" ASC NULLS FIRST
       GroupAggregate keys=[RegionID] COUNT(*), MAX(EventTime)
         Scan table=t source=parquet(files=1, rows=10000) columns=[EventTime, RegionID]
+```
+
+A `Join` line shows its kind (`INNER`, `LEFT`, `SEMI`, `ANTI`, `NULL-AWARE ANTI` or `ONE-ROW`), the input it builds
+on, its key pairs and, when it has any, its residual conditions; its left input follows, then its right input, both
+indented. A column whose binding the plan records is shown qualified, as `a.k`:
+
+```text
+Join INNER build=right keys=[a.k = b.k] residual=[(a.x < b.y)]
+  Scan table=a source=parquet(files=1, rows=1000) columns=[k, x]
+  Scan table=b source=parquet(files=1, rows=10) columns=[k, y]
 ```
 
 ### `explain --analyze`

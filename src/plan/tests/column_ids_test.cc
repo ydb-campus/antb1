@@ -2,6 +2,7 @@
 // index from the ids, and plan::PositionMismatch, which names the first broken invariant.
 
 #include <cstdint>
+#include <format>
 #include <memory>
 #include <optional>
 #include <string>
@@ -281,11 +282,151 @@ TEST(ColumnIdsTest, OptimizeResolvesStaleIndexes) {
   EXPECT_EQ(PositionMismatch(optimized), std::nullopt);
 }
 
+constexpr ColumnId kD{4};
+constexpr ColumnId kE{5};
+constexpr ColumnId kF{6};
+
+// A BOOLEAN residual comparing columns `a` and `b` (operand-local predicate columns 0 and 1).
+ExprPtr Residual(ColumnId a, ColumnId b, int index = 0) {
+  return std::make_shared<const Expr>(
+      Expr{.node = PredicateExpr{.predicate = Predicate{.kind = Predicate::Kind::kCompareColumns,
+                                                        .column = Column(kNoColumnId, 0),
+                                                        .other = Column(kNoColumnId, 1),
+                                                        .op = CompareOp::kLt},
+                                 .operands = {Leaf(a, index), Leaf(b, index)}},
+           .type = LogicalType::kBoolean,
+           .name = "r"});
+}
+
+// A join of Scan() (#1, #2, #3) and a second Scan (#4, #5, #6) on #2 = #5, every index at 0.
+JoinNode Join(JoinKind kind, BuildSide build = BuildSide::kRight) {
+  return JoinNode{.kind = kind,
+                  .left = Scan(),
+                  .right = Scan({kD, kE, kF}),
+                  .keys = {JoinKey{.left = Column(kB, 0), .right = Column(kE, 0)}},
+                  .residual = {},
+                  .build = build,
+                  .span = {}};
+}
+
+TEST(ColumnIdsTest, OutputIdsOfEveryJoinKind) {
+  const std::vector<ColumnId> left = {kA, kB, kC};
+  const std::vector<ColumnId> both = {kA, kB, kC, kD, kE, kF};
+  EXPECT_EQ(OutputIds(Join(JoinKind::kInner)), both);
+  EXPECT_EQ(OutputIds(Join(JoinKind::kLeft)), both);
+  EXPECT_EQ(OutputIds(Join(JoinKind::kOneRow)), both);
+  EXPECT_EQ(OutputIds(Join(JoinKind::kSemi)), left);
+  EXPECT_EQ(OutputIds(Join(JoinKind::kAnti)), left);
+  EXPECT_EQ(OutputIds(Join(JoinKind::kNullAwareAnti)), left);
+}
+
+// Keys resolve against their own input; residual columns against the left ids, then the right ids.
+TEST(ColumnIdsTest, ResolvePositionsResolvesJoinKeysPerInputAndResidualsOverBoth) {
+  JoinNode join = Join(JoinKind::kInner);
+  join.keys = {JoinKey{.left = Column(kC, 0), .right = Column(kF, 0)},
+               JoinKey{.left = Column(kA, 7), .right = Column(kD, 7)}};
+  join.residual = {Residual(kF, kB)};
+  // Over the join's output, a Filter reads a right column.
+  const LogicalPlan plan = Plan(Node(FilterNode{
+      .input = Node(join),
+      .predicates = {Predicate{.kind = Predicate::Kind::kIsNotNull, .column = Column(kE, 0)}},
+      .span = {}}));
+  EXPECT_EQ(PositionMismatch(plan), "Join: column #3 is at 2, not 0");
+
+  const LogicalPlan resolved = ResolvePositions(plan);
+  EXPECT_EQ(PositionMismatch(resolved), std::nullopt);
+  const auto& filter = std::get<FilterNode>(*resolved.root);
+  EXPECT_EQ(filter.predicates[0].column.value_or(BoundColumn{}).index, 4);
+  const auto& j = std::get<JoinNode>(*filter.input);
+  EXPECT_EQ(j.keys[0].left.index, 2);
+  EXPECT_EQ(j.keys[0].right.index, 2) << "the position in the right input";
+  EXPECT_EQ(j.keys[1].left.index, 0);
+  EXPECT_EQ(j.keys[1].right.index, 0);
+  const auto& residual = std::get<PredicateExpr>(j.residual[0]->node);
+  EXPECT_EQ(std::get<ColumnExpr>(residual.operands[0]->node).index, 5) << "after the left input";
+  EXPECT_EQ(std::get<ColumnExpr>(residual.operands[1]->node).index, 1);
+  EXPECT_EQ(residual.predicate.other.value_or(BoundColumn{}).index, 1) << "operand-local";
+  EXPECT_EQ(j.left, join.left) << "the Scans have no references";
+  EXPECT_EQ(j.right, join.right);
+  EXPECT_EQ(ResolvePositions(resolved).root, resolved.root);
+
+  // Over a semi join, the right input's columns are gone.
+  join.kind = JoinKind::kSemi;
+  join.residual.clear();
+  EXPECT_EQ(
+      PositionMismatch(Plan(Node(FilterNode{
+          .input = Node(join),
+          .predicates = {Predicate{.kind = Predicate::Kind::kIsNotNull, .column = Column(kE, 0)}},
+          .span = {}}))),
+      "Filter: column #5 is not in its input");
+}
+
+TEST(ColumnIdsTest, EveryJoinKindResolves) {
+  for (const JoinKind kind : {JoinKind::kInner, JoinKind::kLeft, JoinKind::kSemi, JoinKind::kAnti,
+                              JoinKind::kNullAwareAnti}) {
+    JoinNode join = Join(kind);
+    join.residual = {Residual(kC, kF)};
+    const LogicalPlan resolved = ResolvePositions(Plan(Node(join)));
+    EXPECT_EQ(PositionMismatch(resolved), std::nullopt) << ToString(kind);
+  }
+  JoinNode one_row = Join(JoinKind::kOneRow);
+  one_row.keys.clear();
+  EXPECT_EQ(PositionMismatch(ResolvePositions(Plan(Node(one_row)))), std::nullopt);
+  EXPECT_EQ(
+      PositionMismatch(ResolvePositions(Plan(Node(Join(JoinKind::kInner, BuildSide::kLeft))))),
+      std::nullopt)
+      << "an inner join may build on either input";
+}
+
+TEST(ColumnIdsTest, PositionMismatchNamesBrokenJoins) {
+  JoinNode types = Join(JoinKind::kInner);
+  types.keys[0].right.type = LogicalType::kInteger;
+  EXPECT_EQ(PositionMismatch(Plan(Node(types))),
+            "Join: key #2 = #5 has two types, BIGINT and INTEGER");
+
+  JoinNode keyless = Join(JoinKind::kInner);
+  keyless.keys.clear();
+  EXPECT_EQ(PositionMismatch(Plan(Node(keyless))), "Join: INNER join without keys");
+  keyless.kind = JoinKind::kNullAwareAnti;
+  EXPECT_EQ(PositionMismatch(Plan(Node(keyless))), "Join: NULL-AWARE ANTI join without keys");
+  EXPECT_EQ(PositionMismatch(Plan(Node(Join(JoinKind::kOneRow)))),
+            "Join: ONE-ROW join with 1 keys");
+
+  for (const JoinKind kind :
+       {JoinKind::kLeft, JoinKind::kSemi, JoinKind::kAnti, JoinKind::kNullAwareAnti}) {
+    EXPECT_EQ(PositionMismatch(Plan(Node(Join(kind, BuildSide::kLeft)))),
+              std::format("Join: {} join builds on its left input", ToString(kind)));
+  }
+  JoinNode one_row = Join(JoinKind::kOneRow, BuildSide::kLeft);
+  one_row.keys.clear();
+  EXPECT_EQ(PositionMismatch(Plan(Node(one_row))), "Join: ONE-ROW join builds on its left input");
+
+  JoinNode residual = Join(JoinKind::kInner);
+  residual.residual = {Leaf(kA, 0)};
+  EXPECT_EQ(PositionMismatch(Plan(Node(residual))), "Join: a residual of type BIGINT");
+  residual.residual = {Residual(kA, ColumnId{99})};
+  EXPECT_EQ(PositionMismatch(Plan(Node(residual))), "Join: column #99 is not in its input");
+
+  JoinNode crossed = Join(JoinKind::kInner);
+  crossed.keys[0].right = Column(kB, 1);  // a left column as the right key
+  EXPECT_EQ(PositionMismatch(Plan(Node(crossed))), "Join: column #2 is not in its input");
+  crossed = Join(JoinKind::kInner);
+  crossed.keys[0].left = Column(kE, 1);  // a right column as the left key
+  EXPECT_EQ(PositionMismatch(Plan(Node(crossed))), "Join: column #5 is not in its input");
+
+  JoinNode twice = Join(JoinKind::kInner);
+  twice.right = Scan({kD, kE, kA});  // #1 in both inputs
+  EXPECT_EQ(PositionMismatch(Plan(Node(twice))), "Scan: column #1 is defined twice");
+}
+
 TEST(ColumnIdsDeathTest, BrokenPlansAbort) {
   EXPECT_DEATH(ResolvePositions(FilterPlan(Column(ColumnId{99}, 0))),
                "Filter: column #99 is not in its input");
   EXPECT_DEATH(Optimize(FilterPlan(Column(ColumnId{99}, 0))),
                "Filter: column #99 is not in its input");
+  JoinNode keyless = Join(JoinKind::kSemi);
+  keyless.keys.clear();
+  EXPECT_DEATH(Optimize(Plan(Node(keyless))), "Join: SEMI join without keys");
 }
 
 }  // namespace
