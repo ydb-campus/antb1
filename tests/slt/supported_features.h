@@ -47,6 +47,7 @@ enum class Feature : std::uint8_t {
   kDoubleColumns,   // DOUBLE
   kVarcharColumns,  // VARCHAR (Parquet BYTE_ARRAY, with or without UTF8)
   kDateColumns,     // DATE (EventDate with the clickbench option)
+  kDecimalColumns,  // DECIMAL(p,s), p <= 38: compared with literals, keys, MIN, MAX and COUNT
   // FROM
   kTableName,  // a registered table
   kTablePath,  // '<file or glob>'
@@ -133,6 +134,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "varchar_columns";
     case Feature::kDateColumns:
       return "date_columns";
+    case Feature::kDecimalColumns:
+      return "decimal_columns";
     case Feature::kTableName:
       return "table_name";
     case Feature::kTablePath:
@@ -282,6 +285,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kDoubleColumns,
     Feature::kVarcharColumns,
     Feature::kDateColumns,
+    Feature::kDecimalColumns,
     Feature::kTableName,
     Feature::kTablePath,
     Feature::kWhere,
