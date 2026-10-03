@@ -1,7 +1,7 @@
 # DECIMAL(p,s) columns (ADR 0021, docs/sql-subset.md): decimals.parquet stores DECIMAL(9,2) as INT32, (18,4) and
 # (15,2) as INT64, and (38,10) and (38,0) as FIXED_LEN_BYTE_ARRAY. Values print with exactly s digits after the point;
-# literals fold exactly into the column's (p,s); keys compare by value. SUM, AVG, arithmetic, CASE values and mixed
-# types are not supported yet (onlyif duckdb records).
+# literals fold exactly into the column's (p,s); keys compare by value. CASE values and mixed types are not supported
+# yet (onlyif duckdb records); arithmetic, SUM and AVG are in decimal_arithmetic.slt.
 
 query IDDDDDD nosort
 SELECT id, d9_2, d18_4, d38_10, d38_0, p, q FROM decimals ORDER BY id LIMIT 14
@@ -406,27 +406,8 @@ SELECT p, q FROM decimals WHERE p <> q ORDER BY q DESC, p
 -99.95	-79.96
 59.97	-9999999999999.99
 
-# Not supported yet (exit 4): SUM and AVG, arithmetic, CASE values, mixed types and approximate literals.
-
-onlyif duckdb
-query D nosort
-SELECT SUM(p) FROM decimals
-----
--39.98
-
-onlyif duckdb
-query R nosort
-SELECT AVG(d9_2) FROM decimals
-----
--0.29411764705882354
-
-onlyif duckdb
-query D rowsort
-SELECT p + 1 FROM decimals WHERE id < 3
-----
--18.99
--98.95
-60.97
+# Not supported yet (exit 4): mixed types and approximate literals (decimal_arithmetic.slt has
+# arithmetic, SUM and AVG).
 
 onlyif duckdb
 query I nosort
