@@ -1009,6 +1009,7 @@ TEST(BinderTest, DecimalArithmeticTypesLikeDuckDb) {
            Case{.expr = "z + i", .type = dec(38, 10)},
            Case{.expr = "z * p", .type = dec(38, 12)},
            Case{.expr = "z * z", .type = dec(38, 20)},
+           Case{.expr = "e + g", .type = dec(18, 10)},
            Case{.expr = "e * g", .type = dec(36, 18)},
            Case{.expr = "g * g", .type = dec(36, 20)},
            Case{.expr = "p * q * r", .type = dec(18, 8)},

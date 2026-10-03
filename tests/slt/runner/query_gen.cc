@@ -311,7 +311,12 @@ void AddRange(GenColumn& c, const arrow::Array& a) {
           const auto bits =
               (static_cast<UInt128>(static_cast<uint64_t>(v.high_bits())) << 64U) | v.low_bits();
           const auto value = static_cast<Int128>(bits);
-          const Int128 magnitude = value < 0 ? -value : value;
+          // A file may hold the 128-bit minimum, beyond any width: the largest Int128 stands in,
+          // which no SUM or arithmetic bound accepts.
+          Int128 magnitude = value;
+          if (value < 0 && __builtin_sub_overflow(Int128{0}, value, &magnitude)) {
+            magnitude = kInt128Max;
+          }
           c.abs_max = std::max(c.abs_max.value_or(0), magnitude);
         }
       }

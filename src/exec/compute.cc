@@ -644,16 +644,22 @@ struct Evaluator {
   arrow::Result<ArrayPtr> Evaluate(const plan::NegateExpr& negate, const plan::Expr& e) const {
     ARROW_ASSIGN_OR_RAISE(ArrayPtr operand, (*this)(*negate.operand));
     if (e.type == plan::LogicalType::kDecimal) {
-      // The type is kept, and its range is symmetric: no overflow.
+      // The type is kept, and its range is symmetric. A file may still hold a value beyond its
+      // declared width (nothing checks it on read), so the 128-bit minimum is an overflow, not UB.
       ARROW_ASSIGN_OR_RAISE(DecimalOperand values, ReadDecimalOperand(*operand, e.type, {}));
       arrow::Decimal128Builder builder(plan::ToArrow(e.type), pool);
       ARROW_RETURN_NOT_OK(builder.Reserve(operand->length()));
       for (int64_t i = 0; i < operand->length(); ++i) {
         if (operand->IsNull(i)) {
           builder.UnsafeAppendNull();
-        } else {
-          builder.UnsafeAppend(FromInt128(-values.values[static_cast<std::size_t>(i)]));
+          continue;
         }
+        Int128 negated = 0;
+        if (__builtin_sub_overflow(Int128{0}, values.values[static_cast<std::size_t>(i)],
+                                   &negated)) {
+          return Overflow("negation", e.type);
+        }
+        builder.UnsafeAppend(FromInt128(negated));
       }
       std::shared_ptr<arrow::Array> out;
       ARROW_RETURN_NOT_OK(builder.Finish(&out));

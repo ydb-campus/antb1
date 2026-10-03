@@ -250,6 +250,12 @@ TEST_F(ComputeTest, DecimalArithmetic) {
   auto negated = Eval(negate, {price});
   ASSERT_TRUE(negated.ok()) << negated.status().ToString();
   EXPECT_EQ(UnscaledText(**negated), "decimal128(15, 2): -1700 25 null -999999999999999");
+  // A file may hold a value beyond the declared width: the 128-bit minimum fails, it is not UB.
+  const LogicalType d38 = LogicalType::Decimal(38, 0);
+  const auto minimum = Decimals(d38, {"-170141183460469231731687303715884105728"});
+  const auto negate38 = std::make_shared<const plan::Expr>(
+      plan::Expr{.node = plan::NegateExpr{.operand = ColumnAt(0, d38)}, .type = d38, .name = "-c"});
+  EXPECT_EQ(Eval(negate38, {minimum}).status().message(), "Overflow in negation of DECIMAL(38,0)");
 }
 
 // Overflows at both caps and failed rescales, with DuckDB 1.5.5's messages: + and - check

@@ -80,7 +80,8 @@ inline std::shared_ptr<arrow::Schema> AllTypesSchema() {
 
 // A catalog with "t" (AllTypesSchema, 100 rows), "u" (the same schema, unknown row count),
 // "dup" (columns "a" and "A"), "ok" (i16 and s only) and "dec" (DECIMALs: p DECIMAL(15,2),
-// q DECIMAL(15,2), r DECIMAL(9,4), z DECIMAL(38,10), i INTEGER).
+// q DECIMAL(15,2), r DECIMAL(9,4), z DECIMAL(38,10), i INTEGER, s16 SMALLINT, u16 USMALLINT,
+// b BIGINT, e DECIMAL(18,8), g DECIMAL(18,10), f DOUBLE).
 inline Catalog MakeCatalog() {
   Catalog catalog;
   const auto must = [](const arrow::Status& status) {

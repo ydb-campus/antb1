@@ -211,7 +211,8 @@ items).
   with anything is DOUBLE, and so is a number DuckDB types as DOUBLE (`1e3`) or a decimal with a DOUBLE; `/` is always
   DOUBLE; unary `-` keeps the type. A decimal literal with an integer (DuckDB's DECIMAL), DATE arithmetic, negating a
   USMALLINT (DuckDB wraps it), `//` and `%` of HUGEINT values and arithmetic on FLOAT columns (divergence D11) are
-  unsupported; arithmetic on VARCHAR is a bind error.
+  unsupported; arithmetic on VARCHAR is a bind error. The result name is DuckDB's: `(a + 1)`, `-(a)`,
+  `sum((a + 1))`, with columns as written.
 - DECIMAL arithmetic ([ADR 0021](adr/0021-decimal-semantics.md) rules 4 to 6): `+`, `-` and `*` of a DECIMAL with a
   DECIMAL or an integer, which counts as DECIMAL(5,0) (SMALLINT, USMALLINT), DECIMAL(10,0) (INTEGER, and an integer
   literal that fits it: `7` does not shrink), DECIMAL(19,0) (BIGINT) or DECIMAL(38,0) (HUGEINT). `+` and `-` keep the
@@ -221,8 +222,7 @@ items).
   DECIMAL(38,10) `*` DECIMAL(38,10) is DECIMAL(38,20), and a scale beyond 38 is a bind error with DuckDB's message
   (`Needed scale 40 to accurately represent the multiplication result, ...`). Unary `-` keeps the type. `/`, `//`
   and `%` of a DECIMAL, a decimal literal or a DOUBLE next to a DECIMAL, and DECIMAL `CASE` values are unsupported
-  (exit code 4). The result name is DuckDB's: `(a + 1)`, `-(a)`,
-  `sum((a + 1))`, with columns as written.
+  (exit code 4).
 - Functions (names ASCII case-insensitive): `strlen(x)` takes a VARCHAR and is BIGINT; `regexp_replace(x, 'pattern',
   'replacement')` takes a VARCHAR and two string literals and is VARCHAR. A wrong number of arguments, another type or
   a non-literal pattern or replacement is a bind error (`strlen() needs a VARCHAR, but 'i16' is SMALLINT`); DuckDB's

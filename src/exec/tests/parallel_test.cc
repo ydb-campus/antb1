@@ -1344,12 +1344,14 @@ TEST_F(PartOperatorsTest, HeavyKeysSpreadOverThePartitions) {
 // ---- rows routed past the parts' own tables ----
 
 // 12 parts of 40 rows (every fourth empty): u (BIGINT, unique per row: parts that do not reduce),
-// k (BIGINT, 5 values), d (DOUBLE key with -0.0, 0.0, NaN, NULL), s (VARCHAR), v (BIGINT).
+// k (BIGINT, 5 values), d (DOUBLE key with -0.0, 0.0, NaN, NULL), s (VARCHAR), v (BIGINT), and v as
+// m (DECIMAL(38,2)) and n (DECIMAL(15,2)).
 std::shared_ptr<MemoryTable> RoutedTable(bool split) {
   const auto schema =
       arrow::schema({arrow::field("u", arrow::int64()), arrow::field("k", arrow::int64()),
                      arrow::field("d", arrow::float64()), arrow::field("s", arrow::binary()),
-                     arrow::field("v", arrow::int64())});
+                     arrow::field("v", arrow::int64()), arrow::field("m", arrow::decimal128(38, 2)),
+                     arrow::field("n", arrow::decimal128(15, 2))});
   const std::vector<double> doubles = {-0.0, 0.0, std::nan(""), 1.5, -std::nan("")};
   arrow::RecordBatchVector batches;
   for (int64_t part = 0; part < 12; ++part) {
@@ -1358,6 +1360,8 @@ std::shared_ptr<MemoryTable> RoutedTable(bool split) {
     arrow::DoubleBuilder d;
     std::vector<std::optional<std::string>> str;
     std::vector<std::optional<int64_t>> v;
+    arrow::Decimal128Builder m(arrow::decimal128(38, 2));
+    arrow::Decimal128Builder n(arrow::decimal128(15, 2));
     const int64_t rows = part % 4 == 3 ? 0 : 40;
     for (int64_t i = 0; i < rows; ++i) {
       const int64_t r = (part * 40) + i;
@@ -1367,10 +1371,13 @@ std::shared_ptr<MemoryTable> RoutedTable(bool split) {
           (r % 13 == 0 ? d.AppendNull() : d.Append(doubles[static_cast<std::size_t>(r % 5)])).ok());
       str.emplace_back("s" + std::to_string(r % 7));
       v.emplace_back(r % 11);
+      EXPECT_TRUE(m.Append(arrow::Decimal128(r % 11)).ok());
+      EXPECT_TRUE(n.Append(arrow::Decimal128(r % 11)).ok());
     }
     batches.push_back(arrow::RecordBatch::Make(
         schema, rows,
-        {Int64s(u), Int64s(k), d.Finish().ValueOrDie(), testing::Strings(str), Int64s(v)}));
+        {Int64s(u), Int64s(k), d.Finish().ValueOrDie(), testing::Strings(str), Int64s(v),
+         m.Finish().ValueOrDie(), n.Finish().ValueOrDie()}));
   }
   if (!split) {
     auto combined = arrow::Table::FromRecordBatches(schema, batches).ValueOrDie();
@@ -1392,6 +1399,8 @@ TEST_F(PartOperatorsTest, RoutedRowsGiveTheSameGroups) {
   const auto d = Column(2, "d", LogicalType::kDouble);
   const auto str = Column(3, "s", LogicalType::kVarchar);
   const auto v = Column(4, "v", LogicalType::kBigInt);
+  const auto m = Column(5, "m", LogicalType::Decimal(38, 2));
+  const auto n = Column(6, "n", LogicalType::Decimal(15, 2));
   const std::vector<plan::AggregateCall> calls = {
       {.kind = plan::AggKind::kCountStar, .arg = {}, .type = LogicalType::kBigInt},
       {.kind = plan::AggKind::kCount, .arg = u, .type = LogicalType::kBigInt},
@@ -1401,26 +1410,27 @@ TEST_F(PartOperatorsTest, RoutedRowsGiveTheSameGroups) {
       {.kind = plan::AggKind::kCountDistinct, .arg = v, .type = LogicalType::kBigInt}};
   const plan::AggregateCall double_sum{
       .kind = plan::AggKind::kSum, .arg = d, .type = LogicalType::kDouble};
-  const auto run =
-      [&](const std::shared_ptr<MemoryTable>& table, const std::vector<plan::BoundColumn>& keys,
-          const std::vector<plan::AggregateCall>& aggregates, arrow::internal::Executor* executor,
-          ProfileNode* profile, const std::vector<plan::Predicate>& filter) {
-        plan::LogicalNodePtr input =
-            Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1, 2, 3, 4}});
-        if (!filter.empty()) {
-          input = Node(plan::FilterNode{.input = input, .predicates = filter});
-        }
-        const auto plan = PlanOf(
-            Node(plan::GroupAggregateNode{.input = input, .keys = keys, .aggregates = aggregates}),
-            keys.size() + aggregates.size());
-        auto op = BuildPhysicalPlan(plan, profile);
-        EXPECT_TRUE(op.ok()) << op.status().ToString();
-        ExecContext ctx{.pool = arrow::default_memory_pool(),
-                        .batch_size = 32,
-                        .executor = executor,
-                        .threads = executor == nullptr ? 1 : kThreads};
-        return Drain(**op, ctx);
-      };
+  const auto run = [&](const std::shared_ptr<MemoryTable>& table,
+                       const std::vector<plan::BoundColumn>& keys,
+                       const std::vector<plan::AggregateCall>& aggregates,
+                       arrow::internal::Executor* executor, ProfileNode* profile,
+                       const std::vector<plan::Predicate>& filter) {
+    plan::LogicalNodePtr input =
+        Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1, 2, 3, 4, 5, 6}});
+    if (!filter.empty()) {
+      input = Node(plan::FilterNode{.input = input, .predicates = filter});
+    }
+    const auto plan = PlanOf(
+        Node(plan::GroupAggregateNode{.input = input, .keys = keys, .aggregates = aggregates}),
+        keys.size() + aggregates.size());
+    auto op = BuildPhysicalPlan(plan, profile);
+    EXPECT_TRUE(op.ok()) << op.status().ToString();
+    ExecContext ctx{.pool = arrow::default_memory_pool(),
+                    .batch_size = 32,
+                    .executor = executor,
+                    .threads = executor == nullptr ? 1 : kThreads};
+    return Drain(**op, ctx);
+  };
   const auto raw_parts = [](const ProfileNode& root) -> int64_t {
     for (const ProfileMetric& metric : root.metrics()) {
       if (metric.name == "raw_parts") {
@@ -1443,6 +1453,16 @@ TEST_F(PartOperatorsTest, RoutedRowsGiveTheSameGroups) {
       testing::Compare(v, plan::CompareOp::kEq, BigInt(3))};
   std::vector<plan::AggregateCall> with_double_sum = calls;
   with_double_sum.push_back(double_sum);
+  // A SUM of a DECIMAL beyond 18 digits checks 128 bits at every addition, like HUGEINT: no part
+  // routes. One of at most 18 digits cannot reach that check, so it routes like the integer calls.
+  std::vector<plan::AggregateCall> with_wide_decimal = calls;
+  with_wide_decimal.push_back(
+      {.kind = plan::AggKind::kSum, .arg = m, .type = LogicalType::Decimal(38, 2)});
+  std::vector<plan::AggregateCall> with_narrow_decimal = calls;
+  with_narrow_decimal.push_back(
+      {.kind = plan::AggKind::kSum, .arg = n, .type = LogicalType::Decimal(38, 2)});
+  with_narrow_decimal.push_back(
+      {.kind = plan::AggKind::kAvg, .arg = n, .type = LogicalType::kDouble});
   // v (11 values in 32 rows) routes: 11 groups are more than 1/4 of 32 (they were not more than
   // 3/4). s (7 values) does not.
   const std::vector<Case> cases = {{.keys = {u}, .calls = calls, .routed = 9},
@@ -1454,12 +1474,14 @@ TEST_F(PartOperatorsTest, RoutedRowsGiveTheSameGroups) {
                                    {.keys = {d, u}, .calls = calls, .routed = 9},
                                    {.keys = {str, u}, .calls = calls, .routed = 9},
                                    {.keys = {u}, .calls = with_double_sum, .routed = 0},
+                                   {.keys = {u}, .calls = with_wide_decimal, .routed = 0},
+                                   {.keys = {u}, .calls = with_narrow_decimal, .routed = 9},
                                    {.keys = {k}, .calls = calls, .routed = 0, .filter = selective},
                                    {.keys = {u}, .calls = calls, .routed = 0, .filter = selective}};
   for (const Case& c : cases) {
     ExecContext ctx{.pool = arrow::default_memory_pool(), .batch_size = 32};
-    std::unique_ptr<Operator> source =
-        std::make_unique<TableScanOperator>(RoutedTable(false), std::vector<int>{0, 1, 2, 3, 4});
+    std::unique_ptr<Operator> source = std::make_unique<TableScanOperator>(
+        RoutedTable(false), std::vector<int>{0, 1, 2, 3, 4, 5, 6});
     if (!c.filter.empty()) {
       source = std::make_unique<FilterOperator>(std::move(source), c.filter);
     }
