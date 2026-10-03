@@ -1538,13 +1538,21 @@ std::optional<arrow::Result<TypedConstant>> FoldTyped(const sql::Expr& expr) {
   };
   if (const auto* unary = std::get_if<sql::UnaryExpr>(&expr);
       unary != nullptr && unary->op == sql::UnaryOp::kNegate) {
-    // DuckDB folds the minus of a literal into the literal while parsing, so
+    // DuckDB folds the minuses of a literal into the literal while parsing, so
     // -(-9223372036854775808) is the HUGEINT literal 9223372036854775808, not an overflowing
-    // negation.
-    if (const auto* lit = std::get_if<sql::Literal>(&*unary->operand);
+    // negation, and -(-(-9223372036854775808)) is a BIGINT.
+    bool flip = true;
+    const sql::Expr* operand = &*unary->operand;
+    for (const auto* inner = std::get_if<sql::UnaryExpr>(operand);
+         inner != nullptr && inner->op == sql::UnaryOp::kNegate;
+         inner = std::get_if<sql::UnaryExpr>(operand)) {
+      flip = !flip;
+      operand = &*inner->operand;
+    }
+    if (const auto* lit = std::get_if<sql::Literal>(operand);
         lit != nullptr && lit->kind == sql::Literal::Kind::kInteger) {
       sql::Literal negated = *lit;
-      negated.negative = !lit->negative;
+      negated.negative = flip != lit->negative;
       negated.span = unary->span;
       return FoldTyped(sql::Expr(std::move(negated)));
     }

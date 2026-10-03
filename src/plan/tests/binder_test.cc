@@ -381,6 +381,9 @@ INSTANTIATE_TEST_SUITE_P(
                   "Cannot mix values of type VARCHAR and DATE in BETWEEN clause"},
         ErrorCase{"SELECT i32 FROM t WHERE '2020-01-01' NOT BETWEEN dt AND s", kBind, "NOT BETWEEN",
                   "Cannot mix values of type VARCHAR and DATE in BETWEEN clause"},
+        // DuckDB folds every minus of a literal into it: -(-(-9223372036854775808)) is a BIGINT.
+        ErrorCase{"SELECT i32 FROM t WHERE i64 = -(-(-9223372036854775808)) - 1", kBind,
+                  "-(-(-9223372036854775808)) - 1", "Overflow in subtraction of BIGINT"},
         ErrorCase{"SELECT i32 FROM t WHERE 1 BETWEEN 0 AND 2", kUnsupported, "0",
                   "comparisons between two literals are not supported"},
         ErrorCase{"SELECT i32 FROM t WHERE i32 BETWEEN i16 AND s", kBind, "BETWEEN",
@@ -1113,6 +1116,8 @@ TEST(BinderTest, BetweenAndConstantOperands) {
            // DuckDB folds the minus of a literal into it: -(-9223372036854775808) is a HUGEINT.
            Case{.sql = "SELECT COUNT(*) FROM t WHERE i64 < -(-9223372036854775808)",
                 .text = "Filter i64 IS NOT NULL\n"},
+           Case{.sql = "SELECT COUNT(*) FROM t WHERE h = -(-(9223372036854775808))",
+                .text = "Filter h = 9223372036854775808\n"},
            Case{.sql = "SELECT COUNT(*) FROM t WHERE h > -(-9223372036854775808) - 1",
                 .text = "Filter h > 9223372036854775807\n"},
            // A DOUBLE operand makes both comparisons DOUBLE, as DuckDB's common type.

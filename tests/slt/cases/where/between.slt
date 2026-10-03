@@ -285,3 +285,41 @@ query I nosort
 SELECT COUNT(*) FROM hits_like WHERE RegionID < -(-9223372036854775808)
 ----
 10000
+
+# A DOUBLE operand compares with both bounds in DOUBLE, DuckDB's common type of the three values, whatever the bounds'
+# types: BIGINT and wide literals, decimals with integers.
+query I nosort
+SELECT COUNT(*) FROM edge WHERE d BETWEEN i64 AND 3000000000
+----
+3
+
+query I rowsort
+SELECT id FROM edge WHERE d NOT BETWEEN -9007199254740993 AND i64
+----
+0
+10
+3
+
+query IT rowsort
+SELECT id, CASE WHEN d BETWEEN i16 AND 9223372036854775807 THEN 'in' ELSE 'out' END FROM edge
+----
+0	in
+1	out
+10	in
+11	out
+2	in
+3	in
+4	out
+5	out
+6	in
+7	out
+8	out
+9	out
+
+query I rowsort
+SELECT id FROM edge WHERE d BETWEEN -1.5 AND i32 OR d BETWEEN 1e300 AND i64
+----
+1
+2
+4
+8
