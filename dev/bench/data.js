@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790985542006,
+  "lastUpdate": 1791000267693,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -4152,6 +4152,90 @@ window.BENCHMARK_DATA = {
             "value": 11.27161254838656,
             "unit": "ms/iter",
             "extra": "iterations: 62\ncpu: 11.271235064516134 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1a89ee3f89022ad99d65cf0141a25a467fe4b384",
+          "message": "feat(plan): join nodes with two inputs (#84)\n\n## Summary\n\nPlans can now hold joins: a new `JoinNode` with two inputs, and every\nwalk of a plan visits both. This is PR J1a of\nthe roadmap for the queries derived from TPC-H, the \"Join nodes\" part of\nADR 0022. No SQL produces a join yet (J2b\nbinds them) and the executor rejects one with exit code 4 until the hash\njoin (J1b; E2 for the other kinds), so\nevery EXPLAIN golden and every answer stays the same. J1b and J2b build\non this.\n\n**The node** (`logical_plan.h`):\n\n- `JoinNode`: a kind (`kInner`, `kLeft`, `kSemi`, `kAnti`,\n`kNullAwareAnti`, `kOneRow`), left and right inputs,\nkey pairs (`JoinKey`: a left and a right `BoundColumn` of one type),\nBOOLEAN residual conjuncts (`ExprPtr`) over\nthe left input's columns then the right input's, the build side\n(`BuildSide`) and a span.\n- Output ids: inner, left and one-row output the left ids then the right\nids; semi, anti and null-aware anti output\n  the left ids only.\n- `InputsOf` (every input, in order) and `WithInputs` (a copy over new\ninputs; a wrong count aborts) replace\n  `InputOf`. The optimizer's local `WithInput` is gone.\n- `BoundColumn::qualifier`: EXPLAIN prints a column as `qualifier.name`\nwhen it is set. J2b's binder sets it from\n  the binding name; nothing sets it yet.\n\n**Walkers:**\n\n- **Position resolver** (`ResolvePositions`, `PositionMismatch`): a key\nresolves against its own input, a residual\ncolumn against the left ids then the right ids. New invariants: a key\npair of two types; a join without keys, or a\none-row join with keys; a residual that is not BOOLEAN; a build side the\nkind does not allow (only an inner join\nmay build on its left input). A column defined in both inputs already\nfails as defined twice.\n- **Optimizer:** `COUNT(*)` to `RowCount`, dependent GROUP BY keys and\nthe Limit pushdown recurse into every input\nthrough one helper (`MapInputs`). Under a Limit without a Sort, both\ninputs of a join count as limited, which is\nconservative. A Limit moves below a Project down to a join, never\nthrough it. Projection pruning asks both inputs\nfor what is needed above plus the keys and the residual columns; ids are\nunique, so each input keeps what it\n  outputs.\n- **EXPLAIN:** one line per join, then its left and its right input one\nlevel deeper:\n`Join INNER build=right keys=[a.k = b.k] residual=[(a.x < b.y)]`.\n`residual=` appears only when there are\n  residuals.\n- **Physical planner:** a join is `kUnsupported` (exit code 4) at its\nspan: `INNER joins are not supported yet`.\n`PipelineScan`, `FiltersOnScan` and `LateSplit` already stop at any node\nthat is not a Filter, Compute or\nProject, so no part pipeline runs over a join; a comment and tests now\npin that.\n\n**Tests** (hand-built plans):\n\n- `logical_plan_test`: every node's name, span and inputs (the join's\ntwo in order), `WithInputs` for every node,\na death test for a wrong input count, and the names of the kinds and\nbuild sides.\n- `column_ids_test`: the output ids of every kind; keys resolved per\ninput and residuals over both inputs (also\nabove the join, and a semi join hiding the right columns); every kind\nresolves; one `PositionMismatch` message per\nnew invariant, plus a key from the wrong input, a residual column in\nneither input and a column in both inputs; a\n  death test through `Optimize`.\n- `optimizer_test`: pruning through both inputs, with positions after\npruning, and a semi join whose right input\nkeeps only its key; `COUNT(*)` to `RowCount` inside a join input and not\nabove a join; dependent keys rewritten\ninside an input but not under a Limit above the join; the Limit pushdown\nabove and inside a join; and the rules\nread ids, not positions, over a join (every position set to 0 and to 999\ngives the same plan).\n  `MapReferences` handles the join.\n- `explain_test`: nested joins with qualified, quoted and unqualified\nnames and residuals; every kind's line; and\n  qualified names in Filter, Aggregate, GroupAggregate and Sort.\n- `physical_planner_test`: every kind is unsupported at its span, also\nunder Filter, Compute, Project, Aggregate\n(with `COUNT(DISTINCT)` too), GroupAggregate, Sort, Limit and Limit over\nSort, and with a profile.\n\n**Docs:** `docs/sql-subset.md` (\"Logical plans and EXPLAIN\": the node,\npruning through both inputs, the Join line\nwith an example) and `docs/architecture.md` (the plan module, steps 5\nand 6, the \"A logical plan node\" row).\n\nFor the maintainer:\n\n- The roadmap entry says \"EXPLAIN renders both children with qualified\nnames\". As you decided in the plan, the\nnames come from a `qualifier` on `BoundColumn`, which J2b's binder sets.\nUntil then no column is qualified, and\n  that is why no golden changes.\n- ClickBench data could not be downloaded in this environment (HTTP 403\non hits_0), so `pixi run test-data` did not\nrun. The 43 query texts did download; their EXPLAIN was compared over\nour own `hits_like` fixture registered as\n  the table instead (see Verification).\n- `docs/adr/0022-joins-and-query-blocks.md` line 43 still describes\n`plan::InputOf` as today's API. It is the ADR's\n  context section and ADR edits need you, so it is left as is.\n\nThis workload is derived from the TPC-H Benchmark and is not comparable\nto published TPC-H Benchmark results, as this\nimplementation does not comply with all requirements of the TPC-H\nBenchmark.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full                  # on 074751e\nlint: PASS\nci        100% tests passed out of 1627 (main has 1613; this adds 14)\nasan      100% tests passed out of 1627\ntidy      passed\ncoverage  100% tests passed out of 1627; Coverage gate: PASS\n          plan  lines 96.10% (floor 93.5), branches 91.62% (floor 89.5)\n          exec  lines 96.73% (floor 96.1), branches 86.23% (floor 85.1)\nfuzz      100% tests passed out of 2\nci-gcc    100% tests passed out of 1627\n\nEXPLAIN on main (c33f351) and on 11322e4 (074751e changes only tests and a const; local script, plans not shown; exit code, stdout and stderr compared):\nslt: 628 records, 628 identical\ndiff seeds 1, 2, 20260925: 3000 queries each (9002 SQL lines), all identical\nclickbench query texts over the hits_like fixture as the table: 43 queries, 43 identical\n```\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: none\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code implemented the\nmaintainer-approved plan (node, walkers,\ntests, docs) and compared EXPLAIN before and after locally, and a\nreviewer agent reviewed the diff.\n- Accountable human (has read and understands the whole diff): @hor911\n\n---------\n\nCo-authored-by: Claude <noreply@anthropic.com>",
+          "timestamp": "2026-10-03T07:01:41+03:00",
+          "tree_id": "bcfa672ca57f87fcb00843cf87f4f9337ee48a68",
+          "url": "https://github.com/ydb-campus/antb1/commit/1a89ee3f89022ad99d65cf0141a25a467fe4b384"
+        },
+        "date": 1791000267262,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4667.298442188179,
+            "unit": "ns/iter",
+            "extra": "iterations: 149312\ncpu: 4666.056345102872 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84495.31018231723,
+            "unit": "ns/iter",
+            "extra": "iterations: 8063\ncpu: 84491.34664516931 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222206.19492063383,
+            "unit": "ns/iter",
+            "extra": "iterations: 3150\ncpu: 222187.1685714287 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 444423.23870145873,
+            "unit": "ns/iter",
+            "extra": "iterations: 1571\ncpu: 444411.84086569067 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 349544.12587412604,
+            "unit": "ns/iter",
+            "extra": "iterations: 2002\ncpu: 349349.9610389612 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2100151.0574018504,
+            "unit": "ns/iter",
+            "extra": "iterations: 331\ncpu: 2099110.725075529 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 54.8584089230771,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 54.85390661538462 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 46.46480873333303,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 46.44189986666666 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 227.60787666666715,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 227.58212500000022 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.91547680851113,
+            "unit": "ms/iter",
+            "extra": "iterations: 47\ncpu: 14.915148851063831 ms\nthreads: 1"
           }
         ]
       }
