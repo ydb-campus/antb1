@@ -128,8 +128,9 @@ are the same expression.
   with an exponent or of more than 38 digits) and the operand is not, a `BETWEEN` that also has a `BIGINT` or
   `HUGEINT` value (a column, a literal or a folded constant of that type), a `FLOAT` column, or a decimal literal and
   an integer value is unsupported; one that mixes a `VARCHAR` value with a `DATE` or `TIMESTAMP` value is a bind
-  error, as in DuckDB. As in DuckDB, the minus of an integer literal belongs to the literal, so
-  `-(-9223372036854775808)` is a `HUGEINT`, not an overflow. A plain `BETWEEN` in the `AND` chain of `WHERE` or
+  error, as in DuckDB. As in DuckDB, every unary minus directly over an integer literal (through
+  any nesting) belongs to the literal, so `-(-9223372036854775808)` is a `HUGEINT`, not an overflow, and
+  `-(-(-9223372036854775808))` a `BIGINT`. A plain `BETWEEN` in the `AND` chain of `WHERE` or
   `HAVING` is its two comparisons, each folded and, over a table column, pushed into the scan like any comparison;
   `NOT BETWEEN`, `NOT (a BETWEEN ...)` and `BETWEEN` under `OR` or in `CASE` are compound conditions. DuckDB's names
   apply: `(a BETWEEN 1 AND 2)`, and both negations `(NOT (a BETWEEN 1 AND 2))`;

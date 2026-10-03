@@ -286,6 +286,11 @@ SELECT COUNT(*) FROM hits_like WHERE RegionID < -(-9223372036854775808)
 ----
 10000
 
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i64 BETWEEN -(-(-9223372036854775808)) AND -(-(9223372036854775807))
+----
+10
+
 # A DOUBLE operand compares with both bounds in DOUBLE, DuckDB's common type of the three values, whatever the bounds'
 # types: BIGINT and wide literals, decimals with integers.
 query I nosort
