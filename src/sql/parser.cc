@@ -676,6 +676,9 @@ class Parser {
       // the right operand is parsed as its child (one level deeper).
       const SourceSpan op = Peek().span;
       const std::size_t lhs_peak = peak_;
+      if (lhs_peak + 1 > kMaxDepth) {
+        return std::unexpected(DepthError(op));  // before the right operand: the first error wins
+      }
       peak_ = depth_;
       auto combined = ParseInfix(context, *std::move(lhs), precedence);
       if (!combined) {

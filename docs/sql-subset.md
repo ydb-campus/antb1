@@ -93,13 +93,13 @@ not chain: `a = b = c` and `a BETWEEN 1 AND 2 = b` are unsupported; the bounds o
 `+`, so its `AND` is its own and `a BETWEEN 1 AND 2 AND b = 3` is two conjuncts), `+` and `-`, `*`, `/`, `//` and `%`,
 unary `-`, `::`; binary operators are left-associative, and parentheses group. An expression may be at most 256 levels
 deep, counted along its deepest path through operators and parentheses (the top-level `AND` chain of `WHERE` and
-`HAVING` does not count), else it is unsupported. In a chain such as `a + b + c` each operator pushes everything before
-it one level down, so `f(f(...)) + 1 + 1` counts the calls and the operators together. A `::` and a unary `-` count one
-level more, as they do in the canonical form `CAST(x AS T)` and `-(x)` (a `-` before a parenthesized operand does not),
-and so does a `NOT` that is the right operand of a comparison or of arithmetic, a `LIKE` pattern or a `BETWEEN` bound
-(`a = NOT b` is `a = (NOT b)`). The canonical form writes a `WHERE` or `HAVING` predicate with a top-level `OR` without
-parentheses, so it reads back as it was parsed. Aggregates are allowed in the select list, `HAVING` and `ORDER BY`, and
-cannot be nested.
+`HAVING` does not count, unless an `OR` makes it one tree), else it is unsupported. In a chain such as `a + b + c` each
+operator pushes everything before it one level down, so `f(f(...)) + 1 + 1` counts the calls and the operators together.
+A `::` and a unary `-` count one level more, as they do in the canonical form `CAST(x AS T)` and `-(x)` (a `-` before a
+parenthesized operand does not), and so does a `NOT` that is the right operand of a comparison or of arithmetic, a
+`LIKE` pattern or a `BETWEEN` bound (`a = NOT b` is `a = (NOT b)`). The canonical form writes a `WHERE` or `HAVING`
+predicate with a top-level `OR` without parentheses, so it reads back as it was parsed. Aggregates are allowed in the
+select list, `HAVING` and `ORDER BY`, and cannot be nested.
 
 Lexical rules: an `identifier` is a letter or `_` followed by letters, digits or `_`, or any text in double quotes
 (`""` escapes a quote); a `string_literal` is text in single quotes (`''` escapes a quote); an `integer` is a
