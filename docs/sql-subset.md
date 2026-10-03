@@ -457,7 +457,8 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   return BIGINT, 0 over no values.
 - SUM: over integer columns it accumulates in 128 bits and returns HUGEINT (decimal128(38, 0)), exactly like
   DuckDB, so it never overflows or wraps; Arrow's 64-bit `sum` kernel is never used. A result outside HUGEINT's
-  range is an execution error (divergence D9); no column is HUGEINT, so only arithmetic on a `SUM` can reach it.
+  range is an execution error (divergence D9); no column is HUGEINT, so only a `SUM` of a HUGEINT expression (one
+  with an integer literal beyond BIGINT) or arithmetic on a `SUM` can reach it.
   Over DOUBLE it returns DOUBLE: it adds each row group's values (of each group), then the row group sums in order
   (the same for any number of threads; see Execution below). DOUBLE `AVG` sums the same way.
 - AVG: over integer columns the sum accumulates exactly in 128 bits and is divided by the count once at the end, so
@@ -567,7 +568,7 @@ formatter:
 | Code | Meaning | Examples |
 | --- | --- | --- |
 | 0 | success | |
-| 1 | query error: syntax, bind, execution or memory error | `SELECT COUNT(*) FORM t`; an unknown table or column; `SUM` of a VARCHAR column; arithmetic on a `SUM` outside HUGEINT's range; an invalid `regexp_replace` pattern; a query that needs more memory than `--memory-limit` |
+| 1 | query error: syntax, bind, execution or memory error | `SELECT COUNT(*) FORM t`; an unknown table or column; `SUM` of a VARCHAR column; a `SUM`, or arithmetic on a `SUM`, outside HUGEINT's range; an invalid `regexp_replace` pattern; a query that needs more memory than `--memory-limit` |
 | 2 | usage error | unknown option; neither or both of `-c` and `-f`; a malformed `--table`, `--column-type` or `--memory-limit`; a column that `--column-type` cannot read as DATE; a table name registered twice |
 | 3 | I/O error | a missing or unreadable file; not a Parquet file; schemas that differ; a glob that matches nothing |
 | 4 | unsupported: valid-looking SQL outside the supported subset | `row_number() OVER ()`; `IS NULL`; an unknown function; `SELECT 2.5`; `SUM(DISTINCT ...)`; `CAST(a AS BIGINT)`; `SUM` of a DECIMAL column; a column of an unsupported type |

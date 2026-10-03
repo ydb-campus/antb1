@@ -592,8 +592,9 @@ std::optional<plan::PartStats> ParquetTable::part_stats(int64_t part, int field)
   // The schema is the engine view, so its types always convert.
   const plan::LogicalType engine =
       plan::FromArrow(*schema_->field(field)->type()).ValueOr(plan::LogicalType::kVarchar);
-  // HUGEINT is left out: it is stored as a fixed-length byte array, whose decimal statistics some
-  // writers got wrong (compared as unsigned bytes) in ways a reader cannot always detect.
+  // DECIMAL is left out (not an integer type; ADR 0021): a FIXED_LEN_BYTE_ARRAY decimal's statistics
+  // some writers got wrong (compared as unsigned bytes) in ways a reader cannot always detect. No
+  // column is HUGEINT; the check below keeps it out as well.
   const bool integer_valued = (plan::IsInteger(engine) && engine != plan::LogicalType::kHugeInt) ||
                               engine == plan::LogicalType::kDate;
   if (leaf < 0 || !integer_valued) {
