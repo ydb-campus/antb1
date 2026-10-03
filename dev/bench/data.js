@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791037262575,
+  "lastUpdate": 1791042611553,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -4404,6 +4404,90 @@ window.BENCHMARK_DATA = {
             "value": 14.81120068085106,
             "unit": "ms/iter",
             "extra": "iterations: 47\ncpu: 14.809246425531901 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d0fa94ea42651a30bb566f4cbe32ddbeb17abc4e",
+          "message": "fix(sql): bound the expression tree's height, not just the parser's nesting (#88)\n\n## Summary\n\nThe parser promises that no accepted expression tree is deeper than 256\nlevels, so the recursive code that walks\ntrees (copy, compare, unparse, bind, destroy) cannot overflow the stack.\nLeft-deep operator chains broke that\npromise. This is a small non-roadmap fix that the maintainer approved;\nthe reviewer agent found the bug while\nreviewing #87.\n\n- **The bug:** `ParseExprAtDepth` counted one level per operator from\nwhere the chain started. Every later operator\npushes the chain's left operand, and the earlier right operands, one\nlevel down, and that shift was never counted.\nThe AND and OR chains of WHERE and HAVING (`ParseConjunctsAtDepth`,\n`Conjunction`) had the same flaw. A 58 KB query\nthat nests 120 parentheses, each closed by 120 `+`, parsed on main into\na tree thousands of levels deep, and\n`antb1 explain` segfaulted (exit 139). Smaller inputs such as\n`f(f(...200...)) + 1 + ... (200 times)` built trees\n  about 400 deep without crashing.\n- **The fix (`src/sql/parser.cc`):** the parser counts the height of the\ntree it builds, using S1's `peak_` counter,\n  which already includes the canonical form's levels.\n- Each operator becomes its frame's root. The tree so far moves one\nlevel down, and the right operand is parsed as\nits child: `peak = max(left_peak + 1, right_peak)`. Above 256 this is\nthe depth error at the operator, checked\nbefore the right operand is parsed, so the first error wins. The\nWHERE/HAVING OR does the same.\n- The WHERE/HAVING chain lifts each AND and OR in the same way once an\nOR makes it one tree. A conjunct-only AND\n    chain stays free, as documented.\n- **New public API (sql module):** `sql::kMaxExpressionDepth`\n(`parser.h`) replaces the private constant, and\n`sql::Depth(const Expr&)` / `sql::Depth(const SelectStatement&)`\n(`ast.h`) measure a tree.\n- **Fuzzing:** the fuzz property (`fuzz/sql_parser_property.h`) gains a\nfifth check: no accepted tree is deeper than\n`kMaxExpressionDepth`. The fuzzer can now find this class of bug on its\nown, and the corpus replay runs the check in\n  every build.\n\n**Tests:**\n\n- `ParserTest.OperatorChainsCountTheirOperandsDepth` covers exact\nboundaries for these shapes; the deepest accepted\n  tree has exactly 256 levels:\n  - a deep left operand, then a chain;\n  - a deep right operand early in a chain;\n  - a long chain with a deep last operand;\n  - a deep conjunct, then ANDs, then OR;\n  - ANDs, then a deep conjunct, then OR;\n  - an OR chain in HAVING.\n\nIt also checks shapes with parentheses, casts and minuses, which may\nonly stay at or below the limit.\n- #87's sweep helper now also asserts `Depth ≤ 256` for every accepted\ninput. It finds the first rejected n by\nbisection and checks a window around it and a sample below it. Sweeping\nevery n was quadratic and hit ctest's 120 s\n  timeout under ASan in CI; under ASan the two sweeps now take 6–8 s.\n- With the fix reverted, the new test, #87's sweep, and the replay of\nthe new regression input\n`fuzz/regressions/operator-chain-tree-too-deep` all fail. Replayed on\nthe old parser, that input gives \"an\n  expression tree is 401 levels deep (limit 256)\".\n- A CLI golden, `unsupported_deep_operator_chains`: the crash shape (58\nKB, one chain per line) now exits 4 with the\n  depth error at the operator. The old binary segfaults on it.\n\n**Docs:** the depth paragraph of `docs/sql-subset.md` and the comments\nin `parser.h` and `parser.cc`.\n\nFor the maintainer:\n\n- **Behavior change:** parentheses count as a level, as the docs already\nsaid, and now every operator after them\npushes them down too. So redundant parentheses use up the limit about\ntwice as fast: a fully parenthesized\nleft-deep chain `((((a + b) + c) + d) …)` reaches it at about 128\noperators. Such inputs were accepted before only\n  because the old count did not bound them.\n- This PR and #87 both edited the parser, and parser PRs merge one at a\ntime. So this branch was built locally on\n#87's branch, rebased onto main after #87 merged (it had never been\npushed), and only then pushed.\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [x] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full                  # on 2ce9de9\nlint: PASS\nci        100% tests passed out of 1675\nasan      100% tests passed out of 1675\ntidy      passed\ncoverage  100% tests passed out of 1675; Coverage gate: PASS\nfuzz      100% tests passed out of 2\nci-gcc    100% tests passed out of 1675\n$ ANTB1_FUZZ_SECONDS=600 pixi run fuzz # on 006d7d6 (2ce9de9 changes a test and one error position)\nstat::number_of_executed_units: 2593778\nfuzz: PASS\n$ ANTB1_DIFF_SEED=7 ANTB1_DIFF_COUNT=20000 pixi run diff-random   # on 4a9f466 (same tree as 006d7d6 before the rebase)\nDIFF: PASS seed=7 queries=20000 failed=0 unsupported=0\n```\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: none\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code implemented the\nmaintainer-approved plan (parser counting,\nthe depth API, the fuzz property, tests, CLI golden, docs), and a\nreviewer agent reviewed the diff (its minor points\n  are in 006d7d6; the Claude review's optional OR note is in 2ce9de9).\n- Accountable human (has read and understands the whole diff): @hor911\n\n---------\n\nCo-authored-by: Claude <noreply@anthropic.com>",
+          "timestamp": "2026-10-03T18:47:25+03:00",
+          "tree_id": "2a43c09b67842b531e1fa2e13451ceca7c187feb",
+          "url": "https://github.com/ydb-campus/antb1/commit/d0fa94ea42651a30bb566f4cbe32ddbeb17abc4e"
+        },
+        "date": 1791042611133,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4690.677990724042,
+            "unit": "ns/iter",
+            "extra": "iterations: 150064\ncpu: 4690.103729075595 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84324.69803664928,
+            "unit": "ns/iter",
+            "extra": "iterations: 7640\ncpu: 84282.50471204189 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 221928.23344947543,
+            "unit": "ns/iter",
+            "extra": "iterations: 3157\ncpu: 221833.77320240738 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 437721.56195244135,
+            "unit": "ns/iter",
+            "extra": "iterations: 1598\ncpu: 437566.92365456856 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 402045.22120344394,
+            "unit": "ns/iter",
+            "extra": "iterations: 1745\ncpu: 401865.8802292265 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2114155.912650603,
+            "unit": "ns/iter",
+            "extra": "iterations: 332\ncpu: 2113484.975903612 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 51.443693999999596,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 51.43674523076922 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 44.856518312499816,
+            "unit": "ms/iter",
+            "extra": "iterations: 16\ncpu: 44.84877906250001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 201.660395333325,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 201.6316163333336 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.400751551020175,
+            "unit": "ms/iter",
+            "extra": "iterations: 49\ncpu: 14.39982040816328 ms\nthreads: 1"
           }
         ]
       }
