@@ -389,7 +389,7 @@ int RunCli(std::span<const std::string> args, std::istream& in_stream, std::ostr
       for (const auto& field : table->schema()->fields()) {
         auto logical = plan::FromArrow(*field->type());
         out << "  " << field->name() << '\t'
-            << (logical.ok() ? std::string(plan::ToString(*logical))
+            << (logical.ok() ? plan::ToString(*logical)
                              : "unsupported(" + field->type()->ToString() + ")")
             << '\n';
       }

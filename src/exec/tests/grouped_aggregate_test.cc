@@ -210,8 +210,7 @@ TEST_F(GroupedAggregateTest, EveryGroupEqualsTheScalarStateOverItsRows) {
       id = static_cast<std::uint32_t>(rng.Below(kGroups - 1));
     }
     for (const Call& call : CallsOver(type)) {
-      SCOPED_TRACE(std::string(plan::ToString(call.kind)) + " of " +
-                   std::string(plan::ToString(type)));
+      SCOPED_TRACE(std::string(plan::ToString(call.kind)) + " of " + plan::ToString(type));
       auto grouped = MakeGrouped(call);
       ASSERT_NE(grouped, nullptr);
       grouped->Resize(kGroups);
@@ -253,7 +252,7 @@ TEST_F(GroupedAggregateTest, CountDistinctMatchesASetPerGroup) {
   constexpr std::uint32_t kGroups = 7;  // group 6 gets no row
   Rng rng(42);
   for (const LogicalType type : kTypes) {
-    SCOPED_TRACE(std::string(plan::ToString(type)));
+    SCOPED_TRACE(plan::ToString(type));
     const auto values = RandomColumn(type, kRows, rng);
     std::vector<std::uint32_t> ids(kRows);
     std::vector<std::set<std::string>> model(kGroups);
@@ -304,8 +303,7 @@ TEST_F(GroupedAggregateTest, MergingPartialStatesGivesTheSinglePassResult) {
       id = static_cast<std::uint32_t>(rng.Below(kGroups));
     }
     for (const Call& call : CallsOver(type)) {
-      SCOPED_TRACE(std::string(plan::ToString(call.kind)) + " of " +
-                   std::string(plan::ToString(type)));
+      SCOPED_TRACE(std::string(plan::ToString(call.kind)) + " of " + plan::ToString(type));
       auto single = MakeGrouped(call);
       single->Resize(kGroups);
       ASSERT_TRUE(single->Consume(call.input ? values.get() : nullptr, ids).ok());
@@ -358,8 +356,7 @@ TEST_F(GroupedAggregateTest, MergingSubsetsOfGroups) {
       id = static_cast<std::uint32_t>(rng.Below(kGroups));
     }
     for (const Call& call : CallsOver(type)) {
-      SCOPED_TRACE(std::string(plan::ToString(call.kind)) + " of " +
-                   std::string(plan::ToString(type)));
+      SCOPED_TRACE(std::string(plan::ToString(call.kind)) + " of " + plan::ToString(type));
       auto part = MakeGrouped(call);
       part->Resize(kGroups);
       ASSERT_TRUE(part->Consume(call.input ? values.get() : nullptr, ids).ok());
@@ -702,7 +699,7 @@ TEST_F(GroupedAggregateTest, EveryKeyTypeAndBatchSizeInvariance) {
   arrow::FieldVector fields;
   arrow::ArrayVector columns;
   for (const LogicalType type : kTypes) {
-    fields.push_back(arrow::field(std::string(plan::ToString(type)), plan::ToArrow(type)));
+    fields.push_back(arrow::field(plan::ToString(type), plan::ToArrow(type)));
     // Few distinct values per column: keep only rng.Below(3)-derived repeats.
     auto column = RandomColumn(type, kRows, rng);
     std::vector<std::int64_t> small(kRows);
