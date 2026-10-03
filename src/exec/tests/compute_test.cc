@@ -326,6 +326,28 @@ TEST_F(ComputeTest, DecimalArithmeticErrors) {
             "i32");
 }
 
+// The left operand of + and - is computed and rescaled before the right one is computed, as in
+// DuckDB 1.5.5: here its failed rescale is reported, not the right operand's overflow.
+TEST_F(ComputeTest, DecimalOperandsInDuckDbOrder) {
+  const LogicalType e = LogicalType::Decimal(18, 4);
+  Int128 big = 1;
+  for (int i = 0; i < 32; ++i) {
+    big *= 10;
+  }
+  const auto left = Arith(ArithOp::kMultiply, ColumnAt(0, LogicalType::kBigInt),
+                          ConstantOf(big, LogicalType::kHugeInt), LogicalType::kHugeInt);
+  const auto right =
+      Arith(ArithOp::kMultiply, ColumnAt(1, e), ColumnAt(1, e), LogicalType::Decimal(18, 8));
+  const auto sum = Arith(ArithOp::kAdd, left, right, LogicalType::Decimal(38, 8));
+  EXPECT_EQ(Eval(sum, {Int64s({1}), Decimals(e, {"1200000000000000"})}).status().message(),
+            "Could not cast value 100000000000000000000000000000000 to DECIMAL(38,8)");
+  // The right operand alone overflows.
+  EXPECT_TRUE(Eval(right, {Int64s({1}), Decimals(e, {"1200000000000000"})})
+                  .status()
+                  .message()
+                  .starts_with("Overflow in multiplication of DECIMAL(18)"));
+}
+
 // A Compute appends its columns to the selected rows only: a row a filter dropped is never
 // computed, so it cannot overflow.
 TEST_F(ComputeTest, ComputesOnlyTheSelectedRows) {

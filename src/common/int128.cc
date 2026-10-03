@@ -70,7 +70,9 @@ Real DuckDbHugeintToReal(Int128 value) {
 }  // namespace
 
 double DuckDbDecimalAverage(Int128 sum, int64_t count, int width, int scale) {
-  ANTB1_CHECK(count > 0 && scale >= 0 && scale <= 38);
+  ANTB1_CHECK(count > 0);
+  ANTB1_CHECK(scale >= 0);
+  ANTB1_CHECK(scale <= 38);
   Int128 power = 1;
   for (int i = 0; i < scale; ++i) {
     power *= 10;

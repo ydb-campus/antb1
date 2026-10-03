@@ -192,6 +192,7 @@ arrow::Result<ArrayPtr> HugeIntArith(const arrow::Array& left, const arrow::Arra
 struct DecimalOperand {
   std::vector<Int128> values;
   const arrow::Array* array = nullptr;
+  ArrayPtr owner;  // keeps `array` alive
   plan::LogicalType type;
   std::string column;
 };
@@ -202,7 +203,7 @@ arrow::Result<DecimalOperand> ReadDecimalOperand(const arrow::Array& array, plan
                          .array = &array,
                          .type = type,
                          .column = std::move(column)};
-  const auto read = [&]<class ArrayType>() {
+  const auto read = [&]<class ArrayType> {
     const auto& typed = static_cast<const ArrayType&>(array);
     for (int64_t i = 0; i < typed.length(); ++i) {
       if (typed.IsValid(i)) {
@@ -244,8 +245,9 @@ arrow::Result<DecimalOperand> ReadDecimalOperand(const arrow::Array& array, plan
 arrow::Status RescaleOperand(DecimalOperand& operand, plan::LogicalType result) {
   const bool decimal = operand.type == plan::LogicalType::kDecimal;
   const int from_scale = decimal ? operand.type.scale() : 0;
+  const int to_scale = result.scale();
   Int128 factor = 1;
-  for (int k = from_scale; k < result.scale(); ++k) {
+  for (int k = from_scale; k < to_scale; ++k) {
     factor *= 10;  // at most 10^38
   }
   const plan::IntegerRange range = plan::RangeOf(result);
@@ -296,15 +298,13 @@ arrow::Status DecimalOverflow(plan::ArithOp op, Int128 x, Int128 y, plan::Logica
                                        hint);
 }
 
-// `left <op> right` in the DECIMAL `result`: + and - rescale both operands to it (left, then right,
-// as DuckDB casts the whole of each), * multiplies the unscaled values (the scales add up); every
-// result must fit the result's width (only a width capped to 18 or 38 can overflow).
-arrow::Result<ArrayPtr> DecimalArith(DecimalOperand left, DecimalOperand right, plan::ArithOp op,
-                                     plan::LogicalType result, arrow::MemoryPool* pool) {
-  if (op != plan::ArithOp::kMultiply) {
-    ARROW_RETURN_NOT_OK(RescaleOperand(left, result));
-    ARROW_RETURN_NOT_OK(RescaleOperand(right, result));
-  }
+// `left <op> right` in the DECIMAL `result`, the operands already rescaled for + and - (the caller
+// computes and rescales the left operand before it computes the right one, as DuckDB does), * over
+// the unscaled values (the scales add up); every result must fit the result's width (only a width
+// capped to 18 or 38 can overflow).
+arrow::Result<ArrayPtr> DecimalArith(const DecimalOperand& left, const DecimalOperand& right,
+                                     plan::ArithOp op, plan::LogicalType result,
+                                     arrow::MemoryPool* pool) {
   const plan::IntegerRange range = plan::RangeOf(result);
   arrow::Decimal128Builder builder(plan::ToArrow(result), pool);
   ARROW_RETURN_NOT_OK(builder.Reserve(left.array->length()));
@@ -828,20 +828,26 @@ struct Evaluator {
   }
 
   arrow::Result<ArrayPtr> Evaluate(const plan::ArithExpr& arith, const plan::Expr& e) const {
+    if (e.type == plan::LogicalType::kDecimal) {
+      // Each operand in its own type (DECIMAL(38,0) and HUGEINT share an Arrow type); for + and -
+      // the left one is computed and rescaled before the right one is computed, as in DuckDB.
+      const auto operand = [&](const plan::Expr& expr) -> arrow::Result<DecimalOperand> {
+        ARROW_ASSIGN_OR_RAISE(ArrayPtr values, (*this)(expr));
+        const std::string column =
+            std::holds_alternative<plan::ColumnExpr>(expr.node) ? expr.name : std::string();
+        ARROW_ASSIGN_OR_RAISE(DecimalOperand read, ReadDecimalOperand(*values, expr.type, column));
+        read.owner = std::move(values);
+        if (arith.op != plan::ArithOp::kMultiply) {
+          ARROW_RETURN_NOT_OK(RescaleOperand(read, e.type));
+        }
+        return read;
+      };
+      ARROW_ASSIGN_OR_RAISE(const DecimalOperand l, operand(*arith.left));
+      ARROW_ASSIGN_OR_RAISE(const DecimalOperand r, operand(*arith.right));
+      return DecimalArith(l, r, arith.op, e.type, pool);
+    }
     ARROW_ASSIGN_OR_RAISE(ArrayPtr left, (*this)(*arith.left));
     ARROW_ASSIGN_OR_RAISE(ArrayPtr right, (*this)(*arith.right));
-    if (e.type == plan::LogicalType::kDecimal) {
-      // Each operand in its own type (DECIMAL(38,0) and HUGEINT share an Arrow type).
-      const auto column = [](const plan::Expr& operand) {
-        return std::holds_alternative<plan::ColumnExpr>(operand.node) ? operand.name
-                                                                      : std::string();
-      };
-      ARROW_ASSIGN_OR_RAISE(DecimalOperand l,
-                            ReadDecimalOperand(*left, arith.left->type, column(*arith.left)));
-      ARROW_ASSIGN_OR_RAISE(DecimalOperand r,
-                            ReadDecimalOperand(*right, arith.right->type, column(*arith.right)));
-      return DecimalArith(std::move(l), std::move(r), arith.op, e.type, pool);
-    }
     const auto type = plan::ToArrow(e.type);
     ARROW_ASSIGN_OR_RAISE(left, CastTo(left, type, ctx));
     ARROW_ASSIGN_OR_RAISE(right, CastTo(right, type, ctx));
