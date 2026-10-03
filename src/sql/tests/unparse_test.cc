@@ -64,8 +64,18 @@ TEST(UnparseTest, CanonicalForms) {
                             "ORDER BY 2"},
            Case{.input = "select a from t where a between 1 and b + 2 and not c not between 'x' "
                          "and (d - 1) or e between -1 and (2 * 3)",
-                .canonical = "SELECT a FROM t WHERE (a BETWEEN 1 AND b + 2 AND NOT c NOT BETWEEN "
-                             "'x' AND d - 1 OR e BETWEEN -1 AND 2 * 3)"},
+                .canonical = "SELECT a FROM t WHERE a BETWEEN 1 AND b + 2 AND NOT c NOT BETWEEN "
+                             "'x' AND d - 1 OR e BETWEEN -1 AND 2 * 3"},
+           // A sole conjunct with a top-level OR is written bare (it reads back as parsed); an OR
+           // conjunct next to others keeps its parentheses, and NOT as an operand gets them.
+           Case{.input = "select a from t where (a = 1 or b = 2) group by a having (count(*) > 1 "
+                         "or a = 2)",
+                .canonical = "SELECT a FROM t WHERE a = 1 OR b = 2 GROUP BY a HAVING COUNT(*) > 1 "
+                             "OR a = 2"},
+           Case{.input = "select a from t where (a or b) and c",
+                .canonical = "SELECT a FROM t WHERE (a OR b) AND c"},
+           Case{.input = "select a from t where a = not b and c like not d and -not e",
+                .canonical = "SELECT a FROM t WHERE a = (NOT b) AND c LIKE (NOT d) AND -(NOT e)"},
            Case{.input = "select a from t where a like '%x''%' and b not like '_'",
                 .canonical = "SELECT a FROM t WHERE a LIKE '%x''%' AND b NOT LIKE '_'"},
            Case{.input = "SELECT a FROM t WHERE 5 < a AND b != 'it''s' AND DATE '2024-01-31' >= d",

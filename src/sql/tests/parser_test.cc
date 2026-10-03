@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <optional>
 #include <ostream>
@@ -769,6 +770,139 @@ TEST(ParserTest, ExpressionDepthIsLimited) {
 
 // The levels that the canonical form adds count too (x::T is CAST(x AS T), -x is -(x)), so that
 // the canonical form of every accepted query parses.
+// The first n at which `sql(n)` is rejected, after checking that every accepted n round-trips
+// through the canonical form within the depth limit and that every n from there on is the depth
+// error. 0 when none up to `max` is rejected.
+std::size_t FirstTooDeep(const std::function<std::string(std::size_t)>& sql,
+                         std::size_t max = 400) {
+  std::size_t first = 0;
+  for (std::size_t n = 1; n <= max; ++n) {
+    const std::string text = sql(n);
+    auto stmt = Parse(text);
+    if (first != 0) {
+      EXPECT_FALSE(stmt.has_value()) << "accepted after a rejection: n=" << n;
+      continue;
+    }
+    if (!stmt.has_value()) {
+      EXPECT_EQ(stmt.error().kind, ParseError::Kind::kUnsupported) << stmt.error().message;
+      EXPECT_TRUE(stmt.error().message.starts_with("expressions deeper than 256 levels"))
+          << stmt.error().message;
+      first = n;
+      continue;
+    }
+    const std::string canonical = ToSql(*stmt);
+    auto again = Parse(canonical);
+    if (!again.has_value()) {
+      ADD_FAILURE() << "n=" << n
+                    << ": the canonical form does not parse: " << again.error().message;
+      return 0;
+    }
+    EXPECT_TRUE(EqualIgnoringSpans(*stmt, *again)) << "n=" << n;
+    EXPECT_EQ(ToSql(*again), canonical) << "n=" << n;
+  }
+  return first;
+}
+
+std::string Repeat(std::string_view text, std::size_t n) {
+  std::string out;
+  for (std::size_t i = 0; i < n; ++i) {
+    out += text;
+  }
+  return out;
+}
+
+// Every accepted statement's canonical form parses (the round trip the fuzzer checks), also next
+// to the depth limit: a top-level OR in WHERE or HAVING reads back as parsed, and a NOT that ToSql
+// parenthesizes as an operand counts that level. Written with the parentheses, the same tree is
+// rejected at the same n.
+TEST(ParserTest, CanonicalFormStaysWithinTheDepthLimit) {
+  const auto where = [](std::string predicate) {
+    return "SELECT a FROM t WHERE " + std::move(predicate);
+  };
+  // A top-level OR, also after a long AND chain whose conjuncts it makes one tree.
+  EXPECT_NE(FirstTooDeep([&](std::size_t n) { return where("a = 0" + Repeat(" OR a = 1", n)); }),
+            0U);
+  EXPECT_NE(FirstTooDeep([](std::size_t n) {
+              return "SELECT a FROM t GROUP BY a HAVING a = 0" + Repeat(" OR a = 1", n);
+            }),
+            0U);
+  EXPECT_NE(
+      FirstTooDeep([&](std::size_t n) {
+        return where(Repeat("a AND ", 200) + Repeat("f(", n) + "a" + std::string(n, ')') + " OR b");
+      }),
+      0U);
+  EXPECT_NE(
+      FirstTooDeep([&](std::size_t n) {
+        return where(Repeat("a AND ", n) + Repeat("f(", 50) + "a" + std::string(50, ')') + " OR b");
+      }),
+      0U);
+  // NOT as the right operand of a comparison or arithmetic, a LIKE pattern and BETWEEN bounds,
+  // bare and parenthesized; under a unary minus it gets no second pair.
+  struct Family {
+    std::string_view name;
+    std::function<std::string(std::size_t)> bare;
+    std::function<std::string(std::size_t)> parenthesized;
+  };
+  for (const Family& f : {
+           Family{
+               .name = "=",
+               .bare = [&](std::size_t n) { return where("a = " + Repeat("NOT a = ", n) + "a"); },
+               .parenthesized =
+                   [&](std::size_t n) {
+                     return where("a = " + Repeat("(NOT a = ", n) + "a" + std::string(n, ')'));
+                   }},
+           Family{
+               .name = "+",
+               .bare =
+                   [&](std::size_t n) { return where("a = 1 + " + Repeat("NOT a + ", n) + "a"); },
+               .parenthesized =
+                   [&](std::size_t n) {
+                     return where("a = 1 + " + Repeat("(NOT a + ", n) + "a" + std::string(n, ')'));
+                   }},
+           Family{
+               .name = "LIKE",
+               .bare =
+                   [&](std::size_t n) { return where("a LIKE " + Repeat("NOT a LIKE ", n) + "a"); },
+               .parenthesized =
+                   [&](std::size_t n) {
+                     return where("a LIKE " + Repeat("(NOT a LIKE ", n) + "a" +
+                                  std::string(n, ')'));
+                   }},
+           Family{.name = "BETWEEN low",
+                  .bare =
+                      [&](std::size_t n) {
+                        return where("a BETWEEN " + Repeat("NOT a BETWEEN ", n) + "a" +
+                                     Repeat(" AND 1", n + 1));
+                      },
+                  .parenthesized =
+                      [&](std::size_t n) {
+                        return where("a BETWEEN " + Repeat("(NOT a BETWEEN ", n) + "a" +
+                                     Repeat(" AND 1)", n) + " AND 1");
+                      }},
+           Family{.name = "BETWEEN high",
+                  .bare =
+                      [&](std::size_t n) {
+                        return where("a BETWEEN 0 AND " + Repeat("NOT a BETWEEN 0 AND ", n) + "a");
+                      },
+                  .parenthesized =
+                      [&](std::size_t n) {
+                        return where("a BETWEEN 0 AND " + Repeat("(NOT a BETWEEN 0 AND ", n) + "a" +
+                                     std::string(n, ')'));
+                      }},
+           Family{.name = "minus",
+                  .bare = [](std::size_t n) { return "SELECT " + Repeat("-NOT ", n) + "a FROM t"; },
+                  .parenthesized =
+                      [](std::size_t n) {
+                        return "SELECT " + Repeat("-(NOT ", n) + "a" + std::string(n, ')') +
+                               " FROM t";
+                      }},
+       }) {
+    const std::size_t bare = FirstTooDeep(f.bare);
+    EXPECT_NE(bare, 0U) << f.name;
+    EXPECT_EQ(bare, FirstTooDeep(f.parenthesized)) << f.name;
+  }
+}
+
 TEST(ParserTest, CanonicalLevelsCountAgainstTheDepthLimit) {
   const auto calls = [](std::size_t n, std::string_view before, std::string_view after) {
     std::string sql = "SELECT " + std::string(before);
