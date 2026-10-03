@@ -303,9 +303,42 @@ void AddRange(GenColumn& c, const arrow::Array& a) {
     case arrow::Type::INT64:
       each.template operator()<arrow::Int64Array>();
       break;
+    case arrow::Type::DECIMAL128: {
+      const auto& values = static_cast<const arrow::Decimal128Array&>(a);
+      for (int64_t i = 0; i < values.length(); ++i) {
+        if (values.IsValid(i)) {
+          const arrow::Decimal128 v(values.GetValue(i));
+          const auto bits =
+              (static_cast<UInt128>(static_cast<uint64_t>(v.high_bits())) << 64U) | v.low_bits();
+          const auto value = static_cast<Int128>(bits);
+          const Int128 magnitude = value < 0 ? -value : value;
+          c.abs_max = std::max(c.abs_max.value_or(0), magnitude);
+        }
+      }
+      break;
+    }
     default:
       break;
   }
+}
+
+// 10^n - 1, the largest unscaled value of n digits (n <= 38).
+Int128 MaxOfDigits(int digits) {
+  Int128 power = 1;
+  for (int i = 0; i < digits; ++i) {
+    power *= 10;
+  }
+  return power - 1;
+}
+
+// Whether SUM of a DECIMAL column over every row stays within DECIMAL(38,s): an overflow fails
+// antb1, while DuckDB returns up to 39 digits (a divergence).
+bool Summable(const GenColumn& c, int64_t rows) {
+  if (c.kind != ValueKind::kDecimal) {
+    return false;
+  }
+  const Int128 bound = c.abs_max.value_or(0);
+  return bound == 0 || bound <= MaxOfDigits(38) / std::max<int64_t>(rows, 1);
 }
 
 // ---- query building ----
@@ -533,12 +566,14 @@ class Builder {
   }
 
   std::optional<GeneratedQuery> TryTableAs(const GenTable& t, bool by_path) {
+    rows_ = t.rows;
     std::vector<const GenColumn*> cols;
     std::vector<const GenColumn*> numeric;
     for (const auto& c : t.columns) {
       if (Usable(c, by_path)) {
         cols.push_back(&c);
-        if (IsNumeric(c.kind)) {
+        // SUM and AVG arguments: numbers, and DECIMAL columns whose sum fits DECIMAL(38,s).
+        if (IsNumeric(c.kind) || Summable(c, t.rows)) {
           numeric.push_back(&c);
         }
       }
@@ -872,8 +907,9 @@ class Builder {
       case Agg::kCount:
       case Agg::kCountDistinct:
         return true;
-      case Agg::kSum:
-        return arg != nullptr && arg->kind == ValueKind::kInteger;
+      case Agg::kSum:  // an integer SUM is HUGEINT, a DECIMAL one DECIMAL(38,s)
+        return arg != nullptr &&
+               (arg->kind == ValueKind::kInteger || arg->kind == ValueKind::kDecimal);
       case Agg::kAvg:
         return false;
       case Agg::kMin:
@@ -949,7 +985,8 @@ class Builder {
 
   // The values an aggregate with I or T values takes, as a column for MakeLiteral: a count is
   // between 0 and the row count, an integer SUM gets its argument's literals, MIN and MAX are their
-  // argument.
+  // argument. Over a DECIMAL the literals take 38 digits without spare ones: SUM is DECIMAL(38,s),
+  // and MIN or MAX of an arithmetic argument can be wider than the column.
   static GenColumn ValuesOf(const GenTable& t, Agg agg, const GenColumn* arg) {
     switch (agg) {
       case Agg::kCountStar:
@@ -962,7 +999,11 @@ class Builder {
       case Agg::kMax:
         break;
     }
-    return *arg;
+    GenColumn values = *arg;
+    if (values.kind == ValueKind::kDecimal) {
+      values.precision = 38;
+    }
+    return values;
   }
 
   // HAVING 1 or 2 conditions of an aggregate query (AND): a GROUP BY key, an aggregate call with I
@@ -1699,6 +1740,52 @@ class Builder {
           choices.push_back({.op = "-", .literal = "", .exact = true});
         }
       }
+    } else if (c.kind == ValueKind::kDecimal && integers) {
+      // DuckDB's type of c <op> k with an INTEGER k (DECIMAL(10,0)), and whether every value, and
+      // its sum over every row (the argument of a SUM), stays inside it (ADR 0021 rules 4 to 7).
+      const Int128 bound = c.abs_max.value_or(0);
+      const auto fits = [&](bool multiply, int64_t k) {
+        int width = 0;
+        Int128 largest = 0;
+        if (multiply) {
+          width = c.precision + 10;
+          if (width > 18 && c.precision <= 18 && c.scale < 18) {
+            width = 18;
+          }
+          if (__builtin_mul_overflow(bound, Int128{k}, &largest)) {
+            return false;
+          }
+        } else {
+          width = std::max(c.precision - c.scale, 10) + c.scale + 1;
+          if (width > 18 && c.precision <= 18) {
+            width = 18;
+          }
+          Int128 scaled_k = k;
+          for (int i = 0; i < c.scale; ++i) {
+            if (__builtin_mul_overflow(scaled_k, Int128{10}, &scaled_k)) {
+              return false;
+            }
+          }
+          if (__builtin_add_overflow(bound, scaled_k, &largest)) {
+            return false;
+          }
+        }
+        width = std::min(width, 38);
+        return largest <= MaxOfDigits(width) &&
+               largest <= MaxOfDigits(38) / std::max<int64_t>(rows_, 1);
+      };
+      for (const int64_t k : {1, 7, 100}) {
+        if (fits(false, k)) {
+          choices.push_back({.op = "+", .literal = std::to_string(k), .exact = true});
+          choices.push_back({.op = "-", .literal = std::to_string(k), .exact = true});
+        }
+      }
+      for (const int64_t k : {2, 3}) {
+        if (fits(true, k)) {
+          choices.push_back({.op = "*", .literal = std::to_string(k), .exact = true});
+        }
+      }
+      choices.push_back({.op = "-", .literal = "", .exact = true});  // the type is kept
     }
     if (choices.empty()) {
       return std::nullopt;
@@ -1784,6 +1871,7 @@ class Builder {
   std::vector<Token> tokens_;
   FeatureSet used_;
   std::vector<const GenColumn*> comparable_;  // the query's columns WHERE can compare
+  int64_t rows_ = 0;                          // the query's table's row count
   bool arg_retyped_ =
       false;  // the last Aggregate() wrapped its column in a string or time function
   std::vector<std::string> order_aliases_;  // select aliases of items with I or T values
@@ -1837,14 +1925,17 @@ std::expected<std::vector<GenTable>, std::string> LoadGenTables(
       t.columns.push_back(std::move(*column));
       fields.push_back(i);
     }
-    // The integer columns' value ranges over every file (all files have the first one's schema).
+    // The integer and DECIMAL columns' value ranges over every file (all files have the first one's
+    // schema).
     for (const auto& f : def.files) {
       auto file = f == def.files.front() ? data : ReadFile(f);
       if (!file) {
         return std::unexpected(file.error());
       }
       for (std::size_t k = 0; k < t.columns.size(); ++k) {
-        if (t.columns[k].kind != ValueKind::kInteger || fields[k] >= (*file)->num_columns()) {
+        if ((t.columns[k].kind != ValueKind::kInteger &&
+             t.columns[k].kind != ValueKind::kDecimal) ||
+            fields[k] >= (*file)->num_columns()) {
           continue;
         }
         for (const auto& chunk : (*file)->column(fields[k])->chunks()) {

@@ -122,6 +122,8 @@ TEST(QueryGenerator, TargetSamplesCoverTheWholeGrammar) {
 
 TEST(QueryGenerator, QueriesRespectTheSemanticsBothEnginesShare) {
   const auto gen = Make(3, {.supported = kSupportedFeatures, .target_percent = 100});
+  int decimal_sums = 0;
+  int decimal_arithmetics = 0;
   for (uint64_t i = 0; i < 3000; ++i) {
     const auto q = gen.Generate(i);
     const std::string sql = Lower(q.sql);
@@ -155,13 +157,18 @@ TEST(QueryGenerator, QueriesRespectTheSemanticsBothEnginesShare) {
     if (q.features.Has(Feature::kStar) && q.table == "big") {
       EXPECT_TRUE(q.features.Has(Feature::kLimit)) << q.sql;
     }
-    // DECIMAL columns: no SUM, AVG, arithmetic or CASE values yet (exit 4 on antb1), and no literal
-    // with more than 10 fraction digits (w's scale; m has spare digits), which DuckDB would compare
-    // in a DECIMAL capped at 38 digits (divergence D13). Layout comments could hide a match.
+    // DECIMAL columns: no / // % or CASE values yet, and arithmetic only with integer constants
+    // (exit 4 on antb1, D4); no literal with more than 10 fraction digits (w's scale; m has spare
+    // digits), which DuckDB would compare in a DECIMAL capped at 38 digits (divergence D13). Layout
+    // comments could hide a match.
     if (!q.features.Has(Feature::kLayout)) {
       static const std::regex decimal_misuse(
-          R"re((sum|avg)\( ?"?[mw]"?\)|"?\b[mw]\b"? ?(\+|-|\*|/|%)|then "?[mw]\b|else "?[mw]\b|- "?[mw]\b)re");
+          R"re("?\b[mw]\b"? ?(/|%)|then "?[mw]\b|else "?[mw]\b|"?\b[mw]\b"? ?[-+*] ?[0-9]+\.)re");
       EXPECT_FALSE(std::regex_search(sql, decimal_misuse)) << q.sql;
+      static const std::regex decimal_sum(R"re((sum|avg)\( ?"?[mw]"?\))re");
+      static const std::regex decimal_arithmetic(R"re("?\b[mw]\b"? ?[-+*] ?[0-9]+\b)re");
+      decimal_sums += std::regex_search(sql, decimal_sum) ? 1 : 0;
+      decimal_arithmetics += std::regex_search(sql, decimal_arithmetic) ? 1 : 0;
     }
     static const std::regex long_fraction(R"re(\.[0-9]{11})re");
     EXPECT_FALSE(std::regex_search(sql, long_fraction)) << q.sql;
@@ -169,10 +176,10 @@ TEST(QueryGenerator, QueriesRespectTheSemanticsBothEnginesShare) {
     EXPECT_FALSE(q.sql.contains("0.1000000000000000055511151231257827")) << q.sql;
     EXPECT_FALSE(q.sql.contains("it's")) << "quotes in string literals are doubled: " << q.sql;
   }
+  EXPECT_GT(decimal_sums, 10) << "SUM and AVG of DECIMAL columns";
+  EXPECT_GT(decimal_arithmetics, 10) << "DECIMAL arithmetic with integer constants";
 }
 
-// A DECIMAL of 38 digits with few integer digits: no literal (a BETWEEN bound included) has more
-// integer digits than p - s, which would leave DuckDB's 38-digit common type (divergence D13).
 TEST(QueryGenerator, DecimalLiteralsStayWithinTheColumnsDigits) {
   GenTable t{.name = "t", .path = {}, .rows = 10, .columns = {}};
   t.columns = {{.name = "n",

@@ -2,9 +2,12 @@
 
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
+
+#include "antb1/common/int128.h"
 
 #include "canonical.h"
 #include "supported_features.h"
@@ -23,7 +26,9 @@
 // read as DATE through the clickbench option are never used with FROM '<path>' (DuckDB reads the
 // raw file there), SELECT * on a large table always has a LIMIT, and a DECIMAL column is only
 // compared with literals of its own digits (no SUM, AVG, arithmetic or CASE values yet), which keep
-// DuckDB's common DECIMAL type within 38 digits (divergence D13).
+// DuckDB's common DECIMAL type within 38 digits (divergence D13). DECIMAL SUM, AVG and arithmetic
+// (an integer constant, DuckDB's capped types) stay within their types over the data, since an
+// overflow fails both engines.
 
 namespace antb1::slt {
 
@@ -42,6 +47,9 @@ struct GenColumn {
   std::optional<int64_t> data_max;
   int precision = 0;  // kDecimal: DECIMAL(precision, scale)
   int scale = 0;
+  // kDecimal: the largest magnitude of an unscaled value in every file (none if all are NULL): SUM
+  // and arithmetic stay inside their types, as for data_min and data_max.
+  std::optional<Int128> abs_max;
 };
 
 struct GenTable {
