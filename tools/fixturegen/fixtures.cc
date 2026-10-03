@@ -586,9 +586,7 @@ arrow::Result<std::shared_ptr<arrow::Table>> MakeFloatTable() {
 arrow::Result<std::shared_ptr<arrow::Table>> MakeDecimalTable() {
   constexpr int kRows = 40;
   // 10^n - 1, the largest unscaled value of n digits.
-  const auto max_of = [](int digits) {
-    return arrow::Decimal128::GetMaxValue(digits);
-  };
+  const auto max_of = [](int digits) { return arrow::Decimal128::GetMaxValue(digits); };
   struct Column {
     std::string name;
     int precision;

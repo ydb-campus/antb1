@@ -240,10 +240,10 @@ TEST(LoadGenTables, ReadsDecimalColumns) {
     ASSERT_TRUE(small.Append(arrow::Decimal128(v)).ok());
     ASSERT_TRUE(wide.Append(arrow::Decimal256(v)).ok());
   }
-  const auto table = arrow::Table::Make(
-      arrow::schema({arrow::field("p", arrow::decimal128(9, 2)),
-                     arrow::field("w", arrow::decimal256(40, 0))}),
-      {small.Finish().ValueOrDie(), wide.Finish().ValueOrDie()});
+  const auto table =
+      arrow::Table::Make(arrow::schema({arrow::field("p", arrow::decimal128(9, 2)),
+                                        arrow::field("w", arrow::decimal256(40, 0))}),
+                         {small.Finish().ValueOrDie(), wide.Finish().ValueOrDie()});
   auto out = arrow::io::FileOutputStream::Open(path).ValueOrDie();
   ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), out, 4).ok());
   ASSERT_TRUE(out->Close().ok());

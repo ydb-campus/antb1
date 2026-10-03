@@ -389,14 +389,16 @@ TEST_F(AggregateStateTest, MinMaxOfDatesUnsignedDoublesAndHugeInts) {
   EXPECT_EQ(Text(*huge), "-99999999999999999999");
 }
 
-// A DECIMAL(15,2) column of unscaled values; MIN and MAX keep the type, and the result carries its (p,s).
+// A DECIMAL(15,2) column of unscaled values; MIN and MAX keep the type, and the result carries its
+// (p,s).
 TEST_F(AggregateStateTest, MinMaxAndCountDistinctOfDecimals) {
   const LogicalType type = LogicalType::Decimal(15, 2);
   arrow::Decimal128Builder builder(plan::ToArrow(type));
   const std::vector<std::optional<int64_t>> unscaled = {1700, std::nullopt, -25, 1700,
                                                         -99999999999999};
   for (const std::optional<int64_t>& v : unscaled) {
-    ASSERT_TRUE((v.has_value() ? builder.Append(arrow::Decimal128(*v)) : builder.AppendNull()).ok());
+    ASSERT_TRUE(
+        (v.has_value() ? builder.Append(arrow::Decimal128(*v)) : builder.AppendNull()).ok());
   }
   const auto values = builder.Finish().ValueOrDie();
   const auto selection = Bools({true, true, true, true, false});
