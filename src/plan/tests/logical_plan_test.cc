@@ -256,25 +256,65 @@ TEST(LogicalPlanTest, NodeNamesSpansAndInputs) {
   const auto span = [](std::size_t offset) { return SourceSpan{.offset = offset, .length = 1}; };
   const LogicalNodePtr scan =
       std::make_shared<const LogicalNode>(ScanNode{.table = table, .span = span(1)});
+  const LogicalNodePtr other =
+      std::make_shared<const LogicalNode>(ScanNode{.table = table, .span = span(0)});
   const std::vector<std::pair<LogicalNode, std::string_view>> nodes = {
       {ScanNode{.table = table, .span = span(1)}, "Scan"},
       {FilterNode{.input = scan, .span = span(2)}, "Filter"},
-      {ProjectNode{.input = scan, .span = span(3)}, "Project"},
-      {AggregateNode{.input = scan, .span = span(4)}, "Aggregate"},
-      {LimitNode{.input = scan, .span = span(5)}, "Limit"},
-      {RowCountNode{.table = table, .span = span(6)}, "RowCount"},
+      {ComputeNode{.input = scan, .span = span(3)}, "Compute"},
+      {ProjectNode{.input = scan, .span = span(4)}, "Project"},
+      {AggregateNode{.input = scan, .span = span(5)}, "Aggregate"},
+      {GroupAggregateNode{.input = scan, .span = span(6)}, "GroupAggregate"},
+      {SortNode{.input = scan, .span = span(7)}, "Sort"},
+      {LimitNode{.input = scan, .span = span(8)}, "Limit"},
+      {RowCountNode{.table = table, .span = span(9)}, "RowCount"},
+      {JoinNode{.left = scan, .right = other, .span = span(10)}, "Join"},
   };
   for (std::size_t i = 0; i < nodes.size(); ++i) {
     const auto& [node, name] = nodes[i];
     EXPECT_EQ(NodeName(node), name);
     EXPECT_EQ(SpanOf(node), span(i + 1)) << name;
-    const LogicalNodePtr* input = InputOf(node);
-    const bool leaf = name == "Scan" || name == "RowCount";
-    EXPECT_EQ(input == nullptr, leaf) << name;
-    if (input != nullptr) {
-      EXPECT_EQ(*input, scan) << name;
+    const std::vector<LogicalNodePtr> inputs = InputsOf(node);
+    if (name == "Scan" || name == "RowCount") {
+      EXPECT_TRUE(inputs.empty()) << name;
+    } else if (name == "Join") {
+      EXPECT_EQ(inputs, (std::vector<LogicalNodePtr>{scan, other})) << "left, then right";
+    } else {
+      EXPECT_EQ(inputs, std::vector<LogicalNodePtr>{scan}) << name;
     }
+
+    // WithInputs: a copy of the node, its span and its other fields kept, over new inputs.
+    std::vector<LogicalNodePtr> replaced;
+    replaced.reserve(inputs.size());
+    for (std::size_t k = 0; k < inputs.size(); ++k) {
+      replaced.push_back(
+          std::make_shared<const LogicalNode>(ScanNode{.table = table, .span = span(20 + k)}));
+    }
+    const LogicalNodePtr copy = WithInputs(node, replaced);
+    ASSERT_NE(copy, nullptr) << name;
+    EXPECT_EQ(NodeName(*copy), name);
+    EXPECT_EQ(SpanOf(*copy), span(i + 1)) << name;
+    EXPECT_EQ(InputsOf(*copy), replaced) << name;
   }
+}
+
+TEST(LogicalPlanDeathTest, WithInputsNeedsOneInputPerChild) {
+  const auto table = std::make_shared<FakeTable>(testing::AllTypesSchema(), 1);
+  const LogicalNodePtr scan = std::make_shared<const LogicalNode>(ScanNode{.table = table});
+  EXPECT_DEATH(WithInputs(JoinNode{.left = scan, .right = scan}, {scan}), "inputs.size");
+  EXPECT_DEATH(WithInputs(LimitNode{.input = scan}, {}), "inputs.size");
+  EXPECT_DEATH(WithInputs(ScanNode{.table = table}, {scan}), "inputs.size");
+}
+
+TEST(LogicalPlanTest, JoinKindsAndBuildSidesHaveNames) {
+  EXPECT_EQ(ToString(JoinKind::kInner), "INNER");
+  EXPECT_EQ(ToString(JoinKind::kLeft), "LEFT");
+  EXPECT_EQ(ToString(JoinKind::kSemi), "SEMI");
+  EXPECT_EQ(ToString(JoinKind::kAnti), "ANTI");
+  EXPECT_EQ(ToString(JoinKind::kNullAwareAnti), "NULL-AWARE ANTI");
+  EXPECT_EQ(ToString(JoinKind::kOneRow), "ONE-ROW");
+  EXPECT_EQ(ToString(BuildSide::kLeft), "left");
+  EXPECT_EQ(ToString(BuildSide::kRight), "right");
 }
 
 // The defaults of plan::Table for scans with a filter: no table filters unless it says so; a scan

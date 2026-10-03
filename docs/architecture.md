@@ -32,7 +32,8 @@ Responsibilities:
   `EqualIgnoringSpans`. Arrow-free; errors are `std::expected<T, sql::ParseError>`
   ([ADR 0008](adr/0008-parser-and-unparser.md)).
 - `plan`: logical types and their Arrow mapping, the `plan::Table` interface, the case-insensitive `Catalog`, the
-  binder with exact literal folding (`binder.h`, `literal.h`), the logical plan (`logical_plan.h`), the rule
+  binder with exact literal folding (`binder.h`, `literal.h`), the logical plan (`logical_plan.h`; a `Join` has two inputs,
+  every other node at most one), the rule
   optimizer (`optimizer.h`), EXPLAIN, and the error boundary between `std::expected` and `arrow::Status` in
   `src/plan/include/antb1/plan/sql_status.h` ([ADR 0005](adr/0005-error-boundary.md)).
 - `io`: `io::ParquetTable`, which implements `plan::Table` over one or more Parquet files with identical schemas,
@@ -101,7 +102,9 @@ steps (only step 7 uses more than one thread):
 5. Optimize (`plan::Optimize`): `COUNT(*)` without `WHERE` to `RowCount`; a `GROUP BY` key computed only from other
    (not DOUBLE) keys is dropped from the `GroupAggregate` and computed once per group above it, unless a `Limit`
    without a `Sort` reads it (ADR 0018);
-   `Limit` below `Project`; and projection pruning (a `Scan` reads only the fields used above it). The binder and
+   `Limit` below `Project`; and projection pruning (a `Scan` reads only the fields used above it; a `Join` asks both
+   inputs for what is used above it plus its keys and residuals). Every rule visits every input of a node
+   (`plan::InputsOf`, `plan::WithInputs`). The binder and
    every rule refer to columns by id only, and columns keep their ids through every rule. The last step of both
    `Bind` and `Optimize`, `plan::ResolvePositions`, sets every position from the ids; the executor reads positions
    only.
@@ -113,7 +116,8 @@ steps (only step 7 uses more than one thread):
    over a part pipeline run in two levels when their calls allow it (`exec::TwoLevelAggregation`,
    [ADR 0014](adr/0014-two-level-aggregation.md)). The chain of `Filter`,
    `Compute` and `Project` nodes over a `Scan` is a part pipeline, built once per table part (see
-   [Execution](#execution)).
+   [Execution](#execution)). A `Join` is unsupported (exit code 4) until the hash join implements its kind
+   ([ADR 0022](adr/0022-joins-and-query-blocks.md)).
 7. Drain (`exec::Drain`): `Open`, pull batches with `Next` until the end of the stream, `Close` (also after an
    error); the selected rows of the batches form an `arrow::Table`, and the engine names its columns. The part
    pipelines run on the session's thread pool (`--threads`, `engine::SessionOptions::threads`), and so do the batches
@@ -221,7 +225,7 @@ state's groups through a group map, so partial results of separate parts of the 
 | --- | --- | --- |
 | SQL syntax | `src/sql/` (lexer, parser, AST, unparser) with tests in `src/sql/tests/` | [sql-subset.md](sql-subset.md) grammar |
 | Name resolution or type rules | `src/plan/binder.cc`, `src/plan/types.cc` | [sql-subset.md](sql-subset.md), [ADR 0004](adr/0004-types-null-overflow-semantics.md) if semantics change |
-| A logical plan node | the variant in `src/plan/include/antb1/plan/logical_plan.h`; the compiler then points at every `std::visit` to extend (physical planner, optimizer, EXPLAIN) | tests in `src/plan/tests/` and `src/exec/tests/` |
+| A logical plan node | the variant in `src/plan/include/antb1/plan/logical_plan.h`; the compiler then points at every `std::visit` to extend (`InputsOf`, `WithInputs`, `OutputIds` and the position resolver, the physical planner, the optimizer, EXPLAIN) | tests in `src/plan/tests/` and `src/exec/tests/` |
 | An optimizer rule | `src/plan/optimizer.cc` | tests in `src/plan/tests/optimizer_test.cc`, an EXPLAIN golden in `tests/cli/` |
 | A physical operator | `src/exec/`; its name in the physical planner (`Builder::Name`), and metrics for its phases through `profile()` and `ProfileTimer` | tests in `src/exec/tests/` |
 | A SQL feature antb1 now answers | the modules above | `.slt` records in `tests/slt/cases/` (`pixi run slt-complete`), the feature in `tests/slt/supported_features.h`, [sql-subset.md](sql-subset.md); when `pixi run test-data` reports a new ClickBench pass, the ratchet `tests/data/clickbench_status.json` and the status table; when a query derived from TPC-H starts to pass, `tests/data/tpch_status.json` and its table |

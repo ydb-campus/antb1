@@ -121,11 +121,11 @@ inline std::string SpanText(std::string_view sql, const arrow::Status& status) {
 inline const LogicalNode& Nth(const LogicalPlan& plan, int depth) {
   const LogicalNode* node = plan.root.get();
   for (int i = 0; i < depth; ++i) {
-    const LogicalNodePtr* input = InputOf(*node);
-    if (input == nullptr || *input == nullptr) {
+    const std::vector<LogicalNodePtr> inputs = InputsOf(*node);
+    if (inputs.size() != 1 || inputs[0] == nullptr) {
       std::abort();
     }
-    node = input->get();
+    node = inputs[0].get();
   }
   return *node;
 }

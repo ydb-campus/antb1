@@ -3,6 +3,8 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 #include <arrow/api.h>
 #include <gtest/gtest.h>
@@ -158,6 +160,128 @@ TEST(ExplainTest, NamesAndStringsStayOnOneAsciiLine) {
 }
 
 TEST(ExplainTest, EmptyPlan) { EXPECT_EQ(Explain(LogicalPlan{}), "Output:\n"); }
+
+// ---- joins and qualified names (hand-built plans: no SQL produces a join yet) ----
+
+LogicalNodePtr Node(LogicalNode node) {
+  return std::make_shared<const LogicalNode>(std::move(node));
+}
+
+LogicalNodePtr ScanOf(std::string name, std::vector<int> fields) {
+  return Node(ScanNode{.table = std::make_shared<FakeTable>(testing::AllTypesSchema(), 10),
+                       .table_name = std::move(name),
+                       .fields = std::move(fields),
+                       .ids = {},
+                       .span = {}});
+}
+
+BoundColumn Qualified(std::string qualifier, std::string name) {
+  return BoundColumn{.index = 0,
+                     .id = kNoColumnId,
+                     .name = std::move(name),
+                     .type = LogicalType::kInteger,
+                     .qualifier = std::move(qualifier)};
+}
+
+ExprPtr Condition(std::string name) {
+  return std::make_shared<const Expr>(Expr{.node = ConstantExpr{.value = Constant{}},
+                                           .type = LogicalType::kBoolean,
+                                           .name = std::move(name)});
+}
+
+// One line per join, then its left input and its right input one level deeper.
+TEST(ExplainTest, JoinsShowBothInputs) {
+  const LogicalNodePtr semi = Node(JoinNode{
+      .kind = JoinKind::kSemi,
+      .left = ScanOf("u", {1}),
+      .right = ScanOf("dir/x.parquet", {1, 9}),
+      .keys = {JoinKey{.left = Qualified("u", "i32"), .right = Qualified("x y", "Mixed Case")}},
+      .residual = {},
+      .build = BuildSide::kRight,
+      .span = {}});
+  const LogicalNodePtr inner =
+      Node(JoinNode{.kind = JoinKind::kInner,
+                    .left = ScanOf("t", {0, 1, 2}),
+                    .right = semi,
+                    .keys = {JoinKey{.left = Qualified("t", "i32"), .right = Qualified("u", "i32")},
+                             JoinKey{.left = Qualified("t", "i64"), .right = Qualified("", "i64")}},
+                    .residual = {Condition("(t.i16 < u.i16)"), Condition("(t.s <> 'it''s\n')")},
+                    .build = BuildSide::kLeft,
+                    .span = {}});
+  const LogicalPlan plan{
+      .root = Node(ProjectNode{.input = inner,
+                               .columns = {Qualified("t", "i16"), Qualified("", "i64")},
+                               .constants = {},
+                               .ids = {},
+                               .span = {}}),
+      .output = {OutputColumn{.name = "i16", .type = LogicalType::kSmallInt},
+                 OutputColumn{.name = "i64", .type = LogicalType::kBigInt}}};
+  EXPECT_EQ(Explain(plan),
+            "Output: i16:SMALLINT i64:BIGINT\n"
+            "Project t.i16, i64\n"
+            "  Join INNER build=left keys=[t.i32 = u.i32, t.i64 = i64] "
+            "residual=[(t.i16 < u.i16), (t.s <> 'it''s\\x0A')]\n"
+            "    Scan table=t source=fake columns=[i16, i32, i64]\n"
+            "    Join SEMI build=right keys=[u.i32 = \"x y\".\"Mixed Case\"]\n"
+            "      Scan table=u source=fake columns=[i32]\n"
+            "      Scan table=dir/x.parquet source=fake columns=[i32, \"Mixed Case\"]\n");
+}
+
+TEST(ExplainTest, EveryJoinKind) {
+  for (const auto& [kind, line] : {
+           std::pair{JoinKind::kInner, "Join INNER build=right keys=[a.x = b.y]"},
+           std::pair{JoinKind::kLeft, "Join LEFT build=right keys=[a.x = b.y]"},
+           std::pair{JoinKind::kSemi, "Join SEMI build=right keys=[a.x = b.y]"},
+           std::pair{JoinKind::kAnti, "Join ANTI build=right keys=[a.x = b.y]"},
+           std::pair{JoinKind::kNullAwareAnti, "Join NULL-AWARE ANTI build=right keys=[a.x = b.y]"},
+       }) {
+    EXPECT_EQ(ExplainNode(JoinNode{
+                  .kind = kind,
+                  .left = ScanOf("t", {0}),
+                  .right = ScanOf("t", {0}),
+                  .keys = {JoinKey{.left = Qualified("a", "x"), .right = Qualified("b", "y")}},
+                  .residual = {},
+                  .build = BuildSide::kRight,
+                  .span = {}}),
+              line);
+  }
+  EXPECT_EQ(ExplainNode(JoinNode{.kind = JoinKind::kOneRow,
+                                 .left = ScanOf("t", {0}),
+                                 .right = ScanOf("t", {0}),
+                                 .keys = {},
+                                 .residual = {Condition("(x > \"sum(y)\")")},
+                                 .build = BuildSide::kRight,
+                                 .span = {}}),
+            "Join ONE-ROW build=right keys=[] residual=[(x > \"sum(y)\")]");
+}
+
+// A qualifier is printed wherever a column is (J2b's binder sets it); quoted like a name.
+TEST(ExplainTest, QualifiedColumnNames) {
+  const LogicalNodePtr scan = ScanOf("t", {0});
+  const BoundColumn a = Qualified("a", "x");
+  const BoundColumn quoted = Qualified("Two Words", "from");
+  EXPECT_EQ(ExplainNode(FilterNode{
+                .input = scan,
+                .predicates = {Predicate{.kind = Predicate::Kind::kCompareColumns,
+                                         .column = a,
+                                         .other = quoted,
+                                         .op = CompareOp::kGe},
+                               Predicate{.kind = Predicate::Kind::kIsNotNull, .column = quoted}},
+                .span = {}}),
+            "Filter a.x >= \"Two Words\".from AND \"Two Words\".from IS NOT NULL");
+  EXPECT_EQ(ExplainNode(AggregateNode{
+                .input = scan,
+                .aggregates = {AggregateCall{.kind = AggKind::kSum, .arg = a},
+                               AggregateCall{.kind = AggKind::kCountDistinct, .arg = quoted}},
+                .span = {}}),
+            "Aggregate SUM(a.x), COUNT(DISTINCT \"Two Words\".from)");
+  EXPECT_EQ(ExplainNode(GroupAggregateNode{
+                .input = scan, .keys = {a, quoted}, .key_ids = {}, .aggregates = {}, .span = {}}),
+            "GroupAggregate keys=[a.x, \"Two Words\".from]");
+  EXPECT_EQ(ExplainNode(SortNode{
+                .input = scan, .keys = {SortKey{.column = a, .descending = true}}, .span = {}}),
+            "Sort a.x DESC NULLS LAST");
+}
 
 }  // namespace
 }  // namespace antb1::plan

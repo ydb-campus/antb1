@@ -26,26 +26,24 @@ LogicalNodePtr Make(LogicalNode node) {
   return std::make_shared<const LogicalNode>(std::move(node));
 }
 
-// A copy of a node over another input (leaves are copied unchanged).
-struct WithInput {
-  const LogicalNodePtr& input;
-
-  template <class Node>
-  LogicalNodePtr Replace(Node node) const {
-    node.input = input;
-    return Make(std::move(node));
+// The node over its inputs rewritten by `f` (every input, in order); the node itself when no
+// input changes.
+template <class F>
+LogicalNodePtr MapInputs(const LogicalNodePtr& node, const F& f) {
+  std::vector<LogicalNodePtr> inputs = InputsOf(*node);
+  bool changed = false;
+  for (LogicalNodePtr& input : inputs) {
+    if (input == nullptr) {
+      continue;
+    }
+    LogicalNodePtr rewritten = f(input);
+    if (rewritten != input) {
+      input = std::move(rewritten);
+      changed = true;
+    }
   }
-
-  LogicalNodePtr operator()(const ScanNode& node) const { return Make(node); }
-  LogicalNodePtr operator()(const FilterNode& node) const { return Replace(node); }
-  LogicalNodePtr operator()(const ComputeNode& node) const { return Replace(node); }
-  LogicalNodePtr operator()(const ProjectNode& node) const { return Replace(node); }
-  LogicalNodePtr operator()(const AggregateNode& node) const { return Replace(node); }
-  LogicalNodePtr operator()(const GroupAggregateNode& node) const { return Replace(node); }
-  LogicalNodePtr operator()(const SortNode& node) const { return Replace(node); }
-  LogicalNodePtr operator()(const LimitNode& node) const { return Replace(node); }
-  LogicalNodePtr operator()(const RowCountNode& node) const { return Make(node); }
-};
+  return changed ? WithInputs(*node, std::move(inputs)) : node;
+}
 
 // ---- rule 1: COUNT(*) without WHERE -> RowCount ----
 
@@ -61,12 +59,7 @@ LogicalNodePtr CountStarToRowCount(const LogicalNodePtr& node) {
                                .span = agg->aggregates.front().span});
     }
   }
-  const LogicalNodePtr* input = InputOf(*node);
-  if (input == nullptr || *input == nullptr) {
-    return node;
-  }
-  LogicalNodePtr rewritten = CountStarToRowCount(*input);
-  return rewritten == *input ? node : std::visit(WithInput{.input = rewritten}, *node);
+  return MapInputs(node, CountStarToRowCount);
 }
 
 // ---- rule 2: GROUP BY keys that are functions of other keys ----
@@ -166,7 +159,9 @@ LogicalNodePtr GroupByDeterminingKeys(const GroupAggregateNode& group) {
 // Rewrites every GroupAggregate whose whole output is read. Under a Limit with no Sort in between,
 // the nodes above stop reading after the rows they need: a key computed above the GroupAggregate
 // would then be computed for those groups only, and an error (an overflow) in another group would
-// no longer fail the query, as it does when every row computes it. A Sort reads everything.
+// no longer fail the query, as it does when every row computes it. A Sort reads everything. Both
+// inputs of a join count as limited under a Limit (a probe may stop early; conservative for the
+// build).
 LogicalNodePtr DependentKeys(const LogicalNodePtr& node, bool limited) {
   if (std::holds_alternative<LimitNode>(*node)) {
     limited = true;
@@ -174,14 +169,8 @@ LogicalNodePtr DependentKeys(const LogicalNodePtr& node, bool limited) {
     limited = false;
   }
   const bool group = std::holds_alternative<GroupAggregateNode>(*node);
-  const LogicalNodePtr* input = InputOf(*node);
-  LogicalNodePtr current = node;
-  if (input != nullptr && *input != nullptr) {
-    LogicalNodePtr rewritten = DependentKeys(*input, limited && !group);
-    if (rewritten != *input) {
-      current = std::visit(WithInput{.input = rewritten}, *node);
-    }
-  }
+  LogicalNodePtr current = MapInputs(
+      node, [&](const LogicalNodePtr& input) { return DependentKeys(input, limited && !group); });
   if (const auto* aggregate = std::get_if<GroupAggregateNode>(current.get());
       aggregate != nullptr && !limited) {
     if (LogicalNodePtr rewritten = GroupByDeterminingKeys(*aggregate); rewritten != nullptr) {
@@ -195,7 +184,7 @@ LogicalNodePtr DependentKeys(const LogicalNodePtr& node, bool limited) {
 
 // Limit(Project(x)) -> Project(Limit(x)), and likewise for Compute: both keep every row, so
 // limiting first gives the same rows, copies or computes only the rows kept, and puts the Limit
-// right above a Sort (top-N).
+// right above a Sort (top-N). A Limit never moves below a Join.
 LogicalNodePtr LimitBelowProject(const LogicalNodePtr& node) {
   if (const auto* limit = std::get_if<LimitNode>(node.get())) {
     if (const auto* project = std::get_if<ProjectNode>(limit->input.get())) {
@@ -213,12 +202,7 @@ LogicalNodePtr LimitBelowProject(const LogicalNodePtr& node) {
       return Make(std::move(above));
     }
   }
-  const LogicalNodePtr* input = InputOf(*node);
-  if (input == nullptr || *input == nullptr) {
-    return node;
-  }
-  LogicalNodePtr rewritten = LimitBelowProject(*input);
-  return rewritten == *input ? node : std::visit(WithInput{.input = rewritten}, *node);
+  return MapInputs(node, LimitBelowProject);
 }
 
 // ---- rule 4: projection pruning ----
@@ -234,15 +218,15 @@ LogicalNodePtr Prune(const LogicalNodePtr& node, Needed needed);
 // Rewrites a node so that its output keeps at least the columns in `needed`. Only a Scan drops
 // columns (fields) and only a Compute drops expressions, keeping their order; Filter, Sort and
 // Limit pass the request through (with the columns they read), Project, Aggregate and
-// GroupAggregate ask their input for exactly what they read.
+// GroupAggregate ask their input for exactly what they read, and a Join asks both inputs for the
+// request plus its keys and residual columns (each input keeps the ones it outputs).
 struct Pruner {
   const LogicalNodePtr& node;
   Needed& needed;
 
-  // `node` over its input pruned to `below`.
+  // `node` (of one input) over its input pruned to `below`.
   [[nodiscard]] LogicalNodePtr Over(Needed below) const {
-    const LogicalNodePtr input = Prune(*InputOf(*node), std::move(below));
-    return std::visit(WithInput{.input = input}, *node);
+    return WithInputs(*node, {Prune(InputsOf(*node).at(0), std::move(below))});
   }
 
   LogicalNodePtr operator()(const ScanNode& scan) const {
@@ -329,6 +313,19 @@ struct Pruner {
   LogicalNodePtr operator()(const LimitNode& /*limit*/) const { return Over(std::move(needed)); }
 
   LogicalNodePtr operator()(const RowCountNode& /*rows*/) const { return node; }
+
+  LogicalNodePtr operator()(const JoinNode& join) const {
+    for (const JoinKey& key : join.keys) {
+      Need(needed, key.left);
+      Need(needed, key.right);
+    }
+    for (const ExprPtr& conjunct : join.residual) {
+      std::vector<ColumnId> reads;
+      CollectColumnIds(*conjunct, reads);
+      needed.insert(reads.begin(), reads.end());
+    }
+    return WithInputs(*node, {Prune(join.left, needed), Prune(join.right, needed)});
+  }
 };
 
 LogicalNodePtr Prune(const LogicalNodePtr& node, Needed needed) {
