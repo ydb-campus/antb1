@@ -441,7 +441,7 @@ TEST(ParserTest, Between) {
   ASSERT_EQ(stmt->where.size(), 4U);
   const auto text = [&](SourceSpan span) { return kSql.substr(span.offset, span.length); };
 
-  const auto* plain = std::get_if<BetweenExpr>(&stmt->where[0]);
+  const auto* plain = std::get_if<BetweenExpr>(&stmt->where.front());
   ASSERT_NE(plain, nullptr);
   EXPECT_FALSE(plain->negated);
   EXPECT_EQ(text(plain->span), "b between 1 AND c + 2");

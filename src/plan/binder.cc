@@ -1491,7 +1491,10 @@ struct TypedConstant {
 
 std::optional<arrow::Result<TypedConstant>> FoldTyped(const sql::Expr& expr) {
   const auto rank = [](LogicalType t) {
-    return t == LogicalType::kInteger ? 0 : t == LogicalType::kBigInt ? 1 : 2;
+    if (t == LogicalType::kInteger) {
+      return 0;
+    }
+    return t == LogicalType::kBigInt ? 1 : 2;
   };
   if (const auto* lit = std::get_if<sql::Literal>(&expr)) {
     if (lit->kind != sql::Literal::Kind::kInteger || IsApproximateNumber(lit->text)) {
@@ -1535,6 +1538,16 @@ std::optional<arrow::Result<TypedConstant>> FoldTyped(const sql::Expr& expr) {
   };
   if (const auto* unary = std::get_if<sql::UnaryExpr>(&expr);
       unary != nullptr && unary->op == sql::UnaryOp::kNegate) {
+    // DuckDB folds the minus of a literal into the literal while parsing, so
+    // -(-9223372036854775808) is the HUGEINT literal 9223372036854775808, not an overflowing
+    // negation.
+    if (const auto* lit = std::get_if<sql::Literal>(&*unary->operand);
+        lit != nullptr && lit->kind == sql::Literal::Kind::kInteger) {
+      sql::Literal negated = *lit;
+      negated.negative = !lit->negative;
+      negated.span = unary->span;
+      return FoldTyped(sql::Expr(std::move(negated)));
+    }
     auto inner = FoldTyped(*unary->operand);
     if (!inner.has_value() || !inner->ok()) {
       return inner;
@@ -2757,7 +2770,8 @@ namespace {
 // DOUBLE column or an approximate literal, which an exponent or more than 38 digits makes) and a
 // value does not compare in DOUBLE as it does on its own: a BIGINT or HUGEINT value (a column,
 // or a constant of that type), a FLOAT column, or a decimal literal against an integer value.
-// Such a BETWEEN is unsupported.
+// Such a BETWEEN is unsupported, unless the operand is DOUBLE: then both comparisons are in
+// DOUBLE already.
 template <class BindFn>
 arrow::Status CheckBetweenTypes(const sql::BetweenExpr& between, const BindFn& bind) {
   bool any_double = false;
@@ -2765,6 +2779,9 @@ arrow::Status CheckBetweenTypes(const sql::BetweenExpr& between, const BindFn& b
   bool any_float = false;
   bool any_decimal = false;
   bool any_integer = false;
+  bool any_varchar = false;
+  bool operand_double = false;  // the operand is DOUBLE: both comparisons are DOUBLE anyway
+  std::optional<LogicalType> temporal;
   const auto wide = [](LogicalType t) {
     return t == LogicalType::kBigInt || t == LogicalType::kHugeInt;
   };
@@ -2774,6 +2791,7 @@ arrow::Status CheckBetweenTypes(const sql::BetweenExpr& between, const BindFn& b
           lit->kind == sql::Literal::Kind::kInteger || lit->kind == sql::Literal::Kind::kDecimal;
       if (number && IsApproximateNumber(lit->text)) {
         any_double = true;
+        operand_double = operand_double || value == &*between.operand;
       } else if (lit->kind == sql::Literal::Kind::kDecimal) {
         any_decimal = true;
       } else if (lit->kind == sql::Literal::Kind::kInteger) {
@@ -2792,16 +2810,28 @@ arrow::Status CheckBetweenTypes(const sql::BetweenExpr& between, const BindFn& b
     }
     ARROW_ASSIGN_OR_RAISE(const Typed typed, bind(*value));
     const LogicalType type = typed.expr->type;
+    any_varchar = any_varchar || type == LogicalType::kVarchar;
+    if (type == LogicalType::kDate || type == LogicalType::kTimestamp) {
+      temporal = type;
+    }
     if (typed.stored_as_float) {
       any_float = true;
     } else if (type == LogicalType::kDouble) {
       any_double = true;
+      operand_double = operand_double || value == &*between.operand;
     } else if (IsInteger(type)) {
       any_integer = true;
       any_wide = any_wide || wide(type);
     }
   }
-  if (any_double && (any_wide || any_float || (any_decimal && any_integer))) {
+  // Pairwise, a string literal compares with a VARCHAR value and a DATE value alike; DuckDB
+  // rejects the mix.
+  if (any_varchar && temporal.has_value()) {
+    return BindError(std::format("Cannot mix values of type VARCHAR and {} in BETWEEN clause",
+                                 ToString(*temporal)),
+                     between.op_span);
+  }
+  if (any_double && !operand_double && (any_wide || any_float || (any_decimal && any_integer))) {
     return UnsupportedError(
         "BETWEEN of a DOUBLE value and a BIGINT, HUGEINT or FLOAT value, or of a DOUBLE value, a "
         "decimal literal and an integer value, is not supported (DuckDB compares all three in "
@@ -3066,8 +3096,9 @@ arrow::Status Binder::BindWhere() {
       }
     }
     const std::vector<const sql::Expr*> parts =
-        comparisons.empty() ? std::vector<const sql::Expr*>{conjunct}
-                            : std::vector<const sql::Expr*>{&comparisons[0], &comparisons[1]};
+        comparisons.empty()
+            ? std::vector<const sql::Expr*>{conjunct}
+            : std::vector<const sql::Expr*>{&comparisons.front(), &comparisons.back()};
     for (const sql::Expr* part : parts) {
       ARROW_ASSIGN_OR_RAISE(Predicate predicate, BindCondition(*part, /*having=*/false));
       const bool on_scan =

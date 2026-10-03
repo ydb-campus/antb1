@@ -275,3 +275,13 @@ SELECT COUNT(*) FROM empty WHERE RegionID > 2147483647 + 1
 onlyif antb1
 statement error ^bind: cannot compare
 SELECT COUNT(*) FROM hits_like WHERE RegionID BETWEEN 1 AND 'x'
+
+# DuckDB rejects a BETWEEN that mixes VARCHAR and DATE values, even when each comparison alone binds.
+statement error
+SELECT COUNT(*) FROM hits_like WHERE '2013-07-10' BETWEEN URL AND EventDate
+
+# DuckDB folds the minus of a literal into the literal: -(-9223372036854775808) is a HUGEINT, no overflow.
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE RegionID < -(-9223372036854775808)
+----
+10000

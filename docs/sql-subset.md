@@ -124,13 +124,15 @@ are the same expression.
   is a `BIGINT`; each operation in the wider type of its operands); one that overflows `INTEGER` or `BIGINT` is a
   bind error (exit code 1, divergence D17), and a `HUGEINT` value of more than 38 digits is unsupported. Other
   constant expressions (`/`, `//`, `%`, decimals) are unsupported. DuckDB compares the three values of a `BETWEEN` in
-  one common type and antb1 each comparison in its own, so when a value is `DOUBLE` (a `DOUBLE` column, a literal
-  with an exponent or of more than 38 digits), a `BETWEEN` that also has a `BIGINT` or `HUGEINT` value (a column, a
-  literal or a folded constant of that type), a `FLOAT` column, or a decimal literal and an integer value is
-  unsupported. A plain `BETWEEN` in the `AND` chain of `WHERE` or `HAVING` is its two comparisons, each folded and,
-  over a table column, pushed into the scan like any comparison; `NOT BETWEEN`, `NOT (a BETWEEN ...)` and `BETWEEN`
-  under `OR` or in `CASE` are compound conditions. DuckDB's names apply: `(a BETWEEN 1 AND 2)`, and both negations
-  `(NOT (a BETWEEN 1 AND 2))`;
+  one common type and antb1 each comparison in its own, so when a bound is `DOUBLE` (a `DOUBLE` column, a literal
+  with an exponent or of more than 38 digits) and the operand is not, a `BETWEEN` that also has a `BIGINT` or
+  `HUGEINT` value (a column, a literal or a folded constant of that type), a `FLOAT` column, or a decimal literal and
+  an integer value is unsupported; one that mixes a `VARCHAR` value with a `DATE` or `TIMESTAMP` value is a bind
+  error, as in DuckDB. As in DuckDB, the minus of an integer literal belongs to the literal, so
+  `-(-9223372036854775808)` is a `HUGEINT`, not an overflow. A plain `BETWEEN` in the `AND` chain of `WHERE` or
+  `HAVING` is its two comparisons, each folded and, over a table column, pushed into the scan like any comparison;
+  `NOT BETWEEN`, `NOT (a BETWEEN ...)` and `BETWEEN` under `OR` or in `CASE` are compound conditions. DuckDB's names
+  apply: `(a BETWEEN 1 AND 2)`, and both negations `(NOT (a BETWEEN 1 AND 2))`;
 - any of these in parentheses (`(a)`, `SUM((a))`, `WHERE (a = 1 AND b = 2)`), which group without changing
   anything.
 
