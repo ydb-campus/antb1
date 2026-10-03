@@ -162,9 +162,10 @@ Environment ReadEnvironment(char* const* envp) {
 // anything else (an absolute size, so the run does not depend on the host's memory).
 std::optional<int64_t> ParseByteSize(std::string_view text) {
   int64_t unit = 1;
-  for (const auto& [suffix, bytes] : {std::pair{std::string_view("KiB"), int64_t{1} << 10},
-                                      std::pair{std::string_view("MiB"), int64_t{1} << 20},
-                                      std::pair{std::string_view("GiB"), int64_t{1} << 30}}) {
+  for (const auto& [suffix, bytes] :
+       {std::pair{std::string_view("KiB"), int64_t{1024}},
+        std::pair{std::string_view("MiB"), int64_t{1024} * 1024},
+        std::pair{std::string_view("GiB"), int64_t{1024} * 1024 * 1024}}) {
     if (text.ends_with(suffix)) {
       text.remove_suffix(suffix.size());
       unit = bytes;
