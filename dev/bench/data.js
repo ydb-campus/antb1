@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791000267693,
+  "lastUpdate": 1791030900999,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -4236,6 +4236,90 @@ window.BENCHMARK_DATA = {
             "value": 14.91547680851113,
             "unit": "ms/iter",
             "extra": "iterations: 47\ncpu: 14.915148851063831 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "8a8a41d658a76186eec077a05ec1a51715f421f5",
+          "message": "feat(sql,plan): between and constant operands in comparisons (#86)\n\n## Summary\n\n`[NOT] BETWEEN` now works in conditions, and the constant side of a\ncomparison (or a BETWEEN bound) may be integer\narithmetic of literals. This is PR S2 of the roadmap for the queries\nderived from TPC-H (front-end track). No query\nflips in S2 alone (each still stops at a later construct), so\n`tests/data/tpch_status.json` stays empty.\n\n**Parser** (`src/sql`): a new `BetweenExpr` node (operand, bounds,\n`negated`, `op_span`) at comparison precedence. The\nbounds bind like the operand of `+`, so BETWEEN consumes its own `AND`,\nand `a BETWEEN 1 AND 2 AND b = 3` is two\nconjuncts. `x NOT BETWEEN ...` and `NOT x BETWEEN ...` are different\nASTs. Comparisons do not chain\n(`a BETWEEN 1 AND 2 = b` stays exit 4). A missing `AND` is a syntax\nerror. The AST equality, unparser\n(canonical form) and grammar comment are updated.\n\n**Binder** (`src/plan/binder.cc`):\n\n- A plain BETWEEN in the `AND` chain of WHERE or HAVING becomes its two\ncomparisons (`x >= lo`, `x <= hi`). Each is\nfolded exactly and, over a table column, pushed into the scan (the CLI\ngolden shows \"2 pushed predicates\"). NOT\nBETWEEN, `NOT (x BETWEEN ...)` and BETWEEN under OR or in CASE are\ncompound conditions with three-valued logic.\nNames follow DuckDB: `(x BETWEEN 1 AND 2)`, and `(NOT (x BETWEEN 1 AND\n2))` for both negations. BETWEEN as a\n  select value is unsupported, like any condition used as a value.\n- Constant operands: integer literals under unary `-`, `+`, `-` and `*`\nfold to a literal in DuckDB's types (a\nliteral is INTEGER when its magnitude fits, else BIGINT or HUGEINT by\nvalue; each operation is in the wider type).\nAs in DuckDB's parser, every unary minus directly over an integer\nliteral belongs to the literal, so\n`-(-9223372036854775808)` is a HUGEINT. An INTEGER or BIGINT overflow is\na bind error at the operation (exit\ncode 1). A HUGEINT beyond 38 digits is unsupported. `/`, `//`, `%` and\ndecimals stay unsupported.\n- DuckDB compares the three BETWEEN values in one common type; antb1\ncompares pairwise. They can differ only when a\nbound is DOUBLE (a column, an approximate literal or a 39+ digit\nliteral) and the operand is not: then a BETWEEN\nthat also has a BIGINT/HUGEINT value, a FLOAT column, or a decimal\nliteral plus an integer value is unsupported.\nWith a DOUBLE operand both comparisons are DOUBLE anyway, so it is\nanswered. A BETWEEN that mixes a VARCHAR value\n  with a DATE or TIMESTAMP value is a bind error, as in DuckDB.\n\n**Tests:**\n\n- Parser, property and unparse tests.\n- Binder: EXPLAIN of the split, the folded constants (nested minuses\nincluded) and the compound forms. Error kinds\nand spans for overflows, the type rules and the HUGEINT cap, in WHERE\nand HAVING. FLOAT cases.\n- `tests/slt/cases/where/between.slt` (expected blocks from `pixi run\nslt-complete`), including DOUBLE operands with\nBIGINT, wide and decimal bounds on the plain and compound paths, nested\nminuses, and the VARCHAR/DATE error.\n- An `explain --analyze` CLI golden for the pushdown.\n- The generator's `between` feature: it widens the existing op draw, and\nseeds 1, 7 and 20260925 change only the\n  BETWEEN spellings.\n- Fuzz dictionary entries and two seeds.\n\n**Docs:** `docs/sql-subset.md` (grammar, precedence, binder answers,\nBETWEEN semantics, the rejected list, divergence\nD17).\n\nFor the maintainer:\n\n- D17 is your decision from the plan: an overflowing constant is a bind\nerror at bind time, while DuckDB raises it\nonly when a row computes it (so DuckDB answers on an empty table).\n`between.slt` pins both sides.\n- The BETWEEN type rules came out of four reviewer-agent passes, each\nchecked against the DuckDB CLI. The DOUBLE\nrule is deliberately conservative: exit 4 instead of a possible wrong\nanswer.\n\nThis workload is derived from the TPC-H Benchmark and is not comparable\nto published TPC-H Benchmark results, as this\nimplementation does not comply with all requirements of the TPC-H\nBenchmark.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full                  # on 4bc9c2c\nlint: PASS\nci        100% tests passed out of 1672\nasan      100% tests passed out of 1672\ntidy      passed\ncoverage  100% tests passed out of 1672; Coverage gate: PASS\nfuzz      100% tests passed out of 2\nci-gcc    100% tests passed out of 1672\n$ ANTB1_DIFF_SEED=7 ANTB1_DIFF_COUNT=20000 pixi run diff-random          # on 05d0edc's code\nDIFF: PASS seed=7 queries=20000 failed=0 unsupported=0\n$ ANTB1_DIFF_SEED=20261003 ANTB1_DIFF_COUNT=20000 pixi run diff-random   # on 7d3d6ae\nDIFF: PASS seed=20261003 queries=20000 failed=0 unsupported=0\n```\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: none\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code implemented the\nmaintainer-approved plan (parser, binder,\ntests, docs, generator, fuzz seeds), and a reviewer agent reviewed the\ndiff in four passes (each finding is fixed\n  in a later commit).\n- Accountable human (has read and understands the whole diff): @hor911\n\n---------\n\nCo-authored-by: Claude <noreply@anthropic.com>",
+          "timestamp": "2026-10-03T15:33:03+03:00",
+          "tree_id": "e07bddaa6429eb58006cbf56743e899b60177471",
+          "url": "https://github.com/ydb-campus/antb1/commit/8a8a41d658a76186eec077a05ec1a51715f421f5"
+        },
+        "date": 1791030900567,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 2218.367058390284,
+            "unit": "ns/iter",
+            "extra": "iterations: 304126\ncpu: 2218.225794571987 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 62438.17687623171,
+            "unit": "ns/iter",
+            "extra": "iterations: 11166\ncpu: 62431.46498298406 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 69313.32836831424,
+            "unit": "ns/iter",
+            "extra": "iterations: 10339\ncpu: 69283.52616307185 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 254201.2496575338,
+            "unit": "ns/iter",
+            "extra": "iterations: 2920\ncpu: 254068.29143835625 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 248630.27610040226,
+            "unit": "ns/iter",
+            "extra": "iterations: 2749\ncpu: 248492.79010549287 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 1397954.789473672,
+            "unit": "ns/iter",
+            "extra": "iterations: 494\ncpu: 1397161.2085020258 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 30.01450447826145,
+            "unit": "ms/iter",
+            "extra": "iterations: 23\ncpu: 30.00075904347825 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 28.332936916666423,
+            "unit": "ms/iter",
+            "extra": "iterations: 24\ncpu: 28.319991458333305 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 147.47315319999927,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 147.46241839999996 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 8.496649876543279,
+            "unit": "ms/iter",
+            "extra": "iterations: 81\ncpu: 8.495638641975304 ms\nthreads: 1"
           }
         ]
       }
