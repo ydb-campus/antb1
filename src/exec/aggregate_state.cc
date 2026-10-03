@@ -340,8 +340,8 @@ Int128 HugeIntAt(const arrow::Decimal128Array& values, int64_t row) {
   return static_cast<Int128>(bits);
 }
 
-// SUM or AVG of a HUGEINT or DECIMAL argument (decimal128): every addition is checked. A DECIMAL(p,s)
-// sums to DECIMAL(38,s), and averages as DuckDB does (DuckDbDecimalAverage).
+// SUM or AVG of a HUGEINT or DECIMAL argument (decimal128): every addition is checked. A
+// DECIMAL(p,s) sums to DECIMAL(38,s), and averages as DuckDB does (DuckDbDecimalAverage).
 class HugeIntSumState final : public AggregateState {
  public:
   HugeIntSumState(bool average, plan::LogicalType input, arrow::MemoryPool* pool)
@@ -591,13 +591,11 @@ arrow::Result<std::unique_ptr<AggregateState>> MakeAggregateState(
         }
         return std::make_unique<TemporalAvgState>(pool);
       }
-      plan::LogicalType expected = !average && plan::IsInteger(*input)
-                                       ? plan::LogicalType::kHugeInt
-                                       : plan::LogicalType::kDouble;
+      plan::LogicalType expected = !average && plan::IsInteger(*input) ? plan::LogicalType::kHugeInt
+                                                                       : plan::LogicalType::kDouble;
       const bool decimal = *input == plan::LogicalType::kDecimal;
       if (decimal && !average) {
-        expected =
-            plan::LogicalType::Decimal(plan::LogicalType::kMaxDecimalWidth, input->scale());
+        expected = plan::LogicalType::Decimal(plan::LogicalType::kMaxDecimalWidth, input->scale());
       }
       if ((!plan::IsNumeric(*input) && !decimal) || result != expected) {
         return invalid();

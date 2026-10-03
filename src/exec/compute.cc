@@ -237,7 +237,8 @@ arrow::Result<DecimalOperand> ReadDecimalOperand(const arrow::Array& array, plan
   return operand;
 }
 
-// Rescales the operand to the result's scale, as DuckDB casts it to the result type first (for + and
+// Rescales the operand to the result's scale, as DuckDB casts it to the result type first (for +
+// and
 // -): every value must fit the result's width, else DuckDB's conversion error for the first that
 // does not.
 arrow::Status RescaleOperand(DecimalOperand& operand, plan::LogicalType result) {
@@ -255,8 +256,7 @@ arrow::Status RescaleOperand(DecimalOperand& operand, plan::LogicalType result) 
     Int128 scaled = 0;
     if (__builtin_mul_overflow(operand.values[i], factor, &scaled) || scaled < range.min ||
         scaled > range.max) {
-      const std::string target =
-          std::format("DECIMAL({},{})", result.width(), result.scale());
+      const std::string target = std::format("DECIMAL({},{})", result.width(), result.scale());
       const std::string suffix =
           operand.column.empty() ? "" : " when casting from source column " + operand.column;
       if (decimal) {
@@ -265,9 +265,8 @@ arrow::Status RescaleOperand(DecimalOperand& operand, plan::LogicalType result) 
             plan::FormatDecimal(operand.values[i], operand.type.width(), operand.type.scale()),
             "\" to type ", target, " failed: value is out of range!", suffix);
       }
-      return arrow::Status::ExecutionError("Could not cast value ",
-                                           Int128ToString(operand.values[i]), " to ", target,
-                                           suffix);
+      return arrow::Status::ExecutionError(
+          "Could not cast value ", Int128ToString(operand.values[i]), " to ", target, suffix);
     }
     operand.values[i] = scaled;
   }

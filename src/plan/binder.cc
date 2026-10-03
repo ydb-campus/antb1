@@ -1756,10 +1756,10 @@ arrow::Result<LogicalType> ArithType(sql::BinaryOp sql_op, ArithOp op, const Typ
     }
     if (t->expr->type == LogicalType::kDecimal &&
         (op == ArithOp::kDivide || op == ArithOp::kIntegerDivide || op == ArithOp::kModulo)) {
-      return UnsupportedError(std::format("'{}' of a DECIMAL ('{}' is {}) is not supported",
-                                          sql::ToString(sql_op), Clip(t->expr->name),
-                                          ToString(t->expr->type)),
-                              span);
+      return UnsupportedError(
+          std::format("'{}' of a DECIMAL ('{}' is {}) is not supported", sql::ToString(sql_op),
+                      Clip(t->expr->name), ToString(t->expr->type)),
+          span);
     }
     if (t->expr->type == LogicalType::kDecimal) {
       continue;

@@ -16,8 +16,8 @@ and `ORDER BY` (also by position), `HAVING` (the same conditions on aggregates a
 (`+ - * / // %` and unary `-`), the string functions `strlen` and `regexp_replace`, the timestamp functions
 `toDateTime`, `EXTRACT` and `date_trunc`, and `CASE` in every clause, dates written as casts
 (`CAST('2013-07-01' AS DATE)`, `'2013-07-01'::DATE`), `LIMIT` and `OFFSET`, over one table of Parquet files. This
-covers all 43 ClickBench queries (see [ClickBench status](#clickbench-status)). None of the 22 queries derived from
-TPC-H passes yet (see [Queries derived from TPC-H](#queries-derived-from-tpc-h)).
+covers all 43 ClickBench queries (see [ClickBench status](#clickbench-status)). Of the 22 queries derived from
+TPC-H, Q1 and Q6 pass (see [Queries derived from TPC-H](#queries-derived-from-tpc-h)).
 
 ```sql
 SELECT COUNT(*), SUM(ResolutionWidth) AS width, AVG(UserID), MAX(EventDate) FROM hits WHERE IsMobile = 1
@@ -679,7 +679,7 @@ The second workload is the 22 queries derived from TPC-H, in DuckDB's dialect, a
 committed ([ADR 0006](adr/0006-test-strategy-and-data-policy.md)); queries are referred to by their number (1-based).
 The ratchet `tests/data/tpch_status.json` lists the queries verified to pass, and `pass` below means exactly the
 ratchet (`pixi run lint` compares them); the PR that makes a query pass updates both. A query that does not pass must
-fail cleanly with exit code 4 (unsupported). Today none passes; the plan is recorded in ADRs 0021 (DECIMAL), 0022
+fail cleanly with exit code 4 (unsupported). Today Q1 and Q6 pass; the plan is recorded in ADRs 0021 (DECIMAL), 0022
 (joins, query blocks and uncorrelated subqueries) and 0023 (correlated subqueries). `tests/tpch/` generates the data
 at test time ([testing.md](testing.md#data-derived-from-tpc-h)), and `tpch.status.sf0_01`, `tpch.status.sf0_1` and
 `parallel.tpch.status.sf0_1` enforce the ratchet
@@ -688,12 +688,12 @@ completes the query; most queries also need the DECIMAL work of ADR 0021 before 
 
 | Query | Status | Completed by |
 | --- | --- | --- |
-| Q1 | unsupported (exit code 4) | DECIMAL arithmetic, SUM and AVG (ADR 0021) |
+| Q1 | pass | DECIMAL arithmetic, SUM and AVG (ADR 0021) |
 | Q2 | unsupported (exit code 4) | correlated scalar aggregates (ADR 0023) |
 | Q3 | unsupported (exit code 4) | inner joins (ADR 0022) |
 | Q4 | unsupported (exit code 4) | correlated EXISTS and NOT EXISTS (ADR 0023) |
 | Q5 | unsupported (exit code 4) | inner joins (ADR 0022) |
-| Q6 | unsupported (exit code 4) | DECIMAL arithmetic, SUM and AVG (ADR 0021) |
+| Q6 | pass | DECIMAL arithmetic, SUM and AVG (ADR 0021) |
 | Q7 | unsupported (exit code 4) | derived tables (ADR 0022) |
 | Q8 | unsupported (exit code 4) | derived tables (ADR 0022) |
 | Q9 | unsupported (exit code 4) | derived tables (ADR 0022) |

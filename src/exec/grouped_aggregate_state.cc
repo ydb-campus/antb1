@@ -133,8 +133,7 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecimalAverages(std::span<const Int
     if (counts[g] == 0) {
       builder.UnsafeAppendNull();
     } else {
-      builder.UnsafeAppend(
-          DuckDbDecimalAverage(sums[g], counts[g], input.width(), input.scale()));
+      builder.UnsafeAppend(DuckDbDecimalAverage(sums[g], counts[g], input.width(), input.scale()));
     }
   }
   return builder.Finish();
@@ -257,7 +256,8 @@ class GroupedIntegerSum final : public GroupedAggregateState {
       std::uint32_t begin, std::uint32_t end, arrow::MemoryPool* pool) const override {
     ARROW_ASSIGN_OR_RAISE(const auto sums, GroupRange(sums_, begin, end));
     ARROW_ASSIGN_OR_RAISE(const auto counts, GroupRange(counts_, begin, end));
-    return average_ ? Averages(sums, counts, pool) : HugeInts(sums, counts, plan::LogicalType::kHugeInt, pool);
+    return average_ ? Averages(sums, counts, pool)
+                    : HugeInts(sums, counts, plan::LogicalType::kHugeInt, pool);
   }
 
  private:
@@ -351,8 +351,7 @@ class GroupedHugeIntSum final : public GroupedAggregateState {
     if (values == nullptr) {
       return arrow::Status::Invalid("SUM needs an argument column");
     }
-    ARROW_RETURN_NOT_OK(
-        CheckRows(values, plan::ToArrow(input_).get(), ids, num_groups()));
+    ARROW_RETURN_NOT_OK(CheckRows(values, plan::ToArrow(input_).get(), ids, num_groups()));
     const auto& decimals = static_cast<const arrow::Decimal128Array&>(*values);
     for (std::size_t i = 0; i < ids.size(); ++i) {
       const auto row = static_cast<std::int64_t>(i);
@@ -380,12 +379,11 @@ class GroupedHugeIntSum final : public GroupedAggregateState {
       return average_ ? Averages(sums, counts, pool)
                       : HugeInts(sums, counts, plan::LogicalType::kHugeInt, pool);
     }
-    return average_
-               ? DecimalAverages(sums, counts, input_, pool)
-               : HugeInts(sums, counts,
-                          plan::LogicalType::Decimal(plan::LogicalType::kMaxDecimalWidth,
-                                                     input_.scale()),
-                          pool);
+    return average_ ? DecimalAverages(sums, counts, input_, pool)
+                    : HugeInts(sums, counts,
+                               plan::LogicalType::Decimal(plan::LogicalType::kMaxDecimalWidth,
+                                                          input_.scale()),
+                               pool);
   }
 
  private:
@@ -880,13 +878,11 @@ arrow::Result<std::unique_ptr<GroupedAggregateState>> MakeGroupedAggregateState(
         }
         return std::make_unique<GroupedTemporalAvg>();
       }
-      plan::LogicalType expected = !average && plan::IsInteger(*input)
-                                       ? plan::LogicalType::kHugeInt
-                                       : plan::LogicalType::kDouble;
+      plan::LogicalType expected = !average && plan::IsInteger(*input) ? plan::LogicalType::kHugeInt
+                                                                       : plan::LogicalType::kDouble;
       const bool decimal = *input == plan::LogicalType::kDecimal;
       if (decimal && !average) {
-        expected =
-            plan::LogicalType::Decimal(plan::LogicalType::kMaxDecimalWidth, input->scale());
+        expected = plan::LogicalType::Decimal(plan::LogicalType::kMaxDecimalWidth, input->scale());
       }
       if ((!plan::IsNumeric(*input) && !decimal) || result != expected) {
         return invalid();
