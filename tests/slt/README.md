@@ -153,6 +153,17 @@ The ClickBench data tests (`tests/data`, label `data`) use two more subcommands:
 `canary/canary_queries.sql` and `canary/status_pass_*.json` drive their self-tests (`harness.queries.*`,
 `harness.clickbench.*`).
 
+## The ratchet of the queries derived from TPC-H: `tpch`
+
+`antb1-slt tpch --queries DIR --status FILE [--memory-limit SIZE]` is the same ratchet (`runner/ratchet.h`, shared
+with `clickbench`) for the numbered queries of a directory (`q01.sql`, ... as Q1, ...; the loader of `answers`)
+against `tests/data/tpch_status.json` (`{"pass": [...]}`). Two differences: only Unsupported is a clean failure (a
+parse or bind error fails, since the queries are valid SQL), and each query is logged as `Q<n>: running` before it
+runs, flushed, so the log of a run that times out names the query. `--memory-limit` takes an absolute size (`2GiB`,
+`512MiB`, bytes) for the antb1 sessions. `ANTB1_TPCH_TIMES=1` adds each query's seconds and the geometric mean of
+the passing queries. Its self-tests `harness.tpch.status.*` write our own numbered queries over the canary table
+(marked `redact`) into the build tree.
+
 ## Stored answers: `answers`
 
 `antb1-slt answers --queries DIR --answers DIR` checks answers that DuckDB stored next to their queries, for data,
@@ -190,6 +201,7 @@ because lint R009 keeps files named like `q01.sql` out of the repository.
 - `--mutate <kind>` corrupts antb1 results (`value`, `null`, `drop-row`, `extra-row`, `extra-column`,
   `error`, `unsupported`, `succeed`, `canary`); the self-tests prove that each one is caught.
 
-`--redact` and `--mutate` work for `run`, `diff`, `queries` and `clickbench`; `answers` takes `--mutate`, and
-`--show-values` works for all five. The `pixi run diff-random` repro of a `diff` failure is printed only for the
-tables of that task (`tables.txt`); every failure also prints its exact command line with `--only`.
+`--redact` and `--mutate` work for `run`, `diff`, `queries` and `clickbench`; `answers` and `tpch` take `--mutate`
+(`tpch` is always redacted, whatever its tables file says), and `--show-values` works for all six. The `pixi run diff-random`
+repro of a `diff` failure is printed only for the tables of that task (`tables.txt`); every failure also prints its
+exact command line with `--only`.

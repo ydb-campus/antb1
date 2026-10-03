@@ -53,11 +53,17 @@ set_tests_properties(
 # `redact`, so antb1-slt prints no value and no query text; sanitizer reports (they print values) go to files; and
 # output that looks unredacted (or matches a FORBID regex) is withheld before it reaches the log, so even a broken
 # redaction cannot publish the data.
-#   _tpch_test(<name> LABEL <label> [EXIT_CODE <n>] [REQUIRE <regex>...] [FORBID <regex>...] [NO_DATA]
-#              COMMAND <command>...)
+# TIMEOUT (default 300 seconds) is the ctest timeout; run_redacted.cmake stops the command 30 seconds earlier, so a
+# test that hangs still prints how far it got.
+#   _tpch_test(<name> LABEL <label> [EXIT_CODE <n>] [TIMEOUT <seconds>] [REQUIRE <regex>...] [FORBID <regex>...]
+#              [NO_DATA] COMMAND <command>...)
 function(_tpch_test name)
-  cmake_parse_arguments(ARG "NO_DATA" "LABEL;EXIT_CODE" "REQUIRE;FORBID;COMMAND" ${ARGN})
-  set(_defs "-DWORK_DIR=${CMAKE_BINARY_DIR}/slt-tmp/${name}")
+  cmake_parse_arguments(ARG "NO_DATA" "LABEL;EXIT_CODE;TIMEOUT" "REQUIRE;FORBID;COMMAND" ${ARGN})
+  if(NOT DEFINED ARG_TIMEOUT)
+    set(ARG_TIMEOUT 300)
+  endif()
+  math(EXPR _inner_timeout "${ARG_TIMEOUT} - 30")
+  set(_defs "-DWORK_DIR=${CMAKE_BINARY_DIR}/slt-tmp/${name}" "-DTIMEOUT=${_inner_timeout}")
   if(DEFINED ARG_EXIT_CODE)
     list(APPEND _defs "-DEXIT_CODE=${ARG_EXIT_CODE}")
   endif()
@@ -73,7 +79,7 @@ function(_tpch_test name)
     NAME ${name}
     COMMAND ${CMAKE_COMMAND} ${_defs} -P "${CMAKE_CURRENT_SOURCE_DIR}/run_redacted.cmake" -- ${ARG_COMMAND}
   )
-  set_tests_properties(${name} PROPERTIES LABELS ${ARG_LABEL} TIMEOUT 300)
+  set_tests_properties(${name} PROPERTIES LABELS ${ARG_LABEL} TIMEOUT ${ARG_TIMEOUT})
   if(NOT ARG_NO_DATA)
     set_tests_properties(${name} PROPERTIES FIXTURES_REQUIRED antb1_tpch)
   endif()
@@ -135,6 +141,55 @@ foreach(kind IN ITEMS diff parallel)
     ${_options}
   )
   _tpch_test(${_name} LABEL ${kind} REQUIRE "DIFF: PASS " COMMAND $<TARGET_FILE:antb1-slt> diff ${_args})
+endforeach()
+
+# The ratchet (antb1-slt tpch, tests/slt/runner/ratchet.h): the 22 queries on antb1, and DuckDB for those antb1
+# answers, against tests/data/tpch_status.json. A query passes only with DuckDB's answer (type names, DOUBLE within
+# 1e-9, ORDER BY order with ties in any order); every other query must be Unsupported (exit code 4): a parse, bind,
+# I/O or execution error fails the test, as do an unexpected pass and an unexpected fail. Both scale factors read
+# the same ratchet, so a query passes at both or the test fails at one, and the parallel run (4 threads, batches of
+# 1000 rows) must equal the 1-thread run byte for byte. Each query logs "Q<n>: running" first, so a timeout names
+# it. ANTB1_TPCH_TIMES=1 in the environment of a local run adds each query's seconds; no preset or CI job sets it.
+set(_status "${PROJECT_SOURCE_DIR}/tests/data/tpch_status.json")
+foreach(kind IN ITEMS sf0_01 sf0_1 parallel)
+  if(kind STREQUAL "parallel")
+    set(_name parallel.tpch.status.sf0_1)
+    set(_sf 0_1)
+    set(_label parallel)
+    set(
+      _options
+      --threads
+      4
+      --same-as-threads
+      1
+      --batch-size
+      1000
+    )
+  else()
+    set(_name tpch.status.${kind})
+    string(REPLACE "sf" "" _sf "${kind}")
+    set(_label oracle)
+    set(_options "")
+  endif()
+  antb1_slt_args(
+    _args
+    ${_name}
+    TABLES "${CMAKE_CURRENT_SOURCE_DIR}/tables_sf${_sf}.txt"
+    --queries
+    "${_tpch_dir}/queries"
+    --status
+    "${_status}"
+    --memory-limit
+    2GiB
+    ${_options}
+  )
+  _tpch_test(
+    ${_name}
+    LABEL ${_label}
+    TIMEOUT 900
+    REQUIRE "TPCH: PASS queries=22 "
+    COMMAND $<TARGET_FILE:antb1-slt> tpch ${_args}
+  )
 endforeach()
 
 # Redaction canary: with --mutate canary every query of the answers check fails, and the report prints neither the
@@ -215,10 +270,12 @@ foreach(case IN ITEMS on_ci local)
   set_tests_properties(${_name} PROPERTIES ENVIRONMENT_MODIFICATION "${_environment}")
 endforeach()
 
-# run_redacted.cmake withholds output that matches a FORBID regex or looks like an unredacted report, and prints
-# only the SUMMARY lines of a sanitizer report (fake_sanitizer_report.cmake writes one with a sentinel). The outer
-# expect test checks what reached the log; these outputs are our own sentinels, never data.
-foreach(case IN ITEMS forbid unredacted sanitizer)
+# run_redacted.cmake withholds output that matches a FORBID regex or looks like an unredacted report, prints only the
+# SUMMARY lines of a sanitizer report (fake_sanitizer_report.cmake writes one with a sentinel), and fails a command
+# that does not exit normally with exit code 125 after printing its output so far (fake_slow_query.cmake logs a
+# query as running, then outlasts TIMEOUT). The outer expect test checks what reached the log; these outputs are our
+# own sentinels, never data.
+foreach(case IN ITEMS forbid unredacted sanitizer timeout)
   set(_name harness.tpch.run_redacted.${case})
   set(_inner "-DWORK_DIR=${CMAKE_BINARY_DIR}/slt-tmp/${_name}")
   set(_exit 1)
@@ -238,6 +295,12 @@ foreach(case IN ITEMS forbid unredacted sanitizer)
     )
     set(_require "the output is withheld")
     set(_forbid "SELECT 42")
+  elseif(case STREQUAL "timeout")
+    list(APPEND _inner -DTIMEOUT=2)
+    set(_command ${CMAKE_COMMAND} -P "${CMAKE_CURRENT_SOURCE_DIR}/fake_slow_query.cmake")
+    set(_require "Q7: running\n" "the command did not exit normally")
+    set(_forbid "Q7: unsupported")
+    set(_exit 125)
   else()
     list(APPEND _inner -DEXIT_CODE=1)
     set(_command ${CMAKE_COMMAND} -P "${CMAKE_CURRENT_SOURCE_DIR}/fake_sanitizer_report.cmake")

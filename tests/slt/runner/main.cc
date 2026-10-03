@@ -10,10 +10,14 @@
 //                        [--mutate KIND] QUERIES
 //   antb1-slt answers --fixtures DIR --tables FILE --queries DIR --answers DIR [--only N]
 //                     [--mutate KIND]
+//   antb1-slt tpch --fixtures DIR --tables FILE --queries DIR --status FILE [--memory-limit SIZE]
+//                  [--only N] [--mutate KIND]
 //   antb1-slt version
 //
 // `queries` and `clickbench` run the ClickBench data tests (tests/data): see query_file.h and
-// clickbench.h. `answers` checks stored answers against the DuckDB oracle (answers.h).
+// clickbench.h. `answers` checks stored answers against the DuckDB oracle (answers.h). `tpch` is
+// the ratchet of the queries derived from TPC-H (ratchet.h, tests/tpch): q01.sql, q02.sql, ... of
+// DIR as Q1, Q2, ...; ANTB1_TPCH_TIMES=1 adds each query's seconds and their geometric mean.
 //
 // Redaction: --redact, a table with the `redact` option (tables.h) and `answers` print no values
 // and no SQL. --show-values lifts the last two for a local repro; it is refused when
@@ -23,6 +27,8 @@
 // error (tables, fixtures, engine), 70 internal error.
 
 #include <algorithm>
+#include <charconv>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <exception>
@@ -52,6 +58,7 @@
 #include "engine.h"
 #include "query_file.h"
 #include "query_gen.h"
+#include "ratchet.h"
 #include "runner.h"
 #include "slt_file.h"
 #include "supported_features.h"
@@ -95,9 +102,12 @@ struct Args {
   // queries, clickbench
   std::string query_file;
   std::string status;
-  // answers
+  // answers, tpch
   std::string queries_dir;
   std::string answers_dir;
+  // tpch: the antb1 sessions' memory limit (engine::SessionOptions::memory_limit)
+  std::string memory_limit;
+  bool times = false;  // ANTB1_TPCH_TIMES=1
 };
 
 std::string ShellQuote(std::string_view arg) {
@@ -132,14 +142,44 @@ std::string CommandLine(std::span<char*> argv, bool show_values) {
   return show_values ? command + " --show-values" : command;
 }
 
-// GITHUB_ACTIONS=true in main's environment `envp` (std::getenv is not thread-safe).
-bool OnGitHubActions(char* const* envp) {
+// What antb1-slt reads from main's environment `envp` (std::getenv is not thread-safe).
+struct Environment {
+  bool github_actions = false;  // GITHUB_ACTIONS=true
+  bool tpch_times = false;      // ANTB1_TPCH_TIMES=1
+};
+
+Environment ReadEnvironment(char* const* envp) {
+  Environment env;
   for (char* const* entry = envp; entry != nullptr && *entry != nullptr; ++entry) {
-    if (std::string_view(*entry) == "GITHUB_ACTIONS=true") {
-      return true;
+    const std::string_view variable(*entry);
+    env.github_actions = env.github_actions || variable == "GITHUB_ACTIONS=true";
+    env.tpch_times = env.tpch_times || variable == "ANTB1_TPCH_TIMES=1";
+  }
+  return env;
+}
+
+// A memory size in bytes: digits with an optional KiB, MiB or GiB suffix; std::nullopt for
+// anything else (an absolute size, so the run does not depend on the host's memory).
+std::optional<int64_t> ParseByteSize(std::string_view text) {
+  int64_t unit = 1;
+  for (const auto& [suffix, bytes] :
+       {std::pair{std::string_view("KiB"), int64_t{1024}},
+        std::pair{std::string_view("MiB"), int64_t{1024} * 1024},
+        std::pair{std::string_view("GiB"), int64_t{1024} * 1024 * 1024}}) {
+    if (text.ends_with(suffix)) {
+      text.remove_suffix(suffix.size());
+      unit = bytes;
+      break;
     }
   }
-  return false;
+  int64_t value = 0;
+  const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+  int64_t bytes = 0;
+  if (error != std::errc{} || end != text.data() + text.size() || value < 1 ||
+      __builtin_mul_overflow(value, unit, &bytes)) {
+    return std::nullopt;
+  }
+  return bytes;
 }
 
 // The tables file of `pixi run diff-random` (scripts/diff-random.sh).
@@ -193,6 +233,9 @@ std::expected<std::unique_ptr<Engine>, std::string> MakeEngine(std::string_view 
     engine::SessionOptions options;
     options.threads = args.threads;
     options.batch_size = args.batch_size;
+    if (!args.memory_limit.empty()) {
+      options.memory_limit = ParseByteSize(args.memory_limit);
+    }
     auto engine = Antb1Engine::Make(tables, options);
     if (!engine) {
       return std::unexpected(engine.error());
@@ -503,6 +546,62 @@ int ClickBench(const Args& args, const std::vector<TableDef>& tables, const std:
   return stats.failed == 0 ? 0 : kExitFailed;
 }
 
+// The workload of the queries derived from TPC-H: Q1 to Q22, and only Unsupported is a clean
+// failure (a parse or bind error means the engine misreads valid SQL).
+constexpr Workload kTpch{
+    .summary = "TPCH",
+    .commit_key = "",
+    .first = 1,
+    .rejections_clean = false,
+    .unclean_rule =
+        "a query derived from TPC-H that antb1 does not answer must fail with "
+        "Unsupported (exit code 4)",
+    .table = "the table of the queries derived from TPC-H",
+    .running_lines = true,
+};
+
+int Tpch(const Args& args, const std::vector<TableDef>& tables, const std::string& command) {
+  auto queries = LoadNumberedQueries(args.queries_dir, args.redact);
+  if (!queries) {
+    std::println(stderr, "antb1-slt: {}", queries.error());
+    return kExitSetup;
+  }
+  auto status_text = ReadFile(args.status);
+  if (!status_text) {
+    std::println(stderr, "{}", status_text.error());
+    return kExitSetup;
+  }
+  auto status = ParseRatchetStatus(*status_text, kTpch);
+  if (!status) {
+    std::println(stderr, "antb1-slt: {}: {}", args.status, status.error());
+    return kExitUsage;
+  }
+  auto antb1 = MakeAntb1(tables, args);
+  auto oracle = MakeEngine("duckdb", tables, args);
+  if (!antb1 || !oracle) {
+    std::println(stderr, "antb1-slt: {}", !antb1 ? antb1.error() : oracle.error());
+    return kExitSetup;
+  }
+  RatchetOptions options{.redact = args.redact,
+                         .only = args.only,
+                         .status_path = args.status,
+                         .command = command,
+                         .clock = {}};
+  if (args.times) {
+    options.clock = [] {
+      return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch())
+          .count();
+    };
+  }
+  // Each line as it comes, so the log of a run that times out ends with the query it was running.
+  const RatchetStats stats = RunRatchet(*queries, *status, kTpch, antb1->get(), **oracle, options,
+                                        [](std::string_view text) {
+                                          std::print("{}", text);
+                                          std::fflush(stdout);
+                                        });
+  return stats.failed == 0 ? 0 : kExitFailed;
+}
+
 int Answers(const Args& args, const std::vector<TableDef>& tables, const std::string& command) {
   const auto mutation = ParseMutation(args.mutate);
   if (!mutation.has_value()) {
@@ -531,7 +630,8 @@ int Answers(const Args& args, const std::vector<TableDef>& tables, const std::st
   return stats.failed == 0 ? 0 : kExitFailed;
 }
 
-int Main(std::span<char*> argv, bool github_actions) {
+int Main(std::span<char*> argv, const Environment& env) {
+  const bool github_actions = env.github_actions;
   CLI::App app{"antb1-slt: sqllogictest runner (antb1 engine, DuckDB oracle)", "antb1-slt"};
   app.require_subcommand(1);
   Args args;
@@ -590,6 +690,21 @@ int Main(std::span<char*> argv, bool github_actions) {
       ->required();
   answers->add_option("--only", args.only, "Run only Q<n> (repro)");
   answers->add_option("--mutate", args.mutate, "Corrupt DuckDB's results (harness self-tests)");
+  auto* tpch = app.add_subcommand(
+      "tpch", "Ratchet of the queries derived from TPC-H: q01.sql, ... on antb1 vs DuckDB");
+  AddSetup(tpch, args);
+  tpch->add_option("--queries", args.queries_dir, "Directory of q01.sql, q02.sql, ...")->required();
+  tpch->add_option("--status", args.status, "The ratchet (tests/data/tpch_status.json)")
+      ->required();
+  tpch->add_option("--memory-limit", args.memory_limit,
+                   "antb1: memory a query may use, e.g. 2GiB (bytes, KiB, MiB or GiB)")
+      ->check([](const std::string& value) -> std::string {
+        return ParseByteSize(value).has_value()
+                   ? std::string()
+                   : "expects a size such as 2GiB or 512MiB, got '" + value + "'";
+      });
+  tpch->add_option("--only", args.only, "Run only Q<n> (repro)");
+  tpch->add_option("--mutate", args.mutate, "Corrupt antb1 results (harness self-tests)");
   const auto* version = app.add_subcommand("version", "Print the DuckDB version the oracle uses");
   try {
     app.parse(static_cast<int>(argv.size()), argv.data());
@@ -623,8 +738,10 @@ int Main(std::span<char*> argv, bool github_actions) {
     std::println(stderr, "antb1-slt: {}", tables.error());
     return kExitSetup;
   }
-  // Redacted unless --show-values: tables marked `redact`, and `answers`.
-  const bool redacted_data = answers->parsed() || std::ranges::any_of(*tables, &TableDef::redact);
+  // Redacted unless --show-values: tables marked `redact`, `answers` and `tpch`.
+  // `tpch` too: its queries are derived from TPC-H, whatever the tables file says.
+  const bool redacted_data =
+      answers->parsed() || tpch->parsed() || std::ranges::any_of(*tables, &TableDef::redact);
   if (redacted_data && complete->parsed()) {
     std::println(stderr,
                  "antb1-slt: complete writes values into .slt files; it is refused for tables "
@@ -653,6 +770,10 @@ int Main(std::span<char*> argv, bool github_actions) {
   if (answers->parsed()) {
     return Answers(args, *tables, command);
   }
+  if (tpch->parsed()) {
+    args.times = env.tpch_times;
+    return Tpch(args, *tables, command);
+  }
   return complete->parsed() ? Complete(args, *tables) : Run(args, *tables, command);
 }
 
@@ -662,7 +783,7 @@ int Main(std::span<char*> argv, bool github_actions) {
 int main(int argc, char** argv, char* const* envp) {
   try {
     return antb1::slt::Main(std::span(argv, static_cast<std::size_t>(argc)),
-                            antb1::slt::OnGitHubActions(envp));
+                            antb1::slt::ReadEnvironment(envp));
   } catch (const std::exception& e) {
     std::fputs("antb1-slt: internal error: ", stderr);  // C stdio: cannot throw again
     std::fputs(e.what(), stderr);

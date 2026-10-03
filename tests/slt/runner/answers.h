@@ -50,6 +50,11 @@ std::expected<std::vector<AnswerQuery>, std::string> LoadAnswerQueries(
     const std::filesystem::path& queries_dir, const std::filesystem::path& answers_dir,
     bool redact);
 
+// Reads q01.sql, q02.sql, ... of `dir`: numbered from 1 without gaps, one statement each (the
+// queries of `antb1-slt tpch`). Errors as LoadAnswerQueries's.
+std::expected<std::vector<Statement>, std::string> LoadNumberedQueries(
+    const std::filesystem::path& dir, bool redact);
+
 struct AnswerTable {
   std::size_t columns = 0;  // fields of the header line
   std::vector<std::vector<std::optional<std::string>>> rows;

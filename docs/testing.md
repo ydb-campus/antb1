@@ -338,7 +338,7 @@ an unclean failure (an I/O, execution or internal error) and on any difference f
 The PR that changes the pass set updates the ratchet and the status table in
 [sql-subset.md](sql-subset.md#clickbench-status) in the same PR (`pixi run lint` checks that they agree and that
 the commit matches the lock). An unexpected pass is good news: add the query to both. An unexpected fail is a
-regression to fix. The ratchet is `[0]` today.
+regression to fix. The ratchet lists all 43 queries today.
 
 ### Full dataset (host only)
 
@@ -389,14 +389,36 @@ the test is withheld, so a broken redaction fails the test without publishing th
 
 | Test | Label | What it checks |
 | --- | --- | --- |
+| `tpch.status.sf0_01`, `tpch.status.sf0_1` | `oracle` | the ratchet: the 22 queries on antb1 against DuckDB and `tests/data/tpch_status.json` ([below](#the-ratchet-of-the-queries-derived-from-tpc-h)) |
+| `parallel.tpch.status.sf0_1` | `parallel` | the same on 4 threads with 1000-row batches, equal to the 1-thread results byte for byte |
 | `harness.tpch.answers.sf0_01`, `harness.tpch.answers.sf0_1` | `harness` | the 22 queries on the in-process DuckDB oracle against DuckDB's stored answers (`antb1-slt answers`): the oracle reads the generated files as dbgen meant them |
 | `diff.tpch` | `diff` | 300 generated queries over the tables at scale factor 0.01, antb1 against DuckDB (`antb1-slt diff`, fixed seed) |
 | `parallel.diff.tpch` | `parallel` | the same queries on 4 threads with 1000-row batches, equal to the 1-thread results byte for byte |
 | `harness.tpch.answers.redact` | `harness` | `--mutate canary`: every query fails, and the report prints no sentinel, no query text and no sanitizer report |
 | `harness.tpch.drift` | `harness` | query texts that differ from the committed digests fail, and the report gives numbers and digests only |
 | `harness.tpch.generate.duckdb_fails.on_ci`, `.local` | `harness` | a failing duckdb CLI: only its exit code and error kind are printed; `ANTB1_TPCH_SHOW=1` shows its messages locally, never on GitHub Actions |
-| `harness.tpch.run_redacted.forbid`, `.unredacted`, `.sanitizer` | `harness` | `run_redacted.cmake` withholds forbidden and unredacted output and prints only the `SUMMARY:` line of a sanitizer report |
+| `harness.tpch.run_redacted.forbid`, `.unredacted`, `.sanitizer`, `.timeout` | `harness` | `run_redacted.cmake` withholds forbidden and unredacted output, prints only the `SUMMARY:` line of a sanitizer report, and fails a command that outlasts its timeout with exit code 125 after printing how far it got |
+| `harness.tpch.status.*` | `harness` | `antb1-slt tpch` on our own numbered queries over the canary table: all unsupported passes; an unexpected pass, an unexpected fail, a wrong answer and a parse, bind or execution error each fail, redacted |
 | `harness.tpch.extension` | `harness` | the pinned extension loads into the duckdb CLI |
+
+### The ratchet of the queries derived from TPC-H
+
+`tpch.status.sf0_01`, `tpch.status.sf0_1` and `parallel.tpch.status.sf0_1` run `antb1-slt tpch`
+(`tests/slt/runner/ratchet.h`, which the ClickBench ratchet shares): `q01.sql` to `q22.sql` as Q1 to Q22 on antb1,
+with a memory limit of 2 GiB, and on DuckDB the queries antb1 answers. A query passes when antb1's answer equals
+DuckDB's: the same type names, DOUBLE within 1e-9, ORDER BY order with ties in any order, and any row order
+otherwise. Every other query must be Unsupported (exit code 4): unlike ClickBench, a parse or bind error is not a
+clean failure, because these queries are valid SQL. The tests fail on a wrong answer, on any other error and on any
+difference from the ratchet `tests/data/tpch_status.json` (`{"pass": [<n>, ...]}`). Both scale factors read the same
+ratchet, so a query must pass at both, and the parallel run must equal the 1-thread run byte for byte. The PR that
+makes a query pass adds it to the ratchet and to the table in [sql-subset.md](sql-subset.md#queries-derived-from-tpc-h)
+(`pixi run lint` checks that they agree); both are protected paths, so the maintainer signs off.
+
+Each query is logged as `Q<n>: running` before it runs, and `run_redacted.cmake` stops the run 30 seconds before
+the ctest timeout (900 seconds), so the log of a run that hangs names the query. `ANTB1_TPCH_TIMES=1` adds each
+query's seconds and the geometric mean of the passing queries when set in the environment of a local run
+(`ANTB1_TPCH_TIMES=1 pixi run test -R 'tpch\.status'`); no preset and no CI job sets it, and the self-tests unset
+it. A failure prints the query number, hashes and an unredacted repro command to run locally.
 
 The seed of the differential test is fixed. DuckDB 1.5.5 leaks the state of a string `MIN` or `MAX` over many groups
 without `ORDER BY`, so a new seed is checked with `pixi run asan` first, and one whose queries make DuckDB leak is

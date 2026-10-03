@@ -10,6 +10,7 @@ add_library(
   runner/ordered_compare.cc
   runner/query_file.cc
   runner/query_gen.cc
+  runner/ratchet.cc
   runner/result_diff.cc
   runner/runner.cc
   runner/sha256.cc
@@ -44,6 +45,7 @@ antb1_add_gtest(
     tests/antb1_engine_test.cc
     tests/canonical_test.cc
     tests/clickbench_test.cc
+    tests/ratchet_test.cc
     tests/comparator_test.cc
     tests/limit_compare_test.cc
     tests/ordered_compare_test.cc
@@ -427,6 +429,90 @@ if(ANTB1_HAVE_DUCKDB)
   endforeach()
   set_tests_properties(harness.answers.show_values PROPERTIES ENVIRONMENT_MODIFICATION "GITHUB_ACTIONS=unset:")
   set_tests_properties(harness.answers.show_values_on_ci PROPERTIES ENVIRONMENT "GITHUB_ACTIONS=true")
+
+  # `antb1-slt tpch` (runner/ratchet.h; the ratchet of the queries derived from TPC-H, tests/tpch) on our own numbered
+  # queries over the canary table marked `redact`, written into the build tree (lint R009). Each case is a directory
+  # of queries and a ratchet: a window function is the standard unsupported query, so all-unsupported passes; and an
+  # unexpected pass, an unexpected fail, a wrong answer (--mutate canary), and a parse, bind or execution error (only
+  # Unsupported is a clean failure for this workload) each fail with a redacted report.
+  set(_tpch_selftest "${CMAKE_CURRENT_BINARY_DIR}/tpch-selftest")
+  set(_unsupported "SELECT ROW_NUMBER() OVER () FROM antb1_canary_table;\n")
+  set(_answered "SELECT COUNT(*) FROM antb1_canary_table;\n")
+  set(_q1_pass "${_unsupported}")
+  set(_q1_unexpected_pass "${_answered}")
+  set(_q1_unexpected_fail "${_unsupported}")
+  set(_q1_wrong_answer "${_answered}")
+  set(_q1_parse_error "SELECT FROM antb1_canary_table WHERE;\n")
+  set(_q1_bind_error "SELECT antb1_no_such_column FROM antb1_canary_table;\n")
+  set(_q1_execution_error "SELECT id * 9223372036854775807 FROM antb1_canary_table;\n")
+  set(
+    _cases
+    pass
+    unexpected_pass
+    unexpected_fail
+    wrong_answer
+    parse_error
+    bind_error
+    execution_error
+  )
+  set(
+    _require_pass
+    "Q1: running\nQ1: unsupported\nQ2: running\nQ2: unsupported\n"
+    "TPCH: PASS queries=2 pass=\\[\\] unsupported=2 rejected=0 failed=0 ratchet=\\[\\]\n"
+  )
+  set(_require_unexpected_pass "FAIL Q1: unexpected pass: antb1 answers Q1 and equals DuckDB")
+  set(_require_unexpected_fail "FAIL Q1: unexpected fail: the ratchet .* lists Q1, but it no longer passes")
+  set(_require_wrong_answer "FAIL Q1: result mismatch" "sha256: DuckDB [0-9a-f]+")
+  set(_require_parse_error "FAIL Q1: antb1 fails with a parse error; a query derived from TPC-H")
+  set(_require_bind_error "FAIL Q1: antb1 fails with a bind error; a query derived from TPC-H")
+  set(_require_execution_error "FAIL Q1: antb1 fails with an execution error; a query derived from TPC-H")
+  foreach(case IN LISTS _cases)
+    set(_name harness.tpch.status.${case})
+    set(_dir "${_tpch_selftest}/${case}")
+    file(WRITE "${_dir}/queries/q01.sql" "${_q1_${case}}")
+    file(WRITE "${_dir}/queries/q02.sql" "${_unsupported}")
+    set(_pass "")
+    if(case MATCHES "^(unexpected_fail|wrong_answer)$")
+      set(_pass 1)
+    endif()
+    file(WRITE "${_dir}/status.json" "{\"pass\": [${_pass}]}\n")
+    set(_exit 1)
+    set(_options "")
+    if(case STREQUAL "pass")
+      set(_exit 0)
+    elseif(case STREQUAL "wrong_answer")
+      set(_options --mutate canary)
+    endif()
+    antb1_slt_args(
+      _args
+      ${_name}
+      TABLES "${CMAKE_CURRENT_SOURCE_DIR}/canary/tables_redact.txt"
+      --queries
+      "${_dir}/queries"
+      --status
+      "${_dir}/status.json"
+      --memory-limit
+      1GiB
+      ${_options}
+    )
+    set(_require ${_require_${case}})
+    if(NOT case STREQUAL "pass")
+      list(APPEND _require "TPCH: FAIL queries=2 ")
+    endif()
+    if(NOT case MATCHES "^(pass|unexpected_pass)$")
+      list(APPEND _require "--show-values --only 1\n")
+    endif()
+    antb1_add_expect_test(
+      ${_name}
+      LABELS harness
+      FIXTURES_REQUIRED antb1_fixtures
+      EXIT_CODE ${_exit}
+      REQUIRE ${_require} ${_redacted_forbid}
+      COMMAND $<TARGET_FILE:antb1-slt> tpch ${_args}
+    )
+    # Their output must not depend on a developer's ANTB1_TPCH_TIMES (ctest passes the environment through).
+    set_tests_properties(${_name} PROPERTIES ENVIRONMENT_MODIFICATION "ANTB1_TPCH_TIMES=unset:")
+  endforeach()
 
   # The `redact` option of a tables file (runner/tables.h): canary/tables_redact.txt marks the canary table, so every
   # report is redacted without --redact and its repro adds --show-values; an explicit --redact wins over

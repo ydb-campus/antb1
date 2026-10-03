@@ -1,8 +1,9 @@
 # Runs one test over the data derived from TPC-H (tests/tpch/CMakeLists.txt) so that its log never shows that data,
 # even when the test fails because redaction broke:
 #
-#   cmake -DWORK_DIR=<dir in the build tree> [-DEXIT_CODE=<n>] [-DREQUIRE_COUNT=<k> -DREQUIRE_0=<regex> ...]
-#         [-DFORBID_COUNT=<k> -DFORBID_0=<regex> ...] -P run_redacted.cmake -- <command> [args...]
+#   cmake -DWORK_DIR=<dir in the build tree> [-DEXIT_CODE=<n>] [-DTIMEOUT=<seconds>]
+#         [-DREQUIRE_COUNT=<k> -DREQUIRE_0=<regex> ...] [-DFORBID_COUNT=<k> -DFORBID_0=<regex> ...]
+#         -P run_redacted.cmake -- <command> [args...]
 #
 # - Sanitizer reports go to files in WORK_DIR/sanitizers, because an ASan or UBSan report prints values. Only their
 #   SUMMARY lines (the kind of error and its source location) join the output, as in cmake/scripts/RunDataTest.cmake.
@@ -11,7 +12,10 @@
 #   only the pattern, so a broken redaction fails the test without publishing what it should have hidden. Unlike
 #   cmake/scripts/expect_output.cmake, which prints first and checks after.
 # - The test fails unless the command exits with EXIT_CODE (default 0) and every REQUIRE regex matches. A command
-#   killed by a signal fails the test with exit code 125, whatever EXIT_CODE says.
+#   killed by a signal fails the test with exit code 125, whatever EXIT_CODE says, and so does one that runs longer
+#   than TIMEOUT seconds: its output so far is still checked and printed, so the log shows how far it got (antb1-slt
+#   tpch logs "Q<n>: running" before each query). Set TIMEOUT below the ctest TIMEOUT, which would kill this script
+#   before it prints anything.
 cmake_minimum_required(VERSION 3.29) # cmake_language(EXIT)
 
 if(NOT DEFINED WORK_DIR OR NOT IS_ABSOLUTE "${WORK_DIR}")
@@ -47,7 +51,11 @@ foreach(_var ASAN_OPTIONS UBSAN_OPTIONS LSAN_OPTIONS TSAN_OPTIONS)
   set(ENV{${_var}} "${_options}log_path=${_sanitizer_dir}/${_log}")
 endforeach()
 
-execute_process(COMMAND ${_command} RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _out)
+set(_timeout "")
+if(DEFINED TIMEOUT)
+  set(_timeout TIMEOUT ${TIMEOUT})
+endif()
+execute_process(COMMAND ${_command} RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _out ${_timeout})
 file(GLOB _reports LIST_DIRECTORIES false "${_sanitizer_dir}/*")
 if(_reports)
   string(
