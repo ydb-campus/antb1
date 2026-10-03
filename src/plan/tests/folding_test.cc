@@ -232,6 +232,7 @@ struct FoldCase {
 void PrintTo(const FoldCase& c, std::ostream* os) { *os << c.where; }
 
 class FoldThroughBinderTest : public ::testing::TestWithParam<FoldCase> {};
+class FoldDecimalTest : public ::testing::TestWithParam<FoldCase> {};
 
 TEST_P(FoldThroughBinderTest, Folds) {
   const FoldCase& c = GetParam();
@@ -307,14 +308,62 @@ INSTANTIATE_TEST_SUITE_P(
         FoldCase{"i64 > 1.55e1", kCompare, CompareOp::kGe, 16}, FoldCase{"i64 < 1e19", kIsNotNull},
         FoldCase{"i64 > -1e19", kIsNotNull}, FoldCase{"i64 < 1e-5", kCompare, CompareOp::kLe, 0},
         FoldCase{"1.5 < i64", kCompare, CompareOp::kGe, 2},
-        // HUGEINT: +-(10^38 - 1).
+        // DECIMAL(38,0): +-(10^38 - 1); a fraction is folded like into an integer column.
         FoldCase{"h = 99999999999999999999999999999999999999", kCompare, CompareOp::kEq,
-                 RangeOf(LogicalType::kHugeInt).max},
-        FoldCase{"h < 100000000000000000000000000000000000000", kIsNotNull},
-        FoldCase{"h > -100000000000000000000000000000000000000", kIsNotNull},
-        // 1e38 is a DOUBLE (below 10^38): h >= 99999999999999997748809823456034029568.
-        FoldCase{"h >= 1e38", kCompare, CompareOp::kGe, static_cast<Int128>(1e38)},
-        FoldCase{"h >= 1.0000000000000001e38", kFalse}));
+                 RangeOf(LogicalType::Decimal(38, 0)).max},
+        FoldCase{"h <= -99999999999999999999999999999999999999", kCompare, CompareOp::kLe,
+                 RangeOf(LogicalType::Decimal(38, 0)).min},
+        FoldCase{"h < 1.5", kCompare, CompareOp::kLe, 1}, FoldCase{"h = 1.5", kFalse}));
+
+// A literal folds exactly into a DECIMAL column's scale, as its unscaled value (ADR 0021 rule 11):
+// a fraction beyond the scale gives the nearest value on the kept side, and a literal beyond the
+// precision makes the comparison a constant (divergence D14).
+TEST_P(FoldDecimalTest, Folds) {
+  const FoldCase& c = GetParam();
+  const Catalog catalog = MakeCatalog();
+  const std::string sql = "SELECT COUNT(*) FROM dec WHERE " + std::string(c.where);
+  auto plan = BindSql(sql, catalog);
+  ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+  const Predicate& p = std::get<FilterNode>(Nth(*plan, 1)).predicates.at(0);
+  EXPECT_EQ(p.kind, c.kind);
+  EXPECT_EQ(p.column.has_value(), c.kind != Predicate::Kind::kFalse);
+  if (c.kind == Predicate::Kind::kCompare) {
+    EXPECT_EQ(p.op, c.op);
+    EXPECT_EQ(Int128ToString(std::get<Int128>(p.constant.value)), Int128ToString(c.value));
+    EXPECT_EQ(p.constant.type, p.column->type);
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Binder, FoldDecimalTest,
+    ::testing::Values(
+        // DECIMAL(15,2): the unscaled value is the number times 100.
+        FoldCase{"p = 1.5", kCompare, CompareOp::kEq, 150},
+        FoldCase{"p = 1.50", kCompare, CompareOp::kEq, 150},
+        FoldCase{"p < 2", kCompare, CompareOp::kLt, 200},
+        FoldCase{"p > -0.07", kCompare, CompareOp::kGt, -7},
+        FoldCase{"p <= 12.345", kCompare, CompareOp::kLe, 1234},
+        FoldCase{"p < 12.345", kCompare, CompareOp::kLe, 1234},
+        FoldCase{"p >= 12.345", kCompare, CompareOp::kGe, 1235},
+        FoldCase{"p > 12.345", kCompare, CompareOp::kGe, 1235},
+        FoldCase{"p > -12.345", kCompare, CompareOp::kGe, -1234}, FoldCase{"p = 12.345", kFalse},
+        FoldCase{"p <> 12.345", kIsNotNull}, FoldCase{"p = 0.001", kFalse},
+        FoldCase{"p > 0.001", kCompare, CompareOp::kGe, 1},
+        FoldCase{"12.345 < p", kCompare, CompareOp::kGe, 1235},
+        // The precision bounds the unscaled value: +-(10^15 - 1) for DECIMAL(15,2).
+        FoldCase{"p <= 9999999999999.99", kCompare, CompareOp::kLe, 999999999999999},
+        FoldCase{"p < 10000000000000", kIsNotNull}, FoldCase{"p > 10000000000000", kFalse},
+        FoldCase{"p = 9999999999999.995", kFalse},
+        FoldCase{"p < 9999999999999.995", kCompare, CompareOp::kLe, 999999999999999},
+        FoldCase{"p > -10000000000000", kIsNotNull},
+        // DECIMAL(9,4) and DECIMAL(38,10).
+        FoldCase{"r = 0.0001", kCompare, CompareOp::kEq, 1},
+        FoldCase{"r < 99999.99995", kCompare, CompareOp::kLe, 999999999},
+        FoldCase{"r < 100000", kIsNotNull},
+        FoldCase{"z = 1234567890123456789012345678.0123456789", kCompare, CompareOp::kEq,
+                 (Int128{1234567890123456789} * Int128{1'000'000'000'000'000'000} * 10) +
+                     Int128{123456780123456789}},
+        FoldCase{"z > 10000000000000000000000000000", kFalse}));
 
 // Numbers that DuckDB reads as DOUBLE (an exponent, or a decimal of more than 38 digits) are
 // rounded to the nearest double first, then folded exactly (divergence D7).

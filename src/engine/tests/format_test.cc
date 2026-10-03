@@ -100,6 +100,7 @@ TEST(FormatValueTest, EveryResultType) {
   auto decs = dec.Finish().ValueOrDie();
   EXPECT_EQ(FormatValue(*decs, 0, LogicalType::kHugeInt), "18446744073709551614");
   EXPECT_EQ(FormatValue(*decs, 1, LogicalType::kHugeInt), "NULL");
+  EXPECT_EQ(FormatValue(*decs, 0, LogicalType::Decimal(38, 0)), "18446744073709551614");
 }
 
 QueryResult OneColumn(const std::shared_ptr<arrow::Array>& array, std::string name,
@@ -109,6 +110,33 @@ QueryResult OneColumn(const std::shared_ptr<arrow::Array>& array, std::string na
   r.names = {std::move(name)};
   r.types = {type};
   return r;
+}
+
+// A DECIMAL(p, s) shows s fraction digits, as DuckDB prints it, and is a JSON string like HUGEINT
+// (ADR 0021 rule 15).
+TEST(FormatValueTest, Decimals) {
+  arrow::Decimal128Builder dec(arrow::decimal128(15, 2));
+  for (const char* v : {"1700", "-25", "0", "999999999999999", "-999999999999999", "5"}) {
+    ASSERT_TRUE(dec.Append(arrow::Decimal128(v)).ok());
+  }
+  ASSERT_TRUE(dec.AppendNull().ok());
+  const auto decs = dec.Finish().ValueOrDie();
+  const LogicalType type = LogicalType::Decimal(15, 2);
+  const auto expected = std::to_array<std::string_view>(
+      {"17.00", "-0.25", "0.00", "9999999999999.99", "-9999999999999.99", "0.05", "NULL"});
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    EXPECT_EQ(FormatValue(*decs, static_cast<int64_t>(i), type), expected[i]) << i;
+  }
+  arrow::Decimal128Builder fraction(arrow::decimal128(3, 3));
+  ASSERT_TRUE(fraction.Append(arrow::Decimal128(500)).ok());
+  ASSERT_TRUE(fraction.Append(arrow::Decimal128(-7)).ok());
+  const auto fractions = fraction.Finish().ValueOrDie();
+  EXPECT_EQ(FormatValue(*fractions, 0, LogicalType::Decimal(3, 3)), ".500");
+  EXPECT_EQ(FormatValue(*fractions, 1, LogicalType::Decimal(3, 3)), "-.007");
+  auto r = OneColumn(decs->Slice(0, 2), "p", type);
+  EXPECT_EQ(*FormatResult(r, OutputFormat::kJson),
+            "[\n {\"p\": \"17.00\"},\n {\"p\": \"-0.25\"}\n]\n");
+  EXPECT_EQ(*FormatResult(r, OutputFormat::kCsv), "p\n17.00\n-0.25\n");
 }
 
 TEST(FormatResultTest, CsvJsonTable) {

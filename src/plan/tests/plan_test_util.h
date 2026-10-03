@@ -60,7 +60,7 @@ class FakeTable final : public Table {
 };
 
 // Every engine type, an unsupported column and two names that need quoting:
-//   i16 SMALLINT, i32 INTEGER, i64 BIGINT, u16 USMALLINT, h HUGEINT, d DOUBLE, s VARCHAR,
+//   i16 SMALLINT, i32 INTEGER, i64 BIGINT, u16 USMALLINT, h DECIMAL(38,0), d DOUBLE, s VARCHAR,
 //   dt DATE, bad list<int32>, "Mixed Case" INTEGER, "from" INTEGER.
 inline std::shared_ptr<arrow::Schema> AllTypesSchema() {
   return arrow::schema({
@@ -79,7 +79,8 @@ inline std::shared_ptr<arrow::Schema> AllTypesSchema() {
 }
 
 // A catalog with "t" (AllTypesSchema, 100 rows), "u" (the same schema, unknown row count),
-// "dup" (columns "a" and "A") and "ok" (i16 and s only).
+// "dup" (columns "a" and "A"), "ok" (i16 and s only) and "dec" (DECIMALs: p DECIMAL(15,2),
+// q DECIMAL(15,2), r DECIMAL(9,4), z DECIMAL(38,10), i INTEGER).
 inline Catalog MakeCatalog() {
   Catalog catalog;
   const auto must = [](const arrow::Status& status) {
@@ -97,6 +98,13 @@ inline Catalog MakeCatalog() {
       "ok", std::make_shared<FakeTable>(arrow::schema({arrow::field("i16", arrow::int16()),
                                                        arrow::field("s", arrow::binary())}),
                                         7)));
+  must(catalog.Register("dec", std::make_shared<FakeTable>(
+                                   arrow::schema({arrow::field("p", arrow::decimal128(15, 2)),
+                                                  arrow::field("q", arrow::decimal128(15, 2)),
+                                                  arrow::field("r", arrow::decimal128(9, 4)),
+                                                  arrow::field("z", arrow::decimal128(38, 10)),
+                                                  arrow::field("i", arrow::int32())}),
+                                   10)));
   return catalog;
 }
 

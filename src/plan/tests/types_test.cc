@@ -17,13 +17,15 @@ struct NamedType {
   std::string_view name;
 };
 
-// Every type with its name, in declaration order.
-constexpr std::array<NamedType, 10> kTypes = {{
+// Every type with its name, in declaration order (DECIMAL as its id alone, which no column has: a
+// DECIMAL is made with LogicalType::Decimal).
+constexpr std::array<NamedType, 11> kTypes = {{
     {.id = LogicalType::kSmallInt, .name = "SMALLINT"},
     {.id = LogicalType::kInteger, .name = "INTEGER"},
     {.id = LogicalType::kBigInt, .name = "BIGINT"},
     {.id = LogicalType::kUSmallInt, .name = "USMALLINT"},
     {.id = LogicalType::kHugeInt, .name = "HUGEINT"},
+    {.id = LogicalType::kDecimal, .name = "DECIMAL(0,0)"},
     {.id = LogicalType::kDouble, .name = "DOUBLE"},
     {.id = LogicalType::kVarchar, .name = "VARCHAR"},
     {.id = LogicalType::kDate, .name = "DATE"},
@@ -40,6 +42,7 @@ constexpr bool IsLastId(LogicalType::Id id) {
     case LogicalType::kBigInt:
     case LogicalType::kUSmallInt:
     case LogicalType::kHugeInt:
+    case LogicalType::kDecimal:
     case LogicalType::kDouble:
     case LogicalType::kVarchar:
     case LogicalType::kDate:
@@ -72,20 +75,50 @@ static_assert(LogicalType(LogicalType::kDate) != LogicalType(LogicalType::kTimes
 
 TEST(TypesTest, RoundTripsThroughArrow) {
   // Not `auto`: that would be an Id, and EXPECT_EQ would compare the ids only.
-  for (const LogicalType t : {LogicalType::kSmallInt, LogicalType::kInteger, LogicalType::kBigInt,
-                              LogicalType::kUSmallInt, LogicalType::kHugeInt, LogicalType::kDouble,
-                              LogicalType::kVarchar, LogicalType::kDate}) {
+  for (const LogicalType t : std::to_array<LogicalType>(
+           {LogicalType::kSmallInt, LogicalType::kInteger, LogicalType::kBigInt,
+            LogicalType::kUSmallInt, LogicalType::kDouble, LogicalType::kVarchar,
+            LogicalType::kDate, LogicalType::Decimal(15, 2), LogicalType::Decimal(38, 0)})) {
     auto back = FromArrow(*ToArrow(t));
     ASSERT_TRUE(back.ok()) << ToString(t);
     EXPECT_EQ(*back, t);
   }
+  // HUGEINT (integer SUM) is stored as decimal128(38,0), which a column of a table reads as
+  // DECIMAL(38,0) (ADR 0021 rule 2): no table column is HUGEINT.
+  EXPECT_EQ(*FromArrow(*ToArrow(LogicalType::kHugeInt)), LogicalType::Decimal(38, 0));
 }
 
 TEST(TypesTest, MapsStorageTypes) {
   EXPECT_EQ(*FromArrow(*arrow::utf8()), LogicalType::kVarchar);
   EXPECT_EQ(*FromArrow(*arrow::float32()), LogicalType::kDouble);
   EXPECT_TRUE(FromArrow(*arrow::list(arrow::int32())).status().IsNotImplemented());
-  EXPECT_TRUE(FromArrow(*arrow::decimal128(10, 2)).status().IsNotImplemented());
+}
+
+// Every decimal of at most 38 digits is DECIMAL(p, s), whatever its Arrow width; DECIMAL(38, 0) is
+// no HUGEINT (ADR 0021 rule 2).
+TEST(TypesTest, MapsDecimals) {
+  EXPECT_EQ(*FromArrow(*arrow::decimal128(15, 2)), LogicalType::Decimal(15, 2));
+  EXPECT_EQ(*FromArrow(*arrow::decimal128(38, 0)), LogicalType::Decimal(38, 0));
+  EXPECT_NE(*FromArrow(*arrow::decimal128(38, 0)), LogicalType(LogicalType::kHugeInt));
+  EXPECT_EQ(*FromArrow(*arrow::decimal32(9, 2)), LogicalType::Decimal(9, 2));
+  EXPECT_EQ(*FromArrow(*arrow::decimal64(18, 18)), LogicalType::Decimal(18, 18));
+  EXPECT_EQ(*FromArrow(*arrow::decimal256(38, 10)), LogicalType::Decimal(38, 10));
+  EXPECT_TRUE(FromArrow(*arrow::decimal256(39, 0)).status().IsNotImplemented());
+  EXPECT_TRUE(FromArrow(*arrow::decimal128(10, -2)).status().IsNotImplemented());
+  const LogicalType decimal = LogicalType::Decimal(15, 2);
+  EXPECT_EQ(decimal.width(), 15);
+  EXPECT_EQ(decimal.scale(), 2);
+  EXPECT_EQ(ToString(decimal), "DECIMAL(15,2)");
+  EXPECT_TRUE(ToArrow(decimal)->Equals(*arrow::decimal128(15, 2)));
+  EXPECT_EQ(*FromArrow(*ToArrow(decimal)), decimal);
+  // Another precision or scale is another type, the same id.
+  EXPECT_NE(decimal, LogicalType::Decimal(15, 3));
+  EXPECT_NE(decimal, LogicalType::Decimal(16, 2));
+  EXPECT_TRUE(decimal == LogicalType::kDecimal);
+  // Never an integer or a number for the binder's checks: those contexts reject DECIMAL.
+  EXPECT_FALSE(IsInteger(decimal));
+  EXPECT_FALSE(IsNumeric(decimal));
+  EXPECT_FALSE(IsInteger(LogicalType::Decimal(38, 0)));
 }
 
 TEST(TypesTest, Classification) {

@@ -68,7 +68,8 @@ std::string_view ToString(AggKind kind);
 struct Constant {
   LogicalType type = LogicalType::kBigInt;
   // Every integer type and DATE (days since 1970-01-01): Int128 inside the type's range.
-  // DOUBLE: double. VARCHAR: the bytes.
+  // DECIMAL(p, s): the unscaled value (12.34 in DECIMAL(4,2) is 1234). DOUBLE: double. VARCHAR:
+  // the bytes.
   std::variant<Int128, double, std::string> value;
 };
 

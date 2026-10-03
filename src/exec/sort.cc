@@ -138,6 +138,7 @@ std::optional<TypeOrder> OrderFor(plan::LogicalType type) {
                        .prefix = &SignedPrefix<arrow::Date32Array>,
                        .exact = true};
     case plan::LogicalType::kHugeInt:
+    case plan::LogicalType::kDecimal:  // one scale per key: the unscaled values order it
       return TypeOrder{.compare = &CompareDecimal, .prefix = &DecimalPrefix, .exact = false};
     case plan::LogicalType::kDouble:
       return TypeOrder{.compare = &CompareDouble, .prefix = &DoublePrefix, .exact = true};

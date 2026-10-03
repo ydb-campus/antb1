@@ -202,7 +202,7 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT COUNT(*) FROM t WHERE i64 > DATE '2013-07-01'", kBind,
                   "DATE '2013-07-01'", "with a DATE literal"},
         ErrorCase{"SELECT COUNT(*) FROM t WHERE '2' < u16", kBind, "'2'", "USMALLINT"},
-        ErrorCase{"SELECT COUNT(*) FROM t WHERE h = '1'", kBind, "'1'", "HUGEINT"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE h = '1'", kBind, "'1'", "DECIMAL(38,0)"},
         ErrorCase{"SELECT COUNT(*) FROM t WHERE d = '1.5'", kBind, "'1.5'",
                   "cannot compare DOUBLE column 'd' with a string"},
         ErrorCase{"SELECT COUNT(*) FROM t WHERE d <> DATE '2013-07-01'", kBind, "DATE '2013-07-01'",
@@ -397,7 +397,32 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT i16 * 1.5 FROM t", kUnsupported, "*", "DECIMAL"},
         ErrorCase{"SELECT dt + 1 FROM t", kUnsupported, "+", "DATE arithmetic"},
         ErrorCase{"SELECT -u16 FROM t", kUnsupported, "-", "negating a USMALLINT is not supported"},
-        ErrorCase{"SELECT h % 2 FROM t", kUnsupported, "%", "'%' in HUGEINT"},
+        ErrorCase{"SELECT SUM(i64) % 2 FROM t", kUnsupported, "%", "'%' in HUGEINT"},
+        // DECIMAL (ADR 0021): only comparisons with literals and same-type DECIMALs, keys, MIN,
+        // MAX and COUNT; every other context is unsupported until D3 and D4.
+        ErrorCase{"SELECT h % 2 FROM t", kUnsupported, "%", "DECIMAL arithmetic"},
+        ErrorCase{"SELECT p + 1 FROM dec", kUnsupported, "+", "DECIMAL arithmetic ('p' is"},
+        ErrorCase{"SELECT -p FROM dec", kUnsupported, "-", "negating a DECIMAL"},
+        ErrorCase{"SELECT SUM(p) FROM dec", kUnsupported, "SUM(p)",
+                  "SUM of a DECIMAL ('p' is DECIMAL(15,2)) is not supported"},
+        ErrorCase{"SELECT AVG(z) FROM dec", kUnsupported, "AVG(z)", "AVG of a DECIMAL"},
+        ErrorCase{"SELECT COUNT(*) FROM dec WHERE p = r", kUnsupported, "=",
+                  "only DECIMAL values of the same precision and scale compare"},
+        ErrorCase{"SELECT COUNT(*) FROM dec WHERE i < p", kUnsupported, "<",
+                  "only DECIMAL values of the same precision and scale compare"},
+        ErrorCase{"SELECT COUNT(*) FROM dec WHERE p = 1e0", kUnsupported, "1e0",
+                  "a number DuckDB types as DOUBLE"},
+        ErrorCase{"SELECT COUNT(*) FROM dec WHERE p IN (2e0, 1)", kUnsupported, "2e0",
+                  "a number DuckDB types as DOUBLE"},
+        ErrorCase{"SELECT COUNT(*) FROM dec WHERE p < 100000000000000000000000000000000000000",
+                  kUnsupported, "100000000000000000000000000000000000000",
+                  "a number DuckDB types as DOUBLE"},
+        ErrorCase{"SELECT CASE WHEN i = 1 THEN p END FROM dec", kUnsupported, "p",
+                  "DECIMAL CASE values are not supported"},
+        ErrorCase{"SELECT CASE WHEN i = 1 THEN p ELSE q END FROM dec", kUnsupported, "p",
+                  "DECIMAL CASE values are not supported"},
+        ErrorCase{"SELECT COUNT(*) FROM dec WHERE p = 'x'", kBind, "'x'",
+                  "cannot compare DECIMAL(15,2) column 'p' with a string"},
         ErrorCase{"SELECT SUM(i16) // 2 FROM t", kUnsupported, "//", "'//' in HUGEINT"},
         // String functions: a VARCHAR first argument, literal strings after it.
         ErrorCase{"SELECT strlen(i16) FROM t", kBind, "i16",
@@ -925,7 +950,7 @@ TEST(BinderTest, ArithmeticTypesAndNamesLikeDuckDb) {
                 .type = LogicalType::kSmallInt,
                 .name = "(-((i16 + 1)) * 2)"},
            Case{.expr = "1 + 2", .type = LogicalType::kInteger, .name = "(1 + 2)"},
-           Case{.expr = "h + 1", .type = LogicalType::kHugeInt, .name = "(h + 1)"},
+           Case{.expr = "SUM(i16) + 1", .type = LogicalType::kHugeInt, .name = "(sum(i16) + 1)"},
            Case{.expr = "\"Mixed Case\" + 007",
                 .type = LogicalType::kInteger,
                 .name = "(\"Mixed Case\" + 7)"},
@@ -1308,7 +1333,7 @@ TEST(BinderTest, CaseTypes) {
            {"CASE WHEN i16 = 1 THEN i16 ELSE i32 END", LogicalType::kInteger},
            {"CASE WHEN i16 = 1 THEN u16 ELSE i16 END", LogicalType::kInteger},
            {"CASE WHEN i16 = 1 THEN u16 ELSE i64 END", LogicalType::kBigInt},
-           {"CASE WHEN i16 = 1 THEN h ELSE 1 END", LogicalType::kHugeInt},
+           {"CASE WHEN i16 = 1 THEN 1 ELSE 100000000000000000000 END", LogicalType::kHugeInt},
            {"CASE WHEN i16 = 1 THEN i64 ELSE d END", LogicalType::kDouble},
            {"CASE WHEN i16 = 1 THEN i16 ELSE 1e3 END", LogicalType::kDouble},
            {"CASE WHEN i16 = 1 THEN 0.5 ELSE d END", LogicalType::kDouble},
@@ -1723,10 +1748,10 @@ TEST(BinderTest, ColumnsResolveCaseInsensitivelyAndKeepTheirDeclaredNames) {
   auto plan = BindSql(kSql, catalog);
   ASSERT_TRUE(plan.ok()) << plan.status().ToString();
   const std::vector<std::pair<std::string, LogicalType>> expected = {
-      {"i16", LogicalType::kSmallInt}, {"s", LogicalType::kVarchar},
-      {"dt", LogicalType::kDate},      {"Mixed Case", LogicalType::kInteger},
-      {"from", LogicalType::kInteger}, {"Alias", LogicalType::kUSmallInt},
-      {"x", LogicalType::kHugeInt}};
+      {"i16", LogicalType::kSmallInt},   {"s", LogicalType::kVarchar},
+      {"dt", LogicalType::kDate},        {"Mixed Case", LogicalType::kInteger},
+      {"from", LogicalType::kInteger},   {"Alias", LogicalType::kUSmallInt},
+      {"x", LogicalType::Decimal(38, 0)}};
   ASSERT_EQ(plan->output.size(), expected.size());
   const auto& project = std::get<ProjectNode>(Nth(*plan, 0));
   EXPECT_EQ(kSql.substr(project.span.offset, project.span.length),
@@ -1746,18 +1771,30 @@ TEST(BinderTest, ColumnsResolveCaseInsensitivelyAndKeepTheirDeclaredNames) {
 TEST(BinderTest, AggregateResultTypes) {
   const Catalog catalog = MakeCatalog();
   const std::vector<std::pair<std::string_view, LogicalType>> cases = {
-      {"COUNT(*)", LogicalType::kBigInt},   {"COUNT(i16)", LogicalType::kBigInt},
-      {"COUNT(s)", LogicalType::kBigInt},   {"COUNT(dt)", LogicalType::kBigInt},
-      {"COUNT(h)", LogicalType::kBigInt},   {"SUM(i16)", LogicalType::kHugeInt},
-      {"SUM(i32)", LogicalType::kHugeInt},  {"SUM(i64)", LogicalType::kHugeInt},
-      {"SUM(u16)", LogicalType::kHugeInt},  {"SUM(h)", LogicalType::kHugeInt},
-      {"SUM(d)", LogicalType::kDouble},     {"AVG(i16)", LogicalType::kDouble},
-      {"AVG(i64)", LogicalType::kDouble},   {"AVG(u16)", LogicalType::kDouble},
-      {"AVG(h)", LogicalType::kDouble},     {"AVG(d)", LogicalType::kDouble},
-      {"MIN(i16)", LogicalType::kSmallInt}, {"MAX(i32)", LogicalType::kInteger},
-      {"MIN(i64)", LogicalType::kBigInt},   {"MAX(u16)", LogicalType::kUSmallInt},
-      {"MIN(h)", LogicalType::kHugeInt},    {"MAX(d)", LogicalType::kDouble},
-      {"MIN(s)", LogicalType::kVarchar},    {"MAX(dt)", LogicalType::kDate},
+      {"COUNT(*)", LogicalType::kBigInt},
+      {"COUNT(i16)", LogicalType::kBigInt},
+      {"COUNT(s)", LogicalType::kBigInt},
+      {"COUNT(dt)", LogicalType::kBigInt},
+      {"COUNT(h)", LogicalType::kBigInt},
+      {"SUM(i16)", LogicalType::kHugeInt},
+      {"SUM(i32)", LogicalType::kHugeInt},
+      {"SUM(i64)", LogicalType::kHugeInt},
+      {"SUM(u16)", LogicalType::kHugeInt},
+      {"SUM(d)", LogicalType::kDouble},
+      {"AVG(i16)", LogicalType::kDouble},
+      {"AVG(i64)", LogicalType::kDouble},
+      {"AVG(u16)", LogicalType::kDouble},
+      {"AVG(d)", LogicalType::kDouble},
+      {"MIN(i16)", LogicalType::kSmallInt},
+      {"MAX(i32)", LogicalType::kInteger},
+      {"MIN(i64)", LogicalType::kBigInt},
+      {"MAX(u16)", LogicalType::kUSmallInt},
+      {"MAX(d)", LogicalType::kDouble},
+      {"MIN(s)", LogicalType::kVarchar},
+      {"MAX(dt)", LogicalType::kDate},
+      // MIN and MAX keep a DECIMAL's precision and scale; COUNT DISTINCT is BIGINT.
+      {"MIN(h)", LogicalType::Decimal(38, 0)},
+      {"COUNT(DISTINCT h)", LogicalType::kBigInt},
   };
   for (const auto& [call, type] : cases) {
     const std::string sql = "SELECT " + std::string(call) + " FROM t";
@@ -1827,7 +1864,7 @@ TEST(BinderTest, WhereBuildsAFilterUnderTheSelectList) {
   check(1, 6, CompareOp::kGt, LogicalType::kVarchar, "'abc' < s");  // literal first, mirrored
   check(2, 7, CompareOp::kEq, LogicalType::kDate, "dt = DATE '2022-01-08'");
   check(3, 5, CompareOp::kNe, LogicalType::kDouble, "d <> 0.5");
-  check(4, 4, CompareOp::kLt, LogicalType::kHugeInt, "h < 12");
+  check(4, 4, CompareOp::kLt, LogicalType::Decimal(38, 0), "h < 12");
   EXPECT_EQ(std::get<Int128>(filter.predicates[0].constant.value), -7);
   EXPECT_EQ(std::get<std::string>(filter.predicates[1].constant.value), "abc");
   EXPECT_EQ(std::get<Int128>(filter.predicates[2].constant.value), 19000);

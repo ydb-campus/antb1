@@ -23,8 +23,11 @@ struct ExactNumber {
 };
 
 // Parses the text of an integer or decimal token without its sign ("42", "1.5", ".5", "5.",
-// "1e3", "2.5E-3"); std::nullopt if the text is not such a number.
-std::optional<ExactNumber> ParseExactNumber(std::string_view text, bool negative);
+// "1e3", "2.5E-3"); std::nullopt if the text is not such a number. With `shift`, the number times
+// 10^shift: a literal as the unscaled value of a DECIMAL with that scale ("1.5" with shift 2 is
+// 150; "12.345" is 1234 with `fraction`).
+std::optional<ExactNumber> ParseExactNumber(std::string_view text, bool negative,
+                                            int64_t shift = 0);
 
 // The double nearest to a numeric literal (correctly rounded); like DuckDB, a value beyond the
 // double range is +-inf and one below the smallest subnormal is +-0. std::nullopt if the text is
@@ -77,6 +80,7 @@ std::string FormatTimestamp(int64_t micros);
 std::string FormatDecimal(Int128 unscaled, uint8_t width, uint8_t scale);
 
 // Inclusive value range of an integer logical type; HUGEINT is decimal128(38, 0), so +-(10^38 - 1).
+// For DECIMAL(p, s) the range of its unscaled values: +-(10^p - 1).
 struct IntegerRange {
   Int128 min = 0;
   Int128 max = 0;
