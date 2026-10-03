@@ -19,7 +19,11 @@
 #include <arrow/io/file.h>
 #include <gtest/gtest.h>
 #include <parquet/arrow/writer.h>
+#include <parquet/column_writer.h>
+#include <parquet/file_writer.h>
 #include <parquet/properties.h>
+#include <parquet/schema.h>
+#include <parquet/types.h>
 
 #include "antb1/common/int128.h"
 #include "antb1/io/parquet_table.h"
@@ -834,6 +838,45 @@ TEST_F(ParquetScanTest, SameSizeRewriteIsIOError) {
   }
 }
 
+// A DECIMAL stored as BYTE_ARRAY (big-endian two's complement of any length, which other writers
+// than Arrow's produce) reads as decimal128(p, s) too.
+TEST_F(ParquetScanTest, ReadsByteArrayDecimals) {
+  using parquet::schema::GroupNode;
+  using parquet::schema::PrimitiveNode;
+  const auto node =
+      PrimitiveNode::Make("d", parquet::Repetition::OPTIONAL, parquet::LogicalType::Decimal(9, 2),
+                          parquet::Type::BYTE_ARRAY);
+  const auto schema = std::static_pointer_cast<GroupNode>(
+      GroupNode::Make("schema", parquet::Repetition::REQUIRED, {node}));
+  const std::string path = (dir_ / "byte_array_decimals.parquet").string();
+  {
+    auto out = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+    auto writer = parquet::ParquetFileWriter::Open(out, schema);
+    auto* column = static_cast<parquet::ByteArrayWriter*>(writer->AppendRowGroup()->NextColumn());
+    const std::vector<uint8_t> a = {0x30, 0x39};              // 12345
+    const std::vector<uint8_t> b = {0xFB};                    // -5
+    const std::vector<uint8_t> c = {0x05, 0xF5, 0xE0, 0xFF};  // 99999999
+    const std::vector<parquet::ByteArray> values = {
+        parquet::ByteArray(static_cast<uint32_t>(a.size()), a.data()),
+        parquet::ByteArray(static_cast<uint32_t>(b.size()), b.data()),
+        parquet::ByteArray(static_cast<uint32_t>(c.size()), c.data())};
+    const std::vector<int16_t> definition = {1, 1, 0, 1};
+    column->WriteBatch(4, definition.data(), nullptr, values.data());
+    writer->Close();
+    ASSERT_TRUE(out->Close().ok());
+  }
+  auto table = ParquetTable::Open({path}, ParquetTableOptions{});
+  ASSERT_TRUE(table.ok()) << table.status().ToString();
+  EXPECT_TRUE((*table)->schema()->field(0)->type()->Equals(*arrow::decimal128(9, 2)));
+  const Scanned s = Scan(**table, {0}, 3);
+  ASSERT_NE(s.table, nullptr);
+  std::vector<std::string> got;
+  for (int64_t r = 0; r < s.table->num_rows(); ++r) {
+    got.push_back(s.table->column(0)->GetScalar(r).ValueOrDie()->ToString());
+  }
+  EXPECT_EQ(got, (std::vector<std::string>{"123.45", "-0.05", "null", "999999.99"}));
+}
+
 // Statistics of a part (a row group) for skipping it: exact min, max and NULL count for
 // integer-valued columns, in the engine view (a USMALLINT day number read as DATE keeps its value);
 // nothing for other types, for a file written without statistics, or out of range.
@@ -845,9 +888,13 @@ TEST_F(ParquetScanTest, PartStatisticsOfIntegerColumns) {
   std::vector<std::optional<std::string>> text;
   std::vector<std::optional<int32_t>> days;  // INTEGER day numbers, read as DATE
   arrow::Decimal128Builder huge(arrow::decimal128(38, 0));
+  arrow::Decimal128Builder small(arrow::decimal128(9, 2));  // stored as INT32
+  arrow::Decimal128Builder mid(arrow::decimal128(15, 2));   // stored as INT64
   for (int64_t i = 0; i < 9; ++i) {
     days.emplace_back(static_cast<int32_t>(-3 + i));
     ASSERT_TRUE(huge.Append(arrow::Decimal128(-(i + 1))).ok());
+    ASSERT_TRUE(small.Append(arrow::Decimal128(i * 125)).ok());
+    ASSERT_TRUE(mid.Append(arrow::Decimal128(-i * 1999)).ok());
     id.emplace_back(100 + i);
     day.emplace_back(static_cast<uint16_t>(15000 + (i * 2)));
     sparse.push_back(i >= 3 && i < 6 ? std::nullopt : std::optional<int64_t>(-i));
@@ -858,12 +905,15 @@ TEST_F(ParquetScanTest, PartStatisticsOfIntegerColumns) {
       arrow::schema({arrow::field("id", arrow::int64()), arrow::field("day", arrow::uint16()),
                      arrow::field("sparse", arrow::int64()), arrow::field("real", arrow::float64()),
                      arrow::field("text", arrow::utf8()), arrow::field("days", arrow::int32()),
-                     arrow::field("huge", arrow::decimal128(38, 0))}),
+                     arrow::field("huge", arrow::decimal128(38, 0)),
+                     arrow::field("small", arrow::decimal128(9, 2)),
+                     arrow::field("mid", arrow::decimal128(15, 2))}),
       {Build<arrow::Int64Builder, int64_t>(id), Build<arrow::UInt16Builder, uint16_t>(day),
        Build<arrow::Int64Builder, int64_t>(sparse), Build<arrow::DoubleBuilder, double>(real),
        Build<arrow::StringBuilder, std::string>(text), Build<arrow::Int32Builder, int32_t>(days),
-       huge.Finish().ValueOrDie()});
-  const std::string path = Write("stats.parquet", data, 3);
+       huge.Finish().ValueOrDie(), small.Finish().ValueOrDie(), mid.Finish().ValueOrDie()});
+  const std::string path = Write("stats.parquet", data, 3, /*store_schema=*/false,
+                                 /*decimals_as_integers=*/true);
   auto table = ParquetTable::Open(
       {path}, ParquetTableOptions{.overrides = {{.column = "day"}, {.column = "days"}}});
   ASSERT_TRUE(table.ok()) << table.status().ToString();
@@ -884,12 +934,16 @@ TEST_F(ParquetScanTest, PartStatisticsOfIntegerColumns) {
   expect(0, 5, -3, -1, 0);        // DATE read from INTEGER day numbers, before 1970
   expect(0, 2, -2, 0, 0);
   expect(1, 2, std::nullopt, std::nullopt, 3);  // every value NULL
-  EXPECT_FALSE(stats(0, 6).has_value()) << "DECIMAL(38,0): no part statistics (ADR 0021)";
+  // DECIMAL: no part statistics (ADR 0021), also when stored as INT32 or INT64, whose Parquet
+  // statistics are plain integers of the unscaled values.
+  EXPECT_FALSE(stats(0, 6).has_value()) << "DECIMAL(38,0)";
+  EXPECT_FALSE(stats(0, 7).has_value()) << "DECIMAL(9,2) as INT32";
+  EXPECT_FALSE(stats(0, 8).has_value()) << "DECIMAL(15,2) as INT64";
   EXPECT_FALSE(stats(0, 3).has_value()) << "DOUBLE: NaN may be missing from min/max";
   EXPECT_FALSE(stats(0, 4).has_value()) << "VARCHAR: min/max may be truncated";
   EXPECT_FALSE(stats(3, 0).has_value());
   EXPECT_FALSE(stats(-1, 0).has_value());
-  EXPECT_FALSE(stats(0, 7).has_value());
+  EXPECT_FALSE(stats(0, 9).has_value());
 
   // A file written without statistics never skips.
   const std::string bare = (dir_ / "bare.parquet").string();

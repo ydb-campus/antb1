@@ -1200,7 +1200,9 @@ class Builder {
   }
 
   // c [NOT] BETWEEN lit AND high. The upper bound comes from the literal without another draw: an
-  // integer plus 5, any other literal itself (a single-value range).
+  // integer plus 5, any other literal itself (a single-value range). Not plus 5 for a DECIMAL of
+  // more than 36 digits: one more integer digit could leave DuckDB's 38-digit common type
+  // (DecimalText).
   void Between(const GenColumn& c, const Literal& lit, bool negated) {
     used_.Add(Feature::kBetween);
     Column(c);
@@ -1211,7 +1213,8 @@ class Builder {
     tokens_.insert(tokens_.end(), lit.tokens.begin(), lit.tokens.end());
     Keyword("AND");
     std::vector<Token> high = lit.tokens;
-    if (high.size() == 1 && high[0].kind == Token::Kind::kLiteral) {
+    if (high.size() == 1 && high[0].kind == Token::Kind::kLiteral &&
+        (c.kind != ValueKind::kDecimal || c.precision <= 36)) {
       const std::string& text = high[0].text;
       int64_t value = 0;
       const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);

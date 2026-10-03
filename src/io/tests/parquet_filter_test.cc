@@ -706,6 +706,9 @@ TEST_F(ParquetFilterErrorsTest, ReadableLeavesAndRequests) {
   EXPECT_FALSE(ok(1, arrow::int64(), arrow::date32()));  // DATE from INT64
   EXPECT_TRUE(ok(1, arrow::int64(), arrow::int64()));
   EXPECT_FALSE(ok(0, arrow::int64(), arrow::int64()));  // physical INT32
+  // A DECIMAL is never filtered in the scan (ADR 0021), whatever its storage.
+  EXPECT_FALSE(ok(0, arrow::decimal128(9, 2), arrow::decimal128(9, 2)));
+  EXPECT_FALSE(ok(1, arrow::decimal128(15, 2), arrow::decimal128(15, 2)));
   EXPECT_TRUE(ok(2, arrow::float32(), arrow::float64()));
   EXPECT_FALSE(ok(3, arrow::float32(), arrow::float64()));  // physical DOUBLE
   EXPECT_TRUE(ok(3, arrow::float64(), arrow::float64()));

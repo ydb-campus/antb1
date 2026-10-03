@@ -1200,10 +1200,10 @@ arrow::Result<Predicate> BindEquality(const sql::Comparison& cmp, const BoundCol
       const auto unshifted = ParseExactNumber(lit.text, lit.negative);
       if (as_double || IsApproximateNumber(lit.text) ||
           (unshifted.has_value() && unshifted->huge)) {
-        // DuckDB compares in DOUBLE then (ADR 0021 rule 11), which antb1 does not yet.
-        return UnsupportedError(std::format("comparing the {} column '{}' with a number DuckDB "
-                                            "types as DOUBLE (an exponent or more than 38 digits) "
-                                            "is not supported",
+        // DuckDB compares in DOUBLE (an exponent, a decimal of more than 38 digits) or in a capped
+        // DECIMAL (an integer of 39 digits, a HUGEINT) then (ADR 0021 rule 11), not supported yet.
+        return UnsupportedError(std::format("comparing the {} column '{}' with a number with an "
+                                            "exponent or more than 38 digits is not supported",
                                             ToString(column.type), Clip(column.name)),
                                 lit.span);
       }
