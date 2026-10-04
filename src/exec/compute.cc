@@ -66,7 +66,8 @@ arrow::Result<ArrayPtr> CastTo(const ArrayPtr& values, const std::shared_ptr<arr
   if (values->type_id() == arrow::Type::DECIMAL128 && type->id() == arrow::Type::DOUBLE) {
     const auto& decimals = static_cast<const arrow::Decimal128Array&>(*values);
     const auto& decimal_type = static_cast<const arrow::Decimal128Type&>(*values->type());
-    arrow::DoubleBuilder builder(ctx != nullptr ? ctx->memory_pool() : arrow::default_memory_pool());
+    arrow::DoubleBuilder builder(ctx != nullptr ? ctx->memory_pool()
+                                                : arrow::default_memory_pool());
     ARROW_RETURN_NOT_OK(builder.Reserve(decimals.length()));
     for (int64_t i = 0; i < decimals.length(); ++i) {
       if (decimals.IsNull(i)) {
@@ -359,8 +360,7 @@ arrow::Result<ArrayPtr> DecimalArith(const DecimalOperand& left, const DecimalOp
         value = x % y;
         break;
       default:
-        return arrow::Status::Invalid("DECIMAL arithmetic has no operator ",
-                                      static_cast<int>(op));
+        return arrow::Status::Invalid("DECIMAL arithmetic has no operator ", static_cast<int>(op));
     }
     if (overflow || value < range.min || value > range.max) {
       return DecimalOverflow(op, x, y, result);

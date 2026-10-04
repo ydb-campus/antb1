@@ -243,16 +243,20 @@ This amends ADR 0012's list of unsupported constructs and three points of ADR 00
 
 ## Plan
 
-One PR each. PR H5 and PR D1 land in either order (PR D1 changes no behavior), both before PR D2; then PR D2, PR D3
-and PR D4, in this order. Each engine PR documents its rules in docs/sql-subset.md and rejects the rest with exit
-code 4. The PR ids are the roadmap's, not divergence ids.
+One PR each. PR H5 and PR D1 land in either order (PR D1 changes no behavior), both before PR D2; then PR D2, PR D3 and
+PR D4 (D4a, then D4b), in this order. Each engine PR documents its rules in docs/sql-subset.md and rejects the rest with
+exit code 4. The PR ids are the roadmap's, not divergence ids.
 
 - **PR H5,** test(harness): compare decimal results exactly. Rule 15's text and exact type names, before engine code.
 - **PR D1,** refactor(plan): logical types with width and scale. The type carries (p,s); no behavior change.
 - **PR D2,** feat(plan,io,exec,engine): decimal columns. Rules 1, 2, 14-16 (join keys come with the joins) and io's
   cast to decimal128; rule 11 for integer and decimal literals and same-type operands.
 - **PR D3,** feat(plan,exec): decimal arithmetic, sum and avg. Rules 4-7, 12, 13 and 18.
-- **PR D4,** feat(plan,exec): decimal literals, division and mixed comparisons. Rules 3 and 8-11.
+- **PR D4,** split in two at review size:
+  - **PR D4a,** feat(plan,exec): decimal literals and division. Rules 3, 8 and 9 (`%` up to 38 digits), and rule
+    11's decimal literal against a DOUBLE operand.
+  - **PR D4b,** feat(plan,exec): decimal common types and mixed comparisons. Rule 10 (CASE values, IN lists), the
+    rest of rule 11, and `%` beyond 38 digits.
 - **decimal64 (deferred):** decimal64 for p ≤ 18, with DECIMAL in the filtered scan and in part statistics.
 
 ## Alternatives considered

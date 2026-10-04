@@ -1237,8 +1237,8 @@ arrow::Result<Predicate> BindEquality(const sql::Comparison& cmp, const BoundCol
       }
       p.constant.value = *value;
       if (const auto decimal = ParseDecimalLiteral(lit.text, lit.negative)) {
-        p.constant.value = DuckDbDecimalToDouble(decimal->unscaled, decimal->type.width(),
-                                                 decimal->type.scale());
+        p.constant.value =
+            DuckDbDecimalToDouble(decimal->unscaled, decimal->type.width(), decimal->type.scale());
       }
       // A FLOAT column: DuckDB casts an integer or DECIMAL literal to FLOAT and compares in FLOAT.
       // Widening that float to double is exact and keeps the order, so comparing the widened

@@ -125,6 +125,9 @@ TEST(QueryGenerator, QueriesRespectTheSemanticsBothEnginesShare) {
   const auto gen = Make(3, {.supported = kSupportedFeatures, .target_percent = 100});
   int decimal_sums = 0;
   int decimal_arithmetics = 0;
+  int decimal_divisions = 0;
+  int decimal_literal_operands = 0;
+  int decimal_constants = 0;
   for (uint64_t i = 0; i < 3000; ++i) {
     const auto q = gen.Generate(i);
     const std::string sql = Lower(q.sql);
@@ -158,18 +161,25 @@ TEST(QueryGenerator, QueriesRespectTheSemanticsBothEnginesShare) {
     if (q.features.Has(Feature::kStar) && q.table == "big") {
       EXPECT_TRUE(q.features.Has(Feature::kLimit)) << q.sql;
     }
-    // DECIMAL columns: no / // % or CASE values yet, and arithmetic only with integer constants
-    // (exit 4 on antb1, D4); no literal with more than 10 fraction digits (w's scale; m has spare
-    // digits), which DuckDB would compare in a DECIMAL capped at 38 digits (divergence D13). Layout
-    // comments could hide a match.
+    // DECIMAL columns: no CASE values yet (D4b); arithmetic with integer and decimal literals,
+    // / // % included; no literal with more than 10 fraction digits (w's scale; m has spare
+    // digits), which DuckDB would compare in a DECIMAL capped at 38 digits (divergence D13).
+    // Layout comments could hide a match.
     if (!q.features.Has(Feature::kLayout)) {
-      static const std::regex decimal_misuse(
-          R"re("?\b[mw]\b"? ?(/|%)|then "?[mw]\b|else "?[mw]\b|"?\b[mw]\b"? ?[-+*] ?[0-9]+\.)re");
+      static const std::regex decimal_misuse(R"re(then "?[mw]\b|else "?[mw]\b)re");
       EXPECT_FALSE(std::regex_search(sql, decimal_misuse)) << q.sql;
       static const std::regex decimal_sum(R"re((sum|avg)\( ?"?[mw]"?\))re");
       static const std::regex decimal_arithmetic(R"re("?\b[mw]\b"? ?[-+*] ?[0-9]+\b)re");
+      static const std::regex decimal_division(R"re("?\b[mw]\b"? ?(/|//|%) ?[0-9])re");
+      static const std::regex decimal_literal_operand(
+          R"re("?\b[mwi]\b"? ?[-+*%] ?[0-9]+\.[0-9])re");
+      static const std::regex decimal_constant(
+          R"re((select|,) (-? ?(2\.5|0\.25)|007\.50|\.125)( |,|$))re");
       decimal_sums += std::regex_search(sql, decimal_sum) ? 1 : 0;
       decimal_arithmetics += std::regex_search(sql, decimal_arithmetic) ? 1 : 0;
+      decimal_divisions += std::regex_search(sql, decimal_division) ? 1 : 0;
+      decimal_literal_operands += std::regex_search(sql, decimal_literal_operand) ? 1 : 0;
+      decimal_constants += std::regex_search(sql, decimal_constant) ? 1 : 0;
     }
     static const std::regex long_fraction(R"re(\.[0-9]{11})re");
     EXPECT_FALSE(std::regex_search(sql, long_fraction)) << q.sql;
@@ -179,6 +189,9 @@ TEST(QueryGenerator, QueriesRespectTheSemanticsBothEnginesShare) {
   }
   EXPECT_GT(decimal_sums, 10) << "SUM and AVG of DECIMAL columns";
   EXPECT_GT(decimal_arithmetics, 10) << "DECIMAL arithmetic with integer constants";
+  EXPECT_GT(decimal_divisions, 10) << "/ // % of DECIMAL columns";
+  EXPECT_GT(decimal_literal_operands, 10) << "decimal literals in arithmetic";
+  EXPECT_GT(decimal_constants, 10) << "decimal select constants";
 }
 
 TEST(QueryGenerator, DecimalLiteralsStayWithinTheColumnsDigits) {
@@ -212,8 +225,9 @@ TEST(QueryGenerator, DecimalLiteralsStayWithinTheColumnsDigits) {
 
 // The data range of a DECIMAL column keeps its SUM and arithmetic inside their types (an overflow
 // fails both engines, a SUM beyond 38 digits only antb1, D18): h (DECIMAL(38,0) at its largest
-// value) gets neither SUM, AVG nor a constant, only unary -; x (DECIMAL(18,4), capped to 18
-// digits by * k) gets + k and SUM but not * 2; y (DECIMAL(38,10), 10^38 - 10^12 at most, one
+// value) gets neither SUM, AVG nor a constant, only unary -, / and // and % by an integer (% 2.5
+// needs 39 digits, which DuckDB computes in DOUBLE); x (DECIMAL(18,4), capped to 18 digits by * k)
+// gets + k and SUM but not * 2 or * 1.5; y (DECIMAL(38,10), 10^38 - 10^12 at most, one
 // row) gets + 1 and + 7 but not + 100, which needs one more digit than DECIMAL(38,10) holds.
 TEST(QueryGenerator, DecimalDataRangesKeepSumsAndArithmeticInTheirTypes) {
   Int128 digits38 = 1;
@@ -248,6 +262,7 @@ TEST(QueryGenerator, DecimalDataRangesKeepSumsAndArithmeticInTheirTypes) {
   static const std::regex h_constant(R"re("?\bh\b"? ?[-+*] ?[0-9])re");
   static const std::regex h_negated(R"re(- ?"?h\b)re");
   static const std::regex x_times(R"re("?\bx\b"? ?\* ?[0-9])re");
+  static const std::regex h_wide_modulo(R"re("?\bh\b"? ?% ?2\.5)re");
   static const std::regex x_plus(R"re("?\bx\b"? ?[-+] ?[0-9])re");
   static const std::regex x_sum(R"re((sum|avg)\( ?"?x\b)re");
   static const std::regex y_hundred(R"re("?\by\b"? ?[-+] ?100\b)re");
@@ -265,6 +280,7 @@ TEST(QueryGenerator, DecimalDataRangesKeepSumsAndArithmeticInTheirTypes) {
     EXPECT_FALSE(std::regex_search(sql, h_sum)) << q.sql;
     EXPECT_FALSE(std::regex_search(sql, h_constant)) << q.sql;
     EXPECT_FALSE(std::regex_search(sql, x_times)) << q.sql;
+    EXPECT_FALSE(std::regex_search(sql, h_wide_modulo)) << q.sql;
     EXPECT_FALSE(std::regex_search(sql, y_hundred)) << q.sql;
     h_negations += std::regex_search(sql, h_negated) ? 1 : 0;
     x_additions += std::regex_search(sql, x_plus) ? 1 : 0;
