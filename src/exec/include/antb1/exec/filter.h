@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -18,7 +19,9 @@ namespace antb1::exec {
 
 // One predicate prepared for an input schema. Evaluate gives SQL's three-valued result per row
 // (NULL where the comparison has a NULL operand); with `kleene`, kFalse and kIsNotNull also give
-// NULL for a NULL column, as inside an expression (a filter rejects NULL and false alike).
+// NULL for a NULL column, as inside an expression (a filter rejects NULL and false alike). A
+// DECIMAL compares with a DECIMAL of another scale or an integer exactly by value, and with a
+// DOUBLE (a column, a constant, an IN list) in DOUBLE after DuckDB's conversion (ADR 0021).
 class PredicateEvaluator {
  public:
   static arrow::Result<PredicateEvaluator> Make(const plan::Predicate& predicate,
@@ -27,7 +30,16 @@ class PredicateEvaluator {
                                        bool kleene) const;
 
  private:
+  // How a comparison evaluates, decided by Make from the types.
+  enum class Mode : std::uint8_t {
+    kArrow,           // Arrow's comparison kernels on the values as they are
+    kColumnToDouble,  // kCompare, kIn, kNotIn: the DECIMAL column converted to DOUBLE
+    kInDouble,        // kCompareColumns: the side that is not DOUBLE converted to DOUBLE
+    kExact,           // kCompareColumns: a DECIMAL with another type of number, by value
+  };
+
   plan::Predicate predicate_;
+  Mode mode_ = Mode::kArrow;
   int column_ = -1;                                     // -1: none (kFalse without a column)
   int other_ = -1;                                      // kCompareColumns only
   std::shared_ptr<arrow::Scalar> constant_;             // kCompare only

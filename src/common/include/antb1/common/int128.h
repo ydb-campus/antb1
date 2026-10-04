@@ -34,6 +34,14 @@ inline std::optional<Int128> CheckedAdd(Int128 a, Int128 b) {
   return sum;
 }
 
+// 10^n for 0 <= n <= 38, the largest power of ten an Int128 holds.
+Int128 PowerOfTen(int n);
+
+// Compares a / 10^a_scale with b / 10^b_scale exactly (scales 0 to 38): -1, 0 or 1. The side with
+// the smaller scale is multiplied up; when that overflows, its magnitude exceeds every Int128, so
+// its sign decides. Any Int128 is allowed, the minimum included (nothing is negated).
+int CompareScaled(Int128 a, int a_scale, Int128 b, int b_scale);
+
 // numerator/denominator (denominator > 0) as a double, used for AVG over integers. Accurate to
 // about 1 ulp (exact integer accumulation, then one long double division); oracle comparisons use a
 // relative tolerance.

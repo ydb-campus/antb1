@@ -12,6 +12,7 @@
 
 #include "antb1/plan/catalog.h"
 #include "antb1/plan/logical_plan.h"
+#include "antb1/plan/types.h"
 
 namespace antb1::plan {
 namespace {
@@ -44,8 +45,24 @@ std::string ColumnName(const BoundColumn& column) {
   return Name(column.qualifier) + "." + Name(column.name);
 }
 
+// A DECIMAL column compared with a DOUBLE constant (or IN list) compares in DOUBLE (ADR 0021 rule
+// 11), which the column name alone would not show: `CAST(p AS DOUBLE) > 10`.
+bool ComparedInDouble(const Predicate& p) {
+  if (!p.column.has_value() || p.column->type != LogicalType::kDecimal) {
+    return false;
+  }
+  if (p.kind == Predicate::Kind::kCompare) {
+    return p.constant.type == LogicalType::kDouble;
+  }
+  return (p.kind == Predicate::Kind::kIn || p.kind == Predicate::Kind::kNotIn) &&
+         !p.values.empty() && p.values.front().type == LogicalType::kDouble;
+}
+
 std::string PredicateText(const Predicate& p) {
   std::string column = p.column.has_value() ? ColumnName(*p.column) : "?";
+  if (ComparedInDouble(p)) {
+    column = "CAST(" + column + " AS DOUBLE)";
+  }
   switch (p.kind) {
     case Predicate::Kind::kCompare:
       return std::format("{} {} {}", column, ToString(p.op), ToString(p.constant));

@@ -47,6 +47,50 @@ Int128 Big(const std::string& text) {
   return negative ? -value : value;
 }
 
+TEST(Int128Test, PowerOfTen) {
+  EXPECT_EQ(PowerOfTen(0), Int128{1});
+  EXPECT_EQ(PowerOfTen(18), Int128{1'000'000'000'000'000'000});
+  EXPECT_EQ(Int128ToString(PowerOfTen(38)), "1" + std::string(38, '0'));
+}
+
+// a / 10^sa against b / 10^sb, exactly: equal values of different scales, a difference in the last
+// digit, signs, and scalings that overflow 128 bits (the scaled side's sign decides), with the
+// extremes of Int128 (a file can hold a value beyond its declared width).
+TEST(Int128Test, CompareScaled) {
+  struct Case {
+    Int128 a;
+    int a_scale;
+    Int128 b;
+    int b_scale;
+    int expected;
+  };
+  const Int128 max38 = PowerOfTen(38) - 1;
+  for (const Case& c : {
+           Case{.a = 123, .a_scale = 2, .b = 1230, .b_scale = 3, .expected = 0},
+           Case{.a = 123, .a_scale = 2, .b = 1229, .b_scale = 3, .expected = 1},
+           Case{.a = -123, .a_scale = 2, .b = -1231, .b_scale = 3, .expected = 1},
+           Case{.a = -123, .a_scale = 2, .b = -1229, .b_scale = 3, .expected = -1},
+           Case{.a = 0, .a_scale = 0, .b = 0, .b_scale = 38, .expected = 0},
+           Case{.a = 5, .a_scale = 0, .b = 49999, .b_scale = 4, .expected = 1},
+           Case{.a = 7, .a_scale = 0, .b = 7, .b_scale = 0, .expected = 0},
+           Case{.a = 1, .a_scale = 38, .b = 0, .b_scale = 0, .expected = 1},
+           // max38 * 10^10 overflows: 10^38 - 1 is far above any DECIMAL(38,10) value.
+           Case{.a = max38, .a_scale = 0, .b = max38, .b_scale = 10, .expected = 1},
+           Case{.a = -max38, .a_scale = 0, .b = max38, .b_scale = 10, .expected = -1},
+           Case{.a = max38, .a_scale = 10, .b = -max38, .b_scale = 0, .expected = 1},
+           Case{.a = max38, .a_scale = 10, .b = max38, .b_scale = 0, .expected = -1},
+           Case{.a = kInt128Min, .a_scale = 0, .b = kInt128Min, .b_scale = 38, .expected = -1},
+           Case{.a = kInt128Max, .a_scale = 38, .b = kInt128Max, .b_scale = 0, .expected = -1},
+           Case{.a = kInt128Min, .a_scale = 2, .b = kInt128Min, .b_scale = 2, .expected = 0},
+           Case{.a = kInt128Max, .a_scale = 1, .b = kInt128Min, .b_scale = 0, .expected = 1},
+       }) {
+    SCOPED_TRACE(Int128ToString(c.a) + "e-" + std::to_string(c.a_scale) + " vs " +
+                 Int128ToString(c.b) + "e-" + std::to_string(c.b_scale));
+    EXPECT_EQ(CompareScaled(c.a, c.a_scale, c.b, c.b_scale), c.expected);
+    EXPECT_EQ(CompareScaled(c.b, c.b_scale, c.a, c.a_scale), -c.expected);
+  }
+}
+
 // DuckDB 1.5.5's cast of a DECIMAL to DOUBLE (ADR 0021 rule 8), bit for bit: within 2^53 (or at a
 // width up to 4, or scale 0) one division; beyond it div + mod / 10^scale, which is not the
 // nearest double in the five cases from DuckDB (checked with CAST(<literal> AS DOUBLE)).

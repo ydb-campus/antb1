@@ -27,6 +27,7 @@
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
 
+#include "decimal.h"
 #include "parallel_compute.h"
 
 namespace antb1::exec {
@@ -64,25 +65,8 @@ arrow::Result<ArrayPtr> CastTo(const ArrayPtr& values, const std::shared_ptr<arr
   // A DECIMAL (or HUGEINT) to DOUBLE converts as DuckDB converts it (ADR 0021 rule 8), which is
   // not Arrow's cast.
   if (values->type_id() == arrow::Type::DECIMAL128 && type->id() == arrow::Type::DOUBLE) {
-    const auto& decimals = static_cast<const arrow::Decimal128Array&>(*values);
-    const auto& decimal_type = static_cast<const arrow::Decimal128Type&>(*values->type());
-    arrow::DoubleBuilder builder(ctx != nullptr ? ctx->memory_pool()
-                                                : arrow::default_memory_pool());
-    ARROW_RETURN_NOT_OK(builder.Reserve(decimals.length()));
-    for (int64_t i = 0; i < decimals.length(); ++i) {
-      if (decimals.IsNull(i)) {
-        builder.UnsafeAppendNull();
-      } else {
-        const arrow::Decimal128 d(decimals.GetValue(i));
-        const auto bits =
-            (static_cast<UInt128>(static_cast<uint64_t>(d.high_bits())) << 64U) | d.low_bits();
-        builder.UnsafeAppend(DuckDbDecimalToDouble(static_cast<Int128>(bits),
-                                                   decimal_type.precision(), decimal_type.scale()));
-      }
-    }
-    std::shared_ptr<arrow::Array> out;
-    ARROW_RETURN_NOT_OK(builder.Finish(&out));
-    return out;
+    return DecimalToDouble(*values,
+                           ctx != nullptr ? ctx->memory_pool() : arrow::default_memory_pool());
   }
   // Integer casts only widen, or narrow a constant that fits; to DOUBLE a BIGINT beyond 2^53
   // rounds to the nearest double, as in DuckDB.
@@ -155,16 +139,6 @@ arrow::Result<ArrayPtr> DivideOrModulo(const arrow::Array& left, const arrow::Ar
   return arrow::Status::Invalid("// or % of ", left.type()->ToString());
 }
 
-Int128 ToInt128(const arrow::Decimal128& d) {
-  return static_cast<Int128>((static_cast<UInt128>(static_cast<uint64_t>(d.high_bits())) << 64U) |
-                             d.low_bits());
-}
-
-arrow::Decimal128 FromInt128(Int128 v) {
-  const auto bits = static_cast<UInt128>(v);
-  return {static_cast<int64_t>(bits >> 64U), static_cast<uint64_t>(bits)};
-}
-
 // + - * and negation in HUGEINT (decimal128(38, 0)), exact, an overflow of its range an execution
 // error. Arrow's decimal kernels would widen the precision instead (beyond 38 digits: an error).
 arrow::Result<ArrayPtr> HugeIntArith(const arrow::Array& left, const arrow::Array* right,
@@ -222,43 +196,14 @@ struct DecimalOperand {
 
 arrow::Result<DecimalOperand> ReadDecimalOperand(const arrow::Array& array, plan::LogicalType type,
                                                  std::string column) {
-  DecimalOperand operand{.values = std::vector<Int128>(static_cast<std::size_t>(array.length())),
-                         .array = &array,
-                         .type = type,
-                         .column = std::move(column)};
-  const auto read = [&]<class ArrayType> {
-    const auto& typed = static_cast<const ArrayType&>(array);
-    for (int64_t i = 0; i < typed.length(); ++i) {
-      if (typed.IsValid(i)) {
-        if constexpr (std::is_same_v<ArrayType, arrow::Decimal128Array>) {
-          operand.values[static_cast<std::size_t>(i)] =
-              ToInt128(arrow::Decimal128(typed.GetValue(i)));
-        } else {
-          operand.values[static_cast<std::size_t>(i)] = typed.Value(i);
-        }
-      }
-    }
-  };
-  switch (array.type_id()) {
-    case arrow::Type::INT16:
-      read.template operator()<arrow::Int16Array>();
-      break;
-    case arrow::Type::UINT16:
-      read.template operator()<arrow::UInt16Array>();
-      break;
-    case arrow::Type::INT32:
-      read.template operator()<arrow::Int32Array>();
-      break;
-    case arrow::Type::INT64:
-      read.template operator()<arrow::Int64Array>();
-      break;
-    case arrow::Type::DECIMAL128:
-      read.template operator()<arrow::Decimal128Array>();
-      break;
-    default:
-      return arrow::Status::Invalid("DECIMAL arithmetic over ", array.type()->ToString());
+  auto unscaled = ReadUnscaled(array);
+  if (!unscaled.ok()) {
+    return arrow::Status::Invalid("DECIMAL arithmetic over ", array.type()->ToString());
   }
-  return operand;
+  return DecimalOperand{.values = std::move(unscaled->values),
+                        .array = &array,
+                        .type = type,
+                        .column = std::move(column)};
 }
 
 // Rescales the operand to the result's scale, as DuckDB casts it to the result type first (for +,

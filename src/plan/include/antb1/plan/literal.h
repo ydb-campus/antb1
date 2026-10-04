@@ -59,6 +59,18 @@ std::optional<DecimalLiteral> ParseDecimalLiteral(std::string_view text, bool ne
 // nearest to the literal (docs/sql-subset.md, "Binding"). `text` is written without its sign.
 std::optional<float> DuckDbFloatOf(std::string_view text, bool negative);
 
+// Whether DuckDB (1.5.5) types a numeric literal as DOUBLE: it has an exponent, it is a decimal of
+// more than 38 digits, or it is an integer outside -2^127 to 2^128 - 1 (beyond HUGEINT and
+// UHUGEINT). `text` is written without its sign.
+bool DuckDbTypesAsDouble(std::string_view text, bool negative);
+
+// The double DuckDB (1.5.5) converts a numeric literal to when it compares it in DOUBLE: a literal
+// it types as DOUBLE (DuckDbTypesAsDouble) is the nearest double, a decimal literal converts as its
+// DECIMAL does (DuckDbDecimalToDouble, ADR 0021 rule 8), an INTEGER or BIGINT is the nearest
+// double, a HUGEINT goes through DuckDB's 128-bit formula and a UHUGEINT through its own.
+// std::nullopt if the text is not a number. `text` is written without its sign.
+std::optional<double> DuckDbDoubleOf(std::string_view text, bool negative);
+
 // The exact value of a double: +-inf and magnitudes of 10^38 or more are huge; NaN is zero.
 ExactNumber ExactNumberOf(double value);
 

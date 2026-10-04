@@ -359,13 +359,15 @@ INSTANTIATE_TEST_SUITE_P(
                   "integer constants outside HUGEINT's range (38 digits) are not supported"},
         // DuckDB compares a DOUBLE and a BIGINT BETWEEN all in DOUBLE, antb1 pairwise.
         ErrorCase{"SELECT i32 FROM t WHERE i64 BETWEEN 1e0 AND 9223372036854775806", kUnsupported,
-                  "BETWEEN", "BETWEEN of a DOUBLE value and a BIGINT, HUGEINT or FLOAT value"},
+                  "BETWEEN",
+                  "BETWEEN of a DOUBLE value and a BIGINT, HUGEINT, FLOAT or DECIMAL value"},
         ErrorCase{"SELECT i32 FROM t WHERE i64 NOT BETWEEN d AND 5", kUnsupported, "NOT BETWEEN",
-                  "BETWEEN of a DOUBLE value and a BIGINT, HUGEINT or FLOAT value"},
+                  "BETWEEN of a DOUBLE value and a BIGINT, HUGEINT, FLOAT or DECIMAL value"},
         ErrorCase{"SELECT i32 FROM t WHERE i64 BETWEEN 1 AND d", kUnsupported, "BETWEEN",
-                  "BETWEEN of a DOUBLE value and a BIGINT, HUGEINT or FLOAT value"},
+                  "BETWEEN of a DOUBLE value and a BIGINT, HUGEINT, FLOAT or DECIMAL value"},
         ErrorCase{"SELECT i32 FROM t WHERE i32 BETWEEN 1e0 AND 2147483648 * 2", kUnsupported,
-                  "BETWEEN", "BETWEEN of a DOUBLE value and a BIGINT, HUGEINT or FLOAT value"},
+                  "BETWEEN",
+                  "BETWEEN of a DOUBLE value and a BIGINT, HUGEINT, FLOAT or DECIMAL value"},
         // A decimal literal against an integer value is exact on its own, rounded in DOUBLE.
         ErrorCase{"SELECT i32 FROM t WHERE i32 BETWEEN 1.00000000000000000001 AND 1e1",
                   kUnsupported, "BETWEEN", "a decimal literal and an integer value"},
@@ -376,7 +378,33 @@ INSTANTIATE_TEST_SUITE_P(
                   "AND 5",
                   kUnsupported, "BETWEEN", "BETWEEN of a DOUBLE value"},
         ErrorCase{"SELECT i16 FROM t GROUP BY i16 HAVING SUM(i64) BETWEEN 0 AND 1e0", kUnsupported,
-                  "BETWEEN", "BETWEEN of a DOUBLE value and a BIGINT, HUGEINT or FLOAT value"},
+                  "BETWEEN",
+                  "BETWEEN of a DOUBLE value and a BIGINT, HUGEINT, FLOAT or DECIMAL value"},
+        // A DECIMAL in a BETWEEN with a DOUBLE value: DuckDB compares all three in DOUBLE, so a
+        // pair that antb1 compares exactly differs (ADR 0021): a DECIMAL operand with any bound
+        // that is not DOUBLE, or a DECIMAL column or expression as a bound.
+        ErrorCase{"SELECT COUNT(*) FROM dec WHERE p BETWEEN 1e0 AND 5", kUnsupported, "BETWEEN",
+                  "or DECIMAL value"},
+        ErrorCase{"SELECT COUNT(*) FROM dec WHERE p BETWEEN 2 AND 1e1", kUnsupported, "BETWEEN",
+                  "or DECIMAL value"},
+        ErrorCase{"SELECT COUNT(*) FROM dec WHERE p BETWEEN 1e0 AND 2 + 3", kUnsupported, "BETWEEN",
+                  "or DECIMAL value"},
+        ErrorCase{"SELECT COUNT(*) FROM dec WHERE p BETWEEN -(-2) AND 1e1", kUnsupported, "BETWEEN",
+                  "or DECIMAL value"},
+        ErrorCase{"SELECT COUNT(*) FROM dec WHERE p BETWEEN 1.5 AND 1e1", kUnsupported, "BETWEEN",
+                  "or DECIMAL value"},
+        ErrorCase{"SELECT COUNT(*) FROM dec WHERE p BETWEEN 1e0 AND i", kUnsupported, "BETWEEN",
+                  "or DECIMAL value"},
+        ErrorCase{"SELECT COUNT(*) FROM dec WHERE i BETWEEN 1e0 AND p", kUnsupported, "BETWEEN",
+                  "or DECIMAL value"},
+        ErrorCase{"SELECT COUNT(*) FROM dec WHERE 5 BETWEEN p AND f", kUnsupported, "BETWEEN",
+                  "or DECIMAL value"},
+        ErrorCase{"SELECT COUNT(*) FROM dec WHERE f > 0 OR p NOT BETWEEN q AND 1e1", kUnsupported,
+                  "NOT BETWEEN", "or DECIMAL value"},
+        ErrorCase{"SELECT CASE WHEN p BETWEEN 1e0 AND r THEN 1 END FROM dec", kUnsupported,
+                  "BETWEEN", "or DECIMAL value"},
+        ErrorCase{"SELECT i FROM dec GROUP BY i HAVING SUM(p) BETWEEN 1e0 AND 5", kUnsupported,
+                  "BETWEEN", "or DECIMAL value"},
         // Pairwise, the string compares with both; DuckDB rejects the mix when binding.
         ErrorCase{"SELECT i32 FROM t WHERE '2020-01-01' BETWEEN s AND dt", kBind, "BETWEEN",
                   "Cannot mix values of type VARCHAR and DATE in BETWEEN clause"},
@@ -398,9 +426,7 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT dt + 1 FROM t", kUnsupported, "+", "DATE arithmetic"},
         ErrorCase{"SELECT -u16 FROM t", kUnsupported, "-", "negating a USMALLINT is not supported"},
         ErrorCase{"SELECT SUM(i64) % 2 FROM t", kUnsupported, "%", "'%' in HUGEINT"},
-        // DECIMAL (ADR 0021): only comparisons with literals and same-type DECIMALs, keys, MIN,
-        // MAX and COUNT; every other context is unsupported until D3 and D4.
-        // DECIMAL %: DuckDB computes it in DOUBLE beyond 38 digits (D4b).
+        // DECIMAL (ADR 0021). %: DuckDB computes it in DOUBLE beyond 38 digits (D4c).
         ErrorCase{"SELECT h % 0.5 FROM t", kUnsupported, "%",
                   "'%' of DECIMAL(38,0) and DECIMAL(2,1) is not supported"},
         ErrorCase{"SELECT SUM(i64) % 2.5 FROM t", kUnsupported, "%",
@@ -408,21 +434,16 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT p + 'x' FROM dec", kBind, "+", "needs numbers"},
         ErrorCase{"SELECT z * z * z * z FROM dec", kBind, "*",
                   "Needed scale 40 to accurately represent the multiplication result"},
-        ErrorCase{"SELECT COUNT(*) FROM dec HAVING SUM(p) = MAX(p)", kUnsupported, "=",
-                  "only DECIMAL values of the same precision and scale compare"},
-        ErrorCase{"SELECT COUNT(*) FROM dec WHERE p = r", kUnsupported, "=",
-                  "only DECIMAL values of the same precision and scale compare"},
-        ErrorCase{"SELECT COUNT(*) FROM dec WHERE i < p", kUnsupported, "<",
-                  "only DECIMAL values of the same precision and scale compare"},
-        ErrorCase{"SELECT COUNT(*) FROM dec WHERE p = 1e0", kUnsupported, "1e0",
-                  "with a number with an exponent or more than 38 digits"},
-        ErrorCase{"SELECT COUNT(*) FROM dec WHERE p IN (2e0, 1)", kUnsupported, "2e0",
-                  "with a number with an exponent or more than 38 digits"},
-        ErrorCase{"SELECT COUNT(*) FROM dec WHERE p NOT IN (1, 2, 2e0)", kUnsupported, "2e0",
-                  "with a number with an exponent or more than 38 digits"},
-        ErrorCase{"SELECT COUNT(*) FROM dec WHERE p < 100000000000000000000000000000000000000",
-                  kUnsupported, "100000000000000000000000000000000000000",
-                  "with a number with an exponent or more than 38 digits"},
+        // A DECIMAL against a VARCHAR or DATE operand, as any number (divergence D4: DuckDB casts
+        // the VARCHAR for = and <>, and fails on a DATE only when a row is compared).
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE h = s", kBind, "=",
+                  "cannot compare 'h' is DECIMAL(38,0) with 's' is VARCHAR"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE h <> s", kBind, "<>", "cannot compare"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE s < h", kBind, "<", "cannot compare"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE h = dt", kBind, "=",
+                  "cannot compare 'h' is DECIMAL(38,0) with 'dt' is DATE"},
+        ErrorCase{"SELECT i16 FROM t GROUP BY i16 HAVING MIN(h) = MIN(s)", kBind, "=",
+                  "cannot compare"},
         ErrorCase{"SELECT CASE WHEN i = 1 THEN p END FROM dec", kUnsupported, "p",
                   "DECIMAL CASE values are supported only next to a DOUBLE value"},
         ErrorCase{"SELECT CASE WHEN i = 1 THEN p ELSE q END FROM dec", kUnsupported, "p",
@@ -1722,6 +1743,168 @@ TEST(BinderTest, In) {
   ASSERT_EQ(values.size(), 2U);
   EXPECT_EQ(std::get<Int128>(values[0].value), Int128{9007199254740992});
   EXPECT_EQ(std::get<Int128>(values[1].value), Int128{1});
+}
+
+// The predicates of every Filter of a plan, from the root down.
+std::vector<Predicate> FilterPredicates(const LogicalPlan& plan) {
+  std::vector<Predicate> out;
+  for (const LogicalNode* node = plan.root.get(); node != nullptr;) {
+    if (const auto* filter = std::get_if<FilterNode>(node)) {
+      out.insert(out.end(), filter->predicates.begin(), filter->predicates.end());
+    }
+    const std::vector<LogicalNodePtr> inputs = InputsOf(*node);
+    node = inputs.empty() ? nullptr : inputs[0].get();
+  }
+  return out;
+}
+
+// A DECIMAL compares with a DECIMAL of another precision or scale, with an integer and with a
+// DOUBLE (ADR 0021 rule 11): two columns, which the executor compares exactly by value or in
+// DOUBLE; in WHERE, HAVING and a CASE condition alike.
+TEST(BinderTest, DecimalComparesWithOtherNumbers) {
+  const Catalog catalog = MakeCatalog();
+  for (const char* sql : {
+           "SELECT COUNT(*) FROM dec WHERE p = r",
+           "SELECT COUNT(*) FROM dec WHERE i < p",
+           "SELECT COUNT(*) FROM dec WHERE p >= b",
+           "SELECT COUNT(*) FROM dec WHERE z <> g",
+           "SELECT COUNT(*) FROM dec WHERE p < f",
+           "SELECT COUNT(*) FROM dec WHERE f = z",
+           "SELECT COUNT(*) FROM dec WHERE p * i > r",
+           "SELECT i FROM dec GROUP BY i HAVING SUM(p) = MAX(r)",
+           "SELECT i FROM dec GROUP BY i HAVING SUM(p) > AVG(f)",
+           "SELECT i FROM dec GROUP BY i HAVING SUM(i) <= MIN(z)",
+       }) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    const std::vector<Predicate> predicates = FilterPredicates(*plan);
+    ASSERT_EQ(predicates.size(), 1U) << sql;
+    EXPECT_EQ(predicates[0].kind, Predicate::Kind::kCompareColumns) << sql;
+  }
+  for (const char* sql : {
+           "SELECT CASE WHEN p > r THEN 1 ELSE 0 END FROM dec",
+           "SELECT CASE p WHEN i THEN 1 END FROM dec",
+           "SELECT COUNT(*) FROM dec WHERE p > q OR p = b OR NOT (z < f)",
+           "SELECT SUM(CASE WHEN p > r THEN 1 END) FROM dec",
+       }) {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+  }
+}
+
+// A DECIMAL against a number DuckDB types as DOUBLE (an exponent, more than 38 digits, an integer
+// beyond UHUGEINT), or in an IN list with one, compares in DOUBLE: nothing is folded, and the
+// constants are the doubles DuckDB converts the literals to (ADR 0021 rules 8 and 11).
+TEST(BinderTest, DecimalAgainstDoubleNumbersComparesInDouble) {
+  const Catalog catalog = MakeCatalog();
+  const auto predicate = [&](std::string_view where) -> Predicate {
+    const std::string sql = "SELECT COUNT(*) FROM dec WHERE " + std::string(where);
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    if (!plan.ok()) {
+      return {};
+    }
+    return FilterPredicates(*plan).at(0);
+  };
+  const auto real = [](const Constant& c) {
+    EXPECT_EQ(c.type, LogicalType::kDouble);
+    const auto* value = std::get_if<double>(&c.value);
+    return value != nullptr ? *value : -1.0;
+  };
+  const Predicate gt = predicate("p > 1e1");
+  EXPECT_EQ(gt.kind, Predicate::Kind::kCompare);
+  EXPECT_EQ(gt.op, CompareOp::kGt);
+  EXPECT_EQ(real(gt.constant), 10.0);
+  EXPECT_EQ(gt.column.value_or(BoundColumn{}).type, LogicalType::Decimal(15, 2));
+  const Predicate eq = predicate("p = 1e-1");
+  EXPECT_EQ(eq.kind, Predicate::Kind::kCompare);
+  EXPECT_EQ(real(eq.constant), 0.1);
+  EXPECT_EQ(real(predicate("p <= 1.00000000000000000000000000000000000001").constant), 1.0);
+  EXPECT_EQ(real(predicate("r < 340282366920938463463374607431768211456").constant), 0x1p128);
+  EXPECT_EQ(real(predicate("z > -1e400").constant), -std::numeric_limits<double>::infinity());
+  EXPECT_EQ(real(predicate("1e2 < p * i").constant), 100.0);
+  // An IN list with such a number: every value a double, a decimal literal converted as DuckDB
+  // converts its DECIMAL (9007199254740993.5 is 2^53), a HUGEINT through DuckDB's 128-bit formula.
+  const Predicate in = predicate("z IN (1.5, 9007199254740993.5, 27670116110564329473, 2e0)");
+  EXPECT_EQ(in.kind, Predicate::Kind::kIn);
+  ASSERT_EQ(in.values.size(), 4U);
+  EXPECT_EQ(real(in.values[0]), 1.5);
+  EXPECT_EQ(real(in.values[1]), 0x1p53);
+  EXPECT_EQ(real(in.values[2]), 27670116110564327424.0);
+  EXPECT_EQ(real(in.values[3]), 2.0);
+  const Predicate not_in = predicate("p NOT IN (1, 2, 340282366920938463463374607431768211456)");
+  EXPECT_EQ(not_in.kind, Predicate::Kind::kNotIn);
+  ASSERT_EQ(not_in.values.size(), 3U);
+  EXPECT_EQ(real(not_in.values[0]), 1.0);
+  EXPECT_EQ(real(not_in.values[2]), 0x1p128);
+  // Without one the list folds exactly into the column's scale: 1.001 cannot match DECIMAL(15,2).
+  const Predicate exact = predicate("p IN (1.5, 1.001)");
+  ASSERT_EQ(exact.values.size(), 1U);
+  EXPECT_EQ(exact.values[0].type, LogicalType::Decimal(15, 2));
+  EXPECT_EQ(std::get<Int128>(exact.values[0].value), Int128{150});
+  // HAVING over a DECIMAL aggregate compares in DOUBLE too.
+  auto having = BindSql("SELECT i FROM dec GROUP BY i HAVING SUM(p) > 1e3", catalog);
+  ASSERT_TRUE(having.ok()) << having.status().ToString();
+  EXPECT_EQ(real(FilterPredicates(*having).at(0).constant), 1000.0);
+  // An integer column keeps today's rule: only an exponent or more than 38 digits make the list
+  // DOUBLE, so a 40-digit integer folds exactly (and drops out).
+  auto integer = BindSql(
+      "SELECT COUNT(*) FROM t WHERE i64 IN (9007199254740993, "
+      "400000000000000000000000000000000000000)",
+      catalog);
+  ASSERT_TRUE(integer.ok()) << integer.status().ToString();
+  const std::vector<Constant> values = FilterPredicates(*integer).at(0).values;
+  ASSERT_EQ(values.size(), 1U);
+  EXPECT_EQ(std::get<Int128>(values[0].value), Int128{9007199254740993});
+}
+
+// A BETWEEN with a DECIMAL binds as its two comparisons where they compare as DuckDB's one type
+// does: without a DOUBLE value (exactly), or with both pairs in DOUBLE (a DOUBLE operand, or two
+// DOUBLE bounds). The other mixes are unsupported (Expressions/BindErrorTest).
+TEST(BinderTest, DecimalBetweenWhereThePairsAgree) {
+  const Catalog catalog = MakeCatalog();
+  for (const char* where :
+       {"p BETWEEN 1e0 AND 2e0", "f BETWEEN p AND 1.5", "1e0 BETWEEN p AND q", "p BETWEEN r AND i",
+        "p BETWEEN 1 AND 2.5", "z NOT BETWEEN b AND p", "f > 0 OR p BETWEEN 1e0 AND 1e1"}) {
+    const std::string sql = "SELECT COUNT(*) FROM dec WHERE " + std::string(where);
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+  }
+  auto both_double = BindSql("SELECT COUNT(*) FROM dec WHERE p BETWEEN 1e0 AND 2e0", catalog);
+  ASSERT_TRUE(both_double.ok()) << both_double.status().ToString();
+  const std::vector<Predicate> predicates = FilterPredicates(*both_double);
+  ASSERT_EQ(predicates.size(), 2U);
+  for (const Predicate& p : predicates) {
+    EXPECT_EQ(p.constant.type, LogicalType::kDouble);
+  }
+}
+
+// A DECIMAL that is no literal next to a FLOAT column stays unsupported (divergence D11): antb1
+// reads FLOAT as DOUBLE, and DuckDB would compare in FLOAT.
+TEST(BinderTest, DecimalAgainstAFloatColumnIsUnsupported) {
+  Catalog catalog;
+  ASSERT_TRUE(catalog
+                  .Register("tf", std::make_shared<FakeTable>(
+                                      arrow::schema({arrow::field("f", arrow::float32()),
+                                                     arrow::field("p", arrow::decimal128(15, 2)),
+                                                     arrow::field("d", arrow::float64()),
+                                                     arrow::field("k", arrow::int32())}),
+                                      10, std::vector<int>{0}))
+                  .ok());
+  for (const char* sql :
+       {"SELECT COUNT(*) FROM tf WHERE p < f", "SELECT COUNT(*) FROM tf WHERE f = p",
+        "SELECT k FROM tf GROUP BY k HAVING MIN(p) = MIN(f)",
+        "SELECT COUNT(*) FROM tf WHERE p BETWEEN f AND 1",
+        "SELECT COUNT(*) FROM tf WHERE p BETWEEN 1 AND f",
+        "SELECT CASE WHEN p > f THEN 1 END FROM tf"}) {
+    const auto plan = BindSql(sql, catalog);
+    ASSERT_FALSE(plan.ok()) << sql;
+    const auto detail = GetSqlError(plan.status());
+    ASSERT_NE(detail, nullptr) << sql;
+    EXPECT_EQ(detail->kind(), SqlErrorDetail::Kind::kUnsupported) << sql;
+  }
+  auto with_double = BindSql("SELECT COUNT(*) FROM tf WHERE p < d", catalog);
+  EXPECT_TRUE(with_double.ok()) << with_double.status().ToString();
 }
 
 // [NOT] LIKE binds to its own predicate kinds with the pattern as a VARCHAR constant; a pattern of

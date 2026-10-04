@@ -1098,9 +1098,11 @@ arrow::Result<Predicate> BindEquality(const sql::Comparison& cmp, const BoundCol
 // `column [NOT] IN (v1, ...)`: each value is bound as `column = v` (the same typing and exact
 // folding); a value no column value can equal is dropped. With no value left, IN is FALSE and
 // NOT IN is IS NOT NULL (NULL still rejects the row). DuckDB gives the list one type: with a
-// number it types as DOUBLE (an exponent, or more than 38 digits) every number is a double, so
-// each value is then bound as that DOUBLE would be (integer columns: the nearest double, folded
-// exactly, as divergence D7; a FLOAT column: no FLOAT literals).
+// number it types as DOUBLE every number is a double, so each value is then bound as that DOUBLE
+// would be. A DECIMAL column then compares in DOUBLE with every value (ADR 0021 rule 11), and the
+// list is DOUBLE for any number DuckDB types so (DuckDbTypesAsDouble). Other columns look for an
+// exponent or more than 38 digits: an integer column folds the nearest doubles exactly
+// (divergence D7), and a FLOAT column takes no FLOAT literals.
 arrow::Result<Predicate> BindIn(const sql::Comparison& cmp, const BoundColumn& column,
                                 bool stored_as_float) {
   const bool negated = cmp.op == sql::CompareOp::kNotIn;
@@ -1110,10 +1112,13 @@ arrow::Result<Predicate> BindIn(const sql::Comparison& cmp, const BoundColumn& c
               .constant = {},
               .values = {},
               .span = cmp.span};
-  const bool as_double = std::ranges::any_of(cmp.list, [](const sql::Literal& value) {
-    return (value.kind == sql::Literal::Kind::kInteger ||
-            value.kind == sql::Literal::Kind::kDecimal) &&
-           IsApproximateNumber(value.text);
+  const bool decimal = column.type == LogicalType::kDecimal;
+  const bool as_double = std::ranges::any_of(cmp.list, [decimal](const sql::Literal& value) {
+    if (value.kind != sql::Literal::Kind::kInteger && value.kind != sql::Literal::Kind::kDecimal) {
+      return false;
+    }
+    return decimal ? DuckDbTypesAsDouble(value.text, value.negative)
+                   : IsApproximateNumber(value.text);
   });
   for (const sql::Literal& value : cmp.list) {
     const sql::Comparison equal{.column = cmp.column,
@@ -1151,7 +1156,8 @@ arrow::Result<Predicate> BindComparison(const sql::Comparison& cmp, const BoundC
 
 // `column <op> literal`, with the literal folded exactly into the column's type. `as_double`: a
 // number is read as DuckDB reads a DOUBLE-typed one, even when it is not written that way (an IN
-// list with such a number).
+// list with such a number). A DECIMAL column compared in DOUBLE keeps a DOUBLE constant, which the
+// executor compares with the column's values converted as DuckDB converts them.
 arrow::Result<Predicate> BindEquality(const sql::Comparison& cmp, const BoundColumn& column,
                                       bool stored_as_float, bool as_double) {
   const sql::Literal& lit = cmp.literal;
@@ -1200,18 +1206,22 @@ arrow::Result<Predicate> BindEquality(const sql::Comparison& cmp, const BoundCol
       if (!number) {
         return mismatch("write a number without quotes");
       }
-      // Not `as_double`: in an IN list each approximate value fails here itself, at its own span.
-      const auto unshifted = ParseExactNumber(lit.text, lit.negative);
-      if (IsApproximateNumber(lit.text) || (unshifted.has_value() && unshifted->huge)) {
-        // DuckDB compares in DOUBLE (an exponent, a decimal of more than 38 digits) or in a capped
-        // DECIMAL (an integer of 39 digits, a HUGEINT) then (ADR 0021 rule 11), not supported yet.
-        return UnsupportedError(std::format("comparing the {} column '{}' with a number with an "
-                                            "exponent or more than 38 digits is not supported",
-                                            ToString(column.type), Clip(column.name)),
-                                lit.span);
+      // A number DuckDB types as DOUBLE (an exponent, more than 38 digits, an integer beyond
+      // UHUGEINT), or any number of an IN list with one, is compared in DOUBLE, not folded: the
+      // literal as DuckDB converts it to DOUBLE, the column as DuckDB converts a DECIMAL (ADR 0021
+      // rules 8 and 11), so `p = 1e-1` holds for 0.10.
+      if (as_double || DuckDbTypesAsDouble(lit.text, lit.negative)) {
+        const auto value = DuckDbDoubleOf(lit.text, lit.negative);
+        if (!value.has_value()) {
+          return BindError("invalid number " + Clip(lit.text), lit.span);
+        }
+        p.constant = Constant{.type = LogicalType::kDouble, .value = *value};
+        return p;
       }
       // The literal in the column's scale, folded exactly like an integer literal into an integer
-      // column: 1.5 in DECIMAL(15,2) is 150, and x <= 12.345 is x <= 12.34 (ADR 0021 rule 11).
+      // column: 1.5 in DECIMAL(15,2) is 150, and x <= 12.345 is x <= 12.34 (ADR 0021 rule 11). A
+      // HUGEINT or UHUGEINT literal beyond the type folds to a constant, where DuckDB fails to cast
+      // it to its capped common type (divergence D13).
       const auto exact = ParseExactNumber(lit.text, lit.negative, column.type.scale());
       if (!exact.has_value()) {
         return BindError("invalid number " + Clip(lit.text), lit.span);
@@ -1957,9 +1967,12 @@ sql::CompareOp Mirror(sql::CompareOp op) {
   }
 }
 
-// Whether a comparison between the types is one DuckDB and antb1 make alike: numbers with numbers,
-// VARCHAR with VARCHAR, DATE with DATE.
-bool Comparable(LogicalType a, LogicalType b) { return (IsNumeric(a) && IsNumeric(b)) || a == b; }
+// Whether a comparison between the types is one DuckDB and antb1 make alike: numbers with numbers
+// (a DECIMAL of any precision and scale included), VARCHAR with VARCHAR, DATE with DATE.
+bool Comparable(LogicalType a, LogicalType b) {
+  const auto number = [](LogicalType t) { return IsNumeric(t) || t == LogicalType::kDecimal; };
+  return (number(a) && number(b)) || a == b;
+}
 
 // The last select item with the alias (DuckDB), if any.
 std::optional<std::size_t> FindAlias(const SelectList& select, std::string_view name) {
@@ -2854,16 +2867,9 @@ struct Binder::BindConditionOf {
         temporal(right.expr->type)) {
       return UnsupportedError("comparing a DATE with a TIMESTAMP is not supported", binary.op_span);
     }
-    // A DECIMAL compares with a DECIMAL of the same precision and scale only (ADR 0021 rule 11;
-    // the common type of other pairs comes with D4).
-    if ((left.expr->type == LogicalType::kDecimal || right.expr->type == LogicalType::kDecimal) &&
-        left.expr->type != right.expr->type) {
-      return UnsupportedError(
-          std::format("comparing {} with {} is not supported (only DECIMAL values of the same "
-                      "precision and scale compare)",
-                      DescribeOperand(left), DescribeOperand(right)),
-          binary.op_span);
-    }
+    // A DECIMAL compares with a DECIMAL of any precision and scale and with an integer exactly by
+    // value, and with a DOUBLE in DOUBLE after DuckDB's conversion (ADR 0021 rule 11; the
+    // executor's comparison of the two columns).
     if (!Comparable(left.expr->type, right.expr->type)) {
       return BindError(
           std::format("cannot compare {} with {}", DescribeOperand(left), DescribeOperand(right)),
@@ -2917,32 +2923,40 @@ namespace {
 // DuckDB compares x BETWEEN lo AND hi with one common type of the three values, while antb1
 // compares x >= lo and x <= hi each in its own. They differ only when that type is DOUBLE (a
 // DOUBLE column or an approximate literal, which an exponent or more than 38 digits makes) and a
-// value does not compare in DOUBLE as it does on its own: a BIGINT or HUGEINT value (a column,
-// or a constant of that type), a FLOAT column, or a decimal literal against an integer value.
-// Such a BETWEEN is unsupported, unless the operand is DOUBLE: then both comparisons are in
-// DOUBLE already.
+// pair that antb1 does not compare in DOUBLE would compare otherwise in DOUBLE: a BIGINT or
+// HUGEINT value (a column, or a constant of that type), a FLOAT column, a decimal literal against
+// an integer value, and a DECIMAL (ADR 0021): a DECIMAL operand against any bound that is not
+// DOUBLE (an integer or decimal literal, a constant, a column), or a DECIMAL column or expression
+// as a bound. Such a BETWEEN is unsupported, unless the operand is DOUBLE: then both comparisons
+// are in DOUBLE already.
 template <class BindFn>
 arrow::Status CheckBetweenTypes(const sql::BetweenExpr& between, const BindFn& bind) {
   bool any_double = false;
   bool any_wide = false;
   bool any_float = false;
-  bool any_decimal = false;
+  bool any_decimal = false;  // a decimal literal
   bool any_integer = false;
   bool any_varchar = false;
-  bool operand_double = false;  // the operand is DOUBLE: both comparisons are DOUBLE anyway
+  bool operand_double = false;     // the operand is DOUBLE: both comparisons are DOUBLE anyway
+  bool operand_decimal = false;    // the operand is a DECIMAL (a decimal literal too)
+  bool any_exact_bound = false;    // a bound that is not DOUBLE
+  bool any_decimal_bound = false;  // a bound that is a DECIMAL column or expression
   std::optional<LogicalType> temporal;
   const auto wide = [](LogicalType t) {
     return t == LogicalType::kBigInt || t == LogicalType::kHugeInt;
   };
   for (const sql::Expr* value : {&*between.operand, &*between.low, &*between.high}) {
+    const bool is_operand = value == &*between.operand;
+    bool is_double = false;
+    bool is_decimal = false;
     if (const auto* lit = std::get_if<sql::Literal>(value)) {
       const bool number =
           lit->kind == sql::Literal::Kind::kInteger || lit->kind == sql::Literal::Kind::kDecimal;
       if (number && IsApproximateNumber(lit->text)) {
-        any_double = true;
-        operand_double = operand_double || value == &*between.operand;
+        is_double = true;
       } else if (lit->kind == sql::Literal::Kind::kDecimal) {
         any_decimal = true;
+        operand_decimal = operand_decimal || is_operand;
       } else if (lit->kind == sql::Literal::Kind::kInteger) {
         const auto exact = ParseExactNumber(lit->text, lit->negative);
         const bool huge = !exact.has_value() || exact->huge;
@@ -2950,28 +2964,32 @@ arrow::Status CheckBetweenTypes(const sql::BetweenExpr& between, const BindFn& b
         any_double = any_double || huge;
         any_wide = any_wide || huge || exact->magnitude > RangeOf(LogicalType::kInteger).max;
       }
-      continue;
-    }
-    if (IsConstantInteger(*value)) {
+    } else if (IsConstantInteger(*value)) {
       auto folded = FoldTyped(*value);
       any_wide = any_wide || (folded.has_value() && folded->ok() && wide((*folded)->type));
-      continue;
+    } else {
+      ARROW_ASSIGN_OR_RAISE(const Typed typed, bind(*value));
+      const LogicalType type = typed.expr->type;
+      any_varchar = any_varchar || type == LogicalType::kVarchar;
+      if (type == LogicalType::kDate || type == LogicalType::kTimestamp) {
+        temporal = type;
+      }
+      if (typed.stored_as_float) {
+        any_float = true;
+      } else if (type == LogicalType::kDouble) {
+        is_double = true;
+      } else if (type == LogicalType::kDecimal) {
+        is_decimal = true;
+        operand_decimal = operand_decimal || is_operand;
+      } else if (IsInteger(type)) {
+        any_integer = true;
+        any_wide = any_wide || wide(type);
+      }
     }
-    ARROW_ASSIGN_OR_RAISE(const Typed typed, bind(*value));
-    const LogicalType type = typed.expr->type;
-    any_varchar = any_varchar || type == LogicalType::kVarchar;
-    if (type == LogicalType::kDate || type == LogicalType::kTimestamp) {
-      temporal = type;
-    }
-    if (typed.stored_as_float) {
-      any_float = true;
-    } else if (type == LogicalType::kDouble) {
-      any_double = true;
-      operand_double = operand_double || value == &*between.operand;
-    } else if (IsInteger(type)) {
-      any_integer = true;
-      any_wide = any_wide || wide(type);
-    }
+    any_double = any_double || is_double;
+    operand_double = operand_double || (is_operand && is_double);
+    any_exact_bound = any_exact_bound || (!is_operand && !is_double);
+    any_decimal_bound = any_decimal_bound || (!is_operand && is_decimal);
   }
   // Pairwise, a string literal compares with a VARCHAR value and a DATE value alike; DuckDB
   // rejects the mix.
@@ -2980,11 +2998,13 @@ arrow::Status CheckBetweenTypes(const sql::BetweenExpr& between, const BindFn& b
                                  ToString(*temporal)),
                      between.op_span);
   }
-  if (any_double && !operand_double && (any_wide || any_float || (any_decimal && any_integer))) {
+  const bool decimal_pair = (operand_decimal && any_exact_bound) || any_decimal_bound;
+  if (any_double && !operand_double &&
+      (any_wide || any_float || (any_decimal && any_integer) || decimal_pair)) {
     return UnsupportedError(
-        "BETWEEN of a DOUBLE value and a BIGINT, HUGEINT or FLOAT value, or of a DOUBLE value, a "
-        "decimal literal and an integer value, is not supported (DuckDB compares all three in "
-        "DOUBLE)",
+        "BETWEEN of a DOUBLE value and a BIGINT, HUGEINT, FLOAT or DECIMAL value, or of a DOUBLE "
+        "value, a decimal literal and an integer value, is not supported (DuckDB compares all "
+        "three in DOUBLE)",
         between.op_span);
   }
   return arrow::Status::OK();

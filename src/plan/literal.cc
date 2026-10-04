@@ -163,40 +163,101 @@ std::optional<DecimalLiteral> ParseDecimalLiteral(std::string_view text, bool ne
       .unscaled = negative ? -magnitude : magnitude};
 }
 
-std::optional<float> DuckDbFloatOf(std::string_view text, bool negative) {
-  if (IsApproximateNumber(text) || !ParseExactNumber(text, negative).has_value()) {
-    return std::nullopt;  // an exponent or more than 38 digits: DOUBLE
+namespace {
+
+// A numeric literal as DuckDB types it: a decimal (a point, no exponent, at most 38 digits), an
+// integer by value (INTEGER or BIGINT, HUGEINT from -2^127 to 2^127 - 1, UHUGEINT up to
+// 2^128 - 1), or else DOUBLE.
+struct DuckDbNumber {
+  enum class Kind : std::uint8_t { kDouble, kDecimal, kBigInt, kHugeInt, kUHugeInt };
+  Kind kind = Kind::kDouble;
+  DecimalLiteral decimal;  // kDecimal
+  int64_t bigint = 0;      // kBigInt (INTEGER too)
+  Int128 hugeint = 0;      // kHugeInt
+  UInt128 uhugeint = 0;    // kUHugeInt
+};
+
+// std::nullopt if the text (without its sign) is not a number.
+std::optional<DuckDbNumber> ClassifyNumber(std::string_view text, bool negative) {
+  if (!ParseExactNumber(text, negative).has_value()) {
+    return std::nullopt;
+  }
+  if (IsApproximateNumber(text)) {
+    return DuckDbNumber{};  // an exponent or more than 38 digits
   }
   if (const auto decimal = ParseDecimalLiteral(text, negative)) {
-    return DuckDbDecimalToFloat(decimal->unscaled, decimal->type.width(), decimal->type.scale());
+    return DuckDbNumber{.kind = DuckDbNumber::Kind::kDecimal, .decimal = *decimal};
   }
   // An integer, typed by value; the magnitude is checked against 2^128 - 1 while it is read.
   UInt128 magnitude = 0;
   for (const char c : text) {
     if (__builtin_mul_overflow(magnitude, UInt128{10}, &magnitude) ||
         __builtin_add_overflow(magnitude, static_cast<UInt128>(c - '0'), &magnitude)) {
-      return std::nullopt;  // beyond UHUGEINT: DOUBLE
+      return DuckDbNumber{};  // beyond UHUGEINT
     }
   }
   constexpr UInt128 kHugeIntLimit = UInt128{1} << 127U;  // |HUGEINT min|
-  if (negative) {
-    if (magnitude > kHugeIntLimit) {
-      return std::nullopt;  // below HUGEINT's minimum: DOUBLE
-    }
-    const auto value = static_cast<Int128>(UInt128{0} - magnitude);
-    if (const auto small = Int128ToInt64(value)) {
-      return static_cast<float>(*small);  // INTEGER or BIGINT
-    }
-    return static_cast<float>(DuckDbHugeintToDouble(value));
+  if (!negative && magnitude >= kHugeIntLimit) {
+    return DuckDbNumber{.kind = DuckDbNumber::Kind::kUHugeInt, .uhugeint = magnitude};
   }
-  if (magnitude >= kHugeIntLimit) {
-    return static_cast<float>(DuckDbUhugeintToDouble(magnitude));  // UHUGEINT
+  if (negative && magnitude > kHugeIntLimit) {
+    return DuckDbNumber{};  // below HUGEINT's minimum
   }
-  const auto value = static_cast<Int128>(magnitude);
+  const auto value =
+      negative ? static_cast<Int128>(UInt128{0} - magnitude) : static_cast<Int128>(magnitude);
   if (const auto small = Int128ToInt64(value)) {
-    return static_cast<float>(*small);
+    return DuckDbNumber{.kind = DuckDbNumber::Kind::kBigInt, .bigint = *small};
   }
-  return static_cast<float>(DuckDbHugeintToDouble(value));
+  return DuckDbNumber{.kind = DuckDbNumber::Kind::kHugeInt, .hugeint = value};
+}
+
+}  // namespace
+
+std::optional<float> DuckDbFloatOf(std::string_view text, bool negative) {
+  const auto number = ClassifyNumber(text, negative);
+  if (!number.has_value()) {
+    return std::nullopt;
+  }
+  switch (number->kind) {
+    case DuckDbNumber::Kind::kDouble:
+      break;  // compared in DOUBLE
+    case DuckDbNumber::Kind::kDecimal:
+      return DuckDbDecimalToFloat(number->decimal.unscaled, number->decimal.type.width(),
+                                  number->decimal.type.scale());
+    case DuckDbNumber::Kind::kBigInt:
+      return static_cast<float>(number->bigint);
+    case DuckDbNumber::Kind::kHugeInt:
+      return static_cast<float>(DuckDbHugeintToDouble(number->hugeint));
+    case DuckDbNumber::Kind::kUHugeInt:
+      return static_cast<float>(DuckDbUhugeintToDouble(number->uhugeint));
+  }
+  return std::nullopt;
+}
+
+bool DuckDbTypesAsDouble(std::string_view text, bool negative) {
+  const auto number = ClassifyNumber(text, negative);
+  return number.has_value() && number->kind == DuckDbNumber::Kind::kDouble;
+}
+
+std::optional<double> DuckDbDoubleOf(std::string_view text, bool negative) {
+  const auto number = ClassifyNumber(text, negative);
+  if (!number.has_value()) {
+    return std::nullopt;
+  }
+  switch (number->kind) {
+    case DuckDbNumber::Kind::kDouble:
+      return ParseDoubleLiteral(text, negative);
+    case DuckDbNumber::Kind::kDecimal:
+      return DuckDbDecimalToDouble(number->decimal.unscaled, number->decimal.type.width(),
+                                   number->decimal.type.scale());
+    case DuckDbNumber::Kind::kBigInt:
+      return static_cast<double>(number->bigint);
+    case DuckDbNumber::Kind::kHugeInt:
+      return DuckDbHugeintToDouble(number->hugeint);
+    case DuckDbNumber::Kind::kUHugeInt:
+      return DuckDbUhugeintToDouble(number->uhugeint);
+  }
+  return std::nullopt;
 }
 
 bool IsApproximateNumber(std::string_view text) {
