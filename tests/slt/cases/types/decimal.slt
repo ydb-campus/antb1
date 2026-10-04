@@ -1,7 +1,7 @@
 # DECIMAL(p,s) columns (ADR 0021, docs/sql-subset.md): decimals.parquet stores DECIMAL(9,2) as INT32, (18,4) and
 # (15,2) as INT64, and (38,10) and (38,0) as FIXED_LEN_BYTE_ARRAY. Values print with exactly s digits after the point;
-# literals fold exactly into the column's (p,s); keys compare by value. CASE values and mixed types are not supported
-# yet (onlyif duckdb records); arithmetic, SUM and AVG are in decimal_arithmetic.slt.
+# literals fold exactly into the column's (p,s); keys compare by value. Arithmetic, SUM and AVG are in
+# decimal_arithmetic.slt, comparisons with other types in decimal_comparisons.slt.
 
 query IDDDDDD nosort
 SELECT id, d9_2, d18_4, d38_10, d38_0, p, q FROM decimals ORDER BY id LIMIT 14
@@ -405,24 +405,3 @@ SELECT p, q FROM decimals WHERE p <> q ORDER BY q DESC, p
 -9999999999999.99	-59.97
 -99.95	-79.96
 59.97	-9999999999999.99
-
-# Not supported yet (exit 4): mixed types and approximate literals (decimal_arithmetic.slt has
-# arithmetic, SUM and AVG).
-
-onlyif duckdb
-query I nosort
-SELECT COUNT(*) FROM decimals WHERE d9_2 = p
-----
-3
-
-onlyif duckdb
-query I nosort
-SELECT COUNT(*) FROM decimals WHERE p < id
-----
-18
-
-onlyif duckdb
-query I nosort
-SELECT COUNT(*) FROM decimals WHERE p > 1e1
-----
-14
