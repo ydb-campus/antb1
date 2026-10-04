@@ -6,3 +6,5 @@ d
   d38_0	DECIMAL(38,0)
   p	DECIMAL(15,2)
   q	DECIMAL(15,2)
+  b	BIGINT
+  d	DOUBLE

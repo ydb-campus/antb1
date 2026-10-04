@@ -671,6 +671,34 @@ arrow::Result<std::shared_ptr<arrow::Table>> MakeDecimalTable() {
     fields.push_back(arrow::field(col.name, type));
     arrays.push_back(array);
   }
+  // b BIGINT and d DOUBLE, for comparisons of DECIMALs with integer and DOUBLE columns. b holds
+  // the BIGINT extremes in rows 2 and 3 and 2^53 + 1 in row 12. Every d value is a multiple of
+  // 0.625 between -5 and 5, so its sums are exact in any order (antb1 adds a DOUBLE SUM row group
+  // by row group, DuckDB in one running sum) and some values equal a d9_2 value; no -0.0.
+  arrow::Int64Builder bigints;
+  arrow::DoubleBuilder doubles;
+  for (int i = 0; i < kRows; ++i) {
+    const int base = ((i * 37) % 11) - 5;
+    if (i % 6 == 5) {
+      ARROW_RETURN_NOT_OK(bigints.AppendNull());
+    } else if (i == 2 || i == 3) {
+      ARROW_RETURN_NOT_OK(bigints.Append(i == 2 ? std::numeric_limits<int64_t>::max()
+                                                : std::numeric_limits<int64_t>::min()));
+    } else if (i == 12) {
+      ARROW_RETURN_NOT_OK(bigints.Append(9'007'199'254'740'993));
+    } else {
+      ARROW_RETURN_NOT_OK(bigints.Append(int64_t{base} * 3'000'000'019));
+    }
+    const int eighths = (((i * 29) % 17) - 8) * 5;
+    ARROW_RETURN_NOT_OK(i % 9 == 4 ? doubles.AppendNull()
+                                   : doubles.Append(static_cast<double>(eighths) / 8));
+  }
+  ARROW_ASSIGN_OR_RAISE(auto bigint_array, bigints.Finish());
+  ARROW_ASSIGN_OR_RAISE(auto double_array, doubles.Finish());
+  fields.push_back(arrow::field("b", arrow::int64()));
+  arrays.push_back(bigint_array);
+  fields.push_back(arrow::field("d", arrow::float64()));
+  arrays.push_back(double_array);
   return arrow::Table::Make(arrow::schema(fields), arrays);
 }
 

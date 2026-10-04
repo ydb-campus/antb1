@@ -108,8 +108,9 @@ values: `hits_like.parquet` (10,000 rows in 4 row groups), `hits_like_nulls.parq
 columns and UTF8 strings), `edge.parquet` (type extremes, escapes, empty strings, NULLs), `floats.parquet` (bit-exact
 FLOAT values: 0.1F and its lower neighbour, 2^24 and 2^100 with their next FLOATs, the FLOAT maximum, +-inf, +-0, NULL),
 `decimals.parquet` (DECIMAL(9,2) stored as INT32, (18,4) and (15,2) as INT64, (38,10) and (38,0) as
-FIXED_LEN_BYTE_ARRAY: negatives, NULLs and each precision's extremes, 40 rows in 5 row groups) and `empty.parquet`
-(0 rows). The ctest `fixtures.generate` (label `setup`) writes them to `build/<preset>/fixtures`.
+FIXED_LEN_BYTE_ARRAY: negatives, NULLs and each precision's extremes; a BIGINT column with its extremes and a DOUBLE
+column whose sums are exact in any order; 40 rows in 5 row groups) and `empty.parquet` (0 rows). The ctest
+`fixtures.generate` (label `setup`) writes them to `build/<preset>/fixtures`.
 Values come from splitmix64 with integer-only arithmetic (no `<random>` distributions, no libm, no NaN), so every
 platform generates the same data.
 
