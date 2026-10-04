@@ -6,9 +6,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <format>
+#include <limits>
 #include <optional>
 #include <regex>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -128,6 +131,9 @@ TEST(QueryGenerator, QueriesRespectTheSemanticsBothEnginesShare) {
   int decimal_divisions = 0;
   int decimal_literal_operands = 0;
   int decimal_constants = 0;
+  int decimal_column_comparisons = 0;
+  int decimal_double_comparisons = 0;
+  int decimal_double_lists = 0;
   for (uint64_t i = 0; i < 3000; ++i) {
     const auto q = gen.Generate(i);
     const std::string sql = Lower(q.sql);
@@ -188,6 +194,31 @@ TEST(QueryGenerator, QueriesRespectTheSemanticsBothEnginesShare) {
       decimal_divisions += std::regex_search(sql, decimal_division) ? 1 : 0;
       decimal_literal_operands += std::regex_search(sql, decimal_literal_operand) ? 1 : 0;
       decimal_constants += std::regex_search(sql, decimal_constant) ? 1 : 0;
+      // A DECIMAL against another column of numbers, and against numbers with an exponent (alone
+      // or in an IN list, compared in DOUBLE); the integer column i never gets an exponent, which
+      // it would compare with nearest doubles (divergence D7), and BETWEEN never mixes one with
+      // the other numbers.
+      static const std::regex column_comparison(
+          R"re("?\b[mw]\b"? ?(=|<>|!=|<=|>=|<|>) ?"?\b[idmw]\b"?(?!\.|\())re");
+      static const std::regex reversed_comparison(
+          R"re("?\b[id]\b"? ?(=|<>|!=|<=|>=|<|>) ?"?\b[mw]\b"?)re");
+      static const std::regex double_comparison(
+          R"re("?\b[mw]\b"? ?(=|<>|!=|<=|>=|<|>) ?-?[0-9.]+e)re");
+      static const std::regex double_list(R"re("?\b[mw]\b"? (not )?in ?\([^)]*[0-9]e)re");
+      static const std::regex integer_exponent(
+          R"re("?\bi\b"? ?(=|<>|!=|<=|>=|<|>) ?-?[0-9.]+e|"?\bi\b"? (not )?in ?\([^)]*[0-9]e)re");
+      static const std::regex mixed_between(
+          R"re(between -?[0-9.]+e[-0-9]+ and -?[0-9.]+(?![0-9.]*e)|between -?[0-9.]+(?![0-9.]*e) and -?[0-9.]+e)re");
+      EXPECT_FALSE(std::regex_search(sql, integer_exponent)) << q.sql;
+      EXPECT_FALSE(std::regex_search(sql, mixed_between)) << q.sql;
+      decimal_column_comparisons +=
+          std::regex_search(sql, column_comparison) || std::regex_search(sql, reversed_comparison)
+              ? 1
+              : 0;
+      decimal_double_comparisons += std::regex_search(sql, double_comparison) ? 1 : 0;
+      decimal_double_lists += std::regex_search(sql, double_list) ? 1 : 0;
+      if (sql.find(" in") != std::string::npos) {
+      }
     }
     static const std::regex long_fraction(R"re(\.[0-9]{11})re");
     EXPECT_FALSE(std::regex_search(sql, long_fraction)) << q.sql;
@@ -200,6 +231,66 @@ TEST(QueryGenerator, QueriesRespectTheSemanticsBothEnginesShare) {
   EXPECT_GT(decimal_divisions, 10) << "/ // % of DECIMAL columns";
   EXPECT_GT(decimal_literal_operands, 10) << "decimal literals in arithmetic";
   EXPECT_GT(decimal_constants, 10) << "decimal select constants";
+  EXPECT_GT(decimal_column_comparisons, 10) << "a DECIMAL column against another column";
+  EXPECT_GT(decimal_double_comparisons, 10) << "a DECIMAL column against a DOUBLE literal";
+  EXPECT_GT(decimal_double_lists, 10) << "an IN list with a DOUBLE literal";
+}
+
+// A DECIMAL column meets another column of numbers only where DuckDB's common type of the two
+// (ADR 0021 rule 10) stays within 38 digits; beyond it DuckDB fails on a value it cannot hold
+// (divergence D13): h DECIMAL(38,0) with x DECIMAL(9,2) needs 40 digits, n DECIMAL(38,30) with
+// BIGINT 49 and with INTEGER 40, n with h 68. A DOUBLE column compares with any of them.
+TEST(QueryGenerator, DecimalColumnComparisonsStayWithinDuckDbsCommonType) {
+  GenTable t{.name = "t", .path = {}, .rows = 10, .columns = {}};
+  t.columns = {
+      {.name = "h", .kind = ValueKind::kDecimal, .samples = {"5"}, .precision = 38, .scale = 0},
+      {.name = "x", .kind = ValueKind::kDecimal, .samples = {"1.50"}, .precision = 9, .scale = 2},
+      {.name = "n",
+       .kind = ValueKind::kDecimal,
+       .samples = {"1." + std::string(30, '0')},
+       .precision = 38,
+       .scale = 30},
+      {.name = "b",
+       .kind = ValueKind::kInteger,
+       .min = std::numeric_limits<int64_t>::min(),
+       .max = std::numeric_limits<int64_t>::max(),
+       .samples = {"7"}},
+      {.name = "k",
+       .kind = ValueKind::kInteger,
+       .min = std::numeric_limits<int32_t>::min(),
+       .max = std::numeric_limits<int32_t>::max(),
+       .samples = {"3"}},
+      {.name = "f", .kind = ValueKind::kDouble, .samples = {"0.5"}},
+  };
+  auto gen = QueryGenerator::Make({t}, 13, {.supported = kSupportedFeatures, .target_percent = 0});
+  ASSERT_TRUE(gen.has_value()) << gen.error();
+  const auto pair = [](std::string_view a, std::string_view b) {
+    const std::string ops = "(=|<>|!=|<=|>=|<|>)";
+    return std::regex(std::format(
+        R"re("?\b{0}\b"? ?{2} ?"?\b{1}\b"?(?!\.|\()|"?\b{1}\b"? ?{2} ?"?\b{0}\b"?(?!\.|\())re", a,
+        b, ops));
+  };
+  const std::vector<std::regex> capped = {pair("h", "x"), pair("n", "b"), pair("n", "k"),
+                                          pair("n", "h")};
+  const std::vector<std::regex> allowed = {pair("x", "b"), pair("h", "b"), pair("h", "k"),
+                                           pair("n", "x"), pair("n", "f")};
+  std::vector<int> seen(allowed.size(), 0);
+  for (uint64_t i = 0; i < 5000; ++i) {
+    const auto q = gen->Generate(i);
+    if (q.features.Has(Feature::kLayout)) {
+      continue;  // layout comments could split a match
+    }
+    const std::string sql = Lower(q.sql);
+    for (const std::regex& r : capped) {
+      EXPECT_FALSE(std::regex_search(sql, r)) << q.sql;
+    }
+    for (std::size_t k = 0; k < allowed.size(); ++k) {
+      seen[k] += std::regex_search(sql, allowed[k]) ? 1 : 0;
+    }
+  }
+  for (std::size_t k = 0; k < allowed.size(); ++k) {
+    EXPECT_GT(seen[k], 5) << "allowed pair " << k;
+  }
 }
 
 TEST(QueryGenerator, DecimalLiteralsStayWithinTheColumnsDigits) {

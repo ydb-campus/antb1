@@ -48,7 +48,7 @@ enum class Feature : std::uint8_t {
   kVarcharColumns,  // VARCHAR (Parquet BYTE_ARRAY, with or without UTF8)
   kDateColumns,     // DATE (EventDate with the clickbench option)
   kDecimalColumns,  // DECIMAL(p,s), p <= 38: literals, keys, MIN, MAX, COUNT, SUM, AVG, + - * / //
-                    // % by integer and decimal literals
+                    // % by integer and decimal literals, comparisons with other numbers
   // FROM
   kTableName,  // a registered table
   kTablePath,  // '<file or glob>'
@@ -58,6 +58,7 @@ enum class Feature : std::uint8_t {
   kLike,             // VARCHAR column [NOT] LIKE 'pattern' in WHERE
   kIn,               // column [NOT] IN (literal, ...) in WHERE
   kBetween,          // column [NOT] BETWEEN literal AND literal in WHERE
+  kCompareColumns,   // column <op> column in WHERE (a DECIMAL against another column of numbers)
   kLiteralFirst,     // literal <op> column
   kIntegerLiteral,   // 42
   kDecimalLiteral,   // 4.25
@@ -155,6 +156,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "integer_literal";
     case Feature::kBetween:
       return "between";
+    case Feature::kCompareColumns:
+      return "compare_columns";
     case Feature::kDecimalLiteral:
       return "decimal_literal";
     case Feature::kNegativeLiteral:
@@ -294,6 +297,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kLike,
     Feature::kIn,
     Feature::kBetween,
+    Feature::kCompareColumns,
     Feature::kLiteralFirst,
     Feature::kIntegerLiteral,
     Feature::kDecimalLiteral,
