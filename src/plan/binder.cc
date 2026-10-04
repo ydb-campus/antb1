@@ -3130,6 +3130,12 @@ arrow::Result<Typed> Binder::BindCase(const sql::CaseExpr& c, const BindFn& bind
   // DuckDB's type: the values' common type, where an integer literal takes the others' integer
   // type when it fits and a string literal any type (DATE: the date it spells).
   std::optional<LogicalType> type;
+  // A DECIMAL value (a decimal literal too) next to a DOUBLE value makes the CASE DOUBLE, whatever
+  // the order of the values, the DECIMAL converted as DuckDB converts it (ADR 0021 rule 8); any
+  // other DECIMAL common type is rule 10's (roadmap PR D4b).
+  const bool any_double = std::ranges::any_of(values, [](const Typed& v) {
+    return v.expr->type == LogicalType::kDouble && !v.stored_as_float;
+  });
   for (const bool literals : {false, true}) {
     for (std::size_t i = 0; i < values.size(); ++i) {
       const Typed& v = values[i];
@@ -3143,19 +3149,16 @@ arrow::Result<Typed> Binder::BindCase(const sql::CaseExpr& c, const BindFn& bind
             "divergence D11)",
             span);
       }
-      if (v.decimal) {
-        // With a DOUBLE value DuckDB's CASE is DOUBLE, the literal converted as DuckDB converts a
-        // DECIMAL (ADR 0021 rule 8); else a DECIMAL common type (rule 10, roadmap PR D4b).
-        if (type != LogicalType::kDouble) {
-          return UnsupportedError(
-              "a decimal literal as a CASE value is supported only next to a DOUBLE value (DuckDB "
-              "types the CASE DECIMAL)",
-              span);
-        }
-        continue;
-      }
       if (v.expr->type == LogicalType::kDecimal) {
-        return UnsupportedError("DECIMAL CASE values are not supported", span);
+        if (any_double) {
+          continue;  // the DOUBLE value types the CASE
+        }
+        return UnsupportedError(
+            v.decimal
+                ? "a decimal literal as a CASE value is supported only next to a DOUBLE value "
+                  "(DuckDB types the CASE DECIMAL)"
+                : "DECIMAL CASE values are supported only next to a DOUBLE value",
+            span);
       }
       if (!type.has_value()) {
         type = v.expr->type;

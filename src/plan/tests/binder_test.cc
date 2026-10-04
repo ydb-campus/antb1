@@ -424,9 +424,9 @@ INSTANTIATE_TEST_SUITE_P(
                   kUnsupported, "100000000000000000000000000000000000000",
                   "with a number with an exponent or more than 38 digits"},
         ErrorCase{"SELECT CASE WHEN i = 1 THEN p END FROM dec", kUnsupported, "p",
-                  "DECIMAL CASE values are not supported"},
+                  "DECIMAL CASE values are supported only next to a DOUBLE value"},
         ErrorCase{"SELECT CASE WHEN i = 1 THEN p ELSE q END FROM dec", kUnsupported, "p",
-                  "DECIMAL CASE values are not supported"},
+                  "DECIMAL CASE values are supported only next to a DOUBLE value"},
         ErrorCase{"SELECT COUNT(*) FROM dec WHERE p = 'x'", kBind, "'x'",
                   "cannot compare DECIMAL(15,2) column 'p' with a string"},
         ErrorCase{"SELECT SUM(i16) // 2 FROM t", kUnsupported, "//", "'//' in HUGEINT"},
@@ -1085,6 +1085,26 @@ TEST(BinderTest, DecimalLiteralsAndDivisionTypesLikeDuckDb) {
     ASSERT_EQ(plan->output.size(), 1U);
     EXPECT_EQ(plan->output[0].type, c.type) << sql << ": " << ToString(plan->output[0].type);
     EXPECT_EQ(plan->output[0].name, c.name) << sql;
+  }
+}
+
+// A DECIMAL CASE value, a decimal literal or a negated one included, next to a DOUBLE value makes
+// the CASE DOUBLE, in either order (DuckDB 1.5.5's typeof); other DECIMAL common types wait for
+// D4b.
+TEST(BinderTest, DecimalCaseValuesNextToADoubleAreDouble) {
+  const Catalog catalog = MakeCatalog();
+  for (const std::string_view expr : {
+           "CASE WHEN i = 1 THEN 1.5 ELSE f END",
+           "CASE WHEN i = 1 THEN f ELSE 1.5 END",
+           "CASE WHEN i = 1 THEN 1.5 ELSE 1e3 END",
+           "CASE WHEN i = 1 THEN -(1.5) ELSE f END",
+           "CASE WHEN i = 1 THEN p ELSE f END",
+           "CASE WHEN i = 1 THEN p * q WHEN i = 2 THEN 7 ELSE f END",
+       }) {
+    const std::string sql = "SELECT " + std::string(expr) + " FROM dec";
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    EXPECT_EQ(plan->output[0].type, LogicalType::kDouble) << sql;
   }
 }
 

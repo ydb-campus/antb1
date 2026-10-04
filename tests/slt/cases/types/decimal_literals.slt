@@ -170,6 +170,28 @@ SELECT id, p * 1e0, p + 2.5e0 FROM decimals WHERE id >= 30 ORDER BY id
 38	79.96	82.46
 39	NULL	NULL
 
+# A DECIMAL CASE value (a decimal literal, a negated one, a column) next to a DOUBLE value: DOUBLE, in either order.
+
+query IRRRR nosort
+SELECT id, CASE WHEN id > 35 THEN 1.5 ELSE 2.5e0 END, CASE WHEN id > 35 THEN -(1.5) ELSE p * 1e0 END, CASE WHEN id > 35 THEN p ELSE 1e1 END, CASE WHEN id = 30 THEN d18_4 WHEN id = 31 THEN 7 ELSE id / 4 END FROM decimals WHERE id >= 30 ORDER BY id
+----
+30	2.5	99.95	10	5.0005
+31	2.5	-39.98	10	7
+32	2.5	39.98	10	8
+33	2.5	-99.95	10	8.25
+34	2.5	NULL	10	8.5
+35	2.5	59.97	10	8.75
+36	1.5	-1.5	-79.96	9
+37	1.5	-1.5	0	9.25
+38	1.5	-1.5	79.96	9.5
+39	1.5	-1.5	NULL	9.75
+
+onlyif duckdb
+query TTT nosort
+SELECT typeof(CASE WHEN id > 35 THEN 1.5 ELSE 2.5e0 END), typeof(CASE WHEN id > 35 THEN -(1.5) ELSE p * 1e0 END), typeof(CASE WHEN id > 35 THEN p ELSE 1e1 END) FROM decimals WHERE id = 30
+----
+DOUBLE	DOUBLE	DOUBLE
+
 # In conditions and aggregates.
 
 query I rowsort

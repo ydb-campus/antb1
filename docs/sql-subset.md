@@ -228,8 +228,7 @@ items).
   result, ...`). `%` keeps the larger scale and gives max(p1 - s1, p2 - s2) + s digits, with no cap to 18
   (DECIMAL(15,2) `%` INTEGER is DECIMAL(15,2), `int_col % 2.5` DECIMAL(11,1)). `/` and `//` of a DECIMAL, and any
   DECIMAL with a DOUBLE, are DOUBLE. Unary `-` keeps the type. `%` beyond 38 digits (DuckDB's DOUBLE, as for
-  DECIMAL(38,0) `%` `0.5`) and DECIMAL `CASE` values other than a decimal literal next to a DOUBLE value are
-  unsupported (exit code 4).
+  DECIMAL(38,0) `%` `0.5`) and DECIMAL `CASE` values without a DOUBLE value are unsupported (exit code 4).
 - Functions (names ASCII case-insensitive): `strlen(x)` takes a VARCHAR and is BIGINT; `regexp_replace(x, 'pattern',
   'replacement')` takes a VARCHAR and two string literals and is VARCHAR. A wrong number of arguments, another type or
   a non-literal pattern or replacement is a bind error (`strlen() needs a VARCHAR, but 'i16' is SMALLINT`); DuckDB's
@@ -262,9 +261,10 @@ items).
   a string literal takes VARCHAR or DATE (`ELSE '2013-07-15'` next to a DATE); without other values literals give
   their own types, and no value at all but string literals VARCHAR. A VARCHAR or DATE value with a number is a bind
   error (`cannot mix values of type VARCHAR and INTEGER in CASE`); a string literal next to numbers is unsupported
-  (DuckDB casts it to the number). A decimal literal next to a DOUBLE value converts as DuckDB converts a DECIMAL
-  (rule 8 of [ADR 0021](adr/0021-decimal-semantics.md)); without a DOUBLE value it, a DECIMAL value (DuckDB's DECIMAL
-  common type) and a FLOAT column as a value (divergence D11) are unsupported. `CASE x WHEN v THEN ..` is
+  (DuckDB casts it to the number). A DECIMAL value (a decimal literal too) next to a DOUBLE value, in any order, makes
+  the CASE DOUBLE, the DECIMAL converted as DuckDB converts it (rule 8 of [ADR 0021](adr/0021-decimal-semantics.md));
+  without a DOUBLE value a DECIMAL value (DuckDB's DECIMAL common type) and a FLOAT column as a value (divergence D11)
+  are unsupported. `CASE x WHEN v THEN ..` is
   `CASE WHEN x = v THEN ..`. The result name is DuckDB's: `CASE  WHEN ((a = 1)) THEN (b) ELSE NULL END`.
 - Conditions with `OR` and `NOT` (and `AND` below them): each comparison, `LIKE` and `IN` is bound and folded exactly
   as a `WHERE` comparison, and a `WHERE` or `HAVING` conjunct with `OR` or `NOT` is computed as one condition and
@@ -567,11 +567,11 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   converted on its own (a value beyond 18 digits through the 128-bit formula); this is not always the nearest double
   (`9007199254740993.5` becomes 2^53). `/` then divides as for DOUBLE (`inf`, `-inf` or NaN for a zero divisor), and
   `//` is the same division, NULL for a zero divisor. Not supported yet (exit code 4, [ADR
-  0021](adr/0021-decimal-semantics.md) PR D4b): a DECIMAL as a `CASE` value, `%` beyond 38 digits, and comparing a
-  DECIMAL with another type (an integer or DOUBLE expression, a DECIMAL of another precision or scale, a number DuckDB
-  types as DOUBLE). A scan that reads a DECIMAL column applies no predicate itself, so every `WHERE` condition of that
-  scan is evaluated by the `Filter` (`explain --analyze` shows no pushed predicate), and a condition on a DECIMAL column
-  skips no row group ([ADR 0021](adr/0021-decimal-semantics.md)).
+  0021](adr/0021-decimal-semantics.md) PR D4b): a DECIMAL `CASE` value without a DOUBLE value, `%` beyond 38 digits, and
+  comparing a DECIMAL with another type (an integer or DOUBLE expression, a DECIMAL of another precision or scale, a
+  number DuckDB types as DOUBLE). A scan that reads a DECIMAL column applies no predicate itself, so every `WHERE`
+  condition of that scan is evaluated by the `Filter` (`explain --analyze` shows no pushed predicate), and a condition
+  on a DECIMAL column skips no row group ([ADR 0021](adr/0021-decimal-semantics.md)).
 - Execution: the row groups of a query run on `--threads` threads (default: the hardware threads), 64Ki-row
   batches; their results are combined in file and row group order, so a result is the same for any number of
   threads, and deterministic. A DOUBLE `SUM` or `AVG` adds up every row group (per group with `GROUP BY`),

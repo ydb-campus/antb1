@@ -169,10 +169,18 @@ TEST(QueryGenerator, QueriesRespectTheSemanticsBothEnginesShare) {
       static const std::regex decimal_misuse(R"re(then "?[mw]\b|else "?[mw]\b)re");
       EXPECT_FALSE(std::regex_search(sql, decimal_misuse)) << q.sql;
       static const std::regex decimal_sum(R"re((sum|avg)\( ?"?[mw]"?\))re");
-      static const std::regex decimal_arithmetic(R"re("?\b[mw]\b"? ?[-+*] ?[0-9]+\b)re");
+      static const std::regex decimal_arithmetic(R"re("?\b[mw]\b"? ?[-+*] ?[0-9]+(?![.0-9]))re");
       static const std::regex decimal_division(R"re("?\b[mw]\b"? ?(/|//|%) ?[0-9])re");
-      static const std::regex decimal_literal_operand(
-          R"re("?\b[mwi]\b"? ?[-+*%] ?[0-9]+\.[0-9])re");
+      static const std::regex decimal_literal_operand(R"re("?\b[mw]\b"? ?[-+*%] ?[0-9]+\.[0-9])re");
+      // SUM and AVG never add the inexact doubles a division makes (their rounding follows the
+      // order of the additions), and a DECIMAL aggregate argument keeps its scale (no decimal
+      // literal: HAVING writes literals of the column's scale, D13).
+      static const std::regex summed_division(
+          R"re((sum|avg)\((distinct )?"?([mw]"? ?//? ?[0-9]|i"? ?(/ ?1\.5|// ?2\.5)))re");
+      static const std::regex aggregated_decimal_literal(
+          R"re((sum|avg|min|max|count)\((distinct )?"?[mw]"? ?[-+*%] ?[0-9]+\.)re");
+      EXPECT_FALSE(std::regex_search(sql, summed_division)) << q.sql;
+      EXPECT_FALSE(std::regex_search(sql, aggregated_decimal_literal)) << q.sql;
       static const std::regex decimal_constant(
           R"re((select|,) (-? ?(2\.5|0\.25)|007\.50|\.125)( |,|$))re");
       decimal_sums += std::regex_search(sql, decimal_sum) ? 1 : 0;
@@ -261,6 +269,7 @@ TEST(QueryGenerator, DecimalDataRangesKeepSumsAndArithmeticInTheirTypes) {
   static const std::regex h_sum(R"re((sum|avg)\((distinct )?"?h\b)re");
   static const std::regex h_constant(R"re("?\bh\b"? ?[-+*] ?[0-9])re");
   static const std::regex h_negated(R"re(- ?"?h\b)re");
+  static const std::regex h_division(R"re("?\bh\b"? ?(/|//|%) ?[0-9])re");
   static const std::regex x_times(R"re("?\bx\b"? ?\* ?[0-9])re");
   static const std::regex h_wide_modulo(R"re("?\bh\b"? ?% ?2\.5)re");
   static const std::regex x_plus(R"re("?\bx\b"? ?[-+] ?[0-9])re");
@@ -268,6 +277,7 @@ TEST(QueryGenerator, DecimalDataRangesKeepSumsAndArithmeticInTheirTypes) {
   static const std::regex y_hundred(R"re("?\by\b"? ?[-+] ?100\b)re");
   static const std::regex y_small(R"re("?\by\b"? ?[-+] ?[17]\b)re");
   int h_negations = 0;
+  int h_divisions = 0;
   int x_additions = 0;
   int x_sums = 0;
   int y_additions = 0;
@@ -283,11 +293,13 @@ TEST(QueryGenerator, DecimalDataRangesKeepSumsAndArithmeticInTheirTypes) {
     EXPECT_FALSE(std::regex_search(sql, h_wide_modulo)) << q.sql;
     EXPECT_FALSE(std::regex_search(sql, y_hundred)) << q.sql;
     h_negations += std::regex_search(sql, h_negated) ? 1 : 0;
+    h_divisions += std::regex_search(sql, h_division) ? 1 : 0;
     x_additions += std::regex_search(sql, x_plus) ? 1 : 0;
     x_sums += std::regex_search(sql, x_sum) ? 1 : 0;
     y_additions += std::regex_search(sql, y_small) ? 1 : 0;
   }
   EXPECT_GT(h_negations, 10);
+  EXPECT_GT(h_divisions, 10);
   EXPECT_GT(x_additions, 10);
   EXPECT_GT(x_sums, 10);
   EXPECT_GT(y_additions, 10);

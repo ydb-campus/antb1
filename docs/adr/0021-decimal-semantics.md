@@ -105,7 +105,7 @@ This amends ADR 0012's list of unsupported constructs and three points of ADR 00
    - A DECIMAL operand becomes a double as DuckDB converts it: v / 10^s when |v| ≤ 2^53 or s = 0, otherwise
      (v div 10^s) + (v mod 10^s) / 10^s, where div and mod truncate toward zero and each part is converted on its
      own. This two-step conversion is not always correctly rounded. For p > 18 DuckDB converts a 128-bit integer
-     with its own formula, which antb1 already reproduces for FLOAT comparisons (`src/plan/literal.cc`).
+     with its own formula, which antb1 reproduces in `src/common/int128.cc`.
    - `/` divides as for DOUBLE: a zero divisor gives `inf`, `-inf` or NaN.
    - `//` on a DECIMAL is the same division, not truncated, and NULL for a zero divisor: `price // 4` is 3.0625
      when `price` is 12.25.
@@ -150,7 +150,7 @@ This amends ADR 0012's list of unsupported constructs and three points of ADR 00
     as for HUGEINT, so with values near 10^38 whether a sum fails can depend on the order of the rows and the parts.
 13. **AVG** of DECIMAL(p,s) is DOUBLE. `AVG(price)` is computed as DuckDB computes it, with the same C types:
     - the exact sum, converted to `long double` with DuckDB's 128-bit formula (lower + upper × 2^64 from its two
-      64-bit halves, with upper = -1 handled separately, as `src/plan/literal.cc` already does in double), divided
+      64-bit halves, with upper = -1 handled separately, as `src/common/int128.cc` does), divided
       by the count times 10^s (also in `long double`, with 10^s first rounded to a double), then rounded to double;
       for p ≤ 4 DuckDB computes the same in double;
     - `long double` differs by platform (x87 80-bit on x86-64 Linux, 64-bit on arm64 macOS) exactly as it does in

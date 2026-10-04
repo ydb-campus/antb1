@@ -261,10 +261,9 @@ arrow::Result<DecimalOperand> ReadDecimalOperand(const arrow::Array& array, plan
   return operand;
 }
 
-// Rescales the operand to the result's scale, as DuckDB casts it to the result type first (for +
-// and
-// -): every value must fit the result's width, else DuckDB's conversion error for the first that
-// does not.
+// Rescales the operand to the result's scale, as DuckDB casts it to the result type first (for +,
+// - and %): every value must fit the result's width, else DuckDB's conversion error for the first
+// that does not.
 arrow::Status RescaleOperand(DecimalOperand& operand, plan::LogicalType result) {
   const bool decimal = operand.type == plan::LogicalType::kDecimal;
   const int from_scale = decimal ? operand.type.scale() : 0;
