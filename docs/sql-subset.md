@@ -130,14 +130,15 @@ are the same expression.
   constant expressions (`/`, `//`, `%`, decimals) are unsupported. DuckDB compares the three values of a `BETWEEN` in
   one common type and antb1 each comparison in its own, so when a bound is `DOUBLE` (a `DOUBLE` column, a literal
   with an exponent or of more than 38 digits) and the operand is not, a `BETWEEN` that also has a `BIGINT` or
-  `HUGEINT` value (a column, a literal or a folded constant of that type), a `FLOAT` column, or a decimal literal and
-  an integer value is unsupported; one that mixes a `VARCHAR` value with a `DATE` or `TIMESTAMP` value is a bind
-  error, as in DuckDB. As in DuckDB, every unary minus directly over an integer literal (through
-  any nesting) belongs to the literal, so `-(-9223372036854775808)` is a `HUGEINT`, not an overflow, and
-  `-(-(-9223372036854775808))` a `BIGINT`. A plain `BETWEEN` in the `AND` chain of `WHERE` or
-  `HAVING` is its two comparisons, each folded and, over a table column, pushed into the scan like any comparison;
-  `NOT BETWEEN`, `NOT (a BETWEEN ...)` and `BETWEEN` under `OR` or in `CASE` are compound conditions. DuckDB's names
-  apply: `(a BETWEEN 1 AND 2)`, and both negations `(NOT (a BETWEEN 1 AND 2))`;
+  `HUGEINT` value (a column, a literal or a folded constant of that type), a `FLOAT` column, a decimal literal and
+  an integer value, or a DECIMAL value that antb1 would compare exactly (a DECIMAL operand with a bound that is not
+  `DOUBLE`, or a DECIMAL column or expression as a bound: `price BETWEEN 1e0 AND 5`) is unsupported; one that mixes
+  a `VARCHAR` value with a `DATE` or `TIMESTAMP` value is a bind error, as in DuckDB. As in DuckDB, every unary minus
+  directly over an integer literal (through any nesting) belongs to the literal, so `-(-9223372036854775808)` is a
+  `HUGEINT`, not an overflow, and `-(-(-9223372036854775808))` a `BIGINT`. A plain `BETWEEN` in the `AND` chain of
+  `WHERE` or `HAVING` is its two comparisons, each folded and, over a table column, pushed into the scan like any
+  comparison; `NOT BETWEEN`, `NOT (a BETWEEN ...)` and `BETWEEN` under `OR` or in `CASE` are compound conditions.
+  DuckDB's names apply: `(a BETWEEN 1 AND 2)`, and both negations `(NOT (a BETWEEN 1 AND 2))`;
 - any of these in parentheses (`(a)`, `SUM((a))`, `WHERE (a = 1 AND b = 2)`), which group without changing
   anything.
 
@@ -275,8 +276,11 @@ items).
   DuckDB; a bare name is an alias first, see above). A `GROUP BY` or `ORDER BY` expression without a column (`1 + 1`)
   is unsupported.
 - Comparisons of two operands (`a < b`, `a + 1 = b * 2`) compare numbers in their common type, VARCHAR with VARCHAR
-  and DATE with DATE; any other pair is a bind error. A comparison of an operand with a literal folds the literal into
-  the operand's type, as for a column.
+  and DATE with DATE; any other pair is a bind error (a number or DECIMAL against a VARCHAR or DATE operand: divergence
+  D4). A DECIMAL compares with a DECIMAL of any precision and scale and with an integer exactly by value, and with a
+  DOUBLE in DOUBLE, the DECIMAL converted as DuckDB converts it ([ADR 0021](adr/0021-decimal-semantics.md) rule 11;
+  DuckDB compares in a DECIMAL capped at 38 digits instead, divergence D13). A comparison of an operand with a literal
+  folds the literal into the operand's type, as for a column.
 - `LIMIT n` and `OFFSET m` take integers from 0 to 9223372036854775807, in either order.
 
 Literals in `WHERE` and `HAVING` must fit the column's (or the aggregate's) type; any other combination is a bind
@@ -285,7 +289,7 @@ error that points at the literal:
 | Column type | Literals | Compared as |
 | --- | --- | --- |
 | SMALLINT, INTEGER, BIGINT, USMALLINT, HUGEINT | integer, decimal | exactly, after folding (below) |
-| DECIMAL(p,s) | integer, decimal | exactly, after folding into the column's scale (below); a number DuckDB types as DOUBLE is unsupported (exit code 4) |
+| DECIMAL(p,s) | integer, decimal | exactly, after folding into the column's scale (below); a number DuckDB types as DOUBLE (an exponent, more than 38 digits, an integer beyond 2^128 - 1), and in an `IN` list with one every number, in DOUBLE: the literal as DuckDB converts it to DOUBLE, the column as DuckDB converts a DECIMAL (Semantics, DECIMAL) |
 | DOUBLE | integer, decimal | the nearest double, as in DuckDB for a DOUBLE column, except a decimal of at most 38 digits, which DuckDB types as DECIMAL and converts with its own two-step cast (Semantics, DECIMAL); beyond the double range `inf` or `-inf`, below the smallest subnormal `0`. A column stored as FLOAT is compared as DuckDB compares it: an integer or DECIMAL literal becomes the FLOAT that DuckDB casts it to, with DuckDB's rounding (`0.1` is `0.1F`; `16777217.5` and some long spellings of `0.1`, such as 16 or 24 decimals, are not the nearest FLOAT, and HUGEINT literals are rounded through a double), beyond the FLOAT range `inf` or `-inf`; a number DuckDB types as DOUBLE compares with the nearest double |
 | VARCHAR | string | bytes; `LIKE` and `NOT LIKE` take a string pattern (only a VARCHAR column: LIKE on another type is a bind error, as in DuckDB) |
 | DATE | string, `DATE` string, date cast | a date written exactly `YYYY-MM-DD` (years 0000 to 9999) that exists in the calendar |
@@ -307,9 +311,13 @@ A comparison of an integer column with a number is folded exactly at bind time, 
 - A DECIMAL(p,s) column folds the same way in units of its scale: the number is multiplied by 10^s exactly, a
   remainder moves it to the side the comparison keeps, and the range is -(10^p - 1) to 10^p - 1 units. On
   DECIMAL(15,2), `c <= 12.345` becomes `c <= 12.34`, `c >= 12.345` becomes `c >= 12.35`, `c = 12.345` is never true,
-  and `c < 10000000000000` is true for every value. DuckDB compares in a DECIMAL capped at 38 digits instead
-  (divergence D13). A number DuckDB types as DOUBLE (an exponent, or more than 38 digits) is unsupported for a
-  DECIMAL column (exit code 4), as is a comparison with an expression of another type.
+  and `c < 10000000000000` is true for every value, as is `c < 100000000000000000000000000000000000000`. DuckDB
+  compares in a DECIMAL capped at 38 digits instead, where such an integer of 38 digits or more fails to cast
+  (divergence D13).
+- A number DuckDB types as DOUBLE (an exponent, more than 38 digits, an integer beyond 2^128 - 1) is not folded into
+  a DECIMAL column: DuckDB compares them in DOUBLE, so does antb1, with the column converted as DuckDB converts a
+  DECIMAL (`c = 1e-1` holds for 0.10, and a DECIMAL(38,10) value of 9007199254740993.5 equals `9007199254740992e0`).
+  An `IN` list with such a number compares every value in DOUBLE.
 
 ## Logical plans and EXPLAIN
 
@@ -343,7 +351,8 @@ implements its kind. A rule optimizer then rewrites the plan, through both input
 `antb1 explain` prints the optimized plan: an `Output:` line with the result names and types, then one line per
 node from the root down, each input indented by two more spaces. Names that are not plain identifiers are
 double-quoted, and bytes outside printable ASCII are written as `\xHH`. A folded constant prints in its operand's
-type: against a DECIMAL column with the column's scale (`p <= 12.34`, `d IN (1.25, 5.00)`):
+type: against a DECIMAL column with the column's scale (`p <= 12.34`, `d IN (1.25, 5.00)`); a DECIMAL column compared
+in DOUBLE shows its conversion (`CAST(p AS DOUBLE) > 10`):
 
 ```text
 Output: count_star():BIGINT width:HUGEINT
@@ -444,10 +453,13 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   Registering two tables whose names differ only in case is a usage error (exit code 2). A name that matches two
   columns differing only in case is a bind error.
 - Literals: comparisons of a column with a literal are folded exactly at bind time, never through a lossy cast
-  ([Binding](#binding)). A literal outside the column type's range turns the comparison into constant true or false
-  for non-NULL values; NULL values still compare as NULL. A decimal literal compared with an integer column becomes
-  an equivalent integer comparison: `c > 1.5` becomes `c >= 2`, and `c = 1.5` is never true.
-- WHERE: the comparisons are evaluated with Arrow's comparison kernels and combined with Kleene AND; a row passes
+  ([Binding](#binding)), except that a DECIMAL compares with a number DuckDB types as DOUBLE in DOUBLE, as DuckDB
+  does. A literal outside the column type's range turns the comparison into constant true or false for non-NULL
+  values; NULL values still compare as NULL. A decimal literal compared with an integer column becomes an
+  equivalent integer comparison: `c > 1.5` becomes `c >= 2`, and `c = 1.5` is never true.
+- WHERE: the comparisons are evaluated with Arrow's comparison kernels (a DECIMAL against a DECIMAL of another scale
+  or an integer exactly by its unscaled values, against a DOUBLE after DuckDB's conversion) and combined with Kleene
+  AND; a row passes
   only when every comparison is true, so a comparison that is NULL rejects it. `OR` and `NOT` follow SQL's
   three-valued logic too (`NULL OR TRUE` is true, `NOT NULL` is NULL); a comparison folded to always or never true
   is still NULL for a NULL operand there, so `NOT (smallint_col = 1.5)` rejects NULL and keeps every other row.
@@ -463,7 +475,9 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   dropped, and without values `IN` is `FALSE` and `NOT IN` is `IS NOT NULL`. DuckDB gives the list one type: when a
   number in it types as DOUBLE (an exponent, or more than 38 digits), every number is read as a double, so an integer
   column compares with the nearest doubles (divergence D7) and a FLOAT column in DOUBLE (`f IN (0.1, 1e0)` does not
-  match the FLOAT `0.1`, while `f IN (0.1, 2)` does). NaN is not equal to NaN, as for `=`
+  match the FLOAT `0.1`, while `f IN (0.1, 2)` does). A DECIMAL column then compares in DOUBLE with every value, each
+  converted as DuckDB converts it (a decimal literal as its DECIMAL, a HUGEINT literal through DuckDB's 128-bit
+  formula), and an integer beyond 2^128 - 1 makes its list DOUBLE too. NaN is not equal to NaN, as for `=`
   (divergence D10).
 - LIKE: `%` matches any sequence of characters (none included), `_` exactly one character, and every other byte
   itself; the match is case-sensitive and there is no escape character (`\` is a literal byte), as in DuckDB. A
@@ -548,7 +562,9 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
 - DECIMAL: a DECIMAL(p,s) value is an exact integer of at most p digits, the unscaled value, times 10^-s ([ADR
   0021](adr/0021-decimal-semantics.md)). Comparisons with numbers (`=`, `<>`, `<`, `IN`, `BETWEEN`), `ORDER BY`, `GROUP
   BY`, `COUNT(DISTINCT)`, `MIN` and `MAX` use the unscaled value; `MIN` and `MAX` keep DECIMAL(p,s), `COUNT` is BIGINT.
-  Two DECIMAL operands compare only when both are the same DECIMAL(p,s). `+`, `-` and `*` compute exactly in their
+  A DECIMAL compares with a DECIMAL of another precision or scale and with an integer exactly by value (the side with
+  the smaller scale scaled up, never rounded, at any number of digits), and with a DOUBLE (a column, an expression, a
+  number DuckDB types as DOUBLE) in DOUBLE after the conversion below. `+`, `-` and `*` compute exactly in their
   result type (Binding): an operand of `+` or `-` with a smaller scale is first rescaled to it, and a value that does
   not fit fails the query with DuckDB's conversion error (`Casting value "..." to type DECIMAL(38,10) failed: value is
   out of range! when casting from source column d`, or `Could not cast value ... to DECIMAL(...)` for an integer); a
@@ -567,9 +583,10 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   converted on its own (a value beyond 18 digits through the 128-bit formula); this is not always the nearest double
   (`9007199254740993.5` becomes 2^53). `/` then divides as for DOUBLE (`inf`, `-inf` or NaN for a zero divisor), and
   `//` is the same division, NULL for a zero divisor. Not supported yet (exit code 4, [ADR
-  0021](adr/0021-decimal-semantics.md) PR D4b): a DECIMAL `CASE` value without a DOUBLE value, `%` beyond 38 digits, and
-  comparing a DECIMAL with another type (an integer or DOUBLE expression, a DECIMAL of another precision or scale, a
-  number DuckDB types as DOUBLE). A scan that reads a DECIMAL column applies no predicate itself, so every `WHERE`
+  0021](adr/0021-decimal-semantics.md) PR D4c): a DECIMAL `CASE` value without a DOUBLE value and `%` beyond 38 digits;
+  and, for good, a `BETWEEN` that mixes a DOUBLE value with DECIMAL values that antb1 would compare exactly (Syntax). A
+  DECIMAL against a VARCHAR or DATE operand that is no literal is a bind error, as for any number (divergence D4). A
+  scan that reads a DECIMAL column applies no predicate itself, so every `WHERE`
   condition of that scan is evaluated by the `Filter` (`explain --analyze` shows no pushed predicate), and a condition
   on a DECIMAL column skips no row group ([ADR 0021](adr/0021-decimal-semantics.md)).
 - Execution: the row groups of a query run on `--threads` threads (default: the hardware threads), 64Ki-row
@@ -637,16 +654,16 @@ compare against DuckDB, so an unregistered difference is a bug.
 | D1 | Files with different schemas | a table (or a `FROM '<glob>'`) whose files have different Parquet schemas is an I/O error, exit code 3: `schema of '<file>' differs from '<first file>'` | `read_parquet` over the same files reads them and answers | an `onlyif antb1` record in `tests/slt/cases/basic/errors.slt`; `integration.ParquetErrors.*` (mismatched and mixed schemas); the CLI golden `io_schema_mismatch`; every table in `tests/slt/tables.txt` has a single schema |
 | D2 | Column-type overrides | `--clickbench` and `--column-type COL=DATE` apply to every table with that column, including tables opened with `FROM '<path>'` | the oracle applies `make_date(EventDate)` only to the named tables with the `clickbench` option in `tests/slt/tables.txt`; `FROM '<path>'` reads the raw integers | the runner rejects a table list where some tables with an `EventDate` column have the option and others do not; the random generator never reads an overridden column through `FROM '<path>'`; `.slt` records read `EventDate` only through table names |
 | D3 | Literal types | a string literal compared with a numeric or DECIMAL column is a bind error | casts the string to the column's type | `onlyif antb1` records in `tests/slt/cases/basic/bind_errors.slt`; the query generator writes numbers for numeric and DECIMAL columns |
-| D4 | Literal types | a number or a `DATE` literal (also written as a cast) compared with a VARCHAR column is a bind error | casts the column's values at run time (a conversion error unless every value converts) | as D3, and in `tests/slt/cases/where/cast_date.slt`; the generator writes strings for VARCHAR columns |
+| D4 | Literal types | a number or a `DATE` literal (also written as a cast) compared with a VARCHAR column is a bind error, and so is a number (a DECIMAL too) compared with a VARCHAR or DATE operand that is no literal | casts the column's values at run time (a conversion error unless every value converts); with `=`, `<>` and `IN` it casts a VARCHAR operand to the number, and a DECIMAL against a DATE operand fails only when a row is compared | as D3, and in `tests/slt/cases/where/cast_date.slt`; `plan.Expressions/BindErrorTest` pins the operand errors (`h = s`, `h = dt`); the generator writes strings for VARCHAR columns and compares a DECIMAL column only with columns of numbers |
 | D5 | Date and timestamp literals | a date must be written exactly `YYYY-MM-DD` (also in a cast to DATE), a timestamp exactly as in the literal table (two-digit fields, one space or `T`, hours 00 to 23) | also accepts `2013-7-1`, surrounding spaces and a time of day for a DATE, and single-digit fields, spaces and `24:00:00` for a TIMESTAMP | as D4; the generator writes `YYYY-MM-DD` and `YYYY-MM-DD HH:MM:SS` |
-| D7 | DOUBLE literals and BIGINT | a number that DuckDB types as DOUBLE (an exponent, or more than 38 digits) is rounded to the nearest double like in DuckDB, then compared exactly with the integer column; in an `IN` list with such a number every value is rounded so | converts BIGINT (and HUGEINT) values to DOUBLE for the comparison, so values beyond 2^53 compare rounded: `i64 >= 9223372036854775808e0` holds for `9223372036854775807` | the `.slt` records with such literals avoid BIGINT values beyond 2^53 (`tests/slt/cases/where/folding.slt`); `plan.ApproximateNumbers/FoldThroughBinderTest.*` pins antb1's folding; the generator writes no exponents |
+| D7 | DOUBLE literals and BIGINT | a number that DuckDB types as DOUBLE (an exponent, or more than 38 digits) is rounded to the nearest double like in DuckDB, then compared exactly with the integer column; in an `IN` list with such a number every value is rounded to the nearest double, a decimal literal too, and an integer beyond 2^128 - 1 does not make the list DOUBLE | converts BIGINT (and HUGEINT) values to DOUBLE for the comparison, so values beyond 2^53 compare rounded: `i64 >= 9223372036854775808e0` holds for `9223372036854775807`; in a DOUBLE `IN` list a decimal literal converts as its DECIMAL (`9007199254740993.5` becomes 2^53), and an integer beyond 2^128 - 1 is DOUBLE as well | the `.slt` records with such literals avoid BIGINT values beyond 2^53 (`tests/slt/cases/where/folding.slt`); `plan.ApproximateNumbers/FoldThroughBinderTest.*` and `plan.BinderTest.In` pin antb1's folding; the generator writes no exponents for integer columns |
 | D8 | Result names | an aggregate's argument is quoted when it is not a plain identifier or is a reserved word | also quotes non-reserved keywords (`sum("year")`) | the tests compare values and types, not names |
 | D9 | HUGEINT range | HUGEINT is decimal128(38, 0): a `SUM`, or arithmetic on a `SUM`, outside -(10^38 - 1) to 10^38 - 1 is an execution error (exit code 1). An integer SUM over BIGINT or smaller types cannot reach it | HUGEINT holds -(2^127 - 1) to 2^127 - 1 | no column is HUGEINT (a DECIMAL(38, 0) column is DECIMAL); `exec.AggregateStateTest.HugeIntSumIsCheckedAgainstTheRange` checks the error |
 | D10 | NaN | MIN and MAX ignore NaN like Arrow's `min_max`, whatever the batch and file boundaries: they return NaN only when every selected non-NULL value is NaN (so only MAX over NaN and other values differs from DuckDB). Arrow's comparison kernels follow IEEE 754: NaN compares unequal to everything, so `d > 1` and `d >= 1` are false for NaN, and `d IN (...)` never matches it | orders NaN above every other value and equal to itself: MIN and MAX return NaN when it is the extreme, `d > 1` is true for NaN | the fixtures contain no NaN (fixturegen builds doubles from integer ratios); `exec.AggregateStateTest.MinMaxOfDoublesIgnoreNaNInEveryBatchSplit` and `engine.SessionTest.MinMaxIgnoreNaNAcrossBatchesAndFiles` pin antb1's MIN and MAX |
 | D11 | FLOAT columns | read as DOUBLE (widened exactly): results of FLOAT columns are DOUBLE and print with double precision; `WHERE` compares like DuckDB (see Binding); arithmetic on them, and comparing them with other expressions, is unsupported (exit code 4) | keeps FLOAT (`MIN`, `MAX` and projections return FLOAT) | the random generator never references a FLOAT column (`ColumnOf` in `tests/slt/runner/query_gen.cc`, `harness.LoadGenTables.SkipsFloatColumns`); `tests/slt/cases/where/float.slt` selects only other columns, and `engine.SessionTest.FloatColumnsCompareLikeDuckDb` pins that results stay DOUBLE |
 | D12 | HUGEINT literals against DOUBLE | an integer literal beyond BIGINT compared with a DOUBLE column is the correctly rounded nearest double (a decimal literal converts as DuckDB converts a DECIMAL, [ADR 0021](adr/0021-decimal-semantics.md) rule 8: `9007199254740993.5` is 2^53 in both engines) | converts a HUGEINT literal through its 128-bit formula (lower + upper × 2^64), which can be one ulp off | the generator writes DOUBLE columns only their own sample values and short decimals (`DoubleText` and `ExactDecimalDouble` in `tests/slt/runner/query_gen.cc`); `plan.BinderTest` pins the decimal conversion and `tests/slt/cases/types/decimal_literals.slt` compares it with DuckDB |
-| D13 | Decimals with many digits against integer and DECIMAL columns | compared exactly | compares in a DECIMAL whose width is capped at 38 digits: when the column type's digits plus the literal's decimals exceed 38, a column value with too many integer digits fails the query with a conversion error (`i16 = 1.0000000000000000000000000000000000001` over the value -32768); likewise an integer `SUM` (HUGEINT, 38 digits) in `HAVING` against any decimal fails once the sum has more digits than 38 minus the literal's decimals, and a DECIMAL(p,s) column against a literal with more than s decimals or more than p - s integer digits once their total exceeds 38 (`d38_10 > 0.00000000001` over a value of 28 integer digits) | the `.slt` records and the generator keep literals short enough (`DecimalText` in `tests/slt/runner/query_gen.cc`), and `tests/slt/cases/types/decimal.slt` pins both answers; `plan.Binder/FoldThroughBinderTest.*` and `plan.Binder/FoldDecimalTest.*` cover the exact folding |
-| D14 | Overflows DuckDB's optimizer does not avoid | a comparison that folds to always-true or never-true at bind time (a literal outside the operand's type, as in `smallint_col + 1 > 40000`, or a DECIMAL result's, as in `price * qty > 100000000000000000000` on DECIMAL(15,2) columns) computes nothing, so it cannot overflow | computes the operand and fails on an overflow ("Overflow in addition of INT16") | the random generator never writes arithmetic that can overflow; `plan.BinderTest.WhereMovesConstantsLikeDuckDb` pins which comparisons move their constants |
+| D13 | Decimals with many digits against integer and DECIMAL values | compared exactly, and a literal beyond the operand's type folds to a constant | compares in a DECIMAL whose width is capped at 38 digits: when the column type's digits plus the literal's decimals exceed 38, a column value with too many integer digits fails the query with a conversion error (`i16 = 1.0000000000000000000000000000000000001` over the value -32768); likewise an integer `SUM` (HUGEINT, 38 digits) in `HAVING` against any decimal fails once the sum has more digits than 38 minus the literal's decimals, and a DECIMAL(p,s) column against a literal with more than s decimals or more than p - s integer digits once their total exceeds 38 (`d38_10 > 0.00000000001` over a value of 28 integer digits). Two operands that are no literals fail the same way, in comparisons, `IN` lists and `BETWEEN`: a DECIMAL against a DECIMAL of another scale or an integer, once a value of the side with the smaller scale has more integer digits than 38 minus the larger scale (`d9_2 < d38_0` over d38_0's extremes, a DECIMAL(38,2) against a DECIMAL(38,12) past 26 integer digits). An integer literal of 38 digits or more against a DECIMAL (`p < 100000000000000000000000000000000000000`), and one of 2^127 to 2^128 - 1 (UHUGEINT) against an integer column, fails to cast on any input that reaches it | the `.slt` records and the generator keep literals short enough (`DecimalText` in `tests/slt/runner/query_gen.cc`) and compare two columns only while their common type stays within 38 digits (`ColumnComparison`); `tests/slt/cases/types/decimal.slt` and `decimal_comparisons.slt` pin both answers; `plan.Binder/FoldThroughBinderTest.*` and `plan.Binder/FoldDecimalTest.*` cover the exact folding, `exec.DecimalTest.CompareExactIsExactAcrossScalesAndIntegers` the exact comparison |
+| D14 | Overflows DuckDB's optimizer does not avoid | a comparison that folds to never-true at bind time (a literal outside the operand's type, as in `smallint_col + 1 > 40000`, or a DECIMAL result's, as in `price * qty > 100000000000000000000` on DECIMAL(15,2) columns) computes nothing, so it cannot overflow; one that folds to always-true keeps `IS NOT NULL` over its operand, which is computed | computes the operand and fails on an overflow ("Overflow in addition of INT16") | the random generator never writes arithmetic that can overflow; `plan.BinderTest.WhereMovesConstantsLikeDuckDb` pins which comparisons move their constants |
 | D15 | VARCHAR bytes that are not UTF-8 | answers: `strlen` counts every byte, and `regexp_replace` runs RE2 over the bytes as UTF-8, where an invalid byte never matches (not even `.` or `[^a]`) and stays in the result | cannot read such a value as VARCHAR: reading an unannotated BYTE_ARRAY column (`binary_as_string`) with it fails the query ("Invalid string encoding") | every fixture string is valid UTF-8, so the oracle tests never meet it; `exec.ComputeTest.StringFunctions` pins antb1's behavior |
 | D16 | Evaluation order in conditions | computes the arguments of `AND` and `OR` in the order written, each only for the rows still undecided, and a WHERE conjunct's operands for every row; so an overflow inside a condition fails exactly when a row reaches it in that order | may reorder conjunctions by its cost model, and computes the argument of a `NOT` for every row, so an overflow can fail in one engine and not the other (`NOT (x < 100 AND x * x > 0)` fails in DuckDB) | the random generator never writes arithmetic that can overflow; `exec.ComputeTest.ConditionsAreThreeValued` pins antb1's order |
 | D17 | Overflows in constant expressions | a constant integer expression on a side of a comparison or a `BETWEEN` bound that overflows its type (`a > 2147483647 + 1`) is a bind error, whatever the table holds | raises the overflow only when a row computes it: an empty table, or one whose rows another conjunct rejects first, answers | `plan.Expressions/BindErrorTest` pins the errors; `tests/slt/cases/where/between.slt` has the error on a table both engines fail on and, `onlyif antb1`, on the empty table |
