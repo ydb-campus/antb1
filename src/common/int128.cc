@@ -1,7 +1,9 @@
 #include "antb1/common/int128.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -67,7 +69,55 @@ Real DuckDbHugeintToReal(Int128 value) {
          (static_cast<Real>(upper) * (static_cast<Real>(kUint64Max) + 1));
 }
 
+// DuckDB's NumericHelper::DOUBLE_POWERS_OF_TEN: correctly rounded doubles.
+constexpr std::array<double, 39> kDoublePowersOfTen = {
+    1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,  1e10, 1e11, 1e12,
+    1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22, 1e23, 1e24, 1e25,
+    1e26, 1e27, 1e28, 1e29, 1e30, 1e31, 1e32, 1e33, 1e34, 1e35, 1e36, 1e37, 1e38};
+
+// DuckDB's cast of a DECIMAL's storage integer: int16/int32/int64 directly (a width up to 18), a
+// hugeint through DOUBLE (also for FLOAT).
+template <class Real>
+Real DuckDbStorageToReal(Int128 value, int width) {
+  if (width <= 18) {
+    return static_cast<Real>(static_cast<int64_t>(value));
+  }
+  return static_cast<Real>(DuckDbHugeintToReal<double>(value));
+}
+
+// DuckDB's TryCastDecimalToFloatingPoint<SRC, Real>.
+template <class Real>
+Real DuckDbDecimalToReal(Int128 unscaled, int width, int scale) {
+  ANTB1_CHECK(scale >= 0);
+  ANTB1_CHECK(scale <= 38);
+  // MAX_INT_REPRESENTABLE_IN_FLOAT / _IN_DOUBLE.
+  constexpr auto kMaxExact =
+      static_cast<Int128>(UInt128{1} << static_cast<unsigned>(std::numeric_limits<Real>::digits));
+  const auto power = static_cast<Real>(kDoublePowersOfTen.at(static_cast<std::size_t>(scale)));
+  // int16 storage (width <= 4) is always "representable exactly" in DuckDB.
+  if (width <= 4 || scale == 0 || (unscaled <= kMaxExact && unscaled >= -kMaxExact)) {
+    return DuckDbStorageToReal<Real>(unscaled, width) / power;
+  }
+  Int128 pow10 = 1;
+  for (int i = 0; i < scale; ++i) {
+    pow10 *= 10;
+  }
+  const Int128 div = unscaled / pow10;  // truncating, as in C++ and DuckDB
+  const Int128 mod = unscaled % pow10;
+  return DuckDbStorageToReal<Real>(div, width) + (DuckDbStorageToReal<Real>(mod, width) / power);
+}
+
 }  // namespace
+
+double DuckDbHugeintToDouble(Int128 value) { return DuckDbHugeintToReal<double>(value); }
+
+double DuckDbDecimalToDouble(Int128 unscaled, int width, int scale) {
+  return DuckDbDecimalToReal<double>(unscaled, width, scale);
+}
+
+float DuckDbDecimalToFloat(Int128 unscaled, int width, int scale) {
+  return DuckDbDecimalToReal<float>(unscaled, width, scale);
+}
 
 double DuckDbDecimalAverage(Int128 sum, int64_t count, int width, int scale) {
   ANTB1_CHECK(count > 0);

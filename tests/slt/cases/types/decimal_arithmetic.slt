@@ -197,9 +197,8 @@ SELECT SUM(d38_0) FROM decimals WHERE id = 7 OR id = 8
 ----
 100000000000000000099999999999999999999
 
-# Not supported yet (exit 4): / // % of a DECIMAL and decimal literals in arithmetic.
+# / and % of a DECIMAL and decimal literals in arithmetic (more in decimal_literals.slt).
 
-onlyif duckdb
 query R rowsort
 SELECT p / 2 FROM decimals WHERE id >= 30
 ----
@@ -214,7 +213,6 @@ SELECT p / 2 FROM decimals WHERE id >= 30
 NULL
 NULL
 
-onlyif duckdb
 query D rowsort
 SELECT p % 7 FROM decimals WHERE id >= 30
 ----
@@ -229,7 +227,6 @@ SELECT p % 7 FROM decimals WHERE id >= 30
 NULL
 NULL
 
-onlyif duckdb
 query D rowsort
 SELECT p + 0.5 FROM decimals WHERE id >= 30
 ----

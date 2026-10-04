@@ -113,8 +113,8 @@ std::string ArgumentName(std::string_view name) {
   return out + "\"";
 }
 
-// DuckDB's name of a literal inside an expression: numbers as their value (a decimal as written),
-// strings quoted.
+// DuckDB's name of a literal inside an expression: numbers as their value (a DECIMAL as its value
+// prints, 007.50 as 7.50; a DOUBLE as written), strings quoted.
 std::string LiteralName(const sql::Literal& lit) {
   switch (lit.kind) {
     case sql::Literal::Kind::kInteger: {
@@ -125,6 +125,9 @@ std::string LiteralName(const sql::Literal& lit) {
       break;
     }
     case sql::Literal::Kind::kDecimal:
+      if (const auto decimal = ParseDecimalLiteral(lit.text, lit.negative)) {
+        return FormatDecimal(decimal->unscaled, decimal->type.width(), decimal->type.scale());
+      }
       break;
     case sql::Literal::Kind::kString:
     case sql::Literal::Kind::kDate:
@@ -1226,12 +1229,17 @@ arrow::Result<Predicate> BindEquality(const sql::Comparison& cmp, const BoundCol
       if (!number) {
         return mismatch("write a number without quotes");
       }
-      // Rounded to the nearest double, as DuckDB compares a DOUBLE column with a number.
+      // Rounded to the nearest double, as DuckDB compares a DOUBLE column with a number; a decimal
+      // literal is DuckDB's DECIMAL, converted as DuckDB converts one (ADR 0021 rule 8).
       const auto value = ParseDoubleLiteral(lit.text, lit.negative);
       if (!value.has_value()) {
         return BindError("invalid number " + Clip(lit.text), lit.span);
       }
       p.constant.value = *value;
+      if (const auto decimal = ParseDecimalLiteral(lit.text, lit.negative)) {
+        p.constant.value =
+            DuckDbDecimalToDouble(decimal->unscaled, decimal->type.width(), decimal->type.scale());
+      }
       // A FLOAT column: DuckDB casts an integer or DECIMAL literal to FLOAT and compares in FLOAT.
       // Widening that float to double is exact and keeps the order, so comparing the widened
       // column with it gives DuckDB's answer.
@@ -1314,8 +1322,9 @@ struct SelectList {
 
 // A constant select item with DuckDB's type and result name: an integer is INTEGER, BIGINT or
 // HUGEINT by its value (see below) and named by it ("-5"); a string is VARCHAR named with its
-// quotes ('it''s'); a date is DATE named CAST('2020-01-01' AS "DATE"). A decimal (DuckDB's
-// DECIMAL) and a number DuckDB types as DOUBLE are not supported.
+// quotes ('it''s'); a date is DATE named CAST('2020-01-01' AS "DATE"); a decimal is
+// DECIMAL(digits, fraction digits) named by its value (ADR 0021 rule 3). A number DuckDB types as
+// DOUBLE is not supported.
 arrow::Result<std::pair<Constant, std::string>> BindConstant(const sql::Literal& lit) {
   switch (lit.kind) {
     case sql::Literal::Kind::kInteger: {
@@ -1338,10 +1347,18 @@ arrow::Result<std::pair<Constant, std::string>> BindConstant(const sql::Literal&
       }
       return std::pair(Constant{.type = type, .value = value}, Int128ToString(value));
     }
-    case sql::Literal::Kind::kDecimal:
-      return UnsupportedError(
-          "decimal constants are not supported (DuckDB types them as DECIMAL, which antb1 lacks)",
-          lit.span);
+    case sql::Literal::Kind::kDecimal: {
+      // DECIMAL(digits, fraction digits) (ADR 0021 rule 3), named by its value.
+      const auto decimal = ParseDecimalLiteral(lit.text, lit.negative);
+      if (!decimal.has_value()) {
+        return UnsupportedError(
+            "a number with an exponent or more than 38 digits as a constant is not supported "
+            "(DuckDB types it DOUBLE)",
+            lit.span);
+      }
+      return std::pair(Constant{.type = decimal->type, .value = decimal->unscaled},
+                       LiteralName(lit));
+    }
     case sql::Literal::Kind::kString: {
       std::string name = "'";
       for (const char c : lit.text) {
@@ -1688,23 +1705,12 @@ LogicalType DecimalOfInteger(LogicalType type) {
   return LogicalType::Decimal(LogicalType::kMaxDecimalWidth, 0);  // HUGEINT
 }
 
-// DuckDB's type of `l <op> r` for + - * with a DECIMAL operand and the other a DECIMAL or an
-// integer (ADR 0021 rules 4 to 6): the width beyond 18 digits is capped to 18 while both operands
-// have at most 18 (DuckDB computes them in 64 bits), and to 38 beyond that.
-arrow::Result<LogicalType> DecimalArithType(ArithOp op, const Typed& l, const Typed& r,
-                                            SourceSpan span) {
-  for (const Typed* t : {&l, &r}) {
-    if (t->decimal) {
-      return UnsupportedError(
-          "arithmetic of a DECIMAL with a decimal literal is not supported (ADR 0021, D4)", span);
-    }
-    if (t->expr->type == LogicalType::kDouble) {
-      return UnsupportedError(
-          std::format("arithmetic of a DECIMAL with a DOUBLE ({}) is not supported (ADR 0021, D4)",
-                      DescribeOperand(*t)),
-          span);
-    }
-  }
+// DuckDB's type of `l <op> r` for + - * % with a DECIMAL operand (a decimal literal included) and
+// the other a DECIMAL or an integer (ADR 0021 rules 4 to 6 and 9): for + - * the width beyond 18
+// digits is capped to 18 while both operands have at most 18 (DuckDB computes them in 64 bits),
+// and to 38 beyond that; % takes the common type, which DuckDB makes DOUBLE beyond 38 digits.
+arrow::Result<LogicalType> DecimalArithType(sql::BinaryOp sql_op, ArithOp op, const Typed& l,
+                                            const Typed& r, SourceSpan span) {
   const auto decimal = [](LogicalType t) {
     return t == LogicalType::kDecimal ? t : DecimalOfInteger(t);
   };
@@ -1718,7 +1724,17 @@ arrow::Result<LogicalType> DecimalArithType(ArithOp op, const Typed& l, const Ty
   constexpr int kSmall = 18;  // DuckDB's 64-bit DECIMAL
   int width = 0;
   int scale = 0;
-  if (op == ArithOp::kMultiply) {
+  if (op == ArithOp::kModulo) {
+    scale = std::max(sa, sb);
+    width = std::max(pa - sa, pb - sb) + scale;
+    if (width > kMax) {
+      return UnsupportedError(
+          std::format("'{}' of {} and {} is not supported (DuckDB computes it in DOUBLE beyond 38 "
+                      "digits)",
+                      sql::ToString(sql_op), ToString(a), ToString(b)),
+          span);
+    }
+  } else if (op == ArithOp::kMultiply) {
     scale = sa + sb;
     if (scale > kMax) {
       return BindError(std::format("Needed scale {} to accurately represent the multiplication "
@@ -1754,13 +1770,6 @@ arrow::Result<LogicalType> ArithType(sql::BinaryOp sql_op, ArithOp op, const Typ
                                           Clip(t->expr->name), type),
                               span);
     }
-    if (t->expr->type == LogicalType::kDecimal &&
-        (op == ArithOp::kDivide || op == ArithOp::kIntegerDivide || op == ArithOp::kModulo)) {
-      return UnsupportedError(
-          std::format("'{}' of a DECIMAL ('{}' is {}) is not supported", sql::ToString(sql_op),
-                      Clip(t->expr->name), ToString(t->expr->type)),
-          span);
-    }
     if (t->expr->type == LogicalType::kDecimal) {
       continue;
     }
@@ -1777,23 +1786,16 @@ arrow::Result<LogicalType> ArithType(sql::BinaryOp sql_op, ArithOp op, const Typ
           span);
     }
   }
-  if (op == ArithOp::kDivide) {
+  // / is DOUBLE; so is anything with a DOUBLE, and // with a DECIMAL (a decimal literal included),
+  // whose DECIMAL operands convert as DuckDB converts them (ADR 0021 rule 8).
+  const bool any_decimal =
+      l.expr->type == LogicalType::kDecimal || r.expr->type == LogicalType::kDecimal;
+  if (op == ArithOp::kDivide || l.expr->type == LogicalType::kDouble ||
+      r.expr->type == LogicalType::kDouble || (any_decimal && op == ArithOp::kIntegerDivide)) {
     return LogicalType::kDouble;
   }
-  if (l.expr->type == LogicalType::kDecimal || r.expr->type == LogicalType::kDecimal) {
-    return DecimalArithType(op, l, r, span);
-  }
-  // A decimal literal is DuckDB's DECIMAL, not DOUBLE (though antb1 holds its value as a double).
-  const bool any_double = (l.expr->type == LogicalType::kDouble && !l.decimal) ||
-                          (r.expr->type == LogicalType::kDouble && !r.decimal);
-  if ((l.decimal || r.decimal) && !any_double && op != ArithOp::kIntegerDivide) {
-    return UnsupportedError(
-        "arithmetic of a decimal literal with an integer is not supported (DuckDB computes it in "
-        "DECIMAL, which antb1 lacks)",
-        span);
-  }
-  if (any_double || l.decimal || r.decimal) {
-    return LogicalType::kDouble;
+  if (any_decimal) {
+    return DecimalArithType(sql_op, op, l, r, span);
   }
   LogicalType type = LogicalType::kHugeInt;
   if (l.literal && !r.literal && Fits(*l.expr, r.expr->type)) {
@@ -1864,8 +1866,8 @@ arrow::Result<Typed> Negate(const sql::UnaryExpr& unary, Typed operand) {
                    .name = std::move(name)});
 }
 
-// A literal as an expression operand: typed by its value (an integer), DOUBLE (a number DuckDB
-// types as DOUBLE, or a decimal, which DuckDB types DECIMAL: flagged), VARCHAR or DATE.
+// A literal as an expression operand: typed by its value (an integer), DECIMAL (a decimal, ADR 0021
+// rule 3: flagged), DOUBLE (an exponent or more than 38 digits), VARCHAR or DATE.
 arrow::Result<Typed> LiteralOperand(const sql::Literal& lit) {
   // A DATE or TIMESTAMP literal is named as DuckDB names its cast, as in ExprName.
   const std::string name =
@@ -1874,6 +1876,15 @@ arrow::Result<Typed> LiteralOperand(const sql::Literal& lit) {
           : LiteralName(lit);
   const bool number =
       lit.kind == sql::Literal::Kind::kInteger || lit.kind == sql::Literal::Kind::kDecimal;
+  if (number && lit.kind == sql::Literal::Kind::kDecimal && !IsApproximateNumber(lit.text)) {
+    ARROW_ASSIGN_OR_RAISE(auto constant, BindConstant(lit));
+    const LogicalType type = constant.first.type;
+    Typed out = Leaf(
+        Expr{.node = ConstantExpr{.value = std::move(constant.first)}, .type = type, .name = name});
+    out.literal = true;
+    out.decimal = true;
+    return out;
+  }
   if (number && (lit.kind == sql::Literal::Kind::kDecimal || IsApproximateNumber(lit.text))) {
     const auto value = ParseDoubleLiteral(lit.text, lit.negative);
     if (!value.has_value()) {
@@ -1884,7 +1895,6 @@ arrow::Result<Typed> LiteralOperand(const sql::Literal& lit) {
              .type = LogicalType::kDouble,
              .name = name});
     out.literal = true;
-    out.decimal = !IsApproximateNumber(lit.text);
     return out;
   }
   ARROW_ASSIGN_OR_RAISE(auto constant, BindConstant(lit));
@@ -3120,6 +3130,12 @@ arrow::Result<Typed> Binder::BindCase(const sql::CaseExpr& c, const BindFn& bind
   // DuckDB's type: the values' common type, where an integer literal takes the others' integer
   // type when it fits and a string literal any type (DATE: the date it spells).
   std::optional<LogicalType> type;
+  // A DECIMAL value (a decimal literal too) next to a DOUBLE value makes the CASE DOUBLE, whatever
+  // the order of the values, the DECIMAL converted as DuckDB converts it (ADR 0021 rule 8); any
+  // other DECIMAL common type is rule 10's (roadmap PR D4b).
+  const bool any_double = std::ranges::any_of(values, [](const Typed& v) {
+    return v.expr->type == LogicalType::kDouble && !v.stored_as_float;
+  });
   for (const bool literals : {false, true}) {
     for (std::size_t i = 0; i < values.size(); ++i) {
       const Typed& v = values[i];
@@ -3134,13 +3150,14 @@ arrow::Result<Typed> Binder::BindCase(const sql::CaseExpr& c, const BindFn& bind
             span);
       }
       if (v.expr->type == LogicalType::kDecimal) {
-        return UnsupportedError("DECIMAL CASE values are not supported", span);
-      }
-      if (v.decimal && type != LogicalType::kDouble) {
-        // With a DOUBLE value DuckDB's CASE is DOUBLE; else DECIMAL.
+        if (any_double) {
+          continue;  // the DOUBLE value types the CASE
+        }
         return UnsupportedError(
-            "a decimal literal as a CASE value is not supported (DuckDB types it DECIMAL, which "
-            "antb1 lacks)",
+            v.decimal
+                ? "a decimal literal as a CASE value is supported only next to a DOUBLE value "
+                  "(DuckDB types the CASE DECIMAL)"
+                : "DECIMAL CASE values are supported only next to a DOUBLE value",
             span);
       }
       if (!type.has_value()) {

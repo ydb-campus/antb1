@@ -47,8 +47,8 @@ enum class Feature : std::uint8_t {
   kDoubleColumns,   // DOUBLE
   kVarcharColumns,  // VARCHAR (Parquet BYTE_ARRAY, with or without UTF8)
   kDateColumns,     // DATE (EventDate with the clickbench option)
-  kDecimalColumns,  // DECIMAL(p,s), p <= 38: literals, keys, MIN, MAX, COUNT, SUM, AVG, + - * by
-                    // integers
+  kDecimalColumns,  // DECIMAL(p,s), p <= 38: literals, keys, MIN, MAX, COUNT, SUM, AVG, + - * / //
+                    // % by integer and decimal literals
   // FROM
   kTableName,  // a registered table
   kTablePath,  // '<file or glob>'

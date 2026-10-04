@@ -105,7 +105,7 @@ This amends ADR 0012's list of unsupported constructs and three points of ADR 00
    - A DECIMAL operand becomes a double as DuckDB converts it: v / 10^s when |v| ≤ 2^53 or s = 0, otherwise
      (v div 10^s) + (v mod 10^s) / 10^s, where div and mod truncate toward zero and each part is converted on its
      own. This two-step conversion is not always correctly rounded. For p > 18 DuckDB converts a 128-bit integer
-     with its own formula, which antb1 already reproduces for FLOAT comparisons (`src/plan/literal.cc`).
+     with its own formula, which antb1 reproduces in `src/common/int128.cc`.
    - `/` divides as for DOUBLE: a zero divisor gives `inf`, `-inf` or NaN.
    - `//` on a DECIMAL is the same division, not truncated, and NULL for a zero divisor: `price // 4` is 3.0625
      when `price` is 12.25.
@@ -150,7 +150,7 @@ This amends ADR 0012's list of unsupported constructs and three points of ADR 00
     as for HUGEINT, so with values near 10^38 whether a sum fails can depend on the order of the rows and the parts.
 13. **AVG** of DECIMAL(p,s) is DOUBLE. `AVG(price)` is computed as DuckDB computes it, with the same C types:
     - the exact sum, converted to `long double` with DuckDB's 128-bit formula (lower + upper × 2^64 from its two
-      64-bit halves, with upper = -1 handled separately, as `src/plan/literal.cc` already does in double), divided
+      64-bit halves, with upper = -1 handled separately, as `src/common/int128.cc` does), divided
       by the count times 10^s (also in `long double`, with 10^s first rounded to a double), then rounded to double;
       for p ≤ 4 DuckDB computes the same in double;
     - `long double` differs by platform (x87 80-bit on x86-64 Linux, 64-bit on arm64 macOS) exactly as it does in
@@ -243,16 +243,20 @@ This amends ADR 0012's list of unsupported constructs and three points of ADR 00
 
 ## Plan
 
-One PR each. PR H5 and PR D1 land in either order (PR D1 changes no behavior), both before PR D2; then PR D2, PR D3
-and PR D4, in this order. Each engine PR documents its rules in docs/sql-subset.md and rejects the rest with exit
-code 4. The PR ids are the roadmap's, not divergence ids.
+One PR each. PR H5 and PR D1 land in either order (PR D1 changes no behavior), both before PR D2; then PR D2, PR D3 and
+PR D4 (D4a, then D4b), in this order. Each engine PR documents its rules in docs/sql-subset.md and rejects the rest with
+exit code 4. The PR ids are the roadmap's, not divergence ids.
 
 - **PR H5,** test(harness): compare decimal results exactly. Rule 15's text and exact type names, before engine code.
 - **PR D1,** refactor(plan): logical types with width and scale. The type carries (p,s); no behavior change.
 - **PR D2,** feat(plan,io,exec,engine): decimal columns. Rules 1, 2, 14-16 (join keys come with the joins) and io's
   cast to decimal128; rule 11 for integer and decimal literals and same-type operands.
 - **PR D3,** feat(plan,exec): decimal arithmetic, sum and avg. Rules 4-7, 12, 13 and 18.
-- **PR D4,** feat(plan,exec): decimal literals, division and mixed comparisons. Rules 3 and 8-11.
+- **PR D4,** split in two at review size:
+  - **PR D4a,** feat(plan,exec): decimal literals and division. Rules 3, 8 and 9 (`%` up to 38 digits), and rule
+    11's decimal literal against a DOUBLE operand.
+  - **PR D4b,** feat(plan,exec): decimal common types and mixed comparisons. Rule 10 (CASE values, IN lists), the
+    rest of rule 11, and `%` beyond 38 digits.
 - **decimal64 (deferred):** decimal64 for p ≤ 18, with DECIMAL in the filtered scan and in part statistics.
 
 ## Alternatives considered

@@ -336,6 +336,19 @@ Int128 MaxOfDigits(int digits) {
   return power - 1;
 }
 
+// A literal operand of DECIMAL arithmetic as DuckDB types it: an INTEGER counts as DECIMAL(10,0), a
+// decimal literal is DECIMAL(digits, fraction digits) (ADR 0021 rules 3 and 4).
+struct LiteralOperand {
+  std::string text;
+  int width = 0;
+  int scale = 0;
+  Int128 unscaled = 0;
+
+  static LiteralOperand Integer(int64_t k) {
+    return {.text = std::to_string(k), .width = 10, .scale = 0, .unscaled = k};
+  }
+};
+
 // Whether SUM of a DECIMAL column over every row stays within DECIMAL(38,s): an overflow fails
 // antb1, while DuckDB returns up to 39 digits (a divergence).
 bool Summable(const GenColumn& c, int64_t rows) {
@@ -760,14 +773,20 @@ class Builder {
       bool orderable = true;
       std::optional<std::pair<Agg, const GenColumn*>> call;
       if (allowed_.Has(Feature::kConstant) && rng_.Percent(10)) {
-        // A constant item (never a decimal: DuckDB types it DECIMAL, which antb1 lacks).
+        // A constant item; a decimal is DECIMAL(digits, fraction digits) (ADR 0021 rule 3).
         static constexpr auto kConstants = std::to_array<std::string_view>(
             {"1", "-7", "42", "3000000000", "'k'", "'it''s'", "DATE '2020-01-02'"});
+        static constexpr auto kDecimalConstants =
+            std::to_array<std::string_view>({"2.5", "-0.25", "007.50", ".125"});
         used_.Add(Feature::kConstant);
-        // One roll picks the constant as Pick did (the roll modulo the size) and the spelling of
-        // the date, so that every seed keeps generating the queries it did before kCastDate.
+        // One roll picks the constant (the roll modulo the size) and the spelling of the date; a
+        // decimal constant replaces it with a second draw.
         const std::size_t roll = rng_.Below(4 * kConstants.size());
-        const std::string_view constant = kConstants[roll % kConstants.size()];
+        std::string_view constant = kConstants[roll % kConstants.size()];
+        if (allowed_.Has(Feature::kDecimalLiteral) && rng_.Percent(20)) {
+          constant = rng_.Pick(kDecimalConstants);
+          used_.Add(Feature::kDecimalLiteral);
+        }
         if (constant.starts_with("DATE ")) {
           if (TypedDate(tokens_, std::string(constant.substr(5)), roll / kConstants.size())) {
             used_.Add(Feature::kCastDate);
@@ -893,7 +912,8 @@ class Builder {
           exact = kind.has_value() ? std::optional(true) : std::nullopt;
           arg_retyped_ = exact.has_value();
         } else {
-          exact = Arithmetic(*arg);
+          exact = Arithmetic(*arg, /*aggregated=*/true,
+                             /*summed=*/agg == Agg::kSum || agg == Agg::kAvg);
         }
       }
       if (!exact.has_value()) {
@@ -1006,7 +1026,7 @@ class Builder {
     }
     GenColumn values = *arg;
     if (values.kind == ValueKind::kDecimal) {
-      values.precision = 38;
+      values.precision = 38;  // SUM is DECIMAL(38,s); an argument keeps the column's scale
     }
     return values;
   }
@@ -1594,7 +1614,7 @@ class Builder {
   // over a column: the values share c's kind (a literal of it, as DuckDB types CASE). Returns
   // whether the result is exact (not DOUBLE), or std::nullopt (nothing written).
   std::optional<bool> Case(const GenColumn& c) {
-    // DECIMAL CASE values are unsupported until roadmap PR D3 (ADR 0021).
+    // DECIMAL CASE values are unsupported until roadmap PR D4b (ADR 0021).
     if (!allowed_.Has(Feature::kCase) || comparable_.empty() || c.kind == ValueKind::kDecimal) {
       return std::nullopt;
     }
@@ -1697,9 +1717,13 @@ class Builder {
 
   // A numeric column with a constant under an operator that both engines compute alike and
   // without an overflow (the column's data range decides): c + k, c - k, c * k, c / k (DOUBLE),
-  // c // k, c % k, -c. Returns whether the result is exact (I values; / and DOUBLE give R), or
-  // std::nullopt when none fits (nothing written).
-  std::optional<bool> Arithmetic(const GenColumn& c) {
+  // c // k, c % k, -c. `aggregated`: an aggregate's argument, where a DECIMAL keeps its scale (no
+  // decimal literal), since HAVING writes literals of the column's scale (ValuesOf); `summed`: the
+  // argument of a SUM or AVG, which gets no new inexact DOUBLE (a DECIMAL divided, an integer
+  // divided by a decimal literal), as the sum's rounding follows the order of the additions.
+  // Returns whether the result is exact (I values; / and DOUBLE give R), or std::nullopt when none
+  // fits (nothing written).
+  std::optional<bool> Arithmetic(const GenColumn& c, bool aggregated = false, bool summed = false) {
     if (!allowed_.Has(Feature::kArithmetic)) {
       return std::nullopt;
     }
@@ -1710,8 +1734,9 @@ class Builder {
     };
     std::vector<Choice> choices;
     const bool integers = allowed_.Has(Feature::kIntegerLiteral);
+    const bool decimals = allowed_.Has(Feature::kDecimalLiteral);
     if (c.kind == ValueKind::kDouble) {
-      if (allowed_.Has(Feature::kDecimalLiteral)) {
+      if (decimals) {
         choices.push_back({.op = "+", .literal = "1.5", .exact = false});
         choices.push_back({.op = "-", .literal = "0.25", .exact = false});
       }
@@ -1745,33 +1770,49 @@ class Builder {
           choices.push_back({.op = "-", .literal = "", .exact = true});
         }
       }
-    } else if (c.kind == ValueKind::kDecimal && integers) {
-      // DuckDB's type of c <op> k with an INTEGER k (DECIMAL(10,0)), and whether every value, and
-      // its sum over every row (the argument of a SUM), stays inside it (ADR 0021 rules 4 to 7).
+      if (decimals) {
+        // DECIMAL(k+1, 1) or (k+2, 2) and wider than any integer value: never an overflow (ADR
+        // 0021 rules 3 to 6); / and // are DOUBLE, % exact.
+        choices.push_back({.op = "+", .literal = "1.5", .exact = true});
+        choices.push_back({.op = "-", .literal = "0.25", .exact = true});
+        choices.push_back({.op = "*", .literal = "1.5", .exact = true});
+        choices.push_back({.op = "%", .literal = "2.5", .exact = true});
+        if (!summed) {  // inexact doubles: a sum's rounding follows the order of the additions
+          choices.push_back({.op = "/", .literal = "1.5", .exact = false});
+          choices.push_back({.op = "//", .literal = "2.5", .exact = false});
+        }
+      }
+    } else if (c.kind == ValueKind::kDecimal && (integers || decimals)) {
+      // DuckDB's type of c <op> k with an INTEGER k (DECIMAL(10,0)) or a decimal literal k
+      // (DECIMAL(digits, fraction digits)), and whether every value, and its sum over every row
+      // (the argument of a SUM), stays inside it (ADR 0021 rules 3 to 7).
       const Int128 bound = c.abs_max.value_or(0);
-      const auto fits = [&](bool multiply, int64_t k) {
+      const auto power = [](int n) { return MaxOfDigits(n) + 1; };
+      const auto fits = [&](bool multiply, const LiteralOperand& k) {
         int width = 0;
         Int128 largest = 0;
         if (multiply) {
-          width = c.precision + 10;
-          if (width > 18 && c.precision <= 18 && c.scale < 18) {
+          if (c.scale + k.scale > 38) {
+            return false;  // a bind error in both engines
+          }
+          width = c.precision + k.width;
+          if (width > 18 && c.precision <= 18 && k.width <= 18 && c.scale + k.scale < 18) {
             width = 18;
           }
-          if (__builtin_mul_overflow(bound, Int128{k}, &largest)) {
+          if (__builtin_mul_overflow(bound, k.unscaled, &largest)) {
             return false;
           }
         } else {
-          width = std::max(c.precision - c.scale, 10) + c.scale + 1;
-          if (width > 18 && c.precision <= 18) {
+          const int scale = std::max(c.scale, k.scale);
+          width = std::max(c.precision - c.scale, k.width - k.scale) + scale + 1;
+          if (width > 18 && c.precision <= 18 && k.width <= 18) {
             width = 18;
           }
-          Int128 scaled_k = k;
-          for (int i = 0; i < c.scale; ++i) {
-            if (__builtin_mul_overflow(scaled_k, Int128{10}, &scaled_k)) {
-              return false;
-            }
-          }
-          if (__builtin_add_overflow(bound, scaled_k, &largest)) {
+          Int128 scaled_bound = 0;
+          Int128 scaled_k = 0;
+          if (__builtin_mul_overflow(bound, power(scale - c.scale), &scaled_bound) ||
+              __builtin_mul_overflow(k.unscaled, power(scale - k.scale), &scaled_k) ||
+              __builtin_add_overflow(scaled_bound, scaled_k, &largest)) {
             return false;
           }
         }
@@ -1779,15 +1820,51 @@ class Builder {
         return largest <= MaxOfDigits(width) &&
                largest <= MaxOfDigits(38) / std::max<int64_t>(rows_, 1);
       };
-      for (const int64_t k : {1, 7, 100}) {
-        if (fits(false, k)) {
-          choices.push_back({.op = "+", .literal = std::to_string(k), .exact = true});
-          choices.push_back({.op = "-", .literal = std::to_string(k), .exact = true});
+      // % computes in the common type, which DuckDB makes DOUBLE beyond 38 digits (unsupported).
+      const auto modulo_fits = [&](const LiteralOperand& k) {
+        return std::max(c.precision - c.scale, k.width - k.scale) + std::max(c.scale, k.scale) <=
+               38;
+      };
+      std::vector<LiteralOperand> addends;
+      std::vector<LiteralOperand> factors;
+      std::vector<LiteralOperand> divisors;
+      if (integers) {
+        for (const int64_t k : {1, 7, 100}) {
+          addends.push_back(LiteralOperand::Integer(k));
+        }
+        for (const int64_t k : {2, 3}) {
+          factors.push_back(LiteralOperand::Integer(k));
+        }
+        for (const int64_t k : {3, 7}) {
+          divisors.push_back(LiteralOperand::Integer(k));
         }
       }
-      for (const int64_t k : {2, 3}) {
+      if (decimals && !aggregated) {
+        addends.push_back({.text = "0.5", .width = 2, .scale = 1, .unscaled = 5});
+        addends.push_back({.text = "0.25", .width = 3, .scale = 2, .unscaled = 25});
+        factors.push_back({.text = "1.5", .width = 2, .scale = 1, .unscaled = 15});
+        divisors.push_back({.text = "2.5", .width = 2, .scale = 1, .unscaled = 25});
+      }
+      for (const LiteralOperand& k : addends) {
+        if (fits(false, k)) {
+          choices.push_back({.op = "+", .literal = k.text, .exact = true});
+          choices.push_back({.op = "-", .literal = k.text, .exact = true});
+        }
+      }
+      for (const LiteralOperand& k : factors) {
         if (fits(true, k)) {
-          choices.push_back({.op = "*", .literal = std::to_string(k), .exact = true});
+          choices.push_back({.op = "*", .literal = k.text, .exact = true});
+        }
+      }
+      for (const LiteralOperand& k : divisors) {
+        // / and // are DOUBLE (rule 8), % exact in DECIMAL (rule 9). The doubles are inexact, so
+        // not under SUM or AVG, whose rounding follows the order of the additions.
+        if (!summed) {
+          choices.push_back({.op = "/", .literal = k.text, .exact = false});
+          choices.push_back({.op = "//", .literal = k.text, .exact = false});
+        }
+        if (modulo_fits(k)) {
+          choices.push_back({.op = "%", .literal = k.text, .exact = true});
         }
       }
       choices.push_back({.op = "-", .literal = "", .exact = true});  // the type is kept

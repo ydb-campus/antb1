@@ -47,6 +47,49 @@ Int128 Big(const std::string& text) {
   return negative ? -value : value;
 }
 
+// DuckDB 1.5.5's cast of a DECIMAL to DOUBLE (ADR 0021 rule 8), bit for bit: within 2^53 (or at a
+// width up to 4, or scale 0) one division; beyond it div + mod / 10^scale, which is not the
+// nearest double in the five cases from DuckDB (checked with CAST(<literal> AS DOUBLE)).
+TEST(Int128Test, DuckDbDecimalToDouble) {
+  struct Case {
+    std::string unscaled;
+    int width;
+    int scale;
+    double expected;
+  };
+  for (const Case& c : {
+           Case{.unscaled = "125", .width = 4, .scale = 3, .expected = 0.125},
+           Case{.unscaled = "-25", .width = 2, .scale = 1, .expected = -2.5},
+           Case{.unscaled = "9007199254740992",
+                .width = 17,
+                .scale = 1,
+                .expected = 900719925474099.2},
+           Case{.unscaled = "1152921504606846977", .width = 19, .scale = 0, .expected = 0x1p60},
+           Case{.unscaled = "199489722791016982",
+                .width = 18,
+                .scale = 1,
+                .expected = 1.9948972279101696e+16},
+           Case{.unscaled = "60719098953061412540",
+                .width = 20,
+                .scale = 3,
+                .expected = 6.071909895306141e+16},
+           Case{.unscaled = "-949662803139880935336384",
+                .width = 25,
+                .scale = 8,
+                .expected = -9496628031398808.0},
+           Case{.unscaled = "-494847612481479776948244721282",
+                .width = 30,
+                .scale = 12,
+                .expected = -4.9484761248147974e+17},
+           Case{.unscaled = "-92675172664100886869829230387221166619",
+                .width = 38,
+                .scale = 2,
+                .expected = -9.26751726641009e+35},
+       }) {
+    EXPECT_EQ(DuckDbDecimalToDouble(Big(c.unscaled), c.width, c.scale), c.expected) << c.unscaled;
+  }
+}
+
 // DuckDB 1.5.5's AVG of a DECIMAL, bit for bit, from sums of random sets where the correctly
 // rounded mean differs in the last bit (each answer checked against DuckDB on x86-64). long double
 // is the platform's, as in DuckDB's own build: x87 80-bit on x86-64 Linux, 64-bit on arm64 macOS.
