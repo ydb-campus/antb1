@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791070165045,
+  "lastUpdate": 1791104521854,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -4656,6 +4656,90 @@ window.BENCHMARK_DATA = {
             "value": 14.455204625000087,
             "unit": "ms/iter",
             "extra": "iterations: 48\ncpu: 14.45203389583331 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "608db49eccbed4402e164d112b5f3cca773d26d3",
+          "message": "feat(plan,exec): decimal literals and division (#91)\n\n## Summary\n\nDecimal literals become DECIMAL, `/`, `//` and `%` work on DECIMAL\noperands, a DECIMAL meets a DOUBLE in arithmetic and in CASE, and a\ndecimal literal compared with a DOUBLE converts as DuckDB 1.5.5 converts\nit. This is PR **D4a** of the roadmap for the queries derived from TPC-H\n(types track, [ADR 0021](docs/adr/0021-decimal-semantics.md) rules 3, 8\nand 9, and rule 11's decimal literal against a DOUBLE operand). D4 was\nsplit in two at the maintainer's choice; D4b (rule 10's common types for\nCASE and IN lists, the rest of rule 11) follows. No query flips: Q1 and\nQ6 still pass and the other 20 still exit 4, so\n`tests/data/tpch_status.json` is unchanged.\n\n**Types** (every rule probed with DuckDB's `typeof`):\n\n- A decimal literal (a point, no exponent, at most 38 digits) is\nDECIMAL(digits, digits after the point), leading zeros included and the\nsign not: `2.5` is DECIMAL(2,1), `.125` DECIMAL(3,3), `007.50`\nDECIMAL(5,2). It is named by its value (`7.50`), and `SELECT 2.5` now\nworks.\n- With an integer or a DECIMAL it follows D3's rules 4-7: `int_col +\n1.5` is DECIMAL(12,1), `1.5 * 2.25` DECIMAL(5,3), `p * 1.5`\nDECIMAL(17,3).\n- `/` is DOUBLE as before, and so is `//` with a DECIMAL and anything\nwith a DOUBLE.\n- `%` takes the common type, s = max(s1, s2) and p = max(p1 - s1, p2 -\ns2) + s, with no cap to 18 digits (probed): `p % 7` is DECIMAL(15,2),\n`int_col % 2.5` DECIMAL(11,1). Beyond 38 digits DuckDB computes it in\nDOUBLE; that case stays exit 4 for D4b.\n- In CASE, a DECIMAL value (a decimal literal, a negated one, a column)\nnext to a DOUBLE value makes the CASE DOUBLE, in any order of the\nvalues.\n\n**Execution:**\n\n- **DECIMAL to DOUBLE** (rule 8), for `/`, `//`, a DECIMAL with a\nDOUBLE, and DECIMAL CASE values next to a DOUBLE:\n- `CastTo` converts with DuckDB's `TryCastDecimalToFloatingPoint`, now\nshared as `DuckDbDecimalToDouble` and `DuckDbDecimalToFloat` in\n`src/common/int128`, moved there from `src/plan/literal.cc`.\n- It divides the unscaled value by 10^s when the width is at most 4, the\nscale 0 or |v| ≤ 2^53, and otherwise computes div + mod / 10^s.\n- It matches DuckDB bit for bit on 40 probed values, 32 of them where it\nis not the nearest double.\n- HUGEINT (integer SUM results) converts through the same 128-bit\nformula instead of Arrow's cast.\n- **`%`** computes in Int128, both operands rescaled to the result's\nscale. It takes the dividend's sign and gives NULL for a zero divisor.\n`/` follows IEEE, and `//` is NULL for a zero divisor.\n- **Decimal literal against a DOUBLE** in a comparison or IN list: rule\n8's double, not the nearest one. Divergence D12 narrows to HUGEINT\nliterals: `d = 9007199254740993.5` compares with 2^53 in both engines.\n\n**Still exit 4** (D4b): DECIMAL CASE values without a DOUBLE value,\ncomparing a DECIMAL with another type, `%` beyond 38 digits, and numbers\nDuckDB types as DOUBLE as select constants (`SELECT 1e3`).\n\n**Tests:**\n\n- **common:** `DuckDbDecimalToDouble` on the one-division and two-step\npaths, beyond 18 digits.\n- **plan:**\n  - literal types (`ParseDecimalLiteral`) and names;\n  - a result-type table for literals, `/ // %` and DOUBLE mixes;\n  - DECIMAL CASE values next to a DOUBLE in either order;\n  - the flipped error-table entries and the cases that still exit 4;\n  - D12 with DuckDB's doubles.\n- **exec:**\n  - DECIMAL `/`, `//` and `%`: zero divisors, signs, mixed scales;\n  - DuckDB's conversion against the nearest double, also for a HUGEINT.\n- **slt:**\n- the new `tests/slt/cases/types/decimal_literals.slt`, expected blocks\nfrom `pixi run slt-complete`, also at 4 threads. It covers constants,\nliteral arithmetic with every integer type, `/ // %`, DOUBLE mixes, CASE\nin both orders, conditions, aggregates, D12 records that tell the two\nconversions apart, the overflow and cast errors, and the remaining\nexit-4 cases;\n  - three records in `decimal_arithmetic.slt` lose `onlyif duckdb`.\n- **generator:**\n  - decimal select constants;\n- decimal-literal operands with integer and DECIMAL columns,\nrange-checked;\n  - `/ // %` of DECIMAL columns;\n- negative checks for its two new guards, each shown to fail when its\nguard is removed.\n  - `diff.random`, `diff.decimal` and `diff.tpch` change by design.\n\n**Docs:** `docs/sql-subset.md` covers constants, arithmetic, DECIMAL\narithmetic with `/ // %`, the CASE note, the DOUBLE row of the literal\ntable, DECIMAL semantics (rule 8's conversion), D12 narrowed, and the\nexit-code example. ADR 0021's Plan list records the D4a/D4b split and\npoints to the 128-bit conversion's new home; its status stays Proposed\n(yours to change).\n\nFor the maintainer:\n\n- **Differences from the approved plan:**\n- `SELECT 1e3` stays exit 4. The harness compares no column names, so\nDuckDB's name for a DOUBLE constant couldn't be probed.\n- The generator needed two restrictions, both found by the differential\nruns:\n- SUM and AVG arguments get no inexact doubles from a division. antb1\nadds DOUBLEs row group by row group, as docs/sql-subset.md says, so such\nsums can drift from DuckDB's running sum in the last digits.\n- Aggregate arguments over DECIMAL columns get no decimal-literal\noperands. Those raise the scale, which HAVING literals don't follow\n(divergence D13).\n- From the split review: a DECIMAL CASE value next to a DOUBLE value is\nDOUBLE in any order.\n- Before, a decimal literal had to come after the DOUBLE value (that was\nthe case on main too).\n- A negated literal (`THEN -(1.5) ELSE d`) regressed in this PR's first\nversion.\n    - DuckDB types all three DOUBLE (probed).\n- **Breaking-change label:** none. Existing queries keep their types;\nthe only answers that change are comparisons of a DOUBLE with decimal\nliterals beyond 2^53, which now match DuckDB.\n- **Size:** L (18 files, about 950 changed lines).\n\nThis workload is derived from the TPC-H Benchmark and is not comparable\nto published TPC-H Benchmark results, as this implementation does not\ncomply with all requirements of the TPC-H Benchmark.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full                  # on 82b2bea (the head)\nlint: PASS\n100% tests passed out of 1766          # ci (clang Debug -Werror)\n100% tests passed out of 1766          # asan (ASan + UBSan)\n                                       # tidy: clean\ncoverage: PASS\n100% tests passed out of 2             # fuzz-smoke\n100% tests passed out of 1766          # ci-gcc\n$ ANTB1_DIFF_SEED=7 ANTB1_DIFF_COUNT=20000 pixi run diff-random   # on 82b2bea\nDIFF: PASS seed=7 queries=20000 failed=0 unsupported=0\n$ ANTB1_DIFF_SEED=<1..6> ANTB1_DIFF_COUNT=5000 pixi run diff-random --table decimals --target-percent 50   # on 6895f53 (generation unchanged since)\nDIFF: PASS seed=1 queries=5000 failed=0 unsupported=0   # likewise seeds 2 to 6\n$ pixi run test -R 'tpch\\.status'      # redacted: Q1 pass, Q6 pass, 20 unsupported, at SF 0.01, 0.1 and 4 threads\nANTB1-TESTS: PASS\n```\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: none\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code implemented the\nmaintainer-approved plan (literal typing, DuckDB's DECIMAL-to-double\nconversion, `%`, tests, generator, docs) after probing DuckDB 1.5.5 for\ntypes, values and error texts. A reviewer agent reviewed the diff and\nfound no P0 or P1 problems; its notes are fixed in 6895f53. A split\nreview followed in four parts (plan; common and exec; tests and\ngenerator; docs), and its findings are fixed in 82b2bea.\n- Accountable human (has read and understands the whole diff): @hor911\n\n---------\n\nCo-authored-by: Claude <noreply@anthropic.com>",
+          "timestamp": "2026-10-04T11:59:09+03:00",
+          "tree_id": "4f0ef0d37370b72723d44236e2ab9e1dce41faa8",
+          "url": "https://github.com/ydb-campus/antb1/commit/608db49eccbed4402e164d112b5f3cca773d26d3"
+        },
+        "date": 1791104520776,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4590.914360470984,
+            "unit": "ns/iter",
+            "extra": "iterations: 149055\ncpu: 4590.607507295965 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84015.12423370469,
+            "unit": "ns/iter",
+            "extra": "iterations: 7993\ncpu: 84011.12210684351 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 221858.41571610203,
+            "unit": "ns/iter",
+            "extra": "iterations: 3156\ncpu: 221835.91286438538 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 444788.59569075913,
+            "unit": "ns/iter",
+            "extra": "iterations: 1578\ncpu: 444636.7674271229 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 401375.80469644384,
+            "unit": "ns/iter",
+            "extra": "iterations: 1746\ncpu: 401329.0349369986 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2084121.3264094938,
+            "unit": "ns/iter",
+            "extra": "iterations: 337\ncpu: 2083847.6409495557 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 53.25233469230721,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 53.24253684615387 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 44.52007337499886,
+            "unit": "ms/iter",
+            "extra": "iterations: 16\ncpu: 44.51757912500004 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 200.1564323333298,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 200.12177899999983 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.452404749999795,
+            "unit": "ms/iter",
+            "extra": "iterations: 48\ncpu: 14.451529937499984 ms\nthreads: 1"
           }
         ]
       }
