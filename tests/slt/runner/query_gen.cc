@@ -779,8 +779,8 @@ class Builder {
         static constexpr auto kDecimalConstants =
             std::to_array<std::string_view>({"2.5", "-0.25", "007.50", ".125"});
         used_.Add(Feature::kConstant);
-        // One roll picks the constant as Pick did (the roll modulo the size) and the spelling of
-        // the date, so that every seed keeps generating the queries it did before kCastDate.
+        // One roll picks the constant (the roll modulo the size) and the spelling of the date; a
+        // decimal constant replaces it with a second draw.
         const std::size_t roll = rng_.Below(4 * kConstants.size());
         std::string_view constant = kConstants[roll % kConstants.size()];
         if (allowed_.Has(Feature::kDecimalLiteral) && rng_.Percent(20)) {

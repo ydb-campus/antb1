@@ -91,7 +91,8 @@ Real DuckDbDecimalToReal(Int128 unscaled, int width, int scale) {
   ANTB1_CHECK(scale >= 0);
   ANTB1_CHECK(scale <= 38);
   // MAX_INT_REPRESENTABLE_IN_FLOAT / _IN_DOUBLE.
-  constexpr Int128 kMaxExact = Int128{1} << (std::numeric_limits<Real>::digits);
+  constexpr auto kMaxExact =
+      static_cast<Int128>(UInt128{1} << static_cast<unsigned>(std::numeric_limits<Real>::digits));
   const auto power = static_cast<Real>(kDoublePowersOfTen.at(static_cast<std::size_t>(scale)));
   // int16 storage (width <= 4) is always "representable exactly" in DuckDB.
   if (width <= 4 || scale == 0 || (unscaled <= kMaxExact && unscaled >= -kMaxExact)) {

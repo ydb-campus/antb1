@@ -385,6 +385,13 @@ TEST_F(ComputeTest, DecimalDivisionAndModulo) {
                         {Decimals(wide, {"199489722791016982"})});
   ASSERT_TRUE(converted.ok()) << converted.status().ToString();
   EXPECT_EQ(static_cast<const arrow::DoubleArray&>(**converted).Value(0), 1.9948972279101696e+16);
+  // A HUGEINT (an integer SUM) converts through DuckDB's 128-bit formula too: 2^64 + 2^63 + 2049
+  // is 2^64 + 2^63, where the nearest double is 2^64 + 2^63 + 4096 (ADR 0021 rule 13's value).
+  auto huge = Eval(Arith(ArithOp::kDivide, ColumnAt(0, LogicalType::kHugeInt),
+                         ConstantOf(1, LogicalType::kInteger), LogicalType::kDouble),
+                   {Decimals(LogicalType::kHugeInt, {"27670116110564329473"})});
+  ASSERT_TRUE(huge.ok()) << huge.status().ToString();
+  EXPECT_EQ(static_cast<const arrow::DoubleArray&>(**huge).Value(0), 0x1.8p64);
   // p % 2 is DECIMAL(15,2): 17.00 % 2, -0.25 % 0 (NULL), NULL, 0.00 % 0 (NULL), -7.25 % 2.
   auto remainder = Eval(Arith(ArithOp::kModulo, ColumnAt(0, p), ColumnAt(1, LogicalType::kBigInt),
                               LogicalType::Decimal(21, 2)),

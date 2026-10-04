@@ -1322,8 +1322,9 @@ struct SelectList {
 
 // A constant select item with DuckDB's type and result name: an integer is INTEGER, BIGINT or
 // HUGEINT by its value (see below) and named by it ("-5"); a string is VARCHAR named with its
-// quotes ('it''s'); a date is DATE named CAST('2020-01-01' AS "DATE"). A decimal (DuckDB's
-// DECIMAL) and a number DuckDB types as DOUBLE are not supported.
+// quotes ('it''s'); a date is DATE named CAST('2020-01-01' AS "DATE"); a decimal is
+// DECIMAL(digits, fraction digits) named by its value (ADR 0021 rule 3). A number DuckDB types as
+// DOUBLE is not supported.
 arrow::Result<std::pair<Constant, std::string>> BindConstant(const sql::Literal& lit) {
   switch (lit.kind) {
     case sql::Literal::Kind::kInteger: {

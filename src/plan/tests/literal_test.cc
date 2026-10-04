@@ -433,7 +433,10 @@ TEST(ParseDecimalLiteral, TypesLikeDuckDb) {
                 .unscaled = "1"},
        }) {
     const auto decimal = ParseDecimalLiteral(c.text, c.negative);
-    ASSERT_TRUE(decimal.has_value()) << c.text;
+    if (!decimal.has_value()) {
+      ADD_FAILURE() << c.text;
+      continue;
+    }
     EXPECT_EQ(decimal->type, LogicalType::Decimal(static_cast<std::uint8_t>(c.width),
                                                   static_cast<std::uint8_t>(c.scale)))
         << c.text;
