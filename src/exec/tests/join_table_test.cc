@@ -759,27 +759,34 @@ TEST_F(JoinTableTest, KeysSharingABucketStayTogether) {
 
 // ---- Flags ----
 
-// unique() looks at the inserted keys only: NULL keys are not inserted.
+// unique() looks at the inserted keys only: NULL keys are not inserted. On the pool the partitions,
+// built in parallel, combine their flags into the same answer.
 TEST_F(JoinTableTest, UniquenessIgnoresNullKeys) {
-  for (const int64_t step : {1, 1000003}) {  // direct, then hashed
-    SCOPED_TRACE(step);
-    BuildData unique({LogicalType::kBigInt});
-    unique.Add(0, {Int64s({0, std::nullopt, step, std::nullopt})}).Add(1, {Int64s({2 * step})});
-    auto table = BuildTable(unique, nullptr);
-    ASSERT_TRUE(table.ok()) << table.status().ToString();
-    EXPECT_TRUE((*table)->unique());
-    EXPECT_TRUE((*table)->has_null());
-    EXPECT_EQ((*table)->null_key_rows(), 2);
-    EXPECT_EQ((*table)->num_rows(), 3);
-    EXPECT_EQ((*table)->layout(),
-              step == 1 ? JoinTable::Layout::kDirect : JoinTable::Layout::kHashed);
+  const auto pool = MakeThreadPool();
+  for (arrow::internal::Executor* executor : Executors(pool.get())) {
+    SCOPED_TRACE(executor == nullptr ? "serial" : "pool");
+    for (const int64_t step : {1, 1000003}) {  // direct, then hashed
+      SCOPED_TRACE(step);
+      const JoinTable::Layout layout =
+          step == 1 ? JoinTable::Layout::kDirect : JoinTable::Layout::kHashed;
+      BuildData unique({LogicalType::kBigInt});
+      unique.Add(0, {Int64s({0, std::nullopt, step, std::nullopt})}).Add(1, {Int64s({2 * step})});
+      auto table = BuildTable(unique, executor);
+      ASSERT_TRUE(table.ok()) << table.status().ToString();
+      EXPECT_TRUE((*table)->unique());
+      EXPECT_TRUE((*table)->has_null());
+      EXPECT_EQ((*table)->null_key_rows(), 2);
+      EXPECT_EQ((*table)->num_rows(), 3);
+      EXPECT_EQ((*table)->layout(), layout);
 
-    BuildData repeated({LogicalType::kBigInt});
-    repeated.Add(0, {Int64s({0, std::nullopt, step})}).Add(1, {Int64s({step})});
-    table = BuildTable(repeated, nullptr);
-    ASSERT_TRUE(table.ok()) << table.status().ToString();
-    EXPECT_FALSE((*table)->unique());
-    EXPECT_TRUE((*table)->has_null());
+      BuildData repeated({LogicalType::kBigInt});
+      repeated.Add(0, {Int64s({0, std::nullopt, step})}).Add(1, {Int64s({step})});
+      table = BuildTable(repeated, executor);
+      ASSERT_TRUE(table.ok()) << table.status().ToString();
+      EXPECT_FALSE((*table)->unique());
+      EXPECT_TRUE((*table)->has_null());
+      EXPECT_EQ((*table)->layout(), layout);
+    }
   }
 }
 
@@ -846,9 +853,9 @@ TEST_F(JoinTableTest, ProbesWithoutCandidates) {
 
 constexpr int64_t kRowsPerBatch = 40;
 
-// A build input of `parts` parts of two batches, with duplicates (about 30%) and NULL keys: dense
-// keys, or spread out (hashed).
-BuildData ManyParts(std::size_t parts, bool hashed) {
+// A build input of `parts` parts of two batches, with duplicates (about 30%, unless not `repeats`)
+// and NULL keys: dense keys, or spread out (hashed).
+BuildData ManyParts(std::size_t parts, bool hashed, bool repeats = true) {
   BuildData data({LogicalType::kBigInt});
   for (std::size_t part = 0; part < parts; ++part) {
     for (int64_t b = 0; b < 2; ++b) {
@@ -856,7 +863,7 @@ BuildData ManyParts(std::size_t parts, bool hashed) {
       keys.reserve(kRowsPerBatch);
       for (int64_t r = 0; r < kRowsPerBatch; ++r) {
         const int64_t row = (((static_cast<int64_t>(part) * 2) + b) * kRowsPerBatch) + r;
-        const int64_t k = row % 10 < 3 ? row / 3 : row;  // 3 rows in 10 repeat a key
+        const int64_t k = repeats && row % 10 < 3 ? row / 3 : row;  // 3 rows in 10 repeat a key
         keys.push_back(row % 17 == 0 ? std::nullopt
                                      : std::optional<int64_t>(hashed ? (k * 7919) + 3 : k));
       }
@@ -905,8 +912,76 @@ TEST_F(JoinTableTest, PartsMayArriveInAnyOrder) {
   }
 }
 
+// Parts without a row kept (only NULL keys, nothing selected, no batch at all) between others, in
+// any order and on any number of threads: they add no chunk, the chunks of the parts after them are
+// numbered on in part order, and the matches are the reference's, on both layouts.
+TEST_F(JoinTableTest, PartsWithoutRowsBetweenOthers) {
+  const auto pool = MakeThreadPool();
+  for (const bool hashed : {false, true}) {
+    SCOPED_TRACE(hashed);
+    const auto key = [hashed](int64_t k) -> std::optional<int64_t> {
+      return hashed ? (k * 1000003) + 17 : k;
+    };
+    // Ids: part 0 has 0-3, part 1 4-5, part 2 6-7, part 4 8-11 (10 has a NULL key), part 5 12-13.
+    BuildData data({LogicalType::kBigInt});
+    data.Add(0, {Int64s({key(0), key(1), key(2), key(1)})})
+        .Add(1, {Int64s({std::nullopt, std::nullopt})})
+        .Add(2, {Int64s({key(3), key(1)})}, Bools({false, std::nullopt}))
+        .Add(4, {Int64s({key(2), key(4), std::nullopt, key(0)})})  // part 3 has no batch
+        .Add(5, {Int64s({key(4), key(3)})});
+    std::vector<std::optional<int64_t>> probe_keys;
+    probe_keys.reserve(8);
+    for (int64_t k = -1; k <= 5; ++k) {
+      probe_keys.push_back(key(k));
+    }
+    probe_keys.emplace_back(std::nullopt);
+    const Probe probe = Int64Probe(probe_keys);
+    const Ids expected = Reference(data, probe);
+    std::optional<std::vector<std::pair<std::uint32_t, std::uint32_t>>> rows;
+    for (arrow::internal::Executor* executor : Executors(pool.get())) {
+      for (const std::vector<std::size_t>& order :
+           {std::vector<std::size_t>{0, 1, 2, 3, 4, 5}, std::vector<std::size_t>{1, 3, 2, 5, 0, 4},
+            std::vector<std::size_t>{5, 4, 3, 2, 1, 0}}) {
+        auto table = BuildTable(data, executor, order);
+        ASSERT_TRUE(table.ok()) << table.status().ToString();
+        EXPECT_EQ((*table)->layout(),
+                  hashed ? JoinTable::Layout::kHashed : JoinTable::Layout::kDirect);
+        EXPECT_EQ(Matches(**table, probe), expected);
+        EXPECT_EQ((*table)->input_rows(), 12);
+        EXPECT_EQ((*table)->null_key_rows(), 3);
+        EXPECT_EQ((*table)->num_rows(), 9);
+        EXPECT_FALSE((*table)->unique());
+        // Chunk c is the c-th batch with rows kept: parts 0, 4 and 5.
+        const std::vector<std::vector<int64_t>> chunk_ids = {{0, 1, 2, 3}, {8, 9, 11}, {12, 13}};
+        ASSERT_EQ((*table)->chunks().size(), chunk_ids.size());
+        for (std::size_t c = 0; c < chunk_ids.size(); ++c) {
+          const auto& ids =
+              static_cast<const arrow::Int64Array&>(*(*table)->chunks()[c]->column(1));
+          std::vector<int64_t> sorted;
+          sorted.reserve(static_cast<std::size_t>(ids.length()));
+          for (int64_t i = 0; i < ids.length(); ++i) {
+            sorted.push_back(ids.Value(i));
+          }
+          std::ranges::sort(sorted);
+          EXPECT_EQ(sorted, chunk_ids[c]) << c;
+        }
+        for (const JoinRowRef& ref : (*table)->rows()) {
+          ASSERT_LT(ref.chunk, (*table)->chunks().size());
+          EXPECT_LT(ref.row, (*table)->chunks()[ref.chunk]->num_rows());
+        }
+        if (!rows.has_value()) {
+          rows = RowRefs(**table);
+        } else {
+          EXPECT_EQ(RowRefs(**table), *rows);
+        }
+      }
+    }
+  }
+}
+
 // Parts appended in pool tasks (as part tasks do) and added on this thread in a shuffled order give
-// the table a serial build gives.
+// the table a serial build gives; Finish, called right after the last Add, waits for the merges
+// still running.
 TEST_F(JoinTableTest, PartsBuiltOnWorkers) {
   const auto pool = MakeThreadPool();
   for (const bool hashed : {false, true}) {
@@ -923,7 +998,13 @@ TEST_F(JoinTableTest, PartsBuiltOnWorkers) {
                   parts[p] = std::move(part);
                   return arrow::Status::OK();
                 }).ok());
-    auto table = Assemble(*spec, parts, pool.get(), {7, 2, 11, 0, 5, 9, 1, 3, 10, 4, 8, 6});
+    auto builder = JoinTableBuilder::Make(*spec, static_cast<int64_t>(parts.size()), pool.get(),
+                                          kThreads, nullptr);
+    ASSERT_TRUE(builder.ok()) << builder.status().ToString();
+    for (const std::size_t p : std::vector<std::size_t>{7, 2, 11, 0, 5, 9, 1, 3, 10, 4, 8, 6}) {
+      ASSERT_TRUE((*builder)->Add(static_cast<int64_t>(p), parts[p]).ok());
+    }
+    auto table = (*builder)->Finish();
     ASSERT_TRUE(table.ok()) << table.status().ToString();
     auto serial = BuildTable(data, nullptr);
     ASSERT_TRUE(serial.ok()) << serial.status().ToString();
@@ -933,24 +1014,36 @@ TEST_F(JoinTableTest, PartsBuiltOnWorkers) {
   }
 }
 
-// One thread or four: the same rows in the same order, and the same matches.
+// One thread or four: the same rows in the same order, the same flags and counts, and the same
+// matches, with repeated keys and without.
 TEST_F(JoinTableTest, SameTableForAnyThreadCount) {
   const auto pool = MakeThreadPool();
   for (const bool hashed : {false, true}) {
-    SCOPED_TRACE(hashed);
-    const BuildData data = ManyParts(24, hashed);
-    const Probe probe = ManyPartsProbe(24, hashed);
-    auto serial = BuildTable(data, nullptr);
-    auto parallel = BuildTable(data, pool.get());
-    ASSERT_TRUE(serial.ok()) << serial.status().ToString();
-    ASSERT_TRUE(parallel.ok()) << parallel.status().ToString();
-    EXPECT_EQ((*serial)->layout(),
-              hashed ? JoinTable::Layout::kHashed : JoinTable::Layout::kDirect);
-    EXPECT_EQ((*parallel)->layout(), (*serial)->layout());
-    EXPECT_EQ(RowRefs(**parallel), RowRefs(**serial));
-    const Ids matches = Matches(**serial, probe);
-    EXPECT_EQ(Matches(**parallel, probe), matches);
-    EXPECT_EQ(matches, Reference(data, probe));
+    for (const bool repeats : {true, false}) {
+      SCOPED_TRACE(::testing::Message() << "hashed " << hashed << ", repeats " << repeats);
+      const BuildData data = ManyParts(24, hashed, repeats);
+      const Probe probe = ManyPartsProbe(24, hashed);
+      auto serial = BuildTable(data, nullptr);
+      auto parallel = BuildTable(data, pool.get());
+      ASSERT_TRUE(serial.ok()) << serial.status().ToString();
+      ASSERT_TRUE(parallel.ok()) << parallel.status().ToString();
+      EXPECT_EQ((*serial)->layout(),
+                hashed ? JoinTable::Layout::kHashed : JoinTable::Layout::kDirect);
+      EXPECT_EQ((*parallel)->layout(), (*serial)->layout());
+      EXPECT_EQ(RowRefs(**parallel), RowRefs(**serial));
+      EXPECT_EQ((*serial)->unique(), !repeats);
+      EXPECT_EQ((*parallel)->unique(), (*serial)->unique());
+      EXPECT_EQ((*parallel)->num_rows(), (*serial)->num_rows());
+      EXPECT_EQ((*parallel)->input_rows(), (*serial)->input_rows());
+      EXPECT_EQ((*parallel)->null_key_rows(), (*serial)->null_key_rows());
+      EXPECT_TRUE((*serial)->has_null());
+      EXPECT_EQ((*parallel)->has_null(), (*serial)->has_null());
+      EXPECT_FALSE((*serial)->empty());
+      EXPECT_EQ((*parallel)->empty(), (*serial)->empty());
+      const Ids matches = Matches(**serial, probe);
+      EXPECT_EQ(Matches(**parallel, probe), matches);
+      EXPECT_EQ(matches, Reference(data, probe));
+    }
   }
 }
 
@@ -1097,13 +1190,28 @@ TEST_F(JoinTableTest, RunsOutOfMemoryCleanly) {
       }
       EXPECT_EQ(budget.bytes_allocated(), 0);
     }
-    // Without a limit a budget still counts: a table holds its memory until it goes.
+    // Without a limit a budget still counts: a part holds its rows' hashes, and a finished table
+    // its row references, until it goes. Their Arrow buffers come from another pool here, so the
+    // budget sees only what they reserve.
     {
       MemoryBudget budget(std::nullopt);
       {
-        auto table = BuildTable(data, pool.get(), {}, &budget, &budget);
+        // One batch of many rows: their hashes are most of what the part reserves.
+        std::vector<std::optional<int64_t>> keys(4096);
+        std::ranges::iota(keys, int64_t{0});
+        BuildData many({LogicalType::kBigInt});
+        many.Add(0, {Int64s(keys)});
+        JoinBuildPart part(*spec, &budget);
+        ASSERT_TRUE(part.Append(many.parts()[0][0], arrow::default_memory_pool()).ok());
+        ASSERT_EQ(part.num_rows(), 4096);
+        EXPECT_GE(budget.bytes_allocated(), part.num_rows() * int64_t{sizeof(std::uint64_t)});
+      }
+      EXPECT_EQ(budget.bytes_allocated(), 0);
+      {
+        auto table = BuildTable(data, pool.get(), {}, &budget, arrow::default_memory_pool());
         ASSERT_TRUE(table.ok()) << table.status().ToString();
-        EXPECT_GT(budget.bytes_allocated(), 0);
+        ASSERT_GT((*table)->num_rows(), 0);
+        EXPECT_GE(budget.bytes_allocated(), (*table)->num_rows() * int64_t{sizeof(JoinRowRef)});
         EXPECT_EQ(Matches(**table, probe), expected);
       }
       EXPECT_EQ(budget.bytes_allocated(), 0);
@@ -1128,8 +1236,16 @@ TEST_F(JoinTableTest, RunsOutOfMemoryCleanly) {
           auto table = BuildTable(data, executor, {}, &budget, &budget);
           if (table.ok()) {
             built = true;
-            EXPECT_GT(budget.bytes_allocated(), 0);  // a finished table holds its memory
             EXPECT_EQ(Matches(**table, probe), expected);
+            // A finished table holds its memory until it goes: with its chunks (buffers of the
+            // budget's pool) kept, destroying it gives back at least its row references.
+            const std::vector<std::shared_ptr<arrow::RecordBatch>> chunks = (*table)->chunks();
+            const int64_t references = (*table)->num_rows() * int64_t{sizeof(JoinRowRef)};
+            const int64_t held = budget.bytes_allocated();
+            EXPECT_GT(references, 0);
+            *table = nullptr;
+            EXPECT_LE(budget.bytes_allocated(), held - references);
+            EXPECT_FALSE(chunks.empty());  // still held here
           } else {
             expect_oom(table.status());
           }

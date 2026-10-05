@@ -56,10 +56,22 @@ TEST_F(RowMaskTest, FoldsTheNullsOfEveryColumnAndTheSelection) {
   EXPECT_FALSE(mask->all());
   EXPECT_EQ(Rows(*mask), (std::vector<int64_t>{2, 4, 6}));
 
-  // One column: its bitmap, borrowed. No column (COUNT(*), nullptr): the selection.
-  auto one = RowMask::Make(a_.get(), nullptr, 8, arrow::default_memory_pool());
-  ASSERT_TRUE(one.ok());
+  // One column: its bitmap, borrowed (a pool without room is never asked), also next to columns
+  // without NULLs. No column (COUNT(*), nullptr): the selection; one without NULLs is borrowed.
+  MemoryBudget empty(0);
+  auto one = RowMask::Make(a_.get(), nullptr, 8, &empty);
+  ASSERT_TRUE(one.ok()) << one.status().ToString();
+  EXPECT_FALSE(one->all());
   EXPECT_EQ(Rows(*one), (std::vector<int64_t>{0, 2, 3, 4, 5, 6}));
+  const std::array<const arrow::Array*, 3> with_others = {c_.get(), a_.get(), nullptr};
+  auto borrowed = RowMask::Make(with_others, nullptr, 8, &empty);
+  ASSERT_TRUE(borrowed.ok()) << borrowed.status().ToString();
+  EXPECT_EQ(Rows(*borrowed), (std::vector<int64_t>{0, 2, 3, 4, 5, 6}));
+  const auto keep = Bools({true, false, true, true, false, true, true, false});
+  auto kept = RowMask::Make(nullptr, keep.get(), 8, &empty);
+  ASSERT_TRUE(kept.ok()) << kept.status().ToString();
+  EXPECT_EQ(Rows(*kept), (std::vector<int64_t>{0, 2, 3, 5, 6}));
+  EXPECT_EQ(empty.bytes_allocated(), 0);
   auto selected = RowMask::Make(nullptr, selection_.get(), 8, arrow::default_memory_pool());
   ASSERT_TRUE(selected.ok());
   EXPECT_EQ(Rows(*selected), (std::vector<int64_t>{0, 1, 2, 4, 6, 7}));
