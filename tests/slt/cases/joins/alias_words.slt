@@ -1,0 +1,140 @@
+# SEMI, ANTI and ASOF after a table (ADR 0022): DuckDB reads `t semi JOIN u ON ...` as a semi join and the same with
+# anti as an anti join, so these words are never table aliases, and a quoted one always is. DuckDB answers the semi,
+# anti and asof joins here; antb1 exits 4 for them until a PR implements them.
+
+# ---- the inputs, one table at a time ----
+
+# The ASOF records join tr_pickup, never NULL, with zones' zn_id, unique and never NULL.
+query III nosort
+SELECT COUNT(*), MIN(tr_pickup), MAX(tr_pickup) FROM trips
+----
+3000	1	43
+
+query IIII nosort
+SELECT COUNT(*), COUNT(DISTINCT zn_id), MIN(zn_id), MAX(zn_id) FROM zones
+----
+40	40	1	40
+
+# ---- pending: the words as aliases are syntax errors (roadmap PR S3 makes them so and removes these guards) ----
+
+pending S3
+statement error
+SELECT COUNT(*) FROM trips AS semi
+
+pending S3
+statement error
+SELECT COUNT(*) FROM trips AS anti
+
+pending S3
+statement error
+SELECT COUNT(*) FROM trips AS asof
+
+pending S3
+statement error
+SELECT COUNT(*) FROM trips semi
+
+pending S3
+statement error
+SELECT COUNT(*) FROM trips anti
+
+pending S3
+statement error
+SELECT COUNT(*) FROM trips asof
+
+# ---- pending: quoted, the words are aliases (ADR 0022; roadmap PR J2b removes these guards) ----
+
+pending J2b
+query ID nosort quoted_words
+SELECT COUNT(*), SUM(tr_fare) FROM trips AS "semi" JOIN drivers AS "anti" ON "semi".tr_driver = "anti".dv_id
+----
+2577	38689.00
+
+pending J2b
+query ID nosort quoted_words
+SELECT COUNT(*), SUM(tr_fare) FROM trips "asof" JOIN drivers ON "asof".tr_driver = dv_id
+----
+2577	38689.00
+
+pending J2b
+query ID nosort quoted_words
+SELECT COUNT(*), SUM(tr_fare) FROM trips JOIN drivers ON tr_driver = dv_id
+----
+2577	38689.00
+
+# ---- DuckDB only until SEMI and ANTI joins get a PR (ADR 0022) ----
+
+# A semi join keeps each trip with a rider once, as IN does (roadmap PR J5) and EXISTS (U2).
+onlyif duckdb
+query ID nosort semi
+SELECT COUNT(*), SUM(tr_fare) FROM trips semi JOIN riders ON tr_rider = rd_id
+----
+2745	41289.25
+
+onlyif duckdb
+query ID nosort semi
+SELECT COUNT(*), SUM(tr_fare) FROM trips SEMI JOIN riders ON tr_rider = rd_id
+----
+2745	41289.25
+
+pending J5
+query ID nosort semi
+SELECT COUNT(*), SUM(tr_fare) FROM trips WHERE tr_rider IN (SELECT rd_id FROM riders)
+----
+2745	41289.25
+
+# An anti join keeps the trips without a driver, NULL keys included, as NOT EXISTS does.
+onlyif duckdb
+query II nosort anti
+SELECT COUNT(*), COUNT(tr_driver) FROM trips anti JOIN drivers ON tr_driver = dv_id
+----
+423	319
+
+pending U2
+query II nosort anti
+SELECT COUNT(*), COUNT(tr_driver) FROM trips WHERE NOT EXISTS (SELECT * FROM drivers WHERE dv_id = tr_driver)
+----
+423	319
+
+# ---- DuckDB only until ASOF joins get a PR (ADR 0022) ----
+
+# DuckDB 1.5.5 counts a NULL inequality value as an ASOF match: joined with shifts on tr_driver = sh_driver AND
+# tr_day >= sh_day, the 71 trips whose tr_day is NULL find a shift. These records therefore join only columns without
+# NULLs, on a build key without repeats: each trip meets the zone of the largest zn_id up to its tr_pickup.
+onlyif duckdb
+query III nosort
+SELECT COUNT(*), MIN(zn_id), MAX(zn_id) FROM trips asof JOIN zones ON tr_pickup >= zn_id
+----
+3000	1	40
+
+onlyif duckdb
+query II rowsort
+SELECT zn_id, COUNT(*) FROM trips asof JOIN zones ON tr_pickup >= zn_id WHERE tr_pickup > 38 GROUP BY zn_id
+----
+39	69
+40	276
+
+# asof LEFT pads the trips of pickup 1, which no smaller zn_id precedes.
+onlyif duckdb
+query III nosort
+SELECT COUNT(*), COUNT(zn_id), MIN(zn_id) FROM trips asof LEFT JOIN zones ON tr_pickup > zn_id
+----
+3000	2930	1
+
+# ---- DuckDB only, for good: DuckDB's error texts ----
+
+onlyif duckdb
+statement error ^Parser Error: syntax error at or near "semi"
+SELECT COUNT(*) FROM trips AS semi
+
+onlyif duckdb
+statement error ^Parser Error: syntax error at end of input
+SELECT COUNT(*) FROM trips semi
+
+# A semi join returns the left side's columns only.
+onlyif duckdb
+statement error ^Binder Error: Referenced column "dv_id" not found
+SELECT COUNT(dv_id) FROM trips semi JOIN drivers ON tr_driver = dv_id
+
+onlyif duckdb
+statement error ^Binder Error: Missing ASOF JOIN inequality
+SELECT COUNT(*) FROM trips asof JOIN zones ON tr_pickup = zn_id
