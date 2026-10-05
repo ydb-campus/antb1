@@ -747,7 +747,7 @@ TEST_F(ComputeTest, DecimalCaseValuesCastToTheCaseType) {
             "Could not cast value 10000000000000000000000000000000000000 to DECIMAL(38,2) when "
             "casting from source column sum(b)");
   // A DECIMAL value beyond its declared width (a file can hold one) fails like any value that does
-  // not fit, printed at its own scale.
+  // not fit, printed at its own scale, as in DuckDB (probed with such a file).
   const LogicalType tiny = LogicalType::Decimal(4, 2);
   auto beyond = Eval(
       make(ColumnAt(1, tiny), ColumnAt(2, LogicalType::Decimal(5, 2)), LogicalType::Decimal(5, 2)),

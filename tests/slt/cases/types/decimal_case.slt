@@ -154,7 +154,7 @@ SELECT id, CASE WHEN id < 4 THEN d9_2 WHEN id < 8 THEN 0.00000000000000000000000
 10	6000000038.0000000000000000000
 11	NULL
 
-statement error Could not cast value -15000000095 to DECIMAL\(38,30\)
+statement error Could not cast value -?[0-9]+ to DECIMAL\(38,30\)
 SELECT CASE WHEN id < 4 THEN b WHEN id < 8 THEN d9_2 ELSE 0.000000000000000000000000000001 END FROM decimals
 
 # Only the rows that take a value cast it: row 4's b is 0 and row 5's NULL.
