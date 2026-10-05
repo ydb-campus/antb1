@@ -4,9 +4,10 @@
 // meaning after a FROM item (a new kind of join, say) fails here until the word joins the parser's
 // table of words that are never aliases (kNotAnAlias), so that antb1 never answers such a query
 // as an inner join with an alias. In every place, also after an alias, after an ON condition and
-// where the word would call a table function, a statement that sql::Parse accepts must parse in
-// DuckDB, and one that it rejects as malformed must fail in DuckDB's parser too. Only a parser
-// error counts as a failure to parse: any other error of json_serialize_sql fails the test.
+// where the word would call a table function or qualify a name, a statement that sql::Parse
+// accepts must parse in DuckDB, and one that it rejects as malformed must fail in DuckDB's parser
+// too. Only a parser error counts as a failure to parse: any other error of json_serialize_sql
+// fails the test.
 
 #include <array>
 #include <cstddef>
@@ -49,6 +50,13 @@ constexpr auto kPlaces = std::to_array<Place>({
     {.before = "SELECT 1 FROM t, LATERAL ", .after = "(1)", .alias = false},
     {.before = "SELECT 1 FROM (", .after = "(1) f CROSS JOIN t)", .alias = false},
     {.before = "SELECT 1 FROM (LATERAL ", .after = "(1) f CROSS JOIN t)", .alias = false},
+    // The word as a qualifier where a FROM item starts: DuckDB takes some reserved words for
+    // qualifiers (FROM t, over.x), so antb1 must not call those names malformed either.
+    {.before = "SELECT 1 FROM t, ", .after = ".x", .alias = false},
+    {.before = "SELECT 1 FROM ", .after = ".f(1)", .alias = false},
+    {.before = "SELECT 1 FROM t, LATERAL ", .after = ".f(1)", .alias = false},
+    {.before = "SELECT 1 FROM (", .after = ".x CROSS JOIN t)", .alias = false},
+    {.before = "SELECT 1 FROM (LATERAL ", .after = ".f(1) CROSS JOIN t)", .alias = false},
 });
 
 // `text` as a SQL string literal.
