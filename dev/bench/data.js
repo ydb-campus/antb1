@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791238645746,
+  "lastUpdate": 1791238845410,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -5184,6 +5184,114 @@ window.BENCHMARK_DATA = {
             "value": 56.09032041666732,
             "unit": "ms/iter",
             "extra": "iterations: 12\ncpu: 56.08418383333324 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "5ced388c12aab87394cf0a4d6d9d950ad017ce87",
+          "message": "build(deps): update duckdb to 1.5.6 and floor nodejs at 22 for markdownlint (#102)\n\n## Summary\n\nSupersedes #96, the scheduled `pixi.lock` refresh, whose `lint` job\nfails. This PR takes that refresh and adds the one constraint that makes\nit pass. Approved by the maintainer (non-roadmap PR; `pixi.toml` and\n`pixi.lock` are \"Ask a human first\" paths).\n\n**Why #96 fails.**\n- markdownlint-cli2's conda package\n(`markdownlint-cli2-0.23.3-h5ac6406_0`) depends on `nodejs` with no\nversion bound, although markdownlint-cli2 0.23 and its markdownlint\n0.41.1 declare `engines.node >=22`. Nothing else in `lint` bounds Node.\n- conda-forge now prefers libsqlite and libxml2 builds without icu\n(sqlite-feedstock #173). On linux-64, the icu-free build of libxml2\n2.15.4 is the later upload, and it declares `constrains: icu <0.0a0`.\nThat rules out every nodejs build that needs icu, which is every one\nafter 12.4.0.\n- So the bot's `pixi update` locked nodejs 12.4.0 in the `lint` env on\nlinux-64, and markdownlint-cli2 fails with `ERR_REQUIRE_ESM`.\nlinux-aarch64 and osx-arm64 kept Node 26 only because of the order of\nuploads.\n- A consistent linux-64 solve with nodejs 26.10.0 exists, so this is the\nsolver's choice, not a real conflict. Re-running the bot unchanged would\nlock Node 12 again.\n\n**The change:**\n- `pixi.toml`: `nodejs = \">=22\"` in `[feature.lint.dependencies]`.\n- It is a floor, not the minor pin the recipe prefers for direct\ndependencies. Node is only markdownlint-cli2's runtime, and its lint\nrules come from the bundled markdownlint, so a major pin would only add\nmanual bumps. `curl = \">=8.10\"` is a precedent.\n- The lock still pins one exact build, 26.10.0. No icu-free nodejs\nsatisfies `>=22` on any platform, so a future solve either finds a\nmodern Node or fails loudly.\n- `pixi.lock`: the bot's lock (e8da8a9), re-locked with `pixi lock`\n(pixi 0.81.0).\n- Compared with the bot's lock, only the `lint` environment on linux-64\ndiffers: nodejs 26.10.0 and its dependencies (icu 78.3, c-ares,\nlibabseil, libbrotli*, libuv, libnghttp2, libev), the icu builds of\nlibxml2 and libxml2-16, and libgcc-ng and libstdcxx-ng gone.\n- Those are exactly main's builds, with the same sha256. Every other\nenvironment and platform is identical to the bot's lock, package for\npackage.\n- **Net change against main** (the bot's bumps):\n  - default and gcc:\n    - cmake 4.4.3 → 4.4.4;\n- duckdb-cli, libduckdb, libduckdb-devel and duckdb-extension-tpch 1.5.5\n→ 1.5.6 (lockstep: each pins the same exact libduckdb build);\n    - openssl 3.6.4 → 3.6.5;\n    - the icu-free libsqlite 3.53.4 build.\n  - lint:\n    - ruff 0.16.9 → 0.16.10;\n    - the shellcheck 0.11.0 rebuild;\n    - filelock 4.0.11, platformdirs 4.12.3 and virtualenv 21.14.5;\n    - libsqlite and openssl as above.\n  - Arrow, Clang and the GCC runtime packages are unchanged.\n- **Docs:**\n- ADR 0021 now names DuckDB 1.5.6 as the oracle, and says 1.5.6 gives\nthe same DECIMAL types, values and messages as 1.5.5.\n- These say \"1.5.5 and 1.5.6\", since both versions still have the bugs\nthey describe: the notes on DuckDB's string MIN/MAX leak\n(`docs/testing.md`, a comment in `tests/tpch/CMakeLists.txt`) and on its\nlate-materialization error (`tests/slt/README.md`, a comment in\n`where/pushdown.slt`).\n- About 30 dated \"probed with DuckDB 1.5.5\" notes in ADRs and comments\nstay; every value behind them is the same on 1.5.6.\n\n**DuckDB 1.5.6 against current main.**\n- The 489 keywords and table-alias readings, the 2,951 functions, the 39\noptimizers and the C API symbols antb1 uses are identical to 1.5.5. So\nare the tpch extension's outputs, so `tests/tpch/queries.sha256` holds.\n- What changes upstream is outside what antb1 runs today: integer\nliterals of 275 or more digits are now DOUBLE, as antb1 already types\nthem; DATE vs TIMESTAMP-literal comparisons, which antb1 rejects; a\nwrong-result fix that needs UNION ALL.\n- Still present, so the repo's texts and workarounds stay:\n  - the late-materialization `file_index` internal error (#100);\n  - the string MIN/MAX leak;\n  - the ASOF NULL bug.\n\nCloses #96 when merged; it can also be closed now.\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [x] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full                  # on 40c1919 (the head): lint now runs markdownlint-cli2 on Node 26.10.0\nlint: PASS\n100% tests passed out of 1833          # ci (clang Debug -Werror)\n100% tests passed out of 1833          # asan (ASan + UBSan)\n                                       # tidy: clean\ncoverage: PASS\n100% tests passed out of 2             # fuzz-smoke\n100% tests passed out of 1833          # ci-gcc (GCC 15.3.0)\n# On main 2ef1f4d with the bot's lock, whose default and gcc environments are identical to this PR's:\n$ pixi run test-data                   # ClickBench, redacted\n100% tests passed out of 6\n$ pixi run slt-complete\nall 56 .slt files unchanged\n$ ANTB1_DIFF_SEED=<1..5> ANTB1_DIFF_COUNT=5000 pixi run diff-random      # all tables, star tables included\nDIFF: PASS ... failed=0 unsupported=0  (each seed; also seed 20261005 x 2000 on the 8 star tables, seeds 1, 20261005, 777 x 3000)\n# #101 (S3, be914a8) merged on top: 2017/2017 tests, TableAliasOracle and from_errors included\n```\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed): a dependency refresh; the whole suite, the data\ntests and random differential runs ran on the new packages\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: `pixi.toml`, `pixi.lock` and ADR 0021, approved as\nlisted above\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code diagnosed the\nfailing lint job from the lock files, conda-forge's package index, the\nsolver's behaviour and the upstream engines field. It verified DuckDB\n1.5.6 against current main in a scratch worktree (the whole suite, data\ntests, slt-complete, random differential runs and #101 merged on top)\nand proposed this change. After the maintainer approved it, Claude Code\napplied it and re-locked with `pixi lock`. The reviewer agent checked\nthe lock package by package against the bot's lock and main, plus the\nlockstep groups and the docs: no defects; its nits are folded into this\ntext.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-10-06T01:17:55+03:00",
+          "tree_id": "6fabe2257d28a03943e1bac741aa860ad8e08f57",
+          "url": "https://github.com/ydb-campus/antb1/commit/5ced388c12aab87394cf0a4d6d9d950ad017ce87"
+        },
+        "date": 1791238844919,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4392.223578459049,
+            "unit": "ns/iter",
+            "extra": "iterations: 159510\ncpu: 4391.518218293525 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 94302.12291286749,
+            "unit": "ns/iter",
+            "extra": "iterations: 7127\ncpu: 94296.1485898695 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 124846.72785944772,
+            "unit": "ns/iter",
+            "extra": "iterations: 5578\ncpu: 124825.48243097884 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 485253.3861591616,
+            "unit": "ns/iter",
+            "extra": "iterations: 1445\ncpu: 485225.1716262975 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 455476.61067707464,
+            "unit": "ns/iter",
+            "extra": "iterations: 1536\ncpu: 455403.2617187503 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2221246.834920615,
+            "unit": "ns/iter",
+            "extra": "iterations: 315\ncpu: 2220990.7333333353 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 52.38767299999836,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 52.37633784615382 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 50.208258399999295,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 50.20332280000002 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 231.65971233333948,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 231.63377900000003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 15.06321693617057,
+            "unit": "ms/iter",
+            "extra": "iterations: 47\ncpu: 15.062585680851045 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 20.342938399999507,
+            "unit": "ms/iter",
+            "extra": "iterations: 35\ncpu: 20.340030628571427 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 42.820022187500584,
+            "unit": "ms/iter",
+            "extra": "iterations: 16\ncpu: 42.81916462500001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.4240906441717933,
+            "unit": "ms/iter",
+            "extra": "iterations: 489\ncpu: 1.4239206891615537 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 92.49574587499865,
+            "unit": "ms/iter",
+            "extra": "iterations: 8\ncpu: 92.48609774999994 ms\nthreads: 1"
           }
         ]
       }
