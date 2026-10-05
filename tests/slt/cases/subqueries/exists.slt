@@ -1,0 +1,171 @@
+# Correlated EXISTS and NOT EXISTS (ADR 0023) over the star schema: a trip counts once however many rows match, NULL
+# and dangling keys, residuals that read both blocks, conjuncts on the outer or the inner block only, a two-column
+# correlation, an empty inner side and an outer name in an ON. Every pending subquery correlates through an equality
+# key, as ADR 0023 rejects a correlated EXISTS without one with exit code 4.
+
+# ---- the inputs, one table at a time ----
+
+query I nosort
+SELECT COUNT(*) FROM shifts WHERE sh_hours > 10
+----
+115
+
+query II nosort
+SELECT COUNT(*), COUNT(tr_fare) FROM trips WHERE tr_fare > 20
+----
+897	897
+
+# ---- pending: correlated EXISTS and NOT EXISTS (ADR 0023; roadmap PR U2 removes these guards) ----
+
+# Each trip counts once, although 8 riders repeat their key.
+pending U2
+query ID nosort
+SELECT COUNT(*), SUM(tr_fare) FROM trips WHERE EXISTS (SELECT * FROM riders WHERE rd_id = tr_rider)
+----
+2745	41289.25
+
+# NOT EXISTS keeps the NULL and the dangling keys: with EXISTS, every trip once.
+pending U2
+query II nosort
+SELECT COUNT(*), COUNT(tr_driver) FROM trips WHERE EXISTS (SELECT * FROM drivers WHERE dv_id = tr_driver)
+----
+2577	2577
+
+pending U2
+query II nosort
+SELECT COUNT(*), COUNT(tr_driver) FROM trips WHERE NOT EXISTS (SELECT * FROM drivers WHERE dv_id = tr_driver)
+----
+423	319
+
+# A residual that reads both blocks.
+pending U2
+query I nosort
+SELECT COUNT(*) FROM trips WHERE EXISTS (SELECT * FROM shifts WHERE sh_driver = tr_driver AND sh_day < tr_day)
+----
+2206
+
+pending U2
+query I nosort
+SELECT COUNT(*) FROM trips WHERE NOT EXISTS (SELECT * FROM shifts WHERE sh_driver = tr_driver AND sh_day < tr_day)
+----
+794
+
+# A conjunct on the outer block only: where it is false or NULL, NOT EXISTS keeps the trip.
+pending U2
+query II nosort
+SELECT COUNT(*), COUNT(tr_fare) FROM trips WHERE EXISTS (SELECT * FROM drivers WHERE dv_id = tr_driver AND tr_fare > 20)
+----
+771	771
+
+pending U2
+query II nosort
+SELECT COUNT(*), COUNT(tr_fare) FROM trips WHERE NOT EXISTS (SELECT * FROM drivers WHERE dv_id = tr_driver AND tr_fare > 20)
+----
+2229	2132
+
+# A conjunct on the inner block only.
+pending U2
+query I nosort
+SELECT COUNT(*) FROM trips WHERE EXISTS (SELECT * FROM shifts WHERE sh_driver = tr_driver AND sh_hours > 10)
+----
+2143
+
+# Two columns: 445 trips have a shift that day, where the inner join has 447 rows.
+pending U2
+query I nosort
+SELECT COUNT(*) FROM trips WHERE EXISTS (SELECT * FROM shifts WHERE sh_driver = tr_driver AND sh_day = tr_day)
+----
+445
+
+pending U2
+query I nosort
+SELECT COUNT(*) FROM trips WHERE NOT EXISTS (SELECT * FROM shifts WHERE sh_driver = tr_driver AND sh_day = tr_day)
+----
+2555
+
+# An empty inner side.
+pending U2
+query I nosort
+SELECT COUNT(*) FROM trips WHERE EXISTS (SELECT * FROM promos WHERE pm_id = tr_promo)
+----
+0
+
+pending U2
+query I nosort
+SELECT COUNT(*) FROM trips WHERE NOT EXISTS (SELECT * FROM promos WHERE pm_id = tr_promo)
+----
+3000
+
+# VARCHAR keys: NULL, std and XL.
+pending U2
+query I nosort
+SELECT COUNT(*) FROM trips WHERE NOT EXISTS (SELECT * FROM tariffs WHERE tf_code = tr_tariff)
+----
+726
+
+# A select list other than *.
+pending U2
+query I nosort
+SELECT COUNT(*) FROM trips WHERE EXISTS (SELECT rd_city FROM riders WHERE rd_id = tr_rider AND rd_tier = 'gold')
+----
+911
+
+# The drivers without a trip: the NULL key, drivers 90 to 95 and the key beyond INTEGER.
+pending U2
+query I rowsort
+SELECT dv_row FROM drivers WHERE NOT EXISTS (SELECT * FROM trips WHERE tr_driver = dv_id)
+----
+50
+90
+91
+92
+93
+94
+95
+96
+
+# An outer name in an ON: label is in no FROM item up to that JOIN, so it is cities' label, although the later zones
+# has a label too (roadmap PR J2b for the joins).
+pending U2
+query I rowsort
+SELECT ct_id FROM cities
+WHERE EXISTS (SELECT * FROM trips JOIN tariffs ON tf_code = tr_tariff AND tf_label = label JOIN zones ON zn_id = tr_pickup)
+----
+1
+4
+
+# Inside EXISTS, * is checked: two bindings named z that share label.
+pending U2
+statement error
+SELECT COUNT(*) FROM trips WHERE EXISTS (SELECT * FROM zones AS z, cities AS z WHERE z.zn_id = tr_pickup AND z.zn_city = z.ct_id)
+
+# ---- DuckDB only until the general domain join gets a PR (ADR 0023: an aggregate inside EXISTS exits 4) ----
+
+# An aggregate returns a row even over no input, so this EXISTS keeps every trip.
+onlyif duckdb
+query I nosort
+SELECT COUNT(*) FROM trips WHERE EXISTS (SELECT COUNT(*) FROM promos WHERE pm_id = tr_promo)
+----
+3000
+
+# ---- DuckDB only until the uncorrelated EXISTS gets a PR (ADR 0023) ----
+
+onlyif duckdb
+query I nosort
+SELECT COUNT(*) FROM trips WHERE EXISTS (SELECT * FROM promos)
+----
+0
+
+# ---- DuckDB only until mark joins get a PR (ADR 0023: EXISTS under OR exits 4) ----
+
+onlyif duckdb
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_fare > 25 OR EXISTS (SELECT * FROM riders WHERE rd_id = tr_rider AND rd_tier = 'gold')
+----
+1114
+
+# ---- DuckDB only, for good: DuckDB's error texts ----
+
+onlyif duckdb
+statement error ^Binder Error: Ambiguous reference to table "z"
+SELECT COUNT(*) FROM trips WHERE EXISTS (SELECT * FROM zones AS z, cities AS z WHERE z.zn_id = tr_pickup AND z.zn_city = z.ct_id)

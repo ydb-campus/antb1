@@ -85,6 +85,9 @@ Exit codes are never rewritten: change `EXIT_CODE` in `cli/CMakeLists.txt` delib
 - `harness.answers.*`: `antb1-slt answers` accepts DuckDB's stored answers in their own spelling, catches every
   corrupted result in a redacted report, and refuses `--show-values` on GitHub Actions.
 - `harness.cli.changed_stdout`, `harness.cli.changed_exit_code`: the golden comparison catches changes.
+- `harness.slt.pending`: every `pending <roadmap id>` record of the registered `.slt` files still gets an
+  Unsupported answer from antb1 (`antb1-slt pending`); one that antb1 answers fails with `remove the guard (<id>)`.
+  `harness.slt.pending.mutate.<kind>`: corrupting antb1's answers to `slt/selftest/pending.slt` must fail the check.
 - `harness.fixtures.digest`: the fixtures this build generated match `fixtures/fixtures.digest`, a logical
   digest (schema, row groups, values; not compression or page layout), so Linux and macOS generate the same
   data. The top-level `tpch/` directory of the data derived from TPC-H is skipped. After an intended generator

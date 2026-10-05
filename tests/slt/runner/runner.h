@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -47,7 +49,7 @@ struct RunStats {
   int records = 0;
   int passed = 0;
   int failed = 0;
-  int skipped = 0;      // skipif/onlyif
+  int skipped = 0;      // skipif/onlyif, and pending records on antb1
   int unsupported = 0;  // antb1 Unsupported results (each one is also a failure)
   bool halted = false;
 };
@@ -55,6 +57,21 @@ struct RunStats {
 // Runs the records of `file` that apply to engine.name() and appends the report (failures and a
 // summary line) to `out`. An antb1 Unsupported result is a failure: tests reflect current support.
 RunStats RunFile(const SltFile& file, Engine& engine, const RunOptions& options, std::string& out);
+
+struct PendingStats {
+  int records = 0;      // pending records run
+  int unsupported = 0;  // still Unsupported: the guard stays
+  int failed = 0;       // answered, or failed otherwise: the guard must go
+  std::map<std::string, int, std::less<>> by_id;  // pending records per roadmap id
+  bool halted = false;
+};
+
+// The pending check: runs the `pending <roadmap id>` records of `file` on `engine` (antb1), which
+// RunFile skips, and appends the report to `out`. Each must still get Unsupported; any other
+// answer, rows or an error of another kind, fails with "remove the guard (<id>)": the PR that
+// implements the record's SQL removes its guard, so that RunFile compares the answer.
+PendingStats CheckPendingFile(const SltFile& file, Engine& engine, const RunOptions& options,
+                              std::string& out);
 
 struct CompleteStats {
   int queries = 0;     // expected blocks written

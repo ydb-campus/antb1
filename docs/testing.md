@@ -47,7 +47,7 @@ table must match it (`pixi run lint` compares them).
 | `parallel` | in use | parallel execution on 4 engine threads ([ADR 0013](adr/0013-parallel-execution.md)): every `.slt` case file (`parallel.<area>.<file>`) and 300 random differential queries (`parallel.diff.random`, `parallel.diff.star`, `parallel.diff.tpch`), in 1000-, 700- and 97-row batches; every result must also equal the 1-thread result byte for byte (`antb1-slt --same-as-threads 1`) |
 | `metamorphic` | in use | metamorphic relations on the generated fixtures (`metamorphic.*`) |
 | `cli` | in use | golden tests of the `antb1` command line (`cli.<case>`): output formats, errors, exit codes, EXPLAIN |
-| `harness` | in use | self-tests of the harness (`harness.*`): mutated engines, redaction canaries, fixture digest, runner unit tests, the data derived from TPC-H against DuckDB's answers |
+| `harness` | in use | self-tests of the harness (`harness.*`): mutated engines, redaction canaries, fixture digest, runner unit tests, the pending check of the `.slt` files, the data derived from TPC-H against DuckDB's answers |
 | `fuzz-replay` | in use | `fuzz.replay.sql_parser`: the fuzz corpus and regressions replayed as an ordinary test, on every leg |
 | `fuzz` | in use | `fuzz.sql_parser.smoke`: a short libFuzzer run with a fixed seed (Clang `fuzz` preset only) |
 | `setup` | in use | `fixtures.generate` and `fixtures.tpch`: write the Parquet fixtures (and the data derived from TPC-H) before any test that needs them |
@@ -155,11 +155,17 @@ Workflow for new or changed SQL:
    must check by hand.
 3. Review `git diff tests/slt`: only the records you meant to change may differ. Never edit an expected block by
    hand.
-4. Run `pixi run test -L '^(slt|oracle)$'`.
+4. Run `pixi run test -L '^(slt|oracle)$'`, and for `pending` records (below) also the pending check, which has the
+   label `harness`: `pixi run test -R '^harness\.slt\.pending$'`.
 
 An antb1 `Unsupported` answer always fails, also for `statement error`. A record for SQL that antb1 does not support
-yet carries `onlyif duckdb`; the PR that implements the feature removes the guard and declares the feature in
-`tests/slt/supported_features.h`, which also activates its random differential queries and metamorphic relations.
+yet carries a guard: `pending <roadmap id>` when a roadmap PR implements the SQL, else `onlyif duckdb`. DuckDB runs a
+pending record as usual and antb1's `slt.*` and `parallel.*` tests skip it, while `harness.slt.pending` checks that
+antb1 still answers every pending record with Unsupported and fails with `remove the guard (<id>)` once it answers
+one. The PR that implements the feature removes its guards and declares the feature in
+`tests/slt/supported_features.h`, which also activates its random differential queries and metamorphic relations. The
+join and subquery corpus (`tests/slt/cases/joins/`, `tests/slt/cases/subqueries/`) waits on the roadmap PRs of
+ADRs 0022 and 0023 this way; its rules are in [tests/slt/README.md](../tests/slt/README.md#current-support-is-the-contract).
 `onlyif antb1` is for antb1's own error texts and for registered divergences
 ([sql-subset.md](sql-subset.md#divergences-from-duckdb)).
 
@@ -230,8 +236,10 @@ The `harness` label proves that the harness catches failures: every corruption o
 make the slt runner and the differential test fail; `--redact` output never contains SQL, values or error messages
 (the canaries in `tests/slt/canary/`), and neither does the output of `answers` or of a run over tables marked
 `redact` in their tables file, which is redacted without `--redact`; the golden comparison catches changed output and
-exit codes; the fuzz replay catches a broken unparser; the fixtures match their digest. A change to the harness
-comes with a self-test that fails without it.
+exit codes; the fuzz replay catches a broken unparser; the fixtures match their digest; every `pending` record of the
+`.slt` files still gets Unsupported from antb1 (`harness.slt.pending`), and the check fails when antb1 answers the
+pending records of `tests/slt/selftest/pending.slt` (`harness.slt.pending.mutate.*`). A change to the harness comes
+with a self-test that fails without it.
 
 ## Coverage
 
