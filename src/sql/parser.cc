@@ -349,6 +349,11 @@ static_assert(std::ranges::all_of(kJoinKinds, FitsKeywordLength));
 static_assert(std::ranges::all_of(kJoinStarts, IsReservedWordOf));
 static_assert(std::ranges::all_of(kSubqueryStarts, FitsKeywordLength));
 
+// The kUnsupported message of a typed literal (INT '1', main.integer '1') or a prefixed string.
+constexpr std::string_view kTypedLiterals =
+    "typed literals other than DATE '...', TIMESTAMP '...' and prefixed strings (E'...') are not "
+    "supported";
+
 constexpr std::size_t kMaxQuotedText = 32;
 
 std::optional<std::string_view> Find(std::span<const Construct> table, std::string_view keyword) {
@@ -1157,9 +1162,7 @@ class Parser {
         return Unsupported(token.span, *construct);
       }
       if (!IsReservedKeyword(keyword)) {  // type 'text' (INT '1') or a prefixed string (E'\n')
-        return Unsupported(token.span,
-                           "typed literals other than DATE '...', TIMESTAMP '...' and prefixed "
-                           "strings (E'...') are not supported");
+        return Unsupported(token.span, kTypedLiterals);
       }
     }
     const bool function_like =
@@ -1228,11 +1231,37 @@ class Parser {
                          "qualified function names and method calls (a.f()) are not supported");
     }
     const SourceSpan span = Cover(qualifier.span, column.span);
+    // A string after the name makes a typed literal of a qualified type in DuckDB (main.integer
+    // '5', main.mood E'x'): unsupported, as typed literals are.
+    if (Peek().kind == TokenKind::kString || PrefixedStringAt() != PrefixedString::kNone) {
+      return Unsupported(span, kTypedLiterals);
+    }
     return Expr(ColumnRef{.name = std::move(column.text),
                           .quoted = column.kind == TokenKind::kQuotedIdentifier,
                           .span = span,
                           .qualifier = std::move(qualifier.text),
                           .qualifier_quoted = qualifier.kind == TokenKind::kQuotedIdentifier});
+  }
+
+  // DuckDB's string constants other than a plain string literal, at the next tokens: an escape
+  // string (E'x'), which lexes as E and an adjacent string, and a dollar-quoted string ($$x$$,
+  // $tag$x$tag$), which lexes as a $-token without a digit and an adjacent $-token. $1, $x and
+  // the other prefixes (B'1', N'x') are none.
+  enum class PrefixedString : std::uint8_t { kNone, kEscape, kDollarQuoted };
+  PrefixedString PrefixedStringAt() {
+    const Token& token = Peek();
+    const Token& next = PeekAt(1);
+    if (next.span.offset != token.span.offset + token.span.length) {
+      return PrefixedString::kNone;
+    }
+    if (KeywordOf(token) == "E" && next.kind == TokenKind::kString) {
+      return PrefixedString::kEscape;
+    }
+    if (token.kind == TokenKind::kParameter && next.kind == TokenKind::kParameter &&
+        (token.text.size() == 1 || token.text[1] < '0' || token.text[1] > '9')) {
+      return PrefixedString::kDollarQuoted;
+    }
+    return PrefixedString::kNone;
   }
 
   // agg_call, positioned at the function name (the next token is '(').
@@ -1910,16 +1939,15 @@ class Parser {
         return Unsupported(name.span, "an empty table alias ('') is not supported");
       }
       // DuckDB also takes an escape string (E'x') or a dollar-quoted string ($$x$$, $tag$x$tag$) as
-      // the alias here; each lexes as a token and an adjacent string or $-token. $1, $x and the
-      // other prefixes (B'1', N'x') stay syntax errors, as in DuckDB.
-      const Token& next = PeekAt(1);
-      const bool adjacent = next.span.offset == name.span.offset + name.span.length;
-      if (name.kind == TokenKind::kParameter && adjacent && next.kind == TokenKind::kParameter &&
-          (name.text.size() == 1 || name.text[1] < '0' || name.text[1] > '9')) {
-        return Unsupported(name.span, "dollar-quoted strings are not supported");
-      }
-      if (KeywordOf(name) == "E" && adjacent && next.kind == TokenKind::kString) {
-        return Unsupported(name.span, "prefixed strings (E'...') are not supported");
+      // the alias here. $1, $x and the other prefixes (B'1', N'x') stay syntax errors, as in
+      // DuckDB.
+      switch (PrefixedStringAt()) {
+        case PrefixedString::kEscape:
+          return Unsupported(name.span, "prefixed strings (E'...') are not supported");
+        case PrefixedString::kDollarQuoted:
+          return Unsupported(name.span, "dollar-quoted strings are not supported");
+        case PrefixedString::kNone:
+          break;
       }
       if (!IsTableAlias(name, /*after_as=*/true)) {
         if (const NotAnAlias* word = FindNotAnAlias(name)) {
