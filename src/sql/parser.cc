@@ -2285,14 +2285,16 @@ class Parser {
       default:
         break;
     }
-    // A call or a typed literal, also of a quoted or a qualified name (abs(5), "abs"(5),
-    // main.abs(5), system.main.abs(5), main.left('5', 1), integer '5', "integer" E'5',
-    // main.integer $$5$$, and E'5' itself). A column (LIMIT a, LIMIT t.a, LIMIT a.b.c), which
-    // DuckDB refuses when it binds, stays a syntax error.
+    // A call or a typed literal, also of a quoted or a qualified name of at most three parts
+    // (abs(5), "abs"(5), main.abs(5), system.main.abs(5), main.left('5', 1), integer '5',
+    // "integer" E'5', main.integer $$5$$, and E'5' itself). A column (LIMIT a, LIMIT t.a,
+    // LIMIT a.b.c), which DuckDB refuses when it binds, stays a syntax error, and so does a call
+    // or a typed literal of a longer name (a.b.c.d(1), a.b.c.d '5'), which DuckDB does not parse.
+    constexpr std::size_t kMaxNameParts = 3;  // catalog.schema.name
     const SourceSpan first = token.span;
     const std::string found = Describe(token);
     SourceSpan span = first;
-    bool qualified = false;
+    std::size_t parts = 1;
     if (IsName(token)) {
       // What follows a qualified name is beyond the three tokens of lookahead: take each part
       // before a dot and the dot first. A part after a dot may be a reserved word, as in
@@ -2302,11 +2304,11 @@ class Parser {
               PeekAt(2).kind == TokenKind::kQuotedIdentifier)) {
         Take();
         Take();
-        qualified = true;
+        ++parts;
       }
     }
     const Token& head = Peek();  // the name, or its last part
-    if (qualified) {
+    if (parts > 1) {
       if (IsStringPrefix(head, PeekAt(1))) {  // main.E'5': a string after the dot
         return Syntax(Cover(head.span, PeekAt(1).span),
                       "expected a name after '.', found " + Describe(PeekAt(1)));
@@ -2318,7 +2320,7 @@ class Parser {
         PeekAt(1).kind == TokenKind::kLeftParen;
     const bool typed_literal = IsName(head) && (PeekAt(1).kind == TokenKind::kString ||
                                                 PrefixedStringAt(1) != PrefixedString::kNone);
-    if (call || typed_literal) {
+    if ((call || typed_literal) && parts <= kMaxNameParts) {
       return Unsupported(span,
                          name + " expressions are not supported (" + name + " takes an integer)");
     }

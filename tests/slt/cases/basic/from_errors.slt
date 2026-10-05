@@ -361,6 +361,23 @@ onlyif duckdb
 statement error ^Parser Error:
 SELECT COUNT(*) FROM edge LIMIT edge.e'5'
 
+# After LIMIT and OFFSET, a call or a typed literal of a name of more than three parts: DuckDB takes
+# catalog.schema.name at most.
+
+statement error
+SELECT COUNT(*) FROM edge LIMIT a.b.c.d(1)
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge LIMIT a.b.c.d(1)
+
+statement error
+SELECT COUNT(*) FROM edge OFFSET a.b.c.d '5'
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge OFFSET a.b.c.d '5'
+
 # antb1's messages.
 
 onlyif antb1
