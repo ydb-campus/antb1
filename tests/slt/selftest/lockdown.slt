@@ -8,6 +8,14 @@ SELECT current_setting('threads'), current_setting('autoload_known_extensions')
 ----
 1	false
 
+# The late_materialization optimizer is off, for a DuckDB bug (where/pushdown.slt).
+
+onlyif duckdb
+query T nosort
+SELECT current_setting('disabled_optimizers')
+----
+late_materialization
+
 onlyif duckdb
 statement error the configuration has been locked
 SET threads = 4
