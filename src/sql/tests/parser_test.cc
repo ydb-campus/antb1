@@ -834,6 +834,20 @@ TEST(ParserTest, FunctionsCaseExtractAndExpressionOperands) {
   EXPECT_TRUE(EqualIgnoringSpans(*stmt, *again)) << ToSql(*stmt);
 }
 
+// LEFT and RIGHT start joins, not clauses: after a comma of the select list, GROUP BY or ORDER BY,
+// left( and right( are calls (DuckDB's string functions), not a trailing comma.
+TEST(ParserTest, LeftAndRightCallsAfterListCommas) {
+  auto stmt =
+      Parse("SELECT a, left(s, 1) FROM events GROUP BY a, right(s, 1) ORDER BY a, LEFT(s, 2)");
+  ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
+  ASSERT_EQ(stmt->items.size(), 2U);
+  EXPECT_EQ(std::get<FunctionCall>(stmt->items[1].expr).name, "left");
+  ASSERT_EQ(stmt->group_by.size(), 2U);
+  EXPECT_EQ(std::get<FunctionCall>(stmt->group_by[1]).name, "right");
+  ASSERT_EQ(stmt->order_by.size(), 2U);
+  EXPECT_EQ(std::get<FunctionCall>(stmt->order_by[1].expr).name, "LEFT");
+}
+
 // CAST(x AS T), TRY_CAST(x AS T) and x::T are one node: the type upper-cased with its integer
 // parameters as written, the spelling not recorded. '::' applies to any primary expression, and a
 // cast's span starts at the primary's first token.
@@ -2206,6 +2220,11 @@ INSTANTIATE_TEST_SUITE_P(
                    kSyntax, 4,
                    "unexpected keyword JOIN; expected AND, GROUP BY, HAVING, ORDER BY, LIMIT, "
                    "OFFSET or the end of the query"},
+        // A join keyword after a list comma is no clause, so the comma is no trailing comma.
+        RejectCase{"JoinAfterSelectComma", "SELECT a, ^JOIN FROM events", kSyntax, 4,
+                   "expected an expression or '*', found keyword JOIN"},
+        RejectCase{"LeftAfterGroupByComma", "SELECT a FROM events GROUP BY a, ^LEFT", kSyntax, 4,
+                   "expected an expression, found keyword LEFT"},
         RejectCase{"TwoAliases", "SELECT a FROM events e ^f", kSyntax, 1,
                    "unexpected identifier f"},
         RejectCase{"AliasAfterAlias", "SELECT a FROM events e ^AS f", kSyntax, 2,
