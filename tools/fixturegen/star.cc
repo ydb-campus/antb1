@@ -142,7 +142,7 @@ arrow::Result<StarTable> MakeStar(std::string name, std::string prefix, int64_t 
     fields.push_back(arrow::field(column.name, column.type));
     arrays.push_back(std::move(array));
   }
-  auto table = arrow::Table::Make(arrow::schema(std::move(fields)), std::move(arrays), rows);
+  auto table = arrow::Table::Make(arrow::schema(std::move(fields)), arrays, rows);
   return StarTable{.name = std::move(name),
                    .prefix = std::move(prefix),
                    .table = std::move(table),
