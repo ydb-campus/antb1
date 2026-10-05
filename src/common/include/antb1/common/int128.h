@@ -42,6 +42,11 @@ Int128 PowerOfTen(int n);
 // its sign decides. Any Int128 is allowed, the minimum included (nothing is negated).
 int CompareScaled(Int128 a, int a_scale, Int128 b, int b_scale);
 
+// The unscaled value of scale `from` at scale `to` (scales 0 to 38), as DuckDB casts a DECIMAL:
+// multiplied up exactly (std::nullopt when that overflows an Int128), or divided down and rounded
+// half away from zero (q = value / (f / 2), then q +- 1, then q / 2, with f = 10^(from - to)).
+std::optional<Int128> Rescale(Int128 value, int from, int to);
+
 // numerator/denominator (denominator > 0) as a double, used for AVG over integers. Accurate to
 // about 1 ulp (exact integer accumulation, then one long double division); oracle comparisons use a
 // relative tolerance.
