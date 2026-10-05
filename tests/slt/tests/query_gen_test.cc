@@ -126,6 +126,7 @@ TEST(QueryGenerator, TargetSamplesCoverTheWholeGrammar) {
 
 TEST(QueryGenerator, QueriesRespectTheSemanticsBothEnginesShare) {
   const auto gen = Make(3, {.supported = kSupportedFeatures, .target_percent = 100});
+  int decimal_cases = 0;
   int decimal_sums = 0;
   int decimal_arithmetics = 0;
   int decimal_divisions = 0;
@@ -167,13 +168,13 @@ TEST(QueryGenerator, QueriesRespectTheSemanticsBothEnginesShare) {
     if (q.features.Has(Feature::kStar) && q.table == "big") {
       EXPECT_TRUE(q.features.Has(Feature::kLimit)) << q.sql;
     }
-    // DECIMAL columns: no CASE values yet (D4c); arithmetic with integer and decimal literals,
-    // / // % included; no literal with more than 10 fraction digits (w's scale; m has spare
-    // digits), which DuckDB would compare in a DECIMAL capped at 38 digits (divergence D13).
-    // Layout comments could hide a match.
+    // DECIMAL columns: CASE values; arithmetic with integer and decimal literals, / // %
+    // included; no literal with more than 10 fraction digits (w's scale; m has spare digits),
+    // which DuckDB would compare in a DECIMAL capped at 38 digits (divergence D13). Layout
+    // comments could hide a match.
     if (!q.features.Has(Feature::kLayout)) {
-      static const std::regex decimal_misuse(R"re(then "?[mw]\b|else "?[mw]\b)re");
-      EXPECT_FALSE(std::regex_search(sql, decimal_misuse)) << q.sql;
+      static const std::regex decimal_case(R"re(then "?[mw]\b|else "?[mw]\b)re");
+      decimal_cases += std::regex_search(sql, decimal_case) ? 1 : 0;
       static const std::regex decimal_sum(R"re((sum|avg)\( ?"?[mw]"?\))re");
       static const std::regex decimal_arithmetic(R"re("?\b[mw]\b"? ?[-+*] ?[0-9]+(?![.0-9]))re");
       static const std::regex decimal_division(R"re("?\b[mw]\b"? ?(/|//|%) ?[0-9])re");
@@ -224,6 +225,7 @@ TEST(QueryGenerator, QueriesRespectTheSemanticsBothEnginesShare) {
     EXPECT_FALSE(q.sql.contains("0.1000000000000000055511151231257827")) << q.sql;
     EXPECT_FALSE(q.sql.contains("it's")) << "quotes in string literals are doubled: " << q.sql;
   }
+  EXPECT_GT(decimal_cases, 10) << "DECIMAL CASE values";
   EXPECT_GT(decimal_sums, 10) << "SUM and AVG of DECIMAL columns";
   EXPECT_GT(decimal_arithmetics, 10) << "DECIMAL arithmetic with integer constants";
   EXPECT_GT(decimal_divisions, 10) << "/ // % of DECIMAL columns";
@@ -291,6 +293,118 @@ TEST(QueryGenerator, DecimalColumnComparisonsStayWithinDuckDbsCommonType) {
   }
 }
 
+// The values of each CASE in a lower-case query without layout comments: the operand after each
+// THEN and ELSE (a minus kept with its literal, quotes dropped), the first THEN value first, and
+// whether the CASE is an aggregate's argument.
+struct CaseValues {
+  std::vector<std::string> values;
+  bool aggregated = false;
+  bool summed = false;
+};
+std::vector<CaseValues> CasesOf(const std::string& sql) {
+  static const std::regex case_expr(R"re(\bcase\b(.*?)\bend\b)re");
+  static const std::regex value(R"re(\b(then|else) ?(-? ?"?[a-z0-9_.]+"?))re");
+  std::vector<CaseValues> out;
+  for (auto it = std::sregex_iterator(sql.begin(), sql.end(), case_expr);
+       it != std::sregex_iterator(); ++it) {
+    CaseValues c;
+    const std::string before = sql.substr(0, static_cast<std::size_t>(it->position()));
+    static const std::regex aggregate(R"re((sum|avg|min|max|count)\((distinct )?$)re");
+    static const std::regex sum(R"re((sum|avg)\($)re");
+    c.aggregated = std::regex_search(before, aggregate);
+    c.summed = std::regex_search(before, sum);
+    const std::string body = (*it)[1].str();
+    for (auto v = std::sregex_iterator(body.begin(), body.end(), value);
+         v != std::sregex_iterator(); ++v) {
+      std::string text = (*v)[2].str();
+      std::erase(text, '"');
+      std::erase(text, ' ');
+      c.values.push_back(std::move(text));
+    }
+    out.push_back(std::move(c));
+  }
+  return out;
+}
+
+// DECIMAL CASE values are cast to DuckDB's folded type (ADR 0021 rule 10), and the generator writes
+// none that could fail: b (BIGINT values of 13 digits) never next to n (DECIMAL(38,30): 8 integer
+// digits), k (INTEGER values of 4 digits) may be. As an aggregate's argument a CASE keeps its first
+// value's scale (x next to n or h would change it), and under SUM and AVG no value's sum leaves
+// 38 digits (h's would).
+TEST(QueryGenerator, DecimalCaseValuesNeverFailToCast) {
+  GenTable t{.name = "t", .path = {}, .rows = 10, .columns = {}};
+  Int128 h_max = 1;
+  for (int i = 0; i < 38; ++i) {
+    h_max *= 10;
+  }
+  h_max -= 1;
+  Int128 n_max = 1;
+  for (int i = 0; i < 30; ++i) {
+    n_max *= 10;
+  }
+  t.columns = {
+      {.name = "h",
+       .kind = ValueKind::kDecimal,
+       .samples = {"5"},
+       .precision = 38,
+       .scale = 0,
+       .abs_max = h_max},
+      {.name = "x",
+       .kind = ValueKind::kDecimal,
+       .samples = {"1.50"},
+       .precision = 9,
+       .scale = 2,
+       .abs_max = Int128{150}},
+      {.name = "n",
+       .kind = ValueKind::kDecimal,
+       .samples = {"1." + std::string(30, '0')},
+       .precision = 38,
+       .scale = 30,
+       .abs_max = n_max},
+      {.name = "b",
+       .kind = ValueKind::kInteger,
+       .min = std::numeric_limits<int64_t>::min(),
+       .max = std::numeric_limits<int64_t>::max(),
+       .samples = {"7"},
+       .data_min = -1'000'000'000'000,
+       .data_max = 1'000'000'000'000},
+      {.name = "k",
+       .kind = ValueKind::kInteger,
+       .min = std::numeric_limits<int32_t>::min(),
+       .max = std::numeric_limits<int32_t>::max(),
+       .samples = {"3"},
+       .data_min = -1000,
+       .data_max = 1000},
+  };
+  auto gen = QueryGenerator::Make({t}, 17, {.supported = kSupportedFeatures, .target_percent = 0});
+  ASSERT_TRUE(gen.has_value()) << gen.error();
+  int n_with_k = 0;
+  int x_with_b = 0;
+  int aggregated = 0;
+  for (uint64_t i = 0; i < 10000; ++i) {
+    const auto q = gen->Generate(i);
+    if (q.features.Has(Feature::kLayout)) {
+      continue;  // layout comments could split a match
+    }
+    for (const CaseValues& c : CasesOf(Lower(q.sql))) {
+      const auto has = [&](std::string_view name) { return std::ranges::contains(c.values, name); };
+      EXPECT_FALSE(has("n") && has("b")) << q.sql;
+      if (c.aggregated && !c.values.empty() && c.values.front() == "x") {
+        EXPECT_FALSE(has("n") || has("h")) << q.sql;
+      }
+      if (c.summed) {
+        EXPECT_FALSE(has("h")) << q.sql;
+      }
+      n_with_k += has("n") && has("k") ? 1 : 0;
+      x_with_b += has("x") && has("b") ? 1 : 0;
+      aggregated += c.aggregated && c.values.size() > 1 ? 1 : 0;
+    }
+  }
+  EXPECT_GT(n_with_k, 5);
+  EXPECT_GT(x_with_b, 5);
+  EXPECT_GT(aggregated, 5);
+}
+
 TEST(QueryGenerator, DecimalLiteralsStayWithinTheColumnsDigits) {
   GenTable t{.name = "t", .path = {}, .rows = 10, .columns = {}};
   t.columns = {{.name = "n",
@@ -322,10 +436,11 @@ TEST(QueryGenerator, DecimalLiteralsStayWithinTheColumnsDigits) {
 
 // The data range of a DECIMAL column keeps its SUM and arithmetic inside their types (an overflow
 // fails both engines, a SUM beyond 38 digits only antb1, D18): h (DECIMAL(38,0) at its largest
-// value) gets neither SUM, AVG nor a constant, only unary -, / and // and % by an integer (% 2.5
-// needs 39 digits, which DuckDB computes in DOUBLE); x (DECIMAL(18,4), capped to 18 digits by * k)
-// gets + k and SUM but not * 2 or * 1.5; y (DECIMAL(38,10), 10^38 - 10^12 at most, one
-// row) gets + 1 and + 7 but not + 100, which needs one more digit than DECIMAL(38,10) holds.
+// value) gets neither SUM, AVG nor a constant, only unary -, / and // and % by an integer, and
+// % 2.5 (39 digits: DOUBLE, -0 for a negative multiple) only as a select item; x (DECIMAL(18,4),
+// capped to 18 digits by * k) gets + k and SUM but not * 2 or * 1.5; y (DECIMAL(38,10), 10^38 -
+// 10^12 at most, one row) gets + 1 and + 7 but not + 100, which needs one more digit than
+// DECIMAL(38,10) holds.
 TEST(QueryGenerator, DecimalDataRangesKeepSumsAndArithmeticInTheirTypes) {
   Int128 digits38 = 1;
   for (int i = 0; i < 38; ++i) {
@@ -361,12 +476,14 @@ TEST(QueryGenerator, DecimalDataRangesKeepSumsAndArithmeticInTheirTypes) {
   static const std::regex h_division(R"re("?\bh\b"? ?(/|//|%) ?[0-9])re");
   static const std::regex x_times(R"re("?\bx\b"? ?\* ?[0-9])re");
   static const std::regex h_wide_modulo(R"re("?\bh\b"? ?% ?2\.5)re");
+  static const std::regex h_wide_item(R"re((select|,) "?h"? ?% ?2\.5)re");
   static const std::regex x_plus(R"re("?\bx\b"? ?[-+] ?[0-9])re");
   static const std::regex x_sum(R"re((sum|avg)\( ?"?x\b)re");
   static const std::regex y_hundred(R"re("?\by\b"? ?[-+] ?100\b)re");
   static const std::regex y_small(R"re("?\by\b"? ?[-+] ?[17]\b)re");
   int h_negations = 0;
   int h_divisions = 0;
+  int h_wide_moduli = 0;
   int x_additions = 0;
   int x_sums = 0;
   int y_additions = 0;
@@ -379,7 +496,9 @@ TEST(QueryGenerator, DecimalDataRangesKeepSumsAndArithmeticInTheirTypes) {
     EXPECT_FALSE(std::regex_search(sql, h_sum)) << q.sql;
     EXPECT_FALSE(std::regex_search(sql, h_constant)) << q.sql;
     EXPECT_FALSE(std::regex_search(sql, x_times)) << q.sql;
-    EXPECT_FALSE(std::regex_search(sql, h_wide_modulo)) << q.sql;
+    const bool wide = std::regex_search(sql, h_wide_modulo);
+    EXPECT_EQ(wide, std::regex_search(sql, h_wide_item)) << q.sql;
+    h_wide_moduli += wide ? 1 : 0;
     EXPECT_FALSE(std::regex_search(sql, y_hundred)) << q.sql;
     h_negations += std::regex_search(sql, h_negated) ? 1 : 0;
     h_divisions += std::regex_search(sql, h_division) ? 1 : 0;
@@ -389,6 +508,7 @@ TEST(QueryGenerator, DecimalDataRangesKeepSumsAndArithmeticInTheirTypes) {
   }
   EXPECT_GT(h_negations, 10);
   EXPECT_GT(h_divisions, 10);
+  EXPECT_GT(h_wide_moduli, 2);
   EXPECT_GT(x_additions, 10);
   EXPECT_GT(x_sums, 10);
   EXPECT_GT(y_additions, 10);
