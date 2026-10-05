@@ -1872,8 +1872,9 @@ class Parser {
                         .span = path.span};
       }
       case TokenKind::kLeftParen: {
-        // DuckDB's subqueries, else its joins in parentheses; a table alone in them is a syntax
-        // error (as far as three tokens tell).
+        // DuckDB's subqueries, else its joins in parentheses. A table alone in them, or before a
+        // comma or the end, is a syntax error, as in DuckDB; anything else after the table is
+        // taken for a join (as far as three tokens tell).
         const Token& next = PeekAt(1);
         if (next.kind == TokenKind::kLeftParen || Contains(kSubqueryStarts, KeywordOf(next))) {
           return Unsupported(token.span, "subqueries in FROM are not supported");
@@ -1884,9 +1885,11 @@ class Parser {
                         "found " +
                             Describe(next));
         }
-        if (PeekAt(2).kind == TokenKind::kRightParen) {
-          return Syntax(PeekAt(2).span,
-                        "expected a join after the table in parentheses, found ')'");
+        if (const Token& after = PeekAt(2);
+            after.kind == TokenKind::kRightParen || after.kind == TokenKind::kComma ||
+            after.kind == TokenKind::kSemicolon || after.kind == TokenKind::kEnd) {
+          return Syntax(after.span,
+                        "expected a join after the table in parentheses, found " + Describe(after));
         }
         return Unsupported(token.span, "parenthesized joins in FROM are not supported");
       }

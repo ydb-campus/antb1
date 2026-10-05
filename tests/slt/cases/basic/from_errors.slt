@@ -133,6 +133,13 @@ statement error ^Parser Error:
 SELECT COUNT(*) FROM (edge)
 
 statement error
+SELECT COUNT(*) FROM (edge, floats)
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM (edge, floats)
+
+statement error
 SELECT COUNT(*) FROM '${FIXTURES}/edge.parquet'.id
 
 onlyif duckdb
