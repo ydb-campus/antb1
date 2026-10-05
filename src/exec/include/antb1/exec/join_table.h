@@ -45,9 +45,10 @@
 //
 // Errors: what a correct physical plan never sends (a key of a wrong type, a part added twice) is
 // Invalid; passing the memory limit, or 4294967295 rows, is OutOfMemory, and so is std::bad_alloc.
-// Memory: every container is charged to the budget before it is allocated (MemoryReservation), and
-// Arrow buffers come from the pool given to Append; a finished table keeps its memory until it is
-// destroyed. The budget must outlive the parts, the builder and the table.
+// Memory: every container of a build is charged to the budget before it is allocated
+// (MemoryReservation), and the build's Arrow buffers come from the pool given to Append; a finished
+// table keeps its memory until it is destroyed. The budget must outlive the parts, the builder and
+// the table. A probe (Find) is not charged for its hashes, as GROUP BY's routing is not.
 
 namespace antb1::exec {
 
@@ -162,8 +163,10 @@ class JoinTable {
   // The matches of every probe row: out[i] for row i of `keys` (one array per build key, of its
   // type, all of one length), the build rows whose keys equal row i's, in (part, row) order. A row
   // that is not selected (`selection`: nullptr for every row), has a NULL key or matches nothing
-  // gets an empty range ({0, 0}). Probe buffers (a NULL bitmap, hashes) come from `pool`. Invalid
-  // for keys of another count, type or length, a selection of another length or a short `out`.
+  // gets an empty range ({0, 0}). Probe buffers come from `pool` (a NULL bitmap and, when at most a
+  // quarter of the rows are kept, their positions and a copy of their keys), except the hashed
+  // layout's hashes: a temporary std::vector that no budget sees. Invalid for keys of another
+  // count, type or length, a selection of another length or a short `out`.
   arrow::Status Find(std::span<const std::shared_ptr<arrow::Array>> keys,
                      const arrow::BooleanArray* selection, arrow::MemoryPool* pool,
                      std::span<JoinMatches> out) const;
