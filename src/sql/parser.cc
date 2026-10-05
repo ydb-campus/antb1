@@ -204,15 +204,15 @@ constexpr auto kMultiWordTypes = std::to_array<WordPair>({
     {.first = "TIMESTAMP", .second = "WITHOUT"},
 });
 
-// What a word of kNotAnAlias means right after a FROM item in DuckDB, decided by the token that
-// follows it.
+// What a word of kNotAnAlias means right after a FROM item in DuckDB, decided by the tokens that
+// follow it.
 enum class Follows : std::uint8_t {
   kNothing,   // no meaning there
   kJoin,      // JOIN: SEMI JOIN, ANTI JOIN, POSITIONAL JOIN
-  kAsofJoin,  // JOIN or a join kind (kJoinKinds): ASOF [INNER | LEFT | ...] JOIN
+  kAsofJoin,  // JOIN, or a join kind (kJoinKinds) and JOIN: ASOF [INNER | LEFT [OUTER] | ...] JOIN
   kParen,     // '(': AT (VERSION => 1), PIVOT (...)
   kUnpivot,   // '(', INCLUDE or EXCLUDE: UNPIVOT [INCLUDE NULLS] (...)
-  kSample,    // a number, a name or '(': TABLESAMPLE 10%, TABLESAMPLE reservoir(10)
+  kSample,    // a number, '(' or a name and '(': TABLESAMPLE 10%, TABLESAMPLE reservoir(10)
 };
 
 struct NotAnAlias {
@@ -306,7 +306,8 @@ constexpr auto kNotAnAlias = std::to_array<NotAnAlias>({
 constexpr auto kAliasKeywords =
     std::to_array<std::string_view>({"BETWEEN", "EXISTS", "INTERVAL", "OVER"});
 
-// The words after NATURAL or ASOF that make a join of DuckDB's (NATURAL SEMI JOIN, ASOF LEFT JOIN).
+// The words after NATURAL or ASOF that start a join of DuckDB's (NATURAL SEMI JOIN, ASOF LEFT JOIN;
+// IncompleteJoinKind checks the rest).
 constexpr auto kJoinKinds =
     std::to_array<std::string_view>({"ANTI", "FULL", "INNER", "JOIN", "LEFT", "RIGHT", "SEMI"});
 
@@ -1699,7 +1700,10 @@ class Parser {
       stmt.from.push_back(*std::move(item));
       if (Peek().kind == TokenKind::kComma) {
         connector_span = Take().span;
-        if (EndsList(Peek())) {  // DuckDB allows it
+        // DuckDB allows a trailing comma before the end and the clauses after FROM. Before FROM
+        // or INTO it gives a syntax error, and so does ParseTableRef.
+        if (const Token& next = Peek();
+            EndsList(next) && !next.IsKeyword("FROM") && !next.IsKeyword("INTO")) {
           return Unsupported(connector_span, "a trailing comma in FROM is not supported");
         }
         connector = Connector::kComma;
@@ -1726,6 +1730,9 @@ class Parser {
   // ends). At most three tokens of lookahead (LEFT OUTER JOIN). The joins that DuckDB has and the
   // subset lacks are kUnsupported; a join keyword without the rest is a syntax error, as in DuckDB.
   Expected<std::optional<JoinKeywords>> ParseJoinKeywords() {
+    if (auto error = IncompleteJoin()) {
+      return std::unexpected(std::move(*error));
+    }
     const Token& token = Peek();
     const std::string keyword = KeywordOf(token);
     const auto take = [this](Connector connector, std::size_t words) {
@@ -1740,34 +1747,66 @@ class Parser {
       return take(Connector::kInner, 1);
     }
     if (keyword == "INNER" || keyword == "CROSS") {
-      if (!PeekAt(1).IsKeyword("JOIN")) {
-        return Syntax(PeekAt(1).span,
-                      "expected JOIN after " + keyword + ", found " + Describe(PeekAt(1)));
-      }
       return take(keyword == "INNER" ? Connector::kInner : Connector::kCross, 2);
     }
-    if (keyword == "LEFT" || keyword == "RIGHT" || keyword == "FULL") {
-      const bool outer = PeekAt(1).IsKeyword("OUTER");
-      const Token& join = PeekAt(outer ? 2 : 1);
-      if (!join.IsKeyword("JOIN")) {
-        return Syntax(join.span, "expected JOIN after " + keyword + (outer ? " OUTER" : "") +
-                                     ", found " + Describe(join));
-      }
-      if (keyword != "LEFT") {
-        return Unsupported(token.span, keyword + " JOIN is not supported");
-      }
-      return take(Connector::kLeft, outer ? 3 : 2);
+    if (keyword == "LEFT") {
+      return take(Connector::kLeft, PeekAt(1).IsKeyword("OUTER") ? 3 : 2);
+    }
+    if (keyword == "RIGHT" || keyword == "FULL") {
+      return Unsupported(token.span, keyword + " JOIN is not supported");
     }
     if (keyword == "NATURAL") {
-      if (!Contains(kJoinKinds, KeywordOf(PeekAt(1)))) {
-        return Syntax(PeekAt(1).span, "expected JOIN after NATURAL, found " + Describe(PeekAt(1)));
-      }
       return Unsupported(token.span, "NATURAL JOIN is not supported");
     }
     if (keyword == "OUTER") {
       return Syntax(token.span, "expected LEFT, RIGHT or FULL before OUTER");
     }
     return std::nullopt;
+  }
+
+  // A syntax error when the join keyword at the next token lacks the rest of its join, as in
+  // DuckDB; std::nullopt otherwise, also when no join keyword is there. Within three tokens: the
+  // JOIN of NATURAL LEFT OUTER JOIN is beyond them.
+  std::optional<ParseError> IncompleteJoin() {
+    const std::string keyword = KeywordOf(Peek());
+    if (keyword == "INNER" || keyword == "CROSS") {
+      return ExpectJoinAt(1, keyword);
+    }
+    if (keyword == "LEFT" || keyword == "RIGHT" || keyword == "FULL") {
+      return PeekAt(1).IsKeyword("OUTER") ? ExpectJoinAt(2, keyword + " OUTER")
+                                          : ExpectJoinAt(1, keyword);
+    }
+    if (keyword == "NATURAL") {
+      return IncompleteJoinKind();
+    }
+    return std::nullopt;
+  }
+
+  // After NATURAL or ASOF at the next token: a syntax error unless a join of DuckDB's follows,
+  // JOIN, or INNER, SEMI or ANTI and then JOIN, or LEFT, RIGHT or FULL and then JOIN or OUTER (the
+  // JOIN after OUTER is beyond the three tokens).
+  std::optional<ParseError> IncompleteJoinKind() {
+    const std::string word = KeywordOf(Peek());
+    const std::string kind = KeywordOf(PeekAt(1));
+    if (kind == "JOIN") {
+      return std::nullopt;
+    }
+    if (!Contains(kJoinKinds, kind)) {
+      return ExpectJoinAt(1, word);
+    }
+    if ((kind == "LEFT" || kind == "RIGHT" || kind == "FULL") && PeekAt(2).IsKeyword("OUTER")) {
+      return std::nullopt;
+    }
+    return ExpectJoinAt(2, word + " " + kind);
+  }
+
+  // A syntax error unless PeekAt(ahead) is JOIN; `after` names the words before it.
+  std::optional<ParseError> ExpectJoinAt(std::size_t ahead, const std::string& after) {
+    const Token& token = PeekAt(ahead);
+    if (token.IsKeyword("JOIN")) {
+      return std::nullopt;
+    }
+    return SyntaxError(token.span, "expected JOIN after " + after + ", found " + Describe(token));
   }
 
   // from_item: a table or a path, then its alias. After an item a word of kNotAnAlias is never an
@@ -1911,7 +1950,7 @@ class Parser {
   enum class After : std::uint8_t { kItem, kOn };
 
   // kUnsupported when the word of kNotAnAlias at the next token has its DuckDB meaning there (after
-  // a FROM item, or after an ON condition), told by the token after it; std::nullopt otherwise.
+  // a FROM item, or after an ON condition), told by the tokens after it; std::nullopt otherwise.
   std::optional<ParseError> Meaning(const NotAnAlias& word, After after) {
     if (after == After::kOn && !word.after_on) {
       return std::nullopt;
@@ -1925,7 +1964,7 @@ class Parser {
         means = next.IsKeyword("JOIN");
         break;
       case Follows::kAsofJoin:
-        means = Contains(kJoinKinds, KeywordOf(next));
+        means = !IncompleteJoinKind().has_value();
         break;
       case Follows::kParen:
         means = next.kind == TokenKind::kLeftParen;
@@ -1936,7 +1975,8 @@ class Parser {
         break;
       case Follows::kSample:
         means = next.kind == TokenKind::kInteger || next.kind == TokenKind::kDecimal ||
-                next.kind == TokenKind::kLeftParen || IsName(next);
+                next.kind == TokenKind::kLeftParen ||
+                (IsName(next) && PeekAt(2).kind == TokenKind::kLeftParen);
         break;
     }
     if (!means) {
@@ -1955,7 +1995,11 @@ class Parser {
                            "JOIN ... USING is not supported (write the condition with ON)");
       }
       if (Contains(kJoinStarts, KeywordOf(token))) {
-        return Unsupported(token.span,
+        const SourceSpan join = token.span;
+        if (auto error = IncompleteJoin()) {  // not a join after all: a syntax error, as in DuckDB
+          return std::unexpected(std::move(*error));
+        }
+        return Unsupported(join,
                            "nested joins (a JOIN before the ON of an earlier JOIN) are not "
                            "supported");
       }

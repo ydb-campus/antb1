@@ -84,6 +84,20 @@ statement error ^Parser Error:
 SELECT COUNT(*) FROM edge NATURAL CROSS JOIN floats
 
 statement error
+SELECT COUNT(*) FROM edge NATURAL LEFT floats
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge NATURAL LEFT floats
+
+statement error
+SELECT COUNT(*) FROM edge JOIN floats LEFT decimals ON edge.id = floats.id
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge JOIN floats LEFT decimals ON edge.id = floats.id
+
+statement error
 SELECT COUNT(*) JOIN floats ON edge.id = floats.id
 
 onlyif duckdb
@@ -103,6 +117,13 @@ SELECT COUNT(*) FROM edge, , floats
 onlyif duckdb
 statement error ^Parser Error:
 SELECT COUNT(*) FROM edge, , floats
+
+statement error
+SELECT COUNT(*) FROM edge, FROM floats
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge, FROM floats
 
 statement error
 SELECT COUNT(*) FROM (edge)
@@ -214,6 +235,20 @@ SELECT COUNT(*) FROM edge TABLESAMPLE WHERE edge.id = 1
 onlyif duckdb
 statement error ^Parser Error:
 SELECT COUNT(*) FROM edge TABLESAMPLE WHERE edge.id = 1
+
+statement error
+SELECT COUNT(*) FROM edge TABLESAMPLE reservoir WHERE edge.id = 1
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge TABLESAMPLE reservoir WHERE edge.id = 1
+
+statement error
+SELECT COUNT(*) FROM edge ASOF LEFT floats ON edge.id >= floats.id
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge ASOF LEFT floats ON edge.id >= floats.id
 
 statement error
 SELECT COUNT(*) FROM edge JOIN floats semi ON edge.id = floats.id

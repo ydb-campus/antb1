@@ -142,7 +142,7 @@ are the same expression.
   `SYMMETRIC`, `TABLESAMPLE`, `TO`, `TRAILING`, `UNIQUE`, `UNPACK`, `UNPIVOT`, `VARIADIC` and `VERBOSE`. After a FROM
   item (a table, a path or an alias) such a word is unsupported where DuckDB gives it a meaning: `SEMI`, `ANTI` or
   `POSITIONAL` before `JOIN`, `ASOF` before a join, `AT (` (time travel), `PIVOT (`, `UNPIVOT` before `(`, `INCLUDE`
-  or `EXCLUDE`, and `TABLESAMPLE` before a number, a name or `(`; after an `ON` condition the joins, `PIVOT` and
+  or `EXCLUDE`, and `TABLESAMPLE` before a number, `(` or a name and `(`; after an `ON` condition the joins, `PIVOT` and
   `UNPIVOT`, and the operators `GLOB`, `AT TIME ZONE`, `ISNULL` and `NOTNULL`. Anywhere else after a FROM item it is a
   syntax error, as in DuckDB (`FROM t semi`: a table alias cannot be the keyword SEMI). Read as an alias, `SEMI` and
   `ANTI` would turn DuckDB's semi and anti joins into inner joins. Quoted (`FROM t "semi"`) every word is an alias,
@@ -201,7 +201,8 @@ joins, nested joins (a `JOIN` before the `ON` of an earlier one) and joins in pa
 `ONLY`, table functions, column alias lists (`t AS a(x, y)`), `PIVOT`, `UNPIVOT`, `AT (...)` (time travel),
 `TABLESAMPLE`, a trailing comma and an empty string alias (`AS ''`). Malformed SQL, such as `SELECT COUNT(*) FORM t`,
 is a syntax error with exit code 1, and so is a join keyword where DuckDB has none (`SELECT 1 JOIN u`, a `JOIN` after
-`WHERE`).
+`WHERE`) or without the rest of its join (`LEFT u`, `NATURAL LEFT u`, also before the `ON` of a `JOIN`), and a
+trailing comma before `FROM` or `INTO`.
 
 ## Binding
 
