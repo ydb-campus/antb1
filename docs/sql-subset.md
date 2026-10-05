@@ -131,8 +131,11 @@ are the same expression.
 - Qualified names: a `column_ref` has at most one qualifier (`t.x`), and comments and spaces around the dot are
   allowed. Either part may be quoted (`"T"."x y"`), and a reserved word on either side must be: `t.from` and the
   qualifiers `between`, `exists`, `interval` and `over`, which DuckDB accepts, are unsupported, and any other reserved
-  word before the dot is an error, as in DuckDB. `t.*`, `a.b.c`, `t.f()` and a qualified name before a string
-  (`main.integer '5'`, which DuckDB reads as a typed literal of a qualified type) are unsupported.
+  word before the dot is an error, as in DuckDB, unless the parser takes the word there for the start of a construct
+  that it does not support and reports that (exit code 4, where DuckDB gives a syntax error): `ALL`, `ANY`, `ARRAY`,
+  `DISTINCT`, `FALSE`, `NULL`, `SOME` and `TRUE` (`null.a`: NULL literals are not supported; `SELECT DISTINCT.a`).
+  `t.*`, `a.b.c`, `t.f()` and a qualified name before a string (`main.integer '5'`, which DuckDB reads as a typed
+  literal of a qualified type) are unsupported.
 - Table aliases: after `AS` a name, a quoted identifier or a non-empty string literal (`AS 'a'`, as DuckDB); without
   `AS` a name or a quoted identifier. As in DuckDB, `BETWEEN`, `EXISTS`, `INTERVAL` and `OVER` are table aliases with
   or without `AS`, although they are reserved elsewhere, and these 49 words, which antb1 does not reserve, never are:
@@ -155,7 +158,9 @@ are the same expression.
 
 - FROM: one table or path, without an alias. A FROM list of several items (a comma or any join), a table alias and a
   qualified column name (`t.x`, anywhere in the query) parse and are rejected with exit code 4, in query order and
-  before any table resolves, so also over tables that do not exist (ADR 0022 plans their answers);
+  before any table resolves, so also over tables that do not exist (ADR 0022 plans their answers), except inside the
+  arguments of a call with the wrong number of arguments, which stays a bind error (`strlen(t.s, 1)`: strlen() takes 1
+  argument, not 2; over a table that does not exist, the missing table is the error);
 - date casts: `CAST('YYYY-MM-DD' AS DATE)` and `'YYYY-MM-DD'::DATE` are the literal `DATE 'YYYY-MM-DD'`
   wherever it may stand, as in DuckDB (which names all three `CAST('YYYY-MM-DD' AS "DATE")`);
 - value expressions: columns, literals, aggregates, arithmetic (`+ - * / // %`, unary `-`), the functions
@@ -224,7 +229,8 @@ items).
 - Names: table and column names match ASCII case-insensitively, quoted identifiers included (as in DuckDB). An
   unknown table or column is a bind error, and so is a name that matches two columns differing only in case. A
   column of an unsupported type fails with exit code 4 wherever it is referenced (by `SELECT *` too). A table alias,
-  a qualified column name and a FROM list of several items are unsupported (exit code 4, before the table resolves).
+  a qualified column name and a FROM list of several items are unsupported (exit code 4, before the table resolves),
+  except a qualified name inside the arguments of a call with the wrong number of arguments, which stays a bind error.
 - Select list: `*` alone, or plain columns, aggregates and constants. Without `GROUP BY`, aggregates (in the select
   list, in `HAVING` or in `ORDER BY`) and `HAVING` itself cannot be mixed with plain columns: a bind error at the
   first plain column (or at `*`). Constants mix with anything; with an aggregate (also one only in `HAVING` or

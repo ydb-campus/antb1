@@ -25,8 +25,11 @@ inline constexpr std::size_t kMaxExpressionDepth = 256;
 // and every error span lies inside `text`.
 std::expected<SelectStatement, ParseError> Parse(std::string_view text);
 
-// Whether `word` (ASCII case-insensitive) is reserved: as a column, table or alias name it must be
-// written as a quoted identifier ("from"). Used to quote names that need it, e.g. in result names.
+// Whether `word` (ASCII case-insensitive) is reserved: as a column name, a table name or a select
+// alias it must be written as a quoted identifier ("from"). Used to quote names that need it, e.g.
+// in result names. Table aliases follow DuckDB's own rules instead (divergence D21 in
+// docs/sql-subset.md): four reserved words are valid unquoted table aliases, 49 unreserved words
+// are none, and ToSql quotes every alias.
 bool IsReservedWord(std::string_view word);
 
 }  // namespace antb1::sql

@@ -3654,9 +3654,11 @@ arrow::Status Binder::BindHaving() {
 }
 
 // ORDER BY items in the query's scope. kGlobal checks the items and returns no key: one row needs
-// no sort. A select alias comes before a table column, as in DuckDB; an unsigned integer is a
-// position in the select list; a constant (a constant item, or any other literal) orders nothing;
-// a later key on a column already ordered by changes nothing and is dropped.
+// no sort. A select alias comes before a table column, as in DuckDB, and a qualified name (t.x)
+// never names an alias: that guard is for J2b (ADR 0022), since until then CheckSupported rejects
+// a qualified ORDER BY item before the binder runs. An unsigned integer is a position in the select
+// list; a constant (a constant item, or any other literal) orders nothing; a later key on a column
+// already ordered by changes nothing and is dropped.
 arrow::Status Binder::BindOrderBy() {
   alias_fallback_ = true;
   for (const sql::OrderItem& item : stmt_.order_by) {
@@ -3668,7 +3670,7 @@ arrow::Status Binder::BindOrderBy() {
       }
     } else if (const auto* ref = std::get_if<sql::ColumnRef>(&item.expr);
                ref != nullptr && ref->qualifier.empty() &&
-               FindAlias(select_, ref->name).has_value()) {  // t.x never names an alias
+               FindAlias(select_, ref->name).has_value()) {  // J2b: t.x never names an alias
       const std::size_t alias = FindAlias(select_, ref->name).value_or(0);
       ARROW_ASSIGN_OR_RAISE(key, ItemOutput(alias));
     } else {
