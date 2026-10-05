@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791185828607,
+  "lastUpdate": 1791227352151,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -4908,6 +4908,90 @@ window.BENCHMARK_DATA = {
             "value": 14.803518872340307,
             "unit": "ms/iter",
             "extra": "iterations: 47\ncpu: 14.803312659574484 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9183ca73f39783583b3625f0c1e0b86f4095e3a6",
+          "message": "test: decimal avg expectations for the quad long double of arm64 linux (#99)\n\n## Summary\n\nThe nightly has been red since 2026-10-04. Its `arm64` job fails two\ntests in `pixi run release`:\n\n- `common.Int128Test.DuckDbDecimalAverage`\n- `exec.AggregateStateTest.SumAndAvgOfDecimals`\n\nDuckDB's AVG of a DECIMAL divides in `long double` (ADR 0021 rule 13),\nand antb1 follows it on each platform. The two tests only had\nexpectations for two of the three platforms:\n\n- x86-64 Linux: x87, 64-bit mantissa (had expectations);\n- arm64 macOS: double, 53 bits (had expectations);\n- arm64 Linux, the nightly's `ubuntu-24.04-arm` runner: IEEE quad, 113\nbits (no expectations; arm64 Linux fell back to the double values).\n\nThis PR is test-only, plus a correction to ADR 0021. The engine already\ncomputes DuckDB's arm64 Linux answer.\n\n- `int128_test.cc`: each case gains a `quad` value. A helper picks the\nvalue for the platform's `long double` digits (64, 113 or 53). The test\nfails up front for any other `long double`.\n- `int128_test.cc` also gains the case 2^120 + 2^67 + 1. Every quad\nanswer above equals the correctly rounded mean, so on arm64 Linux the\ntest could not tell DuckDB's formula from a plain division. This case\nmisses the correctly rounded mean on all three platforms: the sum of the\nhalves rounds to 2^120 + 2^67 even in quad, then ties to even. DuckDB on\nx86-64 returns `1.329227995784916e+36` for it.\n- `aggregate_state_test.cc`: the halves case 27670116110564329473 (2^64\n+ 2^63 + 2049) expects `2.767011611056433e+19` with a quad `long\ndouble`. Elsewhere it stays `2.7670116110564327e+19`. The value rounds\ntwice with x87 (the sum, then to double) and with double (the lower\nhalf, then the sum), but only once with quad.\n\n**How the quad values were derived:** from an exact emulation of the\nformula with rational numbers, rounding to nearest-even at 53, 64 or 113\nbits.\n- At 53 and 64 bits, the emulation reproduces all 9 existing double and\nx87 values. Those values had been checked against DuckDB on x86-64.\n- At 113 bits, it gives exactly what the arm64 runner computed for the\nexisting nine cases:\n- the three values it reported in the failures\n(`-3.0138426485904376e+29`, `-6.4031967718413915e+28`,\n`2.7670116110564332e+19`);\n  - the six cases that passed there, where quad equals double.\n\n**ADR 0021 rule 13** (a separate docs commit, as you agreed):\n- It now names arm64 Linux's IEEE quad.\n- It corrects the example: x87 rounds twice there, not once.\n- 27670116110564329473 averages to 27670116110564327424.0 on x86-64\nLinux and arm64 macOS, and to the correctly rounded\n27670116110564331520.0 on arm64 Linux.\n\nCloses #92\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [x] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full                  # on 45bced9 (the head)\nlint: PASS\n100% tests passed out of 1811          # ci (clang Debug -Werror)\n100% tests passed out of 1811          # asan (ASan + UBSan)\n                                       # tidy: clean\ncoverage: PASS\n100% tests passed out of 2             # fuzz-smoke\n100% tests passed out of 1811          # ci-gcc\n$ pixi run test -R 'DuckDbDecimalAverage|SumAndAvgOfDecimals'   # x86-64 Linux: the x87 column\nANTB1-TESTS: PASS preset=dev junit=build/dev/junit.xml\n$ duckdb -c \"SELECT AVG(v) FROM (VALUES (1329227995784916020477759649956757505::DECIMAL(38,0))) t(v)\"   # v1.5.5, x86-64\n1.329227995784916e+36\n```\n\nThe PR checks have no arm64 Linux leg; only the nightly runs one. Two\nways to confirm before closing #92: a manual run, `gh workflow run\nnightly.yml --ref test/quad-long-double-avg`, or tomorrow's scheduled\nnightly after the merge. The arm64 job's second half, `pixi run\ntest-data`, has not run since 2026-10-04, because `release` failed\nfirst.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed): the change is the tests\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed: ADR 0021 rule 13\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: the ADR 0021 rule 13 correction\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code read the arm64\njob logs of both failing nightlies, derived the quad values with an\nexact emulation checked against both existing columns and the runner's\noutput, and wrote the change. clang-tidy's dead-store finding shaped the\nselection helper. The reviewer agent confirmed the values with its own\nemulation and with DuckDB on x86-64. It found that ADR 0021 rule 13\ncontradicted the tests (fixed in the docs commit) and that the quad\nanswers were all correctly rounded (hence the new case); it also had two\ncomment nits, both fixed.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-10-05T22:06:09+03:00",
+          "tree_id": "4ca7c6a4fc72430e23e78df64ac2ff049c06c11a",
+          "url": "https://github.com/ydb-campus/antb1/commit/9183ca73f39783583b3625f0c1e0b86f4095e3a6"
+        },
+        "date": 1791227351074,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4018.852756827511,
+            "unit": "ns/iter",
+            "extra": "iterations: 174222\ncpu: 4018.4729942257572 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 93785.70541222623,
+            "unit": "ns/iter",
+            "extra": "iterations: 7132\ncpu: 93756.00616937745 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 94515.08957038744,
+            "unit": "ns/iter",
+            "extra": "iterations: 7402\ncpu: 94475.70953796274 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 368203.18506834283,
+            "unit": "ns/iter",
+            "extra": "iterations: 1902\ncpu: 368060.5294426919 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 383303.3515881737,
+            "unit": "ns/iter",
+            "extra": "iterations: 1826\ncpu: 383118.7119386636 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2564559.194852917,
+            "unit": "ns/iter",
+            "extra": "iterations: 272\ncpu: 2564015.808823529 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 60.11763566666654,
+            "unit": "ms/iter",
+            "extra": "iterations: 12\ncpu: 60.089780833333386 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 57.31881236363795,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 57.31534372727267 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 197.51451666666262,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 197.49085766666676 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 13.871261509803826,
+            "unit": "ms/iter",
+            "extra": "iterations: 51\ncpu: 13.870375725490199 ms\nthreads: 1"
           }
         ]
       }
