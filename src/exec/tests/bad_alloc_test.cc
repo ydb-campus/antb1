@@ -1,7 +1,8 @@
-// std::bad_alloc in ForEach and in the join hash table (docs/adr/0022-joins-and-query-blocks.md):
-// an allocation of the C++ heap that fails anywhere in a call gives OutOfMemory, never an exception
-// (ForEach lets one out only when not even its OutOfMemory can be made, and only once its tasks
-// ended), and fails a build for good, with no part counted twice and nothing left in the budget.
+// std::bad_alloc in ForEach, the partition lanes and the join hash table
+// (docs/adr/0022-joins-and-query-blocks.md): an allocation of the C++ heap that fails anywhere in a
+// call gives OutOfMemory, never an exception (ForEach lets one out only when not even its
+// OutOfMemory can be made, and only once its tasks ended); it stops the lanes as the serial order
+// would, and fails a build for good, with no part counted twice and nothing left in the budget.
 //
 // The allocation hook. This executable replaces the global operator new and delete, so it is not
 // part of the shared antb1_exec_tests binary. On a thread where a FailAllocations is armed,
@@ -12,6 +13,7 @@
 // ThreadSanitizer the executable links without the sanitizer's own operator new
 // (src/exec/CMakeLists.txt); the sanitizer still sees every allocation, through malloc and free.
 
+#include <algorithm>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -348,6 +350,128 @@ TEST(ForEachBadAllocTest, AFailedSubmitAllocatesNothingMore) {
   EXPECT_EQ(failed, 0);
   for (std::size_t i = 0; i < kTasks; ++i) {
     EXPECT_EQ(ran[i], std::cmp_less(i, kFailAt) ? 1 : 0) << i;
+  }
+}
+
+// ---- The partition lanes ----
+
+// A lane that cannot queue a part (std::bad_alloc in its queue) while it holds earlier parts merges
+// them first: the failure of an earlier part there wins, whatever the timing, and Add returns it.
+// The lane holds its parts while part 0's merge waits; the allocation that fails is the first one
+// a part's queuing makes after the part's own, when the lane's queue needs more memory, and it
+// lets part 0's merge go on.
+TEST(PartitionLanesBadAllocTest, ALaneThatCannotQueueAPartStillMergesThePartsBeforeIt) {
+  const auto pool = StartedPool();
+  UnhookedSpawns spawns(pool.get());
+  constexpr int64_t kMaxParts = 100000;
+  std::mutex mu;
+  std::condition_variable cv;
+  bool open = false;
+  const std::function<void()> open_gate = [&] {
+    {
+      const std::scoped_lock lock(mu);
+      open = true;
+    }
+    cv.notify_all();
+  };
+  PartitionLanes lanes(1, &spawns, kMaxParts);
+  struct OpenAtExit {  // so that no lane waits when a check ends the test early
+    const std::function<void()>& open;
+    ~OpenAtExit() { open(); }
+  };
+  const OpenAtExit open_at_exit{open_gate};
+  ASSERT_TRUE(lanes
+                  .Add(0,
+                       [&](std::size_t) {
+                         std::unique_lock lock(mu);
+                         cv.wait(lock, [&] { return open; });
+                         return arrow::Status::OK();
+                       })
+                  .ok());
+  ASSERT_TRUE(lanes.Add(1, [](std::size_t) { return arrow::Status::Invalid("part 1"); }).ok());
+  arrow::Status added;
+  for (int64_t part = 2;; ++part) {
+    ASSERT_LT(part, kMaxParts) << "queuing a part never allocated";
+    PartitionLanes::Merge merge = [](std::size_t) { return arrow::Status::OK(); };
+    bool fired = false;
+    {
+      const FailAllocations fail(/*skip=*/1, /*count=*/1, open_gate);
+      added = lanes.Add(part, std::move(merge));
+      fired = fail.failed() > 0;
+    }
+    if (fired) {
+      break;
+    }
+    ASSERT_TRUE(added.ok()) << added.ToString();
+  }
+  EXPECT_EQ(added.ToString(), arrow::Status::Invalid("part 1").ToString());
+  EXPECT_EQ(lanes.Finish().ToString(), added.ToString());
+  EXPECT_EQ(lanes.pending(), 0);
+}
+
+// An allocation that fails in an Add, each in turn (the part, a lane's queue, Arrow's Submit of a
+// lane's task; without an executor, a merge on this thread): Add returns OutOfMemory, and so do
+// every later Add and Finish; every lane has merged the parts before, in order, and none after;
+// every merge function is released. An Add that goes through has every lane merge the part.
+TEST(PartitionLanesBadAllocTest, AnAddThatRunsOutOfMemoryStopsTheLanes) {
+  const auto pool = StartedPool();
+  UnhookedSpawns spawns(pool.get());
+  constexpr std::size_t kLanes = 8;
+  constexpr int64_t kAdded = 6;
+  for (arrow::internal::Executor* executor :
+       std::vector<arrow::internal::Executor*>{nullptr, &spawns}) {
+    SCOPED_TRACE(executor == nullptr ? "here" : "pool");
+    for (int64_t armed = 0; armed < kAdded; ++armed) {
+      SCOPED_TRACE(armed);
+      Sweep([&](std::int64_t skip) {
+        // Each lane writes only its own; a merge allocates once, a part it keeps.
+        std::vector<std::vector<std::unique_ptr<int64_t>>> seen(kLanes);
+        for (std::vector<std::unique_ptr<int64_t>>& merged : seen) {
+          merged.reserve(kAdded);
+        }
+        const auto held = std::make_shared<int>(0);
+        bool fired = false;
+        {
+          PartitionLanes lanes(kLanes, executor, /*max_pending=*/2);
+          std::optional<arrow::Status> failure;
+          int64_t failed_part = kAdded;
+          for (int64_t part = 0; part < kAdded; ++part) {
+            PartitionLanes::Merge merge = [&seen, held, part](std::size_t lane) {
+              seen[lane].push_back(std::make_unique<int64_t>(part));
+              return arrow::Status::OK();
+            };
+            arrow::Status added;
+            if (part == armed) {
+              const FailAllocations fail(skip);
+              added = lanes.Add(part, std::move(merge));
+              fired = fail.failed() > 0;
+            } else {
+              added = lanes.Add(part, std::move(merge));
+            }
+            if (failure.has_value()) {
+              EXPECT_EQ(added.ToString(), failure->ToString()) << part;
+            } else if (!added.ok()) {
+              EXPECT_TRUE(fired) << added.ToString();
+              EXPECT_TRUE(added.IsOutOfMemory()) << added.ToString();
+              failure = added;
+              failed_part = part;
+            }
+          }
+          EXPECT_EQ(lanes.Finish().ToString(), failure.has_value() ? failure->ToString() : "OK");
+          EXPECT_EQ(lanes.pending(), 0);
+          for (std::size_t lane = 0; lane < kLanes; ++lane) {
+            const std::vector<std::unique_ptr<int64_t>>& merged = seen[lane];
+            EXPECT_GE(std::ssize(merged), failed_part) << lane;
+            EXPECT_LE(std::ssize(merged), std::min(failed_part + 1, kAdded)) << lane;
+            for (std::size_t i = 0; i < merged.size(); ++i) {
+              EXPECT_EQ(*merged[i], static_cast<int64_t>(i)) << lane;
+            }
+          }
+        }
+        EXPECT_EQ(held.use_count(), 1) << "every merge function released";
+        return fired;
+      });
+    }
   }
 }
 

@@ -44,8 +44,9 @@ arrow::Status ForEach(arrow::internal::Executor* executor, std::size_t n,
 // seen was given to every lane, so which failure wins does not depend on the timing.
 // std::bad_alloc in a merge becomes OutOfMemory. A lane that cannot take a part (its task cannot
 // be submitted, or std::bad_alloc while the part is queued: OutOfMemory) fails as if it had failed
-// to merge the part, every lane does when the part cannot be queued at all, and Add then returns
-// Finish(): no task is left running and no lane waits for one.
+// to merge the part, after merging the parts it holds before it; every lane does when the part
+// cannot be queued at all, and Add then returns Finish(): no task is left running and no lane
+// waits for one.
 //
 // Add and Finish are called from one thread (the consumer), never from the executor's threads:
 // they may wait for the lanes. The destructor waits for every lane.

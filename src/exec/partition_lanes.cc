@@ -150,15 +150,13 @@ arrow::Status PartitionLanes::Add(int64_t part, Merge merge) {
       continue;
     }
     arrow::Status status = Queue(lane, queued);
-    if (!status.ok()) {  // the lane fails as if it had failed to merge the part
+    if (!status.ok()) {
+      // The lane fails as if it had failed to merge the part. The parts it has queued come before
+      // it and are still merged (Finish waits for them): a failure among them comes first.
       failed = true;
       state.failed = true;
       Fail(part, lane, std::move(status));
       Done(*queued);
-      while (!state.queue.empty()) {  // the lane stops: its other parts are dropped
-        Done(*state.queue.front());
-        state.queue.pop_front();
-      }
     }
   }
   if (failed) {
