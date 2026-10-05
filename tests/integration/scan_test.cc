@@ -70,12 +70,22 @@ std::shared_ptr<arrow::Table> ScanAll(const plan::Table& table, const std::vecto
   return result.ok() ? *result : nullptr;
 }
 
+// The tables of the star schema (tools/fixturegen/star.h).
+constexpr auto kStarFiles = std::to_array<std::string_view>(
+    {"star/trips.parquet", "star/riders.parquet", "star/drivers.parquet", "star/zones.parquet",
+     "star/cities.parquet", "star/shifts.parquet", "star/tariffs.parquet", "star/promos.parquet"});
+
 TEST(Scan, EveryFixtureTableInTheEngineView) {
-  for (const std::string_view file :
-       {"hits_like.parquet", "hits_like_nulls.parquet", "hits_like_split/part-*.parquet",
-        "hits_like_required.parquet", "edge.parquet", "empty.parquet"}) {
+  std::vector<std::string_view> files = {"hits_like.parquet",
+                                         "hits_like_nulls.parquet",
+                                         "hits_like_split/part-*.parquet",
+                                         "hits_like_required.parquet",
+                                         "edge.parquet",
+                                         "empty.parquet"};
+  files.insert(files.end(), kStarFiles.begin(), kStarFiles.end());
+  for (const std::string_view file : files) {
     for (const bool clickbench : {false, true}) {
-      if (clickbench && file == "edge.parquet") {
+      if (clickbench && (file == "edge.parquet" || file.starts_with("star/"))) {
         continue;  // no EventDate column
       }
       const auto table = OpenFixture(file, clickbench);
@@ -162,14 +172,19 @@ Int128 IntegerAt(const arrow::Array& column, int64_t i) {
 // gives them: for every table, part and field that has them, the part's rows hold exactly that
 // NULL count and, over the non-NULL values, that min and max. Fields of other types give none.
 TEST(Scan, PartStatisticsMatchThePartsRows) {
+  // Among the star tables: SMALLINT, DATE and sparse BIGINT keys, a last part of one row (drivers),
+  // DECIMAL and DOUBLE columns, which give none, and an empty table.
+  std::vector<std::pair<std::string_view, bool>> files = {{"hits_like.parquet", true},
+                                                          {"hits_like_nulls.parquet", true},
+                                                          {"hits_like_required.parquet", true},
+                                                          {"hits_like_split/part-*.parquet", true},
+                                                          {"edge.parquet", false},
+                                                          {"floats.parquet", false}};
+  for (const std::string_view file : kStarFiles) {
+    files.emplace_back(file, false);
+  }
   int64_t checked = 0;
-  for (const auto& [file, clickbench] :
-       std::vector<std::pair<std::string_view, bool>>{{"hits_like.parquet", true},
-                                                      {"hits_like_nulls.parquet", true},
-                                                      {"hits_like_required.parquet", true},
-                                                      {"hits_like_split/part-*.parquet", true},
-                                                      {"edge.parquet", false},
-                                                      {"floats.parquet", false}}) {
+  for (const auto& [file, clickbench] : files) {
     const auto table = OpenFixture(file, clickbench);
     ASSERT_NE(table, nullptr);
     for (int field = 0; field < table->schema()->num_fields(); ++field) {

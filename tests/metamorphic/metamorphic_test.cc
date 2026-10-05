@@ -1,6 +1,7 @@
 // Metamorphic tests (label metamorphic): the relations of relations.h over the Parquet fixtures,
-// plus checks that relate antb1 to an independent Parquet reader.
+// plus checks that relate antb1 and the tables file to an independent Parquet reader.
 
+#include <algorithm>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
@@ -22,6 +23,7 @@
 #include <parquet/arrow/reader.h>
 
 #include "antb1/engine/session.h"
+#include "antb1/plan/types.h"
 
 #include "antb1_engine.h"
 #include "engine.h"
@@ -293,6 +295,85 @@ TEST(RowCount, MatchesAnIndependentParquetScan) {
     ASSERT_EQ(answer->rows.size(), 1U);
     EXPECT_EQ(answer->rows[0][0], std::to_string(scanned)) << t.name;
   }
+}
+
+// The Arrow schema of the first file of a table, as the Parquet library (not antb1) reads it.
+std::shared_ptr<arrow::Schema> FirstFileSchema(const slt::TableDef& t) {
+  if (t.files.empty()) {
+    ADD_FAILURE() << t.name << " has no files";
+    return nullptr;
+  }
+  auto input = arrow::io::ReadableFile::Open(t.files.front());
+  if (!input.ok()) {
+    ADD_FAILURE() << input.status().ToString();
+    return nullptr;
+  }
+  auto reader = parquet::arrow::OpenFile(*input, arrow::default_memory_pool());
+  if (!reader.ok()) {
+    ADD_FAILURE() << reader.status().ToString();
+    return nullptr;
+  }
+  std::shared_ptr<arrow::Schema> schema;
+  const arrow::Status status = (*reader)->GetSchema(&schema);
+  EXPECT_TRUE(status.ok()) << status.ToString();
+  return schema;
+}
+
+// The kind of join key a column type gives: integers of any width join each other, as DECIMALs of
+// any precision and scale do; std::nullopt for a type that never keys a join (DOUBLE).
+enum class KeyKind : std::uint8_t { kInteger, kDecimal, kDate, kVarchar };
+
+std::optional<KeyKind> KeyKindOf(const arrow::DataType& type) {
+  const auto logical = plan::FromArrow(type);
+  if (!logical.ok()) {
+    return std::nullopt;
+  }
+  if (plan::IsInteger(*logical)) {
+    return KeyKind::kInteger;
+  }
+  switch (logical->id()) {
+    case plan::LogicalType::kDecimal:
+      return KeyKind::kDecimal;
+    case plan::LogicalType::kDate:
+      return KeyKind::kDate;
+    case plan::LogicalType::kVarchar:
+      return KeyKind::kVarchar;
+    default:
+      return std::nullopt;
+  }
+}
+
+// The ref= options of tests/slt/tables.txt (runner/tables.h), which LoadTables does not check
+// against the files: every column exists, and each pair of columns joins one kind of key.
+TEST(TablesTxt, RefsJoinColumnsOfOneKind) {
+  const auto tables = LoadFixtureTables();
+  int refs = 0;
+  for (const auto& t : tables) {
+    for (const auto& ref : t.refs) {
+      ++refs;
+      const auto target = std::ranges::find(tables, ref.table, &slt::TableDef::name);
+      ASSERT_NE(target, tables.end()) << t.name << ": " << ref.table;
+      const auto from = FirstFileSchema(t);
+      const auto to = FirstFileSchema(*target);
+      ASSERT_NE(from, nullptr);
+      ASSERT_NE(to, nullptr);
+      ASSERT_EQ(ref.columns.size(), ref.ref_columns.size());
+      for (std::size_t c = 0; c < ref.columns.size(); ++c) {
+        const std::string what =
+            std::format("{}.{} -> {}.{}", t.name, ref.columns[c], ref.table, ref.ref_columns[c]);
+        const auto column = from->GetFieldByName(ref.columns[c]);
+        const auto ref_column = to->GetFieldByName(ref.ref_columns[c]);
+        ASSERT_NE(column, nullptr) << what << ": no such column";
+        ASSERT_NE(ref_column, nullptr) << what << ": no such referenced column";
+        const auto kind = KeyKindOf(*column->type());
+        EXPECT_TRUE(kind.has_value()) << what << ": " << column->type()->ToString();
+        EXPECT_EQ(kind, KeyKindOf(*ref_column->type()))
+            << what << ": " << column->type()->ToString() << " against "
+            << ref_column->type()->ToString();
+      }
+    }
+  }
+  EXPECT_EQ(refs, 13) << "the references of the star schema (tools/fixturegen/star.h)";
 }
 
 }  // namespace

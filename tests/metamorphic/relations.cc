@@ -210,6 +210,14 @@ constexpr auto kTablePaths = std::to_array<TablePath>({
     {.table = "floats", .path = "floats.parquet"},
     {.table = "decimals", .path = "decimals.parquet"},
     {.table = "empty", .path = "empty.parquet"},
+    {.table = "trips", .path = "star/trips.parquet"},
+    {.table = "riders", .path = "star/riders.parquet"},
+    {.table = "drivers", .path = "star/drivers.parquet"},
+    {.table = "zones", .path = "star/zones.parquet"},
+    {.table = "cities", .path = "star/cities.parquet"},
+    {.table = "shifts", .path = "star/shifts.parquet"},
+    {.table = "tariffs", .path = "star/tariffs.parquet"},
+    {.table = "promos", .path = "star/promos.parquet"},
 });
 
 constexpr std::array<int64_t, 3> kBatchSizes = {1, 7, kDefaultBatchSize};
@@ -535,6 +543,23 @@ std::vector<Relation> AllRelations() {
                  .probes = {Q(std::format(kGrouped, "hits_like_split")),
                             Q(std::format(kGrouped, "hits_like"))},
                  .check = AllEqual()});
+  }
+  // A nullable key with dangling values (the star schema's tr_driver, tools/fixturegen/star.h) over
+  // row groups of 1200 rows: the same groups, the NULL group among them, whatever the batch size.
+  {
+    Relation sizes{
+        .name = "star_grouped_nullable_key_batch_size_invariance",
+        .features = {kGroupBy, kCountStar, kCountColumn, kSum, kMin, kMax, kColumns, kMultipleItems,
+                     kIntegerColumns, kDecimalColumns, kDateColumns, kDoubleColumns, kTableName},
+        .probes = {},
+        .check = AllEqual()};
+    for (const int64_t batch : kBatchSizes) {
+      sizes.probes.push_back(
+          Q("SELECT tr_driver, COUNT(*), COUNT(tr_fare), SUM(tr_fare), "
+            "MIN(tr_day), MAX(tr_distance) FROM trips GROUP BY tr_driver",
+            batch));
+    }
+    r.push_back(std::move(sizes));
   }
   r.push_back(
       {.name = "row_count_vs_scan_count_column",
