@@ -53,6 +53,35 @@ inline std::shared_ptr<arrow::Array> Int16s(const std::vector<std::optional<int1
   return ArrayOf<arrow::Int16Builder>(arrow::int16(), values);
 }
 
+inline std::shared_ptr<arrow::Array> Int32s(const std::vector<std::optional<int32_t>>& values) {
+  return ArrayOf<arrow::Int32Builder>(arrow::int32(), values);
+}
+
+inline std::shared_ptr<arrow::Array> UInt16s(const std::vector<std::optional<uint16_t>>& values) {
+  return ArrayOf<arrow::UInt16Builder>(arrow::uint16(), values);
+}
+
+// DATE values: days since 1970-01-01.
+inline std::shared_ptr<arrow::Array> Dates(const std::vector<std::optional<int32_t>>& days) {
+  return ArrayOf<arrow::Date32Builder>(arrow::date32(), days);
+}
+
+// TIMESTAMP values: microseconds since 1970-01-01 00:00:00.
+inline std::shared_ptr<arrow::Array> Timestamps(const std::vector<std::optional<int64_t>>& micros) {
+  return ArrayOf<arrow::TimestampBuilder>(arrow::timestamp(arrow::TimeUnit::MICRO), micros);
+}
+
+// DECIMAL(precision, scale) values (HUGEINT: 38, 0), unscaled, in decimal digits.
+inline std::shared_ptr<arrow::Array> Decimals(
+    int32_t precision, int32_t scale, const std::vector<std::optional<std::string>>& values) {
+  std::vector<std::optional<arrow::Decimal128>> unscaled;
+  unscaled.reserve(values.size());
+  for (const auto& v : values) {
+    unscaled.push_back(v.has_value() ? std::optional(arrow::Decimal128(*v)) : std::nullopt);
+  }
+  return ArrayOf<arrow::Decimal128Builder>(arrow::decimal128(precision, scale), unscaled);
+}
+
 inline std::shared_ptr<arrow::Array> Strings(
     const std::vector<std::optional<std::string>>& values) {
   return ArrayOf<arrow::BinaryBuilder>(arrow::binary(), values);

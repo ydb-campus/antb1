@@ -26,6 +26,7 @@ antb1_add_module(
     group_table.cc
     grouped_aggregate_state.cc
     group_aggregate.cc
+    join_table.cc
     limit.cc
     sort.cc
     row_count.cc
@@ -52,6 +53,7 @@ if(ANTB1_BUILD_TESTS)
       tests/scan_filter_test.cc
       tests/parallel_test.cc
       tests/heavy_hitters_test.cc
+      tests/join_table_test.cc
       tests/partition_lanes_test.cc
       tests/row_mask_test.cc
       tests/profile_test.cc
