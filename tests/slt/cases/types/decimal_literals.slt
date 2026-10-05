@@ -255,10 +255,9 @@ SELECT d18_4 * 1.5 FROM decimals
 statement error Casting value "99999999999999.9999" to type DECIMAL\(18,5\) failed: value is out of range! when casting from source column d18_4
 SELECT d18_4 + 0.00005 FROM decimals
 
-# Not supported yet (exit 4, roadmap PR D4c): % beyond 38 digits, a decimal literal as a CASE value next to a
-# non-DOUBLE value.
+# % beyond 38 digits is DOUBLE (-0 for a negative multiple), and a decimal literal as a CASE value next to a DECIMAL
+# makes the CASE DECIMAL (decimal_case.slt has the rest).
 
-onlyif duckdb
 query R rowsort
 SELECT d38_0 % 0.5 FROM decimals WHERE id >= 30
 ----
@@ -273,7 +272,6 @@ SELECT d38_0 % 0.5 FROM decimals WHERE id >= 30
 NULL
 NULL
 
-onlyif duckdb
 query D rowsort
 SELECT CASE WHEN id > 35 THEN p ELSE 0.5 END FROM decimals WHERE id >= 30
 ----

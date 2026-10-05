@@ -2,13 +2,19 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
 #include <type_traits>
 
 #include <arrow/api.h>
 
 #include "antb1/common/int128.h"
+#include "antb1/plan/literal.h"
 #include "antb1/plan/logical_plan.h"
+#include "antb1/plan/types.h"
 
 namespace antb1::exec {
 namespace {
@@ -98,6 +104,44 @@ arrow::Result<ArrayPtr> DecimalToDouble(const arrow::Array& values, arrow::Memor
       builder.UnsafeAppend(DuckDbDecimalToDouble(ToInt128(arrow::Decimal128(decimals.GetValue(i))),
                                                  type.precision(), type.scale()));
     }
+  }
+  ArrayPtr out;
+  ARROW_RETURN_NOT_OK(builder.Finish(&out));
+  return out;
+}
+
+arrow::Status DecimalCastError(Int128 value, plan::LogicalType from, plan::LogicalType to,
+                               std::string_view column) {
+  const std::string target = std::format("DECIMAL({},{})", to.width(), to.scale());
+  const std::string suffix =
+      column.empty() ? std::string() : std::format(" when casting from source column {}", column);
+  if (from == plan::LogicalType::kDecimal) {
+    return arrow::Status::ExecutionError(
+        "Casting value \"", plan::FormatDecimal(value, from.width(), from.scale()), "\" to type ",
+        target, " failed: value is out of range!", suffix);
+  }
+  return arrow::Status::ExecutionError("Could not cast value ", Int128ToString(value), " to ",
+                                       target, suffix);
+}
+
+arrow::Result<ArrayPtr> CastToDecimal(const arrow::Array& values, plan::LogicalType from,
+                                      plan::LogicalType to, std::string_view column,
+                                      arrow::MemoryPool* pool) {
+  ARROW_ASSIGN_OR_RAISE(const UnscaledValues read, ReadUnscaled(values));
+  const plan::IntegerRange range = plan::RangeOf(to);
+  arrow::Decimal128Builder builder(plan::ToArrow(to), pool);
+  ARROW_RETURN_NOT_OK(builder.Reserve(values.length()));
+  for (int64_t i = 0; i < values.length(); ++i) {
+    if (values.IsNull(i)) {
+      builder.UnsafeAppendNull();
+      continue;
+    }
+    const Int128 value = read.values[static_cast<std::size_t>(i)];
+    const std::optional<Int128> cast = Rescale(value, read.scale, to.scale());
+    if (!cast.has_value() || *cast < range.min || *cast > range.max) {
+      return DecimalCastError(value, from, to, column);
+    }
+    builder.UnsafeAppend(FromInt128(*cast));
   }
   ArrayPtr out;
   ARROW_RETURN_NOT_OK(builder.Finish(&out));

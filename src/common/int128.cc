@@ -81,6 +81,20 @@ int CompareScaled(Int128 a, int a_scale, Int128 b, int b_scale) {
   return a < b ? -1 : 1;
 }
 
+std::optional<Int128> Rescale(Int128 value, int from, int to) {
+  if (to >= from) {
+    Int128 scaled = 0;
+    if (__builtin_mul_overflow(value, PowerOfTen(to - from), &scaled)) {
+      return std::nullopt;
+    }
+    return scaled;
+  }
+  // f / 2 is at most 5 * 10^37, so no step overflows, the minimum included.
+  Int128 halves = value / (PowerOfTen(from - to) / 2);
+  halves += halves < 0 ? -1 : 1;
+  return halves / 2;
+}
+
 double ExactDivideToDouble(Int128 numerator, int64_t denominator) {
   ANTB1_CHECK(denominator > 0);
   const Int128 den = denominator;

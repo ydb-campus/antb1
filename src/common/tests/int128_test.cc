@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <string>
 
 #include <gtest/gtest.h>
@@ -88,6 +89,56 @@ TEST(Int128Test, CompareScaled) {
                  Int128ToString(c.b) + "e-" + std::to_string(c.b_scale));
     EXPECT_EQ(CompareScaled(c.a, c.a_scale, c.b, c.b_scale), c.expected);
     EXPECT_EQ(CompareScaled(c.b, c.b_scale, c.a, c.a_scale), -c.expected);
+  }
+}
+
+// A DECIMAL cast to another scale, as DuckDB 1.5.5 casts it: up exactly (an overflow of 128 bits is
+// std::nullopt), down rounded half away from zero, also by 38 digits and at the extremes.
+TEST(Int128Test, Rescale) {
+  struct Case {
+    Int128 value;
+    int from;
+    int to;
+    std::optional<Int128> expected;
+  };
+  const Int128 max38 = PowerOfTen(38) - 1;
+  for (const Case& c : {
+           Case{.value = 15, .from = 1, .to = 0, .expected = 2},
+           Case{.value = -15, .from = 1, .to = 0, .expected = -2},
+           Case{.value = -25, .from = 1, .to = 0, .expected = -3},
+           Case{.value = 24, .from = 1, .to = 0, .expected = 2},
+           Case{.value = -4, .from = 1, .to = 0, .expected = 0},
+           Case{.value = 0, .from = 5, .to = 0, .expected = 0},
+           Case{.value = 5, .from = 11, .to = 10, .expected = 1},
+           Case{.value = -5, .from = 11, .to = 10, .expected = -1},
+           Case{.value = 1250, .from = 3, .to = 1, .expected = 13},
+           Case{.value = 1249, .from = 3, .to = 1, .expected = 12},
+           // 9999999999999999999999999999.9999999999 and -9999999999999999999999999999.5 to
+           // scale 0.
+           Case{.value = max38, .from = 10, .to = 0, .expected = PowerOfTen(28)},
+           Case{.value = -(PowerOfTen(38) - (PowerOfTen(9) * 5)),
+                .from = 10,
+                .to = 0,
+                .expected = -PowerOfTen(28)},
+           Case{.value = (PowerOfTen(38) / 2) - 1, .from = 38, .to = 0, .expected = 0},
+           Case{.value = PowerOfTen(38) / 2, .from = 38, .to = 0, .expected = 1},
+           Case{.value = -(PowerOfTen(38) / 2), .from = 38, .to = 0, .expected = -1},
+           // The minimum's tenth, ...0572.8, rounds away from zero.
+           Case{.value = kInt128Min, .from = 1, .to = 0, .expected = (kInt128Min / 10) - 1},
+           Case{.value = 123, .from = 2, .to = 5, .expected = 123000},
+           Case{.value = -1, .from = 0, .to = 38, .expected = -PowerOfTen(38)},
+           Case{.value = max38, .from = 0, .to = 0, .expected = max38},
+           Case{.value = kInt128Max / 10, .from = 0, .to = 1, .expected = (kInt128Max / 10) * 10},
+           Case{.value = max38, .from = 0, .to = 1, .expected = std::nullopt},
+           Case{.value = kInt128Min, .from = 0, .to = 1, .expected = std::nullopt},
+       }) {
+    SCOPED_TRACE(Int128ToString(c.value) + "e-" + std::to_string(c.from) + " to scale " +
+                 std::to_string(c.to));
+    const std::optional<Int128> got = Rescale(c.value, c.from, c.to);
+    ASSERT_EQ(got.has_value(), c.expected.has_value());
+    if (got.has_value() && c.expected.has_value()) {
+      EXPECT_EQ(Int128ToString(*got), Int128ToString(*c.expected));
+    }
   }
 }
 

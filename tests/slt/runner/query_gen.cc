@@ -387,6 +387,61 @@ bool Summable(const GenColumn& c, int64_t rows) {
   return bound == 0 || bound <= MaxOfDigits(38) / std::max<int64_t>(rows, 1);
 }
 
+// A value of a DECIMAL CASE as DuckDB's fold counts it (ADR 0021 rule 10): DECIMAL(width, scale),
+// or an integer by its type's digits (every value meets a DECIMAL there, so an integer literal is
+// an INTEGER), with the largest magnitude of its unscaled values.
+struct CaseValue {
+  const GenColumn* column = nullptr;  // else `literal`
+  std::string literal;                // the text, after a minus when `negative`
+  bool negative = false;
+  int width = 0;
+  int scale = 0;
+  bool integer = false;
+  Int128 abs_max = 0;
+};
+
+// DuckDB's type of DECIMAL CASE values in fold order (the ELSE value first, then the THEN values;
+// the first THEN value is a DECIMAL): with e the larger number of integer digits and s the larger
+// scale, DECIMAL(e + s, s), or DECIMAL(38, 38 - e) beyond 38 digits; an integer keeps the DECIMAL's
+// scale, its width capped at 38.
+std::pair<int, int> CaseFold(const std::vector<const CaseValue*>& order) {
+  int width = order.front()->width;
+  int scale = order.front()->scale;
+  bool integer = order.front()->integer;
+  for (std::size_t i = 1; i < order.size(); ++i) {
+    const CaseValue& v = *order[i];
+    if (integer || v.integer) {
+      const int digits = integer ? width : v.width;  // the integer's
+      const int p = integer ? v.width : width;       // the DECIMAL's
+      const int s = integer ? v.scale : scale;
+      width = digits <= p - s ? p : std::min(kMaxDecimalDigits, digits + s);
+      scale = s;
+      integer = integer && v.integer;
+      continue;
+    }
+    const int digits = std::max(width - scale, v.width - v.scale);
+    scale = std::max(scale, v.scale);
+    if (digits + scale > kMaxDecimalDigits) {
+      scale = kMaxDecimalDigits - digits;
+    }
+    width = digits + scale;
+  }
+  return {width, scale};
+}
+
+// The largest magnitude of a CASE value's unscaled values at `scale`: rescaled, rounded up where
+// the scale shrinks; std::nullopt beyond 128 bits.
+std::optional<Int128> ScaledMax(const CaseValue& v, int scale) {
+  if (scale < v.scale) {
+    return (v.abs_max / (MaxOfDigits(v.scale - scale) + 1)) + 1;
+  }
+  Int128 scaled = 0;
+  if (__builtin_mul_overflow(v.abs_max, MaxOfDigits(scale - v.scale) + 1, &scaled)) {
+    return std::nullopt;
+  }
+  return scaled;
+}
+
 // ---- query building ----
 
 enum class Shape : std::uint8_t { kAggregates, kColumns, kStar };
@@ -839,7 +894,7 @@ class Builder {
             exact = true;
           }
         } else if (rng_.Percent(20)) {
-          exact = Arithmetic(c);
+          exact = Arithmetic(c, /*aggregated=*/false, /*summed=*/false, /*wide_modulo=*/true);
         }
         if (exact.has_value()) {
           orderable = *exact;
@@ -926,7 +981,7 @@ class Builder {
         Keyword("DISTINCT");
       }
       if (arithmetic && rng_.Percent(30)) {
-        exact = Case(*arg);
+        exact = Case(*arg, /*aggregated=*/true, /*summed=*/agg == Agg::kSum || agg == Agg::kAvg);
       }
       // SUM takes only EXTRACT's BIGINT; AVG a TIMESTAMP too.
       if (arithmetic && !exact.has_value() && rng_.Percent(25) &&
@@ -1702,12 +1757,15 @@ class Builder {
   }
 
   // CASE WHEN <condition> THEN c [WHEN <condition> THEN c or a literal] [ELSE c or a literal] END
-  // over a column: the values share c's kind (a literal of it, as DuckDB types CASE). Returns
+  // over a column: the values share c's kind (a literal of it, as DuckDB types CASE); a DECIMAL c
+  // gets the values DecimalCase writes. `aggregated` and `summed` as for Arithmetic. Returns
   // whether the result is exact (not DOUBLE), or std::nullopt (nothing written).
-  std::optional<bool> Case(const GenColumn& c) {
-    // DECIMAL CASE values are unsupported until roadmap PR D4c (ADR 0021).
-    if (!allowed_.Has(Feature::kCase) || comparable_.empty() || c.kind == ValueKind::kDecimal) {
+  std::optional<bool> Case(const GenColumn& c, bool aggregated = false, bool summed = false) {
+    if (!allowed_.Has(Feature::kCase) || comparable_.empty()) {
       return std::nullopt;
+    }
+    if (c.kind == ValueKind::kDecimal) {
+      return DecimalCase(c, aggregated, summed);
     }
     used_.Add(Feature::kCase);
     const auto value = [&](bool column) {
@@ -1729,6 +1787,125 @@ class Builder {
     }
     Keyword("END");
     return c.kind != ValueKind::kDouble;
+  }
+
+  // CASE over a DECIMAL column c (ADR 0021 rule 10): c as the first THEN value, and as the others c
+  // or another DECIMAL or integer column, an integer literal or a short decimal literal, typed by
+  // DuckDB's fold (CaseFold), which casts every value to the result. A value is dropped (c instead)
+  // when its cast could fail (an integer's data range beyond the result's integer digits, which
+  // both engines fail on), and `aggregated` (an aggregate's argument) when it changes c's scale,
+  // since HAVING writes literals of that scale (ValuesOf), or, `summed`, when the sum over every
+  // row could leave 38 digits (antb1 fails there, divergence D18).
+  std::optional<bool> DecimalCase(const GenColumn& c, bool aggregated, bool summed) {
+    used_.Add(Feature::kCase);
+    const auto of_column = [](const GenColumn& col) {
+      if (col.kind == ValueKind::kDecimal) {
+        return CaseValue{.column = &col,
+                         .width = col.precision,
+                         .scale = col.scale,
+                         .abs_max = col.abs_max.value_or(0)};
+      }
+      Int128 largest = 0;
+      for (const std::optional<int64_t> bound : {col.data_min, col.data_max}) {
+        if (bound.has_value()) {
+          largest = std::max(largest, *bound < 0 ? -Int128{*bound} : Int128{*bound});
+        }
+      }
+      return CaseValue{
+          .column = &col, .width = DecimalShape(col).first, .integer = true, .abs_max = largest};
+    };
+    std::vector<CaseValue> columns;
+    for (const GenColumn* other : comparable_) {
+      if (other != &c &&
+          (other->kind == ValueKind::kDecimal || other->kind == ValueKind::kInteger)) {
+        columns.push_back(of_column(*other));
+      }
+    }
+    std::vector<CaseValue> literals;
+    if (allowed_.Has(Feature::kIntegerLiteral)) {
+      for (const int64_t k : {0, 7, 100000}) {
+        literals.push_back(CaseValue{
+            .literal = std::to_string(k), .width = 10, .integer = true, .abs_max = Int128{k}});
+      }
+      if (allowed_.Has(Feature::kNegativeLiteral)) {
+        literals.push_back(CaseValue{
+            .literal = "1", .negative = true, .width = 10, .integer = true, .abs_max = 1});
+      }
+    }
+    if (allowed_.Has(Feature::kDecimalLiteral)) {
+      literals.push_back(CaseValue{.literal = "0.5", .width = 2, .scale = 1, .abs_max = 5});
+      literals.push_back(CaseValue{.literal = "2.25", .width = 3, .scale = 2, .abs_max = 225});
+      if (allowed_.Has(Feature::kNegativeLiteral)) {
+        literals.push_back(
+            CaseValue{.literal = "1.5", .negative = true, .width = 2, .scale = 1, .abs_max = 15});
+      }
+    }
+    const CaseValue self = of_column(c);
+    // c 30% of the time, else another column (60%) or a literal.
+    const auto pick = [&] -> const CaseValue* {
+      if (rng_.Percent(30)) {
+        return &self;
+      }
+      if (!columns.empty() && (literals.empty() || rng_.Percent(60))) {
+        return &rng_.Pick(columns);
+      }
+      return literals.empty() ? &self : &rng_.Pick(literals);
+    };
+    const std::size_t branches = 1 + rng_.Below(2);
+    const CaseValue* then_value = branches == 2 ? pick() : &self;
+    const bool has_else = rng_.Percent(70);
+    const CaseValue* else_value = has_else ? pick() : &self;
+    // Every value's cast fits the folded type (and its scale and sum, under an aggregate).
+    const auto fits = [&] {
+      std::vector<const CaseValue*> order;
+      if (has_else) {
+        order.push_back(else_value);
+      }
+      order.push_back(&self);
+      if (branches == 2) {
+        order.push_back(then_value);
+      }
+      const auto [width, scale] = CaseFold(order);
+      if (aggregated && scale != c.scale) {
+        return false;
+      }
+      return std::ranges::all_of(order, [&](const CaseValue* v) {
+        const std::optional<Int128> largest = ScaledMax(*v, scale);
+        return largest.has_value() && *largest <= MaxOfDigits(width) &&
+               (!summed || *largest <= MaxOfDigits(38) / std::max<int64_t>(rows_, 1));
+      });
+    };
+    if (!fits()) {
+      then_value = &self;
+    }
+    if (!fits()) {
+      else_value = &self;
+    }
+    const auto write = [&](const CaseValue& v) {
+      if (v.column != nullptr) {
+        Column(*v.column);
+        return;
+      }
+      if (v.negative) {
+        used_.Add(Feature::kNegativeLiteral);
+        Symbol("-");
+      }
+      used_.Add(v.integer ? Feature::kIntegerLiteral : Feature::kDecimalLiteral);
+      tokens_.push_back({.kind = Token::Kind::kLiteral, .text = v.literal});
+    };
+    Keyword("CASE");
+    for (std::size_t b = 0; b < branches; ++b) {
+      Keyword("WHEN");
+      Condition();
+      Keyword("THEN");
+      write(b == 0 ? self : *then_value);
+    }
+    if (has_else) {
+      Keyword("ELSE");
+      write(*else_value);
+    }
+    Keyword("END");
+    return true;
   }
 
   // A literal of the column's kind for a CASE value; false if none is allowed (nothing written).
@@ -1757,7 +1934,7 @@ class Builder {
                                 : emit("2", Feature::kIntegerLiteral);
       case ValueKind::kVarchar:
         return emit(rng_.Percent(50) ? "''" : "'k'", Feature::kStringLiteral);
-      case ValueKind::kDecimal:  // never: Case() skips DECIMAL
+      case ValueKind::kDecimal:  // never: DecimalCase writes these
         return false;
       case ValueKind::kDate: {
         // As in MakeLiteral: the roll modulo 100 is the old Percent(50) roll.
@@ -1812,9 +1989,12 @@ class Builder {
   // decimal literal), since HAVING writes literals of the column's scale (ValuesOf); `summed`: the
   // argument of a SUM or AVG, which gets no new inexact DOUBLE (a DECIMAL divided, an integer
   // divided by a decimal literal), as the sum's rounding follows the order of the additions.
-  // Returns whether the result is exact (I values; / and DOUBLE give R), or std::nullopt when none
-  // fits (nothing written).
-  std::optional<bool> Arithmetic(const GenColumn& c, bool aggregated = false, bool summed = false) {
+  // `wide_modulo`: a plain select item, where a DECIMAL % beyond 38 digits (DOUBLE, -0 for a
+  // negative multiple) may stand; never under an aggregate or in a condition. Returns whether the
+  // result is exact (I values; / and DOUBLE give R), or std::nullopt when none fits (nothing
+  // written).
+  std::optional<bool> Arithmetic(const GenColumn& c, bool aggregated = false, bool summed = false,
+                                 bool wide_modulo = false) {
     if (!allowed_.Has(Feature::kArithmetic)) {
       return std::nullopt;
     }
@@ -1911,7 +2091,7 @@ class Builder {
         return largest <= MaxOfDigits(width) &&
                largest <= MaxOfDigits(38) / std::max<int64_t>(rows_, 1);
       };
-      // % computes in the common type, which DuckDB makes DOUBLE beyond 38 digits (unsupported).
+      // % computes in the common type, which is DOUBLE beyond 38 digits.
       const auto modulo_fits = [&](const LiteralOperand& k) {
         return std::max(c.precision - c.scale, k.width - k.scale) + std::max(c.scale, k.scale) <=
                38;
@@ -1956,6 +2136,8 @@ class Builder {
         }
         if (modulo_fits(k)) {
           choices.push_back({.op = "%", .literal = k.text, .exact = true});
+        } else if (wide_modulo) {
+          choices.push_back({.op = "%", .literal = k.text, .exact = false});
         }
       }
       choices.push_back({.op = "-", .literal = "", .exact = true});  // the type is kept

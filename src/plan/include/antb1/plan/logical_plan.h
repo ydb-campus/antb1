@@ -146,7 +146,9 @@ struct ConstantExpr {
 };
 
 // left <op> right, both of the expression's type (the executor casts the operands to it), except
-// kDivide, which computes in DOUBLE whatever the operand types.
+// kDivide, which computes in DOUBLE whatever the operand types, and a DECIMAL result, whose
+// operands the executor rescales as DuckDB does (ADR 0021). A DOUBLE kModulo of operands that are
+// no DOUBLE (DECIMALs beyond 38 digits) is NULL for a zero divisor, not NaN.
 struct ArithExpr {
   ArithOp op = ArithOp::kAdd;
   ExprPtr left;
@@ -193,8 +195,9 @@ struct BoolExpr {
 };
 
 // CASE WHEN whens[0] THEN thens[0] ... ELSE otherwise END: the first branch whose condition is
-// true (a NULL condition is not), else `otherwise` (NULL when it is null). The values are of the
-// expression's type (the executor casts them to it).
+// true (a NULL condition is not), else `otherwise` (NULL when it is null). The values keep their
+// own types; the executor casts each to the expression's type on the rows that take it (to a
+// DECIMAL as DuckDB casts, rounded half away from zero, ADR 0021 rule 10).
 struct CaseExpr {
   std::vector<ExprPtr> whens;  // BOOLEAN
   std::vector<ExprPtr> thens;  // as many as whens

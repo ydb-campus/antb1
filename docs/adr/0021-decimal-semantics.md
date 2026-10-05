@@ -116,11 +116,20 @@ This amends ADR 0012's list of unsupported constructs and three points of ADR 00
 10. **Common types:**
     - comparisons and IN lists take s = max(s1, s2, …) and p = min(38, max(p1 - s1, p2 - s2, …) + s) over all
       their operands; DOUBLE with any number gives DOUBLE;
-    - CASE values take the same type while it fits in 38 digits. Beyond 38, two DECIMALs keep their integer digits
-      (p = 38 and s = 38 - max(p1 - s1, p2 - s2), values rounded half away from zero), and a DECIMAL with an integer
-      keeps its scale (p = 38; a value that does not fit fails with DuckDB's conversion error);
+    - CASE values fold pairwise, as in DuckDB: from the ELSE value's type (NULL without an ELSE) through the THEN
+      values in written order, so the type can depend on the order of the values. Two DECIMALs take the same type
+      while it fits in 38 digits; beyond 38 they keep their integer digits (p = 38 and s = 38 - max(p1 - s1,
+      p2 - s2), values rounded half away from zero). A DECIMAL with an integer keeps its scale and widens only for
+      an integer of more than p - s digits (p = max(p, min(38, the integer's digits + s)); a value that does not fit
+      fails with DuckDB's conversion error on the rows that take it). An integer literal (also under unary minus)
+      takes an integer type it fits, else the two types' common one (SMALLINT with USMALLINT is INTEGER), and counts
+      as its own type next to a DECIMAL. Next to NULL (the first THEN value without an ELSE) or another literal, an
+      integer literal becomes its own type and a string literal VARCHAR; otherwise (an ELSE literal too) a string
+      literal takes the type folded next. Each value is cast once, to the final type, on the rows that take it;
     - `CASE WHEN n > 0 THEN price ELSE 7 END` is DECIMAL(15,2); with `rate` instead of `price` it is DECIMAL(13,3),
-      because 7 counts as INTEGER; `ELSE b` gives DECIMAL(21,2), `ELSE 2.5` DECIMAL(15,2) and `ELSE d` DOUBLE.
+      because 7 counts as INTEGER; `ELSE b` gives DECIMAL(21,2), `ELSE 2.5` DECIMAL(15,2) and `ELSE d` DOUBLE. With
+      a SMALLINT `s16`, `CASE WHEN n > 0 THEN 7 WHEN n > 1 THEN rate ELSE s16 END` is DECIMAL(8,3), as 7 becomes
+      SMALLINT before `rate` comes, while `THEN rate WHEN n > 1 THEN 7` gives DECIMAL(13,3).
 11. **Comparisons:**
     - **With an integer or decimal literal:** folded exactly into the operand's (p,s) at bind time, as integer
       columns are folded today (ADR 0004). `price < 12.345` becomes `price <= 12.34`, `price >= 12.345` becomes
