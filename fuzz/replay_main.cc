@@ -8,7 +8,8 @@
 // A PATH is a file or a directory; directories are read recursively in sorted order, skipping
 // README.md and dotfiles. --mutate-unparse is the harness self-test: it replays with a broken
 // unparser, so the property must report violations:
-//   suffix      appends "_mutated": the text no longer parses, or parses to another table name;
+//   suffix      appends "_mutated": the text no longer parses (LIMIT 100_mutated), or parses to
+//               another table name or alias, or another column name;
 //   whitespace  appends a space when the statement did not start at offset 0 (leading whitespace or
 //               a comment): the round trip holds, but ToSql is no longer idempotent.
 //

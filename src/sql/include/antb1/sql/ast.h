@@ -48,10 +48,13 @@ class Box {
 
 struct Expr;
 
+// A column name, optionally qualified by the name of a FROM item (t.x).
 struct ColumnRef {
   std::string name;
   bool quoted = false;
-  SourceSpan span;
+  SourceSpan span;                // the qualifier (when there is one) through the name
+  std::string qualifier;          // t.x: "t", as written (a quoted one unescaped); empty: none
+  bool qualifier_quoted = false;  // (the lexer makes no empty quoted identifier)
 };
 
 struct Literal {
@@ -267,11 +270,33 @@ struct TableRef {
   SourceSpan span;
 };
 
+// How a FROM item connects to the items before it (ADR 0022): a JOIN binds tighter than a comma
+// and associates to the left, so the items from the last comma up to a JOIN are its left input.
+enum class Connector : std::uint8_t {
+  kFirst,  // the first item
+  kComma,  // ,
+  kCross,  // CROSS JOIN
+  kInner,  // [INNER] JOIN ... ON
+  kLeft,   // LEFT [OUTER] JOIN ... ON
+};
+
+// One item of a FROM list: a table or a path, its alias, and how it joins the items before it.
+struct FromItem {
+  Connector connector = Connector::kFirst;
+  TableRef table;
+  std::optional<std::string> alias;  // as written (quoted and string aliases unescaped)
+  std::vector<Expr> on;              // kInner and kLeft: the ON conjuncts (at least one), as WHERE
+  SourceSpan connector_span;  // ",", "CROSS JOIN", "JOIN", "LEFT OUTER JOIN", ... (not kFirst)
+  SourceSpan alias_span;      // [AS] alias (when alias)
+  SourceSpan on_span;         // ON and its condition (kInner and kLeft)
+  SourceSpan span;            // the table through its alias
+};
+
 struct SelectStatement {
   bool star = false;     // SELECT *
   SourceSpan star_span;  // the '*' (when star)
   std::vector<SelectItem> items;
-  TableRef from;
+  std::vector<FromItem> from;          // at least one: a flat list, never a tree (ADR 0022)
   std::vector<Expr> where;             // conjuncts: the top-level AND chain, split
   std::vector<GroupExpr> group_by;     // GROUP BY items (aliases and positions: see the binder)
   SourceSpan group_by_span;            // GROUP BY and its list (when group_by is not empty)
@@ -288,8 +313,9 @@ struct SelectStatement {
 
 std::string_view ToString(AggKind kind);
 std::string_view ToString(CompareOp op);
-std::string_view ToString(BinaryOp op);       // "+", "//", "<>", "AND", ...
-std::string_view ToString(NullsOrder nulls);  // "", "NULLS FIRST" or "NULLS LAST"
+std::string_view ToString(BinaryOp op);          // "+", "//", "<>", "AND", ...
+std::string_view ToString(NullsOrder nulls);     // "", "NULLS FIRST" or "NULLS LAST"
+std::string_view ToString(Connector connector);  // "", ",", "CROSS JOIN", "INNER JOIN", "LEFT JOIN"
 
 bool EqualIgnoringSpans(const Expr& a, const Expr& b);
 bool EqualIgnoringSpans(const SelectStatement& a, const SelectStatement& b);
@@ -297,7 +323,7 @@ bool EqualIgnoringSpans(const SelectStatement& a, const SelectStatement& b);
 // The levels of an expression tree: the nodes on its longest path from the root to a leaf (a leaf
 // alone is 1). The parser accepts no tree deeper than kMaxExpressionDepth (parser.h).
 std::size_t Depth(const Expr& expr);
-// The deepest expression tree of a statement (its select items, WHERE and HAVING conjuncts and
+// The deepest expression tree of a statement (its select items, ON, WHERE and HAVING conjuncts and
 // GROUP BY and ORDER BY items); 0 when it has none.
 std::size_t Depth(const SelectStatement& stmt);
 

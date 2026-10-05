@@ -169,6 +169,20 @@ TEST_F(CliTest, UnsupportedQueryExits4WithCaret) {
   EXPECT_EQ(r.code, kExitUnsupported);
   EXPECT_NE(r.err.find("SUM(DISTINCT ...) is not supported"), std::string::npos) << r.err;
   EXPECT_NE(r.err.find("^^^^^^^^"), std::string::npos) << r.err;
+  // A join parses, and the binder rejects it at its JOIN before any table resolves (neither a
+  // nor b is registered).
+  r = Invoke({"query", "-c", "SELECT COUNT(*) FROM a JOIN b ON a.k = b.k"});
+  EXPECT_EQ(r.code, kExitUnsupported);
+  EXPECT_EQ(r.err,
+            "antb1: unsupported error: JOIN ... ON is not supported; see docs/sql-subset.md\n"
+            "  at line 1, column 24\n"
+            "  SELECT COUNT(*) FROM a JOIN b ON a.k = b.k\n"
+            "                         ^^^^\n");
+  // A word that DuckDB reads as a join is never an alias: exit code 4 at the word.
+  r = Invoke(
+      {"query", "-c", "SELECT COUNT(*) FROM t semi JOIN u ON t.k = u.k", "--table", "t=" + path_});
+  EXPECT_EQ(r.code, kExitUnsupported);
+  EXPECT_NE(r.err.find("SEMI JOIN is not supported"), std::string::npos) << r.err;
 }
 
 TEST_F(CliTest, JsonErrorObject) {

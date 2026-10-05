@@ -27,12 +27,15 @@
 // Hand-written recursive-descent parser for the grammar in docs/sql-subset.md:
 //
 //   statement   := query [';'] EOF
-//   query       := SELECT select_list FROM table_ref [WHERE expr] [GROUP BY expr (',' expr)*]
+//   query       := SELECT select_list FROM from_list [WHERE expr] [GROUP BY expr (',' expr)*]
 //                  [HAVING expr] [ORDER BY order_item (',' order_item)*]
 //                  [LIMIT integer] [OFFSET integer]      (LIMIT and OFFSET in either order)
 //   select_list := '*' | expr [[AS] identifier] (',' expr [[AS] identifier])*
 //   order_item  := expr [ASC | DESC] [NULLS (FIRST | LAST)]
-//   table_ref   := identifier | quoted_identifier | string_literal
+//   from_list   := from_item (',' from_item | CROSS JOIN from_item | [INNER] JOIN from_item ON expr
+//                  | LEFT [OUTER] JOIN from_item ON expr)*
+//   from_item   := (identifier | quoted_identifier | string_literal) [[AS] alias]
+//   alias       := identifier | quoted_identifier, and after AS also a string_literal
 //   expr        := precedence climbing over, from loosest to tightest: OR; AND; NOT; comparisons,
 //                  [NOT] LIKE, [NOT] IN and [NOT] BETWEEN (not chained); + -; * / // %; unary -;
 //                  postfix. BETWEEN's bounds are additive expressions, so it consumes its own AND.
@@ -40,6 +43,7 @@
 //   primary     := column_ref | literal | '(' expr ')' | agg_call | name '(' [expr (',' expr)*] ')'
 //                | CASE [expr] (WHEN expr THEN expr)+ [ELSE expr] END | EXTRACT '(' field FROM expr
 //                ')' | (CAST | TRY_CAST) '(' expr AS type ')'
+//   column_ref  := [name '.'] name
 //   agg_call    := COUNT '(' '*' ')' | COUNT '(' DISTINCT expr ')'
 //                | (COUNT | SUM | AVG | MIN | MAX) '(' expr ')'
 //   literal     := ['-'] integer | ['-'] decimal | string_literal | (DATE | TIMESTAMP)
@@ -47,7 +51,9 @@
 //   type        := name ['(' integer (',' integer)* ')']
 //
 // The parser keeps expressions as written; what the engine answers is the binder's decision. The
-// WHERE and HAVING predicates are split at their top-level AND chain, collected in a loop.
+// FROM list is flat (ADR 0022): each item records its connector to the items before it, and the
+// list is collected in a loop. The ON, WHERE and HAVING predicates are split at their top-level
+// AND chain, collected in a loop too.
 // Recursion is bounded: every level of an expression tree (but that chain) counts against
 // kMaxDepth, and so do the levels that the canonical form of a cast, a unary minus or a NOT
 // operand adds (ToSql writes x::T as CAST(x AS T), -x as -(x) and a = NOT b as a = (NOT b)); a
@@ -65,8 +71,16 @@ template <typename T>
 using Expected = std::expected<T, ParseError>;
 using Status = std::expected<void, ParseError>;
 
-// Where an operand is parsed; selects the error wording and whether literals are allowed.
-enum class Context : std::uint8_t { kSelect, kAggregateArg, kWhere, kGroupBy, kHaving, kOrderBy };
+// Where an operand is parsed; selects the error wording and whether aggregates are allowed.
+enum class Context : std::uint8_t {
+  kSelect,
+  kAggregateArg,
+  kOn,
+  kWhere,
+  kGroupBy,
+  kHaving,
+  kOrderBy
+};
 
 // Binding powers of the operators (see the grammar above).
 constexpr int kOrPrecedence = 1;
@@ -85,8 +99,8 @@ struct Construct {
   std::string_view message;
 };
 
-// Identifiers longer than every keyword below are never keywords (checked below).
-constexpr std::size_t kMaxKeywordLength = 12;
+// Identifiers longer than every keyword below are never keywords (checked below): AUTHORIZATION.
+constexpr std::size_t kMaxKeywordLength = 13;
 
 // Words that cannot be unquoted column, table or alias names (sorted).
 constexpr auto kReservedWords = std::to_array<std::string_view>({
@@ -109,21 +123,15 @@ constexpr auto kOtherStatements = std::to_array<std::string_view>({
     "TRUNCATE", "UNPIVOT", "UPDATE",   "USE",      "VACUUM", "VALUES",
 });
 
-// Clauses that can follow the select list, the table, the predicate or LIMIT.
+// Clauses that can follow the select list, the FROM list, the predicate or LIMIT. The join keywords
+// are not among them: the FROM list parses them, and elsewhere they are syntax errors, as in
+// DuckDB.
 constexpr auto kUnsupportedClauses = std::to_array<Construct>({
-    {.keyword = "CROSS", .message = "CROSS JOIN is not supported"},
     {.keyword = "EXCEPT", .message = "EXCEPT is not supported"},
     {.keyword = "FETCH", .message = "FETCH is not supported"},
     {.keyword = "FOR", .message = "FOR UPDATE/SHARE is not supported"},
-    {.keyword = "FULL", .message = "FULL JOIN is not supported"},
-    {.keyword = "INNER", .message = "INNER JOIN is not supported"},
     {.keyword = "INTERSECT", .message = "INTERSECT is not supported"},
-    {.keyword = "JOIN", .message = "JOIN is not supported"},
-    {.keyword = "LEFT", .message = "LEFT JOIN is not supported"},
-    {.keyword = "NATURAL", .message = "NATURAL JOIN is not supported"},
-    {.keyword = "OUTER", .message = "OUTER JOIN is not supported"},
     {.keyword = "QUALIFY", .message = "QUALIFY is not supported"},
-    {.keyword = "RIGHT", .message = "RIGHT JOIN is not supported"},
     {.keyword = "UNION", .message = "UNION is not supported"},
     {.keyword = "USING", .message = "USING SAMPLE is not supported"},
     {.keyword = "WINDOW", .message = "WINDOW is not supported"},
@@ -144,8 +152,10 @@ constexpr auto kUnsupportedOperandKeywords = std::to_array<Construct>({
 
 // Keywords that continue a complete operand into an expression outside the subset. They are
 // checked before an implicit alias, so "SELECT a ISNULL FROM t" is never read as "a AS isnull".
+// (AT TIME ZONE is one too: see UnsupportedOperator.)
 constexpr auto kUnsupportedOperatorKeywords = std::to_array<Construct>({
     {.keyword = "COLLATE", .message = "COLLATE is not supported"},
+    {.keyword = "GLOB", .message = "GLOB is not supported"},
     {.keyword = "ILIKE", .message = "ILIKE is not supported"},
     {.keyword = "ISNULL", .message = "ISNULL is not supported"},
     {.keyword = "NOTNULL", .message = "NOTNULL is not supported"},
@@ -194,6 +204,131 @@ constexpr auto kMultiWordTypes = std::to_array<WordPair>({
     {.first = "TIMESTAMP", .second = "WITHOUT"},
 });
 
+// What a word of kNotAnAlias means right after a FROM item in DuckDB, decided by the token that
+// follows it.
+enum class Follows : std::uint8_t {
+  kNothing,   // no meaning there
+  kJoin,      // JOIN: SEMI JOIN, ANTI JOIN, POSITIONAL JOIN
+  kAsofJoin,  // JOIN or a join kind (kJoinKinds): ASOF [INNER | LEFT | ...] JOIN
+  kParen,     // '(': AT (VERSION => 1), PIVOT (...)
+  kUnpivot,   // '(', INCLUDE or EXCLUDE: UNPIVOT [INCLUDE NULLS] (...)
+  kSample,    // a number, a name or '(': TABLESAMPLE 10%, TABLESAMPLE reservoir(10)
+};
+
+struct NotAnAlias {
+  std::string_view keyword;
+  Follows follows = Follows::kNothing;
+  std::string_view construct;  // the kUnsupported message where the word has its meaning
+  bool after_on = false;       // the meaning also exists right after an ON condition
+};
+
+// The words that DuckDB 1.5.5 refuses as table aliases (implicit or after AS) and antb1 does not
+// reserve (sorted; checked below). They stay out of kReservedWords, which decides where a name
+// needs quoting (result names, divergence D8): they remain column, table and function names and
+// select aliases (divergence D21). After a FROM item such a word is never an alias (read as one,
+// SEMI and ANTI would run an inner join instead of DuckDB's semi or anti join): kUnsupported where
+// DuckDB gives it a meaning there, else a syntax error, as in DuckDB (ADR 0022). After an ON
+// condition GLOB, ISNULL, NOTNULL and AT TIME ZONE continue the expression (UnsupportedOperator).
+constexpr auto kNotAnAlias = std::to_array<NotAnAlias>({
+    {.keyword = "ANALYSE"},
+    {.keyword = "ANALYZE"},
+    {.keyword = "ANTI",
+     .follows = Follows::kJoin,
+     .construct = "ANTI JOIN is not supported",
+     .after_on = true},
+    {.keyword = "ASOF",
+     .follows = Follows::kAsofJoin,
+     .construct = "ASOF JOIN is not supported",
+     .after_on = true},
+    {.keyword = "ASYMMETRIC"},
+    {.keyword = "AT", .follows = Follows::kParen, .construct = "AT (time travel) is not supported"},
+    {.keyword = "AUTHORIZATION"},
+    {.keyword = "BINARY"},
+    {.keyword = "BOTH"},
+    {.keyword = "CHECK"},
+    {.keyword = "COLLATION"},
+    {.keyword = "COLUMN"},
+    {.keyword = "CONCURRENTLY"},
+    {.keyword = "CONSTRAINT"},
+    {.keyword = "CREATE"},
+    {.keyword = "DEFAULT"},
+    {.keyword = "DEFERRABLE"},
+    {.keyword = "DESCRIBE"},
+    {.keyword = "DO"},
+    {.keyword = "FOREIGN"},
+    {.keyword = "FREEZE"},
+    {.keyword = "GLOB"},
+    {.keyword = "INITIALLY"},
+    {.keyword = "ISNULL"},
+    {.keyword = "LAMBDA"},
+    {.keyword = "LEADING"},
+    {.keyword = "NOTNULL"},
+    {.keyword = "ONLY"},
+    {.keyword = "OVERLAPS"},
+    {.keyword = "PIVOT",
+     .follows = Follows::kParen,
+     .construct = "PIVOT is not supported",
+     .after_on = true},
+    {.keyword = "PIVOT_LONGER"},
+    {.keyword = "PIVOT_WIDER"},
+    {.keyword = "PLACING"},
+    {.keyword = "POSITIONAL",
+     .follows = Follows::kJoin,
+     .construct = "POSITIONAL JOIN is not supported",
+     .after_on = true},
+    {.keyword = "PRIMARY"},
+    {.keyword = "REFERENCES"},
+    {.keyword = "RETURNING"},
+    {.keyword = "SEMI",
+     .follows = Follows::kJoin,
+     .construct = "SEMI JOIN is not supported",
+     .after_on = true},
+    {.keyword = "SHOW"},
+    {.keyword = "SUMMARIZE"},
+    {.keyword = "SYMMETRIC"},
+    {.keyword = "TABLESAMPLE",
+     .follows = Follows::kSample,
+     .construct = "TABLESAMPLE is not supported"},
+    {.keyword = "TO"},
+    {.keyword = "TRAILING"},
+    {.keyword = "UNIQUE"},
+    {.keyword = "UNPACK"},
+    {.keyword = "UNPIVOT",
+     .follows = Follows::kUnpivot,
+     .construct = "UNPIVOT is not supported",
+     .after_on = true},
+    {.keyword = "VARIADIC"},
+    {.keyword = "VERBOSE"},
+});
+
+// Reserved words that DuckDB accepts as table aliases, with or without AS (checked below). ToSql
+// prints every alias quoted, so the canonical form never writes them bare.
+constexpr auto kAliasKeywords =
+    std::to_array<std::string_view>({"BETWEEN", "EXISTS", "INTERVAL", "OVER"});
+
+// The words after NATURAL or ASOF that make a join of DuckDB's (NATURAL SEMI JOIN, ASOF LEFT JOIN).
+constexpr auto kJoinKinds =
+    std::to_array<std::string_view>({"ANTI", "FULL", "INNER", "JOIN", "LEFT", "RIGHT", "SEMI"});
+
+// The reserved words that start a join after a FROM item (ParseJoinKeywords).
+constexpr auto kJoinStarts =
+    std::to_array<std::string_view>({"CROSS", "FULL", "INNER", "JOIN", "LEFT", "NATURAL", "RIGHT"});
+
+// The first words of a query in parentheses in FROM (a subquery), as DuckDB parses them; a '('
+// starts one too.
+constexpr auto kSubqueryStarts =
+    std::to_array<std::string_view>({"DESCRIBE", "FROM", "PIVOT", "SELECT", "SHOW", "SUMMARIZE",
+                                     "TABLE", "UNPIVOT", "VALUES", "WITH"});
+
+constexpr bool IsReservedWordOf(std::string_view word) {
+  return std::ranges::binary_search(kReservedWords, word);
+}
+static_assert(kNotAnAlias.size() == 49, "DuckDB 1.5.5 refuses 49 such words as table aliases");
+static_assert(std::ranges::is_sorted(kNotAnAlias, {}, &NotAnAlias::keyword));
+static_assert(std::ranges::none_of(kNotAnAlias, IsReservedWordOf, &NotAnAlias::keyword),
+              "a word that cannot be an alias is no reserved word");
+static_assert(std::ranges::all_of(kAliasKeywords, IsReservedWordOf));
+
 constexpr bool FitsKeywordLength(std::string_view word) { return word.size() <= kMaxKeywordLength; }
 static_assert(std::ranges::all_of(kMultiWordTypes, FitsKeywordLength, &WordPair::first));
 static_assert(std::ranges::all_of(kMultiWordTypes, FitsKeywordLength, &WordPair::second));
@@ -208,6 +343,10 @@ static_assert(std::ranges::all_of(kUnsupportedOperatorKeywords, FitsKeywordLengt
 static_assert(std::ranges::all_of(kUnsupportedTypedLiterals, FitsKeywordLength,
                                   &Construct::keyword));
 static_assert(std::ranges::all_of(kStarModifiers, FitsKeywordLength, &Construct::keyword));
+static_assert(std::ranges::all_of(kNotAnAlias, FitsKeywordLength, &NotAnAlias::keyword));
+static_assert(std::ranges::all_of(kJoinKinds, FitsKeywordLength));
+static_assert(std::ranges::all_of(kJoinStarts, IsReservedWordOf));
+static_assert(std::ranges::all_of(kSubqueryStarts, FitsKeywordLength));
 
 constexpr std::size_t kMaxQuotedText = 32;
 
@@ -249,6 +388,35 @@ bool IsReservedKeyword(std::string_view keyword) {
 bool IsName(const Token& token) {
   return token.kind == TokenKind::kQuotedIdentifier ||
          (token.kind == TokenKind::kIdentifier && !IsReservedKeyword(KeywordOf(token)));
+}
+
+// The entry of kNotAnAlias for an unquoted identifier, or nullptr.
+const NotAnAlias* FindNotAnAlias(const Token& token) {
+  const std::string keyword = KeywordOf(token);
+  if (keyword.empty()) {
+    return nullptr;
+  }
+  const auto* it = std::ranges::lower_bound(kNotAnAlias, keyword, {}, &NotAnAlias::keyword);
+  return it != kNotAnAlias.end() && it->keyword == keyword ? it : nullptr;
+}
+
+// A token that can be a table alias: a name other than the words of kNotAnAlias, one of the
+// reserved words of kAliasKeywords, and (`after_as`) a non-empty string literal.
+bool IsTableAlias(const Token& token, bool after_as) {
+  if (token.kind == TokenKind::kString) {
+    return after_as && !token.text.empty();
+  }
+  if (FindNotAnAlias(token) != nullptr) {
+    return false;
+  }
+  return IsName(token) || Contains(kAliasKeywords, KeywordOf(token));
+}
+
+// A token that starts a FROM item's relation (after ONLY): a name, a string or a word that
+// DuckDB accepts as a table name (kAliasKeywords).
+bool StartsRelation(const Token& token) {
+  return token.kind == TokenKind::kString || IsName(token) ||
+         Contains(kAliasKeywords, KeywordOf(token));
 }
 
 std::string Clip(std::string_view text) {
@@ -429,12 +597,7 @@ class Parser {
     if (auto status = ExpectFrom(stmt.star); !status) {
       return std::unexpected(std::move(status.error()));
     }
-    auto table = ParseTableRef();
-    if (!table) {
-      return std::unexpected(std::move(table.error()));
-    }
-    stmt.from = std::move(*table);
-    if (auto status = CheckAfterTable(); !status) {
+    if (auto status = ParseFromList(stmt); !status) {
       return std::unexpected(std::move(status.error()));
     }
     if (Peek().IsKeyword("WHERE")) {
@@ -900,6 +1063,9 @@ class Parser {
       case TokenKind::kIdentifier:
         return ParseIdentifierPrimary(context);
       case TokenKind::kQuotedIdentifier: {
+        if (PeekAt(1).kind == TokenKind::kDot) {
+          return ParseQualifiedColumn();
+        }
         if (PeekAt(1).kind == TokenKind::kLeftParen) {
           return ParseFunction(context);
         }
@@ -956,6 +1122,16 @@ class Parser {
   Expected<Expr> ParseIdentifierPrimary(Context context) {
     const Token& token = Peek();
     const std::string keyword = KeywordOf(token);
+    if (PeekAt(1).kind == TokenKind::kDot) {
+      if (Contains(kAliasKeywords, keyword)) {  // DuckDB accepts them as qualifiers
+        return Unsupported(token.span, "the reserved word " + keyword +
+                                           " as a qualifier is not supported; write it as a "
+                                           "quoted identifier");
+      }
+      if (!IsReservedKeyword(keyword)) {
+        return ParseQualifiedColumn();
+      }
+    }
     if (auto construct = Find(kUnsupportedOperandKeywords, keyword); construct.has_value()) {
       return Unsupported(token.span, *construct);
     }
@@ -990,6 +1166,8 @@ class Parser {
     if (next.kind == TokenKind::kLeftParen && function_like) {
       if (auto agg_kind = AggregateOf(token); agg_kind.has_value()) {
         switch (context) {
+          case Context::kOn:
+            return Syntax(token.span, "aggregate functions are not allowed in ON");
           case Context::kWhere:
             return Syntax(token.span, "aggregate functions are not allowed in WHERE");
           case Context::kGroupBy:
@@ -1021,6 +1199,39 @@ class Parser {
     }
     Token name = Take();
     return Expr(ColumnRef{.name = std::move(name.text), .quoted = false, .span = name.span});
+  }
+
+  // qualifier '.' name, positioned at the qualifier (a name; the next token is '.'). One qualifier
+  // only, and the column a name that needs no quoting to be one.
+  Expected<Expr> ParseQualifiedColumn() {
+    Token qualifier = Take();
+    Take();  // '.'
+    const Token& name = Peek();
+    if (name.kind == TokenKind::kStar) {
+      return Unsupported(name.span, "qualified * (t.*) is not supported");
+    }
+    if (name.kind == TokenKind::kIdentifier && !IsName(name)) {
+      return Unsupported(name.span, "the reserved word " + KeywordOf(name) +
+                                        " after '.' is not supported; write it as a quoted "
+                                        "identifier");
+    }
+    if (!IsName(name)) {
+      return Syntax(name.span, "expected a column name after '.', found " + Describe(name));
+    }
+    Token column = Take();
+    if (Peek().kind == TokenKind::kDot) {
+      return Unsupported(Peek().span, "names of more than two parts (a.b.c) are not supported");
+    }
+    if (Peek().kind == TokenKind::kLeftParen) {
+      return Unsupported(column.span,
+                         "qualified function names and method calls (a.f()) are not supported");
+    }
+    const SourceSpan span = Cover(qualifier.span, column.span);
+    return Expr(ColumnRef{.name = std::move(column.text),
+                          .quoted = column.kind == TokenKind::kQuotedIdentifier,
+                          .span = span,
+                          .qualifier = std::move(qualifier.text),
+                          .qualifier_quoted = qualifier.kind == TokenKind::kQuotedIdentifier});
   }
 
   // agg_call, positioned at the function name (the next token is '(').
@@ -1312,8 +1523,9 @@ class Parser {
         return UnsupportedError(token.span, "string concatenation (||) is not supported");
       case TokenKind::kDoubleColon:
         return UnsupportedError(token.span, "CAST (::) of an IN condition is not supported");
-      case TokenKind::kDot:
-        return UnsupportedError(token.span, "qualified names (a.b) are not supported");
+      case TokenKind::kDot:  // a qualified name is one primary expression (ParseQualifiedColumn)
+        return UnsupportedError(token.span,
+                                "'.' after an expression (a field or a method) is not supported");
       case TokenKind::kOperator:
         if (token.text == "//") {
           return std::nullopt;
@@ -1329,6 +1541,9 @@ class Parser {
     const std::string keyword = KeywordOf(token);
     if (auto construct = Find(kUnsupportedOperatorKeywords, keyword); construct.has_value()) {
       return UnsupportedError(token.span, *construct);
+    }
+    if (keyword == "AT" && PeekAt(1).IsKeyword("TIME")) {
+      return UnsupportedError(token.span, "AT TIME ZONE is not supported");
     }
     if (keyword == "IS") {
       const std::string after = KeywordOf(PeekAt(1));
@@ -1464,13 +1679,139 @@ class Parser {
                                   ", found " + Describe(token));
   }
 
+  // ---- the FROM list ----
+
+  // from_list, positioned after FROM: the items in a loop, each with its connector and, for a
+  // JOIN with ON, its condition. A JOIN binds tighter than a comma, so the list is never nested.
+  Status ParseFromList(SelectStatement& stmt) {
+    Connector connector = Connector::kFirst;
+    SourceSpan connector_span;
+    while (true) {
+      auto item = ParseFromItem(connector, connector_span);
+      if (!item) {
+        return std::unexpected(std::move(item.error()));
+      }
+      if (connector == Connector::kInner || connector == Connector::kLeft) {
+        if (auto status = ParseOn(*item); !status) {
+          return status;
+        }
+      }
+      stmt.from.push_back(*std::move(item));
+      if (Peek().kind == TokenKind::kComma) {
+        connector_span = Take().span;
+        if (EndsList(Peek())) {  // DuckDB allows it
+          return Unsupported(connector_span, "a trailing comma in FROM is not supported");
+        }
+        connector = Connector::kComma;
+        continue;
+      }
+      auto join = ParseJoinKeywords();
+      if (!join) {
+        return std::unexpected(std::move(join.error()));
+      }
+      if (!join->has_value()) {
+        return {};
+      }
+      connector = (*join)->connector;
+      connector_span = (*join)->span;
+    }
+  }
+
+  struct JoinKeywords {
+    Connector connector = Connector::kInner;
+    SourceSpan span;  // CROSS JOIN, [INNER] JOIN or LEFT [OUTER] JOIN
+  };
+
+  // The join keywords at the next token, or std::nullopt when none starts there (the FROM list
+  // ends). At most three tokens of lookahead (LEFT OUTER JOIN). The joins that DuckDB has and the
+  // subset lacks are kUnsupported; a join keyword without the rest is a syntax error, as in DuckDB.
+  Expected<std::optional<JoinKeywords>> ParseJoinKeywords() {
+    const Token& token = Peek();
+    const std::string keyword = KeywordOf(token);
+    const auto take = [this](Connector connector, std::size_t words) {
+      const SourceSpan first = Take().span;
+      SourceSpan last = first;
+      for (std::size_t i = 1; i < words; ++i) {
+        last = Take().span;
+      }
+      return std::optional(JoinKeywords{.connector = connector, .span = Cover(first, last)});
+    };
+    if (keyword == "JOIN") {
+      return take(Connector::kInner, 1);
+    }
+    if (keyword == "INNER" || keyword == "CROSS") {
+      if (!PeekAt(1).IsKeyword("JOIN")) {
+        return Syntax(PeekAt(1).span,
+                      "expected JOIN after " + keyword + ", found " + Describe(PeekAt(1)));
+      }
+      return take(keyword == "INNER" ? Connector::kInner : Connector::kCross, 2);
+    }
+    if (keyword == "LEFT" || keyword == "RIGHT" || keyword == "FULL") {
+      const bool outer = PeekAt(1).IsKeyword("OUTER");
+      const Token& join = PeekAt(outer ? 2 : 1);
+      if (!join.IsKeyword("JOIN")) {
+        return Syntax(join.span, "expected JOIN after " + keyword + (outer ? " OUTER" : "") +
+                                     ", found " + Describe(join));
+      }
+      if (keyword != "LEFT") {
+        return Unsupported(token.span, keyword + " JOIN is not supported");
+      }
+      return take(Connector::kLeft, outer ? 3 : 2);
+    }
+    if (keyword == "NATURAL") {
+      if (!Contains(kJoinKinds, KeywordOf(PeekAt(1)))) {
+        return Syntax(PeekAt(1).span, "expected JOIN after NATURAL, found " + Describe(PeekAt(1)));
+      }
+      return Unsupported(token.span, "NATURAL JOIN is not supported");
+    }
+    if (keyword == "OUTER") {
+      return Syntax(token.span, "expected LEFT, RIGHT or FULL before OUTER");
+    }
+    return std::nullopt;
+  }
+
+  // from_item: a table or a path, then its alias. After an item a word of kNotAnAlias is never an
+  // alias (ParseAlias).
+  Expected<FromItem> ParseFromItem(Connector connector, SourceSpan connector_span) {
+    auto table = ParseTableRef();
+    if (!table) {
+      return std::unexpected(std::move(table.error()));
+    }
+    FromItem item{.connector = connector,
+                  .table = *std::move(table),
+                  .alias = {},
+                  .on = {},
+                  .connector_span = connector_span,
+                  .alias_span = {},
+                  .on_span = {},
+                  .span = {}};
+    item.span = item.table.span;
+    if (item.table.kind == TableRef::Kind::kName && Peek().kind == TokenKind::kDot) {
+      return Unsupported(
+          Peek().span,
+          "qualified table names are not supported (quote file paths: 'dir/f.parquet')");
+    }
+    if (auto status = ParseAlias(item); !status) {
+      return std::unexpected(std::move(status.error()));
+    }
+    return item;
+  }
+
   Expected<TableRef> ParseTableRef() {
     const Token& token = Peek();
     switch (token.kind) {
       case TokenKind::kIdentifier:
       case TokenKind::kQuotedIdentifier: {
         const std::string keyword = KeywordOf(token);
-        if (PeekAt(1).kind == TokenKind::kLeftParen && !IsReservedKeyword(keyword)) {
+        const Token& next = PeekAt(1);
+        if (keyword == "LATERAL" && (next.kind == TokenKind::kLeftParen ||
+                                     (IsName(next) && PeekAt(2).kind == TokenKind::kLeftParen))) {
+          return Unsupported(token.span, "LATERAL is not supported");
+        }
+        if (keyword == "ONLY" && StartsRelation(next)) {  // ONLY t; a table "only" otherwise
+          return Unsupported(token.span, "ONLY is not supported");
+        }
+        if (next.kind == TokenKind::kLeftParen && !IsReservedKeyword(keyword)) {
           return Unsupported(token.span, "table functions are not supported");
         }
         if (IsReservedKeyword(keyword)) {
@@ -1491,29 +1832,146 @@ class Parser {
                         .quoted = false,
                         .span = path.span};
       }
-      case TokenKind::kLeftParen:
-        return Unsupported(token.span, "subqueries in FROM are not supported");
+      case TokenKind::kLeftParen: {
+        // DuckDB's subqueries, else its joins in parentheses; a table alone in them is a syntax
+        // error (as far as three tokens tell).
+        const Token& next = PeekAt(1);
+        if (next.kind == TokenKind::kLeftParen || Contains(kSubqueryStarts, KeywordOf(next))) {
+          return Unsupported(token.span, "subqueries in FROM are not supported");
+        }
+        if (next.kind != TokenKind::kString && !IsName(next)) {
+          return Syntax(next.span,
+                        "expected a table name, a quoted file path or a subquery after '(', "
+                        "found " +
+                            Describe(next));
+        }
+        if (PeekAt(2).kind == TokenKind::kRightParen) {
+          return Syntax(PeekAt(2).span,
+                        "expected a join after the table in parentheses, found ')'");
+        }
+        return Unsupported(token.span, "parenthesized joins in FROM are not supported");
+      }
       default:
         return Syntax(token.span,
                       "expected a table name or a quoted file path, found " + Describe(token));
     }
   }
 
-  Status CheckAfterTable() {
+  // [AS] alias after a FROM item's table, and what may not follow it: a word of kNotAnAlias is
+  // never an alias, and after an alias a column alias list is unsupported.
+  Status ParseAlias(FromItem& item) {
     const Token& token = Peek();
-    if (token.kind == TokenKind::kDot) {
-      return Unsupported(
-          token.span,
-          "qualified table names are not supported (quote file paths: 'dir/f.parquet')");
+    if (token.IsKeyword("AS")) {
+      const SourceSpan as = Take().span;
+      const Token& name = Peek();
+      if (name.kind == TokenKind::kString && name.text.empty()) {  // DuckDB allows it
+        return Unsupported(name.span, "an empty table alias ('') is not supported");
+      }
+      if (!IsTableAlias(name, /*after_as=*/true)) {
+        if (const NotAnAlias* word = FindNotAnAlias(name)) {
+          return Syntax(name.span, NotAnAliasMessage(*word));
+        }
+        return Syntax(name.span, "expected a table alias after AS, found " + Describe(name));
+      }
+      SetAlias(item, as);
+    } else if (const NotAnAlias* word = FindNotAnAlias(token)) {
+      if (auto error = Meaning(*word, After::kItem)) {
+        return std::unexpected(std::move(*error));
+      }
+      return Syntax(token.span, NotAnAliasMessage(*word));
+    } else if (IsTableAlias(token, /*after_as=*/false)) {
+      SetAlias(item, token.span);
+    } else {
+      return {};
     }
-    if (token.kind == TokenKind::kComma) {
-      return Unsupported(token.span, "multiple tables in FROM (JOIN) are not supported");
+    if (Peek().kind == TokenKind::kLeftParen) {
+      return Unsupported(Peek().span, "column alias lists (t AS a(x, y)) are not supported");
     }
-    if (token.IsKeyword("TABLESAMPLE")) {
-      return Unsupported(token.span, "TABLESAMPLE is not supported");
+    if (const NotAnAlias* word = FindNotAnAlias(Peek())) {
+      if (auto error = Meaning(*word, After::kItem)) {
+        return std::unexpected(std::move(*error));
+      }
     }
-    if (token.IsKeyword("AS") || IsName(token)) {
-      return Unsupported(token.span, "table aliases are not supported");
+    return {};
+  }
+
+  static std::string NotAnAliasMessage(const NotAnAlias& word) {
+    return "a table alias cannot be the keyword " + std::string(word.keyword) +
+           "; write it as a quoted identifier";
+  }
+
+  // Takes the alias at the next token: its spans run from `begin` (AS or the alias itself).
+  void SetAlias(FromItem& item, SourceSpan begin) {
+    Token alias = Take();
+    item.alias = std::move(alias.text);
+    item.alias_span = Cover(begin, alias.span);
+    item.span = Cover(item.span, alias.span);
+  }
+
+  enum class After : std::uint8_t { kItem, kOn };
+
+  // kUnsupported when the word of kNotAnAlias at the next token has its DuckDB meaning there (after
+  // a FROM item, or after an ON condition), told by the token after it; std::nullopt otherwise.
+  std::optional<ParseError> Meaning(const NotAnAlias& word, After after) {
+    if (after == After::kOn && !word.after_on) {
+      return std::nullopt;
+    }
+    const Token& next = PeekAt(1);
+    bool means = false;
+    switch (word.follows) {
+      case Follows::kNothing:
+        break;
+      case Follows::kJoin:
+        means = next.IsKeyword("JOIN");
+        break;
+      case Follows::kAsofJoin:
+        means = Contains(kJoinKinds, KeywordOf(next));
+        break;
+      case Follows::kParen:
+        means = next.kind == TokenKind::kLeftParen;
+        break;
+      case Follows::kUnpivot:
+        means = next.kind == TokenKind::kLeftParen || next.IsKeyword("INCLUDE") ||
+                next.IsKeyword("EXCLUDE");
+        break;
+      case Follows::kSample:
+        means = next.kind == TokenKind::kInteger || next.kind == TokenKind::kDecimal ||
+                next.kind == TokenKind::kLeftParen || IsName(next);
+        break;
+    }
+    if (!means) {
+      return std::nullopt;
+    }
+    return UnsupportedError(Peek().span, word.construct);
+  }
+
+  // ON and its condition, after the item of an [INNER] JOIN or a LEFT JOIN, split at its top-level
+  // AND chain like WHERE.
+  Status ParseOn(FromItem& item) {
+    const Token& token = Peek();
+    if (!token.IsKeyword("ON")) {
+      if (token.IsKeyword("USING")) {
+        return Unsupported(token.span,
+                           "JOIN ... USING is not supported (write the condition with ON)");
+      }
+      if (Contains(kJoinStarts, KeywordOf(token))) {
+        return Unsupported(token.span,
+                           "nested joins (a JOIN before the ON of an earlier JOIN) are not "
+                           "supported");
+      }
+      return Syntax(token.span, "expected ON after the JOIN at offset " +
+                                    std::to_string(item.connector_span.offset) + ", found " +
+                                    Describe(token));
+    }
+    const std::size_t begin = Take().span.offset;
+    if (auto status = ParseConjuncts(Context::kOn, item.on); !status) {
+      return status;
+    }
+    item.on_span = SourceSpan{.offset = begin, .length = last_end_ - begin};
+    if (const NotAnAlias* word = FindNotAnAlias(Peek())) {
+      if (auto error = Meaning(*word, After::kOn)) {
+        return std::unexpected(std::move(*error));
+      }
     }
     return {};
   }

@@ -15,12 +15,14 @@ namespace antb1::sql {
 inline constexpr std::size_t kMaxExpressionDepth = 256;
 
 // Parses one statement of the grammar in docs/sql-subset.md; an optional trailing ';' is allowed.
-// Expressions are parsed as written, whether or not the binder answers them. Recognized SQL outside
-// the grammar (JOIN, window functions, subqueries, ...) yields ParseError::Kind::kUnsupported with
-// the span of the first offending token and a message naming the construct; malformed input yields
-// kSyntax. Any byte sequence is accepted as input: Parse never crashes, recurses at most as deep as
-// its expression depth limit (kMaxExpressionDepth levels, else kUnsupported), stops working at the
-// first error, and every error span lies inside `text`.
+// Expressions and the FROM list (a flat list of tables and paths with their aliases, joined by
+// commas, CROSS JOIN, [INNER] JOIN ... ON and LEFT [OUTER] JOIN ... ON) are parsed as written,
+// whether or not the binder answers them. Recognized SQL outside the grammar (window functions,
+// subqueries, RIGHT JOIN, ...) yields ParseError::Kind::kUnsupported with the span of the first
+// offending token and a message naming the construct; malformed input yields kSyntax. Any byte
+// sequence is accepted as input: Parse never crashes, recurses at most as deep as its expression
+// depth limit (kMaxExpressionDepth levels, else kUnsupported), stops working at the first error,
+// and every error span lies inside `text`.
 std::expected<SelectStatement, ParseError> Parse(std::string_view text);
 
 // Whether `word` (ASCII case-insensitive) is reserved: as a column, table or alias name it must be

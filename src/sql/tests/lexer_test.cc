@@ -114,6 +114,25 @@ TEST(LexerTest, OperatorsSplitWithoutSpaces) {
   EXPECT_EQ(error.span, (SourceSpan{.offset = 2, .length = 1}));
 }
 
+// A qualified name is three tokens (the parser joins them); a dot before a digit starts a number.
+TEST(LexerTest, QualifiedNamesAreSeparateTokens) {
+  const std::vector<TokenKind> qualified = {TokenKind::kIdentifier, TokenKind::kDot,
+                                            TokenKind::kIdentifier, TokenKind::kEnd};
+  EXPECT_EQ(Kinds("t.x"), qualified);
+  EXPECT_EQ(Kinds("t . /* c */ x"), qualified);
+  EXPECT_EQ(Kinds(R"("t"."x")"),
+            (std::vector<TokenKind>{TokenKind::kQuotedIdentifier, TokenKind::kDot,
+                                    TokenKind::kQuotedIdentifier, TokenKind::kEnd}));
+  EXPECT_EQ(Kinds("t.*"), (std::vector<TokenKind>{TokenKind::kIdentifier, TokenKind::kDot,
+                                                  TokenKind::kStar, TokenKind::kEnd}));
+  EXPECT_EQ(Kinds("t.5"),
+            (std::vector<TokenKind>{TokenKind::kIdentifier, TokenKind::kDecimal, TokenKind::kEnd}));
+  auto tokens = Tokenize("a.b.c");
+  ASSERT_TRUE(tokens.has_value());
+  ASSERT_EQ(tokens->size(), 6U);
+  EXPECT_EQ((*tokens)[3].span, (SourceSpan{.offset = 3, .length = 1}));
+}
+
 // PostgreSQL's operator rule (DuckDB uses the same lexer): the longest run of operator characters
 // is one token; a trailing '+'/'-' is split off unless the run holds one of ~ ! @ # % ^ & | ` ?.
 TEST(LexerTest, OperatorsFollowPostgresRules) {

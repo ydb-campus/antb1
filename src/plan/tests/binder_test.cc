@@ -657,6 +657,90 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT i16 FROM t ORDER BY strlen(s::VARCHAR, 1)", kBind,
                   "strlen(s::VARCHAR, 1)", "strlen() takes 1 argument, not 2"}));
 
+// FROM lists, joins, aliases and qualified names parse (ADR 0022) and are kUnsupported until the
+// binder answers them (J2b): before any name is resolved, so also over tables that do not exist,
+// at the first one in query order (select list, FROM, WHERE, GROUP BY, HAVING, ORDER BY).
+INSTANTIATE_TEST_SUITE_P(
+    FromLists, BindErrorTest,
+    ::testing::Values(
+        ErrorCase{"SELECT i16 FROM t, u", kUnsupported, ",",
+                  "a FROM list of several tables is not supported"},
+        ErrorCase{"SELECT COUNT(*) FROM nope, missing", kUnsupported, ",",
+                  "a FROM list of several tables is not supported"},
+        ErrorCase{"SELECT i16 FROM t CROSS JOIN u", kUnsupported, "CROSS JOIN",
+                  "CROSS JOIN is not supported"},
+        ErrorCase{"SELECT i16 FROM t JOIN u ON t.i16 = u.i16", kUnsupported, "JOIN",
+                  "JOIN ... ON is not supported"},
+        ErrorCase{"SELECT i16 FROM t inner join u ON i16 = 1", kUnsupported, "inner join",
+                  "JOIN ... ON is not supported"},
+        ErrorCase{"SELECT i16 FROM t LEFT OUTER JOIN u ON t.i16 = u.i16", kUnsupported,
+                  "LEFT OUTER JOIN", "LEFT JOIN is not supported"},
+        ErrorCase{"SELECT i16 FROM nope LEFT JOIN missing ON a = b", kUnsupported, "LEFT JOIN",
+                  "LEFT JOIN is not supported"},
+        ErrorCase{"SELECT i16 FROM t AS a", kUnsupported, "AS a",
+                  "table aliases are not supported"},
+        ErrorCase{"SELECT COUNT(*) FROM nope n", kUnsupported, "n",
+                  "table aliases are not supported"},
+        ErrorCase{"SELECT COUNT(*) FROM 'x.parquet' AS 'p'", kUnsupported, "AS 'p'",
+                  "table aliases are not supported"},
+        ErrorCase{"SELECT COUNT(*) FROM t over", kUnsupported, "over",
+                  "table aliases are not supported"},
+        // Qualified names, wherever a column may stand.
+        ErrorCase{"SELECT t.i16 FROM t", kUnsupported, "t.i16",
+                  "qualified column names (t.x) are not supported"},
+        ErrorCase{"SELECT SUM(t.i16) FROM t", kUnsupported, "t.i16",
+                  "qualified column names (t.x) are not supported"},
+        ErrorCase{R"(SELECT COUNT(DISTINCT "t".i16) FROM t)", kUnsupported, R"("t".i16)",
+                  "qualified column names"},
+        ErrorCase{"SELECT strlen(t.s) FROM t", kUnsupported, "t.s", "qualified column names"},
+        ErrorCase{"SELECT i16 + t.i32, -t.i64 FROM t", kUnsupported, "t.i32",
+                  "qualified column names"},
+        ErrorCase{"SELECT EXTRACT(year FROM t.dt) FROM t", kUnsupported, "t.dt",
+                  "qualified column names"},
+        ErrorCase{"SELECT CASE WHEN t.i16 = 1 THEN 2 END FROM t", kUnsupported, "t.i16",
+                  "qualified column names"},
+        ErrorCase{"SELECT CASE i16 WHEN 1 THEN t.s END FROM t", kUnsupported, "t.s",
+                  "qualified column names"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE t.i16 = 1", kUnsupported, "t.i16",
+                  "qualified column names"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE s LIKE t.s", kUnsupported, "t.s",
+                  "qualified column names"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE i16 IN (1, t.i16)", kUnsupported, "t.i16",
+                  "qualified column names"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE i16 BETWEEN t.i32 AND 2", kUnsupported, "t.i32",
+                  "qualified column names"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE i16 = 1 OR NOT t.i32 > 2", kUnsupported, "t.i32",
+                  "qualified column names"},
+        ErrorCase{"SELECT i16 FROM t GROUP BY t.i16", kUnsupported, "t.i16",
+                  "qualified column names"},
+        ErrorCase{"SELECT i16 FROM t GROUP BY i16 HAVING MAX(t.i32) > 1", kUnsupported, "t.i32",
+                  "qualified column names"},
+        ErrorCase{"SELECT i16 FROM t ORDER BY t.i16", kUnsupported, "t.i16",
+                  "qualified column names"},
+        ErrorCase{"SELECT i16 AS x FROM t ORDER BY t.x", kUnsupported, "t.x",
+                  "qualified column names"},
+        // A call with the wrong number of arguments stays a bind error whatever its arguments
+        // (CheckSupported does not look into them, and the binder reports the arity before it
+        // binds one).
+        ErrorCase{"SELECT strlen(t.s, 1) FROM t", kBind, "strlen(t.s, 1)",
+                  "strlen() takes 1 argument, not 2"},
+        ErrorCase{"SELECT strlen(MAX(t.s), 1) FROM t", kBind, "strlen(MAX(t.s), 1)",
+                  "strlen() takes 1 argument, not 2"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE strlen(t.s, 1) > 1", kBind, "strlen(t.s, 1)",
+                  "strlen() takes 1 argument, not 2"},
+        // Query order.
+        ErrorCase{"SELECT lower(s), t.i16 FROM t, u", kUnsupported, "lower",
+                  "function lower() is not supported"},
+        ErrorCase{"SELECT t.i16 FROM t, u", kUnsupported, "t.i16", "qualified column names"},
+        ErrorCase{"SELECT nope FROM t, u WHERE lower(s) = 'x'", kUnsupported, ",",
+                  "a FROM list of several tables is not supported"},
+        ErrorCase{"SELECT i16 FROM t AS a, u", kUnsupported, "AS a",
+                  "table aliases are not supported"},
+        ErrorCase{"SELECT i16 FROM t JOIN u ON lower(t.s) = u.s WHERE lower(s) = 'x'", kUnsupported,
+                  "JOIN", "JOIN ... ON is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE lower(s) = 'x' GROUP BY t.i16", kUnsupported, "lower",
+                  "function lower() is not supported"}));
+
 TEST(BinderTest, TablesMatchCaseInsensitively) {
   const Catalog catalog = MakeCatalog();
   for (const char* sql :
@@ -666,6 +750,15 @@ TEST(BinderTest, TablesMatchCaseInsensitively) {
     const auto& scan = std::get<ScanNode>(Nth(*plan, 1));
     EXPECT_EQ(scan.table, catalog.Find("t")) << sql;
   }
+}
+
+// plan::Bind is public: a statement without a FROM item, which the parser never makes, is a
+// programming error, never an out-of-range read.
+TEST(BinderDeathTest, AStatementWithoutAFromItemAborts) {
+  const Catalog catalog = MakeCatalog();
+  sql::SelectStatement stmt;
+  stmt.star = true;
+  EXPECT_DEATH((void)Bind(stmt, catalog), "from.empty");
 }
 
 TEST(BinderTest, CountStarIsAnAggregateOverAScanOfEveryField) {

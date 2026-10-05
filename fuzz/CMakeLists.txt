@@ -39,7 +39,7 @@ if(ANTB1_BUILD_TESTS)
     LABELS harness
     EXIT_CODE 1
     REQUIRE
-      "VIOLATION [^ ]*/count_star_path\\.sql: Parse\\(ToSql\\(ast\\)\\) failed"
+      "VIOLATION [^ ]*/star_limit\\.sql: Parse\\(ToSql\\(ast\\)\\) failed"
       "VIOLATION [^ ]*/count_star\\.sql: Parse\\(ToSql\\(ast\\)\\) is not EqualIgnoringSpans to ast"
       "fuzz replay: FAIL inputs=[0-9]+ violations=[1-9]"
     COMMAND $<TARGET_FILE:antb1-fuzz-replay> --mutate-unparse=suffix "${ANTB1_FUZZ_CORPUS_DIR}"

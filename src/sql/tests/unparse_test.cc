@@ -122,6 +122,19 @@ TEST(UnparseTest, CanonicalForms) {
                 .canonical = "SELECT CAST(CAST(a AS VARCHAR) AS DATE), CAST(a + 1 AS BIGINT), "
                              "CAST(SUM(x) AS DOUBLE), NOT CAST(b AS BOOLEAN), "
                              "CAST(a = 1 OR b AS BOOLEAN), try_cast, CAST(try_cast AS INT) FROM t"},
+           // FROM lists: every alias quoted after AS, JOIN as INNER JOIN, LEFT OUTER JOIN as LEFT
+           // JOIN, qualifiers as written; an ON with a top-level OR bare, like WHERE.
+           Case{.input = "select t . x, \"T\".\"y z\" from t x,u cross join v join w on x.a=w.a "
+                         "left outer join 'p.parquet' as 'q' on (q.b = 1 or q.c = 2) inner join y "
+                         "on y.a = 1 and (y.b = 2 or y.c = 3)",
+                .canonical = "SELECT t.x, \"T\".\"y z\" FROM t AS \"x\", u CROSS JOIN v INNER "
+                             "JOIN w ON x.a = w.a LEFT JOIN 'p.parquet' AS \"q\" ON q.b = 1 OR "
+                             "q.c = 2 INNER JOIN y ON y.a = 1 AND (y.b = 2 OR y.c = 3)"},
+           Case{.input = "SELECT a FROM t over, u Between JOIN v AS Exists ON a = b, w interval",
+                .canonical = "SELECT a FROM t AS \"over\", u AS \"Between\" INNER JOIN v AS "
+                             "\"Exists\" ON a = b, w AS \"interval\""},
+           Case{.input = R"(SELECT a FROM t AS 'it''s' LEFT JOIN u "a""b" ON u.a = 1)",
+                .canonical = R"(SELECT a FROM t AS "it's" LEFT JOIN u AS "a""b" ON u.a = 1)"},
        }) {
     EXPECT_EQ(Canonical(c.input), c.canonical) << c.input;
     ExpectRoundTrip(c.input);
@@ -155,9 +168,61 @@ TEST(UnparseTest, RoundTripsCorpus) {
            "SELECT CASE WHEN a > 0 THEN 1 END::INT, EXTRACT(year FROM d)::INT, f(a)::INT, "
            "COUNT(*)::BIGINT FROM t GROUP BY a::VARCHAR ORDER BY 1::INT"sv,
            "SELECT CAST(CAST(a AS VARCHAR) AS DATE), CAST(a = 1 OR b AS BOOLEAN), x::T_1 FROM t"sv,
+           "SELECT COUNT(*) FROM a JOIN b ON a.id = b.id"sv,
+           "SELECT a.x, SUM(b.y) FROM a, b WHERE a.k = b.k GROUP BY a.x HAVING MAX(b.y) > 1"sv,
+           "SELECT * FROM a CROSS JOIN b CROSS JOIN c, d"sv,
+           "SELECT x.a FROM t x LEFT JOIN u y ON x.a = y.a AND y.b WHERE y.c"sv,
+           "SELECT semi.a, anti.b FROM semi, anti JOIN asof ON semi.a = asof.a"sv,
+           "SELECT a FROM t JOIN u ON a = 1 OR b = 2 LEFT JOIN v ON c = 3 OR d = 4, w"sv,
+           "SELECT a FROM 'x.parquet' JOIN 'y.parquet' ON NOT a = b CROSS JOIN 'z.parquet' AS z"sv,
+           R"(SELECT "q"."x", q."y", "q".y FROM "q" AS "q" INNER JOIN "Q" ON "q".k = "Q".k)"sv,
+           "SELECT t.a FROM t ORDER BY t.a DESC NULLS FIRST, t.b LIMIT 1"sv,
        }) {
     ExpectRoundTrip(sql);
   }
+}
+
+TEST(UnparseTest, RendersFromLists) {
+  SelectStatement stmt;
+  stmt.star = true;
+  stmt.from.push_back(
+      FromItem{.table = TableRef{.kind = TableRef::Kind::kName, .name = "t"}, .alias = "a\"b"});
+  stmt.from.push_back(FromItem{.connector = Connector::kComma,
+                               .table = TableRef{.kind = TableRef::Kind::kPath, .name = "x'y"}});
+  stmt.from.push_back(
+      FromItem{.connector = Connector::kCross,
+               .table = TableRef{.kind = TableRef::Kind::kName, .name = "U v", .quoted = true}});
+  FromItem inner{.connector = Connector::kInner,
+                 .table = TableRef{.kind = TableRef::Kind::kName, .name = "w"}};
+  inner.on.emplace_back(BinaryExpr{
+      .op = BinaryOp::kEq,
+      .left =
+          Box<Expr>(Expr(ColumnRef{.name = "k", .quoted = false, .span = {}, .qualifier = "w"})),
+      .right = Box<Expr>(Expr(ColumnRef{.name = "K",
+                                        .quoted = true,
+                                        .span = {},
+                                        .qualifier = "a\"b",
+                                        .qualifier_quoted = true}))});
+  stmt.from.push_back(std::move(inner));
+  FromItem left{.connector = Connector::kLeft,
+                .table = TableRef{.kind = TableRef::Kind::kName, .name = "z"},
+                .alias = "z"};
+  left.on.push_back(ToExpr(Comparison{
+      .column = ColumnRef{.name = "c", .quoted = false, .span = {}, .qualifier = "z"},
+      .op = CompareOp::kLt,
+      .literal = Literal{.kind = Literal::Kind::kInteger, .negative = false, .text = "3"}}));
+  left.on.push_back(ToExpr(Comparison{
+      .column = ColumnRef{.name = "d"},
+      .op = CompareOp::kEq,
+      .literal = Literal{.kind = Literal::Kind::kString, .negative = false, .text = "x"}}));
+  stmt.from.push_back(std::move(left));
+  const std::string sql = ToSql(stmt);
+  EXPECT_EQ(
+      sql, R"(SELECT * FROM t AS "a""b", 'x''y' CROSS JOIN "U v" INNER JOIN w ON w.k = "a""b"."K" )"
+           R"(LEFT JOIN z AS "z" ON z.c < 3 AND d = 'x')");
+  auto parsed = Parse(sql);
+  ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+  EXPECT_TRUE(EqualIgnoringSpans(stmt, *parsed));
 }
 
 TEST(UnparseTest, RendersFullAst) {
@@ -165,7 +230,7 @@ TEST(UnparseTest, RendersFullAst) {
   AggregateCall sum{.kind = AggKind::kSum};
   sum.arg.emplace(Expr(ColumnRef{.name = "a"}));
   stmt.items.push_back(SelectItem{.expr = Expr(std::move(sum)), .alias = "s"});
-  stmt.from = TableRef{.kind = TableRef::Kind::kName, .name = "t"};
+  stmt.from = {FromItem{.table = TableRef{.kind = TableRef::Kind::kName, .name = "t"}}};
   stmt.where.push_back(ToExpr(Comparison{
       .column = ColumnRef{.name = "b"},
       .op = CompareOp::kGe,
@@ -177,7 +242,7 @@ TEST(UnparseTest, RendersFullAst) {
 TEST(UnparseTest, RendersEveryLiteralKindAndOperator) {
   SelectStatement stmt;
   stmt.star = true;
-  stmt.from = TableRef{.kind = TableRef::Kind::kPath, .name = "x'y.parquet"};
+  stmt.from = {FromItem{.table = TableRef{.kind = TableRef::Kind::kPath, .name = "x'y.parquet"}}};
   const std::array<Literal, 6> literals{{
       Literal{.kind = Literal::Kind::kInteger, .negative = false, .text = "1"},
       Literal{.kind = Literal::Kind::kDecimal, .negative = true, .text = "2.5"},
@@ -205,7 +270,7 @@ TEST(UnparseTest, RendersEveryLiteralKindAndOperator) {
 TEST(UnparseTest, LimitExtremes) {
   SelectStatement stmt;
   stmt.star = true;
-  stmt.from = TableRef{.kind = TableRef::Kind::kName, .name = "t"};
+  stmt.from = {FromItem{.table = TableRef{.kind = TableRef::Kind::kName, .name = "t"}}};
   stmt.limit = 0;
   EXPECT_EQ(ToSql(stmt), "SELECT * FROM t LIMIT 0");
   stmt.limit = std::numeric_limits<std::int64_t>::max();
@@ -220,6 +285,14 @@ TEST(EqualIgnoringSpansTest, IgnoresOnlySpans) {
   EXPECT_NE(a->span, b->span);
   EXPECT_TRUE(EqualIgnoringSpans(*a, *b)) << ToSql(*a) << "\n" << ToSql(*b);
   EXPECT_TRUE(EqualIgnoringSpans(*b, *a));
+  // The spelling of a FROM list: AS or not, a quoted or a string alias, JOIN or INNER JOIN, LEFT
+  // OUTER JOIN or LEFT JOIN, parentheses around ON, spaces around a qualifier's dot.
+  auto c = Parse("SELECT t . a FROM t x JOIN u ON a = b LEFT OUTER JOIN v AS 'y' ON y.c = 1");
+  auto d =
+      Parse(R"(SELECT t.a FROM t AS "x" INNER JOIN u ON (a = b) LEFT JOIN v "y" ON (y.c = 1))");
+  ASSERT_TRUE(c.has_value()) << c.error().message;
+  ASSERT_TRUE(d.has_value()) << d.error().message;
+  EXPECT_TRUE(EqualIgnoringSpans(*c, *d)) << ToSql(*c) << "\n" << ToSql(*d);
 }
 
 TEST(EqualIgnoringSpansTest, DetectsEveryStructuralDifference) {
@@ -258,6 +331,34 @@ TEST(EqualIgnoringSpansTest, DetectsEveryStructuralDifference) {
   ASSERT_TRUE(star && count && count_col);
   EXPECT_FALSE(EqualIgnoringSpans(*star, *count));
   EXPECT_FALSE(EqualIgnoringSpans(*count, *count_col));
+}
+
+TEST(EqualIgnoringSpansTest, DetectsEveryDifferenceInFromLists) {
+  const std::string_view base = "SELECT x.a FROM t AS x, u JOIN v ON u.k = v.k AND v.b = 1";
+  for (const std::string_view other : {
+           "SELECT x.a FROM t AS x CROSS JOIN u JOIN v ON u.k = v.k AND v.b = 1"sv,  // connector
+           "SELECT x.a FROM t AS x, u LEFT JOIN v ON u.k = v.k AND v.b = 1"sv,       // join kind
+           "SELECT x.a FROM t, u JOIN v ON u.k = v.k AND v.b = 1"sv,                 // no alias
+           "SELECT x.a FROM t AS y, u JOIN v ON u.k = v.k AND v.b = 1"sv,            // alias
+           "SELECT x.a FROM t AS X, u JOIN v ON u.k = v.k AND v.b = 1"sv,            // alias case
+           "SELECT x.a FROM t AS x, u JOIN v ON u.k = v.k"sv,                        // ON count
+           "SELECT x.a FROM t AS x, u JOIN v ON u.k = v.k AND v.b = 2"sv,            // ON value
+           "SELECT x.a FROM t AS x, u JOIN v ON (u.k = v.k AND v.b = 1)"sv,          // ON tree
+           "SELECT x.a FROM t AS x, u"sv,                                            // item count
+           "SELECT x.a FROM t AS x, w JOIN v ON u.k = v.k AND v.b = 1"sv,            // table
+           "SELECT x.a FROM t AS x, 'u' JOIN v ON u.k = v.k AND v.b = 1"sv,          // path
+           "SELECT y.a FROM t AS x, u JOIN v ON u.k = v.k AND v.b = 1"sv,            // qualifier
+           R"(SELECT "x".a FROM t AS x, u JOIN v ON u.k = v.k AND v.b = 1)"sv,       // quoted
+           R"(SELECT x."a" FROM t AS x, u JOIN v ON u.k = v.k AND v.b = 1)"sv,       // quoted name
+           "SELECT a FROM t AS x, u JOIN v ON u.k = v.k AND v.b = 1"sv,              // unqualified
+       }) {
+    auto x = Parse(base);
+    auto y = Parse(other);
+    ASSERT_TRUE(x.has_value()) << x.error().message;
+    ASSERT_TRUE(y.has_value()) << other << ": " << y.error().message;
+    EXPECT_FALSE(EqualIgnoringSpans(*x, *y)) << other;
+    EXPECT_FALSE(EqualIgnoringSpans(*y, *x)) << other;
+  }
 }
 
 TEST(EqualIgnoringSpansTest, DetectsEveryDifferenceInNewClauses) {
@@ -317,6 +418,11 @@ TEST(AstTest, ToStringNamesKindsAndOperators) {
   EXPECT_EQ(ToString(NullsOrder::kDefault), "");
   EXPECT_EQ(ToString(NullsOrder::kFirst), "NULLS FIRST");
   EXPECT_EQ(ToString(NullsOrder::kLast), "NULLS LAST");
+  EXPECT_EQ(ToString(Connector::kFirst), "");
+  EXPECT_EQ(ToString(Connector::kComma), ",");
+  EXPECT_EQ(ToString(Connector::kCross), "CROSS JOIN");
+  EXPECT_EQ(ToString(Connector::kInner), "INNER JOIN");
+  EXPECT_EQ(ToString(Connector::kLeft), "LEFT JOIN");
   EXPECT_EQ(ToString(AggKind::kCountStar), "COUNT");
   EXPECT_EQ(ToString(AggKind::kCount), "COUNT");
   EXPECT_EQ(ToString(AggKind::kSum), "SUM");
