@@ -171,7 +171,7 @@ SELECT id, CASE WHEN id IN (4, 5) THEN b ELSE 0.000000000000000000000000000001 E
 6	0.000000000000000000000000000001
 7	0.000000000000000000000000000001
 
-# A string literal first in the fold is VARCHAR, which a DECIMAL does not mix with.
+# A string literal next to NULL (the first THEN value without an ELSE) is VARCHAR, which a DECIMAL does not mix with.
 
 statement error mix values of type VARCHAR and DECIMAL\(9,2\) in CASE
 SELECT CASE WHEN id < 4 THEN 'a' WHEN id < 8 THEN d9_2 END FROM decimals

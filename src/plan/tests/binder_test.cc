@@ -442,7 +442,7 @@ INSTANTIATE_TEST_SUITE_P(
                   "cannot compare"},
         // DECIMAL CASE values fold from the ELSE through the THENs (ADR 0021 rule 10): the type
         // folded so far is named first; a string literal that a DECIMAL type takes is unsupported
-        // (DuckDB casts it), one first in the fold is VARCHAR.
+        // (DuckDB casts it), one next to NULL (no ELSE) or another literal is VARCHAR.
         ErrorCase{"SELECT CASE WHEN i32 > 0 THEN h ELSE dt END FROM t", kBind, "h",
                   "cannot mix values of type DATE and DECIMAL(38,0) in CASE"},
         ErrorCase{"SELECT CASE WHEN i32 > 0 THEN h WHEN i32 > 1 THEN dt END FROM t", kBind, "dt",
@@ -1244,8 +1244,8 @@ TEST(BinderTest, DecimalCaseValuesFoldLikeDuckDb) {
 
 // Without a DECIMAL value antb1 types the CASE as before (divergence D20): the values that are no
 // literals first, then each integer literal takes their type when it fits; DuckDB folds from the
-// ELSE through the THENs, where a literal first in that order or next to another literal keeps its
-// own type, `-(7)` is a literal, and a string literal first in that order is VARCHAR.
+// ELSE through the THENs, where a literal next to NULL (the first THEN without an ELSE) or another
+// literal becomes its own type, `-(7)` is a literal, and such a string literal is VARCHAR.
 TEST(BinderTest, CaseTypesWithoutADecimalAreAntb1s) {
   const Catalog catalog = MakeCatalog();
   struct Case {

@@ -26,12 +26,13 @@
 // read as DATE through the clickbench option are never used with FROM '<path>' (DuckDB reads the
 // raw file there), SELECT * on a large table always has a LIMIT, and a DECIMAL column is only
 // compared with literals of its own digits and with columns of numbers whose common type with it
-// has at most 38 digits (no CASE values yet), which keep DuckDB's common DECIMAL type within 38
-// digits (divergence D13), or with numbers DuckDB types as DOUBLE (an exponent: compared in DOUBLE,
-// never next to an integer column, divergence D7). DECIMAL SUM, AVG and arithmetic (an integer or
-// decimal literal, DuckDB's capped types; / // % too) stay within their types over the data, since
-// an overflow fails both engines, and SUM and AVG never add inexact doubles a division made, whose
-// sum's rounding follows the order of the additions.
+// has at most 38 digits, which keep DuckDB's common DECIMAL type within 38 digits (divergence D13),
+// or with numbers DuckDB types as DOUBLE (an exponent: compared in DOUBLE, never next to an integer
+// column, divergence D7); its CASE values never fail to cast to DuckDB's CASE type, and under an
+// aggregate keep its scale. DECIMAL SUM, AVG and arithmetic (an integer or decimal literal,
+// DuckDB's capped types; / // % too, % beyond 38 digits only as a select item) stay within their
+// types over the data, since an overflow fails both engines, and SUM and AVG never add inexact
+// doubles a division made, whose sum's rounding follows the order of the additions.
 
 namespace antb1::slt {
 
