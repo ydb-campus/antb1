@@ -83,14 +83,17 @@ struct FixtureFile {
   int row_groups = 0;
 };
 
-// Writes every fixture into dir (created if needed):
-//   hits_like.parquet            10,000 rows, 4 row groups, the partitioned hits schema (all
-//   OPTIONAL) hits_like_nulls.parquet      the same rows with NULLs sprinkled
-//   hits_like_split/part-N.parquet  the same rows split into 4 files (1000/3000/2500/3500 rows)
-//   hits_like_required.parquet   the same rows, REQUIRED columns and UTF8 strings (single-file
-//   layout) edge.parquet                 MakeEdgeTable() empty.parquet                the
-//   partitioned hits schema, 0 rows floats.parquet               MakeFloatTable()
-//   decimals.parquet             MakeDecimalTable(), 5 row groups
+// Writes every fixture into dir (created if needed; the Parquet files already in hits_like_split/
+// and star/ are removed first, other files stay):
+//   hits_like.parquet               10,000 rows in 4 row groups, the partitioned hits schema
+//   hits_like_nulls.parquet         the same rows with NULLs sprinkled
+//   hits_like_split/part-N.parquet  the same rows in 4 files (1000/3000/2500/3500 rows)
+//   hits_like_required.parquet      the same rows, REQUIRED columns and UTF8 strings
+//   edge.parquet                    MakeEdgeTable()
+//   floats.parquet                  MakeFloatTable()
+//   decimals.parquet                MakeDecimalTable(), 5 row groups
+//   empty.parquet                   the partitioned hits schema, 0 rows
+//   star/<name>.parquet             the 8 tables of MakeStarTables() (star.h)
 arrow::Result<std::vector<FixtureFile>> WriteAllFixtures(const std::filesystem::path& dir);
 
 // Compares the Parquet schema (column path, physical type, logical type, converted type,

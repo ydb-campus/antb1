@@ -43,8 +43,8 @@ table must match it (`pixi run lint` compares them).
 | `integration` | in use | cross-module gtest suites in `tests/integration/` (`integration.*`), including invalid Parquet inputs |
 | `slt` | in use | sqllogictest files run against antb1 (`slt.<area>.<file>`) |
 | `oracle` | in use | the same `.slt` files checked against DuckDB (`oracle.<area>.<file>`) |
-| `diff` | in use | `diff.random`, `diff.decimal` and `diff.tpch`: seeded random differential queries against DuckDB (fixed seeds, 300 queries each; `diff.random` over the tables it names, so a new table does not change its queries, `diff.decimal` over `decimals`, `diff.tpch` over the data derived from TPC-H) |
-| `parallel` | in use | parallel execution on 4 engine threads ([ADR 0013](adr/0013-parallel-execution.md)): every `.slt` case file (`parallel.<area>.<file>`) and 300 random differential queries (`parallel.diff.random`, `parallel.diff.tpch`), in 1000- and 700-row batches; every result must also equal the 1-thread result byte for byte (`antb1-slt --same-as-threads 1`) |
+| `diff` | in use | `diff.random`, `diff.decimal`, `diff.star` and `diff.tpch`: seeded random differential queries against DuckDB (fixed seeds, 300 queries each; `diff.random` over the tables it names, so a new table does not change its queries, `diff.decimal` over `decimals`, `diff.star` over the star schema, `diff.tpch` over the data derived from TPC-H) |
+| `parallel` | in use | parallel execution on 4 engine threads ([ADR 0013](adr/0013-parallel-execution.md)): every `.slt` case file (`parallel.<area>.<file>`) and 300 random differential queries (`parallel.diff.random`, `parallel.diff.star`, `parallel.diff.tpch`), in 1000-, 700- and 97-row batches; every result must also equal the 1-thread result byte for byte (`antb1-slt --same-as-threads 1`) |
 | `metamorphic` | in use | metamorphic relations on the generated fixtures (`metamorphic.*`) |
 | `cli` | in use | golden tests of the `antb1` command line (`cli.<case>`): output formats, errors, exit codes, EXPLAIN |
 | `harness` | in use | self-tests of the harness (`harness.*`): mutated engines, redaction canaries, fixture digest, runner unit tests, the data derived from TPC-H against DuckDB's answers |
@@ -114,6 +114,17 @@ column whose sums are exact in any order; 40 rows in 5 row groups) and `empty.pa
 Values come from splitmix64 with integer-only arithmetic (no `<random>` distributions, no libm, no NaN), so every
 platform generates the same data.
 
+`star/` holds the star schema of the join and subquery tests (`tools/fixturegen/star.h` describes every column):
+`trips`, a ride-hailing fact table of 3000 rows, and its dimensions `riders`, `drivers`, `zones`, `cities`, `shifts`,
+`tariffs` and `promos` (empty). Their values are integer formulas of the row number: NULL keys, keys without a match,
+repeated keys (two of them across a row group boundary), a key beyond INTEGER, keys of two types (INTEGER to BIGINT,
+DECIMAL(4,2) to DECIMAL(5,3)), a two-column key, a join cycle, a many-to-many shortcut, a dimension in two roles and
+DOUBLE columns in two tables, and every non-empty table has several row groups. Every column name carries its table's
+prefix (`tr_`, `rd_`, ...) except `label`, a deliberate collision of `zones` and `cities`, and `<prefix>row` numbers
+each table's rows. `tests/slt/tables.txt` declares the references between the tables with `ref=` options
+([tests/slt/README.md](../tests/slt/README.md#layout)), and the `harness.StarSchema.*` tests pin the properties that
+the join tests rely on.
+
 `harness.fixtures.digest` compares the generated files with `tests/fixtures/fixtures.digest`, a logical digest
 (schema, row groups and values; not compression or page layout), on every leg, macOS included. It skips the
 top-level `tpch/` directory, where the data derived from TPC-H is generated at test time. After an intended
@@ -163,7 +174,8 @@ can differ in its last bits between the engines and so order near-ties different
 only on `s`, `i`, the tables and the supported features, so a single case reproduces on its own.
 
 - ctest `diff.random` (label `diff`) runs 300 queries with a fixed seed on every leg, over the tables it names in
-  `tests/slt/CMakeLists.txt`; `diff.decimal` runs 300 more over `decimals`.
+  `tests/slt/CMakeLists.txt`; `diff.decimal` runs 300 more over `decimals`, and `diff.star` 300 over the star schema
+  (`parallel.diff.star` runs them on 4 threads in 97-row batches, so that a row group spans several batches).
 - `pixi run diff-random` runs 2000 queries with a random seed, printed first. `ANTB1_DIFF_SEED` and
   `ANTB1_DIFF_COUNT` set the seed and the count. Extra arguments go to `antb1-slt diff`: `--list` prints the queries
   without running them, `--table NAME` restricts the tables, `--target-percent P` sets the share of queries that
@@ -429,7 +441,7 @@ without `ORDER BY`, so a new seed is checked with `pixi run asan` first, and one
 replaced. The queries of a seed also depend on the query generator and on the supported features
 (`tests/slt/supported_features.h`), so a PR that changes either runs `pixi run asan` too. A failure in antb1 is fixed,
 never avoided with another seed. The DECIMAL queries of the generator change only the seeds of tables with DECIMAL
-columns (`diff.decimal`, `diff.tpch`): every draw for them is taken where a DECIMAL column is used.
+columns (`diff.decimal`, `diff.star`, `diff.tpch`): every draw for them is taken where a DECIMAL column is used.
 
 This workload is derived from the TPC-H Benchmark and is not comparable to published TPC-H Benchmark results, as this
 implementation does not comply with all requirements of the TPC-H Benchmark.

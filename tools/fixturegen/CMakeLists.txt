@@ -1,5 +1,5 @@
 # antb1-fixturegen: deterministic Parquet fixtures for the hermetic tests (built only with tests).
-add_library(antb1_fixturegen_lib STATIC hits_schema.cc fixtures.cc)
+add_library(antb1_fixturegen_lib STATIC hits_schema.cc fixtures.cc star.cc)
 target_include_directories(antb1_fixturegen_lib PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(
   antb1_fixturegen_lib

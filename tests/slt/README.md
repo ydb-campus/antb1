@@ -12,13 +12,21 @@ test oracle. DuckDB writes the expectations (`pixi run slt-complete`); humans re
   DuckDB lockdown.
 - `canary/`: redaction canaries that fail on purpose (`harness.slt.redact_sentinels`, `harness.diff.redact`), and
   `tables_redact.txt` and `redact_table.slt` for the self-tests of the `redact` option (`harness.*.redact_table`).
-- `tables.txt`: the tables every file can query, registered identically on both engines.
+- `tables.txt`: the tables every file can query, registered identically on both engines, and their foreign keys.
 - `supported_features.h`: the SQL features antb1 answers today (see "Random differential test").
 - `runner/`: the runner (`antb1_slt_lib` and `antb1-slt`); `tests/`: its unit tests (label `harness`).
 
 The tables are views over the Parquet fixtures of `tools/fixturegen` (ctest `fixtures.generate`, written to
 `build/<preset>/fixtures`). Write our own queries over our own tables only: never ClickBench data or
 ClickBench query text.
+
+A table's `ref=<column>[+<column>...]:<table>.<column>[+<column>...]` options (repeatable) declare its foreign keys:
+which of its columns reference, pairwise, which columns of a table of the same file, itself included. The star
+schema of the join tests (`tools/fixturegen/star.h`) declares 13. A ref is a hint for the generated joins of roadmap
+PR T1, not a constraint: NULL and dangling keys are intended. The loader checks the syntax and finds the table
+ASCII case-insensitively (`runner/tables.h`); `metamorphic.TablesTxt.RefsJoinColumnsOfOneKind` checks that every
+column exists and that each pair joins one kind of key (integers, DECIMALs, DATE or VARCHAR, never DOUBLE). The
+engines and the query generator ignore refs until T1.
 
 ## Commands
 
@@ -140,7 +148,9 @@ ANTB1_DIFF_SEED=7 ANTB1_DIFF_ONLY=1234 pixi run diff-random  # one case
 pixi run diff-random --list --target-percent 100        # print generated queries, run nothing
 ```
 
-ctest runs `diff.random` (label `diff`) with a fixed seed and 300 queries. A slice PR that implements a
+ctest runs `diff.random` (label `diff`) with a fixed seed and 300 queries over the tables it names, and `diff.decimal`
+(over `decimals`) and `diff.star` (over the star schema of the join tests) with seeds of their own; `parallel.diff.star`
+runs the queries of `diff.star` on 4 threads in 97-row batches. A slice PR that implements a
 feature adds it to `kSupportedFeatures` (and new grammar to `runner/query_gen.cc`; the unit test
 `harness.QueryGenerator.TargetSamplesCoverTheWholeGrammar` fails until every feature is generated).
 
