@@ -185,7 +185,8 @@ antb1_add_expect_test(
 # with a fixed seed. `pixi run diff-random` runs more (ANTB1_DIFF_SEED, ANTB1_DIFF_COUNT) over every table.
 # diff.random names its tables (a table added to tables.txt would change every query of the seed);
 # diff.decimal covers the DECIMAL columns of decimals.parquet with its own seed, and diff.star the star
-# schema of the join tests (tools/fixturegen/star.h) with another.
+# schema of the join tests (tools/fixturegen/star.h) with another. A new seed must pass `pixi run asan` first:
+# DuckDB itself leaks on the queries of some seeds (docs/testing.md).
 set(
   _diff_tables
   --table

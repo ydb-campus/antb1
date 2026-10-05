@@ -10,7 +10,7 @@ time: the ctest `fixtures.tpch` (label `setup`) writes it to `build/<preset>/fix
 | Directory | ctest names | Label | What it checks |
 |---|---|---|---|
 | `slt/` | `slt.<area>.<file>`, `oracle.<area>.<file>` | `slt`, `oracle` | sqllogictest files on antb1 and DuckDB |
-| `slt/` | `diff.random` | `diff` | generated queries, antb1 vs DuckDB (fixed seed) |
+| `slt/` | `diff.random`, `diff.decimal`, `diff.star` | `diff` | generated queries, antb1 vs DuckDB (fixed seeds) |
 | `metamorphic/` | `metamorphic.*` | `metamorphic` | relations between antb1 answers |
 | `integration/` | `integration.*` | `integration` | `engine::Session` end to end; bad Parquet inputs; globs |
 | `cli/` | `cli.<case>` | `cli` | stdout, stderr and exit code of the `antb1` binary |
@@ -53,7 +53,8 @@ MAX over partitions and over split files, literal folding (a decimal bound equal
 bounds), AND symmetry, literal-first comparisons, LIMIT, projections and batch sizes; all of them are active. Add a
 relation with `r.push_back({...})` in `AllRelations()`; the checks (`AllEqual`, `FirstEqualsSumOfRest`,
 `FirstEqualsMinOfRest`, `FirstEqualsMaxOfRest`, `RowCountsEqualFirst`, `RowCountsAreMinOf`) are in `relations.h`.
-`metamorphic.RowCount.MatchesAnIndependentParquetScan` compares COUNT(*) with the rows the Parquet library decodes.
+`metamorphic.RowCount.MatchesAnIndependentParquetScan` compares COUNT(*) with the rows the Parquet library decodes, and
+`metamorphic.TablesTxt.RefsJoinColumnsOfOneKind` checks the `ref=` options of `slt/tables.txt` against the files.
 
 ## CLI goldens (`cli/`)
 
