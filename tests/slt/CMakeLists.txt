@@ -184,7 +184,8 @@ antb1_add_expect_test(
 # Random differential test (label diff): antb1 vs DuckDB on generated queries (runner/difftest.h),
 # with a fixed seed. `pixi run diff-random` runs more (ANTB1_DIFF_SEED, ANTB1_DIFF_COUNT) over every table.
 # diff.random names its tables (a table added to tables.txt would change every query of the seed);
-# diff.decimal covers the DECIMAL columns of decimals.parquet with its own seed.
+# diff.decimal covers the DECIMAL columns of decimals.parquet with its own seed, and diff.star the star
+# schema of the join tests (tools/fixturegen/star.h) with another.
 set(
   _diff_tables
   --table
@@ -201,6 +202,25 @@ set(
   floats
   --table
   empty
+)
+set(
+  _star_tables
+  --table
+  trips
+  --table
+  riders
+  --table
+  drivers
+  --table
+  zones
+  --table
+  cities
+  --table
+  shifts
+  --table
+  tariffs
+  --table
+  promos
 )
 if(ANTB1_HAVE_DUCKDB)
   antb1_slt_args(_args diff.random)
@@ -221,6 +241,15 @@ if(ANTB1_HAVE_DUCKDB)
     diff.decimal
     PROPERTIES LABELS diff FIXTURES_REQUIRED antb1_fixtures TIMEOUT 300
   )
+  antb1_slt_args(_args diff.star)
+  add_test(
+    NAME diff.star
+    COMMAND antb1-slt diff ${_args} ${_star_tables} --seed 20261005 --count 300
+  )
+  set_tests_properties(
+    diff.star
+    PROPERTIES LABELS diff FIXTURES_REQUIRED antb1_fixtures TIMEOUT 300
+  )
   # The same queries (seed) on 4 threads with 700-row batches: DuckDB's answers, and the 1-thread results byte for
   # byte. (Seed 20260929 makes DuckDB itself leak under ASan: MIN of VARCHAR with GROUP BY and LIMIT.)
   antb1_slt_args(
@@ -239,6 +268,26 @@ if(ANTB1_HAVE_DUCKDB)
   )
   set_tests_properties(
     parallel.diff.random
+    PROPERTIES LABELS parallel FIXTURES_REQUIRED antb1_fixtures TIMEOUT 300
+  )
+  # diff.star on 4 threads with 97-row batches, fewer than the rows of every part of trips and shifts, so that a part
+  # spans several batches.
+  antb1_slt_args(
+    _args
+    parallel.diff.star
+    --threads
+    4
+    --same-as-threads
+    1
+    --batch-size
+    97
+  )
+  add_test(
+    NAME parallel.diff.star
+    COMMAND antb1-slt diff ${_args} ${_star_tables} --seed 20261005 --count 300
+  )
+  set_tests_properties(
+    parallel.diff.star
     PROPERTIES LABELS parallel FIXTURES_REQUIRED antb1_fixtures TIMEOUT 300
   )
 
