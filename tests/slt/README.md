@@ -9,7 +9,8 @@ test oracle. DuckDB writes the expectations (`pixi run slt-complete`); humans re
   (antb1, label `slt`) and `oracle.<area>.<file>` (DuckDB, label `oracle`).
 - `selftest/`: harness self-tests. `mutate.slt` and `redact_canary.slt` must pass as they are, and must
   fail under `--mutate` (`harness.slt.mutate.<kind>`, `harness.slt.redact`). `lockdown.slt` checks the
-  DuckDB lockdown.
+  DuckDB lockdown. The pending records of `pending.slt` stay Unsupported, and the pending check must fail when
+  `--mutate` answers them (`harness.slt.pending.mutate.<kind>`).
 - `canary/`: redaction canaries that fail on purpose (`harness.slt.redact_sentinels`, `harness.diff.redact`), and
   `tables_redact.txt` and `redact_table.slt` for the self-tests of the `redact` option (`harness.*.redact_table`).
 - `tables.txt`: the tables every file can query, registered identically on both engines, and their foreign keys.
@@ -33,7 +34,7 @@ engines and the query generator ignore refs until T1.
 ```bash
 pixi run test -L slt        # antb1 vs the expectations
 pixi run test -L oracle     # DuckDB vs the same expectations
-pixi run test -L harness    # runner unit tests, fixture checks, mutation and redaction self-tests
+pixi run test -L harness    # runner unit tests, fixture checks, mutation and redaction self-tests, pending check
 pixi run slt-complete       # rewrite every expected block from DuckDB, then review `git diff`
 ```
 
@@ -73,15 +74,37 @@ In an expected block each row is one line; the cells of a row are separated by a
   loses the columns, so every value would compare within the R tolerance. Queries with the same label must return the
   same result.
 - `skipif <engine>` / `onlyif <engine>` (engine `antb1` or `duckdb`) guard the next record.
+- `pending <roadmap id>` (`pending J2b`) guards the next statement or query until that roadmap PR answers it: DuckDB
+  runs it, antb1 only in the pending check (below). It takes no `skipif` or `onlyif`.
 - `halt` stops the file (for one engine when guarded); `hash-threshold <n>` hashes results with more than
   `n` values (0: never), except results with an R column.
 - `${FIXTURES}` in SQL is the fixtures directory, e.g. `FROM '${FIXTURES}/edge.parquet'`.
 
 ## Current support is the contract
 
-An antb1 `Unsupported` answer is always a failure, also for `statement error`. A record for SQL that antb1
-does not support yet carries `onlyif duckdb`; the PR that adds the feature removes the guard. Internal
-errors never satisfy `statement error`.
+An antb1 `Unsupported` answer is always a failure, also for `statement error`. Internal errors never satisfy
+`statement error`. A record for SQL that antb1 does not answer yet carries a guard, which the PR that adds the
+feature removes:
+
+- `pending <roadmap id>` when a PR of the roadmap answers it. DuckDB runs the record as usual (`oracle.*` and
+  `slt-complete`), and antb1's `slt.*` and `parallel.*` tests skip it. The pending check `harness.slt.pending`
+  (`antb1-slt pending`) runs the pending records of every registered file on antb1, where each must still get
+  Unsupported: once antb1 answers one, with rows or with an error of another kind, the check fails with
+  `remove the guard (<id>)`, so the PR that answers it removes its guard and the `slt.*` tests compare its answer
+  from then on. A record whose outcome another PR changes first waits on that PR: the syntax errors of
+  `cases/joins/alias_words.slt`, which antb1 rejects as Unsupported until roadmap PR S3, are `pending S3`.
+- `onlyif duckdb` otherwise. A section of such records is headed `# ---- DuckDB only until <deferred item> gets a
+  PR ----` when an ADR defers the SQL until a query needs it, and `# ---- DuckDB only, for good: ... ----` for
+  DuckDB's own error texts.
+
+`cases/joins/` and `cases/subqueries/` hold the pending corpus of the join and subquery PRs of ADRs 0022 and 0023,
+over the star schema. Its pending records stay inside what those PRs answer: every query joins all its tables through
+equalities whose common type is not DOUBLE (a disconnected join graph exits 4), and none has a `NULL` literal,
+`IS NULL`, `SELECT DISTINCT` or `COALESCE`, which exit 4 as well (the NULLs come from the data, and `COUNT(col)`
+counts them). Results of several rows use `rowsort`, and no string `MIN` or `MAX` runs under `GROUP BY`, where
+DuckDB 1.5.5 leaks. The DuckDB-only ASOF records join columns without NULLs on a build key without repeats, because
+DuckDB 1.5.5 counts a NULL inequality value as an ASOF match. Each file starts with unguarded records over one table
+that pin its inputs, so its `slt.*` and `parallel.*` tests run before any guard goes.
 
 ## Canonical values
 

@@ -48,6 +48,9 @@ SELECT a, b, COUNT(*) FROM t GROUP BY a
 - `statement ok` for SQL that must succeed, `statement error <regex>` for SQL that must fail with a matching error.
 - `onlyif antb1` or `skipif duckdb` before a record limits it to one engine. Use them only for a divergence
   registered in [sql-subset.md](../sql-subset.md#divergences-from-duckdb), and put its ID in a comment.
+- `pending <roadmap id>` before a record for SQL that a roadmap PR will answer: DuckDB runs it, antb1 skips it, and
+  `harness.slt.pending` checks that antb1 still answers it with Unsupported until that PR removes the guard.
+  `onlyif duckdb` guards SQL that no roadmap PR answers ([tests/slt/README.md](../../tests/slt/README.md#current-support-is-the-contract)).
 
 ## Steps (after the harness PR)
 
