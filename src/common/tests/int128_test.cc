@@ -113,10 +113,10 @@ TEST(Int128Test, Rescale) {
            Case{.value = -5, .from = 11, .to = 10, .expected = -1},
            Case{.value = 1250, .from = 3, .to = 1, .expected = 13},
            Case{.value = 1249, .from = 3, .to = 1, .expected = 12},
-           // 9999999999999999999999999999.9999999999 and -9999999999999999999999999999.5 at scale
-           // 0.
+           // 9999999999999999999999999999.9999999999 and -9999999999999999999999999999.5 to
+           // scale 0.
            Case{.value = max38, .from = 10, .to = 0, .expected = PowerOfTen(28)},
-           Case{.value = -(PowerOfTen(38) - PowerOfTen(9) * 5),
+           Case{.value = -(PowerOfTen(38) - (PowerOfTen(9) * 5)),
                 .from = 10,
                 .to = 0,
                 .expected = -PowerOfTen(28)},
@@ -136,7 +136,7 @@ TEST(Int128Test, Rescale) {
                  std::to_string(c.to));
     const std::optional<Int128> got = Rescale(c.value, c.from, c.to);
     ASSERT_EQ(got.has_value(), c.expected.has_value());
-    if (got.has_value()) {
+    if (got.has_value() && c.expected.has_value()) {
       EXPECT_EQ(Int128ToString(*got), Int128ToString(*c.expected));
     }
   }

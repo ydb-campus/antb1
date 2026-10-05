@@ -1842,7 +1842,7 @@ class Builder {
     }
     const CaseValue self = of_column(c);
     // c 30% of the time, else another column (60%) or a literal.
-    const auto pick = [&]() -> const CaseValue* {
+    const auto pick = [&] -> const CaseValue* {
       if (rng_.Percent(30)) {
         return &self;
       }

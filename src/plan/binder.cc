@@ -3220,15 +3220,15 @@ arrow::Result<LogicalType> DecimalCaseType(const std::vector<Typed>& values,
     if (folded.kind == kNull || (folded.kind != kPlain && next.kind != kPlain)) {
       // Next to NULL or another literal: a plain type, the string VARCHAR, two literals the
       // integer's type (or VARCHAR for two strings).
-      const bool integer = folded.kind == kInteger || next.kind == kInteger;
-      const LogicalType own = folded.kind == kInteger && next.kind == kInteger
-                                  ? CombineIntegers(folded.type, next.type)
-                                  : (next.kind == kInteger ? next.type : folded.type);
-      folded = Folded{.kind = kPlain,
-                      .type = next.kind == kString && !integer ? LogicalType::kVarchar
-                              : integer                        ? own
-                                                               : next.type,
-                      .value = 0};
+      LogicalType plain = next.type;
+      if (folded.kind == kInteger && next.kind == kInteger) {
+        plain = CombineIntegers(folded.type, next.type);
+      } else if (folded.kind == kInteger) {
+        plain = folded.type;
+      } else if (next.kind == kString) {
+        plain = LogicalType::kVarchar;
+      }
+      folded = Folded{.kind = kPlain, .type = plain, .value = 0};
       continue;
     }
     if (next.kind == kString) {

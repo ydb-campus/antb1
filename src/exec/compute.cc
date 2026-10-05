@@ -96,12 +96,10 @@ arrow::Result<ArrayPtr> DivideOrModulo(const arrow::Array& left, const arrow::Ar
     const T x = l.Value(i);
     const T y = r.Value(i);
     if constexpr (std::is_floating_point_v<T>) {
-      if (op == plan::ArithOp::kModulo && null_for_zero && y == 0) {
+      if (y == 0 && (op != plan::ArithOp::kModulo || null_for_zero)) {
         builder.UnsafeAppendNull();
       } else if (op == plan::ArithOp::kModulo) {
         builder.UnsafeAppend(std::fmod(x, y));  // NaN for a zero divisor, as in DuckDB
-      } else if (y == 0) {
-        builder.UnsafeAppendNull();
       } else {
         builder.UnsafeAppend(x / y);
       }
