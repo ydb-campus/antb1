@@ -536,6 +536,14 @@ std::expected<std::unique_ptr<DuckDbEngine>, std::string> DuckDbEngine::Make(
   }
   // ClickBench's DuckDB setup (duckdb-parquet/create.sql at the pinned commit, docs/sql-subset.md).
   setup.emplace_back("CREATE MACRO toDateTime(t) AS epoch_ms(t * 1000)");
+  // DuckDB 1.5.5 (and 1.5.6) fails some queries with `INTERNAL Error: Failed to bind column
+  // reference "file_index"` when its late_materialization optimizer is on: a LIMIT with an OFFSET
+  // over a Parquet scan with a pushed-down filter that leaves nothing to scan and a computed
+  // condition on two other columns (where/pushdown.slt). So the oracle turns it off. Off, DuckDB
+  // computes the select list of a small ORDER BY ... LIMIT for every row WHERE keeps, as antb1 does
+  // (an overflow there fails in both engines), and only the order of tied rows at the edge of a
+  // LIMIT can differ, which every comparison accepts.
+  setup.emplace_back("SET disabled_optimizers = 'late_materialization'");
   setup.emplace_back("SET lock_configuration = true");
   for (const auto& sql : setup) {
     if (auto result = Query(handles->conn, sql); !result) {

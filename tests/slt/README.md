@@ -88,8 +88,12 @@ trailing spaces. `I`, `D` and `T` compare exactly; `R` compares with relative to
 ## The DuckDB oracle
 
 DuckDB runs in memory through its C API with `threads=1`, no extension autoinstall or autoload, file
-access limited to the fixtures directory, temp files under `build/`, and a locked configuration. A record
-runs one statement, and only `SELECT`, `EXPLAIN`, `SET` or `LOAD`: the oracle refuses anything else
+access limited to the fixtures directory, temp files under `build/`, its `late_materialization` optimizer
+off, and a locked configuration. With the optimizer on, DuckDB 1.5.5 fails some filtered `LIMIT ... OFFSET`
+queries with an internal error (`where/pushdown.slt`). With it off, DuckDB computes the select list of a
+small `ORDER BY ... LIMIT` for every row the `WHERE` keeps, as antb1 does, so an overflow there fails in both
+engines; only the order of tied rows at the edge of a `LIMIT` can differ, and every comparison accepts that.
+A record runs one statement, and only `SELECT`, `EXPLAIN`, `SET` or `LOAD`: the oracle refuses anything else
 (`COPY`, `ATTACH`, `EXPORT`, DDL, DML) with a `Permission Error` before it runs, so no record writes next
 to the shared fixtures or changes state for later records (`selftest/lockdown.slt` checks it). It never
 loads an extension either: DuckDB refuses `LOAD`, by name or by path, once external access is off, so the oracle
