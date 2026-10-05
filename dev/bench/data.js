@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791104521854,
+  "lastUpdate": 1791177751954,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -4740,6 +4740,90 @@ window.BENCHMARK_DATA = {
             "value": 14.452404749999795,
             "unit": "ms/iter",
             "extra": "iterations: 48\ncpu: 14.451529937499984 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "0b284997f7319dfbb995d84029706f10eaf70a01",
+          "message": "feat(plan,exec): decimal mixed comparisons (#93)\n\n## Summary\n\nA DECIMAL now compares with other numbers as DuckDB 1.5.5 does: exactly\nwith a DECIMAL of another precision or scale and with integers, and in\nDOUBLE with a DOUBLE operand or a number DuckDB types as DOUBLE. This is\nPR **D4b** of the roadmap for the queries derived from TPC-H (types\ntrack, [ADR 0021](docs/adr/0021-decimal-semantics.md) rule 11 and rule\n10's common type for comparisons). At the maintainer's choice the rest\nof D4 is split once more: D4c (rule 10 for CASE values, `%` beyond 38\ndigits) follows. No query flips: Q1 and Q6 still pass and the other 20\nstill exit 4, so `tests/data/tpch_status.json` is unchanged.\n\n**Comparisons** (every rule probed with DuckDB 1.5.5 on our own tables:\n`typeof`, values, error texts):\n\n- **DECIMAL with a DECIMAL of any precision and scale, or with an\ninteger** (columns, expressions, aggregates; `WHERE`, `HAVING`, `CASE\nWHEN`): exactly by value. The side with the smaller scale is scaled up\nin Int128, never rounded (`CompareScaled`; on overflow its sign\ndecides). DuckDB compares in its common type (s = max scale, p = min(38,\nmax integer digits + s)), which is exact below the cap; at the cap it\nfails with a conversion error where antb1 answers (divergence D13,\nextended: `d9_2 < d38_0` over d38_0's extremes).\n- **DECIMAL with a DOUBLE operand:** both in DOUBLE, the DECIMAL\nconverted with rule 8 (DuckDB's cast, not always the nearest double).\n- **DECIMAL with a number DuckDB types as DOUBLE** (an exponent, a\ndecimal of more than 38 digits, an integer outside -2^127 to 2^128 - 1):\nnot folded. The literal becomes DuckDB's double (a decimal by rule 8,\nHUGEINT and UHUGEINT literals by DuckDB's 128-bit formulas), the column\nconverts by rule 8. An `IN` list with one such number compares every\nvalue in DOUBLE. EXPLAIN shows it: `CAST(p AS DOUBLE) > 10`.\n- **Integer literals beyond the DECIMAL's range** fold exactly to `IS\nNOT NULL` or `FALSE`, where DuckDB fails to cast one of more than 38 - s\ndigits (D13).\n- **BETWEEN** takes DuckDB's one common type of its three values. Where\nthat is DOUBLE and antb1 would compare a pair exactly (`p BETWEEN 1e0\nAND 5`), it stays exit 4, with a new message; otherwise both pairs give\nDuckDB's rows.\n- **Unchanged:** a DECIMAL against a FLOAT column stays exit 4 (D11);\ninteger and FLOAT `IN` lists keep their rules (D7).\n\n**Answers that change:**\n\n- A HUGEINT (an integer `SUM`) compared with a DOUBLE now converts\nthrough DuckDB's 128-bit formula instead of Arrow's cast, as DuckDB\ndoes: a sum of -2^53 - 2 becomes -2^53, so it is greater than the DOUBLE\n-2^53 - 2 in both engines.\n- A DECIMAL against a VARCHAR, DATE or TIMESTAMP operand that is no\nliteral: exit 4 becomes a bind error (exit 1), as for the other numbers\nalready. DuckDB casts a VARCHAR for `=`, `<>` and `IN` and fails on a\nDATE or TIMESTAMP only when a row is compared (divergence D4, extended).\n\n**Execution:**\n\n- New internal `src/exec/decimal.h/.cc`: `ReadUnscaled` (int16, uint16,\nint32, int64, decimal128), `DecimalToDouble` (rule 8 over an array, now\nshared with `CastTo`) and `CompareExact`.\n- `PredicateEvaluator` picks its mode once in `Make` (Arrow kernels, the\nDECIMAL column in DOUBLE, one side in DOUBLE, or exact), so `Evaluate`\nstays const and thread-safe. A scan applies no predicate to DECIMAL\ncolumns, as before.\n\n**Tests:**\n\n- **common:** `PowerOfTen`; a `CompareScaled` table (scales, last\ndigits, signs, the Int128 extremes, overflow).\n- **plan:**\n  - `DuckDbTypesAsDouble` at its boundaries;\n  - `DuckDbDoubleOf` vectors, HUGEINT and UHUGEINT included;\n  - column pairs in `WHERE`, `HAVING`, `CASE WHEN`, `OR` and `NOT`;\n  - DOUBLE constants and DOUBLE `IN` lists, huge-literal folds;\n  - BETWEEN rows accepted and rejected;\n  - the bind errors against VARCHAR, DATE and TIMESTAMP operands;\n  - the EXPLAIN marker.\n- **exec:**\n  - `DecimalToDouble` against DuckDB's doubles;\n  - `CompareExact` across scales, integers and the Int128 extremes;\n- `PredicateEvaluator` with mixed types, including the HUGEINT vs DOUBLE\nregression;\n  - DOUBLE mode, NULLs, conditions inside expressions;\n  - the scan-filter path.\n- **slt:**\n- the new `tests/slt/cases/types/decimal_comparisons.slt` (40 queries,\nexpected blocks from `pixi run slt-complete`, also at 4 threads), with\nthe D13 pair at the cap as an `onlyif antb1` query and an `onlyif\nduckdb` statement error;\n- rows 12 and 13 of the fixture hold values that are equal as doubles\nbut not exactly, so records tell an exact comparison from one in DOUBLE,\nand DuckDB's conversion from the nearest double;\n- the three `onlyif duckdb` records of `decimal.slt` move there and run\non both engines.\n- **fixtures:** `decimals.parquet` gains `b BIGINT` (its extremes, 2^53\n+ 1) and `d DOUBLE` (sums exact in any order), plus three pinned DECIMAL\nvalues; the digest and the `schema_decimals` golden follow.\n- **generator:**\n- a new Feature `kCompareColumns`: DECIMAL columns compared with\nDECIMAL, integer and DOUBLE columns whose common type stays within 38\ndigits;\n  - exponent literals in DECIMAL comparisons and `IN` lists;\n- every new draw is gated on a DECIMAL column, so `diff.random`'s query\nlist is byte-identical apart from the feature header. `diff.decimal` and\n`diff.tpch` change by design.\n- **CLI:** the `explain_decimal_double` golden.\n\n**Docs:**\n\n- `docs/sql-subset.md`: comparisons, the literal table, DECIMAL folding,\nEXPLAIN, `IN`, BETWEEN and DECIMAL semantics; divergences D4, D7, D13\nand D14 updated.\n- Also `docs/architecture.md` (Filter), `docs/testing.md` (fixture) and\n`tests/slt/README.md`.\n- ADR 0021: the Plan list (D4a, D4b, D4c), rule 11's BETWEEN and\nother-operand bullets, and the D13 and D14 consequences. Its status\nstays Proposed (yours to change).\n\nFor the maintainer:\n\n- **Differences from the approved plan:**\n- D4 also names TIMESTAMP operands: DuckDB binds `=` and fails per row\nthere as for DATE (probed), and antb1's bind error was already the same.\n- D14 is narrowed to whole `WHERE` and `HAVING` conjuncts. Under `OR` or\n`NOT`, or in a `CASE WHEN` condition, a folded comparison keeps NULL for\na NULL operand, so its operand is computed and overflows as in DuckDB.\n- D13 is restated from DuckDB's actual cap: an integer literal of more\nthan 38 - s digits fails to cast (probed: a 37-digit literal against\nDECIMAL(15,2)), not only one of 38 digits or more; a UHUGEINT literal\nfails only against SMALLINT, INTEGER and BIGINT operands.\n- The fixture got three pinned values and `d` one changed value, after\nthe review found that no column pair told an exact comparison from one\nin DOUBLE.\n- **Breaking-change label:** none. The two answers that change are\nlisted above. The first now matches DuckDB; the second turns exit 4 into\nexit 1.\n- **Governance:** the ADR 0021 edits (Plan list, rule 11 wording,\nconsequences) are the ones agreed in the approved plan. No other\ngovernance path changes.\n- **Size:** XL (39 files, about 2,300 changed lines; about 1,300 of them\ntests and `.slt`).\n\nThis workload is derived from the TPC-H Benchmark and is not comparable\nto published TPC-H Benchmark results, as this implementation does not\ncomply with all requirements of the TPC-H Benchmark.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full                  # on d221ab8 (the head)\nlint: PASS\n100% tests passed out of 1802          # ci (clang Debug -Werror)\n100% tests passed out of 1802          # asan (ASan + UBSan)\n                                       # tidy: clean\ncoverage: PASS\n100% tests passed out of 2             # fuzz-smoke\n100% tests passed out of 1802          # ci-gcc\n$ ANTB1_DIFF_SEED=<11,12> ANTB1_DIFF_COUNT=20000 pixi run diff-random   # before e198b55 and d221ab8 (one split ANTB1_CHECK, tests, docs)\nDIFF: PASS seed=11 queries=20000 failed=0 unsupported=0   # likewise seed 12\n$ ANTB1_DIFF_SEED=<1..6> ANTB1_DIFF_COUNT=5000 pixi run diff-random --table decimals --target-percent 50   # likewise\nDIFF: PASS seed=1 queries=5000 failed=0 unsupported=0   # likewise seeds 2 to 6\n$ ANTB1_DIFF_SEED=20260925 ANTB1_DIFF_COUNT=300 pixi run diff-random --list <diff.random's seven tables>   # main vs this branch\nthe same queries; only the header listing the features differs\n$ pixi run test-data                   # ClickBench, redacted\n100% tests passed out of 6             # data.clickbench.status: 43/43\n# tpch.status.* pass in every leg above (redacted: Q1 pass, Q6 pass, 20 unsupported); tpch_status.json unchanged\n```\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: ADR 0021, as listed in the approved plan\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code implemented the\nmaintainer-approved plan (exact and DOUBLE comparisons, DuckDB's literal\ntyping, the BETWEEN rule, the generator, fixtures, tests and docs) after\nprobing DuckDB 1.5.5 for types, values and error texts. A split review\nby area, with adversarial verification of each finding, found doc and\ntest gaps; they are fixed in 9646149, 8eabefd and 1bd10a3. The reviewer\nagent then reviewed the final diff, re-ran the new records in both\nengines and swept about 450 comparisons against DuckDB on the fixture:\nno P0 or P1 problems, and its one doc note is fixed in d221ab8. The\nclang-tidy findings of the first check-full run are fixed in e198b55.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-10-05T08:19:45+03:00",
+          "tree_id": "34df69a60e9255bd337fc03aef592fbf32932a48",
+          "url": "https://github.com/ydb-campus/antb1/commit/0b284997f7319dfbb995d84029706f10eaf70a01"
+        },
+        "date": 1791177750902,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4655.825475887961,
+            "unit": "ns/iter",
+            "extra": "iterations: 151979\ncpu: 4654.624237559136 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84166.75250250255,
+            "unit": "ns/iter",
+            "extra": "iterations: 7992\ncpu: 84162.26726726725 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 221939.8868103979,
+            "unit": "ns/iter",
+            "extra": "iterations: 3154\ncpu: 221927.04692454022 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 439804.1996209623,
+            "unit": "ns/iter",
+            "extra": "iterations: 1583\ncpu: 439783.2931143397 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 361136.7341249411,
+            "unit": "ns/iter",
+            "extra": "iterations: 1937\ncpu: 361009.46411977283 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2071440.3115727296,
+            "unit": "ns/iter",
+            "extra": "iterations: 337\ncpu: 2070782.516320473 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 51.02132861538586,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 51.02084023076929 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 44.54051868749964,
+            "unit": "ms/iter",
+            "extra": "iterations: 16\ncpu: 44.53025887500006 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 175.83373150000625,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 175.82045300000004 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.744367425531712,
+            "unit": "ms/iter",
+            "extra": "iterations: 47\ncpu: 14.743368170212769 ms\nthreads: 1"
           }
         ]
       }
