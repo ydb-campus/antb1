@@ -4,8 +4,10 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <span>
 #include <string>
@@ -18,13 +20,17 @@
 #include <arrow/compute/exec.h>
 #include <arrow/compute/initialize.h>
 #include <arrow/util/bit_util.h>
+#include <arrow/util/cancel.h>
+#include <arrow/util/functional.h>
+#include <arrow/util/thread_pool.h>
 #include <gtest/gtest.h>
 
 #include "antb1/exec/operator.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/table.h"
 
-// Helpers of the exec unit tests: arrays, an in-memory plan::Table and a scripted source operator.
+// Helpers of the exec unit tests: arrays, an in-memory plan::Table, a scripted source operator and
+// an executor whose Submit throws.
 
 namespace antb1::exec::testing {
 
@@ -33,6 +39,38 @@ namespace antb1::exec::testing {
 class ExecTest : public ::testing::Test {
  protected:
   static void SetUpTestSuite() { ASSERT_TRUE(arrow::compute::Initialize().ok()); }
+};
+
+// Runs every task on `pool`, except that spawn number `throw_at` (from 0) throws std::bad_alloc, as
+// Arrow's Submit may when it cannot allocate the task: that task never runs. `before_throw` (if
+// any) is called just before the throw.
+class ThrowingExecutor final : public arrow::internal::Executor {
+ public:
+  ThrowingExecutor(arrow::internal::Executor* pool, int throw_at,
+                   std::function<void()> before_throw = {})
+      : pool_(pool), throw_at_(throw_at), before_throw_(std::move(before_throw)) {}
+
+  int GetCapacity() override { return pool_->GetCapacity(); }
+  // The spawns so far, the one that threw included.
+  [[nodiscard]] int spawns() const { return spawns_.load(); }
+
+ protected:
+  arrow::Status SpawnReal(arrow::internal::TaskHints hints, arrow::internal::FnOnce<void()> task,
+                          arrow::StopToken stop_token, StopCallback&& stop_callback) override {
+    if (spawns_++ == throw_at_) {
+      if (before_throw_) {
+        before_throw_();
+      }
+      throw std::bad_alloc();
+    }
+    return pool_->Spawn(hints, std::move(task), std::move(stop_token), std::move(stop_callback));
+  }
+
+ private:
+  arrow::internal::Executor* pool_;
+  int throw_at_;
+  std::function<void()> before_throw_;
+  std::atomic<int> spawns_ = 0;
 };
 
 template <class Builder, class T>
@@ -51,6 +89,35 @@ inline std::shared_ptr<arrow::Array> Int64s(const std::vector<std::optional<int6
 
 inline std::shared_ptr<arrow::Array> Int16s(const std::vector<std::optional<int16_t>>& values) {
   return ArrayOf<arrow::Int16Builder>(arrow::int16(), values);
+}
+
+inline std::shared_ptr<arrow::Array> Int32s(const std::vector<std::optional<int32_t>>& values) {
+  return ArrayOf<arrow::Int32Builder>(arrow::int32(), values);
+}
+
+inline std::shared_ptr<arrow::Array> UInt16s(const std::vector<std::optional<uint16_t>>& values) {
+  return ArrayOf<arrow::UInt16Builder>(arrow::uint16(), values);
+}
+
+// DATE values: days since 1970-01-01.
+inline std::shared_ptr<arrow::Array> Dates(const std::vector<std::optional<int32_t>>& days) {
+  return ArrayOf<arrow::Date32Builder>(arrow::date32(), days);
+}
+
+// TIMESTAMP values: microseconds since 1970-01-01 00:00:00.
+inline std::shared_ptr<arrow::Array> Timestamps(const std::vector<std::optional<int64_t>>& micros) {
+  return ArrayOf<arrow::TimestampBuilder>(arrow::timestamp(arrow::TimeUnit::MICRO), micros);
+}
+
+// DECIMAL(precision, scale) values (HUGEINT: 38, 0), unscaled, in decimal digits.
+inline std::shared_ptr<arrow::Array> Decimals(
+    int32_t precision, int32_t scale, const std::vector<std::optional<std::string>>& values) {
+  std::vector<std::optional<arrow::Decimal128>> unscaled;
+  unscaled.reserve(values.size());
+  for (const auto& v : values) {
+    unscaled.push_back(v.has_value() ? std::optional(arrow::Decimal128(*v)) : std::nullopt);
+  }
+  return ArrayOf<arrow::Decimal128Builder>(arrow::decimal128(precision, scale), unscaled);
 }
 
 inline std::shared_ptr<arrow::Array> Strings(

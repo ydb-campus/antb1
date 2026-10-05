@@ -28,6 +28,8 @@ pixi run bench --benchmark_repetitions=5 --benchmark_report_aggregates_only=true
 | `BM_ScanColumn` | decoding one SMALLINT column of a Parquet file through `io::ParquetTable::Scan` in 64Ki-row batches |
 | `BM_SortRows` | `ORDER BY` a random BIGINT over 1Mi rows with a VARCHAR payload, no `LIMIT`: a full sort and the gather of its output (`exec::SortOperator`) |
 | `BM_TopNRows` | the same with `LIMIT 10`: the top-N path, which keeps only the best rows while it reads |
+| `BM_JoinTableBuild` | building a join hash table (`exec::JoinTableBuilder`, no executor) of 1Mi rows with a BIGINT key and a BIGINT payload in 16 parts: `/0` dense keys (the direct layout), `/1` random keys (the hashed layout); the `direct` counter shows the layout |
+| `BM_JoinTableProbe` | `exec::JoinTable::Find` over that table with 1Mi probe keys in 64Ki-row batches, every other one absent: `/0` direct, `/1` hashed; the `matches` counter counts the matches |
 
 The `ci-release` preset (`pixi run release`, the `macos-release` CI leg) builds the benchmarks too and runs
 `bench.micro.smoke` (label `bench-smoke`): every benchmark for one iteration (`--benchmark_dry_run`), so they keep

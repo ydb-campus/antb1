@@ -26,6 +26,7 @@ antb1_add_module(
     group_table.cc
     grouped_aggregate_state.cc
     group_aggregate.cc
+    join_table.cc
     limit.cc
     sort.cc
     row_count.cc
@@ -52,9 +53,24 @@ if(ANTB1_BUILD_TESTS)
       tests/scan_filter_test.cc
       tests/parallel_test.cc
       tests/heavy_hitters_test.cc
+      tests/join_table_test.cc
       tests/partition_lanes_test.cc
+      tests/row_mask_test.cc
       tests/profile_test.cc
       tests/memory_test.cc
     LIBS ArrowCompute::arrow_compute_shared
   )
+  # Replaces the global operator new and delete (an allocation-failure hook), so it is an executable of its own.
+  # ThreadSanitizer's runtime defines them too: this one links without the sanitizer's C++ part, and the
+  # sanitizer still sees every allocation, through malloc and free.
+  antb1_add_gtest(
+    antb1_exec_bad_alloc_tests
+    LABEL unit
+    PREFIX exec
+    SOURCES tests/bad_alloc_test.cc
+    LIBS antb1::exec ArrowCompute::arrow_compute_shared
+  )
+  if("thread" IN_LIST ANTB1_SANITIZE)
+    target_link_options(antb1_exec_bad_alloc_tests PRIVATE -fno-sanitize-link-c++-runtime)
+  endif()
 endif()

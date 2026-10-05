@@ -7,7 +7,6 @@
 #include <functional>
 #include <limits>
 #include <memory>
-#include <new>
 #include <numeric>
 #include <optional>
 #include <unordered_map>
@@ -17,7 +16,6 @@
 #include <arrow/api.h>
 #include <arrow/array/concatenate.h>
 #include <arrow/compute/api_vector.h>
-#include <arrow/util/future.h>
 #include <arrow/util/thread_pool.h>
 
 #include "antb1/common/check.h"
@@ -84,44 +82,6 @@ arrow::Status RunPart(const PartPipeline& pipeline, int64_t part, ExecContext ct
   arrow::Status closed = op->Close();
   ARROW_RETURN_NOT_OK(status);
   return closed;
-}
-
-// Runs fn(0) .. fn(n - 1) on the executor (here, one after another, without one) and waits for all
-// of them: the first failure in index order decides the status.
-arrow::Status ForEach(arrow::internal::Executor* executor, std::size_t n,
-                      const std::function<arrow::Status(std::size_t)>& fn) {
-  const auto guarded = [&fn](std::size_t i) -> arrow::Status {
-    try {
-      return fn(i);
-    } catch (const std::bad_alloc&) {
-      return arrow::Status::OutOfMemory("out of memory while merging groups");
-    }
-  };
-  if (executor == nullptr || n <= 1) {
-    for (std::size_t i = 0; i < n; ++i) {
-      ARROW_RETURN_NOT_OK(guarded(i));
-    }
-    return arrow::Status::OK();
-  }
-  std::vector<arrow::Future<>> tasks;
-  tasks.reserve(n);
-  arrow::Status submitted;
-  for (std::size_t i = 0; i < n && submitted.ok(); ++i) {
-    auto task = executor->Submit([&guarded, i] { return guarded(i); });
-    if (task.ok()) {
-      tasks.push_back(std::move(*task));
-    } else {
-      submitted = task.status();
-    }
-  }
-  arrow::Status status = submitted;
-  for (const arrow::Future<>& task : tasks) {  // every task ends before its inputs can go
-    const arrow::Status done = task.status();
-    if (status.ok()) {
-      status = done;
-    }
-  }
-  return status;
 }
 
 }  // namespace
