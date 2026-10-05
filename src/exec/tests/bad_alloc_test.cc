@@ -697,8 +697,8 @@ TEST_F(JoinTableBadAllocTest, MakingASpecOrABuilderRunsOutOfMemoryCleanly) {
 
 // The parts of `input` added in `order` to a build on `executor`, the Add at `armed` with
 // `failures` allocations failing in a row after `skip`: once an Add failed (OutOfMemory), every
-// later call returns its failure (with more than one failing, an OutOfMemory); with none failed, the
-// table is `reference`. Nothing is left in the budget. Whether an allocation failed.
+// later call returns its failure (with more than one failing, an OutOfMemory); with none failed,
+// the table is `reference`. Nothing is left in the budget. Whether an allocation failed.
 bool AddParts(const BuildInput& input, const std::shared_ptr<const JoinBuildSpec>& spec,
               const Snapshot& reference, bool hashed, arrow::internal::Executor* executor,
               const std::vector<std::size_t>& order, std::size_t armed, std::int64_t failures,
@@ -714,8 +714,7 @@ bool AddParts(const BuildInput& input, const std::shared_ptr<const JoinBuildSpec
   MemoryBudget budget(std::nullopt);
   bool fired = false;
   {
-    const std::vector<std::shared_ptr<const JoinBuildPart>> parts =
-        MakeParts(input, spec, &budget);
+    const std::vector<std::shared_ptr<const JoinBuildPart>> parts = MakeParts(input, spec, &budget);
     auto builder = JoinTableBuilder::Make(spec, kParts, executor, kThreads, &budget);
     EXPECT_TRUE(builder.ok()) << builder.status().ToString();
     if (!builder.ok()) {
@@ -778,8 +777,8 @@ TEST_F(JoinTableBadAllocTest, AnAddThatRunsOutOfMemoryFailsTheBuild) {
       for (const std::vector<std::size_t>& order : Orders()) {
         for (std::size_t armed = 0; armed < order.size(); ++armed) {
           for (const std::int64_t failures : {1, 2}) {
-            SCOPED_TRACE(::testing::Message() << "order " << order[0] << ", Add #" << armed
-                                              << ", " << failures << " failing");
+            SCOPED_TRACE(::testing::Message() << "order " << order[0] << ", Add #" << armed << ", "
+                                              << failures << " failing");
             Sweep(
                 [&](std::int64_t skip) {
                   return AddParts(input, *spec, *reference, hashed, executor, order, armed,

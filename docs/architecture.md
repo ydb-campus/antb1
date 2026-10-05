@@ -183,8 +183,11 @@ below widens it by one, and above half no new part starts while another is in fl
 next to others does not fail the query: the parts ahead are dropped (and run again when reached) and it runs again
 alone. The partition lanes of a GROUP BY hold at most as many parts as the window (one above half of the limit)
 before the consumer waits for them to merge, and they finish merging before a part runs again alone. A
-`std::bad_alloc` from a container (outside the budget's view) is caught in the part tasks, in `Drain` and in every
-call of the join hash table, and becomes `OutOfMemory` too.
+`std::bad_alloc` from a container (outside the budget's view) is caught in the part tasks, in `exec::ForEach` (in
+its tasks and around each `Submit`), in `PartitionLanes::Add` (queuing a part, starting a lane's task) and in
+`Drain`, and in every call of the join hash table, and becomes `OutOfMemory` too. Two places in Arrow still end the
+process on one: its thread pool's `Spawn`, where an OpenTelemetry call allocates in a `noexcept` function, and the
+making of an `arrow::Result` from a `Status`, whose `noexcept` constructor copies it.
 
 The budget's pool is Arrow's default pool, mimalloc. On Linux the `antb1` executable restarts itself once with
 `MIMALLOC_PURGE_DELAY=-1` (`cli::RestartForAllocator`, ADR 0017), so that mimalloc keeps the memory a query frees
