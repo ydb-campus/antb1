@@ -394,6 +394,16 @@ antb1_add_cli_golden(
     --table
     "d=${_f}/decimals.parquet"
 )
+# Against numbers DuckDB types as DOUBLE, a DECIMAL compares in DOUBLE (ADR 0021 rule 11).
+antb1_add_cli_golden(
+  explain_decimal_double
+  ARGS
+    explain
+    -c
+    "SELECT id FROM d WHERE p > 1e1 AND d9_2 IN (1.25, 2e0) AND d38_10 NOT IN (1e0, 2) AND p NOT IN (1.555) AND d18_4 < b"
+    --table
+    "d=${_f}/decimals.parquet"
+)
 antb1_add_cli_golden(
   explain_group_by
   ARGS

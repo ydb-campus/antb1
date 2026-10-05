@@ -442,6 +442,8 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT COUNT(*) FROM t WHERE s < h", kBind, "<", "cannot compare"},
         ErrorCase{"SELECT COUNT(*) FROM t WHERE h = dt", kBind, "=",
                   "cannot compare 'h' is DECIMAL(38,0) with 'dt' is DATE"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE h = toDateTime(i64)", kBind, "=",
+                  "cannot compare 'h' is DECIMAL(38,0) with 'todatetime(i64)' is TIMESTAMP"},
         ErrorCase{"SELECT i16 FROM t GROUP BY i16 HAVING MIN(h) = MIN(s)", kBind, "=",
                   "cannot compare"},
         ErrorCase{"SELECT CASE WHEN i = 1 THEN p END FROM dec", kUnsupported, "p",
@@ -1111,7 +1113,7 @@ TEST(BinderTest, DecimalLiteralsAndDivisionTypesLikeDuckDb) {
 
 // A DECIMAL CASE value, a decimal literal or a negated one included, next to a DOUBLE value makes
 // the CASE DOUBLE, in either order (DuckDB 1.5.5's typeof); other DECIMAL common types wait for
-// D4b.
+// D4c.
 TEST(BinderTest, DecimalCaseValuesNextToADoubleAreDouble) {
   const Catalog catalog = MakeCatalog();
   for (const std::string_view expr : {
@@ -1792,9 +1794,10 @@ TEST(BinderTest, DecimalComparesWithOtherNumbers) {
   }
 }
 
-// A DECIMAL against a number DuckDB types as DOUBLE (an exponent, more than 38 digits, an integer
-// beyond UHUGEINT), or in an IN list with one, compares in DOUBLE: nothing is folded, and the
-// constants are the doubles DuckDB converts the literals to (ADR 0021 rules 8 and 11).
+// A DECIMAL against a number DuckDB types as DOUBLE (an exponent, a decimal of more than 38 digits,
+// an integer outside -2^127 to 2^128 - 1), or in an IN list with one, compares in DOUBLE: nothing
+// is folded, and the constants are the doubles DuckDB converts the literals to (ADR 0021 rules 8
+// and 11).
 TEST(BinderTest, DecimalAgainstDoubleNumbersComparesInDouble) {
   const Catalog catalog = MakeCatalog();
   const auto predicate = [&](std::string_view where) -> Predicate {
@@ -1846,8 +1849,8 @@ TEST(BinderTest, DecimalAgainstDoubleNumbersComparesInDouble) {
   auto having = BindSql("SELECT i FROM dec GROUP BY i HAVING SUM(p) > 1e3", catalog);
   ASSERT_TRUE(having.ok()) << having.status().ToString();
   EXPECT_EQ(real(FilterPredicates(*having).at(0).constant), 1000.0);
-  // An integer column keeps today's rule: only an exponent or more than 38 digits make the list
-  // DOUBLE, so a 40-digit integer folds exactly (and drops out).
+  // An integer column keeps today's rule: only an exponent or a decimal of more than 38 digits
+  // make the list DOUBLE, so a 40-digit integer folds exactly (and drops out).
   auto integer = BindSql(
       "SELECT COUNT(*) FROM t WHERE i64 IN (9007199254740993, "
       "400000000000000000000000000000000000000)",
