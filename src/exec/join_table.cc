@@ -191,42 +191,44 @@ JoinBuildSpec::JoinBuildSpec(std::shared_ptr<arrow::Schema> schema,
 
 arrow::Result<std::shared_ptr<const JoinBuildSpec>> JoinBuildSpec::Make(
     std::shared_ptr<arrow::Schema> schema, std::vector<plan::BoundColumn> keys) {
-  if (schema == nullptr) {
-    return arrow::Status::Invalid("a join build without a schema");
-  }
-  if (keys.empty()) {
-    return arrow::Status::Invalid("a join build without keys");
-  }
-  for (const plan::BoundColumn& key : keys) {
-    if (key.index < 0 || key.index >= schema->num_fields()) {
-      return arrow::Status::Invalid("join key outside its input");
+  return NoBadAlloc("a join build", [&] -> arrow::Result<std::shared_ptr<const JoinBuildSpec>> {
+    if (schema == nullptr) {
+      return arrow::Status::Invalid("a join build without a schema");
     }
-    if (key.type == plan::LogicalType::kDouble || key.type == plan::LogicalType::kBoolean) {
-      return arrow::Status::Invalid("a join key of type ", plan::ToString(key.type));
+    if (keys.empty()) {
+      return arrow::Status::Invalid("a join build without keys");
     }
-    const std::shared_ptr<arrow::DataType>& type = schema->field(key.index)->type();
-    if (!type->Equals(plan::ToArrow(key.type))) {
-      return arrow::Status::Invalid("join key of type ", type->ToString(), " declared as ",
-                                    plan::ToString(key.type));
+    for (const plan::BoundColumn& key : keys) {
+      if (key.index < 0 || key.index >= schema->num_fields()) {
+        return arrow::Status::Invalid("join key outside its input");
+      }
+      if (key.type == plan::LogicalType::kDouble || key.type == plan::LogicalType::kBoolean) {
+        return arrow::Status::Invalid("a join key of type ", plan::ToString(key.type));
+      }
+      const std::shared_ptr<arrow::DataType>& type = schema->field(key.index)->type();
+      if (!type->Equals(plan::ToArrow(key.type))) {
+        return arrow::Status::Invalid("join key of type ", type->ToString(), " declared as ",
+                                      plan::ToString(key.type));
+      }
     }
-  }
-  bool direct = false;
-  if (keys.size() == 1) {
-    switch (keys.front().type.id()) {
-      case plan::LogicalType::kSmallInt:
-      case plan::LogicalType::kInteger:
-      case plan::LogicalType::kBigInt:
-      case plan::LogicalType::kUSmallInt:
-      case plan::LogicalType::kDate:
-      case plan::LogicalType::kTimestamp:
-        direct = true;
-        break;
-      default:
-        break;
+    bool direct = false;
+    if (keys.size() == 1) {
+      switch (keys.front().type.id()) {
+        case plan::LogicalType::kSmallInt:
+        case plan::LogicalType::kInteger:
+        case plan::LogicalType::kBigInt:
+        case plan::LogicalType::kUSmallInt:
+        case plan::LogicalType::kDate:
+        case plan::LogicalType::kTimestamp:
+          direct = true;
+          break;
+        default:
+          break;
+      }
     }
-  }
-  return std::shared_ptr<const JoinBuildSpec>(
-      new JoinBuildSpec(std::move(schema), std::move(keys), direct));
+    return std::shared_ptr<const JoinBuildSpec>(
+        new JoinBuildSpec(std::move(schema), std::move(keys), direct));
+  });
 }
 
 // ---- JoinBuildPart ----
@@ -915,11 +917,13 @@ arrow::Status JoinTableBuilder::Merge(std::size_t partition, const JoinBuildPart
 }
 
 arrow::Status JoinTableBuilder::Merged() {
-  arrow::Status merged = lanes_->Finish();
-  if (failed_.ok()) {  // the first failure stays the build's
-    failed_ = std::move(merged);
-  }
-  return failed_;
+  return NoBadAlloc("a join build", [this] {
+    arrow::Status merged = lanes_->Finish();
+    if (failed_.ok()) {  // the first failure stays the build's
+      failed_ = std::move(merged);
+    }
+    return failed_;
+  });
 }
 
 arrow::Result<std::shared_ptr<const JoinTable>> JoinTableBuilder::Finish() {
@@ -927,20 +931,18 @@ arrow::Result<std::shared_ptr<const JoinTable>> JoinTableBuilder::Finish() {
     return arrow::Status::Invalid("a join build finished twice");
   }
   finished_ = true;
-  const auto build = [this] -> arrow::Result<std::shared_ptr<const JoinTable>> {
-    ARROW_RETURN_NOT_OK(Merged());
-    if (next_part_ < num_parts_) {
-      return arrow::Status::Invalid("join build part ", next_part_, " was not added");
-    }
-    return NoBadAlloc("a join build", [this] -> arrow::Result<std::shared_ptr<const JoinTable>> {
-      std::shared_ptr<JoinTable> table(new JoinTable(spec_, budget_));
-      table->input_rows_ = input_rows_;
-      table->null_key_rows_ = null_key_rows_;
-      ARROW_RETURN_NOT_OK(table->Build(parts_, segments_, min_key_, max_key_, executor_));
-      return table;
-    });
-  };
-  arrow::Result<std::shared_ptr<const JoinTable>> table = build();
+  arrow::Result<std::shared_ptr<const JoinTable>> table =
+      NoBadAlloc("a join build", [this] -> arrow::Result<std::shared_ptr<const JoinTable>> {
+        ARROW_RETURN_NOT_OK(Merged());
+        if (next_part_ < num_parts_) {
+          return arrow::Status::Invalid("join build part ", next_part_, " was not added");
+        }
+        std::shared_ptr<JoinTable> built(new JoinTable(spec_, budget_));
+        built->input_rows_ = input_rows_;
+        built->null_key_rows_ = null_key_rows_;
+        ARROW_RETURN_NOT_OK(built->Build(parts_, segments_, min_key_, max_key_, executor_));
+        return built;
+      });
   // Whatever the outcome, the parts' hashes and the runs go; a table holds the parts' rows it
   // needs.
   Free(parts_);
