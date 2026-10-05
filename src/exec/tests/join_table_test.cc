@@ -1299,5 +1299,42 @@ TEST_F(JoinTableTest, AFailedReleaseFailsTheBuild) {
   }
 }
 
+// A merge that fails on the executor fails the build as soon as it is known: an Add that releases
+// only a part without rows, or nothing (out of order), returns it, and so does every later call,
+// Merged(), Finish() and an Add after Finish() included.
+TEST_F(JoinTableTest, AMergeFailureOnTheExecutorFailsEveryLaterCall) {
+  const auto pool = MakeThreadPool();
+  BuildData data({LogicalType::kBigInt});
+  data.Add(0, {Int64s({1, 2, 3, 4})})
+      .Add(1, {Int64s({std::nullopt, std::nullopt})})  // no row kept
+      .Add(2, {Int64s({5, 6})})
+      .Add(3, {Int64s({7, 8})});
+  auto spec = JoinBuildSpec::Make(data.schema(), data.keys());
+  ASSERT_TRUE(spec.ok());
+  MemoryBudget budget(kGiB);
+  {
+    auto parts = MakeParts(data, *spec, &budget, &budget);
+    ASSERT_TRUE(parts.ok()) << parts.status().ToString();
+    auto builder = JoinTableBuilder::Make(*spec, 4, pool.get(), kThreads, &budget);
+    ASSERT_TRUE(builder.ok()) << builder.status().ToString();
+    const int64_t pinned = kGiB - budget.bytes_allocated();
+    ASSERT_TRUE(budget.Reserve(pinned).ok());  // no room for the partitions' runs
+    // Add only queues part 0's merges; they fail on the pool, which then goes idle.
+    ASSERT_TRUE((*builder)->Add(0, (*parts)[0]).ok());
+    pool->WaitForIdle();
+    const arrow::Status failure = (*builder)->Add(1, (*parts)[1]);
+    EXPECT_TRUE(failure.IsOutOfMemory()) << failure.ToString();
+    EXPECT_EQ((*builder)->Add(3, (*parts)[3]).ToString(), failure.ToString());
+    EXPECT_EQ((*builder)->Merged().ToString(), failure.ToString());
+    EXPECT_EQ((*builder)->Add(2, (*parts)[2]).ToString(), failure.ToString());
+    EXPECT_EQ((*builder)->Finish().status().ToString(), failure.ToString());
+    EXPECT_EQ((*builder)->Add(2, (*parts)[2]).ToString(), failure.ToString());
+    budget.Release(pinned);
+    builder->reset();
+    parts->clear();
+  }
+  EXPECT_EQ(budget.bytes_allocated(), 0);
+}
+
 }  // namespace
 }  // namespace antb1::exec

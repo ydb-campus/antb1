@@ -227,6 +227,11 @@ void PartitionLanes::Wait() {
   changed_.wait(lock, [this] { return running_ == 0; });
 }
 
+bool PartitionLanes::failed() const {
+  const std::scoped_lock lock(mu_);
+  return failure_.has_value();
+}
+
 int64_t PartitionLanes::pending() const {
   const std::scoped_lock lock(mu_);
   return pending_;

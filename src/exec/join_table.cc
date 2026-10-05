@@ -826,10 +826,15 @@ arrow::Result<std::unique_ptr<JoinTableBuilder>> JoinTableBuilder::Make(
 
 arrow::Status JoinTableBuilder::Add(int64_t part, std::shared_ptr<const JoinBuildPart> rows) {
   return NoBadAlloc("a join build", [&] -> arrow::Status {
+    // The build's failure comes first. A merge that failed on the executor is one as soon as it is
+    // known, whatever this part is: Merged() waits for the other merges and keeps the failure.
+    if (failed_.ok() && lanes_->failed()) {
+      return Merged();
+    }
+    ARROW_RETURN_NOT_OK(failed_);
     if (finished_) {
       return arrow::Status::Invalid("join build part ", part, " added after the build finished");
     }
-    ARROW_RETURN_NOT_OK(failed_);
     if (part < 0 || part >= num_parts_) {
       return arrow::Status::Invalid("join build part ", part, " of ", num_parts_, " parts");
     }
@@ -910,7 +915,10 @@ arrow::Status JoinTableBuilder::Merge(std::size_t partition, const JoinBuildPart
 }
 
 arrow::Status JoinTableBuilder::Merged() {
-  ARROW_RETURN_NOT_OK(lanes_->Finish());
+  arrow::Status merged = lanes_->Finish();
+  if (failed_.ok()) {  // the first failure stays the build's
+    failed_ = std::move(merged);
+  }
   return failed_;
 }
 

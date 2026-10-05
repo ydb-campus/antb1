@@ -67,6 +67,8 @@ class PartitionLanes {
   arrow::Status Finish();
   // Waits for every lane to merge every part added (their memory is then released).
   void Wait();
+  // Whether a failure is known, without waiting: Finish() then returns one.
+  [[nodiscard]] bool failed() const;
 
   // Parts added and not yet merged by every lane (for tests).
   [[nodiscard]] int64_t pending() const;
