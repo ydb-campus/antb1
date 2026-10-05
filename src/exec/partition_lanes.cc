@@ -9,6 +9,7 @@
 #include <utility>
 #include <vector>
 
+#include <arrow/result.h>
 #include <arrow/status.h>
 #include <arrow/util/future.h>
 #include <arrow/util/thread_pool.h>
@@ -32,25 +33,35 @@ arrow::Status ForEach(arrow::internal::Executor* executor, std::size_t n,
     }
     return arrow::Status::OK();
   }
+  // A Submit that throws std::bad_alloc (Arrow allocates the task) has started nothing, like one
+  // that fails: no task runs from that one on.
+  const auto submit = [executor, &guarded](std::size_t i) -> arrow::Result<arrow::Future<>> {
+    try {
+      return executor->Submit([&guarded, i] { return guarded(i); });
+    } catch (const std::bad_alloc&) {
+      return arrow::Status::OutOfMemory("out of memory while submitting a parallel task");
+    }
+  };
   std::vector<arrow::Future<>> tasks;
   tasks.reserve(n);
   arrow::Status submitted;
   for (std::size_t i = 0; i < n && submitted.ok(); ++i) {
-    auto task = executor->Submit([&guarded, i] { return guarded(i); });
+    arrow::Result<arrow::Future<>> task = submit(i);
     if (task.ok()) {
-      tasks.push_back(std::move(*task));
+      tasks.push_back(*std::move(task));
     } else {
       submitted = task.status();
     }
   }
-  arrow::Status status = submitted;
-  for (const arrow::Future<>& task : tasks) {  // every task ends before its inputs can go
-    const arrow::Status done = task.status();
-    if (status.ok()) {
-      status = done;
-    }
+  // Every task submitted ends before ForEach returns, as the tasks use `fn`. Waiting allocates
+  // nothing, so no std::bad_alloc cuts it short.
+  for (const arrow::Future<>& task : tasks) {
+    task.Wait();
   }
-  return status;
+  for (const arrow::Future<>& task : tasks) {
+    ARROW_RETURN_NOT_OK(task.status());
+  }
+  return submitted;
 }
 
 PartitionLanes::PartitionLanes(std::size_t lanes, arrow::internal::Executor* executor,
@@ -118,34 +129,66 @@ arrow::Status PartitionLanes::Add(int64_t part, Merge merge) {
   if (lanes_.empty()) {
     return arrow::Status::OK();
   }
-  auto queued = std::make_shared<Part>(
-      Part{.part = part, .merge = std::move(merge), .remaining = lanes_.size()});
+  std::shared_ptr<Part> queued;
+  try {
+    queued = std::make_shared<Part>(
+        Part{.part = part, .merge = std::move(merge), .remaining = lanes_.size()});
+  } catch (const std::bad_alloc&) {  // no lane has the part, so none may merge a later one
+    Fail(part, 0, arrow::Status::OutOfMemory("out of memory while queuing a part"));
+    lock.unlock();
+    return Finish();
+  }
   ++pending_;
+  bool failed = false;
   for (std::size_t lane = 0; lane < lanes_.size(); ++lane) {
     Lane& state = lanes_[lane];
     if (state.failed) {
       Done(*queued);
       continue;
     }
-    state.queue.push_back(queued);
-    if (state.running) {
-      continue;
-    }
-    state.running = true;
-    ++running_;
-    auto task = executor_->Submit([this, lane] { Drain(lane); });
-    if (!task.ok()) {  // nothing runs the lane: drop its queue
-      state.running = false;
-      --running_;
+    arrow::Status status = Queue(lane, queued);
+    if (!status.ok()) {  // the lane fails as if it had failed to merge the part
+      failed = true;
       state.failed = true;
-      Fail(part, lane, task.status());
-      while (!state.queue.empty()) {
+      Fail(part, lane, std::move(status));
+      Done(*queued);
+      while (!state.queue.empty()) {  // the lane stops: its other parts are dropped
         Done(*state.queue.front());
         state.queue.pop_front();
       }
-      changed_.notify_all();
     }
   }
+  if (failed) {
+    lock.unlock();
+    return Finish();
+  }
+  return arrow::Status::OK();
+}
+
+arrow::Status PartitionLanes::Queue(std::size_t lane, const std::shared_ptr<Part>& part) {
+  Lane& state = lanes_[lane];
+  try {
+    state.queue.push_back(part);
+  } catch (const std::bad_alloc&) {
+    return arrow::Status::OutOfMemory("out of memory while queuing a part");
+  }
+  if (state.running) {
+    return arrow::Status::OK();
+  }
+  // A Submit that throws std::bad_alloc (Arrow allocates the task) has started nothing, like one
+  // that fails. The task waits for mu_, held here, so the lane is marked running before it runs.
+  arrow::Status submitted;
+  try {
+    submitted = executor_->Submit([this, lane] { Drain(lane); }).status();
+  } catch (const std::bad_alloc&) {
+    submitted = arrow::Status::OutOfMemory("out of memory while starting a partition lane");
+  }
+  if (!submitted.ok()) {
+    state.queue.pop_back();  // the queue of a lane without a task held nothing else
+    return submitted;
+  }
+  state.running = true;
+  ++running_;
   return arrow::Status::OK();
 }
 
