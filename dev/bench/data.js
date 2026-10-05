@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791227352151,
+  "lastUpdate": 1791227400999,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -4992,6 +4992,90 @@ window.BENCHMARK_DATA = {
             "value": 13.871261509803826,
             "unit": "ms/iter",
             "extra": "iterations: 51\ncpu: 13.870375725490199 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2ef1f4d36be64e9d014137e4b210d0e0765c14f6",
+          "message": "test(slt): star-schema join fixtures (#98)\n\n## Summary\n\nRoadmap PR **H6a** (joins track; ADR 0022 Consequences > Tests, ADR 0023\nTests): antb1's own synthetic star schema for the join and subquery\ntests, a `ref=` foreign-key option for tables files, and data,\ndifferential, metamorphic and integration tests over the new tables.\nTest-only: no engine code changes and no query changes its answer\n(`tests/data/tpch_status.json` stays `{\"pass\": [1, 6]}`, ClickBench\nstays 43/43). H6b (the pending join and subquery corpus) follows on top\nof this PR.\n\n- **Fixtures:** `tools/fixturegen/star.{h,cc}` write 8 tables under\n`star/` (trips, riders, drivers, zones, cities, shifts, tariffs,\npromos). Values come from integer formulas only, and no name comes from\nTPC-H.\n- NULL, dangling and repeated keys; two of the repeats cross a row-group\nboundary.\n- A key beyond INTEGER, 2^32+1000, which wraps to 1000 (the key of 29\ntrips).\n- Keys of two types (INTEGER→BIGINT, DECIMAL(4,2)→DECIMAL(5,3)), a\ntwo-column key, a join cycle, a many-to-many shortcut and a dimension in\ntwo roles.\n- DOUBLE columns (multiples of 1/8) in two tables, an empty table, and\nseveral row groups per table (trips: 1200 rows each).\n- `WriteAllFixtures` cleans `star/` as it cleans `hits_like_split/`. The\ndigest gains 8 lines; the 11 existing lines are unchanged.\n- **`ref=<col>[+<col>]:<table>.<col>[+<col>]`** in tables files\n(`TableDef::refs`): the syntax is checked and the table is found\ncase-insensitively, with file:line errors. `tests/slt/tables.txt`\ndeclares 13 refs. The engines and the query generator ignore refs until\nT1; the tpch tables files are untouched.\n- **slt:** `joins/star_tables.slt` (expectations from `pixi run\nslt-complete`), run on both engines and at 4 threads. It pins row\ncounts, NULL, repeated and dangling keys, key ranges, MIN/MAX, the small\ntables in full, and one read by path.\n- **Differential:** new `diff.star` (seed 20261005, 300 queries, checked\nunder `pixi run asan` first) and `parallel.diff.star` (4 threads, 97-row\nbatches, so that a row group spans several batches). `diff.random` is\nunchanged.\n- **Metamorphic:** `path_equals_table_*` for the star tables,\n`star_grouped_nullable_key_batch_size_invariance`, and\n`TablesTxt.RefsJoinColumnsOfOneKind`: every ref's columns exist and each\npair joins one kind of key, never DOUBLE.\n- **Integration:** the star files join\n`Scan.EveryFixtureTableInTheEngineView` and\n`Scan.PartStatisticsMatchThePartsRows`.\n- **fixturegen tests:** `harness.StarSchema.*` (rows and groups; names,\nprefixes and the `label` collision; key properties with the critical\nvalues pinned; exact doubles) and `RemovesStaleStarFiles`. The fixture\ncount is now 19.\n- **Docs:** `docs/testing.md`, `tests/slt/README.md`, `tests/README.md`,\nand the comments in `tables.h`, `tables.txt` and `fixtures.h`.\n\nFor the maintainer:\n\n- **Threads:** `parallel.joins.star_tables` and `parallel.diff.star` use\n4 threads under the `parallel` label's standing approval.\n- **Reshuffled queries:** `harness.diff.mutate.*` (seed 1) now draw from\n16 tables, and each still catches its mutation, under ASan too. `pixi\nrun diff-random` and the nightly `diff-extended` now include the star\ntables.\n- **Known DuckDB 1.5.5 bug:** an internal error (`late_materialization`)\ncan fail random differential runs. The star tables make it more likely:\na reviewer's simulation of 40 nightly `diff-extended` runs over all 16\ntables had 4 failures, against 0 in 600 seeds over the previous tables.\n#100 turns the optimizer off in the oracle, so merge it before or\ntogether with this PR. The fixed-seed tests are unaffected.\n- **Differences from the plan:** the riders repeats are at rows 64 and\n192 (8 repeated keys, 2 across a row-group boundary). The size is about\n1,700 lines against the ~1,100 estimate (column docs in `star.h`, the\nStarSchema tests, the DuckDB-written expectations).\n- After the merge, the advisory Benchmarks workflow runs on main\n(`tools/fixturegen/` changed).\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [x] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full                  # on 3ce7d34 (the head)\nlint: PASS\n100% tests passed out of 1833          # ci (clang Debug -Werror)\n100% tests passed out of 1833          # asan (diff.star, parallel.diff.star, harness.diff.mutate.* included)\nninja: no work to do.                  # tidy (a separate `pixi run tidy` before it: exit 0, no findings)\nCoverage gate: PASS / coverage: PASS   # coverage, 100% tests passed out of 1833\n100% tests passed out of 2             # fuzz-smoke\n100% tests passed out of 1833          # ci-gcc\n$ pixi run test && build/dev/bin/antb1-fixture-digest --write tests/fixtures/fixtures.digest build/dev/fixtures\nantb1-fixture-digest: wrote tests/fixtures/fixtures.digest (19 files)   # vs main: 8 star lines added, none changed\n$ pixi run slt-complete                # 56 files unchanged; only tests/slt/cases/joins/star_tables.slt is new\n$ ANTB1_UPDATE_GOLDENS=1 pixi run test -L cli\n100% tests passed out of 71            # no golden changed\n$ ANTB1_DIFF_SEED=271828 ANTB1_DIFF_COUNT=5000 pixi run diff-random --table trips --table riders --table drivers --table zones --table cities --table shifts --table tariffs --table promos\nDIFF: PASS seed=271828 queries=5000 failed=0 unsupported=0   # likewise seeds 314159 and 8675309 (on 3ce7d34), and 5150, 20261005, 777 (on e482042; same fixtures)\n$ ANTB1_DIFF_SEED=31337 ANTB1_DIFF_COUNT=20000 pixi run diff-random --table trips --table riders --table drivers --table zones --table cities --table shifts --table tariffs --table promos   # on e482042\nDIFF: PASS seed=31337 queries=20000 failed=0 unsupported=0\n$ ANTB1_DIFF_SEED=99991 ANTB1_DIFF_COUNT=20000 pixi run diff-random   # all 16 tables, on e482042\nDIFF: PASS seed=99991 queries=20000 failed=0 unsupported=0\n# tpch.status.* pass in every leg (tpch_status.json unchanged); no src/ change, so ClickBench is unaffected (pixi run test-data not run)\n```\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: none touched\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code implemented the\nmaintainer-approved H6a plan (the star-schema generator, `ref=` loader,\nslt, differential, metamorphic, integration and fixturegen tests, docs),\nprobing DuckDB 1.5.5 for the expected values. The reviewer agent\nreviewed the final diff: no P0/P1/P2; its two nits (a `fixtures.h`\ncomment and this PR text) are fixed in 3ce7d34 and here. The clang-tidy\nfinding is fixed in e482042. An independent split review then covered\nthe fixtures and harness, and the tests and docs, recomputing the\nfixture claims and re-running 35 of the 36 slt records in DuckDB: no\nP0/P1/P2.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-10-05T22:06:43+03:00",
+          "tree_id": "d96e13b2bdac2c6054e4b5596c46eff542c3457a",
+          "url": "https://github.com/ydb-campus/antb1/commit/2ef1f4d36be64e9d014137e4b210d0e0765c14f6"
+        },
+        "date": 1791227400111,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4624.82571885195,
+            "unit": "ns/iter",
+            "extra": "iterations: 151422\ncpu: 4623.159626738518 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84510.31306248343,
+            "unit": "ns/iter",
+            "extra": "iterations: 7778\ncpu: 84497.34469015172 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222486.9184126942,
+            "unit": "ns/iter",
+            "extra": "iterations: 3150\ncpu: 222442.28603174604 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 445929.03369356965,
+            "unit": "ns/iter",
+            "extra": "iterations: 1573\ncpu: 445798.48951048934 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 361822.4039256273,
+            "unit": "ns/iter",
+            "extra": "iterations: 1936\ncpu: 361701.23553719016 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2132507.9027355365,
+            "unit": "ns/iter",
+            "extra": "iterations: 329\ncpu: 2132233.878419453 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 53.79406923076912,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 53.78560315384612 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 50.21733433333301,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 50.210748800000005 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 255.53319300000035,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 255.5060006666666 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.895056425531942,
+            "unit": "ms/iter",
+            "extra": "iterations: 47\ncpu: 14.893050829787239 ms\nthreads: 1"
           }
         ]
       }
