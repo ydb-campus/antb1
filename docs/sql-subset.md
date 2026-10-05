@@ -139,10 +139,11 @@ are the same expression.
 - Typed literals: as in DuckDB, a string after a type name makes a typed literal, whether the string is plain, an
   escape or a dollar-quoted one, and the name plain, quoted or qualified (`integer '5'`, `integer E'5'`,
   `DATE $$2020-01-01$$`, `"integer" '5'`, `main.integer '5'`). Only `DATE` and `TIMESTAMP` before a plain string are
-  in the grammar: every other typed literal is unsupported, and so is an escape or a dollar-quoted string on its own
-  (`E'\n'`, `$$x$$`). Every unreserved word before a string is taken for a type name, also one that DuckDB does not
-  take for one (`coalesce '5'`: exit code 4, where DuckDB gives a syntax error). `E` and a string with a space between
-  them are no escape string (`integer E '5'` is a syntax error, as in DuckDB).
+  in the grammar: every other typed literal is unsupported, in every clause, `LIMIT` and `OFFSET` included, and so is
+  an escape or a dollar-quoted string on its own (`E'\n'`, `$$x$$`). Every unreserved word before a string is taken
+  for a type name, also one that DuckDB does not take for one (`coalesce '5'`: exit code 4, where DuckDB gives a
+  syntax error). `E` and a string with a space between them are no escape string (`integer E '5'` is a syntax error,
+  as in DuckDB).
 - Table aliases: after `AS` a name, a quoted identifier or a non-empty string literal (`AS 'a'`, as DuckDB); without
   `AS` a name or a quoted identifier. As in DuckDB, `BETWEEN`, `EXISTS`, `INTERVAL` and `OVER` are table aliases with
   or without `AS`, although they are reserved elsewhere, and these 49 words, which antb1 does not reserve, never are:
@@ -209,7 +210,10 @@ Outside the grammar, the parser recognizes common SQL and rejects it with exit c
 `SELECT DISTINCT`, subqueries, `ILIKE`, `GLOB`, `LIKE ... ESCAPE`, `NULL` literals, `IS [NOT] NULL`, `AT TIME ZONE`,
 `||`, window functions, unary `+`, and in casts quoted or qualified type names, type names of several words
 (`DOUBLE PRECISION`, `TIMESTAMP WITH TIME ZONE`), array types, `INTERVAL` and `UNION` types and type parameters other
-than integers. In FROM: `JOIN ... USING`, `NATURAL`, `RIGHT` and `FULL` joins, `SEMI`, `ANTI`, `ASOF` and `POSITIONAL`
+than integers. After `LIMIT` and `OFFSET`: expressions such as `LIMIT 1 + 1`, `LIMIT '5'` and `LIMIT (5)`, calls and
+typed literals, also of quoted and qualified names (`LIMIT abs(5)`, `LIMIT main.abs(5)`, `LIMIT integer '5'`,
+`LIMIT E'5'`), a percentage and `LIMIT ALL`; a column there (`LIMIT a`, `LIMIT t.a`) is a syntax error, and DuckDB
+refuses it too. In FROM: `JOIN ... USING`, `NATURAL`, `RIGHT` and `FULL` joins, `SEMI`, `ANTI`, `ASOF` and `POSITIONAL`
 joins, nested joins (a `JOIN` before the `ON` of an earlier one) and joins in parentheses, `LATERAL` before a subquery
 or a table function (also one with a qualified name: `LATERAL main.range(3)`), `schema.table`, `ONLY`, table functions
 (also those named by the 13 reserved words that DuckDB takes as function names, `CROSS`, `FULL`, `ILIKE`, `INNER`,

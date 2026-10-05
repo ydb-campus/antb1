@@ -2272,12 +2272,30 @@ class Parser {
       default:
         break;
     }
-    if (token.kind == TokenKind::kIdentifier && PeekAt(1).kind == TokenKind::kLeftParen) {
-      return Unsupported(token.span,
+    // A call or a typed literal, also of a quoted or a qualified name (abs(5), "abs"(5),
+    // main.abs(5), integer '5', "integer" E'5', main.integer $$5$$, and E'5' itself). A column
+    // (LIMIT a, LIMIT t.a), which DuckDB refuses when it binds, stays a syntax error.
+    const SourceSpan first = token.span;
+    const std::string found = Describe(token);
+    SourceSpan span = first;
+    if (IsName(token) && PeekAt(1).kind == TokenKind::kDot && IsName(PeekAt(2))) {
+      // What follows the name is beyond the three tokens of lookahead: take the qualifier and the
+      // dot first.
+      Take();
+      Take();
+      span = Cover(first, Peek().span);
+    }
+    const Token& head = Peek();  // the name, or its part after the dot
+    const bool call =
+        (head.kind == TokenKind::kIdentifier || head.kind == TokenKind::kQuotedIdentifier) &&
+        PeekAt(1).kind == TokenKind::kLeftParen;
+    const bool typed_literal = IsName(head) && (PeekAt(1).kind == TokenKind::kString ||
+                                                PrefixedStringAt(1) != PrefixedString::kNone);
+    if (call || typed_literal) {
+      return Unsupported(span,
                          name + " expressions are not supported (" + name + " takes an integer)");
     }
-    return Syntax(token.span,
-                  "expected a non-negative integer after " + name + ", found " + Describe(token));
+    return Syntax(first, "expected a non-negative integer after " + name + ", found " + found);
   }
 
   Status ParseEnd(const SelectStatement& stmt) {
