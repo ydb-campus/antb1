@@ -301,8 +301,10 @@ constexpr auto kNotAnAlias = std::to_array<NotAnAlias>({
     {.keyword = "VERBOSE"},
 });
 
-// Reserved words that DuckDB accepts as table aliases, with or without AS (checked below). ToSql
-// prints every alias quoted, so the canonical form never writes them bare.
+// Reserved words that DuckDB accepts as table aliases, with or without AS (checked below), and as
+// table names and qualifiers. antb1 takes them as table aliases; as qualifiers they are
+// unsupported (ReservedQualifier), as table names an error (divergence D21). ToSql prints every
+// alias quoted, so the canonical form never writes them bare.
 constexpr auto kAliasKeywords =
     std::to_array<std::string_view>({"BETWEEN", "EXISTS", "INTERVAL", "OVER"});
 
@@ -438,6 +440,12 @@ bool IsFunctionName(const Token& token) {
   return IsName(token) || Contains(kFunctionKeywords, KeywordOf(token));
 }
 
+// A token that DuckDB accepts before the dot of a qualified name: a name or a word of
+// kAliasKeywords.
+bool IsQualifier(const Token& token) {
+  return IsName(token) || Contains(kAliasKeywords, KeywordOf(token));
+}
+
 std::string Clip(std::string_view text) {
   if (text.size() <= kMaxQuotedText) {
     return std::string(text);
@@ -550,6 +558,13 @@ std::unexpected<ParseError> Syntax(SourceSpan span, std::string message) {
 
 std::unexpected<ParseError> Unsupported(SourceSpan span, std::string_view construct) {
   return std::unexpected(UnsupportedError(span, construct));
+}
+
+// A word of kAliasKeywords before a dot, which DuckDB takes for a qualifier: of a column (over.a),
+// a table (FROM t, over.x) or a table function (FROM over.f(1)).
+std::unexpected<ParseError> ReservedQualifier(SourceSpan span, std::string_view keyword) {
+  return Unsupported(span, "the reserved word " + std::string(keyword) +
+                               " as a qualifier is not supported; write it as a quoted identifier");
 }
 
 // Keywords that start a clause after the select list, supported or not.
@@ -1143,9 +1158,7 @@ class Parser {
     const std::string keyword = KeywordOf(token);
     if (PeekAt(1).kind == TokenKind::kDot) {
       if (Contains(kAliasKeywords, keyword)) {  // DuckDB accepts them as qualifiers
-        return Unsupported(token.span, "the reserved word " + keyword +
-                                           " as a qualifier is not supported; write it as a "
-                                           "quoted identifier");
+        return ReservedQualifier(token.span, keyword);
       }
       if (!IsReservedKeyword(keyword)) {
         return ParseQualifiedColumn();
@@ -1894,6 +1907,9 @@ class Parser {
         if (next.kind == TokenKind::kLeftParen && IsFunctionName(token)) {
           return Unsupported(token.span, "table functions are not supported");
         }
+        if (next.kind == TokenKind::kDot && Contains(kAliasKeywords, keyword)) {
+          return ReservedQualifier(token.span, keyword);  // over.x, over.f(1)
+        }
         if (IsReservedKeyword(keyword)) {
           return Syntax(token.span,
                         "expected a table name or a quoted file path, found keyword " + keyword);
@@ -1916,15 +1932,17 @@ class Parser {
         // DuckDB's subqueries, else its joins in parentheses. A table alone in them, or before a
         // comma or the end, is a syntax error, as in DuckDB; anything else after the table is
         // taken for a join (as far as three tokens tell), and so is a call (also of a word of
-        // kFunctionKeywords) and LATERAL before '(' or a function name.
+        // kFunctionKeywords), a qualified name (also one qualified by a word of kAliasKeywords)
+        // and LATERAL before '(' or what may start a function's name.
         const Token& next = PeekAt(1);
         if (next.kind == TokenKind::kLeftParen || Contains(kSubqueryStarts, KeywordOf(next))) {
           return Unsupported(token.span, "subqueries in FROM are not supported");
         }
         if (const Token& after = PeekAt(2);
             (IsFunctionName(next) && after.kind == TokenKind::kLeftParen) ||
-            (next.IsKeyword("LATERAL") &&
-             (after.kind == TokenKind::kLeftParen || IsFunctionName(after)))) {
+            (IsQualifier(next) && after.kind == TokenKind::kDot) ||
+            (next.IsKeyword("LATERAL") && (after.kind == TokenKind::kLeftParen ||
+                                           IsFunctionName(after) || IsQualifier(after)))) {
           return Unsupported(token.span, "parenthesized joins in FROM are not supported");
         }
         if (next.kind != TokenKind::kString && !IsName(next)) {
@@ -1948,7 +1966,8 @@ class Parser {
   }
 
   // Whether the LATERAL at the next token starts one of DuckDB's LATERAL items, a subquery or a
-  // table function, as far as three tokens tell: of LATERAL s.f(1) they show the name's first dot.
+  // table function, as far as three tokens tell: of LATERAL s.f(1) they show the name's first dot
+  // (also after a word of kAliasKeywords: LATERAL over.f(1)).
   bool StartsLateralItem() {
     const Token& next = PeekAt(1);
     if (next.kind == TokenKind::kLeftParen) {
@@ -1956,7 +1975,7 @@ class Parser {
     }
     const TokenKind after = PeekAt(2).kind;
     return (IsFunctionName(next) && after == TokenKind::kLeftParen) ||
-           (IsName(next) && after == TokenKind::kDot);
+           (IsQualifier(next) && after == TokenKind::kDot);
   }
 
   // [AS] alias after a FROM item's table, and what may not follow it: a word of kNotAnAlias is
