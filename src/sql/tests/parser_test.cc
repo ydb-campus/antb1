@@ -1658,6 +1658,36 @@ INSTANTIATE_TEST_SUITE_P(
                    "LATERAL is not supported"},
         RejectCase{"CrossJoinLateral", "SELECT a FROM events CROSS JOIN ^lateral f(a)",
                    kUnsupported, 7, "LATERAL is not supported"},
+        // LATERAL before a function with a qualified name: three tokens show the first dot only,
+        // so LATERAL s.t, a syntax error in DuckDB, is unsupported too.
+        RejectCase{"LateralQualifiedFunction", "SELECT a FROM events, ^LATERAL main.range(3)",
+                   kUnsupported, 7, "LATERAL is not supported"},
+        RejectCase{"JoinLateralQuotedQualifier",
+                   R"(SELECT a FROM events JOIN ^LATERAL "main".range(3) r ON a = r.range)",
+                   kUnsupported, 7, "LATERAL is not supported"},
+        RejectCase{"LateralThreePartFunction", "SELECT a FROM ^LATERAL system.main.range(3)",
+                   kUnsupported, 7, "LATERAL is not supported"},
+        RejectCase{"LateralQualifiedNameWithoutCall", "SELECT a FROM events, ^LATERAL main.users",
+                   kUnsupported, 7, "LATERAL is not supported"},
+        // The reserved words that DuckDB takes as function names call table functions where a FROM
+        // item starts (also after LATERAL and as the first word in parentheses).
+        RejectCase{"TableFunctionNamedLeft", "SELECT * FROM events, ^left(7)", kUnsupported, 4,
+                   "table functions are not supported"},
+        RejectCase{"FirstTableFunctionNamedSimilar", "SELECT * FROM ^similar(1)", kUnsupported, 7,
+                   "table functions are not supported"},
+        RejectCase{"JoinTableFunctionNamedInner",
+                   "SELECT * FROM events JOIN ^inner(1) i ON a = i.v", kUnsupported, 5,
+                   "table functions are not supported"},
+        RejectCase{"LeftJoinTableFunctionNamedLeft",
+                   "SELECT * FROM events LEFT JOIN ^left(1) l ON a = l.v", kUnsupported, 4,
+                   "table functions are not supported"},
+        RejectCase{"CrossJoinTableFunctionNamedRight", "SELECT * FROM events CROSS JOIN ^RIGHT(1)",
+                   kUnsupported, 5, "table functions are not supported"},
+        RejectCase{"LateralFunctionNamedLeft", "SELECT a FROM events, ^LATERAL left(1)",
+                   kUnsupported, 7, "LATERAL is not supported"},
+        RejectCase{"ParenthesizedJoinOfAFunctionNamedLeft",
+                   "SELECT a FROM ^(left(1) l JOIN events ON a = l.v)", kUnsupported, 1,
+                   "parenthesized joins in FROM are not supported"},
         RejectCase{"Only", "SELECT a FROM ^ONLY events", kUnsupported, 4, "ONLY is not supported"},
         RejectCase{"OnlyPath", "SELECT a FROM ^only 'e.parquet'", kUnsupported, 4,
                    "ONLY is not supported"},
@@ -1673,6 +1703,14 @@ INSTANTIATE_TEST_SUITE_P(
                    1, "parenthesized joins in FROM are not supported"},
         RejectCase{"ParenthesizedJoinWithAlias", "SELECT a FROM ^(events e CROSS JOIN users)",
                    kUnsupported, 1, "parenthesized joins in FROM are not supported"},
+        // In parentheses a LATERAL item only starts a join in DuckDB; three tokens show LATERAL and
+        // the '(' or the name after it.
+        RejectCase{"ParenthesizedJoinOfALateralSubquery",
+                   "SELECT a FROM ^(LATERAL (SELECT 1) x CROSS JOIN events)", kUnsupported, 1,
+                   "parenthesized joins in FROM are not supported"},
+        RejectCase{"ParenthesizedJoinOfALateralFunction",
+                   "SELECT a FROM ^(LATERAL left(1) CROSS JOIN events)", kUnsupported, 1,
+                   "parenthesized joins in FROM are not supported"},
         RejectCase{"SubqueryValues", "SELECT a FROM ^(VALUES (1))", kUnsupported, 1,
                    "subqueries in FROM are not supported"},
         RejectCase{"SubqueryFromFirst", "SELECT a FROM ^(FROM events)", kUnsupported, 1,
@@ -2329,6 +2367,21 @@ INSTANTIATE_TEST_SUITE_P(
                    "expected a table name, a quoted file path or a subquery after '(', found ')'"},
         RejectCase{"LateralWithoutParentheses", "SELECT a FROM events, ^LATERAL users", kSyntax, 7,
                    "expected a table name or a quoted file path, found keyword LATERAL"},
+        RejectCase{"LateralAloneInParentheses", "SELECT a FROM (^LATERAL)", kSyntax, 7,
+                   "expected a table name, a quoted file path or a subquery after '(', found "
+                   "keyword LATERAL"},
+        RejectCase{"LateralPathInParentheses",
+                   "SELECT a FROM (^LATERAL 'e.parquet' CROSS JOIN users)", kSyntax, 7,
+                   "expected a table name, a quoted file path or a subquery after '(', found "
+                   "keyword LATERAL"},
+        // A reserved word that DuckDB takes as a function name is no table name.
+        RejectCase{"LeftAfterCommaWithoutCall", "SELECT a FROM events, ^LEFT users", kSyntax, 4,
+                   "expected a table name or a quoted file path, found keyword LEFT"},
+        RejectCase{"LeftInParenthesesWithoutCall", "SELECT a FROM (^left users)", kSyntax, 4,
+                   "expected a table name, a quoted file path or a subquery after '(', found "
+                   "keyword LEFT"},
+        RejectCase{"BetweenCallAfterComma", "SELECT a FROM events, ^between(1)", kSyntax, 7,
+                   "expected a table name or a quoted file path, found keyword BETWEEN"},
         // After a qualified name, what DuckDB lexes as no string constant.
         RejectCase{"QualifiedNameBeforeBitString", "SELECT main.integer B^'1' FROM events", kSyntax,
                    3, "expected ',' or FROM, found string literal"},
@@ -2416,6 +2469,45 @@ TEST(ParserTest, EveryReservedWordAfterAsInFrom) {
     auto quoted = Parse(prefix + "\"" + std::string(word) + "\"");
     ASSERT_TRUE(quoted.has_value()) << word;
     EXPECT_EQ(quoted->from.at(0).alias, std::optional<std::string>(word));
+  }
+}
+
+// Where a FROM item starts, the reserved words that DuckDB 1.5.5 takes as function names (probed
+// on DuckDB) call table functions before '(', unsupported; no other reserved word does. After
+// LATERAL such a call is a LATERAL item, and first in parentheses it starts a join.
+TEST(ParserTest, ReservedWordsThatNameTableFunctions) {
+  constexpr auto kFunctionWords =
+      std::to_array<std::string_view>({"CROSS", "FULL", "ILIKE", "INNER", "IS", "JOIN", "LEFT",
+                                       "LIKE", "NATURAL", "OUTER", "OVER", "RIGHT", "SIMILAR"});
+  for (const std::string_view word : kReserved) {
+    const bool function = std::ranges::find(kFunctionWords, word) != kFunctionWords.end();
+    for (const std::string_view before :
+         {"SELECT a FROM "sv, "SELECT a FROM t, "sv, "SELECT a FROM t JOIN "sv,
+          "SELECT a FROM t CROSS JOIN "sv}) {
+      const std::string sql = std::string(before) + std::string(word) + "(1)";
+      auto result = Parse(sql);
+      ASSERT_FALSE(result.has_value()) << sql;
+      const ParseError& error = result.error();
+      EXPECT_EQ(error.message.starts_with("table functions are not supported"), function)
+          << sql << ": " << error.message;
+      if (function) {
+        EXPECT_EQ(error.kind, ParseError::Kind::kUnsupported) << sql;
+        EXPECT_EQ(error.span.offset, before.size()) << sql;
+        EXPECT_EQ(error.span.length, word.size()) << sql;
+      }
+    }
+    if (!function) {
+      continue;
+    }
+    auto lateral = Parse("SELECT a FROM t, LATERAL " + std::string(word) + "(1)");
+    ASSERT_FALSE(lateral.has_value()) << word;
+    EXPECT_TRUE(lateral.error().message.starts_with("LATERAL is not supported"))
+        << word << ": " << lateral.error().message;
+    auto parenthesized = Parse("SELECT a FROM (" + std::string(word) + "(1) f CROSS JOIN t)");
+    ASSERT_FALSE(parenthesized.has_value()) << word;
+    EXPECT_TRUE(
+        parenthesized.error().message.starts_with("parenthesized joins in FROM are not supported"))
+        << word << ": " << parenthesized.error().message;
   }
 }
 

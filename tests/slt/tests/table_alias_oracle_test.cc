@@ -3,9 +3,9 @@
 // word as the item's alias exactly when sql::Parse does. A DuckDB update that gives a word a
 // meaning after a FROM item (a new kind of join, say) fails here until the word joins the parser's
 // table of words that are never aliases (kNotAnAlias), so that antb1 never answers such a query
-// as an inner join with an alias. In every place, also after an alias and after an ON condition,
-// a statement that sql::Parse accepts must parse in DuckDB, and one that it rejects as malformed
-// must fail in DuckDB too.
+// as an inner join with an alias. In every place, also after an alias, after an ON condition and
+// where the word would call a table function, a statement that sql::Parse accepts must parse in
+// DuckDB, and one that it rejects as malformed must fail in DuckDB too.
 
 #include <array>
 #include <cstddef>
@@ -40,6 +40,14 @@ constexpr auto kPlaces = std::to_array<Place>({
     {.before = "SELECT 1 FROM t LEFT JOIN u AS ", .after = " ON t.a = u.a", .item = 1},
     {.before = "SELECT 1 FROM t a ", .after = "", .alias = false},
     {.before = "SELECT 1 FROM t JOIN u ON t.a = u.a ", .after = "", .alias = false},
+    // The word as a table function where a FROM item starts: DuckDB takes some reserved words as
+    // function names (FROM t, left(1)), so antb1 must not call those calls malformed.
+    {.before = "SELECT 1 FROM ", .after = "(1)", .alias = false},
+    {.before = "SELECT 1 FROM t, ", .after = "(1)", .alias = false},
+    {.before = "SELECT 1 FROM t JOIN ", .after = "(1) f ON t.a = f.a", .alias = false},
+    {.before = "SELECT 1 FROM t, LATERAL ", .after = "(1)", .alias = false},
+    {.before = "SELECT 1 FROM (", .after = "(1) f CROSS JOIN t)", .alias = false},
+    {.before = "SELECT 1 FROM (LATERAL ", .after = "(1) f CROSS JOIN t)", .alias = false},
 });
 
 // `text` as a SQL string literal.

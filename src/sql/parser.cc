@@ -315,6 +315,12 @@ constexpr auto kJoinKinds =
 constexpr auto kJoinStarts =
     std::to_array<std::string_view>({"CROSS", "FULL", "INNER", "JOIN", "LEFT", "NATURAL", "RIGHT"});
 
+// The reserved words that DuckDB 1.5.5 also takes as function names (sorted; checked below): where
+// a FROM item starts, one before '(' calls a table function (FROM t, left(1)).
+constexpr auto kFunctionKeywords =
+    std::to_array<std::string_view>({"CROSS", "FULL", "ILIKE", "INNER", "IS", "JOIN", "LEFT",
+                                     "LIKE", "NATURAL", "OUTER", "OVER", "RIGHT", "SIMILAR"});
+
 // The first words of a query in parentheses in FROM (a subquery), as DuckDB parses them; a '('
 // starts one too.
 constexpr auto kSubqueryStarts =
@@ -347,6 +353,8 @@ static_assert(std::ranges::all_of(kStarModifiers, FitsKeywordLength, &Construct:
 static_assert(std::ranges::all_of(kNotAnAlias, FitsKeywordLength, &NotAnAlias::keyword));
 static_assert(std::ranges::all_of(kJoinKinds, FitsKeywordLength));
 static_assert(std::ranges::all_of(kJoinStarts, IsReservedWordOf));
+static_assert(std::ranges::is_sorted(kFunctionKeywords));
+static_assert(std::ranges::all_of(kFunctionKeywords, IsReservedWordOf));
 static_assert(std::ranges::all_of(kSubqueryStarts, FitsKeywordLength));
 
 // The kUnsupported message of a typed literal (INT '1', main.integer '1') or a prefixed string.
@@ -423,6 +431,11 @@ bool IsTableAlias(const Token& token, bool after_as) {
 bool StartsRelation(const Token& token) {
   return token.kind == TokenKind::kString || IsName(token) ||
          Contains(kAliasKeywords, KeywordOf(token));
+}
+
+// A token that can name a table function before its '(': a name or a word of kFunctionKeywords.
+bool IsFunctionName(const Token& token) {
+  return IsName(token) || Contains(kFunctionKeywords, KeywordOf(token));
 }
 
 std::string Clip(std::string_view text) {
@@ -1872,14 +1885,13 @@ class Parser {
       case TokenKind::kQuotedIdentifier: {
         const std::string keyword = KeywordOf(token);
         const Token& next = PeekAt(1);
-        if (keyword == "LATERAL" && (next.kind == TokenKind::kLeftParen ||
-                                     (IsName(next) && PeekAt(2).kind == TokenKind::kLeftParen))) {
+        if (keyword == "LATERAL" && StartsLateralItem()) {
           return Unsupported(token.span, "LATERAL is not supported");
         }
         if (keyword == "ONLY" && StartsRelation(next)) {  // ONLY t; a table "only" otherwise
           return Unsupported(token.span, "ONLY is not supported");
         }
-        if (next.kind == TokenKind::kLeftParen && !IsReservedKeyword(keyword)) {
+        if (next.kind == TokenKind::kLeftParen && IsFunctionName(token)) {
           return Unsupported(token.span, "table functions are not supported");
         }
         if (IsReservedKeyword(keyword)) {
@@ -1903,10 +1915,17 @@ class Parser {
       case TokenKind::kLeftParen: {
         // DuckDB's subqueries, else its joins in parentheses. A table alone in them, or before a
         // comma or the end, is a syntax error, as in DuckDB; anything else after the table is
-        // taken for a join (as far as three tokens tell).
+        // taken for a join (as far as three tokens tell), and so is a call (also of a word of
+        // kFunctionKeywords) and LATERAL before '(' or a function name.
         const Token& next = PeekAt(1);
         if (next.kind == TokenKind::kLeftParen || Contains(kSubqueryStarts, KeywordOf(next))) {
           return Unsupported(token.span, "subqueries in FROM are not supported");
+        }
+        if (const Token& after = PeekAt(2);
+            (IsFunctionName(next) && after.kind == TokenKind::kLeftParen) ||
+            (next.IsKeyword("LATERAL") &&
+             (after.kind == TokenKind::kLeftParen || IsFunctionName(after)))) {
+          return Unsupported(token.span, "parenthesized joins in FROM are not supported");
         }
         if (next.kind != TokenKind::kString && !IsName(next)) {
           return Syntax(next.span,
@@ -1926,6 +1945,18 @@ class Parser {
         return Syntax(token.span,
                       "expected a table name or a quoted file path, found " + Describe(token));
     }
+  }
+
+  // Whether the LATERAL at the next token starts one of DuckDB's LATERAL items, a subquery or a
+  // table function, as far as three tokens tell: of LATERAL s.f(1) they show the name's first dot.
+  bool StartsLateralItem() {
+    const Token& next = PeekAt(1);
+    if (next.kind == TokenKind::kLeftParen) {
+      return true;
+    }
+    const TokenKind after = PeekAt(2).kind;
+    return (IsFunctionName(next) && after == TokenKind::kLeftParen) ||
+           (IsName(next) && after == TokenKind::kDot);
   }
 
   // [AS] alias after a FROM item's table, and what may not follow it: a word of kNotAnAlias is
