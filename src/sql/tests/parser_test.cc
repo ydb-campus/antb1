@@ -2046,6 +2046,11 @@ INSTANTIATE_TEST_SUITE_P(
                    "typed literals other than DATE"},
         RejectCase{"QualifiedTypeNationalString", "SELECT ^e.N'x' FROM events e", kUnsupported, 3,
                    "typed literals other than DATE"},
+        // A quoted E before a string is a name, not the start of an escape string.
+        RejectCase{"QualifiedQuotedTypeLetter", "SELECT ^e.\"E\"'x' FROM events e", kUnsupported, 5,
+                   "typed literals other than DATE"},
+        RejectCase{"QualifiedQuotedTypeLetterLimit", "SELECT a FROM events LIMIT ^e.\"E\"'5'",
+                   kUnsupported, 5, "LIMIT expressions are not supported"},
         // So does an escape or a dollar-quoted string after a name, and any string after a quoted
         // name; DATE and TIMESTAMP make literals before a plain string only.
         RejectCase{"TypedEscapeString", "SELECT ^integer E'5' FROM events", kUnsupported, 7,
