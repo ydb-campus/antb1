@@ -125,7 +125,8 @@ and the supported features, so one case reproduces alone.
 - DuckDB runs every query: the generator writes only SQL DuckDB accepts with the semantics antb1 targets
   (typed literals, doubles that both engines parse alike, no FLOAT column because its results are DOUBLE on antb1
   only (divergence D11 in `docs/sql-subset.md`), no clickbench-typed column with `FROM '<path>'`, a DECIMAL compared
-  only where DuckDB's common type keeps 38 digits (divergence D13)), so a DuckDB error is a generator bug and fails.
+  only where DuckDB's common type keeps 38 digits (divergence D13), a DECIMAL `CASE` value only where its cast to the
+  `CASE` type cannot fail), so a DuckDB error is a generator bug and fails.
 - A failure prints the seed, the case index, the features, the SQL, at most 5 differing rows and the repro.
 
 ```bash
