@@ -187,6 +187,52 @@ TEST(PartitionLanesTest, TheEarliestFailureWins) {
   }
 }
 
+// failed() tells whether a failure is known, without waiting: not before one; right after the Add
+// that fails without an executor, once Finish() has waited for the lanes with one; and from then
+// on. A merge that still runs does not hold it back.
+TEST(PartitionLanesTest, FailedTellsWhetherAFailureIsKnown) {
+  const auto pool = Pool();
+  for (arrow::internal::Executor* executor : Executors(pool.get())) {
+    SCOPED_TRACE(executor == nullptr ? "here" : "pool");
+    PartitionLanes lanes(3, executor, 4);
+    EXPECT_FALSE(lanes.failed());
+    EXPECT_TRUE(lanes.Add(0, [](std::size_t) { return arrow::Status::OK(); }).ok());
+    EXPECT_TRUE(lanes.Finish().ok());
+    EXPECT_FALSE(lanes.failed());
+    const arrow::Status added = lanes.Add(1, [](std::size_t lane) {
+      return lane == 1 ? arrow::Status::Invalid("part 1 lane 1") : arrow::Status::OK();
+    });
+    if (executor == nullptr) {
+      EXPECT_EQ(added.message(), "part 1 lane 1");
+      EXPECT_TRUE(lanes.failed());
+    }
+    EXPECT_EQ(lanes.Finish().message(), "part 1 lane 1");
+    EXPECT_TRUE(lanes.failed());
+    EXPECT_FALSE(lanes.Add(2, [](std::size_t) { return arrow::Status::OK(); }).ok());
+    EXPECT_TRUE(lanes.failed());
+  }
+  std::mutex mu;
+  std::condition_variable cv;
+  bool open = false;
+  PartitionLanes lanes(2, pool.get(), 4);
+  EXPECT_TRUE(lanes
+                  .Add(0,
+                       [&](std::size_t) {
+                         std::unique_lock lock(mu);
+                         cv.wait(lock, [&] { return open; });
+                         return arrow::Status::Invalid("part 0");
+                       })
+                  .ok());
+  EXPECT_FALSE(lanes.failed());  // waiting for the merge here would wait forever
+  {
+    const std::scoped_lock lock(mu);
+    open = true;
+  }
+  cv.notify_all();
+  EXPECT_EQ(lanes.Finish().message(), "part 0");
+  EXPECT_TRUE(lanes.failed());
+}
+
 // A lane whose task cannot be submitted (the pool is shut down) fails Add with the executor's
 // status; the part is dropped, nothing waits for it.
 TEST(PartitionLanesTest, AFailedSubmitFailsTheLane) {
