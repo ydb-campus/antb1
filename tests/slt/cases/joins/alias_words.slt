@@ -76,6 +76,7 @@ SELECT COUNT(*), SUM(tr_fare) FROM trips SEMI JOIN riders ON tr_rider = rd_id
 ----
 2745	41289.25
 
+# The pending twin of the label semi, an IN subquery (roadmap PR J5): labels hold within a file.
 pending J5
 query ID nosort semi
 SELECT COUNT(*), SUM(tr_fare) FROM trips WHERE tr_rider IN (SELECT rd_id FROM riders)
@@ -89,6 +90,7 @@ SELECT COUNT(*), COUNT(tr_driver) FROM trips anti JOIN drivers ON tr_driver = dv
 ----
 423	319
 
+# The pending twin of the label anti, a NOT EXISTS (roadmap PR U2).
 pending U2
 query II nosort anti
 SELECT COUNT(*), COUNT(tr_driver) FROM trips WHERE NOT EXISTS (SELECT * FROM drivers WHERE dv_id = tr_driver)
@@ -97,9 +99,9 @@ SELECT COUNT(*), COUNT(tr_driver) FROM trips WHERE NOT EXISTS (SELECT * FROM dri
 
 # ---- DuckDB only until ASOF joins get a PR (ADR 0022) ----
 
-# DuckDB 1.5.5 counts a NULL inequality value as an ASOF match: joined with shifts on tr_driver = sh_driver AND
-# tr_day >= sh_day, the 71 trips whose tr_day is NULL find a shift. These records therefore join only columns without
-# NULLs, on a build key without repeats: each trip meets the zone of the largest zn_id up to its tr_pickup.
+# DuckDB 1.5.5 and 1.5.6 count a NULL inequality value as an ASOF match: joined with shifts on tr_driver = sh_driver
+# AND tr_day >= sh_day, the 71 trips whose tr_day is NULL find a shift. These records therefore join only columns
+# without NULLs, on a build key without repeats: each trip meets the zone of the largest zn_id up to its tr_pickup.
 onlyif duckdb
 query III nosort
 SELECT COUNT(*), MIN(zn_id), MAX(zn_id) FROM trips asof JOIN zones ON tr_pickup >= zn_id

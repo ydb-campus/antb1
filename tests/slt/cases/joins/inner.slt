@@ -27,9 +27,14 @@ SELECT tr_rider, COUNT(*) FROM trips WHERE tr_rider IN (7, 8, 47, 64, 192, 236, 
 7	13
 8	12
 
-# shifts repeats the key (1111, 2026-03-22).
+# shifts repeats the keys (1111, 2026-03-22) and (1148, 2026-03-29), and one trip has each.
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_driver = 1111 AND tr_day = DATE '2026-03-22'
+----
+1
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_driver = 1148 AND tr_day = DATE '2026-03-29'
 ----
 1
 
@@ -129,7 +134,8 @@ SELECT tr_rate, tf_rate, COUNT(*) FROM trips JOIN tariffs ON tr_rate = tf_rate G
 2.00	2.000	345
 2.50	2.500	342
 
-# The two-column key: a key with a NULL part never matches, and the repeated key (1111, 2026-03-22) matches twice.
+# The two-column key: a key with a NULL part never matches, and each repeated key of shifts, (1111, 2026-03-22) and
+# (1148, 2026-03-29), matches twice.
 pending J2b
 query IDD nosort trips_shifts
 SELECT COUNT(*), MIN(sh_hours), MAX(sh_hours) FROM trips JOIN shifts ON tr_driver = sh_driver AND tr_day = sh_day

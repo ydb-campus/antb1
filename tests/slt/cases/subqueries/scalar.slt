@@ -164,8 +164,10 @@ SELECT COUNT(*) FROM riders WHERE 0 = (SELECT CASE WHEN SUM(tr_fare) > 0 THEN 1 
 ----
 4
 
-# ---- DuckDB only until correlations of two types get a PR (ADR 0023: INTEGER tr_driver, BIGINT dv_id) ----
+# ---- DuckDB only until the general domain join gets a PR (ADR 0023: a correlation of two types exits 4) ----
 
+# Only an equality of one type feeds an equivalence class, so the INTEGER tr_driver is no inner equivalent of the
+# BIGINT dv_id.
 onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM drivers WHERE 450 < (SELECT SUM(tr_fare) FROM trips WHERE tr_driver = dv_id)

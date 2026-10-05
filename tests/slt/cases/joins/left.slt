@@ -69,7 +69,7 @@ SELECT zn_city, COUNT(*), COUNT(zn_id) FROM trips LEFT JOIN zones ON tr_pickup =
 9	69	69
 NULL	276	69
 
-# The two-column key: the repeated key adds two rows.
+# The two-column key: the two repeated keys of shifts add a row each.
 pending J6
 query III nosort
 SELECT COUNT(*), COUNT(sh_row), COUNT(sh_hours) FROM trips LEFT JOIN shifts ON tr_driver = sh_driver AND tr_day = sh_day
@@ -123,14 +123,15 @@ SELECT tr_row, tr_tariff, tf_code, tf_rate, tf_label FROM trips LEFT JOIN tariff
 8	(empty)	(empty)	2.125	center
 9	POOL	POOL	0.875	pool
 
-# Two LEFT JOINs: the second pads the trips the first padded, and zone 39's city 9.
+# Two LEFT JOINs: the second pads the trips the first padded, and those of zone 38 (NULL city) and zone 39 (city 9).
 pending J6
 query III nosort
 SELECT COUNT(*), COUNT(zn_id), COUNT(ct_id) FROM trips LEFT JOIN zones ON tr_pickup = zn_id LEFT JOIN cities ON zn_city = ct_id
 ----
 3000	2793	2655
 
-# An inner join and a LEFT JOIN in three FROM orders: the LEFT JOIN's left input is the item before it.
+# An inner join and a LEFT JOIN in three FROM orders. The items from the last comma up to a LEFT JOIN form its left
+# input (ADR 0022): trips JOIN drivers in the first, trips in the other two.
 pending J6
 query IID nosort inner_left
 SELECT COUNT(*), COUNT(zn_id), SUM(tr_fare) FROM trips JOIN drivers ON tr_driver = dv_id LEFT JOIN zones ON tr_pickup = zn_id
