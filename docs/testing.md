@@ -440,6 +440,10 @@ implementation does not comply with all requirements of the TPC-H Benchmark.
   that module's `CMakeLists.txt`. Extra libraries go under `LIBS`: modules reachable through the allow-list (for
   example `antb1::plan` in the `cli` tests) and libraries that build test data (for example `Parquet::parquet_shared`).
   Tests of `common` and `sql` stay Arrow-free.
+- A test that replaces the global `operator new` (the allocation-failure hook of
+  `src/exec/tests/bad_alloc_test.cc`, which fails chosen allocations of one call with `std::bad_alloc`) is an
+  executable of its own, registered with `antb1_add_gtest(...)` in the module's `CMakeLists.txt`, never a file of
+  the module's shared test binary.
 - Cross-module suites are registered in `tests/CMakeLists.txt` with `antb1_add_gtest(... LABEL <label> ...)`, or with
   `antb1_add_fixture_gtest(...)` when they read the fixtures (`cmake/Antb1Testing.cmake`).
 - SQL behavior goes into `.slt` files ([SQL logic tests](#sql-logic-tests)); command-line behavior into CLI goldens.

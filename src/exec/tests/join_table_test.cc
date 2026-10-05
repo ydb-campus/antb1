@@ -1369,11 +1369,12 @@ TEST_F(JoinTableTest, RunsOutOfMemoryCleanly) {
   }
 }
 
-// A part that cannot be handed to the partitions (std::bad_alloc from the executor's Submit) fails
-// the build with OutOfMemory, whichever parts came before it: every later Add returns that failure,
-// in or out of order, and so do Merged() and Finish() (never a part "not added"); nothing is left
-// in the budget once the builder and the parts go.
-TEST_F(JoinTableTest, AFailedReleaseFailsTheBuild) {
+// A part the partitions cannot take (the executor's Submit throws std::bad_alloc, which the
+// partition lanes report as OutOfMemory) fails the build, whichever parts came before it: every
+// later Add returns that failure, in or out of order, and so do Merged() and Finish() (never a part
+// "not added"); nothing is left in the budget once the builder and the parts go. A release that
+// throws itself is in bad_alloc_test.cc.
+TEST_F(JoinTableTest, APartThePartitionsCannotTakeFailsTheBuild) {
   const auto pool = MakeThreadPool();
   for (const bool hashed : {false, true}) {
     SCOPED_TRACE(hashed);
