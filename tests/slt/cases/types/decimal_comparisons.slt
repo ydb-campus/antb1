@@ -1,7 +1,8 @@
 # Comparisons of a DECIMAL with other types (ADR 0021 rule 11, docs/sql-subset.md): with a DECIMAL of another
 # precision or scale and with an integer exactly by value, with a DOUBLE operand, a number DuckDB types as DOUBLE or
 # an IN list with one in DOUBLE, the DECIMAL converted as DuckDB converts it. decimals.parquet adds b BIGINT (its
-# extremes and 2^53 + 1) and d DOUBLE to the DECIMAL columns; the value records read rows 14 and up.
+# extremes and 2^53 + 1) and d DOUBLE to the DECIMAL columns; rows 12 and 13 hold pairs of values that are equal as
+# doubles but not exactly.
 
 # DECIMALs of other precisions and scales, and integers: exactly by value.
 
@@ -71,7 +72,6 @@ SELECT id FROM decimals WHERE d38_10 <= b AND id < 14
 ----
 10
 12
-13
 4
 7
 8
@@ -94,6 +94,17 @@ SELECT id FROM decimals WHERE id >= d38_0 AND id >= 14
 37
 39
 
+# Equal as doubles, not exactly: row 12's d38_10 (2^53 + 0.5) and b (2^53 + 1), row 13's d18_4 and d38_10.
+query I rowsort
+SELECT id FROM decimals WHERE d38_10 < b AND id IN (12, 13)
+----
+12
+
+query I rowsort
+SELECT id FROM decimals WHERE d38_10 > d18_4 AND id >= 12 AND id <= 13
+----
+13
+
 # Beyond 2^53: b + 0.5 is DECIMAL(21,1), above b in every row; in DOUBLE 2^53 + 1.5 and 2^53 + 1 would be equal.
 query I rowsort
 SELECT id FROM decimals WHERE b + 0.5 > b AND (id < 4 OR id = 12)
@@ -104,7 +115,32 @@ SELECT id FROM decimals WHERE b + 0.5 > b AND (id < 4 OR id = 12)
 2
 3
 
+# DECIMAL(21,1) and DECIMAL(22,2): exactly, so never equal; in DOUBLE rows 2, 3 and 12 would be.
+query I nosort
+SELECT COUNT(*) FROM decimals WHERE b + 0.5 = b + 0.25
+----
+0
+
 # Against a DOUBLE operand: in DOUBLE.
+
+query I rowsort
+SELECT id FROM decimals WHERE d9_2 = d
+----
+7
+
+# DuckDB converts 2^53 + 1.5 to 2^53 (its integer part first), the DOUBLE of b in row 12.
+query I rowsort
+SELECT id FROM decimals WHERE b + 0.5 = b * 1e0 AND (id < 4 OR id = 12)
+----
+12
+2
+3
+
+# A comparison converts a DECIMAL as arithmetic does, beyond 2^53 and at width 38 too.
+query I nosort
+SELECT COUNT(*) FROM decimals WHERE d18_4 = d18_4 * 1e0 AND d38_10 <= d38_10 + 0e0
+----
+30
 
 query I rowsort
 SELECT id FROM decimals WHERE p > d AND id >= 30
@@ -136,7 +172,8 @@ SELECT id FROM decimals WHERE p < id / 4 AND id >= 30
 36
 37
 
-# Against a number DuckDB types as DOUBLE: an exponent, more than 38 digits, an integer beyond 2^128 - 1.
+# Against a number DuckDB types as DOUBLE: an exponent, a decimal of more than 38 digits, an integer outside -2^127 to
+# 2^128 - 1.
 
 query I nosort
 SELECT COUNT(*) FROM decimals WHERE p > 1e1
@@ -288,6 +325,8 @@ SELECT id % 4 AS g, COUNT(*) FROM decimals GROUP BY g HAVING SUM(p) > MAX(q) OR 
 query II rowsort
 SELECT id % 4 AS g, COUNT(*) FROM decimals GROUP BY g HAVING SUM(id) < MAX(d38_10)
 ----
+0	10
+1	10
 2	10
 
 # An integer SUM (HUGEINT) against a DOUBLE converts as DuckDB converts a HUGEINT: -2^53 - 2 becomes -2^53.
@@ -364,7 +403,7 @@ SELECT d9_2, SUM(d), AVG(d) FROM decimals GROUP BY d9_2
 -6.25	-3.75	-1.25
 -9999999.99	-0.625	-0.625
 0.00	-3.75	-1.25
-1.25	7.5	2.5
+1.25	3.75	1.25
 2.50	5	2.5
 3.75	2.5	2.5
 5.00	-5.625	-1.875
