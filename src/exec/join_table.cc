@@ -816,6 +816,7 @@ arrow::Result<std::unique_ptr<JoinTableBuilder>> JoinTableBuilder::Make(
       return arrow::Status::OutOfMemory("a join build of ", num_parts, " parts");
     }
     ARROW_RETURN_NOT_OK(builder->memory_.Resize(bytes));
+    builder->out_of_memory_ = arrow::Status::OutOfMemory("out of memory in a join build");
     builder->parts_.resize(static_cast<std::size_t>(num_parts));
     for (MemoryReservation& memory : builder->segment_memory_) {
       memory.Reset(budget);
@@ -848,15 +849,21 @@ arrow::Status JoinTableBuilder::Add(int64_t part, std::shared_ptr<const JoinBuil
       return arrow::Status::Invalid("join build part ", part, " added twice");
     }
     slot = std::move(rows);
-    // A release that fails, std::bad_alloc included, still moves on to the next part and fails the
-    // build: no part is released twice, and every later call returns the failure. It waits for the
-    // merges, as a merge of an earlier part may have failed: that failure comes first (Merged).
-    while (failed_.ok() && next_part_ < num_parts_ &&
-           parts_[static_cast<std::size_t>(next_part_)] != nullptr) {
-      failed_ = NoBadAlloc("a join build", [this] { return Release(next_part_); });
-      ++next_part_;
+    // Each part is released once, in order: it counts as released before Release runs. A release
+    // that fails fails the build, std::bad_alloc included (out_of_memory_ was made ahead: nothing
+    // is allocated here), so no exception leaves a part to release again or the build going on.
+    while (next_part_ < num_parts_ && parts_[static_cast<std::size_t>(next_part_)] != nullptr) {
+      const int64_t releasing = next_part_++;
+      try {
+        failed_ = Release(releasing);
+      } catch (const std::bad_alloc&) {
+        failed_ = std::move(out_of_memory_);  // once: the build stops at its first failure
+      }
+      if (!failed_.ok()) {
+        return Merged();  // a merge of an earlier part may have failed: it comes first
+      }
     }
-    return failed_.ok() ? arrow::Status::OK() : Merged();
+    return arrow::Status::OK();
   });
 }
 
@@ -868,7 +875,7 @@ arrow::Status JoinTableBuilder::Release(int64_t part) {
   }
   // Every piece has a row: the chunks are no more than the rows.
   const auto first_chunk = Narrow<std::uint32_t>(num_chunks_);
-  // The merge is made before anything changes: without memory for it, the build is as it was.
+  // The merge function is made before any count changes.
   PartitionLanes::Merge merge;
   if (!rows->pieces_.empty()) {
     merge = [this, rows, first_chunk](std::size_t partition) {

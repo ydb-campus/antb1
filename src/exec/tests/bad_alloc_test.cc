@@ -695,11 +695,73 @@ TEST_F(JoinTableBadAllocTest, MakingASpecOrABuilderRunsOutOfMemoryCleanly) {
   }
 }
 
+// The parts of `input` added in `order` to a build on `executor`, the Add at `armed` with
+// `failures` allocations failing in a row after `skip`: once an Add failed (OutOfMemory), every
+// later call returns its failure (with more than one failing, an OutOfMemory); with none failed, the
+// table is `reference`. Nothing is left in the budget. Whether an allocation failed.
+bool AddParts(const BuildInput& input, const std::shared_ptr<const JoinBuildSpec>& spec,
+              const Snapshot& reference, bool hashed, arrow::internal::Executor* executor,
+              const std::vector<std::size_t>& order, std::size_t armed, std::int64_t failures,
+              std::int64_t skip) {
+  const auto expect_failure = [failures](const arrow::Status& status,
+                                         const arrow::Status& failure) {
+    if (failures == 1) {
+      EXPECT_EQ(status.ToString(), failure.ToString());
+    } else {
+      EXPECT_TRUE(status.IsOutOfMemory()) << status.ToString();
+    }
+  };
+  MemoryBudget budget(std::nullopt);
+  bool fired = false;
+  {
+    const std::vector<std::shared_ptr<const JoinBuildPart>> parts =
+        MakeParts(input, spec, &budget);
+    auto builder = JoinTableBuilder::Make(spec, kParts, executor, kThreads, &budget);
+    EXPECT_TRUE(builder.ok()) << builder.status().ToString();
+    if (!builder.ok()) {
+      return false;
+    }
+    std::optional<arrow::Status> failure;
+    for (std::size_t i = 0; i < order.size(); ++i) {
+      const auto part = static_cast<int64_t>(order[i]);
+      arrow::Status added;
+      if (i == armed) {
+        const FailAllocations fail(skip, failures);
+        added = (*builder)->Add(part, parts[order[i]]);
+        fired = fail.failed() > 0;
+      } else {
+        added = (*builder)->Add(part, parts[order[i]]);
+      }
+      if (failure.has_value()) {
+        expect_failure(added, *failure);
+      } else if (!added.ok()) {
+        EXPECT_TRUE(fired) << added.ToString();
+        EXPECT_TRUE(added.IsOutOfMemory()) << added.ToString();
+        failure = added;
+      }
+    }
+    if (failure.has_value()) {
+      expect_failure((*builder)->Merged(), *failure);
+      expect_failure((*builder)->Finish().status(), *failure);
+    } else {
+      auto table = (*builder)->Finish();
+      EXPECT_TRUE(table.ok()) << table.status().ToString();
+      if (table.ok()) {
+        EXPECT_EQ(SnapshotOf(**table, hashed), reference);
+      }
+    }
+  }
+  EXPECT_EQ(budget.bytes_allocated(), 0);
+  return fired;
+}
+
 // An allocation that fails in an Add, each in turn (in Release, in the partition lanes, in a merge
 // on this thread, in Arrow's Submit): that Add returns OutOfMemory, and every later Add, Merged()
 // and Finish() returns the same failure, so that no part is released again and nothing is counted
-// twice; an Add that goes through leaves the table an untouched build makes. Nothing is left in
-// the budget.
+// twice; an Add that goes through leaves the table an untouched build makes. With two failing in a
+// row (the second while the first is handled, as when its OutOfMemory is made, so that Release
+// throws once it has counted its part), the build fails for good too: every later call fails with
+// OutOfMemory. Nothing is left in the budget.
 TEST_F(JoinTableBadAllocTest, AnAddThatRunsOutOfMemoryFailsTheBuild) {
   const auto pool = StartedPool();
   UnhookedSpawns spawns(pool.get());
@@ -715,53 +777,16 @@ TEST_F(JoinTableBadAllocTest, AnAddThatRunsOutOfMemoryFailsTheBuild) {
       SCOPED_TRACE(executor == nullptr ? "here" : "pool");
       for (const std::vector<std::size_t>& order : Orders()) {
         for (std::size_t armed = 0; armed < order.size(); ++armed) {
-          SCOPED_TRACE(::testing::Message() << "order " << order[0] << ", Add #" << armed);
-          Sweep(
-              [&](std::int64_t skip) {
-                MemoryBudget budget(std::nullopt);
-                bool fired = false;
-                {
-                  const std::vector<std::shared_ptr<const JoinBuildPart>> parts =
-                      MakeParts(input, *spec, &budget);
-                  auto builder = JoinTableBuilder::Make(*spec, kParts, executor, kThreads, &budget);
-                  EXPECT_TRUE(builder.ok()) << builder.status().ToString();
-                  if (!builder.ok()) {
-                    return false;
-                  }
-                  std::optional<arrow::Status> failure;
-                  for (std::size_t i = 0; i < order.size(); ++i) {
-                    const auto part = static_cast<int64_t>(order[i]);
-                    arrow::Status added;
-                    if (i == armed) {
-                      const FailAllocations fail(skip);
-                      added = (*builder)->Add(part, parts[order[i]]);
-                      fired = fail.failed() > 0;
-                    } else {
-                      added = (*builder)->Add(part, parts[order[i]]);
-                    }
-                    if (failure.has_value()) {
-                      EXPECT_EQ(added.ToString(), failure->ToString()) << part;
-                    } else if (!added.ok()) {
-                      EXPECT_TRUE(fired) << added.ToString();
-                      EXPECT_TRUE(added.IsOutOfMemory()) << added.ToString();
-                      failure = added;
-                    }
-                  }
-                  if (failure.has_value()) {
-                    EXPECT_EQ((*builder)->Merged().ToString(), failure->ToString());
-                    EXPECT_EQ((*builder)->Finish().status().ToString(), failure->ToString());
-                  } else {
-                    auto table = (*builder)->Finish();
-                    EXPECT_TRUE(table.ok()) << table.status().ToString();
-                    if (table.ok()) {
-                      EXPECT_EQ(SnapshotOf(**table, hashed), *reference);
-                    }
-                  }
-                }
-                EXPECT_EQ(budget.bytes_allocated(), 0);
-                return fired;
-              },
-              Releases(order, armed));
+          for (const std::int64_t failures : {1, 2}) {
+            SCOPED_TRACE(::testing::Message() << "order " << order[0] << ", Add #" << armed
+                                              << ", " << failures << " failing");
+            Sweep(
+                [&](std::int64_t skip) {
+                  return AddParts(input, *spec, *reference, hashed, executor, order, armed,
+                                  failures, skip);
+                },
+                Releases(order, armed));
+          }
         }
       }
     }

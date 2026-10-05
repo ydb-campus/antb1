@@ -325,7 +325,9 @@ class JoinTableBuilder {
   int64_t min_key_ = 0;  // over the released parts with rows (a direct candidate)
   int64_t max_key_ = 0;
   bool finished_ = false;
-  arrow::Status failed_;      // the build's failure: the merges', else a failed release's
+  arrow::Status failed_;  // the build's failure: the merges', else a failed release's
+  // The failure of a release that std::bad_alloc cuts short, made ahead: nothing to allocate then.
+  arrow::Status out_of_memory_;
   MemoryReservation memory_;  // parts_
   // Per partition, its runs of rows in part order; each partition is written by its lane only.
   JoinTable::Segments segments_;
