@@ -15,8 +15,22 @@
 //                every subcommand that reads the tables file runs redacted, as with --redact,
 //                and `diff --list` and `complete`, which print or write values, are refused.
 //                --show-values lifts the redaction for local runs (never on GitHub Actions).
+//   ref=<column>[+<column>...]:<table>.<column>[+<column>...]
+//                the table's columns reference those of a table of the same file (itself too),
+//                pairwise: a foreign key, a hint for generated joins (roadmap PR T1) and not a
+//                constraint, so NULL and dangling keys are intended. Repeatable. Names are plain
+//                identifiers; the table is found ASCII case-insensitively, also on a later line.
+//                LoadTables reads no Parquet file: metamorphic.TablesTxt.RefsJoinColumnsOfOneKind
+//                checks the columns. The engines and the query generator ignore refs until T1.
 
 namespace antb1::slt {
+
+// A ref= option: `columns` of the declaring table reference `ref_columns` of `table`, pairwise.
+struct ForeignKey {
+  std::vector<std::string> columns;      // of the declaring table, as written
+  std::string table;                     // the referenced table, as its own line spells it
+  std::vector<std::string> ref_columns;  // of that table, as written
+};
 
 struct TableDef {
   std::string name;
@@ -24,6 +38,7 @@ struct TableDef {
   std::vector<std::string> patterns;  // absolute paths as written (globs not expanded)
   bool clickbench = false;
   bool redact = false;
+  std::vector<ForeignKey> refs;  // the ref= options, in their order
 };
 
 std::expected<std::vector<TableDef>, std::string> LoadTables(

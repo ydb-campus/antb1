@@ -1,10 +1,11 @@
 // Tables files (runner/tables.h): files relative to the fixtures directory, globs, and the
-// clickbench and redact options.
+// clickbench, redact and ref= options.
 
 #include "tables.h"
 
 #include <expected>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <string>
 #include <string_view>
@@ -79,7 +80,7 @@ TEST_F(Tables, FilesGlobsAndOptions) {
 TEST_F(Tables, Errors) {
   EXPECT_TRUE(Load("t a.parquet hidden\n")
                   .error()
-                  .ends_with(":1: unknown option 'hidden' (known: clickbench, redact)"));
+                  .ends_with(":1: unknown option 'hidden' (known: clickbench, redact, ref=)"));
   EXPECT_TRUE(Load("t a.parquet\nT b1.parquet\n").error().ends_with(":2: duplicate table 'T'"));
   EXPECT_TRUE(
       Load("t\n").error().ends_with(":1: expected '<name> <file>[,<file>...] [option...]'"));
@@ -89,6 +90,69 @@ TEST_F(Tables, Errors) {
       << missing;
   EXPECT_TRUE(missing.contains("fixtures.generate")) << missing;
   EXPECT_TRUE(missing.contains("fixtures.tpch")) << missing;
+}
+
+bool SameKey(const ForeignKey& key, const std::vector<std::string>& columns, std::string_view table,
+             const std::vector<std::string>& ref_columns) {
+  return key.columns == columns && key.table == table && key.ref_columns == ref_columns;
+}
+
+TEST_F(Tables, RefOptions) {
+  // A forward reference (t to u), a self-reference (u.p), a two-column key, tables found in any
+  // case and stored as their lines spell them, columns kept as written; refs stay in order.
+  const auto tables = Load(
+      "t   a.parquet  ref=Uid:U.id  redact  ref=uid+day:u.id+Day\n"
+      "u   b1.parquet ref=p:U.id ref=id:T.tid\n"
+      "v   b2.parquet\n");
+  ASSERT_TRUE(tables.has_value()) << tables.error();
+  ASSERT_EQ(tables->size(), 3U);
+  const TableDef& t = (*tables)[0];
+  EXPECT_TRUE(t.redact);
+  ASSERT_EQ(t.refs.size(), 2U);
+  EXPECT_TRUE(SameKey(t.refs[0], {"Uid"}, "u", {"id"}));
+  EXPECT_TRUE(SameKey(t.refs[1], {"uid", "day"}, "u", {"id", "Day"}));
+  const TableDef& u = (*tables)[1];
+  ASSERT_EQ(u.refs.size(), 2U);
+  EXPECT_TRUE(SameKey(u.refs[0], {"p"}, "u", {"id"}));
+  EXPECT_TRUE(SameKey(u.refs[1], {"id"}, "t", {"tid"}));
+  EXPECT_TRUE((*tables)[2].refs.empty());
+}
+
+TEST_F(Tables, RefErrors) {
+  const std::string syntax =
+      "': expected ref=<column>[+<column>...]:<table>.<column>[+<column>...]";
+  for (const std::string_view option :
+       {"ref=", "ref=x", "ref=x:u", "ref=x.u:y", "ref=:u.y", "ref=x:.y", "ref=x:u.", "ref=x+:u.y",
+        "ref=x:u.y+", "ref=x++z:u.y+w", "ref=1x:u.y", "ref=x:u-v.y", "ref=x:u.y.z", "ref=x:u.y:z",
+        "ref=\"x\":u.y"}) {
+    const auto loaded = Load(std::format("u b1.parquet\nt a.parquet {}\n", option));
+    ASSERT_FALSE(loaded.has_value()) << option;
+    EXPECT_TRUE(loaded.error().ends_with(std::format(":2: ref option '{}{}", option, syntax)))
+        << loaded.error();
+  }
+  EXPECT_TRUE(Load("t a.parquet ref=x+z:t.y\n")
+                  .error()
+                  .ends_with(":1: ref option 'ref=x+z:t.y': 2 column(s) reference 1"));
+  EXPECT_TRUE(Load("t a.parquet ref=x:t.y+z\n")
+                  .error()
+                  .ends_with(":1: ref option 'ref=x:t.y+z': 1 column(s) reference 2"));
+  EXPECT_TRUE(Load("t a.parquet ref=x+X:t.y+z\n")
+                  .error()
+                  .ends_with(":1: ref option 'ref=x+X:t.y+z': column 'X' repeats"));
+  EXPECT_TRUE(Load("t a.parquet ref=x+z:t.y+Y\n")
+                  .error()
+                  .ends_with(":1: ref option 'ref=x+z:t.y+Y': column 'Y' repeats"));
+  // The same key, in other cases: a duplicate (another target is not).
+  EXPECT_TRUE(Load("t a.parquet ref=x:t.y ref=x:u.y ref=X:T.Y\n")
+                  .error()
+                  .ends_with(":1: duplicate ref option 'ref=X:T.Y'"));
+  // An unknown table is reported at its option once every line is read.
+  EXPECT_TRUE(Load("t a.parquet\nu b1.parquet ref=y:t.x ref=y:w.x\nv b2.parquet\n")
+                  .error()
+                  .ends_with(":2: ref option 'ref=y:w.x': no table 'w' in tables.txt"));
+  EXPECT_TRUE(Load("t a.parquet ref=y:tt.x\n")
+                  .error()
+                  .ends_with(":1: ref option 'ref=y:tt.x': no table 'tt' in tables.txt"));
 }
 
 }  // namespace
