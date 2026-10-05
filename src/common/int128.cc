@@ -56,7 +56,8 @@ constexpr std::array<Int128, kMaxPowerOfTen + 1> kPowersOfTen = [] {
 }  // namespace
 
 Int128 PowerOfTen(int n) {
-  ANTB1_CHECK(n >= 0 && n <= kMaxPowerOfTen);
+  ANTB1_CHECK(n >= 0);
+  ANTB1_CHECK(n <= kMaxPowerOfTen);
   return kPowersOfTen.at(static_cast<std::size_t>(n));
 }
 

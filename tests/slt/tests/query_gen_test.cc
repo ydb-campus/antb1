@@ -217,8 +217,6 @@ TEST(QueryGenerator, QueriesRespectTheSemanticsBothEnginesShare) {
               : 0;
       decimal_double_comparisons += std::regex_search(sql, double_comparison) ? 1 : 0;
       decimal_double_lists += std::regex_search(sql, double_list) ? 1 : 0;
-      if (sql.find(" in") != std::string::npos) {
-      }
     }
     static const std::regex long_fraction(R"re(\.[0-9]{11})re");
     EXPECT_FALSE(std::regex_search(sql, long_fraction)) << q.sql;

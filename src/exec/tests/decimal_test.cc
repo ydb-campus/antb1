@@ -48,6 +48,7 @@ std::shared_ptr<arrow::Array> Doubles(const std::vector<std::optional<double>>& 
 std::vector<std::optional<bool>> BoolValues(const arrow::Array& array) {
   const auto& bools = static_cast<const arrow::BooleanArray&>(array);
   std::vector<std::optional<bool>> out;
+  out.reserve(static_cast<std::size_t>(bools.length()));
   for (int64_t i = 0; i < bools.length(); ++i) {
     out.push_back(bools.IsNull(i) ? std::nullopt : std::optional(bools.Value(i)));
   }
@@ -124,7 +125,7 @@ TEST_F(DecimalTest, DecimalToDoubleIsDuckDbsConversion) {
 // cast, also beyond 38 digits where DuckDB fails (divergence D13) and at the Int128 extremes a
 // file can hold; NULL gives NULL.
 TEST_F(DecimalTest, CompareExactIsExactAcrossScalesAndIntegers) {
-  const auto pool = arrow::default_memory_pool();
+  auto* const pool = arrow::default_memory_pool();
   const auto compare = [&](const arrow::Array& l, const arrow::Array& r, CompareOp op) {
     auto result = CompareExact(l, r, op, pool);
     EXPECT_TRUE(result.ok()) << result.status().ToString();
