@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791177751954,
+  "lastUpdate": 1791185828607,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -4824,6 +4824,90 @@ window.BENCHMARK_DATA = {
             "value": 14.744367425531712,
             "unit": "ms/iter",
             "extra": "iterations: 47\ncpu: 14.743368170212769 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c59a1a06fbd105c9f6ce96ba002bfd09b612f9ac",
+          "message": "feat(plan,exec): decimal case values and modulo beyond 38 digits (#94)\n\n## Summary\n\nDECIMAL `CASE` values and `%` beyond 38 digits now work as in DuckDB\n1.5.5. This is PR **D4c** of the roadmap for the queries derived from\nTPC-H (types track, [ADR 0021](docs/adr/0021-decimal-semantics.md) rule\n10 for CASE values and rule 9's `%` beyond 38 digits), the last slice of\nD4 after #91 and #93. With it every DECIMAL rule of ADR 0021 is in place\nexcept the deferred decimal64. No query flips: Q1 and Q6 still pass and\nthe other 20 still exit 4, so `tests/data/tpch_status.json` is\nunchanged.\n\n**CASE typing** (every rule probed with DuckDB's `typeof`; 45 type cases\nin `plan.BinderTest.DecimalCaseValuesFoldLikeDuckDb` all equal\nDuckDB's):\n\n- With a DECIMAL value, antb1 folds the types as DuckDB does: from the\n`ELSE` value's type (NULL without an `ELSE`) through the `THEN` values\nin written order, so the order of the values can change the type.\n- Two DECIMALs give the larger scale s and the most integer digits e:\nDECIMAL(e + s, s), or DECIMAL(38, 38 - e) beyond 38 digits, the values\nrounded half away from zero.\n- A DECIMAL and an integer keep the DECIMAL's scale and widen to the\ninteger's digits (5, 10, 19 or 38), up to 38; an integer value that does\nnot fit then fails with DuckDB's conversion error, on the rows that take\nit.\n- An integer literal (negated too: `-(7)`, `- - 7`; not `1 + 1` or `7 +\n0`) takes an integer type it fits, else the two types' common one\n(SMALLINT with USMALLINT: INTEGER), becomes its own type next to NULL or\nanother literal, and counts as its own type (INTEGER) next to a DECIMAL.\nSo with a DECIMAL(9,4) `r` and a SMALLINT `s16`, `THEN 7 WHEN .. THEN r\nELSE s16` is DECIMAL(9,4) but `THEN r WHEN .. THEN 7 ELSE s16`\nDECIMAL(14,4).\n- A string literal is VARCHAR next to NULL (the first `THEN` value\nwithout an `ELSE`) or another literal, so `THEN 'a' WHEN .. THEN p END`\nis a bind error, as in DuckDB; otherwise (an `ELSE` literal too) it\ntakes the type folded next, and one that a DECIMAL type takes (`THEN p\nELSE '5'`) stays exit 4 (DuckDB casts it). A DATE, TIMESTAMP or VARCHAR\nvalue with a DECIMAL is a bind error with the types in fold order; a\nFLOAT column stays exit 4 (D11).\n- A DOUBLE value makes the CASE DOUBLE, in any position, as before.\n\n**Execution:**\n\n- `CastToDecimal` (new, `src/exec/decimal.h`): an integer or DECIMAL\narray cast to exactly decimal128(p,s), rescaled with the new `Rescale`\n(`src/common/int128.h`: up exactly, down with DuckDB's\nhalf-away-from-zero rounding). A value that does not fit fails with\nDuckDB's message, which names the column only for a column reference (an\naggregate's output and a key included). The message code is now shared\nwith the arithmetic's rescale (`DecimalCastError`).\n- The executor's `CASE` casts each value on its branch's rows only\n(`EvaluateSelected` now takes the logical target type), so a row that no\nbranch gives the value never fails.\n- `%` beyond 38 digits is DOUBLE: `fmod` of the operands converted by\nrule 8 (a HUGEINT through DuckDB's 128-bit formula), with the dividend's\nsign (`-0`), NULL for a zero divisor where neither operand is DOUBLE.\n\n**Tests:**\n\n- **common:** `Rescale` (±.5 at several scales, 38-digit steps, the\nInt128 extremes, overflow).\n- **plan:**\n- the fold table above (ADR examples, value orders, literals, beyond 38\ndigits, DOUBLE positions);\n  - the error rows (types in fold order, string literals, FLOAT);\n  - `%` types beyond 38 digits;\n  - five former exit-4 rows flipped;\n  - `CaseTypesWithoutADecimalAreAntb1s` pins the D20 forms.\n- **exec:** `DecimalCaseValuesCastToTheCaseType` (exact output type,\nrounding to a new digit, integer and HUGEINT messages with and without a\ncolumn, untaken rows, a value beyond its declared width) and\n`DecimalModuloBeyond38DigitsIsDouble` (NULL vs NaN, -0.0, BIGINT and\nHUGEINT operands).\n- **slt:**\n- the new `tests/slt/cases/types/decimal_case.slt` (15 records, expected\nblocks from `pixi run slt-complete`, also at 4 threads). It covers\nscales, rounding beyond 38 digits, integers, literal order, an\norder-dependent type with its failing twin, untaken rows, the\nVARCHAR-first bind error, conditions, keys, SUM, and `%` beyond 38\ndigits with NULL and -0;\n  - two `decimal_literals.slt` records lose `onlyif duckdb`.\n- **generator:**\n- DECIMAL columns get CASE values: the column first, then other DECIMAL\nand integer columns, integer literals and short decimal literals, typed\nby a model of DuckDB's fold;\n- a value is dropped when its cast could fail, and, as an aggregate's\nargument, when it would change the column's scale or let the sum leave\n38 digits (D18);\n  - `%` beyond 38 digits only as a plain select item;\n- every new draw is taken where a DECIMAL column is used, so\n`diff.random` is unchanged (checked: the same 300 queries as main's\ngenerator for its seed and tables), and `diff.decimal` and `diff.tpch`\nchange by design;\n- new test `DecimalCaseValuesNeverFailToCast`; the \"no DECIMAL CASE\" and\n\"no wide %\" checks became counters.\n\n**Docs:**\n\n- `docs/sql-subset.md`: arithmetic (`%` beyond 38), the CASE rules,\nDECIMAL semantics (the D4c exit-4 items are gone) and the exit-code\ntable.\n- Divergences: D16 (a CASE value's failed cast in a condition), D19\n(CASE cast errors; the column a message names), new D20 (CASE types\nwithout a DECIMAL value).\n- ADR 0021 rule 10 (fold order, literal rules, SMALLINT ⊔ USMALLINT);\n`docs/architecture.md` (Compute); `tests/slt/README.md`.\n- `logical_plan.h` comments on `ArithExpr` and `CaseExpr`.\n\nFor the maintainer:\n\n- **Differences from the approved plan:**\n- Step 0's last probe: DuckDB range-checks the CASE cast of a value\nbeyond its declared width exactly as antb1 does, with the same messages;\na widening that fits answers alike. Probed with a Parquet file that a\ntemporary, uncommitted test wrote;\n`exec.ComputeTest.DecimalCaseValuesCastToTheCaseType` pins antb1's side.\n- The plan's string-literal rule (\"first in fold order, it is VARCHAR\")\nis refined by probing: an `ELSE` literal keeps its literal status and\ntakes the next value's type (`THEN p ELSE '5'` is DECIMAL in DuckDB,\nexit 4 here); only a literal next to NULL (the first `THEN` value\nwithout an `ELSE`) or next to another literal becomes VARCHAR, or its\nown integer type.\n- The generator picks another column for 60% of the extra CASE values,\nso DECIMAL/DECIMAL and DECIMAL/integer pairs come up often.\n- The branch merges main after #93 (no rebase); the merge keeps this\nbranch's side, as main's tree equals D4b's head.\n- **New divergence D20,** as you chose in the plan: without a DECIMAL\nvalue antb1 keeps its CASE typing, which differs from DuckDB's fold in\nfive forms (probed):\n- `THEN 7 WHEN .. THEN s16 END` and `THEN 8 WHEN .. THEN s16 ELSE 7` are\nSMALLINT, DuckDB's INTEGER;\n  - `THEN -(7) ELSE s16` is INTEGER, DuckDB's SMALLINT;\n- `THEN '2020-01-01' WHEN .. THEN dt END` is DATE, a bind error in\nDuckDB;\n  - `THEN 'a' WHEN .. THEN s16 END` is exit 4, a bind error in DuckDB.\nThe generator writes the column first, where both agree. A separate\nfix(plan) PR can remove D20 if you want one.\n- **Breaking-change label:** none. Only queries that exited 4 now\nanswer.\n- **Size:** L (19 files, about 1,460 changed lines; about 800 of them\ntests and `.slt`).\n\nThis workload is derived from the TPC-H Benchmark and is not comparable\nto published TPC-H Benchmark results, as this implementation does not\ncomply with all requirements of the TPC-H Benchmark.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full                  # on ccb1bd9 (the head)\nlint: PASS\n100% tests passed out of 1811          # ci (clang Debug -Werror)\n100% tests passed out of 1811          # asan (ASan + UBSan)\n                                       # tidy: clean\ncoverage: PASS\n100% tests passed out of 2             # fuzz-smoke\n100% tests passed out of 1811          # ci-gcc\n$ ANTB1_DIFF_SEED=<1..6> ANTB1_DIFF_COUNT=5000 pixi run diff-random --table decimals --target-percent 50   # on daba883 (code unchanged since)\nDIFF: PASS seed=1 queries=5000 failed=0 unsupported=0   # likewise seeds 2 to 6\n$ ANTB1_DIFF_SEED=<11,12> ANTB1_DIFF_COUNT=20000 pixi run diff-random   # on 859366d (before daba883, which only restructures two conditionals)\nDIFF: PASS seed=11 queries=20000 failed=0 unsupported=0   # likewise seed 12\n$ ANTB1_DIFF_SEED=20260925 ANTB1_DIFF_COUNT=300 pixi run diff-random --list <diff.random's seven tables>   # main's generator vs this branch\nidentical\n$ pixi run test-data                   # ClickBench, redacted; on daba883\n100% tests passed out of 6             # data.clickbench.status: 43/43\n# tpch.status.* pass in every leg above (redacted: Q1 pass, Q6 pass, 20 unsupported); tpch_status.json unchanged\n```\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: ADR 0021 rule 10, as listed in the approved plan\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code implemented the\nmaintainer-approved plan (DuckDB's CASE fold for DECIMAL values, its\nDECIMAL cast and rounding, `%` beyond 38 digits, the generator, tests\nand docs) after probing DuckDB 1.5.5 for types, values and error texts,\nincluding a probe with a Parquet file of values beyond their declared\nwidth. The reviewer agent then reviewed the final diff, comparing about\n110 hand-written and 508 random CASE types and about 480 CASE values\nwith DuckDB: no P0, and its P1 (the docs' wording of the string-literal\nrule and the ADR's widening formula) is fixed in ccb1bd9. The clang-tidy\nfindings are fixed in daba883.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-10-05T10:34:20+03:00",
+          "tree_id": "065b86b02a61f9d9de9caf1423224d23138f36a7",
+          "url": "https://github.com/ydb-campus/antb1/commit/c59a1a06fbd105c9f6ce96ba002bfd09b612f9ac"
+        },
+        "date": 1791185827846,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4642.4554126480725,
+            "unit": "ns/iter",
+            "extra": "iterations: 151691\ncpu: 4641.973155955198 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84328.01581477719,
+            "unit": "ns/iter",
+            "extra": "iterations: 7904\ncpu: 84326.68319838058 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 221985.7138334976,
+            "unit": "ns/iter",
+            "extra": "iterations: 3159\ncpu: 221961.91041468826 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 439587.00964631315,
+            "unit": "ns/iter",
+            "extra": "iterations: 1555\ncpu: 439567.66623794235 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 360858.99742135184,
+            "unit": "ns/iter",
+            "extra": "iterations: 1939\ncpu: 360799.8091799897 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2077316.9792284747,
+            "unit": "ns/iter",
+            "extra": "iterations: 337\ncpu: 2077086.860534125 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 51.48664076922999,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 51.47787815384619 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 44.873759600000085,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 44.871945466666695 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 184.86618800000088,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 184.83785750000027 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.803518872340307,
+            "unit": "ms/iter",
+            "extra": "iterations: 47\ncpu: 14.803312659574484 ms\nthreads: 1"
           }
         ]
       }
