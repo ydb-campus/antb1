@@ -193,7 +193,8 @@ SELECT COUNT(*) FROM trips WHERE tr_driver IN (SELECT dv_id FROM drivers JOIN ci
 ----
 1216
 
-# A CTE inside the subquery (roadmap PR J4): the rider rows of the riders with 13 trips or more, repeated keys twice.
+# A CTE referenced inside the subquery (roadmap PR J4): the rider rows of the riders with 13 trips or
+# more, repeated keys twice.
 pending J5
 query II nosort
 WITH busy AS (SELECT tr_rider AS rider FROM trips GROUP BY tr_rider HAVING COUNT(*) >= 13)

@@ -125,7 +125,7 @@ SELECT COUNT(*), SUM(a.n), SUM(b.n) FROM per_zone AS a, per_zone AS b WHERE a.zo
 ----
 42	2931	2930
 
-# A CTE inside a scalar subquery (roadmap PR J5).
+# A CTE referenced inside a scalar subquery (roadmap PR J5).
 pending J5
 query ID nosort
 WITH per_zone AS (SELECT tr_pickup AS zone, SUM(tr_fare) AS fares FROM trips GROUP BY tr_pickup)
