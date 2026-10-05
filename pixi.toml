@@ -206,6 +206,7 @@ actionlint = "1.7.*"
 shellcheck = "0.11.*"
 zizmor = "1.30.*"
 markdownlint-cli2 = "0.23.*"
+nodejs = ">=22"               # markdownlint-cli2 0.23 needs Node >=22; its conda package allows any nodejs
 tombi = "1.5.*"
 
 # ---- env `lint` ----

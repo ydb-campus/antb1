@@ -97,7 +97,7 @@ trailing spaces. `I`, `D` and `T` compare exactly; `R` compares with relative to
 
 DuckDB runs in memory through its C API with `threads=1`, no extension autoinstall or autoload, file
 access limited to the fixtures directory, temp files under `build/`, its `late_materialization` optimizer
-off, and a locked configuration. With the optimizer on, DuckDB 1.5.5 fails some filtered `LIMIT ... OFFSET`
+off, and a locked configuration. With the optimizer on, DuckDB 1.5.5 and 1.5.6 fail some filtered `LIMIT ... OFFSET`
 queries with an internal error (`where/pushdown.slt`). With it off, DuckDB computes the select list of a
 small `ORDER BY ... LIMIT` for every row the `WHERE` keeps, as antb1 does, so an overflow there fails in both
 engines; only the order of tied rows at the edge of a `LIMIT` can differ, and every comparison accepts that.

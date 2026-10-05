@@ -86,7 +86,7 @@ SELECT RegionID, Title, URL FROM hits_like_nulls WHERE Title LIKE '%o%' AND User
 0	cloud alpha	https://www.example.org/alpha/3032?q=pixel
 
 # A scan filter that leaves nothing to scan, a computed condition on two other columns and an OFFSET:
-# DuckDB 1.5.5 fails this with an internal error unless its late_materialization optimizer is off, as
+# DuckDB 1.5.5 and 1.5.6 fail this with an internal error unless its late_materialization optimizer is off, as
 # it is in the oracle (tests/slt/runner/duckdb_engine.cc).
 query I nosort
 SELECT ResolutionWidth FROM hits_like WHERE RegionID < 0 AND (ResolutionWidth > 0 OR ResolutionHeight > 0) LIMIT 1 OFFSET 0
