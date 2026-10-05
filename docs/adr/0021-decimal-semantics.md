@@ -30,10 +30,10 @@ Proposed
   class R, compared within a relative 1e-9, and names its type a bare `DECIMAL`
   (`tests/slt/runner/duckdb_engine.cc`). On a value with ten integer digits that tolerance is at least one whole
   unit, a hundred cents, and a wrong width or scale passes as well.
-- **DuckDB's rules are its own.** The oracle is DuckDB 1.5.5, the locked libduckdb. Its DECIMAL typing is neither the
+- **DuckDB's rules are its own.** The oracle is the locked libduckdb, DuckDB 1.5.6. Its DECIMAL typing is neither the
   SQL standard's nor Arrow's: widths are capped at 18 digits while every input has at most 18 digits, division gives
   DOUBLE, and CASE and comparisons take different common types. Every rule below was probed with DuckDB 1.5.5 on our
-  own data, and its formulas were read in DuckDB's source.
+  own data (1.5.6 gives the same types, values and messages), and its formulas were read in DuckDB's source.
 - **Storage:**
   - Arrow reads a Parquet DECIMAL with p ≤ 38 (INT32, INT64, FIXED_LEN_BYTE_ARRAY or BYTE_ARRAY) as decimal128(p,s)
     by default, and DuckDB reads all four as DECIMAL(p,s). Reading the smallest type (decimal32 for p ≤ 9, decimal64
@@ -48,8 +48,9 @@ Proposed
 
 ## Decision
 
-antb1 follows DuckDB 1.5.5 for DECIMAL. In the rules, p is the width (precision) and s the scale. The examples use a
-table of our own: `price` and `qty` DECIMAL(15,2), `rate` DECIMAL(5,3), `n` INTEGER, `b` BIGINT and `d` DOUBLE.
+antb1 follows DuckDB 1.5.5 and 1.5.6 (they agree) for DECIMAL. In the rules, p is the width (precision) and s the
+scale. The examples use a table of our own: `price` and `qty` DECIMAL(15,2), `rate` DECIMAL(5,3), `n` INTEGER,
+`b` BIGINT and `d` DOUBLE.
 
 This amends ADR 0012's list of unsupported constructs and three points of ADR 0004; both ADRs keep their status:
 
