@@ -83,8 +83,8 @@ struct FixtureFile {
   int row_groups = 0;
 };
 
-// Writes every fixture into dir (created if needed; the Parquet files already in its
-// subdirectories are removed first):
+// Writes every fixture into dir (created if needed; the Parquet files already in hits_like_split/
+// and star/ are removed first, other files stay):
 //   hits_like.parquet               10,000 rows in 4 row groups, the partitioned hits schema
 //   hits_like_nulls.parquet         the same rows with NULLs sprinkled
 //   hits_like_split/part-N.parquet  the same rows in 4 files (1000/3000/2500/3500 rows)
