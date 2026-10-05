@@ -46,6 +46,7 @@ using testing::Int16s;
 using testing::Int32s;
 using testing::Int64s;
 using testing::Strings;
+using testing::ThrowingExecutor;
 using testing::Timestamps;
 using testing::UInt16s;
 
@@ -1248,6 +1249,52 @@ TEST_F(JoinTableTest, RunsOutOfMemoryCleanly) {
         expect_oom(status);
         ASSERT_LT(limit, 1024 * 1024);
       }
+    }
+  }
+}
+
+// A part that cannot be handed to the partitions (std::bad_alloc from the executor's Submit) fails
+// the build with OutOfMemory, whichever parts came before it: every later Add returns that failure,
+// in or out of order, and so do Merged() and Finish() (never a part "not added"); nothing is left
+// in the budget once the builder and the parts go.
+TEST_F(JoinTableTest, AFailedReleaseFailsTheBuild) {
+  const auto pool = MakeThreadPool();
+  for (const bool hashed : {false, true}) {
+    SCOPED_TRACE(hashed);
+    const BuildData data = ManyParts(4, hashed);
+    auto spec = JoinBuildSpec::Make(data.schema(), data.keys());
+    ASSERT_TRUE(spec.ok());
+    for (const std::vector<std::size_t>& order :
+         {std::vector<std::size_t>{0, 1, 2, 3}, std::vector<std::size_t>{2, 3, 0, 1}}) {
+      MemoryBudget budget(std::nullopt);
+      {
+        auto parts = MakeParts(data, *spec, &budget, &budget);
+        ASSERT_TRUE(parts.ok()) << parts.status().ToString();
+        // Part 0 is the first released: every lane is idle and gets a task, and lane 5's throws.
+        ThrowingExecutor executor(pool.get(), /*throw_at=*/5);
+        auto builder = JoinTableBuilder::Make(*spec, 4, &executor, kThreads, &budget);
+        ASSERT_TRUE(builder.ok()) << builder.status().ToString();
+        std::optional<arrow::Status> failure;
+        for (const std::size_t part : order) {
+          const arrow::Status added = (*builder)->Add(static_cast<int64_t>(part), (*parts)[part]);
+          if (failure.has_value()) {
+            EXPECT_EQ(added.ToString(), failure->ToString()) << part;
+          } else if (part == 0) {
+            EXPECT_TRUE(added.IsOutOfMemory()) << added.ToString();
+            failure = added;
+          } else {
+            EXPECT_TRUE(added.ok()) << added.ToString();  // nothing released yet
+          }
+        }
+        ASSERT_TRUE(failure.has_value());
+        EXPECT_EQ((*builder)->Merged().ToString(), failure->ToString());
+        EXPECT_EQ((*builder)->Finish().status().ToString(), failure->ToString());
+        // Part 0's tasks only: no later part was released, and no table built.
+        EXPECT_EQ(executor.spawns(), static_cast<int>(kJoinPartitions));
+        builder->reset();
+        parts->clear();
+      }
+      EXPECT_EQ(budget.bytes_allocated(), 0);
     }
   }
 }

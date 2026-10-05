@@ -841,36 +841,44 @@ arrow::Status JoinTableBuilder::Add(int64_t part, std::shared_ptr<const JoinBuil
       return arrow::Status::Invalid("join build part ", part, " added twice");
     }
     slot = std::move(rows);
-    while (next_part_ < num_parts_ && parts_[static_cast<std::size_t>(next_part_)] != nullptr) {
-      failed_ = Release(next_part_);
+    // A release that fails, std::bad_alloc included, still moves on to the next part and fails the
+    // build: no part is released twice, and every later call returns the failure.
+    while (failed_.ok() && next_part_ < num_parts_ &&
+           parts_[static_cast<std::size_t>(next_part_)] != nullptr) {
+      failed_ = NoBadAlloc("a join build", [this] { return Release(next_part_); });
       ++next_part_;
-      ARROW_RETURN_NOT_OK(failed_);
     }
-    return arrow::Status::OK();
+    return failed_;
   });
 }
 
 arrow::Status JoinTableBuilder::Release(int64_t part) {
-  const std::shared_ptr<const JoinBuildPart> rows = parts_[static_cast<std::size_t>(part)];
+  const std::shared_ptr<const JoinBuildPart>& rows = parts_[static_cast<std::size_t>(part)];
+  const std::uint64_t num_rows = num_rows_ + static_cast<std::uint64_t>(rows->num_rows_);
+  if (num_rows > kMaxRows) {
+    return TooManyRows();
+  }
+  // Every piece has a row: the chunks are no more than the rows.
+  const auto first_chunk = Narrow<std::uint32_t>(num_chunks_);
+  // The merge is made before anything changes: without memory for it, the build is as it was.
+  PartitionLanes::Merge merge;
+  if (!rows->pieces_.empty()) {
+    merge = [this, rows, first_chunk](std::size_t partition) {
+      return Merge(partition, *rows, first_chunk);
+    };
+  }
   if (rows->num_rows_ > 0) {
     min_key_ = num_rows_ == 0 ? rows->min_key_ : std::min(min_key_, rows->min_key_);
     max_key_ = num_rows_ == 0 ? rows->max_key_ : std::max(max_key_, rows->max_key_);
   }
-  num_rows_ += static_cast<std::uint64_t>(rows->num_rows_);
-  if (num_rows_ > kMaxRows) {
-    return TooManyRows();
-  }
+  num_rows_ = num_rows;
   input_rows_ += rows->input_rows_;
   null_key_rows_ += rows->null_key_rows_;
-  // Every piece has a row: the chunks are no more than the rows.
-  const auto first_chunk = Narrow<std::uint32_t>(num_chunks_);
   num_chunks_ += rows->pieces_.size();
-  if (rows->pieces_.empty()) {
+  if (!merge) {
     return arrow::Status::OK();
   }
-  return lanes_->Add(part, [this, rows, first_chunk](std::size_t partition) {
-    return Merge(partition, *rows, first_chunk);
-  });
+  return lanes_->Add(part, std::move(merge));
 }
 
 arrow::Status JoinTableBuilder::Merge(std::size_t partition, const JoinBuildPart& part,
