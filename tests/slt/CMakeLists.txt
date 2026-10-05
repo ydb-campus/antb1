@@ -138,32 +138,6 @@ foreach(kind IN LISTS _mutations)
   )
 endforeach()
 
-# The pending guard (tests/slt/README.md): slt.* and parallel.* skip a `pending <roadmap id>` record, which DuckDB
-# runs as usual. harness.slt.pending runs the pending records of every registered file on antb1, and fails with
-# "remove the guard (<id>)" when antb1 answers one with anything but Unsupported. Its self-tests make antb1 answer
-# the pending records of selftest/pending.slt, or fail them with an execution error, and the check must fail.
-get_property(_slt_files GLOBAL PROPERTY ANTB1_SLT_FILES)
-antb1_slt_args(_args harness.slt.pending)
-add_test(NAME harness.slt.pending COMMAND antb1-slt pending ${_args} ${_slt_files})
-set_tests_properties(
-  harness.slt.pending
-  PROPERTIES LABELS harness FIXTURES_REQUIRED antb1_fixtures TIMEOUT 300
-)
-foreach(kind IN ITEMS succeed error)
-  set(_name harness.slt.pending.mutate.${kind})
-  antb1_slt_args(_args ${_name} --mutate ${kind})
-  antb1_add_expect_test(
-    ${_name}
-    LABELS harness
-    FIXTURES_REQUIRED antb1_fixtures
-    REQUIRE
-      "FAIL .*pending\\.slt:[0-9]+: query I nosort \\[antb1\\]: remove the guard \\(Z9\\): "
-      "FAIL .*pending\\.slt:[0-9]+: statement error \\[antb1\\]: remove the guard \\(Z9\\): "
-      "PENDING: FAIL files=1 with_pending=1 records=2 unsupported=0 failed=2 by id: Z9=2"
-    COMMAND $<TARGET_FILE:antb1-slt> pending ${_args} "${CMAKE_CURRENT_SOURCE_DIR}/selftest/pending.slt"
-  )
-endforeach()
-
 # Redaction canary: a mismatch reported with --redact must not print the SQL text or any value (the
 # expected 10000, the mutated 100001), only ids, types, row counts and hashes.
 set(_name harness.slt.redact)
@@ -777,5 +751,32 @@ if(ANTB1_HAVE_DUCKDB)
     COMMAND $<TARGET_FILE:antb1-slt> complete ${_args} "${_complete_file}"
   )
 endif()
+
+# The pending guard (tests/slt/README.md): slt.* and parallel.* skip a `pending <roadmap id>` record, which DuckDB
+# runs as usual. harness.slt.pending runs the pending records of every registered file on antb1, and fails with
+# "remove the guard (<id>)" when antb1 answers one with anything but Unsupported. Like slt-complete, it reads the
+# registered files after the last antb1_add_slt_suite(), at the end of this file. Its self-tests make antb1 answer
+# the pending records of selftest/pending.slt, or fail them with an execution error, and the check must fail.
+get_property(_slt_files GLOBAL PROPERTY ANTB1_SLT_FILES)
+antb1_slt_args(_args harness.slt.pending)
+add_test(NAME harness.slt.pending COMMAND antb1-slt pending ${_args} ${_slt_files})
+set_tests_properties(
+  harness.slt.pending
+  PROPERTIES LABELS harness FIXTURES_REQUIRED antb1_fixtures TIMEOUT 300
+)
+foreach(kind IN ITEMS succeed error)
+  set(_name harness.slt.pending.mutate.${kind})
+  antb1_slt_args(_args ${_name} --mutate ${kind})
+  antb1_add_expect_test(
+    ${_name}
+    LABELS harness
+    FIXTURES_REQUIRED antb1_fixtures
+    REQUIRE
+      "FAIL .*pending\\.slt:[0-9]+: query I nosort \\[antb1\\]: remove the guard \\(Z9\\): "
+      "FAIL .*pending\\.slt:[0-9]+: statement error \\[antb1\\]: remove the guard \\(Z9\\): "
+      "PENDING: FAIL files=1 with_pending=1 records=2 unsupported=0 failed=2 by id: Z9=2"
+    COMMAND $<TARGET_FILE:antb1-slt> pending ${_args} "${CMAKE_CURRENT_SOURCE_DIR}/selftest/pending.slt"
+  )
+endforeach()
 
 antb1_add_slt_complete_target()
