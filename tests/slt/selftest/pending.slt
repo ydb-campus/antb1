@@ -1,0 +1,20 @@
+# The pending guard (tests/slt/README.md): DuckDB runs a `pending <roadmap id>` record as usual, the slt.* and
+# parallel.* tests skip it, and harness.slt.pending runs it on antb1, where it must still get Unsupported. Z9 is no
+# roadmap PR: these records use a window function, which antb1 does not answer (docs/sql-subset.md), so they stay
+# pending, and the self-tests harness.slt.pending.mutate.* make antb1 answer them, or fail them with an execution
+# error, which the check must report.
+
+query I nosort
+SELECT COUNT(*) FROM edge
+----
+12
+
+pending Z9
+query I nosort
+SELECT COUNT(*) OVER () FROM edge LIMIT 1
+----
+12
+
+pending Z9
+statement error
+SELECT COUNT(*) OVER () FROM no_such_table

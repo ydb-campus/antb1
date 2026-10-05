@@ -107,8 +107,8 @@ class Parser {
     while (i < lines.size()) {
       const std::string_view line = lines[i];
       if (IsBlank(line)) {
-        if (!pending_.skipif.empty() || !pending_.onlyif.empty()) {
-          return Error(i, "skipif/onlyif must be followed directly by a record");
+        if (HasConditions()) {
+          return Error(i, "skipif, onlyif and pending must be followed directly by a record");
         }
         ++i;
         continue;
@@ -126,7 +126,7 @@ class Parser {
       }
       i = *next;
     }
-    if (!pending_.skipif.empty() || !pending_.onlyif.empty() || pending_.tolerance.has_value()) {
+    if (HasConditions() || pending_.tolerance.has_value()) {
       return Error(lines.size() - 1,
                    "condition or '# tol' without a record at the end of the file");
     }
@@ -134,6 +134,11 @@ class Parser {
   }
 
  private:
+  // Whether skipif, onlyif or pending lines wait for their record.
+  [[nodiscard]] bool HasConditions() const {
+    return !pending_.skipif.empty() || !pending_.onlyif.empty() || !pending_.pending.empty();
+  }
+
   std::unexpected<std::string> Error(std::size_t index, std::string_view message) const {
     return std::unexpected(std::format("{}:{}: {}", file_.path, index + 1, message));
   }
@@ -162,6 +167,16 @@ class Parser {
         return Error(i, std::format("expected '{} antb1' or '{} duckdb'", word, word));
       }
       (word == "skipif" ? pending_.skipif : pending_.onlyif).emplace_back(words[1]);
+      return i + 1;
+    }
+    if (word == "pending") {
+      if (words.size() != 2 || !IsRoadmapId(words[1])) {
+        return Error(i, "expected 'pending <roadmap id>', such as 'pending J2b'");
+      }
+      if (!pending_.pending.empty()) {
+        return Error(i, "a record takes one 'pending' line");
+      }
+      pending_.pending = std::string(words[1]);
       return i + 1;
     }
     Record record = std::move(pending_);
@@ -223,6 +238,16 @@ class Parser {
         Trim(record.sql).empty()) {
       return Error(i, "record without SQL");
     }
+    if (!record.pending.empty()) {
+      if (record.kind == RecordKind::kHalt || record.kind == RecordKind::kHashThreshold) {
+        return Error(i, "'pending' must precede a statement or query record");
+      }
+      if (!record.skipif.empty() || !record.onlyif.empty()) {
+        return Error(i,
+                     "'pending' takes no skipif or onlyif: DuckDB runs a pending record, and antb1 "
+                     "only in the pending check");
+      }
+    }
     file_.records.push_back(std::move(record));
     return next;
   }
@@ -276,10 +301,25 @@ class Parser {
 }  // namespace
 
 bool Record::RunsOn(std::string_view engine) const {
+  if (!pending.empty() && engine == "antb1") {
+    return false;
+  }
   if (!onlyif.empty() && !std::ranges::contains(onlyif, engine)) {
     return false;
   }
   return !std::ranges::contains(skipif, engine);
+}
+
+bool IsRoadmapId(std::string_view id) {
+  const auto is_digit = [](char c) { return c >= '0' && c <= '9'; };
+  if (id.size() < 2 || id[0] < 'A' || id[0] > 'Z') {
+    return false;
+  }
+  id.remove_prefix(1);
+  if (id.back() >= 'a' && id.back() <= 'z') {
+    id.remove_suffix(1);
+  }
+  return !id.empty() && std::ranges::all_of(id, is_digit);
 }
 
 std::optional<std::string> SortModeProblem(std::string_view types, SortMode sort) {
