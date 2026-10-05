@@ -266,7 +266,7 @@ TEST(ForEachBadAllocTest, AnExceptionLeavesOnlyOnceTheTasksHaveEnded) {
   const auto pool = StartedPool();
   constexpr std::size_t kTasks = 8;
   constexpr std::size_t kThrowAt = 6;  // more tasks before it than threads: some wait to start
-  constexpr int kSteps = 1 << 20;      // the work of a task
+  constexpr int kSteps = 1'000'000;    // the work of a task
   std::mutex mu;
   std::condition_variable cv;
   bool thrown = false;
@@ -339,13 +339,16 @@ TEST(ForEachBadAllocTest, AFailedSubmitAllocatesNothingMore) {
     return arrow::Status::OK();
   };
   std::optional<arrow::Status> returned;
+  bool threw = false;
   try {
     returned = ForEach(&executor, kTasks, task);
   } catch (const std::bad_alloc&) {
+    threw = true;
   }
   const std::int64_t failed = fail.has_value() ? fail->failed() : -1;
   fail.reset();
-  ASSERT_TRUE(returned.has_value()) << "std::bad_alloc";
+  ASSERT_FALSE(threw);
+  ASSERT_TRUE(returned.has_value());
   EXPECT_EQ(returned->ToString(), refused.ToString());
   EXPECT_EQ(failed, 0);
   for (std::size_t i = 0; i < kTasks; ++i) {
@@ -855,7 +858,7 @@ TEST_F(JoinTableBadAllocTest, AnEarlierMergeFailureWinsOverALaterFailedRelease) 
   ASSERT_TRUE(spec.ok()) << spec.status().ToString();
   auto made = arrow::internal::ThreadPool::Make(1);
   ASSERT_TRUE(made.ok()) << made.status().ToString();
-  const std::shared_ptr<arrow::internal::ThreadPool> pool = *made;
+  const std::shared_ptr<arrow::internal::ThreadPool>& pool = *made;
   std::mutex mu;
   std::condition_variable cv;
   bool open = false;
