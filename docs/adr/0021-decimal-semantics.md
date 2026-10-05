@@ -168,12 +168,14 @@ This amends ADR 0012's list of unsupported constructs and three points of ADR 00
       64-bit halves, with upper = -1 handled separately, as `src/common/int128.cc` does), divided
       by the count times 10^s (also in `long double`, with 10^s first rounded to a double), then rounded to double;
       for p ≤ 4 DuckDB computes the same in double;
-    - `long double` differs by platform (x87 80-bit on x86-64 Linux, 64-bit on arm64 macOS) exactly as it does in
-      DuckDB's own build, so the two engines agree to the bit on each platform, and no AVG divergence is registered;
-    - the formula rounds once on x86-64 but can round twice on arm64 macOS, where a direct conversion of the Int128
-      would be one ulp off: the AVG of the single DECIMAL(38,0) value 27670116110564329473 (2^64 + 2^63 + 2049) is
-      27670116110564327424.0 on both platforms, while a direct conversion gives 27670116110564331520.0 on arm64, a
-      test case for the macos-release leg;
+    - `long double` differs by platform exactly as it does in DuckDB's own build (x87 80-bit on x86-64 Linux, IEEE
+      quad on arm64 Linux, 64-bit double on arm64 macOS), so the two engines agree to the bit on each platform, and no
+      AVG divergence is registered;
+    - the result can miss the correctly rounded mean, by platform: the AVG of the single DECIMAL(38,0) value
+      27670116110564329473 (2^64 + 2^63 + 2049) is 27670116110564327424.0 on x86-64 Linux (the halves' sum rounds
+      to 64 bits, then to double) and on arm64 macOS (the lower half rounds, then the sum), but
+      27670116110564331520.0, the correctly rounded value, on arm64 Linux, where the sum is exact; the unit tests pin
+      each platform's answers (the macos-release leg, the nightly arm64 job);
     - on x86-64, an emulation of this formula matched DuckDB on 1,800 random sets (scales 2 to 6, up to 36 digits),
       where the correctly rounded mean missed one.
 14. **MIN and MAX** keep the type (`MIN(rate)` is DECIMAL(5,3)); COUNT and COUNT(DISTINCT) are BIGINT. Over no rows
