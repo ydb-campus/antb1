@@ -1,0 +1,1 @@
+SELECT "it's".amount FROM sales AS 'it''s' JOIN 'data/x.parquet' AS over ON "it's".id = "over".id

@@ -1,0 +1,1 @@
+SELECT COUNT(*) FROM orders JOIN items JOIN products ON items.p = products.id ON orders.id = items.o

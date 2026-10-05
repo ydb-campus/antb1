@@ -1,0 +1,1 @@
+SELECT o.id, c.name FROM orders o, customers AS c WHERE o.customer_id = c.id

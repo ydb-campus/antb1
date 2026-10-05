@@ -1,0 +1,1 @@
+SELECT p.amount FROM 'data/part-0.parquet' p ORDER BY p.amount DESC LIMIT 5

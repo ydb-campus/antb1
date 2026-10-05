@@ -1,0 +1,1 @@
+SELECT COUNT(*) FROM orders JOIN items USING (id)

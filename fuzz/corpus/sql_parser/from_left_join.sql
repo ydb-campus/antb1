@@ -1,0 +1,1 @@
+SELECT c.name, COUNT(o.id) FROM customers c LEFT OUTER JOIN orders o ON o.customer_id = c.id AND o.total > 10 GROUP BY c.name
