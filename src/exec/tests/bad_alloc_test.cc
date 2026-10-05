@@ -1,6 +1,7 @@
-// std::bad_alloc in the join hash table (docs/adr/0022-joins-and-query-blocks.md): an allocation of
-// the C++ heap that fails anywhere in a call gives OutOfMemory, never an exception, and fails the
-// build for good, with no part counted twice and nothing left in the budget.
+// std::bad_alloc in ForEach and in the join hash table (docs/adr/0022-joins-and-query-blocks.md):
+// an allocation of the C++ heap that fails anywhere in a call gives OutOfMemory, never an exception
+// (ForEach lets one out only when not even its OutOfMemory can be made, and only once its tasks
+// ended), and fails a build for good, with no part counted twice and nothing left in the budget.
 //
 // The allocation hook. This executable replaces the global operator new and delete, so it is not
 // part of the shared antb1_exec_tests binary. On a thread where a FailAllocations is armed,
@@ -33,6 +34,7 @@
 #include "antb1/exec/operator.h"
 #include "antb1/plan/logical_plan.h"
 
+#include "../partition_lanes.h"
 #include "exec_test_util.h"
 
 namespace antb1::exec {
@@ -117,6 +119,7 @@ namespace {
 
 using plan::LogicalType;
 using testing::Int64s;
+using testing::ThrowingExecutor;
 
 constexpr int kThreads = 4;
 constexpr std::size_t kParts = 4;
@@ -217,6 +220,135 @@ std::shared_ptr<arrow::internal::ThreadPool> StartedPool() {
     task.Wait();
   }
   return pool;
+}
+
+// ---- ForEach ----
+
+// Runs every task on `pool`, except that spawn number `fail_at` (from 0) fails with `failure`:
+// `before_fail` runs just before it returns.
+class FailingExecutor final : public arrow::internal::Executor {
+ public:
+  FailingExecutor(arrow::internal::Executor* pool, int fail_at, arrow::Status failure,
+                  std::function<void()> before_fail)
+      : pool_(pool),
+        fail_at_(fail_at),
+        failure_(std::move(failure)),
+        before_fail_(std::move(before_fail)) {}
+
+  int GetCapacity() override { return pool_->GetCapacity(); }
+
+ protected:
+  arrow::Status SpawnReal(arrow::internal::TaskHints hints, arrow::internal::FnOnce<void()> task,
+                          arrow::StopToken stop_token, StopCallback&& stop_callback) override {
+    if (spawns_++ == fail_at_) {
+      arrow::Status failure = failure_;
+      before_fail_();
+      return failure;
+    }
+    return pool_->Spawn(hints, std::move(task), std::move(stop_token), std::move(stop_callback));
+  }
+
+ private:
+  arrow::internal::Executor* pool_;
+  int fail_at_;
+  arrow::Status failure_;
+  std::function<void()> before_fail_;
+  int spawns_ = 0;  // Submit is called from one thread
+};
+
+// A task that cannot be submitted (Submit throws std::bad_alloc), and then no memory for its
+// OutOfMemory either: the std::bad_alloc leaves ForEach only once every task submitted has ended,
+// as they use its frame and `fn`; the later tasks never run. The tasks start their work only when
+// the second std::bad_alloc is thrown, and it takes them a while.
+TEST(ForEachBadAllocTest, AnExceptionLeavesOnlyOnceTheTasksHaveEnded) {
+  const auto pool = StartedPool();
+  constexpr std::size_t kTasks = 8;
+  constexpr std::size_t kThrowAt = 6;  // more tasks before it than threads: some wait to start
+  constexpr int kSteps = 1 << 20;      // the work of a task
+  std::mutex mu;
+  std::condition_variable cv;
+  bool thrown = false;
+  const std::function<void()> throw_again = [&] {
+    {
+      const std::scoped_lock lock(mu);
+      thrown = true;
+    }
+    cv.notify_all();
+  };
+  std::optional<FailAllocations> fail;  // armed by the throwing Submit, on this thread
+  ThrowingExecutor executor(pool.get(), static_cast<int>(kThrowAt), [&] {
+    fail.emplace(/*skip=*/0, /*count=*/1, throw_again);  // the OutOfMemory of the throw fails
+  });
+  std::vector<std::uint64_t> work(kTasks, 0);  // each task writes only its own
+  std::vector<int> ended(kTasks, 0);
+  const std::function<arrow::Status(std::size_t)> task = [&](std::size_t i) {
+    {
+      std::unique_lock lock(mu);
+      cv.wait(lock, [&] { return thrown; });
+    }
+    std::uint64_t value = i + 1;
+    for (int step = 0; step < kSteps; ++step) {
+      value = (value * 6364136223846793005U) + 1442695040888963407U;
+    }
+    work[i] = value;
+    ended[i] = 1;
+    return arrow::Status::OK();
+  };
+  std::optional<arrow::Status> returned;
+  bool threw = false;
+  try {
+    returned = ForEach(&executor, kTasks, task);
+  } catch (const std::bad_alloc&) {
+    threw = true;
+  }
+  const std::int64_t failed = fail.has_value() ? fail->failed() : 0;
+  fail.reset();
+  EXPECT_TRUE(threw) << (returned.has_value() ? returned->ToString() : "");
+  EXPECT_EQ(failed, 1);
+  for (std::size_t i = 0; i < kTasks; ++i) {
+    EXPECT_EQ(ended[i], i < kThrowAt ? 1 : 0) << i;
+    EXPECT_EQ(work[i] != 0, i < kThrowAt) << i;
+  }
+  EXPECT_EQ(executor.spawns(), static_cast<int>(kThrowAt) + 1);
+}
+
+// A Submit that fails with a status, and no memory left: ForEach waits for the tasks before it and
+// returns that status, which it moves, so it allocates nothing more and nothing fails.
+TEST(ForEachBadAllocTest, AFailedSubmitAllocatesNothingMore) {
+  const auto pool = StartedPool();
+  constexpr std::size_t kTasks = 8;
+  constexpr int kFailAt = 3;
+  const arrow::Status refused = arrow::Status::IOError("no task");
+  // The first Result<T> made sets up Arrow's constant status of an empty Result, which moving a
+  // status out of a Result swaps in: once in a process, and here.
+  EXPECT_FALSE(arrow::Result<int>().ok());
+  // Arrow's Submit copies the failure into the Result it returns: those allocations go through.
+  std::int64_t copy = 0;
+  {
+    const FailAllocations count(/*skip=*/0, /*count=*/0);
+    const arrow::Result<arrow::Future<>> copied(refused);
+    copy = count.seen();
+  }
+  std::optional<FailAllocations> fail;
+  FailingExecutor executor(pool.get(), kFailAt, refused, [&] { fail.emplace(copy); });
+  std::vector<int> ran(kTasks, 0);  // each task writes only its own
+  const std::function<arrow::Status(std::size_t)> task = [&ran](std::size_t i) {
+    ran[i] = 1;
+    return arrow::Status::OK();
+  };
+  std::optional<arrow::Status> returned;
+  try {
+    returned = ForEach(&executor, kTasks, task);
+  } catch (const std::bad_alloc&) {
+  }
+  const std::int64_t failed = fail.has_value() ? fail->failed() : -1;
+  fail.reset();
+  ASSERT_TRUE(returned.has_value()) << "std::bad_alloc";
+  EXPECT_EQ(returned->ToString(), refused.ToString());
+  EXPECT_EQ(failed, 0);
+  for (std::size_t i = 0; i < kTasks; ++i) {
+    EXPECT_EQ(ran[i], std::cmp_less(i, kFailAt) ? 1 : 0) << i;
+  }
 }
 
 // ---- The join build ----

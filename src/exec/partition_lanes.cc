@@ -33,33 +33,36 @@ arrow::Status ForEach(arrow::internal::Executor* executor, std::size_t n,
     }
     return arrow::Status::OK();
   }
-  // A Submit that throws std::bad_alloc (Arrow allocates the task) has started nothing, like one
-  // that fails: no task runs from that one on.
-  const auto submit = [executor, &guarded](std::size_t i) -> arrow::Result<arrow::Future<>> {
-    try {
-      return executor->Submit([&guarded, i] { return guarded(i); });
-    } catch (const std::bad_alloc&) {
-      return arrow::Status::OutOfMemory("out of memory while submitting a parallel task");
+  std::vector<arrow::Future<>> tasks;
+  // The tasks use `guarded` and `fn`: every task submitted ends before ForEach returns, however it
+  // returns (a std::bad_alloc while a status is made included). Waiting allocates nothing.
+  struct WaitAll {
+    const std::vector<arrow::Future<>>& futures;
+    ~WaitAll() {
+      for (const arrow::Future<>& future : futures) {
+        future.Wait();
+      }
     }
   };
-  std::vector<arrow::Future<>> tasks;
+  const WaitAll wait_all{tasks};
   tasks.reserve(n);
+  // A Submit that throws std::bad_alloc (Arrow allocates the task) has started nothing, like one
+  // that fails: no task runs from that one on. A failed Submit's status moves: no allocation.
   arrow::Status submitted;
   for (std::size_t i = 0; i < n && submitted.ok(); ++i) {
-    arrow::Result<arrow::Future<>> task = submit(i);
-    if (task.ok()) {
-      tasks.push_back(*std::move(task));
-    } else {
-      submitted = task.status();
+    try {
+      arrow::Result<arrow::Future<>> task = executor->Submit([&guarded, i] { return guarded(i); });
+      if (task.ok()) {
+        tasks.push_back(*std::move(task));  // reserved: nothing allocated, nothing thrown
+      } else {
+        submitted = std::move(task).status();
+      }
+    } catch (const std::bad_alloc&) {
+      submitted = arrow::Status::OutOfMemory("out of memory while submitting a parallel task");
     }
   }
-  // Every task submitted ends before ForEach returns, as the tasks use `fn`. Waiting allocates
-  // nothing, so no std::bad_alloc cuts it short.
   for (const arrow::Future<>& task : tasks) {
-    task.Wait();
-  }
-  for (const arrow::Future<>& task : tasks) {
-    ARROW_RETURN_NOT_OK(task.status());
+    ARROW_RETURN_NOT_OK(task.status());  // waits for the task
   }
   return submitted;
 }

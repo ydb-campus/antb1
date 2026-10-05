@@ -21,8 +21,9 @@ namespace antb1::exec {
 // of them: the first failure in index order decides the status (without an executor, the tasks
 // after it do not run). std::bad_alloc in a task becomes OutOfMemory. A task that cannot be
 // submitted (Submit fails, or throws std::bad_alloc: OutOfMemory) is a failure at its index, and
-// no later task starts; the tasks already submitted still end before ForEach returns. Called from
-// the consumer thread, never from a task of the executor: it waits for the tasks.
+// no later task starts; the tasks already submitted still end before ForEach returns, or throws
+// (std::bad_alloc while even a status cannot be made). Called from the consumer thread, never from
+// a task of the executor: it waits for the tasks.
 arrow::Status ForEach(arrow::internal::Executor* executor, std::size_t n,
                       const std::function<arrow::Status(std::size_t)>& fn);
 
