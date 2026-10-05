@@ -198,5 +198,43 @@ TEST(PartitionLanesTest, AFailedSubmitFailsTheLane) {
   EXPECT_FALSE(lanes.Add(1, [](std::size_t) { return arrow::Status::OK(); }).ok());
 }
 
+// ForEach runs the tasks on the executor (or here) and reports the first failure in index order,
+// whatever the timing; without an executor the tasks after it do not run. std::bad_alloc becomes
+// OutOfMemory, and a task that cannot be submitted fails ForEach.
+TEST(PartitionLanesTest, ForEachReportsTheFirstFailureInIndexOrder) {
+  const auto pool = Pool();
+  for (arrow::internal::Executor* executor : Executors(pool.get())) {
+    for (int run = 0; run < 10; ++run) {
+      std::vector<int> ran(20, 0);  // each task writes only its own
+      const arrow::Status status = ForEach(executor, ran.size(), [&ran](std::size_t i) {
+        ran[i] = 1;
+        if (i == 13) {
+          return arrow::Status::IOError("task 13");
+        }
+        if (i == 7) {
+          return arrow::Status::Invalid("task 7");
+        }
+        return arrow::Status::OK();
+      });
+      EXPECT_TRUE(status.IsInvalid()) << status.ToString();
+      EXPECT_EQ(status.message(), "task 7");
+      EXPECT_EQ(ran[19], executor == nullptr ? 0 : 1);
+    }
+    const arrow::Status oom = ForEach(executor, 3, [](std::size_t i) -> arrow::Status {
+      if (i == 1) {
+        throw std::bad_alloc();
+      }
+      return arrow::Status::OK();
+    });
+    EXPECT_TRUE(oom.IsOutOfMemory()) << oom.ToString();
+    EXPECT_TRUE(
+        ForEach(executor, 0, [](std::size_t) { return arrow::Status::Invalid("none"); }).ok());
+  }
+  auto stopped = arrow::internal::ThreadPool::Make(1);
+  ASSERT_TRUE(stopped.ok());
+  ASSERT_TRUE((*stopped)->Shutdown().ok());
+  EXPECT_FALSE(ForEach(stopped->get(), 2, [](std::size_t) { return arrow::Status::OK(); }).ok());
+}
+
 }  // namespace
 }  // namespace antb1::exec

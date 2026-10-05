@@ -17,6 +17,13 @@
 
 namespace antb1::exec {
 
+// Runs fn(0) .. fn(n - 1) on the executor (here, one after another, without one) and waits for all
+// of them: the first failure in index order decides the status (without an executor, the tasks
+// after it do not run). std::bad_alloc in a task becomes OutOfMemory. Called from the consumer
+// thread, never from a task of the executor: it waits for the tasks.
+arrow::Status ForEach(arrow::internal::Executor* executor, std::size_t n,
+                      const std::function<arrow::Status(std::size_t)>& fn);
+
 // The merge of parts into partitioned state (docs/adr/0013-parallel-execution.md): one lane per
 // partition, each merging the parts in part order on its own, so that a slow partition holds back
 // no other. Add hands a part to every lane and returns; a lane runs on the executor while it has

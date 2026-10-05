@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <span>
 
 #include <arrow/array/array_base.h>
 #include <arrow/array/array_primitive.h>
@@ -10,18 +11,22 @@
 #include <arrow/result.h>
 #include <arrow/util/bit_run_reader.h>
 
-// Private to exec: the rows of one batch that an aggregate reads.
+// Private to exec: the rows of one batch that an aggregate or a join reads.
 
 namespace antb1::exec {
 
-// The rows of a batch that are selected (Batch::selection) and, for an aggregate over a column,
-// not NULL: the AND of the column's validity bitmap, the selection's values and the selection's
-// validity (a NULL in a selection counts as false). Bitmaps are borrowed while one suffices, so the
-// arrays passed to Make must outlive the mask.
+// The rows of a batch that are selected (Batch::selection) and, for an aggregate over a column or
+// a join over key columns, not NULL there: the AND of the columns' validity bitmaps, the
+// selection's values and the selection's validity (a NULL in a selection counts as false). Bitmaps
+// are borrowed while one suffices, so the arrays passed to Make must outlive the mask.
 class RowMask {
  public:
   // values: the aggregate's argument, or nullptr (COUNT(*)); selection: nullptr for every row.
   static arrow::Result<RowMask> Make(const arrow::Array* values,
+                                     const arrow::BooleanArray* selection, int64_t length,
+                                     arrow::MemoryPool* pool);
+  // The rows not NULL in any of `values` (none: every row; a nullptr entry is skipped).
+  static arrow::Result<RowMask> Make(std::span<const arrow::Array* const> values,
                                      const arrow::BooleanArray* selection, int64_t length,
                                      arrow::MemoryPool* pool);
 

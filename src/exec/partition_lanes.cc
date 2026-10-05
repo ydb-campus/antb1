@@ -2,17 +2,56 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <utility>
+#include <vector>
 
 #include <arrow/status.h>
+#include <arrow/util/future.h>
 #include <arrow/util/thread_pool.h>
 
 #include "antb1/exec/memory_budget.h"
 
 namespace antb1::exec {
+
+arrow::Status ForEach(arrow::internal::Executor* executor, std::size_t n,
+                      const std::function<arrow::Status(std::size_t)>& fn) {
+  const auto guarded = [&fn](std::size_t i) -> arrow::Status {
+    try {
+      return fn(i);
+    } catch (const std::bad_alloc&) {
+      return arrow::Status::OutOfMemory("out of memory in a parallel task");
+    }
+  };
+  if (executor == nullptr || n <= 1) {
+    for (std::size_t i = 0; i < n; ++i) {
+      ARROW_RETURN_NOT_OK(guarded(i));
+    }
+    return arrow::Status::OK();
+  }
+  std::vector<arrow::Future<>> tasks;
+  tasks.reserve(n);
+  arrow::Status submitted;
+  for (std::size_t i = 0; i < n && submitted.ok(); ++i) {
+    auto task = executor->Submit([&guarded, i] { return guarded(i); });
+    if (task.ok()) {
+      tasks.push_back(std::move(*task));
+    } else {
+      submitted = task.status();
+    }
+  }
+  arrow::Status status = submitted;
+  for (const arrow::Future<>& task : tasks) {  // every task ends before its inputs can go
+    const arrow::Status done = task.status();
+    if (status.ok()) {
+      status = done;
+    }
+  }
+  return status;
+}
 
 PartitionLanes::PartitionLanes(std::size_t lanes, arrow::internal::Executor* executor,
                                int64_t max_pending, const MemoryBudget* budget)
@@ -30,7 +69,7 @@ arrow::Status PartitionLanes::Run(const Merge& merge, std::size_t lane) {
   try {
     return merge(lane);
   } catch (const std::bad_alloc&) {
-    return arrow::Status::OutOfMemory("out of memory while merging groups");
+    return arrow::Status::OutOfMemory("out of memory while merging partitions");
   }
 }
 

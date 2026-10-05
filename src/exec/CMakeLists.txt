@@ -53,6 +53,7 @@ if(ANTB1_BUILD_TESTS)
       tests/parallel_test.cc
       tests/heavy_hitters_test.cc
       tests/partition_lanes_test.cc
+      tests/row_mask_test.cc
       tests/profile_test.cc
       tests/memory_test.cc
     LIBS ArrowCompute::arrow_compute_shared
