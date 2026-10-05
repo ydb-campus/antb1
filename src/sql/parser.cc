@@ -2273,19 +2273,29 @@ class Parser {
         break;
     }
     // A call or a typed literal, also of a quoted or a qualified name (abs(5), "abs"(5),
-    // main.abs(5), integer '5', "integer" E'5', main.integer $$5$$, and E'5' itself). A column
-    // (LIMIT a, LIMIT t.a), which DuckDB refuses when it binds, stays a syntax error.
+    // main.abs(5), system.main.abs(5), main.left('5', 1), integer '5', "integer" E'5',
+    // main.integer $$5$$, and E'5' itself). A column (LIMIT a, LIMIT t.a, LIMIT a.b.c), which
+    // DuckDB refuses when it binds, stays a syntax error.
     const SourceSpan first = token.span;
     const std::string found = Describe(token);
     SourceSpan span = first;
-    if (IsName(token) && PeekAt(1).kind == TokenKind::kDot && IsName(PeekAt(2))) {
-      // What follows the name is beyond the three tokens of lookahead: take the qualifier and the
-      // dot first.
-      Take();
-      Take();
-      span = Cover(first, Peek().span);
+    bool qualified = false;
+    if (IsName(token)) {
+      // What follows a qualified name is beyond the three tokens of lookahead: take each part
+      // before a dot and the dot first. A part after a dot may be a reserved word, as in
+      // ParseQualifiedColumn.
+      while (PeekAt(1).kind == TokenKind::kDot &&
+             (PeekAt(2).kind == TokenKind::kIdentifier ||
+              PeekAt(2).kind == TokenKind::kQuotedIdentifier)) {
+        Take();
+        Take();
+        qualified = true;
+      }
     }
-    const Token& head = Peek();  // the name, or its part after the dot
+    const Token& head = Peek();  // the name, or its last part
+    if (qualified) {
+      span = Cover(first, head.span);
+    }
     const bool call =
         (head.kind == TokenKind::kIdentifier || head.kind == TokenKind::kQuotedIdentifier) &&
         PeekAt(1).kind == TokenKind::kLeftParen;
