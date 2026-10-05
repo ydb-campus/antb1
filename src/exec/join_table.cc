@@ -849,13 +849,14 @@ arrow::Status JoinTableBuilder::Add(int64_t part, std::shared_ptr<const JoinBuil
     }
     slot = std::move(rows);
     // A release that fails, std::bad_alloc included, still moves on to the next part and fails the
-    // build: no part is released twice, and every later call returns the failure.
+    // build: no part is released twice, and every later call returns the failure. It waits for the
+    // merges, as a merge of an earlier part may have failed: that failure comes first (Merged).
     while (failed_.ok() && next_part_ < num_parts_ &&
            parts_[static_cast<std::size_t>(next_part_)] != nullptr) {
       failed_ = NoBadAlloc("a join build", [this] { return Release(next_part_); });
       ++next_part_;
     }
-    return failed_;
+    return failed_.ok() ? arrow::Status::OK() : Merged();
   });
 }
 
@@ -918,8 +919,10 @@ arrow::Status JoinTableBuilder::Merge(std::size_t partition, const JoinBuildPart
 
 arrow::Status JoinTableBuilder::Merged() {
   return NoBadAlloc("a join build", [this] {
+    // The failure of the earliest part decides, as in the serial order. A failed release hands no
+    // later part to the merges, so a merge failure is of that part or an earlier one: it wins.
     arrow::Status merged = lanes_->Finish();
-    if (failed_.ok()) {  // the first failure stays the build's
+    if (!merged.ok()) {
       failed_ = std::move(merged);
     }
     return failed_;

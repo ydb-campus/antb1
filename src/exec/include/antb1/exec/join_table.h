@@ -289,14 +289,15 @@ class JoinTableBuilder {
   // Waits for the merges still running.
   ~JoinTableBuilder();
 
-  // Part `part` (0 <= part < num_parts), appended to the end; parts may come in any order. Once a
-  // release or a merge failed, that failure, before any other check (a merge on the executor once
-  // it is known, after waiting for the others); otherwise Invalid for a part outside the build, of
-  // another spec or added twice, and after Finish.
+  // Part `part` (0 <= part < num_parts), appended to the end; parts may come in any order. Once the
+  // build failed, its failure (as Merged), before any other check: a release that fails, and a
+  // merge on the executor once its failure is known, wait for the other merges first. Otherwise
+  // Invalid for a part outside the build, of another spec or added twice, and after Finish.
   arrow::Status Add(int64_t part, std::shared_ptr<const JoinBuildPart> rows);
   // Waits for the merges of the parts added so far: the build's failure, which every later call
-  // returns too (the first seen: a failed release, else the failure of the smallest (part,
-  // partition)).
+  // returns too. It is the failure of the earliest part, as in the serial order: the merges' (of
+  // the smallest (part, partition)), else a failed release's. A failed release hands no later part
+  // to the merges, so a merge failure is never of a later part.
   arrow::Status Merged();
   // The table, once every part is added: Invalid for a second call; otherwise the build's failure
   // first (as Merged), then Invalid for a missing part; OutOfMemory past the budget.
@@ -324,7 +325,7 @@ class JoinTableBuilder {
   int64_t min_key_ = 0;  // over the released parts with rows (a direct candidate)
   int64_t max_key_ = 0;
   bool finished_ = false;
-  arrow::Status failed_;      // the build's first failure: a release's or the merges'
+  arrow::Status failed_;      // the build's failure: the merges', else a failed release's
   MemoryReservation memory_;  // parts_
   // Per partition, its runs of rows in part order; each partition is written by its lane only.
   JoinTable::Segments segments_;

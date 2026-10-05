@@ -821,6 +821,64 @@ TEST_F(JoinTableBadAllocTest, AFinishThatRunsOutOfMemoryFails) {
   }
 }
 
+// A release that fails (std::bad_alloc while Release makes its merge function) while the merges of
+// an earlier part fail on the executor, not known yet: the earlier part's failure is the build's,
+// as in the serial order, from that Add on. The pool's only thread waits until the release fails,
+// so part 0's merges run only then.
+TEST_F(JoinTableBadAllocTest, AnEarlierMergeFailureWinsOverALaterFailedRelease) {
+  const BuildInput input = Input(/*hashed=*/false);
+  auto spec = JoinBuildSpec::Make(input.schema, input.keys);
+  ASSERT_TRUE(spec.ok()) << spec.status().ToString();
+  auto made = arrow::internal::ThreadPool::Make(1);
+  ASSERT_TRUE(made.ok()) << made.status().ToString();
+  const std::shared_ptr<arrow::internal::ThreadPool> pool = *made;
+  std::mutex mu;
+  std::condition_variable cv;
+  bool open = false;
+  const std::function<void()> open_gate = [&] {
+    {
+      const std::scoped_lock lock(mu);
+      open = true;
+    }
+    cv.notify_all();
+  };
+  auto blocker = pool->Submit([&] {
+    std::unique_lock lock(mu);
+    cv.wait(lock, [&] { return open; });
+  });
+  ASSERT_TRUE(blocker.ok()) << blocker.status().ToString();
+  UnhookedSpawns spawns(pool.get());
+  MemoryBudget budget(kGiB);
+  {
+    const std::vector<std::shared_ptr<const JoinBuildPart>> parts =
+        MakeParts(input, *spec, &budget);
+    auto builder = JoinTableBuilder::Make(*spec, kParts, &spawns, kThreads, &budget);
+    ASSERT_TRUE(builder.ok()) << builder.status().ToString();
+    const int64_t pinned = kGiB - budget.bytes_allocated();
+    ASSERT_TRUE(budget.Reserve(pinned).ok());  // no room for the partitions' runs
+    const arrow::Status queued = (*builder)->Add(0, parts[0]);
+    arrow::Status added;
+    std::int64_t failed = 0;
+    {
+      const FailAllocations fail(/*skip=*/0, /*count=*/1, open_gate);  // part 1's merge function
+      added = (*builder)->Add(1, parts[1]);
+      failed = fail.failed();
+    }
+    open_gate();  // in case nothing failed: the pool's thread goes on
+    EXPECT_TRUE(queued.ok()) << queued.ToString();
+    EXPECT_EQ(failed, 1);
+    EXPECT_TRUE(added.IsOutOfMemory()) << added.ToString();
+    EXPECT_NE(added.message(), "out of memory in a join build");  // not the release's
+    EXPECT_EQ((*builder)->Merged().ToString(), added.ToString());
+    EXPECT_EQ((*builder)->Add(2, parts[2]).ToString(), added.ToString());
+    EXPECT_EQ((*builder)->Finish().status().ToString(), added.ToString());
+    builder->reset();
+    budget.Release(pinned);
+  }
+  blocker->Wait();
+  EXPECT_EQ(budget.bytes_allocated(), 0);
+}
+
 // A merge that failed (the budget is full), then no memory to copy its failure: Merged() returns
 // OutOfMemory, never an exception, and the build keeps its failure, which the next calls return.
 // Nothing is left in the budget. Finish is not swept here: it returns an arrow::Result, whose

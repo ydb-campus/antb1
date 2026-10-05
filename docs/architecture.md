@@ -205,7 +205,8 @@ their hash and range of rows. The rows stay in the parts' taken batches (`JoinTa
 `JoinRowRef{chunk, row}`, at most 2^32 - 1 rows), each key's rows together and in (part, row) order. The table
 keeps whether any key repeats (`unique`), whether the input had a NULL key (`has_null`) and whether it was empty.
 `JoinTable::Find` gives every probe row the range of its matches, from any number of threads at once and without a
-lock; neither the thread count nor the order in which parts arrive changes the table.
+lock; neither the thread count nor the order in which parts arrive changes the table, nor the failure of a build that
+fails: the failure of its earliest part, as in the serial order (a merge's before a later part's failed release).
 
 | Operator | Logical node | Does |
 | --- | --- | --- |
