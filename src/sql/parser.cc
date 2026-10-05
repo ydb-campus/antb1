@@ -1103,6 +1103,11 @@ class Parser {
         if (PeekAt(1).kind == TokenKind::kLeftParen) {
           return ParseFunction(context);
         }
+        // A string after a quoted name makes a typed literal of a quoted type in DuckDB ("integer"
+        // '5', "DATE" E'2020-01-01'): unsupported, as typed literals are.
+        if (PeekAt(1).kind == TokenKind::kString || PrefixedStringAt(1) != PrefixedString::kNone) {
+          return Unsupported(token.span, kTypedLiterals);
+        }
         Token name = Take();
         return Expr(ColumnRef{.name = std::move(name.text), .quoted = true, .span = name.span});
       }
@@ -1174,8 +1179,12 @@ class Parser {
     if ((keyword == "CAST" || keyword == "TRY_CAST") && next.kind == TokenKind::kLeftParen) {
       return ParseCast(context);
     }
-    if (next.kind == TokenKind::kString) {
-      if (keyword == "DATE" || keyword == "TIMESTAMP") {
+    // A string after the name, also an escape or a dollar-quoted one, makes a typed literal in
+    // DuckDB (INT '1', integer E'5', DATE $$2020-01-01$$), and E'\n' is one string itself. Only
+    // DATE and TIMESTAMP before a plain string are supported. Every unreserved word is taken for a
+    // type here, also one that DuckDB does not take for one (coalesce '5', a syntax error there).
+    if (next.kind == TokenKind::kString || PrefixedStringAt(1) != PrefixedString::kNone) {
+      if (next.kind == TokenKind::kString && (keyword == "DATE" || keyword == "TIMESTAMP")) {
         const SourceSpan date = Take().span;
         Token text = Take();
         return Expr(
@@ -1187,7 +1196,7 @@ class Parser {
       if (auto construct = Find(kUnsupportedTypedLiterals, keyword); construct.has_value()) {
         return Unsupported(token.span, *construct);
       }
-      if (!IsReservedKeyword(keyword)) {  // type 'text' (INT '1') or a prefixed string (E'\n')
+      if (!IsReservedKeyword(keyword)) {
         return Unsupported(token.span, kTypedLiterals);
       }
     }
@@ -1269,14 +1278,14 @@ class Parser {
                           .qualifier_quoted = qualifier.kind == TokenKind::kQuotedIdentifier});
   }
 
-  // DuckDB's string constants other than a plain string literal, at the next tokens: an escape
-  // string (E'x'), which lexes as E and an adjacent string, and a dollar-quoted string ($$x$$,
-  // $tag$x$tag$), which lexes as a $-token without a digit and an adjacent $-token. $1, $x and
-  // the other prefixes (B'1', N'x') are none.
+  // DuckDB's string constants other than a plain string literal, at PeekAt(ahead) and the token
+  // after it: an escape string (E'x'), which lexes as E and an adjacent string, and a dollar-quoted
+  // string ($$x$$, $tag$x$tag$), which lexes as a $-token without a digit and an adjacent $-token.
+  // $1, $x and the other prefixes (B'1', N'x') are none.
   enum class PrefixedString : std::uint8_t { kNone, kEscape, kDollarQuoted };
-  PrefixedString PrefixedStringAt() {
-    const Token& token = Peek();
-    const Token& next = PeekAt(1);
+  PrefixedString PrefixedStringAt(std::size_t ahead = 0) {
+    const Token& token = PeekAt(ahead);
+    const Token& next = PeekAt(ahead + 1);
     if (next.span.offset != token.span.offset + token.span.length) {
       return PrefixedString::kNone;
     }

@@ -136,6 +136,13 @@ are the same expression.
   `DISTINCT`, `FALSE`, `NULL`, `SOME` and `TRUE` (`null.a`: NULL literals are not supported; `SELECT DISTINCT.a`).
   `t.*`, `a.b.c`, `t.f()` and a qualified name before a string (`main.integer '5'`, which DuckDB reads as a typed
   literal of a qualified type) are unsupported.
+- Typed literals: as in DuckDB, a string after a type name makes a typed literal, whether the string is plain, an
+  escape or a dollar-quoted one, and the name plain, quoted or qualified (`integer '5'`, `integer E'5'`,
+  `DATE $$2020-01-01$$`, `"integer" '5'`, `main.integer '5'`). Only `DATE` and `TIMESTAMP` before a plain string are
+  in the grammar: every other typed literal is unsupported, and so is an escape or a dollar-quoted string on its own
+  (`E'\n'`, `$$x$$`). Every unreserved word before a string is taken for a type name, also one that DuckDB does not
+  take for one (`coalesce '5'`: exit code 4, where DuckDB gives a syntax error). `E` and a string with a space between
+  them are no escape string (`integer E '5'` is a syntax error, as in DuckDB).
 - Table aliases: after `AS` a name, a quoted identifier or a non-empty string literal (`AS 'a'`, as DuckDB); without
   `AS` a name or a quoted identifier. As in DuckDB, `BETWEEN`, `EXISTS`, `INTERVAL` and `OVER` are table aliases with
   or without `AS`, although they are reserved elsewhere, and these 49 words, which antb1 does not reserve, never are:
