@@ -476,10 +476,14 @@ TEST_F(AggregateStateTest, SumAndAvgOfDecimals) {
   ASSERT_TRUE(avg_more->Consume(*DecimalsOf(d38, {max38}), nullptr).ok());
   EXPECT_EQ(avg_bits->Merge(*avg_more).message(),
             "AVG overflow: the sum of a DECIMAL(38,0) column exceeds 128 bits");
-  // AVG of a single DECIMAL(38,0) value: DuckDB's halves, not a direct conversion (rule 13).
+  // AVG of a single DECIMAL(38,0) value: DuckDB's halves, not a direct conversion (rule 13). The
+  // value rounds twice with an x87 long double (the sum, then to double) or a double one (the lower
+  // half, then the sum), but once, to the correctly rounded value, with an IEEE quad (arm64 Linux).
   auto halves = Make(AggKind::kAvg, d38, LogicalType::kDouble);
   ASSERT_TRUE(halves->Consume(*DecimalsOf(d38, {"27670116110564329473"}), nullptr).ok());
-  EXPECT_EQ(Text(*halves), "2.7670116110564327e+19");
+  EXPECT_EQ(Text(*halves), std::numeric_limits<long double>::digits == 113
+                               ? "2.767011611056433e+19"
+                               : "2.7670116110564327e+19");
 }
 
 // One batch of DOUBLE values and its selection (empty: every row).
