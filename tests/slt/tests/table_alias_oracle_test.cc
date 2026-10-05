@@ -5,7 +5,8 @@
 // table of words that are never aliases (kNotAnAlias), so that antb1 never answers such a query
 // as an inner join with an alias. In every place, also after an alias, after an ON condition and
 // where the word would call a table function, a statement that sql::Parse accepts must parse in
-// DuckDB, and one that it rejects as malformed must fail in DuckDB too.
+// DuckDB, and one that it rejects as malformed must fail in DuckDB's parser too. Only a parser
+// error counts as a failure to parse: any other error of json_serialize_sql fails the test.
 
 #include <array>
 #include <cstddef>
@@ -83,9 +84,9 @@ TEST(TableAliasOracle, DuckDbReadsAKeywordAsATableAliasExactlyWhenAntb1Does) {
     SCOPED_TRACE(std::string(place.before) + "<word>" + std::string(place.after));
     const std::string table = place.item == 0 ? "$.statements[0].node.from_table"
                                               : "$.statements[0].node.from_table.right";
-    // One row per keyword: the word, whether DuckDB failed to parse, and the item's alias.
-    const std::string sql = "SELECT keyword_name, j->>'$.error', j->>'" + table +
-                            ".alias' FROM (SELECT keyword_name, " + "json_serialize_sql(" +
+    // One row per keyword: the word, whether DuckDB failed, the error's type and the item's alias.
+    const std::string sql = "SELECT keyword_name, j->>'$.error', j->>'$.error_type', j->>'" +
+                            table + ".alias' FROM (SELECT keyword_name, " + "json_serialize_sql(" +
                             SqlString(place.before) + " || keyword_name || " +
                             SqlString(place.after) +
                             ")::JSON AS j FROM duckdb_keywords()) ORDER BY keyword_name";
@@ -93,12 +94,17 @@ TEST(TableAliasOracle, DuckDbReadsAKeywordAsATableAliasExactlyWhenAntb1Does) {
     ASSERT_TRUE(result.has_value()) << result.error().message;
     ASSERT_GT(result->rows.size(), 400U);  // DuckDB 1.5.5 has 489 keywords
     for (const auto& row : result->rows) {
-      ASSERT_EQ(row.size(), 3U);
+      ASSERT_EQ(row.size(), 4U);
       const std::string word = row[0].value_or("");
       SCOPED_TRACE(word);
-      const bool duckdb_parses = row[1] == std::optional<std::string>("false");
-      const bool duckdb_alias = duckdb_parses && row[2].has_value() && Lower(*row[2]) == word;
       const std::string statement = std::string(place.before) + word + std::string(place.after);
+      const bool duckdb_parses = row[1] == std::optional<std::string>("false");
+      if (!duckdb_parses && row[2] != std::optional<std::string>("parser")) {
+        ADD_FAILURE() << statement << ": DuckDB fails with a " << row[2].value_or("NULL")
+                      << " error, not a parser error";
+        continue;
+      }
+      const bool duckdb_alias = duckdb_parses && row[3].has_value() && Lower(*row[3]) == word;
       auto ours = sql::Parse(statement);
       if (place.alias) {
         const bool our_alias = ours.has_value() && place.item < ours->from.size() &&
