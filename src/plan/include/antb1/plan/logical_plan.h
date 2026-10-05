@@ -109,7 +109,9 @@ struct BoundColumn {
 struct Predicate {
   enum class Kind : std::uint8_t {
     kCompare,         // column <op> constant
-    kCompareColumns,  // column <op> other (comparable types, compared as DuckDB compares them)
+    kCompareColumns,  // column <op> other (comparable types, compared as DuckDB compares them: a
+                      // DECIMAL with a DECIMAL or an integer exactly by value, with a DOUBLE in
+                      // DOUBLE after DuckDB's conversion)
     kLike,            // column LIKE constant (a VARCHAR column and pattern; docs/sql-subset.md)
     kNotLike,         // column NOT LIKE constant
     kIn,              // column IN (values): column = v1 OR column = v2 ... (Kleene)
@@ -123,9 +125,11 @@ struct Predicate {
   std::optional<BoundColumn> column;  // empty for kFalse
   std::optional<BoundColumn> other;   // kCompareColumns only
   CompareOp op = CompareOp::kEq;      // kCompare and kCompareColumns
-  Constant constant;                  // kCompare, kLike and kNotLike; typed as the column
-  std::vector<Constant> values;       // kIn and kNotIn (not empty); typed as the column
-  SourceSpan span;                    // the comparison in the query
+  // kCompare, kLike and kNotLike: typed as the column, or DOUBLE on a DECIMAL column, which then
+  // compares in DOUBLE with its values converted as DuckDB converts them (ADR 0021 rule 11).
+  Constant constant;
+  std::vector<Constant> values;  // kIn and kNotIn (not empty): all typed as `constant` would be
+  SourceSpan span;               // the comparison in the query
 };
 
 struct Expr;

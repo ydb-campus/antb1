@@ -125,8 +125,10 @@ This amends ADR 0012's list of unsupported constructs and three points of ADR 00
     - **With an integer or decimal literal:** folded exactly into the operand's (p,s) at bind time, as integer
       columns are folded today (ADR 0004). `price < 12.345` becomes `price <= 12.34`, `price >= 12.345` becomes
       `price >= 12.35`, and `price = 12.345` is never true. A literal beyond the type's range makes the comparison
-      constant, NULL still rejected, and the operand is then not computed (divergence D14). Folding is never an
-      error. An IN list of such literals is folded value by value.
+      constant, NULL still rejected, and a never-true one that is a whole `WHERE` or `HAVING` conjunct does not compute
+      the operand (divergence D14). Folding is never an error, also for an integer literal of more than 38 - s digits,
+      which DuckDB fails to cast to its capped DECIMAL(38,s) (divergence D13). An IN list of such literals is folded
+      value by value.
     - **Two operands that are not literals,** DECIMAL with DECIMAL or with an integer (`price < rate`, `price = b`):
       compared exactly by value.
     - **Both give DuckDB's rows wherever DuckDB answers.** DuckDB compares in rule 10's type, which is exact below
@@ -140,8 +142,12 @@ This amends ADR 0012's list of unsupported constructs and three points of ADR 00
       9007199254740992.0, not 9007199254740994.0. PR D4 then narrows divergence D12 to HUGEINT literals.
     - **With a FLOAT column:** a decimal literal keeps ADR 0004's FLOAT rule (plan::DuckDbFloatOf); only a DECIMAL
       that is not a literal next to a FLOAT column stays unsupported (divergence D11).
-    - **Other operands:** a string literal is a bind error (divergence D3); a DATE or VARCHAR operand is a bind
-      error, as in DuckDB.
+    - **BETWEEN** takes DuckDB's one common type of its three values. Where that is DOUBLE and antb1 would compare
+      a pair exactly (a DECIMAL operand with a bound that is not DOUBLE, or a DECIMAL bound), the BETWEEN is
+      unsupported (exit code 4); otherwise its two comparisons give DuckDB's rows.
+    - **Other operands:** a string literal is a bind error (divergence D3); a DATE, TIMESTAMP or VARCHAR operand is a
+      bind error, as for any number. DuckDB rejects it for `<` and the like, but casts a VARCHAR operand for `=`, `<>`
+      and IN, and fails on a DATE or TIMESTAMP only when a row is compared (divergence D4).
 12. **SUM** of DECIMAL(p,s) is DECIMAL(38,s), summed exactly in Int128 (the HUGEINT sum states), so its value
     depends on neither the thread count, nor the parts, nor the order of the rows. Over no rows it is NULL.
     `SUM(price)` and `SUM(price * n)` are DECIMAL(38,2), `SUM(rate)` is DECIMAL(38,3). A sum beyond 10^38 - 1 in
@@ -208,9 +214,9 @@ This amends ADR 0012's list of unsupported constructs and three points of ADR 00
     with a conversion error, in comparisons and join keys alike, as for
     `price < 1.0000000000000000000000000000000000001` (DuckDB casts `price` to DECIMAL(38,37)) or a DECIMAL(38,2)
     against a DECIMAL(38,12) past 26 integer digits;
-  - divergence D14, extended to DECIMAL operands: a comparison that rule 11 folds to a constant computes nothing.
-    Over a row whose product needs more than 18 digits, `price * qty > 100000000000000000000` returns no rows, where
-    DuckDB computes the product and fails (`Overflow in multiplication of DECIMAL(18)`);
+  - divergence D14, extended to DECIMAL operands: a `WHERE` or `HAVING` conjunct that rule 11 folds to never true
+    computes nothing. Over a row whose product needs more than 18 digits, `price * qty > 100000000000000000000`
+    returns no rows, where DuckDB computes the product and fails (`Overflow in multiplication of DECIMAL(18)`);
   - a new divergence: a DECIMAL SUM beyond 38 digits is an error.
 
   The unregistered difference of reading a Parquet DECIMAL(38,0) column as HUGEINT goes away, and AVG needs no
@@ -244,19 +250,21 @@ This amends ADR 0012's list of unsupported constructs and three points of ADR 00
 ## Plan
 
 One PR each. PR H5 and PR D1 land in either order (PR D1 changes no behavior), both before PR D2; then PR D2, PR D3 and
-PR D4 (D4a, then D4b), in this order. Each engine PR documents its rules in docs/sql-subset.md and rejects the rest with
-exit code 4. The PR ids are the roadmap's, not divergence ids.
+PR D4 (D4a, D4b, then D4c), in this order. Each engine PR documents its rules in docs/sql-subset.md and rejects the rest
+with exit code 4. The PR ids are the roadmap's, not divergence ids.
 
 - **PR H5,** test(harness): compare decimal results exactly. Rule 15's text and exact type names, before engine code.
 - **PR D1,** refactor(plan): logical types with width and scale. The type carries (p,s); no behavior change.
 - **PR D2,** feat(plan,io,exec,engine): decimal columns. Rules 1, 2, 14-16 (join keys come with the joins) and io's
   cast to decimal128; rule 11 for integer and decimal literals and same-type operands.
 - **PR D3,** feat(plan,exec): decimal arithmetic, sum and avg. Rules 4-7, 12, 13 and 18.
-- **PR D4,** split in two at review size:
+- **PR D4,** split in three at review size:
   - **PR D4a,** feat(plan,exec): decimal literals and division. Rules 3, 8 and 9 (`%` up to 38 digits), and rule
     11's decimal literal against a DOUBLE operand.
-  - **PR D4b,** feat(plan,exec): decimal common types and mixed comparisons. Rule 10 (CASE values, IN lists), the
-    rest of rule 11, and `%` beyond 38 digits.
+  - **PR D4b,** feat(plan,exec): decimal mixed comparisons. Rule 10 for comparisons and IN lists, and the rest of
+    rule 11.
+  - **PR D4c,** feat(plan,exec): decimal case values and modulo beyond 38 digits. Rule 10 for CASE values, and `%`
+    beyond 38 digits.
 - **decimal64 (deferred):** decimal64 for p ≤ 18, with DECIMAL in the filtered scan and in part statistics.
 
 ## Alternatives considered

@@ -108,8 +108,9 @@ values: `hits_like.parquet` (10,000 rows in 4 row groups), `hits_like_nulls.parq
 columns and UTF8 strings), `edge.parquet` (type extremes, escapes, empty strings, NULLs), `floats.parquet` (bit-exact
 FLOAT values: 0.1F and its lower neighbour, 2^24 and 2^100 with their next FLOATs, the FLOAT maximum, +-inf, +-0, NULL),
 `decimals.parquet` (DECIMAL(9,2) stored as INT32, (18,4) and (15,2) as INT64, (38,10) and (38,0) as
-FIXED_LEN_BYTE_ARRAY: negatives, NULLs and each precision's extremes, 40 rows in 5 row groups) and `empty.parquet`
-(0 rows). The ctest `fixtures.generate` (label `setup`) writes them to `build/<preset>/fixtures`.
+FIXED_LEN_BYTE_ARRAY: negatives, NULLs and each precision's extremes; a BIGINT column with its extremes and a DOUBLE
+column whose sums are exact in any order; 40 rows in 5 row groups) and `empty.parquet` (0 rows). The ctest
+`fixtures.generate` (label `setup`) writes them to `build/<preset>/fixtures`.
 Values come from splitmix64 with integer-only arithmetic (no `<random>` distributions, no libm, no NaN), so every
 platform generates the same data.
 
@@ -427,7 +428,8 @@ The seed of the differential test is fixed. DuckDB 1.5.5 leaks the state of a st
 without `ORDER BY`, so a new seed is checked with `pixi run asan` first, and one whose queries make DuckDB leak is
 replaced. The queries of a seed also depend on the query generator and on the supported features
 (`tests/slt/supported_features.h`), so a PR that changes either runs `pixi run asan` too. A failure in antb1 is fixed,
-never avoided with another seed. The query generator does not reference DECIMAL columns yet.
+never avoided with another seed. The DECIMAL queries of the generator change only the seeds of tables with DECIMAL
+columns (`diff.decimal`, `diff.tpch`): every draw for them is taken where a DECIMAL column is used.
 
 This workload is derived from the TPC-H Benchmark and is not comparable to published TPC-H Benchmark results, as this
 implementation does not comply with all requirements of the TPC-H Benchmark.

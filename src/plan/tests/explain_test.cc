@@ -97,6 +97,18 @@ TEST(ExplainTest, In) {
             "    Scan table=ok source=fake columns=[i16, s]\n");
 }
 
+// A DECIMAL compared with a DOUBLE constant or IN list compares in DOUBLE (ADR 0021 rule 11), so
+// the column is shown converted; a folded comparison keeps the column's type and shows no cast.
+TEST(ExplainTest, DecimalComparedInDouble) {
+  EXPECT_EQ(ExplainSql("SELECT COUNT(*) FROM dec WHERE p > 1e1 AND q IN (1.5, 2e0) AND "
+                       "p NOT IN (1.555) AND z = 2.5 AND p < f"),
+            "Output: count_star():BIGINT\n"
+            "Aggregate COUNT(*)\n"
+            "  Filter CAST(p AS DOUBLE) > 10 AND CAST(q AS DOUBLE) IN (1.5, 2) AND "
+            "p IS NOT NULL AND z = 2.5000000000 AND p < f\n"
+            "    Scan table=dec source=fake columns=[p, q, z, f]\n");
+}
+
 TEST(ExplainTest, Like) {
   EXPECT_EQ(ExplainSql("SELECT i16 FROM ok WHERE s LIKE '%it''s_%' AND s NOT LIKE ''"),
             "Output: i16:SMALLINT\n"

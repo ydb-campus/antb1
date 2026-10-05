@@ -377,7 +377,13 @@ INSTANTIATE_TEST_SUITE_P(
         FoldCase{"p * q > 100", kCompare, CompareOp::kGt, 1000000},
         FoldCase{"p * q <= 0.00001", kCompare, CompareOp::kLe, 0},
         FoldCase{"-p < -1.5", kCompare, CompareOp::kLt, -150},
-        FoldCase{"p + i >= 99999999999999.995", kFalse}));
+        FoldCase{"p + i >= 99999999999999.995", kFalse},
+        // An integer literal of more than 38 - s digits folds as well, where DuckDB fails to cast
+        // it to its capped common type DECIMAL(38,s) (divergence D13).
+        FoldCase{"p < 100000000000000000000000000000000000000", kIsNotNull},
+        FoldCase{"p = 170141183460469231731687303715884105728", kFalse},
+        FoldCase{"z > -170141183460469231731687303715884105728", kIsNotNull},
+        FoldCase{"p <> 99999999999999999999999999999999999999", kIsNotNull}));
 
 // Numbers that DuckDB reads as DOUBLE (an exponent, or a decimal of more than 38 digits) are
 // rounded to the nearest double first, then folded exactly (divergence D7).
@@ -455,7 +461,9 @@ INSTANTIATE_TEST_SUITE_P(
         FoldCase{"SUM(p) > 1.5", kCompare, CompareOp::kGt, 150},
         FoldCase{"SUM(p) <= 12.345", kCompare, CompareOp::kLe, 1234},
         FoldCase{"SUM(r) = 0.00005", kFalse},
-        FoldCase{"SUM(p) < 1000000000000000000000000000000000000", kIsNotNull}));
+        FoldCase{"SUM(p) < 1000000000000000000000000000000000000", kIsNotNull},
+        FoldCase{"SUM(p) > 170141183460469231731687303715884105727", kFalse},
+        FoldCase{"MIN(z) >= -100000000000000000000000000000000000000", kIsNotNull}));
 
 }  // namespace
 }  // namespace antb1::plan

@@ -255,7 +255,7 @@ SELECT d18_4 * 1.5 FROM decimals
 statement error Casting value "99999999999999.9999" to type DECIMAL\(18,5\) failed: value is out of range! when casting from source column d18_4
 SELECT d18_4 + 0.00005 FROM decimals
 
-# Not supported yet (exit 4, roadmap PR D4b): % beyond 38 digits, a decimal literal as a CASE value next to a
+# Not supported yet (exit 4, roadmap PR D4c): % beyond 38 digits, a decimal literal as a CASE value next to a
 # non-DOUBLE value.
 
 onlyif duckdb

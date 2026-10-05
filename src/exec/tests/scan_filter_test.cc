@@ -18,6 +18,7 @@
 #include <arrow/util/bit_util.h>
 #include <gtest/gtest.h>
 
+#include "antb1/common/int128.h"
 #include "antb1/exec/filter.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/table.h"
@@ -253,6 +254,43 @@ TEST_F(ScanFilterTest, KeepsTheRowsTheFilterOperatorKeeps) {
   ExpectSame({testing::Compare(D(), CompareOp::kGt, Double(0.0)), Of(Kind::kIsNotNull, I()),
               In(S(), {Text("ab"), Text("abc")}, true)},
              "conjunction over three columns");
+}
+
+// A DOUBLE constant or IN list on a DECIMAL column compares in DOUBLE (ADR 0021 rule 11), also
+// pushed into a scan (a Parquet table never does: a scan that reads a DECIMAL column is not
+// filtered, but a test table pushes predicates on every type): 9007199254740993.5 is 2^53 there.
+TEST_F(ScanFilterTest, DecimalsComparedInDouble) {
+  arrow::Decimal128Builder builder(arrow::decimal128(38, 10));
+  const Int128 scale = 10'000'000'000;
+  for (const std::optional<Int128>& v :
+       {std::optional<Int128>(Int128{90071992547409935} * 1'000'000'000), std::optional<Int128>{},
+        std::optional<Int128>(Int128{15} * 1'000'000'000), std::optional<Int128>(-scale),
+        std::optional<Int128>(Int128{0})}) {
+    const auto bits = static_cast<UInt128>(v.value_or(0));
+    const arrow::Decimal128 d(static_cast<int64_t>(bits >> 64U), static_cast<uint64_t>(bits));
+    ASSERT_TRUE((v.has_value() ? builder.Append(d) : builder.AppendNull()).ok());
+  }
+  const auto values = builder.Finish().ValueOrDie();
+  const auto batch = arrow::RecordBatch::Make(
+      arrow::schema({arrow::field("w", arrow::decimal128(38, 10))}), values->length(), {values});
+  const auto w = Column(0, "w", LogicalType::Decimal(38, 10));
+  const auto same_as_filter = [&](const plan::Predicate& p, const std::vector<bool>& expected,
+                                  const std::string& what) {
+    const auto filter = MakeScanFilter({p}, *batch->schema(), arrow::default_memory_pool());
+    ASSERT_TRUE(filter.ok()) << what << ": " << filter.status().ToString();
+    EXPECT_EQ(Expected({p}, *batch), expected) << what;
+    for (const int64_t shift : {int64_t{0}, int64_t{3}}) {
+      EXPECT_EQ(Applied(**filter, *batch, /*piece=*/64, shift), expected) << what;
+    }
+  };
+  same_as_filter(testing::Compare(w, CompareOp::kEq, Double(0x1p53)),
+                 {true, false, false, false, false}, "= 2^53");
+  same_as_filter(testing::Compare(w, CompareOp::kLt, Double(1.5)),
+                 {false, false, false, true, true}, "< 1.5");
+  same_as_filter(In(w, {Double(0x1p53), Double(-1.0)}, false), {true, false, false, true, false},
+                 "IN");
+  same_as_filter(In(w, {Double(0x1p53), Double(-1.0)}, true), {false, false, true, false, true},
+                 "NOT IN");
 }
 
 // columns() lists each column a predicate reads once, in the order of first use.

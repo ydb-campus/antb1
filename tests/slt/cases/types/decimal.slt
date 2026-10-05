@@ -1,7 +1,7 @@
 # DECIMAL(p,s) columns (ADR 0021, docs/sql-subset.md): decimals.parquet stores DECIMAL(9,2) as INT32, (18,4) and
 # (15,2) as INT64, and (38,10) and (38,0) as FIXED_LEN_BYTE_ARRAY. Values print with exactly s digits after the point;
-# literals fold exactly into the column's (p,s); keys compare by value. CASE values and mixed types are not supported
-# yet (onlyif duckdb records); arithmetic, SUM and AVG are in decimal_arithmetic.slt.
+# literals fold exactly into the column's (p,s); keys compare by value. Arithmetic, SUM and AVG are in
+# decimal_arithmetic.slt, comparisons with other types in decimal_comparisons.slt.
 
 query IDDDDDD nosort
 SELECT id, d9_2, d18_4, d38_10, d38_0, p, q FROM decimals ORDER BY id LIMIT 14
@@ -18,8 +18,8 @@ SELECT id, d9_2, d18_4, d38_10, d38_0, p, q FROM decimals ORDER BY id LIMIT 14
 9	-2.50	-2.0002	-2.0000000002	-99999999999999999999999999999999999999	NULL	NULL
 10	NULL	2.0002	2.0000000002	200000000000000000000	9999999999999.99	59.97
 11	-6.25	-5.0005	NULL	-500000000000000000000	-9999999999999.99	-59.97
-12	-1.25	NULL	-1.0000000001	NULL	-19.99	9999999999999.99
-13	3.75	3.0003	3.0000000003	300000000000000000000	59.97	-9999999999999.99
+12	-1.25	NULL	9007199254740992.5000000000	NULL	-19.99	9999999999999.99
+13	3.75	12345678901234.5678	12345678901234.5678000001	300000000000000000000	59.97	-9999999999999.99
 
 query IIIIII nosort
 SELECT COUNT(d9_2), COUNT(d18_4), COUNT(d38_10), COUNT(d38_0), COUNT(p), COUNT(q) FROM decimals
@@ -39,7 +39,7 @@ SELECT MIN(d38_0), MAX(d38_0), MIN(p), MAX(q) FROM decimals WHERE id > 13
 query IIII nosort
 SELECT COUNT(DISTINCT d9_2), COUNT(DISTINCT d18_4), COUNT(DISTINCT d38_0), COUNT(DISTINCT p) FROM decimals
 ----
-13	12	13	13
+13	13	13	13
 
 # Literal folding: integers, the column's scale, more digits than the scale (rounded by direction), out of range.
 
@@ -152,7 +152,7 @@ onlyif antb1
 query I nosort
 SELECT COUNT(*) FROM decimals WHERE d38_10 > 0.00000000001
 ----
-14
+15
 
 onlyif duckdb
 statement error out of range
@@ -162,7 +162,7 @@ SELECT COUNT(*) FROM decimals WHERE d38_10 > 0.00000000001
 query I nosort
 SELECT COUNT(*) FROM decimals WHERE d38_10 > 0
 ----
-14
+15
 
 query I rowsort
 SELECT id FROM decimals WHERE d38_0 = 99999999999999999999999999999999999999
@@ -227,7 +227,7 @@ SELECT COUNT(*) FROM decimals WHERE p NOT BETWEEN -20 AND 20
 query I nosort
 SELECT COUNT(*) FROM decimals WHERE p < -50 OR d38_10 > 3
 ----
-19
+20
 
 query I nosort
 SELECT COUNT(*) FROM decimals WHERE p > 0 OR q < 0
@@ -274,6 +274,7 @@ SELECT d18_4, MIN(q) FROM decimals GROUP BY d18_4 HAVING MIN(q) >= -59.975 AND M
 -3.0003	-59.97
 1.0001	19.99
 2.0002	39.98
+3.0003	59.97
 4.0004	79.96
 5.0005	99.95
 NULL	39.98
@@ -304,11 +305,11 @@ query ID nosort
 SELECT id, d38_10 FROM decimals ORDER BY d38_10 DESC NULLS LAST, id LIMIT 6
 ----
 6	9999999999999999999999999999.9999999999
+12	9007199254740992.5000000000
+13	12345678901234.5678000001
 8	5.0000000005
 19	5.0000000005
 30	5.0000000005
-5	4.0000000004
-16	4.0000000004
 
 query ID nosort
 SELECT id, d9_2 FROM decimals ORDER BY d9_2 NULLS FIRST, id LIMIT 8 OFFSET 3
@@ -405,24 +406,3 @@ SELECT p, q FROM decimals WHERE p <> q ORDER BY q DESC, p
 -9999999999999.99	-59.97
 -99.95	-79.96
 59.97	-9999999999999.99
-
-# Not supported yet (exit 4): mixed types and approximate literals (decimal_arithmetic.slt has
-# arithmetic, SUM and AVG).
-
-onlyif duckdb
-query I nosort
-SELECT COUNT(*) FROM decimals WHERE d9_2 = p
-----
-3
-
-onlyif duckdb
-query I nosort
-SELECT COUNT(*) FROM decimals WHERE p < id
-----
-18
-
-onlyif duckdb
-query I nosort
-SELECT COUNT(*) FROM decimals WHERE p > 1e1
-----
-14

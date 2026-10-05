@@ -404,6 +404,103 @@ TEST(DuckDbFloatOf, DoubleLiteralsAreNotConverted) {
   EXPECT_FALSE(DuckDbFloatOf("abc", false).has_value());
 }
 
+// DuckDB 1.5.5's typeof: an exponent, more than 38 digits with a point (leading zeros count) and an
+// integer outside -2^127 to 2^128 - 1 are DOUBLE; 2^127 to 2^128 - 1 is UHUGEINT, not DOUBLE.
+TEST(DuckDbTypesAsDouble, MatchesDuckDbTypeof) {
+  struct Case {
+    std::string_view text;
+    bool negative;
+    bool is_double;
+  };
+  for (const Case& c : {
+           Case{.text = "1e3", .negative = false, .is_double = true},
+           Case{.text = "2.5E-1", .negative = true, .is_double = true},
+           Case{.text = "1.00000000000000000000000000000000000001",
+                .negative = false,
+                .is_double = true},
+           Case{.text = "0.5000000000000000000000000000000000000",
+                .negative = false,
+                .is_double = false},
+           Case{.text = "00000000000000000000000000000000000000.5",
+                .negative = false,
+                .is_double = true},
+           Case{.text = "2.5", .negative = false, .is_double = false},
+           Case{.text = "7", .negative = true, .is_double = false},
+           Case{.text = "99999999999999999999999999999999999999",
+                .negative = false,
+                .is_double = false},
+           Case{.text = "170141183460469231731687303715884105727",
+                .negative = false,
+                .is_double = false},
+           Case{.text = "170141183460469231731687303715884105728",
+                .negative = false,
+                .is_double = false},
+           Case{.text = "340282366920938463463374607431768211455",
+                .negative = false,
+                .is_double = false},
+           Case{.text = "340282366920938463463374607431768211456",
+                .negative = false,
+                .is_double = true},
+           Case{.text = "170141183460469231731687303715884105728",
+                .negative = true,
+                .is_double = false},
+           Case{.text = "170141183460469231731687303715884105729",
+                .negative = true,
+                .is_double = true},
+           Case{.text = "1000000000000000000000000000000000000000",
+                .negative = false,
+                .is_double = true},
+       }) {
+    EXPECT_EQ(DuckDbTypesAsDouble(c.text, c.negative), c.is_double)
+        << (c.negative ? "-" : "") << c.text;
+  }
+  EXPECT_FALSE(DuckDbTypesAsDouble("abc", false));
+}
+
+// The double DuckDB 1.5.5 compares a literal as in DOUBLE (checked with CAST(<literal> AS DOUBLE)):
+// a decimal converts as its DECIMAL does (rule 8, not always the nearest double), a HUGEINT through
+// the 128-bit formula and a UHUGEINT through its own, and a DOUBLE literal is the nearest double.
+TEST(DuckDbDoubleOf, MatchesDuckDbCasts) {
+  struct Case {
+    std::string_view text;
+    bool negative;
+    double expected;
+  };
+  for (const Case& c : {
+           Case{.text = "9007199254740993.5", .negative = false, .expected = 0x1p53},
+           Case{.text = "9007199254740993.5", .negative = true, .expected = -0x1p53},
+           Case{.text = "0.1", .negative = false, .expected = 0.1},
+           Case{.text = "2.5", .negative = true, .expected = -2.5},
+           Case{.text = "9007199254740993", .negative = false, .expected = 0x1p53},
+           Case{.text = "9223372036854775807", .negative = false, .expected = 0x1p63},
+           // 2^64 + 2^63 + 2049: the 128-bit formula gives 27670116110564327424, the nearest double
+           // would be 27670116110564331520.
+           Case{.text = "27670116110564329473",
+                .negative = false,
+                .expected = 27670116110564327424.0},
+           // 2^127 + 2^74 + 1: the UHUGEINT formula gives 2^127, the nearest double 2^127 + 2^75.
+           Case{.text = "170141183460469250621153235194464960513",
+                .negative = false,
+                .expected = 0x1p127},
+           Case{.text = "1.5e1", .negative = false, .expected = 15.0},
+           Case{.text = "1.00000000000000000000000000000000000001",
+                .negative = false,
+                .expected = 1.0},
+           Case{.text = "340282366920938463463374607431768211457",
+                .negative = false,
+                .expected = 0x1p128},
+       }) {
+    const auto value = DuckDbDoubleOf(c.text, c.negative);
+    if (!value.has_value()) {
+      ADD_FAILURE() << c.text;
+      continue;
+    }
+    EXPECT_EQ(*value, c.expected) << (c.negative ? "-" : "") << c.text;
+  }
+  EXPECT_FALSE(DuckDbDoubleOf("abc", false).has_value());
+  EXPECT_FALSE(DuckDbDoubleOf("1.2.3", false).has_value());
+}
+
 // DuckDB 1.5.5's types of decimal literals (typeof): every digit counts, leading zeros too, and
 // the sign does not; an exponent, more than 38 digits or no point is not a DECIMAL literal.
 TEST(ParseDecimalLiteral, TypesLikeDuckDb) {

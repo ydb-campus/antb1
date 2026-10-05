@@ -16,6 +16,9 @@
 #include <arrow/compute/exec.h>
 
 #include "antb1/plan/logical_plan.h"
+#include "antb1/plan/types.h"
+
+#include "decimal.h"
 
 namespace antb1::exec {
 namespace {
@@ -63,13 +66,34 @@ arrow::Result<PredicateEvaluator> PredicateEvaluator::Make(const plan::Predicate
       return arrow::Status::Invalid("filter compares a column outside its input");
     }
     out.other_ = p.other->index;
+    // Numbers of two types compare in DOUBLE when one is DOUBLE, and exactly by value when one
+    // is a DECIMAL (or a HUGEINT) of another type; Arrow's kernels compare the other pairs (one
+    // type, or two integer types) in their common type, as DuckDB does.
+    const arrow::DataType& other_type = *schema.field(out.other_)->type();
+    const bool column_double = column_type.id() == arrow::Type::DOUBLE;
+    const bool other_double = other_type.id() == arrow::Type::DOUBLE;
+    const bool any_decimal =
+        column_type.id() == arrow::Type::DECIMAL128 || other_type.id() == arrow::Type::DECIMAL128;
+    if (column_double != other_double) {
+      out.mode_ = Mode::kInDouble;
+    } else if (any_decimal && !column_type.Equals(other_type)) {
+      out.mode_ = Mode::kExact;
+    }
   }
   if (p.kind == plan::Predicate::Kind::kIsTrue && column_type.id() != arrow::Type::BOOL) {
     return arrow::Status::Invalid("IS TRUE of a ", column_type.ToString(), " column");
   }
+  // A DOUBLE constant or IN list on a DECIMAL column compares in DOUBLE (ADR 0021 rule 11).
+  const bool decimal_column =
+      column_type.id() == arrow::Type::DECIMAL128 && p.column->type == plan::LogicalType::kDecimal;
+  const auto in_double = [&](const arrow::Scalar& constant) {
+    return decimal_column && constant.type->id() == arrow::Type::DOUBLE;
+  };
   if (p.kind == plan::Predicate::Kind::kCompare) {
     ARROW_ASSIGN_OR_RAISE(out.constant_, plan::ToArrowScalar(p.constant));
-    if (!out.constant_->type->Equals(column_type)) {
+    if (in_double(*out.constant_)) {
+      out.mode_ = Mode::kColumnToDouble;
+    } else if (!out.constant_->type->Equals(column_type)) {
       return arrow::Status::Invalid("filter compares a ", column_type.ToString(), " column with a ",
                                     out.constant_->type->ToString(), " constant");
     }
@@ -85,13 +109,23 @@ arrow::Result<PredicateEvaluator> PredicateEvaluator::Make(const plan::Predicate
     if (p.values.empty()) {
       return arrow::Status::Invalid("IN without values");
     }
+    std::size_t doubles = 0;
     for (const plan::Constant& value : p.values) {
       ARROW_ASSIGN_OR_RAISE(auto scalar, plan::ToArrowScalar(value));
-      if (!scalar->type->Equals(column_type)) {
+      if (in_double(*scalar)) {
+        ++doubles;
+      } else if (!scalar->type->Equals(column_type)) {
         return arrow::Status::Invalid("filter compares a ", column_type.ToString(),
                                       " column with a ", scalar->type->ToString(), " IN value");
       }
       out.values_.push_back(std::move(scalar));
+    }
+    if (doubles != 0 && doubles != p.values.size()) {
+      return arrow::Status::Invalid("an IN list mixes DOUBLE values with ", column_type.ToString(),
+                                    " values");
+    }
+    if (doubles != 0) {
+      out.mode_ = Mode::kColumnToDouble;
     }
   }
   return out;
@@ -106,24 +140,38 @@ arrow::Result<arrow::Datum> PredicateEvaluator::Evaluate(const arrow::RecordBatc
     return arrow::Datum(std::make_shared<arrow::BooleanScalar>(false));
   }
   arrow::Datum column(batch.column(column_));
+  if (mode_ == Mode::kColumnToDouble) {
+    ARROW_ASSIGN_OR_RAISE(const ArrayPtr converted, DecimalToDouble(*batch.column(column_), pool));
+    column = arrow::Datum(converted);
+  }
   switch (p.kind) {
     case plan::Predicate::Kind::kCompare:
       return arrow::compute::CallFunction(std::string(KernelName(p.op)), {column, constant_},
                                           &kernels);
     case plan::Predicate::Kind::kCompareColumns: {
-      // Arrow compares numbers of two types in their common type, as DuckDB does; with a DOUBLE
-      // that is DOUBLE, and a BIGINT beyond 2^53 rounds to it (Arrow's implicit cast refuses).
+      if (mode_ == Mode::kExact) {
+        ARROW_ASSIGN_OR_RAISE(
+            const ArrayPtr result,
+            CompareExact(*batch.column(column_), *batch.column(other_), p.op, pool));
+        return arrow::Datum(result);
+      }
       arrow::Datum left = column;
       arrow::Datum right(batch.column(other_));
-      const bool left_double = left.type()->id() == arrow::Type::DOUBLE;
-      const bool right_double = right.type()->id() == arrow::Type::DOUBLE;
-      if (left_double != right_double) {
-        arrow::compute::CastOptions to_double = arrow::compute::CastOptions::Safe(arrow::float64());
-        to_double.allow_float_truncate = true;
-        to_double.allow_decimal_truncate = true;
-        ARROW_ASSIGN_OR_RAISE(
-            (left_double ? right : left),
-            arrow::compute::Cast(left_double ? right : left, to_double, &kernels));
+      if (mode_ == Mode::kInDouble) {
+        // With a DOUBLE both compare in DOUBLE, as in DuckDB: a DECIMAL (a HUGEINT too) converts as
+        // DuckDB converts it (ADR 0021 rule 8), an integer rounds to the nearest double with
+        // Arrow's cast (a BIGINT beyond 2^53 too, which Arrow's implicit cast refuses).
+        arrow::Datum& other = left.type()->id() == arrow::Type::DOUBLE ? right : left;
+        if (other.type()->id() == arrow::Type::DECIMAL128) {
+          ARROW_ASSIGN_OR_RAISE(const ArrayPtr converted,
+                                DecimalToDouble(*other.make_array(), pool));
+          other = arrow::Datum(converted);
+        } else {
+          arrow::compute::CastOptions to_double =
+              arrow::compute::CastOptions::Safe(arrow::float64());
+          to_double.allow_float_truncate = true;
+          ARROW_ASSIGN_OR_RAISE(other, arrow::compute::Cast(other, to_double, &kernels));
+        }
       }
       return arrow::compute::CallFunction(std::string(KernelName(p.op)), {left, right}, &kernels);
     }

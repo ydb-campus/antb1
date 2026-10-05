@@ -2,7 +2,7 @@
 # tests/harness/fixture_digest.h). Every platform must generate exactly this. After an
 # intended generator change, rewrite it and commit it with the change:
 #   build/dev/bin/antb1-fixture-digest --write tests/fixtures/fixtures.digest build/dev/fixtures
-decimals.parquet rows=40 row_groups=8,8,8,8,8 schema=efac125fca6e39a42872d21cc970e8e6487073edd506e9622c53a63c70e8bcb6 data=6888a5a8f4971aba6eff89ca94b9dbc81cafe9249e0085d3fc35db2721a920dd
+decimals.parquet rows=40 row_groups=8,8,8,8,8 schema=57f357a200b59b9935962caf3583e0b999b59753b1bbff0b6321f9bc4f49b5af data=d2bda4456dcc7a722f5772e188463a6c809086fe55fdd7f2edcdc96897f0ccb2
 edge.parquet rows=12 row_groups=5,5,2 schema=56ddcd00e1f76862aae82d06f51fc409d46d4468118acde9139b222f34902327 data=ec7ec94235c07a581f56e6878b4cc04b4b6b4fb01c6d7131549519290674779d
 empty.parquet rows=0 row_groups=0 schema=63b4297bf3de643a6421d84e13a696ae7ea8df5de016da949223b5c2f3d07e2f data=aca24790d039c70912479c20710be001d1b00b1225bc855f4af96ff852b303fb
 floats.parquet rows=18 row_groups=8,8,2 schema=4df6e0bd65fccd4abc88f9a6f41a0eb0aaa5a9a3a0f74976eebb3fa98f28ee63 data=ff1570c7ebacf2179c0450104476fcfe14771e957b41039d63150a2ec022c194

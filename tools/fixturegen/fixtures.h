@@ -65,8 +65,10 @@ arrow::Result<std::shared_ptr<arrow::Table>> MakeFloatTable();
 // DECIMAL columns of every Parquet storage (fixtures.cc writes them as integers where they fit):
 // d9_2 DECIMAL(9,2) (INT32), d18_4 DECIMAL(18,4) (INT64), d38_10 DECIMAL(38,10) and d38_0
 // DECIMAL(38,0) (FIXED_LEN_BYTE_ARRAY), p and q DECIMAL(15,2) (INT64, for comparisons between
-// columns), with NULLs, negatives, zero, the precision's extremes and repeated values for keys.
-// 40 rows; id (INTEGER) numbers them.
+// columns), with NULLs, negatives, zero, the precision's extremes and repeated values for keys;
+// then b BIGINT (with its extremes and 2^53 + 1) and d DOUBLE (multiples of 0.625, whose sums are
+// exact in any order), for comparisons with other types. Rows 12 and 13 hold pairs of values that
+// are equal as doubles but not exactly. 40 rows; id (INTEGER) numbers them.
 arrow::Result<std::shared_ptr<arrow::Table>> MakeDecimalTable();
 
 // Writes table as Parquet: SNAPPY, row groups of at most row_group_rows rows, no stored

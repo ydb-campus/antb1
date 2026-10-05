@@ -40,6 +40,47 @@ std::optional<int64_t> Int128ToInt64(Int128 value) {
   return static_cast<int64_t>(value);
 }
 
+namespace {
+
+constexpr int kMaxPowerOfTen = 38;
+
+constexpr std::array<Int128, kMaxPowerOfTen + 1> kPowersOfTen = [] {
+  std::array<Int128, kMaxPowerOfTen + 1> powers{};
+  powers.at(0) = 1;
+  for (std::size_t i = 1; i < powers.size(); ++i) {
+    powers.at(i) = powers.at(i - 1) * 10;
+  }
+  return powers;
+}();
+
+}  // namespace
+
+Int128 PowerOfTen(int n) {
+  ANTB1_CHECK(n >= 0);
+  ANTB1_CHECK(n <= kMaxPowerOfTen);
+  return kPowersOfTen.at(static_cast<std::size_t>(n));
+}
+
+int CompareScaled(Int128 a, int a_scale, Int128 b, int b_scale) {
+  if (a_scale < b_scale) {
+    Int128 scaled = 0;
+    if (__builtin_mul_overflow(a, PowerOfTen(b_scale - a_scale), &scaled)) {
+      return a < 0 ? -1 : 1;
+    }
+    a = scaled;
+  } else if (b_scale < a_scale) {
+    Int128 scaled = 0;
+    if (__builtin_mul_overflow(b, PowerOfTen(a_scale - b_scale), &scaled)) {
+      return b < 0 ? 1 : -1;
+    }
+    b = scaled;
+  }
+  if (a == b) {
+    return 0;
+  }
+  return a < b ? -1 : 1;
+}
+
 double ExactDivideToDouble(Int128 numerator, int64_t denominator) {
   ANTB1_CHECK(denominator > 0);
   const Int128 den = denominator;

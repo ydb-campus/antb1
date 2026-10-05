@@ -349,6 +349,34 @@ struct LiteralOperand {
   }
 };
 
+// DECIMAL's largest width.
+constexpr int kMaxDecimalDigits = 38;
+
+// A DECIMAL or integer column as the DECIMAL(width, scale) DuckDB counts it as in a comparison: an
+// integer by its type, SMALLINT and USMALLINT (5,0), INTEGER (10,0), BIGINT (19,0) (ADR 0021 rule
+// 4).
+std::pair<int, int> DecimalShape(const GenColumn& c) {
+  if (c.kind == ValueKind::kDecimal) {
+    return {c.precision, c.scale};
+  }
+  if (c.min >= -32'768 && c.max <= 65'535) {
+    return {5, 0};
+  }
+  if (c.min >= std::numeric_limits<int32_t>::min() &&
+      c.max <= std::numeric_limits<int32_t>::max()) {
+    return {10, 0};
+  }
+  return {19, 0};
+}
+
+// The digits of DuckDB's common type of two DECIMAL or integer columns before its 38-digit cap
+// (ADR 0021 rule 10): the larger integer digits plus the larger scale.
+int CommonDigits(const GenColumn& a, const GenColumn& b) {
+  const auto [pa, sa] = DecimalShape(a);
+  const auto [pb, sb] = DecimalShape(b);
+  return std::max(pa - sa, pb - sb) + std::max(sa, sb);
+}
+
 // Whether SUM of a DECIMAL column over every row stays within DECIMAL(38,s): an overflow fails
 // antb1, while DuckDB returns up to 39 digits (a divergence).
 bool Summable(const GenColumn& c, int64_t rows) {
@@ -1212,6 +1240,12 @@ class Builder {
         In(c);
         return;
       }
+      // A DECIMAL column against another column of numbers. Only DECIMAL columns draw here, so
+      // the queries of other tables stay as they were.
+      if (c.kind == ValueKind::kDecimal && allowed_.Has(Feature::kCompareColumns) &&
+          rng_.Percent(15) && ColumnComparison(c)) {
+        return;
+      }
       // One draw picks the operator (roll % 7, as Pick did) and, with kBetween, now and then a
       // [NOT] BETWEEN instead of the plain comparison below (roll / 7), so that every seed keeps
       // generating the queries it did before kBetween, apart from those.
@@ -1263,6 +1297,38 @@ class Builder {
         tokens_.insert(tokens_.end(), lit.tokens.begin(), lit.tokens.end());
       }
     }
+  }
+
+  // c <op> other (or other <op> c) for a DECIMAL column c and another column of numbers: a DOUBLE
+  // one (compared in DOUBLE), or a DECIMAL or integer one whose common type with c has at most 38
+  // digits, where DuckDB compares exactly as antb1 does; beyond them DuckDB fails on a value its
+  // capped type cannot hold (divergence D13). Returns whether it wrote one.
+  bool ColumnComparison(const GenColumn& c) {
+    std::vector<const GenColumn*> others;
+    for (const GenColumn* other : comparable_) {
+      const bool number = other->kind == ValueKind::kDecimal ||
+                          other->kind == ValueKind::kInteger || other->kind == ValueKind::kDouble;
+      if (other != &c && number &&
+          (other->kind == ValueKind::kDouble || CommonDigits(c, *other) <= kMaxDecimalDigits)) {
+        others.push_back(other);
+      }
+    }
+    if (others.empty()) {
+      return false;
+    }
+    const GenColumn& other = *rng_.Pick(others);
+    const std::string_view op = rng_.Pick(kOps);
+    used_.Add(Feature::kCompareColumns);
+    if (rng_.Percent(30)) {
+      Column(other);
+      Symbol(Flip(op));
+      Column(c);
+    } else {
+      Column(c);
+      Symbol(op);
+      Column(other);
+    }
+    return true;
   }
 
   // c [NOT] BETWEEN lit AND high. The upper bound comes from the literal without another draw: an
@@ -1427,6 +1493,17 @@ class Builder {
     return rng_.Pick(choices);
   }
 
+  // A number with an exponent for a DECIMAL column: a sample value with e0 (DuckDB reads it as the
+  // nearest double, as antb1 does), or an edge.
+  std::string ExponentText(const GenColumn& c) {
+    static constexpr auto kEdges =
+        std::to_array<std::string_view>({"1e1", "2.5e0", "-1e-1", "1e28", "-1.5e2", "0e0"});
+    if (!c.samples.empty() && rng_.Percent(60)) {
+      return rng_.Pick(c.samples) + "e0";
+    }
+    return std::string(rng_.Pick(kEdges));
+  }
+
   Literal MakeLiteral(const GenColumn& c) {
     Literal lit;
     auto single = [&lit](std::string text, Feature feature) {
@@ -1460,6 +1537,20 @@ class Builder {
         break;
       }
       case ValueKind::kDecimal: {
+        // Now and then a number DuckDB types as DOUBLE, which both engines compare in DOUBLE
+        // (ADR 0021 rule 11), so does the rest of an IN list with it. Only DECIMAL columns draw
+        // here: an integer column compares such a number with the nearest doubles (divergence D7).
+        if (allowed_.Has(Feature::kDecimalLiteral) && rng_.Percent(10)) {
+          std::string text = ExponentText(c);
+          if (text.starts_with('-') && !allowed_.Has(Feature::kNegativeLiteral)) {
+            text.erase(0, 1);
+          }
+          if (text.starts_with('-')) {
+            lit.features.Add(Feature::kNegativeLiteral);
+          }
+          single(std::move(text), Feature::kDecimalLiteral);
+          break;
+        }
         std::string text = DecimalText(c);
         if (text.starts_with('-') && !allowed_.Has(Feature::kNegativeLiteral)) {
           text.erase(0, 1);
@@ -1614,7 +1705,7 @@ class Builder {
   // over a column: the values share c's kind (a literal of it, as DuckDB types CASE). Returns
   // whether the result is exact (not DOUBLE), or std::nullopt (nothing written).
   std::optional<bool> Case(const GenColumn& c) {
-    // DECIMAL CASE values are unsupported until roadmap PR D4b (ADR 0021).
+    // DECIMAL CASE values are unsupported until roadmap PR D4c (ADR 0021).
     if (!allowed_.Has(Feature::kCase) || comparable_.empty() || c.kind == ValueKind::kDecimal) {
       return std::nullopt;
     }

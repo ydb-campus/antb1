@@ -1,0 +1,4 @@
+Output: id:INTEGER
+Project id
+  Filter CAST(p AS DOUBLE) > 10 AND CAST(d9_2 AS DOUBLE) IN (1.25, 2) AND CAST(d38_10 AS DOUBLE) NOT IN (1, 2) AND p IS NOT NULL AND d18_4 < b
+    Scan table=d source=parquet(files=1, rows=40) columns=[id, d9_2, d18_4, d38_10, p, b]

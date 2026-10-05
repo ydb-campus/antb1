@@ -650,13 +650,39 @@ arrow::Result<std::shared_ptr<arrow::Table>> MakeDecimalTable() {
   }
   ARROW_ASSIGN_OR_RAISE(auto id_array, ids.Finish());
   arrays.push_back(id_array);
+  // Values equal to another column's as doubles but not exactly, so comparisons of two columns tell
+  // an exact comparison from one in DOUBLE: row 12's d38_10, 9007199254740992.5, becomes 2^53 in
+  // DOUBLE as row 12's b (2^53 + 1) does, and row 13's d18_4 and d38_10 differ only in the tenth
+  // decimal.
+  struct Pinned {
+    std::string_view column;
+    int row = 0;
+    std::string_view unscaled;
+  };
+  static constexpr std::array<Pinned, 3> kPinned = {{
+      {.column = "d38_10", .row = 12, .unscaled = "90071992547409925000000000"},
+      {.column = "d18_4", .row = 13, .unscaled = "123456789012345678"},
+      {.column = "d38_10", .row = 13, .unscaled = "123456789012345678000001"},
+  }};
+  // The pinned unscaled value of a row, or an empty view.
+  const auto pinned_of = [](std::string_view column, int row) {
+    for (const Pinned& p : kPinned) {
+      if (p.column == column && p.row == row) {
+        return p.unscaled;
+      }
+    }
+    return std::string_view{};
+  };
   for (std::size_t c = 0; c < columns.size(); ++c) {
     const Column& col = columns[c];
     const auto type = arrow::decimal128(col.precision, col.scale);
     arrow::Decimal128Builder builder(type);
     for (int i = 0; i < kRows; ++i) {
+      const std::string_view pinned = pinned_of(col.name, i);
       if (i % col.null_every == col.null_at) {
         ARROW_RETURN_NOT_OK(builder.AppendNull());
+      } else if (!pinned.empty()) {
+        ARROW_RETURN_NOT_OK(builder.Append(arrow::Decimal128(std::string(pinned))));
       } else if (i == col.max_row || i == col.max_row + 1) {
         const arrow::Decimal128 max = max_of(col.precision);
         const arrow::Decimal128 value = i == col.max_row ? max : arrow::Decimal128(-max);
@@ -671,6 +697,34 @@ arrow::Result<std::shared_ptr<arrow::Table>> MakeDecimalTable() {
     fields.push_back(arrow::field(col.name, type));
     arrays.push_back(array);
   }
+  // b BIGINT and d DOUBLE, for comparisons of DECIMALs with integer and DOUBLE columns. b holds
+  // the BIGINT extremes in rows 2 and 3 and 2^53 + 1 in row 12. Every d value is a multiple of
+  // 0.625 between -5 and 5, so its sums are exact in any order (antb1 adds a DOUBLE SUM row group
+  // by row group, DuckDB in one running sum), and row 7's equals d9_2 there (1.25); no -0.0.
+  arrow::Int64Builder bigints;
+  arrow::DoubleBuilder doubles;
+  for (int i = 0; i < kRows; ++i) {
+    const int base = ((i * 37) % 11) - 5;
+    if (i % 6 == 5) {
+      ARROW_RETURN_NOT_OK(bigints.AppendNull());
+    } else if (i == 2 || i == 3) {
+      ARROW_RETURN_NOT_OK(bigints.Append(i == 2 ? std::numeric_limits<int64_t>::max()
+                                                : std::numeric_limits<int64_t>::min()));
+    } else if (i == 12) {
+      ARROW_RETURN_NOT_OK(bigints.Append(9'007'199'254'740'993));
+    } else {
+      ARROW_RETURN_NOT_OK(bigints.Append(int64_t{base} * 3'000'000'019));
+    }
+    const int eighths = i == 7 ? 10 : (((i * 29) % 17) - 8) * 5;
+    ARROW_RETURN_NOT_OK(i % 9 == 4 ? doubles.AppendNull()
+                                   : doubles.Append(static_cast<double>(eighths) / 8));
+  }
+  ARROW_ASSIGN_OR_RAISE(auto bigint_array, bigints.Finish());
+  ARROW_ASSIGN_OR_RAISE(auto double_array, doubles.Finish());
+  fields.push_back(arrow::field("b", arrow::int64()));
+  arrays.push_back(bigint_array);
+  fields.push_back(arrow::field("d", arrow::float64()));
+  arrays.push_back(double_array);
   return arrow::Table::Make(arrow::schema(fields), arrays);
 }
 
