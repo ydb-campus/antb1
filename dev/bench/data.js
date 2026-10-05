@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791227400999,
+  "lastUpdate": 1791238645746,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -5076,6 +5076,114 @@ window.BENCHMARK_DATA = {
             "value": 14.895056425531942,
             "unit": "ms/iter",
             "extra": "iterations: 47\ncpu: 14.893050829787239 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "cc3ac341805dad2a024ea0bdd4410742a4f82b78",
+          "message": "feat(exec): a hash table for join builds (#97)\n\n## Summary\n\nRoadmap PR **E1** of the joins track ([ADR\n0022](docs/adr/0022-joins-and-query-blocks.md), \"Partitioned in part\norder (E1)\" and \"The join hash table (E1)\"): the build side of the hash\njoin, as a data structure that J1b's build sink and probe will use.\nNothing calls it yet. The physical planner still rejects joins with exit\ncode 4, and no query changes its answer: `tests/data/tpch_status.json`\nstays `{\"pass\": [1, 6]}` and ClickBench stays 43/43.\n\n**API.** New public header `src/exec/include/antb1/exec/join_table.h`;\nbench/ needs it, as it needs `SortBuffer`.\n- **`JoinBuildSpec::Make(schema, keys)`** returns `Invalid` for no keys,\na bad key index, a field type other than `plan::ToArrow(key.type)`, or a\nDOUBLE or BOOLEAN key. It never returns `NotImplemented`, which would\nexit 70.\n- **`JoinBuildPart::Append(batch, pool)`** handles one part on any\nworker:\n- drops unselected and NULL-key rows (`RowMask`, with a new overload\nover several columns);\n  - hashes the keys with GROUP BY's `KeyHashes`, unchanged;\n- splits the rows into 64 partitions with a stable counting sort on\n`hash % 64` and one Take per column;\n  - keeps the hashes, and counts input rows and NULL-key rows.\n- A part's containers are charged to the budget, so an out-of-memory\npart can be retried alone.\n- **`JoinTableBuilder`** takes the parts in any order. Reorder slots\nrelease them to `PartitionLanes` in part order. `Finish` builds the\npartitions in parallel, or one at a time under memory pressure.\n- **`JoinTable::Find`** is `const`, lock-free and shared by every probe\nthread. For each probe row it returns the range of its matches, in the\nbuild's (part, row) order. It also offers `unique()` for J1b's 1:1 path,\nand `has_null()` and `empty()` for E2's null-aware anti join.\n\n**Layouts.** Each key's rows are contiguous and in (part, row) order.\nThe layout depends on the data only, never on the thread count.\n- **Direct:** used for one integer-like key (SMALLINT, INTEGER, BIGINT,\nUSMALLINT, DATE, TIMESTAMP) whose value range is below 8 × the rows. The\nrange is computed in uint64. An offsets array indexes `key - min`.\n- **Hashed:** each partition has `bit_ceil(n)` buckets on `(hash >> 6) &\nmask`. A bucket holds **distinct-key slots** `{hash, begin, end}`, first\nseen first, so a probe compares keys, not rows, and gets its matches as\none range. This is the layout you chose. ADR 0022 gets one update line\nfor it, which is a CODEOWNERS path; the status stays Proposed.\n- Rows are referenced as `{chunk, row}` into the parts' batches, which\nare kept without a copy. A build of more than 2^32−1 rows is an\nout-of-memory error.\n- Key bytes are read through one helper that honours array offsets,\nbecause probes see sliced batches. Fixed-width keys are compared with\nmemcmp; VARCHAR keys compare lengths first, then bytes.\n\n**Small refactors:** the `RowMask` overload, `ForEach` moved next to\n`PartitionLanes`, and neutral out-of-memory texts.\n\n**Tests:**\n- 15 `exec.JoinTableTest` cases, run with no executor and with a\n4-thread pool:\n  - matches in part order;\n  - both layouts agree;\n- the direct layout's boundaries (8N−1 against 8N, the INT64 extremes);\n- keys of every type and several columns (DECIMAL, HUGEINT, VARCHAR\nincluding `''`, strings over 16 bytes and an embedded NUL);\n  - sliced batches;\n  - keys sharing a bucket;\n  - uniqueness and NULL flags;\n  - empty and NULL-only builds;\n  - parts arriving in any order and built on workers;\n  - the same table for any thread count;\n  - probes sharing the table;\n  - planner misuse;\n- out-of-memory sweeps of `Append`, the lanes, `Finish` and `Find`, with\nthe accounting back to 0.\n- `exec.RowMaskTest`.\n- `exec.PartitionLanesTest.ForEachReportsTheFirstFailureInIndexOrder`.\n- Benchmarks `BM_JoinTableBuild` and `BM_JoinTableProbe`: `/0` dense\nkeys (direct), `/1` random keys (hashed).\n\n**Docs:** `docs/architecture.md` (exec responsibilities, Memory, a \"Join\nbuilds\" paragraph), `docs/benchmarks.md` and the ADR 0022 update line.\n\nFor the maintainer:\n\n- **Size:** 4,415 lines inserted (src 1,488, tests 2,734, bench 153,\ndocs 40), against the ~1,500 we agreed. Most of the excess is tests:\nout-of-memory and allocation-failure sweeps, collision cases and\nRowMask.\n- **Differences from the plan:**\n- Hashing stays exact but skips unselected rows: when at most a quarter\nof a batch's rows are kept, only their keys are hashed. The hashes are\nbit-identical.\n- The hashed `Finish` runs one partition at a time when building all of\nthem at once would pass half the memory limit.\n- A probe's hashes are not charged to the budget, as in GROUP BY's\nrouting; the header says so.\n- **Benchmarks** (Release, no executor, quiet host; 1Mi rows in 16\nparts):\n  - build: 59 ms direct, 73 ms hashed;\n- probe of 1Mi keys: 2.4 ms direct, 51 ms hashed (about 49 ns per probe,\nbound by memory latency).\n  - J1b can add prefetching if profiles ask for it.\n- **Hand-off to J1b:**\n  - a build sink in `Open` over `PartScheduler` parts;\n- `Find` per probe batch with a (row, k) cursor capped at `batch_size`;\n  - the 1:1 path when `unique()`;\n  - a `Gather` over `JoinRowRef`.\n\n**Split review and fixes** (13 commits after the first review; two more\nreview rounds, the last one clean):\n- **`JoinTableBuilder`:**\n- A part counts as released before `Release` runs. A release that throws\nstores an OutOfMemory made ahead in `Make`, so no part is released twice\nor skipped.\n- A merge that fails on the executor fails every later `Add`, `Merged`\nand `Finish`.\n  - The earliest part's failure decides, as ADR 0022 says.\n- `JoinBuildSpec::Make`, `Merged` and `Finish` turn `std::bad_alloc`\ninto OutOfMemory.\n- **`ForEach` and `PartitionLanes`** (older code that E1 now relies on):\n- A throwing `Submit` no longer leaves tasks running or a lane counted\nas running.\n- `ForEach` waits for every task it submitted on every exit, including a\nsecond `std::bad_alloc`.\n- A lane that cannot queue a part still merges the parts before it, so\nno earlier error is lost.\n- GROUP BY's results and error precedence are unchanged.\n`PartitionLanes::Add` now returns a lane failure that it used to report\nonly at the next call.\n- **Tests:**\n  - `unique()` and the counts compared between serial and pool builds;\n  - reservations checked while a table or a part is alive;\n  - `Finish` right after the last `Add` on the pool;\n  - RowMask borrowing at a zero memory limit;\n  - parts without rows between others.\n- **New executable `antb1_exec_bad_alloc_tests`:** it replaces the\nglobal `operator new` with a hook armed per thread around single calls,\nso the join build, `ForEach` and the lanes see a real `std::bad_alloc`.\nASan's runtime symbol is weak; under TSan only this target links with\n`-fno-sanitize-link-c++-runtime`.\n- **Limits found by the hook** (`docs/architecture.md`): Arrow's\nthread-pool `Spawn` and the `arrow::Result` constructor from a `Status`\nend the process on `std::bad_alloc` inside `noexcept` code, so those two\npaths are not swept.\n- **Risk to watch:** on macOS,\n`ForEachBadAllocTest.AnExceptionLeavesOnlyOnceTheTasksHaveEnded` relies\non libarrow's allocations reaching the replaced `operator new`. If they\ndon't, that test hangs until its 120 s timeout in the macos-release leg.\n\nThis workload is derived from the TPC-H Benchmark and is not comparable\nto published TPC-H Benchmark results, as this implementation does not\ncomply with all requirements of the TPC-H Benchmark.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full                  # on 5f1bf97 (the head)\nlint: PASS\n100% tests passed out of 1844          # ci (clang Debug -Werror)\n100% tests passed out of 1844          # asan (ASan + UBSan)\n                                       # tidy: clean\ncoverage: PASS\n100% tests passed out of 2             # fuzz-smoke\n100% tests passed out of 1844          # ci-gcc\n$ pixi run tsan                        # advisory, on 5f1bf97\n100% tests passed out of 1844          # no ThreadSanitizer reports\n$ pixi run release                     # on 99fb714 (before the fixes)\n100% tests passed out of 1830          # includes bench.micro.smoke\n$ pixi run bench --benchmark_filter=JoinTable --benchmark_repetitions=5 --benchmark_report_aggregates_only=true   # on 99fb714\nBM_JoinTableBuild/0 59.2 ms, BM_JoinTableBuild/1 72.9 ms, BM_JoinTableProbe/0 2.37 ms, BM_JoinTableProbe/1 51.0 ms\n```\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: the ADR 0022 update line, as approved in the plan\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code implemented the\nmaintainer-approved E1 plan after a planning round of read-only mapping,\ndesign and adversarial critique agents. Its findings are in the plan:\nsliced key bytes, the bucket array's spare entry, the peak memory in\n`Finish`, and parts built on workers. The reviewer agent reviewed the\nfirst diff: no P0, P1 or P2; its one nit is fixed in 99fb714. An\nindependent three-area split review (layouts, memory and threads, tests\nand docs) then found 3 P1s and older exception-safety holes; fix rounds\nwith adversarial re-reviews followed until a round came back with no P0,\nP1 or P2 (nits remain for a follow-up commit).\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-10-06T01:15:00+03:00",
+          "tree_id": "0dd04574936fb49d337cf15158d8347c982cd568",
+          "url": "https://github.com/ydb-campus/antb1/commit/cc3ac341805dad2a024ea0bdd4410742a4f82b78"
+        },
+        "date": 1791238644700,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 3445.4176006641787,
+            "unit": "ns/iter",
+            "extra": "iterations: 202356\ncpu: 3445.1856826582853 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 73196.83772972919,
+            "unit": "ns/iter",
+            "extra": "iterations: 9250\ncpu: 73191.96010810813 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 84640.7036992273,
+            "unit": "ns/iter",
+            "extra": "iterations: 8272\ncpu: 84634.64688104448 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 375220.2416934633,
+            "unit": "ns/iter",
+            "extra": "iterations: 1866\ncpu: 375209.4072883173 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 353197.05241936137,
+            "unit": "ns/iter",
+            "extra": "iterations: 1984\ncpu: 353167.43397177436 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2163875.2910216744,
+            "unit": "ns/iter",
+            "extra": "iterations: 323\ncpu: 2163861.8049535607 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 41.31656911764694,
+            "unit": "ms/iter",
+            "extra": "iterations: 17\ncpu: 41.307916294117675 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 38.03005494444436,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 38.01271861111117 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 167.09261825000254,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 167.08471450000008 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 11.73426314999991,
+            "unit": "ms/iter",
+            "extra": "iterations: 60\ncpu: 11.733113933333339 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 16.48642795348837,
+            "unit": "ms/iter",
+            "extra": "iterations: 43\ncpu: 16.483391930232564 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 34.03779915000058,
+            "unit": "ms/iter",
+            "extra": "iterations: 20\ncpu: 34.036979499999994 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.0869712274143284,
+            "unit": "ms/iter",
+            "extra": "iterations: 642\ncpu: 1.0867870716510915 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 56.09032041666732,
+            "unit": "ms/iter",
+            "extra": "iterations: 12\ncpu: 56.08418383333324 ms\nthreads: 1"
           }
         ]
       }
