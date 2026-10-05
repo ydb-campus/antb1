@@ -682,6 +682,126 @@ TEST_F(ComputeTest, CaseEvaluatesEachBranchOnItsRows) {
   EXPECT_EQ((*none)->ToString(), (*x).ToString());
 }
 
+// A DECIMAL CASE casts each value to its type on the rows the value's branch takes, as DuckDB casts
+// (ADR 0021 rule 10): up exactly, down rounded half away from zero (beyond 38 digits a value can
+// gain a digit), an integer times 10^s. A value that does not fit fails with DuckDB's conversion
+// error, which names the column it casts, and only where its branch answers.
+TEST_F(ComputeTest, DecimalCaseValuesCastToTheCaseType) {
+  using Kind = plan::Predicate::Kind;
+  const auto make = [](plan::ExprPtr then, plan::ExprPtr otherwise, LogicalType type) {
+    const auto first = Condition(Kind::kCompare, plan::CompareOp::kLt, 3,
+                                 ColumnAt(0, LogicalType::kSmallInt));  // key < 3
+    return std::make_shared<const plan::Expr>(plan::Expr{
+        .node =
+            plan::CaseExpr{
+                .whens = {first}, .thens = {std::move(then)}, .otherwise = std::move(otherwise)},
+        .type = type,
+        .name = "case"});
+  };
+  const auto keys = Int16s({1, 2, 3, 4, 5});
+  // DECIMAL(15,2) and DECIMAL(9,4) give DECIMAL(17,4), exactly that Arrow type; row 2's p is not
+  // taken.
+  const LogicalType p = LogicalType::Decimal(15, 2);
+  const LogicalType r = LogicalType::Decimal(9, 4);
+  auto up = Eval(make(ColumnAt(1, p), ColumnAt(2, r), LogicalType::Decimal(17, 4)),
+                 {keys, Decimals(p, {"1700", "-25", "999999999999999", "1", std::nullopt}),
+                  Decimals(r, {"1", "2", "3", "-99999999", std::nullopt})});
+  ASSERT_TRUE(up.ok()) << up.status().ToString();
+  EXPECT_EQ(UnscaledText(**up), "decimal128(17, 4): 170000 -2500 3 -99999999 null");
+  // DECIMAL(38,10) next to DECIMAL(38,0) is DECIMAL(38,0): 1.5, -2.5, 0.4999999999 and
+  // -9999999999999999999999999999.5 round to 2, -3, 0 and -10^28.
+  const LogicalType z = LogicalType::Decimal(38, 10);
+  const LogicalType h = LogicalType::Decimal(38, 0);
+  auto down = Eval(make(ColumnAt(1, z), ColumnAt(2, h), h),
+                   {Int16s({1, 2, 1, 2, 5}),
+                    Decimals(z, {"15000000000", "-25000000000", "4999999999",
+                                 "-99999999999999999999999999995000000000", "0"}),
+                    Decimals(h, {"0", "0", "0", "0", "-7"})});
+  ASSERT_TRUE(down.ok()) << down.status().ToString();
+  EXPECT_EQ(UnscaledText(**down), "decimal128(38, 0): 2 -3 0 -10000000000000000000000000000 -7");
+  // An integer that does not fit DECIMAL(38,30) fails where it is taken, named by its column (an
+  // aggregate's output column too); a constant is not named.
+  const LogicalType n = LogicalType::Decimal(38, 30);
+  const auto bigint = Named(ColumnAt(1, LogicalType::kBigInt), "b");
+  const arrow::ArrayVector rows = {Int16s({1, 5}), Int64s({123456789, 99}),
+                                   Decimals(n, {"0", "1"})};
+  auto named = Eval(make(bigint, ColumnAt(2, n), n), rows);
+  EXPECT_TRUE(named.status().IsExecutionError()) << named.status().ToString();
+  EXPECT_EQ(named.status().message(),
+            "Could not cast value 123456789 to DECIMAL(38,30) when casting from source column b");
+  auto constant =
+      Eval(make(ConstantOf(-123456789, LogicalType::kInteger), ColumnAt(2, n), n), rows);
+  EXPECT_EQ(constant.status().message(), "Could not cast value -123456789 to DECIMAL(38,30)");
+  auto untaken = Eval(make(bigint, ColumnAt(2, n), n),
+                      {Int16s({5, 6}), Int64s({123456789, 99}), Decimals(n, {"1", std::nullopt})});
+  ASSERT_TRUE(untaken.ok()) << untaken.status().ToString();
+  EXPECT_EQ(UnscaledText(**untaken), "decimal128(38, 30): 1 null");
+  // A HUGEINT (an integer SUM) keeps the integer message; DECIMAL(15,2) next to it is
+  // DECIMAL(38,2).
+  auto huge = Eval(
+      make(Named(ColumnAt(1, LogicalType::kHugeInt), "sum(b)"), ColumnAt(2, p),
+           LogicalType::Decimal(38, 2)),
+      {Int16s({1}), Decimals(LogicalType::kHugeInt, {"10000000000000000000000000000000000000"}),
+       Decimals(p, {"0"})});
+  EXPECT_EQ(huge.status().message(),
+            "Could not cast value 10000000000000000000000000000000000000 to DECIMAL(38,2) when "
+            "casting from source column sum(b)");
+  // A DECIMAL value beyond its declared width (a file can hold one) fails like any value that does
+  // not fit, printed at its own scale.
+  const LogicalType tiny = LogicalType::Decimal(4, 2);
+  auto beyond = Eval(
+      make(ColumnAt(1, tiny), ColumnAt(2, LogicalType::Decimal(5, 2)), LogicalType::Decimal(5, 2)),
+      {Int16s({1}), Decimals(tiny, {"12345678"}), Decimals(LogicalType::Decimal(5, 2), {"0"})});
+  EXPECT_EQ(beyond.status().message(),
+            "Casting value \"123456.78\" to type DECIMAL(5,2) failed: value is out of range! when "
+            "casting from source column c");
+}
+
+// % of DECIMALs beyond 38 digits is DOUBLE, as DuckDB computes it: fmod of the operands converted
+// by rule 8 (a BIGINT to its nearest double, a HUGEINT by DuckDB's 128-bit formula), with the
+// dividend's sign (-0.0 too) and NULL for a zero divisor; with a DOUBLE operand a zero divisor
+// gives NaN, as for any DOUBLE %.
+TEST_F(ComputeTest, DecimalModuloBeyond38DigitsIsDouble) {
+  const LogicalType h = LogicalType::Decimal(38, 0);
+  const LogicalType half = LogicalType::Decimal(2, 1);
+  auto wide =
+      Eval(Arith(ArithOp::kModulo, ColumnAt(0, h), ColumnAt(1, half), LogicalType::kDouble),
+           {Decimals(h, {"-4", "7", std::nullopt, "3", "99999999999999999999999999999999999999"}),
+            Decimals(half, {"5", "25", "5", "0", "25"})});
+  ASSERT_TRUE(wide.ok()) << wide.status().ToString();
+  const auto& w = static_cast<const arrow::DoubleArray&>(**wide);
+  EXPECT_EQ(w.Value(0), 0.0);
+  EXPECT_TRUE(std::signbit(w.Value(0)));  // -4 % 0.5 is -0.0
+  EXPECT_EQ(w.Value(1), 2.0);
+  EXPECT_TRUE(w.IsNull(2));
+  EXPECT_TRUE(w.IsNull(3));  // a zero divisor: NULL, not NaN
+  EXPECT_EQ(w.Value(4), std::fmod(DuckDbDecimalToDouble(PowerOfTen(38) - 1, 38, 0), 2.5));
+  // HUGEINT: 2^64 + 2^63 + 2049 converts to 2^64 + 2^63 (DuckDB's formula).
+  auto huge =
+      Eval(Arith(ArithOp::kModulo, ColumnAt(0, LogicalType::kHugeInt), ColumnAt(1, half),
+                 LogicalType::kDouble),
+           {Decimals(LogicalType::kHugeInt, {"27670116110564329473"}), Decimals(half, {"25"})});
+  ASSERT_TRUE(huge.ok()) << huge.status().ToString();
+  EXPECT_EQ(static_cast<const arrow::DoubleArray&>(**huge).Value(0), std::fmod(0x1.8p64, 2.5));
+  // BIGINT % DECIMAL(38,30): 2^53 + 1 converts to 2^53.
+  const LogicalType n = LogicalType::Decimal(38, 30);
+  auto bigint =
+      Eval(Arith(ArithOp::kModulo, ColumnAt(0, LogicalType::kBigInt), ColumnAt(1, n),
+                 LogicalType::kDouble),
+           {Int64s({9007199254740993, 5}), Decimals(n, {"1500000000000000000000000000000", "0"})});
+  ASSERT_TRUE(bigint.ok()) << bigint.status().ToString();
+  const auto& b = static_cast<const arrow::DoubleArray&>(**bigint);
+  EXPECT_EQ(b.Value(0), std::fmod(0x1p53, 1.5));
+  EXPECT_TRUE(b.IsNull(1));
+  // With a DOUBLE operand: NaN for a zero divisor.
+  const LogicalType p = LogicalType::Decimal(15, 2);
+  auto with_double = Eval(Arith(ArithOp::kModulo, ColumnAt(0, LogicalType::kDouble), ColumnAt(1, p),
+                                LogicalType::kDouble),
+                          {Doubles({7.5}), Decimals(p, {"0"})});
+  ASSERT_TRUE(with_double.ok()) << with_double.status().ToString();
+  EXPECT_TRUE(std::isnan(static_cast<const arrow::DoubleArray&>(**with_double).Value(0)));
+}
+
 plan::ExprPtr Temporal(plan::Function function, plan::ExprPtr value, std::string text,
                        LogicalType type) {
   return std::make_shared<const plan::Expr>(plan::Expr{

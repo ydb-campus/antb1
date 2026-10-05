@@ -316,8 +316,6 @@ INSTANTIATE_TEST_SUITE_P(
                   "'2020-13-01'", "invalid date '2020-13-01'"},
         ErrorCase{"SELECT CASE WHEN i16 = 1 THEN '1' ELSE i16 END FROM t", kUnsupported, "'1'",
                   "a string literal as a CASE value next to SMALLINT values is not supported"},
-        ErrorCase{"SELECT CASE WHEN i16 = 1 THEN i16 ELSE 1.5 END FROM t", kUnsupported, "1.5",
-                  "a decimal literal as a CASE value is supported only next to a DOUBLE value"},
         ErrorCase{"SELECT CASE WHEN i16 = 1 THEN s = 'a' END FROM t", kUnsupported, "=",
                   "comparisons are only supported in conditions"},
         ErrorCase{"SELECT CASE WHEN 1 = 1 THEN i16 END FROM t", kUnsupported, "1",
@@ -426,11 +424,7 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT dt + 1 FROM t", kUnsupported, "+", "DATE arithmetic"},
         ErrorCase{"SELECT -u16 FROM t", kUnsupported, "-", "negating a USMALLINT is not supported"},
         ErrorCase{"SELECT SUM(i64) % 2 FROM t", kUnsupported, "%", "'%' in HUGEINT"},
-        // DECIMAL (ADR 0021). %: DuckDB computes it in DOUBLE beyond 38 digits (D4c).
-        ErrorCase{"SELECT h % 0.5 FROM t", kUnsupported, "%",
-                  "'%' of DECIMAL(38,0) and DECIMAL(2,1) is not supported"},
-        ErrorCase{"SELECT SUM(i64) % 2.5 FROM t", kUnsupported, "%",
-                  "'%' of DECIMAL(38,0) and DECIMAL(2,1) is not supported"},
+        // DECIMAL (ADR 0021).
         ErrorCase{"SELECT p + 'x' FROM dec", kBind, "+", "needs numbers"},
         ErrorCase{"SELECT z * z * z * z FROM dec", kBind, "*",
                   "Needed scale 40 to accurately represent the multiplication result"},
@@ -446,10 +440,21 @@ INSTANTIATE_TEST_SUITE_P(
                   "cannot compare 'h' is DECIMAL(38,0) with 'todatetime(i64)' is TIMESTAMP"},
         ErrorCase{"SELECT i16 FROM t GROUP BY i16 HAVING MIN(h) = MIN(s)", kBind, "=",
                   "cannot compare"},
-        ErrorCase{"SELECT CASE WHEN i = 1 THEN p END FROM dec", kUnsupported, "p",
-                  "DECIMAL CASE values are supported only next to a DOUBLE value"},
-        ErrorCase{"SELECT CASE WHEN i = 1 THEN p ELSE q END FROM dec", kUnsupported, "p",
-                  "DECIMAL CASE values are supported only next to a DOUBLE value"},
+        // DECIMAL CASE values fold from the ELSE through the THENs (ADR 0021 rule 10): the type
+        // folded so far is named first; a string literal that a DECIMAL type takes is unsupported
+        // (DuckDB casts it), one first in the fold is VARCHAR.
+        ErrorCase{"SELECT CASE WHEN i32 > 0 THEN h ELSE dt END FROM t", kBind, "h",
+                  "cannot mix values of type DATE and DECIMAL(38,0) in CASE"},
+        ErrorCase{"SELECT CASE WHEN i32 > 0 THEN h WHEN i32 > 1 THEN dt END FROM t", kBind, "dt",
+                  "cannot mix values of type DECIMAL(38,0) and DATE in CASE"},
+        ErrorCase{"SELECT CASE WHEN i32 > 0 THEN 'abc' WHEN i32 > 1 THEN h END FROM t", kBind, "h",
+                  "cannot mix values of type VARCHAR and DECIMAL(38,0) in CASE"},
+        ErrorCase{"SELECT CASE WHEN i32 > 0 THEN 7 WHEN i32 > 1 THEN h ELSE s END FROM t", kBind,
+                  "7", "cannot mix values of type VARCHAR and INTEGER in CASE"},
+        ErrorCase{"SELECT CASE WHEN i32 > 0 THEN h ELSE 'abc' END FROM t", kUnsupported, "'abc'",
+                  "a string literal as a CASE value next to DECIMAL(38,0) values is not supported"},
+        ErrorCase{"SELECT CASE WHEN i32 > 0 THEN 7 WHEN i32 > 1 THEN h ELSE '5' END FROM t",
+                  kUnsupported, "'5'", "a string literal as a CASE value next to DECIMAL"},
         ErrorCase{"SELECT COUNT(*) FROM dec WHERE p = 'x'", kBind, "'x'",
                   "cannot compare DECIMAL(15,2) column 'p' with a string"},
         ErrorCase{"SELECT SUM(i16) // 2 FROM t", kUnsupported, "//", "'//' in HUGEINT"},
@@ -1100,6 +1105,12 @@ TEST(BinderTest, DecimalLiteralsAndDivisionTypesLikeDuckDb) {
            Case{.expr = "i % 2.5", .type = dec(11, 1), .name = "(i % 2.5)"},
            Case{.expr = "b % 2.5", .type = dec(20, 1), .name = "(b % 2.5)"},
            Case{.expr = "z % 7", .type = dec(38, 10), .name = "(z % 7)"},
+           Case{.expr = "z % e", .type = dec(38, 10), .name = "(z % e)"},
+           // Beyond 38 digits % is DOUBLE.
+           Case{.expr = "z % 0.00000000001",
+                .type = LogicalType::kDouble,
+                .name = "(z % 0.00000000001)"},
+           Case{.expr = "SUM(b) % 2.5", .type = LogicalType::kDouble, .name = "(sum(b) % 2.5)"},
            Case{.expr = "7 % 2.5", .type = dec(11, 1), .name = "(7 % 2.5)"},
        }) {
     const std::string sql = "SELECT " + std::string(c.expr) + " FROM dec";
@@ -1111,24 +1122,112 @@ TEST(BinderTest, DecimalLiteralsAndDivisionTypesLikeDuckDb) {
   }
 }
 
-// A DECIMAL CASE value, a decimal literal or a negated one included, next to a DOUBLE value makes
-// the CASE DOUBLE, in either order (DuckDB 1.5.5's typeof); other DECIMAL common types wait for
-// D4c.
-TEST(BinderTest, DecimalCaseValuesNextToADoubleAreDouble) {
+// CASE values with a DECIMAL fold as in DuckDB 1.5.5 (typeof; ADR 0021 rule 10): from the ELSE
+// through the THENs in written order, so the order of the values matters; an integer literal (also
+// negated) takes an integer type it fits but counts by its own type next to a DECIMAL, `1 + 1` and
+// `7 + 0` count by their type; beyond 38 digits two DECIMALs lose scale, an integer keeps it; a
+// DOUBLE value makes the CASE DOUBLE.
+TEST(BinderTest, DecimalCaseValuesFoldLikeDuckDb) {
   const Catalog catalog = MakeCatalog();
-  for (const std::string_view expr : {
-           "CASE WHEN i = 1 THEN 1.5 ELSE f END",
-           "CASE WHEN i = 1 THEN f ELSE 1.5 END",
-           "CASE WHEN i = 1 THEN 1.5 ELSE 1e3 END",
-           "CASE WHEN i = 1 THEN -(1.5) ELSE f END",
-           "CASE WHEN i = 1 THEN p ELSE f END",
-           "CASE WHEN i = 1 THEN p * q WHEN i = 2 THEN 7 ELSE f END",
+  struct Case {
+    std::string_view table;
+    std::string_view expr;
+    LogicalType type;
+  };
+  const auto dec = [](int width, int scale) {
+    return LogicalType::Decimal(static_cast<std::uint8_t>(width), static_cast<std::uint8_t>(scale));
+  };
+  const LogicalType kDouble = LogicalType::kDouble;
+  for (const Case& c : {
+           Case{"dec", "CASE WHEN i > 0 THEN p ELSE 7 END", dec(15, 2)},
+           Case{"dec", "CASE WHEN i > 0 THEN r ELSE 7 END", dec(14, 4)},
+           Case{"dec", "CASE WHEN i > 0 THEN p ELSE b END", dec(21, 2)},
+           Case{"dec", "CASE WHEN i > 0 THEN p ELSE 2.5 END", dec(15, 2)},
+           Case{"dec", "CASE WHEN i > 0 THEN p END", dec(15, 2)},
+           // The order of the values: 7 next to s16 is SMALLINT, next to r INTEGER.
+           Case{"dec", "CASE WHEN i > 0 THEN 7 WHEN i > 1 THEN r ELSE s16 END", dec(9, 4)},
+           Case{"dec", "CASE WHEN i > 0 THEN r WHEN i > 1 THEN 7 ELSE s16 END", dec(14, 4)},
+           Case{"dec", "CASE WHEN i > 0 THEN u16 WHEN i > 1 THEN r ELSE s16 END", dec(14, 4)},
+           Case{"dec", "CASE WHEN i > 0 THEN r WHEN i > 1 THEN u16 ELSE s16 END", dec(9, 4)},
+           Case{"dec", "CASE WHEN i > 0 THEN 1 + 1 WHEN i > 1 THEN r ELSE s16 END", dec(14, 4)},
+           Case{"dec", "CASE WHEN i > 0 THEN 7 + 0 WHEN i > 1 THEN r ELSE s16 END", dec(14, 4)},
+           Case{"dec", "CASE WHEN i > 0 THEN -(7) WHEN i > 1 THEN r ELSE s16 END", dec(9, 4)},
+           Case{"dec", "CASE WHEN i > 0 THEN - - 7 WHEN i > 1 THEN r ELSE s16 END", dec(9, 4)},
+           Case{"dec", "CASE WHEN i > 0 THEN 40000 WHEN i > 1 THEN r ELSE s16 END", dec(14, 4)},
+           Case{"dec", "CASE WHEN i > 0 THEN -7 WHEN i > 1 THEN r ELSE u16 END", dec(14, 4)},
+           Case{"dec", "CASE WHEN i > 0 THEN 7 ELSE p END", dec(15, 2)},
+           Case{"dec", "CASE WHEN i > 0 THEN 7 WHEN i > 1 THEN p END", dec(15, 2)},
+           Case{"dec", "CASE WHEN i > 0 THEN 7 WHEN i > 1 THEN 8 ELSE p END", dec(15, 2)},
+           Case{"dec", "CASE WHEN i > 0 THEN p WHEN i > 1 THEN 7 ELSE 8 END", dec(15, 2)},
+           Case{"dec", "CASE WHEN i > 0 THEN 3000000000 ELSE p END", dec(21, 2)},
+           Case{"dec", "CASE WHEN i > 0 THEN 100000000000000000000 ELSE p END", dec(38, 2)},
+           Case{"dec", "CASE WHEN i > 0 THEN 2.5 ELSE 7 END", dec(11, 1)},
+           Case{"dec", "CASE WHEN i > 0 THEN 2.5 ELSE 1.25 END", dec(3, 2)},
+           Case{"dec", "CASE p WHEN 1.5 THEN r WHEN q THEN 7 ELSE e END", dec(18, 8)},
+           // Beyond 38 digits.
+           Case{"dec", "CASE WHEN i > 0 THEN z WHEN i > 1 THEN p ELSE r END", dec(38, 10)},
+           Case{"dec", "CASE WHEN i > 0 THEN z ELSE b END", dec(38, 10)},
+           Case{"dec", "CASE WHEN i > 0 THEN g ELSE b END", dec(29, 10)},
+           Case{"dec", "CASE WHEN i > 0 THEN e WHEN i > 1 THEN g ELSE z END", dec(38, 10)},
+           Case{
+               "dec",
+               "CASE WHEN i > 0 THEN z WHEN i > 1 THEN e ELSE 0.000000000000000000000000000001 END",
+               dec(38, 10)},
+           Case{"dec", "CASE WHEN i > 0 THEN b ELSE 0.000000000000000000000000000001 END",
+                dec(38, 30)},
+           Case{"t", "CASE WHEN i32 > 0 THEN h ELSE 1.5 END", dec(38, 0)},
+           Case{"t", "CASE WHEN i32 > 0 THEN h ELSE i64 END", dec(38, 0)},
+           Case{"t", "CASE WHEN i32 > 0 THEN -(1.5) ELSE h END", dec(38, 0)},
+           Case{"t", "CASE WHEN i32 > 0 THEN 1.5 ELSE i16 END", dec(6, 1)},
+           Case{"t", "CASE WHEN i32 > 0 THEN i16 WHEN i32 > 1 THEN 2.5 ELSE 7 END", dec(6, 1)},
+           Case{"t", "CASE WHEN i32 > 0 THEN 2.5 WHEN i32 > 1 THEN i16 ELSE 7 END", dec(11, 1)},
+           // A DOUBLE value, in any position.
+           Case{"dec", "CASE WHEN i = 1 THEN 1.5 ELSE f END", kDouble},
+           Case{"dec", "CASE WHEN i = 1 THEN f ELSE 1.5 END", kDouble},
+           Case{"dec", "CASE WHEN i = 1 THEN 1.5 ELSE 1e3 END", kDouble},
+           Case{"dec", "CASE WHEN i = 1 THEN -(1.5) ELSE f END", kDouble},
+           Case{"dec", "CASE WHEN i = 1 THEN p * q WHEN i = 2 THEN 7 ELSE f END", kDouble},
+           Case{"t", "CASE WHEN i32 > 0 THEN h ELSE d END", kDouble},
        }) {
-    const std::string sql = "SELECT " + std::string(expr) + " FROM dec";
+    const std::string sql = "SELECT " + std::string(c.expr) + " FROM " + std::string(c.table);
     auto plan = BindSql(sql, catalog);
     ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
-    EXPECT_EQ(plan->output[0].type, LogicalType::kDouble) << sql;
+    EXPECT_EQ(ToString(plan->output[0].type), ToString(c.type)) << sql;
   }
+}
+
+// Without a DECIMAL value antb1 types the CASE as before (divergence D20): the values that are no
+// literals first, then each integer literal takes their type when it fits; DuckDB folds from the
+// ELSE through the THENs, where a literal first in that order or next to another literal keeps its
+// own type, `-(7)` is a literal, and a string literal first in that order is VARCHAR.
+TEST(BinderTest, CaseTypesWithoutADecimalAreAntb1s) {
+  const Catalog catalog = MakeCatalog();
+  struct Case {
+    std::string_view expr;
+    LogicalType type;
+  };
+  for (const Case& c : {
+           // DuckDB: INTEGER, INTEGER, SMALLINT and a bind error (VARCHAR and DATE).
+           Case{"CASE WHEN i32 = 1 THEN 7 WHEN i32 = 2 THEN i16 END", LogicalType::kSmallInt},
+           Case{"CASE WHEN i32 = 1 THEN 8 WHEN i32 = 2 THEN i16 ELSE 7 END",
+                LogicalType::kSmallInt},
+           Case{"CASE WHEN i32 = 1 THEN -(7) ELSE i16 END", LogicalType::kInteger},
+           Case{"CASE WHEN i32 = 1 THEN '2020-01-01' WHEN i32 = 2 THEN dt END", LogicalType::kDate},
+       }) {
+    const std::string sql = "SELECT " + std::string(c.expr) + " FROM t";
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    EXPECT_EQ(plan->output[0].type, c.type) << sql;
+  }
+  // DuckDB: a bind error (VARCHAR and SMALLINT).
+  const auto string_first = BindSql(
+      "SELECT CASE WHEN i32 = 1 THEN 'a' WHEN i32 = 2 THEN i16 END "
+      "FROM t",
+      catalog);
+  ASSERT_FALSE(string_first.ok());
+  const auto detail = GetSqlError(string_first.status());
+  ASSERT_NE(detail, nullptr);
+  EXPECT_EQ(detail->kind(), SqlErrorDetail::Kind::kUnsupported);
 }
 
 // No integer-only rewrite applies to DECIMAL (ADR 0021 rule 18): SUM(p + 1) sums p + 1, and
@@ -1899,7 +1998,9 @@ TEST(BinderTest, DecimalAgainstAFloatColumnIsUnsupported) {
         "SELECT k FROM tf GROUP BY k HAVING MIN(p) = MIN(f)",
         "SELECT COUNT(*) FROM tf WHERE p BETWEEN f AND 1",
         "SELECT COUNT(*) FROM tf WHERE p BETWEEN 1 AND f",
-        "SELECT CASE WHEN p > f THEN 1 END FROM tf"}) {
+        "SELECT CASE WHEN p > f THEN 1 END FROM tf",
+        "SELECT CASE WHEN k > 0 THEN p ELSE f END FROM tf",
+        "SELECT CASE WHEN k > 0 THEN f ELSE p END FROM tf"}) {
     const auto plan = BindSql(sql, catalog);
     ASSERT_FALSE(plan.ok()) << sql;
     const auto detail = GetSqlError(plan.status());

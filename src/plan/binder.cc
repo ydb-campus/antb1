@@ -1718,9 +1718,10 @@ LogicalType DecimalOfInteger(LogicalType type) {
 // DuckDB's type of `l <op> r` for + - * % with a DECIMAL operand (a decimal literal included) and
 // the other a DECIMAL or an integer (ADR 0021 rules 4 to 6 and 9): for + - * the width beyond 18
 // digits is capped to 18 while both operands have at most 18 (DuckDB computes them in 64 bits),
-// and to 38 beyond that; % takes the common type, which DuckDB makes DOUBLE beyond 38 digits.
-arrow::Result<LogicalType> DecimalArithType(sql::BinaryOp sql_op, ArithOp op, const Typed& l,
-                                            const Typed& r, SourceSpan span) {
+// and to 38 beyond that; % takes the common type, and beyond 38 digits it is DOUBLE (DuckDB's fmod
+// of the operands converted by rule 8, NULL for a zero divisor).
+arrow::Result<LogicalType> DecimalArithType(ArithOp op, const Typed& l, const Typed& r,
+                                            SourceSpan span) {
   const auto decimal = [](LogicalType t) {
     return t == LogicalType::kDecimal ? t : DecimalOfInteger(t);
   };
@@ -1738,11 +1739,7 @@ arrow::Result<LogicalType> DecimalArithType(sql::BinaryOp sql_op, ArithOp op, co
     scale = std::max(sa, sb);
     width = std::max(pa - sa, pb - sb) + scale;
     if (width > kMax) {
-      return UnsupportedError(
-          std::format("'{}' of {} and {} is not supported (DuckDB computes it in DOUBLE beyond 38 "
-                      "digits)",
-                      sql::ToString(sql_op), ToString(a), ToString(b)),
-          span);
+      return LogicalType::kDouble;
     }
   } else if (op == ArithOp::kMultiply) {
     scale = sa + sb;
@@ -1805,7 +1802,7 @@ arrow::Result<LogicalType> ArithType(sql::BinaryOp sql_op, ArithOp op, const Typ
     return LogicalType::kDouble;
   }
   if (any_decimal) {
-    return DecimalArithType(sql_op, op, l, r, span);
+    return DecimalArithType(op, l, r, span);
   }
   LogicalType type = LogicalType::kHugeInt;
   if (l.literal && !r.literal && Fits(*l.expr, r.expr->type)) {
@@ -3088,13 +3085,44 @@ arrow::Result<Typed> Binder::BindBool(const sql::Expr& expr, const BindFn& bind,
 
 namespace {
 
+// The DECIMAL DuckDB gives two CASE values of which one is DECIMAL and the other a DECIMAL or an
+// integer type (ADR 0021 rule 10): with e the larger number of integer digits and s the larger
+// scale, DECIMAL(e + s, s), or DECIMAL(38, 38 - e) beyond 38 digits (the values are rounded); an
+// integer counts by its type's digits (SMALLINT 5, INTEGER 10, BIGINT 19, HUGEINT 38) and keeps
+// the DECIMAL's scale, so beyond 38 digits its large values fail to cast.
+LogicalType CaseDecimal(LogicalType decimal, LogicalType other) {
+  constexpr int kMax = LogicalType::kMaxDecimalWidth;
+  const int p = decimal.width();
+  const int s = decimal.scale();
+  if (other != LogicalType::kDecimal) {
+    const int digits = DecimalOfInteger(other).width();
+    return digits <= p - s ? decimal
+                           : LogicalType::Decimal(Narrow<std::uint8_t>(std::min(kMax, digits + s)),
+                                                  Narrow<std::uint8_t>(s));
+  }
+  const int integers = std::max(p - s, other.width() - other.scale());
+  const int scale = std::max<int>(s, other.scale());
+  if (integers + scale <= kMax) {
+    return LogicalType::Decimal(Narrow<std::uint8_t>(integers + scale),
+                                Narrow<std::uint8_t>(scale));
+  }
+  return LogicalType::Decimal(Narrow<std::uint8_t>(kMax), Narrow<std::uint8_t>(kMax - integers));
+}
+
 // The type DuckDB gives two CASE values (a string literal takes the other's type elsewhere).
 arrow::Result<LogicalType> CaseCommon(LogicalType a, LogicalType b, SourceSpan span) {
-  if (a == LogicalType::kDecimal || b == LogicalType::kDecimal) {
-    return UnsupportedError("DECIMAL CASE values are not supported", span);
-  }
   if (a == b) {
     return a;
+  }
+  if (a == LogicalType::kDecimal || b == LogicalType::kDecimal) {
+    const LogicalType decimal = a == LogicalType::kDecimal ? a : b;
+    const LogicalType other = a == LogicalType::kDecimal ? b : a;
+    if (other == LogicalType::kDouble) {
+      return LogicalType::kDouble;
+    }
+    if (other == LogicalType::kDecimal || IsInteger(other)) {
+      return CaseDecimal(decimal, other);
+    }
   }
   if (IsInteger(a) && IsInteger(b)) {
     // Unlike arithmetic, USMALLINT with SMALLINT is INTEGER here.
@@ -3116,6 +3144,122 @@ arrow::Result<LogicalType> CaseCommon(LogicalType a, LogicalType b, SourceSpan s
 bool IsStringLiteral(const sql::Expr& expr) {
   const auto* lit = std::get_if<sql::Literal>(&expr);
   return lit != nullptr && lit->kind == sql::Literal::Kind::kString;
+}
+
+// An integer literal as DuckDB's CASE typing sees one: plain, parenthesized or under unary minus
+// (DuckDB folds every minus of a literal into it), with its value and its type by value (INTEGER,
+// BIGINT or HUGEINT); `1 + 1` and `7 + 0` are none.
+std::optional<TypedConstant> CaseIntegerLiteral(const sql::Expr& expr) {
+  const sql::Expr* inner = &expr;
+  for (const auto* unary = std::get_if<sql::UnaryExpr>(inner);
+       unary != nullptr && unary->op == sql::UnaryOp::kNegate;
+       unary = std::get_if<sql::UnaryExpr>(inner)) {
+    inner = &*unary->operand;
+  }
+  const auto* lit = std::get_if<sql::Literal>(inner);
+  if (lit == nullptr || lit->kind != sql::Literal::Kind::kInteger ||
+      IsApproximateNumber(lit->text)) {
+    return std::nullopt;
+  }
+  auto folded = FoldTyped(expr);
+  if (!folded.has_value() || !folded->ok()) {
+    return std::nullopt;
+  }
+  return **folded;
+}
+
+// DuckDB's type of CASE values of which one is DECIMAL (ADR 0021 rule 10), folded from the ELSE
+// value's type as it is (a literal stays one; NULL without an ELSE) through the THEN values in
+// written order, so it can depend on their order. An integer literal takes an integer type it fits,
+// else the two types' common one, and counts by its own type next to a DECIMAL; a string literal
+// takes the type folded so far; next to NULL or another literal either becomes a plain type (the
+// string VARCHAR, the pair the integer's type). Values of other types are combined by CaseCommon,
+// the type folded so far named first in an error, as by DuckDB.
+arrow::Result<LogicalType> DecimalCaseType(const std::vector<Typed>& values,
+                                           const std::vector<const sql::Expr*>& exprs,
+                                           bool has_else) {
+  struct Folded {
+    enum class Kind : std::uint8_t { kNull, kPlain, kInteger, kString };
+    Kind kind = Kind::kNull;
+    LogicalType type = LogicalType::kVarchar;  // kPlain, and kInteger's own type
+    Int128 value = 0;                          // kInteger
+  };
+  std::vector<std::size_t> order;
+  if (has_else) {
+    order.push_back(values.size() - 1);
+  }
+  for (std::size_t i = 0; i + (has_else ? 1 : 0) < values.size(); ++i) {
+    order.push_back(i);
+  }
+  using enum Folded::Kind;
+  Folded folded;
+  const sql::Expr* string_literal = nullptr;
+  for (const std::size_t i : order) {
+    const sql::Expr& expr = *exprs[i];
+    const SourceSpan span = expr.span();
+    const bool first = &expr == exprs[order.front()];
+    if (values[i].stored_as_float) {
+      return UnsupportedError(
+          "a FLOAT column as a CASE value is not supported (antb1 reads FLOAT as DOUBLE, "
+          "divergence D11)",
+          span);
+    }
+    Folded next{.kind = kPlain, .type = values[i].expr->type, .value = 0};
+    if (IsStringLiteral(expr)) {
+      next.kind = kString;
+      if (string_literal == nullptr) {
+        string_literal = &expr;
+      }
+    } else if (const auto literal = CaseIntegerLiteral(expr)) {
+      next = Folded{.kind = kInteger, .type = literal->type, .value = literal->value};
+    }
+    if (first && has_else) {
+      folded = next;
+      continue;
+    }
+    if (folded.kind == kNull || (folded.kind != kPlain && next.kind != kPlain)) {
+      // Next to NULL or another literal: a plain type, the string VARCHAR, two literals the
+      // integer's type (or VARCHAR for two strings).
+      const bool integer = folded.kind == kInteger || next.kind == kInteger;
+      const LogicalType own = folded.kind == kInteger && next.kind == kInteger
+                                  ? CombineIntegers(folded.type, next.type)
+                                  : (next.kind == kInteger ? next.type : folded.type);
+      folded = Folded{.kind = kPlain,
+                      .type = next.kind == kString && !integer ? LogicalType::kVarchar
+                              : integer                        ? own
+                                                               : next.type,
+                      .value = 0};
+      continue;
+    }
+    if (next.kind == kString) {
+      continue;  // the string takes the folded type (a literal one stays a literal)
+    }
+    if (folded.kind == kString) {
+      folded = next;  // a plain type, which the string takes
+      continue;
+    }
+    // A plain type and a plain type or an integer literal; the literal takes an integer type it
+    // fits.
+    if (folded.kind == kInteger || next.kind == kInteger) {
+      const Int128 value = folded.kind == kInteger ? folded.value : next.value;
+      const LogicalType plain = folded.kind == kInteger ? next.type : folded.type;
+      const IntegerRange range = IsInteger(plain) ? RangeOf(plain) : IntegerRange{};
+      if (IsInteger(plain) && value >= range.min && value <= range.max) {
+        folded = Folded{.kind = kPlain, .type = plain, .value = 0};
+        continue;
+      }
+    }
+    ARROW_ASSIGN_OR_RAISE(const LogicalType type, CaseCommon(folded.type, next.type, span));
+    folded = Folded{.kind = kPlain, .type = type, .value = 0};
+  }
+  if (string_literal != nullptr) {
+    // DuckDB casts the string to the number.
+    return UnsupportedError(std::format("a string literal as a CASE value next to {} values is not "
+                                        "supported",
+                                        ToString(folded.type)),
+                            string_literal->span());
+  }
+  return folded.type;
 }
 
 }  // namespace
@@ -3147,15 +3291,25 @@ arrow::Result<Typed> Binder::BindCase(const sql::CaseExpr& c, const BindFn& bind
     values.push_back(std::move(otherwise));
     value_exprs.push_back(&**c.otherwise);
   }
-  // DuckDB's type: the values' common type, where an integer literal takes the others' integer
-  // type when it fits and a string literal any type (DATE: the date it spells).
+  // With a DECIMAL value (a decimal literal too), DuckDB's fold of rule 10 types the CASE, and each
+  // value is cast to it on the rows that take it; a DOUBLE value makes it DOUBLE, the DECIMALs
+  // converted as DuckDB converts them (ADR 0021 rules 8 and 10).
+  if (std::ranges::any_of(values,
+                          [](const Typed& v) { return v.expr->type == LogicalType::kDecimal; })) {
+    ARROW_ASSIGN_OR_RAISE(const LogicalType type,
+                          DecimalCaseType(values, value_exprs, c.otherwise.has_value()));
+    for (std::size_t i = 0; i < c.branches.size(); ++i) {
+      node.thens.push_back(std::move(values[i].expr));
+    }
+    if (c.otherwise.has_value()) {
+      node.otherwise = std::move(values.back().expr);
+    }
+    return Leaf(Expr{.node = std::move(node), .type = type, .name = CaseName(c)});
+  }
+  // Otherwise DuckDB's type is the values' common type, where an integer literal takes the others'
+  // integer type when it fits and a string literal any type (DATE: the date it spells); antb1 takes
+  // the non-literal values first, so some orders type differently (divergence D20).
   std::optional<LogicalType> type;
-  // A DECIMAL value (a decimal literal too) next to a DOUBLE value makes the CASE DOUBLE, whatever
-  // the order of the values, the DECIMAL converted as DuckDB converts it (ADR 0021 rule 8); any
-  // other DECIMAL common type is rule 10's for CASE values (roadmap PR D4c).
-  const bool any_double = std::ranges::any_of(values, [](const Typed& v) {
-    return v.expr->type == LogicalType::kDouble && !v.stored_as_float;
-  });
   for (const bool literals : {false, true}) {
     for (std::size_t i = 0; i < values.size(); ++i) {
       const Typed& v = values[i];
@@ -3167,17 +3321,6 @@ arrow::Result<Typed> Binder::BindCase(const sql::CaseExpr& c, const BindFn& bind
         return UnsupportedError(
             "a FLOAT column as a CASE value is not supported (antb1 reads FLOAT as DOUBLE, "
             "divergence D11)",
-            span);
-      }
-      if (v.expr->type == LogicalType::kDecimal) {
-        if (any_double) {
-          continue;  // the DOUBLE value types the CASE
-        }
-        return UnsupportedError(
-            v.decimal
-                ? "a decimal literal as a CASE value is supported only next to a DOUBLE value "
-                  "(DuckDB types the CASE DECIMAL)"
-                : "DECIMAL CASE values are supported only next to a DOUBLE value",
             span);
       }
       if (!type.has_value()) {

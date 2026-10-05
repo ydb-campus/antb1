@@ -76,10 +76,12 @@ arrow::Result<ArrayPtr> CastTo(const ArrayPtr& values, const std::shared_ptr<arr
   return cast.make_array();
 }
 
-// // and % of two arrays of one type, as DuckDB computes them.
+// // and % of two arrays of one type, as DuckDB computes them. A DOUBLE % gives NaN for a zero
+// divisor, or NULL with null_for_zero (DuckDB's % of DECIMALs beyond 38 digits, computed in
+// DOUBLE).
 template <class ArrayType, class BuilderType>
 arrow::Result<ArrayPtr> DivideOrModulo(const arrow::Array& left, const arrow::Array& right,
-                                       plan::ArithOp op, plan::LogicalType type,
+                                       plan::ArithOp op, plan::LogicalType type, bool null_for_zero,
                                        arrow::MemoryPool* pool) {
   using T = ArrayType::value_type;
   const auto& l = static_cast<const ArrayType&>(left);
@@ -94,7 +96,9 @@ arrow::Result<ArrayPtr> DivideOrModulo(const arrow::Array& left, const arrow::Ar
     const T x = l.Value(i);
     const T y = r.Value(i);
     if constexpr (std::is_floating_point_v<T>) {
-      if (op == plan::ArithOp::kModulo) {
+      if (op == plan::ArithOp::kModulo && null_for_zero && y == 0) {
+        builder.UnsafeAppendNull();
+      } else if (op == plan::ArithOp::kModulo) {
         builder.UnsafeAppend(std::fmod(x, y));  // NaN for a zero divisor, as in DuckDB
       } else if (y == 0) {
         builder.UnsafeAppendNull();
@@ -120,19 +124,24 @@ arrow::Result<ArrayPtr> DivideOrModulo(const arrow::Array& left, const arrow::Ar
 }
 
 arrow::Result<ArrayPtr> DivideOrModulo(const arrow::Array& left, const arrow::Array& right,
-                                       plan::ArithOp op, plan::LogicalType type,
+                                       plan::ArithOp op, plan::LogicalType type, bool null_for_zero,
                                        arrow::MemoryPool* pool) {
   switch (left.type_id()) {
     case arrow::Type::INT16:
-      return DivideOrModulo<arrow::Int16Array, arrow::Int16Builder>(left, right, op, type, pool);
+      return DivideOrModulo<arrow::Int16Array, arrow::Int16Builder>(left, right, op, type,
+                                                                    null_for_zero, pool);
     case arrow::Type::INT32:
-      return DivideOrModulo<arrow::Int32Array, arrow::Int32Builder>(left, right, op, type, pool);
+      return DivideOrModulo<arrow::Int32Array, arrow::Int32Builder>(left, right, op, type,
+                                                                    null_for_zero, pool);
     case arrow::Type::INT64:
-      return DivideOrModulo<arrow::Int64Array, arrow::Int64Builder>(left, right, op, type, pool);
+      return DivideOrModulo<arrow::Int64Array, arrow::Int64Builder>(left, right, op, type,
+                                                                    null_for_zero, pool);
     case arrow::Type::UINT16:
-      return DivideOrModulo<arrow::UInt16Array, arrow::UInt16Builder>(left, right, op, type, pool);
+      return DivideOrModulo<arrow::UInt16Array, arrow::UInt16Builder>(left, right, op, type,
+                                                                      null_for_zero, pool);
     case arrow::Type::DOUBLE:
-      return DivideOrModulo<arrow::DoubleArray, arrow::DoubleBuilder>(left, right, op, type, pool);
+      return DivideOrModulo<arrow::DoubleArray, arrow::DoubleBuilder>(left, right, op, type,
+                                                                      null_for_zero, pool);
     default:
       break;
   }
@@ -225,17 +234,7 @@ arrow::Status RescaleOperand(DecimalOperand& operand, plan::LogicalType result) 
     Int128 scaled = 0;
     if (__builtin_mul_overflow(operand.values[i], factor, &scaled) || scaled < range.min ||
         scaled > range.max) {
-      const std::string target = std::format("DECIMAL({},{})", result.width(), result.scale());
-      const std::string suffix =
-          operand.column.empty() ? "" : " when casting from source column " + operand.column;
-      if (decimal) {
-        return arrow::Status::ExecutionError(
-            "Casting value \"",
-            plan::FormatDecimal(operand.values[i], operand.type.width(), operand.type.scale()),
-            "\" to type ", target, " failed: value is out of range!", suffix);
-      }
-      return arrow::Status::ExecutionError(
-          "Could not cast value ", Int128ToString(operand.values[i]), " to ", target, suffix);
+      return DecimalCastError(operand.values[i], operand.type, result, operand.column);
     }
     operand.values[i] = scaled;
   }
@@ -835,7 +834,11 @@ struct Evaluator {
     ARROW_ASSIGN_OR_RAISE(left, CastTo(left, type, ctx));
     ARROW_ASSIGN_OR_RAISE(right, CastTo(right, type, ctx));
     if (arith.op == plan::ArithOp::kIntegerDivide || arith.op == plan::ArithOp::kModulo) {
-      return DivideOrModulo(*left, *right, arith.op, e.type, pool);
+      // DuckDB computes % of DECIMALs beyond 38 digits in DOUBLE, NULL for a zero divisor; NaN
+      // only with a DOUBLE operand.
+      const bool null_for_zero = arith.left->type != plan::LogicalType::kDouble &&
+                                 arith.right->type != plan::LogicalType::kDouble;
+      return DivideOrModulo(*left, *right, arith.op, e.type, null_for_zero, pool);
     }
     if (e.type == plan::LogicalType::kHugeInt) {
       return HugeIntArith(*left, right.get(), arith.op, pool);
@@ -918,7 +921,7 @@ struct Evaluator {
       ARROW_ASSIGN_OR_RAISE(
           const ArrayPtr compact,
           EvaluateSelected(*boolean.args[i], static_cast<const arrow::BooleanArray&>(*open_rows),
-                           arrow::boolean()));
+                           plan::LogicalType::kBoolean));
       // Decided rows get NULL, which the decided side absorbs (false AND NULL, true OR NULL).
       ARROW_ASSIGN_OR_RAISE(const ArrayPtr next, Scatter(unknown, open_rows, compact));
       ARROW_ASSIGN_OR_RAISE(const arrow::Datum both,
@@ -928,17 +931,18 @@ struct Evaluator {
     return result;
   }
 
-  // The values of `expr` in the rows `mask` (no NULLs) selects, in row order; only those rows are
-  // computed, so an expression never fails on a row it does not answer (as in DuckDB's CASE).
+  // The values of `expr` in the rows `mask` (no NULLs) selects, in row order, as `target`; only
+  // those rows are computed and cast, so an expression never fails on a row it does not answer (as
+  // in DuckDB's CASE).
   arrow::Result<ArrayPtr> EvaluateSelected(const plan::Expr& expr, const arrow::BooleanArray& mask,
-                                           const std::shared_ptr<arrow::DataType>& type) const {
+                                           plan::LogicalType target) const {
     const int64_t selected = mask.true_count();
     if (selected == batch.num_rows()) {
       ARROW_ASSIGN_OR_RAISE(ArrayPtr values, (*this)(expr));
-      return CastTo(values, type, ctx);
+      return Convert(values, expr, target);
     }
     if (selected == 0) {
-      return arrow::MakeArrayOfNull(type, 0, pool);
+      return arrow::MakeArrayOfNull(plan::ToArrow(target), 0, pool);
     }
     // Only the columns the expression reads are filtered; the others are NULL placeholders.
     std::vector<int> reads;
@@ -959,7 +963,19 @@ struct Evaluator {
     const auto rows = arrow::RecordBatch::Make(batch.schema(), selected, std::move(columns));
     ARROW_ASSIGN_OR_RAISE(ArrayPtr values,
                           (Evaluator{.batch = *rows, .pool = pool, .ctx = ctx})(expr));
-    return CastTo(values, type, ctx);
+    return Convert(values, expr, target);
+  }
+
+  // The values of `expr` as `target`: to a DECIMAL as DuckDB casts them (CASE values, ADR 0021 rule
+  // 10; a failed cast names a column), otherwise as CastTo converts them.
+  arrow::Result<ArrayPtr> Convert(const ArrayPtr& values, const plan::Expr& expr,
+                                  plan::LogicalType target) const {
+    if (target == plan::LogicalType::kDecimal && expr.type != target) {
+      const std::string column =
+          std::holds_alternative<plan::ColumnExpr>(expr.node) ? expr.name : std::string();
+      return CastToDecimal(*values, expr.type, target, column, pool);
+    }
+    return CastTo(values, plan::ToArrow(target), ctx);
   }
 
   // `values` (one per true row of `mask`) put at those rows of `into`.
@@ -981,9 +997,8 @@ struct Evaluator {
       return arrow::Status::Invalid("CASE with ", c.whens.size(), " conditions and ",
                                     c.thens.size(), " values");
     }
-    const auto type = plan::ToArrow(e.type);
     const int64_t n = batch.num_rows();
-    ARROW_ASSIGN_OR_RAISE(ArrayPtr result, arrow::MakeArrayOfNull(type, n, pool));
+    ARROW_ASSIGN_OR_RAISE(ArrayPtr result, arrow::MakeArrayOfNull(plan::ToArrow(e.type), n, pool));
     ARROW_ASSIGN_OR_RAISE(ArrayPtr remaining,
                           arrow::MakeArrayFromScalar(arrow::BooleanScalar(true), n, pool));
     ARROW_ASSIGN_OR_RAISE(const ArrayPtr no_condition,
@@ -991,7 +1006,7 @@ struct Evaluator {
     for (std::size_t i = 0; i < c.whens.size(); ++i) {
       const auto& open = static_cast<const arrow::BooleanArray&>(*remaining);
       ARROW_ASSIGN_OR_RAISE(ArrayPtr compact,
-                            EvaluateSelected(*c.whens[i], open, arrow::boolean()));
+                            EvaluateSelected(*c.whens[i], open, plan::LogicalType::kBoolean));
       ARROW_ASSIGN_OR_RAISE(const ArrayPtr condition, Scatter(no_condition, remaining, compact));
       // Taken: the condition is true (NULL counts as false), on an open row.
       ARROW_ASSIGN_OR_RAISE(
@@ -1003,7 +1018,7 @@ struct Evaluator {
       ARROW_ASSIGN_OR_RAISE(
           ArrayPtr values,
           EvaluateSelected(*c.thens[i], static_cast<const arrow::BooleanArray&>(*taken_rows),
-                           type));
+                           e.type));
       ARROW_ASSIGN_OR_RAISE(result, Scatter(result, taken_rows, values));
       ARROW_ASSIGN_OR_RAISE(const arrow::Datum rest,
                             arrow::compute::CallFunction("and_not", {remaining, taken_rows}, ctx));
@@ -1013,7 +1028,7 @@ struct Evaluator {
       ARROW_ASSIGN_OR_RAISE(
           ArrayPtr values,
           EvaluateSelected(*c.otherwise, static_cast<const arrow::BooleanArray&>(*remaining),
-                           type));
+                           e.type));
       ARROW_ASSIGN_OR_RAISE(result, Scatter(result, remaining, values));
     }
     return result;
