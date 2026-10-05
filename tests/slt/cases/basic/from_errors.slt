@@ -185,6 +185,22 @@ onlyif duckdb
 statement error ^Parser Error:
 SELECT COUNT(*) FROM edge 'e'
 
+# A parameter or a bit string is no alias either (an escape or dollar-quoted string is: exit 4).
+
+statement error
+SELECT COUNT(*) FROM edge AS $1
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge AS $1
+
+statement error
+SELECT COUNT(*) FROM edge AS B'1'
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge AS B'1'
+
 # The words that are never table aliases: without what gives them a meaning, a syntax error.
 
 statement error

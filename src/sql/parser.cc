@@ -1909,6 +1909,18 @@ class Parser {
       if (name.kind == TokenKind::kString && name.text.empty()) {  // DuckDB allows it
         return Unsupported(name.span, "an empty table alias ('') is not supported");
       }
+      // DuckDB also takes an escape string (E'x') or a dollar-quoted string ($$x$$, $tag$x$tag$) as
+      // the alias here; each lexes as a token and an adjacent string or $-token. $1, $x and the
+      // other prefixes (B'1', N'x') stay syntax errors, as in DuckDB.
+      const Token& next = PeekAt(1);
+      const bool adjacent = next.span.offset == name.span.offset + name.span.length;
+      if (name.kind == TokenKind::kParameter && adjacent && next.kind == TokenKind::kParameter &&
+          (name.text.size() == 1 || name.text[1] < '0' || name.text[1] > '9')) {
+        return Unsupported(name.span, "dollar-quoted strings are not supported");
+      }
+      if (KeywordOf(name) == "E" && adjacent && next.kind == TokenKind::kString) {
+        return Unsupported(name.span, "prefixed strings (E'...') are not supported");
+      }
       if (!IsTableAlias(name, /*after_as=*/true)) {
         if (const NotAnAlias* word = FindNotAnAlias(name)) {
           return Syntax(name.span, NotAnAliasMessage(*word));

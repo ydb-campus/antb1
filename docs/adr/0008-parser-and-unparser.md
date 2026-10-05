@@ -60,11 +60,11 @@ Accepted
   `[INNER] JOIN ... ON`, `LEFT [OUTER] JOIN ... ON`), table aliases and qualified names `t.x`; the binder rejects them
   with `kUnsupported` before any table resolves, until the binder answers them.
   - The 49 words that DuckDB 1.5.5 refuses as table aliases and antb1 does not reserve stay unreserved (they remain
-    column, table and function names), but are never read as aliases. Their meaning depends on the place: after a
-    FROM item and after an `ON` condition each is `kUnsupported` where DuckDB gives it a meaning there (told by the
-    next token: `SEMI JOIN`, `AT (`, `TABLESAMPLE 10%`, ...), and a syntax error anywhere else, as in DuckDB. A harness
-    test compares every DuckDB keyword as a table alias with DuckDB itself, so that a DuckDB update that gives a word
-    a meaning is noticed.
+    column, table and function names), but are never read as aliases. Their meaning depends on the place: after a FROM
+    item and after an `ON` condition each is `kUnsupported` where DuckDB gives it a meaning there (told by the next one
+    or two tokens: `SEMI JOIN`, `ASOF LEFT JOIN`, `AT (`, `TABLESAMPLE 10%`, ...), and a syntax error anywhere else, as
+    in DuckDB. A harness test compares every DuckDB keyword as a table alias with DuckDB itself, so that a DuckDB update
+    that gives a word a meaning is noticed.
   - After `AS` a table alias may also be a non-empty string literal or one of the reserved words `BETWEEN`, `EXISTS`,
     `INTERVAL` and `OVER`, as in DuckDB. The longest keyword is now `AUTHORIZATION` (13 letters).
   - The join keywords left the table of unsupported clauses: where DuckDB has no join (`SELECT 1 JOIN u`, a `JOIN`

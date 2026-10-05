@@ -199,13 +199,14 @@ Outside the grammar, the parser recognizes common SQL and rejects it with exit c
 than integers. In FROM: `JOIN ... USING`, `NATURAL`, `RIGHT` and `FULL` joins, `SEMI`, `ANTI`, `ASOF` and `POSITIONAL`
 joins, nested joins (a `JOIN` before the `ON` of an earlier one) and joins in parentheses, `LATERAL`, `schema.table`,
 `ONLY`, table functions, column alias lists (`t AS a(x, y)`), `PIVOT`, `UNPIVOT`, `AT (...)` (time travel),
-`TABLESAMPLE`, a trailing comma and an empty string alias (`AS ''`). Malformed SQL, such as `SELECT COUNT(*) FORM t`,
-is a syntax error with exit code 1, and so is a join keyword where DuckDB has none (`SELECT 1 JOIN u`, a `JOIN` after
-`WHERE`) or without the rest of its join (`LEFT u`, `NATURAL LEFT u`, also before the `ON` of a `JOIN`), a trailing
-comma before `FROM` or `INTO`, and a table or a path in parentheses that `)`, `,` or the end follows. An unsupported
-construct is reported at its first token, and the parser looks at most three tokens ahead, so a malformed FROM form
-that starts like an unsupported one is unsupported too (exit code 4, where DuckDB gives a syntax error), such as a
-table in parentheses that anything else follows (`FROM (t a)`) or `NATURAL LEFT OUTER u`.
+`TABLESAMPLE`, a trailing comma, and an empty, escape or dollar-quoted string as a table alias (`AS ''`, `AS E'x'`,
+`AS $$x$$`, which DuckDB accepts). Malformed SQL, such as `SELECT COUNT(*) FORM t`, is a syntax error with exit code 1,
+and so is a join keyword where DuckDB has none (`SELECT 1 JOIN u`, a `JOIN` after `WHERE`) or without the rest of its
+join (`LEFT u`, `NATURAL LEFT u`, also before the `ON` of a `JOIN`), a trailing comma of the FROM list before `FROM` or
+`INTO` (`FROM t, FROM u`), and a table or a path in parentheses that `)`, `,`, `;` or the end follows. An unsupported
+construct is reported at its first token, and the parser looks at most three tokens ahead, so a malformed FROM form that
+starts like an unsupported one is unsupported too (exit code 4, where DuckDB gives a syntax error), such as a table in
+parentheses that anything else follows (`FROM (t a)`) or `NATURAL LEFT OUTER u`.
 
 ## Binding
 
