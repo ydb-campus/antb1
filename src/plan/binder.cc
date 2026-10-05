@@ -1101,8 +1101,8 @@ arrow::Result<Predicate> BindEquality(const sql::Comparison& cmp, const BoundCol
 // number it types as DOUBLE every number is a double, so each value is then bound as that DOUBLE
 // would be. A DECIMAL column then compares in DOUBLE with every value (ADR 0021 rule 11), and the
 // list is DOUBLE for any number DuckDB types so (DuckDbTypesAsDouble). Other columns look for an
-// exponent or more than 38 digits: an integer column folds the nearest doubles exactly
-// (divergence D7), and a FLOAT column takes no FLOAT literals.
+// exponent or a decimal of more than 38 digits: an integer column folds the nearest doubles
+// exactly (divergence D7), and a FLOAT column takes no FLOAT literals.
 arrow::Result<Predicate> BindIn(const sql::Comparison& cmp, const BoundColumn& column,
                                 bool stored_as_float) {
   const bool negated = cmp.op == sql::CompareOp::kNotIn;
@@ -1206,10 +1206,10 @@ arrow::Result<Predicate> BindEquality(const sql::Comparison& cmp, const BoundCol
       if (!number) {
         return mismatch("write a number without quotes");
       }
-      // A number DuckDB types as DOUBLE (an exponent, more than 38 digits, an integer beyond
-      // UHUGEINT), or any number of an IN list with one, is compared in DOUBLE, not folded: the
-      // literal as DuckDB converts it to DOUBLE, the column as DuckDB converts a DECIMAL (ADR 0021
-      // rules 8 and 11), so `p = 1e-1` holds for 0.10.
+      // A number DuckDB types as DOUBLE (an exponent, a decimal of more than 38 digits, an integer
+      // outside -2^127 to 2^128 - 1), or any number of an IN list with one, is compared in DOUBLE,
+      // not folded: the literal as DuckDB converts it to DOUBLE, the column as DuckDB converts a
+      // DECIMAL (ADR 0021 rules 8 and 11), so `p = 1e-1` holds for 0.10.
       if (as_double || DuckDbTypesAsDouble(lit.text, lit.negative)) {
         const auto value = DuckDbDoubleOf(lit.text, lit.negative);
         if (!value.has_value()) {
@@ -1219,9 +1219,9 @@ arrow::Result<Predicate> BindEquality(const sql::Comparison& cmp, const BoundCol
         return p;
       }
       // The literal in the column's scale, folded exactly like an integer literal into an integer
-      // column: 1.5 in DECIMAL(15,2) is 150, and x <= 12.345 is x <= 12.34 (ADR 0021 rule 11). A
-      // HUGEINT or UHUGEINT literal beyond the type folds to a constant, where DuckDB fails to cast
-      // it to its capped common type (divergence D13).
+      // column: 1.5 in DECIMAL(15,2) is 150, and x <= 12.345 is x <= 12.34 (ADR 0021 rule 11). An
+      // integer literal beyond the type folds to a constant, where DuckDB fails to cast one of more
+      // than 38 - s digits to its capped common type DECIMAL(38,s) (divergence D13).
       const auto exact = ParseExactNumber(lit.text, lit.negative, column.type.scale());
       if (!exact.has_value()) {
         return BindError("invalid number " + Clip(lit.text), lit.span);
@@ -3152,7 +3152,7 @@ arrow::Result<Typed> Binder::BindCase(const sql::CaseExpr& c, const BindFn& bind
   std::optional<LogicalType> type;
   // A DECIMAL value (a decimal literal too) next to a DOUBLE value makes the CASE DOUBLE, whatever
   // the order of the values, the DECIMAL converted as DuckDB converts it (ADR 0021 rule 8); any
-  // other DECIMAL common type is rule 10's (roadmap PR D4b).
+  // other DECIMAL common type is rule 10's for CASE values (roadmap PR D4c).
   const bool any_double = std::ranges::any_of(values, [](const Typed& v) {
     return v.expr->type == LogicalType::kDouble && !v.stored_as_float;
   });

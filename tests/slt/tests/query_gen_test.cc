@@ -167,7 +167,7 @@ TEST(QueryGenerator, QueriesRespectTheSemanticsBothEnginesShare) {
     if (q.features.Has(Feature::kStar) && q.table == "big") {
       EXPECT_TRUE(q.features.Has(Feature::kLimit)) << q.sql;
     }
-    // DECIMAL columns: no CASE values yet (D4b); arithmetic with integer and decimal literals,
+    // DECIMAL columns: no CASE values yet (D4c); arithmetic with integer and decimal literals,
     // / // % included; no literal with more than 10 fraction digits (w's scale; m has spare
     // digits), which DuckDB would compare in a DECIMAL capped at 38 digits (divergence D13).
     // Layout comments could hide a match.

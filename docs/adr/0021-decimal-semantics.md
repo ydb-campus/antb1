@@ -125,9 +125,10 @@ This amends ADR 0012's list of unsupported constructs and three points of ADR 00
     - **With an integer or decimal literal:** folded exactly into the operand's (p,s) at bind time, as integer
       columns are folded today (ADR 0004). `price < 12.345` becomes `price <= 12.34`, `price >= 12.345` becomes
       `price >= 12.35`, and `price = 12.345` is never true. A literal beyond the type's range makes the comparison
-      constant, NULL still rejected, and a never-true one does not compute the operand (divergence D14). Folding is
-      never an error, also for an integer literal of HUGEINT or UHUGEINT size, which DuckDB fails to cast (divergence
-      D13). An IN list of such literals is folded value by value.
+      constant, NULL still rejected, and a never-true one that is a whole `WHERE` or `HAVING` conjunct does not compute
+      the operand (divergence D14). Folding is never an error, also for an integer literal of more than 38 - s digits,
+      which DuckDB fails to cast to its capped DECIMAL(38,s) (divergence D13). An IN list of such literals is folded
+      value by value.
     - **Two operands that are not literals,** DECIMAL with DECIMAL or with an integer (`price < rate`, `price = b`):
       compared exactly by value.
     - **Both give DuckDB's rows wherever DuckDB answers.** DuckDB compares in rule 10's type, which is exact below
@@ -144,9 +145,9 @@ This amends ADR 0012's list of unsupported constructs and three points of ADR 00
     - **BETWEEN** takes DuckDB's one common type of its three values. Where that is DOUBLE and antb1 would compare
       a pair exactly (a DECIMAL operand with a bound that is not DOUBLE, or a DECIMAL bound), the BETWEEN is
       unsupported (exit code 4); otherwise its two comparisons give DuckDB's rows.
-    - **Other operands:** a string literal is a bind error (divergence D3); a DATE or VARCHAR operand is a bind
-      error, as for any number. DuckDB rejects it for `<` and the like, but casts a VARCHAR operand for `=`, `<>` and
-      IN, and fails on a DATE only when a row is compared (divergence D4).
+    - **Other operands:** a string literal is a bind error (divergence D3); a DATE, TIMESTAMP or VARCHAR operand is a
+      bind error, as for any number. DuckDB rejects it for `<` and the like, but casts a VARCHAR operand for `=`, `<>`
+      and IN, and fails on a DATE or TIMESTAMP only when a row is compared (divergence D4).
 12. **SUM** of DECIMAL(p,s) is DECIMAL(38,s), summed exactly in Int128 (the HUGEINT sum states), so its value
     depends on neither the thread count, nor the parts, nor the order of the rows. Over no rows it is NULL.
     `SUM(price)` and `SUM(price * n)` are DECIMAL(38,2), `SUM(rate)` is DECIMAL(38,3). A sum beyond 10^38 - 1 in
@@ -213,9 +214,9 @@ This amends ADR 0012's list of unsupported constructs and three points of ADR 00
     with a conversion error, in comparisons and join keys alike, as for
     `price < 1.0000000000000000000000000000000000001` (DuckDB casts `price` to DECIMAL(38,37)) or a DECIMAL(38,2)
     against a DECIMAL(38,12) past 26 integer digits;
-  - divergence D14, extended to DECIMAL operands: a comparison that rule 11 folds to never true computes nothing.
-    Over a row whose product needs more than 18 digits, `price * qty > 100000000000000000000` returns no rows, where
-    DuckDB computes the product and fails (`Overflow in multiplication of DECIMAL(18)`);
+  - divergence D14, extended to DECIMAL operands: a `WHERE` or `HAVING` conjunct that rule 11 folds to never true
+    computes nothing. Over a row whose product needs more than 18 digits, `price * qty > 100000000000000000000`
+    returns no rows, where DuckDB computes the product and fails (`Overflow in multiplication of DECIMAL(18)`);
   - a new divergence: a DECIMAL SUM beyond 38 digits is an error.
 
   The unregistered difference of reading a Parquet DECIMAL(38,0) column as HUGEINT goes away, and AVG needs no

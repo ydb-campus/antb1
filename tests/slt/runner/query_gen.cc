@@ -1705,7 +1705,7 @@ class Builder {
   // over a column: the values share c's kind (a literal of it, as DuckDB types CASE). Returns
   // whether the result is exact (not DOUBLE), or std::nullopt (nothing written).
   std::optional<bool> Case(const GenColumn& c) {
-    // DECIMAL CASE values are unsupported until roadmap PR D4b (ADR 0021).
+    // DECIMAL CASE values are unsupported until roadmap PR D4c (ADR 0021).
     if (!allowed_.Has(Feature::kCase) || comparable_.empty() || c.kind == ValueKind::kDecimal) {
       return std::nullopt;
     }

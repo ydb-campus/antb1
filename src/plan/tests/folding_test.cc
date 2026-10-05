@@ -378,8 +378,8 @@ INSTANTIATE_TEST_SUITE_P(
         FoldCase{"p * q <= 0.00001", kCompare, CompareOp::kLe, 0},
         FoldCase{"-p < -1.5", kCompare, CompareOp::kLt, -150},
         FoldCase{"p + i >= 99999999999999.995", kFalse},
-        // A HUGEINT or UHUGEINT literal folds as well, where DuckDB fails to cast it to its capped
-        // common type DECIMAL(38,s) (divergence D13).
+        // An integer literal of more than 38 - s digits folds as well, where DuckDB fails to cast
+        // it to its capped common type DECIMAL(38,s) (divergence D13).
         FoldCase{"p < 100000000000000000000000000000000000000", kIsNotNull},
         FoldCase{"p = 170141183460469231731687303715884105728", kFalse},
         FoldCase{"z > -170141183460469231731687303715884105728", kIsNotNull},
