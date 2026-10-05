@@ -125,8 +125,10 @@ std::optional<OrderedQuery> MakeOrderedQuery(std::string_view sql) {
         return std::nullopt;
       }
       expr = stmt->items[position - 1].expr;
-    } else if (const auto* ref = std::get_if<sql::ColumnRef>(&expr)) {
-      // A select alias comes first (the last item with it), as in the binder and DuckDB.
+    } else if (const auto* ref = std::get_if<sql::ColumnRef>(&expr);
+               ref != nullptr && ref->qualifier.empty()) {
+      // A select alias comes first (the last item with it), as in the binder and DuckDB; a
+      // qualified name (t.x) is always a column.
       const std::string wanted = Lower(ref->name);
       for (std::size_t n = stmt->items.size(); n > 0; --n) {
         const auto& alias = stmt->items[n - 1].alias;

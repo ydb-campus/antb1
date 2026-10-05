@@ -59,11 +59,15 @@ antb1_add_gtest(
   LIBS antb1_slt_lib Parquet::parquet_shared
 )
 if(ANTB1_HAVE_DUCKDB)
-  # Against the DuckDB library: plan::DuckDbFloatOf on seeded random literals, long runs of ties and
-  # the adapter's DECIMAL columns.
+  # Against the DuckDB library: plan::DuckDbFloatOf on seeded random literals, long runs of ties, the
+  # adapter's DECIMAL columns and the keywords DuckDB reads as table aliases.
   target_sources(
     antb1_slt_tests
-    PRIVATE tests/duckdb_engine_test.cc tests/float_literal_oracle_test.cc tests/ordered_compare_oracle_test.cc
+    PRIVATE
+      tests/duckdb_engine_test.cc
+      tests/float_literal_oracle_test.cc
+      tests/ordered_compare_oracle_test.cc
+      tests/table_alias_oracle_test.cc
   )
 endif()
 

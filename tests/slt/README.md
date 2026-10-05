@@ -138,7 +138,10 @@ pixi run diff-random --list --target-percent 100        # print generated querie
 
 ctest runs `diff.random` (label `diff`) with a fixed seed and 300 queries. A slice PR that implements a
 feature adds it to `kSupportedFeatures` (and new grammar to `runner/query_gen.cc`; the unit test
-`harness.QueryGenerator.TargetSamplesCoverTheWholeGrammar` fails until every feature is generated).
+`harness.QueryGenerator.TargetSamplesCoverTheWholeGrammar` fails until every feature is generated). Grammar that
+the parser accepts before the generator writes it waits in `kGeneratorPending` (today the FROM lists, joins, table
+aliases and qualified names, which ADR 0022's T1 and T2 teach the generator); such a feature cannot be declared
+supported until it leaves that set.
 
 ## Data tests: `queries` and `clickbench`
 

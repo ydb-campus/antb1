@@ -19,7 +19,8 @@
 //
 // A slice PR that implements a feature adds it to kSupportedFeatures in the same PR. New grammar
 // gets a new Feature (above the out-of-scope marker), a name in FeatureName() and generator support
-// in runner/query_gen.cc.
+// in runner/query_gen.cc, or, while a later PR teaches the generator, a place in
+// kGeneratorPending.
 
 namespace antb1::slt {
 
@@ -50,8 +51,13 @@ enum class Feature : std::uint8_t {
   kDecimalColumns,  // DECIMAL(p,s), p <= 38: literals, keys, MIN, MAX, COUNT, SUM, AVG, + - * / //
                     // % by integer and decimal literals, comparisons with other numbers
   // FROM
-  kTableName,  // a registered table
-  kTablePath,  // '<file or glob>'
+  kTableName,      // a registered table
+  kTablePath,      // '<file or glob>'
+  kCommaJoin,      // FROM a, b and FROM a CROSS JOIN b
+  kJoinOn,         // FROM a [INNER] JOIN b ON ...
+  kLeftJoin,       // FROM a LEFT [OUTER] JOIN b ON ...
+  kTableAlias,     // FROM t [AS] a
+  kQualifiedName,  // t.x
   // WHERE
   kWhere,            // WHERE column <op> literal (=, <>, !=, <, <=, >, >=)
   kWhereAnd,         // several comparisons joined by AND
@@ -142,6 +148,16 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "table_name";
     case Feature::kTablePath:
       return "table_path";
+    case Feature::kCommaJoin:
+      return "comma_join";
+    case Feature::kJoinOn:
+      return "join_on";
+    case Feature::kLeftJoin:
+      return "left_join";
+    case Feature::kTableAlias:
+      return "table_alias";
+    case Feature::kQualifiedName:
+      return "qualified_name";
     case Feature::kWhere:
       return "where";
     case Feature::kWhereAnd:
@@ -262,6 +278,14 @@ using FeatureSet = BasicFeatureSet<Feature, kFeatureCount>;
 // Out-of-scope markers, valid in `-- features:` tags and never generated (see the Feature enum).
 inline constexpr FeatureSet kNeverGenerated = {Feature::kWindowFunctions};
 
+// Grammar that the parser accepts ahead of the random generator (runner/query_gen.cc), which
+// learns it in a later PR (ADR 0022: T1 the joins, aliases and qualified names, T2 LEFT JOIN) and
+// then removes it from this set. Valid in `-- features:` tags, and never in kSupportedFeatures
+// while pending (checked below), so that no feature is declared supported before it is generated.
+inline constexpr FeatureSet kGeneratorPending = {Feature::kCommaJoin, Feature::kJoinOn,
+                                                 Feature::kLeftJoin, Feature::kTableAlias,
+                                                 Feature::kQualifiedName};
+
 // What antb1 answers today: the whole slice grammar of docs/sql-subset.md (global and grouped
 // aggregates, projections, WHERE conjunctions of column <op> literal, ORDER BY, LIMIT and OFFSET)
 // over every column type, in any case, quoting and layout. Listed feature by feature, so a Feature
@@ -320,5 +344,8 @@ inline constexpr FeatureSet kSupportedFeatures = {
 };
 static_assert(kSupportedFeatures.Minus(kNeverGenerated) == kSupportedFeatures,
               "kSupportedFeatures must not declare an out-of-scope marker (kNeverGenerated)");
+static_assert(
+    kSupportedFeatures.Minus(kGeneratorPending) == kSupportedFeatures,
+    "kSupportedFeatures must not declare a feature the generator lacks (kGeneratorPending)");
 
 }  // namespace antb1::slt
