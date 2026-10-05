@@ -103,8 +103,8 @@ equalities whose common type is not DOUBLE (a disconnected join graph exits 4), 
 `IS NULL`, `SELECT DISTINCT` or `COALESCE`, which exit 4 as well (the NULLs come from the data, and `COUNT(col)`
 counts them). Results of several rows use `rowsort`, and no string `MIN` or `MAX` runs under `GROUP BY`, where
 DuckDB 1.5.5 leaks. The DuckDB-only ASOF records join columns without NULLs on a build key without repeats, because
-DuckDB 1.5.5 counts a NULL inequality value as an ASOF match. Each file starts with unguarded records over one table
-that pin its inputs, so its `slt.*` and `parallel.*` tests run before any guard goes.
+DuckDB 1.5.5 and 1.5.6 count a NULL inequality value as an ASOF match. Each file starts with unguarded records over
+one table that pin its inputs, so its `slt.*` and `parallel.*` tests run before any guard goes.
 
 ## Canonical values
 

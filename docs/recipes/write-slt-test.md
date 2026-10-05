@@ -61,8 +61,9 @@ SELECT a, b, COUNT(*) FROM t GROUP BY a
    antb1 are flagged for review instead of completed.
 4. Review `git diff` of the generated results line by line against [sql-subset.md](../sql-subset.md). A surprising
    value means a wrong test, an engine bug or a semantic difference to register; it is never edited away.
-5. Run the SQL logic tests on both engines, for example `pixi run test -L slt` and `pixi run test -L oracle`, then
-   `pixi run check` before the PR.
+5. Run the SQL logic tests on both engines, for example `pixi run test -L slt` and `pixi run test -L oracle`, and for
+   `pending` records the pending check (`pixi run test -R '^harness\.slt\.pending$'`), then `pixi run check` before
+   the PR.
 6. When a record fails later, fix the engine (or the registered divergence), not the expectation. If the oracle
    itself changed its answer after a DuckDB update, regenerate with the completion task and explain it in the PR.
 

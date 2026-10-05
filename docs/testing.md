@@ -155,7 +155,8 @@ Workflow for new or changed SQL:
    must check by hand.
 3. Review `git diff tests/slt`: only the records you meant to change may differ. Never edit an expected block by
    hand.
-4. Run `pixi run test -L '^(slt|oracle)$'`.
+4. Run `pixi run test -L '^(slt|oracle)$'`, and for `pending` records (below) also the pending check, which has the
+   label `harness`: `pixi run test -R '^harness\.slt\.pending$'`.
 
 An antb1 `Unsupported` answer always fails, also for `statement error`. A record for SQL that antb1 does not support
 yet carries a guard: `pending <roadmap id>` when a roadmap PR implements the SQL, else `onlyif duckdb`. DuckDB runs a
