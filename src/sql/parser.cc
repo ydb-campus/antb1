@@ -446,6 +446,15 @@ bool IsQualifier(const Token& token) {
   return IsName(token) || Contains(kAliasKeywords, KeywordOf(token));
 }
 
+// True when DuckDB lexes `name` and `next` as one string constant: a bit, an escape or a hex
+// string (B'1', E'x', X'1F', in any case), which antb1 lexes as a one-letter name and an adjacent
+// string. After a dot such a pair is no name but a string, and DuckDB gives a syntax error.
+bool IsStringPrefix(const Token& name, const Token& next) {
+  const std::string letter = KeywordOf(name);
+  return (letter == "B" || letter == "E" || letter == "X") && next.kind == TokenKind::kString &&
+         next.span.offset == name.span.offset + name.span.length;
+}
+
 std::string Clip(std::string_view text) {
   if (text.size() <= kMaxQuotedText) {
     return std::string(text);
@@ -1266,6 +1275,10 @@ class Parser {
                          "qualified function names and method calls (a.f()) are not supported");
     }
     const SourceSpan span = Cover(qualifier.span, column.span);
+    if (IsStringPrefix(column, Peek())) {  // t.E'x': a string after the dot
+      return Syntax(Cover(column.span, Peek().span),
+                    "expected a column name after '.', found " + Describe(Peek()));
+    }
     // A string after the name makes a typed literal of a qualified type in DuckDB (main.integer
     // '5', main.mood E'x'): unsupported, as typed literals are.
     if (Peek().kind == TokenKind::kString || PrefixedStringAt() != PrefixedString::kNone) {
@@ -2294,6 +2307,10 @@ class Parser {
     }
     const Token& head = Peek();  // the name, or its last part
     if (qualified) {
+      if (IsStringPrefix(head, PeekAt(1))) {  // main.E'5': a string after the dot
+        return Syntax(Cover(head.span, PeekAt(1).span),
+                      "expected a name after '.', found " + Describe(PeekAt(1)));
+      }
       span = Cover(first, head.span);
     }
     const bool call =

@@ -143,7 +143,8 @@ are the same expression.
   an escape or a dollar-quoted string on its own (`E'\n'`, `$$x$$`). Every unreserved word before a string is taken
   for a type name, also one that DuckDB does not take for one (`coalesce '5'`: exit code 4, where DuckDB gives a
   syntax error). `E` and a string with a space between them are no escape string (`integer E '5'` is a syntax error,
-  as in DuckDB).
+  as in DuckDB). After a dot, `B'1'`, `E'x'` and `X'1F'` are one string constant each, as DuckDB lexes them, and no
+  name before a string: `t.E'x'` and `LIMIT main.E'5'` are syntax errors, as in DuckDB.
 - Table aliases: after `AS` a name, a quoted identifier or a non-empty string literal (`AS 'a'`, as DuckDB); without
   `AS` a name or a quoted identifier. As in DuckDB, `BETWEEN`, `EXISTS`, `INTERVAL` and `OVER` are table aliases with
   or without `AS`, although they are reserved elsewhere, and these 49 words, which antb1 does not reserve, never are:

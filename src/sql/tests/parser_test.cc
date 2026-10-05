@@ -2040,6 +2040,12 @@ INSTANTIATE_TEST_SUITE_P(
                    kUnsupported, 9, "typed literals other than DATE"},
         RejectCase{"QualifiedTypedDollarQuotedString", "SELECT ^e.a $$x$$ FROM events e",
                    kUnsupported, 3, "typed literals other than DATE"},
+        // E and a string with a space between them, and N before a string, which DuckDB lexes as
+        // NCHAR and a string, make a typed literal of a qualified type in DuckDB too.
+        RejectCase{"QualifiedTypeSpacedEscape", "SELECT ^e.E 'x' FROM events e", kUnsupported, 3,
+                   "typed literals other than DATE"},
+        RejectCase{"QualifiedTypeNationalString", "SELECT ^e.N'x' FROM events e", kUnsupported, 3,
+                   "typed literals other than DATE"},
         // So does an escape or a dollar-quoted string after a name, and any string after a quoted
         // name; DATE and TIMESTAMP make literals before a plain string only.
         RejectCase{"TypedEscapeString", "SELECT ^integer E'5' FROM events", kUnsupported, 7,
@@ -2511,6 +2517,20 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"QualifiedNameBeforeSpacedEscapeString",
                    "SELECT main.integer E ^'5' FROM events", kSyntax, 3,
                    "expected ',' or FROM, found string literal"},
+        // DuckDB lexes B'1', E'x' and X'1F' as one string constant each, which is no name after a
+        // dot.
+        RejectCase{"EscapeStringAfterDot", "SELECT e.^E'x' FROM events e", kSyntax, 4,
+                   "expected a column name after '.', found string literal"},
+        RejectCase{"BitStringAfterDot", "SELECT e.^B'1' FROM events e", kSyntax, 4,
+                   "expected a column name after '.', found string literal"},
+        RejectCase{"HexStringAfterDot", "SELECT e.^X'1F' FROM events e", kSyntax, 5,
+                   "expected a column name after '.', found string literal"},
+        RejectCase{"EscapeStringAfterDotInWhere", "SELECT a FROM events e WHERE a = e.^E'5'",
+                   kSyntax, 4, "expected a column name after '.', found string literal"},
+        RejectCase{"EscapeStringAfterDotLimit", "SELECT a FROM events LIMIT main.^E'5'", kSyntax, 4,
+                   "expected a name after '.', found string literal"},
+        RejectCase{"EscapeStringAfterDotOffset", "SELECT a FROM events OFFSET e.^e'0'", kSyntax, 4,
+                   "expected a name after '.', found string literal"},
         RejectCase{"DotThenOperator", "SELECT e.^+ FROM events", kSyntax, 1,
                    "expected a column name after '.', found '+'"},
         RejectCase{"DotAtEnd", "SELECT e.^", kSyntax, 0,
