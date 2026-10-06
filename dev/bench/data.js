@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791238845410,
+  "lastUpdate": 1791316236149,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -5292,6 +5292,114 @@ window.BENCHMARK_DATA = {
             "value": 92.49574587499865,
             "unit": "ms/iter",
             "extra": "iterations: 8\ncpu: 92.48609774999994 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c74bc47def2826e95dc95ab43f3934f6f96d9da1",
+          "message": "feat(sql,plan): from lists, joins, aliases and qualified names in the grammar (#101)\n\n## Summary\n\nRoadmap PR **S3** of the joins track ([ADR\n0022](docs/adr/0022-joins-and-query-blocks.md)): the grammar for FROM\nlists, joins, table aliases and qualified names. The parser and unparser\nnow accept them. The binder still rejects every new form with exit code\n4 before any table resolves; J2a and J2b will bind them. No query\nchanges its answer:\n- the TPC-H-derived queries stay at 2 of 22\n(`tests/data/tpch_status.json` unchanged); every other one still exits\n4. Q3, Q5, Q10, Q12, Q14 and Q19 now stop at the binder's FROM-list\ncheck instead of the parser;\n- ClickBench stays at 43/43.\n\n**Grammar:**\n- The parser accepts ADR 0022's flat FROM list: commas, `CROSS JOIN`,\n`[INNER] JOIN … ON` and `LEFT [OUTER] JOIN … ON`, with at most three\ntokens of lookahead.\n- **Table aliases:** with or without `AS`. After `AS`, a non-empty\nstring literal and `BETWEEN`, `EXISTS`, `INTERVAL` or `OVER` also work,\nas in DuckDB.\n- **Qualified names:** one level, `t.x`, quoted on either side.\n- **The 49 words DuckDB refuses as table aliases** (D21) are never\naliases in antb1. antb1 still doesn't reserve them, so result-name\nquoting (D8) is unchanged.\n- Where DuckDB gives such a word a meaning, it exits 4: SEMI, ANTI,\nPOSITIONAL and ASOF joins, `AT (`, `PIVOT (`, UNPIVOT, `TABLESAMPLE 10%`\nor `reservoir(10)`; after ON also GLOB, AT TIME ZONE, ISNULL and\nNOTNULL.\n  - Anywhere else it is a syntax error.\n  - Read as an alias, `t semi JOIN u ON …` would have run an inner join.\n- **Exit 4 (unsupported):**\n  - USING; NATURAL, RIGHT and FULL joins;\n  - nested and parenthesized joins; `schema.table`; ONLY;\n- LATERAL before `(`, `name (` or `schema.name (`, and `(LATERAL ...)`;\n- table functions, also named by one of the 13 reserved words DuckDB\ntakes as function names (`FROM t, left(7)`);\n  - `BETWEEN`, `EXISTS`, `INTERVAL` and `OVER` as qualifiers in FROM;\n  - column alias lists, `t.*`, `a.b.c`, `t.f()`;\n- subqueries in FROM (SELECT, WITH, VALUES, FROM, TABLE, PIVOT, UNPIVOT,\nSUMMARIZE, DESCRIBE, SHOW after `(`);\n  - a trailing comma;\n- an empty, escape or dollar-quoted string as an alias (`AS ''`, `AS\nE'x'`, `AS $$x$$`).\n- **Typed literals:** as in DuckDB, a string after a type name makes a\ntyped literal, whether the string is plain, an escape or a dollar-quoted\none, and the name plain, quoted or qualified (`integer E'5'`, `\"integer\"\n'5'`, `main.integer '5'`). Only `DATE` and `TIMESTAMP` before a plain\nstring are in the grammar. Every other typed literal is unsupported, in\nevery clause, LIMIT and OFFSET included. Calls and typed literals of\nnames with up to three parts after LIMIT/OFFSET are unsupported too.\n- **Syntax errors where DuckDB gives them:**\n  - JOIN without ON, `, ON`, `CROSS JOIN … ON`, a bare OUTER;\n- a join keyword without the rest of its join, also before an ON (`LEFT\nu`, `NATURAL LEFT u`, `ASOF LEFT u`);\n- two aliases, `AS select`, `'w'` as an implicit alias, `AS $1`, `AS\nB'1'`;\n  - `SELECT 1 JOIN u`, a JOIN after WHERE;\n  - a comma before FROM or INTO;\n  - `FROM (t)`, `FROM (t, u)`, an unclosed `FROM (t`;\n  - `TABLESAMPLE x` without `(`;\n- `B'1'`, `E'x'` and `X'1F'` after the dot of a two-part column or in\nLIMIT/OFFSET (`t.E'x'`), which DuckDB lexes as one string constant;\n- LIMIT/OFFSET calls or typed literals of names with four or more parts.\n- GLOB and AT TIME ZONE are now unsupported operators in every\nexpression. This also fixes the old exit 1 for `a GLOB 'x'`.\n\n**Unparser:** the canonical form writes `,`, `CROSS JOIN`, `INNER JOIN`,\n`LEFT JOIN`, `AS \"a\"` and qualifiers as written. ON goes through the\nWHERE conjunct printer. `Parse(ToSql(x))` and idempotence hold. The FROM\nlist is only ever walked in loops: 50,000 comma items and 20,000 joins\nare tested.\n\n**Binder:**\n- `RejectFromList` reports several items, joins, aliases (at the alias)\nand qualified names anywhere, in query order.\n- ORDER BY never takes `t.x` for the select alias `x`.\n- `Columns::Resolve` and `Bind` check their invariants.\n\n**Features:** `comma_join`, `join_on`, `left_join`, `table_alias` and\n`qualified_name` are declared. They wait in `kGeneratorPending` until T1\nand T2 generate them, so the random tests are unchanged: `diff-random\n--list` is identical to main.\n\n**Tests:**\n- **sql:** new parser tests (connectors and spans, aliases, ON\nconjuncts, qualified names in every clause, the flat list, the 49-word\ntable at every position, reserved words after AS). 234 new RejectCases\nfor the exit-4 and syntax forms (11 removed for forms that now parse).\nLexer and unparse cases, the round-trip corpus, structural-difference\ncases, and property tests for tokens, spans and generated FROM lists.\n- **plan:** `FromLists/BindErrorTest` (37 cases) and a death test for a\nstatement without a FROM item.\n- **engine and CLI:** exit 4 with a caret for a JOIN and SEMI JOIN.\n- **harness:**\n`TableAliasOracle.DuckDbReadsAKeywordAsATableAliasExactlyWhenAntb1Does`.\nIt parses all 489 DuckDB keywords at 8 places with DuckDB's parse-only\n`json_serialize_sql` and compares the alias DuckDB reads with antb1's,\nso a DuckDB update that gives a word a meaning fails it.\n- **slt:** the new `basic/from_errors.slt`. Every syntax-error record\nhas an `onlyif duckdb` twin that expects DuckDB's parser (or binder)\nerror.\n- **fuzz:** dictionary entries and 11 seeds with our own names.\n`join.sql` now round-trips.\n\n**Docs:**\n- `docs/sql-subset.md`: the grammar, the lexical rules with the 49\nwords, the FROM bullet, the exit-4 list, binding, and the exit-code\nexamples.\n- New divergence **D21**, in both directions: the 49 words as unquoted\nnames, and `BETWEEN`, `EXISTS`, `INTERVAL` and `OVER` as table aliases.\nIt spells out DuckDB's own readings of DEFAULT, ISNULL, NOTNULL and\nUNPACK.\n- An update paragraph in ADR 0008, which is a CODEOWNERS path; its\nstatus is unchanged.\n- `docs/architecture.md`, `tests/slt/README.md`, and the `parser.h` and\n`unparse.h` comments.\n\nFor the maintainer:\n\n- **Size:** 3,216 lines inserted against main (2,170 of them tests,\n`.slt` and fuzz seeds), against the ~1,800 estimate. `from_errors.slt`\nis long because every record has a DuckDB twin. The parser and binder\nhalves must land together, or `t a` and `t.x` would bind silently.\n- **Review rounds after the first push** (`be914a8..`): a three-area\nsplit review (parser against DuckDB, AST/unparser/binder,\ntests/docs/fuzz) found 5 P1s:\n- exit 1 where main gave exit 4 and DuckDB accepts the SQL: qualified\ntyped literals, LATERAL forms, and table functions named by reserved\nwords;\n  - untested keyword-table entries;\n  - a docs claim about wrong-arity calls.\n\nFour fix-and-re-review rounds followed, each probing DuckDB 1.5.5. They\nalso covered the neighbouring typed-literal and LIMIT forms. The last\nround was kept to regressions the branch itself introduced, and a final\nholistic review found no defect in the PR. The older differences below\nare follow-ups, not part of this PR.\n- **Merged main** (E1, H6b, DuckDB 1.5.6), no rebase. H6b's six `pending\nS3` guards in `joins/alias_words.slt` are removed: those records are\nsyntax errors now, and the pending check passes. TableAliasOracle gives\nthe same result on DuckDB 1.5.6.\n- **Exit 4 where DuckDB gives a syntax error** (documented): the parser\nreports an unsupported construct at its first token and looks at most\nthree tokens ahead. So some malformed forms that start like unsupported\nones exit 4: `FROM (t a)`, `NATURAL LEFT OUTER u`, malformed\ntable-function arguments. Only the exit code of invalid SQL differs.\n- **Follow-ups:** exit codes that differ from DuckDB 1.5.5 and are older\nthan this PR, or documented exceptions. Each was checked against the\ncurrent binary.\n1. LIMIT/OFFSET expressions starting with `CASE`, `NOT` or a unary\nminus, and conditions after the integer (`LIMIT 5 = 5`): exit 1; DuckDB\nanswers them. Documented as known gaps.\n2. Reserved words before `(` in LIMIT (`LIMIT from(1)`): exit 4; DuckDB\ngives a parser error.\n3. The 13 reserved function/type words before a string (`SELECT left\n'5'`): exit 1; DuckDB parses them.\n4. Every unreserved word before a string counts as a type name.\n`coalesce '5'` is exit 4 where DuckDB gives a parser error; this is\ndocumented. A table of DuckDB's real type names, with an oracle test,\nwould remove the exception.\n5. `LIMIT t.from '5'` and `LIMIT over.abs(5)`: exit 1; DuckDB parses\nthem.\n  6. `FROM t *` (inheritance star): exit 1; DuckDB answers it.\n  7. `decimal(10, 2) '1.5'`: exit 1; DuckDB answers it.\n8. Strings continued across a newline: exit 1; DuckDB concatenates them.\n9. Reserved join words as scalar function names (`SELECT inner(1)`):\nexit 1; DuckDB parses them.\n10. `FROM t USING (x)` reports \"USING SAMPLE is not supported\" and `a\nNOT GLOB 'x'` reports \"NOT is not supported\" (exit 4); DuckDB gives a\nparser error.\n11. Select aliases `SELECT a AS E'x'` and `AS $$x$$`: exit 1; DuckDB\nanswers them.\n12. Some forms are exit 4 where DuckDB gives a parser error, because an\nearlier unsupported rule wins (documented): reserved words before a dot\ninside call arguments (`abs(select.a)`), and `E'x'` after a dot in a\ncall, a name of more than two parts, a cast or FROM.\n  13. `SELECT a$b`: exit 1; DuckDB reads one name.\n14. An unterminated dollar-quoted string after a type name (`integer\n$x$`) is exit 4, because the lexer does not scan dollar quotes to their\nend. DuckDB gives a parser error.\n- **Differences from the plan, all probed against DuckDB 1.5.5:**\n  - TABLESAMPLE exits 4 only before a number, `(` or `name (`.\n  - NATURAL and ASOF need a complete join kind.\n  - `(` before something that cannot start a table is a syntax error.\n  - ONLY before `(` is a table function.\n  - The keyword oracle uses `json_serialize_sql` rather than `EXPLAIN`.\n- Additions beyond the plan: steps 3 and 4 in `docs/architecture.md`,\nthe death test, and two `onlyif antb1` message pins.\n- **Hand-off:**\n  - **J2a:** bindings from `from`.\n  - **J2b:**\n- lifts the comma, CROSS, INNER, alias and qualified-name rejections;\n    - walks ON and folds dates in ON;\n    - adds qualified result names, rule 10 and the 256-relation limit;\n    - drops the `Resolve` check;\n- keeps a qualified name from matching a select alias in every alias\nfallback (`binder.cc` AliasFallback, GROUP BY, HAVING; the ORDER BY\nguard added here is unreachable until J2b). A test that `SELECT b AS x\nFROM t ORDER BY t.x` orders by column `t.x` belongs in J2b;\n- folds `CAST('...' AS DATE)` in ON before checking it (FoldDateCasts\nskips ON today).\n- **T1/T2:** generate the pending features, then empty\n`kGeneratorPending`.\n  - **S4:** `FromItem::table` becomes a variant.\n  - **J6:** LEFT JOIN.\n\nThis workload is derived from the TPC-H Benchmark and is not comparable\nto published TPC-H Benchmark results, as this implementation does not\ncomply with all requirements of the TPC-H Benchmark.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full                  # on d3572fc (the head: main merged in, the pending S3 guards removed)\nlint: PASS\n100% tests passed out of 2182          # ci (clang Debug -Werror), DuckDB 1.5.6\n100% tests passed out of 2182          # asan (ASan + UBSan)\n                                       # tidy: clean\ncoverage: PASS\n100% tests passed out of 2             # fuzz-smoke\n100% tests passed out of 2182          # ci-gcc\n$ pixi run slt-complete                # on d3572fc\n66 .slt files, every one unchanged\n$ pixi run test-data                   # ClickBench, redacted; on d3572fc\n100% tests passed out of 6             # data.clickbench.status: 43/43\n$ pixi run test -R 'harness\\.slt\\.pending|joins|subqueries|TableAlias|from_errors'   # on d3572fc\n100% tests passed out of 35            # the pending check passes with no S3 guard left\n# tpch.status.* pass in every leg above (redacted: Q1 pass, Q6 pass, 20 unsupported); tpch_status.json unchanged\n# diff-random --list (seeds 7 and 11, 3,000 queries each) is identical to main: the generator does not produce the new forms\n```\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: the ADR 0008 update paragraph, as listed in the\napproved plan\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code implemented the\nmaintainer-approved S3 plan after a planning round of read-only mapping,\ndesign and adversarial critique agents that probed DuckDB 1.5.5. Two\nreviewer passes followed:\n- The first found a P1 (D21 misdescribed DuckDB's reading of DEFAULT,\nISNULL and NOTNULL) and three nits, fixed in a8c929d, a894d8d and\nd4f25f9; 22f193c tightens the parenthesized forms.\n- The second found a P1 (`AS E'x'` and `AS $$x$$` had become syntax\nerrors; DuckDB takes them as aliases) and three nits, all fixed in\nbe914a8.\n- After the first push came a three-area split review, then four\nfix-and-re-review rounds. Each re-review probed DuckDB 1.5.5 and the\nbuilt binary, and the fixes are the commits after be914a8. A final\nholistic review checked docs coherence, the binder rejections and about\n100 supported queries for unchanged answers: no defects.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-10-06T22:47:27+03:00",
+          "tree_id": "e15291d0e4a6795a690b6bb84ad89ef2876cc6df",
+          "url": "https://github.com/ydb-campus/antb1/commit/c74bc47def2826e95dc95ab43f3934f6f96d9da1"
+        },
+        "date": 1791316235615,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 5000.225993553753,
+            "unit": "ns/iter",
+            "extra": "iterations: 140858\ncpu: 5000.082487327663 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84383.17941441362,
+            "unit": "ns/iter",
+            "extra": "iterations: 7753\ncpu: 84371.64130014188 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 226267.63266603684,
+            "unit": "ns/iter",
+            "extra": "iterations: 3147\ncpu: 226245.90943755946 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 442400.23261694086,
+            "unit": "ns/iter",
+            "extra": "iterations: 1582\ncpu: 442338.3748419723 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 361532.13495347835,
+            "unit": "ns/iter",
+            "extra": "iterations: 1934\ncpu: 361501.2916235784 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2108593.2000000244,
+            "unit": "ns/iter",
+            "extra": "iterations: 330\ncpu: 2108299.803030302 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 53.68876453846164,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 53.6843569230769 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 46.64587293333019,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 46.621373666666635 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 240.84031400000563,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 240.80589366666712 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.456464354166107,
+            "unit": "ms/iter",
+            "extra": "iterations: 48\ncpu: 14.45463502083333 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 24.57536451851815,
+            "unit": "ms/iter",
+            "extra": "iterations: 27\ncpu: 24.572734962962986 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 41.519126647057526,
+            "unit": "ms/iter",
+            "extra": "iterations: 17\ncpu: 41.507738764705906 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 2.0711553905324545,
+            "unit": "ms/iter",
+            "extra": "iterations: 338\ncpu: 2.070280943786982 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 158.0542332499988,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 158.0283014999999 ms\nthreads: 1"
           }
         ]
       }
