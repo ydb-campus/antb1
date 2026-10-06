@@ -84,7 +84,27 @@ TEST(ParseSlt, RejectsMalformedFiles) {
       {"onlyif mysql\nstatement ok\nSELECT 1\n",
        "f.slt:1: expected 'onlyif antb1' or 'onlyif duckdb'"},
       {"onlyif duckdb\n\nstatement ok\nSELECT 1\n",
-       "f.slt:2: skipif/onlyif must be followed directly by a record"},
+       "f.slt:2: skipif, onlyif and pending must be followed directly by a record"},
+      {"pending J2b\n\nstatement ok\nSELECT 1\n",
+       "f.slt:2: skipif, onlyif and pending must be followed directly by a record"},
+      {"pending\nstatement ok\nSELECT 1\n",
+       "f.slt:1: expected 'pending <roadmap id>', such as 'pending J2b'"},
+      {"pending j2b\nstatement ok\nSELECT 1\n",
+       "f.slt:1: expected 'pending <roadmap id>', such as 'pending J2b'"},
+      {"pending J2b S3\nstatement ok\nSELECT 1\n",
+       "f.slt:1: expected 'pending <roadmap id>', such as 'pending J2b'"},
+      {"pending J2b\npending J5\nstatement ok\nSELECT 1\n",
+       "f.slt:2: a record takes one 'pending' line"},
+      {"pending J2b\nonlyif duckdb\nstatement ok\nSELECT 1\n",
+       "f.slt:3: 'pending' takes no skipif or onlyif: DuckDB runs a pending record, and antb1 only "
+       "in the pending check"},
+      {"skipif antb1\npending J2b\nquery I\nSELECT 1\n",
+       "f.slt:3: 'pending' takes no skipif or onlyif: DuckDB runs a pending record, and antb1 only "
+       "in the pending check"},
+      {"pending J2b\nhalt\n", "f.slt:2: 'pending' must precede a statement or query record"},
+      {"pending J2b\nhash-threshold 8\n",
+       "f.slt:2: 'pending' must precede a statement or query record"},
+      {"pending J2b\n", "f.slt:1: condition or '# tol' without a record at the end of the file"},
       {"# tol 1e-6\nstatement ok\nSELECT 1\n", "f.slt:2: '# tol' must precede a query record"},
       {"# tol 2\nquery R\nSELECT 1\n",
        "f.slt:1: expected '# tol <relative tolerance>' with 0 < tolerance < 1"},
@@ -101,6 +121,35 @@ TEST(ParseSlt, RejectsMalformedFiles) {
   auto bad_regex = ParseSlt("f.slt", "statement error ([\nSELECT 1\n");
   ASSERT_FALSE(bad_regex.has_value());
   EXPECT_TRUE(bad_regex.error().starts_with("f.slt:1: invalid error regex")) << bad_regex.error();
+}
+
+TEST(ParseSlt, ReadsPendingGuards) {
+  auto file = ParseSlt("f.slt",
+                       "pending J2b\n# a comment between the guard and its record\n"
+                       "query I rowsort\nSELECT 1\n----\n1\n\n"
+                       "pending S3\nstatement error\nSELECT 2\n\n"
+                       "statement ok\nSELECT 3\n");
+  ASSERT_TRUE(file.has_value()) << file.error();
+  ASSERT_EQ(file->records.size(), 3U);
+  const auto& query = file->records[0];
+  EXPECT_EQ(query.pending, "J2b");
+  EXPECT_EQ(query.line, 3);
+  EXPECT_EQ(query.expected, (std::vector<std::string>{"1"}));
+  EXPECT_FALSE(query.RunsOn("antb1"));
+  EXPECT_TRUE(query.RunsOn("duckdb"));
+  EXPECT_EQ(file->records[1].pending, "S3");
+  EXPECT_EQ(file->records[1].kind, RecordKind::kStatementError);
+  EXPECT_TRUE(file->records[2].pending.empty());
+  EXPECT_TRUE(file->records[2].RunsOn("antb1"));
+}
+
+TEST(IsRoadmapId, TakesALetterDigitsAndOneOptionalLowerCaseLetter) {
+  for (const std::string_view id : {"S3", "J2b", "H6b", "T1", "U23", "Z9"}) {
+    EXPECT_TRUE(IsRoadmapId(id)) << id;
+  }
+  for (const std::string_view id : {"", "J", "2b", "j2b", "J2B", "J2bc", "JJ2", "J-2", "J2 "}) {
+    EXPECT_FALSE(IsRoadmapId(id)) << id;
+  }
 }
 
 TEST(ParseSlt, ReadsDecimalColumns) {

@@ -1,0 +1,296 @@
+# The star schema of the join and subquery tests (tools/fixturegen/star.h): trips, a ride-hailing fact table, and its
+# dimensions; tests/slt/tables.txt declares the references between them (ref=). One table at a time, these records pin
+# what the join tests rely on: row counts and NULL keys (COUNT(*) against COUNT(key)), repeated keys, keys without a
+# match (dangling), key ranges, and the small tables in full.
+
+# ---- row counts and NULL keys ----
+
+query IIIIIIIIIII nosort
+SELECT COUNT(*), COUNT(tr_rider), COUNT(tr_driver), COUNT(tr_pickup), COUNT(tr_dropoff), COUNT(tr_day),
+  COUNT(tr_tariff), COUNT(tr_rate), COUNT(tr_promo), COUNT(tr_fare), COUNT(tr_distance)
+FROM trips
+----
+3000	2869	2896	3000	2824	2919	2842	2769	60	2903	2927
+
+query IIIII nosort
+SELECT COUNT(*), COUNT(rd_id), COUNT(rd_city), COUNT(rd_tier), COUNT(rd_joined) FROM riders
+----
+240	240	232	240	240
+
+query IIII nosort
+SELECT COUNT(*), COUNT(dv_id), COUNT(dv_city), COUNT(dv_since) FROM drivers
+----
+97	96	89	97
+
+query IIIIII nosort
+SELECT COUNT(*), COUNT(zn_id), COUNT(zn_city), COUNT(zn_parent), COUNT(label), COUNT(zn_radius) FROM zones
+----
+40	40	39	35	35	37
+
+query IIII nosort
+SELECT COUNT(*), COUNT(sh_driver), COUNT(sh_day), COUNT(sh_hours) FROM shifts
+----
+500	494	495	478
+
+# The empty dimension: no row, so SUM and MAX are NULL.
+query IIDI nosort
+SELECT COUNT(*), COUNT(pm_code), SUM(pm_discount), MAX(pm_id) FROM promos
+----
+0	0	NULL	NULL
+
+# ---- repeated keys ----
+
+# riders repeats 8 keys of its dense range 1..240, two of them across a row group boundary (64 and 192).
+query II rowsort
+SELECT rd_id, COUNT(*) FROM riders GROUP BY rd_id HAVING COUNT(*) > 1
+----
+127	2
+167	2
+192	2
+207	2
+47	2
+64	2
+7	2
+87	2
+
+query III nosort
+SELECT COUNT(DISTINCT rd_id), MIN(rd_id), MAX(rd_id) FROM riders
+----
+232	1	240
+
+# shifts repeats 2 of its (sh_driver, sh_day) keys; a key with a NULL part never repeats.
+query ITI rowsort
+SELECT sh_driver, sh_day, COUNT(*) FROM shifts GROUP BY sh_driver, sh_day HAVING COUNT(*) > 1
+----
+1111	2026-03-22	2
+1148	2026-03-29	2
+
+# drivers and zones repeat no key. The drivers key beyond INTEGER, 2^32 + 1000, is alone in the last row group.
+query IIII nosort
+SELECT COUNT(DISTINCT dv_id), COUNT(dv_id), MIN(dv_id), MAX(dv_id) FROM drivers
+----
+96	96	1000	4294968296
+
+query IIII nosort
+SELECT COUNT(DISTINCT zn_id), COUNT(zn_id), MIN(zn_id), MAX(zn_id) FROM zones
+----
+40	40	1	40
+
+# ---- keys without a match ----
+
+# trips reference riders beyond 240, and the 8 ids that riders skips; riders 237 to 240 have no trip.
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_rider > 240
+----
+28
+
+query II rowsort
+SELECT tr_rider, COUNT(*) FROM trips WHERE tr_rider IN (8, 48, 65, 88, 128, 168, 193, 208) GROUP BY tr_rider
+----
+128	12
+168	13
+193	12
+208	13
+48	10
+65	13
+8	12
+88	11
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_rider BETWEEN 237 AND 240
+----
+0
+
+# No driver has key 2850 (driver 50's key is NULL) or a key from 4552 to 4885; drivers 90 to 95 (4330 to 4515)
+# have no trip.
+query II rowsort
+SELECT tr_driver, COUNT(*) FROM trips WHERE tr_driver = 2850 OR tr_driver > 4515 GROUP BY tr_driver
+----
+2850	29
+4552	29
+4589	29
+4626	29
+4663	29
+4700	29
+4737	29
+4774	29
+4811	29
+4848	29
+4885	29
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_driver BETWEEN 4330 AND 4515
+----
+0
+
+# Zones 41 to 43 do not exist; 9 is no city, and 77 no zone.
+query II rowsort
+SELECT tr_pickup, COUNT(*) FROM trips WHERE tr_pickup > 40 GROUP BY tr_pickup
+----
+41	69
+42	69
+43	69
+
+query II rowsort
+SELECT zn_city, COUNT(*) FROM zones GROUP BY zn_city
+----
+1	8
+2	8
+3	7
+4	7
+5	8
+9	1
+NULL	1
+
+query II rowsort
+SELECT zn_parent, COUNT(*) FROM zones GROUP BY zn_parent
+----
+1	7
+2	7
+3	7
+4	7
+5	6
+77	1
+NULL	5
+
+query II rowsort
+SELECT rd_city, COUNT(*) FROM riders GROUP BY rd_city
+----
+1	77
+2	77
+3	78
+NULL	8
+
+query II rowsort
+SELECT dv_city, COUNT(*) FROM drivers GROUP BY dv_city
+----
+1	23
+2	22
+3	22
+4	22
+NULL	8
+
+# VARCHAR keys: std and XL match no tariff code (by case, and by a trailing space).
+query TI rowsort
+SELECT tr_tariff, COUNT(*) FROM trips GROUP BY tr_tariff
+----
+(empty)	284
+AIRPORT	285
+NIGHT	284
+NULL	158
+POOL	284
+STD	284
+Std	284
+XL	284
+XL\x20	285
+std	284
+Ж-1	284
+
+# DECIMAL(4,2) keys against the DECIMAL(5,3) rates of tariffs: 2.25 and 0.88 match none (0.875 rounds to 0.88).
+query DI rowsort
+SELECT tr_rate, COUNT(*) FROM trips GROUP BY tr_rate
+----
+0.88	343
+1.00	348
+1.25	350
+1.50	348
+1.75	350
+2.00	345
+2.25	343
+2.50	342
+NULL	231
+
+# Every tr_promo value dangles: promos is empty.
+query II rowsort
+SELECT tr_promo, COUNT(*) FROM trips GROUP BY tr_promo
+----
+1	15
+2	15
+3	15
+4	15
+NULL	2940
+
+# No shift is on March 31; trips are.
+query TT nosort
+SELECT MIN(sh_day), MAX(sh_day) FROM shifts
+----
+2026-03-01	2026-03-30
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_day = DATE '2026-03-31'
+----
+93
+
+# ---- values ----
+
+# DATE, DOUBLE (multiples of 1/8, so their sums are exact in any order) and DECIMAL columns.
+query TTRRDD nosort
+SELECT MIN(tr_day), MAX(tr_day), MIN(tr_distance), MAX(tr_distance), MIN(tr_fare), MAX(tr_fare) FROM trips
+----
+2026-03-01	2026-03-31	0.125	19.5	3.50	27.50
+
+query RD nosort
+SELECT SUM(tr_distance), SUM(tr_fare) FROM trips
+----
+28657.125	44992.50
+
+query TT nosort
+SELECT MIN(rd_joined), MAX(rd_joined) FROM riders
+----
+2025-01-01	2026-03-26
+
+query TT nosort
+SELECT MIN(dv_since), MAX(dv_since) FROM drivers
+----
+2025-01-01	2025-12-30
+
+query DD nosort
+SELECT MIN(sh_hours), MAX(sh_hours) FROM shifts
+----
+4.0	12.0
+
+# zn_radius holds some of the tr_distance values.
+query RR nosort
+SELECT MIN(zn_radius), MAX(zn_radius) FROM zones
+----
+0.5	3.25
+
+query RI rowsort
+SELECT tr_distance, COUNT(*) FROM trips WHERE tr_distance IN (0.75, 2, 3.25) GROUP BY tr_distance
+----
+0.75	92
+2	92
+3.25	92
+
+# ---- the small tables in full ----
+
+# label is also a column of zones.
+query IITI nosort
+SELECT * FROM cities ORDER BY ct_row
+----
+0	1	center	120000
+1	2	harbor	45000
+2	3	hills	30000
+3	4	airport	NULL
+4	5	old town	8000
+5	6	outskirts	2500
+
+query ITDT nosort
+SELECT * FROM tariffs ORDER BY tf_row
+----
+0	STD	1.000	standard
+1	NIGHT	1.500	night
+2	AIRPORT	2.000	airport
+3	Std	1.250	standard
+4	(empty)	2.125	center
+5	XL\x20	2.500	xl
+6	Ж-1	1.750	center
+7	NULL	NULL	unknown
+8	POOL	0.875	pool
+
+# ---- by path ----
+
+query III nosort
+SELECT COUNT(*), COUNT(label), COUNT(zn_radius) FROM '${FIXTURES}/star/zones.parquet'
+----
+40	35	37

@@ -31,6 +31,7 @@
 #include <parquet/types.h>
 
 #include "hits_schema.h"
+#include "star.h"
 
 namespace antb1::fixturegen {
 namespace {
@@ -503,6 +504,22 @@ void CompareField(std::vector<std::string>& diffs, int column, std::string_view 
   }
 }
 
+// Creates the subdirectory `sub` and removes the Parquet files in it: stale files from an older
+// generator would be picked up by globs and by the digest.
+arrow::Status PrepareSubdirectory(const fs::path& sub) {
+  std::error_code ec;
+  fs::create_directories(sub, ec);
+  if (ec) {
+    return arrow::Status::IOError("cannot create '", sub.string(), "': ", ec.message());
+  }
+  for (const auto& entry : fs::directory_iterator(sub, ec)) {
+    if (entry.path().extension() == ".parquet") {
+      fs::remove(entry.path(), ec);
+    }
+  }
+  return arrow::Status::OK();
+}
+
 }  // namespace
 
 arrow::Result<std::shared_ptr<arrow::Table>> MakeHitsTable(HitsVariant variant, Nulls nulls,
@@ -748,18 +765,8 @@ arrow::Status WriteParquet(const arrow::Table& table, const fs::path& path,
 }
 
 arrow::Result<std::vector<FixtureFile>> WriteAllFixtures(const fs::path& dir) {
-  const fs::path split_dir = dir / "hits_like_split";
-  std::error_code ec;
-  fs::create_directories(split_dir, ec);
-  if (ec) {
-    return arrow::Status::IOError("cannot create '", split_dir.string(), "': ", ec.message());
-  }
-  // Stale parts from an older generator would be picked up by globs.
-  for (const auto& entry : fs::directory_iterator(split_dir, ec)) {
-    if (entry.path().extension() == ".parquet") {
-      fs::remove(entry.path(), ec);
-    }
-  }
+  ARROW_RETURN_NOT_OK(PrepareSubdirectory(dir / "hits_like_split"));
+  ARROW_RETURN_NOT_OK(PrepareSubdirectory(dir / "star"));
 
   std::vector<FixtureFile> written;
   auto write = [&](const arrow::Table& table, const std::string& rel,
@@ -803,6 +810,11 @@ arrow::Result<std::vector<FixtureFile>> WriteAllFixtures(const fs::path& dir) {
 
   ARROW_ASSIGN_OR_RAISE(auto empty, MakeHitsTable(HitsVariant::kPartitioned, Nulls::kNone, 0, 0));
   ARROW_RETURN_NOT_OK(write(*empty, "empty.parquet", kGroup));
+
+  ARROW_ASSIGN_OR_RAISE(auto star, MakeStarTables());
+  for (const StarTable& t : star) {
+    ARROW_RETURN_NOT_OK(write(*t.table, std::format("star/{}.parquet", t.name), t.row_group_rows));
+  }
   return written;
 }
 

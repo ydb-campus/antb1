@@ -9,10 +9,11 @@ test oracle. DuckDB writes the expectations (`pixi run slt-complete`); humans re
   (antb1, label `slt`) and `oracle.<area>.<file>` (DuckDB, label `oracle`).
 - `selftest/`: harness self-tests. `mutate.slt` and `redact_canary.slt` must pass as they are, and must
   fail under `--mutate` (`harness.slt.mutate.<kind>`, `harness.slt.redact`). `lockdown.slt` checks the
-  DuckDB lockdown.
+  DuckDB lockdown. The pending records of `pending.slt` stay Unsupported, and the pending check must fail when
+  `--mutate` answers them (`harness.slt.pending.mutate.<kind>`).
 - `canary/`: redaction canaries that fail on purpose (`harness.slt.redact_sentinels`, `harness.diff.redact`), and
   `tables_redact.txt` and `redact_table.slt` for the self-tests of the `redact` option (`harness.*.redact_table`).
-- `tables.txt`: the tables every file can query, registered identically on both engines.
+- `tables.txt`: the tables every file can query, registered identically on both engines, and their foreign keys.
 - `supported_features.h`: the SQL features antb1 answers today (see "Random differential test").
 - `runner/`: the runner (`antb1_slt_lib` and `antb1-slt`); `tests/`: its unit tests (label `harness`).
 
@@ -20,12 +21,20 @@ The tables are views over the Parquet fixtures of `tools/fixturegen` (ctest `fix
 `build/<preset>/fixtures`). Write our own queries over our own tables only: never ClickBench data or
 ClickBench query text.
 
+A table's `ref=<column>[+<column>...]:<table>.<column>[+<column>...]` options (repeatable) declare its foreign keys:
+which of its columns reference, pairwise, which columns of a table of the same file, itself included. The star
+schema of the join tests (`tools/fixturegen/star.h`) declares 13. A ref is a hint for the generated joins of roadmap
+PR T1, not a constraint: NULL and dangling keys are intended. The loader checks the syntax and finds the table
+ASCII case-insensitively (`runner/tables.h`); `metamorphic.TablesTxt.RefsJoinColumnsOfOneKind` checks that every
+column exists and that each pair joins one kind of key (integers, DECIMALs, DATE or VARCHAR, never DOUBLE). The
+engines and the query generator ignore refs until T1.
+
 ## Commands
 
 ```bash
 pixi run test -L slt        # antb1 vs the expectations
 pixi run test -L oracle     # DuckDB vs the same expectations
-pixi run test -L harness    # runner unit tests, fixture checks, mutation and redaction self-tests
+pixi run test -L harness    # runner unit tests, fixture checks, mutation and redaction self-tests, pending check
 pixi run slt-complete       # rewrite every expected block from DuckDB, then review `git diff`
 ```
 
@@ -65,15 +74,37 @@ In an expected block each row is one line; the cells of a row are separated by a
   loses the columns, so every value would compare within the R tolerance. Queries with the same label must return the
   same result.
 - `skipif <engine>` / `onlyif <engine>` (engine `antb1` or `duckdb`) guard the next record.
+- `pending <roadmap id>` (`pending J2b`) guards the next statement or query until that roadmap PR answers it: DuckDB
+  runs it, antb1 only in the pending check (below). It takes no `skipif` or `onlyif`.
 - `halt` stops the file (for one engine when guarded); `hash-threshold <n>` hashes results with more than
   `n` values (0: never), except results with an R column.
 - `${FIXTURES}` in SQL is the fixtures directory, e.g. `FROM '${FIXTURES}/edge.parquet'`.
 
 ## Current support is the contract
 
-An antb1 `Unsupported` answer is always a failure, also for `statement error`. A record for SQL that antb1
-does not support yet carries `onlyif duckdb`; the PR that adds the feature removes the guard. Internal
-errors never satisfy `statement error`.
+An antb1 `Unsupported` answer is always a failure, also for `statement error`. Internal errors never satisfy
+`statement error`. A record for SQL that antb1 does not answer yet carries a guard, which the PR that adds the
+feature removes:
+
+- `pending <roadmap id>` when a PR of the roadmap answers it. DuckDB runs the record as usual (`oracle.*` and
+  `slt-complete`), and antb1's `slt.*` and `parallel.*` tests skip it. The pending check `harness.slt.pending`
+  (`antb1-slt pending`) runs the pending records of every registered file on antb1, where each must still get
+  Unsupported: once antb1 answers one, with rows or with an error of another kind, the check fails with
+  `remove the guard (<id>)`, so the PR that answers it removes its guard and the `slt.*` tests compare its answer
+  from then on. A record whose outcome another PR changes first waits on that PR: the syntax errors of
+  `cases/joins/alias_words.slt`, which antb1 rejects as Unsupported until roadmap PR S3, are `pending S3`.
+- `onlyif duckdb` otherwise. A section of such records is headed `# ---- DuckDB only until <deferred item> gets a
+  PR ----` when an ADR defers the SQL until a query needs it, and `# ---- DuckDB only, for good: ... ----` for
+  DuckDB's own error texts.
+
+`cases/joins/` and `cases/subqueries/` hold the pending corpus of the join and subquery PRs of ADRs 0022 and 0023,
+over the star schema. Its pending records stay inside what those PRs answer: every query joins all its tables through
+equalities whose common type is not DOUBLE (a disconnected join graph exits 4), and none has a `NULL` literal,
+`IS NULL`, `SELECT DISTINCT` or `COALESCE`, which exit 4 as well (the NULLs come from the data, and `COUNT(col)`
+counts them). Results of several rows use `rowsort`, and no string `MIN` or `MAX` runs under `GROUP BY`, where
+DuckDB 1.5.5 leaks. The DuckDB-only ASOF records join columns without NULLs on a build key without repeats, because
+DuckDB 1.5.5 and 1.5.6 count a NULL inequality value as an ASOF match. Each file starts with unguarded records over
+one table that pin its inputs, so its `slt.*` and `parallel.*` tests run before any guard goes.
 
 ## Canonical values
 
@@ -88,8 +119,12 @@ trailing spaces. `I`, `D` and `T` compare exactly; `R` compares with relative to
 ## The DuckDB oracle
 
 DuckDB runs in memory through its C API with `threads=1`, no extension autoinstall or autoload, file
-access limited to the fixtures directory, temp files under `build/`, and a locked configuration. A record
-runs one statement, and only `SELECT`, `EXPLAIN`, `SET` or `LOAD`: the oracle refuses anything else
+access limited to the fixtures directory, temp files under `build/`, its `late_materialization` optimizer
+off, and a locked configuration. With the optimizer on, DuckDB 1.5.5 and 1.5.6 fail some filtered `LIMIT ... OFFSET`
+queries with an internal error (`where/pushdown.slt`). With it off, DuckDB computes the select list of a
+small `ORDER BY ... LIMIT` for every row the `WHERE` keeps, as antb1 does, so an overflow there fails in both
+engines; only the order of tied rows at the edge of a `LIMIT` can differ, and every comparison accepts that.
+A record runs one statement, and only `SELECT`, `EXPLAIN`, `SET` or `LOAD`: the oracle refuses anything else
 (`COPY`, `ATTACH`, `EXPORT`, DDL, DML) with a `Permission Error` before it runs, so no record writes next
 to the shared fixtures or changes state for later records (`selftest/lockdown.slt` checks it). It never
 loads an extension either: DuckDB refuses `LOAD`, by name or by path, once external access is off, so the oracle
@@ -136,7 +171,9 @@ ANTB1_DIFF_SEED=7 ANTB1_DIFF_ONLY=1234 pixi run diff-random  # one case
 pixi run diff-random --list --target-percent 100        # print generated queries, run nothing
 ```
 
-ctest runs `diff.random` (label `diff`) with a fixed seed and 300 queries. A slice PR that implements a
+ctest runs `diff.random` (label `diff`) with a fixed seed and 300 queries over the tables it names, and `diff.decimal`
+(over `decimals`) and `diff.star` (over the star schema of the join tests) with seeds of their own; `parallel.diff.star`
+runs the queries of `diff.star` on 4 threads in 97-row batches. A slice PR that implements a
 feature adds it to `kSupportedFeatures` (and new grammar to `runner/query_gen.cc`; the unit test
 `harness.QueryGenerator.TargetSamplesCoverTheWholeGrammar` fails until every feature is generated). Grammar that
 the parser accepts before the generator writes it waits in `kGeneratorPending` (today the FROM lists, joins, table

@@ -30,10 +30,10 @@ Proposed
   class R, compared within a relative 1e-9, and names its type a bare `DECIMAL`
   (`tests/slt/runner/duckdb_engine.cc`). On a value with ten integer digits that tolerance is at least one whole
   unit, a hundred cents, and a wrong width or scale passes as well.
-- **DuckDB's rules are its own.** The oracle is DuckDB 1.5.5, the locked libduckdb. Its DECIMAL typing is neither the
+- **DuckDB's rules are its own.** The oracle is the locked libduckdb, DuckDB 1.5.6. Its DECIMAL typing is neither the
   SQL standard's nor Arrow's: widths are capped at 18 digits while every input has at most 18 digits, division gives
   DOUBLE, and CASE and comparisons take different common types. Every rule below was probed with DuckDB 1.5.5 on our
-  own data, and its formulas were read in DuckDB's source.
+  own data (1.5.6 gives the same types, values and messages), and its formulas were read in DuckDB's source.
 - **Storage:**
   - Arrow reads a Parquet DECIMAL with p ≤ 38 (INT32, INT64, FIXED_LEN_BYTE_ARRAY or BYTE_ARRAY) as decimal128(p,s)
     by default, and DuckDB reads all four as DECIMAL(p,s). Reading the smallest type (decimal32 for p ≤ 9, decimal64
@@ -48,8 +48,9 @@ Proposed
 
 ## Decision
 
-antb1 follows DuckDB 1.5.5 for DECIMAL. In the rules, p is the width (precision) and s the scale. The examples use a
-table of our own: `price` and `qty` DECIMAL(15,2), `rate` DECIMAL(5,3), `n` INTEGER, `b` BIGINT and `d` DOUBLE.
+antb1 follows DuckDB 1.5.5 and 1.5.6 (they agree) for DECIMAL. In the rules, p is the width (precision) and s the
+scale. The examples use a table of our own: `price` and `qty` DECIMAL(15,2), `rate` DECIMAL(5,3), `n` INTEGER,
+`b` BIGINT and `d` DOUBLE.
 
 This amends ADR 0012's list of unsupported constructs and three points of ADR 0004; both ADRs keep their status:
 
@@ -168,12 +169,14 @@ This amends ADR 0012's list of unsupported constructs and three points of ADR 00
       64-bit halves, with upper = -1 handled separately, as `src/common/int128.cc` does), divided
       by the count times 10^s (also in `long double`, with 10^s first rounded to a double), then rounded to double;
       for p ≤ 4 DuckDB computes the same in double;
-    - `long double` differs by platform (x87 80-bit on x86-64 Linux, 64-bit on arm64 macOS) exactly as it does in
-      DuckDB's own build, so the two engines agree to the bit on each platform, and no AVG divergence is registered;
-    - the formula rounds once on x86-64 but can round twice on arm64 macOS, where a direct conversion of the Int128
-      would be one ulp off: the AVG of the single DECIMAL(38,0) value 27670116110564329473 (2^64 + 2^63 + 2049) is
-      27670116110564327424.0 on both platforms, while a direct conversion gives 27670116110564331520.0 on arm64, a
-      test case for the macos-release leg;
+    - `long double` differs by platform exactly as it does in DuckDB's own build (x87 80-bit on x86-64 Linux, IEEE
+      quad on arm64 Linux, 64-bit double on arm64 macOS), so the two engines agree to the bit on each platform, and no
+      AVG divergence is registered;
+    - the result can miss the correctly rounded mean, by platform: the AVG of the single DECIMAL(38,0) value
+      27670116110564329473 (2^64 + 2^63 + 2049) is 27670116110564327424.0 on x86-64 Linux (the halves' sum rounds
+      to 64 bits, then to double) and on arm64 macOS (the lower half rounds, then the sum), but
+      27670116110564331520.0, the correctly rounded value, on arm64 Linux, where the sum is exact; the unit tests pin
+      each platform's answers (the macos-release leg, the nightly arm64 job);
     - on x86-64, an emulation of this formula matched DuckDB on 1,800 random sets (scales 2 to 6, up to 36 digits),
       where the correctly rounded mean missed one.
 14. **MIN and MAX** keep the type (`MIN(rate)` is DECIMAL(5,3)); COUNT and COUNT(DISTINCT) are BIGINT. Over no rows

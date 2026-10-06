@@ -52,7 +52,8 @@ Responsibilities:
   piece by piece) and copies only the rows that pass, for every column.
 - `exec`: pull-based, batch-at-a-time physical operators (`TableScan`, `Filter`, `Compute`, `Project`, `ScalarAggregate`,
   `GroupAggregate`, `Sort`, `Limit`, `RowCount`; see [Execution](#execution)), the exact aggregate states (scalar
-  and grouped), the row comparator and sort buffer, the physical planner and `Drain`. It scans only through
+  and grouped), the row comparator and sort buffer, the join hash table (`JoinTableBuilder`, `JoinTable`; no
+  operator uses it yet, see [Execution](#execution)), the physical planner and `Drain`. It scans only through
   `plan::Table` and never depends on `io`.
 - `engine`: `engine::Session` (owns the catalog, calls `arrow::compute::Initialize()`, runs parse, bind, plan and
   execute) and the canonical value formatter used for every output format.
@@ -173,24 +174,45 @@ row's position in the part (`ScanPart` with `positions`), and the row ids are ma
 **Memory.** The `Session` owns an `exec::MemoryBudget` (`--memory-limit`, `engine::SessionOptions::memory_limit`):
 an Arrow memory pool that is `ExecContext::pool` for every query, and that the Parquet reader decodes into
 (`plan::Table::Scan` and `ScanPart` take the pool). It counts every buffer and, through `Reserve`, the containers
-operators keep outside Arrow buffers: the grouped aggregate states (`GroupedAggregateState::memory_usage`) and the
-sort buffer's row references (`SortBuffer::memory_usage`, plus `sort_memory` while it sorts), each held in an
-`exec::MemoryReservation` that gives the bytes back on `Close`. The count is atomic and checked before an
-allocation, so threads never pass the limit together; past it, an allocation fails with `Status::OutOfMemory` and
-nothing is left behind. A result keeps the budget alive (`QueryResult::memory`) as long as its buffers exist. The
+operators keep outside Arrow buffers: the grouped aggregate states (`GroupedAggregateState::memory_usage`), the
+sort buffer's row references (`SortBuffer::memory_usage`, plus `sort_memory` while it sorts) and a join build's
+containers (each part's row hashes, the partitions' runs of rows, the table's row references, offsets and bucket
+directories, and the temporaries of `Finish`), each held in an `exec::MemoryReservation` that gives the bytes back
+on `Close` (a join table's when the table is destroyed). The count is atomic and checked before an allocation, so
+threads never pass the limit together; past it, an allocation fails with `Status::OutOfMemory` and nothing is left
+behind. A result keeps the budget alive (`QueryResult::memory`) as long as its buffers exist. The
 part scheduler's window adapts to the budget: every part taken above half of the limit halves it, every part taken
 below widens it by one, and above half no new part starts while another is in flight. A part that runs out of memory
 next to others does not fail the query: the parts ahead are dropped (and run again when reached) and it runs again
 alone. The partition lanes of a GROUP BY hold at most as many parts as the window (one above half of the limit)
 before the consumer waits for them to merge, and they finish merging before a part runs again alone. A
-`std::bad_alloc` from a container (outside the budget's view) is caught in the part tasks and in `Drain` and becomes
-`OutOfMemory` too.
+`std::bad_alloc` from a container (outside the budget's view) is caught in the part tasks, in `exec::ForEach` (in
+its tasks and around each `Submit`), in `PartitionLanes::Add` (queuing a part, starting a lane's task) and in
+`Drain`, and in every call of the join hash table, and becomes `OutOfMemory` too. Two places in Arrow still end the
+process on one: its thread pool's `Spawn`, where an OpenTelemetry call allocates in a `noexcept` function, and the
+making of an `arrow::Result` from a `Status`, whose `noexcept` constructor copies it.
 
 The budget's pool is Arrow's default pool, mimalloc. On Linux the `antb1` executable restarts itself once with
 `MIMALLOC_PURGE_DELAY=-1` (`cli::RestartForAllocator`, ADR 0017), so that mimalloc keeps the memory a query frees
 instead of returning it to the system and faulting it back in: unless the variable is set (a value the user set
 wins) or `ARROW_DEFAULT_MEMORY_POOL` names another pool. The process then keeps its peak resident memory until it
 exits; the budget, which counts allocations, is unchanged.
+
+**Join builds** ([ADR 0022](adr/0022-joins-and-query-blocks.md); no operator uses them yet). An
+`exec::JoinBuildPart` takes one part of a build input on any thread: it keeps the selected rows whose keys are not
+NULL, splits them into 64 partitions by `exec::KeyHashes` modulo 64 (the GROUP BY rule) with one Take per column,
+and keeps each row's hash. An `exec::JoinTableBuilder` takes the parts on the consumer thread in any order and hands
+them to `exec::PartitionLanes` in part order, so every partition lists its rows in (part, row) order; `Finish`
+builds the partitions in parallel (one at a time under memory pressure) into an immutable `exec::JoinTable`. One
+SMALLINT, INTEGER, BIGINT, USMALLINT, DATE or TIMESTAMP key whose values span fewer than 8 times the rows gets the
+direct layout, an offsets array indexed by the key minus the smallest key; every other key the hashed layout: per
+partition, `bit_ceil(rows)` buckets on the hash bits above the partition's, each listing its distinct keys with
+their hash and range of rows. The rows stay in the parts' taken batches (`JoinTable::chunks`, referenced as
+`JoinRowRef{chunk, row}`, at most 2^32 - 1 rows), each key's rows together and in (part, row) order. The table
+keeps whether any key repeats (`unique`), whether the input had a NULL key (`has_null`) and whether it was empty.
+`JoinTable::Find` gives every probe row the range of its matches, from any number of threads at once and without a
+lock; neither the thread count nor the order in which parts arrive changes the table, nor the failure of a build that
+fails: the failure of its earliest part, as in the serial order (a merge's before a later part's failed release).
 
 | Operator | Logical node | Does |
 | --- | --- | --- |

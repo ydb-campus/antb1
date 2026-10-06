@@ -185,9 +185,24 @@ TEST(Int128Test, DuckDbDecimalToDouble) {
   }
 }
 
-// DuckDB 1.5.5's AVG of a DECIMAL, bit for bit, from sums of random sets where the correctly
-// rounded mean differs in the last bit (each answer checked against DuckDB on x86-64). long double
-// is the platform's, as in DuckDB's own build: x87 80-bit on x86-64 Linux, 64-bit on arm64 macOS.
+// The value for this platform's long double: x87 (64-bit mantissa), IEEE quad (113) or double.
+double ForLongDouble(double x87, double quad, double double64) {
+  switch (std::numeric_limits<long double>::digits) {
+    case 64:
+      return x87;
+    case 113:
+      return quad;
+    default:
+      return double64;
+  }
+}
+
+// DuckDB 1.5.5's AVG of a DECIMAL, bit for bit (each answer checked against DuckDB on x86-64):
+// sums of random sets where the correctly rounded mean differs in the last bit on x86-64 or arm64
+// macOS, and one sum where it differs on every platform. long double is the platform's, as in
+// DuckDB's own build: x87 80-bit on x86-64 Linux, IEEE quad on arm64 Linux, double on arm64 macOS.
+// The quad answers come from an exact emulation of the formula that reproduces the x87 and double
+// ones.
 TEST(Int128Test, DuckDbDecimalAverage) {
   struct Case {
     std::string sum;
@@ -195,38 +210,47 @@ TEST(Int128Test, DuckDbDecimalAverage) {
     int width;
     int scale;
     double x87;       // 64-bit mantissa
+    double quad;      // 113-bit mantissa
     double double64;  // long double == double
   };
+  constexpr int kDigits = std::numeric_limits<long double>::digits;
+  ASSERT_TRUE(kDigits == 64 || kDigits == 113 || kDigits == 53)
+      << "no expectations for a long double of " << kDigits << " mantissa bits";
   for (const Case& c : {
            Case{.sum = "-6027685297180875454426411241489759",
                 .count = 2,
                 .width = 34,
                 .scale = 4,
                 .x87 = -3.013842648590438e+29,
+                .quad = -3.0138426485904376e+29,
                 .double64 = -3.013842648590438e+29},
            Case{.sum = "-13223336620658",
                 .count = 5,
                 .width = 13,
                 .scale = 5,
                 .x87 = -26446673.241315998,
+                .quad = -26446673.241316,
                 .double64 = -26446673.241316},
            Case{.sum = "-128063935436827839243246709275367",
                 .count = 2,
                 .width = 32,
                 .scale = 3,
                 .x87 = -6.403196771841392e+28,
+                .quad = -6.4031967718413915e+28,
                 .double64 = -6.403196771841392e+28},
            Case{.sum = "506931365701444",
                 .count = 4,
                 .width = 15,
                 .scale = 6,
                 .x87 = 126732841.42536101,
+                .quad = 126732841.425361,
                 .double64 = 126732841.425361},
            Case{.sum = "-3150176280006674350035463",
                 .count = 4,
                 .width = 25,
                 .scale = 3,
                 .x87 = -7.875440700016687e+20,
+                .quad = -7.875440700016685e+20,
                 .double64 = -7.875440700016685e+20},
            // The halves lower + upper * 2^64, not a direct conversion (ADR 0021 rule 13).
            Case{.sum = "33273625953879217449636401730702882204",
@@ -234,29 +258,42 @@ TEST(Int128Test, DuckDbDecimalAverage) {
                 .width = 38,
                 .scale = 0,
                 .x87 = 3.327362595387922e+37,
+                .quad = 3.327362595387922e+37,
                 .double64 = 3.327362595387922e+37},
            Case{.sum = "-96429140781460569102326976360742939557",
                 .count = 1,
                 .width = 38,
                 .scale = 0,
                 .x87 = -9.642914078146058e+37,
+                .quad = -9.642914078146058e+37,
                 .double64 = -9.642914078146058e+37},
            Case{.sum = "27670116110564329473",
                 .count = 1,
                 .width = 38,
                 .scale = 0,
                 .x87 = 27670116110564327424.0,
+                .quad = 27670116110564331520.0,
                 .double64 = 27670116110564327424.0},
+           // 2^120 + 2^67 + 1: the halves' sum rounds to 2^120 + 2^67 even in a quad long double,
+           // then to double ties to even, below the correctly rounded 2^120 + 2^68.
+           Case{.sum = "1329227995784916020477759649956757505",
+                .count = 1,
+                .width = 38,
+                .scale = 0,
+                .x87 = 1.329227995784916e+36,
+                .quad = 1.329227995784916e+36,
+                .double64 = 1.329227995784916e+36},
            // A 16-bit DECIMAL (width up to 4) averages in double.
            Case{.sum = "-1999",
                 .count = 3,
                 .width = 4,
                 .scale = 2,
                 .x87 = -6.663333333333333,
+                .quad = -6.663333333333333,
                 .double64 = -6.663333333333333},
        }) {
-    const double expected = std::numeric_limits<long double>::digits == 64 ? c.x87 : c.double64;
-    EXPECT_EQ(DuckDbDecimalAverage(Big(c.sum), c.count, c.width, c.scale), expected)
+    EXPECT_EQ(DuckDbDecimalAverage(Big(c.sum), c.count, c.width, c.scale),
+              ForLongDouble(c.x87, c.quad, c.double64))
         << c.sum << " / " << c.count;
   }
 }

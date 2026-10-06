@@ -188,7 +188,9 @@ antb1_add_expect_test(
 # Random differential test (label diff): antb1 vs DuckDB on generated queries (runner/difftest.h),
 # with a fixed seed. `pixi run diff-random` runs more (ANTB1_DIFF_SEED, ANTB1_DIFF_COUNT) over every table.
 # diff.random names its tables (a table added to tables.txt would change every query of the seed);
-# diff.decimal covers the DECIMAL columns of decimals.parquet with its own seed.
+# diff.decimal covers the DECIMAL columns of decimals.parquet with its own seed, and diff.star the star
+# schema of the join tests (tools/fixturegen/star.h) with another. A new seed must pass `pixi run asan` first:
+# DuckDB itself leaks on the queries of some seeds (docs/testing.md).
 set(
   _diff_tables
   --table
@@ -205,6 +207,25 @@ set(
   floats
   --table
   empty
+)
+set(
+  _star_tables
+  --table
+  trips
+  --table
+  riders
+  --table
+  drivers
+  --table
+  zones
+  --table
+  cities
+  --table
+  shifts
+  --table
+  tariffs
+  --table
+  promos
 )
 if(ANTB1_HAVE_DUCKDB)
   antb1_slt_args(_args diff.random)
@@ -225,6 +246,15 @@ if(ANTB1_HAVE_DUCKDB)
     diff.decimal
     PROPERTIES LABELS diff FIXTURES_REQUIRED antb1_fixtures TIMEOUT 300
   )
+  antb1_slt_args(_args diff.star)
+  add_test(
+    NAME diff.star
+    COMMAND antb1-slt diff ${_args} ${_star_tables} --seed 20261005 --count 300
+  )
+  set_tests_properties(
+    diff.star
+    PROPERTIES LABELS diff FIXTURES_REQUIRED antb1_fixtures TIMEOUT 300
+  )
   # The same queries (seed) on 4 threads with 700-row batches: DuckDB's answers, and the 1-thread results byte for
   # byte. (Seed 20260929 makes DuckDB itself leak under ASan: MIN of VARCHAR with GROUP BY and LIMIT.)
   antb1_slt_args(
@@ -243,6 +273,26 @@ if(ANTB1_HAVE_DUCKDB)
   )
   set_tests_properties(
     parallel.diff.random
+    PROPERTIES LABELS parallel FIXTURES_REQUIRED antb1_fixtures TIMEOUT 300
+  )
+  # diff.star on 4 threads with 97-row batches, fewer than the rows of every part of trips and shifts, so that a part
+  # spans several batches.
+  antb1_slt_args(
+    _args
+    parallel.diff.star
+    --threads
+    4
+    --same-as-threads
+    1
+    --batch-size
+    97
+  )
+  add_test(
+    NAME parallel.diff.star
+    COMMAND antb1-slt diff ${_args} ${_star_tables} --seed 20261005 --count 300
+  )
+  set_tests_properties(
+    parallel.diff.star
     PROPERTIES LABELS parallel FIXTURES_REQUIRED antb1_fixtures TIMEOUT 300
   )
 
@@ -705,5 +755,32 @@ if(ANTB1_HAVE_DUCKDB)
     COMMAND $<TARGET_FILE:antb1-slt> complete ${_args} "${_complete_file}"
   )
 endif()
+
+# The pending guard (tests/slt/README.md): slt.* and parallel.* skip a `pending <roadmap id>` record, which DuckDB
+# runs as usual. harness.slt.pending runs the pending records of every registered file on antb1, and fails with
+# "remove the guard (<id>)" when antb1 answers one with anything but Unsupported. Like slt-complete, it reads the
+# registered files after the last antb1_add_slt_suite(), at the end of this file. Its self-tests make antb1 answer
+# the pending records of selftest/pending.slt, or fail them with an execution error, and the check must fail.
+get_property(_slt_files GLOBAL PROPERTY ANTB1_SLT_FILES)
+antb1_slt_args(_args harness.slt.pending)
+add_test(NAME harness.slt.pending COMMAND antb1-slt pending ${_args} ${_slt_files})
+set_tests_properties(
+  harness.slt.pending
+  PROPERTIES LABELS harness FIXTURES_REQUIRED antb1_fixtures TIMEOUT 300
+)
+foreach(kind IN ITEMS succeed error)
+  set(_name harness.slt.pending.mutate.${kind})
+  antb1_slt_args(_args ${_name} --mutate ${kind})
+  antb1_add_expect_test(
+    ${_name}
+    LABELS harness
+    FIXTURES_REQUIRED antb1_fixtures
+    REQUIRE
+      "FAIL .*pending\\.slt:[0-9]+: query I nosort \\[antb1\\]: remove the guard \\(Z9\\): "
+      "FAIL .*pending\\.slt:[0-9]+: statement error \\[antb1\\]: remove the guard \\(Z9\\): "
+      "PENDING: FAIL files=1 with_pending=1 records=2 unsupported=0 failed=2 by id: Z9=2"
+    COMMAND $<TARGET_FILE:antb1-slt> pending ${_args} "${CMAKE_CURRENT_SOURCE_DIR}/selftest/pending.slt"
+  )
+endforeach()
 
 antb1_add_slt_complete_target()

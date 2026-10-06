@@ -48,6 +48,9 @@ SELECT a, b, COUNT(*) FROM t GROUP BY a
 - `statement ok` for SQL that must succeed, `statement error <regex>` for SQL that must fail with a matching error.
 - `onlyif antb1` or `skipif duckdb` before a record limits it to one engine. Use them only for a divergence
   registered in [sql-subset.md](../sql-subset.md#divergences-from-duckdb), and put its ID in a comment.
+- `pending <roadmap id>` before a record for SQL that a roadmap PR will answer: DuckDB runs it, antb1 skips it, and
+  `harness.slt.pending` checks that antb1 still answers it with Unsupported until that PR removes the guard.
+  `onlyif duckdb` guards SQL that no roadmap PR answers ([tests/slt/README.md](../../tests/slt/README.md#current-support-is-the-contract)).
 
 ## Steps (after the harness PR)
 
@@ -58,8 +61,9 @@ SELECT a, b, COUNT(*) FROM t GROUP BY a
    antb1 are flagged for review instead of completed.
 4. Review `git diff` of the generated results line by line against [sql-subset.md](../sql-subset.md). A surprising
    value means a wrong test, an engine bug or a semantic difference to register; it is never edited away.
-5. Run the SQL logic tests on both engines, for example `pixi run test -L slt` and `pixi run test -L oracle`, then
-   `pixi run check` before the PR.
+5. Run the SQL logic tests on both engines, for example `pixi run test -L slt` and `pixi run test -L oracle`, and for
+   `pending` records the pending check (`pixi run test -R '^harness\.slt\.pending$'`), then `pixi run check` before
+   the PR.
 6. When a record fails later, fix the engine (or the registered divergence), not the expectation. If the oracle
    itself changed its answer after a DuckDB update, regenerate with the completion task and explain it in the PR.
 

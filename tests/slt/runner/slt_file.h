@@ -18,6 +18,9 @@
 // - query <I|R|D|T...> [nosort|rowsort|valuesort] [label]: SQL lines, "----", then the expected
 //   lines up to a blank line.
 // - skipif <engine> | onlyif <engine> (antb1 or duckdb): conditions of the next record.
+// - pending <roadmap id> (e.g. pending J2b): the next statement or query waits on that roadmap PR.
+//   DuckDB runs it as usual; antb1 runs it only in the pending check (CheckPendingFile in
+//   runner.h), where it must still get Unsupported. It takes no skipif or onlyif.
 // - halt: stop the file (with a condition: for that engine only).
 // - hash-threshold <n>: hash results with more than n values (0: never).
 // - # comment; "# tol <rel>" sets the R tolerance of the next query.
@@ -37,6 +40,7 @@ struct Record {
   int line = 0;  // 1-based line of the header (statement/query/halt/hash-threshold)
   std::vector<std::string> skipif;
   std::vector<std::string> onlyif;
+  std::string pending;  // the roadmap id of `pending <id>`, or empty
   std::string sql;
   std::string error_regex;   // statement error
   std::regex error_pattern;  // error_regex compiled (ParseSlt rejects invalid regexes)
@@ -53,7 +57,8 @@ struct Record {
   std::size_t block_end = 0;
   bool has_separator = false;
 
-  // Whether the record runs on the engine called `engine` (skipif/onlyif).
+  // Whether the record runs on the engine called `engine` (skipif/onlyif; antb1 skips a pending
+  // record, which only the pending check runs on it).
   [[nodiscard]] bool RunsOn(std::string_view engine) const;
 };
 
@@ -64,6 +69,10 @@ struct SltFile {
 };
 
 inline constexpr std::array<std::string_view, 2> kEngineNames{"antb1", "duckdb"};
+
+// Whether `id` names a roadmap PR as a `pending` line writes it: an upper-case letter, digits and
+// at most one lower-case letter (S3, J2b, H6b).
+bool IsRoadmapId(std::string_view id);
 
 // Why `sort` cannot check a record whose columns have the classes `types`, or std::nullopt.
 // valuesort loses the columns: with an R column, every value compares within the tolerance, so

@@ -1,6 +1,8 @@
 # Tables of the .slt files (tests/slt/README.md), registered identically on antb1 and DuckDB.
 # <name> <file>[,<file>...] [option...]   files relative to the fixtures dir (tools/fixturegen); globs allowed
 # Options: clickbench = EventDate (uint16 days) reads as DATE (antb1 --clickbench; DuckDB make_date)
+#          ref=<column>[+<column>...]:<table>.<column>[+<column>...] = a foreign key (repeatable): a hint for
+#          generated joins, not a constraint (NULL and dangling keys are intended); runner/tables.h
 hits_like           hits_like.parquet                  clickbench
 hits_like_nulls     hits_like_nulls.parquet            clickbench
 hits_like_split     hits_like_split/part-*.parquet     clickbench
@@ -9,3 +11,12 @@ edge                edge.parquet
 floats              floats.parquet
 decimals            decimals.parquet
 empty               empty.parquet                      clickbench
+# The star schema of the join and subquery tests (tools/fixturegen/star.h)
+trips               star/trips.parquet                 ref=tr_rider:riders.rd_id ref=tr_driver:drivers.dv_id ref=tr_pickup:zones.zn_id ref=tr_dropoff:zones.zn_id ref=tr_driver+tr_day:shifts.sh_driver+sh_day ref=tr_tariff:tariffs.tf_code ref=tr_rate:tariffs.tf_rate ref=tr_promo:promos.pm_id
+riders              star/riders.parquet                ref=rd_city:cities.ct_id
+drivers             star/drivers.parquet               ref=dv_city:cities.ct_id
+zones               star/zones.parquet                 ref=zn_city:cities.ct_id ref=zn_parent:zones.zn_id
+cities              star/cities.parquet
+shifts              star/shifts.parquet                ref=sh_driver:drivers.dv_id
+tariffs             star/tariffs.parquet
+promos              star/promos.parquet

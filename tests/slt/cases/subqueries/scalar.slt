@@ -1,0 +1,198 @@
+# Scalar subqueries over the star schema: uncorrelated ungrouped aggregates (ADR 0022), zero rows among them, and
+# correlated SUM, AVG, MIN and MAX under comparisons that reject NULL (ADR 0023), over empty groups, on one and two
+# columns, and into a middle block.
+
+# ---- the inputs, one table at a time ----
+
+query DD nosort
+SELECT MIN(tr_fare), MAX(tr_fare) FROM trips
+----
+3.50	27.50
+
+query IDD nosort
+SELECT COUNT(*), MIN(sh_hours), MAX(sh_hours) FROM shifts
+----
+500	4.0	12.0
+
+query II nosort
+SELECT COUNT(*), COUNT(pm_discount) FROM promos
+----
+0	0
+
+# ---- pending: uncorrelated scalar subqueries (ADR 0022; roadmap PR J5 removes these guards) ----
+
+# Over zero rows MAX is NULL, which rejects every row, and COUNT is 0.
+pending J5
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_fare > (SELECT MAX(pm_discount) FROM promos)
+----
+0
+
+pending J5
+query I nosort
+SELECT COUNT(*) FROM trips WHERE 0 = (SELECT COUNT(*) FROM promos)
+----
+3000
+
+# The subquery first, and AVG.
+pending J5
+query I nosort
+SELECT COUNT(*) FROM trips WHERE (SELECT AVG(tr_fare) FROM trips) < tr_fare
+----
+1466
+
+pending J5
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_distance > (SELECT AVG(zn_radius) FROM zones)
+----
+2652
+
+# SUM over the zero rows a filter leaves.
+pending J5
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_fare < (SELECT SUM(sh_hours) FROM shifts WHERE sh_hours > 100)
+----
+0
+
+# An aggregate subquery in a block without aggregates, and two of them.
+pending J5
+query ID rowsort
+SELECT tr_row, tr_fare FROM trips WHERE tr_fare = (SELECT MAX(tr_fare) FROM trips) AND tr_row < 300
+----
+10	27.50
+107	27.50
+204	27.50
+
+pending J5
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_fare > (SELECT MIN(sh_hours) FROM shifts) AND tr_fare < (SELECT MAX(sh_hours) FROM shifts)
+----
+928
+
+# In HAVING.
+pending J5
+query ID rowsort
+SELECT tr_pickup, SUM(tr_fare) FROM trips GROUP BY tr_pickup HAVING SUM(tr_fare) > (SELECT MAX(tr_fare) * 39 FROM trips)
+----
+1	1075.00
+12	1077.25
+14	1079.75
+22	1091.00
+3	1077.50
+33	1093.25
+
+# Over a join (roadmap PR J2b).
+pending J5
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_fare > (SELECT AVG(tr_fare) FROM trips JOIN drivers ON tr_driver = dv_id WHERE dv_city = 1)
+----
+1436
+
+# Two columns.
+pending J5
+statement error
+SELECT COUNT(*) FROM trips WHERE tr_fare > (SELECT MIN(pm_discount), MAX(pm_discount) FROM promos)
+
+# ---- pending: correlated scalar aggregates (ADR 0023; roadmap PR U3 removes these guards) ----
+
+# Empty groups: riders 237 to 240 have no trip, so their SUM is NULL and the comparison drops them.
+pending U3
+query I nosort
+SELECT COUNT(*) FROM riders WHERE rd_id > 225 AND 0 < (SELECT SUM(tr_fare) FROM trips WHERE tr_rider = rd_id)
+----
+11
+
+# SUM, MIN of a DATE and AVG.
+pending U3
+query I nosort
+SELECT COUNT(*) FROM riders WHERE (SELECT SUM(tr_fare) FROM trips WHERE tr_rider = rd_id) > 200
+----
+34
+
+pending U3
+query I nosort
+SELECT COUNT(*) FROM riders WHERE rd_joined > (SELECT MIN(tr_day) FROM trips WHERE tr_rider = rd_id)
+----
+12
+
+pending U3
+query I nosort
+SELECT COUNT(*) FROM riders WHERE (SELECT AVG(tr_fare) FROM trips WHERE tr_rider = rd_id) > 17
+----
+27
+
+# An aggregate combined with literals.
+pending U3
+query I rowsort
+SELECT rd_id FROM riders WHERE rd_id < 20 AND 400 < (SELECT SUM(tr_fare) * 2 - 10 FROM trips WHERE tr_rider = rd_id)
+----
+12
+14
+17
+
+# Two columns of the same types on both sides (the repeated keys of shifts each count).
+pending U3
+query I nosort
+SELECT COUNT(*) FROM shifts WHERE sh_hours * 4 > (SELECT SUM(tr_fare) FROM trips WHERE tr_driver = sh_driver AND tr_day = sh_day)
+----
+380
+
+# A correlation into a middle block: the subquery reads the zones of the IN subquery, not the outer cities (roadmap
+# PR J5 for the IN).
+pending U3
+query I rowsort
+SELECT ct_id FROM cities
+WHERE ct_id IN (SELECT zn_city FROM zones WHERE zn_radius * 3 > (SELECT AVG(tr_distance) FROM trips WHERE tr_pickup = zn_id))
+----
+2
+4
+
+# ---- DuckDB only until correlated COUNT gets a PR (ADR 0023: the COUNT bug) ----
+
+# COUNT over no rows is 0, so the riders without a trip pass: an inner join on the grouped trips would drop them.
+onlyif duckdb
+query I nosort
+SELECT COUNT(*) FROM riders WHERE 0 = (SELECT COUNT(*) FROM trips WHERE tr_rider = rd_id)
+----
+4
+
+# ---- DuckDB only until CASE over correlated aggregates gets a PR (ADR 0023) ----
+
+onlyif duckdb
+query I nosort
+SELECT COUNT(*) FROM riders WHERE 0 = (SELECT CASE WHEN SUM(tr_fare) > 0 THEN 1 ELSE 0 END FROM trips WHERE tr_rider = rd_id)
+----
+4
+
+# ---- DuckDB only until the general domain join gets a PR (ADR 0023: a correlation of two types exits 4) ----
+
+# Only an equality of one type feeds an equivalence class, so the INTEGER tr_driver is no inner equivalent of the
+# BIGINT dv_id.
+onlyif duckdb
+query I nosort
+SELECT COUNT(*) FROM drivers WHERE 450 < (SELECT SUM(tr_fare) FROM trips WHERE tr_driver = dv_id)
+----
+13
+
+# ---- DuckDB only until single joins get a PR (ADR 0023: a scalar subquery that is no aggregate exits 4) ----
+
+# Zero rows give NULL; several rows are an error.
+onlyif duckdb
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_promo = (SELECT pm_id FROM promos)
+----
+0
+
+onlyif duckdb
+statement error
+SELECT COUNT(*) FROM trips WHERE tr_pickup = (SELECT zn_id FROM zones)
+
+# ---- DuckDB only, for good: DuckDB's error texts ----
+
+onlyif duckdb
+statement error ^Binder Error: Subquery returns 2 columns - expected 1
+SELECT COUNT(*) FROM trips WHERE tr_fare > (SELECT MIN(pm_discount), MAX(pm_discount) FROM promos)
+
+onlyif duckdb
+statement error ^Invalid Input Error: More than one row returned by a subquery
+SELECT COUNT(*) FROM trips WHERE tr_pickup = (SELECT zn_id FROM zones)

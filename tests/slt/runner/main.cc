@@ -3,6 +3,7 @@
 //   antb1-slt run --engine antb1|duckdb --fixtures DIR --tables FILE [--redact] [--mutate KIND]
 //                 FILE...
 //   antb1-slt complete --fixtures DIR --tables FILE FILE...
+//   antb1-slt pending --fixtures DIR --tables FILE [--redact] [--mutate KIND] FILE...
 //   antb1-slt diff --fixtures DIR --tables FILE --seed S --count N [--only I] [--table NAME]...
 //                  [--redact] [--mutate KIND] [--target-percent P]
 //   antb1-slt queries --fixtures DIR --tables FILE [--redact] [--only LINE] [--mutate KIND] FILE
@@ -14,10 +15,12 @@
 //                  [--only N] [--mutate KIND]
 //   antb1-slt version
 //
-// `queries` and `clickbench` run the ClickBench data tests (tests/data): see query_file.h and
-// clickbench.h. `answers` checks stored answers against the DuckDB oracle (answers.h). `tpch` is
-// the ratchet of the queries derived from TPC-H (ratchet.h, tests/tpch): q01.sql, q02.sql, ... of
-// DIR as Q1, Q2, ...; ANTB1_TPCH_TIMES=1 adds each query's seconds and their geometric mean.
+// `pending` is the pending check: antb1 must still answer every `pending <roadmap id>` record of
+// FILEs with Unsupported (runner.h). `queries` and `clickbench` run the ClickBench data tests
+// (tests/data): see query_file.h and clickbench.h. `answers` checks stored answers against the
+// DuckDB oracle (answers.h). `tpch` is the ratchet of the queries derived from TPC-H (ratchet.h,
+// tests/tpch): q01.sql, q02.sql, ... of DIR as Q1, Q2, ...; ANTB1_TPCH_TIMES=1 adds each query's
+// seconds and their geometric mean.
 //
 // Redaction: --redact, a table with the `redact` option (tables.h) and `answers` print no values
 // and no SQL. --show-values lifts the last two for a local repro; it is refused when
@@ -481,6 +484,52 @@ std::expected<Antb1Under, std::string> MakeAntb1(const std::vector<TableDef>& ta
   return out;
 }
 
+// The pending check (CheckPendingFile): the `pending <roadmap id>` records of every file on antb1.
+int Pending(const Args& args, const std::vector<TableDef>& tables, const std::string& command) {
+  if (!ParseMutation(args.mutate).has_value()) {
+    std::println(stderr, "antb1-slt: unknown --mutate kind '{}' (known: {})", args.mutate,
+                 kMutationNames);
+    return kExitUsage;
+  }
+  const RunOptions options{.redact = args.redact, .repro = Repro(command, args)};
+  PendingStats total;
+  int with_pending = 0;
+  for (const auto& path : args.files) {
+    auto loaded = Load(path, args);
+    if (!loaded) {
+      std::println(stderr, "{}", loaded.error());
+      return kExitUsage;
+    }
+    if (std::ranges::none_of(loaded->file.records,
+                             [](const Record& r) { return !r.pending.empty(); })) {
+      continue;
+    }
+    ++with_pending;
+    auto antb1 = MakeAntb1(tables, args);
+    if (!antb1) {
+      std::println(stderr, "antb1-slt: {}", antb1.error());
+      return kExitSetup;
+    }
+    std::string out;
+    const PendingStats stats = CheckPendingFile(loaded->file, antb1->get(), options, out);
+    std::print("{}", out);
+    total.records += stats.records;
+    total.unsupported += stats.unsupported;
+    total.failed += stats.failed;
+    for (const auto& [id, count] : stats.by_id) {
+      total.by_id[id] += count;
+    }
+  }
+  std::string ids;
+  for (const auto& [id, count] : total.by_id) {
+    ids += std::format(" {}={}", id, count);
+  }
+  std::println("PENDING: {} files={} with_pending={} records={} unsupported={} failed={}{}",
+               total.failed == 0 ? "PASS" : "FAIL", args.files.size(), with_pending, total.records,
+               total.unsupported, total.failed, ids.empty() ? "" : " by id:" + ids);
+  return total.failed == 0 ? 0 : kExitFailed;
+}
+
 std::expected<std::vector<Statement>, std::string> LoadStatements(const std::string& path) {
   auto text = ReadFile(path);
   if (!text) {
@@ -650,6 +699,12 @@ int Main(std::span<char*> argv, const Environment& env) {
   auto* complete =
       app.add_subcommand("complete", "Rewrite the expected results of FILEs from DuckDB");
   AddCommon(complete, args);
+  auto* pending = app.add_subcommand(
+      "pending", "Check that antb1 still answers the `pending` records of FILEs with Unsupported");
+  AddCommon(pending, args);
+  pending->add_flag("--redact", args.redact,
+                    "Never print values or SQL (only ids, error kinds, row counts)");
+  pending->add_option("--mutate", args.mutate, "Corrupt antb1 results (harness self-tests)");
   auto* diff = app.add_subcommand(
       "diff", "Random differential test: generated queries on antb1 vs the DuckDB oracle");
   AddSetup(diff, args);
@@ -765,6 +820,9 @@ int Main(std::span<char*> argv, const Environment& env) {
   const std::string command = CommandLine(argv, redacted_data);
   if (diff->parsed()) {
     return Diff(args, *tables, command);
+  }
+  if (pending->parsed()) {
+    return Pending(args, *tables, command);
   }
   if (queries->parsed()) {
     return Queries(args, *tables, command);

@@ -109,10 +109,10 @@ endforeach()
 
 # Random differential test over the tables at scale factor 0.01 (tests/slt/runner/difftest.h), and the same queries
 # on 4 threads with batches of 1000 rows, equal to the 1-thread results byte for byte (ADR 0013). The seed is chosen
-# so that DuckDB itself stays clean under ASan: DuckDB 1.5.5 leaks the state of a string MIN or MAX over many groups
-# without ORDER BY, which the generated queries of a seed can contain. The queries also depend on the generator and on
-# the supported features, so a change to either is checked under ASan too. A failure in antb1 is fixed, never avoided
-# by another seed.
+# so that DuckDB itself stays clean under ASan: DuckDB 1.5.5 and 1.5.6 leak the state of a string MIN or MAX over many
+# groups without ORDER BY, which the generated queries of a seed can contain. The queries also depend on the generator
+# and on the supported features, so a change to either is checked under ASan too. A failure in antb1 is fixed, never
+# avoided by another seed.
 set(_seed 20261002)
 foreach(kind IN ITEMS diff parallel)
   if(kind STREQUAL "diff")

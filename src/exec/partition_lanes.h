@@ -17,6 +17,16 @@
 
 namespace antb1::exec {
 
+// Runs fn(0) .. fn(n - 1) on the executor (here, one after another, without one) and waits for all
+// of them: the first failure in index order decides the status (without an executor, the tasks
+// after it do not run). std::bad_alloc in a task becomes OutOfMemory. A task that cannot be
+// submitted (Submit fails, or throws std::bad_alloc: OutOfMemory) is a failure at its index, and
+// no later task starts; the tasks already submitted still end before ForEach returns, or throws
+// (std::bad_alloc while even a status cannot be made). Called from the consumer thread, never from
+// a task of the executor: it waits for the tasks.
+arrow::Status ForEach(arrow::internal::Executor* executor, std::size_t n,
+                      const std::function<arrow::Status(std::size_t)>& fn);
+
 // The merge of parts into partitioned state (docs/adr/0013-parallel-execution.md): one lane per
 // partition, each merging the parts in part order on its own, so that a slow partition holds back
 // no other. Add hands a part to every lane and returns; a lane runs on the executor while it has
@@ -32,7 +42,11 @@ namespace antb1::exec {
 // Once a failure is known, Add queues nothing more and returns Finish(). Finish() waits for every
 // lane and returns the failure of the smallest (part, lane): every part up to the first failure
 // seen was given to every lane, so which failure wins does not depend on the timing.
-// std::bad_alloc in a merge becomes OutOfMemory.
+// std::bad_alloc in a merge becomes OutOfMemory. A lane that cannot take a part (its task cannot
+// be submitted, or std::bad_alloc while the part is queued: OutOfMemory) fails as if it had failed
+// to merge the part, after merging the parts it holds before it; every lane does when the part
+// cannot be queued at all, and Add then returns Finish(): no task is left running and no lane
+// waits for one.
 //
 // Add and Finish are called from one thread (the consumer), never from the executor's threads:
 // they may wait for the lanes. The destructor waits for every lane.
@@ -55,6 +69,8 @@ class PartitionLanes {
   arrow::Status Finish();
   // Waits for every lane to merge every part added (their memory is then released).
   void Wait();
+  // Whether a failure is known, without waiting: Finish() then returns one.
+  [[nodiscard]] bool failed() const;
 
   // Parts added and not yet merged by every lane (for tests).
   [[nodiscard]] int64_t pending() const;
@@ -76,6 +92,9 @@ class PartitionLanes {
     arrow::Status status;
   };
 
+  // Under mu_: queues `part` on lane `lane` and starts a task for the lane unless one runs. On
+  // failure the lane is as it was: the part is not queued and no task was started.
+  arrow::Status Queue(std::size_t lane, const std::shared_ptr<Part>& part);
   // Runs lane `lane`'s queue until it is empty or the lane fails.
   void Drain(std::size_t lane);
   // Under mu_: a lane is done with `part` (merged, failed or dropped).

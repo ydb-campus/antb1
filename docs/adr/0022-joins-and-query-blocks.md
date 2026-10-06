@@ -354,6 +354,10 @@ Proposed
   - In both layouts a key's rows come in (part, row) order. A **uniqueness flag** says that no key repeats.
   - Keys are one or more typed columns of any type but DOUBLE (integers, DATE, TIMESTAMP, VARCHAR, decimal128), which
     the planner has cast to a common type on both sides; equal values of one such type have equal bytes.
+  - Update (2026-10-05): a partition's CSR directory lists its distinct keys bucket by bucket, first seen first, each
+    with its 64-bit hash and the range of its rows, which keep their (part, row) order; rows are referenced as
+    (chunk, row) in the parts' batches, which the table keeps without copying; a build of more than 2^32 - 1 rows is
+    an out-of-memory error.
 - **The probe (J1b)** is a streaming operator of the probe side's part pipeline, or one over a serial input.
   - It hashes the keys of the selected rows, looks them up and emits at most `batch_size` rows per `Next`, resuming
     inside a probe batch: a 1:N join can fan out beyond one batch, and a part union holds a part's whole output.

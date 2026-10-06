@@ -17,6 +17,8 @@
 
 #include "antb1/exec/memory_budget.h"
 
+#include "exec_test_util.h"
+
 namespace antb1::exec {
 namespace {
 
@@ -185,17 +187,165 @@ TEST(PartitionLanesTest, TheEarliestFailureWins) {
   }
 }
 
-// A lane whose task cannot be submitted (the pool is shut down) fails with the executor's status;
-// the part is dropped, nothing waits for it.
+// failed() tells whether a failure is known, without waiting: not before one; right after the Add
+// that fails without an executor, once Finish() has waited for the lanes with one; and from then
+// on. A merge that still runs does not hold it back.
+TEST(PartitionLanesTest, FailedTellsWhetherAFailureIsKnown) {
+  const auto pool = Pool();
+  for (arrow::internal::Executor* executor : Executors(pool.get())) {
+    SCOPED_TRACE(executor == nullptr ? "here" : "pool");
+    PartitionLanes lanes(3, executor, 4);
+    EXPECT_FALSE(lanes.failed());
+    EXPECT_TRUE(lanes.Add(0, [](std::size_t) { return arrow::Status::OK(); }).ok());
+    EXPECT_TRUE(lanes.Finish().ok());
+    EXPECT_FALSE(lanes.failed());
+    const arrow::Status added = lanes.Add(1, [](std::size_t lane) {
+      return lane == 1 ? arrow::Status::Invalid("part 1 lane 1") : arrow::Status::OK();
+    });
+    if (executor == nullptr) {
+      EXPECT_EQ(added.message(), "part 1 lane 1");
+      EXPECT_TRUE(lanes.failed());
+    }
+    EXPECT_EQ(lanes.Finish().message(), "part 1 lane 1");
+    EXPECT_TRUE(lanes.failed());
+    EXPECT_FALSE(lanes.Add(2, [](std::size_t) { return arrow::Status::OK(); }).ok());
+    EXPECT_TRUE(lanes.failed());
+  }
+  std::mutex mu;
+  std::condition_variable cv;
+  bool open = false;
+  PartitionLanes lanes(2, pool.get(), 4);
+  EXPECT_TRUE(lanes
+                  .Add(0,
+                       [&](std::size_t) {
+                         std::unique_lock lock(mu);
+                         cv.wait(lock, [&] { return open; });
+                         return arrow::Status::Invalid("part 0");
+                       })
+                  .ok());
+  EXPECT_FALSE(lanes.failed());  // waiting for the merge here would wait forever
+  {
+    const std::scoped_lock lock(mu);
+    open = true;
+  }
+  cv.notify_all();
+  EXPECT_EQ(lanes.Finish().message(), "part 0");
+  EXPECT_TRUE(lanes.failed());
+}
+
+// A lane whose task cannot be submitted (the pool is shut down) fails Add with the executor's
+// status; the part is dropped, nothing waits for it.
 TEST(PartitionLanesTest, AFailedSubmitFailsTheLane) {
   auto pool = arrow::internal::ThreadPool::Make(1);
   ASSERT_TRUE(pool.ok());
   ASSERT_TRUE((*pool)->Shutdown().ok());
   PartitionLanes lanes(3, pool->get(), 2);
-  EXPECT_TRUE(lanes.Add(0, [](std::size_t) { return arrow::Status::OK(); }).ok());
+  EXPECT_FALSE(lanes.Add(0, [](std::size_t) { return arrow::Status::OK(); }).ok());
   EXPECT_EQ(lanes.pending(), 0);
   EXPECT_FALSE(lanes.Finish().ok());
   EXPECT_FALSE(lanes.Add(1, [](std::size_t) { return arrow::Status::OK(); }).ok());
+}
+
+// A lane whose task cannot be started because Submit throws std::bad_alloc fails with OutOfMemory:
+// Add returns it once the other lanes have merged the part, nothing is queued after it, and the
+// lanes finish and go without waiting for a task that never ran.
+TEST(PartitionLanesTest, ASubmitThatThrowsFailsTheLane) {
+  const auto pool = Pool();
+  constexpr std::size_t kLanes = 4;
+  testing::ThrowingExecutor executor(pool.get(), /*throw_at=*/2);  // lane 2's task for part 0
+  std::vector<std::vector<int64_t>> seen(kLanes);                  // each lane writes only its own
+  const auto merge = [&seen](int64_t part) {
+    return [&seen, part](std::size_t lane) {
+      seen[lane].push_back(part);
+      return arrow::Status::OK();
+    };
+  };
+  {
+    PartitionLanes lanes(kLanes, &executor, 2);
+    const arrow::Status added = lanes.Add(0, merge(0));
+    EXPECT_TRUE(added.IsOutOfMemory()) << added.ToString();
+    EXPECT_EQ(lanes.pending(), 0);
+    const arrow::Status next = lanes.Add(1, merge(1));
+    EXPECT_TRUE(next.IsOutOfMemory()) << next.ToString();
+    const arrow::Status finished = lanes.Finish();
+    EXPECT_TRUE(finished.IsOutOfMemory()) << finished.ToString();
+  }
+  EXPECT_EQ(seen, (std::vector<std::vector<int64_t>>{{0}, {0}, {}, {0}}));
+  EXPECT_EQ(executor.spawns(), static_cast<int>(kLanes));
+}
+
+// ForEach runs the tasks on the executor (or here) and reports the first failure in index order,
+// whatever the timing; without an executor the tasks after it do not run. std::bad_alloc becomes
+// OutOfMemory, and a task that cannot be submitted fails ForEach.
+TEST(PartitionLanesTest, ForEachReportsTheFirstFailureInIndexOrder) {
+  const auto pool = Pool();
+  for (arrow::internal::Executor* executor : Executors(pool.get())) {
+    for (int run = 0; run < 10; ++run) {
+      std::vector<int> ran(20, 0);  // each task writes only its own
+      const arrow::Status status = ForEach(executor, ran.size(), [&ran](std::size_t i) {
+        ran[i] = 1;
+        if (i == 13) {
+          return arrow::Status::IOError("task 13");
+        }
+        if (i == 7) {
+          return arrow::Status::Invalid("task 7");
+        }
+        return arrow::Status::OK();
+      });
+      EXPECT_TRUE(status.IsInvalid()) << status.ToString();
+      EXPECT_EQ(status.message(), "task 7");
+      EXPECT_EQ(ran[19], executor == nullptr ? 0 : 1);
+    }
+    const arrow::Status oom = ForEach(executor, 3, [](std::size_t i) -> arrow::Status {
+      if (i == 1) {
+        throw std::bad_alloc();
+      }
+      return arrow::Status::OK();
+    });
+    EXPECT_TRUE(oom.IsOutOfMemory()) << oom.ToString();
+    EXPECT_TRUE(
+        ForEach(executor, 0, [](std::size_t) { return arrow::Status::Invalid("none"); }).ok());
+  }
+  auto stopped = arrow::internal::ThreadPool::Make(1);
+  ASSERT_TRUE(stopped.ok());
+  ASSERT_TRUE((*stopped)->Shutdown().ok());
+  EXPECT_FALSE(ForEach(stopped->get(), 2, [](std::size_t) { return arrow::Status::OK(); }).ok());
+}
+
+// A Submit that throws std::bad_alloc starts nothing: ForEach fails with OutOfMemory once the tasks
+// it has submitted have ended (they still run when it throws), the later tasks never run, and a
+// task before it that fails comes first.
+TEST(PartitionLanesTest, ForEachWaitsForItsTasksWhenASubmitThrows) {
+  const auto pool = Pool();
+  constexpr std::size_t kTasks = 8;
+  constexpr std::size_t kThrowAt = 6;  // more tasks before it than threads: some wait to start
+  for (const bool fail : {false, true}) {
+    SCOPED_TRACE(fail);
+    std::mutex mu;
+    std::condition_variable cv;
+    bool thrown = false;
+    testing::ThrowingExecutor executor(pool.get(), static_cast<int>(kThrowAt), [&] {
+      const std::scoped_lock lock(mu);
+      thrown = true;
+      cv.notify_all();
+    });
+    std::vector<int> ended(kTasks, 0);  // each task writes only its own
+    const arrow::Status status = ForEach(&executor, kTasks, [&](std::size_t i) {
+      std::unique_lock lock(mu);
+      cv.wait(lock, [&] { return thrown; });  // no task ends before the submit throws
+      ended[i] = 1;
+      return fail && i == 4 ? arrow::Status::Invalid("task 4") : arrow::Status::OK();
+    });
+    if (fail) {
+      EXPECT_TRUE(status.IsInvalid()) << status.ToString();
+    } else {
+      EXPECT_TRUE(status.IsOutOfMemory()) << status.ToString();
+    }
+    for (std::size_t i = 0; i < kTasks; ++i) {
+      EXPECT_EQ(ended[i], i < kThrowAt ? 1 : 0) << i;
+    }
+    EXPECT_EQ(executor.spawns(), static_cast<int>(kThrowAt) + 1);
+  }
 }
 
 }  // namespace

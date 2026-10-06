@@ -208,6 +208,138 @@ TEST(RunFile, HashThresholdAndLabels) {
       << out;
 }
 
+// A pending record between two records that antb1 answers.
+constexpr std::string_view kPendingFile =
+    "query I nosort\nSELECT COUNT(*) FROM t\n----\n31337\n\n"
+    "pending J2b\nquery I nosort\nSELECT COUNT(*) FROM t, u WHERE t.k = u.k\n----\n7\n\n"
+    "statement ok\nSELECT COUNT(*) FROM t\n";
+
+TEST(RunFile, Antb1SkipsPendingRecordsAndDuckDbRunsThem) {
+  FakeEngine antb1("antb1");
+  antb1.Answer("SELECT COUNT(*) FROM t", Ints({{"31337"}}));
+  const auto a = RunText(kPendingFile, antb1);
+  EXPECT_EQ(a.stats.records, 2);
+  EXPECT_EQ(a.stats.passed, 2) << a.out;
+  EXPECT_EQ(a.stats.skipped, 1);
+  EXPECT_EQ(antb1.calls(), 2);
+  FakeEngine duckdb("duckdb");
+  duckdb.Answer("SELECT COUNT(*) FROM t", Ints({{"31337"}}));
+  duckdb.Answer("SELECT COUNT(*) FROM t, u WHERE t.k = u.k", Ints({{"7"}}));
+  const auto d = RunText(kPendingFile, duckdb);
+  EXPECT_EQ(d.stats.records, 3);
+  EXPECT_EQ(d.stats.passed, 3) << d.out;
+  EXPECT_EQ(d.stats.skipped, 0);
+}
+
+PendingStats CheckPendingText(std::string_view text, Engine& engine, std::string& out,
+                              bool redact = false) {
+  return CheckPendingFile(Parse(text), engine,
+                          RunOptions{.redact = redact, .repro = "    repro-command\n"}, out);
+}
+
+TEST(CheckPendingFile, PassesWhileEveryPendingRecordIsUnsupported) {
+  FakeEngine antb1("antb1");
+  antb1.Answer("SELECT COUNT(*) FROM t, u WHERE t.k = u.k", std::unexpected(Unsupported()));
+  antb1.Answer("SELECT COUNT(*) FROM t AS semi", std::unexpected(Unsupported()));
+  std::string out;
+  const auto stats = CheckPendingText(
+      std::string(kPendingFile) + "\npending S3\nstatement error\nSELECT COUNT(*) FROM t AS semi\n",
+      antb1, out);
+  EXPECT_EQ(stats.records, 2);
+  EXPECT_EQ(stats.unsupported, 2);
+  EXPECT_EQ(stats.failed, 0) << out;
+  EXPECT_EQ(stats.by_id, (std::map<std::string, int, std::less<>>{{"J2b", 1}, {"S3", 1}}));
+  EXPECT_EQ(antb1.calls(), 2);  // only the pending records run
+  EXPECT_NE(out.find("t.slt: pending records=2 unsupported=2 failed=0 (J2b 1, S3 1)"),
+            std::string::npos)
+      << out;
+}
+
+TEST(CheckPendingFile, AnyOtherAnswerSaysRemoveTheGuard) {
+  const std::string file = std::string(kPendingFile) +
+                           "\npending J5\nstatement error\nSELECT nope\n\n"
+                           "pending U2\nquery I nosort\nSELECT 1\n----\n1\n";
+  FakeEngine antb1("antb1");
+  antb1.Answer("SELECT COUNT(*) FROM t, u WHERE t.k = u.k", Ints({{"7"}, {"8"}}));
+  antb1.Answer("SELECT 1", std::unexpected(EngineError{.kind = "internal",
+                                                       .message = "internal: boom",
+                                                       .unsupported = false,
+                                                       .internal = true}));
+  std::string out;
+  const auto stats = CheckPendingText(file, antb1, out);  // SELECT nope: a bind error
+  EXPECT_EQ(stats.records, 3);
+  EXPECT_EQ(stats.unsupported, 0);
+  EXPECT_EQ(stats.failed, 3);
+  EXPECT_NE(out.find("FAIL t.slt:7: query I nosort [antb1]: remove the guard (J2b): antb1 answers "
+                     "it now\n  antb1 answers with 2 rows."),
+            std::string::npos)
+      << out;
+  EXPECT_NE(
+      out.find("FAIL t.slt:16: statement error [antb1]: remove the guard (J5): antb1 fails "
+               "with a bind error now, not Unsupported\n  bind: unknown statement SELECT nope"),
+      std::string::npos)
+      << out;
+  EXPECT_NE(out.find("remove the guard (U2): antb1 fails with an internal error now"),
+            std::string::npos)
+      << out;
+  EXPECT_NE(out.find("SELECT COUNT(*) FROM t, u WHERE t.k = u.k"), std::string::npos) << out;
+  EXPECT_NE(out.find("repro-command"), std::string::npos) << out;
+  EXPECT_NE(out.find("pending records=3 unsupported=0 failed=3 (J2b 1, J5 1, U2 1)"),
+            std::string::npos)
+      << out;
+}
+
+TEST(CheckPendingFile, RedactedReportPrintsNoSqlAndNoMessage) {
+  FakeEngine antb1("antb1");
+  antb1.Answer("SELECT COUNT(*) FROM t, u WHERE t.k = u.k", Ints({{"31338"}}));
+  antb1.Answer("SELECT secret FROM t",
+               std::unexpected(EngineError{.kind = "bind", .message = "bind: no column secret"}));
+  std::string out;
+  const auto stats = CheckPendingText(
+      std::string(kPendingFile) + "\npending J5\nstatement error\nSELECT secret FROM t\n", antb1,
+      out, /*redact=*/true);
+  EXPECT_EQ(stats.failed, 2);
+  EXPECT_NE(out.find("remove the guard (J2b): antb1 answers it now\n  rows: 1\n"),
+            std::string::npos)
+      << out;
+  EXPECT_NE(out.find("error kind: bind"), std::string::npos) << out;
+  EXPECT_EQ(out.find("SELECT"), std::string::npos) << out;
+  EXPECT_EQ(out.find("secret"), std::string::npos) << out;
+  EXPECT_EQ(out.find("3133"), std::string::npos) << out;
+}
+
+TEST(CheckPendingFile, StopsAtAHaltForAntb1) {
+  FakeEngine antb1("antb1");
+  antb1.Answer("SELECT 1", std::unexpected(Unsupported()));
+  std::string out;
+  const auto stats = CheckPendingText(
+      "pending J2b\nstatement ok\nSELECT 1\n\nonlyif duckdb\nhalt\n\n"
+      "pending J2b\nstatement ok\nSELECT 2\n\nhalt\n\npending J2b\nstatement ok\nSELECT 3\n",
+      antb1, out);
+  EXPECT_EQ(stats.records, 2) << out;  // SELECT 2 gets a bind error: a failure
+  EXPECT_EQ(stats.failed, 1);
+  EXPECT_TRUE(stats.halted);
+  EXPECT_NE(out.find("t.slt:12: halt: the remaining pending records are not run on antb1"),
+            std::string::npos)
+      << out;
+}
+
+TEST(CompleteFile, WritesPendingRecordsFromTheOracle) {
+  FakeEngine oracle("duckdb");
+  FakeEngine antb1("antb1");
+  oracle.Answer("SELECT COUNT(*) FROM t, u WHERE t.k = u.k", Ints({{"9"}}));
+  const auto file =
+      Parse("pending J2b\nquery I nosort\nSELECT COUNT(*) FROM t, u WHERE t.k = u.k\n");
+  std::string text;
+  std::string out;
+  const auto stats = CompleteFile(file, oracle, antb1, text, out);
+  EXPECT_EQ(stats.queries, 1);
+  EXPECT_EQ(stats.from_antb1, 0);
+  EXPECT_EQ(antb1.calls(), 0);
+  EXPECT_EQ(text,
+            "pending J2b\nquery I nosort\nSELECT COUNT(*) FROM t, u WHERE t.k = u.k\n----\n9\n");
+}
+
 TEST(RunFile, EveryMutationIsCaught) {
   // On an integer record and on a DECIMAL one, where a value mutation (an appended digit) only
   // changes the scale.

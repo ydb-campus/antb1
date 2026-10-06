@@ -61,7 +61,7 @@ jobs:
           persist-credentials: false
       - id: review
         if: steps.token.outputs.run == 'true'
-        uses: anthropics/claude-code-action@9171db3e57d6a3140a37ddc2ba92788584e0ead6 # v1.0.234
+        uses: anthropics/claude-code-action@8ce9314fa9a404564fa7e954cd84f25bcba2b829 # v1.0.236
         with:
           # A repository secret, not an environment secret: this job runs on PR branches, and an environment that
           # PR branches may use protects nothing. Forks never get it (the job skips them and GitHub withholds it).

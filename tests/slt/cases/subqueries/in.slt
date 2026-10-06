@@ -1,0 +1,219 @@
+# Uncorrelated IN and NOT IN subqueries (ADR 0022) over the star schema: a NULL in the set, a NULL probe value and an
+# empty set, in both spellings of NOT IN; repeated values in the set; keys of two types; GROUP BY and HAVING inside
+# the subquery; a subquery in HAVING; and a name of the outer block that the subquery's own table hides.
+
+# ---- the inputs, one table at a time ----
+
+query II nosort
+SELECT COUNT(*), COUNT(tr_tariff) FROM trips
+----
+3000	2842
+
+# tariffs and drivers each hold one NULL key, and promos is empty.
+query II nosort
+SELECT COUNT(*), COUNT(tf_code) FROM tariffs
+----
+9	8
+
+query II nosort
+SELECT COUNT(*), COUNT(dv_id) FROM drivers
+----
+97	96
+
+query I nosort
+SELECT COUNT(*) FROM promos
+----
+0
+
+# ---- pending: IN and NOT IN subqueries (ADR 0022; roadmap PR J5 removes these guards) ----
+
+# IN keeps the rows with a match: the NULL in the set changes nothing.
+pending J5
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_tariff IN (SELECT tf_code FROM tariffs)
+----
+2274
+
+# With a NULL in the set, NOT IN keeps no row, in either spelling.
+pending J5
+query I nosort null_in_set
+SELECT COUNT(*) FROM trips WHERE tr_tariff NOT IN (SELECT tf_code FROM tariffs)
+----
+0
+
+pending J5
+query I nosort null_in_set
+SELECT COUNT(*) FROM trips WHERE NOT (tr_tariff IN (SELECT tf_code FROM tariffs))
+----
+0
+
+pending J5
+query I nosort null_in_set
+SELECT COUNT(*) FROM trips WHERE tr_driver NOT IN (SELECT dv_id FROM drivers)
+----
+0
+
+# Without the NULL code: std and XL, never a NULL probe value.
+pending J5
+query TI rowsort
+SELECT tr_tariff, COUNT(*) FROM trips WHERE tr_tariff NOT IN (SELECT tf_code FROM tariffs WHERE tf_row <> 7) GROUP BY tr_tariff
+----
+XL	284
+std	284
+
+# A set without NULLs drops the NULL probe values: only the 319 dangling drivers stay.
+pending J5
+query II nosort null_probe
+SELECT COUNT(*), COUNT(tr_driver) FROM trips WHERE tr_driver NOT IN (SELECT dv_id FROM drivers WHERE dv_id > 0)
+----
+319	319
+
+pending J5
+query II nosort null_probe
+SELECT COUNT(*), COUNT(tr_driver) FROM trips WHERE NOT (tr_driver IN (SELECT dv_id FROM drivers WHERE dv_id > 0))
+----
+319	319
+
+# An empty set keeps every row, NULL probe values included.
+pending J5
+query I nosort empty_set
+SELECT COUNT(*) FROM trips WHERE tr_promo NOT IN (SELECT pm_id FROM promos)
+----
+3000
+
+pending J5
+query I nosort empty_set
+SELECT COUNT(*) FROM trips WHERE NOT (tr_promo IN (SELECT pm_id FROM promos))
+----
+3000
+
+pending J5
+query I nosort empty_set
+SELECT COUNT(*) FROM trips WHERE tr_driver NOT IN (SELECT dv_id FROM drivers WHERE dv_id > 9000000000)
+----
+3000
+
+pending J5
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_promo IN (SELECT pm_id FROM promos)
+----
+0
+
+# No NULL on either side: the pickups without a zone.
+pending J5
+query II rowsort
+SELECT tr_pickup, COUNT(*) FROM trips WHERE tr_pickup NOT IN (SELECT zn_id FROM zones) GROUP BY tr_pickup
+----
+41	69
+42	69
+43	69
+
+# A repeated value in the set counts once: 2745 trips, where the inner join has 2841 rows.
+pending J5
+query ID nosort
+SELECT COUNT(*), SUM(tr_fare) FROM trips WHERE tr_rider IN (SELECT rd_id FROM riders)
+----
+2745	41289.25
+
+# GROUP BY and HAVING inside the subquery: the trips of the 8 repeated riders.
+pending J5
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_rider IN (SELECT rd_id FROM riders GROUP BY rd_id HAVING COUNT(*) > 1)
+----
+96
+
+# Keys of two types: INTEGER against BIGINT (driver 2^32 + 1000 matches no trip), DECIMAL(4,2) against DECIMAL(5,3).
+pending J5
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_driver IN (SELECT dv_id FROM drivers)
+----
+2577
+
+pending J5
+query DI rowsort
+SELECT tr_rate, COUNT(*) FROM trips WHERE tr_rate IN (SELECT tf_rate FROM tariffs) GROUP BY tr_rate
+----
+1.00	348
+1.25	350
+1.50	348
+1.75	350
+2.00	345
+2.50	342
+
+pending J5
+query DI rowsort
+SELECT tr_rate, COUNT(*) FROM trips WHERE tr_rate NOT IN (SELECT tf_rate FROM tariffs WHERE tf_rate > 1) GROUP BY tr_rate
+----
+0.88	343
+1.00	348
+2.25	343
+
+# DATE values.
+pending J5
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_day IN (SELECT sh_day FROM shifts WHERE sh_driver = 1000)
+----
+473
+
+# A table against itself: zone 40's parent 77 is in no set, NULL parents drop out, and parents 2 to 5 are in the set.
+pending J5
+query II rowsort
+SELECT zn_id, zn_parent FROM zones WHERE zn_parent NOT IN (SELECT zn_id FROM zones WHERE zn_city <> 1)
+----
+11	1
+16	1
+21	1
+26	1
+31	1
+36	1
+40	77
+6	1
+
+# A subquery in HAVING.
+pending J5
+query II rowsort
+SELECT tr_pickup, COUNT(*) FROM trips GROUP BY tr_pickup HAVING tr_pickup NOT IN (SELECT zn_id FROM zones)
+----
+41	69
+42	69
+43	69
+
+# Inside the subquery, label is the label of cities, not of the outer zones.
+pending J5
+query TI rowsort
+SELECT label, COUNT(*) FROM zones WHERE label IN (SELECT label FROM cities) GROUP BY label
+----
+airport	5
+center	5
+
+# A subquery over a join (roadmap PR J2b).
+pending J5
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_driver IN (SELECT dv_id FROM drivers JOIN cities ON dv_city = ct_id WHERE ct_pop > 40000)
+----
+1216
+
+# A CTE referenced inside the subquery (roadmap PR J4): the rider rows of the riders with 13 trips or
+# more, repeated keys twice.
+pending J5
+query II nosort
+WITH busy AS (SELECT tr_rider AS rider FROM trips GROUP BY tr_rider HAVING COUNT(*) >= 13)
+SELECT COUNT(*), COUNT(DISTINCT rd_id) FROM riders WHERE rd_id IN (SELECT rider FROM busy)
+----
+62	59
+
+# ---- DuckDB only until DOUBLE join keys get a PR (ADR 0022: an IN subquery of type DOUBLE exits 4) ----
+
+onlyif duckdb
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_distance IN (SELECT zn_radius FROM zones)
+----
+276
+
+# ---- DuckDB only until correlated IN and NOT IN get a PR (ADR 0023) ----
+
+onlyif duckdb
+query II nosort
+SELECT COUNT(*), COUNT(tr_tariff) FROM trips WHERE tr_tariff IN (SELECT tf_code FROM tariffs WHERE tf_rate = tr_rate)
+----
+199	199

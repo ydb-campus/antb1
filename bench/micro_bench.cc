@@ -23,6 +23,7 @@
 #include <parquet/arrow/writer.h>
 
 #include "antb1/exec/aggregate_state.h"
+#include "antb1/exec/join_table.h"
 #include "antb1/exec/operator.h"
 #include "antb1/exec/sort.h"
 #include "antb1/io/parquet_table.h"
@@ -420,6 +421,158 @@ void BM_SortRows(benchmark::State& state) { SortRows(state, std::nullopt); }
 BENCHMARK(BM_SortRows)->Unit(benchmark::kMillisecond);
 void BM_TopNRows(benchmark::State& state) { SortRows(state, 10); }
 BENCHMARK(BM_TopNRows)->Unit(benchmark::kMillisecond);
+
+// ---- The join hash table: dense keys (the direct layout) and random keys (hashed) ----
+
+// The key of build row i: dense keys, a bijection of [0, 2^20) (0x9E3779B1 is odd), or random
+// 64-bit keys (splitmix64, also a bijection: no key repeats).
+int64_t JoinKey(int64_t i, bool dense) {
+  if (dense) {
+    return static_cast<int64_t>((static_cast<uint64_t>(i) * 0x9E3779B1ULL) % (uint64_t{1} << 20U));
+  }
+  uint64_t state = static_cast<uint64_t>(i);
+  return static_cast<int64_t>(SplitMix64(state));
+}
+
+// kRows rows of a BIGINT key and a BIGINT payload in 64Ki-row batches, one per build part (16).
+arrow::RecordBatchVector MakeJoinBuildInput(bool dense) {
+  arrow::RecordBatchVector out;
+  const auto schema =
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("v", arrow::int64())});
+  for (int64_t start = 0; start < kRows; start += kBatchSize) {
+    arrow::Int64Builder keys;
+    arrow::Int64Builder values;
+    if (!keys.Reserve(kBatchSize).ok() || !values.Reserve(kBatchSize).ok()) {
+      return {};
+    }
+    for (int64_t i = start; i < start + kBatchSize; ++i) {
+      keys.UnsafeAppend(JoinKey(i, dense));
+      values.UnsafeAppend(i);
+    }
+    auto k = keys.Finish();
+    auto v = values.Finish();
+    if (!k.ok() || !v.ok()) {
+      return {};
+    }
+    out.push_back(arrow::RecordBatch::Make(schema, kBatchSize, {*k, *v}));
+  }
+  return out;
+}
+
+const arrow::RecordBatchVector& JoinBuildInput(bool dense) {
+  static const arrow::RecordBatchVector dense_input = MakeJoinBuildInput(true);
+  static const arrow::RecordBatchVector random_input = MakeJoinBuildInput(false);
+  return dense ? dense_input : random_input;
+}
+
+// kRows probe keys in 64Ki-row arrays: every other one a build key (in another order), the others
+// absent from the build.
+arrow::ArrayVector MakeJoinProbeInput(bool dense) {
+  arrow::ArrayVector out;
+  for (int64_t start = 0; start < kRows; start += kBatchSize) {
+    arrow::Int64Builder keys;
+    if (!keys.Reserve(kBatchSize).ok()) {
+      return {};
+    }
+    for (int64_t j = start; j < start + kBatchSize; ++j) {
+      const int64_t absent = dense ? kRows + j : JoinKey(j + (kRows * kRows), false);
+      keys.UnsafeAppend(j % 2 == 0 ? JoinKey((j * 7919) % kRows, dense) : absent);
+    }
+    auto k = keys.Finish();
+    if (!k.ok()) {
+      return {};
+    }
+    out.push_back(*k);
+  }
+  return out;
+}
+
+const arrow::ArrayVector& JoinProbeInput(bool dense) {
+  static const arrow::ArrayVector dense_input = MakeJoinProbeInput(true);
+  static const arrow::ArrayVector random_input = MakeJoinProbeInput(false);
+  return dense ? dense_input : random_input;
+}
+
+// The table of `batches` on this thread (no executor): one part per batch, added in order.
+arrow::Result<std::shared_ptr<const exec::JoinTable>> BuildJoinTable(
+    const arrow::RecordBatchVector& batches) {
+  ARROW_ASSIGN_OR_RAISE(
+      auto spec,
+      exec::JoinBuildSpec::Make(
+          batches.front()->schema(),
+          {plan::BoundColumn{.index = 0, .name = "k", .type = plan::LogicalType::kBigInt}}));
+  ARROW_ASSIGN_OR_RAISE(auto builder,
+                        exec::JoinTableBuilder::Make(spec, static_cast<int64_t>(batches.size()),
+                                                     nullptr, 1, nullptr));
+  for (std::size_t p = 0; p < batches.size(); ++p) {
+    auto part = std::make_shared<exec::JoinBuildPart>(spec, nullptr);
+    ARROW_RETURN_NOT_OK(part->Append(exec::Batch{.data = batches[p], .selection = {}},
+                                     arrow::default_memory_pool()));
+    ARROW_RETURN_NOT_OK(builder->Add(static_cast<int64_t>(p), std::move(part)));
+  }
+  ARROW_RETURN_NOT_OK(builder->Merged());
+  return builder->Finish();
+}
+
+// Building the table of kRows rows: /0 dense keys (direct), /1 random keys (hashed).
+void BM_JoinTableBuild(benchmark::State& state) {
+  const bool dense = state.range(0) == 0;
+  const auto& batches = JoinBuildInput(dense);
+  if (batches.empty()) {
+    state.SkipWithError("cannot build the join input");
+    return;
+  }
+  bool direct = false;
+  for (auto _ : state) {
+    auto table = BuildJoinTable(batches);
+    if (!table.ok()) {
+      state.SkipWithError(table.status().ToString());
+      return;
+    }
+    direct = (*table)->layout() == exec::JoinTable::Layout::kDirect;
+    benchmark::DoNotOptimize(table);
+  }
+  state.SetItemsProcessed(state.iterations() * kRows);
+  state.counters["direct"] = direct ? 1 : 0;
+}
+BENCHMARK(BM_JoinTableBuild)->Arg(0)->Arg(1)->Unit(benchmark::kMillisecond);
+
+// Probing that table with kRows keys, half of them absent: /0 direct, /1 hashed.
+void BM_JoinTableProbe(benchmark::State& state) {
+  const bool dense = state.range(0) == 0;
+  const auto& batches = JoinBuildInput(dense);
+  const auto& probes = JoinProbeInput(dense);
+  if (batches.empty() || probes.empty()) {
+    state.SkipWithError("cannot build the join input");
+    return;
+  }
+  auto table = BuildJoinTable(batches);
+  if (!table.ok()) {
+    state.SkipWithError(table.status().ToString());
+    return;
+  }
+  std::vector<exec::JoinMatches> out(static_cast<std::size_t>(kBatchSize));
+  int64_t matches = 0;
+  for (auto _ : state) {
+    matches = 0;
+    for (const auto& keys : probes) {
+      if (const arrow::Status found =
+              (*table)->Find({&keys, 1}, nullptr, arrow::default_memory_pool(), out);
+          !found.ok()) {
+        state.SkipWithError(found.ToString());
+        return;
+      }
+      for (const exec::JoinMatches& match : out) {
+        matches += match.end - match.begin;
+      }
+    }
+    benchmark::DoNotOptimize(matches);
+  }
+  state.SetItemsProcessed(state.iterations() * kRows);
+  state.counters["matches"] = static_cast<double>(matches);
+  state.counters["direct"] = (*table)->layout() == exec::JoinTable::Layout::kDirect ? 1 : 0;
+}
+BENCHMARK(BM_JoinTableProbe)->Arg(0)->Arg(1)->Unit(benchmark::kMillisecond);
 
 }  // namespace
 }  // namespace antb1::bench

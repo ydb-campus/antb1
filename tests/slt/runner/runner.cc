@@ -178,7 +178,8 @@ Failure ErrorFailure(const EngineError& error, std::string_view engine, std::str
     f.detail = std::format(
         "{}\n  Records reflect current support: an Unsupported result is a failure. Guard the "
         "record with\n"
-        "  `onlyif duckdb` until {} supports it (then remove the guard).",
+        "  `pending <roadmap id>` when a roadmap PR implements it, else with `onlyif duckdb`,\n"
+        "  until {} supports it (then remove the guard).",
         error.message, engine);
   } else {
     // DuckDB kinds already read "Catalog Error"; antb1 kinds are "parse", "bind", ...
@@ -315,6 +316,30 @@ void Report(const SltFile& file, const Record& r, std::string_view engine, const
   out += "  repro:\n" + options.repro;
 }
 
+// The failure of a pending record that `engine` answered with `result`, anything but Unsupported.
+Failure PendingFailure(const Record& r, const ExecResult& result, std::string_view engine) {
+  Failure f;
+  const std::string why = std::format(
+      "  A pending record must get Unsupported from {}. The roadmap PR that implements it removes\n"
+      "  its `pending {}` line, and the slt.* tests compare its answer from then on.",
+      engine, r.pending);
+  if (result.has_value()) {
+    const std::size_t rows = result->rows.size();
+    f.what = std::format("remove the guard ({}): {} answers it now", r.pending, engine);
+    f.detail =
+        std::format("{} answers with {} row{}.\n{}", engine, rows, rows == 1 ? "" : "s", why);
+    f.redacted_detail = std::format("rows: {}", rows);
+    return f;
+  }
+  const EngineError& error = result.error();
+  const bool vowel = error.kind.starts_with('e') || error.kind.starts_with('i');
+  f.what = std::format("remove the guard ({}): {} fails with {} {} error now, not Unsupported",
+                       r.pending, engine, vowel ? "an" : "a", error.kind);
+  f.detail = std::format("{}\n{}", error.message, why);
+  f.redacted_detail = std::format("error kind: {}", error.kind);
+  return f;
+}
+
 }  // namespace
 
 std::optional<Mutation> ParseMutation(std::string_view name) {
@@ -386,6 +411,39 @@ RunStats RunFile(const SltFile& file, Engine& engine, const RunOptions& options,
       "antb1-slt: {}: engine={} records={} passed={} failed={} skipped={} unsupported={}{}\n",
       file.path, engine.name(), stats.records, stats.passed, stats.failed, stats.skipped,
       stats.unsupported, stats.halted ? " (halted)" : "");
+  return stats;
+}
+
+PendingStats CheckPendingFile(const SltFile& file, Engine& engine, const RunOptions& options,
+                              std::string& out) {
+  PendingStats stats;
+  for (const auto& r : file.records) {
+    if (r.kind == RecordKind::kHalt && r.RunsOn(engine.name())) {
+      stats.halted = true;
+      out += std::format("{}:{}: halt: the remaining pending records are not run on {}\n",
+                         file.path, r.line, engine.name());
+      break;
+    }
+    if (r.pending.empty()) {
+      continue;
+    }
+    ++stats.records;
+    ++stats.by_id[r.pending];
+    const auto result = engine.Execute(r.sql);
+    if (!result.has_value() && result.error().unsupported) {
+      ++stats.unsupported;
+      continue;
+    }
+    ++stats.failed;
+    Report(file, r, engine.name(), PendingFailure(r, result, engine.name()), options, out);
+  }
+  std::string ids;
+  for (const auto& [id, count] : stats.by_id) {
+    ids += std::format("{}{} {}", ids.empty() ? " (" : ", ", id, count);
+  }
+  out += std::format("antb1-slt: {}: pending records={} unsupported={} failed={}{}{}\n", file.path,
+                     stats.records, stats.unsupported, stats.failed, ids.empty() ? "" : ids + ")",
+                     stats.halted ? " (halted)" : "");
   return stats;
 }
 

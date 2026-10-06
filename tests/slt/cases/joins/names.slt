@@ -1,0 +1,149 @@
+# Names over several FROM items (ADR 0022, rules 1-6 and 10): qualified names, aliases that hide a table's name,
+# two bindings of one name, SELECT * in FROM order, a path that binds by its file name and names in any case. The
+# column `label` is in zones and in cities on purpose.
+
+# ---- the inputs, one table at a time ----
+
+query ITI rowsort
+SELECT zn_id, label, zn_city FROM zones WHERE zn_id <= 6
+----
+1	center	1
+2	north	2
+3	south	3
+4	airport	4
+5	docks	5
+6	park	1
+
+query IT rowsort
+SELECT ct_id, label FROM cities WHERE ct_id <= 3
+----
+1	center
+2	harbor
+3	hills
+
+# ---- pending: qualified names and aliases (ADR 0022; roadmap PR J2b removes these guards) ----
+
+# Qualified names, the same with aliases, and aliases without AS.
+pending J2b
+query TT rowsort labels
+SELECT zones.label, cities.label FROM zones, cities WHERE zn_city = ct_id AND zn_id <= 6
+----
+airport	airport
+center	center
+docks	old town
+north	harbor
+park	center
+south	hills
+
+pending J2b
+query TT rowsort labels
+SELECT z.label, c.label FROM zones AS z, cities AS c WHERE z.zn_city = c.ct_id AND z.zn_id <= 6
+----
+airport	airport
+center	center
+docks	old town
+north	harbor
+park	center
+south	hills
+
+pending J2b
+query TT rowsort labels
+SELECT z.label, c.label FROM zones z JOIN cities c ON z.zn_city = c.ct_id WHERE z.zn_id <= 6
+----
+airport	airport
+center	center
+docks	old town
+north	harbor
+park	center
+south	hills
+
+# SELECT * returns every binding's columns in FROM order, both labels included.
+pending J2b
+query IITIIIIITR rowsort
+SELECT * FROM cities, zones WHERE zn_city = ct_id AND zn_id <= 3
+----
+0	1	center	120000	0	1	1	NULL	center	0.5
+1	2	harbor	45000	1	2	2	NULL	north	0.75
+2	3	hills	30000	2	3	3	NULL	south	1
+
+# Two bindings named t: t.zn_id and t.zn_city resolve to zones, t.ct_id and t.ct_pop to cities.
+pending J2b
+query III rowsort
+SELECT t.zn_id, t.ct_id, t.ct_pop FROM zones AS t, cities AS t WHERE t.zn_city = t.ct_id AND t.zn_id <= 3
+----
+1	1	120000
+2	2	45000
+3	3	30000
+
+# Each alias hides its table's name, even when the alias is the other table's name.
+pending J2b
+query ITT rowsort
+SELECT cities.zn_id, zones.label, cities.label FROM zones AS cities, cities AS zones
+WHERE cities.zn_city = zones.ct_id AND cities.zn_id <= 3
+----
+1	center	center
+2	harbor	north
+3	hills	south
+
+# A path binds by its file name up to the first dot.
+pending J2b
+query ID nosort
+SELECT COUNT(*), SUM(trips.tr_fare) FROM '${FIXTURES}/star/trips.parquet', zones WHERE trips.tr_pickup = zones.zn_id
+----
+2793	41889.25
+
+# Bindings and columns match in any case, quoted or not.
+pending J2b
+query I nosort
+SELECT COUNT(*) FROM Zones, CITIES WHERE ZONES.zn_city = "Cities".CT_ID
+----
+38
+
+# ---- pending: name errors (ADR 0022; roadmap PR J2b removes these guards) ----
+
+# An unqualified label is in two bindings.
+pending J2b
+statement error
+SELECT label FROM zones, cities WHERE zn_city = ct_id
+
+# The alias z hides the name zones.
+pending J2b
+statement error
+SELECT zones.zn_id FROM zones AS z, cities WHERE z.zn_city = ct_id
+
+# Both bindings named t have a label.
+pending J2b
+statement error
+SELECT t.label FROM zones AS t, cities AS t WHERE t.zn_city = t.ct_id
+
+# * over two bindings of one name that share column names.
+pending J2b
+statement error
+SELECT * FROM zones, zones
+
+# An ON resolves names in the FROM items up to its own JOIN: ct_id comes later.
+pending J2b
+statement error
+SELECT COUNT(*) FROM zones JOIN trips ON tr_pickup = zn_id AND zn_city = ct_id JOIN cities ON ct_id = zn_city
+
+# ---- DuckDB only, for good: DuckDB's error texts ----
+
+onlyif duckdb
+statement error ^Binder Error: Ambiguous reference to column name "label"
+SELECT label FROM zones, cities WHERE zn_city = ct_id
+
+onlyif duckdb
+statement error ^Binder Error: Referenced table "zones" not found
+SELECT zones.zn_id FROM zones AS z, cities WHERE z.zn_city = ct_id
+
+onlyif duckdb
+statement error ^Binder Error: Ambiguous reference to table "t"
+SELECT t.label FROM zones AS t, cities AS t WHERE t.zn_city = t.ct_id
+
+onlyif duckdb
+statement error ^Binder Error: Ambiguous reference to table
+SELECT * FROM zones, zones
+
+onlyif duckdb
+statement error ^Binder Error: Referenced column "ct_id" not found
+SELECT COUNT(*) FROM zones JOIN trips ON tr_pickup = zn_id AND zn_city = ct_id JOIN cities ON ct_id = zn_city

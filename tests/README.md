@@ -10,7 +10,7 @@ time: the ctest `fixtures.tpch` (label `setup`) writes it to `build/<preset>/fix
 | Directory | ctest names | Label | What it checks |
 |---|---|---|---|
 | `slt/` | `slt.<area>.<file>`, `oracle.<area>.<file>` | `slt`, `oracle` | sqllogictest files on antb1 and DuckDB |
-| `slt/` | `diff.random` | `diff` | generated queries, antb1 vs DuckDB (fixed seed) |
+| `slt/` | `diff.random`, `diff.decimal`, `diff.star` | `diff` | generated queries, antb1 vs DuckDB (fixed seeds) |
 | `metamorphic/` | `metamorphic.*` | `metamorphic` | relations between antb1 answers |
 | `integration/` | `integration.*` | `integration` | `engine::Session` end to end; bad Parquet inputs; globs |
 | `cli/` | `cli.<case>` | `cli` | stdout, stderr and exit code of the `antb1` binary |
@@ -53,7 +53,8 @@ MAX over partitions and over split files, literal folding (a decimal bound equal
 bounds), AND symmetry, literal-first comparisons, LIMIT, projections and batch sizes; all of them are active. Add a
 relation with `r.push_back({...})` in `AllRelations()`; the checks (`AllEqual`, `FirstEqualsSumOfRest`,
 `FirstEqualsMinOfRest`, `FirstEqualsMaxOfRest`, `RowCountsEqualFirst`, `RowCountsAreMinOf`) are in `relations.h`.
-`metamorphic.RowCount.MatchesAnIndependentParquetScan` compares COUNT(*) with the rows the Parquet library decodes.
+`metamorphic.RowCount.MatchesAnIndependentParquetScan` compares COUNT(*) with the rows the Parquet library decodes, and
+`metamorphic.TablesTxt.RefsJoinColumnsOfOneKind` checks the `ref=` options of `slt/tables.txt` against the files.
 
 ## CLI goldens (`cli/`)
 
@@ -84,6 +85,9 @@ Exit codes are never rewritten: change `EXIT_CODE` in `cli/CMakeLists.txt` delib
 - `harness.answers.*`: `antb1-slt answers` accepts DuckDB's stored answers in their own spelling, catches every
   corrupted result in a redacted report, and refuses `--show-values` on GitHub Actions.
 - `harness.cli.changed_stdout`, `harness.cli.changed_exit_code`: the golden comparison catches changes.
+- `harness.slt.pending`: every `pending <roadmap id>` record of the registered `.slt` files still gets an
+  Unsupported answer from antb1 (`antb1-slt pending`); one that antb1 answers fails with `remove the guard (<id>)`.
+  `harness.slt.pending.mutate.<kind>`: corrupting antb1's answers to `slt/selftest/pending.slt` must fail the check.
 - `harness.fixtures.digest`: the fixtures this build generated match `fixtures/fixtures.digest`, a logical
   digest (schema, row groups, values; not compression or page layout), so Linux and macOS generate the same
   data. The top-level `tpch/` directory of the data derived from TPC-H is skipped. After an intended generator
