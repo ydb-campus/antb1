@@ -91,8 +91,8 @@ feature removes:
   (`antb1-slt pending`) runs the pending records of every registered file on antb1, where each must still get
   Unsupported: once antb1 answers one, with rows or with an error of another kind, the check fails with
   `remove the guard (<id>)`, so the PR that answers it removes its guard and the `slt.*` tests compare its answer
-  from then on. A record whose outcome another PR changes first waits on that PR: the syntax errors of
-  `cases/joins/alias_words.slt`, which antb1 rejects as Unsupported until roadmap PR S3, are `pending S3`.
+  from then on. A record whose outcome another PR changes first waits on that PR, as the syntax errors of
+  `cases/joins/alias_words.slt` waited on roadmap PR S3 (`pending S3`) until S3 made them syntax errors.
 - `onlyif duckdb` otherwise. A section of such records is headed `# ---- DuckDB only until <deferred item> gets a
   PR ----` when an ADR defers the SQL until a query needs it, and `# ---- DuckDB only, for good: ... ----` for
   DuckDB's own error texts.

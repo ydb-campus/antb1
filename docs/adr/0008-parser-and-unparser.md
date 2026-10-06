@@ -63,9 +63,9 @@ Accepted
   - The 49 words that DuckDB 1.5.5 refuses as table aliases and antb1 does not reserve stay unreserved (they remain
     column, table and function names), but are never read as aliases. Their meaning depends on the place: after a FROM
     item and after an `ON` condition each is `kUnsupported` where DuckDB gives it a meaning there (told by the next one
-    or two tokens: `SEMI JOIN`, `ASOF LEFT JOIN`, `AT (`, `TABLESAMPLE 10%`, ...), and a syntax error anywhere else, as
-    in DuckDB. A harness test compares every DuckDB keyword as a table alias with DuckDB itself, so that a DuckDB update
-    that gives a word a meaning is noticed.
+    or two tokens: `SEMI JOIN`, `ASOF LEFT JOIN`, `AT (`, `TABLESAMPLE 10%`, ...), and a syntax error anywhere else
+    after a FROM item or an `ON` condition, as in DuckDB. A harness test compares every DuckDB keyword as a table alias
+    with DuckDB itself, so that a DuckDB update that gives a word a meaning is noticed.
   - A table alias may also be one of the reserved words `BETWEEN`, `EXISTS`, `INTERVAL` and `OVER`, with or without
     `AS`, and after `AS` a non-empty string literal, as in DuckDB. The longest keyword is now `AUTHORIZATION` (13
     letters).
