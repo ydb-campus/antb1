@@ -1,0 +1,1 @@
+SELECT COUNT(*) FROM orders JOIN items ON orders.id = items.order_id INNER JOIN products p ON p.id = items.product_id CROSS JOIN regions

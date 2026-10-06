@@ -1,0 +1,1 @@
+SELECT "Sales Data".amount FROM sales AS "Sales Data" WHERE "Sales Data"."Region" = 'north'

@@ -15,7 +15,10 @@ namespace {
 
 bool Eq(const Expr& a, const Expr& b);
 
-bool Eq(const ColumnRef& a, const ColumnRef& b) { return a.name == b.name && a.quoted == b.quoted; }
+bool Eq(const ColumnRef& a, const ColumnRef& b) {
+  return a.name == b.name && a.quoted == b.quoted && a.qualifier == b.qualifier &&
+         a.qualifier_quoted == b.qualifier_quoted;
+}
 
 bool Eq(const Literal& a, const Literal& b) {
   return a.kind == b.kind && a.negative == b.negative && a.text == b.text;
@@ -104,6 +107,14 @@ bool Eq(const Expr& a, const Expr& b) {
         return Eq(node, std::get<Node>(b));
       },
       a);
+}
+
+bool Eq(const TableRef& a, const TableRef& b) {
+  return a.kind == b.kind && a.name == b.name && a.quoted == b.quoted;
+}
+
+bool Eq(const FromItem& a, const FromItem& b) {
+  return a.connector == b.connector && Eq(a.table, b.table) && a.alias == b.alias && Eq(a.on, b.on);
 }
 
 std::optional<CompareOp> CompareOpOf(BinaryOp op) {
@@ -354,6 +365,22 @@ std::string_view ToString(NullsOrder nulls) {
   return "?";
 }
 
+std::string_view ToString(Connector connector) {
+  switch (connector) {
+    case Connector::kFirst:
+      return "";
+    case Connector::kComma:
+      return ",";
+    case Connector::kCross:
+      return "CROSS JOIN";
+    case Connector::kInner:
+      return "INNER JOIN";
+    case Connector::kLeft:
+      return "LEFT JOIN";
+  }
+  return "?";
+}
+
 std::string_view ToString(CompareOp op) {
   switch (op) {
     case CompareOp::kEq:
@@ -467,10 +494,16 @@ std::size_t Depth(const Expr& expr) {
   return std::visit(DepthOf{}, static_cast<const ExprNode&>(expr));
 }
 
+// The FROM list is walked in loops, never recursively, so a long list costs no stack.
 std::size_t Depth(const SelectStatement& stmt) {
   std::size_t deepest = 0;
   for (const SelectItem& item : stmt.items) {
     deepest = std::max(deepest, Depth(item.expr));
+  }
+  for (const FromItem& item : stmt.from) {
+    for (const Expr& e : item.on) {
+      deepest = std::max(deepest, Depth(e));
+    }
   }
   for (const std::vector<Expr>* list : {&stmt.where, &stmt.group_by, &stmt.having}) {
     for (const Expr& e : *list) {
@@ -486,9 +519,14 @@ std::size_t Depth(const SelectStatement& stmt) {
 bool EqualIgnoringSpans(const SelectStatement& a, const SelectStatement& b) {
   if (a.star != b.star || a.items.size() != b.items.size() ||
       a.order_by.size() != b.order_by.size() || a.limit != b.limit || a.offset != b.offset ||
-      a.from.kind != b.from.kind || a.from.name != b.from.name || a.from.quoted != b.from.quoted ||
-      !Eq(a.where, b.where) || !Eq(a.group_by, b.group_by) || !Eq(a.having, b.having)) {
+      a.from.size() != b.from.size() || !Eq(a.where, b.where) || !Eq(a.group_by, b.group_by) ||
+      !Eq(a.having, b.having)) {
     return false;
+  }
+  for (std::size_t i = 0; i < a.from.size(); ++i) {
+    if (!Eq(a.from[i], b.from[i])) {
+      return false;
+    }
   }
   for (std::size_t i = 0; i < a.order_by.size(); ++i) {
     if (!Eq(a.order_by[i].expr, b.order_by[i].expr) ||

@@ -1,0 +1,389 @@
+# FROM lists, joins and aliases that both engines reject as malformed. antb1 must fail with a
+# syntax error, never Unsupported, and each record's `onlyif duckdb` twin checks that DuckDB fails
+# in its parser too (or its binder, for an aggregate in ON): a statement that antb1 wrongly calls a
+# syntax error would parse in DuckDB and fail the twin. The tables are registered and the columns
+# real, so no record fails on a missing name instead.
+
+# JOIN without its ON, ON without its JOIN, and join keywords without the rest.
+
+statement error
+SELECT COUNT(*) FROM edge JOIN floats
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge JOIN floats
+
+statement error
+SELECT COUNT(*) FROM edge JOIN floats, decimals ON edge.id = floats.id
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge JOIN floats, decimals ON edge.id = floats.id
+
+statement error
+SELECT COUNT(*) FROM edge CROSS JOIN floats ON edge.id = floats.id
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge CROSS JOIN floats ON edge.id = floats.id
+
+statement error
+SELECT COUNT(*) FROM edge, floats ON edge.id = floats.id
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge, floats ON edge.id = floats.id
+
+statement error
+SELECT COUNT(*) FROM edge ON edge.id = 1
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge ON edge.id = 1
+
+statement error
+SELECT COUNT(*) FROM edge JOIN floats ON edge.id = floats.id ON edge.i16 = floats.id
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge JOIN floats ON edge.id = floats.id ON edge.i16 = floats.id
+
+statement error
+SELECT COUNT(*) FROM edge JOIN floats ON
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge JOIN floats ON
+
+statement error
+SELECT COUNT(*) FROM edge OUTER JOIN floats ON edge.id = floats.id
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge OUTER JOIN floats ON edge.id = floats.id
+
+statement error
+SELECT COUNT(*) FROM edge INNER floats ON edge.id = floats.id
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge INNER floats ON edge.id = floats.id
+
+statement error
+SELECT COUNT(*) FROM edge LEFT floats ON edge.id = floats.id
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge LEFT floats ON edge.id = floats.id
+
+statement error
+SELECT COUNT(*) FROM edge NATURAL CROSS JOIN floats
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge NATURAL CROSS JOIN floats
+
+statement error
+SELECT COUNT(*) FROM edge NATURAL LEFT floats
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge NATURAL LEFT floats
+
+statement error
+SELECT COUNT(*) FROM edge JOIN floats LEFT decimals ON edge.id = floats.id
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge JOIN floats LEFT decimals ON edge.id = floats.id
+
+statement error
+SELECT COUNT(*) JOIN floats ON edge.id = floats.id
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) JOIN floats ON edge.id = floats.id
+
+statement error
+SELECT COUNT(*) FROM edge WHERE edge.id = 1 JOIN floats ON edge.id = floats.id
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge WHERE edge.id = 1 JOIN floats ON edge.id = floats.id
+
+statement error
+SELECT COUNT(*) FROM edge, , floats
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge, , floats
+
+statement error
+SELECT COUNT(*) FROM edge, FROM floats
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge, FROM floats
+
+statement error
+SELECT COUNT(*) FROM (edge)
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM (edge)
+
+statement error
+SELECT COUNT(*) FROM (edge, floats)
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM (edge, floats)
+
+statement error
+SELECT COUNT(*) FROM '${FIXTURES}/edge.parquet'.id
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM '${FIXTURES}/edge.parquet'.id
+
+# An aggregate in ON: a syntax error in antb1, a binder error in DuckDB.
+
+statement error
+SELECT COUNT(*) FROM edge JOIN floats ON SUM(edge.id) = floats.id
+
+onlyif duckdb
+statement error ^Binder Error:
+SELECT COUNT(*) FROM edge JOIN floats ON SUM(edge.id) = floats.id
+
+# Aliases: one per item, a string only after AS, no reserved word.
+
+statement error
+SELECT COUNT(*) FROM edge e f
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge e f
+
+statement error
+SELECT COUNT(*) FROM edge e AS f
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge e AS f
+
+statement error
+SELECT COUNT(*) FROM edge AS select
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge AS select
+
+statement error
+SELECT COUNT(*) FROM edge 'e'
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge 'e'
+
+# A parameter or a bit string is no alias either (an escape or dollar-quoted string is: exit 4).
+
+statement error
+SELECT COUNT(*) FROM edge AS $1
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge AS $1
+
+statement error
+SELECT COUNT(*) FROM edge AS B'1'
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge AS B'1'
+
+# The words that are never table aliases: without what gives them a meaning, a syntax error.
+
+statement error
+SELECT COUNT(*) FROM edge semi
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge semi
+
+statement error
+SELECT COUNT(*) FROM edge ANTI
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge ANTI
+
+statement error
+SELECT COUNT(*) FROM edge asof
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge asof
+
+statement error
+SELECT COUNT(*) FROM edge positional
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge positional
+
+statement error
+SELECT COUNT(*) FROM edge at
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge at
+
+statement error
+SELECT COUNT(*) FROM edge pivot
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge pivot
+
+statement error
+SELECT COUNT(*) FROM edge e unpivot
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge e unpivot
+
+statement error
+SELECT COUNT(*) FROM edge TABLESAMPLE WHERE edge.id = 1
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge TABLESAMPLE WHERE edge.id = 1
+
+statement error
+SELECT COUNT(*) FROM edge TABLESAMPLE reservoir WHERE edge.id = 1
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge TABLESAMPLE reservoir WHERE edge.id = 1
+
+statement error
+SELECT COUNT(*) FROM edge ASOF LEFT floats ON edge.id >= floats.id
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge ASOF LEFT floats ON edge.id >= floats.id
+
+statement error
+SELECT COUNT(*) FROM edge JOIN floats semi ON edge.id = floats.id
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge JOIN floats semi ON edge.id = floats.id
+
+statement error
+SELECT COUNT(*) FROM edge verbose
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge verbose
+
+statement error
+SELECT COUNT(*) FROM edge only
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge only
+
+statement error
+SELECT COUNT(*) FROM edge glob
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge glob
+
+statement error
+SELECT COUNT(*) FROM edge isnull
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge isnull
+
+statement error
+SELECT COUNT(*) FROM edge, floats default
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge, floats default
+
+statement error
+SELECT COUNT(*) FROM edge AS semi
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge AS semi
+
+statement error
+SELECT COUNT(*) FROM edge AS only
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge AS only
+
+# After an ON condition, time travel and TABLESAMPLE have no meaning.
+
+statement error
+SELECT COUNT(*) FROM edge JOIN floats ON edge.id = floats.id TABLESAMPLE 10%
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge JOIN floats ON edge.id = floats.id TABLESAMPLE 10%
+
+statement error
+SELECT COUNT(*) FROM edge JOIN floats ON edge.id = floats.id AT (VERSION => 1)
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge JOIN floats ON edge.id = floats.id AT (VERSION => 1)
+
+# After a dot, E'x' (like B'1' and X'1F') is one string constant, not a name and a string.
+
+statement error
+SELECT edge.E'x' FROM edge
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT edge.E'x' FROM edge
+
+statement error
+SELECT COUNT(*) FROM edge LIMIT edge.e'5'
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge LIMIT edge.e'5'
+
+# After LIMIT and OFFSET, a call or a typed literal of a name of more than three parts: DuckDB takes
+# catalog.schema.name at most.
+
+statement error
+SELECT COUNT(*) FROM edge LIMIT a.b.c.d(1)
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge LIMIT a.b.c.d(1)
+
+statement error
+SELECT COUNT(*) FROM edge OFFSET a.b.c.d '5'
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM edge OFFSET a.b.c.d '5'
+
+# antb1's messages.
+
+onlyif antb1
+statement error ^parse: expected ON after the JOIN at offset 26, found end of input$
+SELECT COUNT(*) FROM edge JOIN floats
+
+onlyif antb1
+statement error ^parse: a table alias cannot be the keyword SEMI; write it as a quoted identifier$
+SELECT COUNT(*) FROM edge AS semi

@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <functional>
 #include <limits>
 #include <optional>
@@ -60,9 +61,9 @@ TEST(ParserTest, SelectStar) {
   ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
   EXPECT_TRUE(stmt->star);
   EXPECT_TRUE(stmt->items.empty());
-  EXPECT_EQ(stmt->from.kind, TableRef::Kind::kName);
-  EXPECT_EQ(stmt->from.name, "events");
-  EXPECT_FALSE(stmt->from.quoted);
+  EXPECT_EQ(stmt->from.at(0).table.kind, TableRef::Kind::kName);
+  EXPECT_EQ(stmt->from.at(0).table.name, "events");
+  EXPECT_FALSE(stmt->from.at(0).table.quoted);
   EXPECT_TRUE(stmt->where.empty());
   EXPECT_FALSE(stmt->limit.has_value());
 }
@@ -92,7 +93,7 @@ TEST(ParserTest, ColumnsKeepTheirSpelling) {
     EXPECT_EQ(stmt->items[i].span, column->span);
     EXPECT_FALSE(stmt->items[i].alias.has_value());
   }
-  EXPECT_EQ(stmt->from.name, "Events");
+  EXPECT_EQ(stmt->from.at(0).table.name, "Events");
 }
 
 TEST(ParserTest, EveryAggregate) {
@@ -150,7 +151,7 @@ TEST(ParserTest, FunctionNamesAreColumnsWithoutParentheses) {
   for (const auto& item : stmt->items) {
     EXPECT_NE(ColumnOf(item), nullptr);
   }
-  EXPECT_EQ(stmt->from.name, "date");
+  EXPECT_EQ(stmt->from.at(0).table.name, "date");
 }
 
 TEST(ParserTest, Aliases) {
@@ -185,8 +186,8 @@ TEST(ParserTest, QuotedReservedWordsAreNames) {
   ASSERT_NE(column, nullptr);
   EXPECT_EQ(column->name, "select");
   EXPECT_EQ(stmt->items[0].alias, std::optional<std::string>("from"));
-  EXPECT_EQ(stmt->from.name, "where");
-  EXPECT_TRUE(stmt->from.quoted);
+  EXPECT_EQ(stmt->from.at(0).table.name, "where");
+  EXPECT_TRUE(stmt->from.at(0).table.quoted);
   ASSERT_EQ(stmt->where.size(), 1U);
   EXPECT_EQ(Cmp(stmt->where[0]).column.name, "limit");
 }
@@ -194,28 +195,246 @@ TEST(ParserTest, QuotedReservedWordsAreNames) {
 TEST(ParserTest, TableReferences) {
   auto name = Parse("SELECT a FROM events");
   ASSERT_TRUE(name.has_value());
-  EXPECT_EQ(name->from.kind, TableRef::Kind::kName);
-  EXPECT_FALSE(name->from.quoted);
+  EXPECT_EQ(name->from.at(0).table.kind, TableRef::Kind::kName);
+  EXPECT_FALSE(name->from.at(0).table.quoted);
 
   constexpr std::string_view kQuoted = R"(SELECT a FROM "My ""Events""")";
   auto quoted = Parse(kQuoted);
   ASSERT_TRUE(quoted.has_value());
-  EXPECT_EQ(quoted->from.kind, TableRef::Kind::kName);
-  EXPECT_EQ(quoted->from.name, R"(My "Events")");
-  EXPECT_TRUE(quoted->from.quoted);
-  EXPECT_EQ(At(kQuoted, quoted->from.span), R"("My ""Events""")");
+  EXPECT_EQ(quoted->from.at(0).table.kind, TableRef::Kind::kName);
+  EXPECT_EQ(quoted->from.at(0).table.name, R"(My "Events")");
+  EXPECT_TRUE(quoted->from.at(0).table.quoted);
+  EXPECT_EQ(At(kQuoted, quoted->from.at(0).table.span), R"("My ""Events""")");
 
   constexpr std::string_view kPath = "select count(*) from 'data/it''s part-0.parquet'";
   auto path = Parse(kPath);
   ASSERT_TRUE(path.has_value());
-  EXPECT_EQ(path->from.kind, TableRef::Kind::kPath);
-  EXPECT_EQ(path->from.name, "data/it's part-0.parquet");
-  EXPECT_FALSE(path->from.quoted);
-  EXPECT_EQ(At(kPath, path->from.span), "'data/it''s part-0.parquet'");
+  EXPECT_EQ(path->from.at(0).table.kind, TableRef::Kind::kPath);
+  EXPECT_EQ(path->from.at(0).table.name, "data/it's part-0.parquet");
+  EXPECT_FALSE(path->from.at(0).table.quoted);
+  EXPECT_EQ(At(kPath, path->from.at(0).table.span), "'data/it''s part-0.parquet'");
 
   auto glob = Parse("SELECT * FROM 'data/*.parquet'");
   ASSERT_TRUE(glob.has_value());
-  EXPECT_EQ(glob->from.name, "data/*.parquet");
+  EXPECT_EQ(glob->from.at(0).table.name, "data/*.parquet");
+}
+
+// The FROM list is flat: each item records its connector, alias and ON conjuncts, with spans.
+TEST(ParserTest, FromListConnectorsAndSpans) {
+  constexpr std::string_view kSql =
+      "SELECT t /*c*/ . x FROM t, u CROSS  JOIN v JOIN w ON t.a = w.a inner join 'p.parquet' AS p "
+      "ON p.b = 1 LEFT OUTER JOIN x ON x.c = t.c AND x.d = 2 left join \"Y\" y ON y.e = 3 OR y.f";
+  auto stmt = Parse(kSql);
+  ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
+  struct Want {
+    Connector connector;
+    std::string_view connector_text;
+    std::string_view item_text;
+    std::string_view alias_text;
+    std::size_t conjuncts;
+    std::string_view on_text;
+  };
+  const std::array<Want, 7> want{{
+      {.connector = Connector::kFirst,
+       .connector_text = "",
+       .item_text = "t",
+       .alias_text = "",
+       .conjuncts = 0,
+       .on_text = ""},
+      {.connector = Connector::kComma,
+       .connector_text = ",",
+       .item_text = "u",
+       .alias_text = "",
+       .conjuncts = 0,
+       .on_text = ""},
+      {.connector = Connector::kCross,
+       .connector_text = "CROSS  JOIN",
+       .item_text = "v",
+       .alias_text = "",
+       .conjuncts = 0,
+       .on_text = ""},
+      {.connector = Connector::kInner,
+       .connector_text = "JOIN",
+       .item_text = "w",
+       .alias_text = "",
+       .conjuncts = 1,
+       .on_text = "ON t.a = w.a"},
+      {.connector = Connector::kInner,
+       .connector_text = "inner join",
+       .item_text = "'p.parquet' AS p",
+       .alias_text = "AS p",
+       .conjuncts = 1,
+       .on_text = "ON p.b = 1"},
+      {.connector = Connector::kLeft,
+       .connector_text = "LEFT OUTER JOIN",
+       .item_text = "x",
+       .alias_text = "",
+       .conjuncts = 2,
+       .on_text = "ON x.c = t.c AND x.d = 2"},
+      {.connector = Connector::kLeft,
+       .connector_text = "left join",
+       .item_text = "\"Y\" y",
+       .alias_text = "y",
+       .conjuncts = 1,
+       .on_text = "ON y.e = 3 OR y.f"},
+  }};
+  ASSERT_EQ(stmt->from.size(), want.size());
+  for (std::size_t i = 0; i < want.size(); ++i) {
+    const FromItem& item = stmt->from[i];
+    EXPECT_EQ(item.connector, want[i].connector) << i;
+    EXPECT_EQ(At(kSql, item.connector_span), want[i].connector_text) << i;
+    EXPECT_EQ(At(kSql, item.span), want[i].item_text) << i;
+    EXPECT_EQ(At(kSql, item.alias_span), want[i].alias_text) << i;
+    EXPECT_EQ(item.on.size(), want[i].conjuncts) << i;
+    EXPECT_EQ(At(kSql, item.on_span), want[i].on_text) << i;
+  }
+  EXPECT_EQ(stmt->from[4].table.kind, TableRef::Kind::kPath);
+  EXPECT_EQ(stmt->from[4].alias, std::optional<std::string>("p"));
+  EXPECT_TRUE(stmt->from[6].table.quoted);
+  EXPECT_EQ(stmt->from[6].alias, std::optional<std::string>("y"));
+  EXPECT_EQ(std::get<BinaryExpr>(stmt->from[6].on.front()).op, BinaryOp::kOr);
+  // A qualified name spans its qualifier through its name, comments and spaces included.
+  const ColumnRef* column = ColumnOf(stmt->items.at(0));
+  ASSERT_NE(column, nullptr);
+  EXPECT_EQ(column->qualifier, "t");
+  EXPECT_FALSE(column->qualifier_quoted);
+  EXPECT_EQ(column->name, "x");
+  EXPECT_EQ(At(kSql, column->span), "t /*c*/ . x");
+  EXPECT_EQ(ToString(stmt->from[5].connector), "LEFT JOIN");
+}
+
+// An alias after AS or without it; a quoted identifier, or after AS a non-empty string; the
+// reserved words BETWEEN, EXISTS, INTERVAL and OVER (as DuckDB); after a name or a path.
+TEST(ParserTest, FromItemAliases) {
+  struct Case {
+    std::string_view sql;
+    std::string_view alias;
+    std::string_view alias_text;
+  };
+  for (const Case& c : {
+           Case{.sql = "SELECT a FROM t e", .alias = "e", .alias_text = "e"},
+           Case{.sql = "SELECT a FROM t as E", .alias = "E", .alias_text = "as E"},
+           Case{.sql = R"(SELECT a FROM t "a ""b""")",
+                .alias = R"(a "b")",
+                .alias_text = R"("a ""b""")"},
+           Case{.sql = R"(SELECT a FROM t AS "select")",
+                .alias = "select",
+                .alias_text = R"(AS "select")"},
+           Case{.sql = "SELECT a FROM t AS 'it''s'", .alias = "it's", .alias_text = "AS 'it''s'"},
+           Case{.sql = "SELECT a FROM 'p.parquet' p", .alias = "p", .alias_text = "p"},
+           Case{.sql = "SELECT a FROM 'p.parquet' AS /* c */ p",
+                .alias = "p",
+                .alias_text = "AS /* c */ p"},
+           Case{.sql = "SELECT a FROM t over", .alias = "over", .alias_text = "over"},
+           Case{
+               .sql = "SELECT a FROM t AS Between", .alias = "Between", .alias_text = "AS Between"},
+           Case{.sql = "SELECT a FROM t EXISTS WHERE a = 1",
+                .alias = "EXISTS",
+                .alias_text = "EXISTS"},
+           Case{.sql = "SELECT a FROM t AS interval LIMIT 1",
+                .alias = "interval",
+                .alias_text = "AS interval"},
+           Case{.sql = "SELECT a FROM t date", .alias = "date", .alias_text = "date"},
+       }) {
+    auto stmt = Parse(c.sql);
+    ASSERT_TRUE(stmt.has_value()) << c.sql << ": " << stmt.error().message;
+    ASSERT_EQ(stmt->from.size(), 1U) << c.sql;
+    const FromItem& item = stmt->from.front();
+    EXPECT_EQ(item.alias, std::optional<std::string>(c.alias)) << c.sql;
+    EXPECT_EQ(At(c.sql, item.alias_span), c.alias_text) << c.sql;
+    EXPECT_TRUE(At(c.sql, item.span).ends_with(At(c.sql, item.alias_span))) << c.sql;
+  }
+  auto none = Parse("SELECT a FROM t");
+  ASSERT_TRUE(none.has_value());
+  EXPECT_FALSE(none->from.front().alias.has_value());
+  EXPECT_EQ(none->from.front().alias_span, SourceSpan{});
+}
+
+// ON is split at its top-level AND chain, like WHERE: a parenthesized AND or a top-level OR makes
+// one conjunct.
+TEST(ParserTest, OnConjunctsSplitLikeWhere) {
+  auto chain = Parse("SELECT a FROM t JOIN u ON t.a = u.a AND (u.b = 1) AND t.c < u.c WHERE a = 1");
+  ASSERT_TRUE(chain.has_value()) << chain.error().message;
+  EXPECT_EQ(chain->from.at(1).on.size(), 3U);
+  EXPECT_EQ(chain->where.size(), 1U);
+  auto nested = Parse("SELECT a FROM t JOIN u ON (t.a = u.a AND u.b = 1) AND t.c < u.c");
+  ASSERT_TRUE(nested.has_value());
+  ASSERT_EQ(nested->from.at(1).on.size(), 2U);
+  EXPECT_EQ(std::get<BinaryExpr>(nested->from.at(1).on[0]).op, BinaryOp::kAnd);
+  auto with_or = Parse("SELECT a FROM t LEFT JOIN u ON t.a = u.a AND u.b = 1 OR u.c = 2");
+  ASSERT_TRUE(with_or.has_value());
+  ASSERT_EQ(with_or->from.at(1).on.size(), 1U);
+  EXPECT_EQ(std::get<BinaryExpr>(with_or->from.at(1).on[0]).op, BinaryOp::kOr);
+  // A long chain builds no deep tree.
+  std::string sql = "SELECT a FROM t JOIN u ON a0 = 0";
+  for (int i = 1; i < 1000; ++i) {
+    sql += " AND a" + std::to_string(i) + " = " + std::to_string(i);
+  }
+  auto wide = Parse(sql);
+  ASSERT_TRUE(wide.has_value()) << wide.error().message;
+  EXPECT_EQ(wide->from.at(1).on.size(), 1000U);
+}
+
+// Qualified names, unquoted or quoted on either side, wherever a column may stand.
+TEST(ParserTest, QualifiedColumnsInEveryClause) {
+  constexpr std::string_view kSql =
+      R"(SELECT t.a, SUM("T".b), COUNT(DISTINCT t."B c"), CASE WHEN t.c IN (t.d, 1) THEN t.e END, )"
+      "lower(t.f), EXTRACT(year FROM t.g), t.h::INT FROM t WHERE t.i BETWEEN t.j AND 2 AND t.k "
+      "LIKE 'x' GROUP BY t.a HAVING MAX(t.l) > 1 ORDER BY t.a DESC, \"x y\".m";
+  auto stmt = Parse(kSql);
+  ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
+  // Every column of the statement is qualified: collect them through ToSql's canonical form.
+  const std::string canonical = ToSql(*stmt);
+  EXPECT_EQ(canonical,
+            R"(SELECT t.a, SUM("T".b), COUNT(DISTINCT t."B c"), CASE WHEN t.c IN (t.d, 1) THEN )"
+            "t.e END, lower(t.f), EXTRACT(year FROM t.g), CAST(t.h AS INT) FROM t WHERE t.i "
+            "BETWEEN t.j AND 2 AND t.k LIKE 'x' GROUP BY t.a HAVING MAX(t.l) > 1 ORDER BY t.a "
+            "DESC, \"x y\".m");
+  const auto* sum = std::get_if<AggregateCall>(&stmt->items.at(1).expr);
+  ASSERT_NE(sum, nullptr);
+  ASSERT_NE(sum->arg_column(), nullptr);
+  EXPECT_EQ(sum->arg_column()->qualifier, "T");
+  EXPECT_TRUE(sum->arg_column()->qualifier_quoted);
+  EXPECT_FALSE(sum->arg_column()->quoted);
+  EXPECT_EQ(At(kSql, sum->arg_column()->span), R"("T".b)");
+  const auto* distinct = std::get_if<AggregateCall>(&stmt->items.at(2).expr);
+  ASSERT_NE(distinct, nullptr);
+  ASSERT_NE(distinct->arg_column(), nullptr);
+  EXPECT_EQ(distinct->arg_column()->name, "B c");
+  EXPECT_TRUE(distinct->arg_column()->quoted);
+  EXPECT_EQ(Cmp(stmt->where.at(1)).column.qualifier, "t");
+  EXPECT_EQ(std::get<ColumnRef>(stmt->group_by.at(0)).qualifier, "t");
+  EXPECT_EQ(HavingCmp(stmt->having.at(0)).op, CompareOp::kGt);
+  const auto& last = std::get<ColumnRef>(stmt->order_by.at(1).expr);
+  EXPECT_EQ(last.qualifier, "x y");
+  EXPECT_EQ(At(kSql, last.span), "\"x y\".m");
+  // A qualified and an unqualified name differ, and so do the quoting of either part.
+  auto plain = Parse("SELECT a FROM t");
+  auto qualified = Parse("SELECT t.a FROM t");
+  ASSERT_TRUE(plain.has_value() && qualified.has_value());
+  EXPECT_FALSE(EqualIgnoringSpans(*plain, *qualified));
+}
+
+// A JOIN binds tighter than a comma, so every FROM clause without nested joins is a flat list:
+// `a, b JOIN c ON ...` is not `a CROSS JOIN b JOIN c ON ...`.
+TEST(ParserTest, JoinsStayAFlatList) {
+  auto stmt = Parse(
+      "SELECT a FROM a, b JOIN c ON b.k = c.k, d LEFT JOIN e ON d.k = e.k CROSS JOIN f JOIN g ON "
+      "f.k = g.k");
+  ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
+  const std::array<Connector, 7> connectors = {
+      Connector::kFirst, Connector::kComma, Connector::kInner, Connector::kComma,
+      Connector::kLeft,  Connector::kCross, Connector::kInner};
+  ASSERT_EQ(stmt->from.size(), connectors.size());
+  for (std::size_t i = 0; i < connectors.size(); ++i) {
+    EXPECT_EQ(stmt->from[i].connector, connectors[i]) << i;
+    EXPECT_EQ(stmt->from[i].table.name, std::string(1, static_cast<char>('a' + i))) << i;
+  }
+  auto comma = Parse("SELECT a FROM a, b JOIN c ON b.k = c.k");
+  auto cross = Parse("SELECT a FROM a CROSS JOIN b JOIN c ON b.k = c.k");
+  ASSERT_TRUE(comma.has_value() && cross.has_value());
+  EXPECT_FALSE(EqualIgnoringSpans(*comma, *cross));
+  EXPECT_EQ(Depth(*stmt), 2U) << "the ON conjuncts count";
 }
 
 struct OpCase {
@@ -615,6 +834,20 @@ TEST(ParserTest, FunctionsCaseExtractAndExpressionOperands) {
   EXPECT_TRUE(EqualIgnoringSpans(*stmt, *again)) << ToSql(*stmt);
 }
 
+// LEFT and RIGHT start joins, not clauses: after a comma of the select list, GROUP BY or ORDER BY,
+// left( and right( are calls (DuckDB's string functions), not a trailing comma.
+TEST(ParserTest, LeftAndRightCallsAfterListCommas) {
+  auto stmt =
+      Parse("SELECT a, left(s, 1) FROM events GROUP BY a, right(s, 1) ORDER BY a, LEFT(s, 2)");
+  ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
+  ASSERT_EQ(stmt->items.size(), 2U);
+  EXPECT_EQ(std::get<FunctionCall>(stmt->items[1].expr).name, "left");
+  ASSERT_EQ(stmt->group_by.size(), 2U);
+  EXPECT_EQ(std::get<FunctionCall>(stmt->group_by[1]).name, "right");
+  ASSERT_EQ(stmt->order_by.size(), 2U);
+  EXPECT_EQ(std::get<FunctionCall>(stmt->order_by[1].expr).name, "LEFT");
+}
+
 // CAST(x AS T), TRY_CAST(x AS T) and x::T are one node: the type upper-cased with its integer
 // parameters as written, the spelling not recorded. '::' applies to any primary expression, and a
 // cast's span starts at the primary's first token.
@@ -860,6 +1093,21 @@ TEST(ParserTest, CanonicalFormStaysWithinTheDepthLimit) {
         return where(Repeat("a AND ", n) + Repeat("f(", 50) + "a" + std::string(50, ')') + " OR b");
       }),
       0U);
+  // ON conditions, also with a top-level OR before the next join (written bare: it reads back as
+  // parsed, the join keywords end it).
+  const auto on = [](std::string predicate) {
+    return "SELECT a FROM t JOIN u ON " + std::move(predicate) + " LEFT JOIN v ON v.a = 1";
+  };
+  EXPECT_NE(FirstTooDeep([&](std::size_t n) { return on("a = 0" + Repeat(" OR a = 1", n)); }), 0U);
+  EXPECT_NE(
+      FirstTooDeep([&](std::size_t n) {
+        return on(Repeat("a AND ", 100) + Repeat("f(", n) + "a" + std::string(n, ')') + " OR b");
+      }),
+      0U);
+  EXPECT_EQ(FirstTooDeep([&](std::size_t n) { return on("a = " + Repeat("NOT a = ", n) + "a"); }),
+            FirstTooDeep([&](std::size_t n) {
+              return on("a = " + Repeat("(NOT a = ", n) + "a" + std::string(n, ')'));
+            }));
   // NOT as the right operand of a comparison or arithmetic, a LIKE pattern and BETWEEN bounds,
   // bare and parenthesized; under a unary minus it gets no second pair.
   struct Family {
@@ -947,7 +1195,14 @@ TEST(ParserTest, OperatorChainsCountTheirOperandsDepth) {
   const auto having = [](const std::string& predicate) {
     return "SELECT a FROM t GROUP BY a HAVING " + predicate;
   };
+  const auto on = [](const std::string& predicate) {
+    return "SELECT a FROM t, u INNER JOIN v ON " + predicate + " CROSS JOIN w";
+  };
   const std::vector<std::pair<std::string_view, std::function<std::string(std::size_t)>>> exact = {
+      {"ON: deep conjunct, ANDs, OR",
+       [&](std::size_t n) { return on(calls(200) + " = 1" + Repeat(" AND a", n) + " OR b"); }},
+      {"ON: OR chain after a deep conjunct",
+       [&](std::size_t n) { return on(calls(200) + " = 1" + Repeat(" OR a = 1", n)); }},
       {"deep left operand", [&](std::size_t n) { return select(calls(200) + Repeat(" + 1", n)); }},
       {"deep early right operand",
        [&](std::size_t n) { return select("a + " + calls(200) + Repeat(" + 1", n)); }},
@@ -1168,7 +1423,7 @@ TEST(ParserTest, IsNullAndNotNullAreNamesOnlyWhereNotOperators) {
   EXPECT_EQ(first->name, "isnull");
   EXPECT_EQ(stmt->items[1].alias, std::optional<std::string>("notnull"));
   EXPECT_EQ(stmt->items[2].alias, std::optional<std::string>("isnull"));
-  EXPECT_EQ(stmt->from.name, "isnull");
+  EXPECT_EQ(stmt->from.at(0).table.name, "isnull");
   ASSERT_EQ(stmt->where.size(), 1U);
   EXPECT_EQ(Cmp(stmt->where[0]).column.name, "notnull");
 }
@@ -1297,18 +1552,273 @@ INSTANTIATE_TEST_SUITE_P(
                    "OFFSET expressions are not supported (OFFSET takes an integer)"},
         RejectCase{"LimitCommaOffset", "SELECT a FROM events LIMIT 5^, 10", kUnsupported, 1,
                    "LIMIT with an offset (LIMIT n, m) is not supported"},
-        RejectCase{"Join", "SELECT a FROM events ^JOIN users ON a = b", kUnsupported, 4,
-                   "JOIN is not supported"},
-        RejectCase{"LeftJoin", "SELECT a FROM events ^LEFT JOIN users ON a = b", kUnsupported, 4,
-                   "LEFT JOIN is not supported"},
-        RejectCase{"InnerJoin", "SELECT a FROM events ^INNER JOIN users USING (a)", kUnsupported, 5,
-                   "INNER JOIN is not supported"},
-        RejectCase{"CrossJoin", "SELECT a FROM events ^CROSS JOIN users", kUnsupported, 5,
-                   "CROSS JOIN is not supported"},
+        // Joins outside the subset, and words that DuckDB reads as joins after a FROM item.
+        RejectCase{"InnerJoinUsing", "SELECT a FROM events INNER JOIN users ^USING (a)",
+                   kUnsupported, 5,
+                   "JOIN ... USING is not supported (write the condition with ON)"},
+        RejectCase{"LeftJoinUsing", "SELECT a FROM events LEFT JOIN users ^using (a)", kUnsupported,
+                   5, "JOIN ... USING is not supported"},
+        RejectCase{"NestedJoin", "SELECT a FROM events JOIN users ^JOIN items ON a = b ON a = c",
+                   kUnsupported, 4,
+                   "nested joins (a JOIN before the ON of an earlier JOIN) are not supported"},
+        RejectCase{"NestedCrossJoin", "SELECT a FROM events JOIN users ^CROSS JOIN items ON a = b",
+                   kUnsupported, 5, "nested joins"},
+        RejectCase{"NestedNaturalJoin",
+                   "SELECT a FROM events LEFT JOIN users ^NATURAL JOIN items ON a = b",
+                   kUnsupported, 7, "nested joins"},
+        RejectCase{"NestedLeftOuterJoin",
+                   "SELECT a FROM events JOIN users ^LEFT OUTER JOIN items ON a = b ON a = c",
+                   kUnsupported, 4, "nested joins"},
+        RejectCase{"NestedRightJoin",
+                   "SELECT a FROM events JOIN users ^RIGHT JOIN items ON a = b ON a = c",
+                   kUnsupported, 5, "nested joins"},
+        RejectCase{"NestedInnerJoin",
+                   "SELECT a FROM events JOIN users ^INNER JOIN items ON a = b ON a = c",
+                   kUnsupported, 5, "nested joins"},
+        RejectCase{"RightJoin", "SELECT a FROM events ^RIGHT JOIN users ON a = b", kUnsupported, 5,
+                   "RIGHT JOIN is not supported"},
+        RejectCase{"RightOuterJoin", "SELECT a FROM events ^right outer join users ON a = b",
+                   kUnsupported, 5, "RIGHT JOIN is not supported"},
+        RejectCase{"FullJoin", "SELECT a FROM events ^FULL JOIN users ON a = b", kUnsupported, 4,
+                   "FULL JOIN is not supported"},
+        RejectCase{"FullOuterJoin", "SELECT a FROM events, items ^FULL OUTER JOIN users ON a = b",
+                   kUnsupported, 4, "FULL JOIN is not supported"},
         RejectCase{"NaturalJoin", "SELECT a FROM events ^NATURAL JOIN users", kUnsupported, 7,
                    "NATURAL JOIN is not supported"},
-        RejectCase{"CommaJoin", "SELECT a FROM events^, users", kUnsupported, 1,
-                   "multiple tables in FROM (JOIN) are not supported"},
+        RejectCase{"NaturalLeftJoin", "SELECT a FROM events ^NATURAL LEFT JOIN users", kUnsupported,
+                   7, "NATURAL JOIN is not supported"},
+        RejectCase{"NaturalFullOuterJoin", "SELECT a FROM events ^NATURAL FULL OUTER JOIN users",
+                   kUnsupported, 7, "NATURAL JOIN is not supported"},
+        RejectCase{"NaturalInnerJoin", "SELECT a FROM events ^NATURAL INNER JOIN users",
+                   kUnsupported, 7, "NATURAL JOIN is not supported"},
+        RejectCase{"NaturalSemiJoin", "SELECT a FROM events ^NATURAL SEMI JOIN users", kUnsupported,
+                   7, "NATURAL JOIN is not supported"},
+        RejectCase{"NaturalAntiJoin", "SELECT a FROM events ^natural anti join users", kUnsupported,
+                   7, "NATURAL JOIN is not supported"},
+        RejectCase{"SemiJoin", "SELECT a FROM events ^semi JOIN users ON a = b", kUnsupported, 4,
+                   "SEMI JOIN is not supported"},
+        RejectCase{"AntiJoin", "SELECT a FROM events ^ANTI JOIN users ON a = b", kUnsupported, 4,
+                   "ANTI JOIN is not supported"},
+        RejectCase{"AsofJoin", "SELECT a FROM events ^asof JOIN users ON a >= b", kUnsupported, 4,
+                   "ASOF JOIN is not supported"},
+        RejectCase{"AsofLeftJoin", "SELECT a FROM events ^ASOF LEFT JOIN users ON a >= b",
+                   kUnsupported, 4, "ASOF JOIN is not supported"},
+        RejectCase{"AsofRightOuterJoin",
+                   "SELECT a FROM events ^asof right outer join users ON a >= b", kUnsupported, 4,
+                   "ASOF JOIN is not supported"},
+        RejectCase{"AsofSemiJoin", "SELECT a FROM events ^ASOF SEMI JOIN users ON a >= b",
+                   kUnsupported, 4, "ASOF JOIN is not supported"},
+        RejectCase{"AsofAntiJoin", "SELECT a FROM events ^ASOF ANTI JOIN users ON a >= b",
+                   kUnsupported, 4, "ASOF JOIN is not supported"},
+        RejectCase{"PositionalJoin", "SELECT a FROM events ^POSITIONAL JOIN users", kUnsupported,
+                   10, "POSITIONAL JOIN is not supported"},
+        RejectCase{"SemiJoinAfterAlias", "SELECT a FROM events AS e ^SEMI JOIN users ON a = b",
+                   kUnsupported, 4, "SEMI JOIN is not supported"},
+        RejectCase{"SemiJoinAfterPath", "SELECT a FROM 'e.parquet' ^semi JOIN users ON a = b",
+                   kUnsupported, 4, "SEMI JOIN is not supported"},
+        RejectCase{"SemiJoinAfterOn",
+                   "SELECT a FROM events JOIN users ON a = b ^SEMI JOIN items ON a = c",
+                   kUnsupported, 4, "SEMI JOIN is not supported"},
+        RejectCase{"AsofJoinAfterOn",
+                   "SELECT a FROM events JOIN users ON a = b ^ASOF JOIN items ON a >= c",
+                   kUnsupported, 4, "ASOF JOIN is not supported"},
+        RejectCase{"TimeTravel", "SELECT a FROM events ^AT (VERSION => 1)", kUnsupported, 2,
+                   "AT (time travel) is not supported"},
+        RejectCase{"Pivot", "SELECT a FROM events ^PIVOT (SUM(a) FOR b IN (1, 2))", kUnsupported, 5,
+                   "PIVOT is not supported"},
+        RejectCase{"PivotAfterOn",
+                   "SELECT a FROM events JOIN users ON a = b ^pivot (SUM(a) FOR b IN (1))",
+                   kUnsupported, 5, "PIVOT is not supported"},
+        RejectCase{"Unpivot", "SELECT a FROM events ^UNPIVOT (v FOR k IN (a, b))", kUnsupported, 7,
+                   "UNPIVOT is not supported"},
+        RejectCase{"UnpivotIncludeNulls",
+                   "SELECT a FROM events e ^UNPIVOT INCLUDE NULLS (v FOR k IN (a, b))",
+                   kUnsupported, 7, "UNPIVOT is not supported"},
+        RejectCase{"UnpivotExcludeNulls",
+                   "SELECT a FROM events ^UNPIVOT EXCLUDE NULLS (v FOR k IN (a, b))", kUnsupported,
+                   7, "UNPIVOT is not supported"},
+        RejectCase{"TableSampleAfterAlias", "SELECT a FROM events e ^TABLESAMPLE 10%", kUnsupported,
+                   11, "TABLESAMPLE is not supported"},
+        RejectCase{"TableSampleMethod", "SELECT a FROM events ^tablesample reservoir(10)",
+                   kUnsupported, 11, "TABLESAMPLE is not supported"},
+        RejectCase{"TableSampleParenthesized", "SELECT a FROM events ^TABLESAMPLE (10)",
+                   kUnsupported, 11, "TABLESAMPLE is not supported"},
+        RejectCase{"TableSampleDecimal", "SELECT a FROM events ^TABLESAMPLE 2.5 PERCENT",
+                   kUnsupported, 11, "TABLESAMPLE is not supported"},
+        // After an ON condition, the words that continue it as an operator.
+        RejectCase{"GlobAfterOn", "SELECT a FROM events JOIN users ON a = b ^GLOB 'x'",
+                   kUnsupported, 4, "GLOB is not supported"},
+        RejectCase{"AtTimeZoneAfterOn",
+                   "SELECT a FROM events JOIN users ON a = b ^AT TIME ZONE 'UTC'", kUnsupported, 2,
+                   "AT TIME ZONE is not supported"},
+        RejectCase{"IsNullAfterOn", "SELECT a FROM events JOIN users ON a = b ^isnull",
+                   kUnsupported, 6, "ISNULL is not supported"},
+        // Other FROM items and FROM-list forms DuckDB parses.
+        RejectCase{"Lateral", "SELECT a FROM ^LATERAL (SELECT 1)", kUnsupported, 7,
+                   "LATERAL is not supported"},
+        RejectCase{"CrossJoinLateral", "SELECT a FROM events CROSS JOIN ^lateral f(a)",
+                   kUnsupported, 7, "LATERAL is not supported"},
+        // LATERAL before a function with a qualified name: three tokens show the first dot only,
+        // so LATERAL s.t, a syntax error in DuckDB, is unsupported too.
+        RejectCase{"LateralQualifiedFunction", "SELECT a FROM events, ^LATERAL main.range(3)",
+                   kUnsupported, 7, "LATERAL is not supported"},
+        RejectCase{"JoinLateralQuotedQualifier",
+                   R"(SELECT a FROM events JOIN ^LATERAL "main".range(3) r ON a = r.range)",
+                   kUnsupported, 7, "LATERAL is not supported"},
+        RejectCase{"LateralThreePartFunction", "SELECT a FROM ^LATERAL system.main.range(3)",
+                   kUnsupported, 7, "LATERAL is not supported"},
+        RejectCase{"LateralQualifiedNameWithoutCall", "SELECT a FROM events, ^LATERAL main.users",
+                   kUnsupported, 7, "LATERAL is not supported"},
+        // The reserved words that DuckDB takes as function names call table functions where a FROM
+        // item starts (also after LATERAL and as the first word in parentheses).
+        RejectCase{"TableFunctionNamedLeft", "SELECT * FROM events, ^left(7)", kUnsupported, 4,
+                   "table functions are not supported"},
+        RejectCase{"FirstTableFunctionNamedSimilar", "SELECT * FROM ^similar(1)", kUnsupported, 7,
+                   "table functions are not supported"},
+        RejectCase{"JoinTableFunctionNamedInner",
+                   "SELECT * FROM events JOIN ^inner(1) i ON a = i.v", kUnsupported, 5,
+                   "table functions are not supported"},
+        RejectCase{"LeftJoinTableFunctionNamedLeft",
+                   "SELECT * FROM events LEFT JOIN ^left(1) l ON a = l.v", kUnsupported, 4,
+                   "table functions are not supported"},
+        RejectCase{"CrossJoinTableFunctionNamedRight", "SELECT * FROM events CROSS JOIN ^RIGHT(1)",
+                   kUnsupported, 5, "table functions are not supported"},
+        RejectCase{"LateralFunctionNamedLeft", "SELECT a FROM events, ^LATERAL left(1)",
+                   kUnsupported, 7, "LATERAL is not supported"},
+        RejectCase{"ParenthesizedJoinOfAFunctionNamedLeft",
+                   "SELECT a FROM ^(left(1) l JOIN events ON a = l.v)", kUnsupported, 1,
+                   "parenthesized joins in FROM are not supported"},
+        // DuckDB takes BETWEEN, EXISTS, INTERVAL and OVER for qualifiers where a FROM item starts:
+        // of a table, of a table function and after LATERAL, also first in parentheses. Three
+        // tokens show only the dot, so LATERAL over.x and (over.x), syntax errors in DuckDB, are
+        // unsupported too, and so is LATERAL before one of these words in parentheses.
+        RejectCase{"TableQualifiedByOverAfterComma", "SELECT a FROM events, ^over.x", kUnsupported,
+                   4,
+                   "the reserved word OVER as a qualifier is not supported; write it as a quoted "
+                   "identifier"},
+        RejectCase{"FirstTableQualifiedByExists", "SELECT a FROM ^EXISTS.x", kUnsupported, 6,
+                   "the reserved word EXISTS as a qualifier is not supported"},
+        RejectCase{"JoinedTableQualifiedByInterval",
+                   "SELECT a FROM events JOIN ^interval.x ON a = b", kUnsupported, 8,
+                   "the reserved word INTERVAL as a qualifier is not supported"},
+        RejectCase{"FirstTableFunctionQualifiedByOver", "SELECT a FROM ^over.f(1)", kUnsupported, 4,
+                   "the reserved word OVER as a qualifier is not supported"},
+        RejectCase{"TableFunctionQualifiedByBetweenAfterComma",
+                   "SELECT a FROM events, ^between.f(1)", kUnsupported, 7,
+                   "the reserved word BETWEEN as a qualifier is not supported"},
+        RejectCase{"LateralFunctionQualifiedByBetween",
+                   "SELECT a FROM events, ^LATERAL between.f(1)", kUnsupported, 7,
+                   "LATERAL is not supported"},
+        RejectCase{"LateralQualifiedByOverWithoutCall", "SELECT a FROM events, ^LATERAL over.users",
+                   kUnsupported, 7, "LATERAL is not supported"},
+        RejectCase{"ParenthesizedJoinOfATableQualifiedByExists",
+                   "SELECT a FROM ^(exists.x CROSS JOIN events)", kUnsupported, 1,
+                   "parenthesized joins in FROM are not supported"},
+        RejectCase{"TableQualifiedByOverAloneInParentheses", "SELECT a FROM ^(over.x)",
+                   kUnsupported, 1, "parenthesized joins in FROM are not supported"},
+        RejectCase{"ParenthesizedJoinOfALateralFunctionQualifiedByExists",
+                   "SELECT a FROM ^(LATERAL exists.f(1) CROSS JOIN events)", kUnsupported, 1,
+                   "parenthesized joins in FROM are not supported"},
+        RejectCase{"ParenthesizedLateralBeforeInterval",
+                   "SELECT a FROM ^(LATERAL interval CROSS JOIN events)", kUnsupported, 1,
+                   "parenthesized joins in FROM are not supported"},
+        RejectCase{"Only", "SELECT a FROM ^ONLY events", kUnsupported, 4, "ONLY is not supported"},
+        RejectCase{"OnlyPath", "SELECT a FROM ^only 'e.parquet'", kUnsupported, 4,
+                   "ONLY is not supported"},
+        RejectCase{"CommaOnly", "SELECT a FROM events, ^ONLY users", kUnsupported, 4,
+                   "ONLY is not supported"},
+        RejectCase{"ColumnAliasList", "SELECT a FROM events AS e^(x, y)", kUnsupported, 1,
+                   "column alias lists (t AS a(x, y)) are not supported"},
+        RejectCase{"ColumnAliasListImplicit", "SELECT a FROM events e^(x)", kUnsupported, 1,
+                   "column alias lists"},
+        RejectCase{"ColumnAliasListPath", "SELECT a FROM 'e.parquet' AS 'p'^(x)", kUnsupported, 1,
+                   "column alias lists"},
+        RejectCase{"ParenthesizedJoin", "SELECT a FROM ^(events JOIN users ON a = b)", kUnsupported,
+                   1, "parenthesized joins in FROM are not supported"},
+        RejectCase{"ParenthesizedJoinWithAlias", "SELECT a FROM ^(events e CROSS JOIN users)",
+                   kUnsupported, 1, "parenthesized joins in FROM are not supported"},
+        // In parentheses a LATERAL item only starts a join in DuckDB; three tokens show LATERAL and
+        // the '(' or the name after it.
+        RejectCase{"ParenthesizedJoinOfALateralSubquery",
+                   "SELECT a FROM ^(LATERAL (SELECT 1) x CROSS JOIN events)", kUnsupported, 1,
+                   "parenthesized joins in FROM are not supported"},
+        RejectCase{"ParenthesizedJoinOfALateralFunction",
+                   "SELECT a FROM ^(LATERAL left(1) CROSS JOIN events)", kUnsupported, 1,
+                   "parenthesized joins in FROM are not supported"},
+        RejectCase{"SubqueryValues", "SELECT a FROM ^(VALUES (1))", kUnsupported, 1,
+                   "subqueries in FROM are not supported"},
+        RejectCase{"SubqueryFromFirst", "SELECT a FROM ^(FROM events)", kUnsupported, 1,
+                   "subqueries in FROM are not supported"},
+        RejectCase{"SubqueryParenthesized", "SELECT a FROM ^((SELECT 1))", kUnsupported, 1,
+                   "subqueries in FROM are not supported"},
+        RejectCase{"SubqueryWith", "SELECT a FROM ^(WITH x AS (SELECT 1) SELECT * FROM x)",
+                   kUnsupported, 1, "subqueries in FROM are not supported"},
+        RejectCase{"SubqueryTable", "SELECT a FROM ^(TABLE events)", kUnsupported, 1,
+                   "subqueries in FROM are not supported"},
+        RejectCase{"SubqueryShow", "SELECT a FROM ^(SHOW events)", kUnsupported, 1,
+                   "subqueries in FROM are not supported"},
+        RejectCase{"SubqueryDescribe", "SELECT a FROM ^(DESCRIBE events)", kUnsupported, 1,
+                   "subqueries in FROM are not supported"},
+        RejectCase{"SubquerySummarize", "SELECT a FROM ^(SUMMARIZE events)", kUnsupported, 1,
+                   "subqueries in FROM are not supported"},
+        RejectCase{"SubqueryPivot", "SELECT a FROM ^(PIVOT events ON a)", kUnsupported, 1,
+                   "subqueries in FROM are not supported"},
+        RejectCase{"SubqueryUnpivot", "SELECT a FROM ^(UNPIVOT events ON a INTO NAME k VALUE v)",
+                   kUnsupported, 1, "subqueries in FROM are not supported"},
+        RejectCase{"EmptyStringAlias", "SELECT a FROM events AS ^''", kUnsupported, 2,
+                   "an empty table alias ('') is not supported"},
+        RejectCase{"EscapeStringAlias", "SELECT a FROM events AS ^E'x'", kUnsupported, 1,
+                   "prefixed strings (E'...') are not supported"},
+        RejectCase{"EscapeStringAliasOfAJoin", "SELECT a FROM events JOIN users AS ^e'u' ON a = b",
+                   kUnsupported, 1, "prefixed strings (E'...') are not supported"},
+        RejectCase{"DollarQuotedAlias", "SELECT a FROM events AS ^$$x$$", kUnsupported, 1,
+                   "dollar-quoted strings are not supported"},
+        RejectCase{"DollarTagQuotedAlias", "SELECT a FROM events AS ^$tag$x$tag$", kUnsupported, 4,
+                   "dollar-quoted strings are not supported"},
+        RejectCase{"EmptyDollarQuotedAlias", "SELECT a FROM events AS ^$$$$", kUnsupported, 1,
+                   "dollar-quoted strings are not supported"},
+        RejectCase{"NaturalLeftOuterWithoutJoin", "SELECT a FROM events ^NATURAL LEFT OUTER users",
+                   kUnsupported, 7, "NATURAL JOIN is not supported"},
+        RejectCase{"TrailingCommaInFrom", "SELECT a FROM events^,", kUnsupported, 1,
+                   "a trailing comma in FROM is not supported"},
+        RejectCase{"TrailingCommaBeforeWhere", "SELECT a FROM events^, WHERE a = 1", kUnsupported,
+                   1, "a trailing comma in FROM is not supported"},
+        RejectCase{"TrailingCommaAfterJoin", "SELECT a FROM events JOIN users ON a = b^, LIMIT 1",
+                   kUnsupported, 1, "a trailing comma in FROM is not supported"},
+        // Qualified names: one qualifier, and a column name that needs no quoting.
+        RejectCase{"QualifiedStar", "SELECT e.^* FROM events e", kUnsupported, 1,
+                   "qualified * (t.*) is not supported"},
+        RejectCase{"CountQualifiedStar", "SELECT COUNT(e.^*) FROM events e", kUnsupported, 1,
+                   "qualified * (t.*) is not supported"},
+        RejectCase{"ThreePartName", "SELECT main.e^.a FROM events e", kUnsupported, 1,
+                   "names of more than two parts (a.b.c) are not supported"},
+        RejectCase{"MethodCall", "SELECT e.^lower(a) FROM events e", kUnsupported, 5,
+                   "qualified function names and method calls (a.f()) are not supported"},
+        RejectCase{"QuotedMethodCall", R"(SELECT "e".^"f"() FROM events e)", kUnsupported, 3,
+                   "qualified function names and method calls"},
+        RejectCase{"ReservedWordAfterDot", "SELECT e.^from FROM events e", kUnsupported, 4,
+                   "the reserved word FROM after '.' is not supported; write it as a quoted "
+                   "identifier"},
+        RejectCase{"AliasKeywordQualifier", "SELECT ^over.a FROM events over", kUnsupported, 4,
+                   "the reserved word OVER as a qualifier is not supported; write it as a quoted "
+                   "identifier"},
+        RejectCase{"ExistsQualifier", "SELECT a FROM events WHERE ^exists.a = 1", kUnsupported, 6,
+                   "the reserved word EXISTS as a qualifier is not supported"},
+        RejectCase{"FieldAccess", "SELECT f(a)^.b FROM events", kUnsupported, 1,
+                   "'.' after an expression (a field or a method) is not supported"},
+        RejectCase{"FieldOfAString", "SELECT 'p'^.x FROM events", kUnsupported, 1,
+                   "'.' after an expression"},
+        // GLOB and AT TIME ZONE: operators in every expression, never an implicit alias.
+        RejectCase{"GlobInWhere", "SELECT a FROM events WHERE a ^GLOB 'x*'", kUnsupported, 4,
+                   "GLOB is not supported"},
+        RejectCase{"GlobInSelect", "SELECT a ^glob 'x*' FROM events", kUnsupported, 4,
+                   "GLOB is not supported"},
+        RejectCase{"GlobAsSelectAlias", "SELECT a ^glob FROM events", kUnsupported, 4,
+                   "GLOB is not supported"},
+        RejectCase{"AtTimeZoneInSelect", "SELECT ts ^AT TIME ZONE 'UTC' FROM events", kUnsupported,
+                   2, "AT TIME ZONE is not supported"},
+        RejectCase{"AtTimeZoneInWhere", "SELECT a FROM events WHERE ts ^at time zone 'UTC' = 1",
+                   kUnsupported, 2, "AT TIME ZONE is not supported"},
         RejectCase{"Union", "SELECT a FROM events ^UNION SELECT a FROM users", kUnsupported, 5,
                    "UNION is not supported"},
         RejectCase{"UnionAfterWhere", "SELECT a FROM events WHERE a = 1 ^UNION ALL SELECT 1",
@@ -1432,22 +1942,12 @@ INSTANTIATE_TEST_SUITE_P(
                    "SELECT without FROM is not supported"},
         RejectCase{"SelectInto", "SELECT a ^INTO copy FROM events", kUnsupported, 4,
                    "SELECT INTO is not supported"},
-        RejectCase{"QualifiedColumn", "SELECT e^.a FROM events", kUnsupported, 1,
-                   "qualified names (a.b) are not supported"},
-        RejectCase{"QualifiedColumnInWhere", "SELECT a FROM events WHERE e^.a = 1", kUnsupported, 1,
-                   "qualified names (a.b) are not supported"},
-        RejectCase{"QualifiedColumnInAggregate", "SELECT SUM(e^.a) FROM events", kUnsupported, 1,
-                   "qualified names (a.b) are not supported"},
         RejectCase{"QualifiedTable", "SELECT a FROM main^.events", kUnsupported, 1,
                    "qualified table names are not supported"},
+        RejectCase{"QualifiedJoinedTable", "SELECT a FROM events JOIN main^.users ON a = b",
+                   kUnsupported, 1, "qualified table names are not supported"},
         RejectCase{"UnquotedPath", "SELECT a FROM data^.parquet", kUnsupported, 1,
                    "qualified table names are not supported"},
-        RejectCase{"TableAlias", "SELECT a FROM events ^e", kUnsupported, 1,
-                   "table aliases are not supported"},
-        RejectCase{"TableAliasWithAs", "SELECT a FROM events ^AS e", kUnsupported, 2,
-                   "table aliases are not supported"},
-        RejectCase{"TableAliasQuoted", R"(SELECT a FROM 'x.parquet' ^"e")", kUnsupported, 3,
-                   "table aliases are not supported"},
         RejectCase{"Window", "SELECT COUNT(*) ^OVER (PARTITION BY a) FROM events", kUnsupported, 4,
                    "window functions (OVER) are not supported"},
         RejectCase{"Filter", "SELECT COUNT(*) ^FILTER (WHERE a = 1) FROM events", kUnsupported, 6,
@@ -1526,6 +2026,55 @@ INSTANTIATE_TEST_SUITE_P(
                    "typed literals other than DATE"},
         RejectCase{"TypedLiteralInSelect", "SELECT ^int4 '1' FROM events", kUnsupported, 4,
                    "typed literals other than DATE"},
+        // A string after a qualified name: a typed literal of a qualified type in DuckDB.
+        RejectCase{"QualifiedTypedLiteral", "SELECT ^main.integer '5' FROM events", kUnsupported,
+                   12, "typed literals other than DATE"},
+        RejectCase{"QualifiedTypedLiteralInWhere",
+                   "SELECT a FROM events WHERE b = ^main.integer '2'", kUnsupported, 12,
+                   "typed literals other than DATE '...', TIMESTAMP '...' and prefixed strings "
+                   "(E'...') are not supported"},
+        RejectCase{"QuotedQualifiedTypedLiteral",
+                   R"(SELECT COUNT(^"main"."integer" '5') FROM events)", kUnsupported, 16,
+                   "typed literals other than DATE"},
+        RejectCase{"QualifiedTypedEscapeString", "SELECT a FROM events ORDER BY ^main.mood E'x'",
+                   kUnsupported, 9, "typed literals other than DATE"},
+        RejectCase{"QualifiedTypedDollarQuotedString", "SELECT ^e.a $$x$$ FROM events e",
+                   kUnsupported, 3, "typed literals other than DATE"},
+        // E and a string with a space between them, and N before a string, which DuckDB lexes as
+        // NCHAR and a string, make a typed literal of a qualified type in DuckDB too.
+        RejectCase{"QualifiedTypeSpacedEscape", "SELECT ^e.E 'x' FROM events e", kUnsupported, 3,
+                   "typed literals other than DATE"},
+        RejectCase{"QualifiedTypeNationalString", "SELECT ^e.N'x' FROM events e", kUnsupported, 3,
+                   "typed literals other than DATE"},
+        // A quoted E before a string is a name, not the start of an escape string.
+        RejectCase{"QualifiedQuotedTypeLetter", "SELECT ^e.\"E\"'x' FROM events e", kUnsupported, 5,
+                   "typed literals other than DATE"},
+        RejectCase{"QualifiedQuotedTypeLetterLimit", "SELECT a FROM events LIMIT ^e.\"E\"'5'",
+                   kUnsupported, 5, "LIMIT expressions are not supported"},
+        // So does an escape or a dollar-quoted string after a name, and any string after a quoted
+        // name; DATE and TIMESTAMP make literals before a plain string only.
+        RejectCase{"TypedEscapeString", "SELECT ^integer E'5' FROM events", kUnsupported, 7,
+                   "typed literals other than DATE"},
+        RejectCase{"DateEscapeString", "SELECT a FROM events WHERE d = ^DATE E'2020-01-01'",
+                   kUnsupported, 4,
+                   "typed literals other than DATE '...', TIMESTAMP '...' and prefixed strings "
+                   "(E'...') are not supported"},
+        RejectCase{"TypedDollarQuotedString", "SELECT ^integer $$5$$ FROM events", kUnsupported, 7,
+                   "typed literals other than DATE"},
+        RejectCase{"TimestampTaggedDollarQuotedString",
+                   "SELECT a FROM events WHERE ts < ^TIMESTAMP $t$2020-01-01$t$", kUnsupported, 9,
+                   "typed literals other than DATE"},
+        RejectCase{"TimeEscapeString", "SELECT ^TIME E'12:00' FROM events", kUnsupported, 4,
+                   "TIME literals are not supported"},
+        RejectCase{"QuotedTypedLiteral", R"(SELECT ^"integer" '5' FROM events)", kUnsupported, 9,
+                   "typed literals other than DATE"},
+        RejectCase{"QuotedTypedLiteralInWhere",
+                   R"(SELECT a FROM events WHERE d = ^"DATE" '2020-01-01')", kUnsupported, 6,
+                   "typed literals other than DATE"},
+        RejectCase{"QuotedTypedEscapeString", R"(SELECT a FROM events ORDER BY ^"integer" E'5')",
+                   kUnsupported, 9, "typed literals other than DATE"},
+        RejectCase{"QuotedTypedDollarQuotedString", R"(SELECT COUNT(^"integer" $$5$$) FROM events)",
+                   kUnsupported, 9, "typed literals other than DATE"},
         RejectCase{"CountWithoutArgument", "SELECT COUNT(^) FROM events", kUnsupported, 1,
                    "COUNT() without an argument is not supported (use COUNT(*))"},
         RejectCase{"TrailingComma", "SELECT a, b^, FROM events", kUnsupported, 1,
@@ -1554,6 +2103,38 @@ INSTANTIATE_TEST_SUITE_P(
                    "LIMIT expressions are not supported"},
         RejectCase{"ParameterLimit", "SELECT a FROM events LIMIT ^$1", kUnsupported, 2,
                    "LIMIT expressions are not supported"},
+        // A typed literal or a call, also of a quoted or a qualified name, is an expression too.
+        RejectCase{"TypedLiteralLimit", "SELECT a FROM events LIMIT ^integer '5'", kUnsupported, 7,
+                   "LIMIT expressions are not supported (LIMIT takes an integer)"},
+        RejectCase{"EscapeStringLimit", "SELECT a FROM events LIMIT ^E'5'", kUnsupported, 1,
+                   "LIMIT expressions are not supported"},
+        RejectCase{"TypedEscapeStringLimit", "SELECT a FROM events LIMIT ^integer E'5'",
+                   kUnsupported, 7, "LIMIT expressions are not supported"},
+        RejectCase{"QuotedTypedDollarQuotedLimit", R"(SELECT a FROM events LIMIT ^"integer" $$5$$)",
+                   kUnsupported, 9, "LIMIT expressions are not supported"},
+        RejectCase{"QualifiedTypedLiteralLimit", "SELECT a FROM events LIMIT ^main.integer '5'",
+                   kUnsupported, 12, "LIMIT expressions are not supported"},
+        RejectCase{"TypedLiteralOffset", "SELECT a FROM events OFFSET ^integer '0'", kUnsupported,
+                   7, "OFFSET expressions are not supported (OFFSET takes an integer)"},
+        RejectCase{"QuotedQualifiedTypedEscapeOffset",
+                   R"(SELECT a FROM events LIMIT 1 OFFSET ^"main"."integer" E'0')", kUnsupported,
+                   16, "OFFSET expressions are not supported (OFFSET takes an integer)"},
+        RejectCase{"QuotedFunctionLimit", R"(SELECT a FROM events LIMIT ^"abs"(5))", kUnsupported,
+                   5, "LIMIT expressions are not supported"},
+        RejectCase{"QualifiedFunctionLimit", "SELECT a FROM events LIMIT ^main.abs(5)",
+                   kUnsupported, 8, "LIMIT expressions are not supported"},
+        // Names of any number of parts, and a reserved word after a dot, as DuckDB takes them.
+        RejectCase{"ThreePartFunctionLimit", "SELECT a FROM events LIMIT ^system.main.abs(5)",
+                   kUnsupported, 15, "LIMIT expressions are not supported"},
+        RejectCase{"ThreePartTypedLiteralLimit",
+                   "SELECT a FROM events LIMIT ^system.main.integer '5'", kUnsupported, 19,
+                   "LIMIT expressions are not supported"},
+        RejectCase{"QualifiedReservedFunctionLimit",
+                   "SELECT a FROM events LIMIT ^main.left('5', 1)", kUnsupported, 9,
+                   "LIMIT expressions are not supported"},
+        RejectCase{"QualifiedReservedFunctionOffset",
+                   "SELECT a FROM events OFFSET ^main.left('8', 1)", kUnsupported, 9,
+                   "OFFSET expressions are not supported (OFFSET takes an integer)"},
         RejectCase{"UsingSample", "SELECT a FROM events ^USING SAMPLE 10%", kUnsupported, 5,
                    "USING SAMPLE is not supported"},
         RejectCase{"UsingSampleAfterWhere", "SELECT a FROM events WHERE a = 1 ^using sample 5",
@@ -1702,6 +2283,43 @@ INSTANTIATE_TEST_SUITE_P(
                    "unexpected keyword LIMIT; expected the end of the query"},
         RejectCase{"NegativeOffset", "SELECT a FROM events OFFSET ^-1", kSyntax, 1,
                    "OFFSET must not be negative"},
+        // Names before what is no string in DuckDB: E and a string with a space between them, and
+        // a parameter.
+        RejectCase{"TypeSpacedEscape", "SELECT integer E ^'5' FROM events", kSyntax, 3,
+                   "expected ',' or FROM, found string literal"},
+        RejectCase{"DateSpacedEscape", "SELECT a FROM events WHERE d = DATE ^E '2020-01-01'",
+                   kSyntax, 1, "unexpected identifier E"},
+        RejectCase{"QuotedTypeParameter", R"(SELECT "integer" ^$1 FROM events)", kSyntax, 2,
+                   "expected ',' or FROM, found parameter"},
+        // A column after LIMIT or OFFSET, which DuckDB parses and then refuses, and names there
+        // before what is no string in DuckDB.
+        RejectCase{"ColumnLimit", "SELECT a FROM events LIMIT ^a", kSyntax, 1,
+                   "expected a non-negative integer after LIMIT, found identifier a"},
+        RejectCase{"QualifiedColumnOffset", "SELECT a FROM events OFFSET ^e.a", kSyntax, 1,
+                   "expected a non-negative integer after OFFSET, found identifier e"},
+        RejectCase{"ThreePartColumnLimit", "SELECT a FROM events LIMIT ^a.b.c", kSyntax, 1,
+                   "expected a non-negative integer after LIMIT, found identifier a"},
+        // A call or a typed literal of a name of more than three parts, which DuckDB does not
+        // parse: it takes catalog.schema.name at most.
+        RejectCase{"FourPartFunctionLimit", "SELECT a FROM events LIMIT ^a.b.c.d(1)", kSyntax, 1,
+                   "expected a non-negative integer after LIMIT, found identifier a"},
+        RejectCase{"FourPartQuotedReservedFunctionOffset",
+                   R"(SELECT a FROM events OFFSET ^"a".b.c.left('5', 1))", kSyntax, 3,
+                   "expected a non-negative integer after OFFSET, found quoted identifier"},
+        RejectCase{"FourPartTypedLiteralOffset", "SELECT a FROM events OFFSET ^a.b.c.d '5'",
+                   kSyntax, 1, "expected a non-negative integer after OFFSET, found identifier a"},
+        RejectCase{"FourPartTypedEscapeLimit", "SELECT a FROM events LIMIT ^a.b.c.d E'5'", kSyntax,
+                   1, "expected a non-negative integer after LIMIT, found identifier a"},
+        RejectCase{"FivePartTypedDollarQuotedOffset",
+                   "SELECT a FROM events LIMIT 1 OFFSET ^a.b.c.d.e $$5$$", kSyntax, 1,
+                   "expected a non-negative integer after OFFSET, found identifier a"},
+        RejectCase{"QualifiedReservedColumnLimit", "SELECT a FROM events LIMIT ^main.left", kSyntax,
+                   4, "expected a non-negative integer after LIMIT, found identifier main"},
+        RejectCase{"QualifiedTypeSpacedEscapeLimit",
+                   "SELECT a FROM events LIMIT ^main.integer E '5'", kSyntax, 4,
+                   "expected a non-negative integer after LIMIT, found identifier main"},
+        RejectCase{"TypeParameterLimit", "SELECT a FROM events LIMIT ^integer $1", kSyntax, 7,
+                   "expected a non-negative integer after LIMIT, found identifier integer"},
         RejectCase{"OrderByAfterLimit", "SELECT a FROM events LIMIT 5 ^ORDER BY a", kSyntax, 5,
                    "unexpected keyword ORDER; expected OFFSET or the end of the query"},
         RejectCase{"UnterminatedString", "SELECT a FROM events WHERE a = ^'open", kSyntax, 5,
@@ -1757,7 +2375,185 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"CastParametersWithoutComma", "SELECT CAST(a AS DECIMAL(15 ^2)) FROM events",
                    kSyntax, 1, "expected , or ) after a type parameter, found integer literal 2"},
         RejectCase{"BareCast", "SELECT ^CAST FROM events", kSyntax, 4,
-                   "expected an expression or '*', found keyword CAST"}),
+                   "expected an expression or '*', found keyword CAST"},
+        // The FROM list: where DuckDB gives a syntax error, so does antb1.
+        RejectCase{"JoinWithoutOn", "SELECT a FROM events JOIN users^", kSyntax, 0,
+                   "expected ON after the JOIN at offset 21, found end of input"},
+        RejectCase{"JoinCommaBeforeOn", "SELECT a FROM events JOIN users^, items ON a = b", kSyntax,
+                   1, "expected ON after the JOIN at offset 21, found ','"},
+        RejectCase{"CrossJoinWithOn", "SELECT a FROM events CROSS JOIN users ^ON a = b", kSyntax, 2,
+                   "unexpected keyword ON; expected WHERE"},
+        RejectCase{"CommaWithOn", "SELECT a FROM events, users ^ON a = b", kSyntax, 2,
+                   "unexpected keyword ON"},
+        RejectCase{"OnWithoutJoin", "SELECT a FROM events ^ON a = b", kSyntax, 2,
+                   "unexpected keyword ON"},
+        RejectCase{"OnTwice", "SELECT a FROM events JOIN users ON a = b ^ON a = c", kSyntax, 2,
+                   "unexpected keyword ON"},
+        RejectCase{"EmptyOn", "SELECT a FROM events JOIN users ON^", kSyntax, 0,
+                   "expected an expression, found end of input"},
+        RejectCase{"OnWhere", "SELECT a FROM events JOIN users ON ^WHERE a = 1", kSyntax, 5,
+                   "expected an expression, found keyword WHERE"},
+        RejectCase{"AggregateInOn", "SELECT a FROM events JOIN users ON ^SUM(a) = 1", kSyntax, 3,
+                   "aggregate functions are not allowed in ON"},
+        RejectCase{"CrossWithoutJoin", "SELECT a FROM events CROSS ^users", kSyntax, 5,
+                   "expected JOIN after CROSS, found identifier users"},
+        RejectCase{"InnerWithoutJoin", "SELECT a FROM events INNER ^users ON a = b", kSyntax, 5,
+                   "expected JOIN after INNER, found identifier users"},
+        RejectCase{"InnerOuterJoin", "SELECT a FROM events INNER ^OUTER JOIN users ON a = b",
+                   kSyntax, 5, "expected JOIN after INNER, found keyword OUTER"},
+        RejectCase{"LeftWithoutJoin", "SELECT a FROM events LEFT ^users ON a = b", kSyntax, 5,
+                   "expected JOIN after LEFT, found identifier users"},
+        RejectCase{"LeftOuterWithoutJoin", "SELECT a FROM events LEFT OUTER ^users ON a = b",
+                   kSyntax, 5, "expected JOIN after LEFT OUTER, found identifier users"},
+        RejectCase{"RightWithoutJoin", "SELECT a FROM events RIGHT^", kSyntax, 0,
+                   "expected JOIN after RIGHT, found end of input"},
+        RejectCase{"NaturalCross", "SELECT a FROM events NATURAL ^CROSS JOIN users", kSyntax, 5,
+                   "expected JOIN after NATURAL, found keyword CROSS"},
+        RejectCase{"NaturalLeftWithoutJoin", "SELECT a FROM events NATURAL LEFT ^users", kSyntax, 5,
+                   "expected JOIN after NATURAL LEFT, found identifier users"},
+        RejectCase{"NaturalSemiWithoutJoin", "SELECT a FROM events NATURAL semi ^OUTER JOIN users",
+                   kSyntax, 5, "expected JOIN after NATURAL SEMI, found keyword OUTER"},
+        RejectCase{"AsofLeftWithoutJoin", "SELECT a FROM events ^ASOF LEFT users ON a >= b",
+                   kSyntax, 4, "a table alias cannot be the keyword ASOF"},
+        RejectCase{"AsofInnerAfterOnWithoutJoin",
+                   "SELECT a FROM events JOIN users ON a = b ^asof INNER items ON a >= c", kSyntax,
+                   4, "unexpected identifier asof"},
+        // Before the ON of a JOIN: a join keyword without the rest of its join is no nested join.
+        RejectCase{"NestedLeftWithoutJoin", "SELECT a FROM events JOIN users LEFT ^x ON a = b",
+                   kSyntax, 1, "expected JOIN after LEFT, found identifier x"},
+        RejectCase{"NestedRightAtEnd", "SELECT a FROM events JOIN users RIGHT^", kSyntax, 0,
+                   "expected JOIN after RIGHT, found end of input"},
+        RejectCase{"NestedFullOuterWithoutJoin",
+                   "SELECT a FROM events JOIN users FULL OUTER ^ON a = b", kSyntax, 2,
+                   "expected JOIN after FULL OUTER, found keyword ON"},
+        RejectCase{"NestedCrossWithoutJoin",
+                   "SELECT a FROM events JOIN users CROSS ^items ON a = b", kSyntax, 5,
+                   "expected JOIN after CROSS, found identifier items"},
+        RejectCase{"NestedNaturalWithoutJoin",
+                   "SELECT a FROM events JOIN users NATURAL LEFT ^items ON a = b", kSyntax, 5,
+                   "expected JOIN after NATURAL LEFT, found identifier items"},
+        RejectCase{"OuterJoinAlone", "SELECT a FROM events ^OUTER JOIN users ON a = b", kSyntax, 5,
+                   "expected LEFT, RIGHT or FULL before OUTER"},
+        RejectCase{"JoinBeforeFrom", "SELECT 1 ^JOIN users ON a = b", kSyntax, 4,
+                   "expected ',' or FROM, found keyword JOIN"},
+        RejectCase{"JoinAfterWhere", "SELECT a FROM events WHERE a = 1 ^JOIN users ON a = b",
+                   kSyntax, 4,
+                   "unexpected keyword JOIN; expected AND, GROUP BY, HAVING, ORDER BY, LIMIT, "
+                   "OFFSET or the end of the query"},
+        // A join keyword after a list comma is no clause, so the comma is no trailing comma.
+        RejectCase{"JoinAfterSelectComma", "SELECT a, ^JOIN FROM events", kSyntax, 4,
+                   "expected an expression or '*', found keyword JOIN"},
+        RejectCase{"LeftAfterGroupByComma", "SELECT a FROM events GROUP BY a, ^LEFT", kSyntax, 4,
+                   "expected an expression, found keyword LEFT"},
+        RejectCase{"TwoAliases", "SELECT a FROM events e ^f", kSyntax, 1,
+                   "unexpected identifier f"},
+        RejectCase{"AliasAfterAlias", "SELECT a FROM events e ^AS f", kSyntax, 2,
+                   "unexpected keyword AS"},
+        RejectCase{"AsWithoutAlias", "SELECT a FROM events AS^", kSyntax, 0,
+                   "expected a table alias after AS, found end of input"},
+        RejectCase{"ParameterAlias", "SELECT a FROM events AS ^$1", kSyntax, 2,
+                   "expected a table alias after AS, found parameter"},
+        RejectCase{"NamedParameterAlias", "SELECT a FROM events AS ^$x", kSyntax, 2,
+                   "expected a table alias after AS, found parameter"},
+        RejectCase{"NumberTagIsNoDollarQuote", "SELECT a FROM events AS ^$1$x$1$", kSyntax, 2,
+                   "expected a table alias after AS, found parameter"},
+        RejectCase{"EscapeStringAfterSpace", "SELECT a FROM events AS E ^'x'", kSyntax, 3,
+                   "unexpected string literal"},
+        RejectCase{"BitStringAlias", "SELECT a FROM events AS B^'1'", kSyntax, 3,
+                   "unexpected string literal"},
+        RejectCase{"ImplicitDollarQuotedAlias", "SELECT a FROM events ^$$x$$", kSyntax, 1,
+                   "unexpected parameter"},
+        RejectCase{"ReservedAliasAfterAs", "SELECT a FROM events AS ^select", kSyntax, 6,
+                   "expected a table alias after AS, found keyword SELECT"},
+        RejectCase{"NotAnAliasAfterAs", "SELECT a FROM events AS ^semi", kSyntax, 4,
+                   "a table alias cannot be the keyword SEMI; write it as a quoted identifier"},
+        RejectCase{"NotAnAliasImplicit", "SELECT a FROM events ^verbose", kSyntax, 7,
+                   "a table alias cannot be the keyword VERBOSE"},
+        RejectCase{"SemiWithoutJoin", "SELECT a FROM events ^semi users", kSyntax, 4,
+                   "a table alias cannot be the keyword SEMI"},
+        RejectCase{"TableSampleWithoutSample", "SELECT a FROM events ^TABLESAMPLE WHERE a = 1",
+                   kSyntax, 11, "a table alias cannot be the keyword TABLESAMPLE"},
+        RejectCase{"TableSampleNameWithoutParentheses",
+                   "SELECT a FROM events ^TABLESAMPLE reservoir WHERE a = 1", kSyntax, 11,
+                   "a table alias cannot be the keyword TABLESAMPLE"},
+        RejectCase{"SemiAfterAlias", "SELECT a FROM events e ^semi", kSyntax, 4,
+                   "unexpected identifier semi"},
+        RejectCase{"TimeTravelAfterOn",
+                   "SELECT a FROM events JOIN users ON a = b ^AT (VERSION => 1)", kSyntax, 2,
+                   "unexpected identifier AT"},
+        RejectCase{"TableSampleAfterOn",
+                   "SELECT a FROM events JOIN users ON a = b ^TABLESAMPLE 10%", kSyntax, 11,
+                   "unexpected identifier TABLESAMPLE"},
+        RejectCase{"StringImplicitAlias", "SELECT a FROM events ^'w'", kSyntax, 3,
+                   "unexpected string literal"},
+        RejectCase{"DoubleComma", "SELECT a FROM events, ^, users", kSyntax, 1,
+                   "expected a table name or a quoted file path, found ','"},
+        RejectCase{"CommaBeforeFrom", "SELECT 1 FROM events, ^FROM users", kSyntax, 4,
+                   "expected a table name or a quoted file path, found keyword FROM"},
+        RejectCase{"CommaBeforeInto", "SELECT 1 FROM events, ^into x", kSyntax, 4,
+                   "expected a table name or a quoted file path, found keyword INTO"},
+        RejectCase{"PathQualified", "SELECT a FROM 'x.parquet'^.y", kSyntax, 1, "unexpected '.'"},
+        RejectCase{"TableInParentheses", "SELECT a FROM (events^)", kSyntax, 1,
+                   "expected a join after the table in parentheses, found ')'"},
+        RejectCase{"CommaInParentheses", "SELECT a FROM ('e.parquet'^, users)", kSyntax, 1,
+                   "expected a join after the table in parentheses, found ','"},
+        RejectCase{"UnclosedParentheses", "SELECT a FROM (events^", kSyntax, 0,
+                   "expected a join after the table in parentheses, found end of input"},
+        RejectCase{"SemicolonInParentheses", "SELECT a FROM (events^;", kSyntax, 1,
+                   "expected a join after the table in parentheses, found ';'"},
+        RejectCase{"EmptyParentheses", "SELECT a FROM (^)", kSyntax, 1,
+                   "expected a table name, a quoted file path or a subquery after '(', found ')'"},
+        RejectCase{"LateralWithoutParentheses", "SELECT a FROM events, ^LATERAL users", kSyntax, 7,
+                   "expected a table name or a quoted file path, found keyword LATERAL"},
+        RejectCase{"LateralAloneInParentheses", "SELECT a FROM (^LATERAL)", kSyntax, 7,
+                   "expected a table name, a quoted file path or a subquery after '(', found "
+                   "keyword LATERAL"},
+        RejectCase{"LateralPathInParentheses",
+                   "SELECT a FROM (^LATERAL 'e.parquet' CROSS JOIN users)", kSyntax, 7,
+                   "expected a table name, a quoted file path or a subquery after '(', found "
+                   "keyword LATERAL"},
+        // A reserved word that DuckDB takes as a function name is no table name.
+        RejectCase{"LeftAfterCommaWithoutCall", "SELECT a FROM events, ^LEFT users", kSyntax, 4,
+                   "expected a table name or a quoted file path, found keyword LEFT"},
+        RejectCase{"LeftInParenthesesWithoutCall", "SELECT a FROM (^left users)", kSyntax, 4,
+                   "expected a table name, a quoted file path or a subquery after '(', found "
+                   "keyword LEFT"},
+        RejectCase{"BetweenCallAfterComma", "SELECT a FROM events, ^between(1)", kSyntax, 7,
+                   "expected a table name or a quoted file path, found keyword BETWEEN"},
+        // Before no dot BETWEEN, EXISTS, INTERVAL and OVER are no table names (DuckDB's are:
+        // divergence D21), and BETWEEN, EXISTS and INTERVAL call no LATERAL function, as in DuckDB.
+        RejectCase{"OverAsTableName", "SELECT a FROM ^over", kSyntax, 4,
+                   "expected a table name or a quoted file path, found keyword OVER"},
+        RejectCase{"ExistsAsTableNameInParentheses", "SELECT a FROM (^exists CROSS JOIN events)",
+                   kSyntax, 6,
+                   "expected a table name, a quoted file path or a subquery after '(', found "
+                   "keyword EXISTS"},
+        RejectCase{"LateralBetweenCall", "SELECT a FROM events, ^LATERAL between(1)", kSyntax, 7,
+                   "expected a table name or a quoted file path, found keyword LATERAL"},
+        // After a qualified name, what DuckDB lexes as no string constant.
+        RejectCase{"QualifiedNameBeforeBitString", "SELECT main.integer B^'1' FROM events", kSyntax,
+                   3, "expected ',' or FROM, found string literal"},
+        RejectCase{"QualifiedNameBeforeSpacedEscapeString",
+                   "SELECT main.integer E ^'5' FROM events", kSyntax, 3,
+                   "expected ',' or FROM, found string literal"},
+        // DuckDB lexes B'1', E'x' and X'1F' as one string constant each, which is no name after a
+        // dot.
+        RejectCase{"EscapeStringAfterDot", "SELECT e.^E'x' FROM events e", kSyntax, 4,
+                   "expected a column name after '.', found string literal"},
+        RejectCase{"BitStringAfterDot", "SELECT e.^B'1' FROM events e", kSyntax, 4,
+                   "expected a column name after '.', found string literal"},
+        RejectCase{"HexStringAfterDot", "SELECT e.^X'1F' FROM events e", kSyntax, 5,
+                   "expected a column name after '.', found string literal"},
+        RejectCase{"EscapeStringAfterDotInWhere", "SELECT a FROM events e WHERE a = e.^E'5'",
+                   kSyntax, 4, "expected a column name after '.', found string literal"},
+        RejectCase{"EscapeStringAfterDotLimit", "SELECT a FROM events LIMIT main.^E'5'", kSyntax, 4,
+                   "expected a name after '.', found string literal"},
+        RejectCase{"EscapeStringAfterDotOffset", "SELECT a FROM events OFFSET e.^e'0'", kSyntax, 4,
+                   "expected a name after '.', found string literal"},
+        RejectCase{"DotThenOperator", "SELECT e.^+ FROM events", kSyntax, 1,
+                   "expected a column name after '.', found '+'"},
+        RejectCase{"DotAtEnd", "SELECT e.^", kSyntax, 0,
+                   "expected a column name after '.', found end of input"}),
     CaseName);
 
 TEST(ParserTest, ExactMessages) {
@@ -1774,18 +2570,34 @@ TEST(ParserTest, ExactMessages) {
   EXPECT_EQ(alias.error().message,
             "an alias cannot be the reserved word FROM; write it as a quoted identifier; see "
             "docs/sql-subset.md");
+  auto semi = Parse("SELECT a FROM t semi JOIN u ON t.a = u.a");
+  ASSERT_FALSE(semi.has_value());
+  EXPECT_EQ(semi.error().message, "SEMI JOIN is not supported; see docs/sql-subset.md");
+  auto keyword = Parse("SELECT a FROM t AS only");
+  ASSERT_FALSE(keyword.has_value());
+  EXPECT_EQ(keyword.error().message,
+            "a table alias cannot be the keyword ONLY; write it as a quoted identifier");
+  auto qualifier = Parse("SELECT interval.a FROM t interval");
+  ASSERT_FALSE(qualifier.has_value());
+  EXPECT_EQ(qualifier.error().message,
+            "the reserved word INTERVAL as a qualifier is not supported; write it as a quoted "
+            "identifier; see docs/sql-subset.md");
 }
 
+// antb1's reserved words (as a name they must be quoted).
+constexpr auto kReserved = std::to_array<std::string_view>(
+    {"ALL",   "AND",       "ANY",      "ARRAY",  "AS",       "ASC",   "BETWEEN", "BY",     "CASE",
+     "CAST",  "COLLATE",   "CROSS",    "DESC",   "DISTINCT", "ELSE",  "END",     "EXCEPT", "EXISTS",
+     "FALSE", "FETCH",     "FOR",      "FROM",   "FULL",     "GROUP", "HAVING",  "ILIKE",  "IN",
+     "INNER", "INTERSECT", "INTERVAL", "INTO",   "IS",       "JOIN",  "LATERAL", "LEFT",   "LIKE",
+     "LIMIT", "NATURAL",   "NOT",      "NULL",   "OFFSET",   "ON",    "OR",      "ORDER",  "OUTER",
+     "OVER",  "QUALIFY",   "RIGHT",    "SELECT", "SIMILAR",  "SOME",  "TABLE",   "THEN",   "TRUE",
+     "UNION", "USING",     "WHEN",     "WHERE",  "WINDOW",   "WITH"});
+
 TEST(ParserTest, EveryReservedWordIsRejectedAsAnAlias) {
-  for (const std::string_view word :
-       {"ALL",    "AND",     "ANY",     "ARRAY", "AS",        "ASC",      "BETWEEN", "BY",
-        "CASE",   "CAST",    "COLLATE", "CROSS", "DESC",      "DISTINCT", "ELSE",    "END",
-        "EXCEPT", "EXISTS",  "FALSE",   "FETCH", "FOR",       "FROM",     "FULL",    "GROUP",
-        "HAVING", "ILIKE",   "IN",      "INNER", "INTERSECT", "INTERVAL", "INTO",    "IS",
-        "JOIN",   "LATERAL", "LEFT",    "LIKE",  "LIMIT",     "NATURAL",  "NOT",     "NULL",
-        "OFFSET", "ON",      "OR",      "ORDER", "OUTER",     "OVER",     "QUALIFY", "RIGHT",
-        "SELECT", "SIMILAR", "SOME",    "TABLE", "THEN",      "TRUE",     "UNION",   "USING",
-        "WHEN",   "WHERE",   "WINDOW",  "WITH"}) {
+  ASSERT_EQ(kReserved.size(), 60U);
+  for (const std::string_view word : kReserved) {
+    EXPECT_TRUE(IsReservedWord(word)) << word;
     const std::string sql = "SELECT a AS " + std::string(word) + " FROM t";
     auto result = Parse(sql);
     ASSERT_FALSE(result.has_value()) << sql;
@@ -1794,6 +2606,262 @@ TEST(ParserTest, EveryReservedWordIsRejectedAsAnAlias) {
     EXPECT_EQ(result.error().span.offset, 12U) << sql;
     // Quoting makes every reserved word a valid name.
     EXPECT_TRUE(Parse(R"(SELECT a AS ")" + std::string(word) + R"(" FROM t)").has_value()) << word;
+  }
+}
+
+// A table alias after AS: DuckDB refuses every reserved word but BETWEEN, EXISTS, INTERVAL and
+// OVER (which it also takes without AS), so a syntax error; quoted, every word is an alias.
+TEST(ParserTest, EveryReservedWordAfterAsInFrom) {
+  const std::string prefix = "SELECT a FROM t AS ";
+  for (const std::string_view word : kReserved) {
+    const bool accepted =
+        word == "BETWEEN" || word == "EXISTS" || word == "INTERVAL" || word == "OVER";
+    auto result = Parse(prefix + std::string(word));
+    if (accepted) {
+      ASSERT_TRUE(result.has_value()) << word << ": " << result.error().message;
+      EXPECT_EQ(result->from.at(0).alias, std::optional<std::string>(word));
+      auto implicit = Parse("SELECT a FROM t " + std::string(word) + " WHERE a = 1");
+      ASSERT_TRUE(implicit.has_value()) << word << ": " << implicit.error().message;
+      EXPECT_EQ(implicit->from.at(0).alias, std::optional<std::string>(word));
+    } else {
+      ASSERT_FALSE(result.has_value()) << word;
+      EXPECT_EQ(result.error().kind, ParseError::Kind::kSyntax) << word;
+      EXPECT_EQ(result.error().span.offset, prefix.size()) << word;
+    }
+    auto quoted = Parse(prefix + "\"" + std::string(word) + "\"");
+    ASSERT_TRUE(quoted.has_value()) << word;
+    EXPECT_EQ(quoted->from.at(0).alias, std::optional<std::string>(word));
+  }
+}
+
+// The reserved words that DuckDB 1.5.5 takes as function names (probed on DuckDB).
+constexpr auto kFunctionWords =
+    std::to_array<std::string_view>({"CROSS", "FULL", "ILIKE", "INNER", "IS", "JOIN", "LEFT",
+                                     "LIKE", "NATURAL", "OUTER", "OVER", "RIGHT", "SIMILAR"});
+
+// Where a FROM item starts, the reserved words of kFunctionWords call table functions before '(',
+// unsupported; no other reserved word does. After LATERAL such a call is a LATERAL item, and first
+// in parentheses it starts a join.
+TEST(ParserTest, ReservedWordsThatNameTableFunctions) {
+  for (const std::string_view word : kReserved) {
+    const bool function = std::ranges::find(kFunctionWords, word) != kFunctionWords.end();
+    for (const std::string_view before :
+         {"SELECT a FROM "sv, "SELECT a FROM t, "sv, "SELECT a FROM t JOIN "sv,
+          "SELECT a FROM t CROSS JOIN "sv}) {
+      const std::string sql = std::string(before) + std::string(word) + "(1)";
+      auto result = Parse(sql);
+      ASSERT_FALSE(result.has_value()) << sql;
+      const ParseError& error = result.error();
+      EXPECT_EQ(error.message.starts_with("table functions are not supported"), function)
+          << sql << ": " << error.message;
+      if (function) {
+        EXPECT_EQ(error.kind, ParseError::Kind::kUnsupported) << sql;
+        EXPECT_EQ(error.span.offset, before.size()) << sql;
+        EXPECT_EQ(error.span.length, word.size()) << sql;
+      }
+    }
+    if (!function) {
+      continue;
+    }
+    auto lateral = Parse("SELECT a FROM t, LATERAL " + std::string(word) + "(1)");
+    ASSERT_FALSE(lateral.has_value()) << word;
+    EXPECT_TRUE(lateral.error().message.starts_with("LATERAL is not supported"))
+        << word << ": " << lateral.error().message;
+    auto parenthesized = Parse("SELECT a FROM (" + std::string(word) + "(1) f CROSS JOIN t)");
+    ASSERT_FALSE(parenthesized.has_value()) << word;
+    EXPECT_TRUE(
+        parenthesized.error().message.starts_with("parenthesized joins in FROM are not supported"))
+        << word << ": " << parenthesized.error().message;
+  }
+}
+
+// Where a FROM item starts, DuckDB 1.5.5 takes BETWEEN, EXISTS, INTERVAL and OVER, and no other
+// reserved word, for a qualifier before a dot (probed on DuckDB): of a table (FROM t, over.x), of a
+// table function (FROM over.f(1)) and after LATERAL. As qualifiers they are unsupported, as in
+// expressions (divergence D21), and first in parentheses such a name starts a join. LATERAL first
+// in parentheses starts one before a word of kFunctionWords too: three tokens do not show the dot.
+TEST(ParserTest, ReservedWordsThatQualifyNamesInFrom) {
+  constexpr std::string_view kParenthesizedJoin = "parenthesized joins in FROM are not supported";
+  for (const std::string_view word : kReserved) {
+    const bool qualifier =
+        word == "BETWEEN" || word == "EXISTS" || word == "INTERVAL" || word == "OVER";
+    const bool function = std::ranges::find(kFunctionWords, word) != kFunctionWords.end();
+    const std::string message =
+        "the reserved word " + std::string(word) + " as a qualifier is not supported";
+    for (const std::string_view before :
+         {"SELECT a FROM "sv, "SELECT a FROM t, "sv, "SELECT a FROM t JOIN "sv,
+          "SELECT a FROM t CROSS JOIN "sv}) {
+      for (const std::string_view after : {".x"sv, ".f(1)"sv}) {
+        const std::string sql = std::string(before) + std::string(word) + std::string(after);
+        auto result = Parse(sql);
+        ASSERT_FALSE(result.has_value()) << sql;
+        const ParseError& error = result.error();
+        EXPECT_EQ(error.message.starts_with(message), qualifier) << sql << ": " << error.message;
+        if (qualifier) {
+          EXPECT_EQ(error.kind, ParseError::Kind::kUnsupported) << sql;
+          EXPECT_EQ(error.span.offset, before.size()) << sql;
+          EXPECT_EQ(error.span.length, word.size()) << sql;
+        }
+      }
+    }
+    auto lateral = Parse("SELECT a FROM t, LATERAL " + std::string(word) + ".f(1)");
+    ASSERT_FALSE(lateral.has_value()) << word;
+    EXPECT_EQ(lateral.error().message.starts_with("LATERAL is not supported"), qualifier)
+        << word << ": " << lateral.error().message;
+    auto parenthesized = Parse("SELECT a FROM (" + std::string(word) + ".x CROSS JOIN t)");
+    ASSERT_FALSE(parenthesized.has_value()) << word;
+    EXPECT_EQ(parenthesized.error().message.starts_with(kParenthesizedJoin), qualifier)
+        << word << ": " << parenthesized.error().message;
+    auto parenthesized_lateral =
+        Parse("SELECT a FROM (LATERAL " + std::string(word) + ".f(1) CROSS JOIN t)");
+    ASSERT_FALSE(parenthesized_lateral.has_value()) << word;
+    EXPECT_EQ(parenthesized_lateral.error().message.starts_with(kParenthesizedJoin),
+              qualifier || function)
+        << word << ": " << parenthesized_lateral.error().message;
+  }
+}
+
+// The words that DuckDB 1.5.5 refuses as table aliases and antb1 does not reserve (an independent
+// copy of the parser's table), with what follows each where DuckDB gives it a meaning (probed on
+// DuckDB): after a FROM item, and after an ON condition.
+struct NotAnAliasCase {
+  std::string_view word;
+  std::array<std::string_view, 2> after_item;  // continuations with a meaning ("" none)
+  bool means_after_on = false;
+  std::string_view after_on;  // the continuation with a meaning after an ON condition
+};
+
+constexpr auto kNotAnAliasCases = std::to_array<NotAnAliasCase>({
+    {.word = "analyse"},
+    {.word = "ANALYZE"},
+    {.word = "anti",
+     .after_item = {"JOIN u ON t.a = u.a"},
+     .means_after_on = true,
+     .after_on = "JOIN v ON t.a = v.a"},
+    {.word = "ASOF",
+     .after_item = {"JOIN u ON t.a >= u.a", "SEMI JOIN u ON t.a >= u.a"},
+     .means_after_on = true,
+     .after_on = "LEFT OUTER JOIN v ON t.a >= v.a"},
+    {.word = "asymmetric"},
+    {.word = "at",
+     .after_item = {"(VERSION => 1)"},
+     .means_after_on = true,
+     .after_on = "TIME ZONE 'UTC'"},
+    {.word = "AUTHORIZATION"},
+    {.word = "binary"},
+    {.word = "both"},
+    {.word = "CHECK"},
+    {.word = "collation"},
+    {.word = "column"},
+    {.word = "concurrently"},
+    {.word = "constraint"},
+    {.word = "create"},
+    {.word = "default"},
+    {.word = "deferrable"},
+    {.word = "describe"},
+    {.word = "do"},
+    {.word = "foreign"},
+    {.word = "freeze"},
+    {.word = "GLOB", .means_after_on = true, .after_on = "'x*'"},
+    {.word = "initially"},
+    {.word = "isnull", .means_after_on = true},
+    {.word = "lambda"},
+    {.word = "leading"},
+    {.word = "NOTNULL", .means_after_on = true},
+    {.word = "only"},
+    {.word = "overlaps"},
+    {.word = "pivot",
+     .after_item = {"(SUM(a) FOR b IN (1, 2))"},
+     .means_after_on = true,
+     .after_on = "(SUM(a) FOR b IN (1))"},
+    {.word = "pivot_longer"},
+    {.word = "pivot_wider"},
+    {.word = "placing"},
+    {.word = "POSITIONAL", .after_item = {"JOIN u"}, .means_after_on = true, .after_on = "JOIN v"},
+    {.word = "primary"},
+    {.word = "references"},
+    {.word = "returning"},
+    {.word = "semi",
+     .after_item = {"JOIN u ON t.a = u.a"},
+     .means_after_on = true,
+     .after_on = "JOIN v ON t.a = v.a"},
+    {.word = "show"},
+    {.word = "summarize"},
+    {.word = "symmetric"},
+    {.word = "TABLESAMPLE", .after_item = {"10%", "reservoir(10)"}},
+    {.word = "to"},
+    {.word = "trailing"},
+    {.word = "unique"},
+    {.word = "unpack"},
+    {.word = "UNPIVOT",
+     .after_item = {"(v FOR k IN (a, b))", "INCLUDE NULLS (v FOR k IN (a, b))"},
+     .means_after_on = true,
+     .after_on = "(v FOR k IN (a, b))"},
+    {.word = "variadic"},
+    {.word = "verbose"},
+});
+
+// The kind and offset of the error that `sql` gives (kSyntax at 0 when it parses).
+std::pair<ParseError::Kind, std::size_t> ErrorOf(const std::string& sql) {
+  auto result = Parse(sql);
+  EXPECT_FALSE(result.has_value()) << sql;
+  return result ? std::pair{ParseError::Kind::kSyntax, std::size_t{0}}
+                : std::pair{result.error().kind, result.error().span.offset};
+}
+
+TEST(ParserTest, WordsThatCannotBeImplicitAliases) {
+  ASSERT_EQ(kNotAnAliasCases.size(), 49U);
+  const auto unsupported_at = [](std::size_t offset) {
+    return std::pair{ParseError::Kind::kUnsupported, offset};
+  };
+  const auto syntax_at = [](std::size_t offset) {
+    return std::pair{ParseError::Kind::kSyntax, offset};
+  };
+  for (const NotAnAliasCase& c : kNotAnAliasCases) {
+    const std::string w(c.word);
+    SCOPED_TRACE(w);
+    // After a table, a path or an alias: never an alias.
+    EXPECT_EQ(ErrorOf("SELECT a FROM t " + w), syntax_at(16));
+    EXPECT_EQ(ErrorOf("SELECT a FROM 'p.parquet' " + w + " WHERE a = 1"), syntax_at(26));
+    EXPECT_EQ(ErrorOf("SELECT a FROM t, u " + w + " ORDER BY a"), syntax_at(19));
+    EXPECT_EQ(ErrorOf("SELECT a FROM t JOIN u " + w + " ON t.a = u.a"), syntax_at(23));
+    EXPECT_EQ(ErrorOf("SELECT a FROM t AS " + w), syntax_at(19));
+    EXPECT_EQ(ErrorOf("SELECT a FROM t AS a " + w), syntax_at(21));
+    // Where DuckDB gives the word a meaning: kUnsupported.
+    for (const std::string_view continuation : c.after_item) {
+      if (continuation.empty()) {
+        continue;
+      }
+      const std::string after = " " + w + " " + std::string(continuation);
+      EXPECT_EQ(ErrorOf("SELECT a FROM t" + after), unsupported_at(16)) << continuation;
+      EXPECT_EQ(ErrorOf("SELECT a FROM 'p.parquet'" + after), unsupported_at(26)) << continuation;
+      EXPECT_EQ(ErrorOf("SELECT a FROM t AS a" + after), unsupported_at(21)) << continuation;
+      EXPECT_EQ(ErrorOf("SELECT a FROM t \"a b\"" + after), unsupported_at(22)) << continuation;
+    }
+    // After an ON condition: the meanings DuckDB has there, else a syntax error.
+    const std::string on = "SELECT a FROM t JOIN u ON t.a = u.a ";
+    const std::string after_on =
+        c.means_after_on ? std::string(c.after_on) : std::string(c.after_item.front());
+    EXPECT_EQ(ErrorOf(on + w + (after_on.empty() ? "" : " " + after_on)),
+              c.means_after_on ? unsupported_at(on.size()) : syntax_at(on.size()))
+        << after_on;
+    // Quoted, it is an alias like any name.
+    for (const std::string& quoted :
+         {"SELECT a FROM t \"" + w + "\"", "SELECT a FROM t AS \"" + w + "\""}) {
+      auto stmt = Parse(quoted);
+      ASSERT_TRUE(stmt.has_value()) << quoted << ": " << stmt.error().message;
+      EXPECT_EQ(stmt->from.at(0).alias, std::optional<std::string>(w));
+    }
+    // Anywhere else an unquoted name (divergence D21): a column, a qualifier, a table, a function
+    // and a select alias after AS.
+    const std::string names =
+        std::format("SELECT {0}, {0}.{0}, {0}(a), a AS {0} FROM {0} WHERE {0} = 1", w);
+    auto stmt = Parse(names);
+    ASSERT_TRUE(stmt.has_value()) << names << ": " << stmt.error().message;
+    EXPECT_EQ(stmt->from.at(0).table.name, w);
+    EXPECT_FALSE(stmt->from.at(0).alias.has_value());
+    EXPECT_EQ(std::get<ColumnRef>(stmt->items.at(1).expr).qualifier, w);
+    EXPECT_FALSE(IsReservedWord(w));
   }
 }
 
@@ -1813,15 +2881,16 @@ TEST(ParserRobustnessTest, MegabyteOfParentheses) {
   for (const std::string& prefix :
        {std::string(), std::string("SELECT "), std::string("SELECT a FROM t WHERE "),
         std::string("SELECT a FROM t WHERE a = "), std::string("SELECT SUM("),
-        std::string("SELECT COUNT(*) FROM "), std::string("SELECT a FROM t LIMIT ")}) {
+        std::string("SELECT COUNT(*) FROM "), std::string("SELECT a FROM t LIMIT "),
+        std::string("SELECT a FROM t JOIN u ON "), std::string("SELECT a FROM t, u CROSS JOIN ")}) {
     const std::string sql = prefix + parens;
     auto result = Parse(sql);
     ASSERT_FALSE(result.has_value()) << prefix;
     EXPECT_EQ(result.error().kind, ParseError::Kind::kUnsupported) << prefix;
-    // In an expression the parentheses nest up to the depth limit; a query, FROM and LIMIT take
-    // none.
-    const bool expression =
-        !prefix.empty() && !prefix.ends_with("FROM ") && !prefix.ends_with("LIMIT ");
+    // In an expression (ON too) the parentheses nest up to the depth limit; a query, a FROM item
+    // and LIMIT take none.
+    const bool expression = !prefix.empty() && !prefix.ends_with("FROM ") &&
+                            !prefix.ends_with("JOIN ") && !prefix.ends_with("LIMIT ");
     const SourceSpan span = result.error().span;
     EXPECT_EQ(span.length, 1U) << prefix;
     if (expression) {
@@ -1865,10 +2934,10 @@ TEST(ParserRobustnessTest, MegabyteInputs) {
   const std::string long_name(kSize, 'n');
   auto name = Parse("SELECT " + long_name + " FROM " + long_name);
   ASSERT_TRUE(name.has_value());
-  EXPECT_EQ(name->from.name.size(), kSize);
+  EXPECT_EQ(name->from.at(0).table.name.size(), kSize);
   auto path = Parse("SELECT * FROM '" + std::string(kSize, 'p') + "'");
   ASSERT_TRUE(path.has_value());
-  EXPECT_EQ(path->from.name.size(), kSize);
+  EXPECT_EQ(path->from.at(0).table.name.size(), kSize);
 
   std::string items = "SELECT a0";
   std::string predicate = " WHERE a = 1";
@@ -1880,6 +2949,42 @@ TEST(ParserRobustnessTest, MegabyteInputs) {
   ASSERT_TRUE(wide.has_value()) << wide.error().message;
   EXPECT_EQ(wide->items.size(), 5000U);
   EXPECT_EQ(wide->where.size(), 5000U);
+}
+
+// A FROM list is walked in loops everywhere (parse, copy, compare, print, Depth, destruction), so
+// long lists and join chains cost no stack. No timing is asserted.
+TEST(ParserRobustnessTest, LongFromListsAndJoinChains) {
+  std::string commas = "SELECT a FROM t0";
+  for (int i = 1; i < 50000; ++i) {
+    commas += ", t" + std::to_string(i);
+  }
+  std::string joins = "SELECT a FROM t";
+  for (int i = 0; i < 20000; ++i) {
+    joins += i % 2 == 0 ? " JOIN t ON a = b" : " LEFT JOIN u x ON x.a = b AND c";
+  }
+  for (const std::string& sql : {commas, joins}) {
+    auto stmt = Parse(sql);
+    ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
+    SelectStatement copy = *stmt;
+    copy.from.back().span = {};
+    EXPECT_TRUE(EqualIgnoringSpans(*stmt, copy));
+    copy.from.back().table.name += '_';
+    EXPECT_FALSE(EqualIgnoringSpans(*stmt, copy));
+    EXPECT_LE(Depth(*stmt), 3U);
+    const std::string canonical = ToSql(*stmt);
+    auto again = Parse(canonical);
+    ASSERT_TRUE(again.has_value()) << again.error().message;
+    EXPECT_TRUE(EqualIgnoringSpans(*stmt, *again));
+    EXPECT_EQ(ToSql(*again), canonical);
+  }
+  auto counted = Parse(commas);
+  ASSERT_TRUE(counted.has_value());
+  EXPECT_EQ(counted->from.size(), 50000U);
+  EXPECT_EQ(counted->from.back().table.name, "t49999");
+  auto chain = Parse(joins);
+  ASSERT_TRUE(chain.has_value());
+  EXPECT_EQ(chain->from.size(), 20001U);
+  EXPECT_EQ(chain->from.back().on.size(), 2U);
 }
 
 TEST(ParserRobustnessTest, EmbeddedNulAndInvalidUtf8) {
@@ -1894,7 +2999,7 @@ TEST(ParserRobustnessTest, EmbeddedNulAndInvalidUtf8) {
   const ColumnRef* column = ColumnOf(ident_ok->items[0]);
   ASSERT_NE(column, nullptr);
   EXPECT_EQ(column->name, "\xff\xfe\0"sv);
-  EXPECT_EQ(ident_ok->from.name, "\xc3\x28.parquet");
+  EXPECT_EQ(ident_ok->from.at(0).table.name, "\xc3\x28.parquet");
 
   auto nul = Parse("SELECT a\0 FROM t"sv);
   ASSERT_FALSE(nul.has_value());

@@ -16,6 +16,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -79,6 +80,7 @@ struct Counts {
   std::size_t strings = 0;
   std::size_t numbers = 0;
   std::size_t casts = 0;  // CAST( / TRY_CAST( or '::'
+  std::size_t dots = 0;   // '.' of a qualified name
 };
 
 std::size_t Separators(std::size_t n) { return n == 0 ? 0U : n - 1; }
@@ -94,7 +96,7 @@ void CountAll(const std::vector<Expr>& exprs, Counts& c) {
 
 struct CountOf {
   Counts& c;
-  void operator()(const ColumnRef& /*column*/) const {}
+  void operator()(const ColumnRef& column) const { c.dots += column.qualifier.empty() ? 0U : 1U; }
   void operator()(const Literal& lit) const {
     c.minuses += lit.negative ? 1U : 0U;
     const bool numeric = lit.kind == Literal::Kind::kInteger || lit.kind == Literal::Kind::kDecimal;
@@ -219,6 +221,9 @@ void CheckTokensAccountedFor(const std::string& sql, const SelectStatement& stmt
       case TokenKind::kDoubleColon:
         ++seen.casts;
         break;
+      case TokenKind::kDot:
+        ++seen.dots;
+        break;
       case TokenKind::kQuotedIdentifier:
       case TokenKind::kSemicolon:
       case TokenKind::kEnd:
@@ -274,12 +279,24 @@ void CheckTokensAccountedFor(const std::string& sql, const SelectStatement& stmt
   }
   Counts want;
   want.stars = stmt.star ? 1U : 0U;
-  want.strings = stmt.from.kind == TableRef::Kind::kPath ? 1U : 0U;
   want.numbers = (stmt.limit.has_value() ? 1U : 0U) + (stmt.offset.has_value() ? 1U : 0U);
   want.commas = Separators(stmt.items.size()) + Separators(stmt.order_by.size());
   want.and_count = Separators(stmt.where.size()) + Separators(stmt.having.size());
   for (const SelectItem& item : stmt.items) {
     Count(item.expr, want);
+  }
+  // A path, a string alias (its last byte a quote), a comma, and ON's AND chain.
+  for (const FromItem& item : stmt.from) {
+    want.strings += item.table.kind == TableRef::Kind::kPath ? 1U : 0U;
+    want.strings += item.alias.has_value() && item.alias_span.length > 0 &&
+                            sql[item.alias_span.offset + item.alias_span.length - 1] == '\''
+                        ? 1U
+                        : 0U;
+    want.commas += item.connector == Connector::kComma ? 1U : 0U;
+    want.and_count += Separators(item.on.size());
+    for (const Expr& e : item.on) {
+      Count(e, want);
+    }
   }
   for (const Expr& e : stmt.where) {
     Count(e, want);
@@ -307,13 +324,24 @@ void CheckTokensAccountedFor(const std::string& sql, const SelectStatement& stmt
   EXPECT_EQ(seen.strings, want.strings) << context;
   EXPECT_EQ(seen.numbers, want.numbers) << context;
   EXPECT_EQ(seen.casts, want.casts) << context;
+  EXPECT_EQ(seen.dots, want.dots) << context;
 }
 
-// Every span of the expression lies inside the query.
+// Every span of the expression lies inside the query. A column's span runs from its qualifier (when
+// it has one) to its name.
 void CheckSpans(const Expr& expr, const std::string& sql) {
   ASSERT_TRUE(SpanInside(expr.span(), sql)) << testing::PrintToString(sql);
-  if (const auto* column = std::get_if<ColumnRef>(&expr); column != nullptr && !column->quoted) {
-    ASSERT_EQ(sql.substr(column->span.offset, column->span.length), column->name);
+  if (const auto* column = std::get_if<ColumnRef>(&expr)) {
+    const std::string text = sql.substr(column->span.offset, column->span.length);
+    if (!column->quoted) {
+      ASSERT_TRUE(text.ends_with(column->name)) << text;
+    }
+    if (column->qualifier.empty() && !column->quoted) {
+      ASSERT_EQ(text, column->name);
+    }
+    if (!column->qualifier.empty() && !column->qualifier_quoted) {
+      ASSERT_TRUE(text.starts_with(column->qualifier)) << text;
+    }
   }
   if (const auto* binary = std::get_if<BinaryExpr>(&expr)) {
     ASSERT_TRUE(SpanInside(binary->op_span, sql));
@@ -369,7 +397,31 @@ void CheckParse(const std::string& sql) {
   }
   const SelectStatement& stmt = *result;
   ASSERT_TRUE(SpanInside(stmt.span, sql)) << testing::PrintToString(sql);
-  ASSERT_TRUE(SpanInside(stmt.from.span, sql));
+  ASSERT_FALSE(stmt.from.empty());
+  for (const FromItem& item : stmt.from) {
+    const bool first = &item == &stmt.from.front();
+    ASSERT_EQ(item.connector == Connector::kFirst, first) << testing::PrintToString(sql);
+    ASSERT_TRUE(SpanInside(item.span, sql));
+    ASSERT_TRUE(SpanInside(item.table.span, sql));
+    ASSERT_EQ(item.span.offset, item.table.span.offset);
+    ASSERT_TRUE(SpanInside(item.connector_span, sql));
+    ASSERT_EQ(item.connector_span.length > 0, !first);
+    ASSERT_TRUE(SpanInside(item.alias_span, sql));
+    ASSERT_EQ(item.alias_span.length > 0, item.alias.has_value());
+    const bool joined = item.connector == Connector::kInner || item.connector == Connector::kLeft;
+    ASSERT_EQ(!item.on.empty(), joined) << testing::PrintToString(sql);
+    ASSERT_EQ(item.on_span.length > 0, joined);
+    ASSERT_TRUE(SpanInside(item.on_span, sql));
+    if (joined) {
+      std::string on = sql.substr(item.on_span.offset, 2);
+      std::ranges::transform(on, on.begin(),
+                             [](unsigned char ch) { return static_cast<char>(std::toupper(ch)); });
+      ASSERT_EQ(on, "ON") << testing::PrintToString(sql);
+    }
+    for (const Expr& e : item.on) {
+      ASSERT_NO_FATAL_FAILURE(CheckSpans(e, sql));
+    }
+  }
   for (const SelectItem& item : stmt.items) {
     ASSERT_TRUE(SpanInside(item.span, sql));
     ASSERT_NO_FATAL_FAILURE(CheckSpans(item.expr, sql));
@@ -433,21 +485,24 @@ constexpr auto kOperands = std::to_array<std::string_view>({
     "-",
 });
 constexpr auto kOther = std::to_array<std::string_view>({
-    "OR",       "NOT",         "ISNULL",    "notnull", "HAVING",
-    "JOIN",     "UNION",       "WITH",      "LIKE",    "IN",
-    "BETWEEN",  "CASE",        "WHEN",      "THEN",    "END",
-    "IS",       "NULL",        "TRUE",      "FALSE",   "INTERVAL",
-    "CAST",     "TIMESTAMPTZ", "EXISTS",    "ALL",     "OVER",
-    "FILTER",   "INTO",        "LEFT",      "COLLATE", "lower",
-    ".",        "+",           "/",         "%",       "::",
-    "||",       "'open",       R"("open)",  "/* open", "-- comment\n",
-    "!",        "#",           "~",         "!~",      "!=-",
-    "==",       "<<",          "->",        "?",       "$1",
-    "{",        "0x1F",        "1_000",     "E'x'",    "INT",
-    "EXCLUDE",  "PERCENT",     "USING",     "-- c\r",  "/* /* */ */",
-    "/* /* */", "\xd0\xb8",    "\x01",      "\xff",    "\xc3\x28",
-    "1e",       "12abc",       R"("")",     ":",       "|",
-    "[",        "TRY_CAST",    "PRECISION",
+    "OR",          "NOT",         "ISNULL",    "notnull", "HAVING",
+    "JOIN",        "UNION",       "WITH",      "LIKE",    "IN",
+    "BETWEEN",     "CASE",        "WHEN",      "THEN",    "END",
+    "IS",          "NULL",        "TRUE",      "FALSE",   "INTERVAL",
+    "CAST",        "TIMESTAMPTZ", "EXISTS",    "ALL",     "OVER",
+    "FILTER",      "INTO",        "LEFT",      "COLLATE", "lower",
+    ".",           "+",           "/",         "%",       "::",
+    "||",          "'open",       R"("open)",  "/* open", "-- comment\n",
+    "!",           "#",           "~",         "!~",      "!=-",
+    "==",          "<<",          "->",        "?",       "$1",
+    "{",           "0x1F",        "1_000",     "E'x'",    "INT",
+    "EXCLUDE",     "PERCENT",     "USING",     "-- c\r",  "/* /* */ */",
+    "/* /* */",    "\xd0\xb8",    "\x01",      "\xff",    "\xc3\x28",
+    "1e",          "12abc",       R"("")",     ":",       "|",
+    "[",           "TRY_CAST",    "PRECISION", "CROSS",   "INNER",
+    "OUTER",       "ON",          "semi",      "ANTI",    "asof",
+    "NATURAL",     "RIGHT",       "LATERAL",   "only",    "PIVOT",
+    "TABLESAMPLE", "at",          "GLOB",      "FULL",    "POSITIONAL",
 });
 constexpr auto kSeparators = std::to_array<std::string_view>(
     {" ", " ", " ", "", "\n", "\t", "/**/", "--\n", "\r", "--\r", "/*/**/*/"});
@@ -501,7 +556,49 @@ std::vector<std::string_view> Skeleton(Rng& rng) {
     }
   }
   tokens.emplace_back("FROM");
-  tokens.push_back(rng.Percent(70) ? rng.Pick(kNames) : "'data/part-0.parquet'");
+  // One item, or a list joined by commas, CROSS JOIN, JOIN ... ON and LEFT [OUTER] JOIN ... ON.
+  static constexpr auto kAliases =
+      std::to_array<std::string_view>({"e", "x_", R"("A b")", "over", "'s'"});
+  const std::size_t items = rng.Percent(70) ? 1 : 2 + rng.Below(3);
+  for (std::size_t i = 0; i < items; ++i) {
+    bool on = false;
+    if (i > 0) {
+      const std::size_t kind = rng.Below(5);
+      if (kind == 0) {
+        tokens.emplace_back(",");
+      } else if (kind == 1) {
+        tokens.insert(tokens.end(), {"CROSS", "JOIN"});
+      } else {
+        if (kind == 3) {
+          tokens.emplace_back("INNER");
+        } else if (kind == 4) {
+          tokens.emplace_back("LEFT");
+          if (rng.Percent(50)) {
+            tokens.emplace_back("OUTER");
+          }
+        }
+        tokens.emplace_back("JOIN");
+        on = true;
+      }
+    }
+    tokens.push_back(rng.Percent(70) ? rng.Pick(kNames) : "'data/part-0.parquet'");
+    if (rng.Percent(30)) {
+      const std::string_view alias = rng.Pick(kAliases);
+      if (alias.starts_with('\'') || rng.Percent(50)) {
+        tokens.emplace_back("AS");
+      }
+      tokens.push_back(alias);
+    }
+    if (on) {
+      tokens.emplace_back("ON");
+      for (std::size_t j = 1 + rng.Below(2); j > 0; --j) {
+        tokens.insert(tokens.end(), {"e", ".", rng.Pick(kNames), "=", "x_", ".", "amount"});
+        if (j > 1) {
+          tokens.emplace_back("AND");
+        }
+      }
+    }
+  }
   if (rng.Percent(60)) {
     const std::size_t conjuncts = 1 + rng.Below(3);
     for (std::size_t i = 0; i < conjuncts; ++i) {
@@ -520,16 +617,19 @@ std::vector<std::string_view> Skeleton(Rng& rng) {
       } else {
         literal = {rng.Pick(kLiterals)};
       }
-      const std::string_view column = rng.Pick(kNames);
+      std::vector<std::string_view> column = {rng.Pick(kNames)};
+      if (rng.Percent(20)) {
+        column.insert(column.begin(), {rng.Pick(kNames), "."});
+      }
       const std::string_view op = rng.Pick(kOps);
       if (rng.Percent(70)) {
-        tokens.push_back(column);
+        tokens.insert(tokens.end(), column.begin(), column.end());
         tokens.push_back(op);
         tokens.insert(tokens.end(), literal.begin(), literal.end());
       } else {
         tokens.insert(tokens.end(), literal.begin(), literal.end());
         tokens.push_back(op);
-        tokens.push_back(column);
+        tokens.insert(tokens.end(), column.begin(), column.end());
       }
     }
   }
@@ -621,6 +721,11 @@ constexpr auto kCorpus = std::to_array<std::string_view>({
     "select count(user_id) from events where user_id != 7 -- trailing\n",
     "SELECT CAST(amount AS DECIMAL(15, 2)) FROM sales WHERE day >= '2024-01-31'::date AND "
     "-1::INTEGER < amount",
+    "SELECT s.region, SUM(e.amount) FROM sales AS s JOIN events e ON s.id = e.sale_id AND "
+    "e.amount > 0 GROUP BY s.region",
+    R"(SELECT COUNT(*) FROM a, "B" b CROSS JOIN 'c.parquet' AS 'c' LEFT OUTER JOIN d ON a.k = )"
+    "d.k OR d.k = 1",
+    "select x.a from t x inner join u on x.a = u.b, v left join w on v.c = w.c where x.a < 3",
 });
 
 std::string Mutate(Rng& rng, std::string sql) {
@@ -699,11 +804,22 @@ std::string RandomName(Rng& rng) {
   }
 }
 
-ColumnRef RandomColumn(Rng& rng) {
+// An unquoted name or any non-empty quoted text (the lexer makes no empty quoted identifier).
+std::pair<std::string, bool> RandomNameOrQuoted(Rng& rng) {
   if (rng.Percent(30)) {
-    return ColumnRef{.name = RandomBytes(rng, 12, true), .quoted = true};
+    return {RandomBytes(rng, 12, true), true};
   }
-  return ColumnRef{.name = RandomName(rng), .quoted = false};
+  return {RandomName(rng), false};
+}
+
+// A column, qualified by a name 20% of the time.
+ColumnRef RandomColumn(Rng& rng) {
+  auto [name, quoted] = RandomNameOrQuoted(rng);
+  ColumnRef column{.name = std::move(name), .quoted = quoted};
+  if (rng.Percent(20)) {
+    std::tie(column.qualifier, column.qualifier_quoted) = RandomNameOrQuoted(rng);
+  }
+  return column;
 }
 
 std::string RandomDigits(Rng& rng, std::size_t max_size) {
@@ -909,17 +1025,34 @@ SelectStatement RandomStatement(Rng& rng) {
       stmt.items.push_back(std::move(item));
     }
   }
-  switch (rng.Below(3)) {
-    case 0:
-      stmt.from = TableRef{.kind = TableRef::Kind::kName, .name = RandomName(rng), .quoted = false};
-      break;
-    case 1:
-      stmt.from = TableRef{
-          .kind = TableRef::Kind::kName, .name = RandomBytes(rng, 12, true), .quoted = true};
-      break;
-    default:
-      stmt.from = TableRef{.kind = TableRef::Kind::kPath, .name = RandomBytes(rng, 20, false)};
-      break;
+  // 1 to 4 FROM items, each a name, a quoted name or a path, joined by random connectors, with
+  // random aliases and ON predicates.
+  static constexpr auto kConnectors = std::to_array<Connector>(
+      {Connector::kComma, Connector::kCross, Connector::kInner, Connector::kLeft});
+  const std::size_t items = 1 + rng.Below(4);
+  for (std::size_t i = 0; i < items; ++i) {
+    FromItem item;
+    item.connector = i == 0 ? Connector::kFirst : rng.Pick(kConnectors);
+    switch (rng.Below(3)) {
+      case 0:
+        item.table =
+            TableRef{.kind = TableRef::Kind::kName, .name = RandomName(rng), .quoted = false};
+        break;
+      case 1:
+        item.table = TableRef{
+            .kind = TableRef::Kind::kName, .name = RandomBytes(rng, 12, true), .quoted = true};
+        break;
+      default:
+        item.table = TableRef{.kind = TableRef::Kind::kPath, .name = RandomBytes(rng, 20, false)};
+        break;
+    }
+    if (rng.Percent(30)) {
+      item.alias = RandomBytes(rng, 10, true);
+    }
+    if (item.connector == Connector::kInner || item.connector == Connector::kLeft) {
+      item.on = RandomPredicate(rng, false);
+    }
+    stmt.from.push_back(std::move(item));
   }
   if (rng.Percent(60)) {
     stmt.where = RandomPredicate(rng, false);

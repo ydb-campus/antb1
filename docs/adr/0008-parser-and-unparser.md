@@ -56,3 +56,21 @@ Accepted
 
   `JOIN` stops being the standard example of a recognized but unsupported construct: window functions replace it in
   the tests and goldens (roadmap PR S0).
+- Update (FROM lists, 2026-10-05, roadmap PR S3): the parser accepts ADR 0022's flat FROM list (commas, `CROSS JOIN`,
+  `[INNER] JOIN ... ON`, `LEFT [OUTER] JOIN ... ON`), table aliases and qualified names `t.x`; the binder rejects them
+  with `kUnsupported` before any table resolves, until the binder answers them. Only a qualified name inside the
+  arguments of a call with the wrong number of arguments is no such error: that call stays a bind error.
+  - The 49 words that DuckDB 1.5.5 refuses as table aliases and antb1 does not reserve stay unreserved (they remain
+    column, table and function names), but are never read as aliases. Their meaning depends on the place: after a FROM
+    item and after an `ON` condition each is `kUnsupported` where DuckDB gives it a meaning there (told by the next one
+    or two tokens: `SEMI JOIN`, `ASOF LEFT JOIN`, `AT (`, `TABLESAMPLE 10%`, ...), and a syntax error anywhere else
+    after a FROM item or an `ON` condition, as in DuckDB. A harness test compares every DuckDB keyword as a table alias
+    with DuckDB itself, so that a DuckDB update that gives a word a meaning is noticed.
+  - A table alias may also be one of the reserved words `BETWEEN`, `EXISTS`, `INTERVAL` and `OVER`, with or without
+    `AS`, and after `AS` a non-empty string literal, as in DuckDB. The longest keyword is now `AUTHORIZATION` (13
+    letters).
+  - The join keywords left the table of unsupported clauses: where DuckDB has no join (`SELECT 1 JOIN u`, a `JOIN`
+    after `WHERE`, a bare `OUTER`) they are syntax errors. `GLOB` and `AT TIME ZONE` became unsupported operators in
+    every expression, so they are never read as aliases either.
+  - `sql::ToSql` prints every alias quoted after `AS`, `JOIN` as `INNER JOIN`, `LEFT OUTER JOIN` as `LEFT JOIN` and
+    qualifiers as written. Copying, comparing, printing and destroying the list are loops, never recursions.

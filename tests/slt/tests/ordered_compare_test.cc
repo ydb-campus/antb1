@@ -61,6 +61,10 @@ TEST(MakeOrderedQuery, AppendsTheKeysAndDropsLimitAndOffset) {
                 .augmented_sql,
             "SELECT a, a + 1 AS \"__antb1_key0\" FROM t ORDER BY a + 1 DESC")
       << "an expression key";
+  // A qualified name is a column, never a select alias (DuckDB orders by the column t.x).
+  EXPECT_EQ(
+      MakeOrderedQuery("SELECT b AS x FROM t ORDER BY t.x").value_or(OrderedQuery{}).augmented_sql,
+      "SELECT b AS \"x\", t.x AS \"__antb1_key0\" FROM t ORDER BY t.x");
 }
 
 // The oracle side of `SELECT v FROM t ORDER BY k [LIMIT/OFFSET]` for (v, k) rows in DuckDB's order.

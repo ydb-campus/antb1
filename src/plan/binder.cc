@@ -523,13 +523,21 @@ constexpr const char* kConditionsOnly =
     " is only supported in conditions (WHERE, HAVING and CASE WHEN)";
 
 struct FirstUnsupportedOf {
-  std::optional<Rejection> operator()(const sql::ColumnRef& /*column*/) const {
+  // Qualified names resolve once FROM lists do (J2b in ADR 0022).
+  std::optional<Rejection> operator()(const sql::ColumnRef& column) const {
+    if (!column.qualifier.empty()) {
+      return Rejection{.span = column.span,
+                       .message = "qualified column names (t.x) are not supported"};
+    }
     return std::nullopt;
   }
   std::optional<Rejection> operator()(const sql::Literal& /*lit*/) const { return std::nullopt; }
   std::optional<Rejection> operator()(const sql::AggregateCall& call) const {
-    if (!call.arg.has_value() || call.arg_column() != nullptr) {
+    if (!call.arg.has_value()) {
       return std::nullopt;
+    }
+    if (const sql::ColumnRef* column = call.arg_column()) {
+      return (*this)(*column);
     }
     const sql::Expr& arg = **call.arg;
     if (auto r = FirstUnsupported(arg)) {
@@ -971,6 +979,9 @@ class Columns {
   // The column of the field that `ref` names, by its id (plan::ResolvePositions sets its position
   // at the end).
   [[nodiscard]] arrow::Result<BoundColumn> Resolve(const sql::ColumnRef& ref) const {
+    // CheckSupported rejected every qualified name, except in the arguments of a call with the
+    // wrong number of them, which BindFunction rejects before it binds an argument.
+    ANTB1_CHECK(ref.qualifier.empty());
     const std::string wanted = AsciiLower(ref.name);
     std::optional<int> found;
     for (std::size_t i = 0; i < lower_.size(); ++i) {
@@ -3643,9 +3654,11 @@ arrow::Status Binder::BindHaving() {
 }
 
 // ORDER BY items in the query's scope. kGlobal checks the items and returns no key: one row needs
-// no sort. A select alias comes before a table column, as in DuckDB; an unsigned integer is a
-// position in the select list; a constant (a constant item, or any other literal) orders nothing;
-// a later key on a column already ordered by changes nothing and is dropped.
+// no sort. A select alias comes before a table column, as in DuckDB, and a qualified name (t.x)
+// never names an alias: that guard is for J2b (ADR 0022), since until then CheckSupported rejects
+// a qualified ORDER BY item before the binder runs. An unsigned integer is a position in the select
+// list; a constant (a constant item, or any other literal) orders nothing; a later key on a column
+// already ordered by changes nothing and is dropped.
 arrow::Status Binder::BindOrderBy() {
   alias_fallback_ = true;
   for (const sql::OrderItem& item : stmt_.order_by) {
@@ -3656,7 +3669,8 @@ arrow::Status Binder::BindOrderBy() {
         ARROW_ASSIGN_OR_RAISE(key, ItemOutput(*position));
       }
     } else if (const auto* ref = std::get_if<sql::ColumnRef>(&item.expr);
-               ref != nullptr && FindAlias(select_, ref->name).has_value()) {
+               ref != nullptr && ref->qualifier.empty() &&
+               FindAlias(select_, ref->name).has_value()) {  // J2b: t.x never names an alias
       const std::size_t alias = FindAlias(select_, ref->name).value_or(0);
       ARROW_ASSIGN_OR_RAISE(key, ItemOutput(alias));
     } else {
@@ -3717,11 +3731,9 @@ arrow::Result<LogicalPlan> Binder::Bind() {
 }
 
 LogicalPlan Binder::Assemble() {
-  ScanNode scan{.table = table_,
-                .table_name = stmt_.from.name,
-                .fields = {},
-                .ids = {},
-                .span = stmt_.from.span};
+  const sql::TableRef& from = stmt_.from.front().table;
+  ScanNode scan{
+      .table = table_, .table_name = from.name, .fields = {}, .ids = {}, .span = from.span};
   for (int i = 0; i < schema_.num_fields(); ++i) {
     scan.fields.push_back(i);
     scan.ids.push_back(columns_.Id(i));
@@ -3946,11 +3958,45 @@ sql::SelectStatement FoldDateCasts(sql::SelectStatement stmt) {
   return stmt;
 }
 
-// Expressions the binder does not answer yet are kUnsupported, reported (like the parser's own
-// kUnsupported errors) before any name is resolved, at the first one in query order.
+// The FROM list the binder answers: one table or path without an alias. The others parse (ADR
+// 0022) and are answered from J2b on: the first item's alias, else the second item's connector.
+std::optional<Rejection> RejectFromList(const std::vector<sql::FromItem>& from) {
+  ANTB1_CHECK(!from.empty());  // the parser makes no statement without a FROM item
+  if (const sql::FromItem& first = from.front(); first.alias.has_value()) {
+    return Rejection{.span = first.alias_span, .message = "table aliases are not supported"};
+  }
+  if (from.size() == 1) {
+    return std::nullopt;
+  }
+  const sql::FromItem& second = from[1];
+  std::string message;
+  switch (second.connector) {
+    case sql::Connector::kComma:
+    case sql::Connector::kFirst:  // only the first item has it
+      message = "a FROM list of several tables is not supported";
+      break;
+    case sql::Connector::kCross:
+      message = "CROSS JOIN is not supported";
+      break;
+    case sql::Connector::kInner:
+      message = "JOIN ... ON is not supported";
+      break;
+    case sql::Connector::kLeft:
+      message = "LEFT JOIN is not supported";
+      break;
+  }
+  return Rejection{.span = second.connector_span, .message = std::move(message)};
+}
+
+// Expressions and FROM lists the binder does not answer yet are kUnsupported, reported (like the
+// parser's own kUnsupported errors) before any name is resolved, so also over tables that do not
+// exist, at the first one in query order.
 arrow::Status CheckSupported(const sql::SelectStatement& stmt) {
   for (const sql::SelectItem& item : stmt.items) {
     ARROW_RETURN_NOT_OK(CheckValue(item.expr));
+  }
+  if (auto r = RejectFromList(stmt.from)) {
+    return Reject(*r);
   }
   for (const sql::Expr& conjunct : stmt.where) {
     if (auto r = RejectCondition(conjunct, /*having=*/false)) {
@@ -3976,7 +4022,8 @@ arrow::Status CheckSupported(const sql::SelectStatement& stmt) {
 arrow::Result<LogicalPlan> Bind(const sql::SelectStatement& stmt, const Catalog& catalog) {
   const sql::SelectStatement folded = FoldDateCasts(stmt);  // the binder refers to it
   ARROW_RETURN_NOT_OK(CheckSupported(folded));
-  ARROW_ASSIGN_OR_RAISE(auto table, ResolveTable(folded.from, catalog));
+  ANTB1_CHECK(folded.from.size() == 1);  // CheckSupported rejected the others
+  ARROW_ASSIGN_OR_RAISE(auto table, ResolveTable(folded.from.front().table, catalog));
   ColumnIdSource ids;
   Binder binder(folded, std::move(table), ids);
   ARROW_ASSIGN_OR_RAISE(LogicalPlan plan, binder.Bind());

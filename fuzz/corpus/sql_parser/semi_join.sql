@@ -1,0 +1,1 @@
+SELECT COUNT(*) FROM orders semi JOIN items ON orders.id = items.order_id

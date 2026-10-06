@@ -112,7 +112,8 @@ TEST(QueryGenerator, SupportedQueriesUseOnlySupportedFeatures) {
 }
 
 TEST(QueryGenerator, TargetSamplesCoverTheWholeGrammar) {
-  // A Feature without generator support fails here (runner/query_gen.cc must learn it).
+  // A Feature without generator support fails here (runner/query_gen.cc must learn it), unless it
+  // waits in kGeneratorPending.
   const auto gen = Make(11, {.supported = kSupportedFeatures, .target_percent = 100});
   FeatureSet seen;
   for (uint64_t i = 0; i < 4000; ++i) {
@@ -120,7 +121,7 @@ TEST(QueryGenerator, TargetSamplesCoverTheWholeGrammar) {
     EXPECT_TRUE(q.target_sample);
     seen.Add(q.features);
   }
-  const FeatureSet expected = FeatureSet::All().Minus(kNeverGenerated);
+  const FeatureSet expected = FeatureSet::All().Minus(kNeverGenerated).Minus(kGeneratorPending);
   EXPECT_EQ(seen, expected) << "never generated: " << expected.Minus(seen).Names();
 }
 

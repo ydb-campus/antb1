@@ -1,0 +1,1 @@
+SELECT a.x FROM a, b JOIN c ON b.k = c.k OR c.j = 1, d LEFT JOIN e ON d.k = e.k WHERE a.x > 0

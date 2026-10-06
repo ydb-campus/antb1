@@ -33,7 +33,15 @@ std::string Quote(const std::string& text, char quote) {
   return out;
 }
 
-std::string Column(const ColumnRef& col) { return col.quoted ? Quote(col.name, '"') : col.name; }
+// A name quoted as written.
+std::string Name(const std::string& name, bool quoted) { return quoted ? Quote(name, '"') : name; }
+
+std::string Column(const ColumnRef& col) {
+  if (col.qualifier.empty()) {
+    return Name(col.name, col.quoted);
+  }
+  return Name(col.qualifier, col.qualifier_quoted) + "." + Name(col.name, col.quoted);
+}
 
 std::string LiteralSql(const Literal& lit) {
   switch (lit.kind) {
@@ -143,7 +151,7 @@ struct SqlOf {
            " AND " + Sql(*between.high, kComparison + 1);
   }
   std::string operator()(const FunctionCall& call) const {
-    return (call.quoted ? Quote(call.name, '"') : call.name) + "(" + List(call.args) + ")";
+    return Name(call.name, call.quoted) + "(" + List(call.args) + ")";
   }
   std::string operator()(const CaseExpr& c) const {
     std::string out = "CASE";
@@ -196,6 +204,29 @@ std::string Conjuncts(const std::vector<Expr>& conjuncts) {
   return out;
 }
 
+// The FROM list, in a loop: each connector as ",", CROSS JOIN, INNER JOIN or LEFT JOIN, each alias
+// quoted after AS, each ON condition like a WHERE predicate. No operand is ever followed by a bare
+// name, and a join keyword never by its first word only, so the text reads back as the same list.
+std::string FromList(const std::vector<FromItem>& from) {
+  std::string out;
+  for (const FromItem& item : from) {
+    if (item.connector == Connector::kComma) {
+      out += ", ";
+    } else if (item.connector != Connector::kFirst) {
+      out += " " + std::string(ToString(item.connector)) + " ";
+    }
+    out += item.table.kind == TableRef::Kind::kPath ? Quote(item.table.name, '\'')
+                                                    : Name(item.table.name, item.table.quoted);
+    if (item.alias.has_value()) {
+      out += " AS " + Quote(*item.alias, '"');
+    }
+    if (!item.on.empty()) {
+      out += " ON " + Conjuncts(item.on);
+    }
+  }
+  return out;
+}
+
 }  // namespace
 
 std::string ToSql(const Expr& expr) { return Sql(expr); }
@@ -215,12 +246,7 @@ std::string ToSql(const SelectStatement& stmt) {
       }
     }
   }
-  sql += " FROM ";
-  if (stmt.from.kind == TableRef::Kind::kPath) {
-    sql += Quote(stmt.from.name, '\'');
-  } else {
-    sql += stmt.from.quoted ? Quote(stmt.from.name, '"') : stmt.from.name;
-  }
+  sql += " FROM " + FromList(stmt.from);
   if (!stmt.where.empty()) {
     sql += " WHERE " + Conjuncts(stmt.where);
   }

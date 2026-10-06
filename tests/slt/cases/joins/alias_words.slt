@@ -15,29 +15,23 @@ SELECT COUNT(*), COUNT(DISTINCT zn_id), MIN(zn_id), MAX(zn_id) FROM zones
 ----
 40	40	1	40
 
-# ---- pending: the words as aliases are syntax errors (roadmap PR S3 makes them so and removes these guards) ----
+# ---- the words as aliases are syntax errors in both engines (roadmap PR S3) ----
 
-pending S3
 statement error
 SELECT COUNT(*) FROM trips AS semi
 
-pending S3
 statement error
 SELECT COUNT(*) FROM trips AS anti
 
-pending S3
 statement error
 SELECT COUNT(*) FROM trips AS asof
 
-pending S3
 statement error
 SELECT COUNT(*) FROM trips semi
 
-pending S3
 statement error
 SELECT COUNT(*) FROM trips anti
 
-pending S3
 statement error
 SELECT COUNT(*) FROM trips asof
 
