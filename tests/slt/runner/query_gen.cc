@@ -28,6 +28,7 @@
 #include <parquet/metadata.h>
 
 #include "antb1/common/int128.h"
+#include "antb1/common/narrow.h"
 #include "antb1/plan/catalog.h"
 
 #include "canonical.h"
@@ -3047,7 +3048,7 @@ std::expected<std::vector<GenTable>, std::string> LoadGenTables(
           return std::unexpected(std::format("table '{}': ref column '{}' is not a column of '{}'",
                                              def.name, name, def.files.front()));
         }
-        const auto index = static_cast<int>(field - names.begin());
+        const auto index = antb1::Narrow<int>(field - names.begin());
         const auto column = std::ranges::find(fields, index);
         // A type the generator skips, a DOUBLE (no DOUBLE keys yet, ADR 0022) or a column typed
         // through the clickbench option (FROM '<path>' reads it raw): the ref is dropped.

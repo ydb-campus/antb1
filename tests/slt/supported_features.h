@@ -41,9 +41,10 @@ enum class Feature : std::uint8_t {
   kArithmetic,          // + - * / // % and unary - of a column and a constant
   kStringFunctions,     // strlen(varchar) and regexp_replace(varchar, 'pattern', 'replacement')
   kCase,                // CASE WHEN <condition> THEN .. [ELSE ..] END
-  kBooleanExpressions,  // OR, NOT and parenthesized AND in conditions (WHERE, HAVING, CASE WHEN)
+  kBooleanExpressions,  // OR, NOT and parenthesized AND in conditions (WHERE, an inner ON, HAVING,
+                        // CASE WHEN)
   kTimestamps,          // toDateTime(integer), EXTRACT(field FROM ..) and date_trunc('unit', ..)
-  // Column types a query reads (select list or WHERE); SELECT * reads every column
+  // Column types a query reads (select list, WHERE or an inner ON); SELECT * reads every column
   kIntegerColumns,  // SMALLINT, INTEGER, BIGINT, USMALLINT
   kDoubleColumns,   // DOUBLE
   kVarcharColumns,  // VARCHAR (Parquet BYTE_ARRAY, with or without UTF8)
@@ -61,10 +62,10 @@ enum class Feature : std::uint8_t {
   // WHERE
   kWhere,            // WHERE column <op> literal (=, <>, !=, <, <=, >, >=); also in an inner ON
   kWhereAnd,         // several comparisons joined by AND
-  kLike,             // VARCHAR column [NOT] LIKE 'pattern' in WHERE
-  kIn,               // column [NOT] IN (literal, ...) in WHERE
-  kBetween,          // column [NOT] BETWEEN literal AND literal in WHERE
-  kCompareColumns,   // column <op> column in WHERE (a DECIMAL against another column of numbers)
+  kLike,             // VARCHAR column [NOT] LIKE 'pattern' in WHERE or an inner ON
+  kIn,               // column [NOT] IN (literal, ...) in WHERE or an inner ON
+  kBetween,          // column [NOT] BETWEEN literal AND literal in WHERE or an inner ON
+  kCompareColumns,   // column <op> column in WHERE or an inner ON (a DECIMAL against numbers)
   kLiteralFirst,     // literal <op> column
   kIntegerLiteral,   // 42
   kDecimalLiteral,   // 4.25

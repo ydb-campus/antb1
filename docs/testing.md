@@ -193,7 +193,7 @@ only on `s`, `i`, the tables and the supported features, so a single case reprod
   along the refs, as commas, `CROSS JOIN` or `[INNER] JOIN ... ON`, with aliases and qualified names, within a row
   bound computed from the keys' statistics ([tests/slt/README.md](../tests/slt/README.md#random-differential-test)).
   Until the join features are declared supported, those queries are target-grammar samples that antb1 answers with
-  `Unsupported` (35 of the 300 queries of `diff.star`).
+  `Unsupported`.
 - A failure prints the seed, the case index, the features, the SQL, at most 5 differing rows and the command that
   reproduces the case:
 
