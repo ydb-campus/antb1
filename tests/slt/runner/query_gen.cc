@@ -327,6 +327,103 @@ void AddRange(GenColumn& c, const arrow::Array& a) {
   }
 }
 
+// ---- key statistics of refs ----
+
+void AppendUint64(std::string& out, uint64_t v) {
+  for (unsigned shift = 0; shift < 64; shift += 8) {
+    out.push_back(static_cast<char>((v >> shift) & 0xFFU));
+  }
+}
+
+// Appends the bytes of the key value at `row` of `a`; false for NULL. An integer or a DATE is 8
+// bytes, a DECIMAL its 16, a string its length (8 bytes) and its bytes: one encoding per column
+// type, so equal keys of a column have equal bytes and a key of several columns stays unambiguous.
+bool AppendKeyBytes(const arrow::Array& a, int64_t row, std::string& out) {
+  if (a.IsNull(row)) {
+    return false;
+  }
+  if (const std::optional<int64_t> v = IntegerAt(a, row)) {
+    AppendUint64(out, static_cast<uint64_t>(*v));
+    return true;
+  }
+  switch (a.type_id()) {
+    case arrow::Type::DECIMAL128: {
+      const arrow::Decimal128 v(static_cast<const arrow::Decimal128Array&>(a).GetValue(row));
+      AppendUint64(out, static_cast<uint64_t>(v.high_bits()));
+      AppendUint64(out, v.low_bits());
+      return true;
+    }
+    case arrow::Type::BINARY:
+    case arrow::Type::STRING: {
+      const std::string_view v = static_cast<const arrow::BinaryArray&>(a).GetView(row);
+      AppendUint64(out, v.size());
+      out.append(v);
+      return true;
+    }
+    default:
+      return false;  // not a key kind: LoadGenTables collects none
+  }
+}
+
+// The keys of some columns of one table (LoadGenTables), collected file by file.
+struct KeyCollector {
+  std::vector<int> fields;        // the key's columns: their fields in the files
+  bool usable = true;             // every column is a GenColumn of a key kind
+  std::vector<std::string> keys;  // the bytes of every non-NULL key so far
+};
+
+// Adds the keys of every row of `file` whose key columns are all non-NULL. A column's chunks are
+// walked in turn, so the columns may be chunked differently.
+void AddKeys(const arrow::Table& file, KeyCollector& k) {
+  const auto rows = static_cast<std::size_t>(file.num_rows());
+  std::vector<std::string> parts(rows);
+  std::vector<std::uint8_t> valid(rows, 1);
+  for (const int field : k.fields) {
+    if (field >= file.num_columns()) {
+      return;  // (all files have the first one's schema)
+    }
+    std::size_t row = 0;
+    for (const auto& chunk : file.column(field)->chunks()) {
+      for (int64_t i = 0; i < chunk->length() && row < rows; ++i, ++row) {
+        if (valid[row] != 0 && !AppendKeyBytes(*chunk, i, parts[row])) {
+          valid[row] = 0;
+        }
+      }
+    }
+  }
+  for (std::size_t row = 0; row < rows; ++row) {
+    if (valid[row] != 0) {
+      k.keys.push_back(std::move(parts[row]));
+    }
+  }
+}
+
+// Counts the keys: sorted, so equal keys form runs (no unordered container, deterministic).
+GenKeyStats StatsOf(std::vector<std::string> keys) {
+  std::ranges::sort(keys);
+  GenKeyStats stats;
+  stats.non_null = std::ssize(keys);
+  for (std::size_t begin = 0; begin < keys.size();) {
+    std::size_t end = begin + 1;
+    while (end < keys.size() && keys[end] == keys[begin]) {
+      ++end;
+    }
+    ++stats.distinct;
+    stats.max_multiplicity = std::max(stats.max_multiplicity, static_cast<int64_t>(end - begin));
+    begin = end;
+  }
+  return stats;
+}
+
+bool SameName(std::string_view a, std::string_view b) {
+  return plan::AsciiLower(a) == plan::AsciiLower(b);
+}
+
+int64_t SaturatingProduct(int64_t a, int64_t b) {
+  int64_t product = 0;
+  return __builtin_mul_overflow(a, b, &product) ? std::numeric_limits<int64_t>::max() : product;
+}
+
 // 10^n - 1, the largest unscaled value of n digits (n <= 38).
 Int128 MaxOfDigits(int digits) {
   Int128 power = 1;
@@ -2243,10 +2340,59 @@ class Builder {
 
 }  // namespace
 
+int64_t JoinRowBound(const GenKeyStats& a, const GenKeyStats& b) {
+  // Each row of one side meets at most the other side's largest multiplicity of rows, and each
+  // key both sides have gives at most the product of the two.
+  return std::min(
+      {SaturatingProduct(a.non_null, b.max_multiplicity),
+       SaturatingProduct(b.non_null, a.max_multiplicity),
+       SaturatingProduct(SaturatingProduct(std::min(a.distinct, b.distinct), a.max_multiplicity),
+                         b.max_multiplicity)});
+}
+
 std::expected<std::vector<GenTable>, std::string> LoadGenTables(
     const std::vector<TableDef>& tables) {
+  // The keys each table collects: the columns of its refs to tables of this call, and the columns
+  // that refs of such tables reference in it, each column list once.
+  std::vector<std::vector<std::vector<std::string>>> needs(tables.size());
+  const auto need = [&needs](std::size_t table, const std::vector<std::string>& columns) {
+    auto& lists = needs[table];
+    const auto same = [&columns](const std::vector<std::string>& list) {
+      return std::ranges::equal(list, columns, SameName);
+    };
+    if (const auto it = std::ranges::find_if(lists, same); it != lists.end()) {
+      return static_cast<std::size_t>(it - lists.begin());
+    }
+    lists.push_back(columns);
+    return lists.size() - 1;
+  };
+  struct RefSite {
+    std::size_t table = 0;    // the table whose ref it is
+    std::size_t ref = 0;      // index in its TableDef::refs
+    std::size_t key = 0;      // need of `table`
+    std::size_t target = 0;   // the referenced table
+    std::size_t ref_key = 0;  // need of `target`
+  };
+  std::vector<RefSite> sites;
+  for (std::size_t i = 0; i < tables.size(); ++i) {
+    for (std::size_t r = 0; r < tables[i].refs.size(); ++r) {
+      const ForeignKey& ref = tables[i].refs[r];
+      const auto target = std::ranges::find_if(
+          tables, [&ref](const TableDef& def) { return SameName(def.name, ref.table); });
+      if (target == tables.end()) {
+        continue;  // a table this call does not load
+      }
+      const auto j = static_cast<std::size_t>(target - tables.begin());
+      const std::size_t key = need(i, ref.columns);
+      sites.push_back(RefSite{
+          .table = i, .ref = r, .key = key, .target = j, .ref_key = need(j, ref.ref_columns)});
+    }
+  }
+  // Per table and need: the key's statistics, none when a column is no GenColumn of a key kind.
+  std::vector<std::vector<std::optional<GenKeyStats>>> stats(tables.size());
   std::vector<GenTable> out;
-  for (const auto& def : tables) {
+  for (std::size_t i = 0; i < tables.size(); ++i) {
+    const TableDef& def = tables[i];
     GenTable t;
     t.name = def.name;
     if (def.patterns.size() == 1) {
@@ -2268,20 +2414,44 @@ std::expected<std::vector<GenTable>, std::string> LoadGenTables(
     }
     const arrow::Table& table = **data;
     std::vector<int> fields;  // per column of t: its field in the file
-    for (int i = 0; i < table.num_columns(); ++i) {
-      auto column = ColumnOf(*table.schema()->field(i), def.clickbench);
+    for (int f = 0; f < table.num_columns(); ++f) {
+      auto column = ColumnOf(*table.schema()->field(f), def.clickbench);
       if (!column.has_value()) {
         t.other_columns = true;
         continue;
       }
-      if (table.column(i)->num_chunks() == 1) {
-        AddSamples(*column, *table.column(i)->chunk(0));
+      if (table.column(f)->num_chunks() == 1) {
+        AddSamples(*column, *table.column(f)->chunk(0));
       }
       t.columns.push_back(std::move(*column));
-      fields.push_back(i);
+      fields.push_back(f);
     }
-    // The integer and DECIMAL columns' value ranges over every file (all files have the first one's
-    // schema).
+    // The keys of refs: their columns as the first file names them (ASCII case-insensitively).
+    std::vector<KeyCollector> keys(needs[i].size());
+    for (std::size_t n = 0; n < needs[i].size(); ++n) {
+      for (const std::string& name : needs[i][n]) {
+        const auto& names = table.schema()->fields();
+        const auto field = std::ranges::find_if(
+            names, [&name](const auto& candidate) { return SameName(candidate->name(), name); });
+        if (field == names.end()) {
+          return std::unexpected(std::format("table '{}': ref column '{}' is not a column of '{}'",
+                                             def.name, name, def.files.front()));
+        }
+        const auto index = static_cast<int>(field - names.begin());
+        const auto column = std::ranges::find(fields, index);
+        // A type the generator skips, a DOUBLE (no DOUBLE keys yet, ADR 0022) or a column typed
+        // through the clickbench option (FROM '<path>' reads it raw): the ref is dropped.
+        if (column == fields.end()) {
+          keys[n].usable = false;
+          continue;
+        }
+        const GenColumn& c = t.columns[static_cast<std::size_t>(column - fields.begin())];
+        keys[n].usable = keys[n].usable && c.kind != ValueKind::kDouble && !c.via_override;
+        keys[n].fields.push_back(index);
+      }
+    }
+    // The integer and DECIMAL columns' value ranges and the keys of refs over every file (all files
+    // have the first one's schema).
     for (const auto& f : def.files) {
       auto file = f == def.files.front() ? data : ReadFile(f);
       if (!file) {
@@ -2297,8 +2467,28 @@ std::expected<std::vector<GenTable>, std::string> LoadGenTables(
           AddRange(t.columns[k], *chunk);
         }
       }
+      for (KeyCollector& k : keys) {
+        if (k.usable) {
+          AddKeys(**file, k);
+        }
+      }
+    }
+    for (KeyCollector& k : keys) {
+      stats[i].push_back(k.usable ? std::optional(StatsOf(std::move(k.keys))) : std::nullopt);
     }
     out.push_back(std::move(t));
+  }
+  for (const RefSite& site : sites) {
+    const std::optional<GenKeyStats>& key = stats[site.table][site.key];
+    const std::optional<GenKeyStats>& ref_key = stats[site.target][site.ref_key];
+    if (key.has_value() && ref_key.has_value()) {
+      const ForeignKey& ref = tables[site.table].refs[site.ref];
+      out[site.table].refs.push_back(GenRef{.columns = ref.columns,
+                                            .table = out[site.target].name,
+                                            .ref_columns = ref.ref_columns,
+                                            .stats = *key,
+                                            .ref_stats = *ref_key});
+    }
   }
   return out;
 }

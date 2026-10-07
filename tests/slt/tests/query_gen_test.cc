@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <format>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <regex>
 #include <string>
@@ -68,6 +69,11 @@ std::vector<GenTable> Tables() {
   big.path = "/data/big-*.parquet";
   big.rows = 10'000;
   return {small, big};
+}
+
+GenKeyStats Stats(int64_t non_null, int64_t distinct, int64_t max_multiplicity) {
+  return GenKeyStats{
+      .non_null = non_null, .distinct = distinct, .max_multiplicity = max_multiplicity};
 }
 
 QueryGenerator Make(uint64_t seed, GeneratorOptions options) {
@@ -618,6 +624,230 @@ TEST(LoadGenTables, ReadsDecimalColumns) {
   EXPECT_EQ(tables->front().columns[2].name, "m");
   EXPECT_EQ(tables->front().columns[2].abs_max, std::optional<Int128>(kInt128Max));
   EXPECT_TRUE(tables->front().other_columns);
+  std::filesystem::remove_all(dir);
+}
+
+// JoinRowBound is a true upper bound: against the rows of inner joins of seeded small multisets of
+// keys (NULL keys never match), symmetric, often exact, and saturating instead of wrapping.
+TEST(JoinRowBound, BoundsTheJoinsOfSmallKeyMultisets) {
+  uint64_t state = 0x5EED;
+  const auto next = [&state] {
+    state = (state * 6364136223846793005ULL) + 1442695040888963407ULL;
+    return state >> 33U;
+  };
+  int exact = 0;
+  for (int trial = 0; trial < 2000; ++trial) {
+    const uint64_t domain = 1 + (next() % 8);
+    std::array<std::vector<std::optional<uint64_t>>, 2> sides;
+    for (auto& side : sides) {
+      for (uint64_t n = next() % 25; n > 0; --n) {
+        side.push_back(next() % 5 == 0 ? std::nullopt : std::optional(next() % domain));
+      }
+    }
+    std::array<GenKeyStats, 2> stats;
+    std::array<std::vector<int64_t>, 2> counts;
+    for (std::size_t s = 0; s < 2; ++s) {
+      counts[s].assign(domain, 0);
+      for (const auto& key : sides[s]) {
+        if (key.has_value()) {
+          ++counts[s][*key];
+          ++stats[s].non_null;
+        }
+      }
+      for (const int64_t n : counts[s]) {
+        stats[s].distinct += n > 0 ? 1 : 0;
+        stats[s].max_multiplicity = std::max(stats[s].max_multiplicity, n);
+      }
+    }
+    int64_t rows = 0;
+    for (uint64_t key = 0; key < domain; ++key) {
+      rows += counts[0][key] * counts[1][key];
+    }
+    const int64_t bound = JoinRowBound(stats[0], stats[1]);
+    EXPECT_GE(bound, rows) << trial;
+    EXPECT_EQ(bound, JoinRowBound(stats[1], stats[0])) << trial;
+    exact += bound == rows ? 1 : 0;
+  }
+  EXPECT_GT(exact, 200);
+  constexpr int64_t kMax = std::numeric_limits<int64_t>::max();
+  EXPECT_EQ(JoinRowBound(Stats(kMax, kMax, kMax), Stats(kMax, kMax, kMax)), kMax);
+  // The three-way product (2^100) overflows alone: the other two decide, never a wrapped value.
+  constexpr int64_t kTwoTo30 = 1'073'741'824;
+  const GenKeyStats wide = Stats(10, kTwoTo30 * 1024, kTwoTo30);
+  EXPECT_EQ(JoinRowBound(wide, wide), 10 * kTwoTo30);
+  EXPECT_EQ(JoinRowBound(Stats(3000, 40, 75), Stats(0, 0, 0)), 0) << "an empty side";
+}
+
+// Arrays with NULLs for the Parquet files of the key statistics test.
+std::shared_ptr<arrow::Array> Int64s(const std::vector<std::optional<int64_t>>& values) {
+  arrow::Int64Builder b;
+  for (const auto& v : values) {
+    EXPECT_TRUE((v.has_value() ? b.Append(*v) : b.AppendNull()).ok());
+  }
+  return b.Finish().ValueOrDie();
+}
+
+std::shared_ptr<arrow::Array> Int32s(const std::vector<std::optional<int32_t>>& values) {
+  arrow::Int32Builder b;
+  for (const auto& v : values) {
+    EXPECT_TRUE((v.has_value() ? b.Append(*v) : b.AppendNull()).ok());
+  }
+  return b.Finish().ValueOrDie();
+}
+
+std::shared_ptr<arrow::Array> UInt16s(const std::vector<uint16_t>& values) {
+  arrow::UInt16Builder b;
+  for (const uint16_t v : values) {
+    EXPECT_TRUE(b.Append(v).ok());
+  }
+  return b.Finish().ValueOrDie();
+}
+
+std::shared_ptr<arrow::Array> Strings(const std::vector<std::optional<std::string>>& values) {
+  arrow::StringBuilder b;
+  for (const auto& v : values) {
+    EXPECT_TRUE((v.has_value() ? b.Append(*v) : b.AppendNull()).ok());
+  }
+  return b.Finish().ValueOrDie();
+}
+
+std::shared_ptr<arrow::Array> Decimals(const std::vector<std::optional<int64_t>>& unscaled) {
+  arrow::Decimal128Builder b(arrow::decimal128(9, 2));
+  for (const auto& v : unscaled) {
+    EXPECT_TRUE((v.has_value() ? b.Append(arrow::Decimal128(*v)) : b.AppendNull()).ok());
+  }
+  return b.Finish().ValueOrDie();
+}
+
+std::shared_ptr<arrow::Array> Dates(const std::vector<std::optional<int32_t>>& days) {
+  arrow::Date32Builder b;
+  for (const auto& v : days) {
+    EXPECT_TRUE((v.has_value() ? b.Append(*v) : b.AppendNull()).ok());
+  }
+  return b.Finish().ValueOrDie();
+}
+
+std::shared_ptr<arrow::Array> Floats(std::size_t n) {
+  arrow::FloatBuilder b;
+  for (std::size_t i = 0; i < n; ++i) {
+    EXPECT_TRUE(b.Append(0.5F).ok());
+  }
+  return b.Finish().ValueOrDie();
+}
+
+std::shared_ptr<arrow::Array> Doubles(std::size_t n) {
+  arrow::DoubleBuilder b;
+  for (std::size_t i = 0; i < n; ++i) {
+    EXPECT_TRUE(b.Append(0.25).ok());
+  }
+  return b.Finish().ValueOrDie();
+}
+
+void WriteParquet(const std::shared_ptr<arrow::Table>& table, const std::string& path,
+                  int64_t group_rows) {
+  auto out = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+  ASSERT_TRUE(
+      parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), out, group_rows).ok());
+  ASSERT_TRUE(out->Close().ok());
+}
+
+// A child table in two files references a parent (two row groups) and an empty table: the key
+// statistics count over every file, without NULL keys (a key of two columns with one NULL part
+// neither), with the case and trailing spaces of strings and DECIMAL keys by value. Ref columns
+// and tables resolve ASCII case-insensitively; refs on a FLOAT, a DOUBLE or a column typed through
+// clickbench, and to a table the call does not load, are dropped; an unknown column is an error.
+TEST(LoadGenTables, ComputesKeyStatisticsOfRefs) {
+  const std::filesystem::path dir =
+      std::filesystem::path(::testing::TempDir()) / "antb1_query_gen_refs";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  const auto file = [&dir](std::string_view name) { return (dir / name).string(); };
+  const auto parent_schema = arrow::schema(
+      {arrow::field("id", arrow::int64()), arrow::field("Code", arrow::utf8()),
+       arrow::field("dec", arrow::decimal128(9, 2)), arrow::field("day", arrow::date32()),
+       arrow::field("f", arrow::float32()), arrow::field("d", arrow::float64())});
+  WriteParquet(
+      arrow::Table::Make(parent_schema, {Int64s({1, 2, 2, 3, std::nullopt, 5}),
+                                         Strings({"a", "A", "a ", "a", "b", std::nullopt}),
+                                         Decimals({150, 150, 200, std::nullopt, 325, 325}),
+                                         Dates({10, 10, 11, 10, 11, 11}), Floats(6), Doubles(6)}),
+      file("parent.parquet"), 3);
+  const auto child_schema = arrow::schema(
+      {arrow::field("k", arrow::int32()), arrow::field("s", arrow::utf8()),
+       arrow::field("m", arrow::decimal128(9, 2)), arrow::field("day", arrow::date32()),
+       arrow::field("x", arrow::float32()), arrow::field("y", arrow::float64()),
+       arrow::field("EventDate", arrow::uint16())});
+  WriteParquet(
+      arrow::Table::Make(child_schema,
+                         {Int32s({1, 1, 2, std::nullopt}), Strings({"a", "A", "a ", std::nullopt}),
+                          Decimals({150, 150, std::nullopt, 325}), Dates({10, 11, 10, 10}),
+                          Floats(4), Doubles(4), UInt16s({1, 2, 3, 4})}),
+      file("child-0.parquet"), 4);
+  WriteParquet(
+      arrow::Table::Make(child_schema, {Int32s({2, 2, 7}), Strings({"a", "zz", std::nullopt}),
+                                        Decimals({200, 325, 999}), Dates({10, std::nullopt, 11}),
+                                        Floats(3), Doubles(3), UInt16s({5, 6, 7})}),
+      file("child-1.parquet"), 3);
+  WriteParquet(arrow::Table::Make(arrow::schema({arrow::field("e", arrow::int64())}), {Int64s({})}),
+               file("empty.parquet"), 1);
+
+  const auto ref = [](std::vector<std::string> columns, std::string table,
+                      std::vector<std::string> ref_columns) {
+    return ForeignKey{.columns = std::move(columns),
+                      .table = std::move(table),
+                      .ref_columns = std::move(ref_columns)};
+  };
+  const TableDef parent{
+      .name = "parent", .files = {file("parent.parquet")}, .patterns = {file("parent.parquet")}};
+  TableDef child{.name = "child",
+                 .files = {file("child-0.parquet"), file("child-1.parquet")},
+                 .patterns = {file("child-*.parquet")},
+                 .clickbench = true};
+  child.refs = {
+      ref({"k"}, "parent", {"id"}),
+      ref({"K", "DAY"}, "PARENT", {"ID", "Day"}),
+      ref({"s"}, "parent", {"code"}),
+      ref({"m"}, "parent", {"dec"}),
+      ref({"x"}, "parent", {"id"}),           // FLOAT: never referenced (D11)
+      ref({"y"}, "parent", {"d"}),            // DOUBLE: no DOUBLE keys
+      ref({"EventDate"}, "parent", {"day"}),  // DATE only through clickbench (D2)
+      ref({"k"}, "ghost", {"id"}),            // not loaded
+      ref({"k"}, "empty", {"e"}),
+  };
+  const TableDef empty{
+      .name = "empty", .files = {file("empty.parquet")}, .patterns = {file("empty.parquet")}};
+  const auto tables = LoadGenTables({parent, child, empty});
+  ASSERT_TRUE(tables.has_value()) << tables.error();
+  ASSERT_EQ(tables->size(), 3U);
+  EXPECT_TRUE((*tables)[0].refs.empty());
+  EXPECT_TRUE((*tables)[2].refs.empty());
+  const std::vector<GenRef>& refs = (*tables)[1].refs;
+  ASSERT_EQ(refs.size(), 5U);
+  const auto expect = [&](std::size_t i, const std::vector<std::string>& columns,
+                          std::string_view table, GenKeyStats stats, GenKeyStats ref_stats) {
+    SCOPED_TRACE(i);
+    EXPECT_EQ(refs[i].columns, columns);
+    EXPECT_EQ(refs[i].table, table);
+    EXPECT_EQ(refs[i].stats, stats) << refs[i].stats.non_null << " " << refs[i].stats.distinct
+                                    << " " << refs[i].stats.max_multiplicity;
+    EXPECT_EQ(refs[i].ref_stats, ref_stats)
+        << refs[i].ref_stats.non_null << " " << refs[i].ref_stats.distinct << " "
+        << refs[i].ref_stats.max_multiplicity;
+  };
+  expect(0, {"k"}, "parent", Stats(6, 3, 3), Stats(5, 4, 2));
+  expect(1, {"K", "DAY"}, "parent", Stats(5, 4, 2), Stats(5, 5, 1));
+  expect(2, {"s"}, "parent", Stats(5, 4, 2), Stats(5, 4, 2));
+  expect(3, {"m"}, "parent", Stats(6, 4, 2), Stats(5, 3, 2));
+  expect(4, {"k"}, "empty", Stats(6, 3, 3), Stats(0, 0, 0));
+  EXPECT_EQ(refs[2].ref_columns, std::vector<std::string>{"code"});
+
+  for (const auto& [columns, ref_columns] :
+       {std::pair<std::string, std::string>{"nope", "id"}, {"k", "nope"}}) {
+    child.refs = {ref({columns}, "parent", {ref_columns})};
+    const auto broken = LoadGenTables({parent, child});
+    ASSERT_FALSE(broken.has_value());
+    EXPECT_NE(broken.error().find("ref column 'nope'"), std::string::npos) << broken.error();
+  }
   std::filesystem::remove_all(dir);
 }
 

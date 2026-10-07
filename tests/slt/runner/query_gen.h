@@ -56,16 +56,44 @@ struct GenColumn {
   std::optional<Int128> abs_max;
 };
 
+// The key of one side of a ref, over every file of its table.
+struct GenKeyStats {
+  int64_t non_null = 0;          // rows whose key columns are all non-NULL
+  int64_t distinct = 0;          // distinct non-NULL keys
+  int64_t max_multiplicity = 0;  // rows of the most frequent non-NULL key (0 without one)
+  friend bool operator==(const GenKeyStats&, const GenKeyStats&) = default;
+};
+
+// A true upper bound of the rows of an inner join on two keys with these statistics (a NULL key
+// never matches): min(a.non_null * b.max_multiplicity, b.non_null * a.max_multiplicity,
+// min(a.distinct, b.distinct) * a.max_multiplicity * b.max_multiplicity), each product saturating
+// at the largest int64_t.
+int64_t JoinRowBound(const GenKeyStats& a, const GenKeyStats& b);
+
+// A ref= option of the tables file (runner/tables.h) to a table of the same LoadGenTables call.
+struct GenRef {
+  std::vector<std::string> columns;      // of this table, as the tables file spells them
+  std::string table;                     // the referenced table, as its own line spells it
+  std::vector<std::string> ref_columns;  // of that table
+  GenKeyStats stats;                     // of `columns` in this table
+  GenKeyStats ref_stats;                 // of `ref_columns` in `table`
+};
+
 struct GenTable {
   std::string name;
   std::string path;  // the FROM '<path>' form (a file or a glob); empty: by name only
   int64_t rows = 0;
   std::vector<GenColumn> columns;
   bool other_columns = false;  // columns of types the generator skips: no SELECT *
+  std::vector<GenRef> refs;    // the refs joins may follow (the generator checks their columns)
 };
 
 // Reads the row counts and schema of every table, and sample values from its first file, with the
-// Parquet library directly (not through antb1).
+// Parquet library directly (not through antb1). Keeps a table's refs (TableDef::refs) to the
+// tables of this call whose columns on both sides are GenColumns of a key kind (integers, DECIMAL,
+// DATE or VARCHAR, never DATE through the clickbench option), with the statistics of both keys over
+// every file; refs to other tables or to other columns are dropped. A ref column that names no
+// column of its table's first file is an error.
 std::expected<std::vector<GenTable>, std::string> LoadGenTables(
     const std::vector<TableDef>& tables);
 
