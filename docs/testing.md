@@ -122,8 +122,8 @@ DECIMAL(4,2) to DECIMAL(5,3)), a two-column key, a join cycle, a many-to-many sh
 DOUBLE columns in two tables, and every non-empty table has several row groups. Every column name carries its table's
 prefix (`tr_`, `rd_`, ...) except `label`, a deliberate collision of `zones` and `cities`, and `<prefix>row` numbers
 each table's rows. `tests/slt/tables.txt` declares the references between the tables with `ref=` options
-([tests/slt/README.md](../tests/slt/README.md#layout)), and the `harness.StarSchema.*` tests pin the properties that
-the join tests rely on.
+([tests/slt/README.md](../tests/slt/README.md#layout)), along which the random differential test joins them, and the
+`harness.StarSchema.*` tests pin the properties that the join tests rely on.
 
 `harness.fixtures.digest` compares the generated files with `tests/fixtures/fixtures.digest`, a logical digest
 (schema, row groups and values; not compression or page layout), on every leg, macOS included. It skips the
@@ -189,6 +189,11 @@ only on `s`, `i`, the tables and the supported features, so a single case reprod
 - Most queries use only the features declared in `tests/slt/supported_features.h`; for them an antb1 `Unsupported`
   answer is a failure. The rest sample the whole target grammar of [sql-subset.md](sql-subset.md#target-grammar):
   there an `Unsupported` answer is counted per missing feature and reported, not a failure.
+- Over tables with `ref=` options (the star schema) a query that may use a join feature often joins 2 or 3 tables
+  along the refs, as commas, `CROSS JOIN` or `[INNER] JOIN ... ON`, with aliases and qualified names, within a row
+  bound computed from the keys' statistics ([tests/slt/README.md](../tests/slt/README.md#random-differential-test)).
+  Until the join features are declared supported, those queries are target-grammar samples that antb1 answers with
+  `Unsupported` (35 of the 300 queries of `diff.star`).
 - A failure prints the seed, the case index, the features, the SQL, at most 5 differing rows and the command that
   reproduces the case:
 
@@ -449,7 +454,10 @@ groups without `ORDER BY`, so a new seed is checked with `pixi run asan` first, 
 is replaced. The queries of a seed also depend on the query generator and on the supported features
 (`tests/slt/supported_features.h`), so a PR that changes either runs `pixi run asan` too. A failure in antb1 is fixed,
 never avoided with another seed. The DECIMAL queries of the generator change only the seeds of tables with DECIMAL
-columns (`diff.decimal`, `diff.star`, `diff.tpch`): every draw for them is taken where a DECIMAL column is used.
+columns (`diff.decimal`, `diff.star`, `diff.tpch`): every draw for them is taken where a DECIMAL column is used. The
+joins draw from a second random stream of the seed and the query index, so a query that joins nothing is the same
+with or without refs, and the join generation changes only the join queries of the seeds of tables with refs
+(`diff.star`).
 
 This workload is derived from the TPC-H Benchmark and is not comparable to published TPC-H Benchmark results, as this
 implementation does not comply with all requirements of the TPC-H Benchmark.

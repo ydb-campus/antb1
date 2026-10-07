@@ -23,11 +23,11 @@ ClickBench query text.
 
 A table's `ref=<column>[+<column>...]:<table>.<column>[+<column>...]` options (repeatable) declare its foreign keys:
 which of its columns reference, pairwise, which columns of a table of the same file, itself included. The star
-schema of the join tests (`tools/fixturegen/star.h`) declares 13. A ref is a hint for the generated joins of roadmap
-PR T1, not a constraint: NULL and dangling keys are intended. The loader checks the syntax and finds the table
-ASCII case-insensitively (`runner/tables.h`); `metamorphic.TablesTxt.RefsJoinColumnsOfOneKind` checks that every
-column exists and that each pair joins one kind of key (integers, DECIMALs, DATE or VARCHAR, never DOUBLE). The
-engines and the query generator ignore refs until T1.
+schema of the join tests (`tools/fixturegen/star.h`) declares 13. A ref is a hint for generated joins, not a
+constraint: NULL and dangling keys are intended. The loader checks the syntax and finds the table ASCII
+case-insensitively (`runner/tables.h`); `metamorphic.TablesTxt.RefsJoinColumnsOfOneKind` checks that every column
+exists and that each pair joins one kind of key (integers, DECIMALs, DATE or VARCHAR, never DOUBLE). The engines
+ignore refs; the random differential test joins along them (see "Random differential test").
 
 ## Commands
 
@@ -176,9 +176,27 @@ ctest runs `diff.random` (label `diff`) with a fixed seed and 300 queries over t
 runs the queries of `diff.star` on 4 threads in 97-row batches. A slice PR that implements a
 feature adds it to `kSupportedFeatures` (and new grammar to `runner/query_gen.cc`; the unit test
 `harness.QueryGenerator.TargetSamplesCoverTheWholeGrammar` fails until every feature is generated). Grammar that
-the parser accepts before the generator writes it waits in `kGeneratorPending` (today the FROM lists, joins, table
-aliases and qualified names, which ADR 0022's T1 and T2 teach the generator); such a feature cannot be declared
-supported until it leaves that set.
+the parser accepts before the generator writes it waits in `kGeneratorPending` (today `LEFT JOIN`, which ADR 0022's
+T2 teaches the generator); such a feature cannot be declared supported until it leaves that set.
+
+Over tables with refs, a query that may use a join feature joins 2 or 3 tables along the refs 60% of the time when its
+first table has a ref to follow (`runner/query_gen.h`): inner joins written with commas, `CROSS JOIN` or
+`[INNER] JOIN ... ON`, each key's equalities
+in the ON of the later of its two FROM items or in `WHERE`, so that they connect every item. The FROM order may start
+with two tables that share no key; a second edge between two joined tables now and then adds a second key, and an ON
+now and then one condition of `WHERE`'s forms over the items up to its own (ADR 0022 rule 10). Aliases `t1` to `t3`
+stand where a table comes twice or a path names another table (rule 1), and at random otherwise; a name that two items
+have is always qualified (every name, next to a table with columns the generator skips), the others as the query's
+drawn style says. A ref joins columns of one kind only, never DOUBLE, and DECIMALs only within 38 common digits (D13).
+`LoadGenTables` counts each key's non-NULL rows, distinct keys and largest multiplicity over every file, and
+`JoinRowBound` keeps a join within max(10,000, its largest table's rows); the bound stands in for the table's rows
+wherever the generator needs a row count (`SELECT *` above 50 rows gets a `LIMIT`, DECIMAL sums stay within 38 digits,
+`COUNT` literals in `HAVING`). Every draw that only a join needs comes from a second random stream of the seed and the
+query index, so a query that joins nothing is the query the same tables give without refs: `diff.random`,
+`diff.decimal` and `diff.tpch` keep their queries, and only the join queries of `diff.star` are new. Until the join
+features are declared supported (roadmap PR J2b), every join is a target-grammar sample that antb1 answers with
+Unsupported. The generated joins never use single-table aliases, and never meet a bind error or an exit code 4 of the
+join rules: `.slt` files cover those.
 
 ## Data tests: `queries` and `clickbench`
 
