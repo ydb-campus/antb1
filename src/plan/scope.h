@@ -107,7 +107,8 @@ struct ColumnLocation {
 };
 
 // The bindings of one query block, in FROM order; immutable. Neither copied nor moved, since the
-// scope of an inner block may point at it.
+// scope of an inner block may point at it: a container of scopes holds them through
+// std::unique_ptr.
 class Scope {
  public:
   // `outer` is the scope of the enclosing block (nullptr: none), which must outlive this one.
@@ -125,7 +126,8 @@ class Scope {
   // The column an unqualified name refers to, by its id (plan::ResolvePositions sets its position
   // at the end): a bind error when two columns match it (reported first) or none does, else as
   // Reference. Until roadmap PR J2b a scope resolves names in its one binding: a qualified name or
-  // another number of bindings is a programming error.
+  // another number of bindings is a programming error. J2b also limits a name in an ON to the
+  // bindings up to and including its own JOIN (rule 10 of ADR 0022).
   [[nodiscard]] arrow::Result<BoundColumn> Resolve(const sql::ColumnRef& ref) const;
 
   // The column at `where`, referred to at `span`: kUnsupported there when it has no engine type.
