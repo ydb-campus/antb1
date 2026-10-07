@@ -1257,7 +1257,8 @@ TEST_F(HashJoinTest, BuildsArePreparedAtTheFirstNext) {
 
 // The builds are held while the probe pipeline's parts may run, released once the sink's parts
 // are done (while the operator still exists, before its Close), and released at Close after a run
-// that fails or stops early. A failed Prepare holds nothing while its build exists.
+// that fails or stops early. A failed Prepare holds nothing while its build exists, not even the
+// batches of a drained input.
 TEST_F(HashJoinTest, BuildsHoldNothingOnceTheirPartsAreDone) {
   const auto pool = MakeThreadPool();
   const auto key = [](int64_t i) -> std::optional<int64_t> { return i % 5; };
@@ -1368,6 +1369,38 @@ TEST_F(HashJoinTest, BuildsHoldNothingOnceTheirPartsAreDone) {
     EXPECT_TRUE(status.IsIOError()) << status.ToString();
     EXPECT_EQ(inner->table(), nullptr);
     EXPECT_EQ(counted.bytes_allocated(), 0);
+    // A drained input whose batches come from the budget's pool (as a GROUP BY's would), its part
+    // 3 failing: once Prepare returns, the budget holds none of its batches, also where the parts
+    // ran on workers (no task owns a batch: a worker may destroy a task after Prepare returned).
+    MemoryBudget pooled(std::nullopt);
+    const auto drained_schema = Int64Schema({"k", "id"});
+    std::vector<Batch> pooled_batches;
+    for (int64_t b = 0; b < 6; ++b) {
+      arrow::Int64Builder keys(&pooled);
+      arrow::Int64Builder ids(&pooled);
+      for (int64_t r = 0; r < 10; ++r) {
+        ASSERT_TRUE(keys.Append(((b * 10) + r) % 7).ok());
+        ASSERT_TRUE(ids.Append((b * 10) + r).ok());
+      }
+      auto key_column = keys.Finish();
+      auto id_column = ids.Finish();
+      ASSERT_TRUE(key_column.ok() && id_column.ok());
+      // Part 3's batch has a schema the build does not take: its part fails (Invalid).
+      pooled_batches.push_back(
+          Batch{.data = BatchOf(b == 3 ? Int64Schema({"k", "other"}) : drained_schema,
+                                {*key_column, *id_column}),
+                .selection = nullptr});
+    }
+    {
+      auto source = std::make_unique<ScriptedSource>(drained_schema, std::move(pooled_batches));
+      source->HandOver();
+      const auto pooled_build = DrainedBuild(std::move(source), {0});
+      ExecContext pooling = ContextOf(executor, 3, &pooled);
+      const arrow::Status failed = pooled_build->Prepare(pooling);
+      EXPECT_TRUE(failed.IsInvalid()) << failed.ToString();
+      EXPECT_EQ(pooled_build->table(), nullptr);
+      EXPECT_EQ(pooled.bytes_allocated(), 0);
+    }
   }
 }
 

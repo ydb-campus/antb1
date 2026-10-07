@@ -462,6 +462,9 @@ class ScriptedSource final : public Operator {
     if (next_ >= batches_.size()) {
       return Batch{};
     }
+    if (hand_over_) {
+      return std::move(batches_[next_++]);
+    }
     return batches_[next_++];
   }
   arrow::Status Close() override {
@@ -470,6 +473,9 @@ class ScriptedSource final : public Operator {
   }
 
   void FailAt(std::size_t index) { fail_at_ = index; }
+  // Next() hands each batch on and keeps no reference to it (a later run gets empty batches): a
+  // test can then see when the consumer releases the batches.
+  void HandOver() { hand_over_ = true; }
   [[nodiscard]] int pulls() const { return pulls_; }
   [[nodiscard]] int opens() const { return opens_; }
   [[nodiscard]] int closes() const { return closes_; }
@@ -479,6 +485,7 @@ class ScriptedSource final : public Operator {
   std::vector<Batch> batches_;
   std::size_t next_ = 0;
   std::optional<std::size_t> fail_at_;
+  bool hand_over_ = false;
   int pulls_ = 0;
   int opens_ = 0;
   int closes_ = 0;

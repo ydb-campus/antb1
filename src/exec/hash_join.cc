@@ -119,9 +119,9 @@ void JoinBuild::Release() {
   ReleaseBuilds(builds_);
 }
 
-arrow::Result<std::shared_ptr<std::vector<Batch>>> JoinBuild::DrainInput(
-    ExecContext& ctx, MemoryReservation& memory) {
-  auto batches = std::make_shared<std::vector<Batch>>();
+arrow::Result<std::vector<Batch>> JoinBuild::DrainInput(ExecContext& ctx,
+                                                        MemoryReservation& memory) {
+  std::vector<Batch> batches;
   arrow::Status status;
   bool out_of_memory = false;
   try {
@@ -138,15 +138,15 @@ arrow::Result<std::shared_ptr<std::vector<Batch>>> JoinBuild::DrainInput(
       if (batch->selected_rows() == 0) {
         continue;
       }
-      if (batches->size() == batches->capacity()) {
-        const std::size_t capacity = std::max<std::size_t>(16, 2 * batches->capacity());
+      if (batches.size() == batches.capacity()) {
+        const std::size_t capacity = std::max<std::size_t>(16, 2 * batches.capacity());
         status = memory.Resize(Narrow<int64_t>(capacity * sizeof(Batch)));
         if (!status.ok()) {
           break;
         }
-        batches->reserve(capacity);
+        batches.reserve(capacity);
       }
-      batches->push_back(*std::move(batch));
+      batches.push_back(*std::move(batch));
     }
   } catch (const std::bad_alloc&) {
     out_of_memory = true;  // the input is closed first: nothing allocates before
@@ -163,10 +163,13 @@ arrow::Result<std::shared_ptr<std::vector<Batch>>> JoinBuild::DrainInput(
 arrow::Status JoinBuild::BuildTable(ExecContext& ctx) {
   // The builds the input probes come first (post-order).
   ARROW_RETURN_NOT_OK(PrepareBuilds(builds_, ctx));
-  PartScheduler<BuildPart>::Task task;
-  std::shared_ptr<std::vector<Batch>> batches;  // a drained input's, one per part
-  MemoryReservation batch_memory;
+  MemoryReservation batch_memory;  // the vector of `batches`
   batch_memory.Reset(ctx.budget);
+  // A drained input's batches, one per part. Its tasks read them through a pointer and own none:
+  // a worker may destroy a task's closure after its run, and so after Prepare has returned. The
+  // scheduler, gone first, waits for every task it started, and the batches go on this thread.
+  std::vector<Batch> batches;
+  PartScheduler<BuildPart>::Task task;
   int64_t num_parts = num_parts_;
   if (pipeline_ != nullptr) {
     task = [pipeline = pipeline_, part_ctx = PartContext(ctx), spec = spec_, profile = profile_](
@@ -182,12 +185,13 @@ arrow::Status JoinBuild::BuildTable(ExecContext& ctx) {
     };
   } else {
     ARROW_ASSIGN_OR_RAISE(batches, DrainInput(ctx, batch_memory));
-    num_parts = static_cast<int64_t>(batches->size());
-    task = [batches, spec = spec_, pool = ctx.pool, budget = ctx.budget, profile = profile_](
-               int64_t part, const std::atomic<bool>& /*stop*/) -> arrow::Result<BuildPart> {
+    num_parts = static_cast<int64_t>(batches.size());
+    task = [drained = &batches, spec = spec_, pool = ctx.pool, budget = ctx.budget,
+            profile = profile_](int64_t part,
+                                const std::atomic<bool>& /*stop*/) -> arrow::Result<BuildPart> {
       const ProfileTimer part_time(profile, "part_time");
       auto rows = std::make_shared<JoinBuildPart>(spec, budget);
-      ARROW_RETURN_NOT_OK(rows->Append((*batches)[static_cast<std::size_t>(part)], pool));
+      ARROW_RETURN_NOT_OK(rows->Append((*drained)[static_cast<std::size_t>(part)], pool));
       return rows;
     };
   }
@@ -217,8 +221,8 @@ arrow::Status JoinBuild::BuildTable(ExecContext& ctx) {
       if (!status.ok()) {
         break;
       }
-      if (batches != nullptr) {
-        (*batches)[static_cast<std::size_t>(part)] = Batch{};  // appended: no run of it is left
+      if (pipeline_ == nullptr) {
+        batches[static_cast<std::size_t>(part)] = Batch{};  // appended: no run of it is left
       }
     }
   }

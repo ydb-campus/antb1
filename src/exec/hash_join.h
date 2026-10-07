@@ -87,8 +87,7 @@ class JoinBuild {
  private:
   arrow::Status BuildTable(ExecContext& ctx);
   // The batches of the drained input that have selected rows, their vector charged to `memory`.
-  arrow::Result<std::shared_ptr<std::vector<Batch>>> DrainInput(ExecContext& ctx,
-                                                                MemoryReservation& memory);
+  arrow::Result<std::vector<Batch>> DrainInput(ExecContext& ctx, MemoryReservation& memory);
 
   std::shared_ptr<const JoinBuildSpec> spec_;
   std::shared_ptr<const PartPipeline> pipeline_;  // a pipeline input, of num_parts_ parts
