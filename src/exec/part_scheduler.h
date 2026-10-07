@@ -200,7 +200,7 @@ class PartScheduler {
         in_flight_.emplace_back();  // an invalid future until the task is submitted
         reserved = true;
         // The task holds the shared state, so it outlives the scheduler if it has to.
-        arrow::Result<arrow::Future<>> future = executor_->Submit([shared = shared_, part]() {
+        arrow::Result<arrow::Future<>> future = executor_->Submit([shared = shared_, part] {
           shared->RunIntoSlot(part);
           return arrow::Status::OK();
         });

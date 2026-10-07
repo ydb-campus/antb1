@@ -141,7 +141,7 @@ Rows RowsOf(const std::shared_ptr<arrow::Schema>& schema, const std::vector<Batc
 // The rows of every part of `table`, in part order.
 Rows RowsOf(const plan::Table& table) {
   std::vector<int> fields(static_cast<std::size_t>(table.schema()->num_fields()));
-  std::iota(fields.begin(), fields.end(), 0);
+  std::ranges::iota(fields, 0);
   auto reader = table.Scan(fields, 1024, arrow::default_memory_pool());
   EXPECT_TRUE(reader.ok()) << reader.status().ToString();
   auto read = (*reader)->ToTable();
@@ -216,7 +216,7 @@ std::shared_ptr<const JoinBuildSpec> SpecOf(std::shared_ptr<arrow::Schema> schem
 
 std::vector<int> AllFields(const plan::Table& table) {
   std::vector<int> fields(static_cast<std::size_t>(table.schema()->num_fields()));
-  std::iota(fields.begin(), fields.end(), 0);
+  std::ranges::iota(fields, 0);
   return fields;
 }
 
@@ -232,6 +232,7 @@ PartPipeline ScanPipeline(const std::shared_ptr<MemoryTable>& table) {
 std::shared_ptr<JoinBuild> ScanBuild(const std::shared_ptr<MemoryTable>& table,
                                      const std::vector<int>& keys, ProfileNode* profile = nullptr) {
   std::vector<plan::BoundColumn> columns;
+  columns.reserve(keys.size());
   for (const int key : keys) {
     columns.push_back(Column(key, table->schema()->field(key)->name(), LogicalType::kBigInt));
   }
@@ -246,6 +247,7 @@ std::shared_ptr<JoinBuild> DrainedBuild(std::unique_ptr<Operator> source,
                                         ProfileNode* profile = nullptr) {
   const std::shared_ptr<arrow::Schema> schema = source->output_schema();
   std::vector<plan::BoundColumn> columns;
+  columns.reserve(keys.size());
   for (const int key : keys) {
     columns.push_back(Column(key, schema->field(key)->name(), LogicalType::kBigInt));
   }
@@ -423,7 +425,7 @@ TEST_F(HashJoinTest, OneToOnePathKeepsTheProbeColumns) {
           EXPECT_EQ(out.selection->Value(i), matched[row]) << row;
         }
         if (matched[row]) {
-          EXPECT_EQ(values.Value(i), 100 + *probe_keys[row]) << row;
+          EXPECT_EQ(values.Value(i), 100 + probe_keys[row].value_or(-1000)) << row;
         } else {
           EXPECT_TRUE(values.IsNull(i)) << row;
         }
@@ -617,30 +619,39 @@ TEST_F(HashJoinTest, BooleanPayloadOnBothPaths) {
 // A build on the left: its columns come first, and residuals read the join's output in that
 // order.
 TEST_F(HashJoinTest, BuildOnTheLeftPutsItsColumnsFirst) {
-  const auto build_table = KeyTable("b", 3, 4, [](int64_t i) { return i % 5; });
   const auto probe_table = KeyTable("p", 4, 3, [](int64_t i) { return i % 7; });
-  const Rows all =
-      ReferenceJoin(RowsOf(*probe_table), RowsOf(*build_table), {0}, {0}, BuildSide::kLeft);
-  // The build's id (column 1) below 6.
-  Rows expected;
-  for (const std::vector<std::string>& row : all) {
-    if (std::stoll(row[1]) < 6) {
-      expected.push_back(row);
+  // Repeated build keys (the 1:N path), then unique ones (the 1:1 path).
+  for (const bool unique : {false, true}) {
+    SCOPED_TRACE(unique ? "1:1" : "1:N");
+    const auto build_table =
+        KeyTable("b", 3, 4, [unique](int64_t i) { return unique ? i : i % 5; });
+    const Rows all =
+        ReferenceJoin(RowsOf(*probe_table), RowsOf(*build_table), {0}, {0}, BuildSide::kLeft);
+    // The build's id (column 1) below 6.
+    Rows expected;
+    for (const std::vector<std::string>& row : all) {
+      if (std::stoll(row[1]) < 6) {
+        expected.push_back(row);
+      }
+    }
+    ASSERT_FALSE(expected.empty());
+    ASSERT_LT(expected.size(), all.size());
+    const auto build = ScanBuild(build_table, {0});
+    for (const bool residual : {false, true}) {
+      const PartPipeline pipeline =
+          ProbePipeline(probe_table, build, {0}, BuildSide::kLeft,
+                        residual ? std::vector<plan::ExprPtr>{Condition(
+                                       plan::CompareOp::kLt, 6, ColumnAt(1, LogicalType::kBigInt))}
+                                 : std::vector<plan::ExprPtr>{});
+      const auto schema = SchemaOf(pipeline);
+      EXPECT_EQ(schema->field(0)->name(), "bk");
+      EXPECT_EQ(schema->field(2)->name(), "pk");
+      EXPECT_TRUE(schema->field(0)->nullable());
+      auto result = RunUnion(pipeline, probe_table->num_parts(), {build}, ContextOf(nullptr));
+      ASSERT_TRUE(result.ok()) << result.status().ToString();
+      EXPECT_EQ(RowsOf(**result), residual ? expected : all);
     }
   }
-  ASSERT_FALSE(expected.empty());
-  ASSERT_LT(expected.size(), all.size());
-  const auto build = ScanBuild(build_table, {0});
-  const PartPipeline pipeline =
-      ProbePipeline(probe_table, build, {0}, BuildSide::kLeft,
-                    {Condition(plan::CompareOp::kLt, 6, ColumnAt(1, LogicalType::kBigInt))});
-  const auto schema = SchemaOf(pipeline);
-  EXPECT_EQ(schema->field(0)->name(), "bk");
-  EXPECT_EQ(schema->field(2)->name(), "pk");
-  EXPECT_TRUE(schema->field(0)->nullable());
-  auto result = RunUnion(pipeline, probe_table->num_parts(), {build}, ContextOf(nullptr));
-  ASSERT_TRUE(result.ok()) << result.status().ToString();
-  EXPECT_EQ(RowsOf(**result), expected);
 }
 
 // ---- residuals ----
@@ -660,7 +671,7 @@ TEST_F(HashJoinTest, ResidualsKeepRowsWhereEveryConditionIsTrue) {
                                     Int64s({0, 1, 5, 1, 0, 9, 7, 8}),
                                     Bools({true, false, unknown, true, true, unknown, true, true})};
   const Rows probe_rows = RowsOf(BatchOf(probe_schema, probe));
-  constexpr int64_t kTwoTo62 = int64_t{1} << 62;
+  constexpr int64_t kTwoTo62 = 4611686018427387904;
   for (const bool repeated : {false, true}) {
     SCOPED_TRACE(repeated ? "1:N" : "1:1");
     const arrow::ArrayVector build =
@@ -1368,10 +1379,12 @@ TEST_F(HashJoinTest, ProfilesCountBuildsAndProbes) {
   const auto pool = MakeThreadPool();
   for (arrow::internal::Executor* executor : Executors(pool.get())) {
     SCOPED_TRACE(executor == nullptr ? "one thread" : "pool");
-    // Unique dense keys 0..11: direct and unique; a NULL key in row 12.
+    // Unique keys 0..11, 113 and 114 (too sparse for the direct layout); a NULL key in row 12.
     const auto build_table = KeyTable("b", 3, 5, [](int64_t i) -> std::optional<int64_t> {
-      return i < 12 ? std::optional<int64_t>(i)
-                    : (i == 12 ? std::nullopt : std::optional<int64_t>(i + 100));
+      if (i == 12) {
+        return std::nullopt;
+      }
+      return i < 12 ? i : i + 100;
     });
     ProfileNode build_node;
     const auto build = ScanBuild(build_table, {0}, &build_node);

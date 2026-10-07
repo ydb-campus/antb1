@@ -327,7 +327,7 @@ class MemoryLimitTest : public testing::ExecTest {
     const int64_t parts = table->num_parts();
     using Result = arrow::Result<std::unique_ptr<Operator>>;
     std::vector<PlanFactory> plans;
-    plans.emplace_back([=]() -> Result {
+    plans.emplace_back([=] -> Result {
       ARROW_ASSIGN_OR_RAISE(auto spec, JoinBuildSpec::Make(table->schema(), {x}));
       auto build = std::make_shared<JoinBuild>(spec, ScanParts(table), parts,
                                                std::vector<std::shared_ptr<JoinBuild>>{}, nullptr);
@@ -342,7 +342,7 @@ class MemoryLimitTest : public testing::ExecTest {
                                               std::nullopt),
           std::vector<std::shared_ptr<JoinBuild>>{build});
     });
-    plans.emplace_back([=]() -> Result {
+    plans.emplace_back([=] -> Result {
       ARROW_ASSIGN_OR_RAISE(auto spec, JoinBuildSpec::Make(table->schema(), {s}));
       auto build = std::make_shared<JoinBuild>(spec, ScanParts(table), parts,
                                                std::vector<std::shared_ptr<JoinBuild>>{}, nullptr);
@@ -357,7 +357,7 @@ class MemoryLimitTest : public testing::ExecTest {
               pipeline, parts, 4, std::vector<plan::BoundColumn>{x}, calls, serial.output_schema()),
           std::vector<std::shared_ptr<JoinBuild>>{build});
     });
-    plans.emplace_back([=]() -> Result {
+    plans.emplace_back([=] -> Result {
       const auto modulo = std::make_shared<const plan::Expr>(plan::Expr{
           .node = plan::ArithExpr{.op = plan::ArithOp::kModulo,
                                   .left = std::make_shared<const plan::Expr>(
@@ -390,7 +390,7 @@ class MemoryLimitTest : public testing::ExecTest {
                                               std::nullopt),
           std::vector<std::shared_ptr<JoinBuild>>{build});
     });
-    plans.emplace_back([=]() -> Result {
+    plans.emplace_back([=] -> Result {
       ARROW_ASSIGN_OR_RAISE(auto spec, JoinBuildSpec::Make(table->schema(), {x}));
       auto build =
           std::make_shared<JoinBuild>(spec,
