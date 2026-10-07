@@ -28,6 +28,7 @@ antb1_add_module(
     group_aggregate.cc
     join_table.cc
     limit.cc
+    gather.cc
     sort.cc
     row_count.cc
     physical_planner.cc

@@ -32,9 +32,7 @@
 #include "partition_lanes.h"
 
 namespace antb1::exec {
-namespace {
 
-// A part runs single-threaded: its operators never see the executor.
 ExecContext PartContext(const ExecContext& ctx) {
   return ExecContext{.pool = ctx.pool,
                      .batch_size = ctx.batch_size,
@@ -43,14 +41,10 @@ ExecContext PartContext(const ExecContext& ctx) {
                      .budget = ctx.budget};
 }
 
-// The number of parts that may run ahead of the consumer.
-int64_t Window(const ExecContext& ctx) {
+int64_t PartWindow(const ExecContext& ctx) {
   return ctx.executor == nullptr ? 1 : int64_t{2} * (ctx.threads < 1 ? 1 : ctx.threads);
 }
 
-// Opens the part's pipeline, hands every batch with selected rows to `consume` until it returns
-// false or the pipeline ends, and closes the pipeline. Once `stop` is set the part is abandoned
-// (its status is dropped by the scheduler).
 arrow::Status RunPart(const PartPipeline& pipeline, int64_t part, ExecContext ctx,
                       const std::atomic<bool>& stop,
                       const std::function<arrow::Result<bool>(Batch)>& consume) {
@@ -84,8 +78,6 @@ arrow::Status RunPart(const PartPipeline& pipeline, int64_t part, ExecContext ct
   return closed;
 }
 
-}  // namespace
-
 // ---- PartUnionOperator ----
 
 PartUnionOperator::PartUnionOperator(PartPipeline pipeline, int64_t num_parts,
@@ -117,8 +109,8 @@ arrow::Status PartUnionOperator::Open(ExecContext& ctx) {
         }));
     return batches;
   };
-  scheduler_ = std::make_unique<PartScheduler<PartBatches>>(num_parts_, std::move(task),
-                                                            ctx.executor, Window(ctx), ctx.budget);
+  scheduler_ = std::make_unique<PartScheduler<PartBatches>>(
+      num_parts_, std::move(task), ctx.executor, PartWindow(ctx), ctx.budget);
   return arrow::Status::OK();
 }
 
@@ -180,8 +172,8 @@ arrow::Status PartAggregateOperator::Open(ExecContext& ctx) {
         }));
     return shared;
   };
-  scheduler_ = std::make_unique<PartScheduler<PartStates>>(num_parts_, std::move(task),
-                                                           ctx.executor, Window(ctx), ctx.budget);
+  scheduler_ = std::make_unique<PartScheduler<PartStates>>(
+      num_parts_, std::move(task), ctx.executor, PartWindow(ctx), ctx.budget);
   return arrow::Status::OK();
 }
 
@@ -266,7 +258,7 @@ arrow::Status PartGroupAggregateOperator::Open(ExecContext& ctx) {
   pool_ = ctx.pool;
   budget_ = ctx.budget;
   executor_ = ctx.executor;
-  window_ = Window(ctx);
+  window_ = PartWindow(ctx);
   threads_ = ctx.executor == nullptr ? 1 : static_cast<std::size_t>(std::max(ctx.threads, 1));
   merged_ = false;
   opened_ = true;
@@ -323,7 +315,7 @@ arrow::Status PartGroupAggregateOperator::Open(ExecContext& ctx) {
     return groups;
   };
   scheduler_ = std::make_unique<PartScheduler<PartTable>>(num_parts_, std::move(task), ctx.executor,
-                                                          Window(ctx), ctx.budget);
+                                                          PartWindow(ctx), ctx.budget);
   return arrow::Status::OK();
 }
 
@@ -600,7 +592,7 @@ arrow::Status PartTwoLevelAggregateOperator::Open(ExecContext& ctx) {
   budget_ = ctx.budget;
   executor_ = ctx.executor;
   part_ctx_ = PartContext(ctx);
-  window_ = Window(ctx);
+  window_ = PartWindow(ctx);
   opened_ = true;
   return arrow::Status::OK();
 }
@@ -933,8 +925,8 @@ arrow::Status PartTopNOperator::Open(ExecContext& ctx) {
     ARROW_RETURN_NOT_OK(rows->memory.Resize(buffer.memory_usage()));
     return rows;
   };
-  scheduler_ = std::make_unique<PartScheduler<PartBuffer>>(num_parts_, std::move(task),
-                                                           ctx.executor, Window(ctx), ctx.budget);
+  scheduler_ = std::make_unique<PartScheduler<PartBuffer>>(
+      num_parts_, std::move(task), ctx.executor, PartWindow(ctx), ctx.budget);
   return arrow::Status::OK();
 }
 

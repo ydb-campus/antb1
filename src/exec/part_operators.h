@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -28,6 +29,20 @@ namespace antb1::exec {
 
 // Builds the pipeline of one part. Called concurrently from several threads.
 using PartPipeline = std::function<arrow::Result<std::unique_ptr<Operator>>(int64_t part)>;
+
+// The context of a part's pipeline: a part runs single-threaded, its operators never see the
+// executor.
+ExecContext PartContext(const ExecContext& ctx);
+
+// The number of parts that may run ahead of the consumer: 2 * threads with an executor, else 1.
+int64_t PartWindow(const ExecContext& ctx);
+
+// Opens the part's pipeline, hands every batch with selected rows to `consume` until it returns
+// false or the pipeline ends, and closes the pipeline. Once `stop` is set the part is abandoned
+// (its status is dropped by the scheduler).
+arrow::Status RunPart(const PartPipeline& pipeline, int64_t part, ExecContext ctx,
+                      const std::atomic<bool>& stop,
+                      const std::function<arrow::Result<bool>(Batch)>& consume);
 
 // The batches of every part in part order: a source that stands for the pipeline's top. Parts
 // run ahead on ExecContext::executor, at most 2 * threads of them at a time. With a row cap (a
