@@ -309,7 +309,7 @@ TEST(PartSchedulerTest, APartTheExecutorCannotTakeFailsNext) {
   }
 }
 
-// ---- part operators through the physical planner ----
+// ---- part operators ----
 
 class PartOperatorsTest : public testing::ExecTest {
  protected:
@@ -2021,6 +2021,103 @@ TEST_F(PartOperatorsTest, SkippingMapsScanColumnsToTableFields) {
     const auto [rows, parts] = count(table, filter);
     EXPECT_EQ(rows, 14);
     EXPECT_EQ(parts.size(), static_cast<std::size_t>(kParts)) << "a Filter above a Compute";
+  }
+}
+
+// Every part sink calls its parts-done callback once per run, on the calling thread, once it has
+// every part's result (every part was read): before it emits anything but a part union's
+// batches, which come first, and never for a run that fails.
+TEST_F(PartOperatorsTest, PartSinksCallPartsDoneOnceTheirPartsAreIn) {
+  const auto pool = Pool();
+  const auto x = Column(0, "x", LogicalType::kBigInt);
+  const auto y = Column(2, "y", LogicalType::kBigInt);
+  const std::vector<plan::AggregateCall> count_star = {
+      {.kind = plan::AggKind::kCountStar, .arg = {}, .type = LogicalType::kBigInt}};
+  const std::vector<plan::AggregateCall> two_level = {
+      {.kind = plan::AggKind::kCountDistinct, .arg = y, .type = LogicalType::kBigInt},
+      {.kind = plan::AggKind::kCountStar, .arg = {}, .type = LogicalType::kBigInt}};
+  const auto pipeline_of = [](const std::shared_ptr<MemoryTable>& table) -> PartPipeline {
+    return [table](int64_t part) -> arrow::Result<std::unique_ptr<Operator>> {
+      return std::make_unique<TableScanOperator>(table, std::vector<int>{0, 1, 2}, part);
+    };
+  };
+  // The sinks over a table's parts, and how many rows each emits.
+  const auto sinks = [&](const std::shared_ptr<MemoryTable>& table) {
+    const PartPipeline pipeline = pipeline_of(table);
+    const auto schema = pipeline(0).ValueOrDie()->output_schema();
+    std::vector<std::pair<std::unique_ptr<PartSink>, int64_t>> made;
+    made.emplace_back(std::make_unique<PartUnionOperator>(pipeline, kParts, schema, std::nullopt),
+                      kParts * kRows);
+    made.emplace_back(std::make_unique<PartAggregateOperator>(pipeline, kParts, 3, count_star), 1);
+    const GroupAggregateOperator grouped(pipeline(0).ValueOrDie(), {x}, count_star);
+    made.emplace_back(std::make_unique<PartGroupAggregateOperator>(
+                          pipeline, kParts, 3, std::vector<plan::BoundColumn>{x}, count_star,
+                          grouped.output_schema()),
+                      kParts * kRows);
+    const ScalarAggregateOperator global(pipeline(0).ValueOrDie(), two_level);
+    made.emplace_back(std::make_unique<PartTwoLevelAggregateOperator>(
+                          pipeline, kParts, 2, 3, std::vector<plan::BoundColumn>{}, two_level,
+                          global.output_schema(), /*global=*/true),
+                      1);
+    made.emplace_back(std::make_unique<PartTopNOperator>(
+                          pipeline, kParts, schema,
+                          std::vector<plan::SortKey>{{.column = x, .descending = true}}, 5, 0),
+                      5);
+    return made;
+  };
+  for (arrow::internal::Executor* executor :
+       {static_cast<arrow::internal::Executor*>(nullptr),
+        static_cast<arrow::internal::Executor*>(pool.get())}) {
+    SCOPED_TRACE(executor == nullptr ? "one thread" : "pool");
+    ExecContext ctx{.pool = arrow::default_memory_pool(),
+                    .batch_size = 3,
+                    .executor = executor,
+                    .threads = executor == nullptr ? 1 : kThreads};
+    const auto table = Table();
+    auto made = sinks(table);
+    for (std::size_t i = 0; i < made.size(); ++i) {
+      SCOPED_TRACE(i);
+      PartSink& sink = *made[i].first;
+      int calls = 0;
+      std::size_t scanned = 0;  // the parts read when the callback came
+      int64_t emitted = -1;     // the rows emitted when it came
+      int64_t rows = 0;
+      const std::thread::id consumer = std::this_thread::get_id();
+      sink.set_parts_done([&] {
+        ++calls;
+        scanned = table->scanned_parts().size();
+        emitted = rows;
+        EXPECT_EQ(std::this_thread::get_id(), consumer);
+      });
+      for (int run = 1; run <= 2; ++run) {
+        rows = 0;
+        const std::size_t before = table->scanned_parts().size();
+        ASSERT_TRUE(sink.Open(ctx).ok());
+        while (true) {
+          auto batch = sink.Next();
+          ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+          if (batch->end()) {
+            break;
+          }
+          rows += batch->selected_rows();
+        }
+        EXPECT_TRUE(sink.Close().ok());
+        EXPECT_EQ(rows, made[i].second);
+        EXPECT_EQ(calls, run);
+        EXPECT_EQ(scanned - before, static_cast<std::size_t>(kParts));
+        EXPECT_EQ(emitted, i == 0 ? made[i].second : 0);  // a union has emitted every batch
+      }
+    }
+    // A run that fails: no callback.
+    const auto failing = Table();
+    failing->FailPart(7);
+    for (auto& [sink, expected] : sinks(failing)) {
+      int calls = 0;
+      sink->set_parts_done([&calls] { ++calls; });
+      const auto result = Drain(*sink, ctx);
+      EXPECT_TRUE(result.status().IsIOError()) << result.status().ToString();
+      EXPECT_EQ(calls, 0);
+    }
   }
 }
 

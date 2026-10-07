@@ -125,12 +125,21 @@ arrow::Result<Batch> PartUnionOperator::Next() {
     current_.reset();
     next_ = 0;
     if (scheduler_->done()) {
+      if (!ended_) {
+        ended_ = true;
+        PartsDone();
+      }
       return Batch{};
     }
-    {
+    arrow::Result<PartBatches> part = [&] {
       const ProfileTimer wait(profile(), "wait");
-      ARROW_ASSIGN_OR_RAISE(current_, scheduler_->Next());
+      return scheduler_->Next();
+    }();
+    if (!part.ok()) {
+      ended_ = true;  // a failed run: its parts are not done
+      return part.status();
     }
+    current_ = *std::move(part);
   }
 }
 
@@ -138,6 +147,7 @@ arrow::Status PartUnionOperator::Close() {
   scheduler_.reset();  // stops the parts still running and waits for them
   current_.reset();
   next_ = 0;
+  ended_ = false;
   return arrow::Status::OK();
 }
 
@@ -195,6 +205,7 @@ arrow::Result<Batch> PartAggregateOperator::Next() {
     ARROW_RETURN_NOT_OK(total.Merge(*part));
   }
   done_ = true;
+  PartsDone();
   ARROW_ASSIGN_OR_RAISE(auto row, total.Finalize(schema_, pool_));
   return Batch{.data = std::move(row), .selection = {}};
 }
@@ -379,6 +390,7 @@ arrow::Result<Batch> PartGroupAggregateOperator::Next() {
     ARROW_RETURN_NOT_OK(Merge());
     merged_ = true;
     scheduler_.reset();
+    PartsDone();
     rows_.assign(tables_.size(), {});
     if (profile() != nullptr) {
       int64_t groups = 0;
@@ -775,6 +787,7 @@ arrow::Status PartTwoLevelAggregateOperator::Aggregate() {
     ARROW_RETURN_NOT_OK(lanes.Finish());
   }
   ARROW_RETURN_NOT_OK(status);
+  PartsDone();
 
   // The outer level, partitions in parallel; then the heavy K's groups across the partitions.
   outer_.clear();
@@ -946,6 +959,7 @@ arrow::Result<Batch> PartTopNOperator::Next() {
       ARROW_RETURN_NOT_OK(memory_.Resize(merged_->memory_usage()));
     }
     scheduler_.reset();
+    PartsDone();
     ARROW_RETURN_NOT_OK(memory_.Resize(merged_->memory_usage() + merged_->sort_memory()));
     ARROW_RETURN_NOT_OK(merged_->Sort(pool_));
     ARROW_RETURN_NOT_OK(memory_.Resize(merged_->memory_usage()));
