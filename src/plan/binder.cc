@@ -2438,7 +2438,8 @@ class Binder {
     if (!alias_fallback_ || detail == nullptr || detail->kind() != SqlErrorDetail::Kind::kBind) {
       return std::nullopt;
     }
-    const auto alias = FindAlias(select_, ref.name);  // J2b: t.x never names an alias
+    // J2b must skip this lookup for a qualified ref: DuckDB errors there.
+    const auto alias = FindAlias(select_, ref.name);
     if (!alias.has_value()) {
       return std::nullopt;
     }
@@ -3424,7 +3425,8 @@ arrow::Status Binder::BindGroupBy() {
       if (detail == nullptr || detail->kind() != SqlErrorDetail::Kind::kBind) {
         return column.status();
       }
-      const auto alias = FindAlias(select_, ref->name);  // J2b: t.x never names an alias
+      // J2b must skip this lookup for a qualified ref: DuckDB errors there.
+      const auto alias = FindAlias(select_, ref->name);
       if (!alias.has_value()) {
         return column.status();
       }
@@ -3514,7 +3516,8 @@ arrow::Result<std::optional<Typed>> Binder::ResolveHavingName(const sql::ColumnR
                                       scope_.StoredAsFloat(table_column->id)));
     }
   }
-  const auto alias = FindAlias(select_, ref.name);  // J2b: t.x never names an alias
+  // J2b must skip this lookup for a qualified ref: DuckDB errors there.
+  const auto alias = FindAlias(select_, ref.name);
   if (!alias.has_value()) {
     return std::nullopt;
   }
