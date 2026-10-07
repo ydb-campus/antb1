@@ -664,6 +664,37 @@ TEST(QueryGenerator, JoinFeaturesChangeOnlyJoinQueries) {
   EXPECT_GT(same, 400);
 }
 
+// A join that fails fails before the first draw from the first stream, so its query falls back
+// to the query the tables give without refs. At target 100 no join fails; at target 0 partial
+// join feature sets make some fail: without kTableAlias, a join from dims read by its glob path
+// (only an alias names it, ADR 0022 rule 1), or from slots read by a path that names another
+// table.
+TEST(QueryGenerator, FailedJoinsFallBackToTheQueriesWithoutRefs) {
+  const FeatureSet base = kSupportedFeatures.Minus(kJoinFeatures);
+  for (const FeatureSet& join : {FeatureSet{Feature::kCommaJoin, Feature::kJoinOn},
+                                 FeatureSet{Feature::kCommaJoin, Feature::kQualifiedName}}) {
+    SCOPED_TRACE(join.Names());
+    const GeneratorOptions options{.supported = Union(base, join), .target_percent = 0};
+    const auto with_refs = MakeOver(JoinTables(), 47, options);
+    const auto without = MakeOver(WithoutRefs(JoinTables()), 47, options);
+    int joins = 0;
+    int dims_by_path = 0;  // 60% of them come from a join that failed
+    for (uint64_t i = 0; i < 2000; ++i) {
+      const auto q = with_refs.Generate(i);
+      if (Joins(q)) {
+        ++joins;
+        continue;
+      }
+      dims_by_path += q.table == "dims" && q.features.Has(Feature::kTablePath) ? 1 : 0;
+      const auto plain = without.Generate(i);
+      EXPECT_EQ(q.sql, plain.sql) << i;
+      EXPECT_EQ(q.features, plain.features) << i;
+    }
+    EXPECT_GT(joins, 400);
+    EXPECT_GT(dims_by_path, 30);
+  }
+}
+
 bool SameName(std::string_view a, std::string_view b) {
   return plan::AsciiLower(a) == plan::AsciiLower(b);
 }
