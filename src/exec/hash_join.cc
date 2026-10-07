@@ -454,8 +454,8 @@ arrow::Result<std::optional<Batch>> HashJoinOperator::NextWindow() {
   window_ = begin + rows;
   const std::span<const JoinMatches> matches = std::span<const JoinMatches>(matches_).subspan(
       static_cast<std::size_t>(begin), static_cast<std::size_t>(rows));
-  const auto matched = static_cast<int64_t>(
-      std::ranges::count_if(matches, [](const JoinMatches& m) { return m.end > m.begin; }));
+  const int64_t matched =
+      std::ranges::count_if(matches, [](const JoinMatches& m) { return m.end > m.begin; });
   if (matched == 0) {
     return std::nullopt;
   }
