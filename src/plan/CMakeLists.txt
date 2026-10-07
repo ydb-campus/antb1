@@ -12,6 +12,7 @@ if(ANTB1_BUILD_TESTS)
       tests/types_test.cc
       tests/literal_test.cc
       tests/binder_test.cc
+      tests/scope_test.cc
       tests/column_ids_test.cc
       tests/folding_test.cc
       tests/optimizer_test.cc
