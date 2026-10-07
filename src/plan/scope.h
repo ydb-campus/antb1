@@ -109,8 +109,9 @@ struct ColumnLocation {
 // scope of an inner block may point at it.
 class Scope {
  public:
-  // `outer` is the scope of the enclosing block (nullptr: none), which must outlive this one. It
-  // is not consulted yet: correlations (rule 9 of ADR 0022, ADR 0023) come with roadmap PR J5.
+  // `outer` is the scope of the enclosing block (nullptr: none), which must outlive this one.
+  // Nothing consults it yet: rule 9 of ADR 0022 (a name found only in an enclosing block is a
+  // correlation, ADR 0023) comes with roadmap PR J5.
   explicit Scope(std::vector<Binding> bindings, const Scope* outer = nullptr);
   Scope(const Scope&) = delete;
   Scope& operator=(const Scope&) = delete;
