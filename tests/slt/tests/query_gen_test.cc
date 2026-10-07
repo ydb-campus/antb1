@@ -9,11 +9,15 @@
 #include <format>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <optional>
+#include <ranges>
 #include <regex>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <arrow/api.h>
@@ -21,7 +25,13 @@
 #include <gtest/gtest.h>
 #include <parquet/arrow/writer.h>
 
+#include "antb1/plan/catalog.h"
+#include "antb1/sql/ast.h"
+#include "antb1/sql/parser.h"
+
 #include "canonical.h"
+#include "join_tables.h"
+#include "sql_parser_property.h"
 #include "supported_features.h"
 #include "tables.h"
 
@@ -76,10 +86,34 @@ GenKeyStats Stats(int64_t non_null, int64_t distinct, int64_t max_multiplicity) 
       .non_null = non_null, .distinct = distinct, .max_multiplicity = max_multiplicity};
 }
 
-QueryGenerator Make(uint64_t seed, GeneratorOptions options) {
-  auto gen = QueryGenerator::Make(Tables(), seed, options);
+// `tables` without their refs: no query joins.
+std::vector<GenTable> WithoutRefs(std::vector<GenTable> tables) {
+  for (GenTable& t : tables) {
+    t.refs.clear();
+  }
+  return tables;
+}
+
+constexpr FeatureSet kJoinFeatures = {Feature::kCommaJoin, Feature::kJoinOn, Feature::kTableAlias,
+                                      Feature::kQualifiedName};
+
+FeatureSet Union(FeatureSet a, FeatureSet b) {
+  a.Add(b);
+  return a;
+}
+
+bool Joins(const GeneratedQuery& q) {
+  return q.features.Has(Feature::kCommaJoin) || q.features.Has(Feature::kJoinOn);
+}
+
+QueryGenerator MakeOver(std::vector<GenTable> tables, uint64_t seed, GeneratorOptions options) {
+  auto gen = QueryGenerator::Make(std::move(tables), seed, options);
   EXPECT_TRUE(gen.has_value()) << gen.error();
   return *std::move(gen);
+}
+
+QueryGenerator Make(uint64_t seed, GeneratorOptions options) {
+  return MakeOver(Tables(), seed, options);
 }
 
 TEST(QueryGenerator, EachIndexIsAPureFunctionOfTheSeed) {
@@ -97,21 +131,26 @@ TEST(QueryGenerator, EachIndexIsAPureFunctionOfTheSeed) {
   EXPECT_GT(differ, 50) << "another seed must give other queries";
 }
 
+// Over tables without refs (Tables()) and with them (JoinTables()) together, so that the join
+// features count as seen once kSupportedFeatures declares them (roadmap PR J2b).
 TEST(QueryGenerator, SupportedQueriesUseOnlySupportedFeatures) {
   const FeatureSet richer = {Feature::kCountStar,      Feature::kSum,
                              Feature::kTableName,      Feature::kWhere,
                              Feature::kIntegerColumns, Feature::kIntegerLiteral,
                              Feature::kMultipleItems,  Feature::kKeywordCase};
-  for (const FeatureSet& supported : {kSupportedFeatures, richer}) {
-    const auto gen = Make(7, {.supported = supported, .target_percent = 0});
+  for (const FeatureSet& supported :
+       {kSupportedFeatures, richer, Union(kSupportedFeatures, kJoinFeatures)}) {
     FeatureSet seen;
-    for (uint64_t i = 0; i < 500; ++i) {
-      const auto q = gen.Generate(i);
-      EXPECT_FALSE(q.target_sample);
-      EXPECT_FALSE(q.sql.empty());
-      EXPECT_TRUE(supported.Contains(q.features))
-          << q.sql << "\n  uses " << q.features.Minus(supported).Names();
-      seen.Add(q.features);
+    for (const auto& tables : {Tables(), JoinTables()}) {
+      const auto gen = MakeOver(tables, 7, {.supported = supported, .target_percent = 0});
+      for (uint64_t i = 0; i < 500; ++i) {
+        const auto q = gen.Generate(i);
+        EXPECT_FALSE(q.target_sample);
+        EXPECT_FALSE(q.sql.empty());
+        EXPECT_TRUE(supported.Contains(q.features))
+            << q.sql << "\n  uses " << q.features.Minus(supported).Names();
+        seen.Add(q.features);
+      }
     }
     EXPECT_EQ(seen, supported) << "seen: " << seen.Names();
   }
@@ -119,13 +158,15 @@ TEST(QueryGenerator, SupportedQueriesUseOnlySupportedFeatures) {
 
 TEST(QueryGenerator, TargetSamplesCoverTheWholeGrammar) {
   // A Feature without generator support fails here (runner/query_gen.cc must learn it), unless it
-  // waits in kGeneratorPending.
-  const auto gen = Make(11, {.supported = kSupportedFeatures, .target_percent = 100});
+  // waits in kGeneratorPending. The joins need tables with refs.
   FeatureSet seen;
-  for (uint64_t i = 0; i < 4000; ++i) {
-    const auto q = gen.Generate(i);
-    EXPECT_TRUE(q.target_sample);
-    seen.Add(q.features);
+  for (const auto& tables : {Tables(), JoinTables()}) {
+    const auto gen = MakeOver(tables, 11, {.supported = kSupportedFeatures, .target_percent = 100});
+    for (uint64_t i = 0; i < 4000; ++i) {
+      const auto q = gen.Generate(i);
+      EXPECT_TRUE(q.target_sample);
+      seen.Add(q.features);
+    }
   }
   const FeatureSet expected = FeatureSet::All().Minus(kNeverGenerated).Minus(kGeneratorPending);
   EXPECT_EQ(seen, expected) << "never generated: " << expected.Minus(seen).Names();
@@ -538,6 +579,593 @@ TEST(QueryGenerator, MakeRejectsWhatCannotBeGenerated) {
   EXPECT_FALSE(
       QueryGenerator::Make(only_paths, 1, {.supported = {Feature::kCountStar, Feature::kTablePath}})
           .has_value());
+}
+
+// ---- generated joins (ADR 0022) ----
+
+TEST(QueryGenerator, JoinQueriesAreAPureFunctionOfTheSeed) {
+  const GeneratorOptions options{.supported = kSupportedFeatures, .target_percent = 50};
+  const auto a = MakeOver(JoinTables(), 42, options);
+  const auto b = MakeOver(JoinTables(), 42, options);
+  const auto c = MakeOver(JoinTables(), 43, options);
+  std::vector<std::string> sql;
+  int joins = 0;
+  int differ = 0;
+  for (uint64_t i = 0; i < 200; ++i) {
+    const auto q = a.Generate(i);
+    sql.push_back(q.sql);
+    joins += Joins(q) ? 1 : 0;
+    EXPECT_EQ(q.sql, b.Generate(i).sql) << i;
+    differ += q.sql != c.Generate(i).sql ? 1 : 0;
+  }
+  for (uint64_t i = sql.size(); i-- > 0;) {
+    EXPECT_EQ(b.Generate(i).sql, sql[i]) << "in reverse order: " << i;
+  }
+  EXPECT_GT(joins, 20);
+  EXPECT_GT(differ, 50) << "another seed must give other queries";
+}
+
+// Every generated query parses, and its canonical form reads back as the same statement: the
+// round-trip property of fuzz/sql_parser_property.h (Parse(ToSql), idempotent ToSql, depth).
+TEST(QueryGenerator, GeneratedQueriesParseAndRoundTrip) {
+  for (const auto& tables : {Tables(), JoinTables()}) {
+    for (const unsigned target : {0U, 100U}) {
+      const auto gen =
+          MakeOver(tables, 19, {.supported = kSupportedFeatures, .target_percent = target});
+      for (uint64_t i = 0; i < 2000; ++i) {
+        const auto q = gen.Generate(i);
+        const auto parsed = sql::Parse(q.sql);
+        ASSERT_TRUE(parsed.has_value()) << q.sql << "\n  " << parsed.error().message;
+        EXPECT_EQ(fuzz::SqlParserPropertyViolation(q.sql), "") << q.sql;
+      }
+    }
+  }
+}
+
+// Over tables without refs the join features change nothing: no query joins, and every query is
+// the one the other supported features alone give.
+TEST(QueryGenerator, TablesWithoutRefsGiveTheSameQueriesWithJoinFeatures) {
+  const FeatureSet base = kSupportedFeatures.Minus(kJoinFeatures);
+  for (const auto& tables : {Tables(), WithoutRefs(JoinTables())}) {
+    const auto plain = MakeOver(tables, 23, {.supported = base, .target_percent = 0});
+    const auto joins =
+        MakeOver(tables, 23, {.supported = Union(base, kJoinFeatures), .target_percent = 0});
+    for (uint64_t i = 0; i < 2000; ++i) {
+      const auto p = plain.Generate(i);
+      const auto j = joins.Generate(i);
+      EXPECT_EQ(p.sql, j.sql) << i;
+      EXPECT_EQ(p.features, j.features) << i;
+    }
+  }
+}
+
+// Every draw that only a join needs comes from a second random stream: over tables with refs, a
+// query that joins nothing is the query the tables give without refs, whichever table it reads.
+// (At target 100 the supported set is ignored: the refs make the only difference.)
+TEST(QueryGenerator, JoinFeaturesChangeOnlyJoinQueries) {
+  const GeneratorOptions options{.supported = kSupportedFeatures, .target_percent = 100};
+  const auto with_refs = MakeOver(JoinTables(), 29, options);
+  const auto without = MakeOver(WithoutRefs(JoinTables()), 29, options);
+  int joins = 0;
+  int same = 0;
+  for (uint64_t i = 0; i < 2000; ++i) {
+    const auto q = with_refs.Generate(i);
+    const auto plain = without.Generate(i);
+    EXPECT_FALSE(Joins(plain)) << plain.sql;
+    if (Joins(q)) {
+      ++joins;
+      continue;
+    }
+    ++same;
+    EXPECT_EQ(q.sql, plain.sql) << i;
+    EXPECT_EQ(q.features, plain.features) << i;
+  }
+  EXPECT_GT(joins, 400) << "more than 20% of the queries join";
+  EXPECT_GT(same, 400);
+}
+
+bool SameName(std::string_view a, std::string_view b) {
+  return plan::AsciiLower(a) == plan::AsciiLower(b);
+}
+
+bool HasColumn(const GenTable& t, std::string_view name) {
+  return std::ranges::any_of(t.columns, [&](const GenColumn& c) { return SameName(c.name, name); });
+}
+
+// The name of a FROM '<path>' item without an alias (ADR 0022 rule 1): its file name up to the
+// first dot, leading dots skipped, or the whole path when it has a glob character.
+std::string PathBindingName(std::string_view path) {
+  if (path.find_first_of("*?[") != std::string_view::npos) {
+    return std::string(path);
+  }
+  std::string_view file = path.substr(path.find_last_of('/') + 1);
+  file.remove_prefix(std::min(file.find_first_not_of('.'), file.size()));
+  return std::string(file.substr(0, file.find('.')));
+}
+
+// Calls `f` on every node of an expression tree, parents first.
+template <class F>
+void ForEachNode(const sql::Expr& e, const F& f) {
+  f(e);
+  std::visit(
+      [&f](const auto& node) {
+        using Node = std::remove_cvref_t<decltype(node)>;
+        if constexpr (std::is_same_v<Node, sql::AggregateCall>) {
+          if (node.arg.has_value()) {
+            ForEachNode(**node.arg, f);
+          }
+        } else if constexpr (std::is_same_v<Node, sql::UnaryExpr> ||
+                             std::is_same_v<Node, sql::CastExpr>) {
+          ForEachNode(*node.operand, f);
+        } else if constexpr (std::is_same_v<Node, sql::BinaryExpr>) {
+          ForEachNode(*node.left, f);
+          ForEachNode(*node.right, f);
+        } else if constexpr (std::is_same_v<Node, sql::LikeExpr>) {
+          ForEachNode(*node.operand, f);
+          ForEachNode(*node.pattern, f);
+        } else if constexpr (std::is_same_v<Node, sql::InExpr>) {
+          ForEachNode(*node.operand, f);
+          for (const sql::Expr& value : node.list) {
+            ForEachNode(value, f);
+          }
+        } else if constexpr (std::is_same_v<Node, sql::BetweenExpr>) {
+          ForEachNode(*node.operand, f);
+          ForEachNode(*node.low, f);
+          ForEachNode(*node.high, f);
+        } else if constexpr (std::is_same_v<Node, sql::FunctionCall>) {
+          for (const sql::Expr& arg : node.args) {
+            ForEachNode(arg, f);
+          }
+        } else if constexpr (std::is_same_v<Node, sql::CaseExpr>) {
+          if (node.operand.has_value()) {
+            ForEachNode(**node.operand, f);
+          }
+          for (const sql::CaseBranch& branch : node.branches) {
+            ForEachNode(*branch.when, f);
+            ForEachNode(*branch.then, f);
+          }
+          if (node.otherwise.has_value()) {
+            ForEachNode(**node.otherwise, f);
+          }
+        } else if constexpr (std::is_same_v<Node, sql::ExtractExpr>) {
+          ForEachNode(*node.source, f);
+        }
+      },
+      static_cast<const sql::ExprNode&>(e));
+}
+
+const sql::ColumnRef* AsColumn(const sql::Expr& e) {
+  return std::get_if<sql::ColumnRef>(&static_cast<const sql::ExprNode&>(e));
+}
+
+// A ref of JoinTables() that joins can follow.
+struct JoinRef {
+  std::string child;
+  std::vector<std::string> columns;
+  std::string parent;
+  std::vector<std::string> ref_columns;
+};
+
+std::vector<JoinRef> UsableJoinRefs() {
+  return {
+      {.child = "facts", .columns = {"f_dim"}, .parent = "dims", .ref_columns = {"d_id"}},
+      {.child = "facts", .columns = {"f_alt"}, .parent = "dims", .ref_columns = {"d_id"}},
+      {.child = "facts", .columns = {"f_code"}, .parent = "codes", .ref_columns = {"c_code"}},
+      {.child = "facts",
+       .columns = {"f_dim", "f_day"},
+       .parent = "slots",
+       .ref_columns = {"s_dim", "s_day"}},
+      {.child = "facts", .columns = {"f_amount"}, .parent = "dims", .ref_columns = {"d_amount"}},
+      {.child = "dims", .columns = {"d_parent"}, .parent = "dims", .ref_columns = {"d_id"}},
+  };
+}
+
+// What the join queries of a run covered (CheckJoin).
+struct JoinCoverage {
+  int queries = 0;
+  int three_tables = 0;
+  int comma = 0;
+  int cross = 0;
+  int join = 0;
+  int inner = 0;
+  int alias_with_as = 0;
+  int alias_without_as = 0;
+  int path = 0;
+  int path_qualifier = 0;
+  int dotted_path_name = 0;
+  int repeated_table = 0;
+  int facts_twice = 0;
+  int two_column_key = 0;
+  int decimal_key = 0;
+  int empty_table = 0;
+  int sibling_on = 0;
+  int closing_edge = 0;
+  int on_condition = 0;
+  int unconnected_start = 0;
+  int star_without_limit = 0;
+  int decimal_comparison = 0;
+};
+
+// Checks a generated join over JoinTables() against the algorithm, on its AST: 2 or 3 inner FROM
+// items of distinct names (ADR 0022 rule 1); every column reference names one item that has the
+// column (no ambiguous or hidden names, every reference qualified next to slots, whose skipped
+// columns are unknown); an ON reads only its own and earlier items (rule 10); the top-level
+// equalities of refs' keys in WHERE and ON connect every item, and never compare columns a join
+// cannot (DOUBLE, 48 DECIMAL digits, INTEGER to VARCHAR); SELECT * has a LIMIT unless the bound
+// is at most 50; no column typed through clickbench next to a path item (D2); facts stands twice
+// only through the empty codes (bound 0); and the features match the AST.
+void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, JoinCoverage& cov) {
+  SCOPED_TRACE(q.sql);
+  const auto parsed = sql::Parse(q.sql);
+  ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+  const sql::SelectStatement& stmt = *parsed;
+  ASSERT_GE(stmt.from.size(), 2U);
+  ASSERT_LE(stmt.from.size(), 3U);
+  ++cov.queries;
+  cov.three_tables += stmt.from.size() == 3 ? 1 : 0;
+  struct Item {
+    const GenTable* table = nullptr;
+    std::string name;
+    bool path = false;
+    bool aliased = false;
+  };
+  std::vector<Item> items;
+  bool comma = false;
+  bool join_on = false;
+  for (const sql::FromItem& item : stmt.from) {
+    ASSERT_NE(item.connector, sql::Connector::kLeft);
+    const bool path = item.table.kind == sql::TableRef::Kind::kPath;
+    const auto table = std::ranges::find_if(tables, [&](const GenTable& t) {
+      return path ? t.path == item.table.name : SameName(t.name, item.table.name);
+    });
+    ASSERT_NE(table, tables.end()) << item.table.name;
+    std::string name =
+        item.alias.value_or(path ? PathBindingName(item.table.name) : item.table.name);
+    for (const Item& other : items) {
+      EXPECT_FALSE(SameName(other.name, name)) << "two FROM items named " << name;
+      cov.repeated_table += other.table == &*table ? 1 : 0;
+    }
+    comma = comma || item.connector == sql::Connector::kComma ||
+            item.connector == sql::Connector::kCross;
+    join_on = join_on || item.connector == sql::Connector::kInner;
+    cov.comma += item.connector == sql::Connector::kComma ? 1 : 0;
+    cov.cross += item.connector == sql::Connector::kCross ? 1 : 0;
+    if (item.connector == sql::Connector::kInner) {
+      ++cov.join;
+      const std::string connector = plan::AsciiLower(
+          std::string_view(q.sql).substr(item.connector_span.offset, item.connector_span.length));
+      cov.inner += connector.starts_with("inner") ? 1 : 0;
+    }
+    if (item.alias.has_value()) {
+      const std::string alias = plan::AsciiLower(
+          std::string_view(q.sql).substr(item.alias_span.offset, item.alias_span.length));
+      (alias.starts_with("as") ? cov.alias_with_as : cov.alias_without_as) += 1;
+    }
+    cov.path += path ? 1 : 0;
+    cov.dotted_path_name += path && !item.alias.has_value() && table->name == "codes" ? 1 : 0;
+    cov.empty_table += table->rows == 0 ? 1 : 0;
+    items.push_back(Item{.table = &*table,
+                         .name = std::move(name),
+                         .path = path,
+                         .aliased = item.alias.has_value()});
+  }
+  const auto count_of = [&](std::string_view table) {
+    return std::ranges::count_if(items, [&](const Item& i) { return i.table->name == table; });
+  };
+  const bool slots = count_of("slots") > 0;
+  const bool any_path = std::ranges::any_of(items, [](const Item& i) { return i.path; });
+  if (count_of("facts") > 1) {
+    ++cov.facts_twice;
+    EXPECT_EQ(q.row_bound, 0) << "facts twice, not through the empty codes";
+  }
+  // The item a column reference names, or npos (a select alias, or a broken reference).
+  constexpr std::size_t kNone = std::string::npos;
+  const auto item_of = [&](const sql::ColumnRef& c) {
+    std::vector<std::size_t> found;
+    for (std::size_t k = 0; k < items.size(); ++k) {
+      if (c.qualifier.empty() ? HasColumn(*items[k].table, c.name)
+                              : SameName(items[k].name, c.qualifier)) {
+        found.push_back(k);
+      }
+    }
+    return found.size() == 1 ? found.front() : kNone;
+  };
+  bool qualified = false;
+  const auto check_columns = [&](const sql::Expr& e, std::size_t scope) {
+    ForEachNode(e, [&](const sql::Expr& node) {
+      const sql::ColumnRef* c = AsColumn(node);
+      if (c == nullptr) {
+        return;
+      }
+      static const std::regex select_alias("a[1-3]");
+      if (c->qualifier.empty() && std::ranges::none_of(items, [&](const Item& i) {
+            return HasColumn(*i.table, c->name);
+          })) {
+        EXPECT_TRUE(std::regex_match(c->name, select_alias)) << c->name << ": no such column";
+        return;
+      }
+      const std::size_t k = item_of(*c);
+      ASSERT_NE(k, kNone) << c->qualifier << "." << c->name << ": ambiguous or no such item";
+      EXPECT_TRUE(HasColumn(*items[k].table, c->name))
+          << c->qualifier << "." << c->name << ": a name the item does not have";
+      EXPECT_LE(k, scope) << c->name << ": an ON reads a later FROM item";
+      EXPECT_TRUE(!slots || !c->qualifier.empty()) << c->name << ": unqualified next to slots";
+      EXPECT_FALSE(any_path && SameName(c->name, "EventDate")) << "clickbench typing (D2)";
+      qualified = qualified || !c->qualifier.empty();
+      cov.path_qualifier += !c->qualifier.empty() && items[k].path && !items[k].aliased ? 1 : 0;
+    });
+  };
+  // Equalities of a usable ref's key columns between two items: (child item, parent item, ref,
+  // key column).
+  const std::vector<JoinRef> refs = UsableJoinRefs();
+  std::vector<std::array<std::size_t, 4>> halves;
+  const auto key_half = [&](const sql::Expr& e) {
+    const auto* eq = std::get_if<sql::BinaryExpr>(&static_cast<const sql::ExprNode&>(e));
+    if (eq == nullptr || eq->op != sql::BinaryOp::kEq) {
+      return false;
+    }
+    const sql::ColumnRef* l = AsColumn(*eq->left);
+    const sql::ColumnRef* r = AsColumn(*eq->right);
+    if (l == nullptr || r == nullptr) {
+      return false;
+    }
+    const std::size_t li = item_of(*l);
+    const std::size_t ri = item_of(*r);
+    if (li == kNone || ri == kNone || li == ri) {
+      return false;
+    }
+    bool found = false;
+    for (std::size_t n = 0; n < refs.size(); ++n) {
+      for (std::size_t k = 0; k < refs[n].columns.size(); ++k) {
+        const auto matches = [&](std::size_t ci, const sql::ColumnRef& cc, std::size_t pi,
+                                 const sql::ColumnRef& pc) {
+          return items[ci].table->name == refs[n].child && SameName(cc.name, refs[n].columns[k]) &&
+                 items[pi].table->name == refs[n].parent &&
+                 SameName(pc.name, refs[n].ref_columns[k]);
+        };
+        if (matches(li, *l, ri, *r)) {
+          halves.push_back({li, ri, n, k});
+          found = true;
+        } else if (matches(ri, *r, li, *l)) {
+          halves.push_back({ri, li, n, k});
+          found = true;
+        }
+      }
+    }
+    return found;
+  };
+  for (const sql::SelectItem& item : stmt.items) {
+    check_columns(item.expr, kNone);
+  }
+  bool condition = false;  // a WHERE or ON conjunct that is no key
+  for (std::size_t k = 0; k < stmt.from.size(); ++k) {
+    // Rule 10: the items up to this one; those before the last comma are earlier comma siblings.
+    std::size_t group = 0;
+    for (std::size_t g = 1; g <= k; ++g) {
+      group = stmt.from[g].connector == sql::Connector::kComma ? g : group;
+    }
+    bool sibling = false;
+    bool extra = false;
+    for (const sql::Expr& conjunct : stmt.from[k].on) {
+      check_columns(conjunct, k);
+      ForEachNode(conjunct, [&](const sql::Expr& node) {
+        if (const sql::ColumnRef* c = AsColumn(node)) {
+          sibling = sibling || item_of(*c) < group;
+        }
+      });
+      extra = !key_half(conjunct) || extra;
+    }
+    cov.sibling_on += sibling ? 1 : 0;
+    cov.on_condition += extra ? 1 : 0;
+    condition = condition || extra;
+  }
+  for (const sql::Expr& conjunct : stmt.where) {
+    check_columns(conjunct, kNone);
+    condition = !key_half(conjunct) || condition;
+  }
+  for (const auto& e : stmt.group_by) {
+    check_columns(e, kNone);
+  }
+  for (const sql::Expr& e : stmt.having) {
+    check_columns(e, kNone);
+  }
+  for (const sql::OrderItem& item : stmt.order_by) {
+    check_columns(item.expr, kNone);
+  }
+  // Edges: every key column of a ref equal between the same two items. They connect every item.
+  std::vector<std::size_t> component(items.size());
+  std::ranges::iota(component, std::size_t{0});
+  const auto root = [&](std::size_t k) {
+    while (component[k] != k) {
+      k = component[k];
+    }
+    return k;
+  };
+  std::size_t edges = 0;
+  bool first_two = false;
+  std::vector<int64_t> bounds;
+  for (std::size_t n = 0; n < refs.size(); ++n) {
+    for (std::size_t ci = 0; ci < items.size(); ++ci) {
+      for (std::size_t pi = 0; pi < items.size(); ++pi) {
+        const bool all = std::ranges::all_of(
+            std::views::iota(std::size_t{0}, refs[n].columns.size()), [&](std::size_t k) {
+              return std::ranges::contains(halves, std::array<std::size_t, 4>{ci, pi, n, k});
+            });
+        if (ci == pi || !all) {
+          continue;
+        }
+        ++edges;
+        component[root(ci)] = root(pi);
+        first_two = first_two || (std::min(ci, pi) == 0 && std::max(ci, pi) == 1);
+        cov.two_column_key += refs[n].columns.size() == 2 ? 1 : 0;
+        cov.decimal_key += refs[n].columns.front() == "f_amount" ? 1 : 0;
+        const GenTable& child = *items[ci].table;
+        const auto ref = std::ranges::find_if(child.refs, [&](const GenRef& r) {
+          return r.table == refs[n].parent && r.columns == refs[n].columns;
+        });
+        if (ref != child.refs.end()) {
+          bounds.push_back(JoinRowBound(ref->stats, ref->ref_stats));
+        }
+      }
+    }
+  }
+  for (std::size_t k = 0; k < items.size(); ++k) {
+    EXPECT_EQ(root(k), root(0)) << "FROM item " << k << " is not connected by keys";
+  }
+  cov.closing_edge += edges > items.size() - 1 ? 1 : 0;
+  cov.unconnected_start += first_two ? 0 : 1;
+  EXPECT_LE(q.row_bound, 10'000);
+  if (items.size() == 2) {
+    EXPECT_TRUE(std::ranges::contains(bounds, q.row_bound)) << "bound " << q.row_bound;
+  }
+  // Comparisons of two columns never mix what DuckDB compares otherwise: no DOUBLE key, no
+  // common DECIMAL type beyond 38 digits (D13: f_wide against d_fine, d_amount, f_amount or
+  // s_hours), no INTEGER against VARCHAR.
+  const auto comparisons = [&](const sql::Expr& e) {
+    ForEachNode(e, [&](const sql::Expr& node) {
+      const auto* b = std::get_if<sql::BinaryExpr>(&static_cast<const sql::ExprNode&>(node));
+      if (b == nullptr || b->op < sql::BinaryOp::kEq || b->op > sql::BinaryOp::kGe) {
+        return;
+      }
+      const sql::ColumnRef* l = AsColumn(*b->left);
+      const sql::ColumnRef* r = AsColumn(*b->right);
+      if (l == nullptr || r == nullptr) {
+        return;
+      }
+      const auto pair = [&](std::string_view x, std::string_view y) {
+        return (SameName(l->name, x) && SameName(r->name, y)) ||
+               (SameName(l->name, y) && SameName(r->name, x));
+      };
+      EXPECT_FALSE(pair("f_ratio", "d_ratio") && b->op == sql::BinaryOp::kEq);
+      EXPECT_FALSE(pair("f_wide", "d_fine") || pair("f_wide", "d_amount") ||
+                   pair("f_wide", "f_amount") || pair("f_wide", "s_hours"));
+      EXPECT_FALSE(pair("f_id", "c_code"));
+      cov.decimal_comparison += pair("d_fine", "f_amount") ? 1 : 0;
+    });
+  };
+  for (const sql::SelectItem& item : stmt.items) {
+    comparisons(item.expr);
+  }
+  for (const sql::FromItem& item : stmt.from) {
+    for (const sql::Expr& conjunct : item.on) {
+      comparisons(conjunct);
+    }
+  }
+  for (const sql::Expr& conjunct : stmt.where) {
+    comparisons(conjunct);
+  }
+  if (stmt.star) {
+    EXPECT_TRUE(stmt.limit.has_value() || q.row_bound <= 50) << "bound " << q.row_bound;
+    cov.star_without_limit += stmt.limit.has_value() ? 0 : 1;
+    EXPECT_FALSE(any_path && std::ranges::any_of(items,
+                                                 [](const Item& i) {
+                                                   return std::ranges::any_of(
+                                                       i.table->columns, [](const GenColumn& c) {
+                                                         return c.via_override;
+                                                       });
+                                                 }))
+        << "SELECT * reads a column typed through clickbench next to a path (D2)";
+  }
+  EXPECT_EQ(q.features.Has(Feature::kCommaJoin), comma);
+  EXPECT_EQ(q.features.Has(Feature::kJoinOn), join_on);
+  EXPECT_EQ(q.features.Has(Feature::kTableAlias),
+            std::ranges::any_of(items, [](const Item& i) { return i.aliased; }));
+  EXPECT_EQ(q.features.Has(Feature::kQualifiedName), qualified);
+  EXPECT_EQ(q.features.Has(Feature::kTablePath), any_path);
+  EXPECT_EQ(q.features.Has(Feature::kTableName),
+            std::ranges::any_of(items, [](const Item& i) { return !i.path; }));
+  EXPECT_FALSE(q.features.Has(Feature::kLeftJoin));
+  EXPECT_TRUE(!condition || q.features.Has(Feature::kWhere)) << "a condition beyond the keys";
+  EXPECT_TRUE(std::ranges::any_of(items, [&](const Item& i) { return i.table->name == q.table; }));
+}
+
+TEST(QueryGenerator, JoinQueriesFollowTheRefs) {
+  const std::vector<GenTable> tables = JoinTables();
+  const auto gen = MakeOver(tables, 31, {.supported = kSupportedFeatures, .target_percent = 100});
+  JoinCoverage cov;
+  for (uint64_t i = 0; cov.queries < 4000 && i < 20'000; ++i) {
+    const auto q = gen.Generate(i);
+    if (Joins(q)) {
+      CheckJoin(q, tables, cov);
+    }
+  }
+  EXPECT_EQ(cov.queries, 4000);
+  EXPECT_GT(cov.three_tables, 0);
+  EXPECT_GT(cov.comma, 0);
+  EXPECT_GT(cov.cross, 0);
+  EXPECT_GT(cov.join, 0);
+  EXPECT_GT(cov.inner, 0);
+  EXPECT_GT(cov.alias_with_as, 0);
+  EXPECT_GT(cov.alias_without_as, 0);
+  EXPECT_GT(cov.path, 0);
+  EXPECT_GT(cov.path_qualifier, 0);
+  EXPECT_GT(cov.dotted_path_name, 0) << "codes by its path without an alias (rule 1)";
+  EXPECT_GT(cov.repeated_table, 0) << "self-joins and dims in two roles";
+  EXPECT_GT(cov.facts_twice, 0) << "through the empty codes";
+  EXPECT_GT(cov.two_column_key, 0);
+  EXPECT_GT(cov.decimal_key, 0);
+  EXPECT_GT(cov.empty_table, 0);
+  EXPECT_GT(cov.sibling_on, 0) << "an ON that reads an earlier comma sibling";
+  EXPECT_GT(cov.closing_edge, 0);
+  EXPECT_GT(cov.on_condition, 0) << "an ON condition beyond the keys";
+  EXPECT_GT(cov.unconnected_start, 0) << "the first two FROM items share no key";
+  EXPECT_GT(cov.star_without_limit, 0);
+  EXPECT_GT(cov.decimal_comparison, 0) << "DECIMAL columns of two items compared";
+}
+
+// Join features declared one by one: a join uses only the declared ones, so the walk takes no
+// step that needs an alias (a table twice, a path that names another table) or a qualifier (a key
+// column's name in two items, a table with columns the generator skips), and other columns of a
+// name two items have are not referenced; supported queries join.
+TEST(QueryGenerator, DeclaredJoinFeaturesAppearInSupportedQueries) {
+  const std::vector<GenTable> tables = JoinTables();
+  for (const FeatureSet& join : {kJoinFeatures, FeatureSet{Feature::kCommaJoin, Feature::kJoinOn},
+                                 FeatureSet{Feature::kJoinOn, Feature::kTableAlias},
+                                 FeatureSet{Feature::kCommaJoin, Feature::kQualifiedName}}) {
+    SCOPED_TRACE(join.Names());
+    const FeatureSet base = kSupportedFeatures.Minus(kJoinFeatures);
+    const FeatureSet supported = Union(base, join);
+    const auto gen = MakeOver(tables, 37, {.supported = supported, .target_percent = 0});
+    FeatureSet seen;
+    JoinCoverage cov;
+    for (uint64_t i = 0; i < 3000; ++i) {
+      const auto q = gen.Generate(i);
+      EXPECT_TRUE(supported.Contains(q.features))
+          << q.sql << "\n  uses " << q.features.Minus(supported).Names();
+      seen.Add(q.features);
+      if (Joins(q)) {
+        CheckJoin(q, tables, cov);
+      }
+    }
+    EXPECT_EQ(seen.Minus(base), join) << "seen: " << seen.Names();
+    EXPECT_GT(cov.queries, 300);
+  }
+}
+
+// An ON condition beyond the keys reads the columns of the items up to its own; with none that a
+// literal can meet (no string literals for VARCHAR columns), the ON holds its keys only.
+TEST(QueryGenerator, OnConditionsNeedComparableColumnsInScope) {
+  GenTable parent{.name = "parent", .path = {}, .rows = 10, .columns = {}};
+  parent.columns = {{.name = "p_code", .kind = ValueKind::kVarchar, .samples = {"a"}}};
+  GenTable child{.name = "child", .path = {}, .rows = 30, .columns = {}};
+  child.columns = {{.name = "c_code", .kind = ValueKind::kVarchar, .samples = {"a"}}};
+  child.refs = {GenRef{.columns = {"c_code"},
+                       .table = "parent",
+                       .ref_columns = {"p_code"},
+                       .stats = Stats(30, 10, 3),
+                       .ref_stats = Stats(10, 10, 1)}};
+  const FeatureSet supported = {Feature::kCountStar, Feature::kCountColumn,
+                                Feature::kTableName, Feature::kVarcharColumns,
+                                Feature::kJoinOn,    Feature::kWhere};
+  const auto gen = MakeOver({parent, child}, 43, {.supported = supported, .target_percent = 0});
+  int joins = 0;
+  for (uint64_t i = 0; i < 500; ++i) {
+    const auto q = gen.Generate(i);
+    EXPECT_TRUE(supported.Contains(q.features)) << q.sql;
+    EXPECT_FALSE(q.features.Has(Feature::kWhere)) << q.sql;
+    joins += Joins(q) ? 1 : 0;
+  }
+  EXPECT_GT(joins, 100);
 }
 
 // antb1 returns a FLOAT column's values as DOUBLE, DuckDB as FLOAT (divergence D11): a FLOAT

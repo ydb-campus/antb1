@@ -33,6 +33,15 @@
 // DuckDB's capped types; / // % too, % beyond 38 digits only as a select item) stay within their
 // types over the data, since an overflow fails both engines, and SUM and AVG never add inexact
 // doubles a division made, whose sum's rounding follows the order of the additions.
+//
+// Over tables with refs (GenTable::refs), a query that may use a join feature (kCommaJoin,
+// kJoinOn) now and then joins 2 or 3 tables along them (ADR 0022): inner joins only, written as
+// commas, CROSS JOIN or [INNER] JOIN ... ON, connected through top-level equalities of the refs'
+// keys (never DOUBLE ones, DECIMAL ones only within 38 common digits), in ON or in WHERE. FROM item
+// names are distinct (aliases t1 to t3 where needed), every name that two items have is qualified
+// by its item's own name, and the join has at most max(10,000, its largest table's rows) rows by
+// JoinRowBound. Every draw that only a join needs comes from a second random stream of (s, i), so
+// a query that joins nothing is the query the same tables give without refs.
 
 namespace antb1::slt {
 
@@ -100,8 +109,9 @@ std::expected<std::vector<GenTable>, std::string> LoadGenTables(
 struct GeneratedQuery {
   uint64_t index = 0;
   std::string sql;
-  std::string table;                  // the table the query reads, for messages
-  FeatureSet features;                // every feature the SQL uses
+  std::string table;      // the table the query starts from (a join's first table), for messages
+  int64_t row_bound = 0;  // at least the rows FROM yields: the table's rows, or JoinRowBound's
+  FeatureSet features;    // every feature the SQL uses
   bool target_sample = false;         // drawn from the full target grammar
   SortMode sort = SortMode::kNoSort;  // kRowSort for projections and GROUP BY: SQL has no row order
   // LIMIT or OFFSET on a projection or GROUP BY (no ORDER BY): any rows of the unlimited answer are

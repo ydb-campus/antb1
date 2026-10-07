@@ -13,6 +13,7 @@
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -679,10 +680,144 @@ std::string_view Flip(std::string_view op) {
   return op;  // = <> != are symmetric
 }
 
+// ---- joins along refs (ADR 0022) ----
+
+// Rows a join may have at most, unless one of its tables has more: a projection of it stays as
+// small as one of a table.
+constexpr int64_t kMaxJoinRows = 10'000;
+// Share of the queries over a table that can join (a join feature allowed) that join.
+constexpr unsigned kJoinPercent = 60;
+// Salt of the second random stream of a query (Generate), which every draw that only a join needs
+// takes, so that the first stream of a query that joins nothing is never touched.
+constexpr uint64_t kJoinStreamSalt = 0x6A6F696E2D726E67ULL;
+
+std::optional<std::size_t> ColumnIndex(const GenTable& t, std::string_view name) {
+  const auto it = std::ranges::find_if(
+      t.columns, [&name](const GenColumn& c) { return SameName(c.name, name); });
+  return it == t.columns.end() ? std::nullopt
+                               : std::optional(static_cast<std::size_t>(it - t.columns.begin()));
+}
+
+// A ref whose columns a join can compare: indexes into the tables and their GenTable::columns.
+struct Edge {
+  std::size_t child = 0;   // the table whose columns reference
+  std::size_t parent = 0;  // the referenced table (child itself for a self-reference)
+  std::vector<std::size_t> child_columns;
+  std::vector<std::size_t> parent_columns;
+  GenKeyStats child_stats;
+  GenKeyStats parent_stats;
+};
+
+// The refs of `tables` that joins can follow: the table and every column resolve (ASCII
+// case-insensitively), the column lists have one length, every pair is of one kind and not DOUBLE
+// (ADR 0022 has no DOUBLE keys yet), every DECIMAL pair has a common type of at most 38 digits
+// (DuckDB caps it there, divergence D13), and no column is DATE through the clickbench option.
+std::vector<Edge> UsableEdges(const std::vector<GenTable>& tables) {
+  std::vector<Edge> edges;
+  for (std::size_t child = 0; child < tables.size(); ++child) {
+    for (const GenRef& ref : tables[child].refs) {
+      const auto parent = std::ranges::find_if(
+          tables, [&ref](const GenTable& t) { return SameName(t.name, ref.table); });
+      if (parent == tables.end() || ref.columns.empty() ||
+          ref.columns.size() != ref.ref_columns.size()) {
+        continue;
+      }
+      Edge edge{.child = child,
+                .parent = static_cast<std::size_t>(parent - tables.begin()),
+                .child_columns = {},
+                .parent_columns = {},
+                .child_stats = ref.stats,
+                .parent_stats = ref.ref_stats};
+      for (std::size_t k = 0; k < ref.columns.size(); ++k) {
+        const auto a = ColumnIndex(tables[child], ref.columns[k]);
+        const auto b = ColumnIndex(*parent, ref.ref_columns[k]);
+        if (!a.has_value() || !b.has_value()) {
+          break;
+        }
+        const GenColumn& ca = tables[child].columns[*a];
+        const GenColumn& cb = parent->columns[*b];
+        if (ca.kind != cb.kind || ca.kind == ValueKind::kDouble || ca.via_override ||
+            cb.via_override ||
+            (ca.kind == ValueKind::kDecimal && CommonDigits(ca, cb) > kMaxDecimalDigits)) {
+          break;
+        }
+        edge.child_columns.push_back(*a);
+        edge.parent_columns.push_back(*b);
+      }
+      if (edge.child_columns.size() == ref.columns.size()) {
+        edges.push_back(std::move(edge));
+      }
+    }
+  }
+  return edges;
+}
+
+// The name of a FROM '<path>' item without an alias (ADR 0022 rule 1): its file name up to the
+// first dot, leading dots skipped, or its whole text when it has a glob character.
+std::string PathName(std::string_view path) {
+  if (path.find_first_of("*?[") != std::string_view::npos) {
+    return std::string(path);
+  }
+  const std::size_t slash = path.rfind('/');
+  std::string_view file = slash == std::string_view::npos ? path : path.substr(slash + 1);
+  while (file.starts_with('.')) {
+    file.remove_prefix(1);
+  }
+  return std::string(file.substr(0, file.find('.')));
+}
+
+// Whether a table read by path may go without an alias: its path names it as its own name does.
+bool PathNamesTable(const GenTable& t) { return SameName(PathName(t.path), t.name); }
+
+// How a FROM item joins the items before it.
+enum class FromConnector : std::uint8_t { kFirst, kComma, kCross, kJoin };
+
+// An equality of two key columns of two FROM items, written in either order.
+struct KeyPair {
+  const GenColumn* left = nullptr;  // pointers into Binding::columns
+  const GenColumn* right = nullptr;
+};
+
+// A FROM item: a table by name or by path, its alias, and how it joins the items before it.
+struct Binding {
+  const GenTable* table = nullptr;
+  bool by_path = false;
+  // What qualifies its columns: the alias, else the table's name or its path's (rule 1).
+  std::string name;
+  bool aliased = false;
+  bool as_keyword = false;  // AS before the alias
+  FromConnector connector = FromConnector::kFirst;
+  bool inner_keyword = false;  // INNER JOIN
+  std::vector<KeyPair> on;     // kJoin: the keys of its ON (at least one)
+  // A join's copy of the table's columns, so that every binding's columns have their own
+  // addresses (a table may stand twice); `columns` views it, or the table's columns when the
+  // query reads one table.
+  std::vector<GenColumn> owned;
+  std::span<const GenColumn> columns;
+};
+
+struct FromList {
+  std::vector<Binding> bindings;    // in FROM order
+  std::vector<KeyPair> where_keys;  // the keys WHERE holds
+  std::string root;                 // the table the query starts from
+  int64_t rows = 0;                 // at least the rows FROM yields
+  bool any_path = false;  // a binding is read by path: no column typed through clickbench (D2)
+  // A binding's table has columns the generator skips, whose names it does not know: every
+  // reference is qualified.
+  bool other_columns = false;
+  std::vector<std::string> shared;  // lower-case names of several bindings: always qualified
+  std::size_t qualify = 0;          // the other references: 0 bare, 1 qualified, 2 by a draw each
+};
+
 class Builder {
  public:
-  Builder(const std::vector<GenTable>& tables, Rng& rng, FeatureSet allowed)
-      : tables_(tables), rng_(rng), allowed_(allowed) {}
+  // `join_rng`: the query's second stream, which every draw that only a join needs takes.
+  Builder(const std::vector<GenTable>& tables, Rng& rng, Rng& join_rng, FeatureSet allowed)
+      : tables_(tables),
+        rng_(rng),
+        join_rng_(join_rng),
+        allowed_(allowed),
+        edges_(UsableEdges(tables)) {}
 
   // A query over the first table (in random order) that admits one under `allowed`.
   std::optional<GeneratedQuery> Build() {
@@ -692,7 +827,7 @@ class Builder {
       std::swap(order[i - 1], order[rng_.Below(i)]);
     }
     for (const std::size_t t : order) {
-      if (auto q = TryTable(tables_[t])) {
+      if (auto q = TryTable(t)) {
         return q;
       }
     }
@@ -745,14 +880,24 @@ class Builder {
     return true;
   }
 
-  // By name or by path (as rolled; the other form if the rolled one admits no query).
-  std::optional<GeneratedQuery> TryTable(const GenTable& t) {
+  // By name or by path (as rolled; the other form if the rolled one admits no query), now and then
+  // joined with other tables along refs. A join draws from join_rng_ only, and TryJoin fails, if it
+  // does, before any draw from rng_: a query that joins nothing is the one the table gives
+  // without refs.
+  std::optional<GeneratedQuery> TryTable(std::size_t index) {
+    const GenTable& t = tables_[index];
     const bool can_name = allowed_.Has(Feature::kTableName);
     const bool can_path = allowed_.Has(Feature::kTablePath) && !t.path.empty();
     if (!can_name && !can_path) {
       return std::nullopt;
     }
     const bool by_path = can_path && (!can_name || rng_.Percent(20));
+    if ((allowed_.Has(Feature::kCommaJoin) || allowed_.Has(Feature::kJoinOn)) &&
+        HasJoinStep(index) && join_rng_.Percent(kJoinPercent)) {
+      if (auto q = TryJoin(index, by_path)) {
+        return q;
+      }
+    }
     if (auto q = TryTableAs(t, by_path)) {
       return q;
     }
@@ -763,15 +908,368 @@ class Builder {
     return TryTableAs(t, !by_path);
   }
 
+  // ---- joins: a walk along usable edges ----
+
+  // A FROM item of a join being planned, in walk order.
+  struct Planned {
+    std::size_t table = 0;
+    bool by_path = false;
+  };
+  // A key of the join: `edge` between the planned bindings on its child and its parent side.
+  struct PlannedKey {
+    std::size_t edge = 0;
+    std::size_t child = 0;
+    std::size_t parent = 0;
+    friend bool operator==(const PlannedKey&, const PlannedKey&) = default;
+  };
+  // A step of the walk: from the planned binding `from` along edge `edge` to its parent side
+  // (`forward`) or to its child side, a new binding of `table`; the join then has at most `rows`
+  // rows.
+  struct Step {
+    std::size_t from = 0;
+    std::size_t edge = 0;
+    bool forward = true;
+    std::size_t table = 0;
+    int64_t rows = 0;
+  };
+
+  // Whether the key columns' types are allowed.
+  [[nodiscard]] bool KeyAllowed(const Edge& edge) const {
+    const auto allowed = [this](const GenTable& t, const std::vector<std::size_t>& columns) {
+      return std::ranges::all_of(
+          columns, [&](std::size_t c) { return allowed_.Has(TypeFeature(t.columns[c].kind)); });
+    };
+    return allowed(tables_[edge.child], edge.child_columns) &&
+           allowed(tables_[edge.parent], edge.parent_columns);
+  }
+
+  // Whether the keys read the same without qualified names: no planned table has columns the
+  // generator skips (their names are unknown), and no key column's name is another binding's.
+  [[nodiscard]] bool KeysNeedNoQualifier(const std::vector<Planned>& planned,
+                                         const std::vector<PlannedKey>& keys) const {
+    if (std::ranges::any_of(planned,
+                            [this](const Planned& p) { return tables_[p.table].other_columns; })) {
+      return false;
+    }
+    const auto unique = [&](const GenTable& t, std::size_t column) {
+      return std::ranges::count_if(planned, [&](const Planned& p) {
+               return ColumnIndex(tables_[p.table], t.columns[column].name).has_value();
+             }) == 1;
+    };
+    return std::ranges::all_of(keys, [&](const PlannedKey& key) {
+      const Edge& edge = edges_[key.edge];
+      return std::ranges::all_of(edge.child_columns,
+                                 [&](std::size_t c) { return unique(tables_[edge.child], c); }) &&
+             std::ranges::all_of(edge.parent_columns,
+                                 [&](std::size_t c) { return unique(tables_[edge.parent], c); });
+    });
+  }
+
+  // Whether a new binding of `table` can be named under the allowed features: by name, or by
+  // path (with an alias unless its path names the table, ADR 0022 rule 1), and with an alias when
+  // the join has the table already.
+  [[nodiscard]] bool Nameable(const std::vector<Planned>& planned, std::size_t table) const {
+    const GenTable& t = tables_[table];
+    const bool alias = allowed_.Has(Feature::kTableAlias);
+    if (!alias &&
+        std::ranges::any_of(planned, [&](const Planned& p) { return p.table == table; })) {
+      return false;
+    }
+    return allowed_.Has(Feature::kTableName) ||
+           (allowed_.Has(Feature::kTablePath) && !t.path.empty() && (alias || PathNamesTable(t)));
+  }
+
+  // Whether a new binding of `table` is read by path: as TryTable rolls it, among the forms that
+  // can name it.
+  bool PartnerByPath(std::size_t table) {
+    const GenTable& t = tables_[table];
+    const bool can_name = allowed_.Has(Feature::kTableName);
+    const bool can_path = allowed_.Has(Feature::kTablePath) && !t.path.empty() &&
+                          (allowed_.Has(Feature::kTableAlias) || PathNamesTable(t));
+    return can_path && (!can_name || join_rng_.Percent(20));
+  }
+
+  // The steps the walk can take from the planned bindings (pure: no draw): along a usable edge
+  // whose key columns are allowed, never from one binding along one edge in one direction twice
+  // (`taken`), to a table that can be named, within max(kMaxJoinRows, the rows of the join's
+  // largest table) by the bound (JoinRowBound for the first step, then the rows so far times the
+  // new key's largest multiplicity), and, without kQualifiedName, with keys that need no qualifier.
+  [[nodiscard]] std::vector<Step> Steps(const std::vector<Planned>& planned,
+                                        const std::vector<PlannedKey>& keys,
+                                        const std::vector<Step>& taken, int64_t rows) const {
+    int64_t limit = kMaxJoinRows;
+    for (const Planned& p : planned) {
+      limit = std::max(limit, tables_[p.table].rows);
+    }
+    std::vector<Step> steps;
+    for (std::size_t from = 0; from < planned.size(); ++from) {
+      for (std::size_t e = 0; e < edges_.size(); ++e) {
+        const Edge& edge = edges_[e];
+        if (!KeyAllowed(edge)) {
+          continue;
+        }
+        for (const bool forward : {true, false}) {
+          const bool repeated = std::ranges::any_of(taken, [&](const Step& s) {
+            return s.from == from && s.edge == e && s.forward == forward;
+          });
+          if ((forward ? edge.child : edge.parent) != planned[from].table || repeated) {
+            continue;
+          }
+          const std::size_t table = forward ? edge.parent : edge.child;
+          const int64_t bound =
+              planned.size() == 1
+                  ? JoinRowBound(edge.child_stats, edge.parent_stats)
+                  : SaturatingProduct(
+                        rows, (forward ? edge.parent_stats : edge.child_stats).max_multiplicity);
+          if (bound > std::max(limit, tables_[table].rows) || !Nameable(planned, table)) {
+            continue;
+          }
+          if (!allowed_.Has(Feature::kQualifiedName)) {
+            std::vector<Planned> next = planned;
+            next.push_back(Planned{.table = table, .by_path = false});
+            std::vector<PlannedKey> next_keys = keys;
+            next_keys.push_back(
+                forward ? PlannedKey{.edge = e, .child = from, .parent = planned.size()}
+                        : PlannedKey{.edge = e, .child = planned.size(), .parent = from});
+            if (!KeysNeedNoQualifier(next, next_keys)) {
+              continue;
+            }
+          }
+          steps.push_back(
+              Step{.from = from, .edge = e, .forward = forward, .table = table, .rows = bound});
+        }
+      }
+    }
+    return steps;
+  }
+
+  // Whether a join can start at table `root` (pure: no draw).
+  [[nodiscard]] bool HasJoinStep(std::size_t root) const {
+    return !Steps({Planned{.table = root, .by_path = false}}, {}, {}, tables_[root].rows).empty();
+  }
+
+  // The alias of the FROM item at `position`: t<position + 1>, unless a table or a binding has
+  // that name (`naturals`: every binding's name without an alias; `names`: the bindings' names
+  // so far, lower case); t2_2 and so on then.
+  [[nodiscard]] std::string Alias(std::size_t position, const std::vector<std::string>& naturals,
+                                  const std::vector<std::string>& names) const {
+    const auto taken = [&](const std::string& alias) {
+      const std::string lower = plan::AsciiLower(alias);
+      return std::ranges::any_of(tables_,
+                                 [&](const GenTable& t) { return SameName(t.name, lower); }) ||
+             std::ranges::any_of(naturals,
+                                 [&](const std::string& n) { return SameName(n, lower); }) ||
+             std::ranges::contains(names, lower);
+    };
+    std::string alias = std::format("t{}", position + 1);
+    for (int n = 2; taken(alias); ++n) {
+      alias = std::format("t{}_{}", position + 1, n);
+    }
+    return alias;
+  }
+
+  // A join of 2 or 3 tables from table `root` (read by path when `root_by_path`) along usable
+  // edges, every draw from join_rng_: the walk, closing edges (another edge between two joined
+  // bindings, a second key, which only removes rows), the FROM order, the connectors, the aliases
+  // and the qualification. An edge's equalities go to the ON of the later of its two items when
+  // that item is a JOIN, else to WHERE. std::nullopt (no draw from rng_) when no join can be
+  // named or written; then TryFrom's, which also fails only before its first draw from rng_.
+  std::optional<GeneratedQuery> TryJoin(std::size_t root, bool root_by_path) {
+    const GenTable& first = tables_[root];
+    if (root_by_path && !allowed_.Has(Feature::kTableAlias) && !PathNamesTable(first)) {
+      return std::nullopt;
+    }
+    std::vector<Planned> planned = {Planned{.table = root, .by_path = root_by_path}};
+    std::vector<PlannedKey> keys;
+    std::vector<Step> taken;
+    int64_t rows = first.rows;
+    const std::size_t size = join_rng_.Percent(35) ? 3 : 2;
+    while (planned.size() < size) {
+      const std::vector<Step> steps = Steps(planned, keys, taken, rows);
+      if (steps.empty()) {
+        break;
+      }
+      const Step step = steps[join_rng_.Below(steps.size())];
+      const std::size_t added = planned.size();
+      planned.push_back(Planned{.table = step.table, .by_path = PartnerByPath(step.table)});
+      keys.push_back(step.forward
+                         ? PlannedKey{.edge = step.edge, .child = step.from, .parent = added}
+                         : PlannedKey{.edge = step.edge, .child = added, .parent = step.from});
+      taken.push_back(step);
+      rows = step.rows;
+    }
+    if (planned.size() < 2) {
+      return std::nullopt;
+    }
+    for (std::size_t e = 0; e < edges_.size(); ++e) {
+      if (!KeyAllowed(edges_[e])) {
+        continue;
+      }
+      for (std::size_t c = 0; c < planned.size(); ++c) {
+        for (std::size_t p = 0; p < planned.size(); ++p) {
+          const PlannedKey key{.edge = e, .child = c, .parent = p};
+          if (c == p || planned[c].table != edges_[e].child ||
+              planned[p].table != edges_[e].parent || std::ranges::contains(keys, key)) {
+            continue;
+          }
+          std::vector<PlannedKey> next = keys;
+          next.push_back(key);
+          if ((allowed_.Has(Feature::kQualifiedName) || KeysNeedNoQualifier(planned, next)) &&
+              join_rng_.Percent(25)) {
+            keys = std::move(next);
+          }
+        }
+      }
+    }
+    // The FROM order: the walk's, or now and then a shuffle (with commas), which can start with
+    // two tables that share no key.
+    std::vector<std::size_t> order(planned.size());  // FROM position -> planned binding
+    std::ranges::iota(order, std::size_t{0});
+    if (allowed_.Has(Feature::kCommaJoin) && join_rng_.Percent(40)) {
+      for (std::size_t i = order.size(); i > 1; --i) {
+        std::swap(order[i - 1], order[join_rng_.Below(i)]);
+      }
+    }
+    std::vector<std::size_t> position(planned.size());
+    for (std::size_t k = 0; k < order.size(); ++k) {
+      position[order[k]] = k;
+    }
+    const auto home = [&position](const PlannedKey& key) {
+      return std::max(position[key.child], position[key.parent]);
+    };
+    FromList from;
+    from.root = first.name;
+    from.rows = rows;
+    from.bindings.resize(order.size());
+    std::vector<std::string> naturals;  // every binding's name without an alias
+    for (std::size_t k = 0; k < order.size(); ++k) {
+      Binding& b = from.bindings[k];
+      b.table = &tables_[planned[order[k]].table];
+      b.by_path = planned[order[k]].by_path;
+      b.owned = b.table->columns;
+      naturals.push_back(b.by_path ? PathName(b.table->path) : b.table->name);
+      from.any_path = from.any_path || b.by_path;
+      from.other_columns = from.other_columns || b.table->other_columns;
+    }
+    // The connector of each later item: a comma or CROSS JOIN (kCommaJoin), or a JOIN (kJoinOn)
+    // when a key links the item to an earlier one, whose ON then holds that key.
+    for (std::size_t k = 1; k < order.size(); ++k) {
+      const bool commas = allowed_.Has(Feature::kCommaJoin);
+      const bool linked =
+          std::ranges::any_of(keys, [&](const PlannedKey& key) { return home(key) == k; });
+      const std::array<unsigned, 3> weights = {commas ? 40U : 0U, commas ? 15U : 0U,
+                                               allowed_.Has(Feature::kJoinOn) && linked ? 45U : 0U};
+      const unsigned total = weights[0] + weights[1] + weights[2];
+      if (total == 0) {
+        return std::nullopt;
+      }
+      const auto roll = static_cast<unsigned>(join_rng_.Below(total));
+      Binding& b = from.bindings[k];
+      if (roll < weights[0]) {
+        b.connector = FromConnector::kComma;
+      } else if (roll - weights[0] < weights[1]) {
+        b.connector = FromConnector::kCross;
+      } else {
+        b.connector = FromConnector::kJoin;
+        b.inner_keyword = join_rng_.Percent(50);
+      }
+    }
+    // Distinct names: an alias for a table read again or under another name, now and then for
+    // any item.
+    std::vector<std::string> names;  // the bindings' names so far, lower case
+    for (std::size_t k = 0; k < order.size(); ++k) {
+      Binding& b = from.bindings[k];
+      const bool forced = (b.by_path && !PathNamesTable(*b.table)) ||
+                          std::ranges::contains(names, plan::AsciiLower(naturals[k]));
+      b.aliased = allowed_.Has(Feature::kTableAlias) && (forced || join_rng_.Percent(40));
+      if (forced && !b.aliased) {
+        return std::nullopt;  // (the walk avoids it: Nameable)
+      }
+      if (b.aliased) {
+        b.name = Alias(k, naturals, names);
+        b.as_keyword = join_rng_.Percent(50);
+      } else {
+        b.name = naturals[k];
+      }
+      names.push_back(plan::AsciiLower(b.name));
+    }
+    // The bindings' columns stand now: the keys point into them.
+    for (Binding& b : from.bindings) {
+      b.columns = b.owned;
+    }
+    for (const PlannedKey& key : keys) {
+      const Edge& edge = edges_[key.edge];
+      const Binding& child = from.bindings[position[key.child]];
+      const Binding& parent = from.bindings[position[key.parent]];
+      Binding& later = from.bindings[home(key)];
+      std::vector<KeyPair>& to =
+          later.connector == FromConnector::kJoin ? later.on : from.where_keys;
+      for (std::size_t c = 0; c < edge.child_columns.size(); ++c) {
+        to.push_back(KeyPair{.left = &child.columns[edge.child_columns[c]],
+                             .right = &parent.columns[edge.parent_columns[c]]});
+      }
+    }
+    for (const Binding& b : from.bindings) {
+      for (const GenColumn& c : b.columns) {
+        const std::string name = plan::AsciiLower(c.name);
+        const auto holders = std::ranges::count_if(from.bindings, [&](const Binding& other) {
+          return std::ranges::any_of(other.columns,
+                                     [&](const GenColumn& o) { return SameName(o.name, name); });
+        });
+        if (holders > 1 && !std::ranges::contains(from.shared, name)) {
+          from.shared.push_back(name);
+        }
+      }
+    }
+    from.qualify = join_rng_.Below(3);
+    return TryFrom(from);
+  }
+
+  // A query over one table, by name or by path.
   std::optional<GeneratedQuery> TryTableAs(const GenTable& t, bool by_path) {
-    rows_ = t.rows;
+    FromList from;
+    from.bindings.emplace_back();
+    Binding& b = from.bindings.back();
+    b.table = &t;
+    b.by_path = by_path;
+    b.name = t.name;
+    b.columns = t.columns;
+    from.root = t.name;
+    from.rows = t.rows;
+    from.any_path = by_path;
+    from.other_columns = t.other_columns;
+    return TryFrom(from);
+  }
+
+  std::optional<GeneratedQuery> TryFrom(const FromList& from) {
+    from_ = &from;
+    std::optional<GeneratedQuery> q = QueryFrom(from);
+    from_ = nullptr;
+    return q;
+  }
+
+  // A query over the FROM list: its shape, select list, WHERE (with the keys the list puts there),
+  // GROUP BY, HAVING, ORDER BY, LIMIT and OFFSET. Over one binding its draws and tokens are those
+  // of the query over the table alone. Fails (std::nullopt) only before its first draw from rng_.
+  std::optional<GeneratedQuery> QueryFrom(const FromList& from) {
+    rows_ = from.rows;
     std::vector<const GenColumn*> cols;
     std::vector<const GenColumn*> numeric;
-    for (const auto& c : t.columns) {
-      if (Usable(c, by_path)) {
+    std::size_t columns = 0;
+    std::size_t usable = 0;
+    for (const Binding& b : from.bindings) {
+      columns += b.columns.size();
+      for (const auto& c : b.columns) {
+        if (!Usable(c, from.any_path)) {
+          continue;
+        }
+        ++usable;
+        if (!allowed_.Has(Feature::kQualifiedName) && MustQualify(c)) {
+          continue;  // a name of several bindings, which only a qualifier writes
+        }
         cols.push_back(&c);
         // SUM and AVG arguments: numbers, and DECIMAL columns whose sum fits DECIMAL(38,s).
-        if (IsNumeric(c.kind) || Summable(c, t.rows)) {
+        if (IsNumeric(c.kind) || Summable(c, from.rows)) {
           numeric.push_back(&c);
         }
       }
@@ -790,9 +1288,11 @@ class Builder {
         aggs.push_back(agg);
       }
     }
-    const bool star_ok = allowed_.Has(Feature::kStar) && !t.columns.empty() && !t.other_columns &&
-                         cols.size() == t.columns.size() &&
-                         (t.rows <= kStarMaxRows || allowed_.Has(Feature::kLimit));
+    // SELECT * reads every column of every binding (a column of several bindings needs no
+    // qualifier there).
+    const bool star_ok = allowed_.Has(Feature::kStar) && columns > 0 && !from.other_columns &&
+                         usable == columns &&
+                         (from.rows <= kStarMaxRows || allowed_.Has(Feature::kLimit));
     const std::array<unsigned, 3> weights = {
         aggs.empty() ? 0U : 60U,
         allowed_.Has(Feature::kColumns) && !cols.empty() ? 25U : 0U,
@@ -855,16 +1355,10 @@ class Builder {
     constant_positions_.clear();
     aggregate_emitted_ = false;
     Keyword("SELECT");
-    SelectList(shape, t, cols, numeric, aggs, selected_keys);
+    SelectList(shape, from, cols, numeric, aggs, selected_keys);
     Keyword("FROM");
-    if (by_path) {
-      used_.Add(Feature::kTablePath);
-      tokens_.push_back({.kind = Token::Kind::kLiteral, .text = SqlString(t.path)});
-    } else {
-      used_.Add(Feature::kTableName);
-      tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = t.name});
-    }
-    Where();
+    EmitFrom(from);
+    Where(from.where_keys);
     // GROUP BY a constant's position alone still groups: no row over no input rows.
     const bool constant_group =
         shape == Shape::kAggregates && keys.empty() && allowed_.Has(Feature::kGroupBy) &&
@@ -892,9 +1386,9 @@ class Builder {
       Keyword("BY");
       Position(rng_.Pick(constant_positions_));
     }
-    const bool having = Having(shape, t, cols, numeric, aggs, keys);
+    const bool having = Having(shape, from.rows, cols, numeric, aggs, keys);
     const bool ordered = OrderBy(shape, cols, numeric, aggs, keys);
-    const bool limited = Limit(shape == Shape::kStar && t.rows > kStarMaxRows);
+    const bool limited = Limit(shape == Shape::kStar && from.rows > kStarMaxRows);
     const bool offset = Offset(limited);
     if (allowed_.Has(Feature::kSemicolon) && rng_.Percent(15)) {
       used_.Add(Feature::kSemicolon);
@@ -902,7 +1396,8 @@ class Builder {
     }
     GeneratedQuery q;
     q.sql = Render();
-    q.table = t.name;
+    q.table = from.root;
+    q.row_bound = from.rows;
     q.features = used_;
     // A select list of constants only (no aggregate emitted) has a row per table row, unless HAVING
     // makes the query aggregate.
@@ -914,13 +1409,15 @@ class Builder {
   }
 
   // `keys`: GROUP BY keys to select too, before or after the aggregates.
-  void SelectList(Shape shape, const GenTable& t, const std::vector<const GenColumn*>& cols,
+  void SelectList(Shape shape, const FromList& from, const std::vector<const GenColumn*>& cols,
                   const std::vector<const GenColumn*>& numeric, const std::vector<Agg>& aggs,
                   const std::vector<const GenColumn*>& keys) {
     if (shape == Shape::kStar) {
       used_.Add(Feature::kStar);
-      for (const auto& c : t.columns) {
-        used_.Add(TypeFeature(c.kind));
+      for (const Binding& b : from.bindings) {
+        for (const auto& c : b.columns) {
+          used_.Add(TypeFeature(c.kind));
+        }
       }
       Symbol("*");
       return;
@@ -1192,12 +1689,13 @@ class Builder {
   // between 0 and the row count, an integer SUM gets its argument's literals, MIN and MAX are their
   // argument. Over a DECIMAL the literals take 38 digits without spare ones: SUM is DECIMAL(38,s),
   // and MIN or MAX of an arithmetic argument can be wider than the column.
-  static GenColumn ValuesOf(const GenTable& t, Agg agg, const GenColumn* arg) {
+  // `rows`: at least the rows the query reads.
+  static GenColumn ValuesOf(int64_t rows, Agg agg, const GenColumn* arg) {
     switch (agg) {
       case Agg::kCountStar:
       case Agg::kCount:
       case Agg::kCountDistinct:
-        return GenColumn{.name = {}, .kind = ValueKind::kInteger, .min = 0, .max = t.rows};
+        return GenColumn{.name = {}, .kind = ValueKind::kInteger, .min = 0, .max = rows};
       case Agg::kSum:
       case Agg::kAvg:
       case Agg::kMin:
@@ -1214,7 +1712,7 @@ class Builder {
   // HAVING 1 or 2 conditions of an aggregate query (AND): a GROUP BY key, an aggregate call with I
   // or T values or the select alias of one, compared with a literal of its type (or [NOT] LIKE, or
   // [NOT] IN, as in WHERE). Returns whether it wrote one.
-  bool Having(Shape shape, const GenTable& t, const std::vector<const GenColumn*>& cols,
+  bool Having(Shape shape, int64_t rows, const std::vector<const GenColumn*>& cols,
               const std::vector<const GenColumn*>& numeric, const std::vector<Agg>& aggs,
               const std::vector<const GenColumn*>& keys) {
     if (shape != Shape::kAggregates || !allowed_.Has(Feature::kHaving) || !rng_.Percent(25)) {
@@ -1236,14 +1734,14 @@ class Builder {
       const GenColumn* arg = agg == Agg::kCountStar
                                  ? nullptr
                                  : rng_.Pick(agg == Agg::kSum || agg == Agg::kAvg ? numeric : cols);
-      GenColumn values = ValuesOf(t, agg, arg);
+      GenColumn values = ValuesOf(rows, agg, arg);
       if (Orderable(agg, arg) && CanLiteral(values.kind)) {
         operands.push_back(Operand{
             .key = nullptr, .call = std::pair(agg, arg), .alias = {}, .values = std::move(values)});
       }
     }
     for (const AggregateAlias& alias : aggregate_aliases_) {
-      GenColumn values = ValuesOf(t, alias.call.first, alias.call.second);
+      GenColumn values = ValuesOf(rows, alias.call.first, alias.call.second);
       if (CanLiteral(values.kind)) {
         operands.push_back(
             Operand{.key = nullptr, .call = {}, .alias = alias.alias, .values = std::move(values)});
@@ -1353,22 +1851,102 @@ class Builder {
     return true;
   }
 
-  void Where() {
-    if (!allowed_.Has(Feature::kWhere) || comparable_.empty() || !rng_.Percent(45)) {
+  // WHERE with the join keys FROM leaves to it (no feature of their own beyond the join's) and
+  // now and then 1 to 3 conditions (kWhere, kWhereAnd), all joined by AND.
+  void Where(const std::vector<KeyPair>& keys) {
+    const bool conditions =
+        allowed_.Has(Feature::kWhere) && !comparable_.empty() && rng_.Percent(45);
+    if (keys.empty() && !conditions) {
       return;
     }
-    used_.Add(Feature::kWhere);
-    std::size_t terms = 1;
-    if (allowed_.Has(Feature::kWhereAnd) && rng_.Percent(40)) {
-      used_.Add(Feature::kWhereAnd);
-      terms = 2 + rng_.Below(2);
+    std::size_t terms = 0;
+    if (conditions) {
+      used_.Add(Feature::kWhere);
+      terms = 1;
+      if (allowed_.Has(Feature::kWhereAnd) && rng_.Percent(40)) {
+        used_.Add(Feature::kWhereAnd);
+        terms = 2 + rng_.Below(2);
+      }
     }
     Keyword("WHERE");
+    Keys(keys);
     for (std::size_t i = 0; i < terms; ++i) {
-      if (i > 0) {
+      if (i > 0 || !keys.empty()) {
         Keyword("AND");
       }
       Condition();
+    }
+  }
+
+  // The equalities of key pairs, joined by AND, each in a drawn order: never kCompareColumns, and
+  // never under OR or NOT, so that they connect the join graph (ADR 0022).
+  void Keys(const std::vector<KeyPair>& keys) {
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+      if (i > 0) {
+        Keyword("AND");
+      }
+      const bool flip = join_rng_.Percent(50);
+      Column(flip ? *keys[i].right : *keys[i].left);
+      Symbol("=");
+      Column(flip ? *keys[i].left : *keys[i].right);
+    }
+  }
+
+  // FROM's items: each one's connector, its table by name or path and its alias, and for a JOIN
+  // its ON: its keys, and now and then a condition of WHERE's forms (kWhere) over the columns of
+  // the items up to its own, the scope of an ON (ADR 0022 rule 10).
+  void EmitFrom(const FromList& from) {
+    for (std::size_t k = 0; k < from.bindings.size(); ++k) {
+      const Binding& b = from.bindings[k];
+      switch (b.connector) {
+        case FromConnector::kFirst:
+          break;
+        case FromConnector::kComma:
+          used_.Add(Feature::kCommaJoin);
+          Symbol(",");
+          break;
+        case FromConnector::kCross:
+          used_.Add(Feature::kCommaJoin);
+          Keyword("CROSS");
+          Keyword("JOIN");
+          break;
+        case FromConnector::kJoin:
+          used_.Add(Feature::kJoinOn);
+          if (b.inner_keyword) {
+            Keyword("INNER");
+          }
+          Keyword("JOIN");
+          break;
+      }
+      if (b.by_path) {
+        used_.Add(Feature::kTablePath);
+        tokens_.push_back({.kind = Token::Kind::kLiteral, .text = SqlString(b.table->path)});
+      } else {
+        used_.Add(Feature::kTableName);
+        tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = b.table->name});
+      }
+      if (b.aliased) {
+        used_.Add(Feature::kTableAlias);
+        if (b.as_keyword) {
+          Keyword("AS");
+        }
+        tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = b.name});
+      }
+      if (b.connector != FromConnector::kJoin) {
+        continue;
+      }
+      Keyword("ON");
+      Keys(b.on);
+      if (join_rng_.Percent(20)) {
+        std::vector<const GenColumn*> all = comparable_;
+        std::erase_if(comparable_, [&](const GenColumn* c) { return PositionOf(*c) > k; });
+        if (!comparable_.empty()) {  // (WhereLeaf picks one)
+          used_.Add(Feature::kWhere);
+          Keyword("AND");
+          Condition();
+        }
+        comparable_ = std::move(all);
+      }
     }
   }
 
@@ -1761,9 +2339,37 @@ class Builder {
   void Symbol(std::string_view s) {
     tokens_.push_back({.kind = Token::Kind::kSymbol, .text = std::string(s)});
   }
+  // A column, over several bindings qualified by its binding's name where another binding has
+  // the name too (or the generator cannot tell), and otherwise as the query's style draws it.
   void Column(const GenColumn& c) {
     used_.Add(TypeFeature(c.kind));
+    if (from_ != nullptr && from_->bindings.size() > 1 && allowed_.Has(Feature::kQualifiedName) &&
+        (MustQualify(c) || from_->qualify == 1 || (from_->qualify == 2 && join_rng_.Percent(50)))) {
+      if (const std::size_t k = PositionOf(c); k < from_->bindings.size()) {
+        used_.Add(Feature::kQualifiedName);
+        tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = from_->bindings[k].name});
+        Symbol(".");
+      }
+    }
     tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.name});
+  }
+
+  // Whether a reference to `c` needs a qualifier: another binding has its name, or a binding has
+  // columns of names the generator does not know.
+  [[nodiscard]] bool MustQualify(const GenColumn& c) const {
+    return from_ != nullptr && from_->bindings.size() > 1 &&
+           (from_->other_columns || std::ranges::contains(from_->shared, plan::AsciiLower(c.name)));
+  }
+
+  // The FROM position of the binding that `c` is a column of, or the number of bindings.
+  [[nodiscard]] std::size_t PositionOf(const GenColumn& c) const {
+    for (std::size_t k = 0; k < from_->bindings.size(); ++k) {
+      if (std::ranges::any_of(from_->bindings[k].columns,
+                              [&c](const GenColumn& column) { return &column == &c; })) {
+        return k;
+      }
+    }
+    return from_->bindings.size();
   }
 
   // toDateTime(c) <op> TIMESTAMP '...' for an integer column of seconds whose values times 1000
@@ -2283,8 +2889,9 @@ class Builder {
       const Token& tok = tokens_[i];
       if (i > 0) {
         const bool spaced = tok.text != "(" && tok.text != ")" && tok.text != "," &&
-                            tok.text != ";" && tok.text != "::" && tokens_[i - 1].text != "(" &&
-                            tokens_[i - 1].text != "::";
+                            tok.text != ";" && tok.text != "::" && tok.text != "." &&
+                            tokens_[i - 1].text != "(" && tokens_[i - 1].text != "::" &&
+                            tokens_[i - 1].text != ".";
         std::string_view gap = spaced ? " " : "";
         if (layout) {
           gap = spaced ? rng_.Pick(kSpaced) : rng_.Pick(kTight);
@@ -2319,11 +2926,14 @@ class Builder {
 
   const std::vector<GenTable>& tables_;
   Rng& rng_;
+  Rng& join_rng_;  // the draws that only a join needs
   FeatureSet allowed_;
+  std::vector<Edge> edges_;         // the refs joins can follow
+  const FromList* from_ = nullptr;  // the FROM list of the query being written (TryFrom)
   std::vector<Token> tokens_;
   FeatureSet used_;
   std::vector<const GenColumn*> comparable_;  // the query's columns WHERE can compare
-  int64_t rows_ = 0;                          // the query's table's row count
+  int64_t rows_ = 0;                          // at least the rows the query reads
   bool arg_retyped_ =
       false;  // the last Aggregate() wrapped its column in a string or time function
   std::vector<std::string> order_aliases_;  // select aliases of items with I or T values
@@ -2503,7 +3113,8 @@ std::expected<QueryGenerator, std::string> QueryGenerator::Make(std::vector<GenT
     return std::unexpected("the target grammar share must be at most 100 percent");
   }
   Rng rng(seed);
-  if (!Builder(tables, rng, options.supported).Build().has_value()) {
+  Rng join_rng(Mix(seed ^ kJoinStreamSalt));
+  if (!Builder(tables, rng, join_rng, options.supported).Build().has_value()) {
     return std::unexpected(
         std::format("no query can be built from the supported features ({}) over these tables",
                     options.supported.Names()));
@@ -2512,11 +3123,13 @@ std::expected<QueryGenerator, std::string> QueryGenerator::Make(std::vector<GenT
 }
 
 GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
-  Rng rng(Mix(seed_ + Mix(index + kGamma)));
+  const uint64_t state = Mix(seed_ + Mix(index + kGamma));
+  Rng rng(state);
+  Rng join_rng(Mix(state ^ kJoinStreamSalt));
   const bool target = rng.Percent(options_.target_percent);
   const FeatureSet allowed = target ? FeatureSet::All() : options_.supported;
   // Make() proved that the supported set admits a query over these tables; All() is a superset.
-  GeneratedQuery q = Builder(tables_, rng, allowed).Build().value_or(GeneratedQuery{});
+  GeneratedQuery q = Builder(tables_, rng, join_rng, allowed).Build().value_or(GeneratedQuery{});
   q.index = index;
   q.target_sample = target;
   return q;

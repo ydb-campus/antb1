@@ -53,13 +53,13 @@ enum class Feature : std::uint8_t {
   // FROM
   kTableName,      // a registered table
   kTablePath,      // '<file or glob>'
-  kCommaJoin,      // FROM a, b and FROM a CROSS JOIN b
+  kCommaJoin,      // FROM a, b and FROM a CROSS JOIN b (connected by equalities in WHERE or an ON)
   kJoinOn,         // FROM a [INNER] JOIN b ON ...
   kLeftJoin,       // FROM a LEFT [OUTER] JOIN b ON ...
   kTableAlias,     // FROM t [AS] a
   kQualifiedName,  // t.x
   // WHERE
-  kWhere,            // WHERE column <op> literal (=, <>, !=, <, <=, >, >=)
+  kWhere,            // WHERE column <op> literal (=, <>, !=, <, <=, >, >=); also in an inner ON
   kWhereAnd,         // several comparisons joined by AND
   kLike,             // VARCHAR column [NOT] LIKE 'pattern' in WHERE
   kIn,               // column [NOT] IN (literal, ...) in WHERE
@@ -279,12 +279,10 @@ using FeatureSet = BasicFeatureSet<Feature, kFeatureCount>;
 inline constexpr FeatureSet kNeverGenerated = {Feature::kWindowFunctions};
 
 // Grammar that the parser accepts ahead of the random generator (runner/query_gen.cc), which
-// learns it in a later PR (ADR 0022: T1 the joins, aliases and qualified names, T2 LEFT JOIN) and
-// then removes it from this set. Valid in `-- features:` tags, and never in kSupportedFeatures
-// while pending (checked below), so that no feature is declared supported before it is generated.
-inline constexpr FeatureSet kGeneratorPending = {Feature::kCommaJoin, Feature::kJoinOn,
-                                                 Feature::kLeftJoin, Feature::kTableAlias,
-                                                 Feature::kQualifiedName};
+// learns it in a later PR (ADR 0022: T2 LEFT JOIN) and then removes it from this set. Valid in
+// `-- features:` tags, and never in kSupportedFeatures while pending (checked below), so that no
+// feature is declared supported before it is generated.
+inline constexpr FeatureSet kGeneratorPending = {Feature::kLeftJoin};
 
 // What antb1 answers today: the whole slice grammar of docs/sql-subset.md (global and grouped
 // aggregates, projections, WHERE conjunctions of column <op> literal, ORDER BY, LIMIT and OFFSET)
