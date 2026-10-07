@@ -48,8 +48,8 @@ arrow::Status RunPart(const PartPipeline& pipeline, int64_t part, ExecContext ct
 // combines their results in part order. Once it has every part's result, so that no part of its
 // pipeline runs any more, it calls its parts-done callback (if one is set), once per run, on the
 // consumer thread: the builds a probe pipeline reads are released then
-// (docs/adr/0022-joins-and-query-blocks.md). A run that fails, or that its consumer stops early,
-// does not call it.
+// (docs/adr/0022-joins-and-query-blocks.md). A run whose parts fail, or that its consumer stops
+// before its parts are done, does not call it.
 class PartSink : public Operator {
  public:
   void set_parts_done(std::function<void()> parts_done) { parts_done_ = std::move(parts_done); }
