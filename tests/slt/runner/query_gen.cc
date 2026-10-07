@@ -1893,8 +1893,8 @@ class Builder {
   }
 
   // FROM's items: each one's connector, its table by name or path and its alias, and for a JOIN
-  // its ON: its keys, and now and then a condition of WHERE's forms (kWhere) over the columns of
-  // the items up to its own, the scope of an ON (ADR 0022 rule 10).
+  // its ON: its keys, and now and then (with kWhere allowed) a condition of WHERE's forms over the
+  // columns of the items up to its own, the scope of an ON (ADR 0022 rule 10).
   void EmitFrom(const FromList& from) {
     for (std::size_t k = 0; k < from.bindings.size(); ++k) {
       const Binding& b = from.bindings[k];
@@ -1937,7 +1937,7 @@ class Builder {
       }
       Keyword("ON");
       Keys(b.on);
-      if (join_rng_.Percent(20)) {
+      if (allowed_.Has(Feature::kWhere) && join_rng_.Percent(20)) {
         std::vector<const GenColumn*> all = comparable_;
         std::erase_if(comparable_, [&](const GenColumn* c) { return PositionOf(*c) > k; });
         if (!comparable_.empty()) {  // (WhereLeaf picks one)

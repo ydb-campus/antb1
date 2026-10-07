@@ -1168,6 +1168,32 @@ TEST(QueryGenerator, OnConditionsNeedComparableColumnsInScope) {
   EXPECT_GT(joins, 100);
 }
 
+// An ON condition beyond the keys is one of WHERE's forms (kWhere): joins have them when kWhere is
+// supported, and no ON holds more than its keys when it is not.
+TEST(QueryGenerator, OnConditionsNeedTheWhereFeature) {
+  const std::vector<GenTable> tables = JoinTables();
+  for (const bool where : {false, true}) {
+    SCOPED_TRACE(where ? "with kWhere" : "without kWhere");
+    FeatureSet supported = {Feature::kCountStar, Feature::kTableName, Feature::kIntegerColumns,
+                            Feature::kIntegerLiteral, Feature::kJoinOn};
+    if (where) {
+      supported.Add(Feature::kWhere);
+    }
+    const auto gen = MakeOver(tables, 41, {.supported = supported, .target_percent = 0});
+    JoinCoverage cov;
+    for (uint64_t i = 0; i < 1000; ++i) {
+      const auto q = gen.Generate(i);
+      EXPECT_TRUE(supported.Contains(q.features))
+          << q.sql << "\n  uses " << q.features.Minus(supported).Names();
+      if (Joins(q)) {
+        CheckJoin(q, tables, cov);
+      }
+    }
+    EXPECT_GT(cov.queries, 100);
+    EXPECT_EQ(cov.on_condition > 0, where) << cov.on_condition << " ON conditions";
+  }
+}
+
 // antb1 returns a FLOAT column's values as DOUBLE, DuckDB as FLOAT (divergence D11): a FLOAT
 // column is never referenced, and its table gets no SELECT *.
 TEST(LoadGenTables, SkipsFloatColumns) {
