@@ -150,10 +150,11 @@ class BuildsFirstOperator final : public Operator {
 //   earlier one dropped, as in a WHERE.
 // - A build that holds no row: the input is never opened, and Next returns the end.
 //
-// In a part pipeline (prepares = false), Open takes the table its pipeline's BuildsFirstOperator
-// prepared (Invalid if none) and opens the input if the table has rows. Over a serial input
-// (prepares = true), Open only records the context; the first Next prepares the build, then opens
-// the input if the table has rows; the input's end and Close release the build.
+// In a part pipeline (prepares = false), Open takes the table prepared by the operator that runs
+// the pipeline (a BuildsFirstOperator, or the JoinBuild whose input the pipeline is; Invalid if
+// none) and opens the input if the table has rows. Over a serial input (prepares = true), Open
+// only records the context; the first Next prepares the build, then opens the input if the table
+// has rows; the input's end and Close release the build.
 //
 // Memory: its own vectors are charged to ExecContext::budget, its Arrow buffers come from
 // ExecContext::pool. Profile: the metrics find, gather, residual and, on the 1:1 path, window_rows

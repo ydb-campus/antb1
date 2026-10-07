@@ -37,7 +37,11 @@ namespace antb1::exec {
 // Errors: Next() returns the first failed part in part order, when it reaches it, and stops the
 // parts after it. A part the consumer never reaches (it stopped early) never reports its error. A
 // part that cannot be submitted to the executor (Submit fails, or std::bad_alloc: OutOfMemory)
-// fails Next() as a failed part does; it started nothing.
+// started nothing; the Next() call that tries to submit it (each call fills the window before it
+// waits for its part, and refills it after) returns that failure instead of its part's result,
+// whatever the parts in flight before it would have returned, and stops the scheduler. Any other
+// exception of the executor's Submit leaves Next() as it is; the parts started before it are
+// still waited for.
 //
 // A task sees `stop` become true once the scheduler is stopped (the consumer is done or failed);
 // it should check it between batches and may then return any status, which is dropped. Stop() and

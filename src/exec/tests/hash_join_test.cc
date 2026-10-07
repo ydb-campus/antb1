@@ -1429,11 +1429,11 @@ TEST_F(HashJoinTest, ProfilesCountBuildsAndProbes) {
     EXPECT_EQ(MetricOf(build_node, "parts"), 3);
     EXPECT_EQ(MetricOf(build_node, "null_keys"), 1);
     EXPECT_EQ(MetricOf(build_node, "unique"), 1);
-    EXPECT_EQ(MetricOf(build_node, "direct"), 0);  // 112..114 make the range sparse
+    EXPECT_EQ(MetricOf(build_node, "direct"), 0);  // 113 and 114 make the range sparse
     for (const char* name : {"part_time", "wait", "lanes_tail", "finish"}) {
       EXPECT_TRUE(MetricOf(build_node, name).has_value()) << name;
     }
-    // A probe of 8 rows in windows of 3, 4 of them matching, one residual.
+    // A probe of 8 rows in windows of 3, 3 of them matching (keys 0, 1 and 2), one residual.
     ProfileNode probe_node;
     const auto probe_schema = Int64Schema({"a"});
     auto join =
