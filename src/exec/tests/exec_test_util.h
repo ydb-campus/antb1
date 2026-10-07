@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -43,13 +44,17 @@ class ExecTest : public ::testing::Test {
 };
 
 // Runs every task on `pool`, except that spawn number `throw_at` (from 0) throws std::bad_alloc, as
-// Arrow's Submit may when it cannot allocate the task: that task never runs. `before_throw` (if
-// any) is called just before the throw.
+// Arrow's Submit may when it cannot allocate the task, or `error` if given (e.g. the
+// std::system_error of a thread pool that cannot start a worker): that task never runs.
+// `before_throw` (if any) is called just before the throw.
 class ThrowingExecutor final : public arrow::internal::Executor {
  public:
   ThrowingExecutor(arrow::internal::Executor* pool, int throw_at,
-                   std::function<void()> before_throw = {})
-      : pool_(pool), throw_at_(throw_at), before_throw_(std::move(before_throw)) {}
+                   std::function<void()> before_throw = {}, std::exception_ptr error = nullptr)
+      : pool_(pool),
+        throw_at_(throw_at),
+        before_throw_(std::move(before_throw)),
+        error_(std::move(error)) {}
 
   int GetCapacity() override { return pool_->GetCapacity(); }
   // The spawns so far, the one that threw included.
@@ -62,6 +67,9 @@ class ThrowingExecutor final : public arrow::internal::Executor {
       if (before_throw_) {
         before_throw_();
       }
+      if (error_ != nullptr) {
+        std::rethrow_exception(error_);
+      }
       throw std::bad_alloc();
     }
     return pool_->Spawn(hints, std::move(task), std::move(stop_token), std::move(stop_callback));
@@ -71,6 +79,7 @@ class ThrowingExecutor final : public arrow::internal::Executor {
   arrow::internal::Executor* pool_;
   int throw_at_;
   std::function<void()> before_throw_;
+  std::exception_ptr error_;
   std::atomic<int> spawns_ = 0;
 };
 

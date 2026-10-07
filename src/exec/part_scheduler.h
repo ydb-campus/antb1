@@ -187,8 +187,10 @@ class PartScheduler {
   }
 
   // Submits parts until the window is full. A part's slot in in_flight_ is made before its task is
-  // submitted, so that a task never runs without being tracked: a part that cannot be submitted
-  // (Submit fails, or std::bad_alloc: OutOfMemory) has started nothing and gives its slot back.
+  // submitted, so that a task never runs without being tracked, and is given back if the task
+  // could not be submitted (it started nothing): in_flight_ holds only the futures of submitted
+  // tasks, which Drop() waits for. A failed Submit's status is returned, std::bad_alloc is
+  // OutOfMemory, and any other exception goes on.
   arrow::Status Submit() {
     while (!stopped_ && next_submit_ < num_parts_ && std::cmp_less(in_flight_.size(), window_)) {
       if (!in_flight_.empty() && budget_ != nullptr && budget_->under_pressure()) {
@@ -214,6 +216,11 @@ class PartScheduler {
           in_flight_.pop_back();
         }
         return arrow::Status::OutOfMemory("out of memory while submitting part ", part);
+      } catch (...) {
+        if (reserved) {
+          in_flight_.pop_back();  // no task completes its future: Drop() must not wait for it
+        }
+        throw;
       }
       ++next_submit_;
     }

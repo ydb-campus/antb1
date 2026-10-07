@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <limits>
 #include <map>
 #include <memory>
@@ -13,6 +14,7 @@
 #include <set>
 #include <span>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -305,6 +307,56 @@ TEST(PartSchedulerTest, APartTheExecutorCannotTakeFailsNext) {
       for (int64_t part = refuse_at; part < kNumParts; ++part) {
         EXPECT_EQ((*starts)[static_cast<std::size_t>(part)].load(), 0) << part;
       }
+    }
+  }
+}
+
+// Any other exception of the executor's Submit (the std::system_error of a thread pool that cannot
+// start a worker) leaves Next(), whether the consumer waits for the part or refills the window. The
+// part started nothing, the results before it came in order, and the scheduler's destructor waits
+// for the parts that started, and only for them (none waits for the part that never started).
+TEST(PartSchedulerTest, AnyOtherExceptionOfSubmitLeavesNext) {
+  const auto pool = Pool();
+  constexpr int64_t kNumParts = 10;
+  const std::exception_ptr error = std::make_exception_ptr(
+      std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again)));
+  for (const int throw_at : {0, 5}) {  // parts are submitted in order: spawn k runs part k
+    SCOPED_TRACE(throw_at);
+    auto starts = std::make_shared<std::vector<std::atomic<int>>>(kNumParts);
+    auto ends = std::make_shared<std::vector<std::atomic<int>>>(kNumParts);
+    testing::ThrowingExecutor executor(pool.get(), throw_at, {}, error);
+    {
+      PartScheduler<int64_t> scheduler(
+          kNumParts,
+          [starts, ends](int64_t part, const std::atomic<bool>&) -> arrow::Result<int64_t> {
+            ++(*starts)[static_cast<std::size_t>(part)];
+            ++(*ends)[static_cast<std::size_t>(part)];
+            return part;
+          },
+          &executor, 3);
+      int64_t taken = 0;
+      bool thrown = false;
+      while (!scheduler.done() && !thrown) {
+        try {
+          auto result = scheduler.Next();
+          ASSERT_TRUE(result.ok()) << result.status().ToString();
+          EXPECT_EQ(*result, taken);
+          ++taken;
+        } catch (const std::system_error& e) {
+          EXPECT_EQ(e.code(), std::errc::resource_unavailable_try_again);
+          thrown = true;
+        }
+      }
+      EXPECT_TRUE(thrown);
+      EXPECT_LT(taken, throw_at + 1);
+    }
+    for (int64_t part = 0; part < kNumParts; ++part) {
+      const auto at = static_cast<std::size_t>(part);
+      EXPECT_EQ((*starts)[at].load(), (*ends)[at].load()) << "part " << part << " still runs";
+    }
+    pool->WaitForIdle();
+    for (int64_t part = throw_at; part < kNumParts; ++part) {
+      EXPECT_EQ((*starts)[static_cast<std::size_t>(part)].load(), 0) << part;
     }
   }
 }
