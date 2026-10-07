@@ -39,9 +39,11 @@
 // commas, CROSS JOIN or [INNER] JOIN ... ON, connected through top-level equalities of the refs'
 // keys (never DOUBLE ones, DECIMAL ones only within 38 common digits), in ON or in WHERE. FROM item
 // names are distinct (aliases t1 to t3 where needed), every name that two items have is qualified
-// by its item's own name, and the join has at most max(10,000, its largest table's rows) rows by
-// JoinRowBound. Every draw that only a join needs comes from a second random stream of (s, i), so
-// a query that joins nothing is the query the same tables give without refs.
+// by its item's own name, and the join has at most max(10,000, its largest table's rows) rows by a
+// true bound: JoinRowBound of the first ref it follows, and for a third table that bound times the
+// largest multiplicity of the third table's key. Every draw that only a join needs comes from a
+// second random stream of (s, i), so a query that joins nothing is the query the same tables give
+// without refs.
 
 namespace antb1::slt {
 
@@ -109,8 +111,10 @@ std::expected<std::vector<GenTable>, std::string> LoadGenTables(
 struct GeneratedQuery {
   uint64_t index = 0;
   std::string sql;
-  std::string table;      // the table the query starts from (a join's first table), for messages
-  int64_t row_bound = 0;  // at least the rows FROM yields: the table's rows, or JoinRowBound's
+  // The table the query reads, or the one a join's walk along the refs starts from (in any FROM
+  // position), for messages.
+  std::string table;
+  int64_t row_bound = 0;  // at least the rows FROM yields: the table's rows, or the join's bound
   FeatureSet features;    // every feature the SQL uses
   bool target_sample = false;         // drawn from the full target grammar
   SortMode sort = SortMode::kNoSort;  // kRowSort for projections and GROUP BY: SQL has no row order

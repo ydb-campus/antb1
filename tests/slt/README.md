@@ -179,24 +179,25 @@ feature adds it to `kSupportedFeatures` (and new grammar to `runner/query_gen.cc
 the parser accepts before the generator writes it waits in `kGeneratorPending` (today `LEFT JOIN`, which ADR 0022's
 T2 teaches the generator); such a feature cannot be declared supported until it leaves that set.
 
-Over tables with refs, a query that may use a join feature joins 2 or 3 tables along the refs 60% of the time when its
-first table has a ref to follow (`runner/query_gen.h`): inner joins written with commas, `CROSS JOIN` or
-`[INNER] JOIN ... ON`, each key's equalities
-in the ON of the later of its two FROM items or in `WHERE`, so that they connect every item. The FROM order may start
-with two tables that share no key; a second edge between two joined tables now and then adds a second key, and an ON
-now and then one condition of `WHERE`'s forms over the items up to its own (ADR 0022 rule 10). Aliases `t1` to `t3`
-stand where a table comes twice or a path names another table (rule 1), and at random otherwise; a name that two items
-have is always qualified (every name, next to a table with columns the generator skips), the others as the query's
-drawn style says. A ref joins columns of one kind only, never DOUBLE, and DECIMALs only within 38 common digits (D13).
-`LoadGenTables` counts each key's non-NULL rows, distinct keys and largest multiplicity over every file, and
-`JoinRowBound` keeps a join within max(10,000, its largest table's rows); the bound stands in for the table's rows
-wherever the generator needs a row count (`SELECT *` above 50 rows gets a `LIMIT`, DECIMAL sums stay within 38 digits,
-`COUNT` literals in `HAVING`). Every draw that only a join needs comes from a second random stream of the seed and the
-query index, so a query that joins nothing is the query the same tables give without refs: `diff.random`,
-`diff.decimal` and `diff.tpch` keep their queries, and only the join queries of `diff.star` are new. Until the join
-features are declared supported (roadmap PR J2b), every join is a target-grammar sample that antb1 answers with
-Unsupported. The generated joins never use single-table aliases, and never meet a bind error or an exit code 4 of the
-join rules: `.slt` files cover those.
+Over tables with refs, a query that may use a join feature joins 2 or 3 tables along the refs 60% of the time when a
+ref from or to the table it starts from can be followed (`runner/query_gen.h`): inner joins written with commas,
+`CROSS JOIN` or `[INNER] JOIN ... ON`, each key's equalities in the ON of the later of its two FROM items or in `WHERE`,
+so that they connect every item. The FROM order may start with two tables that share no key; a second edge between two
+joined tables now and then adds a second key, and an ON now and then one condition of `WHERE`'s forms over the items up
+to its own (ADR 0022 rule 10; it needs and uses the feature `where`). Aliases `t1` to `t3` stand where a table comes
+twice or a path names another table (rule 1), and at random otherwise; a name that two items have is always qualified
+(every name, next to a table with columns the generator skips), the others as the query's drawn style says. A ref joins
+columns of one kind only, never DOUBLE, and DECIMALs only within 38 common digits (D13). `LoadGenTables` counts each
+key's non-NULL rows, distinct keys and largest multiplicity over every file, and a join stays within max(10,000, its
+largest table's rows) by a true bound: `JoinRowBound` of the first ref it follows, and for a third table that bound
+times the largest multiplicity of the third table's key. The bound stands in for the table's rows wherever the
+generator needs a row count (`SELECT *` above 50 rows gets a `LIMIT`, DECIMAL sums stay within 38 digits, `COUNT`
+literals in `HAVING`). Every draw that only a join needs comes from a second random stream of the seed and the query
+index, so a query that joins nothing is the query the same tables give without refs: `diff.random`, `diff.decimal`
+and `diff.tpch` keep their queries, and only the join queries of `diff.star` are new. Until the join features are
+declared supported (roadmap PR J2b), every join is a target-grammar sample that antb1 answers with Unsupported. The
+generated joins never use single-table aliases, and never meet a bind error or an exit code 4 of the join rules:
+`.slt` files cover those.
 
 ## Data tests: `queries` and `clickbench`
 
