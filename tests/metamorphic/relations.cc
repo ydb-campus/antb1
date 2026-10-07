@@ -1099,6 +1099,44 @@ std::vector<Relation> AllRelations() {
   r.push_back(std::move(batches));
   r.push_back(std::move(filtered));
   r.push_back(std::move(projected));
+
+  // ---- pending until joins are answered (roadmap PR J2b, ADR 0022) ----
+  // An inner join gives the same rows in any FROM order and with any connector, its keys in ON or
+  // in WHERE, with or without aliases and qualifiers, in batches of any size (the probe resumes
+  // inside a batch): 2841 rows over the star schema, 96 trips meeting two riders (a repeated key),
+  // and 443 rows of three tables on a two-column key, starting with two unconnected tables.
+  {
+    const slt::FeatureSet joined = {kColumns,   kMultipleItems, kIntegerColumns, kTableName,
+                                    kCommaJoin, kJoinOn,        kTableAlias,     kQualifiedName};
+    constexpr std::string_view kRiders =
+        "SELECT tr_row, rd_row, rd_city FROM trips JOIN riders ON tr_rider = rd_id";
+    r.push_back(
+        {.name = "star_join_commutes",
+         .features = joined,
+         .probes = {Q(std::string(kRiders)),
+                    Q("SELECT tr_row, rd_row, rd_city FROM riders JOIN trips ON rd_id = tr_rider"),
+                    Q("SELECT tr_row, rd_row, rd_city FROM trips, riders WHERE tr_rider = rd_id"),
+                    Q("SELECT t.tr_row, r.rd_row, r.rd_city FROM riders AS r CROSS JOIN trips AS t "
+                      "WHERE r.rd_id = t.tr_rider"),
+                    Q(std::string(kRiders), 1), Q(std::string(kRiders), 7)},
+         .check = AllEqual()});
+    slt::FeatureSet three = joined;
+    three.Add(kDateColumns);
+    constexpr std::string_view kShifts =
+        "SELECT tr_row, sh_row, dv_row FROM trips JOIN shifts ON tr_driver = sh_driver AND tr_day "
+        "= sh_day JOIN drivers ON sh_driver = dv_id";
+    r.push_back(
+        {.name = "star_join_order_three_tables",
+         .features = three,
+         .probes = {Q(std::string(kShifts)),
+                    Q("SELECT tr_row, sh_row, dv_row FROM drivers, trips, shifts WHERE tr_driver = "
+                      "sh_driver AND tr_day = sh_day AND sh_driver = dv_id"),
+                    Q("SELECT t.tr_row, s.sh_row, d.dv_row FROM shifts AS s JOIN drivers AS d ON "
+                      "d.dv_id = s.sh_driver, trips AS t WHERE t.tr_driver = s.sh_driver AND "
+                      "t.tr_day = s.sh_day"),
+                    Q(std::string(kShifts), 1), Q(std::string(kShifts), 7)},
+         .check = AllEqual()});
+  }
   return r;
 }
 
