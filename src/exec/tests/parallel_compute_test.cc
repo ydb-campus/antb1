@@ -30,6 +30,7 @@ using plan::LogicalType;
 using testing::Bools;
 using testing::Int64s;
 using testing::ScriptedSource;
+using testing::WorkerFailingPool;
 
 class ParallelComputeTest : public testing::ExecTest {};
 
@@ -226,43 +227,6 @@ TEST_F(ParallelComputeTest, OutOfMemoryAloneFailsAndFreesEverything) {
   }
   EXPECT_EQ(tiny.bytes_allocated(), 0);
 }
-
-// A pool that fails every allocation off the thread that made it (the consumer's): every batch
-// computed on a worker runs out of memory, and only a batch computed again alone succeeds.
-class WorkerFailingPool final : public arrow::MemoryPool {
- public:
-  explicit WorkerFailingPool(arrow::MemoryPool* backend) : backend_(backend) {}
-
-  arrow::Status Allocate(int64_t size, int64_t alignment, uint8_t** out) override {
-    if (std::this_thread::get_id() != owner_) {
-      failures_.fetch_add(1);
-      return arrow::Status::OutOfMemory("worker allocation");
-    }
-    return backend_->Allocate(size, alignment, out);
-  }
-  arrow::Status Reallocate(int64_t old_size, int64_t new_size, int64_t alignment,
-                           uint8_t** ptr) override {
-    if (std::this_thread::get_id() != owner_) {
-      failures_.fetch_add(1);
-      return arrow::Status::OutOfMemory("worker allocation");
-    }
-    return backend_->Reallocate(old_size, new_size, alignment, ptr);
-  }
-  void Free(uint8_t* buffer, int64_t size, int64_t alignment) override {
-    backend_->Free(buffer, size, alignment);
-  }
-  int64_t bytes_allocated() const override { return backend_->bytes_allocated(); }
-  int64_t total_bytes_allocated() const override { return backend_->total_bytes_allocated(); }
-  int64_t num_allocations() const override { return backend_->num_allocations(); }
-  std::string backend_name() const override { return backend_->backend_name(); }
-
-  [[nodiscard]] int failures() const { return failures_.load(); }
-
- private:
-  arrow::MemoryPool* backend_;
-  std::thread::id owner_ = std::this_thread::get_id();
-  std::atomic<int> failures_ = 0;
-};
 
 // Every batch runs out of memory on a worker, also once the window is 1 and nothing else is in
 // flight: each is computed again alone, and the output is ComputeOperator's.

@@ -491,7 +491,7 @@ TEST(PartSchedulerBadAllocTest, APartThatCannotBeSubmittedStartsNothing) {
   const auto pool = StartedPool();
   UnhookedSpawns spawns(pool.get());
   constexpr int64_t kNumParts = 40;  // enough for the parts in flight to need more room once
-  constexpr int kSteps = 2000;    // the work of a part
+  constexpr int kSteps = 2000;       // the work of a part
   Sweep([&](std::int64_t skip) {
     // Per part, its starts and its ends; each part's task writes only its own.
     auto starts = std::make_shared<std::vector<std::atomic<int>>>(kNumParts);

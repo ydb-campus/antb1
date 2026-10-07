@@ -29,6 +29,7 @@ antb1_add_module(
     join_table.cc
     limit.cc
     gather.cc
+    hash_join.cc
     sort.cc
     row_count.cc
     physical_planner.cc
@@ -59,6 +60,7 @@ if(ANTB1_BUILD_TESTS)
       tests/row_mask_test.cc
       tests/profile_test.cc
       tests/memory_test.cc
+      tests/hash_join_test.cc
     LIBS ArrowCompute::arrow_compute_shared
   )
   # Replaces the global operator new and delete (an allocation-failure hook), so it is an executable of its own.
