@@ -406,6 +406,14 @@ TEST(ScopeDeathTest, ColumnIdsAreUniqueInAScope) {
   EXPECT_DEBUG_DEATH({ const Scope twice({ok, ok}); }, "IdsAreUnique");
 }
 
+// A table's binding needs the table.
+TEST(BindingDeathTest, OfTableNeedsATable) {
+  ColumnIdSource ids;
+  EXPECT_DEATH((void)Binding::OfTable(
+                   "x", TableSource{.table = nullptr, .table_name = "x", .span = {}}, ids),
+               "source.table != nullptr");
+}
+
 // A sub-plan's binding needs a root that outputs exactly its columns' ids, in order, and columns
 // with ids and types.
 TEST(BindingDeathTest, OfPlanChecksItsRootAndColumns) {

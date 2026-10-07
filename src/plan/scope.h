@@ -68,8 +68,9 @@ struct NameMatches {
 // One FROM item; immutable.
 class Binding {
  public:
-  // Column i is field i of the table, with an id minted from `ids`, in schema order. Never fails: a
-  // field without an engine type keeps its column and id (BindingColumn::type).
+  // Column i is field i of the table, which must not be null, with an id minted from `ids`, in
+  // schema order. A field without an engine type is no error here: it keeps its column and id
+  // (BindingColumn::type).
   static Binding OfTable(std::string name, TableSource source, ColumnIdSource& ids);
   // The columns as given. Every column must have an id and a type, and the root must output
   // exactly the columns' ids, in order: anything else is a programming error.
