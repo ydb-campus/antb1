@@ -35,7 +35,9 @@ namespace antb1::exec {
 // results: a part computes the same result whenever it runs.
 //
 // Errors: Next() returns the first failed part in part order, when it reaches it, and stops the
-// parts after it. A part the consumer never reaches (it stopped early) never reports its error.
+// parts after it. A part the consumer never reaches (it stopped early) never reports its error. A
+// part that cannot be submitted to the executor (Submit fails, or std::bad_alloc: OutOfMemory)
+// fails Next() as a failed part does; it started nothing.
 //
 // A task sees `stop` become true once the scheduler is stopped (the consumer is done or failed);
 // it should check it between batches and may then return any status, which is dropped. Stop() and
@@ -80,7 +82,10 @@ class PartScheduler {
       } else {
         window_ = std::min(max_window_, window_ + 1);
       }
-      ARROW_RETURN_NOT_OK(Submit());  // keep the window full while the consumer works
+      if (arrow::Status submitted = Submit(); !submitted.ok()) {  // keep the window full
+        Stop();
+        return submitted;
+      }
     }
     return result;
   }
@@ -181,19 +186,35 @@ class PartScheduler {
     shared_->ClearSlots();
   }
 
-  // Submits parts until the window is full.
+  // Submits parts until the window is full. A part's slot in in_flight_ is made before its task is
+  // submitted, so that a task never runs without being tracked: a part that cannot be submitted
+  // (Submit fails, or std::bad_alloc: OutOfMemory) has started nothing and gives its slot back.
   arrow::Status Submit() {
     while (!stopped_ && next_submit_ < num_parts_ && std::cmp_less(in_flight_.size(), window_)) {
       if (!in_flight_.empty() && budget_ != nullptr && budget_->under_pressure()) {
         break;
       }
       const int64_t part = next_submit_;
-      // The task holds the shared state, so it outlives the scheduler if it has to.
-      ARROW_ASSIGN_OR_RAISE(arrow::Future<> future, executor_->Submit([shared = shared_, part]() {
-        shared->RunIntoSlot(part);
-        return arrow::Status::OK();
-      }));
-      in_flight_.push_back(std::move(future));
+      bool reserved = false;
+      try {
+        in_flight_.emplace_back();  // an invalid future until the task is submitted
+        reserved = true;
+        // The task holds the shared state, so it outlives the scheduler if it has to.
+        arrow::Result<arrow::Future<>> future = executor_->Submit([shared = shared_, part]() {
+          shared->RunIntoSlot(part);
+          return arrow::Status::OK();
+        });
+        if (!future.ok()) {
+          in_flight_.pop_back();
+          return std::move(future).status();
+        }
+        in_flight_.back() = *std::move(future);  // a move: nothing allocated, nothing thrown
+      } catch (const std::bad_alloc&) {
+        if (reserved) {
+          in_flight_.pop_back();
+        }
+        return arrow::Status::OutOfMemory("out of memory while submitting part ", part);
+      }
       ++next_submit_;
     }
     return arrow::Status::OK();

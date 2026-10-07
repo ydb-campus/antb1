@@ -1,4 +1,4 @@
-// std::bad_alloc in ForEach, the partition lanes and the join hash table
+// std::bad_alloc in ForEach, the partition lanes, the part scheduler and the join hash table
 // (docs/adr/0022-joins-and-query-blocks.md): an allocation of the C++ heap that fails anywhere in a
 // call gives OutOfMemory, never an exception (ForEach lets one out only when not even its
 // OutOfMemory can be made, and only once its tasks ended); it stops the lanes as the serial order
@@ -14,6 +14,7 @@
 // (src/exec/CMakeLists.txt); the sanitizer still sees every allocation, through malloc and free.
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -36,6 +37,7 @@
 #include "antb1/exec/operator.h"
 #include "antb1/plan/logical_plan.h"
 
+#include "../part_scheduler.h"
 #include "../partition_lanes.h"
 #include "exec_test_util.h"
 
@@ -476,6 +478,72 @@ TEST(PartitionLanesBadAllocTest, AnAddThatRunsOutOfMemoryStopsTheLanes) {
       });
     }
   }
+}
+
+// ---- The part scheduler ----
+
+// An allocation that fails while Next() submits parts, each in turn (a part's place among the parts
+// in flight, which grows as parts are taken; Arrow's Submit of its task): Next() returns
+// OutOfMemory, never an exception, and the scheduler stops. The part that could not be submitted
+// started nothing, and every part that started is waited for by the scheduler's destructor: no
+// part starts untracked, or twice. Without a failure, every part comes, in order.
+TEST(PartSchedulerBadAllocTest, APartThatCannotBeSubmittedStartsNothing) {
+  const auto pool = StartedPool();
+  UnhookedSpawns spawns(pool.get());
+  constexpr int64_t kNumParts = 40;  // enough for the parts in flight to need more room once
+  constexpr int kSteps = 2000;    // the work of a part
+  Sweep([&](std::int64_t skip) {
+    // Per part, its starts and its ends; each part's task writes only its own.
+    auto starts = std::make_shared<std::vector<std::atomic<int>>>(kNumParts);
+    auto ends = std::make_shared<std::vector<std::atomic<int>>>(kNumParts);
+    std::optional<arrow::Status> failure;
+    int64_t taken = 0;
+    bool fired = false;
+    {
+      PartScheduler<int64_t> scheduler(
+          kNumParts,
+          [starts, ends](int64_t part,
+                         const std::atomic<bool>& /*stop*/) -> arrow::Result<int64_t> {
+            const auto at = static_cast<std::size_t>(part);
+            ++(*starts)[at];
+            std::uint64_t value = static_cast<std::uint64_t>(part) + 1;
+            for (int step = 0; step < kSteps; ++step) {
+              value = (value * 6364136223846793005U) + 1442695040888963407U;
+            }
+            ++(*ends)[at];
+            return value == 0 ? -1 : part;
+          },
+          &spawns, kThreads);
+      {
+        const FailAllocations fail(skip);
+        while (!scheduler.done()) {
+          arrow::Result<int64_t> result = scheduler.Next();
+          if (!result.ok()) {
+            failure = result.status();
+            break;
+          }
+          EXPECT_EQ(*result, taken);
+          ++taken;
+        }
+        fired = fail.failed() > 0;
+      }
+      if (failure.has_value()) {
+        EXPECT_TRUE(fired) << failure->ToString();
+        EXPECT_TRUE(failure->IsOutOfMemory()) << failure->ToString();
+        EXPECT_TRUE(scheduler.done());
+      } else {
+        EXPECT_EQ(taken, kNumParts);
+      }
+    }
+    for (std::size_t part = 0; part < static_cast<std::size_t>(kNumParts); ++part) {
+      EXPECT_EQ((*starts)[part].load(), (*ends)[part].load()) << "part " << part << " still runs";
+    }
+    pool->WaitForIdle();
+    for (std::size_t part = 0; part < static_cast<std::size_t>(kNumParts); ++part) {
+      EXPECT_LE((*starts)[part].load(), 1) << "part " << part;
+    }
+    return fired;
+  });
 }
 
 // ---- The join build ----

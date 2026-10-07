@@ -239,6 +239,76 @@ TEST(PartSchedulerTest, PressureNarrowsTheWindow) {
   }
 }
 
+// Runs every task on `pool`, except that spawn number `refuse_at` (from 0) fails with an IOError.
+class RefusingExecutor final : public arrow::internal::Executor {
+ public:
+  RefusingExecutor(arrow::internal::Executor* pool, int refuse_at)
+      : pool_(pool), refuse_at_(refuse_at) {}
+
+  int GetCapacity() override { return pool_->GetCapacity(); }
+
+ protected:
+  arrow::Status SpawnReal(arrow::internal::TaskHints hints, arrow::internal::FnOnce<void()> task,
+                          arrow::StopToken stop_token, StopCallback&& stop_callback) override {
+    if (spawns_++ == refuse_at_) {
+      return arrow::Status::IOError("no room for a task");
+    }
+    return pool_->Spawn(hints, std::move(task), std::move(stop_token), std::move(stop_callback));
+  }
+
+ private:
+  arrow::internal::Executor* pool_;
+  int refuse_at_;
+  int spawns_ = 0;  // Submit is called from one thread
+};
+
+// A part the executor cannot take (its Submit fails, or throws std::bad_alloc: OutOfMemory) fails
+// Next(), whether the consumer waits for it or refills the window, and the scheduler stops. The
+// part started nothing, no later part was submitted, and the results before it came in order.
+TEST(PartSchedulerTest, APartTheExecutorCannotTakeFailsNext) {
+  const auto pool = Pool();
+  constexpr int64_t kNumParts = 10;
+  for (const bool throws : {false, true}) {
+    for (const int refuse_at : {0, 5}) {  // parts are submitted in order: spawn k runs part k
+      SCOPED_TRACE(::testing::Message() << (throws ? "throws" : "fails") << " at " << refuse_at);
+      auto starts = std::make_shared<std::vector<std::atomic<int>>>(kNumParts);
+      std::unique_ptr<arrow::internal::Executor> executor;
+      if (throws) {
+        executor = std::make_unique<testing::ThrowingExecutor>(pool.get(), refuse_at);
+      } else {
+        executor = std::make_unique<RefusingExecutor>(pool.get(), refuse_at);
+      }
+      {
+        PartScheduler<int64_t> scheduler(
+            kNumParts,
+            [starts](int64_t part, const std::atomic<bool>&) -> arrow::Result<int64_t> {
+              ++(*starts)[static_cast<std::size_t>(part)];
+              return part;
+            },
+            executor.get(), 3);
+        int64_t taken = 0;
+        arrow::Status failure;
+        while (!scheduler.done()) {
+          auto result = scheduler.Next();
+          if (!result.ok()) {
+            failure = result.status();
+            break;
+          }
+          EXPECT_EQ(*result, taken);
+          ++taken;
+        }
+        EXPECT_TRUE(throws ? failure.IsOutOfMemory() : failure.IsIOError()) << failure.ToString();
+        EXPECT_TRUE(scheduler.done());
+        EXPECT_LT(taken, refuse_at + 1);
+      }
+      pool->WaitForIdle();
+      for (int64_t part = refuse_at; part < kNumParts; ++part) {
+        EXPECT_EQ((*starts)[static_cast<std::size_t>(part)].load(), 0) << part;
+      }
+    }
+  }
+}
+
 // ---- part operators through the physical planner ----
 
 class PartOperatorsTest : public testing::ExecTest {
