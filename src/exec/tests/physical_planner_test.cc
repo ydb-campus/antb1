@@ -595,9 +595,10 @@ TEST_F(PhysicalPlannerTest, MalformedJoinsAreInvalidNotUnsupported) {
 }
 
 // An inner join is a hash join (ADR 0022): over a probe that is a part pipeline, the pipeline's
-// sink runs behind the operator that prepares its builds (BuildsFirstOperator), whatever the sink;
-// over a serial probe input, the probe is the HashJoinOperator itself. A plan without a join has
-// no such wrapper. The rows match on equal non-NULL keys, a build on either side.
+// sink runs behind the operator that prepares its builds (BuildsFirstOperator), whatever the sink
+// (the part union, an aggregate, a GROUP BY, either aggregation in two levels, a top-N); over a
+// serial probe input, the probe is the HashJoinOperator itself. A plan without a join has no such
+// wrapper. The rows match on equal non-NULL keys, a build on either side.
 TEST_F(PhysicalPlannerTest, InnerJoinsArePlannedAsHashJoins) {
   const auto table = Table(/*split=*/true);
   const auto scan = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}});
@@ -624,11 +625,19 @@ TEST_F(PhysicalPlannerTest, InnerJoinsArePlannedAsHashJoins) {
   const auto join = join_on(x, plan::BuildSide::kRight, scan);
   const plan::AggregateCall count{
       .kind = plan::AggKind::kCountStar, .arg = {}, .type = LogicalType::kBigInt};
+  const plan::AggregateCall distinct{
+      .kind = plan::AggKind::kCountDistinct, .arg = x, .type = LogicalType::kBigInt};
   EXPECT_TRUE(builds_first(root(join, 4)));
   EXPECT_TRUE(
       builds_first(root(Node(plan::AggregateNode{.input = join, .aggregates = {count}}), 1)));
   EXPECT_TRUE(builds_first(
       root(Node(plan::GroupAggregateNode{.input = join, .keys = {y}, .aggregates = {count}}), 2)));
+  // COUNT(DISTINCT) next to another call: in two levels, without keys and with them.
+  EXPECT_TRUE(builds_first(
+      root(Node(plan::AggregateNode{.input = join, .aggregates = {distinct, count}}), 2)));
+  EXPECT_TRUE(builds_first(root(
+      Node(plan::GroupAggregateNode{.input = join, .keys = {y}, .aggregates = {distinct, count}}),
+      3)));
   EXPECT_TRUE(builds_first(
       root(Node(plan::LimitNode{
                .input = Node(plan::SortNode{.input = join, .keys = {plan::SortKey{.column = x}}}),

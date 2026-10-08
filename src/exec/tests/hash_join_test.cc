@@ -1671,10 +1671,10 @@ TEST_F(HashJoinPlanTest, MatchesTheNestedLoopReference) {
 
 // Every shape through which a join's rows reach a result gives the same rows on one thread and on
 // four: the part union at the root, a Filter and a Project above the probe, every part sink (an
-// aggregate, a GROUP BY, two levels, the COUNT(DISTINCT) rewrite, a top-N), a Limit, a Sort, the
-// partition top-N, a probe over a serial input, a drained build, a chain of two joins in one
-// pipeline and a build whose input probes a build of its own. The joins give the nested-loop
-// reference.
+// aggregate, a GROUP BY, two levels with keys and without, the COUNT(DISTINCT) rewrite, a top-N),
+// a Limit, a Sort, the partition top-N, a probe over a serial input, a drained build, a chain of
+// two joins in one pipeline and a build whose input probes a build of its own. The joins and the
+// aggregation in two levels without keys give the nested-loop reference.
 TEST_F(HashJoinPlanTest, SameResultsOnOneAndFourThreads) {
   const auto pool = MakeThreadPool();
   const auto p = MixedTable("p", 6, 7, ProbeKey);
@@ -1733,6 +1733,9 @@ TEST_F(HashJoinPlanTest, SameResultsOnOneAndFourThreads) {
        PlanOf(Node(plan::GroupAggregateNode{
                   .input = join, .keys = {out_bk}, .aggregates = {distinct_pid, count}}),
               3)},
+      // COUNT(DISTINCT) next to another call, without keys: a global aggregation in two levels.
+      {"global two levels",
+       PlanOf(Node(plan::AggregateNode{.input = join, .aggregates = {distinct_pid, count}}), 2)},
       {"count distinct",
        PlanOf(Node(plan::AggregateNode{.input = join, .aggregates = {distinct_pid}}), 1)},
       {"top-N", PlanOf(Node(plan::LimitNode{.input = sorted, .limit = 5}), 6)},
@@ -1766,6 +1769,14 @@ TEST_F(HashJoinPlanTest, SameResultsOnOneAndFourThreads) {
     EXPECT_TRUE((*parallel)->Equals(**serial));
     if (name == "join") {
       EXPECT_EQ(RowsOf(**serial), ReferenceJoin(RowsOf(*p), RowsOf(*b), {0}, {0}));
+    } else if (name == "global two levels") {
+      const Rows rows = ReferenceJoin(RowsOf(*p), RowsOf(*b), {0}, {0});
+      std::set<std::string> ids;
+      for (const std::vector<std::string>& row : rows) {
+        ids.insert(row[2]);
+      }
+      EXPECT_EQ(RowsOf(**serial),
+                (Rows{{std::to_string(ids.size()), std::to_string(rows.size())}}));
     } else if (name == "chain") {
       EXPECT_EQ(RowsOf(**serial), ReferenceJoin(ReferenceJoin(RowsOf(*p), RowsOf(*b), {0}, {0}),
                                                 RowsOf(*d), {2}, {0}));
