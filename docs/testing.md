@@ -129,8 +129,7 @@ each table's rows. `tests/slt/tables.txt` declares the references between the ta
 (schema, row groups and values; not compression or page layout), on every leg, macOS included. It skips the
 top-level `tpch/` directory, where the data derived from TPC-H is generated at test time. After an intended
 change of the generator, run the tests once (they regenerate the fixtures, and the digest test fails), rewrite the
-digest, regenerate the `.slt` expectations and the CLI goldens, check the join counts that `integration.JoinTest.*`
-pins (DuckDB's for the same joins of the star tables), and review every diff:
+digest, regenerate the `.slt` expectations and the CLI goldens, and review every diff:
 
 ```bash
 pixi run test   # regenerates build/dev/fixtures; harness.fixtures.digest fails
@@ -138,6 +137,10 @@ build/dev/bin/antb1-fixture-digest --write tests/fixtures/fixtures.digest build/
 pixi run slt-complete
 ANTB1_UPDATE_GOLDENS=1 pixi run test -L cli
 ```
+
+The row counts that `integration.JoinTest.*` pins for its hand-built joins of the star tables are DuckDB's, which
+pending `COUNT(*)` records of the same joins hold too (`tests/slt/cases/joins/inner.slt`, and `names.slt` for trips
+with zones): set the test's counts to those `slt-complete` writes there.
 
 ## SQL logic tests
 

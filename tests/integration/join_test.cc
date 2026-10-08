@@ -3,9 +3,11 @@
 // exec::BuildPhysicalPlan: dense keys (the direct layout), repeated and NULL keys, a two-column
 // key, VARCHAR keys, the empty dimension, a self-join, a chain of two joins, and part pruning and
 // filter pushdown on both sides. The rows are checked against a nested-loop join of plain scans,
-// in order, and their counts against those DuckDB 1.5.6 gives for the same joins of the same
-// files: they depend on the fixtures (tools/fixturegen/star.h), so a change of the fixture digest
-// (tests/harness) may change them.
+// in order, and their counts against DuckDB's for the same joins of the same files, which pending
+// J2b records of tests/slt/cases/joins/ hold too (inner.slt, and names.slt for trips with zones).
+// The counts depend on the fixtures (tools/fixturegen/star.h): after a change of the fixture
+// digest (tests/harness), `pixi run slt-complete` rewrites those records from DuckDB, and the
+// counts here follow them.
 
 #include <algorithm>
 #include <cstddef>

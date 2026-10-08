@@ -316,6 +316,33 @@ SELECT COUNT(*) FROM trips AS a JOIN trips AS b ON a.tr_driver = b.tr_driver AND
 ----
 40488
 
+# The row counts that integration.JoinTest (tests/integration/join_test.cc) pins for its hand-built plans of these
+# joins: VARCHAR keys, the self-reference of zones, a chain of two joins and a filter on each side. Its other counts
+# are those of trips with riders, shifts and promos above, and of trips with zones in names.slt.
+pending J2b
+query I nosort
+SELECT COUNT(*) FROM trips JOIN tariffs ON tr_tariff = tf_code
+----
+2274
+
+pending J2b
+query I nosort
+SELECT COUNT(*) FROM zones AS z JOIN zones AS p ON z.zn_parent = p.zn_id
+----
+34
+
+pending J2b
+query I nosort
+SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id JOIN cities ON zn_city = ct_id
+----
+2655
+
+pending J2b
+query I nosort
+SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id WHERE tr_row >= 2400 AND zn_id <= 10
+----
+140
+
 # ---- DuckDB only until DOUBLE join keys get a PR (ADR 0022: a graph connected only through one exits 4) ----
 
 onlyif duckdb
