@@ -19,6 +19,7 @@
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/sql_status.h"
 
+#include "../hash_join.h"
 #include "../parallel_compute.h"
 #include "../part_operators.h"
 #include "exec_test_util.h"
@@ -455,40 +456,44 @@ TEST_F(PhysicalPlannerTest, LateScansAreFiltered) {
   }
 }
 
-// No operator answers a join until the hash join (J1b, E2): every kind is rejected with exit code
-// 4, at the join's span, also below every other node (PipelineScan, FiltersOnScan and LateSplit
-// stop at a join, so no part pipeline runs over one).
-TEST_F(PhysicalPlannerTest, JoinsAreUnsupported) {
+// Only inner joins run until E2 (ADR 0022): every other kind is rejected with exit code 4 at the
+// join's span, as before, also below every other node, in an inner join's build input or probe
+// input (a part pipeline stops at it), and with a profile.
+TEST_F(PhysicalPlannerTest, NonInnerJoinsAreUnsupported) {
   const auto table = Table(/*split=*/true);
   const auto scan = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}});
   const plan::BoundColumn x{.index = 0, .name = "x", .type = LogicalType::kBigInt};
   const SourceSpan span{.offset = 7, .length = 4};
-  const auto join_of = [&](plan::JoinKind kind) {
+  const auto join_of = [&](plan::JoinKind kind, const plan::LogicalNodePtr& left,
+                           const plan::LogicalNodePtr& right, SourceSpan at) {
     return Node(plan::JoinNode{.kind = kind,
-                               .left = scan,
-                               .right = scan,
+                               .left = left,
+                               .right = right,
                                .keys = {plan::JoinKey{.left = x, .right = x}},
                                .residual = {},
                                .build = plan::BuildSide::kRight,
-                               .span = span});
+                               .span = at});
   };
   const auto expect_unsupported = [&](const plan::LogicalNodePtr& root, std::string_view kind) {
-    const auto status = BuildPhysicalPlan(PlanOf(root)).status();
-    const auto detail = plan::GetSqlError(status);
-    ASSERT_NE(detail, nullptr) << plan::NodeName(*root) << ": " << status.ToString();
-    EXPECT_EQ(detail->kind(), plan::SqlErrorDetail::Kind::kUnsupported);
-    EXPECT_EQ(detail->span(), span);
-    EXPECT_EQ(status.message(), std::string(kind) + " joins are not supported yet");
+    for (const bool profiled : {false, true}) {
+      ProfileNode profile;
+      const auto status = BuildPhysicalPlan(PlanOf(root), profiled ? &profile : nullptr).status();
+      const auto detail = plan::GetSqlError(status);
+      ASSERT_NE(detail, nullptr) << plan::NodeName(*root) << ": " << status.ToString();
+      EXPECT_EQ(detail->kind(), plan::SqlErrorDetail::Kind::kUnsupported);
+      EXPECT_EQ(detail->span(), span);
+      EXPECT_EQ(status.message(), std::string(kind) + " joins are not supported yet");
+    }
   };
   for (const auto& [kind, name] :
-       {std::pair{plan::JoinKind::kInner, "INNER"}, std::pair{plan::JoinKind::kLeft, "LEFT"},
-        std::pair{plan::JoinKind::kSemi, "SEMI"}, std::pair{plan::JoinKind::kAnti, "ANTI"},
+       {std::pair{plan::JoinKind::kLeft, "LEFT"}, std::pair{plan::JoinKind::kSemi, "SEMI"},
+        std::pair{plan::JoinKind::kAnti, "ANTI"},
         std::pair{plan::JoinKind::kNullAwareAnti, "NULL-AWARE ANTI"},
         std::pair{plan::JoinKind::kOneRow, "ONE-ROW"}}) {
-    expect_unsupported(join_of(kind), name);
+    expect_unsupported(join_of(kind, scan, scan, span), name);
   }
 
-  const auto join = join_of(plan::JoinKind::kInner);
+  const auto join = join_of(plan::JoinKind::kLeft, scan, scan, span);
   const auto is_not_null = plan::Predicate{.kind = plan::Predicate::Kind::kIsNotNull, .column = x};
   const auto filter = Node(plan::FilterNode{.input = join, .predicates = {is_not_null}});
   const auto sort = Node(plan::SortNode{.input = join, .keys = {plan::SortKey{.column = x}}});
@@ -496,6 +501,8 @@ TEST_F(PhysicalPlannerTest, JoinsAreUnsupported) {
   const plan::AggregateCall distinct{.kind = plan::AggKind::kCountDistinct, .arg = x};
   const auto one = std::make_shared<const plan::Expr>(
       plan::Expr{.node = plan::ConstantExpr{.value = plan::Constant{}}, .name = "1"});
+  // An inner join elsewhere in the query, its span another one.
+  const SourceSpan elsewhere{.offset = 30, .length = 4};
   for (const plan::LogicalNodePtr& root : {
            filter,
            Node(plan::ComputeNode{.input = join, .exprs = {one}}),
@@ -509,14 +516,146 @@ TEST_F(PhysicalPlannerTest, JoinsAreUnsupported) {
            Node(plan::LimitNode{.input = join, .limit = 3}),
            Node(plan::LimitNode{.input = filter, .limit = 3}),
            Node(plan::LimitNode{.input = sort, .limit = 3}),
+           join_of(plan::JoinKind::kInner, scan, join, elsewhere),    // the build input
+           join_of(plan::JoinKind::kInner, join, scan, elsewhere),    // the probe input
+           join_of(plan::JoinKind::kInner, filter, scan, elsewhere),  // below the probe's Filter
        }) {
-    expect_unsupported(root, "INNER");
+    expect_unsupported(root, "LEFT");
   }
-  // With a profile too.
-  ProfileNode profile;
-  const auto profiled = plan::GetSqlError(BuildPhysicalPlan(PlanOf(filter), &profile).status());
-  ASSERT_NE(profiled, nullptr);
-  EXPECT_EQ(profiled->kind(), plan::SqlErrorDetail::Kind::kUnsupported);
+}
+
+// What a correct plan never holds is Invalid, never unsupported: a join without its inputs or
+// keys, a key of two types, a DOUBLE or BOOLEAN key, a key outside its input on either side, a
+// residual that is missing, not BOOLEAN or outside the join; in a part pipeline and over a serial
+// probe input alike.
+TEST_F(PhysicalPlannerTest, MalformedJoinsAreInvalidNotUnsupported) {
+  const auto table = Table(/*split=*/true);
+  const auto scan = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}});
+  const auto x = Column(0, "x", LogicalType::kBigInt);
+  // A sorted scan: a probe input that is no part pipeline.
+  const auto sorted = Node(plan::SortNode{.input = scan, .keys = {plan::SortKey{.column = x}}});
+  const auto expr = [](int index, LogicalType type) {
+    return std::make_shared<const plan::Expr>(
+        plan::Expr{.node = plan::ColumnExpr{.index = index}, .type = type, .name = "c"});
+  };
+  const auto join_of = [&](const plan::LogicalNodePtr& probe, std::vector<plan::JoinKey> keys,
+                           std::vector<plan::ExprPtr> residual) {
+    return Node(plan::JoinNode{.kind = plan::JoinKind::kInner,
+                               .left = probe,
+                               .right = scan,
+                               .keys = std::move(keys),
+                               .residual = std::move(residual),
+                               .build = plan::BuildSide::kRight,
+                               .span = {}});
+  };
+  const auto key = [](plan::BoundColumn left, plan::BoundColumn right) {
+    return std::vector<plan::JoinKey>{
+        plan::JoinKey{.left = std::move(left), .right = std::move(right)}};
+  };
+  const auto expect_invalid = [&](const plan::LogicalNodePtr& root, std::string_view what) {
+    const auto status = BuildPhysicalPlan(PlanOf(root, 4)).status();
+    EXPECT_TRUE(status.IsInvalid()) << what << ": " << status.ToString();
+    EXPECT_EQ(plan::GetSqlError(status), nullptr) << what << ": a malformed plan is a bug";
+  };
+  expect_invalid(Node(plan::JoinNode{}), "no inputs");
+  for (const plan::LogicalNodePtr& probe : {scan, sorted}) {
+    expect_invalid(join_of(probe, {}, {}), "no keys");
+    expect_invalid(join_of(probe, key(x, Column(0, "x", LogicalType::kInteger)), {}),
+                   "a key of two types");
+    expect_invalid(
+        join_of(probe,
+                key(Column(0, "x", LogicalType::kDouble), Column(0, "x", LogicalType::kDouble)),
+                {}),
+        "a DOUBLE key");
+    expect_invalid(
+        join_of(probe,
+                key(Column(0, "x", LogicalType::kBoolean), Column(0, "x", LogicalType::kBoolean)),
+                {}),
+        "a BOOLEAN key");
+    expect_invalid(join_of(probe, key(Column(2, "x", LogicalType::kBigInt), x), {}),
+                   "a probe key outside its input");
+    expect_invalid(join_of(probe, key(x, Column(-1, "x", LogicalType::kBigInt)), {}),
+                   "a build key outside its input");
+    expect_invalid(join_of(probe, key(x, x), {nullptr}), "a missing residual");
+    expect_invalid(join_of(probe, key(x, x), {expr(1, LogicalType::kBigInt)}), "a BIGINT residual");
+    expect_invalid(join_of(probe, key(x, x), {expr(4, LogicalType::kBoolean)}),
+                   "a residual outside the join");
+  }
+  // A malformed join in a build input: in its part pipeline, and drained.
+  for (const plan::LogicalNodePtr& probe : {scan, sorted}) {
+    expect_invalid(Node(plan::JoinNode{.kind = plan::JoinKind::kInner,
+                                       .left = scan,
+                                       .right = join_of(probe, {}, {}),
+                                       .keys = key(x, x),
+                                       .residual = {},
+                                       .build = plan::BuildSide::kRight,
+                                       .span = {}}),
+                   "no keys in a build input");
+  }
+}
+
+// An inner join is a hash join (ADR 0022): over a probe that is a part pipeline, the pipeline's
+// sink runs behind the operator that prepares its builds (BuildsFirstOperator), whatever the sink;
+// over a serial probe input, the probe is the HashJoinOperator itself. A plan without a join has
+// no such wrapper. The rows match on equal non-NULL keys, a build on either side.
+TEST_F(PhysicalPlannerTest, InnerJoinsArePlannedAsHashJoins) {
+  const auto table = Table(/*split=*/true);
+  const auto scan = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}});
+  const auto x = Column(0, "x", LogicalType::kBigInt);
+  const auto y = Column(1, "y", LogicalType::kBigInt);
+  const auto join_on = [&](const plan::BoundColumn& key, plan::BuildSide build,
+                           const plan::LogicalNodePtr& left) {
+    return Node(plan::JoinNode{.kind = plan::JoinKind::kInner,
+                               .left = left,
+                               .right = scan,
+                               .keys = {plan::JoinKey{.left = key, .right = key}},
+                               .residual = {},
+                               .build = build,
+                               .span = {}});
+  };
+  const auto root = [&](const plan::LogicalNodePtr& node, std::size_t width) {
+    auto op = BuildPhysicalPlan(PlanOf(node, width));
+    EXPECT_TRUE(op.ok()) << op.status().ToString();
+    return op.ok() ? *std::move(op) : nullptr;
+  };
+  const auto builds_first = [](const std::unique_ptr<Operator>& op) {
+    return dynamic_cast<const BuildsFirstOperator*>(op.get()) != nullptr;
+  };
+  const auto join = join_on(x, plan::BuildSide::kRight, scan);
+  const plan::AggregateCall count{
+      .kind = plan::AggKind::kCountStar, .arg = {}, .type = LogicalType::kBigInt};
+  EXPECT_TRUE(builds_first(root(join, 4)));
+  EXPECT_TRUE(
+      builds_first(root(Node(plan::AggregateNode{.input = join, .aggregates = {count}}), 1)));
+  EXPECT_TRUE(builds_first(
+      root(Node(plan::GroupAggregateNode{.input = join, .keys = {y}, .aggregates = {count}}), 2)));
+  EXPECT_TRUE(builds_first(
+      root(Node(plan::LimitNode{
+               .input = Node(plan::SortNode{.input = join, .keys = {plan::SortKey{.column = x}}}),
+               .limit = 2}),
+           4)));
+  EXPECT_FALSE(builds_first(root(scan, 2)));
+  EXPECT_NE(dynamic_cast<const PartUnionOperator*>(root(scan, 2).get()), nullptr);
+  // A probe input that is no part pipeline (a sort).
+  const auto sorted = Node(plan::SortNode{.input = scan, .keys = {plan::SortKey{.column = x}}});
+  EXPECT_NE(dynamic_cast<const HashJoinOperator*>(
+                root(join_on(x, plan::BuildSide::kRight, sorted), 4).get()),
+            nullptr);
+  // x = 0..9 matches itself; y, NULL where x is a multiple of 3, matches 6 rows.
+  for (const plan::BuildSide build : {plan::BuildSide::kRight, plan::BuildSide::kLeft}) {
+    for (const plan::LogicalNodePtr& left : {scan, sorted}) {
+      const auto by_x = Run(PlanOf(join_on(x, build, left), 4));
+      ASSERT_NE(by_x, nullptr);
+      EXPECT_EQ(Int64Column(*by_x, 0), Int64Column(*by_x, 2));
+      EXPECT_EQ(Int64Column(*by_x, 0),
+                (std::vector<std::optional<int64_t>>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}));
+      const auto by_y = Run(PlanOf(join_on(y, build, left), 4));
+      ASSERT_NE(by_y, nullptr);
+      EXPECT_EQ(Int64Column(*by_y, 1),
+                (std::vector<std::optional<int64_t>>{10, 20, 40, 50, 70, 80}));
+      EXPECT_EQ(Int64Column(*by_y, 3), Int64Column(*by_y, 1));
+    }
+  }
 }
 
 TEST_F(PhysicalPlannerTest, MalformedPlansAreInvalidNotUnsupported) {

@@ -16,6 +16,7 @@
 #include "antb1/exec/compute.h"
 #include "antb1/exec/filter.h"
 #include "antb1/exec/group_aggregate.h"
+#include "antb1/exec/join_table.h"
 #include "antb1/exec/limit.h"
 #include "antb1/exec/profile.h"
 #include "antb1/exec/project.h"
@@ -27,7 +28,9 @@
 #include "antb1/plan/explain.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/sql_status.h"
+#include "antb1/plan/types.h"
 
+#include "hash_join.h"
 #include "parallel_compute.h"
 #include "part_operators.h"
 #include "part_pruning.h"
@@ -38,55 +41,77 @@ namespace {
 
 using OperatorResult = arrow::Result<std::unique_ptr<Operator>>;
 
+// The inner joins whose probes run in one part pipeline, and their builds, outermost join first:
+// the order in which the operator that runs the pipeline prepares them (PrepareBuilds). Made once
+// per pipeline, before the factory of its parts, so every part's probe reads the same build and no
+// part number of the pipeline ever reaches a build input.
+struct PipelineBuilds {
+  std::vector<const plan::JoinNode*> joins;
+  std::vector<std::shared_ptr<JoinBuild>> builds;  // of each join
+
+  // The build of `join`; nullptr if it is none of the pipeline's joins.
+  [[nodiscard]] std::shared_ptr<JoinBuild> Find(const plan::JoinNode* join) const {
+    for (std::size_t i = 0; i < joins.size(); ++i) {
+      if (joins[i] == join) {
+        return builds[i];
+      }
+    }
+    return nullptr;
+  }
+};
+
 // Builds a node's operators. Without a part, a part pipeline (PipelineScan) becomes the part
-// operators over it; with one, the node is inside the pipeline of that part. With a profile node
-// (`slot`), the operator is profiled into it (profile.h) and its inputs into its children.
-// With `top_n` (a top-N right above `node`), a partitioned grouped aggregation keeps only each
-// partition's first rows in its order (PartitionTopN).
+// operators over it; with one, the node is inside the pipeline of that part, whose joins' builds
+// are `builds`. With a profile node (`slot`), the operator is profiled into it (profile.h) and its
+// inputs into its children. With `top_n` (a top-N right above `node`), a partitioned grouped
+// aggregation keeps only each partition's first rows in its order (PartitionTopN).
 OperatorResult Build(const plan::LogicalNodePtr& node, std::optional<int64_t> part = std::nullopt,
                      ProfileNode* slot = nullptr, const LateScan* late = nullptr,
-                     const PartitionTopN* top_n = nullptr);
+                     const PartitionTopN* top_n = nullptr, const PipelineBuilds* builds = nullptr);
 // The operator profiled into `slot` (with the node's EXPLAIN line when it has no detail yet); the
 // operator itself without a slot.
 OperatorResult Profiled(OperatorResult op, const plan::LogicalNodePtr& node, ProfileNode* slot);
 
-// The scan at the bottom of a part pipeline, a chain of streaming nodes over a scan; nullptr if
-// `node` is not the top of one. A Join ends the chain, as does any node but Filter, Compute and
-// Project; so do FiltersOnScan and LateSplit.
+// The node below `node` that a part pipeline goes on through: the input of a Filter, a Compute or
+// a Project, and an inner join's probe input (the input it does not build on); nullptr for any
+// other node. PipelineScan, FiltersOnScan and PipelineBuildsOf all walk a pipeline with it, so they
+// never disagree on its nodes.
+const plan::LogicalNode* PipelineInput(const plan::LogicalNode& node) {
+  if (const auto* filter = std::get_if<plan::FilterNode>(&node)) {
+    return filter->input.get();
+  }
+  if (const auto* compute = std::get_if<plan::ComputeNode>(&node)) {
+    return compute->input.get();
+  }
+  if (const auto* project = std::get_if<plan::ProjectNode>(&node)) {
+    return project->input.get();
+  }
+  if (const auto* join = std::get_if<plan::JoinNode>(&node);
+      join != nullptr && join->kind == plan::JoinKind::kInner) {
+    return (join->build == plan::BuildSide::kLeft ? join->right : join->left).get();
+  }
+  return nullptr;
+}
+
+// The scan at the bottom of a part pipeline, a chain of streaming nodes over a scan (Filter,
+// Compute, Project and inner joins' probes, PipelineInput); nullptr if `node` is not the top of
+// one. Any other node ends the chain: a join of another kind, an aggregation, a sort, a limit.
 const plan::ScanNode* PipelineScan(const plan::LogicalNodePtr& node) {
-  const plan::LogicalNode* n = node.get();
-  while (n != nullptr) {
+  for (const plan::LogicalNode* n = node.get(); n != nullptr; n = PipelineInput(*n)) {
     if (const auto* scan = std::get_if<plan::ScanNode>(n)) {
       return scan->table == nullptr ? nullptr : scan;
-    }
-    if (const auto* filter = std::get_if<plan::FilterNode>(n)) {
-      n = filter->input.get();
-    } else if (const auto* compute = std::get_if<plan::ComputeNode>(n)) {
-      n = compute->input.get();
-    } else if (const auto* project = std::get_if<plan::ProjectNode>(n)) {
-      n = project->input.get();
-    } else {
-      return nullptr;
     }
   }
   return nullptr;
 }
 
-// The predicates of the Filters directly on the scan of a part pipeline (below any Compute or
-// Project): their columns are the scan's output columns.
+// The predicates of the Filters directly on the scan of the part pipeline whose top is `node`
+// (below any other node of it: a Compute, a Project, a join): their columns are the scan's output
+// columns. A Filter above a join reads the join's columns, so it is never one of them.
 std::vector<plan::Predicate> FiltersOnScan(const plan::LogicalNodePtr& node) {
   std::vector<const plan::LogicalNode*> chain;  // top to scan
-  for (const plan::LogicalNode* n = node.get(); n != nullptr;) {
+  for (const plan::LogicalNode* n = node.get(); n != nullptr; n = PipelineInput(*n)) {
     chain.push_back(n);
-    if (const auto* filter = std::get_if<plan::FilterNode>(n)) {
-      n = filter->input.get();
-    } else if (const auto* compute = std::get_if<plan::ComputeNode>(n)) {
-      n = compute->input.get();
-    } else if (const auto* project = std::get_if<plan::ProjectNode>(n)) {
-      n = project->input.get();
-    } else {
-      break;
-    }
   }
   std::vector<plan::Predicate> predicates;
   for (std::size_t i = chain.size(); i-- > 1;) {  // from just above the scan up
@@ -99,6 +124,44 @@ std::vector<plan::Predicate> FiltersOnScan(const plan::LogicalNodePtr& node) {
   return predicates;
 }
 
+// An inner join as a hash join runs it: its probe and build inputs, and their keys (a key's left
+// column is on the left input, its right column on the right one).
+struct JoinShape {
+  plan::LogicalNodePtr probe;
+  plan::LogicalNodePtr build;
+  std::vector<int> probe_keys;                // columns of the probe input's output
+  std::vector<plan::BoundColumn> build_keys;  // columns of the build input's output
+};
+
+// Invalid, never unsupported, for what a correct plan never holds: a missing input, no key, a key
+// whose two columns differ in type (the binder casts them to one type), a DOUBLE or BOOLEAN key.
+arrow::Result<JoinShape> ShapeOf(const plan::JoinNode& join) {
+  if (join.left == nullptr || join.right == nullptr) {
+    return arrow::Status::Invalid("a join without its inputs");
+  }
+  if (join.keys.empty()) {
+    return arrow::Status::Invalid("a hash join without keys");
+  }
+  const bool build_left = join.build == plan::BuildSide::kLeft;
+  JoinShape shape{.probe = build_left ? join.right : join.left,
+                  .build = build_left ? join.left : join.right,
+                  .probe_keys = {},
+                  .build_keys = {}};
+  for (const plan::JoinKey& key : join.keys) {
+    if (key.left.type != key.right.type) {
+      return arrow::Status::Invalid("a join key of two types: ", plan::ToString(key.left.type),
+                                    " and ", plan::ToString(key.right.type));
+    }
+    if (key.left.type == plan::LogicalType::kDouble ||
+        key.left.type == plan::LogicalType::kBoolean) {
+      return arrow::Status::Invalid("a hash join key of type ", plan::ToString(key.left.type));
+    }
+    shape.probe_keys.push_back((build_left ? key.right : key.left).index);
+    shape.build_keys.push_back(build_left ? key.left : key.right);
+  }
+  return shape;
+}
+
 // The pipelines of the parts a part pipeline reads: every part of the scan's table but those its
 // filters rule out by their statistics (part_pruning.h), in part order, numbered 0 .. count - 1.
 struct Parts {
@@ -108,15 +171,70 @@ struct Parts {
   // The first parts that hold kTwoLevelSampleRows rows by the table's part_rows (all of them if
   // they hold fewer): chosen from metadata, so never by the number of threads.
   int64_t sample = 0;
+  // The builds of the inner joins the pipeline probes; nullptr when it probes none.
+  std::shared_ptr<const PipelineBuilds> builds;
 };
 
+arrow::Result<Parts> PartsOf(const plan::LogicalNodePtr& node, const plan::ScanNode& scan,
+                             ProfileNode* consumer = nullptr,
+                             const std::shared_ptr<const LateScan>& late = nullptr);
+
+// The build of an inner join of shape `shape`, profiled into `slot` (nullptr: not profiled). A
+// build input that is a part pipeline is built from its parts, with the builds of its own joins,
+// which the build prepares first; any other input's operator is drained.
+arrow::Result<std::shared_ptr<JoinBuild>> MakeJoinBuild(const plan::JoinNode& join,
+                                                        const JoinShape& shape, ProfileNode* slot) {
+  if (slot != nullptr) {
+    slot->set_name("HashBuild");
+    slot->set_detail(plan::ExplainNode(plan::LogicalNode(join)));
+  }
+  if (const plan::ScanNode* scan = PipelineScan(shape.build)) {
+    ARROW_ASSIGN_OR_RAISE(Parts parts, PartsOf(shape.build, *scan, slot));
+    ARROW_ASSIGN_OR_RAISE(auto sample, parts.pipeline(0));  // for the schema; never opened
+    ARROW_ASSIGN_OR_RAISE(auto spec,
+                          JoinBuildSpec::Make(sample->output_schema(), shape.build_keys));
+    return std::make_shared<JoinBuild>(
+        std::move(spec), std::move(parts.pipeline), parts.count,
+        parts.builds == nullptr ? std::vector<std::shared_ptr<JoinBuild>>{} : parts.builds->builds,
+        slot);
+  }
+  ARROW_ASSIGN_OR_RAISE(
+      auto input, Build(shape.build, std::nullopt, slot == nullptr ? nullptr : slot->Child(0)));
+  ARROW_ASSIGN_OR_RAISE(auto spec, JoinBuildSpec::Make(input->output_schema(), shape.build_keys));
+  return std::make_shared<JoinBuild>(std::move(spec), std::move(input), slot);
+}
+
+// The builds of the inner joins in the part pipeline whose top is `top`, outermost first; nullptr
+// when it has none. With the profile node of the operator that runs the pipeline (`consumer`),
+// the k-th build is profiled into its child 1 + k (child 0 is the pipeline's).
+arrow::Result<std::shared_ptr<const PipelineBuilds>> PipelineBuildsOf(
+    const plan::LogicalNodePtr& top, ProfileNode* consumer) {
+  auto builds = std::make_shared<PipelineBuilds>();
+  for (const plan::LogicalNode* n = top.get(); n != nullptr; n = PipelineInput(*n)) {
+    const auto* join = std::get_if<plan::JoinNode>(n);
+    if (join == nullptr) {
+      continue;
+    }
+    ARROW_ASSIGN_OR_RAISE(const JoinShape shape, ShapeOf(*join));
+    ARROW_ASSIGN_OR_RAISE(
+        auto build,
+        MakeJoinBuild(*join, shape,
+                      consumer == nullptr ? nullptr : consumer->Child(1 + builds->builds.size())));
+    builds->joins.push_back(join);
+    builds->builds.push_back(std::move(build));
+  }
+  if (builds->builds.empty()) {
+    return nullptr;
+  }
+  return builds;
+}
+
 // With a profile node of the operator that consumes the parts (`consumer`), the pipeline is
-// profiled into its first child, once per part, and the parts read and skipped are counted.
-// With `late` (the late columns of the pipeline's scan and its row-id column), every part's scan
-// is narrow (LateScan), numbered by the part's number.
-Parts PartsOf(const plan::LogicalNodePtr& node, const plan::ScanNode& scan,
-              ProfileNode* consumer = nullptr,
-              const std::shared_ptr<const LateScan>& late = nullptr) {
+// profiled into its first child, once per part, the builds of its joins into the next ones, and
+// the parts read and skipped are counted. With `late` (the late columns of the pipeline's scan and
+// its row-id column), every part's scan is narrow (LateScan), numbered by the part's number.
+arrow::Result<Parts> PartsOf(const plan::LogicalNodePtr& node, const plan::ScanNode& scan,
+                             ProfileNode* consumer, const std::shared_ptr<const LateScan>& late) {
   auto kept = std::make_shared<const std::vector<int64_t>>(
       KeptParts(*scan.table, scan.fields, FiltersOnScan(node)));
   const auto count = static_cast<int64_t>(kept->size());
@@ -126,6 +244,8 @@ Parts PartsOf(const plan::LogicalNodePtr& node, const plan::ScanNode& scan,
     consumer->Max("parts", MetricUnit::kCount, count);
     consumer->Max("skipped", MetricUnit::kCount, scan.table->num_parts() - count);
   }
+  ARROW_ASSIGN_OR_RAISE(std::shared_ptr<const PipelineBuilds> builds,
+                        PipelineBuildsOf(node, consumer));
   int64_t sample = 0;
   int64_t rows = 0;
   while (sample < count && rows < kTwoLevelSampleRows) {
@@ -133,20 +253,34 @@ Parts PartsOf(const plan::LogicalNodePtr& node, const plan::ScanNode& scan,
     ++sample;
   }
   return Parts{.pipeline =
-                   [node, kept, pipeline, late](int64_t i) {
+                   [node, kept, pipeline, late, builds](int64_t i) {
                      // Past the kept parts only for the schema sample, which is never opened.
                      const int64_t part =
                          std::cmp_less(i, kept->size()) ? (*kept)[static_cast<std::size_t>(i)] : i;
                      if (late == nullptr) {
-                       return Build(node, part, pipeline);
+                       return Build(node, part, pipeline, nullptr, nullptr, builds.get());
                      }
                      LateScan numbered = *late;
                      numbered.ordinal = i;
-                     return Build(node, part, pipeline, &numbered);
+                     return Build(node, part, pipeline, &numbered, nullptr, builds.get());
                    },
                .count = count,
                .kept = kept,
-               .sample = sample};
+               .sample = sample,
+               .builds = std::move(builds)};
+}
+
+// The sink of a part pipeline as it runs: the sink itself when the pipeline probes no build, else
+// the operator that prepares its builds before the sink runs a part, and releases them once its
+// parts are done (BuildsFirstOperator). The sink adds its own metrics to `slot` either way.
+std::unique_ptr<Operator> WithBuilds(std::unique_ptr<PartSink> sink,
+                                     const std::shared_ptr<const PipelineBuilds>& builds,
+                                     ProfileNode* slot) {
+  if (builds == nullptr) {
+    return sink;
+  }
+  sink->set_profile(slot);  // Profiled() profiles the operator returned, which is not the sink
+  return std::make_unique<BuildsFirstOperator>(std::move(sink), builds->builds);
 }
 
 // A part pipeline's batches in part order, at most row_cap selected rows per part.
@@ -157,10 +291,11 @@ OperatorResult BuildPartUnion(const plan::LogicalNodePtr& node, const plan::Scan
     slot->set_detail(row_cap.has_value() ? std::format("at most {} rows per part", *row_cap)
                                          : std::string("in part order"));
   }
-  Parts parts = PartsOf(node, scan, slot);
+  ARROW_ASSIGN_OR_RAISE(Parts parts, PartsOf(node, scan, slot));
   ARROW_ASSIGN_OR_RAISE(auto sample, parts.pipeline(0));  // for the output schema; never opened
-  return std::make_unique<PartUnionOperator>(std::move(parts.pipeline), parts.count,
-                                             sample->output_schema(), row_cap);
+  return WithBuilds(std::make_unique<PartUnionOperator>(std::move(parts.pipeline), parts.count,
+                                                        sample->output_schema(), row_cap),
+                    parts.builds, slot);
 }
 
 // The column every call counts distinctly, when every call is COUNT(DISTINCT) of the same column.
@@ -199,7 +334,8 @@ constexpr int64_t kMaxLateRows = int64_t{64} * 1024;
 // The late columns of a part pipeline under a top-N (ADR 0016): the scan's columns that no Filter,
 // no Compute expression and no sort key reads, when the pipeline is Filters and Computes over the
 // scan (they pass the scan's columns through at their positions); the first of them carries the row
-// ids. std::nullopt when no column is late or the pipeline has another node.
+// ids. std::nullopt when no column is late or the pipeline has another node: a Project, or a join's
+// probe (ADR 0016's update: late materialization declines over joins).
 std::optional<LateScan> LateSplit(const plan::LogicalNodePtr& top, const plan::ScanNode& scan,
                                   const std::vector<plan::SortKey>& keys) {
   const std::size_t width = scan.fields.size();
@@ -272,7 +408,8 @@ struct Builder {
   std::optional<int64_t> part;     // inside the pipeline of this part
   ProfileNode* slot = nullptr;     // the profile node of the operator built (nullptr: no profile)
   const LateScan* late = nullptr;  // the narrow scan of the part pipeline (late materialization)
-  const PartitionTopN* top_n = nullptr;  // a top-N right above this node
+  const PartitionTopN* top_n = nullptr;    // a top-N right above this node
+  const PipelineBuilds* builds = nullptr;  // with `part`: the builds of the pipeline's joins
 
   // The profile node of the operator's input (per part as the operator is). A node's name, detail
   // and per-part flag are written by the first build of its plan (at planning time, before the
@@ -336,12 +473,12 @@ struct Builder {
         return std::make_unique<FilterOperator>(std::move(input), std::move(rest));
       }
     }
-    ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input, part, Input(), late));
+    ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input, part, Input(), late, nullptr, builds));
     return std::make_unique<FilterOperator>(std::move(input), node.predicates);
   }
   OperatorResult operator()(const plan::ComputeNode& node) const {
     Name("Compute");
-    ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input, part, Input(), late));
+    ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input, part, Input(), late, nullptr, builds));
     if (!part.has_value()) {  // over a whole input (an aggregation, a sort): batches in parallel
       return std::make_unique<ParallelComputeOperator>(std::move(input), node.exprs);
     }
@@ -349,7 +486,7 @@ struct Builder {
   }
   OperatorResult operator()(const plan::ProjectNode& node) const {
     Name("Project");
-    ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input, part, Input()));
+    ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input, part, Input(), nullptr, nullptr, builds));
     std::vector<int> columns;
     std::vector<std::shared_ptr<arrow::Scalar>> constants;
     columns.reserve(node.columns.size());
@@ -377,7 +514,7 @@ struct Builder {
           .input = groups, .aggregates = CountsOfKey(node.aggregates, *x), .span = node.span});
     }
     if (const plan::ScanNode* scan = PipelineScan(node.input)) {
-      Parts parts = PartsOf(node.input, *scan, slot);
+      ARROW_ASSIGN_OR_RAISE(Parts parts, PartsOf(node.input, *scan, slot));
       ARROW_ASSIGN_OR_RAISE(auto sample, parts.pipeline(0));
       const int width = sample->output_schema()->num_fields();
       if (TwoLevelAggregation({}, node.aggregates)) {
@@ -385,15 +522,17 @@ struct Builder {
         // COUNT(DISTINCT) of several columns, or with other calls: grouped by each column in
         // parallel, then counted.
         const ScalarAggregateOperator serial(std::move(sample), node.aggregates);
-        return std::make_unique<PartTwoLevelAggregateOperator>(
-            std::move(parts.pipeline), parts.count, parts.sample, width,
-            std::vector<plan::BoundColumn>{}, node.aggregates, serial.output_schema(),
-            /*global=*/true);
+        return WithBuilds(std::make_unique<PartTwoLevelAggregateOperator>(
+                              std::move(parts.pipeline), parts.count, parts.sample, width,
+                              std::vector<plan::BoundColumn>{}, node.aggregates,
+                              serial.output_schema(), /*global=*/true),
+                          parts.builds, slot);
       }
       // Aggregated per part, the parts' states merged in part order.
       Name("PartAggregate");
-      return std::make_unique<PartAggregateOperator>(std::move(parts.pipeline), parts.count, width,
-                                                     node.aggregates);
+      return WithBuilds(std::make_unique<PartAggregateOperator>(
+                            std::move(parts.pipeline), parts.count, width, node.aggregates),
+                        parts.builds, slot);
     }
     Name("ScalarAggregate");
     ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input, std::nullopt, Input()));
@@ -402,7 +541,7 @@ struct Builder {
   OperatorResult operator()(const plan::GroupAggregateNode& node) const {
     if (const plan::ScanNode* scan = PipelineScan(node.input)) {
       // Grouped per part, the parts' groups merged in part order.
-      Parts parts = PartsOf(node.input, *scan, slot);
+      ARROW_ASSIGN_OR_RAISE(Parts parts, PartsOf(node.input, *scan, slot));
       ARROW_ASSIGN_OR_RAISE(auto sample, parts.pipeline(0));
       const int width = sample->output_schema()->num_fields();
       // The output schema, as the serial operator names it.
@@ -411,18 +550,21 @@ struct Builder {
         // COUNT(DISTINCT): an inner GROUP BY of the keys and each distinct column, an outer one
         // of the keys, both partitioned with the heavy keys spread (ADR 0014).
         Name("PartTwoLevelAggregate");
-        return std::make_unique<PartTwoLevelAggregateOperator>(
-            std::move(parts.pipeline), parts.count, parts.sample, width, node.keys, node.aggregates,
-            serial.output_schema(), /*global=*/false);
+        return WithBuilds(std::make_unique<PartTwoLevelAggregateOperator>(
+                              std::move(parts.pipeline), parts.count, parts.sample, width,
+                              node.keys, node.aggregates, serial.output_schema(),
+                              /*global=*/false),
+                          parts.builds, slot);
       }
       Name("PartGroupAggregate",
            top_n == nullptr ? std::string()
                             : std::format("{} top-N per partition keep={}",
                                           plan::ExplainNode(plan::LogicalNode(node)), top_n->keep));
-      return std::make_unique<PartGroupAggregateOperator>(
-          std::move(parts.pipeline), parts.count, width, node.keys, node.aggregates,
-          serial.output_schema(),
-          top_n == nullptr ? std::nullopt : std::optional<PartitionTopN>(*top_n));
+      return WithBuilds(std::make_unique<PartGroupAggregateOperator>(
+                            std::move(parts.pipeline), parts.count, width, node.keys,
+                            node.aggregates, serial.output_schema(),
+                            top_n == nullptr ? std::nullopt : std::optional<PartitionTopN>(*top_n)),
+                        parts.builds, slot);
     }
     Name("GroupAggregate");
     ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input, std::nullopt, Input()));
@@ -442,7 +584,7 @@ struct Builder {
       if (const plan::ScanNode* scan = PipelineScan(sort->input)) {
         // Every part keeps its own first rows, merged in part order.
         Name("PartTopN", detail);
-        Parts parts = PartsOf(sort->input, *scan, slot);
+        ARROW_ASSIGN_OR_RAISE(Parts parts, PartsOf(sort->input, *scan, slot));
         ARROW_ASSIGN_OR_RAISE(auto sample, parts.pipeline(0));
         int64_t keep = 0;
         if (__builtin_add_overflow(*node.limit, node.offset, &keep)) {
@@ -453,7 +595,7 @@ struct Builder {
         if (auto split = LateSplit(sort->input, *scan, sort->keys);
             split.has_value() && keep <= kMaxLateRows && keep <= parts.count / 2) {
           const auto spec = std::make_shared<const LateScan>(std::move(*split));
-          Parts narrow = PartsOf(sort->input, *scan, slot, spec);
+          ARROW_ASSIGN_OR_RAISE(Parts narrow, PartsOf(sort->input, *scan, slot, spec));
           ARROW_ASSIGN_OR_RAISE(auto narrow_sample, narrow.pipeline(0));
           LateColumns columns{.table = scan->table,
                               .slots = {},
@@ -470,13 +612,15 @@ struct Builder {
           if (slot != nullptr) {
             slot->set_detail(std::format("{} late={} columns", detail, columns.slots.size()));
           }
-          return std::make_unique<PartTopNOperator>(std::move(narrow.pipeline), narrow.count,
-                                                    sample->output_schema(), sort->keys,
-                                                    *node.limit, node.offset, std::move(columns));
+          return WithBuilds(std::make_unique<PartTopNOperator>(
+                                std::move(narrow.pipeline), narrow.count, sample->output_schema(),
+                                sort->keys, *node.limit, node.offset, std::move(columns)),
+                            narrow.builds, slot);
         }
-        return std::make_unique<PartTopNOperator>(std::move(parts.pipeline), parts.count,
-                                                  sample->output_schema(), sort->keys, *node.limit,
-                                                  node.offset);
+        return WithBuilds(std::make_unique<PartTopNOperator>(std::move(parts.pipeline), parts.count,
+                                                             sample->output_schema(), sort->keys,
+                                                             *node.limit, node.offset),
+                          parts.builds, slot);
       }
       Name("TopN", detail);
       if (std::holds_alternative<plan::GroupAggregateNode>(*sort->input)) {
@@ -521,9 +665,37 @@ struct Builder {
     return std::make_unique<RowCountOperator>("count_star()", *rows);
   }
   OperatorResult operator()(const plan::JoinNode& node) const {
-    // Exit code 4 until the hash join (ADR 0022: J1b for inner joins, E2 for the other kinds).
-    return plan::UnsupportedError(
-        std::format("{} joins are not supported yet", plan::ToString(node.kind)), node.span);
+    if (node.kind != plan::JoinKind::kInner) {
+      // Exit code 4 until E2 runs the other kinds (ADR 0022).
+      return plan::UnsupportedError(
+          std::format("{} joins are not supported yet", plan::ToString(node.kind)), node.span);
+    }
+    // An inner join is a hash join (ADR 0022): a build of one input, probed by the other.
+    ARROW_ASSIGN_OR_RAISE(JoinShape shape, ShapeOf(node));
+    Name("HashJoin");
+    std::shared_ptr<JoinBuild> build;
+    std::unique_ptr<Operator> probe;
+    if (part.has_value()) {
+      // A probe of the part pipeline: its build was made with the pipeline (PartsOf), once for
+      // all parts, and the operator that runs the pipeline prepares it. The part reaches the
+      // probe input only, and only the probe input is profiled under this node.
+      build = builds == nullptr ? nullptr : builds->Find(&node);
+      if (build == nullptr) {
+        return arrow::Status::Invalid("a hash join probe without its build");
+      }
+      ARROW_ASSIGN_OR_RAISE(probe, Build(shape.probe, part, Input(), nullptr, nullptr, builds));
+    } else {
+      // A probe over a serial input (no part pipeline below it) prepares its own build at its
+      // first Next, profiled under it after its input.
+      ARROW_ASSIGN_OR_RAISE(build,
+                            MakeJoinBuild(node, shape, slot == nullptr ? nullptr : slot->Child(1)));
+      ARROW_ASSIGN_OR_RAISE(probe, Build(shape.probe, std::nullopt, Input()));
+    }
+    ARROW_ASSIGN_OR_RAISE(
+        std::unique_ptr<HashJoinOperator> join,
+        HashJoinOperator::Make(std::move(probe), std::move(build), std::move(shape.probe_keys),
+                               node.build, node.residual, /*prepares=*/!part.has_value()));
+    return join;
   }
 };
 
@@ -539,7 +711,8 @@ OperatorResult Profiled(OperatorResult op, const plan::LogicalNodePtr& node, Pro
 }
 
 OperatorResult Build(const plan::LogicalNodePtr& node, std::optional<int64_t> part,
-                     ProfileNode* slot, const LateScan* late, const PartitionTopN* top_n) {
+                     ProfileNode* slot, const LateScan* late, const PartitionTopN* top_n,
+                     const PipelineBuilds* builds) {
   if (node == nullptr) {
     return arrow::Status::Invalid("logical plan node without its input");
   }
@@ -549,8 +722,10 @@ OperatorResult Build(const plan::LogicalNodePtr& node, std::optional<int64_t> pa
     }
   }
   return Profiled(
-      std::visit(Builder{.part = part, .slot = slot, .late = late, .top_n = top_n}, *node), node,
-      slot);
+      std::visit(
+          Builder{.part = part, .slot = slot, .late = late, .top_n = top_n, .builds = builds},
+          *node),
+      node, slot);
 }
 
 }  // namespace
