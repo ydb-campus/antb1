@@ -96,7 +96,8 @@ steps (only step 7 uses more than one thread):
 4. Bind (`plan::Bind`): what the binder does not answer yet (a FROM list of several items, an alias, a qualified
    name, many expressions) is `kUnsupported` before any name resolves; then
    table names resolve case-insensitively in the catalog (or `FROM 'path'` opens a file),
-   columns resolve against the table's schema, types are checked, and every `WHERE` literal is folded exactly into
+   columns resolve in the block's scope (`src/plan/scope.h`: one binding per FROM item, with its columns' ids, types
+   and FLOAT flags), types are checked, and every `WHERE` literal is folded exactly into
    its column's type ([Binding](sql-subset.md#binding)); `HAVING` binds the same way against the aggregation's output
    and becomes a `Filter` above it. The result is a `plan::LogicalPlan`: a tree of immutable
    nodes in a `std::variant` (`Scan`, `Filter`, `Compute`, `Project`, `Aggregate`, `GroupAggregate`, `Sort`, `Limit`,
@@ -249,7 +250,7 @@ state's groups through a group map, so partial results of separate parts of the 
 | To add | Change | Also update |
 | --- | --- | --- |
 | SQL syntax | `src/sql/` (lexer, parser, AST, unparser) with tests in `src/sql/tests/` | [sql-subset.md](sql-subset.md) grammar |
-| Name resolution or type rules | `src/plan/binder.cc`, `src/plan/types.cc` | [sql-subset.md](sql-subset.md), [ADR 0004](adr/0004-types-null-overflow-semantics.md) if semantics change |
+| Name resolution or type rules | `src/plan/binder.cc`, `src/plan/scope.cc`, `src/plan/types.cc` | [sql-subset.md](sql-subset.md), [ADR 0004](adr/0004-types-null-overflow-semantics.md) if semantics change |
 | A logical plan node | the variant in `src/plan/include/antb1/plan/logical_plan.h`; the compiler then points at every `std::visit` to extend (`InputsOf`, `WithInputs`, `OutputIds` and the position resolver, the physical planner, the optimizer, EXPLAIN) | tests in `src/plan/tests/` and `src/exec/tests/` |
 | An optimizer rule | `src/plan/optimizer.cc` | tests in `src/plan/tests/optimizer_test.cc`, an EXPLAIN golden in `tests/cli/` |
 | A physical operator | `src/exec/`; its name in the physical planner (`Builder::Name`), and metrics for its phases through `profile()` and `ProfileTimer` | tests in `src/exec/tests/` |

@@ -192,6 +192,9 @@ Proposed
   its columns (id, name, type, and whether it is stored as FLOAT). A block's scope holds its bindings and links to the
   scope of the enclosing block. Scopes replace the single-table column lookup, the table width and the positional
   FLOAT check.
+  - Update (2026-10-07): P2 had already removed the table width and the positional FLOAT check. `plan::Scope`
+    (`src/plan/scope.h`) replaces the single-table column lookup and the binder's table and schema members. A column
+    without an engine type keeps its id and slot, and is `kUnsupported` only where it is referenced.
 - **Join nodes (J1a).** `JoinNode` has two inputs, a kind, key pairs of one common type each, residual conjuncts
   over both inputs and the chosen build side. A match is a pair of rows with equal keys whose residual is true; a
   NULL key never matches.
