@@ -9,6 +9,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <ranges>
 #include <set>
@@ -330,8 +331,12 @@ TEST(PartSchedulerTest, AnyOtherExceptionOfSubmitLeavesNext) {
           kNumParts,
           [starts, ends](int64_t part, const std::atomic<bool>&) -> arrow::Result<int64_t> {
             ++(*starts)[static_cast<std::size_t>(part)];
+            // Some work between the two counts, so that a part still running when the scheduler
+            // goes would show as started but not ended.
+            std::vector<int64_t> work(4096, part);
+            const auto sum = std::accumulate(work.begin(), work.end(), int64_t{0});
             ++(*ends)[static_cast<std::size_t>(part)];
-            return part;
+            return sum / 4096;
           },
           &executor, 3);
       int64_t taken = 0;
@@ -348,7 +353,9 @@ TEST(PartSchedulerTest, AnyOtherExceptionOfSubmitLeavesNext) {
         }
       }
       EXPECT_TRUE(thrown);
-      EXPECT_LT(taken, throw_at + 1);
+      // Part 0's Submit throws in the first Next(); part 5's in the refill of the third one (a
+      // window of 3), after parts 0 and 1 were taken.
+      EXPECT_EQ(taken, throw_at == 0 ? 0 : 2);
     }
     for (int64_t part = 0; part < kNumParts; ++part) {
       const auto at = static_cast<std::size_t>(part);

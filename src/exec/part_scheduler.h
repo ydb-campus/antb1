@@ -40,8 +40,9 @@ namespace antb1::exec {
 // started nothing; the Next() call that tries to submit it (each call fills the window before it
 // waits for its part, and refills it after) returns that failure instead of its part's result,
 // whatever the parts in flight before it would have returned, and stops the scheduler. Any other
-// exception of the executor's Submit leaves Next() as it is; the parts started before it are
-// still waited for.
+// exception of the executor's Submit propagates out of Next() unchanged: the scheduler is not
+// stopped, and when it came from the refill, the result just taken is dropped, so only Stop() or
+// destruction may follow; the parts started before it are still waited for.
 //
 // A task sees `stop` become true once the scheduler is stopped (the consumer is done or failed);
 // it should check it between batches and may then return any status, which is dropped. Stop() and

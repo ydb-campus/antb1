@@ -473,8 +473,9 @@ class ScriptedSource final : public Operator {
   }
 
   void FailAt(std::size_t index) { fail_at_ = index; }
-  // Next() hands each batch on and keeps no reference to it (a later run gets empty batches): a
-  // test can then see when the consumer releases the batches.
+  // Next() hands each batch on and keeps no reference to it (a later run ends at its first Next(),
+  // since a moved-from Batch has no data): a test can then see when the consumer releases the
+  // batches.
   void HandOver() { hand_over_ = true; }
   [[nodiscard]] int pulls() const { return pulls_; }
   [[nodiscard]] int opens() const { return opens_; }
