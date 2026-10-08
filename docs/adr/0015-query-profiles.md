@@ -57,6 +57,11 @@ Proposed
   - `PartAggregate` and `PartTopN`: `merge`.
   - `TopN` and `Sort`: `sort`.
   - The query: its time, result rows, threads and peak memory (`MemoryBudget::ResetPeak` before the run).
+  - Update (2026-10-09, J1b): a hash join shows its probe, `HashJoin` (per part in a part pipeline), with `find`,
+    `gather`, `residual` and, on the 1:1 path, `window_rows` (the probe rows it gathered the build's columns for,
+    against the rows it returns); and its build, `HashBuild`, under the operator that prepares it, with the rows its
+    table holds, `parts`, `skipped`, `part_time`, `wait`, `lanes_tail`, `finish`, `null_keys`, `unique` and `direct`.
+    The display order lists them where they come as a query runs.
 - **Output.**
   - Text: the `Output:` line, a `Total:` line, then one line per operator indented as EXPLAIN, with the numbers in
     brackets.

@@ -337,6 +337,15 @@ Proposed
   pulls any input, and a build whose input probes builds of its own prepares those first: post-order. One part
   scheduler runs at a time, as the two-level aggregation's two runs of parts already do, and no part task ever waits
   for a build, since a worker that blocks on pool tasks can deadlock the pool.
+  - Update (2026-10-09, J1b): the operator that runs a probe pipeline prepares the pipeline's builds when it is first
+    pulled, not in its `Open`, and opens its sink only then: an unpulled query (`LIMIT 0`) runs no build, as in
+    DuckDB. Within a pipeline the outermost join's build comes first, and a build whose input probes builds of its
+    own prepares those first (post-order). Errors follow that order: the first failing part of the first failing
+    build decides (in a chain the outer build's), before any probe part starts. A probe whose build holds no row
+    never opens its input, and the builds below it are not prepared. Builds are released once the probe pipeline's
+    parts are done (the part sinks' parts-done callback) or at its `Close`. An inner join's residuals are evaluated by
+    its probe, in order, each only on the rows the ones before it kept (NULL counts as false), not by a `Filter`
+    above it. A build's profile line sits under the operator that prepares it.
 - **Each build is created once,** by the physical planner, outside the factory that makes a fresh operator chain for
   every part. The factory captures it, and every part's probe reads the same table.
 - **Build inputs:** a part pipeline, whose parts run on the pool through the part scheduler, with its window, its

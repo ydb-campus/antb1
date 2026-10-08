@@ -12,7 +12,7 @@ internals are described next to the code in [tests/README.md](../tests/README.md
 | Layer | Where | What it checks | Status |
 | --- | --- | --- | --- |
 | Unit tests (GoogleTest) | `src/<module>/tests/` | one module in isolation: lexer, parser, unparser, binder, types, Parquet table, operators, formatter, CLI | in use |
-| Integration tests | `tests/integration/` | `engine::Session` end to end; corrupt, missing and mismatched Parquet inputs; globs | in use |
+| Integration tests | `tests/integration/` | `engine::Session` end to end; corrupt, missing and mismatched Parquet inputs; globs; hand-built hash-join plans over the star fixtures | in use |
 | SQL logic tests | `tests/slt/cases/` | `.slt` files with expected results written by DuckDB, run against antb1 | in use |
 | Oracle tests | `tests/slt/cases/` | the same `.slt` files run against DuckDB, so every expectation stays DuckDB's answer | in use |
 | Random differential tests | `tests/slt/runner/` | seeded generated queries, antb1 against DuckDB | in use |
@@ -40,7 +40,7 @@ table must match it (`pixi run lint` compares them).
 | Label | Status | Meaning |
 | --- | --- | --- |
 | `unit` | in use | module unit tests in `src/<module>/tests/*_test.cc`, named `<module>.<Suite>.<Case>` |
-| `integration` | in use | cross-module gtest suites in `tests/integration/` (`integration.*`), including invalid Parquet inputs |
+| `integration` | in use | cross-module gtest suites in `tests/integration/` (`integration.*`), including invalid Parquet inputs and hand-built hash-join plans over the star fixtures |
 | `slt` | in use | sqllogictest files run against antb1 (`slt.<area>.<file>`) |
 | `oracle` | in use | the same `.slt` files checked against DuckDB (`oracle.<area>.<file>`) |
 | `diff` | in use | `diff.random`, `diff.decimal`, `diff.star` and `diff.tpch`: seeded random differential queries against DuckDB (fixed seeds, 300 queries each; `diff.random` over the tables it names, so a new table does not change its queries, `diff.decimal` over `decimals`, `diff.star` over the star schema, `diff.tpch` over the data derived from TPC-H) |
@@ -129,7 +129,8 @@ each table's rows. `tests/slt/tables.txt` declares the references between the ta
 (schema, row groups and values; not compression or page layout), on every leg, macOS included. It skips the
 top-level `tpch/` directory, where the data derived from TPC-H is generated at test time. After an intended
 change of the generator, run the tests once (they regenerate the fixtures, and the digest test fails), rewrite the
-digest, regenerate the `.slt` expectations and the CLI goldens, and review every diff:
+digest, regenerate the `.slt` expectations and the CLI goldens, check the join counts that `integration.JoinTest.*`
+pins (DuckDB's for the same joins of the star tables), and review every diff:
 
 ```bash
 pixi run test   # regenerates build/dev/fixtures; harness.fixtures.digest fails
