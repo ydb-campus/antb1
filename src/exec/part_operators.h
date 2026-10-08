@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -29,11 +30,48 @@ namespace antb1::exec {
 // Builds the pipeline of one part. Called concurrently from several threads.
 using PartPipeline = std::function<arrow::Result<std::unique_ptr<Operator>>(int64_t part)>;
 
+// The context of a part's pipeline: a part runs single-threaded, its operators never see the
+// executor.
+ExecContext PartContext(const ExecContext& ctx);
+
+// The number of parts that may run ahead of the consumer: 2 * threads with an executor, else 1.
+int64_t PartWindow(const ExecContext& ctx);
+
+// Opens the part's pipeline, hands every batch with selected rows to `consume` until it returns
+// false or the pipeline ends, and closes the pipeline. Once `stop` is set the part is abandoned
+// (its status is dropped by the scheduler).
+arrow::Status RunPart(const PartPipeline& pipeline, int64_t part, ExecContext ctx,
+                      const std::atomic<bool>& stop,
+                      const std::function<arrow::Result<bool>(Batch)>& consume);
+
+// The sink of a part pipeline: an operator that runs the pipeline's parts (PartScheduler) and
+// combines their results in part order. Once it has every part's result, so that no part of its
+// pipeline runs any more, it calls its parts-done callback (if one is set), once per run, on the
+// consumer thread: the builds a probe pipeline reads are released then
+// (docs/adr/0022-joins-and-query-blocks.md). A run whose parts fail, or that its consumer stops
+// before its parts are done, does not call it, as long as the consumer stops at the first error
+// (calling Next() again after a failed Next() is not supported).
+class PartSink : public Operator {
+ public:
+  void set_parts_done(std::function<void()> parts_done) { parts_done_ = std::move(parts_done); }
+
+ protected:
+  void PartsDone() const {
+    if (parts_done_) {
+      parts_done_();
+    }
+  }
+
+ private:
+  std::function<void()> parts_done_;
+};
+
 // The batches of every part in part order: a source that stands for the pipeline's top. Parts
 // run ahead on ExecContext::executor, at most 2 * threads of them at a time. With a row cap (a
 // LIMIT above it needs at most limit + offset rows), each part stops after that many selected rows.
-// Batches keep their selections; batches without selected rows are dropped.
-class PartUnionOperator final : public Operator {
+// Batches keep their selections; batches without selected rows are dropped. Its parts are done
+// once it has handed on the last part's batches.
+class PartUnionOperator final : public PartSink {
  public:
   PartUnionOperator(PartPipeline pipeline, int64_t num_parts, std::shared_ptr<arrow::Schema> schema,
                     std::optional<int64_t> row_cap);
@@ -55,12 +93,13 @@ class PartUnionOperator final : public Operator {
   std::optional<int64_t> row_cap_;
   PartBatches current_;
   std::size_t next_ = 0;  // the next batch of current_
+  bool ended_ = false;    // every part's batches were handed on
   std::unique_ptr<PartScheduler<PartBatches>> scheduler_;
 };
 
 // Global aggregation over a part pipeline: every part is aggregated into its own AggregateSet on
 // the executor, and the sets are merged in part order. Output: as ScalarAggregateOperator.
-class PartAggregateOperator final : public Operator {
+class PartAggregateOperator final : public PartSink {
  public:
   PartAggregateOperator(PartPipeline pipeline, int64_t num_parts, int input_width,
                         std::vector<plan::AggregateCall> aggregates);
@@ -112,7 +151,7 @@ arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> KeepFirstRows(
 // first `keep` rows in the top-N's order (a stable sort, SortBuffer) as it builds them, in
 // parallel: the top-N above then reads at most 64 * keep rows, and picks the rows and the order it
 // would have picked from all of them (ties stay in partition order, then in group order).
-class PartGroupAggregateOperator final : public Operator {
+class PartGroupAggregateOperator final : public PartSink {
  public:
   PartGroupAggregateOperator(PartPipeline pipeline, int64_t num_parts, int input_width,
                              std::vector<plan::BoundColumn> keys,
@@ -191,7 +230,7 @@ inline constexpr int64_t kTwoLevelSampleRows = int64_t{4} * 1000 * 1000;
 // across the partitions, in partition order. Output: the light groups partition by partition, then
 // the heavy ones; the columns of GroupAggregateOperator (`global`: of ScalarAggregateOperator, one
 // row even without input). The same for any number of threads.
-class PartTwoLevelAggregateOperator final : public Operator {
+class PartTwoLevelAggregateOperator final : public PartSink {
  public:
   PartTwoLevelAggregateOperator(PartPipeline pipeline, int64_t num_parts, int64_t sample_parts,
                                 int input_width, std::vector<plan::BoundColumn> keys,
@@ -277,7 +316,7 @@ struct LateColumns {
   std::shared_ptr<arrow::Schema> narrow_schema;  // of the narrow pipeline's rows
 };
 
-class PartTopNOperator final : public Operator {
+class PartTopNOperator final : public PartSink {
  public:
   PartTopNOperator(PartPipeline pipeline, int64_t num_parts, std::shared_ptr<arrow::Schema> schema,
                    std::vector<plan::SortKey> keys, int64_t limit, int64_t offset,

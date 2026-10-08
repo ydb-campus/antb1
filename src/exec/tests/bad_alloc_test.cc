@@ -1,4 +1,5 @@
-// std::bad_alloc in ForEach, the partition lanes and the join hash table
+// std::bad_alloc in ForEach, the partition lanes, the part scheduler, the join hash table and the
+// join build
 // (docs/adr/0022-joins-and-query-blocks.md): an allocation of the C++ heap that fails anywhere in a
 // call gives OutOfMemory, never an exception (ForEach lets one out only when not even its
 // OutOfMemory can be made, and only once its tasks ended); it stops the lanes as the serial order
@@ -14,6 +15,7 @@
 // (src/exec/CMakeLists.txt); the sanitizer still sees every allocation, through malloc and free.
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -36,6 +38,8 @@
 #include "antb1/exec/operator.h"
 #include "antb1/plan/logical_plan.h"
 
+#include "../hash_join.h"
+#include "../part_scheduler.h"
 #include "../partition_lanes.h"
 #include "exec_test_util.h"
 
@@ -476,6 +480,72 @@ TEST(PartitionLanesBadAllocTest, AnAddThatRunsOutOfMemoryStopsTheLanes) {
       });
     }
   }
+}
+
+// ---- The part scheduler ----
+
+// An allocation that fails while Next() submits parts, each in turn (a part's place among the parts
+// in flight, which grows as parts are taken; Arrow's Submit of its task): Next() returns
+// OutOfMemory, never an exception, and the scheduler stops. The part that could not be submitted
+// started nothing, and every part that started is waited for by the scheduler's destructor: no
+// part starts untracked, or twice. Without a failure, every part comes, in order.
+TEST(PartSchedulerBadAllocTest, APartThatCannotBeSubmittedStartsNothing) {
+  const auto pool = StartedPool();
+  UnhookedSpawns spawns(pool.get());
+  constexpr int64_t kNumParts = 40;  // enough for the parts in flight to need more room once
+  constexpr int kSteps = 2000;       // the work of a part
+  Sweep([&](std::int64_t skip) {
+    // Per part, its starts and its ends; each part's task writes only its own.
+    auto starts = std::make_shared<std::vector<std::atomic<int>>>(kNumParts);
+    auto ends = std::make_shared<std::vector<std::atomic<int>>>(kNumParts);
+    std::optional<arrow::Status> failure;
+    int64_t taken = 0;
+    bool fired = false;
+    {
+      PartScheduler<int64_t> scheduler(
+          kNumParts,
+          [starts, ends](int64_t part,
+                         const std::atomic<bool>& /*stop*/) -> arrow::Result<int64_t> {
+            const auto at = static_cast<std::size_t>(part);
+            ++(*starts)[at];
+            std::uint64_t value = static_cast<std::uint64_t>(part) + 1;
+            for (int step = 0; step < kSteps; ++step) {
+              value = (value * 6364136223846793005U) + 1442695040888963407U;
+            }
+            ++(*ends)[at];
+            return value == 0 ? -1 : part;
+          },
+          &spawns, kThreads);
+      {
+        const FailAllocations fail(skip);
+        while (!scheduler.done()) {
+          arrow::Result<int64_t> result = scheduler.Next();
+          if (!result.ok()) {
+            failure = result.status();
+            break;
+          }
+          EXPECT_EQ(*result, taken);
+          ++taken;
+        }
+        fired = fail.failed() > 0;
+      }
+      if (failure.has_value()) {
+        EXPECT_TRUE(fired) << failure->ToString();
+        EXPECT_TRUE(failure->IsOutOfMemory()) << failure->ToString();
+        EXPECT_TRUE(scheduler.done());
+      } else {
+        EXPECT_EQ(taken, kNumParts);
+      }
+    }
+    for (std::size_t part = 0; part < static_cast<std::size_t>(kNumParts); ++part) {
+      EXPECT_EQ((*starts)[part].load(), (*ends)[part].load()) << "part " << part << " still runs";
+    }
+    pool->WaitForIdle();
+    for (std::size_t part = 0; part < static_cast<std::size_t>(kNumParts); ++part) {
+      EXPECT_LE((*starts)[part].load(), 1) << "part " << part;
+    }
+    return fired;
+  });
 }
 
 // ---- The join build ----
@@ -948,6 +1018,66 @@ TEST_F(JoinTableBadAllocTest, NoMemoryToReportAMergeFailure) {
     EXPECT_EQ(budget.bytes_allocated(), 0);
     return fired;
   });
+}
+
+// ---- The join build's Prepare ----
+
+// An allocation that fails in a join build's Prepare on the calling thread, each in turn (draining
+// its input, the builder, the part scheduler and Arrow's Submit of each part, adding the parts, the
+// table): OK or OutOfMemory, never an exception. A Prepare that goes through holds the table an
+// untouched build makes; one that fails holds nothing while its build still exists, and neither
+// holds anything once released. The parts run on the pool: a part on the calling thread would meet
+// Arrow's compute kernels (JoinBuildPart::Append's Take), which allocate a tracing span in a
+// noexcept function, where std::bad_alloc ends the process (the parts' own failures are E1's).
+TEST_F(JoinTableBadAllocTest, APrepareThatRunsOutOfMemoryHoldsNothing) {
+  const auto pool = StartedPool();
+  UnhookedSpawns spawns(pool.get());
+  for (const bool hashed : {false, true}) {
+    SCOPED_TRACE(hashed);
+    const BuildInput input = Input(hashed);
+    const std::optional<Snapshot> reference = Reference(input, hashed);
+    ASSERT_TRUE(reference.has_value());
+    auto spec = JoinBuildSpec::Make(input.schema, input.keys);
+    ASSERT_TRUE(spec.ok()) << spec.status().ToString();
+    // The drained input: every part's batches, in order (each is a part of the build).
+    std::vector<Batch> batches;
+    for (const std::vector<Batch>& part : input.parts) {
+      batches.insert(batches.end(), part.begin(), part.end());
+    }
+    Sweep([&](std::int64_t skip) {
+      MemoryBudget budget(std::nullopt);
+      bool fired = false;
+      {
+        JoinBuild build(*spec, std::make_unique<testing::ScriptedSource>(input.schema, batches),
+                        nullptr);
+        ExecContext ctx{.pool = &budget,
+                        .batch_size = kRows,
+                        .executor = &spawns,
+                        .threads = kThreads,
+                        .budget = &budget};
+        arrow::Status status;
+        {
+          const FailAllocations fail(skip);
+          status = build.Prepare(ctx);
+          fired = fail.failed() > 0;
+        }
+        if (status.ok()) {
+          EXPECT_NE(build.table(), nullptr);
+          if (build.table() != nullptr) {
+            EXPECT_EQ(SnapshotOf(*build.table(), hashed), *reference);
+          }
+        } else {
+          EXPECT_TRUE(fired) << status.ToString();
+          EXPECT_TRUE(status.IsOutOfMemory()) << status.ToString();
+          EXPECT_EQ(build.table(), nullptr);
+          EXPECT_EQ(budget.bytes_allocated(), 0);
+        }
+        build.Release();
+        EXPECT_EQ(budget.bytes_allocated(), 0);
+      }
+      return fired;
+    });
+  }
 }
 
 }  // namespace

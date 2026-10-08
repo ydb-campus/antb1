@@ -32,9 +32,7 @@
 #include "partition_lanes.h"
 
 namespace antb1::exec {
-namespace {
 
-// A part runs single-threaded: its operators never see the executor.
 ExecContext PartContext(const ExecContext& ctx) {
   return ExecContext{.pool = ctx.pool,
                      .batch_size = ctx.batch_size,
@@ -43,14 +41,10 @@ ExecContext PartContext(const ExecContext& ctx) {
                      .budget = ctx.budget};
 }
 
-// The number of parts that may run ahead of the consumer.
-int64_t Window(const ExecContext& ctx) {
+int64_t PartWindow(const ExecContext& ctx) {
   return ctx.executor == nullptr ? 1 : int64_t{2} * (ctx.threads < 1 ? 1 : ctx.threads);
 }
 
-// Opens the part's pipeline, hands every batch with selected rows to `consume` until it returns
-// false or the pipeline ends, and closes the pipeline. Once `stop` is set the part is abandoned
-// (its status is dropped by the scheduler).
 arrow::Status RunPart(const PartPipeline& pipeline, int64_t part, ExecContext ctx,
                       const std::atomic<bool>& stop,
                       const std::function<arrow::Result<bool>(Batch)>& consume) {
@@ -84,8 +78,6 @@ arrow::Status RunPart(const PartPipeline& pipeline, int64_t part, ExecContext ct
   return closed;
 }
 
-}  // namespace
-
 // ---- PartUnionOperator ----
 
 PartUnionOperator::PartUnionOperator(PartPipeline pipeline, int64_t num_parts,
@@ -117,8 +109,8 @@ arrow::Status PartUnionOperator::Open(ExecContext& ctx) {
         }));
     return batches;
   };
-  scheduler_ = std::make_unique<PartScheduler<PartBatches>>(num_parts_, std::move(task),
-                                                            ctx.executor, Window(ctx), ctx.budget);
+  scheduler_ = std::make_unique<PartScheduler<PartBatches>>(
+      num_parts_, std::move(task), ctx.executor, PartWindow(ctx), ctx.budget);
   return arrow::Status::OK();
 }
 
@@ -133,12 +125,21 @@ arrow::Result<Batch> PartUnionOperator::Next() {
     current_.reset();
     next_ = 0;
     if (scheduler_->done()) {
+      if (!ended_) {
+        ended_ = true;
+        PartsDone();
+      }
       return Batch{};
     }
-    {
+    arrow::Result<PartBatches> part = [&] {
       const ProfileTimer wait(profile(), "wait");
-      ARROW_ASSIGN_OR_RAISE(current_, scheduler_->Next());
+      return scheduler_->Next();
+    }();
+    if (!part.ok()) {
+      ended_ = true;  // a failed run: its parts are not done
+      return part.status();
     }
+    current_ = *std::move(part);
   }
 }
 
@@ -146,6 +147,7 @@ arrow::Status PartUnionOperator::Close() {
   scheduler_.reset();  // stops the parts still running and waits for them
   current_.reset();
   next_ = 0;
+  ended_ = false;
   return arrow::Status::OK();
 }
 
@@ -180,8 +182,8 @@ arrow::Status PartAggregateOperator::Open(ExecContext& ctx) {
         }));
     return shared;
   };
-  scheduler_ = std::make_unique<PartScheduler<PartStates>>(num_parts_, std::move(task),
-                                                           ctx.executor, Window(ctx), ctx.budget);
+  scheduler_ = std::make_unique<PartScheduler<PartStates>>(
+      num_parts_, std::move(task), ctx.executor, PartWindow(ctx), ctx.budget);
   return arrow::Status::OK();
 }
 
@@ -203,6 +205,7 @@ arrow::Result<Batch> PartAggregateOperator::Next() {
     ARROW_RETURN_NOT_OK(total.Merge(*part));
   }
   done_ = true;
+  PartsDone();
   ARROW_ASSIGN_OR_RAISE(auto row, total.Finalize(schema_, pool_));
   return Batch{.data = std::move(row), .selection = {}};
 }
@@ -266,7 +269,7 @@ arrow::Status PartGroupAggregateOperator::Open(ExecContext& ctx) {
   pool_ = ctx.pool;
   budget_ = ctx.budget;
   executor_ = ctx.executor;
-  window_ = Window(ctx);
+  window_ = PartWindow(ctx);
   threads_ = ctx.executor == nullptr ? 1 : static_cast<std::size_t>(std::max(ctx.threads, 1));
   merged_ = false;
   opened_ = true;
@@ -323,7 +326,7 @@ arrow::Status PartGroupAggregateOperator::Open(ExecContext& ctx) {
     return groups;
   };
   scheduler_ = std::make_unique<PartScheduler<PartTable>>(num_parts_, std::move(task), ctx.executor,
-                                                          Window(ctx), ctx.budget);
+                                                          PartWindow(ctx), ctx.budget);
   return arrow::Status::OK();
 }
 
@@ -387,6 +390,7 @@ arrow::Result<Batch> PartGroupAggregateOperator::Next() {
     ARROW_RETURN_NOT_OK(Merge());
     merged_ = true;
     scheduler_.reset();
+    PartsDone();
     rows_.assign(tables_.size(), {});
     if (profile() != nullptr) {
       int64_t groups = 0;
@@ -600,7 +604,7 @@ arrow::Status PartTwoLevelAggregateOperator::Open(ExecContext& ctx) {
   budget_ = ctx.budget;
   executor_ = ctx.executor;
   part_ctx_ = PartContext(ctx);
-  window_ = Window(ctx);
+  window_ = PartWindow(ctx);
   opened_ = true;
   return arrow::Status::OK();
 }
@@ -783,6 +787,7 @@ arrow::Status PartTwoLevelAggregateOperator::Aggregate() {
     ARROW_RETURN_NOT_OK(lanes.Finish());
   }
   ARROW_RETURN_NOT_OK(status);
+  PartsDone();
 
   // The outer level, partitions in parallel; then the heavy K's groups across the partitions.
   outer_.clear();
@@ -933,8 +938,8 @@ arrow::Status PartTopNOperator::Open(ExecContext& ctx) {
     ARROW_RETURN_NOT_OK(rows->memory.Resize(buffer.memory_usage()));
     return rows;
   };
-  scheduler_ = std::make_unique<PartScheduler<PartBuffer>>(num_parts_, std::move(task),
-                                                           ctx.executor, Window(ctx), ctx.budget);
+  scheduler_ = std::make_unique<PartScheduler<PartBuffer>>(
+      num_parts_, std::move(task), ctx.executor, PartWindow(ctx), ctx.budget);
   return arrow::Status::OK();
 }
 
@@ -954,6 +959,7 @@ arrow::Result<Batch> PartTopNOperator::Next() {
       ARROW_RETURN_NOT_OK(memory_.Resize(merged_->memory_usage()));
     }
     scheduler_.reset();
+    PartsDone();
     ARROW_RETURN_NOT_OK(memory_.Resize(merged_->memory_usage() + merged_->sort_memory()));
     ARROW_RETURN_NOT_OK(merged_->Sort(pool_));
     ARROW_RETURN_NOT_OK(memory_.Resize(merged_->memory_usage()));

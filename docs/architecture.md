@@ -52,9 +52,10 @@ Responsibilities:
   piece by piece) and copies only the rows that pass, for every column.
 - `exec`: pull-based, batch-at-a-time physical operators (`TableScan`, `Filter`, `Compute`, `Project`, `ScalarAggregate`,
   `GroupAggregate`, `Sort`, `Limit`, `RowCount`; see [Execution](#execution)), the exact aggregate states (scalar
-  and grouped), the row comparator and sort buffer, the join hash table (`JoinTableBuilder`, `JoinTable`; no
-  operator uses it yet, see [Execution](#execution)), the physical planner and `Drain`. It scans only through
-  `plan::Table` and never depends on `io`.
+  and grouped), the row comparator and sort buffer, the join hash table (`JoinTableBuilder`, `JoinTable`) and the
+  inner hash join's operators (`JoinBuild`, `BuildsFirstOperator`, `HashJoinOperator`; no plan uses them yet, see
+  [Execution](#execution)), the physical planner and `Drain`. It scans only through `plan::Table` and never depends
+  on `io`.
 - `engine`: `engine::Session` (owns the catalog, calls `arrow::compute::Initialize()`, runs parse, bind, plan and
   execute) and the canonical value formatter used for every output format.
 - `cli`: the CLI11 command line (`query`, `explain`, `schema`, `bench`, `version`), error reporting and exit codes;
@@ -188,10 +189,12 @@ next to others does not fail the query: the parts ahead are dropped (and run aga
 alone. The partition lanes of a GROUP BY hold at most as many parts as the window (one above half of the limit)
 before the consumer waits for them to merge, and they finish merging before a part runs again alone. A
 `std::bad_alloc` from a container (outside the budget's view) is caught in the part tasks, in `exec::ForEach` (in
-its tasks and around each `Submit`), in `PartitionLanes::Add` (queuing a part, starting a lane's task) and in
-`Drain`, and in every call of the join hash table, and becomes `OutOfMemory` too. Two places in Arrow still end the
-process on one: its thread pool's `Spawn`, where an OpenTelemetry call allocates in a `noexcept` function, and the
-making of an `arrow::Result` from a `Status`, whose `noexcept` constructor copies it.
+its tasks and around each `Submit`), in `PartitionLanes::Add` (queuing a part, starting a lane's task), around the
+part scheduler's `Submit`, in `Drain`, in every call of the join hash table and in a join build's `Prepare`, and
+becomes `OutOfMemory` too. Three places in Arrow still end the process on one: its thread pool's `Spawn`, where an
+OpenTelemetry call allocates in a `noexcept` function, a compute function's call, which allocates its tracing span
+where an exception cannot pass, and the making of an `arrow::Result` from a `Status`, whose `noexcept` constructor
+copies it.
 
 The budget's pool is Arrow's default pool, mimalloc. On Linux the `antb1` executable restarts itself once with
 `MIMALLOC_PURGE_DELAY=-1` (`cli::RestartForAllocator`, ADR 0017), so that mimalloc keeps the memory a query frees
@@ -199,7 +202,7 @@ instead of returning it to the system and faulting it back in: unless the variab
 wins) or `ARROW_DEFAULT_MEMORY_POOL` names another pool. The process then keeps its peak resident memory until it
 exits; the budget, which counts allocations, is unchanged.
 
-**Join builds** ([ADR 0022](adr/0022-joins-and-query-blocks.md); no operator uses them yet). An
+**Join builds** ([ADR 0022](adr/0022-joins-and-query-blocks.md); the physical planner plans no join yet). An
 `exec::JoinBuildPart` takes one part of a build input on any thread: it keeps the selected rows whose keys are not
 NULL, splits them into 64 partitions by `exec::KeyHashes` modulo 64 (the GROUP BY rule) with one Take per column,
 and keeps each row's hash. An `exec::JoinTableBuilder` takes the parts on the consumer thread in any order and hands
@@ -214,6 +217,13 @@ keeps whether any key repeats (`unique`), whether the input had a NULL key (`has
 `JoinTable::Find` gives every probe row the range of its matches, from any number of threads at once and without a
 lock; neither the thread count nor the order in which parts arrive changes the table, nor the failure of a build that
 fails: the failure of its earliest part, as in the serial order (a merge's before a later part's failed release).
+The inner hash join's operators (`src/exec/hash_join.h`) use it. An `exec::JoinBuild` builds a table from a part
+pipeline (its parts on the pool through the part scheduler) or from any operator drained on the consumer thread,
+after the builds its own input probes (post-order). An `exec::BuildsFirstOperator` prepares a probe pipeline's builds
+when it is first pulled, then opens the pipeline's sink, and releases them once the sink's parts are done
+(`exec::PartSink`'s callback). An `exec::HashJoinOperator` probes: with a build of unique keys it keeps the probe
+batch's columns and selects the matched rows, otherwise it takes a (probe row, match) pair per output row; its
+residuals are evaluated in order, each on the rows the ones before it kept.
 
 | Operator | Logical node | Does |
 | --- | --- | --- |

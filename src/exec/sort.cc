@@ -10,12 +10,10 @@
 #include <optional>
 #include <span>
 #include <string_view>
-#include <type_traits>
 #include <utility>
 #include <vector>
 
 #include <arrow/api.h>
-#include <arrow/array/data.h>
 #include <arrow/compute/api_vector.h>
 #include <arrow/compute/exec.h>
 
@@ -24,6 +22,8 @@
 #include "antb1/exec/profile.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
+
+#include "gather.h"
 
 namespace antb1::exec {
 namespace {
@@ -152,90 +152,6 @@ std::optional<TypeOrder> OrderFor(plan::LogicalType type) {
       break;
   }
   return std::nullopt;
-}
-
-// ---- gathering the rows of several chunks into one array ----
-
-// The rows `refs` of `arrays` (one array per chunk), appended to a builder of their type.
-template <class ArrayType, class BuilderType>
-arrow::Status GatherTyped(const std::vector<const arrow::Array*>& arrays,
-                          std::span<const SortBuffer::RowRef> refs, arrow::ArrayBuilder& out) {
-  auto& builder = static_cast<BuilderType&>(out);
-  ARROW_RETURN_NOT_OK(builder.Reserve(static_cast<int64_t>(refs.size())));
-  if constexpr (std::is_same_v<ArrayType, arrow::BinaryArray>) {
-    int64_t bytes = 0;
-    for (const auto& ref : refs) {
-      bytes += static_cast<const ArrayType&>(*arrays[ref.chunk]).value_length(ref.row);
-    }
-    ARROW_RETURN_NOT_OK(builder.ReserveData(bytes));
-  }
-  for (const auto& ref : refs) {
-    const auto& array = static_cast<const ArrayType&>(*arrays[ref.chunk]);
-    if (array.IsNull(ref.row)) {
-      builder.UnsafeAppendNull();
-    } else if constexpr (std::is_same_v<ArrayType, arrow::BinaryArray>) {
-      builder.UnsafeAppend(array.GetView(ref.row));
-    } else if constexpr (std::is_same_v<ArrayType, arrow::Decimal128Array>) {
-      builder.UnsafeAppend(arrow::Decimal128(array.GetValue(ref.row)));
-    } else {
-      builder.UnsafeAppend(array.Value(ref.row));
-    }
-  }
-  return arrow::Status::OK();
-}
-
-// Any other type: one slice per run of consecutive rows of a chunk.
-arrow::Status GatherSlices(const std::vector<std::shared_ptr<arrow::RecordBatch>>& chunks,
-                           int column, std::span<const SortBuffer::RowRef> refs,
-                           arrow::ArrayBuilder& builder) {
-  ARROW_RETURN_NOT_OK(builder.Reserve(static_cast<int64_t>(refs.size())));
-  std::vector<std::optional<arrow::ArraySpan>> spans(chunks.size());
-  for (std::size_t i = 0; i < refs.size();) {
-    const auto first = refs[i];
-    std::size_t length = 1;
-    while (i + length < refs.size() && refs[i + length].chunk == first.chunk &&
-           refs[i + length].row == first.row + length) {
-      ++length;
-    }
-    auto& span = spans[first.chunk];
-    if (!span.has_value()) {
-      span.emplace(*chunks[first.chunk]->column_data(column));
-    }
-    ARROW_RETURN_NOT_OK(builder.AppendArraySlice(*span, first.row, static_cast<int64_t>(length)));
-    i += length;
-  }
-  return arrow::Status::OK();
-}
-
-arrow::Status Gather(const std::vector<std::shared_ptr<arrow::RecordBatch>>& chunks, int column,
-                     std::span<const SortBuffer::RowRef> refs, arrow::ArrayBuilder& builder) {
-  std::vector<const arrow::Array*> arrays;
-  arrays.reserve(chunks.size());
-  for (const auto& chunk : chunks) {
-    arrays.push_back(chunk->column(column).get());
-  }
-  switch (builder.type()->id()) {
-    case arrow::Type::INT16:
-      return GatherTyped<arrow::Int16Array, arrow::Int16Builder>(arrays, refs, builder);
-    case arrow::Type::INT32:
-      return GatherTyped<arrow::Int32Array, arrow::Int32Builder>(arrays, refs, builder);
-    case arrow::Type::INT64:
-      return GatherTyped<arrow::Int64Array, arrow::Int64Builder>(arrays, refs, builder);
-    case arrow::Type::UINT16:
-      return GatherTyped<arrow::UInt16Array, arrow::UInt16Builder>(arrays, refs, builder);
-    case arrow::Type::DATE32:
-      return GatherTyped<arrow::Date32Array, arrow::Date32Builder>(arrays, refs, builder);
-    case arrow::Type::TIMESTAMP:
-      return GatherTyped<arrow::TimestampArray, arrow::TimestampBuilder>(arrays, refs, builder);
-    case arrow::Type::DOUBLE:
-      return GatherTyped<arrow::DoubleArray, arrow::DoubleBuilder>(arrays, refs, builder);
-    case arrow::Type::DECIMAL128:
-      return GatherTyped<arrow::Decimal128Array, arrow::Decimal128Builder>(arrays, refs, builder);
-    case arrow::Type::BINARY:
-      return GatherTyped<arrow::BinaryArray, arrow::BinaryBuilder>(arrays, refs, builder);
-    default:
-      return GatherSlices(chunks, column, refs, builder);
-  }
 }
 
 // a + b, saturated at INT64_MAX (both non-negative).
@@ -488,12 +404,11 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> SortBuffer::Slice(
   const arrow::Schema& schema = *comparator_.schema();
   arrow::ArrayVector columns;
   columns.reserve(Narrow<std::size_t>(schema.num_fields()));
+  const std::span<const RowRef> refs = std::span<const RowRef>(order_).subspan(
+      Narrow<std::size_t>(begin), Narrow<std::size_t>(end - begin));
   for (int c = 0; c < schema.num_fields(); ++c) {
     ARROW_ASSIGN_OR_RAISE(auto builder, arrow::MakeBuilder(schema.field(c)->type(), pool));
-    ARROW_RETURN_NOT_OK(Gather(chunks_, c,
-                               std::span<const RowRef>(order_).subspan(
-                                   Narrow<std::size_t>(begin), Narrow<std::size_t>(end - begin)),
-                               *builder));
+    ARROW_RETURN_NOT_OK((GatherRows<false, RowRef>(chunks_, c, refs, *builder)));
     ARROW_ASSIGN_OR_RAISE(auto column, builder->Finish());
     columns.push_back(std::move(column));
   }

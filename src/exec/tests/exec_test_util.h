@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -12,6 +13,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -29,8 +31,8 @@
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/table.h"
 
-// Helpers of the exec unit tests: arrays, an in-memory plan::Table, a scripted source operator and
-// an executor whose Submit throws.
+// Helpers of the exec unit tests: arrays, an in-memory plan::Table, a scripted source operator, an
+// executor whose Submit throws and a pool that fails on workers.
 
 namespace antb1::exec::testing {
 
@@ -42,13 +44,17 @@ class ExecTest : public ::testing::Test {
 };
 
 // Runs every task on `pool`, except that spawn number `throw_at` (from 0) throws std::bad_alloc, as
-// Arrow's Submit may when it cannot allocate the task: that task never runs. `before_throw` (if
-// any) is called just before the throw.
+// Arrow's Submit may when it cannot allocate the task, or `error` if given (e.g. the
+// std::system_error of a thread pool that cannot start a worker): that task never runs.
+// `before_throw` (if any) is called just before the throw.
 class ThrowingExecutor final : public arrow::internal::Executor {
  public:
   ThrowingExecutor(arrow::internal::Executor* pool, int throw_at,
-                   std::function<void()> before_throw = {})
-      : pool_(pool), throw_at_(throw_at), before_throw_(std::move(before_throw)) {}
+                   std::function<void()> before_throw = {}, std::exception_ptr error = nullptr)
+      : pool_(pool),
+        throw_at_(throw_at),
+        before_throw_(std::move(before_throw)),
+        error_(std::move(error)) {}
 
   int GetCapacity() override { return pool_->GetCapacity(); }
   // The spawns so far, the one that threw included.
@@ -61,6 +67,9 @@ class ThrowingExecutor final : public arrow::internal::Executor {
       if (before_throw_) {
         before_throw_();
       }
+      if (error_ != nullptr) {
+        std::rethrow_exception(error_);
+      }
       throw std::bad_alloc();
     }
     return pool_->Spawn(hints, std::move(task), std::move(stop_token), std::move(stop_callback));
@@ -70,7 +79,45 @@ class ThrowingExecutor final : public arrow::internal::Executor {
   arrow::internal::Executor* pool_;
   int throw_at_;
   std::function<void()> before_throw_;
+  std::exception_ptr error_;
   std::atomic<int> spawns_ = 0;
+};
+
+// A pool that fails every allocation off the thread that made it (the consumer's): every part or
+// batch computed on a worker runs out of memory, and only one computed again alone succeeds.
+class WorkerFailingPool final : public arrow::MemoryPool {
+ public:
+  explicit WorkerFailingPool(arrow::MemoryPool* backend) : backend_(backend) {}
+
+  arrow::Status Allocate(int64_t size, int64_t alignment, uint8_t** out) override {
+    if (std::this_thread::get_id() != owner_) {
+      failures_.fetch_add(1);
+      return arrow::Status::OutOfMemory("worker allocation");
+    }
+    return backend_->Allocate(size, alignment, out);
+  }
+  arrow::Status Reallocate(int64_t old_size, int64_t new_size, int64_t alignment,
+                           uint8_t** ptr) override {
+    if (std::this_thread::get_id() != owner_) {
+      failures_.fetch_add(1);
+      return arrow::Status::OutOfMemory("worker allocation");
+    }
+    return backend_->Reallocate(old_size, new_size, alignment, ptr);
+  }
+  void Free(uint8_t* buffer, int64_t size, int64_t alignment) override {
+    backend_->Free(buffer, size, alignment);
+  }
+  int64_t bytes_allocated() const override { return backend_->bytes_allocated(); }
+  int64_t total_bytes_allocated() const override { return backend_->total_bytes_allocated(); }
+  int64_t num_allocations() const override { return backend_->num_allocations(); }
+  std::string backend_name() const override { return backend_->backend_name(); }
+
+  [[nodiscard]] int failures() const { return failures_.load(); }
+
+ private:
+  arrow::MemoryPool* backend_;
+  std::thread::id owner_ = std::this_thread::get_id();
+  std::atomic<int> failures_ = 0;
 };
 
 template <class Builder, class T>
@@ -206,8 +253,8 @@ class MemoryTable final : public plan::Table {
     std::ranges::sort(out);
     return out;
   }
-  // ScanPart(part) fails with an IOError naming the part.
-  void FailPart(int64_t part) { failing_part_ = part; }
+  // ScanPart(part) fails with an IOError naming the part (each part this is called for).
+  void FailPart(int64_t part) { failing_parts_.push_back(part); }
   // ScanPart of `field` (with any other fields) fails with an IOError naming the field.
   void FailField(int field) { failing_field_ = field; }
   // With `split`: exact statistics of the BIGINT columns (plan::Table::part_stats), unless turned
@@ -261,7 +308,7 @@ class MemoryTable final : public plan::Table {
       const std::scoped_lock lock(mutex_);
       scanned_parts_.push_back(part);
     }
-    if (failing_part_ == part) {
+    if (std::ranges::find(failing_parts_, part) != failing_parts_.end()) {
       return arrow::Status::IOError("part ", part, " is broken");
     }
     if (failing_field_.has_value() && std::ranges::find(fields, *failing_field_) != fields.end()) {
@@ -383,7 +430,7 @@ class MemoryTable final : public plan::Table {
   std::shared_ptr<arrow::Schema> schema_;
   arrow::RecordBatchVector batches_;
   bool split_ = false;
-  std::optional<int64_t> failing_part_;
+  std::vector<int64_t> failing_parts_;
   std::optional<int> failing_field_;
   bool stats_ = true;
   bool scan_filter_ = true;
@@ -415,6 +462,9 @@ class ScriptedSource final : public Operator {
     if (next_ >= batches_.size()) {
       return Batch{};
     }
+    if (hand_over_) {
+      return std::move(batches_[next_++]);
+    }
     return batches_[next_++];
   }
   arrow::Status Close() override {
@@ -423,6 +473,10 @@ class ScriptedSource final : public Operator {
   }
 
   void FailAt(std::size_t index) { fail_at_ = index; }
+  // Next() hands each batch on and keeps no reference to it (a later run ends at its first Next(),
+  // since a moved-from Batch has no data): a test can then see when the consumer releases the
+  // batches.
+  void HandOver() { hand_over_ = true; }
   [[nodiscard]] int pulls() const { return pulls_; }
   [[nodiscard]] int opens() const { return opens_; }
   [[nodiscard]] int closes() const { return closes_; }
@@ -432,6 +486,7 @@ class ScriptedSource final : public Operator {
   std::vector<Batch> batches_;
   std::size_t next_ = 0;
   std::optional<std::size_t> fail_at_;
+  bool hand_over_ = false;
   int pulls_ = 0;
   int opens_ = 0;
   int closes_ = 0;
