@@ -50,6 +50,7 @@ antb1_add_gtest(
     tests/limit_compare_test.cc
     tests/ordered_compare_test.cc
     tests/difftest_test.cc
+    tests/join_tables.cc
     tests/query_file_test.cc
     tests/query_gen_test.cc
     tests/runner_test.cc
@@ -58,15 +59,19 @@ antb1_add_gtest(
     tests/tables_test.cc
   LIBS antb1_slt_lib Parquet::parquet_shared
 )
+# fuzz/ for sql_parser_property.h: generated queries must keep the parser's round-trip property.
+target_include_directories(antb1_slt_tests PRIVATE "${PROJECT_SOURCE_DIR}/fuzz")
 if(ANTB1_HAVE_DUCKDB)
   # Against the DuckDB library: plan::DuckDbFloatOf on seeded random literals, long runs of ties, the
-  # adapter's DECIMAL columns and the keywords DuckDB reads as table aliases.
+  # adapter's DECIMAL columns, the keywords DuckDB reads as table aliases and DuckDB's reading of
+  # generated joins.
   target_sources(
     antb1_slt_tests
     PRIVATE
       tests/duckdb_engine_test.cc
       tests/float_literal_oracle_test.cc
       tests/ordered_compare_oracle_test.cc
+      tests/query_gen_oracle_test.cc
       tests/table_alias_oracle_test.cc
   )
 endif()

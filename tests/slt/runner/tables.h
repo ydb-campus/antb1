@@ -17,11 +17,12 @@
 //                --show-values lifts the redaction for local runs (never on GitHub Actions).
 //   ref=<column>[+<column>...]:<table>.<column>[+<column>...]
 //                the table's columns reference those of a table of the same file (itself too),
-//                pairwise: a foreign key, a hint for generated joins (roadmap PR T1) and not a
-//                constraint, so NULL and dangling keys are intended. Repeatable. Names are plain
-//                identifiers; the table is found ASCII case-insensitively, also on a later line.
-//                LoadTables reads no Parquet file: metamorphic.TablesTxt.RefsJoinColumnsOfOneKind
-//                checks the columns. The engines and the query generator ignore refs until T1.
+//                pairwise: a foreign key, a hint for generated joins and not a constraint, so
+//                NULL and dangling keys are intended. Repeatable. Names are plain identifiers;
+//                the table is found ASCII case-insensitively, also on a later line. LoadTables
+//                reads no Parquet file: metamorphic.TablesTxt.RefsJoinColumnsOfOneKind checks the
+//                columns. The engines ignore refs; the query generator joins along them
+//                (LoadGenTables and QueryGenerator, query_gen.h).
 
 namespace antb1::slt {
 
