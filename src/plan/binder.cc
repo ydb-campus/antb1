@@ -12,7 +12,6 @@
 #include <vector>
 
 #include <arrow/result.h>
-#include <arrow/type.h>
 
 #include "antb1/common/check.h"
 #include "antb1/common/int128.h"
@@ -26,6 +25,8 @@
 #include "antb1/sql/ast.h"
 #include "antb1/sql/error.h"
 #include "antb1/sql/parser.h"
+
+#include "scope.h"
 
 // The binding rules are documented in docs/sql-subset.md and
 // docs/adr/0004-types-null-overflow-semantics.md.
@@ -941,86 +942,6 @@ arrow::Result<std::shared_ptr<Table>> ResolveTable(const sql::TableRef& ref,
   }
   return table;
 }
-
-// Mints the ids of a query's columns (plan::ColumnId): from 1, in binding order.
-class ColumnIdSource {
- public:
-  ColumnId Next() { return ColumnId{++last_}; }
-
- private:
-  std::uint32_t last_ = 0;
-};
-
-// Resolves column names of one table: ASCII case-insensitively, quoted names too (DuckDB). Each
-// field is one column, with its own id.
-class Columns {
- public:
-  Columns(const arrow::Schema& schema, ColumnIdSource& ids) : schema_(schema) {
-    lower_.reserve(Narrow<std::size_t>(schema.num_fields()));
-    ids_.reserve(Narrow<std::size_t>(schema.num_fields()));
-    for (const auto& field : schema.fields()) {
-      lower_.push_back(AsciiLower(field->name()));
-      ids_.push_back(ids.Next());
-    }
-  }
-
-  // The column of field `index`.
-  [[nodiscard]] ColumnId Id(int index) const { return ids_.at(Narrow<std::size_t>(index)); }
-
-  // The field that column `id` is, if it is one (and not a computed column).
-  [[nodiscard]] std::optional<int> FieldOf(ColumnId id) const {
-    const auto it = std::ranges::find(ids_, id);
-    if (it == ids_.end()) {
-      return std::nullopt;
-    }
-    return Narrow<int>(it - ids_.begin());
-  }
-
-  // The column of the field that `ref` names, by its id (plan::ResolvePositions sets its position
-  // at the end).
-  [[nodiscard]] arrow::Result<BoundColumn> Resolve(const sql::ColumnRef& ref) const {
-    // CheckSupported rejected every qualified name, except in the arguments of a call with the
-    // wrong number of them, which BindFunction rejects before it binds an argument.
-    ANTB1_CHECK(ref.qualifier.empty());
-    const std::string wanted = AsciiLower(ref.name);
-    std::optional<int> found;
-    for (std::size_t i = 0; i < lower_.size(); ++i) {
-      if (lower_[i] != wanted) {
-        continue;
-      }
-      const int index = Narrow<int>(i);
-      if (found.has_value()) {
-        return BindError(
-            std::format("column name '{}' is ambiguous: it matches the columns '{}' "
-                        "and '{}', which differ only in case",
-                        ref.name, schema_.field(*found)->name(), schema_.field(index)->name()),
-            ref.span);
-      }
-      found = index;
-    }
-    if (!found.has_value()) {
-      return BindError(std::format("column '{}' does not exist", ref.name), ref.span);
-    }
-    return Field(*found, ref.span);
-  }
-
-  // Field `index`, or kUnsupported (at `span`) if its type is not supported.
-  [[nodiscard]] arrow::Result<BoundColumn> Field(int index, SourceSpan span) const {
-    const auto& field = schema_.field(index);
-    auto type = FromArrow(*field->type());
-    if (!type.ok()) {
-      return UnsupportedError(std::format("column '{}' has the unsupported type {}", field->name(),
-                                          field->type()->ToString()),
-                              span);
-    }
-    return BoundColumn{.id = Id(index), .name = field->name(), .type = *type};
-  }
-
- private:
-  const arrow::Schema& schema_;
-  std::vector<std::string> lower_;
-  std::vector<ColumnId> ids_;  // per field
-};
 
 arrow::Result<LogicalType> AggregateType(const sql::AggregateCall& call, const BoundColumn& arg) {
   switch (call.kind) {
@@ -2045,23 +1966,20 @@ bool IsAggregateQuery(const sql::SelectStatement& stmt) {
 
 class Binder {
  public:
-  Binder(const sql::SelectStatement& stmt, std::shared_ptr<Table> table, ColumnIdSource& ids)
-      : stmt_(stmt),
-        table_(std::move(table)),
-        schema_(*table_->schema()),
-        columns_(schema_, ids),
-        ids_(ids) {}
+  // `bindings`: the FROM items, in order. `ids` minted their columns' ids and mints the binder's.
+  Binder(const sql::SelectStatement& stmt, std::vector<Binding> bindings, ColumnIdSource& ids)
+      : stmt_(stmt), scope_(std::move(bindings)), ids_(ids) {}
 
   arrow::Result<LogicalPlan> Bind();
 
  private:
-  // ---- the input scope: the table's columns, and computed columns over them ----
+  // ---- the input scope: the bindings' columns, and computed columns over them ----
 
   struct BindInputOf {
     Binder& binder;
 
     arrow::Result<Typed> operator()(const sql::ColumnRef& ref) const {
-      auto resolved = binder.columns_.Resolve(ref);
+      auto resolved = binder.scope_.Resolve(ref);
       if (!resolved.ok() && binder.shape_ == Shape::kProjection) {
         if (auto alias = binder.AliasFallback(ref, resolved.status())) {
           return *std::move(alias);
@@ -2069,7 +1987,7 @@ class Binder {
       }
       ARROW_ASSIGN_OR_RAISE(BoundColumn column, std::move(resolved));
       return ColumnLeaf(column.id, column.type, ArgumentName(ref.name),
-                        binder.StoredAsFloat(column.id));
+                        binder.scope_.StoredAsFloat(column.id));
     }
     arrow::Result<Typed> operator()(const sql::Literal& lit) const { return LiteralOperand(lit); }
     arrow::Result<Typed> operator()(const sql::AggregateCall& call) const {
@@ -2225,11 +2143,13 @@ class Binder {
   // so that it is computed only for the rows WHERE keeps.
   BoundColumn InputColumn(const Typed& t, bool where = false) {
     if (const auto* column = std::get_if<ColumnExpr>(&t.expr->node)) {
-      // A table field is named as declared; a computed column (a select item) by its expression.
-      const std::optional<int> field = columns_.FieldOf(column->id);
-      return BoundColumn{.id = column->id,
-                         .name = field.has_value() ? schema_.field(*field)->name() : t.expr->name,
-                         .type = t.expr->type};
+      // A binding's column is named as declared; a computed column (a select item) by its
+      // expression.
+      const std::optional<ColumnLocation> location = scope_.Find(column->id);
+      return BoundColumn{
+          .id = column->id,
+          .name = location.has_value() ? scope_.column(*location).name : t.expr->name,
+          .type = t.expr->type};
     }
     std::vector<ExprPtr>& exprs = where ? where_exprs_ : input_exprs_;
     std::vector<ColumnId>& ids = where ? where_ids_ : input_ids_;
@@ -2351,16 +2271,10 @@ class Binder {
     return ColumnLeaf(agg.id, agg.type, ResultName(call), FloatResult(agg));
   }
 
-  // Whether column `id` is a table field stored as FLOAT (read as DOUBLE, divergence D11).
-  [[nodiscard]] bool StoredAsFloat(ColumnId id) const {
-    const std::optional<int> field = columns_.FieldOf(id);
-    return field.has_value() && table_->StoredAsFloat(*field);
-  }
-
   // DuckDB's MIN and MAX of a FLOAT column are FLOAT; the other aggregates are not.
   [[nodiscard]] bool FloatResult(const AggregateCall& agg) const {
     return (agg.kind == AggKind::kMin || agg.kind == AggKind::kMax) && agg.arg.has_value() &&
-           StoredAsFloat(agg.arg->id);
+           scope_.StoredAsFloat(agg.arg->id);
   }
 
   // The GROUP BY key that is table column `id`, if one is.
@@ -2386,7 +2300,7 @@ class Binder {
     Binder& binder;
 
     arrow::Result<Typed> operator()(const sql::ColumnRef& ref) const {
-      auto resolved = binder.columns_.Resolve(ref);
+      auto resolved = binder.scope_.Resolve(ref);
       if (!resolved.ok()) {
         if (auto alias = binder.AliasFallback(ref, resolved.status())) {
           return *std::move(alias);
@@ -2524,6 +2438,7 @@ class Binder {
     if (!alias_fallback_ || detail == nullptr || detail->kind() != SqlErrorDetail::Kind::kBind) {
       return std::nullopt;
     }
+    // J2b must skip this lookup for a qualified ref: DuckDB errors there.
     const auto alias = FindAlias(select_, ref.name);
     if (!alias.has_value()) {
       return std::nullopt;
@@ -2559,9 +2474,7 @@ class Binder {
   LogicalPlan Assemble();
 
   const sql::SelectStatement& stmt_;
-  std::shared_ptr<Table> table_;
-  const arrow::Schema& schema_;
-  Columns columns_;
+  Scope scope_;
   ColumnIdSource& ids_;
   SelectList select_;
   Shape shape_ = Shape::kProjection;
@@ -2584,14 +2497,18 @@ arrow::Status Binder::BindSelectList() {
   SelectList& list = select_;
   if (stmt_.star) {
     list.span = stmt_.star_span;
-    for (int i = 0; i < schema_.num_fields(); ++i) {
-      ARROW_ASSIGN_OR_RAISE(BoundColumn column, columns_.Field(i, stmt_.star_span));
-      list.output.push_back(plan::OutputColumn{.name = column.name, .type = column.type});
-      list.items.emplace_back(ItemKind::kColumn, list.columns.size());
-      list.column_spans.push_back(stmt_.star_span);
-      list.column_written.push_back(column.name);
-      list.aliases.emplace_back();
-      list.columns.push_back(std::move(column));
+    for (std::size_t b = 0; b < scope_.bindings().size(); ++b) {
+      for (std::size_t c = 0; c < scope_.bindings()[b].columns().size(); ++c) {
+        ARROW_ASSIGN_OR_RAISE(
+            BoundColumn column,
+            scope_.Reference(ColumnLocation{.binding = b, .column = c}, stmt_.star_span));
+        list.output.push_back(plan::OutputColumn{.name = column.name, .type = column.type});
+        list.items.emplace_back(ItemKind::kColumn, list.columns.size());
+        list.column_spans.push_back(stmt_.star_span);
+        list.column_written.push_back(column.name);
+        list.aliases.emplace_back();
+        list.columns.push_back(std::move(column));
+      }
     }
     if (stmt_.group_by.empty() && IsAggregateQuery(stmt_) && !list.columns.empty()) {
       return BindError(std::format("column '{}' must be inside an aggregate function: a query "
@@ -2633,7 +2550,7 @@ arrow::Status Binder::BindSelectList() {
       continue;
     }
     if (const auto* ref = std::get_if<sql::ColumnRef>(&item.expr)) {
-      ARROW_ASSIGN_OR_RAISE(BoundColumn column, columns_.Resolve(*ref));
+      ARROW_ASSIGN_OR_RAISE(BoundColumn column, scope_.Resolve(*ref));
       // DuckDB names a plain column by its declared name, not as written.
       list.output.push_back(
           plan::OutputColumn{.name = item.alias.value_or(column.name), .type = column.type});
@@ -3438,8 +3355,8 @@ arrow::Status Binder::BindWhere() {
     for (const sql::Expr* part : parts) {
       ARROW_ASSIGN_OR_RAISE(Predicate predicate, BindCondition(*part, /*having=*/false));
       const bool on_scan =
-          (!predicate.column.has_value() || columns_.FieldOf(predicate.column->id).has_value()) &&
-          (!predicate.other.has_value() || columns_.FieldOf(predicate.other->id).has_value());
+          (!predicate.column.has_value() || scope_.Find(predicate.column->id).has_value()) &&
+          (!predicate.other.has_value() || scope_.Find(predicate.other->id).has_value());
       (on_scan ? scan_filter_ : input_filter_).push_back(std::move(predicate));
     }
   }
@@ -3499,7 +3416,7 @@ arrow::Status Binder::BindGroupBy() {
       continue;
     }
     if (const auto* ref = std::get_if<sql::ColumnRef>(&expr)) {
-      auto column = columns_.Resolve(*ref);
+      auto column = scope_.Resolve(*ref);
       if (column.ok()) {
         add(ColumnLeaf(column->id, column->type, column->name, false));
         continue;
@@ -3508,6 +3425,7 @@ arrow::Status Binder::BindGroupBy() {
       if (detail == nullptr || detail->kind() != SqlErrorDetail::Kind::kBind) {
         return column.status();
       }
+      // J2b must skip this lookup for a qualified ref: DuckDB errors there.
       const auto alias = FindAlias(select_, ref->name);
       if (!alias.has_value()) {
         return column.status();
@@ -3577,11 +3495,12 @@ arrow::Result<std::optional<Typed>> Binder::ItemOutput(std::size_t i) {
   }
   const BoundColumn& column = select_.columns[index];
   if (shape_ == Shape::kProjection) {
-    return std::optional(ColumnLeaf(column.id, column.type, column.name, StoredAsFloat(column.id)));
+    return std::optional(
+        ColumnLeaf(column.id, column.type, column.name, scope_.StoredAsFloat(column.id)));
   }
   if (const std::optional<std::size_t> k = KeyOf(column.id)) {
     return std::optional(
-        ColumnLeaf(key_ids_[*k], column.type, column.name, StoredAsFloat(column.id)));
+        ColumnLeaf(key_ids_[*k], column.type, column.name, scope_.StoredAsFloat(column.id)));
   }
   return NotGrouped(select_.column_written[index], select_.column_spans[index]);
 }
@@ -3590,13 +3509,14 @@ arrow::Result<std::optional<Typed>> Binder::ItemOutput(std::size_t i) {
 // that alias (DuckDB): a key, an aggregate or an expression. std::nullopt: bind it as any other
 // operand.
 arrow::Result<std::optional<Typed>> Binder::ResolveHavingName(const sql::ColumnRef& ref) {
-  auto table_column = columns_.Resolve(ref);
+  auto table_column = scope_.Resolve(ref);
   if (table_column.ok()) {
     if (const std::optional<std::size_t> k = KeyOf(table_column->id)) {
       return std::optional(ColumnLeaf(key_ids_[*k], table_column->type, table_column->name,
-                                      StoredAsFloat(table_column->id)));
+                                      scope_.StoredAsFloat(table_column->id)));
     }
   }
+  // J2b must skip this lookup for a qualified ref: DuckDB errors there.
   const auto alias = FindAlias(select_, ref.name);
   if (!alias.has_value()) {
     return std::nullopt;
@@ -3731,14 +3651,8 @@ arrow::Result<LogicalPlan> Binder::Bind() {
 }
 
 LogicalPlan Binder::Assemble() {
-  const sql::TableRef& from = stmt_.from.front().table;
-  ScanNode scan{
-      .table = table_, .table_name = from.name, .fields = {}, .ids = {}, .span = from.span};
-  for (int i = 0; i < schema_.num_fields(); ++i) {
-    scan.fields.push_back(i);
-    scan.ids.push_back(columns_.Id(i));
-  }
-  LogicalNodePtr node = Make(std::move(scan));
+  ANTB1_CHECK(scope_.bindings().size() == 1);  // J2b joins the bindings' nodes
+  LogicalNodePtr node = scope_.bindings().front().Node();
   const SourceSpan where_span = stmt_.where.empty()
                                     ? SourceSpan{}
                                     : Cover(stmt_.where.front().span(), stmt_.where.back().span());
@@ -4023,9 +3937,14 @@ arrow::Result<LogicalPlan> Bind(const sql::SelectStatement& stmt, const Catalog&
   const sql::SelectStatement folded = FoldDateCasts(stmt);  // the binder refers to it
   ARROW_RETURN_NOT_OK(CheckSupported(folded));
   ANTB1_CHECK(folded.from.size() == 1);  // CheckSupported rejected the others
-  ARROW_ASSIGN_OR_RAISE(auto table, ResolveTable(folded.from.front().table, catalog));
+  const sql::TableRef& from = folded.from.front().table;
+  ARROW_ASSIGN_OR_RAISE(auto table, ResolveTable(from, catalog));
   ColumnIdSource ids;
-  Binder binder(folded, std::move(table), ids);
+  std::vector<Binding> bindings;
+  bindings.push_back(Binding::OfTable(
+      from.name, TableSource{.table = std::move(table), .table_name = from.name, .span = from.span},
+      ids));
+  Binder binder(folded, std::move(bindings), ids);
   ARROW_ASSIGN_OR_RAISE(LogicalPlan plan, binder.Bind());
   return ResolvePositions(plan);  // the binder refers to columns by id (ADR 0022)
 }
