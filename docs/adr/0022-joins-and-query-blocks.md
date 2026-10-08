@@ -376,6 +376,9 @@ Proposed
   - **The 1:1 path:** with a unique build, an inner join keeps the probe batch and its columns, clears the selection
     bits of the rows without a match and appends the build's payload columns, taken by match; a semi join only
     clears bits. No probe column is copied.
+    - Update (2026-10-09, J1b): an inner join with residuals copies the rows it selected and evaluates its residuals
+      on the copy (the update under "Builds come first, on the consumer thread"); without residuals no probe column
+      is copied.
   - Rows keep the probe side's part and row order, and a probe row's matches come in the build's (part, row) order.
     Every sink above merges as it does today, and answers are byte-identical for any thread count.
 - **NULL keys never match,** on either side: the build does not insert them, and a probe row with a NULL key has
@@ -388,6 +391,9 @@ Proposed
   filter's `exec::PredicateEvaluator`. A semi or anti join ORs the results for each probe row; a left join emits
   every pair that passes and pads a probe row only when none passes. A semi or anti build keeps only distinct keys
   when its join has no residual, and every row when it has one.
+  - Update (2026-10-09, J1b): an inner join's residuals are evaluated by its probe, not by a `Filter` above it: in
+    order, each only on the rows the ones before it kept (the update under "Builds come first, on the consumer
+    thread"). The other kinds' residuals stay E2's, as above.
 - **One build feeds one probe pipeline,** until a later ADR. Nothing else is buffered for reuse: a table or sub-plan
   read twice is computed twice (ADR 0013).
 - **Memory.** A build's Arrow buffers come from the budget's pool, and its own containers are charged through
@@ -398,6 +404,9 @@ Proposed
 - **Errors** follow the serial order of the plan: builds in post-order, then the probe. The first failing part of
   the first failing build decides the error, before any probe part starts; within a pipeline, the first failing part
   in part order decides, as today.
+  - Update (2026-10-09, J1b): within a pipeline the outermost join's build is prepared first, and a build whose input
+    probes builds of its own prepares those first (post-order), so in a chain of joins over one pipeline the outer
+    build's error wins (the update under "Builds come first, on the consumer thread").
 - **The hidden physical rules follow the probe input or decline (J1b):** Filter-on-Scan pushdown, part pruning by
   footers (`exec::KeptParts`), late materialization, the `COUNT(DISTINCT)` rewrite, the partition top-N and the
   Limit over a pipeline. Each looks only along the probe input, or does not apply. Late materialization declines over
