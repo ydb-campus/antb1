@@ -1833,9 +1833,6 @@ TEST_F(HashJoinPlanTest, PartPruningReadsOnlyTheScansOwnFilters) {
   const auto bk = MixedColumn("b", 0);
   const auto bid = MixedColumn("b", 2);
   const auto key = [](int64_t i) -> std::optional<int64_t> { return i % 10; };
-  const auto count = [](const ProfileNode& node, const std::string& name) {
-    return MetricOf(node, name);
-  };
   {
     // pid >= 28 on the probe's scan: its parts 0 to 3 (pid 0 to 27) are skipped.
     const auto p = MixedTable("p", 6, 7, ProbeKey);
@@ -1849,8 +1846,8 @@ TEST_F(HashJoinPlanTest, PartPruningReadsOnlyTheScansOwnFilters) {
                6),
         ContextOf(nullptr), &profile);
     ASSERT_TRUE(result.ok()) << result.status().ToString();
-    EXPECT_EQ(count(profile, "skipped"), 4);
-    EXPECT_EQ(count(*profile.children()[1], "skipped"), 0);
+    EXPECT_EQ(MetricOf(profile, "skipped"), 4);
+    EXPECT_EQ(MetricOf(*profile.children()[1], "skipped"), 0);
     EXPECT_EQ(p->scanned_parts(), (std::vector<int64_t>{4, 5}));
     Rows probe_rows;
     for (const std::vector<std::string>& row : RowsOf(*p)) {
@@ -1874,7 +1871,7 @@ TEST_F(HashJoinPlanTest, PartPruningReadsOnlyTheScansOwnFilters) {
         ContextOf(nullptr), &profile);
     ASSERT_TRUE(result.ok()) << result.status().ToString();
     EXPECT_EQ(profile.name(), "PartUnion");  // the Filter runs in the probe pipeline
-    EXPECT_EQ(count(profile, "skipped"), 0);
+    EXPECT_EQ(MetricOf(profile, "skipped"), 0);
     EXPECT_EQ(p->scanned_parts(), (std::vector<int64_t>{0, 1, 2, 3, 4, 5}));
     const Rows expected =
         WhereAtLeast(ReferenceJoin(RowsOf(*p), RowsOf(*b), {0}, {0}, BuildSide::kLeft), 2, 12);
@@ -1895,10 +1892,10 @@ TEST_F(HashJoinPlanTest, PartPruningReadsOnlyTheScansOwnFilters) {
                6),
         ContextOf(nullptr), &profile);
     ASSERT_TRUE(result.ok()) << result.status().ToString();
-    EXPECT_EQ(count(profile, "skipped"), 0);
+    EXPECT_EQ(MetricOf(profile, "skipped"), 0);
     const ProfileNode& build = *profile.children()[1];
     EXPECT_EQ(build.name(), "HashBuild");
-    EXPECT_EQ(count(build, "skipped"), 2);
+    EXPECT_EQ(MetricOf(build, "skipped"), 2);
     EXPECT_EQ(b->scanned_parts(), (std::vector<int64_t>{2}));
     EXPECT_EQ(RowsOf(**result),
               ReferenceJoin(RowsOf(*p), WhereAtLeast(RowsOf(*b), 2, 10), {0}, {0}));
