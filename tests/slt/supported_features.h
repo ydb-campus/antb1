@@ -41,9 +41,10 @@ enum class Feature : std::uint8_t {
   kArithmetic,          // + - * / // % and unary - of a column and a constant
   kStringFunctions,     // strlen(varchar) and regexp_replace(varchar, 'pattern', 'replacement')
   kCase,                // CASE WHEN <condition> THEN .. [ELSE ..] END
-  kBooleanExpressions,  // OR, NOT and parenthesized AND in conditions (WHERE, HAVING, CASE WHEN)
+  kBooleanExpressions,  // OR, NOT and parenthesized AND in conditions (WHERE, an inner ON, HAVING,
+                        // CASE WHEN)
   kTimestamps,          // toDateTime(integer), EXTRACT(field FROM ..) and date_trunc('unit', ..)
-  // Column types a query reads (select list or WHERE); SELECT * reads every column
+  // Column types a query reads (select list, WHERE or an inner ON); SELECT * reads every column
   kIntegerColumns,  // SMALLINT, INTEGER, BIGINT, USMALLINT
   kDoubleColumns,   // DOUBLE
   kVarcharColumns,  // VARCHAR (Parquet BYTE_ARRAY, with or without UTF8)
@@ -53,18 +54,18 @@ enum class Feature : std::uint8_t {
   // FROM
   kTableName,      // a registered table
   kTablePath,      // '<file or glob>'
-  kCommaJoin,      // FROM a, b and FROM a CROSS JOIN b
+  kCommaJoin,      // FROM a, b and FROM a CROSS JOIN b (connected by equalities in WHERE or an ON)
   kJoinOn,         // FROM a [INNER] JOIN b ON ...
   kLeftJoin,       // FROM a LEFT [OUTER] JOIN b ON ...
   kTableAlias,     // FROM t [AS] a
   kQualifiedName,  // t.x
   // WHERE
-  kWhere,            // WHERE column <op> literal (=, <>, !=, <, <=, >, >=)
+  kWhere,            // WHERE column <op> literal (=, <>, !=, <, <=, >, >=); also in an inner ON
   kWhereAnd,         // several comparisons joined by AND
-  kLike,             // VARCHAR column [NOT] LIKE 'pattern' in WHERE
-  kIn,               // column [NOT] IN (literal, ...) in WHERE
-  kBetween,          // column [NOT] BETWEEN literal AND literal in WHERE
-  kCompareColumns,   // column <op> column in WHERE (a DECIMAL against another column of numbers)
+  kLike,             // VARCHAR column [NOT] LIKE 'pattern' in WHERE or an inner ON
+  kIn,               // column [NOT] IN (literal, ...) in WHERE or an inner ON
+  kBetween,          // column [NOT] BETWEEN literal AND literal in WHERE or an inner ON
+  kCompareColumns,   // column <op> column in WHERE or an inner ON (a DECIMAL against numbers)
   kLiteralFirst,     // literal <op> column
   kIntegerLiteral,   // 42
   kDecimalLiteral,   // 4.25
@@ -279,12 +280,10 @@ using FeatureSet = BasicFeatureSet<Feature, kFeatureCount>;
 inline constexpr FeatureSet kNeverGenerated = {Feature::kWindowFunctions};
 
 // Grammar that the parser accepts ahead of the random generator (runner/query_gen.cc), which
-// learns it in a later PR (ADR 0022: T1 the joins, aliases and qualified names, T2 LEFT JOIN) and
-// then removes it from this set. Valid in `-- features:` tags, and never in kSupportedFeatures
-// while pending (checked below), so that no feature is declared supported before it is generated.
-inline constexpr FeatureSet kGeneratorPending = {Feature::kCommaJoin, Feature::kJoinOn,
-                                                 Feature::kLeftJoin, Feature::kTableAlias,
-                                                 Feature::kQualifiedName};
+// learns it in a later PR (ADR 0022: T2 LEFT JOIN) and then removes it from this set. Valid in
+// `-- features:` tags, and never in kSupportedFeatures while pending (checked below), so that no
+// feature is declared supported before it is generated.
+inline constexpr FeatureSet kGeneratorPending = {Feature::kLeftJoin};
 
 // What antb1 answers today: the whole slice grammar of docs/sql-subset.md (global and grouped
 // aggregates, projections, WHERE conjunctions of column <op> literal, ORDER BY, LIMIT and OFFSET)

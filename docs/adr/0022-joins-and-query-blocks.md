@@ -482,7 +482,9 @@ docs/sql-subset.md sections it changes.
   with the 1:1 path, the hidden rules along the probe input, and the profile lines.
 - **J2a, refactor(plan): name scopes in the binder.** Scopes of bindings, with single-table behavior unchanged.
 - **T1, test(diff): generate joins along foreign keys.** Joins of two and three tables in the random generator, as
-  comma joins and as JOIN ... ON, with aliases and qualified names.
+  comma joins and as JOIN ... ON, with aliases and qualified names. Update (2026-10-07): also `CROSS JOIN`; every join
+  stays within a true row bound from the refs' key statistics (non-NULL rows, distinct keys and the largest
+  multiplicity), and two metamorphic relations of join order and connectors are pending until J2b.
 - **J2b, feat(plan): inner joins of the tables in from.** Rules 1-6, the scope of an ON (rule 10), the relation
   limit, the WHERE classification, the connectivity check, and the join order and build sides from footer statistics
   with distinct-count hints. Its `.slt` cases cover the bind errors of these rules, among them `*` over two bindings
