@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791499028773,
+  "lastUpdate": 1791500438514,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -5508,6 +5508,114 @@ window.BENCHMARK_DATA = {
             "value": 129.9511654000014,
             "unit": "ms/iter",
             "extra": "iterations: 5\ncpu: 129.92277759999985 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "6bd05ce77078de19f3eb671562ded104b73ac44d",
+          "message": "feat(exec): hash join operators (#106)\n\n## Summary\n\nRoadmap PR **J1b-1**, the first half of J1b ([ADR\n0022](docs/adr/0022-joins-and-query-blocks.md), \"Execution\"). You\napproved splitting J1b. This PR adds the inner hash join's operators\nover E1's join table (#97). J1b-2 wires them into the physical planner.\n\nUntil then the planner still rejects joins with exit 4, so no query\nchanges its answer: `tests/data/tpch_status.json` stays `{\"pass\": [1,\n6]}`, and ClickBench stays at 43/43.\n\n**Operators** (`src/exec/hash_join.{h,cc}`, internal):\n- **`JoinBuild`** fills E1's `JoinTableBuilder` in part order. Its input\nis either:\n- a part pipeline, run through the `PartScheduler` (window, memory\npressure, a part retried alone after running out of memory); or\n  - any operator, drained on the consumer and then cut into parts.\n\n`Prepare` runs on the consumer only and prepares its input's own builds\nfirst. It turns `std::bad_alloc` into OutOfMemory and holds nothing once\nit returns after a failure. A drained input's batches are owned by\n`Prepare` itself, never by the part tasks.\n\nBuild metrics: `parts`, `part_time`, `wait`, `lanes_tail`, `finish`,\n`null_keys`, `unique` and `direct`, plus rows and time.\n- **`PrepareBuilds` / `ReleaseBuilds`:** within a pipeline the outermost\njoin's build comes first, and a build whose input probes builds of its\nown prepares those first. They stop at the first build that holds no row\n(your decision: an empty build skips the probe).\n- **`BuildsFirstOperator`** wraps a probe pipeline's sink.\n- `Open` only copies the context. The first `Next` prepares the builds,\nthen opens the sink, so no part runs before the builds are done, and an\nunpulled query (LIMIT 0) runs no build, as in DuckDB.\n- Builds are released when the sink reports its parts done, or at\n`Close`.\n- **`HashJoinOperator`** is the probe. It runs inside a part pipeline,\nor over a serial input, where it prepares its own build at the first\n`Next`.\n- **1:1 path** (unique build): zero-copy windows of at most `batch_size`\nprobe rows, selected where they matched, with build columns gathered and\nNULL elsewhere.\n  - **1:N path:** a cursor resumes inside a probe batch.\n- Rows keep the probe order, and each row's matches keep the build's\n(part, row) order. Build fields are nullable.\n- **Residuals:** evaluated in order, each only on the rows the earlier\nones kept. NULL counts as false, as in WHERE, so a later condition never\nraises on a row an earlier one dropped.\n  - An empty build never opens the probe input.\n- Metrics `find`, `gather`, `residual`, and `window_rows` on the 1:1\npath, written per timed section inside `Next`. Nothing allocates in\n`Open` or `Close`.\n- `Make` returns Invalid for bad keys or residuals, so J1b-2's planner\ncan call it directly.\n\n**Shared changes:**\n- **`GatherRows`** (`src/exec/gather.{h,cc}`): sort's row gather, moved\nout of `sort.cc` and generalized. A `kNoChunk` reference appends NULL.\nSort output is unchanged.\n- **Part helpers:** `PartContext`, `PartWindow` (renamed from `Window`)\nand `RunPart` are declared in `part_operators.h`.\n- **`PartSink`:** a base class with the parts-done callback. PartUnion,\nPartAggregate, PartGroupAggregate, the two-level aggregation and\nPartTopN each call it once per run, after all their parts are in, and\nnever after a failed part or an early stop. Their results and error\nprecedence are unchanged.\n- **Fix of an older defect:**\n- `PartScheduler::Submit` used to record a part's task only after\nsubmitting it, so an exception while recording left a task nothing\ntracked.\n- It now reserves the slot first and gives it back if Submit fails or\nthrows: `std::bad_alloc` becomes OutOfMemory, and other exceptions pass\nthrough.\n\n**Tests** (label `unit`; the 4-thread pool only in exec tests, as\nbefore):\n- `exec.HashJoinTest.*` (17):\n- the 1:1 path keeps the probe's columns, and 1:N fan-out continues\nacross batches;\n- NULL keys never match; multi-column keys; a BOOLEAN payload on both\npaths; build-left column order;\n  - residual order and NULL handling;\n  - an empty build opens no probe input; a drained build input;\n- every sink gives the same rows on 1 and 4 threads; nested builds and\nchains;\n- the first build error in part order wins; a build part runs again\nalone after OOM;\n- misuse is Invalid; builds are prepared at the first `Next`; builds\nhold nothing once their parts are done (including a drained build whose\nbatches come from the budget's pool); profile counts.\n- `exec.PartSchedulerTest`: a part the executor cannot take fails\n`Next`; any other exception of Submit leaves `Next`.\n- `exec.PartOperatorsTest.PartSinksCallPartsDoneOnceTheirPartsAreIn`.\n-\n`exec.PartSchedulerBadAllocTest.APartThatCannotBeSubmittedStartsNothing`:\nfails on the old Submit code.\n- `exec.JoinTableBadAllocTest.APrepareThatRunsOutOfMemoryHoldsNothing`.\n- **Memory-limit tests:** four hand-built joins (a 1:1 direct join under\na projection, a VARCHAR-key join under a grouping, a 1:N join, a serial\nprobe with a drained build) run through the tiny-limit, big-limit and\npressure tests.\n- **Mutation checks:** five key behaviours were removed one at a time,\nand each removal fails at least one test: residual compaction, the\nempty-build stop, the parts-done release, release on failure, and the\n1:1 selection.\n\n**Docs:**\n- `docs/architecture.md`: the operators, the new `bad_alloc` guards, and\na third place where Arrow ends the process on `bad_alloc`. Arrow\ncompute's tracing span allocates inside a noexcept function, so the\n`Prepare` sweep runs with the pool.\n- J1b-2 adds the ADR 0022 and ADR 0015 update lines and the\n`docs/sql-subset.md` changes, as planned. Until then, ADR 0022's\n\"Execution\" text still says builds are prepared in `Open` and residuals\nrun in a Filter above the probe; J1b-2's update line corrects both.\n\nFor the maintainer:\n\n- **Size:** 16 files, about 3,200 lines inserted (about 1,100 code,\n2,000 tests), against the 1,800 to 2,100 estimate; mostly tests.\n- **Differences from the plan:**\n- metrics are written per timed section in `Next`, so a probe stopped by\na LIMIT keeps them;\n- the build order is \"outermost first; a build's own input builds before\nit\" (the critique's wording), with the early stop;\n- `BuildsFirstOperator` takes a `PartSink`, so only sinks that call the\ncallback can be wrapped;\n- the Submit fix also turns a refill failure into a stop of the\nscheduler;\n- some planner-level checks (1 against 4 threads across sinks, chains,\nfirst build error, retry after OOM) are already covered here on\nhand-built pipelines;\n- small `docs/architecture.md` corrections land here, because two of its\nstatements became false.\n- **Left for J1b-2 and J2b:**\n  - the DuckDB divergences, which J2b registers;\n  - the late-materialization positive control;\n  - `kOrder` in `profile_format.cc` and its engine test;\n  - the rest of the docs and the integration tests.\n- **Upstream note:** Arrow's compute tracing span ends the process on\n`std::bad_alloc`; it might be worth reporting to Arrow (not done).\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check-full                  # on 959476e (the head)\nlint: PASS\n100% tests passed out of 2204          # ci (clang Debug -Werror)\n100% tests passed out of 2204          # asan (ASan + UBSan)\n                                       # tidy: clean\ncoverage: PASS                         # exec 97.39% lines / 88.45% branches (floors 96.1 / 85.1)\n100% tests passed out of 2             # fuzz-smoke\n100% tests passed out of 2204          # ci-gcc\n$ pixi run tsan                        # on 959476e\n100% tests passed out of 2204          # no ThreadSanitizer reports\n$ pixi run test -R '^exec\\.(HashJoin|PhysicalPlanner|Profile|MemoryLimit|ParallelCompute|PartOperators|PartScheduler|Sort|JoinTable|BadAlloc|PartitionLanes)'\n100% tests passed out of 134\n```\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: none changed\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code implemented the\nmaintainer-approved J1b-1 plan after a planning round of read-only\nmapping, design and adversarial critique agents that probed DuckDB\n1.5.6. Two reviewer agents then reviewed it from two angles: build side,\nconcurrency and memory; probe semantics and tests. Neither found a P0 or\nP1. Their nine nits are fixed; the ADR line is deferred to J1b-2 as\nplanned. A pre-PR review then checked the fix commits.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-10-09T01:58:30+03:00",
+          "tree_id": "79a1b72148e80df54f68255719552b47090341fc",
+          "url": "https://github.com/ydb-campus/antb1/commit/6bd05ce77078de19f3eb671562ded104b73ac44d"
+        },
+        "date": 1791500437544,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 2593.776531130577,
+            "unit": "ns/iter",
+            "extra": "iterations: 271662\ncpu: 2593.6320611642404 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 61634.17375886473,
+            "unit": "ns/iter",
+            "extra": "iterations: 10998\ncpu: 61628.15366430259 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 68665.82677242537,
+            "unit": "ns/iter",
+            "extra": "iterations: 10212\ncpu: 68660.16186839009 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 251515.6608291599,
+            "unit": "ns/iter",
+            "extra": "iterations: 2798\ncpu: 251477.7587562544 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 247671.63263864233,
+            "unit": "ns/iter",
+            "extra": "iterations: 2831\ncpu: 247641.9600847757 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 1400017.6454183215,
+            "unit": "ns/iter",
+            "extra": "iterations: 502\ncpu: 1399941.5059760963 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 29.86677730434782,
+            "unit": "ms/iter",
+            "extra": "iterations: 23\ncpu: 29.86345913043479 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 28.366501499999945,
+            "unit": "ms/iter",
+            "extra": "iterations: 22\ncpu: 28.363704181818164 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 132.38045299999897,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 132.35721580000012 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 8.536263049382729,
+            "unit": "ms/iter",
+            "extra": "iterations: 81\ncpu: 8.535585345679007 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 11.582331790322545,
+            "unit": "ms/iter",
+            "extra": "iterations: 62\ncpu: 11.579825403225795 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 28.976594615384734,
+            "unit": "ms/iter",
+            "extra": "iterations: 26\ncpu: 28.97257034615386 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.194562367972736,
+            "unit": "ms/iter",
+            "extra": "iterations: 587\ncpu: 1.194398034071549 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 54.165659076922715,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 54.15681107692318 ms\nthreads: 1"
           }
         ]
       }
