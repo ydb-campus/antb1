@@ -87,8 +87,8 @@ Rows ReferenceJoin(const Rows& probe, const Rows& build, const std::vector<std::
 
 // Some columns of a star table (star/<name>.parquet), by name, as a Scan reads them.
 struct Side {
-  Side(const std::string& table_name, std::vector<std::string> column_names)
-      : name(table_name), columns(std::move(column_names)) {
+  Side(std::string table_name, std::vector<std::string> column_names)
+      : name(std::move(table_name)), columns(std::move(column_names)) {
     auto opened = io::ParquetTable::Open({Fixture("star/" + name + ".parquet")});
     EXPECT_TRUE(opened.ok()) << name << ": " << opened.status().ToString();
     if (opened.ok()) {

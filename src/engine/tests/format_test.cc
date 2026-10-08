@@ -324,7 +324,7 @@ TEST(FormatResultTest, JsonCopiesWellFormedUtf8) {
 // lanes_tail, finish, null_keys, unique, direct) among the others, then the unknown ones by name;
 // in the text and in the JSON.
 TEST(FormatProfileTest, JoinMetricsShowInAFixedOrder) {
-  constexpr int64_t kMs = 1000 * 1000;
+  constexpr int64_t kMs = int64_t{1000} * 1000;
   auto root = std::make_shared<exec::ProfileNode>();
   root->set_name("PartAggregate");
   root->set_detail("Aggregate COUNT(*)");

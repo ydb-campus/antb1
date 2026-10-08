@@ -2005,6 +2005,7 @@ TEST_F(HashJoinPlanTest, PartitionTopNRunsOverAJoin) {
     ++matches[std::stoll(row[0])];
   }
   std::vector<std::pair<int64_t, int64_t>> order;  // (-count, key)
+  order.reserve(matches.size());
   for (const auto& [k, n] : matches) {
     order.emplace_back(-n, k);
   }
