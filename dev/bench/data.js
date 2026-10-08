@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791316236149,
+  "lastUpdate": 1791499028773,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -5400,6 +5400,114 @@ window.BENCHMARK_DATA = {
             "value": 158.0542332499988,
             "unit": "ms/iter",
             "extra": "iterations: 4\ncpu: 158.0283014999999 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2701914199339b9b9ea90f374d992bda81da79e2",
+          "message": "refactor(plan): name scopes in the binder (#105)\n\n## Summary\n\nRoadmap PR **J2a** of the joins track ([ADR\n0022](docs/adr/0022-joins-and-query-blocks.md)): the binder's name\nscopes, with no change in behaviour.\n\n- A new private header, `src/plan/scope.h` (with `scope.cc`), has a\n`Binding` per FROM item and a `Scope` per query block.\n- A `Binding` holds its name, its source (a table, or a bound sub-plan\nfor J4) and its columns: declared name, id, engine type or Arrow type\ntext, and FLOAT flag.\n- A `Scope` holds the bindings in FROM order and the enclosing block's\nscope, which nothing consults yet.\n- They replace the binder's single-table `Columns` lookup, its table and\nschema members, and the table query in its FLOAT lookup.\n- A column without an engine type keeps its id and is kUnsupported only\nwhere it is referenced.\n- Messages, kinds, spans and error order are unchanged; no query changes\nits plan or answer. The TPC-H-derived queries stay at 2 of 22\n(`tests/data/tpch_status.json` unchanged); ClickBench stays at 43/43.\n\n**Tests:** `src/plan/tests/scope_test.cc`, 21 cases over `FakeTable`\n(hermetic, no threads):\n- `BindingTest` (6):\n  - ids per field in schema order, continuing across bindings;\n  - declared names, types and unsupported fields;\n- the FLOAT flag taken from the table: a float64 field it flags next to\na float32 field it does not;\n  - case-insensitive matching that reports the first two matches;\n- a table binding's Scan under its ids, showing the FROM reference\n(\"dir/trips.parquet\"), not the binding's name (\"trips\");\n  - a sub-plan binding with its columns as given.\n- `ScopeTest` (8):\n  - resolution that ignores case and quoting;\n- exact messages, kinds and spans for an unknown column, an ambiguous\none (first two matches) and an unsupported type (after ambiguity, and\nonly where referenced, by name or through `*`);\n  - `Find` and `StoredAsFloat` by id across bindings;\n  - the enclosing scope kept, with the inner block resolving first.\n- `BinderIdsTest` (1): Scan ids 1..11, then the computed column, then\nthe select list.\n- Death tests (6): qualified names and several bindings until J2b, a\nlocation out of range, duplicate ids (debug builds), `OfTable` without a\ntable, and `OfPlan`'s root and column checks.\n- Every existing test passes unedited: 2,182 existing plus 21 new, 2,203\nin total.\n\n**Docs:** the Bind step and the \"where to add things\" row of\n`docs/architecture.md`; an update line in ADR 0022 under \"Scopes of\nbindings (J2a)\", with lasting facts only (a CODEOWNERS path; status\nunchanged).\n\nFor the maintainer:\n\n- **Size:** 972 changed lines (834 inserted, 138 deleted) in 7 files,\nagainst the plan's estimate of 800-850 changed lines; `scope_test.cc` is\n439 of them.\n- **Reviews:** two independent reviews found no P0-P2 problems. Their 3\nnits are fixed: a death test for `OfTable`'s null-table check (034c1e8),\nthe hand-off items below noted at the API and at the alias lookups\n(6b0ca57, worded as instructions in 9782620), and exact verification\ncommands in this text. A re-review and a pre-PR review of the final\ncommits found no P0-P2 either.\n- **Differences from the plan:**\n- 21 test cases instead of about 16: every check in `scope.cc` has a\ndeath test, and the outer-scope test also checks that the inner block\nresolves first;\n  - `OfPlan` also checks that every column has an id;\n  - `Scope::column` checks its range instead of calling `.at()`;\n- the ambiguity branch tests both matches explicitly, so clang-tidy can\nfollow the optional access;\n  - binder.cc drops the unused `<arrow/type.h>`.\n- **Hand-off:**\n  - **J2b:**\n- Remove the two `Scope::Resolve` checks and the one in `Assemble`.\nImplement rules 2-5 with `Binding::Match` per binding and qualified\nmatching on `name()` (ASCII case-insensitive); rule 5 goes into the\n`SELECT *` loop.\n- Rule 10: once J2b lets `Scope::Resolve` search every binding, an ON\nmust resolve names only in the FROM items up to and including its own\nJOIN, and a later item's column must never make a name in an ON\nambiguous. Resolve needs a limit on the visible bindings (the `pending\nJ2b` record at `tests/slt/cases/joins/names.slt:124`).\n- Pass rule-1 names to `OfTable`. Keep `TableSource::table_name` as\nwritten, because EXPLAIN's `Scan table=` shows it.\n- Classify WHERE conjuncts with `Find(id)->binding` and build the join\ntree from each binding's `Node()`. Build all bindings before the\n`Binder`, so ids stay contiguous in FROM order.\n- A qualified name must never name a select alias in `AliasFallback`,\nthe `BindGroupBy` fallback or `ResolveHavingName`. Each is marked `J2b\nmust skip this lookup for a qualified ref: DuckDB errors there.`; the\nORDER BY lookup is already guarded.\n- Rule-6 names keep the qualifier inside expressions (`sum(t.a)`, `(t.a\n+ 1)`), so `ExprNameOf` and `BindInputOf` (`ArgumentName(ref.name)`)\nmust change.\n    - `FoldDateCasts` and `CheckSupported` must walk `from[i].on`.\n- Decide when `BoundColumn::qualifier` is set: setting it always changes\nevery single-table EXPLAIN golden.\n- **J4:** `OfPlan` exists. The inner binder must report\n`stored_as_float` per output column, which `OutputColumn` lacks. A\n`Scope` can be neither copied nor moved, so a container of scopes (CTEs,\nderived tables) holds them through `std::unique_ptr`.\n- **J5:** consult `outer()` for rule 9; a correlation exits 4 until\nthen.\n\nThis workload is derived from the TPC-H Benchmark and is not comparable\nto published TPC-H Benchmark results, as this implementation does not\ncomply with all requirements of the TPC-H Benchmark.\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [x] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n# on 9782620 (the head; its last change rewords three comments): pixi run check (lint: PASS, 2203 passed) and pixi run ci-gcc (2203 passed)\n# every command below on 6b0ca57, with TEST_TMPDIR set to a per-worktree directory\n$ pixi run check-full\nlint: PASS\n100% tests passed out of 2203          # ci (clang Debug -Werror)\n100% tests passed out of 2203          # asan (ASan + UBSan)\n                                       # tidy: clean\ncoverage: PASS                         # plan: lines 96.11%, branches 91.47% (floors 93.5, 89.5)\n100% tests passed out of 2             # fuzz-smoke\n100% tests passed out of 2203          # ci-gcc\n$ pixi run check\nlint: PASS\n100% tests passed out of 2203\n$ pixi run test -R '^plan\\.'\n100% tests passed out of 619\n$ pixi run release\n100% tests passed out of 2204\n$ pixi run test-data                   # ClickBench, redacted\n100% tests passed out of 6             # data.clickbench.status: 43/43\n$ ANTB1_DIFF_SEED=1 ANTB1_DIFF_COUNT=20000 pixi run diff-random\nDIFF: PASS seed=1 queries=20000 failed=0 unsupported=0\n$ ANTB1_DIFF_SEED=2 ANTB1_DIFF_COUNT=20000 pixi run diff-random\nDIFF: PASS seed=2 queries=20000 failed=0 unsupported=0\n$ ANTB1_DIFF_SEED=20260925 ANTB1_DIFF_COUNT=20000 pixi run diff-random\nDIFF: PASS seed=20260925 queries=20000 failed=0 unsupported=0\n# each diff-random PASS line, and the summary line before it, is identical to main c74bc47's\n# antb1 explain, main c74bc47 vs this branch (stdout, stderr, exit code), local script: 0 differences\n# over 1,202 .slt records, 9,000 generated queries (seeds 1, 2, 20260925) and the 43 ClickBench queries\n```\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer (the ADR 0022 update line is in the approved plan)\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code implemented the\nmaintainer-approved J2a plan after a planning round of read-only\nmapping, design and adversarial critique agents. Two reviewer agents\nthen reviewed it from two angles. The first compared behaviour against\nmain: 216 hand-written queries and generated queries through query and\nexplain, with 0 differences. The second covered the API, the tests and\nJ2b readiness. Neither found a P0-P2 problem. The nits were fixed and\nre-reviewed, and a pre-PR review checked the final commit.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-10-09T01:34:05+03:00",
+          "tree_id": "aaba0493b16b5712f4a0ef80dbd57d8249ab6a15",
+          "url": "https://github.com/ydb-campus/antb1/commit/2701914199339b9b9ea90f374d992bda81da79e2"
+        },
+        "date": 1791499028360,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4954.841978852829,
+            "unit": "ns/iter",
+            "extra": "iterations: 140728\ncpu: 4954.612372804276 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 83780.40423208218,
+            "unit": "ns/iter",
+            "extra": "iterations: 7325\ncpu: 83767.7913993174 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 221698.6620164921,
+            "unit": "ns/iter",
+            "extra": "iterations: 3154\ncpu: 221675.46766011423 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 442463.48956356524,
+            "unit": "ns/iter",
+            "extra": "iterations: 1581\ncpu: 442401.3440860211 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 360152.2261048193,
+            "unit": "ns/iter",
+            "extra": "iterations: 1946\ncpu: 360135.6849948612 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2086602.415430306,
+            "unit": "ns/iter",
+            "extra": "iterations: 337\ncpu: 2086389.8575667674 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 51.40136007692429,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 51.39451469230774 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 45.87859293333357,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 45.87371926666665 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 238.86021766666468,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 238.8469646666665 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.380785938775906,
+            "unit": "ms/iter",
+            "extra": "iterations: 49\ncpu: 14.37776083673468 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 23.86829748275859,
+            "unit": "ms/iter",
+            "extra": "iterations: 29\ncpu: 23.865090689655162 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 40.860113588235315,
+            "unit": "ms/iter",
+            "extra": "iterations: 17\ncpu: 40.85494917647057 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.965813531791883,
+            "unit": "ms/iter",
+            "extra": "iterations: 346\ncpu: 1.9656810895953745 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 129.9511654000014,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 129.92277759999985 ms\nthreads: 1"
           }
         ]
       }
