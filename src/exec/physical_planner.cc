@@ -1,5 +1,6 @@
 #include "antb1/exec/physical_planner.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <format>
 #include <limits>
@@ -134,13 +135,19 @@ struct JoinShape {
 };
 
 // Invalid, never unsupported, for what a correct plan never holds: a missing input, no key, a key
-// whose two columns differ in type (the binder casts them to one type), a DOUBLE or BOOLEAN key.
+// whose two columns differ in type (the binder casts them to one type), a DOUBLE or BOOLEAN key
+// (E1's table takes neither: such an equality is a residual), a missing residual. Checked before
+// any profile line names the join by its EXPLAIN text, which reads every residual.
 arrow::Result<JoinShape> ShapeOf(const plan::JoinNode& join) {
   if (join.left == nullptr || join.right == nullptr) {
     return arrow::Status::Invalid("a join without its inputs");
   }
   if (join.keys.empty()) {
     return arrow::Status::Invalid("a hash join without keys");
+  }
+  if (std::ranges::any_of(join.residual,
+                          [](const plan::ExprPtr& residual) { return residual == nullptr; })) {
+    return arrow::Status::Invalid("a join residual that is missing");
   }
   const bool build_left = join.build == plan::BuildSide::kLeft;
   JoinShape shape{.probe = build_left ? join.right : join.left,

@@ -527,7 +527,7 @@ TEST_F(PhysicalPlannerTest, NonInnerJoinsAreUnsupported) {
 // What a correct plan never holds is Invalid, never unsupported: a join without its inputs or
 // keys, a key of two types, a DOUBLE or BOOLEAN key, a key outside its input on either side, a
 // residual that is missing, not BOOLEAN or outside the join; in a part pipeline and over a serial
-// probe input alike.
+// probe input alike, with and without a profile (whose lines name the join by its EXPLAIN text).
 TEST_F(PhysicalPlannerTest, MalformedJoinsAreInvalidNotUnsupported) {
   const auto table = Table(/*split=*/true);
   const auto scan = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}});
@@ -553,9 +553,14 @@ TEST_F(PhysicalPlannerTest, MalformedJoinsAreInvalidNotUnsupported) {
         plan::JoinKey{.left = std::move(left), .right = std::move(right)}};
   };
   const auto expect_invalid = [&](const plan::LogicalNodePtr& root, std::string_view what) {
-    const auto status = BuildPhysicalPlan(PlanOf(root, 4)).status();
-    EXPECT_TRUE(status.IsInvalid()) << what << ": " << status.ToString();
-    EXPECT_EQ(plan::GetSqlError(status), nullptr) << what << ": a malformed plan is a bug";
+    for (const bool profiled : {false, true}) {
+      ProfileNode profile;
+      const auto status =
+          BuildPhysicalPlan(PlanOf(root, 4), profiled ? &profile : nullptr).status();
+      EXPECT_TRUE(status.IsInvalid())
+          << what << (profiled ? ", profiled" : "") << ": " << status.ToString();
+      EXPECT_EQ(plan::GetSqlError(status), nullptr) << what << ": a malformed plan is a bug";
+    }
   };
   expect_invalid(Node(plan::JoinNode{}), "no inputs");
   for (const plan::LogicalNodePtr& probe : {scan, sorted}) {

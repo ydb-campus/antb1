@@ -20,7 +20,8 @@ namespace antb1::exec {
 // pipeline). A join of another kind is unsupported (exit code 4: a kUnsupported SqlErrorDetail at
 // the join's span). Invalid for a malformed plan (a node without its input or table; a join
 // without keys, with a key of two types, of DOUBLE or BOOLEAN, or outside its input; a residual
-// that is not BOOLEAN or reads outside the join; a root whose width differs from plan.output).
+// that is missing, not BOOLEAN or reads outside the join; a root whose width differs from
+// plan.output), with a profile or without.
 // With a `profile` node, the plan is profiled into it (profile.h): one node per physical operator,
 // each input a child, a part pipeline profiled once per part into the same nodes, a join's build
 // under the operator that prepares it.
