@@ -2485,6 +2485,33 @@ TEST_F(HashJoinTest, AntiAndLeftResidualsSkipRowsWithoutCandidates) {
   }
 }
 
+// An anti join whose build input is empty keeps every row without ever meeting its residuals: it
+// keeps all (Keep::kAll), so it looks no key up and sizes no matches, and the residual v * v > 0,
+// which would overflow on the row of key 1 (v 2^62), never runs. Evaluating it there would read the
+// matches the probe never sized.
+TEST_F(HashJoinTest, AntiResidualsNeverRunOverAnEmptyBuildInput) {
+  constexpr int64_t kTwoTo62 = 4611686018427387904;
+  const auto probe_schema = Int64Schema({"k", "v"});
+  const auto build_schema = Int64Schema({"bk"});
+  const plan::ExprPtr square =
+      Condition(plan::CompareOp::kGt, 0,
+                Times(ColumnAt(1, LogicalType::kBigInt), ColumnAt(1, LogicalType::kBigInt)));
+  const Rows kept = {{"1", std::to_string(kTwoTo62)}, {"2", "1"}};
+  for (const int64_t batch_size : {1, 64}) {
+    SCOPED_TRACE("batch size " + std::to_string(batch_size));
+    auto join = MakeJoin(
+        SourceOf(probe_schema, {Int64s({1, 2}), Int64s({kTwoTo62, 1})}),
+        DrainedBuild(plan::JoinKind::kAnti,
+                     std::make_unique<ScriptedSource>(build_schema, std::vector<Batch>{}), {0}),
+        {0}, /*prepares=*/true, BuildSide::kRight, {square});
+    ASSERT_NE(join, nullptr);
+    ExecContext ctx = ContextOf(nullptr, batch_size);
+    auto result = Drain(*join, ctx);
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    EXPECT_EQ(RowsOf(**result), kept);
+  }
+}
+
 // A left join pads with NULLs of the build's types, of every type: SMALLINT, INTEGER, BIGINT,
 // USMALLINT, HUGEINT, DECIMAL(5,3), DOUBLE, VARCHAR, DATE, TIMESTAMP and BOOLEAN, in nullable
 // fields (also where the build's field is not); on the 1:1 path, the other one (a repeated key),
