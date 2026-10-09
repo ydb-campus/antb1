@@ -277,6 +277,16 @@ bool Within(IntegerRange inner, IntegerRange outer) {
   return inner.min >= outer.min && inner.max <= outer.max;
 }
 
+// The digits of an integer type's largest magnitude: 5 (SMALLINT, USMALLINT), 10, 19 or 38.
+int IntegerDigits(LogicalType type) {
+  const IntegerRange range = RangeOf(type);
+  int digits = 0;
+  for (Int128 magnitude = std::max(range.max, -range.min); magnitude > 0; magnitude /= 10) {
+    ++digits;
+  }
+  return digits;
+}
+
 }  // namespace
 
 bool IsExactWidening(LogicalType from, LogicalType to) {
@@ -289,13 +299,12 @@ bool IsExactWidening(LogicalType from, LogicalType to) {
   if (to != LogicalType::kDecimal) {
     return false;
   }
-  // The integer part of `to`: its values without the scale's digits.
-  const LogicalType whole = LogicalType::Decimal(Narrow<std::uint8_t>(to.width() - to.scale()), 0);
+  const int integer_digits = to.width() - to.scale();
   if (IsInteger(from)) {
-    return Within(RangeOf(from), RangeOf(whole));
+    return IntegerDigits(from) <= integer_digits;
   }
   return from == LogicalType::kDecimal && from.scale() <= to.scale() &&
-         from.width() - from.scale() <= whole.width();
+         from.width() - from.scale() <= integer_digits;
 }
 
 bool SameExpr(const Expr& a, const Expr& b) {
