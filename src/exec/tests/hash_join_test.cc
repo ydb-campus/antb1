@@ -2807,13 +2807,13 @@ TEST_F(HashJoinTest, PairsCopyNoColumnTheResidualsDoNotRead) {
   }
 }
 
-// The vectors and batches of candidate pairs count against the limit, and a probe gives every
-// byte back at its input's end, before its Close, its build's too (it prepared it): semi, anti
-// and left joins with the residual w < v over a build of 1,000 rows of key 1 (w 0 to 999), whose
-// 64 probe rows (v 0 to 63) meet 1,000 candidates each, in batches of 64 pairs within a limit of
-// 128 KiB. At a batch size of 65,536 one batch holds all 64,000 pairs, whose probe rows alone take
-// 256,000 bytes: the probe fails with OutOfMemory once its build is prepared (it opened its input),
-// and holds nothing after its Close.
+// The vectors of candidate pairs count against the limit, and a probe gives every byte back at
+// its input's end, before its Close, its build's too (it prepared it): semi, anti and left joins
+// with the residual w < v over a build of 1,000 rows of key 1 (w 0 to 999), whose 64 probe rows
+// (v 0 to 63) meet 1,000 candidates each, in batches of 64 pairs within a limit of 128 KiB. At a
+// batch size of 65,536 one batch holds all 64,000 pairs, whose probe rows alone take 256,000
+// bytes: reserving them fails with OutOfMemory once the build is prepared (the probe opened its
+// input), before any pair batch is made, and the probe holds nothing after its Close.
 TEST_F(HashJoinTest, CandidatePairsCountAgainstTheLimit) {
   constexpr int64_t kLimit = int64_t{128} * 1024;
   const auto build_schema = Int64Schema({"bk", "w"});
