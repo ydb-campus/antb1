@@ -482,7 +482,7 @@ void CheckStatement(const SelectStatement& stmt, const std::string& sql) {
       ASSERT_EQ(item.span.offset, table->span.offset);
       ASSERT_TRUE(item.columns.empty()) << context;
     } else {
-      const DerivedTable& derived = std::get<DerivedTable>(item.source);
+      const auto& derived = std::get<DerivedTable>(item.source);
       ASSERT_TRUE(SpanInside(derived.span, sql));
       ASSERT_EQ(item.span.offset, derived.span.offset);
       ASSERT_TRUE(Parenthesized(sql, derived.span)) << context;

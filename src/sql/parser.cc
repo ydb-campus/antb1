@@ -715,8 +715,8 @@ class Parser {
     if (PrefixedStringAt() != PrefixedString::kNone) {
       return Unsupported(token.span, kStringName);
     }
-    const bool string = token.kind == TokenKind::kString;
-    if (!string && !IsTableAlias(token, /*after_as=*/false)) {
+    const bool is_string = token.kind == TokenKind::kString;
+    if (!is_string && !IsTableAlias(token, /*after_as=*/false)) {
       if (const NotAnAlias* word = FindNotAnAlias(token)) {
         return Syntax(token.span, "a CTE name cannot be the keyword " + std::string(word->keyword) +
                                       "; write it as a quoted identifier");
@@ -727,7 +727,7 @@ class Parser {
       return Syntax(token.span,
                     "duplicate CTE name in the WITH list (names match case-insensitively)");
     }
-    if (string) {
+    if (is_string) {
       return Unsupported(token.span, kStringName);
     }
     Token name = Take();

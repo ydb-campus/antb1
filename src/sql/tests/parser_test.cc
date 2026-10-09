@@ -445,12 +445,11 @@ TEST(ParserTest, JoinsStayAFlatList) {
   EXPECT_EQ(Depth(*stmt), 2U) << "the ON conjuncts count";
 }
 
-// The query of a derived table or of a CTE: the test expects the item or the CTE to have one.
-const SelectStatement& QueryOf(const FromItem& item) {
-  static const SelectStatement kNone;
+// The query of a FROM item that the test expects to be a derived table.
+SelectStatement QueryOf(const FromItem& item) {
   const auto* derived = std::get_if<DerivedTable>(&item.source);
   EXPECT_NE(derived, nullptr) << "not a derived table";
-  return derived != nullptr ? *derived->query : kNone;
+  return derived != nullptr ? *derived->query : SelectStatement{};
 }
 
 // A derived table is a FROM item like a table: with or without an alias (after AS also a string),
@@ -521,9 +520,8 @@ TEST(ParserTest, DerivedTables) {
 // queries may hold WITH lists of their own. The statement's span starts at WITH.
 TEST(ParserTest, WithLists) {
   constexpr std::string_view kSql =
-      "/* c */ with a AS (SELECT x FROM t), \"B c\"(y, \"Z\") AS (WITH d AS (SELECT 1 FROM u) "
-      "SELECT "
-      "y FROM d), over AS (SELECT * FROM a) SELECT x FROM a;";
+      R"(/* c */ with a AS (SELECT x FROM t), "B c"(y, "Z") AS (WITH d AS (SELECT 1 FROM u) )"
+      R"(SELECT y FROM d), over AS (SELECT * FROM a) SELECT x FROM a;)";
   auto stmt = Parse(kSql);
   ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
   EXPECT_EQ(At(kSql, stmt->with_span), "with");
@@ -565,7 +563,7 @@ TEST(ParserTest, WithLists) {
 // be of any length.
 TEST(ParserTest, ColumnAliasLists) {
   auto derived =
-      Parse("SELECT 1 FROM (SELECT a FROM t) s(over, Between, \"select\", \"a\"\"b\", date, x_1)");
+      Parse(R"(SELECT 1 FROM (SELECT a FROM t) s(over, Between, "select", "a""b", date, x_1))");
   ASSERT_TRUE(derived.has_value()) << derived.error().message;
   EXPECT_EQ(derived->from.at(0).columns,
             (std::vector<std::string>{"over", "Between", "select", "a\"b", "date", "x_1"}));
@@ -593,7 +591,7 @@ TEST(ParserTest, DuplicateCteNames) {
       "duplicate CTE name in the WITH list (names match case-insensitively)";
   for (const std::string_view sql : {
            "WITH c AS (SELECT a FROM t), ^C AS (SELECT a FROM t) SELECT a FROM c"sv,
-           "WITH \"C\" AS (SELECT a FROM t), ^\"c\" AS (SELECT a FROM t) SELECT a FROM c"sv,
+           R"(WITH "C" AS (SELECT a FROM t), ^"c" AS (SELECT a FROM t) SELECT a FROM c)"sv,
            "WITH c AS (SELECT a FROM t), ^'c' AS (SELECT a FROM t) SELECT a FROM c"sv,
            "WITH c AS (SELECT a FROM t), d AS (SELECT a FROM t), ^c AS (SELECT a FROM t) SELECT "
            "a FROM c"sv,
@@ -1532,8 +1530,11 @@ TEST(ParserTest, NestedQueriesCountTowardTheDepthLimit) {
   const auto mixed = [](std::size_t n) {
     std::string sql = "SELECT a FROM t";
     for (std::size_t i = 1; i <= n; ++i) {
-      sql = i % 2 == 1 ? "SELECT * FROM (" + sql + ") AS d"
-                       : "WITH c AS (" + sql + ") SELECT a FROM c";
+      if (i % 2 == 1) {
+        sql = std::format("SELECT * FROM ({}) AS d", sql);
+      } else {
+        sql = std::format("WITH c AS ({}) SELECT a FROM c", sql);
+      }
     }
     return sql;
   };
@@ -3333,11 +3334,11 @@ TEST(ParserTest, WordsThatCannotBeImplicitAliases) {
     EXPECT_EQ(ErrorOf("SELECT a FROM t AS a " + w), syntax_at(21));
     // After a derived table, its alias or its column alias list, never one either; in a column
     // alias list and as a CTE's name neither (as in DuckDB).
-    const std::string derived = "SELECT a FROM (SELECT a FROM t)";
-    EXPECT_EQ(ErrorOf(derived + " " + w), syntax_at(32));
-    EXPECT_EQ(ErrorOf(derived + " AS " + w + " WHERE a = 1"), syntax_at(35));
-    EXPECT_EQ(ErrorOf(derived + " s(x) " + w), syntax_at(37));
-    EXPECT_EQ(ErrorOf(derived + " s(x, " + w + ")"), syntax_at(37));
+    constexpr std::string_view kDerived = "SELECT a FROM (SELECT a FROM t)";
+    EXPECT_EQ(ErrorOf(std::format("{} {}", kDerived, w)), syntax_at(32));
+    EXPECT_EQ(ErrorOf(std::format("{} AS {} WHERE a = 1", kDerived, w)), syntax_at(35));
+    EXPECT_EQ(ErrorOf(std::format("{} s(x) {}", kDerived, w)), syntax_at(37));
+    EXPECT_EQ(ErrorOf(std::format("{} s(x, {})", kDerived, w)), syntax_at(37));
     EXPECT_EQ(ErrorOf("WITH " + w + " AS (SELECT a FROM t) SELECT a FROM t"), syntax_at(5));
     EXPECT_EQ(ErrorOf("WITH c(" + w + ") AS (SELECT a FROM t) SELECT a FROM t"), syntax_at(7));
     // Where DuckDB gives the word a meaning: kUnsupported, after a derived table too, but for time
@@ -3352,9 +3353,10 @@ TEST(ParserTest, WordsThatCannotBeImplicitAliases) {
       EXPECT_EQ(ErrorOf("SELECT a FROM t AS a" + after), unsupported_at(21)) << continuation;
       EXPECT_EQ(ErrorOf("SELECT a FROM t \"a b\"" + after), unsupported_at(22)) << continuation;
       const bool tables_only = w == "at";
-      EXPECT_EQ(ErrorOf(derived + after), tables_only ? syntax_at(32) : unsupported_at(32))
+      EXPECT_EQ(ErrorOf(std::format("{}{}", kDerived, after)),
+                tables_only ? syntax_at(32) : unsupported_at(32))
           << continuation;
-      EXPECT_EQ(ErrorOf(derived + " AS s(x)" + after),
+      EXPECT_EQ(ErrorOf(std::format("{} AS s(x){}", kDerived, after)),
                 tables_only ? syntax_at(40) : unsupported_at(40))
           << continuation;
     }
@@ -3368,13 +3370,13 @@ TEST(ParserTest, WordsThatCannotBeImplicitAliases) {
     // Quoted, it is an alias like any name, and a column alias and a CTE name too.
     for (const std::string& quoted :
          {"SELECT a FROM t \"" + w + "\"", "SELECT a FROM t AS \"" + w + "\"",
-          derived + " \"" + w + "\"(\"" + w + "\")"}) {
+          std::format(R"({0} "{1}"("{1}"))", kDerived, w)}) {
       auto stmt = Parse(quoted);
       ASSERT_TRUE(stmt.has_value()) << quoted << ": " << stmt.error().message;
       EXPECT_EQ(stmt->from.at(0).alias, std::optional<std::string>(w));
     }
     const std::string quoted_cte =
-        "WITH \"" + w + "\"(\"" + w + "\") AS (SELECT a FROM t) SELECT a FROM t";
+        std::format(R"(WITH "{0}"("{0}") AS (SELECT a FROM t) SELECT a FROM t)", w);
     auto cte = Parse(quoted_cte);
     ASSERT_TRUE(cte.has_value()) << quoted_cte << ": " << cte.error().message;
     EXPECT_EQ(cte->with.at(0).name, w);
@@ -3488,7 +3490,8 @@ TEST(ParserRobustnessTest, MegabyteOfNestedBlocks) {
   ASSERT_FALSE(calls.has_value());
   EXPECT_TRUE(calls.error().message.starts_with("expressions deeper than 256 levels"))
       << calls.error().message;
-  EXPECT_EQ(calls.error().span, (SourceSpan{.offset = blocks.size() + (56 * 2), .length = 1}));
+  EXPECT_EQ(calls.error().span,
+            (SourceSpan{.offset = blocks.size() + (std::size_t{56} * 2), .length = 1}));
 }
 
 // The deepest statement of each family of nested queries survives every walk of the AST: copy,
@@ -3500,8 +3503,11 @@ TEST(ParserRobustnessTest, DeepestBlocksSurviveEveryWalk) {
       Repeat("WITH c AS (", 255) + "SELECT a FROM t" + Repeat(") SELECT a FROM c", 255);
   std::string mixed = "SELECT a FROM t";
   for (std::size_t i = 1; i <= 255; ++i) {
-    mixed = i % 2 == 1 ? "SELECT * FROM (" + mixed + ") AS \"d\"(x)"
-                       : "WITH c(x) AS (" + mixed + ") SELECT x FROM c";
+    if (i % 2 == 1) {
+      mixed = std::format(R"(SELECT * FROM ({}) AS "d"(x))", mixed);
+    } else {
+      mixed = std::format("WITH c(x) AS ({}) SELECT x FROM c", mixed);
+    }
   }
   const std::string calls = "SELECT * FROM " + Repeat("(SELECT * FROM ", 127) + "(SELECT " +
                             Repeat("f(", 127) + "a" + std::string(127, ')') + " FROM t)" +
@@ -3545,7 +3551,7 @@ TEST(ParserRobustnessTest, LongWithListsAndColumnLists) {
   for (int i = 1; i < 50000; ++i) {
     columns += ", x" + std::to_string(i);
   }
-  columns += ")";
+  columns += ')';
   for (const std::string& sql : {with, columns}) {
     auto stmt = Parse(sql);
     ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
