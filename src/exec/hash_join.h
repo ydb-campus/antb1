@@ -197,14 +197,15 @@ class BuildsFirstOperator final : public Operator {
 //     row, the probe's columns taken (Take) and the build's gathered; no selection.
 // - Residuals of semi, anti and left joins (BOOLEAN expressions over the probe's columns, then the
 //   build's): they decide which candidates (the build rows of a probe row's key) are matches. The
-//   candidate pairs go through them in chunks of at most batch_size pairs, with EvaluateExpr: each
-//   residual in order, on the pairs the ones before it passed (NULL is false). Every pair is
-//   evaluated, with no early stop once a row has a match, so whether an error comes does not depend
-//   on batch_size. A row without candidates never meets a residual: anti keeps it, left pads it.
-//   Semi and anti evaluate a probe batch's pairs before its first window, and a row matched when
-//   one of its pairs passed every residual. Left evaluates each batch of slots before it emits it:
-//   the pairs that pass, and one padded row right after the last candidate of a row none of whose
-//   candidates passed (whether one passed carries over to the next batch of slots).
+//   candidate pairs go through them in chunks of at most batch_size pairs, with EvaluateExpr, each
+//   chunk with only the columns the residuals read: each residual in order, on the pairs the ones
+//   before it passed (NULL is false). Every pair is evaluated, with no early stop once a row has a
+//   match, so whether an error comes does not depend on batch_size. A row without candidates never
+//   meets a residual: anti keeps it, left pads it. Semi and anti evaluate a probe batch's pairs
+//   before its first window, and a row matched when one of its pairs passed every residual. Left
+//   evaluates each batch of slots before it emits it: the pairs that pass, and one padded row right
+//   after the last candidate of a row none of whose candidates passed (whether one passed carries
+//   over to the next batch of slots).
 // - One-row (a keyless build of one row, on the right). Output: the probe's columns, then the
 //   build row's values (nullable); each window of a probe batch is a slice of it with its
 //   selection, the values sliced from the build's OneRowValues, so a window has at most their
@@ -221,9 +222,9 @@ class BuildsFirstOperator final : public Operator {
 // Memory: its own vectors are charged to ExecContext::budget, its Arrow buffers come from
 // ExecContext::pool. Profile: the metrics find (whenever it looks keys up), gather (the rows'
 // columns: the build columns an inner or left join gathers, the probe rows it takes on a path
-// other than 1:1, and the columns of candidate pairs; the slices of a one-row join's values),
-// residual and, on the 1:1 path of an inner or left join, window_rows (the rows of the windows its
-// build columns were gathered for, against the rows it emits).
+// other than 1:1, and the columns of candidate pairs that residuals read; the slices of a one-row
+// join's values), residual and, on the 1:1 path of an inner or left join, window_rows (the rows of
+// the windows its build columns were gathered for, against the rows it emits).
 class HashJoinOperator final : public Operator {
  public:
   // The kind is the build's. Invalid without a probe or a build; for a kind other than inner
@@ -293,9 +294,13 @@ class HashJoinOperator final : public Operator {
   // padded row: its build row's chunk is kNoChunk); for a left join with residuals, last_ marks
   // the slot of each row's last candidate. Their number: 0 at the batch's end.
   arrow::Result<int64_t> NextSlots();
-  // The pairs among slots [0, count) that pass every residual (pair_schema_'s batches): their
-  // number, and their slots, in order, at the front of pair_slots_.
+  // The pairs among slots [0, count) that pass every residual: their number, and their slots, in
+  // order, at the front of pair_slots_. The residuals read batches of pairs (PairBatch), each
+  // narrowed to the pairs that passed the ones before.
   arrow::Result<int64_t> PassingSlots(int64_t count);
+  // The batch (pair_schema_) of the pairs pair_rows_ and pair_builds_ [0, pairs): the probe's
+  // columns that the residuals read, taken, then the build's, gathered.
+  arrow::Result<std::shared_ptr<arrow::RecordBatch>> PairBatch(int64_t pairs);
   // A semi or anti join with residuals: passed_ of the current probe batch, from all its pairs.
   arrow::Status EvaluatePairs();
   // A left join with residuals: slots [0, count) without the pairs that failed, but for the last
@@ -305,11 +310,9 @@ class HashJoinOperator final : public Operator {
   int64_t KeepPassingOrPadded(int64_t count, int64_t passing, bool continues);
   // The probe batch's columns of rows `rows` (a Take).
   arrow::Result<arrow::ArrayVector> TakeProbe(std::span<const std::uint32_t> rows);
-  // The build's columns of build_rows_[0, rows), or of `refs`.
+  // The build's columns of build_rows_[0, rows).
   template <bool kWithNulls>
   arrow::Result<arrow::ArrayVector> GatherBuild(int64_t rows);
-  template <bool kWithNulls>
-  arrow::Result<arrow::ArrayVector> GatherBuild(std::span<const JoinRowRef> refs);
   // The output batch of these probe and build columns.
   std::shared_ptr<arrow::RecordBatch> Assemble(const arrow::ArrayVector& probe,
                                                const arrow::ArrayVector& build, int64_t rows) const;
@@ -327,9 +330,13 @@ class HashJoinOperator final : public Operator {
   bool prepares_;
   std::shared_ptr<arrow::Schema> schema_;
   plan::JoinKind kind_;  // the build's
-  // A semi, anti or left join with residuals: the columns of a batch of candidate pairs, the
-  // probe's, the build's, then each pair's slot (UINT32); nullptr otherwise.
+  // A semi, anti or left join with residuals: the columns they read, the probe's, then the build's,
+  // each in order, are the columns of a batch of candidate pairs (pair_schema_), which
+  // pair_residual_ (residual_ over those columns) reads. Empty, and nullptr, otherwise.
+  std::vector<int> pair_probe_;  // columns of the probe's output
+  std::vector<int> pair_build_;  // columns of the build's schema
   std::shared_ptr<arrow::Schema> pair_schema_;
+  std::vector<plan::ExprPtr> pair_residual_;
 
   ExecContext ctx_;  // a copy: the context of the first Next of a probe that prepares its build
   int64_t batch_size_ = 1;

@@ -72,14 +72,6 @@ std::shared_ptr<arrow::Schema> JoinSchema(const arrow::Schema& probe, const arro
   return arrow::schema(std::move(fields));
 }
 
-// The columns of a batch of candidate pairs of a join that builds on the right: the probe's, the
-// build's (the left input's, then the right one's, as residuals read them), then each pair's slot.
-std::shared_ptr<arrow::Schema> PairSchema(const arrow::Schema& probe, const arrow::Schema& build) {
-  arrow::FieldVector fields = JoinSchema(probe, build, plan::BuildSide::kRight)->fields();
-  fields.push_back(arrow::field("slot", arrow::uint32(), /*nullable=*/false));
-  return arrow::schema(std::move(fields));
-}
-
 // A candidate (an index of JoinTable::rows()) that names no build row: a left join's padded row.
 constexpr std::uint32_t kPadded = std::numeric_limits<std::uint32_t>::max();
 
@@ -449,10 +441,39 @@ HashJoinOperator::HashJoinOperator(std::unique_ptr<Operator> probe,
       residual_(std::move(residual)),
       prepares_(prepares),
       schema_(std::move(schema)),
-      kind_(build_->kind()),
-      pair_schema_(kind_ != plan::JoinKind::kInner && !residual_.empty()
-                       ? PairSchema(*input_->output_schema(), *build_->spec()->schema())
-                       : nullptr) {}
+      kind_(build_->kind()) {
+  if (kind_ == plan::JoinKind::kInner || residual_.empty()) {
+    return;
+  }
+  // The columns the residuals read, of the probe's columns, then the build's (Make checked them),
+  // in order: a column's place among them is its index in a batch of candidate pairs.
+  std::vector<int> read;
+  for (const plan::ExprPtr& expr : residual_) {
+    plan::CollectColumns(*expr, read);
+  }
+  std::ranges::sort(read);
+  read.erase(std::ranges::unique(read).begin(), read.end());
+  const arrow::Schema& probe_schema = *input_->output_schema();
+  const arrow::Schema& build_schema = *build_->spec()->schema();
+  arrow::FieldVector fields;
+  for (const int column : read) {
+    if (column < probe_schema.num_fields()) {
+      pair_probe_.push_back(column);
+      fields.push_back(probe_schema.field(column));
+    } else {
+      const int build_column = column - probe_schema.num_fields();
+      pair_build_.push_back(build_column);
+      fields.push_back(build_schema.field(build_column)->WithNullable(true));
+    }
+  }
+  pair_schema_ = arrow::schema(std::move(fields));
+  for (const plan::ExprPtr& expr : residual_) {
+    pair_residual_.push_back(plan::MapColumns(expr, [&read](const plan::ColumnExpr& column) {
+      const auto at = std::ranges::lower_bound(read, column.index) - read.begin();
+      return plan::ColumnExpr{.index = Narrow<int>(at), .id = column.id};
+    }));
+  }
+}
 
 HashJoinOperator::~HashJoinOperator() = default;
 
@@ -845,41 +866,66 @@ arrow::Result<int64_t> HashJoinOperator::PassingSlots(int64_t count) {
   if (pairs == 0) {
     return 0;
   }
-  ARROW_ASSIGN_OR_RAISE(arrow::ArrayVector columns,
-                        TakeProbe(std::span<const std::uint32_t>(pair_rows_.data(), pairs)));
-  ARROW_ASSIGN_OR_RAISE(
-      const arrow::ArrayVector build,
-      GatherBuild<false>(std::span<const JoinRowRef>(pair_builds_.data(), pairs)));
-  columns.insert(columns.end(), build.begin(), build.end());
-  const auto length = static_cast<int64_t>(pairs);
-  columns.push_back(
-      std::make_shared<arrow::UInt32Array>(length, arrow::Buffer::Wrap(pair_slots_.data(), pairs)));
-  std::shared_ptr<arrow::RecordBatch> batch =
-      arrow::RecordBatch::Make(pair_schema_, length, std::move(columns));
+  auto live = static_cast<int64_t>(pairs);  // pair_slots_[0, live): the slots of batch's rows
+  ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::RecordBatch> batch, PairBatch(live));
   const ProfileTimer residual(profile(), "residual");
   arrow::compute::ExecContext kernels(ctx_.pool);
-  for (const plan::ExprPtr& expr : residual_) {
+  for (std::size_t r = 0; r < pair_residual_.size(); ++r) {
     // Only the pairs the residuals before passed: a later one never fails on a dropped pair.
     ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Array> values,
-                          EvaluateExpr(*expr, *batch, ctx_.pool));
-    const int64_t passing = static_cast<const arrow::BooleanArray&>(*values).true_count();
+                          EvaluateExpr(*pair_residual_[r], *batch, ctx_.pool));
+    const auto& passed = static_cast<const arrow::BooleanArray&>(*values);
+    const int64_t passing = passed.true_count();  // NULL is false
     if (passing == 0) {
       return 0;
     }
-    if (passing < batch->num_rows()) {  // the filter drops NULL as it drops false
+    if (passing == live) {
+      continue;
+    }
+    int64_t kept = 0;
+    for (int64_t i = 0; i < live; ++i) {
+      if (passed.IsValid(i) && passed.Value(i)) {
+        pair_slots_[static_cast<std::size_t>(kept)] = pair_slots_[static_cast<std::size_t>(i)];
+        ++kept;
+      }
+    }
+    live = kept;
+    if (r + 1 < pair_residual_.size()) {  // the next residual's pairs (Filter drops NULL too)
       ARROW_ASSIGN_OR_RAISE(
-          const arrow::Datum kept,
+          const arrow::Datum next,
           arrow::compute::Filter(batch, values, arrow::compute::FilterOptions::Defaults(),
                                  &kernels));
-      batch = kept.record_batch();
+      batch = next.record_batch();
     }
   }
-  const auto& slots =
-      static_cast<const arrow::UInt32Array&>(*batch->column(batch->num_columns() - 1));
-  if (slots.length() < length) {  // a copy: pair_slots_ itself when every pair passed
-    std::copy_n(slots.raw_values(), slots.length(), pair_slots_.begin());
+  return live;
+}
+
+arrow::Result<std::shared_ptr<arrow::RecordBatch>> HashJoinOperator::PairBatch(int64_t pairs) {
+  const ProfileTimer gather(profile(), "gather");
+  const auto size = static_cast<std::size_t>(pairs);
+  arrow::ArrayVector columns;
+  columns.reserve(pair_probe_.size() + pair_build_.size());
+  const auto rows =
+      std::make_shared<arrow::UInt32Array>(pairs, arrow::Buffer::Wrap(pair_rows_.data(), size));
+  arrow::compute::ExecContext kernels(ctx_.pool);
+  for (const int c : pair_probe_) {
+    ARROW_ASSIGN_OR_RAISE(
+        const arrow::Datum taken,
+        arrow::compute::Take(batch_.data->column(c), rows,
+                             arrow::compute::TakeOptions::NoBoundsCheck(), &kernels));
+    columns.push_back(taken.make_array());
   }
-  return slots.length();
+  const arrow::Schema& schema = *table_->spec().schema();
+  const std::span<const JoinRowRef> refs(pair_builds_.data(), size);
+  for (const int c : pair_build_) {
+    ARROW_ASSIGN_OR_RAISE(std::unique_ptr<arrow::ArrayBuilder> builder,
+                          arrow::MakeBuilder(schema.field(c)->type(), ctx_.pool));
+    ARROW_RETURN_NOT_OK((GatherRows<false, JoinRowRef>(table_->chunks(), c, refs, *builder)));
+    ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Array> column, builder->Finish());
+    columns.push_back(std::move(column));
+  }
+  return arrow::RecordBatch::Make(pair_schema_, pairs, std::move(columns));
 }
 
 arrow::Status HashJoinOperator::EvaluatePairs() {
@@ -1008,14 +1054,9 @@ arrow::Result<std::optional<Batch>> HashJoinOperator::NextPairs() {
 
 template <bool kWithNulls>
 arrow::Result<arrow::ArrayVector> HashJoinOperator::GatherBuild(int64_t rows) {
-  return GatherBuild<kWithNulls>(
-      std::span<const JoinRowRef>(build_rows_.data(), static_cast<std::size_t>(rows)));
-}
-
-template <bool kWithNulls>
-arrow::Result<arrow::ArrayVector> HashJoinOperator::GatherBuild(std::span<const JoinRowRef> refs) {
   const ProfileTimer gather(profile(), "gather");
   const arrow::Schema& schema = *table_->spec().schema();
+  const std::span<const JoinRowRef> refs(build_rows_.data(), static_cast<std::size_t>(rows));
   arrow::ArrayVector columns;
   columns.reserve(static_cast<std::size_t>(schema.num_fields()));
   for (int c = 0; c < schema.num_fields(); ++c) {

@@ -459,6 +459,13 @@ plan::ExprPtr ConstantOf(int64_t value) {
       .node = plan::ConstantExpr{.value = testing::BigInt(value)}, .type = LogicalType::kBigInt});
 }
 
+plan::ExprPtr TextOf(std::string value) {
+  return std::make_shared<const plan::Expr>(
+      plan::Expr{.node = plan::ConstantExpr{.value = plan::Constant{.type = LogicalType::kVarchar,
+                                                                    .value = std::move(value)}},
+                 .type = LogicalType::kVarchar});
+}
+
 plan::ExprPtr Times(plan::ExprPtr left, plan::ExprPtr right) {
   return std::make_shared<const plan::Expr>(plan::Expr{
       .node =
@@ -2662,6 +2669,120 @@ TEST_F(HashJoinTest, LeftJoinResidualsPadAfterTheLastCandidate) {
       ASSERT_TRUE(batches.ok()) << batches.status().ToString();
       EXPECT_EQ(RowsOf(join->output_schema(), *batches), expected);
     }
+  }
+}
+
+// A batch of candidate pairs holds only the columns the residuals read, whichever they are, and
+// the joins give the nested-loop reference: residuals that read no column (1 > 0, which every
+// pair passes, and 1 < 0, which none does), only the build's VARCHAR (bs <> 'x'), only a probe
+// column (pv > 2), or columns of both sides, the later ones first (bs = pt, then bw > pv). Semi,
+// anti and left joins, and an inner one as the control; batch sizes 1, 2 and 64.
+TEST_F(HashJoinTest, PairsHoldOnlyTheColumnsTheirResidualsRead) {
+  const std::optional<int64_t> null;
+  const auto probe_schema =
+      arrow::schema({arrow::field("pk", arrow::int64()), arrow::field("pv", arrow::int64()),
+                     arrow::field("pt", arrow::binary())});
+  const auto build_schema =
+      arrow::schema({arrow::field("bk", arrow::int64()), arrow::field("bw", arrow::int64()),
+                     arrow::field("bs", arrow::binary())});
+  const arrow::ArrayVector probe = {Int64s({1, 1, 2, 3, null, 1}), Int64s({5, 0, 7, 1, 2, 3}),
+                                    Strings({"a", "b", "c", "a", "d", std::nullopt})};
+  const auto build_table = std::make_shared<MemoryTable>(
+      build_schema,
+      arrow::RecordBatchVector{
+          BatchOf(build_schema, {Int64s({1, 1, 2}), Int64s({4, 6, 7}), Strings({"a", "b", "x"})}),
+          BatchOf(build_schema, {Int64s({1, 2}), Int64s({1, null}), Strings({std::nullopt, "c"})})},
+      /*split=*/true);
+  const Rows probe_rows = RowsOf(BatchOf(probe_schema, probe));
+  const Rows build_rows = RowsOf(*build_table);
+  // Over a pair: the probe's pk, pv and pt, then the build's bk, bw and bs.
+  const auto bigint = [](int index) { return ColumnAt(index, LogicalType::kBigInt); };
+  const auto varchar = [](int index) { return ColumnAt(index, LogicalType::kVarchar); };
+  using Cells = std::vector<std::string>;
+  const std::vector<std::tuple<std::string, std::vector<plan::ExprPtr>, Residual>> cases = {
+      {"1 > 0",
+       {Condition(plan::CompareOp::kGt, 0, ConstantOf(1))},
+       [](const Cells& /*p*/, const Cells& /*b*/) -> std::optional<bool> { return true; }},
+      {"1 < 0",
+       {Condition(plan::CompareOp::kLt, 0, ConstantOf(1))},
+       [](const Cells& /*p*/, const Cells& /*b*/) -> std::optional<bool> { return false; }},
+      {"bs <> 'x'",
+       {Comparison(plan::CompareOp::kNe, varchar(5), TextOf("x"), LogicalType::kVarchar)},
+       [](const Cells& /*p*/, const Cells& b) -> std::optional<bool> {
+         if (b[2] == "null") {
+           return std::nullopt;
+         }
+         return b[2] != "'x'";
+       }},
+      {"pv > 2",
+       {Condition(plan::CompareOp::kGt, 2, bigint(1))},
+       [](const Cells& p, const Cells& /*b*/) -> std::optional<bool> {
+         return std::stoll(p[1]) > 2;
+       }},
+      {"bs = pt, then bw > pv",
+       {Comparison(plan::CompareOp::kEq, varchar(5), varchar(2), LogicalType::kVarchar),
+        Comparison(plan::CompareOp::kGt, bigint(4), bigint(1))},
+       [](const Cells& p, const Cells& b) -> std::optional<bool> {
+         if (p[2] == "null" || b[2] == "null" || b[1] == "null") {
+           return std::nullopt;
+         }
+         return p[2] == b[2] && std::stoll(b[1]) > std::stoll(p[1]);
+       }}};
+  for (const auto& [name, residual, holds] : cases) {
+    for (const plan::JoinKind kind : {plan::JoinKind::kInner, plan::JoinKind::kSemi,
+                                      plan::JoinKind::kAnti, plan::JoinKind::kLeft}) {
+      const Rows expected = ReferenceOf(kind, probe_rows, build_rows, {0}, {0}, 3, holds);
+      for (const int64_t batch_size : {1, 2, 64}) {
+        SCOPED_TRACE(name + ", " + std::string(plan::ToString(kind)) + ", batch size " +
+                     std::to_string(batch_size));
+        auto join = MakeJoin(SourceOf(probe_schema, probe), ScanBuild(kind, build_table, {0}), {0},
+                             /*prepares=*/true, BuildSide::kRight, residual);
+        ASSERT_NE(join, nullptr);
+        auto batches = Batches(*join, ContextOf(nullptr, batch_size));
+        ASSERT_TRUE(batches.ok()) << batches.status().ToString();
+        EXPECT_EQ(RowsOf(join->output_schema(), *batches), expected);
+      }
+    }
+  }
+}
+
+// A batch of candidate pairs copies only the columns the residuals read: over a build whose four
+// rows of key 1 hold a VARCHAR value of 256 KiB each (bs), which the residual bw > pv does not
+// read, 64 probe rows of key 1 meet their 256 candidates in batches of 64 pairs, and the run's
+// peak stays below 4 MiB, where each batch of pairs with bs would take 16 MiB. The residual fails
+// on every pair: a semi join keeps no row, an anti join every row, a left join pads every row.
+TEST_F(HashJoinTest, PairsCopyNoColumnTheResidualsDoNotRead) {
+  const std::string value(std::size_t{256} * 1024, 'q');
+  const auto build_schema =
+      arrow::schema({arrow::field("bk", arrow::int64()), arrow::field("bw", arrow::int64()),
+                     arrow::field("bs", arrow::binary())});
+  const arrow::ArrayVector build = {Int64s({1, 1, 1, 1}), Int64s({1, 2, 3, 4}),
+                                    Strings({value, value, value, value})};
+  const auto probe_schema = Int64Schema({"pk", "pv"});
+  const arrow::ArrayVector probe = {Int64s(std::vector<std::optional<int64_t>>(64, 1)),
+                                    Int64s(std::vector<std::optional<int64_t>>(64, 10))};
+  // Over a pair: the probe's pk and pv, then the build's bk, bw and bs.
+  const plan::ExprPtr above = Comparison(plan::CompareOp::kGt, ColumnAt(3, LogicalType::kBigInt),
+                                         ColumnAt(1, LogicalType::kBigInt));
+  for (const auto& [kind, rows] :
+       {std::pair{plan::JoinKind::kSemi, 0}, std::pair{plan::JoinKind::kAnti, 64},
+        std::pair{plan::JoinKind::kLeft, 64}}) {
+    SCOPED_TRACE(plan::ToString(kind));
+    MemoryBudget budget(std::nullopt);
+    auto join = MakeJoin(SourceOf(probe_schema, probe),
+                         DrainedBuild(kind, SourceOf(build_schema, build), {0}), {0},
+                         /*prepares=*/true, BuildSide::kRight, {above});
+    ASSERT_NE(join, nullptr);
+    {
+      ExecContext ctx = ContextOf(nullptr, 64, &budget);
+      auto result = Drain(*join, ctx);
+      ASSERT_TRUE(result.ok()) << result.status().ToString();
+      EXPECT_EQ((*result)->num_rows(), rows);
+      if (kind == plan::JoinKind::kLeft) {
+        EXPECT_EQ((*result)->column(4)->null_count(), rows);  // bs, padded
+      }
+    }
+    EXPECT_LT(budget.max_memory(), int64_t{4} * 1024 * 1024);
   }
 }
 
