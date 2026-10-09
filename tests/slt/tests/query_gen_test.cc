@@ -845,13 +845,14 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
   bool join_on = false;
   for (const sql::FromItem& item : stmt.from) {
     ASSERT_NE(item.connector, sql::Connector::kLeft);
-    const bool path = item.table.kind == sql::TableRef::Kind::kPath;
+    ASSERT_NE(item.table(), nullptr) << "a derived table";
+    const sql::TableRef& ref = *item.table();
+    const bool path = ref.kind == sql::TableRef::Kind::kPath;
     const auto table = std::ranges::find_if(tables, [&](const GenTable& t) {
-      return path ? t.path == item.table.name : SameName(t.name, item.table.name);
+      return path ? t.path == ref.name : SameName(t.name, ref.name);
     });
-    ASSERT_NE(table, tables.end()) << item.table.name;
-    std::string name =
-        item.alias.value_or(path ? PathBindingName(item.table.name) : item.table.name);
+    ASSERT_NE(table, tables.end()) << ref.name;
+    std::string name = item.alias.value_or(path ? PathBindingName(ref.name) : ref.name);
     for (const Item& other : items) {
       EXPECT_FALSE(SameName(other.name, name)) << "two FROM items named " << name;
       cov.repeated_table += other.table == &*table ? 1 : 0;

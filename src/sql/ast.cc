@@ -109,12 +109,63 @@ bool Eq(const Expr& a, const Expr& b) {
       a);
 }
 
+bool Eq(const SelectStatement& a, const SelectStatement& b);
+
 bool Eq(const TableRef& a, const TableRef& b) {
   return a.kind == b.kind && a.name == b.name && a.quoted == b.quoted;
 }
 
+bool Eq(const DerivedTable& a, const DerivedTable& b) { return Eq(*a.query, *b.query); }
+
 bool Eq(const FromItem& a, const FromItem& b) {
-  return a.connector == b.connector && Eq(a.table, b.table) && a.alias == b.alias && Eq(a.on, b.on);
+  if (a.connector != b.connector || a.source.index() != b.source.index() || a.alias != b.alias ||
+      a.columns != b.columns || !Eq(a.on, b.on)) {
+    return false;
+  }
+  return std::visit(
+      [&b](const auto& source) {
+        using Source = std::decay_t<decltype(source)>;
+        return Eq(source, std::get<Source>(b.source));
+      },
+      a.source);
+}
+
+bool Eq(const CommonTableExpr& a, const CommonTableExpr& b) {
+  return a.name == b.name && a.columns == b.columns && Eq(*a.query, *b.query);
+}
+
+// The WITH list, the FROM list and the nested queries in them are walked in loops; only a nested
+// query recurses, and the parser bounds its nesting (kMaxExpressionDepth).
+bool Eq(const SelectStatement& a, const SelectStatement& b) {
+  if (a.with.size() != b.with.size() || a.star != b.star || a.items.size() != b.items.size() ||
+      a.order_by.size() != b.order_by.size() || a.limit != b.limit || a.offset != b.offset ||
+      a.from.size() != b.from.size() || !Eq(a.where, b.where) || !Eq(a.group_by, b.group_by) ||
+      !Eq(a.having, b.having)) {
+    return false;
+  }
+  for (std::size_t i = 0; i < a.with.size(); ++i) {
+    if (!Eq(a.with[i], b.with[i])) {
+      return false;
+    }
+  }
+  for (std::size_t i = 0; i < a.from.size(); ++i) {
+    if (!Eq(a.from[i], b.from[i])) {
+      return false;
+    }
+  }
+  for (std::size_t i = 0; i < a.order_by.size(); ++i) {
+    if (!Eq(a.order_by[i].expr, b.order_by[i].expr) ||
+        a.order_by[i].descending != b.order_by[i].descending ||
+        a.order_by[i].nulls != b.order_by[i].nulls) {
+      return false;
+    }
+  }
+  for (std::size_t i = 0; i < a.items.size(); ++i) {
+    if (!Eq(a.items[i].expr, b.items[i].expr) || a.items[i].alias != b.items[i].alias) {
+      return false;
+    }
+  }
+  return true;
 }
 
 std::optional<CompareOp> CompareOpOf(BinaryOp op) {
@@ -237,6 +288,8 @@ SourceSpan Expr::span() const {
   return std::visit([](const auto& node) { return node.span; },
                     static_cast<const ExprNode&>(*this));
 }
+
+const TableRef* FromItem::table() const { return std::get_if<TableRef>(&source); }
 
 std::optional<Comparison> AsComparison(const Expr& expr) {
   const auto column_of = [](const Expr& e) -> std::optional<ColumnRef> {
@@ -494,13 +547,20 @@ std::size_t Depth(const Expr& expr) {
   return std::visit(DepthOf{}, static_cast<const ExprNode&>(expr));
 }
 
-// The FROM list is walked in loops, never recursively, so a long list costs no stack.
+// The WITH and FROM lists are walked in loops, never recursively, so a long list costs no stack; a
+// nested query is one level below the statement that holds it.
 std::size_t Depth(const SelectStatement& stmt) {
   std::size_t deepest = 0;
+  for (const CommonTableExpr& cte : stmt.with) {
+    deepest = std::max(deepest, 1 + Depth(*cte.query));
+  }
   for (const SelectItem& item : stmt.items) {
     deepest = std::max(deepest, Depth(item.expr));
   }
   for (const FromItem& item : stmt.from) {
+    if (const auto* derived = std::get_if<DerivedTable>(&item.source)) {
+      deepest = std::max(deepest, 1 + Depth(*derived->query));
+    }
     for (const Expr& e : item.on) {
       deepest = std::max(deepest, Depth(e));
     }
@@ -516,31 +576,6 @@ std::size_t Depth(const SelectStatement& stmt) {
   return deepest;
 }
 
-bool EqualIgnoringSpans(const SelectStatement& a, const SelectStatement& b) {
-  if (a.star != b.star || a.items.size() != b.items.size() ||
-      a.order_by.size() != b.order_by.size() || a.limit != b.limit || a.offset != b.offset ||
-      a.from.size() != b.from.size() || !Eq(a.where, b.where) || !Eq(a.group_by, b.group_by) ||
-      !Eq(a.having, b.having)) {
-    return false;
-  }
-  for (std::size_t i = 0; i < a.from.size(); ++i) {
-    if (!Eq(a.from[i], b.from[i])) {
-      return false;
-    }
-  }
-  for (std::size_t i = 0; i < a.order_by.size(); ++i) {
-    if (!Eq(a.order_by[i].expr, b.order_by[i].expr) ||
-        a.order_by[i].descending != b.order_by[i].descending ||
-        a.order_by[i].nulls != b.order_by[i].nulls) {
-      return false;
-    }
-  }
-  for (std::size_t i = 0; i < a.items.size(); ++i) {
-    if (!Eq(a.items[i].expr, b.items[i].expr) || a.items[i].alias != b.items[i].alias) {
-      return false;
-    }
-  }
-  return true;
-}
+bool EqualIgnoringSpans(const SelectStatement& a, const SelectStatement& b) { return Eq(a, b); }
 
 }  // namespace antb1::sql

@@ -3857,6 +3857,8 @@ void FoldDateCasts(sql::Expr& expr) {
   }
 }
 
+// The statement's own block only: CheckSupported rejects a WITH list and a derived table (J4 folds
+// each nested block when it binds it).
 sql::SelectStatement FoldDateCasts(sql::SelectStatement stmt) {
   for (sql::SelectItem& item : stmt.items) {
     FoldDateCasts(item.expr);
@@ -3872,10 +3874,35 @@ sql::SelectStatement FoldDateCasts(sql::SelectStatement stmt) {
   return stmt;
 }
 
+// A WITH list parses (ADR 0022) and is answered from J4 on: rejected at its WITH, which comes
+// before everything else of the query.
+std::optional<Rejection> RejectWith(const sql::SelectStatement& stmt) {
+  if (stmt.with.empty()) {
+    return std::nullopt;
+  }
+  return Rejection{.span = stmt.with_span,
+                   .message = "WITH (common table expressions) is not supported"};
+}
+
+// A derived table parses (ADR 0022) and is answered from J4 on: rejected at its '(', which comes
+// before its alias.
+std::optional<Rejection> RejectDerivedTable(const sql::FromItem& item) {
+  if (item.table() != nullptr) {
+    return std::nullopt;
+  }
+  const SourceSpan open{.offset = std::get<sql::DerivedTable>(item.source).span.offset,
+                        .length = 1};
+  return Rejection{.span = open, .message = "subqueries in FROM are not supported"};
+}
+
 // The FROM list the binder answers: one table or path without an alias. The others parse (ADR
-// 0022) and are answered from J2b on: the first item's alias, else the second item's connector.
+// 0022) and are answered from J2b and J4 on: the first item's derived table or alias, else the
+// second item's connector.
 std::optional<Rejection> RejectFromList(const std::vector<sql::FromItem>& from) {
   ANTB1_CHECK(!from.empty());  // the parser makes no statement without a FROM item
+  if (auto r = RejectDerivedTable(from.front())) {
+    return r;
+  }
   if (const sql::FromItem& first = from.front(); first.alias.has_value()) {
     return Rejection{.span = first.alias_span, .message = "table aliases are not supported"};
   }
@@ -3902,10 +3929,13 @@ std::optional<Rejection> RejectFromList(const std::vector<sql::FromItem>& from) 
   return Rejection{.span = second.connector_span, .message = std::move(message)};
 }
 
-// Expressions and FROM lists the binder does not answer yet are kUnsupported, reported (like the
-// parser's own kUnsupported errors) before any name is resolved, so also over tables that do not
-// exist, at the first one in query order.
+// Expressions, FROM lists and nested queries the binder does not answer yet are kUnsupported,
+// reported (like the parser's own kUnsupported errors) before any name is resolved, so also over
+// tables that do not exist, at the first one in query order.
 arrow::Status CheckSupported(const sql::SelectStatement& stmt) {
+  if (auto r = RejectWith(stmt)) {
+    return Reject(*r);
+  }
   for (const sql::SelectItem& item : stmt.items) {
     ARROW_RETURN_NOT_OK(CheckValue(item.expr));
   }
@@ -3937,13 +3967,14 @@ arrow::Result<LogicalPlan> Bind(const sql::SelectStatement& stmt, const Catalog&
   const sql::SelectStatement folded = FoldDateCasts(stmt);  // the binder refers to it
   ARROW_RETURN_NOT_OK(CheckSupported(folded));
   ANTB1_CHECK(folded.from.size() == 1);  // CheckSupported rejected the others
-  const sql::TableRef& from = folded.from.front().table;
-  ARROW_ASSIGN_OR_RAISE(auto table, ResolveTable(from, catalog));
+  const sql::TableRef* from = folded.from.front().table();
+  ANTB1_CHECK(from != nullptr);  // CheckSupported rejected derived tables
+  ARROW_ASSIGN_OR_RAISE(auto table, ResolveTable(*from, catalog));
   ColumnIdSource ids;
   std::vector<Binding> bindings;
   bindings.push_back(Binding::OfTable(
-      from.name, TableSource{.table = std::move(table), .table_name = from.name, .span = from.span},
-      ids));
+      from->name,
+      TableSource{.table = std::move(table), .table_name = from->name, .span = from->span}, ids));
   Binder binder(folded, std::move(bindings), ids);
   ARROW_ASSIGN_OR_RAISE(LogicalPlan plan, binder.Bind());
   return ResolvePositions(plan);  // the binder refers to columns by id (ADR 0022)

@@ -204,9 +204,21 @@ std::string Conjuncts(const std::vector<Expr>& conjuncts) {
   return out;
 }
 
-// The FROM list, in a loop: each connector as ",", CROSS JOIN, INNER JOIN or LEFT JOIN, each alias
-// quoted after AS, each ON condition like a WHERE predicate. No operand is ever followed by a bare
-// name, and a join keyword never by its first word only, so the text reads back as the same list.
+std::string StatementSql(const SelectStatement& stmt);
+
+// A column alias list, each name quoted: ("x", "y").
+std::string ColumnList(const std::vector<std::string>& columns) {
+  std::string out = "(";
+  for (std::size_t i = 0; i < columns.size(); ++i) {
+    out += (i == 0 ? "" : ", ") + Quote(columns[i], '"');
+  }
+  return out + ")";
+}
+
+// The FROM list, in a loop: each connector as ",", CROSS JOIN, INNER JOIN or LEFT JOIN, a derived
+// table in parentheses, each alias quoted after AS and a column alias list right after it, each ON
+// condition like a WHERE predicate. No operand is ever followed by a bare name, and a join keyword
+// never by its first word only, so the text reads back as the same list.
 std::string FromList(const std::vector<FromItem>& from) {
   std::string out;
   for (const FromItem& item : from) {
@@ -215,10 +227,17 @@ std::string FromList(const std::vector<FromItem>& from) {
     } else if (item.connector != Connector::kFirst) {
       out += " " + std::string(ToString(item.connector)) + " ";
     }
-    out += item.table.kind == TableRef::Kind::kPath ? Quote(item.table.name, '\'')
-                                                    : Name(item.table.name, item.table.quoted);
+    if (const TableRef* table = item.table()) {
+      out += table->kind == TableRef::Kind::kPath ? Quote(table->name, '\'')
+                                                  : Name(table->name, table->quoted);
+    } else {
+      out += "(" + StatementSql(*std::get<DerivedTable>(item.source).query) + ")";
+    }
     if (item.alias.has_value()) {
       out += " AS " + Quote(*item.alias, '"');
+      if (!item.columns.empty()) {
+        out += ColumnList(item.columns);
+      }
     }
     if (!item.on.empty()) {
       out += " ON " + Conjuncts(item.on);
@@ -227,12 +246,18 @@ std::string FromList(const std::vector<FromItem>& from) {
   return out;
 }
 
-}  // namespace
-
-std::string ToSql(const Expr& expr) { return Sql(expr); }
-
-std::string ToSql(const SelectStatement& stmt) {
-  std::string sql = "SELECT ";
+// A query: its WITH list, each name quoted (WITH "c"("x") AS (...), "d" AS (...)), then its block.
+std::string StatementSql(const SelectStatement& stmt) {
+  std::string sql;
+  for (std::size_t i = 0; i < stmt.with.size(); ++i) {
+    const CommonTableExpr& cte = stmt.with[i];
+    sql += (i == 0 ? "WITH " : ", ") + Quote(cte.name, '"');
+    if (!cte.columns.empty()) {
+      sql += ColumnList(cte.columns);
+    }
+    sql += " AS (" + StatementSql(*cte.query) + ")";
+  }
+  sql += stmt.with.empty() ? "SELECT " : " SELECT ";
   if (stmt.star) {
     sql += '*';
   } else {
@@ -275,5 +300,11 @@ std::string ToSql(const SelectStatement& stmt) {
   }
   return sql;
 }
+
+}  // namespace
+
+std::string ToSql(const Expr& expr) { return Sql(expr); }
+
+std::string ToSql(const SelectStatement& stmt) { return StatementSql(stmt); }
 
 }  // namespace antb1::sql

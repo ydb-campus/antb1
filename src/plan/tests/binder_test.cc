@@ -741,6 +741,49 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT i16 FROM t WHERE lower(s) = 'x' GROUP BY t.i16", kUnsupported, "lower",
                   "function lower() is not supported"}));
 
+// Derived tables and WITH lists parse (ADR 0022) and are kUnsupported until the binder answers
+// them (J4): a WITH list at its WITH, a derived table at its '(', before any name is resolved, so
+// also over tables that do not exist, at the first one in query order (the WITH list comes first).
+INSTANTIATE_TEST_SUITE_P(
+    NestedQueries, BindErrorTest,
+    ::testing::Values(
+        ErrorCase{"SELECT i16 FROM (SELECT i16 FROM t)", kUnsupported, "(",
+                  "subqueries in FROM are not supported"},
+        ErrorCase{"SELECT COUNT(*) FROM (SELECT x FROM nope) AS n(y)", kUnsupported, "(",
+                  "subqueries in FROM are not supported"},
+        ErrorCase{"SELECT * FROM (WITH c AS (SELECT a FROM nope) SELECT a FROM c) s", kUnsupported,
+                  "(", "subqueries in FROM are not supported"},
+        ErrorCase{"WITH c AS (SELECT i16 FROM t) SELECT i16 FROM c", kUnsupported, "WITH",
+                  "WITH (common table expressions) is not supported"},
+        ErrorCase{"with c(x) AS (SELECT a FROM nope) SELECT x FROM missing", kUnsupported, "with",
+                  "WITH (common table expressions) is not supported"},
+        ErrorCase{"WITH unused AS (SELECT nope FROM missing) SELECT COUNT(*) FROM t", kUnsupported,
+                  "WITH", "WITH (common table expressions) is not supported"},
+        ErrorCase{"WITH c AS (SELECT i16 FROM t), d AS (SELECT * FROM c) SELECT i16 FROM t",
+                  kUnsupported, "WITH", "WITH (common table expressions) is not supported"},
+        // Query order: the select list, then the derived table's '(' before its alias, the comma
+        // or the join before a later derived table, and the WITH list before all of them.
+        ErrorCase{"SELECT lower(s) FROM (SELECT s FROM t)", kUnsupported, "lower",
+                  "function lower() is not supported"},
+        ErrorCase{"SELECT x.i16 FROM (SELECT i16 FROM t) x", kUnsupported, "x.i16",
+                  "qualified column names"},
+        ErrorCase{"SELECT i16 FROM (SELECT i16 FROM t) AS a", kUnsupported, "(",
+                  "subqueries in FROM are not supported"},
+        ErrorCase{"SELECT nope FROM (SELECT i16 FROM t) WHERE lower(s) = 'x'", kUnsupported, "(",
+                  "subqueries in FROM are not supported"},
+        ErrorCase{"SELECT i16 FROM t, (SELECT i16 FROM u)", kUnsupported, ",",
+                  "a FROM list of several tables is not supported"},
+        ErrorCase{"SELECT i16 FROM t JOIN (SELECT i16 FROM u) v ON t.i16 = v.i16", kUnsupported,
+                  "JOIN", "JOIN ... ON is not supported"},
+        ErrorCase{"WITH c AS (SELECT i16 FROM t) SELECT lower(s) FROM (SELECT s FROM c) AS a",
+                  kUnsupported, "WITH", "WITH (common table expressions) is not supported"},
+        ErrorCase{"SELECT i16 FROM (WITH c AS (SELECT i16 FROM t) SELECT i16 FROM c)", kUnsupported,
+                  "(", "subqueries in FROM are not supported"},
+        // A call with the wrong number of arguments is a bind error only once the FROM list
+        // binds: a derived table is rejected first.
+        ErrorCase{"SELECT strlen(s, 1) FROM (SELECT s FROM t)", kUnsupported, "(",
+                  "subqueries in FROM are not supported"}));
+
 TEST(BinderTest, TablesMatchCaseInsensitively) {
   const Catalog catalog = MakeCatalog();
   for (const char* sql :

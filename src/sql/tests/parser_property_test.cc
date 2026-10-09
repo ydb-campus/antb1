@@ -2,10 +2,11 @@
 // is splitmix64 and no <random> distribution is used).
 //   1. Parse never crashes, hangs or reports a span outside the input, for random token soups,
 //      random bytes and random mutations of valid queries; whatever parses round-trips, and every
-//      token of an accepted query is accounted for by the AST (no token is silently ignored).
-//   2. Every random valid AST (random expression trees included) round-trips: Parse(ToSql(ast)) ==
-//      ast and ToSql is idempotent; a comparison written literal-first normalizes like the
-//      column-first one.
+//      token of an accepted query is accounted for by the AST (no token is silently ignored), also
+//      in the queries nested in it.
+//   2. Every random valid AST (random expression trees, WITH lists and derived tables included)
+//      round-trips: Parse(ToSql(ast)) == ast and ToSql is idempotent; a comparison written
+//      literal-first normalizes like the column-first one.
 
 #include <algorithm>
 #include <array>
@@ -70,7 +71,7 @@ struct Counts {
   std::size_t and_count = 0;
   std::size_t or_count = 0;
   std::size_t comparisons = 0;  // comparison operator tokens
-  std::size_t parens = 0;       // '(' that belong to a call, an IN list or EXTRACT
+  std::size_t parens = 0;  // '(' of a call, an IN list, EXTRACT, a nested query or a column list
   std::size_t stars = 0;
   std::size_t minuses = 0;
   std::size_t pluses = 0;
@@ -196,6 +197,54 @@ void Count(const Expr& expr, Counts& c) {
   std::visit(CountOf{.c = c}, static_cast<const ExprNode&>(expr));
 }
 
+// What a query explains of its tokens, the queries nested in it included: the parentheses of a
+// nested query and of a column alias list, the commas between CTEs and between column aliases, and
+// a string alias (its last byte a quote).
+void CountStatement(const SelectStatement& stmt, const std::string& sql, Counts& want) {
+  want.stars += stmt.star ? 1U : 0U;
+  want.numbers += (stmt.limit.has_value() ? 1U : 0U) + (stmt.offset.has_value() ? 1U : 0U);
+  want.commas += Separators(stmt.items.size()) + Separators(stmt.order_by.size()) +
+                 Separators(stmt.with.size());
+  want.and_count += Separators(stmt.where.size()) + Separators(stmt.having.size());
+  for (const CommonTableExpr& cte : stmt.with) {
+    want.parens += cte.columns.empty() ? 1U : 2U;
+    want.commas += Separators(cte.columns.size());
+    CountStatement(*cte.query, sql, want);
+  }
+  for (const SelectItem& item : stmt.items) {
+    Count(item.expr, want);
+  }
+  for (const FromItem& item : stmt.from) {
+    if (const TableRef* table = item.table()) {
+      want.strings += table->kind == TableRef::Kind::kPath ? 1U : 0U;
+    } else {
+      ++want.parens;
+      CountStatement(*std::get<DerivedTable>(item.source).query, sql, want);
+    }
+    want.strings += item.alias.has_value() && item.alias_span.length > 0 &&
+                            sql[item.alias_span.offset + item.alias_span.length - 1] == '\''
+                        ? 1U
+                        : 0U;
+    want.parens += item.columns.empty() ? 0U : 1U;
+    want.commas += Separators(item.columns.size());
+    want.commas += item.connector == Connector::kComma ? 1U : 0U;
+    want.and_count += Separators(item.on.size());
+    for (const Expr& e : item.on) {
+      Count(e, want);
+    }
+  }
+  for (const Expr& e : stmt.where) {
+    Count(e, want);
+  }
+  CountAll(stmt.group_by, want);
+  for (const Expr& e : stmt.having) {
+    Count(e, want);
+  }
+  for (const OrderItem& item : stmt.order_by) {
+    Count(item.expr, want);
+  }
+}
+
 // Token counts of an accepted query must match what its AST explains; a token the parser skipped
 // (a silent misparse such as an operator read as an alias) breaks one of the equalities.
 // Parentheses that only group are not in the AST: they come in pairs, on top of the explained ones.
@@ -278,36 +327,7 @@ void CheckTokensAccountedFor(const std::string& sql, const SelectStatement& stmt
     }
   }
   Counts want;
-  want.stars = stmt.star ? 1U : 0U;
-  want.numbers = (stmt.limit.has_value() ? 1U : 0U) + (stmt.offset.has_value() ? 1U : 0U);
-  want.commas = Separators(stmt.items.size()) + Separators(stmt.order_by.size());
-  want.and_count = Separators(stmt.where.size()) + Separators(stmt.having.size());
-  for (const SelectItem& item : stmt.items) {
-    Count(item.expr, want);
-  }
-  // A path, a string alias (its last byte a quote), a comma, and ON's AND chain.
-  for (const FromItem& item : stmt.from) {
-    want.strings += item.table.kind == TableRef::Kind::kPath ? 1U : 0U;
-    want.strings += item.alias.has_value() && item.alias_span.length > 0 &&
-                            sql[item.alias_span.offset + item.alias_span.length - 1] == '\''
-                        ? 1U
-                        : 0U;
-    want.commas += item.connector == Connector::kComma ? 1U : 0U;
-    want.and_count += Separators(item.on.size());
-    for (const Expr& e : item.on) {
-      Count(e, want);
-    }
-  }
-  for (const Expr& e : stmt.where) {
-    Count(e, want);
-  }
-  CountAll(stmt.group_by, want);
-  for (const Expr& e : stmt.having) {
-    Count(e, want);
-  }
-  for (const OrderItem& item : stmt.order_by) {
-    Count(item.expr, want);
-  }
+  CountStatement(stmt, sql, want);
   const std::string context = testing::PrintToString(sql);
   EXPECT_EQ(seen.commas, want.commas) << context;
   EXPECT_EQ(seen.and_count, want.and_count) << context;
@@ -357,6 +377,25 @@ void CheckSpans(const Expr& expr, const std::string& sql) {
     for (const Expr& value : in->list) {
       CheckSpans(value, sql);
     }
+  } else if (const auto* between = std::get_if<BetweenExpr>(&expr)) {
+    ASSERT_TRUE(SpanInside(between->op_span, sql));
+    CheckSpans(*between->operand, sql);
+    CheckSpans(*between->low, sql);
+    CheckSpans(*between->high, sql);
+  } else if (const auto* c = std::get_if<CaseExpr>(&expr)) {
+    if (c->operand.has_value()) {
+      CheckSpans(**c->operand, sql);
+    }
+    for (const CaseBranch& branch : c->branches) {
+      CheckSpans(*branch.when, sql);
+      CheckSpans(*branch.then, sql);
+    }
+    if (c->otherwise.has_value()) {
+      CheckSpans(**c->otherwise, sql);
+    }
+  } else if (const auto* extract = std::get_if<ExtractExpr>(&expr)) {
+    ASSERT_TRUE(SpanInside(extract->field_span, sql));
+    CheckSpans(*extract->source, sql);
   } else if (const auto* call = std::get_if<FunctionCall>(&expr)) {
     for (const Expr& arg : call->args) {
       CheckSpans(arg, sql);
@@ -382,41 +421,94 @@ void CheckSpans(const Expr& expr, const std::string& sql) {
   }
 }
 
-// Checks the invariants of one Parse call (fatal gtest failures on a violation).
-void CheckParse(const std::string& sql) {
-  auto result = Parse(sql);
-  if (!result) {
-    const ParseError& error = result.error();
-    ASSERT_TRUE(SpanInside(error.span, sql))
-        << "span outside input for: " << testing::PrintToString(sql);
-    ASSERT_FALSE(error.message.empty()) << testing::PrintToString(sql);
-    if (error.kind == ParseError::Kind::kUnsupported) {
-      ASSERT_TRUE(error.message.ends_with("; see docs/sql-subset.md")) << error.message;
-    }
-    return;
+// The text of `span`, ASCII upper-cased.
+std::string UpperText(const std::string& sql, SourceSpan span) {
+  std::string text = sql.substr(span.offset, span.length);
+  std::ranges::transform(text, text.begin(),
+                         [](unsigned char ch) { return static_cast<char>(std::toupper(ch)); });
+  return text;
+}
+
+// Whether `span` is a non-empty span in parentheses: its first byte '(' and its last ')'.
+bool Parenthesized(const std::string& sql, SourceSpan span) {
+  return span.length >= 2 && sql[span.offset] == '(' && sql[span.offset + span.length - 1] == ')';
+}
+
+// Whether `inner` lies within `outer`.
+bool Within(SourceSpan inner, SourceSpan outer) {
+  return inner.offset >= outer.offset && inner.offset + inner.length <= outer.offset + outer.length;
+}
+
+// The invariants of one parsed query and of the queries nested in it (fatal gtest failures on a
+// violation): its spans lie inside the input and in each other, it starts with WITH or SELECT, a
+// nested query and a column alias list are in parentheses, and only a derived table with an alias
+// has a column alias list.
+void CheckStatement(const SelectStatement& stmt, const std::string& sql) {
+  const std::string context = testing::PrintToString(sql);
+  ASSERT_TRUE(SpanInside(stmt.span, sql)) << context;
+  ASSERT_TRUE(SpanInside(stmt.with_span, sql)) << context;
+  ASSERT_EQ(stmt.with.empty(), stmt.with_span.length == 0) << context;
+  if (stmt.with.empty()) {
+    ASSERT_EQ(UpperText(sql, SourceSpan{.offset = stmt.span.offset,
+                                        .length = std::min<std::size_t>(6, stmt.span.length)}),
+              "SELECT")
+        << context;
+  } else {
+    ASSERT_EQ(UpperText(sql, stmt.with_span), "WITH") << context;
+    ASSERT_EQ(stmt.with_span.offset, stmt.span.offset) << context;
   }
-  const SelectStatement& stmt = *result;
-  ASSERT_TRUE(SpanInside(stmt.span, sql)) << testing::PrintToString(sql);
+  for (const CommonTableExpr& cte : stmt.with) {
+    ASSERT_TRUE(SpanInside(cte.span, sql)) << context;
+    ASSERT_TRUE(Within(cte.span, stmt.span)) << context;
+    ASSERT_EQ(cte.name_span.offset, cte.span.offset) << context;
+    ASSERT_TRUE(Within(cte.name_span, cte.span)) << context;
+    ASSERT_EQ(cte.columns.empty(), cte.columns_span.length == 0) << context;
+    if (!cte.columns.empty()) {
+      ASSERT_TRUE(Within(cte.columns_span, cte.span)) << context;
+      ASSERT_TRUE(Parenthesized(sql, cte.columns_span)) << context;
+    }
+    ASSERT_EQ(sql[cte.span.offset + cte.span.length - 1], ')') << context;
+    ASSERT_TRUE(Within(cte.query->span, cte.span)) << context;
+    ASSERT_NO_FATAL_FAILURE(CheckStatement(*cte.query, sql));
+  }
   ASSERT_FALSE(stmt.from.empty());
   for (const FromItem& item : stmt.from) {
     const bool first = &item == &stmt.from.front();
-    ASSERT_EQ(item.connector == Connector::kFirst, first) << testing::PrintToString(sql);
+    ASSERT_EQ(item.connector == Connector::kFirst, first) << context;
     ASSERT_TRUE(SpanInside(item.span, sql));
-    ASSERT_TRUE(SpanInside(item.table.span, sql));
-    ASSERT_EQ(item.span.offset, item.table.span.offset);
+    ASSERT_TRUE(Within(item.span, stmt.span)) << context;
+    if (const TableRef* table = item.table()) {
+      ASSERT_TRUE(SpanInside(table->span, sql));
+      ASSERT_EQ(item.span.offset, table->span.offset);
+      ASSERT_TRUE(item.columns.empty()) << context;
+    } else {
+      const DerivedTable& derived = std::get<DerivedTable>(item.source);
+      ASSERT_TRUE(SpanInside(derived.span, sql));
+      ASSERT_EQ(item.span.offset, derived.span.offset);
+      ASSERT_TRUE(Parenthesized(sql, derived.span)) << context;
+      ASSERT_TRUE(Within(derived.query->span, derived.span)) << context;
+      ASSERT_NO_FATAL_FAILURE(CheckStatement(*derived.query, sql));
+    }
     ASSERT_TRUE(SpanInside(item.connector_span, sql));
     ASSERT_EQ(item.connector_span.length > 0, !first);
     ASSERT_TRUE(SpanInside(item.alias_span, sql));
     ASSERT_EQ(item.alias_span.length > 0, item.alias.has_value());
+    ASSERT_TRUE(SpanInside(item.columns_span, sql));
+    ASSERT_EQ(item.columns.empty(), item.columns_span.length == 0) << context;
+    if (!item.columns.empty()) {
+      ASSERT_TRUE(item.alias.has_value()) << context;
+      ASSERT_TRUE(Parenthesized(sql, item.columns_span)) << context;
+      ASSERT_EQ(item.columns_span.offset + item.columns_span.length,
+                item.span.offset + item.span.length)
+          << context;
+    }
     const bool joined = item.connector == Connector::kInner || item.connector == Connector::kLeft;
-    ASSERT_EQ(!item.on.empty(), joined) << testing::PrintToString(sql);
+    ASSERT_EQ(!item.on.empty(), joined) << context;
     ASSERT_EQ(item.on_span.length > 0, joined);
     ASSERT_TRUE(SpanInside(item.on_span, sql));
     if (joined) {
-      std::string on = sql.substr(item.on_span.offset, 2);
-      std::ranges::transform(on, on.begin(),
-                             [](unsigned char ch) { return static_cast<char>(std::toupper(ch)); });
-      ASSERT_EQ(on, "ON") << testing::PrintToString(sql);
+      ASSERT_EQ(UpperText(sql, SourceSpan{.offset = item.on_span.offset, .length = 2}), "ON")
+          << context;
     }
     for (const Expr& e : item.on) {
       ASSERT_NO_FATAL_FAILURE(CheckSpans(e, sql));
@@ -439,6 +531,24 @@ void CheckParse(const std::string& sql) {
   ASSERT_TRUE(SpanInside(stmt.having_span, sql));
   ASSERT_TRUE(SpanInside(stmt.order_by_span, sql));
   ASSERT_TRUE(SpanInside(stmt.offset_span, sql));
+}
+
+// Checks the invariants of one Parse call (fatal gtest failures on a violation).
+void CheckParse(const std::string& sql) {
+  auto result = Parse(sql);
+  if (!result) {
+    const ParseError& error = result.error();
+    ASSERT_TRUE(SpanInside(error.span, sql))
+        << "span outside input for: " << testing::PrintToString(sql);
+    ASSERT_FALSE(error.message.empty()) << testing::PrintToString(sql);
+    if (error.kind == ParseError::Kind::kUnsupported) {
+      ASSERT_TRUE(error.message.ends_with("; see docs/sql-subset.md")) << error.message;
+    }
+    return;
+  }
+  const SelectStatement& stmt = *result;
+  ASSERT_NO_FATAL_FAILURE(CheckStatement(stmt, sql));
+  ASSERT_LE(Depth(stmt), kMaxExpressionDepth) << testing::PrintToString(sql);
   ASSERT_NO_FATAL_FAILURE(CheckTokensAccountedFor(sql, stmt));
   const std::string canonical = ToSql(stmt);
   auto again = Parse(canonical);
@@ -485,24 +595,30 @@ constexpr auto kOperands = std::to_array<std::string_view>({
     "-",
 });
 constexpr auto kOther = std::to_array<std::string_view>({
-    "OR",          "NOT",         "ISNULL",    "notnull", "HAVING",
-    "JOIN",        "UNION",       "WITH",      "LIKE",    "IN",
-    "BETWEEN",     "CASE",        "WHEN",      "THEN",    "END",
-    "IS",          "NULL",        "TRUE",      "FALSE",   "INTERVAL",
-    "CAST",        "TIMESTAMPTZ", "EXISTS",    "ALL",     "OVER",
-    "FILTER",      "INTO",        "LEFT",      "COLLATE", "lower",
-    ".",           "+",           "/",         "%",       "::",
-    "||",          "'open",       R"("open)",  "/* open", "-- comment\n",
-    "!",           "#",           "~",         "!~",      "!=-",
-    "==",          "<<",          "->",        "?",       "$1",
-    "{",           "0x1F",        "1_000",     "E'x'",    "INT",
-    "EXCLUDE",     "PERCENT",     "USING",     "-- c\r",  "/* /* */ */",
-    "/* /* */",    "\xd0\xb8",    "\x01",      "\xff",    "\xc3\x28",
-    "1e",          "12abc",       R"("")",     ":",       "|",
-    "[",           "TRY_CAST",    "PRECISION", "CROSS",   "INNER",
-    "OUTER",       "ON",          "semi",      "ANTI",    "asof",
-    "NATURAL",     "RIGHT",       "LATERAL",   "only",    "PIVOT",
-    "TABLESAMPLE", "at",          "GLOB",      "FULL",    "POSITIONAL",
+    "OR",        "NOT",         "ISNULL",    "notnull",
+    "HAVING",    "JOIN",        "UNION",     "WITH",
+    "LIKE",      "IN",          "BETWEEN",   "CASE",
+    "WHEN",      "THEN",        "END",       "IS",
+    "NULL",      "TRUE",        "FALSE",     "INTERVAL",
+    "CAST",      "TIMESTAMPTZ", "EXISTS",    "ALL",
+    "OVER",      "FILTER",      "INTO",      "LEFT",
+    "COLLATE",   "lower",       ".",         "+",
+    "/",         "%",           "::",        "||",
+    "'open",     R"("open)",    "/* open",   "-- comment\n",
+    "!",         "#",           "~",         "!~",
+    "!=-",       "==",          "<<",        "->",
+    "?",         "$1",          "{",         "0x1F",
+    "1_000",     "E'x'",        "INT",       "EXCLUDE",
+    "PERCENT",   "USING",       "-- c\r",    "/* /* */ */",
+    "/* /* */",  "\xd0\xb8",    "\x01",      "\xff",
+    "\xc3\x28",  "1e",          "12abc",     R"("")",
+    ":",         "|",           "[",         "TRY_CAST",
+    "PRECISION", "CROSS",       "INNER",     "OUTER",
+    "ON",        "semi",        "ANTI",      "asof",
+    "NATURAL",   "RIGHT",       "LATERAL",   "only",
+    "PIVOT",     "TABLESAMPLE", "at",        "GLOB",
+    "FULL",      "POSITIONAL",  "RECURSIVE", "MATERIALIZED",
+    "VALUES",    "KEY",         "TABLE",
 });
 constexpr auto kSeparators = std::to_array<std::string_view>(
     {" ", " ", " ", "", "\n", "\t", "/**/", "--\n", "\r", "--\r", "/*/**/*/"});
@@ -528,7 +644,26 @@ std::vector<std::string_view> Skeleton(Rng& rng) {
       std::to_array<std::string_view>({"=", "<>", "!=", "<", "<=", ">", ">="});
   static constexpr auto kLiterals = std::to_array<std::string_view>(
       {"0", "42", "007", "1.5", ".5", "5.", "1e3", "'it''s'", "''", "'north'"});
-  std::vector<std::string_view> tokens = {"SELECT"};
+  std::vector<std::string_view> tokens;
+  // A WITH list of one or two CTEs (their names drawn so that they differ), each with a column
+  // alias list or not.
+  if (rng.Percent(10)) {
+    static constexpr auto kCteNames =
+        std::to_array<std::array<std::string_view, 2>>({{"c", "recursive"}, {"d", R"("C e")"}});
+    tokens.emplace_back("WITH");
+    for (std::size_t i = 0, ctes = 1 + rng.Below(2); i < ctes; ++i) {
+      if (i > 0) {
+        tokens.emplace_back(",");
+      }
+      tokens.push_back(rng.Pick(kCteNames[i]));
+      if (rng.Percent(30)) {
+        tokens.insert(tokens.end(), {"(", "x", ",", R"("y")", ")"});
+      }
+      tokens.insert(tokens.end(),
+                    {"AS", "(", "SELECT", rng.Pick(kNames), "FROM", rng.Pick(kNames), ")"});
+    }
+  }
+  tokens.emplace_back("SELECT");
   if (rng.Percent(20)) {
     tokens.emplace_back("*");
   } else {
@@ -581,13 +716,23 @@ std::vector<std::string_view> Skeleton(Rng& rng) {
         on = true;
       }
     }
-    tokens.push_back(rng.Percent(70) ? rng.Pick(kNames) : "'data/part-0.parquet'");
+    // A table, a path, or a derived table with a column alias list after its alias or not.
+    const bool derived = rng.Percent(15);
+    if (derived) {
+      tokens.insert(tokens.end(), {"(", "SELECT", rng.Percent(50) ? "*" : rng.Pick(kNames), "FROM",
+                                   rng.Pick(kNames), ")"});
+    } else {
+      tokens.push_back(rng.Percent(70) ? rng.Pick(kNames) : "'data/part-0.parquet'");
+    }
     if (rng.Percent(30)) {
       const std::string_view alias = rng.Pick(kAliases);
       if (alias.starts_with('\'') || rng.Percent(50)) {
         tokens.emplace_back("AS");
       }
       tokens.push_back(alias);
+      if (derived && rng.Percent(50)) {
+        tokens.insert(tokens.end(), {"(", "x", ",", R"("Y z")", ")"});
+      }
     }
     if (on) {
       tokens.emplace_back("ON");
@@ -685,7 +830,7 @@ TEST(ParserPropertyTest, RandomTokenSoupNeverBreaksTheParser) {
   std::size_t parsed = 0;
   for (const std::uint64_t seed : kSeeds) {
     Rng rng(seed);
-    for (int i = 0; i < 2000; ++i) {
+    for (int i = 0; i < 2500; ++i) {
       const std::string sql = TokenSoup(rng);
       ASSERT_NO_FATAL_FAILURE(CheckParse(sql)) << "seed " << seed << " iteration " << i;
       if (Parse(sql).has_value()) {
@@ -726,6 +871,11 @@ constexpr auto kCorpus = std::to_array<std::string_view>({
     R"(SELECT COUNT(*) FROM a, "B" b CROSS JOIN 'c.parquet' AS 'c' LEFT OUTER JOIN d ON a.k = )"
     "d.k OR d.k = 1",
     "select x.a from t x inner join u on x.a = u.b, v left join w on v.c = w.c where x.a < 3",
+    "WITH c(x) AS (SELECT a FROM t WHERE a > 1), d AS (SELECT * FROM c) SELECT x FROM d LIMIT 3",
+    "SELECT s.a, COUNT(*) FROM (SELECT a, b FROM 'p.parquet' WHERE b <> 'x') AS s(a) JOIN u ON "
+    "s.a = u.a GROUP BY s.a",
+    "select * from (with w as (select 1 from t) select * from w) q, (select * from (select b from "
+    "u) r) z",
 });
 
 std::string Mutate(Rng& rng, std::string sql) {
@@ -1010,10 +1160,50 @@ std::vector<Expr> RandomPredicate(Rng& rng, bool aggregates) {
   return out;
 }
 
-SelectStatement RandomStatement(Rng& rng) {
+std::string AsciiUpper(std::string text) {
+  for (char& c : text) {
+    if (c >= 'a' && c <= 'z') {
+      c = static_cast<char>(c - 'a' + 'A');
+    }
+  }
+  return text;
+}
+
+// 1 to 3 quoted names of a column alias list.
+std::vector<std::string> RandomColumnAliases(Rng& rng) {
+  std::vector<std::string> columns;
+  for (std::size_t n = 1 + rng.Below(3); n > 0; --n) {
+    columns.push_back(RandomBytes(rng, 8, true));
+  }
+  return columns;
+}
+
+// A random statement whose queries nest at most `blocks` levels deep: a WITH list (names that
+// differ ASCII case-insensitively, as the parser demands) and derived tables.
+SelectStatement RandomStatement(Rng& rng, std::size_t blocks = 2) {
   static constexpr auto kNulls =
       std::to_array<NullsOrder>({NullsOrder::kDefault, NullsOrder::kFirst, NullsOrder::kLast});
   SelectStatement stmt;
+  if (blocks > 0 && rng.Percent(15)) {
+    std::vector<std::string> names;  // upper-cased
+    for (std::size_t n = 1 + rng.Below(3); n > 0; --n) {
+      std::string name = RandomBytes(rng, 10, true);
+      while (std::ranges::find(names, AsciiUpper(name)) != names.end()) {
+        name = RandomBytes(rng, 10, true);
+      }
+      names.push_back(AsciiUpper(name));
+      CommonTableExpr cte{.name = std::move(name),
+                          .columns = {},
+                          .query = Box<SelectStatement>(RandomStatement(rng, blocks - 1)),
+                          .name_span = {},
+                          .columns_span = {},
+                          .span = {}};
+      if (rng.Percent(40)) {
+        cte.columns = RandomColumnAliases(rng);
+      }
+      stmt.with.push_back(std::move(cte));
+    }
+  }
   stmt.star = rng.Percent(15);
   if (!stmt.star) {
     const std::size_t items = 1 + rng.Below(5);
@@ -1025,29 +1215,37 @@ SelectStatement RandomStatement(Rng& rng) {
       stmt.items.push_back(std::move(item));
     }
   }
-  // 1 to 4 FROM items, each a name, a quoted name or a path, joined by random connectors, with
-  // random aliases and ON predicates.
+  // 1 to 4 FROM items, each a name, a quoted name, a path or a derived table, joined by random
+  // connectors, with random aliases (a derived table's with a column alias list or not) and ON
+  // predicates.
   static constexpr auto kConnectors = std::to_array<Connector>(
       {Connector::kComma, Connector::kCross, Connector::kInner, Connector::kLeft});
   const std::size_t items = 1 + rng.Below(4);
   for (std::size_t i = 0; i < items; ++i) {
     FromItem item;
     item.connector = i == 0 ? Connector::kFirst : rng.Pick(kConnectors);
-    switch (rng.Below(3)) {
+    switch (blocks > 0 && rng.Percent(15) ? 3 : rng.Below(3)) {
       case 0:
-        item.table =
+        item.source =
             TableRef{.kind = TableRef::Kind::kName, .name = RandomName(rng), .quoted = false};
         break;
       case 1:
-        item.table = TableRef{
+        item.source = TableRef{
             .kind = TableRef::Kind::kName, .name = RandomBytes(rng, 12, true), .quoted = true};
         break;
+      case 2:
+        item.source = TableRef{.kind = TableRef::Kind::kPath, .name = RandomBytes(rng, 20, false)};
+        break;
       default:
-        item.table = TableRef{.kind = TableRef::Kind::kPath, .name = RandomBytes(rng, 20, false)};
+        item.source = DerivedTable{.query = Box<SelectStatement>(RandomStatement(rng, blocks - 1)),
+                                   .span = {}};
         break;
     }
     if (rng.Percent(30)) {
       item.alias = RandomBytes(rng, 10, true);
+      if (item.table() == nullptr && rng.Percent(50)) {
+        item.columns = RandomColumnAliases(rng);
+      }
     }
     if (item.connector == Connector::kInner || item.connector == Connector::kLeft) {
       item.on = RandomPredicate(rng, false);
@@ -1096,6 +1294,9 @@ SelectStatement RandomStatement(Rng& rng) {
 }
 
 TEST(ParserPropertyTest, RandomValidAstsRoundTrip) {
+  std::size_t with_lists = 0;
+  std::size_t derived_tables = 0;
+  std::size_t column_lists = 0;
   for (const std::uint64_t seed : kSeeds) {
     Rng rng(seed);
     for (int i = 0; i < 300; ++i) {
@@ -1108,8 +1309,18 @@ TEST(ParserPropertyTest, RandomValidAstsRoundTrip) {
       ASSERT_TRUE(EqualIgnoringSpans(stmt, *parsed)) << testing::PrintToString(sql);
       ASSERT_EQ(ToSql(*parsed), sql);
       ASSERT_NO_FATAL_FAILURE(CheckParse(sql));
+      with_lists += stmt.with.empty() ? 0U : 1U;
+      for (const FromItem& item : stmt.from) {
+        derived_tables += item.table() == nullptr ? 1U : 0U;
+        column_lists += item.columns.empty() ? 0U : 1U;
+      }
     }
   }
+  // The generator reaches the nested queries: at the top level about 15% of the statements have
+  // a WITH list and of the items are derived tables.
+  EXPECT_GT(with_lists, 100U);
+  EXPECT_GT(derived_tables, 150U);
+  EXPECT_GT(column_lists, 20U);
 }
 
 // A comparison written literal-first has the normalized form of the column-first one.

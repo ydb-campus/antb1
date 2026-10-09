@@ -135,6 +135,23 @@ TEST(UnparseTest, CanonicalForms) {
                              "\"Exists\" ON a = b, w AS \"interval\""},
            Case{.input = R"(SELECT a FROM t AS 'it''s' LEFT JOIN u "a""b" ON u.a = 1)",
                 .canonical = R"(SELECT a FROM t AS "it's" LEFT JOIN u AS "a""b" ON u.a = 1)"},
+           // Nested queries in parentheses; the names of a WITH list and of a column alias list
+           // always quoted, the list right after its name or alias.
+           Case{.input = "with c(x) as (select a from t), \"D\" as (select * from (select b from "
+                         "u) s ( y ) where y > 1) select x from c, d",
+                .canonical = R"(WITH "c"("x") AS (SELECT a FROM t), "D" AS (SELECT * FROM )"
+                             R"((SELECT b FROM u) AS "s"("y") WHERE y > 1) SELECT x FROM c, d)"},
+           Case{.input = "select * from ( select a from t ) , (with w as (select 1 from u) select "
+                         "* from w) as 'q'(z, \"a\"\"b\") join (select c from v) over on z = c",
+                .canonical = R"(SELECT * FROM (SELECT a FROM t), (WITH "w" AS (SELECT 1 FROM u) )"
+                             R"(SELECT * FROM w) AS "q"("z", "a""b") INNER JOIN (SELECT c FROM v) )"
+                             R"(AS "over" ON z = c)"},
+           Case{.input = "with recursive as (select a from t) select a from recursive",
+                .canonical = R"(WITH "recursive" AS (SELECT a FROM t) SELECT a FROM recursive)"},
+           Case{.input = "SELECT a FROM (SELECT a, -b FROM t ORDER BY a LIMIT 1 OFFSET 2) x ORDER "
+                         "BY a",
+                .canonical = R"(SELECT a FROM (SELECT a, -(b) FROM t ORDER BY a LIMIT 1 OFFSET 2) )"
+                             R"(AS "x" ORDER BY a)"},
        }) {
     EXPECT_EQ(Canonical(c.input), c.canonical) << c.input;
     ExpectRoundTrip(c.input);
@@ -177,23 +194,59 @@ TEST(UnparseTest, RoundTripsCorpus) {
            "SELECT a FROM 'x.parquet' JOIN 'y.parquet' ON NOT a = b CROSS JOIN 'z.parquet' AS z"sv,
            R"(SELECT "q"."x", q."y", "q".y FROM "q" AS "q" INNER JOIN "Q" ON "q".k = "Q".k)"sv,
            "SELECT t.a FROM t ORDER BY t.a DESC NULLS FIRST, t.b LIMIT 1"sv,
+           "WITH a AS (SELECT x FROM t), b(y) AS (SELECT * FROM a) SELECT y FROM b"sv,
+           R"(WITH "a b" AS (WITH c AS (SELECT 1 FROM t) SELECT * FROM c) SELECT * FROM "a b";)"sv,
+           "SELECT s.a, COUNT(*) FROM (SELECT a FROM t WHERE b = 1) AS s GROUP BY s.a"sv,
+           "SELECT * FROM (SELECT * FROM (SELECT * FROM t) x) y(a, b), (SELECT 1 FROM u) z"sv,
+           "SELECT * FROM t JOIN (SELECT k FROM u) AS v(k) ON t.k = v.k LEFT JOIN (SELECT 1 FROM "
+           "w) ON TRUE_ish"sv,
+           "SELECT * FROM (WITH c(x) AS (SELECT a FROM t) SELECT x FROM c) AS 'q' ORDER BY 1"sv,
        }) {
     ExpectRoundTrip(sql);
   }
+}
+
+// A statement built by hand with a WITH list and derived tables prints as its canonical text,
+// which parses back to it.
+TEST(UnparseTest, RendersNestedQueries) {
+  SelectStatement inner;
+  inner.star = true;
+  inner.from = {FromItem{.source = TableRef{.kind = TableRef::Kind::kPath, .name = "p.parquet"}}};
+  SelectStatement stmt;
+  stmt.with.push_back(CommonTableExpr{.name = "c\"1",
+                                      .columns = {"x", "Y z"},
+                                      .query = Box<SelectStatement>(inner),
+                                      .name_span = {},
+                                      .columns_span = {},
+                                      .span = {}});
+  stmt.star = true;
+  stmt.from.push_back(FromItem{.source = DerivedTable{.query = Box<SelectStatement>(inner)}});
+  stmt.from.push_back(FromItem{.connector = Connector::kCross,
+                               .source = DerivedTable{.query = Box<SelectStatement>(stmt)},
+                               .alias = "s",
+                               .columns = {"k"}});
+  const std::string sql = ToSql(stmt);
+  EXPECT_EQ(sql,
+            R"(WITH "c""1"("x", "Y z") AS (SELECT * FROM 'p.parquet') SELECT * FROM (SELECT * )"
+            R"(FROM 'p.parquet') CROSS JOIN (WITH "c""1"("x", "Y z") AS (SELECT * FROM )"
+            R"('p.parquet') SELECT * FROM (SELECT * FROM 'p.parquet')) AS "s"("k"))");
+  auto parsed = Parse(sql);
+  ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+  EXPECT_TRUE(EqualIgnoringSpans(stmt, *parsed));
 }
 
 TEST(UnparseTest, RendersFromLists) {
   SelectStatement stmt;
   stmt.star = true;
   stmt.from.push_back(
-      FromItem{.table = TableRef{.kind = TableRef::Kind::kName, .name = "t"}, .alias = "a\"b"});
+      FromItem{.source = TableRef{.kind = TableRef::Kind::kName, .name = "t"}, .alias = "a\"b"});
   stmt.from.push_back(FromItem{.connector = Connector::kComma,
-                               .table = TableRef{.kind = TableRef::Kind::kPath, .name = "x'y"}});
+                               .source = TableRef{.kind = TableRef::Kind::kPath, .name = "x'y"}});
   stmt.from.push_back(
       FromItem{.connector = Connector::kCross,
-               .table = TableRef{.kind = TableRef::Kind::kName, .name = "U v", .quoted = true}});
+               .source = TableRef{.kind = TableRef::Kind::kName, .name = "U v", .quoted = true}});
   FromItem inner{.connector = Connector::kInner,
-                 .table = TableRef{.kind = TableRef::Kind::kName, .name = "w"}};
+                 .source = TableRef{.kind = TableRef::Kind::kName, .name = "w"}};
   inner.on.emplace_back(BinaryExpr{
       .op = BinaryOp::kEq,
       .left =
@@ -205,7 +258,7 @@ TEST(UnparseTest, RendersFromLists) {
                                         .qualifier_quoted = true}))});
   stmt.from.push_back(std::move(inner));
   FromItem left{.connector = Connector::kLeft,
-                .table = TableRef{.kind = TableRef::Kind::kName, .name = "z"},
+                .source = TableRef{.kind = TableRef::Kind::kName, .name = "z"},
                 .alias = "z"};
   left.on.push_back(ToExpr(Comparison{
       .column = ColumnRef{.name = "c", .quoted = false, .span = {}, .qualifier = "z"},
@@ -230,7 +283,7 @@ TEST(UnparseTest, RendersFullAst) {
   AggregateCall sum{.kind = AggKind::kSum};
   sum.arg.emplace(Expr(ColumnRef{.name = "a"}));
   stmt.items.push_back(SelectItem{.expr = Expr(std::move(sum)), .alias = "s"});
-  stmt.from = {FromItem{.table = TableRef{.kind = TableRef::Kind::kName, .name = "t"}}};
+  stmt.from = {FromItem{.source = TableRef{.kind = TableRef::Kind::kName, .name = "t"}}};
   stmt.where.push_back(ToExpr(Comparison{
       .column = ColumnRef{.name = "b"},
       .op = CompareOp::kGe,
@@ -242,7 +295,7 @@ TEST(UnparseTest, RendersFullAst) {
 TEST(UnparseTest, RendersEveryLiteralKindAndOperator) {
   SelectStatement stmt;
   stmt.star = true;
-  stmt.from = {FromItem{.table = TableRef{.kind = TableRef::Kind::kPath, .name = "x'y.parquet"}}};
+  stmt.from = {FromItem{.source = TableRef{.kind = TableRef::Kind::kPath, .name = "x'y.parquet"}}};
   const std::array<Literal, 6> literals{{
       Literal{.kind = Literal::Kind::kInteger, .negative = false, .text = "1"},
       Literal{.kind = Literal::Kind::kDecimal, .negative = true, .text = "2.5"},
@@ -270,7 +323,7 @@ TEST(UnparseTest, RendersEveryLiteralKindAndOperator) {
 TEST(UnparseTest, LimitExtremes) {
   SelectStatement stmt;
   stmt.star = true;
-  stmt.from = {FromItem{.table = TableRef{.kind = TableRef::Kind::kName, .name = "t"}}};
+  stmt.from = {FromItem{.source = TableRef{.kind = TableRef::Kind::kName, .name = "t"}}};
   stmt.limit = 0;
   EXPECT_EQ(ToSql(stmt), "SELECT * FROM t LIMIT 0");
   stmt.limit = std::numeric_limits<std::int64_t>::max();
@@ -359,6 +412,56 @@ TEST(EqualIgnoringSpansTest, DetectsEveryDifferenceInFromLists) {
     EXPECT_FALSE(EqualIgnoringSpans(*x, *y)) << other;
     EXPECT_FALSE(EqualIgnoringSpans(*y, *x)) << other;
   }
+}
+
+// EqualIgnoringSpans compares nested queries in full: their WITH lists, derived tables, aliases,
+// column alias lists and every clause inside them.
+TEST(EqualIgnoringSpansTest, DetectsEveryDifferenceInNestedBlocks) {
+  const std::string_view base =
+      "WITH c(x) AS (SELECT a FROM t WHERE a = 1) SELECT * FROM (SELECT b FROM u) AS s(y), c";
+  for (
+      const std::string_view other : {
+          "WITH c(x) AS (SELECT a FROM t WHERE a = 2) SELECT * FROM (SELECT b FROM u) AS s(y), c"sv,
+          "WITH c(x) AS (SELECT a FROM t) SELECT * FROM (SELECT b FROM u) AS s(y), c"sv,
+          "WITH c(z) AS (SELECT a FROM t WHERE a = 1) SELECT * FROM (SELECT b FROM u) AS s(y), c"sv,
+          "WITH c AS (SELECT a FROM t WHERE a = 1) SELECT * FROM (SELECT b FROM u) AS s(y), c"sv,
+          "WITH c(x, y) AS (SELECT a FROM t WHERE a = 1) SELECT * FROM (SELECT b FROM u) AS s(y), "
+          "c"sv,
+          "WITH d(x) AS (SELECT a FROM t WHERE a = 1) SELECT * FROM (SELECT b FROM u) AS s(y), c"sv,
+          "WITH C(x) AS (SELECT a FROM t WHERE a = 1) SELECT * FROM (SELECT b FROM u) AS s(y), c"sv,
+          "WITH c(x) AS (SELECT a FROM t WHERE a = 1), d AS (SELECT a FROM t) SELECT * FROM "
+          "(SELECT b FROM u) AS s(y), c"sv,
+          "SELECT * FROM (SELECT b FROM u) AS s(y), c"sv,
+          "WITH c(x) AS (WITH e AS (SELECT a FROM t) SELECT a FROM t WHERE a = 1) SELECT * FROM "
+          "(SELECT b FROM u) AS s(y), c"sv,
+          "WITH c(x) AS (SELECT a FROM t WHERE a = 1) SELECT * FROM (SELECT b FROM v) AS s(y), c"sv,
+          "WITH c(x) AS (SELECT a FROM t WHERE a = 1) SELECT * FROM (SELECT * FROM u) AS s(y), c"sv,
+          "WITH c(x) AS (SELECT a FROM t WHERE a = 1) SELECT * FROM (SELECT b FROM u LIMIT 1) AS "
+          "s(y), c"sv,
+          "WITH c(x) AS (SELECT a FROM t WHERE a = 1) SELECT * FROM (SELECT b FROM u) AS s(Y), c"sv,
+          "WITH c(x) AS (SELECT a FROM t WHERE a = 1) SELECT * FROM (SELECT b FROM u) AS s, c"sv,
+          "WITH c(x) AS (SELECT a FROM t WHERE a = 1) SELECT * FROM (SELECT b FROM u) AS r(y), c"sv,
+          "WITH c(x) AS (SELECT a FROM t WHERE a = 1) SELECT * FROM (SELECT b FROM u), c"sv,
+          "WITH c(x) AS (SELECT a FROM t WHERE a = 1) SELECT * FROM u AS s, c"sv,
+          "WITH c(x) AS (SELECT a FROM t WHERE a = 1) SELECT * FROM (SELECT b FROM u) AS s(y), "
+          "(SELECT * FROM c)"sv,
+          "WITH c(x) AS (SELECT a FROM t WHERE a = 1) SELECT * FROM (WITH f AS (SELECT 1 FROM u) "
+          "SELECT b FROM u) AS s(y), c"sv,
+      }) {
+    auto x = Parse(base);
+    auto y = Parse(other);
+    ASSERT_TRUE(x.has_value()) << x.error().message;
+    ASSERT_TRUE(y.has_value()) << other << ": " << y.error().message;
+    EXPECT_FALSE(EqualIgnoringSpans(*x, *y)) << other;
+    EXPECT_FALSE(EqualIgnoringSpans(*y, *x)) << other;
+  }
+  // The spelling: quoting, AS, the case of keywords, comments and parentheses' spaces.
+  auto x = Parse(base);
+  auto y = Parse(
+      "with \"c\"( \"x\" ) as ( select a from t where (a = 1) ) select * from ( /* q */ select b "
+      "from u ) s(\"y\"), c ;");
+  ASSERT_TRUE(x.has_value() && y.has_value());
+  EXPECT_TRUE(EqualIgnoringSpans(*x, *y)) << ToSql(*x) << "\n" << ToSql(*y);
 }
 
 TEST(EqualIgnoringSpansTest, DetectsEveryDifferenceInNewClauses) {

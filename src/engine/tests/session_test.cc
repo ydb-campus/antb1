@@ -371,15 +371,17 @@ TEST_F(SessionTest, UnsupportedAndBindErrorsKeepTheirKinds) {
   auto session = Session::Make().ValueOrDie();
   ASSERT_TRUE(session->RegisterParquet("t", {path_}).ok());
   // Column nope does not exist (SUM(nope) below is a bind error), but unsupported SQL is
-  // rejected before any name is resolved, and so are joins, aliases and qualified names, which
-  // parse (table nope is not registered either).
+  // rejected before any name is resolved, and so are joins, aliases, qualified names, derived
+  // tables and WITH lists, which parse (table nope is not registered either).
   for (const char* sql :
        {"SELECT nope, row_number() OVER () FROM t",
         "SELECT AdvEngineID FROM t ORDER BY lower(AdvEngineID)",
         "SELECT SUM(DISTINCT AdvEngineID) FROM t", "SELECT DISTINCT AdvEngineID FROM t",
         "SELECT nope FROM t, nope", "SELECT COUNT(*) FROM t AS a", "SELECT t.AdvEngineID FROM t",
         "SELECT COUNT(*) FROM t JOIN nope ON t.AdvEngineID = nope.x", "SELECT COUNT(*) FROM t over",
-        "SELECT COUNT(*) FROM t semi JOIN nope ON t.AdvEngineID = nope.x"}) {
+        "SELECT COUNT(*) FROM t semi JOIN nope ON t.AdvEngineID = nope.x",
+        "SELECT COUNT(*) FROM (SELECT nope FROM t)",
+        "WITH c AS (SELECT nope FROM nope) SELECT COUNT(*) FROM t"}) {
     auto result = session->Execute(sql);
     const auto detail = plan::GetSqlError(result.status());
     ASSERT_NE(detail, nullptr) << sql << ": " << result.status().ToString();
