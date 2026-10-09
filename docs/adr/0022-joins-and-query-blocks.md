@@ -266,12 +266,14 @@ Proposed
   The domains keep a many-to-many edge (a key with few values on both sides) out of the order while a key edge is
   available; ordering by row counts alone can take such an edge first and multiply the intermediate result. The
   plan depends on metadata only, so EXPLAIN and every answer are the same for any thread count.
-  - Update (2026-10-09, J2b-1): `src/plan/join_order.h` computes rules 1, 2, 3 and 5, with three refinements. The
-    domain of an exact range is capped at the column's non-NULL rows, min(max - min + 1, non-NULL rows): a sparse
-    key, a few values spread over a wide range, would otherwise shrink every estimate of its joins to one row and put
-    them first. An estimate is computed in 128 bits, rounded down and saturated at 2^63 - 1, and is at least 1 unless
-    an input has no row or a key column no non-NULL value (then it is 0). A relation of unknown rows counts as the
-    largest, also where its rows stand in for an unknown domain.
+  - Update (2026-10-09, J2b-1): `src/plan/join_order.h` computes rules 1, 2, 3 and 5 for the tables and sub-plans
+    of an inner block, and rule 4's estimate of a sub-plan, but no filter selectivity; fixed units, a LEFT JOIN unit
+    among them, come with J5 and J6. It adds three refinements. The domain of an exact range is capped at the
+    column's non-NULL rows, min(max - min + 1, non-NULL rows): a sparse key, a few values spread over a wide range,
+    would otherwise shrink every estimate of its joins to one row and put them first. An estimate is computed in 128
+    bits, rounded down and saturated at 2^63 - 1, and is at least 1 unless an input has no row or a key column no
+    non-NULL value (then it is 0). A relation of unknown rows counts as the largest, also where its rows stand in for
+    an unknown domain.
 - **Build sides.**
   - An inner join builds on the input with the smaller footer row count, where a join below stands in with its
     estimate, and on the relation being added on a tie. With the largest relation as the probe, the probe side

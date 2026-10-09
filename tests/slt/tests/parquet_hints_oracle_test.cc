@@ -2,7 +2,7 @@
 // test's temporary directory, with distinct counts in its dictionary-encoded column chunks and none
 // in the others, and for every part and field antb1 reads exactly the count that DuckDB's
 // parquet_metadata reports for the field's column chunk. A nested field has no chunk of its own and
-// no hint; the struct before the other fields shifts their Parquet leaf indices.
+// no hint; the struct, the second field, shifts the Parquet leaf indices of the fields after it.
 
 #include <charconv>
 #include <cstddef>

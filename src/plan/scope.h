@@ -88,8 +88,10 @@ class Binding {
   // exactly the columns' ids, in order: anything else is a programming error.
   static Binding OfPlan(std::string name, LogicalNodePtr root, std::vector<BindingColumn> columns);
 
-  // The name a qualified column reference uses (rule 1 of ADR 0022): the FROM item's alias, else
-  // its table name as written, else its path's PathBindingName. Two bindings may share it (rule 3).
+  // The name a qualified column reference uses, as the binder gives it: by rule 1 of ADR 0022 the
+  // FROM item's alias, else its table name as written, else its path's PathBindingName. Until
+  // roadmap PR J2b-2 binds several FROM items, the binder names its one binding by the FROM
+  // reference as written. Two bindings may share a name (rule 3).
   [[nodiscard]] const std::string& name() const { return name_; }
   [[nodiscard]] const BindingSource& source() const { return source_; }
   [[nodiscard]] const std::vector<BindingColumn>& columns() const { return columns_; }

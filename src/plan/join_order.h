@@ -42,8 +42,9 @@ struct JoinStep {
   // The edges between it and the relations of the earlier steps, ascending: the keys of its join
   // (none for the first step, the probe).
   std::vector<std::size_t> edges;
-  // The side the step's join builds on: always the relation it adds (ADR 0022). An estimate-based
-  // choice would be made here.
+  // The side the step's join builds on: always the relation it adds. ADR 0022's rule, the input
+  // with fewer rows (a join below standing in with its estimate), is deferred until the estimates
+  // can be trusted (they ignore filters); it would be decided here.
   BuildSide build = BuildSide::kRight;
   int64_t estimate = 0;  // the estimated rows of the relations joined so far, saturated
 };
