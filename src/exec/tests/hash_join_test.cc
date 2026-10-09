@@ -2746,12 +2746,13 @@ plan::LogicalNodePtr JoinOf(const plan::LogicalNodePtr& probe, const plan::Logic
 plan::LogicalNodePtr JoinOf(plan::JoinKind kind, const plan::LogicalNodePtr& probe,
                             const plan::LogicalNodePtr& build,
                             const std::vector<plan::BoundColumn>& probe_keys,
-                            const std::vector<plan::BoundColumn>& build_keys) {
+                            const std::vector<plan::BoundColumn>& build_keys,
+                            std::vector<plan::ExprPtr> residual = {}) {
   plan::JoinNode join{.kind = kind,
                       .left = probe,
                       .right = build,
                       .keys = {},
-                      .residual = {},
+                      .residual = std::move(residual),
                       .build = BuildSide::kRight,
                       .span = {}};
   for (std::size_t k = 0; k < probe_keys.size(); ++k) {
@@ -3014,12 +3015,30 @@ TEST_F(HashJoinPlanTest, SameResultsOnOneAndFourThreads) {
 // Through the physical planner, a semi, anti or null-aware anti join gives the nested-loop
 // reference, the probe's rows in part order: on a BIGINT, a VARCHAR ('' is no NULL) or a
 // two-column key (a null-aware anti join on one key, over the build table and over its rows
-// without a NULL key), on unique or repeated build keys, for any batch size. A one-row join appends
-// the row of an aggregate over the build table to every probe row.
+// without a NULL key), on unique or repeated build keys, for any batch size. So does a left join,
+// each probe row with its matches in the build's order or padded, and semi, anti and left joins
+// with residuals (bid * 3 >= pid, then bs <> ps, NULL where either is NULL). A one-row join
+// appends the row of an aggregate over the build table to every probe row.
 TEST_F(HashJoinPlanTest, EveryKindMatchesTheNestedLoopReference) {
   const auto probe_table = MixedTable("p", 6, 7, ProbeKey);
   const Rows probe_rows = RowsOf(*probe_table);
   const std::vector<std::vector<int>> keys = {{0}, {1}, {0, 1}};
+  // Over a pair: the probe's k, s and id, then the build's.
+  const std::vector<plan::ExprPtr> residual = {
+      Comparison(plan::CompareOp::kGe, Times(ColumnAt(5, LogicalType::kBigInt), ConstantOf(3)),
+                 ColumnAt(2, LogicalType::kBigInt)),
+      Comparison(plan::CompareOp::kNe, ColumnAt(4, LogicalType::kVarchar),
+                 ColumnAt(1, LogicalType::kVarchar), LogicalType::kVarchar)};
+  const Residual holds = [](const std::vector<std::string>& p,
+                            const std::vector<std::string>& b) -> std::optional<bool> {
+    if (std::stoll(b[2]) * 3 < std::stoll(p[2])) {
+      return false;
+    }
+    if (p[1] == "null" || b[1] == "null") {
+      return std::nullopt;
+    }
+    return p[1] != b[1];
+  };
   for (const bool unique : {false, true}) {
     const auto build_table =
         unique ? MixedTable("b", 2, 6, [](int64_t i) -> std::optional<int64_t> { return i; })
@@ -3067,6 +3086,35 @@ TEST_F(HashJoinPlanTest, EveryKindMatchesTheNestedLoopReference) {
         }
       }
     }
+    for (const auto& [kind, with_residual] :
+         {std::pair{plan::JoinKind::kLeft, false}, std::pair{plan::JoinKind::kSemi, true},
+          std::pair{plan::JoinKind::kAnti, true}, std::pair{plan::JoinKind::kLeft, true}}) {
+      for (const std::vector<int>& columns : keys) {
+        std::vector<plan::BoundColumn> probe_keys;
+        std::vector<plan::BoundColumn> build_keys;
+        for (const int c : columns) {
+          probe_keys.push_back(MixedColumn("p", c));
+          build_keys.push_back(MixedColumn("b", c));
+        }
+        const bool left = kind == plan::JoinKind::kLeft;
+        const Rows expected = ReferenceOf(kind, probe_rows, build_rows, columns, columns, 3,
+                                          with_residual ? holds : Residual());
+        const auto plan =
+            PlanOf(JoinOf(kind, ScanOf(probe_table, "p"), ScanOf(build_table, "b"), probe_keys,
+                          build_keys, with_residual ? residual : std::vector<plan::ExprPtr>{}),
+                   left ? 6 : 3);
+        for (const int64_t batch_size : {1, 3, 64}) {
+          SCOPED_TRACE(std::string(plan::ToString(kind)) +
+                       (with_residual ? " with residuals" : "") + " on " +
+                       std::to_string(columns.size()) + " key(s) from column " +
+                       std::to_string(columns[0]) + (unique ? ", unique" : ", repeated") +
+                       ", batch size " + std::to_string(batch_size));
+          auto result = RunPlan(plan, ContextOf(nullptr, batch_size));
+          ASSERT_TRUE(result.ok()) << result.status().ToString();
+          EXPECT_EQ(RowsOf(**result), expected);
+        }
+      }
+    }
     // MIN(bk), COUNT(*) and MAX(bs) of the build table, appended to every probe row.
     const plan::LogicalNodePtr row = Node(plan::AggregateNode{
         .input = ScanOf(build_table, "b"),
@@ -3091,8 +3139,9 @@ TEST_F(HashJoinPlanTest, EveryKindMatchesTheNestedLoopReference) {
 // The shapes of SameResultsOnOneAndFourThreads where a join's kind matters give the same rows on
 // one thread and on four, for every kind but inner: the part union at the root, an aggregate above
 // the join, a probe over a serial input, a drained build, a chain with another join in one
-// pipeline and a build whose input probes a join of the kind. A one-row join's build input is an
-// aggregate (drained), or one row of a part pipeline.
+// pipeline and a build whose input probes a join of the kind; for semi, anti and left joins with
+// residuals too. A one-row join's build input is an aggregate (drained), or one row of a part
+// pipeline.
 TEST_F(HashJoinPlanTest, EveryKindGivesTheSameResultsOnOneAndFourThreads) {
   const auto pool = MakeThreadPool();
   const auto p = MixedTable("p", 6, 7, ProbeKey);
@@ -3123,30 +3172,49 @@ TEST_F(HashJoinPlanTest, EveryKindGivesTheSameResultsOnOneAndFourThreads) {
                        count}});
   };
   std::vector<std::pair<std::string, plan::LogicalPlan>> shapes;
-  for (const plan::JoinKind kind :
-       {plan::JoinKind::kSemi, plan::JoinKind::kAnti, plan::JoinKind::kNullAwareAnti}) {
-    const std::string name(plan::ToString(kind));
-    const auto join = JoinOf(kind, ScanOf(p, "p"), ScanOf(b, "b"), {pk}, {bk});  // p's columns
-    shapes.emplace_back(name + " join", PlanOf(join, 3));
+  // Residuals over a pair of two of the tables' rows (each k, s and id): the build's id * 3 is at
+  // least the probe's.
+  const std::vector<plan::ExprPtr> residual = {
+      Comparison(plan::CompareOp::kGe, Times(ColumnAt(5, LogicalType::kBigInt), ConstantOf(3)),
+                 ColumnAt(2, LogicalType::kBigInt))};
+  for (const auto& [kind, with_residual] :
+       {std::pair{plan::JoinKind::kSemi, false}, std::pair{plan::JoinKind::kAnti, false},
+        std::pair{plan::JoinKind::kNullAwareAnti, false}, std::pair{plan::JoinKind::kLeft, false},
+        std::pair{plan::JoinKind::kSemi, true}, std::pair{plan::JoinKind::kAnti, true},
+        std::pair{plan::JoinKind::kLeft, true}}) {
+    const std::string name =
+        std::string(plan::ToString(kind)) + (with_residual ? " with residuals" : "");
+    const std::vector<plan::ExprPtr> conditions =
+        with_residual ? residual : std::vector<plan::ExprPtr>{};
+    // The width of the join of a probe and a build of these widths: a left join's has both.
+    const auto width = [left = kind == plan::JoinKind::kLeft](std::size_t probe,
+                                                              std::size_t build) {
+      return left ? probe + build : probe;
+    };
+    const auto join = JoinOf(kind, ScanOf(p, "p"), ScanOf(b, "b"), {pk}, {bk}, conditions);
+    shapes.emplace_back(name + " join", PlanOf(join, width(3, 3)));
     shapes.emplace_back(
         name + " aggregate",
         PlanOf(Node(plan::AggregateNode{.input = join, .aggregates = {count, max_pid}}), 2));
-    shapes.emplace_back(name + " serial probe",
-                        PlanOf(JoinOf(kind, probe_groups, ScanOf(b, "b"),
-                                      {Column(0, "pk", LogicalType::kBigInt)}, {bk}),
-                               2));
-    shapes.emplace_back(name + " drained build",
-                        PlanOf(JoinOf(kind, ScanOf(p, "p"), build_groups, {pk},
-                                      {Column(0, "bk", LogicalType::kBigInt)}),
-                               3));
+    if (!with_residual) {  // the residuals read two tables' rows
+      shapes.emplace_back(name + " serial probe",
+                          PlanOf(JoinOf(kind, probe_groups, ScanOf(b, "b"),
+                                        {Column(0, "pk", LogicalType::kBigInt)}, {bk}),
+                                 width(2, 3)));
+      shapes.emplace_back(name + " drained build",
+                          PlanOf(JoinOf(kind, ScanOf(p, "p"), build_groups, {pk},
+                                        {Column(0, "bk", LogicalType::kBigInt)}),
+                                 width(3, 2)));
+    }
     shapes.emplace_back(
         name + " chain",
-        PlanOf(JoinOf(plan::JoinKind::kInner, join, ScanOf(d, "d"), {pid}, {dk}), 6));
+        PlanOf(JoinOf(plan::JoinKind::kInner, join, ScanOf(d, "d"), {pid}, {dk}), width(3, 3) + 3));
     shapes.emplace_back(
         name + " nested build",
         PlanOf(JoinOf(plan::JoinKind::kInner, ScanOf(p, "p"),
-                      JoinOf(kind, ScanOf(b, "b"), ScanOf(d, "d"), {bid}, {dk}), {pk}, {bk}),
-               6));
+                      JoinOf(kind, ScanOf(b, "b"), ScanOf(d, "d"), {bid}, {dk}, conditions), {pk},
+                      {bk}),
+               3 + width(3, 3)));
   }
   // One-row: p's columns, then MIN(bid) and COUNT(*) over b.
   const auto one_row =

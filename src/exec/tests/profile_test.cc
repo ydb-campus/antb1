@@ -8,6 +8,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <variant>
 #include <vector>
 
 #include <arrow/api.h>
@@ -336,14 +337,17 @@ TEST_F(ProfileTest, JoinsShowBuildAndProbeLines) {
   }
 }
 
-// Semi, anti, null-aware anti and one-row joins show the lines of an inner join, HashJoin for the
-// probe and HashBuild for the build, with the same counts on 1 and 4 threads: the probe's rows are
-// the rows it keeps, the build's those its table holds (a one-row join's single row). A probe that
-// looks keys up has find; one that keeps every row without a lookup (an anti join over no build
-// row) has none, and only a one-row probe has gather. Over t's 140 rows (g = x % 5) and the
-// dimension's keys 0..9: a semi join on g keeps every row, an anti or null-aware anti join on x
+// Semi, anti, null-aware anti, left and one-row joins show the lines of an inner join, HashJoin for
+// the probe and HashBuild for the build, with the same counts on 1 and 4 threads: the probe's rows
+// are the rows it returns, the build's those its table holds (a one-row join's single row). A
+// probe that looks keys up has find; one that keeps every row without a lookup (an anti join over
+// no build row) has none. A one-row probe has gather, and so does a left probe (window_rows on its
+// 1:1 path) or one with residuals (residual). Over t's 140 rows (g = x % 5) and the dimension's
+// keys 0..9 (v = 100 + k): a semi join on g keeps every row, an anti or null-aware anti join on x
 // keeps the 130 rows of x >= 10, and an anti join over the dimension's keys above 100 every row:
-// there are none, so statistics skip both of the build's parts.
+// there are none, so statistics skip both of the build's parts. A left join on x pads those 130
+// rows; with the residual v > 102 on g, a left join pads the rows of g < 3 and a semi join keeps
+// the 56 others.
 TEST_F(ProfileTest, JoinsOfOtherKindsShowBuildAndProbeLines) {
   auto pool = arrow::internal::ThreadPool::Make(4);
   ASSERT_TRUE(pool.ok());
@@ -351,15 +355,25 @@ TEST_F(ProfileTest, JoinsOfOtherKindsShowBuildAndProbeLines) {
   const auto d = Node(plan::ScanNode{.table = Dimension(), .table_name = "d", .fields = {0, 1}});
   const auto k = Column(0, "k", LogicalType::kBigInt);
   const auto join_of = [](plan::JoinKind kind, plan::LogicalNodePtr probe,
-                          plan::LogicalNodePtr build, std::vector<plan::JoinKey> keys) {
+                          plan::LogicalNodePtr build, std::vector<plan::JoinKey> keys,
+                          std::vector<plan::ExprPtr> residual = {}) {
     return Node(plan::JoinNode{.kind = kind,
                                .left = std::move(probe),
                                .right = std::move(build),
                                .keys = std::move(keys),
-                               .residual = {},
+                               .residual = std::move(residual),
                                .build = plan::BuildSide::kRight,
                                .span = {}});
   };
+  // v > 102 over a pair: t's x and g, then the dimension's k and v.
+  const std::vector<plan::ExprPtr> above = {std::make_shared<const plan::Expr>(
+      plan::Expr{.node =
+                     plan::PredicateExpr{
+                         .predicate = testing::Compare(Column(0, "v", LogicalType::kBigInt),
+                                                       plan::CompareOp::kGt, testing::BigInt(102)),
+                         .operands = {std::make_shared<const plan::Expr>(plan::Expr{
+                             .node = plan::ColumnExpr{.index = 3}, .type = LogicalType::kBigInt})}},
+                 .type = LogicalType::kBoolean})};
   const auto on = [&](const plan::BoundColumn& probe_key) {
     return std::vector<plan::JoinKey>{plan::JoinKey{.left = probe_key, .right = k}};
   };
@@ -386,6 +400,8 @@ TEST_F(ProfileTest, JoinsOfOtherKindsShowBuildAndProbeLines) {
     plan::LogicalNodePtr join;
     std::string counts;
     bool find = true;
+    bool gather = false;
+    bool window_rows = false;
   };
   const std::vector<Case> cases = {
       {.name = "semi",
@@ -410,7 +426,21 @@ TEST_F(ProfileTest, JoinsOfOtherKindsShowBuildAndProbeLines) {
                  "  HashBuild rows=1 runs=1 parts=1\n"
                  "    PartAggregate rows=1 runs=1 parts=2 skipped=0\n"
                  "      Scan rows=10 runs=2 per_part\n",
-       .find = false},
+       .find = false,
+       .gather = true},
+      {.name = "left",
+       .join = join_of(plan::JoinKind::kLeft, t, d, on(x)),
+       .counts = "  HashJoin rows=140 runs=20 per_part\n" + scan_lines + dimension,
+       .gather = true,
+       .window_rows = true},
+      {.name = "left with a residual",
+       .join = join_of(plan::JoinKind::kLeft, t, d, on(g), above),
+       .counts = "  HashJoin rows=140 runs=20 per_part\n" + scan_lines + dimension,
+       .gather = true},
+      {.name = "semi with a residual",
+       .join = join_of(plan::JoinKind::kSemi, t, d, on(g), above),
+       .counts = "  HashJoin rows=56 runs=20 per_part\n" + scan_lines + dimension,
+       .gather = true},
   };
   for (arrow::internal::Executor* executor :
        {static_cast<arrow::internal::Executor*>(nullptr),
@@ -427,8 +457,11 @@ TEST_F(ProfileTest, JoinsOfOtherKindsShowBuildAndProbeLines) {
       EXPECT_EQ(probe.detail(), plan::ExplainNode(*c.join));
       EXPECT_EQ(build.detail(), plan::ExplainNode(*c.join));
       EXPECT_EQ(MetricOf(probe, "find").has_value(), c.find);
-      EXPECT_EQ(MetricOf(probe, "gather").has_value(), c.name == "one-row");
-      EXPECT_FALSE(MetricOf(probe, "window_rows").has_value());
+      EXPECT_EQ(MetricOf(probe, "gather").has_value(), c.gather);
+      EXPECT_EQ(MetricOf(probe, "window_rows"),
+                c.window_rows ? std::optional<int64_t>(140) : std::nullopt);
+      EXPECT_EQ(MetricOf(probe, "residual").has_value(),
+                !std::get<plan::JoinNode>(*c.join).residual.empty());
       EXPECT_TRUE(MetricOf(build, "finish").has_value());
     }
   }

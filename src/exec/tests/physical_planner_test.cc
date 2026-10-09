@@ -1,12 +1,12 @@
 #include "antb1/exec/physical_planner.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
-#include <tuple>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -483,13 +483,23 @@ TEST_F(PhysicalPlannerTest, LateScansAreFiltered) {
   }
 }
 
-// The places of `join` (`width` columns, x its first) in a query over `scan` (x and y), each with
-// its root's width: at the root, below every other node (in the part pipeline it ends, or that
-// goes on through it), and as an inner join's build input or probe input (the inner join's span:
-// `elsewhere`).
-std::vector<std::pair<plan::LogicalNodePtr, std::size_t>> Placements(
-    const plan::LogicalNodePtr& join, std::size_t width, const plan::LogicalNodePtr& scan,
-    SourceSpan elsewhere) {
+// The rows a placement of a join returns: the join's, one, one per distinct x of the join's rows,
+// or at most 3 of the join's.
+enum class Expect : std::uint8_t { kJoin, kOne, kGroups, kLimit };
+
+// A place of a join in a query: its root, the root's width, and its rows.
+struct Placement {
+  plan::LogicalNodePtr root;
+  std::size_t width = 0;
+  Expect rows = Expect::kJoin;
+};
+
+// The places of `join` (`width` columns, x its first) in a query over `scan` (x and y, one row of
+// each x): at the root, below every other node (in the part pipeline it ends, or that goes on
+// through it), and as an inner join's build input or probe input on x (each of the join's rows
+// meets the one row of scan with its x).
+std::vector<Placement> Placements(const plan::LogicalNodePtr& join, std::size_t width,
+                                  const plan::LogicalNodePtr& scan) {
   const plan::BoundColumn x{.index = 0, .name = "x", .type = LogicalType::kBigInt};
   const auto node = [](plan::LogicalNode n) {
     return std::make_shared<const plan::LogicalNode>(std::move(n));
@@ -501,7 +511,7 @@ std::vector<std::pair<plan::LogicalNodePtr, std::size_t>> Placements(
                                .keys = {plan::JoinKey{.left = x, .right = x}},
                                .residual = {},
                                .build = plan::BuildSide::kRight,
-                               .span = elsewhere});
+                               .span = {}});
   };
   const auto filter = node(plan::FilterNode{
       .input = join,
@@ -514,91 +524,53 @@ std::vector<std::pair<plan::LogicalNodePtr, std::size_t>> Placements(
   const auto one = std::make_shared<const plan::Expr>(plan::Expr{
       .node = plan::ConstantExpr{.value = BigInt(1)}, .type = LogicalType::kBigInt, .name = "1"});
   return {
-      {join, width},
-      {filter, width},
-      {node(plan::ComputeNode{.input = join, .exprs = {one}}), width + 1},
-      {node(plan::ProjectNode{.input = join, .columns = {x}}), 1},
-      {node(plan::AggregateNode{.input = join, .aggregates = {min}}), 1},
-      {node(plan::AggregateNode{.input = filter, .aggregates = {min}}), 1},
-      {node(plan::AggregateNode{.input = join, .aggregates = {distinct}}), 1},
-      {node(plan::GroupAggregateNode{.input = join, .keys = {x}, .aggregates = {min}}), 2},
-      {node(plan::GroupAggregateNode{.input = filter, .keys = {x}, .aggregates = {min}}), 2},
-      {sort, width},
-      {node(plan::LimitNode{.input = join, .limit = 3}), width},
-      {node(plan::LimitNode{.input = filter, .limit = 3}), width},
-      {node(plan::LimitNode{.input = sort, .limit = 3}), width},
-      {inner(scan, join), 2 + width},    // the build input
-      {inner(join, scan), width + 2},    // the probe input
-      {inner(filter, scan), width + 2},  // below the probe's Filter
+      {.root = join, .width = width, .rows = Expect::kJoin},
+      {.root = filter, .width = width, .rows = Expect::kJoin},
+      {.root = node(plan::ComputeNode{.input = join, .exprs = {one}}),
+       .width = width + 1,
+       .rows = Expect::kJoin},
+      {.root = node(plan::ProjectNode{.input = join, .columns = {x}}),
+       .width = 1,
+       .rows = Expect::kJoin},
+      {.root = node(plan::AggregateNode{.input = join, .aggregates = {min}}),
+       .width = 1,
+       .rows = Expect::kOne},
+      {.root = node(plan::AggregateNode{.input = filter, .aggregates = {min}}),
+       .width = 1,
+       .rows = Expect::kOne},
+      {.root = node(plan::AggregateNode{.input = join, .aggregates = {distinct}}),
+       .width = 1,
+       .rows = Expect::kOne},
+      {.root = node(plan::GroupAggregateNode{.input = join, .keys = {x}, .aggregates = {min}}),
+       .width = 2,
+       .rows = Expect::kGroups},
+      {.root = node(plan::GroupAggregateNode{.input = filter, .keys = {x}, .aggregates = {min}}),
+       .width = 2,
+       .rows = Expect::kGroups},
+      {.root = sort, .width = width, .rows = Expect::kJoin},
+      {.root = node(plan::LimitNode{.input = join, .limit = 3}),
+       .width = width,
+       .rows = Expect::kLimit},
+      {.root = node(plan::LimitNode{.input = filter, .limit = 3}),
+       .width = width,
+       .rows = Expect::kLimit},
+      {.root = node(plan::LimitNode{.input = sort, .limit = 3}),
+       .width = width,
+       .rows = Expect::kLimit},
+      {.root = inner(scan, join), .width = 2 + width, .rows = Expect::kJoin},    // the build input
+      {.root = inner(join, scan), .width = width + 2, .rows = Expect::kJoin},    // the probe input
+      {.root = inner(filter, scan), .width = width + 2, .rows = Expect::kJoin},  // below its Filter
   };
 }
 
-// LEFT joins, and semi or anti joins with residuals, run from roadmap PR E2b on (ADR 0022): until
-// then they are rejected with exit code 4 at the join's span, in every placement (Placements: a
-// part pipeline stops at a LEFT join and goes on through a semi or anti join, whose residuals the
-// pipeline's builds reject), and with a profile.
-TEST_F(PhysicalPlannerTest, LeftJoinsAndSemiAntiResidualsAreUnsupported) {
-  const auto table = Table(/*split=*/true);
-  const auto scan = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}});
-  const plan::BoundColumn x{.index = 0, .name = "x", .type = LogicalType::kBigInt};
-  const SourceSpan span{.offset = 7, .length = 4};
-  // y > x: a residual over both inputs (the right y is column 3).
-  const auto greater = std::make_shared<const plan::Expr>(plan::Expr{
-      .node =
-          plan::PredicateExpr{.predicate =
-                                  plan::Predicate{.kind = plan::Predicate::Kind::kCompareColumns,
-                                                  .column = Column(0, "y", LogicalType::kBigInt),
-                                                  .other = Column(1, "x", LogicalType::kBigInt),
-                                                  .op = plan::CompareOp::kGt},
-                              .operands = {std::make_shared<const plan::Expr>(
-                                               plan::Expr{.node = plan::ColumnExpr{.index = 3},
-                                                          .type = LogicalType::kBigInt}),
-                                           std::make_shared<const plan::Expr>(
-                                               plan::Expr{.node = plan::ColumnExpr{.index = 0},
-                                                          .type = LogicalType::kBigInt})}},
-      .type = LogicalType::kBoolean});
-  const auto expect_unsupported = [&](const plan::LogicalNodePtr& root,
-                                      const std::string& message) {
-    for (const bool profiled : {false, true}) {
-      ProfileNode profile;
-      const auto status = BuildPhysicalPlan(PlanOf(root), profiled ? &profile : nullptr).status();
-      const auto detail = plan::GetSqlError(status);
-      ASSERT_NE(detail, nullptr) << plan::NodeName(*root) << ": " << status.ToString();
-      EXPECT_EQ(detail->kind(), plan::SqlErrorDetail::Kind::kUnsupported);
-      EXPECT_EQ(detail->span(), span);
-      EXPECT_EQ(status.message(), message);
-    }
-  };
-  for (const auto& [kind, residual, message] :
-       {std::tuple{plan::JoinKind::kLeft, std::vector<plan::ExprPtr>{},
-                   "LEFT joins are not supported yet"},
-        std::tuple{plan::JoinKind::kLeft, std::vector<plan::ExprPtr>{greater},
-                   "LEFT joins are not supported yet"},
-        std::tuple{plan::JoinKind::kSemi, std::vector<plan::ExprPtr>{greater},
-                   "SEMI joins with residuals are not supported yet"},
-        std::tuple{plan::JoinKind::kAnti, std::vector<plan::ExprPtr>{greater},
-                   "ANTI joins with residuals are not supported yet"}}) {
-    SCOPED_TRACE(message);
-    const auto join = Node(plan::JoinNode{.kind = kind,
-                                          .left = scan,
-                                          .right = scan,
-                                          .keys = {plan::JoinKey{.left = x, .right = x}},
-                                          .residual = residual,
-                                          .build = plan::BuildSide::kRight,
-                                          .span = span});
-    for (const auto& [root, width] : Placements(join, kind == plan::JoinKind::kLeft ? 4 : 2, scan,
-                                                {.offset = 30, .length = 4})) {
-      expect_unsupported(root, message);
-    }
-  }
-}
-
-// Semi, anti, null-aware anti and one-row joins run in every placement (Placements: a part
-// pipeline goes on through their probes), with a profile and without. Over x = 0..9 (y = 10x,
-// NULL where x is a multiple of 3), a semi self-join on x keeps every row, an anti or a null-aware
-// anti one none; on y, an anti self-join keeps the rows of a NULL y and a null-aware anti one none
-// (its build has a NULL key); a one-row join appends the row of MIN(x) and COUNT(*).
-TEST_F(PhysicalPlannerTest, SemiAntiAndOneRowJoinsRunEverywhere) {
+// Joins of every kind run in every placement (Placements: a part pipeline goes on through their
+// probes), with a profile and without, and return their rows there, none included. Over x = 0..9
+// (y = 10x, NULL where x is a multiple of 3), self-joins: on x, semi keeps every row, anti and
+// null-aware anti none, left matches every row; on y, anti keeps the rows of a NULL y, null-aware
+// anti none (its build has a NULL key), and left pads them. A one-row join appends the row of
+// MIN(x) and COUNT(*). The residual y > x (the right input's y) passes the rows of a non-NULL y
+// but x = 0: semi keeps them, anti the others, and left pads the others.
+TEST_F(PhysicalPlannerTest, EveryJoinKindRunsEverywhere) {
   const auto table = Table(/*split=*/true);
   const auto scan = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}});
   const auto x = Column(0, "x", LogicalType::kBigInt);
@@ -608,49 +580,93 @@ TEST_F(PhysicalPlannerTest, SemiAntiAndOneRowJoinsRunEverywhere) {
       .aggregates = {
           {.kind = plan::AggKind::kMin, .arg = x, .type = LogicalType::kBigInt},
           {.kind = plan::AggKind::kCountStar, .arg = {}, .type = LogicalType::kBigInt}}});
+  // y > x over the pair: the right input's y is column 3, the left input's x column 0.
+  const auto column = [](int index) {
+    return std::make_shared<const plan::Expr>(
+        plan::Expr{.node = plan::ColumnExpr{.index = index}, .type = LogicalType::kBigInt});
+  };
+  const auto greater = std::make_shared<const plan::Expr>(plan::Expr{
+      .node =
+          plan::PredicateExpr{
+              .predicate = plan::Predicate{.kind = plan::Predicate::Kind::kCompareColumns,
+                                           .column = Column(0, "y", LogicalType::kBigInt),
+                                           .other = Column(1, "x", LogicalType::kBigInt),
+                                           .op = plan::CompareOp::kGt},
+              .operands = {column(3), column(0)}},
+      .type = LogicalType::kBoolean});
   using Values = std::vector<std::optional<int64_t>>;
   const Values all = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+  const std::optional<int64_t> null;
+  const Values non_null_y = {null, 1, 2, null, 4, 5, null, 7, 8, null};
   struct Case {
     plan::JoinKind kind;
     std::optional<plan::BoundColumn> key;  // none: a one-row join of `row`
-    Values xs;                             // the x of the rows it keeps
+    bool residual = false;                 // y > x
+    Values xs;                             // the x of the rows it returns
+    Values right;  // a left join: the right input's x of each row (NULL: padded)
   };
-  for (const Case& c : {Case{.kind = plan::JoinKind::kSemi, .key = x, .xs = all},
-                        Case{.kind = plan::JoinKind::kAnti, .key = x, .xs = {}},
-                        Case{.kind = plan::JoinKind::kNullAwareAnti, .key = x, .xs = {}},
-                        Case{.kind = plan::JoinKind::kAnti, .key = y, .xs = {0, 3, 6, 9}},
-                        Case{.kind = plan::JoinKind::kNullAwareAnti, .key = y, .xs = {}},
-                        Case{.kind = plan::JoinKind::kOneRow, .key = {}, .xs = all}}) {
+  for (const Case& c :
+       {Case{.kind = plan::JoinKind::kSemi, .key = x, .xs = all},
+        Case{.kind = plan::JoinKind::kAnti, .key = x, .xs = {}},
+        Case{.kind = plan::JoinKind::kNullAwareAnti, .key = x, .xs = {}},
+        Case{.kind = plan::JoinKind::kAnti, .key = y, .xs = {0, 3, 6, 9}},
+        Case{.kind = plan::JoinKind::kNullAwareAnti, .key = y, .xs = {}},
+        Case{.kind = plan::JoinKind::kOneRow, .key = {}, .xs = all},
+        Case{.kind = plan::JoinKind::kLeft, .key = x, .xs = all, .right = all},
+        Case{.kind = plan::JoinKind::kLeft, .key = y, .xs = all, .right = non_null_y},
+        Case{.kind = plan::JoinKind::kSemi, .key = x, .residual = true, .xs = {1, 2, 4, 5, 7, 8}},
+        Case{.kind = plan::JoinKind::kAnti, .key = x, .residual = true, .xs = {0, 3, 6, 9}},
+        Case{.kind = plan::JoinKind::kLeft,
+             .key = x,
+             .residual = true,
+             .xs = all,
+             .right = non_null_y}}) {
     SCOPED_TRACE(std::string(plan::ToString(c.kind)) +
-                 (c.key.has_value() ? " on " + c.key->name : ""));
+                 (c.key.has_value() ? " on " + c.key->name : "") +
+                 (c.residual ? " with a residual" : ""));
     const bool one_row = c.kind == plan::JoinKind::kOneRow;
+    const bool wide = one_row || c.kind == plan::JoinKind::kLeft;
     std::vector<plan::JoinKey> keys;
     if (c.key.has_value()) {
       keys.push_back(plan::JoinKey{.left = *c.key, .right = *c.key});
     }
-    const auto join = Node(plan::JoinNode{.kind = c.kind,
-                                          .left = scan,
-                                          .right = one_row ? row : scan,
-                                          .keys = std::move(keys),
-                                          .residual = {},
-                                          .build = plan::BuildSide::kRight,
-                                          .span = {}});
-    const std::size_t width = one_row ? 4 : 2;
+    const auto join = Node(plan::JoinNode{
+        .kind = c.kind,
+        .left = scan,
+        .right = one_row ? row : scan,
+        .keys = std::move(keys),
+        .residual = c.residual ? std::vector<plan::ExprPtr>{greater} : std::vector<plan::ExprPtr>{},
+        .build = plan::BuildSide::kRight,
+        .span = {}});
+    const std::size_t width = wide ? 4 : 2;
     const auto rows = Run(PlanOf(join, width));
     ASSERT_NE(rows, nullptr);
     EXPECT_EQ(Int64Column(*rows, 0), c.xs);
+    if (c.kind == plan::JoinKind::kLeft) {
+      EXPECT_EQ(Int64Column(*rows, 2), c.right);
+    }
     if (one_row) {
       EXPECT_EQ(Int64Column(*rows, 2), Values(10, 0));
       EXPECT_EQ(Int64Column(*rows, 3), Values(10, 10));
     }
-    for (const auto& [root, root_width] : Placements(join, width, scan, {})) {
+    const auto n = static_cast<int64_t>(c.xs.size());  // distinct xs: as many groups
+    for (const Placement& placement : Placements(join, width, scan)) {
+      int64_t expected = n;
+      if (placement.rows == Expect::kOne) {
+        expected = 1;
+      } else if (placement.rows == Expect::kLimit) {
+        expected = std::min<int64_t>(n, 3);
+      }
       for (const bool profiled : {false, true}) {
         ProfileNode profile;
-        auto op = BuildPhysicalPlan(PlanOf(root, root_width), profiled ? &profile : nullptr);
-        ASSERT_TRUE(op.ok()) << plan::NodeName(*root) << ": " << op.status().ToString();
+        auto op = BuildPhysicalPlan(PlanOf(placement.root, placement.width),
+                                    profiled ? &profile : nullptr);
+        ASSERT_TRUE(op.ok()) << plan::NodeName(*placement.root) << ": " << op.status().ToString();
         ExecContext ctx{.pool = arrow::default_memory_pool(), .batch_size = 3};
         const auto result = Drain(**op, ctx);
-        EXPECT_TRUE(result.ok()) << plan::NodeName(*root) << ": " << result.status().ToString();
+        ASSERT_TRUE(result.ok()) << plan::NodeName(*placement.root) << ": "
+                                 << result.status().ToString();
+        EXPECT_EQ((*result)->num_rows(), expected) << plan::NodeName(*placement.root);
       }
     }
   }
@@ -659,12 +675,12 @@ TEST_F(PhysicalPlannerTest, SemiAntiAndOneRowJoinsRunEverywhere) {
 // What a correct plan never holds is Invalid, never unsupported: a join without its inputs or
 // keys, a key of two types, a DOUBLE or BOOLEAN key, a key outside its input on either side, a
 // residual that is missing, not BOOLEAN or outside the join; a join of another kind than inner
-// that builds on its left input, a one-row join with keys or residuals, a semi, anti or null-aware
-// anti join without keys, a null-aware anti join of two keys or with a residual, a semi or anti
-// join with a residual that is missing or not BOOLEAN or with a key of two types (before its
-// residuals make it unsupported); in a part pipeline and over a serial probe input alike, with and
-// without a profile (whose lines name the join by its EXPLAIN text). Each plan has its join's own
-// width, so that only the join's shape can make it Invalid.
+// that builds on its left input, a one-row join with keys or residuals, a semi, anti, null-aware
+// anti or left join without keys, a null-aware anti join of two keys or with a residual, a semi,
+// anti or left join with a residual that is missing, not BOOLEAN or outside the join, or with a
+// key of two types; in a part pipeline and over a serial probe input alike, with and without a
+// profile (whose lines name the join by its EXPLAIN text). Each plan has its join's own width, so
+// that only the join's shape can make it Invalid.
 TEST_F(PhysicalPlannerTest, MalformedJoinsAreInvalidNotUnsupported) {
   const auto table = Table(/*split=*/true);
   const auto scan = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}});
@@ -724,8 +740,8 @@ TEST_F(PhysicalPlannerTest, MalformedJoinsAreInvalidNotUnsupported) {
     expect_invalid(join_of(probe, key(x, x), {expr(1, LogicalType::kBigInt)}), "a BIGINT residual");
     expect_invalid(join_of(probe, key(x, x), {expr(4, LogicalType::kBoolean)}),
                    "a residual outside the join");
-    // The other kinds: building on the left, keys or residuals where none go, a missing residual
-    // and a bad key, which come before the semi or anti residuals that E2b runs.
+    // The other kinds: building on the left, keys or residuals where none go, a bad residual and a
+    // bad key.
     const auto kind_of = [&](plan::JoinKind kind, std::vector<plan::JoinKey> keys,
                              std::vector<plan::ExprPtr> residual,
                              plan::BuildSide build = plan::BuildSide::kRight) {
@@ -739,8 +755,9 @@ TEST_F(PhysicalPlannerTest, MalformedJoinsAreInvalidNotUnsupported) {
     };
     const auto y = Column(1, "y", LogicalType::kBigInt);
     const auto boolean = expr(0, LogicalType::kBoolean);
-    for (const plan::JoinKind kind : {plan::JoinKind::kSemi, plan::JoinKind::kAnti,
-                                      plan::JoinKind::kNullAwareAnti, plan::JoinKind::kOneRow}) {
+    for (const plan::JoinKind kind :
+         {plan::JoinKind::kSemi, plan::JoinKind::kAnti, plan::JoinKind::kNullAwareAnti,
+          plan::JoinKind::kOneRow, plan::JoinKind::kLeft}) {
       expect_invalid(kind_of(kind, key(x, x), {}, plan::BuildSide::kLeft),
                      "a join of another kind than inner that builds on its left input");
     }
@@ -751,6 +768,7 @@ TEST_F(PhysicalPlannerTest, MalformedJoinsAreInvalidNotUnsupported) {
     expect_invalid(kind_of(plan::JoinKind::kAnti, {}, {}), "an anti join without keys");
     expect_invalid(kind_of(plan::JoinKind::kNullAwareAnti, {}, {}),
                    "a null-aware anti join without keys");
+    expect_invalid(kind_of(plan::JoinKind::kLeft, {}, {}), "a left join without keys");
     expect_invalid(
         kind_of(plan::JoinKind::kNullAwareAnti,
                 {plan::JoinKey{.left = x, .right = x}, plan::JoinKey{.left = y, .right = y}}, {}),
@@ -763,9 +781,19 @@ TEST_F(PhysicalPlannerTest, MalformedJoinsAreInvalidNotUnsupported) {
                    "a semi join with a BIGINT residual");
     expect_invalid(kind_of(plan::JoinKind::kAnti, key(x, x), {expr(3, LogicalType::kBigInt)}),
                    "an anti join with a BIGINT residual");
+    expect_invalid(kind_of(plan::JoinKind::kLeft, key(x, x), {expr(3, LogicalType::kBigInt)}),
+                   "a left join with a BIGINT residual");
+    for (const plan::JoinKind kind :
+         {plan::JoinKind::kSemi, plan::JoinKind::kAnti, plan::JoinKind::kLeft}) {
+      expect_invalid(kind_of(kind, key(x, x), {expr(4, LogicalType::kBoolean)}),
+                     "a residual outside the join of another kind");
+    }
     expect_invalid(
         kind_of(plan::JoinKind::kAnti, key(x, Column(0, "x", LogicalType::kInteger)), {boolean}),
         "an anti join key of two types");
+    expect_invalid(
+        kind_of(plan::JoinKind::kLeft, key(x, Column(0, "x", LogicalType::kInteger)), {}),
+        "a left join key of two types");
   }
   // A malformed join in a build input: in its part pipeline, and drained.
   for (const plan::LogicalNodePtr& probe : {scan, sorted}) {
