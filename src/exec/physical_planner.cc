@@ -203,12 +203,12 @@ arrow::Result<std::shared_ptr<JoinBuild>> MakeJoinBuild(const plan::JoinNode& jo
     return std::make_shared<JoinBuild>(
         std::move(spec), std::move(parts.pipeline), parts.count,
         parts.builds == nullptr ? std::vector<std::shared_ptr<JoinBuild>>{} : parts.builds->builds,
-        slot);
+        slot, join.kind);
   }
   ARROW_ASSIGN_OR_RAISE(
       auto input, Build(shape.build, std::nullopt, slot == nullptr ? nullptr : slot->Child(0)));
   ARROW_ASSIGN_OR_RAISE(auto spec, JoinBuildSpec::Make(input->output_schema(), shape.build_keys));
-  return std::make_shared<JoinBuild>(std::move(spec), std::move(input), slot);
+  return std::make_shared<JoinBuild>(std::move(spec), std::move(input), slot, join.kind);
 }
 
 // The builds of the inner joins in the part pipeline whose top is `top`, outermost first; nullptr

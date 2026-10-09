@@ -1049,7 +1049,7 @@ TEST_F(JoinTableBadAllocTest, APrepareThatRunsOutOfMemoryHoldsNothing) {
       bool fired = false;
       {
         JoinBuild build(*spec, std::make_unique<testing::ScriptedSource>(input.schema, batches),
-                        nullptr);
+                        nullptr, plan::JoinKind::kInner);
         ExecContext ctx{.pool = &budget,
                         .batch_size = kRows,
                         .executor = &spawns,
