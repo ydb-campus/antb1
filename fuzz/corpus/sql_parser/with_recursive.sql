@@ -1,0 +1,1 @@
+WITH recursive AS (SELECT a FROM t), c AS MATERIALIZED (SELECT a FROM recursive) SELECT a FROM c

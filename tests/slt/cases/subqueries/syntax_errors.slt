@@ -1,0 +1,309 @@
+# WITH lists and derived tables that both engines reject as malformed (ADR 0022, roadmap PR S4a). antb1 must fail
+# with a syntax error, never Unsupported, and each record's `onlyif duckdb` twin checks that DuckDB fails in its
+# parser too: a statement that antb1 wrongly calls a syntax error would parse in DuckDB and fail the twin. The tables
+# are registered and the columns real, so no record fails on a missing name instead.
+
+# ---- the input ----
+
+query II nosort
+SELECT COUNT(*), MAX(tr_row) FROM trips
+----
+3000	2999
+
+# ---- WITH lists: the list without a query, a CTE without AS or its parentheses, a trailing comma ----
+
+statement error
+WITH c AS (SELECT tr_row FROM trips)
+
+onlyif duckdb
+statement error ^Parser Error:
+WITH c AS (SELECT tr_row FROM trips)
+
+statement error
+WITH c AS (SELECT tr_row FROM trips);
+
+onlyif duckdb
+statement error ^Parser Error:
+WITH c AS (SELECT tr_row FROM trips);
+
+statement error
+WITH c (SELECT tr_row FROM trips) SELECT COUNT(*) FROM c
+
+onlyif duckdb
+statement error ^Parser Error:
+WITH c (SELECT tr_row FROM trips) SELECT COUNT(*) FROM c
+
+statement error
+WITH c AS SELECT COUNT(*) FROM trips
+
+onlyif duckdb
+statement error ^Parser Error:
+WITH c AS SELECT COUNT(*) FROM trips
+
+statement error
+WITH c AS (SELECT tr_row FROM trips), SELECT COUNT(*) FROM c
+
+onlyif duckdb
+statement error ^Parser Error:
+WITH c AS (SELECT tr_row FROM trips), SELECT COUNT(*) FROM c
+
+statement error
+WITH c AS (SELECT tr_row FROM trips) WITH d AS (SELECT tr_row FROM trips) SELECT COUNT(*) FROM c
+
+onlyif duckdb
+statement error ^Parser Error:
+WITH c AS (SELECT tr_row FROM trips) WITH d AS (SELECT tr_row FROM trips) SELECT COUNT(*) FROM c
+
+statement error
+WITH c USING (SELECT tr_row FROM trips) SELECT COUNT(*) FROM c
+
+onlyif duckdb
+statement error ^Parser Error:
+WITH c USING (SELECT tr_row FROM trips) SELECT COUNT(*) FROM c
+
+statement error
+WITH c AS NOT (SELECT tr_row FROM trips) SELECT COUNT(*) FROM c
+
+onlyif duckdb
+statement error ^Parser Error:
+WITH c AS NOT (SELECT tr_row FROM trips) SELECT COUNT(*) FROM c
+
+statement error
+SELECT COUNT(*) FROM (WITH c AS (SELECT tr_row FROM trips))
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM (WITH c AS (SELECT tr_row FROM trips))
+
+# CTE names follow the rules of a table alias without AS.
+
+statement error
+WITH select AS (SELECT tr_row FROM trips) SELECT COUNT(*) FROM trips
+
+onlyif duckdb
+statement error ^Parser Error:
+WITH select AS (SELECT tr_row FROM trips) SELECT COUNT(*) FROM trips
+
+statement error
+WITH semi AS (SELECT tr_row FROM trips) SELECT COUNT(*) FROM trips
+
+onlyif duckdb
+statement error ^Parser Error:
+WITH semi AS (SELECT tr_row FROM trips) SELECT COUNT(*) FROM trips
+
+# A CTE name that repeats an earlier one of its list, ASCII case-insensitively and also as a string, whatever the
+# repeated CTE holds.
+
+statement error
+WITH c AS (SELECT tr_row FROM trips), C AS (SELECT tr_row FROM trips) SELECT COUNT(*) FROM c
+
+onlyif duckdb
+statement error ^Parser Error: Duplicate CTE name
+WITH c AS (SELECT tr_row FROM trips), C AS (SELECT tr_row FROM trips) SELECT COUNT(*) FROM c
+
+statement error
+WITH "Trips" AS (SELECT tr_row FROM trips), "tRIPS" AS (SELECT tr_row FROM trips) SELECT COUNT(*) FROM trips
+
+onlyif duckdb
+statement error ^Parser Error: Duplicate CTE name
+WITH "Trips" AS (SELECT tr_row FROM trips), "tRIPS" AS (SELECT tr_row FROM trips) SELECT COUNT(*) FROM trips
+
+statement error
+WITH c AS (SELECT tr_row FROM trips), 'c' AS (SELECT tr_row FROM trips) SELECT COUNT(*) FROM c
+
+onlyif duckdb
+statement error ^Parser Error: Duplicate CTE name
+WITH c AS (SELECT tr_row FROM trips), 'c' AS (SELECT tr_row FROM trips) SELECT COUNT(*) FROM c
+
+statement error
+WITH c AS (SELECT tr_row FROM trips), c AS (SELECT tr_row FROM trips WHERE tr_row IS NULL) SELECT COUNT(*) FROM c
+
+onlyif duckdb
+statement error ^Parser Error: Duplicate CTE name
+WITH c AS (SELECT tr_row FROM trips), c AS (SELECT tr_row FROM trips WHERE tr_row IS NULL) SELECT COUNT(*) FROM c
+
+statement error
+WITH c AS (SELECT tr_row FROM trips), c AS MATERIALIZED (SELECT tr_row FROM trips) SELECT COUNT(*) FROM c
+
+onlyif duckdb
+statement error ^Parser Error: Duplicate CTE name
+WITH c AS (SELECT tr_row FROM trips), c AS MATERIALIZED (SELECT tr_row FROM trips) SELECT COUNT(*) FROM c
+
+# ---- column alias lists: empty, a comma alone, no name, a reserved word or a word that is no alias ----
+
+statement error
+WITH c() AS (SELECT tr_row FROM trips) SELECT COUNT(*) FROM c
+
+onlyif duckdb
+statement error ^Parser Error:
+WITH c() AS (SELECT tr_row FROM trips) SELECT COUNT(*) FROM c
+
+statement error
+WITH c(,) AS (SELECT tr_row FROM trips) SELECT COUNT(*) FROM c
+
+onlyif duckdb
+statement error ^Parser Error:
+WITH c(,) AS (SELECT tr_row FROM trips) SELECT COUNT(*) FROM c
+
+statement error
+WITH c(x y) AS (SELECT tr_row, tr_fare FROM trips) SELECT COUNT(*) FROM c
+
+onlyif duckdb
+statement error ^Parser Error:
+WITH c(x y) AS (SELECT tr_row, tr_fare FROM trips) SELECT COUNT(*) FROM c
+
+statement error
+SELECT COUNT(*) FROM (SELECT tr_row FROM trips) AS s()
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM (SELECT tr_row FROM trips) AS s()
+
+statement error
+SELECT COUNT(*) FROM (SELECT tr_row FROM trips) AS s(,)
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM (SELECT tr_row FROM trips) AS s(,)
+
+statement error
+SELECT COUNT(*) FROM (SELECT tr_row FROM trips) AS s(x.y)
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM (SELECT tr_row FROM trips) AS s(x.y)
+
+statement error
+SELECT COUNT(*) FROM (SELECT tr_row FROM trips) AS s(1)
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM (SELECT tr_row FROM trips) AS s(1)
+
+statement error
+SELECT COUNT(*) FROM (SELECT tr_row FROM trips) AS s(select)
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM (SELECT tr_row FROM trips) AS s(select)
+
+statement error
+SELECT COUNT(*) FROM (SELECT tr_row FROM trips) AS s(semi)
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM (SELECT tr_row FROM trips) AS s(semi)
+
+# ---- derived tables: a column alias list without an alias or after a second one, the end of the query inside ----
+
+statement error
+SELECT COUNT(*) FROM (SELECT tr_row FROM trips) (x)
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM (SELECT tr_row FROM trips) (x)
+
+statement error
+SELECT COUNT(*) FROM (SELECT tr_row FROM trips) AS (x)
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM (SELECT tr_row FROM trips) AS (x)
+
+statement error
+SELECT COUNT(*) FROM (SELECT tr_row FROM trips) AS s(x) (y)
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM (SELECT tr_row FROM trips) AS s(x) (y)
+
+statement error
+SELECT COUNT(*) FROM (SELECT tr_row FROM trips) s(x) s2
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM (SELECT tr_row FROM trips) s(x) s2
+
+statement error
+SELECT COUNT(*) FROM (SELECT tr_row FROM trips) 's'
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM (SELECT tr_row FROM trips) 's'
+
+statement error
+SELECT COUNT(*) FROM (SELECT tr_row FROM trips ;)
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM (SELECT tr_row FROM trips ;)
+
+statement error
+SELECT COUNT(*) FROM (SELECT tr_row FROM trips
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM (SELECT tr_row FROM trips
+
+statement error
+SELECT COUNT(*) FROM (values)
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM (values)
+
+# After a derived table the words that are never aliases: time travel (AT) reads a table only.
+
+statement error
+SELECT COUNT(*) FROM (SELECT tr_row FROM trips) semi
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM (SELECT tr_row FROM trips) semi
+
+statement error
+SELECT COUNT(*) FROM (SELECT tr_row FROM trips) AT (VERSION => 1)
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM (SELECT tr_row FROM trips) AT (VERSION => 1)
+
+statement error
+SELECT COUNT(*) FROM (SELECT tr_row FROM trips) AS s(x) AT (VERSION => 1)
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM (SELECT tr_row FROM trips) AS s(x) AT (VERSION => 1)
+
+# antb1's messages.
+
+onlyif antb1
+statement error ^parse: expected SELECT, found end of input$
+WITH c AS (SELECT tr_row FROM trips)
+
+onlyif antb1
+statement error ^parse: duplicate CTE name in the WITH list \(names match case-insensitively\)$
+WITH c AS (SELECT tr_row FROM trips), C AS (SELECT tr_row FROM trips) SELECT COUNT(*) FROM c
+
+# ---- DuckDB only, for good: DuckDB's answers that antb1's grammar rests on ----
+
+# DuckDB takes a trailing comma in a column alias list (antb1 exits 4).
+onlyif duckdb
+query II nosort
+SELECT COUNT(*), MAX(x) FROM (SELECT tr_row, tr_fare FROM trips) AS s(x,)
+----
+3000	2999
+
+# A CTE's column alias list may be longer than its query's select list: DuckDB ignores the extra names.
+onlyif duckdb
+query II nosort
+WITH c(x, y, z) AS (SELECT tr_row FROM trips) SELECT COUNT(*), MAX(x) FROM c
+----
+3000	2999
+
+# A WITH list inside a derived table may reuse a name of the statement's.
+onlyif duckdb
+query I nosort
+WITH c AS (SELECT MIN(tr_row) AS x FROM trips) SELECT x FROM (WITH c AS (SELECT MAX(tr_row) AS x FROM trips) SELECT x FROM c)
+----
+2999

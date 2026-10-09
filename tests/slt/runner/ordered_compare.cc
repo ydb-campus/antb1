@@ -148,10 +148,15 @@ std::optional<OrderedQuery> MakeOrderedQuery(std::string_view sql) {
   stmt->limit.reset();
   stmt->offset.reset();
   if (stmt->star) {
+    // SELECT *, <keys>: the keys printed as the select list, then the star put before them, after
+    // the WITH list (if any).
     stmt->star = false;
     stmt->items = std::move(extra);
-    const std::string text = sql::ToSql(*stmt);
-    q.augmented_sql = "SELECT *, " + text.substr(std::string_view("SELECT ").size());
+    const std::string text = sql::ToSql(*stmt);  // [WITH ...] SELECT <keys> FROM ...
+    stmt->with.clear();
+    const std::string block = sql::ToSql(*stmt);  // SELECT <keys> FROM ...
+    q.augmented_sql = text.substr(0, text.size() - block.size()) + "SELECT *, " +
+                      block.substr(std::string_view("SELECT ").size());
   } else {
     stmt->items.insert(stmt->items.end(), extra.begin(), extra.end());
     q.augmented_sql = sql::ToSql(*stmt);
