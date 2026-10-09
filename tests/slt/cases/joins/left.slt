@@ -76,6 +76,13 @@ SELECT COUNT(*), COUNT(sh_row), COUNT(sh_hours) FROM trips LEFT JOIN shifts ON t
 ----
 3002	447	426
 
+# An ON conjunct across both sides is a residual: each passing shift is a match, and a trip without one is padded once.
+pending J6
+query II nosort
+SELECT COUNT(*), COUNT(sh_row) FROM trips LEFT JOIN shifts ON tr_driver = sh_driver AND sh_day < tr_day
+----
+7579	6785
+
 # An ON conjunct on the null-supplying side filters that side only.
 pending J6
 query III rowsort
