@@ -22,6 +22,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -2454,8 +2455,8 @@ TEST_F(HashJoinTest, ResidualErrorsDoNotDependOnTheBatchSize) {
 // A probe row without candidates never meets a residual: p.v * p.m > 0 would overflow on the probe
 // row of key 1 (v 2^62), which no build row matches, so no error comes; anti keeps that row and
 // left pads it, as any row without candidates. The row of key 2 has a candidate and passes: semi
-// keeps it, anti drops it, left matches it. (DuckDB 1.5.6 gives the same LEFT rows; its NOT EXISTS
-// raises the overflow, a divergence that roadmap PR U2 registers.)
+// keeps it, anti drops it, left matches it. (DuckDB 1.5.6 gives the same LEFT rows; its EXISTS and
+// NOT EXISTS raise the overflow, a divergence that roadmap PR U2 registers or avoids.)
 TEST_F(HashJoinTest, AntiAndLeftResidualsSkipRowsWithoutCandidates) {
   constexpr int64_t kTwoTo62 = 4611686018427387904;
   const auto probe_schema = Int64Schema({"k", "v", "m"});

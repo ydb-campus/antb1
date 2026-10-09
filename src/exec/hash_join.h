@@ -200,7 +200,8 @@ class BuildsFirstOperator final : public Operator {
 //   candidate pairs go through them in chunks of at most batch_size pairs, with EvaluateExpr, each
 //   chunk with only the columns the residuals read: each residual in order, on the pairs the ones
 //   before it passed (NULL is false). Every pair is evaluated, with no early stop once a row has a
-//   match, so whether an error comes does not depend on batch_size. A row without candidates never
+//   match, so whether an error comes does not depend on batch_size (unless a Limit above stops the
+//   probe before it reads every row). A row without candidates never
 //   meets a residual: anti keeps it, left pads it. Semi and anti evaluate a probe batch's pairs
 //   before its first window, and a row matched when one of its pairs passed every residual. Left
 //   evaluates each batch of slots before it emits it: the pairs that pass, and one padded row right

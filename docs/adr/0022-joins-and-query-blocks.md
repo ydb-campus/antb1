@@ -436,12 +436,12 @@ Proposed
     its key) gathered in chunks of at most `batch_size` pairs, each with only the columns the residuals read (a left
     join then takes and gathers its output's columns): in the order written, each on the pairs the ones before it passed
     (NULL counts as false), and on every pair, without stopping at a row's first passing pair, so whether an error comes
-    does not depend on the batch size. The order is antb1's rule, the same as for an inner join's residuals and for the
-    arguments of `AND`; it is not a claim about DuckDB, which may reorder conjunctions by its cost model (divergence
-    D16). A semi or anti join ORs the results of a probe row's pairs; a left join emits the passing pairs and pads a row
-    none of whose candidates passed once, right after its last candidate, whatever chunk that falls in. A row without
-    candidates never meets a residual: an anti join keeps it, a left join pads it. No join kind exits 4 in exec any
-    more.
+    does not depend on the batch size (unless a `LIMIT` above stops the join before it reads every row). The order is
+    antb1's rule, the same as for an inner join's residuals and for the arguments of `AND`; it is not a claim about
+    DuckDB, which may reorder conjunctions by its cost model (divergence D16). A semi or anti join ORs the results of a
+    probe row's pairs; a left join emits the passing pairs and pads a row none of whose candidates passed once, right
+    after its last candidate, whatever chunk that falls in. A row without candidates never meets a residual: an anti
+    join keeps it, a left join pads it. No join kind exits 4 in exec any more.
 - **One build feeds one probe pipeline,** until a later ADR. Nothing else is buffered for reuse: a table or sub-plan
   read twice is computed twice (ADR 0013).
 - **Memory.** A build's Arrow buffers come from the budget's pool, and its own containers are charged through

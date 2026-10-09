@@ -246,8 +246,9 @@ slices. An `exec::BuildsFirstOperator` prepares a probe pipeline's builds when i
 pipeline's sink, and releases them once the sink's parts are done (`exec::PartSink`'s callback). An
 `exec::HashJoinOperator` probes, by its build's kind: an inner join with a build of unique keys keeps the probe
 batch's columns and selects the matched rows, otherwise it takes a (probe row, match) pair per output row, and its
-residuals are evaluated in order, each on the rows the ones before it kept; a left join does the same with NULLs for
-a row without a match (on its 1:1 path it keeps the probe's selection); a semi, anti or null-aware anti join passes on
+residuals are evaluated in order, each on the rows the ones before it kept; a left join takes its pairs the same way,
+with NULLs for a row without a match (on its 1:1 path it keeps the probe's selection), and evaluates its residuals on
+candidate pairs, as a semi or anti join does; a semi, anti or null-aware anti join passes on
 slices of the probe batch with the rows it keeps selected; a one-row join appends the slices of its build's values.
 The residuals of a semi, anti or left join are evaluated (`exec::EvaluateExpr`) on the candidate pairs (a probe row
 and a build row of its key), in batches of at most `batch_size` pairs with only the columns they read, in order, every
