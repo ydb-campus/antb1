@@ -140,10 +140,12 @@ struct JoinShape {
 // Invalid, never unsupported, for what a correct plan never holds, in this order: a missing input;
 // a kind other than inner that builds on its left input (it builds on the side whose rows it does
 // not preserve); a one-row join with keys or residuals; any other kind without keys; a null-aware
-// anti join of other than one key, or with residuals; a missing residual; a key whose two columns
-// differ in type (the binder casts them to one type); a DOUBLE or BOOLEAN key (E1's table takes
-// neither: such an equality is a residual). Checked before any profile line names the join by its
-// EXPLAIN text, which reads every residual.
+// anti join of other than one key, or with residuals; a residual that is missing or not BOOLEAN; a
+// key whose two columns differ in type (the binder casts them to one type); a DOUBLE or BOOLEAN key
+// (E1's table takes neither: such an equality is a residual). Checked before any profile line names
+// the join by its EXPLAIN text, which reads every residual. The columns of its keys and residuals
+// are checked against its inputs once their operators are made (JoinBuildSpec::Make,
+// HashJoinOperator::Make).
 arrow::Result<JoinShape> ShapeOf(const plan::JoinNode& join) {
   if (join.left == nullptr || join.right == nullptr) {
     return arrow::Status::Invalid("a join without its inputs");
@@ -168,6 +170,11 @@ arrow::Result<JoinShape> ShapeOf(const plan::JoinNode& join) {
                           [](const plan::ExprPtr& residual) { return residual == nullptr; })) {
     return arrow::Status::Invalid("a join residual that is missing");
   }
+  if (std::ranges::any_of(join.residual, [](const plan::ExprPtr& residual) {
+        return residual->type != plan::LogicalType::kBoolean;
+      })) {
+    return arrow::Status::Invalid("a join residual that is not BOOLEAN");
+  }
   const bool build_left = join.build == plan::BuildSide::kLeft;
   JoinShape shape{.probe = build_left ? join.right : join.left,
                   .build = build_left ? join.left : join.right,
@@ -188,10 +195,12 @@ arrow::Result<JoinShape> ShapeOf(const plan::JoinNode& join) {
   return shape;
 }
 
-// Unsupported (exit code 4, at the join's span) for a well-formed join that exec does not run yet:
-// a semi or anti join with residuals (ADR 0022: roadmap PR E2b evaluates them over candidate
-// pairs). Checked after ShapeOf, so that a malformed join is Invalid first. A LEFT join never
-// reaches it: it ends every pipeline (PipelineInput), and the Builder rejects it first.
+// Unsupported (exit code 4, at the join's span) for a join that exec does not run yet: a semi or
+// anti join with residuals (ADR 0022: roadmap PR E2b evaluates them over candidate pairs). Checked
+// after ShapeOf, so that a join of a malformed shape is Invalid first; but before its operators are
+// made, so until E2b such a join whose key or residual reads a column outside its inputs is
+// unsupported too. A LEFT join never reaches it: it ends every pipeline (PipelineInput), and the
+// Builder rejects it first, whatever its shape.
 arrow::Status NotRunYet(const plan::JoinNode& join) {
   if ((join.kind == plan::JoinKind::kSemi || join.kind == plan::JoinKind::kAnti) &&
       !join.residual.empty()) {

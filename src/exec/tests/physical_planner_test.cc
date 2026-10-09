@@ -8,6 +8,7 @@
 #include <string_view>
 #include <tuple>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <arrow/api.h>
@@ -634,9 +635,11 @@ TEST_F(PhysicalPlannerTest, SemiAntiAndOneRowJoinsRunEverywhere) {
 // keys, a key of two types, a DOUBLE or BOOLEAN key, a key outside its input on either side, a
 // residual that is missing, not BOOLEAN or outside the join; a join of another kind than inner
 // that builds on its left input, a one-row join with keys or residuals, a semi, anti or null-aware
-// anti join without keys, a null-aware anti join of two keys or with a residual; in a part
-// pipeline and over a serial probe input alike, with and without a profile (whose lines name the
-// join by its EXPLAIN text).
+// anti join without keys, a null-aware anti join of two keys or with a residual, a semi or anti
+// join with a residual that is missing or not BOOLEAN or with a key of two types (before its
+// residuals make it unsupported); in a part pipeline and over a serial probe input alike, with and
+// without a profile (whose lines name the join by its EXPLAIN text). Each plan has its join's own
+// width, so that only the join's shape can make it Invalid.
 TEST_F(PhysicalPlannerTest, MalformedJoinsAreInvalidNotUnsupported) {
   const auto table = Table(/*split=*/true);
   const auto scan = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}});
@@ -661,11 +664,20 @@ TEST_F(PhysicalPlannerTest, MalformedJoinsAreInvalidNotUnsupported) {
     return std::vector<plan::JoinKey>{
         plan::JoinKey{.left = std::move(left), .right = std::move(right)}};
   };
+  // The width of the join at `root` if it were planned: a semi, anti or null-aware anti join
+  // returns its probe input's 2 columns, any other join both inputs' 4.
+  const auto width_of = [](const plan::LogicalNodePtr& root) -> std::size_t {
+    const auto* join = std::get_if<plan::JoinNode>(root.get());
+    const bool probe_only = join != nullptr && (join->kind == plan::JoinKind::kSemi ||
+                                                join->kind == plan::JoinKind::kAnti ||
+                                                join->kind == plan::JoinKind::kNullAwareAnti);
+    return probe_only ? 2 : 4;
+  };
   const auto expect_invalid = [&](const plan::LogicalNodePtr& root, std::string_view what) {
     for (const bool profiled : {false, true}) {
       ProfileNode profile;
       const auto status =
-          BuildPhysicalPlan(PlanOf(root, 4), profiled ? &profile : nullptr).status();
+          BuildPhysicalPlan(PlanOf(root, width_of(root)), profiled ? &profile : nullptr).status();
       EXPECT_TRUE(status.IsInvalid())
           << what << (profiled ? ", profiled" : "") << ": " << status.ToString();
       EXPECT_EQ(plan::GetSqlError(status), nullptr) << what << ": a malformed plan is a bug";
@@ -729,6 +741,10 @@ TEST_F(PhysicalPlannerTest, MalformedJoinsAreInvalidNotUnsupported) {
                    "a null-aware anti join with a residual");
     expect_invalid(kind_of(plan::JoinKind::kSemi, key(x, x), {nullptr}),
                    "a semi join with a missing residual");
+    expect_invalid(kind_of(plan::JoinKind::kSemi, key(x, x), {expr(1, LogicalType::kBigInt)}),
+                   "a semi join with a BIGINT residual");
+    expect_invalid(kind_of(plan::JoinKind::kAnti, key(x, x), {expr(3, LogicalType::kBigInt)}),
+                   "an anti join with a BIGINT residual");
     expect_invalid(
         kind_of(plan::JoinKind::kAnti, key(x, Column(0, "x", LogicalType::kInteger)), {boolean}),
         "an anti join key of two types");
