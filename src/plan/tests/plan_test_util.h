@@ -1,8 +1,11 @@
 #pragma once
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <iterator>
+#include <map>
 #include <memory>
 #include <optional>
 #include <ostream>
@@ -13,6 +16,7 @@
 
 #include <arrow/api.h>
 
+#include "antb1/common/narrow.h"
 #include "antb1/plan/binder.h"
 #include "antb1/plan/catalog.h"
 #include "antb1/plan/logical_plan.h"
@@ -32,15 +36,51 @@ inline void PrintTo(ColumnId id, std::ostream* os) { *os << '#' << std::to_under
 namespace antb1::plan::testing {
 
 // A table with a schema, an optional exact row count and the fields stored as FLOAT; it cannot be
-// scanned.
+// scanned. By default it is one part without statistics or distinct-count hints; WithParts,
+// WithStats and WithDistinctCount give it parts and their footer statistics.
 class FakeTable final : public Table {
  public:
   FakeTable(std::shared_ptr<arrow::Schema> schema, std::optional<int64_t> rows,
             std::vector<int> float_fields = {})
       : schema_(std::move(schema)), rows_(rows), float_fields_(std::move(float_fields)) {}
 
+  // Parts of these rows (the exact row count stays as constructed).
+  FakeTable& WithParts(std::vector<int64_t> rows) {
+    parts_ = std::move(rows);
+    return *this;
+  }
+  // part_stats(part, field).
+  FakeTable& WithStats(int64_t part, int field, PartStats stats) {
+    stats_.insert_or_assign({part, field}, stats);
+    return *this;
+  }
+  // part_distinct_count(part, field).
+  FakeTable& WithDistinctCount(int64_t part, int field, int64_t count) {
+    distinct_counts_.insert_or_assign({part, field}, count);
+    return *this;
+  }
+
   const std::shared_ptr<arrow::Schema>& schema() const override { return schema_; }
   std::optional<int64_t> exact_row_count() const override { return rows_; }
+  int64_t num_parts() const override {
+    return parts_.has_value() ? std::ssize(*parts_) : Table::num_parts();
+  }
+  std::optional<int64_t> part_rows(int64_t part) const override {
+    if (!parts_.has_value()) {
+      return Table::part_rows(part);
+    }
+    return part >= 0 && part < std::ssize(*parts_)
+               ? std::optional((*parts_)[Narrow<std::size_t>(part)])
+               : std::nullopt;
+  }
+  std::optional<PartStats> part_stats(int64_t part, int field) const override {
+    const auto it = stats_.find({part, field});
+    return it != stats_.end() ? std::optional(it->second) : std::nullopt;
+  }
+  std::optional<int64_t> part_distinct_count(int64_t part, int field) const override {
+    const auto it = distinct_counts_.find({part, field});
+    return it != distinct_counts_.end() ? std::optional(it->second) : std::nullopt;
+  }
   bool StoredAsFloat(int field) const override {
     return std::ranges::contains(float_fields_, field);
   }
@@ -57,6 +97,9 @@ class FakeTable final : public Table {
   std::shared_ptr<arrow::Schema> schema_;
   std::optional<int64_t> rows_;
   std::vector<int> float_fields_;
+  std::optional<std::vector<int64_t>> parts_;
+  std::map<std::pair<int64_t, int>, PartStats> stats_;
+  std::map<std::pair<int64_t, int>, int64_t> distinct_counts_;
 };
 
 // Every engine type, an unsupported column and two names that need quoting:
