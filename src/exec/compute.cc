@@ -964,6 +964,21 @@ struct Evaluator {
     return Convert(values, expr, target);
   }
 
+  // A join key's cast (ADR 0022): an exact widening, by Convert. A value beyond its own declared
+  // width (a file can hold one) still fails a DECIMAL cast, with DuckDB's conversion error; any
+  // other cast is a malformed plan.
+  arrow::Result<ArrayPtr> Evaluate(const plan::CastExpr& cast, const plan::Expr& e) const {
+    if (cast.operand == nullptr) {
+      return arrow::Status::Invalid("a cast without an operand");
+    }
+    if (!plan::IsExactWidening(cast.operand->type, e.type)) {
+      return arrow::Status::Invalid("a cast of ", plan::ToString(cast.operand->type), " to ",
+                                    plan::ToString(e.type), " is not an exact widening");
+    }
+    ARROW_ASSIGN_OR_RAISE(const ArrayPtr values, (*this)(*cast.operand));
+    return Convert(values, *cast.operand, e.type);
+  }
+
   // The values of `expr` as `target`: to a DECIMAL as DuckDB casts them (CASE values, ADR 0021 rule
   // 10; a failed cast names a column), otherwise as CastTo converts them.
   arrow::Result<ArrayPtr> Convert(const ArrayPtr& values, const plan::Expr& expr,

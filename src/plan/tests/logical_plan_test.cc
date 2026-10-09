@@ -159,6 +159,146 @@ TEST(LogicalPlanTest, CollectsTheIdsAnExpressionReads) {
   EXPECT_EQ(ids, (std::vector<ColumnId>{ColumnId{4}, ColumnId{9}, ColumnId{2}, ColumnId{4}}));
 }
 
+ExprPtr Cast(ExprPtr operand, LogicalType type) {
+  return std::make_shared<const Expr>(
+      Expr{.node = CastExpr{.operand = std::move(operand)}, .type = type, .name = "cast"});
+}
+
+ExprPtr Negate(ExprPtr operand) {
+  const LogicalType type = operand->type;
+  return std::make_shared<const Expr>(
+      Expr{.node = NegateExpr{.operand = std::move(operand)}, .type = type, .name = "-c"});
+}
+
+ExprPtr Plus(ExprPtr left, ExprPtr right, LogicalType type) {
+  return std::make_shared<const Expr>(Expr{
+      .node = ArithExpr{.op = ArithOp::kAdd, .left = std::move(left), .right = std::move(right)},
+      .type = type,
+      .name = "(a + b)"});
+}
+
+// A cast is the same expression when its type and its operand are; its name and a negation of the
+// same operand are not.
+TEST(LogicalPlanTest, CastExprIsTheSameByTypeAndOperand) {
+  const auto cast = Cast(ColumnWithId(7, 0), LogicalType::kBigInt);
+  EXPECT_TRUE(SameExpr(*cast, *Cast(ColumnWithId(7, 3), LogicalType::kBigInt)));
+  EXPECT_FALSE(SameExpr(*cast, *Cast(ColumnWithId(8, 0), LogicalType::kBigInt)));
+  EXPECT_FALSE(SameExpr(*cast, *Cast(ColumnWithId(7, 0), LogicalType::kInteger)));
+  EXPECT_FALSE(SameExpr(*cast, *Cast(ColumnWithId(7, 0), LogicalType::kHugeInt)));
+  Expr renamed = *cast;
+  renamed.name = "CAST(t.c AS BIGINT)";
+  EXPECT_TRUE(SameExpr(*cast, renamed));
+  Expr negated = *Negate(ColumnWithId(7, 0));
+  negated.type = LogicalType::kBigInt;
+  EXPECT_FALSE(SameExpr(*cast, negated));
+  const auto nested = Cast(Cast(ColumnWithId(7, 0), LogicalType::kInteger), LogicalType::kBigInt);
+  EXPECT_TRUE(SameExpr(
+      *nested, *Cast(Cast(ColumnWithId(7, 0), LogicalType::kInteger), LogicalType::kBigInt)));
+  EXPECT_FALSE(SameExpr(*nested, *cast));
+}
+
+// Every walk of an expression reaches a cast's operand: the columns a cast reads are mapped and
+// collected, by position and by id.
+TEST(LogicalPlanTest, CastExprOperandIsMappedAndCollected) {
+  const auto cast = Cast(Plus(ColumnWithId(4, 1), ColumnWithId(9, 2), LogicalType::kInteger),
+                         LogicalType::Decimal(12, 2));
+  std::vector<int> positions;
+  CollectColumns(*cast, positions);
+  EXPECT_EQ(positions, (std::vector<int>{1, 2}));
+  std::vector<ColumnId> ids;
+  CollectColumnIds(*cast, ids);
+  EXPECT_EQ(ids, (std::vector<ColumnId>{ColumnId{4}, ColumnId{9}}));
+  const auto mapped = MapColumns(cast, [](ColumnExpr column) {
+    column.index += 10;
+    return column;
+  });
+  ASSERT_NE(mapped, cast);
+  positions.clear();
+  CollectColumns(*mapped, positions);
+  EXPECT_EQ(positions, (std::vector<int>{11, 12}));
+  EXPECT_EQ(mapped->type, LogicalType::Decimal(12, 2));
+  EXPECT_TRUE(std::holds_alternative<CastExpr>(mapped->node));
+  // Nothing changes: the same pointer.
+  EXPECT_EQ(MapColumns(cast, [](const ColumnExpr& column) { return column; }), cast);
+}
+
+// ResolvePositions sets the position of the column a cast reads from its id.
+TEST(LogicalPlanTest, CastExprPositionsAreResolved) {
+  const auto table = std::make_shared<FakeTable>(AllTypesSchema(), 1);
+  const LogicalNodePtr scan = std::make_shared<const LogicalNode>(ScanNode{
+      .table = table, .table_name = "t", .fields = {0, 1}, .ids = {ColumnId{1}, ColumnId{2}}});
+  // i32 (#2, at 1) as BIGINT, with the position left at 0.
+  const auto cast = std::make_shared<const Expr>(
+      Expr{.node = CastExpr{.operand = std::make_shared<const Expr>(
+                                Expr{.node = ColumnExpr{.index = 0, .id = ColumnId{2}},
+                                     .type = LogicalType::kInteger,
+                                     .name = "i32"})},
+           .type = LogicalType::kBigInt,
+           .name = "CAST(i32 AS BIGINT)"});
+  const LogicalNodePtr compute = std::make_shared<const LogicalNode>(
+      ComputeNode{.input = scan, .exprs = {cast}, .ids = {ColumnId{3}}});
+  const LogicalPlan plan{
+      .root = compute,
+      .output = {{.name = "a", .type = LogicalType::kSmallInt, .id = ColumnId{1}},
+                 {.name = "b", .type = LogicalType::kInteger, .id = ColumnId{2}},
+                 {.name = "c", .type = LogicalType::kBigInt, .id = ColumnId{3}}}};
+  EXPECT_EQ(PositionMismatch(plan), "Compute: column #2 is at 1, not 0");
+  const LogicalPlan resolved = ResolvePositions(plan);
+  EXPECT_EQ(PositionMismatch(resolved), std::nullopt);
+  const auto& expr = *std::get<ComputeNode>(*resolved.root).exprs.front();
+  const auto& operand = *std::get<CastExpr>(expr.node).operand;
+  EXPECT_EQ(std::get<ColumnExpr>(operand.node).index, 1);
+}
+
+TEST(LogicalPlanTest, ExactWidenings) {
+  struct Case {
+    LogicalType from;
+    LogicalType to;
+    bool exact;
+  };
+  const std::vector<Case> cases = {
+      // Integers: by range.
+      {.from = LogicalType::kSmallInt, .to = LogicalType::kInteger, .exact = true},
+      {.from = LogicalType::kUSmallInt, .to = LogicalType::kInteger, .exact = true},
+      {.from = LogicalType::kInteger, .to = LogicalType::kBigInt, .exact = true},
+      {.from = LogicalType::kBigInt, .to = LogicalType::kHugeInt, .exact = true},
+      {.from = LogicalType::kUSmallInt, .to = LogicalType::kHugeInt, .exact = true},
+      {.from = LogicalType::kSmallInt, .to = LogicalType::kUSmallInt, .exact = false},
+      {.from = LogicalType::kUSmallInt, .to = LogicalType::kSmallInt, .exact = false},
+      {.from = LogicalType::kBigInt, .to = LogicalType::kInteger, .exact = false},
+      {.from = LogicalType::kHugeInt, .to = LogicalType::kBigInt, .exact = false},
+      // An integer to a DECIMAL with at least its digits before the point.
+      {.from = LogicalType::kSmallInt, .to = LogicalType::Decimal(5, 0), .exact = true},
+      {.from = LogicalType::kUSmallInt, .to = LogicalType::Decimal(7, 2), .exact = true},
+      {.from = LogicalType::kUSmallInt, .to = LogicalType::Decimal(6, 2), .exact = false},
+      {.from = LogicalType::kInteger, .to = LogicalType::Decimal(10, 0), .exact = true},
+      {.from = LogicalType::kInteger, .to = LogicalType::Decimal(10, 1), .exact = false},
+      {.from = LogicalType::kBigInt, .to = LogicalType::Decimal(21, 2), .exact = true},
+      {.from = LogicalType::kBigInt, .to = LogicalType::Decimal(18, 0), .exact = false},
+      {.from = LogicalType::kHugeInt, .to = LogicalType::Decimal(38, 0), .exact = true},
+      {.from = LogicalType::kHugeInt, .to = LogicalType::Decimal(38, 1), .exact = false},
+      {.from = LogicalType::kSmallInt, .to = LogicalType::Decimal(3, 3), .exact = false},
+      // A DECIMAL to one with at least its integer digits and its scale.
+      {.from = LogicalType::Decimal(4, 2), .to = LogicalType::Decimal(5, 3), .exact = true},
+      {.from = LogicalType::Decimal(15, 2), .to = LogicalType::Decimal(17, 4), .exact = true},
+      {.from = LogicalType::Decimal(15, 2), .to = LogicalType::Decimal(15, 3), .exact = false},
+      {.from = LogicalType::Decimal(5, 3), .to = LogicalType::Decimal(5, 2), .exact = false},
+      {.from = LogicalType::Decimal(38, 0), .to = LogicalType::Decimal(38, 0), .exact = true},
+      // Never to an integer type, and nothing else but a type to itself.
+      {.from = LogicalType::Decimal(5, 0), .to = LogicalType::kBigInt, .exact = false},
+      {.from = LogicalType::Decimal(38, 0), .to = LogicalType::kHugeInt, .exact = false},
+      {.from = LogicalType::kInteger, .to = LogicalType::kDouble, .exact = false},
+      {.from = LogicalType::kDouble, .to = LogicalType::Decimal(38, 10), .exact = false},
+      {.from = LogicalType::kDate, .to = LogicalType::kTimestamp, .exact = false},
+      {.from = LogicalType::kDate, .to = LogicalType::kInteger, .exact = false},
+      {.from = LogicalType::kVarchar, .to = LogicalType::kVarchar, .exact = true},
+      {.from = LogicalType::kDouble, .to = LogicalType::kDouble, .exact = true},
+  };
+  for (const Case& c : cases) {
+    EXPECT_EQ(IsExactWidening(c.from, c.to), c.exact) << c.from << " to " << c.to;
+  }
+}
+
 TEST(LogicalPlanTest, FunctionAndTypeNames) {
   EXPECT_EQ(ToString(Function::kStrlen), "strlen");
   EXPECT_EQ(ToString(Function::kRegexpReplace), "regexp_replace");

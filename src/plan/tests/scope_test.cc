@@ -214,7 +214,8 @@ TEST(BindingTest, ASubPlanBindingTakesItsColumnsAsGiven) {
 }
 
 // A name resolves to its column by id, ASCII case-insensitively and quoted or not, with the
-// declared name; ResolvePositions sets the position later, and nothing sets a qualifier yet.
+// declared name; ResolvePositions sets the position later, and the column of a scope's only binding
+// has no qualifier.
 TEST(ScopeTest, ResolveMatchesAsciiCaseInsensitivelyQuotedOrNot) {
   ColumnIdSource ids;
   const Scope scope({TableBinding("t", AllTypesSchema(), ids)});
@@ -375,21 +376,287 @@ TEST(BinderIdsTest, TheBindingColumnsAreNumberedFirst) {
   EXPECT_EQ(project.ids, (std::vector<ColumnId>{ColumnId{13}}));
 }
 
-// CheckSupported rejects every qualified name and every FROM list of several items before a scope
-// resolves a name; roadmap PR J2b lifts both checks.
-TEST(ScopeDeathTest, QualifiedNamesWaitForJ2b) {
-  ColumnIdSource ids;
-  const Scope scope({TableBinding("t", AllTypesSchema(), ids)});
-  sql::ColumnRef ref = Ref("i16");
-  ref.qualifier = "t";
-  EXPECT_DEATH((void)scope.Resolve(ref), "qualifier.empty");
+// ---- several bindings: the name rules of ADR 0022 (rules 1-5 and 10) ----
+
+// The tables of the rule probes (DuckDB 1.5.6 probes of the J2b design, re-modelled): t(a, b, c),
+// u(a BIGINT, d), w(c, g) and v(e, f), INTEGER but for u.a.
+std::shared_ptr<arrow::Schema> IntegerSchema(const std::vector<std::string>& names) {
+  arrow::FieldVector fields;
+  for (const std::string& name : names) {
+    fields.push_back(arrow::field(name, arrow::int32()));
+  }
+  return arrow::schema(std::move(fields));
+}
+std::shared_ptr<arrow::Schema> T() { return IntegerSchema({"a", "b", "c"}); }
+std::shared_ptr<arrow::Schema> U() {
+  return arrow::schema({arrow::field("a", arrow::int64()), arrow::field("d", arrow::int32())});
+}
+std::shared_ptr<arrow::Schema> W() { return IntegerSchema({"c", "g"}); }
+std::shared_ptr<arrow::Schema> V() { return IntegerSchema({"e", "f"}); }
+
+// The binding `name` of a table referred to in FROM as `table_name`, a table's name or a path: an
+// alias when `name` is not the name the reference gives it (rule 1).
+Binding Aliased(const std::string& name, const std::string& table_name,
+                std::shared_ptr<arrow::Schema> schema, ColumnIdSource& ids,
+                sql::TableRef::Kind kind = sql::TableRef::Kind::kName) {
+  auto table = std::make_shared<FakeTable>(std::move(schema), 1);
+  return Binding::OfTable(
+      name,
+      TableSource{.table = std::move(table), .table_name = table_name, .span = {}, .kind = kind},
+      ids);
 }
 
-TEST(ScopeDeathTest, NamesResolveInOneBindingUntilJ2b) {
+sql::ColumnRef QRef(std::string qualifier, std::string name, SourceSpan span = {}) {
+  sql::ColumnRef ref = Ref(std::move(name), span);
+  ref.qualifier = std::move(qualifier);
+  return ref;
+}
+
+// `ref` resolves in `scope` to column `column` of binding `binding` (by id), with `qualifier`.
+void ExpectResolves(const Scope& scope, const sql::ColumnRef& ref, Visibility visible,
+                    std::size_t binding, std::size_t column, std::string_view qualifier) {
+  const auto resolved = scope.Resolve(ref, visible);
+  ASSERT_TRUE(resolved.ok()) << ref.qualifier << "." << ref.name << ": "
+                             << resolved.status().ToString();
+  const ColumnLocation where{.binding = binding, .column = column};
+  EXPECT_EQ(resolved->id, scope.column(where).id) << ref.qualifier << "." << ref.name;
+  EXPECT_EQ(resolved->name, scope.column(where).name);
+  EXPECT_EQ(resolved->qualifier, qualifier);
+  const Lookup lookup = scope.LookUp(ref, visible);
+  EXPECT_EQ(lookup.outcome, Lookup::Outcome::kFound);
+  EXPECT_EQ(lookup.where, where);
+}
+
+// Rule 1: a path without an alias binds as its file name up to the first dot, leading dots and
+// empty parts skipped, and a path with a glob character as its whole text (DuckDB 1.5.6 probes:
+// `SELECT lead.x FROM 'S/..lead.dots.parquet'`, `SELECT "S/a*.parquet".x FROM 'S/a*.parquet'`).
+TEST(ScopeTest, PathBindingNames) {
+  const std::vector<std::pair<std::string, std::string>> cases = {
+      {"dir/a.b.parquet", "a"},
+      {"..x.parquet", "x"},
+      {"S/..lead.dots.parquet", "lead"},
+      {"nodot", "nodot"},
+      {"dir//a.parquet", "a"},
+      {"./a.parquet", "a"},
+      {"dir/", "dir"},
+      {".", "."},
+      {"a/..", ".."},
+      {"/", "/"},
+      {"", ""},
+      {"dir/t*.parquet", "dir/t*.parquet"},
+      {"dir/?.parquet", "dir/?.parquet"},
+      {"[ab].parquet", "[ab].parquet"},
+      {"dir/{a,b}.parquet", "{a,b}"},  // braces are no glob in DuckDB
+  };
+  for (const auto& [path, name] : cases) {
+    EXPECT_EQ(PathBindingName(path), name) << path;
+  }
+}
+
+// Rules 2 and 3: a qualified name resolves among the bindings of that name, ASCII
+// case-insensitively and quoted or not; a binding without the column, or no binding of the name,
+// is a bind error at the name.
+TEST(ScopeTest, QualifiedNamesResolveInTheBindingsTheyName) {
   ColumnIdSource ids;
-  const Scope scope(
-      {TableBinding("t", AllTypesSchema(), ids), TableBinding("ok", OkSchema(), ids)});
-  EXPECT_DEATH((void)scope.Resolve(Ref("dt")), "bindings_.size");
+  const Scope scope({TableBinding("t", T(), ids), TableBinding("u", U(), ids)});
+  ExpectResolves(scope, QRef("t", "a"), {}, 0, 0, "t");
+  ExpectResolves(scope, QRef("U", "A"), {}, 1, 0, "u");
+  sql::ColumnRef quoted = QRef("T", "C");
+  quoted.qualifier_quoted = true;
+  quoted.quoted = true;
+  ExpectResolves(scope, quoted, {}, 0, 2, "t");
+  const SourceSpan span{.offset = 7, .length = 3};
+  ExpectSqlError(scope.Resolve(QRef("t", "d", span)).status(), kBind, "'t' has no column 'd'",
+                 span);
+  ExpectSqlError(scope.Resolve(QRef("x", "a", span)).status(), kBind, "no FROM item is named 'x'",
+                 span);
+  EXPECT_EQ(scope.LookUp(QRef("x", "a")).outcome, Lookup::Outcome::kMissing);
+}
+
+// Rule 2: an alias hides the name its FROM reference gives a binding without one, a table's name as
+// written or a path's PathBindingName. A path's text names nothing, aliased or not, and a table's
+// name is never taken for a path: FROM "a.b" AS x hides "a.b", not a.
+TEST(ScopeTest, AnAliasHidesItsTablesName) {
+  ColumnIdSource ids;
+  const Scope aliased({Aliased("x", "t", T(), ids), TableBinding("u", U(), ids)});
+  ExpectResolves(aliased, QRef("x", "b"), {}, 0, 1, "x");
+  ExpectSqlError(aliased.Resolve(QRef("t", "b")).status(), kBind,
+                 "no FROM item is named 't' (the alias 'x' hides it)", {});
+  constexpr sql::TableRef::Kind kPath = sql::TableRef::Kind::kPath;
+  const Scope paths({Aliased("x", "F/trips.parquet", T(), ids, kPath),
+                     Aliased("zones", "F/zones.parquet", U(), ids, kPath)});
+  ExpectResolves(paths, QRef("zones", "d"), {}, 1, 1, "zones");
+  ExpectSqlError(paths.Resolve(QRef("trips", "a")).status(), kBind,
+                 "no FROM item is named 'trips' (the alias 'x' hides it)", {});
+  ExpectSqlError(paths.Resolve(QRef("F/trips.parquet", "a")).status(), kBind,
+                 "no FROM item is named 'F/trips.parquet'", {});
+  ExpectSqlError(paths.Resolve(QRef("F/zones.parquet", "d")).status(), kBind,
+                 "no FROM item is named 'F/zones.parquet'", {});
+  const Scope dotted({Aliased("x", "a.b", T(), ids), TableBinding("u", U(), ids)});
+  ExpectSqlError(dotted.Resolve(QRef("a", "b")).status(), kBind, "no FROM item is named 'a'", {});
+  ExpectSqlError(dotted.Resolve(QRef("A.B", "b")).status(), kBind,
+                 "no FROM item is named 'A.B' (the alias 'x' hides it)", {});
+}
+
+// Rule 3: two bindings may share a name; a qualified name resolves to the one that has the column,
+// and is ambiguous when both have it (DuckDB: `FROM t AS x, u AS X WHERE x.b = X.d` answers).
+TEST(ScopeTest, BindingsMayShareAName) {
+  ColumnIdSource ids;
+  const Scope scope({Aliased("x", "t", T(), ids), Aliased("X", "u", U(), ids)});
+  ExpectResolves(scope, QRef("x", "b"), {}, 0, 1, "x");
+  ExpectResolves(scope, QRef("X", "d"), {}, 1, 1, "X");
+  const SourceSpan span{.offset = 2, .length = 3};
+  ExpectSqlError(scope.Resolve(QRef("x", "a", span)).status(), kBind,
+                 "'x.a' is ambiguous: two FROM items named 'x' have a column 'a'", span);
+  const Lookup lookup = scope.LookUp(QRef("X", "A"));
+  EXPECT_EQ(lookup.outcome, Lookup::Outcome::kAmbiguous);
+  EXPECT_EQ(lookup.where, (ColumnLocation{.binding = 0, .column = 0}));
+  EXPECT_EQ(lookup.other, (ColumnLocation{.binding = 1, .column = 0}));
+}
+
+// Rule 4: an unqualified name that two bindings have is ambiguous, and the error names the
+// qualified candidates (DuckDB: `SELECT a FROM t, u WHERE t.a = u.a`); two columns of one binding
+// whose names differ only in case keep the single-table message.
+TEST(ScopeTest, AnUnqualifiedNameInTwoBindingsIsAmbiguous) {
+  ColumnIdSource ids;
+  const Scope scope({TableBinding("t", T(), ids), TableBinding("u", U(), ids)});
+  const SourceSpan span{.offset = 7, .length = 1};
+  ExpectSqlError(scope.Resolve(Ref("A", span)).status(), kBind,
+                 "column name 'A' is ambiguous: it matches t.a and u.a", span);
+  ExpectResolves(scope, Ref("b"), {}, 0, 1, "t");
+  ExpectResolves(scope, Ref("D"), {}, 1, 1, "u");
+  ExpectSqlError(scope.Resolve(Ref("e", span)).status(), kBind, "column 'e' does not exist", span);
+  const Scope cased({TableBinding("m",
+                                  arrow::schema({arrow::field("Ab", arrow::int32()),
+                                                 arrow::field("aB", arrow::int32())}),
+                                  ids),
+                     TableBinding("n", arrow::schema({arrow::field("ab", arrow::int32())}), ids)});
+  ExpectSqlError(cased.Resolve(Ref("AB")).status(), kBind,
+                 "column name 'AB' is ambiguous: it matches the columns 'Ab' and 'aB', which "
+                 "differ only in case",
+                 {});
+  ExpectResolves(cased, QRef("n", "AB"), {}, 1, 0, "n");
+}
+
+// Rule 10 in two levels, as in DuckDB 1.5.6: an ON resolves a name in its own join group first
+// (the items from the last comma up to its JOIN; CROSS JOIN continues a group), and only then in
+// the earlier comma siblings. WHERE sees every binding in one level.
+TEST(ScopeTest, AnOnResolvesInItsJoinGroupFirst) {
+  ColumnIdSource ids;
+  // FROM t, u JOIN w ON c = u.d: w.c, not ambiguous with t.c (DuckDB answers 4, 10).
+  const Scope comma(
+      {TableBinding("t", T(), ids), TableBinding("u", U(), ids), TableBinding("w", W(), ids)});
+  const Visibility on_w{.inner_begin = 1, .end = 3};
+  ExpectResolves(comma, Ref("c"), on_w, 2, 0, "w");
+  ExpectResolves(comma, QRef("u", "d"), on_w, 1, 1, "u");
+  // FROM t, u JOIN w ON b = w.g: b only in the earlier comma sibling t.
+  ExpectResolves(comma, Ref("b"), on_w, 0, 1, "t");
+  // ... WHERE c = 3: one level, so t.c and w.c are ambiguous.
+  ExpectSqlError(comma.Resolve(Ref("c")).status(), kBind,
+                 "column name 'c' is ambiguous: it matches t.c and w.c", {});
+  // FROM t CROSS JOIN u JOIN w ON c = u.d: one group, ambiguous.
+  ExpectSqlError(comma.Resolve(Ref("c"), Visibility{.inner_begin = 0, .end = 3}).status(), kBind,
+                 "column name 'c' is ambiguous: it matches t.c and w.c", {});
+  // FROM t, w, u JOIN v ON c = v.e: c only in the outer level, where t.c and w.c are ambiguous.
+  const Scope outer({TableBinding("t", T(), ids), TableBinding("w", W(), ids),
+                     TableBinding("u", U(), ids), TableBinding("v", V(), ids)});
+  ExpectSqlError(outer.Resolve(Ref("c"), Visibility{.inner_begin = 2, .end = 4}).status(), kBind,
+                 "column name 'c' is ambiguous: it matches t.c and w.c", {});
+  // FROM t AS x, u JOIN w AS x ON x.c = u.d: the inner x (w); ON x.b = u.d: the outer x (t).
+  const Scope shadow(
+      {Aliased("x", "t", T(), ids), TableBinding("u", U(), ids), Aliased("x", "w", W(), ids)});
+  ExpectResolves(shadow, QRef("x", "c"), on_w, 2, 0, "x");
+  ExpectResolves(shadow, QRef("x", "b"), on_w, 0, 1, "x");
+  // In WHERE both x have c.
+  ExpectSqlError(shadow.Resolve(QRef("x", "c")).status(), kBind,
+                 "'x.c' is ambiguous: two FROM items named 'x' have a column 'c'", {});
+}
+
+// Rule 10: an ON never sees a later FROM item. A name only a later item has is a bind error, whose
+// message says so, and a later item's column never makes a name ambiguous.
+TEST(ScopeTest, AnOnDoesNotSeeLaterItems) {
+  ColumnIdSource ids;
+  // FROM t JOIN u ON t.a = u.a AND d = e JOIN v ON e = d: DuckDB's "Referenced column "e" not
+  // found" in the first ON; the second ON sees v.
+  const Scope chain(
+      {TableBinding("t", T(), ids), TableBinding("u", U(), ids), TableBinding("v", V(), ids)});
+  const Visibility first_on{.inner_begin = 0, .end = 2};
+  const SourceSpan span{.offset = 9, .length = 1};
+  ExpectSqlError(chain.Resolve(Ref("e", span), first_on).status(), kBind,
+                 "column 'e' does not exist (an ON sees only the FROM items up to its JOIN)", span);
+  ExpectResolves(chain, Ref("e"), Visibility{.inner_begin = 0, .end = 3}, 2, 0, "v");
+  ExpectSqlError(chain.Resolve(QRef("v", "e"), first_on).status(), kBind,
+                 "no FROM item is named 'v' (an ON sees only the FROM items up to its JOIN)", {});
+  ExpectSqlError(chain.Resolve(Ref("zz"), first_on).status(), kBind, "column 'zz' does not exist",
+                 {});
+  // FROM t JOIN w ON c = w.g JOIN u ...: u.a is later, so a is t.a alone.
+  const Scope later(
+      {TableBinding("t", T(), ids), TableBinding("w", W(), ids), TableBinding("u", U(), ids)});
+  ExpectResolves(later, Ref("a"), first_on, 0, 0, "t");
+  // FROM t AS q JOIN u ON q.d = u.d JOIN u AS q ...: the later q has d, the visible one does not.
+  const Scope same_name(
+      {Aliased("q", "t", T(), ids), TableBinding("u", U(), ids), Aliased("q", "u", U(), ids)});
+  ExpectSqlError(same_name.Resolve(QRef("q", "d"), first_on).status(), kBind,
+                 "'q' has no column 'd' (an ON sees only the FROM items up to its JOIN)", {});
+  ExpectSqlError(same_name.Resolve(QRef("q", "zz"), first_on).status(), kBind,
+                 "'q' has no column 'zz'", {});
+  // An end beyond the bindings is every binding.
+  ExpectResolves(chain, Ref("f"), Visibility{.inner_begin = 1, .end = 9}, 2, 1, "v");
+}
+
+// A column's qualifier is its binding's name (as declared) only in a scope of two or more
+// bindings, so that EXPLAIN of a single table does not change.
+TEST(ScopeTest, QualifiersOnlyWithSeveralBindings) {
+  ColumnIdSource ids;
+  const Scope one({TableBinding("t", T(), ids)});
+  EXPECT_EQ(one.Qualifier(0), "");
+  ExpectResolves(one, QRef("T", "a"), {}, 0, 0, "");
+  const Scope two({Aliased("Big", "t", T(), ids), TableBinding("u", U(), ids)});
+  EXPECT_EQ(two.Qualifier(0), "Big");
+  EXPECT_EQ(two.Qualifier(1), "u");
+  const auto star = two.Reference(ColumnLocation{.binding = 1, .column = 1}, {});
+  ASSERT_TRUE(star.ok()) << star.status().ToString();
+  EXPECT_EQ(star->qualifier, "u");
+  EXPECT_EQ(star->name, "d");
+}
+
+// Rule 5: SELECT * is a bind error only when two bindings of the same name (ASCII
+// case-insensitively) share a column name (DuckDB: `FROM t AS x, u AS x` errors, `FROM t AS x,
+// v AS x` answers); the first such pair in FROM order is reported, with its first shared column.
+TEST(ScopeTest, StarConflicts) {
+  ColumnIdSource ids;
+  const auto conflict = [](const Scope& scope) {
+    return scope.FindStarConflict().value_or(Scope::StarConflict{.first = 9, .second = 9});
+  };
+  const Scope same({Aliased("x", "t", T(), ids), Aliased("X", "u", U(), ids)});
+  EXPECT_EQ(conflict(same).first, 0U);
+  EXPECT_EQ(conflict(same).second, 1U);
+  EXPECT_EQ(conflict(same).column, "a");
+  const Scope twice({TableBinding("t", T(), ids), TableBinding("t", T(), ids)});  // FROM t, t
+  EXPECT_EQ(conflict(twice).column, "a");
+  const Scope disjoint({Aliased("x", "t", T(), ids), Aliased("x", "v", V(), ids)});
+  EXPECT_EQ(disjoint.FindStarConflict(), std::nullopt);
+  const Scope named_apart({TableBinding("t", T(), ids), TableBinding("u", U(), ids)});
+  EXPECT_EQ(named_apart.FindStarConflict(), std::nullopt);
+  const Scope later(
+      {TableBinding("t", T(), ids), Aliased("q", "w", W(), ids), Aliased("q", "t", T(), ids)});
+  EXPECT_EQ(conflict(later).first, 1U);
+  EXPECT_EQ(conflict(later).second, 2U);
+  EXPECT_EQ(conflict(later).column, "c");
+}
+
+// Ambiguity across bindings comes before an unsupported type, which a qualified name reaches like
+// an unqualified one.
+TEST(ScopeTest, UnsupportedTypesAcrossBindings) {
+  ColumnIdSource ids;
+  const Scope scope({TableBinding("t", AllTypesSchema(), ids),
+                     TableBinding("l", arrow::schema({arrow::field("bad", arrow::int32())}), ids)});
+  ExpectSqlError(scope.Resolve(Ref("bad")).status(), kBind,
+                 "column name 'bad' is ambiguous: it matches t.bad and l.bad", {});
+  const SourceSpan span{.offset = 3, .length = 5};
+  ExpectSqlError(scope.Resolve(QRef("t", "bad", span)).status(), kUnsupported,
+                 UnsupportedListMessage("bad"), span);
+  ExpectResolves(scope, QRef("l", "bad"), {}, 1, 0, "l");
 }
 
 TEST(ScopeDeathTest, ALocationOutOfRangeAborts) {

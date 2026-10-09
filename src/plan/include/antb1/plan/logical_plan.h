@@ -204,11 +204,25 @@ struct CaseExpr {
   ExprPtr otherwise;           // may be null
 };
 
+// The operand's values as the expression's type, unchanged: an exact widening (IsExactWidening),
+// which the binder makes of a join key side that is not of the key's type (ADR 0022) and names
+// CAST(<operand> AS <TYPE>). The executor evaluates no other cast.
+struct CastExpr {
+  ExprPtr operand;
+};
+
+// Whether every value of `from` is a value of `to`, so that a cast from one to the other keeps
+// every value as it is: a type to itself; an integer type to one whose range holds its range
+// (SMALLINT and USMALLINT to INTEGER, INTEGER to BIGINT, any of them to HUGEINT); an integer type
+// or a DECIMAL to a DECIMAL with at least as many integer digits (an integer type has those of its
+// largest value: 5, 10, 19 or 38 for HUGEINT) and, from a DECIMAL, at least its scale.
+bool IsExactWidening(LogicalType from, LogicalType to);
+
 // A scalar expression, typed as DuckDB types it (docs/sql-subset.md). Integer arithmetic is exact
 // in its type: an overflow is an execution error, as in DuckDB.
 struct Expr {
   std::variant<ColumnExpr, ConstantExpr, ArithExpr, NegateExpr, FunctionExpr, PredicateExpr,
-               BoolExpr, CaseExpr>
+               BoolExpr, CaseExpr, CastExpr>
       node;
   LogicalType type = LogicalType::kBigInt;
   std::string name;  // DuckDB's result name of the expression, e.g. (a + 1)

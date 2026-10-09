@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -34,11 +35,22 @@ class ColumnIdSource {
   std::uint32_t last_ = 0;
 };
 
+// The name of the binding of a path in FROM without an alias, as DuckDB names it (rule 1 of ADR
+// 0022): the file name up to its first dot, leading dots skipped (`dir/a.b.parquet` is `a`,
+// `..x.parquet` is `x`, `nodot` is itself), and the whole text for a path with a glob character
+// (`*`, `?` or `[`). Like DuckDB it skips empty parts: a file name of dots only names itself, and a
+// path without a part (only slashes, or empty) is its whole text.
+std::string PathBindingName(std::string_view path);
+
 // A table or a path in FROM, as the Scan of its binding shows it.
 struct TableSource {
   std::shared_ptr<Table> table;  // not null
   std::string table_name;        // ScanNode::table_name: the FROM reference as written, or the path
   SourceSpan span;               // ScanNode::span: the FROM reference
+  // Whether the reference is a table's name or a path. Without an alias a table's binding is named
+  // by the name as written, a path's by its PathBindingName (rule 1 of ADR 0022): the name that a
+  // bind error says an alias hides.
+  sql::TableRef::Kind kind = sql::TableRef::Kind::kName;
 };
 
 // A bound sub-plan in FROM (a derived table or a CTE reference, from roadmap PR J4 on): its root
@@ -76,11 +88,16 @@ class Binding {
   // exactly the columns' ids, in order: anything else is a programming error.
   static Binding OfPlan(std::string name, LogicalNodePtr root, std::vector<BindingColumn> columns);
 
-  // Until roadmap PR J2b, which names bindings by rule 1 of ADR 0022, the FROM reference as
-  // written; nothing consults it yet.
+  // The name a qualified column reference uses, as the binder gives it: by rule 1 of ADR 0022 the
+  // FROM item's alias, else its table name as written, else its path's PathBindingName. Until
+  // roadmap PR J2b-2 binds several FROM items, the binder names its one binding by the FROM
+  // reference as written. Two bindings may share a name (rule 3).
   [[nodiscard]] const std::string& name() const { return name_; }
   [[nodiscard]] const BindingSource& source() const { return source_; }
   [[nodiscard]] const std::vector<BindingColumn>& columns() const { return columns_; }
+
+  // Whether `qualifier` names the binding: ASCII case-insensitively, quoted or not (DuckDB).
+  [[nodiscard]] bool Named(std::string_view qualifier) const;
 
   // The columns `name` names: ASCII case-insensitively, quoted or not (DuckDB).
   [[nodiscard]] NameMatches Match(std::string_view name) const;
@@ -93,6 +110,7 @@ class Binding {
   Binding(std::string name, BindingSource source, std::vector<BindingColumn> columns);
 
   std::string name_;
+  std::string lower_name_;  // name_ in ASCII lower case
   BindingSource source_;
   std::vector<BindingColumn> columns_;
   std::vector<std::string> lower_;  // per column: its name in ASCII lower case
@@ -106,6 +124,26 @@ struct ColumnLocation {
   friend bool operator==(const ColumnLocation&, const ColumnLocation&) = default;
 };
 
+// The bindings of a scope that a name may resolve in (rule 10 of ADR 0022, in two levels as in
+// DuckDB): those before `end`. A name resolves in the inner level, [inner_begin, end), and only
+// when no binding there has it in the outer level, [0, inner_begin). For an ON, `end` follows its
+// own JOIN's item and the inner level is its join group, the items from the last comma up to it (a
+// CROSS JOIN continues a group): its earlier comma siblings form the outer level, and later items
+// are invisible. The default, for every other clause, is every binding in one level.
+struct Visibility {
+  std::size_t inner_begin = 0;
+  std::size_t end = std::numeric_limits<std::size_t>::max();
+};
+
+// Where a name resolves (Scope::LookUp). Matches count in FROM order, and within a binding in
+// column order.
+struct Lookup {
+  enum class Outcome : std::uint8_t { kFound, kMissing, kAmbiguous };
+  Outcome outcome = Outcome::kMissing;
+  ColumnLocation where;  // kFound: the column; kAmbiguous: the first match
+  ColumnLocation other;  // kAmbiguous: the second match
+};
+
 // The bindings of one query block, in FROM order; immutable. Neither copied nor moved, since the
 // scope of an inner block may point at it: a container of scopes holds them through
 // std::unique_ptr.
@@ -113,7 +151,8 @@ class Scope {
  public:
   // `outer` is the scope of the enclosing block (nullptr: none), which must outlive this one.
   // Nothing consults it yet: rule 9 of ADR 0022 (a name found only in an enclosing block is a
-  // correlation, ADR 0023) comes with roadmap PR J5.
+  // correlation, ADR 0023) comes with roadmap PR J5, and a Visibility limits this block's bindings
+  // only.
   explicit Scope(std::vector<Binding> bindings, const Scope* outer = nullptr);
   Scope(const Scope&) = delete;
   Scope& operator=(const Scope&) = delete;
@@ -123,15 +162,39 @@ class Scope {
   [[nodiscard]] const std::vector<Binding>& bindings() const { return bindings_; }
   [[nodiscard]] const Scope* outer() const { return outer_; }
 
-  // The column an unqualified name refers to, by its id (plan::ResolvePositions sets its position
-  // at the end): a bind error when two columns match it (reported first) or none does, else as
-  // Reference. Until roadmap PR J2b a scope resolves names in its one binding: a qualified name or
-  // another number of bindings is a programming error. J2b also limits a name in an ON to the
-  // bindings up to and including its own JOIN (rule 10 of ADR 0022).
-  [[nodiscard]] arrow::Result<BoundColumn> Resolve(const sql::ColumnRef& ref) const;
+  // Where `ref` resolves among the `visible` bindings, level by level (Visibility): a qualified
+  // name among the bindings it names (rules 2 and 3 of ADR 0022), an unqualified one among all of
+  // them. A level with two or more matching columns is ambiguous (two bindings that have the name,
+  // or two columns of one binding whose names differ only in case); with none, the next level is
+  // searched.
+  [[nodiscard]] Lookup LookUp(const sql::ColumnRef& ref, Visibility visible = {}) const;
 
-  // The column at `where`, referred to at `span`: kUnsupported there when it has no engine type.
+  // The column `ref` refers to (LookUp), by its id (plan::ResolvePositions sets its position at the
+  // end), as Reference gives it. A bind error at the name when it is ambiguous (rules 3 and 4: the
+  // error names the qualified candidates) or found nowhere; the message then says when a later
+  // FROM item, which an ON does not see, has the name, and when an alias hides the name of a
+  // binding's table (rule 2).
+  [[nodiscard]] arrow::Result<BoundColumn> Resolve(const sql::ColumnRef& ref,
+                                                   Visibility visible = {}) const;
+
+  // The column at `where`, referred to at `span`, with its binding's Qualifier: kUnsupported there
+  // when it has no engine type.
   [[nodiscard]] arrow::Result<BoundColumn> Reference(ColumnLocation where, SourceSpan span) const;
+
+  // The qualifier of binding `binding`'s columns (BoundColumn::qualifier, which EXPLAIN shows): its
+  // name in a scope of two or more bindings, else none, so that a single table's plans do not
+  // change.
+  [[nodiscard]] std::string Qualifier(std::size_t binding) const;
+
+  // Two bindings of the same name that share a column name, which make SELECT * a bind error (rule
+  // 5 of ADR 0022): the first such pair in FROM order, with the first column (in the first
+  // binding's column order) that the second binding has too.
+  struct StarConflict {
+    std::size_t first = 0;
+    std::size_t second = 0;
+    std::string column;  // as the first binding declares it
+  };
+  [[nodiscard]] std::optional<StarConflict> FindStarConflict() const;
 
   // Where column `id` is, if it is a binding's column (and not a computed one).
   [[nodiscard]] std::optional<ColumnLocation> Find(ColumnId id) const;

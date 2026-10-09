@@ -266,6 +266,14 @@ Proposed
   The domains keep a many-to-many edge (a key with few values on both sides) out of the order while a key edge is
   available; ordering by row counts alone can take such an edge first and multiply the intermediate result. The
   plan depends on metadata only, so EXPLAIN and every answer are the same for any thread count.
+  - Update (2026-10-09, J2b-1): `src/plan/join_order.h` computes rules 1, 2, 3 and 5 for the tables and sub-plans
+    of an inner block, and rule 4's estimate of a sub-plan, but no filter selectivity; fixed units, a LEFT JOIN unit
+    among them, come with J5 and J6. It adds three refinements. The domain of an exact range is capped at the
+    column's non-NULL rows, min(max - min + 1, non-NULL rows): a sparse key, a few values spread over a wide range,
+    would otherwise shrink every estimate of its joins to one row and put them first. An estimate is computed in 128
+    bits, rounded down and saturated at 2^63 - 1, and is at least 1 unless an input has no row or a key column no
+    non-NULL value (then it is 0). A relation of unknown rows counts as the largest, also where its rows stand in for
+    an unknown domain.
 - **Build sides.**
   - An inner join builds on the input with the smaller footer row count, where a join below stands in with its
     estimate, and on the relation being added on a tie. With the largest relation as the probe, the probe side
@@ -323,6 +331,10 @@ Proposed
   and NULL counts and, new with J2b, the distinct-count hints that a writer stored, through Arrow's Parquet
   statistics. It reads no data and keeps nothing between queries. Persistent sketches (HyperLogLog, Count-Min) come
   with cost-based join ordering if the footers prove insufficient, with their own storage decision.
+  - Update (2026-10-09, J2b-1): the hints reach the planner through `plan::Table::part_distinct_count`, Parquet's
+    `distinct_count` of a part's column chunk, read by leaf index. DuckDB stores one for each dictionary-encoded
+    chunk and parquet-cpp none; `harness.ParquetDistinctCountOracle` compares antb1's reading with DuckDB's
+    `parquet_metadata`.
 - **Where it runs.** OR factoring, classification, the connectivity check and the join order run when a block is
   bound, on ids, so plain EXPLAIN shows the order and the build sides. `plan::Optimize` then prunes columns through
   both inputs of every join and ends with `plan::ResolvePositions`; ADR 0023 adds its unnesting pass in front.
@@ -508,6 +520,10 @@ docs/sql-subset.md sections it changes.
   limit, the WHERE classification, the connectivity check, and the join order and build sides from footer statistics
   with distinct-count hints. Its `.slt` cases cover the bind errors of these rules, among them `*` over two bindings
   of the same name that share a column name and an ON that reads a later FROM item. Q3, Q5, Q10, Q12 and Q14 pass.
+  - Update (2026-10-09): J2b ships as two PRs. J2b-1, `feat(plan,exec,io): key casts, join order and name rules for
+    joins`, adds the building blocks and changes no SQL answer: `plan::CastExpr` and its evaluation, the scope's
+    rules 1-5 and 10 (`src/plan/scope.h`), the join order (`src/plan/join_order.h`) and the distinct-count hints.
+    J2b-2, `feat(plan): inner joins of the tables in from`, binds the joins with them, and the five queries pass.
 - **E2, feat(exec): semi, anti, null-aware anti, left outer and one-row joins.** Residuals over candidate pairs,
   builds of distinct keys, NULL padding of every type and the one-row join.
 - **T2, test(diff): generate derived tables, ctes, left joins and uncorrelated subqueries.** With their metamorphic

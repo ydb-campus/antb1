@@ -50,6 +50,10 @@ class ParquetTable final : public plan::Table {
   // engine type is integer-valued (integers but HUGEINT, USMALLINT, DATE) and whose chunk has valid
   // statistics with min/max and a null count; std::nullopt otherwise (never skip).
   std::optional<plan::PartStats> part_stats(int64_t part, int field) const override;
+  // The distinct_count of the field's column chunk in the part's row group, from the footer, for a
+  // primitive field of any type whose chunk has valid statistics with one (DuckDB writes it for
+  // dictionary-encoded chunks; parquet-cpp never does); std::nullopt otherwise.
+  std::optional<int64_t> part_distinct_count(int64_t part, int field) const override;
   std::string Describe() const override;
   // A float column of the files (widened to double on read).
   bool StoredAsFloat(int field) const override;

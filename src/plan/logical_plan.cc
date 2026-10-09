@@ -239,9 +239,13 @@ struct SameNode {
     return SameExprs(a.whens, b.whens) && SameExprs(a.thens, b.thens) &&
            SameExprs({a.otherwise}, {b.otherwise});
   }
+  bool operator()(const CastExpr& a) const {
+    return SameExpr(*a.operand, *std::get<CastExpr>(other.node).operand);
+  }
 };
 
-// The children of an expression node, in order (a null ELSE included).
+// The children of an expression node, in order (a null ELSE included). Every node with operands
+// must be listed: MapColumns, CollectColumns and CollectColumnIds see only what it returns.
 std::vector<ExprPtr*> Children(Expr& expr) {
   std::vector<ExprPtr*> out;
   const auto all = [&](std::vector<ExprPtr>& exprs) {
@@ -263,11 +267,45 @@ std::vector<ExprPtr*> Children(Expr& expr) {
     all(c->whens);
     all(c->thens);
     out.push_back(&c->otherwise);
+  } else if (auto* cast = std::get_if<CastExpr>(&expr.node)) {
+    out = {&cast->operand};
   }
   return out;
 }
 
+bool Within(IntegerRange inner, IntegerRange outer) {
+  return inner.min >= outer.min && inner.max <= outer.max;
+}
+
+// The digits of an integer type's largest magnitude: 5 (SMALLINT, USMALLINT), 10, 19 or 38.
+int IntegerDigits(LogicalType type) {
+  const IntegerRange range = RangeOf(type);
+  int digits = 0;
+  for (Int128 magnitude = std::max(range.max, -range.min); magnitude > 0; magnitude /= 10) {
+    ++digits;
+  }
+  return digits;
+}
+
 }  // namespace
+
+bool IsExactWidening(LogicalType from, LogicalType to) {
+  if (from == to) {
+    return true;
+  }
+  if (IsInteger(from) && IsInteger(to)) {
+    return Within(RangeOf(from), RangeOf(to));
+  }
+  if (to != LogicalType::kDecimal) {
+    return false;
+  }
+  const int integer_digits = to.width() - to.scale();
+  if (IsInteger(from)) {
+    return IntegerDigits(from) <= integer_digits;
+  }
+  return from == LogicalType::kDecimal && from.scale() <= to.scale() &&
+         from.width() - from.scale() <= integer_digits;
+}
 
 bool SameExpr(const Expr& a, const Expr& b) {
   return a.type == b.type && a.node.index() == b.node.index() &&
