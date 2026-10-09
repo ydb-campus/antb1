@@ -83,19 +83,17 @@ std::string QualifiedText(const std::vector<Binding>& bindings, ColumnLocation w
   return binding.name() + "." + binding.columns()[where.column].name;
 }
 
-// Whether a binding of a table is named by an alias that hides the table's name `qualifier`: its
-// FROM reference is `qualifier`, as a table name or as a path's name, but the binding is not
-// named so.
+// Whether a binding of a table is named by an alias that hides `qualifier`, the name that its FROM
+// reference gives it without one (rule 1): a table's name as written, a path's PathBindingName.
 bool AliasHides(const Binding& binding, std::string_view qualifier) {
   const auto* table = std::get_if<TableSource>(&binding.source());
-  if (table == nullptr || binding.Named(qualifier)) {
+  if (table == nullptr) {
     return false;
   }
-  const std::string written = AsciiLower(table->table_name);
-  const std::string path_name = AsciiLower(PathBindingName(table->table_name));
-  const std::string wanted = AsciiLower(qualifier);
-  const bool aliased = !binding.Named(written) && !binding.Named(path_name);
-  return aliased && (wanted == written || wanted == path_name);
+  const std::string unaliased = table->kind == sql::TableRef::Kind::kPath
+                                    ? PathBindingName(table->table_name)
+                                    : table->table_name;
+  return !binding.Named(unaliased) && AsciiLower(qualifier) == AsciiLower(unaliased);
 }
 
 // Why `ref` resolves nowhere in the bindings before `end`, for its bind error: the name it lacks,

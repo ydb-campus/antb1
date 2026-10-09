@@ -47,6 +47,10 @@ struct TableSource {
   std::shared_ptr<Table> table;  // not null
   std::string table_name;        // ScanNode::table_name: the FROM reference as written, or the path
   SourceSpan span;               // ScanNode::span: the FROM reference
+  // Whether the reference is a table's name or a path. Without an alias a table's binding is named
+  // by the name as written, a path's by its PathBindingName (rule 1 of ADR 0022): the name that a
+  // bind error says an alias hides.
+  sql::TableRef::Kind kind = sql::TableRef::Kind::kName;
 };
 
 // A bound sub-plan in FROM (a derived table or a CTE reference, from roadmap PR J4 on): its root

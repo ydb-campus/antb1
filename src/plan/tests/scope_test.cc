@@ -394,12 +394,16 @@ std::shared_ptr<arrow::Schema> U() {
 std::shared_ptr<arrow::Schema> W() { return IntegerSchema({"c", "g"}); }
 std::shared_ptr<arrow::Schema> V() { return IntegerSchema({"e", "f"}); }
 
-// The binding `name` of a table referred to in FROM as `table_name`: an alias when they differ.
+// The binding `name` of a table referred to in FROM as `table_name`, a table's name or a path: an
+// alias when `name` is not the name the reference gives it (rule 1).
 Binding Aliased(const std::string& name, const std::string& table_name,
-                std::shared_ptr<arrow::Schema> schema, ColumnIdSource& ids) {
+                std::shared_ptr<arrow::Schema> schema, ColumnIdSource& ids,
+                sql::TableRef::Kind kind = sql::TableRef::Kind::kName) {
   auto table = std::make_shared<FakeTable>(std::move(schema), 1);
   return Binding::OfTable(
-      name, TableSource{.table = std::move(table), .table_name = table_name, .span = {}}, ids);
+      name,
+      TableSource{.table = std::move(table), .table_name = table_name, .span = {}, .kind = kind},
+      ids);
 }
 
 sql::ColumnRef QRef(std::string qualifier, std::string name, SourceSpan span = {}) {
@@ -469,21 +473,29 @@ TEST(ScopeTest, QualifiedNamesResolveInTheBindingsTheyName) {
   EXPECT_EQ(scope.LookUp(QRef("x", "a")).outcome, Lookup::Outcome::kMissing);
 }
 
-// Rule 2: an alias hides its table's name, as written or as a path's binding name; a path without
-// an alias is named by PathBindingName, and its text names nothing.
+// Rule 2: an alias hides the name its FROM reference gives a binding without one, a table's name as
+// written or a path's PathBindingName. A path's text names nothing, aliased or not, and a table's
+// name is never taken for a path: FROM "a.b" AS x hides "a.b", not a.
 TEST(ScopeTest, AnAliasHidesItsTablesName) {
   ColumnIdSource ids;
   const Scope aliased({Aliased("x", "t", T(), ids), TableBinding("u", U(), ids)});
   ExpectResolves(aliased, QRef("x", "b"), {}, 0, 1, "x");
   ExpectSqlError(aliased.Resolve(QRef("t", "b")).status(), kBind,
                  "no FROM item is named 't' (the alias 'x' hides it)", {});
-  const Scope paths(
-      {Aliased("x", "F/trips.parquet", T(), ids), Aliased("zones", "F/zones.parquet", U(), ids)});
+  constexpr sql::TableRef::Kind kPath = sql::TableRef::Kind::kPath;
+  const Scope paths({Aliased("x", "F/trips.parquet", T(), ids, kPath),
+                     Aliased("zones", "F/zones.parquet", U(), ids, kPath)});
   ExpectResolves(paths, QRef("zones", "d"), {}, 1, 1, "zones");
   ExpectSqlError(paths.Resolve(QRef("trips", "a")).status(), kBind,
                  "no FROM item is named 'trips' (the alias 'x' hides it)", {});
+  ExpectSqlError(paths.Resolve(QRef("F/trips.parquet", "a")).status(), kBind,
+                 "no FROM item is named 'F/trips.parquet'", {});
   ExpectSqlError(paths.Resolve(QRef("F/zones.parquet", "d")).status(), kBind,
                  "no FROM item is named 'F/zones.parquet'", {});
+  const Scope dotted({Aliased("x", "a.b", T(), ids), TableBinding("u", U(), ids)});
+  ExpectSqlError(dotted.Resolve(QRef("a", "b")).status(), kBind, "no FROM item is named 'a'", {});
+  ExpectSqlError(dotted.Resolve(QRef("A.B", "b")).status(), kBind,
+                 "no FROM item is named 'A.B' (the alias 'x' hides it)", {});
 }
 
 // Rule 3: two bindings may share a name; a qualified name resolves to the one that has the column,
