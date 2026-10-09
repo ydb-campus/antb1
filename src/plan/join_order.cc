@@ -28,7 +28,9 @@ std::vector<std::vector<std::size_t>> EdgesOf(std::size_t relations,
   std::vector<std::vector<std::size_t>> out(relations);
   for (std::size_t e = 0; e < edges.size(); ++e) {
     const JoinEdge& edge = edges[e];
-    ANTB1_CHECK(edge.a < relations && edge.b < relations && edge.a != edge.b);
+    ANTB1_CHECK(edge.a < relations);
+    ANTB1_CHECK(edge.b < relations);
+    ANTB1_CHECK(edge.a != edge.b);
     out[edge.a].push_back(e);
     out[edge.b].push_back(e);
   }

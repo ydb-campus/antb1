@@ -43,6 +43,7 @@ JoinEdge Edge(std::size_t a, std::size_t b, std::optional<int64_t> a_domain = st
 // The relations of the steps, in order.
 std::vector<std::size_t> Order(const std::vector<JoinStep>& steps) {
   std::vector<std::size_t> out;
+  out.reserve(steps.size());
   for (const JoinStep& step : steps) {
     out.push_back(step.relation);
   }
@@ -51,6 +52,7 @@ std::vector<std::size_t> Order(const std::vector<JoinStep>& steps) {
 
 std::vector<int64_t> Estimates(const std::vector<JoinStep>& steps) {
   std::vector<int64_t> out;
+  out.reserve(steps.size());
   for (const JoinStep& step : steps) {
     out.push_back(step.estimate);
   }
@@ -59,6 +61,7 @@ std::vector<int64_t> Estimates(const std::vector<JoinStep>& steps) {
 
 std::vector<std::vector<std::size_t>> Keys(const std::vector<JoinStep>& steps) {
   std::vector<std::vector<std::size_t>> out;
+  out.reserve(steps.size());
   for (const JoinStep& step : steps) {
     out.push_back(step.edges);
   }
