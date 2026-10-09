@@ -36,6 +36,31 @@ using testing::Int64Column;
 using testing::Int64s;
 using testing::MemoryTable;
 
+// The number of columns `node` returns if it is planned, for the scans, sorts and joins that the
+// malformed-join cases build: a semi, anti or null-aware anti join returns its probe input's
+// columns, any other join both inputs' columns. A missing input counts as the 2-column scan that
+// it stands in for.
+std::size_t WidthOf(const plan::LogicalNodePtr& node) {
+  if (node == nullptr) {
+    return 2;
+  }
+  if (const auto* join = std::get_if<plan::JoinNode>(node.get())) {
+    const std::size_t left = WidthOf(join->left);
+    const bool probe_only = join->kind == plan::JoinKind::kSemi ||
+                            join->kind == plan::JoinKind::kAnti ||
+                            join->kind == plan::JoinKind::kNullAwareAnti;
+    return probe_only ? left : left + WidthOf(join->right);
+  }
+  if (const auto* sort = std::get_if<plan::SortNode>(node.get())) {
+    return WidthOf(sort->input);
+  }
+  if (const auto* scan = std::get_if<plan::ScanNode>(node.get())) {
+    return scan->fields.size();
+  }
+  ADD_FAILURE() << "WidthOf: a node the malformed-join cases do not build";
+  return 0;
+}
+
 class PhysicalPlannerTest : public testing::ExecTest {
  protected:
   // x = 0..9 in batches of 4, 4 and 2; y = 10 * x, NULL where x is a multiple of 3. With `split`,
@@ -664,15 +689,8 @@ TEST_F(PhysicalPlannerTest, MalformedJoinsAreInvalidNotUnsupported) {
     return std::vector<plan::JoinKey>{
         plan::JoinKey{.left = std::move(left), .right = std::move(right)}};
   };
-  // The width of the join at `root` if it were planned: a semi, anti or null-aware anti join
-  // returns its probe input's 2 columns, any other join both inputs' 4.
-  const auto width_of = [](const plan::LogicalNodePtr& root) -> std::size_t {
-    const auto* join = std::get_if<plan::JoinNode>(root.get());
-    const bool probe_only = join != nullptr && (join->kind == plan::JoinKind::kSemi ||
-                                                join->kind == plan::JoinKind::kAnti ||
-                                                join->kind == plan::JoinKind::kNullAwareAnti);
-    return probe_only ? 2 : 4;
-  };
+  // Each plan has the width its root would return, so that the root-width check never decides.
+  const auto width_of = [](const plan::LogicalNodePtr& root) { return WidthOf(root); };
   const auto expect_invalid = [&](const plan::LogicalNodePtr& root, std::string_view what) {
     for (const bool profiled : {false, true}) {
       ProfileNode profile;
