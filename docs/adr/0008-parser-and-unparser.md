@@ -74,3 +74,10 @@ Accepted
     every expression, so they are never read as aliases either.
   - `sql::ToSql` prints every alias quoted after `AS`, `JOIN` as `INNER JOIN`, `LEFT OUTER JOIN` as `LEFT JOIN` and
     qualifiers as written. Copying, comparing, printing and destroying the list are loops, never recursions.
+- Update (derived tables and WITH lists, 2026-10-09, roadmap PR S4a): a query is an optional WITH list and a block, and
+  a derived table and each CTE hold a query of their own (a `sql::SelectStatement` in a heap box), so the AST nests
+  statements. Every walk of it (copying, comparing, printing, `sql::Depth`, destruction) recurses once per nested
+  query, which the depth limit bounds: a nested query is one level below its statement. The WITH list, the FROM list and
+  column alias lists are walked in loops. `sql::ToSql` quotes CTE names and column aliases
+  (`WITH "c"("x") AS (...)`). The binder rejects both forms with `kUnsupported` before any table resolves, until it
+  answers them.

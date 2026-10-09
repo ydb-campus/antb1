@@ -34,7 +34,8 @@ at one layer.
 - Tokens: `src/sql/include/antb1/sql/token.h` and `src/sql/lexer.cc`. Keywords are not reserved by the lexer; the
   parser recognizes them.
 - AST: `src/sql/include/antb1/sql/ast.h`. Every node carries its `SourceSpan`. Extend `EqualIgnoringSpans` in
-  `src/sql/ast.cc` for every new field.
+  `src/sql/ast.cc` for every new field, and `Depth` for every new child: a nested query (a `SelectStatement` in a
+  `Box`, such as a derived table's) is one level below its statement, and the parser must count the same levels.
 - Parser: `src/sql/parser.cc` (recursive descent). Valid-looking SQL outside the subset returns
   `ParseError::Kind::kUnsupported` with the span of the first offending token; malformed SQL returns `kSyntax`.
 - Unparser: `src/sql/unparse.cc`. `ToSql` prints the canonical form, and `Parse(ToSql(ast))` must be equal to `ast`
@@ -46,11 +47,13 @@ at one layer.
 
 - `src/plan/binder.cc` resolves names ASCII case-insensitively through the catalog, checks types and builds the
   logical plan. `src/plan/types.cc` holds the logical types and their Arrow mapping.
-- A new kind of expression node (an alternative of `sql::ExprNode`) fails to compile until every binder visitor
-  handles it: `FirstUnsupportedOf`, `RejectConditionOf`, `ReadsColumnOf`, `ContainsAggregateOf`, `ExprNameOf`,
-  `BindInputOf`, `BindOutputOf` and `BindConditionOf`. Until the binder answers the node, the first two reject it
-  with `kUnsupported`. `BindConditionOf` binds every condition leaf that `RejectConditionOf` admits; any other node
-  reaching it fails an `ANTB1_CHECK`.
+- A new kind of expression node (an alternative of `sql::ExprNode`) fails to compile until each of the nine binder
+  visitors handles it: `FoldDateCastsOf`, `FirstUnsupportedOf`, `RejectConditionOf`, `ReadsColumnOf`,
+  `ContainsAggregateOf`, `ExprNameOf`, `BindInputOf`, `BindOutputOf` and `BindConditionOf`. Until the binder answers
+  the node, `FirstUnsupportedOf` and `RejectConditionOf` reject it with `kUnsupported`. A new form of a query or of a
+  FROM item (a WITH list, a derived table) is rejected in `CheckSupported` (`RejectWith`, `RejectFromList`) the same
+  way, before any table resolves. `BindConditionOf` binds every condition leaf that `RejectConditionOf` admits; any
+  other node reaching it fails an `ANTB1_CHECK`.
 - Compare column and literal exactly at bind time: an out-of-range literal becomes constant true or false for
   non-NULL values (NULLs stay NULL), and a decimal literal against an integer column becomes an equivalent integer
   comparison ([sql-subset.md](../sql-subset.md#semantics)).
