@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791550526154,
+  "lastUpdate": 1791551980594,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -5832,6 +5832,114 @@ window.BENCHMARK_DATA = {
             "value": 101.6142212857127,
             "unit": "ms/iter",
             "extra": "iterations: 7\ncpu: 101.5904282857143 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "0e4efa23fc240dbc31ade28df9f016366c18987c",
+          "message": "feat(exec): semi, anti, null-aware anti and one-row joins (#109)\n\n## Summary\n\nRoadmap PR **E2a**, the first half of E2 ([ADR\n0022](docs/adr/0022-joins-and-query-blocks.md), \"Execution\"). You\napproved splitting E2. This PR runs semi, anti, null-aware anti and\none-row joins without residuals: everything J5 needs. E2b adds residuals\nover candidate pairs and LEFT joins.\n\nNo SQL reaches a join until J2b and J5, so no query changes its answer:\n`tests/data/tpch_status.json` stays `{\"pass\": [1, 6]}` and ClickBench\nstays at 43/43.\n\n**Join table** (`join_table.h`):\n- `JoinBuildSpec::Keyless(schema)` for one-row joins.\n- A keyless build holds every selected row as the rows of one key (one\nhash, one partition, one slot), so `unique()` means at most one row.\n- `Find` on it is Invalid, checked before any key is read.\n\n**Operators** (`hash_join.{h,cc}`):\n- `JoinBuild` takes its join's kind with no default, and\n`HashJoinOperator` reads it from the build, so the build and its probes\ncannot disagree.\n- `EmptiesJoin`: only an inner or semi join whose build holds no row\nempties its join. `PrepareBuilds` stops there, and the probe never opens\nits input.\n- **Semi, anti and null-aware anti:**\n- Windows of at most `batch_size` rows, each a slice of the probe batch\nwith new selection bits.\n- The output schema is the probe's own schema object, so a semi pipeline\ncan feed an inner join's build.\n  - An anti join over no build row keeps every selected row.\n- **Null-aware anti (NOT IN):**\n  - Over an empty build input it keeps every row, NULL keys included.\n- Over a build input with a NULL key it reads its whole probe input and\nkeeps none, as DuckDB's mark join does, so it adds no divergence (your\ndecision).\n  - Otherwise it drops NULL probe keys.\n- **One-row:**\n- The build must hold exactly one row; any other count is Invalid from\n`Prepare`, before any probe part runs.\n- Its values are made once in `JoinBuild` from the budget's pool, shared\nby every part, sliced per window, and released with the build and the\nprobe.\n- A window appends at most 1 MiB of VARCHAR values, and at least one\nrow.\n- `Make` rejects what no plan holds:\n  - a LEFT build;\n  - a non-inner kind that builds on the left;\n- a keyless build on any kind but one-row, and a keyed build on one-row;\n  - a null-aware anti join of other than one key;\n  - residuals on any kind but inner.\n- **Distinct-key builds are deferred** (your decision): semi and anti\nbuilds keep every row, and ADR 0022 records the deferral.\n\n**Physical planner:**\n- `PipelineInput` passes through the probes of the new kinds.\n- `ShapeOf` returns Invalid, in order, for:\n  - a missing input;\n  - a non-inner kind building on the left;\n  - one-row with keys or residuals;\n  - other kinds without keys;\n  - null-aware anti of other than one key, or with residuals;\n  - a residual that is missing or not BOOLEAN;\n  - then J1b's key checks.\n- `NotRunYet` keeps semi and anti joins with residuals at exit 4, at the\njoin's span, until E2b. LEFT stays at exit 4.\n- `MakeJoinBuild` makes a keyless build for a one-row join.\n- `HashJoin` and `HashBuild` are the profile lines of every kind. There\nis no new metric, so `kOrder` and J2b's goldens are unaffected.\n\n**Tests:**\n- `exec.HashJoinTest`:\n  - selection windows;\n- the NULL-key matrix of every kind, over two probe batches. It has an\nunselected NULL-key build row, checks how often each kind opens and\npulls its probe, and has an error in the last batch, which every join\nthat reads its probe must return.\n  - empty builds per kind in a chain;\n  - one-row joins:\n    - over an aggregate of an empty input (exact types, NULL and 0);\n- long VARCHAR values in windows of fewer rows, as valid slices of one\nbuffer;\n    - values released with the build and the probe;\n    - builds of 0 and 2 rows are Invalid;\n  - chains and nested builds of every kind; misuse; profiles.\n- `exec.HashJoinPlanTest`:\n  - every kind against a nested-loop reference;\n  - 1 against 4 threads on the shapes where the kind matters.\n- `exec.JoinTableTest`: keyless builds.\n- `exec.JoinTableBadAllocTest`: `Keyless` and a one-row `Prepare` under\nthe `std::bad_alloc` sweeps.\n- `exec.PhysicalPlannerTest`:\n  - placements of every kind;\n  - LEFT, and semi or anti with residuals, stay unsupported;\n- 14 more malformed shapes, each planned at its root's own width, so\nthat only the shape can make it Invalid.\n- `exec.MemoryLimitTest`:\n  - join plans of the new kinds;\n  - the VARCHAR cap per window: a 256 KiB value runs within 64 MiB;\n- values that pass the limit fail with OutOfMemory from the build's\n`Prepare`, and the budget returns to 0.\n- `exec.ProfileTest`: the lines of every kind.\n- `integration.JoinTest`: one table-driven test of 18 cases over the\nstar files. The counts are DuckDB's, from the pending J5 and U2 records\nof `in.slt`, `exists.slt` and `scalar.slt`.\n- Mutation checks, each reverted (23 in the review round alone); every\none fails at least one test.\n\n**Docs:**\n- `docs/sql-subset.md`: the executor and the metrics per kind.\n- `docs/architecture.md` and `docs/testing.md`.\n- ADR 0022 update lines: the empty-build rule per kind, NOT IN with a\nNULL, slices of the probe batch, keyless one-row builds, distinct-key\nbuilds deferred, and the split.\n- ADR 0015: a metrics line per kind.\n- `/docs/adr/` is a CODEOWNERS path; the status stays Proposed.\n\nFor the maintainer:\n\n- **Size:** about 2,400 lines inserted (code about 470, tests about\n1,830, docs about 95), about 200 over the planned 1,800 to 2,200 because\nof the review round's tests.\n- **Overrides as decided:** no distinct-key builds; NOT IN over a set\nwith a NULL reads its probe; one-row values built once in `JoinBuild`,\nwith VARCHAR windows capped; no default kind.\n- **Not in the plan:**\n  - the cap's value: 1 MiB of VARCHAR values per window;\n- the one-row memory-limit plans run over a scan filter, so they hold\nbudget memory past the tiny limit;\n  - follow-up commits for clang-tidy and GCC 15 findings.\n- **Hand-off to J5:**\n- IN is a semi join with one key of a common non-DOUBLE type and no\nresidual.\n- Both spellings of NOT IN are null-aware anti joins: exactly one key,\nno residual.\n- A scalar subquery is a keyless one-row join with its comparison as a\nFilter above it, never a residual.\n  - Register divergence (b) for semi joins too, and (a) for them.\n  - Remove the `in.slt` and `scalar.slt` guards.\n- **Hand-off to E2b** (stacked on this branch, opened after this PR\nmerges):\n- delete `NotRunYet`, the LEFT return in the Builder and the \"until E2b\"\nclause in `physical_planner.h`;\n  - relax `Make`'s E2a-only checks.\n- **Hand-off to J2b:** no metric changed, so its goldens stand.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run fmt                         # on f955bdc (the head): no diff\n$ pixi run check && pixi run ci-gcc    # on f955bdc\nlint: PASS\n100% tests passed out of 2283          # ci, and the same in ci-gcc\n$ pixi run check-full                  # on f955bdc\nlint: PASS\n100% tests passed out of 2283          # ci (clang Debug -Werror)\n100% tests passed out of 2283          # asan (ASan + UBSan)\n                                       # tidy: clean\nCoverage gate: PASS                    # exec 97.53% lines / 89.10% branches (floors 96.1 / 85.1)\n100% tests passed out of 2             # fuzz-smoke\n100% tests passed out of 2283          # ci-gcc\n$ pixi run tsan                        # on 250d26a (f955bdc changes one planner test only)\n100% tests passed out of 2283          # no ThreadSanitizer reports\n$ pixi run test -R '^exec\\.(HashJoin|HashJoinPlan|PhysicalPlanner|JoinTable|JoinTableBadAlloc|MemoryLimit|Profile)Test'\n100% tests passed out of 96\n$ pixi run test -R '^integration\\.JoinTest'\n100% tests passed out of 11\n$ pixi run test -L slt && pixi run test -L harness   # pending records stay pending\n100% tests passed out of 67\n100% tests passed out of 248\n```\n\nThe only skipped tests are the two metamorphic join relations\n(`star_join_commutes`, `star_join_order_three_tables`), which are\nskipped on main too and become active with J2b-2.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: the ADR 0022 and ADR 0015 update lines, in the\napproved plan\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code implemented the\nmaintainer-approved E2a plan, with your overrides, after a planning\nround of read-only mapping, design and adversarial critique agents that\nprobed DuckDB 1.5.6. Two reviewer agents then reviewed it from two\nangles: semantics per kind against DuckDB 1.5.6; and concurrency, memory\nand tests. Their four P1s were missing tests: NOT IN reading its whole\nprobe, the one-row window cap, the release of one-row values, and the\none-row out-of-memory paths. All four are fixed, as are five nits. A\nre-review found one test case that could not fail; it is fixed in the\nlast commit, which now fails when the build input is valid. A final\npre-PR review found no P0 or P1. Its four nits (two wordings, two\nstronger tests) go to E2b, which edits the same code.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-10-09T16:16:38+03:00",
+          "tree_id": "cdac2cbb7f0f5e43e6d54a3ac4c2643268422726",
+          "url": "https://github.com/ydb-campus/antb1/commit/0e4efa23fc240dbc31ade28df9f016366c18987c"
+        },
+        "date": 1791551980090,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 5085.871257181036,
+            "unit": "ns/iter",
+            "extra": "iterations: 137864\ncpu: 5085.586251668311 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 85403.98070243325,
+            "unit": "ns/iter",
+            "extra": "iterations: 7773\ncpu: 85396.52579441656 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 221917.817721524,
+            "unit": "ns/iter",
+            "extra": "iterations: 3160\ncpu: 221878.86234177215 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 443362.04657017044,
+            "unit": "ns/iter",
+            "extra": "iterations: 1589\ncpu: 443304.28697293886 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 400982.9065902565,
+            "unit": "ns/iter",
+            "extra": "iterations: 1745\ncpu: 400961.41833810904 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2070270.8017751595,
+            "unit": "ns/iter",
+            "extra": "iterations: 338\ncpu: 2070065.3757396452 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 50.82844507142933,
+            "unit": "ms/iter",
+            "extra": "iterations: 14\ncpu: 50.82031650000004 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 45.13782168749891,
+            "unit": "ms/iter",
+            "extra": "iterations: 16\ncpu: 45.13348237499998 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 209.163338333326,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 209.1499636666665 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.887442382978575,
+            "unit": "ms/iter",
+            "extra": "iterations: 47\ncpu: 14.885731127659605 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 22.01691003225854,
+            "unit": "ms/iter",
+            "extra": "iterations: 31\ncpu: 22.013528774193546 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 38.88441349999994,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 38.878595388888925 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.9305055497236807,
+            "unit": "ms/iter",
+            "extra": "iterations: 362\ncpu: 1.9303401988950297 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 106.11492914285999,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 106.10462542857135 ms\nthreads: 1"
           }
         ]
       }
