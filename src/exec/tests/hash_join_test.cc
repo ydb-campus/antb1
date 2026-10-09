@@ -1645,13 +1645,17 @@ TEST_F(HashJoinTest, SelectionKindsPassProbeBatchesThrough) {
 // NULL key (a row the build input does not select is none of its rows), drops the NULL-key row
 // over a build with rows, and keeps every row over an empty build input. A row the probe does not
 // select is never kept. Inner and semi joins over a build without rows never open their probe
-// input; every other join reads it.
+// input; every other join reads it to its end, also one that keeps no row: an error of its last
+// batch is the join's.
 TEST_F(HashJoinTest, NullKeyMatrixOfEveryKind) {
   const auto schema = Int64Schema({"k", "id"});
   const std::optional<int64_t> null;
-  // Probe ids 0 to 4, keys 1, NULL, 2, 3 and 2, the last one not selected.
-  const auto probe = BatchOf(schema, {Int64s({1, null, 2, 3, 2}), Int64s({0, 1, 2, 3, 4})});
-  const auto probe_selection = Bools({true, true, true, true, false});
+  // Probe ids 0 to 4 in two batches, keys 1, NULL and 2, then 3 and 2, the last one not selected.
+  const std::vector<Batch> probe = {
+      Batch{.data = BatchOf(schema, {Int64s({1, null, 2}), Int64s({0, 1, 2})}),
+            .selection = nullptr},
+      Batch{.data = BatchOf(schema, {Int64s({3, 2}), Int64s({3, 4})}),
+            .selection = Bools({true, false})}};
   const auto batch = [&](const std::vector<std::optional<int64_t>>& keys,
                          std::shared_ptr<arrow::BooleanArray> selection = nullptr) {
     const std::vector<std::optional<int64_t>> ids(keys.size(), 100);
@@ -1683,20 +1687,33 @@ TEST_F(HashJoinTest, NullKeyMatrixOfEveryKind) {
       {{{.ids = {2, 3}}, {.ids = {2, 3}}, {.ids = {0, 1}}, {.ids = {0}}}}};
   for (std::size_t b = 0; b < builds.size(); ++b) {
     for (std::size_t k = 0; k < kinds.size(); ++k) {
-      SCOPED_TRACE(std::string(plan::ToString(kinds[k])) + " over " + builds[b].first);
-      auto source = std::make_unique<ScriptedSource>(
-          schema, std::vector<Batch>{Batch{.data = probe, .selection = probe_selection}});
-      const ScriptedSource& probed = *source;
-      auto join = MakeJoin(
-          std::move(source),
-          DrainedBuild(kinds[k], std::make_unique<ScriptedSource>(schema, builds[b].second), {0}),
-          {0}, /*prepares=*/true);
-      ASSERT_NE(join, nullptr);
-      ExecContext ctx = ContextOf(nullptr, 2);
-      auto result = Drain(*join, ctx);
-      ASSERT_TRUE(result.ok()) << result.status().ToString();
-      EXPECT_EQ(Int64Column(**result, 1), expected[b][k].ids);
-      EXPECT_EQ(probed.opens(), expected[b][k].opens);
+      // Then with the probe's second batch failing.
+      for (const bool failing : {false, true}) {
+        SCOPED_TRACE(std::string(plan::ToString(kinds[k])) + " over " + builds[b].first +
+                     (failing ? ", the probe failing" : ""));
+        auto source = std::make_unique<ScriptedSource>(schema, probe);
+        if (failing) {
+          source->FailAt(1);
+        }
+        const ScriptedSource& probed = *source;
+        auto join = MakeJoin(
+            std::move(source),
+            DrainedBuild(kinds[k], std::make_unique<ScriptedSource>(schema, builds[b].second), {0}),
+            {0}, /*prepares=*/true);
+        ASSERT_NE(join, nullptr);
+        ExecContext ctx = ContextOf(nullptr, 2);
+        auto result = Drain(*join, ctx);
+        const int opens = expected[b][k].opens;
+        EXPECT_EQ(probed.opens(), opens);
+        if (failing && opens == 1) {
+          EXPECT_TRUE(result.status().IsIOError()) << result.status().ToString();
+          EXPECT_EQ(probed.pulls(), 2);
+          continue;
+        }
+        ASSERT_TRUE(result.ok()) << result.status().ToString();
+        EXPECT_EQ(Int64Column(**result, 1), expected[b][k].ids);
+        EXPECT_EQ(probed.pulls(), opens * 3);  // both batches and the end, or nothing
+      }
     }
   }
   // The unselected NULL key is no NULL of the build input.
