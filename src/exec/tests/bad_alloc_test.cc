@@ -703,30 +703,39 @@ bool Releases(const std::vector<std::size_t>& order, std::size_t position) {
   return false;
 }
 
-// JoinBuildSpec::Make and JoinTableBuilder::Make without memory: OutOfMemory, never an exception; a
-// builder made goes on to the table an untouched build makes. Nothing is left in the budget.
+// JoinBuildSpec::Make, JoinBuildSpec::Keyless and JoinTableBuilder::Make without memory:
+// OutOfMemory, never an exception; a builder made goes on to the table an untouched build makes.
+// Nothing is left in the budget.
 TEST_F(JoinTableBadAllocTest, MakingASpecOrABuilderRunsOutOfMemoryCleanly) {
   const BuildInput input = Input(/*hashed=*/false);
   const std::optional<Snapshot> reference = Reference(input, /*hashed=*/false);
   ASSERT_TRUE(reference.has_value());
-  Sweep([&](std::int64_t skip) {
-    std::shared_ptr<arrow::Schema> schema = input.schema;
-    std::vector<plan::BoundColumn> keys = input.keys;
-    std::optional<arrow::Result<std::shared_ptr<const JoinBuildSpec>>> spec;
-    bool fired = false;
-    {
-      const FailAllocations fail(skip);
-      spec.emplace(JoinBuildSpec::Make(std::move(schema), std::move(keys)));
-      fired = fail.failed() > 0;
-    }
-    if (!spec->ok()) {
-      EXPECT_TRUE(fired) << spec->status().ToString();
-      EXPECT_TRUE(spec->status().IsOutOfMemory()) << spec->status().ToString();
-    } else {
-      EXPECT_TRUE((**spec)->direct_candidate());
-    }
-    return fired;
-  });
+  for (const bool keyless : {false, true}) {
+    SCOPED_TRACE(keyless ? "keyless" : "keys");
+    Sweep([&](std::int64_t skip) {
+      std::shared_ptr<arrow::Schema> schema = input.schema;
+      std::vector<plan::BoundColumn> keys = input.keys;
+      std::optional<arrow::Result<std::shared_ptr<const JoinBuildSpec>>> spec;
+      bool fired = false;
+      {
+        const FailAllocations fail(skip);
+        if (keyless) {
+          spec.emplace(JoinBuildSpec::Keyless(std::move(schema)));
+        } else {
+          spec.emplace(JoinBuildSpec::Make(std::move(schema), std::move(keys)));
+        }
+        fired = fail.failed() > 0;
+      }
+      if (!spec->ok()) {
+        EXPECT_TRUE(fired) << spec->status().ToString();
+        EXPECT_TRUE(spec->status().IsOutOfMemory()) << spec->status().ToString();
+      } else {
+        EXPECT_EQ((**spec)->direct_candidate(), !keyless);
+        EXPECT_EQ((**spec)->keys().empty(), keyless);
+      }
+      return fired;
+    });
+  }
   auto spec = JoinBuildSpec::Make(input.schema, input.keys);
   ASSERT_TRUE(spec.ok()) << spec.status().ToString();
   const auto pool = StartedPool();
@@ -1078,6 +1087,69 @@ TEST_F(JoinTableBadAllocTest, APrepareThatRunsOutOfMemoryHoldsNothing) {
       return fired;
     });
   }
+}
+
+// The same for a one-row join's build (a keyless spec over one row of a BIGINT and a VARCHAR),
+// whose Prepare then makes its values on the calling thread (OneRowValues: the row's scalars and
+// their columns, from the budget's pool): a Prepare that goes through holds its table and the
+// values, one of batch_size rows each; one that fails holds neither, and nothing is left in the
+// budget once it fails or is released.
+TEST_F(JoinTableBadAllocTest, AOneRowPrepareThatRunsOutOfMemoryHoldsNothing) {
+  const auto pool = StartedPool();
+  UnhookedSpawns spawns(pool.get());
+  const auto schema =
+      arrow::schema({arrow::field("n", arrow::int64()), arrow::field("s", arrow::binary())});
+  auto spec = JoinBuildSpec::Keyless(schema);
+  ASSERT_TRUE(spec.ok()) << spec.status().ToString();
+  const std::vector<Batch> batches = {
+      Batch{.data = arrow::RecordBatch::Make(schema, 1, {Int64s({7}), testing::Strings({"seven"})}),
+            .selection = nullptr}};
+  Sweep([&](std::int64_t skip) {
+    MemoryBudget budget(std::nullopt);
+    bool fired = false;
+    {
+      JoinBuild build(*spec, std::make_unique<testing::ScriptedSource>(schema, batches), nullptr,
+                      plan::JoinKind::kOneRow);
+      ExecContext ctx{.pool = &budget,
+                      .batch_size = kRows,
+                      .executor = &spawns,
+                      .threads = kThreads,
+                      .budget = &budget};
+      arrow::Status status;
+      {
+        const FailAllocations fail(skip);
+        status = build.Prepare(ctx);
+        fired = fail.failed() > 0;
+      }
+      if (status.ok()) {
+        EXPECT_NE(build.table(), nullptr);
+        EXPECT_NE(build.values(), nullptr);
+        if (build.values() != nullptr) {
+          const OneRowValues& values = *build.values();
+          EXPECT_EQ(values.rows, kRows);
+          EXPECT_EQ(values.columns.size(), 2U);
+          if (values.columns.size() == 2) {
+            const auto& n = static_cast<const arrow::Int64Array&>(*values.columns[0]);
+            const auto& s = static_cast<const arrow::BinaryArray&>(*values.columns[1]);
+            EXPECT_EQ(n.length(), kRows);
+            EXPECT_EQ(s.length(), kRows);
+            EXPECT_EQ(n.Value(kRows - 1), 7);
+            EXPECT_EQ(s.GetView(kRows - 1), "seven");
+          }
+        }
+      } else {
+        EXPECT_TRUE(fired) << status.ToString();
+        EXPECT_TRUE(status.IsOutOfMemory()) << status.ToString();
+        EXPECT_EQ(build.table(), nullptr);
+        EXPECT_EQ(build.values(), nullptr);
+        EXPECT_EQ(budget.bytes_allocated(), 0);
+      }
+      build.Release();
+      EXPECT_EQ(build.values(), nullptr);
+      EXPECT_EQ(budget.bytes_allocated(), 0);
+    }
+    return fired;
+  });
 }
 
 }  // namespace

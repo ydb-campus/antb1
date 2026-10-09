@@ -258,14 +258,47 @@ class MemoryLimitTest : public testing::ExecTest {
 
   static arrow::Result<std::shared_ptr<arrow::Table>> Run(const plan::LogicalPlan& plan,
                                                           MemoryBudget& budget,
-                                                          arrow::internal::Executor* executor) {
+                                                          arrow::internal::Executor* executor,
+                                                          int64_t batch_size = 16) {
     ARROW_ASSIGN_OR_RAISE(auto op, BuildPhysicalPlan(plan));
     ExecContext ctx{.pool = &budget,
-                    .batch_size = 16,
+                    .batch_size = batch_size,
                     .executor = executor,
                     .threads = executor == nullptr ? 1 : 4,
                     .budget = &budget};
     return Drain(*op, ctx);
+  }
+
+  // A one-row join of every row of `table` (x and s) with the row of MAX(l) over one row of
+  // `value`, under an aggregate of the values v it appends: COUNT(*), MIN(v) and COUNT(v).
+  static plan::LogicalPlan LongValuePlan(const std::shared_ptr<MemoryTable>& table,
+                                         const std::string& value) {
+    const auto schema = arrow::schema({arrow::field("l", arrow::binary())});
+    const auto values = std::make_shared<MemoryTable>(
+        schema,
+        arrow::RecordBatchVector{arrow::RecordBatch::Make(schema, 1, {testing::Strings({value})})},
+        /*split=*/true);
+    const auto v = Column(2, "v", LogicalType::kVarchar);
+    return PlanOf(
+        Node(plan::AggregateNode{
+            .input = Node(plan::JoinNode{
+                .kind = plan::JoinKind::kOneRow,
+                .left = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}}),
+                .right = Node(plan::AggregateNode{
+                    .input =
+                        Node(plan::ScanNode{.table = values, .table_name = "l", .fields = {0}}),
+                    .aggregates = {{.kind = plan::AggKind::kMax,
+                                    .arg = Column(0, "l", LogicalType::kVarchar),
+                                    .type = LogicalType::kVarchar}}}),
+                .keys = {},
+                .residual = {},
+                .build = plan::BuildSide::kRight,
+                .span = {}}),
+            .aggregates =
+                {{.kind = plan::AggKind::kCountStar, .arg = {}, .type = LogicalType::kBigInt},
+                 {.kind = plan::AggKind::kMin, .arg = v, .type = LogicalType::kVarchar},
+                 {.kind = plan::AggKind::kCount, .arg = v, .type = LogicalType::kBigInt}}}),
+        3);
   }
 
   // Every shape of sink, and joins.
@@ -470,58 +503,54 @@ TEST_F(MemoryLimitTest, SinksGiveTheSameResultsUnderPressure) {
 // A one-row join's values are made once, by its build, and every window of its probes slices
 // them: a VARCHAR value of 256 KiB, appended to each row of batches of 65536 rows, gives windows
 // of 4 rows (1 MiB of values) instead of a copy for each row of a batch (16 GiB), and the join
-// runs within a limit of 64 MiB, on one thread and on four.
+// runs within a limit of 64 MiB, on one thread and on four. Every row gets the value (COUNT(v)).
 TEST_F(MemoryLimitTest, OneRowJoinsCapTheirVarcharValuesPerWindow) {
   auto pool = arrow::internal::ThreadPool::Make(4);
   ASSERT_TRUE(pool.ok());
-  const auto table = Table();
-  const auto long_schema = arrow::schema({arrow::field("l", arrow::binary())});
   const std::string value(std::size_t{256} * 1024, 'q');
-  const auto long_value =
-      std::make_shared<MemoryTable>(long_schema,
-                                    arrow::RecordBatchVector{arrow::RecordBatch::Make(
-                                        long_schema, 1, {testing::Strings({value})})},
-                                    /*split=*/true);
-  const auto v = Column(2, "v", LogicalType::kVarchar);
-  const auto plan = PlanOf(
-      Node(plan::AggregateNode{
-          .input = Node(plan::JoinNode{
-              .kind = plan::JoinKind::kOneRow,
-              .left = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}}),
-              .right = Node(plan::AggregateNode{
-                  .input =
-                      Node(plan::ScanNode{.table = long_value, .table_name = "l", .fields = {0}}),
-                  .aggregates = {{.kind = plan::AggKind::kMax,
-                                  .arg = Column(0, "l", LogicalType::kVarchar),
-                                  .type = LogicalType::kVarchar}}}),
-              .keys = {},
-              .residual = {},
-              .build = plan::BuildSide::kRight,
-              .span = {}}),
-          .aggregates =
-              {{.kind = plan::AggKind::kCountStar, .arg = {}, .type = LogicalType::kBigInt},
-               {.kind = plan::AggKind::kMin, .arg = v, .type = LogicalType::kVarchar}}}),
-      2);
+  const auto plan = LongValuePlan(Table(), value);
   for (arrow::internal::Executor* executor :
        {static_cast<arrow::internal::Executor*>(nullptr),
         static_cast<arrow::internal::Executor*>(pool->get())}) {
     MemoryBudget budget(int64_t{64} * 1024 * 1024);
     {
-      auto op = BuildPhysicalPlan(plan);
-      ASSERT_TRUE(op.ok()) << op.status().ToString();
-      ExecContext ctx{.pool = &budget,
-                      .batch_size = int64_t{64} * 1024,
-                      .executor = executor,
-                      .threads = executor == nullptr ? 1 : 4,
-                      .budget = &budget};
-      const auto result = Drain(**op, ctx);
+      const auto result = Run(plan, budget, executor, int64_t{64} * 1024);
       ASSERT_TRUE(result.ok()) << result.status().ToString();
       EXPECT_EQ(testing::Int64Column(**result, 0), (std::vector<std::optional<int64_t>>{1000}));
       const auto& min = static_cast<const arrow::BinaryArray&>(*(*result)->column(1)->chunk(0));
-      EXPECT_EQ(min.GetView(0), value);
+      EXPECT_TRUE(min.GetView(0) == value);
+      EXPECT_EQ(testing::Int64Column(**result, 2), (std::vector<std::optional<int64_t>>{1000}));
     }
     EXPECT_LT(budget.max_memory(), int64_t{8} * 1024 * 1024);
     EXPECT_EQ(budget.bytes_allocated(), 0);
+  }
+}
+
+// A one-row join's values come from the budget, made by its build's Prepare before any probe part
+// runs: a limit of 1.125 MiB holds the build of a 256 KiB VARCHAR row with values of one row (at
+// batch_size 1), not with values of 4 rows (1 MiB, at batch_size 64). That run fails with
+// OutOfMemory before it scans a probe part, and gives every byte back. On one thread and on four.
+TEST_F(MemoryLimitTest, OneRowValuesCountAgainstTheLimit) {
+  auto pool = arrow::internal::ThreadPool::Make(4);
+  ASSERT_TRUE(pool.ok());
+  const std::string value(std::size_t{256} * 1024, 'q');
+  constexpr int64_t kLimit = int64_t{1152} * 1024;
+  for (arrow::internal::Executor* executor :
+       {static_cast<arrow::internal::Executor*>(nullptr),
+        static_cast<arrow::internal::Executor*>(pool->get())}) {
+    MemoryBudget fits(kLimit);
+    {
+      const auto result = Run(LongValuePlan(Table(), value), fits, executor, 1);
+      ASSERT_TRUE(result.ok()) << result.status().ToString();
+      EXPECT_EQ(testing::Int64Column(**result, 2), (std::vector<std::optional<int64_t>>{1000}));
+    }
+    EXPECT_EQ(fits.bytes_allocated(), 0);
+    const auto probe = Table();
+    MemoryBudget tight(kLimit);
+    const auto failed = Run(LongValuePlan(probe, value), tight, executor, 64);
+    EXPECT_TRUE(failed.status().IsOutOfMemory()) << failed.status().ToString();
+    EXPECT_TRUE(probe->scanned_parts().empty());
+    EXPECT_EQ(tight.bytes_allocated(), 0);
   }
 }
 

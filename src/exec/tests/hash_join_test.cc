@@ -3,9 +3,10 @@
 // pipeline's builds (BuildsFirstOperator) over every part sink, and the probe (HashJoinOperator):
 // an inner join on its 1:1 and 1:N paths, with residuals, NULL and multi-column keys, empty
 // builds, nested builds and chains, errors in the serial order, memory and profiles; semi, anti,
-// null-aware anti and one-row joins, their NULL keys, empty builds, chains and profiles; on one
-// thread and on a 4-thread pool (HashJoinTest). Then joins planned by the physical planner against
-// a nested-loop reference, through every sink and the hidden physical rules (HashJoinPlanTest).
+// null-aware anti and one-row joins, their NULL keys, empty builds, one-row windows and values,
+// chains and profiles; on one thread and on a 4-thread pool (HashJoinTest). Then joins planned by
+// the physical planner against a nested-loop reference, through every sink and the hidden physical
+// rules (HashJoinPlanTest).
 
 #include "../hash_join.h"
 
@@ -1895,6 +1896,8 @@ TEST_F(HashJoinTest, OneRowJoinAppendsAnAggregateOverEmptyInput) {
     expect_types(*SchemaOf(pipeline));
     auto result = RunUnion(pipeline, table->num_parts(), {build}, ContextOf(executor, 3));
     ASSERT_TRUE(result.ok()) << result.status().ToString();
+    EXPECT_EQ(build->table(), nullptr);  // released, its values with it
+    EXPECT_EQ(build->values(), nullptr);
     Rows probe_rows;
     for (const std::vector<std::string>& row : RowsOf(*table)) {
       if (std::stoll(row[0]) > 2) {
@@ -1940,6 +1943,127 @@ TEST_F(HashJoinTest, OneRowBuildOfAnotherCountIsInvalid) {
     EXPECT_TRUE(serial.status().IsInvalid()) << serial.status().ToString();
     EXPECT_EQ(probed.opens(), 0);
     EXPECT_EQ(scanned->table(), nullptr);
+  }
+}
+
+// A one-row join whose VARCHAR values are long appends them to windows of fewer rows than
+// batch_size (OneRowValues::rows: at most 1 MiB of values per window, one row at least). Every
+// batch out is valid: its value columns are as long as its probe columns, slices of the one buffer
+// the build made. With a probe selection and without, every selected probe row comes out once, in
+// order, with the values.
+TEST_F(HashJoinTest, OneRowWindowsOfLongValuesHoldFewerRows) {
+  const auto probe_schema = Int64Schema({"a", "b"});
+  const auto build_schema =
+      arrow::schema({arrow::field("l", arrow::binary()), arrow::field("n", arrow::int64())});
+  const std::optional<int64_t> null;
+  const auto probe = BatchOf(probe_schema, {Int64s({0, 1, 2, 3, 4, 5, 6, 7, 8, 9}),
+                                            Int64s({10, 11, 12, 13, 14, 15, 16, 17, 18, 19})});
+  // In windows of 3 rows: rows 0 and 2, none, all three, none.
+  const auto selection = Bools({true, false, true, false, false, false, true, true, true, false});
+  struct Case {
+    std::size_t bytes;             // of the VARCHAR value
+    int64_t rows;                  // of a window at batch_size 8
+    std::size_t windows;           // the batches out without a selection
+    std::size_t selected_windows;  // and with it
+  };
+  // 1 MiB holds the value 3 times, then not once (a window still has a row).
+  for (const Case& c :
+       {Case{.bytes = std::size_t{300} * 1024, .rows = 3, .windows = 4, .selected_windows = 2},
+        Case{.bytes = std::size_t{1536} * 1024, .rows = 1, .windows = 10, .selected_windows = 5}}) {
+    const std::string value(c.bytes, 'v');
+    for (const bool selected : {false, true}) {
+      SCOPED_TRACE(std::to_string(c.bytes) + " bytes" + (selected ? ", selected" : ""));
+      auto join = MakeJoin(
+          std::make_unique<ScriptedSource>(
+              probe_schema, std::vector<Batch>{Batch{.data = probe,
+                                                     .selection = selected ? selection : nullptr}}),
+          DrainedBuild(plan::JoinKind::kOneRow,
+                       SourceOf(build_schema, {Strings({value}), Int64s({null})}), {}),
+          {}, /*prepares=*/true);
+      ASSERT_NE(join, nullptr);
+      auto batches = Batches(*join, ContextOf(nullptr, 8));
+      ASSERT_TRUE(batches.ok()) << batches.status().ToString();
+      ASSERT_EQ(batches->size(), selected ? c.selected_windows : c.windows);
+      std::vector<int64_t> ids;  // the probe's a of the rows out
+      for (const Batch& out : *batches) {
+        const arrow::Status valid = out.data->ValidateFull();
+        ASSERT_TRUE(valid.ok()) << valid.ToString();
+        EXPECT_LE(out.data->num_rows(), c.rows);
+        EXPECT_EQ(out.data->column(2)->data()->buffers[2]->data(),
+                  batches->front().data->column(2)->data()->buffers[2]->data());
+        auto rows = Materialize(out, arrow::default_memory_pool());
+        ASSERT_TRUE(rows.ok()) << rows.status().ToString();
+        const auto& a = static_cast<const arrow::Int64Array&>(*(*rows)->column(0));
+        const auto& l = static_cast<const arrow::BinaryArray&>(*(*rows)->column(2));
+        for (int64_t r = 0; r < (*rows)->num_rows(); ++r) {
+          ids.push_back(a.Value(r));
+          EXPECT_TRUE(l.GetView(r) == value) << a.Value(r);
+          EXPECT_TRUE((*rows)->column(3)->IsNull(r)) << a.Value(r);
+        }
+      }
+      const std::vector<int64_t> expected =
+          selected ? std::vector<int64_t>{0, 2, 6, 7, 8}
+                   : std::vector<int64_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+      EXPECT_EQ(ids, expected);
+    }
+  }
+}
+
+// A one-row join's values, from the budget's pool, are held while its probes run, and go with its
+// build's table: once the sink's parts are done (a part pipeline), or at the end of the input of a
+// probe that prepares its build, which lets go of them too; both before Close. Every batch out is
+// dropped as it comes, so nothing else holds the values. On one thread and on the pool.
+TEST_F(HashJoinTest, OneRowValuesGoWithTheirBuild) {
+  const auto pool = MakeThreadPool();
+  const auto build_schema =
+      arrow::schema({arrow::field("s", arrow::binary()), arrow::field("n", arrow::int64())});
+  const auto table = KeyTable("p", 3, 4, [](int64_t i) -> std::optional<int64_t> { return i; });
+  // Pulls `op` to its end, dropping every batch: the rows they selected.
+  const auto rest = [](Operator& op) -> arrow::Result<int64_t> {
+    int64_t rows = 0;
+    while (true) {
+      ARROW_ASSIGN_OR_RAISE(const Batch batch, op.Next());
+      if (batch.end()) {
+        return rows;
+      }
+      rows += batch.selected_rows();
+    }
+  };
+  for (arrow::internal::Executor* executor : Executors(pool.get())) {
+    for (const bool in_parts : {true, false}) {
+      SCOPED_TRACE(std::string(in_parts ? "part pipeline" : "serial probe") +
+                   (executor == nullptr ? ", one thread" : ", pool"));
+      MemoryBudget budget(std::nullopt);
+      ExecContext ctx = ContextOf(executor, 3, &budget);
+      const auto build = DrainedBuild(
+          plan::JoinKind::kOneRow, SourceOf(build_schema, {Strings({"value"}), Int64s({7})}), {});
+      std::unique_ptr<Operator> op;
+      if (in_parts) {
+        const PartPipeline pipeline = ProbePipeline(table, build, {});
+        op = std::make_unique<BuildsFirstOperator>(
+            std::make_unique<PartUnionOperator>(pipeline, table->num_parts(), SchemaOf(pipeline),
+                                                std::nullopt),
+            std::vector<std::shared_ptr<JoinBuild>>{build});
+      } else {
+        op = MakeJoin(SourceOf(Int64Schema({"a"}), {Int64s({1, 2, 3, 4, 5})}), build, {},
+                      /*prepares=*/true);
+      }
+      ASSERT_NE(op, nullptr);
+      ASSERT_TRUE(op->Open(ctx).ok());
+      int64_t rows = 0;
+      {
+        auto first = op->Next();
+        ASSERT_TRUE(first.ok() && !first->end());
+        rows += first->selected_rows();
+        EXPECT_NE(build->values(), nullptr);
+      }
+      auto more = rest(*op);
+      ASSERT_TRUE(more.ok()) << more.status().ToString();
+      EXPECT_EQ(rows + *more, in_parts ? 12 : 5);
+      EXPECT_EQ(build->values(), nullptr);
+      EXPECT_EQ(budget.bytes_allocated(), 0);
+      EXPECT_TRUE(op->Close().ok());
+    }
   }
 }
 
