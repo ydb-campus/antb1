@@ -28,7 +28,6 @@
 #include "antb1/exec/table_scan.h"
 #include "antb1/plan/explain.h"
 #include "antb1/plan/logical_plan.h"
-#include "antb1/plan/sql_status.h"
 #include "antb1/plan/types.h"
 
 #include "hash_join.h"
@@ -75,9 +74,8 @@ OperatorResult Profiled(OperatorResult op, const plan::LogicalNodePtr& node, Pro
 
 // The node below `node` that a part pipeline goes on through: the input of a Filter, a Compute or
 // a Project, and a join's probe input (the input it does not build on: the left one, but for an
-// inner join that builds on the left) for every kind but LEFT, which exec does not run yet; nullptr
-// for any other node. PipelineScan, FiltersOnScan and PipelineBuildsOf all walk a pipeline with
-// it, so they never disagree on its nodes.
+// inner join that builds on the left); nullptr for any other node. PipelineScan, FiltersOnScan and
+// PipelineBuildsOf all walk a pipeline with it, so they never disagree on its nodes.
 const plan::LogicalNode* PipelineInput(const plan::LogicalNode& node) {
   if (const auto* filter = std::get_if<plan::FilterNode>(&node)) {
     return filter->input.get();
@@ -88,8 +86,7 @@ const plan::LogicalNode* PipelineInput(const plan::LogicalNode& node) {
   if (const auto* project = std::get_if<plan::ProjectNode>(&node)) {
     return project->input.get();
   }
-  if (const auto* join = std::get_if<plan::JoinNode>(&node);
-      join != nullptr && join->kind != plan::JoinKind::kLeft) {
+  if (const auto* join = std::get_if<plan::JoinNode>(&node)) {
     const bool build_left =
         join->kind == plan::JoinKind::kInner && join->build == plan::BuildSide::kLeft;
     return (build_left ? join->right : join->left).get();
@@ -99,7 +96,7 @@ const plan::LogicalNode* PipelineInput(const plan::LogicalNode& node) {
 
 // The scan at the bottom of a part pipeline, a chain of streaming nodes over a scan (Filter,
 // Compute, Project and joins' probes, PipelineInput); nullptr if `node` is not the top of one. Any
-// other node ends the chain: a LEFT join, an aggregation, a sort, a limit.
+// other node ends the chain: an aggregation, a sort, a limit.
 const plan::ScanNode* PipelineScan(const plan::LogicalNodePtr& node) {
   for (const plan::LogicalNode* n = node.get(); n != nullptr; n = PipelineInput(*n)) {
     if (const auto* scan = std::get_if<plan::ScanNode>(n)) {
@@ -145,7 +142,7 @@ struct JoinShape {
 // (E1's table takes neither: such an equality is a residual). Checked before any profile line names
 // the join by its EXPLAIN text, which reads every residual. The columns of its keys and residuals
 // are checked against its inputs once their operators are made (JoinBuildSpec::Make,
-// HashJoinOperator::Make).
+// HashJoinOperator::Make): Invalid too.
 arrow::Result<JoinShape> ShapeOf(const plan::JoinNode& join) {
   if (join.left == nullptr || join.right == nullptr) {
     return arrow::Status::Invalid("a join without its inputs");
@@ -193,22 +190,6 @@ arrow::Result<JoinShape> ShapeOf(const plan::JoinNode& join) {
     shape.build_keys.push_back(build_left ? key.left : key.right);
   }
   return shape;
-}
-
-// Unsupported (exit code 4, at the join's span) for a join that exec does not run yet: a semi or
-// anti join with residuals (ADR 0022: roadmap PR E2b evaluates them over candidate pairs). Checked
-// after ShapeOf, so that a join of a malformed shape is Invalid first; but before its operators are
-// made, so until E2b such a join whose key or residual reads a column outside its inputs is
-// unsupported too. A LEFT join never reaches it: it ends every pipeline (PipelineInput), and the
-// Builder rejects it first, whatever its shape.
-arrow::Status NotRunYet(const plan::JoinNode& join) {
-  if ((join.kind == plan::JoinKind::kSemi || join.kind == plan::JoinKind::kAnti) &&
-      !join.residual.empty()) {
-    return plan::UnsupportedError(
-        std::format("{} joins with residuals are not supported yet", plan::ToString(join.kind)),
-        join.span);
-  }
-  return arrow::Status::OK();
 }
 
 // The pipelines of the parts a part pipeline reads: every part of the scan's table but those its
@@ -269,7 +250,6 @@ arrow::Result<std::shared_ptr<const PipelineBuilds>> PipelineBuildsOf(
       continue;
     }
     ARROW_ASSIGN_OR_RAISE(const JoinShape shape, ShapeOf(*join));
-    ARROW_RETURN_NOT_OK(NotRunYet(*join));
     ARROW_ASSIGN_OR_RAISE(
         auto build,
         MakeJoinBuild(*join, shape,
@@ -719,14 +699,8 @@ struct Builder {
     return std::make_unique<RowCountOperator>("count_star()", *rows);
   }
   OperatorResult operator()(const plan::JoinNode& node) const {
-    if (node.kind == plan::JoinKind::kLeft) {
-      // Exit code 4 until roadmap PR E2b runs LEFT joins (ADR 0022).
-      return plan::UnsupportedError(
-          std::format("{} joins are not supported yet", plan::ToString(node.kind)), node.span);
-    }
     // A join is a hash join (ADR 0022): a build of one input, probed by the other.
     ARROW_ASSIGN_OR_RAISE(JoinShape shape, ShapeOf(node));
-    ARROW_RETURN_NOT_OK(NotRunYet(node));
     Name("HashJoin");
     std::shared_ptr<JoinBuild> build;
     std::unique_ptr<Operator> probe;

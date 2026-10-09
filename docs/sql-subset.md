@@ -493,18 +493,25 @@ the keys, then the aggregates, one row per group; a `Project` above it restores 
 (`ORDER BY`, below the `Project`, so it can use columns and aggregates the query does not return) and `Limit` (with
 its offset). A `Join` has two inputs ([ADR 0022](adr/0022-joins-and-query-blocks.md)): its kind (inner, left, semi,
 anti, null-aware anti or one-row), key pairs of one type each, residual conditions over both inputs and the input it
-builds on. No query produces a `Join` yet. The executor runs every kind but left as a hash join: it builds a hash
-table of the input it builds on before it reads the other input, which then streams through it in its rows' order.
+builds on. No query produces a `Join` yet. The executor runs every kind as a hash join: it builds a hash table of the
+input it builds on before it reads the other input, which then streams through it in its rows' order.
 
 - An inner join keeps each row's matches in the build input's order; its residual conditions are evaluated in order,
   each on the rows the ones before it kept.
 - A semi join keeps each row with a match, once; an anti join each row without one (a NULL key never matches); a
   null-aware anti join (SQL's `NOT IN`) each row without one whose key is not NULL, every row when its build input is
   empty, and none when its build input has a NULL key, though it still reads the other input to its end.
+- A left join keeps each row with each of its matches, in the build input's order, and pads a row without one once
+  with NULLs of the right input's types (a NULL key included).
+- The residual conditions of a semi, anti or left join decide which candidates (the build rows with a row's key) are
+  matches. They are evaluated in the order written, each on the candidates the ones before it passed (NULL counts as
+  false), on every candidate of every row, without stopping at a row's first match, so whether an overflow fails the
+  query does not depend on the batch size (unless a `LIMIT` above stops the join before it reads every row). A row
+  without candidates never meets them: an anti join keeps it, a left join pads it. A left join pads a row none of
+  whose candidates passes right after its last candidate.
 - A one-row join appends the single row of its right input, an aggregate without groups, to every row; any other row
   count is a planner bug, reported as an error (exit code 1).
 - When an inner or a semi join's build holds no row, the other input is never read.
-- A left join, and a semi or anti join with residual conditions, exit with code 4 until they are implemented.
 
 A rule optimizer then rewrites the plan, through both inputs of every `Join`:
 
@@ -589,10 +596,11 @@ only with `--analyze`); its errors and exit codes are those of `antb1 query`.
   - `sort`, `groups`, and `sample_parts`, `heavy_keys`, `heavy_groups` of a two-level aggregation;
   - a `HashJoin`'s `find` (looking up the keys; none where a join keeps every row or none without looking: a one-row
     join, an anti join over a build without rows, a null-aware anti join over an empty build input or one with a
-    NULL key), `gather` (the rows' columns: the build columns an inner join gathers, and on its 1:N path the probe
-    rows it takes; a one-row join's values, which its build makes once), `residual` and, for an inner join whose
-    build's keys are unique, `window_rows` (the rows of the probe's batches it gathered the build's columns for, next
-    to the `rows` it returned);
+    NULL key), `gather` (the rows' columns: the build columns an inner or a left join gathers, and the probe rows it
+    takes on its other path than 1:1; the columns of the candidates that residuals read; a one-row join's values, which
+    its build makes once), `residual` and, when the build's keys are unique, an inner join's `window_rows`, and a left
+    join's without residuals (the rows of the probe's batches it gathered the build's columns for, next to the `rows` it
+    returned);
   - a `HashBuild`'s `finish` (the table built from its parts, and a one-row join's values), `null_keys` (rows with a
     NULL key, never held), `unique` (1: no key repeats) and `direct` (1: the table indexes its one integer key by
     value, ADR 0022).

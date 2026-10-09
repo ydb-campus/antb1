@@ -315,7 +315,10 @@ class MemoryLimitTest : public testing::ExecTest {
   // join whose build's key is x % 50 (20 rows each), and a probe over a serial input (a LIMIT
   // without a limit) whose build input, another one, is drained. Then semi, anti and null-aware
   // anti joins on x over the rows x >= 500, and one-row joins of SUM(x) and of MAX(s), whose
-  // VARCHAR value every probe row gets, over about half of the rows; each under a projection.
+  // VARCHAR value every probe row gets, over about half of the rows. Then a left join on x over the
+  // rows x >= 500 (the 1:1 path, half of the rows padded), and a left and a semi join on x % 50
+  // whose residual (the build's x above the probe's) the candidate pairs meet. Each under a
+  // projection.
   static std::vector<plan::LogicalPlan> JoinPlans(const std::shared_ptr<MemoryTable>& table) {
     const auto x = Column(0, "x", LogicalType::kBigInt);
     const auto s = Column(1, "s", LogicalType::kVarchar);
@@ -399,6 +402,40 @@ class MemoryLimitTest : public testing::ExecTest {
                      .columns = {x, s, Column(2, "v", call.type)}}),
                  3));
     }
+    const auto join_of = [](plan::JoinKind kind, plan::LogicalNodePtr build,
+                            const plan::BoundColumn& build_key, std::vector<plan::ExprPtr> residual,
+                            const plan::LogicalNodePtr& probe) {
+      return Node(plan::JoinNode{
+          .kind = kind,
+          .left = probe,
+          .right = std::move(build),
+          .keys = {plan::JoinKey{.left = Column(0, "x", LogicalType::kBigInt), .right = build_key}},
+          .residual = std::move(residual),
+          .build = plan::BuildSide::kRight,
+          .span = {}});
+    };
+    // The build's x (column 2 of a pair) above the probe's (column 0).
+    const auto column = [](int index) {
+      return std::make_shared<const plan::Expr>(
+          plan::Expr{.node = plan::ColumnExpr{.index = index}, .type = LogicalType::kBigInt});
+    };
+    const std::vector<plan::ExprPtr> above = {std::make_shared<const plan::Expr>(plan::Expr{
+        .node =
+            plan::PredicateExpr{
+                .predicate = plan::Predicate{.kind = plan::Predicate::Kind::kCompareColumns,
+                                             .column = Column(0, "b", LogicalType::kBigInt),
+                                             .other = Column(1, "p", LogicalType::kBigInt),
+                                             .op = plan::CompareOp::kGt},
+                .operands = {column(2), column(0)}},
+        .type = LogicalType::kBoolean})};
+    const auto residues = Node(plan::ComputeNode{.input = scan, .exprs = {modulo}});
+    const auto e0 = Column(2, "e0", LogicalType::kBigInt);
+    plans.push_back(pair(join_of(plan::JoinKind::kLeft, upper, x, {}, scan)));
+    plans.push_back(pair(join_of(plan::JoinKind::kLeft, residues, e0, above, scan)));
+    plans.push_back(PlanOf(
+        Node(plan::ProjectNode{.input = join_of(plan::JoinKind::kSemi, residues, e0, above, scan),
+                               .columns = {x, s}}),
+        2));
     return plans;
   }
 

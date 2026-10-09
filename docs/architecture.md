@@ -4,8 +4,8 @@ antb1 is a small, single-process SQL engine over Parquet files. It is split into
 (modules) and one binary, `antb1`. This page describes the code as it is today; the engine design beyond the first
 SQL slice is still open (see [ADR 0003](adr/0003-engine-architecture.md)). Joins, derived tables, common table
 expressions and uncorrelated subqueries are designed in [ADR 0022](adr/0022-joins-and-query-blocks.md): the executor
-runs inner, semi, anti, null-aware anti and one-row joins as hash joins, but no query binds to a join yet, and the
-steps below change with the PRs that build the rest.
+runs inner, left, semi, anti, null-aware anti and one-row joins as hash joins, but no query binds to a join yet, and
+the steps below change with the PRs that build the rest.
 
 ## Modules
 
@@ -61,8 +61,8 @@ Responsibilities:
   `GroupAggregate`, `Sort`, `Limit`, `RowCount`; see [Execution](#execution)), the exact aggregate states (scalar
   and grouped), the row comparator and sort buffer, the join hash table (`JoinTableBuilder`, `JoinTable`) and the
   hash joins' operators (`JoinBuild`, `BuildsFirstOperator`, `HashJoinOperator`, which the physical planner plans
-  every join but a left one with; see [Execution](#execution)), the physical planner and `Drain`. It scans only
-  through `plan::Table` and never depends on `io`.
+  every join with; see [Execution](#execution)), the physical planner and `Drain`. It scans only through
+  `plan::Table` and never depends on `io`.
 - `engine`: `engine::Session` (owns the catalog, calls `arrow::compute::Initialize()`, runs parse, bind, plan and
   execute) and the canonical value formatter used for every output format.
 - `cli`: the CLI11 command line (`query`, `explain`, `schema`, `bench`, `version`), error reporting and exit codes;
@@ -130,10 +130,9 @@ steps (only step 7 uses more than one thread):
    over a part pipeline run in two levels when their calls allow it (`exec::TwoLevelAggregation`,
    [ADR 0014](adr/0014-two-level-aggregation.md)). The chain of `Filter`,
    `Compute` and `Project` nodes and joins' probes over a `Scan` is a part pipeline, built once per table part
-   (see [Execution](#execution)). A `Join` of any kind but left is a hash join
+   (see [Execution](#execution)). A `Join` of any kind is a hash join
    ([ADR 0022](adr/0022-joins-and-query-blocks.md)): a build of one input (keyless for a one-row join), made once per
    pipeline before the factory of its parts, and a probe of the other, in that input's part pipeline or over it; a
-   left join, and a semi or anti join with residuals, are unsupported (exit code 4) until they are implemented, and a
    malformed join (keys of two types, say) is `Invalid`.
 7. Drain (`exec::Drain`): `Open`, pull batches with `Next` until the end of the stream, `Close` (also after an
    error); the selected rows of the batches form an `arrow::Table`, and the engine names its columns. The part
@@ -152,10 +151,11 @@ profiled once per part into the same nodes), runs it, drops the rows and prints 
 
 Operators pull `exec::Batch`es from their input: an Arrow record batch and an optional selection, a boolean array
 without NULLs that marks the rows taking part. A filter never copies data. A projection turns a selection into data,
-and so does a hash join's probe when it copies rows: an inner join's (probe row, match) pairs of a build whose keys
-repeat, and the rows it evaluates residuals on; with unique build keys it keeps the probe batch and selects the
-matched rows. A semi, anti or null-aware anti join only selects rows, and a one-row join appends its build's values
-to the probe batch.
+and so does a hash join's probe when it copies rows: an inner or a left join's (probe row, match) pairs of a build
+whose keys repeat, the rows it evaluates residuals on, and the columns of candidate pairs that residuals read; with
+unique build keys it keeps the probe batch and selects the matched rows (a left join without residuals, its selected
+rows; a left join with residuals copies its rows). A semi, anti or null-aware anti join only selects rows, and a
+one-row join appends its build's values to the probe batch.
 Every operator instance is used by one thread.
 
 **Parts** ([ADR 0013](adr/0013-parallel-execution.md)). A table is split into parts (`plan::Table::num_parts`,
@@ -247,23 +247,27 @@ slices. An `exec::BuildsFirstOperator` prepares a probe pipeline's builds when i
 pipeline's sink, and releases them once the sink's parts are done (`exec::PartSink`'s callback). An
 `exec::HashJoinOperator` probes, by its build's kind: an inner join with a build of unique keys keeps the probe
 batch's columns and selects the matched rows, otherwise it takes a (probe row, match) pair per output row, and its
-residuals are evaluated in order, each on the rows the ones before it kept; a semi, anti or null-aware anti join
-passes on slices of the probe batch with the rows it keeps selected; a one-row join appends the slices of its build's
-values.
+residuals are evaluated in order, each on the rows the ones before it kept; a left join takes its pairs the same way,
+with NULLs for a row without a match (on its 1:1 path it keeps the probe's selection), and evaluates its residuals on
+candidate pairs, as a semi or anti join does; a semi, anti or null-aware anti join passes on
+slices of the probe batch with the rows it keeps selected; a one-row join appends the slices of its build's values.
+The residuals of a semi, anti or left join are evaluated (`exec::EvaluateExpr`) on the candidate pairs (a probe row
+and a build row of its key), in batches of at most `batch_size` pairs with only the columns they read, in order, every
+pair evaluated: semi and anti evaluate a probe batch's pairs before its windows, a left join each batch of pairs before
+it emits the passing ones and, after a row's last candidate, the row padded when none passed.
 
-The physical planner plans every join but a left one so. It walks a part pipeline with one helper (`PipelineInput`:
-through `Filter`, `Compute`, `Project` and a join's probe input) to find its scan, the predicates its statistics and its
-scan use (only a `Filter` right on the scan: one above a join reads the join's columns) and its joins; each join's
-build is made then, once, outermost join first, before the factory of the pipeline's parts, so no part number of the
-probe side reaches a build input, whose part pipeline has its own parts, pruning and pushdown. A build input that is
-no part pipeline is drained. The sink of a pipeline with joins runs behind a `BuildsFirstOperator`; a probe over a
-serial input prepares its own build at its first `Next`. Late materialization declines over a join; the
-`COUNT(DISTINCT)` rewrite, the partition top-N and a `LIMIT` over a pipeline apply over one, its builds first. An
-inner or a semi join's build whose table holds no row empties its join (`exec::EmptiesJoin`): the probe never opens
-its input, and the builds below it are not prepared. An anti or null-aware anti join reads its probe input whatever
-its build holds (over a build input with a NULL key, the null-aware one keeps no row but reads them all, as DuckDB
-does). Errors follow the serial order: the builds, outermost first and each after the builds its input probes, then
-the probe's parts.
+The physical planner plans every join so. It walks a part pipeline with one helper (`PipelineInput`: through `Filter`,
+`Compute`, `Project` and a join's probe input) to find its scan, the predicates its statistics and its scan use (only a
+`Filter` right on the scan: one above a join reads the join's columns) and its joins; each join's build is made then,
+once, outermost join first, before the factory of the pipeline's parts, so no part number of the probe side reaches a
+build input, whose part pipeline has its own parts, pruning and pushdown. A build input that is no part pipeline is
+drained. The sink of a pipeline with joins runs behind a `BuildsFirstOperator`; a probe over a serial input prepares its
+own build at its first `Next`. Late materialization declines over a join; the `COUNT(DISTINCT)` rewrite, the partition
+top-N and a `LIMIT` over a pipeline apply over one, its builds first. An inner or a semi join's build whose table holds
+no row empties its join (`exec::EmptiesJoin`): the probe never opens its input, and the builds below it are not
+prepared. An anti, null-aware anti or left join reads its probe input whatever its build holds (over a build input with
+a NULL key, the null-aware one keeps no row but reads them all, as DuckDB does). Errors follow the serial order: the
+builds, outermost first and each after the builds its input probes, then the probe's parts.
 
 | Operator | Logical node | Does |
 | --- | --- | --- |
@@ -281,7 +285,7 @@ the probe's parts.
 | `GroupAggregateOperator` | `GroupAggregate` over other input | through an `exec::GroupTable`, materializes the selected rows, maps their keys to group ids with Arrow's `Grouper` (DOUBLE keys normalized first), feeds one `GroupedAggregateState` per call; after the input, emits one row per group: the keys as first seen, then the aggregates; without keys (`GROUP BY` of constants only) every row is in one group |
 | `SortOperator` | `Sort`, or `Limit` over `Sort` over other input | reads its whole input into a `SortBuffer`, sorts row references stably with `RowComparator` (DuckDB's order: NULLs last by default, NaN above every number, VARCHAR by bytes; each row carries an order-preserving 64-bit prefix of its first key, so most comparisons are integer compares) and emits the rows in batches, gathered column by column with typed builders; with a limit it keeps only `limit + offset` rows while it reads (top-N) and emits the window ([ADR 0011](adr/0011-sorting-and-top-n.md)) |
 | `LimitOperator` | `Limit` | skips `offset` rows, passes on at most `limit` rows (narrowing selections, not copying) and then never pulls its input again |
-| `HashJoinOperator` | a `Join` of any kind but left: its probe, in the part pipeline of the input it does not build on, or over that input | for every probe batch, `JoinTable::Find` of its selected rows' keys; an inner join with a build of unique keys, windows of `batch_size` rows of the probe batch (slices, not copies) selected where they matched, the build's columns gathered by match and NULL elsewhere (`exec::GatherRows`); otherwise a batch of up to `batch_size` (probe row, match) pairs, the probe's columns taken and the build's gathered; then the residuals in order, each on the rows the ones before kept (NULL is false); rows in probe order, each one's matches in the build's (part, row) order; a semi, anti or null-aware anti join, windows of `batch_size` rows of the probe batch selected where it keeps a row, without a lookup when it keeps every row or none; a one-row join, windows of the probe batch with its build's values sliced; over a serial input it prepares its own `JoinBuild` at its first `Next`; when its build empties the join it never opens its input |
+| `HashJoinOperator` | a `Join`: its probe, in the part pipeline of the input it does not build on, or over that input | for every probe batch, `JoinTable::Find` of its selected rows' keys; an inner join with a build of unique keys, windows of `batch_size` rows of the probe batch (slices, not copies) selected where they matched, the build's columns gathered by match and NULL elsewhere (`exec::GatherRows`); otherwise a batch of up to `batch_size` (probe row, match) pairs, the probe's columns taken and the build's gathered; then the residuals in order, each on the rows the ones before kept (NULL is false); rows in probe order, each one's matches in the build's (part, row) order; a left join the same, with a row without a match padded with NULLs of the build's types, and the probe's selection kept on the 1:1 path; a semi, anti or null-aware anti join, windows of `batch_size` rows of the probe batch selected where it keeps a row, without a lookup when it keeps every row or none; the residuals of a semi, anti or left join on the candidate pairs, every pair evaluated, a left join padding a row none of whose candidates passed after its last candidate; a one-row join, windows of the probe batch with its build's values sliced; over a serial input it prepares its own `JoinBuild` at its first `Next`; when its build empties the join it never opens its input |
 | `BuildsFirstOperator` | the sink of a part pipeline whose probes read builds | prepares the pipeline's builds (`exec::JoinBuild`: the `JoinTable` of a build input's parts, or of a drained operator's batches) at its first `Next`, outermost first and stopping after one that empties its join, then opens the sink and returns its batches; releases the builds once the sink's parts are done, or at `Close` |
 | `RowCountOperator` | `RowCount` | one BIGINT row from the table's exact row count |
 

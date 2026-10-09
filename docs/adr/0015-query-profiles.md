@@ -68,6 +68,10 @@ Proposed
     NULL key); `gather` only for an inner join's columns (the build columns it gathers, and on its 1:N path the probe
     rows it takes) and a one-row join's values, which its build makes once, within its `finish`; `window_rows` only on
     an inner join's 1:1 path. No metric is new.
+  - Update (2026-10-09, E2b): a left join shows the same two lines; its probe always has `find` and `gather` (the
+    build columns it gathers, and the probe rows it takes on its other path than 1:1), and `window_rows` on its 1:1
+    path (without residuals). A semi, anti or left join with residuals adds `gather` for the columns of the candidate
+    pairs that its residuals read, and `residual`. No metric is new.
 - **Output.**
   - Text: the `Output:` line, a `Total:` line, then one line per operator indented as EXPLAIN, with the numbers in
     brackets.
