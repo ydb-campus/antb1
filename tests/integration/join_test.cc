@@ -477,7 +477,7 @@ TEST_F(JoinTest, SemiAntiAndOneRowJoinsCountAsDuckDB) {
        .root = JoinOf(plan::JoinKind::kNullAwareAnti, trips.Scan(), zones.Scan(),
                       {trips.Column("tr_pickup")}, {zones.Column("zn_id")}),
        .width = width,
-       .rows = 69 * 3},
+       .rows = int64_t{69} * 3},
       {.record = "exists.slt:102",
        .root = JoinOf(plan::JoinKind::kAnti, trips.Scan(), tariffs.Scan(),
                       {trips.Column("tr_tariff")}, {tariffs.Column("tf_code")}),

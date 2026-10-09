@@ -75,7 +75,7 @@ std::shared_ptr<arrow::Schema> JoinSchema(const arrow::Schema& probe, const arro
 // The most bytes of VARCHAR values that one window of a one-row join appends: its values are
 // copied once per row of a window, so a window holds fewer rows than batch_size when they are long
 // (one row at least).
-constexpr int64_t kOneRowWindowBytes = int64_t{1} << 20;
+constexpr int64_t kOneRowWindowBytes = int64_t{1024} * 1024;
 
 // The values of the single row of `table` as columns of up to max(ctx.batch_size, 1) rows, fewer
 // when its VARCHAR values are long (kOneRowWindowBytes), from ctx.pool.
