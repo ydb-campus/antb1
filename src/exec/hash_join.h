@@ -39,9 +39,9 @@ namespace antb1::exec {
 class ProfileNode;
 
 // The build row of a one-row join as constant columns, one per column of the build input, each of
-// `rows` rows (at most ExecContext::batch_size, fewer when the row's VARCHAR values are long: a
-// window copies them once per row): made once by its build, then sliced by the probes of every
-// part. Immutable.
+// `rows` rows (at most ExecContext::batch_size, fewer when the row's VARCHAR values are long: the
+// columns repeat each value once per row): made once by its build, then sliced by the probes of
+// every part. Immutable.
 struct OneRowValues {
   arrow::ArrayVector columns;
   int64_t rows = 0;

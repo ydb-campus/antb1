@@ -365,9 +365,9 @@ Proposed
   - Update (2026-10-09, E2a): the empty-build rule per kind. Only an inner or a semi join whose build holds no row
     empties its join (`exec::EmptiesJoin`): its probe never opens its input, and the builds below it are not
     prepared. Every other kind reads its probe input: an anti join over no build row keeps every selected row, and a
-    null-aware anti join over an empty build input every row, NULL keys included. `NOT IN` over a set with a NULL
-    reads its probe input too and keeps no row, as DuckDB does (it reads every probe row through a mark join): the
-    builds below it are prepared, and an error of the probe side surfaces as in DuckDB.
+    null-aware anti join over an empty build input every selected row, NULL keys included. `NOT IN` over a set with a
+    NULL reads its probe input too and keeps no row, as DuckDB does (it reads every probe row through a mark join):
+    the builds below it are prepared, and an error of the probe side surfaces as in DuckDB.
 - **Each build is created once,** by the physical planner, outside the factory that makes a fresh operator chain for
   every part. The factory captures it, and every part's probe reads the same table.
 - **Build inputs:** a part pipeline, whose parts run on the pool through the part scheduler, with its window, its

@@ -1947,39 +1947,60 @@ TEST_F(HashJoinTest, OneRowBuildOfAnotherCountIsInvalid) {
 }
 
 // A one-row join whose VARCHAR values are long appends them to windows of fewer rows than
-// batch_size (OneRowValues::rows: at most 1 MiB of values per window, one row at least). Every
-// batch out is valid: its value columns are as long as its probe columns, slices of the one buffer
-// the build made. With a probe selection and without, every selected probe row comes out once, in
-// order, with the values.
+// batch_size (OneRowValues::rows: at most 1 MiB of values per window, the bytes of every VARCHAR
+// column counted, one row at least). Every batch out is valid: its value columns are as long as
+// its probe columns, slices of the one buffer the build made. With a probe selection and without,
+// every selected probe row comes out once, in order, with the values.
 TEST_F(HashJoinTest, OneRowWindowsOfLongValuesHoldFewerRows) {
   const auto probe_schema = Int64Schema({"a", "b"});
-  const auto build_schema =
-      arrow::schema({arrow::field("l", arrow::binary()), arrow::field("n", arrow::int64())});
   const std::optional<int64_t> null;
   const auto probe = BatchOf(probe_schema, {Int64s({0, 1, 2, 3, 4, 5, 6, 7, 8, 9}),
                                             Int64s({10, 11, 12, 13, 14, 15, 16, 17, 18, 19})});
   // In windows of 3 rows: rows 0 and 2, none, all three, none.
   const auto selection = Bools({true, false, true, false, false, false, true, true, true, false});
   struct Case {
-    std::size_t bytes;             // of the VARCHAR value
+    std::size_t bytes;             // of each VARCHAR value
+    int values;                    // the VARCHAR columns, before a NULL BIGINT one
     int64_t rows;                  // of a window at batch_size 8
     std::size_t windows;           // the batches out without a selection
     std::size_t selected_windows;  // and with it
   };
-  // 1 MiB holds the value 3 times, then not once (a window still has a row).
-  for (const Case& c :
-       {Case{.bytes = std::size_t{300} * 1024, .rows = 3, .windows = 4, .selected_windows = 2},
-        Case{.bytes = std::size_t{1536} * 1024, .rows = 1, .windows = 10, .selected_windows = 5}}) {
+  // 1 MiB holds one value of 300 KiB 3 times, two of them once, and one of 1.5 MiB not once (a
+  // window still has a row).
+  for (const Case& c : {Case{.bytes = std::size_t{300} * 1024,
+                             .values = 1,
+                             .rows = 3,
+                             .windows = 4,
+                             .selected_windows = 2},
+                        Case{.bytes = std::size_t{300} * 1024,
+                             .values = 2,
+                             .rows = 1,
+                             .windows = 10,
+                             .selected_windows = 5},
+                        Case{.bytes = std::size_t{1536} * 1024,
+                             .values = 1,
+                             .rows = 1,
+                             .windows = 10,
+                             .selected_windows = 5}}) {
     const std::string value(c.bytes, 'v');
+    arrow::FieldVector build_fields;
+    arrow::ArrayVector build_columns;
+    for (int v = 0; v < c.values; ++v) {
+      build_fields.push_back(arrow::field("l" + std::to_string(v), arrow::binary()));
+      build_columns.push_back(Strings({value}));
+    }
+    build_fields.push_back(arrow::field("n", arrow::int64()));
+    build_columns.push_back(Int64s({null}));
+    const auto build_schema = arrow::schema(build_fields);
     for (const bool selected : {false, true}) {
-      SCOPED_TRACE(std::to_string(c.bytes) + " bytes" + (selected ? ", selected" : ""));
+      SCOPED_TRACE(std::to_string(c.values) + " values of " + std::to_string(c.bytes) + " bytes" +
+                   (selected ? ", selected" : ""));
       auto join = MakeJoin(
           std::make_unique<ScriptedSource>(
               probe_schema, std::vector<Batch>{Batch{.data = probe,
                                                      .selection = selected ? selection : nullptr}}),
-          DrainedBuild(plan::JoinKind::kOneRow,
-                       SourceOf(build_schema, {Strings({value}), Int64s({null})}), {}),
-          {}, /*prepares=*/true);
+          DrainedBuild(plan::JoinKind::kOneRow, SourceOf(build_schema, build_columns), {}), {},
+          /*prepares=*/true);
       ASSERT_NE(join, nullptr);
       auto batches = Batches(*join, ContextOf(nullptr, 8));
       ASSERT_TRUE(batches.ok()) << batches.status().ToString();
@@ -1989,16 +2010,21 @@ TEST_F(HashJoinTest, OneRowWindowsOfLongValuesHoldFewerRows) {
         const arrow::Status valid = out.data->ValidateFull();
         ASSERT_TRUE(valid.ok()) << valid.ToString();
         EXPECT_LE(out.data->num_rows(), c.rows);
-        EXPECT_EQ(out.data->column(2)->data()->buffers[2]->data(),
-                  batches->front().data->column(2)->data()->buffers[2]->data());
+        for (int v = 2; v < 2 + c.values; ++v) {
+          EXPECT_EQ(out.data->column(v)->data()->buffers[2]->data(),
+                    batches->front().data->column(v)->data()->buffers[2]->data());
+        }
         auto rows = Materialize(out, arrow::default_memory_pool());
         ASSERT_TRUE(rows.ok()) << rows.status().ToString();
         const auto& a = static_cast<const arrow::Int64Array&>(*(*rows)->column(0));
-        const auto& l = static_cast<const arrow::BinaryArray&>(*(*rows)->column(2));
         for (int64_t r = 0; r < (*rows)->num_rows(); ++r) {
           ids.push_back(a.Value(r));
-          EXPECT_TRUE(l.GetView(r) == value) << a.Value(r);
-          EXPECT_TRUE((*rows)->column(3)->IsNull(r)) << a.Value(r);
+          for (int v = 2; v < 2 + c.values; ++v) {
+            EXPECT_TRUE(static_cast<const arrow::BinaryArray&>(*(*rows)->column(v)).GetView(r) ==
+                        value)
+                << a.Value(r);
+          }
+          EXPECT_TRUE((*rows)->column(2 + c.values)->IsNull(r)) << a.Value(r);
         }
       }
       const std::vector<int64_t> expected =
