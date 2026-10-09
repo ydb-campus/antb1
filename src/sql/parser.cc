@@ -1624,6 +1624,11 @@ class Parser {
     const SourceSpan begin = Take().span;
     Take();  // '('
     const Token& field = Peek();
+    // DuckDB also takes the field as a string or a quoted name (EXTRACT('year' FROM d)).
+    if (field.kind == TokenKind::kString || field.kind == TokenKind::kQuotedIdentifier ||
+        PrefixedStringAt() != PrefixedString::kNone) {
+      return Unsupported(field.span, "a string or quoted field name in EXTRACT is not supported");
+    }
     if (field.kind != TokenKind::kIdentifier) {
       return Syntax(field.span, "expected a field name in EXTRACT(, found " + Describe(field));
     }
@@ -2400,6 +2405,11 @@ class Parser {
       return Unsupported(Peek().span, KeywordOf(Peek()) + " is not supported");
     }
     while (true) {
+      // The empty grouping set, which DuckDB answers (one group, as without GROUP BY).
+      if (Peek().kind == TokenKind::kLeftParen && PeekAt(1).kind == TokenKind::kRightParen) {
+        return Unsupported(Cover(Peek().span, PeekAt(1).span),
+                           "GROUP BY () (the empty grouping set) is not supported");
+      }
       auto expr = ParseExpr(Context::kGroupBy);
       if (!expr) {
         return std::unexpected(std::move(expr.error()));

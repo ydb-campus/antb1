@@ -232,8 +232,9 @@ are the same expression.
 Every other expression (function calls other than the five aggregates and the functions above, `EXTRACT` of other
 fields, a condition used as a value, as in `SELECT a = 1`, a comparison of two constants, a bare column as a
 condition, `TRY_CAST` and every other cast, such as `CAST(a AS BIGINT)` or `CAST(d AS DATE)`) parses, and is then
-rejected by the binder with exit code 4 at its first unsupported token, before any name is resolved. `GROUP BY ALL`
-and `ORDER BY ALL` are rejected by the parser, and so are `SUM`, `AVG`, `MIN` and `MAX` with `DISTINCT`.
+rejected by the binder with exit code 4 at its first unsupported token, before any name is resolved. `GROUP BY ALL`,
+the empty grouping set `GROUP BY ()` and `ORDER BY ALL` are rejected by the parser, and so are `SUM`, `AVG`, `MIN` and
+`MAX` with `DISTINCT` and a string or quoted field name in `EXTRACT` (`EXTRACT('year' FROM d)`), which DuckDB accepts.
 
 Outside the grammar, the parser recognizes common SQL and rejects it with exit code 4 and a source span, among others:
 `SELECT DISTINCT`, subqueries in expressions, `ILIKE`, `GLOB`, `LIKE ... ESCAPE`, `NULL` literals, `IS [NOT] NULL`,
@@ -250,8 +251,9 @@ DuckDB refuses them too. Known gaps:
 (`LIMIT 5 = 5`, `LIMIT 5 AND 3`) are syntax errors (exit code 1), although DuckDB answers them, and so are a trailing
 comma in an `IN` list (`a IN (1,)`), `IN` before a list literal (`a IN [1, 2]`), `BETWEEN ASYMMETRIC` (`asymmetric`
 is a name, divergence D21), `MAP {...}`, a prefix alias (`SELECT x: 1`), an exponent without digits (`1e`, which
-DuckDB reads as `1 AS e`), a number that a name follows directly (`1x`, which DuckDB reads as `1 AS x`) and named
-arguments (`round(x := 2.5)`), also in a nested query. In FROM:
+DuckDB reads as `1 AS e`), a number that a name follows directly (`1x`, which DuckDB reads as `1 AS x`), named
+arguments (`round(x := 2.5)`), a slice without its lower bound (`b[:2]`; `b[1:2]` is unsupported) and a `$` inside a
+name (`a$b`, which antb1 reads as a parameter), also in a nested query. In FROM:
 `JOIN ... USING`, `NATURAL`, `RIGHT` and `FULL` joins, `SEMI`, `ANTI`, `ASOF` and `POSITIONAL`
 joins, nested joins (a `JOIN` before the `ON` of an earlier one) and joins in parentheses, `LATERAL` before a subquery
 or a table function (also one with a qualified name: `LATERAL main.range(3)`), `schema.table`, `ONLY`, table functions
