@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791551980594,
+  "lastUpdate": 1791560760154,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -5940,6 +5940,114 @@ window.BENCHMARK_DATA = {
             "value": 106.11492914285999,
             "unit": "ms/iter",
             "extra": "iterations: 7\ncpu: 106.10462542857135 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "6df2fb5e8a83432154df0bb925f1dffbc3061b57",
+          "message": "feat(sql,plan): derived tables and with lists in the grammar (#110)\n\n## Summary\n\nRoadmap PR **S4a**, the first half of S4 ([ADR\n0022](docs/adr/0022-joins-and-query-blocks.md), \"Nested query blocks\").\nYou approved splitting S4. The parser now accepts derived tables and\nWITH lists. The binder still rejects both with exit code 4, using main's\nmessages at main's spans, before any table resolves; J4 will bind them.\n\nSubqueries in expressions belong to S4b and behave exactly as on main.\nNo query changes its answer: `tests/data/tpch_status.json` stays\n`{\"pass\": [1, 6]}` and ClickBench stays at 43/43. Only exit codes and\nerror positions change.\n\n**Grammar** (`ast.h`, `ast.cc`, `parser.cc`, `unparse.cc`):\n- **Queries:** `query = [WITH cte {, cte}] block`.\n- A derived table (`FromSource = variant<TableRef, DerivedTable>`, read\nthrough `FromItem::table()`) and a CTE's query are queries of their own.\nEach has its own WITH list and fresh aggregate placement.\n- `SelectStatement` gains its WITH list, and its span starts at WITH or\nSELECT.\n- **Depth:** each nested query is one level below its statement, and\n`sql::Depth` agrees with the parser. 256 derived tables nested in each\nother parse, and so do 255 CTEs around `SELECT a FROM t`. The depth\nerror points at the `(`.\n- **Names:** CTE names and column aliases follow S3's rules for an alias\nwithout AS.\n- **Duplicate CTE names:** a CTE name that repeats an earlier one of its\nlist (ASCII case-insensitively, also as a string) is a syntax error at\nthe name, before its query is parsed, as in DuckDB.\n- **Exit 4:**\n- `WITH RECURSIVE` (a first CTE may still be named recursive),\n`MATERIALIZED`, `NOT MATERIALIZED` and `USING KEY`;\n- strings as CTE names or column aliases, and a trailing comma in a\ncolumn alias list, which DuckDB accepts;\n- a query in parentheses, or after a WITH list, that does not start with\nSELECT or WITH: `(VALUES (1))`, `(FROM t)`, `(TABLE t)`, `((SELECT …))`,\n`PIVOT`, `UNPIVOT`, `PIVOT_WIDER` and `PIVOT_LONGER`, and the other\nstatement words, at the first token;\n- INSERT, UPDATE, DELETE and MERGE after a WITH list, which DuckDB runs\n(each pinned by a test);\n- inside a block: SELECT without FROM, trailing commas, UNION and the\nother unsupported clauses;\n- `OFFSET n ROW[S]`, the empty grouping set `GROUP BY ()`, and an\n`EXTRACT` field written as a string or a quoted name (`EXTRACT('year'\nFROM d)`). DuckDB answers all three. They are now exit 4 nested and at\nthe top level, where they used to be syntax errors.\n- **Syntax errors, as in DuckDB:**\n  - a WITH list without its query;\n  - `()` or `(,)` column lists, and a column list without an alias;\n  - `AT (…)` after a derived table;\n  - `FROM (values)`.\n- **Documented gaps:**\n- The forms that exit 4 where DuckDB gives a syntax error are listed as\nexamples in `docs/sql-subset.md`.\n- So are the grammar's known gaps, among others `IN (1,)`, `IN` before a\nlist or a list column, prefix aliases (`x: 1`), `1e`, `1x`, named\narguments, `b[:2]`, `a$b`, a one-parameter lambda and a string continued\nafter a line break. Nested queries share these gaps, so inside a derived\ntable or CTE some forms that main rejected with exit 4 (the whole\nsubquery was unsupported) now give the same syntax error as at the top\nlevel.\n- **Canonical forms:** `WITH \"c\"(\"x\") AS (…)` and `(…) AS \"s\"(\"x\")`.\n\n**Binder** (`binder.cc`): `RejectWith` runs first, at WITH.\n`RejectDerivedTable` reports at the `(`, before the alias check. `Bind`\nreads `table()`.\n\n**Harness:**\n- The features `derived_table` and `cte` wait in `kGeneratorPending`: T2\ngenerates them, and J4 declares them supported. `diff-random --list` is\nidentical to main for seeds 7 and 11.\n- `MakeOrderedQuery` puts its sort keys after a leading WITH list.\n- `TableAliasOracle` gains 8 places: derived tables, column lists and\nCTE names.\n\n**Tests:**\n- Parser, unparse and property tests, the latter with recursive token\naccounting and span checks.\n- Depth exactness per family.\n- `MegabyteOfNestedBlocks` and `DeepestBlocksSurviveEveryWalk` prove the\nstack at the limit under ASan.\n- About 80 new RejectCases, 17 NestedQueries BindErrorTest cases, and\nCLI carets.\n- The new `subqueries/syntax_errors.slt`, where every syntax error has a\nDuckDB twin.\n- Fuzz seeds, including two that nest 300 levels.\n- Mutation checks, each reverted; every one fails at least one test.\n\n**Docs:**\n- `docs/sql-subset.md`:\n  - the grammar;\n  - a \"Nested queries\" paragraph;\n  - the lexical and canonical-form bullets;\n  - \"Outside the grammar\", with its known gaps and examples.\n- `docs/architecture.md`: step 3.\n- Update lines in ADR 0022 and ADR 0008. `/docs/adr/` is a CODEOWNERS\npath; the statuses are unchanged.\n- The add-sql-feature recipe.\n\nFor the maintainer:\n\n- **Size:** about 2,400 lines inserted (production about 540, tests,\n`.slt` and fuzz about 1,740, docs about 115), above the planned 1,700 to\n2,000. Most of the difference is the `.slt` twins and parser tests.\n- **Differences from the plan** (each probed on DuckDB 1.5.6):\n  - only USING followed by KEY is exit 4;\n- a repeated plain-string CTE name is a duplicate (exit 1), as in\nDuckDB;\n  - the D21 words stay query starts inside FROM parentheses;\n- `OFFSET n ROW[S]`, `GROUP BY ()` and string `EXTRACT` fields became\nexit 4 instead of known gaps;\n  - `FROM ((t JOIN u ON …))` names the parenthesized join.\n- **Hand-offs:**\n  - **J2b-2:**\n    - read `item.table()`;\n- check each item's connector, then `RejectDerivedTable`, then the ON\nwalk.\n  - **J4:**\n    - lift `RejectWith` and `RejectDerivedTable`;\n    - walk nested blocks in `CheckSupported` and `FoldDateCasts`;\n    - a string FROM item names a CTE first;\n- extra CTE column names are ignored, and a longer derived-table column\nlist is a bind error.\n  - **S4b:**\n    - expression subqueries reuse the block parser;\n    - `PIVOT_WIDER` and `PIVOT_LONGER` start a query like `PIVOT`.\n  - **Possible follow-up:** turn the inherited known gaps into exit 4.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run fmt                         # on 78a62ee (the head): no diff\n$ pixi run check && pixi run ci-gcc    # on 78a62ee\nlint: PASS\n100% tests passed out of 2429          # ci, and the same in ci-gcc\n$ pixi run check-full                  # on 78a62ee\nlint: PASS\n100% tests passed out of 2429          # ci (clang Debug -Werror)\n100% tests passed out of 2429          # asan (ASan + UBSan): the depth-limit stack tests included\n                                       # tidy: clean\nCoverage gate: PASS                    # sql 99.14% lines / 97.73% branches; plan 96.16% / 91.56%\n100% tests passed out of 2             # fuzz-smoke\n100% tests passed out of 2429          # ci-gcc\n$ pixi run slt-complete                # on 78a62ee\n67 .slt files, every one unchanged\n$ pixi run test -R '^sql\\.'             # on c25f963; the later commits are covered by check-full above\n100% tests passed out of 743\n$ pixi run test -R '^plan\\.' && pixi run test -L cli\n100% tests passed out of 635 / 71\n$ pixi run test -R 'harness\\.slt\\.pending|subqueries|joins|TableAliasOracle|MakeOrderedQuery|QueryGenerator|fuzz\\.replay|tpch\\.status'\n100% tests passed out of 69\n$ ANTB1_DIFF_SEED=7 pixi run diff-random --list --target-percent 100   # and seed 11\nidentical to main's lists (5,434 and 5,234 lines)\n$ pixi run test-data\nCLICKBENCH: PASS queries=43\n```\n\nThe only skipped tests are the two metamorphic join relations\n(`star_join_commutes`, `star_join_order_three_tables`), which are\nskipped on main too and become active with J2b-2.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: the ADR 0022 and ADR 0008 update lines, in the\napproved plan\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code implemented the\nmaintainer-approved S4a plan after a planning round of read-only\nmapping, design and adversarial critique agents that probed DuckDB\n1.5.6. Two reviewer agents then reviewed it from two angles: the parser\nand AST against DuckDB 1.5.6 (about 200 forms compared); and the binder,\nharness and tests. Their one P1 (PIVOT_WIDER and PIVOT_LONGER fell to\nexit 1) and six nits are fixed. A re-review compared 489 DuckDB keywords\nin 12 templates with main and DuckDB. Its three docs nits are fixed and\nchecked with DuckDB probes. A final pre-PR review found one more P1:\nfour forms that DuckDB answers fell from exit 4 to exit 1 inside nested\nqueries (`GROUP BY ()`, string `EXTRACT` fields, `b[:2]`, `a$b`). The\nfirst two are now exit 4 everywhere, and the two lexer-level ones are\ndocumented and tested as known gaps. Two focused reviews of the fixes\nfollowed. The first restored a syntax-error test that the fix had\nreplaced, added the dollar-quoted EXTRACT case, and extended the known\ngaps with four more forms, each mutation-checked or probed with DuckDB.\nThe second found no P0 or P1, and its wording nits are fixed in the last\ncommit.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-10-09T18:43:59+03:00",
+          "tree_id": "5347ebed724222fee8cace3fca0e6f3af1863038",
+          "url": "https://github.com/ydb-campus/antb1/commit/6df2fb5e8a83432154df0bb925f1dffbc3061b57"
+        },
+        "date": 1791560759559,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 2436.3682172570457,
+            "unit": "ns/iter",
+            "extra": "iterations: 286665\ncpu: 2436.2364711422742 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 58599.721301135396,
+            "unit": "ns/iter",
+            "extra": "iterations: 11098\ncpu: 58592.40628942151 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 66328.94028136671,
+            "unit": "ns/iter",
+            "extra": "iterations: 10449\ncpu: 66304.27839984688 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 238613.86959437135,
+            "unit": "ns/iter",
+            "extra": "iterations: 2983\ncpu: 238487.91216895738 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 235775.2307433545,
+            "unit": "ns/iter",
+            "extra": "iterations: 2973\ncpu: 235641.08644466876 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 1347911.301158318,
+            "unit": "ns/iter",
+            "extra": "iterations: 518\ncpu: 1347730.6332046324 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 27.864355959999898,
+            "unit": "ms/iter",
+            "extra": "iterations: 25\ncpu: 27.84754288000002 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 26.829801153846454,
+            "unit": "ms/iter",
+            "extra": "iterations: 26\ncpu: 26.815562115384598 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 130.81265200000018,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 130.79755100000006 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 8.11768717441858,
+            "unit": "ms/iter",
+            "extra": "iterations: 86\ncpu: 8.1141826511628 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 10.944573538461537,
+            "unit": "ms/iter",
+            "extra": "iterations: 65\ncpu: 10.939388369230777 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 25.81696770370351,
+            "unit": "ms/iter",
+            "extra": "iterations: 27\ncpu: 25.80162292592593 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 0.9262607894039766,
+            "unit": "ms/iter",
+            "extra": "iterations: 755\ncpu: 0.9257050357615898 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 67.71545566666741,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 67.65374000000001 ms\nthreads: 1"
           }
         ]
       }
