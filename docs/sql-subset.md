@@ -441,7 +441,7 @@ table of the input it builds on before it reads the other input, which then stre
   null-aware anti join (SQL's `NOT IN`) each row without one whose key is not NULL, every row when its build input is
   empty, and none when its build input has a NULL key, though it still reads the other input to its end.
 - A one-row join appends the single row of its right input, an aggregate without groups, to every row; any other row
-  count is an internal error.
+  count is a planner bug, reported as an error (exit code 1).
 - When an inner or a semi join's build holds no row, the other input is never read.
 - A left join, and a semi or anti join with residual conditions, exit with code 4 until they are implemented.
 
@@ -528,9 +528,10 @@ only with `--analyze`); its errors and exit codes are those of `antb1 query`.
   - `sort`, `groups`, and `sample_parts`, `heavy_keys`, `heavy_groups` of a two-level aggregation;
   - a `HashJoin`'s `find` (looking up the keys; none where a join keeps every row or none without looking: a one-row
     join, an anti join over a build without rows, a null-aware anti join over an empty build input or one with a
-    NULL key), `gather` (the build's columns: an inner join's, and a one-row join's values, which its build makes
-    once), `residual` and, for an inner join whose build's keys are unique, `window_rows` (the rows of the probe's
-    batches it gathered the build's columns for, next to the `rows` it returned);
+    NULL key), `gather` (the rows' columns: the build columns an inner join gathers, and on its 1:N path the probe
+    rows it takes; a one-row join's values, which its build makes once), `residual` and, for an inner join whose
+    build's keys are unique, `window_rows` (the rows of the probe's batches it gathered the build's columns for, next
+    to the `rows` it returned);
   - a `HashBuild`'s `finish` (the table built from its parts, and a one-row join's values), `null_keys` (rows with a
     NULL key, never held), `unique` (1: no key repeats) and `direct` (1: the table indexes its one integer key by
     value, ADR 0022).

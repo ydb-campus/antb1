@@ -65,8 +65,9 @@ Proposed
   - Update (2026-10-09, E2a): semi, anti, null-aware anti and one-row joins show the same two lines and metrics. A
     probe has `find` only when it looks keys up: not a one-row join's, nor one that keeps every row or none without
     looking (an anti join over a build without rows, a null-aware anti join over an empty build input or one with a
-    NULL key); `gather` only for an inner join's build columns and a one-row join's values, which its build makes
-    once, within its `finish`; `window_rows` only on an inner join's 1:1 path. No metric is new.
+    NULL key); `gather` only for an inner join's columns (the build columns it gathers, and on its 1:N path the probe
+    rows it takes) and a one-row join's values, which its build makes once, within its `finish`; `window_rows` only on
+    an inner join's 1:1 path. No metric is new.
 - **Output.**
   - Text: the `Output:` line, a `Total:` line, then one line per operator indented as EXPLAIN, with the numbers in
     brackets.

@@ -201,8 +201,9 @@ class BuildsFirstOperator final : public Operator {
 // unless the table empties the join; the input's end and Close release the build.
 //
 // Memory: its own vectors are charged to ExecContext::budget, its Arrow buffers come from
-// ExecContext::pool. Profile: the metrics find (whenever it looks keys up), gather (the build's
-// columns of an inner or one-row join), residual and, on the 1:1 path of an inner join,
+// ExecContext::pool. Profile: the metrics find (whenever it looks keys up), gather (the rows'
+// columns: the build columns an inner join gathers, and on its 1:N path the probe rows it takes;
+// the slices of a one-row join's values), residual and, on the 1:1 path of an inner join,
 // window_rows (the rows of the windows its build columns were gathered for, against the rows it
 // emits).
 class HashJoinOperator final : public Operator {
