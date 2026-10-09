@@ -432,11 +432,20 @@ the keys, then the aggregates, one row per group; a `Project` above it restores 
 (`ORDER BY`, below the `Project`, so it can use columns and aggregates the query does not return) and `Limit` (with
 its offset). A `Join` has two inputs ([ADR 0022](adr/0022-joins-and-query-blocks.md)): its kind (inner, left, semi,
 anti, null-aware anti or one-row), key pairs of one type each, residual conditions over both inputs and the input it
-builds on. No query produces a `Join` yet. The executor runs an inner join as a hash join: it builds a hash table of
-the input it builds on before it reads the other input, which then streams through it, keeping its rows' order and
-each row's matches in the build input's order; the residual conditions are evaluated in order, each on the rows the
-ones before it kept. When the build holds no row, the other input is never read. The other kinds exit with code 4
-until they are implemented. A rule optimizer then rewrites the plan, through both inputs of every `Join`:
+builds on. No query produces a `Join` yet. The executor runs every kind but left as a hash join: it builds a hash
+table of the input it builds on before it reads the other input, which then streams through it in its rows' order.
+
+- An inner join keeps each row's matches in the build input's order; its residual conditions are evaluated in order,
+  each on the rows the ones before it kept.
+- A semi join keeps each row with a match, once; an anti join each row without one (a NULL key never matches); a
+  null-aware anti join (SQL's `NOT IN`) each row without one whose key is not NULL, every row when its build input is
+  empty, and none when its build input has a NULL key, though it still reads the other input to its end.
+- A one-row join appends the single row of its right input, an aggregate without groups, to every row; any other row
+  count is a planner bug, reported as an error (exit code 1).
+- When an inner or a semi join's build holds no row, the other input is never read.
+- A left join, and a semi or anti join with residual conditions, exit with code 4 until they are implemented.
+
+A rule optimizer then rewrites the plan, through both inputs of every `Join`:
 
 - `Limit` moves below `Project`: a `Project` keeps every row, so the `Limit` copies only the rows it keeps and ends
   up right above a `Sort`, which the executor runs as a top-N (it keeps only `limit + offset` rows while it reads);
@@ -501,7 +510,7 @@ only with `--analyze`); its errors and exit codes are those of `antb1 query`.
 - A `Scan` that applies predicates of the `Filter` above it while it reads (filter pushdown,
   [ADR 0020](adr/0020-filter-pushdown.md)) says so after its EXPLAIN text, `, N pushed predicates`; its `rows` are
   then those that passed them.
-- A hash join (an inner `Join`) shows two lines, each with the join's EXPLAIN text:
+- A hash join (any `Join` the executor runs) shows two lines, each with the join's EXPLAIN text:
   - `HashJoin`, its probe, where the input it does not build on is read: in that input's part pipeline (per part),
     or over it when it is no part pipeline;
   - `HashBuild`, its build, under the operator that prepares it: the operator that runs the probe's part pipeline
@@ -517,11 +526,15 @@ only with `--analyze`); its errors and exit codes are those of `antb1 query`.
   - `wait` (for parts);
   - `merge`, `lanes_tail` (merging after the last part), `build` (output rows), `outer`;
   - `sort`, `groups`, and `sample_parts`, `heavy_keys`, `heavy_groups` of a two-level aggregation;
-  - a `HashJoin`'s `find` (looking up the keys), `gather` (the rows' columns), `residual` and, when the build's keys
-    are unique, `window_rows` (the rows of the probe's batches it gathered the build's columns for, next to the
-    `rows` it returned);
-  - a `HashBuild`'s `finish` (the table built from its parts), `null_keys` (rows with a NULL key, never held),
-    `unique` (1: no key repeats) and `direct` (1: the table indexes its one integer key by value, ADR 0022).
+  - a `HashJoin`'s `find` (looking up the keys; none where a join keeps every row or none without looking: a one-row
+    join, an anti join over a build without rows, a null-aware anti join over an empty build input or one with a
+    NULL key), `gather` (the rows' columns: the build columns an inner join gathers, and on its 1:N path the probe
+    rows it takes; a one-row join's values, which its build makes once), `residual` and, for an inner join whose
+    build's keys are unique, `window_rows` (the rows of the probe's batches it gathered the build's columns for, next
+    to the `rows` it returned);
+  - a `HashBuild`'s `finish` (the table built from its parts, and a one-row join's values), `null_keys` (rows with a
+    NULL key, never held), `unique` (1: no key repeats) and `direct` (1: the table indexes its one integer key by
+    value, ADR 0022).
 - The counts do not depend on the number of threads, except under a `LIMIT` (it stops parts that already started,
   and how many depends on the threads) and after a part ran out of memory next to others (it runs again alone). The
   times do depend on the threads.

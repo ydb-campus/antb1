@@ -325,6 +325,10 @@ Proposed
     checked at run time. Any other scalar subquery exits 4. It becomes a one-row join that appends its row's
     columns, and a comparison above it. Over an empty input SUM, AVG, MIN and MAX are NULL, which the comparison
     rejects, and COUNT is 0, which it compares as usual; both as in DuckDB.
+    - Update (2026-10-09, E2a): a one-row join's build is keyless (`exec::JoinBuildSpec::Keyless`). It must hold
+      exactly one row: any other count is `Invalid` from its `Prepare`, before any probe part runs, a planner bug
+      that SQL never sees. Its values are made once, as columns that every probe window slices, of fewer rows than
+      `batch_size` when its VARCHAR values are long.
   - A subquery's join sits above the inner joins of its block (WHERE) or above the aggregation (HAVING), in the
     order the conjuncts are written.
 - **Statistics come from the footers only (decision C10).** Planning reads row counts, part rows, integer min/max
@@ -358,6 +362,12 @@ Proposed
     parts are done (the part sinks' parts-done callback) or at its `Close`. An inner join's residuals are evaluated by
     its probe, in order, each only on the rows the ones before it kept (NULL counts as false), not by a `Filter`
     above it. A build's profile line sits under the operator that prepares it.
+  - Update (2026-10-09, E2a): the empty-build rule per kind. Only an inner or a semi join whose build holds no row
+    empties its join (`exec::EmptiesJoin`): its probe never opens its input, and the builds below it are not
+    prepared. Every other kind reads its probe input: an anti join over no build row keeps every selected row, and a
+    null-aware anti join over an empty build input every row, NULL keys included. `NOT IN` over a set with a NULL
+    reads its probe input too and keeps no row, as DuckDB does (it reads every probe row through a mark join): the
+    builds below it are prepared, and an error of the probe side surfaces as in DuckDB.
 - **Each build is created once,** by the physical planner, outside the factory that makes a fresh operator chain for
   every part. The factory captures it, and every part's probe reads the same table.
 - **Build inputs:** a part pipeline, whose parts run on the pool through the part scheduler, with its window, its
@@ -392,6 +402,10 @@ Proposed
       rows before the residuals are evaluated (the update under "Builds come first, on the consumer thread"), and
       a residual that drops some rows leaves a copy of the rest; only a window where every row matched and no
       residual drops a row, or a window without residuals, copies no probe column.
+    - Update (2026-10-09, E2a): semi, anti and null-aware anti joins emit windows of at most `batch_size` rows of
+      the probe batch, slices with new selection bits (none when the window keeps every row; a window that keeps
+      none is skipped), and their output is the probe's own schema. A one-row join's windows are slices of the probe
+      batch with its selection, and its build row's values sliced.
   - Rows keep the probe side's part and row order, and a probe row's matches come in the build's (part, row) order.
     Every sink above merges as it does today, and answers are byte-identical for any thread count.
 - **NULL keys never match,** on either side: the build does not insert them, and a probe row with a NULL key has
@@ -407,6 +421,11 @@ Proposed
   - Update (2026-10-09, J1b): an inner join's residuals are evaluated by its probe, not by a `Filter` above it: in
     order, each only on the rows the ones before it kept (the update under "Builds come first, on the consumer
     thread"). The other kinds' residuals stay E2's, as above.
+  - Update (2026-10-09, E2a): semi, anti and null-aware anti builds keep every row. Builds of distinct keys are
+    deferred until a profile shows a semi or anti build whose repeated keys cost memory or time; results never
+    depend on it, since these joins read only whether a key has a match. Their residuals run with E2b; until then a
+    semi or anti join with residuals exits 4. A null-aware anti join of other than one key, and residuals on a
+    null-aware anti or a one-row join, are `Invalid`: no planned producer makes them.
 - **One build feeds one probe pipeline,** until a later ADR. Nothing else is buffered for reuse: a table or sub-plan
   read twice is computed twice (ADR 0013).
 - **Memory.** A build's Arrow buffers come from the budget's pool, and its own containers are charged through
@@ -525,7 +544,9 @@ docs/sql-subset.md sections it changes.
     rules 1-5 and 10 (`src/plan/scope.h`), the join order (`src/plan/join_order.h`) and the distinct-count hints.
     J2b-2, `feat(plan): inner joins of the tables in from`, binds the joins with them, and the five queries pass.
 - **E2, feat(exec): semi, anti, null-aware anti, left outer and one-row joins.** Residuals over candidate pairs,
-  builds of distinct keys, NULL padding of every type and the one-row join.
+  builds of distinct keys, NULL padding of every type and the one-row join. Update (2026-10-09): split in two, E2a
+  (semi, anti, null-aware anti and one-row joins without residuals) and E2b (residuals over candidate pairs and
+  left outer joins); builds of distinct keys are deferred (the update under "Residuals (E2)").
 - **T2, test(diff): generate derived tables, ctes, left joins and uncorrelated subqueries.** With their metamorphic
   relations, pending until the engine supports them.
 - **J3, feat(plan): factor conjuncts shared by every branch of an or.** Q19 passes.

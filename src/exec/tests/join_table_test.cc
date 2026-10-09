@@ -1,11 +1,12 @@
 // The join hash table (docs/adr/0022-joins-and-query-blocks.md): built from parts in any order and
 // on any number of threads, both layouts, keys of every type and of several columns, NULL keys,
-// sliced batches, probes sharing the table, what the planner must not send, and running out of
-// memory.
+// keyless builds, sliced batches, probes sharing the table, what the planner must not send, and
+// running out of memory.
 
 #include "antb1/exec/join_table.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -829,6 +830,60 @@ TEST_F(JoinTableTest, FlagsForEmptyAndNullOnlyBuilds) {
     EXPECT_TRUE((*table)->chunks().empty());
     expect_no_match(**table);
   }
+}
+
+// A keyless build (a one-row join's) holds every selected row as the rows of one key, NULL values
+// included, in (part, row) order: unique() only for a single row, and no NULL key. It has nothing
+// to probe: Find is Invalid. Keyless needs a schema, and Make still needs keys. The same on one
+// thread and on the pool.
+TEST_F(JoinTableTest, KeylessBuildsHoldEveryRowAsOneKey) {
+  const auto pool = MakeThreadPool();
+  for (arrow::internal::Executor* executor : Executors(pool.get())) {
+    SCOPED_TRACE(executor == nullptr ? "serial" : "pool");
+    // Ids 0 to 4; rows 2 and 4 are not selected.
+    BuildData data({LogicalType::kBigInt});
+    data.Add(0, {Int64s({5, std::nullopt, 7})}, Bools({true, true, false}))
+        .Add(1, {Int64s({8})})
+        .Add(2, {Int64s({std::nullopt})}, Bools({false}));
+    auto spec = JoinBuildSpec::Keyless(data.schema());
+    ASSERT_TRUE(spec.ok()) << spec.status().ToString();
+    EXPECT_TRUE((*spec)->keys().empty());
+    EXPECT_FALSE((*spec)->direct_candidate());
+    auto parts = MakeParts(data, *spec);
+    ASSERT_TRUE(parts.ok()) << parts.status().ToString();
+    auto table = Assemble(*spec, *parts, executor);
+    ASSERT_TRUE(table.ok()) << table.status().ToString();
+    EXPECT_EQ((*table)->num_rows(), 3);
+    EXPECT_EQ((*table)->input_rows(), 3);
+    EXPECT_EQ((*table)->null_key_rows(), 0);
+    EXPECT_FALSE((*table)->has_null());
+    EXPECT_FALSE((*table)->empty());
+    EXPECT_FALSE((*table)->unique());
+    const std::array<JoinMatches, 1> all = {JoinMatches{.begin = 0, .end = 3}};
+    EXPECT_EQ(MatchIds(**table, all), (Ids{{0, 1, 3}}));
+    // Nothing to probe.
+    std::vector<JoinMatches> out(1);
+    for (const std::vector<std::shared_ptr<arrow::Array>>& keys :
+         {std::vector<std::shared_ptr<arrow::Array>>{},
+          std::vector<std::shared_ptr<arrow::Array>>{Int64s({5})}}) {
+      EXPECT_TRUE((*table)->Find(keys, nullptr, arrow::default_memory_pool(), out).IsInvalid());
+    }
+    // One row.
+    BuildData one({LogicalType::kBigInt});
+    one.Add(0, {Int64s({std::nullopt, 9})}, Bools({false, true}));
+    auto one_spec = JoinBuildSpec::Keyless(one.schema());
+    ASSERT_TRUE(one_spec.ok());
+    auto one_parts = MakeParts(one, *one_spec);
+    ASSERT_TRUE(one_parts.ok());
+    auto single = Assemble(*one_spec, *one_parts, executor);
+    ASSERT_TRUE(single.ok()) << single.status().ToString();
+    EXPECT_EQ((*single)->num_rows(), 1);
+    EXPECT_TRUE((*single)->unique());
+  }
+  EXPECT_TRUE(JoinBuildSpec::Keyless(nullptr).status().IsInvalid());
+  EXPECT_TRUE(JoinBuildSpec::Make(arrow::schema({arrow::field("x", arrow::int64())}), {})
+                  .status()
+                  .IsInvalid());
 }
 
 // Probes with nothing to look up: no rows, only NULL keys, no selected row.

@@ -231,6 +231,17 @@ arrow::Result<std::shared_ptr<const JoinBuildSpec>> JoinBuildSpec::Make(
   });
 }
 
+arrow::Result<std::shared_ptr<const JoinBuildSpec>> JoinBuildSpec::Keyless(
+    std::shared_ptr<arrow::Schema> schema) {
+  if (schema == nullptr) {
+    return arrow::Status::Invalid("a join build without a schema");
+  }
+  return NoBadAlloc("a join build", [&] -> arrow::Result<std::shared_ptr<const JoinBuildSpec>> {
+    return std::shared_ptr<const JoinBuildSpec>(
+        new JoinBuildSpec(std::move(schema), {}, /*direct_candidate=*/false));
+  });
+}
+
 // ---- JoinBuildPart ----
 
 JoinBuildPart::JoinBuildPart(std::shared_ptr<const JoinBuildSpec> spec, MemoryBudget* budget)
@@ -708,6 +719,9 @@ arrow::Status JoinTable::DoFind(std::span<const std::shared_ptr<arrow::Array>> k
                                 const arrow::BooleanArray* selection, arrow::MemoryPool* pool,
                                 std::span<JoinMatches> out) const {
   const std::vector<plan::BoundColumn>& build_keys = spec_->keys();
+  if (build_keys.empty()) {  // before any key is read: there is none
+    return arrow::Status::Invalid("a probe of a join build without keys");
+  }
   if (keys.size() != build_keys.size()) {
     return arrow::Status::Invalid("a join probe of ", keys.size(), " keys for ", build_keys.size(),
                                   " build keys");

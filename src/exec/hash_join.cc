@@ -10,6 +10,7 @@
 #include <new>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -71,24 +72,61 @@ std::shared_ptr<arrow::Schema> JoinSchema(const arrow::Schema& probe, const arro
   return arrow::schema(std::move(fields));
 }
 
+// The most bytes of VARCHAR values that one window of a one-row join appends: its values are
+// copied once per row of a window, so a window holds fewer rows than batch_size when they are long
+// (one row at least).
+constexpr int64_t kOneRowWindowBytes = int64_t{1024} * 1024;
+
+// The values of the single row of `table` as columns of up to max(ctx.batch_size, 1) rows, fewer
+// when its VARCHAR values are long (kOneRowWindowBytes), from ctx.pool.
+arrow::Result<std::shared_ptr<const OneRowValues>> OneRowValuesOf(const JoinTable& table,
+                                                                  const ExecContext& ctx) {
+  const JoinRowRef ref = table.rows().front();
+  const arrow::RecordBatch& chunk = *table.chunks()[ref.chunk];
+  std::vector<std::shared_ptr<arrow::Scalar>> scalars;
+  scalars.reserve(static_cast<std::size_t>(chunk.num_columns()));
+  int64_t varchar_bytes = 0;
+  for (int c = 0; c < chunk.num_columns(); ++c) {
+    ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Scalar> scalar,
+                          chunk.column(c)->GetScalar(ref.row));
+    if (scalar->is_valid && scalar->type->id() == arrow::Type::BINARY) {
+      varchar_bytes += static_cast<const arrow::BinaryScalar&>(*scalar).value->size();
+    }
+    scalars.push_back(std::move(scalar));
+  }
+  const int64_t batch_size = std::max<int64_t>(ctx.batch_size, 1);
+  auto values = std::make_shared<OneRowValues>();
+  values->rows = varchar_bytes == 0
+                     ? batch_size
+                     : std::clamp<int64_t>(kOneRowWindowBytes / varchar_bytes, 1, batch_size);
+  values->columns.reserve(scalars.size());
+  for (const std::shared_ptr<arrow::Scalar>& scalar : scalars) {
+    ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Array> column,
+                          arrow::MakeArrayFromScalar(*scalar, values->rows, ctx.pool));
+    values->columns.push_back(std::move(column));
+  }
+  return values;
+}
+
 }  // namespace
 
 // ---- JoinBuild ----
 
 JoinBuild::JoinBuild(std::shared_ptr<const JoinBuildSpec> spec, PartPipeline pipeline,
                      int64_t num_parts, std::vector<std::shared_ptr<JoinBuild>> builds,
-                     ProfileNode* profile)
+                     ProfileNode* profile, plan::JoinKind kind)
     : spec_(std::move(spec)),
       pipeline_(std::make_shared<const PartPipeline>(std::move(pipeline))),
       num_parts_(num_parts),
       builds_(std::move(builds)),
-      profile_(profile) {
+      profile_(profile),
+      kind_(kind) {
   ANTB1_CHECK(spec_ != nullptr && *pipeline_);
 }
 
 JoinBuild::JoinBuild(std::shared_ptr<const JoinBuildSpec> spec, std::unique_ptr<Operator> input,
-                     ProfileNode* profile)
-    : spec_(std::move(spec)), input_(std::move(input)), profile_(profile) {
+                     ProfileNode* profile, plan::JoinKind kind)
+    : spec_(std::move(spec)), input_(std::move(input)), profile_(profile), kind_(kind) {
   ANTB1_CHECK(spec_ != nullptr && input_ != nullptr);
 }
 
@@ -116,6 +154,7 @@ arrow::Status JoinBuild::Prepare(ExecContext& ctx) {
 
 void JoinBuild::Release() {
   table_.reset();
+  values_.reset();
   ReleaseBuilds(builds_);
 }
 
@@ -235,6 +274,14 @@ arrow::Status JoinBuild::BuildTable(ExecContext& ctx) {
   {
     const ProfileTimer finish(profile_, "finish");
     ARROW_ASSIGN_OR_RAISE(table_, builder->Finish());
+    if (kind_ == plan::JoinKind::kOneRow) {
+      // A planner bug, never an answer: SQL plans only an aggregate without groups here.
+      if (table_->num_rows() != 1) {
+        return arrow::Status::Invalid("a one-row join's right input returned ", table_->num_rows(),
+                                      " rows");
+      }
+      ARROW_ASSIGN_OR_RAISE(values_, OneRowValuesOf(*table_, ctx));
+    }
   }
   ReleaseBuilds(builds_);  // the input's parts are done: the tables they probed are not needed
   if (profile_ != nullptr) {
@@ -249,13 +296,17 @@ arrow::Status JoinBuild::BuildTable(ExecContext& ctx) {
   return arrow::Status::OK();
 }
 
+bool EmptiesJoin(plan::JoinKind kind, const JoinTable& table) {
+  return (kind == plan::JoinKind::kInner || kind == plan::JoinKind::kSemi) && table.num_rows() == 0;
+}
+
 arrow::Status PrepareBuilds(std::span<const std::shared_ptr<JoinBuild>> builds, ExecContext& ctx) {
   for (const std::shared_ptr<JoinBuild>& build : builds) {
     if (arrow::Status status = build->Prepare(ctx); !status.ok()) {
       ReleaseBuilds(builds);
       return status;
     }
-    if (build->table()->num_rows() == 0) {
+    if (EmptiesJoin(build->kind(), *build->table())) {
       break;  // no row comes out of its join: the joins below it are never probed
     }
   }
@@ -318,7 +369,25 @@ arrow::Result<std::unique_ptr<HashJoinOperator>> HashJoinOperator::Make(
   if (probe == nullptr || build == nullptr) {
     return arrow::Status::Invalid("a hash join without its inputs");
   }
+  const plan::JoinKind kind = build->kind();
+  const std::string_view kind_name = plan::ToString(kind);
   const JoinBuildSpec& spec = *build->spec();
+  if (kind == plan::JoinKind::kLeft) {
+    return arrow::Status::Invalid("a LEFT hash join, which exec does not run yet");
+  }
+  if (kind != plan::JoinKind::kInner && build_side == plan::BuildSide::kLeft) {
+    return arrow::Status::Invalid("a ", kind_name, " hash join that builds on its left input");
+  }
+  if ((kind == plan::JoinKind::kOneRow) != spec.keys().empty()) {
+    return arrow::Status::Invalid("a ", kind_name, " hash join over a build ",
+                                  spec.keys().empty() ? "without" : "with", " keys");
+  }
+  if (kind == plan::JoinKind::kNullAwareAnti && spec.keys().size() != 1) {
+    return arrow::Status::Invalid("a ", kind_name, " hash join of ", spec.keys().size(), " keys");
+  }
+  if (kind != plan::JoinKind::kInner && !residual.empty()) {
+    return arrow::Status::Invalid("a ", kind_name, " hash join with residuals");
+  }
   const arrow::Schema& probe_schema = *probe->output_schema();
   if (probe_keys.size() != spec.keys().size()) {
     return arrow::Status::Invalid("a hash join probe of ", probe_keys.size(), " keys for ",
@@ -336,15 +405,21 @@ arrow::Result<std::unique_ptr<HashJoinOperator>> HashJoinOperator::Make(
                                     " for a build key of type ", build_type.ToString());
     }
   }
-  std::shared_ptr<arrow::Schema> schema = JoinSchema(probe_schema, *spec.schema(), build_side);
+  // Semi, anti and null-aware anti joins pass the probe's batches on: its schema, the same object,
+  // so that a build of their output takes it (JoinBuildPart checks the schema).
+  const bool pass_through = kind == plan::JoinKind::kSemi || kind == plan::JoinKind::kAnti ||
+                            kind == plan::JoinKind::kNullAwareAnti;
+  std::shared_ptr<arrow::Schema> schema =
+      pass_through ? probe->output_schema() : JoinSchema(probe_schema, *spec.schema(), build_side);
+  // A residual reads the probe's and the build's columns (an inner join's output).
+  const int width = probe_schema.num_fields() + spec.schema()->num_fields();
   for (const plan::ExprPtr& expr : residual) {
     if (expr == nullptr || expr->type != plan::LogicalType::kBoolean) {
       return arrow::Status::Invalid("a hash join residual that is not BOOLEAN");
     }
     std::vector<int> columns;
     plan::CollectColumns(*expr, columns);
-    if (std::ranges::any_of(
-            columns, [&](int column) { return column < 0 || column >= schema->num_fields(); })) {
+    if (std::ranges::any_of(columns, [&](int column) { return column < 0 || column >= width; })) {
       return arrow::Status::Invalid("a hash join residual reads a column outside the join");
     }
   }
@@ -363,7 +438,8 @@ HashJoinOperator::HashJoinOperator(std::unique_ptr<Operator> probe,
       build_side_(build_side),
       residual_(std::move(residual)),
       prepares_(prepares),
-      schema_(std::move(schema)) {}
+      schema_(std::move(schema)),
+      kind_(build_->kind()) {}
 
 HashJoinOperator::~HashJoinOperator() = default;
 
@@ -389,9 +465,31 @@ arrow::Status HashJoinOperator::Start() {
   if (table_ == nullptr) {
     return arrow::Status::Invalid("a hash join probe before its build is prepared");
   }
-  if (table_->num_rows() == 0) {
-    End();  // no row can match: the input is never opened
+  if (EmptiesJoin(kind_, *table_)) {
+    End();  // no row can come out: the input is never opened
     return arrow::Status::OK();
+  }
+  switch (kind_) {
+    case plan::JoinKind::kAnti:
+      keep_ = table_->num_rows() == 0 ? Keep::kAll : Keep::kUnmatched;
+      break;
+    case plan::JoinKind::kNullAwareAnti:
+      // A NULL in the set leaves no row (each one's NOT IN is false or NULL), yet the input is read
+      // to its end, as DuckDB reads it; an empty set keeps every row, a NULL key included.
+      if (table_->has_null()) {
+        keep_ = Keep::kNone;
+      } else {
+        keep_ = table_->empty() ? Keep::kAll : Keep::kUnmatchedNotNull;
+      }
+      break;
+    case plan::JoinKind::kOneRow:
+      values_ = build_->values();  // made with the table, which holds its one row
+      ANTB1_CHECK(values_ != nullptr);
+      keep_ = Keep::kAll;
+      break;
+    default:  // inner, semi
+      keep_ = Keep::kMatched;
+      break;
   }
   done_ = false;
   input_opened_ = true;  // Close closes it even if its Open fails
@@ -411,12 +509,23 @@ arrow::Result<Batch> HashJoinOperator::Next() {
       ARROW_RETURN_NOT_OK(Pull());
       continue;
     }
-    ARROW_ASSIGN_OR_RAISE(std::optional<Batch> out, table_->unique() ? NextWindow() : NextPairs());
+    ARROW_ASSIGN_OR_RAISE(std::optional<Batch> out, NextOutput());
     if (out.has_value()) {
       return *std::move(out);
     }
   }
   return Batch{};
+}
+
+arrow::Result<std::optional<Batch>> HashJoinOperator::NextOutput() {
+  switch (kind_) {
+    case plan::JoinKind::kInner:
+      return table_->unique() ? NextWindow() : NextPairs();
+    case plan::JoinKind::kOneRow:
+      return NextOneRow();
+    default:  // semi, anti, null-aware anti (Make takes no other kind)
+      return NextSelected();
+  }
 }
 
 arrow::Status HashJoinOperator::Pull() {
@@ -425,18 +534,18 @@ arrow::Status HashJoinOperator::Pull() {
     End();
     return arrow::Status::OK();
   }
-  if (in.selected_rows() == 0) {
-    return arrow::Status::OK();
+  if (keep_ == Keep::kNone || in.selected_rows() == 0) {
+    return arrow::Status::OK();  // read, and dropped
   }
   if (std::cmp_greater(in.data->num_rows(), std::numeric_limits<std::uint32_t>::max())) {
     return arrow::Status::CapacityError("a join probe batch of ", in.data->num_rows(), " rows");
   }
-  keys_.clear();
-  for (const int key : probe_keys_) {
-    keys_.push_back(in.data->column(key));
-  }
-  ARROW_RETURN_NOT_OK(Fit(matches_, static_cast<std::size_t>(in.data->num_rows()), memory_));
-  {
+  if (keep_ != Keep::kAll) {  // the rows' matches decide
+    keys_.clear();
+    for (const int key : probe_keys_) {
+      keys_.push_back(in.data->column(key));
+    }
+    ARROW_RETURN_NOT_OK(Fit(matches_, static_cast<std::size_t>(in.data->num_rows()), memory_));
     const ProfileTimer find(profile(), "find");
     ARROW_RETURN_NOT_OK(table_->Find(keys_, in.selection.get(), ctx_.pool, matches_));
   }
@@ -447,15 +556,104 @@ arrow::Status HashJoinOperator::Pull() {
   return arrow::Status::OK();
 }
 
-arrow::Result<std::optional<Batch>> HashJoinOperator::NextWindow() {
+std::optional<std::pair<int64_t, int64_t>> HashJoinOperator::NextRange(int64_t limit) {
   const int64_t length = batch_.data->num_rows();
   if (window_ >= length) {
     batch_ = Batch{};
     return std::nullopt;
   }
   const int64_t begin = window_;
-  const int64_t rows = std::min(batch_size_, length - begin);
+  const int64_t rows = std::min(limit, length - begin);
   window_ = begin + rows;
+  return std::pair(begin, rows);
+}
+
+bool HashJoinOperator::Selected(int64_t row) const {
+  return batch_.selection == nullptr ||
+         (batch_.selection->IsValid(row) && batch_.selection->Value(row));
+}
+
+arrow::Result<std::optional<Batch>> HashJoinOperator::NextSelected() {
+  const std::optional<std::pair<int64_t, int64_t>> range = NextRange(batch_size_);
+  if (!range.has_value()) {
+    return std::nullopt;
+  }
+  const auto [begin, rows] = *range;
+  // The rows the window keeps: one pass counts them, a second sets their bits if some are not.
+  const auto window = [&](const auto& keeps) -> arrow::Result<std::optional<Batch>> {
+    int64_t kept = 0;
+    for (int64_t row = begin; row < begin + rows; ++row) {
+      kept += keeps(row) ? 1 : 0;
+    }
+    if (kept == 0) {
+      return std::nullopt;
+    }
+    std::shared_ptr<arrow::BooleanArray> selection;
+    if (kept < rows) {
+      ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Buffer> bits,
+                            arrow::AllocateEmptyBitmap(rows, ctx_.pool));
+      for (int64_t row = begin; row < begin + rows; ++row) {
+        if (keeps(row)) {
+          arrow::bit_util::SetBit(bits->mutable_data(), row - begin);
+        }
+      }
+      selection = std::make_shared<arrow::BooleanArray>(rows, std::move(bits));
+    }
+    return Batch{.data = batch_.data->Slice(begin, rows), .selection = std::move(selection)};
+  };
+  const auto matched = [this](int64_t row) {
+    const JoinMatches& m = matches_[static_cast<std::size_t>(row)];
+    return m.end > m.begin;
+  };
+  switch (keep_) {
+    case Keep::kMatched:  // Find gives no match to a row that is not selected
+      return window(matched);
+    case Keep::kUnmatched:
+      return window([&](int64_t row) { return Selected(row) && !matched(row); });
+    case Keep::kUnmatchedNotNull:
+      return window(
+          [&](int64_t row) { return Selected(row) && keys_[0]->IsValid(row) && !matched(row); });
+    default:  // kAll (kNone never keeps a batch)
+      return window([this](int64_t row) { return Selected(row); });
+  }
+}
+
+arrow::Result<std::optional<Batch>> HashJoinOperator::NextOneRow() {
+  const std::optional<std::pair<int64_t, int64_t>> range =
+      NextRange(std::min(batch_size_, values_->rows));
+  if (!range.has_value()) {
+    return std::nullopt;
+  }
+  const auto [begin, rows] = *range;
+  std::shared_ptr<arrow::BooleanArray> selection;
+  if (batch_.selection != nullptr) {
+    selection = std::static_pointer_cast<arrow::BooleanArray>(batch_.selection->Slice(begin, rows));
+    const int64_t selected = selection->true_count();
+    if (selected == 0) {
+      return std::nullopt;
+    }
+    if (selected == rows) {
+      selection = nullptr;
+    }
+  }
+  arrow::ArrayVector build;
+  {
+    const ProfileTimer gather(profile(), "gather");
+    build.reserve(values_->columns.size());
+    for (const std::shared_ptr<arrow::Array>& column : values_->columns) {
+      build.push_back(column->Slice(0, rows));
+    }
+  }
+  const std::shared_ptr<arrow::RecordBatch> probe = batch_.data->Slice(begin, rows);
+  return Batch{.data = Assemble(probe->columns(), build, rows), .selection = std::move(selection)};
+}
+
+arrow::Result<std::optional<Batch>> HashJoinOperator::NextWindow() {
+  const std::optional<std::pair<int64_t, int64_t>> range = NextRange(batch_size_);
+  if (!range.has_value()) {
+    return std::nullopt;
+  }
+  const auto [begin, rows] = *range;
   const std::span<const JoinMatches> matches = std::span<const JoinMatches>(matches_).subspan(
       static_cast<std::size_t>(begin), static_cast<std::size_t>(rows));
   const int64_t matched =
@@ -606,6 +804,7 @@ void HashJoinOperator::End() {
   Free(build_rows_);
   memory_.Release();
   table_.reset();
+  values_.reset();
   if (prepares_) {
     build_->Release();
   }

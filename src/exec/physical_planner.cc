@@ -42,9 +42,9 @@ namespace {
 
 using OperatorResult = arrow::Result<std::unique_ptr<Operator>>;
 
-// The inner joins whose probes run in one part pipeline, and their builds, outermost join first:
-// the order in which the operator that runs the pipeline prepares them (PrepareBuilds). Made once
-// per pipeline, before the factory of its parts, so every part's probe reads the same build and no
+// The joins whose probes run in one part pipeline, and their builds, outermost join first: the
+// order in which the operator that runs the pipeline prepares them (PrepareBuilds). Made once per
+// pipeline, before the factory of its parts, so every part's probe reads the same build and no
 // part number of the pipeline ever reaches a build input.
 struct PipelineBuilds {
   std::vector<const plan::JoinNode*> joins;
@@ -74,9 +74,10 @@ OperatorResult Build(const plan::LogicalNodePtr& node, std::optional<int64_t> pa
 OperatorResult Profiled(OperatorResult op, const plan::LogicalNodePtr& node, ProfileNode* slot);
 
 // The node below `node` that a part pipeline goes on through: the input of a Filter, a Compute or
-// a Project, and an inner join's probe input (the input it does not build on); nullptr for any
-// other node. PipelineScan, FiltersOnScan and PipelineBuildsOf all walk a pipeline with it, so they
-// never disagree on its nodes.
+// a Project, and a join's probe input (the input it does not build on: the left one, but for an
+// inner join that builds on the left) for every kind but LEFT, which exec does not run yet; nullptr
+// for any other node. PipelineScan, FiltersOnScan and PipelineBuildsOf all walk a pipeline with
+// it, so they never disagree on its nodes.
 const plan::LogicalNode* PipelineInput(const plan::LogicalNode& node) {
   if (const auto* filter = std::get_if<plan::FilterNode>(&node)) {
     return filter->input.get();
@@ -88,15 +89,17 @@ const plan::LogicalNode* PipelineInput(const plan::LogicalNode& node) {
     return project->input.get();
   }
   if (const auto* join = std::get_if<plan::JoinNode>(&node);
-      join != nullptr && join->kind == plan::JoinKind::kInner) {
-    return (join->build == plan::BuildSide::kLeft ? join->right : join->left).get();
+      join != nullptr && join->kind != plan::JoinKind::kLeft) {
+    const bool build_left =
+        join->kind == plan::JoinKind::kInner && join->build == plan::BuildSide::kLeft;
+    return (build_left ? join->right : join->left).get();
   }
   return nullptr;
 }
 
 // The scan at the bottom of a part pipeline, a chain of streaming nodes over a scan (Filter,
-// Compute, Project and inner joins' probes, PipelineInput); nullptr if `node` is not the top of
-// one. Any other node ends the chain: a join of another kind, an aggregation, a sort, a limit.
+// Compute, Project and joins' probes, PipelineInput); nullptr if `node` is not the top of one. Any
+// other node ends the chain: a LEFT join, an aggregation, a sort, a limit.
 const plan::ScanNode* PipelineScan(const plan::LogicalNodePtr& node) {
   for (const plan::LogicalNode* n = node.get(); n != nullptr; n = PipelineInput(*n)) {
     if (const auto* scan = std::get_if<plan::ScanNode>(n)) {
@@ -125,8 +128,8 @@ std::vector<plan::Predicate> FiltersOnScan(const plan::LogicalNodePtr& node) {
   return predicates;
 }
 
-// An inner join as a hash join runs it: its probe and build inputs, and their keys (a key's left
-// column is on the left input, its right column on the right one).
+// A join as a hash join runs it: its probe and build inputs, and their keys (a key's left column is
+// on the left input, its right column on the right one; a one-row join has none).
 struct JoinShape {
   plan::LogicalNodePtr probe;
   plan::LogicalNodePtr build;
@@ -134,20 +137,43 @@ struct JoinShape {
   std::vector<plan::BoundColumn> build_keys;  // columns of the build input's output
 };
 
-// Invalid, never unsupported, for what a correct plan never holds: a missing input, no key, a key
-// whose two columns differ in type (the binder casts them to one type), a DOUBLE or BOOLEAN key
-// (E1's table takes neither: such an equality is a residual), a missing residual. Checked before
-// any profile line names the join by its EXPLAIN text, which reads every residual.
+// Invalid, never unsupported, for what a correct plan never holds, in this order: a missing input;
+// a kind other than inner that builds on its left input (it builds on the side whose rows it does
+// not preserve); a one-row join with keys or residuals; any other kind without keys; a null-aware
+// anti join of other than one key, or with residuals; a residual that is missing or not BOOLEAN; a
+// key whose two columns differ in type (the binder casts them to one type); a DOUBLE or BOOLEAN key
+// (E1's table takes neither: such an equality is a residual). Checked before any profile line names
+// the join by its EXPLAIN text, which reads every residual. The columns of its keys and residuals
+// are checked against its inputs once their operators are made (JoinBuildSpec::Make,
+// HashJoinOperator::Make).
 arrow::Result<JoinShape> ShapeOf(const plan::JoinNode& join) {
   if (join.left == nullptr || join.right == nullptr) {
     return arrow::Status::Invalid("a join without its inputs");
   }
-  if (join.keys.empty()) {
-    return arrow::Status::Invalid("a hash join without keys");
+  const std::string_view kind = plan::ToString(join.kind);
+  if (join.kind != plan::JoinKind::kInner && join.build == plan::BuildSide::kLeft) {
+    return arrow::Status::Invalid("a ", kind, " join that builds on its left input");
+  }
+  if (join.kind == plan::JoinKind::kOneRow) {
+    if (!join.keys.empty() || !join.residual.empty()) {
+      return arrow::Status::Invalid("a ONE-ROW join with keys or residuals");
+    }
+  } else if (join.keys.empty()) {
+    return arrow::Status::Invalid("a ", kind, " hash join without keys");
+  }
+  if (join.kind == plan::JoinKind::kNullAwareAnti &&
+      (join.keys.size() != 1 || !join.residual.empty())) {
+    return arrow::Status::Invalid("a NULL-AWARE ANTI join of ", join.keys.size(), " keys and ",
+                                  join.residual.size(), " residuals");
   }
   if (std::ranges::any_of(join.residual,
                           [](const plan::ExprPtr& residual) { return residual == nullptr; })) {
     return arrow::Status::Invalid("a join residual that is missing");
+  }
+  if (std::ranges::any_of(join.residual, [](const plan::ExprPtr& residual) {
+        return residual->type != plan::LogicalType::kBoolean;
+      })) {
+    return arrow::Status::Invalid("a join residual that is not BOOLEAN");
   }
   const bool build_left = join.build == plan::BuildSide::kLeft;
   JoinShape shape{.probe = build_left ? join.right : join.left,
@@ -169,6 +195,22 @@ arrow::Result<JoinShape> ShapeOf(const plan::JoinNode& join) {
   return shape;
 }
 
+// Unsupported (exit code 4, at the join's span) for a join that exec does not run yet: a semi or
+// anti join with residuals (ADR 0022: roadmap PR E2b evaluates them over candidate pairs). Checked
+// after ShapeOf, so that a join of a malformed shape is Invalid first; but before its operators are
+// made, so until E2b such a join whose key or residual reads a column outside its inputs is
+// unsupported too. A LEFT join never reaches it: it ends every pipeline (PipelineInput), and the
+// Builder rejects it first, whatever its shape.
+arrow::Status NotRunYet(const plan::JoinNode& join) {
+  if ((join.kind == plan::JoinKind::kSemi || join.kind == plan::JoinKind::kAnti) &&
+      !join.residual.empty()) {
+    return plan::UnsupportedError(
+        std::format("{} joins with residuals are not supported yet", plan::ToString(join.kind)),
+        join.span);
+  }
+  return arrow::Status::OK();
+}
+
 // The pipelines of the parts a part pipeline reads: every part of the scan's table but those its
 // filters rule out by their statistics (part_pruning.h), in part order, numbered 0 .. count - 1.
 struct Parts {
@@ -178,7 +220,7 @@ struct Parts {
   // The first parts that hold kTwoLevelSampleRows rows by the table's part_rows (all of them if
   // they hold fewer): chosen from metadata, so never by the number of threads.
   int64_t sample = 0;
-  // The builds of the inner joins the pipeline probes; nullptr when it probes none.
+  // The builds of the joins the pipeline probes; nullptr when it probes none.
   std::shared_ptr<const PipelineBuilds> builds;
 };
 
@@ -186,34 +228,38 @@ arrow::Result<Parts> PartsOf(const plan::LogicalNodePtr& node, const plan::ScanN
                              ProfileNode* consumer = nullptr,
                              const std::shared_ptr<const LateScan>& late = nullptr);
 
-// The build of an inner join of shape `shape`, profiled into `slot` (nullptr: not profiled). A
-// build input that is a part pipeline is built from its parts, with the builds of its own joins,
-// which the build prepares first; any other input's operator is drained.
+// The build of a join of shape `shape`, profiled into `slot` (nullptr: not profiled): keyless for
+// a one-row join. A build input that is a part pipeline is built from its parts, with the builds of
+// its own joins, which the build prepares first; any other input's operator is drained.
 arrow::Result<std::shared_ptr<JoinBuild>> MakeJoinBuild(const plan::JoinNode& join,
                                                         const JoinShape& shape, ProfileNode* slot) {
   if (slot != nullptr) {
     slot->set_name("HashBuild");
     slot->set_detail(plan::ExplainNode(plan::LogicalNode(join)));
   }
+  const auto spec_of = [&](std::shared_ptr<arrow::Schema> schema) {
+    return join.kind == plan::JoinKind::kOneRow
+               ? JoinBuildSpec::Keyless(std::move(schema))
+               : JoinBuildSpec::Make(std::move(schema), shape.build_keys);
+  };
   if (const plan::ScanNode* scan = PipelineScan(shape.build)) {
     ARROW_ASSIGN_OR_RAISE(Parts parts, PartsOf(shape.build, *scan, slot));
     ARROW_ASSIGN_OR_RAISE(auto sample, parts.pipeline(0));  // for the schema; never opened
-    ARROW_ASSIGN_OR_RAISE(auto spec,
-                          JoinBuildSpec::Make(sample->output_schema(), shape.build_keys));
+    ARROW_ASSIGN_OR_RAISE(auto spec, spec_of(sample->output_schema()));
     return std::make_shared<JoinBuild>(
         std::move(spec), std::move(parts.pipeline), parts.count,
         parts.builds == nullptr ? std::vector<std::shared_ptr<JoinBuild>>{} : parts.builds->builds,
-        slot);
+        slot, join.kind);
   }
   ARROW_ASSIGN_OR_RAISE(
       auto input, Build(shape.build, std::nullopt, slot == nullptr ? nullptr : slot->Child(0)));
-  ARROW_ASSIGN_OR_RAISE(auto spec, JoinBuildSpec::Make(input->output_schema(), shape.build_keys));
-  return std::make_shared<JoinBuild>(std::move(spec), std::move(input), slot);
+  ARROW_ASSIGN_OR_RAISE(auto spec, spec_of(input->output_schema()));
+  return std::make_shared<JoinBuild>(std::move(spec), std::move(input), slot, join.kind);
 }
 
-// The builds of the inner joins in the part pipeline whose top is `top`, outermost first; nullptr
-// when it has none. With the profile node of the operator that runs the pipeline (`consumer`),
-// the k-th build is profiled into its child 1 + k (child 0 is the pipeline's).
+// The builds of the joins in the part pipeline whose top is `top`, outermost first; nullptr when it
+// has none. With the profile node of the operator that runs the pipeline (`consumer`), the k-th
+// build is profiled into its child 1 + k (child 0 is the pipeline's).
 arrow::Result<std::shared_ptr<const PipelineBuilds>> PipelineBuildsOf(
     const plan::LogicalNodePtr& top, ProfileNode* consumer) {
   auto builds = std::make_shared<PipelineBuilds>();
@@ -223,6 +269,7 @@ arrow::Result<std::shared_ptr<const PipelineBuilds>> PipelineBuildsOf(
       continue;
     }
     ARROW_ASSIGN_OR_RAISE(const JoinShape shape, ShapeOf(*join));
+    ARROW_RETURN_NOT_OK(NotRunYet(*join));
     ARROW_ASSIGN_OR_RAISE(
         auto build,
         MakeJoinBuild(*join, shape,
@@ -672,13 +719,14 @@ struct Builder {
     return std::make_unique<RowCountOperator>("count_star()", *rows);
   }
   OperatorResult operator()(const plan::JoinNode& node) const {
-    if (node.kind != plan::JoinKind::kInner) {
-      // Exit code 4 until E2 runs the other kinds (ADR 0022).
+    if (node.kind == plan::JoinKind::kLeft) {
+      // Exit code 4 until roadmap PR E2b runs LEFT joins (ADR 0022).
       return plan::UnsupportedError(
           std::format("{} joins are not supported yet", plan::ToString(node.kind)), node.span);
     }
-    // An inner join is a hash join (ADR 0022): a build of one input, probed by the other.
+    // A join is a hash join (ADR 0022): a build of one input, probed by the other.
     ARROW_ASSIGN_OR_RAISE(JoinShape shape, ShapeOf(node));
+    ARROW_RETURN_NOT_OK(NotRunYet(node));
     Name("HashJoin");
     std::shared_ptr<JoinBuild> build;
     std::unique_ptr<Operator> probe;
