@@ -2103,19 +2103,23 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"SubqueryParenthesized", "SELECT a FROM (^(SELECT 1))", kUnsupported, 1,
                    "parenthesized queries are not supported"},
         // In two pairs of parentheses a table or a path starts a join, and what starts a query in
-        // one pair starts one in two.
+        // one pair starts one in two; within three tokens VALUES does (it is a query in DuckDB
+        // before '(').
         RejectCase{"DoublyParenthesizedJoin", "SELECT a FROM ^((t JOIN u ON a = b))", kUnsupported,
                    1, "parenthesized joins in FROM are not supported"},
         RejectCase{"DoublyParenthesizedJoinOfAPath",
                    "SELECT a FROM t, ^(('u.parquet' AS u CROSS JOIN v)) w", kUnsupported, 1,
                    "parenthesized joins in FROM are not supported"},
-        RejectCase{"DoublyParenthesizedJoinOfValues", "SELECT a FROM ^((values JOIN u ON a = b))",
-                   kUnsupported, 1, "parenthesized joins in FROM are not supported"},
+        RejectCase{"DoublyParenthesizedJoinOfQuotedValues",
+                   "SELECT a FROM ^((\"values\" JOIN u ON a = b))", kUnsupported, 1,
+                   "parenthesized joins in FROM are not supported"},
         RejectCase{"DoublyParenthesizedJoinOfAQualifiedTable",
                    "SELECT a FROM ^((over.x CROSS JOIN u))", kUnsupported, 1,
                    "parenthesized joins in FROM are not supported"},
         RejectCase{"DoublyParenthesizedValues", "SELECT a FROM (^(values (1)))", kUnsupported, 1,
                    "parenthesized queries are not supported"},
+        RejectCase{"DoublyParenthesizedJoinOfValues", "SELECT a FROM (^(values JOIN u ON a = b))",
+                   kUnsupported, 1, "parenthesized queries are not supported"},
         RejectCase{"DoublyParenthesizedDescribe", "SELECT a FROM (^(describe events))",
                    kUnsupported, 1, "parenthesized queries are not supported"},
         RejectCase{"DoublyParenthesizedPivotWider", "SELECT a FROM (^(PIVOT_WIDER events ON a))",

@@ -2137,12 +2137,6 @@ class Parser {
            (keyword == "VALUES" && PeekAt(ahead + 1).kind == TokenKind::kLeftParen);
   }
 
-  // Whether PeekAt(ahead) starts a query in parentheses in FROM, as DuckDB parses them: a word of
-  // kSubqueryStarts or what StartsOtherQuery tells (a '(' starts one too).
-  bool StartsQuery(std::size_t ahead) {
-    return Contains(kSubqueryStarts, KeywordOf(PeekAt(ahead))) || StartsOtherQuery(ahead);
-  }
-
   Expected<FromSource> ParseFromSource() {
     const Token& token = Peek();
     switch (token.kind) {
@@ -2183,16 +2177,20 @@ class Parser {
       case TokenKind::kLeftParen: {
         // A query (a derived table: a query other than SELECT or WITH is unsupported at its first
         // token), else DuckDB's joins in parentheses, also in a second pair of them when a table
-        // or a path follows both (FROM ((t JOIN u ON ...))). A table alone in them, or before a
-        // comma or the end, is a syntax error, as in DuckDB; anything else after the table is
-        // taken for a join (as far as three tokens tell), and so is a call (also of a word of
+        // or a path follows both (FROM ((t JOIN u ON ...)); three tokens do not show whether
+        // VALUES starts a query there, so it does). A table alone in them, or before a comma or
+        // the end, is a syntax error, as in DuckDB; anything else after the table is taken for a
+        // join (as far as three tokens tell), and so is a call (also of a word of
         // kFunctionKeywords), a qualified name (also one qualified by a word of kAliasKeywords)
         // and LATERAL before '(' or what may start a function's name.
         const Token& next = PeekAt(1);
-        if (next.kind == TokenKind::kLeftParen && StartsRelation(PeekAt(2)) && !StartsQuery(2)) {
+        if (const Token& after = PeekAt(2);
+            next.kind == TokenKind::kLeftParen && StartsRelation(after) &&
+            !Contains(kSubqueryStarts, KeywordOf(after)) && KeywordOf(after) != "VALUES") {
           return Unsupported(token.span, "parenthesized joins in FROM are not supported");
         }
-        if (next.kind == TokenKind::kLeftParen || StartsQuery(1)) {
+        if (next.kind == TokenKind::kLeftParen || Contains(kSubqueryStarts, KeywordOf(next)) ||
+            StartsOtherQuery(1)) {
           auto derived = ParseNestedQuery();
           if (!derived) {
             return std::unexpected(std::move(derived.error()));
