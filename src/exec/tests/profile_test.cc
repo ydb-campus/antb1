@@ -336,6 +336,104 @@ TEST_F(ProfileTest, JoinsShowBuildAndProbeLines) {
   }
 }
 
+// Semi, anti, null-aware anti and one-row joins show the lines of an inner join, HashJoin for the
+// probe and HashBuild for the build, with the same counts on 1 and 4 threads: the probe's rows are
+// the rows it keeps, the build's those its table holds (a one-row join's single row). A probe that
+// looks keys up has find; one that keeps every row without a lookup (an anti join over no build
+// row) has none, and only a one-row probe has gather. Over t's 140 rows (g = x % 5) and the
+// dimension's keys 0..9: a semi join on g keeps every row, an anti or null-aware anti join on x
+// keeps the 130 rows of x >= 10, and an anti join over the dimension's keys above 100 every row:
+// there are none, so statistics skip both of the build's parts.
+TEST_F(ProfileTest, JoinsOfOtherKindsShowBuildAndProbeLines) {
+  auto pool = arrow::internal::ThreadPool::Make(4);
+  ASSERT_TRUE(pool.ok());
+  const auto t = Node(plan::ScanNode{.table = Table(), .table_name = "t", .fields = {0, 1}});
+  const auto d = Node(plan::ScanNode{.table = Dimension(), .table_name = "d", .fields = {0, 1}});
+  const auto k = Column(0, "k", LogicalType::kBigInt);
+  const auto join_of = [](plan::JoinKind kind, plan::LogicalNodePtr probe,
+                          plan::LogicalNodePtr build, std::vector<plan::JoinKey> keys) {
+    return Node(plan::JoinNode{.kind = kind,
+                               .left = std::move(probe),
+                               .right = std::move(build),
+                               .keys = std::move(keys),
+                               .residual = {},
+                               .build = plan::BuildSide::kRight,
+                               .span = {}});
+  };
+  const auto on = [&](const plan::BoundColumn& probe_key) {
+    return std::vector<plan::JoinKey>{plan::JoinKey{.left = probe_key, .right = k}};
+  };
+  const auto count_of = [](plan::LogicalNodePtr input) {
+    return PlanOf(Node(plan::AggregateNode{.input = std::move(input),
+                                           .aggregates = {{.kind = plan::AggKind::kCountStar,
+                                                           .arg = {},
+                                                           .type = LogicalType::kBigInt}}}),
+                  1);
+  };
+  const auto x = Column(0, "x", LogicalType::kBigInt);
+  const auto g = Column(1, "g", LogicalType::kBigInt);
+  const auto none = Node(plan::FilterNode{
+      .input = d, .predicates = {testing::Compare(k, plan::CompareOp::kGt, testing::BigInt(100))}});
+  const auto row = Node(plan::AggregateNode{
+      .input = d,
+      .aggregates = {{.kind = plan::AggKind::kMax, .arg = k, .type = LogicalType::kBigInt}}});
+  const std::string scan_lines = "    Scan rows=140 runs=20 per_part\n";
+  const std::string dimension =
+      "  HashBuild rows=10 runs=1 parts=2 skipped=0\n"
+      "    Scan rows=10 runs=2 per_part\n";
+  struct Case {
+    std::string name;
+    plan::LogicalNodePtr join;
+    std::string counts;
+    bool find = true;
+  };
+  const std::vector<Case> cases = {
+      {.name = "semi",
+       .join = join_of(plan::JoinKind::kSemi, t, d, on(g)),
+       .counts = "  HashJoin rows=140 runs=20 per_part\n" + scan_lines + dimension},
+      {.name = "anti",
+       .join = join_of(plan::JoinKind::kAnti, t, d, on(x)),
+       .counts = "  HashJoin rows=130 runs=20 per_part\n" + scan_lines + dimension},
+      {.name = "null-aware anti",
+       .join = join_of(plan::JoinKind::kNullAwareAnti, t, d, on(x)),
+       .counts = "  HashJoin rows=130 runs=20 per_part\n" + scan_lines + dimension},
+      {.name = "anti over no build row",
+       .join = join_of(plan::JoinKind::kAnti, t, none, on(x)),
+       .counts = "  HashJoin rows=140 runs=20 per_part\n" + scan_lines +
+                 "  HashBuild rows=0 runs=1 parts=0 skipped=2\n"
+                 "    Filter rows=0 runs=0 per_part\n"
+                 "      Scan rows=0 runs=0 per_part\n",
+       .find = false},
+      {.name = "one-row",
+       .join = join_of(plan::JoinKind::kOneRow, t, row, {}),
+       .counts = "  HashJoin rows=140 runs=20 per_part\n" + scan_lines +
+                 "  HashBuild rows=1 runs=1 parts=1\n"
+                 "    PartAggregate rows=1 runs=1 parts=2 skipped=0\n"
+                 "      Scan rows=10 runs=2 per_part\n",
+       .find = false},
+  };
+  for (arrow::internal::Executor* executor :
+       {static_cast<arrow::internal::Executor*>(nullptr),
+        static_cast<arrow::internal::Executor*>(pool->get())}) {
+    for (const Case& c : cases) {
+      SCOPED_TRACE(c.name);
+      const auto profile = Profile(count_of(c.join), executor);
+      EXPECT_EQ(Counts(*profile), "PartAggregate rows=1 runs=1 parts=20 skipped=0\n" + c.counts);
+      ASSERT_EQ(profile->children().size(), 2U);
+      const ProfileNode& probe = *profile->children()[0];
+      const ProfileNode& build = *profile->children()[1];
+      EXPECT_EQ(probe.name(), "HashJoin");
+      EXPECT_EQ(build.name(), "HashBuild");
+      EXPECT_EQ(probe.detail(), plan::ExplainNode(*c.join));
+      EXPECT_EQ(build.detail(), plan::ExplainNode(*c.join));
+      EXPECT_EQ(MetricOf(probe, "find").has_value(), c.find);
+      EXPECT_EQ(MetricOf(probe, "gather").has_value(), c.name == "one-row");
+      EXPECT_FALSE(MetricOf(probe, "window_rows").has_value());
+      EXPECT_TRUE(MetricOf(build, "finish").has_value());
+    }
+  }
+}
+
 // Under a LIMIT on several threads, parts beyond the limit may have started: the limit's rows are
 // exact, the parts' counts are not (the docs say so).
 TEST_F(ProfileTest, ALimitStopsParts) {

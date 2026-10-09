@@ -4,9 +4,8 @@
 // an inner join on its 1:1 and 1:N paths, with residuals, NULL and multi-column keys, empty
 // builds, nested builds and chains, errors in the serial order, memory and profiles; semi, anti,
 // null-aware anti and one-row joins, their NULL keys, empty builds, chains and profiles; on one
-// thread and on a 4-thread pool (HashJoinTest). Then inner joins planned by the physical planner
-// against a nested-loop reference, through every sink and the hidden physical rules
-// (HashJoinPlanTest).
+// thread and on a 4-thread pool (HashJoinTest). Then joins planned by the physical planner against
+// a nested-loop reference, through every sink and the hidden physical rules (HashJoinPlanTest).
 
 #include "../hash_join.h"
 
@@ -2051,7 +2050,7 @@ TEST_F(HashJoinTest, ProfilesOfEveryKind) {
   }
 }
 
-// ---- plans (HashJoinPlanTest): inner joins through the physical planner ----
+// ---- plans (HashJoinPlanTest): joins through the physical planner ----
 
 class HashJoinPlanTest : public testing::ExecTest {};
 
@@ -2124,6 +2123,25 @@ plan::LogicalNodePtr JoinOf(const plan::LogicalNodePtr& probe, const plan::Logic
   for (std::size_t k = 0; k < probe_keys.size(); ++k) {
     join.keys.push_back(plan::JoinKey{.left = left ? build_keys[k] : probe_keys[k],
                                       .right = left ? probe_keys[k] : build_keys[k]});
+  }
+  return Node(std::move(join));
+}
+
+// The join of `kind` of `probe` (left) and `build` (right) where probe_keys[k] (a column of the
+// probe's output) equals build_keys[k] (of the build's); no keys for a one-row join.
+plan::LogicalNodePtr JoinOf(plan::JoinKind kind, const plan::LogicalNodePtr& probe,
+                            const plan::LogicalNodePtr& build,
+                            const std::vector<plan::BoundColumn>& probe_keys,
+                            const std::vector<plan::BoundColumn>& build_keys) {
+  plan::JoinNode join{.kind = kind,
+                      .left = probe,
+                      .right = build,
+                      .keys = {},
+                      .residual = {},
+                      .build = BuildSide::kRight,
+                      .span = {}};
+  for (std::size_t k = 0; k < probe_keys.size(); ++k) {
+    join.keys.push_back(plan::JoinKey{.left = probe_keys[k], .right = build_keys[k]});
   }
   return Node(std::move(join));
 }
@@ -2376,6 +2394,190 @@ TEST_F(HashJoinPlanTest, SameResultsOnOneAndFourThreads) {
           RowsOf(**serial),
           ReferenceJoin(RowsOf(*p), ReferenceJoin(RowsOf(*b), RowsOf(*d), {2}, {0}), {0}, {0}));
     }
+  }
+}
+
+// Through the physical planner, a semi, anti or null-aware anti join gives the nested-loop
+// reference, the probe's rows in part order: on a BIGINT, a VARCHAR ('' is no NULL) or a
+// two-column key (a null-aware anti join on one key, over the build table and over its rows
+// without a NULL key), on unique or repeated build keys, for any batch size. A one-row join appends
+// the row of an aggregate over the build table to every probe row.
+TEST_F(HashJoinPlanTest, EveryKindMatchesTheNestedLoopReference) {
+  const auto probe_table = MixedTable("p", 6, 7, ProbeKey);
+  const Rows probe_rows = RowsOf(*probe_table);
+  const std::vector<std::vector<int>> keys = {{0}, {1}, {0, 1}};
+  for (const bool unique : {false, true}) {
+    const auto build_table =
+        unique ? MixedTable("b", 2, 6, [](int64_t i) -> std::optional<int64_t> { return i; })
+               : MixedTable("b", 3, 5, [](int64_t i) -> std::optional<int64_t> { return i % 10; });
+    const Rows build_rows = RowsOf(*build_table);
+    for (const plan::JoinKind kind :
+         {plan::JoinKind::kSemi, plan::JoinKind::kAnti, plan::JoinKind::kNullAwareAnti}) {
+      for (const std::vector<int>& columns : keys) {
+        if (kind == plan::JoinKind::kNullAwareAnti && columns.size() > 1) {
+          continue;
+        }
+        std::vector<plan::BoundColumn> probe_keys;
+        std::vector<plan::BoundColumn> build_keys;
+        std::vector<plan::Predicate> not_null;
+        for (const int c : columns) {
+          probe_keys.push_back(MixedColumn("p", c));
+          build_keys.push_back(MixedColumn("b", c));
+          not_null.push_back(plan::Predicate{.kind = plan::Predicate::Kind::kIsNotNull,
+                                             .column = MixedColumn("b", c)});
+        }
+        for (const bool filtered : {false, true}) {
+          if (filtered && kind != plan::JoinKind::kNullAwareAnti) {
+            continue;
+          }
+          Rows build = build_rows;
+          plan::LogicalNodePtr build_input = ScanOf(build_table, "b");
+          if (filtered) {
+            std::erase_if(
+                build, [&](const std::vector<std::string>& row) { return NullKey(row, columns); });
+            build_input = Node(plan::FilterNode{.input = build_input, .predicates = not_null});
+          }
+          const Rows expected = ReferenceFilter(kind, probe_rows, build, columns, columns);
+          const auto plan = PlanOf(
+              JoinOf(kind, ScanOf(probe_table, "p"), build_input, probe_keys, build_keys), 3);
+          for (const int64_t batch_size : {1, 3, 64}) {
+            SCOPED_TRACE(std::string(plan::ToString(kind)) + " on " +
+                         std::to_string(columns.size()) + " key(s) from column " +
+                         std::to_string(columns[0]) + (unique ? ", unique" : ", repeated") +
+                         (filtered ? ", no NULL key" : "") + ", batch size " +
+                         std::to_string(batch_size));
+            auto result = RunPlan(plan, ContextOf(nullptr, batch_size));
+            ASSERT_TRUE(result.ok()) << result.status().ToString();
+            EXPECT_EQ(RowsOf(**result), expected);
+          }
+        }
+      }
+    }
+    // MIN(bk), COUNT(*) and MAX(bs) of the build table, appended to every probe row.
+    const plan::LogicalNodePtr row = Node(plan::AggregateNode{
+        .input = ScanOf(build_table, "b"),
+        .aggregates = {
+            {.kind = plan::AggKind::kMin, .arg = MixedColumn("b", 0), .type = LogicalType::kBigInt},
+            {.kind = plan::AggKind::kCountStar, .arg = {}, .type = LogicalType::kBigInt},
+            {.kind = plan::AggKind::kMax,
+             .arg = MixedColumn("b", 1),
+             .type = LogicalType::kVarchar}}});
+    const auto plan =
+        PlanOf(JoinOf(plan::JoinKind::kOneRow, ScanOf(probe_table, "p"), row, {}, {}), 6);
+    for (const int64_t batch_size : {1, 3, 64}) {
+      SCOPED_TRACE("one-row, batch size " + std::to_string(batch_size));
+      auto result = RunPlan(plan, ContextOf(nullptr, batch_size));
+      ASSERT_TRUE(result.ok()) << result.status().ToString();
+      EXPECT_EQ(RowsOf(**result),
+                ReferenceOneRow(probe_rows, {"0", std::to_string(build_rows.size()), "'y'"}));
+    }
+  }
+}
+
+// The shapes of SameResultsOnOneAndFourThreads where a join's kind matters give the same rows on
+// one thread and on four, for every kind but inner: the part union at the root, an aggregate above
+// the join, a probe over a serial input, a drained build, a chain with another join in one
+// pipeline and a build whose input probes a join of the kind. A one-row join's build input is an
+// aggregate (drained), or one row of a part pipeline.
+TEST_F(HashJoinPlanTest, EveryKindGivesTheSameResultsOnOneAndFourThreads) {
+  const auto pool = MakeThreadPool();
+  const auto p = MixedTable("p", 6, 7, ProbeKey);
+  const auto b = MixedTable("b", 3, 5, [](int64_t i) -> std::optional<int64_t> { return i % 10; });
+  const auto d = MixedTable("d", 2, 6, [](int64_t i) -> std::optional<int64_t> { return i; });
+  const auto pk = MixedColumn("p", 0);
+  const auto pid = MixedColumn("p", 2);
+  const auto bk = MixedColumn("b", 0);
+  const auto bid = MixedColumn("b", 2);
+  const auto dk = MixedColumn("d", 0);
+  const auto did = MixedColumn("d", 2);
+  const plan::AggregateCall count{
+      .kind = plan::AggKind::kCountStar, .arg = {}, .type = LogicalType::kBigInt};
+  const plan::AggregateCall max_pid{
+      .kind = plan::AggKind::kMax, .arg = pid, .type = LogicalType::kBigInt};
+  // A probe input that is no part pipeline (p's keys, grouped), and a build input that is none.
+  const auto probe_groups =
+      Node(plan::GroupAggregateNode{.input = ScanOf(p, "p"), .keys = {pk}, .aggregates = {count}});
+  const auto build_groups = Node(plan::GroupAggregateNode{
+      .input = ScanOf(b, "b"),
+      .keys = {bk},
+      .aggregates = {{.kind = plan::AggKind::kMin, .arg = bid, .type = LogicalType::kBigInt}}});
+  // The one row of MIN(id), COUNT(*) over `input`.
+  const auto row_of = [&](const plan::LogicalNodePtr& input, const plan::BoundColumn& id) {
+    return Node(plan::AggregateNode{
+        .input = input,
+        .aggregates = {{.kind = plan::AggKind::kMin, .arg = id, .type = LogicalType::kBigInt},
+                       count}});
+  };
+  std::vector<std::pair<std::string, plan::LogicalPlan>> shapes;
+  for (const plan::JoinKind kind :
+       {plan::JoinKind::kSemi, plan::JoinKind::kAnti, plan::JoinKind::kNullAwareAnti}) {
+    const std::string name(plan::ToString(kind));
+    const auto join = JoinOf(kind, ScanOf(p, "p"), ScanOf(b, "b"), {pk}, {bk});  // p's columns
+    shapes.emplace_back(name + " join", PlanOf(join, 3));
+    shapes.emplace_back(
+        name + " aggregate",
+        PlanOf(Node(plan::AggregateNode{.input = join, .aggregates = {count, max_pid}}), 2));
+    shapes.emplace_back(name + " serial probe",
+                        PlanOf(JoinOf(kind, probe_groups, ScanOf(b, "b"),
+                                      {Column(0, "pk", LogicalType::kBigInt)}, {bk}),
+                               2));
+    shapes.emplace_back(name + " drained build",
+                        PlanOf(JoinOf(kind, ScanOf(p, "p"), build_groups, {pk},
+                                      {Column(0, "bk", LogicalType::kBigInt)}),
+                               3));
+    shapes.emplace_back(
+        name + " chain",
+        PlanOf(JoinOf(plan::JoinKind::kInner, join, ScanOf(d, "d"), {pid}, {dk}), 6));
+    shapes.emplace_back(
+        name + " nested build",
+        PlanOf(JoinOf(plan::JoinKind::kInner, ScanOf(p, "p"),
+                      JoinOf(kind, ScanOf(b, "b"), ScanOf(d, "d"), {bid}, {dk}), {pk}, {bk}),
+               6));
+  }
+  // One-row: p's columns, then MIN(bid) and COUNT(*) over b.
+  const auto one_row =
+      JoinOf(plan::JoinKind::kOneRow, ScanOf(p, "p"), row_of(ScanOf(b, "b"), bid), {}, {});
+  shapes.emplace_back("ONE-ROW join", PlanOf(one_row, 5));
+  shapes.emplace_back(
+      "ONE-ROW aggregate",
+      PlanOf(Node(plan::AggregateNode{.input = one_row,
+                                      .aggregates = {count,
+                                                     max_pid,
+                                                     {.kind = plan::AggKind::kMin,
+                                                      .arg = Column(3, "min", LogicalType::kBigInt),
+                                                      .type = LogicalType::kBigInt}}}),
+             3));
+  shapes.emplace_back("ONE-ROW serial probe", PlanOf(JoinOf(plan::JoinKind::kOneRow, probe_groups,
+                                                            row_of(ScanOf(b, "b"), bid), {}, {}),
+                                                     4));
+  shapes.emplace_back(
+      "ONE-ROW pipeline build",
+      PlanOf(JoinOf(plan::JoinKind::kOneRow, ScanOf(p, "p"),
+                    Node(plan::FilterNode{.input = ScanOf(d, "d"),
+                                          .predicates = {testing::Compare(did, plan::CompareOp::kEq,
+                                                                          testing::BigInt(3))}}),
+                    {}, {}),
+             6));
+  shapes.emplace_back(
+      "ONE-ROW chain",
+      PlanOf(JoinOf(plan::JoinKind::kOneRow,
+                    JoinOf(plan::JoinKind::kSemi, ScanOf(p, "p"), ScanOf(b, "b"), {pk}, {bk}),
+                    row_of(ScanOf(d, "d"), did), {}, {}),
+             5));
+  shapes.emplace_back("ONE-ROW nested build",
+                      PlanOf(JoinOf(plan::JoinKind::kInner, ScanOf(p, "p"),
+                                    JoinOf(plan::JoinKind::kOneRow, ScanOf(b, "b"),
+                                           row_of(ScanOf(d, "d"), did), {}, {}),
+                                    {pk}, {bk}),
+                             8));
+  for (const auto& [name, plan] : shapes) {
+    SCOPED_TRACE(name);
+    auto serial = RunPlan(plan, ContextOf(nullptr, 4));
+    ASSERT_TRUE(serial.ok()) << serial.status().ToString();
+    EXPECT_GT((*serial)->num_rows(), 0);
+    auto parallel = RunPlan(plan, ContextOf(pool.get(), 4));
+    ASSERT_TRUE(parallel.ok()) << parallel.status().ToString();
+    EXPECT_TRUE((*parallel)->Equals(**serial));
   }
 }
 
