@@ -376,9 +376,9 @@ Proposed
   - **The 1:1 path:** with a unique build, an inner join keeps the probe batch and its columns, clears the selection
     bits of the rows without a match and appends the build's payload columns, taken by match; a semi join only
     clears bits. No probe column is copied.
-    - Update (2026-10-09, J1b): an inner join with residuals copies the rows it selected and evaluates its residuals
-      on the copy (the update under "Builds come first, on the consumer thread"); without residuals no probe column
-      is copied.
+    - Update (2026-10-09, J1b): with residuals, a window where some rows did not match is copied to its matched
+      rows before the residuals are evaluated (the update under "Builds come first, on the consumer thread"); a
+      window where every row matched, and any window without residuals, copies no probe column.
   - Rows keep the probe side's part and row order, and a probe row's matches come in the build's (part, row) order.
     Every sink above merges as it does today, and answers are byte-identical for any thread count.
 - **NULL keys never match,** on either side: the build does not insert them, and a probe row with a NULL key has
