@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791525015328,
+  "lastUpdate": 1791550526154,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -5724,6 +5724,114 @@ window.BENCHMARK_DATA = {
             "value": 28.34644636000121,
             "unit": "ms/iter",
             "extra": "iterations: 25\ncpu: 28.344601320000038 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "6fbe715b5f870904f585a985aef59f06a1f74da7",
+          "message": "feat(plan,exec,io): key casts, join order and name rules for joins (#108)\n\n## Summary\n\nRoadmap PR **J2b-1**, the first half of J2b ([ADR\n0022](docs/adr/0022-joins-and-query-blocks.md)). You approved splitting\nJ2b in two. This PR adds the building blocks that J2b-2 wires into the\nbinder: key casts, the name rules for several FROM items, and the join\norder from footer statistics.\n\n`binder.cc` is unchanged and still rejects several FROM items, aliases\nand qualified names with exit code 4, so no answer or EXPLAIN output\nchanges. `tests/data/tpch_status.json` stays `{\"pass\": [1, 6]}` and\nClickBench stays at 43/43.\n\n**Key casts** (`logical_plan.h`, `src/exec/compute.cc`):\n- `plan::CastExpr{operand}` is the last alternative of `plan::Expr`. It\nis an exact widening, as the new `plan::IsExactWidening` defines it:\n  - an integer type to one whose range holds its range;\n- an integer type or a DECIMAL to a DECIMAL with at least its integer\ndigits and its scale.\n- `SameExpr` compares a cast by type and operand. `Children()` lists the\noperand, so `MapColumns`, `CollectColumns`, `CollectColumnIds` and\n`ResolvePositions` reach it.\n- exec evaluates it through `CastTo` and `CastToDecimal`. Any other cast\nis `Invalid`.\n\n**Distinct-count hints** (`table.h`, `src/io/parquet_table.cc`):\n- New `plan::Table::part_distinct_count`, which gives no hint by\ndefault.\n- `io::ParquetTable` reads the column chunk's Parquet `distinct_count`\nby leaf index. Any exception gives no hint, as in `part_stats`.\n- DuckDB stores a count for each dictionary-encoded chunk; parquet-cpp\nstores none.\n\n**Name rules** (`src/plan/scope.{h,cc}`, ADR 0022 rules 1-5 and 10):\n- `PathBindingName` names a path's binding as DuckDB 1.5.6 does, empty\npath parts included.\n- `Scope::LookUp(ref, Visibility)` returns found, missing or ambiguous.\nAn ON resolves in its own join group first, then in its earlier comma\nsiblings, and never in a later item, as DuckDB does.\n- `Resolve`:\n  - an ambiguous name's error names the qualified candidates;\n- hints point at a later item, or at an alias that hides the name.\n`TableSource::kind` says whether the hidden name is the table's name as\nwritten or the path's binding name.\n  - single-table messages are unchanged.\n- `FindStarConflict` finds the bindings that make `SELECT *` ambiguous\n(rule 5).\n- Qualifiers are set only with two or more bindings, so no single-table\nplan changes.\n- The two one-binding CHECKs are gone.\n\n**Join order** (new private `src/plan/join_order.{h,cc}`):\n- Greedy and left-deep. The probe is the relation with the most footer\nrows; an unknown count counts as the most.\n- The next relation is the connected one with the smallest estimate\n|L|×|R|/max(domain), ties in FROM order. Every edge to the relations\nalready joined becomes a key, so a cycle gets a second key.\n- Estimates are 128-bit and saturating, and at least 1 unless an input\nor a key side is empty.\n- **Every join builds on the relation it adds** (your decision). The\nchoice is made in one field, so an estimate-based build side can come\nlater.\n- `KeyDomain`:\n  - the key's range, capped at its non-NULL rows and saturated;\n  - else the largest per-part hint, when every part has one;\n  - else unknown.\n\n  A part whose min exceeds its max counts as having no exact statistics.\n- Also `RelationRows`, `EstimateRows`, `FirstUnconnected` and\n`kMaxRelations` (256).\n- Filter selectivity (ADR 0022 join-order rule 4) is deferred, as\ndecided.\n\n**Tests** (31 new; the two one-binding death tests are replaced):\n- `plan.ScopeTest`:\n  - rules 1-5 and 10, with the design's DuckDB 1.5.6 probes re-modelled;\n  - the messages and `PathBindingName`;\n- alias hints for tables, for paths and for a table name containing a\ndot.\n- `plan.JoinOrderTest`:\n  - the probe and its ties;\n- a many-to-many edge waits while a key edge is available, with a\ncontrol that uses row counts only and takes it;\n  - cycles, the cap, empty inputs and saturation;\n- the `KeyDomain` cases, including 128-bit, reversed and negative\nstatistics;\n  - sub-plan rows, and chains and cliques of 256 relations.\n- `plan.LogicalPlanTest.CastExpr*` and `ExactWidenings`;\n`exec.ComputeTest.CastWidensExactly` and\n`CastRejectsWhatIsNoExactWidening`.\n- `io.ParquetScanTest.NoDistinctCountHints`.\n- `harness.ParquetDistinctCountOracle` (new, in the DuckDB block of\n`tests/slt/CMakeLists.txt`): DuckDB writes a dictionary-encoded file\nunder `TempDir()`, with a struct as its second field.\n`part_distinct_count` must equal DuckDB's `parquet_metadata` for every\npart and field.\n- `FakeTable` gains parts, statistics and hints.\n- Mutation checks, each reverted; every one fails at least one test:\n  - drop the domain cap;\n  - drop `CastExpr` from `Children()`;\n  - swap the two lookup levels;\n  - replace domains by row counts;\n  - drop the range's overflow guard;\n  - drop the reversed-range check;\n  - take every table name for a path in the alias hint.\n\n**Docs:**\n- `docs/architecture.md` (the plan and io modules, the ComputeOperator\nrow) and `docs/testing.md` (the hints oracle).\n- ADR 0022 update lines; `/docs/adr/` is a CODEOWNERS path, and the\nstatus stays Proposed:\n- \"Join order\": `join_order.h` computes rules 1, 2, 3 and 5, and rule\n4's sub-plan estimates but no filter selectivity; the domain cap,\nsaturation and unknown rows.\n  - \"Statistics\": hints through `part_distinct_count`.\n  - \"Plan\": J2b ships as J2b-1 and J2b-2.\n\nFor the maintainer:\n\n- **Size:** about 1,845 lines inserted (code about 715, tests about\n1,100, docs about 30), within the plan's 1,600 to 1,900.\n- **Differences from the plan:**\n- the public `plan::IsExactWidening`, which states `CastExpr`'s\ncontract;\n  - `PathBindingName` follows DuckDB's rules for empty path parts;\n- the later-item hint also on \"has no column\", and the alias hint\ndecided by `TableSource::kind`;\n- defensive handling of malformed statistics (no min/max, a min above\nthe max, negative counts) and saturation of 128-bit ranges;\n  - the oracle opens its own DuckDB connection to write the file.\n- **Hand-offs to J2b-2** (stacked on this branch, opened after this PR\nmerges):\n- The binder sets `TableSource::kind` from the FROM item and passes\nrule-1 names; the caveat on `Binding::name()` goes.\n- It uses `Visibility` for each ON, `FindStarConflict` for `SELECT *`,\n`FirstUnconnected` for the connectivity check, then `OrderJoins` for the\ntree.\n  - Its key casts go through `IsExactWidening`.\n- It carries the ADR 0022 lines for binder semantics, among them the\nbuild side on the added table, with the estimate-based choice and rule 4\ndeferred to their trigger.\n- It fixes a message nit: when an ON's qualifier names an aliased later\nitem, the hint should say that the ON cannot see that item.\n- It corrects a test comment in `scope_test.cc`, which says a path's\ntext names nothing; a glob path is named by its whole text.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run fmt                         # on 514f053 (the head): no diff\n$ pixi run lint\nlint: PASS\n$ pixi run test -R '^plan\\.(ScopeTest|BindingTest|JoinOrderTest|LogicalPlanTest)'\n100% tests passed out of 49            # ANTB1-TESTS: PASS\n$ pixi run test -R '^exec\\.ComputeTest|^io\\.ParquetScanTest|^harness\\.ParquetDistinctCountOracle'\n100% tests passed out of 45            # ANTB1-TESTS: PASS\n$ pixi run check && pixi run ci-gcc\nlint: PASS\n100% tests passed out of 2294          # ci, and the same in ci-gcc\n$ pixi run check-full\nlint: PASS\n100% tests passed out of 2294          # ci (clang Debug -Werror)\n100% tests passed out of 2294          # asan (ASan + UBSan)\n                                       # tidy: clean\nCoverage gate: PASS                    # plan 96.27% lines / 91.78% branches; io 95.71 / 88.92; exec 97.41 / 88.73\n100% tests passed out of 2             # fuzz-smoke\n100% tests passed out of 2294          # ci-gcc\n```\n\nThe only skipped tests are the two metamorphic join relations\n(`star_join_commutes`, `star_join_order_three_tables`), which are\nskipped on main too and become active with J2b-2.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: the ADR 0022 update lines, in the approved plan\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code implemented the\nmaintainer-approved J2b-1 plan after a planning round of read-only\nmapping, design and adversarial critique agents that probed DuckDB\n1.5.6. Two reviewer agents then reviewed it from two angles: the join\norder and key casts; and the scope rules against DuckDB 1.5.6 with the\nsingle-table behaviour. Neither found a P0, P1 or P2. Their nine nits\nare fixed, among them overflow guards for 128-bit key ranges and a wrong\nalias hint for paths. A re-review of the fixes and a final pre-PR review\nfound no P0 or P1; their last nits are J2b-2 hand-offs, listed above.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-10-09T15:52:10+03:00",
+          "tree_id": "fe2447addb32c9d844d16871bc636a0df4dcf43d",
+          "url": "https://github.com/ydb-campus/antb1/commit/6fbe715b5f870904f585a985aef59f06a1f74da7"
+        },
+        "date": 1791550525668,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4993.235409784478,
+            "unit": "ns/iter",
+            "extra": "iterations: 139854\ncpu: 4992.226779355614 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84544.53308467913,
+            "unit": "ns/iter",
+            "extra": "iterations: 7239\ncpu: 84498.87000966983 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 221791.23717542875,
+            "unit": "ns/iter",
+            "extra": "iterations: 3158\ncpu: 221702.7881570615 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 436923.02186133346,
+            "unit": "ns/iter",
+            "extra": "iterations: 1601\ncpu: 436744.80199875083 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 347939.37574552506,
+            "unit": "ns/iter",
+            "extra": "iterations: 2012\ncpu: 347823.1167992049 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2090455.5119047347,
+            "unit": "ns/iter",
+            "extra": "iterations: 336\ncpu: 2090237.2499999995 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 52.02806307692334,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 52.02483999999997 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 46.03592679999906,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 46.020518333333335 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 190.29788866666308,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 190.2777036666666 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.31719046938759,
+            "unit": "ms/iter",
+            "extra": "iterations: 49\ncpu: 14.314952020408146 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 22.268310516128878,
+            "unit": "ms/iter",
+            "extra": "iterations: 31\ncpu: 22.266920774193526 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 39.17911005555494,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 39.17151755555557 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 2.200673216560509,
+            "unit": "ms/iter",
+            "extra": "iterations: 314\ncpu: 2.2003971687898063 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 101.6142212857127,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 101.5904282857143 ms\nthreads: 1"
           }
         ]
       }
