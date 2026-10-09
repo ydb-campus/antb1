@@ -406,6 +406,11 @@ Proposed
       the probe batch, slices with new selection bits (none when the window keeps every row; a window that keeps
       none is skipped), and their output is the probe's own schema. A one-row join's windows are slices of the probe
       batch with its selection, and its build row's values sliced.
+    - Update (2026-10-09, E2b): a left join without residuals over a unique build keeps the probe batch with its own
+      selection (a window without a selected row is skipped, one without a match is not) and gathers the build's
+      columns by match, NULL for a padded row. With residuals, or over repeated keys, it emits batches of at most
+      `batch_size` slots, each a (probe row, match) pair or a padded row, the probe's columns taken and the build's
+      gathered.
   - Rows keep the probe side's part and row order, and a probe row's matches come in the build's (part, row) order.
     Every sink above merges as it does today, and answers are byte-identical for any thread count.
 - **NULL keys never match,** on either side: the build does not insert them, and a probe row with a NULL key has
@@ -426,6 +431,16 @@ Proposed
     depend on it, since these joins read only whether a key has a match. Their residuals run with E2b; until then a
     semi or anti join with residuals exits 4. A null-aware anti join of other than one key, and residuals on a
     null-aware anti or a one-row join, are `Invalid`: no planned producer makes them.
+  - Update (2026-10-09, E2b): the residuals of semi, anti and left joins are evaluated by their probe with
+    `exec::EvaluateExpr`, not the filter's `PredicateEvaluator`, on candidate pairs (a probe row and a build row of
+    its key) gathered in chunks of at most `batch_size` pairs: in the order written, each on the pairs the ones
+    before it passed (NULL counts as false), and on every pair, without stopping at a row's first passing pair, so
+    whether an error comes does not depend on the batch size. The order is antb1's rule, the same as for an inner
+    join's residuals and for the arguments of `AND`; it is not a claim about DuckDB, which may reorder conjunctions by
+    its cost model (divergence D16). A semi or anti join ORs the results of a probe row's pairs; a left join emits the
+    passing pairs and pads a row none of whose candidates passed once, right after its last candidate, whatever chunk
+    that falls in. A row without candidates never meets a residual: an anti join keeps it, a left join pads it. No
+    join kind exits 4 in exec any more.
 - **One build feeds one probe pipeline,** until a later ADR. Nothing else is buffered for reuse: a table or sub-plan
   read twice is computed twice (ADR 0013).
 - **Memory.** A build's Arrow buffers come from the budget's pool, and its own containers are charged through
