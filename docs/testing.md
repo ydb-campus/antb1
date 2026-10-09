@@ -125,6 +125,11 @@ each table's rows. `tests/slt/tables.txt` declares the references between the ta
 ([tests/slt/README.md](../tests/slt/README.md#layout)), along which the random differential test joins them, and the
 `harness.StarSchema.*` tests pin the properties that the join tests rely on.
 
+The fixtures carry no distinct-count hints, since parquet-cpp writes none. `harness.ParquetDistinctCountOracle.*` has
+DuckDB write a file of its own under the test's temporary directory (single-threaded, without extension autoloading)
+and checks that `io::ParquetTable::part_distinct_count` reads exactly the counts that DuckDB's `parquet_metadata`
+reports for each part and field.
+
 `harness.fixtures.digest` compares the generated files with `tests/fixtures/fixtures.digest`, a logical digest
 (schema, row groups and values; not compression or page layout), on every leg, macOS included. It skips the
 top-level `tpch/` directory, where the data derived from TPC-H is generated at test time. After an intended

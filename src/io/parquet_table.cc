@@ -629,6 +629,28 @@ std::optional<plan::PartStats> ParquetTable::part_stats(int64_t part, int field)
   }
 }
 
+std::optional<int64_t> ParquetTable::part_distinct_count(int64_t part, int field) const {
+  if (part < 0 || part >= num_parts() || field < 0 || field >= schema_->num_fields()) {
+    return std::nullopt;
+  }
+  const int leaf = leaf_of_field_[Narrow<std::size_t>(field)];
+  if (leaf < 0) {
+    return std::nullopt;  // a nested field: no single column chunk
+  }
+  const Part& p = parts_[Narrow<std::size_t>(part)];
+  try {
+    const std::shared_ptr<parquet::Statistics> stats =
+        metadata_[p.file]->RowGroup(p.row_group)->ColumnChunk(leaf)->statistics();
+    // statistics() is null when there are none or the writer is known to get them wrong.
+    if (stats == nullptr || !stats->HasDistinctCount() || stats->distinct_count() < 0) {
+      return std::nullopt;
+    }
+    return stats->distinct_count();
+  } catch (const std::exception&) {
+    return std::nullopt;  // no usable statistics: no hint
+  }
+}
+
 arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> ParquetTable::DoScanPart(
     int64_t part, const std::vector<int>& fields, int64_t batch_size,
     arrow::MemoryPool* pool) const {

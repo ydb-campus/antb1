@@ -46,7 +46,10 @@ Responsibilities:
   read at `Open` are kept and reused by every scan; a file whose size or footer bytes changed since is an
   `IOError`. The table's parts (`plan::Table::num_parts`, `part_rows`, `ScanPart`), the units of parallel work of
   [ADR 0013](adr/0013-parallel-execution.md), are its row groups with rows in file order; scanning them one after
-  another gives the rows of `Scan`. Other tables are one part by default. A part can also be scanned with a
+  another gives the rows of `Scan`. Other tables are one part by default. A part's footer statistics are the exact
+  min, max and NULL count of an integer-valued column (`part_stats`, for skipping parts) and the distinct count a
+  writer stored for a column (`part_distinct_count`, a hint for the join order: DuckDB stores one for each
+  dictionary-encoded column chunk, parquet-cpp none). A part can also be scanned with a
   `plan::ScanFilter` (filter pushdown, [ADR 0020](adr/0020-filter-pushdown.md)): for flat integer, DATE, DOUBLE and
   VARCHAR columns (`supports_scan_filter`), `src/io/filtered_scan.cc` reads the row group through Parquet's column
   readers, applies the filter to the filter's columns as it decodes them (strings as views into the decoded pages,

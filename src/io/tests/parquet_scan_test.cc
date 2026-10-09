@@ -963,5 +963,51 @@ TEST_F(ParquetScanTest, PartStatisticsOfIntegerColumns) {
   EXPECT_FALSE((*plain)->part_stats(0, 0).has_value());
 }
 
+// parquet-cpp stores no distinct counts, not even for the dictionary-encoded chunks it writes by
+// default, so its files give no distinct-count hints; nor do a nested field, a file without
+// statistics, or a part or field out of range. The hints DuckDB writes are compared with DuckDB
+// itself (harness.ParquetDistinctCountOracle).
+TEST_F(ParquetScanTest, NoDistinctCountHints) {
+  std::vector<std::optional<int64_t>> keys;
+  std::vector<std::optional<std::string>> labels;
+  for (int64_t i = 0; i < 10; ++i) {
+    keys.emplace_back(i % 3);
+    labels.push_back(i % 4 == 0 ? std::nullopt : std::optional("v" + std::to_string(i % 5)));
+  }
+  const auto x = Build<arrow::Int32Builder, int32_t>(std::vector<int32_t>(10, 7));
+  auto nested = arrow::StructArray::Make({x}, std::vector<std::string>{"x"});
+  ASSERT_TRUE(nested.ok()) << nested.status().ToString();
+  const auto data = arrow::Table::Make(
+      arrow::schema({arrow::field("st", (*nested)->type()), arrow::field("k", arrow::int64()),
+                     arrow::field("label", arrow::utf8())}),
+      {*nested, Build<arrow::Int64Builder, int64_t>(keys),
+       Build<arrow::StringBuilder, std::string>(labels)});
+  const std::string path = Write("hints.parquet", data, 4);
+  const std::string bare = (dir_ / "bare.parquet").string();
+  {
+    auto out = arrow::io::FileOutputStream::Open(bare);
+    ASSERT_TRUE(out.ok());
+    const auto properties = parquet::WriterProperties::Builder().disable_statistics()->build();
+    ASSERT_TRUE(
+        parquet::arrow::WriteTable(*data, arrow::default_memory_pool(), *out, 4, properties).ok());
+    ASSERT_TRUE((*out)->Close().ok());
+  }
+  for (const std::string& file : {path, bare}) {
+    auto table = ParquetTable::Open({file});
+    ASSERT_TRUE(table.ok()) << table.status().ToString();
+    ASSERT_EQ((*table)->num_parts(), 3);
+    for (int64_t part = -1; part <= 3; ++part) {
+      for (int field = -1; field <= 3; ++field) {
+        EXPECT_EQ((*table)->part_distinct_count(part, field), std::nullopt)
+            << file << ": part " << part << ", field " << field;
+      }
+    }
+  }
+  // The file does have statistics: the hints are missing, not the statistics.
+  auto table = ParquetTable::Open({path});
+  ASSERT_TRUE(table.ok()) << table.status().ToString();
+  EXPECT_TRUE((*table)->part_stats(0, 1).has_value());
+}
+
 }  // namespace
 }  // namespace antb1::io

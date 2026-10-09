@@ -132,6 +132,16 @@ class Table {
     return std::nullopt;
   }
 
+  // The number of distinct non-NULL values of top-level field `field` in part `part` that the
+  // writer recorded (Parquet's distinct_count, which DuckDB stores for dictionary-encoded column
+  // chunks), if any: a hint for the join order's estimates (ADR 0022), never used for an answer.
+  // std::nullopt by default and for a part or field out of range.
+  virtual std::optional<int64_t> part_distinct_count(int64_t part, int field) const {
+    static_cast<void>(part);
+    static_cast<void>(field);
+    return std::nullopt;
+  }
+
   // Whether top-level field `field` (engine type DOUBLE) is stored as FLOAT and widened on read.
   // The binder compares such a column with a number the way DuckDB compares a FLOAT column
   // (plan::DuckDbFloatOf).

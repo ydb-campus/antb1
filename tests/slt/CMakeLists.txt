@@ -63,14 +63,15 @@ antb1_add_gtest(
 target_include_directories(antb1_slt_tests PRIVATE "${PROJECT_SOURCE_DIR}/fuzz")
 if(ANTB1_HAVE_DUCKDB)
   # Against the DuckDB library: plan::DuckDbFloatOf on seeded random literals, long runs of ties, the
-  # adapter's DECIMAL columns, the keywords DuckDB reads as table aliases and DuckDB's reading of
-  # generated joins.
+  # adapter's DECIMAL columns, the keywords DuckDB reads as table aliases, DuckDB's reading of
+  # generated joins and the distinct counts DuckDB writes into Parquet footers.
   target_sources(
     antb1_slt_tests
     PRIVATE
       tests/duckdb_engine_test.cc
       tests/float_literal_oracle_test.cc
       tests/ordered_compare_oracle_test.cc
+      tests/parquet_hints_oracle_test.cc
       tests/query_gen_oracle_test.cc
       tests/table_alias_oracle_test.cc
   )
