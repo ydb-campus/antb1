@@ -657,9 +657,11 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT i16 FROM t ORDER BY strlen(s::VARCHAR, 1)", kBind,
                   "strlen(s::VARCHAR, 1)", "strlen() takes 1 argument, not 2"}));
 
-// FROM lists, joins, aliases and qualified names parse (ADR 0022) and are kUnsupported until the
-// binder answers them (J2b): before any name is resolved, so also over tables that do not exist,
-// at the first one in query order (select list, FROM, WHERE, GROUP BY, HAVING, ORDER BY).
+// FROM lists and joins parse (ADR 0022) and are kUnsupported until the binder answers them: before
+// any name is resolved, so also over tables that do not exist, at the first one in query order
+// (select list, FROM, WHERE, GROUP BY, HAVING, ORDER BY). Aliases and qualified names bind over one
+// FROM item from J2b-2 on, so they appear here only where the name itself is the error;
+// QualifiedNamesAndAliasesBind covers the ones that answer.
 INSTANTIATE_TEST_SUITE_P(
     FromLists, BindErrorTest,
     ::testing::Values(
@@ -677,48 +679,29 @@ INSTANTIATE_TEST_SUITE_P(
                   "LEFT OUTER JOIN", "LEFT JOIN is not supported"},
         ErrorCase{"SELECT i16 FROM nope LEFT JOIN missing ON a = b", kUnsupported, "LEFT JOIN",
                   "LEFT JOIN is not supported"},
-        ErrorCase{"SELECT i16 FROM t AS a", kUnsupported, "AS a",
-                  "table aliases are not supported"},
-        ErrorCase{"SELECT COUNT(*) FROM nope n", kUnsupported, "n",
-                  "table aliases are not supported"},
-        ErrorCase{"SELECT COUNT(*) FROM 'x.parquet' AS 'p'", kUnsupported, "AS 'p'",
-                  "table aliases are not supported"},
-        ErrorCase{"SELECT COUNT(*) FROM t over", kUnsupported, "over",
-                  "table aliases are not supported"},
-        // Qualified names, wherever a column may stand.
-        ErrorCase{"SELECT t.i16 FROM t", kUnsupported, "t.i16",
-                  "qualified column names (t.x) are not supported"},
-        ErrorCase{"SELECT SUM(t.i16) FROM t", kUnsupported, "t.i16",
-                  "qualified column names (t.x) are not supported"},
-        ErrorCase{R"(SELECT COUNT(DISTINCT "t".i16) FROM t)", kUnsupported, R"("t".i16)",
-                  "qualified column names"},
-        ErrorCase{"SELECT strlen(t.s) FROM t", kUnsupported, "t.s", "qualified column names"},
-        ErrorCase{"SELECT i16 + t.i32, -t.i64 FROM t", kUnsupported, "t.i32",
-                  "qualified column names"},
-        ErrorCase{"SELECT EXTRACT(year FROM t.dt) FROM t", kUnsupported, "t.dt",
-                  "qualified column names"},
-        ErrorCase{"SELECT CASE WHEN t.i16 = 1 THEN 2 END FROM t", kUnsupported, "t.i16",
-                  "qualified column names"},
-        ErrorCase{"SELECT CASE i16 WHEN 1 THEN t.s END FROM t", kUnsupported, "t.s",
-                  "qualified column names"},
-        ErrorCase{"SELECT COUNT(*) FROM t WHERE t.i16 = 1", kUnsupported, "t.i16",
-                  "qualified column names"},
+        // An alias no longer hides the reference it renames: the name behind it is resolved, and
+        // fails where it would without one.
+        ErrorCase{"SELECT COUNT(*) FROM nope n", kBind, "nope", "table 'nope' does not exist"},
+        ErrorCase{"SELECT COUNT(*) FROM 'x.parquet' AS 'p'", kUnsupported, "'x.parquet'",
+                  "file paths in FROM are not enabled in this session"},
+        // A qualified name resolves among the bindings it names (rules 2 and 3), so it is an error
+        // only where the name is: a binding without the column, or no binding of the name.
+        ErrorCase{"SELECT u.i16 FROM t", kBind, "u.i16", "no FROM item is named 'u'"},
+        ErrorCase{"SELECT t.nope FROM t", kBind, "t.nope", "'t' has no column 'nope'"},
+        ErrorCase{"SELECT i16 FROM t AS a WHERE t.i16 = 1", kBind, "t.i16",
+                  "no FROM item is named 't' (the alias 'a' hides it)"},
+        // A select alias is no binding, so a qualified name never finds one, in ORDER BY, GROUP BY
+        // or HAVING (DuckDB errors there too).
+        ErrorCase{"SELECT i16 AS x FROM t ORDER BY t.x", kBind, "t.x", "'t' has no column 'x'"},
+        ErrorCase{"SELECT i16 AS x FROM t GROUP BY t.x", kBind, "t.x", "'t' has no column 'x'"},
+        ErrorCase{"SELECT MAX(i16) AS x FROM t HAVING t.x > 1", kBind, "t.x",
+                  "'t' has no column 'x'"},
+        // A qualifier no longer masks the rule that does reject the expression: LIKE's pattern and
+        // an IN list's elements must be literals, qualified or not.
         ErrorCase{"SELECT COUNT(*) FROM t WHERE s LIKE t.s", kUnsupported, "t.s",
-                  "qualified column names"},
+                  "LIKE with a column or an aggregate as the pattern is not supported"},
         ErrorCase{"SELECT COUNT(*) FROM t WHERE i16 IN (1, t.i16)", kUnsupported, "t.i16",
-                  "qualified column names"},
-        ErrorCase{"SELECT COUNT(*) FROM t WHERE i16 BETWEEN t.i32 AND 2", kUnsupported, "t.i32",
-                  "qualified column names"},
-        ErrorCase{"SELECT COUNT(*) FROM t WHERE i16 = 1 OR NOT t.i32 > 2", kUnsupported, "t.i32",
-                  "qualified column names"},
-        ErrorCase{"SELECT i16 FROM t GROUP BY t.i16", kUnsupported, "t.i16",
-                  "qualified column names"},
-        ErrorCase{"SELECT i16 FROM t GROUP BY i16 HAVING MAX(t.i32) > 1", kUnsupported, "t.i32",
-                  "qualified column names"},
-        ErrorCase{"SELECT i16 FROM t ORDER BY t.i16", kUnsupported, "t.i16",
-                  "qualified column names"},
-        ErrorCase{"SELECT i16 AS x FROM t ORDER BY t.x", kUnsupported, "t.x",
-                  "qualified column names"},
+                  "only literals are supported in an IN list"},
         // A call with the wrong number of arguments stays a bind error whatever its arguments
         // (CheckSupported does not look into them, and the binder reports the arity before it
         // binds one).
@@ -731,11 +714,12 @@ INSTANTIATE_TEST_SUITE_P(
         // Query order.
         ErrorCase{"SELECT lower(s), t.i16 FROM t, u", kUnsupported, "lower",
                   "function lower() is not supported"},
-        ErrorCase{"SELECT t.i16 FROM t, u", kUnsupported, "t.i16", "qualified column names"},
+        ErrorCase{"SELECT t.i16 FROM t, u", kUnsupported, ",",
+                  "a FROM list of several tables is not supported"},
         ErrorCase{"SELECT nope FROM t, u WHERE lower(s) = 'x'", kUnsupported, ",",
                   "a FROM list of several tables is not supported"},
-        ErrorCase{"SELECT i16 FROM t AS a, u", kUnsupported, "AS a",
-                  "table aliases are not supported"},
+        ErrorCase{"SELECT i16 FROM t AS a, u", kUnsupported, ",",
+                  "a FROM list of several tables is not supported"},
         ErrorCase{"SELECT i16 FROM t JOIN u ON lower(t.s) = u.s WHERE lower(s) = 'x'", kUnsupported,
                   "JOIN", "JOIN ... ON is not supported"},
         ErrorCase{"SELECT i16 FROM t WHERE lower(s) = 'x' GROUP BY t.i16", kUnsupported, "lower",
@@ -765,8 +749,8 @@ INSTANTIATE_TEST_SUITE_P(
         // or the join before a later derived table, and the WITH list before all of them.
         ErrorCase{"SELECT lower(s) FROM (SELECT s FROM t)", kUnsupported, "lower",
                   "function lower() is not supported"},
-        ErrorCase{"SELECT x.i16 FROM (SELECT i16 FROM t) x", kUnsupported, "x.i16",
-                  "qualified column names"},
+        ErrorCase{"SELECT x.i16 FROM (SELECT i16 FROM t) x", kUnsupported, "(",
+                  "subqueries in FROM are not supported"},
         ErrorCase{"SELECT i16 FROM (SELECT i16 FROM t) AS a", kUnsupported, "(",
                   "subqueries in FROM are not supported"},
         ErrorCase{"SELECT nope FROM (SELECT i16 FROM t) WHERE lower(s) = 'x'", kUnsupported, "(",
@@ -783,6 +767,60 @@ INSTANTIATE_TEST_SUITE_P(
         // binds: a derived table is rejected first.
         ErrorCase{"SELECT strlen(s, 1) FROM (SELECT s FROM t)", kUnsupported, "(",
                   "subqueries in FROM are not supported"}));
+
+// Rules 1, 2 and 6 of ADR 0022 over one FROM item: an alias names the binding, a qualified name
+// resolves in the binding it names (ASCII case-insensitively, quoted or not), and a result name
+// keeps the qualifier as written, each part quoted as DuckDB quotes an aggregate's argument. A
+// plain column select item keeps its declared name, not the text as written.
+TEST(BinderTest, QualifiedNamesAndAliasesBind) {
+  const Catalog catalog = MakeCatalog();
+  struct Case {
+    std::string_view sql;
+    std::string_view name;  // the first output column's name
+  };
+  for (const Case& c : {
+           Case{"SELECT t.i16 FROM t", "i16"},
+           Case{R"(SELECT "t".i16 FROM t)", "i16"},
+           Case{"SELECT T.I16 FROM t", "i16"},
+           Case{"SELECT a.i16 FROM t AS a", "i16"},
+           Case{"SELECT a.i16 FROM t a", "i16"},
+           // `over` is a legal implicit alias, but the parser takes a reserved word as a qualifier
+           // only quoted, so a reference to it needs the quotes.
+           Case{R"(SELECT "over".i16 FROM t over)", "i16"},
+           Case{"SELECT i16 FROM t AS a", "i16"},
+           Case{"SELECT COUNT(*) FROM t over", "count_star()"},
+           // Rule 6: the qualifier stays as written inside an expression's name.
+           Case{"SELECT SUM(t.i16) FROM t", "sum(t.i16)"},
+           Case{R"(SELECT SUM("t".i16) FROM t)", "sum(t.i16)"},  // a plain identifier, so unquoted
+           Case{R"(SELECT SUM(t."Mixed Case") FROM t)", R"(sum(t."Mixed Case"))"},
+           Case{R"(SELECT SUM("from".i16) FROM t AS "from")", R"(sum("from".i16))"},
+           Case{"SELECT i16 + t.i32 FROM t", "(i16 + t.i32)"},
+           Case{"SELECT -t.i64 FROM t", "-(t.i64)"},
+       }) {
+    auto plan = BindSql(c.sql, catalog);
+    ASSERT_TRUE(plan.ok()) << c.sql << ": " << plan.status().ToString();
+    ASSERT_EQ(plan->output.size(), 1U) << c.sql;
+    EXPECT_EQ(plan->output[0].name, c.name) << c.sql;
+  }
+  // Wherever else a column may stand, a qualified name binds as the unqualified one does.
+  for (const std::string_view sql : {
+           "SELECT strlen(t.s) FROM t",
+           R"(SELECT COUNT(DISTINCT "t".i16) FROM t)",
+           "SELECT EXTRACT(year FROM t.dt) FROM t",
+           "SELECT CASE WHEN t.i16 = 1 THEN 2 END FROM t",
+           "SELECT CASE i16 WHEN 1 THEN t.s END FROM t",
+           "SELECT COUNT(*) FROM t WHERE t.i16 = 1",
+           "SELECT COUNT(*) FROM t WHERE i16 BETWEEN t.i32 AND 2",
+           "SELECT COUNT(*) FROM t WHERE i16 = 1 OR NOT t.i32 > 2",
+           "SELECT i16 FROM t GROUP BY t.i16",
+           "SELECT i16 FROM t GROUP BY i16 HAVING MAX(t.i32) > 1",
+           "SELECT i16 FROM t ORDER BY t.i16",
+           "SELECT a.i16 FROM t AS a GROUP BY a.i16 ORDER BY a.i16",
+       }) {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+  }
+}
 
 TEST(BinderTest, TablesMatchCaseInsensitively) {
   const Catalog catalog = MakeCatalog();

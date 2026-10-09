@@ -114,6 +114,19 @@ std::string ArgumentName(std::string_view name) {
   return out + "\"";
 }
 
+// Rule 6 of ADR 0022: a column reference's name inside a result name, with its qualifier as
+// written, each part quoted by ArgumentName's rule (sum(t.i16), "Mixed Case"."from").
+std::string RefName(const sql::ColumnRef& ref) {
+  return ref.qualifier.empty() ? ArgumentName(ref.name)
+                               : ArgumentName(ref.qualifier) + "." + ArgumentName(ref.name);
+}
+
+// A column reference as the user wrote it, unquoted, for a message that echoes it back: `t.label`.
+// Unqualified it is the name alone, so every message of a single-table query is unchanged.
+std::string WrittenName(const sql::ColumnRef& ref) {
+  return ref.qualifier.empty() ? ref.name : ref.qualifier + "." + ref.name;
+}
+
 // DuckDB's name of a literal inside an expression: numbers as their value (a DECIMAL as its value
 // prints, 007.50 as 7.50; a DOUBLE as written), strings quoted.
 std::string LiteralName(const sql::Literal& lit) {
@@ -349,7 +362,7 @@ std::string TypeText(const sql::CastExpr& cast) {
 // DuckDB's name of an expression of the binder's subset: (a + 1), -(a), sum((a + 1)); conditions
 // as ((a = 1) OR (b != 2) OR (c IN (1, 2))).
 struct ExprNameOf {
-  std::string operator()(const sql::ColumnRef& ref) const { return ArgumentName(ref.name); }
+  std::string operator()(const sql::ColumnRef& ref) const { return RefName(ref); }
   std::string operator()(const sql::Literal& lit) const {
     if (lit.kind == sql::Literal::Kind::kDate) {
       return "CAST('" + lit.text + "' AS \"DATE\")";
@@ -524,12 +537,9 @@ constexpr const char* kConditionsOnly =
     " is only supported in conditions (WHERE, HAVING and CASE WHEN)";
 
 struct FirstUnsupportedOf {
-  // Qualified names resolve once FROM lists do (J2b in ADR 0022).
-  std::optional<Rejection> operator()(const sql::ColumnRef& column) const {
-    if (!column.qualifier.empty()) {
-      return Rejection{.span = column.span,
-                       .message = "qualified column names (t.x) are not supported"};
-    }
+  // A qualified name is no rejection: the scope resolves it among the bindings it names, and says
+  // so when none does (rules 1 to 3 of ADR 0022).
+  std::optional<Rejection> operator()(const sql::ColumnRef& /*column*/) const {
     return std::nullopt;
   }
   std::optional<Rejection> operator()(const sql::Literal& /*lit*/) const { return std::nullopt; }
@@ -1979,14 +1989,14 @@ class Binder {
     Binder& binder;
 
     arrow::Result<Typed> operator()(const sql::ColumnRef& ref) const {
-      auto resolved = binder.scope_.Resolve(ref);
+      auto resolved = binder.Resolve(ref);
       if (!resolved.ok() && binder.shape_ == Shape::kProjection) {
         if (auto alias = binder.AliasFallback(ref, resolved.status())) {
           return *std::move(alias);
         }
       }
       ARROW_ASSIGN_OR_RAISE(BoundColumn column, std::move(resolved));
-      return ColumnLeaf(column.id, column.type, ArgumentName(ref.name),
+      return ColumnLeaf(column.id, column.type, RefName(ref),
                         binder.scope_.StoredAsFloat(column.id));
     }
     arrow::Result<Typed> operator()(const sql::Literal& lit) const { return LiteralOperand(lit); }
@@ -2300,14 +2310,14 @@ class Binder {
     Binder& binder;
 
     arrow::Result<Typed> operator()(const sql::ColumnRef& ref) const {
-      auto resolved = binder.scope_.Resolve(ref);
+      auto resolved = binder.Resolve(ref);
       if (!resolved.ok()) {
         if (auto alias = binder.AliasFallback(ref, resolved.status())) {
           return *std::move(alias);
         }
         return resolved.status();
       }
-      return NotGrouped(ref.name, ref.span);
+      return NotGrouped(WrittenName(ref), ref.span);
     }
     arrow::Result<Typed> operator()(const sql::Literal& lit) const { return LiteralOperand(lit); }
     arrow::Result<Typed> operator()(const sql::AggregateCall& call) const {
@@ -2430,15 +2440,16 @@ class Binder {
   arrow::Result<std::optional<Typed>> ItemOutput(std::size_t i);
 
   // Inside an ORDER BY or HAVING expression a name that is no table column is the last select item
-  // with that alias, as in DuckDB (a table column comes first there). std::nullopt: no such alias,
-  // or not in such an expression.
+  // with that alias, as in DuckDB (a table column comes first there). A qualified name (t.x) never
+  // names an alias, as in DuckDB: its bind error stands. std::nullopt: no such alias, a qualified
+  // name, or not in such an expression.
   std::optional<arrow::Result<Typed>> AliasFallback(const sql::ColumnRef& ref,
                                                     const arrow::Status& resolved) {
     const auto detail = GetSqlError(resolved);
-    if (!alias_fallback_ || detail == nullptr || detail->kind() != SqlErrorDetail::Kind::kBind) {
+    if (!alias_fallback_ || !ref.qualifier.empty() || detail == nullptr ||
+        detail->kind() != SqlErrorDetail::Kind::kBind) {
       return std::nullopt;
     }
-    // J2b must skip this lookup for a qualified ref: DuckDB errors there.
     const auto alias = FindAlias(select_, ref.name);
     if (!alias.has_value()) {
       return std::nullopt;
@@ -2471,10 +2482,18 @@ class Binder {
 
   bool alias_fallback_ = false;  // binding an ORDER BY or HAVING expression
 
+  // Every name resolves through here, so that no clause can forget the visibility it binds in: an
+  // ON sees only its own join group and the comma siblings before it (rule 10 of ADR 0022), every
+  // other clause every binding. `visible_` holds the ON's while its conjuncts bind.
+  [[nodiscard]] arrow::Result<BoundColumn> Resolve(const sql::ColumnRef& ref) const {
+    return scope_.Resolve(ref, visible_);
+  }
+
   LogicalPlan Assemble();
 
   const sql::SelectStatement& stmt_;
   Scope scope_;
+  Visibility visible_;  // the clause being bound (the default: every binding, in one level)
   ColumnIdSource& ids_;
   SelectList select_;
   Shape shape_ = Shape::kProjection;
@@ -2550,13 +2569,13 @@ arrow::Status Binder::BindSelectList() {
       continue;
     }
     if (const auto* ref = std::get_if<sql::ColumnRef>(&item.expr)) {
-      ARROW_ASSIGN_OR_RAISE(BoundColumn column, scope_.Resolve(*ref));
+      ARROW_ASSIGN_OR_RAISE(BoundColumn column, Resolve(*ref));
       // DuckDB names a plain column by its declared name, not as written.
       list.output.push_back(
           plan::OutputColumn{.name = item.alias.value_or(column.name), .type = column.type});
       list.items.emplace_back(ItemKind::kColumn, list.columns.size());
       list.column_spans.push_back(ref->span);
-      list.column_written.push_back(ref->name);
+      list.column_written.push_back(WrittenName(*ref));
       list.columns.push_back(std::move(column));
       if (first_column == nullptr) {
         first_column = ref;
@@ -3416,7 +3435,7 @@ arrow::Status Binder::BindGroupBy() {
       continue;
     }
     if (const auto* ref = std::get_if<sql::ColumnRef>(&expr)) {
-      auto column = scope_.Resolve(*ref);
+      auto column = Resolve(*ref);
       if (column.ok()) {
         add(ColumnLeaf(column->id, column->type, column->name, false));
         continue;
@@ -3425,8 +3444,8 @@ arrow::Status Binder::BindGroupBy() {
       if (detail == nullptr || detail->kind() != SqlErrorDetail::Kind::kBind) {
         return column.status();
       }
-      // J2b must skip this lookup for a qualified ref: DuckDB errors there.
-      const auto alias = FindAlias(select_, ref->name);
+      // A qualified name never names a select alias, as in DuckDB: its bind error stands.
+      const auto alias = ref->qualifier.empty() ? FindAlias(select_, ref->name) : std::nullopt;
       if (!alias.has_value()) {
         return column.status();
       }
@@ -3509,15 +3528,15 @@ arrow::Result<std::optional<Typed>> Binder::ItemOutput(std::size_t i) {
 // that alias (DuckDB): a key, an aggregate or an expression. std::nullopt: bind it as any other
 // operand.
 arrow::Result<std::optional<Typed>> Binder::ResolveHavingName(const sql::ColumnRef& ref) {
-  auto table_column = scope_.Resolve(ref);
+  auto table_column = Resolve(ref);
   if (table_column.ok()) {
     if (const std::optional<std::size_t> k = KeyOf(table_column->id)) {
       return std::optional(ColumnLeaf(key_ids_[*k], table_column->type, table_column->name,
                                       scope_.StoredAsFloat(table_column->id)));
     }
   }
-  // J2b must skip this lookup for a qualified ref: DuckDB errors there.
-  const auto alias = FindAlias(select_, ref.name);
+  // A qualified name never names a select alias, as in DuckDB: it is bound as any other operand.
+  const auto alias = ref.qualifier.empty() ? FindAlias(select_, ref.name) : std::nullopt;
   if (!alias.has_value()) {
     return std::nullopt;
   }
@@ -3575,10 +3594,9 @@ arrow::Status Binder::BindHaving() {
 
 // ORDER BY items in the query's scope. kGlobal checks the items and returns no key: one row needs
 // no sort. A select alias comes before a table column, as in DuckDB, and a qualified name (t.x)
-// never names an alias: that guard is for J2b (ADR 0022), since until then CheckSupported rejects
-// a qualified ORDER BY item before the binder runs. An unsigned integer is a position in the select
-// list; a constant (a constant item, or any other literal) orders nothing; a later key on a column
-// already ordered by changes nothing and is dropped.
+// never names an alias, so it resolves among the bindings alone. An unsigned integer is a position
+// in the select list; a constant (a constant item, or any other literal) orders nothing; a later
+// key on a column already ordered by changes nothing and is dropped.
 arrow::Status Binder::BindOrderBy() {
   alias_fallback_ = true;
   for (const sql::OrderItem& item : stmt_.order_by) {
@@ -3590,7 +3608,7 @@ arrow::Status Binder::BindOrderBy() {
       }
     } else if (const auto* ref = std::get_if<sql::ColumnRef>(&item.expr);
                ref != nullptr && ref->qualifier.empty() &&
-               FindAlias(select_, ref->name).has_value()) {  // J2b: t.x never names an alias
+               FindAlias(select_, ref->name).has_value()) {  // t.x never names an alias
       const std::size_t alias = FindAlias(select_, ref->name).value_or(0);
       ARROW_ASSIGN_OR_RAISE(key, ItemOutput(alias));
     } else {
@@ -3895,16 +3913,13 @@ std::optional<Rejection> RejectDerivedTable(const sql::FromItem& item) {
   return Rejection{.span = open, .message = "subqueries in FROM are not supported"};
 }
 
-// The FROM list the binder answers: one table or path without an alias. The others parse (ADR
-// 0022) and are answered from J2b and J4 on: the first item's derived table or alias, else the
-// second item's connector.
+// The FROM list the binder answers: one table or path, with an alias or without. The others parse
+// (ADR 0022) and are answered from J2b-2 and J4 on: the first item's derived table, else the second
+// item's connector.
 std::optional<Rejection> RejectFromList(const std::vector<sql::FromItem>& from) {
   ANTB1_CHECK(!from.empty());  // the parser makes no statement without a FROM item
   if (auto r = RejectDerivedTable(from.front())) {
     return r;
-  }
-  if (const sql::FromItem& first = from.front(); first.alias.has_value()) {
-    return Rejection{.span = first.alias_span, .message = "table aliases are not supported"};
   }
   if (from.size() == 1) {
     return std::nullopt;
@@ -3961,6 +3976,17 @@ arrow::Status CheckSupported(const sql::SelectStatement& stmt) {
   return arrow::Status::OK();
 }
 
+// Rule 1 of ADR 0022: the name a qualified column reference uses for a FROM item's binding — its
+// alias, else a table's name as written, else a path's PathBindingName.
+std::string BindingName(const sql::FromItem& item) {
+  if (item.alias.has_value()) {
+    return *item.alias;
+  }
+  const sql::TableRef* table = item.table();
+  ANTB1_CHECK(table != nullptr);  // CheckSupported rejected derived tables
+  return table->kind == sql::TableRef::Kind::kPath ? PathBindingName(table->name) : table->name;
+}
+
 }  // namespace
 
 arrow::Result<LogicalPlan> Bind(const sql::SelectStatement& stmt, const Catalog& catalog) {
@@ -3972,9 +3998,12 @@ arrow::Result<LogicalPlan> Bind(const sql::SelectStatement& stmt, const Catalog&
   ARROW_ASSIGN_OR_RAISE(auto table, ResolveTable(*from, catalog));
   ColumnIdSource ids;
   std::vector<Binding> bindings;
-  bindings.push_back(Binding::OfTable(
-      from->name,
-      TableSource{.table = std::move(table), .table_name = from->name, .span = from->span}, ids));
+  bindings.push_back(Binding::OfTable(BindingName(folded.from.front()),
+                                      TableSource{.table = std::move(table),
+                                                  .table_name = from->name,
+                                                  .span = from->span,
+                                                  .kind = from->kind},
+                                      ids));
   Binder binder(folded, std::move(bindings), ids);
   ARROW_ASSIGN_OR_RAISE(LogicalPlan plan, binder.Bind());
   return ResolvePositions(plan);  // the binder refers to columns by id (ADR 0022)
