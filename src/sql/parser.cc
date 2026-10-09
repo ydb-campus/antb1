@@ -121,13 +121,15 @@ constexpr auto kReservedWords = std::to_array<std::string_view>({
 });
 static_assert(std::ranges::is_sorted(kReservedWords));
 
-// Statements other than SELECT (reported at their first keyword).
+// Statements other than SELECT (reported at their first keyword; PIVOT_WIDER and PIVOT_LONGER are
+// DuckDB's other names of PIVOT and UNPIVOT).
 constexpr auto kOtherStatements = std::to_array<std::string_view>({
-    "ALTER",    "ANALYZE", "ATTACH",   "BEGIN",    "CALL",   "CHECKPOINT", "COMMIT",    "COPY",
-    "CREATE",   "DELETE",  "DESCRIBE", "DETACH",   "DROP",   "EXECUTE",    "EXPLAIN",   "EXPORT",
-    "GRANT",    "IMPORT",  "INSERT",   "INSTALL",  "LOAD",   "MERGE",      "PIVOT",     "PRAGMA",
-    "PREPARE",  "RESET",   "REVOKE",   "ROLLBACK", "SET",    "SHOW",       "SUMMARIZE", "TABLE",
-    "TRUNCATE", "UNPIVOT", "UPDATE",   "USE",      "VACUUM", "VALUES",
+    "ALTER",   "ANALYZE",  "ATTACH",       "BEGIN",       "CALL",      "CHECKPOINT", "COMMIT",
+    "COPY",    "CREATE",   "DELETE",       "DESCRIBE",    "DETACH",    "DROP",       "EXECUTE",
+    "EXPLAIN", "EXPORT",   "GRANT",        "IMPORT",      "INSERT",    "INSTALL",    "LOAD",
+    "MERGE",   "PIVOT",    "PIVOT_LONGER", "PIVOT_WIDER", "PRAGMA",    "PREPARE",    "RESET",
+    "REVOKE",  "ROLLBACK", "SET",          "SHOW",        "SUMMARIZE", "TABLE",      "TRUNCATE",
+    "UNPIVOT", "UPDATE",   "USE",          "VACUUM",      "VALUES",
 });
 
 // Clauses that can follow the select list, the FROM list, the predicate or LIMIT. The join keywords
@@ -336,8 +338,9 @@ constexpr auto kFunctionKeywords =
 
 // The first words of a query in parentheses in FROM (a derived table), as DuckDB parses them; a
 // '(' starts one too, and so does what StartsOtherQuery tells.
-constexpr auto kSubqueryStarts = std::to_array<std::string_view>(
-    {"DESCRIBE", "PIVOT", "SELECT", "SHOW", "SUMMARIZE", "UNPIVOT", "WITH"});
+constexpr auto kSubqueryStarts =
+    std::to_array<std::string_view>({"DESCRIBE", "PIVOT", "PIVOT_LONGER", "PIVOT_WIDER", "SELECT",
+                                     "SHOW", "SUMMARIZE", "UNPIVOT", "WITH"});
 
 constexpr bool IsReservedWordOf(std::string_view word) {
   return std::ranges::binary_search(kReservedWords, word);

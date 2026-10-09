@@ -266,16 +266,17 @@ In `WITH` lists and nested queries, these are unsupported (exit code 4): `WITH R
 `NOT MATERIALIZED` and `USING KEY`; a string literal as a CTE name or a column alias (`WITH 'c' AS`, `s('x')`) and a
 trailing comma in a column alias list (`s(x,)`), which DuckDB accepts; a query in parentheses (in FROM or as a CTE's
 query) that starts with no `SELECT` or `WITH` (`(VALUES (1))`, `(FROM t)`, `(TABLE t)`, `(DESCRIBE t)`, `(SHOW t)`,
-`(SUMMARIZE t)`, `(PIVOT ...)`, `(UNPIVOT ...)` or `((SELECT ...))`, at its first token), also after a `WITH` list
-(`WITH c AS (...) FROM c`); and in a nested query `SELECT` without `FROM` (`(SELECT 1)`, which DuckDB answers), a
-trailing comma in its select list, FROM list or `GROUP BY`, and the clauses that are unsupported after a statement
-(`UNION`, `FETCH`, ...). A trailing comma in a nested `ORDER BY` (`(SELECT ... ORDER BY a,)`), `(SELECT 1;` and
-`MATERIALIZED` without `(` are unsupported where DuckDB gives a syntax error, and so is a string CTE name that a later
-CTE of its list repeats. Syntax errors (exit code 1), as in DuckDB: a `WITH` list without its query (`WITH c AS (...)`,
-also before `;` or `)`), a CTE without `AS` or its parentheses, a trailing comma in a `WITH` list, a second `WITH`
-list, an empty column alias list or one with a comma alone, a column alias list after a derived table without an alias
-(`FROM (...) (x)`) or after a second one, a repeated CTE name, `AT (...)` after a derived table, and `FROM (values)`
-(`values` is a name there: `FROM (values JOIN u ON ...)` is a join in parentheses).
+`(SUMMARIZE t)`, `(PIVOT ...)` and `(UNPIVOT ...)`, also written `PIVOT_WIDER` and `PIVOT_LONGER`, or `((SELECT ...))`,
+at its first token), also after a `WITH` list (`WITH c AS (...) FROM c`); and in a nested query `SELECT` without `FROM`
+(`(SELECT 1)`, which DuckDB answers), a trailing comma in its select list, FROM list or `GROUP BY`, and the clauses that
+are unsupported after a statement (`UNION`, `FETCH`, ...). A trailing comma in a nested `ORDER BY`
+(`(SELECT ... ORDER BY a,)`), `(SELECT 1;` and `MATERIALIZED` without `(` are unsupported where DuckDB gives a syntax
+error, and so is a string CTE name that a later CTE of its list repeats. Syntax errors (exit code 1), as in DuckDB: a
+`WITH` list without its query (`WITH c AS (...)`, also before `;` or `)`), a CTE without `AS` or its parentheses, a
+trailing comma in a `WITH` list, a second `WITH` list, an empty column alias list or one with a comma alone, a column
+alias list after a derived table without an alias (`FROM (...) (x)`) or after a second one, a repeated CTE name,
+`AT (...)` after a derived table, and `FROM (values)` (`values` is a name there: `FROM (values JOIN u ON ...)` is a join
+in parentheses).
 
 ## Binding
 
