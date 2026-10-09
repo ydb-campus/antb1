@@ -685,6 +685,31 @@ TEST(ParserTest, WithRecursiveOrACteNamedRecursive) {
   EXPECT_TRUE(keyed.error().message.starts_with("USING KEY is not supported"));
 }
 
+// The grammar's known gaps (docs/sql-subset.md): syntax errors where DuckDB answers. A nested query
+// parses by the rules of a statement, so they are syntax errors inside one too.
+TEST(ParserTest, KnownGapsAreSyntaxErrorsInNestedQueriesToo) {
+  for (const std::string_view query : {
+           "SELECT a FROM t LIMIT -(-5)"sv,
+           "SELECT a FROM t OFFSET -(-1)"sv,
+           "SELECT a FROM t LIMIT CASE WHEN true THEN 1 END"sv,
+           "SELECT a FROM t LIMIT 5 = 5"sv,
+           "SELECT a FROM t WHERE a IN (1,)"sv,
+           "SELECT a FROM t WHERE a IN [1, 2]"sv,
+           "SELECT a FROM t WHERE a BETWEEN ASYMMETRIC 1 AND 2"sv,
+           "SELECT MAP {'k': 1} FROM t"sv,
+           "SELECT x: 1 FROM t"sv,
+           "SELECT 1e FROM t"sv,
+       }) {
+    for (const std::string& sql : {std::string(query), std::format("SELECT * FROM ({}) s", query),
+                                   std::format("WITH c AS ({}) SELECT * FROM c", query)}) {
+      auto result = Parse(sql);
+      ASSERT_FALSE(result.has_value()) << sql;
+      EXPECT_EQ(result.error().kind, ParseError::Kind::kSyntax)
+          << sql << ": " << result.error().message;
+    }
+  }
+}
+
 struct OpCase {
   std::string_view name;
   std::string_view text;

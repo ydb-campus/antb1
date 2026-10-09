@@ -119,15 +119,16 @@ at its top-level `AND` chain like `WHERE`.
 
 Nested queries: a derived table (a query in parentheses in FROM) and the query of a common table expression (a CTE of a
 `WITH` list) are queries of their own. Each may start with a `WITH` list, which stands nowhere else, and its block
-places aggregates by the rules above afresh. A nested query is one level below the clauses around it, so it counts
-against the depth limit together with the expressions inside it: 256 derived tables, each in the FROM list of the next,
-parse, and so do 255 CTEs around `SELECT a FROM t`, whose select item is the 256th level. A column alias list follows a
-derived table's alias (`FROM (...) AS s(x, y)`) or a CTE's name (`WITH c(x, y) AS (...)`), and the parser takes it at
-any length. Within one `WITH` list the CTE names differ ASCII case-insensitively, as in DuckDB: a repeated one (`c` and
-`"C"`, also `'c'`, but not `E'c'` or `$$c$$`, which are unsupported first) is a syntax error at the repeated name,
-before its query is parsed, while a nested `WITH` list may reuse a name. Until the binder answers them (roadmap PR J4,
-[ADR 0022](adr/0022-joins-and-query-blocks.md)), it rejects a `WITH` list at its `WITH` and a derived table at its `(`
-with exit code 4, in query order (the `WITH` list first) and before any table resolves.
+places aggregates by the rules above afresh; it has the grammar's known gaps too (see below). A nested query is one
+level below the clauses around it, so it counts against the depth limit together with the expressions inside it: 256
+derived tables, each in the FROM list of the next, parse, and so do 255 CTEs around `SELECT a FROM t`, whose select item
+is the 256th level. A column alias list follows a derived table's alias (`FROM (...) AS s(x, y)`) or a CTE's name
+(`WITH c(x, y) AS (...)`), and the parser takes it at any length. Within one `WITH` list the CTE names differ ASCII
+case-insensitively, as in DuckDB: a repeated one (`c` and `"C"`, also `'c'`, but not `E'c'` or `$$c$$`, which are
+unsupported first) is a syntax error at the repeated name, before its query is parsed, while a nested `WITH` list may
+reuse a name. Until the binder answers them (roadmap PR J4, [ADR 0022](adr/0022-joins-and-query-blocks.md)), it rejects
+a `WITH` list at its `WITH` and a derived table at its `(` with exit code 4, in query order (the `WITH` list first) and
+before any table resolves.
 
 Lexical rules: an `identifier` is a letter or `_` followed by letters, digits or `_`, or any text in double quotes
 (`""` escapes a quote); a `string_literal` is text in single quotes (`''` escapes a quote); an `integer` is a
@@ -245,7 +246,10 @@ typed literals, also of quoted and qualified names of at most three parts (`LIMI
 (`LIMIT a`, `LIMIT t.a`) and a call or a typed literal of a longer name (`LIMIT a.b.c.d(1)`) are syntax errors, and
 DuckDB refuses them too. Known gaps:
 `LIMIT` and `OFFSET` expressions that start with `CASE`, `NOT` or a unary minus (`LIMIT -(-5)`) and conditions
-(`LIMIT 5 = 5`, `LIMIT 5 AND 3`) are syntax errors (exit code 1), although DuckDB answers them. In FROM:
+(`LIMIT 5 = 5`, `LIMIT 5 AND 3`) are syntax errors (exit code 1), although DuckDB answers them, and so are a trailing
+comma in an `IN` list (`a IN (1,)`), `IN` before a list (`a IN [1, 2]`), `BETWEEN ASYMMETRIC` (`asymmetric` is a
+name, divergence D21), `MAP {...}`, a prefix alias (`SELECT x: 1`) and an exponent without digits (`1e`, which DuckDB
+reads as `1 AS e`), also in a nested query. In FROM:
 `JOIN ... USING`, `NATURAL`, `RIGHT` and `FULL` joins, `SEMI`, `ANTI`, `ASOF` and `POSITIONAL`
 joins, nested joins (a `JOIN` before the `ON` of an earlier one) and joins in parentheses, `LATERAL` before a subquery
 or a table function (also one with a qualified name: `LATERAL main.range(3)`), `schema.table`, `ONLY`, table functions
