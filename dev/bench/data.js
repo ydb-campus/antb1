@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791560760154,
+  "lastUpdate": 1791575810424,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -6048,6 +6048,114 @@ window.BENCHMARK_DATA = {
             "value": 67.71545566666741,
             "unit": "ms/iter",
             "extra": "iterations: 9\ncpu: 67.65374000000001 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "8c4faeb8be06e901e0ac0188217b82927cf55c04",
+          "message": "feat(exec): left joins and residuals over candidate pairs (#111)\n\n## Summary\n\nRoadmap PR **E2b**, the second half of E2 ([ADR\n0022](docs/adr/0022-joins-and-query-blocks.md), \"Execution\"), and\nthe hand-off E2a (#109) left: residuals over candidate pairs for semi,\nanti and left joins, and left outer joins in\nthe probe. Every join kind now runs in `exec`, so **no join kind exits 4\nany more**.\n\nNo SQL reaches a join until J2b-2 and J6, so no query changes its\nanswer: `tests/data/tpch_status.json` stays\n`{\"pass\": [1, 6]}` and ClickBench stays at 43/43.\n\n**Left joins** (`hash_join.{h,cc}`), output = the probe's columns then\nthe build's (nullable):\n\n- **1:1 path** (`NextLeftWindow`), without residuals over a build of\nunique keys: each window of at most\n`batch_size` rows is a slice of the probe batch **with its own\nselection**, the build's columns gathered by match\nand NULL elsewhere. A window without a selected row is skipped; one\nwithout a match is not.\n- **Slot path** (`NextPadded`), with residuals or over repeated keys:\nbatches of at most `batch_size` slots, each a\n(probe row, match) pair or a padded row, the probe's columns taken and\nthe build's gathered, no selection.\n`NextSlots` numbers the slots of a probe batch from `(row_, taken_)` on;\na padded slot is marked by `kNoChunk` as\nits build row's chunk, and `last_` marks the slot of each row's last\ncandidate.\n- A row without a match is padded **once**, with NULLs of the build's\ntypes, a NULL key included.\n- A left join always reads its probe input: it is not in `EmptiesJoin`.\n\n**Residuals over candidate pairs** (semi, anti, left):\n\n- Evaluated by the probe with `exec::EvaluateExpr`, not the filter's\n`PredicateEvaluator`, on the candidate pairs (a\nprobe row and a build row of its key) in chunks of at most `batch_size`\npairs (`PairBatch`), each residual in the\n  order written on the pairs the ones before it passed (NULL is false).\n- **Every pair is evaluated**, with no early stop once a row has a\nmatch, so whether an error comes does not depend\non `batch_size` — unless a `Limit` above stops the probe before it reads\nevery row.\n- Semi and anti evaluate a probe batch's pairs before its first window\n(`EvaluatePairs` fills `passed_` per row); a\n  row matched when one of its pairs passed every residual.\n- A left join evaluates each batch of slots before it emits it\n(`PassingSlots`, then `KeepPassingOrPadded`): the\npairs that pass, and one padded row right after the last candidate of a\nrow none of whose candidates passed.\nWhether a row already had a passing pair carries across batches of slots\nin `row_passed_`.\n- A row **without** candidates never meets a residual: anti keeps it,\nleft pads it.\n\n**Candidate pairs carry only the columns the residuals read** (215849f):\n`pair_probe_`, `pair_build_` and\n`pair_schema_` are the columns the residuals read, the probe's then the\nbuild's, and `pair_residual_` is `residual_`\nrewritten over them. A left join then takes and gathers its *output's*\ncolumns separately, so the pruning never\nreaches the emitted rows.\n\n**Planner** (`physical_planner.{h,cc}`):\n\n- `NotRunYet` is deleted, and so is the Builder's LEFT rejection;\n`PipelineInput` now walks through a left join's\n  probe input, so a left join no longer ends a part pipeline.\n- `HashJoinOperator::Make` keeps as Invalid only what no plan holds:\nresiduals on a null-aware anti or a one-row\njoin, a non-inner kind building on the left, a keyless build on any kind\nbut one-row (and the reverse), a\nnull-aware anti join of other than one key, and keys or residuals that\nread outside the two inputs.\n- The public header comment in\n`src/exec/include/antb1/exec/physical_planner.h` drops the \"unsupported\nuntil E2b\"\n  clause; the only remaining outcome for a malformed join is Invalid.\n- No metric is new. A left join's probe always has `find` and `gather`,\n`window_rows` on its 1:1 path without\nresiduals; a semi, anti or left join with residuals adds `gather` for\nthe pair columns and `residual`.\n\n**Tests** (+1267 lines):\n\n- `exec.HashJoinTest` (+827): the left-join paths, padding across chunk\nboundaries, typed padding through\nresiduals, residual order and NULL-as-false, every-pair evaluation, and\nthe pair-column pruning.\n- `exec.MemoryLimitTest` (+38): the pair memory limits.\n- `exec.ProfileTest` (+45) and `exec.PhysicalPlannerTest` (+149/-121,\nthe kind and API churn of the removed\n  unsupported paths).\n- `integration.JoinTest` (+201): left joins and residuals over the star\nfiles.\n- `tests/slt/cases/joins/left.slt`: a pending J6 record for an `ON`\nconjunct across both sides.\n\n**Docs:** `docs/sql-subset.md` (the executor and the metric list per\nkind), `docs/architecture.md` (the\n`HashJoinOperator` table row and the probe/planner paragraphs),\n`docs/testing.md` (the J6 records the\n`integration.JoinTest` counts come from), ADR 0022 and ADR 0015 E2b\nupdate lines. `/docs/adr/` is a CODEOWNERS\npath; both ADRs stay `Proposed`.\n\n**From this PR's own review round** (the last two commits):\n\n- `perf(exec)`: `PassingSlots` sized the three candidate-pair vectors by\nthe slot count `NextSlots`\nreturned, but a left join's slots include its padded rows (`kNoChunk`),\nwhich the loop never writes. Each\nreserved and charged 4 + 8 + 4 bytes to the probe's reservation — up to\n1 MiB per probe part at the default\n`batch_size`, held at the high-water mark until the input's end, and\nwholly wasted when a chunk's slots were\nall padded. The candidates are now counted by the same test as the loop\nbefore the vectors are fit to them,\nand a chunk of only padded slots returns before it reserves anything.\nSemi and anti joins pad no row, so\ntheir counts were equal already. `PaddedSlotsTakeNoPairMemory` pins it\ndifferentially (the same left join\nwith the residual and without it, 4,096 probe rows that match nothing)\nand fails without the fix.\n- `test(exec)`: `AntiResidualsNeverRunOverAnEmptyBuildInput`. An anti\njoin over an empty build input keeps\nevery row (`Keep::kAll`), so the probe sizes no `matches_` and\n`NextOutput`'s guard must skip the residuals\n— evaluating them would walk a `matches_` that was never sized. Nothing\ncovered that guard, the only path\non which a join with residuals keeps all. The case's residual would\noverflow if it ever ran, and dropping\n  `keep_ != Keep::kAll` from the guard fails it.\n\n**Size:** +1859 / -350 (code +451, tests +1335, docs +73), 15 commits.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [x] perf: performance improvement (the padded-slot reservation, in\nthis PR's own new code)\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\nThis branch was written on a Linux host that was then lost, and verified\non macOS (osx-arm64, clang 23.1.2,\nArrow 25.0.0, pixi 0.81.0). It changes `exec` memory and ownership code\n— five new vectors charged through the\nshared `MemoryReservation` and two new non-owning `arrow::Buffer::Wrap`\nviews over member vectors — so AGENTS.md\nGolden rule 2 makes this a `pixi run check-full` PR, not just `pixi run\ncheck`. **Four of those legs cannot run on\nosx-arm64**, so neither `check` nor `check-full` is green locally and\nthe first checklist box is left unchecked.\nEvery leg that does run here is green; each one that does not fails\nidentically on `main`, in files this PR does\nnot touch. Details below, with a compensating run for each.\n\n```text\n$ pixi run ci                                  # clang 23.1.2 Debug -Werror, osx-arm64\n100% tests passed out of 2307\n# the only tests that did not run are metamorphic.Relations.Hold/star_join_commutes and\n# /star_join_order_three_tables, skipped on main too (they become active with J2b-2)\n\n$ pixi run coverage\nCoverage gate: PASS                            # exec 97.64% lines / 89.24% branches (floors 96.1 / 85.1)\n                                               # total 97.25% lines / 91.28% branches\n\n$ pixi run fmt                                 # no diff\n```\n\nLegs that cannot run on this host. Each reproduces on `main`, and none\nof the flagged code is in this diff:\n\n```text\n$ pixi run lint\nshellcheck (shell).......................................................Failed\n# 20+ SC2218 in tools/github/apply-settings.sh (last touched in #1). The osx-arm64 build of the\n# pinned shellcheck 0.11.0 flags what the linux-64 build of the same version does not; the CI\n# `lint (pixi run lint)` job is green on main. Identical failure on main.\n\n$ pixi run tidy\n# 4 TUs, none of them in this diff: src/exec/{profile,sort,group_table,grouped_aggregate_state}.cc\n#   bugprone-exception-escape       -- traced through libc++'s std::__throw_length_error\n#   bugprone-misplaced-widening-cast -- int64_t is `long long` on Darwin, `long` on linux-64\n# Both are libc++/Darwin diagnoses. Identical failure on main.\n\n$ pixi run asan\n# Two independent macOS blockers, both pre-existing:\n# (1) LeakSanitizer reports a 64-byte allocation inside macOS libdispatch (dispatch_apply ->\n#     _dispatch_continuation_alloc_from_heap) while antb1_plan_tests merely lists its tests, so\n#     every test exits 1. tools/sanitizers/lsan.supp has no entries (\"ask a human first\" path).\n# (2) exec.ForEachBadAllocTest.AnExceptionLeavesOnlyOnceTheTasksHaveEnded\n#     (src/exec/tests/bad_alloc_test.cc, not in this diff) DEADLOCKS in the ASan build: five\n#     threads parked in std::condition_variable::wait at 0% CPU for 45 min (sampled stack:\n#     __psynch_cvwait <- _pthread_cond_wait <- condition_variable::wait <- the test's own task\n#     lambda, via exec::ForEach / partition_lanes.cc). The same test passes in 2 ms in the Debug\n#     build with the same preset environment, so it is ASan-specific; under ctest it would be a\n#     120 s TIMEOUT. The linux-64 clang-asan CI job is green on main.\n\n$ pixi run fuzz-smoke\n# LeakSanitizer reports 56 bytes leaked in libFuzzer's own fuzzer::StartRssThread\n# (FuzzerDriver.cpp:326 -> libc++ std::__thread_struct). No antb1 frame, and no leak-* artifact.\n\n$ pixi run ci-gcc                              # linux-64 only (pixi.toml: feature.gcc platforms)\n```\n\nCompensating runs for those four, on this host:\n\n```text\n# ASan + UBSan over the new code, with leak detection off (the only part LSan cannot do here).\n# This is the leg that matters for this diff: it is what would catch a dangling Buffer::Wrap view\n# or a MemoryReservation not released on an error return.\n$ ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:detect_stack_use_after_return=1:strict_string_checks=1:\\\ncheck_initialization_order=1 ./build/ci-asan/bin/antb1_exec_tests\n[  PASSED  ] 270 tests.                        # including both tests this PR's review round added\n# antb1_exec_bad_alloc_tests could NOT be run under ASan: it deadlocks in the unrelated\n# ForEachBadAllocTest case above. It passes in the Debug build, inside the 2307 of `pixi run ci`.\n\n# clang-tidy over the two source files this PR changes:\n$ clang-tidy -p build/tidy --warnings-as-errors='*' src/exec/hash_join.cc src/exec/physical_planner.cc\n# no findings (4092 suppressed, all in non-user code); the branch adds no NOLINT\n\n# the fuzz smoke run, same seed, runs and dictionary, with leak detection off:\n$ ./build/fuzz/bin/antb1-sql-parser-fuzzer -seed=1 -runs=200000 -dict=fuzz/sql.dict -timeout=10 \\\n    -rss_limit_mb=2048 -detect_leaks=0 ...\nDone 200000 runs in 5 second(s)                # no crash, OOM or timeout; no artifact written\n```\n\nThree notes for the maintainer, all about running the gates on osx-arm64\nand none caused by this PR:\n\n- `tools/sanitizers/lsan.supp` has no entries, so `pixi run asan` and\n`pixi run fuzz-smoke` cannot pass on macOS.\nA `leak:_dispatch_` entry and one for libFuzzer's `StartRssThread` would\nmake both runnable; it is an\n\"ask a human first\" path, so this is a request, not a change in this PR.\n- `exec.ForEachBadAllocTest.AnExceptionLeavesOnlyOnceTheTasksHaveEnded`\ndeadlocks under ASan on osx-arm64 (and\nonly there). Worth a look on its own: it is a test about what\n`exec::ForEach` leaves behind when a task throws,\nand ASan changing the thread interleaving is enough to park every task\nin its condition variable.\n- `gtest_discover_tests` uses the default 5 s `DISCOVERY_TIMEOUT` with\n`DISCOVERY_MODE PRE_TEST`\n(`cmake/Antb1Testing.cmake:21`). On macOS the first exec of a freshly\nlinked binary is scanned by the OS:\n`antb1_plan_tests --gtest_list_tests` took 22.5 s wall at ~0% CPU the\nfirst time and 0.04 s afterwards, so a\nclean `pixi run ci` fails once and passes on the second run. `cmake/` is\nan \"ask a human first\" path too.\n\n## Checklist\n\n- [ ] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests) — `ci` is green\n(2305/2305); `lint` fails only on `tools/github/apply-settings.sh`,\nidentically on `main` (see above)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: the ADR 0022 and\n      ADR 0015 E2b update lines, in the approved E2 plan\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code implemented E2b\non a Linux host (the first 13 commits\nhere, including a clang-tidy pass and the review nits E2a deferred to\nthis PR). That host was lost before\nthe PR was opened, so a second Claude Code session re-created the\ntoolchain on macOS, ran the gates above,\nand re-reviewed the whole diff with nine independent read-only reviewers\n(left-join semantics; residual\nevaluation; the pair index plumbing and the column pruning; memory,\nownership and lifetimes; the C++/Arrow\nhazards AGENTS.md lists; planner and visitor exhaustiveness plus the\nexit-4 removal; profile metrics; test\ncoverage and hermeticity; and doc-vs-code divergence claim by claim).\nThey raised one P2 — a wording nit in\nthe `docs/sql-subset.md` metric list — which two independent verifiers\nrefuted as not a divergence. No P0 or\n      P1 was found.\nA completeness critic then re-derived the reviewers' own claims and\nfound four things they had not looked\nat. Two were about this PR body, not the code (the `/docs/adr/`\ncode-owner request, and that Golden rule 2\nmakes this a `check-full` PR); both are addressed above. The other two\nwent through three adversarial\nverifiers each: \"the ADR overclaims the residual metrics\" was refuted 3\nof 3 (the metric lists catalogue\nnames and mark absence explicitly with \"only\"/\"none where\"/\"always\"; the\nproposed rewording would itself\nhave been wrong for a left join's `gather`, which is present on the\npadded path), and the pair-vector\nsizing was upheld, which is the `perf(exec)` commit. The critic also\nfound the uncovered `Keep::kAll`\nguard, which is the `test(exec)` commit. Both new tests were\nmutation-checked: each fails with its change\n      reverted.\n- Accountable human (has read and understands the whole diff): @hor911\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-09T22:54:01+03:00",
+          "tree_id": "f3a6234b71b84fcd54408835ee7e6a2e0661cf05",
+          "url": "https://github.com/ydb-campus/antb1/commit/8c4faeb8be06e901e0ac0188217b82927cf55c04"
+        },
+        "date": 1791575809646,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4691.91268395759,
+            "unit": "ns/iter",
+            "extra": "iterations: 150442\ncpu: 4691.336215950333 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 94374.13320329915,
+            "unit": "ns/iter",
+            "extra": "iterations: 7177\ncpu: 94364.83920858298 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 124991.96277828785,
+            "unit": "ns/iter",
+            "extra": "iterations: 5615\ncpu: 124953.84149599292 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 485535.82051288924,
+            "unit": "ns/iter",
+            "extra": "iterations: 1443\ncpu: 485452.39847539825 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 454497.73977939045,
+            "unit": "ns/iter",
+            "extra": "iterations: 1541\ncpu: 454462.24594419234 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2214479.259493998,
+            "unit": "ns/iter",
+            "extra": "iterations: 316\ncpu: 2214231.041139242 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 52.626015769227216,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 52.615424769230756 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 45.94458373333813,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 45.938607666666684 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 199.34184166667515,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 199.33116066666653 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 15.09109773912868,
+            "unit": "ms/iter",
+            "extra": "iterations: 46\ncpu: 15.09016045652175 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 20.27009158823536,
+            "unit": "ms/iter",
+            "extra": "iterations: 34\ncpu: 20.26606026470588 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 42.10234341176414,
+            "unit": "ms/iter",
+            "extra": "iterations: 17\ncpu: 42.0980503529412 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.416012739837224,
+            "unit": "ms/iter",
+            "extra": "iterations: 492\ncpu: 1.4159042926829284 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 61.05443781817402,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 61.04193636363627 ms\nthreads: 1"
           }
         ]
       }
