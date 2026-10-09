@@ -371,13 +371,13 @@ TEST_F(SessionTest, UnsupportedAndBindErrorsKeepTheirKinds) {
   auto session = Session::Make().ValueOrDie();
   ASSERT_TRUE(session->RegisterParquet("t", {path_}).ok());
   // Column nope does not exist (SUM(nope) below is a bind error), but unsupported SQL is
-  // rejected before any name is resolved, and so are joins, derived tables and WITH lists, which
-  // parse (table nope is not registered either).
+  // rejected before any name is resolved, and so are LEFT JOINs, derived tables and WITH lists,
+  // which parse (table nope is not registered either).
   for (const char* sql :
        {"SELECT nope, row_number() OVER () FROM t",
         "SELECT AdvEngineID FROM t ORDER BY lower(AdvEngineID)",
         "SELECT SUM(DISTINCT AdvEngineID) FROM t", "SELECT DISTINCT AdvEngineID FROM t",
-        "SELECT nope FROM t, nope", "SELECT COUNT(*) FROM t JOIN nope ON t.AdvEngineID = nope.x",
+        "SELECT COUNT(*) FROM t LEFT JOIN nope ON t.AdvEngineID = nope.x",
         "SELECT COUNT(*) FROM t semi JOIN nope ON t.AdvEngineID = nope.x",
         "SELECT COUNT(*) FROM (SELECT nope FROM t)",
         "WITH c AS (SELECT nope FROM nope) SELECT COUNT(*) FROM t"}) {
@@ -386,6 +386,16 @@ TEST_F(SessionTest, UnsupportedAndBindErrorsKeepTheirKinds) {
     ASSERT_NE(detail, nullptr) << sql << ": " << result.status().ToString();
     EXPECT_EQ(detail->kind(), plan::SqlErrorDetail::Kind::kUnsupported) << sql;
     EXPECT_TRUE(result.status().IsNotImplemented()) << sql;
+  }
+  // An inner join and a comma join bind, so their tables resolve: a missing one is a bind error,
+  // not an unsupported query.
+  for (const char* sql :
+       {"SELECT nope FROM t, nope", "SELECT COUNT(*) FROM t JOIN nope ON t.AdvEngineID = nope.x"}) {
+    auto result = session->Execute(sql);
+    const auto detail = plan::GetSqlError(result.status());
+    ASSERT_NE(detail, nullptr) << sql << ": " << result.status().ToString();
+    EXPECT_EQ(detail->kind(), plan::SqlErrorDetail::Kind::kBind) << sql;
+    EXPECT_EQ(result.status().message(), "table 'nope' does not exist") << sql;
   }
   // A table alias and a qualified name answer from J2b-2 on, so they are no longer rejected: an
   // explicit alias, an implicit one, and a qualifier of the table's own name.

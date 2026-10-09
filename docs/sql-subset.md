@@ -950,18 +950,18 @@ completes the query; most queries also need the DECIMAL work of ADR 0021 before 
 | --- | --- | --- |
 | Q1 | pass | DECIMAL arithmetic, SUM and AVG (ADR 0021) |
 | Q2 | unsupported (exit code 4) | correlated scalar aggregates (ADR 0023) |
-| Q3 | unsupported (exit code 4) | inner joins (ADR 0022) |
+| Q3 | pass | inner joins (ADR 0022) |
 | Q4 | unsupported (exit code 4) | correlated EXISTS and NOT EXISTS (ADR 0023) |
-| Q5 | unsupported (exit code 4) | inner joins (ADR 0022) |
+| Q5 | pass | inner joins (ADR 0022) |
 | Q6 | pass | DECIMAL arithmetic, SUM and AVG (ADR 0021) |
 | Q7 | unsupported (exit code 4) | derived tables (ADR 0022) |
 | Q8 | unsupported (exit code 4) | derived tables (ADR 0022) |
 | Q9 | unsupported (exit code 4) | derived tables (ADR 0022) |
-| Q10 | unsupported (exit code 4) | inner joins (ADR 0022) |
+| Q10 | pass | inner joins (ADR 0022) |
 | Q11 | unsupported (exit code 4) | uncorrelated subqueries as joins (ADR 0022) |
-| Q12 | unsupported (exit code 4) | inner joins (ADR 0022) |
+| Q12 | pass | inner joins (ADR 0022) |
 | Q13 | unsupported (exit code 4) | LEFT JOIN (ADR 0022) |
-| Q14 | unsupported (exit code 4) | inner joins (ADR 0022) |
+| Q14 | pass | inner joins (ADR 0022) |
 | Q15 | unsupported (exit code 4) | uncorrelated subqueries as joins (ADR 0022) |
 | Q16 | unsupported (exit code 4) | uncorrelated subqueries as joins (ADR 0022) |
 | Q17 | unsupported (exit code 4) | correlated scalar aggregates (ADR 0023) |

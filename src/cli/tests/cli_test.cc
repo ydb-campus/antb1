@@ -169,15 +169,23 @@ TEST_F(CliTest, UnsupportedQueryExits4WithCaret) {
   EXPECT_EQ(r.code, kExitUnsupported);
   EXPECT_NE(r.err.find("SUM(DISTINCT ...) is not supported"), std::string::npos) << r.err;
   EXPECT_NE(r.err.find("^^^^^^^^"), std::string::npos) << r.err;
-  // A join parses, and the binder rejects it at its JOIN before any table resolves (neither a
-  // nor b is registered).
-  r = Invoke({"query", "-c", "SELECT COUNT(*) FROM a JOIN b ON a.k = b.k"});
+  // A LEFT JOIN parses, and the binder rejects it at its connector before any table resolves
+  // (neither a nor b is registered).
+  r = Invoke({"query", "-c", "SELECT COUNT(*) FROM a LEFT JOIN b ON a.k = b.k"});
   EXPECT_EQ(r.code, kExitUnsupported);
   EXPECT_EQ(r.err,
-            "antb1: unsupported error: JOIN ... ON is not supported; see docs/sql-subset.md\n"
+            "antb1: unsupported error: LEFT JOIN is not supported; see docs/sql-subset.md\n"
             "  at line 1, column 24\n"
+            "  SELECT COUNT(*) FROM a LEFT JOIN b ON a.k = b.k\n"
+            "                         ^^^^^^^^^\n");
+  // An inner join binds, so its tables are resolved: a missing one is a bind error, exit code 1.
+  r = Invoke({"query", "-c", "SELECT COUNT(*) FROM a JOIN b ON a.k = b.k"});
+  EXPECT_EQ(r.code, kExitQueryError);
+  EXPECT_EQ(r.err,
+            "antb1: bind error: table 'a' does not exist\n"
+            "  at line 1, column 22\n"
             "  SELECT COUNT(*) FROM a JOIN b ON a.k = b.k\n"
-            "                         ^^^^\n");
+            "                       ^\n");
   // A derived table and a WITH list parse too, and the binder rejects them at their '(' and their
   // WITH, before any table resolves (neither u nor c is registered).
   r = Invoke({"query", "-c", "SELECT COUNT(*) FROM (SELECT a FROM u) AS s(x)"});

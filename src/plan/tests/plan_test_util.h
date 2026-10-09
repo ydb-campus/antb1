@@ -187,4 +187,39 @@ inline const LogicalNode& Nth(const LogicalPlan& plan, int depth) {
   return *node;
 }
 
+// Walks single-input nodes from `node`: Down(node, 0) is `node` itself, and nullptr once a node
+// has no input or two (a Join), so a test says where it stopped instead of aborting.
+inline const LogicalNode* Down(const LogicalNode& node, int depth) {
+  const LogicalNode* at = &node;
+  for (int i = 0; i < depth && at != nullptr; ++i) {
+    const std::vector<LogicalNodePtr> inputs = InputsOf(*at);
+    at = inputs.size() == 1 ? inputs[0].get() : nullptr;
+  }
+  return at;
+}
+
+// The outermost Join of a plan, reached through single-input nodes; nullptr if there is none.
+inline const JoinNode* FirstJoin(const LogicalPlan& plan) {
+  for (const LogicalNode* node = plan.root.get(); node != nullptr;) {
+    if (const auto* join = std::get_if<JoinNode>(node)) {
+      return join;
+    }
+    const std::vector<LogicalNodePtr> inputs = InputsOf(*node);
+    node = inputs.size() == 1 ? inputs[0].get() : nullptr;
+  }
+  return nullptr;
+}
+
+// The table a branch scans, through its single-input nodes: "" if it reaches no Scan.
+inline std::string ScannedTable(const LogicalNode& node) {
+  for (const LogicalNode* at = &node; at != nullptr;) {
+    if (const auto* scan = std::get_if<ScanNode>(at)) {
+      return scan->table_name;
+    }
+    const std::vector<LogicalNodePtr> inputs = InputsOf(*at);
+    at = inputs.size() == 1 ? inputs[0].get() : nullptr;
+  }
+  return "";
+}
+
 }  // namespace antb1::plan::testing

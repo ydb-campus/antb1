@@ -665,16 +665,28 @@ INSTANTIATE_TEST_SUITE_P(
 INSTANTIATE_TEST_SUITE_P(
     FromLists, BindErrorTest,
     ::testing::Values(
-        ErrorCase{"SELECT i16 FROM t, u", kUnsupported, ",",
-                  "a FROM list of several tables is not supported"},
-        ErrorCase{"SELECT COUNT(*) FROM nope, missing", kUnsupported, ",",
-                  "a FROM list of several tables is not supported"},
-        ErrorCase{"SELECT i16 FROM t CROSS JOIN u", kUnsupported, "CROSS JOIN",
-                  "CROSS JOIN is not supported"},
-        ErrorCase{"SELECT i16 FROM t JOIN u ON t.i16 = u.i16", kUnsupported, "JOIN",
-                  "JOIN ... ON is not supported"},
-        ErrorCase{"SELECT i16 FROM t inner join u ON i16 = 1", kUnsupported, "inner join",
-                  "JOIN ... ON is not supported"},
+        // No join key connects the relations: a cross product, at the item that is not connected.
+        // The select list binds first, so these name no column both relations have.
+        ErrorCase{"SELECT COUNT(*) FROM t, u", kUnsupported, "u",
+                  "a cross product is not supported: no join key connects 'u' to 't'"},
+        ErrorCase{"SELECT COUNT(*) FROM t CROSS JOIN u", kUnsupported, "u",
+                  "a cross product is not supported: no join key connects 'u' to 't'"},
+        ErrorCase{"SELECT COUNT(*) FROM t JOIN u ON t.i16 > u.i16", kUnsupported, "u",
+                  "a cross product is not supported"},  // a residual is no key
+        ErrorCase{"SELECT COUNT(*) FROM t AS a CROSS JOIN u", kUnsupported, "u",
+                  "a cross product is not supported: no join key connects 'u' to 'a'"},
+        // A column both relations have is ambiguous in the select list, which binds before the
+        // connectivity check (rule 3, and the documented error order).
+        ErrorCase{"SELECT i16 FROM t, u", kBind, "i16",
+                  "column name 'i16' is ambiguous: it matches t.i16 and u.i16"},
+        // Every item's table is resolved, in FROM order, before any conjunct binds.
+        ErrorCase{"SELECT COUNT(*) FROM nope, missing", kBind, "nope",
+                  "table 'nope' does not exist"},
+        ErrorCase{"SELECT COUNT(*) FROM t, missing", kBind, "missing",
+                  "table 'missing' does not exist"},
+        // An unqualified name an ON sees in both its relations is ambiguous (rule 3).
+        ErrorCase{"SELECT i16 FROM t inner join u ON i16 = 1", kBind, "i16",
+                  "column name 'i16' is ambiguous: it matches t.i16 and u.i16"},
         ErrorCase{"SELECT i16 FROM t LEFT OUTER JOIN u ON t.i16 = u.i16", kUnsupported,
                   "LEFT OUTER JOIN", "LEFT JOIN is not supported"},
         ErrorCase{"SELECT i16 FROM nope LEFT JOIN missing ON a = b", kUnsupported, "LEFT JOIN",
@@ -714,14 +726,15 @@ INSTANTIATE_TEST_SUITE_P(
         // Query order.
         ErrorCase{"SELECT lower(s), t.i16 FROM t, u", kUnsupported, "lower",
                   "function lower() is not supported"},
-        ErrorCase{"SELECT t.i16 FROM t, u", kUnsupported, ",",
-                  "a FROM list of several tables is not supported"},
-        ErrorCase{"SELECT nope FROM t, u WHERE lower(s) = 'x'", kUnsupported, ",",
-                  "a FROM list of several tables is not supported"},
-        ErrorCase{"SELECT i16 FROM t AS a, u", kUnsupported, ",",
-                  "a FROM list of several tables is not supported"},
+        ErrorCase{"SELECT t.i16 FROM t, u", kUnsupported, "u", "a cross product is not supported"},
+        ErrorCase{"SELECT nope FROM t, u WHERE lower(s) = 'x'", kUnsupported, "lower",
+                  "function lower() is not supported"},
+        // The select list beats the connectivity check, and an alias names the binding in it.
+        ErrorCase{"SELECT i16 FROM t AS a, u", kBind, "i16",
+                  "column name 'i16' is ambiguous: it matches a.i16 and u.i16"},
+        // An ON is checked with the FROM list, before WHERE: its unsupported function comes first.
         ErrorCase{"SELECT i16 FROM t JOIN u ON lower(t.s) = u.s WHERE lower(s) = 'x'", kUnsupported,
-                  "JOIN", "JOIN ... ON is not supported"},
+                  "lower", "function lower() is not supported"},
         ErrorCase{"SELECT i16 FROM t WHERE lower(s) = 'x' GROUP BY t.i16", kUnsupported, "lower",
                   "function lower() is not supported"}));
 
@@ -755,10 +768,10 @@ INSTANTIATE_TEST_SUITE_P(
                   "subqueries in FROM are not supported"},
         ErrorCase{"SELECT nope FROM (SELECT i16 FROM t) WHERE lower(s) = 'x'", kUnsupported, "(",
                   "subqueries in FROM are not supported"},
-        ErrorCase{"SELECT i16 FROM t, (SELECT i16 FROM u)", kUnsupported, ",",
-                  "a FROM list of several tables is not supported"},
+        ErrorCase{"SELECT i16 FROM t, (SELECT i16 FROM u)", kUnsupported, "(",
+                  "subqueries in FROM are not supported"},
         ErrorCase{"SELECT i16 FROM t JOIN (SELECT i16 FROM u) v ON t.i16 = v.i16", kUnsupported,
-                  "JOIN", "JOIN ... ON is not supported"},
+                  "(", "subqueries in FROM are not supported"},
         ErrorCase{"WITH c AS (SELECT i16 FROM t) SELECT lower(s) FROM (SELECT s FROM c) AS a",
                   kUnsupported, "WITH", "WITH (common table expressions) is not supported"},
         ErrorCase{"SELECT i16 FROM (WITH c AS (SELECT i16 FROM t) SELECT i16 FROM c)", kUnsupported,
@@ -1559,6 +1572,110 @@ TEST(BinderTest, WhereSplitsAroundTheComputation) {
   ASSERT_EQ(scan.predicates.size(), 2U);
   EXPECT_EQ(scan.predicates[0].kind, Predicate::Kind::kCompareColumns);
   EXPECT_EQ(scan.predicates[0].other.value_or(BoundColumn{}).name, "i32");
+}
+
+// The shape of an inner join (ADR 0022): the probe is the relation with the most footer rows (an
+// unknown count is the most), the join builds on the relation it adds, its key pair is oriented
+// left input then right, and its span is the connector that added that relation. `t` has 100 rows,
+// `ok` 7 and `u` an unknown count.
+TEST(BinderTest, JoinOrderBuildSideAndKeys) {
+  const Catalog catalog = MakeCatalog();
+  struct Case {
+    std::string_view sql;
+    std::string_view left;   // the table the left (probe) branch scans
+    std::string_view right;  // and the right (build) branch
+    std::string_view span;   // the query text the Join is bound from
+  };
+  for (const Case& c : {
+           // 100 rows against 7: t probes, ok is added and built on.
+           Case{"SELECT ok.s FROM t JOIN ok ON t.i16 = ok.i16", "t", "ok", "JOIN"},
+           // The same whichever side is written first: the order is the statistics', not FROM's.
+           // The span is the connector that added the built relation, or that relation's own text
+           // when it is the first FROM item and so has no connector.
+           Case{"SELECT ok.s FROM ok JOIN t ON t.i16 = ok.i16", "t", "ok", "ok"},
+           // An unknown row count counts as the most, so u probes and t is added.
+           Case{"SELECT t.s FROM t JOIN u ON t.i16 = u.i16", "u", "t", "t"},
+           // A comma join is the same join; its span is the comma.
+           Case{"SELECT ok.s FROM t, ok WHERE t.i16 = ok.i16", "t", "ok", ","},
+           Case{"SELECT ok.s FROM t CROSS JOIN ok WHERE t.i16 = ok.i16", "t", "ok", "CROSS JOIN"},
+       }) {
+    auto plan = BindSql(c.sql, catalog);
+    ASSERT_TRUE(plan.ok()) << c.sql << ": " << plan.status().ToString();
+    const JoinNode* join = testing::FirstJoin(*plan);
+    ASSERT_NE(join, nullptr) << c.sql;
+    EXPECT_EQ(join->kind, JoinKind::kInner) << c.sql;
+    EXPECT_EQ(join->build, BuildSide::kRight) << c.sql;  // always the relation it adds
+    EXPECT_EQ(testing::ScannedTable(*join->left), c.left) << c.sql;
+    EXPECT_EQ(testing::ScannedTable(*join->right), c.right) << c.sql;
+    ASSERT_EQ(join->keys.size(), 1U) << c.sql;
+    EXPECT_TRUE(join->residual.empty()) << c.sql;
+    EXPECT_EQ(c.sql.substr(join->span.offset, join->span.length), c.span) << c.sql;
+  }
+}
+
+// A cross-relation equality whose sides differ in type gets one key type both widen to exactly,
+// and the side that is not of that type is cast on its own branch (ADR 0022's key casts). An
+// equality with no such type, and any other cross-relation conjunct, is a residual of the join.
+TEST(BinderTest, JoinKeyCastsAndResiduals) {
+  const Catalog catalog = MakeCatalog();
+  // INTEGER against SMALLINT is INTEGER: ok.i16 is cast on ok's branch, t.i32 is already one.
+  auto cast = BindSql("SELECT ok.s FROM t JOIN ok ON t.i32 = ok.i16", catalog);
+  ASSERT_TRUE(cast.ok()) << cast.status().ToString();
+  const JoinNode* join = testing::FirstJoin(*cast);
+  ASSERT_NE(join, nullptr);
+  ASSERT_EQ(join->keys.size(), 1U);
+  EXPECT_EQ(join->keys[0].left.type, LogicalType::kInteger);
+  EXPECT_EQ(join->keys[0].right.type, LogicalType::kInteger);
+  const auto* computed = std::get_if<ComputeNode>(join->right.get());
+  ASSERT_NE(computed, nullptr) << "ok's branch computes the cast";
+  ASSERT_EQ(computed->exprs.size(), 1U);
+  EXPECT_EQ(computed->exprs[0]->name, "CAST(ok.i16 AS INTEGER)");  // rule 6 keeps the qualifier
+  EXPECT_EQ(computed->exprs[0]->type, LogicalType::kInteger);
+  EXPECT_TRUE(std::holds_alternative<CastExpr>(computed->exprs[0]->node));
+  EXPECT_EQ(testing::ScannedTable(*join->right), "ok");
+  // One key and one residual: the ON's second conjunct reads both relations and is no equality.
+  auto residual =
+      BindSql("SELECT ok.s FROM t JOIN ok ON t.i16 = ok.i16 AND t.i32 > ok.i16", catalog);
+  ASSERT_TRUE(residual.ok()) << residual.status().ToString();
+  const JoinNode* with_residual = testing::FirstJoin(*residual);
+  ASSERT_NE(with_residual, nullptr);
+  EXPECT_EQ(with_residual->keys.size(), 1U);
+  EXPECT_EQ(with_residual->residual.size(), 1U);
+  // The same equality in an ON and in WHERE is one key, not two of the same join.
+  auto twice =
+      BindSql("SELECT ok.s FROM t JOIN ok ON t.i16 = ok.i16 WHERE ok.i16 = t.i16", catalog);
+  ASSERT_TRUE(twice.ok()) << twice.status().ToString();
+  const JoinNode* deduped = testing::FirstJoin(*twice);
+  ASSERT_NE(deduped, nullptr);
+  EXPECT_EQ(deduped->keys.size(), 1U);
+  EXPECT_TRUE(deduped->residual.empty());
+  // A DOUBLE equality has no key type, so it is a residual, and then nothing connects the graph.
+  auto doubles = BindSql("SELECT COUNT(*) FROM t JOIN u ON t.d = u.d", catalog);
+  ASSERT_FALSE(doubles.ok());
+  EXPECT_NE(doubles.status().message().find("a cross product is not supported"), std::string::npos)
+      << doubles.status().ToString();
+}
+
+// Each relation keeps the conjuncts that read it alone, on its own branch below the join, and a
+// column of a scope with two bindings carries its binding's qualifier.
+TEST(BinderTest, PerRelationFiltersAndQualifiers) {
+  const Catalog catalog = MakeCatalog();
+  auto plan = BindSql(
+      "SELECT t.s, ok.s FROM t JOIN ok ON t.i16 = ok.i16 WHERE t.i32 = 1 AND ok.s = 'x'", catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  const JoinNode* join = testing::FirstJoin(*plan);
+  ASSERT_NE(join, nullptr);
+  for (const auto& [branch, table] :
+       {std::pair{join->left.get(), "t"}, std::pair{join->right.get(), "ok"}}) {
+    const auto* filter = std::get_if<FilterNode>(branch);
+    ASSERT_NE(filter, nullptr) << table << "'s own conjunct filters its own branch";
+    ASSERT_EQ(filter->predicates.size(), 1U) << table;
+    EXPECT_EQ(testing::ScannedTable(*branch), table);
+  }
+  const auto& project = std::get<ProjectNode>(Nth(*plan, 0));
+  ASSERT_EQ(project.columns.size(), 2U);
+  EXPECT_EQ(project.columns[0].qualifier, "t");
+  EXPECT_EQ(project.columns[1].qualifier, "ok");
 }
 
 // A relation's own layers, in the order RelationNode stacks them over its Scan: the conjuncts on
