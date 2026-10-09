@@ -2505,7 +2505,8 @@ class Parser {
       if (clause == "LIMIT" && Peek().kind == TokenKind::kComma) {
         return Unsupported(Peek().span, "LIMIT with an offset (LIMIT n, m) is not supported");
       }
-      // SQL:2008's OFFSET n ROW[S], which DuckDB answers (after LIMIT n it gives a syntax error).
+      // SQL:2008's OFFSET n ROW[S], which DuckDB answers, next to a LIMIT too (DuckDB's syntax
+      // error is LIMIT n ROW[S]).
       if (clause == "OFFSET" && (Peek().IsKeyword("ROW") || Peek().IsKeyword("ROWS"))) {
         return Unsupported(Peek().span, "OFFSET with ROW or ROWS (OFFSET n ROWS) is not supported");
       }

@@ -242,14 +242,16 @@ words (`DOUBLE PRECISION`, `TIMESTAMP WITH TIME ZONE`), array types, `INTERVAL` 
 other than integers. After `LIMIT` and `OFFSET`: expressions such as `LIMIT 1 + 1`, `LIMIT '5'` and `LIMIT (5)`, calls and
 typed literals, also of quoted and qualified names of at most three parts (`LIMIT abs(5)`, `LIMIT main.abs(5)`,
 `LIMIT integer '5'`, `LIMIT E'5'`), a percentage, `LIMIT ALL` and `ROW` or `ROWS` after the value of `OFFSET`
-(`OFFSET 5 ROWS`, which DuckDB answers; after `LIMIT 5` they are a syntax error, as in DuckDB); a column there
+(`OFFSET 5 ROWS`, also next to a `LIMIT`, which DuckDB answers; `LIMIT 5 ROWS` is a syntax error, as in DuckDB); a
+column there
 (`LIMIT a`, `LIMIT t.a`) and a call or a typed literal of a longer name (`LIMIT a.b.c.d(1)`) are syntax errors, and
 DuckDB refuses them too. Known gaps:
 `LIMIT` and `OFFSET` expressions that start with `CASE`, `NOT` or a unary minus (`LIMIT -(-5)`) and conditions
 (`LIMIT 5 = 5`, `LIMIT 5 AND 3`) are syntax errors (exit code 1), although DuckDB answers them, and so are a trailing
 comma in an `IN` list (`a IN (1,)`), `IN` before a list literal (`a IN [1, 2]`), `BETWEEN ASYMMETRIC` (`asymmetric`
-is a name, divergence D21), `MAP {...}`, a prefix alias (`SELECT x: 1`) and an exponent without digits (`1e`, which
-DuckDB reads as `1 AS e`), also in a nested query. In FROM:
+is a name, divergence D21), `MAP {...}`, a prefix alias (`SELECT x: 1`), an exponent without digits (`1e`, which
+DuckDB reads as `1 AS e`), a number that a name follows directly (`1x`, which DuckDB reads as `1 AS x`) and named
+arguments (`round(x := 2.5)`), also in a nested query. In FROM:
 `JOIN ... USING`, `NATURAL`, `RIGHT` and `FULL` joins, `SEMI`, `ANTI`, `ASOF` and `POSITIONAL`
 joins, nested joins (a `JOIN` before the `ON` of an earlier one) and joins in parentheses, `LATERAL` before a subquery
 or a table function (also one with a qualified name: `LATERAL main.range(3)`), `schema.table`, `ONLY`, table functions
@@ -275,7 +277,9 @@ In `WITH` lists and nested queries, these are unsupported (exit code 4): `WITH R
 trailing comma in a column alias list (`s(x,)`), which DuckDB accepts; a query in parentheses (in FROM or as a CTE's
 query) that starts with no `SELECT` or `WITH` (`(VALUES (1))`, `(FROM t)`, `(TABLE t)`, `(PIVOT ...)` and
 `(UNPIVOT ...)`, also written `PIVOT_WIDER` and `PIVOT_LONGER`, in FROM also `(DESCRIBE t)`, `(SHOW t)` and
-`(SUMMARIZE t)`, or `((SELECT ...))`, at its first token), also after a `WITH` list (`WITH c AS (...) FROM c`); and in
+`(SUMMARIZE t)`, or `((SELECT ...))`, at its first token), also after a `WITH` list (`WITH c AS (...) FROM c`); a
+statement other than a query after a `WITH` list, which DuckDB runs (`WITH c AS (...) INSERT ...`, also `UPDATE`,
+`DELETE` and `MERGE`); and in
 a nested query `SELECT` without `FROM` (`(SELECT 1)`, which DuckDB answers), a trailing comma in its select list, FROM
 list or `GROUP BY`, and the clauses that are unsupported after a statement (`UNION`, `FETCH`, ...). As elsewhere, a
 construct is reported at its first token, so some of these are unsupported where DuckDB gives a syntax error, among
@@ -284,8 +288,8 @@ input cuts short (`(SELECT 1;`, `FROM (SELECT 1`, `FROM (SELECT a FROM t,`); `MA
 that no CTE follows (`WITH RECURSIVE;`, `WITH recursive, c AS (...)`); a word that starts a query, alone in parentheses
 or before something else there (`FROM (pivot)`, `FROM (pivot_wider JOIN u ON ...)`, `WITH c AS (values) ...`);
 `(DESCRIBE t)`, `(SHOW t)` and `(SUMMARIZE t)` as a CTE's query, which DuckDB takes in FROM only; another statement as
-a CTE's query or after a `WITH` list, where DuckDB takes none (`WITH c AS (DROP TABLE t) ...`,
-`WITH c AS (...) DESCRIBE c`); a string CTE name that a later CTE of its list repeats; and an escape or dollar-quoted
+a CTE's query (`WITH c AS (DROP TABLE t) ...`) or one that DuckDB refuses after a `WITH` list
+(`WITH c AS (...) DESCRIBE c`); what DuckDB refuses after `OFFSET n ROWS` (`OFFSET 1 ROWS ONLY`); a string CTE name that a later CTE of its list repeats; and an escape or dollar-quoted
 CTE name that repeats an earlier one (`WITH c AS (...), E'c' AS (...)`). Syntax errors (exit code 1), as in DuckDB: a
 `WITH` list without its query (`WITH c AS (...)`, also before `;` or `)`), a CTE without `AS` or its parentheses, a
 trailing comma in a `WITH` list, a second `WITH` list, an empty column alias list or one with a comma alone, a column

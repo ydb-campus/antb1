@@ -699,6 +699,8 @@ TEST(ParserTest, KnownGapsAreSyntaxErrorsInNestedQueriesToo) {
            "SELECT MAP {'k': 1} FROM t"sv,
            "SELECT x: 1 FROM t"sv,
            "SELECT 1e FROM t"sv,
+           "SELECT 1x FROM t"sv,
+           "SELECT round(x := 2.5) FROM t"sv,
        }) {
     for (const std::string& sql : {std::string(query), std::format("SELECT * FROM ({}) s", query),
                                    std::format("WITH c AS ({}) SELECT * FROM c", query)}) {
@@ -2287,6 +2289,11 @@ INSTANTIATE_TEST_SUITE_P(
                    "VALUES is not supported; only SELECT queries are supported"},
         RejectCase{"DescribeAfterWith", "WITH c AS (SELECT a FROM t) ^DESCRIBE c", kUnsupported, 8,
                    "DESCRIBE is not supported; only SELECT queries are supported"},
+        // DuckDB runs INSERT, UPDATE, DELETE and MERGE after a WITH list.
+        RejectCase{"InsertAfterWith", "WITH c AS (SELECT a FROM t) ^INSERT INTO t SELECT a FROM c",
+                   kUnsupported, 6, "INSERT is not supported; only SELECT queries are supported"},
+        RejectCase{"MergeAfterWith", "WITH c AS (SELECT a FROM t) ^MERGE INTO t USING c ON true",
+                   kUnsupported, 5, "MERGE is not supported; only SELECT queries are supported"},
         RejectCase{"SubqueryPivotAlone", "SELECT a FROM (^pivot)", kUnsupported, 5,
                    "PIVOT is not supported; only SELECT queries are supported"},
         RejectCase{"SubqueryPivotWiderBeforeAJoin", "SELECT a FROM (^pivot_wider JOIN u ON a = b)",
