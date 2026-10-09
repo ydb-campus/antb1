@@ -521,7 +521,7 @@ arrow::Status HashJoinOperator::Start() {
       ANTB1_CHECK(values_ != nullptr);
       keep_ = Keep::kAll;
       break;
-    default:  // inner, semi
+    default:  // inner, semi, left
       keep_ = Keep::kMatched;
       break;
   }
