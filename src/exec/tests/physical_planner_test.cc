@@ -598,16 +598,17 @@ TEST_F(PhysicalPlannerTest, SemiAntiAndOneRowJoinsRunEverywhere) {
     SCOPED_TRACE(std::string(plan::ToString(c.kind)) +
                  (c.key.has_value() ? " on " + c.key->name : ""));
     const bool one_row = c.kind == plan::JoinKind::kOneRow;
-    const auto join = Node(plan::JoinNode{
-        .kind = c.kind,
-        .left = scan,
-        .right = one_row ? row : scan,
-        .keys = one_row
-                    ? std::vector<plan::JoinKey>{}
-                    : std::vector<plan::JoinKey>{plan::JoinKey{.left = *c.key, .right = *c.key}},
-        .residual = {},
-        .build = plan::BuildSide::kRight,
-        .span = {}});
+    std::vector<plan::JoinKey> keys;
+    if (c.key.has_value()) {
+      keys.push_back(plan::JoinKey{.left = *c.key, .right = *c.key});
+    }
+    const auto join = Node(plan::JoinNode{.kind = c.kind,
+                                          .left = scan,
+                                          .right = one_row ? row : scan,
+                                          .keys = std::move(keys),
+                                          .residual = {},
+                                          .build = plan::BuildSide::kRight,
+                                          .span = {}});
     const std::size_t width = one_row ? 4 : 2;
     const auto rows = Run(PlanOf(join, width));
     ASSERT_NE(rows, nullptr);
