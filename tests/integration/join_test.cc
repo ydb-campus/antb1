@@ -1,17 +1,20 @@
-// Inner hash joins over the star schema's Parquet files (label integration, one thread). No SQL
-// reaches a join until roadmap PR J2b, so the plans are built by hand and run through
-// exec::BuildPhysicalPlan: dense keys (the direct layout), repeated and NULL keys, a two-column
-// key, VARCHAR keys, the empty dimension, a self-join, a chain of two joins, and part pruning and
-// filter pushdown on both sides. The rows are checked against a nested-loop join of plain scans,
-// in order, and their counts against DuckDB's for the same joins of the same files, which pending
-// J2b records of tests/slt/cases/joins/ hold too (inner.slt, and names.slt for trips with zones).
-// The counts depend on the fixtures (tools/fixturegen/star.h): after a change of the fixture
-// digest (tests/harness), `pixi run slt-complete` rewrites those records from DuckDB, and the
-// counts here follow them.
+// Hash joins over the star schema's Parquet files (label integration, one thread). No SQL reaches
+// a join until roadmap PR J2b, so the plans are built by hand and run through
+// exec::BuildPhysicalPlan. Inner joins: dense keys (the direct layout), repeated and NULL keys, a
+// two-column key, VARCHAR keys, the empty dimension, a self-join, a chain of two joins, and part
+// pruning and filter pushdown on both sides; their rows are checked against a nested-loop join of
+// plain scans, in order, and their counts against DuckDB's for the same joins of the same files,
+// which pending J2b records of tests/slt/cases/joins/ hold too (inner.slt, and names.slt for trips
+// with zones). Semi, anti, null-aware anti and one-row joins: their counts against DuckDB's for the
+// subqueries that pending J5 and U2 records of tests/slt/cases/subqueries/ hold (in.slt,
+// exists.slt and scalar.slt). The counts depend on the fixtures (tools/fixturegen/star.h): after a
+// change of the fixture digest (tests/harness), `pixi run slt-complete` rewrites those records from
+// DuckDB, and the counts here follow them.
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -141,11 +144,13 @@ plan::LogicalNodePtr Node(plan::LogicalNode node) {
   return std::make_shared<const plan::LogicalNode>(std::move(node));
 }
 
-// The inner join of `probe` (left) and `build` (right) where probe_keys[k] equals build_keys[k].
-plan::LogicalNodePtr JoinOf(plan::LogicalNodePtr probe, plan::LogicalNodePtr build,
+// The join of `kind` of `probe` (left) and `build` (right) where probe_keys[k] equals
+// build_keys[k] (no keys for a one-row join).
+plan::LogicalNodePtr JoinOf(plan::JoinKind kind, plan::LogicalNodePtr probe,
+                            plan::LogicalNodePtr build,
                             const std::vector<plan::BoundColumn>& probe_keys,
                             const std::vector<plan::BoundColumn>& build_keys) {
-  plan::JoinNode join{.kind = plan::JoinKind::kInner,
+  plan::JoinNode join{.kind = kind,
                       .left = std::move(probe),
                       .right = std::move(build),
                       .keys = {},
@@ -156,6 +161,13 @@ plan::LogicalNodePtr JoinOf(plan::LogicalNodePtr probe, plan::LogicalNodePtr bui
     join.keys.push_back(plan::JoinKey{.left = probe_keys[k], .right = build_keys[k]});
   }
   return Node(std::move(join));
+}
+
+// The inner join of `probe` (left) and `build` (right) where probe_keys[k] equals build_keys[k].
+plan::LogicalNodePtr JoinOf(plan::LogicalNodePtr probe, plan::LogicalNodePtr build,
+                            const std::vector<plan::BoundColumn>& probe_keys,
+                            const std::vector<plan::BoundColumn>& build_keys) {
+  return JoinOf(plan::JoinKind::kInner, std::move(probe), std::move(build), probe_keys, build_keys);
 }
 
 // `column` <op> `value`, a predicate the scan can apply (an INTEGER column, as the binder folds
@@ -179,6 +191,19 @@ arrow::Result<Rows> RunPlan(const plan::LogicalNodePtr& root, std::size_t width,
   exec::ExecContext ctx;
   ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Table> table, exec::Drain(*op, ctx));
   return RowsOf(*table);
+}
+
+// The first node named `name` of `node`'s tree (depth first); nullptr if none.
+const exec::ProfileNode* FindNode(const exec::ProfileNode& node, const std::string& name) {
+  if (node.name() == name) {
+    return &node;
+  }
+  for (const exec::ProfileNode* child : node.children()) {
+    if (const exec::ProfileNode* found = FindNode(*child, name)) {
+      return found;
+    }
+  }
+  return nullptr;
 }
 
 std::optional<int64_t> MetricOf(const exec::ProfileNode& node, const std::string& name) {
@@ -346,6 +371,201 @@ TEST_F(JoinTest, PruningAndPushdownOnBothSides) {
     ASSERT_EQ(filter.name(), "Filter");
     EXPECT_TRUE(filter.children()[0]->detail().ends_with(", 1 pushed predicate"))
         << filter.children()[0]->detail();
+  }
+}
+
+// Semi, anti, null-aware anti and one-row joins of trips: each count is DuckDB's for the same IN,
+// NOT IN, [NOT] EXISTS or scalar subquery, which a pending J5 or U2 record of
+// tests/slt/cases/subqueries/ holds (the record's line in each case). A semi join over the empty
+// promos never reads trips; every other join reads all of it, a null-aware anti join over a set
+// with a NULL too, although it keeps no row (as DuckDB reads it). The comparison of a scalar
+// subquery is a Filter above its one-row join. INTEGER drivers meet BIGINT ids through a Compute of
+// tr_driver + 0 as BIGINT, as J5's cast of the keys to their common type will.
+TEST_F(JoinTest, SemiAntiAndOneRowJoinsCountAsDuckDB) {
+  const Side trips("trips", {"tr_row", "tr_rider", "tr_driver", "tr_pickup", "tr_day", "tr_tariff",
+                             "tr_promo", "tr_fare"});
+  const Side riders("riders", {"rd_id"});
+  const Side tariffs("tariffs", {"tf_row", "tf_code"});
+  const Side promos("promos", {"pm_id", "pm_discount"});
+  const Side zones("zones", {"zn_id"});
+  const Side shifts("shifts", {"sh_driver", "sh_day", "sh_hours"});
+  const Side drivers("drivers", {"dv_id"});
+  const std::size_t width = trips.columns.size();
+  const auto bigint = plan::LogicalType::kBigInt;
+  // trips, then tr_driver + 0 as BIGINT (e0).
+  const plan::BoundColumn driver = trips.Column("tr_driver");
+  const auto e0 =
+      std::make_shared<const plan::Expr>(
+          plan::Expr{
+              .node =
+                  plan::ArithExpr{
+                      .op = plan::ArithOp::kAdd,
+                      .left = std::make_shared<const plan::Expr>(plan::Expr{
+                          .node = plan::ColumnExpr{.index = driver.index}, .type = driver.type}),
+                      .right = std::make_shared<const plan::Expr>(plan::Expr{
+                          .node = plan::ConstantExpr{.value = plan::Constant{.type = bigint,
+                                                                             .value = Int128{0}}},
+                          .type = bigint})},
+              .type = bigint,
+              .name = "e0"});
+  const auto widened = Node(plan::ComputeNode{.input = trips.Scan(), .exprs = {e0}});
+  const plan::BoundColumn widened_driver{
+      .index = static_cast<int>(width), .name = "e0", .type = bigint};
+  const auto filtered = [](const plan::LogicalNodePtr& input, plan::Predicate predicate) {
+    return Node(plan::FilterNode{.input = input, .predicates = {std::move(predicate)}});
+  };
+  // trips, then the one row of `call` over `input`, with `compare` above it.
+  const auto scalar = [&](const plan::LogicalNodePtr& input, const plan::AggregateCall& call,
+                          const std::function<plan::Predicate(const plan::BoundColumn&)>& compare) {
+    const plan::BoundColumn value{.index = static_cast<int>(width), .name = "v", .type = call.type};
+    return filtered(JoinOf(plan::JoinKind::kOneRow, trips.Scan(),
+                           Node(plan::AggregateNode{.input = input, .aggregates = {call}}), {}, {}),
+                    compare(value));
+  };
+  const auto fare = [&](plan::CompareOp op) {
+    return [&, op](const plan::BoundColumn& value) {
+      return plan::Predicate{.kind = plan::Predicate::Kind::kCompareColumns,
+                             .column = trips.Column("tr_fare"),
+                             .other = value,
+                             .op = op};
+    };
+  };
+  struct Case {
+    std::string record;
+    plan::LogicalNodePtr root;
+    std::size_t width = 0;
+    int64_t rows = 0;
+    std::optional<std::pair<std::size_t, int64_t>> non_null;  // a column's non-NULL cells
+    bool reads_probe = true;
+  };
+  const std::vector<Case> cases = {
+      {.record = "in.slt:114",
+       .root = JoinOf(plan::JoinKind::kSemi, trips.Scan(), riders.Scan(),
+                      {trips.Column("tr_rider")}, {riders.Column("rd_id")}),
+       .width = width,
+       .rows = 2745},
+      {.record = "in.slt:33",
+       .root = JoinOf(plan::JoinKind::kSemi, trips.Scan(), tariffs.Scan(),
+                      {trips.Column("tr_tariff")}, {tariffs.Column("tf_code")}),
+       .width = width,
+       .rows = 2274},
+      {.record = "in.slt:98",
+       .root = JoinOf(plan::JoinKind::kSemi, trips.Scan(), promos.Scan(),
+                      {trips.Column("tr_promo")}, {promos.Column("pm_id")}),
+       .width = width,
+       .rows = 0,
+       .reads_probe = false},
+      {.record = "in.slt:40",
+       .root = JoinOf(plan::JoinKind::kNullAwareAnti, trips.Scan(), tariffs.Scan(),
+                      {trips.Column("tr_tariff")}, {tariffs.Column("tf_code")}),
+       .width = width,
+       .rows = 0},
+      {.record = "in.slt:59",
+       .root = JoinOf(
+           plan::JoinKind::kNullAwareAnti, trips.Scan(),
+           filtered(tariffs.Scan(), Compare(tariffs.Column("tf_row"), plan::CompareOp::kNe, 7)),
+           {trips.Column("tr_tariff")}, {tariffs.Column("tf_code")}),
+       .width = width,
+       .rows = 284 + 284,
+       .non_null = std::pair(std::size_t{5}, 284 + 284)},
+      {.record = "in.slt:80",
+       .root = JoinOf(plan::JoinKind::kNullAwareAnti, trips.Scan(), promos.Scan(),
+                      {trips.Column("tr_promo")}, {promos.Column("pm_id")}),
+       .width = width,
+       .rows = 3000},
+      {.record = "in.slt:105",
+       .root = JoinOf(plan::JoinKind::kNullAwareAnti, trips.Scan(), zones.Scan(),
+                      {trips.Column("tr_pickup")}, {zones.Column("zn_id")}),
+       .width = width,
+       .rows = 69 * 3},
+      {.record = "exists.slt:102",
+       .root = JoinOf(plan::JoinKind::kAnti, trips.Scan(), tariffs.Scan(),
+                      {trips.Column("tr_tariff")}, {tariffs.Column("tf_code")}),
+       .width = width,
+       .rows = 726},
+      {.record = "exists.slt:95",
+       .root = JoinOf(plan::JoinKind::kAnti, trips.Scan(), promos.Scan(),
+                      {trips.Column("tr_promo")}, {promos.Column("pm_id")}),
+       .width = width,
+       .rows = 3000},
+      {.record = "exists.slt:76",
+       .root = JoinOf(plan::JoinKind::kSemi, trips.Scan(), shifts.Scan(),
+                      {driver, trips.Column("tr_day")},
+                      {shifts.Column("sh_driver"), shifts.Column("sh_day")}),
+       .width = width,
+       .rows = 445},
+      {.record = "exists.slt:82",
+       .root = JoinOf(plan::JoinKind::kAnti, trips.Scan(), shifts.Scan(),
+                      {driver, trips.Column("tr_day")},
+                      {shifts.Column("sh_driver"), shifts.Column("sh_day")}),
+       .width = width,
+       .rows = 2555},
+      {.record = "scalar.slt:27",
+       .root = scalar(promos.Scan(),
+                      {.kind = plan::AggKind::kMax,
+                       .arg = promos.Column("pm_discount"),
+                       .type = promos.Column("pm_discount").type},
+                      fare(plan::CompareOp::kGt)),
+       .width = width + 1,
+       .rows = 0},
+      {.record = "scalar.slt:33",
+       .root = scalar(
+           promos.Scan(), {.kind = plan::AggKind::kCountStar, .arg = {}, .type = bigint},
+           [&](const plan::BoundColumn& value) { return Compare(value, plan::CompareOp::kEq, 0); }),
+       .width = width + 1,
+       .rows = 3000},
+      {.record = "scalar.slt:53",
+       .root = scalar(
+           filtered(shifts.Scan(), Compare(shifts.Column("sh_hours"), plan::CompareOp::kGt, 1000)),
+           {.kind = plan::AggKind::kSum,
+            .arg = shifts.Column("sh_hours"),
+            .type = plan::LogicalType::Decimal(38, 1)},
+           fare(plan::CompareOp::kLt)),
+       .width = width + 1,
+       .rows = 0},
+      {.record = "in.slt:52",
+       .root = JoinOf(plan::JoinKind::kNullAwareAnti, widened, drivers.Scan(), {widened_driver},
+                      {drivers.Column("dv_id")}),
+       .width = width + 1,
+       .rows = 0},
+      {.record = "in.slt:67",
+       .root = JoinOf(
+           plan::JoinKind::kNullAwareAnti, widened,
+           filtered(drivers.Scan(), Compare(drivers.Column("dv_id"), plan::CompareOp::kGt, 0)),
+           {widened_driver}, {drivers.Column("dv_id")}),
+       .width = width + 1,
+       .rows = 319,
+       .non_null = std::pair(std::size_t{2}, 319)},
+      {.record = "in.slt:92",
+       .root = JoinOf(plan::JoinKind::kNullAwareAnti, widened,
+                      filtered(drivers.Scan(),
+                               Compare(drivers.Column("dv_id"), plan::CompareOp::kGt, 9000000000)),
+                      {widened_driver}, {drivers.Column("dv_id")}),
+       .width = width + 1,
+       .rows = 3000},
+      {.record = "in.slt:128",
+       .root = JoinOf(plan::JoinKind::kSemi, widened, drivers.Scan(), {widened_driver},
+                      {drivers.Column("dv_id")}),
+       .width = width + 1,
+       .rows = 2577},
+  };
+  for (const Case& c : cases) {
+    SCOPED_TRACE(c.record);
+    exec::ProfileNode profile;
+    auto rows = RunPlan(c.root, c.width, &profile);
+    ASSERT_TRUE(rows.ok()) << rows.status().ToString();
+    EXPECT_EQ(static_cast<int64_t>(rows->size()), c.rows);
+    if (c.non_null.has_value()) {
+      const auto [column, count] = *c.non_null;
+      EXPECT_EQ(
+          std::ranges::count_if(
+              *rows, [&](const std::vector<std::string>& row) { return row[column] != "null"; }),
+          count);
+    }
+    const exec::ProfileNode* probe = FindNode(profile, "HashJoin");
+    ASSERT_NE(probe, nullptr);
+    ASSERT_EQ(probe->children().size(), 1U);
+    EXPECT_EQ(probe->children()[0]->instances() > 0, c.reads_probe);
   }
 }
 
