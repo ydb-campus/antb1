@@ -2603,8 +2603,9 @@ TEST_F(HashJoinTest, LeftJoinKeepsTheProbeSelectionOnTheOneToOnePath) {
         if (!selected[row]) {
           continue;
         }
-        if (keys[row].has_value() && *keys[row] < 10) {
-          EXPECT_EQ(values.Value(i), 100 + *keys[row]) << row;
+        const int64_t key = keys[row].value_or(-1);  // the build has keys 0 to 9
+        if (key >= 0 && key < 10) {
+          EXPECT_EQ(values.Value(i), 100 + key) << row;
         } else {
           EXPECT_TRUE(values.IsNull(i)) << row;  // padded
         }

@@ -654,7 +654,7 @@ TEST_F(JoinTest, LeftJoinsAndResidualsCountAsDuckDB) {
     }
     if (summed.has_value()) {
       calls.push_back({.kind = plan::AggKind::kSum,
-                       .arg = *summed,
+                       .arg = summed,
                        .type = plan::LogicalType::Decimal(38, summed->type.scale())});
     }
     return Node(plan::AggregateNode{.input = input, .aggregates = std::move(calls)});

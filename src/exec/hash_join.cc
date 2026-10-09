@@ -741,14 +741,14 @@ int64_t HashJoinOperator::KeepPassingOrPadded(int64_t count, int64_t passing, bo
   for (int64_t s = 0; s < count; ++s) {
     const auto slot = static_cast<std::size_t>(s);
     const std::uint32_t row = probe_rows_[slot];
-    if (row != current) {
+    if (std::cmp_not_equal(row, current)) {
       current = row;
       any = false;
     }
     JoinRowRef ref = build_rows_[slot];
     if (ref.chunk != kNoChunk) {  // a candidate: kept when it passed
       if (next_passing < passing &&
-          pair_slots_[static_cast<std::size_t>(next_passing)] == static_cast<std::uint32_t>(s)) {
+          std::cmp_equal(pair_slots_[static_cast<std::size_t>(next_passing)], s)) {
         ++next_passing;
         any = true;
       } else if (last_[slot] != 0 && !any) {
