@@ -289,8 +289,9 @@ that no CTE follows (`WITH RECURSIVE;`, `WITH recursive, c AS (...)`); a word th
 or before something else there (`FROM (pivot)`, `FROM (pivot_wider JOIN u ON ...)`, `WITH c AS (values) ...`);
 `(DESCRIBE t)`, `(SHOW t)` and `(SUMMARIZE t)` as a CTE's query, which DuckDB takes in FROM only; another statement as
 a CTE's query (`WITH c AS (DROP TABLE t) ...`) or one that DuckDB refuses after a `WITH` list
-(`WITH c AS (...) DESCRIBE c`); what DuckDB refuses after `OFFSET n ROWS` (`OFFSET 1 ROWS ONLY`); a string CTE name that a later CTE of its list repeats; and an escape or dollar-quoted
-CTE name that repeats an earlier one (`WITH c AS (...), E'c' AS (...)`). Syntax errors (exit code 1), as in DuckDB: a
+(`WITH c AS (...) DESCRIBE c`); what DuckDB refuses after `OFFSET n ROWS` (`OFFSET 1 ROWS ONLY`); a string CTE name
+that a later CTE of its list repeats; and an escape or dollar-quoted CTE name that repeats an earlier one
+(`WITH c AS (...), E'c' AS (...)`). Syntax errors (exit code 1), as in DuckDB: a
 `WITH` list without its query (`WITH c AS (...)`, also before `;` or `)`), a CTE without `AS` or its parentheses, a
 trailing comma in a `WITH` list, a second `WITH` list, an empty column alias list or one with a comma alone, a column
 alias list after a derived table without an alias (`FROM (...) (x)`) or after a second one, a repeated CTE name,
