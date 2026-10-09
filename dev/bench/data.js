@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791500438514,
+  "lastUpdate": 1791525015328,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -5616,6 +5616,114 @@ window.BENCHMARK_DATA = {
             "value": 54.165659076922715,
             "unit": "ms/iter",
             "extra": "iterations: 13\ncpu: 54.15681107692318 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b39b26d04f4857470fb8a3e170c41baaff1d7a63",
+          "message": "feat(exec): inner hash joins in physical plans (#107)\n\n## Summary\n\nRoadmap PR **J1b-2**, the second half of J1b ([ADR\n0022](docs/adr/0022-joins-and-query-blocks.md), \"Execution\"). J1b-1\n(#106) added the hash join operators; this PR plans every inner `Join`\nnode as a hash join. No SQL reaches a join yet, because the binder still\nrejects joins until J2b, so no query changes its answer:\n`tests/data/tpch_status.json` stays `{\"pass\": [1, 6]}` and ClickBench\nstays at 43/43.\n\n**Physical planner** (`src/exec/physical_planner.cc`):\n- **`PipelineInput(node)`** is the one walk through a pipeline: Filter,\nCompute, Project and an inner join's probe input. `PipelineScan`,\n`FiltersOnScan` and the pipeline's builds all use it, so they cannot\ndrift apart. A Filter above a join is never collected as a scan filter,\nso it can never prune probe parts.\n- **Builds:** each build is made once per pipeline in `PartsOf` (now\n`arrow::Result<Parts>`), outermost first, before the parts' factory\nexists, so the probe's part number never reaches a build input. A build\ninput that is a part pipeline gets its own parts, pruning, pushdown and\nnested builds; any other input is drained. The sinks of pipelines with\nbuilds run behind `BuildsFirstOperator` (all 5 `PartsOf` call sites),\nand a probe over a serial input prepares its own build. Plans without\njoins are unchanged.\n- **Errors:** a malformed join is Invalid, with or without a profile:\nmissing inputs or residuals, no keys, keys of two types, or DOUBLE or\nBOOLEAN keys. Non-inner kinds keep today's exact exit-4 error at the\njoin's span.\n- **Hidden rules over joins:**\n- filter pushdown and part pruning work per side, each with its own part\nnumbers;\n  - late materialization declines at a join;\n- the COUNT(DISTINCT) rewrite, the partition top-N and the Limit cap run\nover a join: build first, then probe.\n- **Profiles:** `HashJoin` lines per part (`find`, `gather`, `residual`,\n`window_rows`) and `HashBuild` lines under the operator that prepares\nthe build (`parts`, `skipped`, `part_time`, `wait`, `lanes_tail`,\n`finish`, `null_keys`, `unique`, `direct`). `kOrder` in\n`src/engine/profile_format.cc` grows from 18 to 26 names.\n\n**Tests** (26 new; the 4-thread pool only in exec tests):\n- **`exec.HashJoinPlanTest`** (multi-part MemoryTables, against a\nnested-loop reference):\n- build on either side; 1:N and 1:1; BIGINT, VARCHAR and two-column\nkeys; batch sizes 1, 3 and 64;\n- **1 and 4 threads give equal tables over 15 shapes:** every sink (the\nglobal two-level aggregation included), a serial probe, a drained build,\na chain and a nested build;\n  - **one test per hidden rule:**\n- the late-materialization test has a positive control: the same scan\nwithout the join shows `late=`;\n- the trap-1 regression: a Filter above a build-left join prunes\nnothing;\n- the first build error in part order wins and no probe part is read; in\na chain the outer build's error wins;\n- a build part runs again alone after OOM (serial probe, so every worker\nfailure is a build part's); 0 bytes are left afterwards;\n- residuals run in order: a narrowing residual then an overflowing one\npasses, the reverse fails;\n- builds are prepared outermost first and in post-order below; a serial\nprobe builds at its first `Next`.\n- **`physical_planner_test`:**\n- non-inner kinds stay unsupported everywhere, with and without a\nprofile;\n  - 11 malformed shapes are Invalid with no SqlErrorDetail;\n- inner joins are planned as hash joins behind `BuildsFirstOperator` for\nevery sink, and plans without a join get no wrapper.\n- **`profile_test.JoinsShowBuildAndProbeLines`:** exact counts on 1 and\n4 threads for three shapes, the metrics, and details equal to the join's\nEXPLAIN line.\n- **`engine.FormatProfileTest.JoinMetricsShowInAFixedOrder`:** fails\nwith the old order. The engine test target links `antb1::exec`.\n- **`integration.JoinTest`** (new, `tests/integration/join_test.cc`, one\nthread): hand-built plans over the star Parquet files, rows compared in\norder with a nested-loop join of plain scans. It covers:\n- the direct layout; repeated and NULL keys; a two-column key; VARCHAR\nkeys; a self-join; a chain;\n  - the empty `promos` table, where the probe reads no rows;\n  - pruning and pushdown on both sides;\n- INTEGER/BIGINT and DECIMAL(4,2)/(5,3) keys are Invalid until J2b casts\nthem.\n\nThe integration target links `antb1::exec` (a test target, not a module\nedge).\n- **Count records:** 4 new `pending J2b` `COUNT(*)` records in\n`joins/inner.slt` pin DuckDB's counts for these joins. Their\nexpectations come from `slt-complete`; `harness.slt.pending` passes.\n- **`memory_test`:** J1b-1's four hand-built join shapes now go through\nthe planner.\n- **Mutation checks**, each reverted after the run; every one fails at\nleast one test:\n  - FiltersOnScan stopping at a join;\n  - the planner dropping residuals;\n  - builds prepared innermost first;\n  - WithBuilds never wrapping a sink;\n  - the old 18-name kOrder.\n\n**Docs:**\n- `docs/sql-subset.md`: logical plans, and explain --analyze lines and\nmetrics.\n- `docs/architecture.md`: operators; pipelines with probes; memory;\n\"only a projection turns a selection into data\" corrected.\n- `docs/testing.md` and `tests/README.md`.\n- **ADR 0015:** an update line with the metrics.\n- **ADR 0022:** update lines under \"Builds come first\", \"The 1:1 path\",\n\"Residuals (E2)\" and \"Errors\":\n- builds are prepared at the first pull, not in `Open`, and released\nwhen the probe pipeline's parts are done;\n  - outermost first, post-order below;\n  - an empty build skips the probe;\n  - inner residuals are evaluated by the probe, in order;\n  - profile placement.\n\n  `/docs/adr/` is a CODEOWNERS path; the status stays Proposed.\n\nFor the maintainer:\n\n- **Size:** about 1,950 lines inserted over J1b-1 (code about 280, tests\nabout 1,590, docs about 80), within the plan's 1,700 to 2,100.\n- **History:** this branch was built on J1b-1 before it merged, and was\nnever pushed. Its 13 commits were cherry-picked onto main after\n#104–#106, so the PR shows only J1b-2's own commits. The resulting tree\nis byte-identical to the reviewed and gated tree, which had merged main.\n- **ClickBench A/B** (hits_0, 43 queries, best of 9 tries, J1b-1's head\nagainst this branch, lukewarm on a shared host): totals 2.963 s against\n2.976 s (+0.4%). Per-query differences stay within the base's own spread\nbetween rounds. That is expected, since ClickBench has no joins and the\nchange runs only at planning.\n- **Not in the plan:** the 4 pending J2b count records in\n`joins/inner.slt`. They keep the integration test's DuckDB counts\nre-derivable through `slt-complete`, since no pixi task runs ad-hoc\nDuckDB SQL.\n- **Hand-off to J2b:**\n  - Emit keys of identical types, with a cast below the join.\n- DOUBLE and BOOLEAN equalities go to residuals or Filters, never into\nkeys.\n  - Put comparison residuals first: they are evaluated in order.\n- Single-table conjuncts directly on a scan get pushdown and pruning;\nconjuncts above a join never prune.\n  - Register the divergences:\n- (a) with a non-empty build, DuckDB may skip probe-side conjuncts on\nrows its dynamic filters reject, while antb1 evaluates them on every\nprobe row;\n- (b) with an empty build, DuckDB still evaluates the first chunk and\nany probe-side pipeline breaker, while antb1 evaluates nothing.\n  - Remove the pending guards, the 4 new count records included.\n  - Add CLI explain --analyze goldens for HashJoin and HashBuild.\n- **Hand-off to E2:**\n  - The empty-build short-circuit is inner/semi only.\n  - Extend `PipelineInput` to the streaming kinds.\n  - The 1:N cursor already yields candidate pairs.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run check && pixi run ci-gcc    # on d7dcffd (the head; same tree as below plus two ADR wording fixes)\nlint: PASS\n100% tests passed out of 2265          # ci, and the same in ci-gcc\n$ pixi run check-full                  # on 615f11c (the merged tree before the last ADR wording fix)\nlint: PASS\n100% tests passed out of 2265          # ci (clang Debug -Werror)\n100% tests passed out of 2265          # asan (ASan + UBSan)\n                                       # tidy: clean\ncoverage: PASS                         # exec 97.4% lines / 88.6% branches; engine 95.8% / 88.1%\n100% tests passed out of 2             # fuzz-smoke\n100% tests passed out of 2265          # ci-gcc\n$ pixi run tsan                        # on 615f11c\n100% tests passed out of 2265          # no ThreadSanitizer reports\n$ pixi run slt-complete                # on 615f11c\n66 .slt files, every one unchanged\n$ pixi run bench-clickbench (hits_0, 3 tries; J1b-1 head vs this branch, 3 interleaved rounds)\ntotal best-of-9: 2.963 s vs 2.976 s (+0.4%), within the base's own round-to-round spread\n```\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: the ADR 0015 and ADR 0022 update lines, in the\napproved plan\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code implemented the\nmaintainer-approved J1b-2 plan, stacked on J1b-1, after the planning\nround's mapping, design and adversarial critique agents. Two reviewer\nagents then reviewed it: planner correctness, and the tests, integration\nand docs (they re-ran DuckDB 1.5.6 on the fixtures for every pinned\ncount). Their P1, an untested call site (the global two-level aggregate\nover a join), is fixed with tests, and so are their nits, among them a\ncrash on a malformed join planned with a profile. A re-review found no\nP0/P1, and a pre-PR review checked the merge with main.\n- Accountable human (has read and understands the whole diff): @hor911",
+          "timestamp": "2026-10-09T08:48:13+03:00",
+          "tree_id": "6b3cb565ef60b214509938ef34be71d928bd3ff0",
+          "url": "https://github.com/ydb-campus/antb1/commit/b39b26d04f4857470fb8a3e170c41baaff1d7a63"
+        },
+        "date": 1791525014441,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 2940.729563363848,
+            "unit": "ns/iter",
+            "extra": "iterations: 238322\ncpu: 2940.647888151324 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 74192.13501789364,
+            "unit": "ns/iter",
+            "extra": "iterations: 9221\ncpu: 74167.1140874092 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 78503.25808262429,
+            "unit": "ns/iter",
+            "extra": "iterations: 8908\ncpu: 78458.82341715314 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 274694.77825746534,
+            "unit": "ns/iter",
+            "extra": "iterations: 2548\ncpu: 274559.5855572998 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 334668.2799808962,
+            "unit": "ns/iter",
+            "extra": "iterations: 2093\ncpu: 334491.8160535115 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 1928764.9726027679,
+            "unit": "ns/iter",
+            "extra": "iterations: 365\ncpu: 1928376.6164383548 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 37.15813399999864,
+            "unit": "ms/iter",
+            "extra": "iterations: 19\ncpu: 37.14936536842104 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 33.63352195238111,
+            "unit": "ms/iter",
+            "extra": "iterations: 21\ncpu: 33.62667142857143 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 126.0815655999977,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 126.07183920000011 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 9.765149472222056,
+            "unit": "ms/iter",
+            "extra": "iterations: 72\ncpu: 9.763743361111102 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 18.29124681579006,
+            "unit": "ms/iter",
+            "extra": "iterations: 38\ncpu: 18.287327789473682 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 28.595267666666757,
+            "unit": "ms/iter",
+            "extra": "iterations: 24\ncpu: 28.591854624999986 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 2.092428982035903,
+            "unit": "ms/iter",
+            "extra": "iterations: 334\ncpu: 2.0916769760479053 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 28.34644636000121,
+            "unit": "ms/iter",
+            "extra": "iterations: 25\ncpu: 28.344601320000038 ms\nthreads: 1"
           }
         ]
       }
