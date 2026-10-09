@@ -26,6 +26,7 @@
 #include "antb1/sql/error.h"
 #include "antb1/sql/parser.h"
 
+#include "join_order.h"
 #include "scope.h"
 
 // The binding rules are documented in docs/sql-subset.md and
@@ -52,6 +53,10 @@ std::string Clip(std::string_view text) {
 SourceSpan Cover(SourceSpan first, SourceSpan last) {
   return SourceSpan{.offset = first.offset, .length = last.offset + last.length - first.offset};
 }
+
+// `span` widened to cover `by`, which starts no earlier: `by` alone while `span` is unset. No span
+// of the query is empty, so a length of 0 is the unset one.
+void Widen(SourceSpan& span, SourceSpan by) { span = span.length == 0 ? by : Cover(span, by); }
 
 LogicalNodePtr Make(LogicalNode node) {
   return std::make_shared<const LogicalNode>(std::move(node));
@@ -1978,7 +1983,7 @@ class Binder {
  public:
   // `bindings`: the FROM items, in order. `ids` minted their columns' ids and mints the binder's.
   Binder(const sql::SelectStatement& stmt, std::vector<Binding> bindings, ColumnIdSource& ids)
-      : stmt_(stmt), scope_(std::move(bindings)), ids_(ids) {}
+      : stmt_(stmt), scope_(std::move(bindings)), ids_(ids), relations_(scope_.bindings().size()) {}
 
   arrow::Result<LogicalPlan> Bind();
 
@@ -2159,10 +2164,12 @@ class Binder {
       return BoundColumn{
           .id = column->id,
           .name = location.has_value() ? scope_.column(*location).name : t.expr->name,
-          .type = t.expr->type};
+          .type = t.expr->type,
+          .qualifier = location.has_value() ? scope_.Qualifier(location->binding) : std::string()};
     }
-    std::vector<ExprPtr>& exprs = where ? where_exprs_ : input_exprs_;
-    std::vector<ColumnId>& ids = where ? where_ids_ : input_ids_;
+    Relation& relation = relations_[conjunct_relation_];
+    std::vector<ExprPtr>& exprs = where ? relation.where_exprs : input_exprs_;
+    std::vector<ColumnId>& ids = where ? relation.where_ids : input_ids_;
     const auto same =
         std::ranges::find_if(exprs, [&](const ExprPtr& e) { return SameExpr(*e, *t.expr); });
     const auto k = Narrow<std::size_t>(same - exprs.begin());
@@ -2170,7 +2177,7 @@ class Binder {
       exprs.push_back(t.expr);
       ids.push_back(ids_.Next());
     }
-    return BoundColumn{.id = ids[k], .name = t.expr->name, .type = t.expr->type};
+    return BoundColumn{.id = ids[k], .name = t.expr->name, .type = t.expr->type};  // computed
   }
 
   // An aggregate call with its argument bound in the input scope (computed when not a column).
@@ -2371,7 +2378,10 @@ class Binder {
   // above the aggregation (once).
   BoundColumn OutputColumn(const Typed& t) {
     if (const auto* column = std::get_if<ColumnExpr>(&t.expr->node)) {
-      return BoundColumn{.id = column->id, .name = t.expr->name, .type = t.expr->type};
+      return BoundColumn{.id = column->id,
+                         .name = t.expr->name,
+                         .type = t.expr->type,
+                         .qualifier = QualifierOf(column->id)};
     }
     const auto same =
         std::ranges::find_if(post_exprs_, [&](const ExprPtr& e) { return SameExpr(*e, *t.expr); });
@@ -2396,7 +2406,18 @@ class Binder {
   // ---- clauses ----
 
   arrow::Status BindSelectList();
+  arrow::Status BindConjunct(const sql::Expr& conjunct, SourceSpan element);
   arrow::Status BindWhere();
+  arrow::Status OrderRelations();
+  // The node of relation `r`: its binding's Scan, then the conjuncts routed to it and the columns
+  // they compute. The scan filter stays directly above the Scan on every branch, where part
+  // pruning and ADR 0020's pushdown look for it.
+  LogicalNodePtr RelationNode(std::size_t r);
+  // The relations joined in the order OrderRelations chose, left-deep.
+  LogicalNodePtr JoinTree();
+  // The qualifier of the column `id` belongs to (BoundColumn::qualifier, which EXPLAIN shows), or
+  // none for a computed column, which belongs to no binding.
+  [[nodiscard]] std::string QualifierOf(ColumnId id) const;
   arrow::Status BindGroupBy();
   arrow::Status CheckGrouped();
   arrow::Status BindSelectExpressions();
@@ -2497,17 +2518,31 @@ class Binder {
   ColumnIdSource& ids_;
   SelectList select_;
   Shape shape_ = Shape::kProjection;
-  std::vector<ExprPtr> where_exprs_;     // WHERE operands, computed over the filtered Scan
-  std::vector<ColumnId> where_ids_;      // per WHERE operand: its column
-  std::vector<ExprPtr> input_exprs_;     // computed after the WHERE filter on computed columns
-  std::vector<ColumnId> input_ids_;      // per input expression: its column
-  std::vector<Predicate> scan_filter_;   // WHERE over the Scan's columns
-  std::vector<Predicate> input_filter_;  // WHERE over computed columns
-  std::vector<BoundColumn> keys_;        // GROUP BY keys, as columns of the input
-  std::vector<ColumnId> key_ids_;        // per key: its column in the aggregation's output
-  std::vector<ExprPtr> key_exprs_;       // per key: its input-scope expression
-  std::vector<ExprPtr> post_exprs_;      // computed over the aggregation's output
-  std::vector<ColumnId> post_ids_;       // per post expression: its column
+  // One FROM item's own layers, below the joins: the conjuncts routed to it (ADR 0022's WHERE
+  // classification) and the columns they compute, in the order RelationNode stacks them.
+  struct Relation {
+    std::vector<Predicate> scan_filter;   // conjuncts over the Scan's columns
+    std::vector<ExprPtr> where_exprs;     // their operands, computed over the filtered Scan
+    std::vector<ColumnId> where_ids;      // per operand: its column
+    std::vector<Predicate> input_filter;  // conjuncts over those computed columns
+    std::vector<ExprPtr> join_key_exprs;  // a join key's cast, computed above the filters
+    std::vector<ColumnId> join_key_ids;   // per key expression: its column
+    SourceSpan filter_span;               // the clause elements its conjuncts came from
+  };
+  std::vector<Relation> relations_;    // one per binding, in FROM order
+  std::size_t conjunct_relation_ = 0;  // the relation the conjunct being bound is routed to
+  // The join order of the relations (join_order.h), decided once every conjunct is classified.
+  std::vector<JoinRelation> join_relations_;
+  std::vector<JoinEdge> edges_;
+  std::vector<JoinStep> steps_;
+
+  std::vector<ExprPtr> input_exprs_;  // computed above the joins, on computed columns
+  std::vector<ColumnId> input_ids_;   // per input expression: its column
+  std::vector<BoundColumn> keys_;     // GROUP BY keys, as columns of the input
+  std::vector<ColumnId> key_ids_;     // per key: its column in the aggregation's output
+  std::vector<ExprPtr> key_exprs_;    // per key: its input-scope expression
+  std::vector<ExprPtr> post_exprs_;   // computed over the aggregation's output
+  std::vector<ColumnId> post_ids_;    // per post expression: its column
   std::vector<Predicate> having_;
   std::vector<SortKey> sort_keys_;
 };
@@ -3349,36 +3384,66 @@ Predicate IsTrue(BoundColumn column, SourceSpan span) {
 
 }  // namespace
 
-arrow::Status Binder::BindWhere() {
-  for (const sql::Expr* conjunct : Conjuncts(stmt_.where)) {
-    if (IsCompound(*conjunct)) {
-      ARROW_ASSIGN_OR_RAISE(
-          const Typed condition,
-          BindBool(*conjunct, [this](const sql::Expr& e) { return BindInput(e); }, /*input=*/true));
-      input_filter_.push_back(IsTrue(InputColumn(condition, /*where=*/true), conjunct->span()));
-      continue;
-    }
-    // A plain BETWEEN is its two comparisons, each folded and pushed into the scan where it can.
-    std::vector<sql::Expr> comparisons;
-    if (const auto* between = std::get_if<sql::BetweenExpr>(conjunct)) {
-      ARROW_RETURN_NOT_OK(
-          CheckBetweenTypes(*between, [this](const sql::Expr& e) { return BindInput(e); }));
-      for (sql::Expr& comparison : BetweenComparisons(*between)) {
-        comparisons.push_back(std::move(comparison));
-      }
-    }
-    const std::vector<const sql::Expr*> parts =
-        comparisons.empty()
-            ? std::vector<const sql::Expr*>{conjunct}
-            : std::vector<const sql::Expr*>{&comparisons.front(), &comparisons.back()};
-    for (const sql::Expr* part : parts) {
-      ARROW_ASSIGN_OR_RAISE(Predicate predicate, BindCondition(*part, /*having=*/false));
-      const bool on_scan =
-          (!predicate.column.has_value() || scope_.Find(predicate.column->id).has_value()) &&
-          (!predicate.other.has_value() || scope_.Find(predicate.other->id).has_value());
-      (on_scan ? scan_filter_ : input_filter_).push_back(std::move(predicate));
+// One conjunct of WHERE, routed to the relation it reads (conjunct_relation_) and recorded in that
+// relation's layers; `element` is the span of the clause element it was flattened out of, which
+// widens the relation's filter span.
+arrow::Status Binder::BindConjunct(const sql::Expr& conjunct, SourceSpan element) {
+  Widen(relations_[conjunct_relation_].filter_span, element);
+  if (IsCompound(conjunct)) {
+    ARROW_ASSIGN_OR_RAISE(
+        const Typed condition,
+        BindBool(conjunct, [this](const sql::Expr& e) { return BindInput(e); }, /*input=*/true));
+    relations_[conjunct_relation_].input_filter.push_back(
+        IsTrue(InputColumn(condition, /*where=*/true), conjunct.span()));
+    return arrow::Status::OK();
+  }
+  // A plain BETWEEN is its two comparisons, each folded and pushed into the scan where it can.
+  std::vector<sql::Expr> comparisons;
+  if (const auto* between = std::get_if<sql::BetweenExpr>(&conjunct)) {
+    ARROW_RETURN_NOT_OK(
+        CheckBetweenTypes(*between, [this](const sql::Expr& e) { return BindInput(e); }));
+    for (sql::Expr& comparison : BetweenComparisons(*between)) {
+      comparisons.push_back(std::move(comparison));
     }
   }
+  const std::vector<const sql::Expr*> parts =
+      comparisons.empty()
+          ? std::vector<const sql::Expr*>{&conjunct}
+          : std::vector<const sql::Expr*>{&comparisons.front(), &comparisons.back()};
+  for (const sql::Expr* part : parts) {
+    ARROW_ASSIGN_OR_RAISE(Predicate predicate, BindCondition(*part, /*having=*/false));
+    const bool on_scan =
+        (!predicate.column.has_value() || scope_.Find(predicate.column->id).has_value()) &&
+        (!predicate.other.has_value() || scope_.Find(predicate.other->id).has_value());
+    Relation& relation = relations_[conjunct_relation_];
+    (on_scan ? relation.scan_filter : relation.input_filter).push_back(std::move(predicate));
+  }
+  return arrow::Status::OK();
+}
+
+arrow::Status Binder::BindWhere() {
+  for (const sql::Expr& element : stmt_.where) {
+    std::vector<const sql::Expr*> conjuncts;
+    Conjuncts(element, conjuncts);
+    for (const sql::Expr* conjunct : conjuncts) {
+      ARROW_RETURN_NOT_OK(BindConjunct(*conjunct, element.span()));
+    }
+  }
+  return OrderRelations();
+}
+
+// The order the relations join in: every one must be connected to the first by an edge (ADR 0022's
+// connectivity check), and OrderJoins then picks the left-deep order from footer statistics.
+arrow::Status Binder::OrderRelations() {
+  join_relations_.clear();
+  join_relations_.reserve(scope_.bindings().size());
+  for (const Binding& binding : scope_.bindings()) {
+    join_relations_.push_back(JoinRelation{.rows = RelationRows(binding)});
+  }
+  // One relation is connected to itself, so this holds while the FROM list has one item; the next
+  // commit reports a cross product here.
+  ANTB1_CHECK(!FirstUnconnected(join_relations_.size(), edges_).has_value());
+  steps_ = OrderJoins(join_relations_, edges_);
   return arrow::Status::OK();
 }
 
@@ -3668,24 +3733,46 @@ arrow::Result<LogicalPlan> Binder::Bind() {
   return Assemble();
 }
 
+LogicalNodePtr Binder::RelationNode(std::size_t r) {
+  Relation& relation = relations_[r];
+  LogicalNodePtr node = scope_.bindings()[r].Node();  // a fresh Scan per call
+  if (!relation.scan_filter.empty()) {
+    node = Make(FilterNode{.input = std::move(node),
+                           .predicates = std::move(relation.scan_filter),
+                           .span = relation.filter_span});
+  }
+  if (!relation.where_exprs.empty()) {
+    node = Make(ComputeNode{.input = std::move(node),
+                            .exprs = relation.where_exprs,
+                            .ids = relation.where_ids,
+                            .span = relation.filter_span});
+  }
+  if (!relation.input_filter.empty()) {
+    node = Make(FilterNode{.input = std::move(node),
+                           .predicates = std::move(relation.input_filter),
+                           .span = relation.filter_span});
+  }
+  if (!relation.join_key_exprs.empty()) {
+    node = Make(ComputeNode{.input = std::move(node),
+                            .exprs = relation.join_key_exprs,
+                            .ids = relation.join_key_ids,
+                            .span = relation.filter_span});
+  }
+  return node;
+}
+
+LogicalNodePtr Binder::JoinTree() {
+  ANTB1_CHECK(!steps_.empty());                  // OrderRelations makes one step per relation
+  return RelationNode(steps_.front().relation);  // the joins come with the next commit
+}
+
+std::string Binder::QualifierOf(ColumnId id) const {
+  const std::optional<ColumnLocation> location = scope_.Find(id);
+  return location.has_value() ? scope_.Qualifier(location->binding) : std::string();
+}
+
 LogicalPlan Binder::Assemble() {
-  ANTB1_CHECK(scope_.bindings().size() == 1);  // J2b joins the bindings' nodes
-  LogicalNodePtr node = scope_.bindings().front().Node();
-  const SourceSpan where_span = stmt_.where.empty()
-                                    ? SourceSpan{}
-                                    : Cover(stmt_.where.front().span(), stmt_.where.back().span());
-  if (!scan_filter_.empty()) {
-    node = Make(FilterNode{
-        .input = std::move(node), .predicates = std::move(scan_filter_), .span = where_span});
-  }
-  if (!where_exprs_.empty()) {
-    node = Make(ComputeNode{
-        .input = std::move(node), .exprs = where_exprs_, .ids = where_ids_, .span = where_span});
-  }
-  if (!input_filter_.empty()) {
-    node = Make(FilterNode{
-        .input = std::move(node), .predicates = std::move(input_filter_), .span = where_span});
-  }
+  LogicalNodePtr node = JoinTree();
   if (!input_exprs_.empty()) {
     node = Make(ComputeNode{
         .input = std::move(node), .exprs = input_exprs_, .ids = input_ids_, .span = select_.span});
@@ -3736,6 +3823,9 @@ LogicalPlan Binder::Assemble() {
           column.id = select_.expr_columns[index].id;
           break;
       }
+      // The column it reads in the node below: a binding's column carries that binding's
+      // qualifier, while an aggregate, an expression, a constant and a grouping key carry none.
+      column.qualifier = QualifierOf(column.id);
       out.columns.push_back(std::move(column));
       out.constants.push_back(std::move(constant));
       out.ids.push_back(ids_.Next());

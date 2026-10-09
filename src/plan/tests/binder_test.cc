@@ -1561,6 +1561,37 @@ TEST(BinderTest, WhereSplitsAroundTheComputation) {
   EXPECT_EQ(scan.predicates[0].other.value_or(BoundColumn{}).name, "i32");
 }
 
+// A relation's own layers, in the order RelationNode stacks them over its Scan: the conjuncts on
+// the Scan's columns, the operands the others need, then those others. Each lower node's span
+// covers the WHERE elements its conjuncts came from, so the whole of this WHERE, and a Project
+// above a projection reads the binding's column with no qualifier while there is one binding.
+TEST(BinderTest, RelationLayersAndTheirSpans) {
+  const Catalog catalog = MakeCatalog();
+  const std::string sql =
+      "SELECT i16 FROM t WHERE i16 = 1 AND (i16 = 2 OR i32 = 3) AND 5 < i16 * 2";
+  auto plan = BindSql(sql, catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  // Project, Filter (computed), Compute (the operands), Filter (on the Scan), Scan.
+  ASSERT_TRUE(std::holds_alternative<ProjectNode>(Nth(*plan, 0)));
+  const auto& computed = std::get<FilterNode>(Nth(*plan, 1));
+  const auto& operands = std::get<ComputeNode>(Nth(*plan, 2));
+  const auto& on_scan = std::get<FilterNode>(Nth(*plan, 3));
+  EXPECT_TRUE(std::holds_alternative<ScanNode>(Nth(*plan, 4)));
+  EXPECT_EQ(computed.predicates.size(), 2U);  // 5 < i16 * 2, and the OR
+  EXPECT_EQ(operands.exprs.size(), 2U);       // i16 * 2, and the OR's own column
+  EXPECT_EQ(on_scan.predicates.size(), 1U);   // i16 = 1
+  // One span for all three, covering the first WHERE element through the last.
+  const std::size_t where = sql.find("i16 = 1");
+  const SourceSpan whole{.offset = where, .length = sql.size() - where};
+  EXPECT_EQ(on_scan.span, whole);
+  EXPECT_EQ(operands.span, whole);
+  EXPECT_EQ(computed.span, whole);
+  // One binding, so no column carries a qualifier.
+  const auto& project = std::get<ProjectNode>(Nth(*plan, 0));
+  ASSERT_EQ(project.columns.size(), 1U);
+  EXPECT_EQ(project.columns[0].qualifier, "");
+}
+
 // DuckDB's constant moving in WHERE: x + c <op> k is x <op> k - c for a signed integer x (and
 // likewise x - c, c + x, c - x, x * c when c divides k), so the arithmetic is never computed;
 // it stops where k or the new constant leaves the type, and never applies to USMALLINT.
