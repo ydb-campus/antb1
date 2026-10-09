@@ -151,9 +151,9 @@ profiled once per part into the same nodes), runs it, drops the rows and prints 
 Operators pull `exec::Batch`es from their input: an Arrow record batch and an optional selection, a boolean array
 without NULLs that marks the rows taking part. A filter never copies data. A projection turns a selection into data,
 and so does a hash join's probe when it copies rows: an inner or a left join's (probe row, match) pairs of a build
-whose keys repeat, and the rows or candidate pairs it evaluates residuals on; with unique build keys it keeps the
-probe batch and selects the matched rows (a left join, its selected rows). A semi, anti or null-aware anti join only
-selects rows, and a one-row join appends its build's values to the probe batch.
+whose keys repeat, the rows it evaluates residuals on, and the columns of candidate pairs that residuals read; with
+unique build keys it keeps the probe batch and selects the matched rows (a left join, its selected rows). A semi, anti
+or null-aware anti join only selects rows, and a one-row join appends its build's values to the probe batch.
 Every operator instance is used by one thread.
 
 **Parts** ([ADR 0013](adr/0013-parallel-execution.md)). A table is split into parts (`plan::Table::num_parts`,
@@ -249,9 +249,9 @@ residuals are evaluated in order, each on the rows the ones before it kept; a le
 a row without a match (on its 1:1 path it keeps the probe's selection); a semi, anti or null-aware anti join passes on
 slices of the probe batch with the rows it keeps selected; a one-row join appends the slices of its build's values.
 The residuals of a semi, anti or left join are evaluated (`exec::EvaluateExpr`) on the candidate pairs (a probe row
-and a build row of its key), in batches of at most `batch_size` pairs, in order, every pair evaluated: semi and anti
-evaluate a probe batch's pairs before its windows, a left join each batch of pairs before it emits the passing ones
-and, after a row's last candidate, the row padded when none passed.
+and a build row of its key), in batches of at most `batch_size` pairs with only the columns they read, in order, every
+pair evaluated: semi and anti evaluate a probe batch's pairs before its windows, a left join each batch of pairs before
+it emits the passing ones and, after a row's last candidate, the row padded when none passed.
 
 The physical planner plans every join so. It walks a part pipeline with one helper (`PipelineInput`: through `Filter`,
 `Compute`, `Project` and a join's probe input) to find its scan, the predicates its statistics and its scan use (only a

@@ -536,10 +536,10 @@ only with `--analyze`); its errors and exit codes are those of `antb1 query`.
   - a `HashJoin`'s `find` (looking up the keys; none where a join keeps every row or none without looking: a one-row
     join, an anti join over a build without rows, a null-aware anti join over an empty build input or one with a
     NULL key), `gather` (the rows' columns: the build columns an inner or a left join gathers, and the probe rows it
-    takes on its other path than 1:1; the columns of the candidates that residuals are evaluated on; a one-row join's
-    values, which its build makes once), `residual` and, when the build's keys are unique, an inner join's
-    `window_rows`, and a left join's without residuals (the rows of the probe's batches it gathered the build's
-    columns for, next to the `rows` it returned);
+    takes on its other path than 1:1; the columns of the candidates that residuals read; a one-row join's values, which
+    its build makes once), `residual` and, when the build's keys are unique, an inner join's `window_rows`, and a left
+    join's without residuals (the rows of the probe's batches it gathered the build's columns for, next to the `rows` it
+    returned);
   - a `HashBuild`'s `finish` (the table built from its parts, and a one-row join's values), `null_keys` (rows with a
     NULL key, never held), `unique` (1: no key repeats) and `direct` (1: the table indexes its one integer key by
     value, ADR 0022).
