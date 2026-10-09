@@ -757,6 +757,82 @@ TEST_F(ComputeTest, DecimalCaseValuesCastToTheCaseType) {
             "casting from source column c");
 }
 
+plan::ExprPtr CastOf(plan::ExprPtr operand, LogicalType type) {
+  return std::make_shared<const plan::Expr>(plan::Expr{
+      .node = plan::CastExpr{.operand = std::move(operand)}, .type = type, .name = "cast"});
+}
+
+// A join key's cast (plan::CastExpr) keeps every value, the extremes of each type included, and
+// NULL stays NULL: integers widen to integers, HUGEINT and DECIMALs, and DECIMALs to DECIMALs with
+// more digits on either side of the point.
+TEST_F(ComputeTest, CastWidensExactly) {
+  const auto cast = [](const std::shared_ptr<arrow::Array>& values, LogicalType from,
+                       LogicalType to) -> std::shared_ptr<arrow::Array> {
+    auto out = Eval(CastOf(ColumnAt(0, from), to), {values});
+    EXPECT_TRUE(out.ok()) << from << " to " << to << ": " << out.status().ToString();
+    if (!out.ok()) {
+      return nullptr;
+    }
+    EXPECT_TRUE((*out)->type()->Equals(*plan::ToArrow(to))) << (*out)->type()->ToString();
+    return *out;
+  };
+  const auto int16 =
+      cast(Int16s({-32768, std::nullopt, 32767}), LogicalType::kSmallInt, LogicalType::kInteger);
+  ASSERT_NE(int16, nullptr);
+  EXPECT_EQ(int16->ToString(), "[\n  -32768,\n  null,\n  32767\n]");
+  const auto uint16 = cast(testing::UInt16s({65535, std::nullopt, 0}), LogicalType::kUSmallInt,
+                           LogicalType::kInteger);
+  ASSERT_NE(uint16, nullptr);
+  EXPECT_EQ(uint16->ToString(), "[\n  65535,\n  null,\n  0\n]");
+  constexpr int32_t kMin32 = std::numeric_limits<int32_t>::min();
+  constexpr int32_t kMax32 = std::numeric_limits<int32_t>::max();
+  const auto int32 = testing::Int32s({kMin32, std::nullopt, kMax32});
+  const auto int64 = cast(int32, LogicalType::kInteger, LogicalType::kBigInt);
+  ASSERT_NE(int64, nullptr);
+  EXPECT_EQ(int64->ToString(), "[\n  -2147483648,\n  null,\n  2147483647\n]");
+  const auto huge = cast(int32, LogicalType::kInteger, LogicalType::kHugeInt);
+  ASSERT_NE(huge, nullptr);
+  EXPECT_EQ(UnscaledText(*huge), "decimal128(38, 0): -2147483648 null 2147483647");
+  const auto cents = cast(Int64s({std::numeric_limits<int64_t>::min(), std::nullopt,
+                                  std::numeric_limits<int64_t>::max()}),
+                          LogicalType::kBigInt, LogicalType::Decimal(21, 2));
+  ASSERT_NE(cents, nullptr);
+  EXPECT_EQ(UnscaledText(*cents),
+            "decimal128(21, 2): -922337203685477580800 null 922337203685477580700");
+  const auto wider = cast(Decimals(LogicalType::Decimal(4, 2), {"9999", std::nullopt, "-9999"}),
+                          LogicalType::Decimal(4, 2), LogicalType::Decimal(5, 3));
+  ASSERT_NE(wider, nullptr);
+  EXPECT_EQ(UnscaledText(*wider), "decimal128(5, 3): 99990 null -99990");
+  const auto sums = cast(Decimals(LogicalType::kHugeInt, {std::string(38, '9'), std::nullopt}),
+                         LogicalType::kHugeInt, LogicalType::Decimal(38, 0));
+  ASSERT_NE(sums, nullptr);
+  EXPECT_EQ(UnscaledText(*sums), "decimal128(38, 0): " + std::string(38, '9') + " null");
+}
+
+// Anything but an exact widening is a malformed plan, and a DECIMAL value beyond its own declared
+// width (a file can hold one) fails the cast with DuckDB's conversion error, naming the column.
+TEST_F(ComputeTest, CastRejectsWhatIsNoExactWidening) {
+  const auto narrowing =
+      Eval(CastOf(ColumnAt(0, LogicalType::kBigInt), LogicalType::kInteger), {Int64s({1})});
+  EXPECT_TRUE(narrowing.status().IsInvalid()) << narrowing.status().ToString();
+  EXPECT_EQ(narrowing.status().message(), "a cast of BIGINT to INTEGER is not an exact widening");
+  const LogicalType price = LogicalType::Decimal(15, 2);
+  const auto scale =
+      Eval(CastOf(ColumnAt(0, price), LogicalType::Decimal(15, 3)), {Decimals(price, {"1"})});
+  EXPECT_EQ(scale.status().message(),
+            "a cast of DECIMAL(15,2) to DECIMAL(15,3) is not an exact widening");
+  const auto empty = std::make_shared<const plan::Expr>(
+      plan::Expr{.node = plan::CastExpr{}, .type = LogicalType::kBigInt, .name = "cast"});
+  EXPECT_TRUE(Eval(empty, {Int64s({1})}).status().IsInvalid());
+  const LogicalType tiny = LogicalType::Decimal(4, 2);
+  auto beyond =
+      Eval(CastOf(ColumnAt(0, tiny), LogicalType::Decimal(5, 3)), {Decimals(tiny, {"12345678"})});
+  EXPECT_TRUE(beyond.status().IsExecutionError()) << beyond.status().ToString();
+  EXPECT_EQ(beyond.status().message(),
+            "Casting value \"123456.78\" to type DECIMAL(5,3) failed: value is out of range! when "
+            "casting from source column c");
+}
+
 // % of DECIMALs beyond 38 digits is DOUBLE, as DuckDB computes it: fmod of the operands converted
 // by rule 8 (a BIGINT to its nearest double, a HUGEINT by DuckDB's 128-bit formula), with the
 // dividend's sign (-0.0 too) and NULL for a zero divisor; with a DOUBLE operand a zero divisor
