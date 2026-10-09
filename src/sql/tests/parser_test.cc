@@ -1840,6 +1840,16 @@ INSTANTIATE_TEST_SUITE_P(
                    "OFFSET expressions are not supported (OFFSET takes an integer)"},
         RejectCase{"LimitCommaOffset", "SELECT a FROM events LIMIT 5^, 10", kUnsupported, 1,
                    "LIMIT with an offset (LIMIT n, m) is not supported"},
+        RejectCase{"OffsetRows", "SELECT a FROM events OFFSET 5 ^ROWS", kUnsupported, 4,
+                   "OFFSET with ROW or ROWS (OFFSET n ROWS) is not supported"},
+        RejectCase{"OffsetRowAfterLimit", "SELECT a FROM events LIMIT 1 OFFSET 5 ^row;",
+                   kUnsupported, 3, "OFFSET with ROW or ROWS (OFFSET n ROWS) is not supported"},
+        RejectCase{"OffsetRowsBeforeLimit", "SELECT a FROM events OFFSET 5 ^Rows LIMIT 1",
+                   kUnsupported, 4, "OFFSET with ROW or ROWS"},
+        RejectCase{"OffsetRowsInADerivedTable", "SELECT a FROM (SELECT a FROM t OFFSET 1 ^ROWS) s",
+                   kUnsupported, 4, "OFFSET with ROW or ROWS"},
+        RejectCase{"OffsetRowInACte", "WITH c AS (SELECT a FROM t OFFSET 1 ^ROW) SELECT a FROM c",
+                   kUnsupported, 3, "OFFSET with ROW or ROWS"},
         // Joins outside the subset, and words that DuckDB reads as joins after a FROM item.
         RejectCase{"InnerJoinUsing", "SELECT a FROM events INNER JOIN users ^USING (a)",
                    kUnsupported, 5,
@@ -2681,6 +2691,11 @@ INSTANTIATE_TEST_SUITE_P(
                    kSyntax, 30, "LIMIT 123456789012345678901234567890 is out of range"},
         RejectCase{"WhereAfterLimit", "SELECT a FROM events LIMIT 5 ^WHERE a = 1", kSyntax, 5,
                    "unexpected keyword WHERE; expected OFFSET or the end of the query"},
+        // ROW and ROWS follow OFFSET's value only, unquoted (as in DuckDB).
+        RejectCase{"RowsAfterLimit", "SELECT a FROM events LIMIT 5 ^ROWS", kSyntax, 4,
+                   "unexpected identifier ROWS; expected OFFSET or the end of the query"},
+        RejectCase{"QuotedRowsAfterOffset", "SELECT a FROM events OFFSET 5 ^\"ROWS\"", kSyntax, 6,
+                   "unexpected quoted identifier; expected LIMIT or the end of the query"},
         RejectCase{"DuplicateWhere", "SELECT a FROM events WHERE a = 1 ^WHERE b = 2", kSyntax, 5,
                    "unexpected keyword WHERE; expected AND, GROUP BY, HAVING, ORDER BY, LIMIT, "
                    "OFFSET or the end of the query"},

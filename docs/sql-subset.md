@@ -238,8 +238,10 @@ Outside the grammar, the parser recognizes common SQL and rejects it with exit c
 words (`DOUBLE PRECISION`, `TIMESTAMP WITH TIME ZONE`), array types, `INTERVAL` and `UNION` types and type parameters
 other than integers. After `LIMIT` and `OFFSET`: expressions such as `LIMIT 1 + 1`, `LIMIT '5'` and `LIMIT (5)`, calls and
 typed literals, also of quoted and qualified names of at most three parts (`LIMIT abs(5)`, `LIMIT main.abs(5)`,
-`LIMIT integer '5'`, `LIMIT E'5'`), a percentage and `LIMIT ALL`; a column there (`LIMIT a`, `LIMIT t.a`) and a call
-or a typed literal of a longer name (`LIMIT a.b.c.d(1)`) are syntax errors, and DuckDB refuses them too. Known gaps:
+`LIMIT integer '5'`, `LIMIT E'5'`), a percentage, `LIMIT ALL` and `ROW` or `ROWS` after the value of `OFFSET`
+(`OFFSET 5 ROWS`, which DuckDB answers; after `LIMIT 5` they are a syntax error, as in DuckDB); a column there
+(`LIMIT a`, `LIMIT t.a`) and a call or a typed literal of a longer name (`LIMIT a.b.c.d(1)`) are syntax errors, and
+DuckDB refuses them too. Known gaps:
 `LIMIT` and `OFFSET` expressions that start with `CASE`, `NOT` or a unary minus (`LIMIT -(-5)`) and conditions
 (`LIMIT 5 = 5`, `LIMIT 5 AND 3`) are syntax errors (exit code 1), although DuckDB answers them. In FROM:
 `JOIN ... USING`, `NATURAL`, `RIGHT` and `FULL` joins, `SEMI`, `ANTI`, `ASOF` and `POSITIONAL`

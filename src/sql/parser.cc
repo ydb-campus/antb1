@@ -2506,6 +2506,10 @@ class Parser {
       if (clause == "LIMIT" && Peek().kind == TokenKind::kComma) {
         return Unsupported(Peek().span, "LIMIT with an offset (LIMIT n, m) is not supported");
       }
+      // SQL:2008's OFFSET n ROW[S], which DuckDB answers (after LIMIT n it gives a syntax error).
+      if (clause == "OFFSET" && (Peek().IsKeyword("ROW") || Peek().IsKeyword("ROWS"))) {
+        return Unsupported(Peek().span, "OFFSET with ROW or ROWS (OFFSET n ROWS) is not supported");
+      }
       return value;
     }
     const std::string keyword = KeywordOf(token);
