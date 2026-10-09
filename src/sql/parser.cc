@@ -1627,7 +1627,10 @@ class Parser {
     // DuckDB also takes the field as a string or a quoted name (EXTRACT('year' FROM d)).
     if (field.kind == TokenKind::kString || field.kind == TokenKind::kQuotedIdentifier ||
         PrefixedStringAt() != PrefixedString::kNone) {
-      return Unsupported(field.span, "a string or quoted field name in EXTRACT is not supported");
+      return Unsupported(
+          field.span,
+          "a string or quoted field name in EXTRACT is not supported; write the field "
+          "as a name, as in EXTRACT(year FROM ...)");
     }
     if (field.kind != TokenKind::kIdentifier) {
       return Syntax(field.span, "expected a field name in EXTRACT(, found " + Describe(field));
