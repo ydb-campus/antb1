@@ -65,6 +65,23 @@ TEST(MakeOrderedQuery, AppendsTheKeysAndDropsLimitAndOffset) {
   EXPECT_EQ(
       MakeOrderedQuery("SELECT b AS x FROM t ORDER BY t.x").value_or(OrderedQuery{}).augmented_sql,
       "SELECT b AS \"x\", t.x AS \"__antb1_key0\" FROM t ORDER BY t.x");
+  // After a WITH list the keys go into the select list of the statement's own block, and a derived
+  // table keeps its query.
+  EXPECT_EQ(MakeOrderedQuery("with c as (select a from t order by a) select * from c order by a")
+                .value_or(OrderedQuery{})
+                .augmented_sql,
+            "WITH \"c\" AS (SELECT a FROM t ORDER BY a) SELECT *, a AS \"__antb1_key0\" FROM c "
+            "ORDER BY a");
+  EXPECT_EQ(MakeOrderedQuery("WITH c(x) AS (SELECT a FROM t) SELECT x FROM c ORDER BY 1 LIMIT 2")
+                .value_or(OrderedQuery{})
+                .augmented_sql,
+            "WITH \"c\"(\"x\") AS (SELECT a FROM t) SELECT x, x AS \"__antb1_key0\" FROM c ORDER "
+            "BY 1");
+  EXPECT_EQ(MakeOrderedQuery("SELECT * FROM (SELECT a FROM t LIMIT 3) s(x) ORDER BY x DESC")
+                .value_or(OrderedQuery{})
+                .augmented_sql,
+            "SELECT *, x AS \"__antb1_key0\" FROM (SELECT a FROM t LIMIT 3) AS \"s\"(\"x\") "
+            "ORDER BY x DESC");
 }
 
 // The oracle side of `SELECT v FROM t ORDER BY k [LIMIT/OFFSET]` for (v, k) rows in DuckDB's order.

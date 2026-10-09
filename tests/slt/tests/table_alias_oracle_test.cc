@@ -1,13 +1,13 @@
 // sql::Parse against DuckDB itself (parse only, through json_serialize_sql) for every word of
-// duckdb_keywords() in every place of a FROM list where a table alias may stand: DuckDB reads the
-// word as the item's alias exactly when sql::Parse does. A DuckDB update that gives a word a
-// meaning after a FROM item (a new kind of join, say) fails here until the word joins the parser's
-// table of words that are never aliases (kNotAnAlias), so that antb1 never answers such a query
-// as an inner join with an alias. In every place, also after an alias, after an ON condition and
-// where the word would call a table function or qualify a name, a statement that sql::Parse
-// accepts must parse in DuckDB, and one that it rejects as malformed must fail in DuckDB's parser
-// too. Only a parser error counts as a failure to parse: any other error of json_serialize_sql
-// fails the test.
+// duckdb_keywords() in every place of a FROM list where a table alias may stand, after a table or a
+// derived table: DuckDB reads the word as the item's alias exactly when sql::Parse does. A DuckDB
+// update that gives a word a meaning after a FROM item (a new kind of join, say) fails here until
+// the word joins the parser's table of words that are never aliases (kNotAnAlias), so that antb1
+// never answers such a query as an inner join with an alias. In every place, also after an alias,
+// after an ON condition and where the word would call a table function or qualify a name, and as a
+// CTE's name or in a column alias list, a statement that sql::Parse accepts must parse in DuckDB,
+// and one that it rejects as malformed must fail in DuckDB's parser too. Only a parser error counts
+// as a failure to parse: any other error of json_serialize_sql fails the test.
 
 #include <array>
 #include <cstddef>
@@ -57,6 +57,16 @@ constexpr auto kPlaces = std::to_array<Place>({
     {.before = "SELECT 1 FROM t, LATERAL ", .after = ".f(1)", .alias = false},
     {.before = "SELECT 1 FROM (", .after = ".x CROSS JOIN t)", .alias = false},
     {.before = "SELECT 1 FROM (LATERAL ", .after = ".f(1) CROSS JOIN t)", .alias = false},
+    // After a derived table, its alias and its column alias list, in that list, and as a CTE's
+    // name or column alias: the words that are aliases there are the same.
+    {.before = "SELECT 1 FROM (SELECT 1 FROM t) ", .after = ""},
+    {.before = "SELECT 1 FROM (SELECT 1 FROM t) AS ", .after = ""},
+    {.before = "SELECT 1 FROM t, (SELECT 1 FROM t) ", .after = "", .item = 1},
+    {.before = "SELECT 1 FROM (SELECT 1 FROM t) s ", .after = "", .alias = false},
+    {.before = "SELECT 1 FROM (SELECT 1 FROM t) AS s(x) ", .after = "", .alias = false},
+    {.before = "SELECT 1 FROM (SELECT 1 FROM t) AS s(", .after = ")", .alias = false},
+    {.before = "WITH ", .after = " AS (SELECT 1 FROM t) SELECT 1 FROM t", .alias = false},
+    {.before = "WITH c(", .after = ") AS (SELECT 1 FROM t) SELECT 1 FROM t", .alias = false},
 });
 
 // `text` as a SQL string literal.
@@ -131,7 +141,7 @@ TEST(TableAliasOracle, DuckDbReadsAKeywordAsATableAliasExactlyWhenAntb1Does) {
   }
   EXPECT_GT(words, kPlaces.size() * 400);
   // The words that are aliases in neither engine are 105 of 489 in DuckDB 1.5.5.
-  EXPECT_GT(aliases, 6U * 300U);
+  EXPECT_GT(aliases, 9U * 300U);
 }
 
 }  // namespace

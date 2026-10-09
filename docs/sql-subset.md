@@ -56,7 +56,9 @@ and the executor runs it. Keywords are case-insensitive.
 
 ```ebnf
 statement   = query , [ ";" ] ;
-query       = "SELECT" , select_list , "FROM" , from_list , [ "WHERE" , expr ] ,
+query       = [ "WITH" , cte , { "," , cte } ] , block ;
+cte         = identifier , [ columns ] , "AS" , "(" , query , ")" ;
+block       = "SELECT" , select_list , "FROM" , from_list , [ "WHERE" , expr ] ,
               [ "GROUP" , "BY" , expr , { "," , expr } ] , [ "HAVING" , expr ] ,
               [ "ORDER" , "BY" , order_item , { "," , order_item } ] ,
               [ limit_offset ] ;
@@ -68,7 +70,9 @@ from_list   = from_item , { "," , from_item
                           | "CROSS" , "JOIN" , from_item
                           | [ "INNER" ] , "JOIN" , from_item , "ON" , expr
                           | "LEFT" , [ "OUTER" ] , "JOIN" , from_item , "ON" , expr } ;
-from_item   = ( identifier | string_literal ) , [ [ "AS" ] , identifier | "AS" , string_literal ] ;
+from_item   = ( identifier | string_literal ) , [ [ "AS" ] , identifier | "AS" , string_literal ]
+            | "(" , query , ")" , [ ( [ "AS" ] , identifier | "AS" , string_literal ) , [ columns ] ] ;
+columns     = "(" , identifier , { "," , identifier } , ")" ;
 column_ref  = [ identifier , "." ] , identifier ;
 expr        = expr , "OR" , expr | expr , "AND" , expr | "NOT" , expr | condition | sum ;
 condition   = sum , cmp_op , sum
@@ -113,13 +117,26 @@ the items before it. A `JOIN` binds tighter than a comma and associates to the l
 a comma take no `ON`, and the other joins need one (a syntax error otherwise, as in DuckDB). The `ON` condition is split
 at its top-level `AND` chain like `WHERE`.
 
+Nested queries: a derived table (a query in parentheses in FROM) and the query of a common table expression (a CTE of a
+`WITH` list) are queries of their own. Each may start with a `WITH` list, which stands nowhere else, and its block
+places aggregates by the rules above afresh; it has the grammar's known gaps too (see below). A nested query is one
+level below the clauses around it, so it counts against the depth limit together with the expressions inside it: 256
+derived tables, each in the FROM list of the next, parse, and so do 255 CTEs around `SELECT a FROM t`, whose select item
+is the 256th level. A column alias list follows a derived table's alias (`FROM (...) AS s(x, y)`) or a CTE's name
+(`WITH c(x, y) AS (...)`), and the parser takes it at any length. Within one `WITH` list the CTE names differ ASCII
+case-insensitively, as in DuckDB: a repeated one (`c` and `"C"`, also `'c'`, but not `E'c'` or `$$c$$`, which are
+unsupported first) is a syntax error at the repeated name, before its query is parsed, while a nested `WITH` list may
+reuse a name. Until the binder answers them (roadmap PR J4, [ADR 0022](adr/0022-joins-and-query-blocks.md)), it rejects
+a `WITH` list at its `WITH` and a derived table at its `(` with exit code 4, in query order (the `WITH` list first) and
+before any table resolves.
+
 Lexical rules: an `identifier` is a letter or `_` followed by letters, digits or `_`, or any text in double quotes
 (`""` escapes a quote); a `string_literal` is text in single quotes (`''` escapes a quote); an `integer` is a
 sequence of digits; a `decimal` is a number with a decimal point, an exponent or both (`1.5`, `.5`, `5.`, `1e3`).
 Keywords are not reserved by the lexer. A `-` directly before a number makes a negative literal, except when `::`
-follows the number: `-1::INTEGER` is `-(CAST(1 AS INTEGER))`, as in DuckDB. The `identifier` of a `type` is unquoted
-and case-insensitive (`date` is `DATE`); its parameters are integers (`DECIMAL(15, 2)`). `CAST(x AS T)` and `x::T`
-are the same expression.
+follows the number: `-1::INTEGER` is `-(CAST(1 AS INTEGER))`, as in DuckDB. The `identifier` of a `type` and the field
+of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's parameters are integers (`DECIMAL(15, 2)`).
+`CAST(x AS T)` and `x::T` are the same expression.
 
 - Reserved words: these 60 words are no unquoted column, table or alias names (an error, with the exceptions below);
   quoted they are names like any other (`"from"`): `ALL`, `AND`, `ANY`, `ARRAY`, `AS`, `ASC`, `BETWEEN`, `BY`,
@@ -156,15 +173,23 @@ are the same expression.
   `GLOB`, `INITIALLY`, `ISNULL`, `LAMBDA`, `LEADING`, `NOTNULL`, `ONLY`, `OVERLAPS`, `PIVOT`, `PIVOT_LONGER`,
   `PIVOT_WIDER`, `PLACING`, `POSITIONAL`, `PRIMARY`, `REFERENCES`, `RETURNING`, `SEMI`, `SHOW`, `SUMMARIZE`,
   `SYMMETRIC`, `TABLESAMPLE`, `TO`, `TRAILING`, `UNIQUE`, `UNPACK`, `UNPIVOT`, `VARIADIC` and `VERBOSE`. After a FROM
-  item (a table, a path or an alias) such a word is unsupported where DuckDB gives it a meaning: `SEMI`, `ANTI` or
-  `POSITIONAL` before `JOIN`, `ASOF` before a join, `AT (` (time travel), `PIVOT (`, `UNPIVOT` before `(`, `INCLUDE`
-  or `EXCLUDE`, and `TABLESAMPLE` before a number, `(` or a name and `(`; after an `ON` condition the joins, `PIVOT` and
-  `UNPIVOT`, and the operators `GLOB`, `AT TIME ZONE`, `ISNULL` and `NOTNULL`. Anywhere else after a FROM item it is a
-  syntax error, as in DuckDB (`FROM t semi`: a table alias cannot be the keyword SEMI). Read as an alias, `SEMI` and
-  `ANTI` would turn DuckDB's semi and anti joins into inner joins. Quoted (`FROM t "semi"`) every word is an alias,
-  and elsewhere the 49 words are names (divergence D21).
+  item (a table, a path, a derived table, an alias or a column alias list) such a word is unsupported where DuckDB
+  gives it a meaning: `SEMI`, `ANTI` or `POSITIONAL` before `JOIN`, `ASOF` before a join, `AT (` (time travel, after a
+  table or a path only), `PIVOT (`, `UNPIVOT` before `(`, `INCLUDE` or `EXCLUDE`, and `TABLESAMPLE` before a number,
+  `(` or a name and `(`; after an `ON` condition the joins, `PIVOT` and `UNPIVOT`, and the operators `GLOB`,
+  `AT TIME ZONE`, `ISNULL` and `NOTNULL`. Anywhere else after a FROM item it is a syntax error, as in DuckDB
+  (`FROM t semi`: a table alias cannot be the keyword SEMI). Read as an alias, `SEMI` and `ANTI` would turn DuckDB's
+  semi and anti joins into inner joins. Quoted (`FROM t "semi"`) every word is an alias, and elsewhere the 49 words are
+  names (divergence D21).
+- CTE names and column aliases follow the rules of a table alias without `AS`: a name, a quoted identifier, `BETWEEN`,
+  `EXISTS`, `INTERVAL` or `OVER`, never one of the 49 words (a syntax error, as in DuckDB). DuckDB also takes a string
+  literal there, which is unsupported. `RECURSIVE` right after `WITH` is unsupported (`WITH RECURSIVE`), unless `AS`,
+  `(` or `USING` follows it: then it names the first CTE, as in DuckDB. A CTE named `BETWEEN`, `EXISTS`, `INTERVAL` or
+  `OVER` is read quoted only (`FROM "over"`): unquoted, these words are no table names (divergence D21), so
+  `WITH over AS (...) SELECT a FROM over` is a syntax error, which DuckDB answers.
 - The canonical form (`sql::ToSql`, [ADR 0008](adr/0008-parser-and-unparser.md)) writes every alias quoted after `AS`
-  (`FROM t AS "a"`), `JOIN` as `INNER JOIN`, `LEFT OUTER JOIN` as `LEFT JOIN`, and a qualifier as written.
+  (`FROM t AS "a"`), `JOIN` as `INNER JOIN`, `LEFT OUTER JOIN` as `LEFT JOIN`, a qualifier as written, a nested query
+  in parentheses, and CTE names and column aliases quoted (`WITH "c"("x") AS (...)`, `FROM (...) AS "s"("x")`).
 
 **What the binder answers today.** Of the grammar above, antb1 answers:
 
@@ -207,19 +232,29 @@ are the same expression.
 Every other expression (function calls other than the five aggregates and the functions above, `EXTRACT` of other
 fields, a condition used as a value, as in `SELECT a = 1`, a comparison of two constants, a bare column as a
 condition, `TRY_CAST` and every other cast, such as `CAST(a AS BIGINT)` or `CAST(d AS DATE)`) parses, and is then
-rejected by the binder with exit code 4 at its first unsupported token, before any name is resolved. `GROUP BY ALL`
-and `ORDER BY ALL` are rejected by the parser, and so are `SUM`, `AVG`, `MIN` and `MAX` with `DISTINCT`.
+rejected by the binder with exit code 4 at its first unsupported token, before any name is resolved. `GROUP BY ALL`,
+the empty grouping set `GROUP BY ()` and `ORDER BY ALL` are rejected by the parser, and so are `SUM`, `AVG`, `MIN` and
+`MAX` with `DISTINCT`, and a string or quoted field name in `EXTRACT` (`EXTRACT('year' FROM d)`), which DuckDB accepts.
 
 Outside the grammar, the parser recognizes common SQL and rejects it with exit code 4 and a source span, among others:
-`SELECT DISTINCT`, subqueries, `ILIKE`, `GLOB`, `LIKE ... ESCAPE`, `NULL` literals, `IS [NOT] NULL`, `AT TIME ZONE`,
-`||`, window functions, unary `+`, and in casts quoted or qualified type names, type names of several words
-(`DOUBLE PRECISION`, `TIMESTAMP WITH TIME ZONE`), array types, `INTERVAL` and `UNION` types and type parameters other
-than integers. After `LIMIT` and `OFFSET`: expressions such as `LIMIT 1 + 1`, `LIMIT '5'` and `LIMIT (5)`, calls and
+`SELECT DISTINCT`, subqueries in expressions, `ILIKE`, `GLOB`, `LIKE ... ESCAPE`, `NULL` literals, `IS [NOT] NULL`,
+`AT TIME ZONE`, `||`, window functions, unary `+`, and in casts quoted or qualified type names, type names of several
+words (`DOUBLE PRECISION`, `TIMESTAMP WITH TIME ZONE`), array types, `INTERVAL` and `UNION` types and type parameters
+other than integers. After `LIMIT` and `OFFSET`: expressions such as `LIMIT 1 + 1`, `LIMIT '5'` and `LIMIT (5)`, calls and
 typed literals, also of quoted and qualified names of at most three parts (`LIMIT abs(5)`, `LIMIT main.abs(5)`,
-`LIMIT integer '5'`, `LIMIT E'5'`), a percentage and `LIMIT ALL`; a column there (`LIMIT a`, `LIMIT t.a`) and a call
-or a typed literal of a longer name (`LIMIT a.b.c.d(1)`) are syntax errors, and DuckDB refuses them too. Known gaps:
+`LIMIT integer '5'`, `LIMIT E'5'`), a percentage, `LIMIT ALL` and `ROW` or `ROWS` after the value of `OFFSET`
+(`OFFSET 5 ROWS`, also next to a `LIMIT`, which DuckDB answers; `LIMIT 5 ROWS` is a syntax error, as in DuckDB); a
+column there (`LIMIT a`, `LIMIT t.a`) and a call or a typed literal of a longer name (`LIMIT a.b.c.d(1)`) are syntax
+errors, and DuckDB refuses them too. Known gaps, among others:
 `LIMIT` and `OFFSET` expressions that start with `CASE`, `NOT` or a unary minus (`LIMIT -(-5)`) and conditions
-(`LIMIT 5 = 5`, `LIMIT 5 AND 3`) are syntax errors (exit code 1), although DuckDB answers them. In FROM:
+(`LIMIT 5 = 5`, `LIMIT 5 AND 3`) are syntax errors (exit code 1), although DuckDB answers them, and so are a trailing
+comma in an `IN` list (`a IN (1,)`), `IN` before a list or a list column (`a IN [1, 2]`, `a IN b`), `BETWEEN ASYMMETRIC`
+(`asymmetric` is a name, divergence D21), `MAP {...}`, a prefix alias (`SELECT x: 1`, `FROM x: t`), an exponent without
+digits (`1e`, which DuckDB reads as `1 AS e`), a number that a name follows directly (`1x`, which DuckDB reads as
+`1 AS x`), named arguments (`round(x := 2.5)`), a slice without its lower bound (`b[:2]`; `b[1:2]` is unsupported), a
+`$` inside a name (`a$b`, which antb1 reads as a parameter), a one-parameter lambda (`lambda x: x + 1`) and a string
+that continues after a line break (`'a'` and `'b'` on the next line, which DuckDB reads as `'ab'`), also in a nested
+query; inside the arguments of a call some of them are unsupported (exit code 4) instead. In FROM:
 `JOIN ... USING`, `NATURAL`, `RIGHT` and `FULL` joins, `SEMI`, `ANTI`, `ASOF` and `POSITIONAL`
 joins, nested joins (a `JOIN` before the `ON` of an earlier one) and joins in parentheses, `LATERAL` before a subquery
 or a table function (also one with a qualified name: `LATERAL main.range(3)`), `schema.table`, `ONLY`, table functions
@@ -239,6 +274,32 @@ error), such as a table in parentheses that anything else follows (`FROM (t a)`,
 qualifier: `FROM (over.x)`), `LATERAL` in parentheses before `(`, a name or a reserved word that DuckDB takes as a
 function name or a qualifier (`FROM (LATERAL t)`, `FROM (LATERAL between)`), `LATERAL` before a qualified name
 without a call (`LATERAL s.t`, `LATERAL over.x`) or `NATURAL LEFT OUTER u`.
+
+In `WITH` lists and nested queries, these are unsupported (exit code 4): `WITH RECURSIVE`, `MATERIALIZED`,
+`NOT MATERIALIZED` and `USING KEY`; a string literal as a CTE name or a column alias (`WITH 'c' AS`, `s('x')`) and a
+trailing comma in a column alias list (`s(x,)`), which DuckDB accepts; a query in parentheses (in FROM or as a CTE's
+query) that starts with no `SELECT` or `WITH` (`(VALUES (1))`, `(FROM t)`, `(TABLE t)`, `(PIVOT ...)` and
+`(UNPIVOT ...)`, also written `PIVOT_WIDER` and `PIVOT_LONGER`, in FROM also `(DESCRIBE t)`, `(SHOW t)` and
+`(SUMMARIZE t)`, or `((SELECT ...))`, at its first token), also after a `WITH` list (`WITH c AS (...) FROM c`); a
+statement other than a query after a `WITH` list, which DuckDB runs (`WITH c AS (...) INSERT ...`, also `UPDATE`,
+`DELETE` and `MERGE`); and in
+a nested query `SELECT` without `FROM` (`(SELECT 1)`, which DuckDB answers), a trailing comma in its select list, FROM
+list or `GROUP BY`, and the clauses that are unsupported after a statement (`UNION`, `FETCH`, ...). As elsewhere, a
+construct is reported at its first token, so some of these are unsupported where DuckDB gives a syntax error, among
+others: a trailing comma in a nested `ORDER BY` (`(SELECT ... ORDER BY a,)`); a nested query that `;` or the end of the
+input cuts short (`(SELECT 1;`, `FROM (SELECT 1`, `FROM (SELECT a FROM t,`); `MATERIALIZED` without `(`; `RECURSIVE`
+that no CTE follows (`WITH RECURSIVE;`, `WITH recursive, c AS (...)`); a word that starts a query, alone in parentheses
+or before something else there (`FROM (pivot)`, `FROM (pivot_wider JOIN u ON ...)`, `WITH c AS (values) ...`);
+`(DESCRIBE t)`, `(SHOW t)` and `(SUMMARIZE t)` as a CTE's query, which DuckDB takes in FROM only; another statement as
+a CTE's query (`WITH c AS (DROP TABLE t) ...`) or one that DuckDB refuses after a `WITH` list
+(`WITH c AS (...) DESCRIBE c`); what DuckDB refuses after `OFFSET n ROWS` (`OFFSET 1 ROWS ONLY`); a string CTE name
+that a later CTE of its list repeats; and an escape or dollar-quoted CTE name that repeats an earlier one
+(`WITH c AS (...), E'c' AS (...)`). Syntax errors (exit code 1), as in DuckDB: a
+`WITH` list without its query (`WITH c AS (...)`, also before `;` or `)`), a CTE without `AS` or its parentheses, a
+trailing comma in a `WITH` list, a second `WITH` list, an empty column alias list or one with a comma alone, a column
+alias list after a derived table without an alias (`FROM (...) (x)`) or after a second one, a repeated CTE name,
+`AT (...)` after a derived table, and `FROM (values)` (`values` is a name there: `FROM (values JOIN u ON ...)` is a join
+in parentheses).
 
 ## Binding
 

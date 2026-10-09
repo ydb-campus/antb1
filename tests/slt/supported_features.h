@@ -89,6 +89,9 @@ enum class Feature : std::uint8_t {
   kQuotedIdentifier,  // "quoted" table and column names
   kLayout,            // newlines, tabs, -- and /* */ comments between tokens
   kSemicolon,         // a trailing ';'
+  // Nested queries (ADR 0022: roadmap PR T2 generates them, J4 declares them supported)
+  kDerivedTable,     // FROM (SELECT ...) [AS] s [(x, ...)]
+  kCommonTableExpr,  // WITH c [(x, ...)] AS (SELECT ...) SELECT ...
   // Out-of-scope marker, the last Feature (new ones go above it): never in kSupportedFeatures and
   // never generated. The harness self-tests tag their "pending" canary query with it, so that path
   // stays tested.
@@ -209,6 +212,10 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "offset";
     case Feature::kHaving:
       return "having";
+    case Feature::kDerivedTable:
+      return "derived_table";
+    case Feature::kCommonTableExpr:
+      return "cte";
     case Feature::kWindowFunctions:
       return "window_functions";
   }
@@ -280,10 +287,11 @@ using FeatureSet = BasicFeatureSet<Feature, kFeatureCount>;
 inline constexpr FeatureSet kNeverGenerated = {Feature::kWindowFunctions};
 
 // Grammar that the parser accepts ahead of the random generator (runner/query_gen.cc), which
-// learns it in a later PR (ADR 0022: T2 LEFT JOIN) and then removes it from this set. Valid in
-// `-- features:` tags, and never in kSupportedFeatures while pending (checked below), so that no
-// feature is declared supported before it is generated.
-inline constexpr FeatureSet kGeneratorPending = {Feature::kLeftJoin};
+// learns it in a later PR (ADR 0022's T2: LEFT JOIN, derived tables and WITH lists) and then
+// removes it from this set. Valid in `-- features:` tags, and never in kSupportedFeatures while
+// pending (checked below), so that no feature is declared supported before it is generated.
+inline constexpr FeatureSet kGeneratorPending = {Feature::kLeftJoin, Feature::kDerivedTable,
+                                                 Feature::kCommonTableExpr};
 
 // What antb1 answers today: the whole slice grammar of docs/sql-subset.md (global and grouped
 // aggregates, projections, WHERE conjunctions of column <op> literal, ORDER BY, LIMIT and OFFSET)

@@ -1,0 +1,1 @@
+SELECT s.x, COUNT(*) FROM (SELECT a AS x FROM t WHERE a > 1) AS s(x) JOIN (SELECT b FROM 'u.parquet') v ON s.x = v.b GROUP BY s.x

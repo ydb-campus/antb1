@@ -97,9 +97,10 @@ steps (only step 7 uses more than one thread):
    footer is read, schemas must match, and column overrides such as `--clickbench` (EventDate as DATE) apply. No
    data pages are read at this point.
 3. Parse (`sql::Parse`): tokens, then a `SelectStatement` AST with spans; expressions are trees (`sql::Expr`), parsed
-   by precedence climbing with a depth limit, and the FROM clause is a flat list of items (tables or paths, with
-   their aliases and joins). Syntax outside the grammar is a `kUnsupported` error with the span of
-   the offending token. The engine converts a parse error with
+   by precedence climbing with a depth limit, and the FROM clause is a flat list of items (tables, paths or derived
+   tables, with their aliases and joins). A derived table and each query of a `WITH` list are `SelectStatement`s of
+   their own, held in heap boxes, and every such nested query counts against the same depth limit. Syntax outside the
+   grammar is a `kUnsupported` error with the span of the offending token. The engine converts a parse error with
    `plan::ToArrowStatus` into an `arrow::Status` that carries a `SqlErrorDetail`.
 4. Bind (`plan::Bind`): what the binder does not answer yet (a FROM list of several items, an alias, a qualified
    name, many expressions) is `kUnsupported` before any name resolves; then

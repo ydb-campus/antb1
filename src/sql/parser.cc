@@ -14,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -27,7 +28,9 @@
 // Hand-written recursive-descent parser for the grammar in docs/sql-subset.md:
 //
 //   statement   := query [';'] EOF
-//   query       := SELECT select_list FROM from_list [WHERE expr] [GROUP BY expr (',' expr)*]
+//   query       := [WITH cte (',' cte)*] block
+//   cte         := name [columns] AS '(' query ')'
+//   block       := SELECT select_list FROM from_list [WHERE expr] [GROUP BY expr (',' expr)*]
 //                  [HAVING expr] [ORDER BY order_item (',' order_item)*]
 //                  [LIMIT integer] [OFFSET integer]      (LIMIT and OFFSET in either order)
 //   select_list := '*' | expr [[AS] identifier] (',' expr [[AS] identifier])*
@@ -35,7 +38,9 @@
 //   from_list   := from_item (',' from_item | CROSS JOIN from_item | [INNER] JOIN from_item ON expr
 //                  | LEFT [OUTER] JOIN from_item ON expr)*
 //   from_item   := (identifier | quoted_identifier | string_literal) [[AS] alias]
+//                | '(' query ')' [[AS] alias [columns]]
 //   alias       := identifier | quoted_identifier, and after AS also a string_literal
+//   columns     := '(' name (',' name)* ')'       (a name: as an implicit table alias)
 //   expr        := precedence climbing over, from loosest to tightest: OR; AND; NOT; comparisons,
 //                  [NOT] LIKE, [NOT] IN and [NOT] BETWEEN (not chained); + -; * / // %; unary -;
 //                  postfix. BETWEEN's bounds are additive expressions, so it consumes its own AND.
@@ -53,13 +58,15 @@
 // The parser keeps expressions as written; what the engine answers is the binder's decision. The
 // FROM list is flat (ADR 0022): each item records its connector to the items before it, and the
 // list is collected in a loop. The ON, WHERE and HAVING predicates are split at their top-level
-// AND chain, collected in a loop too.
+// AND chain, collected in a loop too. A query in parentheses (a derived table, or the query of a
+// common table expression) is a block of its own, with fresh aggregate-placement contexts, built
+// on the heap; it ends at its ')'.
 // Recursion is bounded: every level of an expression tree (but that chain) counts against
 // kMaxDepth, and so do the levels that the canonical form of a cast, a unary minus or a NOT
-// operand adds (ToSql writes x::T as CAST(x AS T), -x as -(x) and a = NOT b as a = (NOT b)); a
-// predicate with a top-level OR is written bare, so it reads back as it was parsed. Tokens are
-// pulled lazily from the lexer (at most three tokens of lookahead), so work and memory stop at the
-// first error whatever the input.
+// operand adds (ToSql writes x::T as CAST(x AS T), -x as -(x) and a = NOT b as a = (NOT b)), and
+// every nested query, one level below the clauses around it; a predicate with a top-level OR is
+// written bare, so it reads back as it was parsed. Tokens are pulled lazily from the lexer (at
+// most three tokens of lookahead), so work and memory stop at the first error whatever the input.
 // Recognized SQL outside the grammar yields kUnsupported at its first offending token and names the
 // construct; anything else yields kSyntax. A lexer error among the tokens the parser looked at wins
 // over the parser's own verdict, which may have been reached on the placeholder end-of-input token.
@@ -114,13 +121,15 @@ constexpr auto kReservedWords = std::to_array<std::string_view>({
 });
 static_assert(std::ranges::is_sorted(kReservedWords));
 
-// Statements other than SELECT (reported at their first keyword).
+// Statements other than SELECT (reported at their first keyword; PIVOT_WIDER and PIVOT_LONGER are
+// DuckDB's other names of PIVOT and UNPIVOT).
 constexpr auto kOtherStatements = std::to_array<std::string_view>({
-    "ALTER",    "ANALYZE", "ATTACH",   "BEGIN",    "CALL",   "CHECKPOINT", "COMMIT",    "COPY",
-    "CREATE",   "DELETE",  "DESCRIBE", "DETACH",   "DROP",   "EXECUTE",    "EXPLAIN",   "EXPORT",
-    "GRANT",    "IMPORT",  "INSERT",   "INSTALL",  "LOAD",   "MERGE",      "PIVOT",     "PRAGMA",
-    "PREPARE",  "RESET",   "REVOKE",   "ROLLBACK", "SET",    "SHOW",       "SUMMARIZE", "TABLE",
-    "TRUNCATE", "UNPIVOT", "UPDATE",   "USE",      "VACUUM", "VALUES",
+    "ALTER",   "ANALYZE",  "ATTACH",       "BEGIN",       "CALL",      "CHECKPOINT", "COMMIT",
+    "COPY",    "CREATE",   "DELETE",       "DESCRIBE",    "DETACH",    "DROP",       "EXECUTE",
+    "EXPLAIN", "EXPORT",   "GRANT",        "IMPORT",      "INSERT",    "INSTALL",    "LOAD",
+    "MERGE",   "PIVOT",    "PIVOT_LONGER", "PIVOT_WIDER", "PRAGMA",    "PREPARE",    "RESET",
+    "REVOKE",  "ROLLBACK", "SET",          "SHOW",        "SUMMARIZE", "TABLE",      "TRUNCATE",
+    "UNPIVOT", "UPDATE",   "USE",          "VACUUM",      "VALUES",
 });
 
 // Clauses that can follow the select list, the FROM list, the predicate or LIMIT. The join keywords
@@ -220,6 +229,7 @@ struct NotAnAlias {
   Follows follows = Follows::kNothing;
   std::string_view construct;  // the kUnsupported message where the word has its meaning
   bool after_on = false;       // the meaning also exists right after an ON condition
+  bool tables_only = false;    // the meaning exists after a table or a path, not a derived table
 };
 
 // The words that DuckDB 1.5.5 refuses as table aliases (implicit or after AS) and antb1 does not
@@ -241,7 +251,10 @@ constexpr auto kNotAnAlias = std::to_array<NotAnAlias>({
      .construct = "ASOF JOIN is not supported",
      .after_on = true},
     {.keyword = "ASYMMETRIC"},
-    {.keyword = "AT", .follows = Follows::kParen, .construct = "AT (time travel) is not supported"},
+    {.keyword = "AT",
+     .follows = Follows::kParen,
+     .construct = "AT (time travel) is not supported",
+     .tables_only = true},
     {.keyword = "AUTHORIZATION"},
     {.keyword = "BINARY"},
     {.keyword = "BOTH"},
@@ -323,11 +336,11 @@ constexpr auto kFunctionKeywords =
     std::to_array<std::string_view>({"CROSS", "FULL", "ILIKE", "INNER", "IS", "JOIN", "LEFT",
                                      "LIKE", "NATURAL", "OUTER", "OVER", "RIGHT", "SIMILAR"});
 
-// The first words of a query in parentheses in FROM (a subquery), as DuckDB parses them; a '('
-// starts one too.
+// The first words of a query in parentheses in FROM (a derived table), as DuckDB parses them; a
+// '(' starts one too, and so does what StartsOtherQuery tells.
 constexpr auto kSubqueryStarts =
-    std::to_array<std::string_view>({"DESCRIBE", "FROM", "PIVOT", "SELECT", "SHOW", "SUMMARIZE",
-                                     "TABLE", "UNPIVOT", "VALUES", "WITH"});
+    std::to_array<std::string_view>({"DESCRIBE", "PIVOT", "PIVOT_LONGER", "PIVOT_WIDER", "SELECT",
+                                     "SHOW", "SUMMARIZE", "UNPIVOT", "WITH"});
 
 constexpr bool IsReservedWordOf(std::string_view word) {
   return std::ranges::binary_search(kReservedWords, word);
@@ -583,22 +596,14 @@ bool IsClauseKeyword(std::string_view keyword) {
          Find(kUnsupportedClauses, keyword).has_value();
 }
 
-// Tokens that may follow a complete list (select list, GROUP BY, ORDER BY); a comma before one of
-// them is a trailing comma.
-bool EndsList(const Token& token) {
-  return token.kind == TokenKind::kEnd || token.kind == TokenKind::kSemicolon ||
-         IsClauseKeyword(KeywordOf(token));
-}
-
 std::string_view Expectation(Context context) {
   return context == Context::kSelect ? "an expression or '*'" : "an expression";
 }
 
-ParseError NotAQuery(const Token& token) {
+// The error for `token` where a query's SELECT should be: at the start of the statement
+// (`statement_start`), after a WITH list or after the '(' of a nested query.
+ParseError NotAQuery(const Token& token, bool statement_start) {
   const std::string keyword = KeywordOf(token);
-  if (keyword == "WITH") {
-    return UnsupportedError(token.span, "WITH (common table expressions) is not supported");
-  }
   if (keyword == "FROM") {
     return UnsupportedError(token.span, "FROM-first queries are not supported");
   }
@@ -609,11 +614,14 @@ ParseError NotAQuery(const Token& token) {
   if (token.kind == TokenKind::kLeftParen) {
     return UnsupportedError(token.span, "parenthesized queries are not supported");
   }
-  if (token.kind == TokenKind::kEnd) {
+  if (token.kind == TokenKind::kEnd && statement_start) {
     return SyntaxError(token.span, "empty query; expected SELECT");
   }
   return SyntaxError(token.span, "expected SELECT, found " + Describe(token));
 }
+
+// Where a block ends: at the end of the statement, or at the ')' of a nested query.
+enum class BlockEnd : std::uint8_t { kStatement, kParenthesis };
 
 class Parser {
  public:
@@ -628,42 +636,237 @@ class Parser {
   }
 
  private:
+  // The state of the block being parsed, for the time a nested block is parsed: where the block
+  // ends, and the expression state, which a block starts without (no unary minus's operand).
+  class BlockScope {
+   public:
+    BlockScope(Parser& parser, BlockEnd end)
+        : parser_(parser),
+          end_(std::exchange(parser.block_end_, end)),
+          minus_operand_(std::exchange(parser.minus_operand_, false)) {}
+    BlockScope(const BlockScope&) = delete;
+    BlockScope& operator=(const BlockScope&) = delete;
+    BlockScope(BlockScope&&) = delete;
+    BlockScope& operator=(BlockScope&&) = delete;
+    ~BlockScope() {
+      parser_.block_end_ = end_;
+      parser_.minus_operand_ = minus_operand_;
+    }
+
+   private:
+    Parser& parser_;
+    BlockEnd end_;
+    bool minus_operand_;
+  };
+
   Expected<SelectStatement> ParseStatement() {
+    SelectStatement stmt;
+    if (auto status = ParseQuery(stmt, BlockEnd::kStatement); !status) {
+      return std::unexpected(std::move(status.error()));
+    }
+    return stmt;
+  }
+
+  // query := [WITH cte (',' cte)*] block, the block ending at `end`. Its span starts at the WITH.
+  Status ParseQuery(SelectStatement& stmt, BlockEnd end) {
+    if (Peek().IsKeyword("WITH")) {
+      if (auto status = ParseWith(stmt); !status) {
+        return status;
+      }
+    }
+    if (auto status = ParseBlock(stmt, end); !status) {
+      return status;
+    }
+    if (!stmt.with.empty()) {
+      stmt.span = Cover(stmt.with_span, stmt.span);
+    }
+    return {};
+  }
+
+  // WITH cte (',' cte)*, positioned at WITH. RECURSIVE right after WITH is unsupported, unless it
+  // names the first CTE (as in DuckDB: then AS, '(' or USING follows it).
+  Status ParseWith(SelectStatement& stmt) {
+    stmt.with_span = Take().span;
+    if (Peek().IsKeyword("RECURSIVE")) {
+      const Token& next = PeekAt(1);
+      if (!next.IsKeyword("AS") && next.kind != TokenKind::kLeftParen && !next.IsKeyword("USING")) {
+        return Unsupported(Peek().span, "WITH RECURSIVE is not supported");
+      }
+    }
+    std::unordered_set<std::string> names;  // ASCII upper-cased
+    while (true) {
+      auto cte = ParseCte(names);
+      if (!cte) {
+        return std::unexpected(std::move(cte.error()));
+      }
+      stmt.with.push_back(*std::move(cte));
+      if (Peek().kind != TokenKind::kComma) {
+        return {};
+      }
+      Take();
+    }
+  }
+
+  // name [columns] AS '(' query ')', positioned at the name. The name follows the rules of an
+  // implicit table alias; DuckDB also takes a string there, which is unsupported. A name that
+  // repeats one of the list's earlier `names` (ASCII case-insensitively, as in DuckDB, also a
+  // plain string's; an escape or a dollar-quoted string is unsupported first) is a syntax error
+  // at the name, before the query is parsed.
+  Expected<CommonTableExpr> ParseCte(std::unordered_set<std::string>& names) {
+    constexpr std::string_view kStringName =
+        "string literals as CTE names are not supported; write the name as a quoted identifier";
+    const Token& token = Peek();
+    if (PrefixedStringAt() != PrefixedString::kNone) {
+      return Unsupported(token.span, kStringName);
+    }
+    const bool is_string = token.kind == TokenKind::kString;
+    if (!is_string && !IsTableAlias(token, /*after_as=*/false)) {
+      if (const NotAnAlias* word = FindNotAnAlias(token)) {
+        return Syntax(token.span, "a CTE name cannot be the keyword " + std::string(word->keyword) +
+                                      "; write it as a quoted identifier");
+      }
+      return Syntax(token.span, "expected a CTE name, found " + Describe(token));
+    }
+    if (!names.insert(AsciiUpper(token.text)).second) {
+      return Syntax(token.span,
+                    "duplicate CTE name in the WITH list (names match case-insensitively)");
+    }
+    if (is_string) {
+      return Unsupported(token.span, kStringName);
+    }
+    Token name = Take();
+    std::vector<std::string> columns;
+    SourceSpan columns_span;
+    if (Peek().kind == TokenKind::kLeftParen) {
+      if (auto status = ParseColumnAliases(columns, columns_span); !status) {
+        return std::unexpected(std::move(status.error()));
+      }
+    }
+    if (Peek().IsKeyword("USING") && PeekAt(1).IsKeyword("KEY")) {
+      return Unsupported(Cover(Peek().span, PeekAt(1).span), "USING KEY is not supported");
+    }
+    if (!Peek().IsKeyword("AS")) {
+      return Syntax(Peek().span, "expected AS in the WITH list, found " + Describe(Peek()));
+    }
+    Take();
+    if (Peek().IsKeyword("MATERIALIZED")) {
+      return Unsupported(Peek().span, "MATERIALIZED is not supported");
+    }
+    if (Peek().IsKeyword("NOT") && PeekAt(1).IsKeyword("MATERIALIZED")) {
+      return Unsupported(Cover(Peek().span, PeekAt(1).span), "NOT MATERIALIZED is not supported");
+    }
+    if (Peek().kind != TokenKind::kLeftParen) {
+      return Syntax(Peek().span, "expected ( after AS in the WITH list, found " + Describe(Peek()));
+    }
+    auto query = ParseNestedQuery();
+    if (!query) {
+      return std::unexpected(std::move(query.error()));
+    }
+    return CommonTableExpr{.name = std::move(name.text),
+                           .columns = std::move(columns),
+                           .query = std::move(query->query),
+                           .name_span = name.span,
+                           .columns_span = columns_span,
+                           .span = Cover(name.span, query->span)};
+  }
+
+  // '(' name (',' name)* ')', positioned at the '(': the column alias list of a CTE or of a
+  // derived table. Each name follows the rules of an implicit table alias; DuckDB also takes a
+  // string there, and a trailing comma, which are unsupported.
+  Status ParseColumnAliases(std::vector<std::string>& columns, SourceSpan& span) {
+    const SourceSpan open = Take().span;
+    while (true) {
+      const Token& token = Peek();
+      if (token.kind == TokenKind::kString || PrefixedStringAt() != PrefixedString::kNone) {
+        return Unsupported(token.span,
+                           "string literals as column aliases are not supported; write the alias "
+                           "as a quoted identifier");
+      }
+      if (!IsTableAlias(token, /*after_as=*/false)) {
+        if (const NotAnAlias* word = FindNotAnAlias(token)) {
+          return Syntax(token.span, "a column alias cannot be the keyword " +
+                                        std::string(word->keyword) +
+                                        "; write it as a quoted identifier");
+        }
+        return Syntax(token.span,
+                      "expected a column name in the column alias list, found " + Describe(token));
+      }
+      columns.push_back(Take().text);
+      const Token& next = Peek();
+      if (next.kind == TokenKind::kRightParen) {
+        span = Cover(open, Take().span);
+        return {};
+      }
+      if (next.kind != TokenKind::kComma) {
+        return Syntax(next.span,
+                      "expected , or ) in the column alias list, found " + Describe(next));
+      }
+      const SourceSpan comma = Take().span;
+      if (Peek().kind == TokenKind::kRightParen) {
+        return Unsupported(comma, "a trailing comma in a column alias list is not supported");
+      }
+    }
+  }
+
+  // '(' query ')', positioned at the '(': the query of a derived table or of a CTE, one level below
+  // the current one (the depth error at the '('). The statement is built on the heap, so a level
+  // of nesting keeps none on the stack.
+  Expected<DerivedTable> ParseNestedQuery() {
+    const std::size_t depth = depth_;
+    const std::size_t outer_peak = peak_;
+    if (auto error = Deeper(); error.has_value()) {
+      return std::unexpected(std::move(*error));
+    }
+    peak_ = depth_;
+    const SourceSpan open = Take().span;
+    DerivedTable out{.query = Box<SelectStatement>(SelectStatement{}), .span = {}};
+    auto status = ParseQuery(*out.query, BlockEnd::kParenthesis);
+    depth_ = depth;
+    peak_ = std::max(outer_peak, peak_);
+    if (!status) {
+      return std::unexpected(std::move(status.error()));
+    }
+    out.span = Cover(open, Take().span);  // the ')' that ParseBlockEnd found
+    return out;
+  }
+
+  // block := SELECT ... [LIMIT/OFFSET], then the block's end (ParseBlockEnd).
+  Status ParseBlock(SelectStatement& stmt, BlockEnd end) {
+    const BlockScope scope(*this, end);
     if (!Peek().IsKeyword("SELECT")) {
-      return std::unexpected(NotAQuery(Peek()));
+      return std::unexpected(NotAQuery(Peek(), end == BlockEnd::kStatement && stmt.with.empty()));
     }
     const std::size_t begin = Take().span.offset;
-    SelectStatement stmt;
     if (auto status = ParseSelectList(stmt); !status) {
-      return std::unexpected(std::move(status.error()));
+      return status;
     }
     if (auto status = ExpectFrom(stmt.star); !status) {
-      return std::unexpected(std::move(status.error()));
+      return status;
     }
     if (auto status = ParseFromList(stmt); !status) {
-      return std::unexpected(std::move(status.error()));
+      return status;
     }
     if (Peek().IsKeyword("WHERE")) {
       Take();
       if (auto status = ParseConjuncts(Context::kWhere, stmt.where); !status) {
-        return std::unexpected(std::move(status.error()));
+        return status;
       }
     }
     if (Peek().IsKeyword("GROUP")) {
       if (auto status = ParseGroupBy(stmt); !status) {
-        return std::unexpected(std::move(status.error()));
+        return status;
       }
     }
     if (Peek().IsKeyword("HAVING")) {
       const std::size_t having_begin = Take().span.offset;
       if (auto status = ParseConjuncts(Context::kHaving, stmt.having); !status) {
-        return std::unexpected(std::move(status.error()));
+        return status;
       }
       stmt.having_span = SourceSpan{.offset = having_begin, .length = last_end_ - having_begin};
     }
     if (Peek().IsKeyword("ORDER")) {
       if (auto status = ParseOrderBy(stmt); !status) {
-        return std::unexpected(std::move(status.error()));
+        return status;
       }
     }
     // LIMIT and OFFSET, each at most once, in either order (as in DuckDB).
@@ -688,10 +891,7 @@ class Parser {
       }
     }
     stmt.span = SourceSpan{.offset = begin, .length = last_end_ - begin};
-    if (auto status = ParseEnd(stmt); !status) {
-      return std::unexpected(std::move(status.error()));
-    }
-    return stmt;
+    return ParseBlockEnd(stmt, end);
   }
 
   Status ParseSelectList(SelectStatement& stmt) {
@@ -767,6 +967,14 @@ class Parser {
     return item;
   }
 
+  // Tokens that may follow a complete list (select list, FROM list, GROUP BY, ORDER BY); a comma
+  // before one of them is a trailing comma. In a nested query its ')' is one too.
+  bool EndsList(const Token& token) const {
+    return token.kind == TokenKind::kEnd || token.kind == TokenKind::kSemicolon ||
+           IsClauseKeyword(KeywordOf(token)) ||
+           (block_end_ == BlockEnd::kParenthesis && token.kind == TokenKind::kRightParen);
+  }
+
   // ---- expressions: precedence climbing ----
 
   // Binding power of the operator at the next token (0: none): OR 1, AND 2, (NOT 3,) comparisons,
@@ -812,9 +1020,9 @@ class Parser {
     return 0;
   }
 
-  // Every level of the tree (a nested expression, or one more operator in a chain) counts
-  // against kMaxDepth, so that the trees stay shallow enough for the recursive code that walks them
-  // (copying, comparing, unparsing, binding, destroying).
+  // Every level of the tree (a nested expression, one more operator in a chain, or a nested query)
+  // counts against kMaxDepth, so that the trees stay shallow enough for the recursive code that
+  // walks them (copying, comparing, unparsing, binding, destroying).
   std::optional<ParseError> Deeper() {
     if (++depth_ > kMaxDepth) {
       return DepthError(Peek().span);
@@ -1416,6 +1624,14 @@ class Parser {
     const SourceSpan begin = Take().span;
     Take();  // '('
     const Token& field = Peek();
+    // DuckDB also takes the field as a string or a quoted name (EXTRACT('year' FROM d)).
+    if (field.kind == TokenKind::kString || field.kind == TokenKind::kQuotedIdentifier ||
+        PrefixedStringAt() != PrefixedString::kNone) {
+      return Unsupported(
+          field.span,
+          "a string or quoted field name in EXTRACT is not supported; write the field "
+          "as a name, as in EXTRACT(year FROM ...)");
+    }
     if (field.kind != TokenKind::kIdentifier) {
       return Syntax(field.span, "expected a field name in EXTRACT(, found " + Describe(field));
     }
@@ -1742,6 +1958,9 @@ class Parser {
       Take();
       return {};
     }
+    if (block_end_ == BlockEnd::kParenthesis && token.kind == TokenKind::kRightParen) {
+      return Unsupported(token.span, "SELECT without FROM is not supported");  // DuckDB: (SELECT 1)
+    }
     const std::string keyword = KeywordOf(token);
     if (auto construct = Find(kUnsupportedClauses, keyword); construct.has_value()) {
       return Unsupported(token.span, *construct);
@@ -1778,7 +1997,7 @@ class Parser {
       if (Peek().kind == TokenKind::kComma) {
         connector_span = Take().span;
         // DuckDB allows a trailing comma before the end and the clauses after FROM. Before FROM
-        // or INTO it gives a syntax error, and so does ParseTableRef.
+        // or INTO it gives a syntax error, and so does ParseFromSource.
         if (const Token& next = Peek();
             EndsList(next) && !next.IsKeyword("FROM") && !next.IsKeyword("INTO")) {
           return Unsupported(connector_span, "a trailing comma in FROM is not supported");
@@ -1886,23 +2105,27 @@ class Parser {
     return SyntaxError(token.span, "expected JOIN after " + after + ", found " + Describe(token));
   }
 
-  // from_item: a table or a path, then its alias. After an item a word of kNotAnAlias is never an
-  // alias (ParseAlias).
+  // from_item: a table, a path or a derived table, then its alias. After an item a word of
+  // kNotAnAlias is never an alias (ParseAlias).
   Expected<FromItem> ParseFromItem(Connector connector, SourceSpan connector_span) {
-    auto table = ParseTableRef();
-    if (!table) {
-      return std::unexpected(std::move(table.error()));
+    auto source = ParseFromSource();
+    if (!source) {
+      return std::unexpected(std::move(source.error()));
     }
     FromItem item{.connector = connector,
-                  .table = *std::move(table),
+                  .source = *std::move(source),
                   .alias = {},
+                  .columns = {},
                   .on = {},
                   .connector_span = connector_span,
                   .alias_span = {},
+                  .columns_span = {},
                   .on_span = {},
                   .span = {}};
-    item.span = item.table.span;
-    if (item.table.kind == TableRef::Kind::kName && Peek().kind == TokenKind::kDot) {
+    const TableRef* table = item.table();
+    item.span = table != nullptr ? table->span : std::get<DerivedTable>(item.source).span;
+    if (table != nullptr && table->kind == TableRef::Kind::kName &&
+        Peek().kind == TokenKind::kDot) {
       return Unsupported(
           Peek().span,
           "qualified table names are not supported (quote file paths: 'dir/f.parquet')");
@@ -1913,7 +2136,16 @@ class Parser {
     return item;
   }
 
-  Expected<TableRef> ParseTableRef() {
+  // Whether PeekAt(ahead) starts a query that DuckDB takes in parentheses although it starts with
+  // no SELECT or WITH: FROM and TABLE, which are reserved, and VALUES before '(' (elsewhere
+  // values is a name: FROM (values JOIN u ON ...) is a join in parentheses).
+  bool StartsOtherQuery(std::size_t ahead) {
+    const std::string keyword = KeywordOf(PeekAt(ahead));
+    return keyword == "FROM" || keyword == "TABLE" ||
+           (keyword == "VALUES" && PeekAt(ahead + 1).kind == TokenKind::kLeftParen);
+  }
+
+  Expected<FromSource> ParseFromSource() {
     const Token& token = Peek();
     switch (token.kind) {
       case TokenKind::kIdentifier:
@@ -1938,27 +2170,40 @@ class Parser {
         }
         const bool quoted = token.kind == TokenKind::kQuotedIdentifier;
         Token name = Take();
-        return TableRef{.kind = TableRef::Kind::kName,
-                        .name = std::move(name.text),
-                        .quoted = quoted,
-                        .span = name.span};
+        return FromSource(TableRef{.kind = TableRef::Kind::kName,
+                                   .name = std::move(name.text),
+                                   .quoted = quoted,
+                                   .span = name.span});
       }
       case TokenKind::kString: {
         Token path = Take();
-        return TableRef{.kind = TableRef::Kind::kPath,
-                        .name = std::move(path.text),
-                        .quoted = false,
-                        .span = path.span};
+        return FromSource(TableRef{.kind = TableRef::Kind::kPath,
+                                   .name = std::move(path.text),
+                                   .quoted = false,
+                                   .span = path.span});
       }
       case TokenKind::kLeftParen: {
-        // DuckDB's subqueries, else its joins in parentheses. A table alone in them, or before a
-        // comma or the end, is a syntax error, as in DuckDB; anything else after the table is
-        // taken for a join (as far as three tokens tell), and so is a call (also of a word of
+        // A query (a derived table: a query other than SELECT or WITH is unsupported at its first
+        // token), else DuckDB's joins in parentheses, also in a second pair of them when a table
+        // or a path follows both (FROM ((t JOIN u ON ...)); three tokens do not show whether
+        // VALUES starts a query there, so it does). A table alone in them, or before a comma or
+        // the end, is a syntax error, as in DuckDB; anything else after the table is taken for a
+        // join (as far as three tokens tell), and so is a call (also of a word of
         // kFunctionKeywords), a qualified name (also one qualified by a word of kAliasKeywords)
         // and LATERAL before '(' or what may start a function's name.
         const Token& next = PeekAt(1);
-        if (next.kind == TokenKind::kLeftParen || Contains(kSubqueryStarts, KeywordOf(next))) {
-          return Unsupported(token.span, "subqueries in FROM are not supported");
+        if (const Token& after = PeekAt(2);
+            next.kind == TokenKind::kLeftParen && StartsRelation(after) &&
+            !Contains(kSubqueryStarts, KeywordOf(after)) && KeywordOf(after) != "VALUES") {
+          return Unsupported(token.span, "parenthesized joins in FROM are not supported");
+        }
+        if (next.kind == TokenKind::kLeftParen || Contains(kSubqueryStarts, KeywordOf(next)) ||
+            StartsOtherQuery(1)) {
+          auto derived = ParseNestedQuery();
+          if (!derived) {
+            return std::unexpected(std::move(derived.error()));
+          }
+          return FromSource(*std::move(derived));
         }
         if (const Token& after = PeekAt(2);
             (IsFunctionName(next) && after.kind == TokenKind::kLeftParen) ||
@@ -2000,9 +2245,11 @@ class Parser {
            (IsQualifier(next) && after == TokenKind::kDot);
   }
 
-  // [AS] alias after a FROM item's table, and what may not follow it: a word of kNotAnAlias is
-  // never an alias, and after an alias a column alias list is unsupported.
+  // [AS] alias after a FROM item's source, and what may not follow it: a word of kNotAnAlias is
+  // never an alias, and after the alias a column alias list follows only a derived table's (DuckDB
+  // takes one after a table too, which is unsupported).
   Status ParseAlias(FromItem& item) {
+    const After after = item.table() != nullptr ? After::kItem : After::kDerivedTable;
     const Token& token = Peek();
     if (token.IsKeyword("AS")) {
       const SourceSpan as = Take().span;
@@ -2029,7 +2276,7 @@ class Parser {
       }
       SetAlias(item, as);
     } else if (const NotAnAlias* word = FindNotAnAlias(token)) {
-      if (auto error = Meaning(*word, After::kItem)) {
+      if (auto error = Meaning(*word, after)) {
         return std::unexpected(std::move(*error));
       }
       return Syntax(token.span, NotAnAliasMessage(*word));
@@ -2039,10 +2286,16 @@ class Parser {
       return {};
     }
     if (Peek().kind == TokenKind::kLeftParen) {
-      return Unsupported(Peek().span, "column alias lists (t AS a(x, y)) are not supported");
+      if (after == After::kItem) {
+        return Unsupported(Peek().span, "column alias lists (t AS a(x, y)) are not supported");
+      }
+      if (auto status = ParseColumnAliases(item.columns, item.columns_span); !status) {
+        return status;
+      }
+      item.span = Cover(item.span, item.columns_span);
     }
     if (const NotAnAlias* word = FindNotAnAlias(Peek())) {
-      if (auto error = Meaning(*word, After::kItem)) {
+      if (auto error = Meaning(*word, after)) {
         return std::unexpected(std::move(*error));
       }
     }
@@ -2062,12 +2315,15 @@ class Parser {
     item.span = Cover(item.span, alias.span);
   }
 
-  enum class After : std::uint8_t { kItem, kOn };
+  // Where a word of kNotAnAlias stands: after a FROM item that is a table or a path, after a
+  // derived table (with its alias and column alias list, if any), or after an ON condition.
+  enum class After : std::uint8_t { kItem, kDerivedTable, kOn };
 
   // kUnsupported when the word of kNotAnAlias at the next token has its DuckDB meaning there (after
   // a FROM item, or after an ON condition), told by the tokens after it; std::nullopt otherwise.
   std::optional<ParseError> Meaning(const NotAnAlias& word, After after) {
-    if (after == After::kOn && !word.after_on) {
+    if ((after == After::kOn && !word.after_on) ||
+        (after == After::kDerivedTable && word.tables_only)) {
       return std::nullopt;
     }
     const Token& next = PeekAt(1);
@@ -2152,6 +2408,11 @@ class Parser {
       return Unsupported(Peek().span, KeywordOf(Peek()) + " is not supported");
     }
     while (true) {
+      // The empty grouping set, which DuckDB answers (one group, as without GROUP BY).
+      if (Peek().kind == TokenKind::kLeftParen && PeekAt(1).kind == TokenKind::kRightParen) {
+        return Unsupported(Cover(Peek().span, PeekAt(1).span),
+                           "GROUP BY () (the empty grouping set) is not supported");
+      }
       auto expr = ParseExpr(Context::kGroupBy);
       if (!expr) {
         return std::unexpected(std::move(expr.error()));
@@ -2257,6 +2518,11 @@ class Parser {
       if (clause == "LIMIT" && Peek().kind == TokenKind::kComma) {
         return Unsupported(Peek().span, "LIMIT with an offset (LIMIT n, m) is not supported");
       }
+      // SQL:2008's OFFSET n ROW[S], which DuckDB answers, next to a LIMIT too (DuckDB's syntax
+      // error is LIMIT n ROW[S]).
+      if (clause == "OFFSET" && (Peek().IsKeyword("ROW") || Peek().IsKeyword("ROWS"))) {
+        return Unsupported(Peek().span, "OFFSET with ROW or ROWS (OFFSET n ROWS) is not supported");
+      }
       return value;
     }
     const std::string keyword = KeywordOf(token);
@@ -2327,12 +2593,19 @@ class Parser {
     return Syntax(first, "expected a non-negative integer after " + name + ", found " + found);
   }
 
-  Status ParseEnd(const SelectStatement& stmt) {
+  // The end of a block: the end of the statement, after an optional ';' (kStatement), or the ')'
+  // of a nested query, which is left for the caller (kParenthesis). A clause of
+  // kUnsupportedClauses there is unsupported; anything else is a syntax error that names what may
+  // still come.
+  Status ParseBlockEnd(const SelectStatement& stmt, BlockEnd end) {
     const Token& token = Peek();
-    if (token.kind == TokenKind::kEnd) {
+    if (end == BlockEnd::kParenthesis && token.kind == TokenKind::kRightParen) {
       return {};
     }
-    if (token.kind == TokenKind::kSemicolon) {
+    if (end == BlockEnd::kStatement && token.kind == TokenKind::kEnd) {
+      return {};
+    }
+    if (end == BlockEnd::kStatement && token.kind == TokenKind::kSemicolon) {
       Take();
       if (Peek().kind != TokenKind::kEnd) {
         return Unsupported(Peek().span, "multiple statements are not supported");
@@ -2370,7 +2643,7 @@ class Parser {
     if (!next.empty()) {
       expected.replace(expected.size() - 2, 2, " or ");
     }
-    expected += "the end of the query";
+    expected += end == BlockEnd::kStatement ? "the end of the query" : "')'";
     return Syntax(token.span, "unexpected " + Describe(token) + "; " + expected);
   }
 
@@ -2408,9 +2681,10 @@ class Parser {
   std::deque<Token> tokens_;
   std::optional<ParseError> lex_error_;
   std::size_t last_end_ = 0;
-  std::size_t depth_ = 0;  // levels of the expression being parsed
+  std::size_t depth_ = 0;  // levels of the nested queries and the expression being parsed
   std::size_t peak_ = 0;   // the deepest level reached, with the levels the canonical form adds
   bool minus_operand_ = false;  // the next prefix is a unary minus's operand, which -(x) wraps
+  BlockEnd block_end_ = BlockEnd::kStatement;  // where the block being parsed ends
 };
 
 }  // namespace

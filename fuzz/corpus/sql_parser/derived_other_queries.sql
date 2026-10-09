@@ -1,0 +1,1 @@
+SELECT * FROM (VALUES (1)) v, (FROM t), (TABLE t), (values JOIN u ON a = b)

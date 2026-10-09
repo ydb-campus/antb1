@@ -11,6 +11,7 @@
 #include <ostream>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -41,6 +42,13 @@ std::string ArgName(const AggregateCall& agg) {
   return column != nullptr ? column->name : "<none>";
 }
 
+// The table or path of a FROM item that the test expects to have one.
+TableRef TableOf(const FromItem& item) {
+  const TableRef* table = item.table();
+  EXPECT_NE(table, nullptr) << "a derived table";
+  return table != nullptr ? *table : TableRef{};
+}
+
 // The normalized form of a WHERE or HAVING conjunct the test expects to be simple.
 Comparison Cmp(const Expr& expr) {
   auto cmp = AsComparison(expr);
@@ -61,9 +69,9 @@ TEST(ParserTest, SelectStar) {
   ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
   EXPECT_TRUE(stmt->star);
   EXPECT_TRUE(stmt->items.empty());
-  EXPECT_EQ(stmt->from.at(0).table.kind, TableRef::Kind::kName);
-  EXPECT_EQ(stmt->from.at(0).table.name, "events");
-  EXPECT_FALSE(stmt->from.at(0).table.quoted);
+  EXPECT_EQ(TableOf(stmt->from.at(0)).kind, TableRef::Kind::kName);
+  EXPECT_EQ(TableOf(stmt->from.at(0)).name, "events");
+  EXPECT_FALSE(TableOf(stmt->from.at(0)).quoted);
   EXPECT_TRUE(stmt->where.empty());
   EXPECT_FALSE(stmt->limit.has_value());
 }
@@ -93,7 +101,7 @@ TEST(ParserTest, ColumnsKeepTheirSpelling) {
     EXPECT_EQ(stmt->items[i].span, column->span);
     EXPECT_FALSE(stmt->items[i].alias.has_value());
   }
-  EXPECT_EQ(stmt->from.at(0).table.name, "Events");
+  EXPECT_EQ(TableOf(stmt->from.at(0)).name, "Events");
 }
 
 TEST(ParserTest, EveryAggregate) {
@@ -151,7 +159,7 @@ TEST(ParserTest, FunctionNamesAreColumnsWithoutParentheses) {
   for (const auto& item : stmt->items) {
     EXPECT_NE(ColumnOf(item), nullptr);
   }
-  EXPECT_EQ(stmt->from.at(0).table.name, "date");
+  EXPECT_EQ(TableOf(stmt->from.at(0)).name, "date");
 }
 
 TEST(ParserTest, Aliases) {
@@ -186,8 +194,8 @@ TEST(ParserTest, QuotedReservedWordsAreNames) {
   ASSERT_NE(column, nullptr);
   EXPECT_EQ(column->name, "select");
   EXPECT_EQ(stmt->items[0].alias, std::optional<std::string>("from"));
-  EXPECT_EQ(stmt->from.at(0).table.name, "where");
-  EXPECT_TRUE(stmt->from.at(0).table.quoted);
+  EXPECT_EQ(TableOf(stmt->from.at(0)).name, "where");
+  EXPECT_TRUE(TableOf(stmt->from.at(0)).quoted);
   ASSERT_EQ(stmt->where.size(), 1U);
   EXPECT_EQ(Cmp(stmt->where[0]).column.name, "limit");
 }
@@ -195,28 +203,28 @@ TEST(ParserTest, QuotedReservedWordsAreNames) {
 TEST(ParserTest, TableReferences) {
   auto name = Parse("SELECT a FROM events");
   ASSERT_TRUE(name.has_value());
-  EXPECT_EQ(name->from.at(0).table.kind, TableRef::Kind::kName);
-  EXPECT_FALSE(name->from.at(0).table.quoted);
+  EXPECT_EQ(TableOf(name->from.at(0)).kind, TableRef::Kind::kName);
+  EXPECT_FALSE(TableOf(name->from.at(0)).quoted);
 
   constexpr std::string_view kQuoted = R"(SELECT a FROM "My ""Events""")";
   auto quoted = Parse(kQuoted);
   ASSERT_TRUE(quoted.has_value());
-  EXPECT_EQ(quoted->from.at(0).table.kind, TableRef::Kind::kName);
-  EXPECT_EQ(quoted->from.at(0).table.name, R"(My "Events")");
-  EXPECT_TRUE(quoted->from.at(0).table.quoted);
-  EXPECT_EQ(At(kQuoted, quoted->from.at(0).table.span), R"("My ""Events""")");
+  EXPECT_EQ(TableOf(quoted->from.at(0)).kind, TableRef::Kind::kName);
+  EXPECT_EQ(TableOf(quoted->from.at(0)).name, R"(My "Events")");
+  EXPECT_TRUE(TableOf(quoted->from.at(0)).quoted);
+  EXPECT_EQ(At(kQuoted, TableOf(quoted->from.at(0)).span), R"("My ""Events""")");
 
   constexpr std::string_view kPath = "select count(*) from 'data/it''s part-0.parquet'";
   auto path = Parse(kPath);
   ASSERT_TRUE(path.has_value());
-  EXPECT_EQ(path->from.at(0).table.kind, TableRef::Kind::kPath);
-  EXPECT_EQ(path->from.at(0).table.name, "data/it's part-0.parquet");
-  EXPECT_FALSE(path->from.at(0).table.quoted);
-  EXPECT_EQ(At(kPath, path->from.at(0).table.span), "'data/it''s part-0.parquet'");
+  EXPECT_EQ(TableOf(path->from.at(0)).kind, TableRef::Kind::kPath);
+  EXPECT_EQ(TableOf(path->from.at(0)).name, "data/it's part-0.parquet");
+  EXPECT_FALSE(TableOf(path->from.at(0)).quoted);
+  EXPECT_EQ(At(kPath, TableOf(path->from.at(0)).span), "'data/it''s part-0.parquet'");
 
   auto glob = Parse("SELECT * FROM 'data/*.parquet'");
   ASSERT_TRUE(glob.has_value());
-  EXPECT_EQ(glob->from.at(0).table.name, "data/*.parquet");
+  EXPECT_EQ(TableOf(glob->from.at(0)).name, "data/*.parquet");
 }
 
 // The FROM list is flat: each item records its connector, alias and ON conjuncts, with spans.
@@ -288,9 +296,9 @@ TEST(ParserTest, FromListConnectorsAndSpans) {
     EXPECT_EQ(item.on.size(), want[i].conjuncts) << i;
     EXPECT_EQ(At(kSql, item.on_span), want[i].on_text) << i;
   }
-  EXPECT_EQ(stmt->from[4].table.kind, TableRef::Kind::kPath);
+  EXPECT_EQ(TableOf(stmt->from[4]).kind, TableRef::Kind::kPath);
   EXPECT_EQ(stmt->from[4].alias, std::optional<std::string>("p"));
-  EXPECT_TRUE(stmt->from[6].table.quoted);
+  EXPECT_TRUE(TableOf(stmt->from[6]).quoted);
   EXPECT_EQ(stmt->from[6].alias, std::optional<std::string>("y"));
   EXPECT_EQ(std::get<BinaryExpr>(stmt->from[6].on.front()).op, BinaryOp::kOr);
   // A qualified name spans its qualifier through its name, comments and spaces included.
@@ -428,13 +436,286 @@ TEST(ParserTest, JoinsStayAFlatList) {
   ASSERT_EQ(stmt->from.size(), connectors.size());
   for (std::size_t i = 0; i < connectors.size(); ++i) {
     EXPECT_EQ(stmt->from[i].connector, connectors[i]) << i;
-    EXPECT_EQ(stmt->from[i].table.name, std::string(1, static_cast<char>('a' + i))) << i;
+    EXPECT_EQ(TableOf(stmt->from[i]).name, std::string(1, static_cast<char>('a' + i))) << i;
   }
   auto comma = Parse("SELECT a FROM a, b JOIN c ON b.k = c.k");
   auto cross = Parse("SELECT a FROM a CROSS JOIN b JOIN c ON b.k = c.k");
   ASSERT_TRUE(comma.has_value() && cross.has_value());
   EXPECT_FALSE(EqualIgnoringSpans(*comma, *cross));
   EXPECT_EQ(Depth(*stmt), 2U) << "the ON conjuncts count";
+}
+
+// The query of a FROM item that the test expects to be a derived table.
+SelectStatement QueryOf(const FromItem& item) {
+  const auto* derived = std::get_if<DerivedTable>(&item.source);
+  EXPECT_NE(derived, nullptr) << "not a derived table";
+  return derived != nullptr ? *derived->query : SelectStatement{};
+}
+
+// A derived table is a FROM item like a table: with or without an alias (after AS also a string),
+// with a column alias list after its alias, joined, holding a WITH list or a derived table of its
+// own. Its span runs from its '(' through its alias or column list; its query's span from its
+// SELECT (or WITH) through its last token, without the parentheses.
+TEST(ParserTest, DerivedTables) {
+  constexpr std::string_view kSql =
+      "SELECT s.x FROM (SELECT a, b FROM t WHERE a > 1) AS s(x, \"Y\") JOIN (SELECT c FROM "
+      "'p.parquet') r ON s.x = r.c, (WITH w AS (SELECT d FROM u) SELECT d FROM w) AS 'q', "
+      "( SELECT * FROM (SELECT e FROM v) n ) ORDER BY 1";
+  auto stmt = Parse(kSql);
+  ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
+  ASSERT_EQ(stmt->from.size(), 4U);
+  for (const FromItem& item : stmt->from) {
+    EXPECT_EQ(item.table(), nullptr);
+  }
+  const FromItem& s = stmt->from[0];
+  EXPECT_EQ(At(kSql, s.span), "(SELECT a, b FROM t WHERE a > 1) AS s(x, \"Y\")");
+  EXPECT_EQ(At(kSql, std::get<DerivedTable>(s.source).span), "(SELECT a, b FROM t WHERE a > 1)");
+  EXPECT_EQ(s.alias, std::optional<std::string>("s"));
+  EXPECT_EQ(At(kSql, s.alias_span), "AS s");
+  EXPECT_EQ(s.columns, (std::vector<std::string>{"x", "Y"}));
+  EXPECT_EQ(At(kSql, s.columns_span), "(x, \"Y\")");
+  const SelectStatement& s_query = QueryOf(s);
+  EXPECT_EQ(At(kSql, s_query.span), "SELECT a, b FROM t WHERE a > 1");
+  EXPECT_EQ(s_query.items.size(), 2U);
+  EXPECT_EQ(TableOf(s_query.from.at(0)).name, "t");
+  EXPECT_EQ(s_query.where.size(), 1U);
+  const FromItem& r = stmt->from[1];
+  EXPECT_EQ(r.connector, Connector::kInner);
+  EXPECT_EQ(At(kSql, r.span), "(SELECT c FROM 'p.parquet') r");
+  EXPECT_EQ(r.alias, std::optional<std::string>("r"));
+  EXPECT_TRUE(r.columns.empty());
+  EXPECT_EQ(r.columns_span, SourceSpan{});
+  EXPECT_EQ(At(kSql, r.on_span), "ON s.x = r.c");
+  EXPECT_EQ(TableOf(QueryOf(r).from.at(0)).kind, TableRef::Kind::kPath);
+  const FromItem& q = stmt->from[2];
+  EXPECT_EQ(q.connector, Connector::kComma);
+  EXPECT_EQ(q.alias, std::optional<std::string>("q"));
+  const SelectStatement& q_query = QueryOf(q);
+  ASSERT_EQ(q_query.with.size(), 1U);
+  EXPECT_EQ(At(kSql, q_query.span), "WITH w AS (SELECT d FROM u) SELECT d FROM w");
+  EXPECT_EQ(At(kSql, q_query.with_span), "WITH");
+  const FromItem& unnamed = stmt->from[3];
+  EXPECT_FALSE(unnamed.alias.has_value());
+  EXPECT_EQ(At(kSql, unnamed.span), "( SELECT * FROM (SELECT e FROM v) n )");
+  const SelectStatement& outer = QueryOf(unnamed);
+  EXPECT_TRUE(outer.star);
+  ASSERT_EQ(outer.from.size(), 1U);
+  EXPECT_EQ(outer.from[0].alias, std::optional<std::string>("n"));
+  EXPECT_EQ(TableOf(QueryOf(outer.from[0]).from.at(0)).name, "v");
+  EXPECT_EQ(stmt->order_by.size(), 1U);
+  EXPECT_EQ(At(kSql, stmt->span), kSql);
+  // Each nested query is one level below its statement: the derived table's derived table.
+  EXPECT_EQ(Depth(*stmt), 3U);
+  // An alias after AS: a quoted identifier, BETWEEN, EXISTS, INTERVAL or OVER (as after a table),
+  // also before a column alias list.
+  for (const std::string_view alias : {"\"from\"", "over", "AS interval", "AS 'it''s'"}) {
+    const std::string sql = "SELECT 1 FROM (SELECT a FROM t) " + std::string(alias) + "(x)";
+    auto aliased = Parse(sql);
+    ASSERT_TRUE(aliased.has_value()) << sql << ": " << aliased.error().message;
+    EXPECT_EQ(aliased->from.at(0).columns, std::vector<std::string>{"x"}) << sql;
+  }
+}
+
+// A WITH list: one or more CTEs, each named as written, with a column alias list or not, whose
+// queries may hold WITH lists of their own. The statement's span starts at WITH.
+TEST(ParserTest, WithLists) {
+  constexpr std::string_view kSql =
+      R"(/* c */ with a AS (SELECT x FROM t), "B c"(y, "Z") AS (WITH d AS (SELECT 1 FROM u) )"
+      R"(SELECT y FROM d), over AS (SELECT * FROM a) SELECT x FROM a;)";
+  auto stmt = Parse(kSql);
+  ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
+  EXPECT_EQ(At(kSql, stmt->with_span), "with");
+  EXPECT_EQ(At(kSql, stmt->span),
+            "with a AS (SELECT x FROM t), \"B c\"(y, \"Z\") AS (WITH d AS (SELECT 1 FROM u) SELECT "
+            "y FROM d), over AS (SELECT * FROM a) SELECT x FROM a");
+  ASSERT_EQ(stmt->with.size(), 3U);
+  const CommonTableExpr& a = stmt->with[0];
+  EXPECT_EQ(a.name, "a");
+  EXPECT_TRUE(a.columns.empty());
+  EXPECT_EQ(At(kSql, a.name_span), "a");
+  EXPECT_EQ(a.columns_span, SourceSpan{});
+  EXPECT_EQ(At(kSql, a.span), "a AS (SELECT x FROM t)");
+  EXPECT_EQ(At(kSql, a.query->span), "SELECT x FROM t");
+  const CommonTableExpr& b = stmt->with[1];
+  EXPECT_EQ(b.name, "B c");
+  EXPECT_EQ(b.columns, (std::vector<std::string>{"y", "Z"}));
+  EXPECT_EQ(At(kSql, b.name_span), "\"B c\"");
+  EXPECT_EQ(At(kSql, b.columns_span), "(y, \"Z\")");
+  EXPECT_EQ(At(kSql, b.span), "\"B c\"(y, \"Z\") AS (WITH d AS (SELECT 1 FROM u) SELECT y FROM d)");
+  ASSERT_EQ(b.query->with.size(), 1U);
+  EXPECT_EQ(b.query->with[0].name, "d");
+  EXPECT_EQ(At(kSql, b.query->span), "WITH d AS (SELECT 1 FROM u) SELECT y FROM d");
+  EXPECT_EQ(stmt->with[2].name, "over");
+  EXPECT_TRUE(stmt->with[2].query->star);
+  // Unquoted, a reserved word is no table name (divergence D21), so a CTE named by one of
+  // kAliasKeywords is read quoted only.
+  auto quoted_over = Parse(R"(WITH over AS (SELECT a FROM t) SELECT a FROM "over")");
+  ASSERT_TRUE(quoted_over.has_value()) << quoted_over.error().message;
+  EXPECT_EQ(TableOf(quoted_over->from.at(0)).name, "over");
+  auto bare_over = Parse("WITH over AS (SELECT a FROM t) SELECT a FROM over");
+  ASSERT_FALSE(bare_over.has_value());
+  EXPECT_EQ(bare_over.error().kind, ParseError::Kind::kSyntax);
+  EXPECT_EQ(bare_over.error().span, (SourceSpan{.offset = 45, .length = 4}));
+  // The statement's own block follows the list.
+  ASSERT_EQ(stmt->items.size(), 1U);
+  EXPECT_EQ(TableOf(stmt->from.at(0)).name, "a");
+  EXPECT_EQ(Depth(*stmt), 3U) << "the CTE's CTE: 2 levels below the statement, then x";
+  // A query without a WITH list has none.
+  auto plain = Parse("SELECT a FROM t");
+  ASSERT_TRUE(plain.has_value());
+  EXPECT_TRUE(plain->with.empty());
+  EXPECT_EQ(plain->with_span, SourceSpan{});
+}
+
+// The names of a column alias list follow the rules of an implicit table alias (as in DuckDB):
+// names, quoted identifiers and BETWEEN, EXISTS, INTERVAL and OVER, as written. A CTE's list may
+// be of any length.
+TEST(ParserTest, ColumnAliasLists) {
+  auto derived =
+      Parse(R"(SELECT 1 FROM (SELECT a FROM t) s(over, Between, "select", "a""b", date, x_1))");
+  ASSERT_TRUE(derived.has_value()) << derived.error().message;
+  EXPECT_EQ(derived->from.at(0).columns,
+            (std::vector<std::string>{"over", "Between", "select", "a\"b", "date", "x_1"}));
+  auto cte = Parse("WITH c(exists, interval) AS (SELECT a FROM t) SELECT 1 FROM c");
+  ASSERT_TRUE(cte.has_value()) << cte.error().message;
+  EXPECT_EQ(cte->with.at(0).columns, (std::vector<std::string>{"exists", "interval"}));
+  // More names than the query has columns: DuckDB ignores the extra ones of a CTE.
+  auto longer = Parse("WITH c(x, y, z) AS (SELECT a FROM t) SELECT x FROM c");
+  ASSERT_TRUE(longer.has_value()) << longer.error().message;
+  EXPECT_EQ(longer->with.at(0).columns.size(), 3U);
+  // A column alias list follows an alias only: after a derived table without one, '(' ends the
+  // FROM list (a syntax error, as in DuckDB).
+  auto bare = Parse("SELECT 1 FROM (SELECT a FROM t) (x)");
+  ASSERT_FALSE(bare.has_value());
+  EXPECT_EQ(bare.error().kind, ParseError::Kind::kSyntax);
+  EXPECT_EQ(bare.error().span.offset, 32U);
+}
+
+// CTE names of one WITH list match ASCII case-insensitively, quoted or not and also as strings (as
+// in DuckDB): a repeated name is a syntax error at the name, before its query is parsed, so a
+// construct in that query that antb1 does not support never hides it. A nested WITH list may reuse
+// a name.
+TEST(ParserTest, DuplicateCteNames) {
+  constexpr std::string_view kMessage =
+      "duplicate CTE name in the WITH list (names match case-insensitively)";
+  for (const std::string_view sql : {
+           "WITH c AS (SELECT a FROM t), ^C AS (SELECT a FROM t) SELECT a FROM c"sv,
+           R"(WITH "C" AS (SELECT a FROM t), ^"c" AS (SELECT a FROM t) SELECT a FROM c)"sv,
+           "WITH c AS (SELECT a FROM t), ^'c' AS (SELECT a FROM t) SELECT a FROM c"sv,
+           "WITH c AS (SELECT a FROM t), d AS (SELECT a FROM t), ^c AS (SELECT a FROM t) SELECT "
+           "a FROM c"sv,
+           // Whatever the repeated CTE holds: unsupported SQL, a malformed list or query.
+           "WITH c AS (SELECT a FROM t), ^c AS (SELECT a FROM t WHERE a IS NULL) SELECT a FROM c"sv,
+           "WITH c AS (SELECT a FROM t), ^c(x,) AS (SELECT a FROM t) SELECT a FROM c"sv,
+           "WITH c AS (SELECT a FROM t), ^c AS MATERIALIZED (SELECT a FROM t) SELECT a FROM c"sv,
+           "WITH c AS (SELECT a FROM t), ^c USING KEY (a) AS (SELECT a FROM t) SELECT a FROM c"sv,
+           "WITH c AS (SELECT a FROM t), ^c AS (SELECT FROM) SELECT a FROM c"sv,
+           "SELECT a FROM (WITH c AS (SELECT a FROM t), ^c AS (SELECT a FROM t) SELECT a FROM c)"sv,
+       }) {
+    const std::size_t caret = sql.find('^');
+    const std::string text = std::string(sql.substr(0, caret)) + std::string(sql.substr(caret + 1));
+    auto result = Parse(text);
+    ASSERT_FALSE(result.has_value()) << text;
+    EXPECT_EQ(result.error().kind, ParseError::Kind::kSyntax) << text;
+    EXPECT_EQ(result.error().span.offset, caret) << text;
+    EXPECT_EQ(result.error().message, kMessage) << text;
+  }
+  for (const std::string_view sql : {
+           // Only ASCII letters match case-insensitively.
+           "WITH \"\xc3\x89\" AS (SELECT a FROM t), \"\xc3\xa9\" AS (SELECT a FROM t) SELECT a "
+           "FROM t"sv,
+           // A nested WITH list starts afresh.
+           "WITH c AS (WITH c AS (SELECT a FROM t) SELECT a FROM c) SELECT a FROM c"sv,
+           "WITH c AS (SELECT a FROM t) SELECT a FROM (WITH C AS (SELECT a FROM t) SELECT a FROM "
+           "c)"sv,
+           "SELECT a FROM (WITH c AS (SELECT a FROM t) SELECT a FROM c), (WITH c AS (SELECT a FROM "
+           "t) SELECT a FROM c)"sv,
+           "WITH c AS (SELECT a FROM t), \"c \" AS (SELECT a FROM t) SELECT a FROM c"sv,
+       }) {
+    auto result = Parse(sql);
+    EXPECT_TRUE(result.has_value()) << sql << ": " << result.error().message;
+  }
+  // An escape or a dollar-quoted string is unsupported before the check (DuckDB: a duplicate).
+  for (const std::string_view sql : {
+           "WITH c AS (SELECT a FROM t), ^E'c' AS (SELECT a FROM t) SELECT a FROM c"sv,
+           "WITH c AS (SELECT a FROM t), ^$$C$$ AS (SELECT a FROM t) SELECT a FROM c"sv,
+       }) {
+    const std::size_t caret = sql.find('^');
+    const std::string text = std::string(sql.substr(0, caret)) + std::string(sql.substr(caret + 1));
+    auto result = Parse(text);
+    ASSERT_FALSE(result.has_value()) << text;
+    EXPECT_EQ(result.error().kind, ParseError::Kind::kUnsupported) << text;
+    EXPECT_EQ(result.error().span.offset, caret) << text;
+    EXPECT_TRUE(
+        result.error().message.starts_with("string literals as CTE names are not supported"))
+        << text << ": " << result.error().message;
+  }
+}
+
+// RECURSIVE right after WITH is unsupported, unless it is the name of the first CTE (AS, '(' or
+// USING follows it), as in DuckDB; elsewhere it is a name like any other.
+TEST(ParserTest, WithRecursiveOrACteNamedRecursive) {
+  for (const std::string_view sql : {
+           "WITH RECURSIVE c AS (SELECT a FROM t) SELECT a FROM c"sv,
+           "with recursive recursive AS (SELECT a FROM t) SELECT a FROM recursive"sv,
+           "WITH RECURSIVE c(x) AS (SELECT a FROM t) SELECT x FROM c"sv,
+       }) {
+    auto result = Parse(sql);
+    ASSERT_FALSE(result.has_value()) << sql;
+    EXPECT_EQ(result.error().kind, ParseError::Kind::kUnsupported) << sql;
+    EXPECT_EQ(result.error().span, (SourceSpan{.offset = 5, .length = 9})) << sql;
+    EXPECT_TRUE(result.error().message.starts_with("WITH RECURSIVE is not supported")) << sql;
+  }
+  auto named = Parse("WITH recursive AS (SELECT a FROM t) SELECT a FROM recursive");
+  ASSERT_TRUE(named.has_value()) << named.error().message;
+  EXPECT_EQ(named->with.at(0).name, "recursive");
+  auto listed = Parse("WITH Recursive(x) AS (SELECT a FROM t) SELECT x FROM recursive");
+  ASSERT_TRUE(listed.has_value()) << listed.error().message;
+  EXPECT_EQ(listed->with.at(0).name, "Recursive");
+  EXPECT_EQ(listed->with.at(0).columns, std::vector<std::string>{"x"});
+  auto later = Parse("WITH c AS (SELECT a FROM t), recursive AS (SELECT a FROM c) SELECT a FROM c");
+  ASSERT_TRUE(later.has_value()) << later.error().message;
+  EXPECT_EQ(later->with.at(1).name, "recursive");
+  // USING KEY after a CTE named recursive is unsupported at USING, not at the name.
+  auto keyed =
+      Parse("WITH recursive USING KEY (x) AS (SELECT a AS x FROM t) SELECT x FROM recursive");
+  ASSERT_FALSE(keyed.has_value());
+  EXPECT_EQ(keyed.error().kind, ParseError::Kind::kUnsupported);
+  EXPECT_EQ(keyed.error().span, (SourceSpan{.offset = 15, .length = 9}));
+  EXPECT_TRUE(keyed.error().message.starts_with("USING KEY is not supported"));
+}
+
+// The grammar's known gaps (docs/sql-subset.md): syntax errors where DuckDB answers. A nested query
+// parses by the rules of a statement, so they are syntax errors inside one too.
+TEST(ParserTest, KnownGapsAreSyntaxErrorsInNestedQueriesToo) {
+  for (const std::string_view query : {
+           "SELECT a FROM t LIMIT -(-5)"sv,
+           "SELECT a FROM t OFFSET -(-1)"sv,
+           "SELECT a FROM t LIMIT CASE WHEN true THEN 1 END"sv,
+           "SELECT a FROM t LIMIT 5 = 5"sv,
+           "SELECT a FROM t WHERE a IN (1,)"sv,
+           "SELECT a FROM t WHERE a IN [1, 2]"sv,
+           "SELECT a FROM t WHERE a IN b"sv,
+           "SELECT list_transform(b, lambda x: x + 1) FROM t"sv,
+           "SELECT 'a'\n'b' AS k FROM t"sv,
+           "SELECT a FROM x: t"sv,
+           "SELECT a FROM t WHERE a BETWEEN ASYMMETRIC 1 AND 2"sv,
+           "SELECT MAP {'k': 1} FROM t"sv,
+           "SELECT x: 1 FROM t"sv,
+           "SELECT 1e FROM t"sv,
+           "SELECT 1x FROM t"sv,
+           "SELECT round(x := 2.5) FROM t"sv,
+           "SELECT b[:2] FROM t"sv,
+           "SELECT a$b FROM t"sv,
+       }) {
+    for (const std::string& sql : {std::string(query), std::format("SELECT * FROM ({}) s", query),
+                                   std::format("WITH c AS ({}) SELECT * FROM c", query)}) {
+      auto result = Parse(sql);
+      ASSERT_FALSE(result.has_value()) << sql;
+      EXPECT_EQ(result.error().kind, ParseError::Kind::kSyntax)
+          << sql << ": " << result.error().message;
+    }
+  }
 }
 
 struct OpCase {
@@ -1285,6 +1566,70 @@ TEST(ParserTest, CanonicalLevelsCountAgainstTheDepthLimit) {
   EXPECT_TRUE(depth_error(casts + "a"));
 }
 
+// The query of a derived table or of a CTE is one level below the statement that holds it, so
+// nested queries count against the depth limit together with the expressions inside them, and
+// Depth() agrees with the parser: the deepest accepted statement of each family is exactly 256
+// levels deep.
+TEST(ParserTest, NestedQueriesCountTowardTheDepthLimit) {
+  // n derived tables in each other, around a query without expressions: n levels.
+  const auto derived = [](std::size_t n) {
+    return "SELECT * FROM " + Repeat("(SELECT * FROM ", n) + "t" + std::string(n, ')');
+  };
+  // n CTEs in each other's queries, around SELECT a: n + 1 levels.
+  const auto ctes = [](std::size_t n) {
+    return Repeat("WITH c AS (", n) + "SELECT a FROM t" + Repeat(") SELECT a FROM c", n);
+  };
+  // A call chain of k levels in a derived table: k + 1 levels.
+  const auto calls = [](std::size_t k) {
+    return "SELECT * FROM (SELECT " + Repeat("f(", k) + "a" + std::string(k, ')') + " FROM t)";
+  };
+  // Derived tables and CTEs in turn, around SELECT a: n + 1 levels.
+  const auto mixed = [](std::size_t n) {
+    std::string sql = "SELECT a FROM t";
+    for (std::size_t i = 1; i <= n; ++i) {
+      if (i % 2 == 1) {
+        sql = std::format("SELECT * FROM ({}) AS d", sql);
+      } else {
+        sql = std::format("WITH c AS ({}) SELECT a FROM c", sql);
+      }
+    }
+    return sql;
+  };
+  // WHERE conjuncts and an ON condition in nested queries.
+  const auto predicates = [](std::size_t n) {
+    return Repeat("SELECT a FROM t JOIN (", n) + "SELECT a FROM t WHERE a = 1" +
+           Repeat(") AS x ON a = b WHERE c = 1", n);
+  };
+  const std::vector<
+      std::tuple<std::string_view, std::function<std::string(std::size_t)>, std::size_t>>
+      families = {{"derived tables", derived, 257},
+                  {"CTEs", ctes, 256},
+                  {"calls in a derived table", calls, 255},
+                  {"derived tables and CTEs", mixed, 256},
+                  {"predicates", predicates, 255}};
+  for (const auto& [name, sql, first] : families) {
+    EXPECT_EQ(FirstTooDeep(sql), first) << name;
+    auto deepest = Parse(sql(first - 1));
+    ASSERT_TRUE(deepest.has_value()) << name << ": " << deepest.error().message;
+    EXPECT_EQ(Depth(*deepest), kMaxExpressionDepth) << name;
+  }
+  // The depth error points at the '(' of the query one level too deep, before its query.
+  auto chain = Parse(derived(300));
+  ASSERT_FALSE(chain.has_value());
+  EXPECT_EQ(chain.error().span, (SourceSpan{.offset = 14 + (256 * 15), .length = 1}));
+  // A column alias list adds no level.
+  EXPECT_EQ(FirstTooDeep([](std::size_t n) {
+              return Repeat("WITH c(x, y) AS (", n) + "SELECT a FROM t" +
+                     Repeat(") SELECT x FROM c", n);
+            }),
+            256U);
+  EXPECT_EQ(FirstTooDeep([](std::size_t n) {
+              return "SELECT * FROM " + Repeat("(SELECT * FROM ", n) + "t" +
+                     Repeat(") AS s(x, y)", n);
+            }),
+            257U);
+}
+
 // Literals are select items (constants), and in GROUP BY and ORDER BY positions or constants; the
 // binder tells them apart.
 TEST(ParserTest, ConstantsAndPositions) {
@@ -1423,7 +1768,7 @@ TEST(ParserTest, IsNullAndNotNullAreNamesOnlyWhereNotOperators) {
   EXPECT_EQ(first->name, "isnull");
   EXPECT_EQ(stmt->items[1].alias, std::optional<std::string>("notnull"));
   EXPECT_EQ(stmt->items[2].alias, std::optional<std::string>("isnull"));
-  EXPECT_EQ(stmt->from.at(0).table.name, "isnull");
+  EXPECT_EQ(TableOf(stmt->from.at(0)).name, "isnull");
   ASSERT_EQ(stmt->where.size(), 1U);
   EXPECT_EQ(Cmp(stmt->where[0]).column.name, "notnull");
 }
@@ -1496,6 +1841,26 @@ INSTANTIATE_TEST_SUITE_P(
                    "SELECT without FROM is not supported"},
         RejectCase{"GroupByAll", "SELECT a FROM events GROUP BY ^ALL", kUnsupported, 3,
                    "GROUP BY ALL is not supported"},
+        RejectCase{"GroupByEmptyGroupingSet", "SELECT COUNT(*) FROM events GROUP BY ^()",
+                   kUnsupported, 2, "GROUP BY () (the empty grouping set) is not supported"},
+        RejectCase{"GroupByEmptyGroupingSetAfterAKey", "SELECT a FROM events GROUP BY a, ^()",
+                   kUnsupported, 2, "GROUP BY () (the empty grouping set) is not supported"},
+        RejectCase{"GroupByEmptyGroupingSetInADerivedTable",
+                   "SELECT n FROM (SELECT COUNT(*) AS n FROM events GROUP BY ^()) s", kUnsupported,
+                   2, "GROUP BY () (the empty grouping set) is not supported"},
+        RejectCase{
+            "ExtractStringField", "SELECT EXTRACT(^'year' FROM d) FROM events", kUnsupported, 6,
+            "a string or quoted field name in EXTRACT is not supported; write the field as a "
+            "name, as in EXTRACT(year FROM ...)"},
+        RejectCase{"ExtractQuotedField", "SELECT EXTRACT(^\"year\" FROM d) FROM events",
+                   kUnsupported, 6, "a string or quoted field name in EXTRACT is not supported"},
+        RejectCase{"ExtractEscapeStringField", "SELECT EXTRACT(^E'year' FROM d) FROM events",
+                   kUnsupported, 1, "a string or quoted field name in EXTRACT is not supported"},
+        RejectCase{"ExtractDollarQuotedField", "SELECT EXTRACT(^$$year$$ FROM d) FROM events",
+                   kUnsupported, 1, "a string or quoted field name in EXTRACT is not supported"},
+        RejectCase{"ExtractStringFieldInACte",
+                   "WITH c AS (SELECT EXTRACT(^'year' FROM d) AS y FROM events) SELECT y FROM c",
+                   kUnsupported, 6, "a string or quoted field name in EXTRACT is not supported"},
         RejectCase{"GroupByTrailingComma", "SELECT a FROM events GROUP BY a^, ORDER BY a",
                    kUnsupported, 1, "a trailing comma in GROUP BY is not supported"},
         RejectCase{"HavingAggregateFilter",
@@ -1552,6 +1917,16 @@ INSTANTIATE_TEST_SUITE_P(
                    "OFFSET expressions are not supported (OFFSET takes an integer)"},
         RejectCase{"LimitCommaOffset", "SELECT a FROM events LIMIT 5^, 10", kUnsupported, 1,
                    "LIMIT with an offset (LIMIT n, m) is not supported"},
+        RejectCase{"OffsetRows", "SELECT a FROM events OFFSET 5 ^ROWS", kUnsupported, 4,
+                   "OFFSET with ROW or ROWS (OFFSET n ROWS) is not supported"},
+        RejectCase{"OffsetRowAfterLimit", "SELECT a FROM events LIMIT 1 OFFSET 5 ^row;",
+                   kUnsupported, 3, "OFFSET with ROW or ROWS (OFFSET n ROWS) is not supported"},
+        RejectCase{"OffsetRowsBeforeLimit", "SELECT a FROM events OFFSET 5 ^Rows LIMIT 1",
+                   kUnsupported, 4, "OFFSET with ROW or ROWS"},
+        RejectCase{"OffsetRowsInADerivedTable", "SELECT a FROM (SELECT a FROM t OFFSET 1 ^ROWS) s",
+                   kUnsupported, 4, "OFFSET with ROW or ROWS"},
+        RejectCase{"OffsetRowInACte", "WITH c AS (SELECT a FROM t OFFSET 1 ^ROW) SELECT a FROM c",
+                   kUnsupported, 3, "OFFSET with ROW or ROWS"},
         // Joins outside the subset, and words that DuckDB reads as joins after a FROM item.
         RejectCase{"InnerJoinUsing", "SELECT a FROM events INNER JOIN users ^USING (a)",
                    kUnsupported, 5,
@@ -1745,26 +2120,217 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"ParenthesizedJoinOfALateralFunction",
                    "SELECT a FROM ^(LATERAL left(1) CROSS JOIN events)", kUnsupported, 1,
                    "parenthesized joins in FROM are not supported"},
-        RejectCase{"SubqueryValues", "SELECT a FROM ^(VALUES (1))", kUnsupported, 1,
-                   "subqueries in FROM are not supported"},
-        RejectCase{"SubqueryFromFirst", "SELECT a FROM ^(FROM events)", kUnsupported, 1,
-                   "subqueries in FROM are not supported"},
-        RejectCase{"SubqueryParenthesized", "SELECT a FROM ^((SELECT 1))", kUnsupported, 1,
-                   "subqueries in FROM are not supported"},
-        RejectCase{"SubqueryWith", "SELECT a FROM ^(WITH x AS (SELECT 1) SELECT * FROM x)",
-                   kUnsupported, 1, "subqueries in FROM are not supported"},
-        RejectCase{"SubqueryTable", "SELECT a FROM ^(TABLE events)", kUnsupported, 1,
-                   "subqueries in FROM are not supported"},
-        RejectCase{"SubqueryShow", "SELECT a FROM ^(SHOW events)", kUnsupported, 1,
-                   "subqueries in FROM are not supported"},
-        RejectCase{"SubqueryDescribe", "SELECT a FROM ^(DESCRIBE events)", kUnsupported, 1,
-                   "subqueries in FROM are not supported"},
-        RejectCase{"SubquerySummarize", "SELECT a FROM ^(SUMMARIZE events)", kUnsupported, 1,
-                   "subqueries in FROM are not supported"},
-        RejectCase{"SubqueryPivot", "SELECT a FROM ^(PIVOT events ON a)", kUnsupported, 1,
-                   "subqueries in FROM are not supported"},
-        RejectCase{"SubqueryUnpivot", "SELECT a FROM ^(UNPIVOT events ON a INTO NAME k VALUE v)",
-                   kUnsupported, 1, "subqueries in FROM are not supported"},
+        // A query in parentheses in FROM is a derived table: one other than SELECT or WITH is
+        // unsupported at its first token.
+        RejectCase{"SubqueryValues", "SELECT a FROM (^VALUES (1))", kUnsupported, 6,
+                   "VALUES is not supported; only SELECT queries are supported"},
+        RejectCase{"SubqueryValuesAfterComma", "SELECT a FROM t, (^values(1)) v", kUnsupported, 6,
+                   "VALUES is not supported; only SELECT queries are supported"},
+        RejectCase{"SubqueryFromFirst", "SELECT a FROM (^FROM events)", kUnsupported, 4,
+                   "FROM-first queries are not supported"},
+        RejectCase{"SubqueryParenthesized", "SELECT a FROM (^(SELECT 1))", kUnsupported, 1,
+                   "parenthesized queries are not supported"},
+        // In two pairs of parentheses a table or a path starts a join, and what starts a query in
+        // one pair starts one in two; within three tokens VALUES does (it is a query in DuckDB
+        // before '(').
+        RejectCase{"DoublyParenthesizedJoin", "SELECT a FROM ^((t JOIN u ON a = b))", kUnsupported,
+                   1, "parenthesized joins in FROM are not supported"},
+        RejectCase{"DoublyParenthesizedJoinOfAPath",
+                   "SELECT a FROM t, ^(('u.parquet' AS u CROSS JOIN v)) w", kUnsupported, 1,
+                   "parenthesized joins in FROM are not supported"},
+        RejectCase{"DoublyParenthesizedJoinOfQuotedValues",
+                   "SELECT a FROM ^((\"values\" JOIN u ON a = b))", kUnsupported, 1,
+                   "parenthesized joins in FROM are not supported"},
+        RejectCase{"DoublyParenthesizedJoinOfAQualifiedTable",
+                   "SELECT a FROM ^((over.x CROSS JOIN u))", kUnsupported, 1,
+                   "parenthesized joins in FROM are not supported"},
+        RejectCase{"DoublyParenthesizedValues", "SELECT a FROM (^(values (1)))", kUnsupported, 1,
+                   "parenthesized queries are not supported"},
+        RejectCase{"DoublyParenthesizedJoinOfValues", "SELECT a FROM (^(values JOIN u ON a = b))",
+                   kUnsupported, 1, "parenthesized queries are not supported"},
+        RejectCase{"DoublyParenthesizedDescribe", "SELECT a FROM (^(describe events))",
+                   kUnsupported, 1, "parenthesized queries are not supported"},
+        RejectCase{"DoublyParenthesizedPivotWider", "SELECT a FROM (^(PIVOT_WIDER events ON a))",
+                   kUnsupported, 1, "parenthesized queries are not supported"},
+        RejectCase{"SubqueryWith", "SELECT a FROM (WITH x AS (SELECT 1^) SELECT * FROM x)",
+                   kUnsupported, 1, "SELECT without FROM is not supported"},
+        RejectCase{"SubqueryTable", "SELECT a FROM (^TABLE events)", kUnsupported, 5,
+                   "TABLE is not supported; only SELECT queries are supported"},
+        RejectCase{"SubqueryShow", "SELECT a FROM (^SHOW events)", kUnsupported, 4,
+                   "SHOW is not supported; only SELECT queries are supported"},
+        RejectCase{"SubqueryDescribe", "SELECT a FROM (^DESCRIBE events)", kUnsupported, 8,
+                   "DESCRIBE is not supported; only SELECT queries are supported"},
+        RejectCase{"SubquerySummarize", "SELECT a FROM (^SUMMARIZE events)", kUnsupported, 9,
+                   "SUMMARIZE is not supported; only SELECT queries are supported"},
+        RejectCase{"SubqueryPivot", "SELECT a FROM (^PIVOT events ON a)", kUnsupported, 5,
+                   "PIVOT is not supported; only SELECT queries are supported"},
+        RejectCase{"SubqueryUnpivot", "SELECT a FROM (^UNPIVOT events ON a INTO NAME k VALUE v)",
+                   kUnsupported, 7, "UNPIVOT is not supported; only SELECT queries are supported"},
+        // DuckDB's other names of PIVOT and UNPIVOT.
+        RejectCase{"SubqueryPivotWider", "SELECT a FROM (^PIVOT_WIDER events ON a)", kUnsupported,
+                   11, "PIVOT_WIDER is not supported; only SELECT queries are supported"},
+        RejectCase{"SubqueryPivotLonger",
+                   "SELECT a FROM (^pivot_longer events ON a INTO NAME k VALUE v) s", kUnsupported,
+                   12, "PIVOT_LONGER is not supported; only SELECT queries are supported"},
+        RejectCase{"SubquerySelectWithoutFrom", "SELECT a FROM (SELECT 1^)", kUnsupported, 1,
+                   "SELECT without FROM is not supported"},
+        RejectCase{"SubquerySelectWithoutFromSemicolon", "SELECT a FROM (SELECT 1^;)", kUnsupported,
+                   1, "SELECT without FROM is not supported"},
+        RejectCase{"SubqueryTrailingCommaInSelect", "SELECT a FROM (SELECT a^, FROM t)",
+                   kUnsupported, 1, "a trailing comma in the select list is not supported"},
+        RejectCase{"SubqueryTrailingCommaInFrom", "SELECT a FROM (SELECT a FROM t^,)", kUnsupported,
+                   1, "a trailing comma in FROM is not supported"},
+        RejectCase{"SubqueryTrailingCommaInGroupBy", "SELECT a FROM (SELECT a FROM t GROUP BY a^,)",
+                   kUnsupported, 1, "a trailing comma in GROUP BY is not supported"},
+        RejectCase{"SubqueryTrailingCommaInOrderBy", "SELECT a FROM (SELECT a FROM t ORDER BY a^,)",
+                   kUnsupported, 1, "a trailing comma in ORDER BY is not supported"},
+        RejectCase{"SubqueryUnion", "SELECT a FROM (SELECT a FROM t ^UNION SELECT a FROM u)",
+                   kUnsupported, 5, "UNION is not supported"},
+        RejectCase{"SubqueryFetch", "SELECT a FROM (SELECT a FROM t ^FETCH FIRST 1 ROWS ONLY) s",
+                   kUnsupported, 5, "FETCH is not supported"},
+        RejectCase{"UnionAfterSubquery", "SELECT a FROM (SELECT a FROM t) s ^UNION SELECT a FROM u",
+                   kUnsupported, 5, "UNION is not supported"},
+        RejectCase{"SubqueryInSubquery", "SELECT a FROM (SELECT a FROM (^VALUES (1)) v) w",
+                   kUnsupported, 6, "VALUES is not supported"},
+        // After a derived table, what DuckDB gives a meaning there (not AT: time travel reads a
+        // table).
+        RejectCase{"SubqueryPivotAfter",
+                   "SELECT a FROM (SELECT a FROM t) ^PIVOT (SUM(a) FOR a IN (1))", kUnsupported, 5,
+                   "PIVOT is not supported"},
+        RejectCase{"SubqueryUnpivotAfterColumns",
+                   "SELECT a FROM (SELECT a FROM t) s(x) ^UNPIVOT (v FOR k IN (x))", kUnsupported,
+                   7, "UNPIVOT is not supported"},
+        RejectCase{"SubqueryTablesample", "SELECT a FROM (SELECT a FROM t) ^TABLESAMPLE 10%",
+                   kUnsupported, 11, "TABLESAMPLE is not supported"},
+        RejectCase{"SubquerySemiJoin", "SELECT a FROM (SELECT a FROM t) ^semi JOIN u ON a = b",
+                   kUnsupported, 4, "SEMI JOIN is not supported"},
+        RejectCase{"SubqueryColumnsAntiJoin",
+                   "SELECT a FROM (SELECT a FROM t) AS s(x) ^anti JOIN u ON x = b", kUnsupported, 4,
+                   "ANTI JOIN is not supported"},
+        RejectCase{"SubqueryAsofJoin", "SELECT a FROM (SELECT a FROM t) s ^ASOF JOIN u ON a >= b",
+                   kUnsupported, 4, "ASOF JOIN is not supported"},
+        RejectCase{"SubqueryEmptyStringAlias", "SELECT a FROM (SELECT a FROM t) AS ^''",
+                   kUnsupported, 2, "an empty table alias ('') is not supported"},
+        RejectCase{"SubqueryEscapeStringAlias", "SELECT a FROM (SELECT a FROM t) AS ^E's'",
+                   kUnsupported, 1, "prefixed strings (E'...') are not supported"},
+        RejectCase{"LateralSubquery", "SELECT a FROM t, ^LATERAL (SELECT a FROM u) s", kUnsupported,
+                   7, "LATERAL is not supported"},
+        // Column alias lists: DuckDB takes a trailing comma and strings in them.
+        RejectCase{"ColumnAliasListTrailingComma", "SELECT a FROM (SELECT a FROM t) s(x^,)",
+                   kUnsupported, 1, "a trailing comma in a column alias list is not supported"},
+        RejectCase{"ColumnAliasListTrailingCommaAfterQuoted",
+                   "SELECT a FROM (SELECT a, b FROM t) AS s(\"x\", y^,)", kUnsupported, 1,
+                   "a trailing comma in a column alias list"},
+        RejectCase{"ColumnAliasListString", "SELECT a FROM (SELECT a FROM t) s(^'x')", kUnsupported,
+                   3,
+                   "string literals as column aliases are not supported; write the alias as a "
+                   "quoted identifier"},
+        RejectCase{"ColumnAliasListEmptyString", "SELECT a FROM (SELECT a FROM t) s(x, ^'')",
+                   kUnsupported, 2, "string literals as column aliases are not supported"},
+        RejectCase{"ColumnAliasListEscapeString", "SELECT a FROM (SELECT a FROM t) s(^E'x')",
+                   kUnsupported, 1, "string literals as column aliases are not supported"},
+        RejectCase{"ColumnAliasListDollarQuoted", "SELECT a FROM (SELECT a FROM t) s(^$$x$$)",
+                   kUnsupported, 1, "string literals as column aliases are not supported"},
+        RejectCase{"ColumnAliasListOfAStringAlias", "SELECT a FROM (SELECT a FROM t) AS 's'(^'x')",
+                   kUnsupported, 3, "string literals as column aliases are not supported"},
+        // WITH lists: what DuckDB answers and antb1 does not, at its first token.
+        RejectCase{"WithRecursive", "WITH ^RECURSIVE c AS (SELECT a FROM t) SELECT a FROM c",
+                   kUnsupported, 9, "WITH RECURSIVE is not supported"},
+        RejectCase{"Materialized", "WITH c AS ^MATERIALIZED (SELECT a FROM t) SELECT a FROM c",
+                   kUnsupported, 12, "MATERIALIZED is not supported"},
+        RejectCase{"MaterializedWithoutParenthesis", "WITH c AS ^MATERIALIZED SELECT 1",
+                   kUnsupported, 12, "MATERIALIZED is not supported"},
+        RejectCase{"NotMaterialized",
+                   "WITH c AS ^not materialized (SELECT a FROM t) SELECT a FROM c", kUnsupported,
+                   16, "NOT MATERIALIZED is not supported"},
+        RejectCase{"UsingKey", "WITH c ^USING KEY (a) AS (SELECT a FROM t) SELECT a FROM c",
+                   kUnsupported, 9, "USING KEY is not supported"},
+        RejectCase{"UsingKeyAfterColumns",
+                   "WITH c(x) ^using key (x) AS (SELECT a AS x FROM t) SELECT x FROM c",
+                   kUnsupported, 9, "USING KEY is not supported"},
+        RejectCase{"CteStringName", "WITH ^'c' AS (SELECT a FROM t) SELECT a FROM c", kUnsupported,
+                   3,
+                   "string literals as CTE names are not supported; write the name as a quoted "
+                   "identifier"},
+        RejectCase{"CteEmptyStringName", "WITH ^'' AS (SELECT a FROM t) SELECT a FROM t",
+                   kUnsupported, 2, "string literals as CTE names are not supported"},
+        RejectCase{"CteEscapeStringName", "WITH ^E'c' AS (SELECT a FROM t) SELECT a FROM t",
+                   kUnsupported, 1, "string literals as CTE names are not supported"},
+        RejectCase{"CteDollarQuotedName", "WITH ^$$c$$ AS (SELECT a FROM t) SELECT a FROM t",
+                   kUnsupported, 1, "string literals as CTE names are not supported"},
+        RejectCase{"CteStringNameLater",
+                   "WITH c AS (SELECT a FROM t), ^'d' AS (SELECT a FROM t) SELECT a FROM c",
+                   kUnsupported, 3, "string literals as CTE names are not supported"},
+        RejectCase{"CteColumnAliasTrailingComma",
+                   "WITH c(x^,) AS (SELECT a FROM t) SELECT x FROM c", kUnsupported, 1,
+                   "a trailing comma in a column alias list is not supported"},
+        RejectCase{"CteColumnAliasString", "WITH c(^'x') AS (SELECT a FROM t) SELECT a FROM c",
+                   kUnsupported, 3, "string literals as column aliases are not supported"},
+        RejectCase{"CteWithoutFrom", "WITH c AS (SELECT 1^) SELECT a FROM t", kUnsupported, 1,
+                   "SELECT without FROM is not supported"},
+        RejectCase{"CteFromFirst", "WITH c AS (^FROM t) SELECT a FROM c", kUnsupported, 4,
+                   "FROM-first queries are not supported"},
+        RejectCase{"CteValues", "WITH c AS (^VALUES (1)) SELECT a FROM c", kUnsupported, 6,
+                   "VALUES is not supported"},
+        RejectCase{"CtePivotWider", "WITH c AS (^PIVOT_WIDER t ON a) SELECT * FROM c", kUnsupported,
+                   11, "PIVOT_WIDER is not supported; only SELECT queries are supported"},
+        RejectCase{"CtePivotLonger",
+                   "WITH c AS (^pivot_longer t ON a INTO NAME k VALUE v) SELECT * FROM c",
+                   kUnsupported, 12,
+                   "PIVOT_LONGER is not supported; only SELECT queries are supported"},
+        RejectCase{"CteParenthesizedQuery", "WITH c AS (^(SELECT a FROM t)) SELECT a FROM c",
+                   kUnsupported, 1, "parenthesized queries are not supported"},
+        RejectCase{"CteUnion", "WITH c AS (SELECT a FROM t ^UNION SELECT a FROM u) SELECT a FROM c",
+                   kUnsupported, 5, "UNION is not supported"},
+        RejectCase{"FromFirstAfterWith", "WITH c AS (SELECT a FROM t) ^FROM c", kUnsupported, 4,
+                   "FROM-first queries are not supported"},
+        RejectCase{"ValuesAfterWith", "WITH c AS (SELECT a FROM t) ^VALUES (1)", kUnsupported, 6,
+                   "VALUES is not supported"},
+        RejectCase{"TableAfterWith", "WITH c AS (SELECT a FROM t) ^TABLE c", kUnsupported, 5,
+                   "TABLE is not supported"},
+        RejectCase{"PivotWiderAfterWith", "WITH c AS (SELECT a FROM t) ^PIVOT_WIDER c ON a",
+                   kUnsupported, 11, "PIVOT_WIDER is not supported"},
+        RejectCase{"PivotLongerAfterWith",
+                   "WITH c AS (SELECT a FROM t) ^Pivot_Longer c ON a INTO NAME k VALUE v",
+                   kUnsupported, 12, "PIVOT_LONGER is not supported"},
+        RejectCase{"ParenthesizedQueryAfterWith", "WITH c AS (SELECT a FROM t) ^(SELECT a FROM c)",
+                   kUnsupported, 1, "parenthesized queries are not supported"},
+        RejectCase{"UnionAfterWith", "WITH c AS (SELECT a FROM t) SELECT a FROM c ^UNION SELECT 1",
+                   kUnsupported, 5, "UNION is not supported"},
+        // Reported at their first token, where DuckDB gives a syntax error (docs/sql-subset.md).
+        RejectCase{"SubqueryCutShort", "SELECT a FROM (SELECT 1^", kUnsupported, 0,
+                   "SELECT without FROM is not supported"},
+        RejectCase{"SubqueryCutShortAfterAComma", "SELECT a FROM (SELECT a FROM t^,", kUnsupported,
+                   1, "a trailing comma in FROM is not supported"},
+        RejectCase{"WithRecursiveAlone", "WITH ^RECURSIVE;", kUnsupported, 9,
+                   "WITH RECURSIVE is not supported"},
+        RejectCase{"WithRecursiveBeforeAComma",
+                   "WITH ^recursive, c AS (SELECT a FROM t) SELECT a FROM c", kUnsupported, 9,
+                   "WITH RECURSIVE is not supported"},
+        RejectCase{"CteDescribe", "WITH c AS (^DESCRIBE t) SELECT a FROM c", kUnsupported, 8,
+                   "DESCRIBE is not supported; only SELECT queries are supported"},
+        RejectCase{"CteDrop", "WITH c AS (^DROP TABLE t) SELECT a FROM c", kUnsupported, 4,
+                   "DROP is not supported; only SELECT queries are supported"},
+        RejectCase{"CteValuesAlone", "WITH c AS (^values) SELECT a FROM c", kUnsupported, 6,
+                   "VALUES is not supported; only SELECT queries are supported"},
+        RejectCase{"DescribeAfterWith", "WITH c AS (SELECT a FROM t) ^DESCRIBE c", kUnsupported, 8,
+                   "DESCRIBE is not supported; only SELECT queries are supported"},
+        // DuckDB runs INSERT, UPDATE, DELETE and MERGE after a WITH list.
+        RejectCase{"InsertAfterWith", "WITH c AS (SELECT a FROM t) ^INSERT INTO t SELECT a FROM c",
+                   kUnsupported, 6, "INSERT is not supported; only SELECT queries are supported"},
+        RejectCase{"UpdateAfterWith", "WITH c AS (SELECT a FROM t) ^UPDATE t SET a = 2",
+                   kUnsupported, 6, "UPDATE is not supported; only SELECT queries are supported"},
+        RejectCase{"DeleteAfterWith", "WITH c AS (SELECT a FROM t) ^DELETE FROM t", kUnsupported, 6,
+                   "DELETE is not supported; only SELECT queries are supported"},
+        RejectCase{
+            "MergeAfterWith",
+            "WITH c AS (SELECT a FROM t) ^MERGE INTO t USING c ON true WHEN MATCHED THEN DELETE",
+            kUnsupported, 5, "MERGE is not supported; only SELECT queries are supported"},
+        RejectCase{"SubqueryPivotAlone", "SELECT a FROM (^pivot)", kUnsupported, 5,
+                   "PIVOT is not supported; only SELECT queries are supported"},
+        RejectCase{"SubqueryPivotWiderBeforeAJoin", "SELECT a FROM (^pivot_wider JOIN u ON a = b)",
+                   kUnsupported, 11,
+                   "PIVOT_WIDER is not supported; only SELECT queries are supported"},
         RejectCase{"EmptyStringAlias", "SELECT a FROM events AS ^''", kUnsupported, 2,
                    "an empty table alias ('') is not supported"},
         RejectCase{"EscapeStringAlias", "SELECT a FROM events AS ^E'x'", kUnsupported, 1,
@@ -1827,8 +2393,6 @@ INSTANTIATE_TEST_SUITE_P(
                    9, "INTERSECT is not supported"},
         RejectCase{"Except", "SELECT a FROM events ^EXCEPT SELECT a FROM users", kUnsupported, 6,
                    "EXCEPT is not supported"},
-        RejectCase{"With", "^WITH x AS (SELECT a FROM events) SELECT a FROM x", kUnsupported, 4,
-                   "WITH (common table expressions) is not supported"},
         RejectCase{"LikeEscape", "SELECT a FROM events WHERE url LIKE 'x!%' ^ESCAPE '!'",
                    kUnsupported, 6, "LIKE ... ESCAPE is not supported"},
         RejectCase{"ILike", "SELECT a FROM events WHERE url ^ILIKE '%x%'", kUnsupported, 5,
@@ -1871,8 +2435,6 @@ INSTANTIATE_TEST_SUITE_P(
                    "string concatenation (||) is not supported"},
         RejectCase{"TableFunction", "SELECT * FROM ^read_parquet('x.parquet')", kUnsupported, 12,
                    "table functions are not supported"},
-        RejectCase{"SubqueryInFrom", "SELECT a FROM ^(SELECT a FROM events)", kUnsupported, 1,
-                   "subqueries in FROM are not supported"},
         RejectCase{"SubqueryInWhere", "SELECT a FROM events WHERE a = ^(SELECT 1)", kUnsupported, 1,
                    "subqueries are not supported"},
         RejectCase{"ParenthesizedQuery", "^(SELECT a FROM events)", kUnsupported, 1,
@@ -1971,6 +2533,10 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"Explain", "^explain SELECT a FROM events", kUnsupported, 7,
                    "EXPLAIN is not supported"},
         RejectCase{"Values", "^VALUES (1)", kUnsupported, 6, "VALUES is not supported"},
+        RejectCase{"PivotWider", "^pivot_wider events ON a", kUnsupported, 11,
+                   "PIVOT_WIDER is not supported; only SELECT queries are supported"},
+        RejectCase{"PivotLonger", "^PIVOT_LONGER events ON a INTO NAME k VALUE v", kUnsupported, 12,
+                   "PIVOT_LONGER is not supported; only SELECT queries are supported"},
         RejectCase{"FromFirst", "^FROM events SELECT a", kUnsupported, 4,
                    "FROM-first queries are not supported"},
         // ISNULL/NOTNULL are postfix operators: never an implicit alias (a silent misparse before).
@@ -2208,8 +2774,8 @@ INSTANTIATE_TEST_SUITE_P(
                    "expected an expression, found end of input"},
         RejectCase{"ChainedComparison", "SELECT a FROM events WHERE a = 1 ^= 2", kUnsupported, 1,
                    "chained comparisons (a = b = c) are not supported"},
-        RejectCase{"ExtractStringField", "SELECT EXTRACT(^'minute' FROM a) FROM events", kSyntax, 8,
-                   "expected a field name in EXTRACT(, found string literal"},
+        RejectCase{"ExtractNumberField", "SELECT EXTRACT(^1 FROM a) FROM events", kSyntax, 1,
+                   "expected a field name in EXTRACT(, found integer literal"},
         RejectCase{"ExtractWithoutFrom", "SELECT EXTRACT(minute ^a) FROM events", kSyntax, 1,
                    "expected FROM in EXTRACT(field FROM ...), found identifier a"},
         RejectCase{"ExtractWithoutSource", "SELECT EXTRACT(minute FROM ^) FROM events", kSyntax, 1,
@@ -2240,6 +2806,11 @@ INSTANTIATE_TEST_SUITE_P(
                    kSyntax, 30, "LIMIT 123456789012345678901234567890 is out of range"},
         RejectCase{"WhereAfterLimit", "SELECT a FROM events LIMIT 5 ^WHERE a = 1", kSyntax, 5,
                    "unexpected keyword WHERE; expected OFFSET or the end of the query"},
+        // ROW and ROWS follow OFFSET's value only, unquoted (as in DuckDB).
+        RejectCase{"RowsAfterLimit", "SELECT a FROM events LIMIT 5 ^ROWS", kSyntax, 4,
+                   "unexpected identifier ROWS; expected OFFSET or the end of the query"},
+        RejectCase{"QuotedRowsAfterOffset", "SELECT a FROM events OFFSET 5 ^\"ROWS\"", kSyntax, 6,
+                   "unexpected quoted identifier; expected LIMIT or the end of the query"},
         RejectCase{"DuplicateWhere", "SELECT a FROM events WHERE a = 1 ^WHERE b = 2", kSyntax, 5,
                    "unexpected keyword WHERE; expected AND, GROUP BY, HAVING, ORDER BY, LIMIT, "
                    "OFFSET or the end of the query"},
@@ -2553,7 +3124,93 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"DotThenOperator", "SELECT e.^+ FROM events", kSyntax, 1,
                    "expected a column name after '.', found '+'"},
         RejectCase{"DotAtEnd", "SELECT e.^", kSyntax, 0,
-                   "expected a column name after '.', found end of input"}),
+                   "expected a column name after '.', found end of input"},
+        // Derived tables and WITH lists where DuckDB gives a syntax error too.
+        RejectCase{"SubqueryUnclosed", "SELECT a FROM (SELECT a FROM t^", kSyntax, 0,
+                   "unexpected end of input; expected WHERE, GROUP BY, HAVING, ORDER BY, LIMIT, "
+                   "OFFSET or ')'"},
+        RejectCase{"SubquerySemicolon", "SELECT a FROM (SELECT a FROM t ORDER BY a^;)", kSyntax, 1,
+                   "unexpected ';'; expected LIMIT, OFFSET or ')'"},
+        RejectCase{"SubqueryEmptyWith", "SELECT a FROM (WITH c AS (SELECT a FROM t)^)", kSyntax, 1,
+                   "expected SELECT, found ')'"},
+        RejectCase{"ValuesInParentheses", "SELECT a FROM (values^)", kSyntax, 1,
+                   "expected a join after the table in parentheses, found ')'"},
+        RejectCase{"SubqueryColumnsWithoutAlias", "SELECT a FROM (SELECT a FROM t) ^(x)", kSyntax,
+                   1, "unexpected '('; expected WHERE"},
+        RejectCase{"SubqueryAsColumns", "SELECT a FROM (SELECT a FROM t) AS ^(x)", kSyntax, 1,
+                   "expected a table alias after AS, found '('"},
+        RejectCase{"SubqueryTwoColumnLists", "SELECT a FROM (SELECT a FROM t) s(x) ^(y)", kSyntax,
+                   1, "unexpected '('; expected WHERE"},
+        RejectCase{"SubqueryTwoAliases", "SELECT a FROM (SELECT a FROM t) s(x) ^s2", kSyntax, 2,
+                   "unexpected identifier s2"},
+        RejectCase{"SubqueryStringImplicitAlias", "SELECT a FROM (SELECT a FROM t) ^'s'", kSyntax,
+                   3, "unexpected string literal"},
+        RejectCase{"SubqueryAt", "SELECT a FROM (SELECT a FROM t) ^AT (VERSION => 1)", kSyntax, 2,
+                   "a table alias cannot be the keyword AT; write it as a quoted identifier"},
+        RejectCase{"SubqueryAliasAt", "SELECT a FROM (SELECT a FROM t) s ^at (VERSION => 1)",
+                   kSyntax, 2, "unexpected identifier at"},
+        RejectCase{"SubqueryAsSemi", "SELECT a FROM (SELECT a FROM t) AS ^semi", kSyntax, 4,
+                   "a table alias cannot be the keyword SEMI"},
+        RejectCase{"EmptyColumnAliasList", "SELECT a FROM (SELECT a FROM t) s(^)", kSyntax, 1,
+                   "expected a column name in the column alias list, found ')'"},
+        RejectCase{"CommaColumnAliasList", "SELECT a FROM (SELECT a FROM t) s(^,)", kSyntax, 1,
+                   "expected a column name in the column alias list, found ','"},
+        RejectCase{"ColumnAliasListTwoCommas", "SELECT a FROM (SELECT a FROM t) s(x,^,y)", kSyntax,
+                   1, "expected a column name in the column alias list, found ','"},
+        RejectCase{"ColumnAliasListWithoutComma", "SELECT a FROM (SELECT a FROM t) s(x ^y)",
+                   kSyntax, 1, "expected , or ) in the column alias list, found identifier y"},
+        RejectCase{"ColumnAliasListQualifiedName", "SELECT a FROM (SELECT a FROM t) s(x^.y)",
+                   kSyntax, 1, "expected , or ) in the column alias list, found '.'"},
+        RejectCase{"ColumnAliasListNumber", "SELECT a FROM (SELECT a FROM t) s(^1)", kSyntax, 1,
+                   "expected a column name in the column alias list, found integer literal 1"},
+        RejectCase{"ColumnAliasListReservedWord", "SELECT a FROM (SELECT a FROM t) s(^select)",
+                   kSyntax, 6,
+                   "expected a column name in the column alias list, found keyword SELECT"},
+        RejectCase{"ColumnAliasListWordThatIsNoAlias",
+                   "SELECT a FROM (SELECT a FROM t) s(x, ^semi)", kSyntax, 4,
+                   "a column alias cannot be the keyword SEMI; write it as a quoted identifier"},
+        RejectCase{"ColumnAliasListUnclosed", "SELECT a FROM (SELECT a FROM t) s(x^", kSyntax, 0,
+                   "expected , or ) in the column alias list, found end of input"},
+        RejectCase{"WithAlone", "WITH c AS (SELECT a FROM t)^", kSyntax, 0,
+                   "expected SELECT, found end of input"},
+        RejectCase{"WithSemicolon", "WITH c AS (SELECT a FROM t)^;", kSyntax, 1,
+                   "expected SELECT, found ';'"},
+        RejectCase{"WithOnly", "WITH^", kSyntax, 0, "expected a CTE name, found end of input"},
+        RejectCase{"WithoutAs", "WITH c (^SELECT a FROM t) SELECT a FROM c", kSyntax, 6,
+                   "expected a column name in the column alias list, found keyword SELECT"},
+        RejectCase{"WithoutParenthesis", "WITH c AS ^SELECT a FROM t", kSyntax, 6,
+                   "expected ( after AS in the WITH list, found keyword SELECT"},
+        RejectCase{"WithNotWithoutMaterialized", "WITH c AS ^NOT (SELECT a FROM t) SELECT a FROM c",
+                   kSyntax, 3, "expected ( after AS in the WITH list, found keyword NOT"},
+        RejectCase{"WithUsingWithoutKey", "WITH c ^USING (SELECT a FROM t) SELECT a FROM c",
+                   kSyntax, 5, "expected AS in the WITH list, found keyword USING"},
+        RejectCase{"WithNameThenString", "WITH c ^'x' AS (SELECT a FROM t) SELECT a FROM c",
+                   kSyntax, 3, "expected AS in the WITH list, found string literal"},
+        RejectCase{"WithTrailingComma", "WITH c AS (SELECT a FROM t), ^SELECT a FROM c", kSyntax, 6,
+                   "expected a CTE name, found keyword SELECT"},
+        RejectCase{"WithAfterWith",
+                   "WITH c AS (SELECT a FROM t) ^WITH d AS (SELECT a FROM t) SELECT a FROM c",
+                   kSyntax, 4, "expected SELECT, found keyword WITH"},
+        RejectCase{"WithEmptyColumnAliasList", "WITH c(^) AS (SELECT a FROM t) SELECT a FROM c",
+                   kSyntax, 1, "expected a column name in the column alias list, found ')'"},
+        RejectCase{"WithCommaColumnAliasList", "WITH c(^,) AS (SELECT a FROM t) SELECT a FROM c",
+                   kSyntax, 1, "expected a column name in the column alias list, found ','"},
+        RejectCase{"CteNameReservedWord", "WITH ^select AS (SELECT a FROM t) SELECT a FROM t",
+                   kSyntax, 6, "expected a CTE name, found keyword SELECT"},
+        RejectCase{"CteNameWordThatIsNoAlias", "WITH ^Semi AS (SELECT a FROM t) SELECT a FROM t",
+                   kSyntax, 4,
+                   "a CTE name cannot be the keyword SEMI; write it as a quoted identifier"},
+        RejectCase{"CteNameParameter", "WITH ^$1 AS (SELECT a FROM t) SELECT a FROM t", kSyntax, 2,
+                   "expected a CTE name, found"},
+        RejectCase{"CteNameNumber", "WITH ^1 AS (SELECT a FROM t) SELECT a FROM t", kSyntax, 1,
+                   "expected a CTE name, found integer literal 1"},
+        RejectCase{"CteQualifiedName", "WITH s^.c AS (SELECT a FROM t) SELECT a FROM t", kSyntax, 1,
+                   "expected AS in the WITH list, found '.'"},
+        RejectCase{"CteDuplicateName",
+                   "WITH c AS (SELECT a FROM t), ^C AS (SELECT a FROM t) SELECT a FROM c", kSyntax,
+                   1, "duplicate CTE name in the WITH list (names match case-insensitively)"},
+        RejectCase{"CteBodyUnclosed", "WITH c AS (SELECT a FROM t^", kSyntax, 0,
+                   "unexpected end of input; expected WHERE"}),
     CaseName);
 
 TEST(ParserTest, ExactMessages) {
@@ -2582,6 +3239,21 @@ TEST(ParserTest, ExactMessages) {
   EXPECT_EQ(qualifier.error().message,
             "the reserved word INTERVAL as a qualifier is not supported; write it as a quoted "
             "identifier; see docs/sql-subset.md");
+  auto cte = Parse("WITH only AS (SELECT a FROM t) SELECT a FROM t");
+  ASSERT_FALSE(cte.has_value());
+  EXPECT_EQ(cte.error().message,
+            "a CTE name cannot be the keyword ONLY; write it as a quoted identifier");
+  auto column = Parse("SELECT a FROM (SELECT a FROM t) s(x, To)");
+  ASSERT_FALSE(column.has_value());
+  EXPECT_EQ(column.error().message,
+            "a column alias cannot be the keyword TO; write it as a quoted identifier");
+  auto duplicate =
+      Parse("WITH \"Name\" AS (SELECT a FROM t), nAME AS (SELECT a FROM t) SELECT a FROM t");
+  ASSERT_FALSE(duplicate.has_value());
+  EXPECT_EQ(duplicate.error().message,
+            "duplicate CTE name in the WITH list (names match case-insensitively)");
+  auto with = Parse("WITH c AS (SELECT a FROM t) SELECT a FROM (SELECT a FROM c)");
+  ASSERT_TRUE(with.has_value()) << with.error().message;
 }
 
 // antb1's reserved words (as a name they must be quoted).
@@ -2827,7 +3499,17 @@ TEST(ParserTest, WordsThatCannotBeImplicitAliases) {
     EXPECT_EQ(ErrorOf("SELECT a FROM t JOIN u " + w + " ON t.a = u.a"), syntax_at(23));
     EXPECT_EQ(ErrorOf("SELECT a FROM t AS " + w), syntax_at(19));
     EXPECT_EQ(ErrorOf("SELECT a FROM t AS a " + w), syntax_at(21));
-    // Where DuckDB gives the word a meaning: kUnsupported.
+    // After a derived table, its alias or its column alias list, never one either; in a column
+    // alias list and as a CTE's name neither (as in DuckDB).
+    constexpr std::string_view kDerived = "SELECT a FROM (SELECT a FROM t)";
+    EXPECT_EQ(ErrorOf(std::format("{} {}", kDerived, w)), syntax_at(32));
+    EXPECT_EQ(ErrorOf(std::format("{} AS {} WHERE a = 1", kDerived, w)), syntax_at(35));
+    EXPECT_EQ(ErrorOf(std::format("{} s(x) {}", kDerived, w)), syntax_at(37));
+    EXPECT_EQ(ErrorOf(std::format("{} s(x, {})", kDerived, w)), syntax_at(37));
+    EXPECT_EQ(ErrorOf("WITH " + w + " AS (SELECT a FROM t) SELECT a FROM t"), syntax_at(5));
+    EXPECT_EQ(ErrorOf("WITH c(" + w + ") AS (SELECT a FROM t) SELECT a FROM t"), syntax_at(7));
+    // Where DuckDB gives the word a meaning: kUnsupported, after a derived table too, but for time
+    // travel (AT), which only a table or a path has.
     for (const std::string_view continuation : c.after_item) {
       if (continuation.empty()) {
         continue;
@@ -2837,6 +3519,13 @@ TEST(ParserTest, WordsThatCannotBeImplicitAliases) {
       EXPECT_EQ(ErrorOf("SELECT a FROM 'p.parquet'" + after), unsupported_at(26)) << continuation;
       EXPECT_EQ(ErrorOf("SELECT a FROM t AS a" + after), unsupported_at(21)) << continuation;
       EXPECT_EQ(ErrorOf("SELECT a FROM t \"a b\"" + after), unsupported_at(22)) << continuation;
+      const bool tables_only = w == "at";
+      EXPECT_EQ(ErrorOf(std::format("{}{}", kDerived, after)),
+                tables_only ? syntax_at(32) : unsupported_at(32))
+          << continuation;
+      EXPECT_EQ(ErrorOf(std::format("{} AS s(x){}", kDerived, after)),
+                tables_only ? syntax_at(40) : unsupported_at(40))
+          << continuation;
     }
     // After an ON condition: the meanings DuckDB has there, else a syntax error.
     const std::string on = "SELECT a FROM t JOIN u ON t.a = u.a ";
@@ -2845,20 +3534,27 @@ TEST(ParserTest, WordsThatCannotBeImplicitAliases) {
     EXPECT_EQ(ErrorOf(on + w + (after_on.empty() ? "" : " " + after_on)),
               c.means_after_on ? unsupported_at(on.size()) : syntax_at(on.size()))
         << after_on;
-    // Quoted, it is an alias like any name.
+    // Quoted, it is an alias like any name, and a column alias and a CTE name too.
     for (const std::string& quoted :
-         {"SELECT a FROM t \"" + w + "\"", "SELECT a FROM t AS \"" + w + "\""}) {
+         {"SELECT a FROM t \"" + w + "\"", "SELECT a FROM t AS \"" + w + "\"",
+          std::format(R"({0} "{1}"("{1}"))", kDerived, w)}) {
       auto stmt = Parse(quoted);
       ASSERT_TRUE(stmt.has_value()) << quoted << ": " << stmt.error().message;
       EXPECT_EQ(stmt->from.at(0).alias, std::optional<std::string>(w));
     }
+    const std::string quoted_cte =
+        std::format(R"(WITH "{0}"("{0}") AS (SELECT a FROM t) SELECT a FROM t)", w);
+    auto cte = Parse(quoted_cte);
+    ASSERT_TRUE(cte.has_value()) << quoted_cte << ": " << cte.error().message;
+    EXPECT_EQ(cte->with.at(0).name, w);
+    EXPECT_EQ(cte->with.at(0).columns, std::vector<std::string>{w});
     // Anywhere else an unquoted name (divergence D21): a column, a qualifier, a table, a function
     // and a select alias after AS.
     const std::string names =
         std::format("SELECT {0}, {0}.{0}, {0}(a), a AS {0} FROM {0} WHERE {0} = 1", w);
     auto stmt = Parse(names);
     ASSERT_TRUE(stmt.has_value()) << names << ": " << stmt.error().message;
-    EXPECT_EQ(stmt->from.at(0).table.name, w);
+    EXPECT_EQ(TableOf(stmt->from.at(0)).name, w);
     EXPECT_FALSE(stmt->from.at(0).alias.has_value());
     EXPECT_EQ(std::get<ColumnRef>(stmt->items.at(1).expr).qualifier, w);
     EXPECT_FALSE(IsReservedWord(w));
@@ -2887,10 +3583,11 @@ TEST(ParserRobustnessTest, MegabyteOfParentheses) {
     auto result = Parse(sql);
     ASSERT_FALSE(result.has_value()) << prefix;
     EXPECT_EQ(result.error().kind, ParseError::Kind::kUnsupported) << prefix;
-    // In an expression (ON too) the parentheses nest up to the depth limit; a query, a FROM item
-    // and LIMIT take none.
+    // In an expression (ON too) the parentheses nest up to the depth limit; a query and LIMIT take
+    // none, and in FROM the first opens a derived table, whose query a '(' cannot start.
     const bool expression = !prefix.empty() && !prefix.ends_with("FROM ") &&
                             !prefix.ends_with("JOIN ") && !prefix.ends_with("LIMIT ");
+    const bool from_item = prefix.ends_with("FROM ") || prefix.ends_with("JOIN ");
     const SourceSpan span = result.error().span;
     EXPECT_EQ(span.length, 1U) << prefix;
     if (expression) {
@@ -2898,12 +3595,155 @@ TEST(ParserRobustnessTest, MegabyteOfParentheses) {
       EXPECT_LE(span.offset, prefix.size() + 256) << prefix;
       EXPECT_TRUE(result.error().message.starts_with("expressions deeper than 256 levels"))
           << result.error().message;
+    } else if (from_item) {
+      EXPECT_EQ(span.offset, prefix.size() + 1) << prefix;
+      EXPECT_TRUE(result.error().message.starts_with("parenthesized queries are not supported"))
+          << result.error().message;
     } else {
       EXPECT_EQ(span.offset, prefix.size()) << prefix;
     }
   }
   ExpectWellFormedError(std::string(kSize, ')'));
   ExpectWellFormedError("SELECT a FROM t WHERE a = 1" + std::string(kSize, ')'));
+}
+
+// The offset of the n-th '(' (1-based) of `sql`.
+std::size_t NthOpenParenthesis(std::string_view sql, std::size_t n) {
+  std::size_t offset = std::string_view::npos;
+  for (std::size_t i = 0; i < n; ++i) {
+    offset = sql.find('(', offset + 1);
+  }
+  return offset;
+}
+
+// A megabyte of nested queries stops at the depth limit: the parser recurses through 256 levels of
+// queries at most (the sanitizer builds run this too), and reports the '(' that opens the 257th.
+TEST(ParserRobustnessTest, MegabyteOfNestedBlocks) {
+  constexpr std::size_t kSize = std::size_t{1} << 20U;
+  for (const std::string_view unit :
+       {"SELECT * FROM ("sv, "WITH c AS ("sv, "SELECT * FROM t JOIN ("sv,
+        "SELECT * FROM (WITH c AS ("sv, "SELECT * FROM (SELECT * FROM t) s, ("sv}) {
+    std::string sql;
+    while (sql.size() < kSize) {
+      sql += unit;
+    }
+    auto result = Parse(sql);
+    ASSERT_FALSE(result.has_value()) << unit;
+    EXPECT_EQ(result.error().kind, ParseError::Kind::kUnsupported) << unit;
+    EXPECT_TRUE(result.error().message.starts_with("expressions deeper than 256 levels"))
+        << unit << ": " << result.error().message;
+    // Every '(' of the unit but the one of a nested derived table opens a level.
+    const std::size_t per_unit = static_cast<std::size_t>(std::ranges::count(unit, '('));
+    const std::size_t levels_per_unit = unit.ends_with("s, (") ? 1 : per_unit;
+    const std::size_t n = ((256 / levels_per_unit) * per_unit) + 1;
+    EXPECT_EQ(result.error().span, (SourceSpan{.offset = NthOpenParenthesis(sql, n), .length = 1}))
+        << unit;
+  }
+  // A select item is one level below its query: in the 256th derived table, a column is too deep.
+  std::string items;
+  while (items.size() < kSize) {
+    items += "SELECT a FROM t JOIN (";
+  }
+  auto item = Parse(items);
+  ASSERT_FALSE(item.has_value());
+  EXPECT_EQ(item.error().span, (SourceSpan{.offset = (256 * 22) + 7, .length = 1}));
+  // Calls in the select list of nested derived tables: the levels of both count together.
+  const std::string blocks = Repeat("SELECT * FROM (", 200) + "SELECT ";
+  std::string sql = blocks;
+  while (sql.size() < kSize) {
+    sql += "f(";
+  }
+  auto calls = Parse(sql);
+  ASSERT_FALSE(calls.has_value());
+  EXPECT_TRUE(calls.error().message.starts_with("expressions deeper than 256 levels"))
+      << calls.error().message;
+  EXPECT_EQ(calls.error().span,
+            (SourceSpan{.offset = blocks.size() + (std::size_t{56} * 2), .length = 1}));
+}
+
+// The deepest statement of each family of nested queries survives every walk of the AST: copy,
+// comparison, printing, Depth and destruction.
+TEST(ParserRobustnessTest, DeepestBlocksSurviveEveryWalk) {
+  const std::string derived =
+      "SELECT * FROM " + Repeat("(SELECT * FROM ", 256) + "t" + std::string(256, ')');
+  const std::string ctes =
+      Repeat("WITH c AS (", 255) + "SELECT a FROM t" + Repeat(") SELECT a FROM c", 255);
+  std::string mixed = "SELECT a FROM t";
+  for (std::size_t i = 1; i <= 255; ++i) {
+    if (i % 2 == 1) {
+      mixed = std::format(R"(SELECT * FROM ({}) AS "d"(x))", mixed);
+    } else {
+      mixed = std::format("WITH c(x) AS ({}) SELECT x FROM c", mixed);
+    }
+  }
+  const std::string calls = "SELECT * FROM " + Repeat("(SELECT * FROM ", 127) + "(SELECT " +
+                            Repeat("f(", 127) + "a" + std::string(127, ')') + " FROM t)" +
+                            std::string(127, ')');
+  for (const std::string& sql : {derived, ctes, mixed, calls}) {
+    auto stmt = Parse(sql);
+    ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
+    EXPECT_EQ(Depth(*stmt), kMaxExpressionDepth);
+    SelectStatement copy = *stmt;
+    EXPECT_TRUE(EqualIgnoringSpans(*stmt, copy));
+    // The innermost query's table, renamed in the copy, makes it differ.
+    SelectStatement* innermost = &copy;
+    while (true) {
+      if (!innermost->with.empty()) {
+        innermost = &*innermost->with.front().query;
+      } else if (auto* nested = std::get_if<DerivedTable>(&innermost->from.at(0).source)) {
+        innermost = &*nested->query;
+      } else {
+        break;
+      }
+    }
+    std::get<TableRef>(innermost->from.at(0).source).name += '_';
+    EXPECT_FALSE(EqualIgnoringSpans(*stmt, copy));
+    const std::string canonical = ToSql(*stmt);
+    auto again = Parse(canonical);
+    ASSERT_TRUE(again.has_value()) << again.error().message;
+    EXPECT_TRUE(EqualIgnoringSpans(*stmt, *again));
+    EXPECT_EQ(ToSql(*again), canonical);
+    EXPECT_EQ(Depth(*again), kMaxExpressionDepth);
+  }
+}
+
+// WITH lists and column alias lists are walked in loops everywhere, so long ones cost no stack.
+TEST(ParserRobustnessTest, LongWithListsAndColumnLists) {
+  std::string with = "WITH c0 AS (SELECT a FROM t)";
+  for (int i = 1; i < 5000; ++i) {
+    with += ", c" + std::to_string(i) + "(x) AS (SELECT a FROM c" + std::to_string(i - 1) + ")";
+  }
+  with += " SELECT x FROM c4999";
+  std::string columns = "SELECT 1 FROM (SELECT a FROM t) AS s(x0";
+  for (int i = 1; i < 50000; ++i) {
+    columns += ", x" + std::to_string(i);
+  }
+  columns += ')';
+  for (const std::string& sql : {with, columns}) {
+    auto stmt = Parse(sql);
+    ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
+    EXPECT_EQ(Depth(*stmt), 2U);
+    SelectStatement copy = *stmt;
+    EXPECT_TRUE(EqualIgnoringSpans(*stmt, copy));
+    if (copy.with.empty()) {
+      copy.from.at(0).columns.back() += '_';
+    } else {
+      copy.with.back().columns.back() += '_';
+    }
+    EXPECT_FALSE(EqualIgnoringSpans(*stmt, copy));
+    const std::string canonical = ToSql(*stmt);
+    auto again = Parse(canonical);
+    ASSERT_TRUE(again.has_value()) << again.error().message;
+    EXPECT_TRUE(EqualIgnoringSpans(*stmt, *again));
+    EXPECT_EQ(ToSql(*again), canonical);
+  }
+  auto counted = Parse(with);
+  ASSERT_TRUE(counted.has_value());
+  EXPECT_EQ(counted->with.size(), 5000U);
+  EXPECT_EQ(counted->with.back().name, "c4999");
+  auto listed = Parse(columns);
+  ASSERT_TRUE(listed.has_value());
+  EXPECT_EQ(listed->from.at(0).columns.size(), 50000U);
 }
 
 TEST(ParserRobustnessTest, MegabyteInputs) {
@@ -2934,10 +3774,10 @@ TEST(ParserRobustnessTest, MegabyteInputs) {
   const std::string long_name(kSize, 'n');
   auto name = Parse("SELECT " + long_name + " FROM " + long_name);
   ASSERT_TRUE(name.has_value());
-  EXPECT_EQ(name->from.at(0).table.name.size(), kSize);
+  EXPECT_EQ(TableOf(name->from.at(0)).name.size(), kSize);
   auto path = Parse("SELECT * FROM '" + std::string(kSize, 'p') + "'");
   ASSERT_TRUE(path.has_value());
-  EXPECT_EQ(path->from.at(0).table.name.size(), kSize);
+  EXPECT_EQ(TableOf(path->from.at(0)).name.size(), kSize);
 
   std::string items = "SELECT a0";
   std::string predicate = " WHERE a = 1";
@@ -2968,7 +3808,7 @@ TEST(ParserRobustnessTest, LongFromListsAndJoinChains) {
     SelectStatement copy = *stmt;
     copy.from.back().span = {};
     EXPECT_TRUE(EqualIgnoringSpans(*stmt, copy));
-    copy.from.back().table.name += '_';
+    std::get<TableRef>(copy.from.back().source).name += '_';
     EXPECT_FALSE(EqualIgnoringSpans(*stmt, copy));
     EXPECT_LE(Depth(*stmt), 3U);
     const std::string canonical = ToSql(*stmt);
@@ -2980,7 +3820,7 @@ TEST(ParserRobustnessTest, LongFromListsAndJoinChains) {
   auto counted = Parse(commas);
   ASSERT_TRUE(counted.has_value());
   EXPECT_EQ(counted->from.size(), 50000U);
-  EXPECT_EQ(counted->from.back().table.name, "t49999");
+  EXPECT_EQ(TableOf(counted->from.back()).name, "t49999");
   auto chain = Parse(joins);
   ASSERT_TRUE(chain.has_value());
   EXPECT_EQ(chain->from.size(), 20001U);
@@ -2999,7 +3839,7 @@ TEST(ParserRobustnessTest, EmbeddedNulAndInvalidUtf8) {
   const ColumnRef* column = ColumnOf(ident_ok->items[0]);
   ASSERT_NE(column, nullptr);
   EXPECT_EQ(column->name, "\xff\xfe\0"sv);
-  EXPECT_EQ(ident_ok->from.at(0).table.name, "\xc3\x28.parquet");
+  EXPECT_EQ(TableOf(ident_ok->from.at(0)).name, "\xc3\x28.parquet");
 
   auto nul = Parse("SELECT a\0 FROM t"sv);
   ASSERT_FALSE(nul.has_value());

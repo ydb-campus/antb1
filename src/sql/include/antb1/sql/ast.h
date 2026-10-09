@@ -47,6 +47,7 @@ class Box {
 };
 
 struct Expr;
+struct SelectStatement;
 
 // A column name, optionally qualified by the name of a FROM item (t.x).
 struct ColumnRef {
@@ -280,21 +281,50 @@ enum class Connector : std::uint8_t {
   kLeft,   // LEFT [OUTER] JOIN ... ON
 };
 
-// One item of a FROM list: a table or a path, its alias, and how it joins the items before it.
+// A query in parentheses as a FROM item: FROM (SELECT ...) [AS] s [(x, ...)].
+struct DerivedTable {
+  Box<SelectStatement> query;  // may lead with a WITH list of its own
+  SourceSpan span;             // '(' .. ')'
+};
+
+// What a FROM item reads: a table or a path, or a derived table.
+using FromSource = std::variant<TableRef, DerivedTable>;
+
+// One item of a FROM list: a table, a path or a derived table, its alias, and how it joins the
+// items before it.
 struct FromItem {
   Connector connector = Connector::kFirst;
-  TableRef table;
+  FromSource source;
   std::optional<std::string> alias;  // as written (quoted and string aliases unescaped)
+  std::vector<std::string> columns;  // a derived table's column alias list, after its alias
   std::vector<Expr> on;              // kInner and kLeft: the ON conjuncts (at least one), as WHERE
   SourceSpan connector_span;  // ",", "CROSS JOIN", "JOIN", "LEFT OUTER JOIN", ... (not kFirst)
   SourceSpan alias_span;      // [AS] alias (when alias)
+  SourceSpan columns_span;    // the column alias list's '(' .. ')' (when columns)
   SourceSpan on_span;         // ON and its condition (kInner and kLeft)
-  SourceSpan span;            // the table through its alias
+  SourceSpan span;            // the source through its alias or its column alias list
+
+  // The table or the path, or nullptr for a derived table.
+  [[nodiscard]] const TableRef* table() const;
 };
 
+// One query of a WITH list: name [(column, ...)] AS (query).
+struct CommonTableExpr {
+  std::string name;                  // as written (a quoted one unescaped)
+  std::vector<std::string> columns;  // the column alias list, of any length
+  Box<SelectStatement> query;        // may lead with a WITH list of its own
+  SourceSpan name_span;
+  SourceSpan columns_span;  // '(' .. ')' (when columns)
+  SourceSpan span;          // the name through the query's ')'
+};
+
+// A query: an optional WITH list and a block (SELECT through LIMIT and OFFSET). A derived table and
+// a common table expression hold a query of their own.
 struct SelectStatement {
-  bool star = false;     // SELECT *
-  SourceSpan star_span;  // the '*' (when star)
+  std::vector<CommonTableExpr> with;  // the WITH list, in order (empty: none)
+  SourceSpan with_span;               // the WITH keyword (when with is not empty)
+  bool star = false;                  // SELECT *
+  SourceSpan star_span;               // the '*' (when star)
   std::vector<SelectItem> items;
   std::vector<FromItem> from;          // at least one: a flat list, never a tree (ADR 0022)
   std::vector<Expr> where;             // conjuncts: the top-level AND chain, split
@@ -308,7 +338,7 @@ struct SelectStatement {
   SourceSpan limit_span;               // LIMIT and its value (when limit)
   std::optional<std::int64_t> offset;  // non-negative
   SourceSpan offset_span;              // OFFSET and its value (when offset)
-  SourceSpan span;                     // SELECT .. last token of the query (without ';')
+  SourceSpan span;                     // WITH or SELECT .. last token of the query (without ';')
 };
 
 std::string_view ToString(AggKind kind);
@@ -324,7 +354,8 @@ bool EqualIgnoringSpans(const SelectStatement& a, const SelectStatement& b);
 // alone is 1). The parser accepts no tree deeper than kMaxExpressionDepth (parser.h).
 std::size_t Depth(const Expr& expr);
 // The deepest expression tree of a statement (its select items, ON, WHERE and HAVING conjuncts and
-// GROUP BY and ORDER BY items); 0 when it has none.
+// GROUP BY and ORDER BY items), or of a query nested in it: a derived table's or a common table
+// expression's query is one level deeper than the statement. 0 when it has none.
 std::size_t Depth(const SelectStatement& stmt);
 
 }  // namespace antb1::sql

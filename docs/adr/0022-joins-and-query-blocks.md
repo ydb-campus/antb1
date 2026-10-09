@@ -113,6 +113,21 @@ Proposed
     limit.
   - The doubly parenthesized `x IN ((query))` exits 4: DuckDB reads it as an IN subquery, while `x IN ((query), 3)`
     is a list that holds a scalar subquery. `(WITH ...)` inside an expression exits 4 too.
+  - Update (2026-10-09, roadmap PR S4a): the parser accepts derived tables and WITH lists, and the binder exits 4 for
+    them until J4; S4b adds the subqueries in expressions.
+    - A CTE's name and the names of a column alias list follow S3's rules for a table alias without AS. DuckDB also
+      takes a string there and a trailing comma in a column alias list, which exit 4. A CTE's column alias list is
+      kept at any length (DuckDB ignores the extra names).
+    - A CTE name that repeats an earlier one of its list, ASCII case-insensitively, is a syntax error at that name,
+      as in DuckDB, before the repeated CTE's query is parsed (an escape or dollar-quoted string name exits 4 first).
+    - A CTE named `BETWEEN`, `EXISTS`, `INTERVAL` or `OVER` is read quoted only, since these words are no unquoted
+      table names (divergence D21).
+    - `WITH RECURSIVE`, `MATERIALIZED`, `NOT MATERIALIZED` and `USING KEY` exit 4; `RECURSIVE` before AS, `(` or
+      USING names the first CTE, as in DuckDB.
+    - Depth: a derived table's or a CTE's query is one level below the clauses around it, and `sql::Depth` counts the
+      same levels as the parser: 256 derived tables in each other parse, the 257th exits 4.
+    - For J4: DuckDB reads a string FROM item as a CTE's name before it reads it as a path
+      (`WITH c AS (...) SELECT * FROM 'c'` reads `c`), so a string FROM item names a CTE first.
 - **Names follow DuckDB 1.5.5,** as the research checked them against it. The binder implements them in steps (see
   the Plan): rules 1-6 in J2b (rule 1's CTEs and derived tables in J4); 7 and 8 in J4 (8 inside subqueries in J5);
   9, 12 and 13 in J5; 11 in J6; and the three parts of rule 10 (the scope of an ON, lateral references and a LEFT
@@ -525,7 +540,8 @@ docs/sql-subset.md sections it changes.
   qualified names, the words that cannot be implicit aliases and the canonical forms; the binder exits 4 for more
   than one FROM item, joins, aliases and qualified names until J2b.
 - **S4, feat(sql,plan): derived tables, with and subqueries in the grammar.** Nested blocks, fresh aggregate
-  contexts and the depth limit; the binder exits 4 for every new form until J4 and J5.
+  contexts and the depth limit; the binder exits 4 for every new form until J4 and J5. Update (2026-10-09): split
+  into S4a (derived tables and WITH lists) and S4b (subqueries in expressions).
 - **E1, feat(exec): a hash table for join builds.** The 64 partitions in part order, both layouts, the uniqueness
   flag, typed keys of several columns, the NULL flags and the reservations.
 - **J1b, feat(exec): inner hash join.** Build sinks prepared in post-order on the consumer thread, the streaming probe
