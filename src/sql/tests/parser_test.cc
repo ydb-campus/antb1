@@ -1848,8 +1848,10 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"GroupByEmptyGroupingSetInADerivedTable",
                    "SELECT n FROM (SELECT COUNT(*) AS n FROM events GROUP BY ^()) s", kUnsupported,
                    2, "GROUP BY () (the empty grouping set) is not supported"},
-        RejectCase{"ExtractStringField", "SELECT EXTRACT(^'year' FROM d) FROM events", kUnsupported,
-                   6, "a string or quoted field name in EXTRACT is not supported"},
+        RejectCase{
+            "ExtractStringField", "SELECT EXTRACT(^'year' FROM d) FROM events", kUnsupported, 6,
+            "a string or quoted field name in EXTRACT is not supported; write the field as a "
+            "name, as in EXTRACT(year FROM ...)"},
         RejectCase{"ExtractQuotedField", "SELECT EXTRACT(^\"year\" FROM d) FROM events",
                    kUnsupported, 6, "a string or quoted field name in EXTRACT is not supported"},
         RejectCase{"ExtractEscapeStringField", "SELECT EXTRACT(^E'year' FROM d) FROM events",

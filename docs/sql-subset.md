@@ -245,16 +245,16 @@ typed literals, also of quoted and qualified names of at most three parts (`LIMI
 `LIMIT integer '5'`, `LIMIT E'5'`), a percentage, `LIMIT ALL` and `ROW` or `ROWS` after the value of `OFFSET`
 (`OFFSET 5 ROWS`, also next to a `LIMIT`, which DuckDB answers; `LIMIT 5 ROWS` is a syntax error, as in DuckDB); a
 column there (`LIMIT a`, `LIMIT t.a`) and a call or a typed literal of a longer name (`LIMIT a.b.c.d(1)`) are syntax
-errors, and
-DuckDB refuses them too. Known gaps, among others:
+errors, and DuckDB refuses them too. Known gaps, among others:
 `LIMIT` and `OFFSET` expressions that start with `CASE`, `NOT` or a unary minus (`LIMIT -(-5)`) and conditions
 (`LIMIT 5 = 5`, `LIMIT 5 AND 3`) are syntax errors (exit code 1), although DuckDB answers them, and so are a trailing
-comma in an `IN` list (`a IN (1,)`), `IN` before anything but `(` (`a IN [1, 2]`, `a IN b`), `BETWEEN ASYMMETRIC`
+comma in an `IN` list (`a IN (1,)`), `IN` before a list or a list column (`a IN [1, 2]`, `a IN b`), `BETWEEN ASYMMETRIC`
 (`asymmetric` is a name, divergence D21), `MAP {...}`, a prefix alias (`SELECT x: 1`, `FROM x: t`), an exponent without
 digits (`1e`, which DuckDB reads as `1 AS e`), a number that a name follows directly (`1x`, which DuckDB reads as
 `1 AS x`), named arguments (`round(x := 2.5)`), a slice without its lower bound (`b[:2]`; `b[1:2]` is unsupported), a
-`$` inside a name (`a$b`, which antb1 reads as a parameter), a lambda (`lambda x: x + 1`) and a string that continues
-after a line break (`'a'` and `'b'` on the next line, which DuckDB reads as `'ab'`), also in a nested query. In FROM:
+`$` inside a name (`a$b`, which antb1 reads as a parameter), a one-parameter lambda (`lambda x: x + 1`) and a string
+that continues after a line break (`'a'` and `'b'` on the next line, which DuckDB reads as `'ab'`), also in a nested
+query; inside the arguments of a call some of them are unsupported (exit code 4) instead. In FROM:
 `JOIN ... USING`, `NATURAL`, `RIGHT` and `FULL` joins, `SEMI`, `ANTI`, `ASOF` and `POSITIONAL`
 joins, nested joins (a `JOIN` before the `ON` of an earlier one) and joins in parentheses, `LATERAL` before a subquery
 or a table function (also one with a qualified name: `LATERAL main.range(3)`), `schema.table`, `ONLY`, table functions
