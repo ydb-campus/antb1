@@ -43,6 +43,10 @@
 // row); a build of more than 4294967295 rows is OutOfMemory. NULL keys are never inserted, so they
 // never match; the table counts them for the null-aware anti join.
 //
+// A keyless build (JoinBuildSpec::Keyless, a one-row join's) holds every selected row as rows of
+// one key: one hash, one partition, one slot, so unique() means at most one row. It has nothing to
+// probe: its Find is Invalid.
+//
 // Errors: what a correct physical plan never sends (a key of a wrong type, a part added twice) is
 // Invalid; passing the memory limit, or 4294967295 rows, is OutOfMemory, and so is std::bad_alloc.
 // Memory: every container of a build is charged to the budget before it is allocated
@@ -73,12 +77,17 @@ struct JoinMatches {
 // both sides of the join. Checked once and shared by every part of the build. Immutable.
 class JoinBuildSpec {
  public:
-  // Invalid (a planner bug, never NotImplemented) without keys, for a key outside the schema, for a
-  // DOUBLE or BOOLEAN key, or for a key whose column is not of its type (plan::ToArrow).
+  // Invalid (a planner bug, never NotImplemented) without a schema or keys, for a key outside the
+  // schema, for a DOUBLE or BOOLEAN key, or for a key whose column is not of its type
+  // (plan::ToArrow).
   static arrow::Result<std::shared_ptr<const JoinBuildSpec>> Make(
       std::shared_ptr<arrow::Schema> schema, std::vector<plan::BoundColumn> keys);
+  // The spec of a build without keys, a one-row join's. Invalid without a schema.
+  static arrow::Result<std::shared_ptr<const JoinBuildSpec>> Keyless(
+      std::shared_ptr<arrow::Schema> schema);
 
   [[nodiscard]] const std::shared_ptr<arrow::Schema>& schema() const { return schema_; }
+  // Empty for a keyless spec.
   [[nodiscard]] const std::vector<plan::BoundColumn>& keys() const { return keys_; }
   // One key of a type the direct layout indexes: SMALLINT, INTEGER, BIGINT, USMALLINT, DATE or
   // TIMESTAMP.
@@ -165,8 +174,8 @@ class JoinTable {
   // that is not selected (`selection`: nullptr for every row), has a NULL key or matches nothing
   // gets an empty range ({0, 0}). Probe buffers come from `pool` (a NULL bitmap and, when at most a
   // quarter of the rows are kept, their positions and a copy of their keys), except the hashed
-  // layout's hashes: a temporary std::vector that no budget sees. Invalid for keys of another
-  // count, type or length, a selection of another length or a short `out`.
+  // layout's hashes: a temporary std::vector that no budget sees. Invalid for a keyless build, keys
+  // of another count, type or length, a selection of another length or a short `out`.
   arrow::Status Find(std::span<const std::shared_ptr<arrow::Array>> keys,
                      const arrow::BooleanArray* selection, arrow::MemoryPool* pool,
                      std::span<JoinMatches> out) const;
