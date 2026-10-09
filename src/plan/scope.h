@@ -5,6 +5,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -134,6 +135,12 @@ struct Visibility {
   std::size_t inner_begin = 0;
   std::size_t end = std::numeric_limits<std::size_t>::max();
 };
+
+// The visibility of the ON of FROM item `item` of `from` (rule 10 of ADR 0022): the items up to and
+// including it, its join group the inner level. A comma starts a group, and so does the first item;
+// every JOIN continues the group it joins into, a CROSS JOIN included. A pure function of the FROM
+// list: the binder calls it once per ON.
+Visibility OnVisibility(std::span<const sql::FromItem> from, std::size_t item);
 
 // Where a name resolves (Scope::LookUp). Matches count in FROM order, and within a binding in
 // column order.
