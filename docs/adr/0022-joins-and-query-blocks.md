@@ -119,7 +119,9 @@ Proposed
       takes a string there and a trailing comma in a column alias list, which exit 4. A CTE's column alias list is
       kept at any length (DuckDB ignores the extra names).
     - A CTE name that repeats an earlier one of its list, ASCII case-insensitively, is a syntax error at that name,
-      as in DuckDB, before the repeated CTE's query is parsed.
+      as in DuckDB, before the repeated CTE's query is parsed (an escape or dollar-quoted string name exits 4 first).
+    - A CTE named `BETWEEN`, `EXISTS`, `INTERVAL` or `OVER` is read quoted only, since these words are no unquoted
+      table names (divergence D21).
     - `WITH RECURSIVE`, `MATERIALIZED`, `NOT MATERIALIZED` and `USING KEY` exit 4; `RECURSIVE` before AS, `(` or
       USING names the first CTE, as in DuckDB.
     - Depth: a derived table's or a CTE's query is one level below the clauses around it, and `sql::Depth` counts the

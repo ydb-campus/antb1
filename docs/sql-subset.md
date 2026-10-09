@@ -117,17 +117,17 @@ the items before it. A `JOIN` binds tighter than a comma and associates to the l
 a comma take no `ON`, and the other joins need one (a syntax error otherwise, as in DuckDB). The `ON` condition is split
 at its top-level `AND` chain like `WHERE`.
 
-Nested queries: a derived table (a query in parentheses in FROM) and the query of a common table expression (a CTE of
-a `WITH` list) are queries of their own. Each may start with a `WITH` list, which stands nowhere else, and its block
+Nested queries: a derived table (a query in parentheses in FROM) and the query of a common table expression (a CTE of a
+`WITH` list) are queries of their own. Each may start with a `WITH` list, which stands nowhere else, and its block
 places aggregates by the rules above afresh. A nested query is one level below the clauses around it, so it counts
-against the depth limit together with the expressions inside it: 256 derived tables, each in the FROM list of the
-next, parse, and so do 255 CTEs around `SELECT a FROM t`, whose select item is the 256th level. A column alias list
-follows a derived table's alias (`FROM (...) AS s(x, y)`) or a CTE's name (`WITH c(x, y) AS (...)`), and the parser
-takes it at any length. Within one `WITH` list the CTE names differ ASCII case-insensitively, as in DuckDB: a repeated
-one (`c` and `"C"`, also `'c'`) is a syntax error at the repeated name, before its query is parsed, while a nested
-`WITH` list may reuse a name. Until the binder answers them (roadmap PR J4, [ADR 0022](adr/0022-joins-and-query-blocks.md)),
-it rejects a `WITH` list at its `WITH` and a derived table at its `(` with exit code 4, in query order (the `WITH` list
-first) and before any table resolves.
+against the depth limit together with the expressions inside it: 256 derived tables, each in the FROM list of the next,
+parse, and so do 255 CTEs around `SELECT a FROM t`, whose select item is the 256th level. A column alias list follows a
+derived table's alias (`FROM (...) AS s(x, y)`) or a CTE's name (`WITH c(x, y) AS (...)`), and the parser takes it at
+any length. Within one `WITH` list the CTE names differ ASCII case-insensitively, as in DuckDB: a repeated one (`c` and
+`"C"`, also `'c'`, but not `E'c'` or `$$c$$`, which are unsupported first) is a syntax error at the repeated name,
+before its query is parsed, while a nested `WITH` list may reuse a name. Until the binder answers them (roadmap PR J4,
+[ADR 0022](adr/0022-joins-and-query-blocks.md)), it rejects a `WITH` list at its `WITH` and a derived table at its `(`
+with exit code 4, in query order (the `WITH` list first) and before any table resolves.
 
 Lexical rules: an `identifier` is a letter or `_` followed by letters, digits or `_`, or any text in double quotes
 (`""` escapes a quote); a `string_literal` is text in single quotes (`''` escapes a quote); an `integer` is a
@@ -183,7 +183,9 @@ are the same expression.
 - CTE names and column aliases follow the rules of a table alias without `AS`: a name, a quoted identifier, `BETWEEN`,
   `EXISTS`, `INTERVAL` or `OVER`, never one of the 49 words (a syntax error, as in DuckDB). DuckDB also takes a string
   literal there, which is unsupported. `RECURSIVE` right after `WITH` is unsupported (`WITH RECURSIVE`), unless `AS`,
-  `(` or `USING` follows it: then it names the first CTE, as in DuckDB.
+  `(` or `USING` follows it: then it names the first CTE, as in DuckDB. A CTE named `BETWEEN`, `EXISTS`, `INTERVAL` or
+  `OVER` is read quoted only (`FROM "over"`): unquoted, these words are no table names (divergence D21), so
+  `WITH over AS (...) SELECT a FROM over` is a syntax error, which DuckDB answers.
 - The canonical form (`sql::ToSql`, [ADR 0008](adr/0008-parser-and-unparser.md)) writes every alias quoted after `AS`
   (`FROM t AS "a"`), `JOIN` as `INNER JOIN`, `LEFT OUTER JOIN` as `LEFT JOIN`, a qualifier as written, a nested query
   in parentheses, and CTE names and column aliases quoted (`WITH "c"("x") AS (...)`, `FROM (...) AS "s"("x")`).
@@ -267,13 +269,20 @@ without a call (`LATERAL s.t`, `LATERAL over.x`) or `NATURAL LEFT OUTER u`.
 In `WITH` lists and nested queries, these are unsupported (exit code 4): `WITH RECURSIVE`, `MATERIALIZED`,
 `NOT MATERIALIZED` and `USING KEY`; a string literal as a CTE name or a column alias (`WITH 'c' AS`, `s('x')`) and a
 trailing comma in a column alias list (`s(x,)`), which DuckDB accepts; a query in parentheses (in FROM or as a CTE's
-query) that starts with no `SELECT` or `WITH` (`(VALUES (1))`, `(FROM t)`, `(TABLE t)`, `(DESCRIBE t)`, `(SHOW t)`,
-`(SUMMARIZE t)`, `(PIVOT ...)` and `(UNPIVOT ...)`, also written `PIVOT_WIDER` and `PIVOT_LONGER`, or `((SELECT ...))`,
-at its first token), also after a `WITH` list (`WITH c AS (...) FROM c`); and in a nested query `SELECT` without `FROM`
-(`(SELECT 1)`, which DuckDB answers), a trailing comma in its select list, FROM list or `GROUP BY`, and the clauses that
-are unsupported after a statement (`UNION`, `FETCH`, ...). A trailing comma in a nested `ORDER BY`
-(`(SELECT ... ORDER BY a,)`), `(SELECT 1;` and `MATERIALIZED` without `(` are unsupported where DuckDB gives a syntax
-error, and so is a string CTE name that a later CTE of its list repeats. Syntax errors (exit code 1), as in DuckDB: a
+query) that starts with no `SELECT` or `WITH` (`(VALUES (1))`, `(FROM t)`, `(TABLE t)`, `(PIVOT ...)` and
+`(UNPIVOT ...)`, also written `PIVOT_WIDER` and `PIVOT_LONGER`, in FROM also `(DESCRIBE t)`, `(SHOW t)` and
+`(SUMMARIZE t)`, or `((SELECT ...))`, at its first token), also after a `WITH` list (`WITH c AS (...) FROM c`); and in
+a nested query `SELECT` without `FROM` (`(SELECT 1)`, which DuckDB answers), a trailing comma in its select list, FROM
+list or `GROUP BY`, and the clauses that are unsupported after a statement (`UNION`, `FETCH`, ...). As elsewhere, a
+construct is reported at its first token, so some of these are unsupported where DuckDB gives a syntax error, among
+others: a trailing comma in a nested `ORDER BY` (`(SELECT ... ORDER BY a,)`); a nested query that `;` or the end of the
+input cuts short (`(SELECT 1;`, `FROM (SELECT 1`, `FROM (SELECT a FROM t,`); `MATERIALIZED` without `(`; `RECURSIVE`
+that no CTE follows (`WITH RECURSIVE;`, `WITH recursive, c AS (...)`); a word that starts a query, alone in parentheses
+or before something else there (`FROM (pivot)`, `FROM (pivot_wider JOIN u ON ...)`, `WITH c AS (values) ...`);
+`(DESCRIBE t)`, `(SHOW t)` and `(SUMMARIZE t)` as a CTE's query, which DuckDB takes in FROM only; another statement as
+a CTE's query or after a `WITH` list, where DuckDB takes none (`WITH c AS (DROP TABLE t) ...`,
+`WITH c AS (...) DESCRIBE c`); a string CTE name that a later CTE of its list repeats; and an escape or dollar-quoted
+CTE name that repeats an earlier one (`WITH c AS (...), E'c' AS (...)`). Syntax errors (exit code 1), as in DuckDB: a
 `WITH` list without its query (`WITH c AS (...)`, also before `;` or `)`), a CTE without `AS` or its parentheses, a
 trailing comma in a `WITH` list, a second `WITH` list, an empty column alias list or one with a comma alone, a column
 alias list after a derived table without an alias (`FROM (...) (x)`) or after a second one, a repeated CTE name,
@@ -830,7 +839,7 @@ compare against DuckDB, so an unregistered difference is a bug.
 | D18 | DECIMAL SUM beyond 38 digits | a `SUM` of a DECIMAL(p,s) whose result has more than 38 digits is an execution error (`SUM overflow: the result is outside the range of DECIMAL(38,s) (38 decimal digits)`), as for HUGEINT (D9) | returns up to 39 digits until its 128-bit sum overflows | `tests/slt/cases/types/decimal_arithmetic.slt` pins both answers; the generator sums only DECIMAL columns whose sum over every row fits 38 digits |
 | D19 | Which failing row an error names | the overflow and cast errors of DECIMAL arithmetic, and the cast errors of DECIMAL `CASE` values, print the values of the first failing row of a 64Ki-row batch (each operand, then the operation); a dependent `GROUP BY` key (ADR 0018) is computed per group, in group order; a failed cast names the column it casts (`when casting from source column b`) only for a column reference, an aggregate's output and a key included | evaluates 2048-row vectors, and every key per row: with several failing rows the message can show another row's values; it also names the column of an expression its optimizer reduces to one (`b + 0`); the exit code and whether a query fails are the same | the `.slt` records match the error text without the values; `exec.ComputeTest.DecimalOperandsInDuckDbOrder` pins the operand order, `exec.ComputeTest.DecimalCaseValuesCastToTheCaseType` the named columns |
 | D20 | CASE types without a DECIMAL value | types the values that are no literals first, then lets each integer literal take their integer type when it fits and each string literal any type: `CASE WHEN c THEN 7 WHEN c2 THEN s16 END` and `CASE WHEN c THEN 8 WHEN c2 THEN s16 ELSE 7 END` are SMALLINT, a negated literal in parentheses (`-(7)`) counts as an INTEGER expression, and a string literal before a DATE value is that DATE (`THEN '2020-01-01' WHEN c2 THEN dt END`) and before a number unsupported | folds from the `ELSE` value (NULL without one) through the `THEN` values in order, where a literal next to NULL (the first `THEN` value without an `ELSE`) or next to another literal becomes its own type (both CASEs are INTEGER), while an `ELSE` literal takes the next value's type; `-(7)` is a literal (SMALLINT next to `s16`), and a string literal next to NULL is VARCHAR (a bind error next to the DATE or the number) | `plan.BinderTest.CaseTypesWithoutADecimalAreAntb1s` pins antb1's types; the random generator writes the column first among its `CASE` values, where both agree; with a DECIMAL value antb1 folds as DuckDB does ([ADR 0021](adr/0021-decimal-semantics.md) rule 10) |
-| D21 | Keywords as names | the 49 words that are never table aliases ([Grammar](#grammar)) are unquoted column, table and function names, qualifiers and select aliases, with or without `AS` (without `AS`, `glob`, `isnull` and `notnull` continue the expression: unsupported), so `SELECT default FROM t` answers with a column named `default`; `BETWEEN`, `EXISTS`, `INTERVAL` and `OVER` are reserved: no unquoted column or table names (an error) or qualifiers (unsupported), but table aliases, as in DuckDB | refuses all 49 words as unquoted column names (`default` is its `DEFAULT` keyword, an error wherever a query uses it: `SELECT default FROM t` is a binder error), table names, qualifiers and select aliases without `AS` (after an expression `isnull` and `notnull` are its operators `IS NULL` and `IS NOT NULL`, not aliases); accepts them after `AS` and after a dot, and 14 of them as function names (`unpack(...)` is its `UNPACK` operator, the other 34 are syntax errors); accepts `BETWEEN`, `EXISTS`, `INTERVAL` and `OVER` as column and table names and as qualifiers | the fixtures, the `.slt` records and the random generator use none of these words as an unquoted name; `sql.ParserTest.WordsThatCannotBeImplicitAliases`, `sql.ParserTest.EveryReservedWordAfterAsInFrom` and `sql.ParserTest.ReservedWordsThatQualifyNamesInFrom` pin antb1's rules, and `harness.TableAliasOracle.*` compares every DuckDB keyword as a table alias and as a qualifier in FROM with DuckDB itself |
+| D21 | Keywords as names | the 49 words that are never table aliases ([Grammar](#grammar)) are unquoted column, table and function names, qualifiers and select aliases, with or without `AS` (without `AS`, `glob`, `isnull` and `notnull` continue the expression: unsupported), so `SELECT default FROM t` answers with a column named `default`; `BETWEEN`, `EXISTS`, `INTERVAL` and `OVER` are reserved: no unquoted column or table names (an error) or qualifiers (unsupported), but table aliases, CTE names and column aliases, as in DuckDB (a CTE so named is read quoted only: `FROM "over"`) | refuses all 49 words as unquoted column names (`default` is its `DEFAULT` keyword, an error wherever a query uses it: `SELECT default FROM t` is a binder error), table names, qualifiers and select aliases without `AS` (after an expression `isnull` and `notnull` are its operators `IS NULL` and `IS NOT NULL`, not aliases); accepts them after `AS` and after a dot, and 14 of them as function names (`unpack(...)` is its `UNPACK` operator, the other 34 are syntax errors); accepts `BETWEEN`, `EXISTS`, `INTERVAL` and `OVER` as column and table names and as qualifiers | the fixtures, the `.slt` records and the random generator use none of these words as an unquoted name; `sql.ParserTest.WordsThatCannotBeImplicitAliases`, `sql.ParserTest.EveryReservedWordAfterAsInFrom` and `sql.ParserTest.ReservedWordsThatQualifyNamesInFrom` pin antb1's rules, and `harness.TableAliasOracle.*` compares every DuckDB keyword as a table alias and as a qualifier in FROM with DuckDB itself |
 
 ## ClickBench status
 

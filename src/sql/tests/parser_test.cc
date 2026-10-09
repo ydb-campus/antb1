@@ -547,6 +547,15 @@ TEST(ParserTest, WithLists) {
   EXPECT_EQ(At(kSql, b.query->span), "WITH d AS (SELECT 1 FROM u) SELECT y FROM d");
   EXPECT_EQ(stmt->with[2].name, "over");
   EXPECT_TRUE(stmt->with[2].query->star);
+  // Unquoted, a reserved word is no table name (divergence D21), so a CTE named by one of
+  // kAliasKeywords is read quoted only.
+  auto quoted_over = Parse(R"(WITH over AS (SELECT a FROM t) SELECT a FROM "over")");
+  ASSERT_TRUE(quoted_over.has_value()) << quoted_over.error().message;
+  EXPECT_EQ(TableOf(quoted_over->from.at(0)).name, "over");
+  auto bare_over = Parse("WITH over AS (SELECT a FROM t) SELECT a FROM over");
+  ASSERT_FALSE(bare_over.has_value());
+  EXPECT_EQ(bare_over.error().kind, ParseError::Kind::kSyntax);
+  EXPECT_EQ(bare_over.error().span, (SourceSpan{.offset = 45, .length = 4}));
   // The statement's own block follows the list.
   ASSERT_EQ(stmt->items.size(), 1U);
   EXPECT_EQ(TableOf(stmt->from.at(0)).name, "a");
@@ -625,6 +634,21 @@ TEST(ParserTest, DuplicateCteNames) {
        }) {
     auto result = Parse(sql);
     EXPECT_TRUE(result.has_value()) << sql << ": " << result.error().message;
+  }
+  // An escape or a dollar-quoted string is unsupported before the check (DuckDB: a duplicate).
+  for (const std::string_view sql : {
+           "WITH c AS (SELECT a FROM t), ^E'c' AS (SELECT a FROM t) SELECT a FROM c"sv,
+           "WITH c AS (SELECT a FROM t), ^$$C$$ AS (SELECT a FROM t) SELECT a FROM c"sv,
+       }) {
+    const std::size_t caret = sql.find('^');
+    const std::string text = std::string(sql.substr(0, caret)) + std::string(sql.substr(caret + 1));
+    auto result = Parse(text);
+    ASSERT_FALSE(result.has_value()) << text;
+    EXPECT_EQ(result.error().kind, ParseError::Kind::kUnsupported) << text;
+    EXPECT_EQ(result.error().span.offset, caret) << text;
+    EXPECT_TRUE(
+        result.error().message.starts_with("string literals as CTE names are not supported"))
+        << text << ": " << result.error().message;
   }
 }
 
@@ -2216,6 +2240,29 @@ INSTANTIATE_TEST_SUITE_P(
                    kUnsupported, 1, "parenthesized queries are not supported"},
         RejectCase{"UnionAfterWith", "WITH c AS (SELECT a FROM t) SELECT a FROM c ^UNION SELECT 1",
                    kUnsupported, 5, "UNION is not supported"},
+        // Reported at their first token, where DuckDB gives a syntax error (docs/sql-subset.md).
+        RejectCase{"SubqueryCutShort", "SELECT a FROM (SELECT 1^", kUnsupported, 0,
+                   "SELECT without FROM is not supported"},
+        RejectCase{"SubqueryCutShortAfterAComma", "SELECT a FROM (SELECT a FROM t^,", kUnsupported,
+                   1, "a trailing comma in FROM is not supported"},
+        RejectCase{"WithRecursiveAlone", "WITH ^RECURSIVE;", kUnsupported, 9,
+                   "WITH RECURSIVE is not supported"},
+        RejectCase{"WithRecursiveBeforeAComma",
+                   "WITH ^recursive, c AS (SELECT a FROM t) SELECT a FROM c", kUnsupported, 9,
+                   "WITH RECURSIVE is not supported"},
+        RejectCase{"CteDescribe", "WITH c AS (^DESCRIBE t) SELECT a FROM c", kUnsupported, 8,
+                   "DESCRIBE is not supported; only SELECT queries are supported"},
+        RejectCase{"CteDrop", "WITH c AS (^DROP TABLE t) SELECT a FROM c", kUnsupported, 4,
+                   "DROP is not supported; only SELECT queries are supported"},
+        RejectCase{"CteValuesAlone", "WITH c AS (^values) SELECT a FROM c", kUnsupported, 6,
+                   "VALUES is not supported; only SELECT queries are supported"},
+        RejectCase{"DescribeAfterWith", "WITH c AS (SELECT a FROM t) ^DESCRIBE c", kUnsupported, 8,
+                   "DESCRIBE is not supported; only SELECT queries are supported"},
+        RejectCase{"SubqueryPivotAlone", "SELECT a FROM (^pivot)", kUnsupported, 5,
+                   "PIVOT is not supported; only SELECT queries are supported"},
+        RejectCase{"SubqueryPivotWiderBeforeAJoin", "SELECT a FROM (^pivot_wider JOIN u ON a = b)",
+                   kUnsupported, 11,
+                   "PIVOT_WIDER is not supported; only SELECT queries are supported"},
         RejectCase{"EmptyStringAlias", "SELECT a FROM events AS ^''", kUnsupported, 2,
                    "an empty table alias ('') is not supported"},
         RejectCase{"EscapeStringAlias", "SELECT a FROM events AS ^E'x'", kUnsupported, 1,

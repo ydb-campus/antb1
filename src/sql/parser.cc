@@ -710,7 +710,8 @@ class Parser {
   // name [columns] AS '(' query ')', positioned at the name. The name follows the rules of an
   // implicit table alias; DuckDB also takes a string there, which is unsupported. A name that
   // repeats one of the list's earlier `names` (ASCII case-insensitively, as in DuckDB, also a
-  // string's) is a syntax error at the name, before the query is parsed.
+  // plain string's; an escape or a dollar-quoted string is unsupported first) is a syntax error
+  // at the name, before the query is parsed.
   Expected<CommonTableExpr> ParseCte(std::unordered_set<std::string>& names) {
     constexpr std::string_view kStringName =
         "string literals as CTE names are not supported; write the name as a quoted identifier";
