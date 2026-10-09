@@ -201,7 +201,7 @@ std::optional<int64_t> KeyDomain(const Table& table, int field) {
     return 0;
   }
   // 1. The integer range over the parts, capped at the non-NULL values: when every part has a
-  // range or only NULLs.
+  // range (its min at most its max, as in every valid footer) or only NULLs.
   Int128 non_null = 0;
   std::optional<Int128> low;
   std::optional<Int128> high;
@@ -212,11 +212,11 @@ std::optional<int64_t> KeyDomain(const Table& table, int field) {
       exact = stats.has_value();  // with only NULLs: no value of the part counts
       continue;
     }
-    if (!stats->min.has_value() || !stats->max.has_value()) {
+    if (!stats->min.has_value() || !stats->max.has_value() || *stats->min > *stats->max) {
       exact = false;
       continue;
     }
-    non_null += stats->rows - std::max<int64_t>(stats->null_count, 0);
+    non_null += std::max<int64_t>(stats->rows - std::max<int64_t>(stats->null_count, 0), 0);
     low = low.has_value() ? std::min(*low, *stats->min) : *stats->min;
     high = high.has_value() ? std::max(*high, *stats->max) : *stats->max;
   }
@@ -224,7 +224,12 @@ std::optional<int64_t> KeyDomain(const Table& table, int field) {
     if (!low.has_value() || !high.has_value()) {
       return 0;  // every value is NULL
     }
-    return Saturated(std::min(*high - *low + 1, non_null));
+    // max - min + 1, saturated: the range of 128-bit values (HUGEINT) can exceed an Int128.
+    Int128 range = kInt128Max;
+    if (Int128 difference = 0; !__builtin_sub_overflow(*high, *low, &difference)) {
+      range = CheckedAdd(difference, 1).value_or(kInt128Max);
+    }
+    return Saturated(std::min(range, non_null));
   }
   // 2. The largest hint, when every part has one.
   int64_t largest = 0;

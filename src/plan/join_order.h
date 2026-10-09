@@ -70,9 +70,10 @@ std::vector<JoinStep> OrderJoins(std::span<const JoinRelation> relations,
 
 // The domain of top-level field `field` of `table` (the number of its distinct non-NULL values,
 // estimated), from the parts' footer statistics:
-//   1. when every part has exact statistics (Table::part_stats), its integer range capped at its
-//      non-NULL values, min(max - min + 1, non-NULL rows), so that a sparse key (few values spread
-//      over a wide range) does not shrink every estimate to 1; 0 when every value is NULL;
+//   1. when every part has exact statistics (Table::part_stats; a part with values needs its min
+//      and max, the min at most the max), its integer range capped at its non-NULL values,
+//      min(max - min + 1, non-NULL rows), saturated at INT64_MAX, so that a sparse key (few values
+//      spread over a wide range) does not shrink every estimate to 1; 0 when every value is NULL;
 //   2. else, when every part has a distinct-count hint (Table::part_distinct_count), the largest
 //      of them, a lower bound of the column's count;
 //   3. else std::nullopt (the estimate takes the relation's rows).

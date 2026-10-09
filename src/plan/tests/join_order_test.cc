@@ -233,6 +233,43 @@ TEST(JoinOrderTest, KeyDomains) {
   EXPECT_EQ(KeyDomain(no_parts.WithParts({}), 0), std::optional<int64_t>(0));
 }
 
+// KeyDomain over statistics that no Parquet footer gives antb1: a range of 128-bit values (HUGEINT)
+// wider than an Int128 saturates, and the non-NULL rows cap it; a part whose min exceeds its max
+// has no exact statistics; a part of negative rows adds no value.
+TEST(JoinOrderTest, KeyDomainsOfExtremeStatistics) {
+  const auto schema = arrow::schema({arrow::field("k", arrow::int64())});
+  const Int128 widest = PowerOfTen(38) - 1;  // HUGEINT's 38 digits
+  FakeTable wide(schema, 20);
+  wide.WithParts({10, 10})
+      .WithStats(0, 0, PartStats{.min = -widest, .max = 0, .null_count = 0, .rows = 10})
+      .WithStats(1, 0, PartStats{.min = 1, .max = widest, .null_count = 4, .rows = 10});
+  EXPECT_EQ(KeyDomain(wide, 0), std::optional<int64_t>(16));
+  FakeTable extreme(schema, 10);
+  extreme.WithParts({10}).WithStats(
+      0, 0, PartStats{.min = kInt128Min, .max = kInt128Max, .null_count = 0, .rows = 10});
+  EXPECT_EQ(KeyDomain(extreme, 0), std::optional<int64_t>(10));
+  extreme.WithStats(0, 0, PartStats{.min = 0, .max = kInt128Max, .null_count = 0, .rows = 10});
+  EXPECT_EQ(KeyDomain(extreme, 0), std::optional<int64_t>(10));
+
+  FakeTable reversed(schema, 20);
+  reversed.WithParts({10, 10})
+      .WithStats(0, 0, PartStats{.min = 1, .max = 5, .null_count = 0, .rows = 10})
+      .WithStats(1, 0, PartStats{.min = 9, .max = 3, .null_count = 0, .rows = 10})
+      .WithDistinctCount(0, 0, 4)
+      .WithDistinctCount(1, 0, 6);
+  EXPECT_EQ(KeyDomain(reversed, 0), std::optional<int64_t>(6));
+  FakeTable reversed_alone(schema, 10);
+  reversed_alone.WithParts({10}).WithStats(
+      0, 0, PartStats{.min = 9, .max = 3, .null_count = 0, .rows = 10});
+  EXPECT_EQ(KeyDomain(reversed_alone, 0), std::nullopt);
+
+  FakeTable negative(schema, 10);
+  negative.WithParts({10, -3})
+      .WithStats(0, 0, PartStats{.min = 1, .max = 50, .null_count = 0, .rows = 10})
+      .WithStats(1, 0, PartStats{.min = 1, .max = 50, .null_count = -5, .rows = -3});
+  EXPECT_EQ(KeyDomain(negative, 0), std::optional<int64_t>(10));
+}
+
 // RelationRows and EstimateRows: a table's exact row count; for a sub-plan, a Scan's table's rows
 // through every single-input node, one row for an ungrouped aggregate and a RowCount, and unknown
 // for a join.
