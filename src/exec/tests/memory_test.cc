@@ -4,7 +4,6 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <latch>
 #include <memory>
 #include <optional>
@@ -17,20 +16,13 @@
 #include <arrow/util/thread_pool.h>
 #include <gtest/gtest.h>
 
-#include "antb1/exec/compute.h"
-#include "antb1/exec/group_aggregate.h"
 #include "antb1/exec/grouped_aggregate_state.h"
-#include "antb1/exec/join_table.h"
 #include "antb1/exec/memory_budget.h"
 #include "antb1/exec/operator.h"
 #include "antb1/exec/physical_planner.h"
-#include "antb1/exec/project.h"
 #include "antb1/exec/sort.h"
-#include "antb1/exec/table_scan.h"
 #include "antb1/plan/logical_plan.h"
 
-#include "../hash_join.h"
-#include "../part_operators.h"
 #include "exec_test_util.h"
 
 namespace antb1::exec {
@@ -264,13 +256,10 @@ class MemoryLimitTest : public testing::ExecTest {
     return plan;
   }
 
-  // A physical plan, built afresh for every run.
-  using PlanFactory = std::function<arrow::Result<std::unique_ptr<Operator>>()>;
-
-  static arrow::Result<std::shared_ptr<arrow::Table>> Run(const PlanFactory& plan,
+  static arrow::Result<std::shared_ptr<arrow::Table>> Run(const plan::LogicalPlan& plan,
                                                           MemoryBudget& budget,
                                                           arrow::internal::Executor* executor) {
-    ARROW_ASSIGN_OR_RAISE(auto op, plan());
+    ARROW_ASSIGN_OR_RAISE(auto op, BuildPhysicalPlan(plan));
     ExecContext ctx{.pool = &budget,
                     .batch_size = 16,
                     .executor = executor,
@@ -279,131 +268,61 @@ class MemoryLimitTest : public testing::ExecTest {
     return Drain(*op, ctx);
   }
 
-  static arrow::Result<std::shared_ptr<arrow::Table>> Run(const plan::LogicalPlan& plan,
-                                                          MemoryBudget& budget,
-                                                          arrow::internal::Executor* executor) {
-    return Run([&plan] { return BuildPhysicalPlan(plan); }, budget, executor);
-  }
-
   // Every shape of sink, and joins.
-  static std::vector<PlanFactory> Plans(const std::shared_ptr<MemoryTable>& table) {
-    std::vector<PlanFactory> plans;
-    for (plan::LogicalPlan& logical : LogicalPlans(table)) {
-      plans.emplace_back([built = std::move(logical)] { return BuildPhysicalPlan(built); });
-    }
-    for (PlanFactory& join : JoinPlans(table)) {
+  static std::vector<plan::LogicalPlan> Plans(const std::shared_ptr<MemoryTable>& table) {
+    std::vector<plan::LogicalPlan> plans = LogicalPlans(table);
+    for (plan::LogicalPlan& join : JoinPlans(table)) {
       plans.push_back(std::move(join));
     }
     return plans;
   }
 
-  // The parts of `table`, scanned (x and s).
-  static PartPipeline ScanParts(const std::shared_ptr<MemoryTable>& table) {
-    return [table](int64_t part) -> arrow::Result<std::unique_ptr<Operator>> {
-      return std::make_unique<TableScanOperator>(table, std::vector<int>{0, 1}, part);
-    };
-  }
-
-  // The parts of `table`, each scanned and probing `build` on `key`.
-  static PartPipeline ProbeParts(const std::shared_ptr<MemoryTable>& table,
-                                 const std::shared_ptr<JoinBuild>& build, int key) {
-    return [table, build, key](int64_t part) -> arrow::Result<std::unique_ptr<Operator>> {
-      ARROW_ASSIGN_OR_RAISE(
-          std::unique_ptr<HashJoinOperator> join,
-          HashJoinOperator::Make(
-              std::make_unique<TableScanOperator>(table, std::vector<int>{0, 1}, part), build,
-              {key}, plan::BuildSide::kRight, {}, /*prepares=*/false));
-      return join;
-    };
-  }
-
-  // Self-joins of the table, built by hand until the physical planner plans joins (J1b-2): a 1:1
-  // join on x (dense unique keys: the direct layout) under a projection, a join on s (VARCHAR keys:
-  // hashed) under a grouping, a 1:N join whose build's key is x % 50 (20 rows each), and a probe
-  // over a serial input whose build input is drained.
-  static std::vector<PlanFactory> JoinPlans(const std::shared_ptr<MemoryTable>& table) {
+  // Self-joins of the table (hash joins, ADR 0022): a 1:1 join on x (dense unique keys: the
+  // direct layout) under a projection, a join on s (VARCHAR keys: hashed) under a grouping, a 1:N
+  // join whose build's key is x % 50 (20 rows each), and a probe over a serial input (a LIMIT
+  // without a limit) whose build input, another one, is drained.
+  static std::vector<plan::LogicalPlan> JoinPlans(const std::shared_ptr<MemoryTable>& table) {
     const auto x = Column(0, "x", LogicalType::kBigInt);
     const auto s = Column(1, "s", LogicalType::kVarchar);
-    const int64_t parts = table->num_parts();
-    using Result = arrow::Result<std::unique_ptr<Operator>>;
-    std::vector<PlanFactory> plans;
-    plans.emplace_back([=] -> Result {
-      ARROW_ASSIGN_OR_RAISE(auto spec, JoinBuildSpec::Make(table->schema(), {x}));
-      auto build = std::make_shared<JoinBuild>(spec, ScanParts(table), parts,
-                                               std::vector<std::shared_ptr<JoinBuild>>{}, nullptr);
-      const PartPipeline probe = ProbeParts(table, build, 0);
-      PartPipeline pipeline = [probe](int64_t part) -> Result {
-        ARROW_ASSIGN_OR_RAISE(auto join, probe(part));
-        return std::make_unique<ProjectOperator>(std::move(join), std::vector<int>{0, 3});
-      };
-      ARROW_ASSIGN_OR_RAISE(auto sample, pipeline(0));
-      return std::make_unique<BuildsFirstOperator>(
-          std::make_unique<PartUnionOperator>(pipeline, parts, sample->output_schema(),
-                                              std::nullopt),
-          std::vector<std::shared_ptr<JoinBuild>>{build});
-    });
-    plans.emplace_back([=] -> Result {
-      ARROW_ASSIGN_OR_RAISE(auto spec, JoinBuildSpec::Make(table->schema(), {s}));
-      auto build = std::make_shared<JoinBuild>(spec, ScanParts(table), parts,
-                                               std::vector<std::shared_ptr<JoinBuild>>{}, nullptr);
-      const PartPipeline pipeline = ProbeParts(table, build, 1);
-      const std::vector<plan::AggregateCall> calls = {{.kind = plan::AggKind::kMin,
-                                                       .arg = Column(3, "s", LogicalType::kVarchar),
-                                                       .type = LogicalType::kVarchar}};
-      ARROW_ASSIGN_OR_RAISE(auto sample, pipeline(0));
-      const GroupAggregateOperator serial(std::move(sample), {x}, calls);
-      return std::make_unique<BuildsFirstOperator>(
-          std::make_unique<PartGroupAggregateOperator>(
-              pipeline, parts, 4, std::vector<plan::BoundColumn>{x}, calls, serial.output_schema()),
-          std::vector<std::shared_ptr<JoinBuild>>{build});
-    });
-    plans.emplace_back([=] -> Result {
-      const auto modulo = std::make_shared<const plan::Expr>(plan::Expr{
-          .node = plan::ArithExpr{.op = plan::ArithOp::kModulo,
-                                  .left = std::make_shared<const plan::Expr>(
-                                      plan::Expr{.node = plan::ColumnExpr{.index = 0},
-                                                 .type = LogicalType::kBigInt}),
-                                  .right = std::make_shared<const plan::Expr>(plan::Expr{
-                                      .node = plan::ConstantExpr{.value = testing::BigInt(50)},
-                                      .type = LogicalType::kBigInt})},
-          .type = LogicalType::kBigInt});
-      const PartPipeline scan = ScanParts(table);
-      PartPipeline build_parts = [scan, modulo](int64_t part) -> Result {
-        ARROW_ASSIGN_OR_RAISE(auto read, scan(part));
-        return std::make_unique<ComputeOperator>(std::move(read),
-                                                 std::vector<plan::ExprPtr>{modulo});
-      };
-      ARROW_ASSIGN_OR_RAISE(auto build_sample, build_parts(0));
-      ARROW_ASSIGN_OR_RAISE(auto spec,
-                            JoinBuildSpec::Make(build_sample->output_schema(),
-                                                {Column(2, "e0", LogicalType::kBigInt)}));
-      auto build = std::make_shared<JoinBuild>(spec, std::move(build_parts), parts,
-                                               std::vector<std::shared_ptr<JoinBuild>>{}, nullptr);
-      const PartPipeline probe = ProbeParts(table, build, 0);
-      PartPipeline pipeline = [probe](int64_t part) -> Result {
-        ARROW_ASSIGN_OR_RAISE(auto join, probe(part));
-        return std::make_unique<ProjectOperator>(std::move(join), std::vector<int>{0, 3});
-      };
-      ARROW_ASSIGN_OR_RAISE(auto sample, pipeline(0));
-      return std::make_unique<BuildsFirstOperator>(
-          std::make_unique<PartUnionOperator>(pipeline, parts, sample->output_schema(),
-                                              std::nullopt),
-          std::vector<std::shared_ptr<JoinBuild>>{build});
-    });
-    plans.emplace_back([=] -> Result {
-      ARROW_ASSIGN_OR_RAISE(auto spec, JoinBuildSpec::Make(table->schema(), {x}));
-      auto build =
-          std::make_shared<JoinBuild>(spec,
-                                      std::make_unique<PartUnionOperator>(
-                                          ScanParts(table), parts, table->schema(), std::nullopt),
-                                      nullptr);
-      ARROW_ASSIGN_OR_RAISE(
-          std::unique_ptr<HashJoinOperator> join,
-          HashJoinOperator::Make(std::make_unique<PartUnionOperator>(ScanParts(table), parts,
-                                                                     table->schema(), std::nullopt),
-                                 build, {0}, plan::BuildSide::kRight, {}, /*prepares=*/true));
-      return std::make_unique<ProjectOperator>(std::move(join), std::vector<int>{0, 3});
-    });
+    const auto build_s = Column(3, "s", LogicalType::kVarchar);
+    const auto scan = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}});
+    const auto join = [](plan::LogicalNodePtr probe, plan::LogicalNodePtr build,
+                         const plan::BoundColumn& probe_key, const plan::BoundColumn& build_key) {
+      return Node(plan::JoinNode{.kind = plan::JoinKind::kInner,
+                                 .left = std::move(probe),
+                                 .right = std::move(build),
+                                 .keys = {plan::JoinKey{.left = probe_key, .right = build_key}},
+                                 .residual = {},
+                                 .build = plan::BuildSide::kRight,
+                                 .span = {}});
+    };
+    // The probe's x and the build's s.
+    const auto pair = [&](plan::LogicalNodePtr joined) {
+      return PlanOf(Node(plan::ProjectNode{.input = std::move(joined), .columns = {x, build_s}}),
+                    2);
+    };
+    const auto modulo = std::make_shared<const plan::Expr>(plan::Expr{
+        .node = plan::ArithExpr{.op = plan::ArithOp::kModulo,
+                                .left = std::make_shared<const plan::Expr>(
+                                    plan::Expr{.node = plan::ColumnExpr{.index = 0},
+                                               .type = LogicalType::kBigInt}),
+                                .right = std::make_shared<const plan::Expr>(plan::Expr{
+                                    .node = plan::ConstantExpr{.value = testing::BigInt(50)},
+                                    .type = LogicalType::kBigInt})},
+        .type = LogicalType::kBigInt});
+    const auto all = [&] { return Node(plan::LimitNode{.input = scan, .limit = std::nullopt}); };
+    std::vector<plan::LogicalPlan> plans;
+    plans.push_back(pair(join(scan, scan, x, x)));
+    plans.push_back(
+        PlanOf(Node(plan::GroupAggregateNode{.input = join(scan, scan, s, s),
+                                             .keys = {x},
+                                             .aggregates = {{.kind = plan::AggKind::kMin,
+                                                             .arg = build_s,
+                                                             .type = LogicalType::kVarchar}}}),
+               2));
+    plans.push_back(pair(join(scan, Node(plan::ComputeNode{.input = scan, .exprs = {modulo}}), x,
+                              Column(2, "e0", LogicalType::kBigInt))));
+    plans.push_back(pair(join(all(), all(), x, x)));
     return plans;
   }
 

@@ -16,6 +16,7 @@
 
 #include "antb1/exec/operator.h"
 #include "antb1/exec/physical_planner.h"
+#include "antb1/plan/explain.h"
 #include "antb1/plan/logical_plan.h"
 
 #include "../profiled_operator.h"
@@ -236,6 +237,102 @@ TEST_F(ProfileTest, EveryOperatorIsNamed) {
               "ScalarAggregate rows=1 runs=1\n"
               "  PartGroupAggregate rows=140 runs=1 parts=20 skipped=0 groups=140\n"
               "    Scan rows=140 runs=20 per_part\n");
+  }
+}
+
+// 2 parts of 5 rows: k = 0..9 (unique and dense: the direct layout), v = 100 + k.
+std::shared_ptr<MemoryTable> Dimension() {
+  const auto schema =
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("v", arrow::int64())});
+  arrow::RecordBatchVector batches;
+  for (int64_t part = 0; part < 2; ++part) {
+    std::vector<std::optional<int64_t>> k;
+    std::vector<std::optional<int64_t>> v;
+    for (int64_t i = 0; i < 5; ++i) {
+      k.emplace_back((part * 5) + i);
+      v.emplace_back(100 + (part * 5) + i);
+    }
+    batches.push_back(arrow::RecordBatch::Make(schema, 5, {Int64s(k), Int64s(v)}));
+  }
+  return std::make_shared<MemoryTable>(schema, std::move(batches), /*split=*/true);
+}
+
+// A hash join shows a HashJoin line for its probe and a HashBuild line, with the join's EXPLAIN
+// text, under the operator that prepares the build: the sink of the probe pipeline (after the
+// pipeline), or the probe itself over a serial input (after its input). The build's line has the
+// rows its table holds and its parts; its input is profiled below it, per part for a part
+// pipeline. The same counts on 1 and 4 threads. Every row of t matches one of the dimension's (g
+// = k), on the 1:1 path.
+TEST_F(ProfileTest, JoinsShowBuildAndProbeLines) {
+  auto pool = arrow::internal::ThreadPool::Make(4);
+  ASSERT_TRUE(pool.ok());
+  const auto t = Node(plan::ScanNode{.table = Table(), .table_name = "t", .fields = {0, 1}});
+  const auto d = Node(plan::ScanNode{.table = Dimension(), .table_name = "d", .fields = {0, 1}});
+  const auto join_of = [](plan::LogicalNodePtr probe, plan::LogicalNodePtr build) {
+    return Node(
+        plan::JoinNode{.kind = plan::JoinKind::kInner,
+                       .left = std::move(probe),
+                       .right = std::move(build),
+                       .keys = {plan::JoinKey{.left = Column(1, "g", LogicalType::kBigInt),
+                                              .right = Column(0, "k", LogicalType::kBigInt)}},
+                       .residual = {},
+                       .build = plan::BuildSide::kRight,
+                       .span = {}});
+  };
+  const auto count_of = [](plan::LogicalNodePtr input) {
+    return PlanOf(Node(plan::AggregateNode{.input = std::move(input),
+                                           .aggregates = {{.kind = plan::AggKind::kCountStar,
+                                                           .arg = {},
+                                                           .type = LogicalType::kBigInt}}}),
+                  1);
+  };
+  const auto join = join_of(t, d);
+  const auto sorted =
+      Node(plan::SortNode{.input = t, .keys = {{.column = Column(0, "x", LogicalType::kBigInt)}}});
+  const auto all_of_d = Node(plan::LimitNode{.input = d, .limit = std::nullopt});
+  for (arrow::internal::Executor* executor :
+       {static_cast<arrow::internal::Executor*>(nullptr),
+        static_cast<arrow::internal::Executor*>(pool->get())}) {
+    const auto probed = Profile(count_of(join), executor);
+    EXPECT_EQ(Counts(*probed),
+              "PartAggregate rows=1 runs=1 parts=20 skipped=0\n"
+              "  HashJoin rows=140 runs=20 per_part\n"
+              "    Scan rows=140 runs=20 per_part\n"
+              "  HashBuild rows=10 runs=1 parts=2 skipped=0\n"
+              "    Scan rows=10 runs=2 per_part\n");
+    ASSERT_EQ(probed->children().size(), 2U);
+    const ProfileNode& probe = *probed->children()[0];
+    const ProfileNode& build = *probed->children()[1];
+    EXPECT_EQ(probe.detail(), plan::ExplainNode(*join));
+    EXPECT_EQ(build.detail(), plan::ExplainNode(*join));
+    for (const char* metric : {"find", "gather", "window_rows"}) {
+      EXPECT_TRUE(MetricOf(probe, metric).has_value()) << metric;
+    }
+    EXPECT_EQ(MetricOf(probe, "window_rows"), 140);
+    for (const char* metric : {"part_time", "wait", "lanes_tail", "finish"}) {
+      EXPECT_TRUE(MetricOf(build, metric).has_value()) << metric;
+    }
+    EXPECT_EQ(MetricOf(build, "null_keys"), 0);
+    EXPECT_EQ(MetricOf(build, "unique"), 1);
+    EXPECT_EQ(MetricOf(build, "direct"), 1);
+
+    // Over a serial input (a sort), the probe prepares the build: its line comes after the input.
+    EXPECT_EQ(Counts(*Profile(PlanOf(join_of(sorted, d), 4), executor)),
+              "HashJoin rows=140 runs=1\n"
+              "  Sort rows=140 runs=1\n"
+              "    PartUnion rows=140 runs=1 parts=20 skipped=0\n"
+              "      Scan rows=140 runs=20 per_part\n"
+              "  HashBuild rows=10 runs=1 parts=2 skipped=0\n"
+              "    Scan rows=10 runs=2 per_part\n");
+    // A drained build input: its batches (two per part of d, in batches of 3) are the parts.
+    EXPECT_EQ(Counts(*Profile(count_of(join_of(t, all_of_d)), executor)),
+              "PartAggregate rows=1 runs=1 parts=20 skipped=0\n"
+              "  HashJoin rows=140 runs=20 per_part\n"
+              "    Scan rows=140 runs=20 per_part\n"
+              "  HashBuild rows=10 runs=1 parts=4\n"
+              "    Limit rows=10 runs=1\n"
+              "      PartUnion rows=10 runs=1 parts=2 skipped=0\n"
+              "        Scan rows=10 runs=2 per_part\n");
   }
 }
 

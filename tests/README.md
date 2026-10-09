@@ -12,7 +12,7 @@ time: the ctest `fixtures.tpch` (label `setup`) writes it to `build/<preset>/fix
 | `slt/` | `slt.<area>.<file>`, `oracle.<area>.<file>` | `slt`, `oracle` | sqllogictest files on antb1 and DuckDB |
 | `slt/` | `diff.random`, `diff.decimal`, `diff.star` | `diff` | generated queries, antb1 vs DuckDB (fixed seeds) |
 | `metamorphic/` | `metamorphic.*` | `metamorphic` | relations between antb1 answers |
-| `integration/` | `integration.*` | `integration` | `engine::Session` end to end; bad Parquet inputs; globs |
+| `integration/` | `integration.*` | `integration` | `engine::Session` end to end; bad Parquet inputs; globs; hand-built hash-join plans over the star fixtures |
 | `cli/` | `cli.<case>` | `cli` | stdout, stderr and exit code of the `antb1` binary |
 | `slt/`, `harness/`, `cli/` | `harness.*` | `harness` | the harness itself: mutations, redaction, digest |
 | `data/` | `data.*` | `data` | ClickBench data tests on downloaded data, redacted (`pixi run test-data` only) |

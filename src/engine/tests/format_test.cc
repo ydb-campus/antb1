@@ -1,5 +1,6 @@
 #include "antb1/engine/format.h"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -12,6 +13,9 @@
 #include <arrow/api.h>
 #include <arrow/array/concatenate.h>
 #include <gtest/gtest.h>
+
+#include "antb1/engine/session.h"
+#include "antb1/exec/profile.h"
 
 namespace antb1::engine {
 namespace {
@@ -313,6 +317,72 @@ TEST(FormatResultTest, JsonCopiesWellFormedUtf8) {
     EXPECT_EQ(Json(bytes), JsonRow(bytes));
     EXPECT_EQ(Json("<" + bytes + ">"), JsonRow("<" + bytes + ">"));
   }
+}
+
+// A profile's metrics show in a fixed order, whatever order the threads recorded them in: a hash
+// join's probe (find, gather, residual, window_rows) and build (parts, skipped, part_time, wait,
+// lanes_tail, finish, null_keys, unique, direct) among the others, then the unknown ones by name;
+// in the text and in the JSON.
+TEST(FormatProfileTest, JoinMetricsShowInAFixedOrder) {
+  constexpr int64_t kMs = int64_t{1000} * 1000;
+  auto root = std::make_shared<exec::ProfileNode>();
+  root->set_name("PartAggregate");
+  root->set_detail("Aggregate COUNT(*)");
+  root->AddRows(1);
+  for (const char* name : {"merge", "wait", "part_time"}) {
+    root->Add(name, exec::MetricUnit::kNanos, kMs);
+  }
+  root->Max("skipped", exec::MetricUnit::kCount, 0);
+  root->Max("parts", exec::MetricUnit::kCount, 6);
+  exec::ProfileNode& probe = *root->Child(0);
+  probe.set_name("HashJoin");
+  probe.set_detail("Join INNER build=right keys=[a = b]");
+  probe.set_per_part(true);
+  probe.Add("zeta", exec::MetricUnit::kCount, 1);
+  probe.Add("window_rows", exec::MetricUnit::kCount, 8);
+  for (const char* name : {"residual", "gather", "find"}) {
+    probe.Add(name, exec::MetricUnit::kNanos, kMs);
+  }
+  probe.Add("alpha", exec::MetricUnit::kCount, 1);
+  exec::ProfileNode& build = *root->Child(1);
+  build.set_name("HashBuild");
+  build.set_detail("Join INNER build=right keys=[a = b]");
+  build.Max("direct", exec::MetricUnit::kCount, 0);
+  build.Max("unique", exec::MetricUnit::kCount, 1);
+  build.Add("null_keys", exec::MetricUnit::kCount, 2);
+  for (const char* name : {"finish", "lanes_tail", "wait", "part_time"}) {
+    build.Add(name, exec::MetricUnit::kNanos, kMs);
+  }
+  build.Max("skipped", exec::MetricUnit::kCount, 1);
+  build.Max("parts", exec::MetricUnit::kCount, 3);
+  const QueryProfile profile{.output = "Output: c:BIGINT",
+                             .root = root,
+                             .time = std::chrono::nanoseconds(0),
+                             .rows = 1,
+                             .peak_memory = 0,
+                             .threads = 4};
+  EXPECT_EQ(FormatProfile(profile, ProfileFormat::kText),
+            "Output: c:BIGINT\n"
+            "Total: time=0.000ms rows=1 peak_memory=0 bytes threads=4\n"
+            "PartAggregate Aggregate COUNT(*)  [rows=1 batches=1 time=0.000ms self=0.000ms parts=6 "
+            "skipped=0 part_time=1.000ms wait=1.000ms merge=1.000ms]\n"
+            "  HashJoin Join INNER build=right keys=[a = b]  [rows=0 batches=0 parts=0 "
+            "time=0.000ms (summed over parts) find=1.000ms gather=1.000ms residual=1.000ms "
+            "window_rows=8 alpha=1 zeta=1]\n"
+            "  HashBuild Join INNER build=right keys=[a = b]  [rows=0 batches=0 time=0.000ms "
+            "parts=3 skipped=1 part_time=1.000ms wait=1.000ms lanes_tail=1.000ms finish=1.000ms "
+            "null_keys=2 unique=1 direct=0]\n");
+  const std::string json = FormatProfile(profile, ProfileFormat::kJson);
+  EXPECT_NE(json.find(R"("metrics":{"find_ns":1000000,"gather_ns":1000000,"residual_ns":1000000,)"
+                      R"("window_rows":8,"alpha":1,"zeta":1})"),
+            std::string::npos)
+      << json;
+  EXPECT_NE(
+      json.find(R"("metrics":{"parts":3,"skipped":1,"part_time_ns":1000000,"wait_ns":1000000,)"
+                R"("lanes_tail_ns":1000000,"finish_ns":1000000,"null_keys":2,"unique":1,)"
+                R"("direct":0})"),
+      std::string::npos)
+      << json;
 }
 
 }  // namespace

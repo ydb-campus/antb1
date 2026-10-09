@@ -3,8 +3,9 @@
 antb1 is a small, single-process SQL engine over Parquet files. It is split into seven C++23 static libraries
 (modules) and one binary, `antb1`. This page describes the code as it is today; the engine design beyond the first
 SQL slice is still open (see [ADR 0003](adr/0003-engine-architecture.md)). Joins, derived tables, common table
-expressions and uncorrelated subqueries are designed in [ADR 0022](adr/0022-joins-and-query-blocks.md) and not built
-yet: the steps below change with the PRs that build them.
+expressions and uncorrelated subqueries are designed in [ADR 0022](adr/0022-joins-and-query-blocks.md): the executor
+runs inner joins as hash joins, but no query binds to a join yet, and the steps below change with the PRs that build
+the rest.
 
 ## Modules
 
@@ -53,9 +54,9 @@ Responsibilities:
 - `exec`: pull-based, batch-at-a-time physical operators (`TableScan`, `Filter`, `Compute`, `Project`, `ScalarAggregate`,
   `GroupAggregate`, `Sort`, `Limit`, `RowCount`; see [Execution](#execution)), the exact aggregate states (scalar
   and grouped), the row comparator and sort buffer, the join hash table (`JoinTableBuilder`, `JoinTable`) and the
-  inner hash join's operators (`JoinBuild`, `BuildsFirstOperator`, `HashJoinOperator`; no plan uses them yet, see
-  [Execution](#execution)), the physical planner and `Drain`. It scans only through `plan::Table` and never depends
-  on `io`.
+  inner hash join's operators (`JoinBuild`, `BuildsFirstOperator`, `HashJoinOperator`, which the physical planner
+  plans every inner join with; see [Execution](#execution)), the physical planner and `Drain`. It scans only through
+  `plan::Table` and never depends on `io`.
 - `engine`: `engine::Session` (owns the catalog, calls `arrow::compute::Initialize()`, runs parse, bind, plan and
   execute) and the canonical value formatter used for every output format.
 - `cli`: the CLI11 command line (`query`, `explain`, `schema`, `bench`, `version`), error reporting and exit codes;
@@ -121,9 +122,11 @@ steps (only step 7 uses more than one thread):
    (merged in parallel, partitioned) with `COUNT(x)` over its groups. Other aggregations with `COUNT(DISTINCT)`
    over a part pipeline run in two levels when their calls allow it (`exec::TwoLevelAggregation`,
    [ADR 0014](adr/0014-two-level-aggregation.md)). The chain of `Filter`,
-   `Compute` and `Project` nodes over a `Scan` is a part pipeline, built once per table part (see
-   [Execution](#execution)). A `Join` is unsupported (exit code 4) until the hash join implements its kind
-   ([ADR 0022](adr/0022-joins-and-query-blocks.md)).
+   `Compute` and `Project` nodes and inner joins' probes over a `Scan` is a part pipeline, built once per table part
+   (see [Execution](#execution)). An inner `Join` is a hash join
+   ([ADR 0022](adr/0022-joins-and-query-blocks.md)): a build of one input, made once per pipeline before the factory
+   of its parts, and a probe of the other, in that input's part pipeline or over it; the other kinds are unsupported
+   (exit code 4) until they are implemented, and a malformed join (keys of two types, say) is `Invalid`.
 7. Drain (`exec::Drain`): `Open`, pull batches with `Next` until the end of the stream, `Close` (also after an
    error); the selected rows of the batches form an `arrow::Table`, and the engine names its columns. The part
    pipelines run on the session's thread pool (`--threads`, `engine::SessionOptions::threads`), and so do the batches
@@ -140,14 +143,18 @@ profiled once per part into the same nodes), runs it, drops the rows and prints 
 ## Execution
 
 Operators pull `exec::Batch`es from their input: an Arrow record batch and an optional selection, a boolean array
-without NULLs that marks the rows taking part. A filter never copies data, and only a projection turns a selection
-into data. Every operator instance is used by one thread.
+without NULLs that marks the rows taking part. A filter never copies data. A projection turns a selection into data,
+and so does a hash join's probe when it copies rows: its (probe row, match) pairs of a build whose keys repeat, and
+the rows it evaluates residuals on; with unique build keys it keeps the probe batch and selects the matched rows.
+Every operator instance is used by one thread.
 
 **Parts** ([ADR 0013](adr/0013-parallel-execution.md)). A table is split into parts (`plan::Table::num_parts`,
 `ScanPart`): the row groups of a Parquet table. The pipeline below the first blocking operator, a chain of `Filter`,
-`Compute` and `Project` over a `Scan`, is built once per part with a `TableScanOperator` of that part, so parts share
-no operator state. `exec::PartScheduler` runs the parts on `ExecContext::executor` (an Arrow `ThreadPool` the
-`Session` owns when it has more than one thread) and hands their results back strictly in part order. At most
+`Compute`, `Project` and inner joins' probes over a `Scan` (a probe's input is the side it does not build on), is
+built once per part with a `TableScanOperator` of that part, so parts share no operator state; the probes of every
+part read the same builds, made once with the pipeline. `exec::PartScheduler` runs the parts on
+`ExecContext::executor` (an Arrow `ThreadPool` the `Session` owns when it has more than one thread) and hands their
+results back strictly in part order. At most
 2 × threads parts are running or finished but not yet taken. With one thread, each part runs on the calling thread
 when it is reached: the same code, so a result does not depend on the thread count. The first failing part in part
 order decides the error. Parts after the point where the consumer stops (a met `LIMIT`) are never started or are
@@ -177,12 +184,15 @@ row's position in the part (`ScanPart` with `positions`), and the row ids are ma
 an Arrow memory pool that is `ExecContext::pool` for every query, and that the Parquet reader decodes into
 (`plan::Table::Scan` and `ScanPart` take the pool). It counts every buffer and, through `Reserve`, the containers
 operators keep outside Arrow buffers: the grouped aggregate states (`GroupedAggregateState::memory_usage`), the
-sort buffer's row references (`SortBuffer::memory_usage`, plus `sort_memory` while it sorts) and a join build's
+sort buffer's row references (`SortBuffer::memory_usage`, plus `sort_memory` while it sorts), a join build's
 containers (each part's row hashes, the partitions' runs of rows, the table's row references, offsets and bucket
-directories, and the temporaries of `Finish`), each held in an `exec::MemoryReservation` that gives the bytes back
-on `Close` (a join table's when the table is destroyed). The count is atomic and checked before an allocation, so
-threads never pass the limit together; past it, an allocation fails with `Status::OutOfMemory` and nothing is left
-behind. A result keeps the budget alive (`QueryResult::memory`) as long as its buffers exist. The
+directories, and the temporaries of `Finish`) and a probe's (the matches of its batch, the rows of its output),
+each held in an `exec::MemoryReservation` that gives the bytes back on `Close` (a join table's when the table is
+destroyed). A finished build stays held until the parts of its probe pipeline are done, and counts toward the
+pressure below; the builds a build's input probes go once that build is finished. The count is atomic and checked
+before an allocation, so threads never pass the limit together; past it, an allocation fails with
+`Status::OutOfMemory` and nothing is left behind. A result keeps the budget alive (`QueryResult::memory`) as long as
+its buffers exist. The
 part scheduler's window adapts to the budget: every part taken above half of the limit halves it, every part taken
 below widens it by one, and above half no new part starts while another is in flight. A part that runs out of memory
 next to others does not fail the query: the parts ahead are dropped (and run again when reached) and it runs again
@@ -202,7 +212,7 @@ instead of returning it to the system and faulting it back in: unless the variab
 wins) or `ARROW_DEFAULT_MEMORY_POOL` names another pool. The process then keeps its peak resident memory until it
 exits; the budget, which counts allocations, is unchanged.
 
-**Join builds** ([ADR 0022](adr/0022-joins-and-query-blocks.md); the physical planner plans no join yet). An
+**Join builds** ([ADR 0022](adr/0022-joins-and-query-blocks.md)). An
 `exec::JoinBuildPart` takes one part of a build input on any thread: it keeps the selected rows whose keys are not
 NULL, splits them into 64 partitions by `exec::KeyHashes` modulo 64 (the GROUP BY rule) with one Take per column,
 and keeps each row's hash. An `exec::JoinTableBuilder` takes the parts on the consumer thread in any order and hands
@@ -225,6 +235,18 @@ when it is first pulled, then opens the pipeline's sink, and releases them once 
 batch's columns and selects the matched rows, otherwise it takes a (probe row, match) pair per output row; its
 residuals are evaluated in order, each on the rows the ones before it kept.
 
+The physical planner plans every inner join so. It walks a part pipeline with one helper (`PipelineInput`: through
+`Filter`, `Compute`, `Project` and an inner join's probe input) to find its scan, the predicates its statistics and its
+scan use (only a `Filter` right on the scan: one above a join reads the join's columns) and its joins; each join's
+build is made then, once, outermost join first, before the factory of the pipeline's parts, so no part number of the
+probe side reaches a build input, whose part pipeline has its own parts, pruning and pushdown. A build input that is
+no part pipeline is drained. The sink of a pipeline with joins runs behind a `BuildsFirstOperator`; a probe over a
+serial input prepares its own build at its first `Next`. Late materialization declines over a join; the
+`COUNT(DISTINCT)` rewrite, the partition top-N and a `LIMIT` over a pipeline apply over one, its builds first. A build
+whose table holds no row empties its join: the probe never opens its input, and the builds below it are not
+prepared. Errors follow the serial order: the builds, outermost first and each after the builds its input probes,
+then the probe's parts.
+
 | Operator | Logical node | Does |
 | --- | --- | --- |
 | `TableScanOperator` | `Scan` | `plan::Table::ScanPart` (in a part pipeline) or `Scan` of the referenced fields only, in batches of `ExecContext::batch_size` rows (64Ki) |
@@ -241,6 +263,8 @@ residuals are evaluated in order, each on the rows the ones before it kept.
 | `GroupAggregateOperator` | `GroupAggregate` over other input | through an `exec::GroupTable`, materializes the selected rows, maps their keys to group ids with Arrow's `Grouper` (DOUBLE keys normalized first), feeds one `GroupedAggregateState` per call; after the input, emits one row per group: the keys as first seen, then the aggregates; without keys (`GROUP BY` of constants only) every row is in one group |
 | `SortOperator` | `Sort`, or `Limit` over `Sort` over other input | reads its whole input into a `SortBuffer`, sorts row references stably with `RowComparator` (DuckDB's order: NULLs last by default, NaN above every number, VARCHAR by bytes; each row carries an order-preserving 64-bit prefix of its first key, so most comparisons are integer compares) and emits the rows in batches, gathered column by column with typed builders; with a limit it keeps only `limit + offset` rows while it reads (top-N) and emits the window ([ADR 0011](adr/0011-sorting-and-top-n.md)) |
 | `LimitOperator` | `Limit` | skips `offset` rows, passes on at most `limit` rows (narrowing selections, not copying) and then never pulls its input again |
+| `HashJoinOperator` | inner `Join`: its probe, in the part pipeline of the input it does not build on, or over that input | for every probe batch, `JoinTable::Find` of its selected rows' keys; with a build of unique keys, windows of `batch_size` rows of the probe batch (slices, not copies) selected where they matched, the build's columns gathered by match and NULL elsewhere (`exec::GatherRows`); otherwise a batch of up to `batch_size` (probe row, match) pairs, the probe's columns taken and the build's gathered; then the residuals in order, each on the rows the ones before kept (NULL is false); rows in probe order, each one's matches in the build's (part, row) order; over a serial input it prepares its own `JoinBuild` at its first `Next`; when the build holds no row it never opens its input |
+| `BuildsFirstOperator` | the sink of a part pipeline whose probes read builds | prepares the pipeline's builds (`exec::JoinBuild`: the `JoinTable` of a build input's parts, or of a drained operator's batches) at its first `Next`, outermost first and stopping after one that holds no row, then opens the sink and returns its batches; releases the builds once the sink's parts are done, or at `Close` |
 | `RowCountOperator` | `RowCount` | one BIGINT row from the table's exact row count |
 
 The aggregate states (`src/exec/include/antb1/exec/aggregate_state.h`) implement `Consume(values, selection)`,

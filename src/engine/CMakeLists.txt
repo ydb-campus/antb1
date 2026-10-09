@@ -8,5 +8,10 @@ antb1_add_module(
 )
 
 if(ANTB1_BUILD_TESTS)
-  antb1_add_module_tests(engine SOURCES tests/session_test.cc tests/format_test.cc LIBS Parquet::parquet_shared)
+  antb1_add_module_tests(
+    engine
+    SOURCES tests/session_test.cc tests/format_test.cc
+    # exec: the profile nodes of the profile format tests
+    LIBS antb1::exec Parquet::parquet_shared
+  )
 endif()

@@ -3,17 +3,22 @@
 // probe pipeline's builds (BuildsFirstOperator) over every part sink, and the probe
 // (HashJoinOperator) on its 1:1 and 1:N paths, with residuals, NULL and multi-column keys, empty
 // builds, nested builds and chains, errors in the serial order, memory and profiles, on one thread
-// and on a 4-thread pool.
+// and on a 4-thread pool (HashJoinTest); then inner joins planned by the physical planner against
+// a nested-loop reference, through every sink and the hidden physical rules (HashJoinPlanTest).
 
 #include "../hash_join.h"
 
+#include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -27,10 +32,13 @@
 #include "antb1/exec/join_table.h"
 #include "antb1/exec/memory_budget.h"
 #include "antb1/exec/operator.h"
+#include "antb1/exec/physical_planner.h"
 #include "antb1/exec/profile.h"
 #include "antb1/exec/scalar_aggregate.h"
 #include "antb1/exec/table_scan.h"
+#include "antb1/plan/explain.h"
 #include "antb1/plan/logical_plan.h"
+#include "antb1/plan/table.h"
 
 #include "../part_operators.h"
 #include "exec_test_util.h"
@@ -1449,6 +1457,838 @@ TEST_F(HashJoinTest, ProfilesCountBuildsAndProbes) {
     for (const char* name : {"find", "gather", "residual"}) {
       EXPECT_TRUE(MetricOf(probe_node, name).has_value()) << name;
     }
+  }
+}
+
+// ---- plans (HashJoinPlanTest): inner joins through the physical planner ----
+
+class HashJoinPlanTest : public testing::ExecTest {};
+
+plan::LogicalNodePtr Node(plan::LogicalNode node) {
+  return std::make_shared<const plan::LogicalNode>(std::move(node));
+}
+
+// A table of `parts` parts (a batch each, of `rows` rows), i numbering the rows in part order:
+// <prefix>k BIGINT key(i), <prefix>s VARCHAR (NULL if i % 9 == 4, else "x", "" or "y" by i % 3)
+// and <prefix>id BIGINT i.
+std::shared_ptr<MemoryTable> MixedTable(const std::string& prefix, int64_t parts, int64_t rows,
+                                        const std::function<std::optional<int64_t>(int64_t)>& key) {
+  static constexpr std::array<const char*, 3> kTexts = {"x", "", "y"};
+  const auto schema = arrow::schema({arrow::field(prefix + "k", arrow::int64()),
+                                     arrow::field(prefix + "s", arrow::binary()),
+                                     arrow::field(prefix + "id", arrow::int64())});
+  arrow::RecordBatchVector batches;
+  for (int64_t part = 0; part < parts; ++part) {
+    std::vector<std::optional<int64_t>> keys;
+    std::vector<std::optional<std::string>> texts;
+    std::vector<std::optional<int64_t>> ids;
+    for (int64_t r = 0; r < rows; ++r) {
+      const int64_t i = (part * rows) + r;
+      keys.push_back(key(i));
+      texts.push_back(i % 9 == 4
+                          ? std::nullopt
+                          : std::optional<std::string>(kTexts[static_cast<std::size_t>(i % 3)]));
+      ids.emplace_back(i);
+    }
+    batches.push_back(BatchOf(schema, {Int64s(keys), Strings(texts), Int64s(ids)}));
+  }
+  return std::make_shared<MemoryTable>(schema, std::move(batches), /*split=*/true);
+}
+
+// Column `index` of a MixedTable's rows read at `offset` in a join's output: <prefix>k and
+// <prefix>id BIGINT, <prefix>s VARCHAR.
+plan::BoundColumn MixedColumn(const std::string& prefix, int index, int offset = 0) {
+  static constexpr std::array<const char*, 3> kNames = {"k", "s", "id"};
+  return Column(offset + index, prefix + kNames[static_cast<std::size_t>(index)],
+                index == 1 ? LogicalType::kVarchar : LogicalType::kBigInt);
+}
+
+// The probe keys i % 13, NULL where i % 11 == 5.
+std::optional<int64_t> ProbeKey(int64_t i) {
+  if (i % 11 == 5) {
+    return std::nullopt;
+  }
+  return i % 13;
+}
+
+plan::LogicalNodePtr ScanOf(const std::shared_ptr<plan::Table>& table, const std::string& name) {
+  return Node(plan::ScanNode{.table = table, .table_name = name, .fields = AllFields(*table)});
+}
+
+// The inner join of `probe` and `build` where probe_keys[k] (a column of the probe's output) equals
+// build_keys[k] (of the build's), building on `build_side`: the build is the left input with kLeft.
+plan::LogicalNodePtr JoinOf(const plan::LogicalNodePtr& probe, const plan::LogicalNodePtr& build,
+                            const std::vector<plan::BoundColumn>& probe_keys,
+                            const std::vector<plan::BoundColumn>& build_keys,
+                            BuildSide build_side = BuildSide::kRight,
+                            std::vector<plan::ExprPtr> residual = {}) {
+  const bool left = build_side == BuildSide::kLeft;
+  plan::JoinNode join{.kind = plan::JoinKind::kInner,
+                      .left = left ? build : probe,
+                      .right = left ? probe : build,
+                      .keys = {},
+                      .residual = std::move(residual),
+                      .build = build_side,
+                      .span = {}};
+  for (std::size_t k = 0; k < probe_keys.size(); ++k) {
+    join.keys.push_back(plan::JoinKey{.left = left ? build_keys[k] : probe_keys[k],
+                                      .right = left ? probe_keys[k] : build_keys[k]});
+  }
+  return Node(std::move(join));
+}
+
+// A plan of `root`, whose output has `width` columns.
+plan::LogicalPlan PlanOf(plan::LogicalNodePtr root, std::size_t width) {
+  plan::LogicalPlan plan{.root = std::move(root), .output = {}};
+  for (std::size_t i = 0; i < width; ++i) {
+    plan.output.push_back({.name = "c" + std::to_string(i), .type = LogicalType::kBigInt});
+  }
+  return plan;
+}
+
+// The rows of `plan`, run with `ctx` and profiled into `profile` (nullptr: not profiled).
+arrow::Result<std::shared_ptr<arrow::Table>> RunPlan(const plan::LogicalPlan& plan, ExecContext ctx,
+                                                     ProfileNode* profile = nullptr) {
+  ARROW_ASSIGN_OR_RAISE(std::unique_ptr<Operator> op, BuildPhysicalPlan(plan, profile));
+  return Drain(*op, ctx);
+}
+
+// The names of the tables whose parts were scanned, in scan order (from any thread).
+class ScanLog {
+ public:
+  void Add(const std::string& name) {
+    const std::scoped_lock lock(mutex_);
+    names_.push_back(name);
+  }
+  [[nodiscard]] std::vector<std::string> names() const {
+    const std::scoped_lock lock(mutex_);
+    return names_;
+  }
+  void Clear() {
+    const std::scoped_lock lock(mutex_);
+    names_.clear();
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  std::vector<std::string> names_;
+};
+
+// A MemoryTable that logs its name at every part scanned: the order in which a plan reads the
+// parts of several tables.
+class LoggedTable final : public plan::Table {
+ public:
+  LoggedTable(std::shared_ptr<MemoryTable> table, std::string name, std::shared_ptr<ScanLog> log)
+      : table_(std::move(table)), name_(std::move(name)), log_(std::move(log)) {}
+
+  const std::shared_ptr<arrow::Schema>& schema() const override { return table_->schema(); }
+  std::optional<int64_t> exact_row_count() const override { return table_->exact_row_count(); }
+  int64_t num_parts() const override { return table_->num_parts(); }
+  std::optional<int64_t> part_rows(int64_t part) const override { return table_->part_rows(part); }
+  std::string Describe() const override { return "logged"; }
+
+ protected:
+  arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScan(
+      const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool) const override {
+    return table_->Scan(fields, batch_size, pool);
+  }
+  arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScanPart(
+      int64_t part, const std::vector<int>& fields, int64_t batch_size,
+      arrow::MemoryPool* pool) const override {
+    log_->Add(name_);
+    return table_->ScanPart(part, fields, batch_size, pool);
+  }
+
+ private:
+  std::shared_ptr<MemoryTable> table_;
+  std::string name_;
+  std::shared_ptr<ScanLog> log_;
+};
+
+// `name` repeated `count` times.
+std::vector<std::string> Repeated(const std::string& name, std::size_t count) {
+  return std::vector<std::string>(count, name);
+}
+
+std::vector<std::string> Concat(std::vector<std::vector<std::string>> parts) {
+  std::vector<std::string> out;
+  for (std::vector<std::string>& part : parts) {
+    out.insert(out.end(), part.begin(), part.end());
+  }
+  return out;
+}
+
+// The rows of `rows` whose cell `column` is a number of at least `value`.
+Rows WhereAtLeast(const Rows& rows, std::size_t column, int64_t value) {
+  Rows out;
+  for (const std::vector<std::string>& row : rows) {
+    if (row[column] != "null" && std::stoll(row[column]) >= value) {
+      out.push_back(row);
+    }
+  }
+  return out;
+}
+
+// Through the physical planner, an inner join gives the nested-loop reference in its order: the
+// probe's rows in part order, each with its matches in the build's (part, row) order. A build on
+// either side, of repeated or unique keys (the 1:N and 1:1 paths), on a BIGINT, a VARCHAR ('' is
+// no NULL) or a two-column key, for any batch size.
+TEST_F(HashJoinPlanTest, MatchesTheNestedLoopReference) {
+  const auto probe_table = MixedTable("p", 6, 7, ProbeKey);
+  const Rows probe_rows = RowsOf(*probe_table);
+  const std::vector<std::vector<int>> keys = {{0}, {1}, {0, 1}};
+  for (const bool unique : {false, true}) {
+    const auto build_table =
+        unique ? MixedTable("b", 2, 6, [](int64_t i) -> std::optional<int64_t> { return i; })
+               : MixedTable("b", 3, 5, [](int64_t i) -> std::optional<int64_t> { return i % 10; });
+    const Rows build_rows = RowsOf(*build_table);
+    for (const std::vector<int>& columns : keys) {
+      std::vector<plan::BoundColumn> probe_keys;
+      std::vector<plan::BoundColumn> build_keys;
+      for (const int c : columns) {
+        probe_keys.push_back(MixedColumn("p", c));
+        build_keys.push_back(MixedColumn("b", c));
+      }
+      for (const BuildSide side : {BuildSide::kRight, BuildSide::kLeft}) {
+        const Rows expected = ReferenceJoin(probe_rows, build_rows, columns, columns, side);
+        ASSERT_FALSE(expected.empty());
+        const auto plan = PlanOf(JoinOf(ScanOf(probe_table, "p"), ScanOf(build_table, "b"),
+                                        probe_keys, build_keys, side),
+                                 6);
+        for (const int64_t batch_size : {1, 3, 64}) {
+          SCOPED_TRACE(std::to_string(columns.size()) + " key(s) from column " +
+                       std::to_string(columns[0]) + (unique ? ", 1:1" : ", 1:N") +
+                       (side == BuildSide::kLeft ? ", build left" : ", build right") +
+                       ", batch size " + std::to_string(batch_size));
+          auto result = RunPlan(plan, ContextOf(nullptr, batch_size));
+          ASSERT_TRUE(result.ok()) << result.status().ToString();
+          EXPECT_EQ(RowsOf(**result), expected);
+        }
+      }
+    }
+  }
+}
+
+// Every shape through which a join's rows reach a result gives the same rows on one thread and on
+// four: the part union at the root, a Filter and a Project above the probe, every part sink (an
+// aggregate, a GROUP BY, two levels with keys and without, the COUNT(DISTINCT) rewrite, a top-N),
+// a Limit, a Sort, the partition top-N, a probe over a serial input, a drained build, a chain of
+// two joins in one pipeline and a build whose input probes a build of its own. The joins and the
+// aggregation in two levels without keys give the nested-loop reference.
+TEST_F(HashJoinPlanTest, SameResultsOnOneAndFourThreads) {
+  const auto pool = MakeThreadPool();
+  const auto p = MixedTable("p", 6, 7, ProbeKey);
+  const auto b = MixedTable("b", 3, 5, [](int64_t i) -> std::optional<int64_t> { return i % 10; });
+  const auto d = MixedTable("d", 2, 6, [](int64_t i) -> std::optional<int64_t> { return i; });
+  const auto pk = MixedColumn("p", 0);
+  const auto bk = MixedColumn("b", 0);
+  const auto bid = MixedColumn("b", 2);
+  const auto dk = MixedColumn("d", 0);
+  const auto join = JoinOf(ScanOf(p, "p"), ScanOf(b, "b"), {pk}, {bk});
+  // The join's output: p's k, s, id, then b's.
+  const auto out_pk = MixedColumn("p", 0);
+  const auto out_pid = MixedColumn("p", 2);
+  const auto out_bk = MixedColumn("b", 0, 3);
+  const auto out_bid = MixedColumn("b", 2, 3);
+  const plan::AggregateCall count{
+      .kind = plan::AggKind::kCountStar, .arg = {}, .type = LogicalType::kBigInt};
+  const plan::AggregateCall min_bid{
+      .kind = plan::AggKind::kMin, .arg = out_bid, .type = LogicalType::kBigInt};
+  const plan::AggregateCall max_pid{
+      .kind = plan::AggKind::kMax, .arg = out_pid, .type = LogicalType::kBigInt};
+  const plan::AggregateCall distinct_pid{
+      .kind = plan::AggKind::kCountDistinct, .arg = out_pid, .type = LogicalType::kBigInt};
+  const auto sorted = Node(plan::SortNode{
+      .input = join,
+      .keys = {{.column = out_pid, .descending = true}, {.column = out_bid, .descending = true}}});
+  const auto grouped =
+      Node(plan::GroupAggregateNode{.input = join, .keys = {out_bk}, .aggregates = {count}});
+  // A probe input that is no part pipeline (p's keys, grouped), and a build input that is none.
+  const auto probe_groups =
+      Node(plan::GroupAggregateNode{.input = ScanOf(p, "p"), .keys = {pk}, .aggregates = {count}});
+  const plan::AggregateCall min_of_bid{
+      .kind = plan::AggKind::kMin, .arg = bid, .type = LogicalType::kBigInt};
+  const auto build_groups = Node(
+      plan::GroupAggregateNode{.input = ScanOf(b, "b"), .keys = {bk}, .aggregates = {min_of_bid}});
+  // p joins b, then d on pid = dk; p joins (b joins d on bid = dk) on pk = bk.
+  const auto chain = JoinOf(join, ScanOf(d, "d"), {out_pid}, {dk});
+  const auto nested =
+      JoinOf(ScanOf(p, "p"), JoinOf(ScanOf(b, "b"), ScanOf(d, "d"), {bid}, {dk}), {pk}, {bk});
+  const std::vector<std::pair<std::string, plan::LogicalPlan>> shapes = {
+      {"join", PlanOf(join, 6)},
+      {"project, filter",
+       PlanOf(Node(plan::ProjectNode{.input = Node(plan::FilterNode{
+                                         .input = join,
+                                         .predicates = {testing::Compare(
+                                             out_pid, plan::CompareOp::kLt, testing::BigInt(30))}}),
+                                     .columns = {out_bid, out_pid}}),
+              2)},
+      {"aggregate",
+       PlanOf(Node(plan::AggregateNode{.input = join, .aggregates = {count, min_bid, max_pid}}),
+              3)},
+      {"group by", PlanOf(Node(plan::GroupAggregateNode{
+                              .input = join, .keys = {out_bk}, .aggregates = {count, min_bid}}),
+                          3)},
+      {"two levels",
+       PlanOf(Node(plan::GroupAggregateNode{
+                  .input = join, .keys = {out_bk}, .aggregates = {distinct_pid, count}}),
+              3)},
+      // COUNT(DISTINCT) next to another call, without keys: a global aggregation in two levels.
+      {"global two levels",
+       PlanOf(Node(plan::AggregateNode{.input = join, .aggregates = {distinct_pid, count}}), 2)},
+      {"count distinct",
+       PlanOf(Node(plan::AggregateNode{.input = join, .aggregates = {distinct_pid}}), 1)},
+      {"top-N", PlanOf(Node(plan::LimitNode{.input = sorted, .limit = 5}), 6)},
+      {"limit", PlanOf(Node(plan::LimitNode{.input = join, .limit = 7}), 6)},
+      {"sort", PlanOf(sorted, 6)},
+      {"partition top-N",
+       PlanOf(
+           Node(plan::LimitNode{.input = Node(plan::SortNode{
+                                    .input = grouped,
+                                    .keys = {{.column = Column(1, "count", LogicalType::kBigInt),
+                                              .descending = true},
+                                             {.column = Column(0, "bk", LogicalType::kBigInt)}}}),
+                                .limit = 3}),
+           2)},
+      {"serial probe",
+       PlanOf(JoinOf(probe_groups, ScanOf(b, "b"), {Column(0, "pk", LogicalType::kBigInt)}, {bk}),
+              5)},
+      {"drained build",
+       PlanOf(JoinOf(ScanOf(p, "p"), build_groups, {pk}, {Column(0, "bk", LogicalType::kBigInt)}),
+              5)},
+      {"chain", PlanOf(chain, 9)},
+      {"nested build", PlanOf(nested, 9)},
+  };
+  for (const auto& [name, plan] : shapes) {
+    SCOPED_TRACE(name);
+    auto serial = RunPlan(plan, ContextOf(nullptr, 4));
+    ASSERT_TRUE(serial.ok()) << serial.status().ToString();
+    EXPECT_GT((*serial)->num_rows(), 0);
+    auto parallel = RunPlan(plan, ContextOf(pool.get(), 4));
+    ASSERT_TRUE(parallel.ok()) << parallel.status().ToString();
+    EXPECT_TRUE((*parallel)->Equals(**serial));
+    if (name == "join") {
+      EXPECT_EQ(RowsOf(**serial), ReferenceJoin(RowsOf(*p), RowsOf(*b), {0}, {0}));
+    } else if (name == "global two levels") {
+      const Rows rows = ReferenceJoin(RowsOf(*p), RowsOf(*b), {0}, {0});
+      std::set<std::string> ids;
+      for (const std::vector<std::string>& row : rows) {
+        ids.insert(row[2]);
+      }
+      EXPECT_EQ(RowsOf(**serial),
+                (Rows{{std::to_string(ids.size()), std::to_string(rows.size())}}));
+    } else if (name == "chain") {
+      EXPECT_EQ(RowsOf(**serial), ReferenceJoin(ReferenceJoin(RowsOf(*p), RowsOf(*b), {0}, {0}),
+                                                RowsOf(*d), {2}, {0}));
+    } else if (name == "nested build") {
+      EXPECT_EQ(
+          RowsOf(**serial),
+          ReferenceJoin(RowsOf(*p), ReferenceJoin(RowsOf(*b), RowsOf(*d), {2}, {0}), {0}, {0}));
+    }
+  }
+}
+
+// Filter pushdown (ADR 0020) stays with a Filter right on a scan, on either side of a join, each
+// scan in its own parts: the probe's 6 parts and the build's 2 apply their own predicates while
+// they read (no probe part number reaches the build, which has no part 5). A Filter above the join
+// reads the join's columns and pushes nothing. The rows are the same either way.
+TEST_F(HashJoinPlanTest, FilterPushdownReachesEachSideWithItsOwnParts) {
+  const auto pool = MakeThreadPool();
+  const auto pk = MixedColumn("p", 0);
+  const auto bk = MixedColumn("b", 0);
+  const auto at_least_2 = testing::Compare(pk, plan::CompareOp::kGe, testing::BigInt(2));
+  const auto at_most_6 = testing::Compare(bk, plan::CompareOp::kLe, testing::BigInt(6));
+  for (arrow::internal::Executor* executor : Executors(pool.get())) {
+    SCOPED_TRACE(executor == nullptr ? "one thread" : "pool");
+    const auto key = [](int64_t i) -> std::optional<int64_t> { return i % 10; };
+    const auto p = MixedTable("p", 6, 7, ProbeKey);
+    const auto b = MixedTable("b", 2, 6, key);
+    const auto below = JoinOf(
+        Node(plan::FilterNode{.input = ScanOf(p, "p"), .predicates = {at_least_2}}),
+        Node(plan::FilterNode{.input = ScanOf(b, "b"), .predicates = {at_most_6}}), {pk}, {bk});
+    ProfileNode profile;
+    auto pushed = RunPlan(PlanOf(below, 6), ContextOf(executor), &profile);
+    ASSERT_TRUE(pushed.ok()) << pushed.status().ToString();
+    EXPECT_EQ(p->filtered_scans(), 6);
+    EXPECT_EQ(b->filtered_scans(), 2);
+    ASSERT_EQ(profile.children().size(), 2U);
+    for (const ProfileNode* side : profile.children()) {
+      const ProfileNode& filter = *side->children()[0];
+      EXPECT_EQ(filter.name(), "Filter");
+      EXPECT_TRUE(filter.children()[0]->detail().ends_with(", 1 pushed predicate"))
+          << filter.children()[0]->detail();
+    }
+    const auto q = MixedTable("p", 6, 7, ProbeKey);
+    const auto c = MixedTable("b", 2, 6, key);
+    const auto above = Node(plan::FilterNode{
+        .input = JoinOf(ScanOf(q, "p"), ScanOf(c, "b"), {pk}, {bk}),
+        .predicates = {at_least_2, testing::Compare(MixedColumn("b", 0, 3), plan::CompareOp::kLe,
+                                                    testing::BigInt(6))}});
+    auto kept = RunPlan(PlanOf(above, 6), ContextOf(executor));
+    ASSERT_TRUE(kept.ok()) << kept.status().ToString();
+    EXPECT_EQ(q->filtered_scans(), 0);
+    EXPECT_EQ(c->filtered_scans(), 0);
+    EXPECT_EQ(RowsOf(**kept), RowsOf(**pushed));
+    EXPECT_FALSE(RowsOf(**kept).empty());
+  }
+}
+
+// Parts are skipped by the statistics of the Filters right on each side's scan, each side in its
+// own parts (`skipped` on the operator that consumes them: the probe's sink, the build). A Filter
+// above a join never skips a part: its columns are the join's, and the build's columns come first
+// on a build on the left, so its predicate on the build's id (column 2) must not be read as one on
+// the probe scan's column 2 (the probe's id), which would skip the probe's part 0.
+TEST_F(HashJoinPlanTest, PartPruningReadsOnlyTheScansOwnFilters) {
+  const auto pk = MixedColumn("p", 0);
+  const auto pid = MixedColumn("p", 2);
+  const auto bk = MixedColumn("b", 0);
+  const auto bid = MixedColumn("b", 2);
+  const auto key = [](int64_t i) -> std::optional<int64_t> { return i % 10; };
+  {
+    // pid >= 28 on the probe's scan: its parts 0 to 3 (pid 0 to 27) are skipped.
+    const auto p = MixedTable("p", 6, 7, ProbeKey);
+    const auto b = MixedTable("b", 3, 5, key);
+    ProfileNode profile;
+    auto result = RunPlan(
+        PlanOf(JoinOf(Node(plan::FilterNode{.input = ScanOf(p, "p"),
+                                            .predicates = {testing::Compare(
+                                                pid, plan::CompareOp::kGe, testing::BigInt(28))}}),
+                      ScanOf(b, "b"), {pk}, {bk}),
+               6),
+        ContextOf(nullptr), &profile);
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    EXPECT_EQ(MetricOf(profile, "skipped"), 4);
+    EXPECT_EQ(MetricOf(*profile.children()[1], "skipped"), 0);
+    EXPECT_EQ(p->scanned_parts(), (std::vector<int64_t>{4, 5}));
+    Rows probe_rows;
+    for (const std::vector<std::string>& row : RowsOf(*p)) {
+      if (std::stoll(row[2]) >= 28) {
+        probe_rows.push_back(row);
+      }
+    }
+    EXPECT_EQ(RowsOf(**result), ReferenceJoin(probe_rows, RowsOf(*b), {0}, {0}));
+  }
+  {
+    // bid >= 12 above a join that builds on the left: no part skipped on either side.
+    const auto p = MixedTable("p", 6, 7, ProbeKey);
+    const auto b = MixedTable("b", 3, 5, key);
+    ProfileNode profile;
+    auto result = RunPlan(
+        PlanOf(
+            Node(plan::FilterNode{
+                .input = JoinOf(ScanOf(p, "p"), ScanOf(b, "b"), {pk}, {bk}, BuildSide::kLeft),
+                .predicates = {testing::Compare(bid, plan::CompareOp::kGe, testing::BigInt(12))}}),
+            6),
+        ContextOf(nullptr), &profile);
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    EXPECT_EQ(profile.name(), "PartUnion");  // the Filter runs in the probe pipeline
+    EXPECT_EQ(MetricOf(profile, "skipped"), 0);
+    EXPECT_EQ(p->scanned_parts(), (std::vector<int64_t>{0, 1, 2, 3, 4, 5}));
+    const Rows expected =
+        WhereAtLeast(ReferenceJoin(RowsOf(*p), RowsOf(*b), {0}, {0}, BuildSide::kLeft), 2, 12);
+    ASSERT_FALSE(expected.empty());
+    EXPECT_EQ(RowsOf(**result), expected);
+  }
+  {
+    // bid >= 10 on the build's scan: its parts 0 and 1 are skipped.
+    const auto p = MixedTable("p", 6, 7, ProbeKey);
+    const auto b = MixedTable("b", 3, 5, key);
+    ProfileNode profile;
+    auto result = RunPlan(
+        PlanOf(JoinOf(ScanOf(p, "p"),
+                      Node(plan::FilterNode{.input = ScanOf(b, "b"),
+                                            .predicates = {testing::Compare(
+                                                bid, plan::CompareOp::kGe, testing::BigInt(10))}}),
+                      {pk}, {bk}),
+               6),
+        ContextOf(nullptr), &profile);
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    EXPECT_EQ(MetricOf(profile, "skipped"), 0);
+    const ProfileNode& build = *profile.children()[1];
+    EXPECT_EQ(build.name(), "HashBuild");
+    EXPECT_EQ(MetricOf(build, "skipped"), 2);
+    EXPECT_EQ(b->scanned_parts(), (std::vector<int64_t>{2}));
+    EXPECT_EQ(RowsOf(**result),
+              ReferenceJoin(RowsOf(*p), WhereAtLeast(RowsOf(*b), 2, 10), {0}, {0}));
+  }
+}
+
+// Late materialization (ADR 0016) declines over a join: a top-N over a probe pipeline reads every
+// column, where the same scan without the join reads its unused columns late (the positive
+// control). The rows are those of the plain top-N.
+TEST_F(HashJoinPlanTest, LateMaterializationDeclinesOverAJoin) {
+  const auto p = MixedTable("p", 6, 7, ProbeKey);
+  const auto b = MixedTable("b", 3, 5, [](int64_t i) -> std::optional<int64_t> { return i % 10; });
+  const auto detail = [](const plan::LogicalPlan& plan) {
+    ProfileNode root;
+    EXPECT_TRUE(BuildPhysicalPlan(plan, &root).ok());
+    return root.detail();
+  };
+  const auto pid = MixedColumn("p", 2);
+  const auto alone =
+      PlanOf(Node(plan::LimitNode{
+                 .input = Node(plan::SortNode{.input = ScanOf(p, "p"),
+                                              .keys = {{.column = pid, .descending = true}}}),
+                 .limit = 2}),
+             3);
+  EXPECT_EQ(detail(alone), "Sort pid DESC NULLS LAST Limit 2 late=2 columns");
+  const auto joined = PlanOf(
+      Node(plan::LimitNode{.input = Node(plan::SortNode{
+                               .input = JoinOf(ScanOf(p, "p"), ScanOf(b, "b"),
+                                               {MixedColumn("p", 0)}, {MixedColumn("b", 0)}),
+                               .keys = {{.column = pid, .descending = true},
+                                        {.column = MixedColumn("b", 2, 3), .descending = true}}}),
+                           .limit = 2}),
+      6);
+  EXPECT_EQ(detail(joined), "Sort pid DESC NULLS LAST, bid DESC NULLS LAST Limit 2");
+  auto result = RunPlan(joined, ContextOf(nullptr));
+  ASSERT_TRUE(result.ok()) << result.status().ToString();
+  Rows expected = ReferenceJoin(RowsOf(*p), RowsOf(*b), {0}, {0});
+  std::ranges::sort(expected,
+                    [](const std::vector<std::string>& x, const std::vector<std::string>& y) {
+                      return std::pair(std::stoll(x[2]), std::stoll(x[5])) >
+                             std::pair(std::stoll(y[2]), std::stoll(y[5]));
+                    });
+  expected.resize(2);
+  EXPECT_EQ(RowsOf(**result), expected);
+}
+
+// A COUNT(DISTINCT) of one column alone over a join is the GROUP BY of that column over the join's
+// pipeline (its build prepared first), then counted: a scalar aggregate over a partitioned GROUP BY
+// whose parts probe the build.
+TEST_F(HashJoinPlanTest, CountDistinctRewriteRunsOverAJoin) {
+  const auto pool = MakeThreadPool();
+  const auto p = MixedTable("p", 6, 7, ProbeKey);
+  const auto b = MixedTable("b", 3, 5, [](int64_t i) -> std::optional<int64_t> { return i % 10; });
+  const auto plan =
+      PlanOf(Node(plan::AggregateNode{.input = JoinOf(ScanOf(p, "p"), ScanOf(b, "b"),
+                                                      {MixedColumn("p", 0)}, {MixedColumn("b", 0)}),
+                                      .aggregates = {{.kind = plan::AggKind::kCountDistinct,
+                                                      .arg = MixedColumn("b", 2, 3),
+                                                      .type = LogicalType::kBigInt}}}),
+             1);
+  std::set<std::string> ids;
+  for (const std::vector<std::string>& row : ReferenceJoin(RowsOf(*p), RowsOf(*b), {0}, {0})) {
+    ids.insert(row[5]);
+  }
+  for (arrow::internal::Executor* executor : Executors(pool.get())) {
+    SCOPED_TRACE(executor == nullptr ? "one thread" : "pool");
+    ProfileNode root;
+    auto result = RunPlan(plan, ContextOf(executor), &root);
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    EXPECT_EQ(testing::SingleInt64(**result), static_cast<int64_t>(ids.size()));
+    EXPECT_EQ(root.name(), "ScalarAggregate");
+    ASSERT_EQ(root.children().size(), 1U);
+    const ProfileNode& groups = *root.children()[0];
+    EXPECT_EQ(groups.name(), "PartGroupAggregate");
+    ASSERT_EQ(groups.children().size(), 2U);
+    EXPECT_EQ(groups.children()[0]->name(), "HashJoin");
+    EXPECT_TRUE(groups.children()[0]->per_part());
+    EXPECT_EQ(groups.children()[1]->name(), "HashBuild");
+  }
+}
+
+// A top-N right above a GROUP BY over a join keeps each partition's first rows (PartitionTopN,
+// ADR 0011) in the GROUP BY over the join's pipeline: the rows of the full sort.
+TEST_F(HashJoinPlanTest, PartitionTopNRunsOverAJoin) {
+  const auto pool = MakeThreadPool();
+  const auto p = MixedTable("p", 6, 7, ProbeKey);
+  const auto b = MixedTable("b", 3, 5, [](int64_t i) -> std::optional<int64_t> { return i % 10; });
+  const auto grouped = Node(plan::GroupAggregateNode{
+      .input = JoinOf(ScanOf(p, "p"), ScanOf(b, "b"), {MixedColumn("p", 0)}, {MixedColumn("b", 0)}),
+      .keys = {MixedColumn("p", 0)},
+      .aggregates = {
+          {.kind = plan::AggKind::kCountStar, .arg = {}, .type = LogicalType::kBigInt}}});
+  const auto plan = PlanOf(
+      Node(plan::LimitNode{
+          .input = Node(plan::SortNode{
+              .input = grouped,
+              .keys = {{.column = Column(1, "count", LogicalType::kBigInt), .descending = true},
+                       {.column = Column(0, "pk", LogicalType::kBigInt)}}}),
+          .limit = 3}),
+      2);
+  // The reference: the matches of each probe key, most first, then by key.
+  std::map<int64_t, int64_t> matches;
+  for (const std::vector<std::string>& row : ReferenceJoin(RowsOf(*p), RowsOf(*b), {0}, {0})) {
+    ++matches[std::stoll(row[0])];
+  }
+  std::vector<std::pair<int64_t, int64_t>> order;  // (-count, key)
+  order.reserve(matches.size());
+  for (const auto& [k, n] : matches) {
+    order.emplace_back(-n, k);
+  }
+  std::ranges::sort(order);
+  Rows expected;
+  for (std::size_t i = 0; i < 3; ++i) {
+    expected.push_back({std::to_string(order[i].second), std::to_string(-order[i].first)});
+  }
+  for (arrow::internal::Executor* executor : Executors(pool.get())) {
+    SCOPED_TRACE(executor == nullptr ? "one thread" : "pool");
+    ProfileNode root;
+    auto result = RunPlan(plan, ContextOf(executor), &root);
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    EXPECT_EQ(RowsOf(**result), expected);
+    EXPECT_EQ(root.name(), "TopN");
+    ASSERT_EQ(root.children().size(), 1U);
+    EXPECT_EQ(root.children()[0]->name(), "PartGroupAggregate");
+    EXPECT_EQ(root.children()[0]->detail(),
+              "GroupAggregate keys=[pk] COUNT(*) top-N per partition keep=3");
+  }
+}
+
+// A LIMIT over a join builds first, then stops the probe's parts once it has its rows: every build
+// part is read, and the probe's parts only up to the window of parts in flight (the first one
+// alone on one thread). LIMIT 0 reads neither table: the operator that runs the probe pipeline is
+// never pulled, so no build runs (as in DuckDB).
+TEST_F(HashJoinPlanTest, LimitOverAJoinBuildsFirstThenStopsProbeParts) {
+  const auto pool = MakeThreadPool();
+  const auto pk = MixedColumn("p", 0);
+  const auto bk = MixedColumn("b", 0);
+  const auto every = [](int64_t i) -> std::optional<int64_t> { return i % 5; };
+  const auto key = [](int64_t i) -> std::optional<int64_t> { return i % 10; };
+  for (arrow::internal::Executor* executor : Executors(pool.get())) {
+    SCOPED_TRACE(executor == nullptr ? "one thread" : "pool");
+    const auto p = MixedTable("p", 20, 7, every);
+    const auto b = MixedTable("b", 3, 5, key);
+    const auto join = JoinOf(ScanOf(p, "p"), ScanOf(b, "b"), {pk}, {bk});
+    auto result =
+        RunPlan(PlanOf(Node(plan::LimitNode{.input = join, .limit = 3}), 6), ContextOf(executor));
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    EXPECT_EQ((*result)->num_rows(), 3);
+    EXPECT_EQ(b->scanned_parts(), (std::vector<int64_t>{0, 1, 2}));
+    if (executor == nullptr) {
+      EXPECT_EQ(p->scanned_parts(), std::vector<int64_t>{0});
+    } else {
+      EXPECT_LE(p->scanned_parts().size(), static_cast<std::size_t>((2 * kThreads) + 1));
+    }
+    // LIMIT 0, over the join and over a sort of it.
+    for (const bool sorted : {false, true}) {
+      const auto q = MixedTable("p", 20, 7, every);
+      const auto c = MixedTable("b", 3, 5, key);
+      plan::LogicalNodePtr input = JoinOf(ScanOf(q, "p"), ScanOf(c, "b"), {pk}, {bk});
+      if (sorted) {
+        input = Node(plan::SortNode{.input = input, .keys = {{.column = pk}}});
+      }
+      auto none = RunPlan(PlanOf(Node(plan::LimitNode{.input = input, .limit = 0}), 6),
+                          ContextOf(executor));
+      ASSERT_TRUE(none.ok()) << none.status().ToString();
+      EXPECT_EQ((*none)->num_rows(), 0);
+      EXPECT_TRUE(q->scanned_parts().empty()) << sorted;
+      EXPECT_TRUE(c->scanned_parts().empty()) << sorted;
+    }
+  }
+}
+
+// A build's error is that of its first failing part in part order, on one thread and on four; it
+// comes before any probe part runs, so it beats the probe's own error. In a chain the outer join's
+// build, prepared first, decides, and the inner one is never read.
+TEST_F(HashJoinPlanTest, FirstBuildErrorInPartOrderWins) {
+  const auto pool = MakeThreadPool();
+  const auto key = [](int64_t i) -> std::optional<int64_t> { return i % 3; };
+  const auto pk = MixedColumn("p", 0);
+  for (arrow::internal::Executor* executor : Executors(pool.get())) {
+    SCOPED_TRACE(executor == nullptr ? "one thread" : "pool");
+    const auto b = MixedTable("b", 6, 2, key);
+    b->FailPart(2);
+    b->FailPart(1);
+    const auto p = MixedTable("p", 3, 2, key);
+    p->FailPart(0);
+    auto result =
+        RunPlan(PlanOf(JoinOf(ScanOf(p, "p"), ScanOf(b, "b"), {pk}, {MixedColumn("b", 0)}), 6),
+                ContextOf(executor));
+    EXPECT_TRUE(result.status().IsIOError()) << result.status().ToString();
+    EXPECT_EQ(result.status().message(), "part 1 is broken");
+    EXPECT_TRUE(p->scanned_parts().empty());
+    // p joins i, then o: o's build comes first.
+    const auto o = MixedTable("o", 4, 2, key);
+    o->FailPart(3);
+    const auto i = MixedTable("i", 2, 2, key);
+    i->FailPart(0);
+    const auto q = MixedTable("p", 3, 2, key);
+    auto chain =
+        RunPlan(PlanOf(JoinOf(JoinOf(ScanOf(q, "p"), ScanOf(i, "i"), {pk}, {MixedColumn("i", 0)}),
+                              ScanOf(o, "o"), {pk}, {MixedColumn("o", 0)}),
+                       9),
+                ContextOf(executor));
+    EXPECT_EQ(chain.status().message(), "part 3 is broken");
+    EXPECT_TRUE(i->scanned_parts().empty());
+    EXPECT_TRUE(q->scanned_parts().empty());
+  }
+}
+
+// Every build part runs out of memory on a worker (as many parts at once might): each runs again
+// alone, on the calling thread, and the rows are those of a run without failures; a drained build's
+// parts too. The probe reads a serial input (a Limit over its scan, whose parts take nothing from
+// the pool) on the calling thread, so every failure on a worker is a build part's.
+TEST_F(HashJoinPlanTest, ABuildPartRunsAgainAloneAfterOutOfMemory) {
+  const auto pool = MakeThreadPool();
+  const auto p = KeyTable("p", 5, 10, [](int64_t i) { return i; });
+  const auto probe = Node(plan::LimitNode{.input = ScanOf(p, "p"), .limit = std::nullopt});
+  const auto pk = Column(0, "pk", LogicalType::kBigInt);
+  const auto bk = Column(0, "bk", LogicalType::kBigInt);
+  for (const bool drained : {false, true}) {
+    SCOPED_TRACE(drained ? "drained" : "pipeline");
+    const auto b = KeyTable("b", 6, 20, [](int64_t i) { return i % 37; });
+    const Rows expected = ReferenceJoin(RowsOf(*p), RowsOf(*b), {0}, {0});
+    const auto build = drained
+                           ? Node(plan::LimitNode{.input = ScanOf(b, "b"), .limit = std::nullopt})
+                           : ScanOf(b, "b");
+    MemoryBudget budget(std::nullopt);
+    WorkerFailingPool failing(&budget);
+    {
+      ExecContext ctx{.pool = &failing,
+                      .batch_size = 16,
+                      .executor = pool.get(),
+                      .threads = kThreads,
+                      .budget = &budget};
+      auto result = RunPlan(PlanOf(JoinOf(probe, build, {pk}, {bk}), 4), ctx);
+      ASSERT_TRUE(result.ok()) << result.status().ToString();
+      EXPECT_EQ(RowsOf(**result), expected);
+    }
+    // At least one failure per build part: the drained build's parts are its 12 batches of at
+    // most 16 rows. A part of the pipeline build is read on a worker, then again alone.
+    EXPECT_GE(failing.failures(), drained ? 12 : 6);
+    if (!drained) {
+      const std::vector<int64_t> scanned = b->scanned_parts();
+      for (int64_t part = 0; part < 6; ++part) {
+        EXPECT_GE(std::ranges::count(scanned, part), 2) << part;
+      }
+    }
+    EXPECT_EQ(budget.bytes_allocated(), 0);
+  }
+}
+
+// A join's residuals are evaluated by its probe, in order, each on the rows the ones before it
+// kept, in a part pipeline and over a serial probe input, a build on either side: bid < 2, then
+// bid * 2^62 > 0 keeps the matches with bid 1, and never meets a larger bid, whose product
+// overflows; the other order fails.
+TEST_F(HashJoinPlanTest, TheProbeEvaluatesTheResidualsInOrder) {
+  const auto p = MixedTable("p", 6, 7, ProbeKey);
+  const auto b = MixedTable("b", 3, 5, [](int64_t i) -> std::optional<int64_t> { return i % 10; });
+  constexpr int64_t kTwoTo62 = 4611686018427387904;
+  for (const BuildSide side : {BuildSide::kRight, BuildSide::kLeft}) {
+    const int bid = side == BuildSide::kRight ? 5 : 2;  // the build's id in the join's output
+    const plan::ExprPtr narrow =
+        Condition(plan::CompareOp::kLt, 2, ColumnAt(bid, LogicalType::kBigInt));
+    const plan::ExprPtr product = Condition(
+        plan::CompareOp::kGt, 0, Times(ColumnAt(bid, LogicalType::kBigInt), ConstantOf(kTwoTo62)));
+    Rows expected;
+    for (const std::vector<std::string>& row :
+         ReferenceJoin(RowsOf(*p), RowsOf(*b), {0}, {0}, side)) {
+      if (row[static_cast<std::size_t>(bid)] == "1") {
+        expected.push_back(row);
+      }
+    }
+    ASSERT_FALSE(expected.empty());
+    for (const bool serial : {false, true}) {
+      SCOPED_TRACE(std::string(serial ? "serial probe" : "part pipeline") +
+                   (side == BuildSide::kLeft ? ", build left" : ", build right"));
+      const plan::LogicalNodePtr probe =
+          serial ? Node(plan::LimitNode{.input = ScanOf(p, "p"), .limit = std::nullopt})
+                 : ScanOf(p, "p");
+      const auto run = [&](std::vector<plan::ExprPtr> residual) {
+        return RunPlan(PlanOf(JoinOf(probe, ScanOf(b, "b"), {MixedColumn("p", 0)},
+                                     {MixedColumn("b", 0)}, side, std::move(residual)),
+                              6),
+                       ContextOf(nullptr));
+      };
+      auto kept = run({narrow, product});
+      ASSERT_TRUE(kept.ok()) << kept.status().ToString();
+      EXPECT_EQ(RowsOf(**kept), expected);
+      EXPECT_TRUE(run({product, narrow}).status().IsExecutionError());
+    }
+  }
+}
+
+// The builds of one probe pipeline are prepared outermost first, all before any probe part runs,
+// and a build whose input probes a build of its own prepares that one first (post-order); each is
+// profiled under the operator that prepares it. The same order on one thread and on four.
+TEST_F(HashJoinPlanTest, BuildsArePreparedOutermostFirstAndInPostOrder) {
+  const auto pool = MakeThreadPool();
+  const auto log = std::make_shared<ScanLog>();
+  const auto key = [](int64_t i) -> std::optional<int64_t> { return i % 6; };
+  const auto logged = [&](const std::string& name, int64_t parts) {
+    return std::make_shared<LoggedTable>(MixedTable(name, parts, 4, key), name, log);
+  };
+  const auto p = logged("p", 5);
+  const auto b = logged("b", 3);
+  const auto c = logged("c", 2);
+  const auto pk = MixedColumn("p", 0);
+  const auto pid = MixedColumn("p", 2);
+  const auto bk = MixedColumn("b", 0);
+  const auto bid = MixedColumn("b", 2);
+  const auto ck = MixedColumn("c", 0);
+  // p joins b on pk = bk, then c on pid = ck: one pipeline over p, c's build first.
+  const auto inner = JoinOf(ScanOf(p, "p"), ScanOf(b, "b"), {pk}, {bk});
+  const auto chain = JoinOf(inner, ScanOf(c, "c"), {pid}, {ck});
+  // p joins (b joins c on bid = ck) on pk = bk: b's build probes c's.
+  const auto nested_build = JoinOf(ScanOf(b, "b"), ScanOf(c, "c"), {bid}, {ck});
+  const auto nested = JoinOf(ScanOf(p, "p"), nested_build, {pk}, {bk});
+  for (arrow::internal::Executor* executor : Executors(pool.get())) {
+    SCOPED_TRACE(executor == nullptr ? "one thread" : "pool");
+    {
+      log->Clear();
+      ProfileNode root;
+      auto result = RunPlan(PlanOf(chain, 9), ContextOf(executor), &root);
+      ASSERT_TRUE(result.ok()) << result.status().ToString();
+      EXPECT_EQ(log->names(), Concat({Repeated("c", 2), Repeated("b", 3), Repeated("p", 5)}));
+      ASSERT_EQ(root.children().size(), 3U);
+      EXPECT_EQ(root.children()[0]->name(), "HashJoin");
+      EXPECT_EQ(root.children()[0]->children()[0]->name(), "HashJoin");
+      EXPECT_EQ(root.children()[1]->name(), "HashBuild");
+      EXPECT_EQ(root.children()[1]->detail(), plan::ExplainNode(*chain));
+      EXPECT_EQ(root.children()[2]->name(), "HashBuild");
+      EXPECT_EQ(root.children()[2]->detail(), plan::ExplainNode(*inner));
+    }
+    {
+      log->Clear();
+      ProfileNode root;
+      auto result = RunPlan(PlanOf(nested, 9), ContextOf(executor), &root);
+      ASSERT_TRUE(result.ok()) << result.status().ToString();
+      EXPECT_EQ(log->names(), Concat({Repeated("c", 2), Repeated("b", 3), Repeated("p", 5)}));
+      ASSERT_EQ(root.children().size(), 2U);
+      const ProfileNode& build = *root.children()[1];
+      EXPECT_EQ(build.name(), "HashBuild");
+      EXPECT_EQ(build.detail(), plan::ExplainNode(*nested));
+      ASSERT_EQ(build.children().size(), 2U);
+      EXPECT_EQ(build.children()[0]->name(), "HashJoin");
+      EXPECT_TRUE(build.children()[0]->per_part());
+      EXPECT_EQ(build.children()[1]->name(), "HashBuild");
+      EXPECT_EQ(build.children()[1]->detail(), plan::ExplainNode(*nested_build));
+    }
+  }
+}
+
+// A probe over a serial input (here a GROUP BY's rows) prepares its build at its first Next, not in
+// Open, and only then opens its input: the build's parts are read first, the probe's after.
+TEST_F(HashJoinPlanTest, ProbeOverASerialInputBuildsAtItsFirstNext) {
+  const auto pool = MakeThreadPool();
+  const auto log = std::make_shared<ScanLog>();
+  const auto key = [](int64_t i) -> std::optional<int64_t> { return i % 6; };
+  const auto p = std::make_shared<LoggedTable>(MixedTable("p", 5, 4, key), "p", log);
+  const auto b = std::make_shared<LoggedTable>(MixedTable("b", 3, 4, key), "b", log);
+  const auto grouped = Node(plan::GroupAggregateNode{
+      .input = ScanOf(p, "p"),
+      .keys = {MixedColumn("p", 0)},
+      .aggregates = {
+          {.kind = plan::AggKind::kCountStar, .arg = {}, .type = LogicalType::kBigInt}}});
+  const auto plan = PlanOf(JoinOf(grouped, ScanOf(b, "b"), {Column(0, "pk", LogicalType::kBigInt)},
+                                  {MixedColumn("b", 0)}),
+                           5);
+  for (arrow::internal::Executor* executor : Executors(pool.get())) {
+    SCOPED_TRACE(executor == nullptr ? "one thread" : "pool");
+    log->Clear();
+    auto op = BuildPhysicalPlan(plan);
+    ASSERT_TRUE(op.ok()) << op.status().ToString();
+    EXPECT_NE(dynamic_cast<const HashJoinOperator*>(op->get()), nullptr);
+    ExecContext ctx = ContextOf(executor);
+    ASSERT_TRUE((*op)->Open(ctx).ok());
+    EXPECT_TRUE(log->names().empty());
+    auto first = (*op)->Next();
+    ASSERT_TRUE(first.ok()) << first.status().ToString();
+    EXPECT_FALSE(first->end());
+    EXPECT_EQ(log->names(), Concat({Repeated("b", 3), Repeated("p", 5)}));
+    ASSERT_TRUE((*op)->Close().ok());
   }
 }
 

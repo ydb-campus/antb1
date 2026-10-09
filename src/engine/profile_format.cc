@@ -50,12 +50,16 @@ std::string MetricKey(const exec::ProfileMetric& metric) {
 }
 
 // The metrics in a fixed order (they are recorded in whatever order the threads reach them):
-// the known ones as a query runs, then any other by name.
+// the known ones as a query runs, then any other by name. A hash join's probe has find, gather,
+// residual and window_rows; its build parts, skipped, part_time, wait, lanes_tail and finish,
+// then what its table holds: null_keys, unique and direct.
 std::vector<exec::ProfileMetric> Ordered(const exec::ProfileNode& node) {
-  static constexpr std::array<std::string_view, 18> kOrder = {
-      "parts",      "skipped", "sample_parts", "heavy_keys",   "part_time",  "raw_parts",
-      "raw_rows",   "wait",    "merge",        "late_columns", "late_parts", "late_fetch",
-      "lanes_tail", "outer",   "build",        "sort",         "groups",     "heavy_groups"};
+  static constexpr std::array<std::string_view, 26> kOrder = {
+      "parts",       "skipped",      "sample_parts", "heavy_keys", "part_time",    "raw_parts",
+      "raw_rows",    "wait",         "merge",        "find",       "gather",       "residual",
+      "window_rows", "late_columns", "late_parts",   "late_fetch", "lanes_tail",   "finish",
+      "outer",       "build",        "sort",         "groups",     "heavy_groups", "null_keys",
+      "unique",      "direct"};
   const auto rank = [](const exec::ProfileMetric& metric) {
     const auto* it = std::ranges::find(kOrder, metric.name);
     return static_cast<std::size_t>(it - kOrder.begin());
