@@ -2873,6 +2873,47 @@ TEST_F(HashJoinTest, CandidatePairsCountAgainstTheLimit) {
   }
 }
 
+// A left join's padded slots take no room in the vectors of candidate pairs: 4,096 probe rows of
+// key 1 meet no row of a build of two rows of key 7 (whose key repeats, so the probe takes the
+// slots path with the residual bw > pv and without it), so every slot is a padded row and no pair
+// is ever made. The two runs make the same output from the same build, so their peaks differ by the
+// byte a slot takes for its row's last candidate only, not by the 16 a pair would take.
+TEST_F(HashJoinTest, PaddedSlotsTakeNoPairMemory) {
+  constexpr int64_t kRows = 4096;
+  const auto build_schema = Int64Schema({"bk", "bw"});
+  const arrow::ArrayVector build = {Int64s({7, 7}), Int64s({1, 2})};
+  const auto probe_schema = Int64Schema({"pk", "pv"});
+  const auto column = [](int64_t value) {
+    return Int64s(std::vector<std::optional<int64_t>>(static_cast<std::size_t>(kRows), value));
+  };
+  const arrow::ArrayVector probe = {column(1), column(10)};
+  // Over a pair: the probe's pk and pv, then the build's bk and bw.
+  const plan::ExprPtr above = Comparison(plan::CompareOp::kGt, ColumnAt(3, LogicalType::kBigInt),
+                                         ColumnAt(1, LogicalType::kBigInt));
+  std::vector<int64_t> peaks;
+  for (const bool residual : {false, true}) {
+    SCOPED_TRACE(residual ? "with the residual" : "without it");
+    MemoryBudget budget(std::nullopt);
+    auto join =
+        MakeJoin(SourceOf(probe_schema, probe),
+                 DrainedBuild(plan::JoinKind::kLeft, SourceOf(build_schema, build), {0}), {0},
+                 /*prepares=*/true, BuildSide::kRight,
+                 residual ? std::vector<plan::ExprPtr>{above} : std::vector<plan::ExprPtr>{});
+    ASSERT_NE(join, nullptr);
+    ExecContext ctx = ContextOf(nullptr, kRows, &budget);
+    {
+      auto result = Drain(*join, ctx);  // its table holds the output's buffers
+      ASSERT_TRUE(result.ok()) << result.status().ToString();
+      EXPECT_EQ((*result)->num_rows(), kRows);               // every row padded, either way
+      EXPECT_EQ((*result)->column(3)->null_count(), kRows);  // bw, padded
+    }
+    peaks.push_back(budget.max_memory());
+    EXPECT_EQ(budget.bytes_allocated(), 0);  // the output gone, the probe's vectors given back
+  }
+  EXPECT_GT(peaks[0], int64_t{16} * kRows);            // the slots, not the build, decide the peak
+  EXPECT_LT(peaks[1] - peaks[0], int64_t{4} * kRows);  // `last_`: 16 more a slot would be the pairs
+}
+
 // ---- plans (HashJoinPlanTest): joins through the physical planner ----
 
 class HashJoinPlanTest : public testing::ExecTest {};

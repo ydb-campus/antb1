@@ -849,11 +849,19 @@ arrow::Result<int64_t> HashJoinOperator::NextSlots() {
 }
 
 arrow::Result<int64_t> HashJoinOperator::PassingSlots(int64_t count) {
-  // The candidate slots: those with a build row.
+  // The candidate slots: those with a build row. Counted by the same test as the loop below, before
+  // the vectors of pairs are fit to them, so a left join's padded slots take no room in those
+  // vectors, and slots that are all padded reserve nothing.
   const auto size = static_cast<std::size_t>(count);
-  ARROW_RETURN_NOT_OK(Fit(pair_rows_, size, memory_));
-  ARROW_RETURN_NOT_OK(Fit(pair_builds_, size, memory_));
-  ARROW_RETURN_NOT_OK(Fit(pair_slots_, size, memory_));
+  const std::span<const JoinRowRef> slots(build_rows_.data(), size);
+  const auto candidates = static_cast<std::size_t>(
+      std::ranges::count_if(slots, [](const JoinRowRef& ref) { return ref.chunk != kNoChunk; }));
+  if (candidates == 0) {
+    return 0;
+  }
+  ARROW_RETURN_NOT_OK(Fit(pair_rows_, candidates, memory_));
+  ARROW_RETURN_NOT_OK(Fit(pair_builds_, candidates, memory_));
+  ARROW_RETURN_NOT_OK(Fit(pair_slots_, candidates, memory_));
   std::size_t pairs = 0;
   for (std::size_t s = 0; s < size; ++s) {
     if (build_rows_[s].chunk != kNoChunk) {
@@ -862,9 +870,6 @@ arrow::Result<int64_t> HashJoinOperator::PassingSlots(int64_t count) {
       pair_slots_[pairs] = static_cast<std::uint32_t>(s);  // s < 2^32 - 1 (NextSlots)
       ++pairs;
     }
-  }
-  if (pairs == 0) {
-    return 0;
   }
   auto live = static_cast<int64_t>(pairs);  // pair_slots_[0, live): the slots of batch's rows
   ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::RecordBatch> batch, PairBatch(live));

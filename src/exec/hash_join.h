@@ -297,7 +297,8 @@ class HashJoinOperator final : public Operator {
   arrow::Result<int64_t> NextSlots();
   // The pairs among slots [0, count) that pass every residual: their number, and their slots, in
   // order, at the front of pair_slots_. The residuals read batches of pairs (PairBatch), each
-  // narrowed to the pairs that passed the ones before.
+  // narrowed to the pairs that passed the ones before. A left join's padded slots are no pairs, so
+  // the vectors of pairs hold room for the candidates among the slots only.
   arrow::Result<int64_t> PassingSlots(int64_t count);
   // The batch (pair_schema_) of the pairs pair_rows_ and pair_builds_ [0, pairs): the probe's
   // columns that the residuals read, taken, then the build's, gathered.
