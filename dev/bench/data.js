@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791575810424,
+  "lastUpdate": 1791603855856,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -6156,6 +6156,114 @@ window.BENCHMARK_DATA = {
             "value": 61.05443781817402,
             "unit": "ms/iter",
             "extra": "iterations: 11\ncpu: 61.04193636363627 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "6320eff83d276ff96f5380e8b092627fc2c80304",
+          "message": "feat(plan): inner joins of the tables in from (#112)\n\n## Summary\n\nRoadmap PR **J2b-2**, the second half of J2b ([ADR\n0022](docs/adr/0022-joins-and-query-blocks.md)), and the hand-off\nJ2b-1 (#108) left. A query now binds to the inner joins of the tables in\nits `FROM`: `Q3`, `Q5`, `Q10`, `Q12` and\n`Q14` pass, the 55 `pending J2b` records of `tests/slt/cases/joins/`\nanswer, and the two metamorphic join relations\nthat were skipped on `main` are active.\n\nSeven commits, each green on its own:\n\n| | |\n| --- | --- |\n| `45ae411` | `feat(plan)`: an ON's visibility, and the hint a later\nitem needs |\n| `3482918` | `feat(plan)`: table aliases and qualified column names\nover one table |\n| `1ff6d54` | `refactor(plan)`: each relation's filters and computed\ncolumns on its own branch |\n| `86d77dd` | `feat(plan)`: inner joins of the tables in from |\n| `1b7b386` | `test(cli)`: explain goldens for the join shapes the\nstatistics decide |\n| `e7fc648` | `docs`: inner joins of the tables in from, and the stale\nprose they leave |\n| `96c1e07` | `chore(plan)`: a clang-tidy finding in the join key column\n|\n\nThe first three change no answer: the scope step adds `OnVisibility` and\nfixes one hint, the alias step keeps the\nFROM list at one item, and the refactor is byte-identical on every plan\nand golden. They carry about 230 of the\nPR's lines to de-risk the fourth.\n\n**Names** (`scope.{h,cc}`, `binder.cc`):\n\n- `plan::OnVisibility(from, item)` reads rule 10 off the FROM list: the\nitems up to and including `item`, its join\ngroup the inner level. A comma or the first item starts a group; every\nJOIN, `CROSS JOIN` included, continues the\none it joins into. The four shapes `ScopeTest` probed with hand-written\n`Visibility` values are now derived.\n- Hand-off item 5: an ON whose qualifier named a table that a **later**\nitem's alias hides reported\n`(the alias 'v' hides it)`, pointing at an item the ON cannot see. The\nlater-item test now also counts a later\nitem whose alias hides the name, and the alias search is restricted to\nthe visible bindings. `WHERE` is\nunaffected by construction. Both hints may appear on one message, later\nitem first.\n- Hand-off item 6: the `scope_test.cc` comment claiming a path's text\nnames nothing is false for a glob path, whose\n  whole text *is* its name; two cases pin it.\n- Rule 1 names the binding (its alias, else a table's name as written,\nelse a path's `PathBindingName`) and\n`TableSource::kind` travels with it, so an error can say which name an\nalias hides. J2b-1's caveat on\n  `Binding::name()` is gone.\n- Every name resolves through one `Binder::Resolve`, which applies a\n`Visibility` member, so no clause can forget\nthe visibility it binds in. A qualified name never names a select item's\nalias (as in DuckDB), so `ORDER BY t.x`\nover `SELECT i16 AS x` is a bind error instead of silently ordering by\nthe alias — that needed guards in all\n  three alias fallbacks.\n- Rule 6 ships with two helpers: `RefName` keeps the qualifier in a\nresult name, each part quoted by\n`ArgumentName`'s rule (`sum(t.i16)`, `sum(t.\"Mixed Case\")`), and\n`WrittenName` echoes a reference back as written\nand unquoted, so every message of a single-table query stays\nbyte-identical.\n- Rule 5: `SELECT *` over two bindings of one name that share a column\nname is a bind error at the `*`, before the\n  expansion.\n\n**Classification and the join tree** (`binder.cc`):\n\n- `CheckFromList` replaces `RejectFromList`: the relation limit first,\nlike the parser's depth limit, then each item\nin query order, where its connector precedes its source, which precedes\nits ON. An ON is checked by the same\n`RejectCondition` as `WHERE`, so an unsupported function inside one is\nrejected identically. `FoldDateCasts` now\nwalks an ON too, so `ON a.dt > CAST('2020-01-01' AS DATE)` is no longer\nrefused.\n- One binding per FROM item from one id source, so a relation's index is\nits binding's and its FROM item's: the\n  invariant `OnVisibility`, `OrderJoins` and `Scope::Find` share.\n- Each ON binds in its own visibility and `WHERE` in none; once bound,\nan ON conjunct is a `WHERE` conjunct.\n`RelationsRead` decides which relations a conjunct reads without binding\nanything or minting an id — a reference\nthat does not resolve contributes nothing, so the conjunct keeps its\nusual error, unchanged in text and span.\n- A conjunct over one relation keeps its old path on that relation's\nbranch. One over two or more is bound once by\n`BindBool`, whose operands stay inline, and becomes a join key when it\nis an equality of two single-relation\nsides that share a key type (`KeyType`, then `IsExactWidening` both\nways), else the residual of the first join\nthat has all its relations. A side not already of the key's type is cast\non its own branch, below its join.\n- A graph the keys do not connect is a cross product: exit 4 at the\nunconnected item. `OrderJoins` then gives the\nleft-deep order; `JoinTree` folds it, orienting each key pair and\nhanding each residual to the first join that\n  has its relations.\n\n**Tests:** `plan` grew by 29 cases — the ON-visibility and hint cases,\nthe rewritten `FromLists` table, rule-1/2/6\nbinding, the relation layers and their spans, and the join shape (probe\nchoice, build side, key casts, residuals,\nkey dedup, the span rule, per-relation filters, qualifiers).\n`plan_test_util.h` gained `Down`, `FirstJoin` and\n`ScannedTable`, since `Nth` aborts on a two-input node. Three CLI\ngoldens carry ADR 0022's plan-shape deliverable.\n\n**Size:** +1245 / −357 (code +641, tests +510, docs +94).\n\n## Decisions, as agreed\n\n| | |\n| --- | --- |\n| D1 | `tests/data/tpch_status.json` and the five `docs/sql-subset.md`\nStatus cells move in the joins commit |\n| D2 | an inner join builds on the relation it adds; ADR 0022's\nsmaller-footer-rows rule is deferred with an update line |\n| D3 | an equality with no exact common key type stays a residual,\nexactly like a DOUBLE one |\n| D4 | a FLOAT-column equality keeps divergence D11's exit 4 at the\ncomparison |\n| D5 | the relation-limit and cross-product texts and spans, with the\ndocs-hint asymmetry documented |\n| D6 | rule 5's message, kind `kBind` |\n| D7 | rule 6 ships, with a second helper so existing messages stay\nbyte-identical |\n| D8 | ON conjuncts bind at the start of `BindWhere`; both hints may\nappear, later item first |\n| D9 | all four join features declared in the joins commit; differential\nseed 20261005 kept |\n| D10 | three plan-shape EXPLAIN goldens, plus the order and build-side\nunit tests |\n| D11 | `tools/ci/coverage_thresholds.json` untouched; the measured\nvalues are below |\n| D12 | one equality is one key; `JoinNode::span` is the added item's\nconnector, or its own text when it is first |\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\nWritten and verified on macOS (osx-arm64, clang 23.1.2, Arrow 25.0.0,\npixi 0.81.0). This PR changes `plan` only,\nno `io`/`exec` memory or ownership code, but it edits a CMake file\n(`tests/cli/CMakeLists.txt`), so AGENTS.md golden\nrule 2 asks for `check-full`; four of its legs cannot run on this host,\neach for a pre-existing reason that\nreproduces on `main`. The TPC-H ratchet **was** one of them; it now runs\nhere, so the five queries are verified\nlocally as well (see the last block).\n\n```text\n$ pixi run ci                                  # clang 23.1.2 Debug -Werror, osx-arm64\n100% tests passed out of 2489                  # nothing skipped: the two metamorphic join\n                                               # relations were skipped on main and are now active.\n                                               # 2489 and not 2472 because the TPC-H layer is live\n                                               # on this host too, see the last block.\n\n$ pixi run test -R '^(tpch\\.status\\.sf0_01|tpch\\.status\\.sf0_1|parallel\\.tpch\\.status\\.sf0_1)$'\n100% tests passed out of 4                     # with fixtures.tpch; the ratchet accepts exactly\n                                               # {\"pass\": [1, 3, 5, 6, 10, 12, 14]}, so all seven\n                                               # pass and nothing outside the set does\n\n$ pixi run coverage\nCoverage gate: PASS      # plan 95.85% lines / 90.83% branches (floors 93.5 / 89.5)\n                         # io 95.62 / 89.35, exec 97.64 / 89.32\n\n$ pixi run fmt                                 # no diff\n\n$ pixi run lint\nmarkdownlint-cli2 (Markdown).............................................Passed\ncheck_repo.py (repo drift and policy, R001-R015).........................Passed\nshellcheck (shell).......................................................Failed\n# every hook but shellcheck passes. shellcheck reports 20+ SC2218 in\n# tools/github/apply-settings.sh (untouched since #1): the osx-arm64 build of the pinned\n# shellcheck 0.11.0 flags what the linux-64 build of the same version does not, and the CI\n# lint job is green on main. R011 (the ratchet against the docs Status table) and R014\n# (backticked paths) both pass, so the two moved together.\n```\n\nLegs that cannot run on osx-arm64, and the compensating run for each:\n\n```text\n$ pixi run tidy\n# 4 TUs fail, none of them in this diff and all of them on main too:\n# src/exec/{profile,sort,group_table,grouped_aggregate_state}.cc. bugprone-exception-escape\n# traces through libc++'s __throw_length_error, and bugprone-misplaced-widening-cast fires\n# because int64_t is `long long` on Darwin and `long` on linux-64. This leg did catch one\n# finding of mine, in src/plan/binder.cc, fixed in 96c1e07.\n$ clang-tidy -p build/tidy --warnings-as-errors='*' src/plan/binder.cc src/plan/scope.cc\n# no findings (3836 suppressed, all in non-user code)\n\n$ pixi run asan\n# Two pre-existing macOS blockers: LeakSanitizer reports a 64-byte macOS libdispatch\n# allocation while antb1_plan_tests lists its tests, and\n# exec.ForEachBadAllocTest.AnExceptionLeavesOnlyOnceTheTasksHaveEnded deadlocks under ASan\n# (it passes in 2 ms in the Debug build). Neither is in this diff.\n$ ASAN_OPTIONS=detect_leaks=0:... ./build/ci-asan/bin/antb1_{plan,exec,engine,cli}_tests\nantb1_plan_tests:   [  PASSED  ] 658 tests.\nantb1_exec_tests:   [  PASSED  ] 270 tests.\nantb1_engine_tests: [  PASSED  ] 25 tests.\nantb1_cli_tests:    [  PASSED  ] 17 tests.\n\n$ pixi run fuzz-smoke\n# LeakSanitizer reports 56 bytes in libFuzzer's own fuzzer::StartRssThread. No antb1 frame.\n$ ./build/fuzz/bin/antb1-sql-parser-fuzzer -seed=1 -runs=200000 ... -detect_leaks=0\nDone 200000 runs in 5 second(s)        # no crash, OOM or timeout; no artifact written\n\n$ pixi run ci-gcc                              # linux-64 only (pixi.toml: feature.gcc platforms)\n```\n\nThe TPC-H ratchet did run here, which `pixi.toml` says it cannot. Worth\nrecording, since it affects every\nlater PR that moves the ratchet (J3, J4, J5 and J6 all do), and since it\nmeans nothing in this PR rests on CI\nalone:\n\n`pixi install` genuinely cannot install `duckdb-extension-tpch` on\nosx-arm64, and the reason is specific. The\npackage lists the extension in its `info/has_prefix` as a **binary**\nprefix-replacement target, and the shipped\nfile carries an adhoc macOS code signature (3809 page hashes) over a\nMach-O that has DuckDB's metadata trailer\n*after* its image. Prefix replacement patches the bytes, which\ninvalidates the signature; the re-sign that then\nbecomes mandatory on Apple silicon is what fails on those trailing bytes\n— exactly what the `pixi.toml` comment\nand ADR 0006 say.\n\nExtracting the package by hand avoids all of it, because the patch never\nhappens: the adhoc signature stays\nvalid, the trailer stays where DuckDB expects it, and the extension's\none rpath is `@loader_path`-relative, so\nit needs no correct prefix at all. With\n`osx-arm64/duckdb-extension-tpch-1.5.6-h6111c0a_0` (the build whose\nstring matches the locked `libduckdb-devel`, and whose `depends` names\nthe locked `libduckdb 1.5.6 he4423df_0`)\nunpacked into `.pixi/envs/default/duckdb/extensions/v1.5.6/osx_arm64/`,\n`pixi run configure` reports\n`antb1: TPC-H dbgen extension ...` and the three ratchet tests register\nand pass.\n\nCaveats, so nobody mistakes this for a fix: it is **not** a change to\nthe project — the file sits under the\ngitignored `.pixi/`, no `pixi.toml` or `pixi.lock` was touched, and the\nnext `pixi install` removes it. It is\nhost setup a maintainer approved on this machine, including the TPC\nEULA. `codesign -v` does report\n`main executable failed strict validation` on the file, which is the\ntrailer again and does not stop dyld\nloading it; a manual `duckdb` load needs `-unsigned`, which\n`tests/tpch/CMakeLists.txt:15` already passes. If\nyou want this to work through pixi, the conda-forge package is where it\nhas to be fixed.\n\n```text\n```\n\n## Checklist\n\n- [ ] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests) — `ci` is green\n(2472/2472); `lint` fails only on `tools/github/apply-settings.sh`,\nidentically on `main` (see above)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: `tests/data/tpch_status.json`\n(decision D1) and the ADR 0022 J2b-2 update lines, whose Status stays\n`Proposed`\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code planned and\nimplemented J2b-2. The plan came from a\nworkflow of six read-only mapping agents (the binder as it stood,\nJ2b-1's `scope` API, the `join_order` API,\nthe ADR requirements line by line, the test and ratchet surface, and the\n`plan`-module wiring), a design\npass, and three adversarial critics whose verdicts were all\n\"needs-changes\". They caught four blockers in the\ndraft, the load-bearing one being that the ratchet and the feature\ndeclarations must land in the same commit\nas the join binder or the `oracle`, `parallel` and `metamorphic` legs go\nred between commits; another was\nthat `ParseConjuncts` splits only the top-level AND chain, so `ON (x = 1\nAND a.k = b.k)` needs flattening\nbefore classification or it reaches an `ANTB1_CHECK(false)`. You then\nsettled the twelve maintainer decisions\nabove before any code was written. Each new test was checked by\nreverting its change and seeing it fail.\nThree things the code corrected in the plan during implementation: the\nselect list binds before the\nconnectivity check, so a column both relations have is ambiguous rather\nthan a cross product; a cast's name\nkeeps rule 6's qualifier; and `BindBool` carries a conjunct's operands\ninline rather than computing them,\n      which is what makes a cross-relation residual expressible at all.\n- Accountable human (has read and understands the whole diff): @hor911\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-10T06:41:10+03:00",
+          "tree_id": "4d67d13120e30646d818748e6f48dde8c41fdddb",
+          "url": "https://github.com/ydb-campus/antb1/commit/6320eff83d276ff96f5380e8b092627fc2c80304"
+        },
+        "date": 1791603854930,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 5056.926739531155,
+            "unit": "ns/iter",
+            "extra": "iterations: 138888\ncpu: 5056.553640343298 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 85174.13344529281,
+            "unit": "ns/iter",
+            "extra": "iterations: 7741\ncpu: 85169.51621237567 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222546.5190355303,
+            "unit": "ns/iter",
+            "extra": "iterations: 3152\ncpu: 222525.44987309648 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 442047.7018319704,
+            "unit": "ns/iter",
+            "extra": "iterations: 1583\ncpu: 442013.3392293117 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 349958.350999998,
+            "unit": "ns/iter",
+            "extra": "iterations: 2000\ncpu: 349949.47750000004 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2075803.498516334,
+            "unit": "ns/iter",
+            "extra": "iterations: 337\ncpu: 2075671.4629080119 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 51.50168623077014,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 51.49838492307694 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 44.63952506250024,
+            "unit": "ms/iter",
+            "extra": "iterations: 16\ncpu: 44.63572362500001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 191.46920199999803,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 191.4401613333337 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.35874632653042,
+            "unit": "ms/iter",
+            "extra": "iterations: 49\ncpu: 14.357234469387759 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 22.36321490322589,
+            "unit": "ms/iter",
+            "extra": "iterations: 31\ncpu: 22.359084548387127 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 39.3850209999995,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 39.379195666666654 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.737813894999931,
+            "unit": "ms/iter",
+            "extra": "iterations: 400\ncpu: 1.7376998074999994 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 117.79252899999904,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 117.77884999999996 ms\nthreads: 1"
           }
         ]
       }
