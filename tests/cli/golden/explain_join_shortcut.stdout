@@ -1,0 +1,8 @@
+Output: count_star():BIGINT sum(tr_fare):DECIMAL(38,2)
+Aggregate COUNT(*), SUM(trips.tr_fare)
+  Join INNER build=right keys=[trips.tr_pickup = zones.zn_id, drivers.dv_city = zones.zn_city]
+    Join INNER build=right keys=["CAST(tr_driver AS BIGINT)" = drivers.dv_id]
+      Compute CAST(tr_driver AS BIGINT)
+        Scan table=trips source=parquet(files=1, rows=3000) columns=[tr_driver, tr_pickup, tr_fare]
+      Scan table=drivers source=parquet(files=1, rows=97) columns=[dv_id, dv_city]
+    Scan table=zones source=parquet(files=1, rows=40) columns=[zn_id, zn_city]
