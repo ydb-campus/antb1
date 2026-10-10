@@ -69,14 +69,13 @@ std::vector<const sql::Expr*> Conjuncts(const std::vector<sql::Expr>& predicate)
 }
 
 void FactorSharedConjuncts(const sql::Expr& element, std::vector<sql::Box<sql::Expr>>& owned,
-                           std::vector<const sql::Expr*>& conjuncts,
-                           std::vector<const sql::Expr*>& absorbed) {
+                           std::vector<FactoredConjunct>& out) {
   std::vector<const sql::Expr*> flat;
   Conjuncts(element, flat);
   for (const sql::Expr* conjunct : flat) {
     const auto* binary = std::get_if<sql::BinaryExpr>(conjunct);
     if (binary == nullptr || binary->op != sql::BinaryOp::kOr) {
-      conjuncts.push_back(conjunct);
+      out.push_back({.expr = conjunct});
       continue;
     }
     std::vector<const sql::Expr*> branches;
@@ -102,7 +101,7 @@ void FactorSharedConjuncts(const sql::Expr& element, std::vector<sql::Box<sql::E
       }
     }
     if (shared.empty()) {
-      conjuncts.push_back(conjunct);  // nothing to factor: the OR stands as it is
+      out.push_back({.expr = conjunct});  // nothing to factor: the OR stands as it is
       continue;
     }
     // What is left of each branch: its conjuncts that are not shared.
@@ -117,21 +116,22 @@ void FactorSharedConjuncts(const sql::Expr& element, std::vector<sql::Box<sql::E
       }
     }
     for (const sql::Expr* s : shared) {
-      conjuncts.push_back(s);
+      out.push_back({.expr = s});
     }
     if (std::ranges::any_of(rest,
                             [](const std::vector<const sql::Expr*>& r) { return r.empty(); })) {
       // A branch of only shared conjuncts makes the whole OR true wherever they hold, so the shared
-      // conjuncts alone are the conjunct. The OR is still bound, for its errors, and discarded.
-      absorbed.push_back(conjunct);
+      // conjuncts alone are the conjunct. The OR stays here, in its own place, to be bound for its
+      // errors and discarded.
+      out.push_back({.expr = conjunct, .bind_only = true});
       continue;
     }
     sql::Expr folded = Conjunction(rest.front());
     for (std::size_t b = 1; b < rest.size(); ++b) {
       folded = Disjunction(std::move(folded), Conjunction(rest[b]));
     }
-    owned.push_back(sql::Box<sql::Expr>(std::move(folded)));
-    conjuncts.push_back(&*owned.back());
+    owned.emplace_back(std::move(folded));
+    out.push_back({.expr = &*owned.back()});
   }
 }
 

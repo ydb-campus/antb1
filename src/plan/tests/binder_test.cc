@@ -140,6 +140,21 @@ INSTANTIATE_TEST_SUITE_P(
                   "table 'missing' does not exist"},
         ErrorCase{"SELECT i16 FROM t WHERE nope = 1 GROUP BY nope", kBind, "nope",
                   "column 'nope' does not exist"},
+        // OR factoring (ADR 0022's J3) drops an OR its shared conjuncts imply, but binds it first,
+        // so an error in the branch it drops is still that error and not an answer.
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE i16 = 1 OR i16 = 1 AND nope > 1", kBind, "nope",
+                  "column 'nope' does not exist"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE i16 = 1 OR i16 = 1 AND strlen(s, 1) > 1", kBind,
+                  "strlen(s, 1)", "strlen() takes 1 argument, not 2"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE i16 = 1 OR i16 = 1 AND s > 1", kBind, "1",
+                  "cannot compare VARCHAR column 's' with a number"},
+        // The same for an inner ON, which the factoring treats exactly as a WHERE element.
+        ErrorCase{"SELECT COUNT(*) FROM t JOIN ok ON t.i16 = ok.i16 OR t.i16 = ok.i16 AND "
+                  "ok.nope > 1",
+                  kBind, "ok.nope", "'ok' has no column 'nope'"},
+        // A dropped OR never hides an error written before it: the element reports its first.
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE (nope = 1 AND (i16 = 1 OR i16 = 1 AND i32 = 2))",
+                  kBind, "nope", "column 'nope' does not exist"},
         // HAVING: aggregates, GROUP BY keys and select aliases of keys or aggregates; HAVING makes
         // the query aggregate.
         ErrorCase{"SELECT i16 FROM t GROUP BY i16 HAVING i32 > 1", kBind, "i32",
@@ -1692,6 +1707,89 @@ TEST(BinderTest, PerRelationFiltersAndQualifiers) {
   ASSERT_EQ(project.columns.size(), 2U);
   EXPECT_EQ(project.columns[0].qualifier, "t");
   EXPECT_EQ(project.columns[1].qualifier, "ok");
+}
+
+// ADR 0022's OR factoring (J3): the conjuncts every branch of an OR shares are hoisted out of it
+// before the conjuncts are classified, so a shared equality becomes a join key and a shared
+// single-relation conjunct reaches its scan. What is left of the branches stays one conjunct, on
+// one relation's branch when it reads one relation and a residual of the join when it reads two.
+TEST(BinderTest, FactorsConjunctsSharedByEveryOrBranch) {
+  const Catalog catalog = MakeCatalog();
+  // The shared equality is the join key, and the remainder reads only `ok`, so it filters `ok`'s
+  // branch. AND binds tighter than OR, so the whole WHERE is one element of two branches.
+  const std::string sql =
+      "SELECT COUNT(*) FROM t, ok WHERE t.i16 = ok.i16 AND ok.s = 'x' OR "
+      "t.i16 = ok.i16 AND ok.s = 'y'";
+  auto plan = BindSql(sql, catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  const JoinNode* join = testing::FirstJoin(*plan);
+  ASSERT_NE(join, nullptr);
+  ASSERT_EQ(join->keys.size(), 1U) << "the shared equality is a key, not part of the OR";
+  EXPECT_TRUE(join->residual.empty()) << "what is left reads one relation, so it is no residual";
+  // `ok`'s branch: the remainder is compound, so a Compute holds it and a Filter keeps its rows.
+  const auto* filter = std::get_if<FilterNode>(join->right.get());
+  ASSERT_NE(filter, nullptr) << Explain(*plan);
+  ASSERT_EQ(filter->predicates.size(), 1U);
+  EXPECT_NE(Explain(*plan).find("Compute ((ok.s = 'x') OR (ok.s = 'y'))"), std::string::npos)
+      << Explain(*plan);
+  EXPECT_EQ(testing::ScannedTable(*join->right), "ok");
+  // The span of a node a relation stacks covers the WHERE elements its conjuncts came from, so
+  // this whole element -- not just the part of it the factoring left behind.
+  const std::size_t where = sql.find("t.i16");
+  EXPECT_EQ(filter->span, (SourceSpan{.offset = where, .length = sql.size() - where}));
+  // A remainder that reads both relations is a residual of the join instead.
+  auto both = BindSql(
+      "SELECT COUNT(*) FROM t, ok WHERE t.i16 = ok.i16 AND t.i32 = 1 OR "
+      "t.i16 = ok.i16 AND ok.s = 'x'",
+      catalog);
+  ASSERT_TRUE(both.ok()) << both.status().ToString();
+  const JoinNode* with_residual = testing::FirstJoin(*both);
+  ASSERT_NE(with_residual, nullptr);
+  EXPECT_EQ(with_residual->keys.size(), 1U);
+  EXPECT_EQ(with_residual->residual.size(), 1U);
+  // A branch of only shared conjuncts makes the OR true wherever they hold, so the key is all
+  // that is left: `ok`'s branch is its bare Scan, with nothing of the dropped OR above it. (The
+  // Scan still lists every field here -- the binder prunes none; the column list the optimizer
+  // then reads is pinned by the EXPLAIN golden in tests/cli.)
+  auto absorbed = BindSql(
+      "SELECT COUNT(*) FROM t, ok WHERE t.i16 = ok.i16 OR t.i16 = ok.i16 AND ok.s = 'x'", catalog);
+  ASSERT_TRUE(absorbed.ok()) << absorbed.status().ToString();
+  const JoinNode* no_filter = testing::FirstJoin(*absorbed);
+  ASSERT_NE(no_filter, nullptr);
+  EXPECT_EQ(no_filter->keys.size(), 1U);
+  EXPECT_TRUE(no_filter->residual.empty());
+  EXPECT_TRUE(std::holds_alternative<ScanNode>(*no_filter->right)) << Explain(*absorbed);
+  EXPECT_EQ(Explain(*absorbed).find("Compute"), std::string::npos)
+      << "the dropped OR is bound for its errors only, and reaches no node\n"
+      << Explain(*absorbed);
+  // Matching is structural, so the same equality written the other way round shares nothing: with
+  // no key left the join is a cross product, which stays unsupported.
+  auto reversed = BindSql(
+      "SELECT COUNT(*) FROM t, ok WHERE t.i16 = ok.i16 AND ok.s = 'x' OR "
+      "ok.i16 = t.i16 AND ok.s = 'y'",
+      catalog);
+  ASSERT_FALSE(reversed.ok());
+  EXPECT_NE(reversed.status().message().find("a cross product is not supported"), std::string::npos)
+      << reversed.status().ToString();
+  // One relation, no join: the shared conjunct still reaches the Scan, where the OR could not.
+  auto pushed =
+      BindSql("SELECT COUNT(*) FROM t WHERE i16 = 1 AND i32 = 2 OR i16 = 1 AND i32 = 3", catalog);
+  ASSERT_TRUE(pushed.ok()) << pushed.status().ToString();
+  EXPECT_NE(Explain(*pushed).find("Filter i16 = 1\n"), std::string::npos) << Explain(*pushed);
+  EXPECT_NE(Explain(*pushed).find("Compute ((i32 = 2) OR (i32 = 3))"), std::string::npos)
+      << Explain(*pushed);
+  // HAVING is not factored: its OR stays one computed conjunct, aggregate and all. Factoring it
+  // would classify against the aggregation's output, not the relations, so it is left out.
+  auto having = BindSql(
+      "SELECT i16, COUNT(*) FROM t GROUP BY i16 "
+      "HAVING COUNT(*) > 1 AND i16 = 1 OR COUNT(*) > 1 AND i16 = 2",
+      catalog);
+  ASSERT_TRUE(having.ok()) << having.status().ToString();
+  EXPECT_NE(Explain(*having).find("Compute (((count_star() > 1) AND (i16 = 1)) OR "
+                                  "((count_star() > 1) AND (i16 = 2)))"),
+            std::string::npos)
+      << "the whole HAVING is one condition, with count_star() > 1 not hoisted\n"
+      << Explain(*having);
 }
 
 // A relation's own layers, in the order RelationNode stacks them over its Scan: the conjuncts on

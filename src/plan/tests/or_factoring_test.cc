@@ -25,10 +25,12 @@ std::vector<sql::Expr> Where(const std::string& text) {
   return stmt->where;
 }
 
-// The factored conjuncts of `text`, as canonical SQL, and what was absorbed.
+// The factored conjuncts of `text`, as canonical SQL: `conjuncts` are the ones that reach the plan,
+// `absorbed` the ORs kept only to be bound, and `order` every one of them as it was emitted.
 struct Factored {
   std::vector<std::string> conjuncts;
   std::vector<std::string> absorbed;
+  std::vector<std::string> order;
 };
 
 Factored Factor(const std::string& text) {
@@ -36,14 +38,12 @@ Factored Factor(const std::string& text) {
   Factored out;
   for (const sql::Expr& element : where) {
     std::vector<sql::Box<sql::Expr>> owned;
-    std::vector<const sql::Expr*> conjuncts;
-    std::vector<const sql::Expr*> absorbed;
-    FactorSharedConjuncts(element, owned, conjuncts, absorbed);
-    for (const sql::Expr* c : conjuncts) {
-      out.conjuncts.push_back(sql::ToSql(*c));
-    }
-    for (const sql::Expr* a : absorbed) {
-      out.absorbed.push_back(sql::ToSql(*a));
+    std::vector<FactoredConjunct> conjuncts;
+    FactorSharedConjuncts(element, owned, conjuncts);
+    for (const FactoredConjunct& c : conjuncts) {
+      std::string sql = sql::ToSql(*c.expr);
+      out.order.push_back(c.bind_only ? "bind-only: " + sql : sql);
+      (c.bind_only ? out.absorbed : out.conjuncts).push_back(std::move(sql));
     }
   }
   return out;
@@ -78,23 +78,50 @@ TEST(OrFactoringTest, AbsorbsAnOrItsSharedConjunctsImply) {
   const Factored last = Factor("(i16 = 1 AND i32 = 2) OR (i32 = 2 AND i16 = 1)");
   EXPECT_EQ(last.conjuncts, (Texts{"i16 = 1", "i32 = 2"}));
   EXPECT_EQ(last.absorbed.size(), 1U);
+  // Three branches, one of which keeps nothing: that branch absorbs the other two, whose remainders
+  // are dropped with it rather than kept as an OR.
+  const Factored three = Factor("i16 = 1 OR (i16 = 1 AND i32 = 2) OR (i16 = 1 AND i32 = 3)");
+  EXPECT_EQ(three.conjuncts, (Texts{"i16 = 1"}));
+  EXPECT_EQ(three.absorbed.size(), 1U);
+  EXPECT_EQ(three.order,
+            (Texts{"i16 = 1", "bind-only: i16 = 1 OR i16 = 1 AND i32 = 2 OR i16 = 1 AND i32 = 3"}));
 }
 
-// Nothing shared, nothing to do: the element's conjuncts come back as they were.
+// Everything is emitted where it was written, so the caller reports the element's first error: an
+// absorbed OR stays in its own place instead of moving ahead of the conjuncts before it.
+TEST(OrFactoringTest, KeepsTheOrderOfTheElement) {
+  EXPECT_EQ(Factor("i32 = 9 AND (i16 = 1 OR i16 = 1 AND i32 = 2)").order,
+            (Texts{"i32 = 9", "i16 = 1", "bind-only: i16 = 1 OR i16 = 1 AND i32 = 2"}))
+      << "the OR follows i32 = 9, which is written before it";
+  // A conjunct written after the OR stays after it.
+  EXPECT_EQ(Factor("(i16 = 1 OR i16 = 1 AND i32 = 2) AND i32 = 9").order,
+            (Texts{"i16 = 1", "bind-only: i16 = 1 OR i16 = 1 AND i32 = 2", "i32 = 9"}));
+}
+
+// Nothing shared, nothing to do: the element's conjuncts come back exactly as they were.
 TEST(OrFactoringTest, LeavesAnOrWithNothingSharedAlone) {
-  for (const char* text : {
-           "i16 = 1 OR i32 = 2",
-           "(i16 = 1 AND i32 = 2) OR (i16 = 3 AND i32 = 2 AND s = 'x')",  // shared i32 = 2
-           "(i16 = 1 AND i32 = 2) OR i32 = 3",
+  struct Case {
+    std::string_view text;
+    Texts conjuncts;
+  };
+  for (const Case& c : {
+           // Two bare comparisons share nothing; the OR is one conjunct, unchanged.
+           Case{.text = "i16 = 1 OR i32 = 2", .conjuncts = {"i16 = 1 OR i32 = 2"}},
+           // One branch is a bare comparison the other's AND chain does not contain.
+           Case{.text = "(i16 = 1 AND i32 = 2) OR i32 = 3",
+                .conjuncts = {"i16 = 1 AND i32 = 2 OR i32 = 3"}},
+           // Three branches where only the first two share: all three keep the OR.
+           Case{.text = "(i16 = 1 AND i32 = 2) OR (i16 = 1 AND i32 = 3) OR s = 'x'",
+                .conjuncts = {"i16 = 1 AND i32 = 2 OR i16 = 1 AND i32 = 3 OR s = 'x'"}},
+           // No OR at all: the AND chain is flattened and nothing else happens.
+           Case{.text = "i16 = 1 AND i32 = 2 AND s = 'x'",
+                .conjuncts = {"i16 = 1", "i32 = 2", "s = 'x'"}},
        }) {
-    const Factored f = Factor(text);
-    EXPECT_TRUE(f.absorbed.empty()) << text;
-    EXPECT_FALSE(f.conjuncts.empty()) << text;
+    const Factored f = Factor(std::string(c.text));
+    EXPECT_EQ(f.conjuncts, c.conjuncts) << c.text;
+    EXPECT_TRUE(f.absorbed.empty()) << c.text;
   }
-  // No OR at all: the AND chain is flattened and nothing else happens.
-  EXPECT_EQ(Factor("i16 = 1 AND i32 = 2 AND s = 'x'").conjuncts,
-            (Texts{"i16 = 1", "i32 = 2", "s = 'x'"}));
-  // The second case above really does share i32 = 2.
+  // A conjunct two branches share is still factored when the rest of them differs in length.
   EXPECT_EQ(Factor("(i16 = 1 AND i32 = 2) OR (i16 = 3 AND i32 = 2 AND s = 'x')").conjuncts,
             (Texts{"i32 = 2", "i16 = 1 OR i16 = 3 AND s = 'x'"}));
 }
@@ -114,7 +141,7 @@ TEST(OrFactoringTest, RewritesOneLevelOnly) {
   // A plain BETWEEN is one conjunct here, so two different bounds do not share a half.
   const Factored between =
       Factor("(i16 BETWEEN 1 AND 5 AND i32 = 2) OR (i16 BETWEEN 1 AND 9 AND i32 = 3)");
-  EXPECT_EQ(between.conjuncts.size(), 1U) << "the BETWEENs differ, so only the OR remains";
+  EXPECT_EQ(between.conjuncts.size(), 1U) << "the two bounds differ, so only the OR remains";
 }
 
 // Structural equality is literal: an equality written the other way round is not the same conjunct.
@@ -140,14 +167,14 @@ TEST(OrFactoringTest, FactorsEveryOrOfAnElementAndKeepsPointersValid) {
       "((s = 'x' AND i64 = 4) OR (s = 'x' AND i64 = 5)))");
   ASSERT_EQ(where.size(), 1U) << "a parenthesized AND of two ORs is one element";
   std::vector<sql::Box<sql::Expr>> owned;
-  std::vector<const sql::Expr*> conjuncts;
-  std::vector<const sql::Expr*> absorbed;
-  FactorSharedConjuncts(where.front(), owned, conjuncts, absorbed);
+  std::vector<FactoredConjunct> conjuncts;
+  FactorSharedConjuncts(where.front(), owned, conjuncts);
   ASSERT_EQ(conjuncts.size(), 4U);
   EXPECT_EQ(owned.size(), 2U);
   std::vector<std::string> texts;
-  for (const sql::Expr* c : conjuncts) {
-    texts.push_back(sql::ToSql(*c));  // every pointer still readable after both pushes
+  texts.reserve(conjuncts.size());
+  for (const FactoredConjunct& c : conjuncts) {
+    texts.push_back(sql::ToSql(*c.expr));  // every pointer still readable after both pushes
   }
   EXPECT_EQ(texts, (Texts{"i16 = 1", "i32 = 2 OR i32 = 3", "s = 'x'", "i64 = 4 OR i64 = 5"}));
 }

@@ -183,6 +183,39 @@ antb1_add_cli_golden(
     --table
     "trips=${_f}/star/trips.parquet"
 )
+# OR factoring (ADR 0022's J3): both branches share the equality and tr_row > 100, so the key joins
+# the relations and the shared filter reaches trips' Scan, while what is left of the branches is one
+# condition computed on zones' branch. Without the factoring this query has no key at all and exits
+# with code 4.
+antb1_add_cli_golden(
+  explain_or_factoring
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT COUNT(*), SUM(tr_fare) FROM trips, zones WHERE tr_pickup = zn_id AND tr_row > 100 AND zn_radius > 1 OR tr_pickup = zn_id AND tr_row > 100 AND zn_city = 2"
+    --table
+    "trips=${_f}/star/trips.parquet"
+    --table
+    "zones=${_f}/star/zones.parquet"
+)
+# The first branch is only the shared equality, so it makes the OR true wherever the equality holds
+# and the equality is the whole condition: nothing of zn_radius reaches the plan, and zones reads
+# the key's column alone.
+antb1_add_cli_golden(
+  explain_or_absorbed
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT COUNT(*) FROM trips, zones WHERE tr_pickup = zn_id OR tr_pickup = zn_id AND zn_radius > 1"
+    --table
+    "trips=${_f}/star/trips.parquet"
+    --table
+    "zones=${_f}/star/zones.parquet"
+)
 
 # ---- bench: ClickBench-format JSON (docs/benchmarks.md); timings vary, so regexes ----
 # CMake regex: [.] [{] [}] [[] []] match the character itself; \n is a newline. Built with string(APPEND):

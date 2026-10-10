@@ -3712,18 +3712,20 @@ arrow::Status Binder::BindWhere() {
 // shares factored out first (ADR 0022's OR factoring), each then classified as any conjunct is.
 arrow::Status Binder::BindElement(const sql::Expr& element) {
   std::vector<sql::Box<sql::Expr>> owned;  // keeps the rewrite's expressions alive
-  std::vector<const sql::Expr*> conjuncts;
-  std::vector<const sql::Expr*> absorbed;
-  FactorSharedConjuncts(element, owned, conjuncts, absorbed);
-  // An OR its shared conjuncts imply contributes nothing to the plan, but it is still bound, so
-  // that a bind error inside a dropped branch is still that error (ADR 0022). BindBool resolves and
-  // types every operand and mints no column id, so the result is discarded without a trace.
-  for (const sql::Expr* dropped : absorbed) {
-    ARROW_RETURN_NOT_OK(
-        BindBool(*dropped, [this](const sql::Expr& e) { return BindInput(e); }, /*input=*/true));
-  }
-  for (const sql::Expr* conjunct : conjuncts) {
-    ARROW_RETURN_NOT_OK(BindConjunct(*conjunct, element.span()));
+  std::vector<FactoredConjunct> conjuncts;
+  FactorSharedConjuncts(element, owned, conjuncts);
+  // In the order they are written, so that the error reported is the element's first, as it is
+  // without the rewrite and as it is in DuckDB.
+  for (const FactoredConjunct& conjunct : conjuncts) {
+    if (conjunct.bind_only) {
+      // An OR its shared conjuncts imply contributes nothing to the plan, but it is still bound, so
+      // that a bind error inside a dropped branch is still that error (ADR 0022). BindBool resolves
+      // and types every operand and mints no column id, so the result goes without a trace.
+      ARROW_RETURN_NOT_OK(BindBool(
+          *conjunct.expr, [this](const sql::Expr& e) { return BindInput(e); }, /*input=*/true));
+      continue;
+    }
+    ARROW_RETURN_NOT_OK(BindConjunct(*conjunct.expr, element.span()));
   }
   return arrow::Status::OK();
 }
