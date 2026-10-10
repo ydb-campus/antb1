@@ -27,6 +27,7 @@
 #include "antb1/sql/parser.h"
 
 #include "join_order.h"
+#include "or_factoring.h"
 #include "scope.h"
 
 // The binding rules are documented in docs/sql-subset.md and
@@ -976,25 +977,6 @@ struct RejectConditionOf {
 std::optional<Rejection> RejectCondition(const sql::Expr& expr, bool having) {
   return std::visit(RejectConditionOf{.expr = expr, .having = having},
                     static_cast<const sql::ExprNode&>(expr));
-}
-
-// The conjuncts of a WHERE or HAVING predicate, with parenthesized AND chains flattened.
-void Conjuncts(const sql::Expr& expr, std::vector<const sql::Expr*>& out) {
-  const auto* binary = std::get_if<sql::BinaryExpr>(&expr);
-  if (binary != nullptr && binary->op == sql::BinaryOp::kAnd) {
-    Conjuncts(*binary->left, out);
-    Conjuncts(*binary->right, out);
-    return;
-  }
-  out.push_back(&expr);
-}
-
-std::vector<const sql::Expr*> Conjuncts(const std::vector<sql::Expr>& predicate) {
-  std::vector<const sql::Expr*> out;
-  for (const sql::Expr& expr : predicate) {
-    Conjuncts(expr, out);
-  }
-  return out;
 }
 
 arrow::Result<std::shared_ptr<Table>> ResolveTable(const sql::TableRef& ref,
@@ -2501,6 +2483,7 @@ class Binder {
   [[nodiscard]] std::vector<std::size_t> RelationsRead(const sql::Expr& expr) const;
   // The relations a bound expression reads, ascending (its columns that are a binding's).
   [[nodiscard]] std::vector<std::size_t> RelationsOf(const Expr& expr) const;
+  arrow::Status BindElement(const sql::Expr& element);
   arrow::Status BindConjunct(const sql::Expr& conjunct, SourceSpan element);
   // A conjunct over one relation at most: routed to it, as a single-table WHERE conjunct is.
   arrow::Status BindOnOneRelation(const sql::Expr& conjunct, SourceSpan element,
@@ -3715,22 +3698,34 @@ arrow::Status Binder::BindWhere() {
     }
     visible_ = OnVisibility(stmt_.from, i);
     for (const sql::Expr& element : stmt_.from[i].on) {
-      std::vector<const sql::Expr*> conjuncts;
-      Conjuncts(element, conjuncts);
-      for (const sql::Expr* conjunct : conjuncts) {
-        ARROW_RETURN_NOT_OK(BindConjunct(*conjunct, element.span()));
-      }
+      ARROW_RETURN_NOT_OK(BindElement(element));
     }
   }
   visible_ = {};  // WHERE sees every binding, in one level
   for (const sql::Expr& element : stmt_.where) {
-    std::vector<const sql::Expr*> conjuncts;
-    Conjuncts(element, conjuncts);
-    for (const sql::Expr* conjunct : conjuncts) {
-      ARROW_RETURN_NOT_OK(BindConjunct(*conjunct, element.span()));
-    }
+    ARROW_RETURN_NOT_OK(BindElement(element));
   }
   return OrderRelations();
+}
+
+// One element of WHERE or of an inner ON: its conjuncts, with what every branch of a top-level OR
+// shares factored out first (ADR 0022's OR factoring), each then classified as any conjunct is.
+arrow::Status Binder::BindElement(const sql::Expr& element) {
+  std::vector<sql::Box<sql::Expr>> owned;  // keeps the rewrite's expressions alive
+  std::vector<const sql::Expr*> conjuncts;
+  std::vector<const sql::Expr*> absorbed;
+  FactorSharedConjuncts(element, owned, conjuncts, absorbed);
+  // An OR its shared conjuncts imply contributes nothing to the plan, but it is still bound, so
+  // that a bind error inside a dropped branch is still that error (ADR 0022). BindBool resolves and
+  // types every operand and mints no column id, so the result is discarded without a trace.
+  for (const sql::Expr* dropped : absorbed) {
+    ARROW_RETURN_NOT_OK(
+        BindBool(*dropped, [this](const sql::Expr& e) { return BindInput(e); }, /*input=*/true));
+  }
+  for (const sql::Expr* conjunct : conjuncts) {
+    ARROW_RETURN_NOT_OK(BindConjunct(*conjunct, element.span()));
+  }
+  return arrow::Status::OK();
 }
 
 // The order the relations join in: every one must be connected to the first by an edge (ADR 0022's

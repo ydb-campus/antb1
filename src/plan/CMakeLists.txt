@@ -7,6 +7,7 @@ antb1_add_module(
     literal.cc
     scope.cc
     join_order.cc
+    or_factoring.cc
     binder.cc
     logical_plan.cc
     optimizer.cc
@@ -24,6 +25,7 @@ if(ANTB1_BUILD_TESTS)
       tests/binder_test.cc
       tests/scope_test.cc
       tests/join_order_test.cc
+      tests/or_factoring_test.cc
       tests/column_ids_test.cc
       tests/folding_test.cc
       tests/optimizer_test.cc
