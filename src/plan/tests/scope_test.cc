@@ -474,8 +474,10 @@ TEST(ScopeTest, QualifiedNamesResolveInTheBindingsTheyName) {
 }
 
 // Rule 2: an alias hides the name its FROM reference gives a binding without one, a table's name as
-// written or a path's PathBindingName. A path's text names nothing, aliased or not, and a table's
-// name is never taken for a path: FROM "a.b" AS x hides "a.b", not a.
+// written or a path's PathBindingName. A path without a glob character is named by its file name up
+// to the first dot, so its whole text names nothing, aliased or not; a glob path's name is its
+// whole text, which an alias then hides. A table's name is never taken for a path: FROM "a.b" AS x
+// hides "a.b", not a.
 TEST(ScopeTest, AnAliasHidesItsTablesName) {
   ColumnIdSource ids;
   const Scope aliased({Aliased("x", "t", T(), ids), TableBinding("u", U(), ids)});
@@ -492,6 +494,12 @@ TEST(ScopeTest, AnAliasHidesItsTablesName) {
                  "no FROM item is named 'F/trips.parquet'", {});
   ExpectSqlError(paths.Resolve(QRef("F/zones.parquet", "d")).status(), kBind,
                  "no FROM item is named 'F/zones.parquet'", {});
+  // A glob path is named by its whole text: unaliased it resolves under it, and an alias hides it.
+  const Scope globs({Aliased("x", "F/t*.parquet", T(), ids, kPath),
+                     Aliased("F/z?.parquet", "F/z?.parquet", U(), ids, kPath)});
+  ExpectResolves(globs, QRef("F/z?.parquet", "d"), {}, 1, 1, "F/z?.parquet");
+  ExpectSqlError(globs.Resolve(QRef("F/t*.parquet", "a")).status(), kBind,
+                 "no FROM item is named 'F/t*.parquet' (the alias 'x' hides it)", {});
   const Scope dotted({Aliased("x", "a.b", T(), ids), TableBinding("u", U(), ids)});
   ExpectSqlError(dotted.Resolve(QRef("a", "b")).status(), kBind, "no FROM item is named 'a'", {});
   ExpectSqlError(dotted.Resolve(QRef("A.B", "b")).status(), kBind,
@@ -602,6 +610,58 @@ TEST(ScopeTest, AnOnDoesNotSeeLaterItems) {
                  "'q' has no column 'zz'", {});
   // An end beyond the bindings is every binding.
   ExpectResolves(chain, Ref("f"), Visibility{.inner_begin = 1, .end = 9}, 2, 1, "v");
+  // FROM t JOIN u ON w.a = u.a JOIN w AS v ...: the later item's alias hides the name the ON uses,
+  // so the hint it needs is that it cannot see that item, not that an alias hides the name.
+  const Scope hidden_later(
+      {TableBinding("t", T(), ids), TableBinding("u", U(), ids), Aliased("v", "w", W(), ids)});
+  ExpectSqlError(hidden_later.Resolve(QRef("w", "a"), first_on).status(), kBind,
+                 "no FROM item is named 'w' (an ON sees only the FROM items up to its JOIN)", {});
+  // FROM t AS w JOIN u ON w2.a = u.a JOIN w2 ...: both facts hold, so both hints come, the later
+  // item first. (A visible alias hides 'w2' and a later item is named by it.)
+  const Scope both({Aliased("alias", "w2", T(), ids), TableBinding("u", U(), ids),
+                    TableBinding("w2", W(), ids)});
+  ExpectSqlError(both.Resolve(QRef("w2", "a"), first_on).status(), kBind,
+                 "no FROM item is named 'w2' (an ON sees only the FROM items up to its JOIN)"
+                 " (the alias 'alias' hides it)",
+                 {});
+}
+
+// Rule 10's visibility of an ON, from the FROM list alone: the items up to and including its own,
+// its join group the inner level. A comma starts a group and so does the first item; JOIN and
+// CROSS JOIN continue the group they join into.
+TEST(ScopeTest, OnVisibilityFollowsTheJoinGroups) {
+  using sql::Connector;
+  const auto from = [](const std::vector<Connector>& connectors) {
+    std::vector<sql::FromItem> items;
+    items.reserve(connectors.size());
+    for (const Connector connector : connectors) {
+      items.push_back(sql::FromItem{.connector = connector});
+    }
+    return items;
+  };
+  const auto visibility = [](const std::vector<sql::FromItem>& items, std::size_t item) {
+    const Visibility v = OnVisibility(items, item);
+    return std::pair{v.inner_begin, v.end};
+  };
+  // FROM t, u JOIN w ON ...: w's group is u and w.
+  const std::vector<sql::FromItem> comma =
+      from({Connector::kFirst, Connector::kComma, Connector::kInner});
+  EXPECT_EQ(visibility(comma, 2), (std::pair{std::size_t{1}, std::size_t{3}}));
+  // FROM t CROSS JOIN u JOIN w ON ...: one group, from the first item.
+  const std::vector<sql::FromItem> cross =
+      from({Connector::kFirst, Connector::kCross, Connector::kInner});
+  EXPECT_EQ(visibility(cross, 2), (std::pair{std::size_t{0}, std::size_t{3}}));
+  // FROM t, w, u JOIN v ON ...: v's group is u and v.
+  const std::vector<sql::FromItem> outer =
+      from({Connector::kFirst, Connector::kComma, Connector::kComma, Connector::kInner});
+  EXPECT_EQ(visibility(outer, 3), (std::pair{std::size_t{2}, std::size_t{4}}));
+  // FROM s JOIN d ON ..., t: the ON of item 1 never sees t.
+  const std::vector<sql::FromItem> trailing =
+      from({Connector::kFirst, Connector::kInner, Connector::kComma});
+  EXPECT_EQ(visibility(trailing, 1), (std::pair{std::size_t{0}, std::size_t{2}}));
+  // A comma item of its own is its whole group.
+  EXPECT_EQ(visibility(comma, 1), (std::pair{std::size_t{1}, std::size_t{2}}));
+  EXPECT_EQ(visibility(comma, 0), (std::pair{std::size_t{0}, std::size_t{1}}));
 }
 
 // A column's qualifier is its binding's name (as declared) only in a scope of two or more

@@ -4,8 +4,8 @@ antb1 is a small, single-process SQL engine over Parquet files. It is split into
 (modules) and one binary, `antb1`. This page describes the code as it is today; the engine design beyond the first
 SQL slice is still open (see [ADR 0003](adr/0003-engine-architecture.md)). Joins, derived tables, common table
 expressions and uncorrelated subqueries are designed in [ADR 0022](adr/0022-joins-and-query-blocks.md): the executor
-runs inner, left, semi, anti, null-aware anti and one-row joins as hash joins, but no query binds to a join yet, and
-the steps below change with the PRs that build the rest.
+runs inner, left, semi, anti, null-aware anti and one-row joins as hash joins, a query binds to the inner joins of
+the tables in its `FROM`, and the steps below change with the PRs that build the rest.
 
 ## Modules
 
@@ -102,15 +102,22 @@ steps (only step 7 uses more than one thread):
    their own, held in heap boxes, and every such nested query counts against the same depth limit. Syntax outside the
    grammar is a `kUnsupported` error with the span of the offending token. The engine converts a parse error with
    `plan::ToArrowStatus` into an `arrow::Status` that carries a `SqlErrorDetail`.
-4. Bind (`plan::Bind`): what the binder does not answer yet (a FROM list of several items, an alias, a qualified
-   name, many expressions) is `kUnsupported` before any name resolves; then
-   table names resolve case-insensitively in the catalog (or `FROM 'path'` opens a file),
-   columns resolve in the block's scope (`src/plan/scope.h`: one binding per FROM item, with its columns' ids, types
-   and FLOAT flags), types are checked, and every `WHERE` literal is folded exactly into
-   its column's type ([Binding](sql-subset.md#binding)); `HAVING` binds the same way against the aggregation's output
-   and becomes a `Filter` above it. The result is a `plan::LogicalPlan`: a tree of immutable
+4. Bind (`plan::Bind`): what the binder does not answer yet (a `LEFT JOIN`, a derived table, a `WITH` list, more
+   than 256 relations, many expressions) is `kUnsupported` before any name resolves; then each FROM item's table
+   name resolves case-insensitively in the catalog (or `FROM 'path'` opens a file), in FROM order, one binding per
+   item in the block's scope (`src/plan/scope.h`: its rule-1 name — its alias, else a table's name as written, else
+   a path's file name — and its columns' ids, types and FLOAT flags). Columns resolve there, an `ON` seeing only its
+   own join group and the comma siblings before it ([ADR 0022](adr/0022-joins-and-query-blocks.md) rule 10); types
+   are checked, and every `WHERE` literal is folded exactly into its column's type
+   ([Binding](sql-subset.md#binding)). Each conjunct of `WHERE` and of an `ON` then goes to the relations it reads:
+   one relation filters that relation's own branch, a cross-relation equality whose sides share one key type (each
+   side cast to it on its own branch where it must be) becomes a join key, and anything else over two or more
+   relations becomes a join's residual. A join graph no key connects is a cross product, `kUnsupported`; otherwise
+   the relations join left-deep in the order the footer row counts and distinct-count hints choose
+   (`src/plan/join_order.h`), each join building on the relation it adds. `HAVING` binds the same way against the
+   aggregation's output and becomes a `Filter` above it. The result is a `plan::LogicalPlan`: a tree of immutable
    nodes in a `std::variant` (`Scan`, `Filter`, `Compute`, `Project`, `Aggregate`, `GroupAggregate`, `Sort`, `Limit`,
-   `RowCount`) plus the output columns. Every column gets a `plan::ColumnId` where it is created (a field, a computed
+   `RowCount`, `Join`) plus the output columns. Every column gets a `plan::ColumnId` where it is created (a field, a computed
    expression, an aggregate call or key, a select item), and a column reference names the column it reads by id and
    by its position in the input ([ADR 0022](adr/0022-joins-and-query-blocks.md)).
 5. Optimize (`plan::Optimize`): `COUNT(*)` without `WHERE` to `RowCount`; a `GROUP BY` key computed only from other

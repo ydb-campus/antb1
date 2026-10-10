@@ -35,21 +35,18 @@ SELECT COUNT(*) FROM trips anti
 statement error
 SELECT COUNT(*) FROM trips asof
 
-# ---- pending: quoted, the words are aliases (ADR 0022; roadmap PR J2b removes these guards) ----
+# ---- quoted, the words are aliases (ADR 0022) ----
 
-pending J2b
 query ID nosort quoted_words
 SELECT COUNT(*), SUM(tr_fare) FROM trips AS "semi" JOIN drivers AS "anti" ON "semi".tr_driver = "anti".dv_id
 ----
 2577	38689.00
 
-pending J2b
 query ID nosort quoted_words
 SELECT COUNT(*), SUM(tr_fare) FROM trips "asof" JOIN drivers ON "asof".tr_driver = dv_id
 ----
 2577	38689.00
 
-pending J2b
 query ID nosort quoted_words
 SELECT COUNT(*), SUM(tr_fare) FROM trips JOIN drivers ON tr_driver = dv_id
 ----

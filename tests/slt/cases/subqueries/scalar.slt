@@ -81,7 +81,7 @@ SELECT tr_pickup, SUM(tr_fare) FROM trips GROUP BY tr_pickup HAVING SUM(tr_fare)
 3	1077.50
 33	1093.25
 
-# Over a join (roadmap PR J2b).
+# Over a join.
 pending J5
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_fare > (SELECT AVG(tr_fare) FROM trips JOIN drivers ON tr_driver = dv_id WHERE dv_city = 1)

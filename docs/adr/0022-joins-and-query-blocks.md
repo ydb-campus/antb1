@@ -111,6 +111,9 @@ Proposed
     exits 4, like the depth limit. Every block has a FROM item, so the count bounds the subqueries too, and with them
     the size and depth of every plan. The largest of the 22 queries joins 8 relations in one block, far below the
     limit.
+  - Update (2026-10-10, J2b-2): the count is one block's FROM items, since a derived table, a CTE and a subquery
+    still exit 4 before it; J4 and J5 add the sub-plans and the per-reference counting. It is checked before the
+    per-item checks, so a query of 300 items reports the limit and not its first LEFT JOIN.
   - The doubly parenthesized `x IN ((query))` exits 4: DuckDB reads it as an IN subquery, while `x IN ((query), 3)`
     is a list that holds a scalar subquery. `(WITH ...)` inside an expression exits 4 too.
   - Update (2026-10-09, roadmap PR S4a): the parser accepts derived tables and WITH lists, and the binder exits 4 for
@@ -250,6 +253,12 @@ Proposed
     waits until a query joins on DOUBLE columns. In WHERE and in an inner ON such an equality stays a residual, so a
     join graph connected only through it exits 4 (see the connectivity rule). An IN or NOT IN subquery with that
     common type, and a LEFT JOIN whose ON has no other key, exit 4.
+  - Update (2026-10-10, J2b-2): an equality whose two sides have no exact common key type stays a residual as well,
+    exactly as a DOUBLE one does, so a graph connected only through it exits 4 with the same cross-product error: the
+    key type is the narrowest type both sides widen to exactly (`plan::IsExactWidening`), which two integers always
+    have and a DECIMAL with a DECIMAL or an integer has below 39 digits, so BIGINT against DECIMAL(38,30) has none.
+    An equality on a FLOAT-stored column keeps divergence D11's exit 4 at the comparison instead, since the binder
+    rejects a FLOAT column compared with another expression before anything is classified: one uniform FLOAT rule.
 - **OR factoring (J3).** Before classification, `(A AND X) OR (A AND Y)` becomes `A AND (X OR Y)` for every conjunct
   `A` that all branches share, compared by structure (`sql::EqualIgnoringSpans`). AND distributes over OR in
   three-valued logic too, so the rewrite is exact. When a branch has no conjunct left, the OR is true and is
@@ -296,6 +305,14 @@ Proposed
   - An outer, semi, anti or one-row join is a fixed unit for ordering, and builds on the side whose rows it does not
     preserve: a LEFT JOIN on its right input, a semi or anti join on its subquery, a one-row join on its single row.
     Building on the preserved side needs build-side output, which waits for its own ADR.
+  - Update (2026-10-10, J2b-2): an inner join builds on the relation it adds, always. The smaller-footer-rows choice
+    above, and join-order rule 4's filter selectivity, are deferred together to the cost-based-ordering trigger
+    below: both need estimates that account for filters, and `OrderJoins` decides the side in one field, so the
+    change is local when they arrive.
+  - Update (2026-10-10, J2b-2): one equality is one key, however often it is written. The binder drops a repeated
+    edge between the same relation pair on the same two columns, in either orientation, so `JOIN b ON a.k = b.k`
+    with `WHERE b.k = a.k` costs one hash column, not two. A `JoinNode::span` is the connector that added the
+    join's relation, or that relation's own text when it is the first FROM item and so has no connector.
 - **LEFT JOIN (J6).**
   - The ON condition stays with the join. ON conjuncts that read only the right input are pushed into it (rule 11),
     equalities between the two inputs are keys as in WHERE, and every other ON conjunct is a residual of the join,

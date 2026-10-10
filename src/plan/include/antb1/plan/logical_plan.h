@@ -21,11 +21,16 @@
 // Logical plan: a tree of immutable nodes (docs/architecture.md). The binder builds
 //
 //   [Limit] <- [Project] <- [Sort] <- [Filter] <- [Compute] <- [Aggregate | GroupAggregate]
-//     <- [Compute] <- [Filter] <- [Compute] <- [Filter] <- Scan (every field)
+//     <- [Compute] <- <relations>
 //
-// A Join has two inputs (ADR 0022); no SQL produces one yet, and every walk of a plan visits every
-// input of a node (InputsOf). plan::Optimize rewrites it (COUNT(*) -> RowCount, GROUP BY keys that
-// are functions of other keys, Limit below Project, projection pruning).
+// where <relations> is one FROM item's own branch,
+//
+//   [Compute (key casts)] <- [Filter] <- [Compute] <- [Filter] <- Scan (every field)
+//
+// or, for several, those branches under left-deep inner Joins (ADR 0022). A Join has two inputs,
+// and every walk of a plan visits every input of a node (InputsOf). plan::Optimize rewrites it
+// (COUNT(*) -> RowCount, GROUP BY keys that are functions of other keys, Limit below Project,
+// projection pruning).
 //
 // Every column has a plan-unique ColumnId, defined once by the node that creates it (see
 // OutputIds); a column reference (BoundColumn, ColumnExpr) names the column it reads by its id and

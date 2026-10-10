@@ -127,6 +127,63 @@ antb1_add_cli_golden(
     "edge=${_f}/edge.parquet"
 )
 
+# ---- join plans (ADR 0022): the shapes whose order and build sides the statistics decide ----
+# One --table per table, never a glob: the star files have different schemas (tests/slt/tables.txt),
+# so one glob table would be an I/O error. The plan reads footers only, so --threads 1 shows it all.
+# A cycle of four tables: every edge of the relations already joined becomes a key, so the edge that
+# closes the cycle is a second key of its join.
+antb1_add_cli_golden(
+  explain_join_cycle
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT COUNT(*), SUM(tr_fare) FROM trips, zones, cities, riders WHERE tr_pickup = zn_id AND zn_city = ct_id AND rd_city = ct_id AND tr_rider = rd_id"
+    --table
+    "trips=${_f}/star/trips.parquet"
+    --table
+    "zones=${_f}/star/zones.parquet"
+    --table
+    "cities=${_f}/star/cities.parquet"
+    --table
+    "riders=${_f}/star/riders.parquet"
+)
+# The shortcut zn_city = dv_city is many-to-many, next to the keys tr_pickup = zn_id and
+# tr_driver = dv_id: it is no edge to join on while a key edge is available.
+antb1_add_cli_golden(
+  explain_join_shortcut
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT COUNT(*), SUM(tr_fare) FROM trips, zones, drivers WHERE tr_pickup = zn_id AND tr_driver = dv_id AND zn_city = dv_city"
+    --table
+    "trips=${_f}/star/trips.parquet"
+    --table
+    "zones=${_f}/star/zones.parquet"
+    --table
+    "drivers=${_f}/star/drivers.parquet"
+)
+# A FROM list that starts with two tables sharing no predicate: no cross product, since the chain
+# connects them through the third.
+antb1_add_cli_golden(
+  explain_join_unconnected_first
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT COUNT(*), SUM(tr_fare) FROM zones, riders, trips WHERE tr_pickup = zn_id AND tr_rider = rd_id"
+    --table
+    "zones=${_f}/star/zones.parquet"
+    --table
+    "riders=${_f}/star/riders.parquet"
+    --table
+    "trips=${_f}/star/trips.parquet"
+)
+
 # ---- bench: ClickBench-format JSON (docs/benchmarks.md); timings vary, so regexes ----
 # CMake regex: [.] [{] [}] [[] []] match the character itself; \n is a newline. Built with string(APPEND):
 # a CMake list would split at the ; separators inside [ ].

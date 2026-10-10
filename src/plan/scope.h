@@ -5,6 +5,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -89,9 +90,8 @@ class Binding {
   static Binding OfPlan(std::string name, LogicalNodePtr root, std::vector<BindingColumn> columns);
 
   // The name a qualified column reference uses, as the binder gives it: by rule 1 of ADR 0022 the
-  // FROM item's alias, else its table name as written, else its path's PathBindingName. Until
-  // roadmap PR J2b-2 binds several FROM items, the binder names its one binding by the FROM
-  // reference as written. Two bindings may share a name (rule 3).
+  // FROM item's alias, else its table name as written, else its path's PathBindingName. Two
+  // bindings may share a name (rule 3).
   [[nodiscard]] const std::string& name() const { return name_; }
   [[nodiscard]] const BindingSource& source() const { return source_; }
   [[nodiscard]] const std::vector<BindingColumn>& columns() const { return columns_; }
@@ -134,6 +134,12 @@ struct Visibility {
   std::size_t inner_begin = 0;
   std::size_t end = std::numeric_limits<std::size_t>::max();
 };
+
+// The visibility of the ON of FROM item `item` of `from` (rule 10 of ADR 0022): the items up to and
+// including it, its join group the inner level. A comma starts a group, and so does the first item;
+// every JOIN continues the group it joins into, a CROSS JOIN included. A pure function of the FROM
+// list: the binder calls it once per ON.
+Visibility OnVisibility(std::span<const sql::FromItem> from, std::size_t item);
 
 // Where a name resolves (Scope::LookUp). Matches count in FROM order, and within a binding in
 // column order.

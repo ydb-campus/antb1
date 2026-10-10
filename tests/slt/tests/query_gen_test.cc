@@ -132,7 +132,7 @@ TEST(QueryGenerator, EachIndexIsAPureFunctionOfTheSeed) {
 }
 
 // Over tables without refs (Tables()) and with them (JoinTables()) together, so that the join
-// features count as seen once kSupportedFeatures declares them (roadmap PR J2b).
+// features kSupportedFeatures declares count as seen.
 TEST(QueryGenerator, SupportedQueriesUseOnlySupportedFeatures) {
   const FeatureSet richer = {Feature::kCountStar,      Feature::kSum,
                              Feature::kTableName,      Feature::kWhere,

@@ -121,12 +121,15 @@ std::string MissingMessage(const std::vector<Binding>& bindings, const sql::Colu
     return message;
   }
   std::string message = std::format("no FROM item is named '{}'", ref.qualifier);
-  if (std::ranges::any_of(later, named)) {
+  // A later item carries the name whether it is named by it or an alias of its hides it: either
+  // way the hint an ON needs is that it cannot see that item, not that an alias hides the name.
+  if (std::ranges::any_of(
+          later, [&](const Binding& b) { return named(b) || AliasHides(b, ref.qualifier); })) {
     message += kLaterHint;
   }
   const auto hiding = std::ranges::find_if(
-      bindings, [&ref](const Binding& b) { return AliasHides(b, ref.qualifier); });
-  if (hiding != bindings.end()) {
+      visible, [&ref](const Binding& b) { return AliasHides(b, ref.qualifier); });
+  if (hiding != visible.end()) {
     message += std::format(" (the alias '{}' hides it)", hiding->name());
   }
   return message;
@@ -151,6 +154,17 @@ std::string AmbiguityMessage(const std::vector<Binding>& bindings, const sql::Co
 }
 
 }  // namespace
+
+Visibility OnVisibility(std::span<const sql::FromItem> from, std::size_t item) {
+  ANTB1_CHECK(item < from.size());
+  // The group starts at the last comma up to `item`, or at the first item.
+  std::size_t inner_begin = item;
+  while (inner_begin > 0 && from[inner_begin].connector != sql::Connector::kFirst &&
+         from[inner_begin].connector != sql::Connector::kComma) {
+    --inner_begin;
+  }
+  return Visibility{.inner_begin = inner_begin, .end = item + 1};
+}
 
 std::string PathBindingName(std::string_view path) {
   if (path.find_first_of("*?[") != std::string_view::npos) {

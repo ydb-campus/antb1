@@ -466,7 +466,7 @@ TEST(OptimizerTest, RulesReadColumnIdsNotPositions) {
   }
 }
 
-// ---- joins (hand-built plans: no SQL produces a join yet) ----
+// ---- joins (hand-built plans: kinds and shapes no query makes) ----
 
 LogicalNodePtr Node(LogicalNode node) {
   return std::make_shared<const LogicalNode>(std::move(node));

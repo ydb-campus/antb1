@@ -1,17 +1,18 @@
-// Hash joins over the star schema's Parquet files (label integration, one thread). No SQL reaches
-// a join until roadmap PR J2b, so the plans are built by hand and run through
-// exec::BuildPhysicalPlan. Inner joins: dense keys (the direct layout), repeated and NULL keys, a
-// two-column key, VARCHAR keys, the empty dimension, a self-join, a chain of two joins, and part
-// pruning and filter pushdown on both sides; their rows are checked against a nested-loop join of
-// plain scans, in order, and their counts against DuckDB's for the same joins of the same files,
-// which pending J2b records of tests/slt/cases/joins/ hold too (inner.slt, and names.slt for trips
-// with zones). Semi, anti, null-aware anti and one-row joins: their counts against DuckDB's for the
-// subqueries that pending J5 and U2 records of tests/slt/cases/subqueries/ hold (in.slt,
-// exists.slt and scalar.slt). Left joins, and semi and anti joins with residuals: their counts
-// against DuckDB's for the pending J6 records of tests/slt/cases/joins/left.slt and U2 records of
-// exists.slt. The counts depend on the fixtures (tools/fixturegen/star.h): after a change of the
-// fixture digest (tests/harness), `pixi run slt-complete` rewrites those records from DuckDB, and
-// the counts here follow them.
+// Hash joins over the star schema's Parquet files (label integration, one thread). The plans are
+// built by hand and run through exec::BuildPhysicalPlan, so they reach shapes and kinds no bound
+// query makes: the binder casts a key whose sides differ in type, while these check that exec
+// rejects a hand-built plan whose key types differ. Inner joins: dense keys (the direct layout),
+// repeated and NULL keys, a two-column key, VARCHAR keys, the empty dimension, a self-join, a chain
+// of two joins, and part pruning and filter pushdown on both sides; their rows are checked against
+// a nested-loop join of plain scans, in order, and their counts against DuckDB's for the same joins
+// of the same files, which pending J2b records of tests/slt/cases/joins/ hold too (inner.slt, and
+// names.slt for trips with zones). Semi, anti, null-aware anti and one-row joins: their counts
+// against DuckDB's for the subqueries that pending J5 and U2 records of tests/slt/cases/subqueries/
+// hold (in.slt, exists.slt and scalar.slt). Left joins, and semi and anti joins with residuals:
+// their counts against DuckDB's for the pending J6 records of tests/slt/cases/joins/left.slt and U2
+// records of exists.slt. The counts depend on the fixtures (tools/fixturegen/star.h): after a
+// change of the fixture digest (tests/harness), `pixi run slt-complete` rewrites those records from
+// DuckDB, and the counts here follow them.
 
 #include <algorithm>
 #include <cstddef>
@@ -767,9 +768,9 @@ TEST_F(JoinTest, LeftJoinPadsWithTypedNulls) {
             2);
 }
 
-// The references of the star schema whose keys differ in type are malformed joins until roadmap
-// PR J2b casts their keys to one type: INTEGER drivers against BIGINT ids, DECIMAL(4,2) rates
-// against DECIMAL(5,3) ones. Invalid, not unsupported.
+// A hand-built join whose key sides differ in type is malformed: INTEGER drivers against BIGINT
+// ids, DECIMAL(4,2) rates against DECIMAL(5,3) ones. Invalid, not unsupported. A bound query never
+// reaches it: the binder casts each side to the key's type on its own branch (ADR 0022).
 TEST_F(JoinTest, KeysOfTwoTypesAreInvalid) {
   const Side trips("trips", {"tr_driver", "tr_rate"});
   const Side shifts("shifts", {"sh_driver"});

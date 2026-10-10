@@ -1,6 +1,6 @@
 # Inner joins over the star schema (tools/fixturegen/star.h, ADR 0022): comma lists, CROSS JOIN with WHERE and
 # [INNER] JOIN ... ON over NULL, dangling and repeated keys, keys of two types, a two-column key, a cycle, a
-# many-to-many edge, residuals, an expression key and self-joins. Every pending query joins all its tables through
+# many-to-many edge, residuals, an expression key and self-joins. Every query joins all its tables through
 # equalities whose common type is not DOUBLE, as ADR 0022 rejects a disconnected join graph with exit code 4.
 
 # ---- the inputs, one table at a time ----
@@ -38,60 +38,51 @@ SELECT COUNT(*) FROM trips WHERE tr_driver = 1148 AND tr_day = DATE '2026-03-29'
 ----
 1
 
-# ---- pending: inner joins (ADR 0022; roadmap PR J2b removes these guards) ----
+# ---- inner joins (ADR 0022) ----
 
 # The INTEGER tr_driver meets the BIGINT dv_id in BIGINT: driver 2^32 + 1000 matches no trip, and NULL keys on either
 # side never match. Five spellings of one join.
-pending J2b
 query IDT nosort trips_drivers
 SELECT COUNT(*), SUM(tr_fare), MIN(dv_since) FROM trips, drivers WHERE tr_driver = dv_id
 ----
 2577	38689.00	2025-01-01
 
-pending J2b
 query IDT nosort trips_drivers
 SELECT COUNT(*), SUM(tr_fare), MIN(dv_since) FROM drivers, trips WHERE dv_id = tr_driver
 ----
 2577	38689.00	2025-01-01
 
-pending J2b
 query IDT nosort trips_drivers
 SELECT COUNT(*), SUM(tr_fare), MIN(dv_since) FROM trips JOIN drivers ON tr_driver = dv_id
 ----
 2577	38689.00	2025-01-01
 
-pending J2b
 query IDT nosort trips_drivers
 SELECT COUNT(*), SUM(tr_fare), MIN(dv_since) FROM trips INNER JOIN drivers ON dv_id = tr_driver
 ----
 2577	38689.00	2025-01-01
 
-pending J2b
 query IDT nosort trips_drivers
 SELECT COUNT(*), SUM(tr_fare), MIN(dv_since) FROM trips CROSS JOIN drivers WHERE tr_driver = dv_id
 ----
 2577	38689.00	2025-01-01
 
-pending J2b
 query II rowsort
 SELECT dv_id, COUNT(*) FROM trips JOIN drivers ON tr_driver = dv_id WHERE dv_id IN (1000, 4294968296) GROUP BY dv_id
 ----
 1000	29
 
 # A repeated rider key matches twice: 2841 rows hold 2745 trips.
-pending J2b
 query II nosort trips_riders
 SELECT COUNT(*), COUNT(DISTINCT tr_row) FROM trips JOIN riders ON tr_rider = rd_id
 ----
 2841	2745
 
-pending J2b
 query II nosort trips_riders
 SELECT COUNT(*), COUNT(DISTINCT tr_row) FROM riders, trips WHERE rd_id = tr_rider
 ----
 2841	2745
 
-pending J2b
 query II rowsort
 SELECT rd_id, COUNT(*) FROM trips JOIN riders ON tr_rider = rd_id WHERE rd_id IN (7, 8, 47, 64, 192, 236, 237) GROUP BY rd_id
 ----
@@ -102,14 +93,12 @@ SELECT rd_id, COUNT(*) FROM trips JOIN riders ON tr_rider = rd_id WHERE rd_id IN
 7	26
 
 # The empty dimension: no row, and SUM is NULL.
-pending J2b
 query ID nosort
 SELECT COUNT(*), SUM(pm_discount) FROM trips JOIN promos ON tr_promo = pm_id
 ----
 0	NULL
 
 # VARCHAR keys: std and XL match no code (case, a trailing space), and the NULL code matches nothing.
-pending J2b
 query TI rowsort
 SELECT tf_code, COUNT(*) FROM trips JOIN tariffs ON tr_tariff = tf_code GROUP BY tf_code
 ----
@@ -123,7 +112,6 @@ XL\x20	285
 Ж-1	284
 
 # DECIMAL(4,2) keys against DECIMAL(5,3) rates: 2.25 and 0.88 match no rate, 2.125 and 0.875 no trip.
-pending J2b
 query DDI rowsort
 SELECT tr_rate, tf_rate, COUNT(*) FROM trips JOIN tariffs ON tr_rate = tf_rate GROUP BY tr_rate, tf_rate
 ----
@@ -136,19 +124,16 @@ SELECT tr_rate, tf_rate, COUNT(*) FROM trips JOIN tariffs ON tr_rate = tf_rate G
 
 # The two-column key: a key with a NULL part never matches, and each repeated key of shifts, (1111, 2026-03-22) and
 # (1148, 2026-03-29), matches twice.
-pending J2b
 query IDD nosort trips_shifts
 SELECT COUNT(*), MIN(sh_hours), MAX(sh_hours) FROM trips JOIN shifts ON tr_driver = sh_driver AND tr_day = sh_day
 ----
 447	4.0	12.0
 
-pending J2b
 query IDD nosort trips_shifts
 SELECT COUNT(*), MIN(sh_hours), MAX(sh_hours) FROM shifts, trips WHERE sh_day = tr_day AND sh_driver = tr_driver
 ----
 447	4.0	12.0
 
-pending J2b
 query TI rowsort
 SELECT sh_day, COUNT(*) FROM trips JOIN shifts ON tr_driver = sh_driver AND tr_day = sh_day WHERE sh_driver = 1111 GROUP BY sh_day
 ----
@@ -159,7 +144,6 @@ SELECT sh_day, COUNT(*) FROM trips JOIN shifts ON tr_driver = sh_driver AND tr_d
 2026-03-25	1
 
 # No shift is on March 31.
-pending J2b
 query I nosort
 SELECT COUNT(*) FROM trips JOIN shifts ON tr_driver = sh_driver AND tr_day = sh_day WHERE tr_day = DATE '2026-03-31'
 ----
@@ -167,33 +151,28 @@ SELECT COUNT(*) FROM trips JOIN shifts ON tr_driver = sh_driver AND tr_day = sh_
 
 # A FROM list that starts with two tables sharing no predicate, the join chain, and an ON that names an earlier comma
 # sibling (zones), which DuckDB allows.
-pending J2b
 query ID nosort unconnected_first
 SELECT COUNT(*), SUM(tr_fare) FROM zones, riders, trips WHERE tr_pickup = zn_id AND tr_rider = rd_id
 ----
 2650	39900.50
 
-pending J2b
 query ID nosort unconnected_first
 SELECT COUNT(*), SUM(tr_fare) FROM trips JOIN zones ON tr_pickup = zn_id JOIN riders ON tr_rider = rd_id
 ----
 2650	39900.50
 
-pending J2b
 query ID nosort unconnected_first
 SELECT COUNT(*), SUM(tr_fare) FROM zones, trips JOIN riders ON tr_rider = rd_id AND tr_pickup = zn_id
 ----
 2650	39900.50
 
 # A cycle: trips -> zones -> cities <- riders <- trips, in two FROM orders.
-pending J2b
 query ID nosort cycle
 SELECT COUNT(*), SUM(tr_fare) FROM trips, zones, cities, riders
 WHERE tr_pickup = zn_id AND zn_city = ct_id AND rd_city = ct_id AND tr_rider = rd_id
 ----
 492	7333.75
 
-pending J2b
 query ID nosort cycle
 SELECT COUNT(*), SUM(tr_fare) FROM riders, cities, zones, trips
 WHERE tr_rider = rd_id AND rd_city = ct_id AND zn_city = ct_id AND tr_pickup = zn_id
@@ -201,66 +180,56 @@ WHERE tr_rider = rd_id AND rd_city = ct_id AND zn_city = ct_id AND tr_pickup = z
 492	7333.75
 
 # A cycle whose shortcut zn_city = dv_city is many-to-many, next to the keys tr_pickup = zn_id and tr_driver = dv_id.
-pending J2b
 query ID nosort shortcut
 SELECT COUNT(*), SUM(tr_fare) FROM trips, zones, drivers WHERE tr_pickup = zn_id AND tr_driver = dv_id AND zn_city = dv_city
 ----
 416	6174.25
 
-pending J2b
 query ID nosort shortcut
 SELECT COUNT(*), SUM(tr_fare) FROM drivers JOIN zones ON zn_city = dv_city JOIN trips ON tr_pickup = zn_id AND tr_driver = dv_id
 ----
 416	6174.25
 
 # The many-to-many edge as the only way to zones: every trip meets each zone of its driver's city.
-pending J2b
 query ID nosort many_to_many
 SELECT COUNT(*), SUM(tr_fare) FROM trips, drivers, riders, zones WHERE tr_driver = dv_id AND tr_rider = rd_id AND zn_city = dv_city
 ----
 16652	250781.75
 
-pending J2b
 query ID nosort many_to_many
 SELECT COUNT(*), SUM(tr_fare) FROM zones JOIN drivers ON zn_city = dv_city JOIN trips ON tr_driver = dv_id JOIN riders ON tr_rider = rd_id
 ----
 16652	250781.75
 
 # Residuals across two tables, in WHERE and in ON.
-pending J2b
 query I nosort
 SELECT COUNT(*) FROM trips JOIN riders ON tr_rider = rd_id WHERE rd_joined > tr_day
 ----
 59
 
-pending J2b
 query I nosort residual_or
 SELECT COUNT(*) FROM trips JOIN riders ON tr_rider = rd_id WHERE rd_joined > tr_day OR rd_city = 1
 ----
 949
 
-pending J2b
 query I nosort residual_or
 SELECT COUNT(*) FROM trips JOIN riders ON tr_rider = rd_id AND (rd_joined > tr_day OR rd_city = 1)
 ----
 949
 
 # A DOUBLE equality next to a key is a residual.
-pending J2b
 query ID nosort
 SELECT COUNT(*), SUM(tr_fare) FROM trips JOIN zones ON tr_pickup = zn_id AND tr_distance = zn_radius
 ----
 19	274.25
 
 # An expression key.
-pending J2b
 query III nosort
 SELECT COUNT(*), MIN(zn_id), MAX(zn_id) FROM trips JOIN zones ON tr_pickup + 1 = zn_id
 ----
 2724	2	40
 
 # Self-joins: a zone and its parent (zone 40's parent 77 does not exist), and zones in two roles.
-pending J2b
 query ITI rowsort
 SELECT z.zn_id, p.label, p.zn_id FROM zones AS z JOIN zones AS p ON z.zn_parent = p.zn_id WHERE z.zn_id > 30
 ----
@@ -274,13 +243,11 @@ SELECT z.zn_id, p.label, p.zn_id FROM zones AS z JOIN zones AS p ON z.zn_parent 
 38	south	3
 39	airport	4
 
-pending J2b
 query III nosort
 SELECT COUNT(*), MIN(pu.zn_id), MAX(dr.zn_id) FROM trips, zones AS pu, zones AS dr WHERE tr_pickup = pu.zn_id AND tr_dropoff = dr.zn_id
 ----
 2629	1	40
 
-pending J2b
 query TTI rowsort
 SELECT pu.label, dr.label, COUNT(*) FROM trips, zones AS pu, zones AS dr
 WHERE tr_pickup = pu.zn_id AND tr_dropoff = dr.zn_id AND pu.zn_id <= 2 GROUP BY pu.label, dr.label
@@ -304,13 +271,11 @@ north	south	8
 
 # The fan-out case: the trips of one rider, and of one driver (up to 28 matches for a probe row, 40488 in all), with
 # a residual that keeps each pair once.
-pending J2b
 query IDI nosort
 SELECT COUNT(*), SUM(a.tr_fare), MIN(b.tr_row - a.tr_row) FROM trips AS a JOIN trips AS b ON a.tr_rider = b.tr_rider AND a.tr_row < b.tr_row
 ----
 15785	236682.00	236
 
-pending J2b
 query I nosort
 SELECT COUNT(*) FROM trips AS a JOIN trips AS b ON a.tr_driver = b.tr_driver AND a.tr_row < b.tr_row
 ----
@@ -319,25 +284,21 @@ SELECT COUNT(*) FROM trips AS a JOIN trips AS b ON a.tr_driver = b.tr_driver AND
 # The row counts that integration.JoinTest (tests/integration/join_test.cc) pins for its hand-built plans of these
 # joins: VARCHAR keys, the self-reference of zones, a chain of two joins and a filter on each side. Its other counts
 # are those of trips with riders, shifts and promos above, and of trips with zones in names.slt.
-pending J2b
 query I nosort
 SELECT COUNT(*) FROM trips JOIN tariffs ON tr_tariff = tf_code
 ----
 2274
 
-pending J2b
 query I nosort
 SELECT COUNT(*) FROM zones AS z JOIN zones AS p ON z.zn_parent = p.zn_id
 ----
 34
 
-pending J2b
 query I nosort
 SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id JOIN cities ON zn_city = ct_id
 ----
 2655
 
-pending J2b
 query I nosort
 SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id WHERE tr_row >= 2400 AND zn_id <= 10
 ----
