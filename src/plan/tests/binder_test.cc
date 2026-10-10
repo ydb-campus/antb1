@@ -792,23 +792,24 @@ TEST(BinderTest, QualifiedNamesAndAliasesBind) {
     std::string_view name;  // the first output column's name
   };
   for (const Case& c : {
-           Case{"SELECT t.i16 FROM t", "i16"},
-           Case{R"(SELECT "t".i16 FROM t)", "i16"},
-           Case{"SELECT T.I16 FROM t", "i16"},
-           Case{"SELECT a.i16 FROM t AS a", "i16"},
-           Case{"SELECT a.i16 FROM t a", "i16"},
+           Case{.sql = "SELECT t.i16 FROM t", .name = "i16"},
+           Case{.sql = R"(SELECT "t".i16 FROM t)", .name = "i16"},
+           Case{.sql = "SELECT T.I16 FROM t", .name = "i16"},
+           Case{.sql = "SELECT a.i16 FROM t AS a", .name = "i16"},
+           Case{.sql = "SELECT a.i16 FROM t a", .name = "i16"},
            // `over` is a legal implicit alias, but the parser takes a reserved word as a qualifier
            // only quoted, so a reference to it needs the quotes.
-           Case{R"(SELECT "over".i16 FROM t over)", "i16"},
-           Case{"SELECT i16 FROM t AS a", "i16"},
-           Case{"SELECT COUNT(*) FROM t over", "count_star()"},
+           Case{.sql = R"(SELECT "over".i16 FROM t over)", .name = "i16"},
+           Case{.sql = "SELECT i16 FROM t AS a", .name = "i16"},
+           Case{.sql = "SELECT COUNT(*) FROM t over", .name = "count_star()"},
            // Rule 6: the qualifier stays as written inside an expression's name.
-           Case{"SELECT SUM(t.i16) FROM t", "sum(t.i16)"},
-           Case{R"(SELECT SUM("t".i16) FROM t)", "sum(t.i16)"},  // a plain identifier, so unquoted
-           Case{R"(SELECT SUM(t."Mixed Case") FROM t)", R"(sum(t."Mixed Case"))"},
-           Case{R"(SELECT SUM("from".i16) FROM t AS "from")", R"(sum("from".i16))"},
-           Case{"SELECT i16 + t.i32 FROM t", "(i16 + t.i32)"},
-           Case{"SELECT -t.i64 FROM t", "-(t.i64)"},
+           Case{.sql = "SELECT SUM(t.i16) FROM t", .name = "sum(t.i16)"},
+           // A plain identifier, so unquoted.
+           Case{.sql = R"(SELECT SUM("t".i16) FROM t)", .name = "sum(t.i16)"},
+           Case{.sql = R"(SELECT SUM(t."Mixed Case") FROM t)", .name = R"(sum(t."Mixed Case"))"},
+           Case{.sql = R"(SELECT SUM("from".i16) FROM t AS "from")", .name = R"(sum("from".i16))"},
+           Case{.sql = "SELECT i16 + t.i32 FROM t", .name = "(i16 + t.i32)"},
+           Case{.sql = "SELECT -t.i64 FROM t", .name = "-(t.i64)"},
        }) {
     auto plan = BindSql(c.sql, catalog);
     ASSERT_TRUE(plan.ok()) << c.sql << ": " << plan.status().ToString();
@@ -1588,16 +1589,31 @@ TEST(BinderTest, JoinOrderBuildSideAndKeys) {
   };
   for (const Case& c : {
            // 100 rows against 7: t probes, ok is added and built on.
-           Case{"SELECT ok.s FROM t JOIN ok ON t.i16 = ok.i16", "t", "ok", "JOIN"},
+           Case{.sql = "SELECT ok.s FROM t JOIN ok ON t.i16 = ok.i16",
+                .left = "t",
+                .right = "ok",
+                .span = "JOIN"},
            // The same whichever side is written first: the order is the statistics', not FROM's.
            // The span is the connector that added the built relation, or that relation's own text
            // when it is the first FROM item and so has no connector.
-           Case{"SELECT ok.s FROM ok JOIN t ON t.i16 = ok.i16", "t", "ok", "ok"},
+           Case{.sql = "SELECT ok.s FROM ok JOIN t ON t.i16 = ok.i16",
+                .left = "t",
+                .right = "ok",
+                .span = "ok"},
            // An unknown row count counts as the most, so u probes and t is added.
-           Case{"SELECT t.s FROM t JOIN u ON t.i16 = u.i16", "u", "t", "t"},
+           Case{.sql = "SELECT t.s FROM t JOIN u ON t.i16 = u.i16",
+                .left = "u",
+                .right = "t",
+                .span = "t"},
            // A comma join is the same join; its span is the comma.
-           Case{"SELECT ok.s FROM t, ok WHERE t.i16 = ok.i16", "t", "ok", ","},
-           Case{"SELECT ok.s FROM t CROSS JOIN ok WHERE t.i16 = ok.i16", "t", "ok", "CROSS JOIN"},
+           Case{.sql = "SELECT ok.s FROM t, ok WHERE t.i16 = ok.i16",
+                .left = "t",
+                .right = "ok",
+                .span = ","},
+           Case{.sql = "SELECT ok.s FROM t CROSS JOIN ok WHERE t.i16 = ok.i16",
+                .left = "t",
+                .right = "ok",
+                .span = "CROSS JOIN"},
        }) {
     auto plan = BindSql(c.sql, catalog);
     ASSERT_TRUE(plan.ok()) << c.sql << ": " << plan.status().ToString();
