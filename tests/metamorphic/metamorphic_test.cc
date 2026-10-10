@@ -26,6 +26,9 @@
 #include "antb1/plan/types.h"
 
 #include "antb1_engine.h"
+#ifdef ANTB1_SLT_HAVE_DUCKDB
+#include "duckdb_engine.h"
+#endif
 #include "engine.h"
 #include "fixtures.h"
 #include "relations.h"
@@ -117,6 +120,34 @@ INSTANTIATE_TEST_SUITE_P(, Relations, ::testing::ValuesIn(AllRelations()),
                          [](const ::testing::TestParamInfo<Relation>& param_info) {
                            return param_info.param.name;
                          });
+
+// A pending relation's probes are the shapes antb1 does not answer yet, so antb1 cannot check that
+// they are even well formed: it reports Unsupported before it resolves a name (a misspelled column
+// inside a LEFT JOIN is invisible), and Evaluate accepts that as pending. DuckDB answers all of
+// them today, so it is what keeps a pending relation's SQL honest until its PR activates it.
+#ifdef ANTB1_SLT_HAVE_DUCKDB
+TEST(RelationList, PendingProbesAreValidSqlInDuckDb) {
+  const auto tables = LoadFixtureTables();
+  ASSERT_FALSE(tables.empty());
+  auto oracle =
+      slt::DuckDbEngine::Make(tables, antb1::testing::FixturesDir(), ::testing::TempDir());
+  ASSERT_TRUE(oracle.has_value()) << oracle.error();
+  int pending = 0;
+  for (const auto& r : AllRelations()) {
+    if (slt::kSupportedFeatures.Contains(r.features)) {
+      continue;  // active: the relation itself already runs its probes
+    }
+    ++pending;
+    for (std::size_t i = 0; i < r.probes.size(); ++i) {
+      const slt::ExecResult answer = (*oracle)->Execute(Substitute(r.probes[i].sql));
+      EXPECT_TRUE(answer.has_value())
+          << r.name << " probe " << i << ": " << (answer ? "" : answer.error().message) << "\n  "
+          << r.probes[i].sql;
+    }
+  }
+  EXPECT_GT(pending, 0) << "no pending relation to check";
+}
+#endif
 
 slt::ResultSet Single(std::string value) {
   return slt::ResultSet{.classes = {slt::ColumnClass::kInteger},
