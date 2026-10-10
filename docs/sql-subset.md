@@ -8,45 +8,53 @@ This page is the contract: a PR that changes SQL behavior updates it in the same
 
 ## What works today
 
-Every query of the [grammar](#grammar) below runs: global and grouped (`GROUP BY`) aggregates, `COUNT(DISTINCT ...)`
-included, projections (`*`, columns or constants), `WHERE` conditions (`column <op> literal` comparisons,
-`column [NOT] LIKE 'pattern'`, `column [NOT] IN (literal, ...)` and `column [NOT] BETWEEN low AND high`, combined
-with `AND`, `OR` and `NOT`, with constant integer arithmetic folded on a side), `GROUP BY`
-and `ORDER BY` (also by position), `HAVING` (the same conditions on aggregates and keys), arithmetic
-(`+ - * / // %` and unary `-`), the string functions `strlen` and `regexp_replace`, the timestamp functions
-`toDateTime`, `EXTRACT` and `date_trunc`, and `CASE` in every clause, dates written as casts
-(`CAST('2013-07-01' AS DATE)`, `'2013-07-01'::DATE`), `LIMIT` and `OFFSET`, over one table of Parquet files or
-several joined by inner joins. This covers all 43 ClickBench queries (see
+All of this runs (the [grammar](#grammar) below accepts more than the binder answers): global and grouped
+(`GROUP BY`) aggregates, `COUNT(DISTINCT ...)` included, projections (`*`, columns or constants), `WHERE`
+conditions (comparisons between columns, expressions and literals, `[NOT] LIKE 'pattern'`,
+`[NOT] IN (literal, ...)` and `[NOT] BETWEEN low AND high`, combined with `AND`, `OR` and `NOT`, with constant
+integer arithmetic folded on a side), `GROUP BY` and `ORDER BY` (also by position), `HAVING` (the same conditions
+on aggregates and keys), arithmetic (`+ - * / // %` and unary `-`) over integers, DOUBLE and DECIMAL, the string
+functions `strlen` and `regexp_replace`, the timestamp functions `toDateTime`, `EXTRACT` and `date_trunc`, and
+`CASE` in every clause, dates written as casts or literals (`CAST('2013-07-01' AS DATE)`, `'2013-07-01'::DATE`,
+`DATE '2013-07-01'`), `LIMIT` and `OFFSET`, over one table of Parquet files or several joined by inner joins. This
+covers all 43 ClickBench queries (see
 [ClickBench status](#clickbench-status)). Of the 22 queries derived from TPC-H, Q1, Q3, Q5, Q6, Q10, Q12, Q14 and Q19
 pass (see [Queries derived from TPC-H](#queries-derived-from-tpc-h)).
 
 ```sql
-SELECT COUNT(*), SUM(ResolutionWidth) AS width, AVG(UserID), MAX(EventDate) FROM hits WHERE IsMobile = 1
-SELECT WatchID, URL FROM hits WHERE RegionID < 300 AND SearchPhrase <> '' LIMIT 10
-SELECT COUNT(*) FROM events WHERE url LIKE '%shop%' AND title NOT LIKE 'Promo_%'
-SELECT RegionID, COUNT(*) AS n, AVG(ResolutionWidth) FROM hits WHERE IsMobile = 1 GROUP BY RegionID
-SELECT OS, COUNT(*) AS n FROM hits GROUP BY OS ORDER BY n DESC, MAX(EventDate) NULLS FIRST LIMIT 10 OFFSET 5
-SELECT CounterID, COUNT(*) AS n FROM hits GROUP BY CounterID HAVING n > 100 AND MIN(URL) LIKE 'http%'
-SELECT * FROM '/data/hits_*.parquet' LIMIT 5
+SELECT COUNT(*), COUNT(DISTINCT OS), AVG(ResolutionWidth) AS width FROM hits WHERE OS BETWEEN 2 AND 44
+SELECT WatchID, URL FROM hits WHERE URL LIKE 'https://%' AND Title NOT LIKE 'Promo_%' LIMIT 10
+SELECT RegionID, COUNT(*) AS n, MAX(strlen(URL)) FROM hits GROUP BY 1 ORDER BY n DESC LIMIT 10 OFFSET 5
+SELECT CounterID, COUNT(*) AS n FROM hits GROUP BY CounterID HAVING n > 260 AND MAX(URL) LIKE 'https%'
+SELECT * FROM trips WHERE tr_promo IN (1, 2) AND NOT (tr_day > '2026-03-20'::DATE OR tr_rate < 1.25) LIMIT 5
+SELECT z.label, SUM(t.tr_fare) FROM trips AS t JOIN zones AS z ON t.tr_pickup = z.zn_id GROUP BY z.label
+SELECT AVG(t.tr_fare * f.tf_rate) FROM trips AS t, tariffs AS f WHERE t.tr_tariff = f.tf_code
+SELECT CASE WHEN EXTRACT(DAY FROM tr_day) > 15 THEN 'late' ELSE 'early' END, COUNT(*) FROM trips GROUP BY 1
+SELECT date_trunc('month', tr_day) AS m, MIN(tr_fare) FROM trips GROUP BY 1 ORDER BY m NULLS FIRST
 ```
 
-- The table is registered with `--table NAME=PATH[,PATH|GLOB]` (an identifier or a `"quoted identifier"`, matched
-  ASCII case-insensitively) or given as a string literal with a path or glob, e.g. `FROM '/data/hits_*.parquet'`.
+- Each table is registered with `--table NAME=PATH[,PATH|GLOB]` (an identifier or a `"quoted identifier"`, matched
+  ASCII case-insensitively), once per table, or given as a string literal with a path or glob, e.g.
+  `FROM '/data/hits_*.parquet'`. The examples above read a hits-shaped table and the join fixtures `trips`, `zones`
+  and `tariffs` ([Fixtures](testing.md#fixtures)).
 - Only the columns a query references are decoded. `COUNT(*)` without `WHERE` is answered from the Parquet footers
   (no data page is read); under `WHERE` it counts the rows the filter selects without copying them.
 - Result names and types follow DuckDB ([Binding](#binding)); values follow the [Semantics](#semantics) below.
 - `--` line comments, `/* block */` comments and one trailing `;` are allowed.
 - SQL outside the grammar (a window function such as `row_number() OVER ()`, `IS NULL`, other functions, ...) fails
   with exit code 4 and points at the first unsupported token. A `FROM` list of tables and paths, joined by commas,
-  `CROSS JOIN` or `[INNER] JOIN ... ON`, with aliases and qualified names, is answered; a `LEFT JOIN`, a derived
-  table, a `WITH` list, more than 256 relations, and a join graph that no join key connects (a cross product) parse
-  ([Grammar](#grammar)) but are not answered: exit code 4 as well. Malformed SQL (a syntax error) and SQL that is
-  wrong for the tables (a bind error) fail with exit code 1.
+  `CROSS JOIN` or `[INNER] JOIN ... ON`, with aliases and qualified names, is answered as long as a join key
+  connects every relation — so a comma list or a `CROSS JOIN` needs an equality between its relations, in the list's
+  `ON` or in `WHERE`. A `LEFT JOIN`, a derived table, a `WITH` list, `TRY_CAST`, more than 256 relations, and a join
+  graph that no join key connects (a cross product) parse ([Grammar](#grammar)) but are not answered: exit code 4
+  as well. Malformed SQL (a syntax error) and SQL that is wrong for the tables (a bind error) fail with exit
+  code 1.
 
 ```bash
 pixi run antb1 query -f query.sql --table hits=/data/clickbench/hits_0.parquet --clickbench
 pixi run antb1 explain -f query.sql --table hits=/data/clickbench/hits_0.parquet --clickbench
 pixi run antb1 explain --analyze -f query.sql --table hits=/data/clickbench/hits_0.parquet --clickbench
+pixi run antb1 query -f query.sql --table trips=/data/trips.parquet --table zones=/data/zones.parquet
 ```
 
 Globs are allowed in the file-name part of a path only (`/data/hits_*.parquet`, not `/data/*/hits.parquet`) and
