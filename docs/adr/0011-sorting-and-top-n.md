@@ -52,4 +52,6 @@ Accepted (with the maintainer-approved plan for GROUP BY, ORDER BY and COUNT(DIS
 - The test harness accepts any order of tied rows: it runs an augmented query on DuckDB (the `ORDER BY` keys
   appended to the select list, no `LIMIT`) and checks that antb1's row `i` is one of DuckDB's rows with the keys of
   rank `offset + i` (`tests/slt/runner/ordered_compare.h`).
-- `ORDER BY` positions (`ORDER BY 2`) and expressions stay outside the subset.
+- `ORDER BY` positions (`ORDER BY 2`) and expressions stay outside the subset. (Later PRs added both: positions
+  together with `GROUP BY` positions and constants, and expressions with the scalar expressions of
+  [ADR 0012](0012-scalar-expressions.md).)

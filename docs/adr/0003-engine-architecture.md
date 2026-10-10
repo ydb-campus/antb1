@@ -33,16 +33,25 @@ For the slice:
   accumulators because Arrow's `sum` wraps at 64 bits.
 - Single-threaded execution, reading files and row groups in order, in batches of 64Ki rows. Metadata-only answers
   are their own logical node and operator: `COUNT(*)` without `WHERE` is a row count from the Parquet footers.
+  (Superseded for the thread count by [ADR 0013](0013-parallel-execution.md): a row group is a part that runs on a
+  thread pool, the parts' partial results are merged in part order, and the CLI's `--threads` defaults to the
+  machine's hardware threads.)
 - Planned operators for the slice: table scan of referenced columns only, filter with a selection mask, scalar
   aggregate, projection, limit (stops early) and row count.
 
 ## Consequences
 
 - The slice stays small and easy to reason about, and each layer can be tested on its own.
-- Performance is limited to one core until parallelism is designed.
+- Performance is limited to one core until parallelism is designed. (Designed and shipped since:
+  [ADR 0013](0013-parallel-execution.md) runs a query's row groups in parallel.)
 - Open questions, to be settled by a later ADR that moves this one to Accepted or supersedes it:
   - intra-query parallelism (for example morsel-driven scheduling) and how operators share work;
   - the GROUP BY strategy (hash aggregation, memory limits, spilling);
   - the expression IR beyond `column <op> literal` (arithmetic, functions, `OR`, `NOT`);
   - pull versus push execution once pipelines get longer;
   - memory accounting and the use of Arrow memory pools.
+- Update (2026-10-10): all of these but spilling have since been settled, with no status change here: intra-query
+  parallelism by [ADR 0013](0013-parallel-execution.md), the GROUP BY strategy by
+  [ADR 0010](0010-grouped-aggregation.md) and the session memory budget (spilling is still open), the expression IR
+  by [ADR 0012](0012-scalar-expressions.md), pull versus push by [ADR 0022](0022-joins-and-query-blocks.md) (pull
+  pipelines stay), and memory accounting by `exec::MemoryBudget` and [ADR 0017](0017-allocator-keeps-memory.md).

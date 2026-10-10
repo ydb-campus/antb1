@@ -199,7 +199,7 @@ only on `s`, `i`, the tables and the supported features, so a single case reprod
   without running them, `--table NAME` restricts the tables, `--target-percent P` sets the share of queries that
   sample the full target grammar.
 - Most queries use only the features declared in `tests/slt/supported_features.h`; for them an antb1 `Unsupported`
-  answer is a failure. The rest sample the whole target grammar of [sql-subset.md](sql-subset.md#target-grammar):
+  answer is a failure. The rest sample the whole target grammar of [sql-subset.md](sql-subset.md#grammar):
   there an `Unsupported` answer is counted per missing feature and reported, not a failure.
 - Over tables with `ref=` options (the star schema) a query that may use a join feature often joins 2 or 3 tables
   along the refs, as commas, `CROSS JOIN` or `[INNER] JOIN ... ON`, with aliases and qualified names, within a row

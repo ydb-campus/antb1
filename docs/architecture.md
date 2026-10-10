@@ -113,7 +113,7 @@ steps (only step 7 uses more than one thread):
    one relation filters that relation's own branch, a cross-relation equality whose sides share one key type (each
    side cast to it on its own branch where it must be) becomes a join key, and anything else over two or more
    relations becomes a join's residual. A join graph no key connects is a cross product, `kUnsupported`; otherwise
-   the relations join left-deep in the order the footer row counts and distinct-count hints choose
+   the relations join left-deep in the order the footer row counts, integer ranges and distinct-count hints choose
    (`src/plan/join_order.h`), each join building on the relation it adds. `HAVING` binds the same way against the
    aggregation's output and becomes a `Filter` above it. The result is a `plan::LogicalPlan`: a tree of immutable
    nodes in a `std::variant` (`Scan`, `Filter`, `Compute`, `Project`, `Aggregate`, `GroupAggregate`, `Sort`, `Limit`,

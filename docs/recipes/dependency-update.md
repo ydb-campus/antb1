@@ -67,8 +67,8 @@ Never resolve a `pixi.lock` conflict by hand.
 2. Regenerate the lock with `pixi lock` (it prompts), then `pixi install --locked` and the checks above.
 3. If the branch did not change `pixi.toml` at all, take the lock from `main` instead of regenerating it.
 
-A scheduled bot PR refreshes `pixi.lock` within the existing constraints once the lock-update workflow is enabled;
-it goes through CI and a human review like any other PR.
+A scheduled bot PR refreshes `pixi.lock` within the existing constraints every Monday (`pixi.lock update`,
+[ci.md](../ci.md#workflows)); it goes through CI and a human review like any other PR.
 
 ## GitHub Actions
 

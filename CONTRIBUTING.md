@@ -41,7 +41,7 @@ the package on macOS, so the TPC-H-derived tests run on Linux only.
 | Format C++, CMake, Python, TOML and Markdown in place | `pixi run fmt` |
 | Lint and repository drift checks (read-only) | `pixi run lint` |
 | Required before every PR | `pixi run check` |
-| Every Linux PR gate (ASan/UBSan, clang-tidy, coverage floors, fuzz smoke, GCC leg) | `pixi run check-full` |
+| Every Linux PR gate except the ClickBench data tests and CodeQL (ASan/UBSan, clang-tidy, coverage floors, fuzz smoke, GCC leg) | `pixi run check-full` |
 | ClickBench data tests (downloads 122 MB once into `~/.cache/antb1`; redacted output) | `pixi run test-data` |
 | Toolchain, build and data status | `pixi run doctor` |
 | Benchmarks (never gating; [docs/benchmarks.md](docs/benchmarks.md)) | `pixi run bench` · `pixi run bench-clickbench` |

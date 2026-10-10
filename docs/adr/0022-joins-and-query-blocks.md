@@ -9,7 +9,8 @@ Proposed
 ## Context
 
 - **The target:** the 22 queries derived from TPC-H. Query numbers in this ADR are theirs, not ClickBench's. Each of
-  them exits 4 today, at its first unsupported construct. On 2026-10-02 the maintainer approved a roadmap to all 22,
+  them exits 4 today, at its first unsupported construct. (Seven pass since J2b: Q1, Q3, Q5, Q6, Q10, Q12 and Q14,
+  `tests/data/tpch_status.json`.) On 2026-10-02 the maintainer approved a roadmap to all 22,
   with the decisions cited here by their ids (C6, C8, C9, C10, C16) and the PRs named in the Plan below. Its DECIMAL
   work is ADR 0021, its correlated subqueries are ADR 0023, and this ADR designs the rest of the relational work.
   What the queries need from it:

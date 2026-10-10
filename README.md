@@ -4,9 +4,13 @@ Experimental C++23 analytics engine: SQL-like queries over local Parquet files, 
 
 ## Status
 
-Early and experimental. The first SQL slice works: global aggregates (`COUNT`, exact 128-bit `SUM`, `AVG`, `MIN`,
-`MAX`), projections, `WHERE` conjunctions of `column <op> literal` and `LIMIT` over Parquet files, single-threaded,
-with DuckDB as the test oracle. It answers ClickBench Q0, Q1, Q2, Q3 and Q6 like DuckDB.
+Early and experimental. A specified subset of `SELECT` works: global and grouped aggregates (`COUNT`,
+`COUNT(DISTINCT ...)`, exact 128-bit `SUM`, `AVG`, `MIN`, `MAX`), projections, `WHERE` (comparisons, `LIKE`, `IN`,
+`BETWEEN`, combined with `AND`, `OR` and `NOT`), `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT` and `OFFSET`, arithmetic,
+`CASE`, DECIMAL and the date and timestamp functions, over one table of Parquet files or several joined by inner
+joins, run in parallel over row groups with filter pushdown and late materialization, with DuckDB as the test
+oracle. It answers all 43 ClickBench queries like DuckDB, and 7 of the 22 queries derived from TPC-H (Q1, Q3, Q5,
+Q6, Q10, Q12 and Q14).
 [docs/sql-subset.md](docs/sql-subset.md) lists exactly what works today.
 
 ## Quickstart
