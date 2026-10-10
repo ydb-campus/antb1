@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791603855856,
+  "lastUpdate": 1791659416233,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -6264,6 +6264,114 @@ window.BENCHMARK_DATA = {
             "value": 117.79252899999904,
             "unit": "ms/iter",
             "extra": "iterations: 6\ncpu: 117.77884999999996 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "0ce88de2436ea6ee815dca285dce381447fc0d2d",
+          "message": "feat(plan): factor conjuncts shared by every branch of an or (#115)\n\n## Summary\n\nRoadmap PR **J3** of [ADR\n0022](docs/adr/0022-joins-and-query-blocks.md): before the binder\nclassifies the conjuncts\nof a `WHERE` element or an inner `ON` element, `(A AND X) OR (A AND Y)`\nbecomes `A AND (X OR Y)` for every conjunct\n`A` that all branches share. The shared conjuncts are then classified\nlike any other, so a shared equality becomes a\njoin key and a shared single-relation conjunct reaches its scan, while\nwhat is left of the branches stays one\nconjunct — a residual when it reads several relations. `Q19` passes, so\nthe TPC-H-derived ratchet moves to **8 of\n22**.\n\nTwo commits:\n\n| | |\n| --- | --- |\n| `959b218` | `feat(plan)`: factor conjuncts shared by every branch of\nan or |\n| `9939905` | `fix(plan)`: bind a factored element in the order it is\nwritten |\n\nThe second is this PR's own review finding, kept separate because it is\na distinct defect with its own test: see\n\"What the review found\" below.\n\nThe point is reach, not speed. A condition that connects a join graph\nonly through an `OR` had no key at all, so it\nwas a cross product and exited 4; now it plans as a hash join:\n\n```text\n$ antb1 explain -c \"SELECT COUNT(*), SUM(tr_fare) FROM trips, zones\n    WHERE tr_pickup = zn_id AND tr_row > 100 AND zn_radius > 1\n       OR tr_pickup = zn_id AND tr_row > 100 AND zn_city = 2\" ...\nAggregate COUNT(*), SUM(trips.tr_fare)\n  Join INNER build=right keys=[trips.tr_pickup = zones.zn_id]\n    Filter trips.tr_row > 100\n      Scan table=trips source=parquet(files=1, rows=3000) columns=[tr_row, tr_pickup, tr_fare]\n    Filter \"((zn_radius > 1) OR (zn_city = 2))\"\n      Compute ((zn_radius > 1) OR (zn_city = 2))\n        Scan table=zones source=parquet(files=1, rows=40) columns=[zn_id, zn_city, zn_radius]\n```\n\nBoth branches share the equality and `tr_row > 100`: the equality is the\nkey, the shared filter reaches trips' scan,\nand the remainder is computed on zones' branch. The same query with the\nsecond branch's equality written\n`zn_id = tr_pickup` still exits 4 — matching is structural, by design\n(below).\n\n## The rewrite\n\n`src/plan/or_factoring.{h,cc}`, a new translation unit private to the\nplan module, following the `join_order.h`\nprecedent; `Conjuncts` moves there from `binder.cc`.\n`Binder::BindElement` calls it per element, and `BindWhere`'s\ntwo loops call `BindElement`. Branches of a top-level `OR` chain are\nflattened, each branch split at its own `AND`\nchain, and a conjunct of the first branch is shared when every other\nbranch has one structurally equal to it\n(`sql::EqualIgnoringSpans`). `AND` distributes over `OR` in three-valued\nlogic, so the rewrite is exact.\n\nIt returns one ordered `std::vector<FactoredConjunct>`, each `{const\nsql::Expr* expr, bool bind_only}`, in the order\nthe conjuncts are written; `owned` keeps the expressions the rewrite\nbuilds alive, and `sql::Box` holds each value\nbehind a `unique_ptr`, so every returned pointer stays valid as `owned`\ngrows.\n\n**The drop rule is implemented as bind-then-drop**, which is the one\nplace this PR does not follow the ADR\nliterally. The ADR says that when a branch keeps nothing the `OR` \"is\ndropped\": `A OR (A AND Y)` is `A`. Taken\nliterally that deletes `Y` before it is ever bound, so a bind error\ninside it disappears and\n\n```sql\nWHERE id = 1 OR (id = 1 AND nope > 1)\n```\n\nwould answer instead of reporting that `nope` does not exist — against\nthe ADR's own rule that DuckDB's bind errors\nstay bind errors. Such an `OR` therefore comes back with `bind_only`\nset, and `BindElement` binds it with `BindBool`\npurely for its errors and discards the result. `BindBool` mints no\ncolumn id and appends to no member — its\n`column_of` carries operands inline — so nothing of the dropped `OR`\nreaches the plan, and it costs nothing at run\ntime. The `explain_or_absorbed` golden shows it reading the key's column\nalone:\n\n```text\n  Join INNER build=right keys=[trips.tr_pickup = zones.zn_id]\n    Scan table=trips source=parquet(files=1, rows=3000) columns=[tr_pickup]\n    Scan table=zones source=parquet(files=1, rows=40) columns=[zn_id]\n```\n\n## Limits, all deliberate and all tested\n\n- **One level only.** A branch's own nested `OR` is a conjunct of that\nbranch and is not descended into; a `NOT` is\none opaque conjunct; a plain `BETWEEN` is one conjunct, so two branches\nwith different bounds share no half of it.\n- **Matching is structural**, so `a.k = b.k` and `b.k = a.k` are\ndifferent conjuncts and nothing is shared.\n- **Every branch must share it** — two of three are not enough.\n- **`HAVING` is not factored** (pinned through EXPLAIN), and neither is\na `LEFT JOIN`'s `ON`. The ADR note added\nhere explains why the second is not merely \"LEFT JOIN is unsupported\": a\nLEFT JOIN's `ON` classifies conjuncts by\nother rules — one that reads only the preserved side is a residual\nthere, because a left row that fails it is\npadded and not dropped — so J6 must keep every hoisted conjunct inside\nthe `ON` and must never let rule 11 push\n  one below the join.\n\n## When a conjunct is computed: divergence D16, both directions\n\nHoisting changes **when** a conjunct is computed, which widens the reach\nof divergence **D16** rather than adding a\ndivergence. A hoisted conjunct is a `WHERE` conjunct of its own, whose\noperands antb1 computes for every row, so\n\n```sql\nSELECT COUNT(*) FROM edge WHERE id = 6 AND i16 * 2 > 1 OR id = 11 AND i16 * 2 > 1\n```\n\nnow fails with `Overflow in multiplication of SMALLINT` where the `OR`'s\nown argument order would have computed\n`i16 * 2` for one row only. This is not new ground: the result of the\nfactoring written by hand,\n`i16 * 2 > 1 AND (id = 6 OR id = 11)`, has always failed the same way on\nantb1, and DuckDB answers both because it\nreorders conjunctions by its cost model — exactly what D16 already\nrecords.\n\nIt cuts the other way too. A shared comparison that folds to never-true\ncomputes nothing once it is a conjunct of\nits own (**D14**), while inside the `OR` it keeps NULL for a NULL\noperand and so computes its operand, so\n`i16 + 1 > 40000 AND id = 6 OR i16 + 1 > 40000 AND id = 11` answers\nwhere the unfactored shape overflows.\n\n`docs/sql-subset.md`'s D16 row gains the first case; the ADR note covers\nboth. DuckDB's side of the second is left\nunasserted on purpose: it **answered** that query under the slt harness\nand **failed** it through its Python API,\nwhich is precisely D16's point about its cost model — I would rather\nrecord that than pin a number that depends on\nDuckDB's configuration.\n\n## What the review found\n\nI had a second Claude instance review the diff against AGENTS.md's\nreview rubric before opening this. It found two\nthings worth the second commit:\n\n1. **Error parity (fixed in `9939905`).** `BindElement` bound every\nabsorbed `OR` before any other conjunct, so an\nelement with both a failing conjunct and a later absorbed `OR` reported\nthe wrong error:\n`WHERE (nope1 = 1 AND (i16 = 1 OR i16 = 1 AND nope2 = 1))` named\n`nope2`. DuckDB names `nope1`, and so did antb1\nbefore the rewrite. Answers and exit codes were unaffected. The single\nordered return list fixes it.\n2. **The bind-then-drop path was untested.** Deleting the `BindBool`\ncall left the whole suite green — the exact\nregression the ADR rule forbids. Five cases now cover it, and I\nmutation-tested them: with that call removed,\nfour of the five fail (the fifth is the ordering case, whose error\nlegitimately comes from an earlier conjunct).\n\nIt also flagged two thin unit tests (absorption had no three-branch\ncase; the \"nothing shared\" test asserted only\nthat nothing was absorbed, so it would have passed on garbage) and the\nuntested `HAVING` limit. All three are now\nexact assertions. Its clean findings are worth recording too: it\nverified the Kleene algebra, `sql::Box` pointer\nstability across reallocation, that the synthesized spans cannot\nunderflow or escape the query text, that\n`BindBool` really does mutate no binder state, and that the ratchet and\ndoc tables agree.\n\n## Tests\n\n- `src/plan/tests/or_factoring_test.cc`, 9 cases on the rewrite alone,\nasserting canonical SQL via `sql::ToSql`:\nwhat every branch shares, three branches, the shared conjunct written\nmid-chain, absorption (two- and\nthree-branch), emission order, nothing shared, one-level-only (nested\n`OR`, `NOT`, `BETWEEN`), non-commutative\nmatching, a repeated conjunct shared once, pointer stability as the\nowning vector grows, and idempotence.\n- `plan.BinderTest.FactorsConjunctsSharedByEveryOrBranch`: key and no\nresidual; a cross-relation remainder as a\nresidual; the absorbed case as a bare `Scan` with no `Compute` above it;\nthe reversed-equality case still exiting\n4; single-relation pushdown; `HAVING` left alone; and the hoisted\nrelation's `Filter` span covering the whole\n`WHERE` element, which is the existing convention\n(`RelationLayersAndTheirSpans`) and not a change.\n- Five `BindErrorTest` cases for the dropped branch, mutation-tested as\ndescribed above.\n- `tests/slt/cases/joins/or_factoring.slt`, 24 records over the star and\nedge fixtures, expectations written by\n`pixi run slt-complete` from DuckDB. The cross-checks are the\ninteresting part: absorption gives the same count as\nthe plain inner join; the factored form over a NULL-bearing key gives\nthe same count as `A AND (X OR Y)` written by\nhand; and the single-relation pair agrees. Also three branches, an inner\n`ON`, a shared `LIKE`, a shared `DECIMAL`\ncomparison, a shared `BETWEEN`, a mostly-NULL remainder, two joins, a\n`GROUP BY` over the result, both D16\ndirections, and the two shapes the factoring does not reach (`onlyif\nduckdb`).\n- Two EXPLAIN goldens, `explain_or_factoring` and `explain_or_absorbed`\n(the second pins the column-list pruning,\n  which the binder does not do — the optimizer does).\n- The five ratchet sites move together, in the same commit as the\nbehaviour change, since the ratchet is two-sided:\n`tests/data/tpch_status.json`, `AGENTS.md`, `README.md` and two places\nin `docs/sql-subset.md`.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n\n## Verification\n\n```text\n$ pixi run ci\n100% tests passed out of 2509\n\n$ pixi run test -R 'tpch'\n100% tests passed out of 25\nTPCH: PASS queries=22 pass=[1, 3, 5, 6, 10, 12, 14, 19] unsupported=14 rejected=0 failed=0 ratchet=[1, 3, 5, 6, 10, 12, 14, 19]\n\n$ pixi run lint\nclang-format (C/C++).....................................................Passed\ngersemi (CMake)..........................................................Passed\nruff format / ruff check (Python).......................................Passed\nmarkdownlint-cli2 (Markdown).............................................Passed\ntypos (spelling).........................................................Passed\nactionlint (workflows)...................................................Passed\nzizmor --offline (GitHub Actions security)...............................Passed\ncheck_repo.py (repo drift and policy, R001-R015).........................Passed\nshellcheck (shell).......................................................Failed   <- pre-existing, not this PR\n```\n\nBeyond the gates, a throwaway differential test (not committed)\ngenerated 1200 random `(A AND X) OR (A AND Y)`\nshapes over the star fixtures — 2 or 3 branches, the shared conjuncts\nshuffled into random positions, keys with and\nwithout NULLs — and compared every answer with DuckDB:\n\n```text\n1200 queries: 949 agree, 251 unsupported (exit 4), 0 MISMATCH\n```\n\nThe 251 are the shapes whose branches share no equality, so no key\nconnects the graph: the correct rejection.\n\n`pixi run check` does **not** pass locally, for one reason that is not\nthis PR: `shellcheck` reports 34 `SC2218`\nfindings in `tools/github/apply-settings.sh`, a file this branch does\nnot touch and that is byte-identical to\n`origin/main` (`git diff origin/main -- tools/github/apply-settings.sh`\nis empty; unchanged since #1). The osx-arm64\nconda build of the pinned shellcheck 0.11.0 flags what the linux-64\nbuild of the same version does not, so\n`lint (pixi run lint)` is green on main in CI and fails on this Mac.\n`/tools/github/` is an \"Ask a human first\"\npath, so I have not touched it.\n\nNot run locally, all four for pre-existing osx-arm64 reasons verified on\n`main`: `asan` (a macOS `libdispatch` leak\nreport and one ASan deadlock), `tidy` (4 pre-existing `src/exec` TUs),\n`fuzz-smoke` (a libFuzzer `StartRssThread`\nleak report) and `ci-gcc` (linux-64 only by `pixi.toml`). As\ncompensation, clang-tidy ran on every TU this PR\nchanges, with the per-directory config, and is clean:\n\n```text\n$ clang-tidy -p build/tidy --warnings-as-errors='*' src/plan/or_factoring.cc src/plan/binder.cc \\\n    src/plan/tests/or_factoring_test.cc src/plan/tests/binder_test.cc\n(clean; two findings it first reported, modernize-use-emplace and\n performance-inefficient-vector-operation, are fixed in this PR)\n```\n\n## Checklist\n\n- [ ] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests) — see above: `ci` passes,\n`lint` fails only on the pre-existing `shellcheck` finding in a path\nthis PR does not touch\n- [x] Tests cover the change\n- [x] Docs updated where behavior, commands or architecture changed\n(`docs/sql-subset.md`, `docs/architecture.md`,\n      ADR 0022 update notes, `AGENTS.md`, `README.md`)\n- [x] No ClickBench-derived data is committed\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools. The ratchet\nsummary above is the harness's own redacted line — query numbers and\ncounts only\n- [ ] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer — **needs your sign-off**:\n`tests/data/tpch_status.json` (the ratchet), `AGENTS.md` (the 7→8 count)\nand\n`docs/adr/0022-joins-and-query-blocks.md` (five update notes under the\nexisting J3 bullet; no status change).\nAll were agreed in session before being written; flagging them here for\nthe record.\n\n## AI assistance\n\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5) wrote\nthe rewrite, the tests, the docs and this\ndescription, ran the verification above, and reviewed its own diff with\na second Claude instance given\nAGENTS.md's \"Code Review Rules\" as its rubric (whose two findings became\ncommit `9939905`). The\nbind-then-drop design for absorbed `OR`s was the maintainer's idea, not\nthe model's.\n- Accountable human (has read and understands the whole diff): @\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-10T22:07:07+03:00",
+          "tree_id": "94504c4092279bd569a9e221072f36ec48ab2ada",
+          "url": "https://github.com/ydb-campus/antb1/commit/0ce88de2436ea6ee815dca285dce381447fc0d2d"
+        },
+        "date": 1791659415048,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4996.7942865315135,
+            "unit": "ns/iter",
+            "extra": "iterations: 139845\ncpu: 4996.370181272123 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84693.60836896283,
+            "unit": "ns/iter",
+            "extra": "iterations: 7719\ncpu: 84667.9476616142 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222195.25095177066,
+            "unit": "ns/iter",
+            "extra": "iterations: 3152\ncpu: 222138.77887055842 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 444658.96827411954,
+            "unit": "ns/iter",
+            "extra": "iterations: 1576\ncpu: 444512.7493654821 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 347997.1663346586,
+            "unit": "ns/iter",
+            "extra": "iterations: 2008\ncpu: 347946.1050796809 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2082601.4494047686,
+            "unit": "ns/iter",
+            "extra": "iterations: 336\ncpu: 2082342.3541666684 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 51.69388253846181,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 51.68524192307697 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 45.246480437500125,
+            "unit": "ms/iter",
+            "extra": "iterations: 16\ncpu: 45.23717418750001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 203.27168933332965,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 203.2534046666665 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.328921551020697,
+            "unit": "ms/iter",
+            "extra": "iterations: 49\ncpu: 14.327634244897954 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 21.816976687500045,
+            "unit": "ms/iter",
+            "extra": "iterations: 32\ncpu: 21.811929499999994 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 38.95230716666573,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 38.941456111111194 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.7213042783251256,
+            "unit": "ms/iter",
+            "extra": "iterations: 406\ncpu: 1.7210691773398996 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 111.24911449999786,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 111.23882300000018 ms\nthreads: 1"
           }
         ]
       }
