@@ -1,7 +1,7 @@
 # AGENTS.md: antb1
 antb1 is an experimental C++23 analytics engine: SQL-like queries over local Parquet files, built on Apache Arrow C++
-25 (conda-forge). Namespace `antb1`, CLI `antb1`. It runs global aggregates (COUNT, SUM, AVG, MIN, MAX), projections,
-`WHERE col <op> literal [AND ...]` and `LIMIT` (ClickBench Q0-Q3, Q6). This file is the canonical guide for every
+25 (conda-forge). Namespace `antb1`, CLI `antb1`. It answers global and grouped aggregates, expressions, sorting,
+top-N and inner joins: all 43 ClickBench queries, 7 of 22 from TPC-H. This file is the canonical guide for every
 agent. Maps: [architecture](docs/architecture.md) · [SQL subset](docs/sql-subset.md) · [testing](docs/testing.md) ·
 [CI](docs/ci.md) · [benchmarks](docs/benchmarks.md) · [ADRs](docs/adr/README.md) · [contributing](CONTRIBUTING.md).
 ## Golden rules
@@ -104,7 +104,7 @@ Every CI job name contains the command that reproduces it (docs/ci.md). SQL cont
   does not need to be up to date with main (update it only on conflicts). AI reviews are advisory and never approve.
 
 ## Ask a human first
-Do not change these paths without a maintainer's approval (CODEOWNERS covers the same set); describe the change you need
+Do not change these paths without approval (CODEOWNERS adds `/pixi.lock` and `/docs/adr/`); describe what you need
 instead: `/.github/`, `/.githooks/`, `/.claude/`, `/.agents/`, `/AGENTS.md`, `/CLAUDE.md`, `/pixi.toml`,
 `/CMakePresets.json`, `/cmake/`, `/tools/github/`, `/tools/lint/`, `/tools/data/`, `/tools/sanitizers/`,
 `/tools/ci/coverage_thresholds.json`, `/.pre-commit-config.yaml`, `/.clang-format`, `/.clang-tidy`,

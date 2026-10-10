@@ -15,8 +15,9 @@ docs/testing.md are the rules; read them first.
   (extra libraries under `LIBS`, e.g. `Parquet::parquet_shared` to write fixtures). Test names become
   `<module>.<Suite>.<Case>` with label `unit`.
 - Tests of `common` and `sql` stay Arrow-free. Other modules may use Arrow and Parquet to build fixtures.
-- Cross-module suites and SQL logic tests (`.slt`, expectations from DuckDB) arrive with the test-harness PR; until
-  then, cover SQL behavior with unit tests in `sql`, `plan`, `exec` and `engine` (see `src/engine/tests/`).
+- Cross-module suites live in `tests/integration/` and SQL logic tests in `tests/slt/cases/<area>/*.slt`, whose
+  expected blocks DuckDB writes (`pixi run slt-complete`, skill `write-slt-test`); the unit tests here cover
+  module-level behavior, including error paths the `.slt` files cannot reach.
 
 ## Rules
 

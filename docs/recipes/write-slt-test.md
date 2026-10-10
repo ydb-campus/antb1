@@ -4,18 +4,13 @@ SQL logic tests pin down what antb1 answers for a query, with expected results w
 ([ADR 0006](../adr/0006-test-strategy-and-data-policy.md)). The skill `.agents/skills/write-slt-test/SKILL.md` is
 the short version.
 
-## Status: the runner arrives with the test-harness PR
+## Status: the harness is in use
 
-The sqllogictest runner, the fixture tables and the task that completes expectations with DuckDB are added by the
-test-harness PR; [testing.md](../testing.md#test-layers) lists the layer as planned and the ctest labels `slt` and
-`oracle` as reserved. Until that PR has landed (there is no tests/slt directory yet):
+The sqllogictest runner (`antb1-slt`, `tests/slt/runner/`), the fixture tables (`tests/slt/tables.txt`) and the task
+that completes expectations with DuckDB (`pixi run slt-complete`) are all in place;
+[testing.md](../testing.md#test-layers) lists the layer and the ctest labels `slt` and `oracle` as in use.
 
-- cover SQL behavior with unit tests in `src/sql/tests/`, `src/plan/tests/`, `src/exec/tests/` and
-  `src/engine/tests/` (the Claude Code `test-author` subagent writes them);
-- say in the PR description that the SQL logic tests follow with the harness.
-
-The rest of this recipe describes the workflow the harness implements. Where it names a command that does not exist
-yet, it describes it in words; use the exact task name from the AGENTS.md command table once the harness is merged.
+The rest of this recipe describes that workflow.
 
 ## How the harness works
 
@@ -52,7 +47,7 @@ SELECT a, b, COUNT(*) FROM t GROUP BY a
   `harness.slt.pending` checks that antb1 still answers it with Unsupported until that PR removes the guard.
   `onlyif duckdb` guards SQL that no roadmap PR answers ([tests/slt/README.md](../../tests/slt/README.md#current-support-is-the-contract)).
 
-## Steps (after the harness PR)
+## Steps
 
 1. Pick the area file for the feature, or add one for a new area. Prefer several small records, each with a comment
    that says what it checks, to one big query.
