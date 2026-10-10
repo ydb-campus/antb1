@@ -1,0 +1,208 @@
+# Factoring the conjuncts every branch of an OR shares, over the star schema (tools/fixturegen/star.h, ADR 0022's
+# "OR factoring (J3)"): `(A AND X) OR (A AND Y)` is `A AND (X OR Y)`, so a shared equality becomes a join key and a
+# shared single-relation conjunct reaches its scan. The rewrite adds no syntax -- OR in a condition is
+# kBooleanExpressions, which antb1 already answers -- it widens which join graphs connect, so these records are
+# queries that exited 4 before it. The results are DuckDB's, as always: the rewrite must change plans and nothing
+# else, NULL keys and three-valued logic included.
+
+# ---- a shared equality is the join key ----
+
+# The remainder reads only zones, so it filters zones' own branch below the join.
+query I nosort
+SELECT COUNT(*) FROM trips, zones WHERE tr_pickup = zn_id AND zn_radius > 1 OR tr_pickup = zn_id AND zn_city = 2
+----
+2165
+
+# Three branches, and the shared equality written last in one of them.
+query I nosort
+SELECT COUNT(*) FROM trips, zones
+WHERE tr_pickup = zn_id AND zn_city = 1 OR tr_pickup = zn_id AND zn_city = 2 OR zn_city = 3 AND tr_pickup = zn_id
+----
+1608
+
+# A remainder that reads both relations is a residual of the join, evaluated per candidate pair.
+query I nosort
+SELECT COUNT(*) FROM trips, zones WHERE tr_pickup = zn_id AND tr_row < 100 OR tr_pickup = zn_id AND zn_radius > 3
+----
+296
+
+# A branch of only shared conjuncts makes the OR true wherever they hold, so the equality is the whole condition:
+# the same count as the plain inner join of the two tables.
+query I nosort
+SELECT COUNT(*) FROM trips, zones WHERE tr_pickup = zn_id OR tr_pickup = zn_id AND zn_radius > 1
+----
+2793
+
+query I nosort
+SELECT COUNT(*) FROM trips, zones WHERE tr_pickup = zn_id
+----
+2793
+
+# An inner ON is factored exactly as a WHERE is.
+query I nosort
+SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id AND zn_radius > 1 OR tr_pickup = zn_id AND zn_city = 2
+----
+2165
+
+# ---- what else the branches share ----
+
+# The equality and a single-relation conjunct on each side: all three are hoisted, so trips keeps its own and
+# zones keeps its own, each below the join.
+query I nosort
+SELECT COUNT(*) FROM trips, zones
+WHERE tr_pickup = zn_id AND tr_row > 100 AND zn_radius > 1 OR tr_pickup = zn_id AND tr_row > 100 AND zn_city = 2
+----
+2093
+
+# A LIKE only one branch writes stays in the remainder, computed on zones' branch with the rest of it.
+query I nosort
+SELECT COUNT(*) FROM trips, zones WHERE tr_pickup = zn_id AND label LIKE 'a%' OR tr_pickup = zn_id AND zn_city = 2
+----
+838
+
+# A LIKE both branches write is shared like any other conjunct.
+query I nosort
+SELECT COUNT(*) FROM trips, zones
+WHERE tr_pickup = zn_id AND label LIKE 'a%' AND zn_city = 2 OR tr_pickup = zn_id AND label LIKE 'a%' AND zn_city = 3
+----
+140
+
+# A DECIMAL comparison, shared: it reads trips alone, so it reaches trips' branch and not the join.
+query I nosort
+SELECT COUNT(*) FROM trips, zones
+WHERE tr_pickup = zn_id AND tr_fare > 20.50 AND zn_radius > 1 OR tr_pickup = zn_id AND tr_fare > 20.50 AND zn_city = 2
+----
+603
+
+# A BETWEEN is one conjunct, shared when both branches write the same bounds.
+query I nosort
+SELECT COUNT(*) FROM trips, zones
+WHERE tr_pickup = zn_id AND tr_row BETWEEN 10 AND 90 AND zn_city = 2
+   OR tr_pickup = zn_id AND tr_row BETWEEN 10 AND 90 AND zn_city = 3
+----
+28
+
+# ---- NULL keys and three-valued logic ----
+
+# tr_dropoff has NULL keys and zones has none of 0: a NULL key matches no row, in either branch, and the rewrite
+# must not change that. `(A AND X) OR (A AND Y)` is `A AND (X OR Y)` in Kleene logic too, so the counts are equal.
+query I nosort
+SELECT COUNT(*) FROM trips, zones WHERE tr_dropoff = zn_id AND zn_radius > 1 OR tr_dropoff = zn_id AND zn_city = 2
+----
+2189
+
+query I nosort
+SELECT COUNT(*) FROM trips, zones WHERE tr_dropoff = zn_id AND (zn_radius > 1 OR zn_city = 2)
+----
+2189
+
+# A remainder over a column that is almost always NULL: tr_promo is set for 60 trips, so `tr_promo > 2` is NULL
+# for nearly every pair and the other branch's condition decides it, as Kleene OR says it must. COUNT(tr_promo)
+# over the survivors shows how few of them carry a promo at all.
+query II nosort
+SELECT COUNT(*), COUNT(tr_promo) FROM trips, zones
+WHERE tr_pickup = zn_id AND tr_promo > 2 OR tr_pickup = zn_id AND zn_city = 2
+----
+580	32
+
+# ---- several relations, and grouping over the result ----
+
+# Two joins, both keys shared by both branches.
+query I nosort
+SELECT COUNT(*) FROM trips, zones, cities
+WHERE tr_pickup = zn_id AND zn_city = ct_id AND zn_radius > 1 OR tr_pickup = zn_id AND zn_city = ct_id AND ct_id = 2
+----
+2165
+
+query IID rowsort
+SELECT zn_city, COUNT(*), SUM(tr_fare) FROM trips, zones
+WHERE tr_pickup = zn_id AND zn_radius > 1 OR tr_pickup = zn_id AND zn_city = 2
+GROUP BY zn_city
+----
+1	419	6279.25
+2	559	8432.75
+3	350	5211.50
+4	419	6249.00
+5	418	6225.00
+
+# ---- one relation: the shared conjunct reaches the scan ----
+
+# No join here; the rewrite still hoists tr_row > 100 out of the OR, where it becomes a predicate of the scan
+# instead of part of a computed condition. Only the plan changes.
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_row > 100 AND tr_rate = 1.50 OR tr_row > 100 AND tr_rate = 2.25
+----
+666
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_row > 100 AND (tr_rate = 1.50 OR tr_rate = 2.25)
+----
+666
+
+# A NOT is one opaque conjunct: nothing is shared with the bare equality, and the answer is unchanged.
+query I nosort
+SELECT COUNT(*) FROM trips WHERE NOT (tr_row > 100 AND tr_rate = 1.50) OR tr_row > 100 AND tr_rate = 2.25
+----
+2441
+
+# ---- what hoisting a conjunct changes about when it is computed: divergence D16 ----
+
+# Hoisting makes a shared conjunct a WHERE conjunct of its own, and antb1 computes a WHERE conjunct's operands for
+# every row (docs/sql-subset.md, divergence D16), so `i16 * 2` now overflows on edge's -32768 -- a row the OR's
+# own argument order would never have computed it for, both branches testing `id` first. Writing the result of the
+# factoring by hand, `i16 * 2 > 1 AND (id = 6 OR id = 11)`, fails on antb1 just the same: D16 already said this,
+# and the factoring only brings more queries to it.
+onlyif antb1
+statement error Overflow in multiplication of SMALLINT
+SELECT COUNT(*) FROM edge WHERE id = 6 AND i16 * 2 > 1 OR id = 11 AND i16 * 2 > 1
+
+onlyif antb1
+statement error Overflow in multiplication of SMALLINT
+SELECT COUNT(*) FROM edge WHERE i16 * 2 > 1 AND (id = 6 OR id = 11)
+
+# DuckDB reorders conjunctions by its cost model, tests `id` first and answers.
+onlyif duckdb
+query I nosort
+SELECT COUNT(*) FROM edge WHERE id = 6 AND i16 * 2 > 1 OR id = 11 AND i16 * 2 > 1
+----
+2
+
+# Nothing shared, so nothing is hoisted and both engines answer: the OR's arguments are computed in the order
+# written, each only for the rows the earlier ones left undecided, so `i16 * 2` is computed for `id = 6`'s row only.
+query I nosort
+SELECT COUNT(*) FROM edge WHERE id = 6 AND i16 * 2 > 1 OR id = 11 AND i16 + i16 > 1
+----
+2
+
+# Hoisting can also take an overflow away. A comparison that folds to never-true computes nothing once it is a
+# conjunct of its own (divergence D14), so the shared `i16 + 1 > 40000` answers below; left inside the OR (nothing
+# shared here, the second branch adding a term) a folded comparison keeps NULL for a NULL operand, so its operand
+# is computed and 32767 + 1 overflows SMALLINT. antb1 only: whether DuckDB reaches the overflow is its cost model's
+# choice, and it answers this one here while failing it through other interfaces -- which is D16 itself.
+onlyif antb1
+statement error Overflow in addition of SMALLINT
+SELECT COUNT(*) FROM edge WHERE i16 + 1 > 40000 AND id = 6 OR i16 + i16 + 1 > 40000 AND id = 11
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i16 + 1 > 40000 AND id = 6 OR i16 + 1 > 40000 AND id = 11
+----
+0
+
+# ---- DuckDB only: what the factoring does not reach ----
+
+# Matching is structural, not commutative (docs/sql-subset.md): `zn_id = tr_pickup` is not the conjunct
+# `tr_pickup = zn_id`, so these branches share nothing, no key connects the graph and antb1 exits 4.
+onlyif duckdb
+query I nosort
+SELECT COUNT(*) FROM trips, zones WHERE tr_pickup = zn_id AND zn_radius > 1 OR zn_id = tr_pickup AND zn_city = 2
+----
+2165
+
+# Every branch must share it: two of these three write the equality and the third does not, so nothing is hoisted
+# and the graph stays disconnected -- even though the third branch alone can never be true here.
+onlyif duckdb
+query I nosort
+SELECT COUNT(*) FROM trips, zones
+WHERE tr_pickup = zn_id AND zn_city = 2 OR tr_pickup = zn_id AND zn_city = 3 OR zn_radius > 99
+----
+1049

@@ -266,6 +266,35 @@ Proposed
   dropped: `A OR (A AND Y)` is `A`. A shared equality then becomes a key, a shared single-binding conjunct reaches
   its scan, and what is left of the OR is classified like any other conjunct: a residual when it reads several
   relations. Filters implied by an OR (each binding's conjuncts from every branch, OR-ed) are deferred.
+  - Update (2026-10-10, J3): shipped as `src/plan/or_factoring.h`, called per element of `WHERE` and of an inner
+    `ON`; `HAVING` is not factored. Q19 passes, so the TPC-H-derived ratchet moves to 8 of 22.
+  - Update (2026-10-10, J3): the drop rule above is implemented as bind-then-drop, not as a plain drop. Taken
+    literally, dropping `A OR (A AND Y)` down to `A` deletes `Y` before it is ever bound, so a bind error inside it
+    disappears and `WHERE id = 1 OR (id = 1 AND nope > 1)` would answer instead of reporting that `nope` does not
+    exist — against this ADR's own rule that DuckDB's bind errors stay bind errors. The rewrite therefore hands such
+    an OR back separately and the binder binds it for its errors alone, discarding the result: `BindBool` mints no
+    column id and appends to no member, so nothing of the dropped OR reaches the plan or costs anything at run time.
+  - Update (2026-10-10, J3): one level only, as the scope above implies but did not say. A branch's own nested `OR`
+    is a conjunct of that branch and is not descended into, a `NOT` is one opaque conjunct, and a plain `BETWEEN` is
+    one conjunct, so two branches with different bounds share no half of it. Matching stays literal: `a.k = b.k` and
+    `b.k = a.k` are different conjuncts, so that query still exits 4, and every branch must share a conjunct for it
+    to be hoisted — two of three are not enough.
+  - Update (2026-10-10, J3): hoisting changes when a conjunct is computed, which widens the reach of divergence D16
+    rather than adding a divergence. A hoisted conjunct is a `WHERE` conjunct of its own, whose operands antb1
+    computes for every row, so `id = 6 AND i16 * 2 > 1 OR id = 11 AND i16 * 2 > 1` fails on an overflow that the
+    `OR`'s own argument order would not have reached; the result of the factoring written by hand,
+    `i16 * 2 > 1 AND (id = 6 OR id = 11)`, has always failed the same way, and DuckDB answers both. It cuts the
+    other way too: a shared comparison that folds to never-true computes nothing once it is a conjunct of its own
+    (D14), while inside the `OR` it keeps NULL for a NULL operand and so computes its operand, so
+    `i16 + 1 > 40000 AND id = 6 OR i16 + 1 > 40000 AND id = 11` answers where the unfactored shape overflows.
+    Both directions are pinned in `tests/slt/cases/joins/or_factoring.slt`, the second for antb1 only: whether
+    DuckDB reaches such an overflow is its cost model's choice, and it was observed to answer under the test
+    harness and to fail through its Python API on the same query — which is what D16 records.
+  - Update (2026-10-10, J3): a warning for J6. A LEFT JOIN's ON classifies conjuncts by other rules — one that
+    reads only the preserved side is a residual there, because a left row that fails it is padded and not dropped —
+    so factoring a LEFT JOIN's ON must keep every hoisted conjunct inside the ON and must never let rule 11 push one
+    that reads the preserved side below the join. Factoring is restricted to `WHERE` and inner `ON` for that reason,
+    not only because LEFT JOIN is still unsupported.
 - **Connected join graphs only.** The relations of an inner block are the nodes of its join graph and its keys are
   the edges; residuals connect nothing.
   - The binder rejects a disconnected graph with exit code 4, whether the cross product is written with a comma or

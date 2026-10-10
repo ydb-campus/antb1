@@ -109,9 +109,11 @@ steps (only step 7 uses more than one thread):
    a path's file name — and its columns' ids, types and FLOAT flags). Columns resolve there, an `ON` seeing only its
    own join group and the comma siblings before it ([ADR 0022](adr/0022-joins-and-query-blocks.md) rule 10); types
    are checked, and every `WHERE` literal is folded exactly into its column's type
-   ([Binding](sql-subset.md#binding)). Each conjunct of `WHERE` and of an `ON` then goes to the relations it reads:
-   one relation filters that relation's own branch, a cross-relation equality whose sides share one key type (each
-   side cast to it on its own branch where it must be) becomes a join key, and anything else over two or more
+   ([Binding](sql-subset.md#binding)). Each element of `WHERE` and of an inner `ON` first gives up the conjuncts
+   every branch of a top-level `OR` shares, `(A AND X) OR (A AND Y)` becoming `A AND (X OR Y)` one level deep
+   (`src/plan/or_factoring.h`), so that an `OR` can connect a join graph. Each conjunct then goes to the relations it
+   reads: one relation filters that relation's own branch, a cross-relation equality whose sides share one key type
+   (each side cast to it on its own branch where it must be) becomes a join key, and anything else over two or more
    relations becomes a join's residual. A join graph no key connects is a cross product, `kUnsupported`; otherwise
    the relations join left-deep in the order the footer row counts, integer ranges and distinct-count hints choose
    (`src/plan/join_order.h`), each join building on the relation it adds. `HAVING` binds the same way against the

@@ -9,8 +9,8 @@ Early and experimental. A specified subset of `SELECT` works: global and grouped
 `BETWEEN`, combined with `AND`, `OR` and `NOT`), `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT` and `OFFSET`, arithmetic,
 `CASE`, DECIMAL and the date and timestamp functions, over one table of Parquet files or several joined by inner
 joins, run in parallel over row groups with filter pushdown and late materialization, with DuckDB as the test
-oracle. It answers all 43 ClickBench queries like DuckDB, and 7 of the 22 queries derived from TPC-H (Q1, Q3, Q5,
-Q6, Q10, Q12 and Q14).
+oracle. It answers all 43 ClickBench queries like DuckDB, and 8 of the 22 queries derived from TPC-H (Q1, Q3, Q5,
+Q6, Q10, Q12, Q14 and Q19).
 [docs/sql-subset.md](docs/sql-subset.md) lists exactly what works today.
 
 ## Quickstart
