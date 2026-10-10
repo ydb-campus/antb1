@@ -26,6 +26,8 @@ pixi run bench --benchmark_repetitions=5 --benchmark_report_aggregates_only=true
 | `BM_NotEqualTrueCount` | `COUNT(*) ... WHERE x <> 0`: Arrow's `not_equal` kernel and the true count of the selection |
 | `BM_Int128AvgAccumulate` | `AVG` over a BIGINT column: exact 128-bit accumulation, one division at the end |
 | `BM_ScanColumn` | decoding one SMALLINT column of a Parquet file through `io::ParquetTable::Scan` in 64Ki-row batches |
+| `BM_StringFilterAfterScan` | `io::ParquetTable::ScanPart` of a VARCHAR column, then the substring filter over the decoded `BinaryArray` |
+| `BM_StringFilterInScan` | the same filter pushed into the scan as a `plan::ScanFilter`, matched on views into the decoded pages (ADR 0020) |
 | `BM_SortRows` | `ORDER BY` a random BIGINT over 1Mi rows with a VARCHAR payload, no `LIMIT`: a full sort and the gather of its output (`exec::SortOperator`) |
 | `BM_TopNRows` | the same with `LIMIT 10`: the top-N path, which keeps only the best rows while it reads |
 | `BM_JoinTableBuild` | building a join hash table (`exec::JoinTableBuilder`, no executor) of 1Mi rows with a BIGINT key and a BIGINT payload in 16 parts: `/0` dense keys (the direct layout), `/1` random keys (the hashed layout); the `direct` counter shows the layout |

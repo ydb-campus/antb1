@@ -74,6 +74,8 @@ Accepted
     every expression, so they are never read as aliases either.
   - `sql::ToSql` prints every alias quoted after `AS`, `JOIN` as `INNER JOIN`, `LEFT OUTER JOIN` as `LEFT JOIN` and
     qualifiers as written. Copying, comparing, printing and destroying the list are loops, never recursions.
+  - Update (2026-10-10, roadmap PR J2b): the binder answers commas, `CROSS JOIN`, `[INNER] JOIN ... ON`, table
+    aliases and qualified names; only `LEFT [OUTER] JOIN ... ON` is still rejected with `kUnsupported`, until J6.
 - Update (derived tables and WITH lists, 2026-10-09, roadmap PR S4a): a query is an optional WITH list and a block, and
   a derived table and each CTE hold a query of their own (a `sql::SelectStatement` in a heap box), so the AST nests
   statements. Every walk of it (copying, comparing, printing, `sql::Depth`, destruction) recurses once per nested

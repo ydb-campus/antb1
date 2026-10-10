@@ -51,4 +51,6 @@ Accepted (with the maintainer-approved plan for GROUP BY, ORDER BY and COUNT(DIS
 - High-cardinality groupings (for example by a user id over the full ClickBench dataset) use memory proportional to
   the number of groups; this is measured, not bounded.
 - `HAVING`, expressions as keys, `GROUP BY` positions and `ALL`, and `GROUPING SETS` stay outside the subset.
-  (Later PRs added `GROUP BY` positions and `HAVING`, a `Filter` over the aggregation below the `Sort`.)
+  (Later PRs added `GROUP BY` positions and `HAVING`, a `Filter` over the aggregation below the `Sort`, and
+  expressions as keys with the scalar expressions of [ADR 0012](0012-scalar-expressions.md); `GROUP BY ALL` and
+  `GROUPING SETS` are still rejected by the parser.)

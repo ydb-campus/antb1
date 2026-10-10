@@ -513,7 +513,8 @@ it reads, so one relation's conjuncts filter that relation's own branch, a cross
 share one key type is a key of their join (each side cast to that type on its own branch, an exact widening, and an
 equality spelled twice is one key), and anything else over two or more relations is the residual of the first join
 that has all of them. A join graph no key connects is a cross product: exit code 4, naming the item nothing connects.
-The relations then join left-deep, greedily, from footer row counts and distinct-count hints only: the relation with
+The relations then join left-deep, greedily, from footer metadata only (row counts, and each key's domain from the
+parts' integer ranges capped at their non-NULL rows, else their distinct-count hints): the relation with
 the most rows (an unknown count counts as the most) is probed first, then the connected relation with the smallest
 estimate joins next, with every edge to the relations already joined as a key, so the edge that closes a cycle
 becomes a second key. Every join builds on the relation it adds. Because the order reads metadata alone, a plan does
