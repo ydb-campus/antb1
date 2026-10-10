@@ -1,18 +1,18 @@
 ---
 name: write-slt-test
-description: Write SQL logic tests (sqllogictest .slt files) for antb1 whose expected results come from DuckDB, never by hand. Use when adding or changing SQL behavior tests, or when an .slt expectation or oracle test fails. The runner arrives with the test-harness PR; until then SQL behavior is covered by unit tests.
+description: Write SQL logic tests (sqllogictest .slt files) for antb1 whose expected results come from DuckDB, never by hand. Use when adding or changing SQL behavior tests, or when an .slt expectation or oracle test fails.
 ---
 
 # Write a SQL logic test
 
 Step-by-step details and a worked example: [docs/recipes/write-slt-test.md](../../../docs/recipes/write-slt-test.md).
 
-## First check that the harness exists
+## The harness
 
-The sqllogictest runner, its fixture tables and the task that completes expectations with DuckDB are added by the
-test-harness PR ([docs/testing.md](../../../docs/testing.md#test-layers) lists the layer as planned). If the
-repository has no tests/slt directory yet, cover the behavior with unit tests instead (the Claude Code
-`test-author` subagent does that) and say in the PR that the SQL logic tests follow with the harness.
+The sqllogictest runner (`tests/slt/runner`, binary `antb1-slt`), its fixture tables (`tests/slt/tables.txt`) and
+`pixi run slt-complete`, which writes the expected blocks from DuckDB, are all in the repository; the cases live in
+`tests/slt/cases/<area>/*.slt` and run under the ctest labels `slt` (antb1) and `oracle` (DuckDB)
+([docs/testing.md](../../../docs/testing.md#test-layers)).
 
 ## Rules
 
@@ -26,7 +26,7 @@ repository has no tests/slt directory yet, cover the behavior with unit tests in
 - If a step needs an "Ask a human first" path (AGENTS.md), for example a new pixi task, a CMake preset or a
   ratchet (ClickBench or TPC-H-derived): stop and hand off with the exact change (file, diff, reason) for a maintainer.
 
-## Workflow (after the harness PR)
+## Workflow
 
 1. Pick the area file for the feature (one file per feature area, several small records rather than one big one).
 2. Write records in standard sqllogictest form: `statement ok` or `statement error <regex>`, and

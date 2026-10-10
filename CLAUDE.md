@@ -22,9 +22,11 @@ task) and never block, except the Stop hook below.
 
 ## Permissions
 
-- Pre-approved: the named tasks of the AGENTS.md command table (except `pixi run install-git-hooks`, which prompts),
-  `pixi install --locked`, read-only git and gh, and `git add` and `git commit`. Never widen this to `pixi run *`
-  (in personal settings too): `pixi run` executes any command, so a wildcard would bypass every other rule.
+- Pre-approved: the named tasks of the AGENTS.md command table except `pixi run bench`,
+  `pixi run bench-clickbench` and `pixi run install-git-hooks`, which prompt; `pixi install --locked`, read-only
+  git and gh, plus `git switch` (its `-f`, `--force` and `--discard-changes` forms prompt), `git fetch origin`,
+  `git add` and `git commit`. Never widen this to `pixi run *` (in personal settings too): `pixi run` executes any
+  command, so a wildcard would bypass every other rule.
 - Ask (you are prompted): dependency changes (`pixi add`, `pixi remove`, `pixi update`, `pixi upgrade`, `pixi lock`),
   `pixi run -x`, `pixi exec`, `git push`, `gh pr create`, `gh pr merge`, and editing any path listed under
   "Ask a human first" in AGENTS.md. A `pixi run` command with a single quote inside double quotes prompts too: pixi

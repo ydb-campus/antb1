@@ -33,8 +33,8 @@ Step-by-step details, file map and examples: [docs/recipes/add-sql-feature.md](.
 6. Execution, `src/exec/`: the operator or aggregate state. Test NULLs, empty input, several batches, overflow
    and selection masks in `src/exec/tests/`.
 7. Engine and CLI: `src/engine/` (session, formatter) and `src/cli/` (flags, exit codes), with tests.
-8. SQL logic tests: once the test-harness PR has landed, add `.slt` cases whose expectations DuckDB writes (skill
-   write-slt-test). Until then the unit tests above carry the coverage.
+8. SQL logic tests: add `.slt` cases in `tests/slt/cases/<area>/` whose expectations `pixi run slt-complete` writes
+   from DuckDB (skill write-slt-test), and declare the feature in `tests/slt/supported_features.h` in the same PR.
 9. ClickBench and the queries derived from TPC-H: a feature that changes which queries pass also changes that ratchet
    and its docs status table in the same PR. Ratchets are protected: hand off with the exact change (for ClickBench,
    skill clickbench-data). Never write TPC-H query text or fragments of it into a test or a doc; refer to the queries

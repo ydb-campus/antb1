@@ -21,9 +21,9 @@ and the "Data policy" section of [testing.md](../testing.md#data-policy); the sk
 
 - Outside the repository, in `~/.cache/antb1/clickbench` by default (set `ANTB1_DATA_DIR` to change it).
   `pixi run doctor` shows whether `hits_0.parquet` (the first partition, about 122 MB) is present.
-- The pinned download task, the redacted data tests (ctest label `data`) and the CI job that runs them on
-  `hits_0.parquet` are added by a later PR. Until then there is no supported download: do not add one to code,
-  scripts or tests. A human can place a copy of the partition in the data directory by hand.
+- `pixi run fetch-data` downloads the pinned files (`tools/data/clickbench.lock`) into the data directory,
+  `pixi run test-data` runs the redacted data tests (ctest label `data`), and the CI job `clickbench-hits0` runs
+  them on `hits_0.parquet`. Never add another download path to code, scripts or tests.
 - The full dataset (100 partitions, about 14 GB) is for local host runs only, never CI.
 
 ## Agents and the data
@@ -41,7 +41,7 @@ Agents never look at the data. That keeps its values out of prompts, transcripts
 
 - Ask a human to run unredacted comparisons on their machine when you need details of a mismatch.
 
-## Redacted data tests (after the data-test PR)
+## Redacted data tests
 
 - Every data test runs redacted. A mismatch prints only the query number or our own file and line, column names and
   types, the row count on each side, the first differing row index and a hash of each engine's result, plus the

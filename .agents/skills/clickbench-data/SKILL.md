@@ -25,8 +25,9 @@ Policy: [ADR 0006](../../../docs/adr/0006-test-strategy-and-data-policy.md).
 
 - The data lives outside the repository, by default in `~/.cache/antb1/clickbench` (override: `ANTB1_DATA_DIR`).
   `pixi run doctor` shows whether `hits_0.parquet` is there.
-- The pinned download task and the data tests (ctest label `data`, always redacted) arrive in a later PR; until then
-  do not download the data from code, scripts or tests. A human may place a copy there by hand.
+- `pixi run fetch-data` downloads the pinned files (`tools/data/clickbench.lock`, sha256-verified) into that
+  directory, and `pixi run test-data` runs the redacted data tests (ctest label `data`, CI job `clickbench-hits0`);
+  `pixi run asan-data` repeats them under ASan. No other code, script or test may download the data.
 - Agents never look at the data: do not print rows or query results over it and do not write ClickBench query text
   into files. Run your own queries and discard stdout, so only the exit code, errors and timing remain:
   `pixi run antb1 query --clickbench -f my.sql --table hits=<file> --timing >/dev/null`.

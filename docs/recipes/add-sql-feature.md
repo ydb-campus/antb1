@@ -91,8 +91,8 @@ at one layer.
 
 ## 7. SQL logic tests and the ratchets
 
-- After the test-harness PR, add `.slt` cases for the feature ([write-slt-test](write-slt-test.md)); DuckDB writes
-  the expected results.
+- Add `.slt` cases for the feature ([write-slt-test](write-slt-test.md)); `pixi run slt-complete` writes the
+  expected results from DuckDB.
 - If the feature changes which ClickBench queries pass, follow [clickbench-data](clickbench-data.md): the ratchet
   and the status table in sql-subset.md change together, and the ratchet needs a maintainer.
 - The queries derived from TPC-H work the same way: `tests/data/tpch_status.json` and the "Queries derived from
