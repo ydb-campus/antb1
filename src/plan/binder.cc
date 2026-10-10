@@ -3657,14 +3657,13 @@ arrow::Status Binder::BindAcrossRelations(const sql::Expr& conjunct,
 }
 
 BoundColumn Binder::JoinKeyColumn(std::size_t r, const ExprPtr& side, LogicalType type) {
-  if (side->type == type) {
-    if (const auto* column = std::get_if<ColumnExpr>(&side->node);
-        column != nullptr && scope_.Find(column->id).has_value()) {
-      const ColumnLocation location = *scope_.Find(column->id);
+  if (const auto* column = side->type == type ? std::get_if<ColumnExpr>(&side->node) : nullptr;
+      column != nullptr) {
+    if (const std::optional<ColumnLocation> location = scope_.Find(column->id)) {
       return BoundColumn{.id = column->id,
-                         .name = scope_.column(location).name,
+                         .name = scope_.column(*location).name,
                          .type = type,
-                         .qualifier = scope_.Qualifier(location.binding)};
+                         .qualifier = scope_.Qualifier(location->binding)};
     }
   }
   // Anything else is computed on the relation's own branch, below its join: the side itself, or its
