@@ -103,7 +103,7 @@ SELECT COUNT(*) FROM busy
 ----
 63
 
-# A derived table joined with a table (roadmap PR J2b).
+# A derived table joined with a table.
 pending J4
 query II rowsort
 SELECT zn_city, SUM(n) FROM (SELECT tr_pickup, COUNT(*) AS n FROM trips GROUP BY tr_pickup) AS p JOIN zones ON p.tr_pickup = zn_id
@@ -117,7 +117,7 @@ GROUP BY zn_city
 9	69
 NULL	69
 
-# A CTE referenced twice, joined with itself on an expression key (roadmap PR J2b).
+# A CTE referenced twice, joined with itself on an expression key.
 pending J4
 query III nosort
 WITH per_zone AS (SELECT tr_pickup AS zone, COUNT(*) AS n FROM trips GROUP BY tr_pickup)

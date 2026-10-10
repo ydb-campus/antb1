@@ -18,7 +18,7 @@
 // - query <I|R|D|T...> [nosort|rowsort|valuesort] [label]: SQL lines, "----", then the expected
 //   lines up to a blank line.
 // - skipif <engine> | onlyif <engine> (antb1 or duckdb): conditions of the next record.
-// - pending <roadmap id> (e.g. pending J2b): the next statement or query waits on that roadmap PR.
+// - pending <roadmap id> (e.g. pending J4): the next statement or query waits on that roadmap PR.
 //   DuckDB runs it as usual; antb1 runs it only in the pending check (CheckPendingFile in
 //   runner.h), where it must still get Unsupported. It takes no skipif or onlyif.
 // - halt: stop the file (with a condition: for that engine only).

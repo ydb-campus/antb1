@@ -50,7 +50,8 @@ same answers for batch sizes 1, 7 and 65536. Each relation declares the features
 
 The relations cover TLP-lite partitions of WHERE (`<`/`>=`, `=`/`<>`, NULLs through `COUNT(col)`), SUM, MIN and
 MAX over partitions and over split files, literal folding (a decimal bound equals its integer bound, out-of-range
-bounds), AND symmetry, literal-first comparisons, LIMIT, projections and batch sizes; all of them are active. Add a
+bounds), AND symmetry, literal-first comparisons, LIMIT, projections and batch sizes, and an inner join's
+independence of its FROM order, its connectors and where its keys are written; all of them are active. Add a
 relation with `r.push_back({...})` in `AllRelations()`; the checks (`AllEqual`, `FirstEqualsSumOfRest`,
 `FirstEqualsMinOfRest`, `FirstEqualsMaxOfRest`, `RowCountsEqualFirst`, `RowCountsAreMinOf`) are in `relations.h`.
 `metamorphic.RowCount.MatchesAnIndependentParquetScan` compares COUNT(*) with the rows the Parquet library decodes, and

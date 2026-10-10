@@ -173,7 +173,7 @@ TEST(ExplainTest, NamesAndStringsStayOnOneAsciiLine) {
 
 TEST(ExplainTest, EmptyPlan) { EXPECT_EQ(Explain(LogicalPlan{}), "Output:\n"); }
 
-// ---- joins and qualified names (hand-built plans: no SQL produces a join yet) ----
+// ---- joins and qualified names (hand-built plans: kinds and shapes no query makes) ----
 
 LogicalNodePtr Node(LogicalNode node) {
   return std::make_shared<const LogicalNode>(std::move(node));

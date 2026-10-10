@@ -74,7 +74,7 @@ In an expected block each row is one line; the cells of a row are separated by a
   loses the columns, so every value would compare within the R tolerance. Queries with the same label must return the
   same result.
 - `skipif <engine>` / `onlyif <engine>` (engine `antb1` or `duckdb`) guard the next record.
-- `pending <roadmap id>` (`pending J2b`) guards the next statement or query until that roadmap PR answers it: DuckDB
+- `pending <roadmap id>` (`pending J4`) guards the next statement or query until that roadmap PR answers it: DuckDB
   runs it, antb1 only in the pending check (below). It takes no `skipif` or `onlyif`.
 - `halt` stops the file (for one engine when guarded); `hash-threshold <n>` hashes results with more than
   `n` values (0: never), except results with an R column.
@@ -195,8 +195,8 @@ times the largest multiplicity of the third table's key. The bound stands in for
 generator needs a row count (`SELECT *` above 50 rows gets a `LIMIT`, DECIMAL sums stay within 38 digits, `COUNT`
 literals in `HAVING`). Every draw that only a join needs comes from a second random stream of the seed and the query
 index, so a query that joins nothing is the query the same tables give without refs: `diff.random`, `diff.decimal`
-and `diff.tpch` keep their queries, and only the join queries of `diff.star` are new. Until the join features are
-declared supported (roadmap PR J2b), every join is a target-grammar sample that antb1 answers with Unsupported. The
+and `diff.tpch` keep their queries, and only the join queries of `diff.star` are new. The join features are
+declared supported, so every generated join is compared against DuckDB like any other query. The
 generated joins never use single-table aliases, and never meet a bind error or an exit code 4 of the join rules:
 `.slt` files cover those.
 

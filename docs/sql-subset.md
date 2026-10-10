@@ -15,9 +15,10 @@ with `AND`, `OR` and `NOT`, with constant integer arithmetic folded on a side), 
 and `ORDER BY` (also by position), `HAVING` (the same conditions on aggregates and keys), arithmetic
 (`+ - * / // %` and unary `-`), the string functions `strlen` and `regexp_replace`, the timestamp functions
 `toDateTime`, `EXTRACT` and `date_trunc`, and `CASE` in every clause, dates written as casts
-(`CAST('2013-07-01' AS DATE)`, `'2013-07-01'::DATE`), `LIMIT` and `OFFSET`, over one table of Parquet files. This
-covers all 43 ClickBench queries (see [ClickBench status](#clickbench-status)). Of the 22 queries derived from
-TPC-H, Q1 and Q6 pass (see [Queries derived from TPC-H](#queries-derived-from-tpc-h)).
+(`CAST('2013-07-01' AS DATE)`, `'2013-07-01'::DATE`), `LIMIT` and `OFFSET`, over one table of Parquet files or
+several joined by inner joins. This covers all 43 ClickBench queries (see
+[ClickBench status](#clickbench-status)). Of the 22 queries derived from TPC-H, Q1, Q3, Q5, Q6, Q10, Q12 and Q14
+pass (see [Queries derived from TPC-H](#queries-derived-from-tpc-h)).
 
 ```sql
 SELECT COUNT(*), SUM(ResolutionWidth) AS width, AVG(UserID), MAX(EventDate) FROM hits WHERE IsMobile = 1
@@ -36,9 +37,11 @@ SELECT * FROM '/data/hits_*.parquet' LIMIT 5
 - Result names and types follow DuckDB ([Binding](#binding)); values follow the [Semantics](#semantics) below.
 - `--` line comments, `/* block */` comments and one trailing `;` are allowed.
 - SQL outside the grammar (a window function such as `row_number() OVER ()`, `IS NULL`, other functions, ...) fails
-  with exit code 4 and points at the first unsupported token. Joins, table aliases and qualified names parse
-  ([Grammar](#grammar)) but are not answered yet: exit code 4 as well. Malformed SQL (a syntax error) and SQL that is
-  wrong for the table (a bind error) fail with exit code 1.
+  with exit code 4 and points at the first unsupported token. A `FROM` list of tables and paths, joined by commas,
+  `CROSS JOIN` or `[INNER] JOIN ... ON`, with aliases and qualified names, is answered; a `LEFT JOIN`, a derived
+  table, a `WITH` list, more than 256 relations, and a join graph that no join key connects (a cross product) parse
+  ([Grammar](#grammar)) but are not answered: exit code 4 as well. Malformed SQL (a syntax error) and SQL that is
+  wrong for the tables (a bind error) fail with exit code 1.
 
 ```bash
 pixi run antb1 query -f query.sql --table hits=/data/clickbench/hits_0.parquet --clickbench
@@ -193,11 +196,12 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
 
 **What the binder answers today.** Of the grammar above, antb1 answers:
 
-- FROM: one table or path, without an alias. A FROM list of several items (a comma or any join), a table alias and a
-  qualified column name (`t.x`, anywhere in the query) parse and are rejected with exit code 4, in query order and
-  before any table resolves, so also over tables that do not exist (ADR 0022 plans their answers), except inside the
-  arguments of a call with the wrong number of arguments, which stays a bind error (`strlen(t.s, 1)`: strlen() takes 1
-  argument, not 2; over a table that does not exist, the missing table is the error);
+- FROM: tables and paths, with an alias or without, joined by commas, `CROSS JOIN` or `[INNER] JOIN ... ON`, with
+  qualified column names (`t.x`) anywhere in the query. A `LEFT JOIN`, a derived table and a `WITH` list parse and
+  are rejected with exit code 4, in query order and before any table resolves, so also over tables that do not
+  exist (ADR 0022 plans their answers), except inside the arguments of a call with the wrong number of arguments,
+  which stays a bind error (`strlen(t.s, 1)`: strlen() takes 1 argument, not 2; over a table that does not exist,
+  the missing table is the error). More than 256 relations is exit code 4 too, before the per-item checks;
 - date casts: `CAST('YYYY-MM-DD' AS DATE)` and `'YYYY-MM-DD'::DATE` are the literal `DATE 'YYYY-MM-DD'`
   wherever it may stand, as in DuckDB (which names all three `CAST('YYYY-MM-DD' AS "DATE")`);
 - value expressions: columns, literals, aggregates, arithmetic (`+ - * / // %`, unary `-`), the functions
@@ -304,19 +308,27 @@ in parentheses).
 ## Binding
 
 The binder (`plan::Bind`) resolves the statement against the table and builds the logical plan. A bind error has exit
-code 1 and points at the offending name, call or literal; the first error in query order wins (the table, then the
-select list, `WHERE`, the `GROUP BY` names, the grouping rule below, `LIMIT`, `OFFSET`, `HAVING` and the `ORDER BY`
-items).
+code 1 and points at the offending name, call or literal; the first error in query order wins (the tables, then the
+select list, the `ON` conditions and `WHERE`, the `GROUP BY` names, the grouping rule below, `LIMIT`, `OFFSET`,
+`HAVING` and the `ORDER BY` items).
 
 - Names: table and column names match ASCII case-insensitively, quoted identifiers included (as in DuckDB). An
   unknown table or column is a bind error, and so is a name that matches two columns differing only in case. A
-  column of an unsupported type fails with exit code 4 wherever it is referenced (by `SELECT *` too). A table alias,
-  a qualified column name and a FROM list of several items are unsupported (exit code 4, before the table resolves),
-  except a qualified name inside the arguments of a call with the wrong number of arguments, which stays a bind error.
-- Select list: `*` alone, or plain columns, aggregates and constants. Without `GROUP BY`, aggregates (in the select
-  list, in `HAVING` or in `ORDER BY`) and `HAVING` itself cannot be mixed with plain columns: a bind error at the
-  first plain column (or at `*`). Constants mix with anything; with an aggregate (also one only in `HAVING` or
-  `ORDER BY`) or `HAVING` the query has one row.
+  column of an unsupported type fails with exit code 4 wherever it is referenced (by `SELECT *` too).
+  Each FROM item is one binding, named by its alias, else a table's name as written, else the file name of its path
+  up to the first dot (a path with a glob character is named by its whole text). An alias hides that name, and the
+  error for a qualifier nothing is named by says so. Two bindings may share a name: a qualified name then resolves
+  to the one that has the column, and is a bind error when both do. A qualifier nothing is named by, and a binding
+  without the column, are bind errors. An `ON` resolves a name in its own join group first (the items from the last
+  comma up to its `JOIN`; a `CROSS JOIN` continues a group), then in the earlier comma siblings, and never in a
+  later item, whose name its error points out; `WHERE` and every other clause see every binding in one level. A
+  qualified name never names a select item's alias, as in DuckDB, so `ORDER BY t.x` over `SELECT i16 AS x` is a bind
+  error.
+- Select list: `*` alone, or plain columns, aggregates and constants. `*` expands to every binding's columns, in
+  FROM order then column order, and is a bind error when two bindings of one name share a column name. Without
+  `GROUP BY`, aggregates (in the select list, in `HAVING` or in `ORDER BY`) and `HAVING` itself cannot be mixed with
+  plain columns: a bind error at the first plain column (or at `*`). Constants mix with anything; with an aggregate
+  (also one only in `HAVING` or `ORDER BY`) or `HAVING` the query has one row.
 - Constants (as DuckDB types and names them): an integer is INTEGER when its magnitude fits (so `-2147483648` is
   BIGINT), else BIGINT or HUGEINT, and is named by its value (`007` is `7`); a string is VARCHAR named with its
   quotes (`'it''s'`); `DATE '2020-01-02'` is DATE named `CAST('2020-01-02' AS "DATE")` (so are
@@ -343,7 +355,10 @@ items).
 - Result names follow DuckDB: a plain column is named as declared in the table (`SELECT regionid` gives
   `RegionID`); an aggregate is named `count_star()`, `count(x)`, `count(DISTINCT x)`, `sum(x)`, `avg(x)`, `min(x)`
   or `max(x)`, with the argument as written in the query, double-quoted when it is not a plain identifier or is a
-  reserved word (`sum("from")`). Constants: see above. An alias replaces the name.
+  reserved word (`sum("from")`). A qualifier inside an expression's name stays as written, each part quoted by that
+  same rule (`sum(t.i16)`, `sum(t."Mixed Case")`), while a plain column select item keeps its declared name alone
+  (`SELECT t.i16` is `i16`); a message that echoes a reference back prints it as written and unquoted, so a grouping
+  error over `t.label` names `t.label`. Constants: see above. An alias replaces the name.
 - `ORDER BY`: a name is the alias of a select item first (the last item with that alias, as in DuckDB; also when a
   table column has the same name), else a table column; an aggregate call is computed like a select-list aggregate.
   A projection may order by any column of the table, selected or not. A grouped query orders by its keys and
@@ -493,7 +508,16 @@ the keys, then the aggregates, one row per group; a `Project` above it restores 
 (`ORDER BY`, below the `Project`, so it can use columns and aggregates the query does not return) and `Limit` (with
 its offset). A `Join` has two inputs ([ADR 0022](adr/0022-joins-and-query-blocks.md)): its kind (inner, left, semi,
 anti, null-aware anti or one-row), key pairs of one type each, residual conditions over both inputs and the input it
-builds on. No query produces a `Join` yet. The executor runs every kind as a hash join: it builds a hash table of the
+builds on. A query produces inner `Join`s: the binder sends each conjunct of `WHERE` and of an `ON` to the relations
+it reads, so one relation's conjuncts filter that relation's own branch, a cross-relation equality whose two sides
+share one key type is a key of their join (each side cast to that type on its own branch, an exact widening, and an
+equality spelled twice is one key), and anything else over two or more relations is the residual of the first join
+that has all of them. A join graph no key connects is a cross product: exit code 4, naming the item nothing connects.
+The relations then join left-deep, greedily, from footer row counts and distinct-count hints only: the relation with
+the most rows (an unknown count counts as the most) is probed first, then the connected relation with the smallest
+estimate joins next, with every edge to the relations already joined as a key, so the edge that closes a cycle
+becomes a second key. Every join builds on the relation it adds. Because the order reads metadata alone, a plan does
+not depend on the thread count. The executor runs every kind as a hash join: it builds a hash table of the
 input it builds on before it reads the other input, which then streams through it in its rows' order.
 
 - An inner join keeps each row's matches in the build input's order; its residual conditions are evaluated in order,
@@ -827,7 +851,7 @@ formatter:
 | 1 | query error: syntax, bind, execution or memory error | `SELECT COUNT(*) FORM t`; `FROM t semi` (a word that is never a table alias); an unknown table or column; `SUM` of a VARCHAR column; a `SUM`, or arithmetic on a `SUM`, outside HUGEINT's range; an invalid `regexp_replace` pattern; a query that needs more memory than `--memory-limit` |
 | 2 | usage error | unknown option; neither or both of `-c` and `-f`; a malformed `--table`, `--column-type` or `--memory-limit`; a column that `--column-type` cannot read as DATE; a table name registered twice |
 | 3 | I/O error | a missing or unreadable file; not a Parquet file; schemas that differ; a glob that matches nothing |
-| 4 | unsupported: valid-looking SQL outside the supported subset | `row_number() OVER ()`; `IS NULL`; an unknown function; `SELECT 1e3`; `SUM(DISTINCT ...)`; `CAST(a AS BIGINT)`; a string literal as a DECIMAL `CASE` value; a column of an unsupported type; `FROM a JOIN b ON a.k = b.k`; `FROM t semi JOIN u ON ...` |
+| 4 | unsupported: valid-looking SQL outside the supported subset | `row_number() OVER ()`; `IS NULL`; an unknown function; `SELECT 1e3`; `SUM(DISTINCT ...)`; `CAST(a AS BIGINT)`; a string literal as a DECIMAL `CASE` value; a column of an unsupported type; `FROM a LEFT JOIN b ON a.k = b.k`; `FROM t semi JOIN u ON ...`; `FROM a, b` with no join key between them (a cross product); more than 256 relations |
 | 70 | internal error: anything else, which is a bug | an uncaught exception; an Arrow `NotImplemented` or type error without SQL context |
 
 Exit code 4 is used only for errors that the parser, the binder or the physical planner marks as unsupported
@@ -939,7 +963,8 @@ The second workload is the 22 queries derived from TPC-H, in DuckDB's dialect, a
 committed ([ADR 0006](adr/0006-test-strategy-and-data-policy.md)); queries are referred to by their number (1-based).
 The ratchet `tests/data/tpch_status.json` lists the queries verified to pass, and `pass` below means exactly the
 ratchet (`pixi run lint` compares them); the PR that makes a query pass updates both. A query that does not pass must
-fail cleanly with exit code 4 (unsupported). Today Q1 and Q6 pass; the plan is recorded in ADRs 0021 (DECIMAL), 0022
+fail cleanly with exit code 4 (unsupported). Today Q1, Q3, Q5, Q6, Q10, Q12 and Q14 pass; the plan is recorded in
+ADRs 0021 (DECIMAL), 0022
 (joins, query blocks and uncorrelated subqueries) and 0023 (correlated subqueries). `tests/tpch/` generates the data
 at test time ([testing.md](testing.md#data-derived-from-tpc-h)), and `tpch.status.sf0_01`, `tpch.status.sf0_1` and
 `parallel.tpch.status.sf0_1` enforce the ratchet

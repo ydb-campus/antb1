@@ -186,7 +186,7 @@ SELECT label, COUNT(*) FROM zones WHERE label IN (SELECT label FROM cities) GROU
 airport	5
 center	5
 
-# A subquery over a join (roadmap PR J2b).
+# A subquery over a join.
 pending J5
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_driver IN (SELECT dv_id FROM drivers JOIN cities ON dv_city = ct_id WHERE ct_pop > 40000)

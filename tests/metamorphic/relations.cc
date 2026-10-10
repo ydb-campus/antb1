@@ -1100,7 +1100,7 @@ std::vector<Relation> AllRelations() {
   r.push_back(std::move(filtered));
   r.push_back(std::move(projected));
 
-  // ---- pending until joins are answered (roadmap PR J2b, ADR 0022) ----
+  // ---- joins (ADR 0022) ----
   // An inner join gives the same rows in any FROM order and with any connector, its keys in ON or
   // in WHERE, with or without aliases and qualifiers, in batches of any size (the probe resumes
   // inside a batch): 2841 rows over the star schema, 96 trips meeting two riders (a repeated key),

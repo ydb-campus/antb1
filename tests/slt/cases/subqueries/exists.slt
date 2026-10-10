@@ -125,7 +125,7 @@ SELECT dv_row FROM drivers WHERE NOT EXISTS (SELECT * FROM trips WHERE tr_driver
 96
 
 # An outer name in an ON: label is in no FROM item up to that JOIN, so it is cities' label, although the later zones
-# has a label too (roadmap PR J2b for the joins).
+# has a label too.
 pending U2
 query I rowsort
 SELECT ct_id FROM cities
