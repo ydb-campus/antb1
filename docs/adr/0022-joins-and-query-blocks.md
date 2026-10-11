@@ -366,6 +366,30 @@ Proposed
     aggregate uses the existing serial operators.
   - A sub-plan without a sink (a select-project-join block) streams into its consumer's pipeline. One that ends in a
     sink (an aggregation, a top-N) is drained by its consumer: a build, or a probe pipeline over a serial input.
+  - Update (2026-10-11, J4): a column alias list longer than the block's select list follows DuckDB, which differs
+    between the two forms: for a derived table it is a bind error, for a CTE the extra names are dropped and the
+    query answers. Rule 7's "a longer one is a bind error" is therefore about a derived table, as its sentence
+    says, and the S4a note above about a CTE's list being kept at any length is the other half. Shorter and equal
+    behave alike in both forms: the list renames the leading columns, each one losing its own name, and the rest
+    keep theirs.
+  - Update (2026-10-11, J4): rule 7's de-duplication applies to the names of a column alias list too, not only to
+    the names a block infers — `(…) AS g(a, a)` gives `a` and `a_1` in both forms, as in DuckDB, and an unqualified
+    `a` then resolves to the first of them rather than being ambiguous. The alias list is applied first and the
+    de-duplication runs over the result.
+  - Update (2026-10-11, J4): a FLOAT-stored column keeps divergence D11 through a sub-plan. The binder carries
+    `stored_as_float` out of a nested block with the column, so a comparison against a literal folds at FLOAT
+    precision wherever the column is read. Without it the same query would answer differently wrapped and
+    unwrapped, which no gate would catch: the random generator never references a FLOAT column.
+  - Update (2026-10-11, J4): a lateral reference is found through the scope chain. A sub-plan's scope is given the
+    enclosing one, and a name it does not have is looked up through every enclosing scope in turn: a hit exits 4 as
+    rule 9 requires, and only a name no scope has is the bind error "does not exist". The whole chain matters, not
+    one level — DuckDB answers a reference two blocks down — and so does an unqualified one, which a check over
+    qualifiers alone would miss.
+  - Update (2026-10-11, J4): the relation limit counts a derived table or a CTE reference as `1 +` its body's
+    count, which is what "counts the FROM items of every block, those of a CTE's body once per reference" above
+    says. It bounds a plan's size, and the chain of 30 self-joining CTEs exits 4 before any sub-plan binds, but it
+    does not bound nesting depth on its own: 255 nested blocks count 256 and still bind, so the parser's depth
+    limit is what bounds them.
 - **Uncorrelated subqueries (J5, decision C16).**
   - They are allowed only as a top-level conjunct of WHERE or HAVING: `x IN (query)`, `x NOT IN (query)`,
     `NOT (x IN (query))` and `x <op> (query)` in either order. A subquery conjunct of an inner join's ON counts as a
