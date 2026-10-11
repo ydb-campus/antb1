@@ -5,7 +5,7 @@ This directory records the architecturally significant decisions of antb1 in Mic
 in the same PR as the change it justifies, and list it below; `pixi run lint` checks that this index is complete.
 
 The one exception, from ADR 0001's update of 2026-10-02: a design ADR that the maintainer asks for ahead of the code
-may land first, in a docs-only PR (0013, 0019, 0021-0023).
+may land first, in a docs-only PR (0013, 0019, 0021-0024).
 
 | ADR | Title | Status |
 | --- | --- | --- |
@@ -32,3 +32,4 @@ may land first, in a docs-only PR (0013, 0019, 0021-0023).
 | [0021](0021-decimal-semantics.md) | DECIMAL semantics as in DuckDB | Proposed |
 | [0022](0022-joins-and-query-blocks.md) | Joins, query blocks and uncorrelated subqueries | Proposed |
 | [0023](0023-unnesting.md) | Correlated subqueries as dependent joins, unnested by the optimizer | Proposed |
+| [0024](0024-several-errors-per-query.md) | Several errors per query, scheduled for later | Proposed (deferred) |
