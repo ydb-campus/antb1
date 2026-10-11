@@ -667,6 +667,22 @@ docs/sql-subset.md sections it changes.
   LEFT JOIN's bound needs the left input's rows added and `query_gen_test`'s `row_bound` assertions widened; then
   the generator promotes an inner join whose ON reads only its own two inputs. Takes `kLeftJoin` out of
   `kGeneratorPending`. J6 depends on it.
+  - Update (2026-10-12, T2c): shipped as `LeftJoinRowBound(matched, left_rows, right_multiplicity)` =
+    `min(left_rows + matched, left_rows * max(1, right_multiplicity))`. A LEFT JOIN emits `max(1, its matches)`
+    rows per left row, and both bounds follow from that sum; the factor is at least 1 because a right input with
+    no matching key pads every left row, which the inner bound alone puts at zero. `matched` has to bound the
+    inner join of every FROM item and `left_rows` the inner join of all of them but the right input, so the
+    sketch above — "the left input's rows added" to a per-key bound — is not enough: on the star fixtures
+    `drivers JOIN trips ON tr_driver = dv_id LEFT JOIN shifts ON dv_id = sh_driver` yields 14159 rows against a
+    per-key bound of 3071, and a bound that is too small makes the generator write a query DuckDB answers and
+    antb1 fails. The generator therefore promotes only the item its walk added last, which is what makes the rest
+    of the FROM list a connected walk prefix whose bound it already has.
+  - Update (2026-10-12, T2c): the promotion is group-scoped — every key that touches the promoted item must reach
+    back no further than its own join group — so a LEFT JOIN's left input may be several items joined by a comma
+    or a `CROSS JOIN`. J6's WHERE classification therefore has to implement the descent of the "One relation"
+    rule above: `FROM drivers CROSS JOIN trips LEFT JOIN zones ON tr_pickup = zn_id WHERE tr_driver = dv_id`
+    answers 2577 rows in DuckDB, and a conjunct that only collapses to the unit instead of moving on into its
+    left input leaves that input disconnected and exits 4.
 - **J3, feat(plan): factor conjuncts shared by every branch of an or.** Q19 passes.
 - **J4, feat(plan): derived tables and common table expressions.** Sub-plans with rules 7 and 8 and rule 1's names
   for CTEs and derived tables, and a CTE's body counted against the relation limit at each reference. Q7, Q8 and Q9
