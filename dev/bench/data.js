@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791659416233,
+  "lastUpdate": 1791740836151,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -6372,6 +6372,114 @@ window.BENCHMARK_DATA = {
             "value": 111.24911449999786,
             "unit": "ms/iter",
             "extra": "iterations: 6\ncpu: 111.23882300000018 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "904c4a6c4d129c8e48ec1a8f2dba97f20020b604",
+          "message": "feat(plan): derived tables and common table expressions (#118)\n\n## Summary\n\nRoadmap PR **J4** of [ADR\n0022](docs/adr/0022-joins-and-query-blocks.md): a derived table and a\nCTE reference are\neach bound as a sub-plan with its own scope, and each is one binding of\nthe block that reads it. **Q7, Q8 and Q9\npass, so the TPC-H-derived ratchet moves to 11 of 22.**\n\n```text\nTPCH: PASS queries=22 pass=[1, 3, 5, 6, 7, 8, 9, 10, 12, 14, 19] unsupported=11 rejected=0 failed=0\n```\n\n| | |\n| --- | --- |\n| `42c036f` | `docs(adr)`: the five J4 decisions on sub-plan names,\nfloats and scopes |\n| `37dd114` | `feat(plan)`: count the relations a query expands to,\nsub-plans included |\n| `06c2e79` | `feat(plan)`: the scope machinery a sub-plan binding needs\n|\n| `6d30426` | `feat(plan)`: derived tables and common table expressions\n|\n| `5a3fbe4` | `test(slt)`: the sub-plan records and goldens, and the\ndocs they outgrew |\n| `28c8030` | `fix(plan)`: a cross product of two sub-plans aborted\ninstead of exiting 4 |\n| `6ced7d7` | `test(exec)`: a hash join with a sink on both sides |\n| `d35ab02` | `fix(plan)`: a cte inside a cte body lost its cte scope,\nand rule 9 pre-empted aliases |\n\n**No logical-plan node, no `std::visit` arm and no `src/exec` production\nchange.** `Binding::OfPlan` and\n`PlanSource` were already there from J2a/J2b-1, annotated \"from roadmap\nPR J4 on\", and the physical planner\nalready falls back from a part pipeline to a drained serial input for\nevery sink\n(`physical_planner.cc:235-238`, `:716-726`). J4 is binder work, which\nthe ADR implies but nobody had checked —\nthe planning pass traced it before a line was written.\n\n## How it binds\n\n`plan::Bind` is now a thin wrapper over a recursive `BindBlock`, which\nmints every block's columns from the **one**\n`ColumnIdSource` — a second source would mint colliding ids — and calls\n`ResolvePositions` once over the whole\ntree. `FoldDateCasts` recurses the same way, once at the top, so a\nnested `CAST('…' AS DATE)` is a date literal\nthere too.\n\n`CheckSupported` walks **every block the statement reaches** — its own,\neach derived table's, and the body of each\nCTE something references — through a new `ReachableBlocks`. It stays a\nstatic walk over names, so every\n`kUnsupported` is still reported before any name resolves, and an\nunreferenced CTE is never checked, exactly as\nDuckDB never binds one.\n\n## The five decisions, as approved\n\n1. **A column alias list longer than the block's select list follows\nDuckDB, which differs between the two forms**:\na bind error for a derived table, extras dropped for a CTE. Rule 7's\nsentence was always about a derived table\nand S4a's note about a CTE, so the two were never in conflict — asking\nfor examples is what established that.\nShorter and equal behave alike: the leading columns are renamed and lose\ntheir own names.\n2. **Rule 7's de-duplication applies to the alias list itself**, which\nthe rule did not say: `AS g(a, a)` gives\n`a`, `a_1` in both forms, and an unqualified `a` resolves to the first\nrather than being ambiguous. The suffix\nis the first free `base_N`, so a block declaring `x`, `x`, `x_1` gives\n`x`, `x_1`, `x_1_1` as DuckDB does.\n3. **Divergence D11 survives the boundary.** `OutputColumn` carries\n`stored_as_float`, so a FLOAT-stored column\ncompared with a literal still folds at FLOAT precision one block up. The\nfixture makes this discriminating:\n`floats.parquet` row 0 is the FLOAT just above 0.1, which widens to\n`0.10000000149011612`, so\n`WHERE f = 0.1` is true at FLOAT precision and false at DOUBLE. Both\nforms now answer **1**, and a `.slt` record\npins the pair. Without the flag the wrapped query would answer 0,\nsilently — the generator never references a\n   FLOAT column and `float.slt` selects only other columns.\n4. **A lateral reference is found through the scope chain.**\n`Scope::outer_` was stored and exposed but consulted\nnowhere; `Resolve` now walks **every** enclosing scope and exits 4 when\none has the name, leaving the bind error\nfor names no scope has. The chain matters because DuckDB answers a\nreference two blocks out, and the unqualified\ncase matters because a check over qualifiers alone would miss `FROM\nzones, (… WHERE tr_pickup = zn_id) s`.\n5. **The relation limit counts a sub-plan as `1 + ` its body**, which is\nwhat the ADR's counting sentence says.\n`src/plan/relation_count.h` is a new plan-private TU on the\n`or_factoring.h` precedent — pure name matching over\nthe AST, so it runs before anything resolves and tests without the\nbinder. Memoized per CTE and saturating, so\n**the ADR's chain of 30 self-joining CTEs is rejected in 0.07 s**\ninstead of binding 2³⁰ copies. A flat\n257-item FROM list is byte-identical to main, message and span, which I\nchecked by building both.\n\n## What review found — including one wrong answer\n\nA second Claude instance reviewed the diff against AGENTS.md's rubric\nand found a **P0 wrong result** plus two\nP1s. All are fixed in `d35ab02`, and both fixes fail two tests each when\nreverted.\n\n**A CTE referenced from inside another CTE's body bound with no CTE\nscope.** The map that says which frame a CTE's\nbody binds in was filled only on the block's own frame — but a body's\nchain starts at *that CTE's* frame, whose\nouter is the enclosing block's, so the own frame is never on it. Every\nCTE name inside such a body fell through to\nthe catalog. A chain of three CTEs over a table sharing the first one's\nname answered **18 where DuckDB 1.5.6\nanswers 0**, silently, and gave a bogus bind error where no such table\nexisted. Instructively,\n`relation_count.cc` got this right because its map is a walker member —\nwhich is exactly why `CountRelations` and\n`ReachableBlocks` agreed with DuckDB while the binder did not.\n\n**Rule 9 pre-empted the select-list aliases.** Applying it inside\n`Scope::Resolve` turned \"not in this block\" into\nexit 4 before `AliasFallback` ran, and that only runs on a bind error.\nSo an inner block's `GROUP BY <alias>`\nwhose alias happens to name a column of an enclosing block was rejected\n— and **whether a supported query was\naccepted depended on the enclosing FROM order**: `zones` first exited 4,\nthe sub-plan first answered 2793, as\nDuckDB does either way. The scope now answers the question\n(`Correlates`) and supplies the error\n(`CorrelationError`) without pre-empting, and `Binder::Resolve` asks\nonce its own aliases have failed.\n\nThe third P1 was a missing test with teeth: a `LEFT JOIN` inside a\n*referenced CTE body* was unpinned, and an\nunrejected one binds as an inner join and loses its keys — deleting\n`ReachableBlocks`' recursion into CTE bodies\nkept the whole suite green. The folding recursion had no test either.\nBoth are covered now.\n\nA methodology correction the reviewer supplied, which I had got wrong:\nthe pinned oracle is\n`.pixi/envs/default/bin/duckdb` at **1.5.6**, while this machine's\n`python3` module is **1.4.5**, and the two\ndiffer on unreferenced CTEs. I had been comparing against 1.4.5. Every\nversion-sensitive claim here has been\nre-checked against the pinned CLI.\n\nIts clean findings are worth recording too: rule 7 across 13 cases, rule\n1's numbering and per-block reset,\nrules 2/3/4/8, ColumnId disjointness across ~60 shapes, the relation\ncounter at 255/256/257 with no reachable\noverflow or cycle, nesting to 256 with no stack overflow, and D11\nthrough a derived table, a CTE, `MIN` and a\n`GROUP BY` key — all matching 1.5.6, with no unregistered divergence.\n\n## What mutation-testing my own work found\n\nMutation-testing the two naming rules **found a crash I would have\nshipped**. `OrderRelations` read the unconnected\nFROM item's table reference only to assert it was not null — sound while\na derived table could not bind, an abort\nafterwards — so `FROM (SELECT …) AS g, (SELECT …)` with no key between\nthem crashed where it should report a cross\nproduct. The plan had told me to delete those two lines and I missed it;\nprobing the numbering rule hit it by\naccident. The message already names the bindings, so the lines were\ndead. Fixed in `28c8030` with two binder cases.\n\nThe same exercise showed two rules were untested in a way a green suite\ncould not reveal, because the existing\nrecords cannot tell right behaviour from wrong:\n\n- Every record had `base_1` free, so starting the suffix search at 2\npassed everything. A record now reads\n  `x`, `x_1`, `x_1_1` out of a block declaring `x`, `x`, `x_1`.\n- The one record with two unaliased derived tables had no aliased one,\nso counting every FROM item gave identical\nnames. Two binder cases now pin that an aliased derived table consumes\nno number.\n\nEach of the three new rules now fails the suite when broken: the suffix\nsearch 2 tests, the counter 2, the\nenclosing-scope walk 1. Making the drained-build fallback unreachable\nfails 10, the new exec test among them.\n\n## Tests\n\n- **`relation_count_test.cc`**, 7 cases the binder could not reach while\na derived table exited 4 one check later:\nnesting, a CTE referenced twice, an unreferenced CTE, rule 8's shadowing\nof a table *and* of a path, a body\nnaming a later CTE, the doubling chain level by level (2, 5, 11, 23, 47,\ncrossing 256 at nine levels), and which\n  FROM item is reported.\n- **`scope_test.cc`**: the enclosing-scope walk at depth 1 and 2,\nqualified and unqualified, a name no scope has\nstaying a bind error, and an alias hiding a CTE's name while a derived\ntable has none to hide.\n- **The 14 `pending J4` records** answer with DuckDB's own expectations,\nso deleting the marker lines was the whole\nedit. Eight more records were added via `pixi run slt-complete` — never\ntyped — for the four decisions, taking\nthe file from 20 records to 28, and two of those moved out of\n`syntax_errors.slt`, where they had been\n  DuckDB-only because antb1 could not answer them.\n- **The 8 metamorphic relations T2 wrote for this blind**, verified then\nonly against DuckDB, activate here and\n**all 8 pass** against the implementation. Exactly 19 remain pending for\nJ5 and J6.\n- **Three EXPLAIN goldens**: a grouped derived table joined with a table\n(the sub-plan probes, estimated from its\ninput), a CTE referenced twice (decision C8 made plain — two identical\nsubtrees, two Scans, not one shared node),\n  and a top-N inside a derived table below the aggregate that drains it.\n- **One exec test**: a hash join with a sink on **both** sides, the\nshape J4 is the first to produce. Each half was\n  covered alone and never composed.\n\n## Twenty tests moved rather than broke\n\nAll in the families the plan predicted. The `NestedQueries` bind-error\nsuite loses the seven cases that are no\nlonger errors and gains rule-4 ambiguity, rule-7 arity, a `LEFT JOIN`\ninside a sub-plan and the two cases above;\nsix flip to bind errors at their own spans. Three were more than\nbookkeeping:\n\n- `with c(x) AS (SELECT a FROM nope) SELECT x FROM missing` now reports\n**`missing`**, not `nope`, because an\n  unreferenced CTE is never bound. Pinned.\n- `WITH c AS (SELECT nope FROM nope) SELECT COUNT(*) FROM t`\n**answers**, so it flipped from an unsupported-error\n  example in `session_test.cc` to a positive assertion.\n- Two defects in my own T2 generator work surfaced only once the\nfeatures were declared. Requiring `kTableAlias`\nfor the derived form had tied nesting to a **join** feature, so a seed\npicked a different form depending on\nwhether the join features were on — caught by\n`TablesWithoutRefsGiveTheSameQueriesWithJoinFeatures`, exactly the\ntest that exists for it. A generated derived table now takes no alias\nand rule 1 names it. And nesting a quarter\nof single-table queries diluted the DECIMAL `CASE` corpus to exactly 5\noccurrences against a floor of \"more than\n  5\"; that test samples 14000 queries rather than lower the threshold.\n\n## Not in this PR\n\nThe plan's step 5 — teaching the optimizer's `Pruner` to drop a non-root\n`ProjectNode`'s unread columns — is\n**withdrawn**, and this is worth your attention because it was in the\nplan you read. Its premise (\"before J4 no\nplan has an inner `Project`\") is false: ADR 0018's dependent-key rewrite\nalready produces one with columns nothing\nabove reads, and pruning them empties the `Compute`, so\n\n```text\nSELECT COUNT(*) AS c FROM edge GROUP BY i64, i64 + 1 ORDER BY c\n```\n\nwould **answer where DuckDB errors** — both error today. An undocumented\ndivergence in queries unrelated to J4,\nwhich `groupby/dependent_keys.slt` would not catch. It also buys J4\nnothing: `pruning_through_a_sub_plan` is\n`AllEqual` over four `COUNT(*)` answers, all 3000, so it holds unpruned.\nPruning through a sub-plan needs an\nADR 0018 interaction decision and should be its own roadmap id.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n\n## Verification\n\n```text\n$ pixi run ci\n100% tests passed out of 2550          # 2539 on main, 27 skipped there; 19 skipped here (J5 and J6)\n\n$ pixi run test -R 'tpch'\n100% tests passed out of 25\n\n$ pixi run lint\nclang-format / gersemi / ruff / markdownlint / typos / actionlint / zizmor / check_repo.py   Passed\nshellcheck (shell)                                                                          Failed  <- pre-existing\n```\n\nclang-tidy on every TU this PR changes, with the per-directory config:\n**clean**, except\n`src/exec/tests/hash_join_test.cc`, whose 5 findings are identical with\nmy changes stashed and sit at lines\n391–3702, none in the new test — the known pre-existing osx-arm64\n`src/exec` failures.\n\n`pixi run check` does not pass locally only because of 34 pre-existing\n`SC2218` findings in\n`tools/github/apply-settings.sh`, byte-identical to `origin/main`; the\nosx-arm64 conda build of the pinned\nshellcheck 0.11.0 flags what the linux-64 build of the same version does\nnot, so CI's `lint` job is green.\n`asan`, `tidy`, `fuzz-smoke` and `ci-gcc` cannot run on this Mac for\npre-existing platform reasons. **`ci-gcc`\nmatters most here** and has no local substitute: this PR writes\nrecursive binding over a boxed variant and\n`-Wconversion` on relation counters, which is where GCC 15 and libstdc++\ndiverge. First CI run before review.\n\n## Checklist\n\n- [ ] `pixi run check` passes locally — `ci` passes; `lint` fails only\non the pre-existing `shellcheck` finding\n- [x] Tests cover the change, and the three new rules plus the\ndrained-build path are mutation-verified\n- [x] Docs updated: `docs/sql-subset.md` (four passages that said a\nderived table and a `WITH` list are not\nanswered, plus the TPC-H table and prose list), `docs/architecture.md`'s\nbind step, `AGENTS.md` and\n      `README.md`'s counts, and the ADR update bullets\n- [x] No ClickBench-derived data is committed\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools. The ratchet\nline above is the harness's own redacted output — query numbers and\ncounts only\n- [x] Changes to governance paths were agreed with a maintainer —\n**needs your sign-off**: `AGENTS.md` (8 → 11,\nstill exactly 150 lines), `tests/data/tpch_status.json`, and\n`docs/adr/0022-joins-and-query-blocks.md` (five\nupdate bullets under the existing J4 bullet; no status change). All five\ndecisions were agreed in session.\n- [x] A public header changed: `OutputColumn` in\n`src/plan/include/antb1/plan/logical_plan.h` gains\n`stored_as_float`, additive with a default. It is decision 3, which you\napproved; flagging it because\n      CLAUDE.md asks for plan mode before a public-header change\n\n## AI assistance\n\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5) planned\nJ4 with a multi-agent pass whose two\nverifiers refuted nine of its own draft's claims — including the Pruner\npremise above — then implemented the\ncorrected plan, mutation-tested every new rule, and reviewed the diff\nwith a second instance given\nAGENTS.md's rubric. The four semantic decisions are the maintainer's,\ntaken against measured DuckDB\nbehaviour rather than the ADR's prose; the de-duplication rule for alias\nlists exists because the maintainer\n      asked for more examples.\n- Accountable human (has read and understands the whole diff): @\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-11T20:45:01+03:00",
+          "tree_id": "ae60e959563ff930b1f4e940897e95940f6258f6",
+          "url": "https://github.com/ydb-campus/antb1/commit/904c4a6c4d129c8e48ec1a8f2dba97f20020b604"
+        },
+        "date": 1791740835153,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 2650.1400139639154,
+            "unit": "ns/iter",
+            "extra": "iterations: 263538\ncpu: 2649.512673694116 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 64358.36220990287,
+            "unit": "ns/iter",
+            "extra": "iterations: 10643\ncpu: 64352.45438316265 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 71528.84678731018,
+            "unit": "ns/iter",
+            "extra": "iterations: 9836\ncpu: 71501.15016266773 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 273933.2763306854,
+            "unit": "ns/iter",
+            "extra": "iterations: 2649\ncpu: 273822.0762551907 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 263472.1399099798,
+            "unit": "ns/iter",
+            "extra": "iterations: 2666\ncpu: 263403.75356339075 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 1475452.9137931138,
+            "unit": "ns/iter",
+            "extra": "iterations: 464\ncpu: 1475128.4396551724 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 31.821877681817444,
+            "unit": "ms/iter",
+            "extra": "iterations: 22\ncpu: 31.811169636363637 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 30.07560329166618,
+            "unit": "ms/iter",
+            "extra": "iterations: 24\ncpu: 30.068720333333335 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 145.89739319999921,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 145.8578948000001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 8.90490423076948,
+            "unit": "ms/iter",
+            "extra": "iterations: 78\ncpu: 8.900312884615383 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 11.95060603389859,
+            "unit": "ms/iter",
+            "extra": "iterations: 59\ncpu: 11.942023220339003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 28.10478611999997,
+            "unit": "ms/iter",
+            "extra": "iterations: 25\ncpu: 28.089306080000043 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.0233840346320058,
+            "unit": "ms/iter",
+            "extra": "iterations: 693\ncpu: 1.0227946681096671 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 81.63538244444466,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 81.62237988888894 ms\nthreads: 1"
           }
         ]
       }
