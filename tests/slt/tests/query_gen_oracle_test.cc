@@ -84,7 +84,8 @@ TEST(QueryGenOracle, DuckDbReadsEveryGeneratedJoinAndItsCanonicalFormAlike) {
   for (uint64_t i = 0; joins < 1500 && i < 10'000; ++i) {
     const GeneratedQuery q = gen->Generate(i);
     if (!q.features.Has(Feature::kCommaJoin) && !q.features.Has(Feature::kJoinOn) &&
-        !q.features.Has(Feature::kDerivedTable) && !q.features.Has(Feature::kCommonTableExpr)) {
+        !q.features.Has(Feature::kLeftJoin) && !q.features.Has(Feature::kDerivedTable) &&
+        !q.features.Has(Feature::kCommonTableExpr)) {
       continue;
     }
     ++joins;

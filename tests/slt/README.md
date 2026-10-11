@@ -178,9 +178,9 @@ feature adds it to `kSupportedFeatures` (and new grammar to `runner/query_gen.cc
 `harness.QueryGenerator.TargetSamplesCoverTheWholeGrammar` fails until every feature is generated). Grammar the
 generator cannot write yet waits in `kGeneratorPending`, whether because the parser rejects it or because the
 generator needs more than the parser; such a feature cannot be declared
-supported until it leaves that set. ADR 0022's T2 took derived tables and `WITH` lists out of it, so today it holds
-`LEFT JOIN`, whose generation needs the row bound to account for padded rows, and the two uncorrelated subquery
-forms, which the parser rejects until roadmap PR S4b and T2b then generates.
+supported until it leaves that set. ADR 0022's T2 took derived tables and `WITH` lists out of it and T2c
+`LEFT JOIN`, so today it holds the two uncorrelated subquery forms, which the parser rejects until roadmap PR S4b
+and T2b then generates.
 
 Over tables with refs, a query that may use a join feature joins 2 or 3 tables along the refs 60% of the time when a
 ref from or to the table it starts from can be followed (`runner/query_gen.h`): inner joins written with commas,
@@ -193,14 +193,21 @@ twice or a path names another table (rule 1), and at random otherwise; a name th
 columns of one kind only, never DOUBLE, and DECIMALs only within 38 common digits (D13). `LoadGenTables` counts each
 key's non-NULL rows, distinct keys and largest multiplicity over every file, and a join stays within max(10,000, its
 largest table's rows) by a true bound: `JoinRowBound` of the first ref it follows, and for a third table that bound
-times the largest multiplicity of the third table's key. The bound stands in for the table's rows wherever the
+times the largest multiplicity of the third table's key. With the feature `left_join` one of a query's joins now
+and then becomes a `LEFT [OUTER] JOIN` (25% of the eligible items): the FROM item the walk added last, and only when
+every key that touches it reaches back no further than its own join group, since a `LEFT JOIN`'s ON sees its own two
+inputs alone and DuckDB refuses one that reads an earlier comma sibling ("Non-inner join on correlated columns not
+supported"). Its bound is `LeftJoinRowBound`, which adds the left rows a padded row stands for; a query has one such
+item at most, and its draws come from a fourth random stream, so a query that joins inner is the query the seed gave
+before the feature. The bound stands in for the table's rows wherever the
 generator needs a row count (`SELECT *` above 50 rows gets a `LIMIT`, DECIMAL sums stay within 38 digits, `COUNT`
 literals in `HAVING`). Every draw that only a join needs comes from a second random stream of the seed and the query
 index, so a query that joins nothing is the query the same tables give without refs: `diff.random`, `diff.decimal`
 and `diff.tpch` keep their queries, and only the join queries of `diff.star` are new. The join features are
 declared supported, so every generated join is compared against DuckDB like any other query. The
 generated joins never use single-table aliases, and never meet a bind error or an exit code 4 of the join rules:
-`.slt` files cover those.
+`.slt` files cover those. A generated `LEFT JOIN` is answered `Unsupported` and counted as such until roadmap PR J6
+declares the feature.
 
 ## Data tests: `queries` and `clickbench`
 

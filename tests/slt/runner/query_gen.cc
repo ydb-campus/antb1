@@ -701,6 +701,12 @@ constexpr unsigned kNestPercent = 25;
 // Salt of the third random stream, which every draw that only a nested block needs takes, so that
 // a query without one is the query this seed generated before the nesting PR.
 constexpr uint64_t kBlockStreamSalt = 0x626C6F636B2D726EULL;
+// Share of the eligible JOIN items (one per join at most: the one the walk added last) that a
+// LEFT JOIN replaces (ADR 0022's J6).
+constexpr unsigned kLeftPercent = 25;
+// Salt of the fourth random stream, which every draw that only a left join needs takes, so that a
+// query without one is the query this seed generated before the left-join PR.
+constexpr uint64_t kLeftStreamSalt = 0x6C6566742D726E67ULL;
 
 std::optional<std::size_t> ColumnIndex(const GenTable& t, std::string_view name) {
   const auto it = std::ranges::find_if(
@@ -781,7 +787,12 @@ std::string PathName(std::string_view path) {
 bool PathNamesTable(const GenTable& t) { return SameName(PathName(t.path), t.name); }
 
 // How a FROM item joins the items before it.
-enum class FromConnector : std::uint8_t { kFirst, kComma, kCross, kJoin };
+enum class FromConnector : std::uint8_t { kFirst, kComma, kCross, kJoin, kLeft };
+
+// Whether the connector writes an ON (so the item's keys go there, not in WHERE).
+bool IsJoin(FromConnector connector) {
+  return connector == FromConnector::kJoin || connector == FromConnector::kLeft;
+}
 
 // An equality of two key columns of two FROM items, written in either order.
 struct KeyPair {
@@ -799,7 +810,13 @@ struct Binding {
   bool as_keyword = false;  // AS before the alias
   FromConnector connector = FromConnector::kFirst;
   bool inner_keyword = false;  // INNER JOIN
-  std::vector<KeyPair> on;     // kJoin: the keys of its ON (at least one)
+  bool outer_keyword = false;  // kLeft: LEFT OUTER JOIN
+  // kLeft: the FROM position its join group starts at, which is the first item its ON may read
+  // (rule 10 of ADR 0022: a LEFT JOIN's ON sees its own two inputs, so not a comma sibling before
+  // the group — DuckDB refuses one with "Non-inner join on correlated columns not supported").
+  // 0 for every other connector, where the clause is a no-op.
+  std::size_t on_scope_start = 0;
+  std::vector<KeyPair> on;  // kJoin and kLeft: the keys of its ON (at least one)
   // A join's copy of the table's columns, so that every binding's columns have their own
   // addresses (a table may stand twice); `columns` views it, or the table's columns when the
   // query reads one table.
@@ -828,15 +845,28 @@ struct FromList {
   std::size_t qualify = 0;          // the other references: 0 bare, 1 qualified, 2 by a draw each
 };
 
+// The FROM position the join group of item `item` starts at (rule 10 of ADR 0022): the last comma
+// before it, else the first item. A CROSS JOIN and a JOIN continue the group they join into.
+std::size_t GroupStart(const FromList& from, std::size_t item) {
+  std::size_t start = 0;
+  for (std::size_t k = 1; k <= item; ++k) {
+    if (from.bindings[k].connector == FromConnector::kComma) {
+      start = k;
+    }
+  }
+  return start;
+}
+
 class Builder {
  public:
   // `join_rng`: the query's second stream, which every draw that only a join needs takes.
   Builder(const std::vector<GenTable>& tables, Rng& rng, Rng& join_rng, Rng& block_rng,
-          FeatureSet allowed)
+          Rng& left_rng, FeatureSet allowed)
       : tables_(tables),
         rng_(rng),
         join_rng_(join_rng),
         block_rng_(block_rng),
+        left_rng_(left_rng),
         allowed_(allowed),
         edges_(UsableEdges(tables)) {}
 
@@ -1211,7 +1241,29 @@ class Builder {
         b.connector = FromConnector::kCross;
       } else {
         b.connector = FromConnector::kJoin;
-        b.inner_keyword = join_rng_.Percent(50);
+        b.inner_keyword = join_rng_.Percent(50);  // always drawn: a later draw must not shift
+        // A LEFT JOIN of this item, now and then, when it is the one the walk added last (what
+        // LeftJoinRowBound's `left_rows` bounds), every key that touches it reaches back inside
+        // its own join group (rule 10), and the padded rows stay within the join's row limit.
+        const std::size_t group = GroupStart(from, k);
+        const auto reaches_back = [&](const PlannedKey& key) {
+          const std::array<std::size_t, 2> ends = {position[key.child], position[key.parent]};
+          const std::size_t other = ends[0] == k ? ends[1] : ends[0];
+          return (ends[0] != k && ends[1] != k) || (other >= group && other < k);
+        };
+        // `rows` bounds the inner join of every item, `rows_before_last` the one without this
+        // item, which only holds because this item is the one the walk added last.
+        const int64_t matched = rows;
+        const int64_t left_rows = rows_before_last;
+        const int64_t bound = LeftJoinRowBound(matched, left_rows, last_multiplicity);
+        if (allowed_.Has(Feature::kLeftJoin) && order[k] + 1 == planned.size() &&
+            std::ranges::all_of(keys, reaches_back) && bound <= RowLimit(planned) &&
+            left_rng_.Percent(kLeftPercent)) {
+          b.connector = FromConnector::kLeft;
+          b.outer_keyword = left_rng_.Percent(50);
+          b.on_scope_start = group;
+          from.rows = bound;
+        }
       }
     }
     // Distinct names: an alias for a table read again or under another name, now and then for
@@ -1242,8 +1294,7 @@ class Builder {
       const Binding& child = from.bindings[position[key.child]];
       const Binding& parent = from.bindings[position[key.parent]];
       Binding& later = from.bindings[home(key)];
-      std::vector<KeyPair>& to =
-          later.connector == FromConnector::kJoin ? later.on : from.where_keys;
+      std::vector<KeyPair>& to = IsJoin(later.connector) ? later.on : from.where_keys;
       for (std::size_t c = 0; c < edge.child_columns.size(); ++c) {
         to.push_back(KeyPair{.left = &child.columns[edge.child_columns[c]],
                              .right = &parent.columns[edge.parent_columns[c]]});
@@ -2050,6 +2101,16 @@ class Builder {
           }
           Keyword("JOIN");
           break;
+        case FromConnector::kLeft:
+          // Not kJoinOn: a LEFT JOIN is its own feature, and a query that has only this ON must
+          // not count as one an inner join could have written.
+          used_.Add(Feature::kLeftJoin);
+          Keyword("LEFT");
+          if (b.outer_keyword) {
+            Keyword("OUTER");
+          }
+          Keyword("JOIN");
+          break;
       }
       if (!b.inner.empty() && !b.as_cte) {
         used_.Add(Feature::kDerivedTable);
@@ -2071,14 +2132,17 @@ class Builder {
         }
         tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = b.name});
       }
-      if (b.connector != FromConnector::kJoin) {
+      if (!IsJoin(b.connector)) {
         continue;
       }
       Keyword("ON");
       Keys(b.on);
       if (allowed_.Has(Feature::kWhere) && join_rng_.Percent(20)) {
         std::vector<const GenColumn*> all = comparable_;
-        std::erase_if(comparable_, [&](const GenColumn* c) { return PositionOf(*c) > k; });
+        std::erase_if(comparable_, [&](const GenColumn* c) {
+          const std::size_t p = PositionOf(*c);
+          return p > k || p < b.on_scope_start;
+        });
         if (!comparable_.empty()) {  // (WhereLeaf picks one)
           used_.Add(Feature::kWhere);
           Keyword("AND");
@@ -3067,6 +3131,7 @@ class Builder {
   Rng& rng_;
   Rng& join_rng_;   // the draws that only a join needs
   Rng& block_rng_;  // the draws that only a nested block needs
+  Rng& left_rng_;   // the draws that only a left join needs
   FeatureSet allowed_;
   std::vector<Edge> edges_;         // the refs joins can follow
   const FromList* from_ = nullptr;  // the FROM list of the query being written (TryFrom)
@@ -3263,7 +3328,8 @@ std::expected<QueryGenerator, std::string> QueryGenerator::Make(std::vector<GenT
   Rng rng(seed);
   Rng join_rng(Mix(seed ^ kJoinStreamSalt));
   Rng block_rng(Mix(seed ^ kBlockStreamSalt));
-  if (!Builder(tables, rng, join_rng, block_rng, options.supported).Build().has_value()) {
+  Rng left_rng(Mix(seed ^ kLeftStreamSalt));
+  if (!Builder(tables, rng, join_rng, block_rng, left_rng, options.supported).Build().has_value()) {
     return std::unexpected(
         std::format("no query can be built from the supported features ({}) over these tables",
                     options.supported.Names()));
@@ -3276,11 +3342,13 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
   Rng rng(state);
   Rng join_rng(Mix(state ^ kJoinStreamSalt));
   Rng block_rng(Mix(state ^ kBlockStreamSalt));
+  Rng left_rng(Mix(state ^ kLeftStreamSalt));
   const bool target = rng.Percent(options_.target_percent);
   const FeatureSet allowed = target ? FeatureSet::All() : options_.supported;
   // Make() proved that the supported set admits a query over these tables; All() is a superset.
-  GeneratedQuery q =
-      Builder(tables_, rng, join_rng, block_rng, allowed).Build().value_or(GeneratedQuery{});
+  GeneratedQuery q = Builder(tables_, rng, join_rng, block_rng, left_rng, allowed)
+                         .Build()
+                         .value_or(GeneratedQuery{});
   q.index = index;
   q.target_sample = target;
   return q;

@@ -103,7 +103,8 @@ FeatureSet Union(FeatureSet a, FeatureSet b) {
 }
 
 bool Joins(const GeneratedQuery& q) {
-  return q.features.Has(Feature::kCommaJoin) || q.features.Has(Feature::kJoinOn);
+  return q.features.Has(Feature::kCommaJoin) || q.features.Has(Feature::kJoinOn) ||
+         q.features.Has(Feature::kLeftJoin);
 }
 
 QueryGenerator MakeOver(std::vector<GenTable> tables, uint64_t seed, GeneratorOptions options) {
@@ -711,6 +712,42 @@ TEST(QueryGenerator, NestingChangesOnlyNestedQueries) {
   EXPECT_GT(cte, 20) << "WITH lists: " << cte;
 }
 
+// Every draw a left join needs comes from the fourth stream (left_rng_), so allowing kLeftJoin
+// changes the queries that promote a join and no others: a seed's query that joins inner is the
+// query that seed gave before ADR 0022's T2c. Pins the stream, as the two tests above pin the
+// second and the third. A promoted query may differ beyond its connector, since its wider row
+// bound also decides whether SELECT * needs a LIMIT, but its bound never shrinks: a LEFT JOIN
+// yields max(1, its matches) rows per left row, so at least the rows the inner join yields.
+TEST(QueryGenerator, LeftJoinsChangeOnlyLeftJoinQueries) {
+  const FeatureSet with_left = Union(kSupportedFeatures, {Feature::kLeftJoin});
+  // target_percent 0: every query draws from `supported`, not from the whole grammar.
+  const auto with = MakeOver(JoinTables(), 43, {.supported = with_left, .target_percent = 0});
+  const auto without =
+      MakeOver(JoinTables(), 43, {.supported = kSupportedFeatures, .target_percent = 0});
+  int promoted = 0;
+  int same = 0;
+  int wider = 0;
+  for (uint64_t i = 0; i < 2000; ++i) {
+    const auto q = with.Generate(i);
+    const auto plain = without.Generate(i);
+    EXPECT_FALSE(plain.features.Has(Feature::kLeftJoin)) << plain.sql;
+    if (q.features.Has(Feature::kLeftJoin)) {
+      ++promoted;
+      EXPECT_TRUE(plain.features.Has(Feature::kJoinOn)) << "a promotion replaces a JOIN ... ON\n"
+                                                        << plain.sql;
+      EXPECT_GE(q.row_bound, plain.row_bound) << q.sql;
+      wider += q.row_bound > plain.row_bound ? 1 : 0;
+      continue;
+    }
+    ++same;
+    EXPECT_EQ(q.sql, plain.sql) << i;
+    EXPECT_EQ(q.features, plain.features) << i;
+  }
+  EXPECT_GT(promoted, 20) << "promoted: " << promoted;
+  EXPECT_GT(same, 1000);
+  EXPECT_GT(wider, 10) << "bounds that the padding widens: " << wider;
+}
+
 // What a nested query's text holds: the block names the table and projects its columns under their
 // own names, which is why the outer block can read them and why the property tests above, whose
 // guards are regexes over column names, still see them.
@@ -895,6 +932,12 @@ struct JoinCoverage {
   int unconnected_start = 0;
   int star_without_limit = 0;
   int decimal_comparison = 0;
+  int left = 0;                // a LEFT JOIN item
+  int left_outer = 0;          // spelled LEFT OUTER JOIN
+  int left_three_item = 0;     // a LEFT JOIN in a FROM list of three items
+  int left_extra_on = 0;       // its ON holds a conjunct beyond the keys
+  int left_sibling_group = 0;  // a comma sibling before its join group (its ON may not read one)
+  int left_cross_group = 0;    // a CROSS JOIN inside its left input
 };
 
 // Checks a generated join over JoinTables() against the algorithm, on its AST: 2 or 3 inner FROM
@@ -923,8 +966,9 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
   std::vector<Item> items;
   bool comma = false;
   bool join_on = false;
+  bool left = false;
+  std::size_t left_item = std::string::npos;  // the FROM position of the LEFT JOIN, if any
   for (const sql::FromItem& item : stmt.from) {
-    ASSERT_NE(item.connector, sql::Connector::kLeft);
     ASSERT_NE(item.table(), nullptr) << "a derived table";
     const sql::TableRef& ref = *item.table();
     const bool path = ref.kind == sql::TableRef::Kind::kPath;
@@ -940,6 +984,16 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
     comma = comma || item.connector == sql::Connector::kComma ||
             item.connector == sql::Connector::kCross;
     join_on = join_on || item.connector == sql::Connector::kInner;
+    if (item.connector == sql::Connector::kLeft) {
+      EXPECT_FALSE(left) << "two LEFT JOINs: the walk promotes at most the item it added last";
+      left = true;
+      left_item = items.size();
+      ++cov.left;
+      cov.left_three_item += stmt.from.size() == 3 ? 1 : 0;
+      const std::string connector = plan::AsciiLower(
+          std::string_view(q.sql).substr(item.connector_span.offset, item.connector_span.length));
+      cov.left_outer += connector.contains("outer") ? 1 : 0;
+    }
     cov.comma += item.connector == sql::Connector::kComma ? 1 : 0;
     cov.cross += item.connector == sql::Connector::kCross ? 1 : 0;
     if (item.connector == sql::Connector::kInner) {
@@ -1070,6 +1124,20 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
     cov.sibling_on += sibling ? 1 : 0;
     cov.on_condition += extra ? 1 : 0;
     condition = condition || extra;
+    if (k != left_item) {
+      continue;
+    }
+    // A LEFT JOIN's ON sees its own two inputs only, so never an earlier comma sibling: DuckDB
+    // refuses one with "Non-inner join on correlated columns not supported".
+    EXPECT_FALSE(sibling) << "a LEFT JOIN's ON reads a FROM item before its join group";
+    cov.left_extra_on += extra ? 1 : 0;
+    cov.left_sibling_group += group > 0 ? 1 : 0;
+    cov.left_cross_group +=
+        std::ranges::any_of(
+            std::views::iota(group + 1, k),
+            [&](std::size_t g) { return stmt.from[g].connector == sql::Connector::kCross; })
+            ? 1
+            : 0;
   }
   for (const sql::Expr& conjunct : stmt.where) {
     check_columns(conjunct, kNone);
@@ -1096,6 +1164,7 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
   std::size_t edges = 0;
   bool first_two = false;
   std::vector<int64_t> bounds;
+  std::vector<int64_t> left_bounds;
   for (std::size_t n = 0; n < refs.size(); ++n) {
     for (std::size_t ci = 0; ci < items.size(); ++ci) {
       for (std::size_t pi = 0; pi < items.size(); ++pi) {
@@ -1116,7 +1185,16 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
           return r.table == refs[n].parent && r.columns == refs[n].columns;
         });
         if (ref != child.refs.end()) {
-          bounds.push_back(JoinRowBound(ref->stats, ref->ref_stats));
+          const int64_t matched = JoinRowBound(ref->stats, ref->ref_stats);
+          bounds.push_back(matched);
+          // The same edge read as `items[0] LEFT JOIN items[1]`: the walk promotes the item it
+          // added last, so the left input is the item at FROM position 0 and the padding is by
+          // the other item's own key.
+          if (std::min(ci, pi) == 0 && std::max(ci, pi) == 1) {
+            const GenKeyStats& right = pi == 1 ? ref->ref_stats : ref->stats;
+            left_bounds.push_back(
+                LeftJoinRowBound(matched, items[0].table->rows, right.max_multiplicity));
+          }
         }
       }
     }
@@ -1128,7 +1206,8 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
   cov.unconnected_start += first_two ? 0 : 1;
   EXPECT_LE(q.row_bound, 10'000);
   if (items.size() == 2) {
-    EXPECT_TRUE(std::ranges::contains(bounds, q.row_bound)) << "bound " << q.row_bound;
+    const std::vector<int64_t>& expected = left ? left_bounds : bounds;
+    EXPECT_TRUE(std::ranges::contains(expected, q.row_bound)) << "bound " << q.row_bound;
   }
   // Comparisons of two columns never mix what DuckDB compares otherwise: no DOUBLE key, no
   // common DECIMAL type beyond 38 digits (D13: f_wide against d_fine, d_amount, f_amount or
@@ -1186,7 +1265,7 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
   EXPECT_EQ(q.features.Has(Feature::kTablePath), any_path);
   EXPECT_EQ(q.features.Has(Feature::kTableName),
             std::ranges::any_of(items, [](const Item& i) { return !i.path; }));
-  EXPECT_FALSE(q.features.Has(Feature::kLeftJoin));
+  EXPECT_EQ(q.features.Has(Feature::kLeftJoin), left);
   EXPECT_TRUE(!condition || q.features.Has(Feature::kWhere)) << "a condition beyond the keys";
   EXPECT_TRUE(std::ranges::any_of(items, [&](const Item& i) { return i.table->name == q.table; }));
 }
@@ -1223,6 +1302,12 @@ TEST(QueryGenerator, JoinQueriesFollowTheRefs) {
   EXPECT_GT(cov.unconnected_start, 0) << "the first two FROM items share no key";
   EXPECT_GT(cov.star_without_limit, 0);
   EXPECT_GT(cov.decimal_comparison, 0) << "DECIMAL columns of two items compared";
+  EXPECT_GT(cov.left, 0) << "a LEFT JOIN";
+  EXPECT_GT(cov.left_outer, 0) << "spelled LEFT OUTER JOIN";
+  EXPECT_GT(cov.left_three_item, 0) << "a LEFT JOIN among three FROM items";
+  EXPECT_GT(cov.left_extra_on, 0) << "a LEFT JOIN's ON beyond its keys";
+  EXPECT_GT(cov.left_sibling_group, 0) << "a comma sibling before a LEFT JOIN's group";
+  EXPECT_GT(cov.left_cross_group, 0) << "a CROSS JOIN inside a LEFT JOIN's left input";
 }
 
 // Join features declared one by one: a join uses only the declared ones, so the walk takes no
@@ -1454,8 +1539,8 @@ TEST(LeftJoinRowBound, BoundsThePaddedRowsOfSmallKeyMultisets) {
     return state >> 33U;
   };
   int exact = 0;
-  int pads = 0;         // trials whose left join has more rows than its inner join
-  int asymmetric = 0;   // trials whose two orientations have different bounds
+  int pads = 0;        // trials whose left join has more rows than its inner join
+  int asymmetric = 0;  // trials whose two orientations have different bounds
   for (int trial = 0; trial < 2000; ++trial) {
     const uint64_t domain = 1 + (next() % 8);
     std::array<std::vector<std::optional<uint64_t>>, 2> sides;

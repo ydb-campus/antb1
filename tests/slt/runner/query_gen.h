@@ -35,15 +35,23 @@
 // doubles a division made, whose sum's rounding follows the order of the additions.
 //
 // Over tables with refs (GenTable::refs), a query that may use a join feature (kCommaJoin,
-// kJoinOn) now and then joins 2 or 3 tables along them (ADR 0022): inner joins only, written as
-// commas, CROSS JOIN or [INNER] JOIN ... ON, connected through top-level equalities of the refs'
-// keys (never DOUBLE ones, DECIMAL ones only within 38 common digits), in ON or in WHERE. FROM item
-// names are distinct (aliases t1 to t3 where needed), every name that two items have is qualified
-// by its item's own name, and the join has at most max(10,000, its largest table's rows) rows by a
-// true bound: JoinRowBound of the first ref it follows, and for a third table that bound times the
+// kJoinOn) now and then joins 2 or 3 tables along them (ADR 0022), written as commas, CROSS JOIN
+// or [INNER] JOIN ... ON, connected through top-level equalities of the refs' keys (never DOUBLE
+// ones, DECIMAL ones only within 38 common digits), in ON or in WHERE. FROM item names are
+// distinct (aliases t1 to t3 where needed), every name that two items have is qualified by its
+// item's own name, and the join has at most max(10,000, its largest table's rows) rows by a true
+// bound: JoinRowBound of the first ref it follows, and for a third table that bound times the
 // largest multiplicity of the third table's key. Every draw that only a join needs comes from a
 // second random stream of (s, i), so a query that joins nothing is the query the same tables give
 // without refs.
+//
+// With kLeftJoin one of those joins now and then becomes a LEFT [OUTER] JOIN (ADR 0022's J6): the
+// FROM item the walk added last, whose padded rows LeftJoinRowBound accounts for, and only when
+// every key that touches it reaches back no further than its own join group, since a LEFT JOIN's
+// ON sees its own two inputs alone (rule 10) and DuckDB refuses one that reads an earlier comma
+// sibling. Its ON holds those keys, and a drawn extra conjunct stays inside the same scope. One
+// item at most per query, from a fourth random stream, so a query that joins inner is the query
+// this seed gave before the feature.
 
 namespace antb1::slt {
 
@@ -131,7 +139,7 @@ struct GeneratedQuery {
   // bound (JoinRowBound, LeftJoinRowBound). A shuffled FROM order writes its keys in WHERE, where
   // they bound the answer but not FROM itself.
   int64_t row_bound = 0;
-  FeatureSet features;    // every feature the SQL uses
+  FeatureSet features;                // every feature the SQL uses
   bool target_sample = false;         // drawn from the full target grammar
   SortMode sort = SortMode::kNoSort;  // kRowSort for projections and GROUP BY: SQL has no row order
   // LIMIT or OFFSET on a projection or GROUP BY (no ORDER BY): any rows of the unlimited answer are
