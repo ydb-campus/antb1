@@ -92,6 +92,11 @@ enum class Feature : std::uint8_t {
   // Nested queries (ADR 0022: roadmap PR T2 generates them, J4 declares them supported)
   kDerivedTable,     // FROM (SELECT ...) [AS] s [(x, ...)]
   kCommonTableExpr,  // WITH c [(x, ...)] AS (SELECT ...) SELECT ...
+  // Uncorrelated subqueries, only as a top-level conjunct of WHERE, HAVING or an inner ON (ADR
+  // 0022's J5). The parser rejects both until roadmap PR S4b, so T2b generates them and J5
+  // declares them.
+  kInSubquery,      // column [NOT] IN (SELECT ...), and NOT (column IN (SELECT ...))
+  kScalarSubquery,  // column <op> (SELECT <aggregate> ...), in either order
   // Out-of-scope marker, the last Feature (new ones go above it): never in kSupportedFeatures and
   // never generated. The harness self-tests tag their "pending" canary query with it, so that path
   // stays tested.
@@ -216,6 +221,10 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "derived_table";
     case Feature::kCommonTableExpr:
       return "cte";
+    case Feature::kInSubquery:
+      return "in_subquery";
+    case Feature::kScalarSubquery:
+      return "scalar_subquery";
     case Feature::kWindowFunctions:
       return "window_functions";
   }
@@ -286,12 +295,14 @@ using FeatureSet = BasicFeatureSet<Feature, kFeatureCount>;
 // Out-of-scope markers, valid in `-- features:` tags and never generated (see the Feature enum).
 inline constexpr FeatureSet kNeverGenerated = {Feature::kWindowFunctions};
 
-// Grammar that the parser accepts ahead of the random generator (runner/query_gen.cc), which
-// learns it in a later PR (ADR 0022's T2: LEFT JOIN, derived tables and WITH lists) and then
-// removes it from this set. Valid in `-- features:` tags, and never in kSupportedFeatures while
-// pending (checked below), so that no feature is declared supported before it is generated.
-inline constexpr FeatureSet kGeneratorPending = {Feature::kLeftJoin, Feature::kDerivedTable,
-                                                 Feature::kCommonTableExpr};
+// Grammar the random generator (runner/query_gen.cc) cannot write yet, which a later PR teaches it
+// and then removes from this set. Valid in `-- features:` tags, and never in kSupportedFeatures
+// while pending (checked below), so that no feature is declared supported before it is generated.
+// ADR 0022's T2 took derived tables and WITH lists out of it. LEFT JOIN waits for the generator's
+// row bound to account for a LEFT JOIN's padded rows; the two subquery forms wait for the parser
+// (roadmap PR S4b) and leave with T2b, which J5 depends on.
+inline constexpr FeatureSet kGeneratorPending = {Feature::kLeftJoin, Feature::kInSubquery,
+                                                 Feature::kScalarSubquery};
 
 // What antb1 answers today: the whole slice grammar of docs/sql-subset.md (global and grouped
 // aggregates, projections, WHERE conjunctions of column <op> literal, ORDER BY, LIMIT and OFFSET)

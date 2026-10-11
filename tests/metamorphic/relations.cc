@@ -192,6 +192,13 @@ Probe Q(std::string sql, int64_t batch_size = kDefaultBatchSize) {
   return Probe{.sql = std::move(sql), .batch_size = batch_size};
 }
 
+// `base` plus `features`: the relations below share a base set and each adds a few to it.
+template <typename... Features>
+slt::FeatureSet SetWith(slt::FeatureSet base, Features... features) {
+  (base.Add(features), ...);
+  return base;
+}
+
 std::string PathOf(std::string_view table) {
   for (const auto& t : TablePaths()) {
     if (t.table == table) {
@@ -1136,6 +1143,275 @@ std::vector<Relation> AllRelations() {
                       "t.tr_day = s.sh_day"),
                     Q(std::string(kShifts), 1), Q(std::string(kShifts), 7)},
          .check = AllEqual()});
+  }
+
+  // ---- pending until derived tables and CTEs are answered (roadmap PR J4, ADR 0022) ----
+  // A single-use derived table or CTE is its block's relation, so wrapping a block changes nothing
+  // but the plan: the same 244 groups however the wrap is written, at any batch size, nested twice,
+  // over a top-N, and with a column alias list. The grouped block's counts still sum to the rows it
+  // read, a predicate on its group key may sit inside or outside it, and the columns the outer
+  // block does not read are pruned through the boundary.
+  {
+    const slt::FeatureSet wrapped = {kColumns,        kMultipleItems,  kAlias,     kCountStar,
+                                     kGroupBy,        kIntegerColumns, kTableName, kWhere,
+                                     kIntegerLiteral, kDerivedTable};
+    constexpr std::string_view kBlock =
+        "SELECT tr_rider AS k, COUNT(*) AS n FROM trips WHERE tr_row > 100 GROUP BY tr_rider";
+    const std::string wrap = std::format("SELECT k, n FROM ({}) AS s", kBlock);
+    slt::FeatureSet with_cte = wrapped;
+    with_cte.Add(kCommonTableExpr);
+    r.push_back({.name = "derived_table_wraps_block",
+                 .features = with_cte,
+                 .probes = {Q(std::string(kBlock)), Q(wrap),
+                            Q(std::format("WITH c AS ({}) SELECT k, n FROM c", kBlock)),
+                            Q(std::format("SELECT a, b FROM ({}) AS s(a, b)", kBlock))},
+                 .check = AllEqual()});
+    r.push_back({.name = "derived_table_batch_size_invariance",
+                 .features = wrapped,
+                 .probes = {Q(wrap, 1), Q(wrap, 7), Q(wrap)},
+                 .check = AllEqual()});
+    r.push_back({.name = "grouped_derived_table_sums_to_row_count",
+                 .features = SetWith(wrapped, kSum),
+                 .probes = {Q(std::format("SELECT SUM(n) FROM ({}) AS s", kBlock)),
+                            Q("SELECT COUNT(*) FROM trips WHERE tr_row > 100")},
+                 .check = AllEqual()});
+    // Only a predicate on the group key may move: one on an aggregate is HAVING, not WHERE.
+    r.push_back({.name = "derived_table_filter_moves_in_or_out",
+                 .features = SetWith(wrapped, kWhereAnd),
+                 .probes = {Q(std::format("SELECT k, n FROM ({}) AS s WHERE k > 100", kBlock)),
+                            Q("SELECT tr_rider AS k, COUNT(*) AS n FROM trips WHERE tr_row > 100 "
+                              "AND tr_rider > 100 GROUP BY tr_rider")},
+                 .check = AllEqual()});
+    r.push_back(
+        {.name = "nested_derived_tables_collapse",
+         .features = wrapped,
+         .probes = {Q(std::string(kBlock)), Q(wrap),
+                    Q(std::format("SELECT k, n FROM (SELECT k, n FROM ({}) AS s) AS u", kBlock))},
+         .check = AllEqual()});
+    // Sound only because the inner order is total: tr_row is unique, so the top ten are one set.
+    constexpr std::string_view kTopN =
+        "SELECT tr_row, tr_fare FROM trips ORDER BY tr_fare DESC NULLS LAST, tr_row LIMIT 10";
+    r.push_back({.name = "derived_table_over_top_n_equals_top_n",
+                 .features = {kColumns, kMultipleItems, kIntegerColumns, kDecimalColumns,
+                              kTableName, kOrderBy, kNullsOrder, kLimit, kDerivedTable},
+                 .probes = {Q(std::string(kTopN)),
+                            Q(std::format("SELECT tr_row, tr_fare FROM ({}) AS s", kTopN))},
+                 .check = AllEqual()});
+    // A CTE is bound once per reference (rule 8), so two references are two derived tables. The
+    // equality is what keeps the FROM graph connected: a cross product exits 4 for good.
+    r.push_back(
+        {.name = "cte_referenced_twice_is_two_derived_tables",
+         .features = SetWith(with_cte, kTableAlias, kQualifiedName, kCompareColumns, kCommaJoin),
+         .probes = {Q(std::format("WITH p AS ({}) SELECT COUNT(*) FROM p AS a, p AS b "
+                                  "WHERE a.k = b.k",
+                                  kBlock)),
+                    Q(std::format("SELECT COUNT(*) FROM ({}) AS a, ({}) AS b WHERE a.k = b.k",
+                                  kBlock, kBlock))},
+         .check = AllEqual()});
+    r.push_back(
+        {.name = "pruning_through_a_sub_plan",
+         .features = {kCountStar, kColumns, kStar, kIntegerColumns, kDoubleColumns, kVarcharColumns,
+                      kDateColumns, kDecimalColumns, kTableName, kDerivedTable},
+         .probes = {Q("SELECT COUNT(*) FROM trips"),
+                    Q("SELECT COUNT(*) FROM (SELECT * FROM trips) AS s"),
+                    Q("SELECT COUNT(*) FROM (SELECT tr_tariff FROM trips) AS s"),
+                    Q("SELECT COUNT(*) FROM (SELECT tr_row FROM trips) AS s")},
+         .check = AllEqual()});
+  }
+
+  // ---- pending until uncorrelated subqueries are answered (roadmap PR J5, ADR 0022) ----
+  // IN keeps a row with a match, once, so it partitions the rows its NOT IN spelling rejects, both
+  // sides made NULL-free so that three-valued logic collapses: 2896 = 2577 + 319. IN is a semi
+  // join, which is only the inner join when the right key is distinct -- over the unique zn_id it
+  // is (2793), over the repeated rd_id it is not (2745 against the join's 2841), which is why the
+  // second form distinct-ifies the right side first. A scalar subquery partitions the non-NULL
+  // values of a column the same way (2903 = 2574 + 329), selects nothing when it is NULL, and
+  // partitions groups from HAVING, above the aggregation (244 = 237 + 7).
+  {
+    const slt::FeatureSet in_sub = {kCountStar, kIntegerColumns, kTableName,      kWhere,
+                                    kWhereAnd,  kIntegerLiteral, kCompareColumns, kInSubquery};
+    r.push_back({.name = "in_subquery_partitions_non_null_probes",
+                 .features = in_sub,
+                 .probes = {Q("SELECT COUNT(*) FROM trips WHERE tr_driver > 0"),
+                            Q("SELECT COUNT(*) FROM trips WHERE tr_driver > 0 AND tr_driver IN "
+                              "(SELECT dv_id FROM drivers WHERE dv_id > 0)"),
+                            Q("SELECT COUNT(*) FROM trips WHERE tr_driver > 0 AND tr_driver NOT IN "
+                              "(SELECT dv_id FROM drivers WHERE dv_id > 0)")},
+                 .check = FirstEqualsSumOfRest()});
+    r.push_back({.name = "not_in_spellings_agree",
+                 .features = SetWith(in_sub, kBooleanExpressions),
+                 .probes = {Q("SELECT COUNT(*) FROM trips WHERE tr_driver NOT IN "
+                              "(SELECT dv_id FROM drivers WHERE dv_id > 0)"),
+                            Q("SELECT COUNT(*) FROM trips WHERE NOT (tr_driver IN "
+                              "(SELECT dv_id FROM drivers WHERE dv_id > 0))")},
+                 .check = AllEqual()});
+    // zn_id is unique (tools/fixturegen/star.h), so the semi join and the inner join coincide.
+    r.push_back({.name = "in_subquery_over_a_unique_key_is_a_join",
+                 .features = SetWith(in_sub, kJoinOn),
+                 .probes = {Q("SELECT COUNT(*) FROM trips WHERE tr_pickup IN "
+                              "(SELECT zn_id FROM zones)"),
+                            Q("SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id")},
+                 .check = AllEqual()});
+    // rd_id repeats, so the join needs the inner GROUP BY to keep each left row at most once.
+    r.push_back({.name = "in_subquery_is_a_semi_join_over_distinct_keys",
+                 .features = SetWith(in_sub, kJoinOn, kDerivedTable, kGroupBy, kTableAlias,
+                                     kQualifiedName, kColumns),
+                 .probes = {Q("SELECT COUNT(*) FROM trips WHERE tr_rider IN "
+                              "(SELECT rd_id FROM riders)"),
+                            Q("SELECT COUNT(*) FROM trips JOIN (SELECT rd_id FROM riders "
+                              "GROUP BY rd_id) AS d ON tr_rider = d.rd_id")},
+                 .check = AllEqual()});
+    constexpr std::string_view kIn =
+        "SELECT COUNT(*) FROM trips WHERE tr_rider IN (SELECT rd_id FROM riders)";
+    constexpr std::string_view kNotIn =
+        "SELECT COUNT(*) FROM trips WHERE tr_rider NOT IN (SELECT rd_id FROM riders)";
+    // One query per relation: IN and NOT IN keep different rows, so they cannot share an AllEqual.
+    r.push_back({.name = "in_subquery_batch_size_invariance",
+                 .features = in_sub,
+                 .probes = {Q(std::string(kIn), 1), Q(std::string(kIn), 7), Q(std::string(kIn))},
+                 .check = AllEqual()});
+    r.push_back(
+        {.name = "not_in_subquery_batch_size_invariance",
+         .features = in_sub,
+         .probes = {Q(std::string(kNotIn), 1), Q(std::string(kNotIn), 7), Q(std::string(kNotIn))},
+         .check = AllEqual()});
+    const slt::FeatureSet scalar = {kCountStar, kCountColumn, kIntegerColumns, kDecimalColumns,
+                                    kTableName, kWhere,       kScalarSubquery, kGroupBy};
+    r.push_back({.name = "scalar_subquery_partitions_non_null_values",
+                 .features = scalar,
+                 .probes = {Q("SELECT COUNT(tr_fare) FROM trips"),
+                            Q("SELECT COUNT(*) FROM trips WHERE tr_fare > "
+                              "(SELECT COUNT(*) FROM cities)"),
+                            Q("SELECT COUNT(*) FROM trips WHERE tr_fare <= "
+                              "(SELECT COUNT(*) FROM cities)")},
+                 .check = FirstEqualsSumOfRest()});
+    // SUM over no row is NULL (shifts has no sh_hours above 100, tools/fixturegen/star.h), and
+    // every comparison with NULL is NULL, so neither side keeps a row.
+    r.push_back({.name = "null_scalar_subquery_selects_nothing",
+                 .features = SetWith(scalar, kSum, kWhereAnd),
+                 .probes = {Q("SELECT COUNT(*) FROM trips WHERE tr_fare < "
+                              "(SELECT SUM(sh_hours) FROM shifts WHERE sh_hours > 100)"),
+                            Q("SELECT COUNT(*) FROM trips WHERE tr_fare >= "
+                              "(SELECT SUM(sh_hours) FROM shifts WHERE sh_hours > 100)")},
+                 .check = AllEqual()});
+    // COUNT(*) is never NULL, so every group falls on one side, the NULL grouping key included.
+    r.push_back({.name = "having_scalar_subquery_partitions_groups",
+                 .features = SetWith(scalar, kColumns, kHaving),
+                 .probes = {Q("SELECT tr_rider FROM trips GROUP BY tr_rider"),
+                            Q("SELECT tr_rider FROM trips GROUP BY tr_rider "
+                              "HAVING COUNT(*) > (SELECT COUNT(*) FROM cities)"),
+                            Q("SELECT tr_rider FROM trips GROUP BY tr_rider "
+                              "HAVING COUNT(*) <= (SELECT COUNT(*) FROM cities)")},
+                 .check = FirstIsUnionOfRest()});
+  }
+
+  // ---- pending until left outer joins are answered (roadmap PR J6, ADR 0022) ----
+  // A LEFT JOIN's matches are the inner join's (447, and 310 and 131 with a residual on either
+  // input), a strict comparison on the right input in WHERE drops every padded row so the result is
+  // the inner join's, and an ON conjunct on the right input filters that input (rule 11) while one
+  // on the left input does not: every left row is still there, matched or padded. Each left row is
+  // padded exactly once, over a unique right key and over an empty right input (3000), and the
+  // inner join below a LEFT JOIN may be reordered though the LEFT JOIN may not (2577).
+  {
+    constexpr std::string_view kKey = "tr_driver = sh_driver AND tr_day = sh_day";
+    const slt::FeatureSet left = {kCountStar, kCountColumn, kIntegerColumns, kDateColumns,
+                                  kTableName, kJoinOn,      kCompareColumns, kLeftJoin};
+    const auto pair = [&](std::string_view residual) {
+      return std::array{
+          Q(std::format("SELECT COUNT(sh_row) FROM trips LEFT JOIN shifts ON {}{}", kKey,
+                        residual)),
+          Q(std::format("SELECT COUNT(*) FROM trips JOIN shifts ON {}{}", kKey, residual))};
+    };
+    for (const auto& [name, residual] : std::initializer_list<std::pair<const char*, const char*>>{
+             {"left_join_matches_equal_inner_join", ""},
+             {"left_join_matches_equal_inner_join_right_residual", " AND sh_hours > 6"},
+             {"left_join_matches_equal_inner_join_left_residual", " AND tr_fare > 20"}}) {
+      const auto probes = pair(residual);
+      slt::FeatureSet features = left;
+      features.Add(kWhere);
+      features.Add(kIntegerLiteral);
+      features.Add(kDoubleColumns);
+      features.Add(kDecimalColumns);
+      r.push_back({.name = name,
+                   .features = features,
+                   .probes = {probes[0], probes[1]},
+                   .check = AllEqual()});
+    }
+    r.push_back(
+        {.name = "left_join_under_null_rejecting_where_is_inner",
+         .features = SetWith(left, kWhere, kDoubleColumns, kIntegerLiteral, kBooleanExpressions),
+         .probes = {Q("SELECT COUNT(*) FROM trips LEFT JOIN zones ON tr_pickup = zn_id "
+                      "WHERE zn_radius > 2"),
+                    Q("SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id "
+                      "WHERE zn_radius > 2"),
+                    Q("SELECT COUNT(*) FROM trips LEFT JOIN zones ON tr_pickup = zn_id "
+                      "WHERE NOT (zn_radius <= 2)"),
+                    Q("SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id "
+                      "WHERE NOT (zn_radius <= 2)")},
+         .check = AllEqual()});
+    // Rule 11, as counts: the ON conjunct decides which candidates match, so the matched pairs are
+    // the inner join's over the same condition.
+    r.push_back({.name = "left_join_on_right_conjunct_filters_the_right_input",
+                 .features = SetWith(left, kDoubleColumns, kIntegerLiteral),
+                 .probes = {Q("SELECT COUNT(zn_id) FROM trips LEFT JOIN zones "
+                              "ON tr_pickup = zn_id AND zn_radius > 2"),
+                            Q("SELECT COUNT(*) FROM trips JOIN zones "
+                              "ON tr_pickup = zn_id AND zn_radius > 2")},
+                 .check = AllEqual()});
+    // The same rule as a multiset, against the filtered input written as a derived table.
+    r.push_back(
+        {.name = "left_join_on_right_conjunct_equals_a_filtered_input",
+         .features = SetWith(left, kColumns, kMultipleItems, kStar, kDoubleColumns, kIntegerLiteral,
+                             kDerivedTable, kTableAlias, kQualifiedName, kWhere),
+         .probes = {Q("SELECT tr_row, zn_id FROM trips LEFT JOIN zones "
+                      "ON tr_pickup = zn_id AND zn_radius > 2"),
+                    Q("SELECT tr_row, z.zn_id FROM trips LEFT JOIN "
+                      "(SELECT * FROM zones WHERE zn_radius > 2) AS z "
+                      "ON tr_pickup = z.zn_id")},
+         .check = AllEqual()});
+    // zn_id is unique and promos is empty (tools/fixturegen/star.h), so every left row appears
+    // once.
+    r.push_back({.name = "left_join_pads_each_left_row_once",
+                 .features = left,
+                 .probes = {Q("SELECT COUNT(*) FROM trips"),
+                            Q("SELECT COUNT(*) FROM trips LEFT JOIN zones ON tr_pickup = zn_id"),
+                            Q("SELECT COUNT(*) FROM trips LEFT JOIN promos ON tr_promo = pm_id")},
+                 .check = AllEqual()});
+    // An ON conjunct that reads only the preserved side is a residual, not a filter: a left row
+    // that fails it is padded, not dropped, so all 3000 tr_row are still present. A plan that
+    // pushed `tr_fare > 20` down to trips instead would leave 897 of them -- the same answer as
+    // writing that conjunct in WHERE, where it really does filter.
+    r.push_back(
+        {.name = "left_join_on_left_conjunct_still_pads",
+         .features =
+             SetWith(left, kCountDistinct, kDecimalColumns, kDoubleColumns, kIntegerLiteral),
+         .probes = {Q("SELECT COUNT(DISTINCT tr_row) FROM trips"),
+                    Q(std::format("SELECT COUNT(DISTINCT tr_row) FROM trips LEFT JOIN shifts ON {}",
+                                  kKey)),
+                    Q(std::format("SELECT COUNT(DISTINCT tr_row) FROM trips LEFT JOIN shifts "
+                                  "ON {} AND tr_fare > 20",
+                                  kKey)),
+                    Q(std::format("SELECT COUNT(DISTINCT tr_row) FROM trips LEFT JOIN shifts "
+                                  "ON {} AND sh_hours > 6",
+                                  kKey))},
+         .check = AllEqual()});
+    constexpr std::string_view kUnder =
+        "SELECT COUNT(*) FROM drivers, trips LEFT JOIN zones ON tr_pickup = zn_id "
+        "WHERE tr_driver = dv_id";
+    r.push_back(
+        {.name = "left_join_batch_size_invariance",
+         .features = SetWith(left, kCommaJoin),
+         .probes = {Q(std::string(kUnder), 1), Q(std::string(kUnder), 7), Q(std::string(kUnder))},
+         .check = AllEqual()});
+    // Only two FROM orders are legal: a LEFT JOIN's ON may read nothing but its own two inputs, so
+    // `trips, drivers LEFT JOIN zones ON tr_pickup = zn_id` exits 4 (DuckDB refuses it too).
+    r.push_back({.name = "inner_join_order_below_a_left_join",
+                 .features = SetWith(left, kCommaJoin),
+                 .probes = {Q(std::string(kUnder)),
+                            Q("SELECT COUNT(*) FROM trips LEFT JOIN zones ON tr_pickup = zn_id, "
+                              "drivers WHERE tr_driver = dv_id"),
+                            Q(std::string(kUnder), 1), Q(std::string(kUnder), 7)},
+                 .check = AllEqual()});
   }
   return r;
 }

@@ -26,6 +26,9 @@
 #include "antb1/plan/types.h"
 
 #include "antb1_engine.h"
+#ifdef ANTB1_SLT_HAVE_DUCKDB
+#include "duckdb_engine.h"
+#endif
 #include "engine.h"
 #include "fixtures.h"
 #include "relations.h"
@@ -117,6 +120,51 @@ INSTANTIATE_TEST_SUITE_P(, Relations, ::testing::ValuesIn(AllRelations()),
                          [](const ::testing::TestParamInfo<Relation>& param_info) {
                            return param_info.param.name;
                          });
+
+// A pending relation checks nothing on antb1: it reports Unsupported before it resolves a name, so
+// a misspelled column inside a LEFT JOIN is invisible, and Evaluate accepts Unsupported as pending
+// without ever calling the relation's check. So neither the SQL nor the invariant is tested until
+// the PR that declares the features activates it, where a mistake made PRs earlier surfaces as an
+// engine bug. DuckDB answers every pending form today, so it can test both now: each probe must
+// answer, and the relation must hold over the answers.
+#ifdef ANTB1_SLT_HAVE_DUCKDB
+TEST(RelationList, PendingRelationsHoldInDuckDb) {
+  const auto tables = LoadFixtureTables();
+  ASSERT_FALSE(tables.empty());
+  auto oracle =
+      slt::DuckDbEngine::Make(tables, antb1::testing::FixturesDir(), ::testing::TempDir());
+  ASSERT_TRUE(oracle.has_value()) << oracle.error();
+  int pending = 0;
+  for (const auto& r : AllRelations()) {
+    if (slt::kSupportedFeatures.Contains(r.features)) {
+      continue;  // active: the relation itself already runs its probes, on antb1
+    }
+    ++pending;
+    std::vector<slt::ResultSet> answers;
+    answers.reserve(r.probes.size());
+    bool all_answered = true;
+    for (std::size_t i = 0; i < r.probes.size(); ++i) {
+      slt::ExecResult answer = (*oracle)->Execute(Substitute(r.probes[i].sql));
+      if (!answer.has_value()) {
+        ADD_FAILURE() << r.name << " probe " << i << ": " << answer.error().message << "\n  "
+                      << r.probes[i].sql;
+        all_answered = false;
+        break;
+      }
+      answers.push_back(*std::move(answer));
+    }
+    if (!all_answered) {
+      continue;
+    }
+    // A pending relation's own batch sizes are antb1's; DuckDB answers each probe once, so this
+    // tests the invariant, not the batch-size invariance those probes also carry.
+    const std::optional<std::string> violation = r.check(answers);
+    EXPECT_FALSE(violation.has_value())
+        << r.name << " does not hold on DuckDB: " << violation.value_or("") << DescribeProbes(r);
+  }
+  EXPECT_GT(pending, 0) << "no pending relation to check";
+}
+#endif
 
 slt::ResultSet Single(std::string value) {
   return slt::ResultSet{.classes = {slt::ColumnClass::kInteger},

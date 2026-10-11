@@ -628,6 +628,21 @@ docs/sql-subset.md sections it changes.
   left outer joins); builds of distinct keys are deferred (the update under "Residuals (E2)").
 - **T2, test(diff): generate derived tables, ctes, left joins and uncorrelated subqueries.** With their metamorphic
   relations, pending until the engine supports them.
+  - Update (2026-10-11, T2): T2 ships the metamorphic relations of all four forms and generates two of them,
+    derived tables and `WITH` lists, so J4 can declare them. The other two leave `kGeneratorPending` later. The
+    uncorrelated subqueries wait for S4b, which is unmerged: `sql::Parse` rejects them, so generating them would
+    fail the round-trip test, and they ship as **T2b**, which J5 depends on. `LEFT JOIN` waits on the row bound:
+    `JoinRowBound` counts matches, a LEFT JOIN also emits a padded row per unmatched left row, and the FROM order
+    is shuffled after the walk, so the bound of an item's left input is no longer a prefix of it. Generating it
+    needs that bound extended and the `row_bound` assertions widened, which is its own PR before J6. Both follow
+    as their own ids below.
+- **T2b, test(diff): generate uncorrelated subqueries.** After S4b, which the parser needs first: `IN (query)`,
+  `NOT IN (query)` and a scalar subquery as a top-level conjunct of WHERE or HAVING, taking `kInSubquery` and
+  `kScalarSubquery` out of `kGeneratorPending`. J5 depends on it.
+- **T2c, test(diff): bound a left join's padded rows and generate it.** `JoinRowBound` counts matches only, so a
+  LEFT JOIN's bound needs the left input's rows added and `query_gen_test`'s `row_bound` assertions widened; then
+  the generator promotes an inner join whose ON reads only its own two inputs. Takes `kLeftJoin` out of
+  `kGeneratorPending`. J6 depends on it.
 - **J3, feat(plan): factor conjuncts shared by every branch of an or.** Q19 passes.
 - **J4, feat(plan): derived tables and common table expressions.** Sub-plans with rules 7 and 8 and rule 1's names
   for CTEs and derived tables, and a CTE's body counted against the relation limit at each reference. Q7, Q8 and Q9
