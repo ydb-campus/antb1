@@ -3755,8 +3755,7 @@ arrow::Status Binder::OrderRelations() {
     join_relations_.push_back(JoinRelation{.rows = RelationRows(binding)});
   }
   if (const auto unconnected = FirstUnconnected(join_relations_.size(), edges_)) {
-    const sql::TableRef* ref = stmt_.from[*unconnected].table();
-    ANTB1_CHECK(ref != nullptr);  // CheckFromList rejected derived tables
+    // The message names the binding, so a sub-plan needs no table reference here.
     return UnsupportedError(
         std::format("a cross product is not supported: no join key connects '{}' to '{}'",
                     scope_.bindings()[*unconnected].name(), scope_.bindings().front().name()),

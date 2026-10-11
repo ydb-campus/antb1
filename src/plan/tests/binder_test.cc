@@ -790,7 +790,18 @@ INSTANTIATE_TEST_SUITE_P(
                   "table \"g\" has 1 columns available but 2 columns specified"},
         // A call with the wrong number of arguments is a bind error once the FROM list binds.
         ErrorCase{"SELECT strlen(s, 1) FROM (SELECT s FROM t)", kBind, "strlen(s, 1)",
-                  "strlen() takes 1 argument, not 2"}));
+                  "strlen() takes 1 argument, not 2"},
+        // Two sub-plans with no key between them are a cross product like any other pair, named by
+        // their bindings: the connectivity check reads no table reference, so it does not abort.
+        ErrorCase{"SELECT COUNT(*) FROM (SELECT i16 FROM t) AS g, (SELECT s FROM u)", kUnsupported,
+                  "(SELECT s FROM u)",
+                  "a cross product is not supported: no join key connects 'unnamed_subquery' "
+                  "to 'g'"},
+        // Rule 1's counter numbers the unaliased derived tables only, so an aliased one beside an
+        // unaliased one leaves the latter `unnamed_subquery`, with no `unnamed_subquery2`.
+        ErrorCase{"SELECT unnamed_subquery2.s FROM (SELECT i16 FROM t) AS g, (SELECT s FROM u) "
+                  "WHERE g.i16 = u.i16",
+                  kBind, "unnamed_subquery2.s", "no FROM item is named 'unnamed_subquery2'"}));
 
 // Rules 1, 2 and 6 of ADR 0022 over one FROM item: an alias names the binding, a qualified name
 // resolves in the binding it names (ASCII case-insensitively, quoted or not), and a result name

@@ -130,6 +130,14 @@ WITH c(x, y, z) AS (SELECT tr_row FROM trips) SELECT COUNT(*), MAX(x) FROM c
 ----
 3000	2999
 
+# The suffix is the first free `base_N`, so a name the block already declares as `x_1` pushes the
+# de-duplicated one to `x_1_1` rather than colliding with it.
+query III nosort
+SELECT x, x_1, x_1_1 FROM (SELECT tr_row AS x, tr_pickup AS x, tr_dropoff AS x_1 FROM trips)
+ORDER BY x LIMIT 1
+----
+0	1	1
+
 # Rule 7's de-duplication runs over the alias list too, after it is applied: the second `a` is
 # `a_1`, and an unqualified `a` is the first column rather than ambiguous.
 query II nosort
