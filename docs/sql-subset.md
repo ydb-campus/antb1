@@ -19,7 +19,7 @@ functions `strlen` and `regexp_replace`, the timestamp functions `toDateTime`, `
 `DATE '2013-07-01'`), `LIMIT` and `OFFSET`, over one table of Parquet files or several joined by inner joins. This
 covers all 43 ClickBench queries (see
 [ClickBench status](#clickbench-status)). Of the 22 queries derived from TPC-H, Q1, Q3, Q5, Q6, Q7, Q8, Q9, Q10,
-Q12, Q14 and Q19 pass (see [Queries derived from TPC-H](#queries-derived-from-tpc-h)).
+Q12, Q13, Q14 and Q19 pass (see [Queries derived from TPC-H](#queries-derived-from-tpc-h)).
 
 ```sql
 SELECT COUNT(*), COUNT(DISTINCT OS), AVG(ResolutionWidth) AS width FROM hits WHERE OS BETWEEN 2 AND 44
@@ -43,13 +43,13 @@ SELECT date_trunc('month', tr_day) AS m, MIN(tr_fare) FROM trips GROUP BY 1 ORDE
 - `--` line comments, `/* block */` comments and one trailing `;` are allowed.
 - SQL outside the grammar (a window function such as `row_number() OVER ()`, `IS NULL`, other functions, ...) fails
   with exit code 4 and points at the first unsupported token. A `FROM` list of tables and paths, joined by commas,
-  `CROSS JOIN` or `[INNER] JOIN ... ON`, with aliases and qualified names, is answered as long as a join key
-  connects every relation — so a comma list or a `CROSS JOIN` needs an equality between its relations, in the list's
-  `ON` or in `WHERE`. A derived table and a `WITH` list are answered too, each bound as a sub-plan of its own. A
-  `LEFT JOIN`, `TRY_CAST`, a lateral reference, more than 256 relations counting every sub-plan, and a join
-  graph that no join key connects (a cross product) parse ([Grammar](#grammar)) but are not answered: exit code 4
-  as well. Malformed SQL (a syntax error) and SQL that is wrong for the tables (a bind error) fail with exit
-  code 1.
+  `CROSS JOIN`, `[INNER] JOIN ... ON` or `LEFT [OUTER] JOIN ... ON`, with aliases and qualified names, is answered
+  as long as a join key connects every relation — so a comma list or a `CROSS JOIN` needs an equality between its
+  relations, in the list's `ON` or in `WHERE`, and a `LEFT JOIN` needs one between its own two inputs, in its `ON`.
+  A derived table and a `WITH` list are answered too, each bound as a sub-plan of its own. `TRY_CAST`, a lateral
+  reference, more than 256 relations counting every sub-plan, and a join graph that no join key connects (a cross
+  product) parse ([Grammar](#grammar)) but are not answered: exit code 4 as well. Malformed SQL (a syntax error) and
+  SQL that is wrong for the tables (a bind error) fail with exit code 1.
 
 ```bash
 pixi run antb1 query -f query.sql --table hits=/data/clickbench/hits_0.parquet --clickbench
@@ -204,13 +204,15 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
 
 **What the binder answers today.** Of the grammar above, antb1 answers:
 
-- FROM: tables and paths, with an alias or without, joined by commas, `CROSS JOIN` or `[INNER] JOIN ... ON`, with
-  qualified column names (`t.x`) anywhere in the query, and derived tables and `WITH` lists, each a sub-plan of its
-  own. A `LEFT JOIN` parses and is rejected with exit code 4, in query order and before any table resolves, so also
-  over tables that do not exist (ADR 0022 plans its answer), except inside the arguments of a call with the wrong
-  number of arguments, which stays a bind error (`strlen(t.s, 1)`: strlen() takes 1 argument, not 2; over a table
-  that does not exist, the missing table is the error). More than 256 relations, counting a derived table and a CTE
-  reference as one plus the relations of their body, is exit code 4 too, before the per-item checks;
+- FROM: tables and paths, with an alias or without, joined by commas, `CROSS JOIN`, `[INNER] JOIN ... ON` or
+  `LEFT [OUTER] JOIN ... ON`, with qualified column names (`t.x`) anywhere in the query, and derived tables and
+  `WITH` lists, each a sub-plan of its own. A `LEFT JOIN` is one fixed unit: it is never reordered, its `ON` reads
+  its own two inputs only, an `ON` conjunct over the right input alone filters that input, and every other one is a
+  residual of the join — including one that reads only the preserved side, since a left row that fails it is padded
+  and not dropped. A `WHERE` conjunct over the null-supplying side stays above the join. A `LEFT JOIN` with no
+  equality key between its two inputs is exit code 4, as a cross product is. More than 256 relations, counting a
+  derived table and a CTE reference as one plus the relations of their body, is exit code 4 too, before the
+  per-item checks;
 - date casts: `CAST('YYYY-MM-DD' AS DATE)` and `'YYYY-MM-DD'::DATE` are the literal `DATE 'YYYY-MM-DD'`
   wherever it may stand, as in DuckDB (which names all three `CAST('YYYY-MM-DD' AS "DATE")`);
 - value expressions: columns, literals, aggregates, arithmetic (`+ - * / // %`, unary `-`), the functions
@@ -875,7 +877,7 @@ formatter:
 | 1 | query error: syntax, bind, execution or memory error | `SELECT COUNT(*) FORM t`; `FROM t semi` (a word that is never a table alias); an unknown table or column; `SUM` of a VARCHAR column; a `SUM`, or arithmetic on a `SUM`, outside HUGEINT's range; an invalid `regexp_replace` pattern; a query that needs more memory than `--memory-limit` |
 | 2 | usage error | unknown option; neither or both of `-c` and `-f`; a malformed `--table`, `--column-type` or `--memory-limit`; a column that `--column-type` cannot read as DATE; a table name registered twice |
 | 3 | I/O error | a missing or unreadable file; not a Parquet file; schemas that differ; a glob that matches nothing |
-| 4 | unsupported: valid-looking SQL outside the supported subset | `row_number() OVER ()`; `IS NULL`; an unknown function; `SELECT 1e3`; `SUM(DISTINCT ...)`; `CAST(a AS BIGINT)`; a string literal as a DECIMAL `CASE` value; a column of an unsupported type; `FROM a LEFT JOIN b ON a.k = b.k`; `FROM t semi JOIN u ON ...`; `FROM a, b` with no join key between them (a cross product); more than 256 relations |
+| 4 | unsupported: valid-looking SQL outside the supported subset | `row_number() OVER ()`; `IS NULL`; an unknown function; `SELECT 1e3`; `SUM(DISTINCT ...)`; `CAST(a AS BIGINT)`; a string literal as a DECIMAL `CASE` value; a column of an unsupported type; `FROM a LEFT JOIN b ON a.k > b.k` (no equality key); `FROM t semi JOIN u ON ...`; `FROM a, b` with no join key between them (a cross product); more than 256 relations |
 | 70 | internal error: anything else, which is a bug | an uncaught exception; an Arrow `NotImplemented` or type error without SQL context |
 
 Exit code 4 is used only for errors that the parser, the binder or the physical planner marks as unsupported
@@ -987,7 +989,8 @@ The second workload is the 22 queries derived from TPC-H, in DuckDB's dialect, a
 committed ([ADR 0006](adr/0006-test-strategy-and-data-policy.md)); queries are referred to by their number (1-based).
 The ratchet `tests/data/tpch_status.json` lists the queries verified to pass, and `pass` below means exactly the
 ratchet (`pixi run lint` compares them); the PR that makes a query pass updates both. A query that does not pass must
-fail cleanly with exit code 4 (unsupported). Today Q1, Q3, Q5, Q6, Q10, Q12, Q14 and Q19 pass; the plan is recorded in
+fail cleanly with exit code 4 (unsupported). Today Q1, Q3, Q5, Q6, Q7, Q8, Q9, Q10, Q12, Q13, Q14 and Q19 pass; the
+plan is recorded in
 ADRs 0021 (DECIMAL), 0022
 (joins, query blocks and uncorrelated subqueries) and 0023 (correlated subqueries). `tests/tpch/` generates the data
 at test time ([testing.md](testing.md#data-derived-from-tpc-h)), and `tpch.status.sf0_01`, `tpch.status.sf0_1` and
@@ -1009,7 +1012,7 @@ completes the query; most queries also need the DECIMAL work of ADR 0021 before 
 | Q10 | pass | inner joins (ADR 0022) |
 | Q11 | unsupported (exit code 4) | uncorrelated subqueries as joins (ADR 0022) |
 | Q12 | pass | inner joins (ADR 0022) |
-| Q13 | unsupported (exit code 4) | LEFT JOIN (ADR 0022) |
+| Q13 | pass | left outer joins (ADR 0022) |
 | Q14 | pass | inner joins (ADR 0022) |
 | Q15 | unsupported (exit code 4) | uncorrelated subqueries as joins (ADR 0022) |
 | Q16 | unsupported (exit code 4) | uncorrelated subqueries as joins (ADR 0022) |

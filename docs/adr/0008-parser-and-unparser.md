@@ -76,6 +76,9 @@ Accepted
     qualifiers as written. Copying, comparing, printing and destroying the list are loops, never recursions.
   - Update (2026-10-10, roadmap PR J2b): the binder answers commas, `CROSS JOIN`, `[INNER] JOIN ... ON`, table
     aliases and qualified names; only `LEFT [OUTER] JOIN ... ON` is still rejected with `kUnsupported`, until J6.
+  - Update (2026-10-12, roadmap PR J6): the binder answers `LEFT [OUTER] JOIN ... ON` too, so every connector the
+    flat FROM list carries is now bound. The other join kinds the parser recognises and rejects by name (`RIGHT`,
+    `FULL`, `SEMI`, `ANTI`, `NATURAL`, `ASOF`, `POSITIONAL`, `JOIN ... USING`) are unchanged.
 - Update (derived tables and WITH lists, 2026-10-09, roadmap PR S4a): a query is an optional WITH list and a block, and
   a derived table and each CTE hold a query of their own (a `sql::SelectStatement` in a heap box), so the AST nests
   statements. Every walk of it (copying, comparing, printing, `sql::Depth`, destruction) recurses once per nested

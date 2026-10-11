@@ -9,8 +9,8 @@
 // names.slt for trips with zones). Semi, anti, null-aware anti and one-row joins: their counts
 // against DuckDB's for the subqueries that pending J5 and U2 records of tests/slt/cases/subqueries/
 // hold (in.slt, exists.slt and scalar.slt). Left joins, and semi and anti joins with residuals:
-// their counts against DuckDB's for the pending J6 records of tests/slt/cases/joins/left.slt and U2
-// records of exists.slt. The counts depend on the fixtures (tools/fixturegen/star.h): after a
+// their counts against DuckDB's for the records of tests/slt/cases/joins/left.slt and the pending
+// U2 records of exists.slt. The counts depend on the fixtures (tools/fixturegen/star.h): after a
 // change of the fixture digest (tests/harness), `pixi run slt-complete` rewrites those records from
 // DuckDB, and the counts here follow them.
 
@@ -574,7 +574,7 @@ TEST_F(JoinTest, SemiAntiAndOneRowJoinsCountAsDuckDB) {
 }
 
 // Left joins, and semi and anti joins with residuals, of trips: each aggregate row is DuckDB's for
-// the same LEFT JOIN or [NOT] EXISTS, which a pending J6 record of left.slt or U2 record of
+// the same LEFT JOIN or [NOT] EXISTS, which a record of left.slt or a pending U2 record of
 // exists.slt holds (the record's line in each case). An ON conjunct on the right input only is a
 // Filter below the join; any other ON conjunct is a residual, also one on trips only (a trip that
 // fails it is padded, not dropped). INTEGER drivers meet BIGINT ids through a Compute of

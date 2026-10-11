@@ -334,6 +334,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kTablePath,
     Feature::kCommaJoin,
     Feature::kJoinOn,
+    Feature::kLeftJoin,
     Feature::kTableAlias,
     Feature::kQualifiedName,
     Feature::kWhere,

@@ -722,8 +722,8 @@ TEST(QueryGenerator, LeftJoinsChangeOnlyLeftJoinQueries) {
   const FeatureSet with_left = Union(kSupportedFeatures, {Feature::kLeftJoin});
   // target_percent 0: every query draws from `supported`, not from the whole grammar.
   const auto with = MakeOver(JoinTables(), 43, {.supported = with_left, .target_percent = 0});
-  const auto without =
-      MakeOver(JoinTables(), 43, {.supported = kSupportedFeatures, .target_percent = 0});
+  const auto without = MakeOver(
+      JoinTables(), 43, {.supported = with_left.Minus({Feature::kLeftJoin}), .target_percent = 0});
   int promoted = 0;
   int same = 0;
   int wider = 0;

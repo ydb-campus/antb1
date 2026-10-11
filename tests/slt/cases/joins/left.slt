@@ -1,6 +1,6 @@
 # LEFT [OUTER] JOIN over the star schema (ADR 0022): padded rows and COUNT(col) against COUNT(*), the same predicate
 # in ON and in WHERE, ON conjuncts on either side, the empty dimension, a two-column key and inner joins mixed with a
-# LEFT JOIN in several FROM orders. Every pending join has an equality key whose common type is not DOUBLE.
+# LEFT JOIN in several FROM orders. Every join here has an equality key whose common type is not DOUBLE.
 
 # ---- the inputs, one table at a time ----
 
@@ -20,44 +20,38 @@ SELECT ct_id FROM cities WHERE ct_pop > 40000
 1
 2
 
-# ---- pending: left joins (ADR 0022; roadmap PR J6 removes these guards) ----
+# ---- left joins (ADR 0022, roadmap PR J6) ----
 
 # The same predicate in ON keeps every trip and pads those without a zone of radius above 2; in WHERE it drops them.
-pending J6
 query III nosort
 SELECT COUNT(*), COUNT(zn_id), COUNT(zn_radius) FROM trips LEFT JOIN zones ON tr_pickup = zn_id AND zn_radius > 2
 ----
 3000	1047	1047
 
-pending J6
 query III nosort
 SELECT COUNT(*), COUNT(zn_id), COUNT(zn_radius) FROM trips LEFT JOIN zones ON tr_pickup = zn_id WHERE zn_radius > 2
 ----
 1047	1047	1047
 
 # An ON conjunct on the preserved side pads the trips that fail it, and drops none.
-pending J6
 query IID nosort
 SELECT COUNT(*), COUNT(dv_id), SUM(tr_fare) FROM trips LEFT JOIN drivers ON tr_driver = dv_id AND tr_fare > 20
 ----
 3000	771	44992.50
 
 # COUNT(col) skips the padded NULLs, and the NULLs of the data.
-pending J6
 query IIIII nosort
 SELECT COUNT(*), COUNT(dv_id), COUNT(dv_city), COUNT(dv_since), COUNT(tr_driver) FROM trips LEFT OUTER JOIN drivers ON tr_driver = dv_id
 ----
 3000	2577	2345	2577	2896
 
 # The empty dimension pads every row.
-pending J6
 query IID nosort
 SELECT COUNT(*), COUNT(pm_id), SUM(pm_discount) FROM trips LEFT JOIN promos ON tr_promo = pm_id
 ----
 3000	0	NULL
 
 # Padded rows group under NULL, with zone 38's NULL city.
-pending J6
 query III rowsort
 SELECT zn_city, COUNT(*), COUNT(zn_id) FROM trips LEFT JOIN zones ON tr_pickup = zn_id GROUP BY zn_city
 ----
@@ -70,21 +64,18 @@ SELECT zn_city, COUNT(*), COUNT(zn_id) FROM trips LEFT JOIN zones ON tr_pickup =
 NULL	276	69
 
 # The two-column key: the two repeated keys of shifts add a row each.
-pending J6
 query III nosort
 SELECT COUNT(*), COUNT(sh_row), COUNT(sh_hours) FROM trips LEFT JOIN shifts ON tr_driver = sh_driver AND tr_day = sh_day
 ----
 3002	447	426
 
 # An ON conjunct across both sides is a residual: each passing shift is a match, and a trip without one is padded once.
-pending J6
 query II nosort
 SELECT COUNT(*), COUNT(sh_row) FROM trips LEFT JOIN shifts ON tr_driver = sh_driver AND sh_day < tr_day
 ----
 7579	6785
 
 # An ON conjunct on the null-supplying side filters that side only.
-pending J6
 query III rowsort
 SELECT ct_id, ct_pop, COUNT(*) FROM riders LEFT JOIN cities ON rd_city = ct_id AND ct_pop > 40000 GROUP BY ct_id, ct_pop
 ----
@@ -93,14 +84,12 @@ SELECT ct_id, ct_pop, COUNT(*) FROM riders LEFT JOIN cities ON rd_city = ct_id A
 NULL	NULL	86
 
 # A WHERE conjunct on the preserved side.
-pending J6
 query II nosort
 SELECT COUNT(*), COUNT(dv_id) FROM trips LEFT JOIN drivers ON tr_driver = dv_id WHERE tr_fare > 20
 ----
 897	771
 
 # DECIMAL keys of two types: 0.88, 2.25 and NULL rates are padded.
-pending J6
 query DII rowsort
 SELECT tr_rate, COUNT(*), COUNT(tf_rate) FROM trips LEFT JOIN tariffs ON tr_rate = tf_rate GROUP BY tr_rate
 ----
@@ -115,7 +104,6 @@ SELECT tr_rate, COUNT(*), COUNT(tf_rate) FROM trips LEFT JOIN tariffs ON tr_rate
 NULL	231	0
 
 # Padding of every type: VARCHAR, DECIMAL and the empty string next to NULL.
-pending J6
 query ITTDT rowsort
 SELECT tr_row, tr_tariff, tf_code, tf_rate, tf_label FROM trips LEFT JOIN tariffs ON tr_tariff = tf_code WHERE tr_row < 10
 ----
@@ -131,7 +119,6 @@ SELECT tr_row, tr_tariff, tf_code, tf_rate, tf_label FROM trips LEFT JOIN tariff
 9	POOL	POOL	0.875	pool
 
 # Two LEFT JOINs: the second pads the trips the first padded, and those of zone 38 (NULL city) and zone 39 (city 9).
-pending J6
 query III nosort
 SELECT COUNT(*), COUNT(zn_id), COUNT(ct_id) FROM trips LEFT JOIN zones ON tr_pickup = zn_id LEFT JOIN cities ON zn_city = ct_id
 ----
@@ -139,23 +126,55 @@ SELECT COUNT(*), COUNT(zn_id), COUNT(ct_id) FROM trips LEFT JOIN zones ON tr_pic
 
 # An inner join and a LEFT JOIN in three FROM orders. The items from the last comma up to a LEFT JOIN form its left
 # input (ADR 0022): trips JOIN drivers in the first, trips in the other two.
-pending J6
 query IID nosort inner_left
 SELECT COUNT(*), COUNT(zn_id), SUM(tr_fare) FROM trips JOIN drivers ON tr_driver = dv_id LEFT JOIN zones ON tr_pickup = zn_id
 ----
 2577	2398	38689.00
 
-pending J6
 query IID nosort inner_left
 SELECT COUNT(*), COUNT(zn_id), SUM(tr_fare) FROM drivers, trips LEFT JOIN zones ON tr_pickup = zn_id WHERE tr_driver = dv_id
 ----
 2577	2398	38689.00
 
-pending J6
 query IID nosort inner_left
 SELECT COUNT(*), COUNT(zn_id), SUM(tr_fare) FROM trips LEFT JOIN zones ON tr_pickup = zn_id JOIN drivers ON dv_id = tr_driver
 ----
 2577	2398	38689.00
+
+# A CROSS JOIN continues its join group, so the unit's left input is drivers and trips together and the WHERE
+# equality between them moves on into that input, where it is their key (ADR 0022's "One relation" rule). Without
+# that descent the input has no key at all and the query would exit 4, where DuckDB answers.
+query IID nosort inner_left
+SELECT COUNT(*), COUNT(zn_id), SUM(tr_fare) FROM drivers CROSS JOIN trips LEFT JOIN zones ON tr_pickup = zn_id WHERE tr_driver = dv_id
+----
+2577	2398	38689.00
+
+# The unit's own key spelled again in WHERE is a conjunct of the enclosing block, not a repeat of the key: it
+# filters the unit's rows, so the padded ones go (tr_pickup = NULL is unknown) and the inner join's rows are left.
+query II nosort
+SELECT COUNT(*), COUNT(zn_id) FROM trips LEFT JOIN zones ON tr_pickup = zn_id WHERE tr_pickup = zn_id
+----
+2793	2793
+
+# An inner join above the unit, keyed on the null-supplying side: its key must be built above the padding, not
+# inside the unit, or the padded rows would meet cities and survive.
+query II nosort
+SELECT COUNT(*), COUNT(ct_id) FROM trips LEFT JOIN zones ON tr_pickup = zn_id JOIN cities ON zn_city = ct_id
+----
+2655	2655
+
+# An ON conjunct that reads only the preserved side is a residual of the join, never a filter of that side: every
+# trip stays and none matches.
+query II nosort
+SELECT COUNT(*), COUNT(zn_id) FROM trips LEFT JOIN zones ON tr_pickup = zn_id AND tr_fare > 1000000
+----
+3000	0
+
+# A unit inside the body of a grouped derived table (ADR 0022's J4 blocks, which J6's units nest inside).
+query II nosort
+SELECT COUNT(*), SUM(n) FROM (SELECT tr_pickup AS p, COUNT(zn_id) AS n FROM trips LEFT JOIN zones ON tr_pickup = zn_id GROUP BY tr_pickup) s
+----
+43	2793
 
 # ---- DuckDB only until DOUBLE join keys get a PR (ADR 0022: a LEFT JOIN without another key exits 4) ----
 

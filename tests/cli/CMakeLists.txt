@@ -233,6 +233,39 @@ antb1_add_cli_golden(
     --table
     "zones=${_f}/star/zones.parquet"
 )
+# A LEFT JOIN unit's ON, by its own rules (ADR 0022): the equality between its inputs is its key,
+# the conjunct that reads only the right input is pushed into that input (rule 11), and the one that
+# reads only the preserved side is a residual of the join, since a left row that fails it is padded
+# and not dropped. The build side is the right input, which the executor requires.
+antb1_add_cli_golden(
+  explain_left_join_fixed_unit
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT COUNT(*), COUNT(zn_id) FROM trips LEFT JOIN zones ON tr_pickup = zn_id AND zn_radius > 2 AND tr_fare > 20"
+    --table
+    "trips=${_f}/star/trips.parquet"
+    --table
+    "zones=${_f}/star/zones.parquet"
+)
+# A WHERE conjunct that reads the null-supplying side stays above the unit, where it drops the
+# padded rows: it never reaches the right input, and the join stays a LEFT JOIN, since there is no
+# LEFT-to-INNER conversion under a NULL-rejecting WHERE (ADR 0022).
+antb1_add_cli_golden(
+  explain_left_join_where_split
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT COUNT(*) FROM trips LEFT JOIN zones ON tr_pickup = zn_id WHERE zn_radius <= 2"
+    --table
+    "trips=${_f}/star/trips.parquet"
+    --table
+    "zones=${_f}/star/zones.parquet"
+)
 # Decision C8 made visible: a CTE referenced twice is bound twice and scanned twice, so the plan
 # holds two identical subtrees rather than one shared node.
 antb1_add_cli_golden(

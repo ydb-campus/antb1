@@ -2502,6 +2502,21 @@ class Binder {
   [[nodiscard]] std::vector<std::size_t> RelationsOf(const Expr& expr) const;
   arrow::Status BindElement(const sql::Expr& element);
   arrow::Status BindConjunct(const sql::Expr& conjunct, SourceSpan element);
+  // A conjunct classified in the block `block_` already descended to, by the relations it reads.
+  arrow::Status ClassifyConjunct(const sql::Expr& conjunct, SourceSpan element,
+                                 const std::vector<std::size_t>& bindings);
+  // The block a conjunct over `bindings` is classified in: this one, or, while they all sit in the
+  // left input of a single LEFT JOIN unit of it, that input (ADR 0022's "One relation" rule, whose
+  // conjunct moves on into the unit's left input and may become a key there). A conjunct that
+  // reads the null-supplying side stops at the unit, so it filters its rows, padded ones included.
+  [[nodiscard]] std::size_t DescendTo(std::size_t block,
+                                      const std::vector<std::size_t>& bindings) const;
+  // The blocks and LEFT JOIN units of the FROM list, before anything is classified.
+  void BuildBlocks();
+  std::size_t NewBlock(std::vector<std::size_t> relations);
+  // The ON of the LEFT JOIN at FROM position `item`, classified into unit `u`.
+  arrow::Status BindUnitOn(std::size_t u, const sql::FromItem& item);
+  arrow::Status BindUnitConjunct(std::size_t u, const sql::Expr& conjunct, SourceSpan element);
   // A conjunct over one relation at most: routed to it, as a single-table WHERE conjunct is.
   arrow::Status BindOnOneRelation(const sql::Expr& conjunct, SourceSpan element,
                                   std::size_t relation);
@@ -2709,6 +2724,10 @@ class Binder {
     int64_t divisor = 0;
   };
   std::vector<Unit> units_;
+  // Per FROM position: the unit the LEFT JOIN there is, so BindWhere finds it in FROM order, or
+  // kNoUnit for every other connector.
+  static constexpr std::size_t kNoUnit = static_cast<std::size_t>(-1);
+  std::vector<std::size_t> unit_at_;
   std::vector<JoinBlock> blocks_;  // blocks_[0] is the statement's own; a unit's inputs follow
   std::size_t block_ = 0;          // the block the conjunct being bound is classified in
 
@@ -3622,6 +3641,64 @@ bool Binder::BlockHolds(std::size_t block, std::size_t binding) const {
                              [&](std::size_t r) { return HoldsBinding(r, binding); });
 }
 
+// The blocks and LEFT JOIN units of the FROM list (ADR 0022, "Inner blocks"). The items a comma
+// separates start groups; within a group CROSS JOIN and INNER JOIN add relations, and a LEFT JOIN
+// makes the group so far its left input and its own item its right input, taking their place as one
+// relation of the group. The statement's own block holds every group's relations. Only the shape is
+// built here: an ON's keys and residual are classified in BindWhere, in FROM order.
+void Binder::BuildBlocks() {
+  unit_at_.assign(stmt_.from.size(), kNoUnit);
+  std::vector<std::size_t> top;    // the relations of the statement's own block
+  std::vector<std::size_t> group;  // the relations of the group being read
+  for (std::size_t i = 0; i < stmt_.from.size(); ++i) {
+    if (stmt_.from[i].connector == sql::Connector::kComma) {
+      top.insert(top.end(), group.begin(), group.end());
+      group.clear();
+    }
+    if (stmt_.from[i].connector != sql::Connector::kLeft) {
+      group.push_back(i);
+      continue;
+    }
+    ANTB1_CHECK(!group.empty());  // the parser gives the first FROM item kFirst
+    const std::size_t left = NewBlock(group);
+    const std::size_t right = NewBlock({i});
+    units_.push_back(Unit{.left = left, .right = right, .span = stmt_.from[i].connector_span});
+    unit_at_[i] = units_.size() - 1;
+    relations_.push_back(Relation{.unit = units_.size() - 1});
+    group.assign({relations_.size() - 1});
+  }
+  top.insert(top.end(), group.begin(), group.end());
+  blocks_.front().relations = std::move(top);
+}
+
+std::size_t Binder::NewBlock(std::vector<std::size_t> relations) {
+  blocks_.push_back(JoinBlock{.relations = std::move(relations)});
+  return blocks_.size() - 1;
+}
+
+std::size_t Binder::DescendTo(std::size_t block, const std::vector<std::size_t>& bindings) const {
+  if (bindings.empty()) {
+    return block;
+  }
+  for (;;) {
+    const std::vector<std::size_t> locals = LocalsOf(block, bindings);
+    if (locals.size() != 1) {
+      return block;
+    }
+    const std::optional<std::size_t> unit =
+        relations_[blocks_[block].relations[locals.front()]].unit;
+    if (!unit.has_value()) {
+      return block;
+    }
+    const std::size_t left = units_[*unit].left;
+    const auto inside = [&](std::size_t b) { return BlockHolds(left, b); };
+    if (!std::ranges::all_of(bindings, inside)) {
+      return block;  // it reads the null-supplying side: it stays above the unit
+    }
+    block = left;
+  }
+}
+
 std::optional<std::size_t> Binder::LocalOf(std::size_t block, std::size_t binding) const {
   const JoinBlock& b = blocks_[block];
   for (std::size_t i = 0; i < b.relations.size(); ++i) {
@@ -3646,15 +3723,28 @@ std::vector<std::size_t> Binder::LocalsOf(std::size_t block,
 }
 
 arrow::Status Binder::BindConjunct(const sql::Expr& conjunct, SourceSpan element) {
-  const std::vector<std::size_t> relations = RelationsRead(conjunct);
+  const std::vector<std::size_t> bindings = RelationsRead(conjunct);
+  const std::size_t outer = block_;
+  block_ = DescendTo(block_, bindings);
+  const arrow::Status status = ClassifyConjunct(conjunct, element, bindings);
+  block_ = outer;
+  return status;
+}
+
+arrow::Status Binder::ClassifyConjunct(const sql::Expr& conjunct, SourceSpan element,
+                                       const std::vector<std::size_t>& bindings) {
+  const JoinBlock& block = blocks_[block_];
+  const std::vector<std::size_t> relations = LocalsOf(block_, bindings);
   if (relations.size() <= 1) {
-    // A conjunct of constants alone belongs to the first relation, which every plan has.
-    return BindOnOneRelation(conjunct, element, relations.empty() ? 0 : relations.front());
+    // A conjunct of constants alone belongs to the first relation, which every block has.
+    const std::size_t local = relations.empty() ? 0 : relations.front();
+    return BindOnOneRelation(conjunct, element, block.relations[local]);
   }
   if (IsCompound(conjunct)) {
-    return BindAcrossRelations(conjunct, relations);
+    return BindAcrossRelations(conjunct, bindings);
   }
-  // A plain BETWEEN is its two comparisons, each classified on its own: one may be a key.
+  // A plain BETWEEN is its two comparisons, each classified on its own: one may be a key, and one
+  // may belong to a deeper block than the two together do.
   std::vector<sql::Expr> comparisons;
   if (const auto* between = std::get_if<sql::BetweenExpr>(&conjunct)) {
     ARROW_RETURN_NOT_OK(
@@ -3664,16 +3754,118 @@ arrow::Status Binder::BindConjunct(const sql::Expr& conjunct, SourceSpan element
     }
   }
   if (comparisons.empty()) {
-    return BindAcrossRelations(conjunct, relations);
+    return BindAcrossRelations(conjunct, bindings);
   }
   for (const sql::Expr* part : {&comparisons.front(), &comparisons.back()}) {
-    const std::vector<std::size_t> read = RelationsRead(*part);
-    if (read.size() <= 1) {
-      ARROW_RETURN_NOT_OK(BindOnOneRelation(*part, element, read.empty() ? 0 : read.front()));
-    } else {
-      ARROW_RETURN_NOT_OK(BindAcrossRelations(*part, read));
+    ARROW_RETURN_NOT_OK(BindConjunct(*part, element));
+  }
+  return arrow::Status::OK();
+}
+
+// The ON of a LEFT JOIN (ADR 0022's LEFT JOIN rules), conjunct by conjunct and never factored: a
+// hoisted conjunct would have to stay inside the ON anyway, and rule 11 must never push one that
+// reads the preserved side below the join.
+arrow::Status Binder::BindUnitOn(std::size_t u, const sql::FromItem& item) {
+  for (const sql::Expr& element : item.on) {
+    std::vector<const sql::Expr*> conjuncts;
+    Conjuncts(element, conjuncts);
+    for (const sql::Expr* conjunct : conjuncts) {
+      ARROW_RETURN_NOT_OK(BindUnitConjunct(u, *conjunct, element.span()));
     }
   }
+  if (units_[u].keys.empty()) {
+    // As a disconnected inner graph is rejected: E1's table and E2's candidate pairs need a key.
+    return UnsupportedError(
+        "a LEFT JOIN without a join key between its two inputs is not supported", units_[u].span);
+  }
+  return arrow::Status::OK();
+}
+
+// One ON conjunct of a LEFT JOIN unit: an equality between its two inputs whose sides share an
+// exact key type is a key of the unit; one that reads only its right input is pushed into that
+// input (rule 11); every other conjunct is a residual of the join, one that reads only the left
+// input included, since a left row that fails it is padded and not dropped. A conjunct that reads a
+// binding outside the join's two inputs exits 4: rule 10's visibility already hides a later item,
+// so what is left is an earlier comma sibling, which DuckDB refuses as well.
+arrow::Status Binder::BindUnitConjunct(std::size_t u, const sql::Expr& conjunct,
+                                       SourceSpan element) {
+  const std::size_t left = units_[u].left;
+  const std::size_t right = units_[u].right;
+  std::vector<const sql::ColumnRef*> refs;
+  CollectRefs(conjunct, refs);
+  bool reads_left = false;
+  bool reads_right = false;
+  for (const sql::ColumnRef* ref : refs) {
+    const Lookup lookup = scope_.LookUp(*ref, visible_);
+    if (lookup.outcome != Lookup::Outcome::kFound) {
+      continue;  // it keeps its usual path and its usual error
+    }
+    const std::size_t binding = lookup.where.binding;
+    if (BlockHolds(left, binding)) {
+      reads_left = true;
+    } else if (BlockHolds(right, binding)) {
+      reads_right = true;
+    } else {
+      return UnsupportedError(
+          "a LEFT JOIN's ON must read its own two inputs only, and this reads a FROM item before "
+          "them",
+          ref->span);
+    }
+  }
+  if (reads_right && !reads_left) {
+    // Rule 11: it filters the right input alone, below the padding, which keeps the same rows.
+    const std::size_t outer = block_;
+    block_ = right;
+    const arrow::Status status =
+        BindOnOneRelation(conjunct, element, blocks_[right].relations.front());
+    block_ = outer;
+    return status;
+  }
+  // Bound once with its operands inline (BindBool computes nothing), so it can serve either as a
+  // key pair or as a residual.
+  ARROW_ASSIGN_OR_RAISE(
+      const Typed bound,
+      BindBool(conjunct, [this](const sql::Expr& e) { return BindInput(e); }, /*input=*/true));
+  const auto* predicate = std::get_if<PredicateExpr>(&bound.expr->node);
+  if (predicate != nullptr && predicate->predicate.kind == Predicate::Kind::kCompareColumns &&
+      predicate->predicate.op == CompareOp::kEq && predicate->operands.size() == 2) {
+    // Each side must read exactly one of the inputs, and the two sides different ones.
+    const auto side = [&](std::size_t i) -> std::optional<std::size_t> {
+      const std::vector<std::size_t> read = RelationsOf(*predicate->operands[i]);
+      const bool in_left =
+          std::ranges::all_of(read, [&](std::size_t b) { return BlockHolds(left, b); });
+      const bool in_right =
+          std::ranges::all_of(read, [&](std::size_t b) { return BlockHolds(right, b); });
+      if (read.empty() || (!in_left && !in_right)) {
+        return std::nullopt;
+      }
+      return in_left ? left : right;
+    };
+    const std::optional<std::size_t> a = side(0);
+    const std::optional<std::size_t> b = side(1);
+    const std::optional<LogicalType> type =
+        a.has_value() && b.has_value() && *a != *b
+            ? KeyType(predicate->operands[0]->type, predicate->operands[1]->type)
+            : std::nullopt;
+    if (type.has_value() && IsExactWidening(predicate->operands[0]->type, *type) &&
+        IsExactWidening(predicate->operands[1]->type, *type)) {
+      // The cast of a side goes on the relation of its own input that holds it, which is below the
+      // unit's join and so below the padding: the same value either way.
+      const auto column = [&](std::size_t i, std::size_t block) {
+        const std::size_t binding = RelationsOf(*predicate->operands[i]).front();
+        const std::size_t relation = blocks_[block].relations[*LocalOf(block, binding)];
+        return JoinKeyColumn(relation, predicate->operands[i], *type);
+      };
+      const bool first_left = *a == left;
+      units_[u].keys.push_back(JoinKey{.left = column(first_left ? 0 : 1, left),
+                                       .right = column(first_left ? 1 : 0, right)});
+      units_[u].divisor =
+          std::max({units_[u].divisor, KeyDomainOf(*predicate->operands[0]).value_or(0),
+                    KeyDomainOf(*predicate->operands[1]).value_or(0)});
+      return arrow::Status::OK();
+    }
+  }
+  units_[u].residual.push_back(bound.expr);
   return arrow::Status::OK();
 }
 
@@ -3704,7 +3896,10 @@ arrow::Status Binder::BindOnOneRelation(const sql::Expr& conjunct, SourceSpan el
           : std::vector<const sql::Expr*>{&comparisons.front(), &comparisons.back()};
   for (const sql::Expr* part : parts) {
     ARROW_ASSIGN_OR_RAISE(Predicate predicate, BindCondition(*part, /*having=*/false));
+    // A unit has no Scan below it, only its join: its conjuncts filter the unit's rows, padded
+    // ones included, so they never claim the scan layer that ADR 0020's pushdown reads.
     const bool on_scan =
+        !relations_[relation].unit.has_value() &&
         (!predicate.column.has_value() || scope_.Find(predicate.column->id).has_value()) &&
         (!predicate.other.has_value() || scope_.Find(predicate.other->id).has_value());
     Relation& own = relations_[relation];
@@ -3815,10 +4010,18 @@ arrow::Status Binder::BindWhere() {
   // An inner ON binds in its own visibility (rule 10): its join group first, then the comma
   // siblings before it, and never a later item. Once bound its conjuncts are WHERE conjuncts.
   for (std::size_t i = 0; i < stmt_.from.size(); ++i) {
-    if (stmt_.from[i].connector != sql::Connector::kInner) {
+    const sql::Connector connector = stmt_.from[i].connector;
+    if (connector != sql::Connector::kInner && connector != sql::Connector::kLeft) {
       continue;
     }
     visible_ = OnVisibility(stmt_.from, i);
+    if (connector == sql::Connector::kLeft) {
+      // A LEFT JOIN's ON stays with its join and goes by its own rules, so it is classified into
+      // the unit rather than flattened into this block's conjuncts.
+      ANTB1_CHECK(unit_at_[i] != kNoUnit);  // BuildBlocks makes one unit per LEFT JOIN
+      ARROW_RETURN_NOT_OK(BindUnitOn(unit_at_[i], stmt_.from[i]));
+      continue;
+    }
     for (const sql::Expr& element : stmt_.from[i].on) {
       ARROW_RETURN_NOT_OK(BindElement(element));
     }
@@ -3856,14 +4059,16 @@ arrow::Status Binder::BindElement(const sql::Expr& element) {
 // first by an edge (ADR 0022's connectivity check), and OrderJoins then picks the left-deep order
 // from footer statistics. A unit's inputs are ordered before the block that holds the unit, since
 // its estimate stands in for the unit's rows there.
-arrow::Status Binder::OrderRelations() {
-  for (std::size_t b = blocks_.size(); b > 0; --b) {
-    ARROW_RETURN_NOT_OK(OrderBlock(b - 1));
-  }
-  return arrow::Status::OK();
-}
+arrow::Status Binder::OrderRelations() { return OrderBlock(0); }
 
 arrow::Status Binder::OrderBlock(std::size_t b) {
+  // Every unit's own inputs first: its estimate stands in for the unit's rows in this block.
+  for (const std::size_t r : blocks_[b].relations) {
+    if (const std::optional<std::size_t> u = relations_[r].unit) {
+      ARROW_RETURN_NOT_OK(OrderBlock(units_[*u].left));
+      ARROW_RETURN_NOT_OK(OrderBlock(units_[*u].right));
+    }
+  }
   JoinBlock& block = blocks_[b];
   block.stats.clear();
   block.stats.reserve(block.relations.size());
@@ -4184,6 +4389,7 @@ arrow::Status Binder::BindOrderBy() {
 }
 
 arrow::Result<LogicalPlan> Binder::Bind() {
+  BuildBlocks();
   ARROW_RETURN_NOT_OK(BindSelectList());
   ARROW_RETURN_NOT_OK(BindWhere());
   if (!stmt_.group_by.empty()) {
@@ -4530,10 +4736,6 @@ sql::SelectStatement FoldDateCasts(sql::SelectStatement stmt) {
 arrow::Status CheckFromList(const std::vector<sql::FromItem>& from) {
   ANTB1_CHECK(!from.empty());  // the parser makes no statement without a FROM item
   for (const sql::FromItem& item : from) {
-    if (item.connector == sql::Connector::kLeft) {
-      return Reject(
-          Rejection{.span = item.connector_span, .message = "LEFT JOIN is not supported"});
-    }
     for (const sql::Expr& conjunct : item.on) {
       if (auto r = RejectCondition(conjunct, /*having=*/false)) {
         return Reject(*r);
