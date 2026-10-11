@@ -28,6 +28,7 @@
 
 #include "join_order.h"
 #include "or_factoring.h"
+#include "relation_count.h"
 #include "scope.h"
 
 // The binding rules are documented in docs/sql-subset.md and
@@ -4352,12 +4353,6 @@ std::optional<Rejection> RejectDerivedTable(const sql::FromItem& item) {
 // source, which precedes its ON.
 arrow::Status CheckFromList(const std::vector<sql::FromItem>& from) {
   ANTB1_CHECK(!from.empty());  // the parser makes no statement without a FROM item
-  if (from.size() > kMaxRelations) {
-    return Reject(Rejection{
-        .span = from[kMaxRelations].connector_span,
-        .message =
-            std::format("a query of more than {} relations is not supported", kMaxRelations)});
-  }
   for (const sql::FromItem& item : from) {
     if (item.connector == sql::Connector::kLeft) {
       return Reject(
@@ -4379,7 +4374,23 @@ arrow::Status CheckFromList(const std::vector<sql::FromItem>& from) {
 // reported (like the parser's own kUnsupported errors) before any name is resolved, so also over
 // tables that do not exist, at the first one in query order. The relation limit belongs here too;
 // the connectivity check cannot, since it needs the ids of the bound conjuncts (Binder::BindWhere).
+// Every relation the statement expands to, sub-plans included, before anything else is checked:
+// every walk of a plan recurses per node, so the limit comes first, like the parser's depth limit
+// (ADR 0022). A derived table or a CTE reference counts 1 plus its body, so a chain of CTEs that
+// each join the previous one with itself is rejected before any sub-plan is bound.
+arrow::Status CheckRelationLimit(const sql::SelectStatement& stmt) {
+  const std::optional<RelationOverflow> over = RelationsExceedLimit(stmt);
+  if (!over.has_value()) {
+    return arrow::Status::OK();
+  }
+  const sql::FromItem& item = stmt.from[over->item];
+  return Reject(Rejection{
+      .span = item.connector == sql::Connector::kFirst ? item.span : item.connector_span,
+      .message = std::format("a query of more than {} relations is not supported", kMaxRelations)});
+}
+
 arrow::Status CheckSupported(const sql::SelectStatement& stmt) {
+  ARROW_RETURN_NOT_OK(CheckRelationLimit(stmt));
   if (auto r = RejectWith(stmt)) {
     return Reject(*r);
   }
