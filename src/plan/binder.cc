@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <deque>
 #include <format>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -2061,7 +2062,15 @@ class Binder {
       : stmt_(stmt),
         scope_(std::move(bindings), outer),
         ids_(ids),
-        relations_(scope_.bindings().size()) {}
+        relations_(scope_.bindings().size()) {
+    // Relations 0 to bindings - 1 are the bindings, in FROM order, which is the invariant
+    // OnVisibility and Scope::Find share; BuildBlocks adds one relation per LEFT JOIN unit after
+    // them, and gathers the relations of each block.
+    blocks_.push_back(JoinBlock{});
+    for (std::size_t r = 0; r < relations_.size(); ++r) {
+      blocks_.front().relations.push_back(r);
+    }
+  }
 
   arrow::Result<LogicalPlan> Bind();
 
@@ -2500,6 +2509,18 @@ class Binder {
   // sides that share a key type, else a residual of the join that first has all its relations.
   arrow::Status BindAcrossRelations(const sql::Expr& conjunct,
                                     const std::vector<std::size_t>& relations);
+  // The relation of block `block` that holds binding `binding`, by its index in that block: the
+  // binding itself, or the LEFT JOIN unit it is an input of. std::nullopt when the block holds it
+  // nowhere, which only an enclosing block's conjunct can ask.
+  [[nodiscard]] std::optional<std::size_t> LocalOf(std::size_t block, std::size_t binding) const;
+  // Whether relation `r` holds binding `binding`: it is that binding's relation, or a LEFT JOIN
+  // unit one of whose inputs holds it, however deeply nested.
+  [[nodiscard]] bool HoldsBinding(std::size_t r, std::size_t binding) const;
+  // Whether block `block` holds binding `binding`, through any of its relations.
+  [[nodiscard]] bool BlockHolds(std::size_t block, std::size_t binding) const;
+  // The relations of block `block` that `bindings` read, by their indices there, ascending.
+  [[nodiscard]] std::vector<std::size_t> LocalsOf(std::size_t block,
+                                                  const std::vector<std::size_t>& bindings) const;
   // The column of a join key's side on relation `r`: the side itself when it is already a column
   // of that relation of type `type`, else its exact widening, computed on the relation's branch.
   BoundColumn JoinKeyColumn(std::size_t r, const ExprPtr& side, LogicalType type);
@@ -2507,13 +2528,21 @@ class Binder {
   // has one, any other expression none. A cast keeps it, an exact widening being injective.
   [[nodiscard]] std::optional<int64_t> KeyDomainOf(const Expr& side);
   arrow::Status BindWhere();
+  // The join order of every block, innermost first: a block's relations must be connected, and
+  // OrderJoins then picks the left-deep order of them.
   arrow::Status OrderRelations();
+  arrow::Status OrderBlock(std::size_t b);
+  [[nodiscard]] std::optional<int64_t> RelationEstimate(std::size_t r) const;
+  [[nodiscard]] std::optional<int64_t> BlockEstimate(std::size_t b) const;
+  [[nodiscard]] std::size_t FirstBindingOf(std::size_t r) const;
   // The node of relation `r`: its binding's Scan, then the conjuncts routed to it and the columns
   // they compute. The scan filter stays directly above the Scan on every branch, where part
   // pruning and ADR 0020's pushdown look for it.
   LogicalNodePtr RelationNode(std::size_t r);
-  // The relations joined in the order OrderRelations chose, left-deep.
-  LogicalNodePtr JoinTree();
+  // The relations of block `block` joined in the order OrderRelations chose, left-deep.
+  LogicalNodePtr JoinTree(std::size_t block);
+  // The join of LEFT JOIN unit `u`'s two inputs, built on its right input.
+  LogicalNodePtr UnitNode(std::size_t u);
   // The qualifier of the column `id` belongs to (BoundColumn::qualifier, which EXPLAIN shows), or
   // none for a computed column, which belongs to no binding.
   [[nodiscard]] std::string QualifierOf(ColumnId id) const;
@@ -2634,27 +2663,54 @@ class Binder {
     std::vector<ExprPtr> join_key_exprs;  // a join key's cast, computed above the filters
     std::vector<ColumnId> join_key_ids;   // per key expression: its column
     SourceSpan filter_span;               // the clause elements its conjuncts came from
+    // The LEFT JOIN unit this relation is (into units_), or none for a binding's relation, whose
+    // layers stand on its own Scan. A unit's layers stand on its join, so they never reach a Scan
+    // and never pad: a conjunct routed here filters the unit's rows, padded ones included.
+    std::optional<std::size_t> unit;
   };
   std::vector<Relation> relations_;    // one per binding, in FROM order
   std::size_t conjunct_relation_ = 0;  // the relation the conjunct being bound is routed to
-  // The join order of the relations (join_order.h), decided once every conjunct is classified.
-  std::vector<JoinRelation> join_relations_;
-  std::vector<JoinEdge> edges_;
-  std::vector<JoinStep> steps_;
   // Per edge, the column each side compares, which JoinEdge does not carry: the key pair of the
   // join that takes the edge.
   struct EdgeKey {
-    std::size_t relation = 0;
+    std::size_t relation = 0;  // a relation of the edge's own block, by its index there
     BoundColumn column;
   };
-  std::vector<std::pair<EdgeKey, EdgeKey>> edge_keys_;  // parallel to edges_
-  // A conjunct over two or more relations that is no key: the join that first has all of them
-  // evaluates it (JoinNode::residual).
+  // A conjunct over two or more relations of one block that is no key: the join that first has all
+  // of them evaluates it (JoinNode::residual).
   struct Residual {
-    std::vector<std::size_t> relations;  // ascending, two or more
+    std::vector<std::size_t> relations;  // of the block, by index there; ascending, two or more
     ExprPtr expr;
   };
-  std::vector<Residual> residuals_;
+  // One inner block (ADR 0022, "Inner blocks"): the relations the commas, CROSS JOINs and INNER
+  // JOINs of one FROM list connect, with the join order of them (join_order.h), decided once every
+  // conjunct is classified. The statement's own FROM list is one, and each input of a LEFT JOIN
+  // unit is one of its own, so `relations` holds indices into `relations_` rather than bindings:
+  // every other member is indexed by this block's own relation order instead.
+  struct JoinBlock {
+    std::vector<std::size_t> relations;  // into relations_, in FROM order; never empty
+    std::vector<JoinRelation> stats;     // parallel to `relations`
+    std::vector<JoinEdge> edges;         // its sides index `relations`
+    std::vector<std::pair<EdgeKey, EdgeKey>> edge_keys;  // parallel to `edges`
+    std::vector<Residual> residuals;
+    std::vector<JoinStep> steps;  // one per relation, after OrderRelations
+  };
+  // A LEFT JOIN unit (ADR 0022, "Inner blocks"): one relation of its enclosing block, never
+  // reordered and always built on its right input, whose two inputs are inner blocks of their own.
+  struct Unit {
+    std::size_t left = 0;           // into blocks_: its left input, the preserved side
+    std::size_t right = 0;          // into blocks_: its right input, the null-supplying side
+    std::vector<JoinKey> keys;      // its ON's equalities between the two inputs (at least one)
+    std::vector<ExprPtr> residual;  // every other ON conjunct, a left-only one included
+    SourceSpan span;                // its LEFT JOIN connector
+    // The largest domain of any of its keys' sides, as join-order rule 3 divides by (0: unknown,
+    // which counts as 1). Its keys are edges of neither input's block, so the estimate of the unit
+    // computes it here instead.
+    int64_t divisor = 0;
+  };
+  std::vector<Unit> units_;
+  std::vector<JoinBlock> blocks_;  // blocks_[0] is the statement's own; a unit's inputs follow
+  std::size_t block_ = 0;          // the block the conjunct being bound is classified in
 
   std::vector<ExprPtr> input_exprs_;  // computed above the joins, on computed columns
   std::vector<ColumnId> input_ids_;   // per input expression: its column
@@ -3550,6 +3606,45 @@ std::vector<std::size_t> Binder::RelationsOf(const Expr& expr) const {
 // One conjunct of WHERE or of an inner ON, classified by the relations it reads (ADR 0022's WHERE
 // classification; rule 10 makes a bound ON conjunct a WHERE conjunct). `element` is the span of
 // the clause element it was flattened out of, which widens its relation's filter span.
+bool Binder::HoldsBinding(std::size_t r, std::size_t binding) const {
+  if (r == binding && !relations_[r].unit.has_value()) {
+    return true;
+  }
+  const std::optional<std::size_t> unit = relations_[r].unit;
+  if (!unit.has_value()) {
+    return false;
+  }
+  return BlockHolds(units_[*unit].left, binding) || BlockHolds(units_[*unit].right, binding);
+}
+
+bool Binder::BlockHolds(std::size_t block, std::size_t binding) const {
+  return std::ranges::any_of(blocks_[block].relations,
+                             [&](std::size_t r) { return HoldsBinding(r, binding); });
+}
+
+std::optional<std::size_t> Binder::LocalOf(std::size_t block, std::size_t binding) const {
+  const JoinBlock& b = blocks_[block];
+  for (std::size_t i = 0; i < b.relations.size(); ++i) {
+    if (HoldsBinding(b.relations[i], binding)) {
+      return i;
+    }
+  }
+  return std::nullopt;
+}
+
+std::vector<std::size_t> Binder::LocalsOf(std::size_t block,
+                                          const std::vector<std::size_t>& bindings) const {
+  std::vector<std::size_t> out;
+  for (const std::size_t binding : bindings) {
+    if (const std::optional<std::size_t> local = LocalOf(block, binding)) {
+      out.push_back(*local);
+    }
+  }
+  std::ranges::sort(out);
+  out.erase(std::ranges::unique(out).begin(), out.end());
+  return out;
+}
+
 arrow::Status Binder::BindConjunct(const sql::Expr& conjunct, SourceSpan element) {
   const std::vector<std::size_t> relations = RelationsRead(conjunct);
   if (relations.size() <= 1) {
@@ -3637,28 +3732,32 @@ arrow::Status Binder::BindAcrossRelations(const sql::Expr& conjunct,
     if (type.has_value() && IsExactWidening(predicate->operands[0]->type, *type) &&
         IsExactWidening(predicate->operands[1]->type, *type)) {
       const auto side = [&](std::size_t i) {
-        return EdgeKey{.relation = i == 0 ? left.front() : right.front(),
-                       .column = JoinKeyColumn(i == 0 ? left.front() : right.front(),
-                                               predicate->operands[i], *type)};
+        const std::size_t binding = i == 0 ? left.front() : right.front();
+        return EdgeKey{.relation = *LocalOf(block_, binding),
+                       .column = JoinKeyColumn(binding, predicate->operands[i], *type)};
       };
       const EdgeKey a = side(0);
       const EdgeKey b = side(1);
-      // One equality spelled in both an ON and WHERE is one key, not two of the same join.
+      JoinBlock& block = blocks_[block_];
+      // One equality spelled in both an ON and WHERE is one key, not two of the same join. The
+      // containers are the block's own, so an equality that a LEFT JOIN unit already keys on is a
+      // conjunct of its own block again: it filters the unit's rows, padded ones included.
       const auto same = [&](const std::pair<EdgeKey, EdgeKey>& keys) {
         return (keys.first.column.id == a.column.id && keys.second.column.id == b.column.id) ||
                (keys.first.column.id == b.column.id && keys.second.column.id == a.column.id);
       };
-      if (std::ranges::none_of(edge_keys_, same)) {
-        edges_.push_back(JoinEdge{.a = a.relation,
-                                  .b = b.relation,
-                                  .a_domain = KeyDomainOf(*predicate->operands[0]),
-                                  .b_domain = KeyDomainOf(*predicate->operands[1])});
-        edge_keys_.emplace_back(a, b);
+      if (std::ranges::none_of(block.edge_keys, same)) {
+        block.edges.push_back(JoinEdge{.a = a.relation,
+                                       .b = b.relation,
+                                       .a_domain = KeyDomainOf(*predicate->operands[0]),
+                                       .b_domain = KeyDomainOf(*predicate->operands[1])});
+        block.edge_keys.emplace_back(a, b);
       }
       return arrow::Status::OK();
     }
   }
-  residuals_.push_back(Residual{.relations = relations, .expr = bound.expr});
+  blocks_[block_].residuals.push_back(
+      Residual{.relations = LocalsOf(block_, relations), .expr = bound.expr});
   return arrow::Status::OK();
 }
 
@@ -3753,23 +3852,71 @@ arrow::Status Binder::BindElement(const sql::Expr& element) {
   return arrow::Status::OK();
 }
 
-// The order the relations join in: every one must be connected to the first by an edge (ADR 0022's
-// connectivity check), and OrderJoins then picks the left-deep order from footer statistics.
+// The order the relations of every block join in: each block's relations must be connected to its
+// first by an edge (ADR 0022's connectivity check), and OrderJoins then picks the left-deep order
+// from footer statistics. A unit's inputs are ordered before the block that holds the unit, since
+// its estimate stands in for the unit's rows there.
 arrow::Status Binder::OrderRelations() {
-  join_relations_.clear();
-  join_relations_.reserve(scope_.bindings().size());
-  for (const Binding& binding : scope_.bindings()) {
-    join_relations_.push_back(JoinRelation{.rows = RelationRows(binding)});
+  for (std::size_t b = blocks_.size(); b > 0; --b) {
+    ARROW_RETURN_NOT_OK(OrderBlock(b - 1));
   }
-  if (const auto unconnected = FirstUnconnected(join_relations_.size(), edges_)) {
+  return arrow::Status::OK();
+}
+
+arrow::Status Binder::OrderBlock(std::size_t b) {
+  JoinBlock& block = blocks_[b];
+  block.stats.clear();
+  block.stats.reserve(block.relations.size());
+  for (const std::size_t r : block.relations) {
+    block.stats.push_back(JoinRelation{.rows = RelationEstimate(r)});
+  }
+  if (const auto unconnected = FirstUnconnected(block.stats.size(), block.edges)) {
     // The message names the binding, so a sub-plan needs no table reference here.
+    const std::size_t missing = FirstBindingOf(block.relations[*unconnected]);
+    const std::size_t first = FirstBindingOf(block.relations.front());
     return UnsupportedError(
         std::format("a cross product is not supported: no join key connects '{}' to '{}'",
-                    scope_.bindings()[*unconnected].name(), scope_.bindings().front().name()),
-        stmt_.from[*unconnected].span);
+                    scope_.bindings()[missing].name(), scope_.bindings()[first].name()),
+        stmt_.from[missing].span);
   }
-  steps_ = OrderJoins(join_relations_, edges_);
+  block.steps = OrderJoins(block.stats, block.edges);
   return arrow::Status::OK();
+}
+
+// The rows of relation `r`, estimated: a binding's own (RelationRows), and for a LEFT JOIN unit its
+// inputs joined as an inner join, but never below its left input's rows, since every left row
+// yields one (ADR 0022's join-order rule 3).
+std::optional<int64_t> Binder::RelationEstimate(std::size_t r) const {
+  const std::optional<std::size_t> unit = relations_[r].unit;
+  if (!unit.has_value()) {
+    return RelationRows(scope_.bindings()[r]);
+  }
+  const std::optional<int64_t> left = BlockEstimate(units_[*unit].left);
+  const std::optional<int64_t> right = BlockEstimate(units_[*unit].right);
+  if (!left.has_value() || !right.has_value()) {
+    return std::nullopt;
+  }
+  // Like an inner join of its inputs, by join-order rule 3 over the unit's own keys, but never
+  // below the left input's rows: every left row yields one, matched or padded.
+  const Int128 divisor = std::max<int64_t>(units_[*unit].divisor, 1);
+  const Int128 joined = Int128{*left} * Int128{*right} / divisor;
+  return std::max(*left, Int128ToInt64(joined).value_or(std::numeric_limits<int64_t>::max()));
+}
+
+// The rows block `b` outputs, estimated: its last step's, which OrderJoins already saturated.
+std::optional<int64_t> Binder::BlockEstimate(std::size_t b) const {
+  const JoinBlock& block = blocks_[b];
+  if (block.steps.empty()) {
+    return std::nullopt;
+  }
+  return block.steps.back().estimate;
+}
+
+// The first binding, in FROM order, that relation `r` holds: itself, or the first of the leftmost
+// input of a LEFT JOIN unit. Used for the messages and spans that name a FROM item.
+std::size_t Binder::FirstBindingOf(std::size_t r) const {
+  const std::optional<std::size_t> unit = relations_[r].unit;
+  return unit.has_value() ? FirstBindingOf(blocks_[units_[*unit].left].relations.front()) : r;
 }
 
 // The GROUP BY keys: an expression over the table's columns (a table column first), or else the
@@ -4060,7 +4207,10 @@ arrow::Result<LogicalPlan> Binder::Bind() {
 
 LogicalNodePtr Binder::RelationNode(std::size_t r) {
   Relation& relation = relations_[r];
-  LogicalNodePtr node = scope_.bindings()[r].Node();  // a fresh Scan per call
+  // A binding's own Scan (a fresh one per call), or the join of a LEFT JOIN unit's two inputs,
+  // which is the one join of the plan that is never reordered and always builds on its right.
+  LogicalNodePtr node =
+      relation.unit.has_value() ? UnitNode(*relation.unit) : scope_.bindings()[r].Node();
   if (!relation.scan_filter.empty()) {
     node = Make(FilterNode{.input = std::move(node),
                            .predicates = std::move(relation.scan_filter),
@@ -4086,24 +4236,38 @@ LogicalNodePtr Binder::RelationNode(std::size_t r) {
   return node;
 }
 
-LogicalNodePtr Binder::JoinTree() {
-  ANTB1_CHECK(!steps_.empty());  // OrderRelations makes one step per relation
-  LogicalNodePtr node = RelationNode(steps_.front().relation);
-  std::vector<std::size_t> joined{steps_.front().relation};
-  for (std::size_t k = 1; k < steps_.size(); ++k) {
-    const JoinStep& step = steps_[k];
+// The join of a LEFT JOIN unit's two inputs: its ON's keys and residual, built on its right input,
+// which is what the executor requires of an outer join (ADR 0022, "Build sides").
+LogicalNodePtr Binder::UnitNode(std::size_t u) {
+  Unit& unit = units_[u];
+  return Make(JoinNode{.kind = JoinKind::kLeft,
+                       .left = JoinTree(unit.left),
+                       .right = JoinTree(unit.right),
+                       .keys = std::move(unit.keys),
+                       .residual = std::move(unit.residual),
+                       .build = BuildSide::kRight,
+                       .span = unit.span});
+}
+
+LogicalNodePtr Binder::JoinTree(std::size_t b) {
+  JoinBlock& block = blocks_[b];
+  ANTB1_CHECK(!block.steps.empty());  // OrderRelations makes one step per relation
+  LogicalNodePtr node = RelationNode(block.relations[block.steps.front().relation]);
+  std::vector<std::size_t> joined{block.steps.front().relation};
+  for (std::size_t k = 1; k < block.steps.size(); ++k) {
+    const JoinStep& step = block.steps[k];
     std::vector<JoinKey> keys;
     for (const std::size_t e : step.edges) {
       // An edge has no orientation: the side on the relation this step adds is the right one.
-      const auto& [a, b] = edge_keys_[e];
+      const auto& [a, b_key] = block.edge_keys[e];
       const bool a_right = a.relation == step.relation;
-      keys.push_back(
-          JoinKey{.left = a_right ? b.column : a.column, .right = a_right ? a.column : b.column});
+      keys.push_back(JoinKey{.left = a_right ? b_key.column : a.column,
+                             .right = a_right ? a.column : b_key.column});
     }
     joined.push_back(step.relation);
     // The residuals whose relations are all joined now, which no earlier join could take.
     std::vector<ExprPtr> residual;
-    for (Residual& r : residuals_) {
+    for (Residual& r : block.residuals) {
       const bool ready = r.expr != nullptr && std::ranges::all_of(r.relations, [&](std::size_t x) {
                            return std::ranges::find(joined, x) != joined.end();
                          });
@@ -4112,11 +4276,12 @@ LogicalNodePtr Binder::JoinTree() {
         r.expr = nullptr;  // taken by this join
       }
     }
-    const sql::FromItem& item = stmt_.from[step.relation];
+    // The span names the FROM item the step adds: a unit's is its own leftmost binding.
+    const sql::FromItem& item = stmt_.from[FirstBindingOf(block.relations[step.relation])];
     node = Make(JoinNode{
         .kind = JoinKind::kInner,
         .left = std::move(node),
-        .right = RelationNode(step.relation),
+        .right = RelationNode(block.relations[step.relation]),
         .keys = std::move(keys),
         .residual = std::move(residual),
         .build = step.build,  // the relation it adds; ADR 0022's row-count rule is deferred
@@ -4131,7 +4296,7 @@ std::string Binder::QualifierOf(ColumnId id) const {
 }
 
 LogicalPlan Binder::Assemble() {
-  LogicalNodePtr node = JoinTree();
+  LogicalNodePtr node = JoinTree(0);
   if (!input_exprs_.empty()) {
     node = Make(ComputeNode{
         .input = std::move(node), .exprs = input_exprs_, .ids = input_ids_, .span = select_.span});
