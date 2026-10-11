@@ -175,8 +175,9 @@ ctest runs `diff.random` (label `diff`) with a fixed seed and 300 queries over t
 (over `decimals`) and `diff.star` (over the star schema of the join tests) with seeds of their own; `parallel.diff.star`
 runs the queries of `diff.star` on 4 threads in 97-row batches. A slice PR that implements a
 feature adds it to `kSupportedFeatures` (and new grammar to `runner/query_gen.cc`; the unit test
-`harness.QueryGenerator.TargetSamplesCoverTheWholeGrammar` fails until every feature is generated). Grammar that
-the parser accepts before the generator writes it waits in `kGeneratorPending`; such a feature cannot be declared
+`harness.QueryGenerator.TargetSamplesCoverTheWholeGrammar` fails until every feature is generated). Grammar the
+generator cannot write yet waits in `kGeneratorPending`, whether because the parser rejects it or because the
+generator needs more than the parser; such a feature cannot be declared
 supported until it leaves that set. ADR 0022's T2 took derived tables and `WITH` lists out of it, so today it holds
 `LEFT JOIN`, whose generation needs the row bound to account for padded rows, and the two uncorrelated subquery
 forms, which the parser rejects until roadmap PR S4b and T2b then generates.

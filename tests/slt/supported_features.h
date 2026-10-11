@@ -92,8 +92,9 @@ enum class Feature : std::uint8_t {
   // Nested queries (ADR 0022: roadmap PR T2 generates them, J4 declares them supported)
   kDerivedTable,     // FROM (SELECT ...) [AS] s [(x, ...)]
   kCommonTableExpr,  // WITH c [(x, ...)] AS (SELECT ...) SELECT ...
-  // Uncorrelated subqueries, only as a top-level conjunct of WHERE or an inner ON (ADR 0022's J5).
-  // The parser rejects both until roadmap PR S4b, so T2b generates them and J5 declares them.
+  // Uncorrelated subqueries, only as a top-level conjunct of WHERE, HAVING or an inner ON (ADR
+  // 0022's J5). The parser rejects both until roadmap PR S4b, so T2b generates them and J5
+  // declares them.
   kInSubquery,      // column [NOT] IN (SELECT ...), and NOT (column IN (SELECT ...))
   kScalarSubquery,  // column <op> (SELECT <aggregate> ...), in either order
   // Out-of-scope marker, the last Feature (new ones go above it): never in kSupportedFeatures and
@@ -297,8 +298,9 @@ inline constexpr FeatureSet kNeverGenerated = {Feature::kWindowFunctions};
 // Grammar the random generator (runner/query_gen.cc) cannot write yet, which a later PR teaches it
 // and then removes from this set. Valid in `-- features:` tags, and never in kSupportedFeatures
 // while pending (checked below), so that no feature is declared supported before it is generated.
-// ADR 0022's T2 takes LEFT JOIN, derived tables and WITH lists out of it; the two subquery forms
-// wait for the parser (roadmap PR S4b) and leave with T2b, which J5 depends on.
+// ADR 0022's T2 took derived tables and WITH lists out of it. LEFT JOIN waits for the generator's
+// row bound to account for a LEFT JOIN's padded rows; the two subquery forms wait for the parser
+// (roadmap PR S4b) and leave with T2b, which J5 depends on.
 inline constexpr FeatureSet kGeneratorPending = {Feature::kLeftJoin, Feature::kInSubquery,
                                                  Feature::kScalarSubquery};
 

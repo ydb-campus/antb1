@@ -1201,7 +1201,7 @@ std::vector<Relation> AllRelations() {
     // equality is what keeps the FROM graph connected: a cross product exits 4 for good.
     r.push_back(
         {.name = "cte_referenced_twice_is_two_derived_tables",
-         .features = SetWith(with_cte, kTableAlias, kQualifiedName, kCompareColumns),
+         .features = SetWith(with_cte, kTableAlias, kQualifiedName, kCompareColumns, kCommaJoin),
          .probes = {Q(std::format("WITH p AS ({}) SELECT COUNT(*) FROM p AS a, p AS b "
                                   "WHERE a.k = b.k",
                                   kBlock)),
@@ -1288,7 +1288,7 @@ std::vector<Relation> AllRelations() {
     // SUM over no row is NULL (shifts has no sh_hours above 100, tools/fixturegen/star.h), and
     // every comparison with NULL is NULL, so neither side keeps a row.
     r.push_back({.name = "null_scalar_subquery_selects_nothing",
-                 .features = SetWith(scalar, kSum, kDoubleColumns, kWhereAnd),
+                 .features = SetWith(scalar, kSum, kWhereAnd),
                  .probes = {Q("SELECT COUNT(*) FROM trips WHERE tr_fare < "
                               "(SELECT SUM(sh_hours) FROM shifts WHERE sh_hours > 100)"),
                             Q("SELECT COUNT(*) FROM trips WHERE tr_fare >= "
@@ -1378,8 +1378,9 @@ std::vector<Relation> AllRelations() {
                             Q("SELECT COUNT(*) FROM trips LEFT JOIN promos ON tr_promo = pm_id")},
                  .check = AllEqual()});
     // An ON conjunct that reads only the preserved side is a residual, not a filter: a left row
-    // that fails it is padded, not dropped, so every tr_row is still present. Pushing it down
-    // leaves 897 of the 3000, and the same conjunct in WHERE leaves 898.
+    // that fails it is padded, not dropped, so all 3000 tr_row are still present. A plan that
+    // pushed `tr_fare > 20` down to trips instead would leave 897 of them -- the same answer as
+    // writing that conjunct in WHERE, where it really does filter.
     r.push_back(
         {.name = "left_join_on_left_conjunct_still_pads",
          .features =

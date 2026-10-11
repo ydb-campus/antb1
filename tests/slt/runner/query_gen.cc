@@ -1263,15 +1263,17 @@ class Builder {
   // is the one this seed generated before the nesting PR. The outer block sees only the projected
   // columns, so a column the table has and the block does not is simply not there.
   void Nest(Binding& b, FromList& from, bool by_path) {
-    // The block writes plain column select items with aliases, so it needs both features; it
-    // records neither, because they describe the outer query's own select list, from which
-    // query_gen_test infers how many rows the query returns.
+    // The block writes plain column select items, so it needs kColumns; it records that feature no
+    // more than it records its own aliases, because kColumns describes the outer query's own select
+    // list, from which query_gen_test infers how many rows the query returns.
     // A table read by path stays unnested: the block's `*` would then be a `SELECT *` over a path,
     // which divergence D2 keeps out of the generated grammar (query_gen_test checks for it).
-    const bool derived = allowed_.Has(Feature::kDerivedTable);
+    // The derived form writes an alias, so it needs that feature; the WITH form names the block
+    // instead and needs none.
+    const bool derived = allowed_.Has(Feature::kDerivedTable) && allowed_.Has(Feature::kTableAlias);
     const bool cte = allowed_.Has(Feature::kCommonTableExpr);
     if (by_path || (!derived && !cte) || !allowed_.Has(Feature::kColumns) ||
-        !allowed_.Has(Feature::kAlias) || !block_rng_.Percent(kNestPercent)) {
+        !block_rng_.Percent(kNestPercent)) {
       return;
     }
     std::vector<const GenColumn*> usable;
@@ -1290,9 +1292,7 @@ class Builder {
       if (!projected.empty() && !block_rng_.Percent(35)) {
         continue;
       }
-      GenColumn out = *c;
-      out.name = std::format("c{}", projected.size() + 1);
-      projected.push_back(std::move(out));
+      projected.push_back(*c);
       inner.push_back(c->name);
     }
     b.owned = std::move(projected);
@@ -1990,18 +1990,12 @@ class Builder {
         Symbol(",");
       }
       tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = b.inner[i]});
-      Keyword("AS");
-      tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = std::string(b.columns[i].name)});
       used_.Add(TypeFeature(b.columns[i].kind));
     }
+    // Nest() never nests a table read by path, so the block always names one.
     Keyword("FROM");
-    if (b.by_path) {
-      used_.Add(Feature::kTablePath);
-      tokens_.push_back({.kind = Token::Kind::kLiteral, .text = SqlString(b.table->path)});
-    } else {
-      used_.Add(Feature::kTableName);
-      tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = b.table->name});
-    }
+    used_.Add(Feature::kTableName);
+    tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = b.table->name});
     Symbol(")");
   }
 

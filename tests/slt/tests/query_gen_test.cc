@@ -664,6 +664,86 @@ TEST(QueryGenerator, JoinFeaturesChangeOnlyJoinQueries) {
   EXPECT_GT(same, 400);
 }
 
+bool Nests(const GeneratedQuery& q) {
+  return q.features.Has(Feature::kDerivedTable) || q.features.Has(Feature::kCommonTableExpr);
+}
+
+// Every draw a nested block needs comes from the third stream (block_rng_), so allowing the two
+// nesting features changes the nested queries and no others: a seed's query that reads its table
+// directly is the query that seed gave before ADR 0022's T2. Pins the stream, as
+// JoinFeaturesChangeOnlyJoinQueries pins the second one.
+TEST(QueryGenerator, NestingChangesOnlyNestedQueries) {
+  FeatureSet nesting = kSupportedFeatures;
+  nesting.Add(Feature::kDerivedTable);
+  nesting.Add(Feature::kCommonTableExpr);
+  // target_percent 0: every query draws from `supported`, not from the whole grammar.
+  const auto with = Make(31, {.supported = nesting, .target_percent = 0});
+  const auto without = Make(31, {.supported = kSupportedFeatures, .target_percent = 0});
+  int nested = 0;
+  int same = 0;
+  int derived = 0;
+  int cte = 0;
+  for (uint64_t i = 0; i < 2000; ++i) {
+    const auto q = with.Generate(i);
+    const auto plain = without.Generate(i);
+    EXPECT_FALSE(Nests(plain)) << plain.sql;
+    if (Nests(q)) {
+      ++nested;
+      derived += q.features.Has(Feature::kDerivedTable) ? 1 : 0;
+      cte += q.features.Has(Feature::kCommonTableExpr) ? 1 : 0;
+      // One form or the other, never both: a WITH list is no derived table.
+      EXPECT_NE(q.features.Has(Feature::kDerivedTable), q.features.Has(Feature::kCommonTableExpr))
+          << q.sql;
+      // The block is a projection of the table, so the bound is still the table's.
+      EXPECT_EQ(q.row_bound, plain.row_bound) << q.sql;
+      continue;
+    }
+    ++same;
+    EXPECT_EQ(q.sql, plain.sql) << i;
+    EXPECT_EQ(q.features, plain.features) << i;
+  }
+  EXPECT_GT(nested, 100) << "nested: " << nested;
+  EXPECT_GT(same, 1000);
+  EXPECT_GT(derived, 20) << "derived tables: " << derived;
+  EXPECT_GT(cte, 20) << "WITH lists: " << cte;
+}
+
+// What a nested query's text holds: the block names the table and projects its columns under their
+// own names, which is why the outer block can read them and why the property tests above, whose
+// guards are regexes over column names, still see them.
+TEST(QueryGenerator, NestedBlocksProjectColumnsUnderTheirOwnNames) {
+  FeatureSet nesting = kSupportedFeatures;
+  nesting.Add(Feature::kDerivedTable);
+  nesting.Add(Feature::kCommonTableExpr);
+  const auto gen = Make(37, {.supported = nesting, .target_percent = 0});
+  int checked = 0;
+  for (uint64_t i = 0; i < 2000 && checked < 150; ++i) {
+    const auto q = gen.Generate(i);
+    if (!Nests(q)) {
+      continue;
+    }
+    ++checked;
+    SCOPED_TRACE(q.sql);
+    const auto ast = sql::Parse(q.sql);
+    ASSERT_TRUE(ast.has_value()) << ast.error().message;
+    ASSERT_EQ(ast->from.size(), 1U) << "a nested binding is the only FROM item of its block";
+    const bool cte = q.features.Has(Feature::kCommonTableExpr);
+    EXPECT_EQ(ast->with.size(), cte ? 1U : 0U);
+    // The derived form is a subquery in FROM, the WITH form a table name; the block is the same.
+    const sql::FromItem& item = ast->from.front();
+    const auto* derived_source = std::get_if<sql::DerivedTable>(&item.source);
+    ASSERT_EQ(derived_source == nullptr, cte) << "the FROM item matches the form recorded";
+    const sql::SelectStatement& block = cte ? *ast->with.front().query : *derived_source->query;
+    EXPECT_FALSE(block.items.empty());
+    for (const sql::SelectItem& select_item : block.items) {
+      EXPECT_FALSE(select_item.alias.has_value()) << "the column's own name is its output name";
+    }
+    EXPECT_EQ(block.from.size(), 1U);
+    EXPECT_NE(block.from.front().table(), nullptr) << "the block reads the table, never a path";
+  }
+  EXPECT_GE(checked, 100) << "checked " << checked << " nested queries";
+}
+
 // A join that fails fails before the first draw from the first stream, so its query falls back
 // to the query the tables give without refs. At target 100 no join fails; at target 0 partial
 // join feature sets make some fail: without kTableAlias, a join from dims read by its glob path
