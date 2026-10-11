@@ -81,6 +81,19 @@ struct GenKeyStats {
 // at the largest int64_t.
 int64_t JoinRowBound(const GenKeyStats& a, const GenKeyStats& b);
 
+// A true upper bound of the rows of a LEFT JOIN: min(left_rows + matched, left_rows * max(1,
+// right_multiplicity)), each operation saturating at the largest int64_t. `matched` bounds the
+// inner join of every FROM item, `left_rows` the inner join of all of them but the right input,
+// and `right_multiplicity` is the rows of the most frequent key of the right input (0 without
+// one: every left row is then padded, which is why the factor is at least 1).
+//
+// A LEFT JOIN emits, per left row, max(1, its matches) rows, and both bounds follow from that sum.
+// The bound is therefore only as good as `left_rows`, which is why the generator promotes the FROM
+// item its walk added last: the rest of the walk is then a connected prefix whose bound it already
+// knows. The bound holds for any FROM order, since the inner joins above a LEFT JOIN multiply and
+// filter its rows uniformly, but not for a promotion anywhere else in the walk.
+int64_t LeftJoinRowBound(int64_t matched, int64_t left_rows, int64_t right_multiplicity);
+
 // A ref= option of the tables file (runner/tables.h) to a table of the same LoadGenTables call.
 struct GenRef {
   std::vector<std::string> columns;      // of this table, as the tables file spells them
@@ -114,7 +127,10 @@ struct GeneratedQuery {
   // The table the query reads, or the one a join's walk along the refs starts from (in any FROM
   // position), for messages.
   std::string table;
-  int64_t row_bound = 0;  // at least the rows FROM yields: the table's rows, or the join's bound
+  // At least the rows FROM yields once its key equalities hold: the table's rows, or the join's
+  // bound (JoinRowBound, LeftJoinRowBound). A shuffled FROM order writes its keys in WHERE, where
+  // they bound the answer but not FROM itself.
+  int64_t row_bound = 0;
   FeatureSet features;    // every feature the SQL uses
   bool target_sample = false;         // drawn from the full target grammar
   SortMode sort = SortMode::kNoSort;  // kRowSort for projections and GROUP BY: SQL has no row order

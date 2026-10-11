@@ -426,6 +426,11 @@ int64_t SaturatingProduct(int64_t a, int64_t b) {
   return __builtin_mul_overflow(a, b, &product) ? std::numeric_limits<int64_t>::max() : product;
 }
 
+int64_t SaturatingSum(int64_t a, int64_t b) {
+  int64_t sum = 0;
+  return __builtin_add_overflow(a, b, &sum) ? std::numeric_limits<int64_t>::max() : sum;
+}
+
 // 10^n - 1, the largest unscaled value of n digits (n <= 38).
 Int128 MaxOfDigits(int digits) {
   Int128 power = 1;
@@ -940,13 +945,15 @@ class Builder {
   };
   // A step of the walk: from the planned binding `from` along edge `edge` to its parent side
   // (`forward`) or to its child side, a new binding of `table`; the join then has at most `rows`
-  // rows.
+  // rows, and `multiplicity` is the rows of the most frequent key of the binding it adds (what a
+  // LEFT JOIN of that binding pads by, LeftJoinRowBound).
   struct Step {
     std::size_t from = 0;
     std::size_t edge = 0;
     bool forward = true;
     std::size_t table = 0;
     int64_t rows = 0;
+    int64_t multiplicity = 0;
   };
 
   // Whether the key columns' types are allowed.
@@ -1005,6 +1012,16 @@ class Builder {
     return can_path && (!can_name || join_rng_.Percent(20));
   }
 
+  // Rows a join of the planned bindings may have at most, unless one of its own tables has more
+  // (pure: no draw).
+  [[nodiscard]] int64_t RowLimit(const std::vector<Planned>& planned) const {
+    int64_t limit = kMaxJoinRows;
+    for (const Planned& p : planned) {
+      limit = std::max(limit, tables_[p.table].rows);
+    }
+    return limit;
+  }
+
   // The steps the walk can take from the planned bindings (pure: no draw): along a usable edge
   // whose key columns are allowed, never from one binding along one edge in one direction twice
   // (`taken`), to a table that can be named, within max(kMaxJoinRows, the rows of the join's
@@ -1013,10 +1030,7 @@ class Builder {
   [[nodiscard]] std::vector<Step> Steps(const std::vector<Planned>& planned,
                                         const std::vector<PlannedKey>& keys,
                                         const std::vector<Step>& taken, int64_t rows) const {
-    int64_t limit = kMaxJoinRows;
-    for (const Planned& p : planned) {
-      limit = std::max(limit, tables_[p.table].rows);
-    }
+    const int64_t limit = RowLimit(planned);
     std::vector<Step> steps;
     for (std::size_t from = 0; from < planned.size(); ++from) {
       for (std::size_t e = 0; e < edges_.size(); ++e) {
@@ -1032,11 +1046,11 @@ class Builder {
             continue;
           }
           const std::size_t table = forward ? edge.parent : edge.child;
-          const int64_t bound =
-              planned.size() == 1
-                  ? JoinRowBound(edge.child_stats, edge.parent_stats)
-                  : SaturatingProduct(
-                        rows, (forward ? edge.parent_stats : edge.child_stats).max_multiplicity);
+          const int64_t multiplicity =
+              (forward ? edge.parent_stats : edge.child_stats).max_multiplicity;
+          const int64_t bound = planned.size() == 1
+                                    ? JoinRowBound(edge.child_stats, edge.parent_stats)
+                                    : SaturatingProduct(rows, multiplicity);
           if (bound > std::max(limit, tables_[table].rows) || !Nameable(planned, table)) {
             continue;
           }
@@ -1051,8 +1065,12 @@ class Builder {
               continue;
             }
           }
-          steps.push_back(
-              Step{.from = from, .edge = e, .forward = forward, .table = table, .rows = bound});
+          steps.push_back(Step{.from = from,
+                               .edge = e,
+                               .forward = forward,
+                               .table = table,
+                               .rows = bound,
+                               .multiplicity = multiplicity});
         }
       }
     }
@@ -1099,6 +1117,10 @@ class Builder {
     std::vector<PlannedKey> keys;
     std::vector<Step> taken;
     int64_t rows = first.rows;
+    // The bound without the binding the walk added last, and the multiplicity of that binding's
+    // key: what LeftJoinRowBound needs to bound a LEFT JOIN of it.
+    int64_t rows_before_last = first.rows;
+    int64_t last_multiplicity = 0;
     const std::size_t size = join_rng_.Percent(35) ? 3 : 2;
     while (planned.size() < size) {
       const std::vector<Step> steps = Steps(planned, keys, taken, rows);
@@ -1112,7 +1134,9 @@ class Builder {
                          ? PlannedKey{.edge = step.edge, .child = step.from, .parent = added}
                          : PlannedKey{.edge = step.edge, .child = added, .parent = step.from});
       taken.push_back(step);
+      rows_before_last = rows;
       rows = step.rows;
+      last_multiplicity = step.multiplicity;
     }
     if (planned.size() < 2) {
       return std::nullopt;
@@ -3074,6 +3098,14 @@ int64_t JoinRowBound(const GenKeyStats& a, const GenKeyStats& b) {
        SaturatingProduct(b.non_null, a.max_multiplicity),
        SaturatingProduct(SaturatingProduct(std::min(a.distinct, b.distinct), a.max_multiplicity),
                          b.max_multiplicity)});
+}
+
+int64_t LeftJoinRowBound(int64_t matched, int64_t left_rows, int64_t right_multiplicity) {
+  // A LEFT JOIN emits, per left row q, max(1, matches(q)) rows. Summed over the left rows,
+  // max(1, c) <= 1 + c gives the first bound and max(1, c) <= max(1, right_multiplicity) the
+  // second, since no left row meets more rows than the right input's largest multiplicity.
+  return std::min(SaturatingSum(left_rows, matched),
+                  SaturatingProduct(left_rows, std::max<int64_t>(1, right_multiplicity)));
 }
 
 std::expected<std::vector<GenTable>, std::string> LoadGenTables(

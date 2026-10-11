@@ -1444,6 +1444,72 @@ TEST(JoinRowBound, BoundsTheJoinsOfSmallKeyMultisets) {
   EXPECT_EQ(JoinRowBound(Stats(3000, 40, 75), Stats(0, 0, 0)), 0) << "an empty side";
 }
 
+// LeftJoinRowBound is a true upper bound of a LEFT JOIN's rows, the padded ones included: against
+// the rows of left joins of seeded small multisets of keys (a left row with no match is padded,
+// and a NULL key never matches), asymmetric, often exact, and saturating instead of wrapping.
+TEST(LeftJoinRowBound, BoundsThePaddedRowsOfSmallKeyMultisets) {
+  uint64_t state = 0x1EF7;
+  const auto next = [&state] {
+    state = (state * 6364136223846793005ULL) + 1442695040888963407ULL;
+    return state >> 33U;
+  };
+  int exact = 0;
+  int pads = 0;         // trials whose left join has more rows than its inner join
+  int asymmetric = 0;   // trials whose two orientations have different bounds
+  for (int trial = 0; trial < 2000; ++trial) {
+    const uint64_t domain = 1 + (next() % 8);
+    std::array<std::vector<std::optional<uint64_t>>, 2> sides;
+    for (auto& side : sides) {
+      for (uint64_t n = next() % 25; n > 0; --n) {
+        side.push_back(next() % 5 == 0 ? std::nullopt : std::optional(next() % domain));
+      }
+    }
+    std::array<GenKeyStats, 2> stats;
+    std::array<std::vector<int64_t>, 2> counts;
+    for (std::size_t s = 0; s < 2; ++s) {
+      counts[s].assign(domain, 0);
+      for (const auto& key : sides[s]) {
+        if (key.has_value()) {
+          ++counts[s][*key];
+          ++stats[s].non_null;
+        }
+      }
+      for (const int64_t n : counts[s]) {
+        stats[s].distinct += n > 0 ? 1 : 0;
+        stats[s].max_multiplicity = std::max(stats[s].max_multiplicity, n);
+      }
+    }
+    int64_t inner = 0;
+    for (uint64_t key = 0; key < domain; ++key) {
+      inner += counts[0][key] * counts[1][key];
+    }
+    // The rows of `sides[0] LEFT JOIN sides[1]`, padding included.
+    int64_t rows = 0;
+    for (const auto& key : sides[0]) {
+      rows += std::max<int64_t>(1, key.has_value() ? counts[1][*key] : 0);
+    }
+    const int64_t matched = JoinRowBound(stats[0], stats[1]);
+    const int64_t bound =
+        LeftJoinRowBound(matched, std::ssize(sides[0]), stats[1].max_multiplicity);
+    EXPECT_GE(bound, rows) << trial;
+    EXPECT_GE(bound, inner) << trial << ": a left join has at least its inner join's rows";
+    exact += bound == rows ? 1 : 0;
+    pads += rows > inner ? 1 : 0;
+    asymmetric +=
+        bound != LeftJoinRowBound(matched, std::ssize(sides[1]), stats[0].max_multiplicity) ? 1 : 0;
+  }
+  EXPECT_GT(exact, 200);
+  EXPECT_GT(pads, 1000) << "the trials would not exercise the padding";
+  EXPECT_GT(asymmetric, 1000) << "the left input must decide the bound";
+  // The padding alone, with no matching row at all: every left row still yields one.
+  EXPECT_EQ(LeftJoinRowBound(0, 3000, 0), 3000) << "an empty right side pads every left row";
+  EXPECT_EQ(LeftJoinRowBound(35, 40, 75), 75) << "40 left rows, each meeting at most 75";
+  EXPECT_EQ(LeftJoinRowBound(35, 3000, 1), 3000) << "the same join the other way round";
+  constexpr int64_t kMax = std::numeric_limits<int64_t>::max();
+  EXPECT_EQ(LeftJoinRowBound(kMax, kMax, kMax), kMax);
+  EXPECT_EQ(LeftJoinRowBound(0, kMax, 0), kMax) << "the sum saturates too";
+}
+
 // Arrays with NULLs for the Parquet files of the key statistics test.
 std::shared_ptr<arrow::Array> Int64s(const std::vector<std::optional<int64_t>>& values) {
   arrow::Int64Builder b;
