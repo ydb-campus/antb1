@@ -807,6 +807,7 @@ struct Binding {
   // only FROM item of its block (it has no key statistics, so JoinRowBound could not bound a join
   // of one), and the inner block is a projection, so the row bound is the table's.
   std::vector<std::string> inner;  // per column: the name it reads from the table
+  bool as_cte = false;             // the block goes in a WITH list, not in FROM
 };
 
 struct FromList {
@@ -1267,7 +1268,9 @@ class Builder {
     // query_gen_test infers how many rows the query returns.
     // A table read by path stays unnested: the block's `*` would then be a `SELECT *` over a path,
     // which divergence D2 keeps out of the generated grammar (query_gen_test checks for it).
-    if (by_path || !allowed_.Has(Feature::kDerivedTable) || !allowed_.Has(Feature::kColumns) ||
+    const bool derived = allowed_.Has(Feature::kDerivedTable);
+    const bool cte = allowed_.Has(Feature::kCommonTableExpr);
+    if (by_path || (!derived && !cte) || !allowed_.Has(Feature::kColumns) ||
         !allowed_.Has(Feature::kAlias) || !block_rng_.Percent(kNestPercent)) {
       return;
     }
@@ -1296,8 +1299,10 @@ class Builder {
     b.columns = b.owned;
     b.inner = std::move(inner);
     b.name = Alias(0, {}, {});
-    b.aliased = true;
-    b.as_keyword = block_rng_.Percent(50);
+    // A WITH list names the block instead, so the FROM item is that name and takes no alias.
+    b.as_cte = cte && (!derived || block_rng_.Percent(40));
+    b.aliased = !b.as_cte;
+    b.as_keyword = b.aliased && block_rng_.Percent(50);
     // The block names every column, so no name is shared and none needs a qualifier, and the
     // table's own skipped columns are out of reach.
     from.other_columns = false;
@@ -1417,6 +1422,7 @@ class Builder {
     key_positions_.clear();
     constant_positions_.clear();
     aggregate_emitted_ = false;
+    EmitWith(from);
     Keyword("SELECT");
     SelectList(shape, from, cols, numeric, aggs, selected_keys);
     Keyword("FROM");
@@ -1958,10 +1964,25 @@ class Builder {
   // FROM's items: each one's connector, its table by name or path and its alias, and for a JOIN
   // its ON: its keys, and now and then (with kWhere allowed) a condition of WHERE's forms over the
   // columns of the items up to its own, the scope of an ON (ADR 0022 rule 10).
-  // `( SELECT <inner> AS <column> , ... FROM <table> )`: the block a nested binding reads. Its
-  // alias follows, written by EmitFrom like any other.
+  // `WITH <name> AS ( ... )` for a binding whose block goes above the statement instead of in its
+  // FROM. One binding at most nests, so the list never has a second entry.
+  void EmitWith(const FromList& from) {
+    for (const Binding& b : from.bindings) {
+      if (b.inner.empty() || !b.as_cte) {
+        continue;
+      }
+      used_.Add(Feature::kCommonTableExpr);
+      Keyword("WITH");
+      tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = b.name});
+      Keyword("AS");
+      EmitNestedBlock(b);
+      return;
+    }
+  }
+
+  // `( SELECT <inner> AS <column> , ... FROM <table> )`: the block a nested binding reads. In FROM
+  // its alias follows, written by EmitFrom like any other; in a WITH list its name precedes it.
   void EmitNestedBlock(const Binding& b) {
-    used_.Add(Feature::kDerivedTable);
     Symbol("(");
     Keyword("SELECT");
     for (std::size_t i = 0; i < b.inner.size(); ++i) {
@@ -2007,8 +2028,12 @@ class Builder {
           Keyword("JOIN");
           break;
       }
-      if (!b.inner.empty()) {
+      if (!b.inner.empty() && !b.as_cte) {
+        used_.Add(Feature::kDerivedTable);
         EmitNestedBlock(b);
+      } else if (!b.inner.empty()) {
+        used_.Add(Feature::kCommonTableExpr);
+        tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = b.name});
       } else if (b.by_path) {
         used_.Add(Feature::kTablePath);
         tokens_.push_back({.kind = Token::Kind::kLiteral, .text = SqlString(b.table->path)});
