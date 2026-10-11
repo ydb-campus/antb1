@@ -120,9 +120,53 @@ SELECT zone, fares FROM per_zone WHERE fares = (SELECT MAX(fares) FROM per_zone)
 ----
 33	1093.25
 
-# A column alias list longer than the select list.
+# A column alias list longer than the select list is a bind error for a derived table, while a CTE's
+# extra names are dropped and the query answers: DuckDB differs between the two forms (ADR 0022).
 statement error
 SELECT COUNT(*) FROM (SELECT tr_pickup FROM trips) AS g(a, b)
+
+query II nosort
+WITH c(x, y, z) AS (SELECT tr_row FROM trips) SELECT COUNT(*), MAX(x) FROM c
+----
+3000	2999
+
+# Rule 7's de-duplication runs over the alias list too, after it is applied: the second `a` is
+# `a_1`, and an unqualified `a` is the first column rather than ambiguous.
+query II nosort
+SELECT a, a_1 FROM (SELECT tr_row, tr_pickup FROM trips) AS g(a, a) ORDER BY a LIMIT 1
+----
+0	1
+
+# A FLOAT column keeps divergence D11 through a sub-plan: the comparison folds at FLOAT precision
+# here as it does over the table, so wrapping the block changes the plan and not the answer.
+query I nosort
+SELECT COUNT(*) FROM (SELECT id, f FROM floats) AS s WHERE f = 0.1
+----
+1
+
+query I nosort
+SELECT COUNT(*) FROM floats WHERE f = 0.1
+----
+1
+
+# Rule 8: a CTE is visible from a derived table of the same block, and names a string FROM item
+# before that item is read as a path.
+query I nosort
+WITH c AS (SELECT tr_row FROM trips) SELECT COUNT(*) FROM (SELECT tr_row FROM c) AS s
+----
+3000
+
+query I nosort
+WITH "trips" AS (SELECT ct_id AS tr_row FROM cities) SELECT COUNT(*) FROM 'trips'
+----
+6
+
+# A WITH list inside a derived table may reuse a name of the statement's: the inner one wins.
+query I nosort
+WITH c AS (SELECT MIN(tr_row) AS x FROM trips)
+SELECT x FROM (WITH c AS (SELECT MAX(tr_row) AS x FROM trips) SELECT x FROM c)
+----
+2999
 
 # ---- DuckDB only until lateral references get a PR (ADR 0022: a lateral reference exits 4) ----
 

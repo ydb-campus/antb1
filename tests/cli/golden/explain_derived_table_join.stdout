@@ -1,0 +1,8 @@
+Output: zn_city:SMALLINT sum(n):HUGEINT
+Project zn_city, "sum(n)"
+  GroupAggregate keys=[zones.zn_city] SUM(p.n)
+    Join INNER build=right keys=[p.tr_pickup = zones.zn_id]
+      Project tr_pickup, n
+        GroupAggregate keys=[tr_pickup] COUNT(*)
+          Scan table=trips source=parquet(files=1, rows=3000) columns=[tr_pickup]
+      Scan table=zones source=parquet(files=1, rows=40) columns=[zn_id, zn_city]

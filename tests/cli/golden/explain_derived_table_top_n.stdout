@@ -1,0 +1,6 @@
+Output: count_star():BIGINT sum(tr_fare):DECIMAL(38,2)
+Aggregate COUNT(*), SUM(tr_fare)
+  Project tr_row, tr_fare
+    Limit 10
+      Sort tr_fare DESC NULLS LAST, tr_row ASC NULLS LAST
+        Scan table=trips source=parquet(files=1, rows=3000) columns=[tr_row, tr_fare]

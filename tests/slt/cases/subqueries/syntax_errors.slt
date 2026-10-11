@@ -294,16 +294,3 @@ SELECT COUNT(*), MAX(x) FROM (SELECT tr_row, tr_fare FROM trips) AS s(x,)
 ----
 3000	2999
 
-# A CTE's column alias list may be longer than its query's select list: DuckDB ignores the extra names.
-onlyif duckdb
-query II nosort
-WITH c(x, y, z) AS (SELECT tr_row FROM trips) SELECT COUNT(*), MAX(x) FROM c
-----
-3000	2999
-
-# A WITH list inside a derived table may reuse a name of the statement's.
-onlyif duckdb
-query I nosort
-WITH c AS (SELECT MIN(tr_row) AS x FROM trips) SELECT x FROM (WITH c AS (SELECT MAX(tr_row) AS x FROM trips) SELECT x FROM c)
-----
-2999

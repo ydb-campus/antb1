@@ -102,11 +102,15 @@ steps (only step 7 uses more than one thread):
    their own, held in heap boxes, and every such nested query counts against the same depth limit. Syntax outside the
    grammar is a `kUnsupported` error with the span of the offending token. The engine converts a parse error with
    `plan::ToArrowStatus` into an `arrow::Status` that carries a `SqlErrorDetail`.
-4. Bind (`plan::Bind`): what the binder does not answer yet (a `LEFT JOIN`, a derived table, a `WITH` list, more
-   than 256 relations, many expressions) is `kUnsupported` before any name resolves; then each FROM item's table
-   name resolves case-insensitively in the catalog (or `FROM 'path'` opens a file), in FROM order, one binding per
-   item in the block's scope (`src/plan/scope.h`: its rule-1 name — its alias, else a table's name as written, else
-   a path's file name — and its columns' ids, types and FLOAT flags). Columns resolve there, an `ON` seeing only its
+4. Bind (`plan::Bind`): what the binder does not answer yet (a `LEFT JOIN`, a lateral reference, more than 256
+   relations counting every sub-plan, many expressions) is `kUnsupported` before any name resolves, over every block
+   the statement reaches — its own, each derived table's, and the body of each CTE something references; then each
+   FROM item resolves, in FROM order, one binding per item in the block's scope (`src/plan/scope.h`: its rule-1
+   name — its alias, else a CTE's name as written, else a table's name as written, else a path's file name, else
+   `unnamed_subquery` for a derived table without one — and its columns' ids, types and FLOAT flags). A derived
+   table and a CTE reference are each bound as a sub-plan of their own, recursively, from the one id source, and
+   a CTE is bound once per reference; a name only an enclosing block has exits 4 (rule 9). Columns resolve there,
+   an `ON` seeing only its
    own join group and the comma siblings before it ([ADR 0022](adr/0022-joins-and-query-blocks.md) rule 10); types
    are checked, and every `WHERE` literal is folded exactly into its column's type
    ([Binding](sql-subset.md#binding)). Each element of `WHERE` and of an inner `ON` first gives up the conjuncts

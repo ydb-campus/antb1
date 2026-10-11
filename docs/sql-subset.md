@@ -45,7 +45,8 @@ SELECT date_trunc('month', tr_day) AS m, MIN(tr_fare) FROM trips GROUP BY 1 ORDE
   with exit code 4 and points at the first unsupported token. A `FROM` list of tables and paths, joined by commas,
   `CROSS JOIN` or `[INNER] JOIN ... ON`, with aliases and qualified names, is answered as long as a join key
   connects every relation — so a comma list or a `CROSS JOIN` needs an equality between its relations, in the list's
-  `ON` or in `WHERE`. A `LEFT JOIN`, a derived table, a `WITH` list, `TRY_CAST`, more than 256 relations, and a join
+  `ON` or in `WHERE`. A derived table and a `WITH` list are answered too, each bound as a sub-plan of its own. A
+  `LEFT JOIN`, `TRY_CAST`, a lateral reference, more than 256 relations counting every sub-plan, and a join
   graph that no join key connects (a cross product) parse ([Grammar](#grammar)) but are not answered: exit code 4
   as well. Malformed SQL (a syntax error) and SQL that is wrong for the tables (a bind error) fail with exit
   code 1.
@@ -137,9 +138,8 @@ is the 256th level. A column alias list follows a derived table's alias (`FROM (
 (`WITH c(x, y) AS (...)`), and the parser takes it at any length. Within one `WITH` list the CTE names differ ASCII
 case-insensitively, as in DuckDB: a repeated one (`c` and `"C"`, also `'c'`, but not `E'c'` or `$$c$$`, which are
 unsupported first) is a syntax error at the repeated name, before its query is parsed, while a nested `WITH` list may
-reuse a name. Until the binder answers them (roadmap PR J4, [ADR 0022](adr/0022-joins-and-query-blocks.md)), it rejects
-a `WITH` list at its `WITH` and a derived table at its `(` with exit code 4, in query order (the `WITH` list first) and
-before any table resolves.
+reuse a name. The binder answers both ([ADR 0022](adr/0022-joins-and-query-blocks.md)): each is a sub-plan with its
+own scope, and one binding of the block that reads it.
 
 Lexical rules: an `identifier` is a letter or `_` followed by letters, digits or `_`, or any text in double quotes
 (`""` escapes a quote); a `string_literal` is text in single quotes (`''` escapes a quote); an `integer` is a
@@ -205,11 +205,12 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
 **What the binder answers today.** Of the grammar above, antb1 answers:
 
 - FROM: tables and paths, with an alias or without, joined by commas, `CROSS JOIN` or `[INNER] JOIN ... ON`, with
-  qualified column names (`t.x`) anywhere in the query. A `LEFT JOIN`, a derived table and a `WITH` list parse and
-  are rejected with exit code 4, in query order and before any table resolves, so also over tables that do not
-  exist (ADR 0022 plans their answers), except inside the arguments of a call with the wrong number of arguments,
-  which stays a bind error (`strlen(t.s, 1)`: strlen() takes 1 argument, not 2; over a table that does not exist,
-  the missing table is the error). More than 256 relations is exit code 4 too, before the per-item checks;
+  qualified column names (`t.x`) anywhere in the query, and derived tables and `WITH` lists, each a sub-plan of its
+  own. A `LEFT JOIN` parses and is rejected with exit code 4, in query order and before any table resolves, so also
+  over tables that do not exist (ADR 0022 plans its answer), except inside the arguments of a call with the wrong
+  number of arguments, which stays a bind error (`strlen(t.s, 1)`: strlen() takes 1 argument, not 2; over a table
+  that does not exist, the missing table is the error). More than 256 relations, counting a derived table and a CTE
+  reference as one plus the relations of their body, is exit code 4 too, before the per-item checks;
 - date casts: `CAST('YYYY-MM-DD' AS DATE)` and `'YYYY-MM-DD'::DATE` are the literal `DATE 'YYYY-MM-DD'`
   wherever it may stand, as in DuckDB (which names all three `CAST('YYYY-MM-DD' AS "DATE")`);
 - value expressions: columns, literals, aggregates, arithmetic (`+ - * / // %`, unary `-`), the functions
