@@ -691,6 +691,11 @@ constexpr unsigned kJoinPercent = 60;
 // Salt of the second random stream of a query (Generate), which every draw that only a join needs
 // takes, so that the first stream of a query that joins nothing is never touched.
 constexpr uint64_t kJoinStreamSalt = 0x6A6F696E2D726E67ULL;
+// Share of the queries over one table that read it through a nested block (ADR 0022's J4).
+constexpr unsigned kNestPercent = 25;
+// Salt of the third random stream, which every draw that only a nested block needs takes, so that
+// a query without one is the query this seed generated before the nesting PR.
+constexpr uint64_t kBlockStreamSalt = 0x626C6F636B2D726EULL;
 
 std::optional<std::size_t> ColumnIndex(const GenTable& t, std::string_view name) {
   const auto it = std::ranges::find_if(
@@ -795,6 +800,13 @@ struct Binding {
   // query reads one table.
   std::vector<GenColumn> owned;
   std::span<const GenColumn> columns;
+  // A nested block instead of a table (ADR 0022's J4): the binding reads
+  // `(SELECT <inner[i]> AS <columns[i].name> ... FROM <table>)`, written in FROM as a derived
+  // table or above the block as a WITH list. `columns` are the block's output columns, so every
+  // one is aliased and no output name depends on rule 7's de-duplication. A nested binding is the
+  // only FROM item of its block (it has no key statistics, so JoinRowBound could not bound a join
+  // of one), and the inner block is a projection, so the row bound is the table's.
+  std::vector<std::string> inner;  // per column: the name it reads from the table
 };
 
 struct FromList {
@@ -813,10 +825,12 @@ struct FromList {
 class Builder {
  public:
   // `join_rng`: the query's second stream, which every draw that only a join needs takes.
-  Builder(const std::vector<GenTable>& tables, Rng& rng, Rng& join_rng, FeatureSet allowed)
+  Builder(const std::vector<GenTable>& tables, Rng& rng, Rng& join_rng, Rng& block_rng,
+          FeatureSet allowed)
       : tables_(tables),
         rng_(rng),
         join_rng_(join_rng),
+        block_rng_(block_rng),
         allowed_(allowed),
         edges_(UsableEdges(tables)) {}
 
@@ -1226,7 +1240,7 @@ class Builder {
     return TryFrom(from);
   }
 
-  // A query over one table, by name or by path.
+  // A query over one table, by name or by path, now and then through a nested block over it.
   std::optional<GeneratedQuery> TryTableAs(const GenTable& t, bool by_path) {
     FromList from;
     from.bindings.emplace_back();
@@ -1239,7 +1253,55 @@ class Builder {
     from.rows = t.rows;
     from.any_path = by_path;
     from.other_columns = t.other_columns;
+    Nest(b, from, by_path);
     return TryFrom(from);
+  }
+
+  // Wraps `b`'s table in a block that projects some of its columns, each aliased: the binding then
+  // reads that block, by its own alias. Drawn from block_rng_ alone, so a query that is not nested
+  // is the one this seed generated before the nesting PR. The outer block sees only the projected
+  // columns, so a column the table has and the block does not is simply not there.
+  void Nest(Binding& b, FromList& from, bool by_path) {
+    // The block writes plain column select items with aliases, so it needs both features; it
+    // records neither, because they describe the outer query's own select list, from which
+    // query_gen_test infers how many rows the query returns.
+    // A table read by path stays unnested: the block's `*` would then be a `SELECT *` over a path,
+    // which divergence D2 keeps out of the generated grammar (query_gen_test checks for it).
+    if (by_path || !allowed_.Has(Feature::kDerivedTable) || !allowed_.Has(Feature::kColumns) ||
+        !allowed_.Has(Feature::kAlias) || !block_rng_.Percent(kNestPercent)) {
+      return;
+    }
+    std::vector<const GenColumn*> usable;
+    for (const auto& c : b.table->columns) {
+      if (Usable(c, by_path)) {
+        usable.push_back(&c);
+      }
+    }
+    if (usable.empty()) {
+      return;
+    }
+    // At least one column, in table order: a projection the outer block then reads by alias.
+    std::vector<GenColumn> projected;
+    std::vector<std::string> inner;
+    for (const GenColumn* c : usable) {
+      if (!projected.empty() && !block_rng_.Percent(35)) {
+        continue;
+      }
+      GenColumn out = *c;
+      out.name = std::format("c{}", projected.size() + 1);
+      projected.push_back(std::move(out));
+      inner.push_back(c->name);
+    }
+    b.owned = std::move(projected);
+    b.columns = b.owned;
+    b.inner = std::move(inner);
+    b.name = Alias(0, {}, {});
+    b.aliased = true;
+    b.as_keyword = block_rng_.Percent(50);
+    // The block names every column, so no name is shared and none needs a qualifier, and the
+    // table's own skipped columns are out of reach.
+    from.other_columns = false;
+    from.any_path = false;
   }
 
   std::optional<GeneratedQuery> TryFrom(const FromList& from) {
@@ -1896,6 +1958,32 @@ class Builder {
   // FROM's items: each one's connector, its table by name or path and its alias, and for a JOIN
   // its ON: its keys, and now and then (with kWhere allowed) a condition of WHERE's forms over the
   // columns of the items up to its own, the scope of an ON (ADR 0022 rule 10).
+  // `( SELECT <inner> AS <column> , ... FROM <table> )`: the block a nested binding reads. Its
+  // alias follows, written by EmitFrom like any other.
+  void EmitNestedBlock(const Binding& b) {
+    used_.Add(Feature::kDerivedTable);
+    Symbol("(");
+    Keyword("SELECT");
+    for (std::size_t i = 0; i < b.inner.size(); ++i) {
+      if (i > 0) {
+        Symbol(",");
+      }
+      tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = b.inner[i]});
+      Keyword("AS");
+      tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = std::string(b.columns[i].name)});
+      used_.Add(TypeFeature(b.columns[i].kind));
+    }
+    Keyword("FROM");
+    if (b.by_path) {
+      used_.Add(Feature::kTablePath);
+      tokens_.push_back({.kind = Token::Kind::kLiteral, .text = SqlString(b.table->path)});
+    } else {
+      used_.Add(Feature::kTableName);
+      tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = b.table->name});
+    }
+    Symbol(")");
+  }
+
   void EmitFrom(const FromList& from) {
     for (std::size_t k = 0; k < from.bindings.size(); ++k) {
       const Binding& b = from.bindings[k];
@@ -1919,7 +2007,9 @@ class Builder {
           Keyword("JOIN");
           break;
       }
-      if (b.by_path) {
+      if (!b.inner.empty()) {
+        EmitNestedBlock(b);
+      } else if (b.by_path) {
         used_.Add(Feature::kTablePath);
         tokens_.push_back({.kind = Token::Kind::kLiteral, .text = SqlString(b.table->path)});
       } else {
@@ -2927,7 +3017,8 @@ class Builder {
 
   const std::vector<GenTable>& tables_;
   Rng& rng_;
-  Rng& join_rng_;  // the draws that only a join needs
+  Rng& join_rng_;   // the draws that only a join needs
+  Rng& block_rng_;  // the draws that only a nested block needs
   FeatureSet allowed_;
   std::vector<Edge> edges_;         // the refs joins can follow
   const FromList* from_ = nullptr;  // the FROM list of the query being written (TryFrom)
@@ -3115,7 +3206,8 @@ std::expected<QueryGenerator, std::string> QueryGenerator::Make(std::vector<GenT
   }
   Rng rng(seed);
   Rng join_rng(Mix(seed ^ kJoinStreamSalt));
-  if (!Builder(tables, rng, join_rng, options.supported).Build().has_value()) {
+  Rng block_rng(Mix(seed ^ kBlockStreamSalt));
+  if (!Builder(tables, rng, join_rng, block_rng, options.supported).Build().has_value()) {
     return std::unexpected(
         std::format("no query can be built from the supported features ({}) over these tables",
                     options.supported.Names()));
@@ -3127,10 +3219,12 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
   const uint64_t state = Mix(seed_ + Mix(index + kGamma));
   Rng rng(state);
   Rng join_rng(Mix(state ^ kJoinStreamSalt));
+  Rng block_rng(Mix(state ^ kBlockStreamSalt));
   const bool target = rng.Percent(options_.target_percent);
   const FeatureSet allowed = target ? FeatureSet::All() : options_.supported;
   // Make() proved that the supported set admits a query over these tables; All() is a superset.
-  GeneratedQuery q = Builder(tables_, rng, join_rng, allowed).Build().value_or(GeneratedQuery{});
+  GeneratedQuery q =
+      Builder(tables_, rng, join_rng, block_rng, allowed).Build().value_or(GeneratedQuery{});
   q.index = index;
   q.target_sample = target;
   return q;

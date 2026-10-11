@@ -299,9 +299,8 @@ inline constexpr FeatureSet kNeverGenerated = {Feature::kWindowFunctions};
 // while pending (checked below), so that no feature is declared supported before it is generated.
 // ADR 0022's T2 takes LEFT JOIN, derived tables and WITH lists out of it; the two subquery forms
 // wait for the parser (roadmap PR S4b) and leave with T2b, which J5 depends on.
-inline constexpr FeatureSet kGeneratorPending = {Feature::kLeftJoin, Feature::kDerivedTable,
-                                                 Feature::kCommonTableExpr, Feature::kInSubquery,
-                                                 Feature::kScalarSubquery};
+inline constexpr FeatureSet kGeneratorPending = {Feature::kLeftJoin, Feature::kCommonTableExpr,
+                                                 Feature::kInSubquery, Feature::kScalarSubquery};
 
 // What antb1 answers today: the whole slice grammar of docs/sql-subset.md (global and grouped
 // aggregates, projections, WHERE conjunctions of column <op> literal, ORDER BY, LIMIT and OFFSET)
