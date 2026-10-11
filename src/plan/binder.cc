@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <deque>
 #include <format>
 #include <memory>
 #include <optional>
@@ -28,6 +29,7 @@
 
 #include "join_order.h"
 #include "or_factoring.h"
+#include "relation_count.h"
 #include "scope.h"
 
 // The binding rules are documented in docs/sql-subset.md and
@@ -2052,8 +2054,14 @@ bool IsAggregateQuery(const sql::SelectStatement& stmt) {
 class Binder {
  public:
   // `bindings`: the FROM items, in order. `ids` minted their columns' ids and mints the binder's.
-  Binder(const sql::SelectStatement& stmt, std::vector<Binding> bindings, ColumnIdSource& ids)
-      : stmt_(stmt), scope_(std::move(bindings)), ids_(ids), relations_(scope_.bindings().size()) {}
+  // `outer`: the scope of the enclosing block (nullptr at the top), which Scope::Resolve consults
+  // for rule 9 -- a name only an enclosing block has is a correlation and exits 4.
+  Binder(const sql::SelectStatement& stmt, std::vector<Binding> bindings, ColumnIdSource& ids,
+         const Scope* outer = nullptr)
+      : stmt_(stmt),
+        scope_(std::move(bindings), outer),
+        ids_(ids),
+        relations_(scope_.bindings().size()) {}
 
   arrow::Result<LogicalPlan> Bind();
 
@@ -2597,8 +2605,15 @@ class Binder {
   // Every name resolves through here, so that no clause can forget the visibility it binds in: an
   // ON sees only its own join group and the comma siblings before it (rule 10 of ADR 0022), every
   // other clause every binding. `visible_` holds the ON's while its conjuncts bind.
+  // Rule 9 is applied here rather than in the scope, after the select-list aliases: an inner
+  // block's `GROUP BY <alias>` whose alias happens to name a column of an enclosing block is the
+  // alias, not a correlation, and whether it resolves must not depend on the FROM order.
   [[nodiscard]] arrow::Result<BoundColumn> Resolve(const sql::ColumnRef& ref) const {
-    return scope_.Resolve(ref, visible_);
+    auto resolved = scope_.Resolve(ref, visible_);
+    if (resolved.ok() || (ref.qualifier.empty() && FindAlias(select_, ref.name).has_value())) {
+      return resolved;
+    }
+    return scope_.Correlates(ref) ? Scope::CorrelationError(ref) : std::move(resolved);
   }
 
   LogicalPlan Assemble();
@@ -2667,7 +2682,11 @@ arrow::Status Binder::BindSelectList() {
         ARROW_ASSIGN_OR_RAISE(
             BoundColumn column,
             scope_.Reference(ColumnLocation{.binding = b, .column = c}, stmt_.star_span));
-        list.output.push_back(plan::OutputColumn{.name = column.name, .type = column.type});
+        list.output.push_back(
+            plan::OutputColumn{.name = column.name,
+                               .type = column.type,
+                               .id = kNoColumnId,
+                               .stored_as_float = scope_.StoredAsFloat(column.id)});
         list.items.emplace_back(ItemKind::kColumn, list.columns.size());
         list.column_spans.push_back(stmt_.star_span);
         list.column_written.push_back(column.name);
@@ -2699,8 +2718,10 @@ arrow::Status Binder::BindSelectList() {
     }
     if (call != nullptr && !rewritten) {
       ARROW_ASSIGN_OR_RAISE(AggregateCall bound, BindAggregate(*call));
-      list.output.push_back(
-          plan::OutputColumn{.name = item.alias.value_or(ResultName(*call)), .type = bound.type});
+      list.output.push_back(plan::OutputColumn{.name = item.alias.value_or(ResultName(*call)),
+                                               .type = bound.type,
+                                               .id = kNoColumnId,
+                                               .stored_as_float = FloatResult(bound)});
       list.items.emplace_back(ItemKind::kAggregate, list.aggregates.size());
       bound.id = ids_.Next();
       list.aggregates.push_back(std::move(bound));
@@ -2717,8 +2738,10 @@ arrow::Status Binder::BindSelectList() {
     if (const auto* ref = std::get_if<sql::ColumnRef>(&item.expr)) {
       ARROW_ASSIGN_OR_RAISE(BoundColumn column, Resolve(*ref));
       // DuckDB names a plain column by its declared name, not as written.
-      list.output.push_back(
-          plan::OutputColumn{.name = item.alias.value_or(column.name), .type = column.type});
+      list.output.push_back(plan::OutputColumn{.name = item.alias.value_or(column.name),
+                                               .type = column.type,
+                                               .id = kNoColumnId,
+                                               .stored_as_float = scope_.StoredAsFloat(column.id)});
       list.items.emplace_back(ItemKind::kColumn, list.columns.size());
       list.column_spans.push_back(ref->span);
       list.column_written.push_back(WrittenName(*ref));
@@ -3739,8 +3762,7 @@ arrow::Status Binder::OrderRelations() {
     join_relations_.push_back(JoinRelation{.rows = RelationRows(binding)});
   }
   if (const auto unconnected = FirstUnconnected(join_relations_.size(), edges_)) {
-    const sql::TableRef* ref = stmt_.from[*unconnected].table();
-    ANTB1_CHECK(ref != nullptr);  // CheckFromList rejected derived tables
+    // The message names the binding, so a sub-plan needs no table reference here.
     return UnsupportedError(
         std::format("a cross product is not supported: no join key connects '{}' to '{}'",
                     scope_.bindings()[*unconnected].name(), scope_.bindings().front().name()),
@@ -4302,9 +4324,13 @@ void FoldDateCasts(sql::Expr& expr) {
   }
 }
 
-// The statement's own block only: CheckSupported rejects a WITH list and a derived table (J4 folds
-// each nested block when it binds it).
-sql::SelectStatement FoldDateCasts(sql::SelectStatement stmt) {
+// Every block of the statement, nested ones included: one folded tree serves every level, so a
+// nested CAST('YYYY-MM-DD' AS DATE) is a date literal there too (the binder holds a reference to
+// the folded statement, so folding per level would fold a copy nothing reads).
+void FoldDateCastsInBlock(sql::SelectStatement& stmt) {
+  for (sql::CommonTableExpr& cte : stmt.with) {
+    FoldDateCastsInBlock(*cte.query);
+  }
   for (sql::SelectItem& item : stmt.items) {
     FoldDateCasts(item.expr);
   }
@@ -4317,32 +4343,18 @@ sql::SelectStatement FoldDateCasts(sql::SelectStatement stmt) {
     for (sql::Expr& expr : item.on) {
       FoldDateCasts(expr);
     }
+    if (auto* derived = std::get_if<sql::DerivedTable>(&item.source)) {
+      FoldDateCastsInBlock(*derived->query);
+    }
   }
   for (sql::OrderItem& item : stmt.order_by) {
     FoldDateCasts(item.expr);
   }
+}
+
+sql::SelectStatement FoldDateCasts(sql::SelectStatement stmt) {
+  FoldDateCastsInBlock(stmt);
   return stmt;
-}
-
-// A WITH list parses (ADR 0022) and is answered from J4 on: rejected at its WITH, which comes
-// before everything else of the query.
-std::optional<Rejection> RejectWith(const sql::SelectStatement& stmt) {
-  if (stmt.with.empty()) {
-    return std::nullopt;
-  }
-  return Rejection{.span = stmt.with_span,
-                   .message = "WITH (common table expressions) is not supported"};
-}
-
-// A derived table parses (ADR 0022) and is answered from J4 on: rejected at its '(', which comes
-// before its alias.
-std::optional<Rejection> RejectDerivedTable(const sql::FromItem& item) {
-  if (item.table() != nullptr) {
-    return std::nullopt;
-  }
-  const SourceSpan open{.offset = std::get<sql::DerivedTable>(item.source).span.offset,
-                        .length = 1};
-  return Rejection{.span = open, .message = "subqueries in FROM are not supported"};
 }
 
 // The FROM list the binder answers: tables and paths, joined by commas, CROSS JOIN or JOIN ... ON,
@@ -4352,19 +4364,10 @@ std::optional<Rejection> RejectDerivedTable(const sql::FromItem& item) {
 // source, which precedes its ON.
 arrow::Status CheckFromList(const std::vector<sql::FromItem>& from) {
   ANTB1_CHECK(!from.empty());  // the parser makes no statement without a FROM item
-  if (from.size() > kMaxRelations) {
-    return Reject(Rejection{
-        .span = from[kMaxRelations].connector_span,
-        .message =
-            std::format("a query of more than {} relations is not supported", kMaxRelations)});
-  }
   for (const sql::FromItem& item : from) {
     if (item.connector == sql::Connector::kLeft) {
       return Reject(
           Rejection{.span = item.connector_span, .message = "LEFT JOIN is not supported"});
-    }
-    if (auto r = RejectDerivedTable(item)) {
-      return Reject(*r);
     }
     for (const sql::Expr& conjunct : item.on) {
       if (auto r = RejectCondition(conjunct, /*having=*/false)) {
@@ -4379,10 +4382,22 @@ arrow::Status CheckFromList(const std::vector<sql::FromItem>& from) {
 // reported (like the parser's own kUnsupported errors) before any name is resolved, so also over
 // tables that do not exist, at the first one in query order. The relation limit belongs here too;
 // the connectivity check cannot, since it needs the ids of the bound conjuncts (Binder::BindWhere).
-arrow::Status CheckSupported(const sql::SelectStatement& stmt) {
-  if (auto r = RejectWith(stmt)) {
-    return Reject(*r);
+// Every relation the statement expands to, sub-plans included, before anything else is checked:
+// every walk of a plan recurses per node, so the limit comes first, like the parser's depth limit
+// (ADR 0022). A derived table or a CTE reference counts 1 plus its body, so a chain of CTEs that
+// each join the previous one with itself is rejected before any sub-plan is bound.
+arrow::Status CheckRelationLimit(const sql::SelectStatement& stmt) {
+  const std::optional<RelationOverflow> over = RelationsExceedLimit(stmt);
+  if (!over.has_value()) {
+    return arrow::Status::OK();
   }
+  const sql::FromItem& item = stmt.from[over->item];
+  return Reject(Rejection{
+      .span = item.connector == sql::Connector::kFirst ? item.span : item.connector_span,
+      .message = std::format("a query of more than {} relations is not supported", kMaxRelations)});
+}
+
+arrow::Status CheckBlock(const sql::SelectStatement& stmt) {
   for (const sql::SelectItem& item : stmt.items) {
     ARROW_RETURN_NOT_OK(CheckValue(item.expr));
   }
@@ -4406,15 +4421,221 @@ arrow::Status CheckSupported(const sql::SelectStatement& stmt) {
   return arrow::Status::OK();
 }
 
+// What antb1 answers, over the whole statement: the relation limit first, like the parser's depth
+// limit, then every block the statement reaches -- its own, each derived table's, and the body of
+// each CTE something references. A static walk over names, so every kUnsupported is reported before
+// any name resolves, and an unreferenced CTE is not checked at all, as DuckDB never binds one.
+arrow::Status CheckSupported(const sql::SelectStatement& stmt) {
+  ARROW_RETURN_NOT_OK(CheckRelationLimit(stmt));
+  for (const sql::SelectStatement* block : ReachableBlocks(stmt)) {
+    ARROW_RETURN_NOT_OK(CheckBlock(*block));
+  }
+  return arrow::Status::OK();
+}
+
 // Rule 1 of ADR 0022: the name a qualified column reference uses for a FROM item's binding — its
-// alias, else a table's name as written, else a path's PathBindingName.
-std::string BindingName(const sql::FromItem& item) {
+// alias, else a CTE's name as written, else a table's name as written, else a path's
+// PathBindingName, else, for a derived table with no alias, `unnamed_subquery` and then
+// `unnamed_subquery2`, `unnamed_subquery3`... counting the unaliased derived tables of this block
+// alone, as DuckDB names them.
+std::string BindingName(const sql::FromItem& item, std::size_t& unnamed) {
   if (item.alias.has_value()) {
     return *item.alias;
   }
   const sql::TableRef* table = item.table();
-  ANTB1_CHECK(table != nullptr);  // CheckSupported rejected derived tables
+  if (table == nullptr) {
+    ++unnamed;
+    return unnamed == 1 ? "unnamed_subquery" : std::format("unnamed_subquery{}", unnamed);
+  }
   return table->kind == sql::TableRef::Kind::kPath ? PathBindingName(table->name) : table->name;
+}
+
+}  // namespace
+
+namespace {
+
+// A block bound as a sub-plan: its plan, and the columns a binding of it reads. The columns carry
+// the ids its root outputs, so Binding::OfPlan accepts them, and each one's FLOAT flag, so
+// divergence D11 survives the block boundary (ADR 0022's J4 note).
+struct BoundBlock {
+  LogicalPlan plan;
+  std::vector<BindingColumn> columns;
+};
+
+// The CTEs a block can see: its own list up to the one being bound, over the frames of the blocks
+// around it. `outer` of the frame a CTE was declared in is the scope its body binds against, which
+// is its definition site and not whatever block referenced it.
+struct CteFrame {
+  std::vector<const sql::CommonTableExpr*> visible;
+  const CteFrame* outer = nullptr;
+  const Scope* scope = nullptr;  // the scope enclosing the block that declared these
+  // Per CTE of this block's list, the frame its body binds in: the one holding the CTEs before it.
+  std::unordered_map<const sql::CommonTableExpr*, const CteFrame*> declared;
+
+  [[nodiscard]] const sql::CommonTableExpr* Find(std::string_view name) const {
+    const std::string lower = AsciiLower(name);
+    for (const CteFrame* frame = this; frame != nullptr; frame = frame->outer) {
+      const auto it = std::ranges::find_if(frame->visible, [&lower](const sql::CommonTableExpr* c) {
+        return AsciiLower(c->name) == lower;
+      });
+      if (it != frame->visible.end()) {
+        return *it;
+      }
+    }
+    return nullptr;
+  }
+
+  // A CTE's body binds at its definition site: the scope and the frame of the block that declared
+  // it, never the block that referenced it.
+  [[nodiscard]] const Scope* ScopeOf(const sql::CommonTableExpr* cte) const {
+    for (const CteFrame* frame = this; frame != nullptr; frame = frame->outer) {
+      if (std::ranges::contains(frame->visible, cte)) {
+        return frame->scope;
+      }
+    }
+    return nullptr;
+  }
+
+  [[nodiscard]] const CteFrame* ScopeFrameOf(const sql::CommonTableExpr* cte) const {
+    for (const CteFrame* frame = this; frame != nullptr; frame = frame->outer) {
+      const auto it = frame->declared.find(cte);
+      if (it != frame->declared.end()) {
+        return it->second;
+      }
+    }
+    return nullptr;
+  }
+};
+
+arrow::Result<BoundBlock> BindBlock(const sql::SelectStatement& stmt, const Catalog& catalog,
+                                    ColumnIdSource& ids, const CteFrame* ctes, const Scope* outer);
+
+// Rule 7: the binding's column names. The alias list renames the leading columns, each losing its
+// own name, and the de-duplication then runs over the result -- so `(SELECT 1 AS x, 2 AS x) s`
+// gives `x`, `x_1`, and `AS g(a, a)` gives `a`, `a_1`, as in DuckDB. A list longer than the block's
+// select list is a bind error for a derived table and has its extra names dropped for a CTE, which
+// is DuckDB's asymmetry (ADR 0022's J4 note).
+arrow::Status ApplyColumnNames(std::vector<BindingColumn>& columns,
+                               const std::vector<std::string>& names, bool is_cte,
+                               SourceSpan names_span, std::string_view what) {
+  if (names.size() > columns.size() && !is_cte) {
+    return BindError(std::format("{} has {} columns available but {} columns specified", what,
+                                 columns.size(), names.size()),
+                     names_span);
+  }
+  for (std::size_t i = 0; i < std::min(names.size(), columns.size()); ++i) {
+    columns[i].name = names[i];
+  }
+  // The first free `base_N`, N from 1, over the names taken so far, compared case-insensitively.
+  std::vector<std::string> taken;
+  taken.reserve(columns.size());
+  const auto used = [&taken](const std::string& name) {
+    const std::string lower = AsciiLower(name);
+    return std::ranges::contains(taken, lower);
+  };
+  for (BindingColumn& column : columns) {
+    if (used(column.name)) {
+      const std::string base = column.name;
+      for (int n = 1; used(column.name); ++n) {
+        column.name = std::format("{}_{}", base, n);
+      }
+    }
+    taken.push_back(AsciiLower(column.name));
+  }
+  return arrow::Status::OK();
+}
+
+// One FROM item's binding: a table, a path, or a sub-plan over a derived table or a CTE reference.
+// `siblings` is the scope of the bindings before it, which a sub-plan binds against so that a
+// lateral reference is found and exits 4 (rule 9) instead of reporting a missing column.
+arrow::Result<Binding> BindFromItem(const sql::FromItem& item, const Catalog& catalog,
+                                    ColumnIdSource& ids, const CteFrame& ctes,
+                                    const std::vector<Binding>& siblings, const Scope* outer,
+                                    std::size_t& unnamed, std::vector<LogicalPlan>& sub_plans) {
+  std::string name = BindingName(item, unnamed);
+  const sql::TableRef* ref = item.table();
+  const sql::CommonTableExpr* cte = ref == nullptr ? nullptr : ctes.Find(ref->name);
+  if (ref != nullptr && cte == nullptr) {
+    ARROW_ASSIGN_OR_RAISE(auto table, ResolveTable(*ref, catalog));
+    return Binding::OfTable(std::move(name),
+                            TableSource{.table = std::move(table),
+                                        .table_name = ref->name,
+                                        .span = ref->span,
+                                        .kind = ref->kind},
+                            ids);
+  }
+  // A sub-plan. A CTE's body binds in the frame and scope of its definition site, a derived table's
+  // in this block's frame and against the siblings before it.
+  const sql::SelectStatement& block =
+      cte == nullptr ? *std::get<sql::DerivedTable>(item.source).query : *cte->query;
+  const CteFrame* frame = cte == nullptr ? &ctes : ctes.ScopeFrameOf(cte);
+  // Only a sub-plan needs the scope of the bindings before it, so it is built here rather than
+  // once per FROM item: a copy of every preceding binding is not free at the relation limit.
+  const Scope preceding(siblings, outer);
+  const Scope* scope = cte == nullptr ? &preceding : ctes.ScopeOf(cte);
+  ARROW_ASSIGN_OR_RAISE(BoundBlock bound, BindBlock(block, catalog, ids, frame, scope));
+  std::vector<BindingColumn> columns = std::move(bound.columns);
+  // A column alias list after a CTE name is rejected by the parser (rule 7), so a CTE's list is
+  // always the one written where it was declared.
+  const std::vector<std::string>& names = cte == nullptr ? item.columns : cte->columns;
+  const SourceSpan span = cte == nullptr ? item.columns_span : cte->columns_span;
+  ARROW_RETURN_NOT_OK(ApplyColumnNames(columns, names, /*is_cte=*/cte != nullptr, span,
+                                       std::format("table \"{}\"", name)));
+  sub_plans.push_back(std::move(bound.plan));
+  return Binding::OfPlan(std::move(name), sub_plans.back().root, std::move(columns),
+                         cte == nullptr ? std::string{} : cte->name);
+}
+
+arrow::Result<BoundBlock> BindBlock(const sql::SelectStatement& stmt, const Catalog& catalog,
+                                    ColumnIdSource& ids, const CteFrame* ctes, const Scope* outer) {
+  // The frames of this block: one per CTE holding the CTEs before it, then the block's own.
+  std::deque<CteFrame> frames;
+  std::vector<const sql::CommonTableExpr*> visible;
+  visible.reserve(stmt.with.size());
+  for (const sql::CommonTableExpr& cte : stmt.with) {
+    frames.push_back(CteFrame{.visible = visible, .outer = ctes, .scope = outer});
+    visible.push_back(&cte);
+  }
+  frames.push_back(CteFrame{.visible = visible, .outer = ctes, .scope = outer});
+  // Which frame each CTE of this list binds its body in, on every frame of this block and not only
+  // on its own: a CTE body's chain starts at that CTE's frame, whose outer is the enclosing
+  // block's, so the block's own frame is not on it. Without the map there, a CTE referenced from
+  // inside another CTE's body would bind with no CTE frame at all and read a catalog table of its
+  // name.
+  std::unordered_map<const sql::CommonTableExpr*, const CteFrame*> declared;
+  declared.reserve(stmt.with.size());
+  for (std::size_t i = 0; i < stmt.with.size(); ++i) {
+    declared.emplace(&stmt.with[i], &frames[i]);
+  }
+  for (CteFrame& frame : frames) {
+    frame.declared = declared;
+  }
+  const CteFrame& own = frames.back();
+
+  // One binding per FROM item, in FROM order and from one id source, so that a relation's index is
+  // its binding's and its FROM item's: the invariant OnVisibility, OrderJoins and Scope::Find
+  // share. A sub-plan binds against the bindings before it, so a lateral reference is found.
+  std::vector<Binding> bindings;
+  std::vector<LogicalPlan> sub_plans;
+  sub_plans.reserve(stmt.from.size());
+  std::size_t unnamed = 0;
+  for (const sql::FromItem& item : stmt.from) {
+    ARROW_ASSIGN_OR_RAISE(Binding binding, BindFromItem(item, catalog, ids, own, bindings, outer,
+                                                        unnamed, sub_plans));
+    bindings.push_back(std::move(binding));
+  }
+  Binder binder(stmt, std::move(bindings), ids, outer);
+  ARROW_ASSIGN_OR_RAISE(LogicalPlan plan, binder.Bind());
+  std::vector<BindingColumn> columns;
+  columns.reserve(plan.output.size());
+  for (const OutputColumn& out : plan.output) {
+    columns.push_back(BindingColumn{.name = out.name,
+                                    .id = out.id,
+                                    .type = out.type,
+                                    .unsupported_type = {},
+                                    .stored_as_float = out.stored_as_float});
+  }
+  return BoundBlock{.plan = std::move(plan), .columns = std::move(columns)};
 }
 
 }  // namespace
@@ -4422,25 +4643,10 @@ std::string BindingName(const sql::FromItem& item) {
 arrow::Result<LogicalPlan> Bind(const sql::SelectStatement& stmt, const Catalog& catalog) {
   const sql::SelectStatement folded = FoldDateCasts(stmt);  // the binder refers to it
   ARROW_RETURN_NOT_OK(CheckSupported(folded));
-  // One binding per FROM item, in FROM order and from one id source, so that a relation's index is
-  // its binding's and its FROM item's: the invariant OnVisibility, OrderJoins and Scope::Find
-  // share.
-  ColumnIdSource ids;
-  std::vector<Binding> bindings;
-  for (const sql::FromItem& item : folded.from) {
-    const sql::TableRef* ref = item.table();
-    ANTB1_CHECK(ref != nullptr);  // CheckSupported rejected derived tables
-    ARROW_ASSIGN_OR_RAISE(auto table, ResolveTable(*ref, catalog));
-    bindings.push_back(Binding::OfTable(BindingName(item),
-                                        TableSource{.table = std::move(table),
-                                                    .table_name = ref->name,
-                                                    .span = ref->span,
-                                                    .kind = ref->kind},
-                                        ids));
-  }
-  Binder binder(folded, std::move(bindings), ids);
-  ARROW_ASSIGN_OR_RAISE(LogicalPlan plan, binder.Bind());
-  return ResolvePositions(plan);  // the binder refers to columns by id (ADR 0022)
+  ColumnIdSource ids;  // one per query: every block's columns are minted from it
+  ARROW_ASSIGN_OR_RAISE(BoundBlock bound,
+                        BindBlock(folded, catalog, ids, /*ctes=*/nullptr, /*outer=*/nullptr));
+  return ResolvePositions(bound.plan);  // the binder refers to columns by id (ADR 0022)
 }
 
 }  // namespace antb1::plan

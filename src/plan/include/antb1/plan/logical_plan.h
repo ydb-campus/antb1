@@ -55,6 +55,10 @@ struct OutputColumn {
   std::string name;
   LogicalType type = LogicalType::kBigInt;
   ColumnId id = kNoColumnId;  // the root's output column
+  // The column holds FLOAT values, widened to DOUBLE (divergence D11): a comparison against a
+  // literal folds at FLOAT precision. A sub-plan's binding carries it out, so the divergence
+  // survives a derived table or a CTE (ADR 0022's J4 note).
+  bool stored_as_float = false;
 };
 
 enum class CompareOp : std::uint8_t { kEq, kNe, kLt, kLe, kGt, kGe };

@@ -21,7 +21,6 @@ SELECT COUNT(*), MAX(ct_id) FROM cities
 # ---- pending: derived tables and CTEs (ADR 0022; roadmap PR J4 removes these guards) ----
 
 # A column alias list shorter than the select list renames the first columns.
-pending J4
 query II rowsort
 SELECT d, n FROM (SELECT tr_pickup, COUNT(*) AS n FROM trips GROUP BY tr_pickup) AS g(d) WHERE d > 38
 ----
@@ -32,19 +31,16 @@ SELECT d, n FROM (SELECT tr_pickup, COUNT(*) AS n FROM trips GROUP BY tr_pickup)
 43	69
 
 # A derived table without an alias is unnamed_subquery, the next unnamed_subquery2.
-pending J4
 query I nosort unnamed
 SELECT unnamed_subquery.n FROM (SELECT COUNT(*) AS n FROM trips)
 ----
 3000
 
-pending J4
 query I nosort unnamed
 SELECT n FROM (SELECT COUNT(*) AS n FROM trips)
 ----
 3000
 
-pending J4
 query II rowsort
 SELECT unnamed_subquery.z, unnamed_subquery2.c FROM (SELECT zn_id AS z, zn_city AS zc FROM zones), (SELECT ct_id AS c FROM cities)
 WHERE zc = c AND z <= 3
@@ -54,48 +50,41 @@ WHERE zc = c AND z <= 3
 3	3
 
 # Output names are de-duplicated: the second tr_driver is tr_driver_1.
-pending J4
 query III nosort
 SELECT COUNT(*), MIN(tr_driver_1), MAX(tr_driver_1) FROM (SELECT tr_driver, tr_driver + 1 AS tr_driver FROM trips)
 ----
 3000	1001	4886
 
 # ORDER BY with LIMIT inside a derived table picks the rows.
-pending J4
 query IDI nosort
 SELECT COUNT(*), SUM(tr_fare), MIN(tr_row) FROM (SELECT tr_row, tr_fare FROM trips ORDER BY tr_fare DESC NULLS LAST, tr_row LIMIT 10)
 ----
 10	275.00	10
 
 # Aggregates over aggregates, and a filter on the grouped rows.
-pending J4
 query III nosort
 SELECT MAX(n), MIN(n), SUM(n) FROM (SELECT tr_rider, COUNT(*) AS n FROM trips GROUP BY tr_rider)
 ----
 131	3	3000
 
-pending J4
 query I nosort
 SELECT COUNT(*) FROM (SELECT tr_rider, COUNT(*) AS n FROM trips GROUP BY tr_rider) WHERE n >= 13
 ----
 63
 
 # A CTE hides the table of the same name.
-pending J4
 query II nosort
 WITH zones AS (SELECT ct_id AS zn_id FROM cities) SELECT COUNT(*), MAX(zn_id) FROM zones
 ----
 6	6
 
 # An unused CTE is never bound.
-pending J4
 query I nosort
 WITH unused AS (SELECT nope FROM no_such_table) SELECT COUNT(*) FROM trips
 ----
 3000
 
 # A CTE that reads the CTE before it.
-pending J4
 query I nosort
 WITH per_rider AS (SELECT tr_rider AS rider, COUNT(*) AS n FROM trips GROUP BY tr_rider),
   busy AS (SELECT rider FROM per_rider WHERE n >= 13)
@@ -104,7 +93,6 @@ SELECT COUNT(*) FROM busy
 63
 
 # A derived table joined with a table.
-pending J4
 query II rowsort
 SELECT zn_city, SUM(n) FROM (SELECT tr_pickup, COUNT(*) AS n FROM trips GROUP BY tr_pickup) AS p JOIN zones ON p.tr_pickup = zn_id
 GROUP BY zn_city
@@ -118,7 +106,6 @@ GROUP BY zn_city
 NULL	69
 
 # A CTE referenced twice, joined with itself on an expression key.
-pending J4
 query III nosort
 WITH per_zone AS (SELECT tr_pickup AS zone, COUNT(*) AS n FROM trips GROUP BY tr_pickup)
 SELECT COUNT(*), SUM(a.n), SUM(b.n) FROM per_zone AS a, per_zone AS b WHERE a.zone + 1 = b.zone
@@ -133,10 +120,115 @@ SELECT zone, fares FROM per_zone WHERE fares = (SELECT MAX(fares) FROM per_zone)
 ----
 33	1093.25
 
-# A column alias list longer than the select list.
-pending J4
+# A column alias list longer than the select list is a bind error for a derived table, while a CTE's
+# extra names are dropped and the query answers: DuckDB differs between the two forms (ADR 0022).
 statement error
 SELECT COUNT(*) FROM (SELECT tr_pickup FROM trips) AS g(a, b)
+
+query II nosort
+WITH c(x, y, z) AS (SELECT tr_row FROM trips) SELECT COUNT(*), MAX(x) FROM c
+----
+3000	2999
+
+# The suffix is the first free `base_N`, so a name the block already declares as `x_1` pushes the
+# de-duplicated one to `x_1_1` rather than colliding with it.
+query III nosort
+SELECT x, x_1, x_1_1 FROM (SELECT tr_row AS x, tr_pickup AS x, tr_dropoff AS x_1 FROM trips)
+ORDER BY x LIMIT 1
+----
+0	1	1
+
+# Rule 7's de-duplication runs over the alias list too, after it is applied: the second `a` is
+# `a_1`, and an unqualified `a` is the first column rather than ambiguous.
+query II nosort
+SELECT a, a_1 FROM (SELECT tr_row, tr_pickup FROM trips) AS g(a, a) ORDER BY a LIMIT 1
+----
+0	1
+
+# A FLOAT column keeps divergence D11 through a sub-plan: the comparison folds at FLOAT precision
+# here as it does over the table, so wrapping the block changes the plan and not the answer.
+query I nosort
+SELECT COUNT(*) FROM (SELECT id, f FROM floats) AS s WHERE f = 0.1
+----
+1
+
+query I nosort
+SELECT COUNT(*) FROM floats WHERE f = 0.1
+----
+1
+
+# Rule 8: a CTE is visible from a derived table of the same block, and names a string FROM item
+# before that item is read as a path.
+query I nosort
+WITH c AS (SELECT tr_row FROM trips) SELECT COUNT(*) FROM (SELECT tr_row FROM c) AS s
+----
+3000
+
+query I nosort
+WITH "trips" AS (SELECT ct_id AS tr_row FROM cities) SELECT COUNT(*) FROM 'trips'
+----
+6
+
+# A chain of three CTEs: the middle one's body must see the first, which only works if the frame a
+# CTE body binds in is reachable from that body. With it unreachable, `per_zone` inside `busy`'s
+# body would read a catalog table of that name instead -- a wrong answer, not an error.
+query I nosort
+WITH per_zone AS (SELECT tr_pickup AS zone, COUNT(*) AS n FROM trips GROUP BY tr_pickup),
+     busy AS (SELECT zone FROM per_zone WHERE n > 69),
+     busiest AS (SELECT zone FROM busy WHERE zone > 20)
+SELECT COUNT(*) FROM busiest
+----
+13
+
+# The same three levels through a nested WITH list, whose CTEs are the inner block's own.
+query I nosort
+WITH outer_c AS (WITH i1 AS (SELECT tr_pickup AS z FROM trips), i2 AS (SELECT z FROM i1),
+                      i3 AS (SELECT z FROM i2)
+                 SELECT COUNT(*) AS n FROM i3)
+SELECT n FROM outer_c
+----
+3000
+
+# A CTE whose name is also a table's, referenced from inside another CTE's body: the CTE wins there
+# too, so the count is the CTE's rows and not the table's.
+query I nosort
+WITH zones AS (SELECT ct_id AS zn_id FROM cities), nested AS (SELECT zn_id FROM zones)
+SELECT COUNT(*) FROM nested
+----
+6
+
+# An inner block's GROUP BY alias that happens to name a column of the enclosing block is the
+# alias, not a correlation, so the two FROM orders answer alike: rule 9 is asked only after this
+# block's own aliases have been tried.
+query I nosort
+SELECT SUM(s.n) FROM zones, (SELECT tr_pickup AS zn_id, COUNT(*) AS n FROM trips GROUP BY zn_id) s
+WHERE s.zn_id = zones.zn_id
+----
+2793
+
+query I nosort
+SELECT SUM(s.n) FROM (SELECT tr_pickup AS zn_id, COUNT(*) AS n FROM trips GROUP BY zn_id) s, zones
+WHERE s.zn_id = zones.zn_id
+----
+2793
+
+# A date cast inside a sub-plan is folded like one in the outer block, in both spellings.
+query IT nosort
+SELECT COUNT(*), MIN(d) FROM (SELECT tr_day AS d FROM trips WHERE tr_day > CAST('2026-03-01' AS DATE)) AS s
+----
+2825	2026-03-02
+
+query I nosort
+WITH c AS (SELECT tr_day AS d FROM trips WHERE tr_day > '2026-03-01'::DATE) SELECT COUNT(*) FROM c
+----
+2825
+
+# A WITH list inside a derived table may reuse a name of the statement's: the inner one wins.
+query I nosort
+WITH c AS (SELECT MIN(tr_row) AS x FROM trips)
+SELECT x FROM (WITH c AS (SELECT MAX(tr_row) AS x FROM trips) SELECT x FROM c)
+----
+2999
 
 # ---- DuckDB only until lateral references get a PR (ADR 0022: a lateral reference exits 4) ----
 

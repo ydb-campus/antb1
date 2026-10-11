@@ -762,5 +762,65 @@ TEST(BindingDeathTest, OfPlanChecksItsRootAndColumns) {
   EXPECT_DEATH((void)Binding::OfPlan("x", root, {}), "OutputIds");
 }
 
+// A name the block lacks that an enclosing one has is a correlation (ADR 0022 rule 9), which the
+// binder reports as kUnsupported and never as "does not exist". The scope answers the question and
+// supplies the error, but does not pre-empt resolution with it: the binder asks only once its own
+// select-list aliases have failed, so an inner alias that happens to name an enclosing column stays
+// the alias. Every enclosing scope is tried, not only the nearest -- DuckDB answers a reference
+// several blocks out -- and an unqualified name counts, which a qualifier check would miss.
+TEST(ScopeTest, AnEnclosingBlocksColumnCorrelatesAndIsNoMissingColumn) {
+  ColumnIdSource ids;
+  const Scope outer({TableBinding("o", arrow::schema({arrow::field("k", arrow::int32())}), ids)});
+  const Scope middle({TableBinding("m", arrow::schema({arrow::field("mid", arrow::int32())}), ids)},
+                     &outer);
+  const Scope inner({TableBinding("i", arrow::schema({arrow::field("own", arrow::int32())}), ids)},
+                    &middle);
+  constexpr SourceSpan kSpan{.offset = 3, .length = 1};
+  // Resolve still reports the plain bind error, so the binder's alias fallbacks keep working.
+  ExpectSqlError(inner.Resolve(Ref("mid", kSpan)).status(), kBind, "column 'mid' does not exist",
+                 kSpan);
+  // One level out, unqualified: a qualifier-only check would miss this one.
+  EXPECT_TRUE(inner.Correlates(Ref("mid")));
+  // Two levels out: the whole chain is walked.
+  EXPECT_TRUE(inner.Correlates(Ref("k")));
+  // Qualified, and the error says so.
+  sql::ColumnRef qualified = Ref("k", kSpan);
+  qualified.qualifier = "o";
+  EXPECT_TRUE(inner.Correlates(qualified));
+  ExpectSqlError(Scope::CorrelationError(qualified), kUnsupported,
+                 "a qualified column of an enclosing query block is not supported", kSpan);
+  ExpectSqlError(Scope::CorrelationError(Ref("mid", kSpan)), kUnsupported,
+                 "a column of an enclosing query block is not supported", kSpan);
+  // A name no scope has correlates with nothing, and the block's own column is never a correlation.
+  EXPECT_FALSE(inner.Correlates(Ref("nope")));
+  EXPECT_FALSE(inner.Correlates(Ref("own")));
+  EXPECT_FALSE(outer.Correlates(Ref("k"))) << "the outermost scope encloses nothing";
+  const auto own = inner.Resolve(Ref("own"));
+  ASSERT_TRUE(own.ok()) << own.status().ToString();
+}
+
+// An alias hides a sub-plan's own name as it hides a table's (rule 2), and the bind error says so.
+// A derived table has no name of its own, so nothing is hidden there.
+TEST(ScopeTest, AnAliasHidesACtesNameAndADerivedTableHasNone) {
+  const auto table =
+      std::make_shared<FakeTable>(arrow::schema({arrow::field("a", arrow::int32())}), 1);
+  const LogicalNodePtr root = std::make_shared<const LogicalNode>(
+      ScanNode{.table = table, .table_name = "x", .fields = {0}, .ids = {ColumnId{1}}});
+  const std::vector<BindingColumn> columns = {
+      BindingColumn{.name = "a", .id = ColumnId{1}, .type = LogicalType::kInteger}};
+  // A CTE named `c`, referenced as `c AS g`: `c.a` is the error that names what hides it.
+  const Scope cte({Binding::OfPlan("g", root, columns, /*unaliased_name=*/"c")});
+  sql::ColumnRef hidden = Ref("a");
+  hidden.qualifier = "c";
+  const arrow::Status status = cte.Resolve(hidden).status();
+  EXPECT_TRUE(status.IsInvalid()) << status.ToString();
+  EXPECT_NE(status.message().find("the alias 'g' hides it"), std::string::npos) << status.message();
+  // A derived table carries no name, so its alias hides nothing and the message is the plain one.
+  const Scope derived({Binding::OfPlan("g", root, columns)});
+  const arrow::Status plain = derived.Resolve(hidden).status();
+  EXPECT_TRUE(plain.IsInvalid()) << plain.ToString();
+  EXPECT_EQ(plain.message().find("hides it"), std::string::npos) << plain.message();
+}
+
 }  // namespace
 }  // namespace antb1::plan

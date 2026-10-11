@@ -186,24 +186,22 @@ TEST_F(CliTest, UnsupportedQueryExits4WithCaret) {
             "  at line 1, column 22\n"
             "  SELECT COUNT(*) FROM a JOIN b ON a.k = b.k\n"
             "                       ^\n");
-  // A derived table and a WITH list parse too, and the binder rejects them at their '(' and their
-  // WITH, before any table resolves (neither u nor c is registered).
+  // A derived table and a WITH list bind from J4 on, so their tables are resolved: a missing one
+  // is a bind error inside the sub-plan, at its own name and not at the '(' or the WITH.
   r = Invoke({"query", "-c", "SELECT COUNT(*) FROM (SELECT a FROM u) AS s(x)"});
-  EXPECT_EQ(r.code, kExitUnsupported);
+  EXPECT_EQ(r.code, kExitQueryError);
   EXPECT_EQ(r.err,
-            "antb1: unsupported error: subqueries in FROM are not supported; see "
-            "docs/sql-subset.md\n"
-            "  at line 1, column 22\n"
+            "antb1: bind error: table 'u' does not exist\n"
+            "  at line 1, column 37\n"
             "  SELECT COUNT(*) FROM (SELECT a FROM u) AS s(x)\n"
-            "                       ^\n");
+            "                                      ^\n");
   r = Invoke({"query", "-c", "WITH c AS (SELECT a FROM u)\nSELECT COUNT(*) FROM c"});
-  EXPECT_EQ(r.code, kExitUnsupported);
+  EXPECT_EQ(r.code, kExitQueryError);
   EXPECT_EQ(r.err,
-            "antb1: unsupported error: WITH (common table expressions) is not supported; see "
-            "docs/sql-subset.md\n"
-            "  at line 1, column 1\n"
+            "antb1: bind error: table 'u' does not exist\n"
+            "  at line 1, column 26\n"
             "  WITH c AS (SELECT a FROM u)\n"
-            "  ^^^^\n");
+            "                           ^\n");
   // A duplicate CTE name is a syntax error (exit code 1), as in DuckDB.
   r = Invoke(
       {"query", "-c", "WITH c AS (SELECT a FROM u), C AS (SELECT a FROM u) SELECT a FROM c"});

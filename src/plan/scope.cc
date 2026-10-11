@@ -86,13 +86,17 @@ std::string QualifiedText(const std::vector<Binding>& bindings, ColumnLocation w
 // Whether a binding of a table is named by an alias that hides `qualifier`, the name that its FROM
 // reference gives it without one (rule 1): a table's name as written, a path's PathBindingName.
 bool AliasHides(const Binding& binding, std::string_view qualifier) {
-  const auto* table = std::get_if<TableSource>(&binding.source());
-  if (table == nullptr) {
+  std::string unaliased;
+  if (const auto* table = std::get_if<TableSource>(&binding.source())) {
+    unaliased = table->kind == sql::TableRef::Kind::kPath ? PathBindingName(table->table_name)
+                                                          : table->table_name;
+  } else {
+    // A sub-plan: a CTE's name as written, and nothing for a derived table, which has none.
+    unaliased = std::get<PlanSource>(binding.source()).unaliased_name;
+  }
+  if (unaliased.empty()) {
     return false;
   }
-  const std::string unaliased = table->kind == sql::TableRef::Kind::kPath
-                                    ? PathBindingName(table->table_name)
-                                    : table->table_name;
   return !binding.Named(unaliased) && AsciiLower(qualifier) == AsciiLower(unaliased);
 }
 
@@ -213,7 +217,8 @@ Binding Binding::OfTable(std::string name, TableSource source, ColumnIdSource& i
   return {std::move(name), std::move(source), std::move(columns)};
 }
 
-Binding Binding::OfPlan(std::string name, LogicalNodePtr root, std::vector<BindingColumn> columns) {
+Binding Binding::OfPlan(std::string name, LogicalNodePtr root, std::vector<BindingColumn> columns,
+                        std::string unaliased_name) {
   ANTB1_CHECK(root != nullptr);
   std::vector<ColumnId> ids;
   ids.reserve(columns.size());
@@ -223,7 +228,9 @@ Binding Binding::OfPlan(std::string name, LogicalNodePtr root, std::vector<Bindi
     ids.push_back(column.id);
   }
   ANTB1_CHECK(OutputIds(*root) == ids);
-  return {std::move(name), PlanSource{.root = std::move(root)}, std::move(columns)};
+  return {std::move(name),
+          PlanSource{.root = std::move(root), .unaliased_name = std::move(unaliased_name)},
+          std::move(columns)};
 }
 
 bool Binding::Named(std::string_view qualifier) const {
@@ -297,6 +304,23 @@ arrow::Result<BoundColumn> Scope::Resolve(const sql::ColumnRef& ref, Visibility 
   }
   return BindError(MissingMessage(bindings_, ref, std::min(visible.end, bindings_.size())),
                    ref.span);
+}
+
+bool Scope::Correlates(const sql::ColumnRef& ref) const {
+  // Every enclosing scope, not just the nearest: DuckDB answers a reference several blocks out.
+  // An unqualified name counts too, which a check over qualifiers alone would miss.
+  for (const Scope* outer = outer_; outer != nullptr; outer = outer->outer_) {
+    if (outer->LookUp(ref).outcome != Lookup::Outcome::kMissing) {
+      return true;
+    }
+  }
+  return false;
+}
+
+arrow::Status Scope::CorrelationError(const sql::ColumnRef& ref) {
+  return UnsupportedError(std::format("a {} of an enclosing query block is not supported",
+                                      ref.qualifier.empty() ? "column" : "qualified column"),
+                          ref.span);
 }
 
 arrow::Result<BoundColumn> Scope::Reference(ColumnLocation where, SourceSpan span) const {

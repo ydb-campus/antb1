@@ -363,6 +363,8 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kQuotedIdentifier,
     Feature::kLayout,
     Feature::kSemicolon,
+    Feature::kDerivedTable,
+    Feature::kCommonTableExpr,
 };
 static_assert(kSupportedFeatures.Minus(kNeverGenerated) == kSupportedFeatures,
               "kSupportedFeatures must not declare an out-of-scope marker (kNeverGenerated)");

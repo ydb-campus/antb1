@@ -217,6 +217,49 @@ antb1_add_cli_golden(
     "zones=${_f}/star/zones.parquet"
 )
 
+# ---- sub-plans (ADR 0022's J4): what a derived table and a CTE reference look like ----
+# A grouped derived table joined with a table: the sub-plan is a lower part of the probe branch,
+# estimated from its input (3000 rows), so it probes and zones builds.
+antb1_add_cli_golden(
+  explain_derived_table_join
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT zn_city, SUM(n) FROM (SELECT tr_pickup, COUNT(*) AS n FROM trips GROUP BY tr_pickup) AS p JOIN zones ON p.tr_pickup = zn_id GROUP BY zn_city"
+    --table
+    "trips=${_f}/star/trips.parquet"
+    --table
+    "zones=${_f}/star/zones.parquet"
+)
+# Decision C8 made visible: a CTE referenced twice is bound twice and scanned twice, so the plan
+# holds two identical subtrees rather than one shared node.
+antb1_add_cli_golden(
+  explain_cte_referenced_twice
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "WITH per_zone AS (SELECT tr_pickup AS zone, COUNT(*) AS n FROM trips GROUP BY tr_pickup) SELECT COUNT(*) FROM per_zone AS a, per_zone AS b WHERE a.zone = b.zone"
+    --table
+    "trips=${_f}/star/trips.parquet"
+)
+# A sub-plan that ends in a sink: the inner ORDER BY with LIMIT is a top-N below the outer
+# aggregate, which drains it.
+antb1_add_cli_golden(
+  explain_derived_table_top_n
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT COUNT(*), SUM(tr_fare) FROM (SELECT tr_row, tr_fare FROM trips ORDER BY tr_fare DESC NULLS LAST, tr_row LIMIT 10) AS top"
+    --table
+    "trips=${_f}/star/trips.parquet"
+)
+
 # ---- bench: ClickBench-format JSON (docs/benchmarks.md); timings vary, so regexes ----
 # CMake regex: [.] [{] [}] [[] []] match the character itself; \n is a newline. Built with string(APPEND):
 # a CMake list would split at the ; separators inside [ ].

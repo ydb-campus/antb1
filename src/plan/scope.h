@@ -58,6 +58,10 @@ struct TableSource {
 // outputs the binding's columns, in order.
 struct PlanSource {
   LogicalNodePtr root;
+  // The name the FROM reference gives it without an alias (rule 1): a CTE's name as written, empty
+  // for a derived table, which has no name of its own. An alias hides it, as it hides a table's
+  // name (rule 2), and the bind error says so.
+  std::string unaliased_name;
 };
 
 using BindingSource = std::variant<TableSource, PlanSource>;
@@ -86,8 +90,11 @@ class Binding {
   // (BindingColumn::type).
   static Binding OfTable(std::string name, TableSource source, ColumnIdSource& ids);
   // The columns as given. Every column must have an id and a type, and the root must output
-  // exactly the columns' ids, in order: anything else is a programming error.
-  static Binding OfPlan(std::string name, LogicalNodePtr root, std::vector<BindingColumn> columns);
+  // exactly the columns' ids, in order: anything else is a programming error. `unaliased_name` is
+  // the name the reference gives it without an alias (a CTE's name as written; empty for a derived
+  // table), which an alias then hides as it hides a table's name (rule 2).
+  static Binding OfPlan(std::string name, LogicalNodePtr root, std::vector<BindingColumn> columns,
+                        std::string unaliased_name = {});
 
   // The name a qualified column reference uses, as the binder gives it: by rule 1 of ADR 0022 the
   // FROM item's alias, else its table name as written, else its path's PathBindingName. Two
@@ -156,9 +163,9 @@ struct Lookup {
 class Scope {
  public:
   // `outer` is the scope of the enclosing block (nullptr: none), which must outlive this one.
-  // Nothing consults it yet: rule 9 of ADR 0022 (a name found only in an enclosing block is a
-  // correlation, ADR 0023) comes with roadmap PR J5, and a Visibility limits this block's bindings
-  // only.
+  // `Resolve` consults the whole chain of them for rule 9 of ADR 0022: a name this block lacks that
+  // an enclosing one has is a correlation, which exits 4 until ADR 0023's PRs answer it and never
+  // reports "does not exist". A Visibility limits this block's bindings only.
   explicit Scope(std::vector<Binding> bindings, const Scope* outer = nullptr);
   Scope(const Scope&) = delete;
   Scope& operator=(const Scope&) = delete;
@@ -174,6 +181,17 @@ class Scope {
   // or two columns of one binding whose names differ only in case); with none, the next level is
   // searched.
   [[nodiscard]] Lookup LookUp(const sql::ColumnRef& ref, Visibility visible = {}) const;
+
+  // Whether an enclosing scope has `ref`, which makes a name this block lacks a correlation rather
+  // than a missing column (ADR 0022 rule 9). Asked only once this block's own resolution has
+  // failed, its select-list aliases included: an alias of this block that happens to name a column
+  // of an enclosing one is this block's alias, not a correlation, so whether it resolves must not
+  // depend on the FROM order of the enclosing block.
+  [[nodiscard]] bool Correlates(const sql::ColumnRef& ref) const;
+
+  // Rule 9's error: a correlation exits 4 until ADR 0023's PRs answer it, and never reports
+  // "does not exist".
+  static arrow::Status CorrelationError(const sql::ColumnRef& ref);
 
   // The column `ref` refers to (LookUp), by its id (plan::ResolvePositions sets its position at the
   // end), as Reference gives it. A bind error at the name when it is ambiguous (rules 3 and 4: the
