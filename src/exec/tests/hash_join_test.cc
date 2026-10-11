@@ -4011,6 +4011,45 @@ TEST_F(HashJoinPlanTest, BuildsArePreparedOutermostFirstAndInPostOrder) {
   }
 }
 
+// A sink on both sides, which ADR 0022's J4 is the first to produce: a derived table or a CTE
+// reference joined with another. Each half is covered on its own -- a drained build
+// (MakeJoinBuild's fallback) and a probe over a serial input -- but never composed, and the keyless
+// one-row join is a different path. The build's rows are read first, then the probe's, and the
+// answer is the one the same keys give over the tables.
+TEST_F(HashJoinPlanTest, AJoinOfTwoSinksDrainsTheBuildThenProbes) {
+  const auto pool = MakeThreadPool();
+  const auto log = std::make_shared<ScanLog>();
+  const auto key = [](int64_t i) -> std::optional<int64_t> { return i % 6; };
+  const auto p = std::make_shared<LoggedTable>(MixedTable("p", 5, 4, key), "p", log);
+  const auto b = std::make_shared<LoggedTable>(MixedTable("b", 3, 4, key), "b", log);
+  const auto grouped = [](const std::shared_ptr<plan::Table>& table, const std::string& name) {
+    return Node(plan::GroupAggregateNode{
+        .input = ScanOf(table, name),
+        .keys = {MixedColumn(name, 0)},
+        .aggregates = {
+            {.kind = plan::AggKind::kCountStar, .arg = {}, .type = LogicalType::kBigInt}}});
+  };
+  const auto plan =
+      PlanOf(JoinOf(grouped(p, "p"), grouped(b, "b"), {Column(0, "pk", LogicalType::kBigInt)},
+                    {Column(0, "bk", LogicalType::kBigInt)}),
+             4);  // each side groups to a key and a count
+  for (arrow::internal::Executor* executor : Executors(pool.get())) {
+    SCOPED_TRACE(executor == nullptr ? "one thread" : "pool");
+    log->Clear();
+    auto op = BuildPhysicalPlan(plan);
+    ASSERT_TRUE(op.ok()) << op.status().ToString();
+    EXPECT_NE(dynamic_cast<const HashJoinOperator*>(op->get()), nullptr);
+    ExecContext ctx = ContextOf(executor);
+    auto rows = RunPlan(plan, ctx);
+    ASSERT_TRUE(rows.ok()) << rows.status().ToString();
+    // Both sides group to one row per key, and the keys are i % 6 on either side, so the join
+    // keeps one row per key both have.
+    EXPECT_EQ(RowsOf(**rows).size(), 6U) << "one row per shared key";
+    EXPECT_EQ(log->names(), Concat({Repeated("b", 3), Repeated("p", 5)}))
+        << "the build is drained before the probe runs";
+  }
+}
+
 // A probe over a serial input (here a GROUP BY's rows) prepares its build at its first Next, not in
 // Open, and only then opens its input: the build's parts are read first, the probe's after.
 TEST_F(HashJoinPlanTest, ProbeOverASerialInputBuildsAtItsFirstNext) {
