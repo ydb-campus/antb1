@@ -7,6 +7,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -134,6 +135,60 @@ std::size_t CountRelations(const sql::SelectStatement& block) {
 std::optional<RelationOverflow> RelationsExceedLimit(const sql::SelectStatement& block) {
   Counter counter;
   return counter.Top(block);
+}
+
+namespace {
+
+// The same frames as the count, walked for the blocks rather than for their size.
+class Reach {
+ public:
+  void Walk(const sql::SelectStatement& block, const CteFrame* outer) {
+    blocks_.push_back(&block);
+    const CteFrame& frame = MakeFrame(block, outer);
+    for (const sql::FromItem& item : block.from) {
+      if (const auto* derived = std::get_if<sql::DerivedTable>(&item.source)) {
+        Walk(*derived->query, &frame);
+        continue;
+      }
+      const sql::TableRef* ref = item.table();
+      if (ref == nullptr) {
+        continue;
+      }
+      const sql::CommonTableExpr* cte = frame.Find(AsciiLower(ref->name));
+      if (cte != nullptr && seen_.insert(cte).second) {
+        const auto declared = declared_in_.find(cte);
+        Walk(*cte->query, declared == declared_in_.end() ? nullptr : declared->second);
+      }
+    }
+  }
+
+  std::vector<const sql::SelectStatement*> take() { return std::move(blocks_); }
+
+ private:
+  const CteFrame& MakeFrame(const sql::SelectStatement& block, const CteFrame* outer) {
+    std::vector<const sql::CommonTableExpr*> visible;
+    visible.reserve(block.with.size());
+    for (const sql::CommonTableExpr& cte : block.with) {
+      frames_.push_back(CteFrame{.visible = visible, .outer = outer});
+      declared_in_.emplace(&cte, &frames_.back());
+      visible.push_back(&cte);
+    }
+    frames_.push_back(CteFrame{.visible = std::move(visible), .outer = outer});
+    return frames_.back();
+  }
+
+  std::vector<const sql::SelectStatement*> blocks_;
+  std::unordered_set<const sql::CommonTableExpr*> seen_;
+  std::unordered_map<const sql::CommonTableExpr*, const CteFrame*> declared_in_;
+  std::deque<CteFrame> frames_;
+};
+
+}  // namespace
+
+std::vector<const sql::SelectStatement*> ReachableBlocks(const sql::SelectStatement& block) {
+  Reach reach;
+  reach.Walk(block, nullptr);
+  return reach.take();
 }
 
 }  // namespace antb1::plan

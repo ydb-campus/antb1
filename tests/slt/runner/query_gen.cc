@@ -1270,7 +1270,10 @@ class Builder {
     // which divergence D2 keeps out of the generated grammar (query_gen_test checks for it).
     // The derived form writes an alias, so it needs that feature; the WITH form names the block
     // instead and needs none.
-    const bool derived = allowed_.Has(Feature::kDerivedTable) && allowed_.Has(Feature::kTableAlias);
+    // Neither form needs an alias: a WITH list names the block, and an unaliased derived table is
+    // named by rule 1 (`unnamed_subquery`). Requiring kTableAlias here would tie nesting to a join
+    // feature and change which form a seed picks when the join features are off.
+    const bool derived = allowed_.Has(Feature::kDerivedTable);
     const bool cte = allowed_.Has(Feature::kCommonTableExpr);
     if (by_path || (!derived && !cte) || !allowed_.Has(Feature::kColumns) ||
         !block_rng_.Percent(kNestPercent)) {
@@ -1298,11 +1301,13 @@ class Builder {
     b.owned = std::move(projected);
     b.columns = b.owned;
     b.inner = std::move(inner);
-    b.name = Alias(0, {}, {});
-    // A WITH list names the block instead, so the FROM item is that name and takes no alias.
     b.as_cte = cte && (!derived || block_rng_.Percent(40));
-    b.aliased = !b.as_cte;
-    b.as_keyword = b.aliased && block_rng_.Percent(50);
+    // A WITH list names the block; a derived table takes no alias, so rule 1 names it
+    // `unnamed_subquery`. Aliasing it would need kTableAlias, which is a join feature, and would
+    // make a non-join query differ by whether the join features are on.
+    b.name = b.as_cte ? Alias(0, {}, {}) : "unnamed_subquery";
+    b.aliased = false;
+    b.as_keyword = false;
     // The block names every column, so no name is shared and none needs a qualifier, and the
     // table's own skipped columns are out of reach.
     from.other_columns = false;

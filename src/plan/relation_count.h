@@ -40,4 +40,10 @@ std::optional<RelationOverflow> RelationsExceedLimit(const sql::SelectStatement&
 // kMaxRelations + 1, so a result of kMaxRelations + 1 means "at least that many".
 std::size_t CountRelations(const sql::SelectStatement& block);
 
+// Every block `block` reaches, outermost first: itself, each derived table's query, and the body of
+// each CTE that a reached block references -- once per CTE however often it is referenced, and not
+// at all when nothing references it, since DuckDB never binds an unreferenced one. Pure name
+// matching, like the count, so a check over the result runs before anything resolves.
+std::vector<const sql::SelectStatement*> ReachableBlocks(const sql::SelectStatement& block);
+
 }  // namespace antb1::plan

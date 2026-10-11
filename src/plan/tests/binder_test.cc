@@ -753,48 +753,44 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT i16 FROM t WHERE lower(s) = 'x' GROUP BY t.i16", kUnsupported, "lower",
                   "function lower() is not supported"}));
 
-// Derived tables and WITH lists parse (ADR 0022) and are kUnsupported until the binder answers
-// them (J4): a WITH list at its WITH, a derived table at its '(', before any name is resolved, so
-// also over tables that do not exist, at the first one in query order (the WITH list comes first).
+// Derived tables and WITH lists bind as sub-plans (ADR 0022's J4), so what is left here is what a
+// sub-plan does not change: an unsupported construct anywhere in the statement is still reported
+// before any name resolves, because CheckSupported walks every block the statement reaches; a
+// missing table inside a sub-plan is that sub-plan's bind error; and a sub-plan's columns take part
+// in rules 4 and 7 like any other binding's.
 INSTANTIATE_TEST_SUITE_P(
     NestedQueries, BindErrorTest,
     ::testing::Values(
-        ErrorCase{"SELECT i16 FROM (SELECT i16 FROM t)", kUnsupported, "(",
-                  "subqueries in FROM are not supported"},
-        ErrorCase{"SELECT COUNT(*) FROM (SELECT x FROM nope) AS n(y)", kUnsupported, "(",
-                  "subqueries in FROM are not supported"},
-        ErrorCase{"SELECT * FROM (WITH c AS (SELECT a FROM nope) SELECT a FROM c) s", kUnsupported,
-                  "(", "subqueries in FROM are not supported"},
-        ErrorCase{"WITH c AS (SELECT i16 FROM t) SELECT i16 FROM c", kUnsupported, "WITH",
-                  "WITH (common table expressions) is not supported"},
-        ErrorCase{"with c(x) AS (SELECT a FROM nope) SELECT x FROM missing", kUnsupported, "with",
-                  "WITH (common table expressions) is not supported"},
-        ErrorCase{"WITH unused AS (SELECT nope FROM missing) SELECT COUNT(*) FROM t", kUnsupported,
-                  "WITH", "WITH (common table expressions) is not supported"},
-        ErrorCase{"WITH c AS (SELECT i16 FROM t), d AS (SELECT * FROM c) SELECT i16 FROM t",
-                  kUnsupported, "WITH", "WITH (common table expressions) is not supported"},
-        // Query order: the select list, then the derived table's '(' before its alias, the comma
-        // or the join before a later derived table, and the WITH list before all of them.
         ErrorCase{"SELECT lower(s) FROM (SELECT s FROM t)", kUnsupported, "lower",
                   "function lower() is not supported"},
-        ErrorCase{"SELECT x.i16 FROM (SELECT i16 FROM t) x", kUnsupported, "(",
-                  "subqueries in FROM are not supported"},
-        ErrorCase{"SELECT i16 FROM (SELECT i16 FROM t) AS a", kUnsupported, "(",
-                  "subqueries in FROM are not supported"},
-        ErrorCase{"SELECT nope FROM (SELECT i16 FROM t) WHERE lower(s) = 'x'", kUnsupported, "(",
-                  "subqueries in FROM are not supported"},
-        ErrorCase{"SELECT i16 FROM t, (SELECT i16 FROM u)", kUnsupported, "(",
-                  "subqueries in FROM are not supported"},
-        ErrorCase{"SELECT i16 FROM t JOIN (SELECT i16 FROM u) v ON t.i16 = v.i16", kUnsupported,
-                  "(", "subqueries in FROM are not supported"},
+        // Beside a sub-plan, and inside a block a CTE reaches: the walk finds both.
+        ErrorCase{"SELECT nope FROM (SELECT i16 FROM t) WHERE lower(s) = 'x'", kUnsupported,
+                  "lower", "function lower() is not supported"},
         ErrorCase{"WITH c AS (SELECT i16 FROM t) SELECT lower(s) FROM (SELECT s FROM c) AS a",
-                  kUnsupported, "WITH", "WITH (common table expressions) is not supported"},
-        ErrorCase{"SELECT i16 FROM (WITH c AS (SELECT i16 FROM t) SELECT i16 FROM c)", kUnsupported,
-                  "(", "subqueries in FROM are not supported"},
-        // A call with the wrong number of arguments is a bind error only once the FROM list
-        // binds: a derived table is rejected first.
-        ErrorCase{"SELECT strlen(s, 1) FROM (SELECT s FROM t)", kUnsupported, "(",
-                  "subqueries in FROM are not supported"}));
+                  kUnsupported, "lower", "function lower() is not supported"},
+        // A LEFT JOIN inside a sub-plan is still J6's, reported at its own connector.
+        ErrorCase{"SELECT COUNT(*) FROM (SELECT t.i16 FROM t LEFT JOIN u ON t.i16 = u.i16) AS s",
+                  kUnsupported, "LEFT JOIN", "LEFT JOIN is not supported"},
+        // A missing table inside a sub-plan is the sub-plan's bind error, at its own name.
+        ErrorCase{"SELECT COUNT(*) FROM (SELECT x FROM nope) AS n(y)", kBind, "nope",
+                  "table 'nope' does not exist"},
+        ErrorCase{"SELECT * FROM (WITH c AS (SELECT a FROM nope) SELECT a FROM c) s", kBind, "nope",
+                  "table 'nope' does not exist"},
+        // An unreferenced CTE is never bound, as DuckDB never binds one, so the missing table in
+        // its body is not the error -- the outer one is.
+        ErrorCase{"with c(x) AS (SELECT a FROM nope) SELECT x FROM missing", kBind, "missing",
+                  "table 'missing' does not exist"},
+        // Rule 4: a sub-plan's column makes an unqualified name ambiguous like any other binding's.
+        ErrorCase{"SELECT i16 FROM t, (SELECT i16 FROM u)", kBind, "i16",
+                  "column name 'i16' is ambiguous"},
+        ErrorCase{"SELECT i16 FROM t JOIN (SELECT i16 FROM u) v ON t.i16 = v.i16", kBind, "i16",
+                  "column name 'i16' is ambiguous"},
+        // Rule 7: more names than the block has columns is a bind error for a derived table.
+        ErrorCase{"SELECT COUNT(*) FROM (SELECT i16 FROM t) AS g(a, b)", kBind, "(a, b)",
+                  "table \"g\" has 1 columns available but 2 columns specified"},
+        // A call with the wrong number of arguments is a bind error once the FROM list binds.
+        ErrorCase{"SELECT strlen(s, 1) FROM (SELECT s FROM t)", kBind, "strlen(s, 1)",
+                  "strlen() takes 1 argument, not 2"}));
 
 // Rules 1, 2 and 6 of ADR 0022 over one FROM item: an alias names the binding, a qualified name
 // resolves in the binding it names (ASCII case-insensitively, quoted or not), and a result name

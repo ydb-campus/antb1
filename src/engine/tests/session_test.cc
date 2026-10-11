@@ -379,8 +379,7 @@ TEST_F(SessionTest, UnsupportedAndBindErrorsKeepTheirKinds) {
         "SELECT SUM(DISTINCT AdvEngineID) FROM t", "SELECT DISTINCT AdvEngineID FROM t",
         "SELECT COUNT(*) FROM t LEFT JOIN nope ON t.AdvEngineID = nope.x",
         "SELECT COUNT(*) FROM t semi JOIN nope ON t.AdvEngineID = nope.x",
-        "SELECT COUNT(*) FROM (SELECT nope FROM t)",
-        "WITH c AS (SELECT nope FROM nope) SELECT COUNT(*) FROM t"}) {
+        "SELECT COUNT(*) FROM (SELECT lower(AdvEngineID) FROM t)"}) {
     auto result = session->Execute(sql);
     const auto detail = plan::GetSqlError(result.status());
     ASSERT_NE(detail, nullptr) << sql << ": " << result.status().ToString();
@@ -396,6 +395,20 @@ TEST_F(SessionTest, UnsupportedAndBindErrorsKeepTheirKinds) {
     ASSERT_NE(detail, nullptr) << sql << ": " << result.status().ToString();
     EXPECT_EQ(detail->kind(), plan::SqlErrorDetail::Kind::kBind) << sql;
     EXPECT_EQ(result.status().message(), "table 'nope' does not exist") << sql;
+  }
+  // A sub-plan binds from J4 on, so a missing column inside one is that block's bind error.
+  {
+    auto result = session->Execute("SELECT COUNT(*) FROM (SELECT nope FROM t)");
+    const auto detail = plan::GetSqlError(result.status());
+    ASSERT_NE(detail, nullptr) << result.status().ToString();
+    EXPECT_EQ(detail->kind(), plan::SqlErrorDetail::Kind::kBind);
+    EXPECT_EQ(result.status().message(), "column 'nope' does not exist");
+  }
+  // An unreferenced CTE is never bound, as DuckDB never binds one, so a broken body answers.
+  {
+    auto result = session->Execute("WITH c AS (SELECT nope FROM nope) SELECT COUNT(*) FROM t");
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    EXPECT_EQ(Rows(*result), (std::vector<std::vector<std::string>>{{"10"}}));
   }
   // A table alias and a qualified name answer from J2b-2 on, so they are no longer rejected: an
   // explicit alias, an implicit one, and a qualifier of the table's own name.

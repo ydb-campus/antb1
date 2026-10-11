@@ -18,8 +18,8 @@ functions `strlen` and `regexp_replace`, the timestamp functions `toDateTime`, `
 `CASE` in every clause, dates written as casts or literals (`CAST('2013-07-01' AS DATE)`, `'2013-07-01'::DATE`,
 `DATE '2013-07-01'`), `LIMIT` and `OFFSET`, over one table of Parquet files or several joined by inner joins. This
 covers all 43 ClickBench queries (see
-[ClickBench status](#clickbench-status)). Of the 22 queries derived from TPC-H, Q1, Q3, Q5, Q6, Q10, Q12, Q14 and Q19
-pass (see [Queries derived from TPC-H](#queries-derived-from-tpc-h)).
+[ClickBench status](#clickbench-status)). Of the 22 queries derived from TPC-H, Q1, Q3, Q5, Q6, Q7, Q8, Q9, Q10,
+Q12, Q14 and Q19 pass (see [Queries derived from TPC-H](#queries-derived-from-tpc-h)).
 
 ```sql
 SELECT COUNT(*), COUNT(DISTINCT OS), AVG(ResolutionWidth) AS width FROM hits WHERE OS BETWEEN 2 AND 44
@@ -1002,9 +1002,9 @@ completes the query; most queries also need the DECIMAL work of ADR 0021 before 
 | Q4 | unsupported (exit code 4) | correlated EXISTS and NOT EXISTS (ADR 0023) |
 | Q5 | pass | inner joins (ADR 0022) |
 | Q6 | pass | DECIMAL arithmetic, SUM and AVG (ADR 0021) |
-| Q7 | unsupported (exit code 4) | derived tables (ADR 0022) |
-| Q8 | unsupported (exit code 4) | derived tables (ADR 0022) |
-| Q9 | unsupported (exit code 4) | derived tables (ADR 0022) |
+| Q7 | pass | derived tables (ADR 0022) |
+| Q8 | pass | derived tables (ADR 0022) |
+| Q9 | pass | derived tables (ADR 0022) |
 | Q10 | pass | inner joins (ADR 0022) |
 | Q11 | unsupported (exit code 4) | uncorrelated subqueries as joins (ADR 0022) |
 | Q12 | pass | inner joins (ADR 0022) |

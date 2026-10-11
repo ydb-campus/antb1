@@ -429,7 +429,10 @@ TEST(QueryGenerator, DecimalCaseValuesNeverFailToCast) {
   int n_with_k = 0;
   int x_with_b = 0;
   int aggregated = 0;
-  for (uint64_t i = 0; i < 10000; ++i) {
+  // 14000 rather than 10000: a quarter of the single-table queries now read their table through a
+  // nested block (ADR 0022's J4), which has no DECIMAL CASE of its own, so the shapes counted below
+  // are that much rarer per query.
+  for (uint64_t i = 0; i < 14000; ++i) {
     const auto q = gen->Generate(i);
     if (q.features.Has(Feature::kLayout)) {
       continue;  // layout comments could split a match
@@ -673,12 +676,12 @@ bool Nests(const GeneratedQuery& q) {
 // directly is the query that seed gave before ADR 0022's T2. Pins the stream, as
 // JoinFeaturesChangeOnlyJoinQueries pins the second one.
 TEST(QueryGenerator, NestingChangesOnlyNestedQueries) {
-  FeatureSet nesting = kSupportedFeatures;
-  nesting.Add(Feature::kDerivedTable);
-  nesting.Add(Feature::kCommonTableExpr);
+  const FeatureSet nesting = kSupportedFeatures;
   // target_percent 0: every query draws from `supported`, not from the whole grammar.
   const auto with = Make(31, {.supported = nesting, .target_percent = 0});
-  const auto without = Make(31, {.supported = kSupportedFeatures, .target_percent = 0});
+  const auto without =
+      Make(31, {.supported = nesting.Minus({Feature::kDerivedTable, Feature::kCommonTableExpr}),
+                .target_percent = 0});
   int nested = 0;
   int same = 0;
   int derived = 0;
@@ -712,10 +715,7 @@ TEST(QueryGenerator, NestingChangesOnlyNestedQueries) {
 // own names, which is why the outer block can read them and why the property tests above, whose
 // guards are regexes over column names, still see them.
 TEST(QueryGenerator, NestedBlocksProjectColumnsUnderTheirOwnNames) {
-  FeatureSet nesting = kSupportedFeatures;
-  nesting.Add(Feature::kDerivedTable);
-  nesting.Add(Feature::kCommonTableExpr);
-  const auto gen = Make(37, {.supported = nesting, .target_percent = 0});
+  const auto gen = Make(37, {.supported = kSupportedFeatures, .target_percent = 0});
   int checked = 0;
   for (uint64_t i = 0; i < 2000 && checked < 150; ++i) {
     const auto q = gen.Generate(i);

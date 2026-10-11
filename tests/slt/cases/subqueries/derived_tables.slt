@@ -21,7 +21,6 @@ SELECT COUNT(*), MAX(ct_id) FROM cities
 # ---- pending: derived tables and CTEs (ADR 0022; roadmap PR J4 removes these guards) ----
 
 # A column alias list shorter than the select list renames the first columns.
-pending J4
 query II rowsort
 SELECT d, n FROM (SELECT tr_pickup, COUNT(*) AS n FROM trips GROUP BY tr_pickup) AS g(d) WHERE d > 38
 ----
@@ -32,19 +31,16 @@ SELECT d, n FROM (SELECT tr_pickup, COUNT(*) AS n FROM trips GROUP BY tr_pickup)
 43	69
 
 # A derived table without an alias is unnamed_subquery, the next unnamed_subquery2.
-pending J4
 query I nosort unnamed
 SELECT unnamed_subquery.n FROM (SELECT COUNT(*) AS n FROM trips)
 ----
 3000
 
-pending J4
 query I nosort unnamed
 SELECT n FROM (SELECT COUNT(*) AS n FROM trips)
 ----
 3000
 
-pending J4
 query II rowsort
 SELECT unnamed_subquery.z, unnamed_subquery2.c FROM (SELECT zn_id AS z, zn_city AS zc FROM zones), (SELECT ct_id AS c FROM cities)
 WHERE zc = c AND z <= 3
@@ -54,48 +50,41 @@ WHERE zc = c AND z <= 3
 3	3
 
 # Output names are de-duplicated: the second tr_driver is tr_driver_1.
-pending J4
 query III nosort
 SELECT COUNT(*), MIN(tr_driver_1), MAX(tr_driver_1) FROM (SELECT tr_driver, tr_driver + 1 AS tr_driver FROM trips)
 ----
 3000	1001	4886
 
 # ORDER BY with LIMIT inside a derived table picks the rows.
-pending J4
 query IDI nosort
 SELECT COUNT(*), SUM(tr_fare), MIN(tr_row) FROM (SELECT tr_row, tr_fare FROM trips ORDER BY tr_fare DESC NULLS LAST, tr_row LIMIT 10)
 ----
 10	275.00	10
 
 # Aggregates over aggregates, and a filter on the grouped rows.
-pending J4
 query III nosort
 SELECT MAX(n), MIN(n), SUM(n) FROM (SELECT tr_rider, COUNT(*) AS n FROM trips GROUP BY tr_rider)
 ----
 131	3	3000
 
-pending J4
 query I nosort
 SELECT COUNT(*) FROM (SELECT tr_rider, COUNT(*) AS n FROM trips GROUP BY tr_rider) WHERE n >= 13
 ----
 63
 
 # A CTE hides the table of the same name.
-pending J4
 query II nosort
 WITH zones AS (SELECT ct_id AS zn_id FROM cities) SELECT COUNT(*), MAX(zn_id) FROM zones
 ----
 6	6
 
 # An unused CTE is never bound.
-pending J4
 query I nosort
 WITH unused AS (SELECT nope FROM no_such_table) SELECT COUNT(*) FROM trips
 ----
 3000
 
 # A CTE that reads the CTE before it.
-pending J4
 query I nosort
 WITH per_rider AS (SELECT tr_rider AS rider, COUNT(*) AS n FROM trips GROUP BY tr_rider),
   busy AS (SELECT rider FROM per_rider WHERE n >= 13)
@@ -104,7 +93,6 @@ SELECT COUNT(*) FROM busy
 63
 
 # A derived table joined with a table.
-pending J4
 query II rowsort
 SELECT zn_city, SUM(n) FROM (SELECT tr_pickup, COUNT(*) AS n FROM trips GROUP BY tr_pickup) AS p JOIN zones ON p.tr_pickup = zn_id
 GROUP BY zn_city
@@ -118,7 +106,6 @@ GROUP BY zn_city
 NULL	69
 
 # A CTE referenced twice, joined with itself on an expression key.
-pending J4
 query III nosort
 WITH per_zone AS (SELECT tr_pickup AS zone, COUNT(*) AS n FROM trips GROUP BY tr_pickup)
 SELECT COUNT(*), SUM(a.n), SUM(b.n) FROM per_zone AS a, per_zone AS b WHERE a.zone + 1 = b.zone
@@ -134,7 +121,6 @@ SELECT zone, fares FROM per_zone WHERE fares = (SELECT MAX(fares) FROM per_zone)
 33	1093.25
 
 # A column alias list longer than the select list.
-pending J4
 statement error
 SELECT COUNT(*) FROM (SELECT tr_pickup FROM trips) AS g(a, b)
 
