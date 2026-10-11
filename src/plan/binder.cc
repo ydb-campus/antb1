@@ -2605,8 +2605,15 @@ class Binder {
   // Every name resolves through here, so that no clause can forget the visibility it binds in: an
   // ON sees only its own join group and the comma siblings before it (rule 10 of ADR 0022), every
   // other clause every binding. `visible_` holds the ON's while its conjuncts bind.
+  // Rule 9 is applied here rather than in the scope, after the select-list aliases: an inner
+  // block's `GROUP BY <alias>` whose alias happens to name a column of an enclosing block is the
+  // alias, not a correlation, and whether it resolves must not depend on the FROM order.
   [[nodiscard]] arrow::Result<BoundColumn> Resolve(const sql::ColumnRef& ref) const {
-    return scope_.Resolve(ref, visible_);
+    auto resolved = scope_.Resolve(ref, visible_);
+    if (resolved.ok() || (ref.qualifier.empty() && FindAlias(select_, ref.name).has_value())) {
+      return resolved;
+    }
+    return scope_.Correlates(ref) ? Scope::CorrelationError(ref) : std::move(resolved);
   }
 
   LogicalPlan Assemble();
@@ -4543,8 +4550,8 @@ arrow::Status ApplyColumnNames(std::vector<BindingColumn>& columns,
 // lateral reference is found and exits 4 (rule 9) instead of reporting a missing column.
 arrow::Result<Binding> BindFromItem(const sql::FromItem& item, const Catalog& catalog,
                                     ColumnIdSource& ids, const CteFrame& ctes,
-                                    const Scope& siblings, std::size_t& unnamed,
-                                    std::vector<LogicalPlan>& sub_plans) {
+                                    const std::vector<Binding>& siblings, const Scope* outer,
+                                    std::size_t& unnamed, std::vector<LogicalPlan>& sub_plans) {
   std::string name = BindingName(item, unnamed);
   const sql::TableRef* ref = item.table();
   const sql::CommonTableExpr* cte = ref == nullptr ? nullptr : ctes.Find(ref->name);
@@ -4562,7 +4569,10 @@ arrow::Result<Binding> BindFromItem(const sql::FromItem& item, const Catalog& ca
   const sql::SelectStatement& block =
       cte == nullptr ? *std::get<sql::DerivedTable>(item.source).query : *cte->query;
   const CteFrame* frame = cte == nullptr ? &ctes : ctes.ScopeFrameOf(cte);
-  const Scope* scope = cte == nullptr ? &siblings : ctes.ScopeOf(cte);
+  // Only a sub-plan needs the scope of the bindings before it, so it is built here rather than
+  // once per FROM item: a copy of every preceding binding is not free at the relation limit.
+  const Scope preceding(siblings, outer);
+  const Scope* scope = cte == nullptr ? &preceding : ctes.ScopeOf(cte);
   ARROW_ASSIGN_OR_RAISE(BoundBlock bound, BindBlock(block, catalog, ids, frame, scope));
   std::vector<BindingColumn> columns = std::move(bound.columns);
   // A column alias list after a CTE name is rejected by the parser (rule 7), so a CTE's list is
@@ -4587,11 +4597,20 @@ arrow::Result<BoundBlock> BindBlock(const sql::SelectStatement& stmt, const Cata
     visible.push_back(&cte);
   }
   frames.push_back(CteFrame{.visible = visible, .outer = ctes, .scope = outer});
-  CteFrame& own = frames.back();
-  own.declared.reserve(stmt.with.size());
+  // Which frame each CTE of this list binds its body in, on every frame of this block and not only
+  // on its own: a CTE body's chain starts at that CTE's frame, whose outer is the enclosing
+  // block's, so the block's own frame is not on it. Without the map there, a CTE referenced from
+  // inside another CTE's body would bind with no CTE frame at all and read a catalog table of its
+  // name.
+  std::unordered_map<const sql::CommonTableExpr*, const CteFrame*> declared;
+  declared.reserve(stmt.with.size());
   for (std::size_t i = 0; i < stmt.with.size(); ++i) {
-    own.declared.emplace(&stmt.with[i], &frames[i]);
+    declared.emplace(&stmt.with[i], &frames[i]);
   }
+  for (CteFrame& frame : frames) {
+    frame.declared = declared;
+  }
+  const CteFrame& own = frames.back();
 
   // One binding per FROM item, in FROM order and from one id source, so that a relation's index is
   // its binding's and its FROM item's: the invariant OnVisibility, OrderJoins and Scope::Find
@@ -4601,9 +4620,8 @@ arrow::Result<BoundBlock> BindBlock(const sql::SelectStatement& stmt, const Cata
   sub_plans.reserve(stmt.from.size());
   std::size_t unnamed = 0;
   for (const sql::FromItem& item : stmt.from) {
-    const Scope siblings(bindings, outer);
-    ARROW_ASSIGN_OR_RAISE(Binding binding,
-                          BindFromItem(item, catalog, ids, own, siblings, unnamed, sub_plans));
+    ARROW_ASSIGN_OR_RAISE(Binding binding, BindFromItem(item, catalog, ids, own, bindings, outer,
+                                                        unnamed, sub_plans));
     bindings.push_back(std::move(binding));
   }
   Binder binder(stmt, std::move(bindings), ids, outer);

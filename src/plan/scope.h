@@ -182,6 +182,17 @@ class Scope {
   // searched.
   [[nodiscard]] Lookup LookUp(const sql::ColumnRef& ref, Visibility visible = {}) const;
 
+  // Whether an enclosing scope has `ref`, which makes a name this block lacks a correlation rather
+  // than a missing column (ADR 0022 rule 9). Asked only once this block's own resolution has
+  // failed, its select-list aliases included: an alias of this block that happens to name a column
+  // of an enclosing one is this block's alias, not a correlation, so whether it resolves must not
+  // depend on the FROM order of the enclosing block.
+  [[nodiscard]] bool Correlates(const sql::ColumnRef& ref) const;
+
+  // Rule 9's error: a correlation exits 4 until ADR 0023's PRs answer it, and never reports
+  // "does not exist".
+  static arrow::Status CorrelationError(const sql::ColumnRef& ref);
+
   // The column `ref` refers to (LookUp), by its id (plan::ResolvePositions sets its position at the
   // end), as Reference gives it. A bind error at the name when it is ambiguous (rules 3 and 4: the
   // error names the qualified candidates) or found nowhere; the message then says when a later

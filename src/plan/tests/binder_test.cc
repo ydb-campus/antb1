@@ -768,8 +768,14 @@ INSTANTIATE_TEST_SUITE_P(
                   "lower", "function lower() is not supported"},
         ErrorCase{"WITH c AS (SELECT i16 FROM t) SELECT lower(s) FROM (SELECT s FROM c) AS a",
                   kUnsupported, "lower", "function lower() is not supported"},
-        // A LEFT JOIN inside a sub-plan is still J6's, reported at its own connector.
+        // A LEFT JOIN inside a sub-plan is still J6's, reported at its own connector -- inside a
+        // derived table, and inside the body of a CTE something references, which is what makes
+        // CheckSupported's walk of the reachable blocks load-bearing and not only cosmetic: an
+        // unrejected LEFT JOIN would bind as an inner join and lose its keys.
         ErrorCase{"SELECT COUNT(*) FROM (SELECT t.i16 FROM t LEFT JOIN u ON t.i16 = u.i16) AS s",
+                  kUnsupported, "LEFT JOIN", "LEFT JOIN is not supported"},
+        ErrorCase{"WITH c AS (SELECT t.i16 AS k FROM t LEFT JOIN u ON t.i16 = u.i16) "
+                  "SELECT COUNT(*) FROM c",
                   kUnsupported, "LEFT JOIN", "LEFT JOIN is not supported"},
         // A missing table inside a sub-plan is the sub-plan's bind error, at its own name.
         ErrorCase{"SELECT COUNT(*) FROM (SELECT x FROM nope) AS n(y)", kBind, "nope",

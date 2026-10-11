@@ -762,10 +762,13 @@ TEST(BindingDeathTest, OfPlanChecksItsRootAndColumns) {
   EXPECT_DEATH((void)Binding::OfPlan("x", root, {}), "OutputIds");
 }
 
-// A name the block lacks that an enclosing one has is a correlation, so it exits 4 and never
-// reports "does not exist" (ADR 0022 rule 9, which ADR 0023 answers). Every enclosing scope is
-// tried, not only the nearest: DuckDB answers a reference several blocks out.
-TEST(ScopeTest, AnEnclosingBlocksColumnIsUnsupportedAndNotAMissingColumn) {
+// A name the block lacks that an enclosing one has is a correlation (ADR 0022 rule 9), which the
+// binder reports as kUnsupported and never as "does not exist". The scope answers the question and
+// supplies the error, but does not pre-empt resolution with it: the binder asks only once its own
+// select-list aliases have failed, so an inner alias that happens to name an enclosing column stays
+// the alias. Every enclosing scope is tried, not only the nearest -- DuckDB answers a reference
+// several blocks out -- and an unqualified name counts, which a qualifier check would miss.
+TEST(ScopeTest, AnEnclosingBlocksColumnCorrelatesAndIsNoMissingColumn) {
   ColumnIdSource ids;
   const Scope outer({TableBinding("o", arrow::schema({arrow::field("k", arrow::int32())}), ids)});
   const Scope middle({TableBinding("m", arrow::schema({arrow::field("mid", arrow::int32())}), ids)},
@@ -773,21 +776,25 @@ TEST(ScopeTest, AnEnclosingBlocksColumnIsUnsupportedAndNotAMissingColumn) {
   const Scope inner({TableBinding("i", arrow::schema({arrow::field("own", arrow::int32())}), ids)},
                     &middle);
   constexpr SourceSpan kSpan{.offset = 3, .length = 1};
+  // Resolve still reports the plain bind error, so the binder's alias fallbacks keep working.
+  ExpectSqlError(inner.Resolve(Ref("mid", kSpan)).status(), kBind, "column 'mid' does not exist",
+                 kSpan);
   // One level out, unqualified: a qualifier-only check would miss this one.
-  ExpectSqlError(inner.Resolve(Ref("mid", kSpan)).status(), kUnsupported,
-                 "a column of an enclosing query block is not supported", kSpan);
+  EXPECT_TRUE(inner.Correlates(Ref("mid")));
   // Two levels out: the whole chain is walked.
-  ExpectSqlError(inner.Resolve(Ref("k", kSpan)).status(), kUnsupported,
-                 "a column of an enclosing query block is not supported", kSpan);
-  // Qualified, and the message says so.
+  EXPECT_TRUE(inner.Correlates(Ref("k")));
+  // Qualified, and the error says so.
   sql::ColumnRef qualified = Ref("k", kSpan);
   qualified.qualifier = "o";
-  ExpectSqlError(inner.Resolve(qualified).status(), kUnsupported,
+  EXPECT_TRUE(inner.Correlates(qualified));
+  ExpectSqlError(Scope::CorrelationError(qualified), kUnsupported,
                  "a qualified column of an enclosing query block is not supported", kSpan);
-  // A name no scope has stays the ordinary bind error.
-  ExpectSqlError(inner.Resolve(Ref("nope", kSpan)).status(), kBind, "column 'nope' does not exist",
-                 kSpan);
-  // The block's own column still resolves, and an enclosing one of the same name never shadows it.
+  ExpectSqlError(Scope::CorrelationError(Ref("mid", kSpan)), kUnsupported,
+                 "a column of an enclosing query block is not supported", kSpan);
+  // A name no scope has correlates with nothing, and the block's own column is never a correlation.
+  EXPECT_FALSE(inner.Correlates(Ref("nope")));
+  EXPECT_FALSE(inner.Correlates(Ref("own")));
+  EXPECT_FALSE(outer.Correlates(Ref("k"))) << "the outermost scope encloses nothing";
   const auto own = inner.Resolve(Ref("own"));
   ASSERT_TRUE(own.ok()) << own.status().ToString();
 }

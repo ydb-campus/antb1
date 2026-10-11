@@ -302,20 +302,25 @@ arrow::Result<BoundColumn> Scope::Resolve(const sql::ColumnRef& ref, Visibility 
     case Lookup::Outcome::kMissing:
       break;
   }
-  // A name this scope lacks that an enclosing one has is a correlation, not a missing column
-  // (ADR 0022 rule 9): until ADR 0023's PRs it exits 4, and never reports "does not exist". Every
-  // enclosing scope is tried, not just the nearest -- DuckDB answers a reference several blocks
-  // out -- and an unqualified name counts, which a check over qualifiers alone would miss.
-  for (const Scope* outer = outer_; outer != nullptr; outer = outer->outer_) {
-    const Lookup found = outer->LookUp(ref);
-    if (found.outcome != Lookup::Outcome::kMissing) {
-      return UnsupportedError(std::format("a {} of an enclosing query block is not supported",
-                                          ref.qualifier.empty() ? "column" : "qualified column"),
-                              ref.span);
-    }
-  }
   return BindError(MissingMessage(bindings_, ref, std::min(visible.end, bindings_.size())),
                    ref.span);
+}
+
+bool Scope::Correlates(const sql::ColumnRef& ref) const {
+  // Every enclosing scope, not just the nearest: DuckDB answers a reference several blocks out.
+  // An unqualified name counts too, which a check over qualifiers alone would miss.
+  for (const Scope* outer = outer_; outer != nullptr; outer = outer->outer_) {
+    if (outer->LookUp(ref).outcome != Lookup::Outcome::kMissing) {
+      return true;
+    }
+  }
+  return false;
+}
+
+arrow::Status Scope::CorrelationError(const sql::ColumnRef& ref) {
+  return UnsupportedError(std::format("a {} of an enclosing query block is not supported",
+                                      ref.qualifier.empty() ? "column" : "qualified column"),
+                          ref.span);
 }
 
 arrow::Result<BoundColumn> Scope::Reference(ColumnLocation where, SourceSpan span) const {
