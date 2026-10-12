@@ -107,6 +107,14 @@ bool Joins(const GeneratedQuery& q) {
          q.features.Has(Feature::kLeftJoin);
 }
 
+// Whether a query used the tables' refs at all: it joins along one, or compares against an
+// uncorrelated subquery, whose candidates the refs also provide. Not the same as Joins(): a
+// subquery needs no second FROM item, so CheckJoin (which requires two) must not see one.
+bool UsesRefs(const GeneratedQuery& q) {
+  return Joins(q) || q.features.Has(Feature::kInSubquery) ||
+         q.features.Has(Feature::kScalarSubquery);
+}
+
 QueryGenerator MakeOver(std::vector<GenTable> tables, uint64_t seed, GeneratorOptions options) {
   auto gen = QueryGenerator::Make(std::move(tables), seed, options);
   EXPECT_TRUE(gen.has_value()) << gen.error();
@@ -655,8 +663,8 @@ TEST(QueryGenerator, JoinFeaturesChangeOnlyJoinQueries) {
   for (uint64_t i = 0; i < 2000; ++i) {
     const auto q = with_refs.Generate(i);
     const auto plain = without.Generate(i);
-    EXPECT_FALSE(Joins(plain)) << plain.sql;
-    if (Joins(q)) {
+    EXPECT_FALSE(UsesRefs(plain)) << plain.sql;
+    if (UsesRefs(q)) {
       ++joins;
       continue;
     }
@@ -841,6 +849,12 @@ void ForEachNode(const sql::Expr& e, const F& f) {
         if constexpr (std::is_same_v<Node, sql::AggregateCall>) {
           if (node.arg.has_value()) {
             ForEachNode(**node.arg, f);
+          }
+        } else if constexpr (std::is_same_v<Node, sql::SubqueryExpr>) {
+          // Its operand belongs to this block; the refs inside node.query resolve in the block's
+          // own scope, so a walk that enters it would look them up against the wrong FROM list.
+          if (node.operand.has_value()) {
+            ForEachNode(**node.operand, f);
           }
         } else if constexpr (std::is_same_v<Node, sql::UnaryExpr> ||
                              std::is_same_v<Node, sql::CastExpr>) {
@@ -1263,8 +1277,12 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
             std::ranges::any_of(items, [](const Item& i) { return i.aliased; }));
   EXPECT_EQ(q.features.Has(Feature::kQualifiedName), qualified);
   EXPECT_EQ(q.features.Has(Feature::kTablePath), any_path);
+  // A subquery's block always names its one table, so it records kTableName even where every FROM
+  // item is read by a path.
+  const bool subquery =
+      q.features.Has(Feature::kInSubquery) || q.features.Has(Feature::kScalarSubquery);
   EXPECT_EQ(q.features.Has(Feature::kTableName),
-            std::ranges::any_of(items, [](const Item& i) { return !i.path; }));
+            subquery || std::ranges::any_of(items, [](const Item& i) { return !i.path; }));
   EXPECT_EQ(q.features.Has(Feature::kLeftJoin), left);
   EXPECT_TRUE(!condition || q.features.Has(Feature::kWhere)) << "a condition beyond the keys";
   EXPECT_TRUE(std::ranges::any_of(items, [&](const Item& i) { return i.table->name == q.table; }));
