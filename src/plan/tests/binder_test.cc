@@ -829,19 +829,14 @@ INSTANTIATE_TEST_SUITE_P(
                   "WHERE g.i16 = u.i16",
                   kBind, "unnamed_subquery2.s", "no FROM item is named 'unnamed_subquery2'"}));
 
-// Subqueries in expressions (ADR 0022): the grammar parses all three forms from roadmap PR S4b on,
-// and the binder refuses each at its own operator before any name resolves -- so a statement with
-// both a subquery and a bad name reports the subquery, as it did when the parser refused it.
-// Roadmap PR J5 answers IN, NOT IN and a scalar subquery; ADR 0023's U-series answers EXISTS.
+// Subqueries in expressions (ADR 0022): the grammar parses all three forms from roadmap PR S4b on.
+// Roadmap PR J5a answers IN and NOT IN as a top-level conjunct of WHERE, of an inner join's ON or
+// of HAVING, so what is left here is the scalar form (J5b), EXISTS (ADR 0023's U-series), and what
+// an answered IN still refuses: a key no type holds, a column count other than one, and a
+// correlation.
 INSTANTIATE_TEST_SUITE_P(
     Subqueries, BindErrorTest,
     ::testing::Values(
-        ErrorCase{"SELECT i16 FROM t WHERE i32 IN (SELECT i16 FROM u)", kUnsupported, "IN",
-                  "IN (subquery) is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE i32 NOT IN (SELECT i16 FROM u)", kUnsupported, "NOT IN",
-                  "IN (subquery) is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE NOT (i32 IN (SELECT i16 FROM u))", kUnsupported, "IN",
-                  "IN (subquery) is not supported"},
         ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u)", kUnsupported, "(",
                   "a scalar subquery is not supported"},
         ErrorCase{"SELECT (SELECT COUNT(*) FROM u) FROM t", kUnsupported, "(",
@@ -855,13 +850,30 @@ INSTANTIATE_TEST_SUITE_P(
         // Inside a sub-plan, which CheckSupported's walk of the reachable blocks reaches.
         ErrorCase{"SELECT COUNT(*) FROM (SELECT i16 FROM t WHERE EXISTS (SELECT i16 FROM u)) AS s",
                   kUnsupported, "EXISTS", "EXISTS (subqueries) is not supported"},
-        // The subquery is the error, not the name that does not exist: the refusal is a static walk
-        // that runs before any name resolves.
-        ErrorCase{"SELECT nope FROM t WHERE i32 IN (SELECT i16 FROM u)", kUnsupported, "IN",
-                  "IN (subquery) is not supported"},
-        // A subquery over a table that does not exist is still the subquery's error.
-        ErrorCase{"SELECT i16 FROM t WHERE i32 IN (SELECT x FROM missing)", kUnsupported, "IN",
-                  "IN (subquery) is not supported"}));
+        // A DOUBLE has no join key, by decision (ADR 0022), and a DECIMAL(38,0) with a
+        // DECIMAL(38,10) would need 48 digits: a semi join needs one type for its key, so neither
+        // exits past 4.
+        ErrorCase{"SELECT i16 FROM t WHERE d IN (SELECT d FROM u)", kUnsupported, "IN",
+                  "IN (subquery) over a DOUBLE is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE h IN (SELECT z FROM dec)", kUnsupported, "IN",
+                  "IN (subquery) of DECIMAL(38,0) and DECIMAL(38,10) is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE s IN (SELECT dt FROM u)", kUnsupported, "IN",
+                  "IN (subquery) of VARCHAR and DATE is not supported"},
+        // One column, as in DuckDB, which reports a bind error for two.
+        ErrorCase{"SELECT i16 FROM t WHERE i32 IN (SELECT i16, i32 FROM u)", kBind, "IN",
+                  "a subquery of IN must have one column, not 2"},
+        // A correlation exits 4 (rule 9) until ADR 0023's PRs answer it, and never reports a
+        // missing column: the sub-block binds against the scope of the block that holds it.
+        ErrorCase{"SELECT i16 FROM t WHERE i32 IN (SELECT i16 FROM u WHERE i64 = t.i64)",
+                  kUnsupported, "t.i64", "a qualified column of an enclosing query block is not"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 IN (SELECT i16 FROM ok WHERE i16 = i64)",
+                  kUnsupported, "i64", "a column of an enclosing query block is not supported"},
+        // An answered subquery no longer masks a name: the static walk accepts the form, so the
+        // first error of the statement is the one a resolution finds, as in DuckDB.
+        ErrorCase{"SELECT nope FROM t WHERE i32 IN (SELECT i16 FROM u)", kBind, "nope",
+                  "column 'nope' does not exist"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 IN (SELECT x FROM missing)", kBind, "missing",
+                  "table 'missing' does not exist"}));
 
 // Where a subquery is refused, placement by placement. Roadmap PR J5 answers the three IN
 // spellings and a scalar subquery as a top-level conjunct of WHERE or HAVING, and nothing else:
@@ -913,7 +925,7 @@ INSTANTIATE_TEST_SUITE_P(
         // An IN list holding one scalar subquery, which is what the grammar reads from a second
         // pair of parentheses (divergence D21); DuckDB reads an IN subquery.
         ErrorCase{"SELECT i16 FROM t WHERE i32 IN ((SELECT i16 FROM u))", kUnsupported, "(",
-                  "a scalar subquery is not supported"}));
+                  "an IN list of one subquery is not supported"}));
 
 // The relation limit comes before every other check (ADR 0022), and it counts a subquery's query
 // too: the doubling chain of CTEs referenced only from a subquery in WHERE would otherwise expand

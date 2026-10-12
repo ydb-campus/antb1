@@ -292,6 +292,43 @@ antb1_add_cli_golden(
     --table
     "trips=${_f}/star/trips.parquet"
 )
+# An IN subquery as a semi join above the block's inner joins (ADR 0022's J5): the sub-plan is the
+# build side, since the join does not keep its rows, and the probe's cast to the key type is a
+# Compute of its own directly below the join -- below the select list's, so a select-list expression
+# that can overflow is computed only for the rows the join keeps (divergence D16). Two conjuncts
+# stack in the order they are written, the second a null-aware anti join.
+antb1_add_cli_golden(
+  explain_in_subquery_semi_join
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id WHERE tr_driver IN (SELECT dv_id FROM drivers) AND tr_rider NOT IN (SELECT rd_id FROM riders)"
+    --table
+    "trips=${_f}/star/trips.parquet"
+    --table
+    "zones=${_f}/star/zones.parquet"
+    --table
+    "drivers=${_f}/star/drivers.parquet"
+    --table
+    "riders=${_f}/star/riders.parquet"
+)
+# The same form in HAVING: its join sits above the aggregation and above the columns HAVING
+# computes, over the groups rather than over the rows.
+antb1_add_cli_golden(
+  explain_in_subquery_having
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT tr_pickup, COUNT(*) FROM trips GROUP BY tr_pickup HAVING tr_pickup NOT IN (SELECT zn_id FROM zones)"
+    --table
+    "trips=${_f}/star/trips.parquet"
+    --table
+    "zones=${_f}/star/zones.parquet"
+)
 
 # ---- bench: ClickBench-format JSON (docs/benchmarks.md); timings vary, so regexes ----
 # CMake regex: [.] [{] [}] [[] []] match the character itself; \n is a newline. Built with string(APPEND):
