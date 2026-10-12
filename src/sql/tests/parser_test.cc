@@ -595,8 +595,10 @@ TEST(ParserTest, SubqueriesInExpressions) {
   const auto& in = std::get<SubqueryExpr>(stmt->where[0]);
   EXPECT_EQ(in.kind, SubqueryExpr::Kind::kIn);
   EXPECT_FALSE(in.negated);
-  ASSERT_TRUE(in.operand.has_value());
-  EXPECT_EQ(std::get<ColumnRef>(**in.operand).name, "a");
+  // Through a pointer: clang-tidy's optional analysis does not read ASSERT_TRUE as a guard.
+  const Expr* in_operand = in.operand.has_value() ? &**in.operand : nullptr;
+  ASSERT_NE(in_operand, nullptr);
+  EXPECT_EQ(std::get<ColumnRef>(*in_operand).name, "a");
   EXPECT_EQ(At(kSql, in.span), "a IN (SELECT b FROM v)");
   EXPECT_EQ(At(kSql, in.op_span), "IN");
 
