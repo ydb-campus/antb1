@@ -209,8 +209,10 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   `WITH` lists, each a sub-plan of its own. A `LEFT JOIN` is one fixed unit: it is never reordered, its `ON` reads
   its own two inputs only, an `ON` conjunct over the right input alone filters that input, and every other one is a
   residual of the join — including one that reads only the preserved side, since a left row that fails it is padded
-  and not dropped. A `WHERE` conjunct over the null-supplying side stays above the join. A `LEFT JOIN` with no
-  equality key between its two inputs is exit code 4, as a cross product is. More than 256 relations, counting a
+  and not dropped. A `WHERE` conjunct over the null-supplying side stays above the join. An equality is a key only
+  when each of its sides reads one relation of one input, since a side that is an expression is computed on that
+  relation's own branch; a side over two of them is a residual, as in an inner `ON`. A `LEFT JOIN` with no equality
+  key between its two inputs is exit code 4, as a cross product is. More than 256 relations, counting a
   derived table and a CTE reference as one plus the relations of their body, is exit code 4 too, before the
   per-item checks;
 - date casts: `CAST('YYYY-MM-DD' AS DATE)` and `'YYYY-MM-DD'::DATE` are the literal `DATE 'YYYY-MM-DD'`

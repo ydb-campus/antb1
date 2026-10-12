@@ -3813,11 +3813,12 @@ arrow::Status Binder::BindUnitConjunct(std::size_t u, const sql::Expr& conjunct,
     }
   }
   if (reads_right && !reads_left) {
-    // Rule 11: it filters the right input alone, below the padding, which keeps the same rows.
+    // Rule 11: it filters the right input alone, below the padding, which keeps the same rows. It
+    // is classified inside that input, which is an inner block of its own, so a right input of
+    // several relations routes it to the right one of them.
     const std::size_t outer = block_;
     block_ = right;
-    const arrow::Status status =
-        BindOnOneRelation(conjunct, element, blocks_[right].relations.front());
+    const arrow::Status status = BindConjunct(conjunct, element);
     block_ = outer;
     return status;
   }
@@ -3829,36 +3830,50 @@ arrow::Status Binder::BindUnitConjunct(std::size_t u, const sql::Expr& conjunct,
   const auto* predicate = std::get_if<PredicateExpr>(&bound.expr->node);
   if (predicate != nullptr && predicate->predicate.kind == Predicate::Kind::kCompareColumns &&
       predicate->predicate.op == CompareOp::kEq && predicate->operands.size() == 2) {
-    // Each side must read exactly one of the inputs, and the two sides different ones.
-    const auto side = [&](std::size_t i) -> std::optional<std::size_t> {
+    // Each side must read exactly one relation of one input, and the two sides different inputs.
+    // One relation, not one input: a side is computed on that relation's own branch, below the
+    // unit's join, which only has the columns of that relation. A side over two relations of one
+    // input is no key, exactly as in an inner join's ON, and the conjunct becomes a residual.
+    struct Side {
+      std::size_t block = 0;     // the input it reads
+      std::size_t relation = 0;  // into relations_: the branch its expression is computed on
+    };
+    const auto side = [&](std::size_t i) -> std::optional<Side> {
       const std::vector<std::size_t> read = RelationsOf(*predicate->operands[i]);
-      const bool in_left =
-          std::ranges::all_of(read, [&](std::size_t b) { return BlockHolds(left, b); });
-      const bool in_right =
-          std::ranges::all_of(read, [&](std::size_t b) { return BlockHolds(right, b); });
-      if (read.empty() || (!in_left && !in_right)) {
+      if (read.empty()) {
         return std::nullopt;
       }
-      return in_left ? left : right;
+      for (const std::size_t block : {left, right}) {
+        if (!std::ranges::all_of(read, [&](std::size_t b) { return BlockHolds(block, b); })) {
+          continue;
+        }
+        const std::vector<std::size_t> locals = LocalsOf(block, read);
+        if (locals.size() != 1) {
+          return std::nullopt;
+        }
+        return Side{.block = block, .relation = blocks_[block].relations[locals.front()]};
+      }
+      return std::nullopt;
     };
-    const std::optional<std::size_t> a = side(0);
-    const std::optional<std::size_t> b = side(1);
+    const std::optional<Side> a = side(0);
+    const std::optional<Side> b = side(1);
     const std::optional<LogicalType> type =
-        a.has_value() && b.has_value() && *a != *b
+        a.has_value() && b.has_value() && a->block != b->block
             ? KeyType(predicate->operands[0]->type, predicate->operands[1]->type)
             : std::nullopt;
     if (type.has_value() && IsExactWidening(predicate->operands[0]->type, *type) &&
         IsExactWidening(predicate->operands[1]->type, *type)) {
-      // The cast of a side goes on the relation of its own input that holds it, which is below the
-      // unit's join and so below the padding: the same value either way.
-      const auto column = [&](std::size_t i, std::size_t block) {
-        const std::size_t binding = RelationsOf(*predicate->operands[i]).front();
-        const std::size_t relation = blocks_[block].relations[*LocalOf(block, binding)];
-        return JoinKeyColumn(relation, predicate->operands[i], *type);
-      };
-      const bool first_left = *a == left;
-      units_[u].keys.push_back(JoinKey{.left = column(first_left ? 0 : 1, left),
-                                       .right = column(first_left ? 1 : 0, right)});
+      // The cast of a side goes on its own relation's branch, below the unit's join and so below
+      // the padding: the same value either way. The preserved side's column is minted first, as
+      // for an inner join's key.
+      const bool first_left = a->block == left;
+      const Side& on_left = first_left ? *a : *b;
+      const Side& on_right = first_left ? *b : *a;
+      BoundColumn key_left =
+          JoinKeyColumn(on_left.relation, predicate->operands[first_left ? 0 : 1], *type);
+      BoundColumn key_right =
+          JoinKeyColumn(on_right.relation, predicate->operands[first_left ? 1 : 0], *type);
+      units_[u].keys.push_back(JoinKey{.left = std::move(key_left), .right = std::move(key_right)});
       units_[u].divisor =
           std::max({units_[u].divisor, KeyDomainOf(*predicate->operands[0]).value_or(0),
                     KeyDomainOf(*predicate->operands[1]).value_or(0)});

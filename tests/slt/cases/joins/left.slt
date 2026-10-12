@@ -176,6 +176,16 @@ SELECT COUNT(*), SUM(n) FROM (SELECT tr_pickup AS p, COUNT(zn_id) AS n FROM trip
 ----
 43	2793
 
+# ---- DuckDB only: a LEFT JOIN left without a key, which exits 4 on antb1 (ADR 0022) ----
+
+# A key side that reads two relations of one input is no key, exactly as in an inner join's ON: it would have to be
+# computed on a branch that holds only one of them. Nothing else keys this join, so antb1 exits 4.
+onlyif duckdb
+query I nosort
+SELECT COUNT(*) FROM drivers CROSS JOIN trips LEFT JOIN zones ON dv_id + tr_pickup = zn_id WHERE tr_driver = dv_id
+----
+2577
+
 # ---- DuckDB only until DOUBLE join keys get a PR (ADR 0022: a LEFT JOIN without another key exits 4) ----
 
 onlyif duckdb

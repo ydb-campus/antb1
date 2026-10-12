@@ -710,6 +710,12 @@ INSTANTIATE_TEST_SUITE_P(
                   "a LEFT JOIN without a join key between its two inputs is not supported"},
         ErrorCase{"SELECT t.i16 FROM t LEFT JOIN u ON t.d = u.d", kUnsupported, "LEFT JOIN",
                   "a LEFT JOIN without a join key between its two inputs is not supported"},
+        // A key side that reads two relations of one input is no key: it would have to be
+        // computed on a branch that holds only one of them, and nothing is left to key the join.
+        ErrorCase{"SELECT t.i16 FROM t CROSS JOIN u LEFT JOIN ok ON t.i16 + u.i16 = ok.i16 "
+                  "WHERE t.i32 = u.i32",
+                  kUnsupported, "LEFT JOIN",
+                  "a LEFT JOIN without a join key between its two inputs is not supported"},
         // A LEFT JOIN's ON sees its own two inputs only (rule 10). An earlier comma sibling is
         // visible, as an inner ON's outer level, but is no input of this join: DuckDB refuses such
         // an ON too ("Non-inner join on correlated columns not supported").
