@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791809700936,
+  "lastUpdate": 1791810693617,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -6696,6 +6696,114 @@ window.BENCHMARK_DATA = {
             "value": 61.15376281818189,
             "unit": "ms/iter",
             "extra": "iterations: 11\ncpu: 61.150156272727195 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "334225516+antb1-bot[bot]@users.noreply.github.com",
+            "name": "antb1-bot[bot]",
+            "username": "antb1-bot[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "a83bb48696e5c516fdb50acc7894340cf1501c36",
+          "message": "build(deps): update pixi.lock (#124)\n\n# Dependencies\n\n<details open>\n<summary>Explicit dependencies</summary>\n\n|Dependency|Before|After|Change|Environments|\n|-|-|-|-|-|\n\n|[clang](https://prefix.dev/channels/conda-forge/packages/clang)|23.1.2|23.1.3|Patch\nUpgrade|default on *all platforms*|\n\n|[clang-format](https://prefix.dev/channels/conda-forge/packages/clang-format)|23.1.2|23.1.3|Patch\nUpgrade|lint on *all platforms*|\n\n|[clang-tools](https://prefix.dev/channels/conda-forge/packages/clang-tools)|23.1.2|23.1.3|Patch\nUpgrade|default on *all platforms*|\n\n|[clangxx](https://prefix.dev/channels/conda-forge/packages/clangxx)|23.1.2|23.1.3|Patch\nUpgrade|default on *all platforms*|\n\n|[compiler-rt](https://prefix.dev/channels/conda-forge/packages/compiler-rt)|23.1.2|23.1.3|Patch\nUpgrade|default on *all platforms*|\n\n|[llvm-tools](https://prefix.dev/channels/conda-forge/packages/llvm-tools)|23.1.2|23.1.3|Patch\nUpgrade|default on *all platforms*|\n\n|[python](https://prefix.dev/channels/conda-forge/packages/python)|3.14.7|3.14.8|Patch\nUpgrade|{default, lint} on *all platforms*|\n\n|[binutils](https://prefix.dev/channels/conda-forge/packages/binutils)|default_h4852527_102|default_h4852527_103|Only\nbuild string|gcc on linux-64|\n\n</details>\n\n<details>\n<summary>Implicit dependencies</summary>\n\n|Dependency|Before|After|Change|Environments|\n|-|-|-|-|-|\n\n|[filelock](https://prefix.dev/channels/conda-forge/packages/filelock)|4.0.11|4.1.1|Minor\nUpgrade|lint on *all platforms*|\n\n|[libsqlite](https://prefix.dev/channels/conda-forge/packages/libsqlite)|3.53.4|3.54.0|Minor\nUpgrade|{default, lint} on *all platforms*|\n\n|[platformdirs](https://prefix.dev/channels/conda-forge/packages/platformdirs)|4.12.3|4.13.0|Minor\nUpgrade|lint on *all platforms*|\n\n|[pycparser](https://prefix.dev/channels/conda-forge/packages/pycparser)|3.0|3.11|Minor\nUpgrade|lint on *all platforms*|\n\n|[tomli](https://prefix.dev/channels/conda-forge/packages/tomli)|2.4.1|2.5.0|Minor\nUpgrade|lint on *all platforms*|\n\n|[clang-23](https://prefix.dev/channels/conda-forge/packages/clang-23)|23.1.2|23.1.3|Patch\nUpgrade|default on *all platforms*|\n\n|[clang-format](https://prefix.dev/channels/conda-forge/packages/clang-format)|23.1.2|23.1.3|Patch\nUpgrade|default on *all platforms*|\n\n|[clang-format-23](https://prefix.dev/channels/conda-forge/packages/clang-format-23)|23.1.2|23.1.3|Patch\nUpgrade|{default, lint} on *all platforms*|\n\n|[clang-scan-deps](https://prefix.dev/channels/conda-forge/packages/clang-scan-deps)|23.1.2|23.1.3|Patch\nUpgrade|default on *all platforms*|\n\n|[clang_impl_linux-64](https://prefix.dev/channels/conda-forge/packages/clang_impl_linux-64)|23.1.2|23.1.3|Patch\nUpgrade|default on linux-64|\n\n|[clang_impl_linux-aarch64](https://prefix.dev/channels/conda-forge/packages/clang_impl_linux-aarch64)|23.1.2|23.1.3|Patch\nUpgrade|default on linux-aarch64|\n\n|[clang_impl_osx-arm64](https://prefix.dev/channels/conda-forge/packages/clang_impl_osx-arm64)|23.1.2|23.1.3|Patch\nUpgrade|default on osx-arm64|\n\n|[clangxx_impl_linux-64](https://prefix.dev/channels/conda-forge/packages/clangxx_impl_linux-64)|23.1.2|23.1.3|Patch\nUpgrade|default on linux-64|\n\n|[clangxx_impl_linux-aarch64](https://prefix.dev/channels/conda-forge/packages/clangxx_impl_linux-aarch64)|23.1.2|23.1.3|Patch\nUpgrade|default on linux-aarch64|\n\n|[clangxx_impl_osx-arm64](https://prefix.dev/channels/conda-forge/packages/clangxx_impl_osx-arm64)|23.1.2|23.1.3|Patch\nUpgrade|default on osx-arm64|\n\n|[compiler-rt23](https://prefix.dev/channels/conda-forge/packages/compiler-rt23)|23.1.2|23.1.3|Patch\nUpgrade|default on *all platforms*|\n\n|[compiler-rt23_linux-64](https://prefix.dev/channels/conda-forge/packages/compiler-rt23_linux-64)|23.1.2|23.1.3|Patch\nUpgrade|default on linux-64|\n\n|[compiler-rt23_linux-aarch64](https://prefix.dev/channels/conda-forge/packages/compiler-rt23_linux-aarch64)|23.1.2|23.1.3|Patch\nUpgrade|default on linux-aarch64|\n\n|[compiler-rt23_osx-arm64](https://prefix.dev/channels/conda-forge/packages/compiler-rt23_osx-arm64)|23.1.2|23.1.3|Patch\nUpgrade|default on osx-arm64|\n\n|[compiler-rt_linux-64](https://prefix.dev/channels/conda-forge/packages/compiler-rt_linux-64)|23.1.2|23.1.3|Patch\nUpgrade|default on linux-64|\n\n|[compiler-rt_linux-aarch64](https://prefix.dev/channels/conda-forge/packages/compiler-rt_linux-aarch64)|23.1.2|23.1.3|Patch\nUpgrade|default on linux-aarch64|\n\n|[compiler-rt_osx-arm64](https://prefix.dev/channels/conda-forge/packages/compiler-rt_osx-arm64)|23.1.2|23.1.3|Patch\nUpgrade|default on osx-arm64|\n\n|[iniconfig](https://prefix.dev/channels/conda-forge/packages/iniconfig)|2.3.0|2.3.1|Patch\nUpgrade|lint on *all platforms*|\n\n|[libclang-cpp23.1](https://prefix.dev/channels/conda-forge/packages/libclang-cpp23.1)|23.1.2|23.1.3|Patch\nUpgrade|{default, lint} on *all platforms*|\n\n|[libclang13](https://prefix.dev/channels/conda-forge/packages/libclang13)|23.1.2|23.1.3|Patch\nUpgrade|default on *all platforms*|\n\n|[libcompiler-rt](https://prefix.dev/channels/conda-forge/packages/libcompiler-rt)|23.1.2|23.1.3|Patch\nUpgrade|default on *all platforms*|\n\n|[libcxx](https://prefix.dev/channels/conda-forge/packages/libcxx)|23.1.2|23.1.3|Patch\nUpgrade|{default, lint} on osx-arm64|\n\n|[libcxx-devel](https://prefix.dev/channels/conda-forge/packages/libcxx-devel)|23.1.2|23.1.3|Patch\nUpgrade|default on osx-arm64|\n\n|[libcxx-headers](https://prefix.dev/channels/conda-forge/packages/libcxx-headers)|23.1.2|23.1.3|Patch\nUpgrade|default on osx-arm64|\n\n|[libedit](https://prefix.dev/channels/conda-forge/packages/libedit)|3.1.20250104|3.1.20260512|Patch\nUpgrade|default on *all platforms*<br/>gcc on linux-64|\n\n|[libllvm23](https://prefix.dev/channels/conda-forge/packages/libllvm23)|23.1.2|23.1.3|Patch\nUpgrade|{default, lint} on *all platforms*|\n\n|[libpython](https://prefix.dev/channels/conda-forge/packages/libpython)|3.14.7|3.14.8|Patch\nUpgrade|{default, lint} on *all platforms*|\n\n|[llvm-openmp](https://prefix.dev/channels/conda-forge/packages/llvm-openmp)|23.1.2|23.1.3|Patch\nUpgrade|default on *all platforms*|\n\n|[llvm-tools-23](https://prefix.dev/channels/conda-forge/packages/llvm-tools-23)|23.1.2|23.1.3|Patch\nUpgrade|default on *all platforms*|\n\n|[python-discovery](https://prefix.dev/channels/conda-forge/packages/python-discovery)|1.6.1|1.6.2|Patch\nUpgrade|lint on *all platforms*|\n\n|[virtualenv](https://prefix.dev/channels/conda-forge/packages/virtualenv)|21.14.5|21.14.7|Patch\nUpgrade|lint on *all platforms*|\n\n|[binutils](https://prefix.dev/channels/conda-forge/packages/binutils)|default_hf1166c9_102|default_hf1166c9_103|Only\nbuild string|default on linux-aarch64|\n\n|[binutils](https://prefix.dev/channels/conda-forge/packages/binutils)|default_h4852527_102|default_h4852527_103|Only\nbuild string|default on linux-64|\n\n|[binutils_impl_linux-64](https://prefix.dev/channels/conda-forge/packages/binutils_impl_linux-64)|default_hfdba357_102|default_hfdba357_103|Only\nbuild string|{default, gcc} on linux-64|\n\n|[binutils_impl_linux-aarch64](https://prefix.dev/channels/conda-forge/packages/binutils_impl_linux-aarch64)|default_h5f4c503_102|default_h5f4c503_103|Only\nbuild string|default on linux-aarch64|\n\n|[ld_impl_linux-64](https://prefix.dev/channels/conda-forge/packages/ld_impl_linux-64)|default_hbd61a6d_102|default_hbd61a6d_103|Only\nbuild string|*all envs* on linux-64|\n\n|[ld_impl_linux-aarch64](https://prefix.dev/channels/conda-forge/packages/ld_impl_linux-aarch64)|default_h1979696_102|default_h1979696_103|Only\nbuild string|{default, lint} on linux-aarch64|\n\n|[libabseil](https://prefix.dev/channels/conda-forge/packages/libabseil)|cxx17_hc5e897d_2|cxx17_hc5e897d_3|Only\nbuild string|{default, lint} on linux-aarch64|\n\n|[libabseil](https://prefix.dev/channels/conda-forge/packages/libabseil)|cxx17_h4c27e2a_2|cxx17_h4c27e2a_3|Only\nbuild string|{default, lint} on osx-arm64|\n\n|[libabseil](https://prefix.dev/channels/conda-forge/packages/libabseil)|cxx17_h0dc7533_2|cxx17_h0dc7533_3|Only\nbuild string|*all envs* on linux-64|\n\n|[libxml2](https://prefix.dev/channels/conda-forge/packages/libxml2)|h92b9305_0|h92b9305_1|Only\nbuild string|{default, lint} on linux-aarch64|\n\n|[libxml2](https://prefix.dev/channels/conda-forge/packages/libxml2)|h7df9aa5_0|h7df9aa5_1|Only\nbuild string|*all envs* on linux-64|\n\n|[libxml2](https://prefix.dev/channels/conda-forge/packages/libxml2)|h550178d_0|h550178d_1|Only\nbuild string|{default, lint} on osx-arm64|\n\n|[libxml2-16](https://prefix.dev/channels/conda-forge/packages/libxml2-16)|hf3af7cc_0|hf3af7cc_1|Only\nbuild string|*all envs* on linux-64|\n\n|[libxml2-16](https://prefix.dev/channels/conda-forge/packages/libxml2-16)|heb56d2d_0|heb56d2d_1|Only\nbuild string|{default, lint} on osx-arm64|\n\n|[libxml2-16](https://prefix.dev/channels/conda-forge/packages/libxml2-16)|h2e5089f_0|h2e5089f_1|Only\nbuild string|{default, lint} on linux-aarch64|\n\n</details>\n\n[^1]: **Bold** means explicit dependency.\n[^2]: Dependency got downgraded.\n\n\nGenerated by `.github/workflows/pixi-lock-update.yml` with pixi 0.81.0.\nCI runs as for any PR;\na maintainer reviews the diff, approves and squash-merges.\n\nCo-authored-by: antb1-bot[bot] <334225516+antb1-bot[bot]@users.noreply.github.com>",
+          "timestamp": "2026-10-12T16:09:07+03:00",
+          "tree_id": "120f908a5987ecc79c8e18eee88031547aab18ff",
+          "url": "https://github.com/ydb-campus/antb1/commit/a83bb48696e5c516fdb50acc7894340cf1501c36"
+        },
+        "date": 1791810692403,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 2616.901205579023,
+            "unit": "ns/iter",
+            "extra": "iterations: 269580\ncpu: 2616.7663142666365 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 62157.18408736371,
+            "unit": "ns/iter",
+            "extra": "iterations: 10897\ncpu: 62152.21326970727 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 68480.79241379493,
+            "unit": "ns/iter",
+            "extra": "iterations: 10150\ncpu: 68472.68640394087 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 251369.65150429434,
+            "unit": "ns/iter",
+            "extra": "iterations: 2792\ncpu: 251352.5454871061 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 249415.6320977936,
+            "unit": "ns/iter",
+            "extra": "iterations: 2536\ncpu: 249401.48264984242 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 1406687.445999978,
+            "unit": "ns/iter",
+            "extra": "iterations: 500\ncpu: 1406564.3259999997 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 31.41254408695738,
+            "unit": "ms/iter",
+            "extra": "iterations: 23\ncpu: 31.407998391304368 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 28.689294079999854,
+            "unit": "ms/iter",
+            "extra": "iterations: 25\ncpu: 28.684874120000003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 154.10663959999624,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 154.0936264000001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 9.192722162499933,
+            "unit": "ms/iter",
+            "extra": "iterations: 80\ncpu: 9.191600862500016 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 13.29456413953473,
+            "unit": "ms/iter",
+            "extra": "iterations: 43\ncpu: 13.293361744186047 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 27.845823239999845,
+            "unit": "ms/iter",
+            "extra": "iterations: 25\ncpu: 27.84211832000004 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.0473818546511389,
+            "unit": "ms/iter",
+            "extra": "iterations: 688\ncpu: 1.0471956380813934 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 92.70971914285805,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 92.69258600000008 ms\nthreads: 1"
           }
         ]
       }
