@@ -126,8 +126,10 @@ TEST(RelationCountTest, RejectsTheDoublingChainBehindASubquery) {
   ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
   const auto over = RelationsExceedLimit(*stmt);
   ASSERT_TRUE(over.has_value());
-  ASSERT_TRUE(over->span.has_value()) << "no FROM item holds the overflow";
-  EXPECT_EQ(sql.substr(over->span->offset, over->span->length), "IN");
+  const RelationOverflow overflow = over.value_or(RelationOverflow{});
+  ASSERT_TRUE(overflow.span.has_value()) << "no FROM item holds the overflow";
+  const SourceSpan span = overflow.span.value_or(SourceSpan{});
+  EXPECT_EQ(sql.substr(span.offset, span.length), "IN");
 }
 
 // A FROM item still wins when it crosses the limit first, even with a subquery in the same block:
@@ -142,8 +144,9 @@ TEST(RelationCountTest, ReportsAFromItemBeforeASubqueryOfTheSameBlock) {
   ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
   const auto over = RelationsExceedLimit(*stmt);
   ASSERT_TRUE(over.has_value());
-  EXPECT_FALSE(over->span.has_value()) << "the derived table, not the subquery";
-  EXPECT_EQ(over->item, 0U);
+  const RelationOverflow overflow = over.value_or(RelationOverflow{});
+  EXPECT_FALSE(overflow.span.has_value()) << "the derived table, not the subquery";
+  EXPECT_EQ(overflow.item, 0U);
 }
 
 // Every block a statement reaches, so that CheckSupported checks a subquery's block too: a block's

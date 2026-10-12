@@ -2692,8 +2692,6 @@ class Binder {
   // it is written in.
   template <class BindFn>
   arrow::Status BindSubqueryConjunct(const SubqueryConjunct& form, bool having, const BindFn& bind);
-  // The subquery conjuncts' joins over `node`, in the order they were written.
-  LogicalNodePtr SubqueryJoins(LogicalNodePtr node, std::vector<SubqueryJoin>& joins);
   // The join order of every block, innermost first: a block's relations must be connected, and
   // OrderJoins then picks the left-deep order of them.
   arrow::Status OrderRelations();
@@ -4214,7 +4212,8 @@ arrow::Status Binder::BindSubqueryConjunct(const SubqueryConjunct& form, bool ha
   return arrow::Status::OK();
 }
 
-LogicalNodePtr Binder::SubqueryJoins(LogicalNodePtr node, std::vector<SubqueryJoin>& joins) {
+// The subquery conjuncts' joins over `node`, in the order they were written.
+LogicalNodePtr SubqueryJoins(LogicalNodePtr node, std::vector<SubqueryJoin>& joins) {
   for (SubqueryJoin& join : joins) {
     if (join.probe_cast != nullptr) {
       node = Make(ComputeNode{.input = std::move(node),
