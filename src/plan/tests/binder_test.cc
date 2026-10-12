@@ -863,6 +863,58 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT i16 FROM t WHERE i32 IN (SELECT x FROM missing)", kUnsupported, "IN",
                   "IN (subquery) is not supported"}));
 
+// Where a subquery is refused, placement by placement. Roadmap PR J5 answers the three IN
+// spellings and a scalar subquery as a top-level conjunct of WHERE or HAVING, and nothing else:
+// every case here must still exit 4 after it, with a message and not an abort -- the binder's
+// expression walks reach a subquery only through a placement the static check accepted, so a
+// placement that slips through is an ANTB1_CHECK, which is why each one is pinned before the
+// acceptance line moves.
+INSTANTIATE_TEST_SUITE_P(
+    SubqueryPlacements, BindErrorTest,
+    ::testing::Values(
+        // Clauses that are no conjunct list.
+        ErrorCase{"SELECT i16 FROM t GROUP BY (SELECT COUNT(*) FROM u)", kUnsupported, "(",
+                  "a scalar subquery is not supported"},
+        ErrorCase{"SELECT i16 FROM t ORDER BY (SELECT COUNT(*) FROM u)", kUnsupported, "(",
+                  "a scalar subquery is not supported"},
+        ErrorCase{"SELECT SUM((SELECT COUNT(*) FROM u)) FROM t", kUnsupported, "(",
+                  "a scalar subquery is not supported"},
+        // Inside an expression rather than as a conjunct of its own.
+        ErrorCase{"SELECT i16 FROM t WHERE i32 + (SELECT COUNT(*) FROM u) > 0", kUnsupported, "(",
+                  "a scalar subquery is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 > (SELECT COUNT(*) FROM u) + 1", kUnsupported, "(",
+                  "a scalar subquery is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE CAST((SELECT COUNT(*) FROM u) AS BIGINT) > 0",
+                  kUnsupported, "(", "a scalar subquery is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 BETWEEN (SELECT MIN(i16) FROM u) AND 10",
+                  kUnsupported, "(", "a scalar subquery is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE s LIKE (SELECT s FROM u)", kUnsupported, "(",
+                  "a scalar subquery is not supported"},
+        ErrorCase{"SELECT CASE WHEN (SELECT COUNT(*) FROM u) > 0 THEN 1 ELSE 0 END FROM t",
+                  kUnsupported, "(", "a scalar subquery is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 IN (1, (SELECT COUNT(*) FROM u))", kUnsupported, "(",
+                  "a scalar subquery is not supported"},
+        // Two subqueries in one comparison, which would be two stacked one-row joins.
+        ErrorCase{"SELECT i16 FROM t WHERE (SELECT MIN(i16) FROM u) < (SELECT MAX(i16) FROM u)",
+                  kUnsupported, "(", "a scalar subquery is not supported"},
+        // Under an OR, which is no top-level conjunct: or_factoring flattens AND only, so the
+        // conjunct never reaches the acceptance list.
+        ErrorCase{"SELECT i16 FROM t WHERE i16 < 10 OR i32 IN (SELECT i16 FROM u)", kUnsupported,
+                  "IN", "IN (subquery) is not supported"},
+        // A LEFT JOIN's ON, which rule 11 does not let a semi join filter (ADR 0022).
+        ErrorCase{"SELECT t.i16 FROM t LEFT JOIN u ON t.i32 IN (SELECT i16 FROM ok)", kUnsupported,
+                  "IN", "IN (subquery) is not supported"},
+        // Beyond the three spellings the ADR names: both double negations mean IN, so a classifier
+        // that counts one NOT and stops would answer NOT IN's rows.
+        ErrorCase{"SELECT i16 FROM t WHERE NOT NOT (i32 IN (SELECT i16 FROM u))", kUnsupported,
+                  "IN", "IN (subquery) is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE NOT (i32 NOT IN (SELECT i16 FROM u))", kUnsupported,
+                  "NOT IN", "IN (subquery) is not supported"},
+        // An IN list holding one scalar subquery, which is what the grammar reads from a second
+        // pair of parentheses (divergence D21); DuckDB reads an IN subquery.
+        ErrorCase{"SELECT i16 FROM t WHERE i32 IN ((SELECT i16 FROM u))", kUnsupported, "(",
+                  "a scalar subquery is not supported"}));
+
 // The relation limit comes before every other check (ADR 0022), and it counts a subquery's query
 // too: the doubling chain of CTEs referenced only from a subquery in WHERE would otherwise expand
 // to 2^11 relations from eleven lines of SQL. A subquery has no FROM item of the outer block to
