@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791810693617,
+  "lastUpdate": 1791849563472,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -6804,6 +6804,114 @@ window.BENCHMARK_DATA = {
             "value": 92.70971914285805,
             "unit": "ms/iter",
             "extra": "iterations: 7\ncpu: 92.69258600000008 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "cce781463e71ec048a9f3f06261bc3a1842bea05",
+          "message": "feat(plan): uncorrelated IN subqueries as semi and null-aware anti joins (#126)\n\n## Summary\n\nRoadmap id **J5a** of [ADR\n0022](../blob/main/docs/adr/0022-joins-and-query-blocks.md) — the `IN`\nhalf of J5, unblocked by T2b (#125), which emptied `kGeneratorPending`.\n**The TPC-H-derived ratchet\ngoes 12 → 14 of 22.**\n\nAs a top-level `AND` conjunct of `WHERE`, of an inner join's `ON` or of\n`HAVING`, `x IN (query)`\nbecomes a semi join on `x` and the query's one column, and `x NOT IN\n(query)` and\n`NOT (x IN (query))` a **null-aware anti join**: an empty set keeps\nevery row, a NULL `x` included,\nand otherwise a row stays only when its `x` is not NULL, has no match,\nand the set holds no NULL —\nwhich a plain anti join gets wrong. The join sits above its block's\ninner joins, or above the\naggregation for a `HAVING` conjunct, in the order the conjuncts are\nwritten, with the probe's cast to\nthe key type in a `Compute` of its own directly below it, so a\nselect-list expression that can\noverflow is still computed over the rows the join keeps (divergence\nD16).\n\n**J5 is split in two.** The seam is clean, and I checked every edge of\nit: no generated query can use\nboth features (`SubqueryConjunct` returns after one branch), no `in.slt`\nrecord uses a scalar subquery\nor vice versa, the nine metamorphic relations split 6/3, and the four\nTPC-H queries split 2/2. **J5a**\nships `kInSubquery` (Q16, Q18 — ratchet 14); **J5b** ships\n`kScalarSubquery` (Q11, Q15 — ratchet 16)\nand owns the metamorphic canary, because once both features are declared\nno relation is pending and\n`metamorphic.RelationList.PendingRelationsHoldInDuckDb` asserts there is\none to check. Recorded in the\nADR.\n\n### The static check is the single place that decides\n\n`CheckConjuncts` recognises the three spellings the ADR names over the\nbinder's own conjuncts\n(`plan::Conjuncts`, which flattens `AND` alone), and\n`BindElement`/`BindHaving` intercept exactly what\nit accepted — so the two cannot disagree. That is what keeps\n`FirstUnsupportedOf` the one place a\nsubquery is refused and every other placement at exit 4 **for free**: an\n`OR` branch (`Conjuncts`\nnever hands the factoring a subquery), a `LEFT JOIN`'s `ON`, a select\nitem, `GROUP BY`, `ORDER BY`, an\naggregate argument, a `LIKE` pattern, a `CASE` branch, an `IN` list, a\n`BETWEEN` bound, a `CAST`\noperand, two subqueries in one comparison, and a subquery that is not a\ndirect operand. It also keeps\nthe four `RejectedSubquery()` → `ANTB1_CHECK(false)` sites unreachable —\nthe #121 failure mode.\n\n`NOT (x NOT IN (query))` and `NOT NOT (x IN (query))` both mean `IN`\nwhere one `NOT` means `NOT IN`,\nso they are **no match** and keep their exit 4 rather than risk the\nother form's rows. The ADR names\nthree spellings and says every other placement exits 4; folding the\n`NOT` count would need an ADR\nchange for a shape no record, no TPC-H query and no generated query\nwrites.\n\n### Three rules the ADR left open\n\n- A subquery counts **1 plus its body** for the relation limit, as a\nderived table and a CTE reference\ndo, and the overflow reports at the subquery's operator, since a `WHERE`\nsubquery has no `FROM` item\n  of the outer block to point at.\n- A column count other than one is a **bind error** for the `IN` form as\nwell as the scalar one, with\n  the same message DuckDB gives for both.\n- `x [NOT] IN ((query))` stays exit 4 with a message of its own at the\ninner `(`, which resolves the\nreading `docs/sql-subset.md` explicitly deferred to this PR — now\n**divergence D22**.\n\n### A correlated subquery needs no new check\n\nThe sub-block binds against the enclosing block's scope, so rule 9's\n`Scope::CorrelationError`\nreports a correlation as `Unsupported` rather than as a missing column.\nThat matters because\n**the TPC-H ratchet fails a parse or bind error outright, listed query\nor not**\n(`rejections_clean = false`): a query antb1 does not answer must exit 4.\nMutation testing showed the\nratchet is not the witness today — the four correlated queries are each\nrefused for another reason\nfirst — so two `binder_test` `ErrorCase`s pin it.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run test\n100% tests passed out of 2602\nANTB1-TESTS: PASS preset=dev junit=build/dev/junit.xml\n\n$ pixi run ci\n100% tests passed out of 2602\n\n$ pixi run coverage\n| `plan` | 96.04% (6790/7070) | 93.5% | 90.90% (3827/4210) | 89.5% | ok |\nCoverage gate: PASS\n\n$ pixi run lint\nevery hook Passed except shellcheck, which fails identically on main\n\n$ clang-tidy -p build/tidy --warnings-as-errors='*' <every TU this PR changes, plus every TU\n  that includes the two changed headers>\n0 findings\n```\n\nThe ratchet was **measured before the JSON was edited**, not derived\nfrom the roadmap:\n\n```text\n$ pixi run test -R 'tpch\\.status'\nTPCH: PASS queries=22 pass=[1, 3, 5, 6, 7, 8, 9, 10, 12, 13, 14, 16, 18, 19]\n      unsupported=8 rejected=0 failed=0\n```\n\n`rejected=0` is the line that matters: no query turned from exit 4 into\na bind error.\n\nDeclaring `kInSubquery` closes the diff gate's tolerance band —\n`difftest.cc` accepts an antb1 error\nonly for a query using an undeclared feature — so every generated\nsubquery query must now answer and\nmatch. At `--target-percent 100`, where ~90% of queries carry a\nsubquery:\n\n```text\n$ antb1-slt diff ... --seed 20261005 --count 300 --target-percent 100\nDIFF: PASS seed=20261005 queries=300 failed=0 unsupported=27   (all 27 scalar_subquery, i.e. J5b)\n  seed 20261013 --count 400: PASS failed=0 unsupported=41\n  seed 777      --count 400: PASS failed=0 unsupported=40\n  seed 424242   --count 400: PASS failed=0 unsupported=35\n  and seed 20261005 again with --threads 4 --same-as-threads 1 --batch-size 97: PASS failed=0\n```\n\n```text\n$ ANTB1_UPDATE_GOLDENS=1 pixi run test -L cli && pixi run test -L cli\na no-op: the two new goldens regenerate byte-identically\n\n$ antb1-sql-parser-fuzzer -seed=1 -runs=200000 (work corpus + the committed seeds)\nDone 200000 runs in 7 seconds\n```\n\n## Tests\n\nThe 24 `pending J5` records of `in.slt` and `joins/alias_words.slt`\nanswer, and the six `IN`\nmetamorphic relations activate on their own from `kSupportedFeatures`.\nAdded for the shapes the\ngenerator cannot write: a cast on the **build** side (every existing\nrecord casts the probe), a\n`LEFT JOIN`'s padded column as the probe of a `NOT IN` over an empty\nset, a NULL grouping key paired\nwith the same groups unfiltered, the inner-`ON` and `WHERE` pair that\nmust agree, two stacked\nconjuncts, a derived table's own conjunct, an aggregate probe in\n`HAVING`, and an `onlyif duckdb`\nrecord for D22. Plus 16 `binder_test` `ErrorCase`s pinning every refused\nplacement **before** the\nfeature commit moved the acceptance line, two EXPLAIN goldens, and seven\n`relation_count_test` cases.\n\n**Mutation checks** (each applied alone against the committed tree;\nevery one fails at least one\ntest):\n\n| mutation | caught by |\n|---|---|\n| `kNullAwareAnti` → `kAnti` | `in.slt`'s `null_in_set` and `null_probe`\nrecords |\n| `kSemi` → `kInner` | `in.slt`, `alias_words.slt`,\n`in_subquery_is_a_semi_join_over_distinct_keys`, a golden |\n| a `HAVING` join placed below the aggregation | `slt.subqueries.in` (as\nan abort) and `explain_in_subquery_having` |\n| the sub-block loses the enclosing scope | the two correlation\n`ErrorCase`s |\n| a connector-blind `ON` gate | the `LEFT JOIN` `ErrorCase` — **as\n`Subprocess aborted`** |\n| the probe's `FirstUnsupported` check dropped | three `ErrorCase`s, two\nof them aborting |\n| the global-aggregate `Project` fix reverted | `slt.subqueries.in` (as\nan abort) |\n| either half of the `relation_count` walk, or its `1 +` | 4\n`relation_count_test` cases, 1 `binder_test` |\n\n## Commits\n\n1. `refactor(plan)`: the relation count and `ReachableBlocks` descend\ninto subquery expressions.\n**A latent hang**: a 30-CTE doubling chain referenced only from `WHERE x\nIN (SELECT … FROM c30)`\nnever ran the limit, so J5a would have bound 2³⁰ relations from 30 lines\nof SQL. Same exit code\n   at the same operator, so no answer moves.\n2. `test(plan)`: the 16 pinned placements, all passing before the\nacceptance line moves.\n3. `feat(plan)`: the feature.\n4. `style(plan)`: two clang-tidy findings on it.\n5. `fix(plan)`: the P0 below.\n\n## What the reviewer found\n\nThe `reviewer` agent swept ~3200 generated comparisons against the\npinned oracle and found **one\ndivergence, an abort** that neither my test matrix nor the differential\ngate reached:\n`SELECT MIN(<int32 col>) FROM t HAVING MIN(<int32 col>) IN (SELECT\n<int64 col> FROM u)` — a global\naggregate whose select list is exactly its aggregates, with a probe\nneeding a cast — exited 134 where\nDuckDB answers a row. The cast column sits above the aggregation, and\n`Shape::kGlobal` added the\nrestoring `Project` only for constants, expressions, hidden aggregates\nand `HAVING`'s own computed\ncolumns. A `GROUP BY`, a hidden aggregate or a probe needing no cast all\nkeep the `Project`, which is\nwhy every committed record passed. Fixed, with three records pinning it;\nwrapped in a derived table\nthe same query aborted one site earlier, in `Binding::OfPlan`, so that\nshape is pinned too.\n\nIt also found that the probe's own `FirstUnsupported` check was the\n**one acceptance predicate with\nno test**, and that dropping it turns `TRY_CAST(x AS BIGINT) IN (query)`\nand `(query) IN (query)` into\naborts rather than exit 4 — `ReadsColumn` does not stand in, since it\nrecurses into both. Four\n`ErrorCase`s now cover that and the CTE a subquery alone references. And\n`docs/sql-subset.md` said the\nprobe must be a column where the gate takes any operand, as the same\nfile says 200 lines further down.\n\n## Maintainer notes\n\n- **Governance.** Three \"Ask a human first\" paths:\n`tests/data/tpch_status.json` (12 → 14),\n`AGENTS.md:4` (\"12 of 22\" → \"14 of 22\") and `docs/adr/0022` (the J5 →\nJ5a/J5b split and three\nUpdate notes). Agreed in advance as part of this PR's plan; flagging\nthem explicitly here.\n- `pixi run check` cannot pass on this osx-arm64 machine, unchanged from\n#120/#121/#123/#125: the\nosx-arm64 shellcheck reports pre-existing `SC2218` in a governance file,\nidentical on `main`. `ci`,\n  `coverage` and per-file `clang-tidy` stand in.\n- `docs/testing.md:467` owes `asan` for any PR touching\n`supported_features.h`, i.e. this one. ASan\ncannot complete here (a macOS `libdispatch` leak report and a\npre-existing deadlock in\n  `bad_alloc_test.cc`), so please let CI's ASan leg decide.\n- `[NOT] IN ((query))` is now a named divergence (D22) rather than an\nopen question. If you prefer\nDuckDB's reading, that is a binder-side AST rewrite and should be its\nown id.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests) — see the\n      maintainer note; `ci`, `coverage` and per-file `clang-tidy` pass\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5) planned\nthe id, implemented it, and\nran the verification and mutation checks above. A multi-agent planning\npass found the four\nblockers that shaped the commit order; its verifiers corrected eleven\nnumbers in the draft and\nalso produced one false \"coverage gap\" (NULL-in-set records that do\nexist), so every\nload-bearing claim was re-checked against the tree first. The `reviewer`\nagent found the P0\n      above on the finished diff.\n- Accountable human (has read and understands the whole diff): @hor911\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-13T02:57:20+03:00",
+          "tree_id": "b1a450b056600f5f24c341b209cb17ed8f28ce01",
+          "url": "https://github.com/ydb-campus/antb1/commit/cce781463e71ec048a9f3f06261bc3a1842bea05"
+        },
+        "date": 1791849562983,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 2670.4298350622453,
+            "unit": "ns/iter",
+            "extra": "iterations: 259795\ncpu: 2670.2876267826555 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 59060.38446428547,
+            "unit": "ns/iter",
+            "extra": "iterations: 11200\ncpu: 59054.57982142858 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 67970.24452874307,
+            "unit": "ns/iter",
+            "extra": "iterations: 10281\ncpu: 67967.11837369905 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 239262.63649074125,
+            "unit": "ns/iter",
+            "extra": "iterations: 2861\ncpu: 239244.58301293253 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 243067.53253182487,
+            "unit": "ns/iter",
+            "extra": "iterations: 2828\ncpu: 243028.70297029696 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 1383084.9320000026,
+            "unit": "ns/iter",
+            "extra": "iterations: 500\ncpu: 1382869.952 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 28.902537208333356,
+            "unit": "ms/iter",
+            "extra": "iterations: 24\ncpu: 28.897415958333323 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 27.56488931999968,
+            "unit": "ms/iter",
+            "extra": "iterations: 25\ncpu: 27.559870040000014 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 121.55490039999961,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 121.53897760000002 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 8.32425521951221,
+            "unit": "ms/iter",
+            "extra": "iterations: 82\ncpu: 8.323915890243896 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 10.606624907692408,
+            "unit": "ms/iter",
+            "extra": "iterations: 65\ncpu: 10.604746215384608 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 25.994046148148364,
+            "unit": "ms/iter",
+            "extra": "iterations: 27\ncpu: 25.990460962962928 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 0.9574297681755941,
+            "unit": "ms/iter",
+            "extra": "iterations: 729\ncpu: 0.9572693017832666 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 50.02826884615366,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 50.0001726923078 ms\nthreads: 1"
           }
         ]
       }
