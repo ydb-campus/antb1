@@ -168,6 +168,11 @@ TEST(RelationCountTest, ReachesTheBlockOfEverySubquery) {
                           "FROM c)"),
             (std::vector<std::string>{"c", "w", "c"}))
       << "the CTE body once, the subquery's own block always";
+  // Referenced from the subquery alone: the body is reached through it, in the frame of the block
+  // that holds the subquery, so a check over the result sees it.
+  EXPECT_EQ(ReachedTables("WITH c AS (SELECT 1 FROM w) SELECT 1 FROM t WHERE a IN (SELECT a "
+                          "FROM c)"),
+            (std::vector<std::string>{"t", "c", "w"}));
 }
 
 // A CTE's body sees the CTEs before it in its own list, never itself and never a later one.

@@ -4796,6 +4796,11 @@ LogicalPlan Binder::Assemble() {
     node = Make(ComputeNode{
         .input = std::move(node), .exprs = input_exprs_, .ids = input_ids_, .span = select_.span});
   }
+  // A HAVING subquery whose probe needs a cast to the key type computes it above the aggregation,
+  // so a column that is no part of the select list reaches whatever stands above -- noted before
+  // `above` runs, since it is what decides a global aggregate's Project below.
+  const bool having_join_columns = std::ranges::any_of(
+      having_subqueries_, [](const SubqueryJoin& join) { return join.probe_cast != nullptr; });
   // Over the aggregation: computed columns, HAVING, the Sort, then a Project restores the select
   // order.
   const auto above = [&] {
@@ -4884,8 +4889,10 @@ LogicalPlan Binder::Assemble() {
           .input = std::move(node), .aggregates = select_.aggregates, .span = select_.span});
       above();
       // A Project restores the select list when the Aggregate's output is not it (constants,
-      // expressions, hidden aggregates, or columns computed for HAVING).
-      if (!select_.constants.empty() || !select_.exprs.empty() || hidden || !post_exprs_.empty()) {
+      // expressions, hidden aggregates, or columns computed for HAVING -- its own, or a subquery
+      // conjunct's probe cast).
+      if (!select_.constants.empty() || !select_.exprs.empty() || hidden || !post_exprs_.empty() ||
+          having_join_columns) {
         project([](ColumnId column) { return column; });
       } else {
         for (std::size_t i = 0; i < select_.items.size(); ++i) {

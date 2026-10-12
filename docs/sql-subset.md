@@ -49,8 +49,9 @@ SELECT date_trunc('month', tr_day) AS m, MIN(tr_fare) FROM trips GROUP BY 1 ORDE
   relations, in the list's `ON` or in `WHERE`, and a `LEFT JOIN` needs one between its own two inputs, in its `ON`.
   A derived table and a `WITH` list are answered too, each bound as a sub-plan of its own. Of the subquery forms in
   an expression, `x [NOT] IN (query)` and `NOT (x IN (query))` are answered as a top-level `AND` conjunct of
-  `WHERE`, of an inner join's `ON` or of `HAVING`, where `x` is a column (in `HAVING`, a column or an aggregate) and
-  the query has one column of a type that shares a join key type with `x` (so no `DOUBLE`); every other placement
+  `WHERE`, of an inner join's `ON` or of `HAVING`, where `x` is an operand (a column, or an expression over one; in
+  `HAVING`, an aggregate too) and the query has one column of a type that shares a join key type with `x` (so no
+  `DOUBLE`); every other placement
   exits 4, `NOT (x NOT IN (query))` and `NOT NOT (x IN (query))` among them, and so does a subquery column count
   other than one — a bind error, as in DuckDB. `(query)` as a value and `EXISTS (query)` parse but are not answered,
   and nor are `TRY_CAST`, a lateral reference, a column of an enclosing query block (a correlation), more than 256

@@ -238,6 +238,24 @@ SELECT COUNT(*), SUM(n) FROM (SELECT COUNT(*) AS n FROM trips GROUP BY tr_rider 
 ----
 243	2869
 
+# A global aggregate whose select list is exactly its aggregates, with a HAVING IN whose probe needs
+# a cast (INTEGER against BIGINT): the cast is a column above the aggregation, so the select list is
+# no longer the aggregation's own output and a Project has to restore it.
+query I nosort
+SELECT MIN(tr_driver) FROM trips HAVING MIN(tr_driver) IN (SELECT dv_id FROM drivers)
+----
+1000
+
+query I nosort
+SELECT MIN(tr_driver) FROM trips HAVING MIN(tr_driver) NOT IN (SELECT dv_id FROM drivers)
+----
+
+# The same block as a sub-plan, where its columns are a binding's.
+query II nosort
+SELECT COUNT(*), SUM(m) FROM (SELECT MIN(tr_driver) AS m FROM trips HAVING MIN(tr_driver) IN (SELECT dv_id FROM drivers)) AS s
+----
+1	1000
+
 # ---- DuckDB only, for good: an IN list of one subquery, which antb1 reads as a list (divergence D22) ----
 
 # A second pair of parentheses makes this an IN list holding one scalar subquery for antb1, where

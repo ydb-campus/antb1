@@ -925,7 +925,24 @@ INSTANTIATE_TEST_SUITE_P(
         // An IN list holding one scalar subquery, which is what the grammar reads from a second
         // pair of parentheses (divergence D21); DuckDB reads an IN subquery.
         ErrorCase{"SELECT i16 FROM t WHERE i32 IN ((SELECT i16 FROM u))", kUnsupported, "(",
-                  "an IN list of one subquery is not supported"}));
+                  "an IN list of one subquery is not supported"},
+        // The probe of an accepted IN is checked like the left-hand side of an IN list: an
+        // unsupported construct in it comes first, a nested subquery among them. Without that
+        // check the conjunct would be accepted and the binder would meet a construct its walks
+        // assume away, which is an abort rather than an error.
+        ErrorCase{"SELECT i16 FROM t WHERE TRY_CAST(i32 AS BIGINT) IN (SELECT i16 FROM u)",
+                  kUnsupported, "TRY_CAST", "TRY_CAST is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE (SELECT MIN(i16) FROM u) IN (SELECT i16 FROM u)",
+                  kUnsupported, "(", "a scalar subquery is not supported"},
+        ErrorCase{"SELECT i16 FROM t GROUP BY i16 HAVING TRY_CAST(COUNT(*) AS BIGINT) IN "
+                  "(SELECT i16 FROM u)",
+                  kUnsupported, "TRY_CAST", "TRY_CAST is not supported"},
+        // The query of an accepted IN is a block CheckSupported reaches, so an unsupported
+        // construct inside it is reported before any name resolves -- including through a CTE that
+        // only the subquery references.
+        ErrorCase{"WITH c AS (SELECT TRY_CAST(i16 AS BIGINT) AS a FROM u) "
+                  "SELECT i16 FROM t WHERE i32 IN (SELECT a FROM c)",
+                  kUnsupported, "TRY_CAST", "TRY_CAST is not supported"}));
 
 // The relation limit comes before every other check (ADR 0022), and it counts a subquery's query
 // too: the doubling chain of CTEs referenced only from a subquery in WHERE would otherwise expand
