@@ -185,8 +185,27 @@ struct CastExpr {
   SourceSpan span;       // CAST .. ')', or the operand's first token .. the type
 };
 
-using ExprNode = std::variant<ColumnRef, Literal, AggregateCall, UnaryExpr, BinaryExpr, LikeExpr,
-                              InExpr, BetweenExpr, FunctionCall, CaseExpr, ExtractExpr, CastExpr>;
+// A nested query inside an expression (ADR 0022): a scalar subquery used as a value,
+// `operand [NOT] IN (query)` and `EXISTS (query)`. One node for the three, since every walk over an
+// expression treats them alike; the kind matters only where a subquery is planned (roadmap PR J5
+// for the first two, ADR 0023's U-series for EXISTS). `NOT EXISTS` is the prefix NOT over kExists.
+struct SubqueryExpr {
+  enum class Kind : std::uint8_t {
+    kScalar,  // (SELECT ...) as a value
+    kIn,      // operand [NOT] IN (SELECT ...)
+    kExists,  // EXISTS (SELECT ...)
+  };
+  Kind kind = Kind::kScalar;
+  Box<SelectStatement> query;        // may lead with a WITH list of its own
+  std::optional<Box<Expr>> operand;  // kIn: its left-hand side; none for the other kinds
+  bool negated = false;              // kIn: NOT IN
+  SourceSpan op_span;                // kIn: the [NOT] IN; kExists: the EXISTS; kScalar: the '('
+  SourceSpan span;                   // kIn: the operand .. ')'; else the keyword or '(' .. ')'
+};
+
+using ExprNode =
+    std::variant<ColumnRef, Literal, AggregateCall, UnaryExpr, BinaryExpr, LikeExpr, InExpr,
+                 BetweenExpr, FunctionCall, CaseExpr, ExtractExpr, CastExpr, SubqueryExpr>;
 
 template <class T>
 concept ExprNodeKind =
@@ -194,7 +213,8 @@ concept ExprNodeKind =
     std::is_same_v<T, AggregateCall> || std::is_same_v<T, UnaryExpr> ||
     std::is_same_v<T, BinaryExpr> || std::is_same_v<T, LikeExpr> || std::is_same_v<T, InExpr> ||
     std::is_same_v<T, BetweenExpr> || std::is_same_v<T, FunctionCall> ||
-    std::is_same_v<T, CaseExpr> || std::is_same_v<T, ExtractExpr> || std::is_same_v<T, CastExpr>;
+    std::is_same_v<T, CaseExpr> || std::is_same_v<T, ExtractExpr> || std::is_same_v<T, CastExpr> ||
+    std::is_same_v<T, SubqueryExpr>;
 
 // An expression: a variant of its node kinds (std::get, std::get_if and std::visit apply). It
 // converts only from its node kinds: variant's catch-all converting constructor would make every

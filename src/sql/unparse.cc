@@ -98,6 +98,7 @@ int Precedence(const Expr& expr) {
 }
 
 std::string Sql(const Expr& expr);
+std::string StatementSql(const SelectStatement& stmt);  // a nested query, which a subquery holds
 
 // `expr` in a place that needs at least binding power `min`.
 std::string Sql(const Expr& expr, int min) {
@@ -180,6 +181,17 @@ struct SqlOf {
     }
     return (cast.try_cast ? "TRY_CAST(" : "CAST(") + Sql(*cast.operand, kOr) + " AS " + type + ")";
   }
+  // The nested query in parentheses, as a derived table's is, so it reads back as the same node.
+  std::string operator()(const SubqueryExpr& s) const {
+    std::string query = "(" + StatementSql(*s.query) + ")";
+    if (s.kind == SubqueryExpr::Kind::kExists) {
+      return "EXISTS " + query;
+    }
+    if (s.kind == SubqueryExpr::Kind::kIn && s.operand.has_value()) {
+      return Sql(**s.operand, kComparison + 1) + (s.negated ? " NOT IN " : " IN ") + query;
+    }
+    return query;  // kScalar; a kIn without its operand is no node the parser builds
+  }
 };
 
 std::string Sql(const Expr& expr) {
@@ -203,8 +215,6 @@ std::string Conjuncts(const std::vector<Expr>& conjuncts) {
   }
   return out;
 }
-
-std::string StatementSql(const SelectStatement& stmt);
 
 // A column alias list, each name quoted: ("x", "y").
 std::string ColumnList(const std::vector<std::string>& columns) {

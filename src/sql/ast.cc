@@ -14,6 +14,7 @@ namespace antb1::sql {
 namespace {
 
 bool Eq(const Expr& a, const Expr& b);
+bool Eq(const SelectStatement& a, const SelectStatement& b);
 
 bool Eq(const ColumnRef& a, const ColumnRef& b) {
   return a.name == b.name && a.quoted == b.quoted && a.qualifier == b.qualifier &&
@@ -97,6 +98,12 @@ bool Eq(const CastExpr& a, const CastExpr& b) {
          Eq(*a.operand, *b.operand);
 }
 
+// The kind and the negation are part of the node; the nested query compares as a statement.
+bool Eq(const SubqueryExpr& a, const SubqueryExpr& b) {
+  return a.kind == b.kind && a.negated == b.negated && Eq(a.operand, b.operand) &&
+         Eq(*a.query, *b.query);
+}
+
 bool Eq(const Expr& a, const Expr& b) {
   if (a.index() != b.index()) {
     return false;
@@ -108,8 +115,6 @@ bool Eq(const Expr& a, const Expr& b) {
       },
       a);
 }
-
-bool Eq(const SelectStatement& a, const SelectStatement& b);
 
 bool Eq(const TableRef& a, const TableRef& b) {
   return a.kind == b.kind && a.name == b.name && a.quoted == b.quoted;
@@ -539,6 +544,11 @@ struct DepthOf {
   }
   std::size_t operator()(const ExtractExpr& e) const { return 1 + Of(*e.source); }
   std::size_t operator()(const CastExpr& c) const { return 1 + Of(*c.operand); }
+  // Its nested query is one level below the node, as a derived table's is below its FROM item, so
+  // the depth limit bounds every walk that recurses through both (ADR 0022).
+  std::size_t operator()(const SubqueryExpr& s) const {
+    return 1 + std::max(Of(s.operand), Depth(*s.query));
+  }
 };
 
 }  // namespace
