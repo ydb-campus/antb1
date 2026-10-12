@@ -1496,20 +1496,26 @@ void CheckSubquery(const GeneratedQuery& q, const std::vector<GenTable>& tables,
     const sql::ColumnRef* probe = sub.operand.has_value() ? AsColumn(**sub.operand) : nullptr;
     ASSERT_NE(probe, nullptr) << "the IN probe is a plain column";
     cov.qualified_probe += probe->qualifier.empty() ? 0 : 1;
-    EXPECT_TRUE(std::ranges::any_of(stmt.from,
-                                    [&](const sql::FromItem& item) {
-                                      const sql::TableRef* ref = item.table();
-                                      if (ref == nullptr) {
-                                        return false;
-                                      }
-                                      const auto t =
-                                          std::ranges::find_if(tables, [&](const GenTable& g) {
-                                            return ref->kind == sql::TableRef::Kind::kPath
-                                                       ? g.path == ref->name
-                                                       : SameName(g.name, ref->name);
-                                          });
-                                      return t != tables.end() && HasColumn(*t, probe->name);
-                                    }))
+    EXPECT_TRUE(std::ranges::any_of(
+        stmt.from,
+        [&](const sql::FromItem& item) {
+          const sql::TableRef* ref = item.table();
+          if (ref == nullptr) {
+            return false;
+          }
+          const auto t = std::ranges::find_if(tables, [&](const GenTable& g) {
+            return ref->kind == sql::TableRef::Kind::kPath ? g.path == ref->name
+                                                           : SameName(g.name, ref->name);
+          });
+          if (t == tables.end() || !HasColumn(*t, probe->name)) {
+            return false;
+          }
+          // Where the probe is qualified, the FROM item that name
+          // resolves to is the one that has the column.
+          const std::string named = item.alias.value_or(
+              ref->kind == sql::TableRef::Kind::kPath ? PathBindingName(ref->name) : ref->name);
+          return probe->qualifier.empty() || SameName(named, probe->qualifier);
+        }))
         << probe->name << ": no FROM item has the probe";
     // An IN block selects a plain column, so it records no aggregate feature of its own.
     EXPECT_TRUE(std::holds_alternative<sql::ColumnRef>(block.items.front().expr));
