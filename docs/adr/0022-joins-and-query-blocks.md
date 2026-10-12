@@ -629,6 +629,12 @@ docs/sql-subset.md sections it changes.
 - **S4, feat(sql,plan): derived tables, with and subqueries in the grammar.** Nested blocks, fresh aggregate
   contexts and the depth limit; the binder exits 4 for every new form until J4 and J5. Update (2026-10-09): split
   into S4a (derived tables and WITH lists) and S4b (subqueries in expressions).
+  - Update (2026-10-12, S4b): shipped. One `sql::SubqueryExpr` with a `Kind` carries all three forms, and the binder
+    refuses each at its own operator in `FirstUnsupported`, which is the walk that runs before any name resolves --
+    so a statement with both a subquery and an unknown name still reports the subquery, as it did when the parser
+    refused the form. T2b and J5 follow. Two consequences worth recording: a malformed nested query is now a parse
+    error (exit code 1) rather than exit code 4, since the parser reaches inside it, which is what DuckDB reports
+    too; and `kInSubquery`/`kScalarSubquery` stay in `kGeneratorPending`, so J5 still waits on T2b.
 - **E1, feat(exec): a hash table for join builds.** The 64 partitions in part order, both layouts, the uniqueness
   flag, typed keys of several columns, the NULL flags and the reservations.
 - **J1b, feat(exec): inner hash join.** Build sinks prepared in post-order on the consumer thread, the streaming probe

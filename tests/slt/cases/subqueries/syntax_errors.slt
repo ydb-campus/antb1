@@ -285,6 +285,39 @@ onlyif antb1
 statement error ^parse: duplicate CTE name in the WITH list \(names match case-insensitively\)$
 WITH c AS (SELECT tr_row FROM trips), C AS (SELECT tr_row FROM trips) SELECT COUNT(*) FROM c
 
+# ---- subqueries in expressions: malformed nested queries (ADR 0022, roadmap PR S4b) ----
+
+# Before S4b the parser refused `IN (` and `(SELECT` outright, so a malformed nested query was exit code 4. Now the
+# nested query parses, and its own syntax error is a parse error, which is what DuckDB reports too.
+
+statement error
+SELECT COUNT(*) FROM trips WHERE tr_row IN (SELECT FROM trips)
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM trips WHERE tr_row IN (SELECT FROM trips)
+
+statement error
+SELECT COUNT(*) FROM trips WHERE tr_row IN (SELECT tr_row FROM)
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM trips WHERE tr_row IN (SELECT tr_row FROM)
+
+statement error
+SELECT COUNT(*) FROM trips WHERE tr_row IN (SELECT tr_row FROM trips
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM trips WHERE tr_row IN (SELECT tr_row FROM trips
+
+statement error
+SELECT COUNT(*) FROM trips WHERE EXISTS (SELECT tr_row FROM trips ;)
+
+onlyif duckdb
+statement error ^Parser Error:
+SELECT COUNT(*) FROM trips WHERE EXISTS (SELECT tr_row FROM trips ;)
+
 # ---- DuckDB only, for good: DuckDB's answers that antb1's grammar rests on ----
 
 # DuckDB takes a trailing comma in a column alias list (antb1 exits 4).

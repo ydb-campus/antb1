@@ -86,3 +86,13 @@ Accepted
   column alias lists are walked in loops. `sql::ToSql` quotes CTE names and column aliases
   (`WITH "c"("x") AS (...)`). The binder rejects both forms with `kUnsupported` before any table resolves, until it
   answers them.
+- Update (subqueries in expressions, 2026-10-12, roadmap PR S4b): one `sql::SubqueryExpr` holds all three forms --
+  a scalar subquery used as a value, `[NOT] IN (query)` and `EXISTS (query)` -- with a `Kind`, since every walk over
+  an expression treats them alike. `NOT EXISTS` is the prefix `NOT` over the `EXISTS` node, so the node itself is
+  never negated. This puts a statement inside an *expression*, where S4a only put one inside a statement, so the
+  walks now recurse through both kinds of edge, interleaved; the depth limit still bounds them, counting a
+  subquery's query one level below its node. A `(` in an expression opens a nested query only for a query's own
+  first words, so `((a + 1))` stays an expression in two pairs of parentheses and the inner pair of
+  `((SELECT ...))` is the subquery; a parenthesized query that starts with neither `SELECT` nor `WITH` is refused at
+  its first token, as in FROM. The binder refuses all three forms with `kUnsupported` at their own operator, before
+  any name resolves.

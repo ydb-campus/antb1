@@ -570,6 +570,96 @@ TEST(ParserTest, WithLists) {
 // The names of a column alias list follow the rules of an implicit table alias (as in DuckDB):
 // names, quoted identifiers and BETWEEN, EXISTS, INTERVAL and OVER, as written. A CTE's list may
 // be of any length.
+// Subqueries in expressions (ADR 0022, roadmap PR S4b): a scalar subquery as a value, IN and NOT
+// IN over a query, and EXISTS, whose NOT is the prefix one. The binder refuses all of them with
+// exit code 4 until J5 and ADR 0023's U-series; the grammar is what lands here.
+TEST(ParserTest, SubqueriesInExpressions) {
+  constexpr std::string_view kSql =
+      "SELECT (SELECT COUNT(*) FROM u) FROM t WHERE a IN (SELECT b FROM v) "
+      "AND c NOT IN (WITH w AS (SELECT d FROM x) SELECT d FROM w) "
+      "AND NOT EXISTS (SELECT 1 FROM y) AND e < (SELECT MAX(f) FROM z)";
+  auto stmt = Parse(kSql);
+  ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
+
+  // A scalar subquery as a select item: its span is the parentheses, which is also its op_span.
+  ASSERT_EQ(stmt->items.size(), 1U);
+  const auto& item = std::get<SubqueryExpr>(stmt->items[0].expr);
+  EXPECT_EQ(item.kind, SubqueryExpr::Kind::kScalar);
+  EXPECT_FALSE(item.operand.has_value());
+  EXPECT_EQ(At(kSql, item.span), "(SELECT COUNT(*) FROM u)");
+  EXPECT_EQ(At(kSql, item.op_span), "(");
+  EXPECT_EQ(At(kSql, item.query->span), "SELECT COUNT(*) FROM u");
+
+  ASSERT_EQ(stmt->where.size(), 4U);
+  // IN over a query: the operand is this block's, and the span covers it through the ')'.
+  const auto& in = std::get<SubqueryExpr>(stmt->where[0]);
+  EXPECT_EQ(in.kind, SubqueryExpr::Kind::kIn);
+  EXPECT_FALSE(in.negated);
+  ASSERT_TRUE(in.operand.has_value());
+  EXPECT_EQ(std::get<ColumnRef>(**in.operand).name, "a");
+  EXPECT_EQ(At(kSql, in.span), "a IN (SELECT b FROM v)");
+  EXPECT_EQ(At(kSql, in.op_span), "IN");
+
+  // NOT IN, and a subquery that leads with a WITH list of its own.
+  const auto& not_in = std::get<SubqueryExpr>(stmt->where[1]);
+  EXPECT_EQ(not_in.kind, SubqueryExpr::Kind::kIn);
+  EXPECT_TRUE(not_in.negated);
+  EXPECT_EQ(At(kSql, not_in.op_span), "NOT IN");
+  EXPECT_EQ(not_in.query->with.size(), 1U);
+  EXPECT_EQ(not_in.query->with[0].name, "w");
+
+  // NOT EXISTS is the prefix NOT over EXISTS, so the node itself is never negated.
+  const auto& prefix = std::get<UnaryExpr>(stmt->where[2]);
+  EXPECT_EQ(prefix.op, UnaryOp::kNot);
+  const auto& exists = std::get<SubqueryExpr>(*prefix.operand);
+  EXPECT_EQ(exists.kind, SubqueryExpr::Kind::kExists);
+  EXPECT_FALSE(exists.operand.has_value());
+  EXPECT_EQ(At(kSql, exists.span), "EXISTS (SELECT 1 FROM y)");
+  EXPECT_EQ(At(kSql, exists.op_span), "EXISTS");
+
+  // A scalar subquery as a comparison operand.
+  const auto& compare = std::get<BinaryExpr>(stmt->where[3]);
+  EXPECT_EQ(std::get<SubqueryExpr>(*compare.right).kind, SubqueryExpr::Kind::kScalar);
+
+  // The canonical form reads back as the same statement, nested queries included.
+  auto again = Parse(ToSql(*stmt));
+  ASSERT_TRUE(again.has_value()) << ToSql(*stmt) << ": " << again.error().message;
+  EXPECT_TRUE(EqualIgnoringSpans(*stmt, *again)) << ToSql(*stmt);
+}
+
+// A '(' in an expression opens a nested query only for a query's own first words: two pairs of
+// parentheses are still an expression in two pairs, and the inner pair of ((SELECT ...)) is the
+// subquery. A query in parentheses that starts with neither SELECT nor WITH is refused at its
+// first token, exactly as in FROM (ADR 0025).
+TEST(ParserTest, ParenthesesOpenANestedQueryOnlyForAQuery) {
+  auto doubled = Parse("SELECT a FROM t WHERE b < ((1 + 2))");
+  ASSERT_TRUE(doubled.has_value()) << doubled.error().message;
+  ASSERT_EQ(doubled->where.size(), 1U);
+  EXPECT_TRUE(std::holds_alternative<BinaryExpr>(doubled->where[0]));
+
+  auto nested = Parse("SELECT a FROM t WHERE b < ((SELECT c FROM u))");
+  ASSERT_TRUE(nested.has_value()) << nested.error().message;
+  const auto& compare = std::get<BinaryExpr>(nested->where[0]);
+  EXPECT_EQ(std::get<SubqueryExpr>(*compare.right).kind, SubqueryExpr::Kind::kScalar);
+
+  // Each is kUnsupported with its own form named, never a syntax error, and the message is the one
+  // the same query in parentheses gives in FROM.
+  const std::vector<std::pair<std::string_view, std::string_view>> others = {
+      {"SELECT a FROM t WHERE b IN (VALUES (1))", "VALUES is not supported"},
+      {"SELECT a FROM t WHERE b < (VALUES (1))", "VALUES is not supported"},
+      {"SELECT a FROM t WHERE b IN (FROM u)", "FROM-first queries are not supported"},
+      {"SELECT a FROM t WHERE b IN (TABLE u)", "TABLE is not supported"},
+      {"SELECT a FROM t WHERE b IN (PIVOT u ON c)", "PIVOT is not supported"},
+  };
+  for (const auto& [sql, message] : others) {
+    auto rejected = Parse(sql);
+    ASSERT_FALSE(rejected.has_value()) << sql;
+    EXPECT_EQ(rejected.error().kind, ParseError::Kind::kUnsupported) << sql;
+    EXPECT_EQ(rejected.error().message.find(message), 0U)
+        << sql << ": " << rejected.error().message;
+  }
+}
+
 TEST(ParserTest, ColumnAliasLists) {
   auto derived =
       Parse(R"(SELECT 1 FROM (SELECT a FROM t) s(over, Between, "select", "a""b", date, x_1))");
@@ -2399,8 +2489,6 @@ INSTANTIATE_TEST_SUITE_P(
                    "ILIKE is not supported"},
         RejectCase{"SimilarTo", "SELECT a FROM events WHERE url ^SIMILAR TO 'x'", kUnsupported, 7,
                    "SIMILAR TO is not supported"},
-        RejectCase{"InSubquery", "SELECT a FROM events WHERE region IN (^SELECT b FROM t)",
-                   kUnsupported, 6, "IN (subquery) is not supported"},
         RejectCase{"ComparisonAfterBetween", "SELECT a FROM events WHERE a BETWEEN 1 AND 2 ^= b",
                    kUnsupported, 1, "chained comparisons (a = b = c) are not supported"},
         RejectCase{"BetweenAfterComparison", "SELECT a FROM events WHERE a = b ^BETWEEN 1 AND 2",
@@ -2435,12 +2523,8 @@ INSTANTIATE_TEST_SUITE_P(
                    "string concatenation (||) is not supported"},
         RejectCase{"TableFunction", "SELECT * FROM ^read_parquet('x.parquet')", kUnsupported, 12,
                    "table functions are not supported"},
-        RejectCase{"SubqueryInWhere", "SELECT a FROM events WHERE a = ^(SELECT 1)", kUnsupported, 1,
-                   "subqueries are not supported"},
         RejectCase{"ParenthesizedQuery", "^(SELECT a FROM events)", kUnsupported, 1,
                    "parenthesized queries are not supported"},
-        RejectCase{"Exists", "SELECT a FROM events WHERE ^EXISTS (SELECT 1)", kUnsupported, 6,
-                   "EXISTS (subqueries) is not supported"},
         RejectCase{"Any", "SELECT a FROM events WHERE a = ^ANY (SELECT 1)", kUnsupported, 3,
                    "ANY (quantified comparisons) is not supported"},
         RejectCase{"MultipleStatements", "SELECT a FROM events; ^SELECT b FROM events",

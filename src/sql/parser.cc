@@ -151,7 +151,6 @@ constexpr auto kUnsupportedOperandKeywords = std::to_array<Construct>({
     {.keyword = "ALL", .message = "ALL (quantified comparisons) is not supported"},
     {.keyword = "ANY", .message = "ANY (quantified comparisons) is not supported"},
     {.keyword = "ARRAY", .message = "ARRAY is not supported"},
-    {.keyword = "EXISTS", .message = "EXISTS (subqueries) is not supported"},
     {.keyword = "FALSE", .message = "boolean literals (TRUE/FALSE) are not supported"},
     {.keyword = "INTERVAL", .message = "INTERVAL is not supported"},
     {.keyword = "NULL", .message = "NULL literals are not supported"},
@@ -1180,10 +1179,18 @@ class Parser {
     if (Peek().kind != TokenKind::kLeftParen) {
       return Syntax(Peek().span, "expected ( after IN, found " + Describe(Peek()));
     }
-    Take();
-    if (Peek().IsKeyword("SELECT")) {
-      return Unsupported(Peek().span, "IN (subquery) is not supported");
+    if (OpensNestedQuery(0)) {
+      auto sub = ParseSubquery(SubqueryExpr::Kind::kIn);
+      if (!sub) {
+        return std::unexpected(std::move(sub.error()));
+      }
+      sub->operand = Box<Expr>(std::move(lhs));
+      sub->negated = negated;
+      sub->op_span = op_span;
+      sub->span = Cover((*sub->operand)->span(), sub->span);
+      return Expr(*std::move(sub));
     }
+    Take();
     if (Peek().kind == TokenKind::kRightParen) {
       return Syntax(Peek().span, "expected a value in IN (...), found )");
     }
@@ -1338,8 +1345,12 @@ class Parser {
                             .span = literal.span});
       }
       case TokenKind::kLeftParen: {
-        if (PeekAt(1).IsKeyword("SELECT")) {
-          return Unsupported(token.span, "subqueries are not supported");
+        if (OpensNestedQuery(0)) {
+          auto sub = ParseSubquery(SubqueryExpr::Kind::kScalar);
+          if (!sub) {
+            return std::unexpected(std::move(sub.error()));
+          }
+          return Expr(*std::move(sub));
         }
         const SourceSpan open = Take().span;
         auto inner = ParseExpr(context);
@@ -1385,6 +1396,19 @@ class Parser {
       if (!IsReservedKeyword(keyword)) {
         return ParseQualifiedColumn();
       }
+    }
+    if (keyword == "EXISTS" && OpensNestedQuery(1)) {
+      // `token` refers into tokens_, which Take() consumes from the front, so the span must be
+      // copied out before the keyword goes: the nested query takes many tokens after it.
+      const SourceSpan exists = token.span;
+      Take();  // EXISTS
+      auto sub = ParseSubquery(SubqueryExpr::Kind::kExists);
+      if (!sub) {
+        return std::unexpected(std::move(sub.error()));
+      }
+      sub->op_span = exists;
+      sub->span = Cover(exists, sub->span);
+      return Expr(*std::move(sub));
     }
     if (auto construct = Find(kUnsupportedOperandKeywords, keyword); construct.has_value()) {
       return Unsupported(token.span, *construct);
@@ -2143,6 +2167,32 @@ class Parser {
     const std::string keyword = KeywordOf(PeekAt(ahead));
     return keyword == "FROM" || keyword == "TABLE" ||
            (keyword == "VALUES" && PeekAt(ahead + 1).kind == TokenKind::kLeftParen);
+  }
+
+  // Whether the token at `ahead` is a '(' that opens a nested query rather than a parenthesized
+  // expression: whatever DuckDB parses as a query there, which ParseNestedQuery then answers for
+  // SELECT and WITH and refuses at its first token otherwise -- so an expression refuses
+  // `(VALUES ...)`, `(FROM t)` and `(PIVOT ...)` exactly as a FROM item does (ADR 0025). Unlike
+  // FROM, a '(' right after it is no nested query here: `((a + 1))` is an expression in two pairs
+  // of parentheses, and `((SELECT ...))` is the inner pair's subquery.
+  bool OpensNestedQuery(std::size_t ahead) {
+    return PeekAt(ahead).kind == TokenKind::kLeftParen &&
+           (Contains(kSubqueryStarts, KeywordOf(PeekAt(ahead + 1))) || StartsOtherQuery(ahead + 1));
+  }
+
+  // A nested query in an expression, positioned at its '(': the node every subquery form holds.
+  Expected<SubqueryExpr> ParseSubquery(SubqueryExpr::Kind kind) {
+    const SourceSpan open = Peek().span;
+    auto nested = ParseNestedQuery();
+    if (!nested) {
+      return std::unexpected(std::move(nested.error()));
+    }
+    return SubqueryExpr{.kind = kind,
+                        .query = std::move(nested->query),
+                        .operand = std::nullopt,
+                        .negated = false,
+                        .op_span = open,
+                        .span = nested->span};
   }
 
   Expected<FromSource> ParseFromSource() {
