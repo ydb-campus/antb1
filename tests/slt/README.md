@@ -178,9 +178,9 @@ feature adds it to `kSupportedFeatures` (and new grammar to `runner/query_gen.cc
 `harness.QueryGenerator.TargetSamplesCoverTheWholeGrammar` fails until every feature is generated). Grammar the
 generator cannot write yet waits in `kGeneratorPending`, whether because the parser rejects it or because the
 generator needs more than the parser; such a feature cannot be declared
-supported until it leaves that set. ADR 0022's T2 took derived tables and `WITH` lists out of it and T2c
-`LEFT JOIN`, so today it holds the two uncorrelated subquery forms, which the parser rejects until roadmap PR S4b
-and T2b then generates.
+supported until it leaves that set. ADR 0022's T2 took derived tables and `WITH` lists out of it, T2c `LEFT JOIN`
+and T2b the two uncorrelated subquery forms, so the set is empty today: a `Feature` added for grammar the
+generator cannot write goes in, and the PR that teaches it takes it out again.
 
 Over tables with refs, a query that may use a join feature joins 2 or 3 tables along the refs 60% of the time when a
 ref from or to the table it starts from can be followed (`runner/query_gen.h`): inner joins written with commas,
@@ -206,8 +206,21 @@ index, so a query that joins nothing is the query the same tables give without r
 and `diff.tpch` keep their queries, and only the join queries of `diff.star` are new. The join features are
 declared supported, so every generated join is compared against DuckDB like any other query. The
 generated joins never use single-table aliases, and never meet a bind error or an exit code 4 of the join rules:
-`.slt` files cover those. A generated `LEFT JOIN` is answered `Unsupported` and counted as such until roadmap PR J6
-declares the feature.
+`.slt` files cover those.
+
+The refs also carry the uncorrelated subqueries (ADR 0022's T2b, feature `in_subquery` or `scalar_subquery`): a
+query with a usable probe takes one as a further top-level `AND` conjunct of `WHERE` 25% of the time, which may be
+the only reason it has a `WHERE` at all. The probe is a column of an unnested FROM item that is one end of a
+single-column ref, and the block is `(SELECT <column> | MIN(<column>) | MAX(<column>) | COUNT(*) FROM <table>)`
+over the ref's other end -- one table named, one output column, and no clause of its own, so nothing in it reads
+the outer query and the subquery is uncorrelated by construction. The ref's own guard is what makes the two
+columns comparable in both engines, so the form needs no type rule beyond a join's. A `NOT IN` set holding a NULL
+keeps no row at all, which both engines agree on but makes the answer empty whatever the data, so the set is
+NULL-free unless a 15% draw asks otherwise; and the block aggregates only where the select list already settles
+the query's row shape, since an aggregate inside a block records its feature on the whole query. Every draw comes
+from a fifth random stream, so a query without a subquery is the query the seed gave before. A generated
+`LEFT JOIN` or subquery is answered `Unsupported` and counted as such until roadmap PR J6 or J5 declares the
+feature.
 
 ## Data tests: `queries` and `clickbench`
 

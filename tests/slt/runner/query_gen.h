@@ -52,6 +52,16 @@
 // sibling. Its ON holds those keys, and a drawn extra conjunct stays inside the same scope. One
 // item at most per query, from a fourth random stream, so a query that joins inner is the query
 // this seed gave before the feature.
+//
+// The refs also carry uncorrelated subqueries (ADR 0022's T2b): a query with a usable probe now and
+// then takes one more top-level AND conjunct of WHERE -- `x [NOT] IN (q)`, `NOT (x IN (q))`, or
+// `x <op> (q)` and its mirror -- where q is `(SELECT col | MIN(col) | MAX(col) | COUNT(*) FROM t)`
+// over the other end of a single-column ref. The block names one table, selects one column of it,
+// and holds no clause of its own, so nothing in it reads the outer query: the subquery is
+// uncorrelated by construction, which is what the binder will keep refusing with exit code 4 even
+// after J5 answers the rest. A NOT IN set is NULL-free unless a draw asks otherwise, since a NULL
+// in it keeps no row at all, and the block aggregates only where the select list already settles
+// the query's row shape. One subquery at most per query, from a fifth random stream.
 
 namespace antb1::slt {
 

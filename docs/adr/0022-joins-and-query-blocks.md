@@ -669,6 +669,22 @@ docs/sql-subset.md sections it changes.
 - **T2b, test(diff): generate uncorrelated subqueries.** After S4b, which the parser needs first: `IN (query)`,
   `NOT IN (query)` and a scalar subquery as a top-level conjunct of WHERE or HAVING, taking `kInSubquery` and
   `kScalarSubquery` out of `kGeneratorPending`. J5 depends on it.
+  - Update (2026-10-12, T2b): shipped, and `kGeneratorPending` is empty for the first time. The forms go in
+    `WHERE` only; the `HAVING` site is not generated, because there the left side must be a grouped key or an
+    aggregate and the shape adds a second type rule for no relation the generator could reach that
+    `relations.cc` does not already run as a fixed query. The probe is a column of one end of a single-column
+    ref and the block reads the other end, so the ref's existing guard — one `ValueKind`, never DOUBLE, never
+    DATE through the clickbench option, DECIMAL within 38 common digits — is the only type rule the form needs,
+    and the ref makes the two columns' values overlap, so the answer is neither empty nor everything.
+  - Update (2026-10-12, T2b): two constraints worth recording, because both are invisible in the grammar. A
+    `NOT IN` set holding a NULL keeps no row at all, which both engines agree on but makes the answer empty
+    whatever the data, so the generator prefers a NULL-free set. And an aggregate inside a block records its
+    feature on the whole query, which the row-shape rule `query_gen_test` derives from the feature set cannot
+    attribute to a block: for a select list that settles no shape of its own — constants or arithmetic alone —
+    an inner aggregate would read as the query's own, so the scalar form waits for a select list that settles
+    it. Six of the nine pending subquery relations are reachable from what T2b generates; the other three need
+    an inner `WHERE`, which would mean threading a random stream through the literal helpers, and they are fixed
+    queries in `relations.cc` that J5 runs regardless.
 - **T2c, test(diff): bound a left join's padded rows and generate it.** `JoinRowBound` counts matches only, so a
   LEFT JOIN's bound needs the left input's rows added and `query_gen_test`'s `row_bound` assertions widened; then
   the generator promotes an inner join whose ON reads only its own two inputs. Takes `kLeftJoin` out of
