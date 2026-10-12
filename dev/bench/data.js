@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791787557355,
+  "lastUpdate": 1791809700936,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -6588,6 +6588,114 @@ window.BENCHMARK_DATA = {
             "value": 116.3989588333294,
             "unit": "ms/iter",
             "extra": "iterations: 6\ncpu: 116.39152133333339 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d4c56603ec0f824395787a57ba6e2edc12b0865c",
+          "message": "feat(sql,plan): subqueries in expressions (#123)\n\n## Summary\n\nRoadmap id **S4b** of [ADR\n0022](../blob/main/docs/adr/0022-joins-and-query-blocks.md), the second\nhalf of S4 (S4a shipped derived tables and `WITH` lists). The grammar\ngains the three subquery\nforms:\n\n```\nprimary   = … | \"(\" , query , \")\"                       -- a scalar subquery used as a value\ncondition = … | sum , [ \"NOT\" ] , \"IN\" , \"(\" , query , \")\"\n          | \"EXISTS\" , \"(\" , query , \")\"                -- NOT EXISTS via the prefix NOT\n```\n\n**No query answer changes.** The binder refuses every form with exit\ncode 4, so no `.slt`\nexpectation moves, all 58 `pending` markers under\n`tests/slt/cases/subqueries/` stay pending, every\nEXPLAIN golden keeps its bytes, and the TPC-H ratchet stays at 12 of 22.\n`kInSubquery` and\n`kScalarSubquery` stay in `kGeneratorPending`, so the chain to the next\nratchet move is still\n**S4b → T2b → J5** (ADR 0023's U-series answers `EXISTS`).\n\nThis unblocks T2b, which could not ship before: a generated subquery\nwould have failed\n`GeneratedQueriesParseAndRoundTrip`.\n\n### Three commits\n\n1. **`refactor(sql,plan)`** — one `sql::SubqueryExpr` with a `Kind`\nenters `ExprNode`, and the ten\nvisitor sets in `binder.cc` plus `ast.cc` and `unparse.cc` gain their\noverload. Nothing\nconstructs it, so it is unreachable and nothing changes. One node rather\nthan three because the\nkind matters only where a subquery is *planned*; three would have cost\nthirty overloads for a\n   distinction only J5 and the U-series branch on.\n2. **`feat(sql,plan)`** — the parsing, three rejections removed, and the\nbinder's refusal.\n3. **`fix(sql)`** — what the review found (below).\n\n### Where the refusal lives, and why it matters\n\n`FirstUnsupportedOf` alone. `RejectCondition`'s `NotACondition` already\nconsults\n`FirstUnsupported` first, so one message source covers both the operand\npositions and the\nwhole-condition positions. That walk runs **before any name resolves**,\nwhich preserves what a\nstatement reports: `SELECT nope FROM t WHERE i32 IN (SELECT …)` still\nreports the subquery, not\n`nope`, exactly as when the parser refused the form.\n\n### Two intended behaviour changes\n\n- **A malformed nested query is a parse error (exit 1), not exit 4.**\nThe old `IN (` rejection fired\nbefore looking inside. DuckDB reports a parser error for the same input,\nso this closes a gap;\n`syntax_errors.slt` gains four records with their `onlyif duckdb` twins.\n- **`IN (VALUES (1))` now says `VALUES is not supported`** instead of\nreading `VALUES` as a function\ncall and reporting an unknown function. The two `(` sites this PR adds\nroute through the same\n`StartsOtherQuery` check FROM has used since S4a, so a parenthesized\nquery starting with neither\n`SELECT` nor `WITH` refuses identically everywhere. That is the wart\n#122's ADR 0025 describes.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run test\n100% tests passed out of 2569\n\n$ pixi run ci\n100% tests passed out of 2569\n\n$ pixi run coverage\nCoverage gate: PASS (floors: `tools/ci/coverage_thresholds.json`; they only go up).\n\n$ pixi run lint\nevery hook Passed except shellcheck (see the maintainer note)\n\n$ pixi run tidy\n1 finding: exec/profile.h:107, which reproduces identically on main (libc++ traces\nbugprone-exception-escape through __throw_bad_array_new_length; linux-64's libstdc++ does not)\n```\n\nEvery DuckDB claim was checked on the pinned\n`.pixi/envs/default/bin/duckdb` **v1.5.6**;\n`.slt` expectations come from `pixi run slt-complete`, which reports\nboth touched files\n*unchanged* — the values match the oracle.\n\n### The fuzzer earned its keep, twice\n\nSeeding the corpus with the new forms turned up a\n**use-after-invalidation I had just written**:\n`tokens_` is filled lazily and consumed from the front, so the `const\nToken&` an expression holds\ndangles after the next `Take()`, and the `EXISTS` case read `token.span`\nafter parsing a whole\nnested query. ASan reported a container-overflow. The span is copied out\nbefore the keyword goes\nnow, and the minimized input is in `fuzz/regressions/`:\n\n```text\nwith the bug:  fuzz.replay.sql_parser ... Subprocess aborted\nwith the fix:  fuzz.replay.sql_parser ... Passed\n```\n\nThen ~5M further runs across three seeds: **0 crashes**, 7277 new\ncoverage units on the last.\n\n### What the review found, and the fixes\n\nA multi-agent review of the diff reported five findings; each was then\nhanded to an agent told to\n*refute* it. Four survived, and I reproduced each myself before fixing.\n\n- **P0 — `unparse.cc` precedence.** `Precedence()` had no `SubqueryExpr`\narm, so a `kIn` node\nreported `kPrimary` while `SqlOf` renders it as comparison-level text. A\ncomparison around it got\nno parentheses back, so `(a IN (SELECT b FROM u)) = c` unparsed to text\nthat re-parses as\n*\"chained comparisons are not supported\"* — breaking the invariant\n`unparse.h:15-17` promises.\nFive shapes (`=`, `LIKE`, `IN`, `BETWEEN`, prefix `NOT`). `kScalar` and\n`kExists` are genuinely\nprimaries and stay so; the pre-existing `InExpr` returns `kComparison`,\nwhich is why\n`(a IN (1, 2)) = c` always round-tripped. **My ~3M fuzz runs missed it\nbecause every seed I wrote\nput the subquery where no parentheses are needed** — libFuzzer had to\nsynthesize both the extra\n  pair and a following comparison. A seed of that shape is committed.\n- **P1 — `EXISTS ((SELECT …))` regressed from exit 4 to a syntax error**\nfor SQL DuckDB answers\n(3000 rows). It took neither the new branch (`OpensNestedQuery`\ndeliberately will not look past a\nsecond `(`) nor the `kUnsupportedOperandKeywords` entry this PR removes.\nIt keeps a rejection of\nits own now. I checked `EXISTS` without a `(`, and as a table alias, a\ncolumn name and a quoted\n  CTE name, against `main`: all unchanged.\n- **P1 — `Eq(SubqueryExpr)`'s `kind` and `negated` had no test.**\nDropping both left 2567/2567\ngreen, which matters because `Eq` is the only check the unparser of\nthese forms has.\n`DetectsEveryDifferenceInSubqueries` follows the repo's existing\nconvention; dropping both fields\n  now fails.\n- **P2 — the property test's `SubqueryExpr` overload was dead.** The\ntoken-accounting property —\nthe one that catches a silent misparse — had zero coverage for the new\nforms, since the\ngenerator's token soup never produces an accepted parse holding a\nsubquery. Three corpus entries\n  fix it; inflating the paren count now fails.\n\nEach fix is mutation-checked: reverting the precedence arm fails 2 sql\ntests **and** the fuzz\nreplay; reverting the `EXISTS` fallback fails 3.\n\nOne finding I deliberately **documented rather than fixed**: `[NOT] IN\n((query))` parses as an `IN`\nlist holding one scalar subquery, where DuckDB reads an `IN` subquery.\nBoth are exit 4 today, so\nnothing diverges yet — but the PR that answers either form has to pick\nDuckDB's reading, and\n`docs/sql-subset.md` now says so.\n\n### Corrections\n\nTwo, both mine.\n\n**1. clang-tidy.** The first push claimed clean on \"all four changed\nTUs\" — true but incomplete: I\nhad only tidied the four files under `src/`, not the test TUs this PR\nalso changes. CI caught an\nunchecked optional access in `parser_test.cc` (`ASSERT_TRUE` is not a\nguard\n`bugprone-unchecked-optional-access` reads). Fixed in `fe474e8`; the\nverification above now runs the\nwhole leg, which is the only honest check once a header changes and\nevery TU including it is\nre-tidied.\n\n**2. A round-trip regression this branch introduced, which I first\nmisattributed to `main`.** CI's\nfuzz leg trapped on\n\n```text\nSELECT -UNPIVOT(a) FROM t   ->   SELECT -(UNPIVOT(a)) FROM t   ->   \"UNPIVOT is not supported\"\n```\n\n`OpensNestedQuery` claimed every word of `kSubqueryStarts` and\n`StartsOtherQuery`, and eight of them\n— `VALUES`, `PIVOT`, `PIVOT_WIDER`, `PIVOT_LONGER`, `UNPIVOT`, `SHOW`,\n`SUMMARIZE`, `DESCRIBE` — are\n*names* in an expression (divergence D21), so an expression may call\nthem. The unparser always\nparenthesises a negation and has no parentheses to spare, so claiming\nthose words turned a call into\na query on the way back. Only a reserved word opens a nested query there\nnow, which leaves `SELECT`,\n`WITH`, `FROM` and `TABLE`; `FROM` position, where none of the eight is\na name, is unchanged.\n\nI initially reported this as pre-existing on `main`. That was wrong, and\nthe cause is worth naming:\nI had tested `main` by stashing with the build output silenced, so a\nstale binary answered. Rebuilt\nproperly, `main` passes all the reproducers. The bug was introduced here\nand is fixed here, so the\nseparate fix-PR I had proposed is unnecessary.\n\n**What that costs.** One message: `IN (VALUES (1))` reports `function\nVALUES() is not supported`\nagain rather than naming `VALUES` as a query. That improvement was\nclaimed in ADR 0025's Context,\nand it cannot be had without giving up the canonical form's round trip —\nso `16447e7` corrects the\nADR with an update note and `docs/sql-subset.md` now states the rule as\nit is. The test pins the rule\nrather than a list of messages: the two reserved forms refuse as\nqueries, and each of the eight names\nround-trips through `-(WORD(a))`. Two minimized inputs are in\n`fuzz/regressions/`, and the replay\nfails on both if the helper claims non-reserved words again.\n\nThis branch is rebased onto `main` after #122, which is also why the ADR\n0025 reference is a link\nagain.\n\n### Superseded note\n\nThe first push claimed clang-tidy clean on \"all four changed TUs\", and\nthat was true but\nincomplete: I had only tidied the four files under `src/`, not the test\nTUs this PR also changes.\nCI's tidy leg caught an unchecked optional access in `parser_test.cc` —\n`ASSERT_TRUE` is not a\nguard that `bugprone-unchecked-optional-access` reads. Fixed in\n`7ccb5e1`, and the verification\nabove now runs the whole leg, which is the only honest check once a\nheader changes and every TU\nincluding it gets re-tidied.\n\n## Maintainer notes\n\n- **`pixi run check` cannot pass on this osx-arm64 machine**, unchanged\nfrom #120/#121: the\nosx-arm64 shellcheck reports 34 pre-existing `SC2218` in two governance\nfiles, identical on\n  `main`. `ci`, `coverage` and per-file `clang-tidy` stand in.\n- **`fuzz-smoke` fails here only on libFuzzer's own leak** — 56 bytes in\n`fuzzer::StartRssThread`. I\nread the stack rather than trusting the byte count, since a leaked\n`Box<SelectStatement>` would\nlook identical (8 direct + 48 indirect). The hermetic\n`fuzz.replay.sql_parser` gate, which is the\n  PR gate, passes.\n- **The risk worth a reviewer's attention** is the new cycle in the AST\ntype graph: a statement now\nsits inside an *expression*, where S4a only put one inside a statement,\nso copy, compare, print,\n`Depth` and destruction recurse through two interleaved kinds of edge.\nThe depth limit still\n  bounds it. ASan is the gate and cannot complete here.\n- `docs/sql-subset.md` references ADR 0025 as plain text rather than a\nlink, because R014 cannot\nresolve a link to a file that lives on #122's branch. Worth linking once\n#122 merges.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests) — see the\nmaintainer note; `ci` and `coverage` pass, `lint`'s shellcheck leg fails\nidentically on `main`\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer — `/docs/adr/`:\n      update notes on ADR 0022 and ADR 0008, no status change\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5) planned\nthe id, implemented it, and\nran the verification, fuzzing and mutation checks above. A multi-agent\nreview of the finished\ndiff found the P0 precedence bug and three test gaps; every finding was\nadversarially verified\n      and then reproduced by hand before being fixed.\n- Accountable human (has read and understands the whole diff): @hor911\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-12T15:52:06+03:00",
+          "tree_id": "043da832b3336ac2578fbf68a14409d770082b35",
+          "url": "https://github.com/ydb-campus/antb1/commit/d4c56603ec0f824395787a57ba6e2edc12b0865c"
+        },
+        "date": 1791809699240,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4444.292324898535,
+            "unit": "ns/iter",
+            "extra": "iterations: 157366\ncpu: 4442.861247029219 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 96046.0820660003,
+            "unit": "ns/iter",
+            "extra": "iterations: 6970\ncpu: 96005.50559540886 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 104686.93795784163,
+            "unit": "ns/iter",
+            "extra": "iterations: 6689\ncpu: 104642.93152937663 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 352398.8722334102,
+            "unit": "ns/iter",
+            "extra": "iterations: 1988\ncpu: 352253.7897384306 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 417716.2571599063,
+            "unit": "ns/iter",
+            "extra": "iterations: 1676\ncpu: 417570.55548926047 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2514534.086330911,
+            "unit": "ns/iter",
+            "extra": "iterations: 278\ncpu: 2513761.3129496383 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 53.96932058333211,
+            "unit": "ms/iter",
+            "extra": "iterations: 12\ncpu: 53.89826475 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 47.80130299999996,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 47.79239146666671 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 195.222514666663,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 195.19944899999982 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 13.710215431372347,
+            "unit": "ms/iter",
+            "extra": "iterations: 51\ncpu: 13.705573921568634 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 26.572906576923025,
+            "unit": "ms/iter",
+            "extra": "iterations: 26\ncpu: 26.56977426923076 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 47.200455000001234,
+            "unit": "ms/iter",
+            "extra": "iterations: 14\ncpu: 47.196083357142854 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 2.299313266233804,
+            "unit": "ms/iter",
+            "extra": "iterations: 308\ncpu: 2.299057957792207 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 61.15376281818189,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 61.150156272727195 ms\nthreads: 1"
           }
         ]
       }
