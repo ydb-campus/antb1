@@ -16,10 +16,11 @@ integer arithmetic folded on a side), `GROUP BY` and `ORDER BY` (also by positio
 on aggregates and keys), arithmetic (`+ - * / // %` and unary `-`) over integers, DOUBLE and DECIMAL, the string
 functions `strlen` and `regexp_replace`, the timestamp functions `toDateTime`, `EXTRACT` and `date_trunc`, and
 `CASE` in every clause, dates written as casts or literals (`CAST('2013-07-01' AS DATE)`, `'2013-07-01'::DATE`,
-`DATE '2013-07-01'`), `LIMIT` and `OFFSET`, over one table of Parquet files or several joined by inner joins. This
+`DATE '2013-07-01'`), `LIMIT` and `OFFSET`, over one table of Parquet files or several joined by inner or left
+outer joins, with uncorrelated `IN` subqueries. This
 covers all 43 ClickBench queries (see
 [ClickBench status](#clickbench-status)). Of the 22 queries derived from TPC-H, Q1, Q3, Q5, Q6, Q7, Q8, Q9, Q10,
-Q12, Q13, Q14 and Q19 pass (see [Queries derived from TPC-H](#queries-derived-from-tpc-h)).
+Q12, Q13, Q14, Q16, Q18 and Q19 pass (see [Queries derived from TPC-H](#queries-derived-from-tpc-h)).
 
 ```sql
 SELECT COUNT(*), COUNT(DISTINCT OS), AVG(ResolutionWidth) AS width FROM hits WHERE OS BETWEEN 2 AND 44
@@ -46,10 +47,16 @@ SELECT date_trunc('month', tr_day) AS m, MIN(tr_fare) FROM trips GROUP BY 1 ORDE
   `CROSS JOIN`, `[INNER] JOIN ... ON` or `LEFT [OUTER] JOIN ... ON`, with aliases and qualified names, is answered
   as long as a join key connects every relation — so a comma list or a `CROSS JOIN` needs an equality between its
   relations, in the list's `ON` or in `WHERE`, and a `LEFT JOIN` needs one between its own two inputs, in its `ON`.
-  A derived table and a `WITH` list are answered too, each bound as a sub-plan of its own. A subquery in an
-  expression — `(query)` as a value, `[NOT] IN (query)` and `EXISTS (query)` — parses but is not answered, and nor
-  are `TRY_CAST`, a lateral reference, more than 256 relations counting every sub-plan, and a join graph that no
-  join key connects (a cross product): exit code 4 as well. A query in parentheses that starts with neither
+  A derived table and a `WITH` list are answered too, each bound as a sub-plan of its own. Of the subquery forms in
+  an expression, `x [NOT] IN (query)` and `NOT (x IN (query))` are answered as a top-level `AND` conjunct of
+  `WHERE`, of an inner join's `ON` or of `HAVING`, where `x` is an operand (a column, or an expression over one; in
+  `HAVING`, an aggregate too) and the query has one column of a type that shares a join key type with `x` (so no
+  `DOUBLE`); every other placement
+  exits 4, `NOT (x NOT IN (query))` and `NOT NOT (x IN (query))` among them, and so does a subquery column count
+  other than one — a bind error, as in DuckDB. `(query)` as a value and `EXISTS (query)` parse but are not answered,
+  and nor are `TRY_CAST`, a lateral reference, a column of an enclosing query block (a correlation), more than 256
+  relations counting every sub-plan and every subquery, and a join graph that no join key connects (a cross
+  product): exit code 4 as well. A query in parentheses that starts with neither
   `SELECT` nor `WITH` is refused at its first token: in an expression `(FROM t)` and `(TABLE t)` are, since those
   words are reserved, while `(VALUES (1))` and `(PIVOT ...)` are not — `VALUES` and the `PIVOT`, `SHOW`,
   `SUMMARIZE` and `DESCRIBE` family are names there (divergence D21), so `VALUES(1)` is a call and
@@ -57,9 +64,9 @@ SELECT date_trunc('month', tr_day) AS m, MIN(tr_fare) FROM trips GROUP BY 1 ORDE
   ([ADR 0025](adr/0025-values-table-constructor.md) postpones the constructor itself). A `(` opens a nested
   query only when a reserved query word follows it, so `((a + 1))` is an expression in two pairs of parentheses and the
   inner pair of `((SELECT ...))` is the subquery; `[NOT] IN ((query))` is therefore an `IN` list holding one scalar
-  subquery, where DuckDB reads an `IN` subquery — both exit code 4 today, and the roadmap PR that answers either form
-  has to decide which DuckDB means. Malformed SQL (a syntax error) and SQL that is wrong for the tables (a bind error)
-  fail with exit code 1.
+  subquery, where DuckDB reads an `IN` subquery and answers it as the single-paren form (divergence D22). antb1 keeps
+  its own reading and exits 4 there, at the inner `(`. Malformed SQL (a syntax error) and SQL that is wrong for the
+  tables (a bind error) fail with exit code 1.
 
 ```bash
 pixi run antb1 query -f query.sql --table hits=/data/clickbench/hits_0.parquet --clickbench
@@ -225,8 +232,8 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   when each of its sides reads one relation of one input, since a side that is an expression is computed on that
   relation's own branch; a side over two of them is a residual, as in an inner `ON`. A `LEFT JOIN` with no equality
   key between its two inputs is exit code 4, as a cross product is. More than 256 relations, counting a
-  derived table and a CTE reference as one plus the relations of their body, is exit code 4 too, before the
-  per-item checks;
+  derived table, a CTE reference and a subquery in an expression as one plus the relations of their body, is exit
+  code 4 too, before the per-item checks;
 - date casts: `CAST('YYYY-MM-DD' AS DATE)` and `'YYYY-MM-DD'::DATE` are the literal `DATE 'YYYY-MM-DD'`
   wherever it may stand, as in DuckDB (which names all three `CAST('YYYY-MM-DD' AS "DATE")`);
 - value expressions: columns, literals, aggregates, arithmetic (`+ - * / // %`, unary `-`), the functions
@@ -255,6 +262,16 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   `WHERE` or `HAVING` is its two comparisons, each folded and, over a table column, pushed into the scan like any
   comparison; `NOT BETWEEN`, `NOT (a BETWEEN ...)` and `BETWEEN` under `OR` or in `CASE` are compound conditions.
   DuckDB's names apply: `(a BETWEEN 1 AND 2)`, and both negations `(NOT (a BETWEEN 1 AND 2))`;
+- uncorrelated `IN` subqueries, as a top-level `AND` conjunct of `WHERE`, of an inner join's `ON` (which counts as
+  a `WHERE` conjunct) or of `HAVING`, in the three spellings `x IN (query)`, `x NOT IN (query)` and
+  `NOT (x IN (query))`: `x` is an operand as above, the query is a block of its own with one column, and the two
+  share a join key type (an exact widening from each, so never a `DOUBLE`). `IN` is a semi join, which keeps a row
+  once when it has a match, so it is exact with NULLs too; `NOT IN` is a null-aware anti join, which keeps every row
+  of an empty set, a NULL `x` included, and otherwise only a row whose `x` is not NULL, has no match, and faces a
+  set with no NULL in it. The join sits above its block's inner joins, or above the aggregation for a `HAVING`
+  conjunct, in the order the conjuncts are written. The query may have its own `GROUP BY` and `HAVING`, and nothing
+  is pulled out of it; an aggregate inside it does not make the outer block an aggregate query. A column of an
+  enclosing block (a correlation) is exit code 4, and a column count other than one a bind error;
 - any of these in parentheses (`(a)`, `SUM((a))`, `WHERE (a = 1 AND b = 2)`), which group without changing
   anything.
 
@@ -937,6 +954,7 @@ compare against DuckDB, so an unregistered difference is a bug.
 | D19 | Which failing row an error names | the overflow and cast errors of DECIMAL arithmetic, and the cast errors of DECIMAL `CASE` values, print the values of the first failing row of a 64Ki-row batch (each operand, then the operation); a dependent `GROUP BY` key (ADR 0018) is computed per group, in group order; a failed cast names the column it casts (`when casting from source column b`) only for a column reference, an aggregate's output and a key included | evaluates 2048-row vectors, and every key per row: with several failing rows the message can show another row's values; it also names the column of an expression its optimizer reduces to one (`b + 0`); the exit code and whether a query fails are the same | the `.slt` records match the error text without the values; `exec.ComputeTest.DecimalOperandsInDuckDbOrder` pins the operand order, `exec.ComputeTest.DecimalCaseValuesCastToTheCaseType` the named columns |
 | D20 | CASE types without a DECIMAL value | types the values that are no literals first, then lets each integer literal take their integer type when it fits and each string literal any type: `CASE WHEN c THEN 7 WHEN c2 THEN s16 END` and `CASE WHEN c THEN 8 WHEN c2 THEN s16 ELSE 7 END` are SMALLINT, a negated literal in parentheses (`-(7)`) counts as an INTEGER expression, and a string literal before a DATE value is that DATE (`THEN '2020-01-01' WHEN c2 THEN dt END`) and before a number unsupported | folds from the `ELSE` value (NULL without one) through the `THEN` values in order, where a literal next to NULL (the first `THEN` value without an `ELSE`) or next to another literal becomes its own type (both CASEs are INTEGER), while an `ELSE` literal takes the next value's type; `-(7)` is a literal (SMALLINT next to `s16`), and a string literal next to NULL is VARCHAR (a bind error next to the DATE or the number) | `plan.BinderTest.CaseTypesWithoutADecimalAreAntb1s` pins antb1's types; the random generator writes the column first among its `CASE` values, where both agree; with a DECIMAL value antb1 folds as DuckDB does ([ADR 0021](adr/0021-decimal-semantics.md) rule 10) |
 | D21 | Keywords as names | the 49 words that are never table aliases ([Grammar](#grammar)) are unquoted column, table and function names, qualifiers and select aliases, with or without `AS` (without `AS`, `glob`, `isnull` and `notnull` continue the expression: unsupported), so `SELECT default FROM t` answers with a column named `default`; `BETWEEN`, `EXISTS`, `INTERVAL` and `OVER` are reserved: no unquoted column or table names (an error) or qualifiers (unsupported), but table aliases, as in DuckDB | refuses all 49 words as unquoted column names (`default` is its `DEFAULT` keyword, an error wherever a query uses it: `SELECT default FROM t` is a binder error), table names, qualifiers and select aliases without `AS` (after an expression `isnull` and `notnull` are its operators `IS NULL` and `IS NOT NULL`, not aliases); accepts them after `AS` and after a dot, and 14 of them as function names (`unpack(...)` is its `UNPACK` operator, the other 34 are syntax errors); accepts `BETWEEN`, `EXISTS`, `INTERVAL` and `OVER` as column and table names and as qualifiers | the fixtures, the `.slt` records and the random generator use none of these words as an unquoted name; `sql.ParserTest.WordsThatCannotBeImplicitAliases`, `sql.ParserTest.EveryReservedWordAfterAsInFrom` and `sql.ParserTest.ReservedWordsThatQualifyNamesInFrom` pin antb1's rules, and `harness.TableAliasOracle.*` compares every DuckDB keyword as a table alias and as a qualifier in FROM with DuckDB itself |
+| D22 | `IN` over a doubly parenthesized query | reads `x [NOT] IN ((query))` as an `IN` list holding one scalar subquery, because a `(` opens a nested query only before a reserved query word (divergence D21), and a list of one subquery is unsupported: exit code 4 at the inner `(` | reads an `IN` subquery and answers it exactly as the single-paren form | `plan.SubqueryPlacements/BindErrorTest` pins the refusal and its span, and `tests/slt/cases/subqueries/in.slt` compares the form with DuckDB's own answer under `onlyif duckdb` |
 
 ## ClickBench status
 
@@ -1003,8 +1021,8 @@ The second workload is the 22 queries derived from TPC-H, in DuckDB's dialect, a
 committed ([ADR 0006](adr/0006-test-strategy-and-data-policy.md)); queries are referred to by their number (1-based).
 The ratchet `tests/data/tpch_status.json` lists the queries verified to pass, and `pass` below means exactly the
 ratchet (`pixi run lint` compares them); the PR that makes a query pass updates both. A query that does not pass must
-fail cleanly with exit code 4 (unsupported). Today Q1, Q3, Q5, Q6, Q7, Q8, Q9, Q10, Q12, Q13, Q14 and Q19 pass; the
-plan is recorded in
+fail cleanly with exit code 4 (unsupported). Today Q1, Q3, Q5, Q6, Q7, Q8, Q9, Q10, Q12, Q13, Q14, Q16, Q18 and Q19
+pass; the plan is recorded in
 ADRs 0021 (DECIMAL), 0022
 (joins, query blocks and uncorrelated subqueries) and 0023 (correlated subqueries). `tests/tpch/` generates the data
 at test time ([testing.md](testing.md#data-derived-from-tpc-h)), and `tpch.status.sf0_01`, `tpch.status.sf0_1` and
@@ -1024,14 +1042,14 @@ completes the query; most queries also need the DECIMAL work of ADR 0021 before 
 | Q8 | pass | derived tables (ADR 0022) |
 | Q9 | pass | derived tables (ADR 0022) |
 | Q10 | pass | inner joins (ADR 0022) |
-| Q11 | unsupported (exit code 4) | uncorrelated subqueries as joins (ADR 0022) |
+| Q11 | unsupported (exit code 4) | uncorrelated scalar subqueries (ADR 0022) |
 | Q12 | pass | inner joins (ADR 0022) |
 | Q13 | pass | left outer joins (ADR 0022) |
 | Q14 | pass | inner joins (ADR 0022) |
-| Q15 | unsupported (exit code 4) | uncorrelated subqueries as joins (ADR 0022) |
-| Q16 | unsupported (exit code 4) | uncorrelated subqueries as joins (ADR 0022) |
+| Q15 | unsupported (exit code 4) | uncorrelated scalar subqueries (ADR 0022) |
+| Q16 | pass | uncorrelated IN and NOT IN subqueries (ADR 0022) |
 | Q17 | unsupported (exit code 4) | correlated scalar aggregates (ADR 0023) |
-| Q18 | unsupported (exit code 4) | uncorrelated subqueries as joins (ADR 0022) |
+| Q18 | pass | uncorrelated IN and NOT IN subqueries (ADR 0022) |
 | Q19 | pass | OR factoring for joins (ADR 0022) |
 | Q20 | unsupported (exit code 4) | correlated scalar aggregates (ADR 0023) |
 | Q21 | unsupported (exit code 4) | correlated EXISTS and NOT EXISTS (ADR 0023) |

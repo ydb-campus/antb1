@@ -712,6 +712,30 @@ docs/sql-subset.md sections it changes.
 - **J5, feat(plan): uncorrelated subqueries as joins.** IN, both spellings of NOT IN and scalar subqueries, with
   rules 9 and 12-13, and CTEs visible inside subqueries (rule 8); outer references exit 4. Q11, Q15, Q16 and Q18
   pass.
+  - Update (2026-10-13, J5): split in two at the IN/scalar seam, since no generated query and no `.slt` record
+    uses both forms, the nine metamorphic relations split six to three, and the four TPC-H queries split two to
+    two. **J5a** ships `kInSubquery` (Q16 and Q18, ratchet 14 of 22) and **J5b** `kScalarSubquery` (Q11 and Q15,
+    16 of 22). J5b also owns the metamorphic canary: once both features are declared no relation is pending, and
+    `metamorphic.RelationList.PendingRelationsHoldInDuckDb` asserts there is one to check, so a permanently
+    pending relation tagged `kWindowFunctions` keeps it honest.
+  - Update (2026-10-13, J5a): three rules the ADR left open, decided. A subquery counts **1 plus its body** for
+    the relation limit, as a derived table and a CTE reference do, and the overflow is reported at the
+    subquery's operator, since a subquery in WHERE has no FROM item of the outer block to point at. A column
+    count other than one is a **bind error** for the IN form as well as for the scalar one, as DuckDB reports
+    for both. And `x [NOT] IN ((query))` stays exit 4 with a message of its own at the inner `(`: a `(` opens a
+    nested query only before a reserved query word, so antb1 reads an IN list holding one scalar subquery where
+    DuckDB reads an IN subquery (divergence D22 of docs/sql-subset.md, which this resolves).
+  - Update (2026-10-13, J5a): the static check is the single place that decides. `CheckConjuncts` recognises the
+    three named spellings over the binder's own conjuncts (`plan::Conjuncts`, which flattens AND alone) and the
+    binder intercepts exactly what it accepted, so the two cannot disagree -- which is what keeps
+    `FirstUnsupportedOf` the one place a subquery is refused and every other placement at exit 4 for free, an OR
+    branch and a LEFT JOIN's ON included. `NOT (x NOT IN (query))` and `NOT NOT (x IN (query))` both mean IN
+    where one NOT means NOT IN, so they are no match and keep their exit 4 rather than risk the other form's
+    rows. A correlated subquery needs no new check: the sub-block binds against the enclosing block's scope, so
+    rule 9's `Scope::CorrelationError` reports it as Unsupported rather than as a missing column. That matters
+    because the TPC-H ratchet fails a bind error outright, listed query or not (`rejections_clean = false`): the
+    four correlated queries each happen to be refused for another reason first today, so two `binder_test`
+    `ErrorCase`s are what pin it.
 - **J6, feat(plan): left outer joins.** The ON placement and the fixed-unit rules. Q13 passes.
   - Update (2026-10-12, J6): shipped. The binder's join state is now per inner block
     (`Binder::JoinBlock`), a unit is one relation of its enclosing block with a `Relation` of its
@@ -722,7 +746,7 @@ docs/sql-subset.md sections it changes.
     `FROM a CROSS JOIN b LEFT JOIN c ON ... WHERE <a = b>` exits 4 where DuckDB answers. A LEFT
     JOIN's ON is routed to the unit instead of through `BindElement`, so it is never OR-factored and
     never reaches rule 11 for a conjunct on the preserved side. Shipping J6 before J5 makes the
-    ratchet 12 of 22, not the 16 the Consequences below assume.
+    ratchet 12 of 22, not the 16 the Consequences below assume; J5a then makes it 14 and J5b 16.
 
 ## Alternatives considered
 

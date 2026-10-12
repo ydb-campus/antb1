@@ -1,0 +1,7 @@
+Output: tr_pickup:INTEGER count_star():BIGINT
+Project tr_pickup, "count_star()"
+  Join NULL-AWARE ANTI build=right keys=[tr_pickup = zn_id]
+    GroupAggregate keys=[tr_pickup] COUNT(*)
+      Scan table=trips source=parquet(files=1, rows=3000) columns=[tr_pickup]
+    Project zn_id
+      Scan table=zones source=parquet(files=1, rows=40) columns=[zn_id]

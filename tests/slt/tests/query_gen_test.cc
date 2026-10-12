@@ -793,7 +793,8 @@ TEST(QueryGenerator, NestedBlocksProjectColumnsUnderTheirOwnNames) {
 // to the query the tables give without refs. At target 100 no join fails; at target 0 partial
 // join feature sets make some fail: without kTableAlias, a join from dims read by its glob path
 // (only an alias names it, ADR 0022 rule 1), or from slots read by a path that names another
-// table.
+// table. A subquery uses the refs without joining (UsesRefs), and the join features are no part
+// of what it needs, so it is skipped here as a join is.
 TEST(QueryGenerator, FailedJoinsFallBackToTheQueriesWithoutRefs) {
   const FeatureSet base = kSupportedFeatures.Minus(kJoinFeatures);
   for (const FeatureSet& join : {FeatureSet{Feature::kCommaJoin, Feature::kJoinOn},
@@ -806,8 +807,8 @@ TEST(QueryGenerator, FailedJoinsFallBackToTheQueriesWithoutRefs) {
     int dims_by_path = 0;  // 60% of them come from a join that failed
     for (uint64_t i = 0; i < 2000; ++i) {
       const auto q = with_refs.Generate(i);
-      if (Joins(q)) {
-        ++joins;
+      if (UsesRefs(q)) {
+        joins += Joins(q) ? 1 : 0;
         continue;
       }
       dims_by_path += q.table == "dims" && q.features.Has(Feature::kTablePath) ? 1 : 0;
