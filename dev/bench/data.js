@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791740836151,
+  "lastUpdate": 1791787557355,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -6480,6 +6480,114 @@ window.BENCHMARK_DATA = {
             "value": 81.63538244444466,
             "unit": "ms/iter",
             "extra": "iterations: 9\ncpu: 81.62237988888894 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "7633fa297eaf27712240117e38a957f003a6fa7c",
+          "message": "feat(plan): left outer joins (#121)\n\n## Summary\n\nRoadmap id **J6** of [ADR\n0022](../blob/main/docs/adr/0022-joins-and-query-blocks.md): the binder\nanswers `LEFT [OUTER] JOIN ... ON`. **Q13 passes, so the TPC-H-derived\nratchet moves 11 → 12 of 22.**\nThe executor already did left joins (E2b, #111); this is binder work\nplus the placement rules.\n\nA LEFT JOIN becomes a planned **fixed unit**: one relation of its\nenclosing block, never reordered,\nalways built on its right input, with each of its two inputs an inner\nblock of its own.\n\n### Two commits, and why they split there\n\n**`refactor(plan): group the join state into inner blocks`** is\nanswer-neutral. The binder held one\nset of join state per statement, indexed by FROM position, on the\ninvariant that a relation's index\nis its binding's and its FROM item's. A unit breaks that, so `JoinBlock`\nnow holds the state and\n`OrderRelations`/`JoinTree` recurse over blocks. Nothing builds a unit\nin that commit: every mapping\nis the identity, the whole suite passes and **every EXPLAIN golden keeps\nits bytes**.\n\n**`feat(plan): left outer joins`** is necessarily atomic — `Evaluate`\nderives relation pendingness\nfrom `kSupportedFeatures`, so declaring the feature and shipping the\nbehaviour cannot be staged\napart.\n\n### The ON rules\n\nAn equality between the two inputs sharing an exact key type is a key; a\nconjunct over the right\ninput alone is pushed into it (rule 11); **every other conjunct is a\nresidual of the join, including\none that reads only the preserved side**, because a left row that fails\nit is padded, not dropped. A\nconjunct reading a FROM item outside the two inputs exits 4, as does a\njoin with no key between them.\nThe ON is routed to the unit rather than through `BindElement`, so it is\nnever OR-factored and rule\n11 can never reach a conjunct on the preserved side.\n\n### The WHERE descent, which the plan originally missed\n\nA binding inside a unit counts as the unit, and a conjunct reading only\nthe unit's **left input moves\non into that input**, where it may become a key there. A `CROSS JOIN`\ncontinues the join group, so\n\n```sql\nFROM drivers CROSS JOIN trips LEFT JOIN zones ON tr_pickup = zn_id WHERE tr_driver = dv_id\n```\n\nhas a unit whose left input is `drivers` and `trips` together, and that\nWHERE equality is their only\nkey. Without the descent the input is disconnected and the query exits 4\n— where DuckDB answers\n**2577** rows, and where `difftest` would turn it into a hard failure\nnow that the feature is\ndeclared. T2c's group-scoped promotion generates this shape, so it is\nreachable from the random\ncorpus and not just by hand.\n\nA conjunct reading the null-supplying side instead stays **above** the\nunit, and there is no\nLEFT-to-INNER conversion under a NULL-rejecting WHERE.\n\nCloses #\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run test\n100% tests passed out of 2556\nANTB1-TESTS: PASS preset=dev junit=build/dev/junit.xml\n\n$ pixi run ci\n100% tests passed out of 2556\n\n$ pixi run coverage\nCoverage gate: PASS (floors: `tools/ci/coverage_thresholds.json`; they only go up).\n\n$ pixi run lint\nevery hook Passed except shellcheck (see the maintainer note)\n\n$ ./.pixi/envs/default/bin/clang-tidy -p build/tidy --warnings-as-errors='*' src/plan/binder.cc\n0 findings\n```\n\nEvery oracle number quoted here and in the new `.slt` records was\nreproduced on the pinned\n`.pixi/envs/default/bin/duckdb` **v1.5.6**; expectations were written by\n`pixi run slt-complete`.\nThe 16 `pending J6` guards in `left.slt` are gone and the 10 pending\nmetamorphic relations activated\non their own (`pending: needs left_join` went 10 → 0).\n\n**Mutation checks.** Each rule was broken on its own and had to go red:\n\n| mutation | result |\n|---|---|\n| no descent into a unit's left input | 2 `joins.left` failures |\n| a left-only ON conjunct pushed instead of kept as a residual | 4 of 14\nfailures |\n| a null-supplying-side WHERE conjunct descends below the unit | 3 of 14\nfailures |\n| the unit's join built on the left | 2 of 4 failures |\n| the unit joined as an inner join | 7 of 25 failures |\n| **rule 11's pushdown deleted** | **all 14 .slt/metamorphic cases stay\ngreen; only the EXPLAIN golden fails** |\n\nThat last row is why both goldens ship in the behaviour commit rather\nthan a step later:\n`explain_left_join_fixed_unit` is the only artifact that can see rule 11\nat all, since filtering the\nright input and keeping a residual give the same rows. It also pins the\nleft-only residual and\n`build=right` in one file, and `explain_left_join_where_split` pins the\nWHERE filter sitting above a\njoin that is still `LEFT`.\n\nOne mutation I expected to bite did **not**, and the reason is worth\nrecording: sharing a unit's key\npairs with its enclosing block's de-duplication changes nothing, because\na block-level edge can never\ncoincide with a unit's internal key — that key joins the unit's own two\ninputs, which are *one*\nrelation of the block. The record for `ON tr_pickup = zn_id WHERE\ntr_pickup = zn_id` (2793) still\nearns its place: it pins the placement, which the WHERE-descent mutation\nabove does break.\n\n## Maintainer notes\n\n- **`pixi run check` cannot pass on this osx-arm64 machine**, unchanged\nfrom #120: the osx-arm64\nbuild of the pinned shellcheck 0.11.0 reports 34 `SC2218` in\n`tools/github/apply-settings.sh` and\n`scripts/agent-setup.sh`, both governance paths untouched here, and it\nfails identically on `main`.\n`pixi run ci`, `coverage` and per-file `clang-tidy` stand in; CI is the\ngate.\n- `docs/testing.md` requires `asan` for any PR touching\n`supported_features.h`. ASan cannot complete\nhere (a macOS `libdispatch` leak report, and a pre-existing deadlock in\n`bad_alloc_test.cc` under\nASan). This PR nests `JoinNode`s inside a boxed variant, so the ASan leg\nis the one most worth\n  watching.\n- **Governance paths touched, all agreed beforehand**:\n`tests/data/tpch_status.json` (11 → 12) with\nits paired `docs/sql-subset.md` table row, `AGENTS.md:2-6` (re-wrapped\nto 5 lines of\n120/120/118/115/115 — the file stays at exactly its 150-line maximum),\nand update notes on ADR 0022\n  and ADR 0008 with no status change.\n- I also fixed `docs/sql-subset.md`'s stale TPC-H prose, which still\nlisted the pre-J4 set of eight\nqueries: R011 compares the ratchet against the table only, so that line\nis hand-maintained.\n- Shipping J6 before J5 deviates from the ADR's listed order, which\nmakes the total 12 rather than\n  the 16 its Consequences assume. Noted in the ADR.\n- `RIGHT`, `FULL`, `SEMI`, `ANTI`, `NATURAL`, `ASOF` and `POSITIONAL`\njoins are unchanged: still\nrecognised by the parser and rejected by name. Worth knowing that\n`JoinKind` already has `kSemi`,\n`kAnti` and `kNullAwareAnti` from E2, so those are surface syntax only —\nbut they need their own id.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests) — see the\nmaintainer note; `ci` and `coverage` pass and `lint`'s shellcheck leg\nfails identically on `main`\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5) planned\nT2c and J6 together, wrote\nboth, and ran the verification and mutation checks above. A multi-agent\nplanning pass found the\nmissing WHERE descent before any code was written — the draft plan would\nhave exited 4 on the\n`CROSS JOIN` shape — and also refuted two of its own claims, which I\nre-checked against the\n      tree rather than relaying.\n- Accountable human (has read and understands the whole diff): @hor911\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-12T09:42:43+03:00",
+          "tree_id": "92350ab5ee7e6295e43d9c4fe8df3bdd5eadeb7d",
+          "url": "https://github.com/ydb-campus/antb1/commit/7633fa297eaf27712240117e38a957f003a6fa7c"
+        },
+        "date": 1791787556468,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4976.403942527888,
+            "unit": "ns/iter",
+            "extra": "iterations: 141077\ncpu: 4976.0902131460125 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84689.99705392712,
+            "unit": "ns/iter",
+            "extra": "iterations: 7807\ncpu: 84688.30395798643 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222003.22472265837,
+            "unit": "ns/iter",
+            "extra": "iterations: 3155\ncpu: 221904.16830427895 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 441728.5308176026,
+            "unit": "ns/iter",
+            "extra": "iterations: 1590\ncpu: 441704.9880503147 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 349707.30929886276,
+            "unit": "ns/iter",
+            "extra": "iterations: 2011\ncpu: 349694.0054699151 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2081095.7848484889,
+            "unit": "ns/iter",
+            "extra": "iterations: 330\ncpu: 2080925.3818181814 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 51.324751714286016,
+            "unit": "ms/iter",
+            "extra": "iterations: 14\ncpu: 51.31619485714284 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 44.75394312500036,
+            "unit": "ms/iter",
+            "extra": "iterations: 16\ncpu: 44.74231568749998 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 192.78386833333153,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 192.7651113333333 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.292539285714746,
+            "unit": "ms/iter",
+            "extra": "iterations: 49\ncpu: 14.291777163265314 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 22.62020406451649,
+            "unit": "ms/iter",
+            "extra": "iterations: 31\ncpu: 22.61758270967743 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 40.56846841176393,
+            "unit": "ms/iter",
+            "extra": "iterations: 17\ncpu: 40.562359470588156 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.9524369944289464,
+            "unit": "ms/iter",
+            "extra": "iterations: 359\ncpu: 1.9522916350974915 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 116.3989588333294,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 116.39152133333339 ms\nthreads: 1"
           }
         ]
       }
