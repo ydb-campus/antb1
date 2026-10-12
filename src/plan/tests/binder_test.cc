@@ -828,6 +828,40 @@ INSTANTIATE_TEST_SUITE_P(
                   "WHERE g.i16 = u.i16",
                   kBind, "unnamed_subquery2.s", "no FROM item is named 'unnamed_subquery2'"}));
 
+// Subqueries in expressions (ADR 0022): the grammar parses all three forms from roadmap PR S4b on,
+// and the binder refuses each at its own operator before any name resolves -- so a statement with
+// both a subquery and a bad name reports the subquery, as it did when the parser refused it.
+// Roadmap PR J5 answers IN, NOT IN and a scalar subquery; ADR 0023's U-series answers EXISTS.
+INSTANTIATE_TEST_SUITE_P(
+    Subqueries, BindErrorTest,
+    ::testing::Values(
+        ErrorCase{"SELECT i16 FROM t WHERE i32 IN (SELECT i16 FROM u)", kUnsupported, "IN",
+                  "IN (subquery) is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 NOT IN (SELECT i16 FROM u)", kUnsupported, "NOT IN",
+                  "IN (subquery) is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE NOT (i32 IN (SELECT i16 FROM u))", kUnsupported, "IN",
+                  "IN (subquery) is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u)", kUnsupported, "(",
+                  "a scalar subquery is not supported"},
+        ErrorCase{"SELECT (SELECT COUNT(*) FROM u) FROM t", kUnsupported, "(",
+                  "a scalar subquery is not supported"},
+        ErrorCase{"SELECT i16 FROM t GROUP BY i16 HAVING COUNT(*) > (SELECT COUNT(*) FROM u)",
+                  kUnsupported, "(", "a scalar subquery is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT i16 FROM u)", kUnsupported, "EXISTS",
+                  "EXISTS (subqueries) is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE NOT EXISTS (SELECT i16 FROM u)", kUnsupported, "EXISTS",
+                  "EXISTS (subqueries) is not supported"},
+        // Inside a sub-plan, which CheckSupported's walk of the reachable blocks reaches.
+        ErrorCase{"SELECT COUNT(*) FROM (SELECT i16 FROM t WHERE EXISTS (SELECT i16 FROM u)) AS s",
+                  kUnsupported, "EXISTS", "EXISTS (subqueries) is not supported"},
+        // The subquery is the error, not the name that does not exist: the refusal is a static walk
+        // that runs before any name resolves.
+        ErrorCase{"SELECT nope FROM t WHERE i32 IN (SELECT i16 FROM u)", kUnsupported, "IN",
+                  "IN (subquery) is not supported"},
+        // A subquery over a table that does not exist is still the subquery's error.
+        ErrorCase{"SELECT i16 FROM t WHERE i32 IN (SELECT x FROM missing)", kUnsupported, "IN",
+                  "IN (subquery) is not supported"}));
+
 // Rules 1, 2 and 6 of ADR 0022 over one FROM item: an alias names the binding, a qualified name
 // resolves in the binding it names (ASCII case-insensitively, quoted or not), and a result name
 // keeps the qualifier as written, each part quoted as DuckDB quotes an aggregate's argument. A

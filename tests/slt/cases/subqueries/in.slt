@@ -217,3 +217,15 @@ query II nosort
 SELECT COUNT(*), COUNT(tr_tariff) FROM trips WHERE tr_tariff IN (SELECT tf_code FROM tariffs WHERE tf_rate = tr_rate)
 ----
 199	199
+
+# ---- DuckDB only, for good: IN over a VALUES table, which is postponed (ADR 0025) ----
+
+# `VALUES` is a table constructor, not this IN list. antb1 refuses it either way, but as a call rather than as a
+# query: `values` is a name in an expression (divergence D21), so the '(' before it opens no nested query -- which
+# is what keeps `-VALUES(a)` round-tripping through its canonical form. In FROM, where it is no name, it is refused
+# as a query (ADR 0025).
+onlyif duckdb
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_pickup IN (VALUES (1), (2))
+----
+140

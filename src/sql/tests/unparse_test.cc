@@ -416,6 +416,36 @@ TEST(EqualIgnoringSpansTest, DetectsEveryDifferenceInFromLists) {
 
 // EqualIgnoringSpans compares nested queries in full: their WITH lists, derived tables, aliases,
 // column alias lists and every clause inside them.
+// Every field of a subquery in an expression that makes two nodes different, one variant each: the
+// kind, the IN negation, the IN operand and the nested query. Eq is the only check the unparser of
+// these forms has, so a field it forgot would let a wrong canonical form round-trip.
+TEST(EqualIgnoringSpansTest, DetectsEveryDifferenceInSubqueries) {
+  const std::string_view base = "SELECT a FROM t WHERE b IN (SELECT c FROM u WHERE c = 1)";
+  for (const std::string_view other : {
+           "SELECT a FROM t WHERE b NOT IN (SELECT c FROM u WHERE c = 1)"sv,
+           "SELECT a FROM t WHERE d IN (SELECT c FROM u WHERE c = 1)"sv,
+           "SELECT a FROM t WHERE b IN (SELECT c FROM v WHERE c = 1)"sv,
+           "SELECT a FROM t WHERE b IN (SELECT c FROM u WHERE c = 2)"sv,
+           "SELECT a FROM t WHERE b IN (SELECT e FROM u WHERE c = 1)"sv,
+           "SELECT a FROM t WHERE EXISTS (SELECT c FROM u WHERE c = 1)"sv,
+           "SELECT a FROM t WHERE b = (SELECT c FROM u WHERE c = 1)"sv,
+           "SELECT a FROM t WHERE b IN (SELECT c FROM u WHERE c = 1 LIMIT 1)"sv,
+           "SELECT a FROM t WHERE b IN (WITH w AS (SELECT c FROM u) SELECT c FROM u WHERE c = 1)"sv,
+       }) {
+    auto x = Parse(base);
+    auto y = Parse(other);
+    ASSERT_TRUE(x.has_value()) << x.error().message;
+    ASSERT_TRUE(y.has_value()) << other << ": " << y.error().message;
+    EXPECT_FALSE(EqualIgnoringSpans(*x, *y)) << other;
+    EXPECT_FALSE(EqualIgnoringSpans(*y, *x)) << other;
+  }
+  // A scalar subquery and EXISTS over the same query differ only in the kind.
+  auto scalar = Parse("SELECT a FROM t WHERE b = (SELECT c FROM u)");
+  auto exists = Parse("SELECT a FROM t WHERE EXISTS (SELECT c FROM u)");
+  ASSERT_TRUE(scalar.has_value() && exists.has_value());
+  EXPECT_FALSE(EqualIgnoringSpans(*scalar, *exists));
+}
+
 TEST(EqualIgnoringSpansTest, DetectsEveryDifferenceInNestedBlocks) {
   const std::string_view base =
       "WITH c(x) AS (SELECT a FROM t WHERE a = 1) SELECT * FROM (SELECT b FROM u) AS s(y), c";

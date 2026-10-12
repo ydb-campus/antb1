@@ -1,0 +1,1 @@
+SELECT a FROM t WHERE b IN (SELECT c FROM u WHERE d > 1)

@@ -102,8 +102,9 @@ steps (only step 7 uses more than one thread):
    their own, held in heap boxes, and every such nested query counts against the same depth limit. Syntax outside the
    grammar is a `kUnsupported` error with the span of the offending token. The engine converts a parse error with
    `plan::ToArrowStatus` into an `arrow::Status` that carries a `SqlErrorDetail`.
-4. Bind (`plan::Bind`): what the binder does not answer yet (a lateral reference, more than 256 relations counting
-   every sub-plan, many expressions) is `kUnsupported` before any name resolves, over every block
+4. Bind (`plan::Bind`): what the binder does not answer yet (a subquery in an expression, a lateral reference, more
+   than 256 relations counting every sub-plan, many expressions) is `kUnsupported` before any name resolves, over
+   every block
    the statement reaches — its own, each derived table's, and the body of each CTE something references; then each
    FROM item resolves, in FROM order, one binding per item in the block's scope (`src/plan/scope.h`: its rule-1
    name — its alias, else a CTE's name as written, else a table's name as written, else a path's file name, else

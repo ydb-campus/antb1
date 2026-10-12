@@ -367,6 +367,7 @@ std::string TypeText(const sql::CastExpr& cast) {
 }
 
 [[noreturn]] void UnfoldedCast();
+[[noreturn]] void RejectedSubquery();
 
 // DuckDB's name of an expression of the binder's subset: (a + 1), -(a), sum((a + 1)); conditions
 // as ((a = 1) OR (b != 2) OR (c IN (1, 2))).
@@ -434,6 +435,7 @@ struct ExprNameOf {
     return std::format("main.date_part('{}', {})", ExtractFieldName(e.field), ExprName(*e.source));
   }
   std::string operator()(const sql::CastExpr& /*cast*/) const { UnfoldedCast(); }
+  std::string operator()(const sql::SubqueryExpr& /*s*/) const { RejectedSubquery(); }
 };
 
 std::string ExprName(const sql::Expr& expr) {
@@ -526,6 +528,12 @@ struct ReadsColumnOf {
   bool operator()(const sql::CastExpr& cast) const {
     return ReadsColumn(*cast.operand, aggregates);
   }
+  // A subquery's own block reads its own columns, which are no columns of this one; a correlated
+  // reference would be, and ADR 0023's U-series revisits this when it answers one. Its IN operand
+  // belongs to this block, though.
+  bool operator()(const sql::SubqueryExpr& s) const {
+    return s.operand.has_value() && ReadsColumn(**s.operand, aggregates);
+  }
 };
 
 bool ReadsColumn(const sql::Expr& expr, bool aggregates) {
@@ -585,6 +593,12 @@ struct CollectRefsOf {
   }
   void operator()(const sql::ExtractExpr& e) const { CollectRefs(*e.source, out); }
   void operator()(const sql::CastExpr& cast) const { CollectRefs(*cast.operand, out); }
+  // Only its IN operand: the refs inside its block resolve in that block's own scope.
+  void operator()(const sql::SubqueryExpr& s) const {
+    if (s.operand.has_value()) {
+      CollectRefs(**s.operand, out);
+    }
+  }
 };
 
 void CollectRefs(const sql::Expr& expr, std::vector<const sql::ColumnRef*>& out) {
@@ -797,6 +811,21 @@ struct FirstUnsupportedOf {
                          "CAST to DATE is only supported for a string literal "
                          "('YYYY-MM-DD')"};
   }
+  // Every subquery in an expression, which the grammar parses from roadmap PR S4b on (ADR 0022).
+  // This is the one place the forms are refused, so the condition walk and every binder visitor
+  // can rely on never seeing one: roadmap PR J5 answers IN, NOT IN and a scalar subquery, and
+  // ADR 0023's U-series answers EXISTS. The span is the operator, as a FROM item's connector is.
+  std::optional<Rejection> operator()(const sql::SubqueryExpr& s) const {
+    switch (s.kind) {
+      case sql::SubqueryExpr::Kind::kScalar:
+        return Rejection{.span = s.op_span, .message = "a scalar subquery is not supported"};
+      case sql::SubqueryExpr::Kind::kIn:
+        return Rejection{.span = s.op_span, .message = "IN (subquery) is not supported"};
+      case sql::SubqueryExpr::Kind::kExists:
+        return Rejection{.span = s.op_span, .message = "EXISTS (subqueries) is not supported"};
+    }
+    return Rejection{.span = s.span, .message = "a subquery is not supported"};
+  }
 };
 
 std::optional<Rejection> FirstUnsupported(const sql::Expr& expr) {
@@ -973,6 +1002,11 @@ struct RejectConditionOf {
     return NotACondition(kThisCondition);
   }
   std::optional<Rejection> operator()(const sql::CastExpr& /*cast*/) const {
+    return NotACondition(kThisCondition);
+  }
+  // A subquery is a condition DuckDB answers, so NotACondition's FirstUnsupported gives the
+  // message: the form itself is what is unsupported, not its use as a condition.
+  std::optional<Rejection> operator()(const sql::SubqueryExpr& /*s*/) const {
     return NotACondition(kThisCondition);
   }
 };
@@ -1423,6 +1457,11 @@ struct ContainsAggregateOf {
   }
   bool operator()(const sql::ExtractExpr& e) const { return ContainsAggregate(*e.source); }
   bool operator()(const sql::CastExpr& cast) const { return ContainsAggregate(*cast.operand); }
+  // A subquery starts aggregate-placement contexts of its own (ADR 0022), so an aggregate inside
+  // its block is that block's, never this one's. Its IN operand is this block's.
+  bool operator()(const sql::SubqueryExpr& s) const {
+    return s.operand.has_value() && ContainsAggregate(**s.operand);
+  }
 };
 
 bool ContainsAggregate(const sql::Expr& expr) {
@@ -1946,6 +1985,10 @@ bool IsConstantExpr(const Expr& expr) { return std::holds_alternative<ConstantEx
 //   CheckSupported rejected every other one, except in the arguments of a call with the wrong
 //   number of them, which BindFunction rejects before it binds or names an argument.
 [[noreturn]] void UnfoldedCast() { ANTB1_CHECK(false); }
+// - RejectedSubquery: CheckSupported rejects every subquery in an expression before any name
+//   resolves (FirstUnsupportedOf), so nothing that binds one is ever reached. Roadmap PR J5 and
+//   ADR 0023's U-series replace these with the real binding.
+[[noreturn]] void RejectedSubquery() { ANTB1_CHECK(false); }
 
 // The comparison of a binary comparison operator (any other operator is no condition leaf).
 sql::CompareOp SqlCompareOp(sql::BinaryOp op) {
@@ -2120,6 +2163,7 @@ class Binder {
       return binder.BindExtract(e, [this](const sql::Expr& x) { return binder.BindInput(x); });
     }
     arrow::Result<Typed> operator()(const sql::CastExpr& /*cast*/) const { UnfoldedCast(); }
+    arrow::Result<Typed> operator()(const sql::SubqueryExpr& /*s*/) const { RejectedSubquery(); }
   };
 
   arrow::Result<Typed> BindInput(const sql::Expr& expr) {
@@ -2442,6 +2486,7 @@ class Binder {
       return binder.BindExtract(e, [this](const sql::Expr& x) { return binder.BindOutput(x); });
     }
     arrow::Result<Typed> operator()(const sql::CastExpr& /*cast*/) const { UnfoldedCast(); }
+    arrow::Result<Typed> operator()(const sql::SubqueryExpr& /*s*/) const { RejectedSubquery(); }
   };
 
   // An expression over the aggregation's output: a subexpression equal to a GROUP BY key is that
@@ -3094,6 +3139,7 @@ struct Binder::BindConditionOf {
   arrow::Result<Predicate> operator()(const sql::CaseExpr& /*c*/) const { NotAConditionLeaf(); }
   arrow::Result<Predicate> operator()(const sql::ExtractExpr& /*e*/) const { NotAConditionLeaf(); }
   arrow::Result<Predicate> operator()(const sql::CastExpr& /*cast*/) const { UnfoldedCast(); }
+  arrow::Result<Predicate> operator()(const sql::SubqueryExpr& /*s*/) const { RejectedSubquery(); }
 };
 
 template <class BindFn, class ColumnOf>
@@ -4649,6 +4695,7 @@ std::optional<sql::Literal> DateLiteralOf(const sql::CastExpr& cast) {
 }
 
 void FoldDateCasts(sql::Expr& expr);
+void FoldDateCastsInBlock(sql::SelectStatement& stmt);  // a subquery folds its own block
 
 struct FoldDateCastsOf {
   void operator()(sql::ColumnRef& /*column*/) const {}
@@ -4677,6 +4724,14 @@ struct FoldDateCastsOf {
     FoldDateCasts(*between.operand);
     FoldDateCasts(*between.low);
     FoldDateCasts(*between.high);
+  }
+  // Into its block too, although CheckSupported refuses the form right after: an unfolded cast
+  // inside a block is a programming error for whoever answers it, so J5 inherits none.
+  void operator()(sql::SubqueryExpr& s) const {
+    if (s.operand.has_value()) {
+      FoldDateCasts(**s.operand);
+    }
+    FoldDateCastsInBlock(*s.query);
   }
   void operator()(sql::FunctionCall& call) const {
     for (sql::Expr& arg : call.args) {

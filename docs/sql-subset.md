@@ -46,10 +46,20 @@ SELECT date_trunc('month', tr_day) AS m, MIN(tr_fare) FROM trips GROUP BY 1 ORDE
   `CROSS JOIN`, `[INNER] JOIN ... ON` or `LEFT [OUTER] JOIN ... ON`, with aliases and qualified names, is answered
   as long as a join key connects every relation — so a comma list or a `CROSS JOIN` needs an equality between its
   relations, in the list's `ON` or in `WHERE`, and a `LEFT JOIN` needs one between its own two inputs, in its `ON`.
-  A derived table and a `WITH` list are answered too, each bound as a sub-plan of its own. `TRY_CAST`, a lateral
-  reference, more than 256 relations counting every sub-plan, and a join graph that no join key connects (a cross
-  product) parse ([Grammar](#grammar)) but are not answered: exit code 4 as well. Malformed SQL (a syntax error) and
-  SQL that is wrong for the tables (a bind error) fail with exit code 1.
+  A derived table and a `WITH` list are answered too, each bound as a sub-plan of its own. A subquery in an
+  expression — `(query)` as a value, `[NOT] IN (query)` and `EXISTS (query)` — parses but is not answered, and nor
+  are `TRY_CAST`, a lateral reference, more than 256 relations counting every sub-plan, and a join graph that no
+  join key connects (a cross product): exit code 4 as well. A query in parentheses that starts with neither
+  `SELECT` nor `WITH` is refused at its first token: in an expression `(FROM t)` and `(TABLE t)` are, since those
+  words are reserved, while `(VALUES (1))` and `(PIVOT ...)` are not — `VALUES` and the `PIVOT`, `SHOW`,
+  `SUMMARIZE` and `DESCRIBE` family are names there (divergence D21), so `VALUES(1)` is a call and
+  `-UNPIVOT(a)` keeps its canonical form. In `FROM`, where none of them is a name, every one of them is refused
+  ([ADR 0025](adr/0025-values-table-constructor.md) postpones the constructor itself). A `(` opens a nested
+  query only when a reserved query word follows it, so `((a + 1))` is an expression in two pairs of parentheses and the
+  inner pair of `((SELECT ...))` is the subquery; `[NOT] IN ((query))` is therefore an `IN` list holding one scalar
+  subquery, where DuckDB reads an `IN` subquery — both exit code 4 today, and the roadmap PR that answers either form
+  has to decide which DuckDB means. Malformed SQL (a syntax error) and SQL that is wrong for the tables (a bind error)
+  fail with exit code 1.
 
 ```bash
 pixi run antb1 query -f query.sql --table hits=/data/clickbench/hits_0.parquet --clickbench
@@ -90,12 +100,14 @@ expr        = expr , "OR" , expr | expr , "AND" , expr | "NOT" , expr | conditio
 condition   = sum , cmp_op , sum
             | sum , [ "NOT" ] , "LIKE" , sum
             | sum , [ "NOT" ] , "IN" , "(" , expr , { "," , expr } , ")"
+            | sum , [ "NOT" ] , "IN" , "(" , query , ")"
+            | "EXISTS" , "(" , query , ")"
             | sum , [ "NOT" ] , "BETWEEN" , sum , "AND" , sum ;
 sum         = sum , ( "+" | "-" ) , product | product ;
 product     = product , ( "*" | "/" | "//" | "%" ) , unary | unary ;
 unary       = "-" , unary | postfix ;
 postfix     = primary , { "::" , type } ;
-primary     = column_ref | literal | "(" , expr , ")" | agg_call
+primary     = column_ref | literal | "(" , expr , ")" | "(" , query , ")" | agg_call
             | identifier , "(" , [ expr , { "," , expr } ] , ")"
             | "CASE" , [ expr ] , "WHEN" , expr , "THEN" , expr , { "WHEN" , expr , "THEN" , expr } ,
               [ "ELSE" , expr ] , "END"
@@ -254,7 +266,7 @@ the empty grouping set `GROUP BY ()` and `ORDER BY ALL` are rejected by the pars
 `MAX` with `DISTINCT`, and a string or quoted field name in `EXTRACT` (`EXTRACT('year' FROM d)`), which DuckDB accepts.
 
 Outside the grammar, the parser recognizes common SQL and rejects it with exit code 4 and a source span, among others:
-`SELECT DISTINCT`, subqueries in expressions, `ILIKE`, `GLOB`, `LIKE ... ESCAPE`, `NULL` literals, `IS [NOT] NULL`,
+`SELECT DISTINCT`, `ILIKE`, `GLOB`, `LIKE ... ESCAPE`, `NULL` literals, `IS [NOT] NULL`,
 `AT TIME ZONE`, `||`, window functions, unary `+`, and in casts quoted or qualified type names, type names of several
 words (`DOUBLE PRECISION`, `TIMESTAMP WITH TIME ZONE`), array types, `INTERVAL` and `UNION` types and type parameters
 other than integers. After `LIMIT` and `OFFSET`: expressions such as `LIMIT 1 + 1`, `LIMIT '5'` and `LIMIT (5)`, calls and
@@ -879,7 +891,7 @@ formatter:
 | 1 | query error: syntax, bind, execution or memory error | `SELECT COUNT(*) FORM t`; `FROM t semi` (a word that is never a table alias); an unknown table or column; `SUM` of a VARCHAR column; a `SUM`, or arithmetic on a `SUM`, outside HUGEINT's range; an invalid `regexp_replace` pattern; a query that needs more memory than `--memory-limit` |
 | 2 | usage error | unknown option; neither or both of `-c` and `-f`; a malformed `--table`, `--column-type` or `--memory-limit`; a column that `--column-type` cannot read as DATE; a table name registered twice |
 | 3 | I/O error | a missing or unreadable file; not a Parquet file; schemas that differ; a glob that matches nothing |
-| 4 | unsupported: valid-looking SQL outside the supported subset | `row_number() OVER ()`; `IS NULL`; an unknown function; `SELECT 1e3`; `SUM(DISTINCT ...)`; `CAST(a AS BIGINT)`; a string literal as a DECIMAL `CASE` value; a column of an unsupported type; `FROM a LEFT JOIN b ON a.k > b.k` (no equality key); `FROM t semi JOIN u ON ...`; `FROM a, b` with no join key between them (a cross product); more than 256 relations |
+| 4 | unsupported: valid-looking SQL outside the supported subset | `row_number() OVER ()`; `IS NULL`; an unknown function; `SELECT 1e3`; `SUM(DISTINCT ...)`; `CAST(a AS BIGINT)`; a string literal as a DECIMAL `CASE` value; a column of an unsupported type; `FROM a LEFT JOIN b ON a.k > b.k` (no equality key); `FROM t semi JOIN u ON ...`; `a IN (SELECT ...)`, `EXISTS (SELECT ...)` and `(SELECT ...)` as a value; `FROM a, b` with no join key between them (a cross product); more than 256 relations |
 | 70 | internal error: anything else, which is a bug | an uncaught exception; an Arrow `NotImplemented` or type error without SQL context |
 
 Exit code 4 is used only for errors that the parser, the binder or the physical planner marks as unsupported

@@ -86,16 +86,18 @@ struct Counts {
 
 std::size_t Separators(std::size_t n) { return n == 0 ? 0U : n - 1; }
 
-void Count(const Expr& expr, Counts& c);
+void Count(const Expr& expr, const std::string& sql, Counts& c);
+void CountStatement(const SelectStatement& stmt, const std::string& sql, Counts& want);
 
-void CountAll(const std::vector<Expr>& exprs, Counts& c) {
+void CountAll(const std::vector<Expr>& exprs, const std::string& sql, Counts& c) {
   c.commas += Separators(exprs.size());
   for (const Expr& e : exprs) {
-    Count(e, c);
+    Count(e, sql, c);
   }
 }
 
 struct CountOf {
+  const std::string& sql;
   Counts& c;
   void operator()(const ColumnRef& column) const { c.dots += column.qualifier.empty() ? 0U : 1U; }
   void operator()(const Literal& lit) const {
@@ -107,12 +109,12 @@ struct CountOf {
     ++c.parens;
     c.stars += agg.kind == AggKind::kCountStar ? 1U : 0U;
     if (agg.arg.has_value()) {
-      Count(**agg.arg, c);
+      Count(**agg.arg, sql, c);
     }
   }
   void operator()(const UnaryExpr& unary) const {
     c.minuses += unary.op == UnaryOp::kNegate ? 1U : 0U;
-    Count(*unary.operand, c);
+    Count(*unary.operand, sql, c);
   }
   void operator()(const BinaryExpr& binary) const {
     switch (binary.op) {
@@ -144,44 +146,44 @@ struct CountOf {
         ++c.comparisons;
         break;
     }
-    Count(*binary.left, c);
-    Count(*binary.right, c);
+    Count(*binary.left, sql, c);
+    Count(*binary.right, sql, c);
   }
   void operator()(const LikeExpr& like) const {
-    Count(*like.operand, c);
-    Count(*like.pattern, c);
+    Count(*like.operand, sql, c);
+    Count(*like.pattern, sql, c);
   }
   void operator()(const InExpr& in) const {
     ++c.parens;
-    Count(*in.operand, c);
-    CountAll(in.list, c);
+    Count(*in.operand, sql, c);
+    CountAll(in.list, sql, c);
   }
   // BETWEEN's own AND is an AND token.
   void operator()(const BetweenExpr& between) const {
     ++c.and_count;
-    Count(*between.operand, c);
-    Count(*between.low, c);
-    Count(*between.high, c);
+    Count(*between.operand, sql, c);
+    Count(*between.low, sql, c);
+    Count(*between.high, sql, c);
   }
   void operator()(const FunctionCall& call) const {
     ++c.parens;
-    CountAll(call.args, c);
+    CountAll(call.args, sql, c);
   }
   void operator()(const CaseExpr& e) const {
     if (e.operand.has_value()) {
-      Count(**e.operand, c);
+      Count(**e.operand, sql, c);
     }
     for (const CaseBranch& branch : e.branches) {
-      Count(*branch.when, c);
-      Count(*branch.then, c);
+      Count(*branch.when, sql, c);
+      Count(*branch.then, sql, c);
     }
     if (e.otherwise.has_value()) {
-      Count(**e.otherwise, c);
+      Count(**e.otherwise, sql, c);
     }
   }
   void operator()(const ExtractExpr& e) const {
     ++c.parens;
-    Count(*e.source, c);
+    Count(*e.source, sql, c);
   }
   // The parentheses of CAST( are not counted: x::T has none. The type's parameters have theirs.
   void operator()(const CastExpr& cast) const {
@@ -189,12 +191,20 @@ struct CountOf {
     c.numbers += cast.type_params.size();
     c.commas += Separators(cast.type_params.size());
     c.parens += cast.type_params.empty() ? 0U : 1U;
-    Count(*cast.operand, c);
+    Count(*cast.operand, sql, c);
+  }
+  // The parentheses of its nested query, its own [NOT] IN or EXISTS, and the query's own tokens.
+  void operator()(const SubqueryExpr& s) const {
+    ++c.parens;
+    if (s.operand.has_value()) {
+      Count(**s.operand, sql, c);
+    }
+    CountStatement(*s.query, sql, c);
   }
 };
 
-void Count(const Expr& expr, Counts& c) {
-  std::visit(CountOf{.c = c}, static_cast<const ExprNode&>(expr));
+void Count(const Expr& expr, const std::string& sql, Counts& c) {
+  std::visit(CountOf{.sql = sql, .c = c}, static_cast<const ExprNode&>(expr));
 }
 
 // What a query explains of its tokens, the queries nested in it included: the parentheses of a
@@ -212,7 +222,7 @@ void CountStatement(const SelectStatement& stmt, const std::string& sql, Counts&
     CountStatement(*cte.query, sql, want);
   }
   for (const SelectItem& item : stmt.items) {
-    Count(item.expr, want);
+    Count(item.expr, sql, want);
   }
   for (const FromItem& item : stmt.from) {
     if (const TableRef* table = item.table()) {
@@ -230,18 +240,18 @@ void CountStatement(const SelectStatement& stmt, const std::string& sql, Counts&
     want.commas += item.connector == Connector::kComma ? 1U : 0U;
     want.and_count += Separators(item.on.size());
     for (const Expr& e : item.on) {
-      Count(e, want);
+      Count(e, sql, want);
     }
   }
   for (const Expr& e : stmt.where) {
-    Count(e, want);
+    Count(e, sql, want);
   }
-  CountAll(stmt.group_by, want);
+  CountAll(stmt.group_by, sql, want);
   for (const Expr& e : stmt.having) {
-    Count(e, want);
+    Count(e, sql, want);
   }
   for (const OrderItem& item : stmt.order_by) {
-    Count(item.expr, want);
+    Count(item.expr, sql, want);
   }
 }
 
@@ -874,6 +884,13 @@ constexpr auto kCorpus = std::to_array<std::string_view>({
     "WITH c(x) AS (SELECT a FROM t WHERE a > 1), d AS (SELECT * FROM c) SELECT x FROM d LIMIT 3",
     "SELECT s.a, COUNT(*) FROM (SELECT a, b FROM 'p.parquet' WHERE b <> 'x') AS s(a) JOIN u ON "
     "s.a = u.a GROUP BY s.a",
+    // Subqueries in expressions (ADR 0022's S4b): the three forms, the parenthesized operand
+    // position a comparison has to put back, and a nested query with a WITH list of its own.
+    "SELECT (SELECT MAX(b) FROM u) FROM t WHERE a IN (SELECT b FROM v) AND c < (SELECT MIN(d) "
+    "FROM w)",
+    "SELECT a FROM t WHERE b NOT IN (WITH w AS (SELECT c FROM u) SELECT c FROM w) AND NOT EXISTS "
+    "(SELECT 1 FROM v WHERE v.a = 1)",
+    "SELECT 1 FROM t WHERE (a IN (SELECT b FROM u)) = c AND (a NOT IN (SELECT b FROM u)) LIKE 'x'",
     "select * from (with w as (select 1 from t) select * from w) q, (select * from (select b from "
     "u) r) z",
 });
