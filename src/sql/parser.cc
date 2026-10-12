@@ -1410,6 +1410,12 @@ class Parser {
       sub->span = Cover(exists, sub->span);
       return Expr(*std::move(sub));
     }
+    // EXISTS over something else in parentheses, which only extra ones around the query make
+    // reachable (`EXISTS ((SELECT ...))`, which DuckDB answers): still the EXISTS form and still
+    // kUnsupported, never a syntax error, since EXISTS is no longer a rejected operand keyword.
+    if (keyword == "EXISTS" && PeekAt(1).kind == TokenKind::kLeftParen) {
+      return Unsupported(token.span, "EXISTS (subqueries) is not supported");
+    }
     if (auto construct = Find(kUnsupportedOperandKeywords, keyword); construct.has_value()) {
       return Unsupported(token.span, *construct);
     }

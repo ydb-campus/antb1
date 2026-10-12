@@ -884,6 +884,13 @@ constexpr auto kCorpus = std::to_array<std::string_view>({
     "WITH c(x) AS (SELECT a FROM t WHERE a > 1), d AS (SELECT * FROM c) SELECT x FROM d LIMIT 3",
     "SELECT s.a, COUNT(*) FROM (SELECT a, b FROM 'p.parquet' WHERE b <> 'x') AS s(a) JOIN u ON "
     "s.a = u.a GROUP BY s.a",
+    // Subqueries in expressions (ADR 0022's S4b): the three forms, the parenthesized operand
+    // position a comparison has to put back, and a nested query with a WITH list of its own.
+    "SELECT (SELECT MAX(b) FROM u) FROM t WHERE a IN (SELECT b FROM v) AND c < (SELECT MIN(d) "
+    "FROM w)",
+    "SELECT a FROM t WHERE b NOT IN (WITH w AS (SELECT c FROM u) SELECT c FROM w) AND NOT EXISTS "
+    "(SELECT 1 FROM v WHERE v.a = 1)",
+    "SELECT 1 FROM t WHERE (a IN (SELECT b FROM u)) = c AND (a NOT IN (SELECT b FROM u)) LIKE 'x'",
     "select * from (with w as (select 1 from t) select * from w) q, (select * from (select b from "
     "u) r) z",
 });

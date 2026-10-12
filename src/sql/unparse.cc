@@ -94,6 +94,12 @@ int Precedence(const Expr& expr) {
       std::holds_alternative<BetweenExpr>(expr)) {
     return kComparison;
   }
+  // `operand IN (query)` binds like the IN list it spells, so a comparison around it needs its
+  // parentheses back. A scalar subquery and EXISTS are primaries: `(query)` and `EXISTS (query)`
+  // need none and must not get them, or the text would read as a parenthesized query.
+  if (const auto* sub = std::get_if<SubqueryExpr>(&expr)) {
+    return sub->kind == SubqueryExpr::Kind::kIn ? kComparison : kPrimary;
+  }
   return kPrimary;
 }
 

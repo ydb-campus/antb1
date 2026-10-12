@@ -627,6 +627,32 @@ TEST(ParserTest, SubqueriesInExpressions) {
   EXPECT_TRUE(EqualIgnoringSpans(*stmt, *again)) << ToSql(*stmt);
 }
 
+// `operand IN (query)` binds like the IN list it spells, so a comparison, LIKE, IN or BETWEEN
+// around it needs its parentheses back in the canonical form -- without them the text reads as a
+// chained comparison and does not parse. A scalar subquery and EXISTS are primaries and must stay
+// unparenthesized.
+TEST(ParserTest, SubqueriesKeepTheParenthesesTheirPrecedenceNeeds) {
+  for (const std::string_view sql : {
+           "SELECT 1 FROM t WHERE (a IN (SELECT b FROM u)) = c"sv,
+           "SELECT 1 FROM t WHERE (a NOT IN (SELECT b FROM u)) = c"sv,
+           "SELECT a FROM t WHERE (a IN (SELECT b FROM u)) LIKE 'x'"sv,
+           "SELECT a FROM t WHERE (a IN (SELECT b FROM u)) IN (1, 2)"sv,
+           "SELECT 1 FROM t WHERE (a IN (SELECT b FROM u)) BETWEEN d AND e"sv,
+           "SELECT a FROM t WHERE NOT (a IN (SELECT b FROM u))"sv,
+           // The primaries, which must not gain parentheses they do not need.
+           "SELECT 1 FROM t WHERE (EXISTS (SELECT b FROM u)) = c"sv,
+           "SELECT 1 FROM t WHERE ((SELECT b FROM u)) = c"sv,
+       }) {
+    auto stmt = Parse(sql);
+    ASSERT_TRUE(stmt.has_value()) << sql << ": " << stmt.error().message;
+    const std::string canonical = ToSql(*stmt);
+    auto again = Parse(canonical);
+    ASSERT_TRUE(again.has_value()) << canonical << ": " << again.error().message;
+    EXPECT_TRUE(EqualIgnoringSpans(*stmt, *again)) << sql << " -> " << canonical;
+    EXPECT_EQ(ToSql(*again), canonical) << sql;  // idempotent, as unparse.h promises
+  }
+}
+
 // A '(' in an expression opens a nested query only for a query's own first words: two pairs of
 // parentheses are still an expression in two pairs, and the inner pair of ((SELECT ...)) is the
 // subquery. A query in parentheses that starts with neither SELECT nor WITH is refused at its
@@ -651,6 +677,19 @@ TEST(ParserTest, ParenthesesOpenANestedQueryOnlyForAQuery) {
       {"SELECT a FROM t WHERE b IN (TABLE u)", "TABLE is not supported"},
       {"SELECT a FROM t WHERE b IN (PIVOT u ON c)", "PIVOT is not supported"},
   };
+  // EXISTS is the one form whose own branch cannot reach a query behind extra parentheses, so it
+  // keeps a rejection of its own: kUnsupported, as before this grammar landed, never a syntax
+  // error. DuckDB answers all three of these.
+  for (const std::string_view sql : {"SELECT a FROM t WHERE EXISTS ((SELECT c FROM u))"sv,
+                                     "SELECT a FROM t WHERE NOT EXISTS ((SELECT c FROM u))"sv,
+                                     "SELECT a FROM t WHERE EXISTS (((SELECT c FROM u)))"sv}) {
+    auto rejected = Parse(sql);
+    ASSERT_FALSE(rejected.has_value()) << sql;
+    EXPECT_EQ(rejected.error().kind, ParseError::Kind::kUnsupported) << sql;
+    EXPECT_EQ(rejected.error().message.find("EXISTS (subqueries) is not supported"), 0U)
+        << sql << ": " << rejected.error().message;
+  }
+
   for (const auto& [sql, message] : others) {
     auto rejected = Parse(sql);
     ASSERT_FALSE(rejected.has_value()) << sql;
