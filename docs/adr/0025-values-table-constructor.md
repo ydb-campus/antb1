@@ -27,12 +27,17 @@ grammar keeps rejecting it with exit code 4)
   parenthesised queries DuckDB takes that start with no `SELECT` or `WITH`, and docs/sql-subset.md
   records `(VALUES (1))` as exit code 4. The guard on the following `(` is needed because `values`
   is otherwise a name: `FROM (values JOIN u ON ...)` is a join of a table called `values`.
-- **What is wrong today, and is fixed without this ADR.** In *expression* position nothing reached
-  that check, so `x IN (VALUES (1), (2))` fell through to the function-call parser and reported
-  `function VALUES() is not supported` — the right exit code with a misleading message. Roadmap PR
-  S4b routes the two `(` sites it adds through `StartsOtherQuery`, so every parenthesised query that
-  starts with neither `SELECT` nor `WITH` refuses the same way in every position. That is a message
-  change only; this ADR is about answering the form.
+- **What is wrong today, and stays wrong.** In *expression* position nothing reaches that check, so
+  `x IN (VALUES (1), (2))` falls through to the function-call parser and reports
+  `function VALUES() is not supported` — the right exit code with a misleading message.
+  - Update (2026-10-12, roadmap PR S4b): this paragraph first said S4b would fix the message by
+    routing its two new `(` sites through `StartsOtherQuery`. It cannot, and S4b does not. `VALUES`
+    is a *name* in an expression (divergence D21), so `VALUES(1)` is a call there; the unparser
+    always parenthesises a negation, so claiming the word would print `-VALUES(a)` as
+    `-(VALUES(a))` and read it back as a query, which costs the canonical form its round trip. Only
+    a reserved word opens a nested query in an expression — `SELECT`, `WITH`, `FROM`, `TABLE` — and
+    the misleading message stays until the form is answered. In `FROM`, where `VALUES` is no name,
+    it is still refused as a query.
 - **Nothing depends on it.** No ClickBench query and none of the 22 queries derived from TPC-H uses
   `VALUES`. There is no `Feature` for it in `tests/slt/supported_features.h`, so it has no
   `kGeneratorPending` entry and no two-sided gate: shipping it without an id would be the one kind of

@@ -54,12 +54,12 @@ SELECT date_trunc('month', tr_day) AS m, MIN(tr_fare) FROM trips GROUP BY 1 ORDE
   words are reserved, while `(VALUES (1))` and `(PIVOT ...)` are not — `VALUES` and the `PIVOT`, `SHOW`,
   `SUMMARIZE` and `DESCRIBE` family are names there (divergence D21), so `VALUES(1)` is a call and
   `-UNPIVOT(a)` keeps its canonical form. In `FROM`, where none of them is a name, every one of them is refused
-  (ADR 0025 postpones the `VALUES` table constructor). A `(` opens a nested query only when a reserved query word
-  follows it, so `((a + 1))` is an expression in two pairs of parentheses and the inner pair of `((SELECT ...))`
-  is the subquery; `[NOT] IN ((query))` is therefore an `IN` list holding one scalar subquery, where DuckDB reads
-  an `IN` subquery — both exit code 4 today, and the roadmap PR that answers either form has to decide which
-  DuckDB means. Malformed SQL (a syntax error) and
-  SQL that is wrong for the tables (a bind error) fail with exit code 1.
+  ([ADR 0025](adr/0025-values-table-constructor.md) postpones the constructor itself). A `(` opens a nested
+  query only when a reserved query word follows it, so `((a + 1))` is an expression in two pairs of parentheses and the
+  inner pair of `((SELECT ...))` is the subquery; `[NOT] IN ((query))` is therefore an `IN` list holding one scalar
+  subquery, where DuckDB reads an `IN` subquery — both exit code 4 today, and the roadmap PR that answers either form
+  has to decide which DuckDB means. Malformed SQL (a syntax error) and SQL that is wrong for the tables (a bind error)
+  fail with exit code 1.
 
 ```bash
 pixi run antb1 query -f query.sql --table hits=/data/clickbench/hits_0.parquet --clickbench
