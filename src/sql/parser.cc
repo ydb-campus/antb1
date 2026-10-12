@@ -2176,14 +2176,23 @@ class Parser {
   }
 
   // Whether the token at `ahead` is a '(' that opens a nested query rather than a parenthesized
-  // expression: whatever DuckDB parses as a query there, which ParseNestedQuery then answers for
-  // SELECT and WITH and refuses at its first token otherwise -- so an expression refuses
-  // `(VALUES ...)`, `(FROM t)` and `(PIVOT ...)` exactly as a FROM item does (ADR 0025). Unlike
-  // FROM, a '(' right after it is no nested query here: `((a + 1))` is an expression in two pairs
-  // of parentheses, and `((SELECT ...))` is the inner pair's subquery.
+  // expression: only a *reserved* word can, which leaves SELECT, WITH, FROM and TABLE.
+  //
+  // The other words that start a query in parentheses in FROM -- VALUES and the PIVOT, SHOW,
+  // SUMMARIZE and DESCRIBE family -- are names anywhere else (divergence D21), so an expression
+  // may call them. Claiming them here would cost the canonical form its round trip, which has no
+  // parentheses to spare: the unparser always parenthesizes a negation, so `-UNPIVOT(a)` prints as
+  // `-(UNPIVOT(a))`, and reading that back as a nested query is a different statement.
+  //
+  // Unlike in FROM, a '(' right after it is no nested query either: `((a + 1))` is an expression in
+  // two pairs of parentheses, and `((SELECT ...))` is the inner pair's subquery.
   bool OpensNestedQuery(std::size_t ahead) {
-    return PeekAt(ahead).kind == TokenKind::kLeftParen &&
-           (Contains(kSubqueryStarts, KeywordOf(PeekAt(ahead + 1))) || StartsOtherQuery(ahead + 1));
+    if (PeekAt(ahead).kind != TokenKind::kLeftParen) {
+      return false;
+    }
+    const std::string keyword = KeywordOf(PeekAt(ahead + 1));
+    return IsReservedWordOf(keyword) &&
+           (Contains(kSubqueryStarts, keyword) || keyword == "FROM" || keyword == "TABLE");
   }
 
   // A nested query in an expression, positioned at its '(': the node every subquery form holds.

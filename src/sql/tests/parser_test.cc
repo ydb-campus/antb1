@@ -670,14 +670,10 @@ TEST(ParserTest, ParenthesesOpenANestedQueryOnlyForAQuery) {
   const auto& compare = std::get<BinaryExpr>(nested->where[0]);
   EXPECT_EQ(std::get<SubqueryExpr>(*compare.right).kind, SubqueryExpr::Kind::kScalar);
 
-  // Each is kUnsupported with its own form named, never a syntax error, and the message is the one
-  // the same query in parentheses gives in FROM.
+  // A reserved query word after the '(' is a nested query, refused as it is in FROM.
   const std::vector<std::pair<std::string_view, std::string_view>> others = {
-      {"SELECT a FROM t WHERE b IN (VALUES (1))", "VALUES is not supported"},
-      {"SELECT a FROM t WHERE b < (VALUES (1))", "VALUES is not supported"},
       {"SELECT a FROM t WHERE b IN (FROM u)", "FROM-first queries are not supported"},
       {"SELECT a FROM t WHERE b IN (TABLE u)", "TABLE is not supported"},
-      {"SELECT a FROM t WHERE b IN (PIVOT u ON c)", "PIVOT is not supported"},
   };
   // EXISTS is the one form whose own branch cannot reach a query behind extra parentheses, so it
   // keeps a rejection of its own: kUnsupported, as before this grammar landed, never a syntax
@@ -698,6 +694,21 @@ TEST(ParserTest, ParenthesesOpenANestedQueryOnlyForAQuery) {
     EXPECT_EQ(rejected.error().kind, ParseError::Kind::kUnsupported) << sql;
     EXPECT_EQ(rejected.error().message.find(message), 0U)
         << sql << ": " << rejected.error().message;
+  }
+
+  // A query word that is *not* reserved is a name in an expression (divergence D21), so the '('
+  // before it opens no nested query: `UNPIVOT(a)` is a call, and the canonical form of its
+  // negation, `-(UNPIVOT(a))`, therefore reads back as the same statement. Claiming these words
+  // here would lose that round trip, which is why only reserved ones are claimed.
+  for (const std::string_view word : {"VALUES"sv, "PIVOT"sv, "PIVOT_WIDER"sv, "PIVOT_LONGER"sv,
+                                      "UNPIVOT"sv, "SHOW"sv, "SUMMARIZE"sv, "DESCRIBE"sv}) {
+    const std::string sql = std::format("SELECT -{}(a) FROM t", word);
+    auto stmt = Parse(sql);
+    ASSERT_TRUE(stmt.has_value()) << sql << ": " << stmt.error().message;
+    const std::string canonical = ToSql(*stmt);
+    auto again = Parse(canonical);
+    ASSERT_TRUE(again.has_value()) << canonical << ": " << again.error().message;
+    EXPECT_TRUE(EqualIgnoringSpans(*stmt, *again)) << sql << " -> " << canonical;
   }
 }
 

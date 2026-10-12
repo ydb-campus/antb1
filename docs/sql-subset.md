@@ -50,12 +50,15 @@ SELECT date_trunc('month', tr_day) AS m, MIN(tr_fare) FROM trips GROUP BY 1 ORDE
   expression — `(query)` as a value, `[NOT] IN (query)` and `EXISTS (query)` — parses but is not answered, and nor
   are `TRY_CAST`, a lateral reference, more than 256 relations counting every sub-plan, and a join graph that no
   join key connects (a cross product): exit code 4 as well. A query in parentheses that starts with neither
-  `SELECT` nor `WITH` (`(VALUES (1))`, `(FROM t)`, `(TABLE t)`, `(PIVOT ...)`) is refused at its first token,
-  wherever it is written (ADR 0025 postpones the `VALUES` table constructor). A `(` opens a nested query only
-  when a query's own first word follows it, so `((a + 1))` is an expression in two pairs of parentheses and the
-  inner pair of `((SELECT ...))` is the subquery; `[NOT] IN ((query))` is therefore an `IN` list holding one
-  scalar subquery, where DuckDB reads an `IN` subquery — both exit code 4 today, and the roadmap PR that answers
-  either form has to decide which DuckDB means. Malformed SQL (a syntax error) and
+  `SELECT` nor `WITH` is refused at its first token: in an expression `(FROM t)` and `(TABLE t)` are, since those
+  words are reserved, while `(VALUES (1))` and `(PIVOT ...)` are not — `VALUES` and the `PIVOT`, `SHOW`,
+  `SUMMARIZE` and `DESCRIBE` family are names there (divergence D21), so `VALUES(1)` is a call and
+  `-UNPIVOT(a)` keeps its canonical form. In `FROM`, where none of them is a name, every one of them is refused
+  (ADR 0025 postpones the `VALUES` table constructor). A `(` opens a nested query only when a reserved query word
+  follows it, so `((a + 1))` is an expression in two pairs of parentheses and the inner pair of `((SELECT ...))`
+  is the subquery; `[NOT] IN ((query))` is therefore an `IN` list holding one scalar subquery, where DuckDB reads
+  an `IN` subquery — both exit code 4 today, and the roadmap PR that answers either form has to decide which
+  DuckDB means. Malformed SQL (a syntax error) and
   SQL that is wrong for the tables (a bind error) fail with exit code 1.
 
 ```bash
