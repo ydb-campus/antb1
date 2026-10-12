@@ -4821,16 +4821,25 @@ arrow::Status CheckFromList(const std::vector<sql::FromItem>& from) {
 // the connectivity check cannot, since it needs the ids of the bound conjuncts (Binder::BindWhere).
 // Every relation the statement expands to, sub-plans included, before anything else is checked:
 // every walk of a plan recurses per node, so the limit comes first, like the parser's depth limit
-// (ADR 0022). A derived table or a CTE reference counts 1 plus its body, so a chain of CTEs that
-// each join the previous one with itself is rejected before any sub-plan is bound.
+// (ADR 0022). A derived table, a CTE reference or a subquery expression counts 1 plus its body, so
+// a chain of CTEs that each join the previous one with itself is rejected before any sub-plan is
+// bound, whether the chain is referenced from a FROM list or from a subquery in an expression.
 arrow::Status CheckRelationLimit(const sql::SelectStatement& stmt) {
   const std::optional<RelationOverflow> over = RelationsExceedLimit(stmt);
   if (!over.has_value()) {
     return arrow::Status::OK();
   }
-  const sql::FromItem& item = stmt.from[over->item];
+  // A FROM item of the outermost block reports at its connector, or at the item itself when it is
+  // the first; one of that block's subqueries has no item of its own and carries its span.
+  const SourceSpan span = [&] {
+    if (over->span.has_value()) {
+      return *over->span;
+    }
+    const sql::FromItem& item = stmt.from[over->item];
+    return item.connector == sql::Connector::kFirst ? item.span : item.connector_span;
+  }();
   return Reject(Rejection{
-      .span = item.connector == sql::Connector::kFirst ? item.span : item.connector_span,
+      .span = span,
       .message = std::format("a query of more than {} relations is not supported", kMaxRelations)});
 }
 

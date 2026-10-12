@@ -45,6 +45,96 @@ struct CteFrame {
   }
 };
 
+// Every subquery expression `expr` holds, in the order it is written, passed to `fn`; not those of
+// a nested query, which is a block of its own that the caller walks in the frame it binds in. A
+// subquery inside another one's IN operand belongs to this expression, so the walk descends there.
+template <class Fn>
+void EachSubqueryOf(const sql::Expr& expr, Fn& fn);
+
+template <class Fn>
+struct SubqueryWalk {
+  Fn& fn;  // NOLINT(misc-non-private-member-variables-in-classes): a visitor, not a class
+
+  void Of(const sql::Expr& e) const { EachSubqueryOf(e, fn); }
+  void Of(const std::optional<sql::Box<sql::Expr>>& e) const {
+    if (e.has_value()) {
+      EachSubqueryOf(**e, fn);
+    }
+  }
+
+  void operator()(const sql::ColumnRef& /*c*/) const {}
+  void operator()(const sql::Literal& /*l*/) const {}
+  void operator()(const sql::AggregateCall& a) const { Of(a.arg); }
+  void operator()(const sql::UnaryExpr& u) const { Of(*u.operand); }
+  void operator()(const sql::BinaryExpr& b) const {
+    Of(*b.left);
+    Of(*b.right);
+  }
+  void operator()(const sql::LikeExpr& l) const {
+    Of(*l.operand);
+    Of(*l.pattern);
+  }
+  void operator()(const sql::InExpr& in) const {
+    Of(*in.operand);
+    for (const sql::Expr& value : in.list) {
+      Of(value);
+    }
+  }
+  void operator()(const sql::BetweenExpr& b) const {
+    Of(*b.operand);
+    Of(*b.low);
+    Of(*b.high);
+  }
+  void operator()(const sql::FunctionCall& f) const {
+    for (const sql::Expr& arg : f.args) {
+      Of(arg);
+    }
+  }
+  void operator()(const sql::CaseExpr& c) const {
+    Of(c.operand);
+    for (const sql::CaseBranch& branch : c.branches) {
+      Of(*branch.when);
+      Of(*branch.then);
+    }
+    Of(c.otherwise);
+  }
+  void operator()(const sql::ExtractExpr& e) const { Of(*e.source); }
+  void operator()(const sql::CastExpr& c) const { Of(*c.operand); }
+  // The IN operand first: its text precedes the operator this node is reported at.
+  void operator()(const sql::SubqueryExpr& s) const {
+    Of(s.operand);
+    fn(s);
+  }
+};
+
+template <class Fn>
+void EachSubqueryOf(const sql::Expr& expr, Fn& fn) {
+  std::visit(SubqueryWalk<Fn>{.fn = fn}, static_cast<const sql::ExprNode&>(expr));
+}
+
+// Every subquery expression of `block`'s own expressions, in query order: the select items, each
+// FROM item's ON, WHERE, GROUP BY, HAVING, ORDER BY -- the order plan::CheckBlock reports in. Not
+// the WITH list's bodies: a CTE is reached through the references to it, or not at all.
+template <class Fn>
+void EachSubqueryIn(const sql::SelectStatement& block, Fn fn) {
+  for (const sql::SelectItem& item : block.items) {
+    EachSubqueryOf(item.expr, fn);
+  }
+  for (const sql::FromItem& item : block.from) {
+    for (const sql::Expr& on : item.on) {
+      EachSubqueryOf(on, fn);
+    }
+  }
+  for (const std::vector<sql::Expr>* list : {&block.where, &block.group_by, &block.having}) {
+    for (const sql::Expr& e : *list) {
+      EachSubqueryOf(e, fn);
+    }
+  }
+  for (const sql::OrderItem& item : block.order_by) {
+    EachSubqueryOf(item.expr, fn);
+  }
+}
+
 class Counter {
  public:
   // The relations `block` expands to, saturated; `outer` is the frame around it.
@@ -57,11 +147,15 @@ class Counter {
         return kSaturated;
       }
     }
+    EachSubqueryIn(block, [&](const sql::SubqueryExpr& s) {
+      total = AddSaturating(total, Subquery(s, frame));
+    });
     return total;
   }
 
   // The outermost block: the first FROM item whose expansion carries the running total past the
-  // limit, so a flat FROM list reports at its 257th item exactly as it did before sub-plans.
+  // limit, so a flat FROM list reports at its 257th item exactly as it did before sub-plans, then
+  // its own subqueries, which have no FROM item to report at and carry a span instead.
   std::optional<RelationOverflow> Top(const sql::SelectStatement& block) {
     const CteFrame& frame = MakeFrame(block, nullptr);
     std::size_t total = 0;
@@ -71,7 +165,17 @@ class Counter {
         return RelationOverflow{.item = i};
       }
     }
-    return std::nullopt;
+    std::optional<RelationOverflow> over;
+    EachSubqueryIn(block, [&](const sql::SubqueryExpr& s) {
+      if (over.has_value()) {
+        return;  // the first one past the limit is the one reported
+      }
+      total = AddSaturating(total, Subquery(s, frame));
+      if (total > kMaxRelations) {
+        over = RelationOverflow{.span = s.op_span};
+      }
+    });
+    return over;
   }
 
  private:
@@ -102,6 +206,12 @@ class Counter {
     // literal names a CTE before it names a path.
     const sql::CommonTableExpr* cte = frame.Find(AsciiLower(ref->name));
     return cte == nullptr ? 1 : AddSaturating(1, Body(*cte));
+  }
+
+  // One subquery expression: 1 plus its query, as a derived table counts, since the roadmap binds
+  // it as a join input of its own. Its query sees the CTEs of the block that holds it.
+  std::size_t Subquery(const sql::SubqueryExpr& s, const CteFrame& frame) {
+    return AddSaturating(1, Count(*s.query, &frame));
   }
 
   // A CTE's body, counted once however often it is referenced.
@@ -160,6 +270,9 @@ class Reach {
         Walk(*cte->query, declared == declared_in_.end() ? nullptr : declared->second);
       }
     }
+    // A subquery's query is a block of its own, after the blocks of this one's FROM list: a check
+    // over the result reports at the first unsupported construct in query order.
+    EachSubqueryIn(block, [&](const sql::SubqueryExpr& s) { Walk(*s.query, &frame); });
   }
 
   std::vector<const sql::SelectStatement*> take() { return std::move(blocks_); }

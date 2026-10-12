@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -861,6 +862,28 @@ INSTANTIATE_TEST_SUITE_P(
         // A subquery over a table that does not exist is still the subquery's error.
         ErrorCase{"SELECT i16 FROM t WHERE i32 IN (SELECT x FROM missing)", kUnsupported, "IN",
                   "IN (subquery) is not supported"}));
+
+// The relation limit comes before every other check (ADR 0022), and it counts a subquery's query
+// too: the doubling chain of CTEs referenced only from a subquery in WHERE would otherwise expand
+// to 2^11 relations from eleven lines of SQL. A subquery has no FROM item of the outer block to
+// report at, so the limit reports at its operator -- where the subquery's own refusal points too.
+TEST(BinderTest, TheRelationLimitCountsAChainBehindASubquery) {
+  std::string sql = "WITH c0 AS (SELECT i16 FROM t)";
+  for (int i = 1; i <= 10; ++i) {
+    sql += std::format(", c{0} AS (SELECT x.i16 FROM c{1} AS x, c{1} AS y WHERE x.i16 = y.i16)", i,
+                       i - 1);
+  }
+  sql += " SELECT COUNT(*) FROM u WHERE i32 IN (SELECT i16 FROM c10)";
+  const Catalog catalog = MakeCatalog();
+  auto plan = BindSql(sql, catalog);
+  ASSERT_FALSE(plan.ok());
+  const auto detail = GetSqlError(plan.status());
+  ASSERT_NE(detail, nullptr) << plan.status().ToString();
+  EXPECT_EQ(detail->kind(), kUnsupported) << plan.status().ToString();
+  EXPECT_EQ(SpanText(sql, plan.status()), "IN") << plan.status().ToString();
+  EXPECT_NE(plan.status().message().find("relations is not supported"), std::string::npos)
+      << plan.status().message();
+}
 
 // Rules 1, 2 and 6 of ADR 0022 over one FROM item: an alias names the binding, a qualified name
 // resolves in the binding it names (ASCII case-insensitively, quoted or not), and a result name
