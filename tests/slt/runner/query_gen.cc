@@ -707,6 +707,11 @@ constexpr unsigned kLeftPercent = 25;
 // Salt of the fourth random stream, which every draw that only a left join needs takes, so that a
 // query without one is the query this seed generated before the left-join PR.
 constexpr uint64_t kLeftStreamSalt = 0x6C6566742D726E67ULL;
+// Share of the queries with a usable probe that take an uncorrelated subquery (ADR 0022's T2b).
+constexpr unsigned kSubqueryPercent = 25;
+// Salt of the fifth random stream, which every draw that only a subquery needs takes, so that a
+// query without one is the query this seed generated before the subquery PR.
+constexpr uint64_t kSubqueryStreamSalt = 0x7375622D71756572ULL;
 
 std::optional<std::size_t> ColumnIndex(const GenTable& t, std::string_view name) {
   const auto it = std::ranges::find_if(
@@ -786,6 +791,20 @@ std::string PathName(std::string_view path) {
 // Whether a table read by path may go without an alias: its path names it as its own name does.
 bool PathNamesTable(const GenTable& t) { return SameName(PathName(t.path), t.name); }
 
+// An uncorrelated subquery a query can write (ADR 0022's T2b): a probe column of one of its FROM
+// bindings, and the one-table block it is compared against. For the IN forms and for MIN/MAX the
+// two columns are the ends of a single-column usable edge, so UsableEdges' guard is what makes them
+// comparable in both engines -- one ValueKind, never DOUBLE, never DATE through the clickbench
+// option, DECIMAL only within 38 common digits -- and the ref makes their values overlap, so the
+// answer is neither empty nor everything. COUNT(*) reads no column of the inner table and so needs
+// no edge, only a probe whose own values can reach a row count.
+struct SubqueryCandidate {
+  const GenColumn* probe = nullptr;   // of a FROM binding, so PositionOf finds its position
+  const GenTable* inner = nullptr;    // the block's only table, always named, never by path
+  const GenColumn* column = nullptr;  // of `inner`: what the block selects (nullptr: COUNT(*))
+  int64_t non_null = 0;               // rows of `column` that are not NULL (a NOT IN set sees them)
+};
+
 // How a FROM item joins the items before it.
 enum class FromConnector : std::uint8_t { kFirst, kComma, kCross, kJoin, kLeft };
 
@@ -861,12 +880,13 @@ class Builder {
  public:
   // `join_rng`: the query's second stream, which every draw that only a join needs takes.
   Builder(const std::vector<GenTable>& tables, Rng& rng, Rng& join_rng, Rng& block_rng,
-          Rng& left_rng, FeatureSet allowed)
+          Rng& left_rng, Rng& sub_rng, FeatureSet allowed)
       : tables_(tables),
         rng_(rng),
         join_rng_(join_rng),
         block_rng_(block_rng),
         left_rng_(left_rng),
+        sub_rng_(sub_rng),
         allowed_(allowed),
         edges_(UsableEdges(tables)) {}
 
@@ -2002,10 +2022,48 @@ class Builder {
 
   // WHERE with the join keys FROM leaves to it (no feature of their own beyond the join's) and
   // now and then 1 to 3 conditions (kWhere, kWhereAnd), all joined by AND.
+  // Whether an aggregate may go inside a subquery's block. It records its feature on the whole
+  // query, and the row-shape rule query_gen_test derives from the feature set cannot tell which
+  // block an aggregate belongs to: for a select list of constants alone the query is still a row
+  // per table row, so an inner aggregate would make it look like a global one. Every other select
+  // list settles the shape on its own -- a column, a star, or an aggregate of its own.
+  [[nodiscard]] bool InnerAggregateFits() const {
+    // The select list has already been written, so used_ says what shape it settled: a column or a
+    // star makes the query a row per table row whatever aggregates appear, and an aggregate of its
+    // own makes it global. A list of constants alone settles nothing, and an inner aggregate would
+    // then be read as the query's own. (The shape drawn is no use here: a kColumns select list of
+    // constants alone records no kColumns feature.)
+    return aggregate_emitted_ || used_.Has(Feature::kColumns) || used_.Has(Feature::kStar);
+  }
+
+  // The candidates this query may actually write, by the forms it is allowed and the shape of its
+  // select list (pure: no draw). The IN forms need a column of the inner table; the scalar form
+  // needs an aggregate, so it waits for InnerAggregateFits.
+  [[nodiscard]] std::vector<SubqueryCandidate> WhereSubqueries() const {
+    const bool in_form = allowed_.Has(Feature::kInSubquery);
+    const bool scalar = allowed_.Has(Feature::kScalarSubquery) && InnerAggregateFits() &&
+                        (allowed_.Has(Feature::kMin) || allowed_.Has(Feature::kMax) ||
+                         allowed_.Has(Feature::kCountStar));
+    if (!allowed_.Has(Feature::kWhere) || (!in_form && !scalar)) {
+      return {};
+    }
+    std::vector<SubqueryCandidate> out = SubqueryCandidates();
+    std::erase_if(out, [&](const SubqueryCandidate& c) {
+      return c.column == nullptr ? !scalar : !in_form && !scalar;
+    });
+    return out;
+  }
+
   void Where(const std::vector<KeyPair>& keys) {
     const bool conditions =
         allowed_.Has(Feature::kWhere) && !comparable_.empty() && rng_.Percent(45);
-    if (keys.empty() && !conditions) {
+    // An uncorrelated subquery as one more top-level AND conjunct (ADR 0022's T2b), appended after
+    // the drawn conditions and never routed through Condition(), which would put it under an OR or
+    // a NOT. It may be the only reason this query has a WHERE. Every draw it needs comes from the
+    // fifth stream, so a query without one is the query this seed gave before.
+    const std::vector<SubqueryCandidate> candidates = WhereSubqueries();
+    const bool subquery = !candidates.empty() && sub_rng_.Percent(kSubqueryPercent);
+    if (keys.empty() && !conditions && !subquery) {
       return;
     }
     std::size_t terms = 0;
@@ -2025,6 +2083,136 @@ class Builder {
       }
       Condition();
     }
+    if (subquery) {
+      if (terms > 0 || !keys.empty()) {
+        Keyword("AND");
+      }
+      used_.Add(Feature::kWhere);
+      SubqueryConjunct(candidates);
+    }
+  }
+
+  // The block of a subquery: `( SELECT <column | AGG(column) | COUNT(*)> FROM <table> )`, one
+  // table named and one output column, and nothing else -- no WHERE, no GROUP BY, no alias -- so
+  // nothing in it can read the outer query and the subquery is uncorrelated by construction.
+  void SubqueryBlock(const SubqueryCandidate& c, std::optional<Agg> agg) {
+    Symbol("(");
+    Keyword("SELECT");
+    if (agg.has_value()) {
+      used_.Add(AggFeature(*agg));
+      Keyword(AggName(*agg));
+      Symbol("(");
+      // COUNT(*) counts rows, so it never names the column a candidate carries for the IN forms:
+      // COUNT(column) is a different aggregate and would record a different feature.
+      if (*agg == Agg::kCountStar) {
+        Symbol("*");
+      } else {
+        used_.Add(TypeFeature(c.column->kind));
+        tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.column->name});
+      }
+      Symbol(")");
+    } else {
+      used_.Add(TypeFeature(c.column->kind));
+      tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.column->name});
+    }
+    Keyword("FROM");
+    used_.Add(Feature::kTableName);
+    tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.inner->name});
+    Symbol(")");
+  }
+
+  // One top-level conjunct: `probe [NOT] IN (block)`, `NOT (probe IN (block))`, or
+  // `probe <op> (block)` and its mirror, the block holding an aggregate then.
+  void SubqueryConjunct(const std::vector<SubqueryCandidate>& candidates) {
+    std::vector<const SubqueryCandidate*> in_forms;
+    for (const SubqueryCandidate& c : candidates) {
+      if (c.column != nullptr) {
+        in_forms.push_back(&c);
+      }
+    }
+    const bool can_in = allowed_.Has(Feature::kInSubquery) && !in_forms.empty();
+    const bool can_scalar = std::ranges::any_of(
+        candidates, [this](const SubqueryCandidate& c) { return !ScalarAggs(c).empty(); });
+    if (can_in && (!can_scalar || sub_rng_.Percent(55))) {
+      // A NOT IN set that holds a NULL keeps no row at all. Both engines agree, so it is correct
+      // SQL, but the answer is then empty whatever the data: prefer a set without one, and take a
+      // NULL-carrying set now and then so the behaviour is still generated.
+      const bool negated = sub_rng_.Percent(40);
+      std::vector<const SubqueryCandidate*> pool = in_forms;
+      if (negated && !sub_rng_.Percent(15)) {
+        std::vector<const SubqueryCandidate*> full;
+        for (const SubqueryCandidate* c : in_forms) {
+          if (c->non_null == c->inner->rows) {
+            full.push_back(c);
+          }
+        }
+        if (!full.empty()) {
+          pool = std::move(full);
+        }
+      }
+      const SubqueryCandidate& c = *pool[sub_rng_.Below(pool.size())];
+      used_.Add(Feature::kInSubquery);
+      const bool prefix_not =
+          negated && allowed_.Has(Feature::kBooleanExpressions) && sub_rng_.Percent(30);
+      if (prefix_not) {
+        used_.Add(Feature::kBooleanExpressions);
+        Keyword("NOT");
+        Symbol("(");
+      }
+      Column(*c.probe);
+      if (negated && !prefix_not) {
+        Keyword("NOT");
+      }
+      Keyword("IN");
+      SubqueryBlock(c, std::nullopt);
+      if (prefix_not) {
+        Symbol(")");
+      }
+      return;
+    }
+    std::vector<const SubqueryCandidate*> pool;
+    for (const SubqueryCandidate& c : candidates) {
+      if (!ScalarAggs(c).empty()) {
+        pool.push_back(&c);
+      }
+    }
+    const SubqueryCandidate& c = *pool[sub_rng_.Below(pool.size())];
+    const std::vector<Agg> aggs = ScalarAggs(c);
+    const Agg agg = aggs[sub_rng_.Below(aggs.size())];
+    used_.Add(Feature::kScalarSubquery);
+    const std::string_view op = kOps[sub_rng_.Below(kOps.size())];
+    if (allowed_.Has(Feature::kLiteralFirst) && sub_rng_.Percent(30)) {
+      used_.Add(Feature::kLiteralFirst);
+      SubqueryBlock(c, agg);
+      Symbol(Flip(op));
+      Column(*c.probe);
+      return;
+    }
+    Column(*c.probe);
+    Symbol(op);
+    SubqueryBlock(c, agg);
+  }
+
+  // The aggregates a candidate's block may hold: COUNT(*) when the probe reaches the row count,
+  // and MIN/MAX of the inner column, whose result is that column's own type and so needs no type
+  // rule of its own beyond the edge's.
+  [[nodiscard]] std::vector<Agg> ScalarAggs(const SubqueryCandidate& c) const {
+    std::vector<Agg> aggs;
+    if (!allowed_.Has(Feature::kScalarSubquery) || !InnerAggregateFits()) {
+      return aggs;  // the same gate WhereSubqueries applies: an inner aggregate must fit
+    }
+    if (allowed_.Has(Feature::kCountStar) && c.inner->rows <= ProbeMax(*c.probe) &&
+        c.probe->kind == ValueKind::kInteger) {
+      aggs.push_back(Agg::kCountStar);
+    }
+    if (c.column != nullptr) {
+      for (const Agg agg : {Agg::kMin, Agg::kMax}) {
+        if (allowed_.Has(AggFeature(agg))) {
+          aggs.push_back(agg);
+        }
+      }
+    }
+    return aggs;
   }
 
   // The equalities of key pairs, joined by AND, each in a drawn order: never kCompareColumns, and
@@ -2151,6 +2339,61 @@ class Builder {
         comparable_ = std::move(all);
       }
     }
+  }
+
+  // The largest value a column is known to hold, for deciding whether comparing it with a row
+  // count can be true at all: its measured data range where LoadGenTables found one, else its
+  // storage type's maximum (the hand-built table sets of the tests measure none).
+  [[nodiscard]] static int64_t ProbeMax(const GenColumn& c) { return c.data_max.value_or(c.max); }
+
+  // The uncorrelated subqueries this query could write (pure: no draw). A probe is a column of a
+  // FROM binding that is not a nested block, since a nested binding projects a drawn subset of its
+  // table's columns under its own names and no property test can resolve a probe inside one
+  // (CheckJoin takes two FROM items at least, and Nest() only ever nests the single item of a
+  // one-table query). Every probe reaches the outer scope by name alone, which is what keeps the
+  // subquery uncorrelated: its block names one table and selects one of that table's own columns.
+  [[nodiscard]] std::vector<SubqueryCandidate> SubqueryCandidates() const {
+    std::vector<SubqueryCandidate> out;
+    if (from_ == nullptr || !allowed_.Has(Feature::kTableName)) {
+      return out;  // the block always names its table
+    }
+    for (const Binding& b : from_->bindings) {
+      if (!b.inner.empty()) {
+        continue;  // a nested block's columns are its own, not its table's
+      }
+      for (const Edge& edge : edges_) {
+        if (edge.child_columns.size() != 1) {
+          continue;  // one output column, so one end of the edge
+        }
+        for (const bool as_child : {true, false}) {
+          const GenTable& own = tables_[as_child ? edge.child : edge.parent];
+          const GenTable& other = tables_[as_child ? edge.parent : edge.child];
+          const std::size_t mine = as_child ? edge.child_columns[0] : edge.parent_columns[0];
+          const std::size_t theirs = as_child ? edge.parent_columns[0] : edge.child_columns[0];
+          const GenKeyStats& stats = as_child ? edge.parent_stats : edge.child_stats;
+          if (!SameName(own.name, b.table->name) || mine >= b.columns.size()) {
+            continue;
+          }
+          const GenColumn& probe = b.columns[mine];
+          if (!CanLiteral(probe.kind) || probe.via_override != other.columns[theirs].via_override) {
+            continue;
+          }
+          out.push_back(SubqueryCandidate{.probe = &probe,
+                                          .inner = &other,
+                                          .column = &other.columns[theirs],
+                                          .non_null = stats.non_null});
+          // COUNT(*) over the same pair: it reads no column of the inner table, so the edge is
+          // needed only to have picked a probe at all, and the count must be a value the probe
+          // can reach or the comparison is never true.
+          if (probe.kind == ValueKind::kInteger && other.rows > 0 &&
+              other.rows <= ProbeMax(probe)) {
+            out.push_back(SubqueryCandidate{
+                .probe = &probe, .inner = &other, .column = nullptr, .non_null = other.rows});
+          }
+        }
+      }
+    }
+    return out;
   }
 
   // A condition over the table: WHERE's forms, or a compound of them.
@@ -3132,6 +3375,7 @@ class Builder {
   Rng& join_rng_;   // the draws that only a join needs
   Rng& block_rng_;  // the draws that only a nested block needs
   Rng& left_rng_;   // the draws that only a left join needs
+  Rng& sub_rng_;    // the draws that only an uncorrelated subquery needs
   FeatureSet allowed_;
   std::vector<Edge> edges_;         // the refs joins can follow
   const FromList* from_ = nullptr;  // the FROM list of the query being written (TryFrom)
@@ -3329,7 +3573,10 @@ std::expected<QueryGenerator, std::string> QueryGenerator::Make(std::vector<GenT
   Rng join_rng(Mix(seed ^ kJoinStreamSalt));
   Rng block_rng(Mix(seed ^ kBlockStreamSalt));
   Rng left_rng(Mix(seed ^ kLeftStreamSalt));
-  if (!Builder(tables, rng, join_rng, block_rng, left_rng, options.supported).Build().has_value()) {
+  Rng sub_rng(Mix(seed ^ kSubqueryStreamSalt));
+  if (!Builder(tables, rng, join_rng, block_rng, left_rng, sub_rng, options.supported)
+           .Build()
+           .has_value()) {
     return std::unexpected(
         std::format("no query can be built from the supported features ({}) over these tables",
                     options.supported.Names()));
@@ -3343,10 +3590,11 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
   Rng join_rng(Mix(state ^ kJoinStreamSalt));
   Rng block_rng(Mix(state ^ kBlockStreamSalt));
   Rng left_rng(Mix(state ^ kLeftStreamSalt));
+  Rng sub_rng(Mix(state ^ kSubqueryStreamSalt));
   const bool target = rng.Percent(options_.target_percent);
   const FeatureSet allowed = target ? FeatureSet::All() : options_.supported;
   // Make() proved that the supported set admits a query over these tables; All() is a superset.
-  GeneratedQuery q = Builder(tables_, rng, join_rng, block_rng, left_rng, allowed)
+  GeneratedQuery q = Builder(tables_, rng, join_rng, block_rng, left_rng, sub_rng, allowed)
                          .Build()
                          .value_or(GeneratedQuery{});
   q.index = index;

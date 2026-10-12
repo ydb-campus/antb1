@@ -298,9 +298,10 @@ inline constexpr FeatureSet kNeverGenerated = {Feature::kWindowFunctions};
 // Grammar the random generator (runner/query_gen.cc) cannot write yet, which a later PR teaches it
 // and then removes from this set. Valid in `-- features:` tags, and never in kSupportedFeatures
 // while pending (checked below), so that no feature is declared supported before it is generated.
-// ADR 0022's T2 took derived tables and WITH lists out of it, and T2c LEFT JOIN. The two subquery
-// forms wait for the parser (roadmap PR S4b) and leave with T2b, which J5 depends on.
-inline constexpr FeatureSet kGeneratorPending = {Feature::kInSubquery, Feature::kScalarSubquery};
+// ADR 0022's T2 took derived tables and WITH lists out of it, T2c LEFT JOIN and T2b the two
+// uncorrelated subquery forms, so nothing waits here today. A Feature added for grammar the
+// generator cannot write yet goes in, and the PR that teaches it takes it out again.
+inline constexpr FeatureSet kGeneratorPending = {};
 
 // What antb1 answers today: the whole slice grammar of docs/sql-subset.md (global and grouped
 // aggregates, projections, WHERE conjunctions of column <op> literal, ORDER BY, LIMIT and OFFSET)
