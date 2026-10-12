@@ -1332,6 +1332,281 @@ TEST(QueryGenerator, JoinQueriesFollowTheRefs) {
 // step that needs an alias (a table twice, a path that names another table) or a qualifier (a key
 // column's name in two items, a table with columns the generator skips), and other columns of a
 // name two items have are not referenced; supported queries join.
+// The Feature a generated aggregate records, so a block's call and the query's feature set can be
+// checked against each other: COUNT(*) and COUNT(column) are different aggregates and different
+// features, and recording one for the other is exactly the leak this id must not ship.
+Feature AggFeatureOf(sql::AggKind kind) {
+  switch (kind) {
+    case sql::AggKind::kCountStar:
+      return Feature::kCountStar;
+    case sql::AggKind::kCount:
+      return Feature::kCountColumn;
+    case sql::AggKind::kSum:
+      return Feature::kSum;
+    case sql::AggKind::kAvg:
+      return Feature::kAvg;
+    case sql::AggKind::kMin:
+      return Feature::kMin;
+    case sql::AggKind::kMax:
+      return Feature::kMax;
+  }
+  return Feature::kCountStar;
+}
+
+struct SubqueryCoverage {
+  int queries = 0;
+  int in_form = 0;
+  int not_in = 0;
+  int prefix_not = 0;
+  int scalar = 0;
+  int count_star = 0;
+  int min_max = 0;
+  int block_first = 0;       // (SELECT ...) <op> probe
+  int introduced_where = 0;  // the subquery is the query's only WHERE conjunct
+  int joined = 0;            // beside a join
+  int qualified_probe = 0;
+};
+
+// Every SubqueryExpr of a statement, those inside another block included. ForEachNode stops at a
+// block's edge on purpose, since the names inside resolve in that block's own scope -- but
+// invisible is exactly what must not happen here: a reference from an inner block to an outer
+// table is a correlated subquery, which DuckDB answers and the binder refuses with exit code 4
+// even after roadmap PR J5 (ADR 0022 rule 9 defers correlation to ADR 0023). Generating one would
+// be green today and a hard failure of diff.star the day J5 declares the features.
+void DeepSubqueries(const sql::SelectStatement& stmt, std::vector<const sql::SubqueryExpr*>& out);
+
+void DeepSubqueries(const sql::Expr& e, std::vector<const sql::SubqueryExpr*>& out) {
+  ForEachNode(e, [&out](const sql::Expr& node) {
+    if (const auto* s = std::get_if<sql::SubqueryExpr>(&node)) {
+      out.push_back(s);
+      DeepSubqueries(*s->query, out);
+    }
+  });
+}
+
+void DeepSubqueries(const sql::SelectStatement& stmt, std::vector<const sql::SubqueryExpr*>& out) {
+  for (const sql::CommonTableExpr& cte : stmt.with) {
+    DeepSubqueries(*cte.query, out);
+  }
+  for (const sql::SelectItem& item : stmt.items) {
+    DeepSubqueries(item.expr, out);
+  }
+  for (const sql::FromItem& item : stmt.from) {
+    if (const auto* derived = std::get_if<sql::DerivedTable>(&item.source)) {
+      DeepSubqueries(*derived->query, out);
+    }
+    for (const sql::Expr& conjunct : item.on) {
+      DeepSubqueries(conjunct, out);
+    }
+  }
+  for (const sql::Expr& conjunct : stmt.where) {
+    DeepSubqueries(conjunct, out);
+  }
+  for (const sql::Expr& e : stmt.group_by) {
+    DeepSubqueries(e, out);
+  }
+  for (const sql::Expr& conjunct : stmt.having) {
+    DeepSubqueries(conjunct, out);
+  }
+  for (const sql::OrderItem& item : stmt.order_by) {
+    DeepSubqueries(item.expr, out);
+  }
+}
+
+// Checks a generated subquery against the algorithm, on its AST (ADR 0022's T2b): exactly one per
+// statement, a top-level conjunct of WHERE, over a probe one FROM item has, with a block that
+// names one table, selects one column of it or an aggregate, holds no clause of its own, and whose
+// every column reference is unqualified -- which together are what keep it uncorrelated.
+void CheckSubquery(const GeneratedQuery& q, const std::vector<GenTable>& tables,
+                   SubqueryCoverage& cov) {
+  SCOPED_TRACE(q.sql);
+  const auto parsed = sql::Parse(q.sql);
+  ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+  const sql::SelectStatement& stmt = *parsed;
+
+  std::vector<const sql::SubqueryExpr*> all;
+  DeepSubqueries(stmt, all);
+  ASSERT_EQ(all.size(), 1U) << "one subquery per query, and never one inside another's block";
+  const sql::SubqueryExpr& sub = *all.front();
+  ++cov.queries;
+
+  // Where it may sit in a top-level conjunct: the conjunct itself (the IN forms), under its own
+  // prefix NOT, or as one operand of a comparison (the scalar form). Anywhere deeper -- under an
+  // OR, inside arithmetic, inside a CASE -- is no top-level conjunct.
+  const auto is_sub = [&sub](const sql::Expr& e) {
+    return std::get_if<sql::SubqueryExpr>(&e) == &sub;
+  };
+  std::size_t at_top = 0;
+  for (const sql::Expr& conjunct : stmt.where) {
+    const sql::Expr* e = &conjunct;
+    bool negated = false;
+    if (const auto* unary = std::get_if<sql::UnaryExpr>(e);
+        unary != nullptr && unary->op == sql::UnaryOp::kNot) {
+      e = &*unary->operand;
+      negated = true;
+    }
+    bool here = is_sub(*e);
+    if (const auto* binary = std::get_if<sql::BinaryExpr>(e); !here && binary != nullptr &&
+                                                              binary->op >= sql::BinaryOp::kEq &&
+                                                              binary->op <= sql::BinaryOp::kGe) {
+      here = is_sub(*binary->left) || is_sub(*binary->right);
+      cov.block_first += is_sub(*binary->left) ? 1 : 0;
+    }
+    if (here) {
+      ++at_top;
+      cov.prefix_not += negated ? 1 : 0;
+    }
+  }
+  EXPECT_EQ(at_top, 1U) << "the subquery is a top-level AND conjunct of WHERE";
+  cov.introduced_where += stmt.where.size() == 1 ? 1 : 0;
+  cov.joined += stmt.from.size() > 1 ? 1 : 0;
+
+  // The block: one named table, one output column, and nothing else.
+  const sql::SelectStatement& block = *sub.query;
+  EXPECT_TRUE(block.with.empty());
+  EXPECT_FALSE(block.star);
+  EXPECT_EQ(block.items.size(), 1U);
+  EXPECT_TRUE(block.where.empty());
+  EXPECT_TRUE(block.group_by.empty());
+  EXPECT_TRUE(block.having.empty());
+  EXPECT_TRUE(block.order_by.empty());
+  EXPECT_FALSE(block.limit.has_value());
+  EXPECT_FALSE(block.offset.has_value());
+  ASSERT_EQ(block.from.size(), 1U);
+  const sql::TableRef* inner_ref = block.from.front().table();
+  ASSERT_NE(inner_ref, nullptr) << "the block names a table, never a path or a derived table";
+  EXPECT_EQ(inner_ref->kind, sql::TableRef::Kind::kName);
+  EXPECT_FALSE(block.from.front().alias.has_value());
+  const auto inner = std::ranges::find_if(
+      tables, [&](const GenTable& t) { return SameName(t.name, inner_ref->name); });
+  ASSERT_NE(inner, tables.end()) << inner_ref->name;
+
+  // Uncorrelated: every reference inside the block is unqualified and a column of the block's own
+  // table. A qualifier, or a name that table does not have, would reach the outer query.
+  ForEachNode(block.items.front().expr, [&](const sql::Expr& node) {
+    if (const sql::ColumnRef* c = AsColumn(node)) {
+      EXPECT_TRUE(c->qualifier.empty()) << c->qualifier << "." << c->name << ": correlated";
+      EXPECT_TRUE(HasColumn(*inner, c->name)) << c->name << ": not a column of " << inner->name;
+    }
+  });
+
+  if (sub.kind == sql::SubqueryExpr::Kind::kIn) {
+    ++cov.in_form;
+    cov.not_in += sub.negated ? 1 : 0;
+    const sql::ColumnRef* probe = sub.operand.has_value() ? AsColumn(**sub.operand) : nullptr;
+    ASSERT_NE(probe, nullptr) << "the IN probe is a plain column";
+    cov.qualified_probe += probe->qualifier.empty() ? 0 : 1;
+    EXPECT_TRUE(std::ranges::any_of(stmt.from,
+                                    [&](const sql::FromItem& item) {
+                                      const sql::TableRef* ref = item.table();
+                                      if (ref == nullptr) {
+                                        return false;
+                                      }
+                                      const auto t =
+                                          std::ranges::find_if(tables, [&](const GenTable& g) {
+                                            return ref->kind == sql::TableRef::Kind::kPath
+                                                       ? g.path == ref->name
+                                                       : SameName(g.name, ref->name);
+                                          });
+                                      return t != tables.end() && HasColumn(*t, probe->name);
+                                    }))
+        << probe->name << ": no FROM item has the probe";
+    // An IN block selects a plain column, so it records no aggregate feature of its own.
+    EXPECT_TRUE(std::holds_alternative<sql::ColumnRef>(block.items.front().expr));
+    EXPECT_TRUE(q.features.Has(Feature::kInSubquery));
+    return;
+  }
+
+  ++cov.scalar;
+  EXPECT_EQ(sub.kind, sql::SubqueryExpr::Kind::kScalar);
+  EXPECT_FALSE(sub.operand.has_value());
+  EXPECT_TRUE(q.features.Has(Feature::kScalarSubquery));
+  // A scalar subquery's block aggregates, so it yields exactly one row whatever the data.
+  const auto* call = std::get_if<sql::AggregateCall>(&block.items.front().expr);
+  ASSERT_NE(call, nullptr) << "a scalar subquery's block aggregates";
+  EXPECT_FALSE(call->distinct);
+  cov.count_star += call->kind == sql::AggKind::kCountStar ? 1 : 0;
+  cov.min_max += call->kind == sql::AggKind::kMin || call->kind == sql::AggKind::kMax ? 1 : 0;
+  // COUNT(*) counts rows and names no column; MIN/MAX name the block's own.
+  EXPECT_EQ(call->arg.has_value(), call->kind != sql::AggKind::kCountStar);
+  EXPECT_TRUE(q.features.Has(AggFeatureOf(call->kind)));
+}
+
+// Every generated subquery, against the algorithm and against the row shape the feature set
+// derives. The second half is the mechanical guard on InnerAggregateFits: an aggregate inside a
+// block records its feature on the whole query, so a select list that settles no shape of its own
+// -- constants, or arithmetic, alone -- must never carry one, or the query would read as a global
+// aggregate when it is still a row per table row.
+TEST(QueryGenerator, SubqueryQueriesStayUncorrelated) {
+  SubqueryCoverage cov;
+  for (const auto& tables : {Tables(), JoinTables()}) {
+    const auto gen = MakeOver(tables, 53, {.supported = kSupportedFeatures, .target_percent = 100});
+    for (uint64_t i = 0; i < 6000; ++i) {
+      const auto q = gen.Generate(i);
+      if (!q.features.Has(Feature::kInSubquery) && !q.features.Has(Feature::kScalarSubquery)) {
+        continue;
+      }
+      ASSERT_NO_FATAL_FAILURE(CheckSubquery(q, tables, cov)) << i;
+      const bool aggregate = std::ranges::any_of(
+          std::to_array({Feature::kCountStar, Feature::kCountColumn, Feature::kSum, Feature::kAvg,
+                         Feature::kMin, Feature::kMax, Feature::kCountDistinct}),
+          [&](Feature f) { return q.features.Has(f); });
+      const bool rows =
+          q.features.Has(Feature::kColumns) || q.features.Has(Feature::kStar) ||
+          q.features.Has(Feature::kGroupBy) ||
+          ((q.features.Has(Feature::kConstant) || q.features.Has(Feature::kArithmetic) ||
+            q.features.Has(Feature::kStringFunctions) || q.features.Has(Feature::kCase) ||
+            q.features.Has(Feature::kTimestamps)) &&
+           !aggregate);
+      const bool ordered = q.features.Has(Feature::kOrderBy);
+      EXPECT_EQ(q.sort, rows && !ordered ? SortMode::kRowSort : SortMode::kNoSort) << q.sql;
+    }
+  }
+  EXPECT_GT(cov.queries, 400) << "subqueries: " << cov.queries;
+  EXPECT_GT(cov.in_form, 200);
+  EXPECT_GT(cov.not_in, 50) << "NOT IN";
+  EXPECT_GT(cov.prefix_not, 20) << "NOT (x IN (...))";
+  EXPECT_GT(cov.scalar, 150);
+  EXPECT_GT(cov.count_star, 50) << "COUNT(*) in the block";
+  EXPECT_GT(cov.min_max, 50) << "MIN/MAX in the block";
+  EXPECT_GT(cov.block_first, 20) << "(SELECT ...) <op> probe";
+  EXPECT_GT(cov.introduced_where, 100) << "the subquery is the only WHERE conjunct";
+  EXPECT_GT(cov.joined, 200) << "a subquery beside a join";
+  EXPECT_GT(cov.qualified_probe, 100) << "a qualified probe";
+}
+
+// Every draw a subquery needs comes from the fifth stream (sub_rng_), so allowing the two forms
+// changes the queries that take one and no others. Pins the stream, as the three tests above pin
+// the second, third and fourth.
+TEST(QueryGenerator, SubqueriesChangeOnlySubqueryQueries) {
+  const FeatureSet with_sub =
+      Union(kSupportedFeatures, {Feature::kInSubquery, Feature::kScalarSubquery});
+  const auto with = MakeOver(JoinTables(), 59, {.supported = with_sub, .target_percent = 0});
+  const auto without =
+      MakeOver(JoinTables(), 59,
+               {.supported = with_sub.Minus({Feature::kInSubquery, Feature::kScalarSubquery}),
+                .target_percent = 0});
+  int took = 0;
+  int same = 0;
+  for (uint64_t i = 0; i < 3000; ++i) {
+    const auto q = with.Generate(i);
+    const auto plain = without.Generate(i);
+    EXPECT_FALSE(plain.features.Has(Feature::kInSubquery)) << plain.sql;
+    EXPECT_FALSE(plain.features.Has(Feature::kScalarSubquery)) << plain.sql;
+    if (q.features.Has(Feature::kInSubquery) || q.features.Has(Feature::kScalarSubquery)) {
+      ++took;
+      // A conjunct only removes rows, so the bound is the one the query had without it.
+      EXPECT_EQ(q.row_bound, plain.row_bound) << q.sql;
+      continue;
+    }
+    ++same;
+    EXPECT_EQ(q.sql, plain.sql) << i;
+    EXPECT_EQ(q.features, plain.features) << i;
+  }
+  EXPECT_GT(took, 300) << "took: " << took;
+  EXPECT_GT(same, 2000);
+}
+
 TEST(QueryGenerator, DeclaredJoinFeaturesAppearInSupportedQueries) {
   const std::vector<GenTable> tables = JoinTables();
   for (const FeatureSet& join : {kJoinFeatures, FeatureSet{Feature::kCommaJoin, Feature::kJoinOn},

@@ -1527,7 +1527,7 @@ class Builder {
     SelectList(shape, from, cols, numeric, aggs, selected_keys);
     Keyword("FROM");
     EmitFrom(from);
-    Where(from.where_keys, shape);
+    Where(from.where_keys);
     // GROUP BY a constant's position alone still groups: no row over no input rows.
     const bool constant_group =
         shape == Shape::kAggregates && keys.empty() && allowed_.Has(Feature::kGroupBy) &&
@@ -2027,16 +2027,21 @@ class Builder {
   // block an aggregate belongs to: for a select list of constants alone the query is still a row
   // per table row, so an inner aggregate would make it look like a global one. Every other select
   // list settles the shape on its own -- a column, a star, or an aggregate of its own.
-  [[nodiscard]] bool InnerAggregateFits(Shape shape) const {
-    return shape != Shape::kAggregates || aggregate_emitted_;
+  [[nodiscard]] bool InnerAggregateFits() const {
+    // The select list has already been written, so used_ says what shape it settled: a column or a
+    // star makes the query a row per table row whatever aggregates appear, and an aggregate of its
+    // own makes it global. A list of constants alone settles nothing, and an inner aggregate would
+    // then be read as the query's own. (The shape drawn is no use here: a kColumns select list of
+    // constants alone records no kColumns feature.)
+    return aggregate_emitted_ || used_.Has(Feature::kColumns) || used_.Has(Feature::kStar);
   }
 
   // The candidates this query may actually write, by the forms it is allowed and the shape of its
   // select list (pure: no draw). The IN forms need a column of the inner table; the scalar form
   // needs an aggregate, so it waits for InnerAggregateFits.
-  [[nodiscard]] std::vector<SubqueryCandidate> WhereSubqueries(Shape shape) const {
+  [[nodiscard]] std::vector<SubqueryCandidate> WhereSubqueries() const {
     const bool in_form = allowed_.Has(Feature::kInSubquery);
-    const bool scalar = allowed_.Has(Feature::kScalarSubquery) && InnerAggregateFits(shape) &&
+    const bool scalar = allowed_.Has(Feature::kScalarSubquery) && InnerAggregateFits() &&
                         (allowed_.Has(Feature::kMin) || allowed_.Has(Feature::kMax) ||
                          allowed_.Has(Feature::kCountStar));
     if (!allowed_.Has(Feature::kWhere) || (!in_form && !scalar)) {
@@ -2049,14 +2054,14 @@ class Builder {
     return out;
   }
 
-  void Where(const std::vector<KeyPair>& keys, Shape shape) {
+  void Where(const std::vector<KeyPair>& keys) {
     const bool conditions =
         allowed_.Has(Feature::kWhere) && !comparable_.empty() && rng_.Percent(45);
     // An uncorrelated subquery as one more top-level AND conjunct (ADR 0022's T2b), appended after
     // the drawn conditions and never routed through Condition(), which would put it under an OR or
     // a NOT. It may be the only reason this query has a WHERE. Every draw it needs comes from the
     // fifth stream, so a query without one is the query this seed gave before.
-    const std::vector<SubqueryCandidate> candidates = WhereSubqueries(shape);
+    const std::vector<SubqueryCandidate> candidates = WhereSubqueries();
     const bool subquery = !candidates.empty() && sub_rng_.Percent(kSubqueryPercent);
     if (keys.empty() && !conditions && !subquery) {
       return;
@@ -2097,7 +2102,9 @@ class Builder {
       used_.Add(AggFeature(*agg));
       Keyword(AggName(*agg));
       Symbol("(");
-      if (c.column == nullptr) {
+      // COUNT(*) counts rows, so it never names the column a candidate carries for the IN forms:
+      // COUNT(column) is a different aggregate and would record a different feature.
+      if (*agg == Agg::kCountStar) {
         Symbol("*");
       } else {
         used_.Add(TypeFeature(c.column->kind));
@@ -2191,8 +2198,8 @@ class Builder {
   // rule of its own beyond the edge's.
   [[nodiscard]] std::vector<Agg> ScalarAggs(const SubqueryCandidate& c) const {
     std::vector<Agg> aggs;
-    if (!allowed_.Has(Feature::kScalarSubquery)) {
-      return aggs;
+    if (!allowed_.Has(Feature::kScalarSubquery) || !InnerAggregateFits()) {
+      return aggs;  // the same gate WhereSubqueries applies: an inner aggregate must fit
     }
     if (allowed_.Has(Feature::kCountStar) && c.inner->rows <= ProbeMax(*c.probe) &&
         c.probe->kind == ValueKind::kInteger) {
