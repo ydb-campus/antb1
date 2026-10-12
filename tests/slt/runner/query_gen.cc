@@ -707,6 +707,11 @@ constexpr unsigned kLeftPercent = 25;
 // Salt of the fourth random stream, which every draw that only a left join needs takes, so that a
 // query without one is the query this seed generated before the left-join PR.
 constexpr uint64_t kLeftStreamSalt = 0x6C6566742D726E67ULL;
+// Share of the queries with a usable probe that take an uncorrelated subquery (ADR 0022's T2b).
+constexpr unsigned kSubqueryPercent = 25;
+// Salt of the fifth random stream, which every draw that only a subquery needs takes, so that a
+// query without one is the query this seed generated before the subquery PR.
+constexpr uint64_t kSubqueryStreamSalt = 0x7375622D71756572ULL;
 
 std::optional<std::size_t> ColumnIndex(const GenTable& t, std::string_view name) {
   const auto it = std::ranges::find_if(
@@ -786,6 +791,20 @@ std::string PathName(std::string_view path) {
 // Whether a table read by path may go without an alias: its path names it as its own name does.
 bool PathNamesTable(const GenTable& t) { return SameName(PathName(t.path), t.name); }
 
+// An uncorrelated subquery a query can write (ADR 0022's T2b): a probe column of one of its FROM
+// bindings, and the one-table block it is compared against. For the IN forms and for MIN/MAX the
+// two columns are the ends of a single-column usable edge, so UsableEdges' guard is what makes them
+// comparable in both engines -- one ValueKind, never DOUBLE, never DATE through the clickbench
+// option, DECIMAL only within 38 common digits -- and the ref makes their values overlap, so the
+// answer is neither empty nor everything. COUNT(*) reads no column of the inner table and so needs
+// no edge, only a probe whose own values can reach a row count.
+struct SubqueryCandidate {
+  const GenColumn* probe = nullptr;   // of a FROM binding, so PositionOf finds its position
+  const GenTable* inner = nullptr;    // the block's only table, always named, never by path
+  const GenColumn* column = nullptr;  // of `inner`: what the block selects (nullptr: COUNT(*))
+  int64_t non_null = 0;               // rows of `column` that are not NULL (a NOT IN set sees them)
+};
+
 // How a FROM item joins the items before it.
 enum class FromConnector : std::uint8_t { kFirst, kComma, kCross, kJoin, kLeft };
 
@@ -861,12 +880,13 @@ class Builder {
  public:
   // `join_rng`: the query's second stream, which every draw that only a join needs takes.
   Builder(const std::vector<GenTable>& tables, Rng& rng, Rng& join_rng, Rng& block_rng,
-          Rng& left_rng, FeatureSet allowed)
+          Rng& left_rng, Rng& sub_rng, FeatureSet allowed)
       : tables_(tables),
         rng_(rng),
         join_rng_(join_rng),
         block_rng_(block_rng),
         left_rng_(left_rng),
+        sub_rng_(sub_rng),
         allowed_(allowed),
         edges_(UsableEdges(tables)) {}
 
@@ -2153,6 +2173,66 @@ class Builder {
     }
   }
 
+  // The largest value a column is known to hold, for deciding whether comparing it with a row
+  // count can be true at all: its measured data range where LoadGenTables found one, else its
+  // storage type's maximum (the hand-built table sets of the tests measure none).
+  [[nodiscard]] static int64_t ProbeMax(const GenColumn& c) { return c.data_max.value_or(c.max); }
+
+  // The uncorrelated subqueries this query could write (pure: no draw). A probe is a column of a
+  // FROM binding that is not a nested block, since a nested binding projects a drawn subset of its
+  // table's columns under its own names and no property test can resolve a probe inside one
+  // (CheckJoin takes two FROM items at least, and Nest() only ever nests the single item of a
+  // one-table query). Every probe reaches the outer scope by name alone, which is what keeps the
+  // subquery uncorrelated: its block names one table and selects one of that table's own columns.
+  [[nodiscard]] std::vector<SubqueryCandidate> SubqueryCandidates() const {
+    std::vector<SubqueryCandidate> out;
+    if (from_ == nullptr || !allowed_.Has(Feature::kTableName)) {
+      return out;  // the block always names its table
+    }
+    for (const Binding& b : from_->bindings) {
+      if (!b.inner.empty()) {
+        continue;  // a nested block's columns are its own, not its table's
+      }
+      for (const Edge& edge : edges_) {
+        if (edge.child_columns.size() != 1) {
+          continue;  // one output column, so one end of the edge
+        }
+        for (const bool as_child : {true, false}) {
+          const GenTable& own = tables_[as_child ? edge.child : edge.parent];
+          const GenTable& other = tables_[as_child ? edge.parent : edge.child];
+          const std::size_t mine = as_child ? edge.child_columns[0] : edge.parent_columns[0];
+          const std::size_t theirs = as_child ? edge.parent_columns[0] : edge.child_columns[0];
+          const GenKeyStats& stats = as_child ? edge.parent_stats : edge.child_stats;
+          if (!SameName(own.name, b.table->name) || mine >= b.columns.size()) {
+            continue;
+          }
+          const GenColumn& probe = b.columns[mine];
+          if (!CanLiteral(probe.kind) || probe.via_override != other.columns[theirs].via_override) {
+            continue;
+          }
+          out.push_back(SubqueryCandidate{.probe = &probe,
+                                          .inner = &other,
+                                          .column = &other.columns[theirs],
+                                          .non_null = stats.non_null});
+        }
+      }
+      // COUNT(*) compares a row count, so it needs no column of the inner table and no edge --
+      // only a probe whose own values reach that count, or the comparison is never true.
+      for (const GenColumn& probe : b.columns) {
+        if (probe.kind != ValueKind::kInteger || probe.via_override) {
+          continue;
+        }
+        for (const GenTable& inner : tables_) {
+          if (inner.rows > 0 && inner.rows <= ProbeMax(probe)) {
+            out.push_back(SubqueryCandidate{
+                .probe = &probe, .inner = &inner, .column = nullptr, .non_null = inner.rows});
+          }
+        }
+      }
+    }
+    return out;
+  }
+
   // A condition over the table: WHERE's forms, or a compound of them.
   void Condition() {
     Compound([this] { WhereLeaf(); });
@@ -3132,6 +3212,7 @@ class Builder {
   Rng& join_rng_;   // the draws that only a join needs
   Rng& block_rng_;  // the draws that only a nested block needs
   Rng& left_rng_;   // the draws that only a left join needs
+  Rng& sub_rng_;    // the draws that only an uncorrelated subquery needs
   FeatureSet allowed_;
   std::vector<Edge> edges_;         // the refs joins can follow
   const FromList* from_ = nullptr;  // the FROM list of the query being written (TryFrom)
@@ -3329,7 +3410,10 @@ std::expected<QueryGenerator, std::string> QueryGenerator::Make(std::vector<GenT
   Rng join_rng(Mix(seed ^ kJoinStreamSalt));
   Rng block_rng(Mix(seed ^ kBlockStreamSalt));
   Rng left_rng(Mix(seed ^ kLeftStreamSalt));
-  if (!Builder(tables, rng, join_rng, block_rng, left_rng, options.supported).Build().has_value()) {
+  Rng sub_rng(Mix(seed ^ kSubqueryStreamSalt));
+  if (!Builder(tables, rng, join_rng, block_rng, left_rng, sub_rng, options.supported)
+           .Build()
+           .has_value()) {
     return std::unexpected(
         std::format("no query can be built from the supported features ({}) over these tables",
                     options.supported.Names()));
@@ -3343,10 +3427,11 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
   Rng join_rng(Mix(state ^ kJoinStreamSalt));
   Rng block_rng(Mix(state ^ kBlockStreamSalt));
   Rng left_rng(Mix(state ^ kLeftStreamSalt));
+  Rng sub_rng(Mix(state ^ kSubqueryStreamSalt));
   const bool target = rng.Percent(options_.target_percent);
   const FeatureSet allowed = target ? FeatureSet::All() : options_.supported;
   // Make() proved that the supported set admits a query over these tables; All() is a superset.
-  GeneratedQuery q = Builder(tables_, rng, join_rng, block_rng, left_rng, allowed)
+  GeneratedQuery q = Builder(tables_, rng, join_rng, block_rng, left_rng, sub_rng, allowed)
                          .Build()
                          .value_or(GeneratedQuery{});
   q.index = index;
