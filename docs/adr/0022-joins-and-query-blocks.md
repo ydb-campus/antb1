@@ -691,6 +691,16 @@ docs/sql-subset.md sections it changes.
   rules 9 and 12-13, and CTEs visible inside subqueries (rule 8); outer references exit 4. Q11, Q15, Q16 and Q18
   pass.
 - **J6, feat(plan): left outer joins.** The ON placement and the fixed-unit rules. Q13 passes.
+  - Update (2026-10-12, J6): shipped. The binder's join state is now per inner block
+    (`Binder::JoinBlock`), a unit is one relation of its enclosing block with a `Relation` of its
+    own for the conjuncts that filter it, and `OrderRelations` and `JoinTree` recurse over the
+    blocks, a unit's inputs first. The "One relation" rule's descent is what the shape of a
+    group-scoped LEFT JOIN needs: a conjunct that reads only the unit's left input is re-classified
+    inside that input and may become its key, without which
+    `FROM a CROSS JOIN b LEFT JOIN c ON ... WHERE <a = b>` exits 4 where DuckDB answers. A LEFT
+    JOIN's ON is routed to the unit instead of through `BindElement`, so it is never OR-factored and
+    never reaches rule 11 for a conjunct on the preserved side. Shipping J6 before J5 makes the
+    ratchet 12 of 22, not the 16 the Consequences below assume.
 
 ## Alternatives considered
 

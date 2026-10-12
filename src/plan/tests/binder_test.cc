@@ -702,10 +702,28 @@ INSTANTIATE_TEST_SUITE_P(
         // An unqualified name an ON sees in both its relations is ambiguous (rule 3).
         ErrorCase{"SELECT i16 FROM t inner join u ON i16 = 1", kBind, "i16",
                   "column name 'i16' is ambiguous: it matches t.i16 and u.i16"},
-        ErrorCase{"SELECT i16 FROM t LEFT OUTER JOIN u ON t.i16 = u.i16", kUnsupported,
-                  "LEFT OUTER JOIN", "LEFT JOIN is not supported"},
-        ErrorCase{"SELECT i16 FROM nope LEFT JOIN missing ON a = b", kUnsupported, "LEFT JOIN",
-                  "LEFT JOIN is not supported"},
+        // A LEFT JOIN needs a key between its two inputs, as a connected inner graph does: with
+        // an ON that has no equality at all, and with one whose only equality is DOUBLE, which is
+        // never a key (ADR 0022). The error is at the connector, which is what added the join.
+        ErrorCase{"SELECT t.i16 FROM t LEFT OUTER JOIN u ON t.i16 > u.i16", kUnsupported,
+                  "LEFT OUTER JOIN",
+                  "a LEFT JOIN without a join key between its two inputs is not supported"},
+        ErrorCase{"SELECT t.i16 FROM t LEFT JOIN u ON t.d = u.d", kUnsupported, "LEFT JOIN",
+                  "a LEFT JOIN without a join key between its two inputs is not supported"},
+        // A key side that reads two relations of one input is no key: it would have to be
+        // computed on a branch that holds only one of them, and nothing is left to key the join.
+        ErrorCase{"SELECT t.i16 FROM t CROSS JOIN u LEFT JOIN ok ON t.i16 + u.i16 = ok.i16 "
+                  "WHERE t.i32 = u.i32",
+                  kUnsupported, "LEFT JOIN",
+                  "a LEFT JOIN without a join key between its two inputs is not supported"},
+        // A LEFT JOIN's ON sees its own two inputs only (rule 10). An earlier comma sibling is
+        // visible, as an inner ON's outer level, but is no input of this join: DuckDB refuses such
+        // an ON too ("Non-inner join on correlated columns not supported").
+        ErrorCase{"SELECT u.i16 FROM t, u LEFT JOIN ok ON ok.i16 = u.i16 AND t.i32 > 1",
+                  kUnsupported, "t.i32", "a LEFT JOIN's ON must read its own two inputs only"},
+        // The missing tables are still missing, and that bind error comes first, as in DuckDB.
+        ErrorCase{"SELECT i16 FROM nope LEFT JOIN missing ON a = b", kBind, "nope",
+                  "table 'nope' does not exist"},
         // An alias no longer hides the reference it renames: the name behind it is resolved, and
         // fails where it would without one.
         ErrorCase{"SELECT COUNT(*) FROM nope n", kBind, "nope", "table 'nope' does not exist"},
@@ -768,15 +786,16 @@ INSTANTIATE_TEST_SUITE_P(
                   "lower", "function lower() is not supported"},
         ErrorCase{"WITH c AS (SELECT i16 FROM t) SELECT lower(s) FROM (SELECT s FROM c) AS a",
                   kUnsupported, "lower", "function lower() is not supported"},
-        // A LEFT JOIN inside a sub-plan is still J6's, reported at its own connector -- inside a
-        // derived table, and inside the body of a CTE something references, which is what makes
-        // CheckSupported's walk of the reachable blocks load-bearing and not only cosmetic: an
-        // unrejected LEFT JOIN would bind as an inner join and lose its keys.
-        ErrorCase{"SELECT COUNT(*) FROM (SELECT t.i16 FROM t LEFT JOIN u ON t.i16 = u.i16) AS s",
-                  kUnsupported, "LEFT JOIN", "LEFT JOIN is not supported"},
-        ErrorCase{"WITH c AS (SELECT t.i16 AS k FROM t LEFT JOIN u ON t.i16 = u.i16) "
+        // A keyless LEFT JOIN inside a sub-plan is reported at its own connector -- inside a
+        // derived table, and inside the body of a CTE something references. (Both shapes answer
+        // when the join has a key: LeftJoinsBindInsideSubPlans covers that.)
+        ErrorCase{"SELECT COUNT(*) FROM (SELECT t.i16 FROM t LEFT JOIN u ON t.d = u.d) AS s",
+                  kUnsupported, "LEFT JOIN",
+                  "a LEFT JOIN without a join key between its two inputs is not supported"},
+        ErrorCase{"WITH c AS (SELECT t.i16 AS k FROM t LEFT JOIN u ON t.d = u.d) "
                   "SELECT COUNT(*) FROM c",
-                  kUnsupported, "LEFT JOIN", "LEFT JOIN is not supported"},
+                  kUnsupported, "LEFT JOIN",
+                  "a LEFT JOIN without a join key between its two inputs is not supported"},
         // A missing table inside a sub-plan is the sub-plan's bind error, at its own name.
         ErrorCase{"SELECT COUNT(*) FROM (SELECT x FROM nope) AS n(y)", kBind, "nope",
                   "table 'nope' does not exist"},

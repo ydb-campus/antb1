@@ -147,7 +147,7 @@ The row counts that `integration.JoinTest.*` pins for its hand-built joins of th
 the `COUNT(*)` records of the same joins hold too (`tests/slt/cases/joins/inner.slt`, and `names.slt` for trips
 with zones, both answered since J2b-2), for its semi, anti, null-aware anti and one-row joins the pending J5 and
 U2 records of the subqueries they stand for (`tests/slt/cases/subqueries/in.slt`, `exists.slt` and `scalar.slt`),
-and for its left joins the pending J6 records of `tests/slt/cases/joins/left.slt` (each case names its record):
+and for its left joins the records of `tests/slt/cases/joins/left.slt` (each case names its record):
 set the test's counts to those `slt-complete` writes there.
 
 ## SQL logic tests

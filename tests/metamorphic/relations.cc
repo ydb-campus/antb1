@@ -1305,7 +1305,7 @@ std::vector<Relation> AllRelations() {
                  .check = FirstIsUnionOfRest()});
   }
 
-  // ---- pending until left outer joins are answered (roadmap PR J6, ADR 0022) ----
+  // ---- left outer joins (roadmap PR J6, ADR 0022) ----
   // A LEFT JOIN's matches are the inner join's (447, and 310 and 131 with a residual on either
   // input), a strict comparison on the right input in WHERE drops every padded row so the result is
   // the inner join's, and an ON conjunct on the right input filters that input (rule 11) while one

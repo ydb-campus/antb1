@@ -53,7 +53,7 @@ MAX over partitions and over split files, literal folding (a decimal bound equal
 bounds), AND symmetry, literal-first comparisons, LIMIT, projections and batch sizes, and an inner join's
 independence of its FROM order, its connectors and where its keys are written. The relations of the forms the
 engine does not answer yet are pending (ADR 0022's T2 added them for derived tables, CTEs, uncorrelated subqueries
-and LEFT JOIN; each is activated by the PR that declares its features). Add a
+and LEFT JOIN; each is activated by the PR that declares its features -- J4 the first two, J6 LEFT JOIN). Add a
 relation with `r.push_back({...})` in `AllRelations()`; the checks (`AllEqual`, `FirstEqualsSumOfRest`,
 `FirstEqualsMinOfRest`, `FirstEqualsMaxOfRest`, `RowCountsEqualFirst`, `RowCountsAreMinOf`) are in `relations.h`.
 `metamorphic.RowCount.MatchesAnIndependentParquetScan` compares COUNT(*) with the rows the Parquet library decodes, and
