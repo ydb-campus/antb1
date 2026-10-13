@@ -685,8 +685,13 @@ struct Evaluator {
 
   // substring(value, start[, length]), by DuckDB's rule, which one window covers: a negative start
   // counts from the end, a negative length extends the window backwards, and the window is clipped
-  // to the value. NULL in any argument gives NULL, and a start or a length above 4294967295 is the
-  // execution error DuckDB raises for it (a negative one of any magnitude only clips).
+  // to the value. NULL in any argument gives NULL, and a start or a length outside
+  // [-4294967296, 4294967295] is the execution error DuckDB raises for it, one message per side.
+  //
+  // Where no length is written DuckDB does not reach the end of the value: it defaults the length
+  // to 4294967295, which shows only at the very bottom of the start's range --
+  // `substring(v, -4294967296)` loses the last codepoint where `substring(v, -4294967295)` keeps
+  // the value whole.
   //
   // Counted in codepoints, as DuckDB counts them -- where antb1's strlen counts bytes (divergence
   // D15) -- so a byte that is no UTF-8 continuation byte starts one and an invalid byte counts as
@@ -707,7 +712,8 @@ struct Evaluator {
     const auto& from = static_cast<const arrow::Int64Array&>(*starts);
     const auto* count =
         lengths == nullptr ? nullptr : &static_cast<const arrow::Int64Array&>(*lengths);
-    constexpr int64_t kLimit = 4294967295;  // DuckDB's own bound on a positive offset or length
+    constexpr int64_t kLimit = 4294967295;   // DuckDB's own bound on an offset or a length
+    constexpr int64_t kFloor = -kLimit - 1;  // and on a negative one, one step further out
     arrow::BinaryBuilder out(pool);
     ARROW_RETURN_NOT_OK(out.Reserve(values.length()));
     ARROW_RETURN_NOT_OK(out.ReserveData(values.total_values_length()));
@@ -718,11 +724,16 @@ struct Evaluator {
         continue;
       }
       const int64_t start = from.Value(row);
-      if (start > kLimit) {
-        return arrow::Status::Invalid("Substring offset outside of supported range (> 4294967295)");
+      if (start > kLimit || start < kFloor) {
+        return arrow::Status::Invalid(
+            std::format("Substring offset outside of supported range ({} {})",
+                        start > kLimit ? '>' : '<', start > kLimit ? kLimit : kFloor));
       }
-      if (count != nullptr && count->Value(row) > kLimit) {
-        return arrow::Status::Invalid("Substring length outside of supported range (> 4294967295)");
+      if (count != nullptr && (count->Value(row) > kLimit || count->Value(row) < kFloor)) {
+        const int64_t length = count->Value(row);
+        return arrow::Status::Invalid(
+            std::format("Substring length outside of supported range ({} {})",
+                        length > kLimit ? '>' : '<', length > kLimit ? kLimit : kFloor));
       }
       const std::string_view value = values.GetView(row);
       starts_of.clear();
@@ -733,17 +744,12 @@ struct Evaluator {
       }
       starts_of.push_back(value.size());
       const int64_t n = static_cast<int64_t>(starts_of.size()) - 1;
-      // A start or a length below -(kLimit + 1) reaches no further than that one does, so clamping
-      // them keeps the arithmetic inside int64 without changing a result.
-      const int64_t clamped_start = std::max(start, -kLimit - 1);
-      const int64_t s = clamped_start < 0 ? n + 1 + clamped_start : clamped_start;
-      int64_t lo = s;
-      int64_t hi = n + 1;
-      if (count != nullptr) {
-        const int64_t length = std::max(count->Value(row), -kLimit - 1);
-        lo = length < 0 ? s + length : s;
-        hi = length < 0 ? s : s + length;
-      }
+      const int64_t s = start < 0 ? n + 1 + start : start;
+      // Both arguments are inside [kFloor, kLimit] by now and n is one batch value's size, so every
+      // sum here stays far inside int64. A missing length is kLimit, not the end of the value.
+      const int64_t length = count == nullptr ? kLimit : count->Value(row);
+      int64_t lo = length < 0 ? s + length : s;
+      int64_t hi = length < 0 ? s : s + length;
       lo = std::max<int64_t>(lo, 1);
       hi = std::min<int64_t>(hi, n + 1);
       if (hi <= lo) {

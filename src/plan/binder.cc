@@ -368,6 +368,11 @@ std::string TypeText(const sql::CastExpr& cast) {
 
 [[noreturn]] void UnfoldedCast();
 [[noreturn]] void RejectedSubquery();
+// The opening of a function call's result name, through to its '(' (defined with the function table
+// below, which knows which names DuckDB reserves). One rule for both name builders: ExprNameOf,
+// which names a call nested in another expression, and BindFunction, which names one bound as a
+// value.
+std::string FunctionNameOpening(const sql::FunctionCall& call);
 
 // DuckDB's name of an expression of the binder's subset: (a + 1), -(a), sum((a + 1)); conditions
 // as ((a = 1) OR (b != 2) OR (c IN (1, 2))).
@@ -428,7 +433,7 @@ struct ExprNameOf {
     for (const sql::Expr& arg : call.args) {
       args += (args.empty() ? "" : ", ") + ExprName(arg);
     }
-    return AsciiLower(call.name) + "(" + args + ")";
+    return FunctionNameOpening(call) + args + ")";
   }
   std::string operator()(const sql::CaseExpr& c) const { return CaseName(c); }
   std::string operator()(const sql::ExtractExpr& e) const {
@@ -510,6 +515,19 @@ std::optional<FunctionSpec> FindFunction(const sql::FunctionCall& call) {
   const std::string name = AsciiLower(call.name);
   const auto* spec = std::ranges::find(kFunctions, name, &FunctionSpec::name);
   return spec == kFunctions.end() ? std::nullopt : std::optional(*spec);
+}
+
+// DuckDB re-serializes a function's name and quotes it only where the identifier needs quoting,
+// which is a property of the name and not of the call: `strlen` is plain however it was written
+// (`"strlen"` and `"STRLEN"` included), while `substring` -- a word DuckDB reserves -- is
+// main."substring" when the call was written unquoted and "substring" when it was quoted, lower
+// case either way, since DuckDB resolves a quoted function name case-insensitively.
+std::string FunctionNameOpening(const sql::FunctionCall& call) {
+  const std::optional<FunctionSpec> spec = FindFunction(call);
+  if (!spec.has_value() || !spec->reserved_name) {
+    return AsciiLower(call.name) + "(";
+  }
+  return call.quoted ? std::format("\"{}\"(", spec->name) : std::format("main.\"{}\"(", spec->name);
 }
 
 struct ReadsColumnOf {
@@ -2372,14 +2390,7 @@ class Binder {
     // `substring` -- a word DuckDB reserves -- is `main."substring"` when the call was written
     // unquoted and `"substring"` when it was quoted (in any case: DuckDB resolves a quoted function
     // name case-insensitively and prints it lower-cased).
-    const auto opening = [&] -> std::string {
-      if (!spec->reserved_name) {
-        return std::string(spec->name) + "(";
-      }
-      return call.quoted ? std::format("\"{}\"(", spec->name)
-                         : std::format("main.\"{}\"(", spec->name);
-    };
-    std::string name = opening();
+    std::string name = FunctionNameOpening(call);
     std::vector<ExprPtr> literals;
     std::vector<ExprPtr> integers;
     for (std::size_t i = 0; i < call.args.size(); ++i) {

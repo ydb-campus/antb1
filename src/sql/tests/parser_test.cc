@@ -662,7 +662,7 @@ TEST(ParserTest, SubstringTakesItsSqlStandardArgumentSyntax) {
   const std::vector<std::pair<std::string_view, std::string_view>> cases = {
       {"SELECT substring(u FROM 1 FOR 2) FROM t"sv, "substring(u, 1, 2)"sv},
       {"SELECT substring(u FROM 2) FROM t"sv, "substring(u, 2)"sv},
-      {"SELECT substring(u FOR 2) FROM t"sv, "substring(u, 1, 2)"sv},
+      // FOR without FROM is refused, below: DuckDB reads it as a length cast to INTEGER.
       {"SELECT substring(u, 1, 2) FROM t"sv, "substring(u, 1, 2)"sv},
       // The name keeps the case it was written in, as every function call does; FROM and FOR are
       // no part of the AST, so their case goes.
@@ -2095,6 +2095,11 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"QuotedSubstringFrom", "SELECT ^\"substring\"(u FROM 1) FROM events",
                    kUnsupported, 11,
                    "function substring() with this argument syntax is not supported"},
+        // FOR without FROM: DuckDB reads SUBSTRING(x FOR n) as SUBSTRING(x, 1, CAST(n AS INTEGER)),
+        // and antb1's subset casts nothing to INTEGER, so the spelling is refused rather than
+        // answered with a length of another type.
+        RejectCase{"SubstringForWithoutFrom", "SELECT substring(u ^FOR 2) FROM events",
+                   kUnsupported, 3, "SUBSTRING(x FOR n) without FROM is not supported"},
         RejectCase{"FunctionSyntaxError", "SELECT ^f(a +) FROM events", kUnsupported, 1,
                    "function f() with this argument syntax is not supported"},
         RejectCase{"FunctionFilter", "SELECT count_if(a > 0) ^FILTER (WHERE a < 5) FROM events",

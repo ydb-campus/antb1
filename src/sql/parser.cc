@@ -1683,6 +1683,7 @@ class Parser {
   Expected<Expr> ParseSubstringStandard(Context context, FunctionCall& call) {
     std::optional<Expr> start;
     std::optional<Expr> length;
+    SourceSpan for_span{};
     while (Peek().IsKeyword("FROM") || Peek().IsKeyword("FOR")) {
       const Token keyword = Take();
       const bool is_from = keyword.IsKeyword("FROM");
@@ -1690,18 +1691,26 @@ class Parser {
         return Syntax(keyword.span,
                       std::string("SUBSTRING( takes at most one ") + (is_from ? "FROM" : "FOR"));
       }
+      if (!is_from) {
+        for_span = keyword.span;
+      }
       auto value = ParseExpr(context);
       if (!value) {
         return value;
       }
       (is_from ? start : length) = *std::move(value);
     }
-    if (start.has_value()) {
-      call.args.push_back(*std::move(start));
-    } else {
-      call.args.emplace_back(Literal{
-          .kind = Literal::Kind::kInteger, .negative = false, .text = "1", .span = call.name_span});
+    if (!start.has_value()) {
+      // SUBSTRING(x FOR n) is SUBSTRING(x, 1, CAST(n AS INTEGER)) in DuckDB, not
+      // SUBSTRING(x, 1, n): the cast narrows the length to INTEGER, so a length the comma form
+      // answers is a conversion error in this spelling, and the cast shows in the result name too.
+      // antb1's subset casts nothing to INTEGER, so the spelling is refused rather than answered
+      // with a length of another type (ADR 0023's S5).
+      return Unsupported(for_span,
+                         "SUBSTRING(x FOR n) without FROM is not supported (DuckDB reads it as "
+                         "SUBSTRING(x, 1, CAST(n AS INTEGER)); write SUBSTRING(x FROM 1 FOR n))");
     }
+    call.args.push_back(*std::move(start));
     if (length.has_value()) {
       call.args.push_back(*std::move(length));
     }

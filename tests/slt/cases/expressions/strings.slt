@@ -159,13 +159,15 @@ x\x7fy	3	2	2	2	2
 Привет, мир	20	6	6	18	6
 日本語	9	6	6	6	6
 
+
 # The window, over literals: a negative start counts from the end, a negative length extends the
 # window backwards, a zero start reaches before the first codepoint, a start past the end keeps
 # nothing, and the two-argument form reaches the end.
 query TTTTTTTT nosort
-SELECT substring('aдb日x', 2, 3), substring('aдb日x' FOR 2), substring('aдb日x', -2, 2), substring('aдb日x', 2, -1), substring('aдb日x', 0, 3), substring('aдb日x', 99, 2), substring('aдb日x', 3), substring('aдb日x', -4294967296, 2) FROM edge LIMIT 1
+SELECT substring('aдb日x', 2, 3), substring('aдb日x' FROM 1 FOR 2), substring('aдb日x', -2, 2), substring('aдb日x', 2, -1), substring('aдb日x', 0, 3), substring('aдb日x', 99, 2), substring('aдb日x', 3), substring('aдb日x', -4294967296, 2) FROM edge LIMIT 1
 ----
 дb日	aд	日x	a	aд	(empty)	b日x	(empty)
+
 
 # A window that closes before it opens, and one clamped from far below: both are the empty string,
 # and a negative length of any magnitude only clips.
@@ -191,6 +193,33 @@ trailing space\x20	2	2
 x\x7fy	2	NULL
 Привет, мир	0	4
 日本語	0	6
+
+# Without a length DuckDB does not reach the end of the value: it defaults the length to 4294967295,
+# which shows only at the bottom of the start's range. One codepoint short at -4294967296, the whole
+# value at -4294967295, and the three-argument form with that length agrees with the two-argument one.
+query TTTT rowsort
+SELECT u, substring(u, -4294967296), substring(u, -4294967295), substring(u, -4294967296, 4294967295) FROM edge
+----
+(empty)	(empty)	(empty)	(empty)
+NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL
+\x28empty)	(empty	\x28empty)	(empty
+a	(empty)	a	(empty)
+back\\slash	back\\slas	back\\slash	back\\slas
+line\nbreak	line\nbrea	line\nbreak	line\nbrea
+tab\there	tab\ther	tab\there	tab\ther
+trailing space\x20	trailing space	trailing space\x20	trailing space
+x\x7fy	x\x7f	x\x7fy	x\x7f
+Привет, мир	Привет, ми	Привет, мир	Привет, ми
+日本語	日本	日本語	日本
+
+# A start or a length outside [-4294967296, 4294967295] fails the query when it runs, one message
+# per side of each bound.
+statement error
+SELECT substring(u, -4294967297, 2) FROM edge
+
+statement error
+SELECT substring(u, 1, -4294967297) FROM edge
 
 # DuckDB's own bound on a position: a start or a length above 4294967295 fails the query when it
 # runs, while a negative one of any magnitude only clips (above).

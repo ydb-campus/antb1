@@ -454,8 +454,11 @@ select list, the `ON` conditions and `WHERE`, the `GROUP BY` names, the grouping
   'replacement')` takes a VARCHAR and two string literals and is VARCHAR; `substring(x, start[, length])` and its
   alias `substr` take a VARCHAR and one or two integers and are VARCHAR, with the SQL-standard spelling
   `substring(x FROM start FOR length)` accepted for `substring` alone (the two clauses in either order, at most once
-  each, `FOR` without `FROM` starting at 1) and read as the comma form, which is also its canonical text and its
-  result name. A wrong number of arguments, another type or a non-literal pattern or replacement is a bind error
+  each) and read as the comma form, which is also its canonical text and its result name. `SUBSTRING(x FOR n)`
+  without `FROM` is unsupported (exit code 4): DuckDB reads it as `substring(x, 1, CAST(n AS INTEGER))`, and that
+  cast both narrows the length to `INTEGER` -- a length the comma form answers is a conversion error there -- and
+  shows in the result name, while antb1's subset casts nothing to `INTEGER`.
+  A wrong number of arguments, another type or a non-literal pattern or replacement is a bind error
   (`strlen() needs a VARCHAR, but 'i16' is SMALLINT`); DuckDB's
   optional fourth argument (options), `\Q` in a pattern, `\8` and `\9` in a replacement and any other function are
   unsupported (exit code 4). The result name is
@@ -841,10 +844,13 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   A byte that is no UTF-8
   continuation byte starts a codepoint, so an invalid byte counts as one of its own (divergence D15). `substring`'s
   window is one rule: a negative start counts from the end (`-1` is the last codepoint), a negative length extends
-  the window backwards from the start, the two-argument form reaches the end of the value, and the window is clipped
-  to the value, so a start past the end or a window that closes before it opens gives the empty string. NULL in any
-  argument gives NULL. A start or a length above 4294967295 fails the query when it runs (exit code 1), with
-  DuckDB's own message, while a negative one of any magnitude only clips.
+  the window backwards from the start, and the window is clipped to the value, so a start past the end or a window
+  that closes before it opens gives the empty string. NULL in any argument gives NULL. Written without a length the
+  window does **not** reach the end of the value: DuckDB defaults the length to 4294967295, which shows only at the
+  bottom of the start's range, where `substring(x, -4294967296)` loses the last codepoint and
+  `substring(x, -4294967295)` keeps the value whole. A start or a length outside
+  [-4294967296, 4294967295] fails the query when it runs (exit code 1), with DuckDB's own message, one per side of
+  each bound.
   `regexp_replace` replaces the first match only, with RE2 in UTF-8 mode as DuckDB
   runs it (`.` matches one character but no newline); in the replacement `\0` is the match, `\1` to `\9` its groups
   and `\\` a backslash. A replacement RE2 rejects (a group the pattern does not have, a lone or unknown backslash)
