@@ -757,6 +757,38 @@ std::vector<Relation> AllRelations() {
     }
     sizes.probes.push_back(Q(std::format(kKeys, "hits_like")));
     r.push_back(std::move(sizes));
+    // substring splits a value in two at any point, and the two pieces hold every byte of it once:
+    // a window is counted in codepoints while strlen counts bytes (divergence D15), so this holds
+    // only if no byte falls outside every codepoint, whatever bytes the column has.
+    const slt::FeatureSet split = {kSum,        kSubstring,      kStringFunctions,
+                                   kArithmetic, kVarcharColumns, kTableName};
+    for (const int k : {1, 2, 7}) {
+      r.push_back(
+          {.name = std::format("substring_splits_every_byte_once_at_{}", k),
+           .features = split,
+           .probes = {Q("SELECT SUM(strlen(URL)) FROM hits_like_nulls"),
+                      Q(std::format("SELECT SUM(strlen(substring(URL, 1, {}))) + "
+                                    "SUM(strlen(substring(URL, {}))) FROM hits_like_nulls",
+                                    k, k + 1)),
+                      Q(std::format("SELECT SUM(STRLEN(SUBSTRING(URL FROM 1 FOR {}))) + "
+                                    "SUM(STRLEN(SUBSTRING(URL FROM {}))) FROM hits_like_nulls",
+                                    k, k + 1))},
+           .check = AllEqual()});
+    }
+    // A window that reaches past either end of the value is the value, and one that closes before
+    // it opens is empty: three spellings of the whole value agree, and an empty one adds nothing.
+    // The start of -4294967295 is the boundary case, since one step further out loses a codepoint:
+    // with no length written DuckDB's is 4294967295, not the end of the value.
+    r.push_back({.name = "substring_clips_to_the_value",
+                 .features = SetWith(split, kNegativeLiteral),
+                 .probes = {Q("SELECT SUM(strlen(URL)) FROM hits_like_nulls"),
+                            Q("SELECT SUM(strlen(substring(URL, 1, 4294967295))) "
+                              "FROM hits_like_nulls"),
+                            Q("SELECT SUM(strlen(substring(URL, -4294967295))) "
+                              "FROM hits_like_nulls"),
+                            Q("SELECT SUM(strlen(substring(URL, 1))) + "
+                              "SUM(strlen(substring(URL, 1, -1))) FROM hits_like_nulls")},
+                 .check = AllEqual()});
   }
   // Boolean conditions: OR and AND count like a union and an intersection; p and NOT p split the
   // non-NULL values of p's column (NULL is neither, folded comparisons included); CASE WHEN p

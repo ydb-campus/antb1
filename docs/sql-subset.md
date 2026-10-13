@@ -842,7 +842,10 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
 - Strings: `strlen` counts bytes, while `substring` counts codepoints, as DuckDB counts them for each (so
   `substring('Привет', 1, 2)` is two letters of four bytes where `strlen` of them is 4).
   A byte that is no UTF-8
-  continuation byte starts a codepoint, so an invalid byte counts as one of its own (divergence D15). `substring`'s
+  continuation byte starts a codepoint, and a continuation byte belongs to the codepoint before it;
+  the first byte of a value always starts one, even when it is a continuation byte, so no byte ever
+  falls outside every codepoint and a window covering the value returns it whole (divergence D15,
+  since an unannotated Parquet `BYTE_ARRAY` is a VARCHAR here and may hold any bytes). `substring`'s
   window is one rule: a negative start counts from the end (`-1` is the last codepoint), a negative length extends
   the window backwards from the start, and the window is clipped to the value, so a start past the end or a window
   that closes before it opens gives the empty string. NULL in any argument gives NULL. Written without a length the

@@ -683,6 +683,32 @@ struct Evaluator {
     return arrow::Status::Invalid("unknown function");
   }
 
+  // The codepoints of `value`, counting as DuckDB counts them: a byte that is no UTF-8 continuation
+  // byte starts one, and a continuation byte belongs to the codepoint before it. The first byte
+  // always starts a codepoint, even when it is a continuation byte -- an unannotated Parquet
+  // BYTE_ARRAY is VARCHAR here and may hold any bytes (divergence D15), and no byte of a value may
+  // fall outside every codepoint, or a full window would not return the value it covers.
+  static int64_t CodepointCount(std::string_view value) {
+    int64_t n = 0;
+    for (std::size_t byte = 0; byte < value.size(); ++byte) {
+      n += byte == 0 || (static_cast<unsigned char>(value[byte]) & 0xC0U) != 0x80U ? 1 : 0;
+    }
+    return n;
+  }
+
+  // The byte offset where codepoint `index` begins, 1-based, or the size of `value` for the
+  // codepoint one past its last (CodepointCount(value) + 1).
+  static std::size_t ByteOfCodepoint(std::string_view value, int64_t index) {
+    int64_t seen = 0;
+    for (std::size_t byte = 0; byte < value.size(); ++byte) {
+      const bool starts = byte == 0 || (static_cast<unsigned char>(value[byte]) & 0xC0U) != 0x80U;
+      if (starts && ++seen == index) {
+        return byte;
+      }
+    }
+    return value.size();
+  }
+
   // substring(value, start[, length]), by DuckDB's rule, which one window covers: a negative start
   // counts from the end, a negative length extends the window backwards, and the window is clipped
   // to the value. NULL in any argument gives NULL, and a start or a length outside
@@ -717,7 +743,6 @@ struct Evaluator {
     arrow::BinaryBuilder out(pool);
     ARROW_RETURN_NOT_OK(out.Reserve(values.length()));
     ARROW_RETURN_NOT_OK(out.ReserveData(values.total_values_length()));
-    std::vector<std::size_t> starts_of;  // the byte offset of each codepoint, then of the end
     for (int64_t row = 0; row < values.length(); ++row) {
       if (values.IsNull(row) || from.IsNull(row) || (count != nullptr && count->IsNull(row))) {
         ARROW_RETURN_NOT_OK(out.AppendNull());
@@ -736,28 +761,21 @@ struct Evaluator {
                         length > kLimit ? '>' : '<', length > kLimit ? kLimit : kFloor));
       }
       const std::string_view value = values.GetView(row);
-      starts_of.clear();
-      for (std::size_t byte = 0; byte < value.size(); ++byte) {
-        if ((static_cast<unsigned char>(value[byte]) & 0xC0U) != 0x80U) {
-          starts_of.push_back(byte);
-        }
-      }
-      starts_of.push_back(value.size());
-      const int64_t n = static_cast<int64_t>(starts_of.size()) - 1;
+      const int64_t n = CodepointCount(value);
       const int64_t s = start < 0 ? n + 1 + start : start;
       // Both arguments are inside [kFloor, kLimit] by now and n is one batch value's size, so every
       // sum here stays far inside int64. A missing length is kLimit, not the end of the value.
       const int64_t length = count == nullptr ? kLimit : count->Value(row);
-      int64_t lo = length < 0 ? s + length : s;
-      int64_t hi = length < 0 ? s : s + length;
-      lo = std::max<int64_t>(lo, 1);
-      hi = std::min<int64_t>(hi, n + 1);
+      const int64_t lo = std::max<int64_t>(length < 0 ? s + length : s, 1);
+      const int64_t hi = std::min<int64_t>(length < 0 ? s : s + length, n + 1);
       if (hi <= lo) {
         ARROW_RETURN_NOT_OK(out.Append("", 0));
         continue;
       }
-      const std::size_t begin = starts_of[static_cast<std::size_t>(lo) - 1];
-      const std::size_t end = starts_of[static_cast<std::size_t>(hi) - 1];
+      // Two walks of the value's bytes and no allocation of our own: the offsets of every codepoint
+      // would be a vector the size of the value, outside the memory budget this operator reports.
+      const std::size_t begin = ByteOfCodepoint(value, lo);
+      const std::size_t end = ByteOfCodepoint(value, hi);
       ARROW_RETURN_NOT_OK(out.Append(value.data() + begin, static_cast<int32_t>(end - begin)));
     }
     return out.Finish();
