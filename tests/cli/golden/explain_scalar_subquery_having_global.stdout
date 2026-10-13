@@ -1,0 +1,8 @@
+Output: min(tr_driver):INTEGER
+Project "min(tr_driver)"
+  Filter "min(tr_driver)" = "min(dv_id)"
+    Join ONE-ROW build=right keys=[]
+      Aggregate MIN(tr_driver)
+        Scan table=trips source=parquet(files=1, rows=3000) columns=[tr_driver]
+      Aggregate MIN(dv_id)
+        Scan table=drivers source=parquet(files=1, rows=97) columns=[dv_id]

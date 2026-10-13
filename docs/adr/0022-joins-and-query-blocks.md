@@ -736,6 +736,18 @@ docs/sql-subset.md sections it changes.
     because the TPC-H ratchet fails a bind error outright, listed query or not (`rejections_clean = false`): the
     four correlated queries each happen to be refused for another reason first today, so two `binder_test`
     `ErrorCase`s are what pin it.
+  - Update (2026-10-13, J5b): the scalar form needs no comparison logic of its own. The one-row join appends its
+    row's column and `BindConditionWith` binds the conjunct with that column standing for the subquery, so every
+    rule a comparison of two operands follows applies unchanged -- the DECIMAL and DATE pairs, the folding of a
+    literal side, `MoveConstants`, and the `FLOAT` refusal of divergence D11, which `BindingColumn` carries across
+    the block boundary. That is also why the other side may be a literal (`0 = (query)`) or a constant integer
+    expression for free. "An ungrouped aggregate" is `IsAggregateQuery(query) && group_by.empty()` --
+    `Shape::kGlobal` -- and not "a bare aggregate call": `scalar.slt`'s HAVING record and Q11 both compare against
+    an *expression over* an aggregate, and reading it narrowly would stop the ratchet at 15.
+  - Update (2026-10-13, J5b): a one-row join leaves a column above what it stands on, where a semi or anti join
+    does not. In `Shape::kGlobal` that means the Project which restores the select list is needed whenever a HAVING
+    subquery conjunct has a join at all, not only when its probe needed a cast -- the same abort J5a fixed for the
+    cast, reached by a second route. `SubqueryJoin::AddsColumns` is the one place that decides.
 - **J6, feat(plan): left outer joins.** The ON placement and the fixed-unit rules. Q13 passes.
   - Update (2026-10-12, J6): shipped. The binder's join state is now per inner block
     (`Binder::JoinBlock`), a unit is one relation of its enclosing block with a `Relation` of its
