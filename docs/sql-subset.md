@@ -17,10 +17,11 @@ on aggregates and keys), arithmetic (`+ - * / // %` and unary `-`) over integers
 functions `strlen` and `regexp_replace`, the timestamp functions `toDateTime`, `EXTRACT` and `date_trunc`, and
 `CASE` in every clause, dates written as casts or literals (`CAST('2013-07-01' AS DATE)`, `'2013-07-01'::DATE`,
 `DATE '2013-07-01'`), `LIMIT` and `OFFSET`, over one table of Parquet files or several joined by inner or left
-outer joins, with uncorrelated `IN` subqueries. This
+outer joins, with uncorrelated `IN` and scalar subqueries. This
 covers all 43 ClickBench queries (see
 [ClickBench status](#clickbench-status)). Of the 22 queries derived from TPC-H, Q1, Q3, Q5, Q6, Q7, Q8, Q9, Q10,
-Q12, Q13, Q14, Q16, Q18 and Q19 pass (see [Queries derived from TPC-H](#queries-derived-from-tpc-h)).
+Q11, Q12, Q13, Q14, Q15, Q16, Q18 and Q19 pass
+(see [Queries derived from TPC-H](#queries-derived-from-tpc-h)).
 
 ```sql
 SELECT COUNT(*), COUNT(DISTINCT OS), AVG(ResolutionWidth) AS width FROM hits WHERE OS BETWEEN 2 AND 44
@@ -48,12 +49,16 @@ SELECT date_trunc('month', tr_day) AS m, MIN(tr_fare) FROM trips GROUP BY 1 ORDE
   as long as a join key connects every relation — so a comma list or a `CROSS JOIN` needs an equality between its
   relations, in the list's `ON` or in `WHERE`, and a `LEFT JOIN` needs one between its own two inputs, in its `ON`.
   A derived table and a `WITH` list are answered too, each bound as a sub-plan of its own. Of the subquery forms in
-  an expression, `x [NOT] IN (query)` and `NOT (x IN (query))` are answered as a top-level `AND` conjunct of
-  `WHERE`, of an inner join's `ON` or of `HAVING`, where `x` is an operand (a column, or an expression over one; in
-  `HAVING`, an aggregate too) and the query has one column of a type that shares a join key type with `x` (so no
-  `DOUBLE`); every other placement
-  exits 4, `NOT (x NOT IN (query))` and `NOT NOT (x IN (query))` among them, and so does a subquery column count
-  other than one — a bind error, as in DuckDB. `(query)` as a value and `EXISTS (query)` parse but are not answered,
+  an expression, `x [NOT] IN (query)`, `NOT (x IN (query))` and `x <op> (query)` in either order are answered as a
+  top-level `AND` conjunct of `WHERE`, of an inner join's `ON` or of `HAVING`, where `x` is an operand (a column, or
+  an expression over one; in `HAVING`, an aggregate too; for a comparison, a literal or a constant integer
+  expression as well) and the query has exactly one column. An `IN` key needs a type that holds both sides (so no
+  `DOUBLE`), and a comparison's query must be an aggregate over every row — no `GROUP BY`, `HAVING`, `LIMIT` or
+  `OFFSET`, each of which could leave no row — since that is the one shape returning exactly one row however the
+  data falls. Every other placement
+  exits 4, `NOT (x NOT IN (query))`, `NOT NOT (x IN (query))`, two subqueries in one comparison and a subquery that
+  is no direct operand among them, and so does a subquery column count
+  other than one — a bind error, as in DuckDB. `EXISTS (query)` parses but is not answered,
   and nor are `TRY_CAST`, a lateral reference, a column of an enclosing query block (a correlation), more than 256
   relations counting every sub-plan and every subquery, and a join graph that no join key connects (a cross
   product): exit code 4 as well. A query in parentheses that starts with neither
@@ -262,16 +267,22 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   `WHERE` or `HAVING` is its two comparisons, each folded and, over a table column, pushed into the scan like any
   comparison; `NOT BETWEEN`, `NOT (a BETWEEN ...)` and `BETWEEN` under `OR` or in `CASE` are compound conditions.
   DuckDB's names apply: `(a BETWEEN 1 AND 2)`, and both negations `(NOT (a BETWEEN 1 AND 2))`;
-- uncorrelated `IN` subqueries, as a top-level `AND` conjunct of `WHERE`, of an inner join's `ON` (which counts as
-  a `WHERE` conjunct) or of `HAVING`, in the three spellings `x IN (query)`, `x NOT IN (query)` and
+- uncorrelated subqueries, as a top-level `AND` conjunct of `WHERE`, of an inner join's `ON` (which counts as a
+  `WHERE` conjunct) or of `HAVING`. `IN` in its three spellings `x IN (query)`, `x NOT IN (query)` and
   `NOT (x IN (query))`: `x` is an operand as above, the query is a block of its own with one column, and the two
   share a join key type (an exact widening from each, so never a `DOUBLE`). `IN` is a semi join, which keeps a row
   once when it has a match, so it is exact with NULLs too; `NOT IN` is a null-aware anti join, which keeps every row
   of an empty set, a NULL `x` included, and otherwise only a row whose `x` is not NULL, has no match, and faces a
-  set with no NULL in it. The join sits above its block's inner joins, or above the aggregation for a `HAVING`
-  conjunct, in the order the conjuncts are written. The query may have its own `GROUP BY` and `HAVING`, and nothing
-  is pulled out of it; an aggregate inside it does not make the outer block an aggregate query. A column of an
-  enclosing block (a correlation) is exit code 4, and a column count other than one a bind error;
+  set with no NULL in it. And a comparison `x <op> (query)` in either order, where the query is an aggregate over
+  every row and so returns exactly one row: it becomes a keyless one-row join that appends that row's column, with
+  the comparison directly above it, which then follows every rule a comparison of two operands does — the `DECIMAL`
+  and `DATE` pairs it admits, its folding of a literal side, and its refusal of a `FLOAT` column (divergence D11),
+  which the column carries across the block boundary. Over no row `SUM`, `AVG`, `MIN` and `MAX` are NULL, which the
+  comparison rejects, and `COUNT` is 0, which it compares as usual; both as in DuckDB. The join sits above its
+  block's inner joins, or above the aggregation for a `HAVING` conjunct, in the order the conjuncts are written. An
+  `IN` query may have its own `GROUP BY` and `HAVING`, and nothing is pulled out of it; an aggregate inside any
+  subquery does not make the outer block an aggregate query. A column of an enclosing block (a correlation) is exit
+  code 4, and a column count other than one a bind error;
 - any of these in parentheses (`(a)`, `SUM((a))`, `WHERE (a = 1 AND b = 2)`), which group without changing
   anything.
 
@@ -1021,8 +1032,8 @@ The second workload is the 22 queries derived from TPC-H, in DuckDB's dialect, a
 committed ([ADR 0006](adr/0006-test-strategy-and-data-policy.md)); queries are referred to by their number (1-based).
 The ratchet `tests/data/tpch_status.json` lists the queries verified to pass, and `pass` below means exactly the
 ratchet (`pixi run lint` compares them); the PR that makes a query pass updates both. A query that does not pass must
-fail cleanly with exit code 4 (unsupported). Today Q1, Q3, Q5, Q6, Q7, Q8, Q9, Q10, Q12, Q13, Q14, Q16, Q18 and Q19
-pass; the plan is recorded in
+fail cleanly with exit code 4 (unsupported). Today Q1, Q3, Q5, Q6, Q7, Q8, Q9, Q10, Q11, Q12, Q13, Q14, Q15, Q16,
+Q18 and Q19 pass; the plan is recorded in
 ADRs 0021 (DECIMAL), 0022
 (joins, query blocks and uncorrelated subqueries) and 0023 (correlated subqueries). `tests/tpch/` generates the data
 at test time ([testing.md](testing.md#data-derived-from-tpc-h)), and `tpch.status.sf0_01`, `tpch.status.sf0_1` and
@@ -1042,11 +1053,11 @@ completes the query; most queries also need the DECIMAL work of ADR 0021 before 
 | Q8 | pass | derived tables (ADR 0022) |
 | Q9 | pass | derived tables (ADR 0022) |
 | Q10 | pass | inner joins (ADR 0022) |
-| Q11 | unsupported (exit code 4) | uncorrelated scalar subqueries (ADR 0022) |
+| Q11 | pass | uncorrelated scalar subqueries (ADR 0022) |
 | Q12 | pass | inner joins (ADR 0022) |
 | Q13 | pass | left outer joins (ADR 0022) |
 | Q14 | pass | inner joins (ADR 0022) |
-| Q15 | unsupported (exit code 4) | uncorrelated scalar subqueries (ADR 0022) |
+| Q15 | pass | uncorrelated scalar subqueries (ADR 0022) |
 | Q16 | pass | uncorrelated IN and NOT IN subqueries (ADR 0022) |
 | Q17 | unsupported (exit code 4) | correlated scalar aggregates (ADR 0023) |
 | Q18 | pass | uncorrelated IN and NOT IN subqueries (ADR 0022) |

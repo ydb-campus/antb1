@@ -329,6 +329,36 @@ antb1_add_cli_golden(
     --table
     "zones=${_f}/star/zones.parquet"
 )
+# A scalar subquery as a keyless one-row join (ADR 0022's J5): its build is the aggregate's single
+# row, which the join appends to every probe row, and the comparison is a Filter directly above it.
+# The outer side is an expression, so it is computed in the join's own layer below it -- the same
+# layer an IN probe's cast uses.
+antb1_add_cli_golden(
+  explain_scalar_subquery_one_row_join
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT COUNT(*) FROM trips WHERE tr_fare * 2 > (SELECT AVG(tr_fare) FROM trips)"
+    --table
+    "trips=${_f}/star/trips.parquet"
+)
+# In HAVING over a global aggregate whose select list is exactly its aggregates: the join's appended
+# column stands above the aggregation, so a Project restores the list.
+antb1_add_cli_golden(
+  explain_scalar_subquery_having_global
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT MIN(tr_driver) FROM trips HAVING MIN(tr_driver) = (SELECT MIN(dv_id) FROM drivers)"
+    --table
+    "trips=${_f}/star/trips.parquet"
+    --table
+    "drivers=${_f}/star/drivers.parquet"
+)
 
 # ---- bench: ClickBench-format JSON (docs/benchmarks.md); timings vary, so regexes ----
 # CMake regex: [.] [{] [}] [[] []] match the character itself; \n is a newline. Built with string(APPEND):

@@ -837,12 +837,42 @@ INSTANTIATE_TEST_SUITE_P(
 INSTANTIATE_TEST_SUITE_P(
     Subqueries, BindErrorTest,
     ::testing::Values(
-        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u)", kUnsupported, "(",
-                  "a scalar subquery is not supported"},
         ErrorCase{"SELECT (SELECT COUNT(*) FROM u) FROM t", kUnsupported, "(",
                   "a scalar subquery is not supported"},
-        ErrorCase{"SELECT i16 FROM t GROUP BY i16 HAVING COUNT(*) > (SELECT COUNT(*) FROM u)",
+        // Only an aggregate over every row returns exactly one row however the data falls, so
+        // every other shape of a scalar subquery exits 4 rather than check a row count at run time.
+        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT i16 FROM u)", kUnsupported, "(",
+                  "other than an aggregate over every row"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u LIMIT 1)", kUnsupported,
+                  "(", "other than an aggregate over every row"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u OFFSET 1)", kUnsupported,
+                  "(", "other than an aggregate over every row"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u GROUP BY i16)",
+                  kUnsupported, "(", "other than an aggregate over every row"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u HAVING COUNT(*) > 1)",
+                  kUnsupported, "(", "other than an aggregate over every row"},
+        // Two of them would be two stacked one-row joins, and one that is no direct operand of the
+        // comparison would need the join below an expression: both keep the form's own refusal.
+        ErrorCase{"SELECT i16 FROM t WHERE (SELECT MIN(i16) FROM u) < (SELECT MAX(i16) FROM u)",
                   kUnsupported, "(", "a scalar subquery is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 > (SELECT COUNT(*) FROM u) + 1", kUnsupported, "(",
+                  "a scalar subquery is not supported"},
+        // The other side is checked as any comparison's is: an operand, a literal, or a constant
+        // integer expression.
+        ErrorCase{"SELECT i16 FROM t WHERE 1 + 2.5 = (SELECT COUNT(*) FROM u)", kUnsupported,
+                  "1 + 2.5", "a comparison with a subquery needs a column or a literal"},
+        // A constant integer expression that overflows is a bind error (divergence D17), as it is
+        // without a subquery: the fold runs, and the comparison's own side has to survive the copy
+        // it makes (sql::Box deep-copies, so the subquery moves).
+        ErrorCase{"SELECT i16 FROM t WHERE 2147483647 + 1 = (SELECT COUNT(*) FROM u)", kBind,
+                  "2147483647 + 1", "Overflow in addition of INTEGER"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u, v)", kBind, "v",
+                  "table 'v' does not exist"},
+        // One column, as in DuckDB, which reports a bind error for two.
+        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT i16, i32 FROM u)", kUnsupported, "(",
+                  "other than an aggregate over every row"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT MIN(i16), MAX(i32) FROM u)", kBind, "(",
+                  "a subquery of a comparison must have one column, not 2"},
         ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT i16 FROM u)", kUnsupported, "EXISTS",
                   "EXISTS (subqueries) is not supported"},
         ErrorCase{"SELECT i16 FROM t WHERE NOT EXISTS (SELECT i16 FROM u)", kUnsupported, "EXISTS",
