@@ -28,7 +28,7 @@ std::string ExplainSql(std::string_view sql, bool optimize = true) {
   if (!plan.ok()) {
     return {};
   }
-  return Explain(optimize ? Optimize(*plan) : *plan);
+  return Explain(optimize ? Optimized(*plan) : *plan);
 }
 
 TEST(ExplainTest, RowCount) {
@@ -164,7 +164,7 @@ TEST(ExplainTest, NamesAndStringsStayOnOneAsciiLine) {
   ASSERT_TRUE(catalog.Register("w", table).ok());
   auto plan = BindSql("SELECT \"a\"\"b\", \"é\n\" FROM w WHERE \"a\"\"b\" = 'x\ty\\z'", catalog);
   ASSERT_TRUE(plan.ok()) << plan.status().ToString();
-  EXPECT_EQ(Explain(Optimize(*plan)),
+  EXPECT_EQ(Explain(Optimized(*plan)),
             "Output: a\"b:VARCHAR \\xC3\\xA9\\x0A:INTEGER\n"
             "Project \"a\"\"b\", \"\\xC3\\xA9\\x0A\"\n"
             "  Filter \"a\"\"b\" = 'x\\x09y\\x5Cz'\n"

@@ -275,7 +275,7 @@ TEST(ColumnIdsTest, PositionMismatchReportsBrokenInvariantsFirst) {
 // Optimize's rules find columns by their ids and leave positions to ResolvePositions, its last
 // step: an index that is not its column's position is set to it.
 TEST(ColumnIdsTest, OptimizeResolvesStaleIndexes) {
-  const LogicalPlan optimized = Optimize(FilterPlan(Column(kC, 0)));  // #3 is at 2, not 0
+  const LogicalPlan optimized = Optimized(FilterPlan(Column(kC, 0)));  // #3 is at 2, not 0
   const auto* filter = std::get_if<FilterNode>(optimized.root.get());
   ASSERT_NE(filter, nullptr);
   EXPECT_EQ(filter->predicates.at(0).column.value_or(BoundColumn{}).index, 2);

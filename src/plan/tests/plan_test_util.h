@@ -15,11 +15,13 @@
 #include <vector>
 
 #include <arrow/api.h>
+#include <gtest/gtest.h>
 
 #include "antb1/common/narrow.h"
 #include "antb1/plan/binder.h"
 #include "antb1/plan/catalog.h"
 #include "antb1/plan/logical_plan.h"
+#include "antb1/plan/optimizer.h"
 #include "antb1/plan/sql_status.h"
 #include "antb1/plan/table.h"
 #include "antb1/sql/parser.h"
@@ -27,6 +29,14 @@
 // In-memory tables and helpers shared by the plan unit tests.
 
 namespace antb1::plan {
+
+// plan::Optimize where the test expects it to succeed. It can fail since ADR 0023's unnesting pass,
+// which rejects a correlated subquery; a test that wants the failure calls Optimize itself.
+inline LogicalPlan Optimized(const LogicalPlan& plan) {
+  arrow::Result<LogicalPlan> out = Optimize(plan);
+  EXPECT_TRUE(out.ok()) << out.status().ToString();
+  return out.ok() ? *std::move(out) : LogicalPlan{};
+}
 
 // gtest prints a column id as EXPLAIN-like text: #7.
 inline void PrintTo(ColumnId id, std::ostream* os) { *os << '#' << std::to_underlying(id); }

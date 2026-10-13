@@ -14,6 +14,7 @@
 #include "antb1/common/check.h"
 #include "antb1/common/narrow.h"
 #include "antb1/plan/logical_plan.h"
+#include "antb1/plan/sql_status.h"
 
 // Every std::visit below uses a visitor with one overload per node type, so a new node type fails
 // to compile until each rule handles it. The rules find columns by their ids and never read or set
@@ -336,20 +337,55 @@ struct Pruner {
   }
 };
 
+// The outermost dependent join of the plan, nullptr when it has none. Pre-order, so the first one
+// found is the one whose span names the whole correlated subquery.
+const DependentJoinNode* FirstDependentJoin(const LogicalNodePtr& node) {
+  if (node == nullptr) {
+    return nullptr;
+  }
+  if (const auto* dependent = std::get_if<DependentJoinNode>(node.get())) {
+    return dependent;
+  }
+  for (const LogicalNodePtr& input : InputsOf(*node)) {
+    if (const DependentJoinNode* found = FirstDependentJoin(input)) {
+      return found;
+    }
+  }
+  return nullptr;
+}
+
+// The unnesting pass (ADR 0023), the first and only fallible step of Optimize: it replaces every
+// dependent join with ordinary joins, or rejects the query with exit code 4 at the subquery's span.
+// Roadmap id U1 has neither rewrite, so it rejects every one; U2 adds Path 1 (correlated EXISTS and
+// NOT EXISTS pulled up into semi and anti joins) and U3 Path 2 (correlated scalar aggregates by
+// equivalence substitution). Outermost first, as the top-down algorithm goes.
+arrow::Result<LogicalNodePtr> Unnest(const LogicalNodePtr& root) {
+  if (const DependentJoinNode* dependent = FirstDependentJoin(root)) {
+    return UnsupportedError("a correlated subquery is not supported", dependent->span);
+  }
+  return root;
+}
+
 LogicalNodePtr Prune(const LogicalNodePtr& node, Needed needed) {
   return std::visit(Pruner{.node = node, .needed = needed}, *node);
 }
 
 }  // namespace
 
-LogicalPlan Optimize(const LogicalPlan& plan) {
+arrow::Result<LogicalPlan> Optimize(const LogicalPlan& plan) {
   if (plan.root == nullptr) {
     return plan;
   }
-  LogicalNodePtr root =
-      LimitBelowProject(DependentKeys(CountStarToRowCount(plan.root), /*limited=*/false));
+  ARROW_ASSIGN_OR_RAISE(LogicalNodePtr root, Unnest(plan.root));
+  root = LimitBelowProject(DependentKeys(CountStarToRowCount(std::move(root)), /*limited=*/false));
   const std::vector<ColumnId> output = OutputIds(*root);
   root = Prune(root, Needed(output.begin(), output.end()));
+  // A dependent join that Unnest left behind is a bug in the pass, never an unsupported query: no
+  // SqlErrorDetail, so it exits 70 and cannot pass for a refusal (ADR 0005, ADR 0023). Unreachable
+  // while Unnest rejects every dependent join; U2 and U3, which rewrite them, make it live.
+  if (FirstDependentJoin(root) != nullptr) {
+    return arrow::Status::NotImplemented("the unnesting pass left a dependent join in the plan");
+  }
   return ResolvePositions({.root = std::move(root), .output = plan.output});
 }
 

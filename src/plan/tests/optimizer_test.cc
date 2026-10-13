@@ -30,7 +30,7 @@ LogicalPlan Optimized(std::string_view sql) {
   static const Catalog catalog = MakeCatalog();
   auto plan = BindSql(sql, catalog);
   EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
-  return plan.ok() ? Optimize(*plan) : LogicalPlan{};
+  return plan.ok() ? Optimized(*plan) : LogicalPlan{};
 }
 
 TEST(OptimizerTest, CountStarWithoutWhereBecomesRowCount) {
@@ -132,7 +132,7 @@ TEST(OptimizerTest, ComputeKeepsOnlyWhatIsUsed) {
   wider.ids.push_back(ColumnId{std::to_underlying(std::ranges::max(OutputIds(project))) + 1});
   ProjectNode top = project;
   top.input = std::make_shared<const LogicalNode>(std::move(wider));
-  const LogicalPlan pruned = Optimize(LogicalPlan{
+  const LogicalPlan pruned = Optimized(LogicalPlan{
       .root = std::make_shared<const LogicalNode>(std::move(top)), .output = bound->output});
   EXPECT_EQ(Explain(pruned),
             "Output: i16:SMALLINT (i16 + 1):SMALLINT\n"
@@ -143,8 +143,8 @@ TEST(OptimizerTest, ComputeKeepsOnlyWhatIsUsed) {
   columns_only.columns.pop_back();
   columns_only.ids.pop_back();
   const LogicalPlan dropped =
-      Optimize(LogicalPlan{.root = std::make_shared<const LogicalNode>(std::move(columns_only)),
-                           .output = {bound->output[0]}});
+      Optimized(LogicalPlan{.root = std::make_shared<const LogicalNode>(std::move(columns_only)),
+                            .output = {bound->output[0]}});
   EXPECT_EQ(Explain(dropped),
             "Output: i16:SMALLINT\n"
             "Project i16\n"
@@ -183,7 +183,7 @@ TEST(OptimizerTest, IsIdempotentAndKeepsTheOutput) {
         "SELECT i32 - 1, COUNT(*) AS c FROM t GROUP BY i32, i32 - 1 ORDER BY c DESC LIMIT 3",
         "SELECT i32, i32 + 1, COUNT(*) FROM t GROUP BY i32, i32 + 1 LIMIT 1"}) {
     const LogicalPlan once = Optimized(sql);
-    const LogicalPlan twice = Optimize(once);
+    const LogicalPlan twice = Optimized(once);
     EXPECT_EQ(Explain(twice), Explain(once)) << sql;
   }
 }
@@ -245,14 +245,14 @@ TEST(OptimizerTest, KeepsTheColumnIds) {
         "SELECT i32 * 2 FROM t ORDER BY i32 LIMIT 3", "SELECT * FROM ok WHERE s = 'x' LIMIT 2"}) {
     auto bound = BindSql(sql, catalog);
     ASSERT_TRUE(bound.ok()) << sql;
-    const LogicalPlan optimized = Optimize(*bound);
+    const LogicalPlan optimized = Optimized(*bound);
     EXPECT_EQ(PositionMismatch(optimized), std::nullopt) << sql;
     EXPECT_EQ(OutputIds(*optimized.root), OutputIds(*bound->root)) << sql;
   }
 
   auto field = BindSql("SELECT i32 FROM t", catalog);
   ASSERT_TRUE(field.ok());
-  const LogicalPlan pruned = Optimize(*field);
+  const LogicalPlan pruned = Optimized(*field);
   const auto& scan = std::get<ScanNode>(Nth(pruned, 1));
   EXPECT_EQ(scan.fields, (std::vector<int>{1}));
   EXPECT_EQ(scan.ids, (std::vector<ColumnId>{std::get<ScanNode>(Nth(*field, 1)).ids.at(1)}));
@@ -260,7 +260,7 @@ TEST(OptimizerTest, KeepsTheColumnIds) {
   // RowCount is the COUNT(*) column it replaces: HAVING above it still reads it.
   auto counted = BindSql("SELECT COUNT(*) FROM t HAVING COUNT(*) > 1", catalog);
   ASSERT_TRUE(counted.ok());
-  const LogicalPlan rows = Optimize(*counted);
+  const LogicalPlan rows = Optimized(*counted);
   const auto& having = std::get<FilterNode>(*rows.root);
   const auto& count = std::get<RowCountNode>(*having.input);
   EXPECT_EQ(count.id, std::get<AggregateNode>(Nth(*counted, 1)).aggregates.at(0).id);
@@ -272,7 +272,7 @@ TEST(OptimizerTest, KeepsTheColumnIds) {
   ASSERT_TRUE(grouped.ok());
   const std::vector<ColumnId> group_ids = OutputIds(Nth(*grouped, 1));
   ASSERT_EQ(group_ids.size(), 3U);
-  const LogicalPlan reduced = Optimize(*grouped);
+  const LogicalPlan reduced = Optimized(*grouped);
   EXPECT_EQ(std::get<ProjectNode>(Nth(reduced, 1)).ids, group_ids);
   EXPECT_EQ(std::get<ComputeNode>(Nth(reduced, 2)).ids, (std::vector<ColumnId>{group_ids[1]}));
   EXPECT_EQ(std::get<GroupAggregateNode>(Nth(reduced, 3)).key_ids,
@@ -454,7 +454,7 @@ TEST(OptimizerTest, RulesReadColumnIdsNotPositions) {
        }) {
     auto bound = BindSql(sql, catalog);
     ASSERT_TRUE(bound.ok()) << sql << ": " << bound.status().ToString();
-    const LogicalPlan expected = Optimize(*bound);
+    const LogicalPlan expected = Optimized(*bound);
     for (const int position : {0, 999}) {
       const std::function<int(ColumnId, int)> scramble = [position](ColumnId, int) {
         return position;
@@ -464,7 +464,7 @@ TEST(OptimizerTest, RulesReadColumnIdsNotPositions) {
       if (position == 999) {  // no plan here has that many columns
         ASSERT_NE(References(scrambled), References(*bound)) << sql;
       }
-      const LogicalPlan optimized = Optimize(scrambled);
+      const LogicalPlan optimized = Optimized(scrambled);
       EXPECT_EQ(Explain(optimized), Explain(expected)) << sql;
       EXPECT_EQ(References(optimized), References(expected)) << sql;
       EXPECT_EQ(PositionMismatch(optimized), std::nullopt) << sql;
@@ -574,7 +574,7 @@ const JoinNode& JoinBelowProject(const LogicalPlan& plan) {
 
 // Each input keeps the columns needed above, the keys and the residual's columns, in field order.
 TEST(OptimizerTest, PrunesThroughBothInputsOfAJoin) {
-  const LogicalPlan plan = Optimize(ProjectOverJoin(
+  const LogicalPlan plan = Optimized(ProjectOverJoin(
       JoinKind::kInner, {FieldOf(11, 3), FieldOf(1, 0)}, {Less(FieldOf(1, 2), FieldOf(11, 2))}));
   EXPECT_EQ(PositionMismatch(plan), std::nullopt);
   const JoinNode& join = JoinBelowProject(plan);
@@ -589,10 +589,10 @@ TEST(OptimizerTest, PrunesThroughBothInputsOfAJoin) {
   const auto& project = std::get<ProjectNode>(*plan.root);
   EXPECT_EQ(project.columns[0].index, 5) << "t11.u16, after the 3 left columns";
   EXPECT_EQ(project.columns[1].index, 0);
-  EXPECT_EQ(Explain(Optimize(plan)), Explain(plan)) << "idempotent";
+  EXPECT_EQ(Explain(Optimized(plan)), Explain(plan)) << "idempotent";
 
   // A semi join outputs its left input only: the right input keeps just its key.
-  const LogicalPlan semi = Optimize(ProjectOverJoin(JoinKind::kSemi, {FieldOf(1, 3)}));
+  const LogicalPlan semi = Optimized(ProjectOverJoin(JoinKind::kSemi, {FieldOf(1, 3)}));
   EXPECT_EQ(PositionMismatch(semi), std::nullopt);
   EXPECT_EQ(std::get<ScanNode>(*JoinBelowProject(semi).left).fields, (std::vector<int>{1, 3}));
   EXPECT_EQ(std::get<ScanNode>(*JoinBelowProject(semi).right).fields, (std::vector<int>{1}));
@@ -604,19 +604,19 @@ TEST(OptimizerTest, CountStarInsideAJoinInputBecomesRowCount) {
       AggregateNode{.input = FourFields(11),
                     .aggregates = {AggregateCall{.kind = AggKind::kCountStar, .id = ColumnId{20}}},
                     .span = {}});
-  const LogicalPlan plan = Optimize(PlanOver(Node(JoinNode{.kind = JoinKind::kOneRow,
-                                                           .left = FourFields(1),
-                                                           .right = count,
-                                                           .keys = {},
-                                                           .residual = {},
-                                                           .build = BuildSide::kRight,
-                                                           .span = {}})));
+  const LogicalPlan plan = Optimized(PlanOver(Node(JoinNode{.kind = JoinKind::kOneRow,
+                                                            .left = FourFields(1),
+                                                            .right = count,
+                                                            .keys = {},
+                                                            .residual = {},
+                                                            .build = BuildSide::kRight,
+                                                            .span = {}})));
   EXPECT_EQ(PositionMismatch(plan), std::nullopt);
   const auto& join = std::get<JoinNode>(*plan.root);
   EXPECT_TRUE(std::holds_alternative<RowCountNode>(*join.right)) << Explain(plan);
   EXPECT_EQ(std::get<ScanNode>(*join.left).fields, (std::vector<int>{0, 1, 2, 3}));
 
-  const LogicalPlan above = Optimize(PlanOver(Node(AggregateNode{
+  const LogicalPlan above = Optimized(PlanOver(Node(AggregateNode{
       .input = std::get<ProjectNode>(*ProjectOverJoin(JoinKind::kInner, {}).root).input,
       .aggregates = {AggregateCall{.kind = AggKind::kCountStar, .id = ColumnId{30}}},
       .span = {}})));
@@ -646,14 +646,14 @@ TEST(OptimizerTest, RulesReachBothInputsOfAJoin) {
                     .residual = {},
                     .build = BuildSide::kRight,
                     .span = {}});
-  const LogicalPlan plain = Optimize(PlanOver(join));
+  const LogicalPlan plain = Optimized(PlanOver(join));
   EXPECT_EQ(PositionMismatch(plain), std::nullopt);
   const auto* group = Find<GroupAggregateNode>(plain.root);
   ASSERT_NE(group, nullptr);
   EXPECT_EQ(group->keys.size(), 1U) << Explain(plain);
 
   const LogicalPlan limited =
-      Optimize(PlanOver(Node(LimitNode{.input = join, .limit = 3, .offset = 0, .span = {}})));
+      Optimized(PlanOver(Node(LimitNode{.input = join, .limit = 3, .offset = 0, .span = {}})));
   EXPECT_EQ(PositionMismatch(limited), std::nullopt);
   group = Find<GroupAggregateNode>(limited.root);
   ASSERT_NE(group, nullptr);
@@ -661,7 +661,7 @@ TEST(OptimizerTest, RulesReachBothInputsOfAJoin) {
 
   // Limit(Project(Join)): the Limit moves below the Project and stays above the Join.
   const LogicalPlan project = ProjectOverJoin(JoinKind::kInner, {FieldOf(1, 0)});
-  const LogicalPlan moved = Optimize(
+  const LogicalPlan moved = Optimized(
       PlanOver(Node(LimitNode{.input = project.root, .limit = 2, .offset = 0, .span = {}})));
   EXPECT_EQ(PositionMismatch(moved), std::nullopt);
   const auto& above = std::get<ProjectNode>(*moved.root);
@@ -672,7 +672,7 @@ TEST(OptimizerTest, RulesReachBothInputsOfAJoin) {
   auto limited_right = BindSql("SELECT i16 FROM t LIMIT 3", catalog);
   ASSERT_TRUE(limited_right.ok()) << limited_right.status().ToString();
   right_key.id = OutputIds(*limited_right->root).front();
-  const LogicalPlan inner = Optimize(
+  const LogicalPlan inner = Optimized(
       PlanOver(Node(JoinNode{.kind = JoinKind::kInner,
                              .left = FourFields(101),
                              .right = limited_right->root,
@@ -689,23 +689,56 @@ TEST(OptimizerTest, RulesReachBothInputsOfAJoin) {
 TEST(OptimizerTest, JoinRulesReadColumnIdsNotPositions) {
   const LogicalPlan bound = ProjectOverJoin(JoinKind::kInner, {FieldOf(11, 3), FieldOf(1, 0)},
                                             {Less(FieldOf(1, 2), FieldOf(11, 2))});
-  const LogicalPlan expected = Optimize(bound);
+  const LogicalPlan expected = Optimized(bound);
   for (const int position : {0, 999}) {
     const std::function<int(ColumnId, int)> scramble = [position](ColumnId, int) {
       return position;
     };
     const LogicalPlan scrambled{.root = MapReferences{.f = scramble}.Map(bound.root),
                                 .output = bound.output};
-    const LogicalPlan optimized = Optimize(scrambled);
+    const LogicalPlan optimized = Optimized(scrambled);
     EXPECT_EQ(Explain(optimized), Explain(expected));
     EXPECT_EQ(References(optimized), References(expected));
   }
 }
 
 TEST(OptimizerTest, EmptyPlanStaysEmpty) {
-  const LogicalPlan plan = Optimize(LogicalPlan{});
+  const LogicalPlan plan = Optimized(LogicalPlan{});
   EXPECT_EQ(plan.root, nullptr);
   EXPECT_TRUE(plan.output.empty());
+}
+
+// The unnesting pass, the first and only fallible step (ADR 0023). U1 has no rewrite, so it rejects
+// every dependent join: kUnsupported at the subquery's span, which the CLI turns into exit code 4,
+// never a bind error (1) or an internal error (70). No other rule runs on a rejected plan.
+TEST(OptimizerTest, TheUnnestingPassRejectsEveryDependentJoin) {
+  const SourceSpan span{.offset = 13, .length = 5};
+  for (const JoinKind kind : {JoinKind::kSemi, JoinKind::kAnti, JoinKind::kOneRow}) {
+    const auto status =
+        Optimize(PlanOver(Node(DependentJoinNode{
+                     .kind = kind, .left = FourFields(1), .right = FourFields(11), .span = span})))
+            .status();
+    const auto detail = GetSqlError(status);
+    ASSERT_NE(detail, nullptr) << ToString(kind) << ": " << status.ToString();
+    EXPECT_EQ(detail->kind(), SqlErrorDetail::Kind::kUnsupported);
+    EXPECT_EQ(detail->span(), span) << "the subquery, not the whole query";
+    EXPECT_EQ(status.message(), "a correlated subquery is not supported");
+  }
+  // Outermost first: the span is the outer subquery's, whichever input holds the inner one.
+  const SourceSpan inner{.offset = 40, .length = 2};
+  const auto nested = Node(DependentJoinNode{
+      .kind = JoinKind::kSemi, .left = FourFields(21), .right = FourFields(31), .span = inner});
+  const auto status =
+      Optimize(PlanOver(Node(DependentJoinNode{
+                   .kind = JoinKind::kSemi, .left = FourFields(1), .right = nested, .span = span})))
+          .status();
+  EXPECT_EQ(GetSqlError(status)->span(), span);
+}
+
+// A plan with no dependent join is unaffected: the pass is an identity and the other rules run.
+TEST(OptimizerTest, TheUnnestingPassLeavesAnOrdinaryPlanAlone) {
+  const LogicalPlan plan = Optimized("SELECT COUNT(*) FROM t");
+  EXPECT_TRUE(std::holds_alternative<RowCountNode>(*plan.root)) << Explain(plan);
 }
 
 }  // namespace
