@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791898709206,
+  "lastUpdate": 1791917945458,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -7128,6 +7128,114 @@ window.BENCHMARK_DATA = {
             "value": 125.14882899999975,
             "unit": "ms/iter",
             "extra": "iterations: 5\ncpu: 125.12537700000016 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "dc7e22c7a7bbe03bd22378c7586b40e123a23fe2",
+          "message": "refactor(plan): dependent joins for correlated subqueries (#131)\n\n## Summary\n\nRoadmap id **U1** of [ADR\n0023](../blob/main/docs/adr/0023-unnesting.md): the whole dependent-join\ncontract, with **no query newly answered**. A correlated scalar subquery\nnow binds to a\n`DependentJoin` that the optimizer's new unnesting pass rejects — the\nquery still exits 4, but\nthrough the pass, which is exactly what U2 and U3 replace with a\nrewrite.\n\nEight commits, each buildable and testable on its own. The first six are\nthe plan contract and\nchange no query's behavior at all; the last two are the binder, the only\nhalf that changes a\nmessage or a span.\n\n| | |\n|---|---|\n| `feat(plan)` | `DependentJoinNode` in the variant and all **ten**\nexhaustive visitors |\n| `refactor(plan)` | the Resolver binds a dependent join's left ids\ninside its right input |\n| `refactor(plan)` | `plan::Optimize` is fallible, with the unnesting\npass first |\n| `refactor(plan)` | outer references classified by clause and distance\n|\n| `feat(plan)` | `plan::FreeVariables` over column ids |\n| `feat(plan)` | the binder builds a dependent join |\n| `test(engine)` | exit 4 from `query`, `explain` and `explain\n--analyze` |\n| `fix(plan)` | the `-Werror` and clang-tidy legs |\n\n## What it delivers\n\n**Outer references resolve.** A reference in a WHERE conjunct of its own\nblock (an inner join's `ON`\nincluded) naming the block that directly encloses it resolves there, by\nid. Every other placement\nexits 4 **at the reference's span, with the rule it broke**: `supported\nonly in WHERE` in a select\nlist, `GROUP BY`, `ORDER BY`, `HAVING` or a `LEFT JOIN`'s `ON`; `further\nout than the enclosing one`\ntwo or more blocks out; and a lateral one in a derived table or a CTE.\n\n**The binder plans the subquery.** A subquery whose plan has free\nvariables becomes a\n`DependentJoin`; an uncorrelated one keeps ADR 0022's direct join, so an\n`IN` subquery with\n`GROUP BY` or `HAVING` stays allowed. The plan shape is pinned:\n\n```text\nFilter i32 = \"min(u.i32)\"\n  DependentJoin ONE-ROW\n    Scan table=t ...\n    Aggregate MIN(i32)\n      Filter \"(u.i64 = t.i64)\"      <- one filter, above the block's joins, below its aggregation\n        Compute (u.i64 = t.i64)\n          Scan table=u ...\n```\n\n**`plan::Optimize` can fail.** Its one production call site is\n`ParseAndBind`, which `Execute`,\n`Explain` and `ExplainAnalyze` all go through, so `explain` now rejects\nexactly what `query`\nrejects — the reason for making Optimize fallible rather than rejecting\nin the physical planner\nalone. A dependent join the pass leaves behind fails with a bare\n`NotImplemented` and no\n`SqlErrorDetail`: exit 70, never 4, so a bug in the pass can never pass\nfor a refusal (ADR 0005).\n\n**Scope kept deliberately narrow.** `EXISTS` waits for U2 (see\nMaintainer notes), so `kSemi` and\n`kAnti` dependent joins exist only in hand-built plans; a correlated\n`IN` or `NOT IN` is refused by\nits shape, at the `IN`, since its NULL semantics need the set's NULL and\nempty flags for each\nbinding. U1 adds **no join kind** and **no operator**.\n\n## The abort this PR exists to prevent\n\nNot hypothetical — I hit it. Today `Scope::CorrelationError`\nshort-circuits binding at the *first*\nouter reference, so a correlated block never finishes binding. The\nmoment outer references resolve\ninstead, the whole block binds and reaches `ResolvePositions`, which\nfails on an id nothing below it\ndefines and escalates to `internal::CheckFailed`. **The build with the\nresolution and without the\nnode aborts on 7 tests**, the TPC-H ratchet among them.\n\nThe Resolver's binding-frame commit is what makes it legal: a dependent\njoin pushes its left input's\noutput ids, walks its right input, and pops. Outside a right input the\nstack is empty, so a plan with\nno dependent join resolves byte for byte as before. This is the same\ndefect class as the two J5 P0s,\nand it is why those two commits are ordered the way they are.\n\n## One pre-existing defect fixed\n\nThe scope chain was consulted after **any** failed resolution, so a name\na block has twice, or one\nwhose column has no engine type, was reported as a correlation instead\nof keeping its own error.\nHarmless while every correlation exited 4 — but once outer references\nresolve, the old rule would\nhave made an **ambiguous inner name silently read the outer column**,\nwhich is a wrong answer, not a\nwrong message. Now only a name the block does not have at all\n(`Lookup::Outcome::kMissing`) is an\nouter reference. Nothing in the repo depended on the masking: the whole\nsuite passed unchanged, and\nthe ambiguous case is pinned now.\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [x] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run ci\n100% tests passed out of 2655\n\n$ pixi run coverage\n| `plan`   | 96.08% (7197/7491) | 93.5% | 90.83% (4043/4451) | 89.5% | ok |\n| `exec`   | 97.63% (9162/9384) | 96.1% | 89.34% (5078/5684) | 85.1% | ok |\n| `engine` | 95.78%   (454/474) | 93.0% | 88.08%   (229/260) | 85.1% | ok |\nCoverage gate: PASS\n\n$ pixi run tidy\n0 findings in all 22 changed files (the remaining ones are pre-existing on osx-arm64,\nin src/exec/{sort,group_table,grouped_aggregate_state,profile}.cc and three exec tests,\nnone of which this PR touches)\n\n$ pixi run lint\nevery hook Passed except shellcheck, which fails identically on main\n\n$ pixi run diff-random\nDIFF: PASS seed=3902297769 queries=2000 failed=0 unsupported=0\n```\n\nThe TPC-H ratchet does not move (16 of 22) and `rejections_clean` holds:\nthe six correlated queries\nstill exit 4, which is the gate this PR most threatened — the binder now\nbinds their whole\nsubquery block, where before it stopped at the first outer reference.\n\n## Tests\n\n- **`column_ids_test.cc`** — the two shapes of the output-id contract: a\nfree variable in the right\ninput resolves to its position among the bound ids, the same reference\nunder the *left* input\nstill fails, and resolving a resolved plan changes nothing; `mark` goes\nlast in `OutputIds`;\n`FreeVariables` over every kind of reference, and the two cases that\nmake a dependent join's own\n  ids not free.\n- **`binder_test.cc`** — a correlated scalar subquery binds to a one-row\n`DependentJoin` whose plan\nhas no mismatch, its right input has free variables and the whole plan\nhas none; the pass rejects\nit; an uncorrelated one still gets a direct join and optimizes clean.\nEight new refusal cases, one\n  per rule, each pinned to its span and message.\n- **`session_test.cc`** — every correlated shape from all three entry\npoints.\n- **`explain_test.cc`**, **`logical_plan_test.cc`**,\n**`join_order_test.cc`**,\n**`physical_planner_test.cc`** — the node in each visitor, and that the\nphysical planner's\nrejection carries `kUnsupported` with the subquery's span, both profiled\nand not, and below\n  another node.\n\nA **lateral reference** is pinned for the first time.\n`derived_tables.slt`'s record for it is\n`onlyif duckdb`, which antb1 never runs, so until now nothing would have\nnoticed if a derived table\nhad started reading its preceding siblings' columns.\n\n## Maintainer notes\n\n- **EXISTS is deferred to U2, on your call.** The ADR genuinely does not\nsettle it: the Placement\nbullet under \"Binding (U1)\" names `EXISTS`, while the Plan section gives\nU2 \"Path 1, the `*` rule,\nthe EXISTS shapes that exit 4\". Deferring matches the code: all 17\n`exists.slt` records are tagged\n`pending U2` under a heading that says U2 removes the guards, and\naccepting it now would turn\n`exists.slt:137-140` from Unsupported into a BindError — rule 5 fires in\n`BindSelectList`, before\n`BindWhere` ever sees the correlation — which the pending gate rejects.\n- Two decisions I took without asking, both from the scoping pass's\nrecommendation: an outer\nreference's `index` is its position among the dependent join's left\noutput ids (the only rule that\nkeeps \"an index is a position in some id list the node can see\" true),\nand `mark` is a field on\n`DependentJoinNode` only, with `JoinIds` generalized to take a defining\nnode's own id. Adding the\nmark kind later therefore needs a kind and that field on `JoinNode`, not\na rewrite of `OutputIds`\nor the resolver walk — which is what ADR 0023's \"One output-id contract\nfor two shapes\" asks of\n  U1. Say the word if you would rather have either differently.\n- **No governance paths touched.** No ADR edit, no status file, no\nratchet, no `pixi.lock`.\n`docs/sql-subset.md` and `docs/architecture.md` are updated as every\nroadmap PR must.\n- `pixi run check` cannot pass on this osx-arm64 machine, unchanged from\n#120 onward: the osx-arm64\nshellcheck reports pre-existing `SC2218` in a governance file, identical\non `main`. `ci`,\n  `coverage` and `tidy` stand in.\n- **What this unblocks.** U2 (Path 1) and U3 (Path 2) can run side by\nside after T3. Both need the\ncorrelated conjuncts where this PR puts them — in one filter above the\nblock's joins — which is\nthe part of U1 with no consumer yet and so the easiest to get wrong\nunnoticed; the plan test pins\n  the whole shape for that reason.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests) — see the\n      maintainer note; `ci`, `coverage` and `tidy` pass\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer — none\n\n## AI assistance\n\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5) scoped,\nimplemented and verified\nthis PR. A ten-agent scoping workflow (six surveys of the code U1\ntouches, three adversarial\nrisk passes, one synthesis) sized the work and raised eight blockers\nbefore any code was\nwritten; four of them were the same unsettled question about EXISTS,\nwhich the maintainer\ndecided. Two of its findings changed the implementation materially: that\nthe resolution and\nthe node must land in that order or correlated queries abort, and that\nno survey had planned a\ntest over a *bound* correlated plan, since every repo gate stays green\nif the binder never\n      builds one.\n- Accountable human (has read and understands the whole diff): @hor911\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-13T21:55:44+03:00",
+          "tree_id": "802e3438e8c8fa0ccfebddb22a5cd360daa46f72",
+          "url": "https://github.com/ydb-campus/antb1/commit/dc7e22c7a7bbe03bd22378c7586b40e123a23fe2"
+        },
+        "date": 1791917944913,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 5041.20912566655,
+            "unit": "ns/iter",
+            "extra": "iterations: 139146\ncpu: 5040.607484225202 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84014.45158791578,
+            "unit": "ns/iter",
+            "extra": "iterations: 7746\ncpu: 84004.23483088044 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 221844.55780804795,
+            "unit": "ns/iter",
+            "extra": "iterations: 3157\ncpu: 221814.28508077297 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 438465.89104570623,
+            "unit": "ns/iter",
+            "extra": "iterations: 1597\ncpu: 438288.2448340639 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 361871.60402684775,
+            "unit": "ns/iter",
+            "extra": "iterations: 1937\ncpu: 361775.6917914299 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2086217.2822822337,
+            "unit": "ns/iter",
+            "extra": "iterations: 333\ncpu: 2085779.660660661 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 51.64518384615436,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 51.632274923076935 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 44.98724156249878,
+            "unit": "ms/iter",
+            "extra": "iterations: 16\ncpu: 44.9652646875 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 193.5854886666751,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 193.54640100000017 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.406975102041176,
+            "unit": "ms/iter",
+            "extra": "iterations: 49\ncpu: 14.405389408163257 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 22.44489064516085,
+            "unit": "ms/iter",
+            "extra": "iterations: 31\ncpu: 22.440184935483902 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 39.58576966666606,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 39.57919816666659 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.6615018057553934,
+            "unit": "ms/iter",
+            "extra": "iterations: 417\ncpu: 1.6611860383693053 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 108.77232016666956,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 108.76004833333337 ms\nthreads: 1"
           }
         ]
       }
