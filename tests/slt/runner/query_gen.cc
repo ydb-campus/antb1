@@ -712,6 +712,12 @@ constexpr unsigned kSubqueryPercent = 25;
 // Salt of the fifth random stream, which every draw that only a subquery needs takes, so that a
 // query without one is the query this seed generated before the subquery PR.
 constexpr uint64_t kSubqueryStreamSalt = 0x7375622D71756572ULL;
+// Share of the VARCHAR-valued string functions that are substring rather than regexp_replace
+// (ADR 0023's S5).
+constexpr unsigned kSubstringPercent = 55;
+// Salt of the sixth random stream, which every draw that only substring needs takes, so that a
+// query without one is the query this seed generated before the substring PR.
+constexpr uint64_t kSubstringStreamSalt = 0x7375627374722D72ULL;
 
 std::optional<std::size_t> ColumnIndex(const GenTable& t, std::string_view name) {
   const auto it = std::ranges::find_if(
@@ -880,13 +886,14 @@ class Builder {
  public:
   // `join_rng`: the query's second stream, which every draw that only a join needs takes.
   Builder(const std::vector<GenTable>& tables, Rng& rng, Rng& join_rng, Rng& block_rng,
-          Rng& left_rng, Rng& sub_rng, FeatureSet allowed)
+          Rng& left_rng, Rng& sub_rng, Rng& substring_rng, FeatureSet allowed)
       : tables_(tables),
         rng_(rng),
         join_rng_(join_rng),
         block_rng_(block_rng),
         left_rng_(left_rng),
         sub_rng_(sub_rng),
+        substring_rng_(substring_rng),
         allowed_(allowed),
         edges_(UsableEdges(tables)) {}
 
@@ -3100,14 +3107,26 @@ class Builder {
     return false;
   }
 
-  // strlen(c) (`length`: an exact BIGINT) or regexp_replace(c, 'pattern', 'replacement') of a
-  // VARCHAR column. Returns the result's kind, or std::nullopt (nothing written).
+  // strlen(c) (`length`: an exact BIGINT), or one of the VARCHAR-valued functions of a VARCHAR
+  // column: regexp_replace(c, 'pattern', 'replacement'), or substring(c, start[, length]) when it
+  // is allowed and the substring stream draws it. Returns the result's kind, or std::nullopt
+  // (nothing written).
   std::optional<ValueKind> StringFunction(const GenColumn& c, bool length) {
-    if (!allowed_.Has(Feature::kStringFunctions) || c.kind != ValueKind::kVarchar ||
-        (!length && !allowed_.Has(Feature::kStringLiteral))) {
+    if (!allowed_.Has(Feature::kStringFunctions) || c.kind != ValueKind::kVarchar) {
+      return std::nullopt;
+    }
+    // Its own stream decides, so a query that writes regexp_replace is the query this seed wrote
+    // before substring existed.
+    const bool substring = !length && allowed_.Has(Feature::kSubstring) &&
+                           allowed_.Has(Feature::kIntegerLiteral) &&
+                           substring_rng_.Percent(kSubstringPercent);
+    if (!length && !substring && !allowed_.Has(Feature::kStringLiteral)) {
       return std::nullopt;
     }
     used_.Add(Feature::kStringFunctions);
+    if (substring) {
+      return Substring(c);
+    }
     if (length) {
       Keyword("STRLEN");
       Symbol("(");
@@ -3128,6 +3147,56 @@ class Builder {
     tokens_.push_back({.kind = Token::Kind::kLiteral, .text = SqlString(rng_.Pick(kPatterns))});
     Symbol(",");
     tokens_.push_back({.kind = Token::Kind::kLiteral, .text = SqlString(rng_.Pick(kReplacements))});
+    Symbol(")");
+    return ValueKind::kVarchar;
+  }
+
+  // substring(c, start[, length]) of a VARCHAR column, in the comma form or in its SQL-standard
+  // spelling (ADR 0023's S5). Every argument is a literal, so the window is the same for every
+  // row: the start reaches from before the value to past its end and may count from the end, and
+  // the length, when one is written, may be negative, which extends the window backwards. The
+  // bounds stay small -- DuckDB fails a start or a length above 4294967295, which no query of the
+  // workload writes -- and the result is VARCHAR either way.
+  ValueKind Substring(const GenColumn& c) {
+    used_.Add(Feature::kSubstring);
+    used_.Add(Feature::kIntegerLiteral);
+    const int64_t start = substring_rng_.Percent(25)
+                              ? -static_cast<int64_t>(substring_rng_.Below(6)) - 1
+                              : static_cast<int64_t>(substring_rng_.Below(8));
+    const bool with_length = substring_rng_.Percent(75);
+    const int64_t count = substring_rng_.Percent(20)
+                              ? -static_cast<int64_t>(substring_rng_.Below(4)) - 1
+                              : static_cast<int64_t>(substring_rng_.Below(6));
+    if (start < 0) {
+      used_.Add(Feature::kNegativeLiteral);
+    }
+    if (with_length && count < 0) {
+      used_.Add(Feature::kNegativeLiteral);
+    }
+    // The standard spelling needs no FROM when it has a FOR, and the engines read both as the
+    // comma form, so it writes the same query.
+    const bool standard = substring_rng_.Percent(35);
+    Keyword("SUBSTRING");
+    Symbol("(");
+    Column(c);
+    const auto number = [&](int64_t v) {
+      tokens_.push_back({.kind = Token::Kind::kLiteral, .text = std::to_string(v)});
+    };
+    if (standard) {
+      Keyword("FROM");
+      number(start);
+      if (with_length) {
+        Keyword("FOR");
+        number(count);
+      }
+    } else {
+      Symbol(",");
+      number(start);
+      if (with_length) {
+        Symbol(",");
+        number(count);
+      }
+    }
     Symbol(")");
     return ValueKind::kVarchar;
   }
@@ -3372,10 +3441,11 @@ class Builder {
 
   const std::vector<GenTable>& tables_;
   Rng& rng_;
-  Rng& join_rng_;   // the draws that only a join needs
-  Rng& block_rng_;  // the draws that only a nested block needs
-  Rng& left_rng_;   // the draws that only a left join needs
-  Rng& sub_rng_;    // the draws that only an uncorrelated subquery needs
+  Rng& join_rng_;       // the draws that only a join needs
+  Rng& block_rng_;      // the draws that only a nested block needs
+  Rng& left_rng_;       // the draws that only a left join needs
+  Rng& sub_rng_;        // the draws that only an uncorrelated subquery needs
+  Rng& substring_rng_;  // the draws that only substring needs
   FeatureSet allowed_;
   std::vector<Edge> edges_;         // the refs joins can follow
   const FromList* from_ = nullptr;  // the FROM list of the query being written (TryFrom)
@@ -3574,7 +3644,9 @@ std::expected<QueryGenerator, std::string> QueryGenerator::Make(std::vector<GenT
   Rng block_rng(Mix(seed ^ kBlockStreamSalt));
   Rng left_rng(Mix(seed ^ kLeftStreamSalt));
   Rng sub_rng(Mix(seed ^ kSubqueryStreamSalt));
-  if (!Builder(tables, rng, join_rng, block_rng, left_rng, sub_rng, options.supported)
+  Rng substring_rng(Mix(seed ^ kSubstringStreamSalt));
+  if (!Builder(tables, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng,
+               options.supported)
            .Build()
            .has_value()) {
     return std::unexpected(
@@ -3591,12 +3663,14 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
   Rng block_rng(Mix(state ^ kBlockStreamSalt));
   Rng left_rng(Mix(state ^ kLeftStreamSalt));
   Rng sub_rng(Mix(state ^ kSubqueryStreamSalt));
+  Rng substring_rng(Mix(state ^ kSubstringStreamSalt));
   const bool target = rng.Percent(options_.target_percent);
   const FeatureSet allowed = target ? FeatureSet::All() : options_.supported;
   // Make() proved that the supported set admits a query over these tables; All() is a superset.
-  GeneratedQuery q = Builder(tables_, rng, join_rng, block_rng, left_rng, sub_rng, allowed)
-                         .Build()
-                         .value_or(GeneratedQuery{});
+  GeneratedQuery q =
+      Builder(tables_, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng, allowed)
+          .Build()
+          .value_or(GeneratedQuery{});
   q.index = index;
   q.target_sample = target;
   return q;

@@ -14,7 +14,8 @@ conditions (comparisons between columns, expressions and literals, `[NOT] LIKE '
 `[NOT] IN (literal, ...)` and `[NOT] BETWEEN low AND high`, combined with `AND`, `OR` and `NOT`, with constant
 integer arithmetic folded on a side), `GROUP BY` and `ORDER BY` (also by position), `HAVING` (the same conditions
 on aggregates and keys), arithmetic (`+ - * / // %` and unary `-`) over integers, DOUBLE and DECIMAL, the string
-functions `strlen` and `regexp_replace`, the timestamp functions `toDateTime`, `EXTRACT` and `date_trunc`, and
+functions `strlen`, `regexp_replace` and `substring`, the timestamp functions `toDateTime`, `EXTRACT` and
+`date_trunc`, and
 `CASE` in every clause, dates written as casts or literals (`CAST('2013-07-01' AS DATE)`, `'2013-07-01'::DATE`,
 `DATE '2013-07-01'`), `LIMIT` and `OFFSET`, over one table of Parquet files or several joined by inner or left
 outer joins, with uncorrelated `IN` and scalar subqueries. This
@@ -242,7 +243,8 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
 - date casts: `CAST('YYYY-MM-DD' AS DATE)` and `'YYYY-MM-DD'::DATE` are the literal `DATE 'YYYY-MM-DD'`
   wherever it may stand, as in DuckDB (which names all three `CAST('YYYY-MM-DD' AS "DATE")`);
 - value expressions: columns, literals, aggregates, arithmetic (`+ - * / // %`, unary `-`), the functions
-  `strlen(varchar)`, `regexp_replace(varchar, 'pattern', 'replacement')`, `toDateTime(integer)`,
+  `strlen(varchar)`, `regexp_replace(varchar, 'pattern', 'replacement')`,
+  `substring(varchar, start[, length])`, `toDateTime(integer)`,
   `EXTRACT(field FROM timestamp)` and `date_trunc('unit', timestamp)`, and `CASE` (both forms, with conditions
   as below) of them, in the select list, aggregate arguments (not constant ones), `GROUP BY` and `ORDER BY` (literals
   there are positions or constants, see [Binding](#binding));
@@ -449,11 +451,21 @@ select list, the `ON` conditions and `WHERE`, the `GROUP BY` names, the grouping
   (DECIMAL(38,0) `%` `0.5`): `fmod` of the operands converted to DOUBLE (Semantics, DECIMAL), with the dividend's
   sign (`-0` for a negative multiple) and NULL for a zero divisor.
 - Functions (names ASCII case-insensitive): `strlen(x)` takes a VARCHAR and is BIGINT; `regexp_replace(x, 'pattern',
-  'replacement')` takes a VARCHAR and two string literals and is VARCHAR. A wrong number of arguments, another type or
-  a non-literal pattern or replacement is a bind error (`strlen() needs a VARCHAR, but 'i16' is SMALLINT`); DuckDB's
+  'replacement')` takes a VARCHAR and two string literals and is VARCHAR; `substring(x, start[, length])` and its
+  alias `substr` take a VARCHAR and one or two integers and are VARCHAR, with the SQL-standard spelling
+  `substring(x FROM start FOR length)` accepted for `substring` alone (the two clauses in either order, at most once
+  each) and read as the comma form, which is also its canonical text and its result name. `SUBSTRING(x FOR n)`
+  without `FROM` is unsupported (exit code 4): DuckDB reads it as `substring(x, 1, CAST(n AS INTEGER))`, and that
+  cast both narrows the length to `INTEGER` -- a length the comma form answers is a conversion error there -- and
+  shows in the result name, while antb1's subset casts nothing to `INTEGER`.
+  A wrong number of arguments, another type or a non-literal pattern or replacement is a bind error
+  (`strlen() needs a VARCHAR, but 'i16' is SMALLINT`); DuckDB's
   optional fourth argument (options), `\Q` in a pattern, `\8` and `\9` in a replacement and any other function are
   unsupported (exit code 4). The result name is
-  DuckDB's: `strlen(URL)`, `regexp_replace(URL, '^(.)', '\1')`.
+  DuckDB's: `strlen(URL)`, `regexp_replace(URL, '^(.)', '\1')`, and -- because DuckDB reserves the word --
+  `main."substring"(URL, 1, 2)` where `substr(URL, 1, 2)` is plain. Unlike DuckDB, antb1 casts no argument
+  implicitly, so a VARCHAR position that parses as a number (`substring(s, '2', 2)`, which DuckDB answers) is a bind
+  error; for every other value and position type DuckDB is a binder error as well.
 - Timestamps: `toDateTime(t)` is ClickBench's DuckDB macro `epoch_ms(t * 1000)` (its `duckdb-parquet/create.sql` at
   the pinned commit; the test oracle defines the same macro): `t * 1000` is typed and checked as arithmetic (so a
   SMALLINT `t` above 32 overflows, as in DuckDB), and the result is TIMESTAMP. It takes an integer other than
@@ -827,7 +839,22 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   range; weeks start on Monday. A DATE is the timestamp of its midnight; `date_trunc` of a DATE whose result is
   outside the TIMESTAMP range fails the query, and of an infinite DATE is infinite, where `EXTRACT` is NULL.
   TIMESTAMP values sort, group and aggregate (`MIN`, `MAX`, `COUNT`, `COUNT(DISTINCT)`) like integers.
-- Strings: `strlen` counts bytes. `regexp_replace` replaces the first match only, with RE2 in UTF-8 mode as DuckDB
+- Strings: `strlen` counts bytes, while `substring` counts codepoints, as DuckDB counts them for each (so
+  `substring('Привет', 1, 2)` is two letters of four bytes where `strlen` of them is 4).
+  A byte that is no UTF-8
+  continuation byte starts a codepoint, and a continuation byte belongs to the codepoint before it;
+  the first byte of a value always starts one, even when it is a continuation byte, so no byte ever
+  falls outside every codepoint and a window covering the value returns it whole (divergence D15,
+  since an unannotated Parquet `BYTE_ARRAY` is a VARCHAR here and may hold any bytes). `substring`'s
+  window is one rule: a negative start counts from the end (`-1` is the last codepoint), a negative length extends
+  the window backwards from the start, and the window is clipped to the value, so a start past the end or a window
+  that closes before it opens gives the empty string. NULL in any argument gives NULL. Written without a length the
+  window does **not** reach the end of the value: DuckDB defaults the length to 4294967295, which shows only at the
+  bottom of the start's range, where `substring(x, -4294967296)` loses the last codepoint and
+  `substring(x, -4294967295)` keeps the value whole. A start or a length outside
+  [-4294967296, 4294967295] fails the query when it runs (exit code 1), with DuckDB's own message, one per side of
+  each bound.
+  `regexp_replace` replaces the first match only, with RE2 in UTF-8 mode as DuckDB
   runs it (`.` matches one character but no newline); in the replacement `\0` is the match, `\1` to `\9` its groups
   and `\\` a backslash. A replacement RE2 rejects (a group the pattern does not have, a lone or unknown backslash)
   leaves the text unchanged, as in DuckDB; an invalid pattern fails the query (exit code 1) when it runs. NULL gives

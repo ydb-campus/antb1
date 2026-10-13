@@ -368,6 +368,11 @@ std::string TypeText(const sql::CastExpr& cast) {
 
 [[noreturn]] void UnfoldedCast();
 [[noreturn]] void RejectedSubquery();
+// The opening of a function call's result name, through to its '(' (defined with the function table
+// below, which knows which names DuckDB reserves). One rule for both name builders: ExprNameOf,
+// which names a call nested in another expression, and BindFunction, which names one bound as a
+// value.
+std::string FunctionNameOpening(const sql::FunctionCall& call);
 
 // DuckDB's name of an expression of the binder's subset: (a + 1), -(a), sum((a + 1)); conditions
 // as ((a = 1) OR (b != 2) OR (c IN (1, 2))).
@@ -428,7 +433,7 @@ struct ExprNameOf {
     for (const sql::Expr& arg : call.args) {
       args += (args.empty() ? "" : ", ") + ExprName(arg);
     }
-    return AsciiLower(call.name) + "(" + args + ")";
+    return FunctionNameOpening(call) + args + ")";
   }
   std::string operator()(const sql::CaseExpr& c) const { return CaseName(c); }
   std::string operator()(const sql::ExtractExpr& e) const {
@@ -475,8 +480,14 @@ bool ReadsColumn(const sql::Expr& expr, bool aggregates = false);
 struct FunctionSpec {
   std::string_view name;  // lower case, as DuckDB names the result
   Function function;
-  std::size_t args;
-  std::size_t value_arg = 0;  // the value argument; the others are string literals
+  std::size_t args;            // the fewest arguments it takes
+  std::size_t max_args = 0;    // the most, or 0 for exactly `args`
+  std::size_t value_arg = 0;   // the value argument
+  bool integer_args = false;   // the other arguments are integer expressions, not string literals
+  bool reserved_name = false;  // DuckDB qualifies and quotes a function whose name it reserves
+
+  [[nodiscard]] std::size_t most_args() const { return max_args == 0 ? args : max_args; }
+  [[nodiscard]] bool TakesArgs(std::size_t n) const { return n >= args && n <= most_args(); }
 };
 
 constexpr auto kFunctions = std::to_array<FunctionSpec>({
@@ -484,12 +495,39 @@ constexpr auto kFunctions = std::to_array<FunctionSpec>({
     {.name = "regexp_replace", .function = Function::kRegexpReplace, .args = 3},
     {.name = "todatetime", .function = Function::kEpochMs, .args = 1},
     {.name = "date_trunc", .function = Function::kDateTrunc, .args = 2, .value_arg = 1},
+    // substring's start and length are evaluated per row, so a column or an expression stands
+    // where every other function takes a string literal. DuckDB reserves the name `substring`, so
+    // it names the result main."substring"(...) where it names substr(...) plainly.
+    {.name = "substring",
+     .function = Function::kSubstring,
+     .args = 2,
+     .max_args = 3,
+     .integer_args = true,
+     .reserved_name = true},
+    {.name = "substr",
+     .function = Function::kSubstring,
+     .args = 2,
+     .max_args = 3,
+     .integer_args = true},
 });
 
 std::optional<FunctionSpec> FindFunction(const sql::FunctionCall& call) {
   const std::string name = AsciiLower(call.name);
   const auto* spec = std::ranges::find(kFunctions, name, &FunctionSpec::name);
   return spec == kFunctions.end() ? std::nullopt : std::optional(*spec);
+}
+
+// DuckDB re-serializes a function's name and quotes it only where the identifier needs quoting,
+// which is a property of the name and not of the call: `strlen` is plain however it was written
+// (`"strlen"` and `"STRLEN"` included), while `substring` -- a word DuckDB reserves -- is
+// main."substring" when the call was written unquoted and "substring" when it was quoted, lower
+// case either way, since DuckDB resolves a quoted function name case-insensitively.
+std::string FunctionNameOpening(const sql::FunctionCall& call) {
+  const std::optional<FunctionSpec> spec = FindFunction(call);
+  if (!spec.has_value() || !spec->reserved_name) {
+    return AsciiLower(call.name) + "(";
+  }
+  return call.quoted ? std::format("\"{}\"(", spec->name) : std::format("main.\"{}\"(", spec->name);
 }
 
 struct ReadsColumnOf {
@@ -696,8 +734,8 @@ struct FirstUnsupportedOf {
     if (!spec.has_value()) {
       return Rejection{.span = call.name_span,
                        .message = std::format("function {}() is not supported (only COUNT, SUM, "
-                                              "AVG, MIN, MAX, STRLEN, REGEXP_REPLACE, TODATETIME "
-                                              "and DATE_TRUNC)",
+                                              "AVG, MIN, MAX, STRLEN, REGEXP_REPLACE, TODATETIME, "
+                                              "DATE_TRUNC and SUBSTRING)",
                                               Clip(call.name))};
     }
     if (spec->function == Function::kRegexpReplace && call.args.size() == 4) {
@@ -707,11 +745,14 @@ struct FirstUnsupportedOf {
                            "regexp_replace() with options (a fourth argument) is not "
                            "supported"};
     }
-    if (call.args.size() != spec->args) {
+    if (!spec->TakesArgs(call.args.size())) {
       return std::nullopt;  // a bind error (the binder reports the arity), as in DuckDB
     }
     for (std::size_t i = 0; i < call.args.size(); ++i) {
-      if (i != spec->value_arg && !std::holds_alternative<sql::Literal>(call.args[i])) {
+      // An integer argument is an expression like any other, so nothing is checked statically: its
+      // type is checked where the call is bound.
+      if (i != spec->value_arg && !spec->integer_args &&
+          !std::holds_alternative<sql::Literal>(call.args[i])) {
         return Rejection{
             .span = call.args[i].span(),
             .message = spec->value_arg == 0
@@ -2336,18 +2377,37 @@ class Binder {
     if (!spec.has_value()) {
       return UnsupportedError("this function is not supported", call.name_span);
     }
-    if (call.args.size() != spec->args) {
-      return BindError(std::format("{}() takes {} argument{}, not {}", spec->name, spec->args,
-                                   spec->args == 1 ? "" : "s", call.args.size()),
+    if (!spec->TakesArgs(call.args.size())) {
+      const std::string takes =
+          spec->max_args == 0 ? std::format("{} argument{}", spec->args, spec->args == 1 ? "" : "s")
+                              : std::format("{} or {} arguments", spec->args, spec->most_args());
+      return BindError(std::format("{}() takes {}, not {}", spec->name, takes, call.args.size()),
                        call.span);
     }
     ARROW_ASSIGN_OR_RAISE(Typed value, bind_arg(call.args[spec->value_arg]));
-    std::string name = std::string(spec->name) + "(";
+    // DuckDB re-serializes a function's name, quoting it only where the identifier needs quoting:
+    // `strlen` is plain however it was written (`"strlen"` and `"STRLEN"` included), while
+    // `substring` -- a word DuckDB reserves -- is `main."substring"` when the call was written
+    // unquoted and `"substring"` when it was quoted (in any case: DuckDB resolves a quoted function
+    // name case-insensitively and prints it lower-cased).
+    std::string name = FunctionNameOpening(call);
     std::vector<ExprPtr> literals;
+    std::vector<ExprPtr> integers;
     for (std::size_t i = 0; i < call.args.size(); ++i) {
       name += i == 0 ? "" : ", ";
       if (i == spec->value_arg) {
         name += value.expr->name;
+        continue;
+      }
+      if (spec->integer_args) {
+        ARROW_ASSIGN_OR_RAISE(const Typed arg, bind_arg(call.args[i]));
+        if (!IsInteger(arg.expr->type) || arg.expr->type == LogicalType::kHugeInt) {
+          return BindError(std::format("argument {} of {}() must be an integer, but {}", i + 1,
+                                       spec->name, DescribeOperand(arg)),
+                           call.args[i].span());
+        }
+        name += arg.expr->name;
+        integers.push_back(arg.expr);
         continue;
       }
       const auto* lit = std::get_if<sql::Literal>(&call.args[i]);
@@ -2406,11 +2466,20 @@ class Binder {
         }
         type = LogicalType::kTimestamp;
         break;
+      case Function::kSubstring:
+        if (value.expr->type != LogicalType::kVarchar) {
+          return BindError(
+              std::format("{}() needs a VARCHAR, but {}", spec->name, DescribeOperand(value)),
+              value_span);
+        }
+        type = LogicalType::kVarchar;
+        break;
       case Function::kExtract:
         return arrow::Status::Invalid("EXTRACT is no function call");
     }
     std::vector<ExprPtr> args{std::move(value.expr)};
     args.insert(args.end(), literals.begin(), literals.end());
+    args.insert(args.end(), integers.begin(), integers.end());
     return Leaf(Expr{.node = FunctionExpr{.function = spec->function, .args = std::move(args)},
                      .type = type,
                      .name = std::move(name)});

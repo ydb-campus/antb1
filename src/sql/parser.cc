@@ -1607,8 +1607,9 @@ class Parser {
   }
 
   // name(arg, ...), positioned at the name (the next token is '('). Special argument syntax that
-  // DuckDB has for some functions (position('a' IN s), substring(s FROM 1), ...) is not a syntax
-  // error but an unsupported function call, and so is a FILTER clause.
+  // DuckDB has for some functions (position('a' IN s), ...) is not a syntax error but an
+  // unsupported function call, and so is a FILTER clause. SUBSTRING's SQL-standard syntax is the
+  // one exception, below.
   Expected<Expr> ParseFunction(Context context) {
     Token name = Take();
     Take();  // '('
@@ -1624,6 +1625,30 @@ class Parser {
     if (Peek().IsKeyword("DISTINCT") || Peek().IsKeyword("ALL") ||
         Peek().kind == TokenKind::kStar) {
       return unsupported();
+    }
+    // SUBSTRING(x FROM a FOR b): the only function whose SQL-standard argument syntax DuckDB takes,
+    // and only under this name -- `substr(s FROM 1)` and `strlen(s FROM 1)` are syntax errors
+    // there. Its first argument is the comma form's as well, so it is parsed once and the keyword
+    // after it decides; there is no putting a token back (Take consumes from the front of a lazy
+    // deque).
+    if (!call.quoted && AsciiUpper(call.name) == "SUBSTRING" &&
+        Peek().kind != TokenKind::kRightParen) {
+      auto value = ParseExpr(context);
+      if (!value) {
+        if (value.error().kind == ParseError::Kind::kSyntax && !lex_error_.has_value()) {
+          return unsupported();
+        }
+        return value;
+      }
+      call.args.push_back(*std::move(value));
+      if (Peek().IsKeyword("FROM") || Peek().IsKeyword("FOR")) {
+        return ParseSubstringStandard(context, call);
+      }
+      if (Peek().kind == TokenKind::kComma) {
+        Take();
+      } else if (Peek().kind != TokenKind::kRightParen) {
+        return unsupported();
+      }
     }
     while (Peek().kind != TokenKind::kRightParen) {
       auto arg = ParseExpr(context);
@@ -1646,6 +1671,53 @@ class Parser {
     if (Peek().IsKeyword("FILTER") && PeekAt(1).kind == TokenKind::kLeftParen) {
       return Unsupported(Peek().span, "FILTER clauses are not supported");
     }
+    return Expr(std::move(call));
+  }
+
+  // The rest of SUBSTRING(x FROM a FOR b), positioned at the first FROM or FOR, with `x` already in
+  // `call.args`. DuckDB normalizes every spelling to the comma form of the same call, so one AST
+  // serves them all and the canonical text is always the comma form. The two clauses come in either
+  // order and at most once each, as DuckDB takes them -- `SUBSTRING(x FOR 2 FROM 3)` is
+  // `SUBSTRING(x FROM 3 FOR 2)`, while a repeated FROM or FOR is a syntax error there -- and FOR
+  // alone starts at 1, which is what DuckDB's own serialization says.
+  Expected<Expr> ParseSubstringStandard(Context context, FunctionCall& call) {
+    std::optional<Expr> start;
+    std::optional<Expr> length;
+    SourceSpan for_span{};
+    while (Peek().IsKeyword("FROM") || Peek().IsKeyword("FOR")) {
+      const Token keyword = Take();
+      const bool is_from = keyword.IsKeyword("FROM");
+      if (is_from ? start.has_value() : length.has_value()) {
+        return Syntax(keyword.span,
+                      std::string("SUBSTRING( takes at most one ") + (is_from ? "FROM" : "FOR"));
+      }
+      if (!is_from) {
+        for_span = keyword.span;
+      }
+      auto value = ParseExpr(context);
+      if (!value) {
+        return value;
+      }
+      (is_from ? start : length) = *std::move(value);
+    }
+    if (!start.has_value()) {
+      // SUBSTRING(x FOR n) is SUBSTRING(x, 1, CAST(n AS INTEGER)) in DuckDB, not
+      // SUBSTRING(x, 1, n): the cast narrows the length to INTEGER, so a length the comma form
+      // answers is a conversion error in this spelling, and the cast shows in the result name too.
+      // antb1's subset casts nothing to INTEGER, so the spelling is refused rather than answered
+      // with a length of another type (ADR 0023's S5).
+      return Unsupported(for_span,
+                         "SUBSTRING(x FOR n) without FROM is not supported (DuckDB reads it as "
+                         "SUBSTRING(x, 1, CAST(n AS INTEGER)); write SUBSTRING(x FROM 1 FOR n))");
+    }
+    call.args.push_back(*std::move(start));
+    if (length.has_value()) {
+      call.args.push_back(*std::move(length));
+    }
+    if (Peek().kind != TokenKind::kRightParen) {
+      return Syntax(Peek().span, "expected ) to close SUBSTRING(, found " + Describe(Peek()));
+    }
+    call.span = Cover(call.name_span, Take().span);
     return Expr(std::move(call));
   }
 

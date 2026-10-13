@@ -258,7 +258,7 @@ INSTANTIATE_TEST_SUITE_P(
                   "function lower() is not supported"},
         ErrorCase{"SELECT a FROM t GROUP BY year(d)", kUnsupported, "year",
                   "function year() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
-                  "REGEXP_REPLACE, TODATETIME and DATE_TRUNC)"},
+                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC and SUBSTRING)"},
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING 1 < 2", kUnsupported, "2",
                   "comparisons between two literals are not supported"},
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING COUNT(*)", kUnsupported, "COUNT(*)",
@@ -487,6 +487,23 @@ INSTANTIATE_TEST_SUITE_P(
                   "regexp_replace() with \\8 in the replacement is not supported"},
         ErrorCase{"SELECT regexp_replace(s, '\\Qa', 'x') FROM t", kUnsupported, "'\\Qa'",
                   "regexp_replace() with \\Q in the pattern is not supported"},
+        // substring: a VARCHAR value and integer positions, two or three arguments. DuckDB is a
+        // binder error for the same value and position types, except a VARCHAR position that parses
+        // as a number, which it casts and antb1 refuses (docs/sql-subset.md).
+        ErrorCase{"SELECT substring(i16, 1, 2) FROM t", kBind, "i16",
+                  "substring() needs a VARCHAR, but 'i16' is SMALLINT"},
+        ErrorCase{"SELECT substring(s, s, 2) FROM t", kBind, "s",
+                  "argument 2 of substring() must be an integer, but 's' is VARCHAR"},
+        ErrorCase{"SELECT substring(s, 1, d) FROM t", kBind, "d",
+                  "argument 3 of substring() must be an integer, but 'd' is DOUBLE"},
+        ErrorCase{"SELECT substring(s, 1, h) FROM t", kBind, "h",
+                  "argument 3 of substring() must be an integer, but 'h' is DECIMAL(38,0)"},
+        ErrorCase{"SELECT substring(s) FROM t", kBind, "substring(s)",
+                  "substring() takes 2 or 3 arguments, not 1"},
+        ErrorCase{"SELECT substring(s, 1, 2, 3) FROM t", kBind, "substring(s, 1, 2, 3)",
+                  "substring() takes 2 or 3 arguments, not 4"},
+        ErrorCase{"SELECT substr(s, 1, 2, 3) FROM t", kBind, "substr(s, 1, 2, 3)",
+                  "substr() takes 2 or 3 arguments, not 4"},
         ErrorCase{"SELECT regexp_replace(s, 'a', 1) FROM t", kBind, "1",
                   "argument 3 of regexp_replace() must be a string literal"},
         ErrorCase{"SELECT regexp_replace(s, 'a', 'b', 'g') FROM t", kUnsupported, "'g'",
@@ -508,19 +525,19 @@ INSTANTIATE_TEST_SUITE_P(
                   "constant aggregate arguments are not supported"},
         ErrorCase{"SELECT lower(url) FROM t", kUnsupported, "lower",
                   "function lower() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
-                  "REGEXP_REPLACE, TODATETIME and DATE_TRUNC)"},
+                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC and SUBSTRING)"},
         ErrorCase{"SELECT a FROM t WHERE length(url) > 5", kUnsupported, "length",
                   "function length() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
-                  "REGEXP_REPLACE, TODATETIME and DATE_TRUNC)"},
+                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC and SUBSTRING)"},
         ErrorCase{"SELECT a FROM t WHERE d > now()", kUnsupported, "now",
                   "function now() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
-                  "REGEXP_REPLACE, TODATETIME and DATE_TRUNC)"},
+                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC and SUBSTRING)"},
         ErrorCase{"SELECT SUM(abs(a)) FROM t", kUnsupported, "abs",
                   "function abs() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
-                  "REGEXP_REPLACE, TODATETIME and DATE_TRUNC)"},
+                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC and SUBSTRING)"},
         ErrorCase{"SELECT left(url, 3) FROM t", kUnsupported, "left",
                   "function left() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
-                  "REGEXP_REPLACE, TODATETIME and DATE_TRUNC)"},
+                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC and SUBSTRING)"},
         ErrorCase{"SELECT COUNT(1) FROM t", kUnsupported, "1",
                   "constant aggregate arguments are not supported (use COUNT(*))"},
         ErrorCase{"SELECT SUM('x') FROM t", kUnsupported, "'x'",
@@ -2963,6 +2980,39 @@ TEST(BinderTest, AggregateCallsAndDuckDbResultNames) {
   const SourceSpan second = agg.aggregates[1].span;
   EXPECT_EQ(kSql.substr(second.offset, second.length), "COUNT(I16)");
   EXPECT_EQ(agg.aggregates[4].arg.value_or(BoundColumn{}).name, "Mixed Case");
+}
+
+// A function call's result name, as DuckDB re-serializes it: the name is quoted only where the
+// identifier needs quoting, so `strlen` is plain however it was written, while `substring` -- which
+// DuckDB reserves -- is schema-qualified and quoted when the call was unquoted and quoted alone
+// when it was quoted, in either case lower-cased. The positions of substring are arguments like any
+// other, so they appear as written.
+TEST(BinderTest, FunctionCallDuckDbResultNames) {
+  const Catalog catalog = MakeCatalog();
+  constexpr std::string_view kSql =
+      R"(SELECT strlen(s), "strlen"(s), "STRLEN"(s), STRLEN(s), substring(s, 1, 2),
+                "substring"(s, 1, 2), "SUBSTRING"(s, 1, 2), SUBSTRING(s FROM 1 FOR 2),
+                substr(s, 1, 2), "substr"(s, i32), substring(s, i32 + 1) FROM t)";
+  auto plan = BindSql(kSql, catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  const std::vector<std::string> names = {
+      "strlen(s)",
+      "strlen(s)",
+      "strlen(s)",
+      "strlen(s)",
+      R"(main."substring"(s, 1, 2))",
+      R"("substring"(s, 1, 2))",
+      R"("substring"(s, 1, 2))",
+      R"(main."substring"(s, 1, 2))",
+      "substr(s, 1, 2)",
+      "substr(s, i32)",
+      R"(main."substring"(s, (i32 + 1)))",
+  };
+  ASSERT_EQ(plan->output.size(), names.size());
+  for (std::size_t i = 0; i < names.size(); ++i) {
+    EXPECT_EQ(plan->output[i].name, names[i]) << i;
+    EXPECT_EQ(plan->output[i].type, i < 4 ? LogicalType::kBigInt : LogicalType::kVarchar) << i;
+  }
 }
 
 TEST(BinderTest, WhereBuildsAFilterUnderTheSelectList) {

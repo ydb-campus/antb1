@@ -496,6 +496,72 @@ TEST_F(ComputeTest, RegexpReplaceOutOfMemoryIsAMemoryError) {
   EXPECT_EQ(budget.bytes_allocated(), 0);
 }
 
+// substring slices codepoints, and its start and length are columns like any other, so the kernel
+// is the only place where a per-row window is exercised: NULL in any of the three arguments, a
+// window clipped at either end, a negative start and a negative length, an empty value, a value
+// whose first byte is a UTF-8 continuation byte (an unannotated Parquet BYTE_ARRAY is VARCHAR and
+// may hold any bytes), and the two out-of-range errors, which no SQL-level test can reach for a
+// NULL-valued row.
+TEST_F(ComputeTest, SubstringSlicesCodepointsPerRow) {
+  // "h\xC3\xA9llo" is 5 codepoints of 6 bytes; the fifth value starts with a continuation byte.
+  const std::string continuation_first{'\x80', 'A'};  // no codepoint precedes the 0x80
+  const auto text =
+      testing::Strings({"h\xC3\xA9llo", std::nullopt, "ab", "", continuation_first, "ab"});
+  const auto call = [&](const std::shared_ptr<arrow::Array>& start,
+                        const std::shared_ptr<arrow::Array>& length) {
+    std::vector<plan::ExprPtr> args{ColumnAt(0, LogicalType::kVarchar),
+                                    ColumnAt(1, LogicalType::kBigInt)};
+    if (length != nullptr) {
+      args.push_back(ColumnAt(2, LogicalType::kBigInt));
+    }
+    arrow::ArrayVector columns{text, start};
+    if (length != nullptr) {
+      columns.push_back(length);
+    }
+    return Eval(Call(plan::Function::kSubstring, std::move(args), LogicalType::kVarchar), columns);
+  };
+  const auto values = [](const std::shared_ptr<arrow::Array>& array) {
+    std::vector<std::optional<std::string>> out;
+    const auto& binary = static_cast<const arrow::BinaryArray&>(*array);
+    out.reserve(Narrow<std::size_t>(binary.length()));
+    for (int64_t i = 0; i < binary.length(); ++i) {
+      out.push_back(binary.IsNull(i) ? std::nullopt : std::optional(binary.GetString(i)));
+    }
+    return out;
+  };
+  using Values = std::vector<std::optional<std::string>>;
+  // Row 1's value is NULL, row 5's start is NULL, row 3's window closes before it opens, and row 4
+  // is empty; row 0 keeps two codepoints of three bytes and row 2 clips at the end.
+  auto three = call(Int64s({1, 1, 2, 3, 1, std::nullopt}), Int64s({2, 2, 9, -1, 9, 1}));
+  ASSERT_TRUE(three.ok()) << three.status().ToString();
+  EXPECT_EQ(values(*three),
+            (Values{"h\xC3\xA9", std::nullopt, "b", "", continuation_first, std::nullopt}));
+  // A NULL length is a NULL result even where the value and the start are not.
+  auto null_length = call(Int64s({1, 1, 1, 1, 1, 1}), Int64s({1, 1, std::nullopt, 1, 1, 1}));
+  ASSERT_TRUE(null_length.ok()) << null_length.status().ToString();
+  EXPECT_EQ(values(*null_length)[2], std::nullopt);
+  // Without a length the window runs to the end of the value here, since 4294967295 covers it, and
+  // a negative start counts from the end. The first byte of row 4 is kept: no byte of a value may
+  // fall outside every codepoint, or a full window would lose it.
+  auto two = call(Int64s({-2, 1, -9, 1, -2, 1}), nullptr);
+  ASSERT_TRUE(two.ok()) << two.status().ToString();
+  EXPECT_EQ(values(*two), (Values{"lo", std::nullopt, "ab", "", continuation_first, "ab"}));
+  // The bounds DuckDB puts on a position, one message per side, raised even though the batch holds
+  // a NULL value and a NULL start.
+  for (const auto& [start, length, side] :
+       std::vector<std::tuple<int64_t, int64_t, std::string>>{{4294967296, 1, "offset"},
+                                                              {-4294967297, 1, "offset"},
+                                                              {1, 4294967296, "length"},
+                                                              {1, -4294967297, "length"}}) {
+    const auto bad = call(Int64s({start, start, start, start, start, std::nullopt}),
+                          Int64s({length, length, length, length, length, length}));
+    ASSERT_FALSE(bad.ok()) << start << ", " << length;
+    EXPECT_NE(bad.status().message().find("Substring " + side + " outside of supported range"),
+              std::string::npos)
+        << bad.status().ToString();
+  }
+}
+
 // strlen counts bytes; regexp_replace replaces the first match with RE2 in UTF-8 mode (`.` is one
 // character, not a newline), \0 and \1 in the replacement; NULL stays NULL; a bad pattern is an
 // execution error (DuckDB 1.5.5).

@@ -677,8 +677,108 @@ struct Evaluator {
         ARROW_ASSIGN_OR_RAISE(const std::string unit, ConstantArg(function, 1));
         return DateTrunc(*text, unit, pool);
       }
+      case plan::Function::kSubstring:
+        return Substring(function, text);
     }
     return arrow::Status::Invalid("unknown function");
+  }
+
+  // The codepoints of `value`, counting as DuckDB counts them: a byte that is no UTF-8 continuation
+  // byte starts one, and a continuation byte belongs to the codepoint before it. The first byte
+  // always starts a codepoint, even when it is a continuation byte -- an unannotated Parquet
+  // BYTE_ARRAY is VARCHAR here and may hold any bytes (divergence D15), and no byte of a value may
+  // fall outside every codepoint, or a full window would not return the value it covers.
+  static int64_t CodepointCount(std::string_view value) {
+    int64_t n = 0;
+    for (std::size_t byte = 0; byte < value.size(); ++byte) {
+      n += byte == 0 || (static_cast<unsigned char>(value[byte]) & 0xC0U) != 0x80U ? 1 : 0;
+    }
+    return n;
+  }
+
+  // The byte offset where codepoint `index` begins, 1-based, or the size of `value` for the
+  // codepoint one past its last (CodepointCount(value) + 1).
+  static std::size_t ByteOfCodepoint(std::string_view value, int64_t index) {
+    int64_t seen = 0;
+    for (std::size_t byte = 0; byte < value.size(); ++byte) {
+      const bool starts = byte == 0 || (static_cast<unsigned char>(value[byte]) & 0xC0U) != 0x80U;
+      if (starts && ++seen == index) {
+        return byte;
+      }
+    }
+    return value.size();
+  }
+
+  // substring(value, start[, length]), by DuckDB's rule, which one window covers: a negative start
+  // counts from the end, a negative length extends the window backwards, and the window is clipped
+  // to the value. NULL in any argument gives NULL, and a start or a length outside
+  // [-4294967296, 4294967295] is the execution error DuckDB raises for it, one message per side.
+  //
+  // Where no length is written DuckDB does not reach the end of the value: it defaults the length
+  // to 4294967295, which shows only at the very bottom of the start's range --
+  // `substring(v, -4294967296)` loses the last codepoint where `substring(v, -4294967295)` keeps
+  // the value whole.
+  //
+  // Counted in codepoints, as DuckDB counts them -- where antb1's strlen counts bytes (divergence
+  // D15) -- so a byte that is no UTF-8 continuation byte starts one and an invalid byte counts as
+  // one of its own.
+  arrow::Result<ArrayPtr> Substring(const plan::FunctionExpr& function,
+                                    const ArrayPtr& text) const {
+    if (function.args.size() < 2 || function.args.size() > 3) {
+      return arrow::Status::Invalid("substring takes two or three arguments");
+    }
+    ARROW_ASSIGN_OR_RAISE(const ArrayPtr start_arg, (*this)(*function.args[1]));
+    ARROW_ASSIGN_OR_RAISE(const ArrayPtr starts, CastTo(start_arg, arrow::int64(), ctx));
+    ArrayPtr lengths;
+    if (function.args.size() == 3) {
+      ARROW_ASSIGN_OR_RAISE(const ArrayPtr length_arg, (*this)(*function.args[2]));
+      ARROW_ASSIGN_OR_RAISE(lengths, CastTo(length_arg, arrow::int64(), ctx));
+    }
+    const auto& values = static_cast<const arrow::BinaryArray&>(*text);
+    const auto& from = static_cast<const arrow::Int64Array&>(*starts);
+    const auto* count =
+        lengths == nullptr ? nullptr : &static_cast<const arrow::Int64Array&>(*lengths);
+    constexpr int64_t kLimit = 4294967295;   // DuckDB's own bound on an offset or a length
+    constexpr int64_t kFloor = -kLimit - 1;  // and on a negative one, one step further out
+    arrow::BinaryBuilder out(pool);
+    ARROW_RETURN_NOT_OK(out.Reserve(values.length()));
+    ARROW_RETURN_NOT_OK(out.ReserveData(values.total_values_length()));
+    for (int64_t row = 0; row < values.length(); ++row) {
+      if (values.IsNull(row) || from.IsNull(row) || (count != nullptr && count->IsNull(row))) {
+        ARROW_RETURN_NOT_OK(out.AppendNull());
+        continue;
+      }
+      const int64_t start = from.Value(row);
+      if (start > kLimit || start < kFloor) {
+        return arrow::Status::Invalid(
+            std::format("Substring offset outside of supported range ({} {})",
+                        start > kLimit ? '>' : '<', start > kLimit ? kLimit : kFloor));
+      }
+      if (count != nullptr && (count->Value(row) > kLimit || count->Value(row) < kFloor)) {
+        const int64_t length = count->Value(row);
+        return arrow::Status::Invalid(
+            std::format("Substring length outside of supported range ({} {})",
+                        length > kLimit ? '>' : '<', length > kLimit ? kLimit : kFloor));
+      }
+      const std::string_view value = values.GetView(row);
+      const int64_t n = CodepointCount(value);
+      const int64_t s = start < 0 ? n + 1 + start : start;
+      // Both arguments are inside [kFloor, kLimit] by now and n is one batch value's size, so every
+      // sum here stays far inside int64. A missing length is kLimit, not the end of the value.
+      const int64_t length = count == nullptr ? kLimit : count->Value(row);
+      const int64_t lo = std::max<int64_t>(length < 0 ? s + length : s, 1);
+      const int64_t hi = std::min<int64_t>(length < 0 ? s : s + length, n + 1);
+      if (hi <= lo) {
+        ARROW_RETURN_NOT_OK(out.Append("", 0));
+        continue;
+      }
+      // Two walks of the value's bytes and no allocation of our own: the offsets of every codepoint
+      // would be a vector the size of the value, outside the memory budget this operator reports.
+      const std::size_t begin = ByteOfCodepoint(value, lo);
+      const std::size_t end = ByteOfCodepoint(value, hi);
+      ARROW_RETURN_NOT_OK(out.Append(value.data() + begin, static_cast<int32_t>(end - begin)));
+    }
+    return out.Finish();
   }
 
   // The string constant argument `i` of a function (a field, a unit).
