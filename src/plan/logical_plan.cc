@@ -567,6 +567,114 @@ struct OutputIdsOf {
   }
 };
 
+// The ids a plan reads and the ids it defines, gathered over the whole tree. One overload per node
+// type: a node type without one fails to compile, so a new node cannot silently hide a reference.
+struct IdsOfNode {
+  std::set<ColumnId>& reads;
+  std::set<ColumnId>& defines;
+
+  void Read(const BoundColumn& column) const {
+    if (column.id != kNoColumnId) {
+      reads.insert(column.id);
+    }
+  }
+  void Read(const std::optional<BoundColumn>& column) const {
+    if (column.has_value()) {
+      Read(*column);
+    }
+  }
+  void Read(const ExprPtr& expr) const {
+    if (expr == nullptr) {
+      return;
+    }
+    std::vector<ColumnId> ids;
+    CollectColumnIds(*expr, ids);
+    for (const ColumnId id : ids) {
+      if (id != kNoColumnId) {
+        reads.insert(id);
+      }
+    }
+  }
+  void Define(ColumnId id) const {
+    if (id != kNoColumnId) {
+      defines.insert(id);
+    }
+  }
+  void Calls(const std::vector<AggregateCall>& calls) const {
+    for (const AggregateCall& call : calls) {
+      Read(call.arg);
+      Define(call.id);
+    }
+  }
+
+  void operator()(const ScanNode& node) const {
+    for (const ColumnId id : node.ids) {
+      Define(id);
+    }
+  }
+  void operator()(const FilterNode& node) const {
+    for (const Predicate& predicate : node.predicates) {
+      Read(predicate.column);
+      Read(predicate.other);
+    }
+  }
+  void operator()(const ComputeNode& node) const {
+    for (const ExprPtr& expr : node.exprs) {
+      Read(expr);
+    }
+    for (const ColumnId id : node.ids) {
+      Define(id);
+    }
+  }
+  void operator()(const ProjectNode& node) const {
+    for (std::size_t i = 0; i < node.columns.size(); ++i) {
+      const bool constant = i < node.constants.size() && node.constants[i].has_value();
+      if (!constant) {
+        Read(node.columns[i]);
+      }
+    }
+    for (const ColumnId id : node.ids) {
+      Define(id);
+    }
+  }
+  void operator()(const AggregateNode& node) const { Calls(node.aggregates); }
+  void operator()(const GroupAggregateNode& node) const {
+    for (const BoundColumn& key : node.keys) {
+      Read(key);
+    }
+    for (const ColumnId id : node.key_ids) {
+      Define(id);
+    }
+    Calls(node.aggregates);
+  }
+  void operator()(const SortNode& node) const {
+    for (const SortKey& key : node.keys) {
+      Read(key.column);
+    }
+  }
+  void operator()(const LimitNode& /*node*/) const {}
+  void operator()(const RowCountNode& node) const { Define(node.id); }
+  void operator()(const JoinNode& node) const {
+    for (const JoinKey& key : node.keys) {
+      Read(key.left);
+      Read(key.right);
+    }
+    for (const ExprPtr& conjunct : node.residual) {
+      Read(conjunct);
+    }
+  }
+  void operator()(const DependentJoinNode& node) const { Define(node.mark); }
+};
+
+void CollectIds(const LogicalNode& node, std::set<ColumnId>& reads, std::set<ColumnId>& defines) {
+  std::visit(IdsOfNode{.reads = reads, .defines = defines}, node);
+  for (const LogicalNodePtr& input : InputsOf(node)) {
+    if (input != nullptr) {
+      CollectIds(*input, reads, defines);
+    }
+  }
+}
+
 std::string IdText(ColumnId id) { return std::format("#{}", std::to_underlying(id)); }
 
 template <class Node>
@@ -913,6 +1021,15 @@ class Resolver {
 }  // namespace
 
 std::vector<ColumnId> OutputIds(const LogicalNode& node) { return std::visit(OutputIdsOf{}, node); }
+
+std::vector<ColumnId> FreeVariables(const LogicalNode& node) {
+  std::set<ColumnId> reads;
+  std::set<ColumnId> defines;
+  CollectIds(node, reads, defines);
+  std::vector<ColumnId> free;
+  std::ranges::set_difference(reads, defines, std::back_inserter(free));
+  return free;
+}
 
 LogicalPlan ResolvePositions(const LogicalPlan& plan, std::source_location location) {
   if (plan.root == nullptr) {

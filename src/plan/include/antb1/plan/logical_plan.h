@@ -468,6 +468,13 @@ LogicalNodePtr WithInputs(const LogicalNode& node, std::vector<LogicalNodePtr> i
 // inputs' (see JoinNode) and a DependentJoin its inputs' by the same rule.
 std::vector<ColumnId> OutputIds(const LogicalNode& node);
 
+// The free variables of a plan (ADR 0023, the formalization's F(R)): the ids its expressions read
+// that none of its own nodes defines, sorted and without repeats. A subquery is correlated exactly
+// when its plan has free variables, and a dependent join is legal only where its left input defines
+// every free variable of its right input. Inside a dependent join of the plan the binding holds, so
+// an id its left input defines is no free variable of the whole.
+std::vector<ColumnId> FreeVariables(const LogicalNode& node);
+
 // The plan with every reference's index set to the position of its id in the ids it reads (its
 // input's output ids); unchanged nodes keep their pointers, so the result of a resolved plan is the
 // plan itself. The last step of plan::Bind and plan::Optimize, which refer to columns by id only

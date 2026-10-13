@@ -331,6 +331,69 @@ TEST(ColumnIdsTest, OutputIdsOfEveryDependentJoinKind) {
             (std::vector<ColumnId>{kA, kB, kC, kD, kE, kF}));
 }
 
+// A plan's free variables (ADR 0023): the ids it reads that none of its own nodes defines. A
+// subquery is correlated exactly when its plan has some.
+TEST(ColumnIdsTest, FreeVariablesAreTheIdsReadButNotDefined) {
+  // A plan that reads only its own Scan's columns has none, whatever it computes above them.
+  const LogicalNodePtr own = Node(ComputeNode{
+      .input = FilterPlan(Column(kA, 0)).root, .exprs = {Leaf(kB, 1)}, .ids = {ColumnId{4}}});
+  EXPECT_TRUE(FreeVariables(*own).empty());
+
+  // A Filter reading #9, which nothing below defines.
+  const LogicalNodePtr reads_outer =
+      Node(FilterNode{.input = Scan(),
+                      .predicates = {Predicate{.kind = Predicate::Kind::kCompareColumns,
+                                               .column = Column(kA, 0),
+                                               .other = Column(ColumnId{9}, 0)}},
+                      .span = {}});
+  EXPECT_EQ(FreeVariables(*reads_outer), (std::vector<ColumnId>{ColumnId{9}}));
+
+  // Sorted and without repeats, over every kind of reference: a Compute's expression, a Sort key,
+  // an aggregate's argument and a join's key and residual.
+  const LogicalNodePtr many = Node(SortNode{
+      .input = Node(AggregateNode{
+          .input = Node(ComputeNode{.input = Scan(),
+                                    .exprs = {Leaf(ColumnId{30}, 0), Leaf(ColumnId{20}, 0)},
+                                    .ids = {ColumnId{40}, ColumnId{41}}}),
+          .aggregates = {AggregateCall{
+              .kind = AggKind::kSum, .arg = Column(ColumnId{20}, 0), .id = ColumnId{42}}}}),
+      .keys = {SortKey{.column = Column(ColumnId{42}, 0)}},
+      .span = {}});
+  EXPECT_EQ(FreeVariables(*many), (std::vector<ColumnId>{ColumnId{20}, ColumnId{30}}));
+
+  // A dependent join binds its left input's ids for its right input, so a right input that reads
+  // them has no free variables left at the dependent join.
+  const LogicalNodePtr bound = Node(
+      DependentJoinNode{.kind = JoinKind::kSemi, .left = Scan(), .right = reads_outer, .span = {}});
+  EXPECT_EQ(FreeVariables(*reads_outer), (std::vector<ColumnId>{ColumnId{9}}));
+  EXPECT_EQ(FreeVariables(*bound), (std::vector<ColumnId>{ColumnId{9}}))
+      << "#9 is defined by neither input, so it stays free of the whole";
+  const LogicalNodePtr reads_left =
+      Node(FilterNode{.input = Scan({ColumnId{4}, ColumnId{5}, ColumnId{6}}),
+                      .predicates = {Predicate{.kind = Predicate::Kind::kCompareColumns,
+                                               .column = Column(ColumnId{4}, 0),
+                                               .other = Column(kB, 0)}},
+                      .span = {}});
+  EXPECT_EQ(FreeVariables(*reads_left), (std::vector<ColumnId>{kB}));
+  EXPECT_TRUE(
+      FreeVariables(*Node(DependentJoinNode{
+                        .kind = JoinKind::kSemi, .left = Scan(), .right = reads_left, .span = {}}))
+          .empty())
+      << "the left input defines #2";
+
+  // `mark` is defined by the dependent join itself, so a node above that reads it is not free.
+  EXPECT_TRUE(
+      FreeVariables(*Node(FilterNode{.input = Node(DependentJoinNode{.kind = JoinKind::kSemi,
+                                                                     .left = Scan(),
+                                                                     .right = Scan({ColumnId{4}}),
+                                                                     .mark = ColumnId{50},
+                                                                     .span = {}}),
+                                     .predicates = {Predicate{.kind = Predicate::Kind::kIsNotNull,
+                                                              .column = Column(ColumnId{50}, 0)}},
+                                     .span = {}}))
+          .empty());
+}
+
 // The first shape of the output-id contract (ADR 0023): a dependent join binds its left input's ids
 // inside its right input, so a node of the right input may read a column that no input of its own
 // outputs -- a free variable. It resolves to its position among the ids the dependent join bound,
