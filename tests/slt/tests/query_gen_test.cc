@@ -1288,8 +1288,6 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
   // kQualifiedName where the FROM list alone would not (ForEachNode does not descend into a
   // block, so `qualified` cannot see it).
   const bool subquery = HasSubquery(q);
-  const bool correlated =
-      q.features.Has(Feature::kCorrelatedExists) || q.features.Has(Feature::kCorrelatedAggregate);
   EXPECT_EQ(q.features.Has(Feature::kTableName),
             subquery || std::ranges::any_of(items, [](const Item& i) { return !i.path; }));
   EXPECT_EQ(q.features.Has(Feature::kLeftJoin), left);
