@@ -425,6 +425,7 @@ TEST(LogicalPlanTest, NodeNamesSpansAndInputs) {
       {LimitNode{.input = scan, .span = span(8)}, "Limit"},
       {RowCountNode{.table = table, .span = span(9)}, "RowCount"},
       {JoinNode{.left = scan, .right = other, .span = span(10)}, "Join"},
+      {DependentJoinNode{.left = scan, .right = other, .span = span(11)}, "DependentJoin"},
   };
   for (std::size_t i = 0; i < nodes.size(); ++i) {
     const auto& [node, name] = nodes[i];
@@ -433,7 +434,7 @@ TEST(LogicalPlanTest, NodeNamesSpansAndInputs) {
     const std::vector<LogicalNodePtr> inputs = InputsOf(node);
     if (name == "Scan" || name == "RowCount") {
       EXPECT_TRUE(inputs.empty()) << name;
-    } else if (name == "Join") {
+    } else if (name == "Join" || name == "DependentJoin") {
       EXPECT_EQ(inputs, (std::vector<LogicalNodePtr>{scan, other})) << "left, then right";
     } else {
       EXPECT_EQ(inputs, std::vector<LogicalNodePtr>{scan}) << name;
@@ -458,6 +459,7 @@ TEST(LogicalPlanDeathTest, WithInputsNeedsOneInputPerChild) {
   const auto table = std::make_shared<FakeTable>(testing::AllTypesSchema(), 1);
   const LogicalNodePtr scan = std::make_shared<const LogicalNode>(ScanNode{.table = table});
   EXPECT_DEATH(WithInputs(JoinNode{.left = scan, .right = scan}, {scan}), "inputs.size");
+  EXPECT_DEATH(WithInputs(DependentJoinNode{.left = scan, .right = scan}, {scan}), "inputs.size");
   EXPECT_DEATH(WithInputs(LimitNode{.input = scan}, {}), "inputs.size");
   EXPECT_DEATH(WithInputs(ScanNode{.table = table}, {scan}), "inputs.size");
 }

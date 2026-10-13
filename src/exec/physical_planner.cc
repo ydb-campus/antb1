@@ -28,6 +28,7 @@
 #include "antb1/exec/table_scan.h"
 #include "antb1/plan/explain.h"
 #include "antb1/plan/logical_plan.h"
+#include "antb1/plan/sql_status.h"
 #include "antb1/plan/types.h"
 
 #include "hash_join.h"
@@ -725,6 +726,12 @@ struct Builder {
         HashJoinOperator::Make(std::move(probe), std::move(build), std::move(shape.probe_keys),
                                node.build, node.residual, /*prepares=*/!part.has_value()));
     return join;
+  }
+  OperatorResult operator()(const plan::DependentJoinNode& node) const {
+    // No operator runs a dependent join: the first pass of plan::Optimize replaces every one or
+    // rejects the query, so only a plan a test builds by hand reaches here. kUnsupported, never
+    // NotImplemented, so that such a plan exits 4 as the same query does (ADR 0023, ADR 0005).
+    return plan::UnsupportedError("a correlated subquery is not supported", node.span);
   }
 };
 

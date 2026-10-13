@@ -68,6 +68,7 @@ struct NodeNameOf {
   std::string_view operator()(const LimitNode& /*node*/) const { return "Limit"; }
   std::string_view operator()(const RowCountNode& /*node*/) const { return "RowCount"; }
   std::string_view operator()(const JoinNode& /*node*/) const { return "Join"; }
+  std::string_view operator()(const DependentJoinNode& /*node*/) const { return "DependentJoin"; }
 };
 
 struct InputsOfNode {
@@ -83,6 +84,9 @@ struct InputsOfNode {
   std::vector<LogicalNodePtr> operator()(const LimitNode& node) const { return {node.input}; }
   std::vector<LogicalNodePtr> operator()(const RowCountNode& /*node*/) const { return {}; }
   std::vector<LogicalNodePtr> operator()(const JoinNode& node) const {
+    return {node.left, node.right};
+  }
+  std::vector<LogicalNodePtr> operator()(const DependentJoinNode& node) const {
     return {node.left, node.right};
   }
 };
@@ -112,6 +116,12 @@ struct WithInputsOfNode {
   }
   LogicalNodePtr operator()(const JoinNode& node) const {
     JoinNode out = node;
+    out.left = std::move(inputs[0]);
+    out.right = std::move(inputs[1]);
+    return std::make_shared<const LogicalNode>(std::move(out));
+  }
+  LogicalNodePtr operator()(const DependentJoinNode& node) const {
+    DependentJoinNode out = node;
     out.left = std::move(inputs[0]);
     out.right = std::move(inputs[1]);
     return std::make_shared<const LogicalNode>(std::move(out));
@@ -509,19 +519,24 @@ std::vector<ColumnId> CallIds(std::vector<ColumnId> ids, const std::vector<Aggre
   return ids;
 }
 
-// The output ids of a join of `kind` over inputs with these output ids.
+// The output ids of a join of `kind` over inputs with these output ids, and then `own` where the
+// node defines a column of its own (a dependent join's `mark`; kNoColumnId for a plain join, which
+// defines none). One rule for both shapes of OutputIds: ADR 0023's "One output-id contract".
 std::vector<ColumnId> JoinIds(JoinKind kind, std::vector<ColumnId> left,
-                              const std::vector<ColumnId>& right) {
+                              const std::vector<ColumnId>& right, ColumnId own = kNoColumnId) {
   switch (kind) {
     case JoinKind::kInner:
     case JoinKind::kLeft:
     case JoinKind::kOneRow:
       left.insert(left.end(), right.begin(), right.end());
-      return left;
+      break;
     case JoinKind::kSemi:
     case JoinKind::kAnti:
     case JoinKind::kNullAwareAnti:
-      return left;
+      break;
+  }
+  if (own != kNoColumnId) {
+    left.push_back(own);
   }
   return left;
 }
@@ -547,7 +562,118 @@ struct OutputIdsOf {
   std::vector<ColumnId> operator()(const JoinNode& node) const {
     return JoinIds(node.kind, OutputIds(*node.left), OutputIds(*node.right));
   }
+  std::vector<ColumnId> operator()(const DependentJoinNode& node) const {
+    return JoinIds(node.kind, OutputIds(*node.left), OutputIds(*node.right), node.mark);
+  }
 };
+
+// The ids a plan reads and the ids it defines, gathered over the whole tree. One overload per node
+// type: a node type without one fails to compile, so a new node cannot silently hide a reference.
+struct IdsOfNode {
+  std::set<ColumnId>& reads;
+  std::set<ColumnId>& defines;
+
+  void Read(const BoundColumn& column) const {
+    if (column.id != kNoColumnId) {
+      reads.insert(column.id);
+    }
+  }
+  void Read(const std::optional<BoundColumn>& column) const {
+    if (column.has_value()) {
+      Read(*column);
+    }
+  }
+  void Read(const ExprPtr& expr) const {
+    if (expr == nullptr) {
+      return;
+    }
+    std::vector<ColumnId> ids;
+    CollectColumnIds(*expr, ids);
+    for (const ColumnId id : ids) {
+      if (id != kNoColumnId) {
+        reads.insert(id);
+      }
+    }
+  }
+  void Define(ColumnId id) const {
+    if (id != kNoColumnId) {
+      defines.insert(id);
+    }
+  }
+  void Calls(const std::vector<AggregateCall>& calls) const {
+    for (const AggregateCall& call : calls) {
+      Read(call.arg);
+      Define(call.id);
+    }
+  }
+
+  void operator()(const ScanNode& node) const {
+    for (const ColumnId id : node.ids) {
+      Define(id);
+    }
+  }
+  void operator()(const FilterNode& node) const {
+    for (const Predicate& predicate : node.predicates) {
+      Read(predicate.column);
+      Read(predicate.other);
+    }
+  }
+  void operator()(const ComputeNode& node) const {
+    for (const ExprPtr& expr : node.exprs) {
+      Read(expr);
+    }
+    for (const ColumnId id : node.ids) {
+      Define(id);
+    }
+  }
+  void operator()(const ProjectNode& node) const {
+    for (std::size_t i = 0; i < node.columns.size(); ++i) {
+      const bool constant = i < node.constants.size() && node.constants[i].has_value();
+      if (!constant) {
+        Read(node.columns[i]);
+      }
+    }
+    for (const ColumnId id : node.ids) {
+      Define(id);
+    }
+  }
+  void operator()(const AggregateNode& node) const { Calls(node.aggregates); }
+  void operator()(const GroupAggregateNode& node) const {
+    for (const BoundColumn& key : node.keys) {
+      Read(key);
+    }
+    for (const ColumnId id : node.key_ids) {
+      Define(id);
+    }
+    Calls(node.aggregates);
+  }
+  void operator()(const SortNode& node) const {
+    for (const SortKey& key : node.keys) {
+      Read(key.column);
+    }
+  }
+  void operator()(const LimitNode& /*node*/) const {}
+  void operator()(const RowCountNode& node) const { Define(node.id); }
+  void operator()(const JoinNode& node) const {
+    for (const JoinKey& key : node.keys) {
+      Read(key.left);
+      Read(key.right);
+    }
+    for (const ExprPtr& conjunct : node.residual) {
+      Read(conjunct);
+    }
+  }
+  void operator()(const DependentJoinNode& node) const { Define(node.mark); }
+};
+
+void CollectIds(const LogicalNode& node, std::set<ColumnId>& reads, std::set<ColumnId>& defines) {
+  std::visit(IdsOfNode{.reads = reads, .defines = defines}, node);
+  for (const LogicalNodePtr& input : InputsOf(node)) {
+    if (input != nullptr) {
+      CollectIds(*input, reads, defines);
+    }
+  }
+}
 
 std::string IdText(ColumnId id) { return std::format("#{}", std::to_underlying(id)); }
 
@@ -616,22 +742,36 @@ class Resolver {
     }
   }
 
-  // Sets `index` to the position of `id` among `ids`; true when it changed.
+  // Sets `index` to the position of `id` among the ids the reference reads; true when it changed.
   bool Resolve(std::string_view node, int& index, ColumnId id, const std::vector<ColumnId>& ids) {
     if (id == kNoColumnId) {
       Fail(std::format("{}: a reference without an id", node));
       return false;
     }
-    const auto first = std::ranges::find(ids, id);
+    // Its own input's ids, or, for a free variable anywhere inside a dependent join's right input,
+    // the left input's ids that the dependent join bound for that subtree (ADR 0023). Innermost
+    // binding first, as the binder resolves an outer reference innermost first.
+    const std::vector<ColumnId>* read = &ids;
+    auto first = std::ranges::find(ids, id);
     if (first == ids.end()) {
+      for (std::size_t depth = bound_.size(); depth > 0; --depth) {
+        const std::vector<ColumnId>& frame = bound_[depth - 1];
+        if (const auto outer = std::ranges::find(frame, id); outer != frame.end()) {
+          read = &frame;
+          first = outer;
+          break;
+        }
+      }
+    }
+    if (first == read->end()) {
       Fail(std::format("{}: column {} is not in its input", node, IdText(id)));
       return false;
     }
-    if (std::ranges::find(std::next(first), ids.end(), id) != ids.end()) {
+    if (std::ranges::find(std::next(first), read->end(), id) != read->end()) {
       Fail(std::format("{}: column {} is in its input twice", node, IdText(id)));
       return false;
     }
-    const auto position = Narrow<int>(first - ids.begin());
+    const auto position = Narrow<int>(first - read->begin());
     if (position == index) {
       return false;
     }
@@ -838,7 +978,42 @@ class Resolver {
             .ids = JoinIds(join.kind, std::move(left.ids), right.ids)};
   }
 
+  Resolved Visit(const LogicalNodePtr& self, const DependentJoinNode& join) {
+    switch (join.kind) {
+      case JoinKind::kSemi:
+      case JoinKind::kAnti:
+      case JoinKind::kOneRow:
+        break;
+      case JoinKind::kInner:
+      case JoinKind::kLeft:
+      case JoinKind::kNullAwareAnti:
+        // Only the three kinds the binder plans (ADR 0023): a correlation is a predicate of the
+        // right input, so there is nothing for the other kinds to match on.
+        Fail(std::format("DependentJoin: a {} dependent join", ToString(join.kind)));
+        break;
+    }
+    Resolved left = Walk(join.left);
+    // The left input's columns are the right input's free variables, bound for that subtree only:
+    // every node of the right input may read them, and no node outside it may.
+    bound_.push_back(left.ids);
+    Resolved right = Walk(join.right);
+    bound_.pop_back();
+    if (join.mark != kNoColumnId) {
+      Define("DependentJoin", join.mark);
+    }
+    DependentJoinNode out = join;
+    const bool changed = left.node != join.left || right.node != join.right;
+    out.left = left.node;
+    out.right = right.node;
+    return {.node = changed ? MakeNode(std::move(out)) : self,
+            .ids = JoinIds(join.kind, std::move(left.ids), right.ids, join.mark)};
+  }
+
   std::set<ColumnId> defined_;
+  // One frame per dependent join on the path to the node being walked: the ids its left input
+  // outputs, which its right input may read as free variables. Empty outside a right input, so a
+  // plan without a dependent join resolves exactly as it did before (ADR 0023).
+  std::vector<std::vector<ColumnId>> bound_;
   std::optional<std::string> failure_;
   std::optional<std::string> difference_;
 };
@@ -846,6 +1021,15 @@ class Resolver {
 }  // namespace
 
 std::vector<ColumnId> OutputIds(const LogicalNode& node) { return std::visit(OutputIdsOf{}, node); }
+
+std::vector<ColumnId> FreeVariables(const LogicalNode& node) {
+  std::set<ColumnId> reads;
+  std::set<ColumnId> defines;
+  CollectIds(node, reads, defines);
+  std::vector<ColumnId> free;
+  std::ranges::set_difference(reads, defines, std::back_inserter(free));
+  return free;
+}
 
 LogicalPlan ResolvePositions(const LogicalPlan& plan, std::source_location location) {
   if (plan.root == nullptr) {

@@ -154,6 +154,9 @@ struct RowsOf {
   std::optional<int64_t> operator()(const LimitNode& node) const { return Input(node); }
   std::optional<int64_t> operator()(const RowCountNode& /*node*/) const { return 1; }
   std::optional<int64_t> operator()(const JoinNode& /*node*/) const { return std::nullopt; }
+  std::optional<int64_t> operator()(const DependentJoinNode& /*node*/) const {
+    return std::nullopt;
+  }
 
   template <class Node>
   static std::optional<int64_t> Input(const Node& node) {

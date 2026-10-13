@@ -275,7 +275,7 @@ TEST(ColumnIdsTest, PositionMismatchReportsBrokenInvariantsFirst) {
 // Optimize's rules find columns by their ids and leave positions to ResolvePositions, its last
 // step: an index that is not its column's position is set to it.
 TEST(ColumnIdsTest, OptimizeResolvesStaleIndexes) {
-  const LogicalPlan optimized = Optimize(FilterPlan(Column(kC, 0)));  // #3 is at 2, not 0
+  const LogicalPlan optimized = Optimized(FilterPlan(Column(kC, 0)));  // #3 is at 2, not 0
   const auto* filter = std::get_if<FilterNode>(optimized.root.get());
   ASSERT_NE(filter, nullptr);
   EXPECT_EQ(filter->predicates.at(0).column.value_or(BoundColumn{}).index, 2);
@@ -318,6 +318,126 @@ TEST(ColumnIdsTest, OutputIdsOfEveryJoinKind) {
   EXPECT_EQ(OutputIds(Join(JoinKind::kSemi)), left);
   EXPECT_EQ(OutputIds(Join(JoinKind::kAnti)), left);
   EXPECT_EQ(OutputIds(Join(JoinKind::kNullAwareAnti)), left);
+}
+
+// A dependent join outputs its inputs' ids by its kind's rule, exactly as the join of that kind.
+TEST(ColumnIdsTest, OutputIdsOfEveryDependentJoinKind) {
+  const auto dependent = [](JoinKind kind) {
+    return DependentJoinNode{.kind = kind, .left = Scan(), .right = Scan({kD, kE, kF}), .span = {}};
+  };
+  EXPECT_EQ(OutputIds(dependent(JoinKind::kSemi)), (std::vector<ColumnId>{kA, kB, kC}));
+  EXPECT_EQ(OutputIds(dependent(JoinKind::kAnti)), (std::vector<ColumnId>{kA, kB, kC}));
+  EXPECT_EQ(OutputIds(dependent(JoinKind::kOneRow)),
+            (std::vector<ColumnId>{kA, kB, kC, kD, kE, kF}));
+}
+
+// A plan's free variables (ADR 0023): the ids it reads that none of its own nodes defines. A
+// subquery is correlated exactly when its plan has some.
+TEST(ColumnIdsTest, FreeVariablesAreTheIdsReadButNotDefined) {
+  // A plan that reads only its own Scan's columns has none, whatever it computes above them.
+  const LogicalNodePtr own = Node(ComputeNode{
+      .input = FilterPlan(Column(kA, 0)).root, .exprs = {Leaf(kB, 1)}, .ids = {ColumnId{4}}});
+  EXPECT_TRUE(FreeVariables(*own).empty());
+
+  // A Filter reading #9, which nothing below defines.
+  const LogicalNodePtr reads_outer =
+      Node(FilterNode{.input = Scan(),
+                      .predicates = {Predicate{.kind = Predicate::Kind::kCompareColumns,
+                                               .column = Column(kA, 0),
+                                               .other = Column(ColumnId{9}, 0)}},
+                      .span = {}});
+  EXPECT_EQ(FreeVariables(*reads_outer), (std::vector<ColumnId>{ColumnId{9}}));
+
+  // Sorted and without repeats, over every kind of reference: a Compute's expression, a Sort key,
+  // an aggregate's argument and a join's key and residual.
+  const LogicalNodePtr many = Node(SortNode{
+      .input = Node(AggregateNode{
+          .input = Node(ComputeNode{.input = Scan(),
+                                    .exprs = {Leaf(ColumnId{30}, 0), Leaf(ColumnId{20}, 0)},
+                                    .ids = {ColumnId{40}, ColumnId{41}}}),
+          .aggregates = {AggregateCall{
+              .kind = AggKind::kSum, .arg = Column(ColumnId{20}, 0), .id = ColumnId{42}}}}),
+      .keys = {SortKey{.column = Column(ColumnId{42}, 0)}},
+      .span = {}});
+  EXPECT_EQ(FreeVariables(*many), (std::vector<ColumnId>{ColumnId{20}, ColumnId{30}}));
+
+  // A dependent join binds its left input's ids for its right input, so a right input that reads
+  // them has no free variables left at the dependent join.
+  const LogicalNodePtr bound = Node(
+      DependentJoinNode{.kind = JoinKind::kSemi, .left = Scan(), .right = reads_outer, .span = {}});
+  EXPECT_EQ(FreeVariables(*reads_outer), (std::vector<ColumnId>{ColumnId{9}}));
+  EXPECT_EQ(FreeVariables(*bound), (std::vector<ColumnId>{ColumnId{9}}))
+      << "#9 is defined by neither input, so it stays free of the whole";
+  const LogicalNodePtr reads_left =
+      Node(FilterNode{.input = Scan({ColumnId{4}, ColumnId{5}, ColumnId{6}}),
+                      .predicates = {Predicate{.kind = Predicate::Kind::kCompareColumns,
+                                               .column = Column(ColumnId{4}, 0),
+                                               .other = Column(kB, 0)}},
+                      .span = {}});
+  EXPECT_EQ(FreeVariables(*reads_left), (std::vector<ColumnId>{kB}));
+  EXPECT_TRUE(
+      FreeVariables(*Node(DependentJoinNode{
+                        .kind = JoinKind::kSemi, .left = Scan(), .right = reads_left, .span = {}}))
+          .empty())
+      << "the left input defines #2";
+
+  // `mark` is defined by the dependent join itself, so a node above that reads it is not free.
+  EXPECT_TRUE(
+      FreeVariables(*Node(FilterNode{.input = Node(DependentJoinNode{.kind = JoinKind::kSemi,
+                                                                     .left = Scan(),
+                                                                     .right = Scan({ColumnId{4}}),
+                                                                     .mark = ColumnId{50},
+                                                                     .span = {}}),
+                                     .predicates = {Predicate{.kind = Predicate::Kind::kIsNotNull,
+                                                              .column = Column(ColumnId{50}, 0)}},
+                                     .span = {}}))
+          .empty());
+}
+
+// The first shape of the output-id contract (ADR 0023): a dependent join binds its left input's ids
+// inside its right input, so a node of the right input may read a column that no input of its own
+// outputs -- a free variable. It resolves to its position among the ids the dependent join bound,
+// and the same reference outside the right input is still "not in its input".
+TEST(ColumnIdsTest, ResolvePositionsBindsLeftIdsInsideTheRightInput) {
+  // The right input filters on #2, a column of the left input, which its own Scan does not output.
+  const auto right_reading = [](ColumnId outer, int index) {
+    return Node(FilterNode{.input = Scan({ColumnId{4}, ColumnId{5}, ColumnId{6}}),
+                           .predicates = {Predicate{.kind = Predicate::Kind::kIsNotNull,
+                                                    .column = Column(outer, index)}},
+                           .span = {}});
+  };
+  const LogicalPlan plan = Plan(Node(DependentJoinNode{
+      .kind = JoinKind::kSemi, .left = Scan(), .right = right_reading(kB, 7), .span = {}}));
+  EXPECT_EQ(PositionMismatch(plan), std::optional<std::string>("Filter: column #2 is at 1, not 7"));
+
+  const LogicalPlan resolved = ResolvePositions(plan);
+  EXPECT_EQ(PositionMismatch(resolved), std::nullopt) << "resolving twice changes nothing";
+  // #2 is the second of the left input's ids, so the free variable's index is 1.
+  const auto& join = std::get<DependentJoinNode>(*resolved.root);
+  EXPECT_EQ(std::get<FilterNode>(*join.right).predicates[0].column.value_or(BoundColumn{}).index,
+            1);
+
+  // The binding ends with the right input: the same reference under the left input is unresolvable.
+  EXPECT_EQ(PositionMismatch(Plan(Node(DependentJoinNode{.kind = JoinKind::kSemi,
+                                                         .left = right_reading(ColumnId{9}, 0),
+                                                         .right = Scan({ColumnId{4}}),
+                                                         .span = {}}))),
+            std::optional<std::string>("Filter: column #9 is not in its input"));
+}
+
+// The second shape of the output-id contract (ADR 0023): a two-input node may also define a column
+// of its own, which goes last. No kind sets `mark` yet, so only a hand-built plan has one.
+TEST(ColumnIdsTest, OutputIdsOfADependentJoinEndWithItsOwnColumn) {
+  const ColumnId mark{12};
+  const auto marked = [](JoinKind kind) {
+    return DependentJoinNode{
+        .kind = kind, .left = Scan(), .right = Scan({kD, kE, kF}), .mark = mark, .span = {}};
+  };
+  EXPECT_EQ(OutputIds(marked(JoinKind::kSemi)), (std::vector<ColumnId>{kA, kB, kC, mark}));
+  EXPECT_EQ(OutputIds(marked(JoinKind::kOneRow)),
+            (std::vector<ColumnId>{kA, kB, kC, kD, kE, kF, mark}));
+  // A Join defines no column of its own, so the same ids without the marker.
+  EXPECT_EQ(OutputIds(Join(JoinKind::kSemi)), (std::vector<ColumnId>{kA, kB, kC}));
 }
 
 // Keys resolve against their own input; residual columns against the left ids, then the right ids.
@@ -422,11 +542,12 @@ TEST(ColumnIdsTest, PositionMismatchNamesBrokenJoins) {
 TEST(ColumnIdsDeathTest, BrokenPlansAbort) {
   EXPECT_DEATH(ResolvePositions(FilterPlan(Column(ColumnId{99}, 0))),
                "Filter: column #99 is not in its input");
-  EXPECT_DEATH(Optimize(FilterPlan(Column(ColumnId{99}, 0))),
+  // Optimize is [[nodiscard]] since ADR 0023's unnesting pass; the abort is what is under test.
+  EXPECT_DEATH(static_cast<void>(Optimize(FilterPlan(Column(ColumnId{99}, 0)))),
                "Filter: column #99 is not in its input");
   JoinNode keyless = Join(JoinKind::kSemi);
   keyless.keys.clear();
-  EXPECT_DEATH(Optimize(Plan(Node(keyless))), "Join: SEMI join without keys");
+  EXPECT_DEATH(static_cast<void>(Optimize(Plan(Node(keyless)))), "Join: SEMI join without keys");
 }
 
 }  // namespace

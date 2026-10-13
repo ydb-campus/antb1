@@ -28,7 +28,7 @@ std::string ExplainSql(std::string_view sql, bool optimize = true) {
   if (!plan.ok()) {
     return {};
   }
-  return Explain(optimize ? Optimize(*plan) : *plan);
+  return Explain(optimize ? Optimized(*plan) : *plan);
 }
 
 TEST(ExplainTest, RowCount) {
@@ -164,7 +164,7 @@ TEST(ExplainTest, NamesAndStringsStayOnOneAsciiLine) {
   ASSERT_TRUE(catalog.Register("w", table).ok());
   auto plan = BindSql("SELECT \"a\"\"b\", \"é\n\" FROM w WHERE \"a\"\"b\" = 'x\ty\\z'", catalog);
   ASSERT_TRUE(plan.ok()) << plan.status().ToString();
-  EXPECT_EQ(Explain(Optimize(*plan)),
+  EXPECT_EQ(Explain(Optimized(*plan)),
             "Output: a\"b:VARCHAR \\xC3\\xA9\\x0A:INTEGER\n"
             "Project \"a\"\"b\", \"\\xC3\\xA9\\x0A\"\n"
             "  Filter \"a\"\"b\" = 'x\\x09y\\x5Cz'\n"
@@ -265,6 +265,41 @@ TEST(ExplainTest, EveryJoinKind) {
                                  .build = BuildSide::kRight,
                                  .span = {}}),
             "Join ONE-ROW build=right keys=[] residual=[(x > \"sum(y)\")]");
+}
+
+// A dependent join prints its kind and nothing else: it has no build side and no keys. Only a plan
+// test sees this line, since Optimize replaces every dependent join or rejects the query (ADR
+// 0023).
+TEST(ExplainTest, EveryDependentJoinKind) {
+  for (const auto& [kind, line] : {
+           std::pair{JoinKind::kSemi, "DependentJoin SEMI"},
+           std::pair{JoinKind::kAnti, "DependentJoin ANTI"},
+           std::pair{JoinKind::kOneRow, "DependentJoin ONE-ROW"},
+       }) {
+    EXPECT_EQ(ExplainNode(DependentJoinNode{
+                  .kind = kind, .left = ScanOf("t", {0}), .right = ScanOf("t", {0}), .span = {}}),
+              line);
+  }
+  EXPECT_EQ(ExplainNode(DependentJoinNode{.kind = JoinKind::kSemi,
+                                          .left = ScanOf("t", {0}),
+                                          .right = ScanOf("t", {0}),
+                                          .mark = ColumnId{7},
+                                          .span = {}}),
+            "DependentJoin SEMI mark=#7");
+}
+
+// Both inputs are rendered, left first, as a Join's are.
+TEST(ExplainTest, DependentJoinShowsBothInputs) {
+  EXPECT_EQ(Explain(LogicalPlan{.root = std::make_shared<const LogicalNode>(
+                                    DependentJoinNode{.kind = JoinKind::kOneRow,
+                                                      .left = ScanOf("a", {0}),
+                                                      .right = ScanOf("b", {0}),
+                                                      .span = {}}),
+                                .output = {}}),
+            "Output:\n"
+            "DependentJoin ONE-ROW\n"
+            "  Scan table=a source=fake columns=[i16]\n"
+            "  Scan table=b source=fake columns=[i16]\n");
 }
 
 // A qualifier is printed wherever a column is (J2b's binder sets it); quoted like a name.

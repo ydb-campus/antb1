@@ -182,16 +182,37 @@ class Scope {
   // searched.
   [[nodiscard]] Lookup LookUp(const sql::ColumnRef& ref, Visibility visible = {}) const;
 
-  // Whether an enclosing scope has `ref`, which makes a name this block lacks a correlation rather
-  // than a missing column (ADR 0022 rule 9). Asked only once this block's own resolution has
-  // failed, its select-list aliases included: an alias of this block that happens to name a column
-  // of an enclosing one is this block's alias, not a correlation, so whether it resolves must not
-  // depend on the FROM order of the enclosing block.
+  // Where `ref` resolves in an enclosing block: the nearest one that has it, with `distance` 1 for
+  // the block that directly encloses this one -- the only distance ADR 0023 answers -- and that
+  // scope's own LookUp, so an outer name that is ambiguous there stays ambiguous. None when no
+  // enclosing block has the name.
+  //
+  // Asked only once this block's own resolution has failed, its select-list aliases included: an
+  // alias of this block that happens to name a column of an enclosing one is this block's alias,
+  // not an outer reference, so whether it resolves must not depend on the FROM order of the
+  // enclosing block.
+  struct OuterLookup {
+    std::size_t distance = 0;      // blocks out: 1 is the directly enclosing block
+    const Scope* scope = nullptr;  // the scope that has the name; outlives this one
+    Lookup lookup;                 // where in that scope
+  };
+  [[nodiscard]] std::optional<OuterLookup> LookUpOuter(const sql::ColumnRef& ref) const;
+
+  // Whether an enclosing scope has `ref`, which makes a name this block lacks an outer reference
+  // rather than a missing column (ADR 0022 rule 9).
   [[nodiscard]] bool Correlates(const sql::ColumnRef& ref) const;
 
-  // Rule 9's error: a correlation exits 4 until ADR 0023's PRs answer it, and never reports
-  // "does not exist".
-  static arrow::Status CorrelationError(const sql::ColumnRef& ref);
+  // Rule 9's error: an outer reference this PR cannot answer exits 4, and never reports "does not
+  // exist". `why` names the reason, which ADR 0023 keeps distinct so that a refusal says which rule
+  // it broke.
+  enum class Refusal : std::uint8_t {
+    kCorrelated,  // the shape itself has no plan yet
+    kClause,      // not in a WHERE conjunct of this block (an inner join's ON counts as WHERE)
+    kDistance,    // a block further out than the one that directly encloses the subquery
+    kLateral,     // a derived table's or a CTE's reference out, which ADR 0022 refuses
+  };
+  static arrow::Status CorrelationError(const sql::ColumnRef& ref,
+                                        Refusal why = Refusal::kCorrelated);
 
   // The column `ref` refers to (LookUp), by its id (plan::ResolvePositions sets its position at the
   // end), as Reference gives it. A bind error at the name when it is ambiguous (rules 3 and 4: the

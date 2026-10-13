@@ -901,5 +901,39 @@ TEST_F(PhysicalPlannerTest, MalformedPlansAreInvalidNotUnsupported) {
   EXPECT_TRUE(BuildPhysicalPlan(PlanOf(scan, 2)).ok());
 }
 
+// A dependent join is unsupported, not a malformed plan: the pass of plan::Optimize replaces every
+// one or rejects the query, so only a hand-built plan reaches the physical planner. It must carry a
+// kUnsupported detail, so that such a plan exits 4 as the query it came from does, and never 70
+// (ADR 0023, ADR 0005).
+TEST_F(PhysicalPlannerTest, ADependentJoinIsUnsupportedAndNotABug) {
+  const auto table = Table();
+  const auto scan = [&] {
+    return Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}});
+  };
+  const SourceSpan span{.offset = 7, .length = 3};
+  for (const plan::JoinKind kind :
+       {plan::JoinKind::kSemi, plan::JoinKind::kAnti, plan::JoinKind::kOneRow}) {
+    const auto root =
+        Node(plan::DependentJoinNode{.kind = kind, .left = scan(), .right = scan(), .span = span});
+    for (const bool profiled : {false, true}) {
+      ProfileNode profile;
+      const auto status =
+          BuildPhysicalPlan(PlanOf(root, 2), profiled ? &profile : nullptr).status();
+      const auto detail = plan::GetSqlError(status);
+      ASSERT_NE(detail, nullptr) << plan::ToString(kind) << ": not a bug but unsupported";
+      EXPECT_EQ(detail->kind(), plan::SqlErrorDetail::Kind::kUnsupported);
+      EXPECT_EQ(detail->span(), span) << "the subquery's span";
+      EXPECT_TRUE(status.IsNotImplemented()) << status.ToString();
+    }
+  }
+  // Below another node, so the rejection does not depend on it being the root.
+  const auto below = Node(plan::DependentJoinNode{
+      .kind = plan::JoinKind::kOneRow, .left = scan(), .right = scan(), .span = span});
+  const auto status =
+      BuildPhysicalPlan(PlanOf(Node(plan::LimitNode{.input = below, .limit = 1}), 2)).status();
+  ASSERT_NE(plan::GetSqlError(status), nullptr);
+  EXPECT_EQ(plan::GetSqlError(status)->kind(), plan::SqlErrorDetail::Kind::kUnsupported);
+}
+
 }  // namespace
 }  // namespace antb1::exec

@@ -274,9 +274,11 @@ struct SortNode;
 struct LimitNode;
 struct RowCountNode;
 struct JoinNode;
+struct DependentJoinNode;
 
-using LogicalNode = std::variant<ScanNode, FilterNode, ComputeNode, ProjectNode, AggregateNode,
-                                 GroupAggregateNode, SortNode, LimitNode, RowCountNode, JoinNode>;
+using LogicalNode =
+    std::variant<ScanNode, FilterNode, ComputeNode, ProjectNode, AggregateNode, GroupAggregateNode,
+                 SortNode, LimitNode, RowCountNode, JoinNode, DependentJoinNode>;
 using LogicalNodePtr = std::shared_ptr<const LogicalNode>;
 
 // Reads top-level fields of a table. Output: the fields, in this order.
@@ -414,6 +416,28 @@ struct JoinNode {
   SourceSpan span;  // the join in the query
 };
 
+// A correlated subquery before unnesting (ADR 0023), the formalization's dependent join: for each
+// row of the left input, the right input evaluated with its free variables (the ids its expressions
+// read and none of its own nodes outputs) bound to that row's values. Its kind is semi (EXISTS),
+// anti (NOT EXISTS) or one-row (a scalar subquery, whose single value it appends to each left row);
+// it has no keys, because a correlation is a predicate of the right input, not a pair of columns.
+// Output: as a join of the same kind, and then `mark` where that is set.
+//
+// The first pass of plan::Optimize replaces every dependent join with ordinary joins or rejects the
+// query (exit code 4), so no session executes one and no later pass meets one; EXPLAIN renders it
+// for the plan tests, and the physical planner rejects it with kUnsupported.
+struct DependentJoinNode {
+  JoinKind kind = JoinKind::kSemi;
+  LogicalNodePtr left;
+  LogicalNodePtr right;  // reads columns of the left input as free variables
+  // A column this node defines that neither input has: a mark join's three-valued marker. No kind
+  // defines one yet, so every bound plan leaves it unset; OutputIds and ResolvePositions honour it
+  // so that adding the mark kind needs a kind and this field on JoinNode, not a second rewrite of
+  // either (ADR 0023, "One output-id contract for two shapes").
+  ColumnId mark = kNoColumnId;
+  SourceSpan span;  // the subquery in the query
+};
+
 struct LogicalPlan {
   LogicalNodePtr root;
   // Result columns of root: names (aliases applied), types and ids (OutputIds(*root)).
@@ -421,25 +445,35 @@ struct LogicalPlan {
 };
 
 // "Scan", "Filter", "Compute", "Project", "Aggregate", "GroupAggregate", "Sort", "Limit",
-// "RowCount" or "Join".
+// "RowCount", "Join" or "DependentJoin".
 std::string_view NodeName(const LogicalNode& node);
 
 // The span of the query text a node was bound from.
 SourceSpan SpanOf(const LogicalNode& node);
 
-// The inputs of a node, in order: none for leaves (Scan, RowCount), left then right for a Join, and
-// one for the others.
+// The inputs of a node, in order: none for leaves (Scan, RowCount), left then right for a Join and
+// a DependentJoin, and one for the others.
 std::vector<LogicalNodePtr> InputsOf(const LogicalNode& node);
 
 // A copy of the node over other inputs, in the order of InputsOf. A count that differs from the
 // node's is a programming error (the process aborts).
 LogicalNodePtr WithInputs(const LogicalNode& node, std::vector<LogicalNodePtr> inputs);
 
-// The ids of a node's output columns, in order. A node defines new columns where it creates them:
-// Scan (`ids`), Compute (its input's ids, then `ids`), Project (`ids`), Aggregate (each call's id),
-// GroupAggregate (`key_ids`, then each call's id) and RowCount (`id`); Filter, Sort and Limit
-// output their input's ids, and a Join its inputs' ids (see JoinNode).
+// The ids of a node's output columns, in order. A node's output takes one of two shapes, and a node
+// with two inputs may take both. It defines new columns where it creates them: Scan (`ids`),
+// Compute (its input's ids, then `ids`), Project (`ids`), Aggregate (each call's id),
+// GroupAggregate
+// (`key_ids`, then each call's id), RowCount (`id`) and a DependentJoin (`mark`, where it is set);
+// and it passes ids through from its inputs: Filter, Sort and Limit their input's, a Join its
+// inputs' (see JoinNode) and a DependentJoin its inputs' by the same rule.
 std::vector<ColumnId> OutputIds(const LogicalNode& node);
+
+// The free variables of a plan (ADR 0023, the formalization's F(R)): the ids its expressions read
+// that none of its own nodes defines, sorted and without repeats. A subquery is correlated exactly
+// when its plan has free variables, and a dependent join is legal only where its left input defines
+// every free variable of its right input. Inside a dependent join of the plan the binding holds, so
+// an id its left input defines is no free variable of the whole.
+std::vector<ColumnId> FreeVariables(const LogicalNode& node);
 
 // The plan with every reference's index set to the position of its id in the ids it reads (its
 // input's output ids); unchanged nodes keep their pointers, so the result of a resolved plan is the
