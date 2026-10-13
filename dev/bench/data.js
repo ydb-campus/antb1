@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791849563472,
+  "lastUpdate": 1791873620018,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -6912,6 +6912,114 @@ window.BENCHMARK_DATA = {
             "value": 50.02826884615366,
             "unit": "ms/iter",
             "extra": "iterations: 13\ncpu: 50.0001726923078 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "6125bf96d769417431d7e2818a908aeb7f031262",
+          "message": "feat(plan): uncorrelated scalar subqueries as one-row joins (#127)\n\n## Summary\n\nRoadmap id **J5b** of [ADR\n0022](../blob/main/docs/adr/0022-joins-and-query-blocks.md) — the scalar\nhalf of J5, after J5a (#126). **The TPC-H-derived ratchet goes 14 → 16\nof 22**, which completes J5\nand the arc S4b (#123) → T2b (#125) → J5a (#126) → J5b.\n\n`x <op> (query)` in either order, as a top-level `AND` conjunct of\n`WHERE`, of an inner join's `ON`\nor of `HAVING`, becomes a keyless **one-row join** (`JoinKind::kOneRow`)\nthat appends the query's\nsingle row, with the comparison as a `Filter` directly above it. The\nquery must be an aggregate over\nevery row — no `GROUP BY`, `HAVING`, `LIMIT` or `OFFSET`, each of which\ncould leave no row — which is\nthe one shape that returns exactly one row however the data falls, so no\nrow count is checked at run\ntime. Over no row `SUM`, `AVG`, `MIN` and `MAX` are NULL, which the\ncomparison rejects, and `COUNT`\nis 0, which it compares as usual; both as in DuckDB.\n\n### The comparison needs no logic of its own\n\n`BindConditionWith` binds the conjunct with the sub-plan's column\nstanding in for the subquery, so\nevery rule a comparison of two operands already follows applies\nunchanged: the DECIMAL and DATE pairs\nit admits, the folding of a literal side, `MoveConstants`, and the\n`FLOAT` refusal of divergence D11,\nwhich `BindingColumn` carries across the block boundary. That is also\nwhy the other side may be a\nliteral (`0 = (query)`) or a constant integer expression for free, and\nwhy\n`tr_distance > (SELECT AVG(zn_radius) FROM zones)` works where a DOUBLE\n*IN key* does not: the scalar\nform has no key.\n\n**\"An ungrouped aggregate\" means `Shape::kGlobal`, not a bare aggregate\ncall.** `scalar.slt`'s\n`HAVING` record and Q11 both compare against an *expression over* an\naggregate, so reading it\nnarrowly would have stopped the ratchet at 15.\n\n### The J5a abort recurred by a second route\n\nA one-row join **appends** its row's column, where a semi or anti join\noutputs its left input's\ncolumns alone. So `Shape::kGlobal` needs its restoring `Project`\nwhenever a `HAVING` subquery\nconjunct has a join at all — not only when a probe needed a cast, which\nis what J5a fixed.\n`SELECT MIN(tr_driver) FROM trips HAVING MIN(tr_driver) = (SELECT\nMAX(dv_id) FROM drivers)` aborted\n(exit 134) before the fix. `SubqueryJoin::AddsColumns()` is now the one\nplace that decides, and two\nrecords pin both branches.\n\n### And one the sweep found\n\n`WHERE 1 + 2 = (SELECT COUNT(*) FROM promos)` aborted where DuckDB\nanswers, and so did every other\n*successfully folded* constant integer expression on the other side, in\n`WHERE`, in `HAVING` and in\nan inner `ON`, in both operand orders. The docs and the ADR both promise\nthat side may be a constant\ninteger expression, and `RejectSubqueryConjunct` admits one, so this was\nan accepted shape reaching a\nprogramming-error check.\n\n`BindConditionOf`'s fold copies the whole comparison to place the folded\nliteral —\n`sql::BinaryExpr literal = binary;` — and **`sql::Box`'s copy\nconstructor deep-copies its pointee**,\nso the untouched subquery side arrives at a new address. `bind_side`\nrecognised it by address, missed,\nand fell through to the general expression binder, whose `SubqueryExpr`\nvisitor is the abort. It now\nmatches on the kind, which does not depend on the AST's identity\nsurviving a copy:\n`AsSubqueryConjunct` accepted exactly one scalar subquery as a direct\noperand, and\n`RejectSubqueryConjunct` ran `FirstUnsupported` over the other side,\nwhich refuses every subquery.\nSeven records pin it, including the overflowing fold, which stays a bind\nerror (divergence D17).\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run test\n100% tests passed out of 2615\nANTB1-TESTS: PASS preset=dev junit=build/dev/junit.xml\n\n$ pixi run ci\n100% tests passed out of 2615\n\n$ pixi run coverage\n| `plan` | 96.08% (6871/7151) | 93.5% | 90.98% (3884/4269) | 89.5% | ok |\nCoverage gate: PASS\n\n$ pixi run lint\nevery hook Passed except shellcheck, which fails identically on main\n\n$ clang-tidy -p build/tidy --warnings-as-errors='*' <every changed TU>\n0 findings\n```\n\nThe ratchet was **measured before the JSON was edited**:\n\n```text\n$ pixi run test -R 'tpch\\.status'\nTPCH: PASS queries=22 pass=[1, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19]\n      unsupported=6 rejected=0 failed=0\n```\n\n`rejected=0` again: no query turned from exit 4 into a bind error. Q11\nand Q15 join; the six left are\nADR 0023's correlated work.\n\n**With `kScalarSubquery` declared, `kSupportedFeatures ==\nAll().Minus(kNeverGenerated)`, so the diff\ngate has no tolerance band at all** — every generated query must answer\nand match:\n\n```text\n$ antb1-slt diff ... --count 400 --target-percent 100\nDIFF: PASS seed=20261005 queries=400 failed=0 unsupported=0\nDIFF: PASS seed=20261013 queries=400 failed=0 unsupported=0\nDIFF: PASS seed=777      queries=400 failed=0 unsupported=0\nDIFF: PASS seed=424242   queries=400 failed=0 unsupported=0\nand seed 20261005 with --threads 4 --same-as-threads 1 --batch-size 97: PASS failed=0 unsupported=0\n```\n\n```text\n$ ANTB1_UPDATE_GOLDENS=1 pixi run test -L cli && pixi run test -L cli\na no-op: the two new goldens regenerate byte-identically\n\n$ antb1-sql-parser-fuzzer -seed=1 -runs=50000 (work corpus + the committed seeds)\nDone 50000 runs, no crash;  fuzz replay: PASS inputs=78\n```\n\n## Tests\n\nThe 11 pending records of `scalar.slt` and\n`subqueries/derived_tables.slt` answer, and the three\nscalar metamorphic relations activate from the feature set. Seventeen\nrecords added for what the\ngenerator does not write: a VARCHAR value from the one row\n(`kOneRowWindowBytes`), a DATE one, `<>`\nagainst `!=`, an expression on the outer side, the global-aggregate\n`Project` both ways, the inner-`ON`\nand `WHERE` pair, both subquery forms in one `WHERE`, and the seven\nconstant-fold shapes above. Plus\neleven new `binder_test` `ErrorCase`s and two EXPLAIN goldens.\n\n**The canary.** With both features declared no relation is pending, and\n`metamorphic.RelationList.PendingRelationsHoldInDuckDb` asserts there is\none to validate on DuckDB —\nso `window_function_canary_stays_pending` carries `kWindowFunctions`,\nthe one `kNeverGenerated`\nmarker, and is now the single skipped relation. Both its probes answer\n3000 on DuckDB and exit 4 on\nantb1 at the `OVER`, so `Evaluate` reads it as pending rather than\nbroken.\n\n**Mutation checks** (each applied alone against the committed tree):\n\n| mutation | caught by |\n|---|---|\n| `AddsColumns` forgets the one-row join | `slt.subqueries.scalar`, **as\nan abort** |\n| `bind_side` matches the subquery by address again |\n`slt.subqueries.scalar`, **as an abort** |\n| the inner-shape gate drops `LIMIT`/`OFFSET` | two `ErrorCase`s |\n| the inner-shape gate drops `IsAggregateQuery` | two `ErrorCase`s |\n| the subquery joins stack in reverse order |\n`cli.explain_in_subquery_semi_join` |\n\n## How the two aborts were found\n\nA 14-agent adversarial workflow swept **4148 generated queries** against\nthe pinned oracle\n(`.pixi/envs/default/bin/duckdb` 1.5.6) across four shape families —\nNULL and empty inputs, typing,\nplacement and shape, and interaction with the rest of the engine — and\nadversarially verified each\nreported divergence against the docs before confirming it. It found\n**exactly one defect, the\nconstant-fold abort**, which all four families hit independently; zero\nwrong answers.\n\nA completeness critic then closed the gaps the sweeps had declared\nunreachable, and found nothing\nfurther: FLOAT/D11 through `floats.parquet` (the refusal fires, and the\nliteral path really does carry\n`stored_as_float` across the block boundary), TIMESTAMP through\n`toDateTime`, a scratch Parquet with a\n2 MB string to force a one-row window in `kOneRowWindowBytes`, wide\nDECIMAL through `decimals.parquet`\n(the >38-digit pairs are divergence D13, reproducible with no subquery),\n100 stacked one-row joins,\nand nesting to depth 100 (clean exit 4, no stack overflow). It also\nflagged two pieces of dead code,\nboth removed, and claimed the join order was unpinned — which I tested\nrather than believed, and the\nJ5a golden catches it.\n\n## Maintainer notes\n\n- **Governance.** The same three \"Ask a human first\" paths as #126:\n`tests/data/tpch_status.json`\n(14 → 16), `AGENTS.md:4` (\"14 of 22\" → \"16 of 22\") and `docs/adr/0022`\n(two Update notes).\n- `pixi run check` cannot pass on this osx-arm64 machine, unchanged from\n#120/#121/#123/#125/#126: the\nosx-arm64 shellcheck reports pre-existing `SC2218` in a governance file,\nidentical on `main`. `ci`,\n  `coverage` and per-file `clang-tidy` stand in.\n- `docs/testing.md:467` owes `asan` for any PR touching\n`supported_features.h`, i.e. this one. ASan\n  cannot complete here, so please let CI's ASan leg decide.\n- **A pre-existing diagnostic worth its own fix, not this PR's:** a\nsub-plan column of an unsupported\ntype (BOOLEAN, LIST, STRUCT) is reported as `a column of an enclosing\nquery block is not supported`,\nbecause resolution skips the column and falls through to the outer\nscope. Still a clean exit 4, but\nthe message misattributes an unsupported type as a correlation, and it\nmakes\n`BindSubqueryConjunct`'s own unsupported-type branch unreachable (marked\ndefensive in a comment).\n- **What this leaves ADR 0023.** Six TPC-H queries, all correlated: Q2,\nQ4, Q17, Q20, Q21, Q22. The\nmachinery J5 leaves behind for them is `BindBlockFn` plus the one-row\njoin; U2 and U3 need the\n  domain join, which is new.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests) — see the\n      maintainer note; `ci`, `coverage` and per-file `clang-tidy` pass\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5)\nimplemented the id against the plan\napproved for J5 as a whole, and ran the verification and mutation checks\nabove. A 14-agent\nadversarial differential workflow found the constant-fold abort after\nimplementation; a\ncompleteness critic closed the sweeps' own coverage gaps and found two\npieces of dead code. One\nof its claims (unpinned join order) was wrong and was refuted against\nthe tree before being\n      acted on.\n- Accountable human (has read and understands the whole diff): @hor911\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-13T09:38:03+03:00",
+          "tree_id": "d6d712f453f7971e2a50455d24f401682b720c35",
+          "url": "https://github.com/ydb-campus/antb1/commit/6125bf96d769417431d7e2818a908aeb7f031262"
+        },
+        "date": 1791873618818,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 2716.758659985312,
+            "unit": "ns/iter",
+            "extra": "iterations: 256236\ncpu: 2716.5173707051317 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 62466.99463498631,
+            "unit": "ns/iter",
+            "extra": "iterations: 10438\ncpu: 62459.822571373836 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 69359.23642455788,
+            "unit": "ns/iter",
+            "extra": "iterations: 10147\ncpu: 69318.42554449593 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 250394.58012243858,
+            "unit": "ns/iter",
+            "extra": "iterations: 2777\ncpu: 250226.7558516385 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 249155.95297918655,
+            "unit": "ns/iter",
+            "extra": "iterations: 2786\ncpu: 249073.04020100486 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 1433278.4526749253,
+            "unit": "ns/iter",
+            "extra": "iterations: 486\ncpu: 1432848.5720164625 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 29.976392782608702,
+            "unit": "ms/iter",
+            "extra": "iterations: 23\ncpu: 29.96047095652173 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 28.483657600000356,
+            "unit": "ms/iter",
+            "extra": "iterations: 25\ncpu: 28.4730974 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 149.68624300000144,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 149.66894499999995 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 8.624486146341603,
+            "unit": "ms/iter",
+            "extra": "iterations: 82\ncpu: 8.623247170731712 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 12.423187648148089,
+            "unit": "ms/iter",
+            "extra": "iterations: 54\ncpu: 12.420997055555532 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 27.57299903846134,
+            "unit": "ms/iter",
+            "extra": "iterations: 26\ncpu: 27.568885192307697 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.0391387991573133,
+            "unit": "ms/iter",
+            "extra": "iterations: 712\ncpu: 1.0389135519662918 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 84.08702722222314,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 84.0804914444444 ms\nthreads: 1"
           }
         ]
       }
