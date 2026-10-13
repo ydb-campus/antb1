@@ -82,7 +82,7 @@ jobs:
           echo "run=true" >>"$GITHUB_OUTPUT"
       - id: codex
         if: steps.prompt.outputs.run == 'true'
-        uses: openai/codex-action@86365089eb2b84e0a8fb0717b304f8bdcb13b20e # v1.12
+        uses: openai/codex-action@bdf19a4a223ec2549a3e2274a0cf61556bc07675 # v1.13
         with:
           # A repository secret, not an environment secret: this job runs on PR branches, and an environment that
           # PR branches may use protects nothing. Forks never get it (the job skips them and GitHub withholds it).
