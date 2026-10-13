@@ -4339,14 +4339,18 @@ LogicalNodePtr SubqueryJoins(LogicalNodePtr node, std::vector<SubqueryJoin>& joi
                               .span = join.span});
     }
     // A one-row join is keyless: its build holds the single row of an ungrouped aggregate, which it
-    // appends to every row of its probe (ADR 0022's E2a note).
-    const bool keyed = join.kind != JoinKind::kOneRow;
+    // appends to every row of its probe (ADR 0022's E2a note). The keys are a named local rather
+    // than a temporary in the initializer, which GCC's -Wdangling-pointer reads as one that may
+    // outlive the statement.
+    std::vector<JoinKey> keys;
+    if (join.kind != JoinKind::kOneRow) {
+      keys.push_back(JoinKey{.left = join.left_key, .right = join.right_key});
+    }
     node = Make(JoinNode{
         .kind = join.kind,
         .left = std::move(node),
         .right = std::move(join.right),
-        .keys = keyed ? std::vector{JoinKey{.left = join.left_key, .right = join.right_key}}
-                      : std::vector<JoinKey>{},
+        .keys = std::move(keys),
         .residual = {},
         .build = BuildSide::kRight,  // the side whose rows the join does not keep, or the one row
         .span = join.span});
