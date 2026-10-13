@@ -4240,7 +4240,8 @@ arrow::Status Binder::BindSubqueryConjunct(const sql::Expr& conjunct, const Subq
   const BindingColumn& column = bound.columns.front();
   if (!column.type.has_value()) {
     // Defensive: a block that selects a column of an unsupported type fails while that block is
-    // bound, so this is a message no input reaches today rather than an invariant worth aborting on.
+    // bound, so this is a message no input reaches today rather than an invariant worth aborting
+    // on.
     return Reject(Rejection{.span = form.subquery->op_span,
                             .message = std::format("column '{}' of the subquery has the "
                                                    "unsupported type {}",
