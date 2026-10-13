@@ -331,6 +331,36 @@ TEST(ColumnIdsTest, OutputIdsOfEveryDependentJoinKind) {
             (std::vector<ColumnId>{kA, kB, kC, kD, kE, kF}));
 }
 
+// The first shape of the output-id contract (ADR 0023): a dependent join binds its left input's ids
+// inside its right input, so a node of the right input may read a column that no input of its own
+// outputs -- a free variable. It resolves to its position among the ids the dependent join bound,
+// and the same reference outside the right input is still "not in its input".
+TEST(ColumnIdsTest, ResolvePositionsBindsLeftIdsInsideTheRightInput) {
+  // The right input filters on #2, a column of the left input, which its own Scan does not output.
+  const auto right_reading = [](ColumnId outer, int index) {
+    return Node(FilterNode{.input = Scan({ColumnId{4}, ColumnId{5}, ColumnId{6}}),
+                           .predicates = {Predicate{.kind = Predicate::Kind::kIsNotNull,
+                                                    .column = Column(outer, index)}},
+                           .span = {}});
+  };
+  const LogicalPlan plan = Plan(Node(DependentJoinNode{
+      .kind = JoinKind::kSemi, .left = Scan(), .right = right_reading(kB, 7), .span = {}}));
+  EXPECT_EQ(PositionMismatch(plan), std::optional<std::string>("Filter: column #2 is at 1, not 7"));
+
+  const LogicalPlan resolved = ResolvePositions(plan);
+  EXPECT_EQ(PositionMismatch(resolved), std::nullopt) << "resolving twice changes nothing";
+  // #2 is the second of the left input's ids, so the free variable's index is 1.
+  const auto& join = std::get<DependentJoinNode>(*resolved.root);
+  EXPECT_EQ(std::get<FilterNode>(*join.right).predicates[0].column->index, 1);
+
+  // The binding ends with the right input: the same reference under the left input is unresolvable.
+  EXPECT_EQ(PositionMismatch(Plan(Node(DependentJoinNode{.kind = JoinKind::kSemi,
+                                                         .left = right_reading(ColumnId{9}, 0),
+                                                         .right = Scan({ColumnId{4}}),
+                                                         .span = {}}))),
+            std::optional<std::string>("Filter: column #9 is not in its input"));
+}
+
 // The second shape of the output-id contract (ADR 0023): a two-input node may also define a column
 // of its own, which goes last. No kind sets `mark` yet, so only a hand-built plan has one.
 TEST(ColumnIdsTest, OutputIdsOfADependentJoinEndWithItsOwnColumn) {

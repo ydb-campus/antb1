@@ -634,22 +634,36 @@ class Resolver {
     }
   }
 
-  // Sets `index` to the position of `id` among `ids`; true when it changed.
+  // Sets `index` to the position of `id` among the ids the reference reads; true when it changed.
   bool Resolve(std::string_view node, int& index, ColumnId id, const std::vector<ColumnId>& ids) {
     if (id == kNoColumnId) {
       Fail(std::format("{}: a reference without an id", node));
       return false;
     }
-    const auto first = std::ranges::find(ids, id);
+    // Its own input's ids, or, for a free variable anywhere inside a dependent join's right input,
+    // the left input's ids that the dependent join bound for that subtree (ADR 0023). Innermost
+    // binding first, as the binder resolves an outer reference innermost first.
+    const std::vector<ColumnId>* read = &ids;
+    auto first = std::ranges::find(ids, id);
     if (first == ids.end()) {
+      for (std::size_t depth = bound_.size(); depth > 0; --depth) {
+        const std::vector<ColumnId>& frame = bound_[depth - 1];
+        if (const auto outer = std::ranges::find(frame, id); outer != frame.end()) {
+          read = &frame;
+          first = outer;
+          break;
+        }
+      }
+    }
+    if (first == read->end()) {
       Fail(std::format("{}: column {} is not in its input", node, IdText(id)));
       return false;
     }
-    if (std::ranges::find(std::next(first), ids.end(), id) != ids.end()) {
+    if (std::ranges::find(std::next(first), read->end(), id) != read->end()) {
       Fail(std::format("{}: column {} is in its input twice", node, IdText(id)));
       return false;
     }
-    const auto position = Narrow<int>(first - ids.begin());
+    const auto position = Narrow<int>(first - read->begin());
     if (position == index) {
       return false;
     }
@@ -871,7 +885,11 @@ class Resolver {
         break;
     }
     Resolved left = Walk(join.left);
+    // The left input's columns are the right input's free variables, bound for that subtree only:
+    // every node of the right input may read them, and no node outside it may.
+    bound_.push_back(left.ids);
     Resolved right = Walk(join.right);
+    bound_.pop_back();
     if (join.mark != kNoColumnId) {
       Define("DependentJoin", join.mark);
     }
@@ -884,6 +902,10 @@ class Resolver {
   }
 
   std::set<ColumnId> defined_;
+  // One frame per dependent join on the path to the node being walked: the ids its left input
+  // outputs, which its right input may read as free variables. Empty outside a right input, so a
+  // plan without a dependent join resolves exactly as it did before (ADR 0023).
+  std::vector<std::vector<ColumnId>> bound_;
   std::optional<std::string> failure_;
   std::optional<std::string> difference_;
 };
