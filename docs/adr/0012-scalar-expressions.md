@@ -29,6 +29,11 @@ Accepted (with the maintainer-approved plan for scalar expressions)
   Update: function calls are a `FunctionExpr` node with a fixed list of functions (`strlen`, `regexp_replace`), each
   with its arity, argument types and result type in the binder; a `regexp_replace` pattern and replacement must be
   literals, so the evaluator compiles them once per batch with Arrow's RE2 kernel.
+  Update (2026-10-13, ADR 0023's S5): the list is `strlen`, `regexp_replace`, `toDateTime`, `date_trunc` and
+  `substring` (with its alias `substr`), and an arity may now be a range: `substring` takes two or three arguments.
+  `substring` is also the first function whose arguments after the value are **evaluated per row** rather than
+  constants, so `FunctionSpec` carries their kind and `FunctionExpr::args` holds bound expressions for them; the
+  evaluator walks UTF-8 codepoints itself, since Arrow's slice kernels take a constant window.
   Update: conditions are BOOLEAN expressions (`PredicateExpr` leaves bound and folded as `WHERE` comparisons,
   `BoolExpr` for `AND`/`OR`/`NOT`) and `CASE` a `CaseExpr`; BOOLEAN is an internal type, never a column of a table
   or a result. A `WHERE` or `HAVING` conjunct with `OR` or `NOT` is computed by a `Compute` and filtered with a new

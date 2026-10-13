@@ -369,6 +369,8 @@ std::string_view ToString(Function function) {
       return "extract";
     case Function::kDateTrunc:
       return "date_trunc";
+    case Function::kSubstring:
+      return "substring";
   }
   return "?";
 }

@@ -677,8 +677,84 @@ struct Evaluator {
         ARROW_ASSIGN_OR_RAISE(const std::string unit, ConstantArg(function, 1));
         return DateTrunc(*text, unit, pool);
       }
+      case plan::Function::kSubstring:
+        return Substring(function, text);
     }
     return arrow::Status::Invalid("unknown function");
+  }
+
+  // substring(value, start[, length]), by DuckDB's rule, which one window covers: a negative start
+  // counts from the end, a negative length extends the window backwards, and the window is clipped
+  // to the value. NULL in any argument gives NULL, and a start or a length above 4294967295 is the
+  // execution error DuckDB raises for it (a negative one of any magnitude only clips).
+  //
+  // Counted in codepoints, as DuckDB counts them -- where antb1's strlen counts bytes (divergence
+  // D15) -- so a byte that is no UTF-8 continuation byte starts one and an invalid byte counts as
+  // one of its own.
+  arrow::Result<ArrayPtr> Substring(const plan::FunctionExpr& function,
+                                    const ArrayPtr& text) const {
+    if (function.args.size() < 2 || function.args.size() > 3) {
+      return arrow::Status::Invalid("substring takes two or three arguments");
+    }
+    ARROW_ASSIGN_OR_RAISE(const ArrayPtr start_arg, (*this)(*function.args[1]));
+    ARROW_ASSIGN_OR_RAISE(const ArrayPtr starts, CastTo(start_arg, arrow::int64(), ctx));
+    ArrayPtr lengths;
+    if (function.args.size() == 3) {
+      ARROW_ASSIGN_OR_RAISE(const ArrayPtr length_arg, (*this)(*function.args[2]));
+      ARROW_ASSIGN_OR_RAISE(lengths, CastTo(length_arg, arrow::int64(), ctx));
+    }
+    const auto& values = static_cast<const arrow::BinaryArray&>(*text);
+    const auto& from = static_cast<const arrow::Int64Array&>(*starts);
+    const auto* count =
+        lengths == nullptr ? nullptr : &static_cast<const arrow::Int64Array&>(*lengths);
+    constexpr int64_t kLimit = 4294967295;  // DuckDB's own bound on a positive offset or length
+    arrow::BinaryBuilder out(pool);
+    ARROW_RETURN_NOT_OK(out.Reserve(values.length()));
+    ARROW_RETURN_NOT_OK(out.ReserveData(values.total_values_length()));
+    std::vector<std::size_t> starts_of;  // the byte offset of each codepoint, then of the end
+    for (int64_t row = 0; row < values.length(); ++row) {
+      if (values.IsNull(row) || from.IsNull(row) || (count != nullptr && count->IsNull(row))) {
+        ARROW_RETURN_NOT_OK(out.AppendNull());
+        continue;
+      }
+      const int64_t start = from.Value(row);
+      if (start > kLimit) {
+        return arrow::Status::Invalid("Substring offset outside of supported range (> 4294967295)");
+      }
+      if (count != nullptr && count->Value(row) > kLimit) {
+        return arrow::Status::Invalid("Substring length outside of supported range (> 4294967295)");
+      }
+      const std::string_view value = values.GetView(row);
+      starts_of.clear();
+      for (std::size_t byte = 0; byte < value.size(); ++byte) {
+        if ((static_cast<unsigned char>(value[byte]) & 0xC0U) != 0x80U) {
+          starts_of.push_back(byte);
+        }
+      }
+      starts_of.push_back(value.size());
+      const int64_t n = static_cast<int64_t>(starts_of.size()) - 1;
+      // A start or a length below -(kLimit + 1) reaches no further than that one does, so clamping
+      // them keeps the arithmetic inside int64 without changing a result.
+      const int64_t clamped_start = std::max(start, -kLimit - 1);
+      const int64_t s = clamped_start < 0 ? n + 1 + clamped_start : clamped_start;
+      int64_t lo = s;
+      int64_t hi = n + 1;
+      if (count != nullptr) {
+        const int64_t length = std::max(count->Value(row), -kLimit - 1);
+        lo = length < 0 ? s + length : s;
+        hi = length < 0 ? s : s + length;
+      }
+      lo = std::max<int64_t>(lo, 1);
+      hi = std::min<int64_t>(hi, n + 1);
+      if (hi <= lo) {
+        ARROW_RETURN_NOT_OK(out.Append("", 0));
+        continue;
+      }
+      const std::size_t begin = starts_of[static_cast<std::size_t>(lo) - 1];
+      const std::size_t end = starts_of[static_cast<std::size_t>(hi) - 1];
+      ARROW_RETURN_NOT_OK(out.Append(value.data() + begin, static_cast<int32_t>(end - begin)));
+    }
+    return out.Finish();
   }
 
   // The string constant argument `i` of a function (a field, a unit).

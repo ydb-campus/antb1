@@ -40,6 +40,7 @@ enum class Feature : std::uint8_t {
   kConstant,            // a literal select item (an integer, a string or a DATE)
   kArithmetic,          // + - * / // % and unary - of a column and a constant
   kStringFunctions,     // strlen(varchar) and regexp_replace(varchar, 'pattern', 'replacement')
+  kSubstring,           // substring(varchar, start[, length]), in the comma and standard spellings
   kCase,                // CASE WHEN <condition> THEN .. [ELSE ..] END
   kBooleanExpressions,  // OR, NOT and parenthesized AND in conditions (WHERE, an inner ON, HAVING,
                         // CASE WHEN)
@@ -135,6 +136,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "constant";
     case Feature::kArithmetic:
       return "arithmetic";
+    case Feature::kSubstring:
+      return "substring";
     case Feature::kStringFunctions:
       return "string_functions";
     case Feature::kCase:
@@ -299,9 +302,9 @@ inline constexpr FeatureSet kNeverGenerated = {Feature::kWindowFunctions};
 // and then removes from this set. Valid in `-- features:` tags, and never in kSupportedFeatures
 // while pending (checked below), so that no feature is declared supported before it is generated.
 // ADR 0022's T2 took derived tables and WITH lists out of it, T2c LEFT JOIN and T2b the two
-// uncorrelated subquery forms, so nothing waits here today. A Feature added for grammar the
-// generator cannot write yet goes in, and the PR that teaches it takes it out again.
-inline constexpr FeatureSet kGeneratorPending = {};
+// uncorrelated subquery forms. ADR 0023's S5 put kSubstring in: the engine answers it, and the
+// commit that teaches the generator to write it takes it out again and declares it supported.
+inline constexpr FeatureSet kGeneratorPending = {Feature::kSubstring};
 
 // What antb1 answers today: the whole slice grammar of docs/sql-subset.md (global and grouped
 // aggregates, projections, WHERE conjunctions of column <op> literal, ORDER BY, LIMIT and OFFSET)

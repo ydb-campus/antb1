@@ -174,9 +174,13 @@ enum class Function : std::uint8_t {
   kEpochMs,    // epoch_ms(integer milliseconds): TIMESTAMP (toDateTime(x) is epoch_ms(x * 1000))
   kExtract,    // extract(field FROM timestamp or date): BIGINT; args: the value, the field
   kDateTrunc,  // date_trunc('unit', timestamp or date): TIMESTAMP; args: the value, the unit
+  // substring(varchar, start[, length]): VARCHAR, counted in codepoints as DuckDB counts them
+  // (where its strlen, and antb1's, count bytes: divergence D15). args: the value, the start, the
+  // length, each evaluated -- the only function whose arguments after the first are no constants.
+  kSubstring,
 };
 
-// "strlen", "regexp_replace", "epoch_ms", "extract", "date_trunc".
+// "strlen", "regexp_replace", "epoch_ms", "extract", "date_trunc", "substring".
 std::string_view ToString(Function function);
 
 // A scalar function of the arguments (constants where the function needs them: the pattern and
