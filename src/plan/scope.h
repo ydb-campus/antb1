@@ -209,6 +209,7 @@ class Scope {
     kCorrelated,  // the shape itself has no plan yet
     kClause,      // not in a WHERE conjunct of this block (an inner join's ON counts as WHERE)
     kDistance,    // a block further out than the one that directly encloses the subquery
+    kLateral,     // a derived table's or a CTE's reference out, which ADR 0022 refuses
   };
   static arrow::Status CorrelationError(const sql::ColumnRef& ref,
                                         Refusal why = Refusal::kCorrelated);

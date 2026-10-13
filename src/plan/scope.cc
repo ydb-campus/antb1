@@ -336,6 +336,9 @@ arrow::Status Scope::CorrelationError(const sql::ColumnRef& ref, Refusal why) {
           std::format("a {} of a query block further out than the enclosing one is not supported",
                       what),
           ref.span);
+    case Refusal::kLateral:
+      return UnsupportedError(
+          std::format("a lateral {} of an enclosing query block is not supported", what), ref.span);
   }
   return UnsupportedError(std::format("a {} of an enclosing query block is not supported", what),
                           ref.span);

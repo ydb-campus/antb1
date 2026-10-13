@@ -909,12 +909,14 @@ INSTANTIATE_TEST_SUITE_P(
         // One column, as in DuckDB, which reports a bind error for two.
         ErrorCase{"SELECT i16 FROM t WHERE i32 IN (SELECT i16, i32 FROM u)", kBind, "IN",
                   "a subquery of IN must have one column, not 2"},
-        // A correlation exits 4 (rule 9) until ADR 0023's PRs answer it, and never reports a
-        // missing column: the sub-block binds against the scope of the block that holds it.
+        // A correlated IN is refused by its shape, at the IN, not at the reference: its NULL
+        // semantics need the set's NULL and empty flags for each binding (ADR 0023).
         ErrorCase{"SELECT i16 FROM t WHERE i32 IN (SELECT i16 FROM u WHERE i64 = t.i64)",
-                  kUnsupported, "t.i64", "a qualified column of an enclosing query block is not"},
+                  kUnsupported, "IN", "a correlated subquery of IN is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 NOT IN (SELECT i16 FROM u WHERE i64 = t.i64)",
+                  kUnsupported, "NOT IN", "a correlated subquery of NOT IN is not supported"},
         ErrorCase{"SELECT i16 FROM t WHERE i32 IN (SELECT i16 FROM ok WHERE i16 = i64)",
-                  kUnsupported, "i64", "a column of an enclosing query block is not supported"},
+                  kUnsupported, "IN", "a correlated subquery of IN is not supported"},
         // ADR 0023 answers an outer reference only in a WHERE conjunct of its own block, an inner
         // join's ON included, and only one block out. Every other placement exits 4 at the
         // reference, with the rule it broke, and never reports a missing column.
@@ -934,10 +936,11 @@ INSTANTIATE_TEST_SUITE_P(
                   "u.i16 = ok.i16 AND ok.i16 = t.i64)",
                   kUnsupported, "t.i64",
                   "a qualified column of an enclosing query block is supported only in WHERE"},
-        // An inner join's ON is a WHERE conjunct (rule 10), so it is the allowed placement.
+        // An inner join's ON is a WHERE conjunct (rule 10), so the reference is answered and the
+        // refusal is the correlated IN's, at the IN.
         ErrorCase{"SELECT i16 FROM t WHERE i32 IN (SELECT u.i16 FROM u JOIN ok ON "
                   "u.i16 = ok.i16 AND ok.i16 = t.i64)",
-                  kUnsupported, "t.i64", "a qualified column of an enclosing query block is not"},
+                  kUnsupported, "IN", "a correlated subquery of IN is not supported"},
         // Two blocks out: the subquery may name only the block that directly encloses it.
         ErrorCase{"SELECT i16 FROM t WHERE i32 IN (SELECT i16 FROM u WHERE i32 IN "
                   "(SELECT i16 FROM ok WHERE i16 = t.i64))",
@@ -3396,6 +3399,73 @@ TEST(BinderTest, ColumnIdsAreUniqueAndResolve) {
   ASSERT_EQ(group.key_ids.size(), 1U);
   EXPECT_NE(group.key_ids[0], group.keys.at(0).id);
   EXPECT_EQ(std::get<ProjectNode>(*grouped->root).columns.at(0).id, group.key_ids[0]);
+}
+
+// A correlated scalar subquery binds to a DependentJoin (ADR 0023's U1), which the unnesting pass
+// then rejects: the query exits 4 either way, but through the pass, which is what U2 and U3 replace
+// with a rewrite. This is the one SQL shape that reaches a dependent join in U1: EXISTS waits for
+// U2 and a correlated IN is refused by its shape.
+TEST(BinderTest, ACorrelatedScalarSubqueryBindsToADependentJoin) {
+  const auto catalog = testing::MakeCatalog();
+  auto plan = BindSql(
+      "SELECT i16 FROM t WHERE i32 = (SELECT MIN(u.i32) FROM u WHERE u.i64 = t.i64)", catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+
+  // The whole plan resolves: the sub-plan reads t.i64, which only the dependent join's left input
+  // defines, and the Resolver's binding frame is what makes that legal (no abort, no mismatch).
+  EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << Explain(*plan);
+
+  const DependentJoinNode* dependent = nullptr;
+  const auto find = [&](auto&& self, const LogicalNodePtr& node) -> void {
+    if (node == nullptr || dependent != nullptr) {
+      return;
+    }
+    if (const auto* d = std::get_if<DependentJoinNode>(node.get())) {
+      dependent = d;
+      return;
+    }
+    for (const LogicalNodePtr& input : InputsOf(*node)) {
+      self(self, input);
+    }
+  };
+  find(find, plan->root);
+  ASSERT_NE(dependent, nullptr) << Explain(*plan);
+  // The whole shape ADR 0023's Binding (U1) asks for: the comparison above the dependent join, the
+  // correlated conjunct in ONE filter at the top of the subquery's block -- above its joins and
+  // below its aggregation -- where the unnesting pass finds it, and no part of it pushed into the
+  // scan, which would read a column the scan does not have.
+  EXPECT_EQ(Explain(*plan),
+            "Output: i16:SMALLINT\n"
+            "Project i16\n"
+            "  Filter i32 = \"min(u.i32)\"\n"
+            "    DependentJoin ONE-ROW\n"
+            "      Scan table=t source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed "
+            "Case\", from]\n"
+            "      Aggregate MIN(i32)\n"
+            "        Filter \"(u.i64 = t.i64)\"\n"
+            "          Compute (u.i64 = t.i64)\n"
+            "            Scan table=u source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, "
+            "\"Mixed Case\", from]\n");
+  EXPECT_EQ(dependent->kind, JoinKind::kOneRow) << "a scalar subquery appends its single value";
+  EXPECT_EQ(dependent->mark, kNoColumnId) << "no kind defines a marker yet";
+  // Its right input is the correlated one, and its left input defines what that reads.
+  EXPECT_FALSE(FreeVariables(*dependent->right).empty());
+  EXPECT_TRUE(FreeVariables(*plan->root).empty()) << "the left input binds every free variable";
+
+  // The pass rejects it: exit code 4 at the subquery, not a bind error and not an abort.
+  const auto status = Optimize(*plan).status();
+  const auto detail = GetSqlError(status);
+  ASSERT_NE(detail, nullptr) << status.ToString();
+  EXPECT_EQ(detail->kind(), SqlErrorDetail::Kind::kUnsupported);
+
+  // An uncorrelated scalar subquery keeps ADR 0022's direct one-row join.
+  auto plain = BindSql("SELECT i16 FROM t WHERE i32 = (SELECT MIN(u.i32) FROM u)", catalog);
+  ASSERT_TRUE(plain.ok()) << plain.status().ToString();
+  const DependentJoinNode* none = nullptr;
+  std::swap(dependent, none);
+  find(find, plain->root);
+  EXPECT_EQ(dependent, nullptr) << Explain(*plain);
+  EXPECT_TRUE(Optimize(*plain).ok());
 }
 
 }  // namespace

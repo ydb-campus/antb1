@@ -2295,6 +2295,12 @@ using BindBlockFn =
 // subquery is keyless and appends its row's column, which `filter` then compares.
 struct SubqueryJoin {
   JoinKind kind = JoinKind::kSemi;
+  // The sub-plan is correlated: it reads columns of the tree below as free variables, so the join
+  // is a DependentJoin, which the unnesting pass of plan::Optimize replaces or rejects (ADR 0023).
+  // A dependent join has no keys: a correlation is a predicate of the sub-plan, not a pair of
+  // columns, so `left_key` and `right_key` stay empty and `exprs` holds only what the comparison
+  // computes on the outer side.
+  bool dependent = false;
   LogicalNodePtr right;   // the sub-plan, its column cast to the key type
   BoundColumn left_key;   // of the tree below (the IN forms)
   BoundColumn right_key;  // of the sub-plan (the IN forms)
@@ -2316,11 +2322,13 @@ class Binder {
   // for rule 9 -- a name only an enclosing block has is a correlation and exits 4. `bind_block`
   // binds a subquery's query, and must outlive the binder.
   Binder(const sql::SelectStatement& stmt, std::vector<Binding> bindings, ColumnIdSource& ids,
-         const Scope* outer = nullptr, const BindBlockFn* bind_block = nullptr)
+         const Scope* outer = nullptr, const BindBlockFn* bind_block = nullptr,
+         bool outer_encloses = false)
       : stmt_(stmt),
         scope_(std::move(bindings), outer),
         ids_(ids),
         bind_block_(bind_block),
+        outer_encloses_(outer_encloses),
         relations_(scope_.bindings().size()) {
     // Relations 0 to bindings - 1 are the bindings, in FROM order, which is the invariant
     // OnVisibility and Scope::Find share; BuildBlocks adds one relation per LEFT JOIN unit after
@@ -2543,8 +2551,14 @@ class Binder {
           .qualifier = location.has_value() ? scope_.Qualifier(location->binding) : std::string()};
     }
     Relation& relation = relations_[conjunct_relation_];
-    std::vector<ExprPtr>& exprs = where ? relation.where_exprs : input_exprs_;
-    std::vector<ColumnId>& ids = where ? relation.where_ids : input_ids_;
+    // A correlated conjunct sits above this block's joins (ADR 0023), so what it computes cannot
+    // go into a relation's layer, which sits below them.
+    std::vector<ExprPtr>& exprs = in_correlated_ ? correlated_exprs_
+                                  : where        ? relation.where_exprs
+                                                 : input_exprs_;
+    std::vector<ColumnId>& ids = in_correlated_ ? correlated_ids_
+                                 : where        ? relation.where_ids
+                                                : input_ids_;
     const auto same =
         std::ranges::find_if(exprs, [&](const ExprPtr& e) { return SameExpr(*e, *t.expr); });
     const auto k = Narrow<std::size_t>(same - exprs.begin());
@@ -2972,14 +2986,42 @@ class Binder {
     // join's ON counts as WHERE, rule 10) and only one block out; every other one exits 4 here, at
     // the reference's span, with the rule it broke. Until the binder plans a dependent join, the
     // allowed one exits 4 too, as kCorrelated.
+    if (!outer_encloses_) {
+      // A derived table or a CTE: the name is in a sibling or declaring scope, so this is a
+      // lateral reference, which ADR 0022 refuses and no PR of ADR 0023 answers.
+      return Scope::CorrelationError(ref, Scope::Refusal::kLateral);
+    }
     if (!WhereClause(clause_)) {
       return Scope::CorrelationError(ref, Scope::Refusal::kClause);
     }
     if (outer->distance > 1) {
       return Scope::CorrelationError(ref, Scope::Refusal::kDistance);
     }
-    return Scope::CorrelationError(ref, Scope::Refusal::kCorrelated);
+    // The outer reference ADR 0023 answers: resolved in the enclosing block's scope, by its id, so
+    // the sub-plan has it as a free variable and becomes a dependent join. An outer name that is
+    // ambiguous there keeps that scope's own bind error, as it does in DuckDB.
+    return outer->scope->Resolve(ref);
   }
+
+  // Whether `expr` reads a column that only an enclosing query block has, which makes its conjunct
+  // one for the block-top filter rather than one to classify by the relations it reads (ADR 0023).
+  // A name a select alias of this block also has is that alias, as in Resolve.
+  [[nodiscard]] bool ReadsOuterColumn(const sql::Expr& expr) const {
+    if (!outer_encloses_) {
+      return false;  // a lateral reference is refused where it resolves, never routed
+    }
+    std::vector<const sql::ColumnRef*> refs;
+    CollectRefs(expr, refs);
+    return std::ranges::any_of(refs, [this](const sql::ColumnRef* ref) {
+      return scope_.LookUp(*ref, visible_).outcome == Lookup::Outcome::kMissing &&
+             !(ref->qualifier.empty() && FindAlias(select_, ref->name).has_value()) &&
+             scope_.LookUpOuter(*ref).has_value();
+    });
+  }
+
+  // One WHERE conjunct of this block that reads an outer column: bound as a condition over the
+  // whole block, whose column the block-top filter then tests (ADR 0023).
+  arrow::Status BindCorrelatedConjunct(const sql::Expr& conjunct);
 
   LogicalPlan Assemble();
 
@@ -2994,6 +3036,20 @@ class Binder {
   Clause clause_ = Clause::kSelect;
   ColumnIdSource& ids_;
   const BindBlockFn* bind_block_ = nullptr;
+  // Whether `outer` is the scope of the query block that directly encloses this one, which only a
+  // subquery expression's block has. A derived table's and a CTE's enclosing scope is a sibling or
+  // declaring one, so a name found there is a lateral reference and exits 4 (ADR 0022).
+  bool outer_encloses_ = false;
+  // ADR 0023: this block's WHERE conjuncts that read a column of the enclosing block. They are
+  // neither keys nor edges of this block's join graph, so they are kept in one filter above all of
+  // this block's joins, its subquery joins included, where the unnesting pass finds them. Conjuncts
+  // on this block's own columns are classified as usual, so pushdown and part pruning still apply
+  // to its scans.
+  std::vector<ExprPtr> correlated_exprs_;
+  std::vector<ColumnId> correlated_ids_;  // per expression: its column
+  std::vector<Predicate> correlated_filter_;
+  SourceSpan correlated_span_;
+  bool in_correlated_ = false;  // a correlated conjunct is binding: see InputColumn
   SelectList select_;
   Shape shape_ = Shape::kProjection;
   // One FROM item's own layers, below the joins: the conjuncts routed to it (ADR 0022's WHERE
@@ -4217,6 +4273,18 @@ arrow::Status Binder::BindUnitConjunct(std::size_t u, const sql::Expr& conjunct,
   return arrow::Status::OK();
 }
 
+arrow::Status Binder::BindCorrelatedConjunct(const sql::Expr& conjunct) {
+  in_correlated_ = true;
+  Widen(correlated_span_, conjunct.span());
+  arrow::Result<Typed> condition =
+      BindBool(conjunct, [this](const sql::Expr& e) { return BindInput(e); }, /*input=*/true);
+  if (condition.ok()) {
+    correlated_filter_.push_back(IsTrue(InputColumn(*condition, /*where=*/true), conjunct.span()));
+  }
+  in_correlated_ = false;  // restored on the error path too, before the status propagates
+  return condition.status();
+}
+
 arrow::Status Binder::BindOnOneRelation(const sql::Expr& conjunct, SourceSpan element,
                                         std::size_t relation) {
   conjunct_relation_ = relation;
@@ -4361,7 +4429,21 @@ arrow::Status Binder::BindSubqueryConjunct(const sql::Expr& conjunct, const Subq
                                                    "unsupported type {}",
                                                    column.name, column.unsupported_type)});
   }
+  // A subquery whose plan reads ids its own nodes do not define is correlated, and becomes a
+  // dependent join over the block's plan at this point, which defines them (ADR 0023). An
+  // uncorrelated one keeps ADR 0022's direct join, so an IN subquery with GROUP BY or HAVING stays
+  // allowed. The binder answers only the shape that is a top-level WHERE conjunct; the unnesting
+  // pass then rewrites it or rejects the query.
+  const bool correlated = !FreeVariables(*bound.plan.root).empty();
+  if (correlated && !form.scalar()) {
+    // Correlated IN and NOT IN need the set's NULL and empty flags for each binding, which a semi
+    // or null-aware anti join cannot carry (ADR 0023's exit-4 list).
+    return Reject(Rejection{.span = form.subquery->op_span,
+                            .message = std::format("a correlated subquery of {} is not supported",
+                                                   form.negated ? "NOT IN" : "IN")});
+  }
   SubqueryJoin join{.kind = JoinKind::kOneRow,
+                    .dependent = correlated,
                     .right = bound.plan.root,
                     .left_key = {},
                     .right_key = {},
@@ -4457,17 +4539,25 @@ LogicalNodePtr SubqueryJoins(LogicalNodePtr node, std::vector<SubqueryJoin>& joi
     // than a temporary in the initializer, which GCC's -Wdangling-pointer reads as one that may
     // outlive the statement.
     std::vector<JoinKey> keys;
-    if (join.kind != JoinKind::kOneRow) {
+    if (!join.dependent && join.kind != JoinKind::kOneRow) {
       keys.push_back(JoinKey{.left = join.left_key, .right = join.right_key});
     }
-    node = Make(JoinNode{
-        .kind = join.kind,
-        .left = std::move(node),
-        .right = std::move(join.right),
-        .keys = std::move(keys),
-        .residual = {},
-        .build = BuildSide::kRight,  // the side whose rows the join does not keep, or the one row
-        .span = join.span});
+    if (join.dependent) {
+      node = Make(DependentJoinNode{.kind = join.kind,
+                                    .left = std::move(node),
+                                    .right = std::move(join.right),
+                                    .mark = kNoColumnId,
+                                    .span = join.span});
+    } else {
+      node = Make(JoinNode{
+          .kind = join.kind,
+          .left = std::move(node),
+          .right = std::move(join.right),
+          .keys = std::move(keys),
+          .residual = {},
+          .build = BuildSide::kRight,  // the side whose rows the join does not keep, or the one row
+          .span = join.span});
+    }
     if (!join.filter.empty()) {
       node = Make(FilterNode{
           .input = std::move(node), .predicates = std::move(join.filter), .span = join.span});
@@ -4570,6 +4660,14 @@ arrow::Status Binder::BindElement(const sql::Expr& element) {
       // and types every operand and mints no column id, so the result goes without a trace.
       ARROW_RETURN_NOT_OK(BindBool(
           *conjunct.expr, [this](const sql::Expr& e) { return BindInput(e); }, /*input=*/true));
+      continue;
+    }
+    // A conjunct that reads a column of the enclosing block goes into the block-top filter: it is
+    // neither a key nor an edge of this block's join graph, and the unnesting pass needs it above
+    // the joins (ADR 0023). A block whose relations connect only through such a conjunct is
+    // therefore disconnected, and exits 4 as ADR 0022 says.
+    if (ReadsOuterColumn(*conjunct.expr)) {
+      ARROW_RETURN_NOT_OK(BindCorrelatedConjunct(*conjunct.expr));
       continue;
     }
     // A subquery conjunct becomes a join above this block's inner joins, so it is neither
@@ -5043,6 +5141,19 @@ std::string Binder::QualifierOf(ColumnId id) const {
 LogicalPlan Binder::Assemble() {
   LogicalNodePtr node = JoinTree(0);
   node = SubqueryJoins(std::move(node), where_subqueries_);
+  // The correlated conjuncts of this block, above all of its joins and below its aggregation, in
+  // one filter (ADR 0023): where the unnesting pass finds them, and where the free variables they
+  // read are bound by the dependent join this block's plan becomes the right input of.
+  if (!correlated_filter_.empty()) {
+    if (!correlated_exprs_.empty()) {
+      node = Make(ComputeNode{.input = std::move(node),
+                              .exprs = correlated_exprs_,
+                              .ids = correlated_ids_,
+                              .span = correlated_span_});
+    }
+    node = Make(FilterNode{
+        .input = std::move(node), .predicates = correlated_filter_, .span = correlated_span_});
+  }
   if (!input_exprs_.empty()) {
     node = Make(ComputeNode{
         .input = std::move(node), .exprs = input_exprs_, .ids = input_ids_, .span = select_.span});
@@ -5456,7 +5567,8 @@ struct CteFrame {
 };
 
 arrow::Result<BoundBlock> BindBlock(const sql::SelectStatement& stmt, const Catalog& catalog,
-                                    ColumnIdSource& ids, const CteFrame* ctes, const Scope* outer);
+                                    ColumnIdSource& ids, const CteFrame* ctes, const Scope* outer,
+                                    bool outer_encloses = false);
 
 // Rule 7: the binding's column names. The alias list renames the leading columns, each losing its
 // own name, and the de-duplication then runs over the result -- so `(SELECT 1 AS x, 2 AS x) s`
@@ -5535,7 +5647,8 @@ arrow::Result<Binding> BindFromItem(const sql::FromItem& item, const Catalog& ca
 }
 
 arrow::Result<BoundBlock> BindBlock(const sql::SelectStatement& stmt, const Catalog& catalog,
-                                    ColumnIdSource& ids, const CteFrame* ctes, const Scope* outer) {
+                                    ColumnIdSource& ids, const CteFrame* ctes, const Scope* outer,
+                                    bool outer_encloses) {
   // The frames of this block: one per CTE holding the CTEs before it, then the block's own.
   std::deque<CteFrame> frames;
   std::vector<const sql::CommonTableExpr*> visible;
@@ -5576,9 +5689,13 @@ arrow::Result<BoundBlock> BindBlock(const sql::SelectStatement& stmt, const Cata
   // count is taken there, and against this block's scope, which the binder passes.
   const BindBlockFn bind_sub = [&](const sql::SelectStatement& block,
                                    const Scope* scope) -> arrow::Result<BoundBlock> {
-    return BindBlock(block, catalog, ids, &own, scope);
+    // A subquery expression's block is the one case whose enclosing scope is a query block's, so
+    // an outer reference in it may be answered (ADR 0023). A derived table and a CTE get the scope
+    // of the preceding FROM items or of the declaring block instead, where a reference out is a
+    // lateral one, which ADR 0022 refuses.
+    return BindBlock(block, catalog, ids, &own, scope, /*outer_encloses=*/true);
   };
-  Binder binder(stmt, std::move(bindings), ids, outer, &bind_sub);
+  Binder binder(stmt, std::move(bindings), ids, outer, &bind_sub, outer_encloses);
   ARROW_ASSIGN_OR_RAISE(LogicalPlan plan, binder.Bind());
   std::vector<BindingColumn> columns;
   columns.reserve(plan.output.size());
