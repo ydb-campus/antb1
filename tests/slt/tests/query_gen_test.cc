@@ -1585,6 +1585,63 @@ TEST(QueryGenerator, SubqueryQueriesStayUncorrelated) {
 // Every draw a subquery needs comes from the fifth stream (sub_rng_), so allowing the two forms
 // changes the queries that take one and no others. Pins the stream, as the three tests above pin
 // the second, third and fourth.
+// substring's draws come from a stream of their own, so declaring it changes only the queries that
+// write it: every other query is the one this seed generated before substring existed.
+TEST(QueryGenerator, SubstringChangesOnlySubstringQueries) {
+  const FeatureSet with_sub = Union(kSupportedFeatures, {Feature::kSubstring});
+  const auto with = MakeOver(Tables(), 71, {.supported = with_sub, .target_percent = 0});
+  const auto without = MakeOver(
+      Tables(), 71, {.supported = with_sub.Minus({Feature::kSubstring}), .target_percent = 0});
+  int took = 0;
+  int same = 0;
+  for (uint64_t i = 0; i < 8000; ++i) {
+    const auto q = with.Generate(i);
+    const auto plain = without.Generate(i);
+    EXPECT_FALSE(plain.features.Has(Feature::kSubstring)) << plain.sql;
+    if (!q.features.Has(Feature::kSubstring)) {
+      ++same;
+      EXPECT_EQ(q.sql, plain.sql) << i;
+      EXPECT_EQ(q.features, plain.features) << i;
+      continue;
+    }
+    ++took;
+    EXPECT_EQ(q.row_bound, plain.row_bound) << q.sql;  // a select item removes no row
+  }
+  EXPECT_GT(took, 40) << "took: " << took;
+  EXPECT_GT(same, 7000);
+}
+
+// What it writes, with the layout and keyword-case features off so the call is one span of text:
+// both spellings, the two- and three-argument forms, and a negative start or length.
+TEST(QueryGenerator, SubstringWritesBothSpellingsAndNegativePositions) {
+  const FeatureSet plain = Union(kSupportedFeatures, {Feature::kSubstring})
+                               .Minus({Feature::kLayout, Feature::kKeywordCase});
+  const auto gen = MakeOver(Tables(), 71, {.supported = plain, .target_percent = 0});
+  int calls = 0;
+  int standard = 0;
+  int three = 0;
+  int negative = 0;
+  for (uint64_t i = 0; i < 8000; ++i) {
+    const auto q = gen.Generate(i);
+    if (!q.features.Has(Feature::kSubstring)) {
+      continue;
+    }
+    const std::size_t call = q.sql.find("SUBSTRING(");
+    ASSERT_NE(call, std::string::npos) << q.sql;
+    const std::string args = q.sql.substr(call, q.sql.find(')', call) - call);
+    ++calls;
+    standard += args.contains(" FROM ") ? 1 : 0;
+    three += args.contains(" FOR ") || std::ranges::count(args, ',') == 2 ? 1 : 0;
+    negative += args.contains('-') ? 1 : 0;
+  }
+  EXPECT_GT(calls, 40) << "calls: " << calls;
+  EXPECT_GT(standard, 8) << "the SQL-standard spelling: " << standard;
+  EXPECT_GT(calls - standard, 15) << "the comma form: " << calls - standard;
+  EXPECT_GT(three, 25) << "the three-argument form: " << three;
+  EXPECT_GT(calls - three, 4) << "the two-argument form: " << calls - three;
+  EXPECT_GT(negative, 4) << "a negative start or length: " << negative;
+}
+
 TEST(QueryGenerator, SubqueriesChangeOnlySubqueryQueries) {
   const FeatureSet with_sub =
       Union(kSupportedFeatures, {Feature::kInSubquery, Feature::kScalarSubquery});
