@@ -178,9 +178,10 @@ feature adds it to `kSupportedFeatures` (and new grammar to `runner/query_gen.cc
 `harness.QueryGenerator.TargetSamplesCoverTheWholeGrammar` fails until every feature is generated). Grammar the
 generator cannot write yet waits in `kGeneratorPending`, whether because the parser rejects it or because the
 generator needs more than the parser; such a feature cannot be declared
-supported until it leaves that set. ADR 0022's T2 took derived tables and `WITH` lists out of it, T2c `LEFT JOIN`
-and T2b the two uncorrelated subquery forms, so the set is empty today: a `Feature` added for grammar the
-generator cannot write goes in, and the PR that teaches it takes it out again.
+supported until it leaves that set. ADR 0022's T2 took derived tables and `WITH` lists out of it, T2c `LEFT JOIN`,
+T2b the two uncorrelated subquery forms and ADR 0023's T3 the two correlated ones, so the set is empty
+today: a `Feature` added for grammar the generator cannot write goes in, and the PR that teaches it takes
+it out again -- in the same commit, since the grammar-coverage test asserts the generated set exactly.
 
 Over tables with refs, a query that may use a join feature joins 2 or 3 tables along the refs 60% of the time when a
 ref from or to the table it starts from can be followed (`runner/query_gen.h`): inner joins written with commas,
@@ -221,6 +222,25 @@ the query's row shape, since an aggregate inside a block records its feature on 
 from a fifth random stream, so a query without a subquery is the query the seed gave before. A generated
 `LEFT JOIN` or subquery is answered `Unsupported` and counted as such until roadmap PR J6 or J5 declares the
 feature.
+
+The refs carry the **correlated** subqueries too (ADR 0023's T3, feature `correlated_exists` or
+`correlated_aggregate`), from a seventh random stream and only where the uncorrelated conjunct did not fire,
+so a query holds at most one subquery and a seed that took an uncorrelated one is untouched. Both forms
+correlate through one equality between a column of a FROM binding and a column of the block's table:
+
+```sql
+[NOT] EXISTS (SELECT * FROM inner WHERE inner.k = outer.k [AND inner.k < outer.k])
+<literal> <op> (SELECT MIN(inner.c) FROM inner WHERE inner.k = outer.k)   -- or the mirror
+```
+
+The candidate rules are stricter than the uncorrelated form's, each because a shape one condition outside
+what ADR 0023's U2 and U3 answer would exit 4 for good and so never be compared: both ends of the key have
+the same type and not merely the same `ValueKind` (a widening pair feeds no equivalence class), the inner
+table is never named like the outer binding (the fixtures' self-reference edges would shadow it and make the
+subquery silently uncorrelated), and the outer binding is never read by a path (its name in SQL is the path's).
+`AVG` is written only over a `DECIMAL` argument, where ADR 0021 rule 13 makes the engines agree bit for bit.
+Both forms are answered `Unsupported` and counted as such until U2 and U3 declare their feature, so a diff run
+reports a non-zero `unsupported=` count until then.
 
 ## Data tests: `queries` and `clickbench`
 

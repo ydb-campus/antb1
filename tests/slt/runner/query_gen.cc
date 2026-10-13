@@ -718,6 +718,18 @@ constexpr unsigned kSubstringPercent = 55;
 // Salt of the sixth random stream, which every draw that only substring needs takes, so that a
 // query without one is the query this seed generated before the substring PR.
 constexpr uint64_t kSubstringStreamSalt = 0x7375627374722D72ULL;
+// Share of the queries that have a correlated candidate and no uncorrelated subquery which take a
+// correlated conjunct (ADR 0023's T3), and, of those, the share that write NOT EXISTS rather than
+// EXISTS and the share that add a non-equality residual to the key.
+constexpr unsigned kCorrelatedPercent = 30;
+constexpr unsigned kNotExistsPercent = 40;
+// Share of the correlated conjuncts that are an aggregate under a comparison (ADR 0023's Path 2)
+// rather than [NOT] EXISTS (Path 1), where the candidate admits one.
+constexpr unsigned kCorrelatedAggregatePercent = 45;
+constexpr unsigned kCorrelatedResidualPercent = 35;
+// Salt of the seventh random stream, which every draw that only a correlated subquery needs takes,
+// so that a query without one is the query this seed generated before the correlated PR.
+constexpr uint64_t kCorrelatedStreamSalt = 0x636F72722D726E67ULL;
 
 std::optional<std::size_t> ColumnIndex(const GenTable& t, std::string_view name) {
   const auto it = std::ranges::find_if(
@@ -857,6 +869,18 @@ struct Binding {
   bool as_cte = false;             // the block goes in a WITH list, not in FROM
 };
 
+// One correlated subquery this query could write (ADR 0023's T3): an equality between a column of
+// a FROM binding and a column of a table the block reads, which is the key the subquery correlates
+// through. Both ends have the same type, not merely the same ValueKind: ADR 0023's Path 2 feeds an
+// equivalence class only from an equality of two columns of one type, so a widening pair would
+// generate a shape U3 cannot answer and that would therefore never be compared.
+struct CorrelatedCandidate {
+  const Binding* outer = nullptr;        // the FROM item the subquery reads out to
+  const GenColumn* outer_key = nullptr;  // of `outer`
+  const GenTable* inner = nullptr;       // the block's only table, always named, never by path
+  const GenColumn* inner_key = nullptr;  // of `inner`, of the same type as `outer_key`
+};
+
 struct FromList {
   std::vector<Binding> bindings;    // in FROM order
   std::vector<KeyPair> where_keys;  // the keys WHERE holds
@@ -886,7 +910,7 @@ class Builder {
  public:
   // `join_rng`: the query's second stream, which every draw that only a join needs takes.
   Builder(const std::vector<GenTable>& tables, Rng& rng, Rng& join_rng, Rng& block_rng,
-          Rng& left_rng, Rng& sub_rng, Rng& substring_rng, FeatureSet allowed)
+          Rng& left_rng, Rng& sub_rng, Rng& substring_rng, Rng& corr_rng, FeatureSet allowed)
       : tables_(tables),
         rng_(rng),
         join_rng_(join_rng),
@@ -894,6 +918,7 @@ class Builder {
         left_rng_(left_rng),
         sub_rng_(sub_rng),
         substring_rng_(substring_rng),
+        corr_rng_(corr_rng),
         allowed_(allowed),
         edges_(UsableEdges(tables)) {}
 
@@ -1951,7 +1976,7 @@ class Builder {
         return;
       }
       const std::string_view op = rng_.Pick(kOps);
-      Literal lit = MakeLiteral(operand.values);
+      Literal lit = MakeLiteral(rng_, operand.values);
       used_.Add(lit.features);
       if (allowed_.Has(Feature::kLiteralFirst) && rng_.Percent(20)) {
         used_.Add(Feature::kLiteralFirst);
@@ -2070,7 +2095,13 @@ class Builder {
     // fifth stream, so a query without one is the query this seed gave before.
     const std::vector<SubqueryCandidate> candidates = WhereSubqueries();
     const bool subquery = !candidates.empty() && sub_rng_.Percent(kSubqueryPercent);
-    if (keys.empty() && !conditions && !subquery) {
+    // A correlated subquery as one more top-level AND conjunct (ADR 0023's T3), on the same terms
+    // and from the seventh stream. Only where the uncorrelated one did not fire, so a seed that
+    // took one is untouched and a query still holds at most one subquery.
+    const std::vector<CorrelatedCandidate> corr =
+        subquery ? std::vector<CorrelatedCandidate>{} : CorrelatedCandidates();
+    const bool correlated = !corr.empty() && corr_rng_.Percent(kCorrelatedPercent);
+    if (keys.empty() && !conditions && !subquery && !correlated) {
       return;
     }
     std::size_t terms = 0;
@@ -2096,6 +2127,19 @@ class Builder {
       }
       used_.Add(Feature::kWhere);
       SubqueryConjunct(candidates);
+    }
+    if (correlated) {
+      if (terms > 0 || !keys.empty()) {
+        Keyword("AND");
+      }
+      used_.Add(Feature::kWhere);
+      const CorrelatedCandidate& c = corr[corr_rng_.Below(corr.size())];
+      // The aggregate form where this candidate admits one, else the EXISTS form, which every
+      // candidate admits.
+      if (!allowed_.Has(Feature::kCorrelatedAggregate) ||
+          !corr_rng_.Percent(kCorrelatedAggregatePercent) || !CorrelatedAggregate(c)) {
+        CorrelatedExists(c);
+      }
     }
   }
 
@@ -2126,6 +2170,124 @@ class Builder {
     used_.Add(Feature::kTableName);
     tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.inner->name});
     Symbol(")");
+  }
+
+  // `<outer>.<k>`, the outer end of a correlated key. Written directly rather than through
+  // Column(), which draws from join_rng_ and qualifies only against the outer bindings.
+  void OuterColumn(const CorrelatedCandidate& c) {
+    used_.Add(Feature::kQualifiedName);
+    used_.Add(TypeFeature(c.outer_key->kind));
+    tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.outer->name});
+    Symbol(".");
+    tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.outer_key->name});
+  }
+
+  // `<inner>.<k>`, the inner end, qualified by the block's table name.
+  void InnerColumn(const CorrelatedCandidate& c, const GenColumn& column) {
+    used_.Add(Feature::kQualifiedName);
+    used_.Add(TypeFeature(column.kind));
+    tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.inner->name});
+    Symbol(".");
+    tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = column.name});
+  }
+
+  // `[NOT] EXISTS (SELECT * FROM inner WHERE inner.k = outer.k [AND inner.x <op> outer.x])`, ADR
+  // 0023's Path 1: a plain block, at least one key, and an optional non-equality residual. The
+  // select list is `*`, which U2 checks but does not expand, and records no shape feature.
+  void CorrelatedExists(const CorrelatedCandidate& c) {
+    used_.Add(Feature::kCorrelatedExists);
+    if (corr_rng_.Percent(kNotExistsPercent)) {
+      Keyword("NOT");
+    }
+    Keyword("EXISTS");
+    Symbol("(");
+    Keyword("SELECT");
+    Symbol("*");
+    Keyword("FROM");
+    used_.Add(Feature::kTableName);
+    tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.inner->name});
+    Keyword("WHERE");
+    InnerColumn(c, *c.inner_key);
+    Symbol("=");
+    OuterColumn(c);
+    // An optional non-equality over the same pair, which only a residual can evaluate: it keeps
+    // the key, so the shape stays inside Path 1.
+    if (corr_rng_.Percent(kCorrelatedResidualPercent)) {
+      static constexpr auto kResidualOps = std::to_array<std::string_view>({"<", "<=", ">", ">="});
+      used_.Add(Feature::kCompareColumns);
+      Keyword("AND");
+      InnerColumn(c, *c.inner_key);
+      Symbol(corr_rng_.Pick(kResidualOps));
+      OuterColumn(c);
+    }
+    Symbol(")");
+  }
+
+  // Whether a correlated block may aggregate `arg` with `agg` and compare the result with a
+  // literal exactly in both engines. Orderable's rule, plus AVG of a DECIMAL: ADR 0021 rule 13
+  // makes a DECIMAL AVG agree bit for bit, while an integer or DOUBLE one divides to a double and
+  // is only accurate to about one ulp -- which a value test tolerates and a WHERE comparison,
+  // deciding row membership, does not. Orderable itself is left alone: widening it would move
+  // every existing HAVING and ORDER BY seed.
+  static bool CorrelatedAggregateFits(Agg agg, const GenColumn* arg) {
+    if (agg == Agg::kAvg) {
+      return arg != nullptr && arg->kind == ValueKind::kDecimal;
+    }
+    return (agg == Agg::kSum || agg == Agg::kMin || agg == Agg::kMax) && Orderable(agg, arg);
+  }
+
+  // `<lit> <op> (SELECT <AGG>(inner.c) FROM inner WHERE inner.k = outer.k)`, or the mirror, ADR
+  // 0023's Path 2: an ungrouped aggregate under a NULL-rejecting comparison that is a top-level
+  // WHERE conjunct, correlated through one equality of two columns of one type. The other operand
+  // is a literal: comparing against an outer column needs a result-type rule for divergence D13
+  // that the generator does not have, and the hand-written .slt records cover that shape.
+  // Returns whether it wrote one.
+  bool CorrelatedAggregate(const CorrelatedCandidate& c) {
+    std::vector<std::pair<Agg, const GenColumn*>> calls;
+    for (const Agg agg : {Agg::kSum, Agg::kAvg, Agg::kMin, Agg::kMax}) {
+      if (!allowed_.Has(AggFeature(agg))) {
+        continue;
+      }
+      for (const GenColumn& arg : c.inner->columns) {
+        if (CorrelatedAggregateFits(agg, &arg) &&
+            CanLiteral(ValuesOf(c.inner->rows, agg, &arg).kind)) {
+          calls.emplace_back(agg, &arg);
+        }
+      }
+    }
+    if (calls.empty()) {
+      return false;
+    }
+    const auto [agg, arg] = calls[corr_rng_.Below(calls.size())];
+    const Literal lit = MakeLiteral(corr_rng_, ValuesOf(c.inner->rows, agg, arg));
+    const std::string_view op = corr_rng_.Pick(kOps);
+    const bool literal_first = corr_rng_.Percent(50);
+    used_.Add(Feature::kCorrelatedAggregate);
+    used_.Add(AggFeature(agg));
+    used_.Add(lit.features);
+    if (literal_first) {
+      tokens_.insert(tokens_.end(), lit.tokens.begin(), lit.tokens.end());
+      Symbol(Flip(op));
+    }
+    Symbol("(");
+    Keyword("SELECT");
+    Keyword(AggName(agg));
+    Symbol("(");
+    InnerColumn(c, *arg);
+    Symbol(")");
+    Keyword("FROM");
+    used_.Add(Feature::kTableName);
+    tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.inner->name});
+    Keyword("WHERE");
+    InnerColumn(c, *c.inner_key);
+    Symbol("=");
+    OuterColumn(c);
+    Symbol(")");
+    if (!literal_first) {
+      Symbol(op);
+      tokens_.insert(tokens_.end(), lit.tokens.begin(), lit.tokens.end());
+    }
+    return true;
   }
 
   // One top-level conjunct: `probe [NOT] IN (block)`, `NOT (probe IN (block))`, or
@@ -2359,6 +2521,54 @@ class Builder {
   // (CheckJoin takes two FROM items at least, and Nest() only ever nests the single item of a
   // one-table query). Every probe reaches the outer scope by name alone, which is what keeps the
   // subquery uncorrelated: its block names one table and selects one of that table's own columns.
+  // The correlated subqueries this query could write. Pure: it draws nothing.
+  [[nodiscard]] std::vector<CorrelatedCandidate> CorrelatedCandidates() const {
+    std::vector<CorrelatedCandidate> out;
+    if (from_ == nullptr || !allowed_.Has(Feature::kCorrelatedExists) ||
+        !allowed_.Has(Feature::kTableName) || !allowed_.Has(Feature::kQualifiedName)) {
+      return out;  // the block names its table, and both ends of the key are qualified
+    }
+    for (const Binding& b : from_->bindings) {
+      // A nested block's columns are its own, and a path binding's name in SQL is its path's, not
+      // the one Binding::name holds for every FROM form, so neither can be qualified reliably.
+      if (!b.inner.empty() || b.by_path) {
+        continue;
+      }
+      for (const Edge& edge : edges_) {
+        if (edge.child_columns.size() != 1) {
+          continue;
+        }
+        for (const bool as_child : {true, false}) {
+          const GenTable& own = tables_[as_child ? edge.child : edge.parent];
+          const GenTable& other = tables_[as_child ? edge.parent : edge.child];
+          const std::size_t mine = as_child ? edge.child_columns[0] : edge.parent_columns[0];
+          const std::size_t theirs = as_child ? edge.parent_columns[0] : edge.child_columns[0];
+          if (!SameName(own.name, b.table->name) || mine >= b.columns.size()) {
+            continue;
+          }
+          // The inner table must not be named like the outer binding: it would shadow it, and the
+          // subquery would silently be uncorrelated (the self-reference edges of the fixtures).
+          if (SameName(other.name, b.name)) {
+            continue;
+          }
+          const GenColumn& outer_key = b.columns[mine];
+          const GenColumn& inner_key = other.columns[theirs];
+          if (outer_key.kind != inner_key.kind || outer_key.kind == ValueKind::kDouble ||
+              outer_key.via_override != inner_key.via_override) {
+            continue;  // no DOUBLE key (ADR 0022), and both read the same way
+          }
+          if (outer_key.kind == ValueKind::kDecimal &&
+              (outer_key.precision != inner_key.precision || outer_key.scale != inner_key.scale)) {
+            continue;  // one DECIMAL type on both ends, not merely one ValueKind
+          }
+          out.push_back(CorrelatedCandidate{
+              .outer = &b, .outer_key = &outer_key, .inner = &other, .inner_key = &inner_key});
+        }
+      }
+    }
+    return out;
+  }
+
   [[nodiscard]] std::vector<SubqueryCandidate> SubqueryCandidates() const {
     std::vector<SubqueryCandidate> out;
     if (from_ == nullptr || !allowed_.Has(Feature::kTableName)) {
@@ -2455,14 +2665,14 @@ class Builder {
       if (IsNumeric(c.kind) && rng_.Percent(15)) {
         if (const std::optional<bool> exact = Arithmetic(c)) {
           // An exact result takes the column's literals; a DOUBLE one those of a DOUBLE column.
-          Literal lit = MakeLiteral(*exact ? c : GenColumn{.kind = ValueKind::kDouble});
+          Literal lit = MakeLiteral(rng_, *exact ? c : GenColumn{.kind = ValueKind::kDouble});
           used_.Add(lit.features);
           Symbol(op);
           tokens_.insert(tokens_.end(), lit.tokens.begin(), lit.tokens.end());
           return;
         }
       }
-      Literal lit = MakeLiteral(c);
+      Literal lit = MakeLiteral(rng_, c);
       used_.Add(lit.features);
       const bool literal_first = allowed_.Has(Feature::kLiteralFirst) && rng_.Percent(20);
       if (allowed_.Has(Feature::kBetween) && (between == 1 || between == 2)) {
@@ -2600,7 +2810,7 @@ class Builder {
       if (i > 0) {
         Symbol(",");
       }
-      Literal lit = MakeLiteral(c);
+      Literal lit = MakeLiteral(rng_, c);
       used_.Add(lit.features);
       tokens_.insert(tokens_.end(), lit.tokens.begin(), lit.tokens.end());
     }
@@ -2621,30 +2831,30 @@ class Builder {
   }
 
   // An integer literal in the column's range, at its edges or just outside.
-  std::string IntegerText(const GenColumn& c) {
-    if (!c.samples.empty() && rng_.Percent(50)) {
-      return rng_.Pick(c.samples);
+  static std::string IntegerText(Rng& rng, const GenColumn& c) {
+    if (!c.samples.empty() && rng.Percent(50)) {
+      return rng.Pick(c.samples);
     }
     const Int128 lo = c.min;
     const Int128 hi = c.max;
-    if (rng_.Percent(60)) {
+    if (rng.Percent(60)) {
       const std::array<Int128, 7> edges = {lo, hi, lo - 1, hi + 1, 0, 1, -1};
-      return Int128ToString(rng_.Pick(edges));
+      return Int128ToString(rng.Pick(edges));
     }
     const auto span = static_cast<UInt128>(hi - lo) + 1U;
-    return Int128ToString(lo + static_cast<Int128>(static_cast<UInt128>(rng_.Next()) % span));
+    return Int128ToString(lo + static_cast<Int128>(static_cast<UInt128>(rng.Next()) % span));
   }
 
-  std::string DoubleText(const GenColumn& c) {
+  static std::string DoubleText(Rng& rng, const GenColumn& c) {
     static constexpr auto kEdges =
         std::to_array<std::string_view>({"0", "0.5", "-1.5", "1000000", "-0.25", "123456789.125"});
-    if (!c.samples.empty() && rng_.Percent(60)) {
-      const std::string& s = rng_.Pick(c.samples);
+    if (!c.samples.empty() && rng.Percent(60)) {
+      const std::string& s = rng.Pick(c.samples);
       if (ExactDecimalDouble(s)) {
         return s;
       }
     }
-    return std::string(rng_.Pick(kEdges));
+    return std::string(rng.Pick(kEdges));
   }
 
   // A literal for a DECIMAL(p,s) column: a sample value, the type's extremes, 0 and +-1, an
@@ -2654,13 +2864,13 @@ class Builder {
   // (divergence D13). With p <= 36, two literals with a spare digit each stay within 38 digits
   // (an IN list shares one type), and an integer literal's type (INTEGER, BIGINT, HUGEINT) only
   // shortens the integer digits the cap leaves to 38 - s >= p - s.
-  std::string DecimalText(const GenColumn& c) {
+  static std::string DecimalText(Rng& rng, const GenColumn& c) {
     const auto int_digits = static_cast<std::size_t>(c.precision - c.scale);
     const auto scale = static_cast<std::size_t>(c.scale);
     const bool spare = c.precision <= 36;
     const std::string fraction = scale > 0 ? "." + std::string(scale, '9') : "";
     const std::string max = (int_digits > 0 ? std::string(int_digits, '9') : "0") + fraction;
-    const std::string sample = c.samples.empty() ? std::string("0") : rng_.Pick(c.samples);
+    const std::string sample = c.samples.empty() ? std::string("0") : rng.Pick(c.samples);
     std::vector<std::string> choices = {sample, sample, sample, max, "-" + max, "0"};
     if (int_digits > 0) {
       choices.emplace_back("1");
@@ -2673,21 +2883,21 @@ class Builder {
       choices.push_back("-" + outside);
       choices.push_back(sample + (scale > 0 ? "5" : ".5"));
     }
-    return rng_.Pick(choices);
+    return rng.Pick(choices);
   }
 
   // A number with an exponent for a DECIMAL column: a sample value with e0 (DuckDB reads it as the
   // nearest double, as antb1 does), or an edge.
-  std::string ExponentText(const GenColumn& c) {
+  static std::string ExponentText(Rng& rng, const GenColumn& c) {
     static constexpr auto kEdges =
         std::to_array<std::string_view>({"1e1", "2.5e0", "-1e-1", "1e28", "-1.5e2", "0e0"});
-    if (!c.samples.empty() && rng_.Percent(60)) {
-      return rng_.Pick(c.samples) + "e0";
+    if (!c.samples.empty() && rng.Percent(60)) {
+      return rng.Pick(c.samples) + "e0";
     }
-    return std::string(rng_.Pick(kEdges));
+    return std::string(rng.Pick(kEdges));
   }
 
-  Literal MakeLiteral(const GenColumn& c) {
+  Literal MakeLiteral(Rng& rng, const GenColumn& c) {
     Literal lit;
     auto single = [&lit](std::string text, Feature feature) {
       lit.tokens.push_back({.kind = Token::Kind::kLiteral, .text = std::move(text)});
@@ -2696,13 +2906,13 @@ class Builder {
     switch (c.kind) {
       case ValueKind::kInteger:
       case ValueKind::kDouble: {
-        std::string text = c.kind == ValueKind::kInteger ? IntegerText(c) : DoubleText(c);
+        std::string text = c.kind == ValueKind::kInteger ? IntegerText(rng, c) : DoubleText(rng, c);
         const bool want_decimal = c.kind == ValueKind::kInteger &&
                                   allowed_.Has(Feature::kDecimalLiteral) &&
-                                  (!allowed_.Has(Feature::kIntegerLiteral) || rng_.Percent(20));
+                                  (!allowed_.Has(Feature::kIntegerLiteral) || rng.Percent(20));
         if (want_decimal) {
           static constexpr auto kFractions = std::to_array<std::string_view>({".5", ".25", ".0"});
-          text += rng_.Pick(kFractions);
+          text += rng.Pick(kFractions);
         }
         const bool decimal = text.contains('.');
         if (!allowed_.Has(decimal ? Feature::kDecimalLiteral : Feature::kIntegerLiteral)) {
@@ -2723,8 +2933,8 @@ class Builder {
         // Now and then a number DuckDB types as DOUBLE, which both engines compare in DOUBLE
         // (ADR 0021 rule 11), so does the rest of an IN list with it. Only DECIMAL columns draw
         // here: an integer column compares such a number with the nearest doubles (divergence D7).
-        if (allowed_.Has(Feature::kDecimalLiteral) && rng_.Percent(10)) {
-          std::string text = ExponentText(c);
+        if (allowed_.Has(Feature::kDecimalLiteral) && rng.Percent(10)) {
+          std::string text = ExponentText(rng, c);
           if (text.starts_with('-') && !allowed_.Has(Feature::kNegativeLiteral)) {
             text.erase(0, 1);
           }
@@ -2734,7 +2944,7 @@ class Builder {
           single(std::move(text), Feature::kDecimalLiteral);
           break;
         }
-        std::string text = DecimalText(c);
+        std::string text = DecimalText(rng, c);
         if (text.starts_with('-') && !allowed_.Has(Feature::kNegativeLiteral)) {
           text.erase(0, 1);
         }
@@ -2755,9 +2965,9 @@ class Builder {
       case ValueKind::kVarchar: {
         static constexpr auto kEdges =
             std::to_array<std::string_view>({"", "a", "zzzz", "~", "O'Brien", "alpha beta", "é"});
-        const std::string text = !c.samples.empty() && rng_.Percent(60)
-                                     ? rng_.Pick(c.samples)
-                                     : std::string(rng_.Pick(kEdges));
+        const std::string text = !c.samples.empty() && rng.Percent(60)
+                                     ? rng.Pick(c.samples)
+                                     : std::string(rng.Pick(kEdges));
         single(SqlString(text), Feature::kStringLiteral);
         break;
       }
@@ -2765,14 +2975,14 @@ class Builder {
         static constexpr auto kEdges =
             std::to_array<std::string_view>({"2013-06-30", "2013-07-01", "2013-07-15", "2013-07-31",
                                              "2013-08-01", "1970-01-01", "2100-12-31"});
-        const std::string text = !c.samples.empty() && rng_.Percent(60)
-                                     ? rng_.Pick(c.samples)
-                                     : std::string(rng_.Pick(kEdges));
+        const std::string text = !c.samples.empty() && rng.Percent(60)
+                                     ? rng.Pick(c.samples)
+                                     : std::string(rng.Pick(kEdges));
         // A typed date 70% of the time: the roll modulo 100 is the old Percent(70) roll, and the
         // rest picks the spelling (see the constants in SelectList).
         const bool typed = allowed_.Has(Feature::kDateLiteral) || allowed_.Has(Feature::kCastDate);
         const std::size_t roll =
-            typed && allowed_.Has(Feature::kStringLiteral) ? rng_.Below(400) : 0;
+            typed && allowed_.Has(Feature::kStringLiteral) ? rng.Below(400) : 0;
         if (typed && roll % 100 < 70) {
           lit.features.Add(TypedDate(lit.tokens, SqlString(text), roll / 100)
                                ? Feature::kCastDate
@@ -3446,6 +3656,7 @@ class Builder {
   Rng& left_rng_;       // the draws that only a left join needs
   Rng& sub_rng_;        // the draws that only an uncorrelated subquery needs
   Rng& substring_rng_;  // the draws that only substring needs
+  Rng& corr_rng_;       // the draws that only a correlated subquery needs
   FeatureSet allowed_;
   std::vector<Edge> edges_;         // the refs joins can follow
   const FromList* from_ = nullptr;  // the FROM list of the query being written (TryFrom)
@@ -3645,7 +3856,8 @@ std::expected<QueryGenerator, std::string> QueryGenerator::Make(std::vector<GenT
   Rng left_rng(Mix(seed ^ kLeftStreamSalt));
   Rng sub_rng(Mix(seed ^ kSubqueryStreamSalt));
   Rng substring_rng(Mix(seed ^ kSubstringStreamSalt));
-  if (!Builder(tables, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng,
+  Rng corr_rng(Mix(seed ^ kCorrelatedStreamSalt));
+  if (!Builder(tables, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng, corr_rng,
                options.supported)
            .Build()
            .has_value()) {
@@ -3664,13 +3876,14 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
   Rng left_rng(Mix(state ^ kLeftStreamSalt));
   Rng sub_rng(Mix(state ^ kSubqueryStreamSalt));
   Rng substring_rng(Mix(state ^ kSubstringStreamSalt));
+  Rng corr_rng(Mix(state ^ kCorrelatedStreamSalt));
   const bool target = rng.Percent(options_.target_percent);
   const FeatureSet allowed = target ? FeatureSet::All() : options_.supported;
   // Make() proved that the supported set admits a query over these tables; All() is a superset.
-  GeneratedQuery q =
-      Builder(tables_, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng, allowed)
-          .Build()
-          .value_or(GeneratedQuery{});
+  GeneratedQuery q = Builder(tables_, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng,
+                             corr_rng, allowed)
+                         .Build()
+                         .value_or(GeneratedQuery{});
   q.index = index;
   q.target_sample = target;
   return q;

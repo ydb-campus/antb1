@@ -98,6 +98,14 @@ enum class Feature : std::uint8_t {
   // declares them.
   kInSubquery,      // column [NOT] IN (SELECT ...), and NOT (column IN (SELECT ...))
   kScalarSubquery,  // column <op> (SELECT <aggregate> ...), in either order
+  // Correlated subqueries, only as a top-level conjunct of WHERE, correlated through one equality
+  // between an inner and an outer column (ADR 0023). T3 generates them and U2 and U3 declare them,
+  // one each: the two PRs run side by side, so neither may declare the other's shape. Until then a
+  // generated one is answered by DuckDB and refused by antb1 with exit code 4, which the diff test
+  // counts as unsupported rather than failing (difftest.cc) exactly because they are declared here
+  // and absent from kSupportedFeatures.
+  kCorrelatedExists,     // [NOT] EXISTS (SELECT * FROM inner WHERE inner.k = outer.k [AND ...])
+  kCorrelatedAggregate,  // <lit> <op> (SELECT <aggregate> FROM inner WHERE inner.k = outer.k)
   // Out-of-scope marker, the last Feature (new ones go above it): never in kSupportedFeatures and
   // never generated. The harness self-tests tag their "pending" canary query with it, so that path
   // stays tested.
@@ -228,6 +236,10 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "in_subquery";
     case Feature::kScalarSubquery:
       return "scalar_subquery";
+    case Feature::kCorrelatedExists:
+      return "correlated_exists";
+    case Feature::kCorrelatedAggregate:
+      return "correlated_aggregate";
     case Feature::kWindowFunctions:
       return "window_functions";
   }
@@ -302,9 +314,9 @@ inline constexpr FeatureSet kNeverGenerated = {Feature::kWindowFunctions};
 // and then removes from this set. Valid in `-- features:` tags, and never in kSupportedFeatures
 // while pending (checked below), so that no feature is declared supported before it is generated.
 // ADR 0022's T2 took derived tables and WITH lists out of it, T2c LEFT JOIN and T2b the two
-// uncorrelated subquery forms, and ADR 0023's S5 substring, so nothing waits here today. A Feature
-// added for grammar the generator cannot write yet goes in, and the PR that teaches it takes it
-// out again.
+// uncorrelated subquery forms, and ADR 0023's S5 substring. A Feature added for grammar the
+// generator cannot write yet goes in, and the PR that teaches it takes it out again -- in the same
+// commit, since TargetSamplesCoverTheWholeGrammar asserts the generated set exactly.
 inline constexpr FeatureSet kGeneratorPending = {};
 
 // What antb1 answers today: the whole slice grammar of docs/sql-subset.md (global and grouped
