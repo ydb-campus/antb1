@@ -2326,9 +2326,9 @@ class Binder {
          bool outer_encloses = false)
       : stmt_(stmt),
         scope_(std::move(bindings), outer),
+        outer_encloses_(outer_encloses),
         ids_(ids),
         bind_block_(bind_block),
-        outer_encloses_(outer_encloses),
         relations_(scope_.bindings().size()) {
     // Relations 0 to bindings - 1 are the bindings, in FROM order, which is the invariant
     // OnVisibility and Scope::Find share; BuildBlocks adds one relation per LEFT JOIN unit after
@@ -2553,12 +2553,17 @@ class Binder {
     Relation& relation = relations_[conjunct_relation_];
     // A correlated conjunct sits above this block's joins (ADR 0023), so what it computes cannot
     // go into a relation's layer, which sits below them.
-    std::vector<ExprPtr>& exprs = in_correlated_ ? correlated_exprs_
-                                  : where        ? relation.where_exprs
-                                                 : input_exprs_;
-    std::vector<ColumnId>& ids = in_correlated_ ? correlated_ids_
-                                 : where        ? relation.where_ids
-                                                : input_ids_;
+    std::vector<ExprPtr>* layer = &input_exprs_;
+    std::vector<ColumnId>* layer_ids = &input_ids_;
+    if (in_correlated_) {
+      layer = &correlated_exprs_;
+      layer_ids = &correlated_ids_;
+    } else if (where) {
+      layer = &relation.where_exprs;
+      layer_ids = &relation.where_ids;
+    }
+    std::vector<ExprPtr>& exprs = *layer;
+    std::vector<ColumnId>& ids = *layer_ids;
     const auto same =
         std::ranges::find_if(exprs, [&](const ExprPtr& e) { return SameExpr(*e, *t.expr); });
     const auto k = Narrow<std::size_t>(same - exprs.begin());
@@ -3034,12 +3039,13 @@ class Binder {
   // but not the second. Set at each clause's entry; the clauses bind in sequence (Binder::Bind) and
   // a subquery's block gets its own Binder, so it needs no saving and restoring.
   Clause clause_ = Clause::kSelect;
-  ColumnIdSource& ids_;
-  const BindBlockFn* bind_block_ = nullptr;
   // Whether `outer` is the scope of the query block that directly encloses this one, which only a
   // subquery expression's block has. A derived table's and a CTE's enclosing scope is a sibling or
   // declaring one, so a name found there is a lateral reference and exits 4 (ADR 0022).
   bool outer_encloses_ = false;
+  bool in_correlated_ = false;  // a correlated conjunct is binding: see InputColumn
+  ColumnIdSource& ids_;
+  const BindBlockFn* bind_block_ = nullptr;
   // ADR 0023: this block's WHERE conjuncts that read a column of the enclosing block. They are
   // neither keys nor edges of this block's join graph, so they are kept in one filter above all of
   // this block's joins, its subquery joins included, where the unnesting pass finds them. Conjuncts
@@ -3049,7 +3055,6 @@ class Binder {
   std::vector<ColumnId> correlated_ids_;  // per expression: its column
   std::vector<Predicate> correlated_filter_;
   SourceSpan correlated_span_;
-  bool in_correlated_ = false;  // a correlated conjunct is binding: see InputColumn
   SelectList select_;
   Shape shape_ = Shape::kProjection;
   // One FROM item's own layers, below the joins: the conjuncts routed to it (ADR 0022's WHERE

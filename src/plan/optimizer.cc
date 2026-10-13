@@ -377,7 +377,7 @@ arrow::Result<LogicalPlan> Optimize(const LogicalPlan& plan) {
     return plan;
   }
   ARROW_ASSIGN_OR_RAISE(LogicalNodePtr root, Unnest(plan.root));
-  root = LimitBelowProject(DependentKeys(CountStarToRowCount(std::move(root)), /*limited=*/false));
+  root = LimitBelowProject(DependentKeys(CountStarToRowCount(root), /*limited=*/false));
   const std::vector<ColumnId> output = OutputIds(*root);
   root = Prune(root, Needed(output.begin(), output.end()));
   // A dependent join that Unnest left behind is a bug in the pass, never an unsupported query: no

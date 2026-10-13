@@ -414,7 +414,8 @@ TEST(ColumnIdsTest, ResolvePositionsBindsLeftIdsInsideTheRightInput) {
   EXPECT_EQ(PositionMismatch(resolved), std::nullopt) << "resolving twice changes nothing";
   // #2 is the second of the left input's ids, so the free variable's index is 1.
   const auto& join = std::get<DependentJoinNode>(*resolved.root);
-  EXPECT_EQ(std::get<FilterNode>(*join.right).predicates[0].column->index, 1);
+  EXPECT_EQ(std::get<FilterNode>(*join.right).predicates[0].column.value_or(BoundColumn{}).index,
+            1);
 
   // The binding ends with the right input: the same reference under the left input is unresolvable.
   EXPECT_EQ(PositionMismatch(Plan(Node(DependentJoinNode{.kind = JoinKind::kSemi,
@@ -428,7 +429,7 @@ TEST(ColumnIdsTest, ResolvePositionsBindsLeftIdsInsideTheRightInput) {
 // of its own, which goes last. No kind sets `mark` yet, so only a hand-built plan has one.
 TEST(ColumnIdsTest, OutputIdsOfADependentJoinEndWithItsOwnColumn) {
   const ColumnId mark{12};
-  const auto marked = [mark](JoinKind kind) {
+  const auto marked = [](JoinKind kind) {
     return DependentJoinNode{
         .kind = kind, .left = Scan(), .right = Scan({kD, kE, kF}), .mark = mark, .span = {}};
   };
@@ -541,11 +542,12 @@ TEST(ColumnIdsTest, PositionMismatchNamesBrokenJoins) {
 TEST(ColumnIdsDeathTest, BrokenPlansAbort) {
   EXPECT_DEATH(ResolvePositions(FilterPlan(Column(ColumnId{99}, 0))),
                "Filter: column #99 is not in its input");
-  EXPECT_DEATH(Optimize(FilterPlan(Column(ColumnId{99}, 0))),
+  // Optimize is [[nodiscard]] since ADR 0023's unnesting pass; the abort is what is under test.
+  EXPECT_DEATH(static_cast<void>(Optimize(FilterPlan(Column(ColumnId{99}, 0)))),
                "Filter: column #99 is not in its input");
   JoinNode keyless = Join(JoinKind::kSemi);
   keyless.keys.clear();
-  EXPECT_DEATH(Optimize(Plan(Node(keyless))), "Join: SEMI join without keys");
+  EXPECT_DEATH(static_cast<void>(Optimize(Plan(Node(keyless)))), "Join: SEMI join without keys");
 }
 
 }  // namespace
