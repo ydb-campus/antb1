@@ -861,6 +861,11 @@ INSTANTIATE_TEST_SUITE_P(
         // integer expression.
         ErrorCase{"SELECT i16 FROM t WHERE 1 + 2.5 = (SELECT COUNT(*) FROM u)", kUnsupported,
                   "1 + 2.5", "a comparison with a subquery needs a column or a literal"},
+        // A constant integer expression that overflows is a bind error (divergence D17), as it is
+        // without a subquery: the fold runs, and the comparison's own side has to survive the copy
+        // it makes (sql::Box deep-copies, so the subquery moves).
+        ErrorCase{"SELECT i16 FROM t WHERE 2147483647 + 1 = (SELECT COUNT(*) FROM u)", kBind,
+                  "2147483647 + 1", "Overflow in addition of INTEGER"},
         ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u, v)", kBind, "v",
                   "table 'v' does not exist"},
         // One column, as in DuckDB, which reports a bind error for two.

@@ -144,6 +144,45 @@ SELECT COUNT(*) FROM trips WHERE tr_day > (SELECT MIN(sh_day) FROM shifts)
 ----
 2825
 
+# A constant integer expression on the other side, in either order: folding it copies the whole
+# comparison and sql::Box deep-copies its pointee, so the subquery arrives at a new address -- the
+# comparison's own side must be recognised by what it is, not by where it sits.
+query I nosort
+SELECT COUNT(*) FROM trips WHERE 1 + 2 = (SELECT COUNT(*) FROM promos)
+----
+0
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE 0 + 0 = (SELECT COUNT(*) FROM promos)
+----
+3000
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE (SELECT COUNT(*) FROM zones) = 20 + 20
+----
+3000
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_fare > (SELECT AVG(tr_fare) FROM trips) AND 1 + 1 > (SELECT COUNT(*) FROM promos)
+----
+1466
+
+# The same fold in HAVING and in an inner join's ON.
+query I nosort
+SELECT COUNT(*) FROM trips HAVING 2 + 3 > (SELECT COUNT(*) FROM promos)
+----
+3000
+
+query I nosort
+SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id AND 2 * 1000 > (SELECT COUNT(*) FROM trips)
+----
+0
+
+# A constant expression that overflows its type is a bind error, as it is without a subquery
+# (divergence D17), and not an abort.
+statement error
+SELECT COUNT(*) FROM trips WHERE 2147483647 + 1 = (SELECT COUNT(*) FROM promos)
+
 # ---- pending: correlated scalar aggregates (ADR 0023; roadmap PR U3 removes these guards) ----
 
 # Empty groups: riders 237 to 240 have no trip, so their SUM is NULL and the comparison drops them.

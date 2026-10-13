@@ -4261,8 +4261,14 @@ arrow::Status Binder::BindSubqueryConjunct(const sql::Expr& conjunct, const Subq
     // subquery. Every rule of a comparison then applies unchanged: the DECIMAL and DATE pairs it
     // admits, its folding of a literal side, and its refusal of a FLOAT column (divergence D11),
     // which the sub-plan's column carries across the block boundary.
+    // Any scalar subquery this meets is the conjunct's own: AsSubqueryConjunct accepted exactly one
+    // as a direct operand of the comparison, and RejectSubqueryConjunct ran FirstUnsupported over
+    // the other side, which refuses every subquery. Matching by kind rather than by address matters
+    // because BindConditionWith does not promise to hand back the same nodes: folding a constant
+    // integer side copies the whole comparison, and sql::Box deep-copies its pointee, so the
+    // subquery arrives at a new address.
     const auto bind_side = [&](const sql::Expr& e) -> arrow::Result<Typed> {
-      if (AsScalarSubquery(e) == form.subquery) {
+      if (AsScalarSubquery(e) != nullptr) {
         return ColumnLeaf(column.id, *column.type, column.name, column.stored_as_float);
       }
       return bind(e);
