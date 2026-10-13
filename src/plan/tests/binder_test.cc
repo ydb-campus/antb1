@@ -2982,6 +2982,39 @@ TEST(BinderTest, AggregateCallsAndDuckDbResultNames) {
   EXPECT_EQ(agg.aggregates[4].arg.value_or(BoundColumn{}).name, "Mixed Case");
 }
 
+// A function call's result name, as DuckDB re-serializes it: the name is quoted only where the
+// identifier needs quoting, so `strlen` is plain however it was written, while `substring` -- which
+// DuckDB reserves -- is schema-qualified and quoted when the call was unquoted and quoted alone
+// when it was quoted, in either case lower-cased. The positions of substring are arguments like any
+// other, so they appear as written.
+TEST(BinderTest, FunctionCallDuckDbResultNames) {
+  const Catalog catalog = MakeCatalog();
+  constexpr std::string_view kSql =
+      R"(SELECT strlen(s), "strlen"(s), "STRLEN"(s), STRLEN(s), substring(s, 1, 2),
+                "substring"(s, 1, 2), "SUBSTRING"(s, 1, 2), SUBSTRING(s FROM 1 FOR 2),
+                substr(s, 1, 2), "substr"(s, i32), substring(s, i32 + 1) FROM t)";
+  auto plan = BindSql(kSql, catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  const std::vector<std::string> names = {
+      "strlen(s)",
+      "strlen(s)",
+      "strlen(s)",
+      "strlen(s)",
+      R"(main."substring"(s, 1, 2))",
+      R"("substring"(s, 1, 2))",
+      R"("substring"(s, 1, 2))",
+      R"(main."substring"(s, 1, 2))",
+      "substr(s, 1, 2)",
+      "substr(s, i32)",
+      R"(main."substring"(s, (i32 + 1)))",
+  };
+  ASSERT_EQ(plan->output.size(), names.size());
+  for (std::size_t i = 0; i < names.size(); ++i) {
+    EXPECT_EQ(plan->output[i].name, names[i]) << i;
+    EXPECT_EQ(plan->output[i].type, i < 4 ? LogicalType::kBigInt : LogicalType::kVarchar) << i;
+  }
+}
+
 TEST(BinderTest, WhereBuildsAFilterUnderTheSelectList) {
   const Catalog catalog = MakeCatalog();
   constexpr std::string_view kSql =

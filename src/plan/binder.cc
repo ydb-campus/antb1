@@ -2367,15 +2367,17 @@ class Binder {
                        call.span);
     }
     ARROW_ASSIGN_OR_RAISE(Typed value, bind_arg(call.args[spec->value_arg]));
-    // DuckDB writes a reserved function name schema-qualified and quoted, so `substring(s, 1, 2)`
-    // results in main."substring"('s', 1, 2) where `substr(s, 1, 2)` and `strlen(s)` are plain.
-    // A call written with the name quoted keeps the quotes without the qualifier, as DuckDB does.
+    // DuckDB re-serializes a function's name, quoting it only where the identifier needs quoting:
+    // `strlen` is plain however it was written (`"strlen"` and `"STRLEN"` included), while
+    // `substring` -- a word DuckDB reserves -- is `main."substring"` when the call was written
+    // unquoted and `"substring"` when it was quoted (in any case: DuckDB resolves a quoted function
+    // name case-insensitively and prints it lower-cased).
     const auto opening = [&] -> std::string {
-      if (call.quoted) {
-        return std::format("\"{}\"(", call.name);  // quoted as written, without the qualifier
+      if (!spec->reserved_name) {
+        return std::string(spec->name) + "(";
       }
-      return spec->reserved_name ? std::format("main.\"{}\"(", spec->name)
-                                 : std::string(spec->name) + "(";
+      return call.quoted ? std::format("\"{}\"(", spec->name)
+                         : std::format("main.\"{}\"(", spec->name);
     };
     std::string name = opening();
     std::vector<ExprPtr> literals;
