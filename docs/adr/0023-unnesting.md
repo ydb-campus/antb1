@@ -349,6 +349,19 @@ docs/sql-subset.md sections it changes.
 U2 (which also waits for S5) and U3 can run side by side after U1 and T3. Roadmap PR A1 moves this ADR to Accepted,
 together with ADRs 0013, 0021 and 0022, once all 22 queries pass (decision C14).
 
+- Update (2026-10-13, S5): **S5 is `substring`,** recovered after ADR 0022's roadmap shipped. The front-end ids of the
+  2026-10-02 roadmap are cited here and in ADR 0022 but listed in neither, as the C-decisions are, and S1 and S5 were
+  cited only in this ADR; this records what they mean before the detour has to be repeated. Of the three queries U2
+  answers, only Q22 still refuses in the front end, and it refuses twice: `substring(x FROM 1 FOR 2)` because
+  `ParseFunction` (`src/sql/parser.cc`) treats DuckDB's special argument syntaxes -- `substring(s FROM 1)`,
+  `position('a' IN s)` -- as unsupported calls rather than syntax errors, and `substring(x, 1, 2)` because the binder's
+  function allowlist holds only COUNT, SUM, AVG, MIN, MAX, STRLEN, REGEXP_REPLACE, TODATETIME and DATE_TRUNC. So S5 is
+  the SQL-standard argument syntax in the parser plus `substring` as a scalar string function through the binder and
+  the executor, modelled on `strlen` and `regexp_replace`, with a `Feature` of its own. **S1 is satisfied,** which is
+  why the sentence above waits on S5 alone: nothing in Q4, Q21 or Q22 is refused today but `substring`, and S4b took
+  the `EXISTS` keyword out of the parser's rejected-word table. That last identification is an inference from what no
+  longer refuses, not a record of the decision.
+
 ## Alternatives considered
 
 - **Kim- and Dayal-style rewrites in the binder** (W. Kim, ACM TODS 1982; U. Dayal, VLDB 1987): one rewrite per
