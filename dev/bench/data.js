@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791873620018,
+  "lastUpdate": 1791898709206,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -7020,6 +7020,114 @@ window.BENCHMARK_DATA = {
             "value": 84.08702722222314,
             "unit": "ms/iter",
             "extra": "iterations: 9\ncpu: 84.0804914444444 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2ac39fb282379e7b4dc2c821103315e850d64acf",
+          "message": "feat(sql,plan,exec): substring, in the comma and SQL-standard spellings (#129)\n\n## Summary\n\nRoadmap id **S5** of [ADR\n0023](../blob/main/docs/adr/0023-unnesting.md): `substring`. The id had\nto\nbe recovered before it could be implemented — ADR 0023 waits on \"the\nfront-end PRs S1 and S5\" and\nnames them nowhere else, and neither does ADR 0022, which defines S3 and\nS4 of the same series. Both\ncome from the 2026-10-02 roadmap approval, which lives outside the repo\nas the C-decisions do, so the\nreference was a dangling one.\n\n**Recovered empirically**, now that ADR 0022's roadmap has shipped: of\nthe three queries U2 answers,\nonly Q22 still refuses in the front end, and it refuses twice — once in\n`ParseFunction`, which treats\nDuckDB's `substring(s FROM 1 FOR 2)` argument syntax as an unsupported\ncall rather than a syntax\nerror, and once in the binder's function allowlist. So **S5 is\n`substring`**: the SQL-standard\nargument syntax plus `substring` as a scalar string function through the\nbinder and the executor.\nS1 is satisfied — nothing in Q4, Q21 or Q22 is refused today but\n`substring` — and the ADR note says\nplainly that identifying it with S4b's `EXISTS` work is an inference\nfrom what no longer refuses,\nnot a record of the decision.\n\n**The ratchet does not move.** Q22 needs U2 as well; S5 only unblocks\nit.\n\n## What it answers\n\n`substring(x, start[, length])` and its alias `substr`, plus the\nSQL-standard\n`substring(x FROM start FOR length)` for `substring` alone — the two\nclauses in either order and at\nmost once each, desugared to the comma form of the same call, since\nDuckDB's own `json_serialize_sql`\ngives the identical AST for both spellings. One AST therefore serves\nevery spelling, with no new\nnode, and `unparse.h`'s round-trip and idempotence hold by construction.\n\n**Every rule below came from measuring the oracle, not from reading its\ndocs**, and the measurements\nrepeatedly contradicted what I expected:\n\n- `substr(s FROM 1)`, `strlen(s FROM 1)` and `\"substring\"(s FROM 1)` are\n**syntax errors in DuckDB**,\nso they keep antb1's existing refusal. I would have accepted `substr` by\nanalogy.\n- The window is one rule: a negative start counts from the end, a\nnegative length extends the window\n**backwards**, and the window is clipped to the value. My first two\nattempts at this rule were\n  wrong — only a 504-cell grid settled it.\n- It counts **codepoints** where `strlen` counts bytes (divergence D15),\nso `Привет, мир` is 20 bytes\nbut a 3-codepoint window is 6. Arrow's slice kernels take a constant\nwindow, so the kernel walks\n  the codepoints itself.\n- A start or a length outside **[-4294967296, 4294967295]** fails the\nquery when it runs, with\n  DuckDB's own message, one per side of each bound.\n- The result name is DuckDB's, which here means `main.\"substring\"(x, 1,\n2)`: DuckDB reserves the\nword, so it qualifies and quotes it where `substr(…)` and `strlen(…)`\nstay plain, and a call\n  written `\"substring\"(…)` keeps the quotes without the qualifier.\n- `SUBSTRING(x FOR n)` without `FROM` is **unsupported** (exit code 4):\nDuckDB reads it as\n`substring(x, 1, CAST(n AS INTEGER))`, and that cast is not cosmetic —\nit narrows the length to\n`INTEGER`, so `substring(x FOR 4294967295)` is a conversion error there\nwhile the comma form\nanswers. antb1's subset casts nothing to `INTEGER`, so the spelling is\nrefused rather than answered\n  with a length of another type.\n\n`substring` is also the **first function whose arguments after the value\nare evaluated per row**\nrather than string constants, so `FunctionSpec` gained an arity range\nand an argument kind, and\n`FunctionExpr::args` holds bound expressions for them.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run test\n100% tests passed out of 2635\nANTB1-TESTS: PASS preset=dev junit=build/dev/junit.xml\n\n$ pixi run ci\n100% tests passed out of 2635\n\n$ pixi run coverage\n| `sql`  | 99.08% (3244/3274) | 97.3% | 97.64% (2190/2243) | 95.6% | ok |\n| `plan` | 96.08% (6906/7188) | 93.5% | 90.98% (3912/4300) | 89.5% | ok |\n| `exec` | 97.63% (9159/9381) | 96.1% | 89.22% (5071/5684) | 85.1% | ok |\nCoverage gate: PASS\n\n$ pixi run lint\nevery hook Passed except shellcheck, which fails identically on main\n\n$ clang-tidy -p build/tidy --warnings-as-errors='*' <every changed TU>\n0 findings\n\n$ ANTB1_UPDATE_GOLDENS=1 pixi run test -L cli && pixi run test -L cli\na no-op\n\n$ antb1-sql-parser-fuzzer -seed=1 -runs=200000 (rebuilt, work corpus + the committed seeds)\nDone 200000 runs, no crash;  fuzz replay: PASS inputs=78\n```\n\nThe boundary grid against the pinned oracle — 14 starts (both bounds and\none step beyond each) × 11\nlengths (including the two-argument form and both bounds) × the 12\n`edge` rows:\n\n```text\n1848 of 1848 values agree; 0 mismatches\n```\n\nThe diff gate, where `kGeneratorPending` is now empty again so **every**\ngenerated query must answer\nand match:\n\n```text\nDIFF: PASS seed=20261005 queries=400 failed=0 unsupported=0\nDIFF: PASS seed=20261013 queries=400 failed=0 unsupported=0\nDIFF: PASS seed=777      queries=400 failed=0 unsupported=0\nDIFF: PASS seed=424242   queries=400 failed=0 unsupported=0\n```\n\n## Tests\n\n`tests/slt/cases/expressions/strings.slt` over the `edge` fixture, all\noracle-generated: the four\nspellings agreeing column-for-column, the byte-versus-codepoint\ncross-check (`strlen(substring(…))`,\nwhich also keeps the expectations free of the word fragments `typos`\nrejects), the window clipped at\nboth ends, expression and `CASE`-NULL positions, the two-argument form\nat the boundary where its\ndefault length shows, and the four out-of-range errors.\n\n`src/exec/tests/compute_test.cc` covers what no SQL-level test can\nreach: a per-row window, a NULL in\neach of the three arguments, a value whose first byte is a continuation\nbyte, and the range errors on\na batch that also holds NULLs — the binder enforces arity, so the\nkernel's own arity guard is\nunreachable through SQL.\n\nFour **metamorphic relations**, since declaring a feature is what\nactivates them: `substring` splits\na value in two at any of three points and the pieces hold every byte of\nit once, in both spellings —\nwhich is exactly the invariant the leading-byte bug below broke — and a\nwindow past either end of the\nvalue is the value, with `-4294967295` as the boundary the two-argument\nform turns on.\n\nThe generator writes it from a **sixth RNG stream**\n(`kSubstringStreamSalt`), so a query that writes\n`regexp_replace` instead is byte-for-byte what its seed wrote before\n`substring` existed —\n`SubstringChangesOnlySubstringQueries` pins that over 8000 indexes,\nwhere the 7941 that decline it\nare identical in SQL and features. Its frequency is modest and the\nfloors are set from measurement\nrather than from hope: **59 calls in 8000 queries**, about 3 per\n400-query diff run, because\n`substring` is one branch of one optional decoration of a VARCHAR column\n— the same bound\n`regexp_replace` has always had. So the gate is a backstop here; the\nsemantic weight sits with the\nboundary grid and the `.slt` records.\n\n## What the adversarial review found\n\nA 29-agent review of the finished branch — the reviewer pass plus three\ndifferential sweeps, each\nfinding verified by an independent refuter, then a completeness critic —\nfound **five divergences and\ntwo missing test layers**. Every one is now fixed and pinned; the\ncommits are separate so each is\nreviewable on its own.\n\n| divergence | why my own verification missed it |\n|---|---|\n| The two-argument form does **not** reach the end of the value: DuckDB\ndefaults the length to 4294967295, so `substring(v, -4294967296)` loses\nthe last codepoint | my check of that form ran starts −8…3; the defect\nlives only at −4294967296 |\n| A start or length **below** −4294967296 is an out-of-range error,\nwhere the kernel clamped and answered — the comment and the docs both\nclaimed clamping \"cannot change a result\" | I measured the upper bound\nand assumed the lower one didn't matter |\n| A **nested** `substring` lost `main.\"substring\"`: `ExprNameOf` is a\nsecond, parallel name builder and only `BindFunction` had the rule | I\ntested names only at the top level. The rule now lives in one function\nboth builders call |\n| `SUBSTRING(x FOR n)`'s implicit `CAST(n AS INTEGER)` (above) | I\nchecked the *value* of `FOR 2`, never its name or range |\n| A value whose **first byte is a continuation byte** lost that byte in\nevery window, so `substring` was not the identity over a full window |\nthere is no oracle — DuckDB refuses such a file — so only antb1's own\nstated rule and consistency with `strlen` could catch it |\n\nThe critic also found that the walk allocated ~8 bytes per input byte\n**outside** the pool\n`--memory-limit` reports: one 32 MB value peaked at 602 MB against 77 MB\nfor `strlen`, escaping the\nlimit sixfold. Two walks of the bytes and no container replace it.\n\nOne earlier regression was mine and caught before the review: the name\nbuilder gained a quoted-call\nbranch and applied it to **every** function, so `\"strlen\"('abc')` was\nnamed `\"strlen\"('abc')` where\nDuckDB and antb1-before-this-branch name it `strlen('abc')`. No test\ncovered a quoted function call's\nresult name; eleven names are pinned now.\n\n**One review finding did not survive verification**: that an\nout-of-range literal position goes\nunchecked on rows whose value is NULL. DuckDB skips the check for a NULL\nvalue exactly as antb1 does,\nso there was nothing to fix.\n\n## Maintainer notes\n\n- **Governance.** Two `/docs/adr/` files (CODEOWNERS):\n`0023-unnesting.md` gets the S5 note recording\nwhat the id means, and `0012-scalar-expressions.md`'s bullet saying the\nfunction list is \"fixed at\n`strlen`, `regexp_replace`\" gets an update, which `substring` makes\nstale. Both were agreed in\n  advance. No status file moves — the ratchet stays at 16 of 22.\n- `pixi run check` cannot pass on this osx-arm64 machine, unchanged from\n#120 onward: the osx-arm64\nshellcheck reports pre-existing `SC2218` in a governance file, identical\non `main`. `ci`,\n  `coverage` and per-file `clang-tidy` stand in.\n- `pixi run fuzz-smoke` fails here on the documented pre-existing\nLeakSanitizer report in libFuzzer's\nown `StartRssThread` (8 + 48 bytes); the rebuilt binary runs 200k\niterations clean with\n  `-detect_leaks=0`.\n- Rebased on `5fcf92d` (#128) before pushing. That bump touches only\n`.github/workflows/*`, so\n`pixi.lock` is unchanged and the oracle stays DuckDB 1.5.6 — which\nmatters, since every expectation\n  here came from it.\n- **What this unblocks.** U2 (correlated `EXISTS`) needs S5 for Q22; U1\ncomes first and nothing in\nADR 0023 is blocked by this PR. `docs/sql-subset.md` records `substring`\nunder the existing rule\nthat antb1 casts no argument implicitly, so a VARCHAR position that\nparses as a number is a bind\nerror where DuckDB answers; for every other value and position type\nDuckDB is a binder error too.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests) — see the\n      maintainer note; `ci`, `coverage` and per-file `clang-tidy` pass\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5)\nrecovered the id, derived every rule\nfrom the pinned oracle, implemented it and ran the verification above. A\nthree-lens scoping\nworkflow sized the work and caught two errors in the draft before coding\n(the order-free\n`FROM`/`FOR` clauses, and the codepoint-versus-byte counting). A\n29-agent adversarial review of\nthe finished branch found the five divergences and two missing test\nlayers listed above; one of\nits findings was refuted against the oracle and dropped, and the earlier\nscoping pass had one\n      claim refuted the same way.\n- Accountable human (has read and understands the whole diff): @hor911\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-13T16:35:18+03:00",
+          "tree_id": "cad3135d92059bcba8483355175a445c064f90ab",
+          "url": "https://github.com/ydb-campus/antb1/commit/2ac39fb282379e7b4dc2c821103315e850d64acf"
+        },
+        "date": 1791898708665,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4961.364456741503,
+            "unit": "ns/iter",
+            "extra": "iterations: 140955\ncpu: 4961.150778617289 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84646.23636844645,
+            "unit": "ns/iter",
+            "extra": "iterations: 7556\ncpu: 84639.06365802011 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 221594.8410889583,
+            "unit": "ns/iter",
+            "extra": "iterations: 3159\ncpu: 221540.44001266215 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 438894.4751728539,
+            "unit": "ns/iter",
+            "extra": "iterations: 1591\ncpu: 438846.4450031425 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 348862.8136522113,
+            "unit": "ns/iter",
+            "extra": "iterations: 2007\ncpu: 348842.09865470877 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2084513.5508982076,
+            "unit": "ns/iter",
+            "extra": "iterations: 334\ncpu: 2084315.8772455086 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 51.68469569230839,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 51.66872476923075 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 44.86903156250044,
+            "unit": "ms/iter",
+            "extra": "iterations: 16\ncpu: 44.863004187499996 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 201.0645430000011,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 201.05196700000033 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.392914836734889,
+            "unit": "ms/iter",
+            "extra": "iterations: 49\ncpu: 14.391091448979621 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 21.968284874999355,
+            "unit": "ms/iter",
+            "extra": "iterations: 32\ncpu: 21.96632812499999 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 39.32684883333416,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 39.321221000000094 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.5833464113636095,
+            "unit": "ms/iter",
+            "extra": "iterations: 440\ncpu: 1.5832200499999984 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 125.14882899999975,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 125.12537700000016 ms\nthreads: 1"
           }
         ]
       }
