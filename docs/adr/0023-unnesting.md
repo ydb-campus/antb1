@@ -105,6 +105,14 @@ work: mark and single dependent-join kinds, and lifting those rejections.
 
   Every visitor handles the node, and EXPLAIN renders it for plan tests; no session prints one, because Optimize
   removes every dependent join or fails.
+- **One output-id contract for two shapes.** A dependent join outputs its inputs' ids only, while binding its left
+  input's ids inside its right input; a mark join would also put in its output a marker id that neither input has.
+  `ComputeNode` already has that second shape, its input's ids plus its own, and `JoinNode` defines no id of its own:
+  its output is `JoinIds` of its inputs' ids, and the position-resolving walk defines no column for a join. U1 shapes
+  the logical plan's header, `OutputIds` and the walk of `plan::ResolvePositions` to admit both, so that a mark join
+  later needs only its own kind and its marker id there, rather than a second rewrite of the same functions. A kind is
+  not compiler-checked the way a node is, since exec dispatches on it through `default:` arms, so each site a new kind
+  reaches has to be found by hand. U1 itself adds no join kind.
 - **Correlated conjuncts at the top of their block.** A WHERE conjunct of the subquery's block that reads an outer
   column becomes neither a key nor an edge of the block's join graph, so a block whose relations connect only through
   an outer column is disconnected and exits 4 (ADR 0022). The binder keeps all such conjuncts in one filter at the top
@@ -300,8 +308,9 @@ hand reach it without Optimize, as ADR 0022's join kinds do before E2.
     ADR (ADR 0022).
 - **Shapes deferred until a query needs them** (a user or generated query of the shape, each with an update of this
   ADR): the general domain join; mark and single joins (subqueries under OR, in CASE or in a select list; scalar
-  subqueries that are not aggregates); correlated IN and NOT IN; correlated COUNT, and CASE or COALESCE over aggregates;
-  IS NOT DISTINCT FROM keys; per-binding top-N; the uncorrelated EXISTS.
+  subqueries that are not aggregates), which a TPC-DS workload would need, see Alternatives considered; correlated IN
+  and NOT IN; correlated COUNT, and CASE or COALESCE over aggregates; IS NOT DISTINCT FROM keys; per-binding top-N; the
+  uncorrelated EXISTS.
 - **Tests:**
   - Our own star-schema fixtures (roadmap PR H6) bring the NULL keys, empty inner sides and duplicate keys that the data
     derived from TPC-H lacks, and a corpus of pending `onlyif duckdb` records whose expectations DuckDB writes: EXISTS
@@ -375,10 +384,18 @@ together with ADRs 0013, 0021 and 0022, once all 22 queries pass (decision C14).
   optimizer passes that understand shared nodes; an outer side computed twice is a copy that ADR 0022's relation
   limit, counted before binding, would have to count too. No query of the workload needs it, because the two cases
   cover all six. Deferred; the dependent join and the top-down pass are its starting point.
-- **Mark and single joins:** a mark join appends a three-valued "has a match" column, so that a subquery can sit
-  under OR, in CASE or in a select list, and correlated IN and NOT IN get their NULL semantics; a single join pads
-  like a left join and fails on a second match, for scalar subqueries that are not aggregates. They need new join
-  kinds in exec and a run-time check, for shapes that no query of the workload has (decision C16). Deferred.
+- **Mark and single joins,** both specified in *The Complete Story of Joins (in HyPer)* (T. Neumann, V. Leis and
+  A. Kemper, BTW 2017): a mark join appends a three-valued "has a match" column, so that a subquery can sit under OR,
+  in CASE or in a select list, and correlated IN and NOT IN get their NULL semantics; a single join pads like a left
+  join and fails on a second match, for scalar subqueries that are not aggregates. They need new join kinds in the
+  binder, the logical plan and exec, and a run-time check, for shapes that no query of the workload has (decision
+  C16). That paper's Table 1 both supports the deferral and names what would end it: in HyPer no TPC-H query needs a
+  single join, and the left mark joins its translation introduces all become the four left and right semi and anti
+  variants, while TPC-DS needs both even after optimization. A TPC-DS workload would therefore need them, and they
+  would not be its only gap: the same table puts full outer and right outer joins in TPC-DS's optimized plans, and
+  right semi and group joins in both suites', and `plan::JoinKind` names none of the four. RIGHT and FULL joins exit
+  4 under ADR 0022, which separately defers building on the preserved side, together with the shared build that the
+  general domain join needs. Deferred.
 - **Per-binding top-N:** a correlated subquery with ORDER BY and LIMIT, such as the first row for each outer row. The
   formalization has no push-down rule for sort or limit, so it needs a top-N per binding, like a window function. No
   query of the workload has one, so it is dropped from the order and deferred.
