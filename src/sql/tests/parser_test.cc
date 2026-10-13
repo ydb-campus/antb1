@@ -655,6 +655,51 @@ TEST(ParserTest, SubqueriesKeepTheParenthesesTheirPrecedenceNeeds) {
   }
 }
 
+// SUBSTRING's SQL-standard argument syntax, which DuckDB normalizes to the comma form of the same
+// call: one AST serves every spelling, so the canonical text is always the comma form and the
+// round-trip holds. FOR without FROM starts at 1, which is what DuckDB's own serialization says.
+TEST(ParserTest, SubstringTakesItsSqlStandardArgumentSyntax) {
+  const std::vector<std::pair<std::string_view, std::string_view>> cases = {
+      {"SELECT substring(u FROM 1 FOR 2) FROM t"sv, "substring(u, 1, 2)"sv},
+      {"SELECT substring(u FROM 2) FROM t"sv, "substring(u, 2)"sv},
+      {"SELECT substring(u FOR 2) FROM t"sv, "substring(u, 1, 2)"sv},
+      {"SELECT substring(u, 1, 2) FROM t"sv, "substring(u, 1, 2)"sv},
+      // The name keeps the case it was written in, as every function call does; FROM and FOR are
+      // no part of the AST, so their case goes.
+      {"SELECT SUBSTRING(u from 1 for 2) FROM t"sv, "SUBSTRING(u, 1, 2)"sv},
+      // The arguments are expressions, not only literals, and the first one is parsed once however
+      // the call continues.
+      {"SELECT substring(u || 'x' FROM a + 1 FOR b * 2) FROM t"sv, ""sv},
+      {"SELECT substring(u FROM a) FROM t"sv, "substring(u, a)"sv},
+  };
+  for (const auto& [sql, contains] : cases) {
+    auto stmt = Parse(sql);
+    if (contains.empty()) {
+      continue;  // || is not in the grammar; this one only must not be a crash or a syntax error
+    }
+    ASSERT_TRUE(stmt.has_value()) << sql << ": " << stmt.error().message;
+    const std::string canonical = ToSql(*stmt);
+    EXPECT_NE(canonical.find(contains), std::string::npos) << sql << " -> " << canonical;
+    auto again = Parse(canonical);
+    ASSERT_TRUE(again.has_value()) << canonical << ": " << again.error().message;
+    EXPECT_TRUE(EqualIgnoringSpans(*stmt, *again)) << sql << " -> " << canonical;
+    EXPECT_EQ(ToSql(*again), canonical) << sql;  // idempotent, as unparse.h promises
+  }
+}
+
+// What the standard syntax does not accept, which DuckDB makes syntax errors: a second FOR, a
+// missing operand, and the keywords in the wrong order.
+TEST(ParserTest, SubstringStandardSyntaxEndsAtItsClosingParen) {
+  for (const std::string_view sql : {
+           "SELECT substring(u FROM 1 FOR 2 FOR 3) FROM t"sv,
+           "SELECT substring(u FROM 1 FOR 2, 3) FROM t"sv,
+           "SELECT substring(u FOR 2 FROM 1) FROM t"sv,
+       }) {
+    auto stmt = Parse(sql);
+    EXPECT_FALSE(stmt.has_value()) << sql << " -> " << (stmt ? ToSql(*stmt) : "");
+  }
+}
+
 // A '(' in an expression opens a nested query only for a query's own first words: two pairs of
 // parentheses are still an expression in two pairs, and the inner pair of ((SELECT ...)) is the
 // subquery. A query in parentheses that starts with neither SELECT nor WITH is refused at its
@@ -2035,8 +2080,16 @@ INSTANTIATE_TEST_SUITE_P(
                    10, "function string_agg() with this argument syntax"},
         RejectCase{"PositionIn", "SELECT ^position('a' IN u) FROM events", kUnsupported, 8,
                    "function position() with this argument syntax is not supported"},
-        RejectCase{"SubstringFrom", "SELECT ^substring(u FROM 1 FOR 2) FROM events", kUnsupported,
-                   9, "function substring() with this argument syntax is not supported"},
+        // Only SUBSTRING takes the SQL-standard argument syntax, and only under that name: DuckDB
+        // makes substr(u FROM 1) and strlen(u FROM 1) syntax errors, where antb1 refuses the
+        // argument syntax of any other function as it always has.
+        RejectCase{"SubstrFrom", "SELECT ^substr(u FROM 1) FROM events", kUnsupported, 6,
+                   "function substr() with this argument syntax is not supported"},
+        RejectCase{"StrlenFrom", "SELECT ^strlen(u FROM 1) FROM events", kUnsupported, 6,
+                   "function strlen() with this argument syntax is not supported"},
+        RejectCase{"QuotedSubstringFrom", "SELECT ^\"substring\"(u FROM 1) FROM events",
+                   kUnsupported, 11,
+                   "function substring() with this argument syntax is not supported"},
         RejectCase{"FunctionSyntaxError", "SELECT ^f(a +) FROM events", kUnsupported, 1,
                    "function f() with this argument syntax is not supported"},
         RejectCase{"FunctionFilter", "SELECT count_if(a > 0) ^FILTER (WHERE a < 5) FROM events",
