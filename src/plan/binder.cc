@@ -4215,14 +4215,11 @@ BoundColumn Binder::SubqueryColumn(SubqueryJoin& join, const Typed& t) {
         .type = t.expr->type,
         .qualifier = location.has_value() ? scope_.Qualifier(location->binding) : std::string()};
   }
-  const auto same =
-      std::ranges::find_if(join.exprs, [&](const ExprPtr& e) { return SameExpr(*e, *t.expr); });
-  const auto k = Narrow<std::size_t>(same - join.exprs.begin());
-  if (same == join.exprs.end()) {
-    join.exprs.push_back(t.expr);
-    join.ids.push_back(ids_.Next());
-  }
-  return BoundColumn{.id = join.ids[k], .name = t.expr->name, .type = t.expr->type};
+  // No deduplication: one side of the comparison is the subquery's own column, which returns above,
+  // so a conjunct computes at most one expression here.
+  join.exprs.push_back(t.expr);
+  join.ids.push_back(ids_.Next());
+  return BoundColumn{.id = join.ids.back(), .name = t.expr->name, .type = t.expr->type};
 }
 
 template <class BindFn>
@@ -4242,6 +4239,8 @@ arrow::Status Binder::BindSubqueryConjunct(const sql::Expr& conjunct, const Subq
   }
   const BindingColumn& column = bound.columns.front();
   if (!column.type.has_value()) {
+    // Defensive: a block that selects a column of an unsupported type fails while that block is
+    // bound, so this is a message no input reaches today rather than an invariant worth aborting on.
     return Reject(Rejection{.span = form.subquery->op_span,
                             .message = std::format("column '{}' of the subquery has the "
                                                    "unsupported type {}",
