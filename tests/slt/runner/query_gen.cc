@@ -1951,7 +1951,7 @@ class Builder {
         return;
       }
       const std::string_view op = rng_.Pick(kOps);
-      Literal lit = MakeLiteral(operand.values);
+      Literal lit = MakeLiteral(rng_, operand.values);
       used_.Add(lit.features);
       if (allowed_.Has(Feature::kLiteralFirst) && rng_.Percent(20)) {
         used_.Add(Feature::kLiteralFirst);
@@ -2455,14 +2455,14 @@ class Builder {
       if (IsNumeric(c.kind) && rng_.Percent(15)) {
         if (const std::optional<bool> exact = Arithmetic(c)) {
           // An exact result takes the column's literals; a DOUBLE one those of a DOUBLE column.
-          Literal lit = MakeLiteral(*exact ? c : GenColumn{.kind = ValueKind::kDouble});
+          Literal lit = MakeLiteral(rng_, *exact ? c : GenColumn{.kind = ValueKind::kDouble});
           used_.Add(lit.features);
           Symbol(op);
           tokens_.insert(tokens_.end(), lit.tokens.begin(), lit.tokens.end());
           return;
         }
       }
-      Literal lit = MakeLiteral(c);
+      Literal lit = MakeLiteral(rng_, c);
       used_.Add(lit.features);
       const bool literal_first = allowed_.Has(Feature::kLiteralFirst) && rng_.Percent(20);
       if (allowed_.Has(Feature::kBetween) && (between == 1 || between == 2)) {
@@ -2600,7 +2600,7 @@ class Builder {
       if (i > 0) {
         Symbol(",");
       }
-      Literal lit = MakeLiteral(c);
+      Literal lit = MakeLiteral(rng_, c);
       used_.Add(lit.features);
       tokens_.insert(tokens_.end(), lit.tokens.begin(), lit.tokens.end());
     }
@@ -2621,30 +2621,30 @@ class Builder {
   }
 
   // An integer literal in the column's range, at its edges or just outside.
-  std::string IntegerText(const GenColumn& c) {
-    if (!c.samples.empty() && rng_.Percent(50)) {
-      return rng_.Pick(c.samples);
+  std::string IntegerText(Rng& rng, const GenColumn& c) {
+    if (!c.samples.empty() && rng.Percent(50)) {
+      return rng.Pick(c.samples);
     }
     const Int128 lo = c.min;
     const Int128 hi = c.max;
-    if (rng_.Percent(60)) {
+    if (rng.Percent(60)) {
       const std::array<Int128, 7> edges = {lo, hi, lo - 1, hi + 1, 0, 1, -1};
-      return Int128ToString(rng_.Pick(edges));
+      return Int128ToString(rng.Pick(edges));
     }
     const auto span = static_cast<UInt128>(hi - lo) + 1U;
-    return Int128ToString(lo + static_cast<Int128>(static_cast<UInt128>(rng_.Next()) % span));
+    return Int128ToString(lo + static_cast<Int128>(static_cast<UInt128>(rng.Next()) % span));
   }
 
-  std::string DoubleText(const GenColumn& c) {
+  std::string DoubleText(Rng& rng, const GenColumn& c) {
     static constexpr auto kEdges =
         std::to_array<std::string_view>({"0", "0.5", "-1.5", "1000000", "-0.25", "123456789.125"});
-    if (!c.samples.empty() && rng_.Percent(60)) {
-      const std::string& s = rng_.Pick(c.samples);
+    if (!c.samples.empty() && rng.Percent(60)) {
+      const std::string& s = rng.Pick(c.samples);
       if (ExactDecimalDouble(s)) {
         return s;
       }
     }
-    return std::string(rng_.Pick(kEdges));
+    return std::string(rng.Pick(kEdges));
   }
 
   // A literal for a DECIMAL(p,s) column: a sample value, the type's extremes, 0 and +-1, an
@@ -2654,13 +2654,13 @@ class Builder {
   // (divergence D13). With p <= 36, two literals with a spare digit each stay within 38 digits
   // (an IN list shares one type), and an integer literal's type (INTEGER, BIGINT, HUGEINT) only
   // shortens the integer digits the cap leaves to 38 - s >= p - s.
-  std::string DecimalText(const GenColumn& c) {
+  std::string DecimalText(Rng& rng, const GenColumn& c) {
     const auto int_digits = static_cast<std::size_t>(c.precision - c.scale);
     const auto scale = static_cast<std::size_t>(c.scale);
     const bool spare = c.precision <= 36;
     const std::string fraction = scale > 0 ? "." + std::string(scale, '9') : "";
     const std::string max = (int_digits > 0 ? std::string(int_digits, '9') : "0") + fraction;
-    const std::string sample = c.samples.empty() ? std::string("0") : rng_.Pick(c.samples);
+    const std::string sample = c.samples.empty() ? std::string("0") : rng.Pick(c.samples);
     std::vector<std::string> choices = {sample, sample, sample, max, "-" + max, "0"};
     if (int_digits > 0) {
       choices.emplace_back("1");
@@ -2673,21 +2673,21 @@ class Builder {
       choices.push_back("-" + outside);
       choices.push_back(sample + (scale > 0 ? "5" : ".5"));
     }
-    return rng_.Pick(choices);
+    return rng.Pick(choices);
   }
 
   // A number with an exponent for a DECIMAL column: a sample value with e0 (DuckDB reads it as the
   // nearest double, as antb1 does), or an edge.
-  std::string ExponentText(const GenColumn& c) {
+  std::string ExponentText(Rng& rng, const GenColumn& c) {
     static constexpr auto kEdges =
         std::to_array<std::string_view>({"1e1", "2.5e0", "-1e-1", "1e28", "-1.5e2", "0e0"});
-    if (!c.samples.empty() && rng_.Percent(60)) {
-      return rng_.Pick(c.samples) + "e0";
+    if (!c.samples.empty() && rng.Percent(60)) {
+      return rng.Pick(c.samples) + "e0";
     }
-    return std::string(rng_.Pick(kEdges));
+    return std::string(rng.Pick(kEdges));
   }
 
-  Literal MakeLiteral(const GenColumn& c) {
+  Literal MakeLiteral(Rng& rng, const GenColumn& c) {
     Literal lit;
     auto single = [&lit](std::string text, Feature feature) {
       lit.tokens.push_back({.kind = Token::Kind::kLiteral, .text = std::move(text)});
@@ -2696,13 +2696,13 @@ class Builder {
     switch (c.kind) {
       case ValueKind::kInteger:
       case ValueKind::kDouble: {
-        std::string text = c.kind == ValueKind::kInteger ? IntegerText(c) : DoubleText(c);
+        std::string text = c.kind == ValueKind::kInteger ? IntegerText(rng, c) : DoubleText(rng, c);
         const bool want_decimal = c.kind == ValueKind::kInteger &&
                                   allowed_.Has(Feature::kDecimalLiteral) &&
-                                  (!allowed_.Has(Feature::kIntegerLiteral) || rng_.Percent(20));
+                                  (!allowed_.Has(Feature::kIntegerLiteral) || rng.Percent(20));
         if (want_decimal) {
           static constexpr auto kFractions = std::to_array<std::string_view>({".5", ".25", ".0"});
-          text += rng_.Pick(kFractions);
+          text += rng.Pick(kFractions);
         }
         const bool decimal = text.contains('.');
         if (!allowed_.Has(decimal ? Feature::kDecimalLiteral : Feature::kIntegerLiteral)) {
@@ -2723,8 +2723,8 @@ class Builder {
         // Now and then a number DuckDB types as DOUBLE, which both engines compare in DOUBLE
         // (ADR 0021 rule 11), so does the rest of an IN list with it. Only DECIMAL columns draw
         // here: an integer column compares such a number with the nearest doubles (divergence D7).
-        if (allowed_.Has(Feature::kDecimalLiteral) && rng_.Percent(10)) {
-          std::string text = ExponentText(c);
+        if (allowed_.Has(Feature::kDecimalLiteral) && rng.Percent(10)) {
+          std::string text = ExponentText(rng, c);
           if (text.starts_with('-') && !allowed_.Has(Feature::kNegativeLiteral)) {
             text.erase(0, 1);
           }
@@ -2734,7 +2734,7 @@ class Builder {
           single(std::move(text), Feature::kDecimalLiteral);
           break;
         }
-        std::string text = DecimalText(c);
+        std::string text = DecimalText(rng, c);
         if (text.starts_with('-') && !allowed_.Has(Feature::kNegativeLiteral)) {
           text.erase(0, 1);
         }
@@ -2755,9 +2755,9 @@ class Builder {
       case ValueKind::kVarchar: {
         static constexpr auto kEdges =
             std::to_array<std::string_view>({"", "a", "zzzz", "~", "O'Brien", "alpha beta", "é"});
-        const std::string text = !c.samples.empty() && rng_.Percent(60)
-                                     ? rng_.Pick(c.samples)
-                                     : std::string(rng_.Pick(kEdges));
+        const std::string text = !c.samples.empty() && rng.Percent(60)
+                                     ? rng.Pick(c.samples)
+                                     : std::string(rng.Pick(kEdges));
         single(SqlString(text), Feature::kStringLiteral);
         break;
       }
@@ -2765,14 +2765,14 @@ class Builder {
         static constexpr auto kEdges =
             std::to_array<std::string_view>({"2013-06-30", "2013-07-01", "2013-07-15", "2013-07-31",
                                              "2013-08-01", "1970-01-01", "2100-12-31"});
-        const std::string text = !c.samples.empty() && rng_.Percent(60)
-                                     ? rng_.Pick(c.samples)
-                                     : std::string(rng_.Pick(kEdges));
+        const std::string text = !c.samples.empty() && rng.Percent(60)
+                                     ? rng.Pick(c.samples)
+                                     : std::string(rng.Pick(kEdges));
         // A typed date 70% of the time: the roll modulo 100 is the old Percent(70) roll, and the
         // rest picks the spelling (see the constants in SelectList).
         const bool typed = allowed_.Has(Feature::kDateLiteral) || allowed_.Has(Feature::kCastDate);
         const std::size_t roll =
-            typed && allowed_.Has(Feature::kStringLiteral) ? rng_.Below(400) : 0;
+            typed && allowed_.Has(Feature::kStringLiteral) ? rng.Below(400) : 0;
         if (typed && roll % 100 < 70) {
           lit.features.Add(TypedDate(lit.tokens, SqlString(text), roll / 100)
                                ? Feature::kCastDate
