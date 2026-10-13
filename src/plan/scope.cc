@@ -306,20 +306,38 @@ arrow::Result<BoundColumn> Scope::Resolve(const sql::ColumnRef& ref, Visibility 
                    ref.span);
 }
 
-bool Scope::Correlates(const sql::ColumnRef& ref) const {
+std::optional<Scope::OuterLookup> Scope::LookUpOuter(const sql::ColumnRef& ref) const {
   // Every enclosing scope, not just the nearest: DuckDB answers a reference several blocks out.
   // An unqualified name counts too, which a check over qualifiers alone would miss.
+  std::size_t distance = 0;
   for (const Scope* outer = outer_; outer != nullptr; outer = outer->outer_) {
-    if (outer->LookUp(ref).outcome != Lookup::Outcome::kMissing) {
-      return true;
+    ++distance;
+    if (const Lookup lookup = outer->LookUp(ref); lookup.outcome != Lookup::Outcome::kMissing) {
+      return OuterLookup{.distance = distance, .scope = outer, .lookup = lookup};
     }
   }
-  return false;
+  return std::nullopt;
 }
 
-arrow::Status Scope::CorrelationError(const sql::ColumnRef& ref) {
-  return UnsupportedError(std::format("a {} of an enclosing query block is not supported",
-                                      ref.qualifier.empty() ? "column" : "qualified column"),
+bool Scope::Correlates(const sql::ColumnRef& ref) const { return LookUpOuter(ref).has_value(); }
+
+arrow::Status Scope::CorrelationError(const sql::ColumnRef& ref, Refusal why) {
+  const std::string_view what = ref.qualifier.empty() ? "column" : "qualified column";
+  switch (why) {
+    case Refusal::kCorrelated:
+      return UnsupportedError(
+          std::format("a {} of an enclosing query block is not supported", what), ref.span);
+    case Refusal::kClause:
+      return UnsupportedError(
+          std::format("a {} of an enclosing query block is supported only in WHERE", what),
+          ref.span);
+    case Refusal::kDistance:
+      return UnsupportedError(
+          std::format("a {} of a query block further out than the enclosing one is not supported",
+                      what),
+          ref.span);
+  }
+  return UnsupportedError(std::format("a {} of an enclosing query block is not supported", what),
                           ref.span);
 }
 

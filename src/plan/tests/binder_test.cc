@@ -915,6 +915,39 @@ INSTANTIATE_TEST_SUITE_P(
                   kUnsupported, "t.i64", "a qualified column of an enclosing query block is not"},
         ErrorCase{"SELECT i16 FROM t WHERE i32 IN (SELECT i16 FROM ok WHERE i16 = i64)",
                   kUnsupported, "i64", "a column of an enclosing query block is not supported"},
+        // ADR 0023 answers an outer reference only in a WHERE conjunct of its own block, an inner
+        // join's ON included, and only one block out. Every other placement exits 4 at the
+        // reference, with the rule it broke, and never reports a missing column.
+        ErrorCase{"SELECT i16 FROM t WHERE i32 IN (SELECT t.i64 FROM u)", kUnsupported, "t.i64",
+                  "a qualified column of an enclosing query block is supported only in WHERE"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 IN (SELECT i16 FROM u GROUP BY i16, t.i64)",
+                  kUnsupported, "t.i64",
+                  "a qualified column of an enclosing query block is supported only in WHERE"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 IN (SELECT i16 FROM u ORDER BY t.i64)", kUnsupported,
+                  "t.i64",
+                  "a qualified column of an enclosing query block is supported only in WHERE"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 IN (SELECT i16 FROM u GROUP BY i16 HAVING "
+                  "MIN(i16) > t.i64)",
+                  kUnsupported, "t.i64",
+                  "a qualified column of an enclosing query block is supported only in WHERE"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 IN (SELECT u.i16 FROM u LEFT JOIN ok ON "
+                  "u.i16 = ok.i16 AND ok.i16 = t.i64)",
+                  kUnsupported, "t.i64",
+                  "a qualified column of an enclosing query block is supported only in WHERE"},
+        // An inner join's ON is a WHERE conjunct (rule 10), so it is the allowed placement.
+        ErrorCase{"SELECT i16 FROM t WHERE i32 IN (SELECT u.i16 FROM u JOIN ok ON "
+                  "u.i16 = ok.i16 AND ok.i16 = t.i64)",
+                  kUnsupported, "t.i64", "a qualified column of an enclosing query block is not"},
+        // Two blocks out: the subquery may name only the block that directly encloses it.
+        ErrorCase{"SELECT i16 FROM t WHERE i32 IN (SELECT i16 FROM u WHERE i32 IN "
+                  "(SELECT i16 FROM ok WHERE i16 = t.i64))",
+                  kUnsupported, "t.i64",
+                  "a qualified column of a query block further out than the enclosing one"},
+        // A name this block has twice keeps its own bind error: an enclosing block that happens to
+        // have it must not turn an ambiguous name into a refusal (nor, once a correlated subquery
+        // binds, make it read the outer column).
+        ErrorCase{"SELECT i16 FROM t WHERE i32 IN (SELECT i16 FROM u, ok)", kBind, "i16",
+                  "column name 'i16' is ambiguous: it matches u.i16 and ok.i16"},
         // An answered subquery no longer masks a name: the static walk accepts the form, so the
         // first error of the statement is the one a resolution finds, as in DuckDB.
         ErrorCase{"SELECT nope FROM t WHERE i32 IN (SELECT i16 FROM u)", kBind, "nope",

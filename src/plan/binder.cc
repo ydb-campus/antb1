@@ -2264,6 +2264,22 @@ struct BoundBlock {
   std::vector<BindingColumn> columns;
 };
 
+// The clause whose expressions are binding. ADR 0023 answers an outer reference only in a WHERE
+// conjunct of its own block, an inner join's ON included (ADR 0022 rule 10); anywhere else it exits
+// 4 at the reference's span, so the binder has to know where it is.
+enum class Clause : std::uint8_t {
+  kSelect,   // the select list, an aggregate's argument included
+  kWhere,    // a WHERE conjunct
+  kInnerOn,  // an inner join's ON, which is a WHERE conjunct once bound
+  kLeftOn,   // a LEFT JOIN's ON, which stays with its join
+  kGroupBy,  // GROUP BY
+  kHaving,   // HAVING
+  kOrderBy,  // ORDER BY
+};
+
+// The clauses whose outer references ADR 0023 answers.
+bool WhereClause(Clause clause) { return clause == Clause::kWhere || clause == Clause::kInnerOn; }
+
 // Binds a nested block as a sub-plan of its own, in a scope whose enclosing one is the given scope.
 // A Binder has no catalog and no CTE frame -- both belong to BindBlock, which binds the FROM list
 // before the Binder exists -- so BindBlock hands it this to reach them for a subquery's query.
@@ -2941,7 +2957,28 @@ class Binder {
     if (resolved.ok() || (ref.qualifier.empty() && FindAlias(select_, ref.name).has_value())) {
       return resolved;
     }
-    return scope_.Correlates(ref) ? Scope::CorrelationError(ref) : std::move(resolved);
+    // Only a name this block does not have at all is an outer reference. One that is ambiguous
+    // here, or whose column has no engine type, keeps its own error: an enclosing block that
+    // happens to have the name must not turn a bind error into a refusal, nor (once the binder
+    // plans a dependent join) make an ambiguous name silently read the outer column.
+    if (scope_.LookUp(ref, visible_).outcome != Lookup::Outcome::kMissing) {
+      return resolved;
+    }
+    const std::optional<Scope::OuterLookup> outer = scope_.LookUpOuter(ref);
+    if (!outer.has_value()) {
+      return resolved;  // no enclosing block has the name: a bind error, as rule 9 says
+    }
+    // An outer reference. ADR 0023 answers one only in a WHERE conjunct of its own block (an inner
+    // join's ON counts as WHERE, rule 10) and only one block out; every other one exits 4 here, at
+    // the reference's span, with the rule it broke. Until the binder plans a dependent join, the
+    // allowed one exits 4 too, as kCorrelated.
+    if (!WhereClause(clause_)) {
+      return Scope::CorrelationError(ref, Scope::Refusal::kClause);
+    }
+    if (outer->distance > 1) {
+      return Scope::CorrelationError(ref, Scope::Refusal::kDistance);
+    }
+    return Scope::CorrelationError(ref, Scope::Refusal::kCorrelated);
   }
 
   LogicalPlan Assemble();
@@ -2949,6 +2986,12 @@ class Binder {
   const sql::SelectStatement& stmt_;
   Scope scope_;
   Visibility visible_;  // the clause being bound (the default: every binding, in one level)
+  // Which clause is binding, for ADR 0023's rule that an outer reference is answered only in a
+  // WHERE conjunct of its own block. `visible_` cannot say it: BindWhere gives an inner join's ON
+  // and a LEFT JOIN's ON the same visibility, and ADR 0023 answers an outer reference in the first
+  // but not the second. Set at each clause's entry; the clauses bind in sequence (Binder::Bind) and
+  // a subquery's block gets its own Binder, so it needs no saving and restoring.
+  Clause clause_ = Clause::kSelect;
   ColumnIdSource& ids_;
   const BindBlockFn* bind_block_ = nullptr;
   SelectList select_;
@@ -3030,6 +3073,7 @@ class Binder {
 };
 
 arrow::Status Binder::BindSelectList() {
+  clause_ = Clause::kSelect;
   SelectList& list = select_;
   if (stmt_.star) {
     list.span = stmt_.star_span;
@@ -4054,6 +4098,7 @@ arrow::Status Binder::ClassifyConjunct(const sql::Expr& conjunct, SourceSpan ele
 // hoisted conjunct would have to stay inside the ON anyway, and rule 11 must never push one that
 // reads the preserved side below the join.
 arrow::Status Binder::BindUnitOn(std::size_t u, const sql::FromItem& item) {
+  clause_ = Clause::kLeftOn;
   for (const sql::Expr& element : item.on) {
     std::vector<const sql::Expr*> conjuncts;
     Conjuncts(element, conjuncts);
@@ -4490,6 +4535,7 @@ arrow::Status Binder::BindWhere() {
       continue;
     }
     visible_ = OnVisibility(stmt_.from, i);
+    clause_ = Clause::kInnerOn;
     if (connector == sql::Connector::kLeft) {
       // A LEFT JOIN's ON stays with its join and goes by its own rules, so it is classified into
       // the unit rather than flattened into this block's conjuncts.
@@ -4502,6 +4548,7 @@ arrow::Status Binder::BindWhere() {
     }
   }
   visible_ = {};  // WHERE sees every binding, in one level
+  clause_ = Clause::kWhere;
   for (const sql::Expr& element : stmt_.where) {
     ARROW_RETURN_NOT_OK(BindElement(element));
   }
@@ -4613,6 +4660,7 @@ std::size_t Binder::FirstBindingOf(std::size_t r) const {
 // or position, or any other literal) is no key: it still makes the query grouped (one group if
 // there is a row at all).
 arrow::Status Binder::BindGroupBy() {
+  clause_ = Clause::kGroupBy;
   const auto add = [&](const Typed& t) {
     const bool duplicate = std::ranges::any_of(
         key_exprs_, [&](const ExprPtr& key) { return SameExpr(*key, *t.expr); });
@@ -4705,6 +4753,7 @@ arrow::Status Binder::CheckGrouped() {
 // The select items that are neither columns, aggregates nor constants, in the query's scope; each
 // gets its column (computed unless it is one already).
 arrow::Status Binder::BindSelectExpressions() {
+  clause_ = Clause::kSelect;
   for (std::size_t i = 0; i < select_.items.size(); ++i) {
     const auto [kind, index] = select_.items[i];
     if (kind != ItemKind::kExpression) {
@@ -4778,6 +4827,7 @@ arrow::Result<std::optional<Typed>> Binder::ResolveHavingName(const sql::ColumnR
 
 // HAVING conditions as predicates over the aggregation's output (and columns computed over it).
 arrow::Status Binder::BindHaving() {
+  clause_ = Clause::kHaving;
   alias_fallback_ = true;
   // A name binds as in BindCondition: a key or a select alias first. The alias of an expression
   // item is its expression: the condition is computed next to it, over the aggregation.
@@ -4828,6 +4878,7 @@ arrow::Status Binder::BindHaving() {
 // in the select list; a constant (a constant item, or any other literal) orders nothing; a later
 // key on a column already ordered by changes nothing and is dropped.
 arrow::Status Binder::BindOrderBy() {
+  clause_ = Clause::kOrderBy;
   alias_fallback_ = true;
   for (const sql::OrderItem& item : stmt_.order_by) {
     std::optional<Typed> key;
