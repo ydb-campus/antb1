@@ -358,6 +358,28 @@ docs/sql-subset.md sections it changes.
 U2 (which also waits for S5) and U3 can run side by side after U1 and T3. Roadmap PR A1 moves this ADR to Accepted,
 together with ADRs 0013, 0021 and 0022, once all 22 queries pass (decision C14).
 
+- Update (2026-10-14, T3): **two Features, not one.** `kCorrelatedExists` and `kCorrelatedAggregate`, because U2
+  and U3 run side by side: one shared feature would let whichever landed first declare the other's shape supported,
+  and the differential test would then fail every query of the shape still refused. Each metamorphic relation
+  carries only its own, so each PR activates its own. `kGeneratorPending` is empty again, both forms being declared
+  and generated. **How T3 ships before them:** neither Feature is in `kSupportedFeatures`, and the differential test
+  counts an `Unsupported` answer rather than failing it exactly when a query's features are not all declared
+  supported, so a generated correlated query is valid SQL that DuckDB answers and antb1 refuses with exit code 4,
+  and a diff run reports a non-zero `unsupported=` count until each form is declared.
+- Update (2026-10-14, T3): **what the generator writes, and what stays with the `.slt` records.** Each narrowing is
+  chosen so that no generated shape sits outside what U2 and U3 answer, where it would exit 4 for good and so never
+  be compared: one inner table, never named like the outer binding (the fixtures' self-reference edges would shadow
+  it, which makes the subquery silently uncorrelated: still generated, still compared, testing nothing) and never
+  read by a path (only a join computes a path's binding name); both ends of the key of one type rather than one
+  value kind, since Path 2 feeds an equivalence class only from an equality of two columns of one type; the conjunct
+  only in WHERE, not in an inner join's ON; the aggregate compared with a literal, not an outer column, whose result
+  types need a rule for divergence D13 that the generator has not got; and AVG only over a DECIMAL argument, where
+  [ADR 0021](0021-decimal-semantics.md) rule 13 has the engines agree to the bit on each platform, while an integer
+  or DOUBLE AVG is accurate to about one ulp -- a tolerance the oracle comparisons allow and a WHERE comparison,
+  deciding row membership, does not. The shapes left out, a multi-table inner block and a self-correlated EXISTS
+  among them, are pinned as `pending` records in tests/slt/cases/subqueries/, where `slt-complete` catches a mistake
+  rather than a fixed seed. Three relations rather than the two named above: the EXISTS partition is written twice,
+  once with an inner-only conjunct of the subquery.
 - Update (2026-10-13, S5): **S5 is `substring`,** recovered after ADR 0022's roadmap shipped. The front-end ids of the
   2026-10-02 roadmap are cited here and in ADR 0022 but listed in neither, as the C-decisions are, and S1 and S5 were
   cited only in this ADR; this records what they mean before the detour has to be repeated. Of the three queries U2
