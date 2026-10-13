@@ -317,8 +317,7 @@ inline constexpr FeatureSet kNeverGenerated = {Feature::kWindowFunctions};
 // uncorrelated subquery forms, and ADR 0023's S5 substring. A Feature added for grammar the
 // generator cannot write yet goes in, and the PR that teaches it takes it out again -- in the same
 // commit, since TargetSamplesCoverTheWholeGrammar asserts the generated set exactly.
-inline constexpr FeatureSet kGeneratorPending = {Feature::kCorrelatedExists,
-                                                 Feature::kCorrelatedAggregate};
+inline constexpr FeatureSet kGeneratorPending = {Feature::kCorrelatedAggregate};
 
 // What antb1 answers today: the whole slice grammar of docs/sql-subset.md (global and grouped
 // aggregates, projections, WHERE conjunctions of column <op> literal, ORDER BY, LIMIT and OFFSET)

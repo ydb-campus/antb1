@@ -718,6 +718,15 @@ constexpr unsigned kSubstringPercent = 55;
 // Salt of the sixth random stream, which every draw that only substring needs takes, so that a
 // query without one is the query this seed generated before the substring PR.
 constexpr uint64_t kSubstringStreamSalt = 0x7375627374722D72ULL;
+// Share of the queries that have a correlated candidate and no uncorrelated subquery which take a
+// correlated conjunct (ADR 0023's T3), and, of those, the share that write NOT EXISTS rather than
+// EXISTS and the share that add a non-equality residual to the key.
+constexpr unsigned kCorrelatedPercent = 30;
+constexpr unsigned kNotExistsPercent = 40;
+constexpr unsigned kCorrelatedResidualPercent = 35;
+// Salt of the seventh random stream, which every draw that only a correlated subquery needs takes,
+// so that a query without one is the query this seed generated before the correlated PR.
+constexpr uint64_t kCorrelatedStreamSalt = 0x636F72722D726E67ULL;
 
 std::optional<std::size_t> ColumnIndex(const GenTable& t, std::string_view name) {
   const auto it = std::ranges::find_if(
@@ -857,6 +866,18 @@ struct Binding {
   bool as_cte = false;             // the block goes in a WITH list, not in FROM
 };
 
+// One correlated subquery this query could write (ADR 0023's T3): an equality between a column of
+// a FROM binding and a column of a table the block reads, which is the key the subquery correlates
+// through. Both ends have the same type, not merely the same ValueKind: ADR 0023's Path 2 feeds an
+// equivalence class only from an equality of two columns of one type, so a widening pair would
+// generate a shape U3 cannot answer and that would therefore never be compared.
+struct CorrelatedCandidate {
+  const Binding* outer = nullptr;        // the FROM item the subquery reads out to
+  const GenColumn* outer_key = nullptr;  // of `outer`
+  const GenTable* inner = nullptr;       // the block's only table, always named, never by path
+  const GenColumn* inner_key = nullptr;  // of `inner`, of the same type as `outer_key`
+};
+
 struct FromList {
   std::vector<Binding> bindings;    // in FROM order
   std::vector<KeyPair> where_keys;  // the keys WHERE holds
@@ -886,7 +907,7 @@ class Builder {
  public:
   // `join_rng`: the query's second stream, which every draw that only a join needs takes.
   Builder(const std::vector<GenTable>& tables, Rng& rng, Rng& join_rng, Rng& block_rng,
-          Rng& left_rng, Rng& sub_rng, Rng& substring_rng, FeatureSet allowed)
+          Rng& left_rng, Rng& sub_rng, Rng& substring_rng, Rng& corr_rng, FeatureSet allowed)
       : tables_(tables),
         rng_(rng),
         join_rng_(join_rng),
@@ -894,6 +915,7 @@ class Builder {
         left_rng_(left_rng),
         sub_rng_(sub_rng),
         substring_rng_(substring_rng),
+        corr_rng_(corr_rng),
         allowed_(allowed),
         edges_(UsableEdges(tables)) {}
 
@@ -2070,7 +2092,13 @@ class Builder {
     // fifth stream, so a query without one is the query this seed gave before.
     const std::vector<SubqueryCandidate> candidates = WhereSubqueries();
     const bool subquery = !candidates.empty() && sub_rng_.Percent(kSubqueryPercent);
-    if (keys.empty() && !conditions && !subquery) {
+    // A correlated subquery as one more top-level AND conjunct (ADR 0023's T3), on the same terms
+    // and from the seventh stream. Only where the uncorrelated one did not fire, so a seed that
+    // took one is untouched and a query still holds at most one subquery.
+    const std::vector<CorrelatedCandidate> corr =
+        subquery ? std::vector<CorrelatedCandidate>{} : CorrelatedCandidates();
+    const bool correlated = !corr.empty() && corr_rng_.Percent(kCorrelatedPercent);
+    if (keys.empty() && !conditions && !subquery && !correlated) {
       return;
     }
     std::size_t terms = 0;
@@ -2096,6 +2124,13 @@ class Builder {
       }
       used_.Add(Feature::kWhere);
       SubqueryConjunct(candidates);
+    }
+    if (correlated) {
+      if (terms > 0 || !keys.empty()) {
+        Keyword("AND");
+      }
+      used_.Add(Feature::kWhere);
+      CorrelatedExists(corr[corr_rng_.Below(corr.size())]);
     }
   }
 
@@ -2125,6 +2160,57 @@ class Builder {
     Keyword("FROM");
     used_.Add(Feature::kTableName);
     tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.inner->name});
+    Symbol(")");
+  }
+
+  // `<outer>.<k>`, the outer end of a correlated key. Written directly rather than through
+  // Column(), which draws from join_rng_ and qualifies only against the outer bindings.
+  void OuterColumn(const CorrelatedCandidate& c) {
+    used_.Add(Feature::kQualifiedName);
+    used_.Add(TypeFeature(c.outer_key->kind));
+    tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.outer->name});
+    Symbol(".");
+    tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.outer_key->name});
+  }
+
+  // `<inner>.<k>`, the inner end, qualified by the block's table name.
+  void InnerColumn(const CorrelatedCandidate& c, const GenColumn& column) {
+    used_.Add(Feature::kQualifiedName);
+    used_.Add(TypeFeature(column.kind));
+    tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.inner->name});
+    Symbol(".");
+    tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = column.name});
+  }
+
+  // `[NOT] EXISTS (SELECT * FROM inner WHERE inner.k = outer.k [AND inner.x <op> outer.x])`, ADR
+  // 0023's Path 1: a plain block, at least one key, and an optional non-equality residual. The
+  // select list is `*`, which U2 checks but does not expand, and records no shape feature.
+  void CorrelatedExists(const CorrelatedCandidate& c) {
+    used_.Add(Feature::kCorrelatedExists);
+    if (corr_rng_.Percent(kNotExistsPercent)) {
+      Keyword("NOT");
+    }
+    Keyword("EXISTS");
+    Symbol("(");
+    Keyword("SELECT");
+    Symbol("*");
+    Keyword("FROM");
+    used_.Add(Feature::kTableName);
+    tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.inner->name});
+    Keyword("WHERE");
+    InnerColumn(c, *c.inner_key);
+    Symbol("=");
+    OuterColumn(c);
+    // An optional non-equality over the same pair, which only a residual can evaluate: it keeps
+    // the key, so the shape stays inside Path 1.
+    if (corr_rng_.Percent(kCorrelatedResidualPercent)) {
+      static constexpr auto kResidualOps = std::to_array<std::string_view>({"<", "<=", ">", ">="});
+      used_.Add(Feature::kCompareColumns);
+      Keyword("AND");
+      InnerColumn(c, *c.inner_key);
+      Symbol(std::string(corr_rng_.Pick(kResidualOps)));
+      OuterColumn(c);
+    }
     Symbol(")");
   }
 
@@ -2359,6 +2445,54 @@ class Builder {
   // (CheckJoin takes two FROM items at least, and Nest() only ever nests the single item of a
   // one-table query). Every probe reaches the outer scope by name alone, which is what keeps the
   // subquery uncorrelated: its block names one table and selects one of that table's own columns.
+  // The correlated subqueries this query could write. Pure: it draws nothing.
+  [[nodiscard]] std::vector<CorrelatedCandidate> CorrelatedCandidates() const {
+    std::vector<CorrelatedCandidate> out;
+    if (from_ == nullptr || !allowed_.Has(Feature::kCorrelatedExists) ||
+        !allowed_.Has(Feature::kTableName) || !allowed_.Has(Feature::kQualifiedName)) {
+      return out;  // the block names its table, and both ends of the key are qualified
+    }
+    for (const Binding& b : from_->bindings) {
+      // A nested block's columns are its own, and a path binding's name in SQL is its path's, not
+      // the one Binding::name holds for every FROM form, so neither can be qualified reliably.
+      if (!b.inner.empty() || b.by_path) {
+        continue;
+      }
+      for (const Edge& edge : edges_) {
+        if (edge.child_columns.size() != 1) {
+          continue;
+        }
+        for (const bool as_child : {true, false}) {
+          const GenTable& own = tables_[as_child ? edge.child : edge.parent];
+          const GenTable& other = tables_[as_child ? edge.parent : edge.child];
+          const std::size_t mine = as_child ? edge.child_columns[0] : edge.parent_columns[0];
+          const std::size_t theirs = as_child ? edge.parent_columns[0] : edge.child_columns[0];
+          if (!SameName(own.name, b.table->name) || mine >= b.columns.size()) {
+            continue;
+          }
+          // The inner table must not be named like the outer binding: it would shadow it, and the
+          // subquery would silently be uncorrelated (the self-reference edges of the fixtures).
+          if (SameName(other.name, b.name)) {
+            continue;
+          }
+          const GenColumn& outer_key = b.columns[mine];
+          const GenColumn& inner_key = other.columns[theirs];
+          if (outer_key.kind != inner_key.kind || outer_key.kind == ValueKind::kDouble ||
+              outer_key.via_override != inner_key.via_override) {
+            continue;  // no DOUBLE key (ADR 0022), and both read the same way
+          }
+          if (outer_key.kind == ValueKind::kDecimal &&
+              (outer_key.precision != inner_key.precision || outer_key.scale != inner_key.scale)) {
+            continue;  // one DECIMAL type on both ends, not merely one ValueKind
+          }
+          out.push_back(CorrelatedCandidate{
+              .outer = &b, .outer_key = &outer_key, .inner = &other, .inner_key = &inner_key});
+        }
+      }
+    }
+    return out;
+  }
+
   [[nodiscard]] std::vector<SubqueryCandidate> SubqueryCandidates() const {
     std::vector<SubqueryCandidate> out;
     if (from_ == nullptr || !allowed_.Has(Feature::kTableName)) {
@@ -3446,6 +3580,7 @@ class Builder {
   Rng& left_rng_;       // the draws that only a left join needs
   Rng& sub_rng_;        // the draws that only an uncorrelated subquery needs
   Rng& substring_rng_;  // the draws that only substring needs
+  Rng& corr_rng_;       // the draws that only a correlated subquery needs
   FeatureSet allowed_;
   std::vector<Edge> edges_;         // the refs joins can follow
   const FromList* from_ = nullptr;  // the FROM list of the query being written (TryFrom)
@@ -3645,7 +3780,8 @@ std::expected<QueryGenerator, std::string> QueryGenerator::Make(std::vector<GenT
   Rng left_rng(Mix(seed ^ kLeftStreamSalt));
   Rng sub_rng(Mix(seed ^ kSubqueryStreamSalt));
   Rng substring_rng(Mix(seed ^ kSubstringStreamSalt));
-  if (!Builder(tables, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng,
+  Rng corr_rng(Mix(seed ^ kCorrelatedStreamSalt));
+  if (!Builder(tables, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng, corr_rng,
                options.supported)
            .Build()
            .has_value()) {
@@ -3664,13 +3800,14 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
   Rng left_rng(Mix(state ^ kLeftStreamSalt));
   Rng sub_rng(Mix(state ^ kSubqueryStreamSalt));
   Rng substring_rng(Mix(state ^ kSubstringStreamSalt));
+  Rng corr_rng(Mix(state ^ kCorrelatedStreamSalt));
   const bool target = rng.Percent(options_.target_percent);
   const FeatureSet allowed = target ? FeatureSet::All() : options_.supported;
   // Make() proved that the supported set admits a query over these tables; All() is a superset.
-  GeneratedQuery q =
-      Builder(tables_, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng, allowed)
-          .Build()
-          .value_or(GeneratedQuery{});
+  GeneratedQuery q = Builder(tables_, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng,
+                             corr_rng, allowed)
+                         .Build()
+                         .value_or(GeneratedQuery{});
   q.index = index;
   q.target_sample = target;
   return q;

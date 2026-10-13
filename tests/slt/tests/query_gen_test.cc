@@ -107,13 +107,16 @@ bool Joins(const GeneratedQuery& q) {
          q.features.Has(Feature::kLeftJoin);
 }
 
-// Whether a query used the tables' refs at all: it joins along one, or compares against an
-// uncorrelated subquery, whose candidates the refs also provide. Not the same as Joins(): a
-// subquery needs no second FROM item, so CheckJoin (which requires two) must not see one.
-bool UsesRefs(const GeneratedQuery& q) {
-  return Joins(q) || q.features.Has(Feature::kInSubquery) ||
-         q.features.Has(Feature::kScalarSubquery);
+// Whether a query used the tables' refs at all: it joins along one, or holds a subquery, whose
+// candidates the refs also provide -- correlated or not. Not the same as Joins(): a subquery needs
+// no second FROM item, so CheckJoin (which requires two) must not see one.
+bool HasSubquery(const GeneratedQuery& q) {
+  return q.features.Has(Feature::kInSubquery) || q.features.Has(Feature::kScalarSubquery) ||
+         q.features.Has(Feature::kCorrelatedExists) ||
+         q.features.Has(Feature::kCorrelatedAggregate);
 }
+
+bool UsesRefs(const GeneratedQuery& q) { return Joins(q) || HasSubquery(q); }
 
 QueryGenerator MakeOver(std::vector<GenTable> tables, uint64_t seed, GeneratorOptions options) {
   auto gen = QueryGenerator::Make(std::move(tables), seed, options);
@@ -1276,12 +1279,17 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
   EXPECT_EQ(q.features.Has(Feature::kJoinOn), join_on);
   EXPECT_EQ(q.features.Has(Feature::kTableAlias),
             std::ranges::any_of(items, [](const Item& i) { return i.aliased; }));
-  EXPECT_EQ(q.features.Has(Feature::kQualifiedName), qualified);
+  EXPECT_EQ(q.features.Has(Feature::kQualifiedName),
+            qualified || q.features.Has(Feature::kCorrelatedExists) ||
+                q.features.Has(Feature::kCorrelatedAggregate));
   EXPECT_EQ(q.features.Has(Feature::kTablePath), any_path);
   // A subquery's block always names its one table, so it records kTableName even where every FROM
-  // item is read by a path.
-  const bool subquery =
-      q.features.Has(Feature::kInSubquery) || q.features.Has(Feature::kScalarSubquery);
+  // item is read by a path; a correlated block also qualifies both ends of its key, so it records
+  // kQualifiedName where the FROM list alone would not (ForEachNode does not descend into a
+  // block, so `qualified` cannot see it).
+  const bool subquery = HasSubquery(q);
+  const bool correlated =
+      q.features.Has(Feature::kCorrelatedExists) || q.features.Has(Feature::kCorrelatedAggregate);
   EXPECT_EQ(q.features.Has(Feature::kTableName),
             subquery || std::ranges::any_of(items, [](const Item& i) { return !i.path; }));
   EXPECT_EQ(q.features.Has(Feature::kLeftJoin), left);
@@ -1609,6 +1617,82 @@ TEST(QueryGenerator, SubstringChangesOnlySubstringQueries) {
   }
   EXPECT_GT(took, 40) << "took: " << took;
   EXPECT_GT(same, 7000);
+}
+
+// A correlated conjunct comes from the seventh stream, so every seed that declines one generates
+// the query it did before ADR 0023's T3, SQL and features alike.
+TEST(QueryGenerator, CorrelatedSubqueriesChangeOnlyCorrelatedQueries) {
+  const FeatureSet with_corr = Union(kSupportedFeatures, {Feature::kCorrelatedExists});
+  const auto with = MakeOver(JoinTables(), 71, {.supported = with_corr, .target_percent = 0});
+  const auto without =
+      MakeOver(JoinTables(), 71,
+               {.supported = with_corr.Minus({Feature::kCorrelatedExists}), .target_percent = 0});
+  int took = 0;
+  int same = 0;
+  for (uint64_t i = 0; i < 8000; ++i) {
+    const auto q = with.Generate(i);
+    const auto plain = without.Generate(i);
+    EXPECT_FALSE(plain.features.Has(Feature::kCorrelatedExists)) << plain.sql;
+    if (!q.features.Has(Feature::kCorrelatedExists)) {
+      ++same;
+      EXPECT_EQ(q.sql, plain.sql) << i;
+      EXPECT_EQ(q.features, plain.features) << i;
+      continue;
+    }
+    ++took;
+    // It never displaces the uncorrelated form, which keeps T2b's coverage floors whole.
+    EXPECT_FALSE(q.features.Has(Feature::kInSubquery)) << q.sql;
+    EXPECT_FALSE(q.features.Has(Feature::kScalarSubquery)) << q.sql;
+  }
+  // Measured over JoinTables(), where every table has a ref, so a candidate is almost always
+  // available: 1299 of 8000 take one and the other 6701 are byte-identical.
+  EXPECT_GT(took, 1000) << "took: " << took;
+  EXPECT_GT(same, 6500) << "same: " << same;
+}
+
+// What it writes: both polarities, a qualified key on each side, the inner table named and never
+// the outer binding's name, and an optional non-equality over the same pair.
+TEST(QueryGenerator, CorrelatedExistsWritesAKeyAndAnOptionalResidual) {
+  const FeatureSet plain = Union(kSupportedFeatures, {Feature::kCorrelatedExists})
+                               .Minus({Feature::kLayout, Feature::kKeywordCase});
+  const auto gen = MakeOver(JoinTables(), 71, {.supported = plain, .target_percent = 0});
+  int exists = 0;
+  int negated = 0;
+  int residual = 0;
+  for (uint64_t i = 0; i < 4000; ++i) {
+    const auto q = gen.Generate(i);
+    if (!q.features.Has(Feature::kCorrelatedExists)) {
+      continue;
+    }
+    ++exists;
+    const std::size_t at = q.sql.find("EXISTS(SELECT * FROM ");
+    ASSERT_NE(at, std::string::npos) << q.sql;
+    if (at >= 4 && q.sql.compare(at - 4, 4, "NOT ") == 0) {
+      ++negated;
+    }
+    // A top-level conjunct of WHERE: what precedes it is AND or WHERE, never an OR and never a
+    // NOT of its own, which is the only placement ADR 0023 accepts. The outer query's own
+    // conditions may hold an OR; this one may not sit under it.
+    const std::size_t begin = (at >= 4 && q.sql.compare(at - 4, 4, "NOT ") == 0) ? at - 4 : at;
+    const std::string before = q.sql.substr(0, begin);
+    EXPECT_TRUE(before.ends_with("AND ") || before.ends_with("WHERE "))
+        << "a top-level conjunct: " << q.sql;
+    // Exactly one key equality, and a residual is a second comparison over the same pair.
+    const std::size_t where = q.sql.find(" WHERE ", at);
+    ASSERT_NE(where, std::string::npos) << q.sql;
+    const std::string block = q.sql.substr(where, q.sql.find(')', where) - where);
+    EXPECT_NE(block.find('='), std::string::npos) << q.sql;
+    EXPECT_GE(std::ranges::count(block, '.'), 2) << "both ends qualified: " << q.sql;
+    if (block.find(" AND ") != std::string::npos) {
+      ++residual;
+    }
+    EXPECT_TRUE(q.features.Has(Feature::kQualifiedName)) << q.sql;
+    EXPECT_TRUE(q.features.Has(Feature::kTableName)) << q.sql;
+  }
+  EXPECT_GT(exists, 150) << "exists: " << exists;
+  EXPECT_GT(negated, 30) << "negated: " << negated;
+  EXPECT_GT(residual, 30) << "residual: " << residual;
+  EXPECT_LT(negated, exists) << "both polarities";
 }
 
 // What it writes, with the layout and keyword-case features off so the call is one span of text:
