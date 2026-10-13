@@ -1446,6 +1446,50 @@ std::vector<Relation> AllRelations() {
                  .check = AllEqual()});
   }
 
+  // ---- correlated subqueries (ADR 0023; pending until U2 and U3 declare their feature) ----
+  // Each carries only its own Feature, so U2 activates the EXISTS family and U3 the aggregate one
+  // without waiting for the other: the two PRs run side by side.
+  {
+    const slt::FeatureSet correlated = {kColumns,   kMultipleItems, kIntegerColumns,
+                                        kTableName, kQualifiedName, kWhere};
+
+    // EXISTS and NOT EXISTS partition the outer rows: both are true or false and never NULL, so
+    // every outer row is in exactly one of them. The second pair reverses the key's sides and the
+    // third adds an inner-only conjunct, which changes which rows match but not the partition.
+    constexpr std::string_view kAll = "SELECT tr_row FROM trips";
+    r.push_back({.name = "correlated_exists_partitions_the_outer_rows",
+                 .features = SetWith(correlated, kCorrelatedExists),
+                 .probes = {Q(std::string(kAll)),
+                            Q("SELECT tr_row FROM trips WHERE EXISTS (SELECT * FROM riders "
+                              "WHERE riders.rd_id = trips.tr_rider)"),
+                            Q("SELECT tr_row FROM trips WHERE NOT EXISTS (SELECT * FROM riders "
+                              "WHERE riders.rd_id = trips.tr_rider)")},
+                 .check = FirstIsUnionOfRest()});
+    r.push_back(
+        {.name = "correlated_exists_partitions_with_an_inner_conjunct",
+         .features = SetWith(correlated, kCorrelatedExists, kDateColumns),
+         .probes =
+             {Q(std::string(kAll)),
+              Q("SELECT tr_row FROM trips WHERE EXISTS (SELECT * FROM shifts "
+                "WHERE shifts.sh_driver = trips.tr_driver AND shifts.sh_day > '2024-01-10')"),
+              Q("SELECT tr_row FROM trips WHERE NOT EXISTS (SELECT * FROM shifts "
+                "WHERE shifts.sh_driver = trips.tr_driver AND shifts.sh_day > '2024-01-10')")},
+         .check = FirstIsUnionOfRest()});
+
+    // A correlated scalar aggregate equals its hand-written rewrite: the subquery grouped by the
+    // key and joined back, which is exactly what ADR 0023's Path 2 does. The inner join drops an
+    // outer row with no group, and the comparison rejects it too, since MIN over no rows is NULL.
+    r.push_back(
+        {.name = "correlated_aggregate_equals_its_group_by_rewrite",
+         .features =
+             SetWith(correlated, kCorrelatedAggregate, kMin, kJoinOn, kGroupBy, kTableAlias),
+         .probes = {Q("SELECT tr_row FROM trips WHERE 2 < (SELECT MIN(riders.rd_row) FROM riders "
+                      "WHERE riders.rd_id = trips.tr_rider)"),
+                    Q("SELECT tr_row FROM trips JOIN (SELECT rd_id AS k, MIN(rd_row) AS m "
+                      "FROM riders GROUP BY rd_id) AS g ON g.k = trips.tr_rider WHERE 2 < g.m")},
+         .check = AllEqual()});
+  }
+
   // ---- the canary: a relation that stays pending for good ----
   // RelationList.PendingRelationsHoldInDuckDb validates a pending relation's SQL on DuckDB before
   // the PR that declares its features activates it, and asserts there is one to validate -- so once
