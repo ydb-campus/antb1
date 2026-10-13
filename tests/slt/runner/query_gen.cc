@@ -2217,7 +2217,7 @@ class Builder {
       used_.Add(Feature::kCompareColumns);
       Keyword("AND");
       InnerColumn(c, *c.inner_key);
-      Symbol(std::string(corr_rng_.Pick(kResidualOps)));
+      Symbol(corr_rng_.Pick(kResidualOps));
       OuterColumn(c);
     }
     Symbol(")");
@@ -2267,7 +2267,7 @@ class Builder {
     used_.Add(lit.features);
     if (literal_first) {
       tokens_.insert(tokens_.end(), lit.tokens.begin(), lit.tokens.end());
-      Symbol(std::string(Flip(op)));
+      Symbol(Flip(op));
     }
     Symbol("(");
     Keyword("SELECT");
@@ -2284,7 +2284,7 @@ class Builder {
     OuterColumn(c);
     Symbol(")");
     if (!literal_first) {
-      Symbol(std::string(op));
+      Symbol(op);
       tokens_.insert(tokens_.end(), lit.tokens.begin(), lit.tokens.end());
     }
     return true;
@@ -2831,7 +2831,7 @@ class Builder {
   }
 
   // An integer literal in the column's range, at its edges or just outside.
-  std::string IntegerText(Rng& rng, const GenColumn& c) {
+  static std::string IntegerText(Rng& rng, const GenColumn& c) {
     if (!c.samples.empty() && rng.Percent(50)) {
       return rng.Pick(c.samples);
     }
@@ -2845,7 +2845,7 @@ class Builder {
     return Int128ToString(lo + static_cast<Int128>(static_cast<UInt128>(rng.Next()) % span));
   }
 
-  std::string DoubleText(Rng& rng, const GenColumn& c) {
+  static std::string DoubleText(Rng& rng, const GenColumn& c) {
     static constexpr auto kEdges =
         std::to_array<std::string_view>({"0", "0.5", "-1.5", "1000000", "-0.25", "123456789.125"});
     if (!c.samples.empty() && rng.Percent(60)) {
@@ -2864,7 +2864,7 @@ class Builder {
   // (divergence D13). With p <= 36, two literals with a spare digit each stay within 38 digits
   // (an IN list shares one type), and an integer literal's type (INTEGER, BIGINT, HUGEINT) only
   // shortens the integer digits the cap leaves to 38 - s >= p - s.
-  std::string DecimalText(Rng& rng, const GenColumn& c) {
+  static std::string DecimalText(Rng& rng, const GenColumn& c) {
     const auto int_digits = static_cast<std::size_t>(c.precision - c.scale);
     const auto scale = static_cast<std::size_t>(c.scale);
     const bool spare = c.precision <= 36;
@@ -2888,7 +2888,7 @@ class Builder {
 
   // A number with an exponent for a DECIMAL column: a sample value with e0 (DuckDB reads it as the
   // nearest double, as antb1 does), or an edge.
-  std::string ExponentText(Rng& rng, const GenColumn& c) {
+  static std::string ExponentText(Rng& rng, const GenColumn& c) {
     static constexpr auto kEdges =
         std::to_array<std::string_view>({"1e1", "2.5e0", "-1e-1", "1e28", "-1.5e2", "0e0"});
     if (!c.samples.empty() && rng.Percent(60)) {

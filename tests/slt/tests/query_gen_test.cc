@@ -1681,7 +1681,7 @@ TEST(QueryGenerator, CorrelatedExistsWritesAKeyAndAnOptionalResidual) {
     const std::string block = q.sql.substr(where, q.sql.find(')', where) - where);
     EXPECT_NE(block.find('='), std::string::npos) << q.sql;
     EXPECT_GE(std::ranges::count(block, '.'), 2) << "both ends qualified: " << q.sql;
-    if (block.find(" AND ") != std::string::npos) {
+    if (block.contains(" AND ")) {
       ++residual;
     }
     EXPECT_TRUE(q.features.Has(Feature::kQualifiedName)) << q.sql;
@@ -1724,7 +1724,7 @@ TEST(QueryGenerator, CorrelatedAggregateComparesALiteralInEitherOrder) {
     if (!subquery_first) {
       ++literal_first;
     }
-    if (block.find("AVG(") != std::string::npos) {
+    if (block.contains("AVG(")) {
       ++avg;
     }
     EXPECT_FALSE(q.features.Has(Feature::kInSubquery)) << q.sql;
