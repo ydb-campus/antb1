@@ -1674,29 +1674,35 @@ class Parser {
     return Expr(std::move(call));
   }
 
-  // The rest of SUBSTRING(x FROM a [FOR b]) or SUBSTRING(x FOR b), positioned at the FROM or the
-  // FOR, with `x` already in `call.args`. DuckDB normalizes both to the comma form of the same
-  // call, so one AST serves every spelling and the canonical text is always the comma form; `FOR`
+  // The rest of SUBSTRING(x FROM a FOR b), positioned at the first FROM or FOR, with `x` already in
+  // `call.args`. DuckDB normalizes every spelling to the comma form of the same call, so one AST
+  // serves them all and the canonical text is always the comma form. The two clauses come in either
+  // order and at most once each, as DuckDB takes them -- `SUBSTRING(x FOR 2 FROM 3)` is
+  // `SUBSTRING(x FROM 3 FOR 2)`, while a repeated FROM or FOR is a syntax error there -- and FOR
   // alone starts at 1, which is what DuckDB's own serialization says.
   Expected<Expr> ParseSubstringStandard(Context context, FunctionCall& call) {
-    const bool from = Take().IsKeyword("FROM");  // the other spelling is FOR
-    if (!from) {
-      call.args.emplace_back(Literal{.kind = Literal::Kind::kInteger,
-                                     .negative = false,
-                                     .text = "1",
-                                     .span = call.name_span});
-    }
-    auto position = ParseExpr(context);
-    if (!position) {
-      return position;
-    }
-    call.args.push_back(*std::move(position));
-    if (from && Peek().IsKeyword("FOR")) {
-      Take();
-      auto length = ParseExpr(context);
-      if (!length) {
-        return length;
+    std::optional<Expr> start;
+    std::optional<Expr> length;
+    while (Peek().IsKeyword("FROM") || Peek().IsKeyword("FOR")) {
+      const Token keyword = Take();
+      const bool is_from = keyword.IsKeyword("FROM");
+      if (is_from ? start.has_value() : length.has_value()) {
+        return Syntax(keyword.span,
+                      std::string("SUBSTRING( takes at most one ") + (is_from ? "FROM" : "FOR"));
       }
+      auto value = ParseExpr(context);
+      if (!value) {
+        return value;
+      }
+      (is_from ? start : length) = *std::move(value);
+    }
+    if (start.has_value()) {
+      call.args.push_back(*std::move(start));
+    } else {
+      call.args.emplace_back(Literal{
+          .kind = Literal::Kind::kInteger, .negative = false, .text = "1", .span = call.name_span});
+    }
+    if (length.has_value()) {
       call.args.push_back(*std::move(length));
     }
     if (Peek().kind != TokenKind::kRightParen) {

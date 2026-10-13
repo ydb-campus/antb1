@@ -671,6 +671,10 @@ TEST(ParserTest, SubstringTakesItsSqlStandardArgumentSyntax) {
       // the call continues.
       {"SELECT substring(u || 'x' FROM a + 1 FOR b * 2) FROM t"sv, ""sv},
       {"SELECT substring(u FROM a) FROM t"sv, "substring(u, a)"sv},
+      // The clauses come in either order: DuckDB answers substring('abcdef' FOR 2 FROM 3) as `cd`,
+      // the same as FROM 3 FOR 2, so both spellings are the one call.
+      {"SELECT substring(u FOR 2 FROM 3) FROM t"sv, "substring(u, 3, 2)"sv},
+      {"SELECT substring(u FROM 3 FOR 2) FROM t"sv, "substring(u, 3, 2)"sv},
   };
   for (const auto& [sql, contains] : cases) {
     auto stmt = Parse(sql);
@@ -687,13 +691,14 @@ TEST(ParserTest, SubstringTakesItsSqlStandardArgumentSyntax) {
   }
 }
 
-// What the standard syntax does not accept, which DuckDB makes syntax errors: a second FOR, a
-// missing operand, and the keywords in the wrong order.
+// What the standard syntax does not accept, each of which DuckDB makes a syntax error: a repeated
+// FROM or FOR, and a comma after the clauses.
 TEST(ParserTest, SubstringStandardSyntaxEndsAtItsClosingParen) {
   for (const std::string_view sql : {
            "SELECT substring(u FROM 1 FOR 2 FOR 3) FROM t"sv,
+           "SELECT substring(u FROM 1 FROM 2) FROM t"sv,
+           "SELECT substring(u FOR 1 FOR 2) FROM t"sv,
            "SELECT substring(u FROM 1 FOR 2, 3) FROM t"sv,
-           "SELECT substring(u FOR 2 FROM 1) FROM t"sv,
        }) {
     auto stmt = Parse(sql);
     EXPECT_FALSE(stmt.has_value()) << sql << " -> " << (stmt ? ToSql(*stmt) : "");
