@@ -320,6 +320,32 @@ TEST(ColumnIdsTest, OutputIdsOfEveryJoinKind) {
   EXPECT_EQ(OutputIds(Join(JoinKind::kNullAwareAnti)), left);
 }
 
+// A dependent join outputs its inputs' ids by its kind's rule, exactly as the join of that kind.
+TEST(ColumnIdsTest, OutputIdsOfEveryDependentJoinKind) {
+  const auto dependent = [](JoinKind kind) {
+    return DependentJoinNode{.kind = kind, .left = Scan(), .right = Scan({kD, kE, kF}), .span = {}};
+  };
+  EXPECT_EQ(OutputIds(dependent(JoinKind::kSemi)), (std::vector<ColumnId>{kA, kB, kC}));
+  EXPECT_EQ(OutputIds(dependent(JoinKind::kAnti)), (std::vector<ColumnId>{kA, kB, kC}));
+  EXPECT_EQ(OutputIds(dependent(JoinKind::kOneRow)),
+            (std::vector<ColumnId>{kA, kB, kC, kD, kE, kF}));
+}
+
+// The second shape of the output-id contract (ADR 0023): a two-input node may also define a column
+// of its own, which goes last. No kind sets `mark` yet, so only a hand-built plan has one.
+TEST(ColumnIdsTest, OutputIdsOfADependentJoinEndWithItsOwnColumn) {
+  const ColumnId mark{12};
+  const auto marked = [mark](JoinKind kind) {
+    return DependentJoinNode{
+        .kind = kind, .left = Scan(), .right = Scan({kD, kE, kF}), .mark = mark, .span = {}};
+  };
+  EXPECT_EQ(OutputIds(marked(JoinKind::kSemi)), (std::vector<ColumnId>{kA, kB, kC, mark}));
+  EXPECT_EQ(OutputIds(marked(JoinKind::kOneRow)),
+            (std::vector<ColumnId>{kA, kB, kC, kD, kE, kF, mark}));
+  // A Join defines no column of its own, so the same ids without the marker.
+  EXPECT_EQ(OutputIds(Join(JoinKind::kSemi)), (std::vector<ColumnId>{kA, kB, kC}));
+}
+
 // Keys resolve against their own input; residual columns against the left ids, then the right ids.
 TEST(ColumnIdsTest, ResolvePositionsResolvesJoinKeysPerInputAndResidualsOverBoth) {
   JoinNode join = Join(JoinKind::kInner);

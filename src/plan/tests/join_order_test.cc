@@ -298,6 +298,7 @@ TEST(JoinOrderTest, RowsOfRelationsAndSubPlans) {
   EXPECT_EQ(EstimateRows(*scan), std::optional<int64_t>(100));
   EXPECT_EQ(EstimateRows(RowCountNode{.table = table}), std::optional<int64_t>(1));
   EXPECT_EQ(EstimateRows(JoinNode{.left = scan, .right = scan}), std::nullopt);
+  EXPECT_EQ(EstimateRows(DependentJoinNode{.left = scan, .right = scan}), std::nullopt);
 
   const ColumnId count = ids.Next();
   const LogicalNodePtr aggregate =

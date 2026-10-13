@@ -326,6 +326,14 @@ struct Pruner {
     }
     return WithInputs(*node, {Prune(join.left, needed), Prune(join.right, needed)});
   }
+  LogicalNodePtr operator()(const DependentJoinNode& /*join*/) const {
+    // Prune nothing through a dependent join: its right input reads columns of its left input as
+    // free variables, which no walk of the right input can see, so pruning the left input by what
+    // the nodes above it need would drop them. Unreachable in a plan that Optimize returns, since
+    // the unnesting pass runs first and replaces every dependent join or rejects the query; a plan
+    // test that prunes a hand-built one gets this rule.
+    return node;
+  }
 };
 
 LogicalNodePtr Prune(const LogicalNodePtr& node, Needed needed) {

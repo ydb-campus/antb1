@@ -68,6 +68,7 @@ struct NodeNameOf {
   std::string_view operator()(const LimitNode& /*node*/) const { return "Limit"; }
   std::string_view operator()(const RowCountNode& /*node*/) const { return "RowCount"; }
   std::string_view operator()(const JoinNode& /*node*/) const { return "Join"; }
+  std::string_view operator()(const DependentJoinNode& /*node*/) const { return "DependentJoin"; }
 };
 
 struct InputsOfNode {
@@ -83,6 +84,9 @@ struct InputsOfNode {
   std::vector<LogicalNodePtr> operator()(const LimitNode& node) const { return {node.input}; }
   std::vector<LogicalNodePtr> operator()(const RowCountNode& /*node*/) const { return {}; }
   std::vector<LogicalNodePtr> operator()(const JoinNode& node) const {
+    return {node.left, node.right};
+  }
+  std::vector<LogicalNodePtr> operator()(const DependentJoinNode& node) const {
     return {node.left, node.right};
   }
 };
@@ -112,6 +116,12 @@ struct WithInputsOfNode {
   }
   LogicalNodePtr operator()(const JoinNode& node) const {
     JoinNode out = node;
+    out.left = std::move(inputs[0]);
+    out.right = std::move(inputs[1]);
+    return std::make_shared<const LogicalNode>(std::move(out));
+  }
+  LogicalNodePtr operator()(const DependentJoinNode& node) const {
+    DependentJoinNode out = node;
     out.left = std::move(inputs[0]);
     out.right = std::move(inputs[1]);
     return std::make_shared<const LogicalNode>(std::move(out));
@@ -509,19 +519,24 @@ std::vector<ColumnId> CallIds(std::vector<ColumnId> ids, const std::vector<Aggre
   return ids;
 }
 
-// The output ids of a join of `kind` over inputs with these output ids.
+// The output ids of a join of `kind` over inputs with these output ids, and then `own` where the
+// node defines a column of its own (a dependent join's `mark`; kNoColumnId for a plain join, which
+// defines none). One rule for both shapes of OutputIds: ADR 0023's "One output-id contract".
 std::vector<ColumnId> JoinIds(JoinKind kind, std::vector<ColumnId> left,
-                              const std::vector<ColumnId>& right) {
+                              const std::vector<ColumnId>& right, ColumnId own = kNoColumnId) {
   switch (kind) {
     case JoinKind::kInner:
     case JoinKind::kLeft:
     case JoinKind::kOneRow:
       left.insert(left.end(), right.begin(), right.end());
-      return left;
+      break;
     case JoinKind::kSemi:
     case JoinKind::kAnti:
     case JoinKind::kNullAwareAnti:
-      return left;
+      break;
+  }
+  if (own != kNoColumnId) {
+    left.push_back(own);
   }
   return left;
 }
@@ -546,6 +561,9 @@ struct OutputIdsOf {
   std::vector<ColumnId> operator()(const RowCountNode& node) const { return {node.id}; }
   std::vector<ColumnId> operator()(const JoinNode& node) const {
     return JoinIds(node.kind, OutputIds(*node.left), OutputIds(*node.right));
+  }
+  std::vector<ColumnId> operator()(const DependentJoinNode& node) const {
+    return JoinIds(node.kind, OutputIds(*node.left), OutputIds(*node.right), node.mark);
   }
 };
 
@@ -836,6 +854,33 @@ class Resolver {
     }
     return {.node = changed ? MakeNode(std::move(out)) : self,
             .ids = JoinIds(join.kind, std::move(left.ids), right.ids)};
+  }
+
+  Resolved Visit(const LogicalNodePtr& self, const DependentJoinNode& join) {
+    switch (join.kind) {
+      case JoinKind::kSemi:
+      case JoinKind::kAnti:
+      case JoinKind::kOneRow:
+        break;
+      case JoinKind::kInner:
+      case JoinKind::kLeft:
+      case JoinKind::kNullAwareAnti:
+        // Only the three kinds the binder plans (ADR 0023): a correlation is a predicate of the
+        // right input, so there is nothing for the other kinds to match on.
+        Fail(std::format("DependentJoin: a {} dependent join", ToString(join.kind)));
+        break;
+    }
+    Resolved left = Walk(join.left);
+    Resolved right = Walk(join.right);
+    if (join.mark != kNoColumnId) {
+      Define("DependentJoin", join.mark);
+    }
+    DependentJoinNode out = join;
+    const bool changed = left.node != join.left || right.node != join.right;
+    out.left = left.node;
+    out.right = right.node;
+    return {.node = changed ? MakeNode(std::move(out)) : self,
+            .ids = JoinIds(join.kind, std::move(left.ids), right.ids, join.mark)};
   }
 
   std::set<ColumnId> defined_;

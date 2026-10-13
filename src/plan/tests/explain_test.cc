@@ -267,6 +267,41 @@ TEST(ExplainTest, EveryJoinKind) {
             "Join ONE-ROW build=right keys=[] residual=[(x > \"sum(y)\")]");
 }
 
+// A dependent join prints its kind and nothing else: it has no build side and no keys. Only a plan
+// test sees this line, since Optimize replaces every dependent join or rejects the query (ADR
+// 0023).
+TEST(ExplainTest, EveryDependentJoinKind) {
+  for (const auto& [kind, line] : {
+           std::pair{JoinKind::kSemi, "DependentJoin SEMI"},
+           std::pair{JoinKind::kAnti, "DependentJoin ANTI"},
+           std::pair{JoinKind::kOneRow, "DependentJoin ONE-ROW"},
+       }) {
+    EXPECT_EQ(ExplainNode(DependentJoinNode{
+                  .kind = kind, .left = ScanOf("t", {0}), .right = ScanOf("t", {0}), .span = {}}),
+              line);
+  }
+  EXPECT_EQ(ExplainNode(DependentJoinNode{.kind = JoinKind::kSemi,
+                                          .left = ScanOf("t", {0}),
+                                          .right = ScanOf("t", {0}),
+                                          .mark = ColumnId{7},
+                                          .span = {}}),
+            "DependentJoin SEMI mark=#7");
+}
+
+// Both inputs are rendered, left first, as a Join's are.
+TEST(ExplainTest, DependentJoinShowsBothInputs) {
+  EXPECT_EQ(Explain(LogicalPlan{.root = std::make_shared<const LogicalNode>(
+                                    DependentJoinNode{.kind = JoinKind::kOneRow,
+                                                      .left = ScanOf("a", {0}),
+                                                      .right = ScanOf("b", {0}),
+                                                      .span = {}}),
+                                .output = {}}),
+            "Output:\n"
+            "DependentJoin ONE-ROW\n"
+            "  Scan table=a source=fake columns=[i16]\n"
+            "  Scan table=b source=fake columns=[i16]\n");
+}
+
 // A qualifier is printed wherever a column is (J2b's binder sets it); quoted like a name.
 TEST(ExplainTest, QualifiedColumnNames) {
   const LogicalNodePtr scan = ScanOf("t", {0});

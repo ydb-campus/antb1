@@ -409,6 +409,12 @@ struct MapReferences {
     node.right = Map(node.right);
     return std::make_shared<const LogicalNode>(std::move(node));
   }
+  LogicalNodePtr operator()(DependentJoinNode node) const {
+    // No keys and no residual to map: a dependent join holds only its two inputs.
+    node.left = Map(node.left);
+    node.right = Map(node.right);
+    return std::make_shared<const LogicalNode>(std::move(node));
+  }
 };
 
 // The id and the position of every column reference that has an id, from the root down.
