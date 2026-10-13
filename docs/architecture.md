@@ -129,10 +129,14 @@ steps (only step 7 uses more than one thread):
    aggregation's output and becomes a `Filter` above it, with any subquery conjunct of it a join above the
    aggregation. The result is a `plan::LogicalPlan`: a tree of immutable
    nodes in a `std::variant` (`Scan`, `Filter`, `Compute`, `Project`, `Aggregate`, `GroupAggregate`, `Sort`, `Limit`,
-   `RowCount`, `Join`) plus the output columns. Every column gets a `plan::ColumnId` where it is created (a field, a computed
+   `RowCount`, `Join`, `DependentJoin`) plus the output columns. A correlated subquery binds to a `DependentJoin`,
+   whose right input reads columns of its left input as free variables (`plan::FreeVariables`).
+    Every column gets a `plan::ColumnId` where it is created (a field, a computed
    expression, an aggregate call or key, a select item), and a column reference names the column it reads by id and
    by its position in the input ([ADR 0022](adr/0022-joins-and-query-blocks.md)).
-5. Optimize (`plan::Optimize`): `COUNT(*)` without `WHERE` to `RowCount`; a `GROUP BY` key computed only from other
+5. Optimize (`plan::Optimize`, which can fail): first the unnesting pass, which replaces every `DependentJoin` with
+   ordinary joins or rejects the query with exit code 4, so no later rule and no operator meets one (ADR 0023); then
+   `COUNT(*)` without `WHERE` to `RowCount`; a `GROUP BY` key computed only from other
    (not DOUBLE) keys is dropped from the `GroupAggregate` and computed once per group above it, unless a `Limit`
    without a `Sort` reads it (ADR 0018);
    `Limit` below `Project`; and projection pruning (a `Scan` reads only the fields used above it; a `Join` asks both

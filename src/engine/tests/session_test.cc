@@ -432,6 +432,44 @@ TEST_F(SessionTest, UnsupportedAndBindErrorsKeepTheirKinds) {
   EXPECT_EQ(Rows(*count), (std::vector<std::vector<std::string>>{{"10"}}));
 }
 
+// A correlated subquery exits 4 from every entry point, not 1 and not 70 (ADR 0023's U1). Before
+// Optimize could fail, only Execute rejected what the optimizer rejects; now `explain` and
+// `explain --analyze` reject exactly what `query` does, since all three bind and optimize through
+// one path.
+TEST_F(SessionTest, CorrelatedSubqueriesAreUnsupportedInEveryEntryPoint) {
+  auto session = Session::Make().ValueOrDie();
+  ASSERT_TRUE(session->RegisterParquet("t", {path_}).ok());
+  ASSERT_TRUE(session->RegisterParquet("u", {path_}).ok());
+  for (const char* sql : {
+           // The shape the binder plans as a dependent join and the pass rejects.
+           "SELECT COUNT(*) FROM t WHERE AdvEngineID = "
+           "(SELECT MIN(u.AdvEngineID) FROM u WHERE u.AdvEngineID = t.AdvEngineID)",
+           // The shapes the binder itself rejects, each with its own rule.
+           "SELECT COUNT(*) FROM t WHERE AdvEngineID IN "
+           "(SELECT u.AdvEngineID FROM u WHERE u.AdvEngineID = t.AdvEngineID)",
+           "SELECT COUNT(*) FROM t WHERE AdvEngineID IN (SELECT t.AdvEngineID FROM u)",
+           // A lateral reference: the derived table's enclosing scope is the FROM items before it,
+           // not a query block's, so ADR 0022 refuses it (nothing pinned this before).
+           "SELECT COUNT(*) FROM t, (SELECT u.AdvEngineID FROM u "
+           "WHERE u.AdvEngineID = t.AdvEngineID) AS d",
+       }) {
+    const auto statuses = {session->Execute(sql).status(), session->Explain(sql).status(),
+                           session->ExplainAnalyze(sql).status()};
+    for (const arrow::Status& status : statuses) {
+      const auto detail = plan::GetSqlError(status);
+      ASSERT_NE(detail, nullptr) << sql << ": " << status.ToString();
+      EXPECT_EQ(detail->kind(), plan::SqlErrorDetail::Kind::kUnsupported) << sql;
+      EXPECT_TRUE(status.IsNotImplemented()) << sql << ": " << status.ToString();
+    }
+  }
+  // An uncorrelated scalar subquery still answers, through all three.
+  const char* plain =
+      "SELECT COUNT(*) FROM t WHERE AdvEngineID = (SELECT MIN(u.AdvEngineID) FROM u)";
+  EXPECT_TRUE(session->Execute(plain).ok());
+  EXPECT_TRUE(session->Explain(plain).ok());
+  EXPECT_TRUE(session->ExplainAnalyze(plain).ok());
+}
+
 // The thread count is checked; the row groups of a query run on the session's threads, and the
 // result is the same for any number of them.
 TEST_F(SessionTest, ThreadsDoNotChangeResults) {

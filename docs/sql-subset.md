@@ -60,7 +60,7 @@ SELECT date_trunc('month', tr_day) AS m, MIN(tr_fare) FROM trips GROUP BY 1 ORDE
   exits 4, `NOT (x NOT IN (query))`, `NOT NOT (x IN (query))`, two subqueries in one comparison and a subquery that
   is no direct operand among them, and so does a subquery column count
   other than one — a bind error, as in DuckDB. `EXISTS (query)` parses but is not answered,
-  and nor are `TRY_CAST`, a lateral reference, a column of an enclosing query block (a correlation), more than 256
+  and nor are `TRY_CAST`, a lateral reference, a correlated subquery, more than 256
   relations counting every sub-plan and every subquery, and a join graph that no join key connects (a cross
   product): exit code 4 as well. A query in parentheses that starts with neither
   `SELECT` nor `WITH` is refused at its first token: in an expression `(FROM t)` and `(TABLE t)` are, since those
@@ -283,8 +283,14 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   comparison rejects, and `COUNT` is 0, which it compares as usual; both as in DuckDB. The join sits above its
   block's inner joins, or above the aggregation for a `HAVING` conjunct, in the order the conjuncts are written. An
   `IN` query may have its own `GROUP BY` and `HAVING`, and nothing is pulled out of it; an aggregate inside any
-  subquery does not make the outer block an aggregate query. A column of an enclosing block (a correlation) is exit
-  code 4, and a column count other than one a bind error;
+  subquery does not make the outer block an aggregate query. A column count other than one is a bind error.
+  A **correlated** subquery -- one that reads a column of the block enclosing it -- is exit code 4, at the subquery
+  for a scalar one under a comparison, which the binder plans as a dependent join that the optimizer's unnesting pass
+  then rejects ([ADR 0023](adr/0023-unnesting.md)), and at the `IN` for a correlated `IN` or `NOT IN`, whose NULL
+  semantics need the set's NULL and empty flags for each binding. An outer reference is read only in a `WHERE`
+  conjunct of the subquery's own block, an inner join's `ON` included, and only one block out; in a select list,
+  `GROUP BY`, `ORDER BY`, `HAVING` or a `LEFT JOIN`'s `ON`, further out, or in a derived table or a CTE (a lateral
+  reference) it is exit code 4 at the reference, each with its own message;
 - any of these in parentheses (`(a)`, `SUM((a))`, `WHERE (a = 1 AND b = 2)`), which group without changing
   anything.
 
