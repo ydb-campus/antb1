@@ -723,6 +723,9 @@ constexpr uint64_t kSubstringStreamSalt = 0x7375627374722D72ULL;
 // EXISTS and the share that add a non-equality residual to the key.
 constexpr unsigned kCorrelatedPercent = 30;
 constexpr unsigned kNotExistsPercent = 40;
+// Share of the correlated conjuncts that are an aggregate under a comparison (ADR 0023's Path 2)
+// rather than [NOT] EXISTS (Path 1), where the candidate admits one.
+constexpr unsigned kCorrelatedAggregatePercent = 45;
 constexpr unsigned kCorrelatedResidualPercent = 35;
 // Salt of the seventh random stream, which every draw that only a correlated subquery needs takes,
 // so that a query without one is the query this seed generated before the correlated PR.
@@ -2130,7 +2133,13 @@ class Builder {
         Keyword("AND");
       }
       used_.Add(Feature::kWhere);
-      CorrelatedExists(corr[corr_rng_.Below(corr.size())]);
+      const CorrelatedCandidate& c = corr[corr_rng_.Below(corr.size())];
+      // The aggregate form where this candidate admits one, else the EXISTS form, which every
+      // candidate admits.
+      if (!allowed_.Has(Feature::kCorrelatedAggregate) ||
+          !corr_rng_.Percent(kCorrelatedAggregatePercent) || !CorrelatedAggregate(c)) {
+        CorrelatedExists(c);
+      }
     }
   }
 
@@ -2212,6 +2221,73 @@ class Builder {
       OuterColumn(c);
     }
     Symbol(")");
+  }
+
+  // Whether a correlated block may aggregate `arg` with `agg` and compare the result with a
+  // literal exactly in both engines. Orderable's rule, plus AVG of a DECIMAL: ADR 0021 rule 13
+  // makes a DECIMAL AVG agree bit for bit, while an integer or DOUBLE one divides to a double and
+  // is only accurate to about one ulp -- which a value test tolerates and a WHERE comparison,
+  // deciding row membership, does not. Orderable itself is left alone: widening it would move
+  // every existing HAVING and ORDER BY seed.
+  static bool CorrelatedAggregateFits(Agg agg, const GenColumn* arg) {
+    if (agg == Agg::kAvg) {
+      return arg != nullptr && arg->kind == ValueKind::kDecimal;
+    }
+    return (agg == Agg::kSum || agg == Agg::kMin || agg == Agg::kMax) && Orderable(agg, arg);
+  }
+
+  // `<lit> <op> (SELECT <AGG>(inner.c) FROM inner WHERE inner.k = outer.k)`, or the mirror, ADR
+  // 0023's Path 2: an ungrouped aggregate under a NULL-rejecting comparison that is a top-level
+  // WHERE conjunct, correlated through one equality of two columns of one type. The other operand
+  // is a literal: comparing against an outer column needs a result-type rule for divergence D13
+  // that the generator does not have, and the hand-written .slt records cover that shape.
+  // Returns whether it wrote one.
+  bool CorrelatedAggregate(const CorrelatedCandidate& c) {
+    std::vector<std::pair<Agg, const GenColumn*>> calls;
+    for (const Agg agg : {Agg::kSum, Agg::kAvg, Agg::kMin, Agg::kMax}) {
+      if (!allowed_.Has(AggFeature(agg))) {
+        continue;
+      }
+      for (const GenColumn& arg : c.inner->columns) {
+        if (CorrelatedAggregateFits(agg, &arg) &&
+            CanLiteral(ValuesOf(c.inner->rows, agg, &arg).kind)) {
+          calls.emplace_back(agg, &arg);
+        }
+      }
+    }
+    if (calls.empty()) {
+      return false;
+    }
+    const auto [agg, arg] = calls[corr_rng_.Below(calls.size())];
+    const Literal lit = MakeLiteral(corr_rng_, ValuesOf(c.inner->rows, agg, arg));
+    const std::string_view op = corr_rng_.Pick(kOps);
+    const bool literal_first = corr_rng_.Percent(50);
+    used_.Add(Feature::kCorrelatedAggregate);
+    used_.Add(AggFeature(agg));
+    used_.Add(lit.features);
+    if (literal_first) {
+      tokens_.insert(tokens_.end(), lit.tokens.begin(), lit.tokens.end());
+      Symbol(std::string(Flip(op)));
+    }
+    Symbol("(");
+    Keyword("SELECT");
+    Keyword(AggName(agg));
+    Symbol("(");
+    InnerColumn(c, *arg);
+    Symbol(")");
+    Keyword("FROM");
+    used_.Add(Feature::kTableName);
+    tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.inner->name});
+    Keyword("WHERE");
+    InnerColumn(c, *c.inner_key);
+    Symbol("=");
+    OuterColumn(c);
+    Symbol(")");
+    if (!literal_first) {
+      Symbol(std::string(op));
+      tokens_.insert(tokens_.end(), lit.tokens.begin(), lit.tokens.end());
+    }
+    return true;
   }
 
   // One top-level conjunct: `probe [NOT] IN (block)`, `NOT (probe IN (block))`, or

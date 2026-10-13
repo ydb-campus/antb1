@@ -1695,6 +1695,51 @@ TEST(QueryGenerator, CorrelatedExistsWritesAKeyAndAnOptionalResidual) {
   EXPECT_LT(negated, exists) << "both polarities";
 }
 
+// The Path 2 form: an ungrouped SUM, AVG, MIN or MAX over the inner table, correlated through the
+// key and compared with a literal in either order. AVG appears only over a DECIMAL argument, where
+// ADR 0021 rule 13 makes the two engines agree bit for bit.
+TEST(QueryGenerator, CorrelatedAggregateComparesALiteralInEitherOrder) {
+  const FeatureSet plain =
+      Union(kSupportedFeatures, {Feature::kCorrelatedExists, Feature::kCorrelatedAggregate})
+          .Minus({Feature::kLayout, Feature::kKeywordCase});
+  const auto gen = MakeOver(JoinTables(), 71, {.supported = plain, .target_percent = 0});
+  int calls = 0;
+  int literal_first = 0;
+  int avg = 0;
+  for (uint64_t i = 0; i < 4000; ++i) {
+    const auto q = gen.Generate(i);
+    if (!q.features.Has(Feature::kCorrelatedAggregate)) {
+      continue;
+    }
+    ++calls;
+    const std::size_t at = q.sql.find("(SELECT ");
+    ASSERT_NE(at, std::string::npos) << q.sql;
+    // Ungrouped: the block holds one aggregate, one FROM and the key, and no GROUP BY.
+    const std::string block = q.sql.substr(at, q.sql.find(')', q.sql.find(" WHERE ", at)) - at);
+    EXPECT_EQ(block.find("GROUP BY"), std::string::npos) << q.sql;
+    EXPECT_NE(block.find(" WHERE "), std::string::npos) << q.sql;
+    // Either order. Subquery first when the conjunct opens with it, so what precedes is the AND or
+    // the WHERE; literal first when an operator does, which the generator mirrored.
+    const std::string before = q.sql.substr(0, at);
+    const bool subquery_first = before.ends_with("AND ") || before.ends_with("AND") ||
+                                before.ends_with("WHERE ") || before.ends_with("WHERE");
+    if (!subquery_first) {
+      ++literal_first;
+    }
+    if (block.find("AVG(") != std::string::npos) {
+      ++avg;
+    }
+    EXPECT_FALSE(q.features.Has(Feature::kInSubquery)) << q.sql;
+    EXPECT_FALSE(q.features.Has(Feature::kScalarSubquery)) << q.sql;
+  }
+  EXPECT_GT(calls, 150) << "calls: " << calls;
+  EXPECT_GT(literal_first, 20) << "literal_first: " << literal_first;
+  EXPECT_LT(literal_first, calls) << "both orders";
+  // AVG is generated, and only over a DECIMAL argument -- CorrelatedAggregateFits is what enforces
+  // the type, and the differential runs are what would catch it if the rule were wrong.
+  EXPECT_GT(avg, 0) << "avg: " << avg;
+}
+
 // What it writes, with the layout and keyword-case features off so the call is one span of text:
 // both spellings, the two- and three-argument forms, and a negative start or length.
 TEST(QueryGenerator, SubstringWritesBothSpellingsAndNegativePositions) {
