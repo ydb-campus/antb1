@@ -4,7 +4,7 @@ Date: 2026-10-02
 
 ## Status
 
-Proposed
+Accepted (with the maintainer-approved roadmap for joins, query blocks and uncorrelated subqueries)
 
 ## Context
 
@@ -353,8 +353,8 @@ Proposed
     type is DOUBLE) exits 4, as a disconnected inner graph does: E1's table and E2's candidate pairs need a key.
   - A WHERE conjunct that reads only the preserved side goes below the join as usual; one that reads the
     null-supplying side stays above it. There is no LEFT-to-INNER conversion under a NULL-rejecting WHERE.
-  - No join is reordered across a LEFT JOIN, and its ON equalities never feed equivalence classes (ADR 0023 builds
-    those from WHERE equalities only).
+  - No join is reordered across a LEFT JOIN, and its ON equalities never feed equivalence classes (ADR 0023's U3
+    builds those from the correlated conjuncts alone, which excludes a LEFT JOIN's ON by construction).
 - **Sub-plans (J4, decision C8).**
   - Each derived table and each CTE reference is bound as its own sub-plan with its own scope, and is one binding of
     its block. A CTE referenced twice is bound twice and scanned twice, as ADR 0013 scans a table that two pipelines
@@ -796,3 +796,8 @@ docs/sql-subset.md sections it changes.
 
 This workload is derived from the TPC-H Benchmark and is not comparable to published TPC-H Benchmark results, as
 this implementation does not comply with all requirements of the TPC-H Benchmark.
+
+- Update (2026-10-14, A1): **all 22 pass.** The counts above are this ADR's own roadmap, which ended at 16 of 22;
+  ADR 0023's U2 and U3 then unnested the six correlated queries, and `tests/data/tpch_status.json` lists all 22. The
+  Context's "exits 4 today" and the Consequences' "what passes when" are the record of 2026-10-02 and are left as
+  written, as an ADR's are.

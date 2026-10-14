@@ -4,7 +4,7 @@ Date: 2026-09-28
 
 ## Status
 
-Proposed
+Accepted (with the maintainer-approved plan for parallel execution over row groups)
 
 ## Context
 
@@ -79,7 +79,8 @@ Proposed
     library default stays 1, so embedders and the test harnesses are single-threaded unless they ask; the `parallel`
     label uses 4.
   - The CLI gets `--threads` for `query` and `bench`, and `antb1 bench` records the count in its JSON. `explain`
-    prints the logical plan and executes nothing, so it has no `--threads`.
+    prints the logical plan and executes nothing, so it needs no `--threads` -- until ADR 0015 gives it
+    `--analyze`, which runs the query, and with it `--threads` and `--memory-limit`.
   - Arrow compute kernels keep running inline (no nested parallelism), each worker with its own `compute::ExecContext`.
   - I/O stays synchronous inside a part (no pre-buffering), so memory is about one row group per busy thread plus the
     window.
@@ -205,3 +206,9 @@ subqueries; both amend this section where marked.
   pull-versus-push question is answered for joins (amended 2026-10-02, ADR 0022): pull pipelines stay. Builds are
   prepared on the consumer thread in post-order before the probe's scheduler starts, never from a part task, and
   there are no exchange operators.
+
+- Update (2026-10-14, A1): **ADR 0003 stays Proposed.** The bullet above promised it would move with this one, and
+  roadmap PR A1 does not move it: decision C14 names ADRs 0013, 0021, 0022 and 0023 and no other, and ADR 0003's own
+  update records that its open questions "have since been settled, with no status change here" while spilling stays
+  open. Parallelism is settled for ADR 0003's purposes either way; what is deliberately not settled is the rest of
+  it.

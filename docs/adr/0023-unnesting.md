@@ -4,7 +4,7 @@ Date: 2026-10-02
 
 ## Status
 
-Proposed
+Accepted (decision C14, once all 22 queries derived from TPC-H passed)
 
 ## Context
 
@@ -163,14 +163,19 @@ work: mark and single dependent-join kinds, and lifting those rejections.
   none of its columns, and the conjuncts of the block's top filter move into the join, which becomes a semi join
   (EXISTS) or a plain anti join (NOT EXISTS, which has no NULL case, unlike NOT IN). Its build side is the subquery
   (ADR 0022). Each conjunct goes by the columns it reads:
-  - **Keys:** an equality between a side that reads only inner columns and a side that reads only outer columns,
-    whose common type is not DOUBLE, is a key, both sides cast to that type as in ADR 0022 (`t.k = o.k`).
+  - **Keys:** an equality between a plain column of the inner block and a plain column of the outer one, whose
+    common type is not DOUBLE, is a key, both sides cast to that type as in ADR 0022 (`t.k = o.k`). An equality over
+    an expression stays a residual, which is always correct and never wrong; where it is the only correlation the
+    query has no key and exits 4.
   - **Residuals:** every other conjunct that reads inner and outer columns (a non-equality such as `t.x < o.x`, an OR,
     an equality whose common type is DOUBLE, a side that reads both) is a residual, evaluated over the candidate pairs
     (roadmap PR E2). The build then keeps every row, duplicate keys included.
-  - **Outer-only conjuncts** stay residuals of an anti join. Where such a conjunct is false or NULL, the subquery has
-    no row and NOT EXISTS keeps the outer row; a filter on the outer rows would drop it. In an EXISTS the same
-    reasoning makes them a filter on the outer rows, below the semi join, on its probe side.
+  - **Outer-only conjuncts** stay residuals, of an anti join and of a semi join alike. Where such a conjunct is
+    false or NULL, the subquery has no row and NOT EXISTS keeps the outer row; a filter on the outer rows would drop
+    it. An EXISTS could take the same conjunct as a filter below the semi join, which gives the same answer and drops
+    the rows earlier, and U2 does not: computing it on the probe side adds a column to the semi join's output, which
+    breaks `plan::Optimize`'s contract that a plan keeps its output columns and would need a Project to undo. Pushing
+    it down is a performance refinement, registered as divergence D23 in docs/sql-subset.md.
   - **Inner-only conjuncts** stay where the binder put them, below the build.
 - **At least one key.** A correlated EXISTS or NOT EXISTS without a key exits 4, as a LEFT JOIN without one does in
   ADR 0022: the join hash table and the candidate pairs need a key.
@@ -193,8 +198,14 @@ DependentJoin anti                               Join anti  keys o.k = t.k  resi
 
 ### Path 2: equivalence substitution (scalar aggregates, U3)
 
-- **Equivalence classes:** a union-find over column ids, built from the equalities between two columns among the WHERE
-  conjuncts of the subquery's block (an inner join's ON conjuncts included). These are NULL-rejecting: in every row that
+- **Equivalence classes:** a union-find over column ids, built from the equalities between two columns among the
+  correlated WHERE conjuncts of the subquery's block -- the conjuncts of the one filter the binder puts at the top of
+  it. U3 takes those alone, where this ADR as first written took every equality of the block, an inner join's ON
+  conjuncts included. Acceptance is the same either way, since an inner-inner equality can only extend a class that
+  already holds an inner member and so never gives an outer column its first inner equivalent; what the narrowing
+  rules out is two silent wrong answers, a LEFT JOIN's ON key (not enforced on padded rows, so the group key would be
+  non-NULL exactly where the correlation was NULL) and a conjunct of a nested dependent join (an anti join keeps the
+  rows where it is false). These are NULL-rejecting: in every row that
   the WHERE keeps, the columns of a class are equal and not NULL. Only an equality between two columns of the same type
   feeds a class. An inner equivalent of another type would change the type of every expression that reads the outer
   column, and with it the overflow checks (an INTEGER product would be computed in BIGINT), and casting it to the outer
@@ -214,9 +225,9 @@ DependentJoin anti                               Join anti  keys o.k = t.k  resi
   conjuncts read inner columns only and stay below the aggregation; an equality that became `c = c` is dropped, since
   it only removes rows whose `c` is NULL, a group that no outer row can match. The aggregation groups by the inner
   equivalents. The one-row dependent join becomes an inner join with one key per outer column, the outer column equal
-  to its inner equivalent, and its build side follows ADR 0022's rule for inner joins. The comparison above it reads
-  both inputs, so by ADR 0022's classification it becomes a residual, or another key when it is an equality whose
-  common type is not DOUBLE.
+  to its inner equivalent, and its build side follows ADR 0022's rule for inner joins. The comparison above it
+  stays in the filter the binder put it in, above the new join: an inner join gives the same answer either way, and
+  leaving it alone keeps the rewrite to the nodes it has to touch.
 - **Why the rewrite is exact.** Take an outer row whose correlated columns are not NULL. A row of the subquery passes
   its WHERE for that outer row exactly when it passes the rewritten WHERE and its inner equivalents equal the outer
   values, because the classes come from those very equalities, and an inner equivalent of the same type and value leaves
