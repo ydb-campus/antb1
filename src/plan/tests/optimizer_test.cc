@@ -713,7 +713,8 @@ TEST(OptimizerTest, EmptyPlanStaysEmpty) {
 // never a bind error (1) or an internal error (70). No other rule runs on a rejected plan.
 TEST(OptimizerTest, TheUnnestingPassRejectsWhatNeitherPathFits) {
   const SourceSpan span{.offset = 13, .length = 5};
-  // A one-row dependent join waits for Path 2 (roadmap id U3), and keeps U1's message.
+  // Path 2 takes a one-row dependent join, and declines a right input that is not the ungrouped
+  // aggregate over a correlation it knows: a bare Scan is not one.
   const auto one_row = Optimize(PlanOver(Node(DependentJoinNode{.kind = JoinKind::kOneRow,
                                                                 .left = FourFields(1),
                                                                 .right = FourFields(11),
@@ -722,7 +723,9 @@ TEST(OptimizerTest, TheUnnestingPassRejectsWhatNeitherPathFits) {
   ASSERT_NE(GetSqlError(one_row), nullptr) << one_row.ToString();
   EXPECT_EQ(GetSqlError(one_row)->kind(), SqlErrorDetail::Kind::kUnsupported);
   EXPECT_EQ(GetSqlError(one_row)->span(), span) << "the subquery, not the whole query";
-  EXPECT_EQ(one_row.message(), "a correlated subquery is not supported");
+  EXPECT_EQ(one_row.message(),
+            "a correlated scalar subquery over a block that is not an ungrouped aggregate over "
+            "its correlation is not supported");
 
   // Path 1 takes a semi or anti one, and declines a right input that is not a block it knows:
   // a bare Scan has no filter of correlated conjuncts.

@@ -385,6 +385,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kInSubquery,
     Feature::kScalarSubquery,
     Feature::kCorrelatedExists,
+    Feature::kCorrelatedAggregate,
 };
 static_assert(kSupportedFeatures.Minus(kNeverGenerated) == kSupportedFeatures,
               "kSupportedFeatures must not declare an out-of-scope marker (kNeverGenerated)");
