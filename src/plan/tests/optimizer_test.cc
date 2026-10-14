@@ -711,28 +711,146 @@ TEST(OptimizerTest, EmptyPlanStaysEmpty) {
 // The unnesting pass, the first and only fallible step (ADR 0023). U1 has no rewrite, so it rejects
 // every dependent join: kUnsupported at the subquery's span, which the CLI turns into exit code 4,
 // never a bind error (1) or an internal error (70). No other rule runs on a rejected plan.
-TEST(OptimizerTest, TheUnnestingPassRejectsEveryDependentJoin) {
+TEST(OptimizerTest, TheUnnestingPassRejectsWhatNeitherPathFits) {
   const SourceSpan span{.offset = 13, .length = 5};
-  for (const JoinKind kind : {JoinKind::kSemi, JoinKind::kAnti, JoinKind::kOneRow}) {
+  // A one-row dependent join waits for Path 2 (roadmap id U3), and keeps U1's message.
+  const auto one_row = Optimize(PlanOver(Node(DependentJoinNode{.kind = JoinKind::kOneRow,
+                                                                .left = FourFields(1),
+                                                                .right = FourFields(11),
+                                                                .span = span})))
+                           .status();
+  ASSERT_NE(GetSqlError(one_row), nullptr) << one_row.ToString();
+  EXPECT_EQ(GetSqlError(one_row)->kind(), SqlErrorDetail::Kind::kUnsupported);
+  EXPECT_EQ(GetSqlError(one_row)->span(), span) << "the subquery, not the whole query";
+  EXPECT_EQ(one_row.message(), "a correlated subquery is not supported");
+
+  // Path 1 takes a semi or anti one, and declines a right input that is not a block it knows:
+  // a bare Scan has no filter of correlated conjuncts.
+  for (const JoinKind kind : {JoinKind::kSemi, JoinKind::kAnti}) {
     const auto status =
         Optimize(PlanOver(Node(DependentJoinNode{
                      .kind = kind, .left = FourFields(1), .right = FourFields(11), .span = span})))
             .status();
-    const auto detail = GetSqlError(status);
-    ASSERT_NE(detail, nullptr) << ToString(kind) << ": " << status.ToString();
-    EXPECT_EQ(detail->kind(), SqlErrorDetail::Kind::kUnsupported);
-    EXPECT_EQ(detail->span(), span) << "the subquery, not the whole query";
-    EXPECT_EQ(status.message(), "a correlated subquery is not supported");
+    ASSERT_NE(GetSqlError(status), nullptr) << ToString(kind) << ": " << status.ToString();
+    EXPECT_EQ(GetSqlError(status)->kind(), SqlErrorDetail::Kind::kUnsupported);
+    EXPECT_EQ(GetSqlError(status)->span(), span);
+    EXPECT_EQ(status.message(),
+              std::format("a correlated {} over a block that is not a plain FROM and WHERE is not "
+                          "supported",
+                          kind == JoinKind::kSemi ? "EXISTS" : "NOT EXISTS"));
   }
-  // Outermost first: the span is the outer subquery's, whichever input holds the inner one.
-  const SourceSpan inner{.offset = 40, .length = 2};
-  const auto nested = Node(DependentJoinNode{
-      .kind = JoinKind::kSemi, .left = FourFields(21), .right = FourFields(31), .span = inner});
+}
+
+// ---- ADR 0023's Path 1 (roadmap id U2) ----
+
+// A correlated subquery's block as the binder leaves it: the inner Scan under a Compute that
+// evaluates the correlated conjuncts and a Filter that tests them, which is where the pass looks.
+// `conjuncts` are the PredicateExprs, one per correlated conjunct.
+LogicalNodePtr CorrelatedBlock(std::vector<ExprPtr> conjuncts, std::uint32_t first_id) {
+  std::vector<ColumnId> ids;
+  std::vector<Predicate> predicates;
+  for (std::size_t i = 0; i < conjuncts.size(); ++i) {
+    ids.push_back(ColumnId{first_id + static_cast<std::uint32_t>(i)});
+    predicates.push_back(Predicate{
+        .kind = Predicate::Kind::kIsTrue,
+        .column = BoundColumn{.id = ids.back(), .name = "c", .type = LogicalType::kBoolean}});
+  }
+  return Node(FilterNode{
+      .input = Node(ComputeNode{
+          .input = FourFields(11), .exprs = std::move(conjuncts), .ids = std::move(ids)}),
+      .predicates = std::move(predicates)});
+}
+
+// `left <op> right` as the binder writes a correlated conjunct: a PredicateExpr whose operands
+// carry the ids and whose own column is operand-local.
+ExprPtr Compare(const BoundColumn& left, const BoundColumn& right, CompareOp op) {
+  const auto leaf = [](const BoundColumn& c) {
+    return std::make_shared<const Expr>(
+        Expr{.node = ColumnExpr{.id = c.id}, .type = c.type, .name = c.name});
+  };
+  return std::make_shared<const Expr>(
+      Expr{.node = PredicateExpr{.predicate = Predicate{.kind = Predicate::Kind::kCompareColumns,
+                                                        .column = BoundColumn{},
+                                                        .other = BoundColumn{},
+                                                        .op = op},
+                                 .operands = {leaf(left), leaf(right)}},
+           .type = LogicalType::kBoolean,
+           .name = "cmp"});
+}
+
+// The pull-up: the block's conjunct becomes the join's key, the dependent join becomes a semi or
+// anti join building on the subquery, and the block's own nodes below the filter are kept.
+TEST(OptimizerTest, Path1PullsACorrelatedEqualityIntoTheJoinKey) {
+  for (const JoinKind kind : {JoinKind::kSemi, JoinKind::kAnti}) {
+    // t11.i32 = t1.i32: one type on both sides, so the key needs no cast.
+    const LogicalPlan plan = Optimized(PlanOver(Node(DependentJoinNode{
+        .kind = kind,
+        .left = FourFields(1),
+        .right = CorrelatedBlock({Compare(FieldOf(11, 1), FieldOf(1, 1), CompareOp::kEq)}, 50),
+        .span = {}})));
+    const auto* join = std::get_if<JoinNode>(plan.root.get());
+    ASSERT_NE(join, nullptr) << Explain(plan);
+    EXPECT_EQ(join->kind, kind);
+    EXPECT_EQ(join->build, BuildSide::kRight) << "the subquery builds (ADR 0022)";
+    ASSERT_EQ(join->keys.size(), 1U) << Explain(plan);
+    EXPECT_EQ(join->keys[0].left.id, FieldOf(1, 1).id) << "the outer side";
+    EXPECT_EQ(join->keys[0].right.id, FieldOf(11, 1).id) << "the inner side";
+    EXPECT_TRUE(join->residual.empty()) << Explain(plan);
+    // The block's filter and compute are gone; its scan is the join's right input.
+    EXPECT_TRUE(std::holds_alternative<ScanNode>(*join->right)) << Explain(plan);
+    EXPECT_EQ(PositionMismatch(plan), std::nullopt) << Explain(plan);
+  }
+}
+
+// A conjunct that reads both sides and is no key becomes a residual, evaluated over the candidate
+// pairs; the equality still has to be there, since a correlated EXISTS without a key exits 4.
+TEST(OptimizerTest, Path1MakesANonEqualityAResidual) {
+  const LogicalPlan plan = Optimized(PlanOver(Node(DependentJoinNode{
+      .kind = JoinKind::kSemi,
+      .left = FourFields(1),
+      .right = CorrelatedBlock({Compare(FieldOf(11, 1), FieldOf(1, 1), CompareOp::kEq),
+                                Compare(FieldOf(11, 2), FieldOf(1, 2), CompareOp::kLt)},
+                               50),
+      .span = {}})));
+  const auto* join = std::get_if<JoinNode>(plan.root.get());
+  ASSERT_NE(join, nullptr) << Explain(plan);
+  EXPECT_EQ(join->keys.size(), 1U);
+  EXPECT_EQ(join->residual.size(), 1U) << Explain(plan);
+  EXPECT_EQ(PositionMismatch(plan), std::nullopt) << Explain(plan);
+}
+
+// Sides of two types are cast to their common one, each on its own side of the join, as ADR 0022's
+// keys are: ResolvePositions requires a key's two sides to have one type.
+TEST(OptimizerTest, Path1CastsAKeyOfTwoTypes) {
+  // t11.i16 is SMALLINT and t1.i32 is INTEGER, so both become INTEGER.
+  const LogicalPlan plan = Optimized(PlanOver(Node(DependentJoinNode{
+      .kind = JoinKind::kSemi,
+      .left = FourFields(1),
+      .right = CorrelatedBlock({Compare(FieldOf(11, 0), FieldOf(1, 1), CompareOp::kEq)}, 50),
+      .span = {}})));
+  const auto* join = std::get_if<JoinNode>(plan.root.get());
+  ASSERT_NE(join, nullptr) << Explain(plan);
+  ASSERT_EQ(join->keys.size(), 1U) << Explain(plan);
+  EXPECT_EQ(join->keys[0].left.type, join->keys[0].right.type) << "one type on both sides";
+  EXPECT_EQ(join->keys[0].right.type, LogicalType::kInteger);
+  // The cast is computed on the inner side, above the scan.
+  EXPECT_TRUE(std::holds_alternative<ComputeNode>(*join->right)) << Explain(plan);
+  EXPECT_EQ(PositionMismatch(plan), std::nullopt) << Explain(plan);
+}
+
+// Without a key the pass refuses: the hash table and the candidate pairs need one (ADR 0023).
+TEST(OptimizerTest, Path1RefusesABlockWithoutAKey) {
   const auto status =
       Optimize(PlanOver(Node(DependentJoinNode{
-                   .kind = JoinKind::kSemi, .left = FourFields(1), .right = nested, .span = span})))
+                   .kind = JoinKind::kSemi,
+                   .left = FourFields(1),
+                   .right = CorrelatedBlock(
+                       {Compare(FieldOf(11, 1), FieldOf(1, 1), CompareOp::kLt)}, 50),
+                   .span = {}})))
           .status();
-  EXPECT_EQ(GetSqlError(status)->span(), span);
+  ASSERT_NE(GetSqlError(status), nullptr) << status.ToString();
+  EXPECT_EQ(GetSqlError(status)->kind(), SqlErrorDetail::Kind::kUnsupported);
+  EXPECT_EQ(status.message(), "a correlated EXISTS without a key is not supported");
 }
 
 // A plan with no dependent join is unaffected: the pass is an identity and the other rules run.

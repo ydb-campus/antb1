@@ -1022,6 +1022,15 @@ class Resolver {
 
 std::vector<ColumnId> OutputIds(const LogicalNode& node) { return std::visit(OutputIdsOf{}, node); }
 
+ColumnId MaxColumnId(const LogicalNode& node) {
+  std::set<ColumnId> reads;
+  std::set<ColumnId> defines;
+  CollectIds(node, reads, defines);
+  const ColumnId read = reads.empty() ? kNoColumnId : *reads.rbegin();
+  const ColumnId defined = defines.empty() ? kNoColumnId : *defines.rbegin();
+  return std::max(read, defined);
+}
+
 std::vector<ColumnId> FreeVariables(const LogicalNode& node) {
   std::set<ColumnId> reads;
   std::set<ColumnId> defines;
