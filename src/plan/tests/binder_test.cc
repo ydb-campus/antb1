@@ -946,6 +946,27 @@ INSTANTIATE_TEST_SUITE_P(
                   "(SELECT i16 FROM ok WHERE i16 = t.i64))",
                   kUnsupported, "t.i64",
                   "a qualified column of a query block further out than the enclosing one"},
+        // Two shapes that aborted the process until the binder refused them (ADR 0023). Both
+        // became reachable when U1 made an outer reference resolve instead of refusing at once.
+        // A correlated subquery in HAVING: the clause gate cannot catch it, since the reference
+        // sits in the WHERE of the subquery's own block while this block's HAVING holds the
+        // subquery, and the dependent join would be stacked above the aggregation, whose output
+        // does not define the free variable.
+        ErrorCase{"SELECT i32 FROM t GROUP BY i32 HAVING MIN(i16) = "
+                  "(SELECT MIN(u.i16) FROM u WHERE u.i32 = t.i32)",
+                  kUnsupported, "(", "a correlated subquery in HAVING is not supported"},
+        // A conjunct that is both a subquery conjunct and a reader of an enclosing block's column:
+        // the subquery route binds the other side as an ordinary expression and the correlated
+        // route binds the whole conjunct as a condition, whose expression visitors abort on a
+        // subquery, so neither can take it.
+        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT MIN(u.i16) FROM u WHERE "
+                  "t.i64 = (SELECT MIN(ok.i16) FROM ok))",
+                  kUnsupported, "(",
+                  "a subquery whose conjunct also reads a column of an enclosing query block"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT MIN(u.i16) FROM u WHERE "
+                  "t.i64 IN (SELECT ok.i16 FROM ok))",
+                  kUnsupported, "IN",
+                  "a subquery whose conjunct also reads a column of an enclosing query block"},
         // A name this block has twice keeps its own bind error: an enclosing block that happens to
         // have it must not turn an ambiguous name into a refusal (nor, once a correlated subquery
         // binds, make it read the outer column).

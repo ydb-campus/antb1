@@ -287,7 +287,10 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   A **correlated** subquery -- one that reads a column of the block enclosing it -- is exit code 4, at the subquery
   for a scalar one under a comparison, which the binder plans as a dependent join that the optimizer's unnesting pass
   then rejects ([ADR 0023](adr/0023-unnesting.md)), and at the `IN` for a correlated `IN` or `NOT IN`, whose NULL
-  semantics need the set's NULL and empty flags for each binding. An outer reference is read only in a `WHERE`
+  semantics need the set's NULL and empty flags for each binding; at the subquery for one in `HAVING`, whose outer
+  references would read the outer block's groups and not its rows; and at the subquery for a conjunct that is both a
+  subquery conjunct and a reader of an enclosing block's column, which neither unnesting path handles. An outer
+  reference is read only in a `WHERE`
   conjunct of the subquery's own block, an inner join's `ON` included, and only one block out; in a select list,
   `GROUP BY`, `ORDER BY`, `HAVING` or a `LEFT JOIN`'s `ON`, further out, or in a derived table or a CTE (a lateral
   reference) it is exit code 4 at the reference, each with its own message;
