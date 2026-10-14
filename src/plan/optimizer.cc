@@ -5,8 +5,12 @@
 #include <format>
 #include <map>
 #include <memory>
+#include <optional>
+#include <ranges>
 #include <set>
 #include <string>
+#include <string_view>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>

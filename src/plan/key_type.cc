@@ -4,6 +4,7 @@
 #include <format>
 #include <memory>
 #include <optional>
+#include <string>
 
 #include "antb1/common/narrow.h"
 #include "antb1/plan/logical_plan.h"
