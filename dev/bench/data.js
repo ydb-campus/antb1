@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791982449665,
+  "lastUpdate": 1791989778616,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -7560,6 +7560,114 @@ window.BENCHMARK_DATA = {
             "value": 164.68999375000237,
             "unit": "ms/iter",
             "extra": "iterations: 4\ncpu: 164.67743050000027 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "18083379865d328dba91ae2ea44b75e0d3317927",
+          "message": "fix(plan): finish Path 1's EXPLAIN names and the star rule it skipped (#137)\n\n## Summary\n\nThree things U2 (#135) and U3 (#136) left undone. None was caught by a\ngate — all three surfaced\nwhile verifying the four ADRs before proposing to accept them (roadmap\nid A1).\n\n**1. Every correlated `EXISTS` printed placeholder key names.**\n\n```text\nbefore:  Join SEMI build=right keys=[outer = inner]\nafter:   Join SEMI build=right keys=[\"trips.tr_rider\" = \"riders.rd_id\"]\n```\n\nPath 1 passed the literal strings `\"outer\"` and `\"inner\"` as the key\ncolumns' names, so a widened\nkey would have rendered `CAST(outer AS BIGINT)` too. The names the\nbinder gave each side live in the\nconjunct's own predicate, positionally — which is exactly where Path 2\nalready reads them, and why\nPath 2's EXPLAIN was correct all along.\n\n**2. The `*`-inside-`EXISTS` rule was never implemented.** ADR 0023's\nPath 1 says a `*` there is\n\"checked but not expanded … a table with a column of a type that antb1\ncannot read still works\nthere\". U2 skipped it, and the expansion is the only place a column's\nengine type is checked, so\n`EXISTS (SELECT * FROM t …)` over such a table exited 4 where the ADR\npromises an answer. The block\nof an `EXISTS` conjunct now knows it is one: it keeps ADR 0022's rule 5\ncheck and skips the\nexpansion.\n\n**3. The SQL contract doc was wrong on `main`.** `docs/sql-subset.md`\nstill told a reader that\n`EXISTS (query)` \"is not answered\" and that a correlated subquery \"is\nexit code 4\". U2 and U3\nupdated the divergence table and the TPC-H status table but not the\nprose that states the contract —\nwhich ADR 0023 obliges each of its PRs to do. It now says which\ncorrelated shapes are answered and\nhow, and which are still exit 4.\n\n## Type of change\n\n- [ ] feat / perf\n- [x] fix: bug fix\n- [ ] refactor, test, docs, build, ci or chore\n\n## Verification\n\n```text\n$ pixi run ci\n100% tests passed out of 2681          (2680 before, +1 test)\n\n$ pixi run diff-random\nDIFF: PASS seed=20261005 queries=400 failed=0 unsupported=0\n\n$ pixi run tidy        (per file over every changed TU)\n0 findings\n\n$ pixi run lint\nevery hook Passed except shellcheck, which fails identically on main\n```\n\nThe `-Werror` leg caught a shadowed lambda parameter that the dev preset\ndoes not raise; fixed here.\nInclude hygiene was audited by hand again, since the GCC leg cannot run\non this machine.\n\n## Tests\n\n`BinderTest.AStarInsideExistsIsCheckedButNotExpanded`: an `EXISTS` over\na table with an unreadable\ncolumn binds and resolves, while the same `*` outside `EXISTS` stays\nexit 4 (already pinned at\n`binder_test.cc:204`), and ADR 0022's rule 5 still makes an ambiguous\n`*` a bind error inside\n`EXISTS`.\n\nThe EXPLAIN names are covered by the existing plan tests, which now read\nthe real column names.\n\n## Maintainer notes\n\n- **Why these were not caught.** All three are invisible to the gates:\nthe key names are cosmetic so\nno answer changed; the `*` rule is a refusal where an answer was\npromised, and exit 4 is always\npermitted so no test failed; and the prose is prose. Verification\nagainst the ADR text is what\nfound them, which is an argument for doing that before accepting an ADR\nrather than after.\n- **This unblocks A1.** Accepting ADR 0023 while the `*` rule it\nspecifies was unimplemented would\nhave published a false statement as an accepted decision. A1 follows as\na docs-only PR: the four\n  status flips plus the ADR corrections.\n- No governance paths. No ratchet change; all 22 TPC-H queries still\npass.\n\n## Checklist\n\n- [x] `pixi run check` passes locally — osx-arm64 shellcheck fails\nidentically on `main`; `ci`,\n      `coverage` and per-file `clang-tidy` pass\n- [x] Tests cover the change\n- [x] Docs updated where behavior, commands or architecture changed\n- [x] No ClickBench-derived data is committed (ADR-0006)\n- [x] Nothing derived from TPC-H is committed (ADR-0006)\n- [x] Changes to governance paths were agreed with a maintainer — none\n\n## AI assistance\n\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5) wrote\nthe U2 and U3 gaps these fix,\nfound them with an eight-agent workflow verifying the four ADRs against\nthe code before\n      proposing A1, and confirmed each by hand before fixing it.\n- Accountable human (has read and understands the whole diff): @hor911\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-14T17:52:55+03:00",
+          "tree_id": "f42f25b68550ba9f142bdbddaec01eb89cf72bd5",
+          "url": "https://github.com/ydb-campus/antb1/commit/18083379865d328dba91ae2ea44b75e0d3317927"
+        },
+        "date": 1791989777685,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 5013.770140223541,
+            "unit": "ns/iter",
+            "extra": "iterations: 140490\ncpu: 5013.680468360737 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84818.02973684101,
+            "unit": "ns/iter",
+            "extra": "iterations: 7600\ncpu: 84805.94486842107 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 221867.77534853795,
+            "unit": "ns/iter",
+            "extra": "iterations: 3156\ncpu: 221830.19866920143 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 440390.75125943415,
+            "unit": "ns/iter",
+            "extra": "iterations: 1588\ncpu: 440300.30037783366 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 401551.7540137622,
+            "unit": "ns/iter",
+            "extra": "iterations: 1744\ncpu: 401534.12041284435 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2083248.7492537356,
+            "unit": "ns/iter",
+            "extra": "iterations: 335\ncpu: 2083019.3522388078 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 51.097556307693225,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 51.0914770769231 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 46.502752666666915,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 46.498411000000075 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 185.12653533333415,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 185.11475833333316 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.872234127659809,
+            "unit": "ms/iter",
+            "extra": "iterations: 47\ncpu: 14.864405340425511 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 22.220114677419325,
+            "unit": "ms/iter",
+            "extra": "iterations: 31\ncpu: 22.212756645161285 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 39.24993449999982,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 39.23294666666669 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 2.1490100437500104,
+            "unit": "ms/iter",
+            "extra": "iterations: 320\ncpu: 2.148701875000003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 94.91296057143066,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 94.9024101428572 ms\nthreads: 1"
           }
         ]
       }
