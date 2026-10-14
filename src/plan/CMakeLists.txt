@@ -6,6 +6,7 @@ antb1_add_module(
     sql_status.cc
     literal.cc
     scope.cc
+    key_type.cc
     join_order.cc
     or_factoring.cc
     relation_count.cc

@@ -29,6 +29,7 @@
 #include "antb1/sql/parser.h"
 
 #include "join_order.h"
+#include "key_type.h"
 #include "or_factoring.h"
 #include "relation_count.h"
 #include "scope.h"
@@ -1650,34 +1651,8 @@ Typed ColumnLeaf(ColumnId id, LogicalType type, std::string name, bool stored_as
 }
 
 // The rank of an integer type among the signed ones (USMALLINT: none).
-int SignedRank(LogicalType type) {
-  switch (type.id()) {
-    case LogicalType::kSmallInt:
-      return 1;
-    case LogicalType::kInteger:
-      return 2;
-    case LogicalType::kBigInt:
-      return 3;
-    case LogicalType::kHugeInt:
-      return 4;
-    default:
-      return 0;
-  }
-}
 
 // The type DuckDB computes two integer operands in (neither of them a literal that fits the
-// other's type): the wider signed type, where USMALLINT with SMALLINT is BIGINT and with a wider
-// type that type.
-LogicalType CombineIntegers(LogicalType a, LogicalType b) {
-  if (a == b) {
-    return a;
-  }
-  if (a == LogicalType::kUSmallInt || b == LogicalType::kUSmallInt) {
-    const LogicalType other = a == LogicalType::kUSmallInt ? b : a;
-    return other == LogicalType::kSmallInt ? LogicalType::kBigInt : other;
-  }
-  return SignedRank(a) >= SignedRank(b) ? a : b;
-}
 
 bool IsSignedInteger(LogicalType t) {
   return t == LogicalType::kSmallInt || t == LogicalType::kInteger || t == LogicalType::kBigInt;
@@ -1886,53 +1861,6 @@ bool Fits(const Expr& constant, LogicalType type) {
 
 std::string DescribeOperand(const Typed& t) {
   return std::format("'{}' is {}", Clip(t.expr->name), ToString(t.expr->type));
-}
-
-// An integer type as the DECIMAL DuckDB computes it in next to a DECIMAL (ADR 0021 rule 4): by its
-// type, so a literal does not shrink to fit (7 is INTEGER, DECIMAL(10,0)).
-LogicalType DecimalOfInteger(LogicalType type) {
-  switch (type.id()) {
-    case LogicalType::kSmallInt:
-    case LogicalType::kUSmallInt:
-      return LogicalType::Decimal(5, 0);
-    case LogicalType::kInteger:
-      return LogicalType::Decimal(10, 0);
-    case LogicalType::kBigInt:
-      return LogicalType::Decimal(19, 0);
-    default:
-      break;
-  }
-  return LogicalType::Decimal(LogicalType::kMaxDecimalWidth, 0);  // HUGEINT
-}
-
-// The one type both sides of a cross-relation equality can be compared in as a join key, where an
-// exact widening reaches it from each (ADR 0022's join keys); std::nullopt otherwise, and the
-// equality then stays a residual. DOUBLE never has one, by decision: its comparison is not exact.
-// BOOLEAN is defensive, mirroring exec's own Invalid: no condition is a comparison operand.
-std::optional<LogicalType> KeyType(LogicalType a, LogicalType b) {
-  if (a == LogicalType::kDouble || b == LogicalType::kDouble || a == LogicalType::kBoolean ||
-      b == LogicalType::kBoolean) {
-    return std::nullopt;
-  }
-  if (a == b) {
-    return a;
-  }
-  if (IsInteger(a) && IsInteger(b)) {
-    return CombineIntegers(a, b);
-  }
-  const bool a_decimal = a == LogicalType::kDecimal;
-  const bool b_decimal = b == LogicalType::kDecimal;
-  if (!(a_decimal || IsInteger(a)) || !(b_decimal || IsInteger(b))) {
-    return std::nullopt;  // a VARCHAR with a DATE, say: no type holds both their values
-  }
-  const LogicalType wide_a = a_decimal ? a : DecimalOfInteger(a);
-  const LogicalType wide_b = b_decimal ? b : DecimalOfInteger(b);
-  const int scale = std::max(wide_a.scale(), wide_b.scale());
-  const int digits = std::max(wide_a.width() - wide_a.scale(), wide_b.width() - wide_b.scale());
-  if (digits + scale > LogicalType::kMaxDecimalWidth) {
-    return std::nullopt;  // BIGINT against DECIMAL(38,30) needs 49 digits
-  }
-  return LogicalType::Decimal(Narrow<std::uint8_t>(digits + scale), Narrow<std::uint8_t>(scale));
 }
 
 // DuckDB's type of `l <op> r` for + - * % with a DECIMAL operand (a decimal literal included) and
@@ -4379,15 +4307,6 @@ arrow::Status Binder::BindAcrossRelations(const sql::Expr& conjunct,
 
 // `expr` as `type`, which an exact widening reaches: the expression itself when it is already of
 // that type.
-ExprPtr WidenTo(const ExprPtr& expr, LogicalType type) {
-  if (expr->type == type) {
-    return expr;
-  }
-  return std::make_shared<const Expr>(
-      Expr{.node = CastExpr{.operand = expr},
-           .type = type,
-           .name = std::format("CAST({} AS {})", expr->name, ToString(type))});
-}
 
 // The column of a subquery join's own side of the comparison: a column of the tree below as is,
 // anything else computed in the join's own layer, directly below it. It stands in for InputColumn
