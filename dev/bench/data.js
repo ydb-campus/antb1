@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791917945458,
+  "lastUpdate": 1791956130558,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -7236,6 +7236,114 @@ window.BENCHMARK_DATA = {
             "value": 108.77232016666956,
             "unit": "ms/iter",
             "extra": "iterations: 6\ncpu: 108.76004833333337 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "33ff9ce3381b08808019c2507ece41442c3ac5f2",
+          "message": "fix(plan): two correlated shapes that aborted the process (#134)\n\n## Summary\n\nTwo process aborts (exit 134) that are **live on `main`**, both\nintroduced by roadmap id U1 (#131).\n\n```text\n$ antb1 query \"SELECT tr_rider FROM trips GROUP BY tr_rider\n               HAVING MIN(tr_fare) = (SELECT MIN(rd_row) FROM riders WHERE rd_id = tr_rider)\"\nexit 134 — check failed: Compute: column #2 is not in its input   (binder.cc:5725)\n\n$ antb1 query \"SELECT COUNT(*) FROM trips\n               WHERE tr_fare = (SELECT MIN(rd_row) FROM riders\n                                WHERE trips.tr_pickup = (SELECT MIN(zn_id) FROM zones))\"\nexit 134 — check failed: false at RejectedSubquery()              (binder.cc:2152)\n```\n\nBoth are U1's, not pre-existing: before it, every correlated subquery\nexited 4 at the first outer\nreference, so neither path was reachable. The second aborts inside\n`BindCorrelatedConjunct`, a\nfunction U1 added; the first aborts resolving a `DependentJoin`, a node\nU1 added.\n\nBoth now exit 4, which is what ADR 0023 already specifies — so neither\nfix needs a new decision.\n\n## The two shapes\n\n**A correlated subquery in `HAVING`.** ADR 0023's Placement bullet says\nit exits 4. U1's clause gate\ncannot catch it, and this is the part worth reading twice: the outer\nreference sits in the `WHERE`\nof the *subquery's own* block, so that block's binder sees a `WHERE` and\nresolves it happily — while\nit is the *enclosing* block's `HAVING` that holds the subquery. The\ndependent join was then stacked\nabove the aggregation (`having_subqueries_`), whose output ids are keys\nand aggregates, so the right\ninput's free variable — a raw scan id — is in no frame the resolver has,\nand `ResolvePositions`\naborted. Refused in `BindSubqueryConjunct`, the one place that knows\nboth that the subquery is\ncorrelated and that it came from `HAVING`.\n\n**A conjunct that is both a subquery conjunct and a reader of an\nenclosing block's column**, such as\nan inner block's `o.col = (SELECT …)`. `BindElement` tested\n`ReadsOuterColumn` *before*\n`AsSubqueryConjunct`, so the conjunct took the correlated route, which\nbinds the whole conjunct as a\ncondition — and every expression visitor's subquery arm is\n`ANTB1_CHECK(false)`.\n\nSwapping the order alone would not fix it: the subquery route binds the\nconjunct's *other side* as\nan ordinary expression, so it cannot take one either. No unnesting path\nof ADR 0023 handles a block\nthat is correlated **and** holds a subquery of its own, so both forms\nare refused at the subquery.\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [x] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run ci\n100% tests passed out of 2664          (2661 before, +3 regression cases)\n\n$ pixi run lint\nevery hook Passed except shellcheck, which fails identically on main\n\n$ clang-tidy -p build/tidy --warnings-as-errors='*' src/plan/binder.cc src/plan/tests/binder_test.cc\n0 findings\n```\n\nBoth reproductions above now exit 4 with a span-accurate message, as\ndoes the `IN` spelling of the\nsecond.\n\n## Tests\n\nThree `ErrorCase`s in `src/plan/tests/binder_test.cc`, one per shape\n(the `HAVING` form, and the\nsecond shape in both its scalar and `IN` spellings), each pinned to its\nspan and message.\n`docs/sql-subset.md` gains both refusals next to the correlated-subquery\nrules U1 wrote.\n\n## Maintainer notes\n\n- **Found by scoping U2, before any U2 code was written.** The\nadversarial pass on the U2 plan\nreproduced both against `main`; I verified each myself before believing\nit. That is the fourth and\nfifth instance of this abort class in ADR 0023's work (J5a, J5b, and now\nthese two), and in every\ncase the trigger is the same: a plan reaches `ResolvePositions`, or an\nexpression visitor, by a\n  route the author did not think it could.\n- **U2 will revisit both sites.** It lifts the `EXISTS` gate through\n`AsSubqueryConjunct` and has to\ndecide `HAVING`'s behaviour for the `EXISTS` form too. Fixing them here\nkeeps two P0s out of a\nlarge feature PR and gets `main` correct now; U2 then starts from a\nclean base. The maintainer\n  chose this sequencing.\n- No governance paths. No ratchet change (the TPC-H queries are\nunaffected: none has a correlated\n  subquery in `HAVING`, and all 22 keep their current status).\n- `pixi run check` cannot pass on this osx-arm64 machine, unchanged from\n#120 onward: the osx-arm64\nshellcheck reports pre-existing `SC2218` in a governance file, identical\non `main`. `ci` and\n  per-file `clang-tidy` stand in.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests) — see the\n      maintainer note; `ci` and per-file `clang-tidy` pass\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer — none\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5) wrote\nthe U1 regressions these fix,\nfound them while scoping U2 with an eight-agent workflow whose\nadversarial pass reproduced both\nagainst `main`, verified each reproduction independently before acting\non it, and wrote the\n      fixes and their tests.\n- Accountable human (has read and understands the whole diff): @hor911\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-14T08:32:13+03:00",
+          "tree_id": "259c06320e9d087aab57d24c6ca4b23fbc32bf8b",
+          "url": "https://github.com/ydb-campus/antb1/commit/33ff9ce3381b08808019c2507ece41442c3ac5f2"
+        },
+        "date": 1791956129912,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 5022.742156348611,
+            "unit": "ns/iter",
+            "extra": "iterations: 139189\ncpu: 5022.600241398386 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84163.60682680205,
+            "unit": "ns/iter",
+            "extra": "iterations: 7910\ncpu: 84163.53160556257 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 221620.49952516635,
+            "unit": "ns/iter",
+            "extra": "iterations: 3159\ncpu: 221605.21842355176 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 439139.45050123864,
+            "unit": "ns/iter",
+            "extra": "iterations: 1596\ncpu: 439125.30639097746 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 360340.9701184927,
+            "unit": "ns/iter",
+            "extra": "iterations: 1941\ncpu: 360313.0566718184 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2090567.6190476897,
+            "unit": "ns/iter",
+            "extra": "iterations: 336\ncpu: 2090464.0684523825 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 50.78001271428637,
+            "unit": "ms/iter",
+            "extra": "iterations: 14\ncpu: 50.774765571428574 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 44.550324437500066,
+            "unit": "ms/iter",
+            "extra": "iterations: 16\ncpu: 44.5377750625 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 180.08365600000076,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 180.06602075 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.34846865306171,
+            "unit": "ms/iter",
+            "extra": "iterations: 49\ncpu: 14.34774608163266 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 21.814538031249775,
+            "unit": "ms/iter",
+            "extra": "iterations: 32\ncpu: 21.811369125000034 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 39.021103999999696,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 39.01782766666666 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.558521896396404,
+            "unit": "ms/iter",
+            "extra": "iterations: 444\ncpu: 1.5583848851351327 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 95.65537357143025,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 95.65277257142846 ms\nthreads: 1"
           }
         ]
       }
