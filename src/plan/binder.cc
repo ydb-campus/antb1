@@ -4440,6 +4440,16 @@ arrow::Status Binder::BindSubqueryConjunct(const sql::Expr& conjunct, const Subq
   // allowed. The binder answers only the shape that is a top-level WHERE conjunct; the unnesting
   // pass then rewrites it or rejects the query.
   const bool correlated = !FreeVariables(*bound.plan.root).empty();
+  if (correlated && having) {
+    // ADR 0023: a correlated subquery in HAVING exits 4, since its outer references would read the
+    // outer block's groups and not its rows. The clause gate of an outer reference cannot catch
+    // this one: the reference sits in the WHERE of the subquery's own block, so that block's
+    // binder sees a WHERE, while it is this block's HAVING that holds the subquery. Without the
+    // refusal the dependent join is stacked above the aggregation, whose output does not define
+    // the free variable, and ResolvePositions aborts the process.
+    return Reject(Rejection{.span = form.subquery->op_span,
+                            .message = "a correlated subquery in HAVING is not supported"});
+  }
   if (correlated && !form.scalar()) {
     // Correlated IN and NOT IN need the set's NULL and empty flags for each binding, which a semi
     // or null-aware anti join cannot carry (ADR 0023's exit-4 list).
@@ -4667,17 +4677,30 @@ arrow::Status Binder::BindElement(const sql::Expr& element) {
           *conjunct.expr, [this](const sql::Expr& e) { return BindInput(e); }, /*input=*/true));
       continue;
     }
+    const std::optional<SubqueryConjunct> form = AsSubqueryConjunct(*conjunct.expr);
+    const bool outer = ReadsOuterColumn(*conjunct.expr);
+    // A conjunct that is both a subquery conjunct and a reader of an enclosing block's column:
+    // neither route can take it. The subquery route binds the conjunct's other side as an ordinary
+    // expression, and the correlated route binds the whole conjunct as a condition, whose every
+    // expression visitor aborts on a subquery. Neither unnesting path of ADR 0023 handles a block
+    // that is correlated and holds a subquery of its own, so it exits 4 at the subquery.
+    if (form.has_value() && outer) {
+      return Reject(Rejection{
+          .span = form->subquery->op_span,
+          .message = "a subquery whose conjunct also reads a column of an enclosing query block is "
+                     "not supported"});
+    }
     // A conjunct that reads a column of the enclosing block goes into the block-top filter: it is
     // neither a key nor an edge of this block's join graph, and the unnesting pass needs it above
     // the joins (ADR 0023). A block whose relations connect only through such a conjunct is
     // therefore disconnected, and exits 4 as ADR 0022 says.
-    if (ReadsOuterColumn(*conjunct.expr)) {
+    if (outer) {
       ARROW_RETURN_NOT_OK(BindCorrelatedConjunct(*conjunct.expr));
       continue;
     }
     // A subquery conjunct becomes a join above this block's inner joins, so it is neither
     // classified by the relations it reads (it reads none of them) nor pushed into a relation.
-    if (const std::optional<SubqueryConjunct> form = AsSubqueryConjunct(*conjunct.expr)) {
+    if (form.has_value()) {
       ARROW_RETURN_NOT_OK(
           BindSubqueryConjunct(*conjunct.expr, *form, /*having=*/false,
                                [this](const sql::Expr& e) { return BindInput(e); }));
