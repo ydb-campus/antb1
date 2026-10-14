@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791956130558,
+  "lastUpdate": 1791968110854,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -7344,6 +7344,114 @@ window.BENCHMARK_DATA = {
             "value": 95.65537357143025,
             "unit": "ms/iter",
             "extra": "iterations: 7\ncpu: 95.65277257142846 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "3c4ca8dd2988c625ba9e5ac2c6a85217bb65e4ea",
+          "message": "feat(plan): unnest correlated exists and not exists (#135)\n\n## Summary\n\nRoadmap id **U2** of [ADR\n0023](../blob/main/docs/adr/0023-unnesting.md): a correlated `EXISTS` or\n`NOT EXISTS` is accepted as a top-level `WHERE` conjunct, bound as a\nsemi or anti dependent join,\nand unnested by **Path 1** into an ordinary join.\n\n**Q4, Q21 and Q22 answer and equal DuckDB**, so the TPC-H ratchet moves\n**16 → 19 of 22**. The three\nleft are Q2, Q17 and Q20 — exactly U3's.\n\n```text\nTPCH: pass=[1,3,4,5,6,7,8,9,10,11,12,13,14,15,16,18,19,21,22] unsupported=3 failed=0\n```\n\nThree commits: the shared key header, Path 1 with no SQL reaching it,\nthen the binder flip.\n\n## Path 1\n\nEach conjunct of the block's top filter goes by the columns it reads,\nagainst the left input's\noutput ids: an equality of a pure-inner and a pure-outer column whose\ncommon type is not `DOUBLE` is\na **key**; anything else reading both sides is a **residual** over the\ncandidate pairs. Without a\nkey the pass refuses, as a `LEFT JOIN` without one does.\n\nThe conjuncts are not `Predicate{column, other}` — the binder leaves\nthem as `kIsTrue` predicates\nover a `Compute` that holds the real expression, so the classification\nreads the `Compute`.\n\nA key of two types is cast to the common one on each side. That is not\noptional: T3's generator\nwrites `INTEGER` → `BIGINT` correlations, so without the cast those\nqueries would exit 4 forever and\nthe diff gate would go red the moment the feature was declared. The cast\nmust also be spelled\nexactly as the binder spells it — a CLI golden pins its rendering and\nexec checks the declared type\nagainst the Arrow type — which is why `KeyType` and `WidenTo` move to a\nshared header first.\n\nThe pass is **top-down**: a dependent join is rewritten before anything\ninside it, so a dependent\njoin nested in a correlated block is rewritten too, or refused at *its\nown* span.\n\n**Two guards against being silently wrong rather than loudly\nunsupported**: a right input whose\nshape the pass does not recognise is refused rather than rewritten, and\nLemma 3.1 is checked *after*\nthe rewrite — a free variable left in the new join's right input fails\nwith no `SqlErrorDetail`\n(exit 70), since only a bug in the classification can cause it and\n`ResolvePositions` would\notherwise abort the process.\n\n## The binder: four changes, each guarding a hazard\n\n- `AsSubqueryConjunct` accepts the `EXISTS` form, which has **no other\nside**.\n- `RejectSubqueryConjunct` gets its `EXISTS` arm **before** its\nunconditional deref of that absent\nother side, and refuses there every clause Path 1's plain block excludes\n(`GROUP BY`, `HAVING`,\n`LIMIT`, `OFFSET`, an aggregate) plus `EXISTS` in `HAVING` — all before\na name resolves.\n- `BindSubqueryConjunct` gets its branch **before** the one-column rule,\nwhich an `EXISTS` block\n  would fail for having no columns at all.\n- An **uncorrelated** `EXISTS` is refused once the block is bound, which\nis when the binder knows it\nreads nothing out: a semi join needs a key and there is no correlation\nto make one from.\n\n## One deviation from the ADR, registered as divergence D23\n\nAn outer-only conjunct becomes a **residual in both polarities**. For an\nanti join that is the ADR's\nown rule and it is required: where the conjunct is false or NULL the\nsubquery has no row, so\n`NOT EXISTS` must keep the outer row that a filter would drop.\n\nThe ADR puts an `EXISTS`'s outer-only conjunct in a filter *below* the\nsemi join instead — same\nanswer, rows dropped earlier. Computing it on the probe side widens the\nsemi join's output, which\nbreaks `Optimize`'s contract that a plan keeps its output columns, and\nwould need a `Project` to\nundo. A residual is correct for both; pushing it down is a performance\nrefinement.\n\n**The `.slt` records found this as a process abort before any unit test\ndid** — my own Path 1 tests\nhad no outer-only conjunct in a semi join. Both polarities are pinned\nnow.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix / perf / refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run ci\n100% tests passed out of 2676\n\n$ pixi run tidy        (per file over every changed TU)\n0 findings\n\n$ pixi run lint\nevery hook Passed except shellcheck, which fails identically on main\n\n$ pixi run diff-random\nDIFF: PASS seed=4129153989 queries=2000 failed=0 unsupported=22\n  Unsupported by feature outside the supported set: correlated_aggregate=22\n```\n\nThat last line is the one to read: **`correlated_exists` has vanished\nfrom the unsupported list.**\nEvery correlated `EXISTS` the T3 generator writes — shapes nobody\nhand-picked — now answers and\nmatches DuckDB. Four more 400-query seeds pass the same way.\n\n## Tests\n\n- **`optimizer_test.cc`** — Path 1 on hand-built plans: the key pull-up\nin both polarities, a\nnon-equality as a residual, a key of two types cast on each side, an\nouter-only conjunct as a\nresidual in both polarities (with the plan's output width pinned), and\nthe refusal without a key.\n- **`binder_test.cc`** — ten new cases: the uncorrelated `EXISTS`, every\nplacement that keeps the\nstatic refusal (select list, under `OR`, `ORDER BY`), every clause Path\n1 excludes, and\n  `EXISTS` in `HAVING`.\n- **18 pending records un-guard** across `exists.slt` and\n`alias_words.slt`, all oracle-written.\n- **Two of T3's three metamorphic relations now run on antb1 and pass**;\nthe third still waits for\n  U3, which is what giving the two forms separate Features bought.\n\n## Maintainer notes\n\n- **Governance, both approved in advance**:\n`tests/data/tpch_status.json` (16 → 19) and `AGENTS.md`\nline 4 (`16 of 22` → `19 of 22`). The ratchet itself demanded both and\nnamed the exact change; I\nasked only once Q4, Q21 and Q22 actually passed locally, so the approval\nwas of a verified fact.\n- **The feature declaration is not a separable commit.** The metamorphic\nharness fails a pending\nrelation the moment antb1 answers it, naming the feature to declare — so\nthe binder flip and\n`kCorrelatedExists` joining `kSupportedFeatures` have to land together.\nGood design: it makes the\n  gate impossible to forget.\n- `docs/sql-subset.md` gains D23, the three query rows, and the\ncorrelated-`EXISTS` rules.\n- `pixi run check` cannot pass on this osx-arm64 machine, unchanged from\n#120 onward: the osx-arm64\nshellcheck reports pre-existing `SC2218` in a governance file, identical\non `main`. Note also that\n`pixi run tidy` stops at the first failing TU here, which hides findings\nin files built later —\n  per-file clang-tidy over the changed TUs is what I ran instead.\n- **What this unblocks.** U3 (Path 2) is the last implementation id; A1\nthen moves four ADRs to\n  Accepted (decision C14).\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests) — see the\n      maintainer note; `ci`, `coverage` and per-file `clang-tidy` pass\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer\n\n## AI assistance\n\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5) scoped,\nimplemented and verified\nthis PR. An eight-agent scoping workflow raised six blockers before any\ncode was written;\nthree were process aborts live on `main` that became PR #134, and the\nother three shaped this\none — most importantly that T3's generator makes the key cast mandatory.\nTwo further defects\nwere found during implementation by the suite rather than by the plan:\nthe probe-side filter\n      that aborted, and the output-width contract it broke.\n- Accountable human (has read and understands the whole diff): @hor911\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-14T11:51:55+03:00",
+          "tree_id": "f163eee5aa49d732ac55fa6342af31aade17288e",
+          "url": "https://github.com/ydb-campus/antb1/commit/3c4ca8dd2988c625ba9e5ac2c6a85217bb65e4ea"
+        },
+        "date": 1791968109521,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4974.684230595454,
+            "unit": "ns/iter",
+            "extra": "iterations: 141616\ncpu: 4974.0157750536655 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84939.33358720431,
+            "unit": "ns/iter",
+            "extra": "iterations: 7878\ncpu: 84904.48032495556 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 221970.19366085617,
+            "unit": "ns/iter",
+            "extra": "iterations: 3155\ncpu: 221864.16513470674 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 442766.051363354,
+            "unit": "ns/iter",
+            "extra": "iterations: 1577\ncpu: 442596.9010779963 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 402212.51398600935,
+            "unit": "ns/iter",
+            "extra": "iterations: 1716\ncpu: 402038.28321678314 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2083381.349253858,
+            "unit": "ns/iter",
+            "extra": "iterations: 335\ncpu: 2082676.0388059695 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 53.5006923076935,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 53.492609076923095 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 46.369973142857035,
+            "unit": "ms/iter",
+            "extra": "iterations: 14\ncpu: 46.35700035714293 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 183.45368974999587,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 183.43449675000033 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.859355297871504,
+            "unit": "ms/iter",
+            "extra": "iterations: 47\ncpu: 14.858257234042552 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 22.17853503124978,
+            "unit": "ms/iter",
+            "extra": "iterations: 32\ncpu: 22.174012031250022 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 38.85232855555564,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 38.84862394444443 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.8786154375000617,
+            "unit": "ms/iter",
+            "extra": "iterations: 368\ncpu: 1.8783600842391344 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 99.06521214285898,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 99.05481628571445 ms\nthreads: 1"
           }
         ]
       }
