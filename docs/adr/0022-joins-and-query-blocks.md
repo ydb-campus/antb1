@@ -339,6 +339,10 @@ Accepted (with the maintainer-approved roadmap for joins, query blocks and uncor
     above, and join-order rule 4's filter selectivity, are deferred together to the cost-based-ordering trigger
     below: both need estimates that account for filters, and `OrderJoins` decides the side in one field, so the
     change is local when they arrive.
+  - Update (2026-10-14): **they have arrived.** A run of all 22 at SF 1, SF 10 and SF 100 fired the
+    cost-based-ordering trigger below, and the build-side trigger for the preserved side with it, naming the queries
+    it predicted. [ADR 0026](0026-join-performance.md) records the evidence and takes over both items, the estimates
+    that account for filters and the side they decide.
   - Update (2026-10-10, J2b-2): one equality is one key, however often it is written. The binder drops a repeated
     edge between the same relation pair on the same two columns, in either orientation, so `JOIN b ON a.k = b.k`
     with `WHERE b.k = a.k` costs one hash column, not two. A `JoinNode::span` is the connector that added the
@@ -576,15 +580,17 @@ Accepted (with the maintainer-approved roadmap for joins, query blocks and uncor
   - DOUBLE join keys, until a user or generated query joins on DOUBLE columns;
   - cost-based join order (dynamic programming, selectivity estimates, equivalence edges, key ranges carried across
     joins), until a query of the SF 1 nightly run is far slower than DuckDB, or builds a very large table, because of
-    its join order;
+    its join order — **fired 2026-10-14, [ADR 0026](0026-join-performance.md)**;
   - building on the preserved side (right outer, right semi and right anti joins) and one build probed by several
-    pipelines, until profiles of Q13 or Q20-Q22 at SF 10 or above, or the general unnesting domain, need them;
+    pipelines, until profiles of Q13 or Q20-Q22 at SF 10 or above, or the general unnesting domain, need them —
+    **fired 2026-10-14 by profiles of those very queries, [ADR 0026](0026-join-performance.md)**;
   - runtime join filters and part pruning by build keys, until performance work resumes, after DECIMAL reaches the
     filtered scan;
   - batch-range parts (ADR 0013) and co-clustered range joins with in-order aggregation, until benchmarks sit idle
     at 64 or more threads, or SF 100 is targeted;
   - pressure measured without the pinned builds, until a memory-limit test or a run at SF 10 or above shows probes
-    running one part at a time;
+    running one part at a time — **a run at SF 100 showed a build, not a probe, serialized this way;
+    [ADR 0026](0026-join-performance.md)'s C4**;
   - materialized CTEs, until a profile shows that the recomputation dominates;
   - filters implied by ORs and late materialization across joins, until profiles ask for them;
   - LEFT-to-INNER conversion, with IS NULL support and a profile that needs it;

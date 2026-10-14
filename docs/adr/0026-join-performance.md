@@ -1,0 +1,191 @@
+# 26. Join performance: build sides, right-sided joins and cost-based order
+
+Date: 2026-10-14
+
+## Status
+
+Proposed
+
+## Context
+
+- **The triggers fired.** [ADR 0022](0022-joins-and-query-blocks.md) deferred its performance items each "until its
+  trigger", and a run of all 22 queries derived from TPC-H at SF 1, SF 10 and SF 100 — against DuckDB and ClickHouse
+  over the same Parquet, outside the repository as [ADR 0006](0006-test-strategy-and-data-policy.md) requires —
+  fires three of them as written:
+  - *"cost-based join order (dynamic programming, selectivity estimates, equivalence edges, key ranges carried across
+    joins), until a query of the SF 1 nightly run is far slower than DuckDB, or builds a very large table, because of
+    its join order"*: Q21 builds the whole of the largest relation and runs 19.6x DuckDB on 8 threads.
+  - *"building on the preserved side (right outer, right semi and right anti joins) and one build probed by several
+    pipelines, until profiles of Q13 or Q20-Q22 at SF 10 or above, or the general unnesting domain, need them"*: the
+    profiles are of Q13 and Q20-Q22 at SF 100, and they ask for exactly this. The trigger named the queries correctly.
+  - *"pressure measured without the pinned builds, until a memory-limit test or a run at SF 10 or above shows probes
+    running one part at a time"*: at SF 100 a build, not a probe, is what serializes — see the chain below.
+- **The trigger's own precondition does not exist.** No workflow runs any of the 22: `bench.yml` runs the micro
+  benchmarks and ClickBench, on a push to `main` that touches `src/`, on `workflow_dispatch`, or on a pull request
+  carrying the `performance` label. There is no "SF 1 nightly run", so the evidence here comes from a run outside the
+  repository at SF 100 — a stronger condition than the trigger asks for — and this ADR adds the on-demand run that
+  makes it repeatable.
+- **Where the gap is.** antb1 is 3.2x DuckDB's geomean at SF 100 on 4 threads and 3.4x on 8. It is not a scaling
+  defect: 10x the data costs a median 10.0x the time, with 21 of the 22 between 7.3x and 11.7x, and each doubling of
+  threads holds 85-88% efficiency, within a point or two of DuckDB's. So the gap is per-operator cost, and it
+  concentrates in joins. Six queries that each join four or more relations (Q5, Q7, Q8, Q9, Q10, Q21) sit at a 5.33x
+  geomean ratio; five a scan and an aggregate dominate (Q1, Q6, Q13, Q14, Q22) sit at 1.70x. Scan and aggregate
+  throughput are already close to DuckDB's. Bringing the six to the level of the five takes the overall ratio to
+  2.34x and nearly halves the wall clock of the 22.
+- **The cause: the estimates ignore filters, so the build side is often the big one.** `OrderJoins` picks the probe by
+  rule 1, the relation with the most rows, and does not pick the build side at all: `src/plan/join_order.cc` sets
+  `BuildSide::kRight` unconditionally, computing an `estimate` on the line above and never reading it — which is what
+  the comment in `src/plan/join_order.h` says it does. Footer row counts know nothing of filters, nor of what a join
+  below produced, so wherever a filter or an earlier join shrinks one side the choice is made on stale numbers. In 12
+  of the 22 queries, 14 joins build on a side 2x to 185x larger than the stream that probes it: worst are Q2 at 185x,
+  Q21 at 82x and 54x, Q22 at 79x, Q4 at 66x, Q20 at 63x, Q12 at 48x, Q17 at 33x, Q8 at 12x and Q13 at 10x. The other
+  join shapes hard-code the side too (the binder's LEFT JOIN units and subquery joins, and the unnesting rewrites of
+  ADR 0023).
+- **It is a memory problem before it is a speed problem.** Peak memory is set by the wrong side: 5 of the 22 pass
+  8 GB at SF 100, Q21 reaches 36 GB on a 48 GB host, and Q4 holds 15 GB for a query that finishes in under six
+  seconds. ADR 0022 judged "the workload far below half of the default limit up to SF 100 on the development host";
+  that no longer holds for Q21, and it is the build side, not the data, that broke it.
+- **The memory then costs the parallelism,** in a chain whose top is the item above:
+  1. the estimates ignore filters, so Q21's semi join builds the whole of the largest relation instead of the small
+     stream that probes it;
+  2. the build peaks at 36 GB;
+  3. `OneAtATime` in `src/exec/join_table.cc` gives the build a null executor once the budget passes half the memory
+     limit, and `ForEach` in `src/exec/partition_lanes.cc` then runs the 64 partition lanes on the calling thread, so
+     the one phase of the build that could use the pool does not. The CLI's default limit is 80% of physical memory,
+     which puts the threshold well below this build;
+  4. so Q21 gains 1.08x from 4 to 8 threads where the other 21 gain 1.65x to 1.94x and DuckDB's own Q21 gains 1.91x,
+     and it is the one query of the 22 that scales superlinearly with the data, at 39.7x for 10x. Measured directly,
+     that build's `finish` phase is 11.0s on 4 threads and 10.4s on 8.
+
+  Each step follows from the one above it, so the first fix is the only one that must land.
+- **What the measurements do not support.** A scan gets no filter pushdown at all when any column it reads is
+  DECIMAL: `ParquetTable::supports_scan_filter` requires every projected field to be one `FilteredColumnOf` handles,
+  and DECIMAL is not. This is deliberate and documented — [ADR 0020](0020-filter-pushdown.md): "A scan that reads one
+  gets no pushdown ... until the decimal64 item of ADR 0021" — and it is why Q12 is the only scan of the largest
+  relation in the workload that filters while decoding, its projection being the only one without a DECIMAL column.
+  It is also worth little here: a full scan of one integer column of that relation at SF 100 takes about half a
+  second warm, and losing the pushdown above it costs about a tenth of that. Row-group pruning cannot help either,
+  because the workload's order dates do not correlate with its order keys, so a row group's date range spans nearly
+  the whole domain and `skipped` is 0 everywhere. ADR 0022 already orders runtime join filters after "DECIMAL reaches
+  the filtered scan"; this ADR keeps that order and keeps the item last.
+
+## Decision
+
+### The build side comes from estimates that account for filters, behind one ratio (C1)
+
+`JoinRelation::rows` becomes an estimate that applies the conjuncts the binder has already attributed to that single
+relation, and `OrderJoins` decides `JoinStep::build` from the estimates instead of hard-coding `kRight`. Rule 1 reads
+the same estimates, so the probe and the build side move together: a relation that a filter shrinks stops being
+chosen as the probe for having the most rows in its footer.
+
+Selectivity uses only what the footers already give, as ADR 0022 requires of a plan ("from metadata alone, and the
+same for any thread count"): `Table::part_stats` has exact minimum and maximum for integer, DATE and USMALLINT
+columns, so a range conjunct estimates from the overlap of its range with the column's, and `KeyDomain` already reads
+those statistics the same way. A column type without statistics — DECIMAL, which `parquet_table.cc` excludes per
+[ADR 0021](0021-decimal-semantics.md) — takes a documented default factor, never a silent one.
+
+**One knob decides how much to trust it.** The side flips only when the estimated build side exceeds the estimated
+probe side by more than a ratio, `--build-side-ratio`:
+
+- at **4.0**, the default, the choice is conservative: wherever the estimates are close, today's plan stands, so an
+  estimate that is wrong cannot move a join that is already right;
+- at **1.0** it is ADR 0022's original rule, "the input with the smaller footer row count ... and on the relation
+  being added on a tie", now with filters;
+- unknown on either side keeps `kRight`. Unknown must never read as small.
+
+The ratio exists so that the default is answerable by measurement rather than by argument: one sweep over the 22 at
+SF 100 chooses it, and that sweep is recorded here when C1 lands. `BuildSide::kLeft` already works in the physical
+planner and the hash join, and is reached today only from tests, so C1 is a planner change alone.
+
+### Building on the preserved side (C2, C3)
+
+A semi, anti or left outer join builds on the side it does not preserve, so for these the ratio has nothing to
+choose: the shape fixes the side, and it is the wrong one wherever the preserved side is the smaller. Q21, Q4, Q22
+and Q13 are that case, and together they hold the largest builds in the workload.
+
+The mirror of each is the standard one: mark the build rows a probe matched, then emit the marked rows (right semi),
+the unmarked rows (right anti), or the unmarked rows padded with NULLs (right outer). The direction is already a
+field — `JoinNode::build` — so no new `JoinKind` is needed and the enum stays at six. **The hazard is that
+`src/exec/hash_join.cc` switches on `JoinKind` twice behind `default:` arms**, so neither a new kind nor a new
+direction fails to compile there; C2 makes both switches exhaustive in the same PR as it adds the direction.
+
+### Join order (C5)
+
+Choosing the build side does not change which joins run first, and the row counts between joins say that order is
+the other half. Four of Q7's five joins each output the same rows, and only the fifth cuts them, by 312x; Q8 and Q5
+do the same over fewer joins. This is ADR 0022's cost-based ordering proper — rules 1 and 4 with selectivity — and
+it comes after C1, which is its prerequisite, and after C3, which is worth more for less.
+
+### What stays deferred
+
+Runtime join filters and part pruning by build keys keep ADR 0022's order, after DECIMAL reaches the filtered scan;
+`plan::ScanFilter` is built once at physical-plan time from static predicates, and nothing reaches back from a build
+into a probe's scan. Spilling keeps its own trigger of SF 300. Q10's 5.5x to 6.5x is not a build-side case — its
+worst build is 1.3x the stream probing it, not the 10x and above of the queries above — so it needs its own profile
+before it gets a roadmap item.
+
+## Consequences
+
+- A plan still depends on metadata alone, so it is the same for any thread count and any batch size, and EXPLAIN
+  stays a function of the catalog. Selectivity from exact footer statistics keeps that property; a sampled or
+  historical estimate would not, and is not proposed.
+- `build=left|right` is printed on every join already; C1 adds the estimate beside it, so a wrong side is visible
+  from `explain` without `--analyze`. This is also what makes C5 reviewable.
+- A query's peak memory becomes a function of the smaller side of each join rather than of its text. That is the
+  change that matters most at SF 100 and above, and it is what ADR 0022's SF 300 spilling trigger was reserved for.
+- C1 changes plans, not answers. `pixi run diff-random` and the metamorphic relations `star_join_commutes` and
+  `star_join_order_three_tables` are what prove that, and they are the gate this work leans on.
+- The on-demand run (C7) makes the triggers above measurable inside the repository for the first time. It stays off
+  `push` and `pull_request` so that no PR pays for it.
+
+## Plan
+
+One PR per id. C1 is the prerequisite for C3 and C5: nothing chooses a side without estimates that account for
+filters. Each PR reports the 22 queries at SF 100 before and after, and updates the docs/sql-subset.md sections it
+changes.
+
+- **C1, feat(plan): filter-aware relation estimates and the build-side ratio.** `JoinRelation::rows` applies the
+  conjuncts of its own relation; `OrderJoins` takes the ratio and sets `JoinStep::build` from the estimates; rule 1
+  reads them too. A `BindOptions` parameter on `plan::Bind`, the ratio on `engine::SessionOptions`, and
+  `--build-side-ratio` on the CLI, defaulting to 4.0. EXPLAIN prints the estimate next to `build=`. Addresses Q2, Q8,
+  Q12, Q17 and Q20; plans change, answers do not.
+- **C2, feat(exec): build-side output for semi, anti and left outer joins.** The match mark on the build rows and the
+  final pass that emits them, selected by `JoinNode::build`; both `JoinKind` switches in `hash_join.cc` become
+  exhaustive. No planner change, so no plan moves yet.
+- **C3, feat(plan): choose the build side for semi, anti and outer joins.** C1's estimates with C2's operators. This
+  is where Q21's 36 GB, its 19.6x and its 1.08x thread scaling go, and with them Q4, Q22 and Q13. The largest single
+  win of this ADR.
+- **C4, perf(exec): keep a large build parallel.** `OneAtATime` trades all of a build's parallelism for headroom at
+  half the limit, with nothing in between. After C3 no query of the 22 reaches that threshold, so this is no longer
+  urgent — but any query whose build is legitimately large still falls off the same cliff.
+- **C5, feat(plan): cost-based join order with filter selectivity.** Rules 1 and 4 with the estimates of C1, for the
+  queries that carry a join's output through later joins that would have cut it: Q7 first, then Q8 and Q5.
+- **C6, feat(io): DECIMAL columns in the filtered scan.** ADR 0021's decimal64 item, or — cheaper and strictly
+  better — `supports_scan_filter` per column, so a scan pushes what it can and decodes the rest for surviving rows
+  only. Low measured value; last of the engine work, and the thing runtime join filters wait for.
+- **C7, ci: the 22 queries on demand.** A job in `bench.yml`, on `workflow_dispatch` with a scale-factor input and
+  never on `push` or `pull_request`, generating its data at test time as the SLT runner does. `.github/` is a
+  protected path, so the diff needs the maintainer.
+- **T4, test(diff): generate the shapes the build directions answer.** A build direction is not a new feature of the
+  SQL subset, so `kGeneratorPending` has nothing to hold; what the generator owes is the shapes where the preserved
+  side is the smaller one, so that `diff-random` covers the plans C3 newly chooses.
+
+## Alternatives considered
+
+- **Keep the footer-only estimates and swap the side by a rule of thumb** (build on a scan, probe a join; build on
+  the second relation of the FROM list). Cheap, and it would fix Q12. Rejected: it is not a rule anyone can predict
+  from the query, it moves with the text rather than the data, and it would not touch Q21, where the shape and not
+  the footer picks the side.
+- **A full cost model with sampling or histograms.** Rejected for now: it breaks the property that a plan depends on
+  metadata alone, which is what makes EXPLAIN reproducible and the tests hermetic, and ten of the fourteen wrong
+  sides are wrong by a factor of 10 or more — far more margin than an estimate from exact footer minimums and
+  maximums needs in order to separate them.
+- **Runtime join filters first.** They would cut the probe side of Q8 and Q19 without any estimate at all, and need
+  no cardinality model. Rejected as the first step: ADR 0022 orders them after DECIMAL reaches the filtered scan,
+  nothing in the engine passes a filter sideways today, and they do not address memory, which is what Q21 is about.
+- **Spilling instead of choosing the side.** It would stop Q21 from failing on a smaller host, but it would not make
+  it faster, and it would make the 36 GB build legitimate rather than unnecessary. Deferred to its own SF 300
+  trigger, as ADR 0022 has it.
+
+This workload is derived from the TPC-H Benchmark and is not comparable to published TPC-H Benchmark results, as
+this implementation does not comply with all requirements of the TPC-H Benchmark.

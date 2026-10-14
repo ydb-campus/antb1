@@ -34,3 +34,4 @@ may land first, in a docs-only PR (0013, 0019, 0021-0025).
 | [0023](0023-unnesting.md) | Correlated subqueries as dependent joins, unnested by the optimizer | Accepted |
 | [0024](0024-several-errors-per-query.md) | Several errors per query, scheduled for later | Proposed (deferred) |
 | [0025](0025-values-table-constructor.md) | The VALUES table constructor, postponed | Postponed |
+| [0026](0026-join-performance.md) | Join performance: build sides, right-sided joins and cost-based order | Proposed |
