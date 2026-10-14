@@ -344,6 +344,224 @@ TEST(JoinOrderTest, TwoHundredFiftySixRelations) {
   }
 }
 
+// The sides of the steps, in order.
+std::vector<BuildSide> Builds(const std::vector<JoinStep>& steps) {
+  std::vector<BuildSide> out;
+  out.reserve(steps.size());
+  for (const JoinStep& step : steps) {
+    out.push_back(step.build);
+  }
+  return out;
+}
+
+// Rule 5 (ADR 0026): a step builds on the relation it adds, unless that relation is more than the
+// ratio larger than the relations joined so far, when it builds on them instead. The first step is
+// the probe and joins nothing, so its side is the default.
+TEST(JoinOrderTest, TheBuildSideIsTheAddedRelationUnlessItIsDecisivelyLarger) {
+  // 1000 probes; 10 then 900 join it. One edge of unknown domain, so each estimate is the product
+  // over the larger side's rows: joining 10 leaves 1000, and 900 against that is far more than a
+  // quarter of it, so the second step builds on the relations joined so far instead.
+  const std::vector<JoinEdge> chain = {Edge(0, 1, 1000, 1000), Edge(0, 2, 1000, 1000)};
+  const auto steps = OrderJoins(Relations({1000, 10, 900}), chain);
+  EXPECT_EQ(Order(steps), (std::vector<std::size_t>{0, 1, 2}));
+  EXPECT_EQ(Estimates(steps), (std::vector<int64_t>{1000, 10, 9}));
+  // Step 1 adds 10 rows to 1000: the added relation stays the build side. Step 2 adds 900 rows to
+  // an estimate of 10, which is 90x and so decisive: it builds on the left instead.
+  EXPECT_EQ(Builds(steps),
+            (std::vector<BuildSide>{BuildSide::kRight, BuildSide::kRight, BuildSide::kLeft}));
+}
+
+// A near-tie keeps the plan as it was: the ratio exists so that an estimate that is wrong by a
+// little cannot move a join that is already right.
+//
+// Only a third relation can put the larger side on the build: with two, rule 1 makes the larger of
+// them the probe, so the relation each step adds is already the smaller one. Here 1000 probes, a
+// relation of 10 rows joins it down to an estimate of 10, and the last relation is compared against
+// that 10 -- which is how a join of a shrinking pipeline to a whole table arises in a real query.
+TEST(JoinOrderTest, TheBuildSideKeepsTheAddedRelationOnANearTie) {
+  const std::vector<JoinEdge> edges = {Edge(0, 1, 1000, 1000), Edge(0, 2, 1000, 1000)};
+  const auto last = [&edges](int64_t rows, int64_t ratio = kBuildSideRatio) {
+    return Builds(OrderJoins(Relations({1000, 10, rows}), edges, ratio)).back();
+  };
+  EXPECT_EQ(last(40), BuildSide::kRight);  // 40 against 10 is 4.0x: not more than the ratio
+  EXPECT_EQ(last(41), BuildSide::kLeft);   // 4.1x is
+  // At a ratio of 100 hundredths the smaller side always builds, which is ADR 0022's own rule.
+  EXPECT_EQ(last(11, 100), BuildSide::kLeft);
+  EXPECT_EQ(last(10, 100), BuildSide::kRight);  // equal rows are no reason to move the build
+  // A larger ratio trusts the estimates less: at 10x, 4.1x is no longer decisive.
+  EXPECT_EQ(last(41, 1000), BuildSide::kRight);
+}
+
+// Unknown rows count as the largest for the order (rule 1), but must never decide a build side:
+// building on a side that turns out to be large is the mistake the rule exists to avoid.
+TEST(JoinOrderTest, AnUnknownOrEmptyEstimateKeepsTheAddedRelationAsTheBuildSide) {
+  const std::vector<JoinEdge> edges = {Edge(0, 1, 1000, 1000), Edge(0, 2, 1000, 1000)};
+  const auto last = [&edges](std::optional<int64_t> rows) {
+    return Builds(OrderJoins(Relations({1000, 10, rows}), edges)).back();
+  };
+  // Unknown rows on the side that would build: it counts as the largest for the order, but a side
+  // that may turn out to be large is exactly what must not be chosen to build on.
+  EXPECT_EQ(last(std::nullopt), BuildSide::kRight);
+  // An estimate of no row at all is just as untrustworthy, and an empty build is free either way.
+  EXPECT_EQ(Builds(OrderJoins(Relations({1000, 0, 1000}), edges)).back(), BuildSide::kRight);
+}
+
+TEST(JoinOrderDeathTest, TheBuildSideRatioIsAtLeastOne) {
+  EXPECT_DEATH((void)OrderJoins(Relations({1, 2}), std::vector{Edge(0, 1)}, 99),
+               "build_side_ratio >= 100");
+}
+
+// The footer statistics one column's estimates read (ADR 0026): exact only when every part has
+// them, since a part without them could hold any value.
+TEST(JoinOrderTest, ColumnRanges) {
+  // Two fields: `k` has statistics in every part, `d` is a DECIMAL and so has none anywhere
+  // (ADR 0021), which is the case that matters -- an unrelated DECIMAL column in the same scan.
+  const auto schema = arrow::schema(
+      {arrow::field("k", arrow::int64()), arrow::field("d", arrow::decimal128(15, 2))});
+  FakeTable table(schema, 40);
+  table.WithParts({10, 30})
+      .WithStats(0, 0, PartStats{.min = 1, .max = 10, .null_count = 0, .rows = 10})
+      .WithStats(1, 0, PartStats{.min = 5, .max = 40, .null_count = 6, .rows = 30});
+  const ColumnRange range = ColumnRangeOf(table, 0);
+  EXPECT_TRUE(range.exact);
+  EXPECT_EQ(range.min, std::optional<Int128>(1));
+  EXPECT_EQ(range.max, std::optional<Int128>(40));
+  EXPECT_EQ(range.non_null, 34);  // 10 + (30 - 6)
+  // A column whose type has no statistics at all (DECIMAL, VARCHAR: ADR 0021) is not exact, so
+  // every predicate on it takes a default factor.
+  EXPECT_FALSE(ColumnRangeOf(table, 1).exact);
+  EXPECT_EQ(ColumnRangeOf(table, 1).non_null, 0);
+  // Nor is a column one of whose parts has none.
+  FakeTable partial(schema, 40);
+  partial.WithParts({10, 30}).WithStats(
+      0, 0, PartStats{.min = 1, .max = 10, .null_count = 0, .rows = 10});
+  EXPECT_FALSE(ColumnRangeOf(partial, 0).exact);
+  // A part of NULLs only contributes nothing and keeps the column exact.
+  FakeTable nulls(schema, 20);
+  nulls.WithParts({10, 10})
+      .WithStats(0, 0,
+                 PartStats{.min = std::nullopt, .max = std::nullopt, .null_count = 10, .rows = 10})
+      .WithStats(1, 0, PartStats{.min = 3, .max = 7, .null_count = 0, .rows = 10});
+  const ColumnRange only_nulls = ColumnRangeOf(nulls, 0);
+  EXPECT_TRUE(only_nulls.exact);
+  EXPECT_EQ(only_nulls.min, std::optional<Int128>(3));
+  EXPECT_EQ(only_nulls.non_null, 10);
+  // A table without parts has nothing to read.
+  EXPECT_FALSE(ColumnRangeOf(FakeTable(schema, 40).WithParts({}), 0).exact);
+}
+
+Predicate Compare(CompareOp op, Int128 value) {
+  return Predicate{.kind = Predicate::Kind::kCompare,
+                   .column = BoundColumn{},
+                   .op = op,
+                   .constant = Constant{.type = LogicalType::kBigInt, .value = value}};
+}
+
+// A column of 100 rows whose values run 1 to 100, one row each.
+ColumnRange Hundred() { return ColumnRange{.min = 1, .max = 100, .non_null = 100, .exact = true}; }
+
+// PredicateRows over a range the footers give exactly: the part of the range the comparison admits.
+TEST(JoinOrderTest, PredicateRowsFromAnExactRange) {
+  const ColumnRange range = Hundred();
+  EXPECT_EQ(PredicateRows(100, Compare(CompareOp::kLt, 51), range, 100), 50);  // 1..50
+  EXPECT_EQ(PredicateRows(100, Compare(CompareOp::kLe, 50), range, 100), 50);
+  EXPECT_EQ(PredicateRows(100, Compare(CompareOp::kGt, 50), range, 100), 50);  // 51..100
+  EXPECT_EQ(PredicateRows(100, Compare(CompareOp::kGe, 51), range, 100), 50);
+  // A constant outside the range admits all of it or none of it, and never more rows than there
+  // are.
+  EXPECT_EQ(PredicateRows(100, Compare(CompareOp::kLt, 1000), range, 100), 100);
+  EXPECT_EQ(PredicateRows(100, Compare(CompareOp::kGt, 1000), range, 100), 0);
+  EXPECT_EQ(PredicateRows(100, Compare(CompareOp::kLt, -5), range, 100), 0);
+  // Equality divides by the domain; inequality keeps the rest.
+  EXPECT_EQ(PredicateRows(100, Compare(CompareOp::kEq, 7), range, 100), 1);
+  EXPECT_EQ(PredicateRows(100, Compare(CompareOp::kNe, 7), range, 100), 99);
+  // An estimate never reaches no row from a comparison that admits part of the range: a relation
+  // estimated at nothing would be ordered first and stop every later estimate.
+  EXPECT_EQ(PredicateRows(100, Compare(CompareOp::kEq, 7), range, 1000), 1);
+  EXPECT_EQ(PredicateRows(0, Compare(CompareOp::kEq, 7), range, 100), 0);
+}
+
+// A column whose footer range excludes the constant decides the predicate outright: an equality
+// matches no row, and its complement excludes none. Without this a column of one distinct value
+// estimates `col <> other` at almost no rows, which orders that relation first and then builds on
+// the wrong side of its joins -- a plan strictly worse than the unfiltered footer count gave.
+TEST(JoinOrderTest, PredicateRowsUsesTheRangeForEqualityAndItsComplement) {
+  // 100 rows whose only value is 1, as a constant column's footers report it.
+  const ColumnRange one{.min = 1, .max = 1, .non_null = 100, .exact = true};
+  EXPECT_EQ(PredicateRows(100, Compare(CompareOp::kEq, 7), one, 1), 0);    // cannot match
+  EXPECT_EQ(PredicateRows(100, Compare(CompareOp::kNe, 7), one, 1), 100);  // excludes nothing
+  EXPECT_EQ(PredicateRows(100, Compare(CompareOp::kEq, 1), one, 1), 100);  // the only value
+  EXPECT_EQ(PredicateRows(100, Compare(CompareOp::kNe, 1), one, 1), 1);    // floored, not 0
+  // The complement never reaches no row even where the match saturates, because a relation
+  // estimated at no row is ordered first and makes every later estimate 0 as well.
+  EXPECT_EQ(PredicateRows(100, Compare(CompareOp::kNe, 50), Hundred(), 1), 1);
+  Predicate in{.kind = Predicate::Kind::kIn, .column = BoundColumn{}};
+  const auto value = [](Int128 v) { return Constant{.type = LogicalType::kBigInt, .value = v}; };
+  in.values = {value(7), value(8)};
+  EXPECT_EQ(PredicateRows(100, in, one, 1), 0);  // no listed value is in the range
+  in.kind = Predicate::Kind::kNotIn;
+  EXPECT_EQ(PredicateRows(100, in, one, 1), 100);
+  // A value inside the range counts; one outside does not.
+  in.values = {value(1), value(8)};
+  EXPECT_EQ(PredicateRows(100, in, one, 1), 1);  // NOT IN (1, 8): only 1 can match
+  in.kind = Predicate::Kind::kIn;
+  EXPECT_EQ(PredicateRows(100, in, one, 1), 100);  // IN (1, 8): 1 matches every row
+  // Without an exact range no value can be excluded, so the factors apply as before.
+  EXPECT_EQ(PredicateRows(100, Compare(CompareOp::kNe, 7), ColumnRange{}, std::nullopt), 90);
+}
+
+// The whole point of the complement floor, at the level the orderer sees: a filter that keeps every
+// row must not make its relation look empty, because an empty estimate is ordered first and then
+// every later estimate and build side in the block follows from it.
+TEST(JoinOrderTest, AKeepEverythingFilterDoesNotCollapseTheOrder) {
+  const ColumnRange one{.min = 1, .max = 1, .non_null = 100'000, .exact = true};
+  const int64_t kept = PredicateRows(100'000, Compare(CompareOp::kNe, 0), one, 1);
+  EXPECT_EQ(kept, 100'000);
+  // 100,000 rows against a 100-row dimension and a 7-row one: the big relation still probes, and
+  // each step still builds on the relation it adds.
+  const auto steps =
+      OrderJoins(Relations({kept, 100, 7}), std::vector{Edge(0, 1, 100, 100), Edge(0, 2, 7, 7)});
+  EXPECT_EQ(Order(steps), (std::vector<std::size_t>{0, 1, 2}));
+  EXPECT_EQ(Builds(steps),
+            (std::vector<BuildSide>{BuildSide::kRight, BuildSide::kRight, BuildSide::kRight}));
+}
+
+// Without statistics every shape takes its documented default factor, and the shapes the footers
+// never cover take one always.
+TEST(JoinOrderTest, PredicateRowsFromTheDefaultFactors) {
+  const ColumnRange none;
+  EXPECT_EQ(PredicateRows(100, Compare(CompareOp::kEq, 7), none, std::nullopt), 10);  // 1 in 10
+  EXPECT_EQ(PredicateRows(100, Compare(CompareOp::kNe, 7), none, std::nullopt), 90);
+  EXPECT_EQ(PredicateRows(100, Compare(CompareOp::kLt, 7), none, std::nullopt), 33);
+  // A domain is enough for equality even with no range to compare against.
+  EXPECT_EQ(PredicateRows(100, Compare(CompareOp::kEq, 7), none, 4), 25);
+  Predicate in{.kind = Predicate::Kind::kIn, .column = BoundColumn{}};
+  in.values = {Constant{}, Constant{}, Constant{}};
+  EXPECT_EQ(PredicateRows(100, in, none, 10), 30);  // 3 of 10 values
+  EXPECT_EQ(PredicateRows(100, in, none, 2), 100);  // never more rows than there are
+  in.kind = Predicate::Kind::kNotIn;
+  EXPECT_EQ(PredicateRows(100, in, none, 10), 70);
+  // A pattern match, two columns compared and a computed BOOLEAN have no statistics to read.
+  EXPECT_EQ(PredicateRows(100, Predicate{.kind = Predicate::Kind::kLike, .column = BoundColumn{}},
+                          Hundred(), 100),
+            25);
+  EXPECT_EQ(
+      PredicateRows(100, Predicate{.kind = Predicate::Kind::kNotLike, .column = BoundColumn{}},
+                    Hundred(), 100),
+      75);  // the complement of LIKE's quarter
+  EXPECT_EQ(PredicateRows(100, Predicate{.kind = Predicate::Kind::kCompareColumns}, Hundred(), 100),
+            50);
+  EXPECT_EQ(PredicateRows(100, Predicate{.kind = Predicate::Kind::kIsTrue, .column = BoundColumn{}},
+                          Hundred(), 100),
+            50);
+  // IS NOT NULL reads the null count when it is exact, and a default factor otherwise.
+  const Predicate not_null{.kind = Predicate::Kind::kIsNotNull, .column = BoundColumn{}};
+  EXPECT_EQ(PredicateRows(100, not_null, ColumnRange{.non_null = 60, .exact = true}, 100), 60);
+  EXPECT_EQ(PredicateRows(100, not_null, none, std::nullopt), 90);
+  // A folded conjunct that is true for no row keeps none, whatever the statistics say.
+  EXPECT_EQ(PredicateRows(100, Predicate{.kind = Predicate::Kind::kFalse}, Hundred(), 100), 0);
+}
+
 TEST(JoinOrderDeathTest, EdgesJoinTwoRelationsOfTheBlock) {
   EXPECT_DEATH((void)OrderJoins(Relations({1, 2}), std::vector{Edge(1, 1)}), "edge.a != edge.b");
   EXPECT_DEATH((void)OrderJoins(Relations({1, 2}), std::vector{Edge(0, 2)}), "edge.b < relations");

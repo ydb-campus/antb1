@@ -5,7 +5,9 @@
 #include <filesystem>
 #include <format>
 #include <limits>
+#include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -476,6 +478,56 @@ TEST_F(SessionTest, CorrelatedSubqueriesAreUnsupportedInEveryEntryPoint) {
     EXPECT_TRUE(session->Explain(answered).ok()) << answered;
     EXPECT_TRUE(session->ExplainAnalyze(answered).ok()) << answered;
   }
+}
+
+// The build-side ratio is checked, and it reaches the join order: the same query gets a different
+// build side at a different ratio, and the same answer at every one of them (ADR 0026). Three
+// bindings of the 10-row table join on one key, and the equality on `a` leaves the relations joined
+// so far estimated at one row, so the relation added last is decisively larger than them.
+TEST_F(SessionTest, TheBuildSideRatioReachesTheJoinOrderAndKeepsEveryAnswer) {
+  for (const int64_t ratio : {int64_t{99}, int64_t{0}, int64_t{-1}}) {
+    SessionOptions options;
+    options.build_side_ratio = ratio;
+    const auto made = Session::Make(options);
+    ASSERT_TRUE(made.status().IsInvalid()) << ratio;
+    EXPECT_NE(made.status().message().find("build-side ratio"), std::string::npos) << ratio;
+  }
+  const std::string sql =
+      "SELECT COUNT(*) FROM t a, t b, t c "
+      "WHERE a.AdvEngineID = b.AdvEngineID AND b.AdvEngineID = c.AdvEngineID "
+      "AND a.AdvEngineID = 5";
+  const auto lefts = [](const std::string& plan) {
+    std::size_t n = 0;
+    for (std::size_t at = plan.find("build=left"); at != std::string::npos;
+         at = plan.find("build=left", at + 1)) {
+      ++n;
+    }
+    return n;
+  };
+  std::optional<std::vector<std::vector<std::string>>> expected;
+  std::map<int64_t, std::size_t> left_builds;
+  for (const int64_t ratio : {int64_t{100}, int64_t{400}, int64_t{1'000'000}}) {
+    SessionOptions options;
+    options.build_side_ratio = ratio;
+    auto session = Session::Make(options);
+    ASSERT_TRUE(session.ok()) << ratio << ": " << session.status().ToString();
+    ASSERT_TRUE((*session)->RegisterParquet("t", {path_}).ok());
+    auto plan = (*session)->Explain(sql);
+    ASSERT_TRUE(plan.ok()) << ratio << ": " << plan.status().ToString();
+    left_builds[ratio] = lefts(*plan);
+    auto result = (*session)->Execute(sql);
+    ASSERT_TRUE(result.ok()) << ratio << ": " << result.status().ToString();
+    if (!expected.has_value()) {
+      expected = Rows(*result);
+    } else {
+      EXPECT_EQ(Rows(*result), *expected) << "ratio " << ratio;  // the answer never moves
+    }
+  }
+  // Building on the smaller side always finds one here; trusting the estimates only beyond a
+  // millionfold finds none. That difference is the whole chain -- SessionOptions to BindOptions to
+  // OrderJoins -- so stubbing any link of it out fails this.
+  EXPECT_GT(left_builds[100], 0U);
+  EXPECT_EQ(left_builds[1'000'000], 0U);
 }
 
 // The thread count is checked; the row groups of a query run on the session's threads, and the

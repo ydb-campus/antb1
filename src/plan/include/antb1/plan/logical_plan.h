@@ -394,6 +394,13 @@ enum class BuildSide : std::uint8_t { kLeft, kRight };
 // "left", "right".
 std::string_view ToString(BuildSide side);
 
+// How much larger a join's build side must be than the side that probes it before the join builds
+// on the probe side instead (docs/adr/0026-join-performance.md), in hundredths of a factor: 400,
+// the default, flips only a decisive difference and leaves every near-tie as it was, so an estimate
+// that is wrong cannot move a join that is already right; 100 is ADR 0022's original rule, the
+// smaller side always. Below 100 is invalid.
+inline constexpr int64_t kBuildSideRatio = 400;
+
 // One key of a join: a column of the left input and one of the right input, of one type.
 struct JoinKey {
   BoundColumn left;   // of the left input

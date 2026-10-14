@@ -925,6 +925,15 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   a bind error, as for any number (divergence D4). A scan that reads a DECIMAL column applies no predicate itself, so
   every `WHERE` condition of that scan is evaluated by the `Filter` (`explain --analyze` shows no pushed predicate),
   and a condition on a DECIMAL column skips no row group ([ADR 0021](adr/0021-decimal-semantics.md)).
+- Join order and build sides: the relations of a `FROM` list join left-deep in the order their estimated rows choose
+  ([ADR 0022](adr/0022-joins-and-query-blocks.md)), and the estimates account for the conjuncts routed to each
+  relation, from the row counts, minimums, maximums and null counts in the Parquet footers, with a documented default
+  factor for every condition the footers cannot measure ([ADR 0026](adr/0026-join-performance.md)). A join builds its
+  hash table on the relation it adds and probes with the rest; it builds on the rest instead when the relation it adds
+  is estimated at more than `--build-side-ratio` times them (default 4; `1` always builds on the smaller side). The
+  ratio changes which plan a query gets, never its answer, and an unknown estimate on either side never moves a
+  build. Estimates are integer arithmetic over footer metadata alone, so a plan is the same on every host and for any
+  number of threads; `explain` prints `build=left|right` on every join.
 - Execution: the row groups of a query run on `--threads` threads (default: the hardware threads), 64Ki-row
   batches; their results are combined in file and row group order, so a result is the same for any number of
   threads, and deterministic. A DOUBLE `SUM` or `AVG` adds up every row group (per group with `GROUP BY`),
