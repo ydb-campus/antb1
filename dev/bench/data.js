@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791968110854,
+  "lastUpdate": 1791982449665,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -7452,6 +7452,114 @@ window.BENCHMARK_DATA = {
             "value": 99.06521214285898,
             "unit": "ms/iter",
             "extra": "iterations: 7\ncpu: 99.05481628571445 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9c0211c0669a4beb229b112f1eb3b2f5da3ff97c",
+          "message": "feat(plan): unnest correlated scalar aggregates (#136)\n\n## Summary\n\nRoadmap id **U3** of ADR 0023, the last implementation id. Path 2: each\nouter column a correlated\nscalar subquery reads is replaced by its inner equivalent, the\naggregation groups by those\nequivalents, and the one-row dependent join becomes an inner join keyed\non them.\n\n**All 22 TPC-H-derived queries now answer and equal DuckDB.** The\nratchet moves 19 → 22, and every\ngenerated query in a differential run is compared: `unsupported=0` over\n2000 queries, the tolerance\nband shut again.\n\n```text\nFilter tr_fare > \"min(rd_row)\"\n  Join INNER build=right keys=[\"trips.tr_rider\" = \"riders.rd_id\"]\n    Scan trips\n    GroupAggregate keys=[\"riders.rd_id\"] MIN(rd_row)\n      Scan riders\n```\n\n## The COUNT bug was a live wrong answer in this branch\n\nBefore the strictness classifier existed, this branch answered **0**\nwhere DuckDB answers **255**:\n\n```sql\nSELECT COUNT(*) FROM trips WHERE 0 = (SELECT COUNT(*) FROM riders WHERE rd_id = tr_rider)\n```\n\nCOUNT is 0 over no rows, so an outer row with no group passes the\ncomparison — while the rewrite's\ninner join drops it. That is exactly the defect ADR 0023 cites Ganski &\nWong (SIGMOD 1987) for, and\nit is why Path 2 accepts only SUM, AVG, MIN and MAX combined by\nliterals, arithmetic, unary minus\nand implicit casts. `CASE`, `COALESCE`, a function, a boolean operator\nor an explicit cast refuses\nwith exit 4. All four COUNT spellings are refused now, including `0 <\nCOUNT(*)`, which happened to\nagree.\n\n## Two narrowings, both measured against DuckDB before they were written\n\n**The equivalence classes come from the block's correlated conjuncts\nalone** — narrower than the\nADR's \"every equality among the block's WHERE conjuncts\". An inner-inner\nequality can only extend a\nclass that already holds an inner member, so it never gives an outer\ncolumn its *first* inner\nequivalent: the shapes accepted are identical. What it buys is two whole\nclasses of silently wrong\nanswer that cannot then arise — a `LEFT JOIN`'s ON key, which is not\nenforced on padded rows and\nwould make the group key non-NULL exactly where the correlation was\nNULL, and a conjunct of a\nnested dependent join, which an anti join keeps the rows of where it is\nfalse.\n\n**One key per outer column, not one per class.** With two correlated\nequalities onto one inner\ncolumn, a single key drops the second outer column's constraint and\nkeeps rows SQL rejects. Pinned\nby an oracle-written `.slt` record, since the plan tests' fixtures have\nno two columns of one type.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n\n## Verification\n\n```text\n$ pixi run ci\n100% tests passed out of 2680\n\n$ pixi run diff-random\nDIFF: PASS seed=911508270 queries=2000 failed=0 unsupported=0\n\n$ pixi run tidy        (per file over every changed TU)\n0 findings\n\n$ pixi run lint\nevery hook Passed except shellcheck, which fails identically on main\n\nTPCH: pass=[1..22] unsupported=0 failed=0        at SF 0.01 and SF 0.1, 1 and 4 threads\n```\n\n## Two aborts found and fixed inside this branch\n\nBoth are the recurring class — a plan reaching `ResolvePositions` by a\nroute I did not expect:\n\n1. Reading a `std::vector` of keys **after** `std::move`ing its owner\ninto the node. libc++'s\nhardened mode traps with no message (exit 133); `lldb` named the line.\n2. A select item over the aggregate (`MIN(x) * 2`) puts a `Project`\nabove it, and a `Project`\noutputs only its own columns — dropping the group key the join's right\nside names. The key\n   columns are passed through it now.\n\nA third, milder one shaped the tests: Path 2's inner join exposes the\ngroup's key columns that the\none-row dependent join did not, so a hand-built plan whose root *is* the\njoin has a wider output\nthan its `output` list. Real plans always have a `Project` or an\naggregation above, so the plan's\noutput is unchanged — `optimizer.h` now records that this is the one\nrule changing a node's output.\n\n## Maintainer notes\n\n- **Governance, approved in advance**: `tests/data/tpch_status.json` (19\n→ 22) and `AGENTS.md`\n(`19 of 22` → `all 22`). The ratchet demanded both and named each query;\nI asked only once all\n  three passed locally. `README.md` and `docs/sql-subset.md` follow.\n- **The first commit is a T3 bug fix.** T3's candidate rule claimed \"the\nsame type, not merely the\nsame ValueKind\" and its DECIMAL branch enforced it, but\n`ValueKind::kInteger` spans SMALLINT\nthrough BIGINT, so widening integer pairs slipped through. U2 hid it\n(Path 1 casts); Path 2\ncannot, since a class needs one type. Left as its own commit so the\nseeds move once.\n- `docs/sql-subset.md` gains divergence D24 and the three query rows;\nthe prose U2 left stale is\n  corrected here too.\n- **What is left.** Only roadmap id **A1**: ADRs 0013, 0021, 0022 and\n0023 to Accepted (decision\n  C14), now that all 22 pass.\n\n## Checklist\n\n- [x] `pixi run check` passes locally — see the maintainer note; `ci`,\n`coverage` and per-file\n      `clang-tidy` pass\n- [x] Tests cover the change\n- [x] Docs updated where behavior, commands or architecture changed\n- [x] No ClickBench-derived data is committed (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths were agreed with a maintainer\n\n## AI assistance\n\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5) scoped,\nimplemented and verified\nthis PR. An eight-agent scoping workflow raised eight blockers before\nany code was written,\nmost of them wrong-answer blockers verified against DuckDB on real data;\nfour shaped the\nimplementation directly (one key per outer column, the generator's\nwidening keys, and the two\nclass-source hazards). The COUNT bug was reproduced as a live wrong\nanswer in this branch and\n      then closed.\n- Accountable human (has read and understands the whole diff): @hor911\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-14T15:50:51+03:00",
+          "tree_id": "245fd415e930db402d428db12f7d40c59628908d",
+          "url": "https://github.com/ydb-campus/antb1/commit/9c0211c0669a4beb229b112f1eb3b2f5da3ff97c"
+        },
+        "date": 1791982449003,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4835.892428641965,
+            "unit": "ns/iter",
+            "extra": "iterations: 143607\ncpu: 4835.007151461976 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84946.17950349867,
+            "unit": "ns/iter",
+            "extra": "iterations: 7855\ncpu: 84935.16690006368 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222495.22465841312,
+            "unit": "ns/iter",
+            "extra": "iterations: 3147\ncpu: 222422.1804893549 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 444998.90690310276,
+            "unit": "ns/iter",
+            "extra": "iterations: 1579\ncpu: 444853.3438885374 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 401843.7759907941,
+            "unit": "ns/iter",
+            "extra": "iterations: 1741\ncpu: 401780.93854106823 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2112681.3689023624,
+            "unit": "ns/iter",
+            "extra": "iterations: 328\ncpu: 2112469.804878049 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 55.002142923080136,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 54.98338607692312 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 49.375799571428,
+            "unit": "ms/iter",
+            "extra": "iterations: 14\ncpu: 49.36592950000003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 236.14861066666512,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 236.13202033333337 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.979876276596132,
+            "unit": "ms/iter",
+            "extra": "iterations: 47\ncpu: 14.979026680851035 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 23.650050733334638,
+            "unit": "ms/iter",
+            "extra": "iterations: 30\ncpu: 23.648793400000002 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 40.34545752941032,
+            "unit": "ms/iter",
+            "extra": "iterations: 17\ncpu: 40.33429417647054 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 2.2085114462024906,
+            "unit": "ms/iter",
+            "extra": "iterations: 316\ncpu: 2.2083276044303783 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 164.68999375000237,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 164.67743050000027 ms\nthreads: 1"
           }
         ]
       }
