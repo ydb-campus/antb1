@@ -15,7 +15,7 @@ Accepted (with the maintainer-approved plan for GROUP BY, ORDER BY and COUNT(DIS
   as a key value. It lives in `libarrow_compute`, which `exec` already links, and needs no Acero.
 - Arrow's grouped aggregate kernels (`hash_sum` and others) wrap integer sums at 64 bits, while antb1 must return
   DuckDB's exact 128-bit `SUM` and `AVG` (ADR 0004).
-- Execution is single-threaded (ADR 0003), but parallel execution over row groups is the expected next step; the
+- Execution was single-threaded when this was written (ADR 0003); it runs over row groups in parallel since ADR 0013. The
   grouped design should not have to be rewritten for it.
 
 ## Decision

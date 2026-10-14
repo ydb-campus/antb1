@@ -4,7 +4,7 @@ Date: 2026-10-02
 
 ## Status
 
-Proposed
+Accepted (with the maintainer-approved plan for DECIMAL)
 
 ## Context
 
@@ -188,9 +188,9 @@ This amends ADR 0012's list of unsupported constructs and three points of ADR 00
 16. **Keys:** GROUP BY, ORDER BY, top-N and COUNT(DISTINCT) compare DECIMAL values by value within their one type,
     which is the order of the unscaled integers; NULL behaves as for other types. A join key that pairs a DECIMAL
     with another DECIMAL or an integer type compares by value, as in rule 11: both sides are cast to rule 10's type
-    (`price = rate` as a key compares in DECIMAL(16,3)), and at the 38-digit cap a value that does not fit matches
-    no row, where DuckDB fails with a conversion error (divergence D13). A DECIMAL against a DOUBLE compares in
-    DOUBLE, so it is a key only where DOUBLE keys are.
+    (`price = rate` as a key compares in DECIMAL(16,3)); where that type would need more than 38 digits there is
+    no key at all and the equality stays a residual, compared as rule 11 compares it (divergence D13). A DECIMAL
+    against a DOUBLE compares in DOUBLE, so it is a key only where DOUBLE keys are.
 17. **CAST,** when general CAST arrives (it is deferred):
     - DECIMAL to a smaller scale, and DECIMAL to an integer, round half away from zero: 1.005 and -1.005 become 1.01
       and -1.01 as DECIMAL(15,2), and -2.5 becomes -3 as INTEGER;

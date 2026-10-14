@@ -21,7 +21,7 @@ may land first, in a docs-only PR (0013, 0019, 0021-0025).
 | [0010](0010-grouped-aggregation.md) | Grouped aggregation | Accepted |
 | [0011](0011-sorting-and-top-n.md) | Sorting and top-N | Accepted |
 | [0012](0012-scalar-expressions.md) | Scalar expressions | Accepted |
-| [0013](0013-parallel-execution.md) | Parallel execution over row groups | Proposed |
+| [0013](0013-parallel-execution.md) | Parallel execution over row groups | Accepted |
 | [0014](0014-two-level-aggregation.md) | Two-level aggregation with skew-aware partitioning | Proposed |
 | [0015](0015-query-profiles.md) | Query profiles and `explain --analyze` | Proposed |
 | [0016](0016-late-materialization.md) | Late materialization of top-N columns | Proposed |
@@ -29,8 +29,8 @@ may land first, in a docs-only PR (0013, 0019, 0021-0025).
 | [0018](0018-dependent-group-keys.md) | GROUP BY keys that are functions of other keys | Proposed |
 | [0019](0019-own-aggregation-hash-table.md) | An aggregation hash table of our own, scheduled for later | Proposed (deferred) |
 | [0020](0020-filter-pushdown.md) | Filter pushdown into the scan | Proposed |
-| [0021](0021-decimal-semantics.md) | DECIMAL semantics as in DuckDB | Proposed |
-| [0022](0022-joins-and-query-blocks.md) | Joins, query blocks and uncorrelated subqueries | Proposed |
-| [0023](0023-unnesting.md) | Correlated subqueries as dependent joins, unnested by the optimizer | Proposed |
+| [0021](0021-decimal-semantics.md) | DECIMAL semantics as in DuckDB | Accepted |
+| [0022](0022-joins-and-query-blocks.md) | Joins, query blocks and uncorrelated subqueries | Accepted |
+| [0023](0023-unnesting.md) | Correlated subqueries as dependent joins, unnested by the optimizer | Accepted |
 | [0024](0024-several-errors-per-query.md) | Several errors per query, scheduled for later | Proposed (deferred) |
 | [0025](0025-values-table-constructor.md) | The VALUES table constructor, postponed | Postponed |
