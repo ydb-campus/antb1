@@ -279,3 +279,11 @@ SELECT COUNT(*) FROM trips WHERE tr_fare > (SELECT MIN(pm_discount), MAX(pm_disc
 onlyif duckdb
 statement error ^Invalid Input Error: More than one row returned by a subquery
 SELECT COUNT(*) FROM trips WHERE tr_pickup = (SELECT zn_id FROM zones)
+
+# Two outer columns in one equivalence class, both equal to the same inner column: each needs its
+# own join key. One key per class would drop the second column's constraint and keep outer rows
+# that SQL rejects (ADR 0023's Path 2).
+query I nosort
+SELECT COUNT(*) FROM zones WHERE 2 < (SELECT MIN(tr_fare) FROM trips WHERE trips.tr_pickup = zones.zn_id AND trips.tr_pickup = zones.zn_parent)
+----
+0

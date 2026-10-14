@@ -882,6 +882,123 @@ TEST(OptimizerTest, Path1RefusesABlockWithoutAKey) {
   EXPECT_EQ(status.message(), "a correlated EXISTS without a key is not supported");
 }
 
+// ---- ADR 0023's Path 2 (roadmap id U3) ----
+
+// An ungrouped-aggregate block over the correlated filter, as the binder leaves it.
+LogicalNodePtr ScalarBlock(std::vector<ExprPtr> conjuncts, AggKind kind, std::uint32_t first_id) {
+  const ColumnId value{first_id + 90};
+  return Node(AggregateNode{
+      .input = CorrelatedBlock(std::move(conjuncts), first_id),
+      .aggregates = {AggregateCall{
+          .kind = kind, .arg = FieldOf(11, 2), .type = LogicalType::kBigInt, .id = value}}});
+}
+
+// A plan over a dependent join as a real query has it: a Project of the outer columns on top, so
+// the plan's output does not change when Path 2 adds the group's key columns to the join's own.
+LogicalPlan PlanOverJoin(LogicalNodePtr join, std::uint32_t outer_first) {
+  ProjectNode project{.input = std::move(join), .columns = {}, .constants = {}, .ids = {}};
+  for (int field = 0; field < 4; ++field) {
+    BoundColumn column = FieldOf(outer_first, field);
+    project.ids.push_back(column.id);
+    project.columns.push_back(std::move(column));
+  }
+  return PlanOver(Node(std::move(project)));
+}
+
+// The join below the plan's Project.
+const JoinNode* JoinUnder(const LogicalPlan& plan) {
+  const auto* project = std::get_if<ProjectNode>(plan.root.get());
+  return project == nullptr ? nullptr : std::get_if<JoinNode>(project->input.get());
+}
+
+// The rewrite: the aggregation groups by the inner equivalent, the dependent join becomes an inner
+// join keyed on it, and the block's correlated filter is gone.
+TEST(OptimizerTest, Path2GroupsByTheInnerEquivalent) {
+  const LogicalPlan plan = Optimized(PlanOverJoin(
+      Node(DependentJoinNode{
+          .kind = JoinKind::kOneRow,
+          .left = FourFields(1),
+          .right = ScalarBlock({Compare(FieldOf(11, 1), FieldOf(1, 1), CompareOp::kEq)},
+                               AggKind::kMin, 50),
+          .span = {}}),
+      1));
+  const auto* join = JoinUnder(plan);
+  ASSERT_NE(join, nullptr) << Explain(plan);
+  EXPECT_EQ(join->kind, JoinKind::kInner);
+  EXPECT_EQ(join->build, BuildSide::kRight);
+  ASSERT_EQ(join->keys.size(), 1U) << Explain(plan);
+  EXPECT_EQ(join->keys[0].left.id, FieldOf(1, 1).id) << "the outer column";
+  const auto* grouped = std::get_if<GroupAggregateNode>(join->right.get());
+  ASSERT_NE(grouped, nullptr) << Explain(plan);
+  ASSERT_EQ(grouped->keys.size(), 1U);
+  EXPECT_EQ(grouped->keys[0].id, FieldOf(11, 1).id) << "the inner equivalent";
+  EXPECT_EQ(join->keys[0].right.id, grouped->key_ids[0]) << "the group's output, not its input";
+  EXPECT_TRUE(std::holds_alternative<ScanNode>(*grouped->input))
+      << "the correlated filter is gone: " << Explain(plan);
+  EXPECT_EQ(PositionMismatch(plan), std::nullopt) << Explain(plan);
+}
+
+// One key per OUTER column. Two correlations give two keys and two group keys; the case where two
+// outer columns share one inner equivalent, where a key per CLASS would drop the second column's
+// constraint and keep rows SQL rejects, needs two outer columns of one type and is pinned against
+// the oracle in tests/slt/cases/subqueries/scalar.slt.
+TEST(OptimizerTest, Path2KeysEveryOuterColumn) {
+  const LogicalPlan plan = Optimized(PlanOverJoin(
+      Node(DependentJoinNode{
+          .kind = JoinKind::kOneRow,
+          .left = FourFields(1),
+          .right = ScalarBlock({Compare(FieldOf(11, 1), FieldOf(1, 1), CompareOp::kEq),
+                                Compare(FieldOf(11, 2), FieldOf(1, 2), CompareOp::kEq)},
+                               AggKind::kMax, 50),
+          .span = {}}),
+      1));
+  const auto* join = JoinUnder(plan);
+  ASSERT_NE(join, nullptr) << Explain(plan);
+  ASSERT_EQ(join->keys.size(), 2U) << "one per outer column: " << Explain(plan);
+  EXPECT_NE(join->keys[0].left.id, join->keys[1].left.id);
+  const auto* grouped = std::get_if<GroupAggregateNode>(join->right.get());
+  ASSERT_NE(grouped, nullptr) << Explain(plan);
+  EXPECT_EQ(grouped->keys.size(), 2U) << Explain(plan);
+  EXPECT_EQ(PositionMismatch(plan), std::nullopt) << Explain(plan);
+}
+
+// The COUNT bug (R. A. Ganski and H. K. T. Wong, SIGMOD 1987): COUNT is 0 over no rows, so an
+// outer row with no group would pass a comparison the inner join drops it from. It must refuse,
+// not answer -- this was a live wrong answer before the strictness classifier existed.
+TEST(OptimizerTest, Path2RefusesACountAndAnyNonStrictCombination) {
+  for (const AggKind kind : {AggKind::kCountStar, AggKind::kCount, AggKind::kCountDistinct}) {
+    const auto status =
+        Optimize(PlanOver(Node(DependentJoinNode{
+                     .kind = JoinKind::kOneRow,
+                     .left = FourFields(1),
+                     .right = ScalarBlock({Compare(FieldOf(11, 1), FieldOf(1, 1), CompareOp::kEq)},
+                                          kind, 50),
+                     .span = {}})))
+            .status();
+    ASSERT_NE(GetSqlError(status), nullptr) << status.ToString();
+    EXPECT_EQ(GetSqlError(status)->kind(), SqlErrorDetail::Kind::kUnsupported);
+    EXPECT_EQ(status.message(),
+              "a correlated scalar subquery whose aggregate is not SUM, AVG, MIN or MAX is not "
+              "supported");
+  }
+}
+
+// Without an inner equivalent for every outer column the substitution cannot run.
+TEST(OptimizerTest, Path2RefusesAnOuterColumnWithoutAnInnerEquivalent) {
+  const auto status =
+      Optimize(PlanOver(Node(DependentJoinNode{
+                   .kind = JoinKind::kOneRow,
+                   .left = FourFields(1),
+                   .right = ScalarBlock({Compare(FieldOf(11, 1), FieldOf(1, 1), CompareOp::kLt)},
+                                        AggKind::kSum, 50),
+                   .span = {}})))
+          .status();
+  ASSERT_NE(GetSqlError(status), nullptr) << status.ToString();
+  EXPECT_EQ(status.message(),
+            "a correlated scalar subquery with an outer column that has no inner equivalent is "
+            "not supported");
+}
+
 // A plan with no dependent join is unaffected: the pass is an identity and the other rules run.
 TEST(OptimizerTest, TheUnnestingPassLeavesAnOrdinaryPlanAlone) {
   const LogicalPlan plan = Optimized("SELECT COUNT(*) FROM t");

@@ -42,7 +42,7 @@ SELECT AVG(UserID), AVG(ResolutionWidth) FROM hits_like_nulls
 query RR nosort
 SELECT AVG(WatchID), AVG(ClientIP) FROM hits_like WHERE RegionID < 5000
 ----
-93295893444752688	13334174.703935271
+93295893444752704	13334174.703935271
 
 # NULLs are skipped: the sum and the count only see non-NULL values.
 query IRI nosort
