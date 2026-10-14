@@ -80,8 +80,7 @@ SELECT COUNT(*), COUNT(tr_driver) FROM trips anti JOIN drivers ON tr_driver = dv
 ----
 423	319
 
-# The pending twin of the label anti, a NOT EXISTS (roadmap PR U2).
-pending U2
+# The twin of the label anti, a NOT EXISTS (ADR 0023, roadmap PR U2).
 query II nosort anti
 SELECT COUNT(*), COUNT(tr_driver) FROM trips WHERE NOT EXISTS (SELECT * FROM drivers WHERE dv_id = tr_driver)
 ----

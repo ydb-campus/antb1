@@ -1002,6 +1002,7 @@ compare against DuckDB, so an unregistered difference is a bug.
 | D20 | CASE types without a DECIMAL value | types the values that are no literals first, then lets each integer literal take their integer type when it fits and each string literal any type: `CASE WHEN c THEN 7 WHEN c2 THEN s16 END` and `CASE WHEN c THEN 8 WHEN c2 THEN s16 ELSE 7 END` are SMALLINT, a negated literal in parentheses (`-(7)`) counts as an INTEGER expression, and a string literal before a DATE value is that DATE (`THEN '2020-01-01' WHEN c2 THEN dt END`) and before a number unsupported | folds from the `ELSE` value (NULL without one) through the `THEN` values in order, where a literal next to NULL (the first `THEN` value without an `ELSE`) or next to another literal becomes its own type (both CASEs are INTEGER), while an `ELSE` literal takes the next value's type; `-(7)` is a literal (SMALLINT next to `s16`), and a string literal next to NULL is VARCHAR (a bind error next to the DATE or the number) | `plan.BinderTest.CaseTypesWithoutADecimalAreAntb1s` pins antb1's types; the random generator writes the column first among its `CASE` values, where both agree; with a DECIMAL value antb1 folds as DuckDB does ([ADR 0021](adr/0021-decimal-semantics.md) rule 10) |
 | D21 | Keywords as names | the 49 words that are never table aliases ([Grammar](#grammar)) are unquoted column, table and function names, qualifiers and select aliases, with or without `AS` (without `AS`, `glob`, `isnull` and `notnull` continue the expression: unsupported), so `SELECT default FROM t` answers with a column named `default`; `BETWEEN`, `EXISTS`, `INTERVAL` and `OVER` are reserved: no unquoted column or table names (an error) or qualifiers (unsupported), but table aliases, as in DuckDB | refuses all 49 words as unquoted column names (`default` is its `DEFAULT` keyword, an error wherever a query uses it: `SELECT default FROM t` is a binder error), table names, qualifiers and select aliases without `AS` (after an expression `isnull` and `notnull` are its operators `IS NULL` and `IS NOT NULL`, not aliases); accepts them after `AS` and after a dot, and 14 of them as function names (`unpack(...)` is its `UNPACK` operator, the other 34 are syntax errors); accepts `BETWEEN`, `EXISTS`, `INTERVAL` and `OVER` as column and table names and as qualifiers | the fixtures, the `.slt` records and the random generator use none of these words as an unquoted name; `sql.ParserTest.WordsThatCannotBeImplicitAliases`, `sql.ParserTest.EveryReservedWordAfterAsInFrom` and `sql.ParserTest.ReservedWordsThatQualifyNamesInFrom` pin antb1's rules, and `harness.TableAliasOracle.*` compares every DuckDB keyword as a table alias and as a qualifier in FROM with DuckDB itself |
 | D22 | `IN` over a doubly parenthesized query | reads `x [NOT] IN ((query))` as an `IN` list holding one scalar subquery, because a `(` opens a nested query only before a reserved query word (divergence D21), and a list of one subquery is unsupported: exit code 4 at the inner `(` | reads an `IN` subquery and answers it exactly as the single-paren form | `plan.SubqueryPlacements/BindErrorTest` pins the refusal and its span, and `tests/slt/cases/subqueries/in.slt` compares the form with DuckDB's own answer under `onlyif duckdb` |
+| D23 | A correlated `EXISTS`'s conjuncts over different rows | unnests it into a semi or anti join (ADR 0023's Path 1), so a conjunct that reads both blocks is a residual, computed only over the candidate pairs a key matches, and a conjunct that reads only the outer block is a residual too, computed over those same pairs rather than over every outer row | plans a delim join and computes the subquery's conjuncts for the bindings of the outer side, so an overflow in such a conjunct can fail in one engine and not the other | the random generator writes no arithmetic that can overflow (as for divergences D14 and D16), and `tests/slt/cases/subqueries/exists.slt` compares every shape Path 1 answers with DuckDB's own answer |
 
 ## ClickBench status
 
@@ -1082,7 +1083,7 @@ completes the query; most queries also need the DECIMAL work of ADR 0021 before 
 | Q1 | pass | DECIMAL arithmetic, SUM and AVG (ADR 0021) |
 | Q2 | unsupported (exit code 4) | correlated scalar aggregates (ADR 0023) |
 | Q3 | pass | inner joins (ADR 0022) |
-| Q4 | unsupported (exit code 4) | correlated EXISTS and NOT EXISTS (ADR 0023) |
+| Q4 | pass | a correlated EXISTS, unnested into a semi join (ADR 0023's Path 1) |
 | Q5 | pass | inner joins (ADR 0022) |
 | Q6 | pass | DECIMAL arithmetic, SUM and AVG (ADR 0021) |
 | Q7 | pass | derived tables (ADR 0022) |
@@ -1099,8 +1100,8 @@ completes the query; most queries also need the DECIMAL work of ADR 0021 before 
 | Q18 | pass | uncorrelated IN and NOT IN subqueries (ADR 0022) |
 | Q19 | pass | OR factoring for joins (ADR 0022) |
 | Q20 | unsupported (exit code 4) | correlated scalar aggregates (ADR 0023) |
-| Q21 | unsupported (exit code 4) | correlated EXISTS and NOT EXISTS (ADR 0023) |
-| Q22 | unsupported (exit code 4) | correlated EXISTS and NOT EXISTS (ADR 0023) |
+| Q21 | pass | a correlated EXISTS and a NOT EXISTS over the outer block's own table, with a non-equality residual (ADR 0023's Path 1) |
+| Q22 | pass | a correlated NOT EXISTS inside a derived table (ADR 0023's Path 1) |
 
 This workload is derived from the TPC-H Benchmark and is not comparable to published TPC-H Benchmark results, as this
 implementation does not comply with all requirements of the TPC-H Benchmark.

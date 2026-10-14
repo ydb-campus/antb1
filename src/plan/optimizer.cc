@@ -509,8 +509,7 @@ arrow::Result<LogicalNodePtr> Path1(const DependentJoinNode& join, ColumnId& las
 
   std::vector<JoinKey> keys;
   std::vector<ExprPtr> residual;
-  std::vector<Predicate> probe_filter;  // an EXISTS's outer-only conjuncts, below the semi join
-  std::vector<ExprPtr> inner_casts;     // a key's inner side widened to the key type
+  std::vector<ExprPtr> inner_casts;  // a key's inner side widened to the key type
   std::vector<ColumnId> inner_cast_ids;
   std::vector<ExprPtr> outer_casts;  // and its outer side
   std::vector<ColumnId> outer_cast_ids;
@@ -532,15 +531,18 @@ arrow::Result<LogicalNodePtr> Path1(const DependentJoinNode& join, ColumnId& las
       continue;
     }
     if (sides.outer_only()) {
-      // ADR 0023: an outer-only conjunct stays a residual of an anti join -- where it is false or
-      // NULL the subquery has no row, and NOT EXISTS keeps the outer row, which a filter on the
-      // outer rows would drop. In an EXISTS the same reasoning makes it a filter on the probe
-      // side, below the join.
-      if (join.kind == JoinKind::kAnti) {
-        residual.push_back(expr);
-      } else {
-        probe_filter.push_back(predicate);
-      }
+      // ADR 0023: an outer-only conjunct must not become a filter on the outer rows of an anti
+      // join -- where it is false or NULL the subquery has no row, so NOT EXISTS keeps the outer
+      // row that a filter would drop. A residual gets that right: the pair does not match, and
+      // the anti join keeps the row.
+      //
+      // The ADR puts an EXISTS's outer-only conjunct in a filter below the semi join instead,
+      // which is the same answer and drops the rows earlier. A residual is used for both here:
+      // the filter would have to compute the conjunct on the probe side, which widens the semi
+      // join's output and so breaks Optimize's contract that a plan keeps its output columns,
+      // and it would need a Project to undo. Pushing it down is a performance refinement, and
+      // the pass is correct without it.
+      residual.push_back(expr);
       continue;
     }
     if (const std::optional<KeyParts> key = AsKey(*expr, outer)) {
@@ -575,10 +577,6 @@ arrow::Result<LogicalNodePtr> Path1(const DependentJoinNode& join, ColumnId& las
   }
 
   LogicalNodePtr left = join.left;
-  if (!probe_filter.empty()) {
-    left =
-        Make(FilterNode{.input = std::move(left), .predicates = probe_filter, .span = join.span});
-  }
   if (!outer_casts.empty()) {
     left = Make(ComputeNode{
         .input = std::move(left), .exprs = outer_casts, .ids = outer_cast_ids, .span = join.span});

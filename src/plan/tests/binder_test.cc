@@ -890,13 +890,38 @@ INSTANTIATE_TEST_SUITE_P(
                   "other than an aggregate over every row"},
         ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT MIN(i16), MAX(i32) FROM u)", kBind, "(",
                   "a subquery of a comparison must have one column, not 2"},
+        // A top-level conjunct is the one placement ADR 0023's U2 answers, and only correlated:
+        // an uncorrelated EXISTS waits for its own PR, since a semi join needs a key and there is
+        // no correlation to make one from.
         ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT i16 FROM u)", kUnsupported, "EXISTS",
-                  "EXISTS (subqueries) is not supported"},
+                  "an uncorrelated EXISTS is not supported"},
         ErrorCase{"SELECT i16 FROM t WHERE NOT EXISTS (SELECT i16 FROM u)", kUnsupported, "EXISTS",
-                  "EXISTS (subqueries) is not supported"},
+                  "an uncorrelated EXISTS is not supported"},
         // Inside a sub-plan, which CheckSupported's walk of the reachable blocks reaches.
         ErrorCase{"SELECT COUNT(*) FROM (SELECT i16 FROM t WHERE EXISTS (SELECT i16 FROM u)) AS s",
-                  kUnsupported, "EXISTS", "EXISTS (subqueries) is not supported"},
+                  kUnsupported, "EXISTS", "an uncorrelated EXISTS is not supported"},
+        // Every other placement keeps the static refusal, before any name resolves.
+        ErrorCase{"SELECT EXISTS (SELECT i16 FROM u) FROM t", kUnsupported, "EXISTS",
+                  "EXISTS (subqueries) is not supported here"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 = 1 OR EXISTS (SELECT u.i16 FROM u WHERE "
+                  "u.i32 = t.i32)",
+                  kUnsupported, "EXISTS", "EXISTS (subqueries) is not supported here"},
+        ErrorCase{"SELECT i16 FROM t ORDER BY EXISTS (SELECT i16 FROM u)", kUnsupported, "EXISTS",
+                  "EXISTS (subqueries) is not supported here"},
+        // Path 1 takes a plain block only: every clause that would have to act per binding is
+        // refused where the shape is visible, before a name resolves.
+        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT u.i16 FROM u WHERE u.i32 = t.i32 "
+                  "GROUP BY u.i16)",
+                  kUnsupported, "EXISTS", "EXISTS over a subquery with GROUP BY is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT u.i16 FROM u WHERE u.i32 = t.i32 "
+                  "LIMIT 1)",
+                  kUnsupported, "EXISTS", "EXISTS over a subquery with LIMIT is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT MIN(u.i16) FROM u WHERE u.i32 = t.i32)",
+                  kUnsupported, "EXISTS",
+                  "EXISTS over a subquery with an aggregate is not supported"},
+        ErrorCase{"SELECT i32, COUNT(*) FROM t GROUP BY i32 HAVING EXISTS "
+                  "(SELECT u.i16 FROM u WHERE u.i32 = t.i32)",
+                  kUnsupported, "EXISTS", "EXISTS in HAVING is not supported"},
         // A DOUBLE has no join key, by decision (ADR 0022), and a DECIMAL(38,0) with a
         // DECIMAL(38,10) would need 48 digits: a semi join needs one type for its key, so neither
         // exits past 4.

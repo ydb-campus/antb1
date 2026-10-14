@@ -838,6 +838,32 @@ TEST(OptimizerTest, Path1CastsAKeyOfTwoTypes) {
   EXPECT_EQ(PositionMismatch(plan), std::nullopt) << Explain(plan);
 }
 
+// An outer-only conjunct is a residual, in both polarities. For an anti join that is required:
+// where the conjunct is false or NULL the subquery has no row, so NOT EXISTS must keep the outer
+// row, which a filter on the outer rows would drop. For a semi join a residual gives the same
+// answer as the filter ADR 0023 suggests, and keeps the join's output columns, which a computed
+// probe-side column would widen.
+TEST(OptimizerTest, Path1MakesAnOuterOnlyConjunctAResidual) {
+  for (const JoinKind kind : {JoinKind::kSemi, JoinKind::kAnti}) {
+    const LogicalPlan plan = Optimized(PlanOver(Node(DependentJoinNode{
+        .kind = kind,
+        .left = FourFields(1),
+        .right = CorrelatedBlock({Compare(FieldOf(11, 1), FieldOf(1, 1), CompareOp::kEq),
+                                  Compare(FieldOf(1, 2), FieldOf(1, 3), CompareOp::kLt)},
+                                 50),
+        .span = {}})));
+    const auto* join = std::get_if<JoinNode>(plan.root.get());
+    ASSERT_NE(join, nullptr) << Explain(plan);
+    EXPECT_EQ(join->keys.size(), 1U) << Explain(plan);
+    EXPECT_EQ(join->residual.size(), 1U) << ToString(kind) << ": " << Explain(plan);
+    EXPECT_TRUE(std::holds_alternative<ScanNode>(*join->left))
+        << "no filter and no compute on the outer side: " << Explain(plan);
+    EXPECT_EQ(PositionMismatch(plan), std::nullopt) << Explain(plan);
+    // The pass keeps the plan's output columns, which a probe-side computed column would widen.
+    EXPECT_EQ(OutputIds(*plan.root).size(), 4U) << Explain(plan);
+  }
+}
+
 // Without a key the pass refuses: the hash table and the candidate pairs need one (ADR 0023).
 TEST(OptimizerTest, Path1RefusesABlockWithoutAKey) {
   const auto status =
