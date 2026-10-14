@@ -475,6 +475,12 @@ std::vector<ColumnId> OutputIds(const LogicalNode& node);
 // an id its left input defines is no free variable of the whole.
 std::vector<ColumnId> FreeVariables(const LogicalNode& node);
 
+// The largest column id the plan mentions, read or defined; kNoColumnId for a plan that mentions
+// none. A rewrite that has to create a column mints above it, so the new id is plan-unique as the
+// binder's are (ADR 0022). The binder mints in binding order and never needs this; ADR 0023's
+// unnesting pass does, since it casts a correlated key's sides to one type.
+ColumnId MaxColumnId(const LogicalNode& node);
+
 // The plan with every reference's index set to the position of its id in the ids it reads (its
 // input's output ids); unchanged nodes keep their pointers, so the result of a resolved plan is the
 // plan itself. The last step of plan::Bind and plan::Optimize, which refer to columns by id only

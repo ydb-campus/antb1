@@ -29,6 +29,7 @@
 #include "antb1/sql/parser.h"
 
 #include "join_order.h"
+#include "key_type.h"
 #include "or_factoring.h"
 #include "relation_count.h"
 #include "scope.h"
@@ -863,7 +864,9 @@ struct FirstUnsupportedOf {
       case sql::SubqueryExpr::Kind::kIn:
         return Rejection{.span = s.op_span, .message = "IN (subquery) is not supported"};
       case sql::SubqueryExpr::Kind::kExists:
-        return Rejection{.span = s.op_span, .message = "EXISTS (subqueries) is not supported"};
+        // Still every placement but a top-level conjunct of WHERE or an inner join's ON, which
+        // AsSubqueryConjunct intercepts before this walk runs (ADR 0023's U2).
+        return Rejection{.span = s.op_span, .message = "EXISTS (subqueries) is not supported here"};
     }
     return Rejection{.span = s.span, .message = "a subquery is not supported"};
   }
@@ -1100,6 +1103,9 @@ struct SubqueryConjunct {
   bool negated = false;  // kIn: NOT IN, in either of its two spellings
 
   [[nodiscard]] bool scalar() const { return subquery->kind == sql::SubqueryExpr::Kind::kScalar; }
+  // EXISTS and NOT EXISTS (ADR 0023's U2), whose conjunct is the subquery itself: `other` is null,
+  // and `negated` is NOT EXISTS.
+  [[nodiscard]] bool exists() const { return subquery->kind == sql::SubqueryExpr::Kind::kExists; }
 };
 
 std::optional<SubqueryConjunct> AsSubqueryConjunct(const sql::Expr& conjunct) {
@@ -1123,7 +1129,16 @@ std::optional<SubqueryConjunct> AsSubqueryConjunct(const sql::Expr& conjunct) {
     negated = true;
   }
   const auto* subquery = std::get_if<sql::SubqueryExpr>(form);
-  if (subquery == nullptr || subquery->kind != sql::SubqueryExpr::Kind::kIn) {
+  if (subquery == nullptr) {
+    return std::nullopt;
+  }
+  if (subquery->kind == sql::SubqueryExpr::Kind::kExists) {
+    // The conjunct is the subquery itself, so there is no other side; the parser writes NOT EXISTS
+    // as a kExists node with `negated`, and a written NOT over it negates again.
+    return SubqueryConjunct{
+        .subquery = subquery, .other = nullptr, .negated = negated != subquery->negated};
+  }
+  if (subquery->kind != sql::SubqueryExpr::Kind::kIn) {
     return std::nullopt;
   }
   if (negated && subquery->negated) {
@@ -1147,6 +1162,35 @@ std::optional<SubqueryConjunct> AsSubqueryConjunct(const sql::Expr& conjunct) {
 // What needs the catalog, the subquery's column count and the IN key's type, is checked where the
 // sub-block is bound.
 std::optional<Rejection> RejectSubqueryConjunct(const SubqueryConjunct& form, bool having) {
+  if (form.exists()) {
+    // The conjunct is the subquery itself: there is no other side to check. ADR 0023's Path 1 takes
+    // a plain block, so every clause that would have to act per binding is refused here, where the
+    // shape is visible before a name resolves; an uncorrelated EXISTS stays deferred and is refused
+    // once the block is bound, which is when the binder knows it reads nothing out.
+    const sql::SelectStatement& query = *form.subquery->query;
+    std::string_view clause;
+    if (!query.group_by.empty()) {
+      clause = "GROUP BY";
+    } else if (!query.having.empty()) {
+      clause = "HAVING";
+    } else if (query.limit.has_value()) {
+      clause = "LIMIT";
+    } else if (query.offset.has_value()) {
+      clause = "OFFSET";
+    } else if (IsAggregateQuery(query)) {
+      clause = "an aggregate";
+    }
+    if (!clause.empty()) {
+      return Rejection{
+          .span = form.subquery->op_span,
+          .message = std::format("EXISTS over a subquery with {} is not supported", clause)};
+    }
+    if (having) {
+      return Rejection{.span = form.subquery->op_span,
+                       .message = "EXISTS in HAVING is not supported"};
+    }
+    return std::nullopt;
+  }
   if (auto r = FirstUnsupported(*form.other)) {
     return r;
   }
@@ -1650,34 +1694,8 @@ Typed ColumnLeaf(ColumnId id, LogicalType type, std::string name, bool stored_as
 }
 
 // The rank of an integer type among the signed ones (USMALLINT: none).
-int SignedRank(LogicalType type) {
-  switch (type.id()) {
-    case LogicalType::kSmallInt:
-      return 1;
-    case LogicalType::kInteger:
-      return 2;
-    case LogicalType::kBigInt:
-      return 3;
-    case LogicalType::kHugeInt:
-      return 4;
-    default:
-      return 0;
-  }
-}
 
 // The type DuckDB computes two integer operands in (neither of them a literal that fits the
-// other's type): the wider signed type, where USMALLINT with SMALLINT is BIGINT and with a wider
-// type that type.
-LogicalType CombineIntegers(LogicalType a, LogicalType b) {
-  if (a == b) {
-    return a;
-  }
-  if (a == LogicalType::kUSmallInt || b == LogicalType::kUSmallInt) {
-    const LogicalType other = a == LogicalType::kUSmallInt ? b : a;
-    return other == LogicalType::kSmallInt ? LogicalType::kBigInt : other;
-  }
-  return SignedRank(a) >= SignedRank(b) ? a : b;
-}
 
 bool IsSignedInteger(LogicalType t) {
   return t == LogicalType::kSmallInt || t == LogicalType::kInteger || t == LogicalType::kBigInt;
@@ -1886,53 +1904,6 @@ bool Fits(const Expr& constant, LogicalType type) {
 
 std::string DescribeOperand(const Typed& t) {
   return std::format("'{}' is {}", Clip(t.expr->name), ToString(t.expr->type));
-}
-
-// An integer type as the DECIMAL DuckDB computes it in next to a DECIMAL (ADR 0021 rule 4): by its
-// type, so a literal does not shrink to fit (7 is INTEGER, DECIMAL(10,0)).
-LogicalType DecimalOfInteger(LogicalType type) {
-  switch (type.id()) {
-    case LogicalType::kSmallInt:
-    case LogicalType::kUSmallInt:
-      return LogicalType::Decimal(5, 0);
-    case LogicalType::kInteger:
-      return LogicalType::Decimal(10, 0);
-    case LogicalType::kBigInt:
-      return LogicalType::Decimal(19, 0);
-    default:
-      break;
-  }
-  return LogicalType::Decimal(LogicalType::kMaxDecimalWidth, 0);  // HUGEINT
-}
-
-// The one type both sides of a cross-relation equality can be compared in as a join key, where an
-// exact widening reaches it from each (ADR 0022's join keys); std::nullopt otherwise, and the
-// equality then stays a residual. DOUBLE never has one, by decision: its comparison is not exact.
-// BOOLEAN is defensive, mirroring exec's own Invalid: no condition is a comparison operand.
-std::optional<LogicalType> KeyType(LogicalType a, LogicalType b) {
-  if (a == LogicalType::kDouble || b == LogicalType::kDouble || a == LogicalType::kBoolean ||
-      b == LogicalType::kBoolean) {
-    return std::nullopt;
-  }
-  if (a == b) {
-    return a;
-  }
-  if (IsInteger(a) && IsInteger(b)) {
-    return CombineIntegers(a, b);
-  }
-  const bool a_decimal = a == LogicalType::kDecimal;
-  const bool b_decimal = b == LogicalType::kDecimal;
-  if (!(a_decimal || IsInteger(a)) || !(b_decimal || IsInteger(b))) {
-    return std::nullopt;  // a VARCHAR with a DATE, say: no type holds both their values
-  }
-  const LogicalType wide_a = a_decimal ? a : DecimalOfInteger(a);
-  const LogicalType wide_b = b_decimal ? b : DecimalOfInteger(b);
-  const int scale = std::max(wide_a.scale(), wide_b.scale());
-  const int digits = std::max(wide_a.width() - wide_a.scale(), wide_b.width() - wide_b.scale());
-  if (digits + scale > LogicalType::kMaxDecimalWidth) {
-    return std::nullopt;  // BIGINT against DECIMAL(38,30) needs 49 digits
-  }
-  return LogicalType::Decimal(Narrow<std::uint8_t>(digits + scale), Narrow<std::uint8_t>(scale));
 }
 
 // DuckDB's type of `l <op> r` for + - * % with a DECIMAL operand (a decimal literal included) and
@@ -4379,15 +4350,6 @@ arrow::Status Binder::BindAcrossRelations(const sql::Expr& conjunct,
 
 // `expr` as `type`, which an exact widening reaches: the expression itself when it is already of
 // that type.
-ExprPtr WidenTo(const ExprPtr& expr, LogicalType type) {
-  if (expr->type == type) {
-    return expr;
-  }
-  return std::make_shared<const Expr>(
-      Expr{.node = CastExpr{.operand = expr},
-           .type = type,
-           .name = std::format("CAST({} AS {})", expr->name, ToString(type))});
-}
 
 // The column of a subquery join's own side of the comparison: a column of the tree below as is,
 // anything else computed in the join's own layer, directly below it. It stands in for InputColumn
@@ -4419,6 +4381,27 @@ arrow::Status Binder::BindSubqueryConjunct(const sql::Expr& conjunct, const Subq
   // enclosing block has is a correlation that exits 4 rather than a missing column -- which is
   // what keeps a correlated subquery an Unsupported failure and not a bind error.
   ARROW_ASSIGN_OR_RAISE(BoundBlock bound, (*bind_block_)(*form.subquery->query, &scope_));
+  if (form.exists()) {
+    // Before the column-count rule below: an EXISTS block's select list is dropped, so it has no
+    // columns at all, and the rule would make it a bind error where ADR 0023 wants an answer.
+    if (FreeVariables(*bound.plan.root).empty()) {
+      // An uncorrelated EXISTS waits for its own PR (ADR 0023's deferred list): a semi join with
+      // no key is malformed, and there is no correlation to make one from.
+      return Reject(Rejection{.span = form.subquery->op_span,
+                              .message = "an uncorrelated EXISTS is not supported"});
+    }
+    where_subqueries_.push_back(
+        SubqueryJoin{.kind = form.negated ? JoinKind::kAnti : JoinKind::kSemi,
+                     .dependent = true,
+                     .right = bound.plan.root,
+                     .left_key = {},
+                     .right_key = {},
+                     .exprs = {},
+                     .ids = {},
+                     .filter = {},
+                     .span = form.subquery->op_span});
+    return arrow::Status::OK();
+  }
   if (bound.columns.size() != 1) {
     return BindError(std::format("a subquery of {} must have one column, not {}",
                                  form.scalar() ? "a comparison" : "IN", bound.columns.size()),
