@@ -18,7 +18,7 @@ functions `strlen`, `regexp_replace` and `substring`, the timestamp functions `t
 `date_trunc`, and
 `CASE` in every clause, dates written as casts or literals (`CAST('2013-07-01' AS DATE)`, `'2013-07-01'::DATE`,
 `DATE '2013-07-01'`), `LIMIT` and `OFFSET`, over one table of Parquet files or several joined by inner or left
-outer joins, with uncorrelated `IN` and scalar subqueries. This
+outer joins, with `IN`, scalar and `EXISTS` subqueries, correlated or not. This
 covers all 43 ClickBench queries (see
 [ClickBench status](#clickbench-status)). Of the 22 queries derived from TPC-H, Q1, Q3, Q5, Q6, Q7, Q8, Q9, Q10,
 Q11, Q12, Q13, Q14, Q15, Q16, Q18 and Q19 pass
@@ -59,8 +59,8 @@ SELECT date_trunc('month', tr_day) AS m, MIN(tr_fare) FROM trips GROUP BY 1 ORDE
   data falls. Every other placement
   exits 4, `NOT (x NOT IN (query))`, `NOT NOT (x IN (query))`, two subqueries in one comparison and a subquery that
   is no direct operand among them, and so does a subquery column count
-  other than one — a bind error, as in DuckDB. `EXISTS (query)` parses but is not answered,
-  and nor are `TRY_CAST`, a lateral reference, more than 256
+  other than one — a bind error, as in DuckDB. `EXISTS (query)` is answered as a top-level `WHERE`
+  conjunct and nowhere else; `TRY_CAST`, a lateral reference, more than 256
   relations counting every sub-plan and every subquery, and a join graph that no join key connects (a cross
   product): exit code 4 as well. A query in parentheses that starts with neither
   `SELECT` nor `WITH` is refused at its first token: in an expression `(FROM t)` and `(TABLE t)` are, since those
@@ -284,9 +284,16 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   block's inner joins, or above the aggregation for a `HAVING` conjunct, in the order the conjuncts are written. An
   `IN` query may have its own `GROUP BY` and `HAVING`, and nothing is pulled out of it; an aggregate inside any
   subquery does not make the outer block an aggregate query. A column count other than one is a bind error.
-  A **correlated** subquery -- one that reads a column of the block enclosing it -- is exit code 4, at the subquery
-  for a scalar one under a comparison, which the binder plans as a dependent join that the optimizer's unnesting pass
-  then rejects ([ADR 0023](adr/0023-unnesting.md)), and at the `IN` for a correlated `IN` or `NOT IN`, whose NULL
+  A **correlated** subquery -- one that reads a column of the block enclosing it -- is answered where it is a
+  top-level `WHERE` conjunct: the binder plans it as a dependent join, which the optimizer's unnesting pass turns
+  into ordinary joins ([ADR 0023](adr/0023-unnesting.md)). `EXISTS` and `NOT EXISTS` become a semi or anti join,
+  keyed on the equality they correlate through, over a block of `FROM` and `WHERE` alone; a scalar `SUM`, `AVG`,
+  `MIN` or `MAX` under a comparison becomes a `GROUP BY` of the inner equivalent and an inner join, where the
+  select item combines the aggregate with literals and arithmetic alone -- `COUNT` is exit code 4 there, since it
+  is 0 over no rows and the rewrite gives an outer row with no group no row at all (divergences D23 and D24).
+  Every other correlated shape is exit code 4: an uncorrelated `EXISTS`, a block with `GROUP BY`, `HAVING`,
+  `LIMIT`, `OFFSET` or an aggregate inside `EXISTS`, a correlated `EXISTS` without a key, a correlated scalar
+  subquery whose outer column has no inner equivalent, and at the `IN` a correlated `IN` or `NOT IN`, whose NULL
   semantics need the set's NULL and empty flags for each binding; at the subquery for one in `HAVING`, whose outer
   references would read the outer block's groups and not its rows; and at the subquery for a conjunct that is both a
   subquery conjunct and a reader of an enclosing block's column, which neither unnesting path handles. An outer

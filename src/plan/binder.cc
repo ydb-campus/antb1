@@ -2254,8 +2254,10 @@ bool WhereClause(Clause clause) { return clause == Clause::kWhere || clause == C
 // Binds a nested block as a sub-plan of its own, in a scope whose enclosing one is the given scope.
 // A Binder has no catalog and no CTE frame -- both belong to BindBlock, which binds the FROM list
 // before the Binder exists -- so BindBlock hands it this to reach them for a subquery's query.
+// `inside_exists` is true only for the block of an EXISTS conjunct, whose select list ADR 0023's
+// Path 1 checks but does not expand.
 using BindBlockFn =
-    std::function<arrow::Result<BoundBlock>(const sql::SelectStatement&, const Scope*)>;
+    std::function<arrow::Result<BoundBlock>(const sql::SelectStatement&, const Scope*, bool)>;
 
 // One subquery conjunct's join (ADR 0022's J5): above its block's inner joins for a WHERE or
 // inner-ON conjunct, above its aggregation for a HAVING one, in the order the conjuncts are
@@ -2294,10 +2296,11 @@ class Binder {
   // binds a subquery's query, and must outlive the binder.
   Binder(const sql::SelectStatement& stmt, std::vector<Binding> bindings, ColumnIdSource& ids,
          const Scope* outer = nullptr, const BindBlockFn* bind_block = nullptr,
-         bool outer_encloses = false)
+         bool outer_encloses = false, bool inside_exists = false)
       : stmt_(stmt),
         scope_(std::move(bindings), outer),
         outer_encloses_(outer_encloses),
+        inside_exists_(inside_exists),
         ids_(ids),
         bind_block_(bind_block),
         relations_(scope_.bindings().size()) {
@@ -3014,6 +3017,10 @@ class Binder {
   // subquery expression's block has. A derived table's and a CTE's enclosing scope is a sibling or
   // declaring one, so a name found there is a lateral reference and exits 4 (ADR 0022).
   bool outer_encloses_ = false;
+  // The block of an EXISTS conjunct. ADR 0023's Path 1 drops its select list, so a `*` here is
+  // checked for ADR 0022's rule 5 and then neither expanded into columns nor type-checked: a table
+  // with a column antb1 cannot read still works inside EXISTS, as it does in DuckDB.
+  bool inside_exists_ = false;
   bool in_correlated_ = false;  // a correlated conjunct is binding: see InputColumn
   ColumnIdSource& ids_;
   const BindBlockFn* bind_block_ = nullptr;
@@ -3114,6 +3121,11 @@ arrow::Status Binder::BindSelectList() {
       return BindError(std::format("'*' is ambiguous: two FROM items named '{}' have a column '{}'",
                                    scope_.bindings()[conflict->first].name(), conflict->column),
                        stmt_.star_span);
+    }
+    if (inside_exists_) {
+      // Checked, not expanded (ADR 0023): the semi or anti join reads none of these columns, and
+      // the expansion below is the only place a column's engine type is checked.
+      return arrow::Status::OK();
     }
     for (std::size_t b = 0; b < scope_.bindings().size(); ++b) {
       for (std::size_t c = 0; c < scope_.bindings()[b].columns().size(); ++c) {
@@ -4380,7 +4392,8 @@ arrow::Status Binder::BindSubqueryConjunct(const sql::Expr& conjunct, const Subq
   // The sub-plan has its own scope, bound against this block's (rule 9), so a name only an
   // enclosing block has is a correlation that exits 4 rather than a missing column -- which is
   // what keeps a correlated subquery an Unsupported failure and not a bind error.
-  ARROW_ASSIGN_OR_RAISE(BoundBlock bound, (*bind_block_)(*form.subquery->query, &scope_));
+  ARROW_ASSIGN_OR_RAISE(BoundBlock bound,
+                        (*bind_block_)(*form.subquery->query, &scope_, form.exists()));
   if (form.exists()) {
     // Before the column-count rule below: an EXISTS block's select list is dropped, so it has no
     // columns at all, and the rule would make it a bind error where ADR 0023 wants an answer.
@@ -5579,7 +5592,7 @@ struct CteFrame {
 
 arrow::Result<BoundBlock> BindBlock(const sql::SelectStatement& stmt, const Catalog& catalog,
                                     ColumnIdSource& ids, const CteFrame* ctes, const Scope* outer,
-                                    bool outer_encloses = false);
+                                    bool outer_encloses = false, bool inside_exists = false);
 
 // Rule 7: the binding's column names. The alias list renames the leading columns, each losing its
 // own name, and the de-duplication then runs over the result -- so `(SELECT 1 AS x, 2 AS x) s`
@@ -5659,7 +5672,7 @@ arrow::Result<Binding> BindFromItem(const sql::FromItem& item, const Catalog& ca
 
 arrow::Result<BoundBlock> BindBlock(const sql::SelectStatement& stmt, const Catalog& catalog,
                                     ColumnIdSource& ids, const CteFrame* ctes, const Scope* outer,
-                                    bool outer_encloses) {
+                                    bool outer_encloses, bool inside_exists) {
   // The frames of this block: one per CTE holding the CTEs before it, then the block's own.
   std::deque<CteFrame> frames;
   std::vector<const sql::CommonTableExpr*> visible;
@@ -5698,15 +5711,15 @@ arrow::Result<BoundBlock> BindBlock(const sql::SelectStatement& stmt, const Cata
   }
   // A subquery's query is a block of its own: it binds in this block's CTE frame, as its relation
   // count is taken there, and against this block's scope, which the binder passes.
-  const BindBlockFn bind_sub = [&](const sql::SelectStatement& block,
-                                   const Scope* scope) -> arrow::Result<BoundBlock> {
+  const BindBlockFn bind_sub = [&](const sql::SelectStatement& block, const Scope* scope,
+                                   bool exists_block) -> arrow::Result<BoundBlock> {
     // A subquery expression's block is the one case whose enclosing scope is a query block's, so
     // an outer reference in it may be answered (ADR 0023). A derived table and a CTE get the scope
     // of the preceding FROM items or of the declaring block instead, where a reference out is a
     // lateral one, which ADR 0022 refuses.
-    return BindBlock(block, catalog, ids, &own, scope, /*outer_encloses=*/true);
+    return BindBlock(block, catalog, ids, &own, scope, /*outer_encloses=*/true, exists_block);
   };
-  Binder binder(stmt, std::move(bindings), ids, outer, &bind_sub, outer_encloses);
+  Binder binder(stmt, std::move(bindings), ids, outer, &bind_sub, outer_encloses, inside_exists);
   ARROW_ASSIGN_OR_RAISE(LogicalPlan plan, binder.Bind());
   std::vector<BindingColumn> columns;
   columns.reserve(plan.output.size());
