@@ -3447,6 +3447,23 @@ TEST(BinderTest, ColumnIdsAreUniqueAndResolve) {
   EXPECT_EQ(std::get<ProjectNode>(*grouped->root).columns.at(0).id, group.key_ids[0]);
 }
 
+// ADR 0023's Path 1: inside EXISTS a `*` is checked but not expanded, so a table with a column of
+// a type antb1 cannot read still works there, as it does in DuckDB. The same `*` outside EXISTS is
+// exit 4 at the star, which the bind-error cases pin.
+TEST(BinderTest, AStarInsideExistsIsCheckedButNotExpanded) {
+  const auto catalog = testing::MakeCatalog();
+  // `t` has `bad`, a list<int32> column with no engine type.
+  auto plan =
+      BindSql("SELECT i16 FROM u WHERE EXISTS (SELECT * FROM t WHERE t.i64 = u.i64)", catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << Explain(*plan);
+  // Rule 5 of ADR 0022 still applies to it, before any expansion: two bindings of one name that
+  // share a column name make the star a bind error inside EXISTS too.
+  auto conflict = BindSql(
+      "SELECT i16 FROM u WHERE EXISTS (SELECT * FROM t, t AS t WHERE t.i64 = u.i64)", catalog);
+  EXPECT_FALSE(conflict.ok());
+}
+
 // A correlated scalar subquery binds to a DependentJoin (ADR 0023's U1), which the unnesting pass
 // then rejects: the query exits 4 either way, but through the pass, which is what U2 and U3 replace
 // with a rewrite. This is the one SQL shape that reaches a dependent join in U1: EXISTS waits for

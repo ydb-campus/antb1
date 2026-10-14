@@ -451,6 +451,11 @@ struct KeyParts {
   LogicalType inner_type = LogicalType::kBigInt;
   LogicalType outer_type = LogicalType::kBigInt;
   LogicalType key_type = LogicalType::kBigInt;
+  // What the binder calls each side. BindBool's column_of puts the names in the PredicateExpr's
+  // own predicate, positionally, while the ids live in the operands; EXPLAIN prints them, so a key
+  // built without them reads `keys=[outer = inner]`.
+  std::string inner_name;
+  std::string outer_name;
 };
 
 std::optional<KeyParts> AsKey(const Expr& expr, const std::set<ColumnId>& outer_ids) {
@@ -475,11 +480,18 @@ std::optional<KeyParts> AsKey(const Expr& expr, const std::set<ColumnId>& outer_
   if (!key.has_value()) {
     return std::nullopt;  // DOUBLE, or no type holds both: a residual
   }
+  const auto name_of = [](const std::optional<BoundColumn>& column, const Expr& fallback) {
+    return column.has_value() && !column->name.empty() ? column->name : fallback.name;
+  };
+  const std::optional<BoundColumn>& first = predicate->predicate.column;
+  const std::optional<BoundColumn>& second = predicate->predicate.other;
   return KeyParts{.inner = a_outer ? *b : *a,
                   .outer = a_outer ? *a : *b,
                   .inner_type = inner_expr.type,
                   .outer_type = outer_expr.type,
-                  .key_type = *key};
+                  .key_type = *key,
+                  .inner_name = name_of(a_outer ? second : first, inner_expr),
+                  .outer_name = name_of(a_outer ? first : second, outer_expr)};
 }
 
 // ---- ADR 0023's Path 2: equivalence substitution (scalar aggregates, U3) ----
@@ -654,9 +666,9 @@ arrow::Result<LogicalNodePtr> Path1(const DependentJoinNode& join, ColumnId& las
         return BoundColumn{.id = cast_ids.back(), .name = casts.back()->name, .type = to};
       };
       keys.push_back(JoinKey{.left = side(key->outer, key->outer_type, key->key_type, outer_casts,
-                                          outer_cast_ids, "outer"),
+                                          outer_cast_ids, key->outer_name),
                              .right = side(key->inner, key->inner_type, key->key_type, inner_casts,
-                                           inner_cast_ids, "inner")});
+                                           inner_cast_ids, key->inner_name)});
       continue;
     }
     residual.push_back(expr);  // reads both sides and is no key: a residual over candidate pairs
