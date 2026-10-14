@@ -1,7 +1,7 @@
 # AGENTS.md: antb1
 antb1 is an experimental C++23 analytics engine: SQL-like queries over local Parquet files, built on Apache Arrow C++ 25
 (conda-forge). Namespace `antb1`, CLI `antb1`. It answers global and grouped aggregates, expressions, sorting, top-N and
-inner and left outer joins: all 43 ClickBench queries, 19 of 22 from TPC-H. This file is the canonical guide for every
+inner and left outer joins: all 43 ClickBench queries, all 22 from TPC-H. This file is the canonical guide for every
 agent. Maps: [architecture](docs/architecture.md) · [SQL subset](docs/sql-subset.md) · [testing](docs/testing.md) ·
 [CI](docs/ci.md) · [benchmarks](docs/benchmarks.md) · [ADRs](docs/adr/README.md) · [contributing](CONTRIBUTING.md).
 ## Golden rules

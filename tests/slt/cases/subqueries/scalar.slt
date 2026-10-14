@@ -186,33 +186,28 @@ SELECT COUNT(*) FROM trips WHERE 2147483647 + 1 = (SELECT COUNT(*) FROM promos)
 # ---- pending: correlated scalar aggregates (ADR 0023; roadmap PR U3 removes these guards) ----
 
 # Empty groups: riders 237 to 240 have no trip, so their SUM is NULL and the comparison drops them.
-pending U3
 query I nosort
 SELECT COUNT(*) FROM riders WHERE rd_id > 225 AND 0 < (SELECT SUM(tr_fare) FROM trips WHERE tr_rider = rd_id)
 ----
 11
 
 # SUM, MIN of a DATE and AVG.
-pending U3
 query I nosort
 SELECT COUNT(*) FROM riders WHERE (SELECT SUM(tr_fare) FROM trips WHERE tr_rider = rd_id) > 200
 ----
 34
 
-pending U3
 query I nosort
 SELECT COUNT(*) FROM riders WHERE rd_joined > (SELECT MIN(tr_day) FROM trips WHERE tr_rider = rd_id)
 ----
 12
 
-pending U3
 query I nosort
 SELECT COUNT(*) FROM riders WHERE (SELECT AVG(tr_fare) FROM trips WHERE tr_rider = rd_id) > 17
 ----
 27
 
 # An aggregate combined with literals.
-pending U3
 query I rowsort
 SELECT rd_id FROM riders WHERE rd_id < 20 AND 400 < (SELECT SUM(tr_fare) * 2 - 10 FROM trips WHERE tr_rider = rd_id)
 ----
@@ -221,7 +216,6 @@ SELECT rd_id FROM riders WHERE rd_id < 20 AND 400 < (SELECT SUM(tr_fare) * 2 - 1
 17
 
 # Two columns of the same types on both sides (the repeated keys of shifts each count).
-pending U3
 query I nosort
 SELECT COUNT(*) FROM shifts WHERE sh_hours * 4 > (SELECT SUM(tr_fare) FROM trips WHERE tr_driver = sh_driver AND tr_day = sh_day)
 ----
@@ -229,7 +223,6 @@ SELECT COUNT(*) FROM shifts WHERE sh_hours * 4 > (SELECT SUM(tr_fare) FROM trips
 
 # A correlation into a middle block: the subquery reads the zones of the IN subquery, not the outer cities (roadmap
 # PR J5 for the IN).
-pending U3
 query I rowsort
 SELECT ct_id FROM cities
 WHERE ct_id IN (SELECT zn_city FROM zones WHERE zn_radius * 3 > (SELECT AVG(tr_distance) FROM trips WHERE tr_pickup = zn_id))
@@ -286,3 +279,11 @@ SELECT COUNT(*) FROM trips WHERE tr_fare > (SELECT MIN(pm_discount), MAX(pm_disc
 onlyif duckdb
 statement error ^Invalid Input Error: More than one row returned by a subquery
 SELECT COUNT(*) FROM trips WHERE tr_pickup = (SELECT zn_id FROM zones)
+
+# Two outer columns in one equivalence class, both equal to the same inner column: each needs its
+# own join key. One key per class would drop the second column's constraint and keep outer rows
+# that SQL rejects (ADR 0023's Path 2).
+query I nosort
+SELECT COUNT(*) FROM zones WHERE 2 < (SELECT MIN(tr_fare) FROM trips WHERE trips.tr_pickup = zones.zn_id AND trips.tr_pickup = zones.zn_parent)
+----
+0

@@ -1620,18 +1620,25 @@ TEST(QueryGenerator, SubstringChangesOnlySubstringQueries) {
 // A correlated conjunct comes from the seventh stream, so every seed that declines one generates
 // the query it did before ADR 0023's T3, SQL and features alike.
 TEST(QueryGenerator, CorrelatedSubqueriesChangeOnlyCorrelatedQueries) {
-  const FeatureSet with_corr = Union(kSupportedFeatures, {Feature::kCorrelatedExists});
+  // kCorrelatedExists gates the candidate list, so removing it removes both correlated forms.
+  const FeatureSet with_corr =
+      Union(kSupportedFeatures, {Feature::kCorrelatedExists, Feature::kCorrelatedAggregate});
   const auto with = MakeOver(JoinTables(), 71, {.supported = with_corr, .target_percent = 0});
-  const auto without =
-      MakeOver(JoinTables(), 71,
-               {.supported = with_corr.Minus({Feature::kCorrelatedExists}), .target_percent = 0});
+  const auto without = MakeOver(
+      JoinTables(), 71,
+      {.supported = with_corr.Minus({Feature::kCorrelatedExists, Feature::kCorrelatedAggregate}),
+       .target_percent = 0});
   int took = 0;
   int same = 0;
   for (uint64_t i = 0; i < 8000; ++i) {
     const auto q = with.Generate(i);
     const auto plain = without.Generate(i);
-    EXPECT_FALSE(plain.features.Has(Feature::kCorrelatedExists)) << plain.sql;
-    if (!q.features.Has(Feature::kCorrelatedExists)) {
+    const auto correlated = [](const GeneratedQuery& g) {
+      return g.features.Has(Feature::kCorrelatedExists) ||
+             g.features.Has(Feature::kCorrelatedAggregate);
+    };
+    EXPECT_FALSE(correlated(plain)) << plain.sql;
+    if (!correlated(q)) {
       ++same;
       EXPECT_EQ(q.sql, plain.sql) << i;
       EXPECT_EQ(q.features, plain.features) << i;

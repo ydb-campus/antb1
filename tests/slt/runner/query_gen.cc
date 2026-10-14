@@ -2557,6 +2557,15 @@ class Builder {
               outer_key.via_override != inner_key.via_override) {
             continue;  // no DOUBLE key (ADR 0022), and both read the same way
           }
+          // One SQL type on both ends, not merely one ValueKind: kInteger spans SMALLINT through
+          // BIGINT, and for an integer column the storage range is the type. ADR 0023's Path 2
+          // feeds an equivalence class only from an equality of two columns of ONE type, so a
+          // widening pair writes an aggregate form U3 refuses -- which would be a diff failure
+          // rather than an unsupported answer once U3 declares the feature.
+          if (outer_key.kind == ValueKind::kInteger &&
+              (outer_key.min != inner_key.min || outer_key.max != inner_key.max)) {
+            continue;
+          }
           if (outer_key.kind == ValueKind::kDecimal &&
               (outer_key.precision != inner_key.precision || outer_key.scale != inner_key.scale)) {
             continue;  // one DECIMAL type on both ends, not merely one ValueKind

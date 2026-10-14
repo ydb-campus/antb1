@@ -3498,11 +3498,18 @@ TEST(BinderTest, ACorrelatedScalarSubqueryBindsToADependentJoin) {
   EXPECT_FALSE(FreeVariables(*dependent->right).empty());
   EXPECT_TRUE(FreeVariables(*plan->root).empty()) << "the left input binds every free variable";
 
-  // The pass rejects it: exit code 4 at the subquery, not a bind error and not an abort.
-  const auto status = Optimize(*plan).status();
-  const auto detail = GetSqlError(status);
-  ASSERT_NE(detail, nullptr) << status.ToString();
-  EXPECT_EQ(detail->kind(), SqlErrorDetail::Kind::kUnsupported);
+  // Path 2 (roadmap id U3) unnests it: the aggregation groups by the inner equivalent and the
+  // dependent join becomes an inner join keyed on it.
+  const auto optimized = Optimize(*plan);
+  ASSERT_TRUE(optimized.ok()) << optimized.status().ToString();
+  EXPECT_EQ(Explain(*optimized),
+            "Output: i16:SMALLINT\n"
+            "Project i16\n"
+            "  Filter i32 = \"min(u.i32)\"\n"
+            "    Join INNER build=right keys=[\"t.i64\" = \"u.i64\"]\n"
+            "      Scan table=t source=fake columns=[i16, i32, i64]\n"
+            "      GroupAggregate keys=[\"u.i64\"] MIN(i32)\n"
+            "        Scan table=u source=fake columns=[i32, i64]\n");
 
   // An uncorrelated scalar subquery keeps ADR 0022's direct one-row join.
   auto plain = BindSql("SELECT i16 FROM t WHERE i32 = (SELECT MIN(u.i32) FROM u)", catalog);

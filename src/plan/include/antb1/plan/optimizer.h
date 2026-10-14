@@ -25,6 +25,11 @@ namespace antb1::plan {
 // plan::ResolvePositions sets every index from the ids (ADR 0022). A plan it returns has the same
 // output columns (and column ids) and the same answer as the input plan, and holds no dependent
 // join, so no later pass and no operator meets one.
+//
+// The unnesting pass is the one rule that changes a NODE's output columns: Path 2's inner join
+// exposes the group's key columns that the dependent join did not. The PLAN's output is unchanged
+// all the same, since the binder always puts a Project or an aggregation above a subquery's join;
+// a hand-built plan whose root is the join itself would see the wider output.
 arrow::Result<LogicalPlan> Optimize(const LogicalPlan& plan);
 
 }  // namespace antb1::plan
