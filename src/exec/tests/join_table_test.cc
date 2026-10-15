@@ -1181,7 +1181,7 @@ TEST_F(JoinTableTest, ThreadsMarkingAtOnceLoseNoMark) {
     const std::unique_ptr<JoinMarks> marks = std::move(*made);
     // Marker i takes every 16th row, so all 16 threads write the same words throughout.
     ASSERT_TRUE(ForEach(pool.get(), kMarkers, [&](std::size_t i) {
-                  for (int64_t row = static_cast<int64_t>(i); row < kRows;
+                  for (auto row = static_cast<int64_t>(i); row < kRows;
                        row += static_cast<int64_t>(kMarkers)) {
                     marks->Mark(static_cast<std::uint32_t>(row));
                   }

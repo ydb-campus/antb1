@@ -479,6 +479,15 @@ LogicalNodePtr Node(LogicalNode node) {
 }
 
 // A Scan of fields 0-3 of AllTypesSchema (i16, i32, i64, u16) as columns first .. first + 3.
+LogicalNodePtr FourFieldsRows(std::uint32_t first, int64_t rows) {
+  return Node(ScanNode{
+      .table = std::make_shared<testing::FakeTable>(testing::AllTypesSchema(), rows),
+      .table_name = "t" + std::to_string(first),
+      .fields = {0, 1, 2, 3},
+      .ids = {ColumnId{first}, ColumnId{first + 1}, ColumnId{first + 2}, ColumnId{first + 3}},
+      .span = {}});
+}
+
 LogicalNodePtr FourFields(std::uint32_t first) {
   return Node(ScanNode{
       .table = std::make_shared<testing::FakeTable>(testing::AllTypesSchema(), 10),
@@ -749,7 +758,8 @@ TEST(OptimizerTest, TheUnnestingPassRejectsWhatNeitherPathFits) {
 // A correlated subquery's block as the binder leaves it: the inner Scan under a Compute that
 // evaluates the correlated conjuncts and a Filter that tests them, which is where the pass looks.
 // `conjuncts` are the PredicateExprs, one per correlated conjunct.
-LogicalNodePtr CorrelatedBlock(std::vector<ExprPtr> conjuncts, std::uint32_t first_id) {
+LogicalNodePtr CorrelatedBlockOver(LogicalNodePtr inner, std::vector<ExprPtr> conjuncts,
+                                   std::uint32_t first_id) {
   std::vector<ColumnId> ids;
   std::vector<Predicate> predicates;
   for (std::size_t i = 0; i < conjuncts.size(); ++i) {
@@ -760,8 +770,12 @@ LogicalNodePtr CorrelatedBlock(std::vector<ExprPtr> conjuncts, std::uint32_t fir
   }
   return Node(FilterNode{
       .input = Node(ComputeNode{
-          .input = FourFields(11), .exprs = std::move(conjuncts), .ids = std::move(ids)}),
+          .input = std::move(inner), .exprs = std::move(conjuncts), .ids = std::move(ids)}),
       .predicates = std::move(predicates)});
+}
+
+LogicalNodePtr CorrelatedBlock(std::vector<ExprPtr> conjuncts, std::uint32_t first_id) {
+  return CorrelatedBlockOver(FourFields(11), std::move(conjuncts), first_id);
 }
 
 // `left <op> right` as the binder writes a correlated conjunct: a PredicateExpr whose operands
@@ -779,6 +793,45 @@ ExprPtr Compare(const BoundColumn& left, const BoundColumn& right, CompareOp op)
                                  .operands = {leaf(left), leaf(right)}},
            .type = LogicalType::kBoolean,
            .name = "cmp"});
+}
+
+// ADR 0026's C2b and C3: a semi join may build on the side it preserves, the outer one, when the
+// subquery's side is estimated at more than `build_side_ratio` hundredths times it -- the shape a
+// correlated EXISTS over a large table has. An anti join cannot emit its build rows yet (C2c), so
+// it keeps building on the subquery whatever the estimates say.
+TEST(OptimizerTest, Path1BuildsOnTheOuterSideOfASemiJoinOverAMuchLargerSubquery) {
+  // The outer side is 10 rows; `inner` is the subquery's.
+  const auto side = [](JoinKind kind, int64_t inner, int64_t ratio) {
+    const arrow::Result<LogicalPlan> plan =
+        Optimize(PlanOver(Node(DependentJoinNode{
+                     .kind = kind,
+                     .left = FourFields(1),
+                     .right = CorrelatedBlockOver(
+                         FourFieldsRows(11, inner),
+                         {Compare(FieldOf(11, 1), FieldOf(1, 1), CompareOp::kEq)}, 50),
+                     .span = {}})),
+                 BindOptions{.build_side_ratio = ratio});
+    EXPECT_TRUE(plan.ok()) << plan.status().ToString();
+    if (!plan.ok()) {
+      return BuildSide::kRight;
+    }
+    const auto* join = std::get_if<JoinNode>(plan->root.get());
+    EXPECT_NE(join, nullptr) << Explain(*plan);
+    return join == nullptr ? BuildSide::kRight : join->build;
+  };
+  // Exactly the ratio is not more than it, so the boundary keeps the side every join had before.
+  EXPECT_EQ(side(JoinKind::kSemi, 40, kBuildSideRatio), BuildSide::kRight);
+  EXPECT_EQ(side(JoinKind::kSemi, 41, kBuildSideRatio), BuildSide::kLeft);
+  EXPECT_EQ(side(JoinKind::kSemi, 4000, kBuildSideRatio), BuildSide::kLeft);
+  // A ratio of 1 builds on the smaller side whenever it is smaller at all (ADR 0022's rule).
+  EXPECT_EQ(side(JoinKind::kSemi, 11, 100), BuildSide::kLeft);
+  EXPECT_EQ(side(JoinKind::kSemi, 10, 100), BuildSide::kRight) << "a tie keeps the subquery";
+  // The subquery being smaller never moves the build: there is nothing to win.
+  EXPECT_EQ(side(JoinKind::kSemi, 1, kBuildSideRatio), BuildSide::kRight);
+  // And an anti join never moves, however lopsided it is.
+  for (const int64_t inner : {1, 41, 4000}) {
+    EXPECT_EQ(side(JoinKind::kAnti, inner, kBuildSideRatio), BuildSide::kRight) << inner;
+  }
 }
 
 // The pull-up: the block's conjunct becomes the join's key, the dependent join becomes a semi or

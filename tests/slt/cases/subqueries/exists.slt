@@ -131,6 +131,85 @@ SELECT COUNT(*) FROM trips WHERE EXISTS (SELECT COUNT(*) FROM promos WHERE pm_id
 ----
 3000
 
+# ---- the outer side far smaller than the subquery's (ADR 0026's C2b) ----
+
+# `trips` has about twenty times the rows of `zones`, so the semi join builds on the outer side and
+# emits the rows it marked there, in the build's order rather than the probe's.
+
+# Every row of the smaller side once, however many rows of the larger one match it.
+query I nosort
+SELECT COUNT(*) FROM zones WHERE EXISTS (SELECT * FROM trips WHERE tr_pickup = zn_id)
+----
+40
+
+# A residual reads both blocks, so its columns are the outer side's and then the subquery's while
+# the join probes with the subquery: the marked rows are those with a pair that passes.
+query I nosort
+SELECT zn_id FROM zones WHERE EXISTS (SELECT * FROM trips WHERE tr_pickup = zn_id AND tr_fare > zn_radius) ORDER BY zn_id
+----
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+40
+
+# Nothing passes the residual, so nothing is marked and the join emits no row.
+query I nosort
+SELECT COUNT(*) FROM zones WHERE EXISTS (SELECT * FROM trips WHERE tr_pickup = zn_id AND tr_fare < -1)
+----
+0
+
+# The subquery's NULL keys match nothing, and a zone with no trip is not marked.
+query I nosort
+SELECT COUNT(*) FROM zones WHERE EXISTS (SELECT * FROM trips WHERE tr_dropoff = zn_id)
+----
+40
+
+# NOT EXISTS of the same shape still builds on the subquery (C2c is not in). With the EXISTS above
+# it it partitions the 40 zones: a semi join and an anti join over one condition keep every row
+# between them and none twice, whichever side either of them builds on.
+query I nosort
+SELECT COUNT(*) FROM zones WHERE NOT EXISTS (SELECT * FROM trips WHERE tr_pickup = zn_id AND tr_fare > zn_radius)
+----
+3
+
+query I nosort
+SELECT COUNT(*) FROM zones WHERE EXISTS (SELECT * FROM trips WHERE tr_pickup = zn_id AND tr_fare > zn_radius)
+----
+37
+
 # ---- DuckDB only until the uncorrelated EXISTS gets a PR (ADR 0023) ----
 
 onlyif duckdb

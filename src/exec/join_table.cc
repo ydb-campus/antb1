@@ -378,7 +378,7 @@ arrow::Result<std::unique_ptr<JoinMarks>> JoinMarks::Make(int64_t rows, MemoryBu
 }
 
 void JoinMarks::Mark(std::uint32_t row) {
-  ANTB1_CHECK(static_cast<int64_t>(row) < rows_);
+  ANTB1_CHECK(std::cmp_less(row, rows_));
   std::atomic<std::uint64_t>& word = words_[row / 64];
   const std::uint64_t bit = std::uint64_t{1} << (row % 64);
   // Most probe rows of a right-direction join share a build row with an earlier one -- that is why
@@ -389,7 +389,7 @@ void JoinMarks::Mark(std::uint32_t row) {
 }
 
 bool JoinMarks::marked(std::uint32_t row) const {
-  ANTB1_CHECK(static_cast<int64_t>(row) < rows_);
+  ANTB1_CHECK(std::cmp_less(row, rows_));
   return (words_[row / 64].load(kOrder) & (std::uint64_t{1} << (row % 64))) != 0;
 }
 

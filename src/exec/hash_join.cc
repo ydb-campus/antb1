@@ -401,15 +401,15 @@ arrow::Status PartRightJoinOperator::Open(ExecContext& ctx) {
   // part runs before the scheduler below exists, so this is the one moment at which the marks can
   // be made: every part's probe then finds them through the build they share.
   ARROW_RETURN_NOT_OK(build_->PrepareMarks(ctx));
-  auto task = [pipeline = pipeline_, part_ctx = PartContext(ctx),
-               profile = profile()](int64_t part,
-                                    const std::atomic<bool>& stop) -> arrow::Result<bool> {
+  auto task = [pipeline = pipeline_, part_ctx = PartContext(ctx), profile = profile()](
+                  int64_t part, const std::atomic<bool>& stop) -> arrow::Result<bool> {
     const ProfileTimer part_time(profile, "part_time");
     // The part's probe marks and hands nothing on: a batch with no selected row never reaches
     // `consume` (RunPart drops it), so this asks for every batch and expects none.
-    ARROW_RETURN_NOT_OK(RunPart(*pipeline, part, part_ctx, stop, [](Batch) -> arrow::Result<bool> {
-      return arrow::Status::Invalid("a join that emits its build rows handed on a probe batch");
-    }));
+    ARROW_RETURN_NOT_OK(
+        RunPart(*pipeline, part, part_ctx, stop, [](const Batch&) -> arrow::Result<bool> {
+          return arrow::Status::Invalid("a join that emits its build rows handed on a probe batch");
+        }));
     return true;
   };
   scheduler_ = std::make_unique<PartScheduler<bool>>(num_parts_, std::move(task), ctx.executor,
@@ -493,7 +493,6 @@ arrow::Status PartRightJoinOperator::Close() {
   return arrow::Status::OK();
 }
 
-
 arrow::Result<std::unique_ptr<HashJoinOperator>> HashJoinOperator::Make(
     std::unique_ptr<Operator> probe, std::shared_ptr<JoinBuild> build, std::vector<int> probe_keys,
     plan::BuildSide build_side, std::vector<plan::ExprPtr> residual, bool prepares) {
@@ -546,10 +545,14 @@ arrow::Result<std::unique_ptr<HashJoinOperator>> HashJoinOperator::Make(
                             kind == plan::JoinKind::kNullAwareAnti;
   // A join that emits its build rows outputs the build's own schema object, for the same reason the
   // pass-through kinds output the probe's: a build above it takes the object as it is.
-  std::shared_ptr<arrow::Schema> schema =
-      emits_build  ? spec.schema()
-      : pass_through ? probe->output_schema()
-                     : JoinSchema(probe_schema, *spec.schema(), build_side);
+  std::shared_ptr<arrow::Schema> schema;
+  if (emits_build) {
+    schema = spec.schema();
+  } else if (pass_through) {
+    schema = probe->output_schema();
+  } else {
+    schema = JoinSchema(probe_schema, *spec.schema(), build_side);
+  }
   // A residual reads the left input's columns, then the right one's (the probe's and the build's,
   // in the order of the sides).
   const int width = probe_schema.num_fields() + spec.schema()->num_fields();
@@ -609,16 +612,16 @@ HashJoinOperator::HashJoinOperator(std::unique_ptr<Operator> probe,
   arrow::FieldVector fields;
   std::vector<int> original;
   for (const int column : read) {
-    const auto [build, index] = side_of(column);
-    if (!build) {
+    const auto [on_build, index] = side_of(column);
+    if (!on_build) {
       pair_probe_.push_back(index);
       fields.push_back(probe_schema.field(index));
       original.push_back(column);
     }
   }
   for (const int column : read) {
-    const auto [build, index] = side_of(column);
-    if (build) {
+    const auto [on_build, index] = side_of(column);
+    if (on_build) {
       pair_build_.push_back(index);
       fields.push_back(build_schema.field(index)->WithNullable(true));
       original.push_back(column);
@@ -1027,7 +1030,7 @@ arrow::Result<int64_t> HashJoinOperator::NextSlots() {
       }
       if (emits_build_) {
         build_positions_[slot] = candidate;  // never kPadded: only a left join pads, and it emits
-      }                                      // its probe's rows
+      }  // its probe's rows
     });
   }
   row_ = row;

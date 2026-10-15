@@ -946,6 +946,15 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   ratio changes which plan a query gets, never its answer, and an unknown estimate on either side never moves a
   build. Estimates are integer arithmetic over footer metadata alone, so a plan is the same on every host and for any
   number of threads; `explain` prints `build=left|right` on every join.
+- A semi join of a correlated `EXISTS` builds on the side it preserves, the outer one, when the subquery's side is
+  estimated at more than the same ratio times it ([ADR 0026](adr/0026-join-performance.md)): a correlated `EXISTS`
+  over a large table otherwise builds the whole of that table to probe it with far fewer rows. Such a join emits the
+  rows of the side it builds on, so it ends its probe's pipeline rather than sitting inside one, and `explain` shows
+  it as `RightJoin` with its probe and its build beneath; whatever is above it runs on one thread. The rows it
+  returns are the rows the other direction returns, in the build's order rather than the probe's; neither order is
+  specified without `ORDER BY`. A plan whose probe has no row groups to spread over keeps building on its right
+  input. An `EXISTS` that is not correlated, a `NOT EXISTS`, a `NOT IN` and a `LEFT JOIN` always build on their
+  right input.
 - Execution: the row groups of a query run on `--threads` threads (default: the hardware threads), 64Ki-row
   batches; their results are combined in file and row group order, so a result is the same for any number of
   threads, and deterministic. A DOUBLE `SUM` or `AVG` adds up every row group (per group with `GROUP BY`),

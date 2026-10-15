@@ -91,15 +91,17 @@ class PhysicalPlannerTest : public testing::ExecTest {
     const auto schema =
         arrow::schema({arrow::field("x", arrow::int64()), arrow::field("y", arrow::int64())});
     arrow::RecordBatchVector batches;
-    for (const std::vector<std::optional<int64_t>>& x :
-         {std::vector<std::optional<int64_t>>{1, 1},
-          std::vector<std::optional<int64_t>>{2, 2, 2},
-          std::vector<std::optional<int64_t>>{4}}) {
+    for (const std::vector<int64_t>& part :
+         {std::vector<int64_t>{1, 1}, std::vector<int64_t>{2, 2, 2}, std::vector<int64_t>{4}}) {
+      std::vector<std::optional<int64_t>> x;
       std::vector<std::optional<int64_t>> y;
-      for (const std::optional<int64_t>& value : x) {
-        y.emplace_back(-*value);
+      x.reserve(part.size());
+      y.reserve(part.size());
+      for (const int64_t value : part) {
+        x.emplace_back(value);
+        y.emplace_back(-value);
       }
-      batches.push_back(arrow::RecordBatch::Make(schema, static_cast<int64_t>(x.size()),
+      batches.push_back(arrow::RecordBatch::Make(schema, static_cast<int64_t>(part.size()),
                                                  {Int64s(x), Int64s(y)}));
     }
     return std::make_shared<MemoryTable>(schema, std::move(batches), /*split=*/true);
@@ -695,15 +697,15 @@ TEST_F(PhysicalPlannerTest, SemiJoinsBuildingOnTheirLeftInputKeepTheSameRows) {
              .what = "repeated keys on the right, y > x"}}) {
     SCOPED_TRACE(c.what);
     const auto join_of = [&](plan::BuildSide build) {
-      return Node(plan::JoinNode{
-          .kind = plan::JoinKind::kSemi,
-          .left = c.left,
-          .right = c.right,
-          .keys = {plan::JoinKey{.left = c.key, .right = c.key}},
-          .residual = c.residual == nullptr ? std::vector<plan::ExprPtr>{}
-                                            : std::vector<plan::ExprPtr>{c.residual},
-          .build = build,
-          .span = {}});
+      return Node(plan::JoinNode{.kind = plan::JoinKind::kSemi,
+                                 .left = c.left,
+                                 .right = c.right,
+                                 .keys = {plan::JoinKey{.left = c.key, .right = c.key}},
+                                 .residual = c.residual == nullptr
+                                                 ? std::vector<plan::ExprPtr>{}
+                                                 : std::vector<plan::ExprPtr>{c.residual},
+                                 .build = build,
+                                 .span = {}});
     };
     // The left-sided direction is the sink of its probe pipeline, so it emits in the build's
     // JoinTable::rows() order rather than in the probe's; both are deterministic.
@@ -738,6 +740,55 @@ TEST_F(PhysicalPlannerTest, SemiJoinsBuildingOnTheirLeftInputKeepTheSameRows) {
     // a planner that quietly kept building on the right.
     EXPECT_EQ(names, "RightJoin/HashJoin/Scan/HashBuild/Scan/");
   }
+}
+
+// A join that emits its build rows needs a part pipeline under its probe, because the sink that
+// emits them is the sink of that pipeline. Where there is none the build side -- a performance
+// choice, never a semantic one -- goes back to the right input, so the join still runs and still
+// answers. A Sort under the probe is the shape: it ends the chain.
+TEST_F(PhysicalPlannerTest, ASemiJoinWithoutAProbePipelineBuildsOnItsRightInputInstead) {
+  const auto table = Table(/*split=*/true);
+  const auto scan = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}});
+  const auto x = Column(0, "x", LogicalType::kBigInt);
+  const auto sorted = Node(plan::SortNode{.input = scan, .keys = {plan::SortKey{.column = x}}});
+  const auto join_of = [&](const plan::LogicalNodePtr& right, plan::BuildSide build) {
+    return Node(plan::JoinNode{.kind = plan::JoinKind::kSemi,
+                               .left = scan,
+                               .right = right,
+                               .keys = {plan::JoinKey{.left = x, .right = x}},
+                               .residual = {},
+                               .build = build,
+                               .span = {}});
+  };
+  using Values = std::vector<std::optional<int64_t>>;
+  const Values all = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+  const auto rows = Run(PlanOf(join_of(sorted, plan::BuildSide::kLeft), 2));
+  ASSERT_NE(rows, nullptr);
+  Values xs = Int64Column(*rows, 0);
+  std::ranges::sort(xs);
+  EXPECT_EQ(xs, all);
+
+  const auto tree = [](const plan::LogicalPlan& plan) {
+    ProfileNode root;
+    EXPECT_TRUE(BuildPhysicalPlan(plan, &root).ok());
+    std::string names;
+    const auto walk = [&names](const ProfileNode& node, auto&& self) -> void {
+      names += node.name() + "/";
+      for (const auto& child : node.children()) {
+        self(*child, self);
+      }
+    };
+    walk(root, walk);
+    return names;
+  };
+  // The operator tree says what it really ran, and the profile's detail names the side with it:
+  // the probe is the left input now, so it is a part pipeline again and the join runs inside one.
+  EXPECT_EQ(tree(PlanOf(join_of(sorted, plan::BuildSide::kLeft), 2)),
+            "PartUnion/HashJoin/Scan/HashBuild/Sort/PartUnion/Scan/");
+  // With a part pipeline under the probe the same plan takes the sink: the fallback is about the
+  // shape below the join, not about the kind or the side.
+  EXPECT_EQ(tree(PlanOf(join_of(scan, plan::BuildSide::kLeft), 2)),
+            "RightJoin/HashJoin/Scan/HashBuild/Scan/");
 }
 
 TEST_F(PhysicalPlannerTest, EveryJoinKindRunsEverywhere) {
@@ -927,9 +978,8 @@ TEST_F(PhysicalPlannerTest, MalformedJoinsAreInvalidNotUnsupported) {
     const auto boolean = expr(0, LogicalType::kBoolean);
     // A semi join that builds on its left input runs (ADR 0026's C2b): it is
     // SemiJoinsBuildingOnTheirLeftInputAreTheSinkOfTheirProbePipeline below, not a malformed plan.
-    for (const plan::JoinKind kind :
-         {plan::JoinKind::kAnti, plan::JoinKind::kNullAwareAnti, plan::JoinKind::kOneRow,
-          plan::JoinKind::kLeft}) {
+    for (const plan::JoinKind kind : {plan::JoinKind::kAnti, plan::JoinKind::kNullAwareAnti,
+                                      plan::JoinKind::kOneRow, plan::JoinKind::kLeft}) {
       expect_invalid(kind_of(kind, key(x, x), {}, plan::BuildSide::kLeft),
                      "a join of another kind than inner or semi that builds on its left input");
     }

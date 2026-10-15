@@ -97,11 +97,29 @@ const plan::LogicalNode* PipelineInput(const plan::LogicalNode& node) {
   return nullptr;
 }
 
+// Whether `node` is a join that emits its build rows (EmitsBuildRows), which only the top of a
+// part pipeline may be: such a join is the sink of its own probe pipeline, so a node above it is
+// not in that pipeline and has no part pipeline of its own.
+bool IsRightJoin(const plan::LogicalNode& node) {
+  const auto* join = std::get_if<plan::JoinNode>(&node);
+  return join != nullptr && EmitsBuildRows(join->kind, join->build);
+}
+
 // The scan at the bottom of a part pipeline, a chain of streaming nodes over a scan (Filter,
 // Compute, Project and joins' probes, PipelineInput); nullptr if `node` is not the top of one. Any
 // other node ends the chain: an aggregation, a sort, a limit.
-const plan::ScanNode* PipelineScan(const plan::LogicalNodePtr& node) {
+//
+// A join that emits its build rows ends the chain too, because it is the sink of its own probe
+// pipeline and never a node inside another's. `through_right_join` is how its own sink asks the
+// other question -- where does the pipeline this join tops begin -- and only Build's dispatch and
+// the PartsOf below it pass true. Every other caller is asking whether it may run `node` inside a
+// pipeline of its own, and for such a join the answer is no: an operator above it is serial.
+const plan::ScanNode* PipelineScan(const plan::LogicalNodePtr& node,
+                                   bool through_right_join = false) {
   for (const plan::LogicalNode* n = node.get(); n != nullptr; n = PipelineInput(*n)) {
+    if (IsRightJoin(*n) && (!through_right_join || n != node.get())) {
+      return nullptr;
+    }
     if (const auto* scan = std::get_if<plan::ScanNode>(n)) {
       return scan->table == nullptr ? nullptr : scan;
     }
@@ -348,10 +366,9 @@ OperatorResult BuildRightJoin(const plan::JoinNode& join, const plan::LogicalNod
     return arrow::Status::Invalid("a join that emits its build rows without its build");
   }
   ARROW_ASSIGN_OR_RAISE(auto sample, parts.pipeline(0));  // for the output schema; never opened
-  return WithBuilds(
-      std::make_unique<PartRightJoinOperator>(std::move(parts.pipeline), parts.count,
-                                              sample->output_schema(), build),
-      parts.builds, slot);
+  return WithBuilds(std::make_unique<PartRightJoinOperator>(std::move(parts.pipeline), parts.count,
+                                                            sample->output_schema(), build),
+                    parts.builds, slot);
 }
 
 // The column every call counts distinctly, when every call is COUNT(DISTINCT) of the same column.
@@ -773,14 +790,24 @@ OperatorResult Build(const plan::LogicalNodePtr& node, std::optional<int64_t> pa
   if (node == nullptr) {
     return arrow::Status::Invalid("logical plan node without its input");
   }
+  if (!part.has_value() && IsRightJoin(*node)) {
+    // It emits the build's rows, so it has to see every part's marks before it emits one: it is
+    // the sink of its own probe pipeline.
+    if (const plan::ScanNode* scan = PipelineScan(node, /*through_right_join=*/true)) {
+      return Profiled(BuildRightJoin(std::get<plan::JoinNode>(*node), node, *scan, slot), node,
+                      slot);
+    }
+    // Its probe has no part pipeline under it, so there are no parts and no sink to emit from. The
+    // build side is a performance choice and never a semantic one (ADR 0026), so the join runs the
+    // way every join ran before C2b instead: building on its right input. The node carries the
+    // side it really runs, so a profile and an EXPLAIN name that one.
+    plan::JoinNode right = std::get<plan::JoinNode>(*node);
+    right.build = plan::BuildSide::kRight;
+    const auto rebuilt = std::make_shared<const plan::LogicalNode>(plan::LogicalNode(right));
+    return Build(rebuilt, part, slot, late, top_n, builds);
+  }
   if (!part.has_value()) {
     if (const plan::ScanNode* scan = PipelineScan(node)) {
-      // A join that emits its build rows is the sink of the pipeline it tops, not a node inside
-      // one: it has to see every part's marks before it emits a row.
-      const auto* join = std::get_if<plan::JoinNode>(node.get());
-      if (join != nullptr && EmitsBuildRows(join->kind, join->build)) {
-        return Profiled(BuildRightJoin(*join, node, *scan, slot), node, slot);
-      }
       return Profiled(BuildPartUnion(node, *scan, std::nullopt, slot), node, slot);
     }
   }

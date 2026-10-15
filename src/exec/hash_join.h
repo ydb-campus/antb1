@@ -447,9 +447,9 @@ class PartRightJoinOperator final : public PartSink {
   std::shared_ptr<JoinBuild> build_;
   arrow::MemoryPool* pool_ = arrow::default_memory_pool();
   int64_t batch_size_ = 1;
-  int64_t position_ = 0;  // the next build row to consider emitting
-  bool probed_ = false;   // every part is in: the marks are final and emitting has begun
-  bool ended_ = false;    // the last marked row was handed on (or the run failed)
+  int64_t position_ = 0;          // the next build row to consider emitting
+  bool probed_ = false;           // every part is in: the marks are final and emitting has begun
+  bool ended_ = false;            // the last marked row was handed on (or the run failed)
   std::vector<JoinRowRef> rows_;  // the refs of a batch's marked rows
   std::unique_ptr<PartScheduler<bool>> scheduler_;
 };
