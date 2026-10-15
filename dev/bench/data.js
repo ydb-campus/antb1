@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792046672671,
+  "lastUpdate": 1792054391004,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -7884,6 +7884,114 @@ window.BENCHMARK_DATA = {
             "value": 91.81151257143127,
             "unit": "ms/iter",
             "extra": "iterations: 7\ncpu: 91.79435671428568 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c7d9339f264fd815b2ca3bc24553ecaf8da10775",
+          "message": "feat(plan): choose the build side of the joins unnesting creates (#142)\n\n## Summary\n\nADR 0026's **C3a** — the part of C3 that needs no C2. ADR 0023's Path 2\nproduces an *inner* join, so either side may\nbuild it, but it hardcoded `BuildSide::kRight` (the aggregate it puts on\nthe right) while the join order chose by\nestimate. One pass hardcoded a side the other decided by rule.\n\nPath 2 now calls the same rule, extracted as `plan::ChooseBuildSide` so\nthe two cannot drift. Reaching it needed two\npieces of groundwork:\n\n- **`JoinNode` carries the estimate the join order already computed and\ndiscarded**, and `EstimateRows` reads it. The\ndomains rule 3 divides by are not reachable from a plan node, so nothing\ndownstream could recompute an estimate;\n  keeping it is what lets any later pass estimate *through* a join.\n- **`plan::Optimize` takes the `BindOptions` that `plan::Bind` takes**,\nso `--build-side-ratio` reaches the unnesting\npass too. `BindOptions` moves into its own header rather than\n`optimizer.h` including `binder.h`, which would have\n  turned two sibling passes into a dependency.\n\nIt flips exactly the two joins it was meant to — Q2's, whose build side\nwas **185×** the stream probing it, and\nQ17's, **33×** — and only those two plans move: every other plan at SF\n100 is byte-identical.\n\nCloses #\n\n## It buys nothing measurable, and I am not claiming otherwise\n\n| | before | after | change |\n|---|---:|---:|---|\n| Q17 | 17.44s | 15.82s | −9.3% |\n| Q2 | 3.47s | 3.42s | −1.7% |\n| geomean | 8.434s | 8.480s | — |\n| Q17 peak memory | 1.64 GB | 1.70 GB | +4% |\n\nBoth time changes sit inside the **±15.8%** band DuckDB's own unchanged\nbinary set across the same pair of runs, so\nneither is established. That the other twenty plans are byte-identical\nis what confirms the band is noise rather than\nhidden regressions.\n\n**The reason is worth recording, and ADR 0023 called it before this was\ntried:** in both queries the oversized side is\nan *aggregate whose own group state dominates* — Q17's is 20M groups\nover the whole of the largest relation — so the\njoin's hash table was never the bottleneck. ADR 0023, on Q17: *\"the scan\nof the inner table dominates anyway\"*. Their\nreal lever is that ADR's deferred **semi-join reduction**, computing\nonly the groups the outer side needs.\n\nShipped as groundwork rather than as a win, with the maintainer's\nagreement: the estimate on the node, the shared rule\nand `EstimateRows` through a join are what C5 and the rest of C3 both\nneed, and the inconsistency is gone.\n\n## What re-profiling after C1 found, which redirects the roadmap\n\nRecorded in the ADR, because three of the four worst queries need items\nthis ADR does not own — two of them ADR 0022\ndeferrals whose triggers this profiling fires:\n\n- **Q10, 6.6×, nothing in the roadmap targets it.** Its cost is\n`gather`: 21.8s on one join materialising seven\ncustomer columns, four of them VARCHAR, for 11.46M rows — to produce\n**20 output rows** under a `LIMIT 20`. That is\nADR 0016 and ADR 0022's deferred \"late materialization across joins\",\nand the largest win left after Q21.\n- **Q7, 4.8×.** Its whole selectivity is locked in a join residual: both\nnation relations scan all 25 rows, there is\nno filter node at all, and four joins each carry 182,301,190 rows before\nthe fifth cuts them to 583,512. No\nestimate can see that, so **C5 cannot help Q7** until `n_name IN (...)`\nis derived from the disjunction — ADR 0022's\n  deferred \"filters implied by ORs\".\n- **Q5** is the one that genuinely wants C5.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement — deliberately not claimed; see\nabove\n- [x] refactor, test, docs, build, ci or chore\n- [ ] Breaking change\n\n## Verification\n\n```text\n$ pixi run test\n100% tests passed out of 2699\n\n$ pixi run diff-random            # and seed 8888\nDIFF: PASS seed=7777 queries=2000 failed=0 unsupported=0\nDIFF: PASS seed=8888 queries=2000 failed=0 unsupported=0\n\n$ clang-tidy -p build/tidy --warnings-as-errors='*' <each of the six changed .cc files>\n(no findings)\n\n$ pixi run lint\nclang-format / gersemi / markdownlint / typos / check_repo.py ... Passed\n```\n\n4000 random queries against the DuckDB oracle with no answer mismatch —\nthe test that matters, since this changes\nplans and not answers. Four new tests: `ChooseBuildSide` over the ratio,\nunknown and zero estimates and 128-bit\nsaturation; `EstimateRows` reading a join's estimate and passing it\nthrough a node above; and an end-to-end test that\nPath 2's join flips with the sizes and that the ratio controls it.\n\n`pixi run check-full` cannot complete on this osx-arm64 host (`ci-gcc`\nis linux-64 only). `pixi run lint` exits\nnon-zero for the pre-existing `tools/github/apply-settings.sh`\nshellcheck findings, a protected path this diff does\nnot touch; every hook covering the diff passes.\n\n## Checklist\n\n- [ ] `pixi run check` passes locally — `ci` passes; `lint` blocked by\nthe pre-existing shellcheck above\n- [x] Tests cover the change (four new, including the end-to-end flip\nand the ratio reaching the unnesting pass)\n- [x] Docs updated: ADR 0026 gains C3a with its measured null result,\nand the post-C1 re-profiling that redirects the\n      roadmap\n- [x] No ClickBench-derived data is committed\n- [x] Nothing derived from TPC-H is committed: query numbers, timings,\nratios and peak memory only\n- [ ] Changes to governance paths were agreed with a maintainer —\n**`docs/adr/` is CODEOWNERS-protected; shipping this\nas groundwork despite the null result was agreed, but the ADR diff needs\nyour sign-off**\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5)\nre-profiled all 22 queries at SF 100 after C1 to\nfind where the remaining gap is, wrote the change and its tests,\nmeasured it before and after, and established\nthat the win it was expected to deliver does not exist — then recorded\nwhy in the ADR rather than reporting a\n      geomean move that was noise.\n- Accountable human (has read and understands the whole diff): @hor911\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-15T11:51:01+03:00",
+          "tree_id": "c45a0d6b4ad8c7fef0d35bc3d7fdbc4de9f32ba6",
+          "url": "https://github.com/ydb-campus/antb1/commit/c7d9339f264fd815b2ca3bc24553ecaf8da10775"
+        },
+        "date": 1792054389756,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 2598.8444375327713,
+            "unit": "ns/iter",
+            "extra": "iterations: 244352\ncpu: 2598.6387506547935 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 62238.384836764984,
+            "unit": "ns/iter",
+            "extra": "iterations: 11119\ncpu: 62232.30200557605 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 69167.4324216017,
+            "unit": "ns/iter",
+            "extra": "iterations: 9981\ncpu: 69157.4809137361 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 254974.73817925056,
+            "unit": "ns/iter",
+            "extra": "iterations: 2834\ncpu: 254960.03634438946 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 255195.6107142875,
+            "unit": "ns/iter",
+            "extra": "iterations: 2800\ncpu: 255166.9517857142 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 1426768.9089026786,
+            "unit": "ns/iter",
+            "extra": "iterations: 483\ncpu: 1426666.0973084886 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 30.550942695651635,
+            "unit": "ms/iter",
+            "extra": "iterations: 23\ncpu: 30.54593152173913 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 28.532936208332416,
+            "unit": "ms/iter",
+            "extra": "iterations: 24\ncpu: 28.527496458333335 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 140.6007106000004,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 140.59008520000003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 8.658216864197595,
+            "unit": "ms/iter",
+            "extra": "iterations: 81\ncpu: 8.65741524691357 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 11.754386101694466,
+            "unit": "ms/iter",
+            "extra": "iterations: 59\ncpu: 11.753959186440675 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 27.046065576923386,
+            "unit": "ms/iter",
+            "extra": "iterations: 26\ncpu: 27.03976423076925 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 0.828154086805547,
+            "unit": "ms/iter",
+            "extra": "iterations: 864\ncpu: 0.8281099236111122 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 79.08533911111073,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 79.07159099999994 ms\nthreads: 1"
           }
         ]
       }
