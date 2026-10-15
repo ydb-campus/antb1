@@ -759,7 +759,10 @@ TEST_F(PhysicalPlannerTest, SemiJoinsBuildingOnTheirLeftInputKeepTheSameRows) {
     // distinct.
     Values keys = c.xs;
     std::ranges::sort(keys);
-    const auto groups = static_cast<int64_t>(std::ranges::unique(keys).begin() - keys.begin());
+    // Not static_cast<int64_t>: an iterator difference is already `long int` on linux-64, where
+    // int64_t is that type and GCC's -Wuseless-cast fires, while on Darwin int64_t is `long long`
+    // and a cast would be needed. Letting the initialisation convert is right on both.
+    const int64_t groups = std::ranges::unique(keys).begin() - keys.begin();
     for (const Placement& placement : Placements(join_of(plan::BuildSide::kLeft), 2, scan)) {
       int64_t expected = n;
       if (placement.rows == Expect::kOne) {
