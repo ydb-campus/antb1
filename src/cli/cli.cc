@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
@@ -82,6 +83,7 @@ struct Inputs {
   int threads = 1;                      // --threads (query and bench)
   // --memory-limit (query and bench); std::nullopt for commands that run no query.
   std::optional<std::string> memory_limit;
+  double build_side_ratio = 4.0;  // --build-side-ratio (query, explain and bench)
   BenchSettings bench;
 };
 
@@ -105,6 +107,18 @@ void AddMemoryLimitOption(CLI::App* cmd, Inputs& in) {
                ? std::string()
                : "expects a size such as 4GB, 512MiB or 50%, got '" + value + "'";
   });
+}
+
+// --build-side-ratio (ADR 0026): how decisively a join's build side must be the larger one before
+// the join builds on the side that probes it instead. 1 is ADR 0022's rule, the smaller side
+// always.
+void AddBuildSideRatioOption(CLI::App* cmd, Inputs& in) {
+  cmd->add_option("--build-side-ratio", in.build_side_ratio,
+                  "How many times larger a join's build side must be than the side probing it "
+                  "before the join builds on the probe side instead (default: 4; 1 always builds "
+                  "on the smaller side). Changes the plan, never the answer")
+      ->default_val(4.0)
+      ->check(CLI::Range(1.0, 1'000'000.0));
 }
 
 void AddThreadsOption(CLI::App* cmd, Inputs& in) {
@@ -194,6 +208,9 @@ arrow::Result<std::unique_ptr<engine::Session>> MakeSession(const Inputs& in) {
   if (in.memory_limit.has_value()) {
     options.memory_limit = ParseMemorySize(*in.memory_limit, PhysicalMemory());
   }
+  // In hundredths, rounded: the join order is integer arithmetic, so that a plan depends on the
+  // metadata alone and is the same on every host (ADR 0022).
+  options.build_side_ratio = static_cast<int64_t>(std::llround(in.build_side_ratio * 100.0));
   if (in.clickbench) {
     options.default_overrides.emplace_back("EventDate", plan::LogicalType::kDate);
   }
@@ -297,6 +314,7 @@ int RunCli(std::span<const std::string> args, std::istream& in_stream, std::ostr
   query->add_flag("--timing", in.timing, "Print elapsed seconds as the last stderr line");
   AddThreadsOption(query, in);
   AddMemoryLimitOption(query, in);
+  AddBuildSideRatioOption(query, in);
 
   auto* explain = app.add_subcommand(
       "explain",
@@ -313,6 +331,7 @@ int RunCli(std::span<const std::string> args, std::istream& in_stream, std::ostr
       ->needs(analyze);
   AddThreadsOption(explain, in);
   AddMemoryLimitOption(explain, in);
+  AddBuildSideRatioOption(explain, in);
 
   auto* schema = app.add_subcommand("schema", "Print the columns of the registered tables");
   AddTableOptions(schema, in);
@@ -335,6 +354,7 @@ int RunCli(std::span<const std::string> args, std::istream& in_stream, std::ostr
                   "Drop the page cache (sudo -n) before the first try of every query (Linux)");
   AddThreadsOption(bench, in);
   AddMemoryLimitOption(bench, in);
+  AddBuildSideRatioOption(bench, in);
 
   const auto* version = app.add_subcommand("version", "Print version information");
 

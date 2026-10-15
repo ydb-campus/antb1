@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <format>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -56,7 +57,18 @@ arrow::Result<std::shared_ptr<plan::Table>> OpenParquet(const SessionOptions& op
   return table;
 }
 
+// What the session tells the binder about the plan to choose (ADR 0026). Session::Make validated
+// it; an option the caller left unset keeps the planner's own default.
+plan::BindOptions BindOptionsOf(const SessionOptions& options) {
+  plan::BindOptions out;
+  if (options.build_side_ratio.has_value()) {
+    out.build_side_ratio = *options.build_side_ratio;
+  }
+  return out;
+}
+
 arrow::Result<plan::LogicalPlan> ParseAndBind(std::string_view sql, const plan::Catalog& catalog,
+                                              const plan::BindOptions& options,
                                               QueryTimings* timings) {
   const auto t0 = Clock::now();
   auto stmt = sql::Parse(sql);
@@ -64,7 +76,7 @@ arrow::Result<plan::LogicalPlan> ParseAndBind(std::string_view sql, const plan::
   if (!stmt) {
     return plan::ToArrowStatus(stmt.error());
   }
-  auto bound = plan::Bind(*stmt, catalog);
+  auto bound = plan::Bind(*stmt, catalog, options);
   if (bound.ok()) {
     // Optimize can fail (ADR 0023's unnesting pass), and every caller of ParseAndBind propagates
     // it, so `explain` and `explain --analyze` reject exactly what `query` rejects.
@@ -99,6 +111,14 @@ arrow::Result<std::unique_ptr<Session>> Session::Make(SessionOptions options) {
   if (options.memory_limit.has_value() && *options.memory_limit < 1) {
     return arrow::Status::Invalid("the memory limit must be positive, not ", *options.memory_limit);
   }
+  if (options.build_side_ratio.has_value() && *options.build_side_ratio < 100) {
+    // Hundredths as a multiple, which is how the option is documented and how the CLI takes it.
+    // Formatted as one number rather than assembled from a quotient and a remainder, which would
+    // read as "0.-1" for a negative value.
+    return arrow::Status::Invalid(
+        "the build-side ratio must be at least 1.00, not ",
+        std::format("{:.2f}", static_cast<double>(*options.build_side_ratio) / 100.0));
+  }
   ARROW_RETURN_NOT_OK(arrow::compute::Initialize());
   std::unique_ptr<Session> session(new Session(std::move(options)));
   session->memory_ = std::make_shared<exec::MemoryBudget>(session->options_.memory_limit);
@@ -117,7 +137,8 @@ arrow::Status Session::RegisterParquet(const std::string& name,
 
 arrow::Result<QueryResult> Session::Execute(std::string_view sql) {
   QueryResult result;
-  ARROW_ASSIGN_OR_RAISE(auto logical, ParseAndBind(sql, catalog_, &result.timings));
+  ARROW_ASSIGN_OR_RAISE(auto logical,
+                        ParseAndBind(sql, catalog_, BindOptionsOf(options_), &result.timings));
   const auto t0 = Clock::now();
   ARROW_ASSIGN_OR_RAISE(auto op, exec::BuildPhysicalPlan(logical));
   result.memory = memory_;
@@ -137,12 +158,14 @@ arrow::Result<QueryResult> Session::Execute(std::string_view sql) {
 }
 
 arrow::Result<std::string> Session::Explain(std::string_view sql) {
-  ARROW_ASSIGN_OR_RAISE(auto logical, ParseAndBind(sql, catalog_, nullptr));
+  ARROW_ASSIGN_OR_RAISE(auto logical,
+                        ParseAndBind(sql, catalog_, BindOptionsOf(options_), nullptr));
   return plan::Explain(logical);
 }
 
 arrow::Result<QueryProfile> Session::ExplainAnalyze(std::string_view sql) {
-  ARROW_ASSIGN_OR_RAISE(auto logical, ParseAndBind(sql, catalog_, nullptr));
+  ARROW_ASSIGN_OR_RAISE(auto logical,
+                        ParseAndBind(sql, catalog_, BindOptionsOf(options_), nullptr));
   QueryProfile profile;
   profile.output = plan::ExplainOutput(logical);
   profile.root = std::make_shared<exec::ProfileNode>();

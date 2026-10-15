@@ -6,6 +6,7 @@
 #include <span>
 #include <vector>
 
+#include "antb1/common/int128.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/table.h"
 
@@ -42,9 +43,10 @@ struct JoinStep {
   // The edges between it and the relations of the earlier steps, ascending: the keys of its join
   // (none for the first step, the probe).
   std::vector<std::size_t> edges;
-  // The side the step's join builds on: always the relation it adds. ADR 0022's rule, the input
-  // with fewer rows (a join below standing in with its estimate), is deferred until the estimates
-  // can be trusted (they ignore filters); it would be decided here.
+  // The side the step's join builds on: the relation it adds, unless that relation's estimate
+  // exceeds the estimate of the relations joined so far by more than `build_side_ratio`, when it
+  // builds on those instead (ADR 0026). An unknown estimate on either side keeps the relation it
+  // adds: unknown must never read as small.
   BuildSide build = BuildSide::kRight;
   int64_t estimate = 0;  // the estimated rows of the relations joined so far, saturated
 };
@@ -64,10 +66,14 @@ std::optional<std::size_t> FirstUnconnected(std::size_t relations, std::span<con
 //      sides, at least 1: computed in 128 bits, rounded down, at least 1 and saturated at
 //      INT64_MAX. It is 0 when L or R has no row, or a side of the edges has an empty domain.
 //   4. Ties go to the relation first in FROM.
-// Edges that do not join two different relations below relations.size(), or relations that are not
-// connected, are a programming error.
+//   5. The step's join builds on the relation it adds, unless that relation's rows exceed the
+//      estimate of the relations joined so far by more than `build_side_ratio` hundredths, when it
+//      builds on them instead (JoinStep::build).
+// Edges that do not join two different relations below relations.size(), relations that are not
+// connected, or a ratio below 100, are a programming error.
 std::vector<JoinStep> OrderJoins(std::span<const JoinRelation> relations,
-                                 std::span<const JoinEdge> edges);
+                                 std::span<const JoinEdge> edges,
+                                 int64_t build_side_ratio = kBuildSideRatio);
 
 // The domain of top-level field `field` of `table` (the number of its distinct non-NULL values,
 // estimated), from the parts' footer statistics:
@@ -80,6 +86,33 @@ std::vector<JoinStep> OrderJoins(std::span<const JoinRelation> relations,
 //   3. else std::nullopt (the estimate takes the relation's rows).
 // A table without parts has no value: 0.
 std::optional<int64_t> KeyDomain(const Table& table, int field);
+
+// What the parts' footers say about one top-level column over the whole table, as the estimates of
+// ADR 0026 read them: the range of its non-NULL values and how many of its rows are not NULL.
+struct ColumnRange {
+  std::optional<Int128> min;  // over the non-NULL values of every part; empty when all are NULL
+  std::optional<Int128> max;
+  int64_t non_null = 0;  // rows that are not NULL, summed over the parts; only when `exact`
+  bool exact = false;    // every part had statistics with its min at most its max, or only NULLs
+};
+
+// The footer statistics of top-level field `field` of `table` (Table::part_stats). A column whose
+// type has no statistics -- DECIMAL, VARCHAR, DOUBLE (ADR 0021) -- is not exact.
+ColumnRange ColumnRangeOf(const Table& table, int field);
+
+// KeyDomain's answer for a column whose range has already been read, so that an estimate needing
+// both pays for one walk of the parts rather than two: rule 1 comes from `range` alone, and only a
+// column without exact statistics is walked again for rule 2's distinct-count hints.
+std::optional<int64_t> ColumnDomain(const Table& table, int field, const ColumnRange& range);
+
+// The rows of `rows` that `predicate` keeps, estimated (ADR 0026): from `range` and `domain`
+// (KeyDomain) where the footers have them, and from a documented default factor for every shape
+// they do not cover -- a pattern match, a comparison of two columns, a computed BOOLEAN, and any
+// column whose type has no statistics. Integer arithmetic throughout, as join-order rule 3 is, so
+// that the estimate depends on the metadata alone and is the same on every host. Never below 0, and
+// never above `rows`; `rows` must not be negative.
+int64_t PredicateRows(int64_t rows, const Predicate& predicate, const ColumnRange& range,
+                      std::optional<int64_t> domain);
 
 // The rows of a binding: a table's exact row count, a sub-plan's estimate (EstimateRows).
 std::optional<int64_t> RelationRows(const Binding& binding);

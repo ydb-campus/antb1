@@ -36,6 +36,12 @@ struct SessionOptions {
   // caller still holds, and the operators' own containers. A query that needs more fails with
   // Status::OutOfMemory. std::nullopt: no limit. The CLI defaults to 80% of physical memory.
   std::optional<int64_t> memory_limit;
+  // How much larger a join's build side must be than the side that probes it before the join builds
+  // on the probe side instead (docs/adr/0026-join-performance.md), in hundredths of a factor: 100
+  // is ADR 0022's rule, the smaller side always, and a larger value flips only a more decisive
+  // difference. Below 100 is invalid. std::nullopt: the planner's own default (plan::BindOptions).
+  // It changes which plan a query gets, never what the query means.
+  std::optional<int64_t> build_side_ratio;
   // Column type overrides applied to every table opened by this session, e.g. {"EventDate", kDate}
   // for ClickBench (`antb1 --clickbench`).
   std::vector<std::pair<std::string, plan::LogicalType>> default_overrides;

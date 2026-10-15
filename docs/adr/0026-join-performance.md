@@ -84,6 +84,17 @@ columns, so a range conjunct estimates from the overlap of its range with the co
 those statistics the same way. A column type without statistics — DECIMAL, which `parquet_table.cc` excludes per
 [ADR 0021](0021-decimal-semantics.md) — takes a documented default factor, never a silent one.
 
+Two rules keep a selective-looking conjunct from estimating a relation into nothing, because a relation estimated at
+no row is ordered first and then makes every later estimate in its block 0 as well, which would decide the whole
+order and every build side after it:
+
+- **An equality and its complement both read the range.** A constant the column's range excludes matches no row, so
+  the equality keeps none and the complement keeps all. Without the second half, a column of one distinct value
+  estimates `col <> other` at almost none of its rows, when in truth it keeps every one — a plan strictly worse than
+  the unfiltered footer count gave, in the direction this ADR exists to fix.
+- **A complement never estimates no row.** Where the matching part saturates, the rest is floored at one row rather
+  than rounded to zero.
+
 **One knob decides how much to trust it.** The side flips only when the estimated build side exceeds the estimated
 probe side by more than a ratio, `--build-side-ratio`:
 
@@ -147,8 +158,22 @@ changes.
 - **C1, feat(plan): filter-aware relation estimates and the build-side ratio.** `JoinRelation::rows` applies the
   conjuncts of its own relation; `OrderJoins` takes the ratio and sets `JoinStep::build` from the estimates; rule 1
   reads them too. A `BindOptions` parameter on `plan::Bind`, the ratio on `engine::SessionOptions`, and
-  `--build-side-ratio` on the CLI, defaulting to 4.0. EXPLAIN prints the estimate next to `build=`. Addresses Q2, Q8,
-  Q12, Q17 and Q20; plans change, answers do not.
+  `--build-side-ratio` on the CLI, defaulting to 4. Plans change, answers do not.
+  - Update (2026-10-15, C1): shipped, and it moves **Q8 and Q12**, not the five this bullet first guessed. Q12's
+    probe flips to the unfiltered relation and the filtered one builds; Q8 gets two `build=left` joins and, because
+    rule 2 now reads the same estimates, its most selective join moves to the bottom of the tree -- a part of C5
+    arriving early. Q2 and Q17 do not move: their oversized build side is a subquery or an aggregate, whose rows
+    `EstimateRows` reports as unknown, and unknown keeps the build where it is. Q20's is a semi join, so it waits for
+    C3. Estimating through a join and an aggregate is C5's work, and Q2 and Q17 are the measurements that ask for it.
+  - Measured at SF 100 on 4 threads, best of 2, against the same run before the change: **Q8 falls 57%** and its
+    ratio to DuckDB goes from 4.52x to **2.03x**; **Q12 falls 11%**. Nothing regresses: the worst query moves +0.2%.
+    The two are the only queries outside the run-to-run band, which DuckDB's own unchanged binary set at 1.9% to 9.5%
+    over the same pair of runs -- so the geomean, 3.20x to 3.10x, is partly a warmer cache and only Q8 and Q12 are
+    this change. Both are exactly the queries whose `build=` and join order moved, which is the agreement that makes
+    the attribution safe.
+  - EXPLAIN printing the estimate next to `build=` is deliberately **not** part of C1: it would rewrite about fifteen
+    golden files and thirteen in-code assertions with pure diagnostics and bury the rule change. `build=left|right`
+    already shows which side was chosen, so the golden churn of C1 is exactly the plans that moved.
 - **C2, feat(exec): build-side output for semi, anti and left outer joins.** The match mark on the build rows and the
   final pass that emits them, selected by `JoinNode::build`; both `JoinKind` switches in `hash_join.cc` become
   exhaustive. No planner change, so no plan moves yet.

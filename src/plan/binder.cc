@@ -2295,13 +2295,15 @@ class Binder {
   // for rule 9 -- a name only an enclosing block has is a correlation and exits 4. `bind_block`
   // binds a subquery's query, and must outlive the binder.
   Binder(const sql::SelectStatement& stmt, std::vector<Binding> bindings, ColumnIdSource& ids,
-         const Scope* outer = nullptr, const BindBlockFn* bind_block = nullptr,
-         bool outer_encloses = false, bool inside_exists = false)
+         const BindOptions& options, const Scope* outer = nullptr,
+         const BindBlockFn* bind_block = nullptr, bool outer_encloses = false,
+         bool inside_exists = false)
       : stmt_(stmt),
         scope_(std::move(bindings), outer),
         outer_encloses_(outer_encloses),
         inside_exists_(inside_exists),
         ids_(ids),
+        options_(options),
         bind_block_(bind_block),
         relations_(scope_.bindings().size()) {
     // Relations 0 to bindings - 1 are the bindings, in FROM order, which is the invariant
@@ -2841,6 +2843,7 @@ class Binder {
   arrow::Status OrderRelations();
   arrow::Status OrderBlock(std::size_t b);
   [[nodiscard]] std::optional<int64_t> RelationEstimate(std::size_t r) const;
+  [[nodiscard]] std::optional<int64_t> FilteredRelationRows(std::size_t r) const;
   [[nodiscard]] std::optional<int64_t> BlockEstimate(std::size_t b) const;
   [[nodiscard]] std::size_t FirstBindingOf(std::size_t r) const;
   // The node of relation `r`: its binding's Scan, then the conjuncts routed to it and the columns
@@ -3023,6 +3026,7 @@ class Binder {
   bool inside_exists_ = false;
   bool in_correlated_ = false;  // a correlated conjunct is binding: see InputColumn
   ColumnIdSource& ids_;
+  const BindOptions& options_;  // one per query, and the caller outlives the binder
   const BindBlockFn* bind_block_ = nullptr;
   // ADR 0023: this block's WHERE conjuncts that read a column of the enclosing block. They are
   // neither keys nor edges of this block's join graph, so they are kept in one filter above all of
@@ -4736,17 +4740,17 @@ arrow::Status Binder::OrderBlock(std::size_t b) {
                     scope_.bindings()[missing].name(), scope_.bindings()[first].name()),
         stmt_.from[missing].span);
   }
-  block.steps = OrderJoins(block.stats, block.edges);
+  block.steps = OrderJoins(block.stats, block.edges, options_.build_side_ratio);
   return arrow::Status::OK();
 }
 
-// The rows of relation `r`, estimated: a binding's own (RelationRows), and for a LEFT JOIN unit its
-// inputs joined as an inner join, but never below its left input's rows, since every left row
-// yields one (ADR 0022's join-order rule 3).
+// The rows of relation `r`, estimated: a binding's own, after the conjuncts routed to it
+// (FilteredRelationRows), and for a LEFT JOIN unit its inputs joined as an inner join, but never
+// below its left input's rows, since every left row yields one (ADR 0022's join-order rule 3).
 std::optional<int64_t> Binder::RelationEstimate(std::size_t r) const {
   const std::optional<std::size_t> unit = relations_[r].unit;
   if (!unit.has_value()) {
-    return RelationRows(scope_.bindings()[r]);
+    return FilteredRelationRows(r);
   }
   const std::optional<int64_t> left = BlockEstimate(units_[*unit].left);
   const std::optional<int64_t> right = BlockEstimate(units_[*unit].right);
@@ -4758,6 +4762,46 @@ std::optional<int64_t> Binder::RelationEstimate(std::size_t r) const {
   const Int128 divisor = std::max<int64_t>(units_[*unit].divisor, 1);
   const Int128 joined = Int128{*left} * Int128{*right} / divisor;
   return std::max(*left, Int128ToInt64(joined).value_or(std::numeric_limits<int64_t>::max()));
+}
+
+// The rows of a binding's relation after the conjuncts routed to its Scan (ADR 0026): the
+// binding's own rows (RelationRows), reduced once per conjunct by what the column's footer
+// statistics say it keeps. Only a conjunct on a column of the binding's own table counts: one over
+// a column computed above the Scan has no statistics to read, so it is left out and the estimate
+// stays an upper bound, which is the side that keeps a build where it already is.
+std::optional<int64_t> Binder::FilteredRelationRows(std::size_t r) const {
+  const Binding& binding = scope_.bindings()[r];
+  const std::optional<int64_t> rows = RelationRows(binding);
+  const auto* source = std::get_if<TableSource>(&binding.source());
+  if (!rows.has_value() || source == nullptr || *rows < 0) {
+    return rows;
+  }
+  int64_t kept = *rows;
+  // Reading a column's statistics walks every part of the table, and a part's are not free to
+  // fetch, so each column is read once however many conjuncts name it. The range gives the domain
+  // too (ColumnDomain), which is why one walk serves both.
+  std::map<int, std::pair<ColumnRange, std::optional<int64_t>>> columns;
+  for (const Predicate& predicate : relations_[r].scan_filter) {
+    if (!predicate.column.has_value()) {  // kFalse: no column, and it keeps no row
+      kept = PredicateRows(kept, predicate, ColumnRange{}, std::nullopt);
+      continue;
+    }
+    const std::optional<ColumnLocation> location = scope_.Find(predicate.column->id);
+    if (!location.has_value() || location->binding != r) {
+      continue;  // a column this binding does not define: no statistics of ours to read
+    }
+    const int field = Narrow<int>(location->column);
+    const auto read = columns.find(field);
+    if (read == columns.end()) {
+      ColumnRange range = ColumnRangeOf(*source->table, field);
+      std::optional<int64_t> domain = ColumnDomain(*source->table, field, range);
+      kept = PredicateRows(kept, predicate, range, domain);
+      columns.emplace(field, std::pair{range, domain});
+      continue;
+    }
+    kept = PredicateRows(kept, predicate, read->second.first, read->second.second);
+  }
+  return kept;
 }
 
 // The rows block `b` outputs, estimated: its last step's, which OrderJoins already saturated.
@@ -5591,7 +5635,8 @@ struct CteFrame {
 };
 
 arrow::Result<BoundBlock> BindBlock(const sql::SelectStatement& stmt, const Catalog& catalog,
-                                    ColumnIdSource& ids, const CteFrame* ctes, const Scope* outer,
+                                    const BindOptions& options, ColumnIdSource& ids,
+                                    const CteFrame* ctes, const Scope* outer,
                                     bool outer_encloses = false, bool inside_exists = false);
 
 // Rule 7: the binding's column names. The alias list renames the leading columns, each losing its
@@ -5633,9 +5678,10 @@ arrow::Status ApplyColumnNames(std::vector<BindingColumn>& columns,
 // `siblings` is the scope of the bindings before it, which a sub-plan binds against so that a
 // lateral reference is found and exits 4 (rule 9) instead of reporting a missing column.
 arrow::Result<Binding> BindFromItem(const sql::FromItem& item, const Catalog& catalog,
-                                    ColumnIdSource& ids, const CteFrame& ctes,
-                                    const std::vector<Binding>& siblings, const Scope* outer,
-                                    std::size_t& unnamed, std::vector<LogicalPlan>& sub_plans) {
+                                    const BindOptions& options, ColumnIdSource& ids,
+                                    const CteFrame& ctes, const std::vector<Binding>& siblings,
+                                    const Scope* outer, std::size_t& unnamed,
+                                    std::vector<LogicalPlan>& sub_plans) {
   std::string name = BindingName(item, unnamed);
   const sql::TableRef* ref = item.table();
   const sql::CommonTableExpr* cte = ref == nullptr ? nullptr : ctes.Find(ref->name);
@@ -5657,7 +5703,7 @@ arrow::Result<Binding> BindFromItem(const sql::FromItem& item, const Catalog& ca
   // once per FROM item: a copy of every preceding binding is not free at the relation limit.
   const Scope preceding(siblings, outer);
   const Scope* scope = cte == nullptr ? &preceding : ctes.ScopeOf(cte);
-  ARROW_ASSIGN_OR_RAISE(BoundBlock bound, BindBlock(block, catalog, ids, frame, scope));
+  ARROW_ASSIGN_OR_RAISE(BoundBlock bound, BindBlock(block, catalog, options, ids, frame, scope));
   std::vector<BindingColumn> columns = std::move(bound.columns);
   // A column alias list after a CTE name is rejected by the parser (rule 7), so a CTE's list is
   // always the one written where it was declared.
@@ -5671,8 +5717,9 @@ arrow::Result<Binding> BindFromItem(const sql::FromItem& item, const Catalog& ca
 }
 
 arrow::Result<BoundBlock> BindBlock(const sql::SelectStatement& stmt, const Catalog& catalog,
-                                    ColumnIdSource& ids, const CteFrame* ctes, const Scope* outer,
-                                    bool outer_encloses, bool inside_exists) {
+                                    const BindOptions& options, ColumnIdSource& ids,
+                                    const CteFrame* ctes, const Scope* outer, bool outer_encloses,
+                                    bool inside_exists) {
   // The frames of this block: one per CTE holding the CTEs before it, then the block's own.
   std::deque<CteFrame> frames;
   std::vector<const sql::CommonTableExpr*> visible;
@@ -5705,8 +5752,8 @@ arrow::Result<BoundBlock> BindBlock(const sql::SelectStatement& stmt, const Cata
   sub_plans.reserve(stmt.from.size());
   std::size_t unnamed = 0;
   for (const sql::FromItem& item : stmt.from) {
-    ARROW_ASSIGN_OR_RAISE(Binding binding, BindFromItem(item, catalog, ids, own, bindings, outer,
-                                                        unnamed, sub_plans));
+    ARROW_ASSIGN_OR_RAISE(Binding binding, BindFromItem(item, catalog, options, ids, own, bindings,
+                                                        outer, unnamed, sub_plans));
     bindings.push_back(std::move(binding));
   }
   // A subquery's query is a block of its own: it binds in this block's CTE frame, as its relation
@@ -5717,9 +5764,11 @@ arrow::Result<BoundBlock> BindBlock(const sql::SelectStatement& stmt, const Cata
     // an outer reference in it may be answered (ADR 0023). A derived table and a CTE get the scope
     // of the preceding FROM items or of the declaring block instead, where a reference out is a
     // lateral one, which ADR 0022 refuses.
-    return BindBlock(block, catalog, ids, &own, scope, /*outer_encloses=*/true, exists_block);
+    return BindBlock(block, catalog, options, ids, &own, scope, /*outer_encloses=*/true,
+                     exists_block);
   };
-  Binder binder(stmt, std::move(bindings), ids, outer, &bind_sub, outer_encloses, inside_exists);
+  Binder binder(stmt, std::move(bindings), ids, options, outer, &bind_sub, outer_encloses,
+                inside_exists);
   ARROW_ASSIGN_OR_RAISE(LogicalPlan plan, binder.Bind());
   std::vector<BindingColumn> columns;
   columns.reserve(plan.output.size());
@@ -5735,12 +5784,13 @@ arrow::Result<BoundBlock> BindBlock(const sql::SelectStatement& stmt, const Cata
 
 }  // namespace
 
-arrow::Result<LogicalPlan> Bind(const sql::SelectStatement& stmt, const Catalog& catalog) {
+arrow::Result<LogicalPlan> Bind(const sql::SelectStatement& stmt, const Catalog& catalog,
+                                const BindOptions& options) {
   const sql::SelectStatement folded = FoldDateCasts(stmt);  // the binder refers to it
   ARROW_RETURN_NOT_OK(CheckSupported(folded));
   ColumnIdSource ids;  // one per query: every block's columns are minted from it
-  ARROW_ASSIGN_OR_RAISE(BoundBlock bound,
-                        BindBlock(folded, catalog, ids, /*ctes=*/nullptr, /*outer=*/nullptr));
+  ARROW_ASSIGN_OR_RAISE(BoundBlock bound, BindBlock(folded, catalog, options, ids, /*ctes=*/nullptr,
+                                                    /*outer=*/nullptr));
   return ResolvePositions(bound.plan);  // the binder refers to columns by id (ADR 0022)
 }
 

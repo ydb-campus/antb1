@@ -8,6 +8,16 @@
 
 namespace antb1::plan {
 
+// What the binder may be told about the plan it should choose, as opposed to what the plan means.
+// Every field has a default that holds for every query, so a caller that has no opinion passes none
+// and gets the same plan the engine would choose for itself.
+struct BindOptions {
+  // How much larger a join's build side must be than the side that probes it before the join builds
+  // on the probe side instead (ADR 0026), in hundredths of a factor: 400, the default, flips only a
+  // decisive difference; 100 is ADR 0022's rule, the smaller side always. Below 100 is invalid.
+  int64_t build_side_ratio = kBuildSideRatio;
+};
+
 // Resolves names and types against the catalog and builds the logical plan (its shape is in
 // logical_plan.h) with every WHERE literal folded exactly into the type of its column
 // (docs/sql-subset.md). One Scan of every field per FROM item, named by rule 1 of ADR 0022 (its
@@ -22,6 +32,7 @@ namespace antb1::plan {
 // of the wrong type), kUnsupported for a column of an unsupported type, FROM 'path' without a path
 // opener, a LEFT JOIN, a derived table, a WITH list, more than 256 relations, and a join graph no
 // key connects (a cross product).
-arrow::Result<LogicalPlan> Bind(const sql::SelectStatement& stmt, const Catalog& catalog);
+arrow::Result<LogicalPlan> Bind(const sql::SelectStatement& stmt, const Catalog& catalog,
+                                const BindOptions& options = {});
 
 }  // namespace antb1::plan

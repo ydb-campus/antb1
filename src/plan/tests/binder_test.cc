@@ -1889,10 +1889,11 @@ TEST(BinderTest, WhereSplitsAroundTheComputation) {
   EXPECT_EQ(scan.predicates[0].other.value_or(BoundColumn{}).name, "i32");
 }
 
-// The shape of an inner join (ADR 0022): the probe is the relation with the most footer rows (an
-// unknown count is the most), the join builds on the relation it adds, its key pair is oriented
-// left input then right, and its span is the connector that added that relation. `t` has 100 rows,
-// `ok` 7 and `u` an unknown count.
+// The shape of an inner join (ADR 0022): the probe is the relation with the most rows it is
+// estimated at (an unknown count is the most), the join builds on the relation it adds unless that
+// relation is decisively larger (ADR 0026, covered below and in join_order_test), its key pair is
+// oriented left input then right, and its span is the connector that added that relation. `t` has
+// 100 rows, `ok` 7 and `u` an unknown count; none of them has footer statistics.
 TEST(BinderTest, JoinOrderBuildSideAndKeys) {
   const Catalog catalog = MakeCatalog();
   struct Case {
@@ -1934,13 +1935,40 @@ TEST(BinderTest, JoinOrderBuildSideAndKeys) {
     const JoinNode* join = testing::FirstJoin(*plan);
     ASSERT_NE(join, nullptr) << c.sql;
     EXPECT_EQ(join->kind, JoinKind::kInner) << c.sql;
-    EXPECT_EQ(join->build, BuildSide::kRight) << c.sql;  // always the relation it adds
+    EXPECT_EQ(join->build, BuildSide::kRight) << c.sql;  // here always the relation it adds
     EXPECT_EQ(testing::ScannedTable(*join->left), c.left) << c.sql;
     EXPECT_EQ(testing::ScannedTable(*join->right), c.right) << c.sql;
     ASSERT_EQ(join->keys.size(), 1U) << c.sql;
     EXPECT_TRUE(join->residual.empty()) << c.sql;
     EXPECT_EQ(c.sql.substr(join->span.offset, join->span.length), c.span) << c.sql;
   }
+}
+
+// The estimates account for the conjuncts routed to each relation (ADR 0026), so a filter can
+// decide which relation probes. `t` has 100 rows and `ok` 7, so `t` probes on its own; with two
+// equalities on `t`, neither of which the footers can measure, `t` is estimated at 100 through two
+// default factors of a tenth each, which is one row, and `ok` probes instead.
+TEST(BinderTest, FiltersDecideWhichRelationProbes) {
+  const Catalog catalog = MakeCatalog();
+  const auto scanned = [&catalog](std::string_view sql) {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    const JoinNode* join = testing::FirstJoin(*plan);
+    EXPECT_NE(join, nullptr) << sql;
+    return join == nullptr
+               ? std::pair<std::string, std::string>{}
+               : std::pair<std::string, std::string>{testing::ScannedTable(*join->left),
+                                                     testing::ScannedTable(*join->right)};
+  };
+  EXPECT_EQ(scanned("SELECT ok.s FROM t JOIN ok ON t.i16 = ok.i16"),
+            (std::pair<std::string, std::string>{"t", "ok"}));
+  EXPECT_EQ(scanned("SELECT ok.s FROM t JOIN ok ON t.i16 = ok.i16 "
+                    "WHERE t.i32 = 5 AND t.i64 = 7"),
+            (std::pair<std::string, std::string>{"ok", "t"}));
+  // A conjunct on the other relation moves it the other way again: `ok` is estimated at 7 through
+  // one default factor, which is no row at all, and so is ordered first whatever `t` carries.
+  EXPECT_EQ(scanned("SELECT ok.s FROM t JOIN ok ON t.i16 = ok.i16 WHERE ok.i16 = 3"),
+            (std::pair<std::string, std::string>{"t", "ok"}));
 }
 
 // A cross-relation equality whose sides differ in type gets one key type both widen to exactly,

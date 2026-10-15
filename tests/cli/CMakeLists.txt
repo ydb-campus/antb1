@@ -166,6 +166,37 @@ antb1_add_cli_golden(
     --table
     "drivers=${_f}/star/drivers.parquet"
 )
+# --build-side-ratio (ADR 0026): the same query, the same answer, a different build side. The
+# equality on `a` leaves the relations joined so far estimated at far fewer rows than the relation
+# the last step adds, so building on the smaller side (ratio 1) builds on them instead, while a
+# ratio that trusts the estimates only beyond a 400-fold difference keeps the relation it adds.
+# Two cases, because one would still pass if the flag were unwired and the default happened to match.
+antb1_add_cli_golden(
+  explain_build_side_ratio_prefers_the_smaller_side
+  ARGS
+    explain
+    --threads
+    1
+    --build-side-ratio
+    1
+    -c
+    "SELECT COUNT(*) FROM trips a, trips b, trips c WHERE a.tr_pickup = b.tr_pickup AND b.tr_pickup = c.tr_pickup AND a.tr_row = 7"
+    --table
+    "trips=${_f}/star/trips.parquet"
+)
+antb1_add_cli_golden(
+  explain_build_side_ratio_keeps_the_added_relation
+  ARGS
+    explain
+    --threads
+    1
+    --build-side-ratio
+    400
+    -c
+    "SELECT COUNT(*) FROM trips a, trips b, trips c WHERE a.tr_pickup = b.tr_pickup AND b.tr_pickup = c.tr_pickup AND a.tr_row = 7"
+    --table
+    "trips=${_f}/star/trips.parquet"
+)
 # A FROM list that starts with two tables sharing no predicate: no cross product, since the chain
 # connects them through the third.
 antb1_add_cli_golden(

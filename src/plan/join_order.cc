@@ -22,6 +22,18 @@ namespace {
 
 constexpr int64_t kLargest = std::numeric_limits<int64_t>::max();
 
+// The default factors PredicateRows takes where the footers say nothing: the textbook ones, out of
+// `kDefaultScale`. They only have to order two relations, never to be right: ADR 0026 measured the
+// build sides it must separate as differing by factors of 10 and more, and the ratio keeps every
+// near-tie as it was, so a default that is off by two or three still decides correctly or not at
+// all. They are deliberately coarse and deliberately not tuned to one workload.
+constexpr int64_t kDefaultScale = 100;
+constexpr int64_t kEqualDefault = 10;    // column = constant, with no domain to divide by
+constexpr int64_t kRangeDefault = 33;    // column < constant, with no range to compare against
+constexpr int64_t kLikeDefault = 25;     // column LIKE pattern
+constexpr int64_t kNotNullDefault = 90;  // column IS NOT NULL, with no null count
+constexpr int64_t kOtherDefault = 50;    // two columns compared, or a computed BOOLEAN
+
 // Per relation, the indices of its edges, ascending.
 std::vector<std::vector<std::size_t>> EdgesOf(std::size_t relations,
                                               std::span<const JoinEdge> edges) {
@@ -43,11 +55,15 @@ int64_t Saturated(Int128 count) { return Int128ToInt64(count).value_or(kLargest)
 // The greedy walk of OrderJoins.
 class Orderer {
  public:
-  Orderer(std::span<const JoinRelation> relations, std::span<const JoinEdge> edges)
+  Orderer(std::span<const JoinRelation> relations, std::span<const JoinEdge> edges,
+          int64_t build_side_ratio)
       : relations_(relations),
         edges_(edges),
         edges_of_(EdgesOf(relations.size(), edges)),
-        joined_(relations.size(), false) {}
+        joined_(relations.size(), false),
+        ratio_(build_side_ratio) {
+    ANTB1_CHECK(build_side_ratio >= 100);
+  }
 
   std::vector<JoinStep> Order() {
     std::vector<JoinStep> steps;
@@ -60,22 +76,24 @@ class Orderer {
         probe = r;
       }
     }
-    steps.push_back(Add(probe, Rows(probe)));
+    // The first step is the probe itself and joins nothing, so it has no side to choose.
+    steps.push_back(Add(probe, Rows(probe), std::nullopt));
     while (steps.size() < relations_.size()) {
       std::optional<std::size_t> next;
       int64_t smallest = 0;
+      const int64_t joined_rows = steps.back().estimate;
       for (std::size_t c = 0; c < relations_.size(); ++c) {
         if (joined_[c]) {
           continue;
         }
-        const std::optional<int64_t> estimate = Estimate(c, steps.back().estimate);
+        const std::optional<int64_t> estimate = Estimate(c, joined_rows);
         if (estimate.has_value() && (!next.has_value() || *estimate < smallest)) {
           next = c;
           smallest = *estimate;
         }
       }
       ANTB1_CHECK(next.has_value());  // the relations are connected (FirstUnconnected)
-      steps.push_back(Add(*next, smallest));
+      steps.push_back(Add(*next, smallest, joined_rows));
     }
     return steps;
   }
@@ -120,10 +138,27 @@ class Orderer {
     return std::max<int64_t>(Saturated(Int128{rows} * Rows(candidate) / divisor), 1);
   }
 
+  // The side the step that adds `relation` builds on (rule 5): the relation it adds, unless its
+  // rows exceed `joined_rows`, the estimate of the relations joined so far, by more than the ratio.
+  // An unknown count on either side, and an estimate of no row at all, keep the relation it adds:
+  // neither may be read as small, since building on a side that turns out to be large is the very
+  // mistake this rule exists to avoid.
+  [[nodiscard]] BuildSide Build(std::size_t relation,
+                                const std::optional<int64_t>& joined_rows) const {
+    const std::optional<int64_t>& adding = relations_[relation].rows;
+    if (!adding.has_value() || !joined_rows.has_value() || *adding < 0 || *joined_rows <= 0) {
+      return BuildSide::kRight;
+    }
+    const bool decisive = Int128{*adding} * 100 > Int128{ratio_} * Int128{*joined_rows};
+    return decisive ? BuildSide::kLeft : BuildSide::kRight;
+  }
+
   // The step that joins `relation`, with its edges to the joined relations as keys.
-  JoinStep Add(std::size_t relation, int64_t estimate) {
-    JoinStep step{
-        .relation = relation, .edges = {}, .build = BuildSide::kRight, .estimate = estimate};
+  JoinStep Add(std::size_t relation, int64_t estimate, const std::optional<int64_t>& joined_rows) {
+    JoinStep step{.relation = relation,
+                  .edges = {},
+                  .build = Build(relation, joined_rows),
+                  .estimate = estimate};
     for (const std::size_t e : edges_of_[relation]) {
       const JoinEdge& edge = edges_[e];
       if (joined_[edge.a == relation ? edge.b : edge.a]) {
@@ -138,6 +173,7 @@ class Orderer {
   std::span<const JoinEdge> edges_;
   std::vector<std::vector<std::size_t>> edges_of_;
   std::vector<bool> joined_;
+  int64_t ratio_;  // hundredths of a factor, at least 100
 };
 
 // One overload per node type: a node type without one fails to compile.
@@ -194,49 +230,30 @@ std::optional<std::size_t> FirstUnconnected(std::size_t relations,
 }
 
 std::vector<JoinStep> OrderJoins(std::span<const JoinRelation> relations,
-                                 std::span<const JoinEdge> edges) {
-  return Orderer(relations, edges).Order();
+                                 std::span<const JoinEdge> edges, int64_t build_side_ratio) {
+  return Orderer(relations, edges, build_side_ratio).Order();
 }
 
-std::optional<int64_t> KeyDomain(const Table& table, int field) {
-  const int64_t parts = table.num_parts();
-  if (parts <= 0) {
-    return 0;
+std::optional<int64_t> ColumnDomain(const Table& table, int field, const ColumnRange& range) {
+  if (table.num_parts() <= 0) {
+    return 0;  // a table without parts has no value
   }
-  // 1. The integer range over the parts, capped at the non-NULL values: when every part has a
+  // 1. The integer range over the parts, capped at the non-NULL values, when every part has a
   // range (its min at most its max, as in every valid footer) or only NULLs.
-  Int128 non_null = 0;
-  std::optional<Int128> low;
-  std::optional<Int128> high;
-  bool exact = true;
-  for (int64_t part = 0; part < parts && exact; ++part) {
-    const std::optional<PartStats> stats = table.part_stats(part, field);
-    if (!stats.has_value() || stats->null_count >= stats->rows) {
-      exact = stats.has_value();  // with only NULLs: no value of the part counts
-      continue;
-    }
-    if (!stats->min.has_value() || !stats->max.has_value() || *stats->min > *stats->max) {
-      exact = false;
-      continue;
-    }
-    non_null += std::max<int64_t>(stats->rows - std::max<int64_t>(stats->null_count, 0), 0);
-    low = low.has_value() ? std::min(*low, *stats->min) : *stats->min;
-    high = high.has_value() ? std::max(*high, *stats->max) : *stats->max;
-  }
-  if (exact) {
-    if (!low.has_value() || !high.has_value()) {
+  if (range.exact) {
+    if (!range.min.has_value() || !range.max.has_value()) {
       return 0;  // every value is NULL
     }
     // max - min + 1, saturated: the range of 128-bit values (HUGEINT) can exceed an Int128.
-    Int128 range = kInt128Max;
-    if (Int128 difference = 0; !__builtin_sub_overflow(*high, *low, &difference)) {
-      range = CheckedAdd(difference, 1).value_or(kInt128Max);
+    Int128 span = kInt128Max;
+    if (Int128 difference = 0; !__builtin_sub_overflow(*range.max, *range.min, &difference)) {
+      span = CheckedAdd(difference, 1).value_or(kInt128Max);
     }
-    return Saturated(std::min(range, non_null));
+    return Saturated(std::min(span, Int128{range.non_null}));
   }
-  // 2. The largest hint, when every part has one.
+  // 2. The largest hint, when every part has one. Only this rule needs the parts again.
   int64_t largest = 0;
-  for (int64_t part = 0; part < parts; ++part) {
+  for (int64_t part = 0; part < table.num_parts(); ++part) {
     const std::optional<int64_t> hint = table.part_distinct_count(part, field);
     if (!hint.has_value()) {
       return std::nullopt;
@@ -244,6 +261,166 @@ std::optional<int64_t> KeyDomain(const Table& table, int field) {
     largest = std::max(largest, *hint);
   }
   return largest;
+}
+
+std::optional<int64_t> KeyDomain(const Table& table, int field) {
+  return ColumnDomain(table, field, ColumnRangeOf(table, field));
+}
+
+ColumnRange ColumnRangeOf(const Table& table, int field) {
+  const int64_t parts = table.num_parts();
+  ColumnRange out;
+  if (parts <= 0) {
+    return out;  // nothing to read: not exact, so every predicate takes its default factor
+  }
+  Int128 non_null = 0;
+  for (int64_t part = 0; part < parts; ++part) {
+    const std::optional<PartStats> stats = table.part_stats(part, field);
+    if (!stats.has_value()) {
+      return {};  // a column whose type has no statistics (ADR 0021), or a part without them
+    }
+    if (stats->null_count >= stats->rows) {
+      continue;  // only NULLs: no value of the part counts, and the part is still exact
+    }
+    if (!stats->min.has_value() || !stats->max.has_value() || *stats->min > *stats->max) {
+      return {};
+    }
+    non_null += std::max<int64_t>(stats->rows - std::max<int64_t>(stats->null_count, 0), 0);
+    out.min = out.min.has_value() ? std::min(*out.min, *stats->min) : *stats->min;
+    out.max = out.max.has_value() ? std::max(*out.max, *stats->max) : *stats->max;
+  }
+  out.non_null = Saturated(non_null);
+  out.exact = true;
+  return out;
+}
+
+int64_t PredicateRows(int64_t rows, const Predicate& predicate, const ColumnRange& range,
+                      std::optional<int64_t> domain) {
+  ANTB1_CHECK(rows >= 0);
+  // `rows` of a relation that has any, never estimated at none: a relation estimated at no row is
+  // ordered first and makes every estimate after it 0 too, so a predicate that keeps few rows must
+  // not be rounded down to keeping none.
+  const auto at_least_one = [rows](Int128 kept) {
+    return std::clamp<int64_t>(Saturated(kept), rows == 0 ? 0 : 1, rows);
+  };
+  // `rows` times `numerator` over `denominator`, rounded down but never to no row at all unless the
+  // numerator is 0.
+  const auto scaled = [rows, &at_least_one](Int128 numerator, Int128 denominator) {
+    if (numerator <= 0) {
+      return int64_t{0};
+    }
+    return at_least_one(Int128{rows} * numerator / std::max<Int128>(denominator, 1));
+  };
+  // What a predicate's complement keeps: the rest of the rows, and never none of them. A column of
+  // one distinct value would otherwise estimate `col <> that value` at exactly 0.
+  const auto complement = [rows, &at_least_one](int64_t matched) {
+    return at_least_one(Int128{rows} - Int128{matched});
+  };
+  // The values of the column, when the footers give them exactly: its range, and one value's share.
+  // The span is guarded like KeyDomain's: the range of 128-bit values can exceed an Int128.
+  bool ranged = range.exact && range.min.has_value() && range.max.has_value();
+  Int128 span = 0;
+  if (ranged) {
+    Int128 difference = 0;
+    if (__builtin_sub_overflow(*range.max, *range.min, &difference)) {
+      ranged = false;
+    } else {
+      const std::optional<Int128> widened = CheckedAdd(difference, 1);
+      ranged = widened.has_value();
+      span = widened.value_or(0);
+    }
+  }
+  const auto* constant = std::get_if<Int128>(&predicate.constant.value);
+  // Whether the column's range provably excludes a value, so that no row can equal it. Only an
+  // integer-valued constant can be placed against the range; anything else may match for all the
+  // footers say.
+  const auto outside = [&range, ranged](const Constant& value) {
+    const auto* integer = std::get_if<Int128>(&value.value);
+    return ranged && integer != nullptr && (*integer < *range.min || *integer > *range.max);
+  };
+
+  switch (predicate.kind) {
+    case Predicate::Kind::kFalse:
+      return 0;
+    case Predicate::Kind::kIsNotNull:
+      return range.exact ? std::min(rows, range.non_null) : scaled(kNotNullDefault, kDefaultScale);
+    case Predicate::Kind::kCompare: {
+      switch (predicate.op) {
+        case CompareOp::kEq:
+          // A constant the column's range excludes matches no row, as a range comparison outside
+          // the range admits none.
+          if (outside(predicate.constant)) {
+            return 0;
+          }
+          return domain.has_value() ? scaled(1, *domain) : scaled(kEqualDefault, kDefaultScale);
+        case CompareOp::kNe:
+          // The mirror: a constant the range excludes excludes no row, so every row passes. Without
+          // this the complement of a column of one value estimates a relation at almost none of its
+          // rows, which would order it first and build on the wrong side of its joins.
+          if (outside(predicate.constant)) {
+            return rows;
+          }
+          return domain.has_value() ? complement(scaled(1, *domain))
+                                    : scaled(kDefaultScale - kEqualDefault, kDefaultScale);
+        case CompareOp::kLt:
+        case CompareOp::kLe:
+        case CompareOp::kGt:
+        case CompareOp::kGe: {
+          if (!ranged || constant == nullptr) {
+            return scaled(kRangeDefault, kDefaultScale);
+          }
+          // How many of the column's values the comparison admits, clamped to its range: over
+          // [min, max] and a constant c, "< c" admits [min, c - 1], "<= c" admits [min, c], "> c"
+          // admits [c + 1, max] and ">= c" admits [c, max]. A constant outside the range admits
+          // all of them or none.
+          Int128 admitted = 0;
+          switch (predicate.op) {
+            case CompareOp::kLt:
+              admitted = *constant - *range.min;
+              break;
+            case CompareOp::kLe:
+              admitted = *constant - *range.min + 1;
+              break;
+            case CompareOp::kGt:
+              admitted = *range.max - *constant;
+              break;
+            default:  // kGe; kEq and kNe returned above
+              admitted = *range.max - *constant + 1;
+              break;
+          }
+          return scaled(std::clamp<Int128>(admitted, 0, span), span);
+        }
+      }
+      return scaled(kRangeDefault, kDefaultScale);
+    }
+    case Predicate::Kind::kIn: {
+      // Only a value the column's range admits can match, so a list of values it all excludes
+      // matches no row.
+      const int64_t matching = std::ranges::count_if(
+          predicate.values, [&outside](const Constant& value) { return !outside(value); });
+      if (matching == 0) {
+        return 0;
+      }
+      return domain.has_value() ? scaled(matching, *domain) : scaled(kEqualDefault, kDefaultScale);
+    }
+    case Predicate::Kind::kNotIn: {
+      const int64_t matching = std::ranges::count_if(
+          predicate.values, [&outside](const Constant& value) { return !outside(value); });
+      if (matching == 0) {
+        return rows;  // the mirror of kIn: nothing to exclude
+      }
+      return domain.has_value() ? complement(scaled(matching, *domain))
+                                : scaled(kDefaultScale - kEqualDefault, kDefaultScale);
+    }
+    case Predicate::Kind::kLike:
+      return scaled(kLikeDefault, kDefaultScale);
+    case Predicate::Kind::kNotLike:
+      return scaled(kDefaultScale - kLikeDefault, kDefaultScale);
+    case Predicate::Kind::kCompareColumns:
+    case Predicate::Kind::kIsTrue:
+      return scaled(kOtherDefault, kDefaultScale);
+  }
+  return rows;
 }
 
 std::optional<int64_t> RelationRows(const Binding& binding) {
