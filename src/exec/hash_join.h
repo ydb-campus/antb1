@@ -139,6 +139,15 @@ class JoinBuild {
 // One function so that the planner, the build and the probe cannot disagree about the direction.
 bool EmitsBuildRows(plan::JoinKind kind, plan::BuildSide side);
 
+// Whether such a join emits the build rows that did *not* match, rather than those that did: an
+// anti or a left outer join building on its left input. Those two need the build to retain the rows
+// whose keys are NULL (JoinBuildSpec::keep_null_keys), because a NULL key never matches and so is
+// unmatched by definition, where a semi join emits only matched rows and needs none of them. One
+// function for the same reason as EmitsBuildRows: the planner asks it to set the flag, the probe
+// asks it to refuse a build without one, and the sink asks it which way round to read the marks --
+// three places that must not disagree, since either disagreement loses rows with no error.
+bool EmitsUnmatchedBuildRows(plan::JoinKind kind, plan::BuildSide side);
+
 // Whether no row can come out of a join of `kind` whose build holds `table`, whatever its probe
 // input holds: an inner or a semi join whose table holds no row. Every other kind reads its probe
 // input: an anti join over no row keeps every selected row, a null-aware anti join over an empty
@@ -442,9 +451,12 @@ class PartRightJoinOperator final : public PartSink {
   arrow::Status Close() override;
 
  private:
-  // The marked build rows from position_ on, at most batch_size_ of them; nothing past the last
-  // build row. Every batch holds rows: it walks on until it finds marked ones or runs out.
+  // The next build rows the marks select, at most batch_size_ of them, then -- for a join that
+  // emits unmatched rows -- the retained NULL-key rows, which are all unmatched; nothing once both
+  // are done. Every batch holds rows: it walks on until it finds some or runs out.
   arrow::Result<std::optional<Batch>> NextMarked();
+  // The next slice of the retained NULL-key rows, at most batch_size_ rows of one batch.
+  arrow::Result<std::optional<Batch>> NextNullKeyed(const JoinTable& table);
 
   std::shared_ptr<const PartPipeline> pipeline_;
   int64_t num_parts_;
@@ -452,10 +464,17 @@ class PartRightJoinOperator final : public PartSink {
   std::shared_ptr<JoinBuild> build_;
   arrow::MemoryPool* pool_ = arrow::default_memory_pool();
   int64_t batch_size_ = 1;
-  int64_t position_ = 0;          // the next build row to consider emitting
+  int64_t position_ = 0;        // the next build row to consider emitting
+  std::size_t null_chunk_ = 0;  // and the retained NULL-key batch the tail reaches afterwards
+  int64_t null_row_ = 0;        // and the row of it
+  // Emit the rows the marks did not select rather than those they did, and then the retained
+  // NULL-key rows, which are unmatched by definition (EmitsUnmatchedBuildRows). The two stores
+  // never share an output batch: a JoinRowRef addresses chunks() and nothing else, and these are
+  // slices of their own batches.
+  bool unmatched_ = false;
   bool probed_ = false;           // every part is in: the marks are final and emitting has begun
-  bool ended_ = false;            // the last marked row was handed on (or the run failed)
-  std::vector<JoinRowRef> rows_;  // the refs of a batch's marked rows
+  bool ended_ = false;            // the last row was handed on (or the run failed)
+  std::vector<JoinRowRef> rows_;  // the refs of a batch's selected keyed rows
   std::unique_ptr<PartScheduler<bool>> scheduler_;
 };
 

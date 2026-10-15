@@ -210,6 +210,52 @@ SELECT COUNT(*) FROM zones WHERE EXISTS (SELECT * FROM trips WHERE tr_pickup = z
 ----
 37
 
+# ---- NOT EXISTS over a much larger subquery (ADR 0026's C2c) ----
+
+# `trips` has about twenty times the rows of `zones`, so the anti join builds on the outer side and
+# emits the rows it did *not* mark, in the build's order rather than the probe's.
+query I nosort
+SELECT zn_id FROM zones WHERE NOT EXISTS (SELECT * FROM trips WHERE tr_pickup = zn_id AND tr_fare > zn_radius) ORDER BY zn_id
+----
+13
+26
+39
+
+# Keyed on a column of the preserved side that has NULLs: `zn_parent` is NULL for 5 of the 40 zones,
+# and a NULL key matches nothing, so NOT EXISTS keeps every one of those rows. They are the rows the
+# build retains apart from the table it indexes -- nothing marks them, and nothing can.
+query I nosort
+SELECT COUNT(*) FROM zones WHERE NOT EXISTS (SELECT * FROM trips WHERE tr_pickup = zn_parent)
+----
+6
+
+query I nosort
+SELECT zn_id FROM zones WHERE NOT EXISTS (SELECT * FROM trips WHERE tr_pickup = zn_parent AND tr_fare > zn_radius) ORDER BY zn_id
+----
+1
+2
+3
+4
+5
+13
+26
+39
+40
+
+# The same key with EXISTS: the two partition the 40 zones between them, and the rows whose key is
+# NULL fall to the anti side every time.
+query I nosort
+SELECT COUNT(*) FROM zones WHERE EXISTS (SELECT * FROM trips WHERE tr_pickup = zn_parent)
+----
+34
+
+# A NOT EXISTS whose subquery keeps nothing, so no row is marked and every zone comes out -- both
+# the keyed rows and the retained ones, which the sink emits one store after the other.
+query I nosort
+SELECT COUNT(*) FROM zones WHERE NOT EXISTS (SELECT * FROM trips WHERE tr_pickup = zn_parent AND tr_fare < -1)
+----
+40
+
 # ---- two correlated subqueries at one level (ADR 0026) ----
 
 # The unnesting pass rewrites top-down, so the second EXISTS is rewritten first, while its outer

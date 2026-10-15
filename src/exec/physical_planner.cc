@@ -235,10 +235,16 @@ arrow::Result<std::shared_ptr<JoinBuild>> MakeJoinBuild(const plan::JoinNode& jo
     slot->set_name("HashBuild");
     slot->set_detail(plan::ExplainNode(plan::LogicalNode(join)));
   }
+  // A join that emits the build rows which did not match needs the rows whose keys are NULL kept:
+  // those are unmatched by definition. One predicate decides it here, in the probe and in the sink
+  // (EmitsUnmatchedBuildRows), and the probe refuses a build whose spec disagrees. Note the
+  // fallback that rewrites a node with build=kRight runs before this, so the flag follows the side
+  // the join really runs on, not the one the logical plan asked for.
+  const bool keep_null_keys = EmitsUnmatchedBuildRows(join.kind, join.build);
   const auto spec_of = [&](std::shared_ptr<arrow::Schema> schema) {
     return join.kind == plan::JoinKind::kOneRow
                ? JoinBuildSpec::Keyless(std::move(schema))
-               : JoinBuildSpec::Make(std::move(schema), shape.build_keys);
+               : JoinBuildSpec::Make(std::move(schema), shape.build_keys, keep_null_keys);
   };
   if (const plan::ScanNode* scan = PipelineScan(shape.build)) {
     ARROW_ASSIGN_OR_RAISE(Parts parts, PartsOf(shape.build, *scan, slot));

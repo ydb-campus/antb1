@@ -692,13 +692,14 @@ arrow::Result<LogicalNodePtr> Path1(const DependentJoinNode& join, ColumnId& las
     right = Make(ComputeNode{
         .input = std::move(right), .exprs = inner_casts, .ids = inner_cast_ids, .span = join.span});
   }
-  // ADR 0026's C2b and C3: a semi join may build on its left input, the side it preserves, when
-  // the subquery side is decisively larger -- the shape a correlated EXISTS over a large relation
-  // has, where ADR 0022's rule built the whole of that relation to probe it with far fewer rows.
-  // An anti join cannot emit its build rows yet (C2c), so it keeps building on the subquery side
-  // whatever the estimates say.
+  // ADR 0026's C2b, C2c and C3: a semi or an anti join may build on its left input, the side it
+  // preserves, when the subquery side is decisively larger -- the shape a correlated EXISTS or NOT
+  // EXISTS over a large relation has, where ADR 0022's rule built the whole of that relation to
+  // probe it with far fewer rows. A null-aware anti join (NOT IN) still cannot emit its build rows,
+  // so it keeps building on the subquery side whatever the estimates say.
   const std::optional<int64_t> left_rows = EstimateRows(*left);
-  const BuildSide build = join.kind == JoinKind::kSemi
+  const bool chooses = join.kind == JoinKind::kSemi || join.kind == JoinKind::kAnti;
+  const BuildSide build = chooses
                               ? ChooseBuildSide(left_rows, EstimateRows(*right), build_side_ratio)
                               : BuildSide::kRight;
   LogicalNodePtr out = Make(JoinNode{.kind = join.kind,

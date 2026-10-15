@@ -24,7 +24,7 @@
 // then read by any number of probe threads without locks.
 //
 // A build runs in three steps. Each part of the input is appended to its own JoinBuildPart, on any
-// thread (a part task): the part keeps its selected rows whose keys are not NULL, split into
+// thread (a part task): the part indexes its selected rows whose keys are not NULL, split into
 // kJoinPartitions partitions by the hash of their keys (KeyHashes modulo kJoinPartitions, the
 // GROUP BY rule), with one Take per column. The consumer thread adds the parts to a
 // JoinTableBuilder in any order; the builder hands them to the partitions in part order
@@ -42,7 +42,9 @@
 //
 // Rows are kept as the parts appended them (the chunks), without a copy, and referenced as (chunk,
 // row); a build of more than 4294967295 rows is OutOfMemory. NULL keys are never inserted, so they
-// never match; the table counts them for the null-aware anti join.
+// never match; the table counts them for the null-aware anti join, and with
+// JoinBuildSpec::keep_null_keys it also retains their rows in null_chunks(), apart from everything
+// a JoinRowRef addresses, for the join that must emit the build rows which did not match.
 //
 // A keyless build (JoinBuildSpec::Keyless, a one-row join's) holds every selected row as rows of
 // one key: one hash, one partition, one slot, so unique() means at most one row. It has nothing to
@@ -81,8 +83,13 @@ class JoinBuildSpec {
   // Invalid (a planner bug, never NotImplemented) without a schema or keys, for a key outside the
   // schema, for a DOUBLE or BOOLEAN key, or for a key whose column is not of its type
   // (plan::ToArrow).
+  // With `keep_null_keys`, the build also retains the selected rows whose keys are NULL, apart from
+  // the table it indexes (JoinTable::null_chunks): a join that emits the build rows which did not
+  // match needs them, since a NULL key never matches (ADR 0026's C2c). Every other join leaves them
+  // behind, so it costs nothing unless it is asked for.
   static arrow::Result<std::shared_ptr<const JoinBuildSpec>> Make(
-      std::shared_ptr<arrow::Schema> schema, std::vector<plan::BoundColumn> keys);
+      std::shared_ptr<arrow::Schema> schema, std::vector<plan::BoundColumn> keys,
+      bool keep_null_keys = false);
   // The spec of a build without keys, a one-row join's. Invalid without a schema.
   static arrow::Result<std::shared_ptr<const JoinBuildSpec>> Keyless(
       std::shared_ptr<arrow::Schema> schema);
@@ -93,14 +100,17 @@ class JoinBuildSpec {
   // One key of a type the direct layout indexes: SMALLINT, INTEGER, BIGINT, USMALLINT, DATE or
   // TIMESTAMP.
   [[nodiscard]] bool direct_candidate() const { return direct_candidate_; }
+  // Whether the build retains the rows whose keys are NULL (JoinTable::null_chunks).
+  [[nodiscard]] bool keep_null_keys() const { return keep_null_keys_; }
 
  private:
   JoinBuildSpec(std::shared_ptr<arrow::Schema> schema, std::vector<plan::BoundColumn> keys,
-                bool direct_candidate);
+                bool direct_candidate, bool keep_null_keys);
 
   std::shared_ptr<arrow::Schema> schema_;
   std::vector<plan::BoundColumn> keys_;
   bool direct_candidate_ = false;
+  bool keep_null_keys_ = false;
 };
 
 // One part of a build's input, partitioned as it is appended. Single-threaded: a part task appends
@@ -116,14 +126,16 @@ class JoinBuildPart {
   ~JoinBuildPart();
 
   // Keeps the selected rows of `batch` whose keys are not NULL, every column, partitioned (Arrow
-  // buffers from `pool`). Invalid for an end batch, another schema or a selection of another
-  // length. On failure the part is unchanged.
+  // buffers from `pool`); with JoinBuildSpec::keep_null_keys, the selected rows whose keys are NULL
+  // are kept too, in their own batches that no partition indexes. Invalid for an end batch, another
+  // schema or a selection of another length. On failure the part is unchanged.
   arrow::Status Append(const Batch& batch, arrow::MemoryPool* pool);
 
   [[nodiscard]] const std::shared_ptr<const JoinBuildSpec>& spec() const { return spec_; }
   // The selected rows appended, NULL keys included.
   [[nodiscard]] int64_t input_rows() const { return input_rows_; }
-  // The selected rows with a NULL in some key (not kept).
+  // The selected rows with a NULL in some key (never indexed; retained only with
+  // JoinBuildSpec::keep_null_keys).
   [[nodiscard]] int64_t null_key_rows() const { return null_key_rows_; }
   // The rows kept.
   [[nodiscard]] int64_t num_rows() const { return num_rows_; }
@@ -141,19 +153,29 @@ class JoinBuildPart {
   };
 
   arrow::Status AppendRows(const Batch& batch, arrow::MemoryPool* pool);
-  // The bytes of pieces_ (at `capacity`) and of the pieces' hashes.
-  [[nodiscard]] int64_t MemoryUsage(std::size_t capacity) const;
+  // The rows of `batch` that are selected and have a NULL key, appended to null_pieces_; nothing
+  // when there is none. `remaining` is how many there are (the selected rows less the kept ones),
+  // which is known before the rows are found.
+  arrow::Status AppendNullKeys(const Batch& batch, int64_t remaining, arrow::MemoryPool* pool);
+  // The bytes of pieces_ and null_pieces_ (each at its own capacity) and of the pieces' hashes.
+  // One function, taking both, because MemoryReservation::Resize is absolute: a term added at one
+  // call site would be dropped by the next Append.
+  [[nodiscard]] int64_t MemoryUsage(std::size_t capacity, std::size_t null_capacity) const;
 
   std::shared_ptr<const JoinBuildSpec> spec_;
   MemoryBudget* budget_;
   std::vector<Piece> pieces_;
+  // The retained rows whose keys are NULL, in the order they were appended; empty unless the spec
+  // asks for them. They are batches rather than Pieces: nothing hashes, partitions or indexes them,
+  // and the tail that emits them slices them whole.
+  std::vector<std::shared_ptr<arrow::RecordBatch>> null_pieces_;
   int64_t input_rows_ = 0;
   int64_t null_key_rows_ = 0;
   int64_t num_rows_ = 0;
   int64_t min_key_ = 0;  // a direct candidate with rows: its smallest and largest key
   int64_t max_key_ = 0;
   int64_t hash_bytes_ = 0;    // the capacity of the pieces' hashes, in bytes
-  MemoryReservation memory_;  // pieces_ and the hashes
+  MemoryReservation memory_;  // pieces_, null_pieces_ and the hashes
 };
 
 class JoinTableBuilder;
@@ -226,6 +248,14 @@ class JoinTable {
   // The parts' rows (every column of the build input) that JoinRowRef::chunk indexes.
   [[nodiscard]] const std::vector<std::shared_ptr<arrow::RecordBatch>>& chunks() const {
     return chunks_;
+  }
+  // The retained rows whose keys are NULL, in part order; empty unless
+  // JoinBuildSpec::keep_null_keys asked for them. They are in no key's range, Find never returns
+  // one, and no JoinRowRef addresses them -- a ref's `chunk` indexes chunks() and nothing else,
+  // which is what keeps the two stores apart. The join that emits the build rows which did not
+  // match emits these whole (ADR 0026's C2c), since a NULL key matches nothing.
+  [[nodiscard]] const std::vector<std::shared_ptr<arrow::RecordBatch>>& null_chunks() const {
+    return null_chunks_;
   }
   [[nodiscard]] const JoinBuildSpec& spec() const { return *spec_; }
   [[nodiscard]] Layout layout() const { return layout_; }
@@ -307,6 +337,7 @@ class JoinTable {
   MemoryBudget* budget_;
   std::vector<int> widths_;  // per key: the bytes of a value, 0 for VARCHAR
   std::vector<std::shared_ptr<arrow::RecordBatch>> chunks_;
+  std::vector<std::shared_ptr<arrow::RecordBatch>> null_chunks_;  // not indexed by any JoinRowRef
   std::vector<KeyView> chunk_keys_;  // chunk c's keys at [c * keys, (c + 1) * keys)
   std::vector<JoinRowRef> rows_;
   Layout layout_ = Layout::kHashed;

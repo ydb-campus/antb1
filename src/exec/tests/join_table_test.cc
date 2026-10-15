@@ -164,8 +164,9 @@ arrow::Result<std::shared_ptr<const JoinTable>> Assemble(
 // The table of `data`: its parts appended on this thread, added in `order`.
 arrow::Result<std::shared_ptr<const JoinTable>> BuildTable(
     const BuildData& data, arrow::internal::Executor* executor, std::vector<std::size_t> order = {},
-    MemoryBudget* budget = nullptr, arrow::MemoryPool* pool = arrow::default_memory_pool()) {
-  ARROW_ASSIGN_OR_RAISE(auto spec, JoinBuildSpec::Make(data.schema(), data.keys()));
+    MemoryBudget* budget = nullptr, arrow::MemoryPool* pool = arrow::default_memory_pool(),
+    bool keep_null_keys = false) {
+  ARROW_ASSIGN_OR_RAISE(auto spec, JoinBuildSpec::Make(data.schema(), data.keys(), keep_null_keys));
   ARROW_ASSIGN_OR_RAISE(auto parts, MakeParts(data, spec, budget, pool));
   return Assemble(spec, parts, executor, std::move(order), budget);
 }
@@ -830,6 +831,127 @@ TEST_F(JoinTableTest, FlagsForEmptyAndNullOnlyBuilds) {
     EXPECT_TRUE((*table)->chunks().empty());
     expect_no_match(**table);
   }
+}
+
+// With JoinBuildSpec::keep_null_keys the build also retains the rows whose keys are NULL, for the
+// join that must emit the build rows which did not match (ADR 0026's C2c). They stay out of
+// everything that indexes or probes the table: a NULL key matches nothing, so nothing addresses
+// them and Find never returns one. Every count and flag reads as it did without the flag.
+TEST_F(JoinTableTest, ABuildMayRetainTheRowsWhoseKeysAreNull) {
+  const auto pool = MakeThreadPool();
+  const Probe probe = Int64Probe({1, std::nullopt, 2, 3});
+  // Part 0 mixes keys and NULLs, part 1 is all NULL (the path where no row is kept at all), part 2
+  // has no NULL, and part 3's selection drops one of its NULL keys and one of its keys.
+  const auto data = [] {
+    BuildData out({LogicalType::kBigInt});
+    out.Add(0, {Int64s({1, std::nullopt, 2})})
+        .Add(1, {Int64s({std::nullopt, std::nullopt})})
+        .Add(2, {Int64s({3})})
+        .Add(3, {Int64s({std::nullopt, 4, std::nullopt})}, Bools({true, false, false}));
+    return out;
+  }();
+  for (arrow::internal::Executor* executor : Executors(pool.get())) {
+    for (const bool keep : {false, true}) {
+      SCOPED_TRACE(std::string(executor == nullptr ? "serial" : "pooled") +
+                   (keep ? " keeping" : " dropping"));
+      auto table = BuildTable(data, executor, {}, nullptr, arrow::default_memory_pool(), keep);
+      ASSERT_TRUE(table.ok()) << table.status().ToString();
+      // Selected: 3 + 2 + 1 + 1 = 7; keys 1, 2, 3; NULL keys 1 + 2 + 0 + 1 = 4.
+      EXPECT_EQ((*table)->input_rows(), 7);
+      EXPECT_EQ((*table)->num_rows(), 3);
+      EXPECT_EQ((*table)->null_key_rows(), 4) << "counted either way";
+      EXPECT_TRUE((*table)->has_null());
+      EXPECT_TRUE((*table)->unique()) << "the retained rows are no key of their own";
+      // The keyed rows and their chunks are the same either way: a retained row is in neither.
+      EXPECT_EQ((*table)->rows().size(), 3U);
+      // One chunk per part that kept a key: part 1 kept none and part 3's selection left it only a
+      // NULL key, so neither of those two is a chunk however the flag is set.
+      EXPECT_EQ((*table)->chunks().size(), 2U);
+      // Find never reaches a retained row: keys 1, 2 and 3 match one row each, a NULL key none.
+      const std::vector<JoinMatches> matches = FindAll(**table, probe);
+      ASSERT_EQ(matches.size(), 4U);
+      EXPECT_EQ(matches[0].end - matches[0].begin, 1U) << "key 1";
+      EXPECT_EQ(matches[1].end - matches[1].begin, 0U) << "a NULL probe key matches nothing";
+      EXPECT_EQ(matches[2].end - matches[2].begin, 1U) << "key 2";
+      EXPECT_EQ(matches[3].end - matches[3].begin, 1U) << "key 3";
+      int64_t retained = 0;
+      for (const std::shared_ptr<arrow::RecordBatch>& chunk : (*table)->null_chunks()) {
+        retained += chunk->num_rows();
+        // Every retained row really has a NULL key: the selection decided which, not the order.
+        const auto& keys = static_cast<const arrow::Int64Array&>(*chunk->column(0));
+        for (int64_t row = 0; row < chunk->num_rows(); ++row) {
+          EXPECT_TRUE(keys.IsNull(row)) << row;
+        }
+      }
+      EXPECT_EQ(retained, keep ? 4 : 0);
+      // Dropping is the default, so nothing that does not ask for them pays for them.
+      EXPECT_EQ((*table)->null_chunks().empty(), !keep);
+    }
+  }
+}
+
+// The retained rows are charged to the budget, and a part that fails to take them is unchanged and
+// gives every byte back. RunsOutOfMemoryCleanly cannot see this on its own: a MemoryReservation
+// hands everything back in its destructor, so its scope-exit assertion holds even for a Resize that
+// released too little. This watches the budget while the part is still alive.
+TEST_F(JoinTableTest, RetainedNullKeysAreChargedAndGivenBackOnFailure) {
+  BuildData data({LogicalType::kBigInt});
+  data.Add(0, {Int64s({1, std::nullopt, 2, std::nullopt})});
+  const auto spec_of = [&](bool keep) {
+    auto spec = JoinBuildSpec::Make(data.schema(), data.keys(), keep);
+    EXPECT_TRUE(spec.ok()) << spec.status().ToString();
+    return *spec;
+  };
+  const Batch& batch = data.parts().front().front();
+
+  // What a part costs without the retained rows, and with them: the flag is not free, and it is
+  // charged, which is what a budget has to see.
+  MemoryBudget plain(std::nullopt);
+  MemoryBudget keeping(std::nullopt);
+  int64_t plain_bytes = 0;
+  int64_t keeping_bytes = 0;
+  {
+    JoinBuildPart part(spec_of(false), &plain);
+    ASSERT_TRUE(part.Append(batch, &plain).ok());
+    plain_bytes = plain.bytes_allocated();
+  }
+  {
+    JoinBuildPart part(spec_of(true), &keeping);
+    ASSERT_TRUE(part.Append(batch, &keeping).ok());
+    keeping_bytes = keeping.bytes_allocated();
+  }
+  EXPECT_GT(keeping_bytes, plain_bytes) << "the retained rows are charged";
+  EXPECT_EQ(plain.bytes_allocated(), 0) << "and given back with the part";
+  EXPECT_EQ(keeping.bytes_allocated(), 0);
+
+  // A limit between the two: the append fails and the part holds nothing at all. The retained rows
+  // go in before the keyed ones, so a failure among those leaves a batch of the same call behind
+  // unless it is dropped -- and the table a failed part builds is where that shows, since its
+  // Arrow buffers are charged to the pool rather than to the reservation. Checking bytes alone
+  // would not do: a vector whose capacity grew keeps it on purpose, as pieces_ always has.
+  int64_t failures = 0;
+  for (int64_t limit = plain_bytes; limit < keeping_bytes; limit += 8) {
+    SCOPED_TRACE(limit);
+    MemoryBudget tight(limit);
+    const std::shared_ptr<const JoinBuildSpec> spec = spec_of(true);
+    auto part = std::make_shared<JoinBuildPart>(spec, &tight);
+    const arrow::Status status = part->Append(batch, &tight);
+    if (status.ok()) {
+      continue;  // this limit was enough after all
+    }
+    ++failures;
+    EXPECT_TRUE(status.IsOutOfMemory()) << status.ToString();
+    EXPECT_EQ(part->input_rows(), 0) << "a part that failed is unchanged";
+    EXPECT_EQ(part->null_key_rows(), 0);
+    EXPECT_EQ(part->num_rows(), 0);
+    const std::vector<std::shared_ptr<const JoinBuildPart>> parts = {part};
+    auto table = Assemble(spec, parts, nullptr);
+    ASSERT_TRUE(table.ok()) << table.status().ToString();
+    EXPECT_TRUE((*table)->null_chunks().empty()) << "it kept a batch of the call that failed";
+    EXPECT_TRUE((*table)->chunks().empty());
+    EXPECT_EQ((*table)->input_rows(), 0);
+  }
+  EXPECT_GT(failures, 0) << "no limit in the range failed: the test proves nothing";
 }
 
 // A keyless build (a one-row join's) holds every selected row as the rows of one key, NULL values

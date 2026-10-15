@@ -187,11 +187,16 @@ void ForEachRowHash(const RowMask& mask, const RowHashes& hashed, const Visit& v
 // ---- JoinBuildSpec ----
 
 JoinBuildSpec::JoinBuildSpec(std::shared_ptr<arrow::Schema> schema,
-                             std::vector<plan::BoundColumn> keys, bool direct_candidate)
-    : schema_(std::move(schema)), keys_(std::move(keys)), direct_candidate_(direct_candidate) {}
+                             std::vector<plan::BoundColumn> keys, bool direct_candidate,
+                             bool keep_null_keys)
+    : schema_(std::move(schema)),
+      keys_(std::move(keys)),
+      direct_candidate_(direct_candidate),
+      keep_null_keys_(keep_null_keys) {}
 
 arrow::Result<std::shared_ptr<const JoinBuildSpec>> JoinBuildSpec::Make(
-    std::shared_ptr<arrow::Schema> schema, std::vector<plan::BoundColumn> keys) {
+    std::shared_ptr<arrow::Schema> schema, std::vector<plan::BoundColumn> keys,
+    bool keep_null_keys) {
   return NoBadAlloc("a join build", [&] -> arrow::Result<std::shared_ptr<const JoinBuildSpec>> {
     if (schema == nullptr) {
       return arrow::Status::Invalid("a join build without a schema");
@@ -228,7 +233,7 @@ arrow::Result<std::shared_ptr<const JoinBuildSpec>> JoinBuildSpec::Make(
       }
     }
     return std::shared_ptr<const JoinBuildSpec>(
-        new JoinBuildSpec(std::move(schema), std::move(keys), direct));
+        new JoinBuildSpec(std::move(schema), std::move(keys), direct, keep_null_keys));
   });
 }
 
@@ -238,8 +243,9 @@ arrow::Result<std::shared_ptr<const JoinBuildSpec>> JoinBuildSpec::Keyless(
     return arrow::Status::Invalid("a join build without a schema");
   }
   return NoBadAlloc("a join build", [&] -> arrow::Result<std::shared_ptr<const JoinBuildSpec>> {
-    return std::shared_ptr<const JoinBuildSpec>(
-        new JoinBuildSpec(std::move(schema), {}, /*direct_candidate=*/false));
+    return std::shared_ptr<const JoinBuildSpec>(new JoinBuildSpec(std::move(schema), {},
+                                                                  /*direct_candidate=*/false,
+                                                                  /*keep_null_keys=*/false));
   });
 }
 
@@ -253,17 +259,80 @@ JoinBuildPart::JoinBuildPart(std::shared_ptr<const JoinBuildSpec> spec, MemoryBu
 
 JoinBuildPart::~JoinBuildPart() = default;
 
-int64_t JoinBuildPart::MemoryUsage(std::size_t capacity) const {
-  return Narrow<int64_t>(capacity * sizeof(Piece)) + hash_bytes_;
+int64_t JoinBuildPart::MemoryUsage(std::size_t capacity, std::size_t null_capacity) const {
+  return Narrow<int64_t>((capacity * sizeof(Piece)) +
+                         (null_capacity * sizeof(std::shared_ptr<arrow::RecordBatch>))) +
+         hash_bytes_;
 }
 
 arrow::Status JoinBuildPart::Append(const Batch& batch, arrow::MemoryPool* pool) {
+  const std::size_t retained = null_pieces_.size();
   arrow::Status status = NoBadAlloc("a join build", [&] { return AppendRows(batch, pool); });
   if (!status.ok()) {
-    // Gives back what the batch reserved (shrinking never fails); its rows were not kept.
-    status &= memory_.Resize(MemoryUsage(pieces_.capacity()));
+    // The rows whose keys are NULL are retained before the keyed ones, so a failure among those
+    // leaves a batch of this very call behind -- and the part must be unchanged. Dropping it also
+    // gives its Arrow buffers back, which the reservation below does not cover: they are charged to
+    // the pool by the Take that made them.
+    null_pieces_.resize(retained);
+    // Gives back what the batch reserved (shrinking never fails); its rows were not kept. Both
+    // capacities, or the reservation keeps the room the batch asked for in the other store.
+    status &= memory_.Resize(MemoryUsage(pieces_.capacity(), null_pieces_.capacity()));
   }
   return status;
+}
+
+arrow::Status JoinBuildPart::AppendNullKeys(const Batch& batch, int64_t remaining,
+                                            arrow::MemoryPool* pool) {
+  if (!spec_->keep_null_keys() || remaining == 0) {
+    return arrow::Status::OK();  // not asked for, or every selected row has its keys
+  }
+  const arrow::RecordBatch& data = *batch.data;
+  const int64_t length = data.num_rows();
+  // The rows that are selected, exactly: RowMask folds a selection's values and its validity, so a
+  // NULL in a selection counts as false here just as it does in Batch::selected_rows. Walking the
+  // selected rows and testing the keys costs O(selected); walking the gaps between the key mask's
+  // own runs would cost O(length) and would have to re-derive what a selection's NULL means.
+  //
+  // The walk is a bitmap read per row, measured at 0.415 ns on this host, and it only happens when
+  // a key really has a NULL -- `remaining` is 0 otherwise, which is the common case, including for
+  // every TPC-H-derived query. The build it walks is also the small side by construction, since the
+  // planner only moves to this side when the other is several times larger: 2.9 ms for a 7.1M-row
+  // build, 0.01% of the query that build belongs to. Reading each key's validity bitmap in runs
+  // instead would be faster still and is not worth the arithmetic in a path this exact.
+  ARROW_ASSIGN_OR_RAISE(
+      const RowMask selected,
+      RowMask::Make(std::span<const arrow::Array* const>{}, batch.selection.get(), length, pool));
+  ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Buffer> index_buffer,
+                        arrow::AllocateBuffer(remaining * int64_t{sizeof(std::uint32_t)}, pool));
+  const std::span<std::uint32_t> indices = index_buffer->mutable_span_as<std::uint32_t>();
+  int64_t found = 0;
+  selected.ForEachRun([&](int64_t position, int64_t count) {
+    for (int64_t row = position; row < position + count && found < remaining; ++row) {
+      const bool null_key = std::ranges::any_of(spec_->keys(), [&](const plan::BoundColumn& key) {
+        return data.column(key.index)->IsNull(row);
+      });
+      if (null_key) {
+        indices[static_cast<std::size_t>(found)] = Narrow<std::uint32_t>(row);
+        ++found;
+      }
+    }
+  });
+  // `remaining` came from the mask, which counts the same rows: a mismatch is a programming error
+  // in one of the two, and emitting a short batch would silently drop build rows.
+  ANTB1_CHECK(found == remaining);
+  const std::size_t capacity = null_pieces_.size() < null_pieces_.capacity()
+                                   ? null_pieces_.capacity()
+                                   : std::max<std::size_t>(4, 2 * null_pieces_.capacity());
+  ARROW_RETURN_NOT_OK(memory_.Resize(MemoryUsage(pieces_.capacity(), capacity)));
+  null_pieces_.reserve(capacity);
+  arrow::compute::ExecContext kernels(pool);
+  ARROW_ASSIGN_OR_RAISE(
+      const arrow::Datum taken,
+      arrow::compute::Take(batch.data,
+                           std::make_shared<arrow::UInt32Array>(remaining, index_buffer),
+                           arrow::compute::TakeOptions::NoBoundsCheck(), &kernels));
+  null_pieces_.push_back(taken.record_batch());
+  return arrow::Status::OK();
 }
 
 arrow::Status JoinBuildPart::AppendRows(const Batch& batch, arrow::MemoryPool* pool) {
@@ -298,10 +367,17 @@ arrow::Status JoinBuildPart::AppendRows(const Batch& batch, arrow::MemoryPool* p
                         RowMask::Make(key_arrays, batch.selection.get(), length, pool));
   const int64_t kept = mask.CountRows();
   if (kept == 0) {
+    // Every selected row has a NULL key. The counters move only after the last fallible call, so a
+    // failed retention leaves the part unchanged.
+    ARROW_RETURN_NOT_OK(AppendNullKeys(batch, selected, pool));
     input_rows_ += selected;
     null_key_rows_ += selected;
     return arrow::Status::OK();
   }
+  // Before the keyed rows, so that a failure here leaves no piece behind either. The rows with a
+  // NULL key are the selected ones the mask dropped; `kept == selected` means there are none and
+  // nothing is walked.
+  ARROW_RETURN_NOT_OK(AppendNullKeys(batch, selected - kept, pool));
   MemoryReservation scratch;  // the hashes of the batch, given back on return
   scratch.Reset(budget_);
   ARROW_ASSIGN_OR_RAISE(const RowHashes hashed, HashRows(keys, mask, kept, pool, scratch));
@@ -316,7 +392,7 @@ arrow::Status JoinBuildPart::AppendRows(const Batch& batch, arrow::MemoryPool* p
                                    ? pieces_.capacity()
                                    : std::max<std::size_t>(4, 2 * pieces_.capacity());
   const int64_t hash_bytes = kept * int64_t{sizeof(std::uint64_t)};
-  ARROW_RETURN_NOT_OK(memory_.Resize(MemoryUsage(capacity) + hash_bytes));
+  ARROW_RETURN_NOT_OK(memory_.Resize(MemoryUsage(capacity, null_pieces_.capacity()) + hash_bytes));
   pieces_.reserve(capacity);
   piece.hashes.resize(static_cast<std::size_t>(kept));
   ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Buffer> index_buffer,
@@ -456,6 +532,7 @@ bool JoinTable::KeysEqual(std::span<const KeyView> keys, int64_t row, JoinRowRef
 int64_t JoinTable::MemoryUsage() const {
   return Narrow<int64_t>((widths_.capacity() * sizeof(int)) +
                          (chunks_.capacity() * sizeof(std::shared_ptr<arrow::RecordBatch>)) +
+                         (null_chunks_.capacity() * sizeof(std::shared_ptr<arrow::RecordBatch>)) +
                          (chunk_keys_.capacity() * sizeof(KeyView)) +
                          (rows_.capacity() * sizeof(JoinRowRef)) +
                          (offsets_.capacity() * sizeof(std::uint32_t)));
@@ -467,9 +544,11 @@ arrow::Status JoinTable::Build(std::span<const std::shared_ptr<const JoinBuildPa
   const std::vector<plan::BoundColumn>& keys = spec_->keys();
   std::size_t num_chunks = 0;
   std::size_t num_rows = 0;
+  std::size_t num_null_chunks = 0;
   for (const std::shared_ptr<const JoinBuildPart>& part : parts) {
     num_chunks += part->pieces_.size();
     num_rows += static_cast<std::size_t>(part->num_rows_);
+    num_null_chunks += part->null_pieces_.size();
   }
   // Direct for one dense integer key; the span is counted in 64 bits, so that keys from INT64_MIN
   // to INT64_MAX do not overflow it.
@@ -484,6 +563,7 @@ arrow::Status JoinTable::Build(std::span<const std::shared_ptr<const JoinBuildPa
   const std::uint64_t bytes = (keys.size() * sizeof(int)) +
                               (num_chunks * (sizeof(std::shared_ptr<arrow::RecordBatch>) +
                                              (keys.size() * sizeof(KeyView)))) +
+                              (num_null_chunks * sizeof(std::shared_ptr<arrow::RecordBatch>)) +
                               (num_rows * sizeof(JoinRowRef)) + (offsets * sizeof(std::uint32_t));
   ARROW_RETURN_NOT_OK(memory_.Resize(Narrow<int64_t>(bytes)));
   widths_.reserve(keys.size());
@@ -491,6 +571,7 @@ arrow::Status JoinTable::Build(std::span<const std::shared_ptr<const JoinBuildPa
     widths_.push_back(KeyWidth(*spec_->schema()->field(key.index)->type()));
   }
   chunks_.reserve(num_chunks);
+  null_chunks_.reserve(num_null_chunks);
   chunk_keys_.reserve(num_chunks * keys.size());
   for (const std::shared_ptr<const JoinBuildPart>& part : parts) {
     for (const JoinBuildPart::Piece& piece : part->pieces_) {
@@ -498,6 +579,12 @@ arrow::Status JoinTable::Build(std::span<const std::shared_ptr<const JoinBuildPa
       for (std::size_t k = 0; k < keys.size(); ++k) {
         chunk_keys_.push_back(ViewOf(*piece.rows->column_data(keys[k].index), widths_[k]));
       }
+    }
+    // In the same part-ordered walk, so that the rows a tail emits from them are the same rows in
+    // the same order for any number of threads. They get no chunk number and no key view: nothing
+    // indexes or probes them.
+    for (const std::shared_ptr<arrow::RecordBatch>& rows : part->null_pieces_) {
+      null_chunks_.push_back(rows);
     }
   }
   rows_.resize(num_rows);
