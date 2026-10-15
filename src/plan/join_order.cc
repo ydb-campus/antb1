@@ -188,8 +188,15 @@ struct RowsOf {
   // The join order's own estimate for this join, kept on the node (ADR 0026): the domains rule 3
   // divides by are not reachable from a plan node, so nothing here could recompute it.
   std::optional<int64_t> operator()(const JoinNode& node) const { return node.estimate; }
-  std::optional<int64_t> operator()(const DependentJoinNode& /*node*/) const {
-    return std::nullopt;
+  // A dependent join outputs at most its left input's rows, for every kind the unnesting pass
+  // admits: a semi or an anti join keeps a subset of them, and a one-row join pairs each with the
+  // subquery's single row (ADR 0023 refuses every other kind). The pass rewrites top-down, so the
+  // outer of two nested dependent joins is rewritten while its left input still holds the inner
+  // one -- and reading that as unknown left the outer join building on its subquery however
+  // lopsided it was (ADR 0026). Over-estimating a left input makes ChooseBuildSide flip less
+  // readily, which is the safe direction.
+  std::optional<int64_t> operator()(const DependentJoinNode& node) const {
+    return EstimateRows(*node.left);
   }
 
   template <class Node>

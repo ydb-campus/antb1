@@ -799,6 +799,53 @@ ExprPtr Compare(const BoundColumn& left, const BoundColumn& right, CompareOp op)
 // subquery's side is estimated at more than `build_side_ratio` hundredths times it -- the shape a
 // correlated EXISTS over a large table has. An anti join cannot emit its build rows yet (C2c), so
 // it keeps building on the subquery whatever the estimates say.
+// The pass rewrites top-down, so the OUTER of two nested dependent joins is rewritten while its
+// left input still holds the inner one. Reading a dependent join's rows as unknown therefore left
+// that outer join building on its subquery however lopsided it was, and only the inner one ever
+// moved -- which is why a query with two correlated subqueries at one level kept the larger of the
+// two builds. An estimate now reads through a dependent join to its left input (ADR 0026).
+TEST(OptimizerTest, Path1ChoosesASideForTheOuterOfTwoNestedDependentJoins) {
+  // 10 outer rows, and a subquery of `inner` rows on each level.
+  const auto sides = [](int64_t inner) {
+    const LogicalNodePtr nested = Node(DependentJoinNode{
+        .kind = JoinKind::kSemi,
+        .left = FourFields(1),
+        .right = CorrelatedBlockOver(FourFieldsRows(11, inner),
+                                     {Compare(FieldOf(11, 1), FieldOf(1, 1), CompareOp::kEq)}, 50),
+        .span = {}});
+    const arrow::Result<LogicalPlan> plan = Optimize(PlanOver(Node(DependentJoinNode{
+        .kind = JoinKind::kSemi,
+        .left = nested,
+        .right = CorrelatedBlockOver(FourFieldsRows(21, inner),
+                                     {Compare(FieldOf(21, 1), FieldOf(1, 1), CompareOp::kEq)}, 60),
+        .span = {}})));
+    EXPECT_TRUE(plan.ok()) << plan.status().ToString();
+    std::vector<BuildSide> out;
+    if (!plan.ok()) {
+      return out;
+    }
+    // Outer first, then the inner one it stands on.
+    const auto* outer = std::get_if<JoinNode>(plan->root.get());
+    EXPECT_NE(outer, nullptr) << Explain(*plan);
+    if (outer == nullptr) {
+      return out;
+    }
+    out.push_back(outer->build);
+    const auto* inner_join = std::get_if<JoinNode>(outer->left.get());
+    EXPECT_NE(inner_join, nullptr) << Explain(*plan);
+    if (inner_join != nullptr) {
+      out.push_back(inner_join->build);
+      // The outer join's own estimate is its left input's, so a join above it would read one too.
+      EXPECT_EQ(outer->estimate, std::optional<int64_t>(10)) << Explain(*plan);
+    }
+    return out;
+  };
+  // Both levels are lopsided the same way, so both move. Before this, only the inner one did.
+  EXPECT_EQ(sides(4000), (std::vector<BuildSide>{BuildSide::kLeft, BuildSide::kLeft}));
+  // And neither moves when neither subquery is decisively larger.
+  EXPECT_EQ(sides(10), (std::vector<BuildSide>{BuildSide::kRight, BuildSide::kRight}));
+}
+
 TEST(OptimizerTest, Path1BuildsOnTheOuterSideOfASemiJoinOverAMuchLargerSubquery) {
   // The outer side is 10 rows; `inner` is the subquery's.
   const auto side = [](JoinKind kind, int64_t inner, int64_t ratio) {
