@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791989778616,
+  "lastUpdate": 1792022567084,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -7668,6 +7668,114 @@ window.BENCHMARK_DATA = {
             "value": 94.91296057143066,
             "unit": "ms/iter",
             "extra": "iterations: 7\ncpu: 94.9024101428572 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "43e95eeddf4bda1f1520be129d5830c2bf48dabd",
+          "message": "feat(plan): filter-aware relation estimates and the build-side ratio (#140)\n\n## Summary\n\nADR 0026's **C1**. The join order estimated every relation at its\nParquet footer row count, so a filter that shrinks\na relation to a fraction of its table was invisible to it: `OrderJoins`\nchose the probe from counts that ignored\nfilters, and chose no build side at all — it set `BuildSide::kRight`\nunconditionally, computing an `estimate` on the\nline above and never reading it, exactly as its own comment said.\n\n`JoinRelation::rows` now applies the conjuncts the binder routed to that\nrelation's scan, estimated from the footers:\na range from the overlap of the predicate's range with the column's\nexact minimum and maximum, an equality from the\nkey domain, a null count from the parts, and a documented default factor\nfor every shape the footers cannot measure.\nAll of it integer arithmetic over metadata alone, so a plan stays the\nsame on every host and for any thread count.\nEach column's statistics are read once per relation however many\nconjuncts name it, and the range yields the domain\ntoo, so one walk of the parts serves both (`KeyDomain` now shares\n`ColumnDomain` with it).\n\nRule 1 reads those estimates, so a filtered relation stops being chosen\nas the probe for being big in its footer, and\nnew **rule 5** chooses the build side: the relation a step adds, unless\nthat relation is estimated at more than\n`--build-side-ratio` times the relations joined so far. The default of 4\nflips only a decisive difference, so an\nestimate that is wrong by a little cannot move a join that is already\nright; `1` is ADR 0022's original rule, the\nsmaller side always. An unknown estimate on either side, and an estimate\nof no row, keep the build where it was —\nneither may read as small.\n\n`BuildSide::kLeft` was already implemented in the physical planner and\nthe hash join but reached only from tests; the\nbinder now produces it.\n\n**Plans change, answers do not.**\n\nCloses #\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [x] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\nNew CLI option `--build-side-ratio` on `query`, `explain` and `bench`,\ndefaulting to the previous behaviour's\nneighbourhood; no existing invocation changes meaning.\n\n## Verification\n\n```text\n$ pixi run test\n100% tests passed out of 2694\nANTB1-TESTS: PASS preset=dev junit=build/dev/junit.xml\n\n$ pixi run diff-random           # and seeds 11111, 22222, 33333\nDIFF: PASS seed=11111 queries=2000 failed=0 unsupported=0\nDIFF: PASS seed=22222 queries=2000 failed=0 unsupported=0\nDIFF: PASS seed=33333 queries=2000 failed=0 unsupported=0\n\n$ clang-tidy -p build/tidy --warnings-as-errors='*' <each changed file>\n(no findings)\n\n$ pixi run lint\nclang-format / gersemi / ruff / markdownlint / typos / check_repo.py ... Passed\n```\n\n8000 random queries against the DuckDB oracle with no answer mismatch.\nOne further seed (`2349571235`) does fail,\nand it is **not this change**: the harness reports *\"DuckDB rejects the\ngenerated SQL\"*, and the same SQL crashes\nDuckDB's own shell with an `INTERNAL Error` binding a column when one\ntable is referenced both by name and by path —\nreproduced with no antb1 in the picture. Worth a separate look at the\ngenerator; it is unrelated here.\n\n`pixi run lint` exits non-zero for a pre-existing reason this diff does\nnot touch: 34 `SC2218` shellcheck errors in\n`tools/github/apply-settings.sh`, reproducible on `main`. Every hook\nthat covers this diff passes.\n\n### Measured, SF 100, 4 threads, best of 2, against the same run before\nthe change\n\n| query | before | after | change | vs DuckDB |\n|---|---:|---:|---:|---|\n| Q8 | 20.04s | **8.37s** | **−58.2%** | 4.52x → **1.98x** |\n| Q12 | 7.56s | 6.81s | −9.9% | 4.14x → 3.96x |\n\nGeomean 8.982s → 8.434s; the 22-query wall clock 345s → 325s; the ratio\nto DuckDB 3.20x → 3.11x. **Nothing\nregresses.** Attribution is checked rather than assumed: DuckDB's own\nunchanged binary moved up to 8.6% across the\nsame pair of runs, and only Q8 and Q12 fall outside that band — which\nare exactly the two queries whose `build=` and\njoin order changed. Part of the geomean move is therefore a warmer\ncache, not this diff.\n\nQ8 gains twice over: because rule 2 now reads the same estimates, its\nmost selective join also moves to the bottom of\nthe tree, which is a slice of C5 arriving early. Q2 and Q17 do **not**\nmove — their oversized build side is a\nsubquery or an aggregate, which `EstimateRows` reports as unknown, and\nunknown deliberately keeps the build where it\nis. Q20's is a semi join and waits for C3. ADR 0026's C1 bullet records\nthis, since the roadmap first guessed five\nqueries.\n\n## Notes for review\n\nTwo rules in `PredicateRows` exist to stop a conjunct estimating a\nrelation into nothing — a relation estimated at no\nrow is ordered first and then makes every later estimate in its block 0,\ndeciding the whole order and every build\nside after it:\n\n- an equality **and its complement** both read the range, so a constant\nthe range excludes matches no row and its\n  complement keeps all of them;\n- a complement is floored at one row where the matching part saturates.\n\nBoth came out of an adversarial review of this diff; without the first,\na column of one distinct value estimated\n`col <> other` at almost none of its rows when it keeps every one — a\nplan worse than the unfiltered count gave, in\nthe direction this ADR exists to fix. Each of the three new plumbing\ntests (session, CLI goldens) was confirmed to\n**fail** when its link is stubbed out, because the first versions of\nthem passed against a deliberately broken chain.\n\nEXPLAIN printing the estimate beside `build=` is deliberately **not**\nhere: it would rewrite about fifteen golden\nfiles and thirteen in-code assertions with pure diagnostics and bury the\nrule change. `build=left|right` already\nshows the choice, so this diff's golden churn is only the two new cases.\n\n## Checklist\n\n- [ ] `pixi run check` passes locally — `ci` passes; `lint` is blocked\nby the pre-existing `apply-settings.sh`\n      shellcheck above, not by this diff\n- [x] Tests cover the change (9 unit tests over rule 5, `ColumnRangeOf`\nand `PredicateRows`; a binder test; a session\ntest through `SessionOptions`; two CLI goldens that differ by build\nside)\n- [x] Docs updated: ADR 0026's C1 bullet and decision, and a new\n`docs/sql-subset.md` bullet on join order and build\n      sides\n- [x] No ClickBench-derived data is committed\n- [x] Nothing derived from TPC-H is committed: query numbers, timings\nand ratios only\n- [x] Changes to governance paths were agreed with a maintainer —\n`docs/adr/` is CODEOWNERS-protected; ADR 0026 was\n      agreed and merged as #139, and this adds its dated C1 update\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5) wrote\nthe change and its tests, measured it at SF 1,\n10 and 100 against DuckDB and ClickHouse, and ran a multi-agent\nadversarial review of the diff whose surviving\nfindings (the complement estimating zero, and three tests that passed\nagainst a broken chain) are fixed here.\n- Accountable human (has read and understands the whole diff): @hor911\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-15T03:00:41+03:00",
+          "tree_id": "c69a25035c848e627d6b4c269e8a999a1f9b13aa",
+          "url": "https://github.com/ydb-campus/antb1/commit/43e95eeddf4bda1f1520be129d5830c2bf48dabd"
+        },
+        "date": 1792022566368,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 2416.063986590407,
+            "unit": "ns/iter",
+            "extra": "iterations: 288748\ncpu: 2415.8813602172136 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 58853.20349352846,
+            "unit": "ns/iter",
+            "extra": "iterations: 11278\ncpu: 58843.24250753679 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 65368.34659635668,
+            "unit": "ns/iter",
+            "extra": "iterations: 10430\ncpu: 65356.31831255993 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 240958.41278476716,
+            "unit": "ns/iter",
+            "extra": "iterations: 2941\ncpu: 240919.4688881333 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 237423.68522267294,
+            "unit": "ns/iter",
+            "extra": "iterations: 2964\ncpu: 237373.05398110664 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 1356071.5009746454,
+            "unit": "ns/iter",
+            "extra": "iterations: 513\ncpu: 1356027.7212475634 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 27.98656563999998,
+            "unit": "ms/iter",
+            "extra": "iterations: 25\ncpu: 27.980375680000016 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 27.063056769231018,
+            "unit": "ms/iter",
+            "extra": "iterations: 26\ncpu: 27.058187653846144 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 127.03162619999944,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 127.00077360000003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 8.232879164706098,
+            "unit": "ms/iter",
+            "extra": "iterations: 85\ncpu: 8.232462211764718 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 10.856843875000077,
+            "unit": "ms/iter",
+            "extra": "iterations: 64\ncpu: 10.85360568749999 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 25.658880481482054,
+            "unit": "ms/iter",
+            "extra": "iterations: 27\ncpu: 25.653399222222177 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 0.8008120101925423,
+            "unit": "ms/iter",
+            "extra": "iterations: 883\ncpu: 0.8005548765571928 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 57.5961646153845,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 57.58205130769234 ms\nthreads: 1"
           }
         ]
       }
