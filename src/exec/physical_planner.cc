@@ -138,8 +138,7 @@ struct JoinShape {
 };
 
 // Invalid, never unsupported, for what a correct plan never holds, in this order: a missing input;
-// a kind other than inner that builds on its left input (it builds on the side whose rows it does
-// not preserve); a one-row join with keys or residuals; any other kind without keys; a null-aware
+// a one-row join with keys or residuals; any other kind without keys; a null-aware
 // anti join of other than one key, or with residuals; a residual that is missing or not BOOLEAN; a
 // key whose two columns differ in type (the binder casts them to one type); a DOUBLE or BOOLEAN key
 // (E1's table takes neither: such an equality is a residual). Checked before any profile line names

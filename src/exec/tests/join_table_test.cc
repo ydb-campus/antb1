@@ -1125,6 +1125,93 @@ TEST_F(JoinTableTest, ProbesShareTheTable) {
   }
 }
 
+// ---- Marks (ADR 0026's C2b) ----
+
+TEST_F(JoinTableTest, MarksStartClearAndRememberEveryMarkedRow) {
+  MemoryBudget budget(std::nullopt);
+  arrow::Result<std::unique_ptr<JoinMarks>> made = JoinMarks::Make(200, &budget);
+  ASSERT_TRUE(made.ok()) << made.status().ToString();
+  const std::unique_ptr<JoinMarks> marks = std::move(*made);
+  EXPECT_EQ(marks->num_rows(), 200);
+  for (std::uint32_t row = 0; row < 200; ++row) {
+    EXPECT_FALSE(marks->marked(row)) << row;
+  }
+  // Both ends of a word and both ends of the bitmap, so an off-by-one in the word or bit index
+  // shows up rather than hiding inside one word.
+  const std::vector<std::uint32_t> set = {0, 1, 63, 64, 65, 127, 128, 198, 199};
+  for (const std::uint32_t row : set) {
+    marks->Mark(row);
+  }
+  for (std::uint32_t row = 0; row < 200; ++row) {
+    EXPECT_EQ(marks->marked(row), std::ranges::contains(set, row)) << row;
+  }
+}
+
+// PartScheduler may rerun a part and discard the first run, so a mark must be idempotent.
+TEST_F(JoinTableTest, MarkingTheSameRowAgainChangesNothing) {
+  arrow::Result<std::unique_ptr<JoinMarks>> made = JoinMarks::Make(70, nullptr);
+  ASSERT_TRUE(made.ok()) << made.status().ToString();
+  const std::unique_ptr<JoinMarks> marks = std::move(*made);
+  marks->Mark(5);
+  marks->Mark(69);
+  for (int again = 0; again < 3; ++again) {
+    marks->Mark(5);
+    marks->Mark(69);
+  }
+  int64_t count = 0;
+  for (std::uint32_t row = 0; row < 70; ++row) {
+    count += marks->marked(row) ? 1 : 0;
+  }
+  EXPECT_EQ(count, 2);
+}
+
+// Every probe thread of a right-direction join marks into one bitmap at once. Marks that share a
+// word are the interesting case: a read-modify-write that is not atomic loses one of them. A lost
+// mark is a race, so one round catches it only sometimes (a non-atomic Mark failed one round in
+// three here); the rounds make that likely rather than a coin flip, and `pixi run tsan` is the
+// deterministic check.
+TEST_F(JoinTableTest, ThreadsMarkingAtOnceLoseNoMark) {
+  const auto pool = MakeThreadPool();
+  constexpr int64_t kRows = 1024;
+  constexpr std::size_t kMarkers = 16;
+  for (int round = 0; round < 32; ++round) {
+    SCOPED_TRACE(round);
+    arrow::Result<std::unique_ptr<JoinMarks>> made = JoinMarks::Make(kRows, nullptr);
+    ASSERT_TRUE(made.ok()) << made.status().ToString();
+    const std::unique_ptr<JoinMarks> marks = std::move(*made);
+    // Marker i takes every 16th row, so all 16 threads write the same words throughout.
+    ASSERT_TRUE(ForEach(pool.get(), kMarkers, [&](std::size_t i) {
+                  for (int64_t row = static_cast<int64_t>(i); row < kRows;
+                       row += static_cast<int64_t>(kMarkers)) {
+                    marks->Mark(static_cast<std::uint32_t>(row));
+                  }
+                  return arrow::Status::OK();
+                }).ok());
+    for (std::uint32_t row = 0; row < kRows; ++row) {
+      ASSERT_TRUE(marks->marked(row)) << row;
+    }
+  }
+}
+
+TEST_F(JoinTableTest, MarksAreChargedToTheBudgetAndRunOutCleanly) {
+  MemoryBudget budget(std::nullopt);
+  arrow::Result<std::unique_ptr<JoinMarks>> one = JoinMarks::Make(1, &budget);
+  ASSERT_TRUE(one.ok()) << one.status().ToString();
+  EXPECT_EQ(budget.bytes_allocated(), 8) << "one bit still needs its word";
+  arrow::Result<std::unique_ptr<JoinMarks>> bigger = JoinMarks::Make(1025, &budget);
+  ASSERT_TRUE(bigger.ok()) << bigger.status().ToString();
+  EXPECT_EQ(budget.bytes_allocated(), 8 + (17 * 8));
+
+  MemoryBudget tight(8);
+  EXPECT_TRUE(JoinMarks::Make(64, &tight).ok());
+  EXPECT_TRUE(JoinMarks::Make(65, &tight).status().IsOutOfMemory());
+
+  // No row at all needs no word, and marks nothing.
+  arrow::Result<std::unique_ptr<JoinMarks>> none = JoinMarks::Make(0, nullptr);
+  ASSERT_TRUE(none.ok()) << none.status().ToString();
+  EXPECT_EQ((*none)->num_rows(), 0);
+}
+
 // ---- Errors ----
 
 // What a correct physical plan never sends is Invalid (exit code 1), never NotImplemented.

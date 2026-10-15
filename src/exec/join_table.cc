@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -363,6 +364,34 @@ arrow::Status JoinBuildPart::AppendRows(const Batch& batch, arrow::MemoryPool* p
 }
 
 // ---- JoinTable ----
+
+arrow::Result<std::unique_ptr<JoinMarks>> JoinMarks::Make(int64_t rows, MemoryBudget* budget) {
+  ANTB1_CHECK(rows >= 0);
+  auto marks = std::unique_ptr<JoinMarks>(new JoinMarks());
+  marks->memory_.Reset(budget);
+  const int64_t words = (rows + 63) / 64;
+  ARROW_RETURN_NOT_OK(marks->memory_.Resize(words * static_cast<int64_t>(sizeof(std::uint64_t))));
+  // Value-initialized, so every bit starts clear.
+  marks->words_ = std::vector<std::atomic<std::uint64_t>>(static_cast<std::size_t>(words));
+  marks->rows_ = rows;
+  return marks;
+}
+
+void JoinMarks::Mark(std::uint32_t row) {
+  ANTB1_CHECK(static_cast<int64_t>(row) < rows_);
+  std::atomic<std::uint64_t>& word = words_[row / 64];
+  const std::uint64_t bit = std::uint64_t{1} << (row % 64);
+  // Most probe rows of a right-direction join share a build row with an earlier one -- that is why
+  // the join builds on this side -- so the load spares the read-modify-write almost every time.
+  if ((word.load(kOrder) & bit) == 0) {
+    word.fetch_or(bit, kOrder);
+  }
+}
+
+bool JoinMarks::marked(std::uint32_t row) const {
+  ANTB1_CHECK(static_cast<int64_t>(row) < rows_);
+  return (words_[row / 64].load(kOrder) & (std::uint64_t{1} << (row % 64))) != 0;
+}
 
 JoinTable::JoinTable(std::shared_ptr<const JoinBuildSpec> spec, MemoryBudget* budget)
     : spec_(std::move(spec)), budget_(budget) {
