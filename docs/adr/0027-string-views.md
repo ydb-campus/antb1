@@ -75,6 +75,16 @@ Proposed
   loudly at each call site instead of hiding a copy. And the Parquet view decode is **not** zero-copy — it copies
   every out-of-line byte into 32 KiB heap blocks — which is consistent with ADR 0019 having measured only 10-16%
   there.
+- **That table reads worse than the situation is, because the two sites that matter are not Arrow kernels at all.**
+  `src/exec/gather.cc` contains no `arrow::compute` reference: the join gather is antb1's own `GatherTyped` loop over
+  a builder, and the sort's comparison is antb1's own `OrderFor`. So the sites the measurement points at need plain
+  C++ and no kernel. Nor is the grouper a dead end: `arrow::compute::Grouper` is an abstract class whose `Consume`,
+  `Lookup`, `Populate`, `GetUniques`, `num_groups` and `Reset` are public and pure virtual, and `GroupTable` holds it
+  as a `std::unique_ptr`, so a grouper of our own accepting view keys is a drop-in — which is exactly what ADR 0019
+  proposes to build anyway. And if a kernel is genuinely wanted, Arrow's registry is open: `GetFunction` returns a
+  **non-const** `shared_ptr<Function>` and `VectorFunction::AddKernel` is public, so a view kernel can be added to
+  Arrow's own `take` at startup beside `arrow::compute::Initialize()`. What remains genuinely Arrow's is only the
+  string functions and the `Filter`/`Take` calls in `src/exec/aggregate_state.cc` and `src/exec/sort.cc`.
 
 ## Decision
 
@@ -98,6 +108,13 @@ Proposed
   build, the group table, the sort buffer, a result the caller holds — materialises them. This is the rule
   `plan::ScanValues` already states for one call; this ADR extends it to a batch's lifetime and writes it down,
   because the alternative is a dangling view and a wrong answer rather than a slow one.
+- **The cost of this work is retention, not kernels.** A view array keeps its *whole* source data buffers alive, so a
+  gather that keeps one row in a hundred pins a hundred rows' bytes. That converts a copy cost into a
+  memory-retention cost, and memory is what already broke Q21 at SF 100 ([ADR 0026](0026-join-performance.md)). So
+  every site that adopts a view must say which buffers it retains and for how long, and the gather of S1 must be
+  measured on peak memory as well as on time — a gather that halves the time and triples the retention is a
+  regression here, not a win. Where retention would exceed the bytes saved, the answer is to materialise, which is
+  the same rule as above read from the other side.
 - **What this does not change.** Determinism is untouched: a view carries the same bytes in the same order, and an
   answer stays byte-identical for any thread count. `common` and `sql` still never include Arrow, since none of this
   is visible to them. No new dependency: the layout, the builders and the comparison kernels are in the pinned
@@ -146,10 +163,20 @@ answer to the same question — carry a row reference rather than a cheaper valu
 ## Alternatives considered
 
 - **Make `arrow::utf8_view()` the engine's VARCHAR type.** The clean version, and what a greenfield engine would do.
-  Rejected for Arrow 25: `take`, `filter`, `sort_indices`, `Grouper` and every string function reject view types, so
-  this means writing our own kernels for all of them before a single query gets faster, and `DispatchBest` will not
-  quietly cast back. Worth revisiting when a later Arrow fills the compute layer in — that is this ADR's trigger to
-  reopen.
+  Rejected for Arrow 25, but not because it is impossible: the work is a whole-engine change before a single query
+  gets faster. Every type switch over `arrow::Type::BINARY` needs a second arm (`KeyWidth`, `JoinTable::ViewOf`,
+  `GatherRows`, `OrderFor`, `FilteredColumnOf`, the scan filter's string branch), every remaining `arrow::compute`
+  call needs a view path or a materialisation point, literals need a `BinaryViewScalar` built from a `Buffer` because
+  `MakeScalar` refuses view types, and the whole engine carries the retention risk at once rather than one site at a
+  time. Deferred rather than refused: the trigger to reopen is a later Arrow whose compute layer accepts views, or
+  S1 and S2 showing the win is large enough to be worth the sweep.
+- **Add view kernels to Arrow's registry up front.** Possible — `GetFunction` hands back a non-const
+  `shared_ptr<Function>` and `VectorFunction::AddKernel` is public, so `take` and `filter` could learn view types at
+  startup. Rejected as a starting point, not on feasibility: it is a process-global mutation that must happen before
+  any query and that the registry is not safe to take concurrently, Arrow's selection internals are not in the
+  installed headers so each kernel body is ours to write regardless, a later Arrow adding its own view kernel would
+  collide and needs a version guard, and none of it is needed for the two sites the measurement actually points at.
+  If S1 and S2 land and a third site turns out to want `arrow::compute::Take` on views, this is how.
 - **`arrow::large_binary()` instead.** Removes the 2 GiB limit and nothing else: it is still contiguous bytes plus
   offsets, so every selection still copies, and it costs 8 bytes per offset rather than 4. Rejected: it addresses
   the limit we are not hitting and not the cost we measured.
