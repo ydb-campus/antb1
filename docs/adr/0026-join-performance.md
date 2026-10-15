@@ -255,10 +255,21 @@ Re-profiling all 22 at SF 100 after C1 and C3a says the roadmap above no longer 
 the four worst queries need items this ADR does not own, and two of those are deferrals of ADR 0022's whose triggers
 this profiling fires:
 
-- **Q10, 6.6x, nothing in this ADR targets it.** Its cost is `gather`: 21.8s on one join materialising seven customer
-  columns, four of them VARCHAR, for 11.46M rows — to produce **20 output rows** under a `LIMIT 20`. That is
-  [ADR 0016](0016-late-materialization.md) and ADR 0022's deferred "late materialization across joins". The largest
-  single win left after Q21.
+- **Q10, 6.6x, nothing in this ADR targets it, and it is not a plan problem.** Its cost is `gather`: 21.8s on one
+  join materialising seven customer columns, four of them VARCHAR, for 11.46M rows. The first reading of this was
+  that the `LIMIT 20` makes most of that materialisation pointless — it does not. The query groups by all seven
+  columns, 3,884,218 groups out of 11,463,171 rows, so the values are needed to form the groups at all, and DuckDB's
+  plan groups by all seven too (`Groups: #0` through `#6`): neither engine can decline to load them, and no
+  functional-dependency reduction is available over Parquet, which declares no key.
+
+  Measured instead, over the same join with only the GROUP BY width varied: with one narrow key antb1 takes 9.18s
+  against DuckDB's 2.69s — the engine's general per-operator gap of about 3.4x. Adding the four VARCHAR group keys
+  costs antb1 **+8.2s** and DuckDB **+0.56s**, a 14.6x difference in the marginal cost alone. Q10's excess over the
+  baseline gap is therefore the price of carrying and hashing wide string keys — roughly 130 bytes of string per row
+  over 11.46M rows, copied in `gather` and then hashed — not the plan. The lever is an execution one: gather a string
+  column by reference into the build's own buffers rather than by copying its bytes, and compare group keys by hash
+  before their bytes. That belongs to `exec`, not to this ADR, and it is a different thing from
+  [ADR 0016](0016-late-materialization.md)'s late materialization of top-N columns.
 - **Q7, 4.8x.** Its whole selectivity is locked in a join residual: both nation relations scan all 25 rows, there is
   no filter node at all, and four joins each carry 182,301,190 rows before the fifth cuts them to 583,512. No
   estimate can see that, so C5 cannot help until `n_name IN (...)` is *derived* from the disjunction — ADR 0022's
