@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792065800616,
+  "lastUpdate": 1792086223513,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -8208,6 +8208,114 @@ window.BENCHMARK_DATA = {
             "value": 120.50383383333478,
             "unit": "ms/iter",
             "extra": "iterations: 6\ncpu: 120.49758750000007 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9c379edd6ff1256df8e9acbce3646fdfa6388717",
+          "message": "perf(plan): build a correlated EXISTS on its outer side (#148)\n\n## Summary\n\nADR 0026's **C2b** (build-side output for semi joins) together with\n**C3's rule for a semi join**, which is what\nmakes C2b reach a query. A semi join whose preserved side is far smaller\nthan the subquery side built the subquery\nanyway; it may now build on its left input and probe with its right.\n\nBecause such a join emits the **build's** rows, it cannot be a node\ninside a part pipeline — it has to see every\npart's matches before it emits a row. `PartRightJoinOperator` makes it\nthe sink of its own probe pipeline: the\nparts' probes mark the build rows they matched (`JoinMarks`, shared\nthrough the `JoinBuild`) and emit nothing, and\nonce the scheduler drains the sink emits the marked rows in\n`JoinTable::rows()` order.\n\n**Two things need a maintainer's decision, please:**\n\n1. **This PR carries two roadmap ids** (C2b and C3-for-semi), against\nthe ADR's own \"one PR per id\". They went\ntogether deliberately: C2b alone moves no plan, so on its own it is an\noperator nothing reaches and nothing can\nmeasure, and C3's rule alone has no operator to run. Happy to split if\nyou prefer the id boundary.\n2. **`docs/adr/0026-join-performance.md` is a CODEOWNERS path.** It\nrecords C2b as shipped with the measurements,\ncorrects C3's bullet (which read as unshipped while its semi half had\nshipped), and records the two findings\n   below. ADR 0026 stays `Proposed`.\n\nThe guard move the ADR had planned as its own PR is the first commit\nhere instead: with the operator still refusing\nthe combination, nothing could exercise the moved guard, so splitting it\nwould have shipped a diff no test reaches.\n\nTwo findings the design had not anticipated, both recorded in the ADR:\n\n- **A latent wrong-answer bug, fixed here.** A residual's columns are\nthe join's *left* input's and then its *right*\ninput's, but the pair-batch split read them as the *probe's* and then\nthe *build's*. Those agree only while the\nprobe is the left input. All 53 existing hash-join cases pass with the\nold split, which is why it was latent —\n  and it only shows up in a test whose two relations hold unlike values.\n- **The pipeline boundary is not expressible in `PipelineInput` alone.**\n`PipelineScan` is asked two different\nquestions — *where does the pipeline this node tops begin* and *may I\nrun this node inside a pipeline of mine* —\nand a right-direction join answers them differently. It takes a\nparameter now, and only that join's own sink\npasses it. Where the probe side has no part pipeline there is no sink to\nemit from, so the physical planner keeps\nbuilding on the right; the side is a performance choice and never a\nsemantic one, which is what lets it.\n\nAnti, null-aware anti and left outer joins stay rejected (C2c): they\nmust emit the build rows that did *not* match,\nand a build discards its NULL-key rows, which are unmatched by\ndefinition.\n\nCloses #\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [x] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\nMeasured on the TPC-H-derived harness outside the repo (ADR 0006), scale\nfactor 100, 4 threads, best of 2.\nNot TPC Benchmark results — antb1 does not comply with the TPC-H\nBenchmark's requirements.\n\n- **Q21: 110.60 s → 32.50 s, 3.4x faster**; its ratio to DuckDB 11.10x →\n**3.2x**; peak memory ~36 GB → **18.81 GB**.\nThe semi join's build fell from every row of the largest relation to the\nouter side's: **82x fewer rows**.\n- The time won is more than the memory saved explains on its own. At ~36\nGB against this host's 51.5 GB the query\nwas evicting the page cache for a 33 GB dataset — which also explains\nwhy Q21 was the one query that did not\nanswer to thread count (it scaled 39x from SF 10 to SF 100 for 10x the\ndata).\n- **No other query moved outside the noise band** DuckDB's own unchanged\nbinary shows across the same pair of runs\n(±8.6%–15.8% historically; DuckDB's Q21 was 10.011 s here against ~9.96\ns before, 0.5%). Geomean over the 22\n  went from ~3.0x to **2.8x** DuckDB.\n- At SF 10: 2.808 s → 2.625 s, peak 3.62 GB → 1.89 GB.\n- **Q4 did not move**, although its correlated `EXISTS` has Q21's shape:\n`EstimateRows` reads a `Filter` as an upper\nbound, so it sees the subquery side at 4.0x the outer side, and 4.0x is\nnot *more* than the default ratio. Noted\n  in the ADR as the smallest remaining lever, belonging with C5.\n\n```text\n$ pixi run lint\n... shellcheck (shell) ... Failed      <- 36 pre-existing SC2218 in tools/github/apply-settings.sh and\n                                         scripts/agent-setup.sh, neither touched here; osx-arm64 only\n... every other leg ..... Passed\n\n$ pixi run ci\n100% tests passed out of 2711          <- exit 0\n\n$ pixi run test\nANTB1-TESTS: PASS preset=dev junit=build/dev/junit.xml\n\n$ ANTB1_DIFF_SEED=20261015 pixi run diff-random\nDIFF: PASS seed=20261015 queries=2000 failed=0 unsupported=0\n```\n\nBeyond `check`, since this is `exec` ownership and concurrency code\n(`check-full` cannot complete on osx-arm64:\n`ci-gcc` is linux-64 only):\n\n- **ThreadSanitizer**: every data race it reports is one pre-existing\nsite unrelated to this branch\n(`GroupedCountDistinct::MergeGroups` via `GroupTable::MergePartition`,\ni.e. COUNT(DISTINCT) merging across\npartition lanes). **Zero frames in `JoinMarks` or\n`PartRightJoinOperator`.** Please see the note below — that\n  race looks like a real defect on `main`.\n- **ASan+UBSan**: 77 join and planner cases clean via\n`ASAN_OPTIONS=detect_leaks=0 ./build/ci-asan/bin/antb1_exec_tests`,\nplus the new SLT cases and 120 random differential queries. (`pixi run\nasan` itself dies during gtest *discovery*\non a 64-byte CoreFoundation `CFPreferences`/`libdispatch` leak with no\nantb1 frame — a known osx-arm64 gap.)\n- **clang-tidy** per file over every TU that includes the two changed\nheaders: no finding in the changed code or\n  inside the headers.\n\nTests, each confirmed against a deliberate mutation:\n\n-\n`exec.PhysicalPlannerTest.SemiJoinsBuildingOnTheirLeftInputKeepTheSameRows`\n— 9 shapes (unique and repeated keys\non either side, with and without a residual, and one where nothing is\nmarked) × 2 executors (calling thread and a\n4-thread pool) × 3 batch sizes × both directions, asserting the two\ndirections keep the same rows; then all 15\n`Placements` positions including a `LIMIT` directly above the join; then\na re-run of one operator.\nCaught: a non-atomic mark, marking only the first candidate of a key,\nmarking the slot instead of the build\nposition, a `Mark` that does nothing, the old residual split, a `Close`\nthat keeps the emit position, and\n`through_right_join=true` at each of the three other `PipelineScan`\nsites.\n-\n`exec.JoinTableTest.{MarksStartClear…,MarkingTheSameRowAgain…,ThreadsMarkingAtOnceLoseNoMark,MarksAreCharged…}`\n-\n`exec.HashJoinTest.{AJoinThatEmitsItsBuildRowsNeedsItsMarks,ARightJoinSinkRejectsNextBeforeOpen}`\n-\n`plan.OptimizerTest.Path1BuildsOnTheOuterSideOfASemiJoinOverAMuchLargerSubquery`\n— the ratio boundary (exactly\nthe ratio keeps the old side; one row more flips it), a ratio of 1, and\nthat an anti join never moves\n- `tests/slt/cases/subqueries/exists.slt` — 6 differential cases where\nthe subquery side is ~20x the outer one,\n  expectations written by `pixi run slt-complete` from DuckDB\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests) — except the pre-existing\nosx-arm64 shellcheck findings above, in files this PR does not touch\n- [x] Tests cover the change\n- [x] Docs updated where behavior, commands or architecture changed\n(`docs/sql-subset.md`, ADR 0026)\n- [x] No ClickBench-derived data is committed\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006).\nOnly timings, row counts of non-TPC-H fixtures, and query numbers appear\nhere.\n- [ ] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer — **`docs/adr/` needs\n      your sign-off, see the two points at the top**\n\n## Maintainer note, unrelated to this branch\n\n`pixi run tsan` is not clean on `main`:\n`GroupedCountDistinct::MergeGroups`\n(`src/exec/grouped_aggregate_state.cc`), reached through\n`GroupTable::MergePartition` and\n`PartGroupAggregateOperator::Merge`, races when COUNT(DISTINCT)\npartitions merge across `PartitionLanes`. Because it\nis a race, which tests abort varies per run: two consecutive runs\naborted 4 and 6 of ~2707, drawn from\n`exec.GroupedAggregateTest.MergingSubsetsOfGroups`,\n\n`exec.PartOperatorsTest.{RoutedRowsGiveTheSameGroups,GroupingPerPartMergesInPartOrder}`\nand\n`parallel.diff.{star,random,tpch}`. Worth its own issue.\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5) wrote\nthe diff, the tests and the docs, ran every\nverification above, profiled the TPC-H-derived harness, and reviewed its\nown diff with the repo's `reviewer`\n      subagent — whose four findings are the last commit.\n- Accountable human (has read and understands the whole diff): @hor911\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-15T20:40:33+03:00",
+          "tree_id": "ba17e34e68f36edda4d69b8afb83cb6a8d72acae",
+          "url": "https://github.com/ydb-campus/antb1/commit/9c379edd6ff1256df8e9acbce3646fdfa6388717"
+        },
+        "date": 1792086222021,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4522.382885406802,
+            "unit": "ns/iter",
+            "extra": "iterations: 155271\ncpu: 4520.159179756683 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 94588.63125351093,
+            "unit": "ns/iter",
+            "extra": "iterations: 7116\ncpu: 94532.06773468242 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 124665.37520042618,
+            "unit": "ns/iter",
+            "extra": "iterations: 5613\ncpu: 124593.20826652416 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 484155.75034577545,
+            "unit": "ns/iter",
+            "extra": "iterations: 1446\ncpu: 483967.2745504841 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 456124.3966190014,
+            "unit": "ns/iter",
+            "extra": "iterations: 1538\ncpu: 455886.6397919372 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2225885.3333333097,
+            "unit": "ns/iter",
+            "extra": "iterations: 315\ncpu: 2224797.609523809 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 54.035840923078766,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 54.01903084615386 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 48.252018866666425,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 48.22760613333331 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 209.71768799999305,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 209.66739533333308 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 15.144400521738595,
+            "unit": "ms/iter",
+            "extra": "iterations: 46\ncpu: 15.139372521739132 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 21.383881031249885,
+            "unit": "ms/iter",
+            "extra": "iterations: 32\ncpu: 21.378855343750004 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 43.098144750000955,
+            "unit": "ms/iter",
+            "extra": "iterations: 16\ncpu: 43.09150750000001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.707858638820685,
+            "unit": "ms/iter",
+            "extra": "iterations: 407\ncpu: 1.7071732702702689 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 68.90169540000102,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 68.88350029999995 ms\nthreads: 1"
           }
         ]
       }
