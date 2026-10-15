@@ -41,11 +41,23 @@ JoinEdge Edge(std::size_t a, std::size_t b, std::optional<int64_t> a_domain = st
 }
 
 // The relations of the steps, in order.
+// The relations in the order they join, reconstructed from a left-deep step list: the probe, which
+// is the first step's left input, then each step's right input. A step list that is not left-deep
+// has no such sequence, so this also pins left-deepness -- which is what the greedy order produces.
 std::vector<std::size_t> Order(const std::vector<JoinStep>& steps) {
   std::vector<std::size_t> out;
-  out.reserve(steps.size());
-  for (const JoinStep& step : steps) {
-    out.push_back(step.relation);
+  if (steps.empty()) {
+    return out;
+  }
+  EXPECT_FALSE(steps.front().left.step) << "the first step's left input is the probe";
+  out.push_back(steps.front().left.index);
+  for (std::size_t k = 0; k < steps.size(); ++k) {
+    EXPECT_FALSE(steps[k].right.step) << "step " << k << " adds a relation";
+    EXPECT_EQ(steps[k].left.step, k > 0) << "step " << k;
+    if (k > 0) {
+      EXPECT_EQ(steps[k].left.index, k - 1) << "step " << k << " joins the one before it";
+    }
+    out.push_back(steps[k].right.index);
   }
   return out;
 }
@@ -69,23 +81,21 @@ std::vector<std::vector<std::size_t>> Keys(const std::vector<JoinStep>& steps) {
 }
 
 // Rule 1 of the join order: the probe is the relation with the most rows, the first of them in
-// FROM order on a tie, and a relation of unknown rows counts as the largest. It is the first step,
-// without keys, and estimated at its rows.
+// FROM order on a tie, and a relation of unknown rows counts as the largest. The probe is the left
+// input of the first step rather than a step of its own: a step is a join, and there is one fewer
+// of them than there are relations.
 TEST(JoinOrderTest, TheProbeIsTheLargestRelation) {
   const std::vector<JoinEdge> chain = {Edge(0, 1), Edge(1, 2), Edge(2, 3)};
   const auto steps = OrderJoins(Relations({10, 30, 20, 30}), chain);
-  ASSERT_EQ(steps.size(), 4U);
-  EXPECT_EQ(steps.front().relation, 1U);
-  EXPECT_TRUE(steps.front().edges.empty());
-  EXPECT_EQ(steps.front().estimate, 30);
+  ASSERT_EQ(steps.size(), 3U);
+  EXPECT_FALSE(steps.front().left.step);
+  EXPECT_EQ(steps.front().left.index, 1U);
+  EXPECT_FALSE(steps.front().edges.empty()) << "a join always has a key";
   const auto unknown = OrderJoins(Relations({10, std::nullopt, 50, std::nullopt}), chain);
-  ASSERT_EQ(unknown.size(), 4U);
-  EXPECT_EQ(unknown.front().relation, 1U);
-  EXPECT_EQ(unknown.front().estimate, kLargest);
-  const auto one = OrderJoins(Relations({7}), {});
-  ASSERT_EQ(one.size(), 1U);
-  EXPECT_EQ(one.front().relation, 0U);
-  EXPECT_EQ(one.front().estimate, 7);
+  ASSERT_EQ(unknown.size(), 3U);
+  EXPECT_EQ(unknown.front().left.index, 1U);
+  // One relation is its own tree, so there is nothing to join and no step at all.
+  EXPECT_TRUE(OrderJoins(Relations({7}), {}).empty());
   EXPECT_TRUE(OrderJoins({}, {}).empty());
 }
 
@@ -96,8 +106,8 @@ TEST(JoinOrderTest, TheSmallestEstimateJoinsNext) {
   const auto steps = OrderJoins(Relations({1000, 100, 10}),
                                 std::vector{Edge(0, 1, 1000, 100), Edge(0, 2, 10, 10)});
   EXPECT_EQ(Order(steps), (std::vector<std::size_t>{0, 1, 2}));
-  EXPECT_EQ(Estimates(steps), (std::vector<int64_t>{1000, 100, 100}));
-  EXPECT_EQ(Keys(steps), (std::vector<std::vector<std::size_t>>{{}, {0}, {1}}));
+  EXPECT_EQ(Estimates(steps), (std::vector<int64_t>{100, 100}));
+  EXPECT_EQ(Keys(steps), (std::vector<std::vector<std::size_t>>{{0}, {1}}));
   for (const JoinStep& step : steps) {
     EXPECT_EQ(step.build, BuildSide::kRight);
   }
@@ -105,7 +115,7 @@ TEST(JoinOrderTest, TheSmallestEstimateJoinsNext) {
   const auto through =
       OrderJoins(Relations({1000, 5, 100}), std::vector{Edge(1, 2), Edge(0, 2, 100, 100)});
   EXPECT_EQ(Order(through), (std::vector<std::size_t>{0, 2, 1}));
-  EXPECT_EQ(Keys(through), (std::vector<std::vector<std::size_t>>{{}, {1}, {0}}));
+  EXPECT_EQ(Keys(through), (std::vector<std::vector<std::size_t>>{{1}, {0}}));
 }
 
 // The domains keep a many-to-many edge (few values on both sides) out of the order while a key edge
@@ -117,10 +127,10 @@ TEST(JoinOrderTest, AManyToManyEdgeWaitsWhileAKeyEdgeIsAvailable) {
   const auto with_domains =
       OrderJoins(relations, std::vector{Edge(0, 1, 500, 500), Edge(0, 2, 2, 2)});
   EXPECT_EQ(Order(with_domains), (std::vector<std::size_t>{0, 1, 2}));
-  EXPECT_EQ(Estimates(with_domains), (std::vector<int64_t>{1000, 1000, 5000}));
+  EXPECT_EQ(Estimates(with_domains), (std::vector<int64_t>{1000, 5000}));
   const auto rows_only = OrderJoins(relations, std::vector{Edge(0, 1), Edge(0, 2)});
   EXPECT_EQ(Order(rows_only), (std::vector<std::size_t>{0, 2, 1}));
-  EXPECT_EQ(Estimates(rows_only), (std::vector<int64_t>{1000, 10, 5}));
+  EXPECT_EQ(Estimates(rows_only), (std::vector<int64_t>{10, 5}));
 }
 
 // Every edge between the relation that joins and those already joined is a key of its join, so the
@@ -132,13 +142,13 @@ TEST(JoinOrderTest, ACycleGetsASecondKey) {
       OrderJoins(Relations({1000, 100, 10}),
                  std::vector{Edge(0, 1, 100, 100), Edge(1, 2, 10, 10), Edge(0, 2, 10, 10)});
   EXPECT_EQ(Order(steps), (std::vector<std::size_t>{0, 1, 2}));
-  EXPECT_EQ(Keys(steps), (std::vector<std::vector<std::size_t>>{{}, {0}, {1, 2}}));
-  EXPECT_EQ(Estimates(steps), (std::vector<int64_t>{1000, 1000, 1000}));
+  EXPECT_EQ(Keys(steps), (std::vector<std::vector<std::size_t>>{{0}, {1, 2}}));
+  EXPECT_EQ(Estimates(steps), (std::vector<int64_t>{1000, 1000}));
   // Two keys between the same relations: the larger domain divides (1000 x 50 / 50).
   const auto pair =
       OrderJoins(Relations({1000, 50}), std::vector{Edge(0, 1, 5, 5), Edge(1, 0, 50, 20)});
-  EXPECT_EQ(Keys(pair), (std::vector<std::vector<std::size_t>>{{}, {0, 1}}));
-  EXPECT_EQ(Estimates(pair), (std::vector<int64_t>{1000, 1000}));
+  EXPECT_EQ(Keys(pair), (std::vector<std::vector<std::size_t>>{{0, 1}}));
+  EXPECT_EQ(Estimates(pair), (std::vector<int64_t>{1000}));
 }
 
 // A relation without rows, or a key without a non-NULL value, makes the join empty: estimate 0,
@@ -147,15 +157,15 @@ TEST(JoinOrderTest, EmptyInputsEstimateZero) {
   const auto empty =
       OrderJoins(Relations({1000, 0, 10}), std::vector{Edge(0, 1), Edge(0, 2, 10, 10)});
   EXPECT_EQ(Order(empty), (std::vector<std::size_t>{0, 1, 2}));
-  EXPECT_EQ(Estimates(empty), (std::vector<int64_t>{1000, 0, 0}));
+  EXPECT_EQ(Estimates(empty), (std::vector<int64_t>{0, 0}));
   const auto all_null =
       OrderJoins(Relations({1000, 50, 10}), std::vector{Edge(0, 1, 0, 50), Edge(0, 2, 10, 10)});
   EXPECT_EQ(Order(all_null), (std::vector<std::size_t>{0, 1, 2}));
-  EXPECT_EQ(Estimates(all_null), (std::vector<int64_t>{1000, 0, 0}));
+  EXPECT_EQ(Estimates(all_null), (std::vector<int64_t>{0, 0}));
   // A domain that falls back to an empty relation's rows is empty as well.
   const auto none = OrderJoins(Relations({0, 0}), std::vector{Edge(0, 1)});
   EXPECT_EQ(Order(none), (std::vector<std::size_t>{0, 1}));
-  EXPECT_EQ(Estimates(none), (std::vector<int64_t>{0, 0}));
+  EXPECT_EQ(Estimates(none), (std::vector<int64_t>{0}));
 }
 
 // Estimates are computed in 128 bits: they saturate at INT64_MAX instead of overflowing, and are at
@@ -163,14 +173,14 @@ TEST(JoinOrderTest, EmptyInputsEstimateZero) {
 TEST(JoinOrderTest, EstimatesSaturateAndStayPositive) {
   constexpr int64_t kHuge = 4'000'000'000'000'000'000;
   const auto huge = OrderJoins(Relations({kHuge, kHuge}), std::vector{Edge(0, 1, 1, 1)});
-  EXPECT_EQ(Estimates(huge), (std::vector<int64_t>{kHuge, kLargest}));
+  EXPECT_EQ(Estimates(huge), (std::vector<int64_t>{kLargest}));
   const auto unknown = OrderJoins(Relations({std::nullopt, std::nullopt}), std::vector{Edge(0, 1)});
-  EXPECT_EQ(Estimates(unknown), (std::vector<int64_t>{kLargest, kLargest}));
+  EXPECT_EQ(Estimates(unknown), (std::vector<int64_t>{kLargest}));
   const auto small = OrderJoins(Relations({10, 10}), std::vector{Edge(0, 1, 1000, 1000)});
-  EXPECT_EQ(Estimates(small), (std::vector<int64_t>{10, 1}));
+  EXPECT_EQ(Estimates(small), (std::vector<int64_t>{1}));
   // A negative count (no valid footer has one) counts as no row.
   const auto negative = OrderJoins(Relations({10, -5}), std::vector{Edge(0, 1, -1, 3)});
-  EXPECT_EQ(Estimates(negative), (std::vector<int64_t>{10, 0}));
+  EXPECT_EQ(Estimates(negative), (std::vector<int64_t>{0}));
 }
 
 TEST(JoinOrderTest, FirstUnconnected) {
@@ -334,10 +344,12 @@ TEST(JoinOrderTest, TwoHundredFiftySixRelations) {
   }
   EXPECT_EQ(FirstUnconnected(kMaxRelations, chain), std::nullopt);
   const auto steps = OrderJoins(Relations(rows), chain);
-  ASSERT_EQ(steps.size(), kMaxRelations);
+  ASSERT_EQ(steps.size(), kMaxRelations - 1);
+  // The chain joins from its largest end, one relation and one key per step.
+  EXPECT_EQ(Order(steps).front(), kMaxRelations - 1);
   for (std::size_t k = 0; k < steps.size(); ++k) {
-    EXPECT_EQ(steps[k].relation, kMaxRelations - 1 - k);
-    EXPECT_EQ(steps[k].edges.size(), k == 0 ? 0U : 1U);
+    EXPECT_EQ(steps[k].right.index, kMaxRelations - 2 - k);
+    EXPECT_EQ(steps[k].edges.size(), 1U);
   }
 
   std::vector<JoinEdge> clique;
@@ -348,10 +360,11 @@ TEST(JoinOrderTest, TwoHundredFiftySixRelations) {
   }
   const auto all =
       OrderJoins(Relations(std::vector<std::optional<int64_t>>(kMaxRelations, 1000)), clique);
-  ASSERT_EQ(all.size(), kMaxRelations);
+  ASSERT_EQ(all.size(), kMaxRelations - 1);
+  EXPECT_EQ(Order(all).front(), 0U);
   for (std::size_t k = 0; k < all.size(); ++k) {
-    EXPECT_EQ(all[k].relation, k);
-    EXPECT_EQ(all[k].edges.size(), k);
+    EXPECT_EQ(all[k].right.index, k + 1);
+    EXPECT_EQ(all[k].edges.size(), k + 1) << k;
     EXPECT_EQ(all[k].estimate, 1000);
   }
 }
@@ -376,11 +389,10 @@ TEST(JoinOrderTest, TheBuildSideIsTheAddedRelationUnlessItIsDecisivelyLarger) {
   const std::vector<JoinEdge> chain = {Edge(0, 1, 1000, 1000), Edge(0, 2, 1000, 1000)};
   const auto steps = OrderJoins(Relations({1000, 10, 900}), chain);
   EXPECT_EQ(Order(steps), (std::vector<std::size_t>{0, 1, 2}));
-  EXPECT_EQ(Estimates(steps), (std::vector<int64_t>{1000, 10, 9}));
-  // Step 1 adds 10 rows to 1000: the added relation stays the build side. Step 2 adds 900 rows to
-  // an estimate of 10, which is 90x and so decisive: it builds on the left instead.
-  EXPECT_EQ(Builds(steps),
-            (std::vector<BuildSide>{BuildSide::kRight, BuildSide::kRight, BuildSide::kLeft}));
+  EXPECT_EQ(Estimates(steps), (std::vector<int64_t>{10, 9}));
+  // The first step adds 10 rows to 1000: the added relation stays the build side. The second adds
+  // 900 rows to an estimate of 10, which is 90x and so decisive: it builds on the left instead.
+  EXPECT_EQ(Builds(steps), (std::vector<BuildSide>{BuildSide::kRight, BuildSide::kLeft}));
 }
 
 // A near-tie keeps the plan as it was: the ratio exists so that an estimate that is wrong by a
@@ -585,8 +597,7 @@ TEST(JoinOrderTest, AKeepEverythingFilterDoesNotCollapseTheOrder) {
   const auto steps =
       OrderJoins(Relations({kept, 100, 7}), std::vector{Edge(0, 1, 100, 100), Edge(0, 2, 7, 7)});
   EXPECT_EQ(Order(steps), (std::vector<std::size_t>{0, 1, 2}));
-  EXPECT_EQ(Builds(steps),
-            (std::vector<BuildSide>{BuildSide::kRight, BuildSide::kRight, BuildSide::kRight}));
+  EXPECT_EQ(Builds(steps), (std::vector<BuildSide>{BuildSide::kRight, BuildSide::kRight}));
 }
 
 // The range arithmetic is guarded. Once the span is computable, a constant inside the range cannot

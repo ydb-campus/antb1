@@ -5170,44 +5170,64 @@ LogicalNodePtr Binder::UnitNode(std::size_t u) {
 
 LogicalNodePtr Binder::JoinTree(std::size_t b) {
   JoinBlock& block = blocks_[b];
-  ANTB1_CHECK(!block.steps.empty());  // OrderRelations makes one step per relation
-  LogicalNodePtr node = RelationNode(block.relations[block.steps.front().relation]);
-  std::vector<std::size_t> joined{block.steps.front().relation};
-  for (std::size_t k = 1; k < block.steps.size(); ++k) {
+  // One step per join, so one fewer than the relations; a block of one relation is its own tree.
+  ANTB1_CHECK(block.steps.size() + 1 == block.relations.size());
+  if (block.steps.empty()) {
+    return RelationNode(block.relations.front());
+  }
+  // Per step, the node it produces and the relations below it, ascending. An operand names either
+  // a relation of the block or an earlier step, so both are indexed by the step that made them.
+  std::vector<LogicalNodePtr> built(block.steps.size());
+  std::vector<std::vector<std::size_t>> below(block.steps.size());
+  const auto node_of = [&](const JoinOperand& operand) {
+    return operand.step ? built[operand.index] : RelationNode(block.relations[operand.index]);
+  };
+  const auto below_of = [&](const JoinOperand& operand) {
+    return operand.step ? below[operand.index] : std::vector<std::size_t>{operand.index};
+  };
+  for (std::size_t k = 0; k < block.steps.size(); ++k) {
     const JoinStep& step = block.steps[k];
+    const std::vector<std::size_t> left_below = below_of(step.left);
+    const std::vector<std::size_t> right_below = below_of(step.right);
     std::vector<JoinKey> keys;
     for (const std::size_t e : step.edges) {
-      // An edge has no orientation: the side on the relation this step adds is the right one.
+      // An edge has no orientation: the side whose relation is below the left input is the left
+      // key. With a composite input that is no longer "the relation this step adds", which is why
+      // each step carries the relations below it (ADR 0026's C5).
       const auto& [a, b_key] = block.edge_keys[e];
-      const bool a_right = a.relation == step.relation;
-      keys.push_back(JoinKey{.left = a_right ? b_key.column : a.column,
-                             .right = a_right ? a.column : b_key.column});
+      const bool a_left = std::ranges::binary_search(left_below, a.relation);
+      keys.push_back(JoinKey{.left = a_left ? a.column : b_key.column,
+                             .right = a_left ? b_key.column : a.column});
     }
-    joined.push_back(step.relation);
-    // The residuals whose relations are all joined now, which no earlier join could take.
+    below[k] = left_below;
+    below[k].insert(below[k].end(), right_below.begin(), right_below.end());
+    std::ranges::sort(below[k]);
+    // The residuals every one of whose relations is below this join, which no earlier one could
+    // take. Each is taken once, by the lowest step that holds them all.
     std::vector<ExprPtr> residual;
     for (Residual& r : block.residuals) {
       const bool ready = r.expr != nullptr && std::ranges::all_of(r.relations, [&](std::size_t x) {
-                           return std::ranges::find(joined, x) != joined.end();
+                           return std::ranges::binary_search(below[k], x);
                          });
       if (ready) {
         residual.push_back(std::move(r.expr));
         r.expr = nullptr;  // taken by this join
       }
     }
-    // The span names the FROM item the step adds: a unit's is its own leftmost binding.
-    const sql::FromItem& item = stmt_.from[FirstBindingOf(block.relations[step.relation])];
-    node = Make(JoinNode{
+    // The span names a FROM item of the right input: the first binding of its lowest relation, so
+    // that a composite input is named by where it begins. A unit's is its own leftmost binding.
+    const sql::FromItem& item = stmt_.from[FirstBindingOf(block.relations[right_below.front()])];
+    built[k] = Make(JoinNode{
         .kind = JoinKind::kInner,
-        .left = std::move(node),
-        .right = RelationNode(block.relations[step.relation]),
+        .left = node_of(step.left),
+        .right = node_of(step.right),
         .keys = std::move(keys),
         .residual = std::move(residual),
         .build = step.build,
         .estimate = step.estimate,  // kept for the passes above (ADR 0026)
         .span = item.connector == sql::Connector::kFirst ? item.span : item.connector_span});
   }
-  return node;
+  return built.back();  // the last step is the root: the steps are in dependency order
 }
 
 std::string Binder::QualifierOf(ColumnId id) const {
