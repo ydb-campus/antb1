@@ -411,6 +411,57 @@ TEST(JoinOrderDeathTest, TheBuildSideRatioIsAtLeastOne) {
                "build_side_ratio >= 100");
 }
 
+// The build-side rule itself (ADR 0026), which both the join order and the unnesting pass call so
+// that they cannot drift. The left input is the side already joined, the right the side added.
+TEST(JoinOrderTest, ChooseBuildSideFlipsOnlyOnADecisiveDifference) {
+  EXPECT_EQ(ChooseBuildSide(100, 399), BuildSide::kRight);  // 3.99x: not more than the default 4
+  EXPECT_EQ(ChooseBuildSide(100, 401), BuildSide::kLeft);
+  EXPECT_EQ(ChooseBuildSide(100, 100), BuildSide::kRight);
+  EXPECT_EQ(ChooseBuildSide(400, 100), BuildSide::kRight);  // a smaller right never moves a build
+  // At 100 hundredths the smaller side always builds, which is ADR 0022's own rule; a larger ratio
+  // trusts the estimates less.
+  EXPECT_EQ(ChooseBuildSide(100, 101, 100), BuildSide::kLeft);
+  EXPECT_EQ(ChooseBuildSide(100, 100, 100), BuildSide::kRight);
+  EXPECT_EQ(ChooseBuildSide(100, 401, 1000), BuildSide::kRight);
+  // Unknown on either side, and an estimate of no row, keep the build where it was.
+  EXPECT_EQ(ChooseBuildSide(std::nullopt, 1'000'000), BuildSide::kRight);
+  EXPECT_EQ(ChooseBuildSide(100, std::nullopt), BuildSide::kRight);
+  EXPECT_EQ(ChooseBuildSide(0, 1'000'000), BuildSide::kRight);
+  EXPECT_EQ(ChooseBuildSide(100, -1), BuildSide::kRight);
+  // 128-bit arithmetic: the largest counts must not overflow into the wrong answer.
+  EXPECT_EQ(ChooseBuildSide(1, kLargest), BuildSide::kLeft);
+  EXPECT_EQ(ChooseBuildSide(kLargest, kLargest), BuildSide::kRight);
+  EXPECT_EQ(ChooseBuildSide(kLargest, 1), BuildSide::kRight);
+}
+
+TEST(JoinOrderDeathTest, ChooseBuildSideNeedsARatioOfAtLeastOne) {
+  EXPECT_DEATH((void)ChooseBuildSide(1, 2, 99), "build_side_ratio >= 100");
+}
+
+// A join's rows are estimated from the estimate the join order left on the node: the domains rule 3
+// divides by are not reachable from a plan node, so nothing downstream could recompute it, and a
+// join whose estimate was never set stays unknown.
+TEST(JoinOrderTest, EstimateRowsReadsAJoinsOwnEstimate) {
+  const auto schema = arrow::schema({arrow::field("k", arrow::int64())});
+  const auto scan = [&schema](int64_t rows) {
+    return std::make_shared<const LogicalNode>(
+        ScanNode{.table = std::make_shared<FakeTable>(schema, rows),
+                 .table_name = "t",
+                 .fields = {0},
+                 .ids = {ColumnId{1}},
+                 .span = {}});
+  };
+  JoinNode join{.kind = JoinKind::kInner, .left = scan(1000), .right = scan(10)};
+  EXPECT_EQ(EstimateRows(LogicalNode{join}), std::nullopt);  // nothing estimated it
+  join.estimate = 250;
+  EXPECT_EQ(EstimateRows(LogicalNode{join}), std::optional<int64_t>(250));
+  // A single-input node above it passes the estimate through as an upper bound, which is what lets
+  // a pass above a subquery's aggregate see the join below it.
+  const auto over = std::make_shared<const LogicalNode>(join);
+  EXPECT_EQ(EstimateRows(LogicalNode{GroupAggregateNode{.input = over}}),
+            std::optional<int64_t>(250));
+}
+
 // The footer statistics one column's estimates read (ADR 0026): exact only when every part has
 // them, since a part without them could hold any value.
 TEST(JoinOrderTest, ColumnRanges) {

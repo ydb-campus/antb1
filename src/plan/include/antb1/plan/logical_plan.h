@@ -420,6 +420,13 @@ struct JoinNode {
   // position in that concatenation); every one must be true for a match.
   std::vector<ExprPtr> residual;
   BuildSide build = BuildSide::kRight;
+  // The rows this join outputs, as the join order estimated them (join_order.h's rule 3, which
+  // divides by the largest domain of the keys), or std::nullopt where nothing estimated it. The
+  // binder computes it to choose the order and the build side and would otherwise discard it;
+  // keeping it is what lets a later pass estimate through a join, since the domains it needs are
+  // not reachable from a plan node (docs/adr/0026-join-performance.md). An estimate is never read
+  // for an answer, only for a plan, so a stale or absent one costs speed and never correctness.
+  std::optional<int64_t> estimate;
   SourceSpan span;  // the join in the query
 };
 

@@ -15,7 +15,8 @@
 // The join order of an inner block (docs/adr/0022-joins-and-query-blocks.md, "Join order",
 // decision C9): greedy and left-deep, from footer statistics only, in integer arithmetic, so that a
 // plan depends on metadata alone and is the same for any thread count. Private to the plan module:
-// the binder and its tests include it.
+// the binder, the optimizer's unnesting pass (which chooses its own join's build side by the same
+// rule, ADR 0026) and their tests include it.
 
 namespace antb1::plan {
 
@@ -87,6 +88,16 @@ std::vector<JoinStep> OrderJoins(std::span<const JoinRelation> relations,
 // A table without parts has no value: 0.
 std::optional<int64_t> KeyDomain(const Table& table, int field);
 
+// The side a join builds on, from its two inputs' estimated rows (rule 5 of OrderJoins;
+// docs/adr/0026-join-performance.md): `BuildSide::kRight`, the side every join built on before that
+// ADR, unless the right input's estimate exceeds the left's by more than `build_side_ratio`
+// hundredths, when it builds on the left instead. An unknown estimate on either side, and an
+// estimate of no row at all, keep `kRight`: neither may be read as small, since building on a side
+// that turns out to be large is the mistake the rule exists to avoid. A ratio below 100 is a
+// programming error. One function so that the order's rule and the unnesting pass's cannot drift.
+BuildSide ChooseBuildSide(const std::optional<int64_t>& left, const std::optional<int64_t>& right,
+                          int64_t build_side_ratio = kBuildSideRatio);
+
 // What the parts' footers say about one top-level column over the whole table, as the estimates of
 // ADR 0026 read them: the range of its non-NULL values and how many of its rows are not NULL.
 struct ColumnRange {
@@ -119,7 +130,8 @@ std::optional<int64_t> RelationRows(const Binding& binding);
 
 // The rows a plan's node outputs, estimated from footer row counts: a Scan's table's, one for an
 // ungrouped Aggregate and a RowCount, its input's for any other single-input node (an upper bound),
-// and unknown for a Join.
+// and a Join's own `estimate`, which the binder kept there because the domains rule 3 divides by
+// are not reachable from a plan node (unknown where nothing estimated it).
 std::optional<int64_t> EstimateRows(const LogicalNode& node);
 
 }  // namespace antb1::plan

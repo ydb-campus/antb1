@@ -231,8 +231,41 @@ changes.
 - **C4, perf(exec): keep a large build parallel.** `OneAtATime` trades all of a build's parallelism for headroom at
   half the limit, with nothing in between. After C3 no query of the 22 reaches that threshold, so this is no longer
   urgent — but any query whose build is legitimately large still falls off the same cliff.
+- **C3a, feat(plan): build sides for the joins the unnesting pass creates.** The part of C3 that needs no C2: ADR
+  0023's Path 2 produces an *inner* join, so either side may build it, and it hardcoded the aggregate it puts on the
+  right. It now chooses by the same rule the order uses (`ChooseBuildSide`, one function so the two cannot drift),
+  which needs the join order's estimate kept on `JoinNode` and `EstimateRows` reading it — the domains rule 3 divides
+  by are not reachable from a plan node, so nothing downstream could recompute one.
+  - Update (2026-10-15, C3a): shipped, and **it buys nothing measurable.** It flips exactly the two joins it was
+    meant to — Q2's, whose build side was 185x the stream probing it, and Q17's, 33x — and only those two plans move;
+    every other plan at SF 100 is byte-identical. Q17 falls 9.3% and Q2 1.7%, both inside the ±15.8% band DuckDB's
+    own unchanged binary set over the same pair of runs, the geomean does not move, and peak memory does not either
+    (Q17 1.64 GB to 1.70 GB). The reason is that in both queries the oversized side is an **aggregate whose own group
+    state dominates** — Q17's is 20M groups over the whole of the largest relation — so the join's hash table was
+    never the bottleneck. ADR 0023 said as much about Q17 before this was tried: "the scan of the inner table
+    dominates anyway". The lever for Q2 and Q17 is therefore ADR 0023's deferred **semi-join reduction**, computing
+    only the groups the outer side needs, not the build side. Kept all the same: the estimate on the node, the shared
+    rule and `EstimateRows` through a join are what C5 and C3 both need, and one pass no longer hardcodes a side the
+    other chooses by rule.
 - **C5, feat(plan): cost-based join order with filter selectivity.** Rules 1 and 4 with the estimates of C1, for the
-  queries that carry a join's output through later joins that would have cut it: Q7 first, then Q8 and Q5.
+  queries that carry a join's output through later joins that would have cut it: Q5, and Q7 only once its selectivity
+  is visible (see below).
+
+Re-profiling all 22 at SF 100 after C1 and C3a says the roadmap above no longer matches where the time is. Three of
+the four worst queries need items this ADR does not own, and two of those are deferrals of ADR 0022's whose triggers
+this profiling fires:
+
+- **Q10, 6.6x, nothing in this ADR targets it.** Its cost is `gather`: 21.8s on one join materialising seven customer
+  columns, four of them VARCHAR, for 11.46M rows — to produce **20 output rows** under a `LIMIT 20`. That is
+  [ADR 0016](0016-late-materialization.md) and ADR 0022's deferred "late materialization across joins". The largest
+  single win left after Q21.
+- **Q7, 4.8x.** Its whole selectivity is locked in a join residual: both nation relations scan all 25 rows, there is
+  no filter node at all, and four joins each carry 182,301,190 rows before the fifth cuts them to 583,512. No
+  estimate can see that, so C5 cannot help until `n_name IN (...)` is *derived* from the disjunction — ADR 0022's
+  deferred "filters implied by ORs". Self-contained, and `or_factoring.h` already exists for the related transform.
+- **Q2 and Q17** want the semi-join reduction, as C3a's update above establishes by measurement.
+- **Q5, 4.6x**, is the one that genuinely wants C5: its filters are visible and its order is still greedy left-deep
+  from the largest relation.
 - **C6, feat(io): DECIMAL columns in the filtered scan.** ADR 0021's decimal64 item, or — cheaper and strictly
   better — `supports_scan_filter` per column, so a scan pushes what it can and decodes the rest for surviving rows
   only. Low measured value; last of the engine work, and the thing runtime join filters wait for.

@@ -21,6 +21,7 @@
 #include "antb1/common/int128.h"
 #include "antb1/plan/explain.h"
 #include "antb1/plan/logical_plan.h"
+#include "antb1/plan/optimizer.h"
 #include "antb1/plan/sql_status.h"
 #include "antb1/sql/parser.h"
 
@@ -1969,6 +1970,37 @@ TEST(BinderTest, FiltersDecideWhichRelationProbes) {
   // one default factor, which is no row at all, and so is ordered first whatever `t` carries.
   EXPECT_EQ(scanned("SELECT ok.s FROM t JOIN ok ON t.i16 = ok.i16 WHERE ok.i16 = 3"),
             (std::pair<std::string, std::string>{"t", "ok"}));
+}
+
+// The join ADR 0023's Path 2 creates for a correlated scalar aggregate is an inner join, so either
+// side may build it, and the aggregate it puts on the right is often far larger than the outer rows
+// that probe it (ADR 0026). It therefore chooses by the same rule the join order uses, and
+// `--build-side-ratio` reaches it. `t` has 100 rows and `ok` 7.
+TEST(BinderTest, Path2ChoosesItsBuildSideFromTheEstimates) {
+  const Catalog catalog = MakeCatalog();
+  const auto side = [&catalog](std::string_view sql, int64_t ratio) {
+    auto bound = BindSql(sql, catalog);
+    EXPECT_TRUE(bound.ok()) << sql << ": " << bound.status().ToString();
+    auto optimized = Optimize(*bound, BindOptions{.build_side_ratio = ratio});
+    EXPECT_TRUE(optimized.ok()) << sql << ": " << optimized.status().ToString();
+    const JoinNode* join = testing::FirstJoin(*optimized);
+    EXPECT_NE(join, nullptr) << sql;
+    return join == nullptr ? BuildSide::kRight : join->build;
+  };
+  // 7 outer rows against an aggregate over 100: more than four times larger, so it builds on the
+  // outer side instead of on the aggregate.
+  constexpr std::string_view kSmallOuter =
+      "SELECT i16 FROM ok WHERE i16 = (SELECT MAX(t.i16) FROM t WHERE t.i16 = ok.i16)";
+  // The other way round: 100 outer rows against an aggregate over 7 keeps the aggregate as the
+  // build side, which is where every such join built before this rule.
+  constexpr std::string_view kLargeOuter =
+      "SELECT i16 FROM t WHERE i16 = (SELECT MAX(ok.i16) FROM ok WHERE ok.i16 = t.i16)";
+  EXPECT_EQ(side(kSmallOuter, kBuildSideRatio), BuildSide::kLeft);
+  EXPECT_EQ(side(kLargeOuter, kBuildSideRatio), BuildSide::kRight);
+  // The ratio decides, and it reaches the unnesting pass: at 100 hundredths the smaller side always
+  // builds, and a ratio no difference can exceed never moves a build.
+  EXPECT_EQ(side(kSmallOuter, 100), BuildSide::kLeft);
+  EXPECT_EQ(side(kSmallOuter, 1'000'000), BuildSide::kRight);
 }
 
 // Only an inner join may build on its left input: every other kind outputs or preserves the rows of

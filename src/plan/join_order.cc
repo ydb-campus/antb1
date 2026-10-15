@@ -145,12 +145,8 @@ class Orderer {
   // mistake this rule exists to avoid.
   [[nodiscard]] BuildSide Build(std::size_t relation,
                                 const std::optional<int64_t>& joined_rows) const {
-    const std::optional<int64_t>& adding = relations_[relation].rows;
-    if (!adding.has_value() || !joined_rows.has_value() || *adding < 0 || *joined_rows <= 0) {
-      return BuildSide::kRight;
-    }
-    const bool decisive = Int128{*adding} * 100 > Int128{ratio_} * Int128{*joined_rows};
-    return decisive ? BuildSide::kLeft : BuildSide::kRight;
+    // The left input is the relations joined so far, the right the relation this step adds.
+    return ChooseBuildSide(joined_rows, relations_[relation].rows, ratio_);
   }
 
   // The step that joins `relation`, with its edges to the joined relations as keys.
@@ -189,7 +185,9 @@ struct RowsOf {
   std::optional<int64_t> operator()(const SortNode& node) const { return Input(node); }
   std::optional<int64_t> operator()(const LimitNode& node) const { return Input(node); }
   std::optional<int64_t> operator()(const RowCountNode& /*node*/) const { return 1; }
-  std::optional<int64_t> operator()(const JoinNode& /*node*/) const { return std::nullopt; }
+  // The join order's own estimate for this join, kept on the node (ADR 0026): the domains rule 3
+  // divides by are not reachable from a plan node, so nothing here could recompute it.
+  std::optional<int64_t> operator()(const JoinNode& node) const { return node.estimate; }
   std::optional<int64_t> operator()(const DependentJoinNode& /*node*/) const {
     return std::nullopt;
   }
@@ -232,6 +230,16 @@ std::optional<std::size_t> FirstUnconnected(std::size_t relations,
 std::vector<JoinStep> OrderJoins(std::span<const JoinRelation> relations,
                                  std::span<const JoinEdge> edges, int64_t build_side_ratio) {
   return Orderer(relations, edges, build_side_ratio).Order();
+}
+
+BuildSide ChooseBuildSide(const std::optional<int64_t>& left, const std::optional<int64_t>& right,
+                          int64_t build_side_ratio) {
+  ANTB1_CHECK(build_side_ratio >= 100);
+  if (!left.has_value() || !right.has_value() || *right < 0 || *left <= 0) {
+    return BuildSide::kRight;
+  }
+  const bool decisive = Int128{*right} * 100 > Int128{build_side_ratio} * Int128{*left};
+  return decisive ? BuildSide::kLeft : BuildSide::kRight;
 }
 
 std::optional<int64_t> ColumnDomain(const Table& table, int field, const ColumnRange& range) {

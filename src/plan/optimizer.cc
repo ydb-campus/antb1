@@ -20,6 +20,7 @@
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/sql_status.h"
 
+#include "join_order.h"
 #include "key_type.h"
 
 // Every std::visit below uses a visitor with one overload per node type, so a new node type fails
@@ -764,7 +765,8 @@ bool StrictAggregates(const std::vector<AggregateCall>& calls) {
 //       Aggregate m := max(t.x)              GroupAggregate keys t.k  m := max(t.x)
 //         Filter t.k = o.k                     Scan t
 //           Scan t
-arrow::Result<LogicalNodePtr> Path2(const DependentJoinNode& join, ColumnId& last_id) {
+arrow::Result<LogicalNodePtr> Path2(const DependentJoinNode& join, ColumnId& last_id,
+                                    int64_t build_side_ratio) {
   const auto refuse = [&join](std::string_view what) {
     return UnsupportedError(std::format("a correlated scalar subquery {} is not supported", what),
                             join.span);
@@ -965,13 +967,20 @@ arrow::Result<LogicalNodePtr> Path2(const DependentJoinNode& join, ColumnId& las
     }
     keys.push_back(JoinKey{.left = std::move(key), .right = std::move(group_key)});
   }
-  LogicalNodePtr out = Make(JoinNode{.kind = JoinKind::kInner,
-                                     .left = join.left,
-                                     .right = std::move(right),
-                                     .keys = std::move(keys),
-                                     .residual = {},
-                                     .build = BuildSide::kRight,
-                                     .span = join.span});
+  // Path 2's join is an inner join, so either side may build: the aggregate it puts on the right
+  // is often far larger than the outer rows that probe it (ADR 0026). Its own estimate stays
+  // unknown: the aggregate's groups are not estimated, so nothing better than its input's rows is
+  // available, and an estimate must not claim more than it knows.
+  const std::optional<int64_t> left_rows = EstimateRows(*join.left);
+  const std::optional<int64_t> right_rows = EstimateRows(*right);
+  LogicalNodePtr out =
+      Make(JoinNode{.kind = JoinKind::kInner,
+                    .left = join.left,
+                    .right = std::move(right),
+                    .keys = std::move(keys),
+                    .residual = {},
+                    .build = ChooseBuildSide(left_rows, right_rows, build_side_ratio),
+                    .span = join.span});
   if (!FreeVariables(*std::get<JoinNode>(*out).right).empty()) {
     return arrow::Status::NotImplemented(
         "the unnesting pass left a free variable in a rewritten join's right input");
@@ -983,7 +992,8 @@ arrow::Result<LogicalNodePtr> Path2(const DependentJoinNode& join, ColumnId& las
 // anything inside it, and the rewrite's own inputs are then walked, so a dependent join nested in
 // a correlated block is rewritten too (or refused at its own span, which is more useful than a
 // blanket refusal at the outer one).
-arrow::Result<LogicalNodePtr> UnnestNode(const LogicalNodePtr& node, ColumnId& last_id) {
+arrow::Result<LogicalNodePtr> UnnestNode(const LogicalNodePtr& node, ColumnId& last_id,
+                                         int64_t build_side_ratio) {
   if (node == nullptr) {
     return node;
   }
@@ -992,11 +1002,12 @@ arrow::Result<LogicalNodePtr> UnnestNode(const LogicalNodePtr& node, ColumnId& l
       case JoinKind::kSemi:
       case JoinKind::kAnti: {
         ARROW_ASSIGN_OR_RAISE(const LogicalNodePtr rewritten, Path1(*dependent, last_id));
-        return UnnestNode(rewritten, last_id);  // its inputs may hold more
+        return UnnestNode(rewritten, last_id, build_side_ratio);  // its inputs may hold more
       }
       case JoinKind::kOneRow: {
-        ARROW_ASSIGN_OR_RAISE(const LogicalNodePtr rewritten, Path2(*dependent, last_id));
-        return UnnestNode(rewritten, last_id);
+        ARROW_ASSIGN_OR_RAISE(const LogicalNodePtr rewritten,
+                              Path2(*dependent, last_id, build_side_ratio));
+        return UnnestNode(rewritten, last_id, build_side_ratio);
       }
       case JoinKind::kInner:
       case JoinKind::kLeft:
@@ -1010,7 +1021,7 @@ arrow::Result<LogicalNodePtr> UnnestNode(const LogicalNodePtr& node, ColumnId& l
     if (input == nullptr) {
       continue;
     }
-    ARROW_ASSIGN_OR_RAISE(LogicalNodePtr rewritten, UnnestNode(input, last_id));
+    ARROW_ASSIGN_OR_RAISE(LogicalNodePtr rewritten, UnnestNode(input, last_id, build_side_ratio));
     if (rewritten != input) {
       input = std::move(rewritten);
       changed = true;
@@ -1019,12 +1030,12 @@ arrow::Result<LogicalNodePtr> UnnestNode(const LogicalNodePtr& node, ColumnId& l
   return changed ? WithInputs(*node, std::move(inputs)) : node;
 }
 
-arrow::Result<LogicalNodePtr> Unnest(const LogicalNodePtr& root) {
+arrow::Result<LogicalNodePtr> Unnest(const LogicalNodePtr& root, int64_t build_side_ratio) {
   if (FirstDependentJoin(root) == nullptr) {
     return root;
   }
   ColumnId last_id = MaxColumnId(*root);
-  return UnnestNode(root, last_id);
+  return UnnestNode(root, last_id, build_side_ratio);
 }
 
 LogicalNodePtr Prune(const LogicalNodePtr& node, Needed needed) {
@@ -1033,11 +1044,11 @@ LogicalNodePtr Prune(const LogicalNodePtr& node, Needed needed) {
 
 }  // namespace
 
-arrow::Result<LogicalPlan> Optimize(const LogicalPlan& plan) {
+arrow::Result<LogicalPlan> Optimize(const LogicalPlan& plan, const BindOptions& options) {
   if (plan.root == nullptr) {
     return plan;
   }
-  ARROW_ASSIGN_OR_RAISE(LogicalNodePtr root, Unnest(plan.root));
+  ARROW_ASSIGN_OR_RAISE(LogicalNodePtr root, Unnest(plan.root, options.build_side_ratio));
   root = LimitBelowProject(DependentKeys(CountStarToRowCount(root), /*limited=*/false));
   const std::vector<ColumnId> output = OutputIds(*root);
   root = Prune(root, Needed(output.begin(), output.end()));

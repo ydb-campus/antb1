@@ -2844,6 +2844,7 @@ class Binder {
   arrow::Status OrderBlock(std::size_t b);
   [[nodiscard]] std::optional<int64_t> RelationEstimate(std::size_t r) const;
   [[nodiscard]] std::optional<int64_t> FilteredRelationRows(std::size_t r) const;
+  [[nodiscard]] std::optional<int64_t> UnitEstimate(std::size_t u) const;
   [[nodiscard]] std::optional<int64_t> BlockEstimate(std::size_t b) const;
   [[nodiscard]] std::size_t FirstBindingOf(std::size_t r) const;
   // The node of relation `r`: its binding's Scan, then the conjuncts routed to it and the columns
@@ -4749,17 +4750,19 @@ arrow::Status Binder::OrderBlock(std::size_t b) {
 // below its left input's rows, since every left row yields one (ADR 0022's join-order rule 3).
 std::optional<int64_t> Binder::RelationEstimate(std::size_t r) const {
   const std::optional<std::size_t> unit = relations_[r].unit;
-  if (!unit.has_value()) {
-    return FilteredRelationRows(r);
-  }
-  const std::optional<int64_t> left = BlockEstimate(units_[*unit].left);
-  const std::optional<int64_t> right = BlockEstimate(units_[*unit].right);
+  return unit.has_value() ? UnitEstimate(*unit) : FilteredRelationRows(r);
+}
+
+// The rows a LEFT JOIN unit outputs, estimated: like an inner join of its inputs, by join-order
+// rule 3 over the unit's own keys, but never below its left input's rows, since every left row
+// yields one, matched or padded.
+std::optional<int64_t> Binder::UnitEstimate(std::size_t u) const {
+  const std::optional<int64_t> left = BlockEstimate(units_[u].left);
+  const std::optional<int64_t> right = BlockEstimate(units_[u].right);
   if (!left.has_value() || !right.has_value()) {
     return std::nullopt;
   }
-  // Like an inner join of its inputs, by join-order rule 3 over the unit's own keys, but never
-  // below the left input's rows: every left row yields one, matched or padded.
-  const Int128 divisor = std::max<int64_t>(units_[*unit].divisor, 1);
+  const Int128 divisor = std::max<int64_t>(units_[u].divisor, 1);
   const Int128 joined = Int128{*left} * Int128{*right} / divisor;
   return std::max(*left, Int128ToInt64(joined).value_or(std::numeric_limits<int64_t>::max()));
 }
@@ -5157,6 +5160,7 @@ LogicalNodePtr Binder::UnitNode(std::size_t u) {
                        .keys = std::move(unit.keys),
                        .residual = std::move(unit.residual),
                        .build = BuildSide::kRight,
+                       .estimate = UnitEstimate(u),
                        .span = unit.span});
 }
 
@@ -5195,7 +5199,8 @@ LogicalNodePtr Binder::JoinTree(std::size_t b) {
         .right = RelationNode(block.relations[step.relation]),
         .keys = std::move(keys),
         .residual = std::move(residual),
-        .build = step.build,  // the relation it adds; ADR 0022's row-count rule is deferred
+        .build = step.build,
+        .estimate = step.estimate,  // kept for the passes above (ADR 0026)
         .span = item.connector == sql::Connector::kFirst ? item.span : item.connector_span});
   }
   return node;
