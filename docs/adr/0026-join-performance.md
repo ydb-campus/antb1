@@ -288,8 +288,10 @@ changes.
 - **C2b, feat(exec): build-side output for semi joins.** Shipped 2026-10-15, with C3's rule for a semi join: the
   mark bitmap (`JoinMarks`), the `rows()` position carried through the residual path, and the join as the sink of its
   own probe pipeline (`PartRightJoinOperator`). Semi alone, because it needs no change to the build.
-  - **Measured on the sf100 harness at 4 threads:** Q21 went from 110.60 s to 33.1 s, **3.3x faster**, and its peak
-    memory from about 36 GB to 18.81 GB. At SF 10 it went from 2.808 s to 2.625 s and 3.62 GB to 1.89 GB. The semi
+  - **Measured on the sf100 harness at 4 threads, best of 2:** Q21 went from 110.60 s to 32.50 s, **3.4x faster**,
+    and its ratio to DuckDB from 11.10x to 3.2x; its peak memory from about 36 GB to 18.81 GB (the profiled run,
+    which is the one the peak comes from, takes 33.0 s). At SF 10 it went from 2.808 s to 2.625 s and 3.62 GB to
+    1.89 GB. The semi
     join's build fell from every row of the largest relation to the outer side's: 82x fewer rows. The time won is far
     more than the memory saved would suggest on its own, which is the reading this ADR expected: at 36 GB against
     this host's 51.5 GB the query was evicting the page cache for a 33 GB dataset, so it also explains why Q21 was
