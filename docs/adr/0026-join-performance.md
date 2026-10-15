@@ -116,9 +116,48 @@ and Q13 are that case, and together they hold the largest builds in the workload
 
 The mirror of each is the standard one: mark the build rows a probe matched, then emit the marked rows (right semi),
 the unmarked rows (right anti), or the unmarked rows padded with NULLs (right outer). The direction is already a
-field — `JoinNode::build` — so no new `JoinKind` is needed and the enum stays at six. **The hazard is that
-`src/exec/hash_join.cc` switches on `JoinKind` twice behind `default:` arms**, so neither a new kind nor a new
-direction fails to compile there; C2 makes both switches exhaustive in the same PR as it adds the direction.
+field — `JoinNode::build` — so no new `JoinKind` is needed and the enum stays at six.
+
+Update (2026-10-15, C2a): **C2 was one PR and is now three.** A read of the hash join against this design says the
+marking is the easy half and the emitting is not, and that the split falls on a line of correctness rather than of
+convenience.
+
+What is already there: a dense build-row index, the position in `JoinTable::rows()`, which is exactly what
+`JoinMatches{begin, end}` carries — so a mark bitmap of `num_rows()` bits needs no new addressing, and `num_rows()`
+is final before any probe row is read.
+
+What is not:
+
+- **Where the tail goes is undecided, and it is C2b's first question.** A right-direction join must emit its build
+  rows once, but the probe runs per part: a fresh `HashJoinOperator` is made, drained and destroyed per part, up to
+  twice the thread count at a time, and `End()` already releases the table at the input's end. The only
+  all-parts-done signal is `PartSink`'s single `parts_done` slot, which `BuildsFirstOperator` already owns in order to
+  release the build. Three candidates, none free: emit inside the operator with a serial probe (**rejected** — in the
+  mirrored direction the probe is the large side, so this trades the whole point away); emit at the sink (correct only
+  where the join is the last streaming operator of its probe pipeline — true of Q4 and Q13, false of Q21, which has an
+  anti join above it, and of Q22, which has a Compute and a Project; it buys memory rather than time, since Q4 and Q13
+  hold 14.6 GB and 12.6 GB at ratios of only 2.73x and 1.85x); or make the join pipeline-breaking, consuming its
+  probe pipeline and becoming a source for a new one, which is the only candidate that reaches Q21 and is ADR 0022's
+  separately deferred "one build probed by several pipelines" — the two were deferred together because they are one
+  piece of work.
+- **A NULL-key build row is discarded, not merely unindexed.** `JoinBuildPart::Append` keeps only selected rows
+  whose keys are not NULL, so their payload never enters `chunks()`. Right **anti** and right **outer** must emit
+  unmatched build rows, and a NULL key is unmatched by definition, so both need the build to keep them. Right
+  **semi** does not: a NULL-key row never matches, so its absence is already right. That is why C2b is semi alone.
+- **Marks are the first mutable state two probes would share.** `JoinTable` is handed out as
+  `shared_ptr<const JoinTable>` with no mutable and no atomic member, documented lock-free for any number of probe
+  threads, so a bitmap must be atomic even for set-only writes; and `PartScheduler` may rerun a part and discard the
+  first run, so a mark must be idempotent — an OR is, a count is not.
+- **A residual forces per-row marks.** With one, each (probe row, build row) pair is accepted or rejected
+  individually, so a key's whole match range cannot be marked wholesale. Both of Q21's joins carry residuals.
+- **The dense index is dropped one line after it is read**, when a `rows()` position becomes a `JoinRowRef` and no
+  reverse map exists, so the position has to be carried alongside.
+
+**The hazard C2a closes.** `src/exec/hash_join.cc` switched on `JoinKind` twice behind `default:` arms, so neither a
+new kind nor a new direction failed to compile: a right-semi join would have fallen into the arm that emits slices of
+the probe batch — the left-sided answer — with no error and no assert. Nothing produced that combination (the
+`ResolvePositions` check rejects it and the operator's `Make` returns `Invalid`), so it was latent; it was also
+exactly the trap C2b and C2c would have walked into, which is why it is closed before them rather than with them.
 
 ### Join order (C5)
 
@@ -174,12 +213,21 @@ changes.
   - EXPLAIN printing the estimate next to `build=` is deliberately **not** part of C1: it would rewrite about fifteen
     golden files and thirteen in-code assertions with pure diagnostics and bury the rule change. `build=left|right`
     already shows which side was chosen, so the golden churn of C1 is exactly the plans that moved.
-- **C2, feat(exec): build-side output for semi, anti and left outer joins.** The match mark on the build rows and the
-  final pass that emits them, selected by `JoinNode::build`; both `JoinKind` switches in `hash_join.cc` become
-  exhaustive. No planner change, so no plan moves yet.
-- **C3, feat(plan): choose the build side for semi, anti and outer joins.** C1's estimates with C2's operators. This
-  is where Q21's 36 GB, its 19.6x and its 1.08x thread scaling go, and with them Q4, Q22 and Q13. The largest single
-  win of this ADR.
+- **C2a, fix(exec): make the join-kind switches exhaustive.** Both switches in `hash_join.cc` list every enumerator,
+  so a kind or a build direction that belongs elsewhere fails to compile instead of silently taking the probe-side
+  arm, and a test pins that the binder never produces `BuildSide::kLeft` for a non-inner kind — which only an
+  aborting internal check stood behind, and which C1 made worth pinning by making `kLeft` reachable from real SQL.
+  No plan and no answer changes. **Shipped first, before C2b and C2c, because it is the trap they would walk into.**
+- **C2b, feat(exec): build-side output for semi joins.** The atomic mark bitmap, the `rows()` position carried
+  through the residual path, and the tail — whose location this ADR leaves open above, and which C2b must decide
+  first. Semi alone, because it needs no change to the build. Unlocks Q21's semi join, which today builds the whole
+  of the largest relation to probe it with 7.3M rows, and Q4's.
+- **C2c, feat(exec): build-side output for anti and left outer joins.** Right anti and right outer, which
+  additionally need the build to keep its NULL-key rows, since those are unmatched by definition and must be
+  emitted. Unlocks Q21's anti join, Q22 and Q13.
+- **C3, feat(plan): choose the build side for semi, anti and outer joins.** C1's estimates with C2b's and C2c's
+  operators, one kind at a time as each lands. This is where Q21's 36 GB, its 10.8x and its 1.08x thread scaling go,
+  and with them Q4, Q22 and Q13. The largest single win of this ADR.
 - **C4, perf(exec): keep a large build parallel.** `OneAtATime` trades all of a build's parallelism for headroom at
   half the limit, with nothing in between. After C3 no query of the 22 reaches that threshold, so this is no longer
   urgent — but any query whose build is legitimately large still falls off the same cliff.

@@ -1971,6 +1971,70 @@ TEST(BinderTest, FiltersDecideWhichRelationProbes) {
             (std::pair<std::string, std::string>{"t", "ok"}));
 }
 
+// Only an inner join may build on its left input: every other kind outputs or preserves the rows of
+// one specific input, and src/exec/hash_join.cc has no right-semi, right-anti or right-outer
+// implementation (ADR 0026's C2b and C2c). The binder must therefore never produce
+// BuildSide::kLeft for a non-inner kind, however the estimates fall.
+//
+// Nothing but this test checks that at test time. ResolvePositions fails on the combination and
+// hash_join.cc's Make rejects it, but the first is an internal check that aborts, so a later change
+// to join-order rule 5 that reached a LEFT JOIN unit or a subquery join would crash rather than
+// fail a test. C1 made BuildSide::kLeft reachable from real SQL, which is what makes that worth
+// pinning.
+TEST(BinderTest, OnlyAnInnerJoinEverBuildsOnItsLeftInput) {
+  const Catalog catalog = MakeCatalog();
+  // Every join of a plan, both inputs of each, however deeply nested.
+  const auto joins = [](const LogicalNode& root) {
+    std::vector<const JoinNode*> found;
+    std::vector<const LogicalNode*> pending = {&root};
+    while (!pending.empty()) {
+      const LogicalNode* at = pending.back();
+      pending.pop_back();
+      if (const auto* join = std::get_if<JoinNode>(at)) {
+        found.push_back(join);
+      }
+      for (const LogicalNodePtr& input : InputsOf(*at)) {
+        pending.push_back(input.get());
+      }
+    }
+    return found;
+  };
+  for (const std::string_view sql : {
+           // A LEFT JOIN unit, which is one relation of its block and never reordered.
+           "SELECT t.s FROM t LEFT JOIN ok ON t.i16 = ok.i16",
+           "SELECT t.s FROM ok LEFT JOIN t ON t.i16 = ok.i16",
+           // A unit whose preserved side is the smaller, which is the case rule 5 would want to
+           // flip if it ever applied to a unit.
+           "SELECT ok.s FROM ok LEFT JOIN t ON t.i16 = ok.i16 WHERE ok.i16 = 3",
+           // Subquery joins (ADR 0022's J5): a semi join for IN, a null-aware anti for NOT IN, and
+           // a one-row join for a scalar subquery.
+           "SELECT i16 FROM t WHERE i16 IN (SELECT i16 FROM ok)",
+           "SELECT i16 FROM t WHERE i16 NOT IN (SELECT i16 FROM ok)",
+           "SELECT i16 FROM t WHERE i16 = (SELECT MAX(i16) FROM ok)",
+           // The same where the outer side is far smaller than the subquery, so an estimate-driven
+           // rule would have every reason to want the other side.
+           "SELECT i16 FROM ok WHERE i16 IN (SELECT i16 FROM t)",
+           "SELECT i16 FROM ok WHERE i16 NOT IN (SELECT i16 FROM t)",
+           // The ADR 0023 unnesting rewrites, which Optimize produces: a correlated EXISTS and a
+           // correlated scalar aggregate.
+           "SELECT i16 FROM t WHERE EXISTS (SELECT i16 FROM ok WHERE ok.i16 = t.i16)",
+           "SELECT i16 FROM t WHERE NOT EXISTS (SELECT i16 FROM ok WHERE ok.i16 = t.i16)",
+           "SELECT i16 FROM t WHERE i16 = (SELECT MAX(ok.i16) FROM ok WHERE ok.i16 = t.i16)",
+       }) {
+    auto bound = BindSql(sql, catalog);
+    ASSERT_TRUE(bound.ok()) << sql << ": " << bound.status().ToString();
+    const LogicalPlan plan = Optimized(*bound);
+    const std::vector<const JoinNode*> all = joins(*plan.root);
+    EXPECT_FALSE(all.empty()) << sql << ": no join to check";
+    for (const JoinNode* join : all) {
+      if (join->kind != JoinKind::kInner) {
+        EXPECT_EQ(join->build, BuildSide::kRight)
+            << sql << ": a " << ToString(join->kind) << " join builds on its left input";
+      }
+    }
+  }
+}
+
 // A cross-relation equality whose sides differ in type gets one key type both widen to exactly,
 // and the side that is not of that type is cast on its own branch (ADR 0022's key casts). An
 // equality with no such type, and any other cross-relation conjunct, is a residual of the join.

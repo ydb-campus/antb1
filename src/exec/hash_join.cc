@@ -521,7 +521,11 @@ arrow::Status HashJoinOperator::Start() {
       ANTB1_CHECK(values_ != nullptr);
       keep_ = Keep::kAll;
       break;
-    default:  // inner, semi, left
+    // Listed rather than left to a `default:` so that a new kind, or a build-side direction that
+    // outputs the build's rows (ADR 0026's C2b and C2c), does not compile until it is handled here.
+    case plan::JoinKind::kInner:
+    case plan::JoinKind::kSemi:
+    case plan::JoinKind::kLeft:
       keep_ = Keep::kMatched;
       break;
   }
@@ -559,12 +563,20 @@ arrow::Result<std::optional<Batch>> HashJoinOperator::NextOutput() {
       return table_->unique() && residual_.empty() ? NextLeftWindow() : NextPadded();
     case plan::JoinKind::kOneRow:
       return NextOneRow();
-    default:  // semi, anti, null-aware anti (Make takes no other kind)
+    // Semi, anti and null-aware anti, which output the probe's rows and none of the build's. Listed
+    // rather than left to a `default:`: this is the arm a build-side direction (ADR 0026's C2b and
+    // C2c) would otherwise fall into silently, emitting slices of the probe batch -- the left-sided
+    // answer -- with no error and no assert. A kind or direction that belongs elsewhere must now
+    // fail to compile instead.
+    case plan::JoinKind::kSemi:
+    case plan::JoinKind::kAnti:
+    case plan::JoinKind::kNullAwareAnti:
       if (!residual_.empty() && keep_ != Keep::kAll && !evaluated_) {
         ARROW_RETURN_NOT_OK(EvaluatePairs());  // before the batch's first window
       }
       return NextSelected();
   }
+  return arrow::Status::Invalid("hash join: unhandled join kind");  // unreachable
 }
 
 arrow::Status HashJoinOperator::Pull() {
