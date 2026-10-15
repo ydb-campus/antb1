@@ -376,7 +376,12 @@ arrow::Result<std::unique_ptr<HashJoinOperator>> HashJoinOperator::Make(
   const std::string_view kind_name = plan::ToString(kind);
   const JoinBuildSpec& spec = *build->spec();
   if (kind != plan::JoinKind::kInner && build_side == plan::BuildSide::kLeft) {
-    return arrow::Status::Invalid("a ", kind_name, " hash join that builds on its left input");
+    // The plan is legal and the planner may express it; the operator cannot run it yet. Building on
+    // the preserved side means emitting the build's rows after the probe is exhausted, which is ADR
+    // 0026's C2b and C2c. Until then this is the single gate, and nothing the binder produces
+    // reaches it (plan.BinderTest.OnlyAnInnerJoinEverBuildsOnItsLeftInput).
+    return arrow::Status::Invalid("a ", kind_name,
+                                  " hash join that builds on its left input is not implemented");
   }
   if ((kind == plan::JoinKind::kOneRow) != spec.keys().empty()) {
     return arrow::Status::Invalid("a ", kind_name, " hash join over a build ",

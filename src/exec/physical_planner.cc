@@ -88,8 +88,10 @@ const plan::LogicalNode* PipelineInput(const plan::LogicalNode& node) {
     return project->input.get();
   }
   if (const auto* join = std::get_if<plan::JoinNode>(&node)) {
-    const bool build_left =
-        join->kind == plan::JoinKind::kInner && join->build == plan::BuildSide::kLeft;
+    // The probe is whichever input the join does not build on, for every kind: a semi, anti or
+    // outer join that builds on its left input probes with its right (ADR 0026's C2b), and the part
+    // pipeline is that side's.
+    const bool build_left = join->build == plan::BuildSide::kLeft;
     return (build_left ? join->right : join->left).get();
   }
   return nullptr;
@@ -149,9 +151,6 @@ arrow::Result<JoinShape> ShapeOf(const plan::JoinNode& join) {
     return arrow::Status::Invalid("a join without its inputs");
   }
   const std::string_view kind = plan::ToString(join.kind);
-  if (join.kind != plan::JoinKind::kInner && join.build == plan::BuildSide::kLeft) {
-    return arrow::Status::Invalid("a ", kind, " join that builds on its left input");
-  }
   if (join.kind == plan::JoinKind::kOneRow) {
     if (!join.keys.empty() || !join.residual.empty()) {
       return arrow::Status::Invalid("a ONE-ROW join with keys or residuals");
