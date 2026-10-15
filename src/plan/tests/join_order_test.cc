@@ -577,6 +577,33 @@ TEST(JoinOrderTest, AKeepEverythingFilterDoesNotCollapseTheOrder) {
             (std::vector<BuildSide>{BuildSide::kRight, BuildSide::kRight, BuildSide::kRight}));
 }
 
+// The range arithmetic is guarded. Once the span is computable, a constant inside the range cannot
+// overflow the subtraction -- the difference is at most the span -- so the case that can is a
+// narrow range and a constant far outside it, which is where `max - constant` runs away. No Parquet
+// column and no bound literal reach it today, a constant being typed as its column, so this pins
+// the same defensive arithmetic KeyDomain already carries rather than a live case.
+TEST(JoinOrderTest, PredicateRowsGuardsIts128BitArithmetic) {
+  const ColumnRange narrow{.min = 0, .max = 10, .non_null = 100, .exact = true};
+  // `>= kInt128Min` admits every value, and `max - kInt128Min` is what would overflow.
+  EXPECT_EQ(PredicateRows(100, Compare(CompareOp::kGe, kInt128Min), narrow, 100), 33);
+  EXPECT_EQ(PredicateRows(100, Compare(CompareOp::kGt, kInt128Min), narrow, 100), 33);
+  // The mirror is asymmetric, because the subtrahend differs: `< kInt128Max` computes
+  // `kInt128Max - min`, which fits and so admits every value exactly; `<= kInt128Max` then adds one
+  // for the closed bound, and that is what overflows.
+  EXPECT_EQ(PredicateRows(100, Compare(CompareOp::kLt, kInt128Max), narrow, 100), 100);
+  EXPECT_EQ(PredicateRows(100, Compare(CompareOp::kLe, kInt128Max), narrow, 100), 33);
+  // A constant just outside the range still computes exactly, so the guard does not fire early.
+  EXPECT_EQ(PredicateRows(100, Compare(CompareOp::kGe, -1), narrow, 100), 100);
+  EXPECT_EQ(PredicateRows(100, Compare(CompareOp::kLt, 11), narrow, 100), 100);
+  // A range whose own span overflows is not a range at all: the span guard takes it first.
+  const ColumnRange unbounded{.min = kInt128Min, .max = kInt128Max, .non_null = 100, .exact = true};
+  EXPECT_EQ(PredicateRows(100, Compare(CompareOp::kGe, 0), unbounded, 100), 33);
+  // The product guard: with the span computable, `rows` times a numerator that wide overflows
+  // before the division brings it back, and keeping every row errs toward the plan it already had.
+  const ColumnRange wide{.min = 0, .max = kInt128Max - 1, .non_null = 100, .exact = true};
+  EXPECT_EQ(PredicateRows(100, Compare(CompareOp::kGe, 0), wide, 100), 100);
+}
+
 // Without statistics every shape takes its documented default factor, and the shapes the footers
 // never cover take one always.
 TEST(JoinOrderTest, PredicateRowsFromTheDefaultFactors) {

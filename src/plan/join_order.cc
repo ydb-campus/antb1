@@ -317,7 +317,15 @@ int64_t PredicateRows(int64_t rows, const Predicate& predicate, const ColumnRang
     if (numerator <= 0) {
       return int64_t{0};
     }
-    return at_least_one(Int128{rows} * numerator / std::max<Int128>(denominator, 1));
+    // `rows` times a numerator that a 128-bit column's range can make very large overflows before
+    // the division brings it back. Every caller passes a numerator no larger than its denominator,
+    // so the true quotient is at most `rows`: keeping every row is the answer that errs toward the
+    // plan this relation already had.
+    Int128 product = 0;
+    if (__builtin_mul_overflow(Int128{rows}, numerator, &product)) {
+      return rows;
+    }
+    return at_least_one(product / std::max<Int128>(denominator, 1));
   };
   // What a predicate's complement keeps: the rest of the rows, and never none of them. A column of
   // one distinct value would otherwise estimate `col <> that value` at exactly 0.
@@ -380,21 +388,25 @@ int64_t PredicateRows(int64_t rows, const Predicate& predicate, const ColumnRang
           // How many of the column's values the comparison admits, clamped to its range: over
           // [min, max] and a constant c, "< c" admits [min, c - 1], "<= c" admits [min, c], "> c"
           // admits [c + 1, max] and ">= c" admits [c, max]. A constant outside the range admits
-          // all of them or none.
+          // all of them or none. Guarded like `span` is: a column whose range spans the 128-bit
+          // values can put the two ends far enough apart that the subtraction overflows, which is
+          // undefined rather than merely wrong, and an overflow leaves the predicate to its default
+          // factor. No Parquet column reaches that today -- `part_stats` has no DECIMAL and so no
+          // 128-bit column -- so this is the same defensive arithmetic KeyDomain already carries,
+          // not a live case.
+          const bool below = predicate.op == CompareOp::kLt || predicate.op == CompareOp::kLe;
+          const bool closed = predicate.op == CompareOp::kLe || predicate.op == CompareOp::kGe;
           Int128 admitted = 0;
-          switch (predicate.op) {
-            case CompareOp::kLt:
-              admitted = *constant - *range.min;
-              break;
-            case CompareOp::kLe:
-              admitted = *constant - *range.min + 1;
-              break;
-            case CompareOp::kGt:
-              admitted = *range.max - *constant;
-              break;
-            default:  // kGe; kEq and kNe returned above
-              admitted = *range.max - *constant + 1;
-              break;
+          if (__builtin_sub_overflow(below ? *constant : *range.max, below ? *range.min : *constant,
+                                     &admitted)) {
+            return scaled(kRangeDefault, kDefaultScale);
+          }
+          if (closed) {
+            const std::optional<Int128> inclusive = CheckedAdd(admitted, 1);
+            if (!inclusive.has_value()) {
+              return scaled(kRangeDefault, kDefaultScale);
+            }
+            admitted = *inclusive;
           }
           return scaled(std::clamp<Int128>(admitted, 0, span), span);
         }
