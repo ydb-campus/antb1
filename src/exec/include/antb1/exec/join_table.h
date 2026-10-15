@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -156,6 +157,46 @@ class JoinBuildPart {
 };
 
 class JoinTableBuilder;
+
+// Which build rows of a JoinTable have matched a probe row: one bit per rows() position, which is
+// the position JoinMatches already carries, so marking needs no index of its own. A join that
+// builds on the side it preserves (docs/adr/0026-join-performance.md, C2b) allocates one, every
+// probe thread marks into it, and the join reads it once its probe pipeline is done; no other join
+// allocates one, so a join that does not need marks pays nothing.
+class JoinMarks {
+ public:
+  JoinMarks(const JoinMarks&) = delete;
+  JoinMarks& operator=(const JoinMarks&) = delete;
+  JoinMarks(JoinMarks&&) = delete;
+  JoinMarks& operator=(JoinMarks&&) = delete;
+  ~JoinMarks() = default;
+
+  // `rows` bits, every one clear, charged to `budget` (nullptr: no budget). OutOfMemory past the
+  // limit. `rows` must not be negative.
+  static arrow::Result<std::unique_ptr<JoinMarks>> Make(int64_t rows, MemoryBudget* budget);
+
+  // Marks build row `row`, from any number of threads at once and any number of times: the write
+  // is an OR, so a part that PartScheduler reruns and then discards marks the same bits again and
+  // leaves the same answer. `row` must be below num_rows().
+  void Mark(std::uint32_t row);
+  // Whether build row `row` is marked. Only for a reader that the parts-done signal orders after
+  // every Mark: a concurrent Mark races it. `row` must be below num_rows().
+  [[nodiscard]] bool marked(std::uint32_t row) const;
+  // The bits (the build's num_rows()).
+  [[nodiscard]] int64_t num_rows() const { return rows_; }
+
+ private:
+  JoinMarks() = default;
+
+  // Relaxed throughout: a set bit must be visible to the one thread that reads the marks after the
+  // probe pipeline is done, and the parts-done signal already orders that read after every Mark.
+  // Nothing reads a mark to decide anything while probes run, so no mark orders any other write.
+  static constexpr std::memory_order kOrder = std::memory_order_relaxed;
+
+  std::vector<std::atomic<std::uint64_t>> words_;
+  int64_t rows_ = 0;
+  MemoryReservation memory_;
+};
 
 // A finished build, immutable: Find and every accessor may be called from any number of threads at
 // once.

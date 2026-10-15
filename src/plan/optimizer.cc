@@ -595,7 +595,8 @@ std::optional<ScalarBlock> ScalarBlockOf(const LogicalNodePtr& root) {
 //         Compute <their expressions>
 //           Filter t.z = 1
 //             Scan t
-arrow::Result<LogicalNodePtr> Path1(const DependentJoinNode& join, ColumnId& last_id) {
+arrow::Result<LogicalNodePtr> Path1(const DependentJoinNode& join, ColumnId& last_id,
+                                    int64_t build_side_ratio) {
   const auto refuse = [&join](std::string_view what) {
     return UnsupportedError(
         std::format("a correlated {} {} is not supported",
@@ -691,12 +692,21 @@ arrow::Result<LogicalNodePtr> Path1(const DependentJoinNode& join, ColumnId& las
     right = Make(ComputeNode{
         .input = std::move(right), .exprs = inner_casts, .ids = inner_cast_ids, .span = join.span});
   }
+  // ADR 0026's C2b and C3: a semi join may build on its left input, the side it preserves, when
+  // the subquery side is decisively larger -- the shape a correlated EXISTS over a large relation
+  // has, where ADR 0022's rule built the whole of that relation to probe it with far fewer rows.
+  // An anti join cannot emit its build rows yet (C2c), so it keeps building on the subquery side
+  // whatever the estimates say.
+  const BuildSide build =
+      join.kind == JoinKind::kSemi
+          ? ChooseBuildSide(EstimateRows(*left), EstimateRows(*right), build_side_ratio)
+          : BuildSide::kRight;
   LogicalNodePtr out = Make(JoinNode{.kind = join.kind,
                                      .left = std::move(left),
                                      .right = std::move(right),
                                      .keys = std::move(keys),
                                      .residual = std::move(residual),
-                                     .build = BuildSide::kRight,
+                                     .build = build,
                                      .span = join.span});
   // Lemma 3.1: the rewrite is legal only when the new join's right input has no free variables
   // left. A bug in the classification above is the only way this fails, and it must not reach
@@ -1001,7 +1011,8 @@ arrow::Result<LogicalNodePtr> UnnestNode(const LogicalNodePtr& node, ColumnId& l
     switch (dependent->kind) {
       case JoinKind::kSemi:
       case JoinKind::kAnti: {
-        ARROW_ASSIGN_OR_RAISE(const LogicalNodePtr rewritten, Path1(*dependent, last_id));
+        ARROW_ASSIGN_OR_RAISE(const LogicalNodePtr rewritten,
+                              Path1(*dependent, last_id, build_side_ratio));
         return UnnestNode(rewritten, last_id, build_side_ratio);  // its inputs may hold more
       }
       case JoinKind::kOneRow: {

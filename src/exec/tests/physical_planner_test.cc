@@ -12,6 +12,7 @@
 #include <vector>
 
 #include <arrow/api.h>
+#include <arrow/util/thread_pool.h>
 #include <gtest/gtest.h>
 
 #include "antb1/exec/limit.h"
@@ -80,6 +81,31 @@ class PhysicalPlannerTest : public testing::ExecTest {
       batches.push_back(arrow::RecordBatch::Make(schema, rows, {Int64s(x), Int64s(y)}));
     }
     return std::make_shared<MemoryTable>(schema, std::move(batches), split);
+  }
+
+  // A relation whose keys repeat, over three parts, so that one probe row matches several build
+  // rows and one build row is matched by several probe rows: x in {1, 1, 2, 2, 2, 4}. Its y is
+  // -x, where Table()'s is 10 * x, so that `this side's y > that side's x` is true one way round
+  // and false the other: a join that read a residual's columns off the wrong side would agree
+  // with one that read them off the right side if both relations held the same values.
+  static std::shared_ptr<MemoryTable> Repeated() {
+    const auto schema =
+        arrow::schema({arrow::field("x", arrow::int64()), arrow::field("y", arrow::int64())});
+    arrow::RecordBatchVector batches;
+    for (const std::vector<int64_t>& part :
+         {std::vector<int64_t>{1, 1}, std::vector<int64_t>{2, 2, 2}, std::vector<int64_t>{4}}) {
+      std::vector<std::optional<int64_t>> x;
+      std::vector<std::optional<int64_t>> y;
+      x.reserve(part.size());
+      y.reserve(part.size());
+      for (const int64_t value : part) {
+        x.emplace_back(value);
+        y.emplace_back(-value);
+      }
+      batches.push_back(arrow::RecordBatch::Make(schema, static_cast<int64_t>(part.size()),
+                                                 {Int64s(x), Int64s(y)}));
+    }
+    return std::make_shared<MemoryTable>(schema, std::move(batches), /*split=*/true);
   }
 
   static plan::LogicalNodePtr Node(plan::LogicalNode node) {
@@ -570,6 +596,274 @@ std::vector<Placement> Placements(const plan::LogicalNodePtr& join, std::size_t 
 // anti none (its build has a NULL key), and left pads them. A one-row join appends the row of
 // MIN(x) and COUNT(*). The residual y > x (the right input's y) passes the rows of a non-NULL y
 // but x = 0: semi keeps them, anti the others, and left pads the others.
+// ADR 0026's C2b: a semi join may build on its left input, the side it preserves, instead of on
+// the subquery side. It then probes with its right input, marks the build rows that matched and
+// emits them once no part of its probe pipeline runs any more -- so it is the sink of that
+// pipeline (PartRightJoinOperator) rather than a node inside one. The rows it keeps must be the
+// rows the other direction keeps: the direction is a performance choice, never a semantic one.
+TEST_F(PhysicalPlannerTest, SemiJoinsBuildingOnTheirLeftInputKeepTheSameRows) {
+  const auto table = Table(/*split=*/true);
+  const auto repeated = Repeated();
+  const auto scan = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}});
+  const auto dups = Node(plan::ScanNode{.table = repeated, .table_name = "r", .fields = {0, 1}});
+  const auto x = Column(0, "x", LogicalType::kBigInt);
+  const auto y = Column(1, "y", LogicalType::kBigInt);
+  const auto column = [](int index) {
+    return std::make_shared<const plan::Expr>(
+        plan::Expr{.node = plan::ColumnExpr{.index = index}, .type = LogicalType::kBigInt});
+  };
+  // The right input's y > the left input's x. Its columns are the left input's, then the right
+  // input's, whichever side the join builds on -- which is the mapping a left-building join has to
+  // invert to read them off a batch of candidate pairs.
+  const auto compare = [&](int left_index, int right_index) {
+    return std::make_shared<const plan::Expr>(plan::Expr{
+        .node =
+            plan::PredicateExpr{
+                .predicate = plan::Predicate{.kind = plan::Predicate::Kind::kCompareColumns,
+                                             .column = Column(0, "a", LogicalType::kBigInt),
+                                             .other = Column(1, "b", LogicalType::kBigInt),
+                                             .op = plan::CompareOp::kGt},
+                .operands = {column(left_index), column(right_index)}},
+        .type = LogicalType::kBoolean});
+  };
+  // The table holds x = 0..9 and y = 10 * x, NULL where x is a multiple of 3.
+  const plan::ExprPtr y_over_x = compare(3, 0);  // the right input's y > the left input's x
+  const plan::ExprPtr x_over_y = compare(2, 1);  // the right input's x > the left input's y: never
+  using Values = std::vector<std::optional<int64_t>>;
+  struct Case {
+    plan::LogicalNodePtr left;
+    plan::LogicalNodePtr right;
+    plan::BoundColumn key;
+    plan::ExprPtr residual;
+    Values xs;  // sorted: the two directions agree on the rows, not on the order
+    std::string_view what;
+  };
+  for (const Case& c :
+       {Case{.left = scan,
+             .right = scan,
+             .key = x,
+             .xs = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9},
+             .what = "t on x"},
+        Case{.left = scan,
+             .right = scan,
+             .key = y,
+             .xs = {1, 2, 4, 5, 7, 8},
+             .what = "t on y, whose NULLs match nothing"},
+        Case{.left = scan,
+             .right = scan,
+             .key = x,
+             .residual = y_over_x,
+             .xs = {1, 2, 4, 5, 7, 8},
+             .what = "t on x, y > x"},
+        Case{.left = scan,
+             .right = scan,
+             .key = y,
+             .residual = y_over_x,
+             .xs = {1, 2, 4, 5, 7, 8},
+             .what = "t on y, y > x"},
+        // Nothing passes, so nothing is marked: the sink emits no row at all.
+        Case{.left = scan,
+             .right = scan,
+             .key = x,
+             .residual = x_over_y,
+             .xs = {},
+             .what = "t on x, x > y"},
+        // The build's keys repeat, so one probe row marks several build rows (the 1:N path) and
+        // the marked rows are not a prefix of the build.
+        Case{.left = dups,
+             .right = scan,
+             .key = x,
+             .xs = {1, 1, 2, 2, 2, 4},
+             .what = "repeated keys on the left"},
+        Case{.left = dups,
+             .right = scan,
+             .key = x,
+             .residual = y_over_x,
+             .xs = {1, 1, 2, 2, 2, 4},
+             .what = "repeated keys on the left, y > x"},
+        // The probe's keys repeat, so several probe rows mark the same build row: a mark has to be
+        // idempotent, which an OR is and a count would not be.
+        Case{.left = scan,
+             .right = dups,
+             .key = x,
+             .xs = {1, 2, 4},
+             .what = "repeated keys on the right"},
+        // The right input's y is negative here, so no pair passes; read off the wrong side the
+        // residual would be the left input's y over the right input's x, and every pair would.
+        Case{.left = scan,
+             .right = dups,
+             .key = x,
+             .residual = y_over_x,
+             .xs = {},
+             .what = "repeated keys on the right, y > x"}}) {
+    SCOPED_TRACE(c.what);
+    const auto join_of = [&](plan::BuildSide build) {
+      return Node(plan::JoinNode{.kind = plan::JoinKind::kSemi,
+                                 .left = c.left,
+                                 .right = c.right,
+                                 .keys = {plan::JoinKey{.left = c.key, .right = c.key}},
+                                 .residual = c.residual == nullptr
+                                                 ? std::vector<plan::ExprPtr>{}
+                                                 : std::vector<plan::ExprPtr>{c.residual},
+                                 .build = build,
+                                 .span = {}});
+    };
+    // The left-sided direction is the sink of its probe pipeline, so it emits in the build's
+    // JoinTable::rows() order rather than in the probe's; both are deterministic.
+    const auto sorted = [](const std::shared_ptr<arrow::Table>& rows) {
+      Values xs = Int64Column(*rows, 0);
+      std::ranges::sort(xs);
+      return xs;
+    };
+    const auto pool = arrow::internal::ThreadPool::Make(4);
+    ASSERT_TRUE(pool.ok()) << pool.status().ToString();
+    // On the calling thread, then on a pool: with an executor the parts run at once, so several
+    // probe threads mark one bitmap, the scheduler's window applies and a part it reruns marks the
+    // same bits twice. The answer must not notice any of that.
+    for (arrow::internal::Executor* executor :
+         {static_cast<arrow::internal::Executor*>(nullptr),
+          static_cast<arrow::internal::Executor*>(pool->get())}) {
+      for (const int64_t batch_size : {1, 3, 64}) {
+        SCOPED_TRACE(std::string(executor == nullptr ? "serial" : "pooled") +
+                     " batch_size=" + std::to_string(batch_size));
+        const auto drain = [&](plan::BuildSide build) {
+          auto op = BuildPhysicalPlan(PlanOf(join_of(build), 2));
+          EXPECT_TRUE(op.ok()) << op.status().ToString();
+          if (!op.ok()) {
+            return std::shared_ptr<arrow::Table>{};
+          }
+          ExecContext ctx{.pool = arrow::default_memory_pool(),
+                          .batch_size = batch_size,
+                          .executor = executor,
+                          .threads = executor == nullptr ? 1 : 4};
+          auto drained = Drain(**op, ctx);
+          EXPECT_TRUE(drained.ok()) << drained.status().ToString();
+          return drained.ok() ? *drained : std::shared_ptr<arrow::Table>{};
+        };
+        const auto right = drain(plan::BuildSide::kRight);
+        const auto left = drain(plan::BuildSide::kLeft);
+        ASSERT_NE(right, nullptr);
+        ASSERT_NE(left, nullptr);
+        EXPECT_EQ(sorted(right), c.xs);
+        EXPECT_EQ(sorted(left), c.xs);
+        EXPECT_EQ(left->schema()->field(0)->name(), right->schema()->field(0)->name());
+      }
+    }
+    // Every place a join can sit, for the new direction: the matrix exists because a join that
+    // ends its pipeline is reached differently from every node above it, and a LIMIT above it is
+    // the trap -- the per-part row cap belongs to PartUnionOperator, and a join that owns its own
+    // scheduler passes none, so a cap must never be applied to a probe that hands on no row.
+    const auto n = static_cast<int64_t>(c.xs.size());
+    // The repeated-key cases return a key more than once, so a GROUP BY above them has fewer rows
+    // than the join does -- unlike every case of EveryJoinKindRunsEverywhere, whose xs are
+    // distinct.
+    Values keys = c.xs;
+    std::ranges::sort(keys);
+    // Not static_cast<int64_t>: an iterator difference is already `long int` on linux-64, where
+    // int64_t is that type and GCC's -Wuseless-cast fires, while on Darwin int64_t is `long long`
+    // and a cast would be needed. Letting the initialisation convert is right on both.
+    const int64_t groups = std::ranges::unique(keys).begin() - keys.begin();
+    for (const Placement& placement : Placements(join_of(plan::BuildSide::kLeft), 2, scan)) {
+      int64_t expected = n;
+      if (placement.rows == Expect::kOne) {
+        expected = 1;
+      } else if (placement.rows == Expect::kGroups) {
+        expected = groups;
+      } else if (placement.rows == Expect::kLimit) {
+        expected = std::min<int64_t>(n, 3);
+      }
+      for (const bool profiled : {false, true}) {
+        ProfileNode profile;
+        auto placed = BuildPhysicalPlan(PlanOf(placement.root, placement.width),
+                                        profiled ? &profile : nullptr);
+        ASSERT_TRUE(placed.ok()) << plan::NodeName(*placement.root) << ": "
+                                 << placed.status().ToString();
+        ExecContext ctx{.pool = arrow::default_memory_pool(), .batch_size = 3};
+        const arrow::Result<std::shared_ptr<arrow::Table>> result = Drain(**placed, ctx);
+        ASSERT_TRUE(result.ok()) << plan::NodeName(*placement.root) << ": "
+                                 << result.status().ToString();
+        EXPECT_EQ((*result)->num_rows(), expected) << plan::NodeName(*placement.root);
+      }
+    }
+    // A re-run of one operator: Drain opens, drains and closes, so twice over the same operator is
+    // the (re)run Operator::Open documents. Open makes the marks afresh, so a bit the first run set
+    // cannot carry into the second, and the position the sink emits from starts over.
+    auto op = BuildPhysicalPlan(PlanOf(join_of(plan::BuildSide::kLeft), 2));
+    ASSERT_TRUE(op.ok()) << op.status().ToString();
+    for (int run = 0; run < 2; ++run) {
+      ExecContext ctx{.pool = arrow::default_memory_pool(), .batch_size = 3};
+      const arrow::Result<std::shared_ptr<arrow::Table>> again = Drain(**op, ctx);
+      ASSERT_TRUE(again.ok()) << again.status().ToString();
+      EXPECT_EQ(sorted(*again), c.xs) << "run " << run;
+    }
+    // The plan really is the new shape: without this the case would pass on a planner that
+    // quietly kept building on the right.
+    ProfileNode root;
+    ASSERT_TRUE(BuildPhysicalPlan(PlanOf(join_of(plan::BuildSide::kLeft), 2), &root).ok());
+    std::string names;
+    const auto walk = [&names](const ProfileNode& node, auto&& self) -> void {
+      names += node.name() + "/";
+      for (const auto& child : node.children()) {
+        self(*child, self);
+      }
+    };
+    walk(root, walk);
+    // The sink on top, its probe pipeline as child 0 and its own build as child 1 -- the build the
+    // operator above it prepares before it opens. Without this the case would pass just as well on
+    // a planner that quietly kept building on the right.
+    EXPECT_EQ(names, "RightJoin/HashJoin/Scan/HashBuild/Scan/");
+  }
+}
+
+// A join that emits its build rows needs a part pipeline under its probe, because the sink that
+// emits them is the sink of that pipeline. Where there is none the build side -- a performance
+// choice, never a semantic one -- goes back to the right input, so the join still runs and still
+// answers. A Sort under the probe is the shape: it ends the chain.
+TEST_F(PhysicalPlannerTest, ASemiJoinWithoutAProbePipelineBuildsOnItsRightInputInstead) {
+  const auto table = Table(/*split=*/true);
+  const auto scan = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}});
+  const auto x = Column(0, "x", LogicalType::kBigInt);
+  const auto sorted = Node(plan::SortNode{.input = scan, .keys = {plan::SortKey{.column = x}}});
+  const auto join_of = [&](const plan::LogicalNodePtr& right, plan::BuildSide build) {
+    return Node(plan::JoinNode{.kind = plan::JoinKind::kSemi,
+                               .left = scan,
+                               .right = right,
+                               .keys = {plan::JoinKey{.left = x, .right = x}},
+                               .residual = {},
+                               .build = build,
+                               .span = {}});
+  };
+  using Values = std::vector<std::optional<int64_t>>;
+  const Values all = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+  const auto rows = Run(PlanOf(join_of(sorted, plan::BuildSide::kLeft), 2));
+  ASSERT_NE(rows, nullptr);
+  Values xs = Int64Column(*rows, 0);
+  std::ranges::sort(xs);
+  EXPECT_EQ(xs, all);
+
+  const auto tree = [](const plan::LogicalPlan& plan) {
+    ProfileNode root;
+    EXPECT_TRUE(BuildPhysicalPlan(plan, &root).ok());
+    std::string names;
+    const auto walk = [&names](const ProfileNode& node, auto&& self) -> void {
+      names += node.name() + "/";
+      for (const auto& child : node.children()) {
+        self(*child, self);
+      }
+    };
+    walk(root, walk);
+    return names;
+  };
+  // The operator tree says what it really ran, and the profile's detail names the side with it:
+  // the probe is the left input now, so it is a part pipeline again and the join runs inside one.
+  EXPECT_EQ(tree(PlanOf(join_of(sorted, plan::BuildSide::kLeft), 2)),
+            "PartUnion/HashJoin/Scan/HashBuild/Sort/PartUnion/Scan/");
+  // With a part pipeline under the probe the same plan takes the sink: the fallback is about the
+  // shape below the join, not about the kind or the side.
+  EXPECT_EQ(tree(PlanOf(join_of(scan, plan::BuildSide::kLeft), 2)),
+            "RightJoin/HashJoin/Scan/HashBuild/Scan/");
+}
+
 TEST_F(PhysicalPlannerTest, EveryJoinKindRunsEverywhere) {
   const auto table = Table(/*split=*/true);
   const auto scan = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}});
@@ -755,11 +1049,12 @@ TEST_F(PhysicalPlannerTest, MalformedJoinsAreInvalidNotUnsupported) {
     };
     const auto y = Column(1, "y", LogicalType::kBigInt);
     const auto boolean = expr(0, LogicalType::kBoolean);
-    for (const plan::JoinKind kind :
-         {plan::JoinKind::kSemi, plan::JoinKind::kAnti, plan::JoinKind::kNullAwareAnti,
-          plan::JoinKind::kOneRow, plan::JoinKind::kLeft}) {
+    // A semi join that builds on its left input runs (ADR 0026's C2b): it is
+    // SemiJoinsBuildingOnTheirLeftInputAreTheSinkOfTheirProbePipeline below, not a malformed plan.
+    for (const plan::JoinKind kind : {plan::JoinKind::kAnti, plan::JoinKind::kNullAwareAnti,
+                                      plan::JoinKind::kOneRow, plan::JoinKind::kLeft}) {
       expect_invalid(kind_of(kind, key(x, x), {}, plan::BuildSide::kLeft),
-                     "a join of another kind than inner that builds on its left input");
+                     "a join of another kind than inner or semi that builds on its left input");
     }
     expect_invalid(kind_of(plan::JoinKind::kOneRow, key(x, x), {}), "a one-row join with a key");
     expect_invalid(kind_of(plan::JoinKind::kOneRow, {}, {boolean}),

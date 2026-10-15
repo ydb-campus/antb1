@@ -1270,6 +1270,61 @@ TEST_F(HashJoinTest, ABuildPartRunsAgainAloneAfterOutOfMemory) {
 // build whose kind does not fit (building on the left, keys or none, residuals of a null-aware
 // anti or a one-row join), a probe without its build prepared, and Next before Open or after
 // Close.
+// The guards around the marks a right-direction semi join needs (ADR 0026's C2b). The planner
+// makes them between preparing the build and running the first part, and a probe that finds none
+// would mark nothing and make the join emit no row at all -- so it fails instead of answering.
+TEST_F(HashJoinTest, AJoinThatEmitsItsBuildRowsNeedsItsMarks) {
+  const auto build_schema = Int64Schema({"k", "v"});
+  const auto probe_schema = Int64Schema({"a", "b"});
+  const auto make_build = [&] {
+    return DrainedBuild(plan::JoinKind::kSemi, SourceOf(build_schema, {Int64s({1}), Int64s({2})}),
+                        {0});
+  };
+  ExecContext ctx{.pool = arrow::default_memory_pool()};
+
+  // Marks before the build is prepared: Invalid, and it makes none.
+  const std::shared_ptr<JoinBuild> unprepared = make_build();
+  EXPECT_TRUE(unprepared->PrepareMarks(ctx).IsInvalid());
+  EXPECT_EQ(unprepared->marks(), nullptr);
+
+  // Prepared, so the marks can be made: one bit per row the table holds, all clear.
+  ASSERT_TRUE(unprepared->Prepare(ctx).ok());
+  ASSERT_TRUE(unprepared->PrepareMarks(ctx).ok());
+  ASSERT_NE(unprepared->marks(), nullptr);
+  EXPECT_EQ(unprepared->marks()->num_rows(), unprepared->table()->num_rows());
+  // Releasing the table releases them with it: they address its rows and nothing else.
+  unprepared->Release();
+  EXPECT_EQ(unprepared->marks(), nullptr);
+
+  // A probe that builds on its left over a build whose marks were never made: Invalid from the
+  // first Next, which is where it takes the table.
+  const std::shared_ptr<JoinBuild> without = make_build();
+  auto probe = HashJoinOperator::Make(SourceOf(probe_schema, {Int64s({1}), Int64s({2})}), without,
+                                      {0}, BuildSide::kLeft, {}, /*prepares=*/true);
+  ASSERT_TRUE(probe.ok()) << probe.status().ToString();
+  // Its output is the build's schema, not the probe's: the sink emits the build's rows.
+  EXPECT_TRUE((*probe)->output_schema()->Equals(*build_schema));
+  ASSERT_TRUE((*probe)->Open(ctx).ok());
+  const arrow::Result<Batch> next = (*probe)->Next();
+  EXPECT_TRUE(next.status().IsInvalid()) << next.status().ToString();
+  EXPECT_TRUE((*probe)->Close().ok());
+}
+
+// The sink of such a join: Next before Open, and after Close, is Invalid rather than undefined.
+TEST_F(HashJoinTest, ARightJoinSinkRejectsNextBeforeOpen) {
+  const auto schema = Int64Schema({"k", "v"});
+  PartRightJoinOperator sink(
+      [](int64_t) -> arrow::Result<std::unique_ptr<Operator>> {
+        return arrow::Status::Invalid("no part should be built");
+      },
+      /*num_parts=*/1, schema,
+      DrainedBuild(plan::JoinKind::kSemi, SourceOf(schema, {Int64s({1}), Int64s({2})}), {0}));
+  EXPECT_TRUE(sink.output_schema()->Equals(*schema));
+  EXPECT_TRUE(sink.Next().status().IsInvalid());
+  EXPECT_TRUE(sink.Close().ok());
+  EXPECT_TRUE(sink.Next().status().IsInvalid());
+}
+
 TEST_F(HashJoinTest, MisuseIsInvalid) {
   const auto build_schema = Int64Schema({"k", "v"});
   const auto build = [&] {
@@ -1310,11 +1365,21 @@ TEST_F(HashJoinTest, MisuseIsInvalid) {
       build_schema, {Column(0, "k", LogicalType::kBigInt), Column(1, "v", LogicalType::kBigInt)});
   const plan::ExprPtr residual =
       Condition(plan::CompareOp::kLt, 1, ColumnAt(3, LogicalType::kBigInt));
-  for (const plan::JoinKind kind : {plan::JoinKind::kSemi, plan::JoinKind::kLeft}) {
+  // Building on the left input: an anti, null-aware anti or left outer join must emit the build
+  // rows that did not match, which needs the build to keep its NULL-key rows first (ADR 0026's
+  // C2c, not implemented). A semi join is C2b and runs.
+  for (const plan::JoinKind kind :
+       {plan::JoinKind::kAnti, plan::JoinKind::kNullAwareAnti, plan::JoinKind::kLeft}) {
     EXPECT_TRUE(
         HashJoinOperator::Make(probe(), build_of(kind, keyed), {0}, BuildSide::kLeft, {}, true)
             .status()
-            .IsInvalid());
+            .IsInvalid())
+        << plan::ToString(kind);
+  }
+  EXPECT_TRUE(HashJoinOperator::Make(probe(), build_of(plan::JoinKind::kSemi, keyed), {0},
+                                     BuildSide::kLeft, {}, true)
+                  .ok());
+  for (const plan::JoinKind kind : {plan::JoinKind::kSemi, plan::JoinKind::kLeft}) {
     EXPECT_TRUE(make(probe(), build_of(kind, keyless), {}, {}).IsInvalid());
   }
   EXPECT_TRUE(make(probe(), build_of(plan::JoinKind::kOneRow, keyed), {0}, {}).IsInvalid());

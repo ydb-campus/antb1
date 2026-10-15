@@ -492,10 +492,12 @@ TEST(ColumnIdsTest, EveryJoinKindResolves) {
   JoinNode one_row = Join(JoinKind::kOneRow);
   one_row.keys.clear();
   EXPECT_EQ(PositionMismatch(ResolvePositions(Plan(Node(one_row)))), std::nullopt);
-  EXPECT_EQ(
-      PositionMismatch(ResolvePositions(Plan(Node(Join(JoinKind::kInner, BuildSide::kLeft))))),
-      std::nullopt)
-      << "an inner join may build on either input";
+  for (const JoinKind kind : {JoinKind::kInner, JoinKind::kLeft, JoinKind::kSemi, JoinKind::kAnti,
+                              JoinKind::kNullAwareAnti}) {
+    EXPECT_EQ(PositionMismatch(ResolvePositions(Plan(Node(Join(kind, BuildSide::kLeft))))),
+              std::nullopt)
+        << "every kind but ONE-ROW may build on either input: " << ToString(kind);
+  }
 }
 
 TEST(ColumnIdsTest, PositionMismatchNamesBrokenJoins) {
@@ -512,11 +514,6 @@ TEST(ColumnIdsTest, PositionMismatchNamesBrokenJoins) {
   EXPECT_EQ(PositionMismatch(Plan(Node(Join(JoinKind::kOneRow)))),
             "Join: ONE-ROW join with 1 keys");
 
-  for (const JoinKind kind :
-       {JoinKind::kLeft, JoinKind::kSemi, JoinKind::kAnti, JoinKind::kNullAwareAnti}) {
-    EXPECT_EQ(PositionMismatch(Plan(Node(Join(kind, BuildSide::kLeft)))),
-              std::format("Join: {} join builds on its left input", ToString(kind)));
-  }
   JoinNode one_row = Join(JoinKind::kOneRow, BuildSide::kLeft);
   one_row.keys.clear();
   EXPECT_EQ(PositionMismatch(Plan(Node(one_row))), "Join: ONE-ROW join builds on its left input");

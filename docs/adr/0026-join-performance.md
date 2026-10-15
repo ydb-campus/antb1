@@ -285,23 +285,55 @@ changes.
   arm, and a test pins that the binder never produces `BuildSide::kLeft` for a non-inner kind — which only an
   aborting internal check stood behind, and which C1 made worth pinning by making `kLeft` reachable from real SQL.
   No plan and no answer changes. **Shipped first, before C2b and C2c, because it is the trap they would walk into.**
-- **C2b, feat(exec): build-side output for semi joins.** The atomic mark bitmap on `JoinBuild`, the `rows()`
-  position carried through the residual path, and the join as the sink of its own probe pipeline — the design is
-  decided and recorded above. Semi alone, because it needs no change to the build. Unlocks Q21's semi join, which
-  today builds the whole of the largest relation to probe it with 7.3M rows, and Q4's.
-  - It reports two numbers that decide whether C2c follows: the peak memory it adds for the bitmap, which bears on
-    the `OneAtATime` cliff of C4, and the cost of the serial chain above the break, which is what the design trades
-    away for the parallel probe.
-  - Sequenced after a smaller PR that moves the probe-side guard: `PipelineInput`, `ShapeOf`,
-    `HashJoinOperator::Make` and `plan::ResolvePositions` must stop rejecting a non-inner join that builds on its
-    left input, in lockstep, with the combination still unreachable from SQL until C3 chooses it. That PR changes no
-    plan and no answer, and keeping it separate is what makes C2b's diff about the marking and the tail.
+- **C2b, feat(exec): build-side output for semi joins.** Shipped 2026-10-15, with C3's rule for a semi join: the
+  mark bitmap (`JoinMarks`), the `rows()` position carried through the residual path, and the join as the sink of its
+  own probe pipeline (`PartRightJoinOperator`). Semi alone, because it needs no change to the build.
+  - **Measured on the sf100 harness at 4 threads, best of 2:** Q21 went from 110.60 s to 32.50 s, **3.4x faster**,
+    and its ratio to DuckDB from 11.10x to 3.2x; its peak memory from about 36 GB to 18.81 GB (the profiled run,
+    which is the one the peak comes from, takes 33.0 s). At SF 10 it went from 2.808 s to 2.625 s and 3.62 GB to
+    1.89 GB. The semi
+    join's build fell from every row of the largest relation to the outer side's: 82x fewer rows. The time won is far
+    more than the memory saved would suggest on its own, which is the reading this ADR expected: at 36 GB against
+    this host's 51.5 GB the query was evicting the page cache for a 33 GB dataset, so it also explains why Q21 was
+    the one query that did not answer to thread count.
+  - **What the design traded away, measured:** the serial chain above the break costs nothing here. Q21's aggregate
+    now runs on one thread over 39,448 rows and 4,009 groups, and the anti join above the break is serial too; both
+    are in the 33.1 s. The bitmap's own peak is one bit per build row — 8 bytes per 64 rows — and does not approach
+    C4's `OneAtATime` threshold. **So C2c follows**, and the remaining 18.81 GB is mostly its anti join's build,
+    which is still every filtered row of the largest relation.
+  - **Two findings from the work**, neither of which this design had anticipated:
+    - A residual's columns are the join's left input's and then its right input's, but the pair-batch split read
+      them as the probe's and then the build's. Those agree only while the probe is the left input. The 53 existing
+      hash-join cases all pass with the old split, so it was latent, and it is the second trap of the kind C2a
+      closed — found by a test with relations of unlike values, since one with the same values on both sides cannot
+      tell the two orderings apart.
+    - The pipeline boundary is not expressible in `PipelineInput` alone. `PipelineScan` is asked two different
+      questions — *where does the pipeline this node tops begin* and *may I run this node inside a pipeline of
+      mine* — and a right-direction join answers them differently. It takes a parameter now, and only its own sink
+      passes it. Where its probe has no part pipeline at all there is no sink to emit from, so the physical planner
+      keeps building on the right instead: the side is a performance choice and never a semantic one, which is what
+      lets it.
+  - Sequenced after a smaller change that moved the probe-side guard in `PipelineInput`, `ShapeOf`,
+    `HashJoinOperator::Make` and `plan::ResolvePositions` in lockstep. That went in as the first commit of the same
+    PR rather than its own: with the operator still refusing the combination, nothing could exercise the moved
+    guard, so splitting it would have shipped a diff no test could reach.
 - **C2c, feat(exec): build-side output for anti and left outer joins.** Right anti and right outer, which
   additionally need the build to keep its NULL-key rows, since those are unmatched by definition and must be
   emitted. Unlocks Q21's anti join, Q22 and Q13.
 - **C3, feat(plan): choose the build side for semi, anti and outer joins.** C1's estimates with C2b's and C2c's
   operators, one kind at a time as each lands. This is where Q21's 36 GB, its 10.8x and its 1.08x thread scaling go,
   and with them Q4, Q22 and Q13. The largest single win of this ADR.
+  - Update (2026-10-15): **the semi-join half shipped with C2b, in the same PR**, as the rule the unnesting pass
+    applies to the join it creates (`ChooseBuildSide`, the same function and the same `--build-side-ratio` the join
+    order uses). The two went together deliberately, against this ADR's own "one PR per id": C2b alone moves no plan,
+    so on its own it is an operator nothing reaches and nothing can measure, and C3's rule alone has no operator to
+    run. Q21's 36 GB and its 10.8x are therefore already collected under C2b above. **The anti and outer halves wait
+    on C2c**, which is now the only thing between this ADR and Q22, Q13 and Q21's remaining 18.81 GB.
+  - What did *not* move, and why it is worth knowing: Q4, whose correlated `EXISTS` has the same shape as Q21's.
+    `EstimateRows` reads a `Filter` as an upper bound -- it does not apply the predicate -- so it sees the subquery
+    side at 4.0x the outer side where the true ratio is far higher, and 4.0x is not *more* than the default ratio.
+    Making `EstimateRows` filter-aware (it would reuse C1's `PredicateRows`) is the smallest remaining lever here and
+    belongs with C5, which needs estimates through a join and an aggregate for the same reason.
 - **C4, perf(exec): keep a large build parallel.** `OneAtATime` trades all of a build's parallelism for headroom at
   half the limit, with nothing in between. After C3 no query of the 22 reaches that threshold, so this is no longer
   urgent — but any query whose build is legitimately large still falls off the same cliff.

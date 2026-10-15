@@ -939,7 +939,9 @@ class Resolver {
     } else if (!one_row && join.keys.empty()) {
       Fail(std::format("Join: {} join without keys", ToString(join.kind)));
     }
-    if (join.build == BuildSide::kLeft && join.kind != JoinKind::kInner) {
+    if (join.build == BuildSide::kLeft && join.kind == JoinKind::kOneRow) {
+      // Every other kind may build on either input since ADR 0026's C2b; a ONE-ROW join may not,
+      // because its right input is the single-row side by definition.
       Fail(std::format("Join: {} join builds on its left input", ToString(join.kind)));
     }
     JoinNode out = join;
