@@ -41,7 +41,19 @@ struct FactoredConjunct {
 // after them is the original OR with `bind_only` set. The caller must bind it like any other
 // conjunct and discard the result: that is what keeps a bind error in a dropped branch a bind error
 // (ADR 0022's "DuckDB's bind errors stay bind errors"), which dropping it unbound would lose.
-void FactorSharedConjuncts(const sql::Expr& element, std::vector<sql::Box<sql::Expr>>& owned,
+// It also derives the IN lists a top-level OR implies: where every branch of the OR constrains one
+// column to literals, their union holds for every row the OR keeps, so `(c = 'A' AND x) OR (c = 'B'
+// AND y)` contributes `c IN ('A', 'B')` beside the OR (ADR 0022's "filters implied by ORs"). The
+// derived conjunct is redundant -- the OR stays where it is -- so it can only change the plan,
+// never the answer: a single-column IN reaches its scan and its estimate, where an OR over two
+// relations is a join residual that neither can see.
+//
+// `siblings` is every conjunct of the whole predicate this element belongs to (the Conjuncts
+// overload above gives it), so that a derivation the predicate already holds is not repeated. That
+// is what keeps the rewrite idempotent: its own output, re-parsed, factors to itself even though a
+// derived conjunct becomes an element of its own.
+void FactorSharedConjuncts(const sql::Expr& element, const std::vector<const sql::Expr*>& siblings,
+                           std::vector<sql::Box<sql::Expr>>& owned,
                            std::vector<FactoredConjunct>& out);
 
 }  // namespace antb1::plan

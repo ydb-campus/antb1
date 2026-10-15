@@ -148,22 +148,22 @@ SELECT COUNT(*) FROM trips WHERE NOT (tr_row > 100 AND tr_rate = 1.50) OR tr_row
 # ---- what hoisting a conjunct changes about when it is computed: divergence D16 ----
 
 # Hoisting makes a shared conjunct a WHERE conjunct of its own, and antb1 computes a WHERE conjunct's operands for
-# every row (docs/sql-subset.md, divergence D16), so `i16 * 2` now overflows on edge's -32768 -- a row the OR's
-# own argument order would never have computed it for, both branches testing `id` first. Writing the result of the
-# factoring by hand, `i16 * 2 > 1 AND (id = 6 OR id = 11)`, fails on antb1 just the same: D16 already said this,
-# and the factoring only brings more queries to it.
-onlyif antb1
-statement error Overflow in multiplication of SMALLINT
-SELECT COUNT(*) FROM edge WHERE id = 6 AND i16 * 2 > 1 OR id = 11 AND i16 * 2 > 1
-
-onlyif antb1
-statement error Overflow in multiplication of SMALLINT
-SELECT COUNT(*) FROM edge WHERE i16 * 2 > 1 AND (id = 6 OR id = 11)
-
-# DuckDB reorders conjunctions by its cost model, tests `id` first and answers.
-onlyif duckdb
+# every row (docs/sql-subset.md, divergence D16), so `i16 * 2` would overflow on edge's -32768 -- a row the OR's own
+# argument order would never have computed it for, both branches testing `id` first. Both of these used to fail on
+# antb1 for that reason, where DuckDB reorders by its cost model, tests `id` first and answers.
+#
+# They now answer on antb1 too, and agree with DuckDB: every branch of the remainder bounds `id`, so the implied
+# `id IN (6, 11)` reaches the Scan (ADR 0026, "filters implied by ORs") and `i16 * 2` is computed only for the two
+# rows it keeps. The derivation narrows D16 rather than widening it -- a conjunct that reaches the Scan takes rows
+# away from the arithmetic above it, which is the direction that turns an overflow into an answer.
 query I nosort
 SELECT COUNT(*) FROM edge WHERE id = 6 AND i16 * 2 > 1 OR id = 11 AND i16 * 2 > 1
+----
+2
+
+# The result of the factoring written by hand answers for the same reason, and the same as DuckDB.
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i16 * 2 > 1 AND (id = 6 OR id = 11)
 ----
 2
 
@@ -177,11 +177,13 @@ SELECT COUNT(*) FROM edge WHERE id = 6 AND i16 * 2 > 1 OR id = 11 AND i16 + i16 
 # Hoisting can also take an overflow away. A comparison that folds to never-true computes nothing once it is a
 # conjunct of its own (divergence D14), so the shared `i16 + 1 > 40000` answers below; left inside the OR (nothing
 # shared here, the second branch adding a term) a folded comparison keeps NULL for a NULL operand, so its operand
-# is computed and 32767 + 1 overflows SMALLINT. antb1 only: whether DuckDB reaches the overflow is its cost model's
-# choice, and it answers this one here while failing it through other interfaces -- which is D16 itself.
-onlyif antb1
-statement error Overflow in addition of SMALLINT
+# is computed and 32767 + 1 would overflow SMALLINT. This too now answers, and agrees with DuckDB: both branches
+# bound `id`, so the implied `id IN (6, 11)` reaches the Scan and the folded comparison is computed for its two rows
+# only.
+query I nosort
 SELECT COUNT(*) FROM edge WHERE i16 + 1 > 40000 AND id = 6 OR i16 + i16 + 1 > 40000 AND id = 11
+----
+0
 
 query I nosort
 SELECT COUNT(*) FROM edge WHERE i16 + 1 > 40000 AND id = 6 OR i16 + 1 > 40000 AND id = 11

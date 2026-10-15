@@ -2194,11 +2194,14 @@ TEST(BinderTest, FactorsConjunctsSharedByEveryOrBranch) {
   ASSERT_FALSE(reversed.ok());
   EXPECT_NE(reversed.status().message().find("a cross product is not supported"), std::string::npos)
       << reversed.status().ToString();
-  // One relation, no join: the shared conjunct still reaches the Scan, where the OR could not.
+  // One relation, no join: the shared conjunct reaches the Scan, where the OR could not -- and so
+  // does the IN list the remainder implies (ADR 0026's "filters implied by ORs"), which is the
+  // whole point of deriving it.
   auto pushed =
       BindSql("SELECT COUNT(*) FROM t WHERE i16 = 1 AND i32 = 2 OR i16 = 1 AND i32 = 3", catalog);
   ASSERT_TRUE(pushed.ok()) << pushed.status().ToString();
-  EXPECT_NE(Explain(*pushed).find("Filter i16 = 1\n"), std::string::npos) << Explain(*pushed);
+  EXPECT_NE(Explain(*pushed).find("Filter i16 = 1 AND i32 IN (2, 3)\n"), std::string::npos)
+      << Explain(*pushed);
   EXPECT_NE(Explain(*pushed).find("Compute ((i32 = 2) OR (i32 = 3))"), std::string::npos)
       << Explain(*pushed);
   // HAVING is not factored: its OR stays one computed conjunct, aggregate and all. Factoring it
