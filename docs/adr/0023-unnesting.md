@@ -314,9 +314,11 @@ hand reach it without Optimize, as ADR 0022's join kinds do before E2.
     scan of the inner table dominates anyway), until profiles of correlated aggregates or the divergence call for the
     semi-join reduction;
   - a semi or anti join with a residual keeps every build row (Q21), until profiles of Q21 at SF 10 or above ask for a
-    smaller build;
+    smaller build — **fired 2026-10-15: profiles of Q21 at SF 100 show both its joins building the whole of the
+    largest relation, [ADR 0026](0026-join-performance.md)**;
   - an anti join builds on the subquery even where the outer side is smaller (Q22), until build-side output gets its
-    ADR (ADR 0022).
+    ADR (ADR 0022) — **it has one: [ADR 0026](0026-join-performance.md)'s C2c, which this trigger named by its own
+    name. Q22's anti join builds 150M rows to probe them with 1.9M**.
 - **Shapes deferred until a query needs them** (a user or generated query of the shape, each with an update of this
   ADR): the general domain join; mark and single joins (subqueries under OR, in CASE or in a select list; scalar
   subqueries that are not aggregates), which a TPC-DS workload would need, see Alternatives considered; correlated IN
