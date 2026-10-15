@@ -714,8 +714,10 @@ only with `--analyze`); its errors and exit codes are those of `antb1 query`.
     or over it when it is no part pipeline;
   - `HashBuild`, its build, under the operator that prepares it: the operator that runs the probe's part pipeline
     (after the pipeline's lines), or a `HashJoin` over its input (after that input's line). Its input follows it,
-    per part when it is a part pipeline. Its `rows` and `batches` are the rows its table holds (those without a NULL
-    key) and the table's chunks, and its time includes that of the builds its input probes, which come first.
+    per part when it is a part pipeline. Its `rows` and `batches` are the rows its table holds and the table's
+    chunks, and its time includes that of the builds its input probes, which come first. The rows it holds are those
+    without a NULL key, except for a join that emits the build rows which did not match (below), whose build keeps
+    the rows with one too.
   - In the JSON, a `HashBuild` is one more entry of the `inputs` of the operator that prepares it.
 - Metrics:
   - `parts`, `skipped` (by statistics);
@@ -727,14 +729,18 @@ only with `--analyze`); its errors and exit codes are those of `antb1 query`.
   - `sort`, `groups`, and `sample_parts`, `heavy_keys`, `heavy_groups` of a two-level aggregation;
   - a `HashJoin`'s `find` (looking up the keys; none where a join keeps every row or none without looking: a one-row
     join, an anti join over a build without rows, a null-aware anti join over an empty build input or one with a
-    NULL key), `gather` (the rows' columns: the build columns an inner or a left join gathers, and the probe rows it
+    NULL key, and an anti join on its left input over a build with no key at all, whose probe is never opened),
+    `gather` (the rows' columns: the build columns an inner or a left join gathers, and the probe rows it
     takes on its other path than 1:1; the columns of the candidates that residuals read; a one-row join's values, which
     its build makes once), `residual` and, when the build's keys are unique, an inner join's `window_rows`, and a left
     join's without residuals (the rows of the probe's batches it gathered the build's columns for, next to the `rows` it
     returned);
   - a `HashBuild`'s `finish` (the table built from its parts, and a one-row join's values), `null_keys` (rows with a
-    NULL key, never held), `unique` (1: no key repeats) and `direct` (1: the table indexes its one integer key by
-    value, ADR 0022).
+    NULL key, which no key's range holds and no lookup returns; a join that emits the build rows which did not match
+    keeps their rows apart from the table it indexes, since such a row is unmatched by definition), `unique` (1: no
+    key repeats) and `direct` (1: the table indexes its one integer key by value, ADR 0022);
+  - a `RightJoin`'s `emitted` (the build rows it returned: those the probes marked for a semi join, those they did
+    not plus the retained NULL-key ones for an anti join).
 - The counts do not depend on the number of threads, except under a `LIMIT` (it stops parts that already started,
   and how many depends on the threads) and after a part ran out of memory next to others (it runs again alone). The
   times do depend on the threads.
@@ -946,17 +952,20 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   ratio changes which plan a query gets, never its answer, and an unknown estimate on either side never moves a
   build. Estimates are integer arithmetic over footer metadata alone, so a plan is the same on every host and for any
   number of threads; `explain` prints `build=left|right` on every join.
-- A semi join of a correlated `EXISTS` builds on the side it preserves, the outer one, when the subquery's side is
-  estimated at more than the same ratio times it ([ADR 0026](adr/0026-join-performance.md)): a correlated `EXISTS`
-  over a large table otherwise builds the whole of that table to probe it with far fewer rows. Such a join emits the
-  rows of the side it builds on, so it ends its probe's pipeline rather than sitting inside one, and `explain` shows
-  it as `RightJoin` with its probe and its build beneath; whatever is above it runs on one thread. The rows it
-  returns are the rows the other direction returns, in the build's order rather than the probe's; neither order is
-  specified without `ORDER BY`. A plan whose probe side is not a chain of streaming
+- A semi join of a correlated `EXISTS`, and an anti join of a correlated `NOT EXISTS`, build on the side they
+  preserve -- the outer one -- when the subquery's side is estimated at more than the same ratio times it
+  ([ADR 0026](adr/0026-join-performance.md)): such a subquery over a large table otherwise builds the whole of that
+  table to probe it with far fewer rows. The estimate reads through a dependent join to its outer side, so the outer
+  of two correlated subqueries at one level chooses a side as the inner one does. Such a join emits the rows of the
+  side it builds on, so it ends its probe's pipeline rather than sitting inside one, and `explain` shows it as
+  `RightJoin` with its probe and its build beneath; whatever is above it runs on one thread. The rows it returns are
+  the rows the other direction returns, in the build's order rather than the probe's; neither order is specified
+  without `ORDER BY`. An anti join returns the rows a semi join over the same condition drops, the rows whose key is
+  NULL among them, so the two partition the side they preserve. A plan whose probe side is not a chain of streaming
   nodes over a scan -- a sorted or aggregated subquery, say -- keeps building on its right input, since there is no
   pipeline for the join to be the sink of; a probe scan whose row groups the statistics all prune does take this
-  plan, and returns no row. An `EXISTS` that is not correlated, a `NOT EXISTS`, a `NOT IN` and a `LEFT JOIN`
-  always build on their right input.
+  plan, and returns the whole preserved side for `NOT EXISTS` and no row for `EXISTS`. An `EXISTS` or `NOT EXISTS`
+  that is not correlated, a `NOT IN` and a `LEFT JOIN` always build on their right input.
 - Execution: the row groups of a query run on `--threads` threads (default: the hardware threads), 64Ki-row
   batches; their results are combined in file and row group order, so a result is the same for any number of
   threads, and deterministic. A DOUBLE `SUM` or `AVG` adds up every row group (per group with `GROUP BY`),

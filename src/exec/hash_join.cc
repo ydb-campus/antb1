@@ -300,6 +300,11 @@ arrow::Status JoinBuild::BuildTable(ExecContext& ctx) {
     for (const std::shared_ptr<arrow::RecordBatch>& chunk : table_->chunks()) {
       profile_->AddRows(chunk->num_rows());
     }
+    // The retained NULL-key rows are rows the build holds and will emit, so they belong in the one
+    // line a reader looks at to see how large a build is.
+    for (const std::shared_ptr<arrow::RecordBatch>& chunk : table_->null_chunks()) {
+      profile_->AddRows(chunk->num_rows());
+    }
     profile_->Add("null_keys", MetricUnit::kCount, table_->null_key_rows());
     profile_->Max("unique", MetricUnit::kCount, table_->unique() ? 1 : 0);
     profile_->Max("direct", MetricUnit::kCount,
@@ -310,6 +315,10 @@ arrow::Status JoinBuild::BuildTable(ExecContext& ctx) {
 
 bool EmitsBuildRows(plan::JoinKind kind, plan::BuildSide side) {
   return kind != plan::JoinKind::kInner && side == plan::BuildSide::kLeft;
+}
+
+bool EmitsUnmatchedBuildRows(plan::JoinKind kind, plan::BuildSide side) {
+  return EmitsBuildRows(kind, side) && kind != plan::JoinKind::kSemi;
 }
 
 bool EmptiesJoin(plan::JoinKind kind, const JoinTable& table) {
@@ -389,6 +398,7 @@ PartRightJoinOperator::PartRightJoinOperator(PartPipeline pipeline, int64_t num_
       schema_(std::move(schema)),
       build_(std::move(build)) {
   ANTB1_CHECK(build_ != nullptr);
+  unmatched_ = EmitsUnmatchedBuildRows(build_->kind(), plan::BuildSide::kLeft);
 }
 
 PartRightJoinOperator::~PartRightJoinOperator() = default;
@@ -459,15 +469,18 @@ arrow::Result<std::optional<Batch>> PartRightJoinOperator::NextMarked() {
   while (position_ < num_rows && std::cmp_less(rows_.size(), batch_size_)) {
     const auto at = static_cast<std::uint32_t>(position_);
     ++position_;
-    if (marks->marked(at)) {
+    if (marks->marked(at) != unmatched_) {
       rows_.push_back(table->rows()[at]);
     }
   }
   if (rows_.empty()) {
-    return std::nullopt;  // position_ reached the last build row
+    // The keyed rows are done. A join that emits unmatched rows then emits the retained NULL-key
+    // ones, every one of which is unmatched; the two never share a batch, since these are slices of
+    // their own batches and a JoinRowRef addresses chunks() alone.
+    return unmatched_ ? NextNullKeyed(*table) : arrow::Result<std::optional<Batch>>(std::nullopt);
   }
   if (profile() != nullptr) {
-    profile()->Add("marked", MetricUnit::kCount, static_cast<int64_t>(rows_.size()));
+    profile()->Add("emitted", MetricUnit::kCount, static_cast<int64_t>(rows_.size()));
   }
   const ProfileTimer gather(profile(), "gather");
   const auto rows = static_cast<int64_t>(rows_.size());
@@ -484,10 +497,36 @@ arrow::Result<std::optional<Batch>> PartRightJoinOperator::NextMarked() {
                .selection = {}};
 }
 
+arrow::Result<std::optional<Batch>> PartRightJoinOperator::NextNullKeyed(const JoinTable& table) {
+  const std::vector<std::shared_ptr<arrow::RecordBatch>>& chunks = table.null_chunks();
+  while (null_chunk_ < chunks.size()) {
+    const std::shared_ptr<arrow::RecordBatch>& chunk = chunks[null_chunk_];
+    const int64_t left = chunk->num_rows() - null_row_;
+    if (left <= 0) {
+      ++null_chunk_;
+      null_row_ = 0;
+      continue;
+    }
+    const int64_t rows = std::min(left, batch_size_);
+    const std::shared_ptr<arrow::RecordBatch> slice = chunk->Slice(null_row_, rows);
+    null_row_ += rows;
+    if (profile() != nullptr) {
+      profile()->Add("emitted", MetricUnit::kCount, rows);
+    }
+    // The slice's own schema is the build input's; the output carries this operator's, whose key
+    // fields are nullable because of exactly these rows. The columns are the same arrays: no copy.
+    return Batch{.data = arrow::RecordBatch::Make(schema_, rows, slice->columns()),
+                 .selection = {}};
+  }
+  return std::nullopt;
+}
+
 arrow::Status PartRightJoinOperator::Close() {
   scheduler_.reset();  // stops the parts still running and waits for them
   rows_.clear();
   position_ = 0;
+  null_chunk_ = 0;
+  null_row_ = 0;
   probed_ = false;
   ended_ = false;
   return arrow::Status::OK();
@@ -503,13 +542,22 @@ arrow::Result<std::unique_ptr<HashJoinOperator>> HashJoinOperator::Make(
   const std::string_view kind_name = plan::ToString(kind);
   const JoinBuildSpec& spec = *build->spec();
   const bool emits_build = EmitsBuildRows(kind, build_side);
-  if (emits_build && kind != plan::JoinKind::kSemi) {
-    // The plan is legal and the planner may express it; the operator cannot run it yet. An anti or
-    // a left outer join that builds on the side it preserves must emit the build rows that did not
-    // match, and a build discards its NULL-key rows, which are unmatched by definition -- so those
-    // two need the build to keep them first. That is ADR 0026's C2c; semi is C2b and runs.
+  const bool emits_unmatched = EmitsUnmatchedBuildRows(kind, build_side);
+  if (emits_build && kind != plan::JoinKind::kSemi && kind != plan::JoinKind::kAnti) {
+    // The plan is legal and the planner may express it; the operator cannot run it yet. A
+    // null-aware anti join would have to suppress every row once any probe key is NULL, and a left
+    // outer join emits matched pairs during the probe as well as padded rows after it -- neither
+    // of which this operator does. Semi is ADR 0026's C2b, anti its C2c.
     return arrow::Status::Invalid("a ", kind_name,
                                   " hash join that builds on its left input is not implemented");
+  }
+  if (emits_unmatched && !spec.keep_null_keys()) {
+    // It must emit the build rows that did not match, and a row whose key is NULL is one of them,
+    // so a build that left those behind cannot answer. The planner decides both from
+    // EmitsUnmatchedBuildRows; this is what makes a path that forgets one of them fail loudly
+    // rather than lose rows.
+    return arrow::Status::Invalid("a ", kind_name,
+                                  " hash join over a build that did not keep its NULL keys");
   }
   if ((kind == plan::JoinKind::kOneRow) != spec.keys().empty()) {
     return arrow::Status::Invalid("a ", kind_name, " hash join over a build ",
@@ -546,7 +594,16 @@ arrow::Result<std::unique_ptr<HashJoinOperator>> HashJoinOperator::Make(
   // A join that emits its build rows outputs the build's own schema object, for the same reason the
   // pass-through kinds output the probe's: a build above it takes the object as it is.
   std::shared_ptr<arrow::Schema> schema;
-  if (emits_build) {
+  if (emits_unmatched) {
+    // Its tail emits the rows whose keys are NULL, so those columns really can carry one even where
+    // the build input's field says they cannot. Every other column keeps the input's nullability.
+    arrow::FieldVector fields = spec.schema()->fields();
+    for (const plan::BoundColumn& key : spec.keys()) {
+      fields[static_cast<std::size_t>(key.index)] =
+          fields[static_cast<std::size_t>(key.index)]->WithNullable(true);
+    }
+    schema = arrow::schema(std::move(fields));
+  } else if (emits_build) {
     schema = spec.schema();
   } else if (pass_through) {
     schema = probe->output_schema();
@@ -662,6 +719,14 @@ arrow::Status HashJoinOperator::Start() {
   }
   if (EmptiesJoin(kind_, *table_)) {
     End();  // no row can come out: the input is never opened
+    return arrow::Status::OK();
+  }
+  if (emits_build_ && kind_ != plan::JoinKind::kSemi && table_->num_rows() == 0) {
+    // No mark can be set, so the probe cannot change which build rows come out: all of them do.
+    // End() leaves the input unopened, as EmptiesJoin does for the mirrored kinds, and the sink
+    // still emits the retained NULL-key rows. It also keeps Keep::kAll off this path, where Pull
+    // never fits matches_ and both of MarkMatches' branches read it.
+    End();
     return arrow::Status::OK();
   }
   if (emits_build_) {

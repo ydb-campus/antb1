@@ -875,10 +875,15 @@ TEST(OptimizerTest, Path1BuildsOnTheOuterSideOfASemiJoinOverAMuchLargerSubquery)
   EXPECT_EQ(side(JoinKind::kSemi, 10, 100), BuildSide::kRight) << "a tie keeps the subquery";
   // The subquery being smaller never moves the build: there is nothing to win.
   EXPECT_EQ(side(JoinKind::kSemi, 1, kBuildSideRatio), BuildSide::kRight);
-  // And an anti join never moves, however lopsided it is.
-  for (const int64_t inner : {1, 41, 4000}) {
-    EXPECT_EQ(side(JoinKind::kAnti, inner, kBuildSideRatio), BuildSide::kRight) << inner;
-  }
+  // An anti join moves by the same rule (ADR 0026's C2c): a correlated NOT EXISTS over a much
+  // larger subquery built the whole of it to probe it with far fewer rows, exactly as EXISTS did.
+  EXPECT_EQ(side(JoinKind::kAnti, 40, kBuildSideRatio), BuildSide::kRight);
+  EXPECT_EQ(side(JoinKind::kAnti, 41, kBuildSideRatio), BuildSide::kLeft);
+  EXPECT_EQ(side(JoinKind::kAnti, 4000, kBuildSideRatio), BuildSide::kLeft);
+  EXPECT_EQ(side(JoinKind::kAnti, 1, kBuildSideRatio), BuildSide::kRight);
+  // A null-aware anti join never reaches this rule at all: the pass admits only semi, anti and
+  // one-row kinds and refuses a correlated NOT IN outright, so where it still may not build on its
+  // left input is HashJoinOperator::Make (exec.HashJoinTest.MisuseIsInvalid).
 }
 
 // The pull-up: the block's conjunct becomes the join's key, the dependent join becomes a semi or

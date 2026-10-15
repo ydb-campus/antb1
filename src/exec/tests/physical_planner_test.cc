@@ -601,7 +601,77 @@ std::vector<Placement> Placements(const plan::LogicalNodePtr& join, std::size_t 
 // emits them once no part of its probe pipeline runs any more -- so it is the sink of that
 // pipeline (PartRightJoinOperator) rather than a node inside one. The rows it keeps must be the
 // rows the other direction keeps: the direction is a performance choice, never a semantic one.
-TEST_F(PhysicalPlannerTest, SemiJoinsBuildingOnTheirLeftInputKeepTheSameRows) {
+// Two shapes a semi join never meets, because it emits only matched rows: a preserved side whose
+// keys are all NULL, where every row is unmatched and the probe cannot change that, and a probe
+// that yields no row at all, where the whole preserved side comes out. Both are ADR 0026's C2c.
+TEST_F(PhysicalPlannerTest, AnAntiJoinOnItsLeftInputOverNullKeysAndAnEmptyProbe) {
+  const auto table = Table(/*split=*/true);
+  const auto scan = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}});
+  const auto x = Column(0, "x", LogicalType::kBigInt);
+  const auto y = Column(1, "y", LogicalType::kBigInt);
+  // A relation whose key column is entirely NULL, over two parts, so the preserved side has no key
+  // at all and every one of its rows is unmatched whatever the probe holds.
+  const auto nulls = [] {
+    const auto schema =
+        arrow::schema({arrow::field("x", arrow::int64()), arrow::field("y", arrow::int64())});
+    arrow::RecordBatchVector batches;
+    const std::optional<int64_t> null;
+    batches.push_back(arrow::RecordBatch::Make(schema, 2, {Int64s({0, 1}), Int64s({null, null})}));
+    batches.push_back(arrow::RecordBatch::Make(schema, 2, {Int64s({2, 3}), Int64s({null, null})}));
+    return std::make_shared<MemoryTable>(schema, std::move(batches), /*split=*/true);
+  }();
+  const auto null_keys = Node(plan::ScanNode{.table = nulls, .table_name = "n", .fields = {0, 1}});
+  // A probe that yields no row: kFalse keeps none, whatever the data.
+  const auto no_row = Node(plan::FilterNode{
+      .input = scan, .predicates = {plan::Predicate{.kind = plan::Predicate::Kind::kFalse}}});
+  using Values = std::vector<std::optional<int64_t>>;
+  const auto join_of = [&](plan::JoinKind kind, const plan::LogicalNodePtr& left,
+                           const plan::LogicalNodePtr& right) {
+    return Node(plan::JoinNode{.kind = kind,
+                               .left = left,
+                               .right = right,
+                               .keys = {plan::JoinKey{.left = y, .right = y}},
+                               .residual = {},
+                               .build = plan::BuildSide::kLeft,
+                               .span = {}});
+  };
+  const auto sorted = [](const std::shared_ptr<arrow::Table>& rows) {
+    Values xs = Int64Column(*rows, 0);
+    std::ranges::sort(xs);
+    return xs;
+  };
+  for (const int64_t batch_size : {1, 64}) {
+    SCOPED_TRACE(batch_size);
+    // Every preserved row's key is NULL: an anti join keeps all four, a semi join none. The whole
+    // answer comes out of the retained rows, which no mark can ever reach.
+    const auto all_null =
+        Run(PlanOf(join_of(plan::JoinKind::kAnti, null_keys, scan), 2), batch_size);
+    ASSERT_NE(all_null, nullptr);
+    EXPECT_EQ(sorted(all_null), (Values{0, 1, 2, 3}));
+    const auto none = Run(PlanOf(join_of(plan::JoinKind::kSemi, null_keys, scan), 2), batch_size);
+    ASSERT_NE(none, nullptr);
+    EXPECT_EQ(sorted(none), Values{});
+    // A probe that yields no row marks nothing, so an anti join keeps every preserved row -- here
+    // the six whose key is not NULL, since a NULL key is kept too but by the other store.
+    const auto empty_probe =
+        Run(PlanOf(join_of(plan::JoinKind::kAnti, scan, no_row), 2), batch_size);
+    ASSERT_NE(empty_probe, nullptr);
+    EXPECT_EQ(sorted(empty_probe), (Values{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}));
+  }
+  // The probe of a build with no key is never opened: nothing it could yield changes the answer,
+  // so its scan reads no row at all.
+  ProfileNode root;
+  ASSERT_TRUE(
+      BuildPhysicalPlan(PlanOf(join_of(plan::JoinKind::kAnti, null_keys, scan), 2), &root).ok());
+  ExecContext ctx{.pool = arrow::default_memory_pool(), .batch_size = 3};
+  const arrow::Result<std::shared_ptr<arrow::Table>> rows = Drain(
+      **BuildPhysicalPlan(PlanOf(join_of(plan::JoinKind::kAnti, null_keys, scan), 2), &root), ctx);
+  ASSERT_TRUE(rows.ok()) << rows.status().ToString();
+  ASSERT_EQ(root.children().size(), 2U) << "the probe pipeline, then the build";
+  EXPECT_EQ(root.children()[0]->rows(), 0) << "the probe never ran";
+}
+
+TEST_F(PhysicalPlannerTest, JoinsBuildingOnTheirLeftInputKeepTheSameRows) {
   const auto table = Table(/*split=*/true);
   const auto repeated = Repeated();
   const auto scan = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}});
@@ -635,31 +705,53 @@ TEST_F(PhysicalPlannerTest, SemiJoinsBuildingOnTheirLeftInputKeepTheSameRows) {
     plan::LogicalNodePtr right;
     plan::BoundColumn key;
     plan::ExprPtr residual;
-    Values xs;  // sorted: the two directions agree on the rows, not on the order
+    Values xs;  // a semi join's rows, sorted: the directions agree on those, not on the order
+    Values preserved;  // every row of the side both kinds preserve, sorted
     std::string_view what;
+  };
+  // t holds x = 0..9; r holds 1, 1, 2, 2, 2, 4.
+  const Values all_t = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+  const Values all_r = {1, 1, 2, 2, 2, 4};
+  // An anti join keeps exactly the rows a semi join over the same condition drops, so the two
+  // partition the preserved side: that pins its answer without a second hand-written list, which is
+  // what a NULL key or an unselected row would make easy to get wrong by hand.
+  const auto complement = [](const Values& preserved, const Values& kept) {
+    Values out = preserved;
+    for (const std::optional<int64_t>& row : kept) {
+      const auto at = std::ranges::find(out, row);
+      EXPECT_NE(at, out.end()) << "a semi join kept a row its input does not hold";
+      if (at != out.end()) {
+        out.erase(at);
+      }
+    }
+    return out;
   };
   for (const Case& c :
        {Case{.left = scan,
              .right = scan,
              .key = x,
              .xs = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9},
+             .preserved = all_t,
              .what = "t on x"},
         Case{.left = scan,
              .right = scan,
              .key = y,
              .xs = {1, 2, 4, 5, 7, 8},
+             .preserved = all_t,
              .what = "t on y, whose NULLs match nothing"},
         Case{.left = scan,
              .right = scan,
              .key = x,
              .residual = y_over_x,
              .xs = {1, 2, 4, 5, 7, 8},
+             .preserved = all_t,
              .what = "t on x, y > x"},
         Case{.left = scan,
              .right = scan,
              .key = y,
              .residual = y_over_x,
              .xs = {1, 2, 4, 5, 7, 8},
+             .preserved = all_t,
              .what = "t on y, y > x"},
         // Nothing passes, so nothing is marked: the sink emits no row at all.
         Case{.left = scan,
@@ -667,6 +759,7 @@ TEST_F(PhysicalPlannerTest, SemiJoinsBuildingOnTheirLeftInputKeepTheSameRows) {
              .key = x,
              .residual = x_over_y,
              .xs = {},
+             .preserved = all_t,
              .what = "t on x, x > y"},
         // The build's keys repeat, so one probe row marks several build rows (the 1:N path) and
         // the marked rows are not a prefix of the build.
@@ -674,12 +767,14 @@ TEST_F(PhysicalPlannerTest, SemiJoinsBuildingOnTheirLeftInputKeepTheSameRows) {
              .right = scan,
              .key = x,
              .xs = {1, 1, 2, 2, 2, 4},
+             .preserved = all_r,
              .what = "repeated keys on the left"},
         Case{.left = dups,
              .right = scan,
              .key = x,
              .residual = y_over_x,
              .xs = {1, 1, 2, 2, 2, 4},
+             .preserved = all_r,
              .what = "repeated keys on the left, y > x"},
         // The probe's keys repeat, so several probe rows mark the same build row: a mark has to be
         // idempotent, which an OR is and a count would not be.
@@ -687,6 +782,7 @@ TEST_F(PhysicalPlannerTest, SemiJoinsBuildingOnTheirLeftInputKeepTheSameRows) {
              .right = dups,
              .key = x,
              .xs = {1, 2, 4},
+             .preserved = all_t,
              .what = "repeated keys on the right"},
         // The right input's y is negative here, so no pair passes; read off the wrong side the
         // residual would be the left input's y over the right input's x, and every pair would.
@@ -695,10 +791,11 @@ TEST_F(PhysicalPlannerTest, SemiJoinsBuildingOnTheirLeftInputKeepTheSameRows) {
              .key = x,
              .residual = y_over_x,
              .xs = {},
+             .preserved = all_t,
              .what = "repeated keys on the right, y > x"}}) {
     SCOPED_TRACE(c.what);
-    const auto join_of = [&](plan::BuildSide build) {
-      return Node(plan::JoinNode{.kind = plan::JoinKind::kSemi,
+    const auto join_of = [&](plan::JoinKind kind, plan::BuildSide build) {
+      return Node(plan::JoinNode{.kind = kind,
                                  .left = c.left,
                                  .right = c.right,
                                  .keys = {plan::JoinKey{.left = c.key, .right = c.key}},
@@ -726,8 +823,8 @@ TEST_F(PhysicalPlannerTest, SemiJoinsBuildingOnTheirLeftInputKeepTheSameRows) {
       for (const int64_t batch_size : {1, 3, 64}) {
         SCOPED_TRACE(std::string(executor == nullptr ? "serial" : "pooled") +
                      " batch_size=" + std::to_string(batch_size));
-        const auto drain = [&](plan::BuildSide build) {
-          auto op = BuildPhysicalPlan(PlanOf(join_of(build), 2));
+        const auto drain = [&](plan::JoinKind kind, plan::BuildSide build) {
+          auto op = BuildPhysicalPlan(PlanOf(join_of(kind, build), 2));
           EXPECT_TRUE(op.ok()) << op.status().ToString();
           if (!op.ok()) {
             return std::shared_ptr<arrow::Table>{};
@@ -740,13 +837,24 @@ TEST_F(PhysicalPlannerTest, SemiJoinsBuildingOnTheirLeftInputKeepTheSameRows) {
           EXPECT_TRUE(drained.ok()) << drained.status().ToString();
           return drained.ok() ? *drained : std::shared_ptr<arrow::Table>{};
         };
-        const auto right = drain(plan::BuildSide::kRight);
-        const auto left = drain(plan::BuildSide::kLeft);
-        ASSERT_NE(right, nullptr);
-        ASSERT_NE(left, nullptr);
-        EXPECT_EQ(sorted(right), c.xs);
-        EXPECT_EQ(sorted(left), c.xs);
-        EXPECT_EQ(left->schema()->field(0)->name(), right->schema()->field(0)->name());
+        // A semi join emits the rows the marks selected, an anti join those they did not plus the
+        // build rows whose keys are NULL, which no mark can reach. Both directions of both kinds
+        // must agree, and the two kinds must partition the side they preserve.
+        const auto semi_right = drain(plan::JoinKind::kSemi, plan::BuildSide::kRight);
+        const auto semi_left = drain(plan::JoinKind::kSemi, plan::BuildSide::kLeft);
+        const auto anti_right = drain(plan::JoinKind::kAnti, plan::BuildSide::kRight);
+        const auto anti_left = drain(plan::JoinKind::kAnti, plan::BuildSide::kLeft);
+        ASSERT_NE(semi_right, nullptr);
+        ASSERT_NE(semi_left, nullptr);
+        ASSERT_NE(anti_right, nullptr);
+        ASSERT_NE(anti_left, nullptr);
+        EXPECT_EQ(sorted(semi_right), c.xs);
+        EXPECT_EQ(sorted(semi_left), c.xs);
+        const Values rest = complement(c.preserved, c.xs);
+        EXPECT_EQ(sorted(anti_right), rest);
+        EXPECT_EQ(sorted(anti_left), rest);
+        EXPECT_EQ(semi_left->schema()->field(0)->name(), semi_right->schema()->field(0)->name());
+        EXPECT_EQ(anti_left->schema()->field(0)->name(), anti_right->schema()->field(0)->name());
       }
     }
     // Every place a join can sit, for the new direction: the matrix exists because a join that
@@ -763,7 +871,8 @@ TEST_F(PhysicalPlannerTest, SemiJoinsBuildingOnTheirLeftInputKeepTheSameRows) {
     // int64_t is that type and GCC's -Wuseless-cast fires, while on Darwin int64_t is `long long`
     // and a cast would be needed. Letting the initialisation convert is right on both.
     const int64_t groups = std::ranges::unique(keys).begin() - keys.begin();
-    for (const Placement& placement : Placements(join_of(plan::BuildSide::kLeft), 2, scan)) {
+    for (const Placement& placement :
+         Placements(join_of(plan::JoinKind::kSemi, plan::BuildSide::kLeft), 2, scan)) {
       int64_t expected = n;
       if (placement.rows == Expect::kOne) {
         expected = 1;
@@ -788,26 +897,32 @@ TEST_F(PhysicalPlannerTest, SemiJoinsBuildingOnTheirLeftInputKeepTheSameRows) {
     // A re-run of one operator: Drain opens, drains and closes, so twice over the same operator is
     // the (re)run Operator::Open documents. Open makes the marks afresh, so a bit the first run set
     // cannot carry into the second, and the position the sink emits from starts over.
-    auto op = BuildPhysicalPlan(PlanOf(join_of(plan::BuildSide::kLeft), 2));
+    auto op = BuildPhysicalPlan(PlanOf(join_of(plan::JoinKind::kAnti, plan::BuildSide::kLeft), 2));
     ASSERT_TRUE(op.ok()) << op.status().ToString();
+    const Values rerun = complement(c.preserved, c.xs);
     for (int run = 0; run < 2; ++run) {
       ExecContext ctx{.pool = arrow::default_memory_pool(), .batch_size = 3};
       const arrow::Result<std::shared_ptr<arrow::Table>> again = Drain(**op, ctx);
       ASSERT_TRUE(again.ok()) << again.status().ToString();
-      EXPECT_EQ(sorted(*again), c.xs) << "run " << run;
+      EXPECT_EQ(sorted(*again), rerun) << "run " << run;
     }
-    // The plan really is the new shape: without this the case would pass on a planner that
-    // quietly kept building on the right.
-    ProfileNode root;
-    ASSERT_TRUE(BuildPhysicalPlan(PlanOf(join_of(plan::BuildSide::kLeft), 2), &root).ok());
-    std::string names;
-    const auto walk = [&names](const ProfileNode& node, auto&& self) -> void {
-      names += node.name() + "/";
-      for (const auto& child : node.children()) {
-        self(*child, self);
-      }
+    // The plan really is the new shape, for both kinds: without this a case would pass on a
+    // planner that quietly kept building on the right.
+    const auto tree_of = [&](plan::JoinKind kind) {
+      ProfileNode root;
+      EXPECT_TRUE(BuildPhysicalPlan(PlanOf(join_of(kind, plan::BuildSide::kLeft), 2), &root).ok());
+      std::string names;
+      const auto walk = [&names](const ProfileNode& node, auto&& self) -> void {
+        names += node.name() + "/";
+        for (const auto& child : node.children()) {
+          self(*child, self);
+        }
+      };
+      walk(root, walk);
+      return names;
     };
-    walk(root, walk);
+    const std::string names = tree_of(plan::JoinKind::kSemi);
+    EXPECT_EQ(tree_of(plan::JoinKind::kAnti), names) << "both kinds take the same operators";
     // The sink on top, its probe pipeline as child 0 and its own build as child 1 -- the build the
     // operator above it prepares before it opens. Without this the case would pass just as well on
     // a planner that quietly kept building on the right.
@@ -1049,12 +1164,12 @@ TEST_F(PhysicalPlannerTest, MalformedJoinsAreInvalidNotUnsupported) {
     };
     const auto y = Column(1, "y", LogicalType::kBigInt);
     const auto boolean = expr(0, LogicalType::kBoolean);
-    // A semi join that builds on its left input runs (ADR 0026's C2b): it is
-    // SemiJoinsBuildingOnTheirLeftInputAreTheSinkOfTheirProbePipeline below, not a malformed plan.
-    for (const plan::JoinKind kind : {plan::JoinKind::kAnti, plan::JoinKind::kNullAwareAnti,
-                                      plan::JoinKind::kOneRow, plan::JoinKind::kLeft}) {
+    // A semi join (ADR 0026's C2b) and an anti join (its C2c) that build on their left input run:
+    // they are the two KeepTheSameRows cases below, not malformed plans.
+    for (const plan::JoinKind kind :
+         {plan::JoinKind::kNullAwareAnti, plan::JoinKind::kOneRow, plan::JoinKind::kLeft}) {
       expect_invalid(kind_of(kind, key(x, x), {}, plan::BuildSide::kLeft),
-                     "a join of another kind than inner or semi that builds on its left input");
+                     "a join that builds on its left input and cannot emit its rows");
     }
     expect_invalid(kind_of(plan::JoinKind::kOneRow, key(x, x), {}), "a one-row join with a key");
     expect_invalid(kind_of(plan::JoinKind::kOneRow, {}, {boolean}),

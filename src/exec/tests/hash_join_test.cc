@@ -307,8 +307,9 @@ std::shared_ptr<MemoryTable> KeyTable(const std::string& prefix, int64_t parts, 
 }
 
 std::shared_ptr<const JoinBuildSpec> SpecOf(std::shared_ptr<arrow::Schema> schema,
-                                            std::vector<plan::BoundColumn> keys) {
-  auto spec = JoinBuildSpec::Make(std::move(schema), std::move(keys));
+                                            std::vector<plan::BoundColumn> keys,
+                                            bool keep_null_keys = false) {
+  auto spec = JoinBuildSpec::Make(std::move(schema), std::move(keys), keep_null_keys);
   EXPECT_TRUE(spec.ok()) << spec.status().ToString();
   return *spec;
 }
@@ -1365,20 +1366,34 @@ TEST_F(HashJoinTest, MisuseIsInvalid) {
       build_schema, {Column(0, "k", LogicalType::kBigInt), Column(1, "v", LogicalType::kBigInt)});
   const plan::ExprPtr residual =
       Condition(plan::CompareOp::kLt, 1, ColumnAt(3, LogicalType::kBigInt));
-  // Building on the left input: an anti, null-aware anti or left outer join must emit the build
-  // rows that did not match, which needs the build to keep its NULL-key rows first (ADR 0026's
-  // C2c, not implemented). A semi join is C2b and runs.
-  for (const plan::JoinKind kind :
-       {plan::JoinKind::kAnti, plan::JoinKind::kNullAwareAnti, plan::JoinKind::kLeft}) {
+  // Building on the left input: a null-aware anti join would have to suppress every row once any
+  // probe key is NULL, and a left outer join emits matched pairs during the probe as well as padded
+  // rows after it -- neither of which this operator does.
+  for (const plan::JoinKind kind : {plan::JoinKind::kNullAwareAnti, plan::JoinKind::kLeft}) {
     EXPECT_TRUE(
         HashJoinOperator::Make(probe(), build_of(kind, keyed), {0}, BuildSide::kLeft, {}, true)
             .status()
             .IsInvalid())
         << plan::ToString(kind);
   }
+  // A semi join runs over this build (ADR 0026's C2b): it emits only matched rows, and a row whose
+  // key is NULL is never one, so it needs none of them kept.
   EXPECT_TRUE(HashJoinOperator::Make(probe(), build_of(plan::JoinKind::kSemi, keyed), {0},
                                      BuildSide::kLeft, {}, true)
                   .ok());
+  // An anti join must emit the rows that did not match, and a NULL key never matches, so it needs a
+  // build that kept them (its C2c). Over one that did not, it is Invalid rather than short of rows.
+  EXPECT_TRUE(HashJoinOperator::Make(probe(), build_of(plan::JoinKind::kAnti, keyed), {0},
+                                     BuildSide::kLeft, {}, true)
+                  .status()
+                  .IsInvalid());
+  {
+    const auto kept_nulls = SpecOf(build_schema, {Column(0, "k", LogicalType::kBigInt)},
+                                   /*keep_null_keys=*/true);
+    EXPECT_TRUE(HashJoinOperator::Make(probe(), build_of(plan::JoinKind::kAnti, kept_nulls), {0},
+                                       BuildSide::kLeft, {}, true)
+                    .ok());
+  }
   for (const plan::JoinKind kind : {plan::JoinKind::kSemi, plan::JoinKind::kLeft}) {
     EXPECT_TRUE(make(probe(), build_of(kind, keyless), {}, {}).IsInvalid());
   }

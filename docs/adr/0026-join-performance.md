@@ -317,9 +317,44 @@ changes.
     `HashJoinOperator::Make` and `plan::ResolvePositions` in lockstep. That went in as the first commit of the same
     PR rather than its own: with the operator still refusing the combination, nothing could exercise the moved
     guard, so splitting it would have shipped a diff no test could reach.
-- **C2c, feat(exec): build-side output for anti and left outer joins.** Right anti and right outer, which
-  additionally need the build to keep its NULL-key rows, since those are unmatched by definition and must be
-  emitted. Unlocks Q21's anti join, Q22 and Q13.
+- **C2c, feat(exec): build-side output for anti joins.** Shipped 2026-10-16 with C3's anti-join rule, as C2b
+  shipped with its semi one and for the same reason: neither moves a query alone. **Plain anti only**, where the
+  ADR had said "anti and left outer" — the measurements do not ask for the other two, and a dated note below
+  defers them.
+  - **A prerequisite that had to ship first**, found while planning this and confirmed on the shipped binary
+    before any of it was written: Q21's anti join **would not have flipped at all**. The unnesting pass rewrites
+    top-down, so the outer of two nested dependent joins is rewritten while its left input still holds the inner
+    one, and `EstimateRows` read a `DependentJoinNode` as unknown — which rule 5 must treat as "never read as
+    small". Q21's `NOT EXISTS` is the outer one, so every bit of C2c's exec work would have been dead weight.
+    C2b's semi only flipped because its `EXISTS` is the inner one, which also means **C2b shipped leaving this on
+    the table**. An estimate now reads through a dependent join to its left input, an upper bound for every kind
+    the pass admits, and `Path1` and `Path2` keep that bound on the join they build. That change moved no TPC-H
+    plan on its own: Q21 is the only one of the 22 with two correlated subqueries at one level.
+  - **Measured at SF 100, best of 2:** Q21's peak memory fell from 18.81 GB to **4.27 GB**, 4.4x, and its anti
+    join's build from every filtered row of the largest relation to the outer side's — 54x fewer rows, the same
+    ratio the semi join gave. Time fell 12.9% at 4 threads (32.87 s to 28.64 s) and 15.1% at 8 (19.11 s to
+    16.22 s); the ratio to DuckDB went from 3.25x to 2.86x. At SF 10 the peak fell from 1.89 GB to 433.81 MB.
+  - **The time win is far smaller than C2b's 3.4x, and the page-cache reading is why.** C2b's win was outsized
+    because 36 GB against this host's 51.5 GB was evicting the cache for a 33 GB dataset; 18.81 GB was no longer
+    doing that, so what is left here is the operator's own work. The same reading predicted this, which is some
+    evidence it is right. The memory is the headline, and it is what makes Q21 safe at a larger scale factor.
+    Thread scaling is now healthy too: 4 to 8 threads buys 1.77x, where before C2b the query ignored threads.
+  - **Two findings from the work.** The retained rows had to go in a store of their own, not in `chunks_`:
+    `JoinTableBuilder::Merge` numbers a `Segment::chunk` by counting pieces, and that numbering must equal
+    `JoinTable::Build`'s push order or every `JoinRowRef` silently addresses the wrong batch, with nothing
+    checking it. And a batch retained before the keyed rows of the same `Append` survived a later failure in that
+    call, so the part was not unchanged and its Arrow buffers stayed charged — caught by a test written because
+    `RunsOutOfMemoryCleanly` cannot see it, since a `MemoryReservation` returns everything in its destructor
+    before that test's assertion runs.
+  - Q21's anti build reaches `DrainInput` rather than a part pipeline, because its build input is the semi join's
+    serial output: the 54x oversizing becomes a drained 707,593 rows, not zero.
+- **C2c's remainder, deferred 2026-10-16: right null-aware anti and right outer.** Not on effort but on the
+  measurements. Q22 (`NOT IN`, a null-aware anti join) is **1.05x** DuckDB and Q13 (`LEFT JOIN`) **1.79x**, so
+  neither has a win to collect, and each costs more than plain anti did: a null-aware anti join must suppress every
+  output row once any probe key is NULL, which needs a flag the probes write and the tail reads, and it must then
+  withhold its own NULL-key rows rather than emit them; a left outer join emits matched pairs *during* the probe as
+  well as padded rows after it, so the sink would carry two emission paths. Until a profile of Q13 or Q22 at SF 100
+  or above asks for them, `HashJoinOperator::Make` refuses both and says so.
 - **C3, feat(plan): choose the build side for semi, anti and outer joins.** C1's estimates with C2b's and C2c's
   operators, one kind at a time as each lands. This is where Q21's 36 GB, its 10.8x and its 1.08x thread scaling go,
   and with them Q4, Q22 and Q13. The largest single win of this ADR.
