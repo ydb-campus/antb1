@@ -5175,39 +5175,49 @@ LogicalNodePtr Binder::JoinTree(std::size_t b) {
   if (block.steps.empty()) {
     return RelationNode(block.relations.front());
   }
-  // Per step, the node it produces and the relations below it, ascending. An operand names either
-  // a relation of the block or an earlier step, so both are indexed by the step that made them.
+  // Per step, the node it produces, the relations below it as a set, and the lowest of them. An
+  // operand names either a relation of the block or an earlier step, so all three are indexed by
+  // the step that made them. A set rather than a sorted list: every use here is a membership test,
+  // the union is a word-wise OR, and it is the representation the search itself wants (C5).
   std::vector<LogicalNodePtr> built(block.steps.size());
-  std::vector<std::vector<std::size_t>> below(block.steps.size());
+  std::vector<RelationSet> below(block.steps.size());
+  std::vector<std::size_t> lowest(block.steps.size(), 0);
   const auto node_of = [&](const JoinOperand& operand) {
     return operand.step ? built[operand.index] : RelationNode(block.relations[operand.index]);
   };
   const auto below_of = [&](const JoinOperand& operand) {
-    return operand.step ? below[operand.index] : std::vector<std::size_t>{operand.index};
+    RelationSet out;
+    if (operand.step) {
+      out = below[operand.index];
+    } else {
+      out.set(operand.index);
+    }
+    return out;
+  };
+  const auto lowest_of = [&](const JoinOperand& operand) {
+    return operand.step ? lowest[operand.index] : operand.index;
   };
   for (std::size_t k = 0; k < block.steps.size(); ++k) {
     const JoinStep& step = block.steps[k];
-    const std::vector<std::size_t> left_below = below_of(step.left);
-    const std::vector<std::size_t> right_below = below_of(step.right);
+    const RelationSet left_below = below_of(step.left);
     std::vector<JoinKey> keys;
     for (const std::size_t e : step.edges) {
       // An edge has no orientation: the side whose relation is below the left input is the left
       // key. With a composite input that is no longer "the relation this step adds", which is why
       // each step carries the relations below it (ADR 0026's C5).
       const auto& [a, b_key] = block.edge_keys[e];
-      const bool a_left = std::ranges::binary_search(left_below, a.relation);
+      const bool a_left = left_below.test(a.relation);
       keys.push_back(JoinKey{.left = a_left ? a.column : b_key.column,
                              .right = a_left ? b_key.column : a.column});
     }
-    below[k] = left_below;
-    below[k].insert(below[k].end(), right_below.begin(), right_below.end());
-    std::ranges::sort(below[k]);
+    below[k] = left_below | below_of(step.right);
+    lowest[k] = std::min(lowest_of(step.left), lowest_of(step.right));
     // The residuals every one of whose relations is below this join, which no earlier one could
     // take. Each is taken once, by the lowest step that holds them all.
     std::vector<ExprPtr> residual;
     for (Residual& r : block.residuals) {
       const bool ready = r.expr != nullptr && std::ranges::all_of(r.relations, [&](std::size_t x) {
-                           return std::ranges::binary_search(below[k], x);
+                           return below[k].test(x);
                          });
       if (ready) {
         residual.push_back(std::move(r.expr));
@@ -5216,7 +5226,7 @@ LogicalNodePtr Binder::JoinTree(std::size_t b) {
     }
     // The span names a FROM item of the right input: the first binding of its lowest relation, so
     // that a composite input is named by where it begins. A unit's is its own leftmost binding.
-    const sql::FromItem& item = stmt_.from[FirstBindingOf(block.relations[right_below.front()])];
+    const sql::FromItem& item = stmt_.from[FirstBindingOf(block.relations[lowest_of(step.right)])];
     built[k] = Make(JoinNode{
         .kind = JoinKind::kInner,
         .left = node_of(step.left),

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <bitset>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -37,6 +38,12 @@ struct JoinEdge {
   std::optional<int64_t> a_domain;
   std::optional<int64_t> b_domain;
 };
+
+// A set of a block's relations, by index. The order works in sets because every question it asks is
+// a set question: which relations are below a step, which an edge connects, and -- for the search
+// of ADR 0026's C5 -- whether one set contains another. kMaxRelations bits is 32 bytes, cheap to
+// copy and to union.
+using RelationSet = std::bitset<kMaxRelations>;
 
 // An input of a join step: a relation of the block, or the result of an earlier step. Naming the
 // inputs rather than "the relation this step adds" is what lets an order be something other than a
