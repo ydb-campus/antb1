@@ -144,12 +144,20 @@ a representation change across the engine.
 
 ## Plan
 
-One PR per id. The first stands alone and decides whether the rest is worth doing.
+One PR per id. See S1's dated update: the order below is **S2 then S1**, not as first written.
 
 - **S1, perf(exec): gather VARCHAR by reference in the hash join.** The one site antb1 owns, with the lifetime rule
   enforced where the join retains rows. Measured before and after on the three-table join above and on all 22 at
-  SF 100. **If it does not move `gather` and peak memory materially, this ADR stops here** and the string cost is
-  ADR 0019's to carry.
+  SF 100.
+  - Update (2026-10-15): **S1 cannot stand alone, and the order below is wrong as first written.** In the query this
+    ADR measures, the join's output goes to a `Compute` and then to a `PartGroupAggregate`, whose
+    `arrow::compute::Grouper` rejects view keys — so a view gather would be materialised at the grouper immediately,
+    which *moves* the copy rather than removing it. The four VARCHAR columns are group keys, so every one of the
+    11.46M rows reaches that grouper; there is no selection in between to shrink what is materialised. **S1 has no
+    consumer until S2 gives it one.** S2 is therefore first, and S1's acceptance measurement has to be taken with S2
+    in place. The claim that S1 "stands alone and decides whether the rest is worth doing" was wrong: what decides it
+    is S2 plus S1 together, and the way to find out cheaply is to measure S2's key layout against the same query
+    before building a view gather at all.
 - **S2, perf(exec): the inline-string key layout, inside ADR 0019's own hash table.** Not before it: the key layout
   is a property of that table, and building it against `arrow::compute::Grouper` is not possible — the grouper
   rejects view keys outright.
