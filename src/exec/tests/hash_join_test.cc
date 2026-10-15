@@ -1310,11 +1310,21 @@ TEST_F(HashJoinTest, MisuseIsInvalid) {
       build_schema, {Column(0, "k", LogicalType::kBigInt), Column(1, "v", LogicalType::kBigInt)});
   const plan::ExprPtr residual =
       Condition(plan::CompareOp::kLt, 1, ColumnAt(3, LogicalType::kBigInt));
-  for (const plan::JoinKind kind : {plan::JoinKind::kSemi, plan::JoinKind::kLeft}) {
+  // Building on the left input: an anti, null-aware anti or left outer join must emit the build
+  // rows that did not match, which needs the build to keep its NULL-key rows first (ADR 0026's
+  // C2c, not implemented). A semi join is C2b and runs.
+  for (const plan::JoinKind kind :
+       {plan::JoinKind::kAnti, plan::JoinKind::kNullAwareAnti, plan::JoinKind::kLeft}) {
     EXPECT_TRUE(
         HashJoinOperator::Make(probe(), build_of(kind, keyed), {0}, BuildSide::kLeft, {}, true)
             .status()
-            .IsInvalid());
+            .IsInvalid())
+        << plan::ToString(kind);
+  }
+  EXPECT_TRUE(HashJoinOperator::Make(probe(), build_of(plan::JoinKind::kSemi, keyed), {0},
+                                     BuildSide::kLeft, {}, true)
+                  .ok());
+  for (const plan::JoinKind kind : {plan::JoinKind::kSemi, plan::JoinKind::kLeft}) {
     EXPECT_TRUE(make(probe(), build_of(kind, keyless), {}, {}).IsInvalid());
   }
   EXPECT_TRUE(make(probe(), build_of(plan::JoinKind::kOneRow, keyed), {0}, {}).IsInvalid());

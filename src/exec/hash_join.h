@@ -98,8 +98,17 @@ class JoinBuild {
   // Releases the table, a one-row join's values and the tables of the builds its input probes.
   void Release();
 
+  // Allocates the marks of the table's rows (JoinMarks), every bit clear: the join that emits its
+  // build rows (EmitsBuildRows) calls this once, after a successful Prepare and before any part of
+  // its probe pipeline runs, so that every part's probe finds them. OutOfMemory past the memory
+  // limit, Invalid without a table. Consumer thread only; released with the table.
+  arrow::Status PrepareMarks(ExecContext& ctx);
+
   // The table: nullptr before Prepare, after a failed one and after Release.
   [[nodiscard]] const std::shared_ptr<const JoinTable>& table() const { return table_; }
+  // The marks of the table's rows while it holds them, for the probes to mark into and for the
+  // join to read once they are done; nullptr unless PrepareMarks made them.
+  [[nodiscard]] JoinMarks* marks() const { return marks_.get(); }
   // A one-row join's values, while it holds its table; nullptr for any other kind.
   [[nodiscard]] const std::shared_ptr<const OneRowValues>& values() const { return values_; }
   [[nodiscard]] const std::shared_ptr<const JoinBuildSpec>& spec() const { return spec_; }
@@ -119,7 +128,16 @@ class JoinBuild {
   plan::JoinKind kind_;
   std::shared_ptr<const JoinTable> table_;
   std::shared_ptr<const OneRowValues> values_;
+  std::unique_ptr<JoinMarks> marks_;
 };
+
+// Whether a join of `kind` building on `side` outputs its build's rows rather than its probe's
+// (docs/adr/0026-join-performance.md, C2b and C2c): any kind but inner that builds on its left
+// input, since every kind but inner preserves its left input. Such a join marks the build rows its
+// probe matches and emits the rows the marks select once no part of its probe pipeline runs any
+// more, so it is the sink of that pipeline (PartRightJoinOperator) rather than a node inside it.
+// One function so that the planner, the build and the probe cannot disagree about the direction.
+bool EmitsBuildRows(plan::JoinKind kind, plan::BuildSide side);
 
 // Whether no row can come out of a join of `kind` whose build holds `table`, whatever its probe
 // input holds: an inner or a semi join whose table holds no row. Every other kind reads its probe
@@ -179,6 +197,13 @@ class BuildsFirstOperator final : public Operator {
 //     rows that passed the ones before it, never on others (the selected rows are taken first),
 //     and a row passes when every one is true (NULL is not): a later residual never sees a row an
 //     earlier one dropped, as in a WHERE.
+// - Semi building on its left input, the side it preserves (EmitsBuildRows; ADR 0026's C2b).
+//   Output: the build's own schema object, and no row at all from this operator -- every batch it
+//   returns holds none. It marks the build rows that matched (JoinMarks, the build's, shared by
+//   every part of the probe pipeline) and the join's sink emits the marked rows once no part runs
+//   any more (PartRightJoinOperator). With residuals only the pairs that pass every one mark, the
+//   same pairs a left-sided semi join would have counted as matches, so the two directions keep
+//   the same rows; without residuals every build row of a matching key marks.
 // - Semi, anti and null-aware anti (building on the right). Output: the probe's own schema object;
 //   each window of at most batch_size rows of a probe batch is a slice of it, selected where it
 //   keeps a row, without a selection when it keeps every row, skipped when it keeps none. Semi
@@ -228,8 +253,9 @@ class BuildsFirstOperator final : public Operator {
 // the windows its build columns were gathered for, against the rows it emits).
 class HashJoinOperator final : public Operator {
  public:
-  // The kind is the build's. Invalid without a probe or a build; for a kind other than inner
-  // building on the left; for a one-row join over a build with keys, or any other kind over a
+  // The kind is the build's. Invalid without a probe or a build; for a kind other than inner or
+  // semi building on the left (ADR 0026's C2c, not implemented); for a one-row join over a build
+  // with keys, or any other kind over a
   // keyless one; for a null-aware anti join of other than one key; for residuals on a null-aware
   // anti or a one-row join; for probe keys (columns of the probe's output, one per build key)
   // outside the probe's output or of another type than their build key; and for a residual that is
@@ -278,6 +304,11 @@ class HashJoinOperator final : public Operator {
   arrow::Result<std::optional<Batch>> NextPairs();
   arrow::Result<std::optional<Batch>> NextSelected();
   arrow::Result<std::optional<Batch>> NextOneRow();
+  // A join that emits its build rows: marks the build rows the current probe batch matched, the
+  // whole batch at once, and returns no batch. With residuals it walks the batch's candidate pairs
+  // as EvaluatePairs does and marks the build row of each pair that passes; without them it marks
+  // every candidate of every row, which Find left empty for a row that is not selected.
+  arrow::Result<std::optional<Batch>> MarkMatches();
   arrow::Result<std::optional<Batch>> NextLeftWindow();
   arrow::Result<std::optional<Batch>> NextPadded();
   // The next window of at most `limit` rows of the current probe batch, from window_ on: its first
@@ -335,6 +366,7 @@ class HashJoinOperator final : public Operator {
   // A semi, anti or left join with residuals: the columns they read, the probe's, then the build's,
   // each in order, are the columns of a batch of candidate pairs (pair_schema_), which
   // pair_residual_ (residual_ over those columns) reads. Empty, and nullptr, otherwise.
+  bool emits_build_;             // EmitsBuildRows: it marks the build's rows and emits none
   std::vector<int> pair_probe_;  // columns of the probe's output
   std::vector<int> pair_build_;  // columns of the build's schema
   std::shared_ptr<arrow::Schema> pair_schema_;
@@ -361,10 +393,65 @@ class HashJoinOperator final : public Operator {
   std::vector<JoinRowRef> build_rows_;     // and build rows
   std::vector<std::uint8_t> last_;         // per slot: its row's last candidate
   std::vector<std::uint8_t> passed_;       // per row of batch_: one of its pairs passed
+  // Per slot, its build row's position in JoinTable::rows(), which is what a mark addresses:
+  // build_rows_ holds the JoinRowRef that position resolved to and no reverse map exists, so a
+  // join that emits its build rows keeps the position too. Empty for every other join.
+  std::vector<std::uint32_t> build_positions_;
+  JoinMarks* marks_ = nullptr;  // the build's, while it holds its table; only when emits_build_
   std::vector<std::uint32_t> pair_rows_;   // a batch of pairs' probe rows,
   std::vector<JoinRowRef> pair_builds_;    // build rows
   std::vector<std::uint32_t> pair_slots_;  // and slots (after PassingSlots: those that passed)
   MemoryReservation memory_;               // matches_ and the vectors from probe_rows_ on
+};
+
+// A join that emits its build rows (EmitsBuildRows; ADR 0026's C2b) as the sink of its own probe
+// pipeline: the join is where that pipeline ends, so whatever is above it is serial, as above every
+// other PartSink. Parts run ahead on ExecContext::executor, at most 2 * threads of them at a time;
+// each part's probe marks the build rows it matched and emits no row, so this hands nothing on
+// while they run. Once every part is in, the marks are final and this emits the build rows they
+// select, in JoinTable::rows() order (part order within a partition, so the same rows in the same
+// order for any number of threads), in batches of at most max(ExecContext::batch_size, 1) rows.
+// Output: the build's schema.
+//
+// Its parts are done only once it has emitted the last of those rows, not when its scheduler
+// drains: the marks and the rows it reads belong to the build, which its parts-done callback
+// releases (BuildsFirstOperator). A failed run does not call it.
+//
+// Memory: the marks and the table are the build's; the gathered batches come from
+// ExecContext::pool. Profile: the metrics part_time and wait, as the other sinks', and gather (the
+// build columns of the rows it emits) and marked (the rows the marks selected).
+class PartRightJoinOperator final : public PartSink {
+ public:
+  // `pipeline` is the join's own probe pipeline of `num_parts` parts, whose top is the join's probe
+  // operator; `schema` its output schema (the build's); `build` the join's build, which the
+  // operator above prepares (BuildsFirstOperator) before this one opens.
+  PartRightJoinOperator(PartPipeline pipeline, int64_t num_parts,
+                        std::shared_ptr<arrow::Schema> schema, std::shared_ptr<JoinBuild> build);
+  ~PartRightJoinOperator() override;
+
+  [[nodiscard]] const std::shared_ptr<arrow::Schema>& output_schema() const override {
+    return schema_;
+  }
+  arrow::Status Open(ExecContext& ctx) override;
+  arrow::Result<Batch> Next() override;
+  arrow::Status Close() override;
+
+ private:
+  // The marked build rows from position_ on, at most batch_size_ of them; nothing past the last
+  // build row. Every batch holds rows: it walks on until it finds marked ones or runs out.
+  arrow::Result<std::optional<Batch>> NextMarked();
+
+  std::shared_ptr<const PartPipeline> pipeline_;
+  int64_t num_parts_;
+  std::shared_ptr<arrow::Schema> schema_;
+  std::shared_ptr<JoinBuild> build_;
+  arrow::MemoryPool* pool_ = arrow::default_memory_pool();
+  int64_t batch_size_ = 1;
+  int64_t position_ = 0;  // the next build row to consider emitting
+  bool probed_ = false;   // every part is in: the marks are final and emitting has begun
+  bool ended_ = false;    // the last marked row was handed on (or the run failed)
+  std::vector<JoinRowRef> rows_;  // the refs of a batch's marked rows
+  std::unique_ptr<PartScheduler<bool>> scheduler_;
 };
 
 }  // namespace antb1::exec

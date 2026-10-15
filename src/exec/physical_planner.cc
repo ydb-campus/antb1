@@ -331,6 +331,29 @@ OperatorResult BuildPartUnion(const plan::LogicalNodePtr& node, const plan::Scan
                     parts.builds, slot);
 }
 
+// A join that emits its build rows (EmitsBuildRows; ADR 0026's C2b) as the sink of its own probe
+// pipeline, whose top `node` is the join itself: its parts' probes mark, and it emits the build
+// rows the marks select. The one sink whose own build is among the pipeline's builds -- the
+// operator that prepares them must prepare it before this one opens, which WithBuilds arranges.
+OperatorResult BuildRightJoin(const plan::JoinNode& join, const plan::LogicalNodePtr& node,
+                              const plan::ScanNode& scan, ProfileNode* slot) {
+  if (slot != nullptr) {
+    slot->set_name("RightJoin");
+    slot->set_detail(plan::ExplainNode(plan::LogicalNode(join)));
+  }
+  ARROW_ASSIGN_OR_RAISE(Parts parts, PartsOf(node, scan, slot));
+  const std::shared_ptr<JoinBuild> build =
+      parts.builds == nullptr ? nullptr : parts.builds->Find(&join);
+  if (build == nullptr) {
+    return arrow::Status::Invalid("a join that emits its build rows without its build");
+  }
+  ARROW_ASSIGN_OR_RAISE(auto sample, parts.pipeline(0));  // for the output schema; never opened
+  return WithBuilds(
+      std::make_unique<PartRightJoinOperator>(std::move(parts.pipeline), parts.count,
+                                              sample->output_schema(), build),
+      parts.builds, slot);
+}
+
 // The column every call counts distinctly, when every call is COUNT(DISTINCT) of the same column.
 // A global aggregation of only such calls is planned as a GROUP BY of that column, which merges in
 // parallel (partitioned); other aggregations with COUNT(DISTINCT) run in two levels
@@ -752,6 +775,12 @@ OperatorResult Build(const plan::LogicalNodePtr& node, std::optional<int64_t> pa
   }
   if (!part.has_value()) {
     if (const plan::ScanNode* scan = PipelineScan(node)) {
+      // A join that emits its build rows is the sink of the pipeline it tops, not a node inside
+      // one: it has to see every part's marks before it emits a row.
+      const auto* join = std::get_if<plan::JoinNode>(node.get());
+      if (join != nullptr && EmitsBuildRows(join->kind, join->build)) {
+        return Profiled(BuildRightJoin(*join, node, *scan, slot), node, slot);
+      }
       return Profiled(BuildPartUnion(node, *scan, std::nullopt, slot), node, slot);
     }
   }
