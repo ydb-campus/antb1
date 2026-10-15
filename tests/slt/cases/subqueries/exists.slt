@@ -210,6 +210,65 @@ SELECT COUNT(*) FROM zones WHERE EXISTS (SELECT * FROM trips WHERE tr_pickup = z
 ----
 37
 
+# ---- two correlated subqueries at one level (ADR 0026) ----
+
+# The unnesting pass rewrites top-down, so the second EXISTS is rewritten first, while its outer
+# side still holds the un-rewritten first one. Reading that side's rows as unknown left the outer
+# join building on its subquery however lopsided it was; both levels now build on the outer side.
+query I nosort
+SELECT COUNT(*) FROM zones WHERE EXISTS (SELECT * FROM trips WHERE tr_pickup = zn_id) AND EXISTS (SELECT * FROM trips WHERE tr_dropoff = zn_id)
+----
+40
+
+# With a residual on each level, so both marks come from the pair path rather than the key range.
+query I nosort
+SELECT zn_id FROM zones WHERE EXISTS (SELECT * FROM trips WHERE tr_pickup = zn_id AND tr_fare > zn_radius) AND EXISTS (SELECT * FROM trips WHERE tr_dropoff = zn_id AND tr_fare > zn_radius) ORDER BY zn_id
+----
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+40
+
+# An EXISTS outside a NOT EXISTS: the anti join keeps building on its subquery (ADR 0026's C2c is
+# not in), and the semi join above it reads its rows rather than giving up on them.
+query I nosort
+SELECT COUNT(*) FROM zones WHERE NOT EXISTS (SELECT * FROM trips WHERE tr_pickup = zn_id AND tr_fare > 60) AND EXISTS (SELECT * FROM trips WHERE tr_dropoff = zn_id)
+----
+40
+
 # ---- DuckDB only until the uncorrelated EXISTS gets a PR (ADR 0023) ----
 
 onlyif duckdb

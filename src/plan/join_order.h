@@ -131,7 +131,10 @@ std::optional<int64_t> RelationRows(const Binding& binding);
 // The rows a plan's node outputs, estimated from footer row counts: a Scan's table's, one for an
 // ungrouped Aggregate and a RowCount, its input's for any other single-input node (an upper bound),
 // and a Join's own `estimate`, which the binder kept there because the domains rule 3 divides by
-// are not reachable from a plan node (unknown where nothing estimated it).
+// are not reachable from a plan node (unknown where nothing estimated it). A DependentJoin reads
+// through to its left input, which bounds it for every kind the unnesting pass admits: the outer of
+// two nested dependent joins is rewritten while its left input still holds the inner one, so
+// without that it could not choose a build side at all (ADR 0026).
 std::optional<int64_t> EstimateRows(const LogicalNode& node);
 
 }  // namespace antb1::plan

@@ -298,7 +298,19 @@ TEST(JoinOrderTest, RowsOfRelationsAndSubPlans) {
   EXPECT_EQ(EstimateRows(*scan), std::optional<int64_t>(100));
   EXPECT_EQ(EstimateRows(RowCountNode{.table = table}), std::optional<int64_t>(1));
   EXPECT_EQ(EstimateRows(JoinNode{.left = scan, .right = scan}), std::nullopt);
-  EXPECT_EQ(EstimateRows(DependentJoinNode{.left = scan, .right = scan}), std::nullopt);
+  // A dependent join outputs at most its left input's rows, for every kind the unnesting pass
+  // admits, so it reads through to that side. The pass rewrites top-down, so this is what the outer
+  // of two nested dependent joins has to read to choose a build side at all (ADR 0026).
+  EXPECT_EQ(EstimateRows(DependentJoinNode{.left = scan, .right = scan}),
+            std::optional<int64_t>(100));
+  EXPECT_EQ(EstimateRows(DependentJoinNode{
+                .left = node(DependentJoinNode{.left = scan, .right = scan}), .right = scan}),
+            std::optional<int64_t>(100))
+      << "nested, as the pass meets them";
+  EXPECT_EQ(EstimateRows(DependentJoinNode{.left = node(JoinNode{.left = scan, .right = scan}),
+                                           .right = scan}),
+            std::nullopt)
+      << "a join whose own estimate nothing set stays unknown through it";
 
   const ColumnId count = ids.Next();
   const LogicalNodePtr aggregate =

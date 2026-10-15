@@ -697,16 +697,20 @@ arrow::Result<LogicalNodePtr> Path1(const DependentJoinNode& join, ColumnId& las
   // has, where ADR 0022's rule built the whole of that relation to probe it with far fewer rows.
   // An anti join cannot emit its build rows yet (C2c), so it keeps building on the subquery side
   // whatever the estimates say.
-  const BuildSide build =
-      join.kind == JoinKind::kSemi
-          ? ChooseBuildSide(EstimateRows(*left), EstimateRows(*right), build_side_ratio)
-          : BuildSide::kRight;
+  const std::optional<int64_t> left_rows = EstimateRows(*left);
+  const BuildSide build = join.kind == JoinKind::kSemi
+                              ? ChooseBuildSide(left_rows, EstimateRows(*right), build_side_ratio)
+                              : BuildSide::kRight;
   LogicalNodePtr out = Make(JoinNode{.kind = join.kind,
                                      .left = std::move(left),
                                      .right = std::move(right),
                                      .keys = std::move(keys),
                                      .residual = std::move(residual),
                                      .build = build,
+                                     // A semi or an anti join keeps a subset of its left input, so
+                                     // that is an upper bound: without it every join above this
+                                     // rewrite would read its own left input as unknown.
+                                     .estimate = left_rows,
                                      .span = join.span});
   // Lemma 3.1: the rewrite is legal only when the new join's right input has no free variables
   // left. A bug in the classification above is the only way this fails, and it must not reach
@@ -978,9 +982,12 @@ arrow::Result<LogicalNodePtr> Path2(const DependentJoinNode& join, ColumnId& las
     keys.push_back(JoinKey{.left = std::move(key), .right = std::move(group_key)});
   }
   // Path 2's join is an inner join, so either side may build: the aggregate it puts on the right
-  // is often far larger than the outer rows that probe it (ADR 0026). Its own estimate stays
-  // unknown: the aggregate's groups are not estimated, so nothing better than its input's rows is
-  // available, and an estimate must not claim more than it knows.
+  // is often far larger than the outer rows that probe it (ADR 0026). Its estimate is its left
+  // input's rows: the keys above are exactly the aggregate's group keys, which a group by makes
+  // unique, so each outer row matches at most one group and the join cannot multiply its left
+  // input. That is an upper bound rather than a count of the groups, which nothing estimates --
+  // but leaving it unknown left every join above this rewrite reading its own left input as
+  // unknown, which is what kept a lopsided join building on the wrong side (ADR 0026).
   const std::optional<int64_t> left_rows = EstimateRows(*join.left);
   const std::optional<int64_t> right_rows = EstimateRows(*right);
   LogicalNodePtr out =
@@ -990,6 +997,7 @@ arrow::Result<LogicalNodePtr> Path2(const DependentJoinNode& join, ColumnId& las
                     .keys = std::move(keys),
                     .residual = {},
                     .build = ChooseBuildSide(left_rows, right_rows, build_side_ratio),
+                    .estimate = left_rows,
                     .span = join.span});
   if (!FreeVariables(*std::get<JoinNode>(*out).right).empty()) {
     return arrow::Status::NotImplemented(
