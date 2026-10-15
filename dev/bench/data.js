@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792054391004,
+  "lastUpdate": 1792064569519,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -7992,6 +7992,114 @@ window.BENCHMARK_DATA = {
             "value": 79.08533911111073,
             "unit": "ms/iter",
             "extra": "iterations: 9\ncpu: 79.07159099999994 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f6c8563371dcd4ac18d57e26f4335b6e894c8a0d",
+          "message": "feat(plan): derive the IN lists an OR implies (#144)\n\n## Summary\n\nADR 0022's deferred **\"filters implied by ORs\"**, whose trigger this\nworkload's profiles fire.\n\nQ7's whole selectivity was locked inside a join residual: both nation\nrelations scanned all 25 rows, there was **no\nfilter node at all**, and four joins each carried 182,301,190 rows\nbefore the fifth cut them to 583,512. No estimate\ncan see a two-relation residual, so neither the join order nor C1's\nbuild-side rule could touch it.\n\nWhere every branch of a top-level `OR` bounds one column to literals —\nby `=` or by `IN`, a literal on either side —\nthe union of those literals holds for every row the `OR` keeps, because\na row satisfies some branch and so takes one\nof that branch's values. The rewrite that already factors shared\nconjuncts now also contributes that union, so\n`(a = 'X' AND b = 'Y') OR (a = 'Y' AND b = 'X')` yields `a IN ('X',\n'Y')` and `b IN ('Y', 'X')` beside the `OR`.\n\n**The derived conjunct is redundant by construction** — the `OR` stays\nwhere it is — so it cannot change an answer.\nWhat it changes is the plan: a single-column `IN` is classified like any\nother single-relation conjunct, so it reaches\nthat column's scan and its row-count estimate, where the `OR` is a\nresidual neither can see.\n\nCloses #\n\n## Measured, SF 100, 4 threads, best of 2\n\n| query | before | after | change | vs DuckDB |\n|---|---:|---:|---:|---|\n| Q7 | 18.89s | **13.74s** | **−27.2%** | 4.81x → **4.08x** |\n| Q19 | 12.03s | **9.86s** | **−18.0%** | 3.77x → **3.13x** |\n\nBoth are outside the ±15.8% band DuckDB's own unchanged binary set\nacross the same pair of runs, and **nothing\nregresses beyond it**. Attribution is checked rather than assumed:\ndiffing the saved plans shows **only Q7's and\nQ19's changed** out of the 22, which is what makes the other twenty's\nmovements noise rather than hidden regressions.\nGeomean 8.480s → 8.306s, the 22-query ratio 3.08x → 3.03x.\n\nQ19 was an unexpected second winner: it gains **two** derived lists on\n`part` — `p_brand IN ('Brand#12', 'Brand#23',\n'Brand#34')` and `p_container IN ('SM CASE', 'SM BOX', …)`, each a union\nacross its three branches — where before\nonly the shared conjuncts reached that scan.\n\n## It narrows divergence D16\n\nA derived conjunct that reaches a scan takes rows away from the\nconditions above it. Three cases in\n`or_factoring.slt` used to raise `Overflow in multiplication/addition of\nSMALLINT` because an unfiltered row reached\nthe arithmetic; the derived `id IN (6, 11)` now filters first, so they\nanswer.\n\n**They agree with DuckDB, which answered them all along** — I checked\neach against DuckDB directly (2, 2, 0). Their\n`onlyif antb1` guards existed precisely because antb1 errored where\nDuckDB answered, so those guards are gone and the\ncases are ordinary two-engine ones now. That is a divergence narrowing,\nnot a new one, and `docs/sql-subset.md`\nrecords both the derivation and the narrowing in D16's row.\n\nI raised this before changing it, since it is a semantics change in\ndivergence territory, and shipping it was agreed.\n\n## What it refuses to derive\n\nSoundness needs *every* branch to bound the column, so the negative\ncases are tested as carefully as the positive\nones: a branch that leaves the column free; a bound by range, `<>`, `NOT\nIN` or another column; literals of different\nkinds across branches (the `IN` would be a bind error on a query that\nbinds today); and a single value for every\nbranch, which is the existing shared-conjunct path.\n\nThe rewrite also stays **idempotent**. A derived conjunct re-parses as\nan element of its own, which the element it\ncame from cannot see, so it was being derived twice — found by the\nexisting `IsIdempotent` test. Fixed by giving the\nrewrite the conjuncts of the whole predicate (the existing\n`Conjuncts(predicate)` overload) rather than of one\nelement.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [x] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [x] Breaking change (semantics): three queries that raised an overflow\nnow answer. Strictly toward DuckDB's\nbehaviour, and D16 already covered the class; flagging it rather than\nburying it.\n\n## Verification\n\n```text\n$ pixi run test\n100% tests passed out of 2701\n\n$ pixi run diff-random            # and seed 42424\nDIFF: PASS seed=31337 queries=2000 failed=0 unsupported=0\nDIFF: PASS seed=42424 queries=2000 failed=0 unsupported=0\n\n$ clang-tidy -p build/tidy --warnings-as-errors='*' <each of the four changed .cc files>\n(no findings)\n\n$ pixi run lint\nclang-format / gersemi / markdownlint / typos / check_repo.py ... Passed\n```\n\n4000 random queries against the DuckDB oracle with no answer mismatch —\nthe test that matters for a rewrite that\nmust be answer-preserving. Two new test cases cover the derivation and\nits refusals; eight existing expectations were\nupdated because the derived conjunct is genuinely new output, each\nverified sound by hand before being changed.\n\n`pixi run lint` exits non-zero for the pre-existing\n`tools/github/apply-settings.sh` shellcheck findings, a protected\npath this diff does not touch. `pixi run check-full` cannot complete on\nthis osx-arm64 host (`ci-gcc` is linux-64\nonly).\n\n## Checklist\n\n- [ ] `pixi run check` passes locally — `ci` passes; `lint` blocked by\nthe pre-existing shellcheck above\n- [x] Tests cover the change (positive and negative derivation cases,\nthe idempotence fix, and the three slt cases\n      now checked against both engines)\n- [x] Docs updated: `docs/sql-subset.md`'s OR-factoring section and\nD16's row\n- [x] No ClickBench-derived data is committed\n- [x] Nothing derived from TPC-H is committed: query numbers, timings\nand ratios only\n- [x] Changes to governance paths were agreed with a maintainer —\n**`tests/slt/cases/` is not protected, but three\n`onlyif antb1` expectations change and D16's documented behaviour\nnarrows; that was agreed before writing and\n      wants your sign-off on the diff**\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5) found\nthat Q7's selectivity was unreachable by any\nestimate, implemented the derivation, and measured it. It also found its\nown two defects along the way — the\nidempotence break, caught by the existing test, and the error-behaviour\nchange, caught by the slt suite — and\nchecked the three affected cases against DuckDB before proposing how to\nresolve them.\n- Accountable human (has read and understands the whole diff): @hor911\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-15T14:39:19+03:00",
+          "tree_id": "42d6423cd0f6e15d18d0ab7369ff1ecf7d57aa68",
+          "url": "https://github.com/ydb-campus/antb1/commit/f6c8563371dcd4ac18d57e26f4335b6e894c8a0d"
+        },
+        "date": 1792064568992,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4982.772898967971,
+            "unit": "ns/iter",
+            "extra": "iterations: 142430\ncpu: 4980.36117390999 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84838.6569158981,
+            "unit": "ns/iter",
+            "extra": "iterations: 7931\ncpu: 84794.93128230992 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222305.3322734467,
+            "unit": "ns/iter",
+            "extra": "iterations: 3145\ncpu: 222210.64483306836 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 442318.27462120785,
+            "unit": "ns/iter",
+            "extra": "iterations: 1584\ncpu: 442105.26325757586 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 402621.0126436739,
+            "unit": "ns/iter",
+            "extra": "iterations: 1740\ncpu: 402440.82701149414 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2096154.7012195583,
+            "unit": "ns/iter",
+            "extra": "iterations: 328\ncpu: 2095124.292682925 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 51.47170730769255,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 51.468252230769174 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 47.97453953333388,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 47.948716733333306 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 203.06909033333417,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 203.02650366666637 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.865345595744826,
+            "unit": "ms/iter",
+            "extra": "iterations: 47\ncpu: 14.863520446808518 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 23.156950033332652,
+            "unit": "ms/iter",
+            "extra": "iterations: 30\ncpu: 23.15503009999998 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 39.64704088235247,
+            "unit": "ms/iter",
+            "extra": "iterations: 17\ncpu: 39.63984476470592 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.920380863888877,
+            "unit": "ms/iter",
+            "extra": "iterations: 360\ncpu: 1.9202475055555526 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 127.30150479999907,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 127.28072739999979 ms\nthreads: 1"
           }
         ]
       }
