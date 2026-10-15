@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792022567084,
+  "lastUpdate": 1792046672671,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -7776,6 +7776,114 @@ window.BENCHMARK_DATA = {
             "value": 57.5961646153845,
             "unit": "ms/iter",
             "extra": "iterations: 13\ncpu: 57.58205130769234 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "3e8538e45c3f2ff4e2bd500d20f8b6b73b81c00b",
+          "message": "fix(exec): make the join-kind switches exhaustive (#141)\n\n## Summary\n\nADR 0026's **C2a**, and the ADR re-scope that comes with it.\n\nBoth switches on `JoinKind` in `src/exec/hash_join.cc` ended in\n`default:` arms, so neither a new kind nor a new\nbuild-side direction failed to compile. The dangerous one is\n`NextOutput`'s: a right-semi join — which C2b adds —\nwould have fallen into the arm that emits slices of the probe batch,\ni.e. **the left-sided answer**, with no error and\nno assert. Nothing produces that combination today (`ResolvePositions`\nrejects it, `Make` returns `Invalid`), so it\nwas latent. It is also exactly the trap C2b and C2c would walk into,\nwhich is why it is closed before them rather\nthan with them.\n\nBoth arms now list their enumerators. **Verified by adding a temporary\nseventh kind:** before, only the four switches\nin `plan/` warned and the two in `exec/` were silent; afterwards both\nwarn too, which is an error under CI's\n`-Werror`. Behaviour is unchanged — the arms cover exactly what their\ncomments said, and all 72 hash-join and\njoin-table cases pass untouched.\n\nA binder test pins the invariant the switches rely on: no non-inner kind\never gets `BuildSide::kLeft`, across the\nshapes that could produce one — a LEFT JOIN unit, a subquery semi /\nnull-aware anti / one-row join, and the ADR 0023\nunnesting rewrites, each also in the orientation where the preserved\nside is the smaller and an estimate-driven rule\nwould have every reason to flip it. Only an aborting internal check\nstood behind this, and C1 made `BuildSide::kLeft`\nreachable from real SQL, so a later change to join-order rule 5 that\nreached a unit would have crashed in production\nrather than failed a test. **Confirmed by setting `kLeft` on the unit's\njoin: the suite fails with `Join: LEFT join\nbuilds on its left input`.**\n\n**No plan and no answer changes**, so no measurement is claimed.\n\nCloses #\n\n## Why C2 became three items\n\nResearch into the hash join says C2 as ADR 0026 scoped it (\"one PR, no\nplanner change\") is not one PR. The marking is\nthe easy half: a dense build-row index already exists — the position in\n`JoinTable::rows()`, which is exactly what\n`JoinMatches{begin, end}` carries — and `num_rows()` is final before any\nprobe row is read.\n\nThe emitting is the hard half. A right-direction join must emit its\nbuild rows **once**, but the probe runs per part:\na fresh `HashJoinOperator` is made, drained and destroyed per part, up\nto twice the thread count at a time, and\n`End()` already releases the table at the input's end. The only\nall-parts-done signal is `PartSink`'s single\n`parts_done` slot, which `BuildsFirstOperator` already owns in order to\n*release* the build. So emitting at the sink\nis correct only where the join is the last streaming operator of its\nprobe pipeline:\n\n| query | join | above it | sink-level tail |\n|---|---|---|---|\n| Q4 | SEMI | `GroupAggregate` | correct |\n| Q13 | LEFT | `GroupAggregate` | correct, but see NULL keys |\n| Q21 | SEMI | **another ANTI join** | wrong: bypassed |\n| Q22 | ANTI | `Compute`, `Project` | wrong: bypassed |\n\nThe ADR records the three candidates and leaves the choice to C2b,\nbecause the sink-level option buys **memory rather\nthan time** (Q4 and Q13 hold 14.6 GB and 12.6 GB at ratios of only 2.73x\nand 1.85x) while the headline query needs\nthe join to become pipeline-breaking — ADR 0022's separately deferred\n\"one build probed by several pipelines\", which\nturns out to be the same piece of work.\n\nC2b is **semi alone** because `JoinBuildPart::Append` keeps only rows\nwhose keys are not NULL: a NULL-key build row is\n*discarded*, not merely unindexed. Right anti and right outer must emit\nunmatched build rows, and a NULL key is\nunmatched by definition, so those two need the build to keep them — C2c.\nRight semi needs no build change at all,\nsince a NULL-key row never matches and its absence is already correct.\n\nADR 0023 also gets dated notes on two deferrals of its own that this\nresearch fires: *a semi or anti join with a\nresidual keeps every build row (Q21)*, and *an anti join builds on the\nsubquery even where the outer side is smaller\n(Q22), until build-side output gets its ADR* — which named C2c by its\nown name before it existed.\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [x] fix: bug fix (a latent one: a silent wrong answer the next two\nitems would have hit)\n- [ ] perf: performance improvement\n- [x] refactor, test, docs, build, ci or chore\n- [ ] Breaking change\n\n## Verification\n\n```text\n$ pixi run ci            # Clang Debug -Werror + tests\n100% tests passed out of 2695\n\n$ pixi run test\n100% tests passed out of 2695\n\n$ pixi run coverage\nCoverage gate: PASS\n\n$ pixi run diff-random\nDIFF: PASS seed=1484416217 queries=2000 failed=0 unsupported=0\n\n$ clang-tidy -p build/tidy --warnings-as-errors='*' src/exec/hash_join.cc src/plan/tests/binder_test.cc\n(no findings)\n\n$ ASAN_OPTIONS=detect_leaks=0 ./build/ci-asan/bin/antb1_exec_tests --gtest_filter='HashJoin*:JoinTable*'\n[  PASSED  ] 72 tests.\n```\n\n`pixi run check-full` cannot complete on this osx-arm64 host: `ci-gcc`\nis linux-64 only by `pixi.toml`. The\ncompensating runs are above. Two further host-specific gate failures,\nboth pre-existing and both reproduced on `main`\npreviously, not caused by this diff:\n\n- `asan` — LeakSanitizer reports 64 bytes in macOS\n`CFPreferences`/`libdispatch` under `dispatch_apply`, with no\n  antb1 frame in the stack. Hence the `detect_leaks=0` exec run above.\n- `lint` — 34 `SC2218` shellcheck findings in\n`tools/github/apply-settings.sh`, a protected path this diff does not\ntouch. Every hook covering this diff passes (clang-format, gersemi,\nmarkdownlint, typos, check_repo.py).\n\n## Checklist\n\n- [ ] `pixi run check` passes locally — `ci` passes; `lint` is blocked\nby the pre-existing `apply-settings.sh`\n      shellcheck above\n- [x] Tests cover the change (the invariant test, confirmed to fail when\nthe invariant is broken; the 72 existing\nhash-join and join-table cases are what prove the switches changed no\nbehaviour)\n- [x] Docs updated: ADR 0026's C2 re-scope and findings, ADR 0023's two\nfired deferrals\n- [x] No ClickBench-derived data is committed\n- [x] Nothing derived from TPC-H is committed: query numbers, peak\nmemory and ratios only\n- [ ] Changes to governance paths were agreed with a maintainer —\n**`docs/adr/` is CODEOWNERS-protected and this\nedits ADR 0026 and ADR 0023 (which stays `Accepted`); the re-scope into\nC2a/C2b/C2c and deferring the tail's\nlocation to C2b were agreed before writing, but the diff needs your\nsign-off**\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5) ran a\nfive-subsystem read of the hash join to\nestablish what C2 would actually require, found the five obstacles\nrecorded in the ADR, wrote the change and\nthe invariant test, and verified both the exhaustiveness (with a\ntemporary extra kind) and the test (by\n      breaking the invariant on purpose).\n- Accountable human (has read and understands the whole diff): @hor911\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-15T09:41:21+03:00",
+          "tree_id": "083cd97577dfda6fc602ee1753a39d188b465724",
+          "url": "https://github.com/ydb-campus/antb1/commit/3e8538e45c3f2ff4e2bd500d20f8b6b73b81c00b"
+        },
+        "date": 1792046672105,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 5017.149091844581,
+            "unit": "ns/iter",
+            "extra": "iterations: 139954\ncpu: 5016.670698943939 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 85300.47252747224,
+            "unit": "ns/iter",
+            "extra": "iterations: 7826\ncpu: 85291.53079478661 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222171.87770012478,
+            "unit": "ns/iter",
+            "extra": "iterations: 3148\ncpu: 222147.56003811944 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 441493.5235997421,
+            "unit": "ns/iter",
+            "extra": "iterations: 1589\ncpu: 441460.3071113908 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 402378.4443168741,
+            "unit": "ns/iter",
+            "extra": "iterations: 1742\ncpu: 402345.23938002315 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2080596.4161677004,
+            "unit": "ns/iter",
+            "extra": "iterations: 334\ncpu: 2080279.6287425172 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 52.21112800000163,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 52.192346615384594 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 46.73760973333477,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 46.725939800000006 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 188.49563933334443,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 188.46685900000003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.860903425531124,
+            "unit": "ms/iter",
+            "extra": "iterations: 47\ncpu: 14.858503319148964 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 22.882889700000913,
+            "unit": "ms/iter",
+            "extra": "iterations: 30\ncpu: 22.88039926666669 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 40.102364833333894,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 40.095138555555565 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 2.1021415419161165,
+            "unit": "ms/iter",
+            "extra": "iterations: 334\ncpu: 2.1018823443113765 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 91.81151257143127,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 91.79435671428568 ms\nthreads: 1"
           }
         ]
       }
