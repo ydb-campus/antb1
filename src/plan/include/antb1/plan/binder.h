@@ -4,19 +4,10 @@
 
 #include "antb1/plan/catalog.h"
 #include "antb1/plan/logical_plan.h"
+#include "antb1/plan/plan_options.h"
 #include "antb1/sql/ast.h"
 
 namespace antb1::plan {
-
-// What the binder may be told about the plan it should choose, as opposed to what the plan means.
-// Every field has a default that holds for every query, so a caller that has no opinion passes none
-// and gets the same plan the engine would choose for itself.
-struct BindOptions {
-  // How much larger a join's build side must be than the side that probes it before the join builds
-  // on the probe side instead (ADR 0026), in hundredths of a factor: 400, the default, flips only a
-  // decisive difference; 100 is ADR 0022's rule, the smaller side always. Below 100 is invalid.
-  int64_t build_side_ratio = kBuildSideRatio;
-};
 
 // Resolves names and types against the catalog and builds the logical plan (its shape is in
 // logical_plan.h) with every WHERE literal folded exactly into the type of its column

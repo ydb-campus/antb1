@@ -3,6 +3,7 @@
 #include <arrow/result.h>
 
 #include "antb1/plan/logical_plan.h"
+#include "antb1/plan/plan_options.h"
 
 namespace antb1::plan {
 
@@ -30,6 +31,6 @@ namespace antb1::plan {
 // exposes the group's key columns that the dependent join did not. The PLAN's output is unchanged
 // all the same, since the binder always puts a Project or an aggregation above a subquery's join;
 // a hand-built plan whose root is the join itself would see the wider output.
-arrow::Result<LogicalPlan> Optimize(const LogicalPlan& plan);
+arrow::Result<LogicalPlan> Optimize(const LogicalPlan& plan, const BindOptions& options = {});
 
 }  // namespace antb1::plan
