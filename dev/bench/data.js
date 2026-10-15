@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792064569519,
+  "lastUpdate": 1792065800616,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -8100,6 +8100,114 @@ window.BENCHMARK_DATA = {
             "value": 127.30150479999907,
             "unit": "ms/iter",
             "extra": "iterations: 5\ncpu: 127.28072739999979 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "e3c66482c207b1b8f2cce269d948ac1cc188702f",
+          "message": "fix(plan): guard PredicateRows' 128-bit arithmetic (#145)\n\n## Summary\n\nThe **P2 note from #140's review**:\n\n> `PredicateRows` (`src/plan/join_order.cc`, range branch) computes\n`*constant - *range.min` and\n> `*range.max - *constant + 1` without the overflow guard that `span`\nhas. This can only overflow for a 128-bit\n> column, and I found no such column coming from Parquet, so it is not\nreportable today.\n\nCorrect on both counts. Signed overflow is undefined behaviour, and this\nrepo's own rule on `Int128` is to use\n`__builtin_*_overflow` rather than to hope — which `span`, two lines up,\nand `KeyDomain` before it, both already do.\nThe asymmetry was mine, introduced in #140.\n\nThe reviewer's reachability judgement also holds: a constant is typed as\nits column, no Parquet column is 128-bit\n(`Table::part_stats` excludes DECIMAL), and once the span is computable\na constant *inside* the range cannot overflow\nthe subtraction, since the difference is at most the span. **No\nreachable query changes behaviour.**\n\nThe case that *can* overflow is a narrow range with a constant far\noutside it, where `max - constant` runs away, and\na closed bound where the inclusive `+1` then overflows. Both are\nguarded, and an overflow now leaves the predicate to\nits documented default factor rather than to a wrapped value.\n\nThe product in `scaled` had the same exposure — `rows` times a numerator\nas wide as a 128-bit span overflows before\nthe division brings it back — so it is guarded too. Every caller passes\na numerator no larger than its denominator,\nso the true quotient is at most `rows`: keeping every row is the answer\nthat errs toward the plan the relation\nalready had.\n\nCloses #\n\n## The test took three tries, and each failure was mine\n\nWorth recording, because the first two versions would have shipped a\ntest that proved nothing:\n\n1. **The first used the widest possible range** — and the `span` guard\nfires first there, so the subtraction never\nruns. Removing the guard changed no result and the test passed either\nway.\n2. **The second expected `< kInt128Max` to overflow.** It does not: that\ncomputes `constant - min`, which fits, and\ncorrectly admits every value. Only the *closed* `<=` overflows, on the\n`+1`. The guards are asymmetric because the\n   subtrahend differs, and the test now says so in a comment.\n3. **The third is pinned by mutation.** With the guard removed the test\nfails, and UBSan reports both sites:\n\n   ```text\n   join_order.cc:399: runtime error: signed integer overflow:\n10 - 0x80000000000000000000000000000000 cannot be represented in type\n'__int128'\n   join_order.cc:401: runtime error: signed integer overflow:\n0x7fffffffffffffffffffffffffffffff + 1 cannot be represented in type\n'Int128'\n   ```\n\n## Type of change\n\n- [x] fix: bug fix (latent undefined behaviour; no reachable query\nchanges)\n- [ ] feat / perf / refactor / docs\n- [ ] Breaking change\n\n## Verification\n\n```text\n$ pixi run test\n100% tests passed out of 2700\n\n$ clang-tidy -p build/tidy --warnings-as-errors='*' src/plan/join_order.cc src/plan/tests/join_order_test.cc\n(no findings)\n\n$ pixi run lint\nclang-format / markdownlint / typos / check_repo.py ... Passed\n\n$ ASAN_OPTIONS=detect_leaks=0 ./build/ci-asan/bin/antb1_plan_tests --gtest_filter='JoinOrder*'\n[  PASSED  ] 26 tests.          # clean with the guard; both UBSan reports above appear without it\n```\n\nNo benchmark is claimed: the guarded paths are unreachable from a query,\nso this cannot change a plan or a timing.\n\n`pixi run lint` exits non-zero for the pre-existing\n`tools/github/apply-settings.sh` shellcheck findings, a protected\npath this diff does not touch. `pixi run asan`'s 64-byte `libdispatch`\nleak on this host is the known macOS artifact,\nhence the `detect_leaks=0` run above.\n\n## Checklist\n\n- [ ] `pixi run check` passes locally — `ci` passes; `lint` blocked by\nthe pre-existing shellcheck above\n- [x] Tests cover the change (one case per guarded site, pinned by\nmutation against both the test and UBSan)\n- [x] Docs updated — not needed: no documented behaviour changes\n- [x] No ClickBench-derived data is committed\n- [x] Nothing derived from TPC-H is committed\n- [x] Changes to governance paths were agreed with a maintainer — none\ntouched\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5)\nimplemented the guards, and found two defects in its\nown first attempts at the test by checking that the test failed when the\nguard was removed — which it did not,\n      at first, for two different reasons.\n- Accountable human (has read and understands the whole diff): @hor911\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-15T15:00:04+03:00",
+          "tree_id": "c39d834cb3e3629f11e3fa040e2341e2e9a7a5eb",
+          "url": "https://github.com/ydb-campus/antb1/commit/e3c66482c207b1b8f2cce269d948ac1cc188702f"
+        },
+        "date": 1792065799874,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 5064.941132480998,
+            "unit": "ns/iter",
+            "extra": "iterations: 137733\ncpu: 5063.669156992151 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 85111.30472211618,
+            "unit": "ns/iter",
+            "extra": "iterations: 7899\ncpu: 85105.90897581971 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222239.25055573898,
+            "unit": "ns/iter",
+            "extra": "iterations: 3149\ncpu: 222110.40901873616 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 438546.0400751431,
+            "unit": "ns/iter",
+            "extra": "iterations: 1597\ncpu: 438361.3700688792 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 401412.90945559065,
+            "unit": "ns/iter",
+            "extra": "iterations: 1745\ncpu: 401252.3318051576 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2077755.3649851582,
+            "unit": "ns/iter",
+            "extra": "iterations: 337\ncpu: 2076803.7181008905 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 50.55846342857251,
+            "unit": "ms/iter",
+            "extra": "iterations: 14\ncpu: 50.553425999999945 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 46.44910013333288,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 46.44318900000001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 194.2998586666723,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 194.27791299999993 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.794512893616984,
+            "unit": "ms/iter",
+            "extra": "iterations: 47\ncpu: 14.793042936170213 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 22.089498258064705,
+            "unit": "ms/iter",
+            "extra": "iterations: 31\ncpu: 22.08738325806448 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 39.71113927777815,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 39.70581849999998 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.9750176324785984,
+            "unit": "ms/iter",
+            "extra": "iterations: 351\ncpu: 1.9748259886039887 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 120.50383383333478,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 120.49758750000007 ms\nthreads: 1"
           }
         ]
       }
