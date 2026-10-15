@@ -12,6 +12,7 @@
 #include <vector>
 
 #include <arrow/api.h>
+#include <arrow/util/thread_pool.h>
 #include <gtest/gtest.h>
 
 #include "antb1/exec/limit.h"
@@ -714,14 +715,72 @@ TEST_F(PhysicalPlannerTest, SemiJoinsBuildingOnTheirLeftInputKeepTheSameRows) {
       std::ranges::sort(xs);
       return xs;
     };
-    for (const int64_t batch_size : {1, 3, 64}) {
-      const auto right = Run(PlanOf(join_of(plan::BuildSide::kRight), 2), batch_size);
-      const auto left = Run(PlanOf(join_of(plan::BuildSide::kLeft), 2), batch_size);
-      ASSERT_NE(right, nullptr);
-      ASSERT_NE(left, nullptr);
-      EXPECT_EQ(sorted(right), c.xs) << "batch_size=" << batch_size;
-      EXPECT_EQ(sorted(left), c.xs) << "batch_size=" << batch_size;
-      EXPECT_EQ(left->schema()->field(0)->name(), right->schema()->field(0)->name());
+    const auto pool = arrow::internal::ThreadPool::Make(4);
+    ASSERT_TRUE(pool.ok()) << pool.status().ToString();
+    // On the calling thread, then on a pool: with an executor the parts run at once, so several
+    // probe threads mark one bitmap, the scheduler's window applies and a part it reruns marks the
+    // same bits twice. The answer must not notice any of that.
+    for (arrow::internal::Executor* executor :
+         {static_cast<arrow::internal::Executor*>(nullptr),
+          static_cast<arrow::internal::Executor*>(pool->get())}) {
+      for (const int64_t batch_size : {1, 3, 64}) {
+        SCOPED_TRACE(std::string(executor == nullptr ? "serial" : "pooled") +
+                     " batch_size=" + std::to_string(batch_size));
+        const auto drain = [&](plan::BuildSide build) {
+          auto op = BuildPhysicalPlan(PlanOf(join_of(build), 2));
+          EXPECT_TRUE(op.ok()) << op.status().ToString();
+          if (!op.ok()) {
+            return std::shared_ptr<arrow::Table>{};
+          }
+          ExecContext ctx{.pool = arrow::default_memory_pool(),
+                          .batch_size = batch_size,
+                          .executor = executor,
+                          .threads = executor == nullptr ? 1 : 4};
+          auto drained = Drain(**op, ctx);
+          EXPECT_TRUE(drained.ok()) << drained.status().ToString();
+          return drained.ok() ? *drained : std::shared_ptr<arrow::Table>{};
+        };
+        const auto right = drain(plan::BuildSide::kRight);
+        const auto left = drain(plan::BuildSide::kLeft);
+        ASSERT_NE(right, nullptr);
+        ASSERT_NE(left, nullptr);
+        EXPECT_EQ(sorted(right), c.xs);
+        EXPECT_EQ(sorted(left), c.xs);
+        EXPECT_EQ(left->schema()->field(0)->name(), right->schema()->field(0)->name());
+      }
+    }
+    // Every place a join can sit, for the new direction: the matrix exists because a join that
+    // ends its pipeline is reached differently from every node above it, and a LIMIT above it is
+    // the trap -- the per-part row cap belongs to PartUnionOperator, and a join that owns its own
+    // scheduler passes none, so a cap must never be applied to a probe that hands on no row.
+    const auto n = static_cast<int64_t>(c.xs.size());
+    // The repeated-key cases return a key more than once, so a GROUP BY above them has fewer rows
+    // than the join does -- unlike every case of EveryJoinKindRunsEverywhere, whose xs are
+    // distinct.
+    Values keys = c.xs;
+    std::ranges::sort(keys);
+    const auto groups = static_cast<int64_t>(std::ranges::unique(keys).begin() - keys.begin());
+    for (const Placement& placement : Placements(join_of(plan::BuildSide::kLeft), 2, scan)) {
+      int64_t expected = n;
+      if (placement.rows == Expect::kOne) {
+        expected = 1;
+      } else if (placement.rows == Expect::kGroups) {
+        expected = groups;
+      } else if (placement.rows == Expect::kLimit) {
+        expected = std::min<int64_t>(n, 3);
+      }
+      for (const bool profiled : {false, true}) {
+        ProfileNode profile;
+        auto placed = BuildPhysicalPlan(PlanOf(placement.root, placement.width),
+                                        profiled ? &profile : nullptr);
+        ASSERT_TRUE(placed.ok()) << plan::NodeName(*placement.root) << ": "
+                                 << placed.status().ToString();
+        ExecContext ctx{.pool = arrow::default_memory_pool(), .batch_size = 3};
+        const arrow::Result<std::shared_ptr<arrow::Table>> result = Drain(**placed, ctx);
+        ASSERT_TRUE(result.ok()) << plan::NodeName(*placement.root) << ": "
+                                 << result.status().ToString();
+        EXPECT_EQ((*result)->num_rows(), expected) << plan::NodeName(*placement.root);
+      }
     }
     // A re-run of one operator: Drain opens, drains and closes, so twice over the same operator is
     // the (re)run Operator::Open documents. Open makes the marks afresh, so a bit the first run set

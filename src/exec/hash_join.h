@@ -398,6 +398,11 @@ class HashJoinOperator final : public Operator {
   // join that emits its build rows keeps the position too. Empty for every other join.
   std::vector<std::uint32_t> build_positions_;
   JoinMarks* marks_ = nullptr;  // the build's, while it holds its table; only when emits_build_
+  // A marking probe's return value: no row, of its output schema, made once per run. It returns one
+  // per probe batch rather than draining the part in a single Next, so that RunPart gets to look at
+  // the part's stop flag between batches -- an early stop and the scheduler's out-of-memory retry
+  // both wait for whatever is in flight, and a row group of the side such a join probes is large.
+  std::shared_ptr<arrow::RecordBatch> empty_;
   std::vector<std::uint32_t> pair_rows_;   // a batch of pairs' probe rows,
   std::vector<JoinRowRef> pair_builds_;    // build rows
   std::vector<std::uint32_t> pair_slots_;  // and slots (after PassingSlots: those that passed)

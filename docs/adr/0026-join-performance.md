@@ -321,6 +321,17 @@ changes.
 - **C3, feat(plan): choose the build side for semi, anti and outer joins.** C1's estimates with C2b's and C2c's
   operators, one kind at a time as each lands. This is where Q21's 36 GB, its 10.8x and its 1.08x thread scaling go,
   and with them Q4, Q22 and Q13. The largest single win of this ADR.
+  - Update (2026-10-15): **the semi-join half shipped with C2b, in the same PR**, as the rule the unnesting pass
+    applies to the join it creates (`ChooseBuildSide`, the same function and the same `--build-side-ratio` the join
+    order uses). The two went together deliberately, against this ADR's own "one PR per id": C2b alone moves no plan,
+    so on its own it is an operator nothing reaches and nothing can measure, and C3's rule alone has no operator to
+    run. Q21's 36 GB and its 10.8x are therefore already collected under C2b above. **The anti and outer halves wait
+    on C2c**, which is now the only thing between this ADR and Q22, Q13 and Q21's remaining 18.81 GB.
+  - What did *not* move, and why it is worth knowing: Q4, whose correlated `EXISTS` has the same shape as Q21's.
+    `EstimateRows` reads a `Filter` as an upper bound -- it does not apply the predicate -- so it sees the subquery
+    side at 4.0x the outer side where the true ratio is far higher, and 4.0x is not *more* than the default ratio.
+    Making `EstimateRows` filter-aware (it would reuse C1's `PredicateRows`) is the smallest remaining lever here and
+    belongs with C5, which needs estimates through a join and an aggregate for the same reason.
 - **C4, perf(exec): keep a large build parallel.** `OneAtATime` trades all of a build's parallelism for headroom at
   half the limit, with nothing in between. After C3 no query of the 22 reaches that threshold, so this is no longer
   urgent — but any query whose build is legitimately large still falls off the same cliff.

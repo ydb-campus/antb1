@@ -665,6 +665,7 @@ arrow::Status HashJoinOperator::Start() {
     return arrow::Status::OK();
   }
   if (emits_build_) {
+    ARROW_ASSIGN_OR_RAISE(empty_, arrow::RecordBatch::MakeEmpty(schema_, ctx_.pool));
     marks_ = build_->marks();
     if (marks_ == nullptr) {
       // The sink makes them after the build is prepared and before any part runs; without them a
@@ -1165,7 +1166,9 @@ arrow::Result<std::optional<Batch>> HashJoinOperator::MarkMatches() {
     }
   }
   batch_ = Batch{};  // the whole batch is marked: nothing of it is left to walk
-  return std::nullopt;
+  // No row, but a batch rather than nothing: RunPart drops a batch with no selected row and then
+  // looks at the part's stop flag, which it would not reach if this drained the part in one call.
+  return Batch{.data = empty_, .selection = {}};
 }
 
 arrow::Result<arrow::ArrayVector> HashJoinOperator::TakeProbe(std::span<const std::uint32_t> rows) {
@@ -1346,6 +1349,7 @@ void HashJoinOperator::End() {
   table_.reset();
   values_.reset();
   marks_ = nullptr;  // the build's, which outlives this run only while it holds its table
+  empty_.reset();
   if (prepares_) {
     build_->Release();
   }

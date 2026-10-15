@@ -952,9 +952,11 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   rows of the side it builds on, so it ends its probe's pipeline rather than sitting inside one, and `explain` shows
   it as `RightJoin` with its probe and its build beneath; whatever is above it runs on one thread. The rows it
   returns are the rows the other direction returns, in the build's order rather than the probe's; neither order is
-  specified without `ORDER BY`. A plan whose probe has no row groups to spread over keeps building on its right
-  input. An `EXISTS` that is not correlated, a `NOT EXISTS`, a `NOT IN` and a `LEFT JOIN` always build on their
-  right input.
+  specified without `ORDER BY`. A plan whose probe side is not a chain of streaming
+  nodes over a scan -- a sorted or aggregated subquery, say -- keeps building on its right input, since there is no
+  pipeline for the join to be the sink of; a probe scan whose row groups the statistics all prune does take this
+  plan, and returns no row. An `EXISTS` that is not correlated, a `NOT EXISTS`, a `NOT IN` and a `LEFT JOIN`
+  always build on their right input.
 - Execution: the row groups of a query run on `--threads` threads (default: the hardware threads), 64Ki-row
   batches; their results are combined in file and row group order, so a result is the same for any number of
   threads, and deterministic. A DOUBLE `SUM` or `AVG` adds up every row group (per group with `GROUP BY`),
