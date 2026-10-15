@@ -723,6 +723,17 @@ TEST_F(PhysicalPlannerTest, SemiJoinsBuildingOnTheirLeftInputKeepTheSameRows) {
       EXPECT_EQ(sorted(left), c.xs) << "batch_size=" << batch_size;
       EXPECT_EQ(left->schema()->field(0)->name(), right->schema()->field(0)->name());
     }
+    // A re-run of one operator: Drain opens, drains and closes, so twice over the same operator is
+    // the (re)run Operator::Open documents. Open makes the marks afresh, so a bit the first run set
+    // cannot carry into the second, and the position the sink emits from starts over.
+    auto op = BuildPhysicalPlan(PlanOf(join_of(plan::BuildSide::kLeft), 2));
+    ASSERT_TRUE(op.ok()) << op.status().ToString();
+    for (int run = 0; run < 2; ++run) {
+      ExecContext ctx{.pool = arrow::default_memory_pool(), .batch_size = 3};
+      const arrow::Result<std::shared_ptr<arrow::Table>> again = Drain(**op, ctx);
+      ASSERT_TRUE(again.ok()) << again.status().ToString();
+      EXPECT_EQ(sorted(*again), c.xs) << "run " << run;
+    }
     // The plan really is the new shape: without this the case would pass on a planner that
     // quietly kept building on the right.
     ProfileNode root;
