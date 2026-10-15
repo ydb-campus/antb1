@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792086223513,
+  "lastUpdate": 1792093713534,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -8316,6 +8316,114 @@ window.BENCHMARK_DATA = {
             "value": 68.90169540000102,
             "unit": "ms/iter",
             "extra": "iterations: 10\ncpu: 68.88350029999995 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "653160ecf93b0ae4ad5c3cf88b0e11039e139f2d",
+          "message": "perf(plan): estimate the rows of a dependent join (#149)\n\n## Summary\n\nThe prerequisite for ADR 0026's **C2c**, and a gap in **C2b** as\nshipped.\n\nThe unnesting pass rewrites top-down, deliberately, so that a refusal\nlands on the inner span. The\n**outer** of two nested dependent joins is therefore rewritten *first*,\nwhile its left input still\nholds the un-rewritten inner one — and `EstimateRows` read a\n`DependentJoinNode` as unknown, which\n`ChooseBuildSide` must treat as \"never read as small\". So the outer join\nkept building on its\nsubquery however lopsided it was, and only the inner one ever moved. On\nthe star fixtures, two\ncorrelated `EXISTS` with identical 40-row-outer / 3000-row-inner shapes:\n\n```\n  Join SEMI build=right keys=[zn_id = tr_dropoff]     <- outer: did NOT flip\n    Join SEMI build=left  keys=[zn_id = tr_pickup]    <- inner: flipped\n```\n\nBoth move now. A dependent join outputs at most its left input's rows\nfor every kind the pass\nadmits — semi and anti keep a subset, a one-row join pairs each row with\nthe subquery's single row\n(ADR 0023 refuses every other kind) — so reading through to that side is\nan upper bound, and\n*over*-estimating a left input makes `ChooseBuildSide` flip **less**\nreadily, which is the safe\ndirection.\n\n`Path1` and `Path2` also keep that bound on the join they build, which\nthey left unknown; otherwise\nany join above a rewrite loses its own left estimate the same way.\n`Path2`'s is its left input's\nrows because its keys are exactly the aggregate's group keys, which a\n`GROUP BY` makes unique, so\nthe join cannot multiply its left input — that replaces a comment which\nsaid no bound was available.\n\n**Why this is separate from C2c.** It is the only reason C2c can reach\nQ21: that query's `NOT\nEXISTS` is the outer dependent join, so without this the anti join would\nnot flip however lopsided\nit is, and all of C2c's exec work would be dead weight. Keeping it\nseparate also isolates the\nestimate's plan perturbation from the exec change — and the answer is\nthat there is none (below).\n\nCloses #\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [x] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n**No TPC-H plan moves.** All 22 `explain` outputs at SF 100 are\nbyte-identical to `main`'s binary,\nso no timing can change — stronger evidence than a benchmark, and the\nreason none is quoted here.\nQ21 is the only one of the 22 with two correlated subqueries at one\nlevel, and its `NOT EXISTS` is\nstill pinned to its subquery until C2c. `Path2` fires for Q2 and Q17;\nits new estimate does not\ncross the ratio for either.\n\n```text\n$ for n in 01..22; do diff <(main/antb1 explain qN) <(HEAD/antb1 explain qN); done\n(no output)\n\n$ pixi run lint\n... shellcheck (shell) ... Failed      <- 36 pre-existing SC2218 in two .sh files this does not\n                                         touch; osx-arm64 only, green on CI\n... every other leg ..... Passed\n\n$ pixi run ci\n100% tests passed out of 2712          <- exit 0\n\n$ ANTB1_DIFF_SEED=20261016 pixi run diff-random\nDIFF: PASS seed=20261016 queries=2000 failed=0 unsupported=0\n```\n\nAlso per-file `clang-tidy -p build/tidy --warnings-as-errors='*'` over\nthe changed TUs and all four\nthat include `join_order.h`: no finding in the changed code or in the\nheader.\n\nTests, each confirmed against a deliberate mutation (reverting the\noverload, and dropping `Path1`'s\nestimate alone — all three caught):\n\n-\n`plan.OptimizerTest.Path1ChoosesASideForTheOuterOfTwoNestedDependentJoins`\n— both levels of a\nnested pair move when both are lopsided, neither moves when neither is,\nand the outer join carries\n  its own estimate so a join above it would read one too.\n- `plan.JoinOrderTest.RowsOfRelationsAndSubPlans` — the direct contract,\nincluding nested dependent\njoins and that a `Join` whose own estimate nothing set still reads as\nunknown through one.\n- `tests/slt/cases/subqueries/exists.slt` — three differential cases\nover the star fixtures: two\ncorrelated `EXISTS` at one level (the shape above, where both joins now\nbuild on the outer side),\nthe same with a residual on each level, and an `EXISTS` outside a `NOT\nEXISTS`. Expectations\n  written by `pixi run slt-complete` from DuckDB.\n\n## Checklist\n\n- [x] `pixi run check` passes locally — except the pre-existing\nosx-arm64 shellcheck findings above\n- [x] Tests cover the change\n- [x] Docs updated where behavior, commands or architecture changed —\nthe `EstimateRows` contract in\n`src/plan/join_order.h`. No `docs/` or ADR change: ADR 0026 already owns\nthis decision, and\n      C2c's PR will record the result there.\n- [x] No ClickBench-derived data is committed\n- [x] Nothing derived from TPC-H is committed: no query text, data,\nanswers or TPC tools (ADR-0006).\nOnly the count of plans that moved (zero) and query numbers appear here.\n- [x] Changes to governance paths: none.\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5) found\nthis while planning C2c —\na design review predicted that C2c would not reach Q21, and the shipped\nbinary confirmed it\nbefore any exec code was written. It wrote the diff, the tests and ran\nevery verification.\n- Accountable human (has read and understands the whole diff): @hor911\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-15T22:45:48+03:00",
+          "tree_id": "abf24edb60ea3353ee2d6d1d8859379320210add",
+          "url": "https://github.com/ydb-campus/antb1/commit/653160ecf93b0ae4ad5c3cf88b0e11039e139f2d"
+        },
+        "date": 1792093712362,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 3568.037861801485,
+            "unit": "ns/iter",
+            "extra": "iterations: 195791\ncpu: 3567.671716268878 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 73367.54924073399,
+            "unit": "ns/iter",
+            "extra": "iterations: 8956\ncpu: 73363.19506476105 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 84793.5617582947,
+            "unit": "ns/iter",
+            "extra": "iterations: 8258\ncpu: 84790.63344635503 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 375773.043431635,
+            "unit": "ns/iter",
+            "extra": "iterations: 1865\ncpu: 375694.9045576407 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 353531.5984848496,
+            "unit": "ns/iter",
+            "extra": "iterations: 1980\ncpu: 353349.2651515151 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2192515.165624975,
+            "unit": "ns/iter",
+            "extra": "iterations: 320\ncpu: 2191460.5062500006 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 43.68718731249999,
+            "unit": "ms/iter",
+            "extra": "iterations: 16\ncpu: 43.681042312499976 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 37.68596594736844,
+            "unit": "ms/iter",
+            "extra": "iterations: 19\ncpu: 37.682288578947386 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 190.2629549999991,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 190.24677766666662 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 11.72120940000004,
+            "unit": "ms/iter",
+            "extra": "iterations: 60\ncpu: 11.719917483333326 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 17.001766853658264,
+            "unit": "ms/iter",
+            "extra": "iterations: 41\ncpu: 16.99920943902438 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 34.183732099999986,
+            "unit": "ms/iter",
+            "extra": "iterations: 20\ncpu: 34.179205699999926 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.29557060146255,
+            "unit": "ms/iter",
+            "extra": "iterations: 547\ncpu: 1.2954050932358334 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 75.56558637499933,
+            "unit": "ms/iter",
+            "extra": "iterations: 8\ncpu: 75.55340437499991 ms\nthreads: 1"
           }
         ]
       }
