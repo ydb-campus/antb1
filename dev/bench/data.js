@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792093713534,
+  "lastUpdate": 1792099781786,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -8424,6 +8424,114 @@ window.BENCHMARK_DATA = {
             "value": 75.56558637499933,
             "unit": "ms/iter",
             "extra": "iterations: 8\ncpu: 75.55340437499991 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9ac7fe546c67735ccff71f0f0a6cff88feb05d8b",
+          "message": "perf(exec): build a correlated NOT EXISTS on its outer side (#150)\n\n## Summary\n\nADR 0026's **C2c** with **C3's anti-join rule**, which together finish\nthe build-side work for\ncorrelated subqueries. A correlated `NOT EXISTS` built the whole of its\nsubquery however lopsided it\nwas: Q21's ANTI build was **37,929,348 rows at SF 10 against a\n707,593-row probe**, 54x oversized,\nand that was its remaining 18.81 GB after #148.\n\n**Scope: plain ANTI only**, where the ADR had said \"anti and left\nouter\". The measurements do not ask\nfor the other two — Q22 (`NOT IN`) is **1.05x** DuckDB and Q13 (`LEFT\nJOIN`) **1.79x** — and each\ncosts more than plain anti did: a null-aware anti join must suppress\nevery output row once any probe\nkey is NULL and then withhold its own NULL-key rows, and a left outer\njoin emits matched pairs\n*during* the probe as well as padded rows after it, so the sink would\ncarry two emission paths. Both\nstay refused with a message saying so, and the ADR defers them on the\nratios rather than on effort.\n\n**Please note for the ADR** (`docs/adr/0026-join-performance.md` is a\nCODEOWNERS path): it records\nC2c's result, the deferral above, and the prerequisite that #149 turned\nout to be. As with #148 this\ncarries two roadmap ids (C2c and C3's anti half) because neither moves a\nquery alone — say the word\nif you'd rather I split them.\n\n### How it works\n\nAn anti join must emit the build rows that did **not** match, and a row\nwhose key is NULL is one of\nthem. The build retains those rows now, in a store of its own rather\nthan in `chunks_`:\n`JoinTableBuilder::Merge` numbers a `Segment::chunk` by counting pieces,\nand that numbering must\nequal `JoinTable::Build`'s push order or every `JoinRowRef` silently\naddresses the wrong batch —\nwith nothing checking it. So they go in `null_chunks()`, which no ref\naddresses, no partition\nindexes and `Find` never returns; the tail emits them as slices after\nthe keyed rows, one store at a\ntime. Nothing retains them unless `EmitsUnmatchedBuildRows` asks: the\nplanner sets the flag from it,\nthe sink reads the marks by it, and the probe returns Invalid for a\nbuild whose spec disagrees, so a\npath that forgets one fails loudly instead of losing rows.\n\nCloses #\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [x] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\nMeasured on the TPC-H-derived harness outside the repo (ADR 0006), SF\n100, best of 2. Not TPC\nBenchmark results — antb1 does not comply with the TPC-H Benchmark's\nrequirements.\n\n- **Q21's peak memory: 18.81 GB → 4.27 GB, 4.4x.** Its anti join's build\nfell from every filtered\nrow of the largest relation to the outer side's: **54x fewer rows**, the\nsame ratio the semi join\n  gave in #148. At SF 10 the peak fell 1.89 GB → 433.81 MB.\n- **Time: 32.497 s → 28.593 s at 4 threads (−12.0%)**, ratio **3.25x →\n2.9x**; and 19.11 s →\n  16.22 s at 8 threads (−15.1%).\n- **The time win is far smaller than #148's 3.4x, and the page-cache\nreading is why** — which is\nsome evidence that reading is right, since it predicted this. #148's win\nwas outsized because\n36 GB against this host's 51.5 GB was evicting the cache for a 33 GB\ndataset; 18.81 GB was not, so\nwhat is left here is the operator's own work. **The memory is the\nheadline**, and it is what makes\nQ21 safe at a larger scale factor. Thread scaling is healthy too: 4 → 8\nthreads now buys 1.77x,\n  where before #148 the query ignored threads entirely.\n- **Only Q21's plan moves**, and only its ANTI join. Verified by diffing\nall 22 `explain` outputs at\nSF 100 against a release build of `main` in a separate worktree — the\none diff is\n  `Join ANTI build=right` → `build=left`.\n- **Every other query is inside the noise band**, which DuckDB's own\nunchanged binary sets at up to\n±14% in this very run (its Q1 moved +10.0% and Q9 +14.4% between the two\nsweeps, while its Q21\n  moved −0.4%). Geomean over the 22 is unchanged at 2.8x.\n\n```text\n$ pixi run lint\n... shellcheck (shell) ... Failed      <- 36 pre-existing SC2218 in two .sh files this does not\n                                         touch; osx-arm64 only, green on CI\n... every other leg ..... Passed\n\n$ pixi run ci\n100% tests passed out of 2715          <- exit 0\n\n$ ANTB1_DIFF_SEED=20261017 pixi run diff-random\nDIFF: PASS seed=20261017 queries=2000 failed=0 unsupported=0\n```\n\nBeyond `check`, since this is `exec` ownership code (`check-full` cannot\ncomplete on osx-arm64:\n`feature.gcc` is `platforms = [\"linux-64\"]`):\n\n- **ASan+UBSan**: 82 join and planner cases, the new SLT cases at 4\nthreads, and 150 random\ndifferential queries, all clean via `ASAN_OPTIONS=detect_leaks=0\n./build/ci-asan/bin/...`.\n(`pixi run asan` itself dies in gtest *discovery* on a 64-byte\nCoreFoundation leak with no antb1\n  frame — a known osx-arm64 gap.)\n- **ThreadSanitizer**: **82 join and planner cases with zero race\nreports.** The full `pixi run tsan`\nleg reported only the pre-existing `GroupedCountDistinct::MergeGroups`\nsite (see the note below),\nwith zero frames in `JoinMarks`, `PartRightJoinOperator` or\n`AppendNullKeys`; that full run was cut\nshort by a local timeout, which is why the per-binary run is quoted as\nthe complete signal.\n- **clang-tidy** per file over the changed TUs and every TU that\nincludes the two changed headers:\n  no finding in the changed code or inside the headers.\n\n### Tests, each confirmed against a deliberate mutation\n\nFour mutations, all caught: the tail never emitting the retained rows;\nthe build not retaining them;\nthe mark read the same way for both kinds; and the rollback keeping a\nretained batch.\n\n-\n`exec.PhysicalPlannerTest.JoinsBuildingOnTheirLeftInputKeepTheSameRows`\n— now both kinds: 9 shapes\n× 2 executors (calling thread and a 4-thread pool) × 3 batch sizes × 2\nkinds × 2 directions. The\nsemi answers are absolute; **the anti answers are pinned by the\npartition property** — an anti join\nkeeps exactly the rows a semi join over the same condition drops — so no\nsecond hand-computed list\ncan be wrong. Then all 15 `Placements` positions and a re-run, both on\nthe anti direction.\n-\n`exec.PhysicalPlannerTest.AnAntiJoinOnItsLeftInputOverNullKeysAndAnEmptyProbe`\n— two shapes a semi\njoin never meets: a preserved side whose keys are *all* NULL (the whole\nanswer comes out of the\nretained store, and the probe is never opened), and a probe that yields\nno row at all.\n- `exec.JoinTableTest.ABuildMayRetainTheRowsWhoseKeysAreNull` — across\nboth layouts and executors:\nthe rows land in `null_chunks()` and in neither `rows()` nor `chunks()`,\nevery count and flag\nreads as before, `Find` never returns one, and the all-NULL batch and a\nselection that excludes\n  some NULL keys both behave.\n- `exec.JoinTableTest.RetainedNullKeysAreChargedAndGivenBackOnFailure` —\n**this one found a bug.** A\nbatch retained before the keyed rows of the same `Append` survived a\nlater failure in that call,\nso the part was not unchanged and its Arrow buffers stayed charged.\n`RunsOutOfMemoryCleanly` cannot\nsee it: a `MemoryReservation` returns everything in its destructor,\nbefore that test's scope-exit\nassertion runs. Fixed, and the test now asserts the invariant that\nmatters — a table built from the\nfailed part holds nothing — rather than a byte count, since a grown\nvector keeps its capacity on\n  purpose.\n- `exec.HashJoinTest.MisuseIsInvalid` — kAnti+kLeft is accepted over a\nbuild that kept its NULL keys\nand **Invalid over one that did not**; kNullAwareAnti and kLeft still\nrefused. Worth noting: that\nassertion had stayed green for the wrong reason until the positive case\nwas added.\n- `plan.OptimizerTest` — the ratio boundary for kAnti, and that\nkNullAwareAnti never reaches the rule\n  at all because the pass refuses a correlated `NOT IN` outright.\n- `tests/slt/cases/subqueries/exists.slt` — five differential `NOT\nEXISTS` cases, including one keyed\non `zn_parent`, which is NULL for 5 of 40 zones: `NOT EXISTS` keeps 6\nand `EXISTS` 34, so the\nretained store is covered against DuckDB and the partition is checked.\nExpectations written by\n  `pixi run slt-complete`.\n\n## Checklist\n\n- [x] `pixi run check` passes locally — except the pre-existing\nosx-arm64 shellcheck findings above\n- [x] Tests cover the change\n- [x] Docs updated: `docs/sql-subset.md` (the build side rule, and three\nstatements this makes\nfalse about `rows`, `null_keys` and `find`, plus the sink's `emitted`\nmetric), ADR 0026\n- [x] No ClickBench-derived data is committed\n- [x] Nothing derived from TPC-H is committed: no query text, data,\nanswers or TPC tools (ADR-0006).\n      Only timings, row counts and query numbers appear here.\n- [ ] Changes to governance paths (see `.github/CODEOWNERS`) —\n**`docs/adr/` needs your sign-off**\n\n## Maintainer note, unrelated to this branch\n\nStill open from #148: `pixi run tsan` is not clean on `main` —\n`GroupedCountDistinct::MergeGroups`\n(`src/exec/grouped_aggregate_state.cc`) races when\nCOUNT(DISTINCT) partitions merge across `PartitionLanes`. Which tests\nabort varies per run because it\nis a race. Worth its own issue.\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5) planned\nit (a design review caught\nthat C2c would not reach Q21 at all, which became #149), wrote the diff,\nthe tests and the\ndocs, and ran every verification above including the measurements and\nthe plan diff against a\n      worktree build of main.\n- Accountable human (has read and understands the whole diff): @hor911\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-16T00:26:24+03:00",
+          "tree_id": "4884df5c30cb4a81ac2bcdceafbc82269acab215",
+          "url": "https://github.com/ydb-campus/antb1/commit/9ac7fe546c67735ccff71f0f0a6cff88feb05d8b"
+        },
+        "date": 1792099780727,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 5034.109391324222,
+            "unit": "ns/iter",
+            "extra": "iterations: 139746\ncpu: 5032.6247048216055 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 83993.3834606283,
+            "unit": "ns/iter",
+            "extra": "iterations: 7594\ncpu: 83957.47563866209 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 221933.43454833634,
+            "unit": "ns/iter",
+            "extra": "iterations: 3155\ncpu: 221844.31568938188 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 445958.4307400433,
+            "unit": "ns/iter",
+            "extra": "iterations: 1581\ncpu: 445790.4332700822 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 361142.05260443996,
+            "unit": "ns/iter",
+            "extra": "iterations: 1939\ncpu: 360988.0144404332 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2087399.6537313273,
+            "unit": "ns/iter",
+            "extra": "iterations: 335\ncpu: 2086465.9283582105 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 56.37861253846337,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 56.37086215384621 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 44.99872046666648,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 44.98252100000002 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 200.80730133332736,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 200.77647800000045 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.367557326530848,
+            "unit": "ms/iter",
+            "extra": "iterations: 49\ncpu: 14.366570367346936 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 22.639449612903896,
+            "unit": "ms/iter",
+            "extra": "iterations: 31\ncpu: 22.637942129032254 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 40.072094777777856,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 40.06613766666669 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.9204880333333563,
+            "unit": "ms/iter",
+            "extra": "iterations: 360\ncpu: 1.9201532611111114 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 112.41803928571618,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 112.40205242857166 ms\nthreads: 1"
           }
         ]
       }
