@@ -2784,7 +2784,8 @@ class Binder {
   [[nodiscard]] std::vector<std::size_t> RelationsRead(const sql::Expr& expr) const;
   // The relations a bound expression reads, ascending (its columns that are a binding's).
   [[nodiscard]] std::vector<std::size_t> RelationsOf(const Expr& expr) const;
-  arrow::Status BindElement(const sql::Expr& element);
+  arrow::Status BindElement(const sql::Expr& element,
+                            const std::vector<const sql::Expr*>& siblings);
   arrow::Status BindConjunct(const sql::Expr& conjunct, SourceSpan element);
   // A conjunct classified in the block `block_` already descended to, by the relations it reads.
   arrow::Status ClassifyConjunct(const sql::Expr& conjunct, SourceSpan element,
@@ -4649,24 +4650,27 @@ arrow::Status Binder::BindWhere() {
       ARROW_RETURN_NOT_OK(BindUnitOn(unit_at_[i], stmt_.from[i]));
       continue;
     }
+    const std::vector<const sql::Expr*> on_siblings = Conjuncts(stmt_.from[i].on);
     for (const sql::Expr& element : stmt_.from[i].on) {
-      ARROW_RETURN_NOT_OK(BindElement(element));
+      ARROW_RETURN_NOT_OK(BindElement(element, on_siblings));
     }
   }
   visible_ = {};  // WHERE sees every binding, in one level
   clause_ = Clause::kWhere;
+  const std::vector<const sql::Expr*> where_siblings = Conjuncts(stmt_.where);
   for (const sql::Expr& element : stmt_.where) {
-    ARROW_RETURN_NOT_OK(BindElement(element));
+    ARROW_RETURN_NOT_OK(BindElement(element, where_siblings));
   }
   return OrderRelations();
 }
 
 // One element of WHERE or of an inner ON: its conjuncts, with what every branch of a top-level OR
 // shares factored out first (ADR 0022's OR factoring), each then classified as any conjunct is.
-arrow::Status Binder::BindElement(const sql::Expr& element) {
+arrow::Status Binder::BindElement(const sql::Expr& element,
+                                  const std::vector<const sql::Expr*>& siblings) {
   std::vector<sql::Box<sql::Expr>> owned;  // keeps the rewrite's expressions alive
   std::vector<FactoredConjunct> conjuncts;
-  FactorSharedConjuncts(element, owned, conjuncts);
+  FactorSharedConjuncts(element, siblings, owned, conjuncts);
   // In the order they are written, so that the error reported is the element's first, as it is
   // without the rewrite and as it is in DuckDB.
   for (const FactoredConjunct& conjunct : conjuncts) {

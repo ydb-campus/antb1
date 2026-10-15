@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "antb1/sql/ast.h"
@@ -48,6 +49,140 @@ sql::Expr Conjunction(const std::vector<const sql::Expr*>& parts) {
   return out;
 }
 
+// One column an OR constrains to constants, and the constants each branch allows it.
+struct Constrained {
+  const sql::Expr* column;               // the operand every branch compares, by structure
+  std::vector<const sql::Expr*> values;  // the literals, in the order the branches write them
+};
+
+// The literals `conjunct` constrains `column` to, appended to `out`; false when it constrains it to
+// something that is not a set of literals, in which case nothing can be derived for that column.
+// Only `=` and `IN` bound a column to constants: `<>`, `<`, `NOT IN` and a nested OR do not.
+bool ValuesOf(const sql::Expr& conjunct, const sql::Expr& column,
+              std::vector<const sql::Expr*>& out) {
+  if (const auto* binary = std::get_if<sql::BinaryExpr>(&conjunct)) {
+    if (binary->op != sql::BinaryOp::kEq) {
+      return false;
+    }
+    // `c = literal` or `literal = c`: either side may be the column.
+    const bool left_is_column = sql::EqualIgnoringSpans(*binary->left, column);
+    const sql::Expr& other = left_is_column ? *binary->right : *binary->left;
+    if (!left_is_column && !sql::EqualIgnoringSpans(*binary->right, column)) {
+      return false;
+    }
+    if (!std::holds_alternative<sql::Literal>(other)) {
+      return false;
+    }
+    out.push_back(&other);
+    return true;
+  }
+  if (const auto* in = std::get_if<sql::InExpr>(&conjunct)) {
+    if (in->negated || !sql::EqualIgnoringSpans(*in->operand, column)) {
+      return false;
+    }
+    for (const sql::Expr& value : in->list) {
+      if (!std::holds_alternative<sql::Literal>(value)) {
+        return false;
+      }
+      out.push_back(&value);
+    }
+    return !in->list.empty();
+  }
+  return false;
+}
+
+// Mixing literal kinds would make the derived IN a bind error on a query that binds today, so a
+// column is only derived for when every branch writes the same kind of literal.
+bool SameKind(const std::vector<const sql::Expr*>& values) {
+  const sql::Literal::Kind kind = std::get<sql::Literal>(*values.front()).kind;
+  return std::ranges::all_of(
+      values, [kind](const sql::Expr* v) { return std::get<sql::Literal>(*v).kind == kind; });
+}
+
+// The IN lists a top-level OR implies, appended to `out`: where every branch constrains one column
+// to literals, their union is implied, since a row that satisfies the OR satisfies some branch and
+// so takes one of that branch's values. `(c = 'A' AND x) OR (c = 'B' AND y)` therefore implies
+// `c IN ('A', 'B')` (ADR 0022's "filters implied by ORs").
+//
+// The derived conjunct is redundant by construction -- the OR stays where it is -- so it can only
+// change the plan, never the answer: a single-relation IN reaches its scan and its estimate, where
+// the OR, spanning two relations, is a join residual that neither can see.
+void DeriveImpliedInLists(const std::vector<std::vector<const sql::Expr*>>& per_branch,
+                          const std::vector<const sql::Expr*>& already,
+                          std::vector<sql::Box<sql::Expr>>& owned,
+                          std::vector<FactoredConjunct>& out) {
+  std::vector<Constrained> candidates;
+  // The first branch's columns are the only ones that can be constrained by every branch.
+  for (const sql::Expr* conjunct : per_branch.front()) {
+    const sql::Expr* column = nullptr;
+    if (const auto* binary = std::get_if<sql::BinaryExpr>(conjunct);
+        binary != nullptr && binary->op == sql::BinaryOp::kEq) {
+      column =
+          std::holds_alternative<sql::Literal>(*binary->right) ? &*binary->left : &*binary->right;
+    } else if (const auto* in = std::get_if<sql::InExpr>(conjunct); in != nullptr && !in->negated) {
+      column = &*in->operand;
+    }
+    if (column == nullptr || std::holds_alternative<sql::Literal>(*column)) {
+      continue;
+    }
+    const bool seen = std::ranges::any_of(candidates, [column](const Constrained& c) {
+      return sql::EqualIgnoringSpans(*c.column, *column);
+    });
+    if (!seen) {
+      candidates.push_back({.column = column, .values = {}});
+    }
+  }
+  for (Constrained& candidate : candidates) {
+    bool every_branch = true;
+    for (const std::vector<const sql::Expr*>& branch : per_branch) {
+      const std::size_t before = candidate.values.size();
+      for (const sql::Expr* conjunct : branch) {
+        // A branch may constrain the column more than once; every such conjunct must be a set of
+        // literals, since one that is not leaves the column unbounded in that branch.
+        if (ValuesOf(*conjunct, *candidate.column, candidate.values)) {
+          continue;
+        }
+      }
+      if (candidate.values.size() == before) {
+        every_branch = false;  // this branch does not bound the column
+        break;
+      }
+    }
+    if (!every_branch || candidate.values.size() < 2 || !SameKind(candidate.values)) {
+      continue;
+    }
+    // Deduplicate, keeping the written order so that the derived list is deterministic.
+    sql::InExpr derived{.operand = sql::Box<sql::Expr>(*candidate.column),
+                        .list = {},
+                        .negated = false,
+                        .op_span = {},
+                        .span = {}};
+    for (const sql::Expr* value : candidate.values) {
+      const bool repeated = std::ranges::any_of(derived.list, [value](const sql::Expr& kept) {
+        return sql::EqualIgnoringSpans(kept, *value);
+      });
+      if (!repeated) {
+        derived.list.push_back(*value);
+      }
+    }
+    if (derived.list.size() < 2) {
+      continue;  // every branch allows the same single value: the shared-conjunct path has it
+    }
+    // The element may already hold this conjunct, either because the writer wrote it or because
+    // the rewrite ran before: deriving it again would duplicate it and break idempotence.
+    const sql::Expr as_expr{derived};
+    const auto equal = [&as_expr](const sql::Expr* e) {
+      return sql::EqualIgnoringSpans(*e, as_expr);
+    };
+    if (std::ranges::any_of(already, equal) ||
+        std::ranges::any_of(out, [&equal](const FactoredConjunct& c) { return equal(c.expr); })) {
+      continue;
+    }
+    owned.emplace_back(as_expr);
+    out.push_back({.expr = &*owned.back()});
+  }
+}
+
 }  // namespace
 
 void Conjuncts(const sql::Expr& expr, std::vector<const sql::Expr*>& out) {
@@ -68,7 +203,8 @@ std::vector<const sql::Expr*> Conjuncts(const std::vector<sql::Expr>& predicate)
   return out;
 }
 
-void FactorSharedConjuncts(const sql::Expr& element, std::vector<sql::Box<sql::Expr>>& owned,
+void FactorSharedConjuncts(const sql::Expr& element, const std::vector<const sql::Expr*>& siblings,
+                           std::vector<sql::Box<sql::Expr>>& owned,
                            std::vector<FactoredConjunct>& out) {
   std::vector<const sql::Expr*> flat;
   Conjuncts(element, flat);
@@ -102,6 +238,7 @@ void FactorSharedConjuncts(const sql::Expr& element, std::vector<sql::Box<sql::E
     }
     if (shared.empty()) {
       out.push_back({.expr = conjunct});  // nothing to factor: the OR stands as it is
+      DeriveImpliedInLists(per_branch, siblings, owned, out);
       continue;
     }
     // What is left of each branch: its conjuncts that are not shared.
@@ -132,6 +269,7 @@ void FactorSharedConjuncts(const sql::Expr& element, std::vector<sql::Box<sql::E
     }
     owned.emplace_back(std::move(folded));
     out.push_back({.expr = &*owned.back()});
+    DeriveImpliedInLists(rest, siblings, owned, out);
   }
 }
 
