@@ -140,6 +140,8 @@ What is not:
   probe pipeline and becoming a source for a new one, which is the only candidate that reaches Q21 and is ADR 0022's
   separately deferred "one build probed by several pipelines" — the two were deferred together because they are one
   piece of work.
+  - Update (2026-10-15, C2b): **decided, and it is the third candidate: the join becomes the sink of its own probe
+    pipeline.** The decision section below records the design and what reading the planner changed about it.
 - **A NULL-key build row is discarded, not merely unindexed.** `JoinBuildPart::Append` keeps only selected rows
   whose keys are not NULL, so their payload never enters `chunks()`. Right **anti** and right **outer** must emit
   unmatched build rows, and a NULL key is unmatched by definition, so both need the build to keep them. Right
@@ -158,6 +160,71 @@ new kind nor a new direction failed to compile: a right-semi join would have fal
 the probe batch — the left-sided answer — with no error and no assert. Nothing produced that combination (the
 `ResolvePositions` check rejects it and the operator's `Make` returns `Invalid`), so it was latent; it was also
 exactly the trap C2b and C2c would have walked into, which is why it is closed before them rather than with them.
+
+### Where the tail goes: the join becomes the sink of its probe pipeline (C2b)
+
+A right-direction join **owns the `PartScheduler` of its probe pipeline**, consumes every part while emitting
+nothing, and then emits the build rows from its own `Next()`. It is a sixth member of the `PartSink` family, not a
+new concept in the execution model.
+
+Reading `src/exec/physical_planner.cc` moved this design twice, and both corrections are the point of writing it
+down.
+
+**What is not available.** The first sketch had the join become a *source* for a new part pipeline above it, so that
+the rest of the plan stayed parallel. The planner has no such shape: a part pipeline's bottom must be a `ScanNode`
+with a table (`PipelineScan`), and above every one of the five existing `PartSink` subclasses sits a **serial** chain,
+built with no part number. Nothing in the engine terminates one part pipeline and begins another. Representing a
+materialised row set as a pipeline source is a much larger change than C2b, and this ADR does not take it.
+
+**What is available, and is the precedent to copy.** `JoinBuild` over a pipeline input is already a pipeline breaker:
+it owns its own `PartScheduler`, consumes a whole part pipeline, and its product — a `JoinTable` rather than batches —
+is read by the probes of a different pipeline. At most one scheduler is ever live, by construction, because
+`BuildsFirstOperator` prepares the builds before it opens the sink. A right-direction join is that same shape with
+one more phase: build, then probe-and-mark over its own scheduler, then emit.
+
+Owning the scheduler also disposes of two traps that the sink-level candidate would have had to solve. The join never
+needs `PartSink`'s single `parts_done` slot — already taken by `BuildsFirstOperator` to release the build — because it
+knows directly when its own scheduler is drained. And it is unaffected by `parts_done` firing *before* output in four
+of the five sinks, which would have made a tail keyed on that signal emit too early.
+
+**The cost, stated plainly.** Everything above the break runs serially. For Q21 that is an anti join and a grouped
+aggregate over the roughly 7M rows the semi join emits — on the order of a second, against the 110s the query takes
+and the 36 GB and serial `finish` phase that building the whole of the largest relation costs. The trade is strongly
+favourable there, but it is a trade, and C2b measures it rather than assuming it: a query whose break sits under a
+large parallel chain could lose.
+
+**What the marking must satisfy**, each from the code rather than from first principles:
+
+- **The marks live on `JoinBuild`, never on `JoinTable`.** The table is handed out as `shared_ptr<const JoinTable>`
+  and documented immutable for any number of threads; `JoinBuild` is reachable non-const from a probe. Adding a
+  mutable member to the table would change a contract that every probe depends on.
+- **Set-only and idempotent, an OR and never a count.** `PartScheduler` stops the parts ahead of one that ran out of
+  memory, discards their results and runs them again, and `RunPart` abandons a part mid-probe on `stop`. A part's
+  marks can therefore be written twice, or partially and then again.
+- **Atomic, because the writers are concurrent.** Up to twice the thread count of independent `HashJoinOperator`
+  objects probe one shared table, and a per-part `ExecContext` has no executor, so a probe cannot schedule the work
+  itself.
+- **The `rows()` position must be carried through the residual path.** It is the only dense build-row index, and it
+  is converted to a `JoinRowRef` and dropped one line after it is read. Without a residual the whole matched range
+  can be marked at once; with one, only the pairs that survive the residual may be marked, which is per-row.
+- **The bitmap is reserved on the consumer thread and charged before it is allocated**, as every other container of
+  a build is. A `MemoryReservation` is non-movable and single-threaded, so it belongs to the build, never to the
+  per-part operator that releases its own memory in `End()`. Charging it raises `bytes_allocated()`, which pushes a
+  large build toward `OneAtATime`'s half-the-limit threshold — this ADR's C4 cliff — so C2b reports the peak it adds.
+- **Emission in `rows()` order is deterministic across thread counts**, which is what ADR 0022 and ADR 0013 require
+  and what `antb1-slt --same-as-threads` enforces. It is not stable across datasets: the order is ascending key in
+  the direct layout and bucket order in the hashed one, and the layout is chosen by key density. That is sound, no
+  query having an order without `ORDER BY`, and worth knowing before reading a diff of two plans' output.
+- **Early stop must suppress the tail.** A `LimitOperator` above simply stops pulling, which is correct — the tail is
+  the output being limited. The per-part row cap is the trap: parts stop early and `parts_done` still fires, so a
+  tail keyed on that signal would emit build rows whose matches were never probed. A join that owns its scheduler
+  passes no row cap, so the path does not arise, and C2b has a test that pins it.
+
+**One guard must move in four places at once.** `PipelineInput` picks a join's probe input with a hard-coded test for
+an inner join building on its left, and the same combination is rejected in `ShapeOf`, in `HashJoinOperator::Make`
+and in `plan::ResolvePositions`. `PipelineScan`, `FiltersOnScan` and `PipelineBuildsOf` all walk pipelines with
+`PipelineInput` and must keep agreeing with it. C2a made the two `JoinKind` switches exhaustive so that this is a
+compile error rather than a silent probe-side answer; that was the point of shipping it first.
 
 ### Join order (C5)
 
@@ -218,10 +285,17 @@ changes.
   arm, and a test pins that the binder never produces `BuildSide::kLeft` for a non-inner kind — which only an
   aborting internal check stood behind, and which C1 made worth pinning by making `kLeft` reachable from real SQL.
   No plan and no answer changes. **Shipped first, before C2b and C2c, because it is the trap they would walk into.**
-- **C2b, feat(exec): build-side output for semi joins.** The atomic mark bitmap, the `rows()` position carried
-  through the residual path, and the tail — whose location this ADR leaves open above, and which C2b must decide
-  first. Semi alone, because it needs no change to the build. Unlocks Q21's semi join, which today builds the whole
-  of the largest relation to probe it with 7.3M rows, and Q4's.
+- **C2b, feat(exec): build-side output for semi joins.** The atomic mark bitmap on `JoinBuild`, the `rows()`
+  position carried through the residual path, and the join as the sink of its own probe pipeline — the design is
+  decided and recorded above. Semi alone, because it needs no change to the build. Unlocks Q21's semi join, which
+  today builds the whole of the largest relation to probe it with 7.3M rows, and Q4's.
+  - It reports two numbers that decide whether C2c follows: the peak memory it adds for the bitmap, which bears on
+    the `OneAtATime` cliff of C4, and the cost of the serial chain above the break, which is what the design trades
+    away for the parallel probe.
+  - Sequenced after a smaller PR that moves the probe-side guard: `PipelineInput`, `ShapeOf`,
+    `HashJoinOperator::Make` and `plan::ResolvePositions` must stop rejecting a non-inner join that builds on its
+    left input, in lockstep, with the combination still unreachable from SQL until C3 chooses it. That PR changes no
+    plan and no answer, and keeping it separate is what makes C2b's diff about the marking and the tail.
 - **C2c, feat(exec): build-side output for anti and left outer joins.** Right anti and right outer, which
   additionally need the build to keep its NULL-key rows, since those are unmatched by definition and must be
   emitted. Unlocks Q21's anti join, Q22 and Q13.
