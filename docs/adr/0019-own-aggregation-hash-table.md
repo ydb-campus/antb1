@@ -73,3 +73,8 @@ Proposed (deferred: the work is scheduled for a later optimization round)
   - specialize per key shape.
 - **Other gaps:** the string scan gap (Q20-Q22: the Parquet decoder copies every string; decoding into `BINARY_VIEW`
   saved only 10-16%) is a separate, later decision.
+  - Update (2026-10-15): that decision is [ADR 0027](0027-string-views.md), which keeps the Parquet side deferred on
+    this measurement and takes up the two sites where antb1 owns the copying instead. Its key layout — the size and a
+    four-byte prefix in the first eight bytes, so that most comparisons never read the bytes — is the "specialize per
+    key shape" of this ADR applied to a string key, and belongs to the table this ADR proposes rather than before it:
+    `arrow::compute::Grouper` rejects view key types outright.
