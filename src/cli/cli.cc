@@ -83,7 +83,8 @@ struct Inputs {
   int threads = 1;                      // --threads (query and bench)
   // --memory-limit (query and bench); std::nullopt for commands that run no query.
   std::optional<std::string> memory_limit;
-  double build_side_ratio = 4.0;  // --build-side-ratio (query, explain and bench)
+  double build_side_ratio = 4.0;    // --build-side-ratio (query, explain and bench)
+  std::string join_order = "cost";  // --join-order (query, explain and bench)
   BenchSettings bench;
 };
 
@@ -119,6 +120,17 @@ void AddBuildSideRatioOption(CLI::App* cmd, Inputs& in) {
                   "on the smaller side). Changes the plan, never the answer")
       ->default_val(4.0)
       ->check(CLI::Range(1.0, 1'000'000.0));
+}
+
+// --join-order (ADR 0026's C5): which search chooses a block's join order. `greedy` is the rule
+// every plan used before the search, kept so that a plan can be compared against it.
+void AddJoinOrderOption(CLI::App* cmd, Inputs& in) {
+  cmd->add_option("--join-order", in.join_order,
+                  "How to order the joins of a block: cost (dynamic programming over the rows the "
+                  "joins carry) or greedy (the largest relation probes, then the smallest join "
+                  "next). Changes the plan, never the answer")
+      ->default_val("cost")
+      ->check(CLI::IsMember({"cost", "greedy"}));
 }
 
 void AddThreadsOption(CLI::App* cmd, Inputs& in) {
@@ -211,6 +223,8 @@ arrow::Result<std::unique_ptr<engine::Session>> MakeSession(const Inputs& in) {
   // In hundredths, rounded: the join order is integer arithmetic, so that a plan depends on the
   // metadata alone and is the same on every host (ADR 0022).
   options.build_side_ratio = static_cast<int64_t>(std::llround(in.build_side_ratio * 100.0));
+  options.join_order =
+      in.join_order == "greedy" ? plan::JoinOrderSearch::kGreedy : plan::JoinOrderSearch::kCost;
   if (in.clickbench) {
     options.default_overrides.emplace_back("EventDate", plan::LogicalType::kDate);
   }
@@ -315,6 +329,7 @@ int RunCli(std::span<const std::string> args, std::istream& in_stream, std::ostr
   AddThreadsOption(query, in);
   AddMemoryLimitOption(query, in);
   AddBuildSideRatioOption(query, in);
+  AddJoinOrderOption(query, in);
 
   auto* explain = app.add_subcommand(
       "explain",
@@ -332,6 +347,7 @@ int RunCli(std::span<const std::string> args, std::istream& in_stream, std::ostr
   AddThreadsOption(explain, in);
   AddMemoryLimitOption(explain, in);
   AddBuildSideRatioOption(explain, in);
+  AddJoinOrderOption(explain, in);
 
   auto* schema = app.add_subcommand("schema", "Print the columns of the registered tables");
   AddTableOptions(schema, in);
@@ -355,6 +371,7 @@ int RunCli(std::span<const std::string> args, std::istream& in_stream, std::ostr
   AddThreadsOption(bench, in);
   AddMemoryLimitOption(bench, in);
   AddBuildSideRatioOption(bench, in);
+  AddJoinOrderOption(bench, in);
 
   const auto* version = app.add_subcommand("version", "Print version information");
 

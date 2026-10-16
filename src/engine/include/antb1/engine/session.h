@@ -13,6 +13,7 @@
 #include <arrow/table.h>
 
 #include "antb1/plan/catalog.h"
+#include "antb1/plan/plan_options.h"
 #include "antb1/plan/types.h"
 
 namespace arrow::internal {
@@ -42,6 +43,9 @@ struct SessionOptions {
   // difference. Below 100 is invalid. std::nullopt: the planner's own default (plan::BindOptions).
   // It changes which plan a query gets, never what the query means.
   std::optional<int64_t> build_side_ratio;
+  // Which search chooses a block's join order (docs/adr/0026-join-performance.md, C5).
+  // std::nullopt: the planner's own default. It changes which plan a query gets, never the answer.
+  std::optional<plan::JoinOrderSearch> join_order;
   // Column type overrides applied to every table opened by this session, e.g. {"EventDate", kDate}
   // for ClickBench (`antb1 --clickbench`).
   std::vector<std::pair<std::string, plan::LogicalType>> default_overrides;

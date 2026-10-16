@@ -1,6 +1,7 @@
 #include "join_order.h"
 
 #include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -52,20 +53,359 @@ std::vector<std::vector<std::size_t>> EdgesOf(std::size_t relations,
 // A count that is not negative, saturated at INT64_MAX.
 int64_t Saturated(Int128 count) { return Int128ToInt64(count).value_or(kLargest); }
 
+// A relation's rows: unknown counts as the largest, since unknown must never read as small, and a
+// negative count as none.
+int64_t BlockRows(std::span<const JoinRelation> relations, std::size_t relation) {
+  return std::max<int64_t>(relations[relation].rows.value_or(kLargest), 0);
+}
+
+// A key's distinct values: the footers' domain where there is one, else its relation's rows, which
+// is the most distinct values it could have.
+int64_t BlockDomain(std::span<const JoinRelation> relations, const std::optional<int64_t>& domain,
+                    std::size_t relation) {
+  return domain.has_value() ? std::max<int64_t>(*domain, 0) : BlockRows(relations, relation);
+}
+
+// `a * b`, saturated: a subset of a dozen relations can multiply past 128 bits before any domain
+// divides it back down, and an estimate that large only has to stay large and stay deterministic.
+Int128 Multiplied(Int128 a, int64_t b) {
+  Int128 out = 0;
+  return __builtin_mul_overflow(a, Int128{b}, &out) ? kInt128Max : out;
+}
+
+// The rows a join of inputs of `left` and `right` rows produces, from the edges between them, as
+// everything that decides memory must read it: the largest domain of any of those edges divides, so
+// a second key reads as no more selective than the stronger one. A composite key has at least as
+// many distinct values as its most selective column, so this never over-states selectivity -- and
+// under-stating the rows of a build is what materialises a side that does not fit. ADR 0026's C5
+// records the query that proved it. This is the estimate a step carries and the one ChooseBuildSide
+// reads; only the search's own cost reads the narrower, independence-assuming one.
+int64_t JoinRowsOf(std::span<const JoinRelation> relations, std::span<const JoinEdge> edges,
+                   int64_t left, int64_t right, std::span<const std::size_t> crossing) {
+  bool empty = left == 0 || right == 0;
+  int64_t divisor = 1;
+  for (const std::size_t e : crossing) {
+    const JoinEdge& edge = edges[e];
+    const int64_t a = BlockDomain(relations, edge.a_domain, edge.a);
+    const int64_t b = BlockDomain(relations, edge.b_domain, edge.b);
+    empty = empty || a == 0 || b == 0;
+    divisor = std::max({divisor, a, b});
+  }
+  return empty ? 0 : std::max<int64_t>(Saturated(Int128{left} * right / divisor), 1);
+}
+
+// Per pair of relations, what an equality between them divides by: the domains of the edges
+// between that pair multiplied, capped at the larger of their row counts. 1 when no edge connects
+// them; `empty` when a key of theirs has no value at all.
+struct PairDivisors {
+  std::vector<int64_t> divisor;  // relations x relations, 1 where no edge
+  std::vector<bool> empty;
+  std::size_t n = 0;
+
+  [[nodiscard]] std::size_t At(std::size_t u, std::size_t v) const { return (u * n) + v; }
+};
+
+PairDivisors DivisorsOf(std::span<const JoinRelation> relations, std::span<const JoinEdge> edges) {
+  const std::size_t n = relations.size();
+  PairDivisors out{
+      .divisor = std::vector<int64_t>(n * n, 1), .empty = std::vector<bool>(n * n, false), .n = n};
+  std::vector<Int128> product(n * n, 0);  // 0: no edge between the pair yet
+  for (const JoinEdge& edge : edges) {
+    ANTB1_CHECK(edge.a < n);
+    ANTB1_CHECK(edge.b < n);
+    ANTB1_CHECK(edge.a != edge.b);
+    const int64_t a = BlockDomain(relations, edge.a_domain, edge.a);
+    const int64_t b = BlockDomain(relations, edge.b_domain, edge.b);
+    const std::size_t at = out.At(std::min(edge.a, edge.b), std::max(edge.a, edge.b));
+    if (a == 0 || b == 0) {
+      out.empty[at] = true;  // a key with no value at all: the join keeps no row
+    }
+    // Within a pair the larger domain wins rather than the two multiplying: two keys between the
+    // same two relations are one composite key, and its parts narrow together -- a foreign key
+    // into a composite primary key is the common case, and multiplying there under-stated Q09's
+    // largest join by 7.5x and made the search choose it first (ADR 0026's C5).
+    product[at] = std::max({product[at], Int128{1}, Int128{a}, Int128{b}});
+  }
+  for (std::size_t u = 0; u < n; ++u) {
+    for (std::size_t v = u + 1; v < n; ++v) {
+      const std::size_t at = out.At(u, v);
+      out.divisor[at] = Saturated(std::max(product[at], Int128{1}));
+      out.divisor[out.At(v, u)] = out.divisor[at];
+      out.empty[out.At(v, u)] = out.empty[at];
+    }
+  }
+  return out;
+}
+
+// Dynamic programming over connected subsets (DPccp, Moerkotte and Neumann 2006), minimising the
+// rows the joins carry: cost(S) = cost(S1) + cost(S2) + rows(S) over the splits of S, and 0 for a
+// single relation, whose scan happens in any order. It ignores what a build costs, which rule 5
+// decides from its own estimate, and the scan, which every order pays alike (ADR 0026's C5).
+//
+// Edges are read as pairs of relation masks rather than pairs of indices. Every edge the binder
+// can build today has one relation on each side, so the masks are singletons -- but it makes
+// Connected already the test a hypergraph needs, and Neighbours and Connected are then the only
+// two places the graph model is consulted, which is the seam DPhyp would replace.
+class Searcher {
+ public:
+  using Mask = std::uint32_t;
+
+  Searcher(std::span<const JoinRelation> relations, std::span<const JoinEdge> edges)
+      : relations_(relations), edges_(edges), n_(relations.size()) {
+    ANTB1_CHECK(n_ >= 2);
+    ANTB1_CHECK(n_ <= kSearchRelations);
+    adjacent_.assign(n_, 0);
+    ends_.reserve(edges.size());
+    for (const JoinEdge& edge : edges) {
+      ends_.push_back(Ends{.u = Mask{1} << edge.a, .v = Mask{1} << edge.b});
+      adjacent_[edge.a] |= Mask{1} << edge.b;
+      adjacent_[edge.b] |= Mask{1} << edge.a;
+    }
+    rows_.assign(std::size_t{1} << n_, -1);
+    memo_.assign(std::size_t{1} << n_, Entry{});
+  }
+
+  struct Entry {
+    int64_t cost = -1;  // -1: no plan for this subset
+    Mask left = 0;      // the split that won; 0 for a single relation
+    Mask right = 0;
+  };
+
+  // Whether a plan was found for every relation at once. It is not when the relations are not
+  // connected, which the binder rejects before this runs.
+  bool Solve() {
+    for (std::size_t r = 0; r < n_; ++r) {
+      memo_[Mask{1} << r].cost = 0;
+    }
+    // The enumeration finds every connected complement pair exactly once; a second pass applies
+    // them in order of the size of their union, so the programme can never read a sub-plan it has
+    // not solved. Keeping the two apart is what makes the enumeration's bookkeeping testable
+    // against a plain reference search rather than only reviewable.
+    for (std::size_t i = n_; i-- > 0;) {
+      const Mask seed = Mask{1} << i;
+      FindComplements(seed);
+      GrowSubgraph(seed, Below(i) | seed);
+    }
+    std::ranges::stable_sort(
+        pairs_, [](const std::pair<Mask, Mask>& x, const std::pair<Mask, Mask>& y) {
+          const Mask sx = x.first | x.second;
+          const Mask sy = y.first | y.second;
+          return std::popcount(sx) != std::popcount(sy) ? std::popcount(sx) < std::popcount(sy)
+                                                        : sx < sy;
+        });
+    for (const auto& [left, right] : pairs_) {
+      Consider(left, right);
+    }
+    return memo_[All()].cost >= 0;
+  }
+
+  [[nodiscard]] Mask All() const { return static_cast<Mask>((std::uint64_t{1} << n_) - 1); }
+
+  // The steps of the plan that won, children before parents: a subset of one relation is an
+  // operand rather than a step, and every other is the join of the split the programme chose.
+  // Returns the operand that names the whole plan and the rows it carries.
+  struct Emitted {
+    JoinOperand operand;
+    std::optional<int64_t> rows;  // a relation's own count, or a subtree's estimate
+  };
+
+  Emitted Emit(Mask s, int64_t ratio, std::vector<JoinStep>& steps) const {
+    if (std::popcount(s) == 1) {
+      const std::size_t r = Lowest(s);
+      // The relation's own count, unknown and all: ChooseBuildSide must see that it is unknown
+      // rather than a stand-in for it, since unknown may never read as small.
+      return Emitted{.operand = JoinOperand{.step = false, .index = r}, .rows = relations_[r].rows};
+    }
+    const Entry& entry = memo_[s];
+    const Emitted first = Emit(entry.left, ratio, steps);
+    const Emitted second = Emit(entry.right, ratio, steps);
+    // A side whose rows nothing knows is the left, so that the other is built: ChooseBuildSide
+    // keeps the right on an unknown estimate, and building a relation that turns out to be huge is
+    // the mistake the whole rule exists to avoid -- rule 1 kept such a relation as the probe, and
+    // this is how the search keeps that. Otherwise the lower minimum relation is the left, which
+    // Consider already settled. Orienting by the estimates instead would read better, but it would
+    // put the larger side on the left always and so make "unless the right is decisively larger"
+    // unreachable: the build-side ratio would silently stop doing anything.
+    const bool unknown_right = !second.rows.has_value() && first.rows.has_value();
+    const Emitted& left = unknown_right ? second : first;
+    const Emitted& right = unknown_right ? first : second;
+    const Mask left_mask = unknown_right ? entry.right : entry.left;
+    const Mask right_mask = unknown_right ? entry.left : entry.right;
+    std::vector<std::size_t> crossing;
+    for (std::size_t e = 0; e < ends_.size(); ++e) {
+      const Mask u = ends_[e].u;
+      const Mask v = ends_[e].v;
+      if (((u & left_mask) == u && (v & right_mask) == v) ||
+          ((v & left_mask) == v && (u & right_mask) == u)) {
+        crossing.push_back(e);
+      }
+    }
+    const int64_t rows =
+        JoinRowsOf(relations_, edges_, std::max<int64_t>(left.rows.value_or(kLargest), 0),
+                   std::max<int64_t>(right.rows.value_or(kLargest), 0), crossing);
+    steps.push_back(JoinStep{.left = left.operand,
+                             .right = right.operand,
+                             .edges = std::move(crossing),
+                             .build = ChooseBuildSide(left.rows, right.rows, ratio),
+                             .estimate = rows});
+    return Emitted{.operand = JoinOperand{.step = true, .index = steps.size() - 1}, .rows = rows};
+  }
+
+  // Memoised: one subset's rows are read once per split that reaches it.
+  int64_t Rows(Mask s) {
+    if (rows_[s] < 0) {
+      RelationSet set;
+      for (std::size_t r = 0; r < n_; ++r) {
+        if ((s & (Mask{1} << r)) != 0) {
+          set.set(r);
+        }
+      }
+      rows_[s] = SubsetRows(relations_, edges_, set);
+    }
+    return rows_[s];
+  }
+
+ private:
+  // The index of the lowest relation in `s`, which must hold one. Spelt with bit_width rather
+  // than the obvious standard call, whose name the repository's spell check rejects.
+  [[nodiscard]] static std::size_t Lowest(Mask s) {
+    return static_cast<std::size_t>(std::bit_width(s & (~s + 1)) - 1);
+  }
+  // The relations of index below `i`.
+  [[nodiscard]] static Mask Below(std::size_t i) { return (Mask{1} << i) - 1; }
+
+  // The relations an edge connects to `s`, minus `s` itself and minus `forbidden`. One of the two
+  // places the graph model is read.
+  [[nodiscard]] Mask Neighbours(Mask s, Mask forbidden) const {
+    Mask out = 0;
+    for (std::size_t r = 0; r < n_; ++r) {
+      if ((s & (Mask{1} << r)) != 0) {
+        out |= adjacent_[r];
+      }
+    }
+    return out & ~s & ~forbidden;
+  }
+
+  // Whether an edge joins the two sets: with pair edges, one end in each. The other place the
+  // graph model is read, and already the shape a hyperedge needs (u subset of s1, v of s2).
+  [[nodiscard]] bool Connected(Mask s1, Mask s2) const {
+    return std::ranges::any_of(ends_, [s1, s2](const Ends& ends) {
+      return ((ends.u & s1) == ends.u && (ends.v & s2) == ends.v) ||
+             ((ends.v & s1) == ends.v && (ends.u & s2) == ends.u);
+    });
+  }
+
+  // Every non-empty subset of `set`, in a fixed order.
+  template <class Visit>
+  static void ForEachSubset(Mask set, Visit&& visit) {
+    for (Mask sub = set; sub != 0; sub = (sub - 1) & set) {
+      visit(sub);
+    }
+  }
+
+  // Grows a connected subgraph from `s`, emitting the complements of every one it reaches.
+  void GrowSubgraph(Mask s, Mask forbidden) {
+    const Mask neighbours = Neighbours(s, forbidden);
+    ForEachSubset(neighbours, [&](Mask add) { FindComplements(s | add); });
+    ForEachSubset(neighbours, [&](Mask add) { GrowSubgraph(s | add, forbidden | neighbours); });
+  }
+
+  // The connected complements of `s`, each paired with it.
+  void FindComplements(Mask s) {
+    const std::size_t lowest = Lowest(s);
+    const Mask forbidden = s | Below(lowest);
+    const Mask neighbours = Neighbours(s, forbidden);
+    for (std::size_t v = n_; v-- > 0;) {
+      const Mask bit = Mask{1} << v;
+      if ((neighbours & bit) == 0) {
+        continue;
+      }
+      pairs_.emplace_back(s, bit);
+      GrowComplement(s, bit, forbidden | (neighbours & (Below(v) | bit)));
+    }
+  }
+
+  // Grows the complement `s2` of `s1`, pairing the two whenever an edge still joins them.
+  void GrowComplement(Mask s1, Mask s2, Mask forbidden) {
+    const Mask neighbours = Neighbours(s2, forbidden);
+    ForEachSubset(neighbours, [&](Mask add) {
+      if (Connected(s1, s2 | add)) {
+        pairs_.emplace_back(s1, s2 | add);
+      }
+    });
+    ForEachSubset(neighbours,
+                  [&](Mask add) { GrowComplement(s1, s2 | add, forbidden | neighbours); });
+  }
+
+  // The join of two solved subsets, if it is the cheapest plan for their union so far. Ties keep
+  // the plan found first, and the pairs are applied in a fixed order, so the choice is a function
+  // of the relations and the edges alone.
+  void Consider(Mask s1, Mask s2) {
+    const Entry& left = memo_[s1];
+    const Entry& right = memo_[s2];
+    ANTB1_CHECK(left.cost >= 0);  // applied in order of size: a sub-plan is always solved
+    ANTB1_CHECK(right.cost >= 0);
+    const Mask s = s1 | s2;
+    // The rows the join produces, and the rows it has to hold to produce them: a hash join builds
+    // one side into a table and streams the other past it, so a plan that carries few rows but
+    // builds a huge side is not cheap. Counting only the output is the textbook C_out, and it
+    // chose exactly such a plan for Q09 -- 79% slower than the greedy one (ADR 0026's C5).
+    const Int128 cost = Int128{left.cost} + right.cost + Rows(s) + std::min(Rows(s1), Rows(s2));
+    const int64_t total = Saturated(cost);
+    Entry& out = memo_[s];
+    if (out.cost >= 0 && out.cost <= total) {
+      return;
+    }
+    // The lower minimum relation is the left input, so that a tree reads from where it begins.
+    const bool flip = Lowest(s2) < Lowest(s1);
+    out = Entry{.cost = total, .left = flip ? s2 : s1, .right = flip ? s1 : s2};
+  }
+
+  struct Ends {
+    Mask u = 0;
+    Mask v = 0;
+  };
+
+  std::span<const JoinRelation> relations_;
+  std::span<const JoinEdge> edges_;
+  std::size_t n_;
+  std::vector<Mask> adjacent_;
+  std::vector<Ends> ends_;
+  std::vector<int64_t> rows_;
+  std::vector<Entry> memo_;
+  std::vector<std::pair<Mask, Mask>> pairs_;
+};
+
 // The greedy walk of OrderJoins.
 class Orderer {
  public:
   Orderer(std::span<const JoinRelation> relations, std::span<const JoinEdge> edges,
-          int64_t build_side_ratio)
+          int64_t build_side_ratio, JoinOrderSearch search)
       : relations_(relations),
         edges_(edges),
         edges_of_(EdgesOf(relations.size(), edges)),
         joined_(relations.size(), false),
-        ratio_(build_side_ratio) {
+        ratio_(build_side_ratio),
+        search_(search) {
     ANTB1_CHECK(build_side_ratio >= 100);
   }
 
   std::vector<JoinStep> Order() {
+    if (search_ == JoinOrderSearch::kCost && relations_.size() >= 2 &&
+        relations_.size() <= kSearchRelations) {
+      Searcher searcher(relations_, edges_);
+      if (searcher.Solve()) {
+        std::vector<JoinStep> steps;
+        searcher.Emit(searcher.All(), ratio_, steps);
+        return steps;
+      }
+      // No plan for every relation at once: they are not connected, which the binder rejects
+      // before this runs. Falling through lets the greedy walk's own check say so.
+    }
+    return Greedy();
+  }
+
+  std::vector<JoinStep> Greedy() {
     std::vector<JoinStep> steps;
     if (relations_.size() < 2) {
       if (relations_.size() == 1) {
@@ -120,30 +460,31 @@ class Orderer {
 
   // The estimated rows of joining `candidate` to the joined relations (`rows` of them), or
   // std::nullopt when no edge joins it to them.
-  [[nodiscard]] std::optional<int64_t> Estimate(std::size_t candidate, int64_t rows) const {
-    bool connected = false;
-    bool empty = rows == 0 || Rows(candidate) == 0;
-    int64_t divisor = 1;
+  // The rows a join of inputs of `left` and `right` rows produces, from the edges between them,
+  // as everything that decides memory must read it: the largest domain of any of those edges
+  // divides, so a second key reads as no more selective than the stronger one. A composite key has
+  // at least as many distinct values as its most selective column, so this never over-states
+  // selectivity -- and under-stating the rows of a build is what materialises a side that does not
+  // fit. ADR 0026's C5 records the query that proved it. This is the estimate a step carries and
+  // the one ChooseBuildSide reads; only the search reads the narrower one below.
+  // The edges between `candidate` and the relations joined so far, ascending.
+  [[nodiscard]] std::vector<std::size_t> Crossing(std::size_t candidate) const {
+    std::vector<std::size_t> out;
     for (const std::size_t e : edges_of_[candidate]) {
       const JoinEdge& edge = edges_[e];
-      const bool on_a = edge.a == candidate;
-      const std::size_t other = on_a ? edge.b : edge.a;
-      if (!joined_[other]) {
-        continue;
+      if (joined_[edge.a == candidate ? edge.b : edge.a]) {
+        out.push_back(e);
       }
-      connected = true;
-      const int64_t mine = Domain(on_a ? edge.a_domain : edge.b_domain, candidate);
-      const int64_t theirs = Domain(on_a ? edge.b_domain : edge.a_domain, other);
-      empty = empty || mine == 0 || theirs == 0;
-      divisor = std::max({divisor, mine, theirs});
     }
-    if (!connected) {
-      return std::nullopt;
+    return out;
+  }
+
+  [[nodiscard]] std::optional<int64_t> Estimate(std::size_t candidate, int64_t rows) const {
+    const std::vector<std::size_t> crossing = Crossing(candidate);
+    if (crossing.empty()) {
+      return std::nullopt;  // no edge to the joined relations: it cannot join yet
     }
-    if (empty) {
-      return 0;
-    }
-    return std::max<int64_t>(Saturated(Int128{rows} * Rows(candidate) / divisor), 1);
+    return JoinRowsOf(relations_, edges_, rows, Rows(candidate), crossing);
   }
 
   // The side the step that adds `relation` builds on (rule 5): the relation it adds, unless its
@@ -165,12 +506,7 @@ class Orderer {
                   .edges = {},
                   .build = Build(relation, joined_rows),
                   .estimate = estimate};
-    for (const std::size_t e : edges_of_[relation]) {
-      const JoinEdge& edge = edges_[e];
-      if (joined_[edge.a == relation ? edge.b : edge.a]) {
-        step.edges.push_back(e);
-      }
-    }
+    step.edges = Crossing(relation);
     joined_[relation] = true;
     return step;
   }
@@ -180,6 +516,7 @@ class Orderer {
   std::vector<std::vector<std::size_t>> edges_of_;
   std::vector<bool> joined_;
   int64_t ratio_;  // hundredths of a factor, at least 100
+  JoinOrderSearch search_;
 };
 
 // One overload per node type: a node type without one fails to compile.
@@ -244,9 +581,63 @@ std::optional<std::size_t> FirstUnconnected(std::size_t relations,
   return Narrow<std::size_t>(first - reached.begin());
 }
 
+int64_t SubsetRows(std::span<const JoinRelation> relations, std::span<const JoinEdge> edges,
+                   RelationSet set) {
+  const PairDivisors pairs = DivisorsOf(relations, edges);
+  // In relation order, multiplying each relation's rows in and dividing by the divisor of every
+  // pair it closes with a relation already taken in. Dividing as it goes keeps the running value
+  // near a real cardinality, so nothing overflows in practice, and the order is fixed, so the
+  // answer is the subset's and not any order's.
+  Int128 running = 1;
+  RelationSet done;
+  bool empty = false;
+  for (std::size_t r = 0; r < relations.size(); ++r) {
+    if (!set.test(r)) {
+      continue;
+    }
+    const int64_t rows = BlockRows(relations, r);
+    running = Multiplied(running, rows);
+    empty = empty || rows == 0;
+    for (std::size_t u = 0; u < r; ++u) {
+      if (!done.test(u)) {
+        continue;
+      }
+      empty = empty || pairs.empty[pairs.At(u, r)];
+      running /= pairs.divisor[pairs.At(u, r)];
+    }
+    done.set(r);
+  }
+  return empty ? 0 : std::max<int64_t>(Saturated(running), 1);
+}
+
+int64_t OrderCost(std::span<const JoinRelation> relations, std::span<const JoinEdge> edges,
+                  std::span<const JoinStep> steps) {
+  // Per step, the relations below it, so that its own rows can be read from the set it produces.
+  std::vector<RelationSet> below(steps.size());
+  Int128 cost = 0;
+  for (std::size_t k = 0; k < steps.size(); ++k) {
+    const auto set_of = [&](const JoinOperand& operand) {
+      RelationSet out;
+      if (operand.step) {
+        out = below[operand.index];
+      } else {
+        out.set(operand.index);
+      }
+      return out;
+    };
+    const RelationSet left = set_of(steps[k].left);
+    const RelationSet right = set_of(steps[k].right);
+    below[k] = left | right;
+    cost += SubsetRows(relations, edges, below[k]) +
+            std::min(SubsetRows(relations, edges, left), SubsetRows(relations, edges, right));
+  }
+  return Saturated(cost);
+}
+
 std::vector<JoinStep> OrderJoins(std::span<const JoinRelation> relations,
-                                 std::span<const JoinEdge> edges, int64_t build_side_ratio) {
-  return Orderer(relations, edges, build_side_ratio).Order();
+                                 std::span<const JoinEdge> edges, int64_t build_side_ratio,
+                                 JoinOrderSearch search) {
+  return Orderer(relations, edges, build_side_ratio, search).Order();
 }
 
 BuildSide ChooseBuildSide(const std::optional<int64_t>& left, const std::optional<int64_t>& right,

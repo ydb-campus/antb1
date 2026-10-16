@@ -4745,7 +4745,8 @@ arrow::Status Binder::OrderBlock(std::size_t b) {
                     scope_.bindings()[missing].name(), scope_.bindings()[first].name()),
         stmt_.from[missing].span);
   }
-  block.steps = OrderJoins(block.stats, block.edges, options_.build_side_ratio);
+  block.steps =
+      OrderJoins(block.stats, block.edges, options_.build_side_ratio, options_.join_order);
   return arrow::Status::OK();
 }
 

@@ -391,6 +391,75 @@ changes.
 - **C5, feat(plan): cost-based join order with filter selectivity.** Rules 1 and 4 with the estimates of C1, for the
   queries that carry a join's output through later joins that would have cut it: Q5, and Q7 only once its selectivity
   is visible (see below).
+  - Update (2026-10-16, C5): **shipped.** The greedy rule gives way to dynamic programming over the subsets the join
+    conditions connect (DPccp, Moerkotte and Neumann 2006), minimising the rows each join produces plus the rows it
+    must hold to produce them. A block of more than 12 relations keeps the greedy rule, which `--join-order greedy`
+    also selects for any block; it reproduces every one of the 22 plans byte for byte, so the rule it replaces stays
+    reachable and comparable.
+  - **Exec needed no change, against this ADR's expectation.** A bushy tree already binds, plans, profiles and
+    answers: `PipelineInput` descends only probe sides, so each part pipeline keeps its single scan, and
+    `PipelineBuildsOf`, `MakeJoinBuild` and `PartsOf` already recurse through a join on a build side. A LEFT JOIN unit
+    and a derived table have been producing a join as another join's input all along. C5 is planner-only.
+  - **Measured at SF 100, 4 threads, best of 2**, against the greedy rule on the same binary:
+
+    | query | greedy | search | |
+    | --- | ---: | ---: | --- |
+    | Q10 | 22.69 s | **9.49 s** | **-58%** |
+    | Q21 | 28.92 s | **22.29 s** | **-23%** |
+    | Q05 | 16.26 s | **14.82 s** | **-8.9%** |
+    | Q11 | 1.42 s | 1.90 s | **+33%** |
+
+    The geomean over the 22 falls from 7.73 s to 7.37 s, 2.8x DuckDB to 2.7x, with everything else inside the +-8%
+    band DuckDB's own unchanged binary showed over the same pair of runs. Peak memory falls where plans move: Q03
+    4.79 GB to 1.33 GB, Q07 7.59 GB to 1.05 GB, Q10 5.40 GB to 3.67 GB. **Q10 was the worst query of the 22 at 6.1x
+    and is now 2.8x** — which was not the target; Q05 was, and gained the least of the three.
+  - **Two estimates, because the two consumers need opposite errors.** Everything that decides memory — a step's
+    stored estimate and every `ChooseBuildSide` call — keeps C1's reading, the largest single key domain, which never
+    over-states selectivity. Only the search's cost reads the narrower one, where each pair of relations divides once.
+    A search only compares orders, so an optimistic estimate costs a worse plan; a build side reads it to decide what
+    to materialise, where the same optimism costs the query. **The search may be optimistic; the build side may not.**
+  - **The estimate rule took two tries, and only measurement caught the first.** Multiplying the domains of *every*
+    key made Q09 fail outright at SF 100 (25.5 s and 11.65 GB became an out-of-memory error against a 41.23 GB
+    limit): `lineitem` joins `partsupp` on `(l_partkey, l_suppkey) = (ps_partkey, ps_suppkey)`, a composite foreign
+    key whose parts are perfectly correlated, so the product read 2,400 rows where there are about 600M, and three
+    build sides flipped. Capping each pair's product at its larger row count left it 7.5x low, which still made the
+    search choose that join first and cost 79%. The rule that works takes the **largest domain within a pair of
+    relations** and multiplies **across** pairs: two conditions between the same two relations are the one composite
+    key they describe, while conditions to different relations narrow in turn. Q09 is then neutral and Q05 keeps its
+    gain. Nothing in a Parquet footer records a composite distinct count, so this is a choice of bound and not a
+    measurement; the ADR's determinism property is unaffected, since it is still integer arithmetic over metadata.
+  - **DPccp over relation masks, not DPhyp.** DPhyp generalises the same enumeration to hyperedges and to
+    reorderability constraints, and antb1 has neither: a `JoinEdge` is a pair, every join the order builds is inner,
+    and a LEFT JOIN unit is one opaque relation of its block. Over a simple graph DPhyp *is* DPccp, so its extra
+    machinery would ship with no test able to reach it. Its producer would be opening those units up so that outer
+    joins join the order — a separate semantic change — and adopting TPC-DS would not create one by itself. The
+    search therefore reads edges as **pairs of relation masks** even though every edge has one relation on each side
+    today, which makes its connectivity test already the one a hypergraph needs and leaves `Neighbours` and
+    `Connected` as the only two places the graph model is read: the seam DPhyp would replace.
+  - **A plain subset-and-split search stays in the tests as the reference.** DPccp's forbidden-set bookkeeping is
+    intricate, and a connected pair it loses would only make the plan quietly worse — nothing else would notice. The
+    reference agrees with it on cost and plan for every graph in the test set, which is what turned the Q09
+    regression into a question about the estimate rather than about the enumeration.
+  - **Two orientation rules that look cosmetic and are not.** A side whose rows nothing knows is made the left, so
+    that the other is built: `ChooseBuildSide` keeps the right on an unknown estimate, and rule 1 used to keep such a
+    relation as the probe. Otherwise the lower relation index is the left. Orienting by the estimates instead reads
+    better and keeps a plan independent of the order a `FROM` list is written in, but it puts the larger side on the
+    left always, which makes "unless the right is decisively larger" unreachable and silently stops
+    `--build-side-ratio` doing anything. Which side is *built* does not depend on the orientation; only the labels do,
+    so `plan.BinderTest` now pins the built relation rather than the branches.
+- **C5a, perf(plan): cost the join's own layout, deferred 2026-10-16.** The one regression C5 leaves: **Q11 is 33%
+  slower** (1.42 s to 1.90 s), and the cause is exact. Its new plan reduces `supplier` to the 40,045 rows of one
+  nation before the large join — the classic star-schema move, and it carries 3.2M rows where the greedy plan carries
+  80M. But `s_suppkey` is dense over all of `supplier`, 1..1,000,000 over 1,000,000 rows, so a build on the whole
+  table qualifies for the direct layout: an array indexed by the key, no hashing. The 40,045 surviving keys stay
+  spread over the same range, so `max - min + 1` of about 1,000,000 against `8 x 40,045` fails `JoinTable`'s
+  density test and the build falls back to hashing. Measured over the same 80M probes: `find` goes from 77 ms to
+  865 ms, about 22x per probe, and the two blocks' join time accounts for the whole regression to the millisecond.
+  **Making a build 25x smaller made it 11x dearer to probe.** Filtering a build shrinks its rows but not its key's
+  range, so it can only ever lose the layout, never gain it. A cost model that saw this would need each subset to
+  carry its key's footer range beside its estimated rows and to know which side rule 5 will build; the data is in
+  `ColumnRange` already and the model would get this case right. Until then the search is blind to it, and the trade
+  is 0.46 s on Q11 against 13 s on Q10.
 
 Re-profiling all 22 at SF 100 after C1 and C3a says the roadmap above no longer matches where the time is. Three of
 the four worst queries need items this ADR does not own, and two of those are deferrals of ADR 0022's whose triggers

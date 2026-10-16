@@ -943,15 +943,27 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   a bind error, as for any number (divergence D4). A scan that reads a DECIMAL column applies no predicate itself, so
   every `WHERE` condition of that scan is evaluated by the `Filter` (`explain --analyze` shows no pushed predicate),
   and a condition on a DECIMAL column skips no row group ([ADR 0021](adr/0021-decimal-semantics.md)).
-- Join order and build sides: the relations of a `FROM` list join left-deep in the order their estimated rows choose
-  ([ADR 0022](adr/0022-joins-and-query-blocks.md)), and the estimates account for the conjuncts routed to each
-  relation, from the row counts, minimums, maximums and null counts in the Parquet footers, with a documented default
-  factor for every condition the footers cannot measure ([ADR 0026](adr/0026-join-performance.md)). A join builds its
-  hash table on the relation it adds and probes with the rest; it builds on the rest instead when the relation it adds
-  is estimated at more than `--build-side-ratio` times them (default 4; `1` always builds on the smaller side). The
-  ratio changes which plan a query gets, never its answer, and an unknown estimate on either side never moves a
-  build. Estimates are integer arithmetic over footer metadata alone, so a plan is the same on every host and for any
-  number of threads; `explain` prints `build=left|right` on every join.
+- Join order and build sides: the relations of a `FROM` list join in the order and the tree shape that carry the
+  fewest rows between the joins, chosen by dynamic programming over the subsets the join conditions connect
+  ([ADR 0026](adr/0026-join-performance.md), C5). The tree need not be a chain: two groups of relations may be
+  reduced separately and then joined, which is often much cheaper for a schema whose dimensions hang off one large
+  table. The cost counts the rows each join produces and the rows it has to hold to produce them; it does not count
+  the scans, which every order pays alike. A block of more than 12 relations keeps ADR 0022's older rule, the
+  largest relation probing and the smallest join next, which `--join-order greedy` also selects for any block.
+- The estimates behind that order account for the conjuncts routed to each relation, from the row counts, minimums,
+  maximums and null counts in the Parquet footers, with a documented default factor for every condition the footers
+  cannot measure. Each join condition narrows by the larger of its two columns' distinct-value estimates; two
+  conditions between the same pair of relations narrow only once, being one composite key, while conditions to
+  different relations narrow in turn. A join builds its hash table on its right input and probes with its left; it
+  builds on the left instead when the right is estimated at more than `--build-side-ratio` times it (default 4; `1`
+  always builds on the smaller side). The ratio changes which plan a query gets, never its answer, and an estimate
+  nothing knows never moves a build -- a relation of unknown size is probed, never built. Estimates are integer
+  arithmetic over footer metadata alone, so a plan is the same on every host and for any number of threads; `explain`
+  prints `build=left|right` on every join.
+- What the order does **not** account for: a build whose one integer key is dense enough is probed by an array
+  indexed by the key rather than by a hash table, which is about twenty times faster per probe, and reducing that
+  side's rows without reducing its key's range loses it. So a plan that carries fewer rows can still be slower. ADR
+  0026 records the query this costs and leaves the cost of the layout to a later change.
 - A semi join of a correlated `EXISTS`, and an anti join of a correlated `NOT EXISTS`, build on the side they
   preserve -- the outer one -- when the subquery's side is estimated at more than the same ratio times it
   ([ADR 0026](adr/0026-join-performance.md)): such a subquery over a large table otherwise builds the whole of that
