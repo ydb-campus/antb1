@@ -212,6 +212,95 @@ plan::ExprPtr Named(const plan::ExprPtr& expr, std::string name) {
   return std::make_shared<const plan::Expr>(std::move(copy));
 }
 
+// A constant operand reaches Arrow's kernel as the one scalar value it is rather than as an array
+// of copies of itself (ADR 0026's C11), so it has to answer and fail exactly as a *column* of that
+// value does. Each case below is computed both ways and compared, which is the only way to see a
+// difference the scalar path could introduce: the result of the two is otherwise identical.
+TEST_F(ComputeTest, AConstantOperandAnswersAsAColumnOfItWould) {
+  struct Case {
+    std::string what;
+    plan::ExprPtr constant;                // the operand as a constant
+    std::shared_ptr<arrow::Array> column;  // the same value as a column, row for row
+    std::shared_ptr<arrow::Array> values;  // the other operand
+    LogicalType operand;                   // the other operand's type
+    LogicalType result;
+    ArithOp op = ArithOp::kAdd;
+  };
+  const LogicalType d2_1 = LogicalType::Decimal(2, 1);
+  const std::vector<Case> cases = {
+      // An INTEGER constant narrowed into a SMALLINT result, and a row it overflows.
+      {.what = "narrowed, fits",
+       .constant = ConstantOf(1, LogicalType::kInteger),
+       .column = testing::Int32s({1, 1, 1}),
+       .values = Int16s({1, std::nullopt, 32766}),
+       .operand = LogicalType::kSmallInt,
+       .result = LogicalType::kSmallInt},
+      {.what = "narrowed, overflows the result",
+       .constant = ConstantOf(1, LogicalType::kInteger),
+       .column = testing::Int32s({1}),
+       .values = Int16s({32767}),
+       .operand = LogicalType::kSmallInt,
+       .result = LogicalType::kSmallInt},
+      // A constant that does not fit the result type at all: the cast fails, both ways.
+      {.what = "does not fit the result type",
+       .constant = ConstantOf(100000, LogicalType::kInteger),
+       .column = testing::Int32s({100000}),
+       .values = Int16s({1}),
+       .operand = LogicalType::kSmallInt,
+       .result = LogicalType::kSmallInt},
+      // The same over no rows, which is the one place the two could part: there is no value to
+      // convert, so neither raises. Taking the constant as a scalar would have raised on the
+      // constant alone, which is why a conversion it fails goes back to the array path.
+      {.what = "does not fit the result type, over no rows",
+       .constant = ConstantOf(100000, LogicalType::kInteger),
+       .column = testing::Int32s({}),
+       .values = Int16s({}),
+       .operand = LogicalType::kSmallInt,
+       .result = LogicalType::kSmallInt},
+      // A DECIMAL constant beside a DOUBLE column, which is how a decimal literal meets one
+      // (`f + 1.5` is DOUBLE + DECIMAL(2,1)): the conversion is DuckDB's, not Arrow's cast.
+      {.what = "a decimal literal into DOUBLE",
+       .constant = ConstantOf(15, d2_1),
+       .column = Decimals(d2_1, {"15", "15", "15"}),
+       .values = Doubles({1.5, -0.25, std::nullopt}),
+       .operand = LogicalType::kDouble,
+       .result = LogicalType::kDouble},
+      // A decimal past the exactly representable range, where DuckDB's conversion splits the value
+      // and adds the parts rather than dividing the whole (DuckDbDecimalToReal). Taking the
+      // constant through CastTo rather than Arrow's own cast is what keeps it converting as a
+      // column of it would; the two agree on every value tried here, including this one, so this
+      // case asserts the invariant rather than proving the routing necessary.
+      {.what = "a decimal past the exactly representable range",
+       .constant = ConstantOf((Int128{9007199254740992} * 10000000000) + 9999999999,
+                              LogicalType::Decimal(38, 10)),
+       .column = Decimals(LogicalType::Decimal(38, 10), {"90071992547409929999999999"}),
+       .values = Doubles({1.0}),
+       .operand = LogicalType::kDouble,
+       .result = LogicalType::kDouble},
+      {.what = "a BIGINT multiply that overflows",
+       .constant = ConstantOf(2, LogicalType::kInteger),
+       .column = testing::Int32s({2}),
+       .values = Int64s({std::numeric_limits<int64_t>::max()}),
+       .operand = LogicalType::kBigInt,
+       .result = LogicalType::kBigInt,
+       .op = ArithOp::kMultiply},
+  };
+  for (const Case& c : cases) {
+    SCOPED_TRACE(c.what);
+    auto with_constant =
+        Eval(Arith(c.op, ColumnAt(0, c.operand), c.constant, c.result), {c.values});
+    auto with_column =
+        Eval(Arith(c.op, ColumnAt(0, c.operand), ColumnAt(1, c.constant->type), c.result),
+             {c.values, c.column});
+    EXPECT_EQ(with_constant.ok(), with_column.ok());
+    if (with_constant.ok() && with_column.ok()) {
+      EXPECT_EQ((*with_constant)->ToString(), (*with_column)->ToString());
+    } else {
+      EXPECT_EQ(with_constant.status().message(), with_column.status().message());
+    }
+  }
+}
+
 // DECIMAL + and - rescale both operands to the result's scale, * multiplies the unscaled values;
 // only a width capped to 18 or 38 can overflow, with DuckDB 1.5.5's messages (ADR 0021 rule 7).
 TEST_F(ComputeTest, DecimalArithmetic) {
