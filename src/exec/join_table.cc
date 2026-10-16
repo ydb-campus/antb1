@@ -43,6 +43,22 @@ constexpr std::uint64_t kMaxRows = std::numeric_limits<std::uint32_t>::max();
 // The low bits of a hash pick its partition, the bits above them its bucket.
 constexpr unsigned kPartitionBits = 6;
 static_assert((std::size_t{1} << kPartitionBits) == kJoinPartitions);
+// How sparse the direct layout's index may be, in slots of 4 bytes per row of the build, and how
+// much sparser it may be when the query can afford the memory. A filtered build keeps the whole key
+// range it was selected from, so the move the join order makes to carry fewer rows -- reduce a
+// relation before it joins -- is exactly what makes a key sparse, on the column it was densest on.
+// The index stays the cheaper read far past the first bound and past any cache: at SF 100 a build
+// of 40,045 rows spanning 1,000,000 (25 slots a row) answers 80M probes in 52ms direct against
+// 884ms hashed, and one of 22.8M rows spanning 600M (26 slots a row, a 2.4 GB index) makes its
+// query 17% faster. One dependent load beats a hash, a bucket load and a key compare whether or not
+// either side fits in cache (ADR 0026's C5a).
+constexpr std::uint64_t kDirectSlotsPerRow = 8;
+// Past that the index is gigabytes the hashed layout would not spend, so the sparser rule is only
+// taken when the limit can carry it: a build that would fail its budget on an index is better
+// hashed than failed. An eighth of the limit, the same reading of the same budget as OneAtATime's
+// half, and no bound at all when the query has no limit.
+constexpr std::uint64_t kSparseDirectSlotsPerRow = 32;
+constexpr int64_t kSparseDirectLimitShare = 8;
 
 arrow::Status TooManyRows() {
   return arrow::Status::OutOfMemory("a join build of more than ", kMaxRows, " rows");
@@ -101,6 +117,16 @@ arrow::Status Room(std::vector<T>& values, MemoryReservation& memory) {
       memory.Resize(memory.bytes() + Narrow<int64_t>((capacity - values.capacity()) * sizeof(T))));
   values.reserve(capacity);
   return arrow::Status::OK();
+}
+
+// Whether a sparse direct index of `bytes` is within the share of the limit one may take. A query
+// without a limit is not bounded here; the reservation still charges every byte.
+bool Affordable(const MemoryBudget* budget, int64_t bytes) {
+  if (budget == nullptr) {
+    return true;
+  }
+  const std::optional<int64_t> limit = budget->limit();
+  return !limit.has_value() || bytes <= *limit / kSparseDirectLimitShare;
 }
 
 // Whether a build's partitions are built one at a time: the budget is under pressure, or would be
@@ -554,8 +580,11 @@ arrow::Status JoinTable::Build(std::span<const std::shared_ptr<const JoinBuildPa
   // to INT64_MAX do not overflow it.
   const std::uint64_t span =
       static_cast<std::uint64_t>(max_key) - static_cast<std::uint64_t>(min_key);
-  const bool direct =
-      spec_->direct_candidate() && num_rows > 0 && span < std::uint64_t{8} * num_rows;
+  // The second clause only multiplies and adds inside the first's bound, so neither overflows.
+  const bool direct = spec_->direct_candidate() && num_rows > 0 &&
+                      (span < kDirectSlotsPerRow * num_rows ||
+                       (span < kSparseDirectSlotsPerRow * num_rows &&
+                        Affordable(budget_, Narrow<int64_t>((span + 3) * sizeof(std::uint32_t)))));
   layout_ = direct ? Layout::kDirect : Layout::kHashed;
   // Everything but the hashed directories, reserved before it is allocated (the counting of the
   // direct layout needs one offset more than it keeps).

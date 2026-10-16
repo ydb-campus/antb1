@@ -962,8 +962,12 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   prints `build=left|right` on every join.
 - What the order does **not** account for: a build whose one integer key is dense enough is probed by an array
   indexed by the key rather than by a hash table, which is about twenty times faster per probe, and reducing that
-  side's rows without reducing its key's range loses it. So a plan that carries fewer rows can still be slower. ADR
-  0026 records the query this costs and leaves the cost of the layout to a later change.
+  side's rows without reducing its key's range makes the key sparser. The order does not read the layout, so a plan
+  that carries fewer rows can still be slower; what keeps the two from fighting is that the array is laid out far
+  past the density it needs to beat a hash, up to 32 slots a row -- the memory of 4 bytes a slot, bounded at an
+  eighth of `--memory-limit`, is all a sparser one costs ([ADR 0026](adr/0026-join-performance.md)). A query near its
+  limit is hashed rather than failed, so the limit changes how a join is laid out, never its answer; `explain
+  --analyze` prints `direct=1` on a build the array serves.
 - A semi join of a correlated `EXISTS`, and an anti join of a correlated `NOT EXISTS`, build on the side they
   preserve -- the outer one -- when the subquery's side is estimated at more than the same ratio times it
   ([ADR 0026](adr/0026-join-performance.md)): such a subquery over a large table otherwise builds the whole of that

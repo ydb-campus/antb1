@@ -1684,12 +1684,13 @@ TEST_F(HashJoinTest, ProfilesCountBuildsAndProbes) {
   const auto pool = MakeThreadPool();
   for (arrow::internal::Executor* executor : Executors(pool.get())) {
     SCOPED_TRACE(executor == nullptr ? "one thread" : "pool");
-    // Unique keys 0..11, 113 and 114 (too sparse for the direct layout); a NULL key in row 12.
+    // Unique keys 0..11, 1013 and 1014 (too sparse for the direct layout, which allows 32 slots a
+    // row); a NULL key in row 12.
     const auto build_table = KeyTable("b", 3, 5, [](int64_t i) -> std::optional<int64_t> {
       if (i == 12) {
         return std::nullopt;
       }
-      return i < 12 ? i : i + 100;
+      return i < 12 ? i : i + 1000;
     });
     ProfileNode build_node;
     const auto build = ScanBuild(build_table, {0}, &build_node);
@@ -1701,7 +1702,7 @@ TEST_F(HashJoinTest, ProfilesCountBuildsAndProbes) {
     EXPECT_EQ(MetricOf(build_node, "parts"), 3);
     EXPECT_EQ(MetricOf(build_node, "null_keys"), 1);
     EXPECT_EQ(MetricOf(build_node, "unique"), 1);
-    EXPECT_EQ(MetricOf(build_node, "direct"), 0);  // 113 and 114 make the range sparse
+    EXPECT_EQ(MetricOf(build_node, "direct"), 0);  // 1013 and 1014 make the range sparse
     for (const char* name : {"part_time", "wait", "lanes_tail", "finish"}) {
       EXPECT_TRUE(MetricOf(build_node, name).has_value()) << name;
     }
