@@ -613,6 +613,13 @@ this profiling fires:
   a repeated subtree rather than sharing it (`SameExpr` in `src/plan/binder.cc` would recognise it). That is a `plan`
   change, not an `exec` one, and it is what remains of this query.
 
+  One behaviour it does change, which no test can see and which review caught before the merge: where more than one
+  row of a batch would raise, the program reports the **first such row**, while the node-by-node path reports the
+  first failing row of the *left subtree*, having evaluated all of it before the right. Both raise, and each is
+  deterministic for a given plan and input, so what differs is which values the message names. Matching the old
+  order would mean evaluating every step over every row, which is the pass this item exists to remove, so the
+  difference is accepted and written down where the program runs.
+
   Two bugs of its own, both caught before the measurement and both pinned: the operand range check C9 had just added
   had to be carried into the program (a step whose rescale is a no-op still checks a column operand, and a `*`
   checks neither, as C9 established); and taking a single nullable column's own validity bitmap for the rows is

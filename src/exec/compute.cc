@@ -492,13 +492,20 @@ Int128 ScaleFactor(plan::LogicalType from, plan::LogicalType to, plan::ArithOp o
 // Runs `program` over `rows` rows, writing its last step's result. `valid` is the rows every column
 // the tree reads has a value for (nullptr: all of them); a row without one is NULL and no step runs
 // for it, so an operand a NULL row holds can never raise.
+//
+// One consequence of going row by row rather than node by node: where more than one row would
+// raise, this reports the first such row, while the recursive path reports the first failing row of
+// the *left subtree*, having evaluated all of it before the right. Both raise, and each is
+// deterministic for a given plan and input, so what differs is which values the message names. The
+// alternative is to evaluate every step over every row, which is the pass this exists to remove.
 arrow::Result<ArrayPtr> RunDecimalProgram(const DecimalProgram& program, int64_t rows,
                                           const std::uint8_t* valid, plan::LogicalType result,
                                           arrow::MemoryPool* pool) {
   arrow::Decimal128Builder builder(plan::ToArrow(result), pool);
   ARROW_RETURN_NOT_OK(builder.Reserve(rows));
   std::array<Int128, kMaxProgramSteps> slots{};
-  const std::size_t last = program.steps.size() - 1;  // Compile returns a step, so there is one
+  const std::span<const DecimalProgram::Step> steps(program.steps);
+  const std::size_t last = steps.size() - 1;  // Compile returns a step, so there is one
   const auto read = [&](const DecimalProgram::Source& source, std::size_t row) {
     switch (source.kind) {
       case DecimalProgram::Source::Kind::kColumn:
@@ -516,8 +523,8 @@ arrow::Result<ArrayPtr> RunDecimalProgram(const DecimalProgram& program, int64_t
     }
     const auto at = static_cast<std::size_t>(row);
     bool null = false;  // a % by zero, which is NULL rather than an error
-    for (std::size_t s = 0; s < program.steps.size(); ++s) {
-      const DecimalProgram::Step& step = program.steps[s];
+    for (std::size_t s = 0; s < steps.size(); ++s) {
+      const DecimalProgram::Step& step = steps[s];
       Int128 x = read(step.left, at);
       Int128 y = read(step.right, at);
       // The left operand is rescaled and checked before the right one, as the recursive path does.
