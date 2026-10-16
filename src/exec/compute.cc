@@ -1381,8 +1381,15 @@ struct Evaluator {
       return arrow::Datum{scalar};
     }
     ARROW_ASSIGN_OR_RAISE(const ArrayPtr one, arrow::MakeArrayFromScalar(*scalar, 1, pool));
-    ARROW_ASSIGN_OR_RAISE(const ArrayPtr converted, CastTo(one, type, ctx));
-    ARROW_ASSIGN_OR_RAISE(const std::shared_ptr<arrow::Scalar> value, converted->GetScalar(0));
+    const arrow::Result<ArrayPtr> converted = CastTo(one, type, ctx);
+    if (!converted.ok()) {
+      // A constant the result's type cannot hold. The array path converts the batch's own rows, so
+      // it raises this for a batch with rows and not for an empty one, where there is no value to
+      // convert; one row of it would raise either way. Rather than reason about which batches can
+      // be empty, the operand goes back the way it went before and raises what it raised before.
+      return std::nullopt;
+    }
+    ARROW_ASSIGN_OR_RAISE(const std::shared_ptr<arrow::Scalar> value, (*converted)->GetScalar(0));
     return arrow::Datum{value};
   }
 

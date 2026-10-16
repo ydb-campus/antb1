@@ -612,6 +612,22 @@ this profiling fires:
   `ep * (1 - disc)` twice**, once as its own output and once inside the second expression, because the binder copies
   a repeated subtree rather than sharing it (`SameExpr` in `src/plan/binder.cc` would recognise it). That is a `plan`
   change, not an `exec` one, and it is what remains of this query.
+  One behaviour it does change, which no test can see and which review caught before the merge: where more than one
+  row of a batch would raise, the program reports the **first such row**, while the node-by-node path reports the
+  first failing row of the *left subtree*, having evaluated all of it before the right. Both raise, and each is
+  deterministic for a given plan and input, so what differs is which values the message names. Matching the old
+  order would mean evaluating every step over every row, which is the pass this item exists to remove, so the
+  difference is accepted and written down where the program runs.
+
+  Two bugs of its own, both caught before the measurement and both pinned: the operand range check C9 had just added
+  had to be carried into the program (a step whose rescale is a no-op still checks a column operand, and a `*`
+  checks neither, as C9 established); and taking a single nullable column's own validity bitmap for the rows is
+  wrong for a **sliced** array, whose bitmap starts at the buffer rather than at the array's first row. The second
+  needed a twelve-row case sliced at row 8 to catch at all -- at any offset that is not a whole number of bytes the
+  code took the other path and the bug hid.
+
+## Alternatives considered
+
 - **C11, perf(exec): a constant operand as a scalar, not an array of copies, done 2026-10-16.** C9 stopped a DECIMAL
   constant being materialised; the **integer and DOUBLE path never got the same treatment**, and asking what it cost
   there gave a sharper answer than expected. Over 100M rows of one column, with a `GROUP BY` so that DuckDB's
@@ -643,22 +659,6 @@ this profiling fires:
   ways and compares answers *and* error messages, including a narrowing that fits, one that does not, an overflow,
   and a decimal past the exactly representable range. Worth recording that the two conversions agree on every value
   tried, so that case asserts the invariant rather than proving the routing necessary.
-
-  One behaviour it does change, which no test can see and which review caught before the merge: where more than one
-  row of a batch would raise, the program reports the **first such row**, while the node-by-node path reports the
-  first failing row of the *left subtree*, having evaluated all of it before the right. Both raise, and each is
-  deterministic for a given plan and input, so what differs is which values the message names. Matching the old
-  order would mean evaluating every step over every row, which is the pass this item exists to remove, so the
-  difference is accepted and written down where the program runs.
-
-  Two bugs of its own, both caught before the measurement and both pinned: the operand range check C9 had just added
-  had to be carried into the program (a step whose rescale is a no-op still checks a column operand, and a `*`
-  checks neither, as C9 established); and taking a single nullable column's own validity bitmap for the rows is
-  wrong for a **sliced** array, whose bitmap starts at the buffer rather than at the array's first row. The second
-  needed a twelve-row case sliced at row 8 to catch at all -- at any offset that is not a whole number of bytes the
-  code took the other path and the bug hid.
-
-## Alternatives considered
 
 - **Keep the footer-only estimates and swap the side by a rule of thumb** (build on a scan, probe a join; build on
   the second relation of the FROM list). Cheap, and it would fix Q12. Rejected: it is not a rule anyone can predict

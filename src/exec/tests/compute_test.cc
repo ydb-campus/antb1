@@ -212,7 +212,6 @@ plan::ExprPtr Named(const plan::ExprPtr& expr, std::string name) {
   return std::make_shared<const plan::Expr>(std::move(copy));
 }
 
-// DECIMAL + and - rescale both operands to the result's scale, * multiplies the unscaled values;
 // A constant operand reaches Arrow's kernel as the one scalar value it is rather than as an array
 // of copies of itself (ADR 0026's C11), so it has to answer and fail exactly as a *column* of that
 // value does. Each case below is computed both ways and compared, which is the only way to see a
@@ -247,6 +246,15 @@ TEST_F(ComputeTest, AConstantOperandAnswersAsAColumnOfItWould) {
        .constant = ConstantOf(100000, LogicalType::kInteger),
        .column = testing::Int32s({100000}),
        .values = Int16s({1}),
+       .operand = LogicalType::kSmallInt,
+       .result = LogicalType::kSmallInt},
+      // The same over no rows, which is the one place the two could part: there is no value to
+      // convert, so neither raises. Taking the constant as a scalar would have raised on the
+      // constant alone, which is why a conversion it fails goes back to the array path.
+      {.what = "does not fit the result type, over no rows",
+       .constant = ConstantOf(100000, LogicalType::kInteger),
+       .column = testing::Int32s({}),
+       .values = Int16s({}),
        .operand = LogicalType::kSmallInt,
        .result = LogicalType::kSmallInt},
       // A DECIMAL constant beside a DOUBLE column, which is how a decimal literal meets one
@@ -293,6 +301,7 @@ TEST_F(ComputeTest, AConstantOperandAnswersAsAColumnOfItWould) {
   }
 }
 
+// DECIMAL + and - rescale both operands to the result's scale, * multiplies the unscaled values;
 // only a width capped to 18 or 38 can overflow, with DuckDB 1.5.5's messages (ADR 0021 rule 7).
 TEST_F(ComputeTest, DecimalArithmetic) {
   const LogicalType p = LogicalType::Decimal(15, 2);
