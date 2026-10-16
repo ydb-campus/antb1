@@ -574,6 +574,139 @@ void BM_JoinTableProbe(benchmark::State& state) {
 }
 BENCHMARK(BM_JoinTableProbe)->Arg(0)->Arg(1)->Unit(benchmark::kMillisecond);
 
+// ---- Grouping: arrow::compute::Grouper, which GroupTable uses to turn key rows into group ids
+// ----
+//
+// The baseline for the table of docs/adr/0019-own-aggregation-hash-table.md, whose gate is 1.3x
+// this on every shape at 1000, 1 M and 4 M groups. A prototype of that table was 1.17-1.30x at 1-4
+// M groups and 0.22-0.70x at 1000, so the small counts are the ones to watch, not the large: a
+// table that wins only where the groups do not fit in cache is the prototype again.
+//
+// Rows, not groups, are what a benchmark iteration costs, so every shape reads kGroupRows of them
+// and the group count is the argument. At 4 M groups there is one row per group; at 1000 about four
+// thousand. `groups` reports what the grouper made, which is the argument exactly: the ids come
+// from a multiplication by an odd number modulo the count, which visits every group rather than
+// colliding as a random id would (a random one reached only 2.65 M of 4 M, and the gate names 4 M).
+
+constexpr int64_t kGroupRows =
+    int64_t{4} * 1024 * 1024;  // 64 batches of 64Ki rows, enough for 4 M groups
+
+// Which key columns a shape groups by. The gate's four: one and two fixed-width keys, a string, and
+// a fixed-width key beside a string.
+enum class GroupShape : std::uint8_t { kInt64, kInt64Int32, kString, kInt64String };
+
+// kGroupRows rows of `shape`'s key columns, in 64Ki-row batches, with keys over `groups` values; an
+// empty vector if they cannot be built. Each row's keys come from one group id, so a shape's
+// columns agree on which group a row belongs to and the group count is the id count.
+arrow::RecordBatchVector GroupInput(GroupShape shape, int64_t groups) {
+  arrow::FieldVector fields;
+  switch (shape) {
+    case GroupShape::kInt64:
+      fields = {arrow::field("k", arrow::int64())};
+      break;
+    case GroupShape::kInt64Int32:
+      fields = {arrow::field("k", arrow::int64()), arrow::field("j", arrow::int32())};
+      break;
+    case GroupShape::kString:
+      fields = {arrow::field("s", arrow::binary())};
+      break;
+    case GroupShape::kInt64String:
+      fields = {arrow::field("k", arrow::int64()), arrow::field("s", arrow::binary())};
+      break;
+  }
+  const auto schema = arrow::schema(fields);
+  const bool has_int64 = shape != GroupShape::kString;
+  const bool has_int32 = shape == GroupShape::kInt64Int32;
+  const bool has_string = shape == GroupShape::kString || shape == GroupShape::kInt64String;
+  arrow::RecordBatchVector out;
+  // An odd stride modulo the count: every group is visited (kGroupRows is a power of two, so any
+  // odd stride is coprime with it) and consecutive rows land far apart, as a random id would.
+  constexpr uint64_t kStride = 0x9E3779B1ULL;
+  for (int64_t start = 0; start < kGroupRows; start += kBatchSize) {
+    arrow::Int64Builder keys;
+    arrow::Int32Builder seconds;
+    arrow::BinaryBuilder strings;
+    for (int64_t row = start; row < start + kBatchSize; ++row) {
+      const uint64_t id = (static_cast<uint64_t>(row) * kStride) % static_cast<uint64_t>(groups);
+      // A two-key shape splits the id between its columns, so that neither alone separates the
+      // groups and the grouper has to read both.
+      if (has_int64 && !keys.Append(static_cast<int64_t>(has_int32 ? id / 1024U : id)).ok()) {
+        return {};
+      }
+      if (has_int32 && !seconds.Append(static_cast<int32_t>(id % 1024U)).ok()) {
+        return {};
+      }
+      // About twenty bytes, as a URL or a search phrase is longer than the eight a word compares.
+      if (has_string && !strings.Append("key-" + std::to_string(id) + "-pad______").ok()) {
+        return {};
+      }
+    }
+    arrow::ArrayVector columns;
+    const auto take = [&columns](auto& builder) {
+      auto array = builder.Finish();
+      if (array.ok()) {
+        columns.push_back(*array);
+      }
+      return array.ok();
+    };
+    if ((has_int64 && !take(keys)) || (has_int32 && !take(seconds)) ||
+        (has_string && !take(strings))) {
+      return {};
+    }
+    out.push_back(arrow::RecordBatch::Make(schema, kBatchSize, std::move(columns)));
+  }
+  return out;
+}
+
+// One grouper over every batch, as GroupTable::Consume does per part.
+void GroupKeys(benchmark::State& state, GroupShape shape) {
+  const int64_t groups = state.range(0);
+  const arrow::RecordBatchVector batches = GroupInput(shape, groups);
+  if (batches.empty()) {
+    state.SkipWithError("cannot build the grouping input");
+    return;
+  }
+  std::vector<arrow::TypeHolder> types;
+  types.reserve(static_cast<std::size_t>(batches.front()->num_columns()));
+  for (const auto& field : batches.front()->schema()->fields()) {
+    types.emplace_back(field->type());
+  }
+  uint32_t made = 0;
+  for (auto _ : state) {
+    auto grouper = arrow::compute::Grouper::Make(types);
+    if (!grouper.ok()) {
+      state.SkipWithError(grouper.status().ToString());
+      return;
+    }
+    for (const auto& batch : batches) {
+      const arrow::compute::ExecBatch keys(*batch);
+      auto ids = (*grouper)->Consume(arrow::compute::ExecSpan(keys));
+      if (!ids.ok()) {
+        state.SkipWithError(ids.status().ToString());
+        return;
+      }
+      benchmark::DoNotOptimize(ids->length());
+    }
+    made = (*grouper)->num_groups();
+    benchmark::DoNotOptimize(made);
+  }
+  state.SetItemsProcessed(state.iterations() * kGroupRows);
+  state.counters["groups"] = static_cast<double>(made);
+}
+
+void BM_GroupInt64(benchmark::State& state) { GroupKeys(state, GroupShape::kInt64); }
+void BM_GroupInt64Int32(benchmark::State& state) { GroupKeys(state, GroupShape::kInt64Int32); }
+void BM_GroupString(benchmark::State& state) { GroupKeys(state, GroupShape::kString); }
+void BM_GroupInt64String(benchmark::State& state) { GroupKeys(state, GroupShape::kInt64String); }
+
+// The gate's three counts: cached, past cache, and about one row a group.
+#define ANTB1_GROUP_COUNTS Arg(1000)->Arg(1024 * 1024)->Arg(4 * 1024 * 1024)
+BENCHMARK(BM_GroupInt64)->ANTB1_GROUP_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_GroupInt64Int32)->ANTB1_GROUP_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_GroupString)->ANTB1_GROUP_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_GroupInt64String)->ANTB1_GROUP_COUNTS->Unit(benchmark::kMillisecond);
+#undef ANTB1_GROUP_COUNTS
+
 }  // namespace
 }  // namespace antb1::bench
 
