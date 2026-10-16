@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792099781786,
+  "lastUpdate": 1792125854501,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -8532,6 +8532,114 @@ window.BENCHMARK_DATA = {
             "value": 112.41803928571618,
             "unit": "ms/iter",
             "extra": "iterations: 7\ncpu: 112.40205242857166 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ebfe797ce30c7cc287b89084b2b36968e7e0b50b",
+          "message": "refactor(plan): a join step names its two inputs (#151)\n\n## Summary\n\nGroundwork for ADR 0026's **C5**, with **no plan movement**: all 22\nplans at SF 10 and SF 100 are\nbyte-identical to `main`'s.\n\nC5 needs an order that is not a chain, and the step list could not\nexpress one. `JoinStep` carried a\nsingle `relation` index plus one running `estimate` of \"the relations\njoined so far\", and\n`Binder::JoinTree` consumed it with a single accumulator always passed\nas `.left` and\n`RelationNode(...)` always as `.right`. Left-deepness was baked into\nboth, independently.\n\nA step is now a **join of two operands**, each a relation of the block\nor an earlier step's result:\n\n```cpp\nstruct JoinOperand { bool step = false; std::size_t index = 0; };\n\nstruct JoinStep {\n  JoinOperand left;\n  JoinOperand right;\n  std::vector<std::size_t> edges;  // the edges between the two inputs: its keys\n  BuildSide build = BuildSide::kRight;\n  int64_t estimate = 0;            // the rows this join outputs\n};\n```\n\nSo there is one step per join rather than one per relation, the probe is\nthe first step's left input\nrather than a step of its own, the steps are in dependency order, and\nthe last one is the root.\n\n`JoinTree` keeps a node and a relation set per step instead of an\naccumulator. That is what the three\nthings it used to derive from \"the relation this step adds\" now need:\n\n- **a key's orientation** is which operand's relations contain that\nendpoint, not which side is the\n  added relation;\n- **a residual** is taken by the lowest step whose relations cover every\none it reads, tested against\n  that set rather than against a joined prefix;\n- **the span** names the first binding of the right input's lowest\nrelation, since a composite input\n  has no single FROM item that added it.\n\nThe greedy order is otherwise untouched and emits left-deep steps in the\nnew shape.\n\nCloses #\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [x] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\nThe headline is that nothing moves. Both binaries built from source,\nmtimes checked, `main`'s in a\nseparate worktree:\n\n```text\n$ for scale in sf10 sf100; do for n in 01..22; do\n    diff <(main/antb1 explain qN) <(HEAD/antb1 explain qN); done; done\nall 44 plans byte-identical to main\n\n$ pixi run ci\n100% tests passed out of 2715          <- exit 0\n\n$ pixi run test -L metamorphic\n100% tests passed out of 154           <- star_join_commutes and star_join_order_three_tables,\n                                          the gate this ADR leans on\n\n$ ANTB1_DIFF_SEED=20261019 pixi run diff-random\nDIFF: PASS seed=20261019 queries=2000 failed=0 unsupported=0\n\n$ pixi run lint\n... shellcheck (shell) ... Failed      <- 36 pre-existing SC2218 in two .sh files this does not\n                                         touch; osx-arm64 only, green on CI\n... every other leg ..... Passed\n```\n\nPer-file `clang-tidy -p build/tidy --warnings-as-errors='*'` over the\nchanged TUs and all four that\ninclude `join_order.h`: no finding in the changed code or in the header.\n\nTests: the existing `plan.JoinOrderTest` and `plan.BinderTest` cases\ncarry the whole weight here,\nsince the point is that their answers do not change —\n`TheSmallestEstimateJoinsNext`,\n`ACycleGetsASecondKey`, `AManyToManyEdgeWaitsWhileAKeyEdgeIsAvailable`,\n`EmptyInputsEstimateZero`,\n`TwoHundredFiftySixRelations`, the three build-side cases,\n`JoinOrderBuildSideAndKeys`,\n`JoinKeyCastsAndResiduals`, `PerRelationFiltersAndQualifiers` and\n`RelationLayersAndTheirSpans`.\nTheir expectations lose the leading entry that described the probe,\nbecause a step is now a join and\nthere is one fewer of them; the values that remain are unchanged.\n\nOne addition worth noting: the helper that reconstructs the relation\nsequence from a step list now\n**asserts left-deepness while it does so** (the first step's left input\nis a relation, every later\nstep's left is the step before it, every right is a relation). The\ngreedy order satisfies that, and\nit means the bushy orders of the next PR cannot pass the tests that pin\nthe greedy one by accident.\n\n## Checklist\n\n- [x] `pixi run check` passes locally — except the pre-existing\nosx-arm64 shellcheck findings above\n- [x] Tests cover the change — by pinning that it changes nothing\n- [x] Docs updated where behavior, commands or architecture changed: the\ndocumented rules in\n`src/plan/join_order.h` (rule 5 is now stated in terms of the two\ninputs). No `docs/` or ADR\nchange: ADR 0026 already owns C5, and the PR that lands the search will\nrecord the result.\n- [x] No ClickBench-derived data is committed\n- [x] Nothing derived from TPC-H is committed: no query text, data,\nanswers or TPC tools (ADR-0006).\n      Only the count of plans that moved (zero) appears here.\n- [x] Changes to governance paths: none.\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5) planned\nC5, found that exec already\nruns bushy trees so C5 is planner-only, wrote this diff and ran every\nverification above.\n- Accountable human (has read and understands the whole diff): @hor911\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-16T07:41:29+03:00",
+          "tree_id": "00ea79b1442521b965ec941de791e6f6667c1575",
+          "url": "https://github.com/ydb-campus/antb1/commit/ebfe797ce30c7cc287b89084b2b36968e7e0b50b"
+        },
+        "date": 1792125853233,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4222.596319703086,
+            "unit": "ns/iter",
+            "extra": "iterations: 164878\ncpu: 4222.08628197819 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 94398.16747296021,
+            "unit": "ns/iter",
+            "extra": "iterations: 7028\ncpu: 94394.05207740466 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 103509.3942392884,
+            "unit": "ns/iter",
+            "extra": "iterations: 6770\ncpu: 103500.67976366325 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 331277.7661904777,
+            "unit": "ns/iter",
+            "extra": "iterations: 2100\ncpu: 331255.5961904762 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 426785.66565165634,
+            "unit": "ns/iter",
+            "extra": "iterations: 1642\ncpu: 426743.0846528622 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2441044.779720153,
+            "unit": "ns/iter",
+            "extra": "iterations: 286\ncpu: 2440859.807692305 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 52.96641607692174,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 52.95092092307693 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 45.69918806666541,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 45.682794466666664 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 185.98162749999858,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 185.9581395000003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 12.99499522222218,
+            "unit": "ms/iter",
+            "extra": "iterations: 54\ncpu: 12.994147407407384 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 23.577421896551844,
+            "unit": "ms/iter",
+            "extra": "iterations: 29\ncpu: 23.576466482758644 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 44.68856749999972,
+            "unit": "ms/iter",
+            "extra": "iterations: 16\ncpu: 44.68481950000003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 2.306633834437258,
+            "unit": "ms/iter",
+            "extra": "iterations: 302\ncpu: 2.306280791390729 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 38.37974927777863,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 38.37494683333335 ms\nthreads: 1"
           }
         ]
       }
