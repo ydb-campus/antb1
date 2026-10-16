@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792125854501,
+  "lastUpdate": 1792138237978,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -8640,6 +8640,114 @@ window.BENCHMARK_DATA = {
             "value": 38.37974927777863,
             "unit": "ms/iter",
             "extra": "iterations: 18\ncpu: 38.37494683333335 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c80d51baad9a02e44315541568729218162d27b7",
+          "message": "perf(plan): choose a join order by cost, over any tree shape (#152)\n\n## Summary\n\nADR 0026's **C5**. The join order was greedy and left-deep with **no\naccumulated cost at all**: the\nlargest relation probed, then the neighbour whose own join was smallest,\nand nothing was ever summed.\nDynamic programming over the subsets the join conditions connect (DPccp,\nMoerkotte and Neumann 2006)\nreplaces it, minimising the rows each join produces plus the rows it\nmust hold to produce them. **The\ntree need not be a chain.**\n\nA block of more than 12 relations keeps the greedy rule, which\n`--join-order greedy` also selects for\nany block — and it **reproduces all 22 plans byte for byte**, so the\nrule it replaces stays reachable,\ncomparable, and available as an escape hatch.\n\n**Exec needed no change, against this ADR's own expectation.** A bushy\ntree already binds, plans,\nprofiles and answers: `PipelineInput` descends only probe sides, so each\npart pipeline keeps its single\nscan, and `PipelineBuildsOf`/`MakeJoinBuild`/`PartsOf` already recurse\nthrough a join on a build side. A\nLEFT JOIN unit and a derived table have been producing a join as another\njoin's input all along.\n\nCloses #\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [x] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\nTPC-H-derived harness outside the repo (ADR 0006), SF 100, 4 threads,\nbest of 2, **both columns from\nthe same binary** via `--join-order`:\n\n| query | greedy | search | |\n| --- | ---: | ---: | --- |\n| **Q10** | 22.69 s | **9.49 s** | **−58%** |\n| **Q21** | 28.92 s | **22.29 s** | **−23%** |\n| Q05 | 16.26 s | **14.82 s** | −8.9% |\n| Q09 | 24.10 s | 23.88 s | neutral |\n| **Q11** | 1.42 s | **1.90 s** | **+33%** |\n\nGeomean over the 22: **7.73 s → 7.37 s**, 2.8x DuckDB → **2.7x**.\nEverything else is inside the ±8%\nband DuckDB's own unchanged binary showed over the same pair of runs.\nPeak memory falls where plans\nmove: Q03 4.79 → 1.33 GB, Q07 7.59 → 1.05 GB, Q10 5.40 → 3.67 GB.\n\n**Q10 was the worst query of the 22 at 6.1x and is now 2.8x** — which\nwas not the target. Q05 was, and\ngained the least of the three.\n\n```text\n$ pixi run ci\n100% tests passed out of 2720          <- exit 0\n\n$ pixi run test -L metamorphic\n100% tests passed out of 154           <- star_join_commutes and star_join_order_three_tables: the\n                                          gate that asserts an answer survives reordering\n\n$ ANTB1_DIFF_SEED=20261020 pixi run diff-random\nDIFF: PASS seed=20261020 queries=2000 failed=0 unsupported=0\n\n$ pixi run lint\n... shellcheck (shell) ... Failed       <- 36 pre-existing SC2218 in two .sh files this does not\n                                          touch; osx-arm64 only, green on CI\n... every other leg ..... Passed\n```\n\nAlso: per-file `clang-tidy --warnings-as-errors='*'` over the changed\nTUs and every TU including the\nchanged headers, clean; ASan+UBSan over 96 plan and binder cases plus\n150 random differential queries.\n\n### Two estimates, because the consumers need opposite errors\n\nEverything that decides memory — a step's stored estimate and every\n`ChooseBuildSide` call — keeps C1's\nreading, the largest single key domain, which never over-states\nselectivity. **Only the search's cost**\nreads the narrower one. A search merely compares orders, so optimism\nthere costs a worse plan; a build\nside reads it to decide what to *materialise*, where the same optimism\ncosts the query.\n\n**That rule took two tries, and only measurement caught the first.**\nMultiplying every key's domain made\n**Q09 fail outright** at SF 100 — 25.5 s and an 11.65 GB peak became an\nout-of-memory error against a\n41.23 GB limit. `lineitem` joins `partsupp` on a composite foreign key\nwhose parts are perfectly\ncorrelated, so the product read 2,400 rows where there are ~600 M, and\nthree build sides flipped.\nCapping each pair's product at its larger row count left it 7.5x low —\nstill enough to cost 79%.\n\nThe rule that works takes the **largest domain within a pair of\nrelations** and multiplies **across**\npairs: two conditions between the same two relations are the one\ncomposite key they describe, while\nconditions to different relations narrow in turn. Nothing in a Parquet\nfooter records a composite\ndistinct count, so this is a choice of bound, not a measurement —\nrecorded as such in the ADR.\n\n### DPccp over relation masks, not DPhyp\n\nDPhyp generalises the same enumeration to hyperedges and reorderability\nconstraints, and antb1 has\nneither: a `JoinEdge` is a pair, every join the order builds is inner,\nand a LEFT JOIN unit is one\nopaque relation of its block. Over a simple graph DPhyp *is* DPccp, so\nits extra machinery would ship\nwith no test able to reach it. So the search reads edges as **pairs of\nrelation masks** even though every\nedge has one relation per side today — which makes `Connected` already\nthe test a hypergraph needs and\nleaves it and `Neighbours` as the only two places the graph model is\nread: the seam DPhyp would replace.\n\n### Tests\n\n- `plan.JoinOrderTest.TheSearchChoosesAnOrderOfTheLowestCost` — **a\nplain subset-and-split reference\nsearch** in the test file agrees with DPccp on cost *and* plan for six\ngraph shapes, including Q5's.\nDPccp's forbidden-set bookkeeping is intricate and a connected pair it\nlost would only make plans\nquietly worse, which nothing else would notice. This is what turned the\nQ09 regression into a question\n  about the estimate rather than about the enumeration.\n- `TheSearchChoosesATreeThatIsNotAChain` — two tight pairs joined by a\nweak edge, asserting the root's\n*both* operands are joins. The left-deep `Order` helper from #151\nrejects such a plan, so this case\n  cannot pass by accident.\n- `TheSearchGivesWayToTheGreedyRuleAboveTheCap` — at 12 relations the\nplan is bushy; at 13 it is the\n  greedy one exactly.\n- `SubsetRowsDividesOncePerPair` — the cardinality rule against\nhand-computed values, including the\nwithin-pair max, the across-pair product, an empty domain and\nsaturation.\n- `plan.BinderTest.JoinOrderBuildSideAndKeys` /\n`FiltersDecideWhichRelationProbes` now pin **which\nrelation is built** rather than which branch is which. The built\nrelation is still order-independent;\nthe branch labels follow relation index. See the orientation note below.\n- CLI goldens: `explain_join_cycle` (now bushy, still showing the\ncycle's second key),\n`explain_join_unconnected_first`, the two `--build-side-ratio` cases\n(which still differ from each\nother, so they still demonstrate the ratio), plus a new\n`explain_join_order_greedy` paired with\n  `explain_join_cycle` so the new flag cannot be unwired unnoticed.\n\n### Two orientation rules that look cosmetic and are not\n\n- **A side whose rows nothing knows is made the left**, so the other is\nbuilt: `ChooseBuildSide` keeps\nthe right on an unknown estimate, and rule 1 used to keep such a\nrelation as the probe. Without this\n  the search would build a relation of unknown size.\n- **Otherwise the lower relation index is the left.** Orienting by the\nestimates instead reads better and\nwould keep a plan independent of FROM order — but it puts the larger\nside on the left *always*, which\nmakes \"unless the right is decisively larger\" unreachable and **silently\nstops `--build-side-ratio`\ndoing anything**.\n`engine.SessionTest.TheBuildSideRatioReachesTheJoinOrderAndKeepsEveryAnswer`\ncaught\n  that, which is exactly what its comment says it is for.\n\n## The one regression, with its cause measured\n\n**Q11 is 33% slower** (1.42 → 1.90 s) and ADR 0026 records it as\n**C5a**, deferred.\n\nIts new plan reduces `supplier` to one nation's 40,045 rows before the\nlarge join — the classic\nstar-schema move, and it carries 3.2 M rows where greedy carries 80 M.\nBut `s_suppkey` is dense over all\nof `supplier`, so a build on the whole table qualifies for the **direct\nlayout**: an array indexed by the\nkey, no hashing. The 40,045 surviving keys keep the original\n1..1,000,000 range, so `max − min + 1`\nagainst `8 × 40,045` fails `JoinTable`'s density test and it falls back\nto hashing.\n\nOver the same 80 M probes, `find` goes from **77 ms to 865 ms** — about\n22x per probe — and the two\nblocks' join time accounts for the whole regression to the millisecond\n(+1,843 ms summed over parts, ÷4\nthreads = +461 ms; observed +461 ms). **Making the build 25x smaller\nmade it 11x dearer to probe.**\n\nFiltering a build shrinks its rows but not its key's range, so it can\nonly ever *lose* the layout. A cost\nmodel that saw this needs each subset to carry its key's footer range\nbeside its estimated rows and to\nknow which side rule 5 will build; the data is in `ColumnRange` already.\nDeferred deliberately rather\nthan appended here: this PR already had three model corrections that\nonly measurement caught, and the\ntrade is 0.46 s on Q11 against 13 s on Q10.\n\n## Checklist\n\n- [x] `pixi run check` passes locally — except the pre-existing\nosx-arm64 shellcheck findings above\n- [x] Tests cover the change\n- [x] Docs updated: `docs/sql-subset.md` (the order, the two estimate\nreadings, the new flag, and what\n      the order does not account for), ADR 0026\n- [x] No ClickBench-derived data is committed\n- [x] Nothing derived from TPC-H is committed: no query text, data,\nanswers or TPC tools (ADR-0006).\n      Only timings, memory figures and query numbers appear here.\n- [ ] Changes to governance paths (see `.github/CODEOWNERS`) —\n**`docs/adr/` needs your sign-off**\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5) planned\nC5, established that exec\nalready runs bushy trees, wrote the diff, the tests and the docs, and\nran every measurement above\n      including the plan diffs against a worktree build of `main`.\n- Accountable human (has read and understands the whole diff): @hor911\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-16T11:08:31+03:00",
+          "tree_id": "cfb8ea71fe6b7462cd3cd6f13745a1001ae629c5",
+          "url": "https://github.com/ydb-campus/antb1/commit/c80d51baad9a02e44315541568729218162d27b7"
+        },
+        "date": 1792138237346,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 2510.225091445324,
+            "unit": "ns/iter",
+            "extra": "iterations: 279402\ncpu: 2510.040912377148 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 60556.01147209045,
+            "unit": "ns/iter",
+            "extra": "iterations: 10373\ncpu: 60552.30974645715 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 67761.59081911581,
+            "unit": "ns/iter",
+            "extra": "iterations: 10609\ncpu: 67759.38891507214 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 242986.58827683743,
+            "unit": "ns/iter",
+            "extra": "iterations: 2832\ncpu: 242944.90077683615 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 238002.26514611556,
+            "unit": "ns/iter",
+            "extra": "iterations: 2806\ncpu: 237971.37205987162 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 1348502.624761907,
+            "unit": "ns/iter",
+            "extra": "iterations: 525\ncpu: 1347827.251428572 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 28.77437575999977,
+            "unit": "ms/iter",
+            "extra": "iterations: 25\ncpu: 28.764514199999986 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 27.078744000000107,
+            "unit": "ms/iter",
+            "extra": "iterations: 26\ncpu: 27.06345553846154 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 121.37213219999978,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 121.3656232 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 8.220986418604765,
+            "unit": "ms/iter",
+            "extra": "iterations: 86\ncpu: 8.2199583255814 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 10.44078813636353,
+            "unit": "ms/iter",
+            "extra": "iterations: 66\ncpu: 10.437335121212143 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 25.5606446538464,
+            "unit": "ms/iter",
+            "extra": "iterations: 26\ncpu: 25.552368923076944 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 0.7908974446952661,
+            "unit": "ms/iter",
+            "extra": "iterations: 886\ncpu: 0.7886043306997731 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 51.823865384615324,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 51.82175253846156 ms\nthreads: 1"
           }
         ]
       }
