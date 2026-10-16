@@ -612,6 +612,37 @@ this profiling fires:
   `ep * (1 - disc)` twice**, once as its own output and once inside the second expression, because the binder copies
   a repeated subtree rather than sharing it (`SameExpr` in `src/plan/binder.cc` would recognise it). That is a `plan`
   change, not an `exec` one, and it is what remains of this query.
+- **C11, perf(exec): a constant operand as a scalar, not an array of copies, done 2026-10-16.** C9 stopped a DECIMAL
+  constant being materialised; the **integer and DOUBLE path never got the same treatment**, and asking what it cost
+  there gave a sharper answer than expected. Over 100M rows of one column, with a `GROUP BY` so that DuckDB's
+  `SUM(x + c)` rewrite does not fire: four integer additions cost **0.037 s**, and the four literals feeding them
+  **0.272 s** — the literal was **7x the arithmetic it wrapped**.
+
+  The cause is `Evaluate(const plan::ConstantExpr&)` returning an array, because the evaluator's contract is
+  `arrow::Result<ArrayPtr>` and a constant has nowhere else to go: `MakeArrayFromScalar(*scalar, batch.num_rows())`,
+  once per constant per expression per batch, plus a second array when the literal's type differs from the
+  operation's and the whole thing is cast. Arrow's arithmetic kernels take a scalar beside an array, so the fix is to
+  hand them the one value: a scalar cast is O(1) where the array cast was O(rows).
+
+  Measured on the same probes: four integer additions with four literals **0.578 s to 0.353 s (-39%)**, which is
+  **the same as the no-literal case** (0.349 s) — a literal now costs nothing. The DOUBLE form gains more, 0.698 s to
+  **0.216 s (-69%)**, because a decimal literal beside a DOUBLE column (`f + 1.5` is DOUBLE + DECIMAL(2,1), DuckDB's
+  literal typing) was paying **two** materialisations: the array of copies, then converting all of them to DOUBLE.
+
+  Deliberately narrow. The general form -- the evaluator returning `arrow::Datum` so a constant never materialises
+  anywhere -- would touch every node and every call site of a 1500-line file, and the sites it would additionally
+  reach turn out to be already handled: a comparison keeps its literal inside the `Predicate` rather than as an
+  operand, `regexp_replace` keeps its pattern and replacement as kernel *options* (`logical_plan.h`, "constants where
+  the function needs them"), and a select-list literal rides in `ProjectNode::constants`. What is left is a `CASE`
+  branch returning a constant, which `EvaluateSelected` already limits to the rows that take the branch. So the
+  narrow fix takes the measured cost and the refactor was not worth its blast radius.
+
+  The one thing to be careful of is that a constant must convert exactly as a column of it would, so it goes through
+  the same `CastTo` -- on an array of itself alone -- rather than Arrow's cast, since a DECIMAL to DOUBLE is DuckDB's
+  conversion and not Arrow's (ADR 0021 rule 8). `AConstantOperandAnswersAsAColumnOfItWould` computes six cases both
+  ways and compares answers *and* error messages, including a narrowing that fits, one that does not, an overflow,
+  and a decimal past the exactly representable range. Worth recording that the two conversions agree on every value
+  tried, so that case asserts the invariant rather than proving the routing necessary.
 
   One behaviour it does change, which no test can see and which review caught before the merge: where more than one
   row of a batch would raise, the program reports the **first such row**, while the node-by-node path reports the

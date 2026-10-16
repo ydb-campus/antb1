@@ -1323,9 +1323,31 @@ struct Evaluator {
       ARROW_ASSIGN_OR_RAISE(const DecimalOperand r, operand(*arith.right));
       return DecimalArith(l, r, arith.op, e.type, pool);
     }
+    const auto type = plan::ToArrow(e.type);
+    // Arrow's kernels take a scalar beside an array, so a constant operand goes as the one value it
+    // is. Materialising it instead -- an array of copies of itself, and then a second array when it
+    // has to be cast -- cost more than the arithmetic it feeds: over 100M rows one such literal was
+    // 0.068s against 0.037s for four additions (ADR 0026's C11). The operations below this that do
+    // not go through a kernel (an integer division, a %, HUGEINT) read arrays, and two constants
+    // would leave the result a scalar rather than a column, which is why exactly one is taken here;
+    // the binder folds an operation of two constants long before this anyway.
+    if (arith.op != plan::ArithOp::kIntegerDivide && arith.op != plan::ArithOp::kModulo &&
+        e.type != plan::LogicalType::kHugeInt) {
+      ARROW_ASSIGN_OR_RAISE(const std::optional<arrow::Datum> left_value,
+                            ScalarOperand(*arith.left, type));
+      ARROW_ASSIGN_OR_RAISE(const std::optional<arrow::Datum> right_value,
+                            ScalarOperand(*arith.right, type));
+      if (left_value.has_value() != right_value.has_value()) {
+        const plan::Expr& column = left_value.has_value() ? *arith.right : *arith.left;
+        ARROW_ASSIGN_OR_RAISE(ArrayPtr values, (*this)(column));
+        ARROW_ASSIGN_OR_RAISE(values, CastTo(values, type, ctx));
+        const arrow::Datum other{values};
+        return KernelArith(left_value.value_or(other), right_value.value_or(other), arith.op,
+                           e.type);
+      }
+    }
     ARROW_ASSIGN_OR_RAISE(ArrayPtr left, (*this)(*arith.left));
     ARROW_ASSIGN_OR_RAISE(ArrayPtr right, (*this)(*arith.right));
-    const auto type = plan::ToArrow(e.type);
     ARROW_ASSIGN_OR_RAISE(left, CastTo(left, type, ctx));
     ARROW_ASSIGN_OR_RAISE(right, CastTo(right, type, ctx));
     if (arith.op == plan::ArithOp::kIntegerDivide || arith.op == plan::ArithOp::kModulo) {
@@ -1338,9 +1360,40 @@ struct Evaluator {
     if (e.type == plan::LogicalType::kHugeInt) {
       return HugeIntArith(*left, right.get(), arith.op, pool);
     }
-    const bool integer = plan::IsInteger(e.type);
+    return KernelArith(left, right, arith.op, e.type);
+  }
+
+  // A constant operand as the one scalar value it is, of `type`; nothing when the operand is not a
+  // constant. Where it has to be converted it goes through CastTo on an array of itself alone, so
+  // that it converts exactly as a column of it would -- a DECIMAL to DOUBLE is DuckDB's conversion
+  // and not Arrow's cast (ADR 0021 rule 8), and a decimal literal beside a DOUBLE column is the
+  // common way to meet it (`f + 1.5` is DOUBLE + DECIMAL(2,1)). One row costs nothing beside the
+  // batch-long array it replaces.
+  arrow::Result<std::optional<arrow::Datum>> ScalarOperand(
+      const plan::Expr& expr, const std::shared_ptr<arrow::DataType>& type) const {
+    const auto* constant = std::get_if<plan::ConstantExpr>(&expr.node);
+    if (constant == nullptr) {
+      return std::nullopt;
+    }
+    ARROW_ASSIGN_OR_RAISE(const std::shared_ptr<arrow::Scalar> scalar,
+                          plan::ToArrowScalar(constant->value));
+    if (scalar->type->Equals(*type)) {
+      return arrow::Datum{scalar};
+    }
+    ARROW_ASSIGN_OR_RAISE(const ArrayPtr one, arrow::MakeArrayFromScalar(*scalar, 1, pool));
+    ARROW_ASSIGN_OR_RAISE(const ArrayPtr converted, CastTo(one, type, ctx));
+    ARROW_ASSIGN_OR_RAISE(const std::shared_ptr<arrow::Scalar> value, converted->GetScalar(0));
+    return arrow::Datum{value};
+  }
+
+  // `left <op> right` through Arrow's own kernel, both already of the operation's type. Either may
+  // be a scalar, which the kernels take: that is how a constant operand reaches one without being
+  // built into an array of copies of itself (ADR 0026's C11).
+  arrow::Result<ArrayPtr> KernelArith(const arrow::Datum& left, const arrow::Datum& right,
+                                      plan::ArithOp op, plan::LogicalType type) const {
+    const bool integer = plan::IsInteger(type);
     std::string function;
-    switch (arith.op) {
+    switch (op) {
       case plan::ArithOp::kAdd:
         function = "add";
         break;
@@ -1359,8 +1412,7 @@ struct Evaluator {
     }
     auto result = arrow::compute::CallFunction(function, {left, right}, ctx);
     if (!result.ok()) {
-      return integer && result.status().IsInvalid() ? Overflow(Verb(arith.op), e.type)
-                                                    : result.status();
+      return integer && result.status().IsInvalid() ? Overflow(Verb(op), type) : result.status();
     }
     return result->make_array();
   }
