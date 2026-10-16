@@ -238,6 +238,18 @@ TEST_F(ComputeTest, DecimalArithmetic) {
   EXPECT_EQ(Eval(product, {price, rate}).status().message(),
             "Overflow in multiplication of DECIMAL(18) (999999999999999 * 999999999). You might "
             "want to add an explicit cast to a bigger decimal.");
+  // A sliced operand past its first row: the values are read in place, from the array's own buffer
+  // (ADR 0026's C9), so the offset has to reach the arithmetic -- the same rows answer the same
+  // whether they are a whole array or the tail of one. The add rescales its left operand and reads
+  // its right one as it is; the multiply reads both as they are.
+  const auto tail_sum =
+      Arith(ArithOp::kAdd, ColumnAt(0, p), ColumnAt(1, r), LogicalType::Decimal(18, 4));
+  auto sliced = Eval(tail_sum, {price->Slice(1, 2), rate->Slice(1, 2)});
+  ASSERT_TRUE(sliced.ok()) << sliced.status().ToString();
+  EXPECT_EQ(UnscaledText(**sliced), "decimal128(18, 4): -12500 null");
+  auto sliced_product = Eval(product, {price->Slice(1, 2), rate->Slice(1, 2)});
+  ASSERT_TRUE(sliced_product.ok()) << sliced_product.status().ToString();
+  EXPECT_EQ(UnscaledText(**sliced_product), "decimal128(18, 6): 250000 null");
   // An integer operand counts as DECIMAL(k,0): p + 7 is DECIMAL(16,2).
   auto plus_int = Eval(Arith(ArithOp::kAdd, ColumnAt(0, p), ConstantOf(7, LogicalType::kInteger),
                              LogicalType::Decimal(16, 2)),
@@ -319,6 +331,28 @@ TEST_F(ComputeTest, DecimalArithmeticErrors) {
                 .message(),
             "Casting value \"12345678901234567.5\" to type DECIMAL(18,2) failed: value is out of "
             "range!");
+  // A file may hold a value beyond the column's declared width, and at equal scales there is no
+  // rescale to catch it (ADR 0026's C9), so the arithmetic checks the operands as it reads them.
+  // Both of these are out of DECIMAL(19,0) by one, and their sum is 0: without the check the query
+  // would answer 0 where DuckDB raises its conversion error.
+  const LogicalType d18_0 = LogicalType::Decimal(18, 0);
+  const auto over = Decimals(d18_0, {"10000000000000000000"});
+  const auto under = Decimals(d18_0, {"-10000000000000000000"});
+  EXPECT_EQ(Eval(Arith(ArithOp::kAdd, Named(ColumnAt(0, d18_0), "wide"), ColumnAt(1, d18_0),
+                       LogicalType::Decimal(19, 0)),
+                 {over, under})
+                .status()
+                .message(),
+            "Casting value \"10000000000000000000\" to type DECIMAL(19,0) failed: value is out of "
+            "range! when casting from source column wide");
+  // The right operand is reported when the left one fits.
+  EXPECT_EQ(Eval(Arith(ArithOp::kAdd, ColumnAt(1, d18_0), Named(ColumnAt(0, d18_0), "wide"),
+                       LogicalType::Decimal(19, 0)),
+                 {over, Decimals(d18_0, {"1"})})
+                .status()
+                .message(),
+            "Casting value \"10000000000000000000\" to type DECIMAL(19,0) failed: value is out of "
+            "range! when casting from source column wide");
   // An integer operand that does not fit: DuckDB's integer cast message.
   const auto ints = testing::ArrayOf<arrow::Int32Builder>(
       arrow::int32(), std::vector<std::optional<int32_t>>{std::numeric_limits<int32_t>::min()});

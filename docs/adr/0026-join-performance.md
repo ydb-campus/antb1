@@ -550,6 +550,43 @@ this profiling fires:
   re-profiling read Q10's cost as `gather` and handed it to `exec` as a string-width problem; a good part of it was
   this instead. The lesson for the entries that remain is that a metric covering two different things — here
   `Take`-on-probe and the build gather under one timer — hid a 2x for as long as it was not split.
+- **C9, perf(exec): read DECIMAL operands without copying them, done 2026-10-16.** Once C8 had taken the join
+  costs out, the slowest query of the 22 was **Q01 at 16.84 s and 3.25x, which contains no join at all**: 38.4 s of
+  its 49.8 s (summed over parts) was `Compute`, evaluating two DECIMAL expressions over 591.6 M rows. Isolated
+  against a floor of the same scan with no arithmetic, **one DECIMAL addition cost 2.68 ns a row — 2.4x what reading
+  and summing the whole column costs** — and each constant in an expression added 0.50 ns a row on top.
+
+  None of it was Arrow's: DECIMAL arithmetic takes antb1's own path (`DecimalArith`), and it was moving about
+  **176 bytes a row for one addition of two columns** where 48 would do. `DecimalOperand` held a
+  `std::vector<Int128>`, so every operand of every operation was value-initialised (a memset), filled from the Arrow
+  buffer and read back — while a decimal128 array already *is* 16 contiguous bytes a row. On top of that
+  `RescaleOperand` walked both operands even when the scales already agreed and its factor was therefore 1, and a
+  constant was built into a full array of copies of itself (`MakeArrayFromScalar`) and then widened into a full
+  vector of them.
+
+  So: an operand is read in place from its own buffer, a constant is one value, and a rescale that would multiply by
+  1 does not happen. **One addition now costs 1.27 ns a row**, and a constant operand went from costing 0.50 ns a
+  row *more* than a column to 0.14 ns *less*, which is what it should always have been. Measured at SF 100 on
+  4 threads, best of 3, over the same column so only the arithmetic varies: four additions 6.98 s to 3.64 s, the
+  same four with four constants 8.16 s to 3.31 s, and Q01's own pair of expressions 10.76 s to 6.37 s. Over the 22:
+  **Q01 16.84 s to 12.39 s (-26.4%)**, 3.25x to 2.41x, geomean 5.659 s to 5.589 s and **2.04x DuckDB to 2.02x**;
+  everything else inside the noise band.
+
+  Skipping the rescale is where the one defect of this change was, and it was caught in review: the type rules do
+  make a result at least as wide as an operand of its own scale, so the walk could not fail for a value within its
+  column's declared width -- but **nothing checks that width when a file is read**, which the code it replaced said
+  in as many words. A column holding more than it declares, added to its own negation, would then have answered 0
+  where DuckDB raises a conversion error: a wrong answer, not a lost error. The check is back, in the arithmetic's
+  own loop where the value is already in a register rather than in a pass of its own, and only for an operand no
+  rescale has already vouched for (a constant and a widened integer are within their types by construction). It
+  costs about 1% of Q01, and `DecimalArithmeticErrors` now pins it with the sum-in-range case that distinguishes a
+  wrong answer from a lost one.
+
+  Two things are deliberately left, both measurable from Q01's remaining `Compute` (20.8 s summed, still 42% of the
+  query): its two expressions **share a subexpression** that is evaluated twice, because the evaluator is a tree walk
+  with no memoisation (worth about 1.7 s of the 6.25 s probe above); and each operation still **materialises its
+  result**, where a fused walk would keep intermediates in registers. The second subsumes the first and is the larger
+  change. At 48 bytes a row for one operation the current form is near what a materialising evaluator can do.
 
 ## Alternatives considered
 
