@@ -550,7 +550,7 @@ this profiling fires:
   re-profiling read Q10's cost as `gather` and handed it to `exec` as a string-width problem; a good part of it was
   this instead. The lesson for the entries that remain is that a metric covering two different things — here
   `Take`-on-probe and the build gather under one timer — hid a 2x for as long as it was not split.
-- **C9, perf(exec): DECIMAL arithmetic without copying its operands, done 2026-10-16.** Once C8 had taken the join
+- **C9, perf(exec): read DECIMAL operands without copying them, done 2026-10-16.** Once C8 had taken the join
   costs out, the slowest query of the 22 was **Q01 at 16.84 s and 3.25x, which contains no join at all**: 38.4 s of
   its 49.8 s (summed over parts) was `Compute`, evaluating two DECIMAL expressions over 591.6 M rows. Isolated
   against a floor of the same scan with no arithmetic, **one DECIMAL addition cost 2.68 ns a row — 2.4x what reading
