@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792147834323,
+  "lastUpdate": 1792156622721,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -8856,6 +8856,114 @@ window.BENCHMARK_DATA = {
             "value": 107.74627228571327,
             "unit": "ms/iter",
             "extra": "iterations: 7\ncpu: 107.71998757142853 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "6e8dfdca1bba3873ac4da47b0caba71eaf44bdc5",
+          "message": "perf(exec): gather only the rows a 1:1 window matched (#154)\n\n## Summary\n\nADR 0026's **C8**. Re-profiling the 22 after #152 and #153 put the whole\nremaining join cost in one\nmetric: **`gather` 235.3 s against `find`'s 78.9 s**, summed over parts\n— and `gather` was charged per\n*probe* row almost regardless of how many rows the join kept:\n\n| query | gather | probe rows | output rows | kept | ns per probe row |\n| --- | ---: | ---: | ---: | ---: | ---: |\n| q05 | 18.29 s | 600,037,902 | 18,199,912 | 3.03% | 30.5 |\n| q07 | 18.00 s | 600,037,902 | 14,578,165 | 2.43% | 30.0 |\n| q03 | 16.69 s | 600,037,902 | 2,987,578 | **0.50%** | **27.8** |\n| q18 | 11.97 s | 600,037,902 | 600,037,902 | **100.00%** | **19.9** |\n\nA join keeping 0.50% paid *more per probe row* than one keeping 100% — a\n200x difference in match rate\nproducing a 1.4x difference in cost, in the wrong direction.\n\nThe cause is in `HashJoinOperator::NextWindow`, the inner join's 1:1\npath. It left the probe where it\nwas — a zero-copy slice of the batch, which is the design's point — and\ngathered the build's columns\nfor **every row of the window**, NULL where a row had no match, then\nmasked the misses off with a\nselection. A window where one row in 200 matched still materialised the\nbuild of all 200.\n\nCloses #\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [x] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## The measurement picked the fix, and then removed the knob\n\n`matched` was already computed at the top of `NextWindow` and thrown\naway. Adding it as a metric beside\n`window_rows` settled which of two very different fixes applied —\ncompact the window, or run the\nresidual before the gather:\n\n```text\nover every inner 1:1 join of the 22, summed over parts:\n  gather spent on probe rows with no match          169.9 s\n  gather spent on pairs a residual rejected           0.0 s\n```\n\nSo: compact. **And the rule needs no threshold, which the sweep\nestablished rather than the design.**\nCompacting costs a `Take` over the probe that slicing avoids, so there\nshould be a crossover — there\nisn't one worth naming:\n\n```text\nQ03/05/07/09/18/19/21 at SF 100, 4 threads, best of 2, one binary, ANTB1_WINDOW_SHARE:\n  never compact   geomean 14.627s\n  below 1 in 4    geomean  9.689s\n  any miss at all geomean  9.584s      <- within 1% of 1-in-4\n  q18 (100% matched)  -2.2% / -0.1%    <- untouched either way: it never compacts\n```\n\nA window every row of which matched never compacts under either rule, so\nthe condition is simply\n`matched < rows`. With it the window path runs **only** when the window\nmatched entirely — so its\nselection bitmap, and the NULL-aware build gather it needed, are both\n**deleted**. The faster path also\nhas less code in it.\n\n## Verification\n\nTPC-H-derived harness outside the repo (ADR 0006), SF 100, 4 threads,\nbest of 2, **both columns from\nthe same binary** (the rule behind a temporary environment override,\nremoved before this commit):\n\n| | before | after | | | | before | after | |\n| --- | ---: | ---: | --- | --- | --- | ---: | ---: | --- |\n| **Q02** | 3.404 s | **1.687 s** | **−50.4%** | | Q03 | 10.905 s |\n**7.814 s** | −28.3% |\n| **Q07** | 13.114 s | **6.586 s** | **−49.8%** | | Q16 | 1.607 s |\n**1.190 s** | −26.0% |\n| **Q05** | 11.984 s | **6.048 s** | **−49.5%** | | Q19 | 9.631 s |\n**7.133 s** | −25.9% |\n| **Q11** | 1.584 s | **0.879 s** | **−44.5%** | | Q21 | 21.203 s |\n**16.983 s** | −19.9% |\n| **Q09** | 22.306 s | **13.568 s** | **−39.2%** | | Q10 | 9.554 s |\n**7.790 s** | −18.5% |\n| **Q14** | 4.534 s | **3.042 s** | **−32.9%** | | Q08 | 9.250 s |\n**7.724 s** | −16.5% |\n| | | | | | Q17 | 15.894 s | **13.964 s** | −12.1% |\n\n**Geomean over the 22: 7.259 s → 5.695 s, −21.5%.** Nothing regressed —\nthe largest move the other way\nis Q06 at +2.8%, which has no join in it at all and so sets the noise\nband (Q01 +0.3%, Q04 +0.4%,\nQ13 +0.7% likewise).\n\nThe shipped binary, measured against DuckDB in the same run: **geomean\n5.659 s against 2.769 s = 2.04x**,\ndown from 2.61x. The worst ratios are now Q12 4.0x, Q17 3.7x, Q18 3.6x,\nQ01 3.3x — **none of them a\njoin problem**, which is where the next item will have to look.\n\n```text\n$ pixi run ci\n100% tests passed out of 2723          <- exit 0\n\n$ pixi run test -L metamorphic\n100% tests passed out of 154\n\n$ ANTB1_DIFF_SEED=20261116 pixi run diff-random\nDIFF: PASS seed=20261116 queries=2000 failed=0 unsupported=0\n\n$ ASAN_OPTIONS=detect_leaks=0 ./build/ci-asan/bin/antb1_exec_tests \\\n    --gtest_filter='HashJoin*:PartOperators*'\n[  PASSED  ] 85 tests.\n\n$ pixi run lint\nshellcheck (shell) ... Failed          <- 36 pre-existing SC2218 in two .sh files this does not\n                                          touch; osx-arm64 only, green on CI\n... every other leg .. Passed\n```\n\nPer-file `clang-tidy --warnings-as-errors='*'` is clean on\n`src/exec/hash_join.cc`.\n`src/exec/tests/hash_join_test.cc` reports the same 5 findings a\nworktree of `main` reports for it, so\nthey are pre-existing and osx-arm64 only.\n\n### Tests\n\n- `exec.HashJoinTest.AWindowOfMostlyMissesGathersOnlyTheRowsThatMatched`\n— sixteen probe rows of which\ntwo match: the batch is as long as its matches, carries no selection,\nand its probe columns are\n**not** the input's buffers. The same probe and build at `batch_size` 1\ngo down the *other* path (a\none-row window is wholly matched or skipped) and must answer\nidentically, in the same order. Setting\nthe condition so it never compacts fails this case, so it is\nload-bearing rather than merely present.\n- `OneToOnePathKeepsTheProbeColumns` → `...OfAWhollyMatchedWindow`,\nrewritten around the new invariant:\nevery output batch is as long as its matches and carries no selection,\nand shares the probe's buffers\n  **exactly when** no row of the window missed.\n- `BooleanPayloadOnBothPaths` — an inner join's 1:1 path no longer pads\nan unmatched probe row with a\nNULL build side, which is what an inner join means. The NULL-aware slice\ngather (BOOLEAN takes\n`GatherSlices`) is still reached through a **left** join, and this case\nnow covers it there, so the\ncoverage moved rather than went away. A NULL in the build's own data is\nasserted on both kinds.\n\n## Checklist\n\n- [x] `pixi run check` passes locally — except the pre-existing\nosx-arm64 shellcheck findings above\n- [x] Tests cover the change\n- [x] Docs updated: `docs/sql-subset.md` (the new `window_matched`\nmetric and why a selective join's\n`gather` is now near its output rather than near its probe), ADR 0026's\nC8\n- [x] No ClickBench-derived data is committed\n- [x] Nothing derived from TPC-H is committed: no query text, data,\nanswers or TPC tools (ADR-0006).\n      Only timings, memory figures and query numbers appear here.\n- [ ] Changes to governance paths (see `.github/CODEOWNERS`) —\n**`docs/adr/` needs your sign-off**\n\n## One note for the roadmap\n\n**Three of ADR 0026's own entries were waiting behind this.** C5's\nre-profiling read Q10's cost as\n`gather` and handed it to `exec` as a string-width problem; a good part\nof it was this instead (Q10\n−18.5% here, with no string work done). The transferable lesson is in\nthe ADR: one timer covering two\ndifferent things — `Take`-on-probe and the build gather — hid a 2x for\nas long as it was not split.\n\nI also checked the semi-join reduction (ADR 0023's deferred item) before\ncoming here and left it alone\nwith its numbers written down: ~9% on Q17, ~0% on Q02. It is not where\nthe time was.\n\n## AI assistance\n\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5)\nre-profiled the 22, found the\nper-probe-row `gather` anomaly, added the metric that distinguished\nunmatched rows from\nresidual-rejected pairs, swept the threshold to establish that none is\nneeded, wrote the diff,\n      the tests and the docs, and mutation-checked the new test.\n- Accountable human (has read and understands the whole diff): @hor911\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-16T16:13:45+03:00",
+          "tree_id": "ce915ce301b3da3d4970a893d1492c48cac5bace",
+          "url": "https://github.com/ydb-campus/antb1/commit/6e8dfdca1bba3873ac4da47b0caba71eaf44bdc5"
+        },
+        "date": 1792156622031,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 5169.114454863376,
+            "unit": "ns/iter",
+            "extra": "iterations: 133948\ncpu: 5168.489331680951 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 83826.85852130945,
+            "unit": "ns/iter",
+            "extra": "iterations: 7980\ncpu: 83812.86441102758 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 221988.2431061903,
+            "unit": "ns/iter",
+            "extra": "iterations: 3155\ncpu: 221932.9911251981 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 439368.1255492703,
+            "unit": "ns/iter",
+            "extra": "iterations: 1593\ncpu: 439276.09667294414 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 360193.5977366064,
+            "unit": "ns/iter",
+            "extra": "iterations: 1944\ncpu: 360100.8508230457 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2091364.8000000243,
+            "unit": "ns/iter",
+            "extra": "iterations: 335\ncpu: 2090911.3253731346 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 51.237197999997676,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 51.22695830769226 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 44.54934012499834,
+            "unit": "ms/iter",
+            "extra": "iterations: 16\ncpu: 44.5307788125 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 200.36090100001047,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 200.31012266666676 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.313253000000026,
+            "unit": "ms/iter",
+            "extra": "iterations: 49\ncpu: 14.312911755102036 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 22.016081687500133,
+            "unit": "ms/iter",
+            "extra": "iterations: 32\ncpu: 22.011496593750014 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 40.1434420588236,
+            "unit": "ms/iter",
+            "extra": "iterations: 17\ncpu: 40.14016335294122 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.5592451024498666,
+            "unit": "ms/iter",
+            "extra": "iterations: 449\ncpu: 1.55899509131403 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 98.93699857142987,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 98.93378771428577 ms\nthreads: 1"
           }
         ]
       }
