@@ -56,8 +56,11 @@ arrow::Status Fit(std::vector<T>& values, std::size_t size, MemoryReservation& m
   return arrow::Status::OK();
 }
 
-// The join's output: the left input's fields, then the right input's; the build's are nullable
-// (the 1:1 path writes NULL where a probe row has no match).
+// The join's output: the left input's fields, then the right input's; the build's are nullable,
+// because a left join pads a probe row without a match with NULLs. An inner join no longer produces
+// one of those -- its paths emit the rows that matched and nothing else (ADR 0026's C8) -- so for
+// inner joins this is wider than it has to be, which costs a validity bitmap nobody reads and never
+// a wrong answer.
 std::shared_ptr<arrow::Schema> JoinSchema(const arrow::Schema& probe, const arrow::Schema& build,
                                           plan::BuildSide build_side) {
   arrow::FieldVector build_fields;
