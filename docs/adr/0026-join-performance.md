@@ -447,19 +447,43 @@ changes.
     left always, which makes "unless the right is decisively larger" unreachable and silently stops
     `--build-side-ratio` doing anything. Which side is *built* does not depend on the orientation; only the labels do,
     so `plan.BinderTest` now pins the built relation rather than the branches.
-- **C5a, perf(plan): cost the join's own layout, deferred 2026-10-16.** The one regression C5 leaves: **Q11 is 33%
-  slower** (1.42 s to 1.90 s), and the cause is exact. Its new plan reduces `supplier` to the 40,045 rows of one
+- **C5a, perf(exec): lay out a sparse key directly too, done 2026-10-16.** The one regression C5 left: **Q11 was 33%
+  slower** (1.42 s to 1.90 s), and the cause was exact. Its new plan reduces `supplier` to the 40,045 rows of one
   nation before the large join — the classic star-schema move, and it carries 3.2M rows where the greedy plan carries
   80M. But `s_suppkey` is dense over all of `supplier`, 1..1,000,000 over 1,000,000 rows, so a build on the whole
   table qualifies for the direct layout: an array indexed by the key, no hashing. The 40,045 surviving keys stay
-  spread over the same range, so `max - min + 1` of about 1,000,000 against `8 x 40,045` fails `JoinTable`'s
-  density test and the build falls back to hashing. Measured over the same 80M probes: `find` goes from 77 ms to
-  865 ms, about 22x per probe, and the two blocks' join time accounts for the whole regression to the millisecond.
-  **Making a build 25x smaller made it 11x dearer to probe.** Filtering a build shrinks its rows but not its key's
-  range, so it can only ever lose the layout, never gain it. A cost model that saw this would need each subset to
-  carry its key's footer range beside its estimated rows and to know which side rule 5 will build; the data is in
-  `ColumnRange` already and the model would get this case right. Until then the search is blind to it, and the trade
-  is 0.46 s on Q11 against 13 s on Q10.
+  spread over the same range, so `max - min + 1` of about 1,000,000 against `8 x 40,045` failed `JoinTable`'s
+  density test and the build fell back to hashing. Measured over the same 80M probes: `find` went from 52 ms to
+  884 ms, about 17x per probe, and the two blocks' join time accounted for the whole regression to the millisecond.
+  **Making a build 25x smaller made it 17x dearer to probe.**
+
+  **The plan-side fix this ADR sketched cannot work, and the arithmetic says so without writing it.** A search that
+  saw the layout would need the build's key range *after* its filters; a footer only has the whole column's. Both of
+  Q11's plans contain a join whose build is a filtered relation, so the footer range misreads both and the penalty
+  cancels: the greedy plan's second build is `nation` at **one row**, whose footer span of 25 against `8 x 1` reads
+  as hashed where the actual span is 0 and `JoinTable` lays it out directly. Charging a hashed probe its rows then
+  leaves the greedy plan at 164.2M against the new plan's 84.3M and **the search still picks the slower one**.
+  Separating them needs to know whether filtering collapses a key's range — `nation`'s does, `supplier`'s does not —
+  which no statistic in a Parquet footer records.
+
+  So the fix belongs where both the actual range and the actual rows are already known: **the layout rule.** Not
+  "make the search avoid the plan that loses the array" but "let the better plan keep it". `JoinTable::Build` allows
+  32 slots a row rather than 8 — and the `8` rule is still unconditional, so this only ever *adds* the array. The
+  density bound turns out to have been far too tight, and not for the reason it looks like: **the array wins even
+  when it cannot be cache-resident.** Q05's build is 22.8M rows spanning 600M, a **2.4 GB** index read at random, and
+  it is 17% faster than hashing the same keys — one dependent load beats a hash, a bucket load and a key compare
+  whichever level of memory each lands in. Nothing above 32 slots a row moved any measurement, so the constant is a
+  bound, not a tuning. Past 8 slots a row the index is memory the hashed layout would not spend, so the sparse half
+  of the rule asks the budget first and takes at most an eighth of `--memory-limit`: a build that would fail its
+  budget on an index is better hashed than failed. A query's limit therefore changes how a join is laid out and never
+  its answer, as `--build-side-ratio` and `--join-order` do for its plan.
+
+  Measured at SF 100 on 4 threads, best of 2, both columns from the same binary: **Q11 2.04 s to 1.56 s (-23%)**,
+  **Q05 15.55 s to 12.90 s (-17%)**, **Q09 24.95 s to 22.34 s (-10%)**, Q21 23.23 s to 21.76 s (-6%), and the geomean
+  over the 22 falls **7.58 s to 7.29 s (-3.8%)**. Nothing regressed: the worst query moved +0.2%, and Q06 — which has
+  no join at all — moved -5.4%, which sets the noise band this was read against. The cost is peak memory where a
+  sparse index is taken: Q05 4.55 to 6.27 GB, Q21 5.03 to 5.59 GB, Q09 12.10 to 12.38 GB, every other query flat.
+  **Q11 is now faster than either plan C5 could choose**, so C5's regression is closed rather than traded away.
 
 Re-profiling all 22 at SF 100 after C1 and C3a says the roadmap above no longer matches where the time is. Three of
 the four worst queries need items this ADR does not own, and two of those are deferrals of ADR 0022's whose triggers

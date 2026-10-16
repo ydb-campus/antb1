@@ -414,8 +414,9 @@ TEST_F(JoinTableTest, BothLayoutsAgree) {
   EXPECT_EQ(results[1], results[3]);
 }
 
-// The direct layout serves a single integer key whose values span fewer than 8 times the rows,
-// whatever the type, the sign or the range of the keys.
+// The direct layout serves a single integer key whose values span fewer than 8 times the rows --
+// or, when the query can afford the index, 32 times (ADR 0026's C5a) -- whatever the type, the sign
+// or the range of the keys.
 TEST_F(JoinTableTest, DirectLayoutBoundaries) {
   const auto check = [](const BuildData& data, JoinTable::Layout layout, const Probe& probe) {
     auto table = BuildTable(data, nullptr);
@@ -423,8 +424,11 @@ TEST_F(JoinTableTest, DirectLayoutBoundaries) {
     EXPECT_EQ((*table)->layout(), layout);
     EXPECT_EQ(Matches(**table, probe), Reference(data, probe));
   };
-  // Ten rows: a span of 79 (8N - 1) is direct, 80 (8N) is hashed.
-  for (const int64_t last : {79, 80}) {
+  // Ten rows: a span of 319 (32N - 1) is direct, 320 (32N) is hashed. The middle of that range is
+  // the shape ADR 0026's C5a is about -- nine dense keys and one far away, which is what a build
+  // filtered out of a dense key looks like -- so 200 (20 slots a row, past the 8 the first rule
+  // allowed) has to be direct, not merely under the bound.
+  for (const int64_t last : {79, 200, 319, 320}) {
     std::vector<std::optional<int64_t>> keys;
     keys.reserve(10);
     for (int64_t k = 0; k < 9; ++k) {
@@ -434,11 +438,11 @@ TEST_F(JoinTableTest, DirectLayoutBoundaries) {
     BuildData data({LogicalType::kBigInt});
     data.Add(0, {Int64s(keys)});
     std::vector<std::optional<int64_t>> probe;
-    probe.reserve(83);
-    for (int64_t k = -1; k <= 81; ++k) {
+    probe.reserve(static_cast<std::size_t>(last) + 4);
+    for (int64_t k = -1; k <= last + 2; ++k) {
       probe.emplace_back(k);
     }
-    check(data, last == 79 ? JoinTable::Layout::kDirect : JoinTable::Layout::kHashed,
+    check(data, last == 320 ? JoinTable::Layout::kHashed : JoinTable::Layout::kDirect,
           Int64Probe(probe));
   }
   // The whole BIGINT range: hashed, and the span does not overflow.
@@ -508,6 +512,49 @@ TEST_F(JoinTableTest, DirectLayoutBoundaries) {
     check(data, JoinTable::Layout::kDirect,
           Probe{.keys = {IntegersOf(c.type, probe)}, .selection = nullptr});
   }
+}
+
+// Only the sparse half of the rule asks the budget (ADR 0026's C5a): an index of more than an
+// eighth of the limit, or one that does not fit in what is still free, is not taken, because a
+// build that would fail its budget on an index is better hashed than failed. A key dense enough for
+// the first bound is laid out directly whatever the budget says. Both layouts answer the same
+// probe.
+TEST_F(JoinTableTest, ASparseDirectIndexNeedsTheBudgetAndADenseOneDoesNot) {
+  // `rows` keys 0.. with the last at `span`, so the index is (span + 3) * 4 bytes. `held` is
+  // charged to the budget before the build, as another operator's memory would be.
+  const auto build = [](int64_t rows, int64_t span, int64_t limit, int64_t held = 0) {
+    std::vector<std::optional<int64_t>> keys;
+    keys.reserve(static_cast<std::size_t>(rows));
+    for (int64_t k = 0; k < rows - 1; ++k) {
+      keys.emplace_back(k);
+    }
+    keys.emplace_back(span);
+    BuildData data({LogicalType::kBigInt});
+    data.Add(0, {Int64s(keys)});
+    MemoryBudget budget(limit);
+    EXPECT_TRUE(budget.Reserve(held).ok());
+    auto table = BuildTable(data, nullptr, {}, &budget, &budget);
+    EXPECT_TRUE(table.ok()) << table.status().ToString();
+    if (!table.ok()) {
+      budget.Release(held);
+      return JoinTable::Layout::kHashed;
+    }
+    const Probe probe = Int64Probe({0, span, span - 1, rows - 1, -1, std::nullopt});
+    EXPECT_EQ(Matches(**table, probe), Reference(data, probe));
+    const JoinTable::Layout layout = (*table)->layout();
+    budget.Release(held);
+    return layout;
+  };
+  // Ten rows spanning 200: an 812-byte index, so a limit of 6 KiB affords only 768 of it.
+  EXPECT_EQ(build(10, 200, int64_t{64} * 1024), JoinTable::Layout::kDirect);
+  EXPECT_EQ(build(10, 200, int64_t{6} * 1024), JoinTable::Layout::kHashed);
+  EXPECT_EQ(build(10, 79, int64_t{6} * 1024), JoinTable::Layout::kDirect);  // dense: never asks
+  // 1000 rows spanning 31,999: a 128,008-byte index, an eighth of a 1 MiB limit almost exactly. It
+  // is taken with the limit free and not taken with 900 KiB of it already held, which a share of
+  // the limit alone would not have noticed.
+  EXPECT_EQ(build(1000, 31999, int64_t{1024} * 1024), JoinTable::Layout::kDirect);
+  EXPECT_EQ(build(1000, 31999, int64_t{1024} * 1024, int64_t{900} * 1024),
+            JoinTable::Layout::kHashed);
 }
 
 // Keys of the types that are always hashed and keys of two columns follow SQL's equality: equal
