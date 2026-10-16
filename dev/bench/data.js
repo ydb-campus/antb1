@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792138237978,
+  "lastUpdate": 1792147834323,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -8748,6 +8748,114 @@ window.BENCHMARK_DATA = {
             "value": 51.823865384615324,
             "unit": "ms/iter",
             "extra": "iterations: 13\ncpu: 51.82175253846156 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d6f6f3e3f38390bb93b3e4e05059a60425231eff",
+          "message": "perf(exec): lay out a sparse join key directly too (#153)\n\n## Summary\n\nADR 0026's **C5a**, which closes the one regression\n[#152](https://github.com/ydb-campus/antb1/pull/152) left.\n\nQ11 was 33% slower because its *better* plan lost the direct layout. It\nreduces `supplier` to one\nnation's 40,045 rows before the large join — the right move by rows,\n3.2M carried instead of 80M — but\n`s_suppkey` stays spread over 1..1,000,000, so `max − min + 1` against\n`8 × 40,045` failed\n`JoinTable`'s density test and the build fell back to hashing. Over the\nsame 80M probes `find` went\n**52 ms → 884 ms**, which accounted for the whole regression.\n\n**The plan-side fix this ADR sketched cannot work, and the arithmetic\nsays so without writing it.** A\nsearch that saw the layout would need the build's key range *after* its\nfilters; a footer only has the\nwhole column's. Both of Q11's plans contain a join whose build is a\nfiltered relation, so the footer\nrange misreads both and the penalty cancels — the greedy plan's second\nbuild is `nation` at **one\nrow**, whose footer span of 25 against `8 × 1` reads as hashed where the\nactual span is 0 and the\nlayout is direct. Charging a hashed probe its rows then leaves the\ngreedy plan at 164.2M against the\nnew plan's 84.3M and **the search still picks the slower one**. Whether\nfiltering collapses a key's\nrange — `nation`'s does, `supplier`'s does not — is not something any\nfooter statistic records.\n\nSo the rule moves to where the actual range and the actual rows are both\nalready known: the layout\nitself. Not \"make the search avoid the plan that loses the array\" but\n**\"let the better plan keep\nit\"**. `JoinTable::Build` allows 32 slots a row rather than 8, and **the\n`8` rule stays\nunconditional, so this only ever adds the array, never takes it away.**\n\nCloses #\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [x] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## The old bound was far too tight, and not for the reason it looks like\n\n`span < 8 * num_rows` reads like a memory rule, but at 4 bytes a slot it\nis also a *locality* rule: a\nsparse index means every probe touches a random line in a large array,\nwhere the equivalent hash table\nmay be cache-resident. That is a real effect and it is why I measured\nbefore designing anything.\n\n**It does not hold. The array wins even when it cannot possibly be\ncache-resident.** Q05's build is\n22.8M rows spanning 600M — a **2.4 GB index read at random** — and it is\n17% faster than hashing the\nsame keys. One dependent load beats a hash, a bucket load and a key\ncompare whichever level of memory\neach lands in. Sweeping the bound at 8 → 32 → 128 → 1024 → unbounded,\n**nothing above 32 moved any\nmeasurement**, so the constant is a bound rather than a tuning:\n\n```text\nQ11, SF 100, 4 threads, best of 3, --join-order cost, same binary\n  slots/row      find      wall\n          8   884.0ms    1.952s   <- the build is hashed\n         32    52.2ms    1.534s   <- direct\n        128    52.2ms    1.526s\n       1024    52.4ms    1.529s\n 1000000000    52.4ms    1.546s\n```\n\nPast 8 slots a row the index is memory the hashed layout would not\nspend, so the sparse half of the\nrule asks the budget first and takes at most an eighth of\n`--memory-limit`: **a build that would fail\nits budget on an index is better hashed than failed.** A limit therefore\nchanges how a join is laid\nout and never its answer, as `--build-side-ratio` and `--join-order` do\nfor its plan. Verified end to\nend on Q05's 2.4 GB index, which the default limit affords and a tight\none declines:\n\n```text\n$ antb1 explain --analyze --memory-limit 38GB ... | grep 'o_orderkey = lineitem.l_orderkey'\n  HashBuild ... rows=22760819 direct=1\n$ antb1 explain --analyze --memory-limit 8GB  ...        # 8GB/8 = 1GB < 2.4GB\n  HashBuild ... rows=22760819 direct=0                   # slower, not failed\n```\n\n## Verification\n\nTPC-H-derived harness outside the repo (ADR 0006), SF 100, 4 threads,\nbest of 2, **both columns from\nthe same binary** (the bound behind a temporary environment override,\nremoved before this commit):\n\n| query | 8 slots | 32 slots | | peak memory |\n| --- | ---: | ---: | --- | --- |\n| **Q11** | 2.037 s | **1.561 s** | **−23.4%** | 0.54 → 0.53 GB |\n| **Q05** | 15.551 s | **12.899 s** | **−17.1%** | 4.55 → **6.27 GB** |\n| **Q09** | 24.954 s | **22.340 s** | **−10.5%** | 12.10 → 12.38 GB |\n| Q21 | 23.230 s | **21.761 s** | −6.3% | 5.03 → 5.59 GB |\n| **geomean, 22** | **7.582 s** | **7.294 s** | **−3.8%** | |\n\n**Nothing regressed** — the worst query moved +0.2%. Q06, which has *no\njoin at all*, moved −5.4%,\nwhich is what sets the noise band these were read against; by it, only\nQ11, Q05 and Q09 are\nunambiguous and Q21 is marginal. The shipped binary (with the budget\nguard, under the default limit)\nreproduces the right-hand column: Q05 12.894 s, Q09 22.536 s, Q11 1.564\ns, Q21 21.578 s.\n\n**The cost is peak memory where a sparse index is taken**, and Q05's is\nnot small: +1.72 GB for 2.65 s.\nQ11 is now faster than either plan C5 could choose, so C5's regression\nis closed rather than traded.\n\n```text\n$ pixi run ci\n100% tests passed out of 2722          <- exit 0\n\n$ pixi run test -L metamorphic\n100% tests passed out of 154\n\n$ ANTB1_DIFF_SEED=20261101 pixi run diff-random\nDIFF: PASS seed=20261101 queries=2000 failed=0 unsupported=0\n\n$ ASAN_OPTIONS=detect_leaks=0 ./build/ci-asan/bin/antb1_exec_tests \\\n    --gtest_filter='JoinTable*:HashJoin*'\n[  PASSED  ] 80 tests.\n\n$ pixi run lint\nshellcheck (shell) ... Failed          <- 36 pre-existing SC2218 in two .sh files this does not\n                                          touch; osx-arm64 only, green on CI\n... every other leg .. Passed\n```\n\nPer-file `clang-tidy --warnings-as-errors='*'` is clean on\n`src/exec/join_table.cc` and\n`src/exec/tests/join_table_test.cc`. `src/exec/tests/hash_join_test.cc`\nreports 5 findings — the same\n5 a worktree of `main` reports for that file, so they are pre-existing\nand osx-arm64 only.\n\n### Tests\n\n-\n`exec.JoinTableTest.ASparseDirectIndexNeedsTheBudgetAndADenseOneDoesNot`\n— the new clause is the\nonly one that asks the budget: 10 rows spanning 200 (an 812-byte index)\nare direct under a 64 KiB\nlimit and hashed under 6 KiB, while 10 rows spanning 79 are direct under\nthe same 6 KiB because the\n  dense rule never asks. Both layouts answer the same probe.\n- `DirectLayoutBoundaries` now pins 319 (`32N − 1`) direct and 320\n(`32N`) hashed, and **200 in the\nmiddle** — nine dense keys and one far away, which is the miniature of\nthe Q11 shape, so the case\nfails if the new bound is reverted rather than merely sitting under it.\n- `exec.HashJoinTest.ProfilesCountBuildsAndProbes` built its keys 0..11\nplus 113 to exercise the\n*hashed* profile; that is now dense enough to be direct, so its sparse\nkey moved to 1013 to keep\n  testing what it was written for.\n- `parallel.diff.*` and the metamorphic suite are the correctness gate:\nthe layout must not change an\nanswer, and the budget guard means a limit now selects between the two\nat run time.\n\n## Checklist\n\n- [x] `pixi run check` passes locally — except the pre-existing\nosx-arm64 shellcheck findings above\n- [x] Tests cover the change\n- [x] Docs updated: `docs/sql-subset.md` (what the order does not\naccount for, now with the bound and\n      the limit's part in it), ADR 0026's C5a\n- [x] No ClickBench-derived data is committed\n- [x] Nothing derived from TPC-H is committed: no query text, data,\nanswers or TPC tools (ADR-0006).\n      Only timings, memory figures and query numbers appear here.\n- [ ] Changes to governance paths (see `.github/CODEOWNERS`) —\n**`docs/adr/` needs your sign-off**\n\n## AI assistance\n\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5)\nestablished by arithmetic that the\nplan-side C5a this ADR had scheduled could not separate Q11's two plans,\nredirected the fix to\nthe layout rule, ran the density sweep and the 22-query A/B, wrote the\ndiff, the tests and the\n      docs, and verified the budget guard end to end.\n- Accountable human (has read and understands the whole diff): @hor911\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-16T13:47:18+03:00",
+          "tree_id": "bf23bc5de6909ddfcdc9f335ca01b5034f3a6cba",
+          "url": "https://github.com/ydb-campus/antb1/commit/d6f6f3e3f38390bb93b3e4e05059a60425231eff"
+        },
+        "date": 1792147833662,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4998.442222254703,
+            "unit": "ns/iter",
+            "extra": "iterations: 137302\ncpu: 4996.754526518187 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84298.45560091925,
+            "unit": "ns/iter",
+            "extra": "iterations: 7838\ncpu: 84256.12184230673 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222142.8332804123,
+            "unit": "ns/iter",
+            "extra": "iterations: 3149\ncpu: 222065.7135598604 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 444071.0957514275,
+            "unit": "ns/iter",
+            "extra": "iterations: 1577\ncpu: 443899.82054533926 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 361797.0569358199,
+            "unit": "ns/iter",
+            "extra": "iterations: 1932\ncpu: 361652.17805383034 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2093311.3958333156,
+            "unit": "ns/iter",
+            "extra": "iterations: 336\ncpu: 2092693.9345238102 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 51.54444069230653,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 51.53913169230766 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 45.1142581874997,
+            "unit": "ms/iter",
+            "extra": "iterations: 16\ncpu: 45.09761343749996 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 188.64498299999846,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 188.62275533333298 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.3997249387756,
+            "unit": "ms/iter",
+            "extra": "iterations: 49\ncpu: 14.398025653061229 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 22.361183387096894,
+            "unit": "ms/iter",
+            "extra": "iterations: 31\ncpu: 22.35945293548384 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 39.6726713333335,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 39.666835222222275 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.7392989726368344,
+            "unit": "ms/iter",
+            "extra": "iterations: 402\ncpu: 1.7390040024875622 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 107.74627228571327,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 107.71998757142853 ms\nthreads: 1"
           }
         ]
       }
