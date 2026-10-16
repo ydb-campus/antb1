@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792156622721,
+  "lastUpdate": 1792163316176,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -8964,6 +8964,114 @@ window.BENCHMARK_DATA = {
             "value": 98.93699857142987,
             "unit": "ms/iter",
             "extra": "iterations: 7\ncpu: 98.93378771428577 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "3fb7fb6138f4e1fa6ac9d4a4d1852e6f4355974a",
+          "message": "perf(exec): read DECIMAL operands without copying them (#155)\n\n## Summary\n\nADR 0026's **C9**. With the join costs gone after #154, the slowest\nquery of the 22 was **Q01 at\n16.84 s and 3.25x — and it contains no join at all**. 38.4 s of its 49.8\ns (summed over parts) was\n`Compute`, evaluating two DECIMAL expressions over 591.6 M rows.\n\nIsolated against a floor of the same scan with no arithmetic, **one\nDECIMAL addition cost 2.68 ns a\nrow — 2.4x what reading and summing the whole column costs** — and each\nconstant in an expression added\n0.50 ns a row on top:\n\n```text\nSF 100, 4 threads, best of 3, one column so only the arithmetic varies\n  SUM(l_discount)                                      0.645s   <- scan + sum floor\n  SUM(l_discount + l_discount + ... )  4 adds           6.984s   -> 2.68 ns per add per row\n  SUM(l_discount + 1 + 1 + 1 + 1)     4 adds, 4 consts  8.162s   -> +0.50 ns per constant\n```\n\n**None of it was Arrow's** — DECIMAL arithmetic takes antb1's own path\n(`DecimalArith`), and it was\nmoving about **176 bytes a row for one addition of two columns** where\n48 would do:\n\n- `DecimalOperand` held a `std::vector<Int128>`, so every operand of\nevery operation was\nvalue-initialised (a memset), filled from the Arrow buffer and read back\n— while a decimal128 array\n  already *is* 16 contiguous bytes a row.\n- `RescaleOperand` walked both operands even when the scales already\nagreed and its factor was\n  therefore 1.\n- A constant was built into a full array of copies of itself\n(`MakeArrayFromScalar`) and then widened\n  into a full vector of them.\n\nSo an operand is read in place from its own buffer, a constant is one\nvalue, and a rescale that would\nmultiply by 1 does not happen. A rescale is the one thing that still\nmaterialises, because it rewrites\nevery value.\n\nCloses #\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [x] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n**One addition now costs 1.27 ns a row**, and a constant operand went\nfrom costing 0.50 ns a row *more* than a column to 0.14 ns *less* —\nwhich is what it should always have been. Same probes, same\nbinary shape, best of 3:\n\n| probe | before | after | |\n| --- | ---: | ---: | --- |\n| scan + sum floor | 0.645 s | 0.655 s | — |\n| 4 additions | 6.984 s | **3.639 s** | **−47.9%** |\n| 4 additions, 4 constants | 8.162 s | **3.314 s** | **−59.4%** |\n| `SUM(ep·(1−disc))` | 4.334 s | **2.869 s** | −33.8% |\n| `SUM(ep·(1−disc)·(1+tax))` | 7.471 s | **4.509 s** | −39.6% |\n| **Q01's pair of expressions** | **10.756 s** | **6.373 s** |\n**−40.8%** |\n\nOver the 22 at SF 100, 4 threads, best of 2, against DuckDB measured in\nthe same run:\n\n| | before | after | |\n| --- | ---: | ---: | --- |\n| **Q01** | 16.838 s / 3.25x | **12.389 s / 2.41x** | **−26.4%** |\n\n| **geomean** | 5.659 s / 2.04x | **5.589 s / 2.02x** | −1.2% |\n\nEverything else is inside the noise band. Q01's `Compute` falls **38.4 s\n→ 20.8 s summed (−45.8%)**.\n\n**A P0 was found in review and is fixed in b09fc43**, with the numbers\nabove already reflecting it: skipping the\nrescale where the scales agree also skipped the only check on a value a\n*file* holds beyond its column's\ndeclared width, so such a column added to its own negation answered `0`\nwhere DuckDB raises a conversion\nerror. My own PR text had named that cause and argued it was acceptable\nbecause no test pinned it — the\nwrong call. The check is back in the arithmetic's own loop (no extra\npass, and skipped for operands a\nrescale or their own type already vouches for), it costs about 1% of\nQ01, and `DecimalArithmeticErrors`\nnow pins it with the sum-in-range case. The review's stated mechanism —\nHUGEINT being wider than\nDECIMAL(38,0) — does not exist: `RangeOf` gives both 10^38−1.\n\nA note on method: my first run of the 22 was **invalid** — I had a `pixi\nrun ci` going at the same time,\nand DuckDB's own numbers moved +20%, which is the tell. The table above\nis a clean re-run on an idle\nmachine, and DuckDB's figures in it match the previous clean run\n(geomean 2.769 s → 2.771 s).\n\n```text\n$ pixi run ci\n100% tests passed out of 2722          <- exit 0\n\n$ pixi run test -L metamorphic\n100% tests passed out of 154\n\n$ ANTB1_DIFF_SEED=20261201 pixi run diff-random\nDIFF: PASS seed=20261201 queries=2000 failed=0 unsupported=0\n\n$ ASAN_OPTIONS=detect_leaks=0 ./build/ci-asan/bin/antb1_exec_tests \\\n    --gtest_filter='Compute*:Filter*'\n[  PASSED  ] 21 tests.\n\n$ pixi run lint\nshellcheck (shell) ... Failed          <- 36 pre-existing SC2218 in two .sh files this does not\n                                          touch; osx-arm64 only, green on CI\n... every other leg .. Passed\n```\n\nPer-file `clang-tidy --warnings-as-errors='*'` is clean on both changed\nTUs.\n\n### Tests\n\n`exec.ComputeTest.DecimalArithmetic` already covered a constant operand,\na one-sided NULL and a\n`Slice(0, 3)` — but at **offset 0**, so it could not see the one new way\nthis can go wrong: reading a\nbuffer in place has to start at the array's own offset. The new case\nslices **past the first row** and\nasserts the same rows answer the same as a tail of the array, through\nboth an add (which rescales its\nleft operand and reads its right in place) and a multiply (which reads\nboth in place). Dropping the\noffset from the pointer fails it, so it is load-bearing rather than\nmerely present. Slices matter here\nbecause that is how batches are passed around.\n\nThe error behaviour is unchanged, and the reason is worth stating:\nskipping the rescale where the scales\nagree keeps every error the tests pin, because they rest on the\n**result's** own range check, and the\none case that needs an operand check is a real rescale, which still\nruns. A value a file holds beyond\nits declared width (nothing checks that on read) is still caught by the\nresult check.\n\n## Checklist\n\n- [x] `pixi run check` passes locally — except the pre-existing\nosx-arm64 shellcheck findings above\n- [x] Tests cover the change\n- [x] Docs updated: ADR 0026's C9. No `docs/sql-subset.md` change — no\nSQL, output or metric moves.\n- [x] No ClickBench-derived data is committed\n- [x] Nothing derived from TPC-H is committed: no query text, data,\nanswers or TPC tools (ADR-0006).\nOnly timings and query numbers appear here; the probe queries above are\nmy own.\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) —\n**`docs/adr/` needs your sign-off**\n\n## What I deliberately left\n\nBoth are measurable from Q01's remaining `Compute` (20.8 s summed, still\n42% of the query), and both are\nrecorded in the ADR:\n\n- Its two expressions **share a subexpression** that is evaluated twice\n— the evaluator is a tree walk\n  with no memoisation. Worth about 1.7 s of the 6.25 s probe.\n- Each operation still **materialises its result**, where a fused walk\nwould keep intermediates in\n  registers. This subsumes the first and is the larger change.\n\nAt 48 bytes a row for one operation, the current form is near what a\nmaterialising evaluator can do, so\nthe next step there is fusion rather than more trimming.\n\n## AI assistance\n\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5)\nisolated the per-operation and\nper-constant costs against a no-arithmetic floor, found the three\nsources of copying, wrote the\ndiff and the offset test, mutation-checked that test, and measured the\nresult (including catching\n      and discarding its own contended benchmark run).\n- Accountable human (has read and understands the whole diff): @hor911\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-16T18:05:11+03:00",
+          "tree_id": "82c73c631dbcb8c83f1e6fffa4db86e3dff6e65c",
+          "url": "https://github.com/ydb-campus/antb1/commit/3fb7fb6138f4e1fa6ac9d4a4d1852e6f4355974a"
+        },
+        "date": 1792163315583,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 5052.636340787421,
+            "unit": "ns/iter",
+            "extra": "iterations: 139254\ncpu: 5052.352492567538 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84560.45784224702,
+            "unit": "ns/iter",
+            "extra": "iterations: 7721\ncpu: 84556.65237663515 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222263.17959313304,
+            "unit": "ns/iter",
+            "extra": "iterations: 3146\ncpu: 222248.81913541004 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 441686.16277604055,
+            "unit": "ns/iter",
+            "extra": "iterations: 1585\ncpu: 441641.20441640384 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 361123.50955084915,
+            "unit": "ns/iter",
+            "extra": "iterations: 1937\ncpu: 361107.82550335565 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2103162.161194035,
+            "unit": "ns/iter",
+            "extra": "iterations: 335\ncpu: 2102978.035820895 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 51.80284776922952,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 51.79929146153852 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 45.220436399999166,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 45.19949133333334 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 207.63005833333636,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 207.6074243333335 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.383575183673578,
+            "unit": "ms/iter",
+            "extra": "iterations: 49\ncpu: 14.381728755102033 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 22.601712709677983,
+            "unit": "ms/iter",
+            "extra": "iterations: 31\ncpu: 22.59715006451611 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 40.000800294117596,
+            "unit": "ms/iter",
+            "extra": "iterations: 17\ncpu: 39.9987651764706 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.6188670517647097,
+            "unit": "ms/iter",
+            "extra": "iterations: 425\ncpu: 1.6187444258823547 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 127.9146073333332,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 127.90486216666666 ms\nthreads: 1"
           }
         ]
       }
