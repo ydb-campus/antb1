@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792163316176,
+  "lastUpdate": 1792176860512,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -9072,6 +9072,114 @@ window.BENCHMARK_DATA = {
             "value": 127.9146073333332,
             "unit": "ms/iter",
             "extra": "iterations: 6\ncpu: 127.90486216666666 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9d4f0268d55227a81775c78c36eebdaa439b9942",
+          "message": "perf(exec): run a DECIMAL arithmetic tree in one pass (#156)\n\n## Summary\n\nADR 0026's **C10**, and the thing C9 said was left. A tree of DECIMAL\n`+`, `-` and `*` over columns and\nconstants is now **compiled once per batch into a short list of steps\nand run a row at a time**, with\nintermediates in registers instead of arrays. `ep * (1 - disc) * (1 +\ntax)` moved about **160 bytes a\nrow**; it reads its three columns and writes one result now, **64**.\n\n**The risk was that a per-row program would be slower than the tight\nper-operation loops it replaces** —\na loop over steps pays dispatch where a vectorised loop pays none. It\nisn't, and the reason is specific:\nthe steps are identical for every row, so the dispatch branch predicts\nperfectly and what's left is the\narithmetic. That was the one thing worth measuring before writing any of\nit, and it's why this is a\nmeasurement-gated change rather than an obvious one.\n\nCloses #\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [x] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\nSF 100, 4 threads, best of 3, over one column so only the arithmetic\nvaries — **the gain grows with the\nchain**, as the traffic it removes does:\n\n| probe | C9 | C10 | |\n| --- | ---: | ---: | --- |\n| 4 additions | 3.639 s | **2.854 s** | **−21.6%** |\n| `ep * (1 − disc)` — 2 operations | 2.869 s | 2.716 s | −5.3% |\n| `ep * (1 − disc) * (1 + tax)` | 4.509 s | **3.778 s** | **−16.2%** |\n| **Q01's pair of expressions** | **6.373 s** | **5.514 s** | **−13.5%**\n|\n\nOver the 22, against DuckDB measured in the same run:\n\n| | C9 | C10 | |\n| --- | ---: | ---: | --- |\n| **Q01** | 12.389 s / 2.41x | **11.673 s / 2.26x** | **−5.8%** |\n| **Q09** | 13.946 s | **13.274 s** | **−4.8%** (same expression) |\n| geomean | 5.589 s / 2.00x | 5.546 s / **2.00x** | −0.8% |\n\nQ01's `Compute` falls **20.8 s → 18.5 s summed (−11.0%)** — so **38.4 s\n→ 18.5 s** across C9 and C10\ntogether. The geomean barely moves because only two of the 22 carry a\nDECIMAL chain long enough to\nmatter; I'd rather state that than dress it up.\n\n**On the queries that moved the other way (Q18 +2.3%, Q20 +3.8%, Q21\n+2.5%): DuckDB moved with them on\nthe same queries** (+2.0%, +1.6%, +1.9%), so that's machine drift, not\nthis change. Using the oracle's\nown figures per query as the control is the only way I can tell those\napart at this size.\n\n```text\n$ pixi run ci\n100% tests passed out of 2723          <- exit 0\n\n$ pixi run test -L metamorphic\n100% tests passed out of 154\n\n$ ANTB1_DIFF_SEED=20261210 pixi run diff-random\nDIFF: PASS seed=20261210 queries=2000 failed=0 unsupported=0\n\n$ ASAN_OPTIONS=detect_leaks=0 ./build/ci-asan/bin/antb1_exec_tests --gtest_filter='Compute*'\n[  PASSED  ] 21 tests.\n\n$ pixi run lint\nshellcheck (shell) ... Failed          <- 36 pre-existing SC2218 in two .sh files this does not\n                                          touch; osx-arm64 only, green on CI\n... every other leg .. Passed\n```\n\nPer-file `clang-tidy --warnings-as-errors='*'` is clean on both changed\nTUs.\n\n## Semantics are the recursive path's, step for step\n\nIncluding which operand a failed rescale names, and that the left one is\nchecked before the right.\n**C9's operand range check is carried into the program**: a step whose\nrescale is a no-op still checks a\ncolumn operand, and a `*` checks neither — because a `*` rescales\nneither, as C9 established. A tree the\nprogram doesn't cover falls back to the recursive path unchanged: a `%`,\na division, an integer column\nthat would have to be widened, or a tree deeper than the slots.\n\n### Two bugs of its own, both mine, both caught before the measurement\n\n- **The operand check wasn't carried over at first**, and\n`DecimalArithmeticErrors` caught it\nimmediately — the sum-in-range case I added for C9's P0 failed, which is\nexactly what it was written\n  to do. Nice to see a test earn its keep one commit later.\n- **Taking a single nullable column's own validity bitmap for the rows\nis wrong for a *sliced* array**,\nwhose bitmap starts at the buffer, not at the array's first row. My\nfirst test for it *didn't catch\nit*: `Slice(1, 3)` has offset 1, and at any offset that isn't a whole\nnumber of bytes the code took\nthe other path and the bug hid. It needed a **twelve-row array sliced at\nrow 8**, where the buggy\npath reads bits of the wrong rows and a NULL comes out as `1`. Reverting\nthe fix fails that case, so\n  it's load-bearing.\n\nSlices matter here because that is how batches reach a `Compute` above a\njoin.\n\n## Checklist\n\n- [x] `pixi run check` passes locally — except the pre-existing\nosx-arm64 shellcheck findings above\n- [x] Tests cover the change\n- [x] Docs updated: ADR 0026's C10. No `docs/sql-subset.md` change — no\nSQL, output or metric moves.\n- [x] No ClickBench-derived data is committed\n- [x] Nothing derived from TPC-H is committed: no query text, data,\nanswers or TPC tools (ADR-0006).\nOnly timings and query numbers appear here; the probe queries are my\nown.\n- [ ] Changes to governance paths (see `.github/CODEOWNERS`) —\n**`docs/adr/` needs your sign-off**\n\n## What's left for Q01, and it isn't exec's\n\nAt about **0.9 ns an operation a row** the evaluator is now at the\narithmetic's own cost rather than at\nits traffic, so the next gain is fewer operations, not another pass.\n**Q01 still evaluates\n`ep * (1 - disc)` twice** — once as its own output and once inside the\nsecond expression — because the\nbinder copies a repeated subtree instead of sharing it. `SameExpr`\n(`src/plan/binder.cc`) already\nrecognises structural equality, and `ComputeNode` already appends its\nresults to its input's columns, so\na pass that lifts a shared subtree into an earlier `Compute` would do\nit. That's a `plan` change and the\nremaining ~25% of this query.\n\n## AI assistance\n\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5)\nidentified the dispatch-vs-traffic risk\nup front and measured it before designing, wrote the compiler, the\nrunner and the tests,\nmutation-checked both, and used DuckDB's per-query movement as the drift\ncontrol for a change\n      smaller than the noise band.\n- Accountable human (has read and understands the whole diff): @hor911\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-16T21:52:03+03:00",
+          "tree_id": "e7ab7a22391edc555d77812b84ddf9c0f662f8da",
+          "url": "https://github.com/ydb-campus/antb1/commit/9d4f0268d55227a81775c78c36eebdaa439b9942"
+        },
+        "date": 1792176859767,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 2819.9978889796535,
+            "unit": "ns/iter",
+            "extra": "iterations: 258169\ncpu: 2819.8491569475814 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 63966.669601242815,
+            "unit": "ns/iter",
+            "extra": "iterations: 9655\ncpu: 63957.886069394095 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 70439.2257902164,
+            "unit": "ns/iter",
+            "extra": "iterations: 9934\ncpu: 70426.51258304813 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 264329.2570806067,
+            "unit": "ns/iter",
+            "extra": "iterations: 2754\ncpu: 264302.9001452432 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 253564.02798982058,
+            "unit": "ns/iter",
+            "extra": "iterations: 2751\ncpu: 253510.09014903673 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 1420161.4717741793,
+            "unit": "ns/iter",
+            "extra": "iterations: 496\ncpu: 1420010.965725806 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 31.67840399999991,
+            "unit": "ms/iter",
+            "extra": "iterations: 22\ncpu: 31.66227063636364 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 29.876993416666647,
+            "unit": "ms/iter",
+            "extra": "iterations: 24\ncpu: 29.874592874999976 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 162.1465847500012,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 162.10893799999982 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 8.887858950000016,
+            "unit": "ms/iter",
+            "extra": "iterations: 80\ncpu: 8.886829799999996 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 14.92909276000006,
+            "unit": "ms/iter",
+            "extra": "iterations: 50\ncpu: 14.924779400000007 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 29.725794565217836,
+            "unit": "ms/iter",
+            "extra": "iterations: 23\ncpu: 29.72261673913046 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 0.9270154102902338,
+            "unit": "ms/iter",
+            "extra": "iterations: 758\ncpu: 0.926713945910292 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 98.62850685714315,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 98.61849900000003 ms\nthreads: 1"
           }
         ]
       }
