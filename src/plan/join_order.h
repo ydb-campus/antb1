@@ -1,5 +1,6 @@
 #pragma once
 
+#include <bitset>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -38,18 +39,33 @@ struct JoinEdge {
   std::optional<int64_t> b_domain;
 };
 
-// One step of a join order: the relation it joins to those of the earlier steps.
+// A set of a block's relations, by index. The order works in sets because every question it asks is
+// a set question: which relations are below a step, which an edge connects, and -- for the search
+// of ADR 0026's C5 -- whether one set contains another. kMaxRelations bits is 32 bytes, cheap to
+// copy and to union.
+using RelationSet = std::bitset<kMaxRelations>;
+
+// An input of a join step: a relation of the block, or the result of an earlier step. Naming the
+// inputs rather than "the relation this step adds" is what lets an order be something other than a
+// chain, since either input may be a composite (ADR 0026's C5).
+struct JoinOperand {
+  bool step = false;      // whether `index` names a step rather than a relation
+  std::size_t index = 0;  // a relation of the block, or a step before this one
+};
+
+// One join of an order: its two inputs and the edges between them. The steps are in dependency
+// order, so every operand that names a step names an earlier one, and the last step is the root.
 struct JoinStep {
-  std::size_t relation = 0;
-  // The edges between it and the relations of the earlier steps, ascending: the keys of its join
-  // (none for the first step, the probe).
+  JoinOperand left;
+  JoinOperand right;
+  // The edges between the two inputs, ascending: the keys of this join. Never empty -- a step
+  // joins two inputs that an edge connects, and the binder rejects a cross product.
   std::vector<std::size_t> edges;
-  // The side the step's join builds on: the relation it adds, unless that relation's estimate
-  // exceeds the estimate of the relations joined so far by more than `build_side_ratio`, when it
-  // builds on those instead (ADR 0026). An unknown estimate on either side keeps the relation it
-  // adds: unknown must never read as small.
+  // The side this join builds on: its right input, unless that input's estimate exceeds its left
+  // input's by more than `build_side_ratio` (ADR 0026). An unknown estimate on either side keeps
+  // the right: unknown must never read as small.
   BuildSide build = BuildSide::kRight;
-  int64_t estimate = 0;  // the estimated rows of the relations joined so far, saturated
+  int64_t estimate = 0;  // the rows this join outputs, estimated and saturated
 };
 
 // The first relation, in FROM order, that the edges do not connect to relation 0, or std::nullopt
@@ -57,8 +73,8 @@ struct JoinStep {
 // Every edge must join two relations below `relations`.
 std::optional<std::size_t> FirstUnconnected(std::size_t relations, std::span<const JoinEdge> edges);
 
-// The join order of connected relations (FirstUnconnected gives std::nullopt), one step per
-// relation:
+// The join order of connected relations (FirstUnconnected gives std::nullopt), one step per join,
+// so relations.size() - 1 of them, in dependency order (none for a single relation):
 //   1. The probe, first, is the relation with the most rows (unknown counts as the most).
 //   2. Then, of the relations with an edge to those already joined, the one with the smallest
 //      estimate joins next. Its edges to them all become its keys, so the edge that closes a cycle
@@ -67,9 +83,9 @@ std::optional<std::size_t> FirstUnconnected(std::size_t relations, std::span<con
 //      sides, at least 1: computed in 128 bits, rounded down, at least 1 and saturated at
 //      INT64_MAX. It is 0 when L or R has no row, or a side of the edges has an empty domain.
 //   4. Ties go to the relation first in FROM.
-//   5. The step's join builds on the relation it adds, unless that relation's rows exceed the
-//      estimate of the relations joined so far by more than `build_side_ratio` hundredths, when it
-//      builds on them instead (JoinStep::build).
+//   5. Each step builds on its right input, unless that input's rows exceed its left input's
+//      estimate by more than `build_side_ratio` hundredths, when it builds on the left instead
+//      (JoinStep::build).
 // Edges that do not join two different relations below relations.size(), relations that are not
 // connected, or a ratio below 100, are a programming error.
 std::vector<JoinStep> OrderJoins(std::span<const JoinRelation> relations,

@@ -67,8 +67,11 @@ class Orderer {
 
   std::vector<JoinStep> Order() {
     std::vector<JoinStep> steps;
-    if (relations_.empty()) {
-      return steps;
+    if (relations_.size() < 2) {
+      if (relations_.size() == 1) {
+        joined_[0] = true;
+      }
+      return steps;  // nothing to join: one relation is its own tree, none is no tree
     }
     std::size_t probe = 0;
     for (std::size_t r = 1; r < relations_.size(); ++r) {
@@ -76,12 +79,14 @@ class Orderer {
         probe = r;
       }
     }
-    // The first step is the probe itself and joins nothing, so it has no side to choose.
-    steps.push_back(Add(probe, Rows(probe), std::nullopt));
-    while (steps.size() < relations_.size()) {
+    // The probe is the left input of the first step rather than a step of its own: a step is a
+    // join, and the probe joins nothing by itself.
+    joined_[probe] = true;
+    JoinOperand left{.step = false, .index = probe};
+    int64_t joined_rows = Rows(probe);
+    while (steps.size() + 1 < relations_.size()) {
       std::optional<std::size_t> next;
       int64_t smallest = 0;
-      const int64_t joined_rows = steps.back().estimate;
       for (std::size_t c = 0; c < relations_.size(); ++c) {
         if (joined_[c]) {
           continue;
@@ -93,7 +98,10 @@ class Orderer {
         }
       }
       ANTB1_CHECK(next.has_value());  // the relations are connected (FirstUnconnected)
-      steps.push_back(Add(*next, smallest, joined_rows));
+      steps.push_back(Add(left, *next, smallest, joined_rows));
+      // Every later step joins the result of this one: greedy is left-deep by construction.
+      left = JoinOperand{.step = true, .index = steps.size() - 1};
+      joined_rows = smallest;
     }
     return steps;
   }
@@ -149,9 +157,11 @@ class Orderer {
     return ChooseBuildSide(joined_rows, relations_[relation].rows, ratio_);
   }
 
-  // The step that joins `relation`, with its edges to the joined relations as keys.
-  JoinStep Add(std::size_t relation, int64_t estimate, const std::optional<int64_t>& joined_rows) {
-    JoinStep step{.relation = relation,
+  // The step that joins `relation` to `left`, with its edges to the joined relations as keys.
+  JoinStep Add(JoinOperand left, std::size_t relation, int64_t estimate,
+               const std::optional<int64_t>& joined_rows) {
+    JoinStep step{.left = left,
+                  .right = JoinOperand{.step = false, .index = relation},
                   .edges = {},
                   .build = Build(relation, joined_rows),
                   .estimate = estimate};
