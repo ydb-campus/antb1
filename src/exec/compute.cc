@@ -352,6 +352,53 @@ arrow::Status DecimalOverflow(plan::ArithOp op, Int128 x, Int128 y, plan::Logica
                                        hint);
 }
 
+// ---- a DECIMAL arithmetic tree in one pass (ADR 0026's C10) ----
+
+// A tree of DECIMAL +, - and * over columns and constants, compiled once per batch and then run a
+// row at a time. Evaluating it node by node, as the recursive Evaluate below does, writes an array
+// per node and reads it back for the node above: `ep * (1 - disc) * (1 + tax)` moves about 160
+// bytes a row that way, where reading its three columns and writing one result is 64. The steps are
+// the same for every row, so the dispatch below predicts perfectly and what is left is the
+// arithmetic.
+//
+// The semantics are the recursive path's, step for step: an operand of a +, - or % is rescaled to
+// its step's scale and must fit its range (DuckDB casts it to the result type first), the left one
+// before the right one, and a * takes the unscaled values because the scales add up.
+constexpr std::size_t kMaxProgramSteps = 16;
+
+struct DecimalProgram {
+  // Where a step reads an operand: a column of the batch, a constant, or an earlier step's result.
+  struct Source {
+    enum class Kind : std::uint8_t { kColumn, kConstant, kStep };
+    Kind kind = Kind::kConstant;
+    std::size_t at = 0;  // the column, the constant or the step
+  };
+  // Widest first, so the step carries no padding worth naming.
+  struct Step {
+    Int128 left_factor = 1;  // the rescale to this step's scale, 1 for none (and for *)
+    Int128 right_factor = 1;
+    plan::IntegerRange range;  // this step's own: its result and its operands must fit it
+    Source left;
+    Source right;
+    std::string left_column;  // the column name the operand names, empty when it is not one
+    std::string right_column;
+    plan::ArithOp op = plan::ArithOp::kAdd;
+    // Whether the operand still has to be checked against this step's range: a rescale would have
+    // done it, and a * rescales nothing and checks nothing (ADR 0026's C9). A constant and an
+    // earlier step's result are within their types already -- only a column can hold what its
+    // declared width does not admit.
+    bool check_left = false;
+    bool check_right = false;
+    plan::LogicalType type;       // the step's result type, the cast error's target
+    plan::LogicalType left_type;  // the operand types the cast error names
+    plan::LogicalType right_type;
+  };
+
+  std::vector<DecimalOperand> columns;  // one per column *occurrence*, each read in place
+  std::vector<Int128> constants;
+  std::vector<Step> steps;  // in evaluation order; the last one's result is the tree's
+};
+
 // `left <op> right` in the DECIMAL `result`, the operands already rescaled for +, - and % (the
 // caller computes and rescales the left operand before it computes the right one, as DuckDB does),
 // * over the unscaled values (the scales add up); every result must fit the result's width (only a
@@ -421,6 +468,116 @@ arrow::Result<ArrayPtr> DecimalArith(const DecimalOperand& left, const DecimalOp
       return DecimalOverflow(op, x, y, result);
     }
     builder.UnsafeAppend(FromInt128(value));
+  }
+  std::shared_ptr<arrow::Array> out;
+  ARROW_RETURN_NOT_OK(builder.Finish(&out));
+  return out;
+}
+
+// The rescale a step applies to an operand of `from` to reach `to`'s scale: the factor, and whether
+// the step rescales at all (* does not, and equal scales need no factor).
+Int128 ScaleFactor(plan::LogicalType from, plan::LogicalType to, plan::ArithOp op) {
+  if (op == plan::ArithOp::kMultiply) {
+    return 1;
+  }
+  const int from_scale = from == plan::LogicalType::kDecimal ? from.scale() : 0;
+  const int to_scale = to.scale();
+  Int128 factor = 1;
+  for (int k = from_scale; k < to_scale; ++k) {
+    factor *= 10;  // at most 10^38
+  }
+  return factor;
+}
+
+// Runs `program` over `rows` rows, writing its last step's result. `valid` is the rows every column
+// the tree reads has a value for (nullptr: all of them); a row without one is NULL and no step runs
+// for it, so an operand a NULL row holds can never raise.
+//
+// One consequence of going row by row rather than node by node: where more than one row would
+// raise, this reports the first such row, while the recursive path reports the first failing row of
+// the *left subtree*, having evaluated all of it before the right. Both raise, and each is
+// deterministic for a given plan and input, so what differs is which values the message names. The
+// alternative is to evaluate every step over every row, which is the pass this exists to remove.
+arrow::Result<ArrayPtr> RunDecimalProgram(const DecimalProgram& program, int64_t rows,
+                                          const std::uint8_t* valid, plan::LogicalType result,
+                                          arrow::MemoryPool* pool) {
+  arrow::Decimal128Builder builder(plan::ToArrow(result), pool);
+  ARROW_RETURN_NOT_OK(builder.Reserve(rows));
+  std::array<Int128, kMaxProgramSteps> slots{};
+  const std::span<const DecimalProgram::Step> steps(program.steps);
+  const std::size_t last = steps.size() - 1;  // Compile returns a step, so there is one
+  const auto read = [&](const DecimalProgram::Source& source, std::size_t row) {
+    switch (source.kind) {
+      case DecimalProgram::Source::Kind::kColumn:
+        return program.columns[source.at].At(row);
+      case DecimalProgram::Source::Kind::kConstant:
+        return program.constants[source.at];
+      default:
+        return slots[source.at];
+    }
+  };
+  for (int64_t row = 0; row < rows; ++row) {
+    if (valid != nullptr && !arrow::bit_util::GetBit(valid, static_cast<std::uint64_t>(row))) {
+      builder.UnsafeAppendNull();
+      continue;
+    }
+    const auto at = static_cast<std::size_t>(row);
+    bool null = false;  // a % by zero, which is NULL rather than an error
+    for (std::size_t s = 0; s < steps.size(); ++s) {
+      const DecimalProgram::Step& step = steps[s];
+      Int128 x = read(step.left, at);
+      Int128 y = read(step.right, at);
+      // The left operand is rescaled and checked before the right one, as the recursive path does.
+      if (step.left_factor != 1) {
+        if (__builtin_mul_overflow(x, step.left_factor, &x) || x < step.range.min ||
+            x > step.range.max) {
+          return DecimalCastError(read(step.left, at), step.left_type, step.type, step.left_column);
+        }
+      } else if (step.check_left && (x < step.range.min || x > step.range.max)) {
+        return DecimalCastError(x, step.left_type, step.type, step.left_column);
+      }
+      if (step.right_factor != 1) {
+        if (__builtin_mul_overflow(y, step.right_factor, &y) || y < step.range.min ||
+            y > step.range.max) {
+          return DecimalCastError(read(step.right, at), step.right_type, step.type,
+                                  step.right_column);
+        }
+      } else if (step.check_right && (y < step.range.min || y > step.range.max)) {
+        return DecimalCastError(y, step.right_type, step.type, step.right_column);
+      }
+      Int128 value = 0;
+      bool overflow = false;
+      switch (step.op) {
+        case plan::ArithOp::kAdd:
+          overflow = __builtin_add_overflow(x, y, &value);
+          break;
+        case plan::ArithOp::kSubtract:
+          overflow = __builtin_sub_overflow(x, y, &value);
+          break;
+        case plan::ArithOp::kMultiply:
+          overflow = __builtin_mul_overflow(x, y, &value);
+          break;
+        default:  // kModulo
+          if (y == 0) {
+            null = true;
+            break;
+          }
+          value = x % y;
+          break;
+      }
+      if (null) {
+        break;
+      }
+      if (overflow || value < step.range.min || value > step.range.max) {
+        return DecimalOverflow(step.op, x, y, step.type);
+      }
+      slots[s] = value;
+    }
+    if (null) {
+      builder.UnsafeAppendNull();
+      continue;
+    }
+    builder.UnsafeAppend(FromInt128(slots[last]));
   }
   std::shared_ptr<arrow::Array> out;
   ARROW_RETURN_NOT_OK(builder.Finish(&out));
@@ -1020,8 +1177,123 @@ struct Evaluator {
     return bytes.make_array();
   }
 
+  // The rows every column the program reads has a value for, as one bitmap; nullptr when none of
+  // them has a NULL, which is the common case and lets the run test no bitmap at all. A row without
+  // a value is NULL whatever the arithmetic would have made of it, so no step runs for it.
+  arrow::Result<std::shared_ptr<arrow::Buffer>> ProgramValidity(
+      const DecimalProgram& program) const {
+    const arrow::Array* only = nullptr;
+    std::size_t nullable = 0;
+    for (const DecimalOperand& column : program.columns) {
+      if (column.array->null_count() != 0) {
+        ++nullable;
+        only = column.array;
+      }
+    }
+    if (nullable == 0) {
+      return nullptr;
+    }
+    // One nullable column at no offset: its own bitmap, whose bits are then the rows. A sliced
+    // array's bitmap starts at the buffer, not at the array's first row, so that one is combined
+    // below through IsValid, which reads the offset.
+    if (nullable == 1 && only->offset() == 0) {
+      return only->null_bitmap();
+    }
+    const int64_t rows = batch.num_rows();
+    ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Buffer> valid, arrow::AllocateBitmap(rows, pool));
+    std::uint8_t* const bits = valid->mutable_data();
+    for (int64_t row = 0; row < rows; ++row) {
+      bool ok = true;
+      for (const DecimalOperand& column : program.columns) {
+        ok = ok && column.array->IsValid(row);
+      }
+      arrow::bit_util::SetBitTo(bits, row, ok);
+    }
+    return valid;
+  }
+
+  // Adds `expr` to `program` as a step, with the steps its operands need below it, and says where
+  // its result is read from. Nothing when the tree is not one the program covers: a node that is
+  // not a DECIMAL +, - or * over a column, a constant or another such node, or a tree deeper than
+  // the slots allow. The caller then evaluates it the recursive way (ADR 0026's C10).
+  std::optional<DecimalProgram::Source> Compile(const plan::Expr& expr,
+                                                DecimalProgram& program) const {
+    using Source = DecimalProgram::Source;
+    if (const std::optional<Int128> value = UnscaledConstant(expr); value.has_value()) {
+      program.constants.push_back(*value);
+      return Source{.kind = Source::Kind::kConstant, .at = program.constants.size() - 1};
+    }
+    if (const auto* column = std::get_if<plan::ColumnExpr>(&expr.node)) {
+      if (expr.type != plan::LogicalType::kDecimal || column->index < 0 ||
+          column->index >= batch.num_columns()) {
+        return std::nullopt;  // an integer column would have to be widened, which copies anyway
+      }
+      const ArrayPtr& values = batch.column(column->index);
+      if (!ReadableInPlace(*values)) {
+        return std::nullopt;
+      }
+      auto read = ReadDecimalOperand(*values, expr.type, expr.name);
+      if (!read.ok()) {
+        return std::nullopt;
+      }
+      read->owner = values;
+      program.columns.push_back(*std::move(read));
+      return Source{.kind = Source::Kind::kColumn, .at = program.columns.size() - 1};
+    }
+    const auto* arith = std::get_if<plan::ArithExpr>(&expr.node);
+    if (arith == nullptr || expr.type != plan::LogicalType::kDecimal ||
+        program.steps.size() + 1 > kMaxProgramSteps) {
+      return std::nullopt;
+    }
+    if (arith->op != plan::ArithOp::kAdd && arith->op != plan::ArithOp::kSubtract &&
+        arith->op != plan::ArithOp::kMultiply) {
+      return std::nullopt;  // % and the divisions keep the recursive path
+    }
+    // The operands first, left before right, so the steps come out in evaluation order.
+    const std::optional<Source> left = Compile(*arith->left, program);
+    if (!left.has_value()) {
+      return std::nullopt;
+    }
+    const std::optional<Source> right = Compile(*arith->right, program);
+    if (!right.has_value() || program.steps.size() + 1 > kMaxProgramSteps) {
+      return std::nullopt;
+    }
+    const auto name = [](const plan::Expr& operand) {
+      return std::holds_alternative<plan::ColumnExpr>(operand.node) ? operand.name : std::string();
+    };
+    const Int128 left_factor = ScaleFactor(arith->left->type, expr.type, arith->op);
+    const Int128 right_factor = ScaleFactor(arith->right->type, expr.type, arith->op);
+    const bool rescales = arith->op != plan::ArithOp::kMultiply;
+    program.steps.push_back(DecimalProgram::Step{
+        .left_factor = left_factor,
+        .right_factor = right_factor,
+        .range = plan::RangeOf(expr.type),
+        .left = *left,
+        .right = *right,
+        .left_column = name(*arith->left),
+        .right_column = name(*arith->right),
+        .op = arith->op,
+        .check_left = rescales && left->kind == Source::Kind::kColumn && left_factor == 1,
+        .check_right = rescales && right->kind == Source::Kind::kColumn && right_factor == 1,
+        .type = expr.type,
+        .left_type = arith->left->type,
+        .right_type = arith->right->type});
+    return Source{.kind = Source::Kind::kStep, .at = program.steps.size() - 1};
+  }
+
   arrow::Result<ArrayPtr> Evaluate(const plan::ArithExpr& arith, const plan::Expr& e) const {
     if (e.type == plan::LogicalType::kDecimal) {
+      // The whole tree in one pass where it is one the program covers, which is what keeps a chain
+      // of DECIMAL arithmetic from writing an array per operation and reading it back for the one
+      // above (ADR 0026's C10).
+      DecimalProgram program;
+      if (const std::optional<DecimalProgram::Source> root = Compile(e, program);
+          root.has_value() && root->kind == DecimalProgram::Source::Kind::kStep &&
+          !program.columns.empty()) {
+        ARROW_ASSIGN_OR_RAISE(const std::shared_ptr<arrow::Buffer> valid, ProgramValidity(program));
+        return RunDecimalProgram(program, batch.num_rows(),
+                                 valid == nullptr ? nullptr : valid->data(), e.type, pool);
+      }
       // Each operand in its own type (DECIMAL(38,0) and HUGEINT share an Arrow type); for +, - and
       // % the left one is computed and rescaled before the right one is computed, as in DuckDB.
       // A constant is one value for every row, so it is read as one rather than built into an array

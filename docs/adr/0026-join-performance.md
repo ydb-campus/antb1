@@ -587,6 +587,45 @@ this profiling fires:
   with no memoisation (worth about 1.7 s of the 6.25 s probe above); and each operation still **materialises its
   result**, where a fused walk would keep intermediates in registers. The second subsumes the first and is the larger
   change. At 48 bytes a row for one operation the current form is near what a materialising evaluator can do.
+- **C10, perf(exec): run a DECIMAL arithmetic tree in one pass, done 2026-10-16.** C9's closing note said each
+  operation still materialises its result and that a fused walk would be the larger change. It is, and it works: a
+  tree of DECIMAL `+`, `-` and `*` over columns and constants is compiled once per batch into a short list of steps
+  and then run a row at a time, with intermediates in registers instead of arrays. `ep * (1 - disc) * (1 + tax)`
+  moved about 160 bytes a row before and reads its three columns and writes one result now, 64.
+
+  **The risk was that a per-row program would be slower than the tight per-operation loops it replaces**, since a
+  loop over steps pays dispatch where a vectorised loop pays none. It is not, and the reason is that the steps are
+  the same for every row, so the dispatch predicts perfectly and what is left is the arithmetic. Measured at SF 100
+  on 4 threads, best of 3, over one column so only the arithmetic varies: four additions 3.64 s to **2.85 s
+  (-21.6%)**, `ep * (1 - disc)` 2.87 s to 2.72 s (-5.3%), `ep * (1 - disc) * (1 + tax)` 4.51 s to **3.78 s (-16.2%)**,
+  and Q01's pair of expressions 6.37 s to **5.51 s (-13.5%)**. The gain grows with the chain, as the traffic it
+  removes does, and one operation alone gains nothing.
+
+  Over the 22: **Q01 12.39 s to 11.67 s (-5.8%)**, 2.41x to 2.26x, and Q09 13.95 s to 13.27 s (-4.8%) — it carries
+  the same expression. Q01's `Compute` falls 20.8 s to **18.5 s** summed (-11.0%), which is 38.4 s to 18.5 s across
+  C9 and C10 together. The geomean moves 5.589 s to 5.546 s, holding **2.00x DuckDB**, because only two of the 22
+  carry a DECIMAL chain long enough to matter. Everything else moved with DuckDB's own figures on the same queries
+  (Q18, Q20 and Q21 all +2-4% in both engines), which is the drift the noise band covers and not this change.
+
+  At about 0.9 ns an operation a row the evaluator is now at the arithmetic's own cost rather than at its traffic, so
+  what is left for a DECIMAL chain is not another pass but fewer operations: **Q01 still evaluates
+  `ep * (1 - disc)` twice**, once as its own output and once inside the second expression, because the binder copies
+  a repeated subtree rather than sharing it (`SameExpr` in `src/plan/binder.cc` would recognise it). That is a `plan`
+  change, not an `exec` one, and it is what remains of this query.
+
+  One behaviour it does change, which no test can see and which review caught before the merge: where more than one
+  row of a batch would raise, the program reports the **first such row**, while the node-by-node path reports the
+  first failing row of the *left subtree*, having evaluated all of it before the right. Both raise, and each is
+  deterministic for a given plan and input, so what differs is which values the message names. Matching the old
+  order would mean evaluating every step over every row, which is the pass this item exists to remove, so the
+  difference is accepted and written down where the program runs.
+
+  Two bugs of its own, both caught before the measurement and both pinned: the operand range check C9 had just added
+  had to be carried into the program (a step whose rescale is a no-op still checks a column operand, and a `*`
+  checks neither, as C9 established); and taking a single nullable column's own validity bitmap for the rows is
+  wrong for a **sliced** array, whose bitmap starts at the buffer rather than at the array's first row. The second
+  needed a twelve-row case sliced at row 8 to catch at all -- at any offset that is not a whole number of bytes the
+  code took the other path and the bug hid.
 
 ## Alternatives considered
 

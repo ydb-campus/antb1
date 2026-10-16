@@ -250,6 +250,34 @@ TEST_F(ComputeTest, DecimalArithmetic) {
   auto sliced_product = Eval(product, {price->Slice(1, 2), rate->Slice(1, 2)});
   ASSERT_TRUE(sliced_product.ok()) << sliced_product.status().ToString();
   EXPECT_EQ(UnscaledText(**sliced_product), "decimal128(18, 6): 250000 null");
+  // A chain of operations runs in one pass over the rows (ADR 0026's C10), so the rows a NULL makes
+  // NULL and the offset of a sliced operand both have to reach it: `(p + r) * r` over the tail of
+  // three arrays, one of which is NULL in the middle, answers as the whole arrays do at those rows.
+  const auto chain =
+      Arith(ArithOp::kMultiply,
+            Arith(ArithOp::kAdd, ColumnAt(0, p), ColumnAt(1, r), LogicalType::Decimal(18, 4)),
+            ColumnAt(1, r), LogicalType::Decimal(38, 8));
+  auto whole = Eval(chain, {price, rate});
+  ASSERT_TRUE(whole.ok()) << whole.status().ToString();
+  EXPECT_EQ(UnscaledText(**whole),
+            "decimal128(38, 8): 850025 125000000 null 100000000899999898000000101");
+  auto tail = Eval(chain, {price->Slice(1, 3), rate->Slice(1, 3)});
+  ASSERT_TRUE(tail.ok()) << tail.status().ToString();
+  EXPECT_EQ(UnscaledText(**tail), "decimal128(38, 8): 125000000 null 100000000899999898000000101");
+  // The same at an offset that is a whole number of bytes, which is where taking one nullable
+  // column's own bitmap for the rows would read bits of the wrong rows: twelve rows, NULL at row 9,
+  // sliced from row 8.
+  std::vector<std::optional<std::string>> many;
+  std::vector<std::optional<std::string>> ones;
+  for (int i = 0; i < 12; ++i) {
+    many.emplace_back(i == 9 ? std::nullopt : std::optional(std::to_string(i * 100)));
+    ones.emplace_back("1");
+  }
+  const auto long_p = Decimals(p, many);
+  const auto long_r = Decimals(r, ones);
+  auto aligned = Eval(chain, {long_p->Slice(8, 4), long_r->Slice(8, 4)});
+  ASSERT_TRUE(aligned.ok()) << aligned.status().ToString();
+  EXPECT_EQ(UnscaledText(**aligned), "decimal128(38, 8): 80001 null 100001 110001");
   // An integer operand counts as DECIMAL(k,0): p + 7 is DECIMAL(16,2).
   auto plus_int = Eval(Arith(ArithOp::kAdd, ColumnAt(0, p), ConstantOf(7, LogicalType::kInteger),
                              LogicalType::Decimal(16, 2)),
