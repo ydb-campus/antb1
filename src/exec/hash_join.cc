@@ -1248,6 +1248,34 @@ arrow::Result<arrow::ArrayVector> HashJoinOperator::TakeProbe(std::span<const st
   return taken.record_batch()->columns();
 }
 
+// A window most of whose rows found nothing: its matched rows alone, gathered and output densely.
+// The window path leaves the probe where it is and gathers the build for every row of the window,
+// which is the cheaper pair when most rows match -- it copies no probe column at all. When most
+// rows do not, it is the build of rows nobody keeps: across the 22 TPC-H-derived queries at SF 100,
+// 169.9s of 235.3s of `gather` went on probe rows with no match (ADR 0026's C8). This pays a Take
+// over the probe to gather only the rows that matched, and emits them with no selection to mask.
+arrow::Result<std::optional<Batch>> HashJoinOperator::CompactWindow(
+    int64_t begin, std::span<const JoinMatches> matches, int64_t matched,
+    std::span<const JoinRowRef> table_rows) {
+  const auto kept = static_cast<std::size_t>(matched);
+  ARROW_RETURN_NOT_OK(Fit(probe_rows_, kept, memory_));
+  ARROW_RETURN_NOT_OK(Fit(build_rows_, kept, memory_));
+  std::size_t at = 0;
+  for (std::size_t i = 0; i < matches.size(); ++i) {  // in probe order, so the output order holds
+    if (matches[i].end <= matches[i].begin) {
+      continue;
+    }
+    probe_rows_[at] = Narrow<std::uint32_t>(begin + static_cast<int64_t>(i));
+    build_rows_[at] = table_rows[matches[i].begin];
+    ++at;
+  }
+  ANTB1_CHECK(at == kept);  // `matched` counted the same rows this walk keeps
+  ARROW_ASSIGN_OR_RAISE(const arrow::ArrayVector probe,
+                        TakeProbe(std::span(probe_rows_).first(kept)));
+  ARROW_ASSIGN_OR_RAISE(const arrow::ArrayVector build, GatherBuild<false>(matched));
+  return ApplyResiduals(Batch{.data = Assemble(probe, build, matched), .selection = {}});
+}
+
 arrow::Result<std::optional<Batch>> HashJoinOperator::NextWindow() {
   const std::optional<std::pair<int64_t, int64_t>> range = NextRange(batch_size_);
   if (!range.has_value()) {
@@ -1263,28 +1291,23 @@ arrow::Result<std::optional<Batch>> HashJoinOperator::NextWindow() {
   }
   if (profile() != nullptr) {
     profile()->Add("window_rows", MetricUnit::kCount, rows);
+    // The rows of the window that matched, beside the rows it holds: together they say how much of
+    // the gather the join keeps, which is what sent this path's build gather to CompactWindow.
+    profile()->Add("window_matched", MetricUnit::kCount, matched);
   }
-  ARROW_RETURN_NOT_OK(Fit(build_rows_, static_cast<std::size_t>(rows), memory_));
   const std::span<const JoinRowRef> table_rows = table_->rows();
-  for (std::size_t i = 0; i < matches.size(); ++i) {
-    build_rows_[i] = matches[i].end > matches[i].begin ? table_rows[matches[i].begin]
-                                                       : JoinRowRef{.chunk = kNoChunk, .row = 0};
-  }
-  ARROW_ASSIGN_OR_RAISE(const arrow::ArrayVector build, GatherBuild<true>(rows));
-  std::shared_ptr<arrow::BooleanArray> selection;
   if (matched < rows) {
-    ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Buffer> bits,
-                          arrow::AllocateEmptyBitmap(rows, ctx_.pool));
-    for (std::size_t i = 0; i < matches.size(); ++i) {
-      if (matches[i].end > matches[i].begin) {
-        arrow::bit_util::SetBit(bits->mutable_data(), static_cast<int64_t>(i));
-      }
-    }
-    selection = std::make_shared<arrow::BooleanArray>(rows, std::move(bits));
+    return CompactWindow(begin, matches, matched, table_rows);
   }
+  // Every row of the window matched, so the probe stays where it is -- its buffers, at an offset --
+  // nothing is masked off, and no row needs a NULL build side.
+  ARROW_RETURN_NOT_OK(Fit(build_rows_, static_cast<std::size_t>(rows), memory_));
+  for (std::size_t i = 0; i < matches.size(); ++i) {
+    build_rows_[i] = table_rows[matches[i].begin];
+  }
+  ARROW_ASSIGN_OR_RAISE(const arrow::ArrayVector build, GatherBuild<false>(rows));
   const std::shared_ptr<arrow::RecordBatch> probe = batch_.data->Slice(begin, rows);
-  return ApplyResiduals(
-      Batch{.data = Assemble(probe->columns(), build, rows), .selection = std::move(selection)});
+  return ApplyResiduals(Batch{.data = Assemble(probe->columns(), build, rows), .selection = {}});
 }
 
 arrow::Result<std::optional<Batch>> HashJoinOperator::NextPairs() {

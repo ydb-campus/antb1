@@ -734,7 +734,10 @@ only with `--analyze`); its errors and exit codes are those of `antb1 query`.
     takes on its other path than 1:1; the columns of the candidates that residuals read; a one-row join's values, which
     its build makes once), `residual` and, when the build's keys are unique, an inner join's `window_rows`, and a left
     join's without residuals (the rows of the probe's batches it gathered the build's columns for, next to the `rows` it
-    returned);
+    returned), beside an inner join's `window_matched` (how many of those rows found a match: a window all of whose
+    rows did keeps the probe's columns where they are and gathers the build for the window, and any other window
+    gathers only the rows that matched, which is why a selective join's `gather` is near its output rather than near
+    its probe — [ADR 0026](adr/0026-join-performance.md));
   - a `HashBuild`'s `finish` (the table built from its parts, and a one-row join's values), `null_keys` (rows with a
     NULL key, which no key's range holds and no lookup returns; a join that emits the build rows which did not match
     keeps their rows apart from the table it indexes, since such a row is unmatched by definition), `unique` (1: no
