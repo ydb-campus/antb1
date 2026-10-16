@@ -41,6 +41,62 @@ JoinEdge Edge(std::size_t a, std::size_t b, std::optional<int64_t> a_domain = st
 }
 
 // The relations of the steps, in order.
+// ADR 0022's rule, which the search replaced. The cases below that pin rules 1 to 5 ask for it by
+// name, because it is still what orders a block of more relations than the search is bounded for,
+// and what `--join-order greedy` selects.
+std::vector<JoinStep> GreedyOrder(std::span<const JoinRelation> relations,
+                                  std::span<const JoinEdge> edges,
+                                  int64_t ratio = kBuildSideRatio) {
+  return OrderJoins(relations, edges, ratio, JoinOrderSearch::kGreedy);
+}
+
+// The cheapest an order of these relations can be, by a plain search over every subset and every
+// split of it. The reference the search must match: a lost or duplicated connected pair would just
+// make it choose a worse plan, which nothing else would notice.
+int64_t OptimalCost(std::span<const JoinRelation> relations, std::span<const JoinEdge> edges) {
+  const std::size_t n = relations.size();
+  const auto all = static_cast<std::uint32_t>((std::uint64_t{1} << n) - 1);
+  std::vector<int64_t> best(std::size_t{1} << n, -1);
+  const auto set_of = [n](std::uint32_t mask) {
+    RelationSet out;
+    for (std::size_t r = 0; r < n; ++r) {
+      if (((mask >> r) & 1U) != 0) {
+        out.set(r);
+      }
+    }
+    return out;
+  };
+  const auto joined = [&edges](std::uint32_t a, std::uint32_t b) {
+    return std::ranges::any_of(edges, [a, b](const JoinEdge& edge) {
+      const bool a_to_b = ((a >> edge.a) & 1U) != 0 && ((b >> edge.b) & 1U) != 0;
+      const bool b_to_a = ((a >> edge.b) & 1U) != 0 && ((b >> edge.a) & 1U) != 0;
+      return a_to_b || b_to_a;
+    });
+  };
+  for (std::size_t r = 0; r < n; ++r) {
+    best[std::size_t{1} << r] = 0;  // a relation costs nothing: its scan is the same in any order
+  }
+  for (std::uint32_t mask = 1; mask <= all; ++mask) {
+    if (std::popcount(mask) < 2) {
+      continue;
+    }
+    // Every proper non-empty subset is numerically smaller, so one ascending pass suffices.
+    for (std::uint32_t sub = (mask - 1) & mask; sub != 0; sub = (sub - 1) & mask) {
+      const std::uint32_t other = mask ^ sub;
+      if (best[sub] < 0 || best[other] < 0 || !joined(sub, other)) {
+        continue;
+      }
+      const int64_t cost = best[sub] + best[other] + SubsetRows(relations, edges, set_of(mask)) +
+                           std::min(SubsetRows(relations, edges, set_of(sub)),
+                                    SubsetRows(relations, edges, set_of(other)));
+      if (best[mask] < 0 || cost < best[mask]) {
+        best[mask] = cost;
+      }
+    }
+  }
+  return best[all];
+}
+
 // The relations in the order they join, reconstructed from a left-deep step list: the probe, which
 // is the first step's left input, then each step's right input. A step list that is not left-deep
 // has no such sequence, so this also pins left-deepness -- which is what the greedy order produces.
@@ -86,25 +142,153 @@ std::vector<std::vector<std::size_t>> Keys(const std::vector<JoinStep>& steps) {
 // of them than there are relations.
 TEST(JoinOrderTest, TheProbeIsTheLargestRelation) {
   const std::vector<JoinEdge> chain = {Edge(0, 1), Edge(1, 2), Edge(2, 3)};
-  const auto steps = OrderJoins(Relations({10, 30, 20, 30}), chain);
+  const auto steps = GreedyOrder(Relations({10, 30, 20, 30}), chain);
   ASSERT_EQ(steps.size(), 3U);
   EXPECT_FALSE(steps.front().left.step);
   EXPECT_EQ(steps.front().left.index, 1U);
   EXPECT_FALSE(steps.front().edges.empty()) << "a join always has a key";
-  const auto unknown = OrderJoins(Relations({10, std::nullopt, 50, std::nullopt}), chain);
+  const auto unknown = GreedyOrder(Relations({10, std::nullopt, 50, std::nullopt}), chain);
   ASSERT_EQ(unknown.size(), 3U);
   EXPECT_EQ(unknown.front().left.index, 1U);
   // One relation is its own tree, so there is nothing to join and no step at all.
-  EXPECT_TRUE(OrderJoins(Relations({7}), {}).empty());
-  EXPECT_TRUE(OrderJoins({}, {}).empty());
+  EXPECT_TRUE(GreedyOrder(Relations({7}), {}).empty());
+  EXPECT_TRUE(GreedyOrder({}, {}).empty());
+}
+
+// The search must choose an order of the lowest cost there is. A plain search over every subset
+// and every split is the reference: nothing else would notice a connected pair the enumeration
+// loses, because a lost pair only makes the plan quietly worse.
+TEST(JoinOrderTest, TheSearchChoosesAnOrderOfTheLowestCost) {
+  struct Case {
+    std::vector<std::optional<int64_t>> rows;
+    std::vector<JoinEdge> edges;
+    std::string_view what;
+  };
+  // The last is Q5's shape: a fact table, two dimensions behind it, and a cycle that closes on the
+  // relation joined last, which is what makes its two-key join selective.
+  for (const Case& c : std::vector<Case>{
+           {.rows = {100, 10}, .edges = {Edge(0, 1, 10, 10)}, .what = "one join"},
+           {.rows = {1000, 100, 10},
+            .edges = {Edge(0, 1, 100, 100), Edge(1, 2, 10, 10)},
+            .what = "a chain"},
+           {.rows = {1000, 100, 10},
+            .edges = {Edge(0, 1, 100, 100), Edge(1, 2, 10, 10), Edge(0, 2, 10, 10)},
+            .what = "a triangle"},
+           {.rows = {1'000'000, 10, 10, 10},
+            .edges = {Edge(0, 1, 10, 10), Edge(0, 2, 10, 10), Edge(0, 3, 10, 10)},
+            .what = "a star"},
+           {.rows = {100, 200, 300, 400, 500},
+            .edges = {Edge(0, 1, 50, 50), Edge(1, 2, 60, 60), Edge(2, 3, 70, 70),
+                      Edge(3, 4, 80, 80), Edge(0, 4, 90, 90)},
+            .what = "a cycle of five"},
+           {.rows = {1'500'000, 2'275'919, 59'986'052, 100'000, 25, 1},
+            .edges = {Edge(0, 1, 1'500'000, 1'500'000), Edge(1, 2, 15'000'000, 15'000'000),
+                      Edge(2, 3, 100'000, 100'000), Edge(0, 3, 25, 25), Edge(3, 4, 25, 25),
+                      Edge(4, 5, 5, 5)},
+            .what = "a fact table, its dimensions, and a cycle through the last of them"}}) {
+    SCOPED_TRACE(c.what);
+    const std::vector<JoinRelation> relations = Relations(c.rows);
+    const auto steps = OrderJoins(relations, c.edges);
+    ASSERT_EQ(steps.size(), c.rows.size() - 1);
+    EXPECT_EQ(OrderCost(relations, c.edges, steps), OptimalCost(relations, c.edges));
+    // And it is at least as good as the rule it replaced, which is the point of having it.
+    EXPECT_LE(OrderCost(relations, c.edges, steps),
+              OrderCost(relations, c.edges, GreedyOrder(relations, c.edges)));
+  }
+}
+
+// The rows of a subset, which is what the search compares. Within a pair of relations the largest
+// domain of their edges wins; across pairs the divisors multiply.
+TEST(JoinOrderTest, SubsetRowsDividesOncePerPair) {
+  const auto set_of = [](std::initializer_list<std::size_t> members) {
+    RelationSet out;
+    for (const std::size_t r : members) {
+      out.set(r);
+    }
+    return out;
+  };
+  const std::vector<JoinRelation> relations = Relations({1000, 100, 10});
+  // One pair, one edge: 1000 x 100 / 100.
+  EXPECT_EQ(SubsetRows(relations, std::vector{Edge(0, 1, 100, 100)}, set_of({0, 1})), 1000);
+  // A subset of one relation is its own rows, and the empty subset is one row (nothing joined).
+  EXPECT_EQ(SubsetRows(relations, std::vector{Edge(0, 1, 100, 100)}, set_of({1})), 100);
+  EXPECT_EQ(SubsetRows(relations, std::vector{Edge(0, 1, 100, 100)}, set_of({})), 1);
+  // A relation an edge does not reach multiplies in undivided: 1000 x 100 / 100 x 10.
+  EXPECT_EQ(SubsetRows(relations, std::vector{Edge(0, 1, 100, 100)}, set_of({0, 1, 2})), 10000);
+  // Two edges between the *same* pair are one composite key: the larger domain divides, not their
+  // product, so this is 1000 x 100 / 100 rather than / (100 x 5).
+  EXPECT_EQ(
+      SubsetRows(relations, std::vector{Edge(0, 1, 100, 100), Edge(0, 1, 5, 5)}, set_of({0, 1})),
+      1000);
+  // Two edges to *different* relations do narrow twice: 1000 x 100 x 10 / (100 x 10).
+  EXPECT_EQ(SubsetRows(relations, std::vector{Edge(0, 1, 100, 100), Edge(0, 2, 10, 10)},
+                       set_of({0, 1, 2})),
+            1000);
+  // A key with no value at all empties the join; an unknown domain falls back to the relation's
+  // rows; and a relation of unknown rows counts as the largest, saturating rather than wrapping.
+  EXPECT_EQ(SubsetRows(relations, std::vector{Edge(0, 1, 0, 100)}, set_of({0, 1})), 0);
+  EXPECT_EQ(SubsetRows(relations, std::vector{Edge(0, 1)}, set_of({0, 1})), 100);
+  EXPECT_EQ(
+      SubsetRows(Relations({std::nullopt, std::nullopt}), std::vector{Edge(0, 1)}, set_of({0, 1})),
+      kLargest);
+}
+
+// Two tight pairs joined by a weak edge: joining each pair first and then the two results carries
+// far fewer rows than any chain, so the plan the search chooses is not left-deep at all. The Order
+// helper above would reject it, which is the point of checking the shape directly.
+TEST(JoinOrderTest, TheSearchChoosesATreeThatIsNotAChain) {
+  const std::vector<JoinRelation> relations = Relations({1000, 1000, 1000, 1000});
+  // 0-1 and 2-3 narrow to 1000 rows each; 1-2 narrows to nothing, so whichever chain is taken
+  // carries a million rows twice, where the two pairs first carry it once.
+  const std::vector<JoinEdge> edges = {Edge(0, 1, 1000, 1000), Edge(2, 3, 1000, 1000),
+                                       Edge(1, 2, 1, 1)};
+  const auto steps = OrderJoins(relations, edges);
+  ASSERT_EQ(steps.size(), 3U);
+  EXPECT_EQ(OrderCost(relations, edges, steps), OptimalCost(relations, edges));
+  EXPECT_LT(OrderCost(relations, edges, steps),
+            OrderCost(relations, edges, GreedyOrder(relations, edges)));
+  // The root joins two results, which no chain does.
+  EXPECT_TRUE(steps.back().left.step) << "the root's left input is a join";
+  EXPECT_TRUE(steps.back().right.step) << "the root's right input is a join";
+}
+
+// At the cap the search runs; one relation more and the greedy rule orders the block instead. The
+// graph is the pair-of-pairs above with a chain hung off it, so the two choose differently: the
+// search finds the bushy root, and the greedy walk cannot.
+TEST(JoinOrderTest, TheSearchGivesWayToTheGreedyRuleAboveTheCap) {
+  const auto graph = [](std::size_t n) {
+    std::vector<JoinEdge> edges = {Edge(0, 1, 1000, 1000), Edge(2, 3, 1000, 1000),
+                                   Edge(1, 2, 1, 1)};
+    for (std::size_t r = 4; r < n; ++r) {
+      edges.push_back(Edge(r - 1, r, 1000, 1000));
+    }
+    return edges;
+  };
+  const auto bushy = [](const std::vector<JoinStep>& steps) {
+    return std::ranges::any_of(
+        steps, [](const JoinStep& step) { return step.left.step && step.right.step; });
+  };
+  const std::vector<JoinRelation> at_cap =
+      Relations(std::vector<std::optional<int64_t>>(kSearchRelations, 1000));
+  const std::vector<JoinStep> searched = OrderJoins(at_cap, graph(kSearchRelations));
+  ASSERT_EQ(searched.size(), kSearchRelations - 1);
+  EXPECT_TRUE(bushy(searched)) << "at the cap the search runs";
+
+  const std::vector<JoinRelation> over_cap =
+      Relations(std::vector<std::optional<int64_t>>(kSearchRelations + 1, 1000));
+  const std::vector<JoinEdge> over = graph(kSearchRelations + 1);
+  const std::vector<JoinStep> fell_back = OrderJoins(over_cap, over);
+  ASSERT_EQ(fell_back.size(), kSearchRelations);
+  EXPECT_FALSE(bushy(fell_back)) << "one relation more and the greedy rule orders it";
+  EXPECT_EQ(Order(fell_back), Order(GreedyOrder(over_cap, over)));
 }
 
 // Rule 2: of the relations joined to those already joined, the smallest estimate |L| x |R| /
 // max(domain) comes next, whatever its own size; every join builds on the relation it adds.
 TEST(JoinOrderTest, TheSmallestEstimateJoinsNext) {
   // f(1000) joins a(100) on a key of 1000 values (f's) against 100, and b(10) on 10 values.
-  const auto steps = OrderJoins(Relations({1000, 100, 10}),
-                                std::vector{Edge(0, 1, 1000, 100), Edge(0, 2, 10, 10)});
+  const auto steps = GreedyOrder(Relations({1000, 100, 10}),
+                                 std::vector{Edge(0, 1, 1000, 100), Edge(0, 2, 10, 10)});
   EXPECT_EQ(Order(steps), (std::vector<std::size_t>{0, 1, 2}));
   EXPECT_EQ(Estimates(steps), (std::vector<int64_t>{100, 100}));
   EXPECT_EQ(Keys(steps), (std::vector<std::vector<std::size_t>>{{0}, {1}}));
@@ -113,7 +297,7 @@ TEST(JoinOrderTest, TheSmallestEstimateJoinsNext) {
   }
   // A relation without an edge to the joined ones waits for one: c joins only through b.
   const auto through =
-      OrderJoins(Relations({1000, 5, 100}), std::vector{Edge(1, 2), Edge(0, 2, 100, 100)});
+      GreedyOrder(Relations({1000, 5, 100}), std::vector{Edge(1, 2), Edge(0, 2, 100, 100)});
   EXPECT_EQ(Order(through), (std::vector<std::size_t>{0, 2, 1}));
   EXPECT_EQ(Keys(through), (std::vector<std::vector<std::size_t>>{{1}, {0}}));
 }
@@ -125,10 +309,10 @@ TEST(JoinOrderTest, TheSmallestEstimateJoinsNext) {
 TEST(JoinOrderTest, AManyToManyEdgeWaitsWhileAKeyEdgeIsAvailable) {
   const std::vector<JoinRelation> relations = Relations({1000, 500, 10});
   const auto with_domains =
-      OrderJoins(relations, std::vector{Edge(0, 1, 500, 500), Edge(0, 2, 2, 2)});
+      GreedyOrder(relations, std::vector{Edge(0, 1, 500, 500), Edge(0, 2, 2, 2)});
   EXPECT_EQ(Order(with_domains), (std::vector<std::size_t>{0, 1, 2}));
   EXPECT_EQ(Estimates(with_domains), (std::vector<int64_t>{1000, 5000}));
-  const auto rows_only = OrderJoins(relations, std::vector{Edge(0, 1), Edge(0, 2)});
+  const auto rows_only = GreedyOrder(relations, std::vector{Edge(0, 1), Edge(0, 2)});
   EXPECT_EQ(Order(rows_only), (std::vector<std::size_t>{0, 2, 1}));
   EXPECT_EQ(Estimates(rows_only), (std::vector<int64_t>{10, 5}));
 }
@@ -139,14 +323,14 @@ TEST(JoinOrderTest, AManyToManyEdgeWaitsWhileAKeyEdgeIsAvailable) {
 TEST(JoinOrderTest, ACycleGetsASecondKey) {
   // a(1000), b(100), c(10): a-b on 100 values, b-c and a-c on 10. b and c tie at 1000 after a.
   const auto steps =
-      OrderJoins(Relations({1000, 100, 10}),
-                 std::vector{Edge(0, 1, 100, 100), Edge(1, 2, 10, 10), Edge(0, 2, 10, 10)});
+      GreedyOrder(Relations({1000, 100, 10}),
+                  std::vector{Edge(0, 1, 100, 100), Edge(1, 2, 10, 10), Edge(0, 2, 10, 10)});
   EXPECT_EQ(Order(steps), (std::vector<std::size_t>{0, 1, 2}));
   EXPECT_EQ(Keys(steps), (std::vector<std::vector<std::size_t>>{{0}, {1, 2}}));
   EXPECT_EQ(Estimates(steps), (std::vector<int64_t>{1000, 1000}));
   // Two keys between the same relations: the larger domain divides (1000 x 50 / 50).
   const auto pair =
-      OrderJoins(Relations({1000, 50}), std::vector{Edge(0, 1, 5, 5), Edge(1, 0, 50, 20)});
+      GreedyOrder(Relations({1000, 50}), std::vector{Edge(0, 1, 5, 5), Edge(1, 0, 50, 20)});
   EXPECT_EQ(Keys(pair), (std::vector<std::vector<std::size_t>>{{0, 1}}));
   EXPECT_EQ(Estimates(pair), (std::vector<int64_t>{1000}));
 }
@@ -155,15 +339,15 @@ TEST(JoinOrderTest, ACycleGetsASecondKey) {
 // which joins first, and everything joined after it is 0 too.
 TEST(JoinOrderTest, EmptyInputsEstimateZero) {
   const auto empty =
-      OrderJoins(Relations({1000, 0, 10}), std::vector{Edge(0, 1), Edge(0, 2, 10, 10)});
+      GreedyOrder(Relations({1000, 0, 10}), std::vector{Edge(0, 1), Edge(0, 2, 10, 10)});
   EXPECT_EQ(Order(empty), (std::vector<std::size_t>{0, 1, 2}));
   EXPECT_EQ(Estimates(empty), (std::vector<int64_t>{0, 0}));
   const auto all_null =
-      OrderJoins(Relations({1000, 50, 10}), std::vector{Edge(0, 1, 0, 50), Edge(0, 2, 10, 10)});
+      GreedyOrder(Relations({1000, 50, 10}), std::vector{Edge(0, 1, 0, 50), Edge(0, 2, 10, 10)});
   EXPECT_EQ(Order(all_null), (std::vector<std::size_t>{0, 1, 2}));
   EXPECT_EQ(Estimates(all_null), (std::vector<int64_t>{0, 0}));
   // A domain that falls back to an empty relation's rows is empty as well.
-  const auto none = OrderJoins(Relations({0, 0}), std::vector{Edge(0, 1)});
+  const auto none = GreedyOrder(Relations({0, 0}), std::vector{Edge(0, 1)});
   EXPECT_EQ(Order(none), (std::vector<std::size_t>{0, 1}));
   EXPECT_EQ(Estimates(none), (std::vector<int64_t>{0}));
 }
@@ -172,14 +356,15 @@ TEST(JoinOrderTest, EmptyInputsEstimateZero) {
 // least 1 for inputs with rows. A relation of unknown rows counts as INT64_MAX rows.
 TEST(JoinOrderTest, EstimatesSaturateAndStayPositive) {
   constexpr int64_t kHuge = 4'000'000'000'000'000'000;
-  const auto huge = OrderJoins(Relations({kHuge, kHuge}), std::vector{Edge(0, 1, 1, 1)});
+  const auto huge = GreedyOrder(Relations({kHuge, kHuge}), std::vector{Edge(0, 1, 1, 1)});
   EXPECT_EQ(Estimates(huge), (std::vector<int64_t>{kLargest}));
-  const auto unknown = OrderJoins(Relations({std::nullopt, std::nullopt}), std::vector{Edge(0, 1)});
+  const auto unknown =
+      GreedyOrder(Relations({std::nullopt, std::nullopt}), std::vector{Edge(0, 1)});
   EXPECT_EQ(Estimates(unknown), (std::vector<int64_t>{kLargest}));
-  const auto small = OrderJoins(Relations({10, 10}), std::vector{Edge(0, 1, 1000, 1000)});
+  const auto small = GreedyOrder(Relations({10, 10}), std::vector{Edge(0, 1, 1000, 1000)});
   EXPECT_EQ(Estimates(small), (std::vector<int64_t>{1}));
   // A negative count (no valid footer has one) counts as no row.
-  const auto negative = OrderJoins(Relations({10, -5}), std::vector{Edge(0, 1, -1, 3)});
+  const auto negative = GreedyOrder(Relations({10, -5}), std::vector{Edge(0, 1, -1, 3)});
   EXPECT_EQ(Estimates(negative), (std::vector<int64_t>{0}));
 }
 
@@ -343,7 +528,7 @@ TEST(JoinOrderTest, TwoHundredFiftySixRelations) {
     }
   }
   EXPECT_EQ(FirstUnconnected(kMaxRelations, chain), std::nullopt);
-  const auto steps = OrderJoins(Relations(rows), chain);
+  const auto steps = GreedyOrder(Relations(rows), chain);
   ASSERT_EQ(steps.size(), kMaxRelations - 1);
   // The chain joins from its largest end, one relation and one key per step.
   EXPECT_EQ(Order(steps).front(), kMaxRelations - 1);
@@ -359,7 +544,7 @@ TEST(JoinOrderTest, TwoHundredFiftySixRelations) {
     }
   }
   const auto all =
-      OrderJoins(Relations(std::vector<std::optional<int64_t>>(kMaxRelations, 1000)), clique);
+      GreedyOrder(Relations(std::vector<std::optional<int64_t>>(kMaxRelations, 1000)), clique);
   ASSERT_EQ(all.size(), kMaxRelations - 1);
   EXPECT_EQ(Order(all).front(), 0U);
   for (std::size_t k = 0; k < all.size(); ++k) {
@@ -387,7 +572,7 @@ TEST(JoinOrderTest, TheBuildSideIsTheAddedRelationUnlessItIsDecisivelyLarger) {
   // over the larger side's rows: joining 10 leaves 1000, and 900 against that is far more than a
   // quarter of it, so the second step builds on the relations joined so far instead.
   const std::vector<JoinEdge> chain = {Edge(0, 1, 1000, 1000), Edge(0, 2, 1000, 1000)};
-  const auto steps = OrderJoins(Relations({1000, 10, 900}), chain);
+  const auto steps = GreedyOrder(Relations({1000, 10, 900}), chain);
   EXPECT_EQ(Order(steps), (std::vector<std::size_t>{0, 1, 2}));
   EXPECT_EQ(Estimates(steps), (std::vector<int64_t>{10, 9}));
   // The first step adds 10 rows to 1000: the added relation stays the build side. The second adds
@@ -405,7 +590,7 @@ TEST(JoinOrderTest, TheBuildSideIsTheAddedRelationUnlessItIsDecisivelyLarger) {
 TEST(JoinOrderTest, TheBuildSideKeepsTheAddedRelationOnANearTie) {
   const std::vector<JoinEdge> edges = {Edge(0, 1, 1000, 1000), Edge(0, 2, 1000, 1000)};
   const auto last = [&edges](int64_t rows, int64_t ratio = kBuildSideRatio) {
-    return Builds(OrderJoins(Relations({1000, 10, rows}), edges, ratio)).back();
+    return Builds(GreedyOrder(Relations({1000, 10, rows}), edges, ratio)).back();
   };
   EXPECT_EQ(last(40), BuildSide::kRight);  // 40 against 10 is 4.0x: not more than the ratio
   EXPECT_EQ(last(41), BuildSide::kLeft);   // 4.1x is
@@ -421,17 +606,17 @@ TEST(JoinOrderTest, TheBuildSideKeepsTheAddedRelationOnANearTie) {
 TEST(JoinOrderTest, AnUnknownOrEmptyEstimateKeepsTheAddedRelationAsTheBuildSide) {
   const std::vector<JoinEdge> edges = {Edge(0, 1, 1000, 1000), Edge(0, 2, 1000, 1000)};
   const auto last = [&edges](std::optional<int64_t> rows) {
-    return Builds(OrderJoins(Relations({1000, 10, rows}), edges)).back();
+    return Builds(GreedyOrder(Relations({1000, 10, rows}), edges)).back();
   };
   // Unknown rows on the side that would build: it counts as the largest for the order, but a side
   // that may turn out to be large is exactly what must not be chosen to build on.
   EXPECT_EQ(last(std::nullopt), BuildSide::kRight);
   // An estimate of no row at all is just as untrustworthy, and an empty build is free either way.
-  EXPECT_EQ(Builds(OrderJoins(Relations({1000, 0, 1000}), edges)).back(), BuildSide::kRight);
+  EXPECT_EQ(Builds(GreedyOrder(Relations({1000, 0, 1000}), edges)).back(), BuildSide::kRight);
 }
 
 TEST(JoinOrderDeathTest, TheBuildSideRatioIsAtLeastOne) {
-  EXPECT_DEATH((void)OrderJoins(Relations({1, 2}), std::vector{Edge(0, 1)}, 99),
+  EXPECT_DEATH((void)GreedyOrder(Relations({1, 2}), std::vector{Edge(0, 1)}, 99),
                "build_side_ratio >= 100");
 }
 
@@ -595,7 +780,7 @@ TEST(JoinOrderTest, AKeepEverythingFilterDoesNotCollapseTheOrder) {
   // 100,000 rows against a 100-row dimension and a 7-row one: the big relation still probes, and
   // each step still builds on the relation it adds.
   const auto steps =
-      OrderJoins(Relations({kept, 100, 7}), std::vector{Edge(0, 1, 100, 100), Edge(0, 2, 7, 7)});
+      GreedyOrder(Relations({kept, 100, 7}), std::vector{Edge(0, 1, 100, 100), Edge(0, 2, 7, 7)});
   EXPECT_EQ(Order(steps), (std::vector<std::size_t>{0, 1, 2}));
   EXPECT_EQ(Builds(steps), (std::vector<BuildSide>{BuildSide::kRight, BuildSide::kRight}));
 }
@@ -664,14 +849,14 @@ TEST(JoinOrderTest, PredicateRowsFromTheDefaultFactors) {
 }
 
 TEST(JoinOrderDeathTest, EdgesJoinTwoRelationsOfTheBlock) {
-  EXPECT_DEATH((void)OrderJoins(Relations({1, 2}), std::vector{Edge(1, 1)}), "edge.a != edge.b");
-  EXPECT_DEATH((void)OrderJoins(Relations({1, 2}), std::vector{Edge(0, 2)}), "edge.b < relations");
+  EXPECT_DEATH((void)GreedyOrder(Relations({1, 2}), std::vector{Edge(1, 1)}), "edge.a != edge.b");
+  EXPECT_DEATH((void)GreedyOrder(Relations({1, 2}), std::vector{Edge(0, 2)}), "edge.b < relations");
   EXPECT_DEATH((void)FirstUnconnected(2, std::vector{Edge(3, 0)}), "edge.a < relations");
 }
 
 // OrderJoins needs connected relations: the binder checks connectivity first.
 TEST(JoinOrderDeathTest, TheRelationsMustBeConnected) {
-  EXPECT_DEATH((void)OrderJoins(Relations({1, 2, 3}), std::vector{Edge(1, 2)}), "next.has_value");
+  EXPECT_DEATH((void)GreedyOrder(Relations({1, 2, 3}), std::vector{Edge(1, 2)}), "next.has_value");
 }
 
 }  // namespace

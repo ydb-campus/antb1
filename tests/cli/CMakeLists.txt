@@ -197,6 +197,28 @@ antb1_add_cli_golden(
     --table
     "trips=${_f}/star/trips.parquet"
 )
+# --join-order greedy (ADR 0026's C5): ADR 0022's rule instead of the search, on the same query as
+# explain_join_cycle above, whose searched plan is bushy. The pair is what shows the flag is wired:
+# either alone would pass if it were ignored and the default happened to match.
+antb1_add_cli_golden(
+  explain_join_order_greedy
+  ARGS
+    explain
+    --threads
+    1
+    --join-order
+    greedy
+    -c
+    "SELECT COUNT(*), SUM(tr_fare) FROM trips, zones, cities, riders WHERE tr_pickup = zn_id AND zn_city = ct_id AND rd_city = ct_id AND tr_rider = rd_id"
+    --table
+    "trips=${_f}/star/trips.parquet"
+    --table
+    "zones=${_f}/star/zones.parquet"
+    --table
+    "cities=${_f}/star/cities.parquet"
+    --table
+    "riders=${_f}/star/riders.parquet"
+)
 # A FROM list that starts with two tables sharing no predicate: no cross product, since the chain
 # connects them through the third.
 antb1_add_cli_golden(

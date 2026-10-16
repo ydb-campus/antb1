@@ -1899,36 +1899,27 @@ TEST(BinderTest, JoinOrderBuildSideAndKeys) {
   const Catalog catalog = MakeCatalog();
   struct Case {
     std::string_view sql;
-    std::string_view left;   // the table the left (probe) branch scans
-    std::string_view right;  // and the right (build) branch
+    std::string_view built;  // the table the join builds its table on
     std::string_view span;   // the query text the Join is bound from
   };
   for (const Case& c : {
-           // 100 rows against 7: t probes, ok is added and built on.
+           // 100 rows against 7: the smaller is built and the larger probes.
            Case{.sql = "SELECT ok.s FROM t JOIN ok ON t.i16 = ok.i16",
-                .left = "t",
-                .right = "ok",
+                .built = "ok",
                 .span = "JOIN"},
-           // The same whichever side is written first: the order is the statistics', not FROM's.
-           // The span is the connector that added the built relation, or that relation's own text
-           // when it is the first FROM item and so has no connector.
+           // The same table is built whichever side is written first: which one that is comes from
+           // the statistics, not from FROM. Which branch is the *left* does follow FROM, because
+           // the two inputs of a join are interchangeable and the search orients them by relation
+           // index; the span then names the right input, so it moves with the labels.
            Case{.sql = "SELECT ok.s FROM ok JOIN t ON t.i16 = ok.i16",
-                .left = "t",
-                .right = "ok",
-                .span = "ok"},
-           // An unknown row count counts as the most, so u probes and t is added.
-           Case{.sql = "SELECT t.s FROM t JOIN u ON t.i16 = u.i16",
-                .left = "u",
-                .right = "t",
-                .span = "t"},
+                .built = "ok",
+                .span = "JOIN"},
+           // A row count nothing knows must never be read as small, so u is probed and t built.
+           Case{.sql = "SELECT t.s FROM t JOIN u ON t.i16 = u.i16", .built = "t", .span = "t"},
            // A comma join is the same join; its span is the comma.
-           Case{.sql = "SELECT ok.s FROM t, ok WHERE t.i16 = ok.i16",
-                .left = "t",
-                .right = "ok",
-                .span = ","},
+           Case{.sql = "SELECT ok.s FROM t, ok WHERE t.i16 = ok.i16", .built = "ok", .span = ","},
            Case{.sql = "SELECT ok.s FROM t CROSS JOIN ok WHERE t.i16 = ok.i16",
-                .left = "t",
-                .right = "ok",
+                .built = "ok",
                 .span = "CROSS JOIN"},
        }) {
     auto plan = BindSql(c.sql, catalog);
@@ -1936,9 +1927,10 @@ TEST(BinderTest, JoinOrderBuildSideAndKeys) {
     const JoinNode* join = testing::FirstJoin(*plan);
     ASSERT_NE(join, nullptr) << c.sql;
     EXPECT_EQ(join->kind, JoinKind::kInner) << c.sql;
-    EXPECT_EQ(join->build, BuildSide::kRight) << c.sql;  // here always the relation it adds
-    EXPECT_EQ(testing::ScannedTable(*join->left), c.left) << c.sql;
-    EXPECT_EQ(testing::ScannedTable(*join->right), c.right) << c.sql;
+    const LogicalNode& build = join->build == BuildSide::kLeft ? *join->left : *join->right;
+    const LogicalNode& probe = join->build == BuildSide::kLeft ? *join->right : *join->left;
+    EXPECT_EQ(testing::ScannedTable(build), c.built) << c.sql;
+    EXPECT_NE(testing::ScannedTable(probe), c.built) << c.sql << ": the other side probes";
     ASSERT_EQ(join->keys.size(), 1U) << c.sql;
     EXPECT_TRUE(join->residual.empty()) << c.sql;
     EXPECT_EQ(c.sql.substr(join->span.offset, join->span.length), c.span) << c.sql;
@@ -1946,30 +1938,28 @@ TEST(BinderTest, JoinOrderBuildSideAndKeys) {
 }
 
 // The estimates account for the conjuncts routed to each relation (ADR 0026), so a filter can
-// decide which relation probes. `t` has 100 rows and `ok` 7, so `t` probes on its own; with two
-// equalities on `t`, neither of which the footers can measure, `t` is estimated at 100 through two
-// default factors of a tenth each, which is one row, and `ok` probes instead.
+// decide which relation is built and which probes. `t` has 100 rows and `ok` 7, so `ok` is built on
+// its own; with two equalities on `t`, neither of which the footers can measure, `t` is estimated
+// at 100 through two default factors of a tenth each, which is one row, and `t` is built instead.
 TEST(BinderTest, FiltersDecideWhichRelationProbes) {
   const Catalog catalog = MakeCatalog();
-  const auto scanned = [&catalog](std::string_view sql) {
+  const auto built = [&catalog](std::string_view sql) {
     auto plan = BindSql(sql, catalog);
     EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
     const JoinNode* join = testing::FirstJoin(*plan);
     EXPECT_NE(join, nullptr) << sql;
-    return join == nullptr
-               ? std::pair<std::string, std::string>{}
-               : std::pair<std::string, std::string>{testing::ScannedTable(*join->left),
-                                                     testing::ScannedTable(*join->right)};
+    if (join == nullptr) {
+      return std::string{};
+    }
+    return testing::ScannedTable(join->build == BuildSide::kLeft ? *join->left : *join->right);
   };
-  EXPECT_EQ(scanned("SELECT ok.s FROM t JOIN ok ON t.i16 = ok.i16"),
-            (std::pair<std::string, std::string>{"t", "ok"}));
-  EXPECT_EQ(scanned("SELECT ok.s FROM t JOIN ok ON t.i16 = ok.i16 "
-                    "WHERE t.i32 = 5 AND t.i64 = 7"),
-            (std::pair<std::string, std::string>{"ok", "t"}));
+  EXPECT_EQ(built("SELECT ok.s FROM t JOIN ok ON t.i16 = ok.i16"), "ok");
+  EXPECT_EQ(built("SELECT ok.s FROM t JOIN ok ON t.i16 = ok.i16 "
+                  "WHERE t.i32 = 5 AND t.i64 = 7"),
+            "t");
   // A conjunct on the other relation moves it the other way again: `ok` is estimated at 7 through
-  // one default factor, which is no row at all, and so is ordered first whatever `t` carries.
-  EXPECT_EQ(scanned("SELECT ok.s FROM t JOIN ok ON t.i16 = ok.i16 WHERE ok.i16 = 3"),
-            (std::pair<std::string, std::string>{"t", "ok"}));
+  // one default factor, which is no row at all, so it is the side to build whatever `t` carries.
+  EXPECT_EQ(built("SELECT ok.s FROM t JOIN ok ON t.i16 = ok.i16 WHERE ok.i16 = 3"), "ok");
 }
 
 // The join ADR 0023's Path 2 creates for a correlated scalar aggregate is an inner join, so either

@@ -64,6 +64,9 @@ plan::BindOptions BindOptionsOf(const SessionOptions& options) {
   if (options.build_side_ratio.has_value()) {
     out.build_side_ratio = *options.build_side_ratio;
   }
+  if (options.join_order.has_value()) {
+    out.join_order = *options.join_order;
+  }
   return out;
 }
 

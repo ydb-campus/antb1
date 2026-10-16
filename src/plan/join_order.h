@@ -9,6 +9,7 @@
 
 #include "antb1/common/int128.h"
 #include "antb1/plan/logical_plan.h"
+#include "antb1/plan/plan_options.h"
 #include "antb1/plan/table.h"
 
 #include "scope.h"
@@ -73,8 +74,24 @@ struct JoinStep {
 // Every edge must join two relations below `relations`.
 std::optional<std::size_t> FirstUnconnected(std::size_t relations, std::span<const JoinEdge> edges);
 
+// The most relations a block may have before `kCost` gives way to `kGreedy`: beyond it the search's
+// own work is no longer bounded for every shape a query may have.
+inline constexpr std::size_t kSearchRelations = 12;
+
 // The join order of connected relations (FirstUnconnected gives std::nullopt), one step per join,
-// so relations.size() - 1 of them, in dependency order (none for a single relation):
+// so relations.size() - 1 of them, in dependency order (none for a single relation).
+//
+// With `JoinOrderSearch::kCost` and at most kSearchRelations relations, dynamic programming over
+// connected subsets chooses the order: of all the trees the edges allow, including those that are
+// not a chain, it takes one whose joins carry the fewest rows in total. The cost of a subset is the
+// cost of the two it joins plus the rows it produces, and a single relation costs nothing, its scan
+// being the same in any order. The rows of a subset are read with the keys assumed independent --
+// per pair of relations the edges between them multiply, capped at the larger of their row counts,
+// so that two keys between the same pair read as the one composite key they are while two keys to
+// different relations really do narrow twice. Ties keep the plan found first, and the subsets are
+// visited in a fixed order, so the choice is a function of the relations and the edges alone.
+//
+// With `kGreedy`, or above kSearchRelations relations, ADR 0022's rule instead:
 //   1. The probe, first, is the relation with the most rows (unknown counts as the most).
 //   2. Then, of the relations with an edge to those already joined, the one with the smallest
 //      estimate joins next. Its edges to them all become its keys, so the edge that closes a cycle
@@ -90,7 +107,28 @@ std::optional<std::size_t> FirstUnconnected(std::size_t relations, std::span<con
 // connected, or a ratio below 100, are a programming error.
 std::vector<JoinStep> OrderJoins(std::span<const JoinRelation> relations,
                                  std::span<const JoinEdge> edges,
-                                 int64_t build_side_ratio = kBuildSideRatio);
+                                 int64_t build_side_ratio = kBuildSideRatio,
+                                 JoinOrderSearch search = JoinOrderSearch::kCost);
+
+// The rows the relations of `set` produce when joined, as the cost the search minimises reads them:
+// every relation's rows multiplied, divided once per pair of them an edge connects. Per pair the
+// divisor is the largest domain of the edges between that pair -- two keys between the same two
+// relations are the one composite key they describe, whose parts narrow together, a foreign key
+// into a composite primary key being the common case. Across pairs the divisors multiply, so two
+// keys to *different* relations do narrow twice, which is what lets a selective multi-key join be
+// told from a weak one. In 128 bits, saturated, at least 1, and 0 when a relation has no row or a
+// key has no value. A property of the set alone, not of any order of it.
+//
+// This is the narrower of the ADR's two readings and nothing that decides memory may use it: a
+// build side reads a join's rows the other way (ADR 0026's C5). It is public so that a test can
+// check the search's choice against every other order of the same graph.
+int64_t SubsetRows(std::span<const JoinRelation> relations, std::span<const JoinEdge> edges,
+                   RelationSet set);
+
+// The cost the search minimises for `steps`: the rows every one of its joins produces, summed.
+// Edges that do not join two different relations below relations.size() are a programming error.
+int64_t OrderCost(std::span<const JoinRelation> relations, std::span<const JoinEdge> edges,
+                  std::span<const JoinStep> steps);
 
 // The domain of top-level field `field` of `table` (the number of its distinct non-NULL values,
 // estimated), from the parts' footer statistics:
