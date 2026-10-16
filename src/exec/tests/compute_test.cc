@@ -238,6 +238,18 @@ TEST_F(ComputeTest, DecimalArithmetic) {
   EXPECT_EQ(Eval(product, {price, rate}).status().message(),
             "Overflow in multiplication of DECIMAL(18) (999999999999999 * 999999999). You might "
             "want to add an explicit cast to a bigger decimal.");
+  // A sliced operand past its first row: the values are read in place, from the array's own buffer
+  // (ADR 0026's C9), so the offset has to reach the arithmetic -- the same rows answer the same
+  // whether they are a whole array or the tail of one. The add rescales its left operand and reads
+  // its right one as it is; the multiply reads both as they are.
+  const auto tail_sum =
+      Arith(ArithOp::kAdd, ColumnAt(0, p), ColumnAt(1, r), LogicalType::Decimal(18, 4));
+  auto sliced = Eval(tail_sum, {price->Slice(1, 2), rate->Slice(1, 2)});
+  ASSERT_TRUE(sliced.ok()) << sliced.status().ToString();
+  EXPECT_EQ(UnscaledText(**sliced), "decimal128(18, 4): -12500 null");
+  auto sliced_product = Eval(product, {price->Slice(1, 2), rate->Slice(1, 2)});
+  ASSERT_TRUE(sliced_product.ok()) << sliced_product.status().ToString();
+  EXPECT_EQ(UnscaledText(**sliced_product), "decimal128(18, 6): 250000 null");
   // An integer operand counts as DECIMAL(k,0): p + 7 is DECIMAL(16,2).
   auto plus_int = Eval(Arith(ArithOp::kAdd, ColumnAt(0, p), ConstantOf(7, LogicalType::kInteger),
                              LogicalType::Decimal(16, 2)),

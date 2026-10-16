@@ -193,49 +193,132 @@ arrow::Result<ArrayPtr> HugeIntArith(const arrow::Array& left, const arrow::Arra
 
 // One operand of DECIMAL arithmetic: its unscaled values (0 where NULL), validity and type, and its
 // name when it is a column (DuckDB names that column in a failed cast).
+// One operand of a DECIMAL operation, read without copying it wherever that is possible. An
+// operand is read once per operation and then once per row, so materialising it as a vector of
+// Int128 costs an allocation, a pass to fill it and a pass to read it back -- about 64 of the 176
+// bytes a row that one addition of two columns used to move (ADR 0026's C9). Three shapes:
+//
+//   `scalar`   a constant: one value, whatever the row (its array is never built either)
+//   `bytes`    a decimal128 array: its buffer, 16 bytes a row, read in place
+//   `owned`    anything that had to be converted -- an integer array widened to Int128, or an
+//              operand a rescale moved -- which is the only shape that allocates
+//
+// `nulls` is the validity of the row, nullptr when nothing is NULL, so the common case tests no
+// bitmap at all.
 struct DecimalOperand {
-  std::vector<Int128> values;
+  Int128 scalar = 0;
+  const std::uint8_t* bytes = nullptr;
+  std::vector<Int128> owned;
   const arrow::Array* array = nullptr;
-  ArrayPtr owner;  // keeps `array` alive
+  ArrayPtr owner;  // keeps `array`, and so `bytes`, alive
   plan::LogicalType type;
   std::string column;
+
+  [[nodiscard]] bool is_scalar() const { return array == nullptr; }
+  // The unscaled value of row `row`; 0 where it is NULL, as the vector held before.
+  [[nodiscard]] Int128 At(std::size_t row) const {
+    if (bytes != nullptr) {
+      return ToInt128(arrow::Decimal128(bytes + (row * sizeof(Int128))));
+    }
+    return owned.empty() ? scalar : owned[row];
+  }
 };
+
+// Whether a decimal128 array holds its values where At() can read them: Arrow stores them as 16
+// contiguous bytes a row, which is what arrow::Decimal128's byte constructor reads.
+bool ReadableInPlace(const arrow::Array& array) {
+  return array.type_id() == arrow::Type::DECIMAL128;
+}
 
 arrow::Result<DecimalOperand> ReadDecimalOperand(const arrow::Array& array, plan::LogicalType type,
                                                  std::string column) {
-  auto unscaled = ReadUnscaled(array);
+  DecimalOperand operand{.array = &array, .type = type, .column = std::move(column)};
+  if (ReadableInPlace(array)) {
+    operand.bytes = static_cast<const arrow::Decimal128Array&>(array).GetValue(0);
+    return operand;
+  }
+  auto unscaled = ReadUnscaled(array);  // an integer operand, widened into a vector
   if (!unscaled.ok()) {
     return arrow::Status::Invalid("DECIMAL arithmetic over ", array.type()->ToString());
   }
-  return DecimalOperand{.values = std::move(unscaled->values),
-                        .array = &array,
-                        .type = type,
-                        .column = std::move(column)};
+  operand.owned = std::move(unscaled->values);
+  return operand;
+}
+
+// The same for a constant, which needs no array at all.
+DecimalOperand ScalarDecimalOperand(Int128 value, plan::LogicalType type) {
+  return DecimalOperand{.scalar = value, .type = type};
+}
+
+// The unscaled value of a constant that a DECIMAL operation can read as one value for every row,
+// for the types ReadUnscaled accepts: an integer (scale 0), a DECIMAL (whose Constant already holds
+// its unscaled value) or a HUGEINT. Nothing for anything else, so such an operand goes the way it
+// went before. A Constant holding an Int128 is never NULL (plan::ToArrowScalar), so the
+// arithmetic's NULL handling does not have to reach a scalar operand.
+std::optional<Int128> UnscaledConstant(const plan::Expr& expr) {
+  const auto* constant = std::get_if<plan::ConstantExpr>(&expr.node);
+  if (constant == nullptr) {
+    return std::nullopt;
+  }
+  switch (expr.type.id()) {
+    case plan::LogicalType::kSmallInt:
+    case plan::LogicalType::kInteger:
+    case plan::LogicalType::kBigInt:
+    case plan::LogicalType::kUSmallInt:
+    case plan::LogicalType::kHugeInt:
+    case plan::LogicalType::kDecimal:
+      break;
+    default:
+      return std::nullopt;
+  }
+  const auto* value = std::get_if<Int128>(&constant->value.value);
+  return value == nullptr ? std::nullopt : std::optional<Int128>(*value);
 }
 
 // Rescales the operand to the result's scale, as DuckDB casts it to the result type first (for +,
 // - and %): every value must fit the result's width, else DuckDB's conversion error for the first
-// that does not.
+// that does not. Nothing to do when the scales already agree, which is the common case -- the
+// factor is then 1, and an operand within its own declared width is within a result at least as
+// wide, so the walk would only ever confirm what the type rules already give. A value a file holds
+// beyond its declared width (nothing checks that on read) is still caught, by the result's own
+// range check in DecimalArith.
 arrow::Status RescaleOperand(DecimalOperand& operand, plan::LogicalType result) {
   const bool decimal = operand.type == plan::LogicalType::kDecimal;
   const int from_scale = decimal ? operand.type.scale() : 0;
   const int to_scale = result.scale();
+  if (from_scale == to_scale) {
+    return arrow::Status::OK();
+  }
   Int128 factor = 1;
   for (int k = from_scale; k < to_scale; ++k) {
     factor *= 10;  // at most 10^38
   }
   const plan::IntegerRange range = plan::RangeOf(result);
-  for (std::size_t i = 0; i < operand.values.size(); ++i) {
+  const auto rescale = [&](Int128 value, Int128& out) {
+    return !__builtin_mul_overflow(value, factor, &out) && out >= range.min && out <= range.max;
+  };
+  if (operand.is_scalar()) {
+    Int128 scaled = 0;
+    if (!rescale(operand.scalar, scaled)) {
+      return DecimalCastError(operand.scalar, operand.type, result, operand.column);
+    }
+    operand.scalar = scaled;
+    return arrow::Status::OK();
+  }
+  // A rescale rewrites every value, so this is where an operand read in place is copied out.
+  const auto rows = static_cast<std::size_t>(operand.array->length());
+  std::vector<Int128> scaled(rows);
+  for (std::size_t i = 0; i < rows; ++i) {
     if (operand.array->IsNull(static_cast<int64_t>(i))) {
       continue;
     }
-    Int128 scaled = 0;
-    if (__builtin_mul_overflow(operand.values[i], factor, &scaled) || scaled < range.min ||
-        scaled > range.max) {
-      return DecimalCastError(operand.values[i], operand.type, result, operand.column);
+    const Int128 value = operand.At(i);
+    if (!rescale(value, scaled[i])) {
+      return DecimalCastError(value, operand.type, result, operand.column);
     }
-    operand.values[i] = scaled;
   }
+  operand.owned = std::move(scaled);
+  operand.bytes = nullptr;
   return arrow::Status::OK();
 }
 
@@ -270,16 +353,27 @@ arrow::Result<ArrayPtr> DecimalArith(const DecimalOperand& left, const DecimalOp
                                      plan::ArithOp op, plan::LogicalType result,
                                      arrow::MemoryPool* pool) {
   const plan::IntegerRange range = plan::RangeOf(result);
+  // One of the two is an array (an operation of two constants is folded before it reaches here),
+  // and its length is the result's.
+  const arrow::Array* const sized = left.is_scalar() ? right.array : left.array;
+  const auto rows = static_cast<std::size_t>(sized->length());
   arrow::Decimal128Builder builder(plan::ToArrow(result), pool);
-  ARROW_RETURN_NOT_OK(builder.Reserve(left.array->length()));
-  for (std::size_t i = 0; i < left.values.size(); ++i) {
+  ARROW_RETURN_NOT_OK(builder.Reserve(sized->length()));
+  // A constant is never NULL here and an array with no NULL needs no test, so a row is only looked
+  // up in the bitmaps that have one.
+  const arrow::Array* const left_nulls =
+      !left.is_scalar() && left.array->null_count() != 0 ? left.array : nullptr;
+  const arrow::Array* const right_nulls =
+      !right.is_scalar() && right.array->null_count() != 0 ? right.array : nullptr;
+  for (std::size_t i = 0; i < rows; ++i) {
     const auto row = static_cast<int64_t>(i);
-    if (left.array->IsNull(row) || right.array->IsNull(row)) {
+    if ((left_nulls != nullptr && left_nulls->IsNull(row)) ||
+        (right_nulls != nullptr && right_nulls->IsNull(row))) {
       builder.UnsafeAppendNull();
       continue;
     }
-    const Int128 x = left.values[i];
-    const Int128 y = right.values[i];
+    const Int128 x = left.At(i);
+    const Int128 y = right.At(i);
     Int128 value = 0;
     bool overflow = false;
     switch (op) {
@@ -629,8 +723,7 @@ struct Evaluator {
           continue;
         }
         Int128 negated = 0;
-        if (__builtin_sub_overflow(Int128{0}, values.values[static_cast<std::size_t>(i)],
-                                   &negated)) {
+        if (__builtin_sub_overflow(Int128{0}, values.At(static_cast<std::size_t>(i)), &negated)) {
           return Overflow("negation", e.type);
         }
         builder.UnsafeAppend(FromInt128(negated));
@@ -911,12 +1004,24 @@ struct Evaluator {
     if (e.type == plan::LogicalType::kDecimal) {
       // Each operand in its own type (DECIMAL(38,0) and HUGEINT share an Arrow type); for +, - and
       // % the left one is computed and rescaled before the right one is computed, as in DuckDB.
+      // A constant is one value for every row, so it is read as one rather than built into an array
+      // of copies of itself and then widened into a vector of them (ADR 0026's C9). Not when both
+      // operands are constants: the result is then as long as the batch, which only an array of one
+      // of them says, and the binder folds such an operation long before this anyway.
+      const bool both_constant =
+          UnscaledConstant(*arith.left).has_value() && UnscaledConstant(*arith.right).has_value();
       const auto operand = [&](const plan::Expr& expr) -> arrow::Result<DecimalOperand> {
-        ARROW_ASSIGN_OR_RAISE(ArrayPtr values, (*this)(expr));
-        const std::string column =
-            std::holds_alternative<plan::ColumnExpr>(expr.node) ? expr.name : std::string();
-        ARROW_ASSIGN_OR_RAISE(DecimalOperand read, ReadDecimalOperand(*values, expr.type, column));
-        read.owner = std::move(values);
+        DecimalOperand read;
+        const std::optional<Int128> value = both_constant ? std::nullopt : UnscaledConstant(expr);
+        if (value.has_value()) {
+          read = ScalarDecimalOperand(*value, expr.type);
+        } else {
+          ARROW_ASSIGN_OR_RAISE(ArrayPtr values, (*this)(expr));
+          const std::string column =
+              std::holds_alternative<plan::ColumnExpr>(expr.node) ? expr.name : std::string();
+          ARROW_ASSIGN_OR_RAISE(read, ReadDecimalOperand(*values, expr.type, column));
+          read.owner = std::move(values);
+        }
         if (arith.op != plan::ArithOp::kMultiply) {
           ARROW_RETURN_NOT_OK(RescaleOperand(read, e.type));
         }
