@@ -331,6 +331,28 @@ TEST_F(ComputeTest, DecimalArithmeticErrors) {
                 .message(),
             "Casting value \"12345678901234567.5\" to type DECIMAL(18,2) failed: value is out of "
             "range!");
+  // A file may hold a value beyond the column's declared width, and at equal scales there is no
+  // rescale to catch it (ADR 0026's C9), so the arithmetic checks the operands as it reads them.
+  // Both of these are out of DECIMAL(19,0) by one, and their sum is 0: without the check the query
+  // would answer 0 where DuckDB raises its conversion error.
+  const LogicalType d18_0 = LogicalType::Decimal(18, 0);
+  const auto over = Decimals(d18_0, {"10000000000000000000"});
+  const auto under = Decimals(d18_0, {"-10000000000000000000"});
+  EXPECT_EQ(Eval(Arith(ArithOp::kAdd, Named(ColumnAt(0, d18_0), "wide"), ColumnAt(1, d18_0),
+                       LogicalType::Decimal(19, 0)),
+                 {over, under})
+                .status()
+                .message(),
+            "Casting value \"10000000000000000000\" to type DECIMAL(19,0) failed: value is out of "
+            "range! when casting from source column wide");
+  // The right operand is reported when the left one fits.
+  EXPECT_EQ(Eval(Arith(ArithOp::kAdd, ColumnAt(1, d18_0), Named(ColumnAt(0, d18_0), "wide"),
+                       LogicalType::Decimal(19, 0)),
+                 {over, Decimals(d18_0, {"1"})})
+                .status()
+                .message(),
+            "Casting value \"10000000000000000000\" to type DECIMAL(19,0) failed: value is out of "
+            "range! when casting from source column wide");
   // An integer operand that does not fit: DuckDB's integer cast message.
   const auto ints = testing::ArrayOf<arrow::Int32Builder>(
       arrow::int32(), std::vector<std::optional<int32_t>>{std::numeric_limits<int32_t>::min()});

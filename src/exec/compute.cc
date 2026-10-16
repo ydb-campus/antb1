@@ -203,8 +203,9 @@ arrow::Result<ArrayPtr> HugeIntArith(const arrow::Array& left, const arrow::Arra
 //   `owned`    anything that had to be converted -- an integer array widened to Int128, or an
 //              operand a rescale moved -- which is the only shape that allocates
 //
-// `nulls` is the validity of the row, nullptr when nothing is NULL, so the common case tests no
-// bitmap at all.
+// `checked` says a rescale has already confirmed every value fits the result, so the arithmetic
+// does not have to: an operand it skipped (the scales agreed) carries whatever a file holds, which
+// may be beyond the operand's own declared width, and DecimalArith checks those rows itself.
 struct DecimalOperand {
   Int128 scalar = 0;
   const std::uint8_t* bytes = nullptr;
@@ -213,6 +214,7 @@ struct DecimalOperand {
   ArrayPtr owner;  // keeps `array`, and so `bytes`, alive
   plan::LogicalType type;
   std::string column;
+  bool checked = false;
 
   [[nodiscard]] bool is_scalar() const { return array == nullptr; }
   // The unscaled value of row `row`; 0 where it is NULL, as the vector held before.
@@ -242,12 +244,16 @@ arrow::Result<DecimalOperand> ReadDecimalOperand(const arrow::Array& array, plan
     return arrow::Status::Invalid("DECIMAL arithmetic over ", array.type()->ToString());
   }
   operand.owned = std::move(unscaled->values);
+  // An integer array's values are within its physical type, which the type rules nest in the
+  // result: only a decimal128 column can hold what its declared width does not admit.
+  operand.checked = true;
   return operand;
 }
 
 // The same for a constant, which needs no array at all.
 DecimalOperand ScalarDecimalOperand(Int128 value, plan::LogicalType type) {
-  return DecimalOperand{.scalar = value, .type = type};
+  // The binder folds a constant within its own type, which the type rules nest in the result.
+  return DecimalOperand{.scalar = value, .type = type, .checked = true};
 }
 
 // The unscaled value of a constant that a DECIMAL operation can read as one value for every row,
@@ -277,11 +283,11 @@ std::optional<Int128> UnscaledConstant(const plan::Expr& expr) {
 
 // Rescales the operand to the result's scale, as DuckDB casts it to the result type first (for +,
 // - and %): every value must fit the result's width, else DuckDB's conversion error for the first
-// that does not. Nothing to do when the scales already agree, which is the common case -- the
-// factor is then 1, and an operand within its own declared width is within a result at least as
-// wide, so the walk would only ever confirm what the type rules already give. A value a file holds
-// beyond its declared width (nothing checks that on read) is still caught, by the result's own
-// range check in DecimalArith.
+// that does not. Nothing to rescale when the scales already agree -- the factor is then 1 -- so the
+// walk is skipped and the operand stays where it is, `checked` false: the type rules make the
+// result at least as wide as an operand of its own scale, but a file may hold a value beyond its
+// declared width (nothing checks that on read), and DecimalArith tests those rows as it reads them
+// rather than in a pass of its own (ADR 0026's C9).
 arrow::Status RescaleOperand(DecimalOperand& operand, plan::LogicalType result) {
   const bool decimal = operand.type == plan::LogicalType::kDecimal;
   const int from_scale = decimal ? operand.type.scale() : 0;
@@ -289,6 +295,7 @@ arrow::Status RescaleOperand(DecimalOperand& operand, plan::LogicalType result) 
   if (from_scale == to_scale) {
     return arrow::Status::OK();
   }
+  operand.checked = true;
   Int128 factor = 1;
   for (int k = from_scale; k < to_scale; ++k) {
     factor *= 10;  // at most 10^38
@@ -374,6 +381,19 @@ arrow::Result<ArrayPtr> DecimalArith(const DecimalOperand& left, const DecimalOp
     }
     const Int128 x = left.At(i);
     const Int128 y = right.At(i);
+    // The rescale a +, - or % would have done confirms its operands fit the result; where it had
+    // nothing to rescale it left them unchecked, and a file may hold a value beyond the operand's
+    // own declared width. Checked here, where the value is already read, rather than in a pass of
+    // its own: without it such a value would come out of `x + -x` as 0 where DuckDB raises its
+    // conversion error (ADR 0026's C9). A multiply rescales neither operand, so neither is checked.
+    if (op != plan::ArithOp::kMultiply) {
+      if (!left.checked && (x < range.min || x > range.max)) {
+        return DecimalCastError(x, left.type, result, left.column);
+      }
+      if (!right.checked && (y < range.min || y > range.max)) {
+        return DecimalCastError(y, right.type, result, right.column);
+      }
+    }
     Int128 value = 0;
     bool overflow = false;
     switch (op) {
