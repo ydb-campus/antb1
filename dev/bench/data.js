@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792176860512,
+  "lastUpdate": 1792181185670,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -9180,6 +9180,114 @@ window.BENCHMARK_DATA = {
             "value": 98.62850685714315,
             "unit": "ms/iter",
             "extra": "iterations: 7\ncpu: 98.61849900000003 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "df423184d923e4866fa83cc29996fbfb77b394e6",
+          "message": "perf(exec): pass a constant operand as a scalar, not an array (#157)\n\n## Summary\n\nADR 0026's **C11**. C9 stopped a DECIMAL constant being materialised;\nthe **integer and DOUBLE path\nnever got the same treatment**, and measuring it gave a sharper answer\nthan I expected.\n\nOver 100 M rows of one column, with a `GROUP BY` so DuckDB's `SUM(x +\nc)` rewrite doesn't fire:\n\n```text\nSUM(c)                                 0.306s   <- floor\nSUM(c + c + c + c + c)   4 additions   0.343s   -> 4 ops = 0.037s\nSUM(c + 1 + 1 + 1 + 1)   + 4 literals  0.578s   -> 4 literals = 0.272s\n```\n\n**The literal was 7× the arithmetic it wrapped.** The cause is that\n`Evaluate(const\nplan::ConstantExpr&)` must return an array — the evaluator's contract is\n`arrow::Result<ArrayPtr>`, so\na constant has nowhere else to go:\n\n```cpp\nreturn arrow::MakeArrayFromScalar(*scalar, batch.num_rows(), pool);\n```\n\nonce per constant, per expression, per batch — plus a *second* array\nwhen the literal's type differs\nfrom the operation's and the whole thing gets cast. Arrow's arithmetic\nkernels take a scalar beside an\narray, so they now get the one value, and a scalar cast is O(1) where\nthe array cast was O(rows).\n\nCloses #\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [x] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n| probe (100 M rows, 4 threads, best of 3) | before | after | |\n| --- | ---: | ---: | --- |\n| 4 integer additions, no literals | 0.343 s | 0.349 s | unchanged |\n| **4 integer additions + 4 literals** | 0.578 s | **0.353 s** |\n**−39%** |\n| 4 DOUBLE additions, no literals | 0.218 s | 0.220 s | unchanged |\n| **4 DOUBLE additions + 4 literals** | 0.698 s | **0.216 s** | **−69%**\n|\n\nA literal now costs **nothing** — the with-literal cases land on their\nno-literal counterparts\n(0.353 vs 0.349, 0.216 vs 0.220). **DOUBLE gains more than integers**,\nwhich surprised me until I\nlooked: `f + 1.5` is DOUBLE + DECIMAL(2,1) by DuckDB's literal typing,\nso it was paying *two* full\nmaterialisations — the array of copies, then converting all N of them to\nDOUBLE.\n\n```text\n$ pixi run ci\n100% tests passed out of 2723          <- exit 0\n\n$ pixi run test -L metamorphic\n100% tests passed out of 154\n\n$ ANTB1_DIFF_SEED=20261215 pixi run diff-random\nDIFF: PASS seed=20261215 queries=2000 failed=0 unsupported=0\n\n$ pixi run lint\nshellcheck (shell) ... Failed          <- 36 pre-existing SC2218 in two .sh files this does not\n                                          touch; osx-arm64 only, green on CI\n... every other leg .. Passed\n```\n\nPer-file `clang-tidy --warnings-as-errors='*'` is clean on both changed\nTUs. **No TPC-H effect worth\nquoting** — their expression cost is DECIMAL and C9/C10 already took it\n— so I did not re-run the 22.\n\n## What had to be got right\n\nA constant must convert **exactly as a column of it would**, so it goes\nthrough the same `CastTo`, on an\narray of itself alone, rather than Arrow's own cast: a DECIMAL to DOUBLE\nis DuckDB's conversion and not\nArrow's (ADR 0021 rule 8, `DuckDbDecimalToReal`, which splits a value\npast 2^53 and adds the parts\ninstead of dividing the whole). One row costs nothing beside the\nbatch-long array it replaces.\n\nUntouched by construction: the operations that don't go through an Arrow\nkernel (an integer division, a\n`%`, HUGEINT) read arrays, and two constants keep the array path because\nthe result must be a column\nrather than a scalar — the binder folds that case long before this\nanyway.\n\n### Tests\n\n`exec.ComputeTest.AConstantOperandAnswersAsAColumnOfItWould` computes\nsix cases **both ways** — operand\nas a constant, and as a column of that same value, row for row — and\ncompares answers *and* error\nmessages: a narrowing that fits, one that doesn't, an integer overflow,\na BIGINT multiply overflow, a\ndecimal literal into DOUBLE, and a decimal past the exactly\nrepresentable range. That shape is the only\nway to see a difference this change could introduce, since the two paths\nare otherwise indistinguishable\nfrom the outside.\n\nTwo things worth being straight about:\n\n- **The test found a bug in itself first, not in the code**: I'd written\nthe \"doesn't fit\" case with a\ncolumn of `1` against a constant of `100000`, so the two sides weren't\nthe same value. The strictness\n  caught my own mistake.\n- **I could not prove the `CastTo` routing is load-bearing.** I mutated\nit to Arrow's plain cast and the\ntest still passed; I then went looking for a value where the two\nconversions differ, found one on\npaper (unscaled `90071992547409929999999999` at scale 10:\n9007199254740992 by DuckDB's split against\n9007199254740994 by a plain divide, two ULP apart) and used it — and\nArrow's cast *still* agrees. So\nthat case asserts the invariant rather than proving the routing\nnecessary, and the test comment and\nthe ADR say exactly that. The routing stays because it is correct by\nconstruction, not because I can\n  demonstrate a divergence.\n\n## Checklist\n\n- [x] `pixi run check` passes locally — except the pre-existing\nosx-arm64 shellcheck findings above\n- [x] Tests cover the change\n- [x] Docs updated: ADR 0026's C11. No `docs/sql-subset.md` change — no\nSQL, output or metric moves.\n- [x] No ClickBench-derived data is committed\n- [x] Nothing derived from TPC-H is committed (ADR-0006). The probe\nqueries above are my own, over\n      synthetic data.\n- [ ] Changes to governance paths (see `.github/CODEOWNERS`) —\n**`docs/adr/` needs your sign-off**\n\n## Why this and not the general refactor\n\nThe general form — the evaluator returning `arrow::Datum` so a constant\nnever materialises anywhere —\nwould touch every node and every call site of a 1500-line file. I\nchecked what it would additionally\nreach, and the answer is: not much. A comparison keeps its literal\n**inside** the `Predicate` rather\nthan as an operand; `regexp_replace` keeps its pattern and replacement\nas kernel **options**\n(`logical_plan.h`: \"constants where the function needs them\"); a\nselect-list literal rides in\n`ProjectNode::constants`. What's left is a `CASE` branch returning a\nconstant, and `EvaluateSelected`\nalready limits that to the rows which take the branch.\n\nSo three different mechanisms already handle the cases the refactor\nwould cover, and the narrow fix\ntakes the whole measured cost. Recorded in the ADR so the question isn't\nreopened from scratch.\n\n## AI assistance\n\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5)\nmeasured the literal against the\narithmetic it wraps, found the DOUBLE case paying double, wrote the diff\nand the two-path test,\nmutation-checked it, and reported honestly that one part of it could not\nbe shown load-bearing.\n- Accountable human (has read and understands the whole diff): @hor911\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-16T23:03:05+03:00",
+          "tree_id": "71504cb09de6206dbe60c4d94345aaf7c7851a9d",
+          "url": "https://github.com/ydb-campus/antb1/commit/df423184d923e4866fa83cc29996fbfb77b394e6"
+        },
+        "date": 1792181184197,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4989.308010775885,
+            "unit": "ns/iter",
+            "extra": "iterations: 141060\ncpu: 4989.145604707216 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84218.2729208432,
+            "unit": "ns/iter",
+            "extra": "iterations: 7984\ncpu: 84213.9852204409 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 221995.64229185073,
+            "unit": "ns/iter",
+            "extra": "iterations: 3159\ncpu: 221937.24216524212 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 438429.0588972417,
+            "unit": "ns/iter",
+            "extra": "iterations: 1596\ncpu: 438317.03571428574 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 360671.0303966912,
+            "unit": "ns/iter",
+            "extra": "iterations: 1941\ncpu: 360593.07934054645 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2074224.0890208168,
+            "unit": "ns/iter",
+            "extra": "iterations: 337\ncpu: 2073881.495548963 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 51.76858792307607,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 51.75886946153847 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 44.647898312501155,
+            "unit": "ms/iter",
+            "extra": "iterations: 16\ncpu: 44.642306500000004 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 206.94606600000043,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 206.9235846666668 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.420613061224222,
+            "unit": "ms/iter",
+            "extra": "iterations: 49\ncpu: 14.419574306122477 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 22.283403483870202,
+            "unit": "ms/iter",
+            "extra": "iterations: 31\ncpu: 22.2781073870968 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 39.731212882352736,
+            "unit": "ms/iter",
+            "extra": "iterations: 17\ncpu: 39.727750117647076 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.5762406514806793,
+            "unit": "ms/iter",
+            "extra": "iterations: 439\ncpu: 1.5760204168564915 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 122.9173505714292,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 122.90931728571434 ms\nthreads: 1"
           }
         ]
       }
