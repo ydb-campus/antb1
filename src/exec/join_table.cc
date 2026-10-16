@@ -54,9 +54,9 @@ static_assert((std::size_t{1} << kPartitionBits) == kJoinPartitions);
 // either side fits in cache (ADR 0026's C5a).
 constexpr std::uint64_t kDirectSlotsPerRow = 8;
 // Past that the index is gigabytes the hashed layout would not spend, so the sparser rule is only
-// taken when the limit can carry it: a build that would fail its budget on an index is better
-// hashed than failed. An eighth of the limit, the same reading of the same budget as OneAtATime's
-// half, and no bound at all when the query has no limit.
+// taken when the budget can carry it: a build that would fail its budget on an index is better
+// hashed than failed. At most an eighth of the limit and inside what is free (Affordable), and no
+// bound at all when the query has no limit.
 constexpr std::uint64_t kSparseDirectSlotsPerRow = 32;
 constexpr int64_t kSparseDirectLimitShare = 8;
 
@@ -119,14 +119,20 @@ arrow::Status Room(std::vector<T>& values, MemoryReservation& memory) {
   return arrow::Status::OK();
 }
 
-// Whether a sparse direct index of `bytes` is within the share of the limit one may take. A query
-// without a limit is not bounded here; the reservation still charges every byte.
+// Whether a sparse direct index of `bytes` is one this query may take: no more than a share of the
+// limit, and inside what is still free. The second is what makes the first a bound at all -- a
+// share of the limit alone is a share each of any number of joins building at once, which together
+// are not bounded by it -- and it is the same reading of the same budget as OneAtATime's. The
+// answer can go stale between asking and reserving, as OneAtATime's can; the reservation is the
+// gate, and declining here is only what turns a build that would fail on its index into one that
+// hashes instead.
 bool Affordable(const MemoryBudget* budget, int64_t bytes) {
   if (budget == nullptr) {
     return true;
   }
   const std::optional<int64_t> limit = budget->limit();
-  return !limit.has_value() || bytes <= *limit / kSparseDirectLimitShare;
+  return !limit.has_value() ||
+         (bytes <= *limit / kSparseDirectLimitShare && budget->bytes_allocated() + bytes <= *limit);
 }
 
 // Whether a build's partitions are built one at a time: the budget is under pressure, or would be
