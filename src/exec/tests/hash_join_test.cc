@@ -511,11 +511,69 @@ plan::ExprPtr Condition(plan::CompareOp op, int64_t value, plan::ExprPtr operand
 
 // ---- the 1:1 and 1:N paths ----
 
-// A build of unique keys: each window of at most batch_size rows of a probe batch is a slice of it
-// (its buffers, at an offset), selected where it matched (a row the probe batch does not select
-// matches nothing), with the build's columns where it matched and NULL elsewhere; a window without
-// a match is skipped.
-TEST_F(HashJoinTest, OneToOnePathKeepsTheProbeColumns) {
+// A window most of whose rows match nothing gathers only the rows that matched (ADR 0026's C8): the
+// batch is as long as its matches, holds no selection, and its probe columns are a copy rather than
+// the input's buffers -- which is what the window path above them does not do. The same probe and
+// build down both paths answer the same, which is the point of the second batch size: at one row a
+// window is all matches or skipped, so it never compacts.
+TEST_F(HashJoinTest, AWindowOfMostlyMissesGathersOnlyTheRowsThatMatched) {
+  const auto build_schema = arrow::schema(
+      {arrow::field("k", arrow::int64()), arrow::field("v", arrow::int64(), /*nullable=*/false)});
+  const std::vector<Batch> build_batches = {Batch{
+      .data = BatchOf(build_schema, {Int64s({0, 1, 2, 3, 4}), Int64s({100, 101, 102, 103, 104})}),
+      .selection = nullptr}};
+  const auto probe_schema = arrow::schema(
+      {arrow::field("a", arrow::int64()), arrow::field("b", arrow::int64(), /*nullable=*/false)});
+  // Sixteen rows, two of which match: well under the one in four the compacting path needs.
+  std::vector<std::optional<int64_t>> probe_keys(16, 50);
+  probe_keys[3] = 1;
+  probe_keys[11] = 4;
+  std::vector<std::optional<int64_t>> probe_values(16);
+  for (std::size_t i = 0; i < probe_values.size(); ++i) {
+    probe_values[i] = static_cast<int64_t>(i);
+  }
+  const auto probe = BatchOf(probe_schema, {Int64s(probe_keys), Int64s(probe_values)});
+  Rows both;
+  for (const int64_t batch_size : {64, 1}) {
+    SCOPED_TRACE(batch_size);
+    auto join =
+        MakeJoin(std::make_unique<ScriptedSource>(
+                     probe_schema, std::vector<Batch>{Batch{.data = probe, .selection = nullptr}}),
+                 DrainedBuild(std::make_unique<ScriptedSource>(build_schema, build_batches), {0}),
+                 {0}, /*prepares=*/true);
+    ASSERT_NE(join, nullptr);
+    auto batches = Batches(*join, ContextOf(nullptr, batch_size));
+    ASSERT_TRUE(batches.ok()) << batches.status().ToString();
+    if (batch_size == 64) {  // one window of 16 rows with 2 matches: compacted
+      ASSERT_EQ(batches->size(), 1U);
+      const Batch& out = batches->front();
+      EXPECT_EQ(out.data->num_rows(), 2);  // the matches alone, not the window
+      EXPECT_EQ(out.selection, nullptr);   // nothing left to mask off
+      EXPECT_NE(out.data->column(0)->data()->buffers[1]->data(),
+                probe->column(0)->data()->buffers[1]->data());  // taken, not sliced
+    } else {  // a window of one row is wholly matched or skipped, so the window path runs
+      ASSERT_EQ(batches->size(), 2U);
+      for (const Batch& out : *batches) {
+        EXPECT_EQ(out.data->num_rows(), 1);
+        EXPECT_EQ(out.selection, nullptr);
+      }
+    }
+    const Rows rows = RowsOf(join->output_schema(), *batches);
+    EXPECT_EQ(rows, (Rows{{"1", "3", "1", "101"}, {"4", "11", "4", "104"}}));
+    if (both.empty()) {
+      both = rows;
+    } else {
+      EXPECT_EQ(rows, both);  // the two paths answer the same, in the same order
+    }
+  }
+}
+
+// A build of unique keys: each window of at most batch_size rows of a probe batch comes out as long
+// as its matches and without a selection, the build's column never NULL (a row the probe batch does
+// not select matches nothing, and a window without a match is skipped). A window every row of which
+// matched is a slice of the probe -- its buffers, at an offset; one with a miss in it is compacted
+// instead, so its probe columns are a copy of the rows that matched (ADR 0026's C8).
+TEST_F(HashJoinTest, OneToOnePathKeepsTheProbeColumnsOfAWhollyMatchedWindow) {
   // The build's and the probe's second columns are not nullable: the join's build column is.
   const auto build_schema = arrow::schema(
       {arrow::field("k", arrow::int64()), arrow::field("v", arrow::int64(), /*nullable=*/false)});
@@ -556,28 +614,30 @@ TEST_F(HashJoinTest, OneToOnePathKeepsTheProbeColumns) {
       }
       ASSERT_LT(next, batches->size());
       const Batch& out = (*batches)[next++];
-      ASSERT_EQ(out.data->num_rows(), rows);
-      for (int c = 0; c < 2; ++c) {  // the probe's columns: its buffers, sliced
-        EXPECT_EQ(out.data->column(c)->data()->buffers[1]->data(),
-                  probe->column(c)->data()->buffers[1]->data());
-        EXPECT_EQ(out.data->column(c)->offset(), begin);
+      // The probe rows of this window that matched, in order: what the output holds, either way.
+      std::vector<std::size_t> kept;
+      for (int64_t i = begin; i < begin + rows; ++i) {
+        if (matched[static_cast<std::size_t>(i)]) {
+          kept.push_back(static_cast<std::size_t>(i));
+        }
       }
-      if (hits == rows) {
-        EXPECT_EQ(out.selection, nullptr);
-      } else {
-        ASSERT_NE(out.selection, nullptr);
+      ASSERT_EQ(out.data->num_rows(), static_cast<int64_t>(kept.size()));
+      EXPECT_EQ(out.selection, nullptr);  // as long as its matches: nothing to mask off
+      for (int c = 0; c < 2; ++c) {
+        const bool sliced = out.data->column(c)->data()->buffers[1]->data() ==
+                            probe->column(c)->data()->buffers[1]->data();
+        EXPECT_EQ(sliced, hits == rows) << c;  // the probe's own buffers only when none missed
+        if (sliced) {
+          EXPECT_EQ(out.data->column(c)->offset(), begin) << c;
+        }
       }
+      const auto& row_of = static_cast<const arrow::Int64Array&>(*out.data->column(1));
       const auto& values = static_cast<const arrow::Int64Array&>(*out.data->column(3));
-      for (int64_t i = 0; i < rows; ++i) {
-        const auto row = static_cast<std::size_t>(begin + i);
-        if (out.selection != nullptr) {
-          EXPECT_EQ(out.selection->Value(i), matched[row]) << row;
-        }
-        if (matched[row]) {
-          EXPECT_EQ(values.Value(i), 100 + probe_keys[row].value_or(-1000)) << row;
-        } else {
-          EXPECT_TRUE(values.IsNull(i)) << row;
-        }
+      for (std::size_t i = 0; i < kept.size(); ++i) {
+        const auto at = static_cast<int64_t>(i);
+        EXPECT_EQ(row_of.Value(at), static_cast<int64_t>(kept[i])) << i;
+        EXPECT_FALSE(values.IsNull(at)) << i;
+        EXPECT_EQ(values.Value(at), 100 + probe_keys[kept[i]].value_or(-1000)) << i;
       }
     }
     EXPECT_EQ(next, batches->size());
@@ -722,34 +782,38 @@ TEST_F(HashJoinTest, MultiColumnKeys) {
   }
 }
 
-// A BOOLEAN build column (gathered by slices, with NULLs) on the 1:1 path, where a row without a
-// match gets NULL, and on the 1:N path.
+// A BOOLEAN build column (gathered by slices) on the 1:1 path, where an inner join emits the rows
+// that matched and a left join pads the rest with NULL -- which is where the slice gather's own
+// NULLs come from now that the inner path compacts instead of padding (ADR 0026's C8) -- and on the
+// 1:N path. A NULL in the build's own data survives either way.
 TEST_F(HashJoinTest, BooleanPayloadOnBothPaths) {
   const auto build_schema =
       arrow::schema({arrow::field("k", arrow::int64()), arrow::field("flag", arrow::boolean())});
   const auto probe_schema = Int64Schema({"a"});
   const std::optional<bool> no_flag;
-  {
+  const arrow::ArrayVector flagged = {Int64s({1, 2, 3, 4}), Bools({true, no_flag, false, true})};
+  for (const plan::JoinKind kind : {plan::JoinKind::kInner, plan::JoinKind::kLeft}) {
+    SCOPED_TRACE(plan::ToString(kind));
     auto join = MakeJoin(SourceOf(probe_schema, {Int64s({1, 9, 2, 3, 9, 9, 4})}),
-                         DrainedBuild(SourceOf(build_schema, {Int64s({1, 2, 3, 4}),
-                                                              Bools({true, no_flag, false, true})}),
-                                      {0}),
-                         {0}, /*prepares=*/true);
+                         DrainedBuild(kind, SourceOf(build_schema, flagged), {0}), {0},
+                         /*prepares=*/true);
     ASSERT_NE(join, nullptr);
-    auto batches = Batches(*join, ContextOf(nullptr, 64));
-    ASSERT_TRUE(batches.ok()) << batches.status().ToString();
-    ASSERT_EQ(batches->size(), 1U);
-    const auto& flags = static_cast<const arrow::BooleanArray&>(*(*batches)[0].data->column(2));
-    const std::vector<std::optional<bool>> expected = {true,    no_flag, no_flag, false,
-                                                       no_flag, no_flag, true};
-    ASSERT_EQ(flags.length(), 7);
-    for (int64_t i = 0; i < flags.length(); ++i) {
-      const auto& want = expected[static_cast<std::size_t>(i)];
-      EXPECT_EQ(flags.IsValid(i), want.has_value()) << i;
-      if (want.has_value() && flags.IsValid(i)) {
-        EXPECT_EQ(flags.Value(i), *want) << i;
-      }
+    ExecContext ctx = ContextOf(nullptr, 64);
+    auto result = Drain(*join, ctx);
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    // Keys 1, 2, 3 and 4 match; the three 9s do not. The inner join drops them, the left join keeps
+    // them with a NULL build side. Key 2's flag is NULL in the build itself.
+    const Rows matched_rows = {
+        {"1", "1", "true"}, {"2", "2", "null"}, {"3", "3", "false"}, {"4", "4", "true"}};
+    Rows expected;
+    if (kind == plan::JoinKind::kInner) {
+      expected = matched_rows;
+    } else {
+      expected = {{"1", "1", "true"},  {"9", "null", "null"}, {"2", "2", "null"},
+                  {"3", "3", "false"}, {"9", "null", "null"}, {"9", "null", "null"},
+                  {"4", "4", "true"}};
     }
+    EXPECT_EQ(RowsOf(**result), expected);
   }
   {
     const arrow::ArrayVector build = {Int64s({1, 1, 2, 1, 2}),

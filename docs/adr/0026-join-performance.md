@@ -520,6 +520,36 @@ this profiling fires:
 - **T4, test(diff): generate the shapes the build directions answer.** A build direction is not a new feature of the
   SQL subset, so `kGeneratorPending` has nothing to hold; what the generator owes is the shapes where the preserved
   side is the smaller one, so that `diff-random` covers the plans C3 newly chooses.
+- **C8, perf(exec): gather only the rows a 1:1 window matched, done 2026-10-16.** Re-profiling all 22 after C5 and
+  C5a put the whole remaining join cost in one metric: **`gather` 235.3 s against `find`'s 78.9 s**, summed over
+  parts, and `gather` was charged per *probe* row almost regardless of how many rows the join kept. A join keeping
+  0.50% of its probe rows paid **27.8 ns** each where one keeping 100% paid **19.9 ns** — a 200x difference in match
+  rate producing a 1.4x difference in cost, in the wrong direction.
+
+  The cause was in `HashJoinOperator::NextWindow`, the inner join's 1:1 path. It left the probe where it was — a
+  zero-copy slice of the batch, which is the design's point — and gathered the build's columns for **every row of the
+  window**, NULL where a row had no match, then masked the misses off with a selection. So a window where one row in
+  200 matched still materialised the build of all 200. Adding the matched count as a metric beside `window_rows`
+  settled what the waste was: of the 235.3 s, **169.9 s went on probe rows with no match and 0.0 s on pairs a
+  residual rejected** — so the fix was to compact, not to reorder the residual.
+
+  The rule needs no threshold, and that was the measurement's doing rather than the design's. Sweeping the share at
+  which compacting beats slicing — compact below 1 in 2, 1 in 4, 1 in 8 — found 1 in 4 and *any miss at all* within
+  1% of each other, and the all-matched case untouched either way, because a window whose every row matched never
+  compacts under either rule. So the condition is simply `matched < rows`, and with it the window path runs **only**
+  when the window matched entirely: its selection, and the NULL-aware build gather it needed, are both gone. The
+  faster path is also the one with less code in it.
+
+  Measured at SF 100 on 4 threads, best of 2, both columns from the same binary: the geomean over the 22 falls
+  **7.259 s to 5.695 s (-21.5%)**, and antb1 goes from 2.61x DuckDB to **2.04x**. Thirteen queries gain more than
+  12%: Q02 -50.4%, Q07 -49.8%, Q05 -49.5%, Q11 -44.5%, Q09 -39.2%, Q14 -32.9%, Q03 -28.3%, Q16 -26.0%, Q19 -25.9%,
+  Q21 -19.9%, Q10 -18.5%, Q08 -16.5%, Q17 -12.1%. Nothing regressed: the largest move the other way is Q06 at +2.8%,
+  which has no join in it at all and so sets the noise band.
+
+  **This is the item the roadmap above did not have, and three of its entries were waiting behind it.** C5's own
+  re-profiling read Q10's cost as `gather` and handed it to `exec` as a string-width problem; a good part of it was
+  this instead. The lesson for the entries that remain is that a metric covering two different things — here
+  `Take`-on-probe and the build gather under one timer — hid a 2x for as long as it was not split.
 
 ## Alternatives considered
 

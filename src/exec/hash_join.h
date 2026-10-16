@@ -310,6 +310,13 @@ class HashJoinOperator final : public Operator {
   // of slots or the residuals; batch_ is cleared at its end).
   arrow::Result<std::optional<Batch>> NextOutput();
   arrow::Result<std::optional<Batch>> NextWindow();
+  // The matched rows of a window most of whose rows found nothing, gathered alone: NextWindow's
+  // other half, which gathers the build for the whole window and masks the rest off (ADR 0026's
+  // C8).
+  arrow::Result<std::optional<Batch>> CompactWindow(int64_t begin,
+                                                    std::span<const JoinMatches> matches,
+                                                    int64_t matched,
+                                                    std::span<const JoinRowRef> table_rows);
   arrow::Result<std::optional<Batch>> NextPairs();
   arrow::Result<std::optional<Batch>> NextSelected();
   arrow::Result<std::optional<Batch>> NextOneRow();
