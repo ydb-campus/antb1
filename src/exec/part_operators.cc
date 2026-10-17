@@ -300,6 +300,7 @@ arrow::Status PartGroupAggregateOperator::Open(ExecContext& ctx) {
           ARROW_ASSIGN_OR_RAISE(const auto rows, Materialize(batch, part_ctx.pool));
           if (route) {
             // Routed rows are Arrow buffers of the query's pool: the budget counts them.
+            const ProfileTimer routing(profile, "routed_path");
             ARROW_ASSIGN_OR_RAISE(auto split, table.RouteRows(*rows));
             for (std::size_t p = 0; p < split.size(); ++p) {
               if (split[p]->num_rows() > 0) {
@@ -309,7 +310,10 @@ arrow::Status PartGroupAggregateOperator::Open(ExecContext& ctx) {
             routed += rows->num_rows();
             return true;
           }
-          ARROW_RETURN_NOT_OK(table.Consume(*rows));
+          {
+            const ProfileTimer local(profile, "local_path");
+            ARROW_RETURN_NOT_OK(table.Consume(*rows));
+          }
           consumed += rows->num_rows();
           if (!decided && consumed >= decide_after) {
             decided = true;
@@ -320,10 +324,22 @@ arrow::Status PartGroupAggregateOperator::Open(ExecContext& ctx) {
           }
           return true;
         }));
-    ARROW_RETURN_NOT_OK(table.Partition());  // on the worker, not on the merging thread
-    if (profile != nullptr && routed > 0) {
-      profile->Add("raw_parts", MetricUnit::kCount, 1);
-      profile->Add("raw_rows", MetricUnit::kCount, routed);
+    {
+      const ProfileTimer partitioning(profile, "local_path");
+      ARROW_RETURN_NOT_OK(table.Partition());  // on the worker, not on the merging thread
+    }
+    if (profile != nullptr) {
+      // What the local path bought: the rows the parts aggregated themselves and the groups they
+      // came to, so the reduction the routing rule tests can be read off rather than inferred from
+      // the group count. With local_path and routed_path -- each path's whole cost across both the
+      // workers and the lanes, summed over threads -- this says which path a query should have
+      // taken and why, which no single-threaded benchmark of the tables can show.
+      profile->Add("local_rows", MetricUnit::kCount, consumed);
+      profile->Add("local_groups", MetricUnit::kCount, table.num_groups());
+      if (routed > 0) {
+        profile->Add("raw_parts", MetricUnit::kCount, 1);
+        profile->Add("raw_rows", MetricUnit::kCount, routed);
+      }
     }
     return groups;
   };
@@ -363,8 +379,15 @@ arrow::Status PartGroupAggregateOperator::Merge() {
     }
     ANTB1_CHECK(tables_.size() == partitions);
     status = lanes->Add(index, [this, groups = *std::move(part)](std::size_t p) -> arrow::Status {
-      ARROW_RETURN_NOT_OK(tables_[p]->MergePartition(*groups->table, p));
+      // The rest of each path's cost: a part's groups re-inserted here, against its routed rows
+      // inserted here for the first time. Both add into the same metric as their part-side halves,
+      // so local_path and routed_path are each one path's whole cost.
+      {
+        const ProfileTimer merging(profile(), "local_path");
+        ARROW_RETURN_NOT_OK(tables_[p]->MergePartition(*groups->table, p));
+      }
       if (p < groups->rows.size()) {  // the part's other rows, after its first batch's groups
+        const ProfileTimer merging(profile(), "routed_path");
         for (const auto& rows : groups->rows[p]) {
           ARROW_RETURN_NOT_OK(tables_[p]->Consume(*rows));
         }
