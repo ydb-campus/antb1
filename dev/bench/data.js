@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792268825892,
+  "lastUpdate": 1792270444685,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -9900,6 +9900,258 @@ window.BENCHMARK_DATA = {
             "value": 2749.1439269999773,
             "unit": "ms/iter",
             "extra": "iterations: 1\ncpu: 2748.7245780000007 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "3d1559038e99676ca269d8568892757b2cc2d0ab",
+          "message": "feat(exec): profile each grouping path's own cost (#161)\n\n## Summary\n\nA grouped aggregation runs a part's rows one of two ways: the part\naggregates them itself and its\ngroups are merged into the partitions (**local**), or the rows go\nstraight to the partitions\n(**routed**). Which one a part takes is decided by the 1/4 reduction\nrule in `part_operators.cc`,\nand until now a profile showed only the decision's *outcome* —\n`raw_parts`, `raw_rows` — never what\neither path cost.\n\nFour metrics on `PartGroupAggregate`:\n\n- **`local_path`** and **`routed_path`** — each path's whole cost,\nsummed over the workers *and* the\nlanes, because each path has a half on either side: a part's own\n`Consume` and `Partition()` run\non its worker, its `MergePartition` and its routed rows' `Consume` in\nthe partition lanes. Adding\n  both halves into one metric is what makes the two comparable.\n- **`local_rows`** and **`local_groups`** — the rows the parts\naggregated themselves and the groups\nthey came to, so the realised reduction can be read off rather than\ninferred from the final group\ncount. These are each part's own numbers summed, so `local_groups`\nexceeds `groups`: the parts\n  hold the same key in several of their tables.\n\n## What it measures that nothing else could\n\nA single-threaded benchmark of the tables cannot see this, because the\ntwo paths put their work on\n*different threads* — the choice changes the parallel critical path, not\nonly the total work. On\nClickBench at 100 M rows, 14 threads:\n\n| query | reduction | local ns/row | routed ns/row | cheaper | measured\nwinner |\n| --- | ---: | ---: | ---: | --- | --- |\n| q05 | 16.0 | **46** | 71 | local | local |\n| q16 | 4.7 | 94 | **89** | routed | routed |\n| q33 | 5.3 | **148** | 183 | local | **routed** |\n| q32 | 1.0 | 249 | **115** | routed | routed |\n\n\"Measured winner\" is which path wins end to end, from an A/B that forces\nthe decision. Three results\nfollow:\n\n1. **The cheaper path is the faster one in three of the four**, so a\nrule could compare these costs\n   instead of guessing from a ratio.\n2. **The local cost tracks the reduction** as the rule's own reasoning\npredicts — 249 ns/row at\n1:1, 46 ns/row at 16:1 — which is the first direct confirmation that the\nreasoning is right in\n   kind, even where the threshold is wrong.\n3. **q33 is now the single case that needs explaining**, not a general\nmystery: its local path is\n19% cheaper in CPU yet 5.8% slower end to end. Something other than\ntotal work decides it there,\nand the likeliest candidate is memory pressure — `PartScheduler` halves\nits window when the\nbudget is under pressure, so the local path's 226 live part tables can\ncost parallelism.\n\nFor context on why a ratio cannot do this job: a companion benchmark\n(#160) shows one insert costs\n2.7 ns in a cache-resident table and 29.8 ns in a 16 M-group one, so \"an\ninsert\" is not a unit of\ncost and break-even depends on both tables' sizes. This PR supplies the\nother half — what the paths\nactually cost on real data at real thread counts.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability — four profile metrics;\n`explain --analyze` output changes\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\nNo behaviour changes. The metrics cost nothing when profiling is off\n(`ProfileTimer` holds a null\nnode and does nothing in its destructor) and are per batch, not per row.\n\n## Verification\n\n```text\n$ pixi run ci\n100% tests passed out of 2724\n\n$ pixi run release\n100% tests passed out of 2725\n\n$ pixi run test -R '^cli\\.'\n100% tests passed out of 105\n\n$ ANTB1_DIFF_SEED=20261019 pixi run diff-random\nDIFF: PASS seed=20261019 queries=2000 failed=0 unsupported=0\n\n$ for f in $(git diff --name-only origin/main...HEAD | grep '\\.cc$'); do \\\n    ./.pixi/envs/default/bin/clang-tidy -p build/tidy --warnings-as-errors='*' --quiet \"$f\"; done\nsrc/exec/part_operators.cc  clean\n```\n\n`pixi run lint`'s shellcheck leg still fails on the 36 pre-existing\nosx-arm64 SC2218 findings; this\nbranch touches no shell script and the count is identical on\n`origin/main`.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change — `cli.explain_analyze` pins the new\nmetrics, and its regex golden is\nedited **by hand**, which is what `tests/cli/CMakeLists.txt` asks of a\nprofile change\n      (`ANTB1_UPDATE_GOLDENS=1` does not regenerate a regex expectation)\n- [x] Docs updated where behavior, commands or architecture changed, or\nnot needed — the metrics are\nself-describing in the profile; [ADR\n0015](../blob/main/docs/adr/0015-query-profiles.md) sets\nno list of metrics to amend, and it is `Proposed`, so I have not touched\nit. Say if you would\n      rather it recorded them.\n- [x] No ClickBench-derived data is committed: the table above is\ntimings and query numbers only\n- [x] Nothing derived from TPC-H is committed\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer — none touched\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5) wrote\nthe diff, the golden update\nand this description, and ran every command quoted above. The\nmeasurement table is from the\n      run shown.\n- Accountable human (has read and understands the whole diff): @hor911\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-17T23:50:07+03:00",
+          "tree_id": "4523f1ce1c39a251699c2d22a22bd1f8426e654c",
+          "url": "https://github.com/ydb-campus/antb1/commit/3d1559038e99676ca269d8568892757b2cc2d0ab"
+        },
+        "date": 1792270443766,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4977.006200523146,
+            "unit": "ns/iter",
+            "extra": "iterations: 143375\ncpu: 4976.349635571054 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84561.79229976979,
+            "unit": "ns/iter",
+            "extra": "iterations: 7766\ncpu: 84543.9563481844 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 221806.9955640046,
+            "unit": "ns/iter",
+            "extra": "iterations: 3156\ncpu: 221731.51172370085 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 439554.80376176466,
+            "unit": "ns/iter",
+            "extra": "iterations: 1595\ncpu: 439425.6501567396 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 347689.6547441664,
+            "unit": "ns/iter",
+            "extra": "iterations: 2013\ncpu: 347567.1167411823 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2081865.4179104452,
+            "unit": "ns/iter",
+            "extra": "iterations: 335\ncpu: 2081580.495522386 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 51.212703642856845,
+            "unit": "ms/iter",
+            "extra": "iterations: 14\ncpu: 51.20122221428572 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 46.93898333333474,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 46.92612966666664 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 199.52350600000082,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 199.43841633333352 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.369374551019904,
+            "unit": "ms/iter",
+            "extra": "iterations: 49\ncpu: 14.368536673469379 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 22.70650899999982,
+            "unit": "ms/iter",
+            "extra": "iterations: 32\ncpu: 22.702896593750022 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 39.40457522222118,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 39.402793166666704 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.8846425430107805,
+            "unit": "ms/iter",
+            "extra": "iterations: 372\ncpu: 1.8842941344086064 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 115.33662049999786,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 115.3265173333334 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1000",
+            "value": 28.2154866399992,
+            "unit": "ms/iter",
+            "extra": "iterations: 25\ncpu: 28.21146751999997 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16384",
+            "value": 31.40232299999985,
+            "unit": "ms/iter",
+            "extra": "iterations: 22\ncpu: 31.40043122727269 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/262144",
+            "value": 64.77949636363756,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 64.7723743636361 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1048576",
+            "value": 100.72329100000032,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 100.71769271428569 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/4194304",
+            "value": 347.2410465000024,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 347.189607999999 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16777216",
+            "value": 1695.6913319999956,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1695.5683300000005 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1000",
+            "value": 34.66897469999992,
+            "unit": "ms/iter",
+            "extra": "iterations: 20\ncpu: 34.66776594999992 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16384",
+            "value": 39.277077333333445,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 39.2732235 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/262144",
+            "value": 67.2560255999997,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 67.25125950000006 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1048576",
+            "value": 123.92855533333602,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 123.91237799999999 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/4194304",
+            "value": 397.81863499999304,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 397.7796829999995 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16777216",
+            "value": 1852.2955059999902,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1852.1379109999998 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1000",
+            "value": 58.99414191666826,
+            "unit": "ms/iter",
+            "extra": "iterations: 12\ncpu: 58.97251533333343 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16384",
+            "value": 62.70297118181713,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 62.69971463636378 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/262144",
+            "value": 93.4779665714294,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 93.47368157142861 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1048576",
+            "value": 162.21286424999448,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 162.1933010000003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/4194304",
+            "value": 483.719627499994,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 483.6921005000008 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16777216",
+            "value": 2348.9793310000096,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2348.692534999998 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1000",
+            "value": 69.83270570000002,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 69.82305390000008 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16384",
+            "value": 75.26871611111119,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 75.26449688888923 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/262144",
+            "value": 109.96525033333171,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 109.94983633333295 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1048576",
+            "value": 189.69833375000178,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 189.67735825 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/4194304",
+            "value": 538.0984040000101,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 538.0504769999988 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16777216",
+            "value": 2398.184191000013,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2397.8665419999957 ms\nthreads: 1"
           }
         ]
       }
