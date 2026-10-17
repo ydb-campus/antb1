@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792205992787,
+  "lastUpdate": 1792257623833,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -9468,6 +9468,186 @@ window.BENCHMARK_DATA = {
             "value": 344.26328050000166,
             "unit": "ms/iter",
             "extra": "iterations: 2\ncpu: 344.2141589999999 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "e24d639442490f6a14c6695f189519c5c539a9d6",
+          "message": "perf(exec): skip top-N parts their statistics rule out (#159)\n\n## Summary\n\nA part contributes to `ORDER BY ... LIMIT` only if it holds a row better\nthan the worst row the\ntop-N already keeps. Where the first sort key is an integer-valued\ncolumn of the scan, the footer\nstatistics answer that before anything is read, so the part is skipped\nentirely: no scan, no\ndecoding, no filtering.\n\nThe bound already existed and was simply never shown to the parts.\n`SortBuffer` keeps `threshold_`\n(the last of the first `keep` rows) and `Add` already drops arriving\nrows against it; this adds\n`Tighten()` to establish it on demand -- each part contributes at most\n`keep` rows, far too few to\nreach `Add`'s own compaction threshold -- and `ThresholdKey()` to read\nthe first key's value from\nit. `PartTopNOperator` publishes that after every merge; each part task\nreads it once before it runs\nand returns an empty buffer when `PartMayBeat` says its statistics rule\nthe part out.\n\nThis extends the part pruning of ADR 0020 from static to dynamic: the\ntest cannot be made when the\nplan is, because the bound depends on the rows already read.\n\nNothing is skipped unless the statistics say so. A part is ruled out\nonly when *strictly* worse on\nthe first key, since one that ties may still come first on a later key;\nNULLS FIRST with any NULL\nnever prunes; a key that is not integer-valued (VARCHAR, DOUBLE) has no\nstatistics and prunes\nnothing. Only a chain of Filters over the scan qualifies, as\n`FiltersOnScan` already requires for\npredicate pruning and for the same reason -- above a Compute, a Project\nor a join the key's column\nindex is no longer the scan's.\n\nCloses #\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [x] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n### One behaviour change to review deliberately\n\nA part that is skipped is not read, so a read error inside it is no\nlonger reported. Static\npredicate pruning has always had that property. What is new is that with\nthreads it depends on how\nmany parts have merged when a part is scheduled, so over a corrupt file\na query may fail on one run\nand not the next.\n\n`TopNKeepsEachPartsFirstRows` caught this immediately (it breaks part 4\nand expects an `IOError`).\nRather than weaken it, that case now turns statistics off, so it still\npins error propagation\ndeterministically, and the new `TopNSkipsPartsItsBoundRulesOut` pins the\nskipping on purpose --\nincluding that a broken part the bound rules out does **not** fail the\nquery.\n\n## Verification\n\n```text\n$ pixi run ci\n100% tests passed out of 2724\n\n$ pixi run release\n100% tests passed out of 2725\n\n$ ANTB1_DIFF_SEED=20261017 pixi run diff-random\nDIFF: PASS seed=20261017 queries=2000 failed=0 unsupported=0\n\n$ pixi run test -L metamorphic            # inside pixi run ci above\n153 tests, all passed\n\n$ ASAN_OPTIONS=detect_leaks=0 ./build/ci-asan/bin/antb1_exec_tests \\\n    --gtest_filter='*TopN*:*Sort*:*PartOperators*:*Pruning*'\n47 tests from 5 test suites ran. [  PASSED  ] 47 tests.\n\n$ ./.pixi/envs/default/bin/clang-tidy -p build/tidy --warnings-as-errors='*' --quiet \\\n    src/exec/part_pruning.cc src/exec/part_operators.cc src/exec/physical_planner.cc\nclean\n```\n\nTwo pre-existing conditions on the osx-arm64 host, both unrelated to\nthis diff and both verified as\nsuch:\n\n- `pixi run asan` fails during *test discovery* with a 64-byte leak\nwhose stack is entirely\n`curl_global_init` from `libazure-core`'s static initializer under dyld\n-- an Arrow dependency's\none-time global init, present in every ASan binary here. The leaking\n`antb1_plan_tests` binary\nwas built 16.5 hours before the first edit in this branch, holds no\n`exec` symbols, and `plan`\ndoes not depend on `exec` (`ANTB1_DEPS_plan = \"common;sql\"`). Hence\n`detect_leaks=0` above.\n- clang-tidy reports `bugprone-misplaced-widening-cast` at\n`src/exec/sort.cc:342`; the same line is\non `origin/main` verbatim, so it is not from this change and is left\nalone.\n\n### Measurement\n\n100M rows, one file, 14 threads, best of 3, wall seconds. Never TPC\nBenchmark results.\n\n| query | before | after | change | parts read |\n| --- | ---: | ---: | ---: | --- |\n| q23 | 0.652 | 0.353 | **-45.8%** | 59 of 226 (167 skipped) |\n| q24 | 0.247 | 0.155 | **-37.1%** | - |\n| q26 | 0.255 | 0.154 | **-39.5%** | 50 of 226 (176 skipped), 3.3M rows\ninstead of 13.2M |\n| q25 | 0.233 | 0.228 | -2.1% | 226 of 226 (0 skipped): its key is\nVARCHAR |\n\nThose three are the **only** queries of the 43 that move outside a +-8%\nband, and none is slower.\nThe oracle's own geomean moved +0.6% across the same runs, as the drift\ncontrol. Over those four\nqueries, execution time goes from 2.0x the oracle on the two worst to\n1.02x across all four; the\nwhole-suite geomean goes 1.35x -> 1.31x.\n\nThe TPC-H-derived suite at the larger scale is unchanged: every\nper-query ratio to the oracle is the\nsame, and its geomean ratio moved 2.33x -> 2.31x. Its five `ORDER BY ...\nLIMIT` queries correctly\ngain nothing -- their sort keys are computed or aggregated values, so\nthe eligibility test declines\nthem. An initial run there showed a uniform ~5% uplift on the first five\nqueries for *both* engines,\nincluding the unchanged oracle binary; a warm re-run put them back\ninside the band, so that was\npage-cache state and not this change.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (new `TopNSkipsPartsItsBoundRulesOut`, and\n`TopNKeepsEachPartsFirstRows`\n      extended; both in `src/exec/tests/parallel_test.cc`)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer\n\nThe ADR 0011 amendment is now in this PR (c6f28e6), as AGENTS.md\nrequires of an architecture\nchange. @Hor911 approved both open questions in it: the error-visibility\nconsequence is recorded as\naccepted, and ADR 0011 is the home rather than 0020 or a new number.\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5) wrote\nthe diff, the tests and this\ndescription, and ran every command quoted above. The design was reviewed\nas a plan before any\n      code was written.\n- Accountable human (has read and understands the whole diff): @hor911\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-17T20:16:37+03:00",
+          "tree_id": "5fb07be72018664875db67fcc0cd8ca74e5d3779",
+          "url": "https://github.com/ydb-campus/antb1/commit/e24d639442490f6a14c6695f189519c5c539a9d6"
+        },
+        "date": 1792257623004,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4946.769367162549,
+            "unit": "ns/iter",
+            "extra": "iterations: 140431\ncpu: 4946.0289038745 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84296.39490861632,
+            "unit": "ns/iter",
+            "extra": "iterations: 7660\ncpu: 84293.34099216708 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222236.0993335444,
+            "unit": "ns/iter",
+            "extra": "iterations: 3151\ncpu: 222220.9784195494 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 440047.7153652284,
+            "unit": "ns/iter",
+            "extra": "iterations: 1588\ncpu: 440023.7657430727 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 360737.39556471497,
+            "unit": "ns/iter",
+            "extra": "iterations: 1939\ncpu: 360691.2764311498 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2078806.6765578503,
+            "unit": "ns/iter",
+            "extra": "iterations: 337\ncpu: 2078603.7091988134 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 50.92733615384759,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 50.910436538461525 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 44.241550999998935,
+            "unit": "ms/iter",
+            "extra": "iterations: 16\ncpu: 44.238034562499976 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 178.25177049999752,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 178.20681549999983 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.531044571428737,
+            "unit": "ms/iter",
+            "extra": "iterations: 49\ncpu: 14.526104795918377 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 22.46032303225874,
+            "unit": "ms/iter",
+            "extra": "iterations: 31\ncpu: 22.458672548387128 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 39.609334388888186,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 39.60656611111111 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 2.0728464970414358,
+            "unit": "ms/iter",
+            "extra": "iterations: 338\ncpu: 2.0725853994082857 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 92.06195249999993,
+            "unit": "ms/iter",
+            "extra": "iterations: 8\ncpu: 92.05552637500003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1000",
+            "value": 28.012495519999447,
+            "unit": "ms/iter",
+            "extra": "iterations: 25\ncpu: 28.008129680000025 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1048576",
+            "value": 98.61922914285515,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 98.6143308571426 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/4194304",
+            "value": 326.3983024999959,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 326.37559550000003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1000",
+            "value": 34.63624729999992,
+            "unit": "ms/iter",
+            "extra": "iterations: 20\ncpu: 34.633539400000046 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1048576",
+            "value": 115.34533066667052,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 115.3314173333335 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/4194304",
+            "value": 391.6224694999926,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 391.60139250000014 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1000",
+            "value": 58.64488633333309,
+            "unit": "ms/iter",
+            "extra": "iterations: 12\ncpu: 58.63812091666679 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1048576",
+            "value": 160.50620450000253,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 160.48567650000047 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/4194304",
+            "value": 479.20604149999235,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 479.174089999999 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1000",
+            "value": 69.73381070000073,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 69.72609470000002 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1048576",
+            "value": 186.01298974999736,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 185.95313899999954 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/4194304",
+            "value": 522.0106440000052,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 521.9866050000021 ms\nthreads: 1"
           }
         ]
       }
