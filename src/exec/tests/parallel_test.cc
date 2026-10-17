@@ -1,6 +1,7 @@
 // Parallel execution over table parts (docs/adr/0013-parallel-execution.md): the part scheduler
 // and the part operators the physical planner builds, on one thread and on a 4-thread pool.
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstddef>
@@ -1081,8 +1082,9 @@ TEST_F(PartOperatorsTest, TopNSkipsPartsItsBoundRulesOut) {
   // The planner builds part 0's pipeline once more to read the output schema, so a part can be
   // scanned more than once; what matters is which parts were read at all.
   const auto read = [](const std::shared_ptr<MemoryTable>& table) {
-    std::vector<int64_t> parts = table->scanned_parts();
-    parts.erase(std::unique(parts.begin(), parts.end()), parts.end());
+    std::vector<int64_t> parts = table->scanned_parts();  // sorted
+    const auto repeated = std::ranges::unique(parts);
+    parts.erase(repeated.begin(), repeated.end());
     return parts;
   };
   // One thread, so which parts have merged when a part is considered is fixed: part 0 fills the
