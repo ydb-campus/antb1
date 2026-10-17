@@ -1026,6 +1026,10 @@ TEST_F(PartOperatorsTest, TopNKeepsEachPartsFirstRows) {
         static_cast<arrow::internal::Executor*>(pool.get())}) {
     const auto table = Table();
     table->FailPart(4);
+    // Without statistics no part is skipped, so part 4 is read and its error is the query's. With
+    // them this very top-N skips it (TopNSkipsPartsItsBoundRulesOut below), and then there is no
+    // read to fail -- which is what is being separated here, not weakened.
+    table->set_stats(false);
     const auto failed = Run(top(table, 5, 0, false, false), executor);
     EXPECT_TRUE(failed.status().IsIOError()) << failed.status().ToString();
     EXPECT_EQ(failed.status().message(), "part 4 is broken");
@@ -1042,6 +1046,113 @@ TEST_F(PartOperatorsTest, TopNKeepsEachPartsFirstRows) {
     EXPECT_TRUE(oom.status().IsOutOfMemory()) << oom.status().ToString();
     op->reset();
     EXPECT_EQ(tiny.bytes_allocated(), 0);
+  }
+}
+
+// A part whose statistics of the first sort key put every one of its rows behind the worst row the
+// top-N already keeps holds nothing it can use, so it is never read (exec::PartMayBeat). The rows
+// are the serial top-N's either way -- TopNKeepsEachPartsFirstRows compares them for every window
+// with statistics on -- so what is left to pin here is that parts really are skipped, that the
+// skipping does not depend on how many are read first, and that a key whose statistics cannot rule
+// anything out skips nothing.
+//
+// The fixture makes this exact: y = x, NULL where x is a multiple of 5, 20 parts of 7 rows, so part
+// 0 holds the five smallest values (1, 2, 3, 4, 6) and `LIMIT 5` is satisfied by it alone. Every
+// later part starts at 7 or more, above that bound, and the statistics say so.
+TEST_F(PartOperatorsTest, TopNSkipsPartsItsBoundRulesOut) {
+  const auto pool = Pool();
+  // Sorted by y (BIGINT, statistics) or by d (DOUBLE, which plan::Table::part_stats has none for).
+  const auto plan = [&](const std::shared_ptr<MemoryTable>& table, int64_t limit, bool by_double) {
+    const auto key =
+        by_double ? Column(1, "d", LogicalType::kDouble) : Column(2, "y", LogicalType::kBigInt);
+    const auto sort =
+        Node(plan::SortNode{.input = Scan(table),
+                            .keys = {{.column = key, .descending = false, .nulls_first = false}}});
+    return PlanOf(Node(plan::LimitNode{.input = sort, .limit = limit, .offset = 0}), 3);
+  };
+  const auto pruned = [](const ProfileNode& root) -> int64_t {
+    for (const ProfileMetric& metric : root.metrics()) {
+      if (metric.name == "pruned") {
+        return metric.value;
+      }
+    }
+    return 0;
+  };
+  // The planner builds part 0's pipeline once more to read the output schema, so a part can be
+  // scanned more than once; what matters is which parts were read at all.
+  const auto read = [](const std::shared_ptr<MemoryTable>& table) {
+    std::vector<int64_t> parts = table->scanned_parts();
+    parts.erase(std::unique(parts.begin(), parts.end()), parts.end());
+    return parts;
+  };
+  // One thread, so which parts have merged when a part is considered is fixed: part 0 fills the
+  // window, and the 19 parts after it are all ruled out.
+  {
+    const auto table = Table();
+    ProfileNode profile;
+    auto op = BuildPhysicalPlan(plan(table, 5, /*by_double=*/false), &profile);
+    ASSERT_TRUE(op.ok()) << op.status().ToString();
+    ExecContext ctx{.pool = arrow::default_memory_pool(), .batch_size = 3, .threads = 1};
+    const auto rows = Drain(**op, ctx);
+    ASSERT_TRUE(rows.ok()) << rows.status().ToString();
+    EXPECT_EQ((*rows)->num_rows(), 5);
+    EXPECT_EQ(pruned(profile), kParts - 1);
+    EXPECT_EQ(read(table), std::vector<int64_t>{0});
+  }
+  // A broken part the bound rules out is never read, so it cannot fail the query. The deliberate
+  // consequence of not reading what cannot contribute, and the reason
+  // TopNKeepsEachPartsFirstRows turns statistics off for its error case.
+  {
+    const auto table = Table();
+    table->FailPart(4);
+    const auto rows = Run(plan(table, 5, /*by_double=*/false), nullptr);
+    ASSERT_TRUE(rows.ok()) << rows.status().ToString();
+    EXPECT_EQ((*rows)->num_rows(), 5);
+  }
+  // A key with no statistics to compare rules nothing out: every part is read, and the rows are
+  // the same. DOUBLE is deliberately not an integer-valued type (ParquetTable::part_stats).
+  {
+    const auto table = Table();
+    ProfileNode profile;
+    auto op = BuildPhysicalPlan(plan(table, 5, /*by_double=*/true), &profile);
+    ASSERT_TRUE(op.ok()) << op.status().ToString();
+    ExecContext ctx{.pool = arrow::default_memory_pool(), .batch_size = 3, .threads = 1};
+    const auto rows = Drain(**op, ctx);
+    ASSERT_TRUE(rows.ok()) << rows.status().ToString();
+    EXPECT_EQ((*rows)->num_rows(), 5);
+    EXPECT_EQ(pruned(profile), 0);
+    EXPECT_EQ(read(table).size(), static_cast<std::size_t>(kParts));
+  }
+  // Nor does a table that keeps no statistics at all.
+  {
+    const auto table = Table();
+    table->set_stats(false);
+    ProfileNode profile;
+    auto op = BuildPhysicalPlan(plan(table, 5, /*by_double=*/false), &profile);
+    ASSERT_TRUE(op.ok()) << op.status().ToString();
+    ExecContext ctx{.pool = arrow::default_memory_pool(), .batch_size = 3, .threads = 1};
+    const auto rows = Drain(**op, ctx);
+    ASSERT_TRUE(rows.ok()) << rows.status().ToString();
+    EXPECT_EQ((*rows)->num_rows(), 5);
+    EXPECT_EQ(pruned(profile), 0);
+    EXPECT_EQ(read(table).size(), static_cast<std::size_t>(kParts));
+  }
+  // Four threads: the window the scheduler keeps full means the first parts are read before any
+  // bound exists, so fewer are skipped -- but never none, and never a row of the answer.
+  {
+    const auto table = Table();
+    ProfileNode profile;
+    auto op = BuildPhysicalPlan(plan(table, 5, /*by_double=*/false), &profile);
+    ASSERT_TRUE(op.ok()) << op.status().ToString();
+    ExecContext ctx{.pool = arrow::default_memory_pool(),
+                    .batch_size = 3,
+                    .executor = pool.get(),
+                    .threads = kThreads};
+    const auto rows = Drain(**op, ctx);
+    ASSERT_TRUE(rows.ok()) << rows.status().ToString();
+    EXPECT_EQ((*rows)->num_rows(), 5);
+    EXPECT_GT(pruned(profile), 0);
+    EXPECT_LE(pruned(profile), kParts - 1);
   }
 }
 

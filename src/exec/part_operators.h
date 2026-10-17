@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <vector>
 
@@ -316,11 +317,22 @@ struct LateColumns {
   std::shared_ptr<arrow::Schema> narrow_schema;  // of the narrow pipeline's rows
 };
 
+// What a top-N needs to skip a part while it runs (exec::PartMayBeat): the statistics of its first
+// sort key. Absent -- and then no part is ever skipped -- unless that key is a column of the scan
+// the part pipelines read, which the physical planner decides (LeadingKeyField).
+struct TopNPruning {
+  std::shared_ptr<plan::Table> table;
+  int field = -1;  // the table field of the first sort key
+  // The table part of each part number (the parts the pipeline reads, in order).
+  std::shared_ptr<const std::vector<int64_t>> parts;
+};
+
 class PartTopNOperator final : public PartSink {
  public:
   PartTopNOperator(PartPipeline pipeline, int64_t num_parts, std::shared_ptr<arrow::Schema> schema,
                    std::vector<plan::SortKey> keys, int64_t limit, int64_t offset,
-                   std::optional<LateColumns> late = std::nullopt);
+                   std::optional<LateColumns> late = std::nullopt,
+                   std::optional<TopNPruning> pruning = std::nullopt);
   ~PartTopNOperator() override;
 
   [[nodiscard]] const std::shared_ptr<arrow::Schema>& output_schema() const override {
@@ -342,6 +354,14 @@ class PartTopNOperator final : public PartSink {
   };
   using PartBuffer = std::shared_ptr<PartRows>;
 
+  // The value a part has to beat on the first sort key, as the merged rows tighten it: read by the
+  // part tasks before they scan, written by Next() after every merge. Shared with the tasks, which
+  // outlive a Close() that races with them.
+  struct Bound {
+    mutable std::mutex mutex;
+    std::optional<Int128> value;
+  };
+
   std::shared_ptr<const PartPipeline> pipeline_;
   int64_t num_parts_;
   std::shared_ptr<arrow::Schema> schema_;
@@ -351,6 +371,8 @@ class PartTopNOperator final : public PartSink {
   arrow::MemoryPool* pool_ = arrow::default_memory_pool();
   int64_t batch_size_ = 1;
   std::optional<LateColumns> late_;
+  std::optional<TopNPruning> pruning_;
+  std::shared_ptr<Bound> bound_;  // nullptr without pruning_
   arrow::internal::Executor* executor_ = nullptr;
   std::unique_ptr<SortBuffer> merged_;  // the parts' first rows, until emitted
   MemoryReservation memory_;            // merged_'s own containers

@@ -7,6 +7,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <unordered_map>
@@ -28,6 +29,7 @@
 #include "aggregate_set.h"
 #include "heavy_hitters.h"
 #include "outer_groups.h"
+#include "part_pruning.h"
 #include "part_scheduler.h"
 #include "partition_lanes.h"
 
@@ -872,14 +874,16 @@ arrow::Status PartTwoLevelAggregateOperator::Close() {
 PartTopNOperator::PartTopNOperator(PartPipeline pipeline, int64_t num_parts,
                                    std::shared_ptr<arrow::Schema> schema,
                                    std::vector<plan::SortKey> keys, int64_t limit, int64_t offset,
-                                   std::optional<LateColumns> late)
+                                   std::optional<LateColumns> late,
+                                   std::optional<TopNPruning> pruning)
     : pipeline_(std::make_shared<const PartPipeline>(std::move(pipeline))),
       num_parts_(num_parts),
       schema_(std::move(schema)),
       keys_(std::move(keys)),
       limit_(limit),
       offset_(offset),
-      late_(std::move(late)) {}
+      late_(std::move(late)),
+      pruning_(std::move(pruning)) {}
 
 PartTopNOperator::~PartTopNOperator() = default;
 
@@ -918,14 +922,36 @@ arrow::Status PartTopNOperator::Open(ExecContext& ctx) {
   next_ = 0;
   end_ = 0;
   window_.reset();
+  // Only with statistics of the first sort key is there anything to skip a part by.
+  const bool prunes = pruning_.has_value() && pruning_->table != nullptr && pruning_->field >= 0 &&
+                      pruning_->parts != nullptr;
+  bound_ = prunes ? std::make_shared<Bound>() : nullptr;
   auto task = [pipeline = pipeline_, part_ctx = PartContext(ctx), schema = rows_schema,
-               keys = keys_, keep, profile = profile()](
+               keys = keys_, keep, profile = profile(), pruning = pruning_, bound = bound_](
                   int64_t part, const std::atomic<bool>& stop) -> arrow::Result<PartBuffer> {
     const ProfileTimer part_time(profile, "part_time");
     ARROW_ASSIGN_OR_RAISE(RowComparator part_comparator, RowComparator::Make(schema, keys));
     auto rows =
         std::make_shared<PartRows>(SortBuffer(std::move(part_comparator), keep), part_ctx.budget);
     SortBuffer& buffer = rows->buffer;
+    // A part none of whose rows can reach the rows merged so far is not read at all: no scan, no
+    // decoding, no filtering. The bound only tightens, so a part skipped here would be skipped by
+    // every later bound too.
+    if (bound != nullptr && std::cmp_less(part, pruning->parts->size())) {
+      std::optional<Int128> worst;
+      {
+        const std::scoped_lock lock(bound->mutex);
+        worst = bound->value;
+      }
+      const std::optional<plan::PartStats> stats = pruning->table->part_stats(
+          (*pruning->parts)[static_cast<std::size_t>(part)], pruning->field);
+      if (worst.has_value() && stats.has_value() && !PartMayBeat(*stats, keys.front(), *worst)) {
+        if (profile != nullptr) {
+          profile->Add("pruned", MetricUnit::kCount, 1);
+        }
+        return rows;  // an empty buffer, which merges as nothing
+      }
+    }
     ARROW_RETURN_NOT_OK(
         RunPart(*pipeline, part, part_ctx, stop, [&](const Batch& batch) -> arrow::Result<bool> {
           ARROW_ASSIGN_OR_RAISE(auto data, Materialize(batch, part_ctx.pool));
@@ -956,6 +982,14 @@ arrow::Result<Batch> PartTopNOperator::Next() {
       }
       const ProfileTimer merge(profile(), "merge");
       ARROW_RETURN_NOT_OK(merged_->Merge(part->buffer, pool_));  // after the earlier parts' rows
+      if (bound_ != nullptr) {
+        // The parts keep at most `keep` rows each, far too few to reach Add's own compaction
+        // threshold, so the bound has to be asked for rather than waited for.
+        ARROW_RETURN_NOT_OK(merged_->Tighten(pool_));
+        const std::optional<Int128> worst = merged_->ThresholdKey();
+        const std::scoped_lock lock(bound_->mutex);
+        bound_->value = worst;
+      }
       ARROW_RETURN_NOT_OK(memory_.Resize(merged_->memory_usage()));
     }
     scheduler_.reset();
@@ -1095,6 +1129,7 @@ arrow::Status PartTopNOperator::Close() {
   scheduler_.reset();
   merged_.reset();
   window_.reset();
+  bound_.reset();  // a task still running holds its own reference
   memory_.Release();
   return arrow::Status::OK();
 }
