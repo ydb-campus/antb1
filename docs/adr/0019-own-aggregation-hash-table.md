@@ -127,6 +127,12 @@ Proposed
     Context above; 1.3× of the 16 M column is 22.9 ns/row for one `int64` key, 26.7 for two, and **41.6 for a
     string**. A table that cleared the old gates and not the 16 M column would not move Q32-Q34 at all, which is
     what the gates exist to prevent.
+  - Update (2026-10-18, **the counts are wrong in both directions**): 4 M and 16 M, added the day before, measure
+    tables the engine cannot build — 64 partitions and a part bounded by its row group put every one of them in
+    10⁴-10⁶ groups (see the Consequences below). A table has to win **in that band**, so the counts to sweep are
+    16 Ki, 256 Ki and 1 Mi, and the targets are the grouper's costs there rather than the 16 M column's. Keeping
+    1000 is still right, and 4 M is worth reporting as the band the engine would reach if
+    [ADR 0013](0013-parallel-execution.md)'s partition count ever changed — but it gates nothing today.
   - Update (2026-10-17, the end-to-end gate's baseline): "the GROUP BY queries" means Q16, Q17, Q18, Q32, Q33 and
     Q34, measured on the official single-file dataset at 14 threads, best of three, against DuckDB's unchanged binary
     in the same runs as the drift control. The 2026-10-01 baseline was a 100-partition dataset at 128 threads and is
@@ -135,6 +141,48 @@ Proposed
 
 ## Consequences
 
+- Update (2026-10-18, **the table was finished and measured in the pipeline; it reaches parity, not a win**): the
+  second prototype was taken through the work the updates above called for, then put behind
+  `arrow::compute::Grouper` in `exec::GroupTable` and measured on the queries themselves. What it cost and what it
+  bought, in order:
+  - **A batch-oriented loop** (pack every row of the batch one key column at a time, then hash the packed rows, then
+    probe) and **its own probe hash**, which the update above establishes it is free to have. Together these took one
+    `int64` key from 0.29× the grouper to 0.43× at a thousand groups, and from 0.80× to 1.09× at 4 M.
+  - **Prefetching the bucket eight rows ahead**, the one element ADR 0019's *first* prototype had and the second
+    dropped. At 16 M groups this alone took 44.16 ns a row to 20.14 — the table's whole advantage at high
+    cardinality, from one hint. With it, and with rows padded to whole words, the micro benchmark reads: 0.43× and
+    0.39× at a thousand groups, 0.73× and 0.86× at 1 M, **1.38× and 1.59× at 4 M, 1.44× and 1.56× at 16 M** for one
+    and two fixed-width keys.
+  - **What the gates could not see.** Those counts do not occur. `GroupTable::kPartitions` is 64 and a part's table
+    is bounded by its rows, so the largest table this engine builds is a partition table of q32 at **1,562,460
+    groups**, and a part table is at most a row group — 442,467 rows on the official dataset. Every table the engine
+    constructs falls in the 10⁴-10⁶ band, which is where the micro benchmark has this design at 0.46-0.88×. **The
+    4 M and 16 M columns added on 2026-10-17 measure tables the architecture prevents**, and they should be
+    10⁴-10⁶ instead; that correction is mine to own, since I argued for those columns.
+  - **End to end, with the table carrying every fixed-width key** (18 of the 43 queries; a string key still falls
+    back, so q33, q34 and the rest of ADR 0027's share are untouched): **7.74 s to 35.65 s, +360%**. q32 went 1.58 s
+    to 13.55 s.
+  - **All of which was one flaw, not the table.** `Reserve(group + 1)` charges the `MemoryBudget` **once per
+    inserted group**, so q32's hundred million groups are a hundred million contended updates across fourteen
+    threads. The micro benchmark passed no budget and so never paid it — the whole distance between "1.4× faster"
+    and "8.6× slower". With the budget bypassed the same binary gives **1.56 s against the grouper's 1.58 s on q32,
+    0.43 against 0.43 on Q4, 0.41 against 0.43 on Q8**: parity. A table of this kind must charge its budget when its
+    capacity changes, never per group.
+  - **So the decision's premise does not hold.** "Replacing `arrow::compute::Grouper` ... the main lever left for
+    GROUP BY" assumed a table of our own would be faster at the cardinalities the engine meets. Once its accounting
+    is fixed it is level with the grouper there, and it still cannot hold a string or a BOOLEAN key. The levers that
+    did pay over the same period were elsewhere: skipping top-N parts by their statistics (#159), and before it the
+    join work of [ADR 0026](0026-join-performance.md).
+  - **What would change the answer**, neither of which is a hash table: a **fused, vectorized** pass, which is how
+    the grouper wins below the cache knee — its whole operation costs 2.77 ns a row at a thousand groups, less than
+    this table's packing and hashing alone, before a single probe — and which means giving up the one portable
+    arithmetic definition this design chose; or **fewer partitions**, so that large tables exist at all, which is
+    [ADR 0013](0013-parallel-execution.md)'s decision rather than this one's.
+  - Correctness, for the record: the table answers identically once wired in — 2733 tests with it in the pipeline —
+    but it took a second round to get there. Nine differential cases against the grouper passed a version that
+    failed **26** integration tests, because a reused pack buffer kept a row position's NULL bit from an earlier
+    batch and collapsed distinct keys into the NULL group. A differential test over single batches cannot see that;
+    the engine's own suite saw it immediately.
 - **For now:** GROUP BY keeps `arrow::compute::Grouper`. The engine's other levers (partitioned merge, routing,
   partition top-N, dependent keys) stay as they are and carry over to the new table.
 - **When the work starts:** it begins with that micro benchmark and the prototype's lessons:
