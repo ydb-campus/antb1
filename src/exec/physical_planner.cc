@@ -150,20 +150,28 @@ std::vector<plan::Predicate> FiltersOnScan(const plan::LogicalNodePtr& node) {
 // part's statistics of that key live under (exec::PartMayBeat), or empty when there are none to
 // read.
 //
-// Only a chain of Filters over the scan qualifies, exactly as FiltersOnScan requires for the same
-// reason: a Filter keeps its input's columns, so the key's index is still the scan's output column,
-// while a Compute or a Project may compute the key or move it, and above a join the column belongs
-// to the join. Anything else and the top-N simply reads every part, as it did before.
+// The pipeline must be the scan itself or nothing but Filters over it -- every node from its top
+// down to the scan -- exactly as FiltersOnScan requires, and for the same reason: a Filter keeps
+// its input's columns, so the key's index is still the scan's output column. Every other node moves
+// them. A Compute appends, a Project may reorder or drop, and a join prepends the columns of the
+// input it does not probe, so above a build-on-the-left join the key's index is the probe's
+// position plus the build's width. Taking `scan->fields[index]` there reads another column's
+// statistics and prunes parts that hold the answer, so none of them may qualify.
+//
+// The key's type must be one part statistics exist for as well (ParquetTable::part_stats keeps them
+// for the integer types and DATE, and for nothing else). A VARCHAR or DOUBLE key would read no
+// statistics and prune nothing, so the top-N does not take the bound's cost for it either.
 std::optional<int> LeadingKeyField(const plan::LogicalNodePtr& node, const plan::SortKey& key) {
   const plan::ScanNode* scan = PipelineScan(node);
-  if (scan == nullptr || key.column.index < 0) {
+  if (scan == nullptr || key.column.index < 0 ||
+      !(plan::IsInteger(key.column.type) || key.column.type == plan::LogicalType::kDate)) {
     return std::nullopt;
   }
-  std::vector<const plan::LogicalNode*> chain;  // top to scan
+  std::vector<const plan::LogicalNode*> chain;  // the top down to the scan
   for (const plan::LogicalNode* n = node.get(); n != nullptr; n = PipelineInput(*n)) {
     chain.push_back(n);
   }
-  for (std::size_t i = 1; i + 1 < chain.size(); ++i) {  // between the top and the scan
+  for (std::size_t i = 0; i + 1 < chain.size(); ++i) {  // the top included, the scan not
     if (!std::holds_alternative<plan::FilterNode>(*chain[i])) {
       return std::nullopt;
     }

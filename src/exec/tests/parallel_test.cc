@@ -1137,6 +1137,41 @@ TEST_F(PartOperatorsTest, TopNSkipsPartsItsBoundRulesOut) {
     EXPECT_EQ(pruned(profile), 0);
     EXPECT_EQ(read(table).size(), static_cast<std::size_t>(kParts));
   }
+  // A node that is not a Filter between the top-N and the scan moves the columns, so the key's
+  // index is no longer the scan's and its statistics belong to another column. Pruning by those
+  // would skip the parts that hold the answer: a Project that swaps x and y here would have the key
+  // (y, index 0 of the Project) read x's statistics. Nothing may be skipped, and the rows must be
+  // the five smallest y, which live in part 0 while x's smallest live there too -- so a wrong field
+  // is not enough to notice, and the answer is checked against the serial top-N instead.
+  {
+    const auto table = Table();
+    const auto x = Column(0, "x", LogicalType::kBigInt);
+    const auto y = Column(2, "y", LogicalType::kBigInt);
+    // Project(y, x) over the scan, so the key below is the Project's column 0, which is y.
+    const auto project = Node(plan::ProjectNode{.input = Scan(table), .columns = {y, x}});
+    const auto sort = Node(plan::SortNode{
+        .input = project,
+        .keys = {{.column = Column(0, "y", LogicalType::kBigInt), .descending = true}}});
+    ProfileNode profile;
+    auto op = BuildPhysicalPlan(
+        PlanOf(Node(plan::LimitNode{.input = sort, .limit = 5, .offset = 0}), 2), &profile);
+    ASSERT_TRUE(op.ok()) << op.status().ToString();
+    ExecContext ctx{.pool = arrow::default_memory_pool(), .batch_size = 3, .threads = 1};
+    const auto rows = Drain(**op, ctx);
+    ASSERT_TRUE(rows.ok()) << rows.status().ToString();
+    EXPECT_EQ(pruned(profile), 0);
+    EXPECT_EQ(read(table).size(), static_cast<std::size_t>(kParts));
+    // DESC on y: the largest five of 1..139 that are not multiples of 5, in the last parts -- the
+    // ones a wrong field's statistics would have skipped. The rows come in batches of 3.
+    std::vector<int64_t> got;
+    for (const auto& chunk : (*rows)->column(0)->chunks()) {
+      const auto& values = static_cast<const arrow::Int64Array&>(*chunk);
+      for (int64_t i = 0; i < values.length(); ++i) {
+        got.push_back(values.Value(i));
+      }
+    }
+    EXPECT_EQ(got, std::vector<int64_t>({139, 138, 137, 136, 134}));
+  }
   // Four threads: the window the scheduler keeps full means the first parts are read before any
   // bound exists, so fewer are skipped -- but never none, and never a row of the answer.
   {
