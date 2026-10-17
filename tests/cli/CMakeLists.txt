@@ -746,7 +746,11 @@ string(
   "[[]rows=3 batches=1 time=${_d} self=${_d} sort=${_d}[]]\n"
   "    PartGroupAggregate GroupAggregate keys=[[]RegionID[]] COUNT[(][*][)] top-N per partition keep=3  "
   "[[]rows=192 batches=[0-9]+ time=${_d} parts=11 skipped=0 part_time=${_d} wait=${_d} "
-  "lanes_tail=${_d} build=${_d} groups=4357[]]\n"
+  # local_groups is each part's own group count summed, so it exceeds `groups`, the distinct
+  # count over the whole table: the parts hold the same key in more than one of their tables.
+  # routed_path is absent here because no part of this fixture routes (no raw_parts either).
+  "lanes_tail=${_d} build=${_d} groups=4357 local_groups=[0-9]+ local_path=${_d} "
+  "local_rows=[0-9]+[]]\n"
   "      Filter IsMobile = 1  [[]rows=5064 batches=11 parts=11 time=${_d} [(]summed over parts[)] "
   "self=${_d}[]]\n"
   "        Scan table=t source=parquet[(]files=4, rows=10000[)] columns=[[]RegionID, IsMobile[]], "
