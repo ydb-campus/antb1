@@ -3,6 +3,7 @@
 // the numbers from main. Numbers never gate a PR. Inputs are synthetic (splitmix64), never
 // ClickBench data.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -591,14 +592,24 @@ BENCHMARK(BM_JoinTableProbe)->Arg(0)->Arg(1)->Unit(benchmark::kMillisecond);
 constexpr int64_t kGroupRows =
     int64_t{4} * 1024 * 1024;  // 64 batches of 64Ki rows, enough for 4 M groups
 
+// The rows a group count needs: kGroupRows, or one row per group once there are more groups than
+// that. ClickBench's grouped queries reach 18-100 M groups, well past the 4 M the gates of
+// docs/adr/0019-own-aggregation-hash-table.md name, and a table's cost per row is not flat in its
+// size -- which is the point of measuring the curve rather than one point on it.
+int64_t GroupRowsFor(int64_t groups) {
+  return arrow::bit_util::RoundUpToPowerOf2(std::max(kGroupRows, groups), kBatchSize);
+}
+
 // Which key columns a shape groups by. The gate's four: one and two fixed-width keys, a string, and
 // a fixed-width key beside a string.
 enum class GroupShape : std::uint8_t { kInt64, kInt64Int32, kString, kInt64String };
 
-// kGroupRows rows of `shape`'s key columns, in 64Ki-row batches, with keys over `groups` values; an
+// `rows` rows of `shape`'s key columns, in 64Ki-row batches, with keys over `groups` values; an
 // empty vector if they cannot be built. Each row's keys come from one group id, so a shape's
-// columns agree on which group a row belongs to and the group count is the id count.
-arrow::RecordBatchVector GroupInput(GroupShape shape, int64_t groups) {
+// columns agree on which group a row belongs to and the group count is the id count. `rows` is at
+// least `groups` (GroupRowsFor), so every group is reached and the count the grouper reports is the
+// argument exactly -- which the `groups` counter shows.
+arrow::RecordBatchVector GroupInput(GroupShape shape, int64_t groups, int64_t rows) {
   arrow::FieldVector fields;
   switch (shape) {
     case GroupShape::kInt64:
@@ -622,7 +633,7 @@ arrow::RecordBatchVector GroupInput(GroupShape shape, int64_t groups) {
   // An odd stride modulo the count: every group is visited (kGroupRows is a power of two, so any
   // odd stride is coprime with it) and consecutive rows land far apart, as a random id would.
   constexpr uint64_t kStride = 0x9E3779B1ULL;
-  for (int64_t start = 0; start < kGroupRows; start += kBatchSize) {
+  for (int64_t start = 0; start < rows; start += kBatchSize) {
     arrow::Int64Builder keys;
     arrow::Int32Builder seconds;
     arrow::BinaryBuilder strings;
@@ -661,7 +672,8 @@ arrow::RecordBatchVector GroupInput(GroupShape shape, int64_t groups) {
 // One grouper over every batch, as GroupTable::Consume does per part.
 void GroupKeys(benchmark::State& state, GroupShape shape) {
   const int64_t groups = state.range(0);
-  const arrow::RecordBatchVector batches = GroupInput(shape, groups);
+  const int64_t rows = GroupRowsFor(groups);
+  const arrow::RecordBatchVector batches = GroupInput(shape, groups, rows);
   if (batches.empty()) {
     state.SkipWithError("cannot build the grouping input");
     return;
@@ -690,8 +702,13 @@ void GroupKeys(benchmark::State& state, GroupShape shape) {
     made = (*grouper)->num_groups();
     benchmark::DoNotOptimize(made);
   }
-  state.SetItemsProcessed(state.iterations() * kGroupRows);
+  state.SetItemsProcessed(state.iterations() * rows);
   state.counters["groups"] = static_cast<double>(made);
+  state.counters["rows"] = static_cast<double>(rows);
+  // What the curve is about: the cost of one row at this table size.
+  state.counters["ns_per_row"] =
+      benchmark::Counter(static_cast<double>(rows), benchmark::Counter::kIsIterationInvariantRate |
+                                                        benchmark::Counter::kInvert);
 }
 
 void BM_GroupInt64(benchmark::State& state) { GroupKeys(state, GroupShape::kInt64); }
@@ -699,8 +716,16 @@ void BM_GroupInt64Int32(benchmark::State& state) { GroupKeys(state, GroupShape::
 void BM_GroupString(benchmark::State& state) { GroupKeys(state, GroupShape::kString); }
 void BM_GroupInt64String(benchmark::State& state) { GroupKeys(state, GroupShape::kInt64String); }
 
-// The gate's three counts: cached, past cache, and about one row a group.
-#define ANTB1_GROUP_COUNTS Arg(1000)->Arg(1024 * 1024)->Arg(4 * 1024 * 1024)
+// The gate's three counts (1000, 1 M, 4 M: cached, past cache, about one row a group) with the
+// steps between and above them, so the shape of the cost per row is visible rather than inferred.
+// 16 M is ClickBench's own range (q33 groups 18 M URLs, q32 100 M pairs).
+#define ANTB1_GROUP_COUNTS   \
+  Arg(1000)                  \
+      ->Arg(16 * 1024)       \
+      ->Arg(256 * 1024)      \
+      ->Arg(1024 * 1024)     \
+      ->Arg(4 * 1024 * 1024) \
+      ->Arg(16 * 1024 * 1024)
 BENCHMARK(BM_GroupInt64)->ANTB1_GROUP_COUNTS->Unit(benchmark::kMillisecond);
 BENCHMARK(BM_GroupInt64Int32)->ANTB1_GROUP_COUNTS->Unit(benchmark::kMillisecond);
 BENCHMARK(BM_GroupString)->ANTB1_GROUP_COUNTS->Unit(benchmark::kMillisecond);
