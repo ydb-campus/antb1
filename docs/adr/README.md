@@ -27,7 +27,7 @@ may land first, in a docs-only PR (0013, 0019, 0021-0025).
 | [0016](0016-late-materialization.md) | Late materialization of top-N columns | Proposed |
 | [0017](0017-allocator-keeps-memory.md) | The allocator keeps the memory a query frees | Proposed |
 | [0018](0018-dependent-group-keys.md) | GROUP BY keys that are functions of other keys | Proposed |
-| [0019](0019-own-aggregation-hash-table.md) | An aggregation hash table of our own, scheduled for later | Proposed (deferred) |
+| [0019](0019-own-aggregation-hash-table.md) | An aggregation hash table of our own | Proposed |
 | [0020](0020-filter-pushdown.md) | Filter pushdown into the scan | Proposed |
 | [0021](0021-decimal-semantics.md) | DECIMAL semantics as in DuckDB | Accepted |
 | [0022](0022-joins-and-query-blocks.md) | Joins, query blocks and uncorrelated subqueries | Accepted |
