@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792181185670,
+  "lastUpdate": 1792205992787,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -9288,6 +9288,186 @@ window.BENCHMARK_DATA = {
             "value": 122.9173505714292,
             "unit": "ms/iter",
             "extra": "iterations: 7\ncpu: 122.90931728571434 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "877506c5b9e7317198b5af7141a931266d7f9898",
+          "message": "test(bench): the grouping baseline ADR 0019's gates are written against (#158)\n\n## Summary\n\n[ADR 0019](../blob/main/docs/adr/0019-own-aggregation-hash-table.md)\nproposes an aggregation hash table\nof our own and states its gates in terms of a micro benchmark: **≥1.3×\n`arrow::compute::Grouper` on\nevery key shape (int64, int64+int32, string, int64+string) at 1000, 1 M\nand 4 M groups, one thread**.\n\n**That benchmark did not exist.** `bench/micro_bench.cc` has no grouping\ncase at all, so the gates had\nnothing to be measured against. This adds it, over the grouper, *before*\nany table exists — so the\nbaseline is on record and anyone can check the next PR's claims against\nit.\n\nCloses #\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [x] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## The baseline\n\n4 Mi rows an iteration in 64Ki-row batches, one thread, this host:\n\n| key shape | 1 000 groups | 1 M | 4 M |\n| --- | ---: | ---: | ---: |\n| int64 | **12.2 ms** (345 M rows/s) | 30.4 ms | 91.7 ms |\n| int64 + int32 | 13.4 ms (313 M/s) | 39.0 ms | 115 ms |\n| string | 29.1 ms (144 M/s) | 71.5 ms | 171 ms |\n| int64 + string | 32.5 ms (129 M/s) | 78.0 ms | 168 ms |\n\nSo the gate's twelve bars are 1.3× of those — e.g. int64 at 1000 groups\nmust come in under 9.4 ms.\n\nTwo things the baseline already says:\n\n- **A string key costs about 2.4× an int64 one at every count.** That is\nthe layout ADR 0027's S2\nproposes (size and a four-byte prefix in the first eight bytes) and\nwhich belongs inside this table\n  because `arrow::compute::Grouper` rejects view key types outright.\n- **The 1000-group case runs at 345 M rows/s** — Arrow's SIMD tag\nprobing over a table that fits in\ncache. That is exactly where ADR 0019's prototype measured\n**0.22–0.70×** and cost the project its\nend-to-end result (2.3% overall; Q8, Q9 and Q15 each 7–10% *slower*).\n**It is the bar to clear first,\nnot the 4 M one**, and the benchmark is ordered so that is the first\nnumber you see.\n\n## Verification\n\n```text\n$ pixi run ci\n100% tests passed out of 2723\n\n$ pixi run release                 # the preset that smoke-tests the benchmarks\n100% tests passed out of 2724      <- includes bench.micro.smoke\n\n$ pixi run lint\nshellcheck (shell) ... Failed      <- 36 pre-existing SC2218 in two .sh files this does not touch;\n                                      osx-arm64 only, green on CI\n... every other leg .. Passed\n```\n\n`bench/` is explicitly not a gate (\"Numbers never gate a PR\"), so this\nchanges no behaviour and cannot\nregress anything. Per-file `clang-tidy` reports 25 findings for this\nfile against **21 on `main`**; the\nfour added are the `BM_Group*` function names, which Google Benchmark's\nconvention requires and which\nevery existing `BM_*` in the file shares. `bench/` is not in the tidy\nleg (CI is green on `main` with\nthose 21).\n\n### One input detail worth a sentence\n\nRows, not groups, are what an iteration costs, so every shape reads the\nsame 4 Mi rows and the group\ncount is the argument. The ids come from a multiplication by an odd\nstride modulo the count, which\n**visits every group exactly** — my first attempt used a random id and\nreached only **2.65 M of 4 M**,\nand the gate names 4 M. The `groups` counter reports what the grouper\nactually made, so the input's\nshape is checkable from the output rather than trusted.\n\n## Checklist\n\n- [x] `pixi run check` passes locally — except the pre-existing\nosx-arm64 shellcheck findings above\n- [x] Tests cover the change — `bench.micro.smoke` in the release preset\n- [x] Docs updated: none needed. No SQL, CLI, task or architecture\nchange; ADR 0019 already specifies\n      these gates and this is the instrument for them.\n- [x] No ClickBench-derived data is committed — the input is synthetic,\nas the file's other cases are\n- [x] Nothing derived from TPC-H is committed (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) — none in\nthis PR\n\n## What comes next, and what you still need to decide\n\nThe plan is: this benchmark, then the table as a **drop-in for the\ngrouper's role only** — same\n`group_ids` output, `GroupedAggregateState` untouched — which is where\nthe 1.3× question gets answered\nfor a fraction of the diff that ADR 0019's full design direction\nimplies. Strings, inline states,\nCOUNT(DISTINCT) and the undecoded merge follow, each on its own\nmeasurement.\n\n**ADR 0019's status is still `Proposed (deferred: the work is scheduled\nfor a later optimization\nround)`.** Nothing beyond this benchmark can land until that changes,\nand AGENTS.md says to ask before\nan ADR status change — so that edit is yours. Three amendments are also\nworth making when you do: the\npremise re-measured (ClickBench at full scale now puts **13.80 s of the\n15.39 s gap in GROUP BY\nqueries**, with q32–q34 peaking above 11 GB); COUNT(DISTINCT) by an\nextra grouping level rather than a\nvariable-size per-group state; and the fact that\n`GroupedCountDistinct::MergeGroups` is a **pre-existing\ndata race** TSan reports on clean `main`, recorded nowhere in the repo.\n\n## AI assistance\n\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5)\nre-measured ADR 0019's premise against\nthe full ClickBench dataset before starting, wrote the benchmark, and\ncaught that its own first\n      input generator missed the group count the gate names.\n- Accountable human (has read and understands the whole diff): @hor911\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-17T05:57:36+03:00",
+          "tree_id": "7690d86ce61e1325109ffc2ee9cde5190f64ac3e",
+          "url": "https://github.com/ydb-campus/antb1/commit/877506c5b9e7317198b5af7141a931266d7f9898"
+        },
+        "date": 1792205991507,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 2466.6863658976768,
+            "unit": "ns/iter",
+            "extra": "iterations: 283429\ncpu: 2466.165311241969 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 58728.638908639914,
+            "unit": "ns/iter",
+            "extra": "iterations: 11252\ncpu: 58726.47253821543 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 65632.02049602075,
+            "unit": "ns/iter",
+            "extra": "iterations: 10685\ncpu: 65630.06279831541 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 239806.78855380893,
+            "unit": "ns/iter",
+            "extra": "iterations: 2918\ncpu: 239760.32282385192 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 236413.6708305175,
+            "unit": "ns/iter",
+            "extra": "iterations: 2962\ncpu: 236386.06617150558 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 1332802.3371428528,
+            "unit": "ns/iter",
+            "extra": "iterations: 525\ncpu: 1332802.5352380956 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 27.700473639999927,
+            "unit": "ms/iter",
+            "extra": "iterations: 25\ncpu: 27.69663768000001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 26.64674550000038,
+            "unit": "ms/iter",
+            "extra": "iterations: 26\ncpu: 26.646365499999995 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 116.90282719999914,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 116.89055199999991 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 8.125189476744335,
+            "unit": "ms/iter",
+            "extra": "iterations: 86\ncpu: 8.124588965116274 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 10.188899695652045,
+            "unit": "ms/iter",
+            "extra": "iterations: 69\ncpu: 10.188052942029001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 24.92458400000024,
+            "unit": "ms/iter",
+            "extra": "iterations: 28\ncpu: 24.920530607142815 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 0.7817344284116186,
+            "unit": "ms/iter",
+            "extra": "iterations: 894\ncpu: 0.7816499809843402 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 47.17709621428615,
+            "unit": "ms/iter",
+            "extra": "iterations: 14\ncpu: 47.17090799999988 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1000",
+            "value": 15.295854239130582,
+            "unit": "ms/iter",
+            "extra": "iterations: 46\ncpu: 15.295228891304344 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1048576",
+            "value": 49.480149142857904,
+            "unit": "ms/iter",
+            "extra": "iterations: 14\ncpu: 49.46720592857139 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/4194304",
+            "value": 216.80164866666965,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 216.76957400000003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1000",
+            "value": 19.898368833333773,
+            "unit": "ms/iter",
+            "extra": "iterations: 36\ncpu: 19.89503236111107 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1048576",
+            "value": 65.04288419999966,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 65.02545800000021 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/4194304",
+            "value": 260.19768666666704,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 260.1721173333331 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1000",
+            "value": 32.229375318182335,
+            "unit": "ms/iter",
+            "extra": "iterations: 22\ncpu: 32.226754409090965 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1048576",
+            "value": 95.8214120000004,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 95.80413957142855 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/4194304",
+            "value": 321.79292050000186,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 321.78011599999934 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1000",
+            "value": 38.974499944444574,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 38.97045850000009 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1048576",
+            "value": 112.37421983333225,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 112.36448766666682 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/4194304",
+            "value": 344.26328050000166,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 344.2141589999999 ms\nthreads: 1"
           }
         ]
       }
