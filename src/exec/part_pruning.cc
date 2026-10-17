@@ -100,6 +100,25 @@ bool PartMayMatch(const plan::Table& table, int64_t part, const std::vector<int>
   });
 }
 
+bool PartMayBeat(const plan::PartStats& stats, const plan::SortKey& key, const Int128& bound) {
+  // A NULL sorts before every value with NULLS FIRST, so a part that holds one always beats a bound
+  // taken from a row whose key is not NULL -- which is the only bound there is (ThresholdKey has no
+  // value for a NULL).
+  if (key.nulls_first && stats.null_count > 0) {
+    return true;
+  }
+  // No min or max: every value is NULL (part_stats keeps the counts either way), or the part is
+  // empty. Its NULLs sorting first is the only way it could beat the bound, and that is the case
+  // above, so what is left cannot.
+  if (!stats.min.has_value() || !stats.max.has_value()) {
+    return false;
+  }
+  // The part's best value in the key's direction, against the worst row the top-N keeps -- and not
+  // strictly: a row whose first key equals the bound can still come before that row on a later key,
+  // so only a part strictly worse on the first key holds nothing.
+  return key.descending ? *stats.max >= bound : *stats.min <= bound;
+}
+
 std::vector<int64_t> KeptParts(const plan::Table& table, const std::vector<int>& fields,
                                const std::vector<plan::Predicate>& predicates) {
   std::vector<int64_t> kept;

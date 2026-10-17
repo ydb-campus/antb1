@@ -33,6 +33,29 @@ int Order(const T& x, const T& y) {
   return static_cast<int>(y < x) - static_cast<int>(x < y);
 }
 
+// A row's value as a number, for the integer-valued types plan::Table::part_stats keeps statistics
+// for (ParquetTable::part_stats; DECIMAL and HUGEINT are deliberately not among them). Empty for a
+// NULL and for every other type, so a bound from one never compares with a part's statistics.
+std::optional<Int128> IntegerAt(const arrow::Array& values, int64_t row) {
+  if (values.IsNull(row)) {
+    return std::nullopt;
+  }
+  switch (values.type_id()) {
+    case arrow::Type::INT16:
+      return Int128{static_cast<const arrow::Int16Array&>(values).Value(row)};
+    case arrow::Type::INT32:
+      return Int128{static_cast<const arrow::Int32Array&>(values).Value(row)};
+    case arrow::Type::INT64:
+      return Int128{static_cast<const arrow::Int64Array&>(values).Value(row)};
+    case arrow::Type::UINT16:
+      return Int128{static_cast<const arrow::UInt16Array&>(values).Value(row)};
+    case arrow::Type::DATE32:
+      return Int128{static_cast<const arrow::Date32Array&>(values).Value(row)};
+    default:
+      return std::nullopt;
+  }
+}
+
 template <class ArrayType>
 int ComparePrimitive(const arrow::Array& a, int64_t i, const arrow::Array& b, int64_t j) {
   return Order(static_cast<const ArrayType&>(a).Value(i),
@@ -364,6 +387,28 @@ arrow::Status SortBuffer::Sort(arrow::MemoryPool* pool) {
   }
   sorted_ = true;
   return arrow::Status::OK();
+}
+
+arrow::Status SortBuffer::Tighten(arrow::MemoryPool* pool) {
+  // Fewer than `keep` rows is no bound at all: every row still fits, so no part can be ruled out.
+  // Compact is what sets the threshold, and Add clears `sorted_` whenever better rows arrive, so a
+  // buffer that is already sorted with a threshold has the tightest one its rows allow.
+  if (!keep_.has_value() || rows_ < *keep_ || (sorted_ && threshold_.has_value())) {
+    return arrow::Status::OK();
+  }
+  return Compact(pool);
+}
+
+std::optional<Int128> SortBuffer::ThresholdKey() const {
+  if (!threshold_.has_value()) {
+    return std::nullopt;
+  }
+  // KeyArrays holds the key columns in key order, so the first is the first sort key's.
+  const RowComparator::KeyArrays& keys = chunk_keys_[threshold_->chunk];
+  if (keys.empty() || keys.front() == nullptr) {
+    return std::nullopt;
+  }
+  return IntegerAt(*keys.front(), threshold_->row);
 }
 
 arrow::Status SortBuffer::Compact(arrow::MemoryPool* pool) {

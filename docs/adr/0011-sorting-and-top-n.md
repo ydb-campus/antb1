@@ -43,10 +43,35 @@ Accepted (with the maintainer-approved plan for GROUP BY, ORDER BY and COUNT(DIS
   ties included. On the full ClickBench data Q32 (100 M groups) went from 2.43 s to 1.60 s: the serial top-N over
   every group and the building of rows no one reads are gone.
 
+- **A top-N skips the parts its own bound rules out** (amended 2026-10-17): a part holds a row the top-N can use
+  only if that row beats the worst row it already keeps, and where the first sort key is an integer-valued column of
+  the scan, the part's footer statistics answer that before anything is read. `SortBuffer` already knows the bound —
+  `threshold_`, the last of the first `limit + offset` rows, which `Add` drops arriving rows against — so
+  `Tighten` establishes it on demand (each part contributes at most that many rows, far too few to reach `Add`'s own
+  compaction) and `ThresholdKey` reads the first key's value from it. `PartTopNOperator` publishes it after every
+  merge; each part reads it once before it runs and is skipped entirely when `exec::PartMayBeat` rules it out: no
+  scan, no decoding, no filtering. This extends [ADR 0020](0020-filter-pushdown.md)'s part pruning from static to
+  dynamic — the test cannot be made when the plan is, because the bound depends on the rows already read.
+  Conservative in every direction: a part is ruled out only when *strictly* worse on the first key, since one that
+  ties may still come first on a later key (`ORDER BY a, b`); `NULLS FIRST` with any NULL never prunes; and the
+  pipeline must be the scan or nothing but Filters over it, as `FiltersOnScan` requires and for the same reason —
+  every other node moves the columns, so the key's index would no longer be the scan's and another column's
+  statistics would prune the parts holding the answer. A key whose type has no statistics (VARCHAR, DOUBLE) keeps no
+  bound at all. On the full ClickBench data the three `ORDER BY <integer key> LIMIT` queries fell 37–44%, two of
+  them reading 59 and 52 of 226 parts; they were the only queries of the 43 to move outside a ±8% band and none was
+  slower.
+
 ## Consequences
 
 - Follow-up: a top-N over table parts reads the columns only the result needs for the result's rows alone
   ([ADR 0016](0016-late-materialization.md)).
+- A part that the 2026-10-17 pruning skips is not read, so a read error inside it is not reported. Static predicate
+  pruning has always had that property; what is new is that with threads it depends on how many parts have merged
+  when a part is scheduled, so over a corrupt file a query may fail on one run and not the next. Accepted: not
+  reading what provably cannot contribute is the point, and the alternative is to read every part.
+- Parts are still dispatched in index order with a sliding window, so the first wave is never pruned. Ordering them
+  by their minimum would prune more but serialises what currently saturates the threads; that needs its own
+  decision.
 - `ORDER BY` on columns, aliases and aggregates, `ASC`/`DESC`, `NULLS FIRST`/`LAST`, `LIMIT` and `OFFSET` answer like
   DuckDB up to the order of tied rows.
 - The test harness accepts any order of tied rows: it runs an augmented query on DuckDB (the `ORDER BY` keys

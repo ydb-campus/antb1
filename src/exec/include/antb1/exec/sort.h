@@ -11,6 +11,7 @@
 #include <arrow/status.h>
 #include <arrow/type_fwd.h>
 
+#include "antb1/common/int128.h"
 #include "antb1/exec/memory_budget.h"
 #include "antb1/exec/operator.h"
 #include "antb1/plan/logical_plan.h"
@@ -91,6 +92,16 @@ class SortBuffer {
   arrow::Status Merge(SortBuffer& other, arrow::MemoryPool* pool);
   // Sorts the rows; afterwards num_rows() is at most keep.
   arrow::Status Sort(arrow::MemoryPool* pool);
+  // Establishes the bound ThresholdKey() reads, so that a caller can ask for it between Adds: with
+  // `keep` and at least that many rows, the last of the first `keep` rows of the order so far. A
+  // no-op without `keep`, with fewer rows, or when one is already established.
+  arrow::Status Tighten(arrow::MemoryPool* pool);
+
+  // The first sort key's value in the last kept row: what a row has to beat to enter the top-N, so
+  // a part whose values are all worse holds nothing this buffer wants (exec::PartMayBeat). Empty
+  // until a compaction or Tighten has established one, when the key is not integer-valued (only
+  // those have part statistics to compare with) and when its value in that row is NULL.
+  [[nodiscard]] std::optional<Int128> ThresholdKey() const;
 
   // The number of rows (after Sort: the sorted rows).
   [[nodiscard]] int64_t num_rows() const { return rows_; }

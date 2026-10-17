@@ -146,6 +146,42 @@ std::vector<plan::Predicate> FiltersOnScan(const plan::LogicalNodePtr& node) {
   return predicates;
 }
 
+// The table field of `key`'s column, for a top-N whose part pipeline's top is `node`: the field a
+// part's statistics of that key live under (exec::PartMayBeat), or empty when there are none to
+// read.
+//
+// The pipeline must be the scan itself or nothing but Filters over it -- every node from its top
+// down to the scan -- exactly as FiltersOnScan requires, and for the same reason: a Filter keeps
+// its input's columns, so the key's index is still the scan's output column. Every other node moves
+// them. A Compute appends, a Project may reorder or drop, and a join prepends the columns of the
+// input it does not probe, so above a build-on-the-left join the key's index is the probe's
+// position plus the build's width. Taking `scan->fields[index]` there reads another column's
+// statistics and prunes parts that hold the answer, so none of them may qualify.
+//
+// The key's type must be one part statistics exist for as well (ParquetTable::part_stats keeps them
+// for the integer types and DATE, and for nothing else). A VARCHAR or DOUBLE key would read no
+// statistics and prune nothing, so the top-N does not take the bound's cost for it either.
+std::optional<int> LeadingKeyField(const plan::LogicalNodePtr& node, const plan::SortKey& key) {
+  const plan::ScanNode* scan = PipelineScan(node);
+  if (scan == nullptr || key.column.index < 0 ||
+      !(plan::IsInteger(key.column.type) || key.column.type == plan::LogicalType::kDate)) {
+    return std::nullopt;
+  }
+  std::vector<const plan::LogicalNode*> chain;  // the top down to the scan
+  for (const plan::LogicalNode* n = node.get(); n != nullptr; n = PipelineInput(*n)) {
+    chain.push_back(n);
+  }
+  for (std::size_t i = 0; i + 1 < chain.size(); ++i) {  // the top included, the scan not
+    if (!std::holds_alternative<plan::FilterNode>(*chain[i])) {
+      return std::nullopt;
+    }
+  }
+  if (std::cmp_greater_equal(key.column.index, scan->fields.size())) {
+    return std::nullopt;
+  }
+  return scan->fields[static_cast<std::size_t>(key.column.index)];
+}
+
 // A join as a hash join runs it: its probe and build inputs, and their keys (a key's left column is
 // on the left input, its right column on the right one; a one-row join has none).
 struct JoinShape {
@@ -669,6 +705,14 @@ struct Builder {
         if (__builtin_add_overflow(*node.limit, node.offset, &keep)) {
           keep = std::numeric_limits<int64_t>::max();
         }
+        // The first sort key's table field, when its statistics can skip a part as the top-N runs.
+        const std::optional<int> key_field = LeadingKeyField(sort->input, sort->keys.front());
+        const auto pruning = [&](const std::shared_ptr<const std::vector<int64_t>>& kept) {
+          return key_field.has_value()
+                     ? std::optional(
+                           TopNPruning{.table = scan->table, .field = *key_field, .parts = kept})
+                     : std::nullopt;
+        };
         // Late materialization (ADR 0016): the parts read only the columns the pipeline and the
         // keys use, when at most half of the parts can own a row of the result.
         if (auto split = LateSplit(sort->input, *scan, sort->keys);
@@ -691,15 +735,17 @@ struct Builder {
           if (slot != nullptr) {
             slot->set_detail(std::format("{} late={} columns", detail, columns.slots.size()));
           }
-          return WithBuilds(std::make_unique<PartTopNOperator>(
-                                std::move(narrow.pipeline), narrow.count, sample->output_schema(),
-                                sort->keys, *node.limit, node.offset, std::move(columns)),
-                            narrow.builds, slot);
+          return WithBuilds(
+              std::make_unique<PartTopNOperator>(
+                  std::move(narrow.pipeline), narrow.count, sample->output_schema(), sort->keys,
+                  *node.limit, node.offset, std::move(columns), pruning(narrow.kept)),
+              narrow.builds, slot);
         }
-        return WithBuilds(std::make_unique<PartTopNOperator>(std::move(parts.pipeline), parts.count,
-                                                             sample->output_schema(), sort->keys,
-                                                             *node.limit, node.offset),
-                          parts.builds, slot);
+        return WithBuilds(
+            std::make_unique<PartTopNOperator>(std::move(parts.pipeline), parts.count,
+                                               sample->output_schema(), sort->keys, *node.limit,
+                                               node.offset, std::nullopt, pruning(parts.kept)),
+            parts.builds, slot);
       }
       Name("TopN", detail);
       if (std::holds_alternative<plan::GroupAggregateNode>(*sort->input)) {
