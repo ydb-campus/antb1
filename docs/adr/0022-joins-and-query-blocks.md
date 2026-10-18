@@ -601,7 +601,8 @@ Accepted (with the maintainer-approved roadmap for joins, query blocks and uncor
   - pressure measured without the pinned builds, until a memory-limit test or a run at SF 10 or above shows probes
     running one part at a time — **a run at SF 100 showed a build, not a probe, serialized this way;
     [ADR 0026](0026-join-performance.md)'s C4**;
-  - materialized CTEs, until a profile shows that the recomputation dominates;
+  - materialized CTEs, until a profile shows that the recomputation dominates -- **fired 2026-10-18 at SF 100;
+    [ADR 0030](0030-shared-sub-plans.md)**;
   - filters implied by ORs and late materialization across joins, until profiles ask for them;
   - LEFT-to-INNER conversion, with IS NULL support and a profile that needs it;
   - spilling, until a target of SF 300 or above, or a runner with less memory than the builds need; until then a
@@ -794,6 +795,13 @@ docs/sql-subset.md sections it changes.
   CTE, a second scan costs one more scan and aggregation, and every optimizer pass would have to become aware of
   shared nodes (today a rebuild un-shares a DAG and prunes each path its own way). Deferred to its trigger
   (decision C8).
+  Update (2026-10-18): **the trigger fired, and this bullet's premise was too narrow** --
+  [ADR 0030](0030-shared-sub-plans.md) takes it up. A profile at SF 100 puts the recomputation at 49% of one query
+  and 37% of another, and **three** queries duplicate substantial work where this expected one: only Q15 is written
+  with a CTE, while Q11 repeats its `FROM` list in a `HAVING` subquery and Q2 in an unnested correlated one. So the
+  duplication is of sub-plans whatever syntax made them, and materialising CTEs alone would miss two of the three.
+  The objection about shared nodes stands and is what makes ADR 0030 share *after* the passes rather than teach
+  them about DAGs.
 - **Build-side output now** (right outer, right semi and right anti joins, which build on the preserved side): they
   need matched flags and a source that runs after the probe pipeline. DuckDB builds on the preserved side when it is
   the smaller one, but building on the side that is not preserved is correct, so this is performance only. Deferred
