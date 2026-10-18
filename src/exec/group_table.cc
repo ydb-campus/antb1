@@ -111,8 +111,7 @@ arrow::Result<std::vector<std::uint64_t>> KeyHashes(const arrow::compute::ExecBa
       // is NULL, is allowed to carry no values buffer at all, and this base is taken once for the
       // column rather than inside the row loop. GetValues gives nullptr for that column and
       // `value_of` is never called on it -- no row of it is valid.
-      const auto* base = column->data()->GetValues<std::uint8_t>(
-          1, static_cast<std::int64_t>(column->offset()) * width);
+      const auto* base = column->data()->GetValues<std::uint8_t>(1, column->offset() * width);
       MixKeyColumn(
           *column,
           [base, width](std::size_t row) {

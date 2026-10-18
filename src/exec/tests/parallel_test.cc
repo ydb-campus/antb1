@@ -1703,8 +1703,7 @@ TEST_F(PartOperatorsTest, KeyHashesOfASliceAreTheHashesOfThoseRows) {
       ASSERT_TRUE(sliced.ok()) << sliced.status().ToString();
       const auto whole = KeyHashes(arrow::compute::ExecBatch({column}, column->length()));
       ASSERT_TRUE(whole.ok()) << whole.status().ToString();
-      const std::vector<std::uint64_t> expected(
-          whole->begin() + static_cast<std::ptrdiff_t>(offset), whole->end());
+      const std::vector<std::uint64_t> expected(whole->begin() + offset, whole->end());
       EXPECT_EQ(*sliced, expected) << column->type()->ToString() << " from " << offset;
     }
   }
