@@ -24,6 +24,7 @@ antb1_add_module(
     heavy_hitters.cc
     outer_groups.cc
     group_table.cc
+    group_hash_table.cc
     grouped_aggregate_state.cc
     group_aggregate.cc
     join_table.cc
@@ -50,6 +51,7 @@ if(ANTB1_BUILD_TESTS)
       tests/row_count_test.cc
       tests/physical_planner_test.cc
       tests/grouped_aggregate_test.cc
+      tests/group_hash_table_test.cc
       tests/sort_test.cc
       tests/like_test.cc
       tests/scan_filter_test.cc
