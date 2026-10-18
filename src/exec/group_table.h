@@ -113,6 +113,12 @@ class GroupTable {
   // (to[i]), with part's first-seen keys, in chunks of at most kMaxMergeChunk groups.
   arrow::Status AddPartGroups(const GroupTable& part, std::span<const std::uint32_t> from,
                               std::span<const std::uint32_t> to, std::uint32_t after);
+  // The same groups, from the batch of part's keys this table has just consumed (row i the keys of
+  // the part group that became to[i]) rather than from part's first_keys_: what a part that keeps
+  // no first-seen keys has handed over already. One Take a column a chunk, where AddPartGroups
+  // needs two and a Concatenate to gather the same values out of part's chunks.
+  arrow::Status AddUniqueGroups(const arrow::compute::ExecBatch& keys,
+                                std::span<const std::uint32_t> to, std::uint32_t after);
   arrow::Status Account();
 
   std::vector<plan::BoundColumn> keys_;

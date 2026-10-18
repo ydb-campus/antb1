@@ -222,7 +222,9 @@ arrow::Status GroupTable::Merge(const GroupTable& part) {
     ids = std::static_pointer_cast<arrow::UInt32Array>(id_datum.make_array());
     group_map = IdsOf(*ids);
     const std::uint32_t after = grouper_->num_groups();
-    if (after > num_groups_) {
+    if (after > num_groups_ && !part.keep_first_keys_) {
+      ARROW_RETURN_NOT_OK(AddUniqueGroups(uniques, group_map, after));
+    } else if (after > num_groups_) {
       std::vector<std::uint32_t> every(group_map.size());
       std::ranges::iota(every, 0U);
       ARROW_RETURN_NOT_OK(AddPartGroups(part, every, group_map, after));
@@ -300,6 +302,39 @@ arrow::Status GroupTable::AddPartGroups(const GroupTable& part, std::span<const 
           arrow::compute::Take(slice, order, arrow::compute::TakeOptions::NoBoundsCheck(),
                                kernels_.get()));
       first.push_back(ordered.make_array());
+    }
+    ARROW_RETURN_NOT_OK(
+        AddGroups(num_groups_ + static_cast<std::uint32_t>(end - begin), std::move(first)));
+  }
+  return arrow::Status::OK();
+}
+
+arrow::Status GroupTable::AddUniqueGroups(const arrow::compute::ExecBatch& keys,
+                                          std::span<const std::uint32_t> to, std::uint32_t after) {
+  // The row of `keys` each new group's keys are in, by group: the grouper numbers new groups in an
+  // order of its own, not the order it first sees them, so they are placed per id as in Consume.
+  // Every new group has exactly one such row, since the keys of a part are unique.
+  std::vector<std::int64_t> positions(static_cast<std::size_t>(after - num_groups_), -1);
+  for (std::size_t i = 0; i < to.size(); ++i) {
+    if (to[i] >= num_groups_) {
+      positions[to[i] - num_groups_] = static_cast<std::int64_t>(i);
+    }
+  }
+  ANTB1_CHECK(std::ranges::none_of(positions, [](std::int64_t row) { return row < 0; }));
+  for (std::size_t begin = 0; begin < positions.size(); begin += kMaxMergeChunk) {
+    const std::size_t end = std::min(positions.size(), begin + kMaxMergeChunk);
+    arrow::Int64Builder indices(pool_);
+    ARROW_RETURN_NOT_OK(
+        indices.AppendValues(positions.data() + begin, static_cast<std::int64_t>(end - begin)));
+    ARROW_ASSIGN_OR_RAISE(const auto rows, indices.Finish());
+    std::vector<std::shared_ptr<arrow::Array>> first;
+    first.reserve(keys.values.size());
+    for (const arrow::Datum& column : keys.values) {
+      ARROW_ASSIGN_OR_RAISE(
+          const arrow::Datum taken,
+          arrow::compute::Take(column, rows, arrow::compute::TakeOptions::NoBoundsCheck(),
+                               kernels_.get()));
+      first.push_back(taken.make_array());
     }
     ARROW_RETURN_NOT_OK(
         AddGroups(num_groups_ + static_cast<std::uint32_t>(end - begin), std::move(first)));
@@ -460,6 +495,8 @@ arrow::Status GroupTable::MergePartition(const GroupTable& part, std::size_t par
     const std::uint32_t after = grouper_->num_groups();
     if (after > num_groups_ && !keep_first_keys_) {
       ARROW_RETURN_NOT_OK(AddGroups(after, {}));
+    } else if (after > num_groups_ && !part.keep_first_keys_) {
+      ARROW_RETURN_NOT_OK(AddUniqueGroups(part.partition_uniques_[partition], to, after));
     } else if (after > num_groups_) {
       ARROW_RETURN_NOT_OK(AddPartGroups(part, groups, to, after));
     }
