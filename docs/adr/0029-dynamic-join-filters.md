@@ -49,6 +49,16 @@ Proposed (draft: the measurement below is taken, the design is not built)
     aggregate. C5's estimates are, in its own words, "integer arithmetic over metadata"; no Parquet footer records
     this, and no static rule can derive it. **The information exists only at runtime, which is why the filter must be
     dynamic.**
+- **Which pruning mechanism can reach it, measured on the same query (2026-10-18).** The filter side's 6,398 keys
+  span **99.99% of the key domain**, so a single min/max interval from the build prunes **no row group at all**: it
+  is one interval covering everything. Testing each row group's *own* range against the key set is a different
+  question and prunes **1,337 of lineitem's 4,896 row groups (27%)**, over an average span of about 122,500 keys a
+  group. That 27% is structural rather than a property of this data: with `k` keys scattered over `g` row groups the
+  share that contains none is `e^(-k/g)`, which for 6,398 over 4,896 predicts 1,325 against the 1,337 measured. So
+  the reach of row-group pruning is **known in advance from two counts** -- 90% at 500 keys, 82% at 1,000, 27% at
+  6,398, nothing by 50,000 -- and it pays only where the build is small relative to the probe's row-group count. Only
+  a per-row test reaches the rest, which is why DuckDB's plan carries a Bloom filter here and not merely a range.
+  **A scattered key set is the case against min/max and the case for Bloom, not evidence against both.**
 - **The seam already exists, and it does not cross a module edge.** `plan::ScanFilter`
   (`src/plan/include/antb1/plan/table.h:48`) is an abstract class "implemented by exec, applied by tables that
   support it (`Table::supports_scan_filter`)", already documented as "thread-safe: the parts of a query apply one
@@ -66,10 +76,17 @@ Draft. What follows is the shape to build and measure, not a decision taken.
   knows its key column's exact contents. It publishes, per key column: the **min and max**, the **null count**, and —
   when the build is small enough to be worth it — a **blocked Bloom filter** over the key hashes it has already
   computed. The probe side's scan applies them as an extra `ScanFilter`.
-- **Two uses, in increasing cost.** Min/max prunes **whole row groups** from the Parquet footer, which is the
-  mechanism ADR 0020's pushdown already has and which decodes nothing at all for a pruned group. The Bloom filter
-  prunes **rows** within a surviving group, before the other columns of those rows are decoded — the order ADR 0020's
-  filtered scan already uses, predicate column first and the rest for survivors only.
+- **Three uses, not two, and they do not substitute for each other.** The measurement above separates them:
+  - a **min/max interval** prunes row groups from the footer, and reaches nothing once the keys are scattered. It is
+    two integers, so it is published anyway, but it is not worth a plan item of its own.
+  - **each row group's range against the key set** prunes whole row groups, decoding nothing for a pruned one. Its
+    reach is `e^(-k/g)` and therefore decidable before it runs. A Bloom filter cannot do this -- it tests points, not
+    ranges -- so this is its own mechanism and needs its own entry point: `ScanFilter::Apply` sees values a table has
+    already decoded, where this must be asked *before* the decode, against footer statistics. That is an addition to
+    `plan::Table`, which makes it the one item here with an interface change in it.
+  - a **per-row Bloom filter** prunes rows inside a surviving group, before that row's other columns are decoded --
+    the order ADR 0020's filtered scan already uses, predicate column first and the rest for survivors only. It is
+    the only mechanism that reaches a scattered key set, so on the query above it is the one that pays.
 - **Optional, in DuckDB's sense, and that is a correctness property.** A dynamic filter is a pure filter over rows
   the join would have dropped anyway. So:
   - a filter that is not ready when a batch is scanned is skipped, and that batch is filtered by the join as today;
@@ -117,15 +134,28 @@ lesson of [ADR 0027](0027-string-views.md)'s S1, which was planned as a win whos
   relation matches. In the query above that is 600,037,902 rows gathered becoming of the order of 44,786, with no
   runtime machinery whatsoever. Measure it first; if it lands, D1 and D2's remaining prize is the `lineitem` scan
   alone, which is the half DuckDB uses a Bloom filter for.
-- **D1, feat(exec): publish a completed build's key min/max, and prune row groups with it.** The cheap half of the
-  mechanism, reusing ADR 0020's footer pruning. Measured on the 22 at SF 100 and 14 threads, with ClickBench as the
-  no-change control. The gate is the queries whose profile shows a large `gather` under a selective join; if none of
-  them moves by 10%, D2 is not worth building.
-- **D2, feat(exec): a blocked Bloom filter over the build's keys, applied per row.** Only with D1's measurement in
-  hand, and only where D1's min/max proved too coarse — a key range that spans the whole column prunes no row group
-  at all, which is exactly the case a Bloom filter answers.
-- **D3, feat(exec): report what each filter pruned in `EXPLAIN ANALYZE`**, with D1, not after it.
+- **D1, perf(exec): publish a completed build's keys, and apply them per row with a blocked Bloom filter.** The
+  mechanism the measurement says pays, so it is first of the dynamic filters rather than last: it is the only one
+  that reaches a key set spanning its whole domain. The min/max interval is published with it, because it is two
+  integers and the row-group item needs it anyway. All the plumbing lives here -- publishing from a finished build,
+  the atomic readiness, the memory bound, and the probe side finding its filter -- which is why the cheaper-looking
+  item is not the smaller one. Measured on the 22 at SF 100 and 14 threads **after D0**, so that D0's win is not
+  counted twice, with ClickBench as the no-change control (no ClickBench query joins).
+- **D2, feat(plan+io): ask a table whether a row group can contain any published key.** The 27% the measurement
+  found, from about `g` binary searches over the sorted key set. It needs the new entry point named in the Decision,
+  since `ScanFilter::Apply` is handed values that have already been decoded, and a pruned row group is one that is
+  never decoded at all. Worth it only where `e^(-k/g)` is large, which the engine can evaluate before publishing
+  anything: both counts are known once the build finishes.
+- **D3, feat(exec): report what each filter pruned in `EXPLAIN ANALYZE`**, with D1, not after it. Rows and row groups
+  skipped, and whether the filter was ready — without it a filter that never fires and a filter that is never ready
+  are the same timing.
 - **D4, docs(adr): record what D0-D2 measured**, and either accept this ADR or defer it with the numbers.
+
+**The gate, stated so it cannot be read backwards.** An earlier draft of D1 gated the Bloom filter on min/max having
+moved a query by 10%, which is exactly wrong: min/max pruning nothing *is* the signal that the keys are scattered,
+and a scattered key set is what a Bloom filter is for. The gate is D1's own measurement on the queries whose profile
+shows a large `gather` or probe under a selective join, taken after D0; and D2's gate is `e^(-k/g)` on those same
+queries, which is arithmetic over two counts and needs no run at all.
 
 Deliberately out of scope: filters derived from a Parquet file's own Bloom filters, which are static and answer a
 different question; carrying a filter *between* queries; and late materialization, which is
