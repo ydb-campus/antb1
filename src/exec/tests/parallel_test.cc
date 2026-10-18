@@ -860,6 +860,71 @@ TEST_F(PartOperatorsTest, MergedGroupsComeInBoundedChunks) {
   EXPECT_TRUE(SameRows(*SortedRows(a), *SortedRows(b)));
 }
 
+// A part keeps its groups' first-seen key values only for a DOUBLE key, the one type whose
+// normalized value is not the value to output. Otherwise the merge takes the new groups' keys from
+// the uniques the part hands it anyway, which is the same gather from another source: the same
+// groups, the same keys and counts, in the same bounded chunks.
+TEST_F(PartOperatorsTest, MergingAPartWithoutFirstKeysGathersTheSameGroups) {
+  const auto x = Column(0, "x", LogicalType::kBigInt);
+  const auto s = Column(1, "s", LogicalType::kVarchar);
+  const std::vector<plan::AggregateCall> calls = {
+      {.kind = plan::AggKind::kCountStar, .arg = {}, .type = LogicalType::kBigInt}};
+  const auto schema =
+      arrow::schema({arrow::field("key0", arrow::int64()), arrow::field("key1", arrow::binary()),
+                     arrow::field("agg0", arrow::int64())});
+  constexpr int64_t kGroups = 150'000;
+  constexpr int64_t kBatch = 50'000;
+  // A part over kGroups groups, consumed in batches, keeping first-seen keys or not.
+  const auto part_over = [&](bool first_keys) {
+    auto part =
+        GroupTable::Make({x, s}, calls, 2, arrow::default_memory_pool(), nullptr, first_keys);
+    EXPECT_TRUE(part.ok()) << part.status().ToString();
+    for (int64_t start = 0; start < kGroups; start += kBatch) {
+      std::vector<std::optional<int64_t>> xs;
+      std::vector<std::optional<std::string>> ss;
+      xs.reserve(kBatch);
+      ss.reserve(kBatch);
+      for (int64_t i = start; i < start + kBatch; ++i) {
+        xs.emplace_back(kGroups - i);
+        ss.emplace_back(std::to_string(i % 97));
+      }
+      const auto batch = arrow::RecordBatch::Make(
+          arrow::schema({arrow::field("x", arrow::int64()), arrow::field("s", arrow::binary())}),
+          kBatch, {Int64s(xs), testing::Strings(ss)});
+      EXPECT_TRUE((*part)->Consume(*batch).ok());
+    }
+    return std::move(*part);
+  };
+  // Both parts merged into a table that does keep them, as a lane table does.
+  const auto merged_from = [&](const GroupTable& part) {
+    auto merged = GroupTable::Make({x, s}, calls, 2, arrow::default_memory_pool(), nullptr);
+    EXPECT_TRUE(merged.ok()) << merged.status().ToString();
+    EXPECT_TRUE((*merged)->Merge(part).ok());
+    EXPECT_EQ((*merged)->num_groups(), kGroups);
+    arrow::RecordBatchVector out;
+    while (true) {
+      auto chunk = (*merged)->NextChunk(schema);
+      EXPECT_TRUE(chunk.ok()) << chunk.status().ToString();
+      if (!chunk.ok() || *chunk == nullptr) {
+        return out;
+      }
+      EXPECT_TRUE((*chunk)->ValidateFull().ok());
+      out.push_back(*chunk);
+    }
+  };
+  const arrow::RecordBatchVector without = merged_from(*part_over(false));
+  const arrow::RecordBatchVector with = merged_from(*part_over(true));
+  std::vector<int64_t> sizes;
+  sizes.reserve(without.size());
+  for (const auto& chunk : without) {
+    sizes.push_back(chunk->num_rows());
+  }
+  EXPECT_EQ(sizes, (std::vector<int64_t>{65536, 65536, 18928}));  // more than one chunk, as above
+  const auto a = arrow::Table::FromRecordBatches(schema, without).ValueOrDie();
+  const auto b = arrow::Table::FromRecordBatches(schema, with).ValueOrDie();
+  EXPECT_TRUE(SameRows(*SortedRows(a), *SortedRows(b)));
+}
+
 // The partition of a group depends only on its key: the same on every run and build (with this
 // Arrow version), whatever the order of the groups or the number of threads. A change here changes
 // the order of GROUP BY results; update the golden only on purpose.

@@ -243,6 +243,17 @@ bool MayRouteRows(const std::vector<plan::BoundColumn>& keys,
 // look more distinct than the part).
 constexpr int64_t kRouteDecisionRows = int64_t{64} * 1024;
 
+// Whether a part's table has to keep its groups' first-seen key values, rather than let the merge
+// take them from the normalized keys it hands over anyway (GroupTable::AddUniqueGroups): only for
+// a DOUBLE key, the one type whose normalized value is not the value to output (-0.0 groups with
+// 0.0, every NaN with every other). A part that keeps them copies every new group's keys out of
+// every batch and holds them until it is merged, which for a VARCHAR key is the bytes of the key
+// twice over -- the grouper has them too.
+bool PartKeepsFirstKeys(const std::vector<plan::BoundColumn>& keys) {
+  return std::ranges::any_of(
+      keys, [](const plan::BoundColumn& key) { return key.type == plan::LogicalType::kDouble; });
+}
+
 }  // namespace
 
 // ---- PartGroupAggregateOperator ----
@@ -281,8 +292,9 @@ arrow::Status PartGroupAggregateOperator::Open(ExecContext& ctx) {
                   int64_t part, const std::atomic<bool>& stop) -> arrow::Result<PartTable> {
     const ProfileTimer part_time(profile, "part_time");
     auto groups = std::make_shared<PartGroups>();
-    ARROW_ASSIGN_OR_RAISE(
-        groups->table, GroupTable::Make(keys, aggregates, width, part_ctx.pool, part_ctx.budget));
+    ARROW_ASSIGN_OR_RAISE(groups->table,
+                          GroupTable::Make(keys, aggregates, width, part_ctx.pool, part_ctx.budget,
+                                           PartKeepsFirstKeys(keys)));
     GroupTable& table = *groups->table;
     // After its first kRouteDecisionRows rows (or batch), a part whose groups are more than 1/4 of
     // its rows stops aggregating on its own: its other rows go straight to the partitions. A part

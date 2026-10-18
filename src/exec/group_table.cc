@@ -20,6 +20,7 @@
 #include <arrow/util/hashing.h>
 
 #include "antb1/common/check.h"
+#include "antb1/common/narrow.h"
 #include "antb1/exec/grouped_aggregate_state.h"
 #include "antb1/exec/memory_budget.h"
 #include "antb1/plan/logical_plan.h"
@@ -222,7 +223,9 @@ arrow::Status GroupTable::Merge(const GroupTable& part) {
     ids = std::static_pointer_cast<arrow::UInt32Array>(id_datum.make_array());
     group_map = IdsOf(*ids);
     const std::uint32_t after = grouper_->num_groups();
-    if (after > num_groups_) {
+    if (after > num_groups_ && !part.keep_first_keys_) {
+      ARROW_RETURN_NOT_OK(AddUniqueGroups(uniques, group_map, after));
+    } else if (after > num_groups_) {
       std::vector<std::uint32_t> every(group_map.size());
       std::ranges::iota(every, 0U);
       ARROW_RETURN_NOT_OK(AddPartGroups(part, every, group_map, after));
@@ -300,6 +303,47 @@ arrow::Status GroupTable::AddPartGroups(const GroupTable& part, std::span<const 
           arrow::compute::Take(slice, order, arrow::compute::TakeOptions::NoBoundsCheck(),
                                kernels_.get()));
       first.push_back(ordered.make_array());
+    }
+    ARROW_RETURN_NOT_OK(
+        AddGroups(num_groups_ + static_cast<std::uint32_t>(end - begin), std::move(first)));
+  }
+  return arrow::Status::OK();
+}
+
+arrow::Status GroupTable::AddUniqueGroups(const arrow::compute::ExecBatch& keys,
+                                          std::span<const std::uint32_t> to, std::uint32_t after) {
+  // The row of `keys` each new group's keys are in, by group: the grouper numbers new groups in an
+  // order of its own, not the order it first sees them, so they are placed per id as in Consume.
+  // A row index, like a group, is a uint32: `keys` is one part's groups, or one partition of them.
+  const auto groups = static_cast<std::size_t>(after - num_groups_);
+  std::vector<std::uint32_t> positions(groups, 0);
+  std::size_t found = 0;
+  for (std::size_t i = 0; i < to.size(); ++i) {
+    if (to[i] >= num_groups_) {
+      positions[to[i] - num_groups_] = Narrow<std::uint32_t>(i);
+      ++found;
+    }
+  }
+  // Exactly one row per new group, since the keys of a part are unique: with as many rows found as
+  // there are new groups, every position was written.
+  ANTB1_CHECK(found == groups);
+  // One index array for every chunk, sliced rather than rebuilt: a chunk's Take reads its own rows
+  // out of it and a slice allocates nothing.
+  arrow::UInt32Builder indices(pool_);
+  ARROW_RETURN_NOT_OK(indices.AppendValues(positions));
+  ARROW_ASSIGN_OR_RAISE(const auto rows, indices.Finish());
+  for (std::size_t begin = 0; begin < groups; begin += kMaxMergeChunk) {
+    const std::size_t end = std::min(groups, begin + kMaxMergeChunk);
+    const std::shared_ptr<arrow::Array> chunk_rows =
+        rows->Slice(static_cast<std::int64_t>(begin), static_cast<std::int64_t>(end - begin));
+    std::vector<std::shared_ptr<arrow::Array>> first;
+    first.reserve(keys.values.size());
+    for (const arrow::Datum& column : keys.values) {
+      ARROW_ASSIGN_OR_RAISE(
+          const arrow::Datum taken,
+          arrow::compute::Take(column, chunk_rows, arrow::compute::TakeOptions::NoBoundsCheck(),
+                               kernels_.get()));
+      first.push_back(taken.make_array());
     }
     ARROW_RETURN_NOT_OK(
         AddGroups(num_groups_ + static_cast<std::uint32_t>(end - begin), std::move(first)));
@@ -460,6 +504,8 @@ arrow::Status GroupTable::MergePartition(const GroupTable& part, std::size_t par
     const std::uint32_t after = grouper_->num_groups();
     if (after > num_groups_ && !keep_first_keys_) {
       ARROW_RETURN_NOT_OK(AddGroups(after, {}));
+    } else if (after > num_groups_ && !part.keep_first_keys_) {
+      ARROW_RETURN_NOT_OK(AddUniqueGroups(part.partition_uniques_[partition], to, after));
     } else if (after > num_groups_) {
       ARROW_RETURN_NOT_OK(AddPartGroups(part, groups, to, after));
     }
