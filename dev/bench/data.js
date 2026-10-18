@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792286514013,
+  "lastUpdate": 1792290118790,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -10404,6 +10404,258 @@ window.BENCHMARK_DATA = {
             "value": 2241.864152000005,
             "unit": "ms/iter",
             "extra": "iterations: 1\ncpu: 2241.5736809999985 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "09e6d158a27bf0eacfa3683647e85270eec9731d",
+          "message": "perf(exec): decide a key column's type once in KeyHashes, not once a row (#165)\n\n## Summary\n\n**Stacked on #164** (base `perf/group-keys-once`) — review that one\nfirst; this branch's own diff is\nthe second commit.\n\n`KeyHashes` ran its type dispatch *inside* the row loop. Per row it\ntested for a binary array, then\nfor `BOOL`, then for a fixed width; asked the array whether the row was\nvalid; and for a fixed-width\nkey walked `column->data()->buffers[1]->data()` — two indirections\nthrough `shared_ptr`s — before\nhashing eight bytes. The hash of a row is a property of its column, so\nall of that hoists: the type\nand the base of the values are read once per column, and a column with\nno nulls skips the validity\ncheck.\n\n**The hash values are unchanged**, which matters because they pick a\ngroup's partition and therefore\nthe order of GROUP BY results. `PartitionsFollowTheKeyHash` (the golden)\npasses, and I ran the two\nloops side by side over a million rows of five column shapes comparing\nevery hash.\n\n## Measured\n\nThe loop itself, best of 5 over 1 Mi rows:\n\n| key shape | before | after | |\n| --- | ---: | ---: | ---: |\n| one BIGINT | 2.64 ns/row | 0.94 | **0.36×** |\n| BIGINT + INTEGER | 5.07 | 1.69 | **0.33×** |\n| 20-byte VARCHAR | 2.68 | 1.95 | 0.73× |\n| one BIGINT, 1% NULL | 2.53 | 1.39 | 0.55× |\n| VARCHAR, 1% NULL | 2.52 | 2.34 | 0.93× |\n\nEnd to end it is small, and the honest figure is **about 1.5%**.\nClickBench query times (best of 5,\nthe profile's own total, which excludes start-up), over the nine grouped\nqueries that route:\n**6.780 s → 6.681 s, 0.985×** — q15 0.959×, q18 0.973×, q17 0.975×, q35\n0.981×, q12 0.984×, q32\n0.987×, q30/q31 0.995×, q33 1.003×. Three ungrouped queries (q19, q29,\nq40) read **identically** in\nboth runs, which is the drift control.\n\nTPC-H at scale 100 is flat to slightly better and inside its own noise.\nWorth recording how that was\nsettled: the harness at 2 repeats read 0.980× overall **but with Q11 at\n1.036× and Q12 at 1.055×**,\nwhich would fail the no-regression gate. Re-measured at 5 repeats those\ntwo are **0.977× and\n0.994×** (and Q18 went from 0.92× to 1.010×), so the 2-repeat harness\nnumbers carry ±5–8% on this\nhost and should not be read at that granularity.\n\n## Type of change\n\n- [x] feat / fix / perf\n- [ ] refactor, test, docs, build, ci or chore\n\n## Verification\n\n```text\n$ pixi run ci\n100% tests passed out of 2726\n```\n\n- `pixi run ci` — Clang Debug `-Werror`, all tests pass.\n- `pixi run release` — bench-smoke included, pass.\n- `pixi run tidy` — 4 findings, all 4 on the clean-`main` list\n(`profile.h:107`, `sort.cc:342`,\n`group_table.cc` `Account()`, `grouped_aggregate_state.cc:59`); none\nnew.\n- `pixi run lint` — clang-format and every other linter passes;\nshellcheck fails on the 36\n  pre-existing osx-arm64 SC2218 findings and no shell script is touched.\n\n## Tests\n\n`exec.PartOperatorsTest.KeyHashesOfASliceAreTheHashesOfThoseRows`. A key\ncolumn reaches this\nfunction **sliced** — the routed rows of a materialized batch — and\napplying the array offset once\ninstead of per row is exactly the hazard the hoist introduces. The test\nhashes a slice of a BIGINT, a\nVARCHAR with NULLs and a BOOLEAN column at three offsets and compares\nagainst the same rows of the\nwhole column. The value golden is `PartitionsFollowTheKeyHash`,\nunchanged.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint caveat above)\n- [x] Tests cover the change\n- [x] Docs updated — none needed; no SQL, task or architecture change\n- [x] No ClickBench-derived data: query numbers and timings only\n- [x] Nothing derived from TPC-H is committed: scale, query numbers and\ntimings only\n- [x] Changes to governance paths were agreed with a maintainer — none\nare included\n\n## AI assistance\n\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5) found\nthe per-row dispatch in a\nsampling profile, wrote the change, the test and this description, and\nran every measurement.\n- Accountable human (has read and understands the whole diff): @hor911\n\n---\n\nThis workload is derived from the TPC-H Benchmark and is not comparable\nto published TPC-H Benchmark\nresults, as this implementation does not comply with all requirements of\nthe TPC-H Benchmark.\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-18T05:19:19+03:00",
+          "tree_id": "3709f2c3f1fd82d9db7c9e59b6bfd945b1afc94f",
+          "url": "https://github.com/ydb-campus/antb1/commit/09e6d158a27bf0eacfa3683647e85270eec9731d"
+        },
+        "date": 1792290117479,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 2642.0222606163525,
+            "unit": "ns/iter",
+            "extra": "iterations: 265087\ncpu: 2641.494958258986 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 61930.23987284204,
+            "unit": "ns/iter",
+            "extra": "iterations: 11010\ncpu: 61920.24877384197 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 69659.33739113258,
+            "unit": "ns/iter",
+            "extra": "iterations: 10104\ncpu: 69624.89519002376 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 251065.12402551234,
+            "unit": "ns/iter",
+            "extra": "iterations: 2822\ncpu: 250908.03543586118 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 251755.44174409914,
+            "unit": "ns/iter",
+            "extra": "iterations: 2798\ncpu: 251660.24660471783 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 1413701.7338709696,
+            "unit": "ns/iter",
+            "extra": "iterations: 496\ncpu: 1413107.983870968 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 30.280684304348487,
+            "unit": "ms/iter",
+            "extra": "iterations: 23\ncpu: 30.276943086956525 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 28.96354085714306,
+            "unit": "ms/iter",
+            "extra": "iterations: 21\ncpu: 28.94963204761904 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 141.379183600003,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 141.35901640000003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 8.560571901234498,
+            "unit": "ms/iter",
+            "extra": "iterations: 81\ncpu: 8.559181407407399 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 9.938184408450528,
+            "unit": "ms/iter",
+            "extra": "iterations: 71\ncpu: 9.934815535211262 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 25.136191185184643,
+            "unit": "ms/iter",
+            "extra": "iterations: 27\ncpu: 25.133500851851878 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 0.9115905380773849,
+            "unit": "ms/iter",
+            "extra": "iterations: 801\ncpu: 0.9113737865168556 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 78.38371777777473,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 78.37509388888877 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1000",
+            "value": 15.858872622222483,
+            "unit": "ms/iter",
+            "extra": "iterations: 45\ncpu: 15.852543111111098 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16384",
+            "value": 19.06738372222192,
+            "unit": "ms/iter",
+            "extra": "iterations: 36\ncpu: 19.061743500000006 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/262144",
+            "value": 40.325312052631624,
+            "unit": "ms/iter",
+            "extra": "iterations: 19\ncpu: 40.3143355789474 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1048576",
+            "value": 61.76259000000073,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 61.75756327272727 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/4194304",
+            "value": 249.56887233333683,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 249.5135306666659 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16777216",
+            "value": 1320.407242000016,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1320.2140639999982 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1000",
+            "value": 19.824606028570965,
+            "unit": "ms/iter",
+            "extra": "iterations: 35\ncpu: 19.818857742857126 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16384",
+            "value": 22.977188516128695,
+            "unit": "ms/iter",
+            "extra": "iterations: 31\ncpu: 22.97605709677422 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/262144",
+            "value": 36.422570684210676,
+            "unit": "ms/iter",
+            "extra": "iterations: 19\ncpu: 36.4120768947369 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1048576",
+            "value": 77.32840471428355,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 77.3274011428572 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/4194304",
+            "value": 299.7531039999899,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 299.6950320000007 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16777216",
+            "value": 1487.6158879999934,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1487.3216010000015 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1000",
+            "value": 32.61383495238116,
+            "unit": "ms/iter",
+            "extra": "iterations: 21\ncpu: 32.61056209523819 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16384",
+            "value": 34.58060465000017,
+            "unit": "ms/iter",
+            "extra": "iterations: 20\ncpu: 34.57600369999998 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/262144",
+            "value": 50.39871078571423,
+            "unit": "ms/iter",
+            "extra": "iterations: 14\ncpu: 50.39692535714276 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1048576",
+            "value": 100.52023649999835,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 100.50631566666664 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/4194304",
+            "value": 353.8753444999969,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 353.8519140000016 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16777216",
+            "value": 1730.73581700001,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1730.5447379999955 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1000",
+            "value": 39.07365288888798,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 39.069594555555575 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16384",
+            "value": 42.4666922352966,
+            "unit": "ms/iter",
+            "extra": "iterations: 17\ncpu: 42.46089023529427 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/262144",
+            "value": 63.872009272725705,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 63.86175954545467 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1048576",
+            "value": 115.58533399999267,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 115.5637476666674 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/4194304",
+            "value": 349.70637650002345,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 349.63535500000023 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16777216",
+            "value": 1810.3085100000271,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1810.124350999999 ms\nthreads: 1"
           }
         ]
       }
