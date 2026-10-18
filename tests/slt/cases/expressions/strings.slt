@@ -138,6 +138,44 @@ x\x7fy	x\x7fy	x\x7fy	x\x7fy	x\x7fy
 statement error
 SELECT regexp_replace(u, '(', 'x') FROM edge
 
+# A leading ^ does not make a pattern anchored. The evaluator runs an anchored pattern as written
+# and wraps any other one so that RE2 searches (exec/compute.cc), and only the first match is ever
+# replaced -- so a pattern whose leading ^ covers one branch of an alternation (^a|e), or whose ^ is
+# itself optional (^*a, ^?a, ^{0,2}a), still replaces one match and not every one.
+query TTTTT rowsort
+SELECT u, regexp_replace(u, '^a|e', 'X'), regexp_replace(u, '^a$|e', 'X'), regexp_replace(u, '^*a', 'X'), regexp_replace(u, '^?a', 'X') FROM edge
+----
+(empty)	(empty)	(empty)	(empty)	(empty)
+NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL
+\x28empty)	(Xmpty)	(Xmpty)	\x28empty)	\x28empty)
+a	X	X	X	X
+back\\slash	back\\slash	back\\slash	bXck\\slash	bXck\\slash
+line\nbreak	linX\nbreak	linX\nbreak	line\nbreXk	line\nbreXk
+tab\there	tab\thXre	tab\thXre	tXb\there	tXb\there
+trailing space\x20	trailing spacX\x20	trailing spacX\x20	trXiling space\x20	trXiling space\x20
+x\x7fy	x\x7fy	x\x7fy	x\x7fy	x\x7fy
+Привет, мир	Привет, мир	Привет, мир	Привет, мир	Привет, мир
+日本語	日本語	日本語	日本語	日本語
+
+# The same shapes where the alternation is anchored on both sides, and one inside a group, which is
+# anchored as a whole but keeps the wrapper.
+query TTTT rowsort
+SELECT u, regexp_replace(u, '^a|^e', 'X'), regexp_replace(u, '^(a|b)', 'X'), regexp_replace(u, '^[a|b]', 'X') FROM edge
+----
+(empty)	(empty)	(empty)	(empty)
+NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL
+\x28empty)	\x28empty)	\x28empty)	\x28empty)
+a	X	X	X
+back\\slash	back\\slash	Xack\\slash	Xack\\slash
+line\nbreak	line\nbreak	line\nbreak	line\nbreak
+tab\there	tab\there	tab\there	tab\there
+trailing space\x20	trailing space\x20	trailing space\x20	trailing space\x20
+x\x7fy	x\x7fy	x\x7fy	x\x7fy
+Привет, мир	Привет, мир	Привет, мир	Привет, мир
+日本語	日本語	日本語	日本語
+
 # ---- substring (ADR 0023's S5): codepoints, as DuckDB counts them ----
 
 # strlen counts bytes and substring counts codepoints, so a window of 3 codepoints over a multi-byte

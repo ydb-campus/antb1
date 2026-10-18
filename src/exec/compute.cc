@@ -1156,8 +1156,19 @@ struct Evaluator {
                  : arrow::Status::ExecutionError("regexp_replace: ", valid.status().message());
     }
     // A leading ^ forces the wrapper's prefix to be empty, so the pattern runs as the user wrote
-    // it, with their replacement and their group numbers.
-    const bool anchored = pattern.starts_with('^');
+    // it, with their replacement and their group numbers -- but only where that ^ provably anchors
+    // the *whole* pattern, which takes more than a leading character:
+    //   - no alternation anywhere. A top-level `|` leaves a branch unanchored, so `^a|b` matches a
+    //     `b` at any position and the kernel, replacing every match, would replace them all:
+    //     'abab' would come back 'XXaX' where DuckDB gives 'Xbab'. Rejecting every `|`, not only a
+    //     top-level one, keeps this a character scan: `^(a|b)c` is anchored too and keeps the
+    //     wrapper, which costs only speed.
+    //   - no repetition of the anchor. `^*b` and `^?b` make it optional, so they match a `b`
+    //     anywhere as well.
+    // Anything else that could bypass the first term of a concatenation is one of those two, and a
+    // `(?m)` can only follow the ^ here, where it no longer applies to it.
+    const bool anchored = pattern.starts_with('^') && !pattern.contains('|') &&
+                          (pattern.size() == 1 || !std::string_view("*+?{").contains(pattern[1]));
     const arrow::compute::ReplaceSubstringOptions options(
         anchored ? pattern : "^(\\C*?)(" + pattern + ")", anchored ? replacement : shifted,
         /*max_replacements=*/-1);
