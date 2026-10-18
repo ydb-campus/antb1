@@ -1,6 +1,7 @@
 #include "group_table.h"
 
 #include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -141,9 +142,12 @@ GroupTable::~GroupTable() = default;
 
 arrow::Result<std::unique_ptr<GroupTable>> GroupTable::Make(
     std::vector<plan::BoundColumn> keys, std::vector<plan::AggregateCall> aggregates,
-    int input_width, arrow::MemoryPool* pool, MemoryBudget* budget, bool first_keys) {
+    int input_width, arrow::MemoryPool* pool, MemoryBudget* budget, bool first_keys,
+    std::size_t partitions) {
   std::unique_ptr<GroupTable> table(
       new GroupTable(std::move(keys), std::move(aggregates), pool, first_keys));
+  ANTB1_CHECK(std::has_single_bit(partitions));  // PartitionOf masks
+  table->partitions_ = partitions;
   table->memory_.Reset(budget);
   std::vector<arrow::TypeHolder> key_types;
   for (const plan::BoundColumn& key : table->keys_) {
@@ -414,17 +418,17 @@ arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> GroupTable::Rout
   ARROW_ASSIGN_OR_RAISE(const std::vector<std::uint64_t> hashes,
                         KeyHashes(arrow::compute::ExecBatch(std::move(keys), rows.num_rows())));
   // The rows in partition order (a stable counting sort), one Take, then a slice per partition.
-  std::vector<std::int64_t> start(kPartitions + 1, 0);
+  std::vector<std::int64_t> start(partitions_ + 1, 0);
   for (const std::uint64_t hash : hashes) {
-    ++start[(hash % kPartitions) + 1];
+    ++start[PartitionOf(hash) + 1];
   }
-  for (std::size_t p = 1; p <= kPartitions; ++p) {
+  for (std::size_t p = 1; p <= partitions_; ++p) {
     start[p] += start[p - 1];
   }
   std::vector<std::int64_t> next(start.begin(), start.end() - 1);
   std::vector<std::int64_t> order(hashes.size());
   for (std::size_t r = 0; r < hashes.size(); ++r) {
-    order[static_cast<std::size_t>(next[hashes[r] % kPartitions]++)] = static_cast<std::int64_t>(r);
+    order[static_cast<std::size_t>(next[PartitionOf(hashes[r])]++)] = static_cast<std::int64_t>(r);
   }
   arrow::Int64Builder indices(pool_);
   ARROW_RETURN_NOT_OK(indices.AppendValues(order));
@@ -441,8 +445,8 @@ arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> GroupTable::Rout
   const std::shared_ptr<arrow::RecordBatch> sorted =
       arrow::RecordBatch::Make(rows.schema(), rows.num_rows(), std::move(columns));
   std::vector<std::shared_ptr<arrow::RecordBatch>> out;
-  out.reserve(kPartitions);
-  for (std::size_t p = 0; p < kPartitions; ++p) {
+  out.reserve(partitions_);
+  for (std::size_t p = 0; p < partitions_; ++p) {
     out.push_back(sorted->Slice(start[p], start[p + 1] - start[p]));
   }
   return out;
@@ -464,7 +468,7 @@ arrow::Status GroupTable::Partition(std::size_t prefix, std::span<const std::uin
     }
     return arrow::Status::OK();
   }
-  partition_groups_.resize(kPartitions);
+  partition_groups_.resize(partitions_);
   ARROW_ASSIGN_OR_RAISE(const arrow::compute::ExecBatch uniques, grouper_->GetUniques());
   arrow::compute::ExecBatch prefix_keys = uniques;
   prefix_keys.values.resize(prefix);
@@ -478,7 +482,7 @@ arrow::Status GroupTable::Partition(std::size_t prefix, std::span<const std::uin
     }
   }
   for (std::uint32_t g = 0; g < hashes.size(); ++g) {
-    partition_groups_[hashes[g] % kPartitions].push_back(g);
+    partition_groups_[PartitionOf(hashes[g])].push_back(g);
   }
   // Every partition's keys with one Take per column (the groups in partition order), sliced per
   // partition without copying: 64 Takes per column cost more than the rows for small parts.
@@ -497,7 +501,7 @@ arrow::Status GroupTable::Partition(std::size_t prefix, std::span<const std::uin
                              kernels_.get()));
     columns.push_back(taken.make_array());
   }
-  partition_uniques_.reserve(kPartitions);
+  partition_uniques_.reserve(partitions_);
   std::int64_t offset = 0;
   for (const std::vector<std::uint32_t>& groups : partition_groups_) {
     const auto length = static_cast<std::int64_t>(groups.size());

@@ -520,10 +520,15 @@ arrow::Status PartGroupAggregateOperator::Close() {
 
 namespace {
 
-// The summary of the sample's K hashes: every K with more than 1 / (2 * kPartitions) of the
+// The partitions the two-level aggregation merges through, which is not GroupTable::kPartitions:
+// its inner tables are keyed by K and a distinct column together, so each lane's table grows as the
+// count falls, and 32 cost q13 5% where the plain path gained. Measured per docs/adr/0014.
+constexpr std::size_t kTwoLevelPartitions = 64;
+
+// The summary of the sample's K hashes: every K with more than 1 / (2 * kTwoLevelPartitions) of the
 // sample's inner groups is heavy (it would take more than half a fair partition's share).
 constexpr std::size_t kHeavyCounters = 512;
-constexpr double kHeavyShare = 1.0 / (2.0 * static_cast<double>(GroupTable::kPartitions));
+constexpr double kHeavyShare = 1.0 / (2.0 * static_cast<double>(kTwoLevelPartitions));
 
 // What every part builds its inner tables from.
 struct InnerSpec {
@@ -543,13 +548,15 @@ arrow::Result<std::vector<std::unique_ptr<GroupTable>>> MakeInnerTables(const In
   for (const plan::BoundColumn& column : spec.distinct) {
     std::vector<plan::BoundColumn> keys = spec.keys;
     keys.push_back(column);
-    ARROW_ASSIGN_OR_RAISE(auto table, GroupTable::Make(std::move(keys), {}, spec.width, pool,
-                                                       budget, /*first_keys=*/false));
+    ARROW_ASSIGN_OR_RAISE(auto table,
+                          GroupTable::Make(std::move(keys), {}, spec.width, pool, budget,
+                                           /*first_keys=*/false, kTwoLevelPartitions));
     tables.push_back(std::move(table));
   }
   if (!spec.plain.empty()) {
-    ARROW_ASSIGN_OR_RAISE(auto table, GroupTable::Make(spec.keys, spec.plain, spec.width, pool,
-                                                       budget, /*first_keys=*/false));
+    ARROW_ASSIGN_OR_RAISE(auto table,
+                          GroupTable::Make(spec.keys, spec.plain, spec.width, pool, budget,
+                                           /*first_keys=*/false, kTwoLevelPartitions));
     tables.push_back(std::move(table));
   }
   return tables;
@@ -740,7 +747,7 @@ arrow::Status PartTwoLevelAggregateOperator::Aggregate() {
 
   // Per inner table, one merged table per partition.
   tables_.clear();
-  for (std::size_t p = 0; p < GroupTable::kPartitions; ++p) {
+  for (std::size_t p = 0; p < kTwoLevelPartitions; ++p) {
     ARROW_ASSIGN_OR_RAISE(auto made, MakeInnerTables(*spec, pool_, budget_));
     tables_.resize(made.size());
     for (std::size_t t = 0; t < made.size(); ++t) {
@@ -788,7 +795,7 @@ arrow::Status PartTwoLevelAggregateOperator::Aggregate() {
   }));
   // Every part merges in part order, each partition in its own lane: the sample's parts, then the
   // others, partitioned on their workers.
-  PartitionLanes lanes(GroupTable::kPartitions, executor_, window_, budget_);
+  PartitionLanes lanes(kTwoLevelPartitions, executor_, window_, budget_);
   int64_t index = 0;
   arrow::Status status;
   for (PartTables& part : sampled) {
@@ -828,19 +835,19 @@ arrow::Status PartTwoLevelAggregateOperator::Aggregate() {
 
   // The outer level, partitions in parallel; then the heavy K's groups across the partitions.
   outer_.clear();
-  outer_.resize(GroupTable::kPartitions);
-  heavy_groups_.assign(GroupTable::kPartitions, {});
-  rows_.assign(GroupTable::kPartitions, {});
+  outer_.resize(kTwoLevelPartitions);
+  heavy_groups_.assign(kTwoLevelPartitions, {});
+  rows_.assign(kTwoLevelPartitions, {});
   {
     const ProfileTimer outer(profile(), "outer");
     ARROW_RETURN_NOT_OK(
-        ForEach(executor_, GroupTable::kPartitions, [&](std::size_t p) { return Outer(p); }));
+        ForEach(executor_, kTwoLevelPartitions, [&](std::size_t p) { return Outer(p); }));
   }
   tables_.clear();
   ARROW_ASSIGN_OR_RAISE(heavy_table_,
                         OuterGroups::Make(key_types_, distinct_.size(), plain_, pool_, budget_));
   int64_t light = 0;
-  for (std::size_t p = 0; p < GroupTable::kPartitions; ++p) {
+  for (std::size_t p = 0; p < kTwoLevelPartitions; ++p) {
     light += static_cast<int64_t>(outer_[p]->num_groups()) -
              static_cast<int64_t>(heavy_groups_[p].size());
     ARROW_RETURN_NOT_OK(heavy_table_->Merge(*outer_[p], heavy_groups_[p]));

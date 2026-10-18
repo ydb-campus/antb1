@@ -46,14 +46,21 @@ class GroupTable {
   static constexpr int64_t kMaxJoinedKeyBytes = int64_t{16} * 1024 * 1024;
   // The partitions of a partitioned merge: a constant, never the number of threads, so that the
   // result is the same for any number of threads.
-  static constexpr std::size_t kPartitions = 64;
+  // The partitions a table's groups merge through: a constant, never the number of threads, so
+  // that the result is the same for any number of threads (docs/adr/0013-parallel-execution.md).
+  // 32 rather than 64 because the fixed cost of a partition is paid once per part per partition --
+  // a merge call, a slice of the uniques and a lane table -- and halving it is worth 5-10% on the
+  // grouped queries, at the same ratio on 4 threads as on 14. A table may be made with another
+  // count: the two-level aggregation keeps 64, whose inner tables grow as partitions shrink.
+  static constexpr std::size_t kPartitions = 32;
 
   // Checks the keys and calls against an input `input_width` columns wide. Without
   // `first_keys` the table keeps no first-seen key values (NextChunk is then unavailable): its
   // groups are read through uniques(), which holds the normalized keys.
   static arrow::Result<std::unique_ptr<GroupTable>> Make(
       std::vector<plan::BoundColumn> keys, std::vector<plan::AggregateCall> aggregates,
-      int input_width, arrow::MemoryPool* pool, MemoryBudget* budget, bool first_keys = true);
+      int input_width, arrow::MemoryPool* pool, MemoryBudget* budget, bool first_keys = true,
+      std::size_t partitions = kPartitions);
   GroupTable(const GroupTable&) = delete;
   GroupTable& operator=(const GroupTable&) = delete;
   GroupTable(GroupTable&&) = delete;
@@ -76,7 +83,7 @@ class GroupTable {
   // puts a group in the same partition.
   arrow::Status Partition(std::size_t prefix, std::span<const std::uint64_t> heavy);
   // The rows of `rows` (a batch of this table's input) split as Partition splits their groups:
-  // per partition (kPartitions), the rows whose keys' group Partition() puts there, in input order.
+  // per partition, the rows whose keys' group Partition() puts there, in input order.
   // For a table with keys; DOUBLE keys are normalized for the hash, as the grouper does.
   arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> RouteRows(
       const arrow::RecordBatch& rows) const;
@@ -120,11 +127,18 @@ class GroupTable {
   arrow::Status AddUniqueGroups(const arrow::compute::ExecBatch& keys,
                                 std::span<const std::uint32_t> to, std::uint32_t after);
   arrow::Status Account();
+  // The partition of a key hash. The count is a power of two (checked in Make), so this masks
+  // rather than divides: RouteRows runs it once a row, where a constant count let the compiler do
+  // the same thing and a runtime one would not.
+  [[nodiscard]] std::size_t PartitionOf(std::uint64_t hash) const {
+    return static_cast<std::size_t>(hash) & (partitions_ - 1);
+  }
 
   std::vector<plan::BoundColumn> keys_;
   std::vector<plan::AggregateCall> aggregates_;
   arrow::MemoryPool* pool_;
   bool keep_first_keys_;
+  std::size_t partitions_ = kPartitions;  // this table's partition count
   std::unique_ptr<arrow::compute::ExecContext> kernels_;
   std::unique_ptr<arrow::compute::Grouper> grouper_;  // nullptr without keys
   std::vector<std::unique_ptr<GroupedAggregateState>> states_;

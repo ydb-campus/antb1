@@ -185,6 +185,20 @@ subqueries; both amend this section where marked.
    not 4096, whose groups overstate the part's) and routes when its groups are more than 1/4 of its rows (not
    3/4): a part that reduces less than 4 to 1 inserts most groups twice, which costs more than inserting its rows
    once. On the full data Q33 and Q34 went 1.84 s → 1.49 s.
+   Amended 2026-10-18: **32 partitions, not 64, and the two-level aggregation keeps 64.** The cost of a partition
+   is paid once per part per partition — a `MergePartition` call, a slice of the part's uniques, a lane table with
+   its own grouper — so at 226 parts the count is a fixed cost paid 14,464 times, and halving it is worth 6-9% on
+   the grouped queries (q18 0.915×, q12 and q17 0.923×, q30 0.929×, q04 0.931×, q14 0.934×, q16 0.937×, q15
+   0.942×) and 2.2% over the 43. It is a fixed cost, not a scheduling effect: the same ratio appears on 4 threads
+   (0.955×) as on 14 (0.953×). Q33 and Q34 do not move, since they route most of their rows past their part
+   tables, and TPC-H is flat (total 1.003×, geomean 1.000×).
+   The two-level aggregation ([ADR 0014](0014-two-level-aggregation.md)) keeps 64 as `kTwoLevelPartitions`: its
+   inner tables are keyed by the outer keys *and* a distinct column, so each lane's table grows as the count falls,
+   and 32 cost q13 5% where every plain GROUP BY gained. The counts are now independent, and so is a join's
+   (`kJoinPartitions`, still 64 and unmeasured against either).
+   The sweep: 8 and 16 partitions are no better than 32 overall and 16 cost q13 10%; 128 is 10.5% worse. The limit
+   on going lower is that the count caps the merge's parallelism, so it must stay above the thread counts the
+   engine is run with; 32 was measured at 4 and 14 threads only.
 5. **exec:** the top-N sink (every part keeps its first rows, merged in part order). A full `ORDER BY` without
    `LIMIT` still sorts the part union on one thread; a k-way merge of sorted parts is its follow-up.
 6. **io and exec** (follow-up): skipping parts by their footer statistics (integer-valued columns, predicates

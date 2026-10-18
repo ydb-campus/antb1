@@ -960,7 +960,10 @@ TEST_F(PartOperatorsTest, PartitionsFollowTheKeyHash) {
   for (const std::size_t p : strings) {
     golden += std::to_string(p) + " ";
   }
-  EXPECT_EQ(golden, "24 13 0 22 60 12 | 26 30 37 35 12 ");
+  // Updated on purpose with GroupTable::kPartitions, 64 to 32: every partition below 32 is
+  // unchanged and the three above it moved down by exactly 32 (60, 37, 35), which is the modulus
+  // changing and the hash of a key not.
+  EXPECT_EQ(golden, "24 13 0 22 28 12 | 26 30 5 3 12 ");
 }
 
 // A partition merge that fails on the executor (here: a HUGEINT sum past its range, reached only
@@ -1665,7 +1668,9 @@ TEST_F(PartOperatorsTest, HeavyKeysSpreadOverThePartitions) {
   const auto hash = (*single)->PrefixHashes(1);
   ASSERT_TRUE(hash.ok());
   const auto spread = partitions_of(*hash);
-  EXPECT_GT(count(spread, 7), 30) << "100 (7, x) groups over 64 partitions";
+  // Over half the partitions, whatever GroupTable::kPartitions is: 100 groups spread by the hash of
+  // all their keys reach about 96% of 32 partitions and about 79% of 64.
+  EXPECT_GT(count(spread, 7), std::ssize(spread) / 2) << "100 (7, x) groups over the partitions";
   for (int64_t key : {0, 1, 2, 3, 4}) {
     EXPECT_EQ(count(spread, key), 1) << key;
   }
@@ -1677,11 +1682,14 @@ TEST_F(PartOperatorsTest, HeavyKeysSpreadOverThePartitions) {
   const auto empty_prefix = KeyHashes(arrow::compute::ExecBatch({}, 1));
   ASSERT_TRUE(empty_prefix.ok());
   ASSERT_TRUE((*by_x)->Partition(0, *empty_prefix).ok());
+  // Three quarters of the partitions, whatever GroupTable::kPartitions is: 400 values reach nearly
+  // all of them at 32 and at 64 alike.
+  constexpr auto kMostPartitions = static_cast<std::ptrdiff_t>(3 * GroupTable::kPartitions / 4);
   EXPECT_GT(
       std::ranges::count_if(std::views::iota(std::size_t{0}, (*by_x)->num_partitions()),
                             [&](std::size_t p) { return !(*by_x)->partition_groups(p).empty(); }),
-      50)
-      << "400 values of x over 64 partitions";
+      kMostPartitions)
+      << "400 values of x over the partitions";
 }
 
 // A key column reaches KeyHashes sliced (the routed rows of a materialized batch, a partition's
