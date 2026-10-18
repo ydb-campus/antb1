@@ -770,8 +770,10 @@ struct FirstUnsupportedOf {
                                                 "(docs/sql-subset.md lists the units)",
                                                 Clip(unit->text))};
       }
-      // The evaluator anchors the pattern as ^(\C*?)(pattern) and shifts the replacement's groups
-      // by two (exec/compute.cc): \8 and \9 would pass RE2's \9, and \Q would quote the ')'.
+      // The evaluator wraps a pattern that is not anchored at ^ as ^(\C*?)(pattern) and shifts the
+      // replacement's groups by two (exec/compute.cc): \8 and \9 would pass RE2's \9, and \Q
+      // would quote the ')'. Rejected for every pattern, anchored or not, so that which form the
+      // evaluator picks stays invisible.
       const auto* lit = std::get_if<sql::Literal>(&call.args[i]);
       if (spec->function == Function::kRegexpReplace && i > 0 && lit != nullptr) {
         const std::string_view escapes = i == 1 ? "Q" : "89";
