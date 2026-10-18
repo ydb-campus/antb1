@@ -3655,5 +3655,107 @@ TEST(BinderTest, ACorrelatedScalarSubqueryBindsToADependentJoin) {
   EXPECT_TRUE(Optimize(*plain).ok());
 }
 
+// A semi join over one relation runs on that relation's own branch rather than above every join of
+// its block, so the joins above carry the rows it kept instead of all of them (ADR 0029's D0). It
+// answers the same either way: a joined row matches exactly when its row from that relation does.
+// ADR 0022 makes "an outer, semi, anti or one-row join a fixed unit for ordering", so each
+// condition that holds one back is pinned here beside the one case that moves.
+TEST(BinderTest, ASemiJoinOverOneRelationRunsOnItsBranch) {
+  const Catalog catalog = MakeCatalog();
+  const auto plan_of = [&catalog](std::string_view sql) {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    return plan.ok() ? Explain(Optimized(*plan)) : std::string();
+  };
+  // `ok` holds 7 rows, fewer than the join above it is estimated to output, so the semi join moves
+  // onto its scan and the INNER join probes what the semi join kept.
+  EXPECT_EQ(
+      plan_of("SELECT COUNT(*) FROM t, ok WHERE t.i16 = ok.i16 AND ok.i16 IN (SELECT i16 FROM t)"),
+      "Output: count_star():BIGINT\n"
+      "Aggregate COUNT(*)\n"
+      "  Join INNER build=right keys=[t.i16 = ok.i16]\n"
+      "    Scan table=t source=fake columns=[i16]\n"
+      R"(    Join SEMI build=right keys=["ok.i16" = i16])"
+      "\n"
+      "      Scan table=ok source=fake columns=[i16]\n"
+      "      Project i16\n"
+      "        Scan table=t source=fake columns=[i16]\n");
+  // A subquery join above every join of its block renders before the INNER join; one on a branch
+  // renders after it.
+  const auto on_top = [&plan_of](std::string_view sql) {
+    const std::string plan = plan_of(sql);
+    const std::size_t join = std::min(plan.find("Join SEMI"), plan.find("Join NULL-AWARE ANTI"));
+    const std::size_t inner = plan.find("Join INNER");
+    EXPECT_NE(join, std::string::npos) << plan;
+    EXPECT_NE(inner, std::string::npos) << plan;
+    return join < inner;
+  };
+  struct Case {
+    std::string_view sql;
+    bool on_top;  // whether it stays above every join of its block, as before D0
+    std::string_view why;
+  };
+  for (const Case& c : {
+           Case{.sql = "SELECT COUNT(*) FROM t, ok WHERE t.i16 = ok.i16 AND ok.i16 IN (SELECT "
+                       "i16 FROM t)",
+                .on_top = false,
+                .why = "7 rows under a join estimated to output more"},
+           // The guard against moving it onto more rows than it would see above: `t` holds 100,
+           // and this join of 100 rows and 7 over a wide key domain outputs fewer than either.
+           Case{.sql = "SELECT COUNT(*) FROM t, ok WHERE t.i16 = ok.i16 AND t.i32 IN (SELECT "
+                       "i16 FROM ok)",
+                .on_top = true,
+                .why = "100 rows under a join estimated to output fewer"},
+           // The same relation that moves above, with NOT IN instead, so the kind is all that
+           // differs: a null-aware anti join reads its whole set to answer one row.
+           Case{.sql = "SELECT COUNT(*) FROM t, ok WHERE t.i16 = ok.i16 AND ok.i16 NOT IN "
+                       "(SELECT i16 FROM t)",
+                .on_top = true,
+                .why = "a null-aware anti join is not a filter on one row"},
+           // `ok`'s 7 rows are known but `u`'s are not, which saturates the root's estimate --
+           // and against a saturated root every relation reads as small. This is the shape the
+           // comparison would otherwise admit however selective the joins below it are.
+           Case{.sql = "SELECT COUNT(*) FROM ok, u WHERE ok.i16 = u.i16 AND ok.i16 IN (SELECT "
+                       "i16 FROM t)",
+                .on_top = true,
+                .why = "another relation of the block has no row count"},
+           // The moved relation's own count unknown, which must never read as small either.
+           Case{.sql = "SELECT COUNT(*) FROM t, u WHERE t.i16 = u.i16 AND u.i32 IN (SELECT i16 "
+                       "FROM ok)",
+                .on_top = true,
+                .why = "an unknown row count never reads as small"},
+           // The probe needs widening to the key type, so the join's key is a column computed in
+           // its own layer, which belongs to no binding and names no relation to move to.
+           Case{.sql = "SELECT COUNT(*) FROM t, ok WHERE t.i16 = ok.i16 AND ok.i16 IN (SELECT "
+                       "i64 FROM t)",
+                .on_top = true,
+                .why = "its probe is widened in the join's own layer, below it"},
+           // The key belongs to a binding inside a LEFT JOIN unit, whose branch is a join of its
+           // own and whose rows pad.
+           Case{.sql = "SELECT COUNT(*) FROM t LEFT JOIN ok ON t.i16 = ok.i16, dec WHERE "
+                       "t.i32 = dec.i AND ok.i16 IN (SELECT i16 FROM ok)",
+                .on_top = true,
+                .why = "a LEFT JOIN unit's branch is a join of its own"},
+       }) {
+    EXPECT_EQ(on_top(c.sql), c.on_top) << c.why << ": " << c.sql;
+  }
+  // Two of them on the one relation: both move, stacked on its branch in the order written.
+  EXPECT_EQ(plan_of("SELECT COUNT(*) FROM t, ok WHERE t.i16 = ok.i16 AND ok.i16 IN (SELECT i16 "
+                    "FROM t) AND ok.i16 IN (SELECT s16 FROM dec)"),
+            "Output: count_star():BIGINT\n"
+            "Aggregate COUNT(*)\n"
+            "  Join INNER build=right keys=[t.i16 = ok.i16]\n"
+            "    Scan table=t source=fake columns=[i16]\n"
+            R"(    Join SEMI build=right keys=["ok.i16" = s16])"
+            "\n"
+            R"(      Join SEMI build=right keys=["ok.i16" = i16])"
+            "\n"
+            "        Scan table=ok source=fake columns=[i16]\n"
+            "        Project i16\n"
+            "          Scan table=t source=fake columns=[i16]\n"
+            "      Project s16\n"
+            "        Scan table=dec source=fake columns=[s16]\n");
+}
+
 }  // namespace
 }  // namespace antb1::plan

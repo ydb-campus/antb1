@@ -280,7 +280,9 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   and `DATE` pairs it admits, its folding of a literal side, and its refusal of a `FLOAT` column (divergence D11),
   which the column carries across the block boundary. Over no row `SUM`, `AVG`, `MIN` and `MAX` are NULL, which the
   comparison rejects, and `COUNT` is 0, which it compares as usual; both as in DuckDB. The join sits above its
-  block's inner joins, or above the aggregation for a `HAVING` conjunct, in the order the conjuncts are written. An
+  block's inner joins, or above the aggregation for a `HAVING` conjunct, in the order the conjuncts are written --
+  except that a `WHERE` semi join whose key reads one relation of the block runs on that relation's own branch,
+  below those joins, which answers the same and carries fewer rows through them (ADR 0029's D0). An
   `IN` query may have its own `GROUP BY` and `HAVING`, and nothing is pulled out of it; an aggregate inside any
   subquery does not make the outer block an aggregate query. A column count other than one is a bind error.
   A **correlated** subquery -- one that reads a column of the block enclosing it -- is answered where it is a

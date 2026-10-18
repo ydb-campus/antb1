@@ -2841,6 +2841,11 @@ class Binder {
   // The column of a subquery join's own side: a column of the tree below as is, anything else
   // computed in that join's layer directly below it.
   BoundColumn SubqueryColumn(SubqueryJoin& join, const Typed& t);
+  // Routes every WHERE semi join that reads one relation onto that relation's own branch, before
+  // the joins of its block rather than above them (ADR 0029's D0).
+  void PushSemiJoinsDown();
+  // The relation `join` can run on the branch of, or none: the conditions are in the definition.
+  [[nodiscard]] std::optional<std::size_t> PushableSemiJoin(const SubqueryJoin& join) const;
   // The join order of every block, innermost first: a block's relations must be connected, and
   // OrderJoins then picks the left-deep order of them.
   arrow::Status OrderRelations();
@@ -3057,6 +3062,9 @@ class Binder {
     // layers stand on its own Scan. A unit's layers stand on its join, so they never reach a Scan
     // and never pad: a conjunct routed here filters the unit's rows, padded ones included.
     std::optional<std::size_t> unit;
+    // The semi joins PushSemiJoinsDown routed here: they run on this relation's own branch rather
+    // than above every join of its block (ADR 0029's D0).
+    std::vector<SubqueryJoin> semi_joins;
   };
   std::vector<Relation> relations_;    // one per binding, in FROM order
   std::size_t conjunct_relation_ = 0;  // the relation the conjunct being bound is routed to
@@ -5148,6 +5156,12 @@ LogicalNodePtr Binder::RelationNode(std::size_t r) {
                            .predicates = std::move(relation.input_filter),
                            .span = relation.filter_span});
   }
+  // Above this relation's own filters, so the semi join sees the fewest rows, and below the join
+  // keys computed for the joins it now runs under.
+  if (!relation.semi_joins.empty()) {
+    node = SubqueryJoins(std::move(node), relation.semi_joins);
+    relation.semi_joins.clear();  // moved from: this relation's branch is built once (JoinTree)
+  }
   if (!relation.join_key_exprs.empty()) {
     node = Make(ComputeNode{.input = std::move(node),
                             .exprs = relation.join_key_exprs,
@@ -5248,7 +5262,76 @@ std::string Binder::QualifierOf(ColumnId id) const {
   return location.has_value() ? scope_.Qualifier(location->binding) : std::string();
 }
 
+// A semi join is a filter: it keeps or drops a row of its left input and never duplicates one. So
+// when its key reads one relation, it can run on that relation's own branch instead of above every
+// join of the block -- a joined row matches exactly when its row from that relation matches, so the
+// two answer the same, and the joins above then carry the rows that survived rather than all of
+// them. ADR 0022 makes "an outer, semi, anti or one-row join a fixed unit for ordering"; this
+// relaxes that for this one case, which ADR 0029's D0 measured as 600,037,902 rows gathered where
+// 44,786 are kept.
+std::optional<std::size_t> Binder::PushableSemiJoin(const SubqueryJoin& join) const {
+  // A plain semi join only, and only the shape whose left side is already a column of the key's
+  // type: a dependent join has no key until the unnesting pass gives it one, a null-aware anti join
+  // reads its whole set to answer one row, and a join with a computed layer of its own (`exprs`) or
+  // a filter above it would have to carry them down as well, which is only sound where what they
+  // read is this relation too. The last two cannot fire today and are kept as the precondition they
+  // state: a computed probe's key belongs to no binding, so the lookup below refuses it anyway, and
+  // only a one-row join carries a filter, which the kind already excludes.
+  if (join.kind != JoinKind::kSemi || join.dependent || !join.exprs.empty() ||
+      !join.filter.empty()) {
+    return std::nullopt;
+  }
+  const std::optional<ColumnLocation> location = scope_.Find(join.left_key.id);
+  if (!location.has_value()) {
+    return std::nullopt;  // a computed column, which belongs to no binding
+  }
+  const JoinBlock& block = blocks_.front();
+  const std::vector<std::size_t> locals = LocalsOf(0, {location->binding});
+  if (locals.size() != 1) {
+    return std::nullopt;  // a key of no relation of this block, or of more than one
+  }
+  const std::size_t relation = block.relations[locals.front()];
+  if (relations_[relation].unit.has_value()) {
+    // A LEFT JOIN unit: its branch is a join of its own and its rows pad. Standing above that join
+    // would answer the same, since a padded row's NULL key matches nothing either way, but a unit
+    // is the one relation this pass has no measurement for, so it keeps its place.
+    return std::nullopt;
+  }
+  // Only where it cannot cost more than it saves. The semi join probes the rows of whatever it
+  // stands on, so moving it down is a loss when the branch holds more rows than the tree above it
+  // would -- a very selective join below a semi join that keeps nearly everything. Both estimates
+  // are the ones ADR 0026's C1 and C5 already computed.
+  // Every relation of the block must have a known row count for the comparison to mean anything: an
+  // unknown one enters the search as the largest int64 (`join_order.cc`'s kLargest), which
+  // saturates the root's estimate, and against a saturated root every relation reads as small --
+  // which is the regression this test exists to prevent, not a licence for it.
+  if (std::ranges::any_of(block.stats, [](const JoinRelation& r) { return !r.rows.has_value(); })) {
+    return std::nullopt;
+  }
+  const std::optional<int64_t> rows = block.stats[locals.front()].rows;
+  if (!rows.has_value() || *rows > block.steps.back().estimate) {
+    return std::nullopt;
+  }
+  return relation;
+}
+
+void Binder::PushSemiJoinsDown() {
+  if (blocks_.empty() || blocks_.front().relations.size() < 2) {
+    return;  // one relation: its branch and its tree are the same node, so this would only churn
+  }
+  std::vector<SubqueryJoin> kept;
+  for (SubqueryJoin& join : where_subqueries_) {
+    if (const std::optional<std::size_t> relation = PushableSemiJoin(join)) {
+      relations_[*relation].semi_joins.push_back(std::move(join));
+    } else {
+      kept.push_back(std::move(join));
+    }
+  }
+  where_subqueries_ = std::move(kept);
+}
+
 LogicalPlan Binder::Assemble() {
+  PushSemiJoinsDown();
   LogicalNodePtr node = JoinTree(0);
   node = SubqueryJoins(std::move(node), where_subqueries_);
   // The correlated conjuncts of this block, above all of its joins and below its aggregation, in

@@ -134,6 +134,32 @@ lesson of [ADR 0027](0027-string-views.md)'s S1, which was planned as a win whos
   relation matches. In the query above that is 600,037,902 rows gathered becoming of the order of 44,786, with no
   runtime machinery whatsoever. Measure it first; if it lands, D1 and D2's remaining prize is the `lineitem` scan
   alone, which is the half DuckDB uses a Bloom filter for.
+  - Update (2026-10-18, D0): **shipped, and worth 1.82x on the query this ADR is built around.** A WHERE semi join
+    whose key reads one relation of the statement's block now runs on that relation's own branch
+    (`Binder::PushableSemiJoin`), guarded on the relation's estimate not exceeding the estimate of the tree the join
+    would otherwise stand on: a semi join probes the rows of whatever it stands on, so moving it below a very
+    selective join would cost more than it saves. [ADR 0022](0022-joins-and-query-blocks.md)'s "fixed unit for
+    ordering" now carries the exception. Measured on the 22 at SF 100, 14 threads, best of three, on one binary with
+    the pass behind a temporary override removed before the commit:
+
+    | | before | after | |
+    | --- | ---: | ---: | --- |
+    | the query, end to end | 8.598 s | **4.729 s** | **0.550x**, 3.9x to **2.1x** of DuckDB |
+    | rows its largest join outputs | 600,037,902 | **44,786** | the rows the answer needs |
+    | that join's `gather`, summed over parts | 26.692 s | 7.451 s | |
+    | peak memory | 15.36 GB | 13.65 GB | |
+    | the 22, geomean | 2.402 s | 2.341 s | 0.975x, 2.15x to **2.09x** of DuckDB |
+
+    **Only that one query moved.** The other 21 are inside +-2.8%, and DuckDB's own binary read 1.117 s and 1.118 s
+    across the pair of runs, which is the drift control. It is the only one of the 22 whose `IN (subquery)` stands
+    over a FROM of more than one relation. ClickBench cannot be affected at all: none of its 43 queries holds a join
+    or a subquery.
+  - **What D0 leaves for D1 and D2, from the same profile.** That join now outputs 44,786 rows but still *probes*
+    291,130,673 of them (`find` 3.184 s, `self` 10.878 s), because the 600,037,902-row scan of its probe side is
+    untouched -- nothing yet tells it which keys can match. That is exactly the Bloom filter's half, and it is now
+    the largest single cost of the query, which is the order this plan predicted. Peak memory fell by only 1.71 GB,
+    so the 600 M-row join output was never the peak; the other build is, and that is a separate question from this
+    ADR's.
 - **D1, perf(exec): publish a completed build's keys, and apply them per row with a blocked Bloom filter.** The
   mechanism the measurement says pays, so it is first of the dynamic filters rather than last: it is the only one
   that reaches a key set spanning its whole domain. The min/max interval is published with it, because it is two
