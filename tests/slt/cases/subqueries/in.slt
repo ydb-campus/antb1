@@ -282,6 +282,52 @@ SELECT COUNT(*), COUNT(tr_tariff) FROM trips WHERE tr_tariff IN (SELECT tf_code 
 ----
 199	199
 
+# ---- IN over a FROM of more than one relation: the semi join runs on one relation's branch ----
+
+# A semi join is a filter, so it runs on the branch of the relation its key reads rather than above
+# every join of the block (ADR 0029's D0). These pin the answer, which is the same either way: a
+# joined row matches exactly when its row from that relation does. The set holds a NULL, repeats and
+# the empty string, the probe column holds NULLs, and the joins are of two relations and of three.
+
+query II rowsort
+SELECT COUNT(*), COUNT(tr_fare) FROM trips, cities WHERE tr_pickup = ct_id AND ct_id IN (SELECT ct_id FROM cities WHERE ct_pop > 10000)
+----
+210	204
+
+# The same join with NOT IN, which reads its whole set to answer one row and so keeps its place.
+query II rowsort
+SELECT COUNT(*), COUNT(tr_fare) FROM trips, cities WHERE tr_pickup = ct_id AND ct_id NOT IN (SELECT ct_id FROM cities WHERE ct_pop > 10000)
+----
+210	202
+
+# The key is a VARCHAR whose set repeats values, holds a NULL and the empty string.
+query II rowsort
+SELECT COUNT(*), COUNT(tr_rate) FROM trips, tariffs WHERE tr_tariff = tf_code AND tf_code IN (SELECT tr_tariff FROM trips)
+----
+2274	2098
+
+# An empty set drops every row, wherever the semi join stands.
+query I rowsort
+SELECT COUNT(*) FROM trips, drivers WHERE tr_driver = dv_id AND dv_id IN (SELECT pm_id FROM promos)
+----
+0
+
+# Three relations, so the join that moves sits under two of them, and a grouped answer rather than a
+# count: every group of the result has to be the one the semi join above the joins would have left.
+query TII rowsort
+SELECT cities.label, COUNT(*), COUNT(DISTINCT tr_driver) FROM trips, zones, cities WHERE tr_pickup = zn_id AND zn_city = ct_id AND ct_id IN (SELECT rd_city FROM riders) GROUP BY cities.label
+----
+center	559	100
+harbor	559	100
+hills	490	100
+
+# The probe reads the fact table, which the estimates may keep above the joins: the answer is the
+# same, and this is the case that says so.
+query II rowsort
+SELECT COUNT(*), COUNT(tr_promo) FROM trips, zones WHERE tr_pickup = zn_id AND tr_tariff IN (SELECT tf_code FROM tariffs)
+----
+2118	52
+
 # ---- DuckDB only, for good: IN over a VALUES table, which is postponed (ADR 0025) ----
 
 # `VALUES` is a table constructor, not this IN list. antb1 refuses it either way, but as a call rather than as a
