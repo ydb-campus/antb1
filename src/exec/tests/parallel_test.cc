@@ -1721,20 +1721,20 @@ TEST_F(PartOperatorsTest, KeyHashesOfAColumnWithNoValuesBuffer) {
   ASSERT_TRUE(empty.ok()) << empty.status().ToString();
   EXPECT_TRUE(empty->empty());
 
-  constexpr int64_t kRows = 8;
-  auto bitmap = arrow::AllocateBitmap(kRows).ValueOrDie();
+  constexpr int64_t kNullRows = 8;
+  auto bitmap = arrow::AllocateBitmap(kNullRows).ValueOrDie();
   std::memset(bitmap->mutable_data(), 0, static_cast<std::size_t>(bitmap->size()));
-  const auto all_null =
-      arrow::MakeArray(arrow::ArrayData::Make(arrow::int64(), kRows, {bitmap, nullptr}, kRows));
+  const auto all_null = arrow::MakeArray(
+      arrow::ArrayData::Make(arrow::int64(), kNullRows, {bitmap, nullptr}, kNullRows));
   ASSERT_EQ(all_null->data()->buffers[1], nullptr);
-  ASSERT_EQ(all_null->null_count(), kRows);
-  const auto nulls = KeyHashes(arrow::compute::ExecBatch({all_null}, kRows));
+  ASSERT_EQ(all_null->null_count(), kNullRows);
+  const auto nulls = KeyHashes(arrow::compute::ExecBatch({all_null}, kNullRows));
   ASSERT_TRUE(nulls.ok()) << nulls.status().ToString();
   // Every row is the one NULL hash, which is what a column of NULLs hashed to before.
   const auto expected = KeyHashes(
       arrow::compute::ExecBatch({Int64s({std::nullopt, std::nullopt, std::nullopt, std::nullopt,
                                          std::nullopt, std::nullopt, std::nullopt, std::nullopt})},
-                                kRows));
+                                kNullRows));
   ASSERT_TRUE(expected.ok()) << expected.status().ToString();
   EXPECT_EQ(*nulls, *expected);
 }
