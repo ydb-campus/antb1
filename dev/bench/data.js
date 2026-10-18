@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792320422960,
+  "lastUpdate": 1792334492410,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -11160,6 +11160,258 @@ window.BENCHMARK_DATA = {
             "value": 2518.921804999991,
             "unit": "ms/iter",
             "extra": "iterations: 1\ncpu: 2518.508746000002 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "051e6d2eb76c042b8eedf961761a36af0f671fc4",
+          "message": "perf(exec): run a regexp_replace `.*$` tail byte-wise (#169)\n\n## Summary\n\nA `regexp_replace` pattern ending in `.*$` has that tail rewritten to\n`\\C*$`, RE2's any byte.\n\nThe tail does no work. Its match is replaced along with the rest of the\npattern's, so every byte it\nreads is thrown away, and all that scan establishes is that those bytes\nare characters and that none\nof them is a newline. `\\C*` establishes nothing and skips bytes instead\nof decoding characters. Over\n977,975 of ClickBench's Referer values, whose ~82 bytes are about 60 of\ntail, that is 0.444 µs a\nvalue against **0.197** — the speed of running RE2 in Latin-1 with\n`dot_nl`, but through Arrow's own\nkernel, so with no new dependency and no change of semantics.\n(`(?s:.*)$` is 0.389, which is how we\nknow the win is the byte-wise skip and not the newline flag.)\n\n`.` is a character that is not a newline and `\\C` is any byte, so the\ntwo read a value the same way\nonly where it is a whole number of characters and holds no newline. Both\nare read off the batch's\ndistinct values — the dictionary the evaluator already builds — before\nthe regex runs:\n\n- **UTF-8 in one pass over all the values at once**, plus a per-value\ntest that no value starts on a\ncontinuation byte. Validating the concatenation is weaker than\nvalidating each value, since a\nsequence split across two adjacent values validates as the pair it\nforms; the boundary test is\nwhat closes that. `Array::ValidateFull` reads the same bytes per value\nand measured 27% of q28.\n- **A newline per value, not per batch.** Per batch was the first form\nand it gave back 57% of the\nwin: one newline among a batch's ~20 K distinct values takes the rewrite\noff every one of them,\nand enough of ClickBench's Referer values hold one to reach more than\nhalf the batches. The values\nthat do hold one run the pattern as written and go back in place with\n`replace_with_mask`.\n\nThe per-value split is correctness and not only speed. For an unanchored\npattern the two tails answer\n*differently* on a value with a newline: `.*$` cannot match across it,\nso the leftmost match starts\nafter the newline, where `\\C*$` matches from the front. The new `.slt`\ncases pin both shapes from\nDuckDB — `regexp_replace(u, '.*$', 'X')` over a value with a newline\nkeeps everything up to it, and\n`(?m)^.*$` replaces only the first line.\n\nThe pattern must also **start the tail where a character starts**, which\nwhole values do not give on\ntheir own. `\\C` (one byte) and `\\B` (a word boundary over bytes, so it\nholds *between* the bytes of a\ncharacter) both leave the cursor inside one, and there `.*$` fails — no\nlone continuation byte is a\ncharacter — where `\\C*$` eats the rest of it: `\\B.*$` over a value of\n`a` and U+00E9 answers\n`61 C3 58`, a result that is **not valid UTF-8 built from input that\nis**. Those two are the only\nconstructs that can do it — `\\b` cannot, since no byte of a multi-byte\ncharacter is an ASCII word\ncharacter, so it sees non-word on both sides and fails; `^`, `$`, `\\A`,\n`\\z` and their `(?m)` forms\nare all at a character boundary; and everything that matches a rune\nconsumes it whole. A pattern\nholding an unescaped `\\C` or `\\B` therefore keeps the slower tail.\n\nThe rest of the pattern test is deliberately conservative — the last\nthree characters, with an even\nnumber of backslashes before the dot — so `(.*)$` and `.{0,}$` keep that\ntail too, and a tail whose\ngroup the replacement reads is never rewritten. `\\Q` stays rejected by\nthe binder for every pattern\n(`src/plan/binder.cc:779`), so a quoted literal `.*$` cannot reach the\nevaluator.\n\nMeasured on one binary with both arms behind a temporary override,\nremoved before the commit:\nClickBench q28 **2.93 s → 2.03 s wall (0.694×)**, 2.78 s → 1.91 s\nin-engine, and the 43\n**20.04 s → 19.21 s (0.959×)**. Only q28's code path changes. One other\nquery reads 1.030× in the\nharness's wall figure (q15, which contains no `regexp_replace`); its\nin-engine time over seven runs\nof the same binary is 302.6-305.9 ms, a 1% spread, and the earlier run\nof these same two arms put\nq15 inside 3% with a different query worst at 1.021× — so that is\nstart-up noise in the wall metric,\nnot a regression. This is the last of q28's RE2 cost that was\nreclaimable;\nwhat remains there is `Take` and builder traffic, which needs a\ndictionary to cross an operator\nboundary — measured and rejected in ADR 0028.\n\nCloses #\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [x] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run ci\n100% tests passed out of 2729\n\n$ pixi run lint\nclang-format (C/C++).....................................................Passed\ntypos (spelling).........................................................Passed\nmarkdownlint-cli2 (Markdown).............................................Passed\ncheck_repo.py (repo drift and policy, R001-R015).........................Passed\n# shellcheck reports 36 SC2218 findings in tools/github/apply-settings.sh, all\n# pre-existing on main and macOS-only (a newer shellcheck than CI's); none in\n# this diff.\n\n$ ANTB1_DIFF_SEED=20261018 pixi run diff-random\nDIFF: PASS seed=20261018 queries=2000 failed=0 unsupported=0\n\n$ pixi run test -L metamorphic -R regexp\n100% tests passed out of 3\n# includes regexp_replace_keys_batch_size_invariance, which is the relation that\n# matters here: the gate reads a per-batch dictionary.\n\n$ clang-tidy -p build/tidy --warnings-as-errors='*' src/exec/compute.cc src/exec/tests/compute_test.cc\n# no findings in either file\n\n$ build/ci-asan/bin/antb1_exec_tests --gtest_filter='ComputeTest.*Regexp*:ComputeTest.*Rewritten*'\n[  PASSED  ] 3 tests.\n# ASan+UBSan. `pixi run asan` itself fails at test discovery on macOS for a\n# pre-existing reason (a curl_global_init leak from libazure-core).\n```\n\nMutation-checked, each one against\n`exec.ComputeTest.ARewrittenRegexpReplaceTailMatchesTheDotTail`\nand `slt.expressions.strings`; every one fails a test when removed:\n\n| removed | caught by |\n| --- | --- |\n| the per-value newline mask | the newline rows of every `.*$` case |\n| the UTF-8 validation | the invalid-byte array (divergence D15) |\n| the continuation-byte boundary test | a character split across two\nvalues |\n| the escaped-dot parity in `TailCanRunByteWise` | an escaped `\\.*$`,\nwhich is a literal dot |\n| the `$` in the pattern test | a `.*` that is not a tail |\n| the `\\C` / `\\B` rejection | `^.\\C.*$` and `\\B.*$`, in the unit test\nand the new `.slt` block |\n\nOne direction is not mutation-testable and is worth knowing: a\ndifferential test can only catch a\n*wrong* rewrite, never a missing one, so dropping the `++i` that makes\n`\\\\C` a backslash-and-a-C\nwould silently cost speed on such a pattern without failing anything. It\nis a speed-only property\nwith no public signal to assert on.\n\nTPC-H sf10 at 14 threads was run as a control and is unchanged; no TPC-H\nquery uses\n`regexp_replace`, so the changed path is unreachable there.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [ ] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer\n\n**`docs/adr/0012-scalar-expressions.md` is the CODEOWNERS piece** — it\nrecords the rewrite, the gate\nand the measurement beside PR #168's entry and the two ideas already\nrejected there. No other\nprotected path is touched.\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5) wrote\nthe change, the tests and the\nADR amendment, took the measurements, and ran the `reviewer` subagent on\nthe diff.\n- Accountable human (has read and understands the whole diff): @",
+          "timestamp": "2026-10-18T17:37:42+03:00",
+          "tree_id": "e1f23da40350f37a8d28fb2f1525678bdf57755a",
+          "url": "https://github.com/ydb-campus/antb1/commit/051e6d2eb76c042b8eedf961761a36af0f671fc4"
+        },
+        "date": 1792334491749,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4991.252856260178,
+            "unit": "ns/iter",
+            "extra": "iterations: 140831\ncpu: 4990.672224155193 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84222.19587498238,
+            "unit": "ns/iter",
+            "extra": "iterations: 7903\ncpu: 84213.70568138683 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222010.56353239957,
+            "unit": "ns/iter",
+            "extra": "iterations: 3148\ncpu: 221994.1629606099 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 443710.86573780095,
+            "unit": "ns/iter",
+            "extra": "iterations: 1579\ncpu: 443673.0006333119 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 401645.0137772658,
+            "unit": "ns/iter",
+            "extra": "iterations: 1742\ncpu: 401604.53272101004 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2101416.314371256,
+            "unit": "ns/iter",
+            "extra": "iterations: 334\ncpu: 2101244.6167664677 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 51.31533161538361,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 51.31090669230767 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 45.29005246666694,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 45.26725886666666 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 183.97489150000013,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 183.9401607500002 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.323031673469865,
+            "unit": "ms/iter",
+            "extra": "iterations: 49\ncpu: 14.322027428571431 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 20.09470928571448,
+            "unit": "ms/iter",
+            "extra": "iterations: 35\ncpu: 20.09258454285714 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 37.557386736841934,
+            "unit": "ms/iter",
+            "extra": "iterations: 19\ncpu: 37.55102789473681 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.6653679568345277,
+            "unit": "ms/iter",
+            "extra": "iterations: 417\ncpu: 1.6651952134292551 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 99.44017414285408,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 99.42177457142876 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1000",
+            "value": 28.15321479999966,
+            "unit": "ms/iter",
+            "extra": "iterations: 25\ncpu: 28.15117812000004 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16384",
+            "value": 31.191659136364468,
+            "unit": "ms/iter",
+            "extra": "iterations: 22\ncpu: 31.1897598181819 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/262144",
+            "value": 65.39850220000005,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 65.38971380000014 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1048576",
+            "value": 98.37431142856953,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 98.36031085714275 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/4194304",
+            "value": 352.5287675000044,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 352.49843049999896 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16777216",
+            "value": 1674.8426039999913,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1674.7093029999967 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1000",
+            "value": 34.611433100000966,
+            "unit": "ms/iter",
+            "extra": "iterations: 20\ncpu: 34.604868649999965 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16384",
+            "value": 39.26343344444503,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 39.259259 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/262144",
+            "value": 68.05502880000063,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 68.04516440000015 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1048576",
+            "value": 121.21864100000153,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 121.20738320000014 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/4194304",
+            "value": 413.85128350000855,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 413.7602959999995 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16777216",
+            "value": 1988.8268420000088,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1988.596667000003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1000",
+            "value": 58.998427250000894,
+            "unit": "ms/iter",
+            "extra": "iterations: 12\ncpu: 58.99083691666658 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16384",
+            "value": 63.188541727271286,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 63.184585363636685 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/262144",
+            "value": 94.76812328571782,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 94.74751899999998 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1048576",
+            "value": 166.50108075000247,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 166.4826210000001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/4194304",
+            "value": 507.78907299999787,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 507.7180820000038 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16777216",
+            "value": 2323.385868999992,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2323.190387999993 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1000",
+            "value": 70.10708669999985,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 70.09542190000033 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16384",
+            "value": 74.94999999999803,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 74.9434568888887 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/262144",
+            "value": 111.69261383333169,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 111.6812403333339 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1048576",
+            "value": 191.97587349999878,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 191.93893824999896 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/4194304",
+            "value": 567.9725239999982,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 567.9144369999989 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16777216",
+            "value": 2588.1169519999785,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2587.8308059999995 ms\nthreads: 1"
           }
         ]
       }
