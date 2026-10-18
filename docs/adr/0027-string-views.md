@@ -4,7 +4,7 @@ Date: 2026-10-15
 
 ## Status
 
-Proposed
+Proposed (deferred: S3 measured the lever at 18% of one query, not at the gap; see S3)
 
 ## Context
 
@@ -163,6 +163,53 @@ One PR per id. See S1's dated update: the order below is **S2 then S1**, not as 
   rejects view keys outright.
 - **S3, docs(adr): record what S1 and S2 measured**, and either accept this ADR or move it to
   `Proposed (deferred)` with the numbers that say why.
+  - Update (2026-10-18, S3): **deferred, and neither S1 nor S2 was built.** S2 lost its host and S1 still has no
+    consumer, so what follows is measured around them rather than by them. Four results, in the order they land on
+    this ADR:
+    1. **S2 has no host.** [ADR 0019](0019-own-aggregation-hash-table.md)'s own table was finished and measured in
+       the pipeline on 2026-10-18 and **reaches parity, not a win**: every table this engine builds falls in the
+       10^4-10^6 band, where that design is 0.46-0.88x of `arrow::compute::Grouper`, and its 1.4-1.6x wins are at
+       4-16 M groups, which the partitioning prevents. S2 is "the inline-string key layout, inside ADR 0019's own
+       hash table"; there is no table to put it in. The key layout itself was tried on that prototype and removed
+       only *false* candidates — which the stored hash already removed — so it bought nothing measurable.
+    2. **The ClickBench gap is not string-shaped, which is the result this ADR would most have liked to be wrong.**
+       Over the official single file at 14 threads, best of three, execution time: the six grouped queries that carry
+       the whole remaining gap are 7.205 s against DuckDB's 4.611 s (1.56x, +2.59 s), while **the other 37 are
+       0.83x** — faster than DuckDB. Inside those six, q32 keys on a BIGINT and an INTEGER with no string anywhere
+       and runs **1.61x**, against 1.62x and 1.57x for the two keyed on a VARCHAR URL and 1.47x and 1.49x for the two
+       whose keys include a VARCHAR phrase. The deficit is the same with and without strings. Two other queries
+       *grouped on a VARCHAR* run 1.05x and 0.80x, and a pure string filter runs 0.80x. So the gap tracks group
+       cardinality and not key type, and an inline-string key layout cannot close it. (String *handling* on the scan
+       side is already by reference: [ADR 0020](0020-filter-pushdown.md)'s pushdown compares, `LIKE`s and `IN`s
+       through `plan::ScanValues`'s views without copying.)
+    3. **The string cost this ADR predicted is real, and it is 18% of the worst query.** The prediction was isolated
+       on the 22 at SF 100, 14 threads, best of three, by removing the one VARCHAR column from the query with the
+       largest absolute deficit — its remaining key functionally determines that column, so the group count and every
+       row count are unchanged:
+
+       | the query with the largest deficit | time | peak memory |
+       | --- | ---: | ---: |
+       | as written, one VARCHAR among five keys | 8.407 s | 15.36 GB |
+       | without the VARCHAR column | 6.860 s | 12.84 GB |
+       | **the marginal cost of one VARCHAR key** | **+1.55 s (18%)** | **+2.5 GB** |
+
+       That reproduces this ADR's +8.52 s for four keys at 4 threads in kind and in order of magnitude, so the
+       Context's measurement stands. What it does not support is the conclusion: **the same query without any VARCHAR
+       at all is still 3.1x DuckDB** (6.860 s against 2.188 s). A view gather would remove most of the copy half of
+       1.55 s on an 8.4 s query that is 3.9x off the oracle.
+    4. **What the gap actually is, in the same profile.** That query materialises **600,037,902 rows to keep
+       44,786**: an inner join whose `gather` costs 26.692 s summed over parts, under a semi join that then discards
+       all but 44,786 rows, with a build side of 6,398. The cost is the *number of rows gathered*, not the bytes of
+       the strings among them. DuckDB answers it in 2.17 s by computing that 6,398-row filter first and pushing it
+       into both Parquet scans. That is [ADR 0029](0029-dynamic-join-filters.md), and it is a different lever
+       entirely.
+  - **The trigger to reopen.** This ADR stays deferred rather than rejected, because nothing in it was refuted
+    except its ranking. Reopen when any one of: ADR 0029 or a semi-join ordering rule removes the 600 M-row
+    materialisation, so that what remains at that site is the string bytes and an 18% lever is the top of the list;
+    ADR 0019's table finds a shape that beats the grouper, giving S2 a host again; or a later Arrow accepts view
+    types in `take`, `filter`, `sort_indices` and `Grouper`, which turns the whole-engine alternative from a sweep
+    into a type change. The probe of Arrow 25 in the Context is the thing to re-run first, since it is what makes
+    the difference.
 
 Deliberately out of scope: decoding Parquet into `BINARY_VIEW` (ADR 0019 measured 10-16% and the decode is not
 zero-copy); changing the engine's VARCHAR type; and late materialization, which is ADR 0016's and is a different
