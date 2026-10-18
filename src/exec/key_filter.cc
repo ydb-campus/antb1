@@ -14,12 +14,12 @@
 
 namespace antb1::exec {
 
-arrow::Result<std::shared_ptr<KeyFilter>> KeyFilter::Make(int64_t keys, MemoryBudget* budget) {
-  if (keys <= 0) {
+arrow::Result<std::shared_ptr<KeyFilter>> KeyFilter::Make(int64_t num_keys, MemoryBudget* budget) {
+  if (num_keys <= 0) {
     return nullptr;
   }
   // Whole blocks, rounded up to a power of two so the block index is a mask and not a division.
-  const int64_t bits = keys * kBitsPerKey;
+  const int64_t bits = num_keys * kBitsPerKey;
   const int64_t words = (bits + 31) / 32;
   const auto blocks_wanted = static_cast<std::uint64_t>(
       (words + Narrow<int64_t>(kWordsPerBlock) - 1) / Narrow<int64_t>(kWordsPerBlock));
@@ -40,9 +40,9 @@ arrow::Result<std::shared_ptr<KeyFilter>> KeyFilter::Make(int64_t keys, MemoryBu
   auto filter = std::shared_ptr<KeyFilter>(new KeyFilter());
   filter->memory_.Reset(budget);
   ARROW_RETURN_NOT_OK(filter->memory_.Resize(bytes));
-  filter->words_.assign(static_cast<std::size_t>(blocks) * kWordsPerBlock, 0);
+  filter->words_.assign(blocks * kWordsPerBlock, 0);
   filter->block_mask_ = blocks - 1;
-  filter->keys_ = keys;
+  filter->keys_ = num_keys;
   return filter;
 }
 

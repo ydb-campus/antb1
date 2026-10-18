@@ -44,12 +44,13 @@ class KeyFilter {
   // conservative side of it.
   static constexpr int64_t kMaxBytes = int64_t{16} * 1024 * 1024;
 
-  // A filter sized for `keys` of them, every bit clear, charged to `budget` (nullptr: no budget).
-  // Null -- not an error -- when `keys` is not positive or when the filter would not fit the
+  // A filter sized for `num_keys` of them, every bit clear, charged to `budget` (nullptr: no
+  // budget). Null -- not an error -- when `num_keys` is not positive or when the filter would not
+  // fit the
   // budget: a filter that cannot be afforded is one the probe does without, exactly as it does
   // today, which is why this is not an OutOfMemory. OutOfMemory only if the reservation the size
   // test already approved then fails.
-  static arrow::Result<std::shared_ptr<KeyFilter>> Make(int64_t keys, MemoryBudget* budget);
+  static arrow::Result<std::shared_ptr<KeyFilter>> Make(int64_t num_keys, MemoryBudget* budget);
 
   // Adds `hash`. Not thread-safe: the build fills the filter on one thread before any probe reads
   // it.
@@ -105,7 +106,10 @@ class KeyFilter {
   // already chose the bits within it; a mask rather than a modulo, so the count need not be a
   // prime.
   [[nodiscard]] std::size_t BlockAt(std::uint64_t hash) const {
-    return static_cast<std::size_t>((hash >> 32U) & block_mask_) * kWordsPerBlock;
+    // No cast: the masked hash is a uint64_t, which *is* size_t on linux-64, so GCC reads a cast
+    // here as useless and -Werror stops the build. Both are 64-bit unsigned on every platform this
+    // builds for, so the implicit conversion changes no value and warns nowhere.
+    return ((hash >> 32U) & block_mask_) * kWordsPerBlock;
   }
   [[nodiscard]] const std::uint32_t* BlockOf(std::uint64_t hash) const {
     return words_.data() + BlockAt(hash);
