@@ -170,6 +170,7 @@ void JoinBuild::Release() {
   table_.reset();
   values_.reset();
   marks_.reset();
+  key_filter_.reset();
   ReleaseBuilds(builds_);
 }
 
@@ -288,6 +289,8 @@ arrow::Status JoinBuild::BuildTable(ExecContext& ctx) {
   ARROW_RETURN_NOT_OK(status);
   {
     const ProfileTimer finish(profile_, "finish");
+    // Before Finish: it frees the parts the per-row hashes live in (ADR 0029's D1).
+    ARROW_ASSIGN_OR_RAISE(key_filter_, builder->MakeKeyFilter());
     ARROW_ASSIGN_OR_RAISE(table_, builder->Finish());
     if (kind_ == plan::JoinKind::kOneRow) {
       // A planner bug, never an answer: SQL plans only an aggregate without groups here.

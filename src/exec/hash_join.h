@@ -106,6 +106,11 @@ class JoinBuild {
 
   // The table: nullptr before Prepare, after a failed one and after Release.
   [[nodiscard]] const std::shared_ptr<const JoinTable>& table() const { return table_; }
+  // The filter over the build's key hashes, for the scan of its probe side to reject rows with
+  // (ADR 0029's D1); nullptr when the keys are not one a scan can hash, when the filter did not fit
+  // the budget, or before Prepare. Whether a probe scan may *use* it is the physical planner's
+  // decision, not this one: a join that emits unmatched probe rows must not drop any.
+  [[nodiscard]] const std::shared_ptr<const KeyFilter>& key_filter() const { return key_filter_; }
   // The marks of the table's rows while it holds them, for the probes to mark into and for the
   // join to read once they are done; nullptr unless PrepareMarks made them.
   [[nodiscard]] JoinMarks* marks() const { return marks_.get(); }
@@ -129,6 +134,7 @@ class JoinBuild {
   std::shared_ptr<const JoinTable> table_;
   std::shared_ptr<const OneRowValues> values_;
   std::unique_ptr<JoinMarks> marks_;
+  std::shared_ptr<const KeyFilter> key_filter_;
 };
 
 // Whether a join of `kind` building on `side` outputs its build's rows rather than its probe's

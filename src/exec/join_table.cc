@@ -1110,6 +1110,38 @@ arrow::Status JoinTableBuilder::Merged() {
   });
 }
 
+arrow::Result<std::shared_ptr<const KeyFilter>> JoinTableBuilder::MakeKeyFilter() const {
+  // One key, and of a type a Parquet scan decodes to the same values the build hashed: the probe
+  // side hashes with KeyHashes over the scan's own array, so the two agree only when the one key
+  // column is there to hash. (The same restriction LeadingKeyField states for a sort key.)
+  if (spec_ == nullptr || spec_->keys().size() != 1 ||
+      !(plan::IsInteger(spec_->keys().front().type) ||
+        spec_->keys().front().type == plan::LogicalType::kDate)) {
+    return nullptr;
+  }
+  int64_t rows = 0;
+  for (const std::shared_ptr<const JoinBuildPart>& part : parts_) {
+    if (part != nullptr) {
+      rows += part->num_rows();
+    }
+  }
+  ARROW_ASSIGN_OR_RAISE(std::shared_ptr<KeyFilter> filter, KeyFilter::Make(rows, budget_));
+  if (filter == nullptr) {
+    return nullptr;  // no keys, or no room: the probe runs as it does without one
+  }
+  // In part order, though the order cannot matter: setting a bit twice sets it once, so the filter
+  // is the same whatever order the parts arrived in or the merges ran in.
+  for (const std::shared_ptr<const JoinBuildPart>& part : parts_) {
+    if (part == nullptr) {
+      continue;
+    }
+    for (const JoinBuildPart::Piece& piece : part->pieces_) {
+      filter->Add(piece.hashes);
+    }
+  }
+  return filter;
+}
+
 arrow::Result<std::shared_ptr<const JoinTable>> JoinTableBuilder::Finish() {
   if (finished_) {
     return arrow::Status::Invalid("a join build finished twice");

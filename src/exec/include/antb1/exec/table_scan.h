@@ -7,6 +7,7 @@
 
 #include <arrow/record_batch.h>
 
+#include "antb1/exec/key_filter.h"
 #include "antb1/exec/operator.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/table.h"
@@ -41,10 +42,19 @@ constexpr int64_t RowIdOffset(int64_t id) { return id % (kRowIdParts * 2); }
 // table reports.
 class TableScanOperator final : public Operator {
  public:
+  // A hash join's key filter over one field of the scan (docs/adr/0029-dynamic-join-filters.md,
+  // D1), for a part's scan with no pushed predicates: the scan drops the rows whose key the build
+  // cannot hold, so the join never sees them.
+  struct KeyScan {
+    std::shared_ptr<const KeyFilter> filter;
+    int column = 0;  // a position in `fields`, of the probe's one key column
+  };
+
   TableScanOperator(std::shared_ptr<plan::Table> table, std::vector<int> fields,
                     std::optional<int64_t> part = std::nullopt,
                     std::optional<LateScan> late = std::nullopt,
-                    std::vector<plan::Predicate> pushed = {});
+                    std::vector<plan::Predicate> pushed = {},
+                    std::optional<KeyScan> key_scan = std::nullopt);
 
   [[nodiscard]] const std::shared_ptr<arrow::Schema>& output_schema() const override {
     return schema_;
@@ -59,6 +69,7 @@ class TableScanOperator final : public Operator {
   std::optional<int64_t> part_;
   std::optional<LateScan> late_;
   std::vector<plan::Predicate> pushed_;
+  std::optional<KeyScan> key_scan_;
   std::vector<int> read_;  // the fields read: fields_ but the late ones
   std::shared_ptr<arrow::Schema> schema_;
   std::unique_ptr<arrow::RecordBatchReader> reader_;

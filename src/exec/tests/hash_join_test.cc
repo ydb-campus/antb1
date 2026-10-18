@@ -3689,6 +3689,68 @@ TEST_F(HashJoinPlanTest, EveryKindGivesTheSameResultsOnOneAndFourThreads) {
 // scan in its own parts: the probe's 6 parts and the build's 2 apply their own predicates while
 // they read (no probe part number reaches the build, which has no part 5). A Filter above the join
 // reads the join's columns and pushes nothing. The rows are the same either way.
+// A join whose build is small against its probe has its key filter pushed into the probe's scan
+// (ADR 0029's D1): the scan drops the rows whose key the build cannot hold, so the join never sees
+// them. Two things have to hold. The answer must be the one the join alone gives -- the filter may
+// only remove rows the join removes anyway -- and a join that emits an unmatched probe row must not
+// be filtered at all, since there the dropped rows are the answer.
+//
+// The control runs the same join with an always-true predicate pushed into the probe's scan: a scan
+// takes one filter, so the static one takes the slot and no key filter is attached, which makes the
+// two arms differ in the key filter and nothing else (the same decoder, the same rows read).
+TEST_F(HashJoinPlanTest, AKeyFilterDropsProbeRowsAndKeepsTheAnswer) {
+  const auto pool = MakeThreadPool();
+  const auto pk = MixedColumn("p", 0);
+  const auto bk = MixedColumn("b", 0);
+  const auto always = testing::Compare(MixedColumn("p", 2), plan::CompareOp::kGe,
+                                       testing::BigInt(0));  // p_id >= 0: every row
+  const auto probe_keys = [](int64_t i) -> std::optional<int64_t> {
+    return i % 37 == 11 ? std::optional<int64_t>{} : std::optional<int64_t>(i % 60);
+  };
+  const auto build_keys = [](int64_t i) -> std::optional<int64_t> { return i * 7; };
+  for (arrow::internal::Executor* executor : Executors(pool.get())) {
+    SCOPED_TRACE(executor == nullptr ? "one thread" : "pool");
+    // 480 probe rows against 5 build rows: 480 / kFilterBuildShare is 30, well above 5, so the
+    // filter is taken. The build's keys are 0, 7, 14, 21 and 28, so most probe keys cannot match.
+    const auto build = MixedTable("b", 1, 5, build_keys);
+    for (const plan::JoinKind kind :
+         {plan::JoinKind::kInner, plan::JoinKind::kSemi, plan::JoinKind::kAnti}) {
+      SCOPED_TRACE(static_cast<int>(kind));
+      // An inner join emits both sides' columns; a semi or anti join its probe's alone.
+      const std::size_t columns = kind == plan::JoinKind::kInner ? 6U : 3U;
+      // An anti join of this orientation emits the probe rows that found no match, so the rows a
+      // filter would drop are exactly the rows it must keep: it must not be filtered.
+      const bool filtered = kind != plan::JoinKind::kAnti;
+      const auto one = MixedTable("p", 6, 80, probe_keys);
+      auto got =
+          RunPlan(PlanOf(JoinOf(kind, ScanOf(one, "p"), ScanOf(build, "b"), {pk}, {bk}), columns),
+                  ContextOf(executor));
+      ASSERT_TRUE(got.ok()) << got.status().ToString();
+      EXPECT_EQ(one->filtered_scans(), filtered ? 6 : 0);
+      const auto two = MixedTable("p", 6, 80, probe_keys);
+      auto control = RunPlan(
+          PlanOf(JoinOf(kind,
+                        Node(plan::FilterNode{.input = ScanOf(two, "p"), .predicates = {always}}),
+                        ScanOf(build, "b"), {pk}, {bk}),
+                 columns),
+          ContextOf(executor));
+      ASSERT_TRUE(control.ok()) << control.status().ToString();
+      EXPECT_EQ(two->filtered_scans(), 6) << "the control's own predicate should be pushed";
+      EXPECT_EQ(RowsOf(**got), RowsOf(**control));
+      EXPECT_FALSE(RowsOf(**got).empty());
+    }
+    // A build as large as what it would filter rejects too little to pay for the hash of every
+    // probe row, so it is refused: 480 rows against 480 is far past kFilterBuildShare.
+    const auto wide = MixedTable("p", 6, 80, probe_keys);
+    const auto big = MixedTable("b", 6, 80, build_keys);
+    auto large = RunPlan(
+        PlanOf(JoinOf(plan::JoinKind::kInner, ScanOf(wide, "p"), ScanOf(big, "b"), {pk}, {bk}), 6),
+        ContextOf(executor));
+    ASSERT_TRUE(large.ok()) << large.status().ToString();
+    EXPECT_EQ(wide->filtered_scans(), 0) << "a build this size must not be filtered with";
+  }
+}
+
 TEST_F(HashJoinPlanTest, FilterPushdownReachesEachSideWithItsOwnParts) {
   const auto pool = MakeThreadPool();
   const auto pk = MixedColumn("p", 0);
@@ -3723,6 +3785,10 @@ TEST_F(HashJoinPlanTest, FilterPushdownReachesEachSideWithItsOwnParts) {
                                                     testing::BigInt(6))}});
     auto kept = RunPlan(PlanOf(above, 6), ContextOf(executor));
     ASSERT_TRUE(kept.ok()) << kept.status().ToString();
+    // No static predicate reaches either scan -- the Filter above the join reads the join's
+    // columns -- and the join's own key filter (ADR 0029's D1) is refused here too: this probe has
+    // 42 rows against a 12-row build, far too few for a filter to pay for the hash of every probe
+    // row. ASemiJoinKeyFilterDropsRowsAndKeepsTheAnswer covers the shape where it is taken.
     EXPECT_EQ(q->filtered_scans(), 0);
     EXPECT_EQ(c->filtered_scans(), 0);
     EXPECT_EQ(RowsOf(**kept), RowsOf(**pushed));

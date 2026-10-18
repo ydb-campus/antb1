@@ -518,6 +518,87 @@ std::vector<int> ReadFields(const plan::ScanNode& scan, const LateScan* late) {
   return read;
 }
 
+// The most of a probe's rows a build may hold and still be worth filtering with: a build of more
+// than this share of them rejects too little to pay for the hash of every probe row (ADR 0029's
+// D1).
+constexpr int64_t kFilterBuildShare = 16;
+
+// The key filter of the innermost join of this part pipeline, over the position of the probe key
+// in `scan`'s field list, for the scan to reject rows that can match nothing (ADR 0029's D1); none
+// when no join of the pipeline offers one this scan can apply. The conditions, in order:
+//
+//   - only the innermost join is a candidate. The chain from any other one's probe input passes
+//     through a join, which prepends the other side's width, so a column index above it is not a
+//     column index at the scan -- the same hazard LeadingKeyField states.
+//   - the join must not emit an unmatched probe row, or dropping one would lose an answer. INNER
+//     and SEMI never do; ANTI and LEFT only when they build on their left and emit build rows
+//     (EmitsBuildRows), which is the form ADR 0026's C2b gave them. A null-aware anti join is
+//     excluded outright: it answers from the whole set, not row by row.
+//   - one key, whose column maps to a field of the scan through FilterNodes alone (a Compute
+//     appends, a Project reorders), and whose type the build hashed and a scan decodes the same.
+//   - the build must have published a filter (its keys may not be hashable, or it may not have
+//     fit the budget), and the table must support a scan filter at all over the fields it reads.
+//
+// Called per part, from the part's own pipeline build, which is why the build has already finished
+// and `key_filter()` is there to read (hash_join.cc's PrepareBuilds).
+std::optional<TableScanOperator::KeyScan> KeyScanOf(const plan::ScanNode& scan,
+                                                    const PipelineBuilds* builds,
+                                                    const std::optional<LateScan>& late) {
+  if (builds == nullptr || builds->joins.empty() || builds->builds.empty() || late.has_value()) {
+    return std::nullopt;  // a narrow scan reads other fields: its indices are the late scan's
+  }
+  const plan::JoinNode* join = builds->joins.back();
+  const std::shared_ptr<JoinBuild>& build = builds->builds.back();
+  if (join == nullptr || build == nullptr) {
+    return std::nullopt;
+  }
+  if (join->kind != plan::JoinKind::kInner && join->kind != plan::JoinKind::kSemi &&
+      !EmitsBuildRows(join->kind, join->build)) {
+    return std::nullopt;
+  }
+  if (join->kind == plan::JoinKind::kNullAwareAnti || join->kind == plan::JoinKind::kOneRow) {
+    return std::nullopt;
+  }
+  const arrow::Result<JoinShape> shape = ShapeOf(*join);
+  if (!shape.ok() || shape->probe_keys.size() != 1) {
+    return std::nullopt;
+  }
+  const int column = shape->probe_keys.front();
+  if (column < 0 || std::cmp_greater_equal(column, scan.fields.size())) {
+    return std::nullopt;
+  }
+  // Only FilterNodes between the join's probe input and the scan preserve a column's index.
+  for (const plan::LogicalNode* n = PipelineInput(*join); n != nullptr; n = PipelineInput(*n)) {
+    if (std::holds_alternative<plan::ScanNode>(*n)) {
+      if (&std::get<plan::ScanNode>(*n) != &scan) {
+        return std::nullopt;  // another scan of the pipeline, not this one
+      }
+      break;
+    }
+    if (!std::holds_alternative<plan::FilterNode>(*n)) {
+      return std::nullopt;
+    }
+  }
+  if (build->key_filter() == nullptr ||
+      !scan.table->supports_scan_filter(ReadFields(scan, nullptr))) {
+    return std::nullopt;
+  }
+  // The build must be small against what it filters, or the filter holds so many keys that it
+  // rejects nothing and the probe pays the hash for it. A build's rows are an upper bound on its
+  // distinct keys, and the probe's table rows a lower bound on what the filter is asked about, so
+  // the ratio errs towards refusing -- which is the right direction for a filter that is only ever
+  // an optimisation. Measured: the four queries this helps build 0.01 to 0.02 of their probe's
+  // rows, and the one it cost 14% builds 0.25 of them (every key of the probe's domain), so the
+  // share separates them by an order of magnitude either way.
+  const std::shared_ptr<const JoinTable>& table = build->table();
+  const std::optional<int64_t> probe_rows = scan.table->exact_row_count();
+  if (table == nullptr || !probe_rows.has_value() ||
+      table->num_rows() > *probe_rows / kFilterBuildShare) {
+    return std::nullopt;
+  }
+  return TableScanOperator::KeyScan{.filter = build->key_filter(), .column = column};
+}
+
 // One overload per logical node type: a node type without one fails to compile.
 struct Builder {
   std::optional<int64_t> part;     // inside the pipeline of this part
@@ -552,10 +633,23 @@ struct Builder {
     if (node.table == nullptr) {
       return arrow::Status::Invalid("scan without a table");
     }
+    const std::optional<LateScan> late_scan =
+        late == nullptr ? std::nullopt : std::optional<LateScan>(*late);
+    // A dynamic join filter, where this scan is the probe side of a join whose build published one
+    // (ADR 0029's D1). Only here, on a scan with no predicates of its own: a scan takes one filter.
+    std::optional<TableScanOperator::KeyScan> key_scan;
+    if (part.has_value()) {
+      key_scan = KeyScanOf(node, builds, late_scan);
+    }
     Name("Scan");
-    return std::make_unique<TableScanOperator>(
-        node.table, node.fields, part,
-        late == nullptr ? std::nullopt : std::optional<LateScan>(*late));
+    // Per part, so a reader can see the filter is in use. It is a metric and not the node's detail
+    // because the plan-time build of this pipeline runs before the join's build exists and so
+    // carries no filter -- and only that first build may write a name or a detail.
+    if (key_scan.has_value() && slot != nullptr) {
+      slot->Max("key_filter", MetricUnit::kCount, 1);
+    }
+    return std::make_unique<TableScanOperator>(node.table, node.fields, part, late_scan,
+                                               std::vector<plan::Predicate>{}, std::move(key_scan));
   }
   OperatorResult operator()(const plan::FilterNode& node) const {
     Name("Filter");
