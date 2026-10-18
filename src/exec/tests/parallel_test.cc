@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <limits>
 #include <map>
@@ -1681,6 +1682,61 @@ TEST_F(PartOperatorsTest, HeavyKeysSpreadOverThePartitions) {
                             [&](std::size_t p) { return !(*by_x)->partition_groups(p).empty(); }),
       50)
       << "400 values of x over 64 partitions";
+}
+
+// A key column reaches KeyHashes sliced (the routed rows of a materialized batch, a partition's
+// keys), and the hash of a row is its own bytes wherever the slice starts: the type of a column and
+// the base of its values are read once per column, not per row, so the offset has to be applied
+// once rather than forgotten.
+TEST_F(PartOperatorsTest, KeyHashesOfASliceAreTheHashesOfThoseRows) {
+  const auto numbers = Int64s({10, 20, 30, 40, 50, 60, 70, 80});
+  const auto strings = testing::Strings(
+      {"a", "bb", std::nullopt, "dddd", "eeeee", "ffffff", std::nullopt, "hhhhhhhh"});
+  arrow::BooleanBuilder flags;
+  const std::vector<bool> bits = {true, false, true, true, false, false, true, false};
+  ASSERT_TRUE(flags.AppendValues(bits).ok());
+  const auto booleans = flags.Finish().ValueOrDie();
+  for (const auto& column : arrow::ArrayVector{numbers, strings, booleans}) {
+    for (const int64_t offset : {int64_t{1}, int64_t{3}, int64_t{5}}) {
+      const int64_t length = column->length() - offset;
+      const auto sliced = KeyHashes(arrow::compute::ExecBatch({column->Slice(offset)}, length));
+      ASSERT_TRUE(sliced.ok()) << sliced.status().ToString();
+      const auto whole = KeyHashes(arrow::compute::ExecBatch({column}, column->length()));
+      ASSERT_TRUE(whole.ok()) << whole.status().ToString();
+      const std::vector<std::uint64_t> expected(whole->begin() + offset, whole->end());
+      EXPECT_EQ(*sliced, expected) << column->type()->ToString() << " from " << offset;
+    }
+  }
+}
+
+// A fixed-width column is allowed to carry no values buffer when it has no rows, or when every row
+// of it is NULL, and the base of its values is taken once per column rather than per row: the
+// column has to be reached through GetValues, which gives nullptr for those, and not through
+// buffers[1]->data(), which dereferences one.
+TEST_F(PartOperatorsTest, KeyHashesOfAColumnWithNoValuesBuffer) {
+  const auto no_rows =
+      arrow::MakeArray(arrow::ArrayData::Make(arrow::int64(), 0, {nullptr, nullptr}, 0));
+  ASSERT_EQ(no_rows->data()->buffers[1], nullptr);
+  const auto empty = KeyHashes(arrow::compute::ExecBatch({no_rows}, 0));
+  ASSERT_TRUE(empty.ok()) << empty.status().ToString();
+  EXPECT_TRUE(empty->empty());
+
+  constexpr int64_t kNullRows = 8;
+  auto bitmap = arrow::AllocateBitmap(kNullRows).ValueOrDie();
+  std::memset(bitmap->mutable_data(), 0, static_cast<std::size_t>(bitmap->size()));
+  const auto all_null = arrow::MakeArray(
+      arrow::ArrayData::Make(arrow::int64(), kNullRows, {bitmap, nullptr}, kNullRows));
+  ASSERT_EQ(all_null->data()->buffers[1], nullptr);
+  ASSERT_EQ(all_null->null_count(), kNullRows);
+  const auto nulls = KeyHashes(arrow::compute::ExecBatch({all_null}, kNullRows));
+  ASSERT_TRUE(nulls.ok()) << nulls.status().ToString();
+  // Every row is the one NULL hash, which is what a column of NULLs hashed to before.
+  const auto expected = KeyHashes(
+      arrow::compute::ExecBatch({Int64s({std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+                                         std::nullopt, std::nullopt, std::nullopt, std::nullopt})},
+                                kNullRows));
+  ASSERT_TRUE(expected.ok()) << expected.status().ToString();
+  EXPECT_EQ(*nulls, *expected);
 }
 
 // ---- rows routed past the parts' own tables ----
