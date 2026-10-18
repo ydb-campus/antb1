@@ -43,6 +43,37 @@ Accepted (with the maintainer-approved plan for scalar expressions)
   rows do not match q28's pattern). End to end q28 went 3.330 s to 2.740 s, **0.823x** -- 0.59 s off the largest
   query of the 43. The binder's rejections (`\Q` in a pattern, `\8` and `\9` in a replacement) stay unconditional,
   so which form the evaluator picks is invisible apart from the speed.
+  Update (2026-10-18): **a trailing `.*$` is rewritten to `\C*$`.** The match is replaced along with
+  everything else, so the tail's bytes are thrown away and all that scan establishes is that they are
+  characters and that none of them is a newline; `\C*`, RE2's any byte, establishes nothing and skips
+  bytes instead of decoding characters. Over 977,975 Referer values that is 0.444 us a value against
+  **0.197** -- the speed of running RE2 in Latin-1 with `dot_nl`, but through Arrow's own kernel, so
+  with no new dependency. (`(?s:.*)$` is 0.389: the win is the byte-wise skip, not the newline flag.)
+  The two tails read a value the same way only where it is a whole number of characters and holds no
+  newline, so the rewrite is guarded on both, off the batch's distinct values before the regex runs:
+  UTF-8 in one pass over all of them (plus a test that no value starts on a continuation byte, since
+  the concatenation can validate where a value alone does not), and a newline **per value**, not per
+  batch. Per batch was the first form and it gave back 57% of the win: one newline among a batch's
+  ~20 K distinct values takes the rewrite off every one of them, and about 2,200 of ClickBench's
+  100 M Referer values hold one -- enough to reach more than half the batches. The values that do
+  hold one run the pattern as written and go back in place with `replace_with_mask`. That is
+  correctness and not only speed: for an unanchored pattern the two tails answer differently there,
+  since `.*$` cannot match across the newline and the leftmost match therefore starts after it,
+  where `\C*$` matches from the front.
+  The pattern must also start the tail where a character starts, which whole values do not give on
+  their own: `\C`, which consumes one byte, and `\B`, which is a word boundary over bytes and so
+  holds between the bytes of a character, both leave the cursor inside one, and there `.*$` fails --
+  no lone continuation byte is a character -- where `\C*$` eats the rest of it. `\B.*$` over a value
+  of `a` and U+00E9 answered `61 C3 58`, a result that is not valid UTF-8 from input that is. Those
+  two are the only constructs that can do it: `\b` cannot, since no byte of a multi-byte character
+  is an ASCII word character, so it sees non-word on both sides and fails; `^`, `$`, `\A`, `\z` and
+  their `(?m)` forms are all at a character boundary; and everything that matches a rune consumes it
+  whole. So a pattern holding an unescaped `\C` or `\B` keeps the slower tail, and the rest of the
+  pattern test is deliberately conservative -- the last three characters, with an even number of
+  backslashes before the dot -- so `(.*)$` and `.{0,}$` keep it too, and a tail whose group the
+  replacement reads is never rewritten. End to end
+  q28 went 2.78 s to 1.90 s, **0.68x**, and the 43 from 20.04 s to 19.16 s with no query more than
+  3% slower.
   Rejected on the way there, so that it is not planned twice: **memoising the replacement across the batches of a
   part.** The evaluator dictionary-encodes each batch so RE2 runs once per distinct value *of that batch*, and
   widening that scope looked worth 4x. Instrumented on q28 it is not: 25,806,416 calls today against the 23,266,159

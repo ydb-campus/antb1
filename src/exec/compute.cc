@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <format>
 #include <limits>
 #include <memory>
@@ -20,6 +21,7 @@
 #include <arrow/compute/api_vector.h>
 #include <arrow/compute/cast.h>
 #include <arrow/compute/exec.h>
+#include <arrow/util/utf8.h>
 
 #include "antb1/common/int128.h"
 #include "antb1/exec/filter.h"
@@ -863,6 +865,105 @@ arrow::Result<ArrayPtr> DateTrunc(const arrow::Array& values, std::string_view u
   return out;
 }
 
+// Whether a pattern's `.*$` tail can be run byte-wise, which takes two things of the pattern.
+// It must *have* one: the last three characters, with the dot the any-character class and not an
+// escaped one. Conservative on purpose -- `(.*)$` and `.{0,}$` keep the dot, which only costs
+// speed.
+// And the tail must start where a character starts. The values are whole characters (see
+// ValuesAreWholeCharacters), but a pattern can still leave the cursor inside one, and there the
+// two tails diverge: `.` matches no lone continuation byte, so `.*$` fails and the value comes
+// back unchanged, where `\C*$` eats the rest of the character and the replacement cuts it in half.
+// Two RE2 constructs can do that, and only these two: `\C`, which consumes one byte, and `\B`,
+// which is a word boundary over bytes and so holds between the bytes of a character. `\b` cannot,
+// since no byte of a multi-byte character is an ASCII word character, so it sees non-word on both
+// sides and fails; `^`, `$`, `\A`, `\z` and their `(?m)` forms are all at a character boundary (a
+// newline is one byte, and in any case a value holding one does not take this path); and every
+// construct that matches a rune consumes it whole. The wrapper's own `\C*?` can stop mid-character,
+// but then what follows it must match there, which without `\C` or `\B` nothing can.
+bool TailCanRunByteWise(std::string_view pattern) {
+  if (!pattern.ends_with(".*$")) {
+    return false;
+  }
+  bool escaped_dot = false;
+  for (std::size_t i = 0; i + 1 < pattern.size(); ++i) {
+    if (pattern[i] != '\\') {
+      continue;
+    }
+    if (pattern[i + 1] == 'C' || pattern[i + 1] == 'B') {
+      return false;
+    }
+    escaped_dot = escaped_dot || i + 1 == pattern.size() - 3;
+    ++i;  // the escaped character, so that `\\C` is a backslash and a C and not the any byte
+  }
+  return !escaped_dot;
+}
+
+// Whether `.` and `\C` read these values the same way: `.` matches a character, so an invalid
+// UTF-8 byte stops it where `\C`, any byte, consumes it. Validated in one pass over all the values
+// at once -- `Array::ValidateFull` reads the same bytes per value and costs 27% of q28. The
+// concatenation validating is weaker than each value validating, since a sequence split across two
+// adjacent values validates as the pair it forms; so no value may begin inside a sequence, which is
+// exactly a continuation byte (10xxxxxx) as its first byte. Valid bytes and no boundary inside a
+// sequence means every value is a whole number of characters.
+bool ValuesAreWholeCharacters(const arrow::StringArray& values) {
+  const int64_t rows = values.length();
+  if (rows == 0) {
+    return true;
+  }
+  const auto* offsets = values.raw_value_offsets();
+  const int64_t to = offsets[rows];
+  if (to == offsets[0]) {
+    return true;  // every value is empty, so there is nothing to read; the buffer may even be null
+  }
+  const auto* data = values.raw_data();
+  [[maybe_unused]] static const bool tables = [] {
+    arrow::util::InitializeUTF8();  // required before validating, and idempotent
+    return true;
+  }();
+  if (!arrow::util::ValidateUTF8(data + offsets[0], to - offsets[0])) {
+    return false;
+  }
+  for (int64_t row = 0; row < rows; ++row) {
+    if (offsets[row] == to) {
+      continue;  // an empty value at the very end, with no first byte to read
+    }
+    const std::uint8_t first = data[offsets[row]];
+    if (first >= 0x80 && first <= 0xBF) {  // a continuation byte, so this value begins mid-sequence
+      return false;
+    }
+  }
+  return true;
+}
+
+// The values a `\C*$` tail reads differently from a `.*$` one: those holding a newline, which `.`
+// cannot match and `\C` can. Null when no value does, so data without one pays a single memchr over
+// all the values and no mask at all. Per value and not per batch on purpose: one newline among the
+// ~20 K distinct values of a batch would otherwise cost every one of them the slower pattern, which
+// over the ~2,200 such values of ClickBench is more than half the batches and 57% of the win.
+arrow::Result<std::shared_ptr<arrow::Array>> ValuesWithANewline(const arrow::StringArray& values,
+                                                                arrow::MemoryPool* pool) {
+  const int64_t rows = values.length();
+  if (rows == 0) {
+    return nullptr;
+  }
+  const auto* offsets = values.raw_value_offsets();
+  const auto bytes = static_cast<std::size_t>(offsets[rows] - offsets[0]);
+  if (bytes == 0) {
+    return nullptr;  // every value is empty, and the buffer of no bytes may be null
+  }
+  const auto* data = values.raw_data();
+  if (std::memchr(data + offsets[0], '\n', bytes) == nullptr) {
+    return nullptr;
+  }
+  arrow::BooleanBuilder mask(pool);
+  ARROW_RETURN_NOT_OK(mask.Reserve(rows));
+  for (int64_t row = 0; row < rows; ++row) {
+    const auto length = static_cast<std::size_t>(offsets[row + 1] - offsets[row]);
+    mask.UnsafeAppend(std::memchr(data + offsets[row], '\n', length) != nullptr);
+  }
+  return mask.Finish();
+}
+
 struct Evaluator {
   const arrow::RecordBatch& batch;
   arrow::MemoryPool* pool;
@@ -1169,17 +1270,35 @@ struct Evaluator {
     // `(?m)` can only follow the ^ here, where it no longer applies to it.
     const bool anchored = pattern.starts_with('^') && !pattern.contains('|') &&
                           (pattern.size() == 1 || !std::string_view("*+?{").contains(pattern[1]));
-    const arrow::compute::ReplaceSubstringOptions options(
-        anchored ? pattern : "^(\\C*?)(" + pattern + ")", anchored ? replacement : shifted,
-        /*max_replacements=*/-1);
     // Each distinct value once: the values of a batch repeat (URLs, referrer URLs), and the regex
     // is far dearer than hashing. The results go back to their rows with one Take (NULL stays
-    // NULL).
+    // NULL). Encoded before the pattern is settled, because the tail rewrite below reads these
+    // values.
     ARROW_ASSIGN_OR_RAISE(const arrow::Datum encoded,
                           arrow::compute::DictionaryEncode(
                               utf8, arrow::compute::DictionaryEncodeOptions::Defaults(), ctx));
     const std::shared_ptr<arrow::Array> encoded_array = encoded.make_array();
     const auto& dictionary = static_cast<const arrow::DictionaryArray&>(*encoded_array);
+    const auto& values = static_cast<const arrow::StringArray&>(*dictionary.dictionary());
+    // The pattern the kernel runs, wrapped unless the user anchored it themselves.
+    const auto options_for = [&](const std::string& body) {
+      return arrow::compute::ReplaceSubstringOptions(anchored ? body : "^(\\C*?)(" + body + ")",
+                                                     anchored ? replacement : shifted,
+                                                     /*max_replacements=*/-1);
+    };
+    // A trailing `.*$` does no work. Its match is replaced along with the rest, so every byte it
+    // reads is thrown away, and all it establishes is that those bytes are characters and none of
+    // them is a newline. `\C*$` -- RE2's any byte -- establishes nothing and skips bytes instead of
+    // decoding characters: over ClickBench's Referer values, whose ~82 bytes are about 60 of tail,
+    // 0.44 us a value becomes 0.20. The two accept the same value when it is a whole number of
+    // characters and holds no newline, so the values that hold one run the pattern as written.
+    std::string body = pattern;
+    std::shared_ptr<arrow::Array> newlines;
+    if (TailCanRunByteWise(body) && ValuesAreWholeCharacters(values)) {
+      ARROW_ASSIGN_OR_RAISE(newlines, ValuesWithANewline(values, pool));
+      body.replace(body.size() - 3, 3, "\\C*$");
+    }
+    const arrow::compute::ReplaceSubstringOptions options = options_for(body);
     auto replaced = arrow::compute::CallFunction("replace_substring_regex",
                                                  {dictionary.dictionary()}, &options, ctx);
     if (!replaced.ok() && replaced.status().message().starts_with("Invalid replacement string")) {
@@ -1193,6 +1312,20 @@ struct Evaluator {
       return replaced.status().IsOutOfMemory()
                  ? replaced.status()
                  : arrow::Status::ExecutionError("regexp_replace: ", replaced.status().message());
+    }
+    if (newlines != nullptr) {
+      // The few values a newline makes the two tails disagree on, run again as the user wrote the
+      // pattern and put back where they belong. `\C*$` crossed that newline where `.*$` stops at
+      // it, which for a pattern anchored before the tail means no match at all and the value
+      // unchanged -- what DuckDB's RE2 does, so the rewrite stays invisible.
+      ARROW_ASSIGN_OR_RAISE(const arrow::Datum crossed,
+                            arrow::compute::Filter(dictionary.dictionary(), newlines));
+      const arrow::compute::ReplaceSubstringOptions as_written = options_for(pattern);
+      ARROW_ASSIGN_OR_RAISE(
+          const arrow::Datum kept,
+          arrow::compute::CallFunction("replace_substring_regex", {crossed}, &as_written, ctx));
+      ARROW_ASSIGN_OR_RAISE(replaced,
+                            arrow::compute::ReplaceWithMask(*replaced, newlines, kept, ctx));
     }
     ARROW_ASSIGN_OR_RAISE(const arrow::Datum rows,
                           arrow::compute::Take(*replaced, dictionary.indices(),

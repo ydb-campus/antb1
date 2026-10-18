@@ -176,6 +176,48 @@ x\x7fy	x\x7fy	x\x7fy	x\x7fy
 Привет, мир	Привет, мир	Привет, мир	Привет, мир
 日本語	日本語	日本語	日本語
 
+# A pattern ending in `.*$` has that tail run byte-wise, which reads a value the same way only
+# where it is a whole number of characters and holds no newline. `line\nbreak` holds one, so it
+# answers as the pattern reads it: a `.` that stops at the newline leaves `$` unmatched and the
+# anchored pattern does not match at all. The unanchored shapes show the same thing from the other
+# side -- the match starts after the newline, which a byte-wise tail would never leave behind.
+query TTTT rowsort
+SELECT u, regexp_replace(u, '^(.).*$', '[\1]'), regexp_replace(u, 'a.*$', 'X'), regexp_replace(u, '.*$', 'X') FROM edge
+----
+(empty)	(empty)	(empty)	X
+NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL
+\x28empty)	[(]	\x28empty)	X
+a	[a]	X	X
+back\\slash	[b]	bX	X
+line\nbreak	line\nbreak	line\nbreX	line\nX
+tab\there	[t]	tX	X
+trailing space\x20	[t]	trX	X
+x\x7fy	[x]	x\x7fy	X
+Привет, мир	[П]	Привет, мир	X
+日本語	[日]	日本語	X
+
+# `(?m)` makes `$` match before a newline too, so a multiline pattern replaces only the first line
+# of `line\nbreak` where a byte-wise tail would take the whole value. The third column is an escaped
+# dot, a literal: its `\.*$` is no tail at all, and reading it as one would ask for a backslash the
+# values do not have. The fourth is `\C`, the any byte, which can leave the cursor inside a
+# character, where the two tails disagree even though every value here is a whole number of them.
+query TTTTT rowsort
+SELECT u, regexp_replace(u, '(?m)^.*$', 'X'), regexp_replace(u, '^[a-z]+\.*$', 'X'), regexp_replace(u, '^.\C.*$', 'X'), regexp_replace(u, '\B.*$', 'X') FROM edge
+----
+(empty)	X	(empty)	(empty)	X
+NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL
+\x28empty)	X	\x28empty)	X	X
+a	X	X	a	a
+back\\slash	X	back\\slash	X	bX
+line\nbreak	X\nbreak	line\nbreak	line\nbreak	line\nbX
+tab\there	X	tab\there	X	tX
+trailing space\x20	X	trailing space\x20	X	tX
+x\x7fy	X	x\x7fy	X	x\x7fy
+Привет, мир	X	Привет, мир	Привет, мир	X
+日本語	X	日本語	日本語	X
+
 # ---- substring (ADR 0023's S5): codepoints, as DuckDB counts them ----
 
 # strlen counts bytes and substring counts codepoints, so a window of 3 codepoints over a multi-byte
