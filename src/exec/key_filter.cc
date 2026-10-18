@@ -13,31 +13,6 @@
 #include "antb1/common/narrow.h"
 
 namespace antb1::exec {
-namespace {
-
-// The salts of Parquet's split-block Bloom filter, one per word of a block: multiplying the hash by
-// each and taking the top five bits of the product picks one bit of that word, so a key sets eight
-// bits spread over the block and no two words are picked the same way.
-constexpr std::array<std::uint32_t, 8> kSalt = {0x47b6137bU, 0x44974d91U, 0x8824ad5bU, 0xa2b7289dU,
-                                                0x705495c7U, 0x2df1424bU, 0x9efc4947U, 0x5c6bfb31U};
-
-// The eight words a key sets in its block, one bit each.
-std::array<std::uint32_t, 8> MaskOf(std::uint64_t hash) {
-  const auto low = static_cast<std::uint32_t>(hash);
-  std::array<std::uint32_t, 8> mask{};
-  for (std::size_t word = 0; word < mask.size(); ++word) {
-    mask[word] = std::uint32_t{1} << ((low * kSalt[word]) >> 27U);
-  }
-  return mask;
-}
-
-// The hash's block. The high bits choose it, because the low ones already chose the bits within it;
-// a multiply-shift rather than a modulo, so the count need not be a prime.
-std::size_t BlockOf(std::uint64_t hash, std::uint64_t block_mask) {
-  return static_cast<std::size_t>((hash >> 32U) & block_mask);
-}
-
-}  // namespace
 
 arrow::Result<std::shared_ptr<KeyFilter>> KeyFilter::Make(int64_t keys, MemoryBudget* budget) {
   if (keys <= 0) {
@@ -72,10 +47,9 @@ arrow::Result<std::shared_ptr<KeyFilter>> KeyFilter::Make(int64_t keys, MemoryBu
 }
 
 void KeyFilter::Add(std::uint64_t hash) {
-  const std::array<std::uint32_t, 8> mask = MaskOf(hash);
-  std::uint32_t* block = words_.data() + (BlockOf(hash, block_mask_) * kWordsPerBlock);
+  std::uint32_t* block = words_.data() + BlockAt(hash);
   for (std::size_t word = 0; word < kWordsPerBlock; ++word) {
-    block[word] |= mask[word];
+    block[word] |= MaskWord(hash, word);
   }
 }
 
@@ -83,21 +57,6 @@ void KeyFilter::Add(std::span<const std::uint64_t> hashes) {
   for (const std::uint64_t hash : hashes) {
     Add(hash);
   }
-}
-
-void KeyFilter::Prefetch(std::uint64_t hash) const {
-  __builtin_prefetch(words_.data() + (BlockOf(hash, block_mask_) * kWordsPerBlock));
-}
-
-bool KeyFilter::MayContain(std::uint64_t hash) const {
-  const std::array<std::uint32_t, 8> mask = MaskOf(hash);
-  const std::uint32_t* block = words_.data() + (BlockOf(hash, block_mask_) * kWordsPerBlock);
-  for (std::size_t word = 0; word < kWordsPerBlock; ++word) {
-    if ((block[word] & mask[word]) != mask[word]) {
-      return false;
-    }
-  }
-  return true;
 }
 
 }  // namespace antb1::exec
