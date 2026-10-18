@@ -36,3 +36,4 @@ may land first, in a docs-only PR (0013, 0019, 0021-0025).
 | [0025](0025-values-table-constructor.md) | The VALUES table constructor, postponed | Postponed |
 | [0026](0026-join-performance.md) | Join performance: build sides, right-sided joins and cost-based order | Proposed |
 | [0027](0027-string-views.md) | Short strings inline: the view layout for VARCHAR | Proposed |
+| [0028](0028-dictionary-group-keys.md) | Grouping a Parquet dictionary instead of its rows | Rejected |
