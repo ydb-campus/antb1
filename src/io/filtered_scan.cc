@@ -192,6 +192,21 @@ arrow::Result<std::shared_ptr<arrow::Array>> FixedArray(
     case arrow::Type::DOUBLE:
       nulls = StoreRows(decoded, max_def, selected, values->mutable_data_as<double>(), valid);
       break;
+    case arrow::Type::DECIMAL128:
+      // The decoded value is the unscaled integer Parquet stored, and the engine type carries the
+      // same scale (FilteredColumnOf admits no other), so widening it to 128 bits is the whole
+      // conversion -- no rescale. A NULL stores Decimal128{}, which is the zero every other type
+      // stores too. Only an integer widens: FilteredColumnOf pairs a DECIMAL engine type with an
+      // INT32 or INT64 physical one and nothing else, so this template's floating-point arms are
+      // unreachable rather than lossy.
+      if constexpr (std::is_integral_v<Value>) {
+        nulls = StoreRows(decoded, max_def, selected, values->mutable_data_as<arrow::Decimal128>(),
+                          valid);
+      } else {
+        return arrow::Status::Invalid("a filtered scan cannot store ", type->ToString(),
+                                      " from a floating-point column");
+      }
+      break;
     default:
       return arrow::Status::Invalid("a filtered scan cannot store ", type->ToString());
   }
@@ -708,6 +723,34 @@ std::optional<FilteredColumn> FilteredColumnOf(const parquet::FileMetaData& meta
         return of(Physical::kByteArray);
       }
       break;
+    case arrow::Type::DECIMAL128: {
+      // A DECIMAL Parquet stores as an integer: the decoded unscaled value widens to decimal128 in
+      // FixedArray, which is the only conversion needed as long as the storage carries the engine's
+      // precision and scale -- a different scale would need a rescale this path does not do. The
+      // engine reads every DECIMAL as decimal128(p, s) (ADR 0021), and a FIXED_LEN_BYTE_ARRAY or
+      // BYTE_ARRAY decimal is no integer to widen, so both stay unreadable here rather than wrong.
+      // The storage must be decimal128 as well, not merely a decimal of the same precision and
+      // scale: the engine reads every DECIMAL as decimal128 (ADR 0021), and the narrower and wider
+      // storages an embedded Arrow schema can restore are what the unfiltered path's
+      // kDecimal32To128, kDecimal64To128 and kDecimal256To128 conversions exist for. An INT32- or
+      // INT64-backed value of those would in fact widen the same way, but leaving them to the
+      // unfiltered path costs only the filtered path's speed and keeps one rule to state.
+      const auto& want = static_cast<const arrow::Decimal128Type&>(engine);
+      if (s != arrow::Type::DECIMAL128) {
+        break;
+      }
+      const auto& have = static_cast<const arrow::Decimal128Type&>(storage);
+      if (have.precision() != want.precision() || have.scale() != want.scale()) {
+        break;
+      }
+      if (physical == parquet::Type::INT32) {
+        return of(Physical::kInt32);
+      }
+      if (physical == parquet::Type::INT64) {
+        return of(Physical::kInt64);
+      }
+      break;
+    }
     default:
       break;
   }
