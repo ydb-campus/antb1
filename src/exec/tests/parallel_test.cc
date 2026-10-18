@@ -1683,6 +1683,32 @@ TEST_F(PartOperatorsTest, HeavyKeysSpreadOverThePartitions) {
       << "400 values of x over 64 partitions";
 }
 
+// A key column reaches KeyHashes sliced (the routed rows of a materialized batch, a partition's
+// keys), and the hash of a row is its own bytes wherever the slice starts: the type of a column and
+// the base of its values are read once per column, not per row, so the offset has to be applied
+// once rather than forgotten.
+TEST_F(PartOperatorsTest, KeyHashesOfASliceAreTheHashesOfThoseRows) {
+  const auto numbers = Int64s({10, 20, 30, 40, 50, 60, 70, 80});
+  const auto strings = testing::Strings(
+      {"a", "bb", std::nullopt, "dddd", "eeeee", "ffffff", std::nullopt, "hhhhhhhh"});
+  arrow::BooleanBuilder flags;
+  const std::vector<bool> bits = {true, false, true, true, false, false, true, false};
+  ASSERT_TRUE(flags.AppendValues(bits).ok());
+  const auto booleans = flags.Finish().ValueOrDie();
+  for (const auto& column : arrow::ArrayVector{numbers, strings, booleans}) {
+    for (const int64_t offset : {int64_t{1}, int64_t{3}, int64_t{5}}) {
+      const int64_t length = column->length() - offset;
+      const auto sliced = KeyHashes(arrow::compute::ExecBatch({column->Slice(offset)}, length));
+      ASSERT_TRUE(sliced.ok()) << sliced.status().ToString();
+      const auto whole = KeyHashes(arrow::compute::ExecBatch({column}, column->length()));
+      ASSERT_TRUE(whole.ok()) << whole.status().ToString();
+      const std::vector<std::uint64_t> expected(
+          whole->begin() + static_cast<std::ptrdiff_t>(offset), whole->end());
+      EXPECT_EQ(*sliced, expected) << column->type()->ToString() << " from " << offset;
+    }
+  }
+}
+
 // ---- rows routed past the parts' own tables ----
 
 // 12 parts of 40 rows (every fourth empty): u (BIGINT, unique per row: parts that do not reduce),

@@ -54,34 +54,69 @@ arrow::Result<std::shared_ptr<arrow::Array>> FirstPositions(std::span<const std:
   return positions.Finish();
 }
 
+constexpr std::uint64_t kNullKeyHash = 0x5BD1E995ULL;
+constexpr std::uint64_t kKeySeed = 0x9E3779B97F4A7C15ULL;
+constexpr std::uint64_t kKeyCombine = 0x100000001B3ULL;
+
+// Mixes `value_of(row)` into every row's hash, or kNullKeyHash where the column is null. The type
+// of a column and the base of its values are decided once here, not per row, and a column without
+// nulls skips the validity check: a row of a fixed-width key spent more of its time reaching its
+// bytes (two indirections through the array's buffers) than hashing them.
+template <typename ValueOf>
+void MixKeyColumn(const arrow::Array& column, const ValueOf& value_of,
+                  std::span<std::uint64_t> hashes) {
+  const auto rows = static_cast<std::size_t>(column.length());
+  if (column.null_count() == 0) {
+    for (std::size_t row = 0; row < rows; ++row) {
+      hashes[row] = (hashes[row] ^ value_of(row)) * kKeyCombine;
+    }
+    return;
+  }
+  for (std::size_t row = 0; row < rows; ++row) {
+    const std::uint64_t value =
+        column.IsValid(static_cast<std::int64_t>(row)) ? value_of(row) : kNullKeyHash;
+    hashes[row] = (hashes[row] ^ value) * kKeyCombine;
+  }
+}
+
 }  // namespace
 
 arrow::Result<std::vector<std::uint64_t>> KeyHashes(const arrow::compute::ExecBatch& keys) {
-  std::vector<std::uint64_t> hashes(static_cast<std::size_t>(keys.length), 0x9E3779B97F4A7C15ULL);
+  std::vector<std::uint64_t> hashes(static_cast<std::size_t>(keys.length), kKeySeed);
   for (const arrow::Datum& datum : keys.values) {
     const std::shared_ptr<arrow::Array> column = datum.make_array();
     const arrow::DataType& type = *column->type();
     const int width = type.byte_width();
-    const auto* binary = dynamic_cast<const arrow::BinaryArray*>(column.get());
-    for (std::int64_t row = 0; row < column->length(); ++row) {
-      std::uint64_t value = 0x5BD1E995ULL;  // NULL
-      if (column->IsValid(row)) {
-        if (binary != nullptr) {
-          const std::string_view bytes = binary->GetView(row);
-          value = arrow::internal::ComputeStringHash<0>(bytes.data(),
-                                                        static_cast<std::int64_t>(bytes.size()));
-        } else if (type.id() == arrow::Type::BOOL) {
-          value = static_cast<const arrow::BooleanArray&>(*column).Value(row) ? 1 : 2;
-        } else if (width > 0) {
-          const std::uint8_t* bytes =
-              column->data()->buffers[1]->data() + ((column->offset() + row) * width);
-          value = arrow::internal::ComputeStringHash<0>(bytes, width);
-        } else {
-          return arrow::Status::NotImplemented("GROUP BY partition of a ", type.ToString(), " key");
-        }
-      }
-      auto& hash = hashes[static_cast<std::size_t>(row)];
-      hash = (hash ^ value) * 0x100000001B3ULL;
+    if (const auto* binary = dynamic_cast<const arrow::BinaryArray*>(column.get());
+        binary != nullptr) {
+      MixKeyColumn(
+          *column,
+          [binary](std::size_t row) {
+            const std::string_view bytes = binary->GetView(static_cast<std::int64_t>(row));
+            return arrow::internal::ComputeStringHash<0>(bytes.data(),
+                                                         static_cast<std::int64_t>(bytes.size()));
+          },
+          hashes);
+    } else if (type.id() == arrow::Type::BOOL) {
+      const auto& bools = static_cast<const arrow::BooleanArray&>(*column);
+      MixKeyColumn(
+          *column,
+          [&bools](std::size_t row) -> std::uint64_t {
+            return bools.Value(static_cast<std::int64_t>(row)) ? 1 : 2;
+          },
+          hashes);
+    } else if (width > 0) {
+      const std::uint8_t* base = column->data()->buffers[1]->data() +
+                                 (static_cast<std::ptrdiff_t>(column->offset()) * width);
+      MixKeyColumn(
+          *column,
+          [base, width](std::size_t row) {
+            return arrow::internal::ComputeStringHash<0>(
+                base + (static_cast<std::ptrdiff_t>(row) * width), width);
+          },
+          hashes);
+    } else {
+      return arrow::Status::NotImplemented("GROUP BY partition of a ", type.ToString(), " key");
     }
   }
   for (std::uint64_t& hash : hashes) {
