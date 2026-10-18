@@ -28,7 +28,27 @@ Accepted (with the maintainer-approved plan for scalar expressions)
   `sum((a + 1))`). Later PRs of the plan add function calls, `CASE` and timestamps as new node kinds.
   Update: function calls are a `FunctionExpr` node with a fixed list of functions (`strlen`, `regexp_replace`), each
   with its arity, argument types and result type in the binder; a `regexp_replace` pattern and replacement must be
-  literals, so the evaluator compiles them once per batch with Arrow's RE2 kernel.
+  literals, so the evaluator compiles them once per batch with Arrow's RE2 kernel. DuckDB replaces the first match
+  of the whole value (`RE2::Replace`) where Arrow's `replace_substring_regex` replaces every match, and with one
+  replacement re-matches the pattern against the matched substring alone, where `\b`, `\B`, `^` and `$` see the
+  wrong neighbours; so a pattern is wrapped as `^(\C*?)(pattern)` -- RE2's own leftmost unanchored search, `\C`
+  being any byte -- with the text before the match in group 1 and the replacement's groups shifted by two.
+  Update (2026-10-18): **a pattern already anchored at `^` is not wrapped.** A leading `^` matches in one place
+  only, so the lazy `\C*?` before it can match nothing: `^(\C*?)(^P)` accepts exactly what `^P` accepts, with group
+  1 always empty, and the anchor already limits the kernel to one replacement. What the wrapper costs is RE2's
+  literal prefix -- with `\C*?` first it cannot reject a value that could never match without trying every
+  position, where `^https?://` first rejects on the first byte. So it is free on values that match and dear on
+  values that do not: over 200 K values through the kernel, dropping it is 0.93x when all of them match, **0.29x
+  when none do**, and 0.79x over the 82/18 mix the ClickBench data holds (14.7 M of its 81.0 M non-empty Referer
+  rows do not match q28's pattern). End to end q28 went 3.330 s to 2.740 s, **0.823x** -- 0.59 s off the largest
+  query of the 43. The binder's rejections (`\Q` in a pattern, `\8` and `\9` in a replacement) stay unconditional,
+  so which form the evaluator picks is invisible apart from the speed.
+  Rejected on the way there, so that it is not planned twice: **memoising the replacement across the batches of a
+  part.** The evaluator dictionary-encodes each batch so RE2 runs once per distinct value *of that batch*, and
+  widening that scope looked worth 4x. Instrumented on q28 it is not: 25,806,416 calls today against the 23,266,159
+  a part-scoped memo would make and 19,720,796 for a query-wide one -- **1.11x and 1.31x**, because the per-batch
+  dictionary already reaches 3.14 rows a call. The 4x came from extrapolating one row group that is 13.6% distinct
+  where the file is 24%.
   Update (2026-10-13, ADR 0023's S5): the list is `strlen`, `regexp_replace`, `toDateTime`, `date_trunc` and
   `substring` (with its alias `substr`), and an arity may now be a range: `substring` takes two or three arguments.
   `substring` is also the first function whose arguments after the value are **evaluated per row** rather than
