@@ -1099,6 +1099,16 @@ struct Evaluator {
   // other neighbors; so the pattern becomes ^(\C*?)(pattern), RE2's own unanchored search (\C is
   // any byte) with the text before the match in group 1, and every match of it (there is at most
   // one) is replaced with \1 and the replacement, its groups shifted by two.
+  //
+  // Except when the pattern is already anchored at ^, where the wrapper is not only unnecessary but
+  // expensive. A leading ^ can match at one place only, so the lazy \C*? before it can match
+  // nothing: ^(\C*?)(^P) accepts exactly what ^P accepts, with group 1 always empty. But \C*?
+  // hides P's literal prefix from RE2, which can no longer reject a value that cannot match without
+  // trying every position -- and a value that does not match is the common case for the patterns
+  // this is used with. Over values of which 82% match, dropping the wrapper is 0.79x; over values
+  // of which none match, 0.29x; over values that all match, 0.93x. The binder's restrictions stay
+  // as they are either way (\Q in a pattern, \8 and \9 in a replacement, plan/binder.cc), so
+  // which form runs is invisible apart from the speed.
   arrow::Result<ArrayPtr> RegexpReplace(const plan::FunctionExpr& function,
                                         const ArrayPtr& text) const {
     if (function.args.size() != 3) {
@@ -1145,8 +1155,23 @@ struct Evaluator {
                  ? valid.status()
                  : arrow::Status::ExecutionError("regexp_replace: ", valid.status().message());
     }
-    const arrow::compute::ReplaceSubstringOptions options("^(\\C*?)(" + pattern + ")", shifted,
-                                                          /*max_replacements=*/-1);
+    // A leading ^ forces the wrapper's prefix to be empty, so the pattern runs as the user wrote
+    // it, with their replacement and their group numbers -- but only where that ^ provably anchors
+    // the *whole* pattern, which takes more than a leading character:
+    //   - no alternation anywhere. A top-level `|` leaves a branch unanchored, so `^a|b` matches a
+    //     `b` at any position and the kernel, replacing every match, would replace them all:
+    //     'abab' would come back 'XXaX' where DuckDB gives 'Xbab'. Rejecting every `|`, not only a
+    //     top-level one, keeps this a character scan: `^(a|b)c` is anchored too and keeps the
+    //     wrapper, which costs only speed.
+    //   - no repetition of the anchor. `^*b` and `^?b` make it optional, so they match a `b`
+    //     anywhere as well.
+    // Anything else that could bypass the first term of a concatenation is one of those two, and a
+    // `(?m)` can only follow the ^ here, where it no longer applies to it.
+    const bool anchored = pattern.starts_with('^') && !pattern.contains('|') &&
+                          (pattern.size() == 1 || !std::string_view("*+?{").contains(pattern[1]));
+    const arrow::compute::ReplaceSubstringOptions options(
+        anchored ? pattern : "^(\\C*?)(" + pattern + ")", anchored ? replacement : shifted,
+        /*max_replacements=*/-1);
     // Each distinct value once: the values of a batch repeat (URLs, referrer URLs), and the regex
     // is far dearer than hashing. The results go back to their rows with one Take (NULL stays
     // NULL).

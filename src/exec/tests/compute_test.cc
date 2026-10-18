@@ -797,6 +797,57 @@ TEST_F(ComputeTest, StringFunctions) {
   EXPECT_EQ(values(*context)[4], "Zbab");
 }
 
+// A pattern anchored at ^ runs as the user wrote it, where any other pattern is wrapped in
+// ^(\C*?)(...) so that RE2 does the unanchored search (see RegexpReplace). The two accept exactly
+// the same values -- a leading ^ matches in one place only, so the lazy prefix can match nothing --
+// and the wrapper costs RE2 the literal prefix it would otherwise reject a non-matching value on.
+// Each case here is the anchored pattern against the wrapper written out by hand, which is what the
+// evaluator used to build; the wrapper form is itself ^-anchored, so it runs as it always did.
+TEST_F(ComputeTest, AnchoredRegexpReplaceMatchesTheWrappedForm) {
+  const auto text = testing::Strings(
+      {"abab", std::nullopt, "", "xyz", "abc", "a\nb", "aaa", "h\xC3\xA9llo", "ab", "\nab"});
+  const auto replace = [&](std::string pattern, std::string replacement) {
+    return Eval(Call(plan::Function::kRegexpReplace,
+                     {ColumnAt(0, LogicalType::kVarchar), StringConstant(std::move(pattern)),
+                      StringConstant(std::move(replacement))},
+                     LogicalType::kVarchar),
+                {text});
+  };
+  const auto values = [](const std::shared_ptr<arrow::Array>& array) {
+    std::vector<std::optional<std::string>> out;
+    const auto& binary = static_cast<const arrow::BinaryArray&>(*array);
+    out.reserve(Narrow<std::size_t>(binary.length()));
+    for (int64_t i = 0; i < binary.length(); ++i) {
+      out.push_back(binary.IsNull(i) ? std::nullopt : std::optional(binary.GetString(i)));
+    }
+    return out;
+  };
+  struct Case {
+    std::string pattern;      // anchored: the evaluator runs it bare
+    std::string replacement;  // the user's groups
+    std::string shifted;      // the same, groups + 2, for the hand-written wrapper
+  };
+  // Zero-width matches, an empty-only pattern, several groups, an assertion, and a non-ASCII value.
+  const std::vector<Case> cases = {
+      {.pattern = "^a(b)", .replacement = R"([\1])", .shifted = R"([\3])"},
+      {.pattern = "^(.)", .replacement = R"(<\1>)", .shifted = R"(<\3>)"},
+      {.pattern = "^x*", .replacement = "Z", .shifted = "Z"},
+      {.pattern = "^$", .replacement = "E", .shifted = "E"},
+      {.pattern = "^(a)(b)(c)", .replacement = R"(\3\2\1)", .shifted = R"(\5\4\3)"},
+      {.pattern = R"(^a\B)", .replacement = "Q", .shifted = "Q"},
+      {.pattern = R"(^\C)", .replacement = "B", .shifted = "B"},
+      {.pattern = "^(?i)AB", .replacement = "i", .shifted = "i"},
+      {.pattern = "^.*b", .replacement = "G", .shifted = "G"},
+  };
+  for (const Case& c : cases) {
+    auto bare = replace(c.pattern, c.replacement);
+    ASSERT_TRUE(bare.ok()) << c.pattern << ": " << bare.status().ToString();
+    auto wrapped = replace("^(\\C*?)(" + c.pattern + ")", "\\1" + c.shifted);
+    ASSERT_TRUE(wrapped.ok()) << c.pattern << ": " << wrapped.status().ToString();
+    EXPECT_EQ(values(*bare), values(*wrapped)) << c.pattern << " -> " << c.replacement;
+  }
+}
+
 // A condition leaf: `column <op> constant` over operand 0, or a folded kind.
 plan::ExprPtr Condition(plan::Predicate::Kind kind, plan::CompareOp op, Int128 value,
                         plan::ExprPtr operand) {
