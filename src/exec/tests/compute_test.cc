@@ -848,6 +848,88 @@ TEST_F(ComputeTest, AnchoredRegexpReplaceMatchesTheWrappedForm) {
   }
 }
 
+// A pattern ending in `.*$` has that tail rewritten to `\C*$`, RE2's any byte, because the match is
+// replaced whole and the tail's bytes are thrown away (see RegexpReplace). `.` is a character that
+// is not a newline, so the two agree only on a value that is a whole number of characters and holds
+// no newline; the rest run the pattern as written. Each case here is the rewritten pattern against
+// `[^\n]*$`, which means what `.*$` means and is not rewritten, so it is the answer DuckDB gives.
+TEST_F(ComputeTest, ARewrittenRegexpReplaceTailMatchesTheDotTail) {
+  using Values = std::vector<std::optional<std::string>>;
+  const auto replace = [&](const std::shared_ptr<arrow::Array>& text, std::string pattern,
+                           std::string replacement) {
+    return Eval(Call(plan::Function::kRegexpReplace,
+                     {ColumnAt(0, LogicalType::kVarchar), StringConstant(std::move(pattern)),
+                      StringConstant(std::move(replacement))},
+                     LogicalType::kVarchar),
+                {text});
+  };
+  const auto values = [](const std::shared_ptr<arrow::Array>& array) {
+    std::vector<std::optional<std::string>> out;
+    const auto& binary = static_cast<const arrow::BinaryArray&>(*array);
+    out.reserve(Narrow<std::size_t>(binary.length()));
+    for (int64_t i = 0; i < binary.length(); ++i) {
+      out.push_back(binary.IsNull(i) ? std::nullopt : std::optional(binary.GetString(i)));
+    }
+    return out;
+  };
+  // A newline first, last and in the middle (the values the tails disagree on, so the ones that
+  // must take the pattern as written), a value with no tail at all, an empty one, NULL, a
+  // multi-byte character, and two URLs, that being the idiom a discarded tail comes from.
+  const auto text = testing::Strings({"abab", std::nullopt, "", "a\nb", "\nab", "ab\n", "a", "za",
+                                      "h\xC3\xA9llo", "https://www.example.com/p/q", "http://h/"});
+  const std::vector<std::pair<std::string, std::string>> cases = {
+      {R"(^[a-z]+://([^@/]+)/.*$)", R"(\1)"},  // keep a prefix group, drop the rest
+      {"^a.*$", "X"},                          // anchored, the plain shape
+      {"a.*$", "X"},                           // unanchored: rewritten inside the wrapper
+      {R"(^(a).*$)", R"([\1])"},               // a group before the tail
+      {"^x.*$", "X"},                          // matches nothing in the corpus
+      {".*$", "X"},                            // the whole value
+      {"^a|b.*$", "X"},                        // an alternation, so wrapped as written
+      {R"(^a\\.*$)", "X"},                     // an escaped backslash, then a real tail
+      {R"(^.\C.*$)", "X"},                     // `\C` lands the tail inside a character
+      {R"(\B.*$)", "X"},                       // so does `\B`, which holds mid-character
+  };
+  for (const auto& [pattern, replacement] : cases) {
+    auto rewritten = replace(text, pattern, replacement);
+    ASSERT_TRUE(rewritten.ok()) << pattern << ": " << rewritten.status().ToString();
+    auto as_written =
+        replace(text, pattern.substr(0, pattern.size() - 3) + R"([^\n]*$)", replacement);
+    ASSERT_TRUE(as_written.ok()) << pattern << ": " << as_written.status().ToString();
+    EXPECT_EQ(values(*rewritten), values(*as_written)) << pattern << " -> " << replacement;
+  }
+  // A byte that is no character at all: `.` cannot match it, so the pattern does not match and
+  // DuckDB returns the value unchanged (divergence D15), where `\C*$` would consume it. One such
+  // value in a batch takes the rewrite off every value of it, which is why this is its own array.
+  const auto invalid =
+      testing::Strings({"a\xFF"
+                        "b",
+                        "ab"});
+  auto bytes = replace(invalid, "^a.*$", "X");
+  ASSERT_TRUE(bytes.ok()) << bytes.status().ToString();
+  EXPECT_EQ(values(*bytes), (Values{"a\xFF"
+                                    "b",
+                                    "X"}));
+  // Values with no bytes at all: the one distinct value is empty, and a buffer of no bytes can be a
+  // null one, which neither check may read (as in KeyHashes, where that was a crash).
+  auto empty = replace(testing::Strings({"", std::nullopt, ""}), "^.*$", "X");
+  ASSERT_TRUE(empty.ok()) << empty.status().ToString();
+  EXPECT_EQ(values(*empty), (Values{"X", std::nullopt, "X"}));
+  // A character split across two values: the bytes validate concatenated, as the pair they form,
+  // where neither value is a character on its own. The boundary test is what rejects them, so `.`
+  // matches neither value and both come back unchanged.
+  auto split = replace(testing::Strings({"\xC3", "\xA9"}), "^.*$", "X");
+  ASSERT_TRUE(split.ok()) << split.status().ToString();
+  EXPECT_EQ(values(*split), (Values{"\xC3", "\xA9"}));
+  // The two halves of the pattern test: an escaped dot is a literal, and a `.*` without the anchor
+  // is not the tail. Rewriting either would change what the pattern means, not only its speed.
+  auto literal = replace(testing::Strings({"a", "a.", "a..", "ab"}), R"(^a\.*$)", "X");
+  ASSERT_TRUE(literal.ok()) << literal.status().ToString();
+  EXPECT_EQ(values(*literal), (Values{"X", "X", "X", "ab"}));
+  auto unterminated = replace(testing::Strings({"a\nb", "ab", "za"}), "^a.*", "X");
+  ASSERT_TRUE(unterminated.ok()) << unterminated.status().ToString();
+  EXPECT_EQ(values(*unterminated), (Values{"X\nb", "X", "za"}));
+}
+
 // A condition leaf: `column <op> constant` over operand 0, or a folded kind.
 plan::ExprPtr Condition(plan::Predicate::Kind kind, plan::CompareOp op, Int128 value,
                         plan::ExprPtr operand) {
