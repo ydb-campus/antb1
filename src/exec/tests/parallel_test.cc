@@ -1709,6 +1709,36 @@ TEST_F(PartOperatorsTest, KeyHashesOfASliceAreTheHashesOfThoseRows) {
   }
 }
 
+// A fixed-width column is allowed to carry no values buffer when it has no rows, or when every row
+// of it is NULL, and the base of its values is taken once per column rather than per row: the
+// column has to be reached through GetValues, which gives nullptr for those, and not through
+// buffers[1]->data(), which dereferences one.
+TEST_F(PartOperatorsTest, KeyHashesOfAColumnWithNoValuesBuffer) {
+  const auto no_rows =
+      arrow::MakeArray(arrow::ArrayData::Make(arrow::int64(), 0, {nullptr, nullptr}, 0));
+  ASSERT_EQ(no_rows->data()->buffers[1], nullptr);
+  const auto empty = KeyHashes(arrow::compute::ExecBatch({no_rows}, 0));
+  ASSERT_TRUE(empty.ok()) << empty.status().ToString();
+  EXPECT_TRUE(empty->empty());
+
+  constexpr int64_t kRows = 8;
+  auto bitmap = arrow::AllocateBitmap(kRows).ValueOrDie();
+  std::memset(bitmap->mutable_data(), 0, static_cast<std::size_t>(bitmap->size()));
+  const auto all_null =
+      arrow::MakeArray(arrow::ArrayData::Make(arrow::int64(), kRows, {bitmap, nullptr}, kRows));
+  ASSERT_EQ(all_null->data()->buffers[1], nullptr);
+  ASSERT_EQ(all_null->null_count(), kRows);
+  const auto nulls = KeyHashes(arrow::compute::ExecBatch({all_null}, kRows));
+  ASSERT_TRUE(nulls.ok()) << nulls.status().ToString();
+  // Every row is the one NULL hash, which is what a column of NULLs hashed to before.
+  const auto expected = KeyHashes(
+      arrow::compute::ExecBatch({Int64s({std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+                                         std::nullopt, std::nullopt, std::nullopt, std::nullopt})},
+                                kRows));
+  ASSERT_TRUE(expected.ok()) << expected.status().ToString();
+  EXPECT_EQ(*nulls, *expected);
+}
+
 // ---- rows routed past the parts' own tables ----
 
 // 12 parts of 40 rows (every fourth empty): u (BIGINT, unique per row: parts that do not reduce),
