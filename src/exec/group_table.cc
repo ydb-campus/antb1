@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -165,8 +166,17 @@ arrow::Result<std::unique_ptr<GroupTable>> GroupTable::Make(
   }
   table->kernels_ = std::make_unique<arrow::compute::ExecContext>(pool);
   if (!table->keys_.empty()) {
-    ARROW_ASSIGN_OR_RAISE(table->grouper_,
-                          arrow::compute::Grouper::Make(key_types, table->kernels_.get()));
+    const char* own = std::getenv("ANTB1_OWN_TABLE");
+    if (own != nullptr && (std::string_view(own) == "1" || std::string_view(own) == "2") &&
+        GroupHashTable::Supports(key_types)) {
+      // TEMPORARY: ANTB1_OWN_TABLE=2 passes no budget, to separate the table's cost from
+      // its per-group budget accounting.
+      MemoryBudget* own_budget = std::string_view(own) == "2" ? nullptr : budget;
+      ARROW_ASSIGN_OR_RAISE(table->own_, GroupHashTable::Make(key_types, pool, own_budget));
+    } else {
+      ARROW_ASSIGN_OR_RAISE(table->grouper_,
+                            arrow::compute::Grouper::Make(key_types, table->kernels_.get()));
+    }
   }
   table->first_keys_.assign(table->keys_.size(), {});
   return table;
@@ -183,6 +193,23 @@ arrow::Status GroupTable::AddGroups(std::uint32_t after,
     state->Resize(num_groups_);
   }
   return arrow::Status::OK();
+}
+
+arrow::Result<std::shared_ptr<arrow::UInt32Array>> GroupTable::ConsumeKeys(
+    const arrow::compute::ExecBatch& keys) {
+  if (own_ != nullptr) {
+    return own_->Consume(keys);
+  }
+  ARROW_ASSIGN_OR_RAISE(const arrow::Datum ids, grouper_->Consume(arrow::compute::ExecSpan(keys)));
+  return std::static_pointer_cast<arrow::UInt32Array>(ids.make_array());
+}
+
+std::uint32_t GroupTable::KeyGroups() const {
+  return own_ != nullptr ? own_->num_groups() : grouper_->num_groups();
+}
+
+arrow::Result<arrow::compute::ExecBatch> GroupTable::KeyUniques() const {
+  return own_ != nullptr ? own_->GetUniques() : grouper_->GetUniques();
 }
 
 arrow::Status GroupTable::Consume(const arrow::RecordBatch& rows) {
@@ -207,11 +234,9 @@ arrow::Status GroupTable::Consume(const arrow::RecordBatch& rows) {
       keys.emplace_back(std::move(column));
     }
     const arrow::compute::ExecBatch key_batch(std::move(keys), n);
-    ARROW_ASSIGN_OR_RAISE(const arrow::Datum id_datum,
-                          grouper_->Consume(arrow::compute::ExecSpan(key_batch)));
-    ids = std::static_pointer_cast<arrow::UInt32Array>(id_datum.make_array());
+    ARROW_ASSIGN_OR_RAISE(ids, ConsumeKeys(key_batch));
     group_ids = IdsOf(*ids);
-    const std::uint32_t after = grouper_->num_groups();
+    const std::uint32_t after = KeyGroups();
     if (after > num_groups_ && !keep_first_keys_) {
       ARROW_RETURN_NOT_OK(AddGroups(after, {}));
     } else if (after > num_groups_) {
@@ -255,12 +280,10 @@ arrow::Status GroupTable::Merge(const GroupTable& part) {
     group_map = no_keys;
   } else {
     // Part's groups in its own order, by their normalized keys: the map from its groups to ours.
-    ARROW_ASSIGN_OR_RAISE(const arrow::compute::ExecBatch uniques, part.grouper_->GetUniques());
-    ARROW_ASSIGN_OR_RAISE(const arrow::Datum id_datum,
-                          grouper_->Consume(arrow::compute::ExecSpan(uniques)));
-    ids = std::static_pointer_cast<arrow::UInt32Array>(id_datum.make_array());
+    ARROW_ASSIGN_OR_RAISE(const arrow::compute::ExecBatch uniques, part.KeyUniques());
+    ARROW_ASSIGN_OR_RAISE(ids, ConsumeKeys(uniques));
     group_map = IdsOf(*ids);
-    const std::uint32_t after = grouper_->num_groups();
+    const std::uint32_t after = KeyGroups();
     if (after > num_groups_ && !part.keep_first_keys_) {
       ARROW_RETURN_NOT_OK(AddUniqueGroups(uniques, group_map, after));
     } else if (after > num_groups_) {
@@ -392,9 +415,9 @@ arrow::Status GroupTable::AddUniqueGroups(const arrow::compute::ExecBatch& keys,
 arrow::Status GroupTable::Partition() { return Partition(keys_.size(), {}); }
 
 arrow::Result<std::vector<std::uint64_t>> GroupTable::PrefixHashes(std::size_t prefix) const {
-  ANTB1_CHECK(grouper_ != nullptr);
+  ANTB1_CHECK(grouper_ != nullptr || own_ != nullptr);
   ANTB1_CHECK(prefix <= keys_.size());
-  ARROW_ASSIGN_OR_RAISE(arrow::compute::ExecBatch keys, grouper_->GetUniques());
+  ARROW_ASSIGN_OR_RAISE(arrow::compute::ExecBatch keys, KeyUniques());
   keys.values.resize(prefix);
   return KeyHashes(keys);
 }
@@ -449,8 +472,8 @@ arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> GroupTable::Rout
 }
 
 arrow::Result<arrow::compute::ExecBatch> GroupTable::uniques() const {
-  ANTB1_CHECK(grouper_ != nullptr);
-  return grouper_->GetUniques();
+  ANTB1_CHECK(grouper_ != nullptr || own_ != nullptr);
+  return KeyUniques();
 }
 
 arrow::Status GroupTable::Partition(std::size_t prefix, std::span<const std::uint64_t> heavy) {
@@ -465,7 +488,7 @@ arrow::Status GroupTable::Partition(std::size_t prefix, std::span<const std::uin
     return arrow::Status::OK();
   }
   partition_groups_.resize(kPartitions);
-  ARROW_ASSIGN_OR_RAISE(const arrow::compute::ExecBatch uniques, grouper_->GetUniques());
+  ARROW_ASSIGN_OR_RAISE(const arrow::compute::ExecBatch uniques, KeyUniques());
   arrow::compute::ExecBatch prefix_keys = uniques;
   prefix_keys.values.resize(prefix);
   ARROW_ASSIGN_OR_RAISE(std::vector<std::uint64_t> hashes, KeyHashes(prefix_keys));
@@ -534,12 +557,9 @@ arrow::Status GroupTable::MergePartition(const GroupTable& part, std::size_t par
     to = single;
   } else {
     // The partition's groups of part, by their normalized keys, through this table's grouper.
-    ARROW_ASSIGN_OR_RAISE(
-        const arrow::Datum id_datum,
-        grouper_->Consume(arrow::compute::ExecSpan(part.partition_uniques_[partition])));
-    ids = std::static_pointer_cast<arrow::UInt32Array>(id_datum.make_array());
+    ARROW_ASSIGN_OR_RAISE(ids, ConsumeKeys(part.partition_uniques_[partition]));
     to = IdsOf(*ids);
-    const std::uint32_t after = grouper_->num_groups();
+    const std::uint32_t after = KeyGroups();
     if (after > num_groups_ && !keep_first_keys_) {
       ARROW_RETURN_NOT_OK(AddGroups(after, {}));
     } else if (after > num_groups_ && !part.keep_first_keys_) {

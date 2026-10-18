@@ -17,6 +17,8 @@
 #include "antb1/exec/memory_budget.h"
 #include "antb1/plan/logical_plan.h"
 
+#include "group_hash_table.h"
+
 namespace arrow::compute {
 class ExecContext;
 class Grouper;
@@ -127,6 +129,14 @@ class GroupTable {
   bool keep_first_keys_;
   std::unique_ptr<arrow::compute::ExecContext> kernels_;
   std::unique_ptr<arrow::compute::Grouper> grouper_;  // nullptr without keys
+  // TEMPORARY, NOT FOR MERGE: with ANTB1_OWN_TABLE=1 and keys it can hold, the table of ADR 0019
+  // stands in for the grouper, so the two can be compared on real queries. Exactly one is set.
+  std::unique_ptr<GroupHashTable> own_;
+  // Whichever of the two is in use, in the three roles GroupTable needs of it.
+  [[nodiscard]] arrow::Result<std::shared_ptr<arrow::UInt32Array>> ConsumeKeys(
+      const arrow::compute::ExecBatch& keys);
+  [[nodiscard]] std::uint32_t KeyGroups() const;
+  [[nodiscard]] arrow::Result<arrow::compute::ExecBatch> KeyUniques() const;
   std::vector<std::unique_ptr<GroupedAggregateState>> states_;
   std::vector<std::vector<std::shared_ptr<arrow::Array>>> first_keys_;  // per key, per chunk
   std::vector<std::uint32_t> chunk_groups_;  // the number of new groups of each chunk
