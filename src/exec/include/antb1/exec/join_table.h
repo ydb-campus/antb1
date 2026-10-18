@@ -61,7 +61,8 @@ namespace antb1::exec {
 
 class PartitionLanes;
 
-// The partitions of a build: a constant (GroupTable::kPartitions), never the number of threads.
+// The partitions of a build: a constant of its own, never the number of threads. Independent of
+// GroupTable::kPartitions: a join partitions build rows, a GROUP BY its groups.
 inline constexpr std::size_t kJoinPartitions = 64;
 
 // A build row: row `row` of JoinTable::chunks()[chunk].

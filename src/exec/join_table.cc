@@ -34,7 +34,9 @@
 
 namespace antb1::exec {
 
-static_assert(kJoinPartitions == GroupTable::kPartitions, "a join partitions as GROUP BY does");
+// A join's partition count is its own: kJoinPartitions sizes std::arrays, and nothing has measured
+// it against GroupTable::kPartitions, which is now 32. The two are independent -- a join partitions
+// its build rows, a GROUP BY its groups -- so there is no longer an invariant to assert here.
 
 namespace {
 

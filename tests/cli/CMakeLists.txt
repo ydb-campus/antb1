@@ -745,7 +745,8 @@ string(
   "  TopN Sort c DESC NULLS LAST, RegionID ASC NULLS LAST Limit 3  "
   "[[]rows=3 batches=1 time=${_d} self=${_d} sort=${_d}[]]\n"
   "    PartGroupAggregate GroupAggregate keys=[[]RegionID[]] COUNT[(][*][)] top-N per partition keep=3  "
-  "[[]rows=192 batches=[0-9]+ time=${_d} parts=11 skipped=0 part_time=${_d} wait=${_d} "
+  # rows is keep=3 per partition, so it tracks GroupTable::kPartitions: 96 at 32, 192 at 64.
+  "[[]rows=96 batches=[0-9]+ time=${_d} parts=11 skipped=0 part_time=${_d} wait=${_d} "
   # local_groups is each part's own group count summed, so it exceeds `groups`, the distinct
   # count over the whole table: the parts hold the same key in more than one of their tables.
   # routed_path is absent here because no part of this fixture routes (no raw_parts either).

@@ -223,7 +223,7 @@ inline constexpr int64_t kTwoLevelSampleRows = int64_t{4} * 1000 * 1000;
 // GROUP BY K over the inner groups, which counts each column's inner groups with a non-NULL x.
 // Every part groups into its own inner tables on the executor. The first `sample_parts` parts
 // decide the heavy keys (a K with a large share of the sample's inner groups, HeavyHitters). Every
-// table splits into GroupTable::kPartitions partitions by the hash of K, but the inner groups of a
+// table splits into kTwoLevelPartitions partitions by the hash of K, but the inner groups of a
 // heavy K by the hash of K and x, so that no partition holds most of the pairs. Parts merge in part
 // order, each partition in its own lane (PartitionLanes); then each partition groups its inner
 // groups by K in
