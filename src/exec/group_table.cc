@@ -20,6 +20,7 @@
 #include <arrow/util/hashing.h>
 
 #include "antb1/common/check.h"
+#include "antb1/common/narrow.h"
 #include "antb1/exec/grouped_aggregate_state.h"
 #include "antb1/exec/memory_budget.h"
 #include "antb1/plan/logical_plan.h"
@@ -110,7 +111,7 @@ arrow::Result<std::vector<std::uint64_t>> KeyHashes(const arrow::compute::ExecBa
       // is NULL, is allowed to carry no values buffer at all, and this base is taken once for the
       // column rather than inside the row loop. GetValues gives nullptr for that column and
       // `value_of` is never called on it -- no row of it is valid.
-      const std::uint8_t* base = column->data()->GetValues<std::uint8_t>(
+      const auto* base = column->data()->GetValues<std::uint8_t>(
           1, static_cast<std::int64_t>(column->offset()) * width);
       MixKeyColumn(
           *column,
@@ -352,26 +353,34 @@ arrow::Status GroupTable::AddUniqueGroups(const arrow::compute::ExecBatch& keys,
                                           std::span<const std::uint32_t> to, std::uint32_t after) {
   // The row of `keys` each new group's keys are in, by group: the grouper numbers new groups in an
   // order of its own, not the order it first sees them, so they are placed per id as in Consume.
-  // Every new group has exactly one such row, since the keys of a part are unique.
-  std::vector<std::int64_t> positions(static_cast<std::size_t>(after - num_groups_), -1);
+  // A row index, like a group, is a uint32: `keys` is one part's groups, or one partition of them.
+  const auto groups = static_cast<std::size_t>(after - num_groups_);
+  std::vector<std::uint32_t> positions(groups, 0);
+  std::size_t found = 0;
   for (std::size_t i = 0; i < to.size(); ++i) {
     if (to[i] >= num_groups_) {
-      positions[to[i] - num_groups_] = static_cast<std::int64_t>(i);
+      positions[to[i] - num_groups_] = Narrow<std::uint32_t>(i);
+      ++found;
     }
   }
-  ANTB1_CHECK(std::ranges::none_of(positions, [](std::int64_t row) { return row < 0; }));
-  for (std::size_t begin = 0; begin < positions.size(); begin += kMaxMergeChunk) {
-    const std::size_t end = std::min(positions.size(), begin + kMaxMergeChunk);
-    arrow::Int64Builder indices(pool_);
-    ARROW_RETURN_NOT_OK(
-        indices.AppendValues(positions.data() + begin, static_cast<std::int64_t>(end - begin)));
-    ARROW_ASSIGN_OR_RAISE(const auto rows, indices.Finish());
+  // Exactly one row per new group, since the keys of a part are unique: with as many rows found as
+  // there are new groups, every position was written.
+  ANTB1_CHECK(found == groups);
+  // One index array for every chunk, sliced rather than rebuilt: a chunk's Take reads its own rows
+  // out of it and a slice allocates nothing.
+  arrow::UInt32Builder indices(pool_);
+  ARROW_RETURN_NOT_OK(indices.AppendValues(positions));
+  ARROW_ASSIGN_OR_RAISE(const auto rows, indices.Finish());
+  for (std::size_t begin = 0; begin < groups; begin += kMaxMergeChunk) {
+    const std::size_t end = std::min(groups, begin + kMaxMergeChunk);
+    const std::shared_ptr<arrow::Array> chunk_rows =
+        rows->Slice(static_cast<std::int64_t>(begin), static_cast<std::int64_t>(end - begin));
     std::vector<std::shared_ptr<arrow::Array>> first;
     first.reserve(keys.values.size());
     for (const arrow::Datum& column : keys.values) {
       ARROW_ASSIGN_OR_RAISE(
           const arrow::Datum taken,
-          arrow::compute::Take(column, rows, arrow::compute::TakeOptions::NoBoundsCheck(),
+          arrow::compute::Take(column, chunk_rows, arrow::compute::TakeOptions::NoBoundsCheck(),
                                kernels_.get()));
       first.push_back(taken.make_array());
     }
