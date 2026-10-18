@@ -22,18 +22,18 @@ CPU inside `arrow::compute::Grouper`**, and the two ways of attacking that direc
   confirmed, most recently rebased on both merged changes — 0.96-1.03x over seven fixed-width-key
   queries;
 - the inline-string key layout of ADR 0027 S2 only resolves *false* candidates, about 5% of probes,
-  because DuckDB's 12-byte inline window covers 0.01% of this data's URL rows and ~2% of its
-  SearchPhrase rows. A true match — 82% of the probes of the worst query — reads every byte in
-  either engine.
+  because DuckDB's 12-byte inline window covers a negligible share of this data's URL rows and only
+  a few percent of its SearchPhrase rows. A true match — 82% of the probes of the worst query —
+  reads every byte in either engine.
 
 What remained was not a faster probe but **fewer probes**. Every string column of the data is
 dictionary-encoded in all 226 row groups, and the engine discards that: the scan expands each column
 to dense `arrow::binary()` and the grouper then hashes and compares every row. The idea was to group
 each dictionary once and map rows through their indices.
 
-It looked excellent. Reading one row group of the widest column (450,560 rows, 56,316 distinct) as
-`dictionary<int32, binary>` and handing it to the grouper took **6.27 ns a row against the dense
-column's 27.70 — 4.4x**, for the same group count. Arrow's grouper accepts a dictionary key type and
+It looked excellent. Reading one row group of the widest string column — roughly an eighth of its
+rows distinct — as `dictionary<int32, binary>` and handing it to the grouper took **6.27 ns a row
+against the dense column's 27.70, 4.4x**, for the same group count. Arrow's grouper accepts a dictionary key type and
 exploits it; `take`, `filter`, `sort_indices`, `equal`, `unique`, `is_in`, `if_else` and `cast` all
 accept one too, so unlike ADR 0027's view layout the compute surface was not the obstacle. Arrow even
 enforced the boundary for us: a grouper consumes dictionary batches while the dictionary is identical
@@ -63,17 +63,18 @@ arrived, take the 4.4x down to about 3% of one query:
    | 256Ki | 0.21 | 27.57 | 9.89 | 2.79x |
    | one batch a row group | 0.12 | 28.02 | 7.77 | 3.61x |
 
-   A narrower column (SearchPhrase, 13,967 distinct a row group) reads 1.38x at 64Ki.
+   A narrower string column, with an order of magnitude fewer distinct values a row group, reads
+   1.38x at 64Ki.
 3. **The batch size cannot be raised to compensate.** End to end, 256Ki batches cost **+2.9%** over
    ten representative queries and are worst on the very queries this would have helped (+6%, +7% and
    +19% on the three largest grouped ones), while smaller batches are far worse (+9.5% at 32Ki,
    +33.5% at 16Ki). 64Ki is at a local optimum — a useful result in itself, since the constant had
    never been measured.
 
-And only part-local rows could have benefited in any case: the worst query routes 43.8 M of its
-100 M rows straight past its part table, and routed batches reach a lane carrying different
-dictionaries. That leaves about 1.53 s of addressable CPU in a query that burns roughly 18, so 1.51x
-on it is **about 3%** — against the 10% this was asked to clear.
+And only part-local rows could have benefited in any case: the worst query routes about 44% of its
+rows straight past its part table, and routed batches reach a lane carrying different dictionaries.
+That leaves about 1.53 s of addressable CPU in a query that burns roughly 18, so 1.51x on it is
+**about 3%** — against the 10% this was asked to clear.
 
 So the cost was a public-header change in `plan` (a per-column request on `plan::Table::ScanPart`
 and an amendment to its "columns typed as in `schema()`" contract), a decode path in `io`, an
