@@ -85,6 +85,10 @@ void KeyFilter::Add(std::span<const std::uint64_t> hashes) {
   }
 }
 
+void KeyFilter::Prefetch(std::uint64_t hash) const {
+  __builtin_prefetch(words_.data() + (BlockOf(hash, block_mask_) * kWordsPerBlock));
+}
+
 bool KeyFilter::MayContain(std::uint64_t hash) const {
   const std::array<std::uint32_t, 8> mask = MaskOf(hash);
   const std::uint32_t* block = words_.data() + (BlockOf(hash, block_mask_) * kWordsPerBlock);

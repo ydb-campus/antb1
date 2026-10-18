@@ -235,7 +235,18 @@ class KeyScanFilter final : public plan::ScanFilter {
     ARROW_ASSIGN_OR_RAISE(
         const std::vector<std::uint64_t> hashes,
         KeyHashes(arrow::compute::ExecBatch({values.array}, values.array->length())));
+    // How far ahead to warm the filter's cache lines. A probe row's read has no locality, so
+    // without this every row waits on one; the distance has to cover the latency at the rate the
+    // loop runs, which is why it is far longer than the eight rows ADR 0019's table uses -- that
+    // one walks a table it has just built and this one an 8 MB filter. Measured on the 80 M-row
+    // probe of Q16 at SF 100, scan time summed over parts: 1.443 s at 8 rows, 1.321 at 16, 1.228
+    // at 32, 1.142 at 64, 1.125 at 128 and back up to 1.189 at 256, where the lines are evicted
+    // before they are read.
+    constexpr int64_t kPrefetch = 128;
     for (int64_t row = 0; row < values.rows; ++row) {
+      if (row + kPrefetch < values.rows) {
+        filter_->Prefetch(hashes[static_cast<std::size_t>(row + kPrefetch)]);
+      }
       // GetBit takes an unsigned index and ClearBit a signed one, so each gets its own.
       const int64_t bit = offset + row;
       if (arrow::bit_util::GetBit(selected, Narrow<std::uint64_t>(bit)) &&

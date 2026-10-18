@@ -61,6 +61,12 @@ class KeyFilter {
   // already orders every Add before the first probe (hash_join.cc's PrepareBuilds).
   [[nodiscard]] bool MayContain(std::uint64_t hash) const;
 
+  // Warms the cache line `MayContain(hash)` will read. A probe tests one row after another with no
+  // locality at all, so the read is a cache miss whenever the filter outgrows the cache -- and the
+  // caller knows every hash of its batch before it tests the first, so it can ask for the line of a
+  // later row now. ADR 0019 measured the same hint on a hash bucket at 44.16 ns a row to 20.14.
+  void Prefetch(std::uint64_t hash) const;
+
   // The keys it was sized for, and its bytes.
   [[nodiscard]] int64_t keys() const { return keys_; }
   [[nodiscard]] int64_t bytes() const { return memory_.bytes(); }
