@@ -59,6 +59,22 @@ Proposed (draft: the measurement below is taken, the design is not built)
   6,398, nothing by 50,000 -- and it pays only where the build is small relative to the probe's row-group count. Only
   a per-row test reaches the rest, which is why DuckDB's plan carries a Bloom filter here and not merely a range.
   **A scattered key set is the case against min/max and the case for Bloom, not evidence against both.**
+- **Why the min/max interval fails here, which is not the reason it looks like.** The probe side is *ideally* ordered
+  on the join key: those 4,896 row groups each span **0.0204%** of the key domain and their spans sum to **100.0%**,
+  so they tile it contiguously and a range test is positioned to prune almost everything. What defeats the interval
+  is the **build** side, not the probe: 6,398 keys scattered over a domain the probe tiles in 4,896 pieces put at
+  least one key in 73% of the pieces, so the envelope `[min, max]` covers every piece while the key *set* misses
+  1,337 of them. The fix for that is a finer question, not a wider interval -- which is the row-group test above.
+- **And in this workload the interval has no home at all, measured rather than assumed.** It is tempting to expect a
+  date-filtered dimension to be min/max's case. It is not: at SF 100 the orders rows of a three-month window are
+  5,735,195 of 150,000,000 (3.8% selectivity) and their `o_orderkey` range still spans **100.00%** of the domain,
+  as does a single-priority filter's 29,995,209 rows. `dbgen` draws `o_orderdate` independently of `o_orderkey`, so
+  no filter on a non-key column narrows the key envelope. A min/max runtime filter would therefore prune nothing
+  anywhere in the 22, and ClickBench has no join to put one on. Its real home is a build side **contiguous** on the
+  join key -- a date-partitioned or key-sorted table -- which neither benchmark has, so it would ship unmeasurable.
+  DuckDB publishes one regardless (its plan carries `o_orderkey >= <min> AND o_orderkey < <max>` beside the Bloom
+  filter), and by this measurement it earns nothing there either: it is carried because it is nearly free and
+  because a range is the only filter a Parquet statistics path can take.
 - **The seam already exists, and it does not cross a module edge.** `plan::ScanFilter`
   (`src/plan/include/antb1/plan/table.h:48`) is an abstract class "implemented by exec, applied by tables that
   support it (`Table::supports_scan_filter`)", already documented as "thread-safe: the parts of a query apply one
@@ -73,12 +89,18 @@ Proposed (draft: the measurement below is taken, the design is not built)
 Draft. What follows is the shape to build and measure, not a decision taken.
 
 - **A completed hash build publishes a key filter; the probe side's scan reads it.** When a `HashBuild` finishes, it
-  knows its key column's exact contents. It publishes, per key column: the **min and max**, the **null count**, and —
-  when the build is small enough to be worth it — a **blocked Bloom filter** over the key hashes it has already
-  computed. The probe side's scan applies them as an extra `ScanFilter`.
+  knows its key column's exact contents. It publishes, per key column, what the mechanism below it is going to read
+  and nothing more: the **null count** and, when the build is small enough to be worth it, a **blocked Bloom filter**
+  over the key hashes it has already computed, which the probe side's scan applies as an extra `ScanFilter`; the
+  **sorted key set** and its **min and max** arrive with the row-group test that reads them, since each is published
+  by the item that consumes it.
 - **Three uses, not two, and they do not substitute for each other.** The measurement above separates them:
-  - a **min/max interval** prunes row groups from the footer, and reaches nothing once the keys are scattered. It is
-    two integers, so it is published anyway, but it is not worth a plan item of its own.
+  - a **min/max interval** prunes row groups from the footer, and reaches nothing once the keys are scattered. It
+    shares the row-group test's entry point and its measurement, so it is published and applied **with that item**
+    and not before it: two integers that nothing reads are two integers nobody can measure. A **per-row** range test
+    is deliberately not built at all -- it is the weakest of the three in both directions, since where the envelope
+    is narrow the row-group test has already pruned before anything was decoded, and where it is wide the per-row
+    test rejects nothing that the Bloom filter does not reject more precisely.
   - **each row group's range against the key set** prunes whole row groups, decoding nothing for a pruned one. Its
     reach is `e^(-k/g)` and therefore decidable before it runs. A Bloom filter cannot do this -- it tests points, not
     ranges -- so this is its own mechanism and needs its own entry point: `ScanFilter::Apply` sees values a table has
@@ -102,9 +124,11 @@ Draft. What follows is the shape to build and measure, not a decision taken.
   looks.
 - **Bounded memory, decided from the build's own row count.** A Bloom filter is sized from the completed build's rows
   at a fixed bits-per-key, capped, and allocated on the Arrow pool like every other exec allocation so that it is
-  inside `MemoryBudget` rather than beside it. Above the cap, min/max alone is published. Memory is what broke this
-  workload before ([ADR 0026](0026-join-performance.md)), and a filter that saves 15 GB of materialisation must not
-  cost an unbounded fraction of it back.
+  inside `MemoryBudget` rather than beside it. Above the cap **nothing is published and the probe runs as it does
+  today**, which is the one behaviour a filter that cannot pay for itself should have; the fallback is not a cheaper
+  filter, since the cheaper filter prunes nothing on the data this ADR measures. Memory is what broke this workload
+  before ([ADR 0026](0026-join-performance.md)), and a filter that saves 15 GB of materialisation must not cost an
+  unbounded fraction of it back.
 
 ## Consequences
 
@@ -115,9 +139,11 @@ Draft. What follows is the shape to build and measure, not a decision taken.
   mechanism is unobservable and untunable. This is also where it becomes reviewable: a filter that never fires and a
   filter that is never ready look identical in a timing.
 - The engine gains a cost that does not appear in any plan: hashing probe rows against a filter that may prune
-  nothing. A selective-looking join that is not selective pays for the filter and gains nothing, so the published
-  filter needs a cheap abandonment rule (publish min/max always, Bloom only when the build is small relative to the
-  probe's estimated rows — an estimate C1 already computes).
+  nothing. A selective-looking join that is not selective pays for the filter and gains nothing, so each published
+  filter needs a cheap abandonment rule, and each has one that is arithmetic rather than a guess: the Bloom filter
+  only where the build is small relative to the probe's estimated rows, which C1 already computes, and the row-group
+  test only where `e^(-k/g)` is large, which is two counts the build has in hand. Where neither holds, nothing is
+  published.
 - Nothing here helps ClickBench, and that should be said plainly in any PR that claims a win: the acceptance
   measurement is the 22 at SF 100, with ClickBench as a no-change control.
 
@@ -160,21 +186,27 @@ lesson of [ADR 0027](0027-string-views.md)'s S1, which was planned as a win whos
     the largest single cost of the query, which is the order this plan predicted. Peak memory fell by only 1.71 GB,
     so the 600 M-row join output was never the peak; the other build is, and that is a separate question from this
     ADR's.
-- **D1, perf(exec): publish a completed build's keys, and apply them per row with a blocked Bloom filter.** The
-  mechanism the measurement says pays, so it is first of the dynamic filters rather than last: it is the only one
-  that reaches a key set spanning its whole domain. The min/max interval is published with it, because it is two
-  integers and the row-group item needs it anyway. All the plumbing lives here -- publishing from a finished build,
-  the atomic readiness, the memory bound, and the probe side finding its filter -- which is why the cheaper-looking
-  item is not the smaller one. Measured on the 22 at SF 100 and 14 threads **after D0**, so that D0's win is not
-  counted twice, with ClickBench as the no-change control (no ClickBench query joins).
+- **D1, perf(exec): a blocked Bloom filter over a completed build's keys, applied per row.** The mechanism the
+  measurement says pays, so it is first of the dynamic filters rather than last: it is the only one that reaches a
+  key set spanning its whole domain. The min/max interval is **not** published here, nor is the sorted key set --
+  their only reader is D2, and ADR 0027's S1 is this ADR's standing lesson about shipping a producer before its
+  consumer. All the other plumbing lives here: publishing from a finished build, the atomic readiness, the memory
+  bound, and the probe side finding its filter -- which is why the cheaper-looking item is not the smaller one.
+  Measured on the 22 at SF 100 and 14 threads **after D0**, so that D0's win is not counted twice, with ClickBench
+  as the no-change control (no ClickBench query joins).
 - **D2, feat(plan+io): ask a table whether a row group can contain any published key.** The 27% the measurement
   found, from about `g` binary searches over the sorted key set. It needs the new entry point named in the Decision,
   since `ScanFilter::Apply` is handed values that have already been decoded, and a pruned row group is one that is
   never decoded at all. Worth it only where `e^(-k/g)` is large, which the engine can evaluate before publishing
-  anything: both counts are known once the build finishes.
-- **D3, feat(exec): report what each filter pruned in `EXPLAIN ANALYZE`**, with D1, not after it. Rows and row groups
-  skipped, and whether the filter was ready — without it a filter that never fires and a filter that is never ready
-  are the same timing.
+  anything: both counts are known once the build finishes. **The min/max interval belongs to this item**, published
+  and applied through the same entry point, which is the only place anything reads it. It will prune nothing in the
+  22 and nothing in ClickBench, for the reason the Context measures -- so it is carried on the argument that it is
+  two integers behind a gate that already has to exist, and this item's acceptance rests on the key-set test alone.
+  If that reads as too thin a justification, the honest alternative is to leave the interval out until a workload
+  with a contiguous build side is in the gate set.
+- **D3, feat(exec): report what each filter pruned in `EXPLAIN ANALYZE`**, each half with the item that produces it
+  -- rows with D1, row groups with D2 -- and not after either. Rows and row groups skipped, and whether the filter
+  was ready: without that last one, a filter that never fires and a filter that is never ready are the same timing.
 - **D4, docs(adr): record what D0-D2 measured**, and either accept this ADR or defer it with the numbers.
 
 **The gate, stated so it cannot be read backwards.** An earlier draft of D1 gated the Bloom filter on min/max having
@@ -198,6 +230,14 @@ rather than do not gather the rows.
 - **Better static estimates.** Tried and shipped: ADR 0026's C1 (filter-aware estimates) and C5 (DPccp over them).
   The measurement in the Context is taken *with both* and shows the defect intact. The missing number is the output
   cardinality of an aggregate with a `HAVING`, which metadata does not hold. Rejected on evidence.
+- **A min/max runtime filter as a mechanism of its own, ahead of the Bloom filter.** The cheapest thing to build
+  and the first thing to reach for: two integers from a finished build, applied through the footer statistics the
+  scan already reads. Rejected as an item, and reduced to a passenger of D2, on measurement rather than on taste --
+  0 of 4,896 row groups on the query this ADR is built around, and a key envelope spanning 100.00% of the domain
+  even behind a 3.8%-selective date filter, because `dbgen` draws the filtered column independently of the key.
+  The trigger to promote it: a gate workload whose **build** side is contiguous on the join key, which is the shape
+  where it prunes whole row groups for two integers and where the Bloom filter is the redundant one. A key-sorted or
+  date-partitioned table would create one; TPC-H and ClickBench do not.
 - **Sampling the build side to estimate selectivity, then reordering.** Replaces an exact runtime fact with an
   estimate of it, keeps the planner in charge, and costs a pass over data. Rejected: the exact keys are already in
   the build's hash table, so there is nothing to estimate.
