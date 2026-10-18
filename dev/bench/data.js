@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792314597546,
+  "lastUpdate": 1792320422960,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -10908,6 +10908,258 @@ window.BENCHMARK_DATA = {
             "value": 2225.1150019999955,
             "unit": "ms/iter",
             "extra": "iterations: 1\ncpu: 2224.8285760000003 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "a1bb13bf0507a0b2fa9ec1f619de50567ae8b401",
+          "message": "perf(exec): run an anchored regexp_replace pattern without the search wrapper (#168)\n\n## Summary\n\n`regexp_replace` wraps every pattern in `^(\\C*?)(pattern)`, groups\nshifted by two, so RE2 does its\nown leftmost unanchored search — Arrow's `replace_substring_regex`\nreplaces *every* match, and with\none replacement it re-matches the pattern against the matched substring\nalone, where `\\b`, `\\B`, `^`\nand `$` see the wrong neighbours. The wrapper is what makes the kernel\nbehave like DuckDB's\n`RE2::Replace` over the whole value.\n\n**A pattern already anchored at `^` needs none of it.** A leading `^`\nmatches in one place only, so\nthe lazy `\\C*?` before it can match nothing: `^(\\C*?)(^P)` accepts\nexactly what `^P` accepts with\ngroup 1 always empty, and the anchor already limits the kernel to one\nreplacement.\n\nWhat the wrapper costs is **RE2's literal prefix**. With `\\C*?` first,\nRE2 cannot reject a value that\ncould never match without trying every position; with `^https?://` first\nit rejects on the first\nbyte.\n\n## Measured\n\nThat is invisible on values that match and large on values that do not —\nwhich is why I first\nmeasured this as worthless. 200 K values through the kernel:\n\n| corpus | wrapped | bare | |\n| --- | ---: | ---: | ---: |\n| all match | 0.48 µs | 0.45 µs | 0.93× |\n| **none match** | 0.63 µs | **0.18 µs** | **0.29×** |\n| **82% match (as the data is)** | 0.51 µs | **0.40 µs** | **0.79×** |\n\nAnswers identical in all three. The data's non-match rate is real: 14.7\nM of the 81.0 M non-empty\nReferer rows do not match q28's pattern.\n\n**End to end, paired best of 5 on release builds:**\n\n| q | main | this | |\n| --- | ---: | ---: | ---: |\n| **q28** | **3.330** | **2.740** | **0.823×** |\n| q27 | 0.441 | 0.447 | 1.013× |\n| q20 | 0.424 | 0.409 | 0.964× |\n| q22 | 0.642 | 0.637 | 0.992× |\n| q33 | 1.429 | 1.448 | 1.013× |\n\n**0.59 s off the largest query in the suite** — 2.8% of the 20.9 s\ntotal. q28 is the only one of the\n43 that calls `regexp_replace` (checked), so the other four are a noise\nband, not a result.\n\n## How I got here, since the first answer was wrong\n\nI came at this intending a different change — memoising the regex across\nthe batches of a part,\nbecause `RegexpReplace` dictionary-encodes per batch so RE2 runs once\nper distinct value *per batch*.\nA gate measurement killed it: instrumenting the real engine, q28 makes\n**25,806,416** regex calls\ntoday against the **23,266,159** a part-scoped memo would make, and\n19,720,796 for a hypothetical\nquery-wide one. **1.11×**, because the per-batch dictionary already\nachieves 3.14 rows per call. I had\nextrapolated 4.34× from one row group that happens to be 13.6% distinct\nwhere the file is 24%.\n\nHaving measured the call count rather than guessed it, the remaining\ncost had to be *per call* — and\nthat is where the wrapper turned out to matter, but only for\nnon-matches, which my first benchmark\n(all-matching values, 1.05×) could not see.\n\n## Semantics\n\n**Unchanged.** The binder still rejects `\\Q` in a pattern and `\\8`/`\\9`\nin a replacement for every\npattern, anchored or not, so which form the evaluator picks stays\ninvisible apart from the speed; its\ncomment now says so rather than describing the wrapper as unconditional.\n\n## Type of change\n\n- [x] feat / fix / perf\n- [ ] refactor, test, docs, build, ci or chore\n\n## Verification\n\n```text\n$ pixi run check\nclang-format, markdownlint, typos, check_repo.py ......................... Passed\n100% tests passed out of 2728\n```\n\n- `pixi run ci` — Clang Debug `-Werror`, **2728 pass**, including\n`metamorphic.Relations.Hold/regexp_replace_keys_batch_size_invariance`\nand the `.slt` cases at\n  `tests/slt/cases/expressions/strings.slt:22-139`.\n- `pixi run release` — bench-smoke included, pass.\n- `pixi run tidy` — back to the clean-`main` baseline (two findings of\nmy own, raw-string literals and\n  designated initializers in the new test, fixed).\n- `ASAN_OPTIONS=detect_leaks=0 ./build/ci-asan/bin/antb1_exec_tests\n--gtest_filter='*Compute*'` —\n  33 pass on a freshly rebuilt binary.\n- `pixi run lint` — shellcheck fails on the 36 pre-existing osx-arm64\nSC2218 findings; no shell\n  script touched.\n\n## Tests\n\n`exec.ComputeTest.AnchoredRegexpReplaceMatchesTheWrappedForm` runs nine\nanchored patterns —\nzero-width matches, an empty-only pattern, three groups, `\\B`, `\\C`, an\ninline flag — against the\nwrapper **written out by hand**, over ten values including NULL, empty\nand non-ASCII. The hand-written\nwrapper is itself `^`-anchored, so it runs exactly as the evaluator used\nto build it, which makes the\nequivalence directly testable without a toggle.\n\nMutation-checked: forcing the condition to `true` makes\n`StringFunctions` fail, because a\nnon-anchored pattern then replaces every match instead of the first —\n`a<b>a<b>` where `a<b>ab` is\nright.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint caveat above)\n- [x] Tests cover the change\n- [x] Docs updated — none needed: semantics and `docs/sql-subset.md`'s\nwording are unchanged, since\nthe per-batch dedup and the binder's restrictions both stay as they are.\n**Worth your call:**\n      the rejected memo measurement (1.11×) could go in\n[ADR 0012](docs/adr/0012-scalar-expressions.md), which owns the\nevaluator and currently says\nthe pattern is compiled \"once per batch\"; `/docs/adr/` is CODEOWNERS so\nI have not touched it.\n- [x] No ClickBench-derived data: query numbers, row counts and timings\nonly\n- [x] Nothing derived from TPC-H is committed\n\n## AI assistance\n\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5)\nprofiled q28, ran the gate that\nkilled the memo idea, found the hidden-prefix effect, wrote the change,\nthe test and this\n      description.\n- Accountable human (has read and understands the whole diff): @hor911\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-18T13:43:06+03:00",
+          "tree_id": "7645fe0dd8654ca88f689575bbf9170b9791a2e9",
+          "url": "https://github.com/ydb-campus/antb1/commit/a1bb13bf0507a0b2fa9ec1f619de50567ae8b401"
+        },
+        "date": 1792320421619,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4832.787391292146,
+            "unit": "ns/iter",
+            "extra": "iterations: 141664\ncpu: 4832.371548170319 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84272.52185829687,
+            "unit": "ns/iter",
+            "extra": "iterations: 7297\ncpu: 84252.0602987529 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 221875.87108013983,
+            "unit": "ns/iter",
+            "extra": "iterations: 3157\ncpu: 221822.88153310106 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 447332.0257537589,
+            "unit": "ns/iter",
+            "extra": "iterations: 1592\ncpu: 447226.61620603 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 409312.5978198385,
+            "unit": "ns/iter",
+            "extra": "iterations: 1743\ncpu: 409084.9024670105 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2090033.7994012337,
+            "unit": "ns/iter",
+            "extra": "iterations: 334\ncpu: 2089446.1616766478 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 54.780839749999664,
+            "unit": "ms/iter",
+            "extra": "iterations: 12\ncpu: 54.77337966666666 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 45.63323133333294,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 45.622924799999964 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 204.21243950000445,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 204.15092725000017 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.327482857142435,
+            "unit": "ms/iter",
+            "extra": "iterations: 49\ncpu: 14.32630451020408 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 20.121684999999648,
+            "unit": "ms/iter",
+            "extra": "iterations: 35\ncpu: 20.11814565714286 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 38.13425436842079,
+            "unit": "ms/iter",
+            "extra": "iterations: 19\ncpu: 38.13060531578955 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.5404746044444235,
+            "unit": "ms/iter",
+            "extra": "iterations: 450\ncpu: 1.5403276533333354 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 89.82456485714303,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 89.81836514285695 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1000",
+            "value": 28.72334791999947,
+            "unit": "ms/iter",
+            "extra": "iterations: 25\ncpu: 28.71967036000001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16384",
+            "value": 31.216037173913453,
+            "unit": "ms/iter",
+            "extra": "iterations: 23\ncpu: 31.213377739130376 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/262144",
+            "value": 66.4151700909098,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 66.40783609090887 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1048576",
+            "value": 95.49379171428589,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 95.48132914285748 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/4194304",
+            "value": 341.90252550000366,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 341.8346225000004 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16777216",
+            "value": 1643.3644399999991,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1643.2526250000024 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1000",
+            "value": 34.63668870000021,
+            "unit": "ms/iter",
+            "extra": "iterations: 20\ncpu: 34.63380355000005 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16384",
+            "value": 39.73869155555576,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 39.73451166666663 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/262144",
+            "value": 68.31472480000116,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 68.30982399999996 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1048576",
+            "value": 119.51298683333296,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 119.50166016666704 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/4194304",
+            "value": 415.9315630000009,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 415.8842690000011 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16777216",
+            "value": 1932.006763000004,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1931.7814320000011 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1000",
+            "value": 60.409319166666364,
+            "unit": "ms/iter",
+            "extra": "iterations: 12\ncpu: 60.40381258333335 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16384",
+            "value": 63.28633718181788,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 63.28044172727264 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/262144",
+            "value": 93.74015462499585,
+            "unit": "ms/iter",
+            "extra": "iterations: 8\ncpu: 93.73553837499982 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1048576",
+            "value": 166.61680250000188,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 166.59081150000077 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/4194304",
+            "value": 523.5997400000088,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 523.5333359999998 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16777216",
+            "value": 2336.6258120000225,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2336.2306889999973 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1000",
+            "value": 70.05464499999903,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 70.04814630000027 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16384",
+            "value": 74.66910655554986,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 74.66116466666664 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/262144",
+            "value": 111.8449749999968,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 111.8388648333332 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1048576",
+            "value": 194.51194199999122,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 194.4975754999998 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/4194304",
+            "value": 554.7749520000025,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 554.725095000002 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16777216",
+            "value": 2518.921804999991,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2518.508746000002 ms\nthreads: 1"
           }
         ]
       }
