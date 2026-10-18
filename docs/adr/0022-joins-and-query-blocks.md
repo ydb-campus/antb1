@@ -335,6 +335,14 @@ Accepted (with the maintainer-approved roadmap for joins, query blocks and uncor
   - An outer, semi, anti or one-row join is a fixed unit for ordering, and builds on the side whose rows it does not
     preserve: a LEFT JOIN on its right input, a semi or anti join on its subquery, a one-row join on its single row.
     Building on the preserved side needs build-side output, which waits for its own ADR.
+    Update (2026-10-18, [ADR 0029](0029-dynamic-join-filters.md)'s D0): **a WHERE semi join whose key reads one
+    relation of the block is no longer a fixed unit.** It is a filter -- it keeps or drops a row of its left input
+    and never duplicates one -- so it runs on that relation's own branch, below the joins rather than above them, and
+    a joined row matches exactly when its row from that relation matches. It moves only where the relation's estimate
+    does not exceed the estimate of the tree it would otherwise stand on, since a semi join probes the rows of
+    whatever it stands on. Everything else in this bullet is unchanged, this one included for a null-aware anti join,
+    a dependent join, and a key the join computes in a layer of its own. `Binder::PushableSemiJoin` holds the
+    conditions and `plan.BinderTest.ASemiJoinOverOneRelationRunsOnItsBranch` pins each of them.
   - Update (2026-10-10, J2b-2): an inner join builds on the relation it adds, always. The smaller-footer-rows choice
     above, and join-order rule 4's filter selectivity, are deferred together to the cost-based-ordering trigger
     below: both need estimates that account for filters, and `OrderJoins` decides the side in one field, so the
@@ -420,7 +428,9 @@ Accepted (with the maintainer-approved roadmap for joins, query blocks and uncor
       that SQL never sees. Its values are made once, as columns that every probe window slices, of fewer rows than
       `batch_size` when its VARCHAR values are long.
   - A subquery's join sits above the inner joins of its block (WHERE) or above the aggregation (HAVING), in the
-    order the conjuncts are written.
+    order the conjuncts are written. Update (2026-10-18): a WHERE semi join whose key reads one relation of the
+    block runs on that relation's own branch instead, below those joins; see the "Build sides" exception above and
+    [ADR 0029](0029-dynamic-join-filters.md)'s D0.
 - **Statistics come from the footers only (decision C10).** Planning reads row counts, part rows, integer min/max
   and NULL counts and, new with J2b, the distinct-count hints that a writer stored, through Arrow's Parquet
   statistics. It reads no data and keeps nothing between queries. Persistent sketches (HyperLogLog, Count-Min) come
