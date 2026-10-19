@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792414002104,
+  "lastUpdate": 1792415787878,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -12420,6 +12420,258 @@ window.BENCHMARK_DATA = {
             "value": 2443.137670999988,
             "unit": "ms/iter",
             "extra": "iterations: 1\ncpu: 2442.9041550000006 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c32426314bd6fdb4fb525760be9819b4366a9887",
+          "message": "feat(plan): find sub-plans equal up to the fields they read (#179)\n\n## Summary\n\nADR 0030's **E1**, with the ADR amended first on what reading the plans\nshowed.\n\nA `plan`-internal pass reports which sub-plans of a plan compute the\nsame rows, and `EXPLAIN` notes each member.\nIt materialises nothing and rewrites nothing, so it cannot give a wrong\nanswer — which is why it comes before the\nitem that shares what it finds.\n\n## The amendment, and why the identity rule changed\n\nThe ADR said the duplicated subtrees in its three motivating queries\nwere \"identical\". That was asserted, not\nchecked, and for two of the three it is false:\n\n| query | the duplicated sub-plan | equal? | the difference |\n| --- | --- | --- | --- |\n| Q15 | lineitem scan → filter → compute → grouped SUM → project |\n**yes** | none |\n| Q11 | `partsupp` ⋈ `supplier` ⋈ `nation` | no | the `partsupp` scans\nread **4 fields against 3** |\n| Q2 | `supplier` ⋈ `nation` ⋈ `region` | no | `supplier` **7 against\n2**, `nation` **3 against 2** |\n\nSo **exact structural equality catches one of the three** — the question\nE1 was written to answer, answered by\nreading plans instead of building it. And Q15's match is **incidental**:\nits second reference does not use the\nCTE's supplier column, and the two branches are equal only because\noptimizer rule 4 prunes Scans and Computes but\n**not Project columns**, so a column the SQL plainly never references\nsurvives into the aggregating branch. A\npruning improvement would have retired the optimisation. *A performance\nfeature whose trigger depends on another\npass not being improved is the wrong coupling*, and no amount of\nmeasuring exact equality would have shown it.\n\nHence the rule is structural equality **up to the fields a sub-plan\nreads**, with the shared one reading the\nunion. It also makes the feature explainable: under exact equality, \"is\nmy `WITH` computed once?\" answers \"only if\nboth references happen to want the same columns\", which no user can\npredict.\n\n## What E1 does\n\nTwo deliberate loosenesses, both necessary rather than convenient:\n\n- **Columns are compared by where they come from**, not by position or\nid. A `ColumnId` is minted per reference, so\ntwo references to one CTE never share one; and `BoundColumn::index`\nshifts in *every* node above a scan that\nreads one field fewer — which is exactly why Q11's two joins are unequal\nby index and equal by origin.\n- **A scan's field set is not compared at all.** Selecting fields does\nnot change which *rows* a scan returns, so\n  two scans of one table differing only there compute the same rows.\n\nA `Sort`, `Limit`, `RowCount` or dependent join gets no key, so no\nsub-plan holding one is a member: a shared\nresult cannot hand two consumers an order without deciding whose wins.\nEach of the three visitors is exhaustive, so\na new node type fails to compile.\n\n## What it found over the 22, including one the ADR had dismissed\n\nIt reports a group on nine queries, and **every one is a true finding**\n— I checked each by reading its plan\nrather than trusting the count:\n\n- **Four with a *reducing* shared sub-plan**, which is what a later item\nwould materialise: **Q15** (the CTE),\n**Q11** and **Q2** (both reachable only with field subsumption — 8 and\n12 fields), and **Q21**, which this ADR\ndismissed as repeating `lineitem` \"for genuinely different work\". Half\nof that was wrong: Q21 has *three*\nreferences, and two carry the same filter over the same four fields. At\nSF 100 it is the largest of the four. The\n  ADR now records the correction.\n- **Five whose repeated sub-plan is a scan and nothing more** (Q7, Q8,\nQ17, Q18, Q22). The scans do compute the\nsame rows, so reporting them is correct — and the cost gate refuses\nevery one for the reason the ADR gives: a\nsub-plan is worth holding when it **reduces**, and a scan does not. That\nsplit is precisely why reporting is a\nseparate item from deciding, and it is the thing a unit test on\nhand-built plans cannot establish.\n\nNothing is shared and no query runs differently. The only behaviour\nchange is `EXPLAIN` output.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n`EXPLAIN` gains a note on a plan that repeats a sub-plan. It is additive\nand only on such plans, so no plan without\nduplication changes — but it *is* a visible output change, which is why\nfour goldens move.\n\n## Verification\n\n```text\n$ pixi run ci\n100% tests passed out of 2754\n\n$ ANTB1_DIFF_SEED=20261020 pixi run diff-random\nDIFF: PASS seed=20261020 queries=2000 failed=0 unsupported=0\n\n$ pixi run coverage\nCoverage gate: PASS      # plan 95.41% lines / 89.91% branches, floors 93.5% / 89.5%\n# shared_sub_plans.cc 97.31% lines, explain.cc 100%. The ten uncovered lines are all\n# defensive null guards on paths a bound plan cannot produce.\n\n$ ANTB1_UPDATE_GOLDENS=1 pixi run test -L cli   # then reviewed every line of the diff\n100% tests passed out of 88\n\n$ clang-tidy -p build/tidy --warnings-as-errors='*' \\\n    src/plan/shared_sub_plans.cc src/plan/explain.cc src/plan/tests/shared_sub_plans_test.cc\n# no findings in any of them\n\n$ pixi run lint\n# every linter passes except shellcheck, which reports 36 pre-existing macOS-only SC2218\n# findings in tools/github/apply-settings.sh. This diff touches no shell at all, so\n# `pixi run check` stops there on this host and the `ci` leg above was run on its own.\n```\n\n**ASan**: `pixi run asan` fails at test discovery on this host for a\npre-existing reason unrelated to this change\n(a `curl_global_init` leak in discovery, present on `main`), so the\nsuites were run from the ASan build directly:\n`antb1_plan_tests` 812 tests and `antb1_cli_tests` 17, all passing, with\n`detect_leaks=0`.\n\n**GCC was not checked**: the `gcc` environment is linux-64 only and this\nis macOS. The diff was read by hand for\nthe two traps that caught #175 — a cast whose operand is already that\ntype (`-Wuseless-cast`) and a parameter\nshadowing a member (`-Wshadow`) — and carries neither; the `ci` leg,\nwhich adds `-Wconversion -Wsign-conversion\n-Wshadow-all`, is clean.\n\n**One accidental breadth worth knowing about**: `Explain()` now calls\nthe pass, so **every existing plan test\nexercises it** — including plans holding `CASE`, function calls and\ncasts that this PR's own tests do not build.\nThat is why nothing but the null guards is uncovered, and it means the\n2,754-test run is meaningful evidence that\nthe pass neither crashes nor misgroups across the whole variety of plans\nthe suite constructs.\n\n**Four CLI goldens and two pinned binder expectations gained the note**,\nand each was checked to be a query that\ngenuinely reads one table twice: two build-side-ratio plans (three\n`trips` scans, union 2 fields), the\ntwice-referenced-CTE plan (the `Project`, 2 members), the\nscalar-subquery plan (two `trips` scans), and the D0\nsemi-join plan (two scans of `t`, once in the FROM and once in the\nsubquery). The comment above the CTE golden\nsaid the plan \"holds two identical subtrees rather than one shared node\"\n— it now says the plan reports them.\n\n`.slt` cases hold no EXPLAIN output, so there is no churn there.\n\n**Mutation-checked:**\n\n| mutation | result |\n| --- | --- |\n| a Scan's fields go into the key (so no subsumption) | caught, 2 tests\n|\n| columns compared by id instead of by origin | caught, 3 tests |\n\n**Tests** (`src/plan/tests/shared_sub_plans_test.cc`, hand-built plans\nover the module's own fake tables, nothing\nTPC-H-derived). Each asserts *which* node heads a group and not merely\nhow many there are, because two references\nto one table almost always repeat their **scan** — a test that counted\ngroups would pass while the node it cares\nabout went unshared:\n\n- the sub-plan two CTE references repeat → `Project 2x1`, the outermost\nnode and not the Scan inside it;\n- **field subsumption** → `Join 2x3`, where one side's scan of `t` reads\na field the other's does not and the\ndifference is driven from outside the repeated sub-plan, as it is in Q11\nand Q2;\n- a different constant, a different column, a different table → the\ndiffering node is **not** shared;\n- an ordered or limited sub-plan → never a member, though the scans\nbelow it are;\n- three references → one group of three, not three of two;\n- a bare repeated scan → reported, because the cost gate is E2's;\n- nothing repeating, and an empty plan;\n- determinism, which the goldens depend on.\n\n## Checklist\n\n- [x] `pixi run check` passes locally — see the lint note above: its\n`ci` leg is clean and its `lint` leg stops on\n36 pre-existing macOS-only shellcheck findings in a file this diff does\nnot touch\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [ ] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer\n\n**One CODEOWNERS file, agreed with the maintainer before being\nwritten**: ADR 0030 gains the identity rule's\nchange, the per-query evidence, Q15's fragility, the Q21 correction, the\nmaterialisation shape and the out-of-scope\nlist. Its Status stays `Proposed`; E3 accepts or defers it. The\nTPC-H-derived figures here are field counts, group\ncounts and query numbers — no query text or fragments and **no EXPLAIN\noutput of those queries**, both of which\nADR 0006 line 70 bars from repository files and PR text. (One draft of\nthe amendment did quote a four-word\nfragment; it is gone, and I grep the diff for query text as part of the\nchecks now.)\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5) read\nthe three plans and found that two of the\nADR's \"identical\" subtrees are not, traced Q15's accidental match to the\nprojection-pruning rule, designed and\nimplemented the pass, wrote the tests, mutation-checked the two\nloosenesses, verified all nine reported groups by\nhand, and corrected its own claim that groups are strictly maximal when\nQ21 showed they can nest.\n- Accountable human (has read and understands the whole diff): @\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-19T16:12:47+03:00",
+          "tree_id": "4b883b13dd921e393ca46696007b99a4dc1d614b",
+          "url": "https://github.com/ydb-campus/antb1/commit/c32426314bd6fdb4fb525760be9819b4366a9887"
+        },
+        "date": 1792415786640,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4576.469160866858,
+            "unit": "ns/iter",
+            "extra": "iterations: 154171\ncpu: 4576.230665948849 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 91691.37700680386,
+            "unit": "ns/iter",
+            "extra": "iterations: 7350\ncpu: 91682.44517006802 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 94359.29391891882,
+            "unit": "ns/iter",
+            "extra": "iterations: 7400\ncpu: 94353.8043243243 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 368240.99684375233,
+            "unit": "ns/iter",
+            "extra": "iterations: 1901\ncpu: 368218.3214097842 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 383015.6863066136,
+            "unit": "ns/iter",
+            "extra": "iterations: 1833\ncpu: 382835.0561920348 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2580189.8413283704,
+            "unit": "ns/iter",
+            "extra": "iterations: 271\ncpu: 2579984.011070109 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 65.60381063636359,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 65.5535957272727 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 63.28342790909212,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 63.275934909090886 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 212.2679689999908,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 212.25988866666628 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 13.772678470588165,
+            "unit": "ms/iter",
+            "extra": "iterations: 51\ncpu: 13.771252960784302 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 31.51728209523764,
+            "unit": "ms/iter",
+            "extra": "iterations: 21\ncpu: 31.514841904761884 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 43.78686200000104,
+            "unit": "ms/iter",
+            "extra": "iterations: 16\ncpu: 43.78031012500006 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 3.049055986238483,
+            "unit": "ms/iter",
+            "extra": "iterations: 218\ncpu: 3.0487448899082574 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 84.21950600000017,
+            "unit": "ms/iter",
+            "extra": "iterations: 8\ncpu: 84.21439937499997 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1000",
+            "value": 34.78973805263165,
+            "unit": "ms/iter",
+            "extra": "iterations: 19\ncpu: 34.78444936842108 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16384",
+            "value": 35.34700769999972,
+            "unit": "ms/iter",
+            "extra": "iterations: 20\ncpu: 35.34474644999994 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/262144",
+            "value": 61.148720818181346,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 61.14130327272737 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1048576",
+            "value": 136.36526800000297,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 136.3545305999999 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/4194304",
+            "value": 361.528640500012,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 361.51280900000063 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16777216",
+            "value": 1461.6435750000107,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1461.3435320000008 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1000",
+            "value": 48.9249068571423,
+            "unit": "ms/iter",
+            "extra": "iterations: 14\ncpu: 48.921226571428534 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16384",
+            "value": 52.05155199999904,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 52.04945407692317 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/262144",
+            "value": 75.67781877777848,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 75.66180388888888 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1048576",
+            "value": 162.8404682500033,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 162.83453550000004 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/4194304",
+            "value": 429.457127500001,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 429.3888145000011 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16777216",
+            "value": 1903.0713310000067,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1902.8730190000012 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1000",
+            "value": 66.34930327272637,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 66.34175836363615 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16384",
+            "value": 67.53794980000123,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 67.53431550000002 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/262144",
+            "value": 113.88890450000133,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 113.87319133333365 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1048576",
+            "value": 221.44150333333337,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 221.42268533333245 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/4194304",
+            "value": 538.8810649999982,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 538.7869950000024 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16777216",
+            "value": 2260.9069460000055,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2260.349523999999 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1000",
+            "value": 92.26450337500225,
+            "unit": "ms/iter",
+            "extra": "iterations: 8\ncpu: 92.25259399999963 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16384",
+            "value": 93.91655028571628,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 93.91198314285784 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/262144",
+            "value": 149.28610975000112,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 149.2717382500004 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1048576",
+            "value": 257.3383970000028,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 257.30716033333323 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/4194304",
+            "value": 616.8171390000055,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 616.7800829999948 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16777216",
+            "value": 2548.6758210000175,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2548.051817000001 ms\nthreads: 1"
           }
         ]
       }
