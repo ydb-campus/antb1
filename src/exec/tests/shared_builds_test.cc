@@ -19,6 +19,7 @@
 #include "antb1/exec/memory_budget.h"
 #include "antb1/exec/operator.h"
 #include "antb1/exec/physical_planner.h"
+#include "antb1/exec/profile.h"
 #include "antb1/plan/binder.h"
 #include "antb1/plan/catalog.h"
 #include "antb1/plan/logical_plan.h"
@@ -67,17 +68,26 @@ arrow::Result<plan::LogicalPlan> PlanOf(std::string_view sql,
 
 struct Run {
   std::shared_ptr<arrow::Table> rows;
-  int parts_scanned = 0;  // how many part scans the base table served
+  int parts_scanned = 0;               // how many part scans the base table served
+  std::optional<int64_t> shared_rows;  // the profile's count, absent when nothing was shared
 };
 
 arrow::Result<Run> Execute(std::string_view sql, const std::shared_ptr<MemoryTable>& table) {
   ARROW_ASSIGN_OR_RAISE(const plan::LogicalPlan plan, PlanOf(sql, table));
-  ARROW_ASSIGN_OR_RAISE(std::unique_ptr<Operator> op, BuildPhysicalPlan(plan));
+  ProfileNode profile;
+  ARROW_ASSIGN_OR_RAISE(std::unique_ptr<Operator> op, BuildPhysicalPlan(plan, &profile));
   MemoryBudget budget(int64_t{1024} * 1024 * 1024);
   ExecContext ctx{.pool = arrow::default_memory_pool(), .budget = &budget};
   ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Table> rows, Drain(*op, ctx));
+  std::optional<int64_t> shared_rows;
+  for (const ProfileMetric& metric : profile.metrics()) {
+    if (metric.name == "shared_rows") {
+      shared_rows = metric.value;
+    }
+  }
   return Run{.rows = std::move(rows),
-             .parts_scanned = static_cast<int>(table->scanned_parts().size())};
+             .parts_scanned = static_cast<int>(table->scanned_parts().size()),
+             .shared_rows = shared_rows};
 }
 
 // A CTE referenced twice: the sub-plan is a grouped aggregate, which reduces, so with a table large
@@ -99,6 +109,8 @@ TEST(SharedBuildsTest, ComputesARepeatedSubPlanOnceAndKeepsTheAnswer) {
   ASSERT_TRUE(without.ok()) << without.status().ToString();
 
   EXPECT_EQ(with->parts_scanned, 3) << "the three parts read once, for one shared result";
+  EXPECT_EQ(with->shared_rows, 7) << "and the profile says what was shared: one row a group";
+  EXPECT_EQ(without->shared_rows, std::nullopt) << "nothing shared, nothing reported";
   EXPECT_EQ(without->parts_scanned, 6) << "and twice when the sub-plan is recomputed";
   ASSERT_NE(with->rows, nullptr);
   ASSERT_NE(without->rows, nullptr);

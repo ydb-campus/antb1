@@ -41,8 +41,6 @@ class MaterializedTable final : public plan::Table {
   void Finish();
   // Gives the rows and the bytes back.
   void Release();
-  // Whether it has been filled, which a consumer's scan asserts rather than silently reading none.
-  [[nodiscard]] bool filled() const;
 
   const std::shared_ptr<arrow::Schema>& schema() const override { return schema_; }
   std::optional<int64_t> exact_row_count() const override;

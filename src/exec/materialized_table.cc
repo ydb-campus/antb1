@@ -78,11 +78,6 @@ void MaterializedTable::Release() {
   memory_.Release();
 }
 
-bool MaterializedTable::filled() const {
-  const std::scoped_lock lock(mutex_);
-  return filled_;
-}
-
 void MaterializedTable::Finish() {
   const std::scoped_lock lock(mutex_);
   filled_ = true;
