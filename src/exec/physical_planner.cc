@@ -64,14 +64,37 @@ struct PipelineBuilds {
   }
 };
 
+// A key filter published by a join *above* this node, carried down to a grouped aggregate so that
+// the aggregate's own input can drop the rows whose key that join cannot match.
+//
+// This restores what ADR 0023's unnesting discards. Its Path 2 replaces the domain D with a map
+// (the formalization's Lemma 4.2), which keeps the answer and drops the restriction D carried,
+// because a map restricts nothing -- so a grouped aggregate under a join ends up grouping a whole
+// table by a key when the join above it will read a fraction of those groups. The join's build has
+// the keys that matter and already publishes them (ADR 0029's D1); this is the one place more that
+// the published filter has to reach.
+//
+// The key travels as a **ColumnId and not an index**, because every node between the join and the
+// aggregate moves positions while an id survives one (logical_plan.h). It is remapped, not merely
+// passed: a Project may mint a new id for a column it passes through.
+struct AggregateFilter {
+  // The build, not its filter: this is decided while the planner builds operators, and a build
+  // publishes its filter only when it is prepared, which happens later. D1 reads `key_filter()` at
+  // the same late moment and for the same reason.
+  std::shared_ptr<JoinBuild> build;
+  plan::ColumnId key = plan::kNoColumnId;
+};
+
 // Builds a node's operators. Without a part, a part pipeline (PipelineScan) becomes the part
 // operators over it; with one, the node is inside the pipeline of that part, whose joins' builds
 // are `builds`. With a profile node (`slot`), the operator is profiled into it (profile.h) and its
 // inputs into its children. With `top_n` (a top-N right above `node`), a partitioned grouped
-// aggregation keeps only each partition's first rows in its order (PartitionTopN).
+// aggregation keeps only each partition's first rows in its order (PartitionTopN). With `above`, a
+// join over this node published a filter its grouped aggregate may apply (AggregateFilter).
 OperatorResult Build(const plan::LogicalNodePtr& node, std::optional<int64_t> part = std::nullopt,
                      ProfileNode* slot = nullptr, const LateScan* late = nullptr,
-                     const PartitionTopN* top_n = nullptr, const PipelineBuilds* builds = nullptr);
+                     const PartitionTopN* top_n = nullptr, const PipelineBuilds* builds = nullptr,
+                     const AggregateFilter* above = nullptr);
 // The operator profiled into `slot` (with the node's EXPLAIN line when it has no detail yet); the
 // operator itself without a slot.
 OperatorResult Profiled(OperatorResult op, const plan::LogicalNodePtr& node, ProfileNode* slot);
@@ -263,7 +286,8 @@ struct Parts {
 
 arrow::Result<Parts> PartsOf(const plan::LogicalNodePtr& node, const plan::ScanNode& scan,
                              ProfileNode* consumer = nullptr,
-                             const std::shared_ptr<const LateScan>& late = nullptr);
+                             const std::shared_ptr<const LateScan>& late = nullptr,
+                             const AggregateFilter* above = nullptr);
 
 // The build of a join of shape `shape`, profiled into `slot` (nullptr: not profiled): keyless for
 // a one-row join. A build input that is a part pipeline is built from its parts, with the builds of
@@ -330,7 +354,11 @@ arrow::Result<std::shared_ptr<const PipelineBuilds>> PipelineBuildsOf(
 // the parts read and skipped are counted. With `late` (the late columns of the pipeline's scan and
 // its row-id column), every part's scan is narrow (LateScan), numbered by the part's number.
 arrow::Result<Parts> PartsOf(const plan::LogicalNodePtr& node, const plan::ScanNode& scan,
-                             ProfileNode* consumer, const std::shared_ptr<const LateScan>& late) {
+                             ProfileNode* consumer, const std::shared_ptr<const LateScan>& late,
+                             const AggregateFilter* above) {
+  // Copied into the factory: the aggregate above outlives no part task, so the pointer must not.
+  const std::optional<AggregateFilter> inherited =
+      above == nullptr ? std::nullopt : std::optional<AggregateFilter>(*above);
   auto kept = std::make_shared<const std::vector<int64_t>>(
       KeptParts(*scan.table, scan.fields, FiltersOnScan(node)));
   const auto count = static_cast<int64_t>(kept->size());
@@ -349,12 +377,13 @@ arrow::Result<Parts> PartsOf(const plan::LogicalNodePtr& node, const plan::ScanN
     ++sample;
   }
   return Parts{.pipeline =
-                   [node, kept, pipeline, late, builds](int64_t i) {
+                   [node, kept, pipeline, late, builds, inherited](int64_t i) {
                      // Past the kept parts only for the schema sample, which is never opened.
                      const int64_t part =
                          std::cmp_less(i, kept->size()) ? (*kept)[static_cast<std::size_t>(i)] : i;
                      if (late == nullptr) {
-                       return Build(node, part, pipeline, nullptr, nullptr, builds.get());
+                       return Build(node, part, pipeline, nullptr, nullptr, builds.get(),
+                                    inherited.has_value() ? &*inherited : nullptr);
                      }
                      LateScan numbered = *late;
                      numbered.ordinal = i;
@@ -666,12 +695,42 @@ std::optional<TableScanOperator::KeyScan> KeyScanOf(const plan::ScanNode& scan,
 }
 
 // One overload per logical node type: a node type without one fails to compile.
+// The filter `node` may offer a grouped aggregate under its probe, or none.
+//
+// One key, because the aggregate applies it to one column; the probe side's key by id, since that
+// is what survives the nodes in between. The join must not emit an unmatched probe row -- dropping
+// rows from the aggregate's input drops whole groups and so drops probe rows -- which is D1's rule
+// (EmitsBuildRows), and a null-aware anti join and a one-row join are excluded as they are there.
+AggregateFilter ProbeAggregateFilter(const plan::JoinNode& node, const JoinShape& shape,
+                                     const std::shared_ptr<JoinBuild>& build) {
+  if (build == nullptr || node.keys.size() != 1 || shape.probe == nullptr) {
+    return {};
+  }
+  if (node.kind != plan::JoinKind::kInner && node.kind != plan::JoinKind::kSemi &&
+      !EmitsBuildRows(node.kind, node.build)) {
+    return {};
+  }
+  if (node.kind == plan::JoinKind::kNullAwareAnti || node.kind == plan::JoinKind::kOneRow) {
+    return {};
+  }
+  const plan::BoundColumn& key =
+      node.build == plan::BuildSide::kLeft ? node.keys.front().right : node.keys.front().left;
+  if (key.id == plan::kNoColumnId) {
+    return {};
+  }
+  return AggregateFilter{.build = build, .key = key.id};
+}
+
 struct Builder {
   std::optional<int64_t> part;     // inside the pipeline of this part
   ProfileNode* slot = nullptr;     // the profile node of the operator built (nullptr: no profile)
   const LateScan* late = nullptr;  // the narrow scan of the part pipeline (late materialization)
   const PartitionTopN* top_n = nullptr;    // a top-N right above this node
   const PipelineBuilds* builds = nullptr;  // with `part`: the builds of the pipeline's joins
+  // A filter a join above published, on its way to a grouped aggregate (AggregateFilter). Only the
+  // nodes that keep every row carry it on: a Filter as it is, a Project and a Compute with the key
+  // remapped, and every other node drops it.
+  const AggregateFilter* above = nullptr;
 
   // The profile node of the operator's input (per part as the operator is). A node's name, detail
   // and per-part flag are written by the first build of its plan (at planning time, before the
@@ -708,6 +767,26 @@ struct Builder {
     std::optional<TableScanOperator::KeyScan> key_scan;
     if (part.has_value()) {
       key_scan = KeyScanOf(node, builds, late_scan, *part);
+    }
+    // A filter from a join above the grouped aggregate this scan feeds, where the scan still has
+    // the column it groups by. Finding the key among `node.ids` is also the check that nothing
+    // between here and the aggregate moved it: only a Filter keeps an id in place, which is the
+    // same chain D1 requires. It yields to a filter of this scan's own, since a scan takes one.
+    if (!key_scan.has_value() && above != nullptr && part.has_value() && !late_scan.has_value() &&
+        above->build != nullptr && above->build->key_filter() != nullptr &&
+        node.table->supports_scan_filter(ReadFields(node, nullptr))) {
+      const auto at = std::ranges::find(node.ids, above->key);
+      const std::shared_ptr<const JoinTable>& table = above->build->table();
+      const std::optional<int64_t> rows = node.table->exact_row_count();
+      // The same share the per-row filter is gated on, and for the same reason: a build holding
+      // too many of the keys asked about rejects nothing and the scan pays the hash for it.
+      if (at != node.ids.end() && table != nullptr && rows.has_value() &&
+          table->num_rows() <= *rows / kFilterBuildShare) {
+        key_scan = TableScanOperator::KeyScan{
+            .filter = above->build->key_filter(),
+            .column = static_cast<int>(at - node.ids.begin()),
+        };
+      }
     }
     Name("Scan");
     // Per part, so a reader can see the filter is in use. It is a metric and not the node's detail
@@ -774,7 +853,14 @@ struct Builder {
   }
   OperatorResult operator()(const plan::ComputeNode& node) const {
     Name("Compute");
-    ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input, part, Input(), late, nullptr, builds));
+    // A Compute appends, so its input's ids are its own: the key passes through unchanged unless it
+    // *is* one of the appended expressions, which is a computed column and never a grouping key.
+    const AggregateFilter* carried = above;
+    if (carried != nullptr && std::ranges::contains(node.ids, carried->key)) {
+      carried = nullptr;
+    }
+    ARROW_ASSIGN_OR_RAISE(auto input,
+                          Build(node.input, part, Input(), late, nullptr, builds, carried));
     if (!part.has_value()) {  // over a whole input (an aggregation, a sort): batches in parallel
       return std::make_unique<ParallelComputeOperator>(std::move(input), node.exprs);
     }
@@ -782,7 +868,22 @@ struct Builder {
   }
   OperatorResult operator()(const plan::ProjectNode& node) const {
     Name("Project");
-    ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input, part, Input(), nullptr, nullptr, builds));
+    // A Project renames: the key arrives as one of *its* output ids, and what the input calls that
+    // column is the id the matching entry reads. Without this remap the match at the aggregate
+    // fails silently, since a Project mints a new id even for a column it only passes through.
+    AggregateFilter remapped;
+    const AggregateFilter* carried = nullptr;
+    if (above != nullptr) {
+      for (std::size_t i = 0; i < node.ids.size() && i < node.columns.size(); ++i) {
+        if (node.ids[i] == above->key && node.columns[i].id != plan::kNoColumnId) {
+          remapped = AggregateFilter{.build = above->build, .key = node.columns[i].id};
+          carried = &remapped;
+          break;
+        }
+      }
+    }
+    ARROW_ASSIGN_OR_RAISE(auto input,
+                          Build(node.input, part, Input(), nullptr, nullptr, builds, carried));
     std::vector<int> columns;
     std::vector<std::shared_ptr<arrow::Scalar>> constants;
     columns.reserve(node.columns.size());
@@ -836,8 +937,23 @@ struct Builder {
   }
   OperatorResult operator()(const plan::GroupAggregateNode& node) const {
     if (const plan::ScanNode* scan = PipelineScan(node.input)) {
+      // A filter the join above offered, if its key is one this aggregate **groups by**: then the
+      // filter drops whole groups and never changes a surviving group's value, which is the whole
+      // correctness argument. On any other column it would corrupt every aggregate, so the key has
+      // to be found among key_ids and nowhere else. `keys[i]` is what the input calls that column.
+      AggregateFilter inner;
+      const AggregateFilter* below = nullptr;
+      if (above != nullptr) {
+        for (std::size_t i = 0; i < node.key_ids.size() && i < node.keys.size(); ++i) {
+          if (node.key_ids[i] == above->key && node.keys[i].id != plan::kNoColumnId) {
+            inner = AggregateFilter{.build = above->build, .key = node.keys[i].id};
+            below = &inner;
+            break;
+          }
+        }
+      }
       // Grouped per part, the parts' groups merged in part order.
-      ARROW_ASSIGN_OR_RAISE(Parts parts, PartsOf(node.input, *scan, slot));
+      ARROW_ASSIGN_OR_RAISE(Parts parts, PartsOf(node.input, *scan, slot, nullptr, below));
       ARROW_ASSIGN_OR_RAISE(auto sample, parts.pipeline(0));
       const int width = sample->output_schema()->num_fields();
       // The output schema, as the serial operator names it.
@@ -990,7 +1106,17 @@ struct Builder {
       // first Next, profiled under it after its input.
       ARROW_ASSIGN_OR_RAISE(build,
                             MakeJoinBuild(node, shape, slot == nullptr ? nullptr : slot->Child(1)));
-      ARROW_ASSIGN_OR_RAISE(probe, Build(shape.probe, std::nullopt, Input()));
+      // The published filter offered to a grouped aggregate below the probe (AggregateFilter).
+      //
+      // The probe side only, because that is where it is ready: Start() prepares the build and
+      // *then* opens the probe input (hash_join.cc), while the build side's own pipeline runs
+      // inside that Prepare. **This is about the benefit and not about correctness** -- a build
+      // that is not prepared has no filter to publish, `key_filter()` is null, and nothing
+      // attaches. Reading one too early cannot produce a wrong answer, only a missed filter, which
+      // is why no test can catch the difference.
+      const AggregateFilter offered = ProbeAggregateFilter(node, shape, build);
+      ARROW_ASSIGN_OR_RAISE(probe, Build(shape.probe, std::nullopt, Input(), nullptr, nullptr,
+                                         nullptr, offered.build == nullptr ? nullptr : &offered));
     }
     ARROW_ASSIGN_OR_RAISE(
         std::unique_ptr<HashJoinOperator> join,
@@ -1019,7 +1145,7 @@ OperatorResult Profiled(OperatorResult op, const plan::LogicalNodePtr& node, Pro
 
 OperatorResult Build(const plan::LogicalNodePtr& node, std::optional<int64_t> part,
                      ProfileNode* slot, const LateScan* late, const PartitionTopN* top_n,
-                     const PipelineBuilds* builds) {
+                     const PipelineBuilds* builds, const AggregateFilter* above) {
   if (node == nullptr) {
     return arrow::Status::Invalid("logical plan node without its input");
   }
@@ -1044,11 +1170,14 @@ OperatorResult Build(const plan::LogicalNodePtr& node, std::optional<int64_t> pa
       return Profiled(BuildPartUnion(node, *scan, std::nullopt, slot), node, slot);
     }
   }
-  return Profiled(
-      std::visit(
-          Builder{.part = part, .slot = slot, .late = late, .top_n = top_n, .builds = builds},
-          *node),
-      node, slot);
+  return Profiled(std::visit(Builder{.part = part,
+                                     .slot = slot,
+                                     .late = late,
+                                     .top_n = top_n,
+                                     .builds = builds,
+                                     .above = above},
+                             *node),
+                  node, slot);
 }
 
 // The least a shared sub-plan must read before holding its result is worth it. ADR 0030 asks two

@@ -344,6 +344,44 @@ lesson of [ADR 0027](0027-string-views.md)'s S1, which was planned as a win whos
       unsaid, a reader would keep looking for it.
     - Nothing was needed to carry a metric from the scan: `Profiled` already calls `Operator::set_profile` on
       every operator, so `TableScanOperator::Close` reports through `profile()` like any other operator.
+- **D5, perf(exec): apply a published filter below the grouped aggregate a join reads.** Not in this ADR's first
+  plan, and found by asking what scan sharing would do for a query [ADR 0030](0030-shared-sub-plans.md) had
+  wrongly named: the answer was that its real cost is a grouped aggregate averaging **20,000,000** parts when the
+  join above reads the **20,031** that pass a filter. [ADR 0023](0023-unnesting.md)'s Path 2 replaces the domain D
+  with a map, which keeps the answer and drops the restriction D carried -- so the aggregate has no way to know.
+  This item puts that restriction back from the one place that has it: the join's build, which already publishes
+  the key set D1 attaches to probe scans.
+  - Update (2026-10-19, D5): **shipped, 0.935x of the 22 -- the largest single item of this ADR.**
+
+    | | before | after |
+    | --- | ---: | ---: |
+    | the query | 5.833 s | **1.797 s (0.308x)** |
+    | its groups | 20,000,000 | **20,031** |
+    | its local group insertions | 319,678,579 | **599,206** |
+    | its peak memory | 1.87 GB | **138 MB** |
+    | the 22 | 61.19 s | **57.20 s (0.935x)** |
+    | the other 21 | | 1.0009, this harness's noise |
+
+    It closes that query from **4.6x of DuckDB to 1.35x**, and the answer is DuckDB's to the last digit.
+  - **The correctness condition is one sentence**: the filter is applied to a column the aggregate **groups by**,
+    so it removes whole groups and never changes a surviving group's value. On any other column it would corrupt
+    every aggregate. Mutation-checked -- dropping that requirement fails a test.
+  - **An approximate filter is sound here, and that is why this is cheaper than the delim join.** A Bloom filter
+    has no false negatives, so it can never remove a group the join needs; false positives leave extra groups,
+    which the join never reads. **The exact domain is not required, only a reduction** -- so this needs none of
+    D's duplicate elimination.
+  - **The key travels as a ColumnId, remapped at each node rather than carried.** Positions move; ids survive one.
+    A Project mints a new id even for a column it passes through, so without the remap the match at the aggregate
+    fails silently -- and the shape this was built for has a Project and a Compute between the join and the
+    aggregate.
+  - **The ordering is self-enforcing, against what the plan for this item assumed.** It is offered on the probe
+    side because that is where the build is prepared first -- but a build that is not prepared publishes no
+    filter, so reading one too early attaches nothing. It cannot produce a wrong answer, only a missed filter,
+    which is also why no test can catch the difference.
+  - **What it does not do**: ADR 0023's general duplicate-free domain, which stays deferred there and is justified
+    by the shapes it would *answer* (COUNT, OR) rather than by this query's speed. The two do not conflict; if the
+    general algorithm later restricts such an aggregate exactly, this filter finds nothing left to drop and the
+    build-share gate refuses it.
 - **D4, docs(adr): record what D0-D2 measured**, and either accept this ADR or defer it with the numbers.
   - Update (2026-10-19, D4): **the cumulative measurement, taken fresh end to end rather than chained.** Each item
     above was measured against its own contemporaneous baseline, and those baselines drift between sessions, so

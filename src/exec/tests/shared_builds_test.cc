@@ -34,6 +34,9 @@ namespace {
 
 using testing::MemoryTable;
 
+// As AggregateFilterTest: the kernels need arrow::compute::Initialize, which ExecTest does.
+class SharedBuildsTest : public testing::ExecTest {};
+
 // Three batches of `k` (a BIGINT with repeats, so a GROUP BY reduces) and `v`.
 std::shared_ptr<MemoryTable> KeyedTable() {
   const auto schema =
@@ -98,7 +101,7 @@ constexpr std::string_view kTwiceReferencedCte =
     "WITH g AS (SELECT k, COUNT(*) AS n FROM t GROUP BY k) "
     "SELECT COUNT(*) FROM g AS a, g AS b WHERE a.k = b.k";
 
-TEST(SharedBuildsTest, ComputesARepeatedSubPlanOnceAndKeepsTheAnswer) {
+TEST_F(SharedBuildsTest, ComputesARepeatedSubPlanOnceAndKeepsTheAnswer) {
   const auto shared = KeyedTable();
   shared->set_claimed_rows(20'000'000);  // past the gate, while holding 60 rows
   auto with = Execute(kTwiceReferencedCte, shared);
@@ -123,7 +126,7 @@ TEST(SharedBuildsTest, ComputesARepeatedSubPlanOnceAndKeepsTheAnswer) {
 // The gate's second half, which the measurement had to teach: a sub-plan must be *dear* as well as
 // reducing. Reading little is cheaper to do twice than to hold -- measured at 1.017x on the one
 // query of the workload whose shared join read about a million rows.
-TEST(SharedBuildsTest, RefusesASubPlanTooCheapToBeWorthHolding) {
+TEST_F(SharedBuildsTest, RefusesASubPlanTooCheapToBeWorthHolding) {
   const auto table = KeyedTable();
   table->set_claimed_rows(1'000);
   auto run = Execute(kTwiceReferencedCte, table);
@@ -134,7 +137,7 @@ TEST(SharedBuildsTest, RefusesASubPlanTooCheapToBeWorthHolding) {
 // And the first half: a sub-plan that does not reduce. Two references to a bare table repeat a
 // scan, and holding its rows to avoid reading them is the trade the gate exists to refuse -- the
 // shape that would otherwise hold 379 million rows of the workload's largest query.
-TEST(SharedBuildsTest, RefusesARepeatedSubPlanThatDoesNotReduce) {
+TEST_F(SharedBuildsTest, RefusesARepeatedSubPlanThatDoesNotReduce) {
   const auto table = KeyedTable();
   table->set_claimed_rows(20'000'000);
   auto run = Execute("SELECT COUNT(*) FROM t AS a, t AS b WHERE a.k = b.k", table);
@@ -143,7 +146,7 @@ TEST(SharedBuildsTest, RefusesARepeatedSubPlanThatDoesNotReduce) {
 }
 
 // Nothing shared, nothing changed: the plan of a query with no repetition is the plan it was.
-TEST(SharedBuildsTest, LeavesAPlanWithNoRepetitionAlone) {
+TEST_F(SharedBuildsTest, LeavesAPlanWithNoRepetitionAlone) {
   const auto table = KeyedTable();
   table->set_claimed_rows(20'000'000);
   auto run = Execute("SELECT k, COUNT(*) AS n FROM t GROUP BY k", table);
