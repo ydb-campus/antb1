@@ -4,7 +4,8 @@ Date: 2026-10-18
 
 ## Status
 
-Proposed (draft: the measurement below is taken, the design is not built)
+Proposed (D0-D3 are built and measured; D4's table is the cumulative result, on which this ADR is accepted or
+deferred)
 
 ## Context
 
@@ -211,6 +212,11 @@ lesson of [ADR 0027](0027-string-views.md)'s S1, which was planned as a win whos
       scan reads, and the filtered path had no DECIMAL case, so a scan reading one could take no filter at all --
       including both probe scans of the query this ADR is built around. [ADR 0026](0026-join-performance.md)'s C6
       shipped first and is what let D1 reach them.
+      - Note (2026-10-19): **C6 shipped in D1's PR, so this ADR's window contains it, and its gain is not this
+        ADR's.** C6 is worth 0.981x of the 22 on its own -- it unblocked *static* pushdown (ADR 0020) on every
+        query reading a DECIMAL, which is most of them -- and that is recorded in ADR 0026, not here. Any
+        before/after taken across D0-D3 therefore includes C6; D4's table says which share is whose, and the
+        join-free queries that move in it (Q01, Q06) are the proof that it must.
     - **The filter is always ready, so none of the readiness machinery above was built.** `PrepareBuilds` runs
       before the sink that schedules the probe pipeline's parts, and the serial path before `input_->Open`, so a
       build completes at one global moment on the consumer thread and every probe part is constructed after it. No
@@ -339,6 +345,39 @@ lesson of [ADR 0027](0027-string-views.md)'s S1, which was planned as a win whos
     - Nothing was needed to carry a metric from the scan: `Profiled` already calls `Operator::set_profile` on
       every operator, so `TableScanOperator::Close` reports through `profile()` like any other operator.
 - **D4, docs(adr): record what D0-D2 measured**, and either accept this ADR or defer it with the numbers.
+  - Update (2026-10-19, D4): **the cumulative measurement, taken fresh end to end rather than chained.** Each item
+    above was measured against its own contemporaneous baseline, and those baselines drift between sessions, so
+    the per-item ratios do **not** multiply out to the figure below -- which is the reason to take one matched
+    pair rather than trust arithmetic over four runs.
+  - **Protocol**, stated because the first attempt at it was wrong: both arms were built and measured in a single
+    run, each preceded by a **discarded warm-up pass over all 22**, best of three, antb1 and DuckDB interleaved
+    per query. The first attempt measured the two arms in separate sessions and attributed a 7-10% warm-up and
+    page-cache asymmetry to the code; the warm-up pass and DuckDB-as-control are what remove that. SF 100,
+    14 threads, `before` = the last commit with none of D0-D3 in it.
+
+    | | before | after | |
+    | --- | ---: | ---: | --- |
+    | the 22, total | 69.46 s | **60.35 s** | **0.869x** |
+    | the 22, geomean | 2.384 s | **2.147 s** | 0.901x |
+    | DuckDB, total (the drift control) | 29.78 s | 29.51 s | 0.991x -- so the move above is antb1's |
+    | **against DuckDB, total** | 2.33x | **2.05x** | |
+    | **against DuckDB, geomean** | 2.18x | **1.98x** | first time under 2x in this ADR's figures |
+
+  - **Where the 9.10 s went, which is not where this ADR's plan put it.** Q18 0.504x, Q04 0.609x and Q21 0.828x --
+    the three queries D0 and D1 were built for -- are **6.25 s of it, 69%**. Most of the rest is C6's static
+    pushdown (the note under D1), spread a few percent over queries no item here was aiming at. Two queries
+    regress, both already recorded under D1: Q11 1.129x and Q16 1.052x.
+  - **Per item, as measured by each**: D0 0.550x on its one query and 0.975x of the 22; D1 0.958x of the 22; D2
+    0.998x; D3 no timing of its own. So **D0 and D1 are this ADR, and D2 is a mechanism that works and does not
+    pay** -- the honest one-line summary of the whole plan.
+  - **Twice the value landed somewhere the plan did not predict**, which is the transferable lesson: D2 arrived to
+    find D1 had already taken the prize it was costed on, and C6 was planned as plumbing for D1 while being worth
+    more than its own entry expected. Both are failures of *ordering* analysis rather than of measurement -- the
+    plan reasoned about each item alone, and two mechanisms over the same rows share one prize, which goes to
+    whichever ships first.
+  - **This entry records the numbers; it does not move the Status line.** On these figures the ADR is accepted or
+    deferred by a maintainer: for, D0 and D1 together close 0.869x and the mechanisms are measured, bounded and
+    instrumented; against, D2 earns 0.2% and the reach that would pay for it is not represented in this gate set.
 
 **The gate, stated so it cannot be read backwards.** An earlier draft of D1 gated the Bloom filter on min/max having
 moved a query by 10%, which is exactly wrong: min/max pruning nothing *is* the signal that the keys are scattered,
