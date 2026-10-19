@@ -1187,7 +1187,11 @@ arrow::Result<std::shared_ptr<const KeyFilter>> JoinTableBuilder::MakeKeyFilter(
   // costs one pass and no memory. The pieces are read for both because they are about to be freed
   // -- Finish keeps no hash, and the direct layout keeps no key either.
   const int key_column = spec_->keys().front().index;
-  const bool keep_values = rows <= KeyFilter::kMaxPublishedKeys;
+  // The budget approves the values before they are held, not after: ReserveKeys charges them, and
+  // only then are they collected. Asked in this order so that a budget too tight for them costs
+  // neither the memory nor the pass -- and so that the bytes are never briefly unaccounted, which
+  // a reservation made after the fact would leave them.
+  const bool keep_values = rows <= KeyFilter::kMaxPublishedKeys && filter->ReserveKeys(rows);
   std::vector<Int128> values;
   if (keep_values) {
     values.reserve(static_cast<std::size_t>(rows));

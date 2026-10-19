@@ -45,7 +45,12 @@ arrow::Result<std::shared_ptr<KeyFilter>> KeyFilter::Make(int64_t num_keys, Memo
   filter->words_.assign(blocks * kWordsPerBlock, 0);
   filter->block_mask_ = blocks - 1;
   filter->keys_ = num_keys;
+  filter->bits_bytes_ = bytes;
   return filter;
+}
+
+bool KeyFilter::ReserveKeys(int64_t count) {
+  return count > 0 && memory_.Resize(bits_bytes_ + (count * Narrow<int64_t>(sizeof(Int128)))).ok();
 }
 
 void KeyFilter::Add(std::uint64_t hash) {
@@ -66,11 +71,12 @@ void KeyFilter::PublishKeys(std::vector<Int128> keys, const Int128& min, const I
   if (keys.empty()) {
     return;  // the interval alone: above kMaxPublishedKeys the values were never collected
   }
-  // Charged on top of the bits, which the reservation already holds. A refusal here keeps the old
-  // reservation (MemoryReservation::Resize), so dropping the values is all that is needed: the
-  // interval still prunes, and a filter that prunes fewer parts is slower and never wrong.
+  // The bits plus exactly these values, as an absolute charge: a ReserveKeys of the same count
+  // already made it, and this asks for the same total again, which costs nothing. A refusal keeps
+  // the old reservation (MemoryReservation::Resize), so dropping the values is all that is needed:
+  // the interval still prunes, and a filter that prunes fewer parts is slower and never wrong.
   const int64_t bytes =
-      memory_.bytes() + (Narrow<int64_t>(keys.size()) * Narrow<int64_t>(sizeof(Int128)));
+      bits_bytes_ + (Narrow<int64_t>(keys.size()) * Narrow<int64_t>(sizeof(Int128)));
   if (!memory_.Resize(bytes).ok()) {
     return;
   }

@@ -97,11 +97,18 @@ class KeyFilter {
   // there were more than kMaxPublishedKeys of them and leaves the interval as the whole of what is
   // published.
   //
-  // The values are charged to the same reservation as the bits, and if that cannot be afforded the
-  // interval is published alone: a filter that skips fewer parts is slower, never wrong.
+  // The values are charged to the same reservation as the bits, to exactly what `keys` needs. The
+  // charge is absolute, so a ReserveKeys of the same count beforehand costs nothing again here, and
+  // without one this charges instead; either way a charge that cannot be afforded publishes the
+  // interval alone -- a filter that skips fewer parts is slower, never wrong.
   //
   // Called once, on the thread that filled the bits, before any probe reads the filter.
   void PublishKeys(std::vector<Int128> keys, const Int128& min, const Int128& max);
+
+  // Charges `count` key values, so that a caller collects them into memory the budget has already
+  // approved instead of having them charged once they are already held. False when they cannot be
+  // afforded, and then the caller should collect none: the interval alone is published.
+  [[nodiscard]] bool ReserveKeys(int64_t count);
 
   // Whether a part whose key column runs from `min` to `max` may hold a published key. False means
   // it certainly holds none, so the part matches nothing and need not be read: no open, no decode,
@@ -153,6 +160,9 @@ class KeyFilter {
   std::uint64_t block_mask_ = 0;      // blocks - 1
   int64_t keys_ = 0;
   MemoryReservation memory_;
+  // The bits' own bytes, so that a charge for the values is absolute and therefore idempotent:
+  // reserving them and then publishing them must not charge twice.
+  int64_t bits_bytes_ = 0;
 
   // The interval over the published keys. One optional and not two, so that holding it is one
   // question with one answer: empty says PublishKeys was never called, which is a filter that rules

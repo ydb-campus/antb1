@@ -191,6 +191,10 @@ TEST(KeyFilterTest, DeclinesTheBitsAndThenTheValuesWhenTheBudgetIsTight) {
   ASSERT_TRUE(filter.ok()) << filter.status().ToString();
   ASSERT_NE(*filter, nullptr);
   const int64_t bits = (*filter)->bytes();
+  // The build asks before it collects, so this is the refusal it actually sees, and the values are
+  // never held at all rather than charged once they are.
+  EXPECT_FALSE((*filter)->ReserveKeys(1000));
+  EXPECT_EQ((*filter)->bytes(), bits) << "a refused reservation must charge nothing";
   std::vector<Int128> keys(1000);
   for (std::size_t i = 0; i < keys.size(); ++i) {
     keys[i] = static_cast<Int128>(i) * 2;  // 0, 2, 4, ... so there are gaps to miss
@@ -215,8 +219,13 @@ TEST(KeyFilterTest, ChargesThePublishedValues) {
   for (std::size_t i = 0; i < keys.size(); ++i) {
     keys[i] = static_cast<Int128>(i);
   }
-  (*filter)->PublishKeys(keys, 0, 999);
+  // Reserved first, as the build does, and then published: the charge is absolute, so the two
+  // together cost what one of them does.
+  EXPECT_TRUE((*filter)->ReserveKeys(1000));
   EXPECT_EQ((*filter)->bytes(), bits + (1000 * static_cast<int64_t>(sizeof(Int128))));
+  (*filter)->PublishKeys(keys, 0, 999);
+  EXPECT_EQ((*filter)->bytes(), bits + (1000 * static_cast<int64_t>(sizeof(Int128))))
+      << "reserving and then publishing must not charge twice";
   EXPECT_GE(budget.bytes_allocated(), before + (*filter)->bytes());
   (*filter).reset();
   EXPECT_EQ(budget.bytes_allocated(), before) << "the reservation outlived the filter";
