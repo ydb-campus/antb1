@@ -49,6 +49,24 @@ Accepted (decision C14, once all 22 queries derived from TPC-H passed)
   - **The general case needs the domain:** D is computed from R and then read twice, inside S and by the final join,
     whose keys must treat NULL as equal to NULL (IS NOT DISTINCT FROM). DuckDB plans all six queries with delim joins,
     which buffer R for this.
+  - **What a delim join is**, since this ADR uses the term throughout and defined it nowhere. "Delim" is short for
+    **duplicate elimination**: it is the physical form of D above. DuckDB buffers R, derives D from it by
+    de-duplicating the free variables' columns, evaluates S **once per distinct binding** instead of once per row of
+    R, and re-attaches the results to R with a join whose keys compare `IS NOT DISTINCT FROM`, because D may hold
+    NULL. Its operators are a scan of the buffered domain and the re-attaching join, which is a *left* join for a
+    scalar subquery so that an outer row with no inner row survives.
+  - **D restricts as well as de-duplicates, which is the half worth remembering.** Because `D ⧑ S` is pushed *into*
+    S, the subquery's own scans meet D's keys on the way. That is the "relevance" of magic sets (*Magic is
+    Relevant*, Mumick, Finkelstein, Pirahesh and Ramakrishnan, SIGMOD 1990): S is evaluated only for bindings that
+    can reach the answer. Measured on the query of the 22 whose correlated subquery averages a column per part:
+    DuckDB's grouped aggregate builds **20,031** groups over **600,982** rows, where ours builds **20,000,000**
+    over **600,037,902** -- the whole difference being that D's keys reached the scan before the grouping did.
+  - **So the two no-domain cases are correct and *non-relevant*.** Replacing D with a map (Lemma 4.2) keeps the
+    answer and drops the restriction D would have carried, because a map restricts nothing. Path 2 below takes that
+    route, which is why its grouped aggregate groups a whole table by a key when the join above it will read a
+    thousandth of those groups. Nothing is wrong with the plan; what is missing is information the rewrite threw
+    away, and it can be put back from elsewhere -- [ADR 0029](0029-dynamic-join-filters.md)'s build already
+    publishes exactly that key set for the join above.
 - **What ADR 0022 provides:**
   - inner, semi and anti joins, with keys of one common type and residuals evaluated over candidate pairs;
   - sub-plans with their own scopes, linked to the scope of the enclosing block and resolved innermost first (its rule
