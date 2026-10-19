@@ -53,6 +53,7 @@ if(ANTB1_BUILD_TESTS)
       tests/row_count_test.cc
       tests/physical_planner_test.cc
       tests/grouped_aggregate_test.cc
+      tests/grouped_sum_alias_test.cc
       tests/sort_test.cc
       tests/like_test.cc
       tests/scan_filter_test.cc

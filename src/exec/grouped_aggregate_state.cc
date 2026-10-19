@@ -28,6 +28,7 @@
 #include "antb1/plan/types.h"
 
 #include "double_key.h"
+#include "grouped_sum_alias.h"
 #include "temporal_average.h"
 
 namespace antb1::exec {
@@ -399,17 +400,25 @@ class GroupedHugeIntSum final : public GroupedAggregateState {
   }
   [[nodiscard]] arrow::Result<std::shared_ptr<arrow::Array>> Finalize(
       std::uint32_t begin, std::uint32_t end, arrow::MemoryPool* pool) const override {
+    return FinalizeAs(average_, begin, end, pool);
+  }
+
+  // This accumulator as either SUM or AVG, which is what lets one of the two read the other's
+  // state instead of adding the same column again (grouped_sum_alias.h). The sums and the counts
+  // are the same either way; only the output differs.
+  [[nodiscard]] arrow::Result<std::shared_ptr<arrow::Array>> FinalizeAs(
+      bool average, std::uint32_t begin, std::uint32_t end, arrow::MemoryPool* pool) const {
     ARROW_ASSIGN_OR_RAISE(const auto sums, GroupRange(sums_, begin, end));
     ARROW_ASSIGN_OR_RAISE(const auto counts, GroupRange(counts_, begin, end));
     if (input_ != plan::LogicalType::kDecimal) {
-      return average_ ? Averages(sums, counts, pool)
-                      : HugeInts(sums, counts, plan::LogicalType::kHugeInt, pool);
+      return average ? Averages(sums, counts, pool)
+                     : HugeInts(sums, counts, plan::LogicalType::kHugeInt, pool);
     }
-    return average_ ? DecimalAverages(sums, counts, input_, pool)
-                    : HugeInts(sums, counts,
-                               plan::LogicalType::Decimal(plan::LogicalType::kMaxDecimalWidth,
-                                                          input_.scale()),
-                               pool);
+    return average ? DecimalAverages(sums, counts, input_, pool)
+                   : HugeInts(sums, counts,
+                              plan::LogicalType::Decimal(plan::LogicalType::kMaxDecimalWidth,
+                                                         input_.scale()),
+                              pool);
   }
 
  private:
@@ -442,6 +451,37 @@ class GroupedHugeIntSum final : public GroupedAggregateState {
   plan::LogicalType input_;
   std::vector<Int128> sums_;
   std::vector<std::int64_t> counts_;
+};
+
+// Finalizes another state's accumulator and does nothing else (grouped_sum_alias.h). Every method
+// that would touch an accumulator is empty, because the state it points at has one and is driven
+// by its own entry of the same table: consuming or merging here would count every row twice.
+class GroupedSumAlias final : public GroupedAggregateState {
+ public:
+  GroupedSumAlias(const GroupedHugeIntSum* owner, bool average)
+      : owner_(owner), average_(average) {}
+
+  [[nodiscard]] std::uint32_t num_groups() const override { return owner_->num_groups(); }
+  void Resize(std::uint32_t /*num_groups*/) override {}  // the owner's entry resizes it
+  [[nodiscard]] std::int64_t memory_usage() const override { return 0; }  // the owner charges it
+  arrow::Status Consume(const arrow::Array* /*values*/, GroupIds /*ids*/) override {
+    return arrow::Status::OK();  // the owner consumes the same column
+  }
+  arrow::Status MergeGroups(const GroupedAggregateState& other, GroupIds from,
+                            GroupIds to) override {
+    // Nothing to fold, but the shapes are still checked: a table merged into this one must have
+    // an alias at this aggregate too, or the two disagree about which entry owns the accumulator.
+    ARROW_RETURN_NOT_OK(SameKind<GroupedSumAlias>(other, from, to, num_groups()).status());
+    return arrow::Status::OK();
+  }
+  [[nodiscard]] arrow::Result<std::shared_ptr<arrow::Array>> Finalize(
+      std::uint32_t begin, std::uint32_t end, arrow::MemoryPool* pool) const override {
+    return owner_->FinalizeAs(average_, begin, end, pool);
+  }
+
+ private:
+  const GroupedHugeIntSum* owner_;
+  bool average_;
 };
 
 // SUM or AVG of a DOUBLE column: values are added in row order within each group.
@@ -942,6 +982,17 @@ arrow::Result<std::unique_ptr<GroupedAggregateState>> MakeGroupedAggregateState(
       return GroupedCountDistinct::Make(plan::ToArrow(*input), pool);
   }
   return invalid();
+}
+
+std::unique_ptr<GroupedAggregateState> MakeSumAlias(const GroupedAggregateState& owner,
+                                                    bool average) {
+  // Only the Int128 accumulator for now: it is where a DECIMAL or HUGEINT SUM and AVG cost most,
+  // and the integer and DOUBLE sums would each need the same split of Finalize to join in.
+  const auto* sum = dynamic_cast<const GroupedHugeIntSum*>(&owner);
+  if (sum == nullptr) {
+    return nullptr;
+  }
+  return std::make_unique<GroupedSumAlias>(sum, average);
 }
 
 }  // namespace antb1::exec
