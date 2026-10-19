@@ -37,5 +37,5 @@ may land first, in a docs-only PR (0013, 0019, 0021-0025).
 | [0026](0026-join-performance.md) | Join performance: build sides, right-sided joins and cost-based order | Proposed |
 | [0027](0027-string-views.md) | Short strings inline: the view layout for VARCHAR | Proposed (deferred) |
 | [0028](0028-dictionary-group-keys.md) | Grouping a Parquet dictionary instead of its rows | Rejected |
-| [0029](0029-dynamic-join-filters.md) | Dynamic join filters: the build side's keys at the probe's scan | Proposed |
-| [0030](0030-shared-sub-plans.md) | Shared sub-plans: computing an identical sub-plan once | Proposed |
+| [0029](0029-dynamic-join-filters.md) | Dynamic join filters: the build side's keys at the probe's scan | Accepted |
+| [0030](0030-shared-sub-plans.md) | Shared sub-plans: computing an identical sub-plan once | Accepted |
