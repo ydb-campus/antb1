@@ -8,7 +8,12 @@ root="${PIXI_PROJECT_ROOT:-$(pwd)}"
 pixi_version=$(pixi --version 2>/dev/null | awk '{print $2}')
 cxx=$(${CXX:-c++} --version 2>/dev/null | head -1)
 cmake_v=$(cmake --version 2>/dev/null | head -1 | awk '{print $3}')
-arrow_v=$(pkg-config --modversion arrow 2>/dev/null || awk -F'"' '/ARROW_VERSION_STRING/{print $2}' "${CONDA_PREFIX:-}/include/arrow/util/config.h" 2>/dev/null)
+# The environment's own header first, and pkg-config only as a fallback. The other order reports the
+# *host's* Arrow: pkg-config searches its default path before the environment's, so on a machine with
+# Arrow installed by Homebrew it answered 26.0.0 for a build linking the environment's 25.0.0 --
+# which is the one number here nobody can sanity-check against something else.
+arrow_v=$(awk -F'"' '/ARROW_VERSION_STRING/{print $2}' "${CONDA_PREFIX:-}/include/arrow/util/config.h" 2>/dev/null)
+[ -n "$arrow_v" ] || arrow_v=$(pkg-config --modversion arrow 2>/dev/null)
 envs=""
 for d in "$root"/.pixi/envs/*/; do
   [ -d "$d" ] && envs="${envs:+$envs }$(basename "$d")"
