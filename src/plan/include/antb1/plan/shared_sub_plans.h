@@ -12,9 +12,9 @@
 // subquery that repeats a FROM list produces the same duplication with no CTE in it -- and nothing
 // after the binder notices that two subtrees are the same.
 //
-// Module-internal on purpose: E1's consumers are explain.cc and this module's tests. It moves to
-// src/plan/include/ when exec needs it, not before (ADR 0027's S1: a producer shipped ahead of its
-// consumer is a producer nothing measures).
+// Public since E2, which is what reads it from exec to decide what to materialise; E1 kept it
+// module-internal because only explain.cc and this module's tests used it (ADR 0027's S1: a
+// producer shipped ahead of its consumer is a producer nothing measures).
 
 namespace antb1::plan {
 
@@ -23,6 +23,14 @@ struct SharedSubPlan {
   // Two or more, distinct nodes, in the order a walk from the root meets them. Every member
   // computes the same rows in the same order as every other.
   std::vector<LogicalNodePtr> members;
+  // The member whose output columns contain every other member's: the one a later item would
+  // actually compute, the others reading a subset of its result. A group whose members' outputs do
+  // not nest this way is not reported at all, since one result could not serve them.
+  std::size_t widest = 0;
+  // Per member, for each of its output columns, that column's position in members[widest]'s
+  // output. This is what lets a consumer read the shared result without anything above it being
+  // rewritten: give it those positions and its own column ids, and its own view is unchanged.
+  std::vector<std::vector<int>> columns;
   // The table fields the one shared sub-plan would read: per scan, the union over the members, and
   // the sum of those. A member reads at most this many, so the difference is what sharing would
   // decode for a consumer that does not want it.

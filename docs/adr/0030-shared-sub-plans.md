@@ -34,12 +34,20 @@ Proposed (draft: the measurement below is taken, the design is not built)
   In every case the smaller column set is a **strict subset** of the larger, so column subsumption is the whole of
   what separates them. **Exact structural equality catches one of this ADR's three motivating queries.** That is
   the question E1 was written to answer, answered by reading plans instead of building it.
-- **Correction (2026-10-19, from E1 as built): there is a fourth, and this ADR dismissed it.** The Context below
-  says Q21 "repeats a scan too, but ... of `lineitem` for genuinely different work". Half of that is wrong. Q21
-  holds **three** references to `lineitem`, and two of them -- the outer one and the one under the anti join --
-  carry the *same* filter over the *same* four fields, so they compute the same rows and E1 groups them. Only the
-  third, the semi join's unfiltered probe, is different work. So the queries with a reducing sub-plan worth
-  materialising are **Q15, Q11, Q2 and Q21**, and Q21 is the largest of the four at SF 100.
+- **Correction (2026-10-19, from E1 as built): there is a fourth repeated sub-plan, and this ADR dismissed it.**
+  The Context below says Q21 "repeats a scan too, but ... of `lineitem` for genuinely different work". Half of
+  that is wrong. Q21 holds **three** references to `lineitem`, and two of them -- the outer one and the one under
+  the anti join -- carry the *same* filter over the *same* four fields, so they compute the same rows and E1
+  groups them. Only the third, the semi join's unfiltered probe, is different work.
+  - **Second correction (2026-10-19, from E2): Q21 is nonetheless not a candidate, and the reason is a
+    cross-ADR interaction worth more than the finding above.** The entry first called it "the largest of the four
+    at SF 100". It is the largest and it must be refused. Those two members compute **379,356,474** rows, measured
+    directly, and the profile shows them *emitting* 24 M and 15 M only because
+    [ADR 0029](0029-dynamic-join-filters.md)'s dynamic join filters prune each probe scan **differently**. One
+    shared result cannot carry two consumers' different Bloom filters, so sharing would replace two cheaply
+    filtered scans with a 12 GB materialisation and two full re-scans: **strictly worse**. A pruning mechanism
+    downstream of a sharing mechanism can turn a real duplication into one it is a mistake to remove, and nothing
+    in either ADR would have predicted that.
 - **E1 also reports five queries that are a scan and nothing more** (Q7, Q8, Q17, Q18, Q22: repeated scans of
   `nation`, `lineitem` or `customer` with no filter between them). Those are true findings and not false ones --
   the scans do compute the same rows -- and every one is refused by the cost gate for the reason the Alternatives
@@ -144,6 +152,38 @@ One PR per id.
   pass that only reports cannot give a wrong answer.
 - **E2, perf(exec): materialise a shared sub-plan once.** Measured on Q15, Q11 and Q2 at SF 100, with peak memory
   reported beside time, and the other 19 as the control.
+  - Update (2026-10-19, E2): **shipped, 0.980x of the 22, and all of it is one query.** Q15 goes 2.250 s to
+    **1.208 s (0.537x)** and the other 21 move 0.9967 together, which is this harness's noise. The gate ended up
+    admitting that one query and nothing else, and every narrowing was forced by a measurement rather than chosen.
+    - **The gate needs both halves this ADR specified, and the second is the one that bit.** "Small enough to
+      hold" was easy; "dear enough to be worth materialising" is what separates the cases. Q2's shared join reads
+      about a million rows and came out at **1.017x** -- slower than recomputing it, because materialising
+      200,535 rows and scanning them twice costs more than redoing cheap work. So a sub-plan must also *read*
+      enough to be worth not reading twice (`kMinSharedRows`).
+    - **Join-topped sub-plans are refused outright, on their numbers.** Q11 shares 3,203,600 rows for
+      **0.937x while holding about 269 MB** -- 30 ms bought with a quarter of a gigabyte -- and Q2 is the 1.017x
+      above. Carrying a path with those numbers would be worse than recording them, so only an aggregate (which
+      reduces by definition) qualifies. That also refuses Q21 by **shape** rather than by an estimate that might
+      be wrong.
+    - **Sharing needs no DAG, against this ADR's expectation.** `ScanNode::table` is already a
+      `shared_ptr<Table>`, so each member becomes *its own* ScanNode over *one shared* Table object, carrying its
+      own column ids. Nothing above a consumer is rewritten, no pass sees a DAG, and `ResolvePositions` is not
+      re-run -- so the Decision's "the consumers' column indices are rewritten, and that is the real cost of
+      subsumption" is **not** a cost this pays, and the Consequences' "the plan stops being a tree in the physical
+      planner" does not happen either.
+    - **No reference count either.** One owner above the whole plan fills every shared result before it opens the
+      root and frees them with the query, so "released when the last consumer is done, which is new" was not
+      needed. The cost is peak memory held to the end of the query, which is the honest trade for not tracking
+      consumers.
+    - **The shared result is one part, and that is forced.** The physical planner reads `num_parts()` while it
+      *builds* operators, which is before anything has run -- so a chunk-per-part table would hand its consumers
+      zero parts and they would read nothing. One part read at Open is the shape that works, and it costs the
+      consumers part-parallelism over a result the gate has already established is small.
+    - **A group whose members' outputs do not nest is not reported at all**, found while building E2: one member's
+      result must contain every other's for one table to serve them. Q8's two `nation` scans read
+      `[n_nationkey, n_regionkey]` and `[n_nationkey, n_name]` -- overlapping, neither inside the other -- so E1
+      now reports eight queries rather than nine. Serving that shape needs a union schema and a rewrite of the
+      members, which is the cost this design exists to avoid.
 - **E3, docs(adr): record what E1 and E2 measured**, and either accept this ADR or defer it with the numbers.
 
 Deliberately out of scope: `WITH RECURSIVE` and `MATERIALIZED`, both of which the binder refuses today (ADR 0022);
