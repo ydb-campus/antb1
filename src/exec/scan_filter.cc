@@ -216,8 +216,9 @@ class PredicateScanFilter final : public plan::ScanFilter {
 // Apply is const, so every part of a query applies the one object concurrently.
 class KeyScanFilter final : public plan::ScanFilter {
  public:
-  KeyScanFilter(std::shared_ptr<const KeyFilter> filter, int column)
-      : filter_(std::move(filter)), columns_{column} {}
+  KeyScanFilter(std::shared_ptr<const KeyFilter> filter, int column,
+                std::shared_ptr<std::atomic<int64_t>> dropped)
+      : filter_(std::move(filter)), columns_{column}, dropped_(std::move(dropped)) {}
 
   [[nodiscard]] const std::vector<int>& columns() const override { return columns_; }
 
@@ -243,6 +244,7 @@ class KeyScanFilter final : public plan::ScanFilter {
     // at 32, 1.142 at 64, 1.125 at 128 and back up to 1.189 at 256, where the lines are evicted
     // before they are read.
     constexpr int64_t kPrefetch = 128;
+    int64_t dropped = 0;
     for (int64_t row = 0; row < values.rows; ++row) {
       if (row + kPrefetch < values.rows) {
         filter_->Prefetch(hashes[static_cast<std::size_t>(row + kPrefetch)]);
@@ -252,7 +254,13 @@ class KeyScanFilter final : public plan::ScanFilter {
       if (arrow::bit_util::GetBit(selected, Narrow<std::uint64_t>(bit)) &&
           !filter_->MayContain(hashes[static_cast<std::size_t>(row)])) {
         arrow::bit_util::ClearBit(selected, bit);
+        ++dropped;
       }
+    }
+    // The rows this filter cleared, and only those: a row another filter had already cleared is not
+    // counted, because the bit was tested before it was touched (D3).
+    if (dropped_ != nullptr && dropped > 0) {
+      dropped_->fetch_add(dropped, std::memory_order_relaxed);
     }
     return arrow::Status::OK();
   }
@@ -260,6 +268,7 @@ class KeyScanFilter final : public plan::ScanFilter {
  private:
   std::shared_ptr<const KeyFilter> filter_;
   std::vector<int> columns_;
+  std::shared_ptr<std::atomic<int64_t>> dropped_;  // nullptr: the scan is not counting
 };
 
 }  // namespace
@@ -282,14 +291,15 @@ bool PushableToScan(const plan::Predicate& predicate) {
 }
 
 arrow::Result<std::shared_ptr<const plan::ScanFilter>> MakeKeyScanFilter(
-    std::shared_ptr<const KeyFilter> filter, int column) {
+    std::shared_ptr<const KeyFilter> filter, int column,
+    std::shared_ptr<std::atomic<int64_t>> dropped) {
   if (filter == nullptr) {
     return arrow::Status::Invalid("a key scan filter without a filter");
   }
   if (column < 0) {
     return arrow::Status::Invalid("a key scan filter on a column outside the scan");
   }
-  return std::make_shared<KeyScanFilter>(std::move(filter), column);
+  return std::make_shared<KeyScanFilter>(std::move(filter), column, std::move(dropped));
 }
 
 arrow::Result<std::shared_ptr<const plan::ScanFilter>> MakeScanFilter(

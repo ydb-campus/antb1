@@ -173,6 +173,36 @@ TEST(KeyFilterTest, RulesOutNoPartWithoutPublishedKeys) {
   EXPECT_TRUE((*filter)->MayHoldAKeyIn(kInt128Min, kInt128Max));
 }
 
+// Both ways of not affording something, because both must give up quietly rather than fail a
+// query: a filter is an optimisation, and one that is not made leaves the probe exactly as it was.
+TEST(KeyFilterTest, DeclinesTheBitsAndThenTheValuesWhenTheBudgetIsTight) {
+  // A thousand keys need 2,048 bytes of bits and 16,000 of values.
+  {
+    MemoryBudget tiny(1024);  // less than the bits alone: no filter at all, and no error
+    auto filter = KeyFilter::Make(1000, &tiny);
+    ASSERT_TRUE(filter.ok()) << filter.status().ToString();
+    EXPECT_EQ(*filter, nullptr);
+    EXPECT_EQ(tiny.bytes_allocated(), 0);
+  }
+  // Room for the bits but not for the values on top of them: the interval is published alone, which
+  // rules out fewer parts and no wrong ones.
+  MemoryBudget middling(17000);
+  auto filter = KeyFilter::Make(1000, &middling);
+  ASSERT_TRUE(filter.ok()) << filter.status().ToString();
+  ASSERT_NE(*filter, nullptr);
+  const int64_t bits = (*filter)->bytes();
+  std::vector<Int128> keys(1000);
+  for (std::size_t i = 0; i < keys.size(); ++i) {
+    keys[i] = static_cast<Int128>(i) * 2;  // 0, 2, 4, ... so there are gaps to miss
+  }
+  (*filter)->PublishKeys(keys, 0, 1998);
+  EXPECT_EQ((*filter)->bytes(), bits) << "the values were not charged, so they were not kept";
+  EXPECT_TRUE((*filter)->prunes_parts());
+  EXPECT_FALSE((*filter)->MayHoldAKeyIn(1999, 5000)) << "the interval still rules out a part";
+  EXPECT_TRUE((*filter)->MayHoldAKeyIn(1001, 1001))
+      << "and without the values it cannot see that this odd number is not a key";
+}
+
 // The values are charged on top of the bits, and given back with them.
 TEST(KeyFilterTest, ChargesThePublishedValues) {
   MemoryBudget budget(1024 * 1024);

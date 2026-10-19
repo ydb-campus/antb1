@@ -325,6 +325,11 @@ lesson of [ADR 0027](0027-string-views.md)'s S1, which was planned as a win whos
       cleared is not counted, because the bit is tested before it is touched.
     - `key_pruned`, the parts the key set ruled out, written by the planner where it decides them. It is a count
       and not a flag, so the per-part profile sums it to the figure above: 1,337 on the query that has it.
+    - **Together they account for the probe exactly, which is the first time either mechanism's share has been
+      visible.** On that query's lineitem probe: **163,106,013 rows never read** (the 1,337 row groups D2 pruned),
+      **436,744,092 read and dropped** by D1's filter, and 187,797 handed to the join -- the three summing to the
+      table's 600,037,902. So **D1 does 73% of the rejecting and D2 27%**, which is the same split the timing
+      shows and the quantitative form of "D1 had already taken this item's prize".
     - **The readiness metric is not implemented, and this is the record of why.** D1 established that a build
       completes before any probe part is constructed (`PrepareBuilds` runs before the sink that schedules them),
       so there is no not-ready state for a filter to be in and nothing for the metric to distinguish. Left

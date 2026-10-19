@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -42,12 +43,19 @@ constexpr int64_t RowIdOffset(int64_t id) { return id % (kRowIdParts * 2); }
 // table reports.
 class TableScanOperator final : public Operator {
  public:
-  // A hash join's key filter over one field of the scan (docs/adr/0029-dynamic-join-filters.md,
-  // D1), for a part's scan with no pushed predicates: the scan drops the rows whose key the build
-  // cannot hold, so the join never sees them.
+  // What a hash join's build says about this part of the scan
+  // (docs/adr/0029-dynamic-join-filters.md), over one field of it:
+  //
+  //   - `filter`, the key filter the scan drops rows with as it decodes them, so the join never
+  //     sees a row whose key the build cannot hold (D1). Null when the scan applies none: it takes
+  //     one filter, and pushed predicates have the first claim on it.
+  //   - `part_has_no_key`, that this part holds no key the build published, so the scan reads
+  //     nothing at all -- no open, no decode, no filtering (D2). Independent of the filter slot,
+  //     which is why a scan with pushed predicates can still carry this.
   struct KeyScan {
     std::shared_ptr<const KeyFilter> filter;
     int column = 0;  // a position in `fields`, of the probe's one key column
+    bool part_has_no_key = false;
   };
 
   TableScanOperator(std::shared_ptr<plan::Table> table, std::vector<int> fields,
@@ -75,6 +83,10 @@ class TableScanOperator final : public Operator {
   std::unique_ptr<arrow::RecordBatchReader> reader_;
   int64_t offset_ = 0;       // with late_: the position in the part of the next batch's first row
   bool positioned_ = false;  // a narrow scan whose batches end with the rows' positions
+  bool pruned_ = false;      // the part holds no published key: no reader was opened at all
+  // The rows the key filter cleared, which only the filter can count (the operators above see the
+  // survivors alone): shared with the filter, and reported on Close (ADR 0029's D3).
+  std::shared_ptr<std::atomic<int64_t>> key_dropped_;
   arrow::MemoryPool* pool_ = arrow::default_memory_pool();
 
   // The filter of the pushed predicates over the narrow scan's read fields.
