@@ -723,6 +723,11 @@ only with `--analyze`); its errors and exit codes are those of `antb1 query`.
   - In the JSON, a `HashBuild` is one more entry of the `inputs` of the operator that prepares it.
 - Metrics:
   - `parts`, `skipped` (by statistics);
+  - of a dynamic join filter on a `Scan`, where this scan is the probe side of a hash join whose build published
+    one ([ADR 0029](adr/0029-dynamic-join-filters.md)): `key_filter` (1 where the scan applies the filter row by
+    row), `key_dropped` (the rows it rejected, which the scan's own `rows` no longer counts) and `key_pruned` (the
+    parts ruled out whole, because the build published no key their key column spans — those parts are not read at
+    all, so they contribute no time and no rows);
   - `raw_parts`, `raw_rows` (a GROUP BY's parts that sent rows straight to the partitions, because their first
     rows hardly reduced);
   - `part_time` (the part tasks' time, summed);

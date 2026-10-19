@@ -311,10 +311,12 @@ lesson of [ADR 0027](0027-string-views.md)'s S1, which was planned as a win whos
       its benefit: the test itself is free once published. It is why the two SEMI/ANTI joins of another query --
       7.3 million keys each -- get nothing, which is the right answer, since `e^(-k/g)` there is zero to many
       decimal places.
-    - **Accepted on these numbers rather than deferred**, deliberately: it regresses nothing, its reach is
-      arithmetic over two counts known before it runs (90% of row groups at a 500-key build, 82% at 1,000, 27% at
-      6,398, nothing by 50,000), and the mechanism is 322 lines of exec confined to one path. A gate set holding a
-      smaller build side would make it pay; ours holds one 6,398-key case and no smaller.
+    - **Shipped rather than withdrawn, and the reasons are here for D4 to weigh** -- this entry records a
+      measurement, not an acceptance; the Status line above is still `Proposed`, and only a maintainer moves it.
+      For: it regresses nothing, its reach is arithmetic over two counts known before it runs (90% of row groups
+      at a 500-key build, 82% at 1,000, 27% at 6,398, nothing by 50,000), and the mechanism is about 320 lines of
+      exec confined to one path. Against: 0.2% of a gate set is below what new code usually has to earn, and ours
+      holds one 6,398-key case and nothing smaller, so the reach that would pay is not represented in it.
 - **D3, feat(exec): report what each filter pruned in `EXPLAIN ANALYZE`**, each half with the item that produces it
   -- rows with D1, row groups with D2 -- and not after either. Rows and row groups skipped, and whether the filter
   was ready: without that last one, a filter that never fires and a filter that is never ready are the same timing.

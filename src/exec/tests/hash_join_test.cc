@@ -3860,6 +3860,51 @@ TEST_F(HashJoinPlanTest, TheProfileReportsWhatTheDynamicFilterPruned) {
   EXPECT_EQ(RowsOf(**got).size(), 5U) << "and the rows it kept are the answer";
 }
 
+// A DATE key, which is a different arm of the published-values dispatch from a BIGINT one and the
+// shape a date-partitioned table has. The values and the statistics must agree on the domain --
+// both are days -- or parts holding matching rows would be skipped and rows lost in silence.
+TEST_F(HashJoinPlanTest, APartIsSkippedOnADateKeyToo) {
+  // Parts of ten rows each, the key a DATE: part 0 holds days 0..9, part 1 10..19, part 2 20..29.
+  const auto days = [](const std::string& prefix, int64_t parts,
+                       const std::function<int32_t(int32_t)>& day) {
+    const auto schema = arrow::schema(
+        {arrow::field(prefix + "d", arrow::date32()), arrow::field(prefix + "n", arrow::int64())});
+    arrow::RecordBatchVector batches;
+    for (int64_t part = 0; part < parts; ++part) {
+      std::vector<std::optional<int32_t>> ds;
+      std::vector<std::optional<int64_t>> ns;
+      for (int32_t r = 0; r < 10; ++r) {
+        const auto i = static_cast<int32_t>(part * 10) + r;
+        ds.emplace_back(day(i));
+        ns.emplace_back(i);
+      }
+      batches.push_back(BatchOf(schema, {Dates(ds), Int64s(ns)}));
+    }
+    return std::make_shared<MemoryTable>(schema, std::move(batches), /*split=*/true);
+  };
+  const plan::BoundColumn probe_key = Column(0, "pd", LogicalType::kDate);
+  const plan::BoundColumn build_key = Column(0, "bd", LogicalType::kDate);
+  // The build holds days 2 and 5 only, both in part 0, so parts 1 and 2 can be ruled out.
+  const auto build = days("b", 1, [](int32_t i) { return i % 2 == 0 ? 2 : 5; });
+  const auto probe = days("p", 3, [](int32_t i) { return i; });
+  auto got = RunPlan(PlanOf(JoinOf(plan::JoinKind::kInner, ScanOf(probe, "p"), ScanOf(build, "b"),
+                                   {probe_key}, {build_key}),
+                            4),
+                     ContextOf(nullptr));
+  ASSERT_TRUE(got.ok()) << got.status().ToString();
+  EXPECT_EQ(probe->scanned_parts(), (std::vector<int64_t>{0}));
+  const auto control = days("p", 3, [](int32_t i) { return i; });
+  control->set_stats(false);
+  auto reference = RunPlan(PlanOf(JoinOf(plan::JoinKind::kInner, ScanOf(control, "p"),
+                                         ScanOf(build, "b"), {probe_key}, {build_key}),
+                                  4),
+                           ContextOf(nullptr));
+  ASSERT_TRUE(reference.ok()) << reference.status().ToString();
+  EXPECT_EQ(control->scanned_parts(), (std::vector<int64_t>{0, 1, 2}));
+  EXPECT_EQ(RowsOf(**got), RowsOf(**reference));
+  EXPECT_FALSE(RowsOf(**got).empty());
+}
+
 // A part whose key column is entirely NULL holds nothing any join can match, so it is skipped too:
 // the build publishes no NULL key, and a probe row with one matches nothing in any case.
 TEST_F(HashJoinPlanTest, APartOfNullKeysIsNotScanned) {
