@@ -4,8 +4,8 @@ Date: 2026-10-18
 
 ## Status
 
-Proposed (D0-D3 are built and measured; D4's table is the cumulative result, on which this ADR is accepted or
-deferred)
+Proposed (D0-D3 and D5 are built and measured; D4's refreshed table is the cumulative result, on which this ADR
+is accepted or deferred)
 
 ## Context
 
@@ -395,27 +395,56 @@ lesson of [ADR 0027](0027-string-views.md)'s S1, which was planned as a win whos
 
     | | before | after | |
     | --- | ---: | ---: | --- |
-    | the 22, total | 69.46 s | **60.35 s** | **0.869x** |
-    | the 22, geomean | 2.384 s | **2.147 s** | 0.901x |
+    | the 22, total | 69.46 s | 60.35 s | 0.869x |
+    | the 22, geomean | 2.384 s | 2.147 s | 0.901x |
     | DuckDB, total (the drift control) | 29.78 s | 29.51 s | 0.991x -- so the move above is antb1's |
-    | **against DuckDB, total** | 2.33x | **2.05x** | |
-    | **against DuckDB, geomean** | 2.18x | **1.98x** | first time under 2x in this ADR's figures |
+    | against DuckDB, total | 2.33x | 2.05x | |
+    | against DuckDB, geomean | 2.18x | 1.98x | |
 
   - **Where the 9.10 s went, which is not where this ADR's plan put it.** Q18 0.504x, Q04 0.609x and Q21 0.828x --
     the three queries D0 and D1 were built for -- are **6.25 s of it, 69%**. Most of the rest is C6's static
     pushdown (the note under D1), spread a few percent over queries no item here was aiming at. Two queries
     regress, both already recorded under D1: Q11 1.129x and Q16 1.052x.
+  - **Re-measured (2026-10-19), because the table above was taken before D5 and before
+    [ADR 0030](0030-shared-sub-plans.md)'s E2 and is no longer the cumulative figure.** The numbers above stand as
+    what was true when they were taken; these supersede them. Same protocol -- both arms built and measured in one
+    run, a discarded warm-up pass each, best of three, antb1 and DuckDB interleaved per query -- and the same
+    `before`, the last commit with none of this work in it:
+
+    | | before | after | |
+    | --- | ---: | ---: | --- |
+    | **the 22, total** | 71.09 s | **55.97 s** | **0.787x**, 15.12 s saved |
+    | the 22, geomean | 2.438 s | **2.001 s** | 0.821x |
+    | DuckDB, total (the drift control) | 30.73 s | 30.23 s | 0.984x -- so the move above is antb1's |
+    | **against DuckDB, total** | 2.31x | **1.85x** | |
+    | **against DuckDB, geomean** | 2.16x | **1.80x** | |
+
+  - **Attribution, since this window holds three ADRs and not one.** The five named items' queries are **12.04 s
+    of the 15.12 s, 80%**: Q17 **0.284x** (D5), Q18 0.503x (D0 with D1 and D2), Q15 0.482x (ADR 0030's E2), Q21
+    0.831x and Q04 0.627x (D1). The remaining 3.1 s is spread thinly -- Q19 0.824x, Q08 0.805x, Q14 0.843x, Q01
+    0.890x, Q06 0.884x and six more inside 10% -- and belongs to ADR 0026's C6, which is also where it is
+    recorded. **Q01 and Q06 hold no join at all**, so they cannot be any filter of this ADR's: that is the check
+    that keeps the attribution honest. The same two queries regress as before, both recorded under D1: Q11 1.160x
+    and Q16 1.053x.
+  - **D5 is the largest item of the ADR**, which no version of this plan predicted: it was found by asking what
+    scan sharing would do for a query ADR 0030 had misnamed, and it restores a restriction ADR 0023's unnesting
+    discards rather than adding a filter of its own.
   - **Per item, as measured by each**: D0 0.550x on its one query and 0.975x of the 22; D1 0.958x of the 22; D2
-    0.998x; D3 no timing of its own. So **D0 and D1 are this ADR, and D2 is a mechanism that works and does not
-    pay** -- the honest one-line summary of the whole plan.
+    0.998x; D3 no timing of its own; D5 0.935x of the 22. So **D0, D1 and D5 are this ADR, and D2 is a mechanism
+    that works and does not pay**. Note that these five do not multiply to 0.787x, and the pair above is the
+    figure: each was measured in its own session against its own control, and D5's control arm alone read 61.19 s
+    where the previous pair's "after" read 60.35 s -- a session-to-session drift larger than several of the items.
+    **A cumulative claim needs a cumulative pair, not a product of ratios.**
   - **Twice the value landed somewhere the plan did not predict**, which is the transferable lesson: D2 arrived to
     find D1 had already taken the prize it was costed on, and C6 was planned as plumbing for D1 while being worth
     more than its own entry expected. Both are failures of *ordering* analysis rather than of measurement -- the
     plan reasoned about each item alone, and two mechanisms over the same rows share one prize, which goes to
     whichever ships first.
   - **This entry records the numbers; it does not move the Status line.** On these figures the ADR is accepted or
-    deferred by a maintainer: for, D0 and D1 together close 0.869x and the mechanisms are measured, bounded and
-    instrumented; against, D2 earns 0.2% and the reach that would pay for it is not represented in this gate set.
+    deferred by a maintainer. For: the work closes **0.787x** of the 22 and the gap to DuckDB from 2.31x to
+    **1.85x**, with four of its five items paying and every mechanism measured, bounded and instrumented.
+    Against: D2 earns 0.2% and the reach that would pay for it is not represented in this gate set, and two
+    queries are left slower than they were.
 
 **The gate, stated so it cannot be read backwards.** An earlier draft of D1 gated the Bloom filter on min/max having
 moved a query by 10%, which is exactly wrong: min/max pruning nothing *is* the signal that the keys are scattered,
