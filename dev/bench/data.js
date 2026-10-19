@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792386966016,
+  "lastUpdate": 1792405240826,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -11916,6 +11916,258 @@ window.BENCHMARK_DATA = {
             "value": 2404.5642160000116,
             "unit": "ms/iter",
             "extra": "iterations: 1\ncpu: 2404.234333000005 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "450ba6e0fb7b6914643fc55de0888276ae983da5",
+          "message": "perf(exec): skip a probe part no published key can be in (#176)\n\n## Summary\n\nADR 0029's **D2**, **D3** and **D4** — the items that finish it, plus\nthe cumulative measurement D4 asked for.\n\n## The cumulative result (D4)\n\nTaken fresh end to end rather than chained, because each item was\nmeasured against its own contemporaneous\nbaseline and those drift between sessions. Both arms were built and\nmeasured **in one run**, each preceded by a\n**discarded warm-up pass over all 22**, best of three, antb1 and DuckDB\ninterleaved per query. SF 100, 14 threads,\n`before` = the last commit with none of D0–D3 in it.\n\n| | before | after | |\n| --- | ---: | ---: | --- |\n| the 22, total | 69.46 s | **60.35 s** | **0.869×** |\n| the 22, geomean | 2.384 s | **2.147 s** | 0.901× |\n| DuckDB, total — the drift control | 29.78 s | 29.51 s | 0.991×, so the\nmove above is antb1's |\n| **against DuckDB, total** | 2.33× | **2.05×** | |\n| **against DuckDB, geomean** | 2.18× | **1.98×** | first time under 2×\nin this ADR's figures |\n\nQ18 0.504×, Q04 0.609× and Q21 0.828× — the three queries D0 and D1 were\nbuilt for — are **6.25 s of the 9.10 s\nsaved, 69%**. Two queries regress, both already recorded under D1: Q11\n1.129×, Q16 1.052×.\n\n**My first attempt at this measurement was wrong, and the ADR says so.**\nIt measured the two arms in separate\nsessions and attributed a 7–10% page-cache asymmetry to the code. The\ntell was that **Q1 and Q6 moved despite\nholding no join**, so no dynamic filter can touch them. Chasing that\nproduced the second correction below; the\nwarm-up pass and DuckDB-as-control are what remove the asymmetry.\n\n**Most of the remaining gain is not this ADR's.** ADR 0026's **C6**\nshipped *inside* D1's PR as its prerequisite,\nso this ADR's window contains it — and C6 unblocked **static** pushdown\n(ADR 0020) on every query reading a\nDECIMAL, which is most of TPC-H. That is why join-free queries move in a\ncumulative table. ADR 0026 measured C6 at\n0.981× on the 18th, and this run replicates it closely on the four\nqueries the two runs share (Q19 0.824→0.815,\nQ14 0.839→0.853, Q01 0.912→0.907, Q06 0.947→0.935), so that entry now\ncarries the replication and the warning\nthat a cumulative figure over ADR 0029 must not be credited to ADR\n0029's filters.\n\n**The transferable lesson**, recorded in D4 because it cost two\nmispredictions: the plan costed each item alone,\nbut two mechanisms over the same rows share one prize, which goes to\nwhichever ships first. D2 arrived to find D1\nhad taken the prize D2 was costed on; C6 was planned as plumbing while\nbeing worth more than its own entry\nexpected. Both are failures of ordering analysis, not of measurement.\n\n## D2 and D3 A completed hash build now publishes its key *values* as\nwell as\nthe Bloom bits D1 publishes, and a part of its probe's scan whose key\ncolumn spans none of them is not read at\nall — no open, no decode, no filtering. D3 makes both halves visible in\n`EXPLAIN ANALYZE`.\n\n**D2 prunes exactly what the ADR predicted, and it is worth almost\nnothing.** Both halves of that sentence\nmatter, and the second is the one to read first.\n\n| | |\n| --- | ---: |\n| row groups the test rules out on the query the ADR is built around |\n**1,337 of 4,896** (27.3%) |\n| what `e^(-k/g)` predicted for it | 1,325 |\n| the same test on that query's other probe | 6 of 1,222, against 6.7\npredicted |\n| **the 22 at SF 100, 14 threads** | 61.90 s → 61.78 s, **0.998×** |\n| that one query | **0.978×** (median of seven), 0.992× (min of seven) |\n| queries of the 22 where it prunes anything at all | **1** |\n| every other query | inside ±1.2%, this harness's noise |\n\n**Why the reach did not become value, which is this PR's one real\nfinding.** The ADR's Context counted row groups\nand assumed the time followed. It does not: D1's filtered scan decodes\nthe key column, rejects the rows and never\ntouches the other columns, so a row group holding no matching key was\n**already cheap**. Skipping the part saves\nthat key column's decode, its hashes and its probes and nothing else —\nthe probe scan goes 5.034 s to 3.692 s\nsummed over 14 threads, about 96 ms of wall clock on a 4.5 s query. **A\npruning mechanism's reach and its value\nare different quantities, and the ADR measured the first while arguing\nthe second.** Had D2 shipped before D1 it\nwould have collected most of what D1 collected, and D1 would then have\nlooked marginal; the corollary of ordering\nthem — that whichever ships first takes the shared prize — was not\nstated in the plan and should have been.\n\n**It is accepted on these numbers rather than deferred**, and that was a\njudgement call made explicitly: it\nregresses nothing, its reach is arithmetic over two counts known before\nit runs (90% of row groups at a 500-key\nbuild, 82% at 1,000, 27% at 6,398, nothing by 50,000), and it is\nconfined to one path in `exec`. A gate set with a\nsmaller build side would make it pay; ours holds one 6,398-key case and\nnothing smaller.\n\n## Four of the ADR's premises for these items were wrong, all in the\ncheaper direction\n\nEach is corrected in the ADR with the line of code that settles it.\n\n- **D2 needs no `plan::Table` entry point and no `io` change.** The ADR\nreasoned that `ScanFilter::Apply` sees\nvalues already decoded, so a row-group test must be a new table\ninterface. The premise is right and the\nconclusion is not: a Parquet part **is** one row group of one file\n(`plan/table.h`), `exec` drives parts, and\n`Table::part_stats(part, field)` already exists — the top-N has pruned\nparts at runtime through it since ADR\n0011 (`exec/part_pruning.h`'s `PartMayBeat`). What shipped is\n**exec-only**.\n- **D3's rows counter does not belong in the filtered scan.** The code\nthat clears the bit is\n`KeyScanFilter::Apply`, which is `exec`'s own, so it counts what it\nclears.\n- **The min/max interval is not a separate mechanism.** A binary search\nover the key set already finds nothing\noutside it, so the interval is that test's degenerate case. The ADR's\noffer to \"leave the interval out until a\nworkload with a contiguous build side is in the gate set\" had nothing to\ndecide.\n- **The part test reaches further than the per-row filter, not less\nfar.** A part that is never read needs no\nfiltered decoder, takes none of the single `ScanFilter` slot, and costs\none binary search whether it prunes or\nnot — so it also applies to a probe scan that already pushes static\npredicates, which D1 must refuse, and the\nbuild-share gate that bounds D1's cost has nothing to say about it. No\nquery of the 22 exercises that\ncombination, so that path is carried on its test and not on a\nmeasurement.\n\nD3's third item, the readiness metric, is **not implemented**, and the\nADR now records why: D1 established that a\nbuild completes before any probe part is constructed, so there is no\nnot-ready state to report. Left unsaid, a\nreader would keep looking for it.\n\n## What D3 shows, which is how the two mechanisms divide the probe\n\nMeasured by the engine's own metrics on the query above, for its\n600,037,902-row probe:\n\n| | rows | share of the rejecting |\n| --- | ---: | ---: |\n| never read — the 1,337 row groups D2 pruned | 163,106,013 | **27%** |\n| read and dropped by D1's per-row filter | 436,744,092 | **73%** |\n| handed to the join | 187,797 | |\n\nThe three sum to the table's rows, which is the check that the counters\nare honest. **This is the quantitative\nform of \"D1 had already taken this item's prize\"** — and the first time\neither mechanism's share has been visible\nat all, which is what D3 is for.\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [x] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\nFour commits: `perf(exec)` for D2, `feat(exec)` for D3's two profile\nmetrics, `test(exec)` for the review fixes\nand `docs(adr)` for D4's cumulative record. The PR's subject is the perf\nitem.\n\n## Verification\n\n```text\n$ pixi run ci\n100% tests passed out of 2746\n\n$ ANTB1_DIFF_SEED=20261019 pixi run diff-random\nDIFF: PASS seed=20261019 queries=2000 failed=0 unsupported=0\n\n$ pixi run test -L metamorphic     # thread-count and batch-size invariance\n100% tests passed out of 154\n\n$ pixi run test -L cli             # goldens unchanged: no query of theirs attaches a filter\n100% tests passed out of 88\n\n$ clang-tidy -p build/tidy --warnings-as-errors='*' <the five changed .cc> <the two changed tests>\n# no findings in any of them. (hash_join_test.cc has 5 findings that are present on main\n# unchanged; the one my diff added -- a literal RNG seed -- is fixed by taking the seed as a\n# parameter, which is the idiom the file already uses.)\n\n$ pixi run coverage\nCoverage gate: PASS      # exec 97.24% lines / 89.19% branches, floors 96.1% / 85.1%\n# Lines, per changed file, after the test the first run prompted: key_filter.cc and\n# table_scan.cc 100% (key_filter.cc was 93.55% before it), physical_planner.cc 97.64%,\n# scan_filter.cc 94.90%, join_table.cc 97.93%.\n\n$ pixi run lint\n# every linter passes except shellcheck, which reports 36 pre-existing macOS-only SC2218\n# findings in tools/github/apply-settings.sh. None are in this diff, which touches no shell.\n```\n\n**ASan**: `pixi run asan` fails at test discovery on this host for a\npre-existing reason unrelated to this change\n(a `curl_global_init` leak in discovery, present on `main`), so the\nsuites were run from the ASan build directly:\n`antb1_exec_tests` 306 tests and `antb1_engine_tests` 27 tests, all\npassing, with `detect_leaks=0`.\n\n**GCC was not checked**: the `gcc` environment is linux-64 only and this\nis macOS. The diff was read by hand for\nthe two traps that caught #175 — a cast whose operand is already that\ntype (`-Wuseless-cast`, which fires on\nlinux-64 where `uint64_t` *is* `size_t`) and a parameter shadowing a\nmember (`-Wshadow`) — and carries neither;\nthe release leg, which adds `-Wconversion -Wsign-conversion\n-Wshadow-all`, is clean.\n\n## Tests\n\nThe exec test table already reports exact part statistics, can be told\nto report none, and records the parts it\nwas asked to scan — so these assert that the mechanism **fired**, not\nmerely that the answer survived:\n\n- `exec.HashJoinPlanTest.APartHoldingNoBuildKeyIsNotScanned` — six probe\nparts tile the key domain and the build's\nfive keys fall in two of them; the other four are absent from the\ntable's scanned-parts list, while the control\narm reports no statistics, scans all six, and returns **the same rows**.\nIt also covers the anti join of the\norientation that emits unmatched probe rows (which must read every part)\nand the probe scan that already pushes\n  a predicate of its own (which must still skip parts).\n- `exec.HashJoinPlanTest.APartIsSkippedOnADateKeyToo` — a **DATE** key,\nwhich is a different arm of the\npublished-values dispatch and the shape a date-partitioned table has (a\nDATE over a UINT16-stored column is\nexactly it). This came out of review: only the BIGINT arm was reachable\nbefore, because the exec test table\nreported statistics for INT64 columns alone, so\n`MemoryTable::part_stats` now covers the same integer-valued\ntypes `ParquetTable` does. A domain mismatch on such a key would skip\nparts holding matching rows.\n- `exec.HashJoinPlanTest.APartOfNullKeysIsNotScanned` — a part whose key\ncolumn is entirely NULL.\n- `exec.HashJoinPlanTest.TheProfileReportsWhatTheDynamicFilterPruned` —\nD3's two metrics, pinned to exact values.\n- Six cases in `exec.KeyFilterTest`: no range holding a key is ever\nruled out, over a seeded set; every gap\nbetween adjacent keys is ruled out; the interval-only fallback above the\ncap; a filter nothing was published to\nrules out no part; the values are charged to the budget and given back;\nand **both ways of not affording\nsomething** — a budget too small for the bits (no filter, no error) and\none with room for the bits but not the\nvalues on top (the interval alone, which rules out fewer parts and no\nwrong ones). The last of these came out of\nthe coverage run, which showed those two give-up paths were the only\nuncovered lines in the new code.\n\n**Mutation-checked**, each against the suite above:\n\n| mutation | result |\n| --- | --- |\n| `MayHoldAKeyIn` always says yes (no pruning) | caught (3 tests) |\n| the key *values* are never published, only the interval | **caught** —\nwhich is what proves the values do the pruning, since the interval\ncovers every part here |\n| missing statistics prune instead of never pruning | caught (3 tests) |\n| an all-NULL part is not pruned | caught |\n| the DATE32 arm of the dispatch publishes nothing | caught |\n\n## From review\n\nThe `reviewer` subagent confirmed the six correctness questions I put to\nit — that\n`spec_->keys().front().index` is the right column (`AppendRows` Takes\nthe whole batch in the build schema's order),\nthat key widths cannot diverge (`ShapeOf` rejects a join whose key\ncolumns differ in type, and a cast would appear\nas a `ComputeNode`, which `ProbeKeyOf` refuses), that every kind\nreaching `PartHasNoKey` either drops unmatched\nprobe rows or uses them only to set marks, that `pruned_` is computed\nbefore every branch so a prune-only KeyScan\nnever takes the filter slot, and that the swallowed `Resize` leaves the\nreservation consistent. It also noted that\nthe build-on-left orientation is exercised with a real prune by an\nexisting test\n(`physical_planner_test.cc`'s\n`JoinsBuildingOnTheirLeftInputKeepTheSameRows`), which asserts exact\nrows both ways.\n\nIts three P1s are all fixed in the third commit: the untested dispatch\narms (above), the undocumented metrics\n(`docs/sql-subset.md`), and an \"accepted on these numbers\" phrase in the\nADR that was a status claim an update is\nnot the place to make.\n\nOne nit left deliberately: in the Scan branch a part that is pruned\nstill records `key_filter=1` when the per-row\nfilter *would* have applied, so a query whose every part is pruned\nreports a filter that never ran. Changing it\nwould mean deciding the metric after the scan rather than where the\nfilter is attached; it is cosmetic, and I would\nrather not move that reporting in the same PR that introduces it.\n\n### The ADR Status line, changed on the maintainer's say-so\n\nADR 0029's Status read `Proposed (draft: the measurement below is taken,\nthe design is not built)`, whose second\nclause D0–D3 make false. It now reads:\n\n```diff\n-Proposed (draft: the measurement below is taken, the design is not built)\n+Proposed (D0-D3 are built and measured; D4's table is the cumulative result, on which this ADR is accepted or\n+deferred)\n```\n\nIt stays **Proposed** — this PR records numbers and does not accept the\nADR. Accepting or deferring it is the\ndecision D4's table exists to support, and D4 states the case both ways:\nfor, D0 and D1 together close 0.869× and\nthe mechanisms are measured, bounded and instrumented; against, D2 earns\n0.2% and the reach that would pay for it\nis not represented in this gate set.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [ ] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer\n\n**Two CODEOWNERS files and one Status line, all agreed with the\nmaintainer before being written.** ADR 0029 gains\nD2's, D3's and D4's updates, four inline corrections to its Decision\nsection, and the Status line above; ADR 0026's\nC6 entry gains the independent replication of its own measurement and\nthe warning that goes with it. The ADR stays\n`Proposed`. The TPC-H-derived figures throughout are timings, row counts\nand row-group counts, with the\nnon-comparability notice already at the foot of ADR 0029 (ADR 0006\npermits these and the file already carries\nmany); no query text, data or answers appear anywhere in the diff.\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5) mapped\nthe subsystems and found that four of the\nADR's premises for these items were wrong, implemented both items, wrote\nthe tests, mutation-checked each guard,\ntook the SF 100 measurements, diagnosed why the predicted reach did not\nbecome value, caught and corrected its\nown first cumulative measurement (which attributed a page-cache\nasymmetry to the code), traced the residual to\n  ADR 0026's C6, and ran the `reviewer` subagent on the diff.\n- Accountable human (has read and understands the whole diff): @\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-19T13:16:40+03:00",
+          "tree_id": "076dae84561d3f0aeabcaaf5d25d56b4dd99fc34",
+          "url": "https://github.com/ydb-campus/antb1/commit/450ba6e0fb7b6914643fc55de0888276ae983da5"
+        },
+        "date": 1792405239937,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4837.339077920018,
+            "unit": "ns/iter",
+            "extra": "iterations: 142569\ncpu: 4836.976088771051 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84215.62531581603,
+            "unit": "ns/iter",
+            "extra": "iterations: 7916\ncpu: 84195.84537645272 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222141.4294322882,
+            "unit": "ns/iter",
+            "extra": "iterations: 3153\ncpu: 222096.33967649864 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 442624.89943073835,
+            "unit": "ns/iter",
+            "extra": "iterations: 1581\ncpu: 442581.4123972167 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 359782.9649303798,
+            "unit": "ns/iter",
+            "extra": "iterations: 1939\ncpu: 359731.1480144406 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2100161.780120488,
+            "unit": "ns/iter",
+            "extra": "iterations: 332\ncpu: 2099781.7409638534 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 52.83018807692157,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 52.82693838461535 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 46.12545180000135,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 46.11720346666661 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 226.66572400000481,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 226.63303966666663 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.47035397916648,
+            "unit": "ms/iter",
+            "extra": "iterations: 48\ncpu: 14.467552124999985 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 21.659250870967636,
+            "unit": "ms/iter",
+            "extra": "iterations: 31\ncpu: 21.65706758064514 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 38.08338477777795,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 38.077041 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.5908718068964778,
+            "unit": "ms/iter",
+            "extra": "iterations: 435\ncpu: 1.5906917908045994 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 144.76065160000644,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 144.73621879999996 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1000",
+            "value": 28.14166564000061,
+            "unit": "ms/iter",
+            "extra": "iterations: 25\ncpu: 28.13940988000006 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16384",
+            "value": 31.184411045454784,
+            "unit": "ms/iter",
+            "extra": "iterations: 22\ncpu: 31.1795015 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/262144",
+            "value": 68.56742863636163,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 68.56205172727282 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1048576",
+            "value": 143.5599613333333,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 143.54159483333302 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/4194304",
+            "value": 405.49705700001937,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 405.45353849999975 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16777216",
+            "value": 1769.6913649999715,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1769.4137500000018 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1000",
+            "value": 34.759691049998764,
+            "unit": "ms/iter",
+            "extra": "iterations: 20\ncpu: 34.75372149999991 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16384",
+            "value": 39.42272388889023,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 39.420287111111165 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/262144",
+            "value": 72.31525279999573,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 72.30494679999993 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1048576",
+            "value": 147.27091525000446,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 147.24276224999943 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/4194304",
+            "value": 452.0775745000094,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 452.0267904999997 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16777216",
+            "value": 2104.0332150000154,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2103.8235400000003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1000",
+            "value": 60.1704149166693,
+            "unit": "ms/iter",
+            "extra": "iterations: 12\ncpu: 60.158909833333205 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16384",
+            "value": 63.074406909089994,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 63.069080272727454 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/262144",
+            "value": 98.3232064285744,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 98.30843071428522 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1048576",
+            "value": 213.66475766668222,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 213.63548000000068 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/4194304",
+            "value": 552.6869490000195,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 552.6463499999963 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16777216",
+            "value": 2435.4599240000425,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2435.1113929999997 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1000",
+            "value": 70.55247270000109,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 70.54812760000004 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16384",
+            "value": 76.0179150000037,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 75.9981391111108 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/262144",
+            "value": 123.5784838333321,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 123.56444699999969 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1048576",
+            "value": 265.01240200002485,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 264.9884119999974 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/4194304",
+            "value": 608.3820059999994,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 608.3032479999986 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16777216",
+            "value": 2567.4216880000245,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2567.0684440000005 ms\nthreads: 1"
           }
         ]
       }
