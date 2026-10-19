@@ -430,8 +430,11 @@ lesson of [ADR 0027](0027-string-views.md)'s S1, which was planned as a win whos
     scan sharing would do for a query ADR 0030 had misnamed, and it restores a restriction ADR 0023's unnesting
     discards rather than adding a filter of its own.
   - **Per item, as measured by each**: D0 0.550x on its one query and 0.975x of the 22; D1 0.958x of the 22; D2
-    0.998x; D3 no timing of its own. So **D0 and D1 are this ADR, and D2 is a mechanism that works and does not
-    pay** -- the honest one-line summary of the whole plan.
+    0.998x; D3 no timing of its own; D5 0.935x of the 22. So **D0, D1 and D5 are this ADR, and D2 is a mechanism
+    that works and does not pay**. Note that these five do not multiply to 0.787x, and the pair above is the
+    figure: each was measured in its own session against its own control, and D5's control arm alone read 61.19 s
+    where the previous pair's "after" read 60.35 s -- a session-to-session drift larger than several of the items.
+    **A cumulative claim needs a cumulative pair, not a product of ratios.**
   - **Twice the value landed somewhere the plan did not predict**, which is the transferable lesson: D2 arrived to
     find D1 had already taken the prize it was costed on, and C6 was planned as plumbing for D1 while being worth
     more than its own entry expected. Both are failures of *ordering* analysis rather than of measurement -- the
