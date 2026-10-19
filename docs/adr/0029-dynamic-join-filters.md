@@ -4,8 +4,10 @@ Date: 2026-10-18
 
 ## Status
 
-Proposed (D0-D3 and D5 are built and measured; D4's refreshed table is the cumulative result, on which this ADR
-is accepted or deferred)
+Accepted (D0-D3 and D5 built and measured; D4's refreshed table carries the numbers it was accepted on. A
+completed build publishes its keys sideways to the probe's scan, where they skip a part, a row, or a group below
+the aggregate a join reads. D2 shipped and earns 0.2%, and two queries are left slower -- both recorded rather
+than removed.)
 
 ## Context
 
@@ -440,11 +442,16 @@ lesson of [ADR 0027](0027-string-views.md)'s S1, which was planned as a win whos
     more than its own entry expected. Both are failures of *ordering* analysis rather than of measurement -- the
     plan reasoned about each item alone, and two mechanisms over the same rows share one prize, which goes to
     whichever ships first.
-  - **This entry records the numbers; it does not move the Status line.** On these figures the ADR is accepted or
-    deferred by a maintainer. For: the work closes **0.787x** of the 22 and the gap to DuckDB from 2.31x to
-    **1.85x**, with four of its five items paying and every mechanism measured, bounded and instrumented.
-    Against: D2 earns 0.2% and the reach that would pay for it is not represented in this gate set, and two
-    queries are left slower than they were.
+  - **Accepted on these figures (2026-10-19), by the maintainer.** The case put both ways before the call, and
+    recorded here because the negatives are part of what was accepted. For: the work closes **0.787x** of the 22
+    and the gap to DuckDB from 2.31x to **1.85x**, with four of its five items paying and every mechanism
+    measured, bounded and instrumented. Against: D2 earns 0.2% and the reach that would pay for it is not
+    represented in this gate set, and two queries are left slower than they were -- Q11 1.160x and Q16 1.053x,
+    both the cost of a filter that cannot pay on them, bounded by `kFilterBuildShare` and recorded under D1.
+    **Accepting this ADR accepts those two numbers**, which is why they are in the Status line as well. D2 stays
+    in the tree rather than being reverted: it is correct, instrumented by D3, and costs a part's statistics
+    lookup where it does not pay -- its case is a key set small relative to the probe's row-group count, which
+    neither gate set has.
 
 **The gate, stated so it cannot be read backwards.** An earlier draft of D1 gated the Bloom filter on min/max having
 moved a query by 10%, which is exactly wrong: min/max pruning nothing *is* the signal that the keys are scattered,
