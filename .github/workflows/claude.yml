@@ -107,7 +107,7 @@ jobs:
           cache-write: false # only CI on main writes caches
       - name: Install the lint environment (pixi run lint, fmt and check)
         run: pixi install --locked -e lint
-      - uses: anthropics/claude-code-action@58985842b834ed26087302ba27d07bc24ca8697a # v1.0.244
+      - uses: anthropics/claude-code-action@1d6de8cb0c237e7c15e9e1bdf973826ebae490cc # v1.0.248
         with:
           # A repository secret, not an environment secret: review events run this job on the PR's merge ref, and an
           # environment that PR refs may use protects nothing. The gate above refuses forks and outsiders.
