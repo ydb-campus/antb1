@@ -39,3 +39,4 @@ may land first, in a docs-only PR (0013, 0019, 0021-0025).
 | [0028](0028-dictionary-group-keys.md) | Grouping a Parquet dictionary instead of its rows | Rejected |
 | [0029](0029-dynamic-join-filters.md) | Dynamic join filters: the build side's keys at the probe's scan | Accepted |
 | [0030](0030-shared-sub-plans.md) | Shared sub-plans: computing an identical sub-plan once | Accepted |
+| [0031](0031-runtime-knobs.md) | Runtime knobs: a decision switchable without a rebuild, globally and per operator | Proposed |
