@@ -534,12 +534,17 @@ TEST_F(GroupedAggregateTest, HugeIntSumIsCheckedAgainstTheRange) {
 // two cases that distinguishes are an overflow with rows still to come, and one a later addition
 // wraps back out of. Both failed at the overflowing row before and must fail now.
 TEST_F(GroupedAggregateTest, AnOverflowAnywhereInABatchFailsTheBatch) {
-  const auto huge_ints = [](const std::vector<std::string>& values) {
+  const auto huge_ints_with_null = [](const std::vector<std::optional<std::string>>& values) {
     arrow::Decimal128Builder builder(plan::ToArrow(LogicalType::kHugeInt));
     for (const auto& v : values) {
-      EXPECT_TRUE(builder.Append(arrow::Decimal128(v)).ok());
+      EXPECT_TRUE(
+          (v.has_value() ? builder.Append(arrow::Decimal128(*v)) : builder.AppendNull()).ok());
     }
     return builder.Finish().ValueOrDie();
+  };
+  const auto huge_ints = [&huge_ints_with_null](const std::vector<std::string>& values) {
+    std::vector<std::optional<std::string>> some(values.begin(), values.end());
+    return huge_ints_with_null(some);
   };
   const std::string big = "99999999999999999999999999999999999999";  // 10^38 - 1
   const Call call{
@@ -561,6 +566,17 @@ TEST_F(GroupedAggregateTest, AnOverflowAnywhereInABatchFailsTheBatch) {
   auto status = wrapped->Consume(huge_ints({big, big, minus_big, minus_big}).get(), kFour);
   EXPECT_TRUE(status.IsExecutionError()) << status.ToString();
   EXPECT_EQ(status.message(), "SUM overflow: the sum of a HUGEINT column exceeds 128 bits");
+
+  // Through the NULL-bearing loop, which is a separate loop and so a separate overflow flag. The
+  // message has to be the 128-bit one from Consume: a sum merely outside HUGEINT's range would be
+  // caught later by Finalize instead, and would not say whether this loop tested anything.
+  auto with_null = MakeGrouped(call);
+  with_null->Resize(1);
+  constexpr auto kThree = std::to_array<std::uint32_t>({0, 0, 0});
+  auto null_status =
+      with_null->Consume(huge_ints_with_null({big, std::nullopt, big}).get(), kThree);
+  EXPECT_TRUE(null_status.IsExecutionError()) << null_status.ToString();
+  EXPECT_EQ(null_status.message(), "SUM overflow: the sum of a HUGEINT column exceeds 128 bits");
 }
 
 // The loop a column with no nulls takes and the loop a column with nulls takes must agree on the
