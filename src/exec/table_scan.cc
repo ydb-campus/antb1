@@ -39,12 +39,14 @@ std::shared_ptr<arrow::Schema> FieldsOf(const plan::Table& table, const std::vec
 
 TableScanOperator::TableScanOperator(std::shared_ptr<plan::Table> table, std::vector<int> fields,
                                      std::optional<int64_t> part, std::optional<LateScan> late,
-                                     std::vector<plan::Predicate> pushed)
+                                     std::vector<plan::Predicate> pushed,
+                                     std::optional<KeyScan> key_scan)
     : table_(std::move(table)),
       fields_(std::move(fields)),
       part_(part),
       late_(std::move(late)),
       pushed_(std::move(pushed)),
+      key_scan_(std::move(key_scan)),
       schema_(FieldsOf(*table_, fields_, late_)) {
   for (std::size_t i = 0; i < fields_.size(); ++i) {
     if (!late_.has_value() || i >= late_->late.size() || !late_->late[i]) {
@@ -57,7 +59,7 @@ arrow::Status TableScanOperator::Open(ExecContext& ctx) {
   offset_ = 0;
   pool_ = ctx.pool;
   positioned_ = false;
-  if (!pushed_.empty() && !part_.has_value()) {
+  if ((!pushed_.empty() || key_scan_.has_value()) && !part_.has_value()) {
     return arrow::Status::Invalid("only the scan of a part applies predicates");
   }
   if (late_.has_value()) {
@@ -82,6 +84,10 @@ arrow::Status TableScanOperator::Open(ExecContext& ctx) {
     std::shared_ptr<const plan::ScanFilter> filter;
     if (!pushed_.empty()) {
       ARROW_ASSIGN_OR_RAISE(filter, MakeScanFilter(pushed_, *schema_, ctx.pool));
+    } else if (key_scan_.has_value()) {
+      // A scan takes one filter, so this is only for a scan with no pushed predicates of its own;
+      // the planner attaches it on no other (ADR 0029's D1).
+      ARROW_ASSIGN_OR_RAISE(filter, MakeKeyScanFilter(key_scan_->filter, key_scan_->column));
     }
     ARROW_ASSIGN_OR_RAISE(reader_,
                           table_->ScanPart(*part_, fields_, ctx.batch_size, ctx.pool, filter));

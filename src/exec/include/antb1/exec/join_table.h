@@ -15,6 +15,7 @@
 #include <arrow/status.h>
 #include <arrow/type_fwd.h>
 
+#include "antb1/exec/key_filter.h"
 #include "antb1/exec/memory_budget.h"
 #include "antb1/exec/operator.h"
 #include "antb1/plan/logical_plan.h"
@@ -384,6 +385,16 @@ class JoinTableBuilder {
   // The table, once every part is added: Invalid for a second call; otherwise the build's failure
   // first (as Merged), then Invalid for a missing part; OutOfMemory past the budget.
   arrow::Result<std::shared_ptr<const JoinTable>> Finish();
+
+  // A Bloom filter over the key hash of every row the parts kept, for the scan of a probe side to
+  // reject rows that can match nothing (docs/adr/0029-dynamic-join-filters.md, D1). Null -- not an
+  // error -- when the spec's keys are not the one integer or DATE column a scan can hash the same
+  // way, or when the filter does not fit the budget.
+  //
+  // Must be called **before** Finish, which frees the parts: the per-row hashes live in them and
+  // nowhere else, and the table keeps none for the direct layout at all. Rows whose key is NULL are
+  // not in it, which is right -- a NULL key matches nothing on either side.
+  arrow::Result<std::shared_ptr<const KeyFilter>> MakeKeyFilter() const;
 
  private:
   JoinTableBuilder(std::shared_ptr<const JoinBuildSpec> spec, int64_t num_parts,

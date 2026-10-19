@@ -31,9 +31,10 @@ struct FilteredColumn {
 
 // The filtered path's reading of a top-level field whose storage type (as Arrow reads it) is
 // `storage` and engine type `engine`, at Parquet leaf `leaf` of `metadata`: flat INT16, INT32,
-// UINT16 and DATE32 (from INT32), INT64, FLOAT and DOUBLE (as DOUBLE), and BINARY and STRING (as
-// BINARY); std::nullopt for anything else (nested, repeated, other types), which the filtered path
-// does not read.
+// UINT16 and DATE32 (from INT32), INT64, FLOAT and DOUBLE (as DOUBLE), BINARY and STRING (as
+// BINARY), and DECIMAL(p, s) where Parquet stores it as an INT32 or INT64 of the same scale (its
+// unscaled value widens to decimal128); std::nullopt for anything else (nested, repeated, a decimal
+// of another scale or stored as bytes, other types), which the filtered path does not read.
 std::optional<FilteredColumn> FilteredColumnOf(const parquet::FileMetaData& metadata, int leaf,
                                                const arrow::DataType& storage,
                                                const arrow::DataType& engine);

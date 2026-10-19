@@ -27,6 +27,7 @@ antb1_add_module(
     grouped_aggregate_state.cc
     group_aggregate.cc
     join_table.cc
+    key_filter.cc
     limit.cc
     gather.cc
     hash_join.cc
@@ -56,6 +57,7 @@ if(ANTB1_BUILD_TESTS)
       tests/parallel_test.cc
       tests/heavy_hitters_test.cc
       tests/join_table_test.cc
+      tests/key_filter_test.cc
       tests/partition_lanes_test.cc
       tests/row_mask_test.cc
       tests/profile_test.cc

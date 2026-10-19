@@ -194,6 +194,72 @@ lesson of [ADR 0027](0027-string-views.md)'s S1, which was planned as a win whos
   bound, and the probe side finding its filter -- which is why the cheaper-looking item is not the smaller one.
   Measured on the 22 at SF 100 and 14 threads **after D0**, so that D0's win is not counted twice, with ClickBench
   as the no-change control (no ClickBench query joins).
+  - Update (2026-10-18, D1): **shipped, 0.958x of the 22, and three of this ADR's assumptions were wrong.**
+    - **It needed a prerequisite this ADR did not know it had.** `supports_scan_filter` is gated on *every* field a
+      scan reads, and the filtered path had no DECIMAL case, so a scan reading one could take no filter at all --
+      including both probe scans of the query this ADR is built around. [ADR 0026](0026-join-performance.md)'s C6
+      shipped first and is what let D1 reach them.
+    - **The filter is always ready, so none of the readiness machinery above was built.** `PrepareBuilds` runs
+      before the sink that schedules the probe pipeline's parts, and the serial path before `input_->Open`, so a
+      build completes at one global moment on the consumer thread and every probe part is constructed after it. No
+      atomic flag, no unfiltered early batches, no new ordering: the bullet above is simply not needed.
+    - **The per-row hashes do not survive the build**, against "over the key hashes it has already computed":
+      `JoinTableBuilder::Finish` frees every `JoinBuildPart` and the direct layout keeps no hash at all. So
+      `JoinTableBuilder::MakeKeyFilter` fills the filter from the parts' pieces *before* Finish. Setting a bit twice
+      sets it once, so the filter does not depend on the order the parts arrived in or the merges ran in.
+    - **The null count is not published either.** Nothing reads it: a NULL key matches nothing on either side, so a
+      probe row with one is dropped by the filter not holding it, which is the answer the join gives anyway.
+    - **The probe hashes with `exec::KeyHashes`, the function the build hashed with.** That is the whole of the
+      correctness argument for the hash, and a hash of its own would have been the one mistake that loses answers
+      silently rather than loudly.
+  - **Three gates decide when a filter is used, and each came out of a regression rather than from taste.**
+    - The join must not emit an unmatched probe row: INNER and SEMI always, ANTI and LEFT only when they build on
+      their left (`EmitsBuildRows`). An ANTI building on its right emits precisely the rows a filter would drop.
+    - The build must hold at most a sixteenth of the probe's rows. Without this, a query whose build held every key
+      of its probe's domain ran **1.138x**: the filter rejected nothing and the probe paid the hash for it.
+    - The filter must fit 16 MB. It is probed once a row with no locality at all, so it pays only while it stays in
+      cache: filters of 6 to 14 MB are worth 0.72x to 0.96x, and a 45 MB one cost **17%** on a query whose build
+      held a sixth of its probe's keys.
+  - **The measurement**, arms alternating per query on one binary, best of three: the 22 go 62.96 s to 60.30 s,
+    **0.958x**. Seven queries gain -- 0.724x, 0.851x, 0.890x, 0.927x, 0.931x, 0.947x and 0.966x -- and the largest
+    of them is the query D0 left with a 291,130,673-row probe, which is the prize this plan predicted.
+  - **Two sub-second queries lose 43 and 47 ms, and the first diagnosis of that was wrong.** This entry first said
+    the cost was "the filtered decoder being slower per row for that table's column mix". It is not: both of those
+    queries read two BIGINT columns and no DECIMAL, and the arms that settle it hold the decoder constant. Putting an
+    always-true predicate on the probe's scan makes the static pushdown take the single filter slot, so both arms run
+    the *filtered* decoder and differ only in the key filter. On Q16 the scan then goes 746 ms to 1,443 ms summed
+    over parts **while emitting 6.7x fewer rows**, and the query 477 ms unfiltered, 483 ms with the decoder switch
+    alone and 521 ms with the filter. **The filter is 87% of the regression and the decoder switch 13%.**
+  - **What decides whether a filter pays, measured on both sides.** The same arms over a query that gains 28% and one
+    that loses 9%:
+
+    | | the query that gains | the query that loses |
+    | --- | ---: | ---: |
+    | join time without the filter, summed | 13.819 s | 0.500 s |
+    | join time with it | 1.634 s | 0.391 s |
+    | **join time saved** | **12.2 s** | **0.11 s** |
+    | extra scan time, the filter's cost | 5.6 s | 0.75 s |
+    | the join's cost per probe row | **23 ns** | **6.3 ns** |
+
+    So a filter pays exactly when the join costs more per probe row than the filter does, and the rejection rate --
+    85% to 96% in every one of these -- does not discriminate at all. Neither does the build's size: the query that
+    gains most has a 6,398-row build and the one that loses most a 40,045-row one. **There is no static quantity
+    here that separates them**, which is why the gates above bound the filter's cost rather than predict its gain.
+  - **The filter's own cost, and halving it.** 9.4 ns a row on that 80 M-row probe, split by short-circuiting the
+    lookup while leaving the hash and the prefetch: **1.8 ns the hash and 7.0 ns the lookup**. The lookup is a read
+    with no locality, so it is a prefetch's to fix, and prefetching the block 128 rows ahead brings the filter to
+    **4.7 ns a row** -- Q04 0.724x to 0.622x, Q21 0.890x to 0.831x, and the 1.099x regression to **1.042x**, inside
+    the band every other query of the 22 moves within. Rejected on the way: **8 bits a key instead of 16**, which
+    halves the filter and should help its cache residency. It is worse on both queries (Q16 508.8 ms to 517.9,
+    Q04 1.240 s to 1.266): the 467,000 extra false positives cost more than the smaller filter saves.
+  - **What is left is one query at 1.147x, and it is partly ADR 0030's.** Its filter is about 128 KB, entirely in
+    cache, so there is no miss for a prefetch to remove and its join's probes are cheap -- the shape where a filter
+    cannot win. It is also one of the queries that **scans its probe side twice** for want of shared sub-plans
+    ([ADR 0030](0030-shared-sub-plans.md)), so it pays the filter twice and saves little twice; eliminating the
+    duplication halves the cost before anything else is tried.
+  - **D3 is only half done here.** The scan reports *that* a filter is attached (a `key_filter` metric, per part);
+    the rows it dropped would need a counter inside the filtered scan, since the scan operator above it sees only
+    the survivors. That half stays with D3.
 - **D2, feat(plan+io): ask a table whether a row group can contain any published key.** The 27% the measurement
   found, from about `g` binary searches over the sorted key set. It needs the new entry point named in the Decision,
   since `ScanFilter::Apply` is handed values that have already been decoded, and a pruned row group is one that is

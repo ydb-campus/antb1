@@ -514,6 +514,27 @@ this profiling fires:
 - **C6, feat(io): DECIMAL columns in the filtered scan.** ADR 0021's decimal64 item, or — cheaper and strictly
   better — `supports_scan_filter` per column, so a scan pushes what it can and decodes the rest for surviving rows
   only. Low measured value; last of the engine work, and the thing runtime join filters wait for.
+  - Update (2026-10-18, C6): **shipped, and "low measured value" was wrong — it is 0.981x of the 22.** Neither form
+    above was needed. A DECIMAL this data stores is physically an INT32 or INT64 with a logical annotation, a physical
+    type the filtered path already decodes, and `FixedArray` already *converts* while storing only the survivors —
+    which is how FLOAT is read as DOUBLE. So the change is one case in `FilteredColumnOf` admitting a decimal128
+    engine type over an integer physical one of the same precision and scale (a rescale, a byte-stored decimal and a
+    decimal32/64/256 storage all stay unreadable, since the unfiltered path has explicit conversions for those), and
+    one case in `FixedArray` widening the unscaled integer to decimal128.
+  - **Nothing was needed on the predicate side, against this item's premise.** `MakeScanFilter` builds a one-field
+    schema and delegates to `PredicateEvaluator::Make` — *the same evaluator the Filter operator uses* — so a DECIMAL
+    predicate in a scan cannot diverge from the same predicate above the scan, and
+    `exec.ScanFilterTest.DecimalsComparedInDouble` had been pinning that for a decimal128 batch all along. The
+    capability existed and was unreachable: `supports_scan_filter` is gated on *every read field*, so one DECIMAL
+    column in the field list turned the whole scan's pushdown off, predicates on other columns included. (A first
+    draft of this change refused DECIMAL predicates out of caution; that test is what showed the refusal would have
+    removed working, tested behaviour.)
+  - **Measured on the 22 at SF 100, 14 threads, best of three, against the same harness on `main`:** the suite 66.17 s
+    to 64.92 s (0.981x) and the geomean 2.341 s to 2.281 s. Six queries moved beyond noise and **every one of them
+    gained a pushdown**: Q19 0.824x (1 to 2 pushed), Q14 0.839x (0 to 1), Q01 0.912x (0 to 1), Q15 0.915x (0 to 2),
+    Q07 0.931x (2 to 3), Q06 0.947x (0 to 1). The three that read slower — Q05 1.041x, Q08 1.029x, Q12 1.027x —
+    pushed exactly what they pushed before, which is what says they are noise rather than the cost of the decoder
+    switch this change makes for the queries that gained one.
 - **C7, ci: the 22 queries on demand.** A job in `bench.yml`, on `workflow_dispatch` with a scale-factor input and
   never on `push` or `pull_request`, generating its data at test time as the SLT runner does. `.github/` is a
   protected path, so the diff needs the maintainer.

@@ -657,6 +657,77 @@ TEST_F(ParquetFilterErrorsTest, FixedWidthFilterErrorsAndClose) {
 }
 
 // Which leaves the filtered path reads (FilteredColumnOf), and MakeFilteredScan's checks.
+// A DECIMAL column Parquet stores as an integer is carried through the filtered path, which is
+// what lets a scan reading one be filtered at all (its predicate still runs above the scan). The
+// values are the gate: read with a filter on another column, the decimals must be exactly what the
+// unfiltered scan returns for the same rows, NULLs included, for an INT32- and an INT64-backed
+// column and whatever the batch size. ADR 0029's D1 is what needs this.
+TEST_F(ParquetFilterErrorsTest, DecimalColumnsReadAsTheUnfilteredScanReadsThem) {
+  arrow::Int64Builder key;
+  arrow::Decimal128Builder small(arrow::decimal128(9, 2));   // stored as INT32
+  arrow::Decimal128Builder large(arrow::decimal128(15, 2));  // stored as INT64
+  constexpr int64_t kDecimalRows = 2600;
+  for (int64_t r = 0; r < kDecimalRows; ++r) {
+    ASSERT_TRUE(key.Append(r).ok());
+    // Negative, zero and positive unscaled values, and a NULL every seventh and eleventh row, so
+    // the definition-level path and the value-compaction path both run.
+    ASSERT_TRUE((r % 7 == 0 ? small.AppendNull()
+                            : small.Append(arrow::Decimal128(((r * 37) % 20000) - 10000)))
+                    .ok());
+    ASSERT_TRUE((r % 11 == 0
+                     ? large.AppendNull()
+                     : large.Append(arrow::Decimal128((r % 2 == 0 ? 1 : -1) * ((r * 1000) + 7))))
+                    .ok());
+  }
+  const auto table = arrow::Table::Make(
+      arrow::schema({arrow::field("key", arrow::int64()),
+                     arrow::field("small", arrow::decimal128(9, 2)),
+                     arrow::field("large", arrow::decimal128(15, 2))}),
+      {key.Finish().ValueOrDie(), small.Finish().ValueOrDie(), large.Finish().ValueOrDie()});
+  const std::string path = (dir_ / "decimals.parquet").string();
+  {
+    auto out = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+    parquet::WriterProperties::Builder props;
+    // Without this the writer stores a decimal as FIXED_LEN_BYTE_ARRAY, which this path does not
+    // read -- and then the test would pass while proving nothing.
+    props.data_pagesize(1024)->enable_store_decimal_as_integer();
+    ASSERT_TRUE(
+        parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), out, 1100, props.build())
+            .ok());
+    ASSERT_TRUE(out->Close().ok());
+  }
+  {  // the columns really are integers in the file, or the rest of this test is vacuous
+    const auto metadata = parquet::ParquetFileReader::OpenFile(path)->metadata();
+    EXPECT_EQ(metadata->schema()->Column(1)->physical_type(), parquet::Type::INT32);
+    EXPECT_EQ(metadata->schema()->Column(2)->physical_type(), parquet::Type::INT64);
+  }
+  auto opened = ParquetTable::Open({path}, ParquetTableOptions{});
+  ASSERT_TRUE(opened.ok()) << opened.status().ToString();
+  const auto& scanned = *opened;
+  const std::vector<int> fields = {0, 1, 2};
+  ASSERT_TRUE(scanned->supports_scan_filter(fields));  // the point of the change
+  // A predicate on the key, not on a decimal: a decimal predicate is not pushed (PushableToScan).
+  const std::vector<Predicate> predicates = {
+      [](const Value& v) { return !v.null && v.integer < 1700; }};
+  for (const int64_t batch_size : {int64_t{7}, int64_t{1000}, int64_t{65536}}) {
+    for (int64_t part = 0; part < scanned->num_parts(); ++part) {
+      auto plain = scanned->ScanPart(part, fields, batch_size);
+      ASSERT_TRUE(plain.ok()) << plain.status().ToString();
+      const auto all = Drain(**plain, batch_size);
+      auto filter = std::make_shared<TestFilter>(std::vector<int>{0}, predicates);
+      auto filtered =
+          scanned->ScanPart(part, fields, batch_size, arrow::default_memory_pool(), filter);
+      ASSERT_TRUE(filtered.ok()) << filtered.status().ToString();
+      const auto got = Drain(**filtered, batch_size);
+      const auto expected = Expected(*all, {0}, predicates);
+      ASSERT_TRUE(got->schema()->Equals(*all->schema())) << got->schema()->ToString();
+      EXPECT_TRUE(got->Equals(*expected))
+          << "batch " << batch_size << " part " << part << ": " << got->num_rows()
+          << " rows, expected " << expected->num_rows();
+    }
+  }
+}
+
 TEST_F(ParquetFilterErrorsTest, ReadableLeavesAndRequests) {
   // Leaves: 0 i32 (INT32), 1 l64 (INT64), 2 f (FLOAT), 3 d (DOUBLE), 4 s (BYTE_ARRAY),
   // 5 the list's element (repeated), 6 the struct's field (definition level 2).
@@ -706,9 +777,17 @@ TEST_F(ParquetFilterErrorsTest, ReadableLeavesAndRequests) {
   EXPECT_FALSE(ok(1, arrow::int64(), arrow::date32()));  // DATE from INT64
   EXPECT_TRUE(ok(1, arrow::int64(), arrow::int64()));
   EXPECT_FALSE(ok(0, arrow::int64(), arrow::int64()));  // physical INT32
-  // A DECIMAL is never filtered in the scan (ADR 0021), whatever its storage.
-  EXPECT_FALSE(ok(0, arrow::decimal128(9, 2), arrow::decimal128(9, 2)));
-  EXPECT_FALSE(ok(1, arrow::decimal128(15, 2), arrow::decimal128(15, 2)));
+  // A DECIMAL this path can read is one Parquet stores as an integer of the engine's own scale: its
+  // unscaled value widens to decimal128 and nothing is rescaled. Readable is not filterable -- a
+  // predicate on such a column still runs above the scan (exec's PushableToScan).
+  EXPECT_TRUE(ok(0, arrow::decimal128(9, 2), arrow::decimal128(9, 2)));     // physical INT32
+  EXPECT_TRUE(ok(1, arrow::decimal128(15, 2), arrow::decimal128(15, 2)));   // physical INT64
+  EXPECT_FALSE(ok(0, arrow::decimal128(9, 2), arrow::decimal128(9, 3)));    // a rescale
+  EXPECT_FALSE(ok(0, arrow::decimal128(9, 2), arrow::decimal128(10, 2)));   // another precision
+  EXPECT_FALSE(ok(2, arrow::decimal128(9, 2), arrow::decimal128(9, 2)));    // physical FLOAT
+  EXPECT_FALSE(ok(4, arrow::decimal128(9, 2), arrow::decimal128(9, 2)));    // stored as bytes
+  EXPECT_FALSE(ok(0, arrow::int32(), arrow::decimal128(9, 2)));             // no storage decimal
+  EXPECT_FALSE(ok(1, arrow::decimal256(15, 2), arrow::decimal128(15, 2)));  // decimal256 storage
   EXPECT_TRUE(ok(2, arrow::float32(), arrow::float64()));
   EXPECT_FALSE(ok(3, arrow::float32(), arrow::float64()));  // physical DOUBLE
   EXPECT_TRUE(ok(3, arrow::float64(), arrow::float64()));

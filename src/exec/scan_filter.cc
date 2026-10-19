@@ -16,10 +16,13 @@
 #include <arrow/util/bit_util.h>
 #include <arrow/util/bitmap_ops.h>
 
+#include "antb1/common/narrow.h"
 #include "antb1/exec/filter.h"
 #include "antb1/exec/like.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/table.h"
+
+#include "group_table.h"
 
 namespace antb1::exec {
 namespace {
@@ -208,6 +211,57 @@ class PredicateScanFilter final : public plan::ScanFilter {
   arrow::MemoryPool* pool_;
 };
 
+// A hash join's key filter as a scan filter: one column, and a hash per row computed with the very
+// function the build hashed its keys with, so the two cannot disagree. Immutable once made, and
+// Apply is const, so every part of a query applies the one object concurrently.
+class KeyScanFilter final : public plan::ScanFilter {
+ public:
+  KeyScanFilter(std::shared_ptr<const KeyFilter> filter, int column)
+      : filter_(std::move(filter)), columns_{column} {}
+
+  [[nodiscard]] const std::vector<int>& columns() const override { return columns_; }
+
+  arrow::Status Apply(int column, const plan::ScanValues& values, int64_t offset,
+                      std::uint8_t* selected) const override {
+    if (column != 0) {
+      return arrow::Status::Invalid("no such filter column");
+    }
+    if (values.array == nullptr) {
+      // A VARCHAR column, which MakeKeyScanFilter refuses: nothing to hash here.
+      return arrow::Status::Invalid("a key scan filter needs a fixed-width column");
+    }
+    // KeyHashes, not a hash of our own: the build hashed with it (JoinBuildPart's HashRows), and a
+    // hash that differed by one bit would make the filter miss rows the join must keep.
+    ARROW_ASSIGN_OR_RAISE(
+        const std::vector<std::uint64_t> hashes,
+        KeyHashes(arrow::compute::ExecBatch({values.array}, values.array->length())));
+    // How far ahead to warm the filter's cache lines. A probe row's read has no locality, so
+    // without this every row waits on one; the distance has to cover the latency at the rate the
+    // loop runs, which is why it is far longer than the eight rows ADR 0019's table uses -- that
+    // one walks a table it has just built and this one an 8 MB filter. Measured on the 80 M-row
+    // probe of Q16 at SF 100, scan time summed over parts: 1.443 s at 8 rows, 1.321 at 16, 1.228
+    // at 32, 1.142 at 64, 1.125 at 128 and back up to 1.189 at 256, where the lines are evicted
+    // before they are read.
+    constexpr int64_t kPrefetch = 128;
+    for (int64_t row = 0; row < values.rows; ++row) {
+      if (row + kPrefetch < values.rows) {
+        filter_->Prefetch(hashes[static_cast<std::size_t>(row + kPrefetch)]);
+      }
+      // GetBit takes an unsigned index and ClearBit a signed one, so each gets its own.
+      const int64_t bit = offset + row;
+      if (arrow::bit_util::GetBit(selected, Narrow<std::uint64_t>(bit)) &&
+          !filter_->MayContain(hashes[static_cast<std::size_t>(row)])) {
+        arrow::bit_util::ClearBit(selected, bit);
+      }
+    }
+    return arrow::Status::OK();
+  }
+
+ private:
+  std::shared_ptr<const KeyFilter> filter_;
+  std::vector<int> columns_;
+};
+
 }  // namespace
 
 bool PushableToScan(const plan::Predicate& predicate) {
@@ -225,6 +279,17 @@ bool PushableToScan(const plan::Predicate& predicate) {
       return false;
   }
   return false;
+}
+
+arrow::Result<std::shared_ptr<const plan::ScanFilter>> MakeKeyScanFilter(
+    std::shared_ptr<const KeyFilter> filter, int column) {
+  if (filter == nullptr) {
+    return arrow::Status::Invalid("a key scan filter without a filter");
+  }
+  if (column < 0) {
+    return arrow::Status::Invalid("a key scan filter on a column outside the scan");
+  }
+  return std::make_shared<KeyScanFilter>(std::move(filter), column);
 }
 
 arrow::Result<std::shared_ptr<const plan::ScanFilter>> MakeScanFilter(
