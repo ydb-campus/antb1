@@ -4,7 +4,9 @@ Date: 2026-10-18
 
 ## Status
 
-Proposed (draft: the measurement below is taken, the design is not built)
+Accepted (E1 and E2 built and measured; E3's entry carries the numbers it was accepted on. A sub-plan the plan
+computes more than once is computed once where it **reduces** and where it reads enough to be worth not reading
+twice; the join-topped and filter-topped cases were measured and **refused**, not deferred.)
 
 ## Context
 
@@ -82,7 +84,9 @@ Proposed (draft: the measurement below is taken, the design is not built)
 
 ## Decision
 
-Draft. What follows is the shape to build and measure, not a decision taken.
+Taken, and narrower than drafted: E3's entry in the Plan records which of these held, which the measurement
+changed, and which were refused outright. The bullets below are the shape as designed; the corrections under them
+are what was built.
 
 - **Share after the passes, not before.** Identical sub-plans are found once the optimizer's passes are done, and
   the sharing is a physical-planning decision. That answers C8's objection without paying it: every pass keeps
@@ -185,6 +189,44 @@ One PR per id.
       now reports eight queries rather than nine. Serving that shape needs a union schema and a rewrite of the
       members, which is the cost this design exists to avoid.
 - **E3, docs(adr): record what E1 and E2 measured**, and either accept this ADR or defer it with the numbers.
+  - Update (2026-10-19, E3): **accepted, on 0.980x of the 22 and one second bought with 56 MB.**
+  - **The measurement this ADR made its own acceptance turn on.** The Consequences say "the measurement has to
+    report peak memory beside time, since trading 1.0 s for a gigabyte is not obviously a win at SF 100". On the
+    one query that shares, at SF 100 and 14 threads:
+
+    | | time | peak memory |
+    | --- | ---: | ---: |
+    | recomputed | 2.125 s | 244 MB |
+    | **shared** | **1.11 s** | **300 MB** |
+
+    So **1.02 seconds for 56 MB** -- against the gigabyte this ADR named as the price at which the trade stops
+    being obvious, about eighteen times the wrong side of it. That is the number the acceptance rests on, and it
+    was nearly not taken: E2 shipped having measured the shared result's *rows* and not the query's peak.
+  - **What the whole ADR is worth**: 0.980x of the 22, Q15 at 0.521x, and the other 21 together at 0.9967, which
+    is this harness's noise. E1 contributes no time at all -- it reports -- so the figure is E2's and the ADR's
+    alike.
+  - **Accepted as built, which is narrower than it was drafted**, and every narrowing is a measurement:
+    - **only an aggregate-topped sub-plan is shared**, because a join-topped one was 0.937x while holding 269 MB
+      and another was 1.017x, slower than recomputing it;
+    - **and only where it reads enough to be worth not reading twice**, because materialising something cheap and
+      scanning it twice costs more than redoing it;
+    - **Q21 is refused though it is the largest duplication in the workload**, because ADR 0029's dynamic filters
+      prune its two consumers differently and one shared result cannot carry both.
+  - **What is out is out on evidence, not pending.** Filter-topped sub-plans, scan sharing, filter subsumption and
+    a union schema for members whose outputs do not nest are all recorded above with the reason. None is a
+    half-finished item; each would need its own measurement to reopen.
+  - **Three lessons worth more than the 2%**, and all three are about plans rather than about this feature:
+    - **A cost gate needs to ask two questions, not one.** "Is the result small enough to hold" is the easy half;
+      "is the work worth avoiding" is the half that decides, and this ADR specified both while the first
+      implementation had only one.
+    - **A mechanism's prize can belong to another mechanism.** Q21 duplicates real work that it is a *mistake* to
+      remove, because a pruning mechanism downstream already handles it two different ways. Nothing in either ADR
+      predicted an interaction of that shape, and the next plan that layers two mechanisms over the same rows
+      should look for one.
+    - **The expected cost did not materialise.** The DAG, the rewritten column indices and the reference-counted
+      release were all argued for at length and none was needed: sharing a `shared_ptr<Table>` between two scans
+      is the whole mechanism. [ADR 0022](0022-joins-and-query-blocks.md)'s C8 deferred this work on the DAG
+      objection, and the objection was answerable by not building a DAG.
 
 Deliberately out of scope: `WITH RECURSIVE` and `MATERIALIZED`, both of which the binder refuses today (ADR 0022);
 sharing across statements; and making the optimizer's passes DAG-aware, which the first decision above exists to
