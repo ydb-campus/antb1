@@ -28,6 +28,7 @@
 #include "antb1/plan/types.h"
 
 #include "double_key.h"
+#include "grouped_sum_alias.h"
 
 namespace antb1::exec {
 namespace {
@@ -156,6 +157,15 @@ arrow::Result<std::unique_ptr<GroupTable>> GroupTable::Make(
     }
     key_types.emplace_back(plan::ToArrow(key.type));
   }
+  // A SUM and an AVG over one column hold the same sums and counts, so the second of them reads
+  // the first's accumulator instead of adding every row again (grouped_sum_alias.h). The state is
+  // still made first, so the result-type check every call gets does not move.
+  struct Summed {
+    int column = 0;
+    plan::LogicalType type;
+    std::size_t state = 0;
+  };
+  std::vector<Summed> summed;
   for (const plan::AggregateCall& call : table->aggregates_) {
     std::optional<plan::LogicalType> input;
     if (call.arg.has_value()) {
@@ -165,6 +175,22 @@ arrow::Result<std::unique_ptr<GroupTable>> GroupTable::Make(
       input = call.arg->type;
     }
     ARROW_ASSIGN_OR_RAISE(auto state, MakeGroupedAggregateState(call.kind, input, call.type, pool));
+    const bool sums = call.kind == plan::AggKind::kSum || call.kind == plan::AggKind::kAvg;
+    if (sums && call.arg.has_value()) {
+      const auto seen = std::ranges::find_if(summed, [&call](const Summed& other) {
+        return other.column == call.arg->index && other.type == call.arg->type;
+      });
+      if (seen != summed.end()) {
+        if (auto alias =
+                MakeSumAlias(*table->states_[seen->state], call.kind == plan::AggKind::kAvg);
+            alias != nullptr) {
+          state = std::move(alias);
+        }
+      } else {
+        summed.push_back(Summed{
+            .column = call.arg->index, .type = call.arg->type, .state = table->states_.size()});
+      }
+    }
     table->states_.push_back(std::move(state));
   }
   table->kernels_ = std::make_unique<arrow::compute::ExecContext>(pool);
