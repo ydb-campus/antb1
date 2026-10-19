@@ -802,6 +802,13 @@ docs/sql-subset.md sections it changes.
   duplication is of sub-plans whatever syntax made them, and materialising CTEs alone would miss two of the three.
   The objection about shared nodes stands and is what makes ADR 0030 share *after* the passes rather than teach
   them about DAGs.
+  Update (2026-10-19): **and after the passes no DAG was needed either, which is worth knowing because this
+  bullet deferred the work on that objection.** ADR 0030 is accepted and shipped, and the mechanism is that each
+  reference becomes its **own** `ScanNode` over **one shared** `plan::Table` object, carrying its own column ids.
+  `ScanNode::table` was already a `shared_ptr<Table>`, so the plan stays a tree, no pass meets a shared node, and
+  the column indices above a consumer are not rewritten. The objection was answerable by not building a DAG at
+  all -- so a deferral resting on "every optimizer pass would have to become aware of shared nodes" was resting on
+  a cost the design never had to pay.
 - **Build-side output now** (right outer, right semi and right anti joins, which build on the preserved side): they
   need matched flags and a source that runs after the probe pipeline. DuckDB builds on the preserved side when it is
   the smaller one, but building on the side that is not preserved is correct, so this is performance only. Deferred
