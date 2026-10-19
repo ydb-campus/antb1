@@ -325,8 +325,12 @@ class GroupedTemporalAvg final : public GroupedAggregateState {
   std::vector<std::int64_t> counts_;
 };
 
-Int128 HugeIntAt(const arrow::Decimal128Array& values, std::int64_t row) {
-  const arrow::Decimal128 value(values.GetValue(row));
+// The unscaled value of row `row` of a decimal128 values buffer: Arrow stores them as 16
+// contiguous bytes a row, which is what arrow::Decimal128's byte constructor reads. The buffer's
+// base is taken once by the caller rather than per row, since Decimal128Array::GetValue redoes the
+// array's offset arithmetic on every call.
+Int128 HugeIntAt(const std::uint8_t* base, std::size_t row) {
+  const arrow::Decimal128 value(base + (row * sizeof(Int128)));
   const UInt128 bits =
       (static_cast<UInt128>(static_cast<std::uint64_t>(value.high_bits())) << 64U) |
       static_cast<UInt128>(value.low_bits());
@@ -353,14 +357,36 @@ class GroupedHugeIntSum final : public GroupedAggregateState {
     }
     ARROW_RETURN_NOT_OK(CheckRows(values, plan::ToArrow(input_).get(), ids, num_groups()));
     const auto& decimals = static_cast<const arrow::Decimal128Array&>(*values);
-    for (std::size_t i = 0; i < ids.size(); ++i) {
-      const auto row = static_cast<std::int64_t>(i);
-      if (decimals.IsNull(row)) {
-        continue;
-      }
-      ARROW_RETURN_NOT_OK(Add(ids[i], HugeIntAt(decimals, row), 1));
+    // Nothing to add. Also the one case where the array is allowed to carry no values buffer, so
+    // the base below would be null: the loop would skip every row and never read it, which makes
+    // this a guard that states the case rather than one an answer depends on.
+    if (ids.empty() || decimals.null_count() == decimals.length()) {
+      return arrow::Status::OK();
     }
-    return arrow::Status::OK();
+    // One overflow test for the batch rather than one per row. __builtin_add_overflow leaves a
+    // defined wrapped sum and reports whether it wrapped, so collecting that in a flag and failing
+    // after the loop says exactly what failing inside it said -- the message names no row or value
+    // -- while the loop keeps no branch to an error and builds no arrow::Status per row. The
+    // declared width cannot rule an overflow out instead: a file may hold a decimal128 outside its
+    // column's precision and the scan does not narrow it (see compute.cc's DecimalOperand), so only
+    // the addition itself knows.
+    const std::uint8_t* const base = decimals.GetValue(0);
+    bool overflow = false;
+    if (decimals.null_count() == 0) {
+      for (std::size_t i = 0; i < ids.size(); ++i) {
+        overflow |= AddAt(ids[i], base, i);
+      }
+    } else {
+      // A separate loop so a column with no nulls pays no validity test per row, as KeyHashes
+      // splits them for the same reason (group_table.cc).
+      for (std::size_t i = 0; i < ids.size(); ++i) {
+        if (decimals.IsNull(static_cast<std::int64_t>(i))) {
+          continue;
+        }
+        overflow |= AddAt(ids[i], base, i);
+      }
+    }
+    return overflow ? Overflowed() : arrow::Status::OK();
   }
   arrow::Status MergeGroups(const GroupedAggregateState& other, GroupIds from,
                             GroupIds to) override {
@@ -387,11 +413,25 @@ class GroupedHugeIntSum final : public GroupedAggregateState {
   }
 
  private:
+  // Row `row` of a decimal128 buffer into `group`: true when the sum wrapped, which the caller
+  // collects for the whole batch. Callers use `|=` rather than `||` because short-circuiting puts
+  // back the per-row branch this is here to remove; either spelling answers the same, since a batch
+  // that sets the flag fails and its sums are discarded.
+  [[nodiscard]] bool AddAt(std::uint32_t group, const std::uint8_t* base, std::size_t row) {
+    ++counts_[group];
+    return __builtin_add_overflow(sums_[group], HugeIntAt(base, row), &sums_[group]);
+  }
+
+  [[nodiscard]] arrow::Status Overflowed() const {
+    return arrow::Status::ExecutionError(average_ ? "AVG" : "SUM", " overflow: the sum of a ",
+                                         plan::ToString(input_), " column exceeds 128 bits");
+  }
+
+  // A merge folds one value per group, not per row, so it keeps the checked form.
   arrow::Status Add(std::uint32_t group, Int128 value, std::int64_t count) {
     const auto next = CheckedAdd(sums_[group], value);
     if (!next.has_value()) {
-      return arrow::Status::ExecutionError(average_ ? "AVG" : "SUM", " overflow: the sum of a ",
-                                           plan::ToString(input_), " column exceeds 128 bits");
+      return Overflowed();
     }
     sums_[group] = *next;
     counts_[group] += count;

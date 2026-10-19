@@ -530,6 +530,90 @@ TEST_F(GroupedAggregateTest, HugeIntSumIsCheckedAgainstTheRange) {
   EXPECT_TRUE(a->Merge(*b, kFirst).IsExecutionError());
 }
 
+// A batch reports an overflow once, after its rows, rather than at the row that overflowed: the
+// two cases that distinguishes are an overflow with rows still to come, and one a later addition
+// wraps back out of. Both failed at the overflowing row before and must fail now.
+TEST_F(GroupedAggregateTest, AnOverflowAnywhereInABatchFailsTheBatch) {
+  const auto huge_ints = [](const std::vector<std::string>& values) {
+    arrow::Decimal128Builder builder(plan::ToArrow(LogicalType::kHugeInt));
+    for (const auto& v : values) {
+      EXPECT_TRUE(builder.Append(arrow::Decimal128(v)).ok());
+    }
+    return builder.Finish().ValueOrDie();
+  };
+  const std::string big = "99999999999999999999999999999999999999";  // 10^38 - 1
+  const Call call{
+      .kind = AggKind::kSum, .input = LogicalType::kHugeInt, .result = LogicalType::kHugeInt};
+
+  // Overflows at row 1 of 6, so five rows follow it and the flag has to survive them.
+  auto early = MakeGrouped(call);
+  early->Resize(1);
+  constexpr auto kSix = std::to_array<std::uint32_t>({0, 0, 0, 0, 0, 0});
+  EXPECT_TRUE(
+      early->Consume(huge_ints({big, big, "1", "1", "1", "1"}).get(), kSix).IsExecutionError());
+
+  // Overflows at row 1 and comes back inside 128 bits at row 3: the sum looks ordinary by the end
+  // of the batch, and the batch must still fail.
+  auto wrapped = MakeGrouped(call);
+  wrapped->Resize(1);
+  constexpr auto kFour = std::to_array<std::uint32_t>({0, 0, 0, 0});
+  const std::string minus_big = "-" + big;
+  auto status = wrapped->Consume(huge_ints({big, big, minus_big, minus_big}).get(), kFour);
+  EXPECT_TRUE(status.IsExecutionError()) << status.ToString();
+  EXPECT_EQ(status.message(), "SUM overflow: the sum of a HUGEINT column exceeds 128 bits");
+}
+
+// The loop a column with no nulls takes and the loop a column with nulls takes must agree on the
+// rows they both hold: the two are separate so that the first pays no validity test per row.
+TEST_F(GroupedAggregateTest, TheNullFreeAndNullBearingLoopsAgree) {
+  const auto decimals = [](const std::vector<std::optional<std::string>>& values) {
+    arrow::Decimal128Builder builder(plan::ToArrow(LogicalType::Decimal(15, 2)));
+    for (const auto& v : values) {
+      EXPECT_TRUE(
+          (v.has_value() ? builder.Append(arrow::Decimal128(*v)) : builder.AppendNull()).ok());
+    }
+    return builder.Finish().ValueOrDie();
+  };
+  const Call call{.kind = AggKind::kSum,
+                  .input = LogicalType::Decimal(15, 2),
+                  .result = LogicalType::Decimal(LogicalType::kMaxDecimalWidth, 2)};
+  constexpr auto kIds = std::to_array<std::uint32_t>({0, 1, 0, 1});
+
+  auto dense = MakeGrouped(call);  // no nulls: null_count() == 0
+  dense->Resize(2);
+  ASSERT_TRUE(dense->Consume(decimals({"100", "200", "300", "400"}).get(), kIds).ok());
+
+  // The same values with a fifth row that is NULL, so the column reports nulls and the other loop
+  // runs; the NULL goes to its own group, which then has no values at all.
+  auto sparse = MakeGrouped(call);
+  sparse->Resize(3);
+  constexpr auto kIdsWithNull = std::to_array<std::uint32_t>({0, 1, 0, 1, 2});
+  ASSERT_TRUE(
+      sparse->Consume(decimals({"100", "200", "300", "400", std::nullopt}).get(), kIdsWithNull)
+          .ok());
+
+  const auto dense_out = Finalized(*dense);
+  const auto sparse_out = Finalized(*sparse);
+  ASSERT_NE(dense_out, nullptr);
+  ASSERT_NE(sparse_out, nullptr);
+  EXPECT_TRUE(dense_out->Equals(*sparse_out->Slice(0, 2))) << dense_out->ToString() << "\nagainst\n"
+                                                           << sparse_out->ToString();
+  EXPECT_TRUE(sparse_out->IsNull(2)) << "a group of only NULLs sums to NULL";
+
+  // A column of nothing but NULLs: every group must be NULL rather than zero. This pins the
+  // answer, not the early return that skips such a column -- dropping that return changes nothing
+  // observable, since the null-bearing loop skips every row of it anyway.
+  auto all_null = MakeGrouped(call);
+  all_null->Resize(2);
+  ASSERT_TRUE(
+      all_null
+          ->Consume(decimals({std::nullopt, std::nullopt, std::nullopt, std::nullopt}).get(), kIds)
+          .ok());
+  const auto empty_out = Finalized(*all_null);
+  ASSERT_NE(empty_out, nullptr);
+  EXPECT_EQ(empty_out->null_count(), 2) << empty_out->ToString();
+}
+
 // ---- GroupAggregateOperator ----
 
 std::shared_ptr<arrow::RecordBatch> Rows(const std::vector<std::optional<std::int64_t>>& keys,
