@@ -1058,25 +1058,6 @@ OperatorResult Build(const plan::LogicalNodePtr& node, std::optional<int64_t> pa
 // than materialising it and scanning it twice; the one that pays reads 600,037,902.
 constexpr int64_t kMinSharedRows = 10'000'000;
 
-// And the second: the most a shared result may hold, since a sub-plan computed once is held until
-// the query ends. The budget is charged for what actually arrives, so this is the predicted bound
-// rather than the real one.
-constexpr int64_t kMaxSharedBytes = int64_t{256} * 1024 * 1024;
-
-// A guess at a row's bytes from the schema, for the gate alone: a VARCHAR counts as this many,
-// since its real width is not in the type. Never an answer and never a reservation -- what is
-// actually held is charged to MemoryBudget as it arrives.
-constexpr int64_t kVarcharBytes = 32;
-
-int64_t RowBytes(const arrow::Schema& schema) {
-  int64_t bytes = 0;
-  for (const auto& field : schema.fields()) {
-    const int bit_width = field->type()->bit_width();
-    bytes += bit_width > 0 ? bit_width / 8 : kVarcharBytes;
-  }
-  return bytes;
-}
-
 // The rows the scans under `node` read, which is what sharing it avoids reading twice. Unknown
 // (none) if any of them cannot say, which refuses the group: a sub-plan whose cost cannot be seen
 // is not one to hold a result for.
@@ -1117,7 +1098,7 @@ std::optional<int64_t> InputRows(const plan::LogicalNode& node) {
 // numbers would be worse than recording them, so the join case is gone and ADR 0030 says why.
 // Anything else -- a Filter, a bare Scan -- never qualified: that is how a 379-million-row filtered
 // scan is refused by **shape**, not by an estimate that might be wrong.
-bool WorthSharing(const plan::LogicalNode& node, const arrow::Schema& schema) {
+bool WorthSharing(const plan::LogicalNode& node) {
   const plan::LogicalNode* reducing = nullptr;
   for (const plan::LogicalNode* n = &node; n != nullptr;) {
     if (std::holds_alternative<plan::AggregateNode>(*n) ||
@@ -1135,13 +1116,12 @@ bool WorthSharing(const plan::LogicalNode& node, const arrow::Schema& schema) {
   if (reducing == nullptr) {
     return false;
   }
+  // The result's own size is **not** tested here, and that is deliberate rather than forgotten: the
+  // gate admits a sub-plan because it reduces, and nothing records an aggregate's output
+  // cardinality, so the size is not knowable until the rows arrive.
+  // MaterializedTable::kMaxBytes is the bound, enforced where it can be.
   const std::optional<int64_t> rows = InputRows(node);
-  if (!rows.has_value() || *rows < kMinSharedRows) {
-    return false;
-  }
-  // The result's own bound is the budget's to enforce as rows arrive; this only refuses a schema so
-  // wide that one row of it would already be unreasonable, which no plan of this workload has.
-  return RowBytes(schema) > 0 && RowBytes(schema) <= kMaxSharedBytes;
+  return rows.has_value() && *rows >= kMinSharedRows;
 }
 
 // `root` with every node of `replacements` replaced by its scan of a shared result.
@@ -1191,7 +1171,7 @@ arrow::Result<std::unique_ptr<Operator>> BuildPhysicalPlan(const plan::LogicalPl
     }
     const plan::LogicalNodePtr& widest = group.members[group.widest];
     ARROW_ASSIGN_OR_RAISE(std::unique_ptr<Operator> op, Build(widest, std::nullopt, nullptr));
-    if (!WorthSharing(*widest, *op->output_schema())) {
+    if (!WorthSharing(*widest)) {
       continue;
     }
     auto table = std::make_shared<MaterializedTable>(op->output_schema());

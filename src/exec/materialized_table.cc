@@ -60,11 +60,21 @@ arrow::Status MaterializedTable::Append(std::shared_ptr<arrow::RecordBatch> batc
     return arrow::Status::OK();
   }
   const std::scoped_lock lock(mutex_);
+  const int64_t bytes = memory_.bytes() + BytesOf(*batch);
+  if (bytes > kMaxBytes) {
+    // Named, so that a reader of the failure knows which mechanism caused it and that turning it
+    // off is a possibility. Sharing cannot be abandoned here -- the consumers are already built to
+    // scan this table and have no sub-plan left to recompute from -- so a result past the cap is a
+    // failure rather than a fallback, which is the honest cost of deciding to share before the size
+    // is knowable.
+    return arrow::Status::OutOfMemory(
+        "a shared sub-plan produced more than ", kMaxBytes,
+        " bytes, which is the most one is held for (docs/adr/0030-shared-sub-plans.md)");
+  }
   // Absolute, as MemoryReservation::Resize is: the running total plus this batch. A refusal leaves
-  // the reservation and the rows as they were and fails the query, which is the loud failure a
-  // shared result that outgrew its estimate should have (ADR 0026: memory is what broke this
-  // workload before).
-  ARROW_RETURN_NOT_OK(memory_.Resize(memory_.bytes() + BytesOf(*batch)));
+  // the reservation and the rows as they were (ADR 0026: memory is what broke this workload
+  // before).
+  ARROW_RETURN_NOT_OK(memory_.Resize(bytes));
   rows_ += batch->num_rows();
   batches_.push_back(std::move(batch));
   return arrow::Status::OK();
@@ -92,12 +102,19 @@ std::optional<int64_t> MaterializedTable::exact_row_count() const {
 
 arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> MaterializedTable::DoScan(
     const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* /*pool*/) const {
-  const std::scoped_lock lock(mutex_);
-  if (!filled_) {
-    // The operator that owns this fills it before it opens the consumers, so this cannot happen
-    // from a plan the planner built -- and if it ever did, reading no rows would be a wrong answer
-    // rather than an error, which is the one outcome worth refusing outright.
-    return arrow::Status::Invalid("a shared sub-plan was read before it was computed");
+  // The batches are taken under the lock and sliced outside it: filling is over before any scan
+  // starts, so this only publishes the handover, and holding it through the slicing would serialise
+  // consumers that open at the same time -- which the ones this exists for do.
+  arrow::RecordBatchVector batches;
+  {
+    const std::scoped_lock lock(mutex_);
+    if (!filled_) {
+      // The operator that owns this fills it before it opens the consumers, so this cannot happen
+      // from a plan the planner built -- and if it ever did, reading no rows would be a wrong
+      // answer rather than an error, which is the one outcome worth refusing outright.
+      return arrow::Status::Invalid("a shared sub-plan was read before it was computed");
+    }
+    batches = batches_;  // the shared_ptrs, not the rows
   }
   arrow::FieldVector out_fields;
   out_fields.reserve(fields.size());
@@ -109,7 +126,7 @@ arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> MaterializedTable::DoSc
   }
   auto out_schema = arrow::schema(std::move(out_fields));
   arrow::RecordBatchVector out;
-  for (const std::shared_ptr<arrow::RecordBatch>& batch : batches_) {
+  for (const std::shared_ptr<arrow::RecordBatch>& batch : batches) {
     for (int64_t start = 0; start < batch->num_rows(); start += batch_size) {
       const std::shared_ptr<arrow::RecordBatch> slice = batch->Slice(start, batch_size);
       arrow::ArrayVector columns;
