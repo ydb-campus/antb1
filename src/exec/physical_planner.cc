@@ -523,9 +523,9 @@ std::vector<int> ReadFields(const plan::ScanNode& scan, const LateScan* late) {
 // D1).
 constexpr int64_t kFilterBuildShare = 16;
 
-// The key filter of the innermost join of this part pipeline, over the position of the probe key
-// in `scan`'s field list, for the scan to reject rows that can match nothing (ADR 0029's D1); none
-// when no join of the pipeline offers one this scan can apply. The conditions, in order:
+// What a scan of this part pipeline may be filtered by: the key filter the innermost join's build
+// published, and the position of the probe key in `scan`'s field list; none when no join of the
+// pipeline offers one this scan can apply. The conditions, in order:
 //
 //   - only the innermost join is a candidate. The chain from any other one's probe input passes
 //     through a join, which prepends the other side's width, so a column index above it is not a
@@ -536,14 +536,22 @@ constexpr int64_t kFilterBuildShare = 16;
 //     excluded outright: it answers from the whole set, not row by row.
 //   - one key, whose column maps to a field of the scan through FilterNodes alone (a Compute
 //     appends, a Project reorders), and whose type the build hashed and a scan decodes the same.
-//   - the build must have published a filter (its keys may not be hashable, or it may not have
-//     fit the budget), and the table must support a scan filter at all over the fields it reads.
+//   - the build must have published a filter: its keys may not be hashable, or it may not have fit
+//     the budget.
+//
+// These are the conditions on the *rows* the join can be asked about, so both halves of ADR 0029
+// share them: the per-row test (D1, KeyScanOf) and the part test (D2, PartHasNoKey), which then
+// require different things of the scan itself.
 //
 // Called per part, from the part's own pipeline build, which is why the build has already finished
 // and `key_filter()` is there to read (hash_join.cc's PrepareBuilds).
-std::optional<TableScanOperator::KeyScan> KeyScanOf(const plan::ScanNode& scan,
-                                                    const PipelineBuilds* builds,
-                                                    const std::optional<LateScan>& late) {
+struct ProbeKey {
+  const JoinBuild* build = nullptr;  // its key_filter() is published and not null
+  int column = 0;                    // a position in scan.fields, of the probe's one key
+};
+
+std::optional<ProbeKey> ProbeKeyOf(const plan::ScanNode& scan, const PipelineBuilds* builds,
+                                   const std::optional<LateScan>& late) {
   if (builds == nullptr || builds->joins.empty() || builds->builds.empty() || late.has_value()) {
     return std::nullopt;  // a narrow scan reads other fields: its indices are the late scan's
   }
@@ -579,9 +587,19 @@ std::optional<TableScanOperator::KeyScan> KeyScanOf(const plan::ScanNode& scan,
       return std::nullopt;
     }
   }
-  if (build->key_filter() == nullptr ||
-      !scan.table->supports_scan_filter(ReadFields(scan, nullptr))) {
+  if (build->key_filter() == nullptr) {
     return std::nullopt;
+  }
+  return ProbeKey{.build = build.get(), .column = column};
+}
+
+// Whether `scan` can reject rows with the build's filter, row by row as it decodes them (ADR
+// 0029's D1). Beyond ProbeKeyOf's conditions this needs the table to support a scan filter at all
+// over the fields it reads, and the build to be small enough that the filter's own cost is worth
+// paying.
+bool CanFilterRows(const plan::ScanNode& scan, const ProbeKey& key) {
+  if (!scan.table->supports_scan_filter(ReadFields(scan, nullptr))) {
+    return false;
   }
   // The build must be small against what it filters, or the filter holds so many keys that it
   // rejects nothing and the probe pays the hash for it. A build's rows are an upper bound on its
@@ -590,13 +608,58 @@ std::optional<TableScanOperator::KeyScan> KeyScanOf(const plan::ScanNode& scan,
   // an optimisation. Measured: the four queries this helps build 0.01 to 0.02 of their probe's
   // rows, and the one it cost 14% builds 0.25 of them (every key of the probe's domain), so the
   // share separates them by an order of magnitude either way.
-  const std::shared_ptr<const JoinTable>& table = build->table();
+  const std::shared_ptr<const JoinTable>& table = key.build->table();
   const std::optional<int64_t> probe_rows = scan.table->exact_row_count();
-  if (table == nullptr || !probe_rows.has_value() ||
-      table->num_rows() > *probe_rows / kFilterBuildShare) {
+  return table != nullptr && probe_rows.has_value() &&
+         table->num_rows() <= *probe_rows / kFilterBuildShare;
+}
+
+// Whether part `part` of `scan` holds no key the innermost join's build published, so that it
+// matches nothing and need not be read at all: no open, no decode, no filtering (ADR 0029's D2).
+//
+// It asks less of the scan than the per-row filter does, and deliberately so. A part that is never
+// read needs no filtered decoder, so `supports_scan_filter` is beside the point; it takes none of
+// the single filter slot, so a scan that already pushes static predicates can still be skipped; and
+// the test costs one binary search whether it prunes or not, so the build's share of the probe --
+// which bounds the per-row filter's cost -- has nothing to say about it either.
+//
+// Statistics the table does not have never prune. A part whose key column is entirely NULL always
+// does: a NULL key matches nothing on either side, which is the answer the join gives anyway and is
+// why the build published no NULL key to test against.
+bool PartHasNoKey(const plan::ScanNode& scan, const ProbeKey& key, int64_t part) {
+  if (!key.build->key_filter()->prunes_parts()) {
+    return false;
+  }
+  const std::optional<plan::PartStats> stats =
+      scan.table->part_stats(part, scan.fields[static_cast<std::size_t>(key.column)]);
+  if (!stats.has_value() || stats->rows <= 0) {
+    return false;
+  }
+  if (!stats->min.has_value() || !stats->max.has_value()) {
+    return stats->null_count >= stats->rows;  // every value NULL, so no value to match
+  }
+  return !key.build->key_filter()->MayHoldAKeyIn(*stats->min, *stats->max);
+}
+
+// What a hash join's build says about part `part` of `scan`: both halves of ADR 0029, resolved
+// together because they share every condition on the join (ProbeKeyOf) and differ only in what they
+// then ask of the scan. None when neither applies.
+std::optional<TableScanOperator::KeyScan> KeyScanOf(const plan::ScanNode& scan,
+                                                    const PipelineBuilds* builds,
+                                                    const std::optional<LateScan>& late,
+                                                    int64_t part) {
+  const std::optional<ProbeKey> key = ProbeKeyOf(scan, builds, late);
+  if (!key.has_value()) {
     return std::nullopt;
   }
-  return TableScanOperator::KeyScan{.filter = build->key_filter(), .column = column};
+  const bool no_key = PartHasNoKey(scan, *key, part);
+  const bool rows = CanFilterRows(scan, *key);
+  if (!no_key && !rows) {
+    return std::nullopt;
+  }
+  return TableScanOperator::KeyScan{.filter = rows ? key->build->key_filter() : nullptr,
+                                    .column = key->column,
+                                    .part_has_no_key = no_key};
 }
 
 // One overload per logical node type: a node type without one fails to compile.
@@ -636,17 +699,24 @@ struct Builder {
     const std::optional<LateScan> late_scan =
         late == nullptr ? std::nullopt : std::optional<LateScan>(*late);
     // A dynamic join filter, where this scan is the probe side of a join whose build published one
-    // (ADR 0029's D1). Only here, on a scan with no predicates of its own: a scan takes one filter.
+    // (ADR 0029). The per-row filter is only ever attached here, on a scan with no predicates of
+    // its own, because a scan takes one filter; the part test has no such limit and so is also
+    // attached in the pushdown branch of the FilterNode below.
     std::optional<TableScanOperator::KeyScan> key_scan;
     if (part.has_value()) {
-      key_scan = KeyScanOf(node, builds, late_scan);
+      key_scan = KeyScanOf(node, builds, late_scan, *part);
     }
     Name("Scan");
     // Per part, so a reader can see the filter is in use. It is a metric and not the node's detail
     // because the plan-time build of this pipeline runs before the join's build exists and so
     // carries no filter -- and only that first build may write a name or a detail.
     if (key_scan.has_value() && slot != nullptr) {
-      slot->Max("key_filter", MetricUnit::kCount, 1);
+      if (key_scan->filter != nullptr) {
+        slot->Max("key_filter", MetricUnit::kCount, 1);
+      }
+      if (key_scan->part_has_no_key) {
+        slot->Add("key_pruned", MetricUnit::kCount, 1);
+      }
     }
     return std::make_unique<TableScanOperator>(node.table, node.fields, part, late_scan,
                                                std::vector<plan::Predicate>{}, std::move(key_scan));
@@ -672,13 +742,27 @@ struct Builder {
                                              plan::ExplainNode(*node.input), pushed.size(),
                                              pushed.size() == 1 ? "" : "s"));
         }
-        ARROW_ASSIGN_OR_RAISE(
-            auto input,
-            Profiled(std::make_unique<TableScanOperator>(
-                         scan->table, scan->fields, part,
-                         late == nullptr ? std::nullopt : std::optional<LateScan>(*late),
-                         std::move(pushed)),
-                     node.input, input_slot));
+        const std::optional<LateScan> late_scan =
+            late == nullptr ? std::nullopt : std::optional<LateScan>(*late);
+        // The part test, which these pushed predicates do not stand in the way of: a part no
+        // published key can be in is not read, so it needs neither the filter slot they take nor
+        // the filtered decoder they use (ADR 0029's D2). The per-row filter is dropped, because
+        // they hold the one slot.
+        std::optional<TableScanOperator::KeyScan> key_scan =
+            KeyScanOf(*scan, builds, late_scan, *part);
+        if (key_scan.has_value() && !key_scan->part_has_no_key) {
+          key_scan.reset();
+        }
+        if (key_scan.has_value()) {
+          key_scan->filter = nullptr;
+          if (input_slot != nullptr) {
+            input_slot->Add("key_pruned", MetricUnit::kCount, 1);
+          }
+        }
+        ARROW_ASSIGN_OR_RAISE(auto input, Profiled(std::make_unique<TableScanOperator>(
+                                                       scan->table, scan->fields, part, late_scan,
+                                                       std::move(pushed), std::move(key_scan)),
+                                                   node.input, input_slot));
         return std::make_unique<FilterOperator>(std::move(input), std::move(rest));
       }
     }

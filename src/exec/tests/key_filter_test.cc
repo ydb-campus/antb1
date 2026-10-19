@@ -1,5 +1,7 @@
 #include "antb1/exec/key_filter.h"
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <random>
@@ -7,6 +9,7 @@
 
 #include <gtest/gtest.h>
 
+#include "antb1/common/int128.h"
 #include "antb1/exec/memory_budget.h"
 
 namespace antb1::exec {
@@ -18,6 +21,16 @@ std::vector<std::uint64_t> Hashes(std::size_t count, std::uint64_t seed) {
   std::vector<std::uint64_t> out(count);
   for (std::uint64_t& h : out) {
     h = random();
+  }
+  return out;
+}
+
+// Key values, seeded for the same reason, spread over `range` so that they leave gaps between them.
+std::vector<Int128> Keys(std::size_t count, std::uint64_t seed, std::uint64_t range) {
+  std::mt19937_64 random(seed);
+  std::vector<Int128> out(count);
+  for (Int128& key : out) {
+    key = static_cast<Int128>(random() % range);
   }
   return out;
 }
@@ -97,6 +110,86 @@ TEST(KeyFilterTest, ChargesTheBudgetAndDeclinesWhatItCannotAfford) {
   ASSERT_TRUE(too_big.ok()) << too_big.status().ToString();
   EXPECT_EQ(*too_big, nullptr);
   EXPECT_EQ(budget.bytes_allocated(), before);
+}
+
+// The part test's own version of the property above: a range that holds a published key is never
+// reported empty. A wrong "no" here skips a part of the probe that had matching rows in it, which
+// loses answers silently -- the one failure no benchmark would show.
+TEST(KeyFilterTest, NeverRulesOutARangeHoldingAKey) {
+  auto filter = KeyFilter::Make(500, nullptr);
+  ASSERT_TRUE(filter.ok()) << filter.status().ToString();
+  ASSERT_NE(*filter, nullptr);
+  std::vector<Int128> keys = Keys(500, 20261019, 1000000);
+  (*filter)->PublishKeys(keys, *std::ranges::min_element(keys), *std::ranges::max_element(keys));
+  ASSERT_TRUE((*filter)->prunes_parts());
+  // Every single key, and every range around one, is held.
+  for (const Int128& key : keys) {
+    EXPECT_TRUE((*filter)->MayHoldAKeyIn(key, key)) << static_cast<int64_t>(key);
+    EXPECT_TRUE((*filter)->MayHoldAKeyIn(key - 10, key + 10)) << static_cast<int64_t>(key);
+  }
+  // And every range the keys do leave empty is ruled out, which is the point of publishing them.
+  std::ranges::sort(keys);
+  int64_t ruled_out = 0;
+  for (std::size_t i = 1; i < keys.size(); ++i) {
+    if (keys[i] - keys[i - 1] < 3) {
+      continue;  // no gap between them to test
+    }
+    EXPECT_FALSE((*filter)->MayHoldAKeyIn(keys[i - 1] + 1, keys[i] - 1))
+        << static_cast<int64_t>(keys[i - 1]) << ".." << static_cast<int64_t>(keys[i]);
+    ++ruled_out;
+  }
+  EXPECT_GT(ruled_out, 100) << "a key set this sparse should leave gaps to find";
+  // Outside the interval altogether, on either side.
+  EXPECT_FALSE((*filter)->MayHoldAKeyIn(keys.front() - 100, keys.front() - 1));
+  EXPECT_FALSE((*filter)->MayHoldAKeyIn(keys.back() + 1, keys.back() + 100));
+}
+
+// Above kMaxPublishedKeys the values are not collected, so only the interval is published. It rules
+// out less -- a gap inside it is invisible -- and must still never rule out a range holding a key.
+TEST(KeyFilterTest, FallsBackToTheIntervalWithoutTheValues) {
+  auto filter = KeyFilter::Make(100, nullptr);
+  ASSERT_TRUE(filter.ok()) << filter.status().ToString();
+  ASSERT_NE(*filter, nullptr);
+  (*filter)->PublishKeys({}, 100, 200);
+  EXPECT_TRUE((*filter)->prunes_parts());
+  EXPECT_FALSE((*filter)->MayHoldAKeyIn(0, 99));
+  EXPECT_FALSE((*filter)->MayHoldAKeyIn(201, 1000));
+  EXPECT_TRUE((*filter)->MayHoldAKeyIn(100, 100));
+  EXPECT_TRUE((*filter)->MayHoldAKeyIn(200, 200));
+  EXPECT_TRUE((*filter)->MayHoldAKeyIn(0, 100));
+  EXPECT_TRUE((*filter)->MayHoldAKeyIn(200, 1000));
+  EXPECT_TRUE((*filter)->MayHoldAKeyIn(0, 1000));
+  EXPECT_TRUE((*filter)->MayHoldAKeyIn(140, 160)) << "the interval cannot see a gap inside itself";
+}
+
+// A filter nothing was published to rules out no part at all, which is how a build whose keys are
+// not integers in the engine's domain leaves the probe exactly as it is.
+TEST(KeyFilterTest, RulesOutNoPartWithoutPublishedKeys) {
+  auto filter = KeyFilter::Make(100, nullptr);
+  ASSERT_TRUE(filter.ok()) << filter.status().ToString();
+  ASSERT_NE(*filter, nullptr);
+  EXPECT_FALSE((*filter)->prunes_parts());
+  EXPECT_TRUE((*filter)->MayHoldAKeyIn(0, 0));
+  EXPECT_TRUE((*filter)->MayHoldAKeyIn(kInt128Min, kInt128Max));
+}
+
+// The values are charged on top of the bits, and given back with them.
+TEST(KeyFilterTest, ChargesThePublishedValues) {
+  MemoryBudget budget(1024 * 1024);
+  const int64_t before = budget.bytes_allocated();
+  auto filter = KeyFilter::Make(1000, &budget);
+  ASSERT_TRUE(filter.ok()) << filter.status().ToString();
+  ASSERT_NE(*filter, nullptr);
+  const int64_t bits = (*filter)->bytes();
+  std::vector<Int128> keys(1000);
+  for (std::size_t i = 0; i < keys.size(); ++i) {
+    keys[i] = static_cast<Int128>(i);
+  }
+  (*filter)->PublishKeys(keys, 0, 999);
+  EXPECT_EQ((*filter)->bytes(), bits + (1000 * static_cast<int64_t>(sizeof(Int128))));
+  EXPECT_GE(budget.bytes_allocated(), before + (*filter)->bytes());
+  (*filter).reset();
+  EXPECT_EQ(budget.bytes_allocated(), before) << "the reservation outlived the filter";
 }
 
 }  // namespace

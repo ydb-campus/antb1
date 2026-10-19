@@ -3,11 +3,13 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <vector>
 
 #include <arrow/result.h>
 
+#include "antb1/common/int128.h"
 #include "antb1/exec/memory_budget.h"
 
 namespace antb1::exec {
@@ -43,6 +45,13 @@ class KeyFilter {
   // build holds a sixth of its probe's keys -- so the boundary is between them, and this is the
   // conservative side of it.
   static constexpr int64_t kMaxBytes = int64_t{16} * 1024 * 1024;
+
+  // The most keys published as values beside the bits (D2). A part's range is tested against them
+  // with one binary search, which is free whether it prunes anything or not, so what has to be
+  // bounded is the publication rather than the test: at this cap the sort is of the order of a
+  // millisecond and the array a megabyte, against a build that has by then copied every column of
+  // 65,536 rows. Above it only the interval is published, which costs nothing to collect.
+  static constexpr int64_t kMaxPublishedKeys = int64_t{64} * 1024;
 
   // A filter sized for `num_keys` of them, every bit clear, charged to `budget` (nullptr: no
   // budget). Null -- not an error -- when `num_keys` is not positive or when the filter would not
@@ -80,6 +89,31 @@ class KeyFilter {
   // caller knows every hash of its batch before it tests the first, so it can ask for the line of a
   // later row now. ADR 0019 measured the same hint on a hash bucket at 44.16 ns a row to 20.14.
   void Prefetch(std::uint64_t hash) const { __builtin_prefetch(BlockOf(hash)); }
+
+  // Publishes the build's key *values*, which answer a coarser question than the bits do: not "can
+  // this row match" but "can this part of the probe's scan hold anything that matches", asked
+  // before a part is read at all (D2). `keys` must hold no NULL -- a NULL key matches nothing, so
+  // the join drops such a row anyway -- and need not be sorted; empty with a `min` and `max` says
+  // there were more than kMaxPublishedKeys of them and leaves the interval as the whole of what is
+  // published.
+  //
+  // The values are charged to the same reservation as the bits, and if that cannot be afforded the
+  // interval is published alone: a filter that skips fewer parts is slower, never wrong.
+  //
+  // Called once, on the thread that filled the bits, before any probe reads the filter.
+  void PublishKeys(std::vector<Int128> keys, const Int128& min, const Int128& max);
+
+  // Whether a part whose key column runs from `min` to `max` may hold a published key. False means
+  // it certainly holds none, so the part matches nothing and need not be read: no open, no decode,
+  // no filtering (D2). True whenever nothing was published, which skips nothing.
+  //
+  // The published values answer this strictly more often than their interval does -- that is the
+  // whole point of publishing them, since a build whose keys are scattered has an interval covering
+  // every part -- so the interval is only consulted when the values are not there.
+  [[nodiscard]] bool MayHoldAKeyIn(const Int128& min, const Int128& max) const;
+
+  // Whether any part can be ruled out at all: whether PublishKeys was called with anything.
+  [[nodiscard]] bool prunes_parts() const { return key_range_.has_value(); }
 
   // The keys it was sized for, and its bytes.
   [[nodiscard]] int64_t keys() const { return keys_; }
@@ -119,6 +153,18 @@ class KeyFilter {
   std::uint64_t block_mask_ = 0;      // blocks - 1
   int64_t keys_ = 0;
   MemoryReservation memory_;
+
+  // The interval over the published keys. One optional and not two, so that holding it is one
+  // question with one answer: empty says PublishKeys was never called, which is a filter that rules
+  // out no part.
+  struct KeyRange {
+    Int128 min;
+    Int128 max;
+  };
+  std::optional<KeyRange> key_range_;
+  // The published key values, sorted; empty when there were too many to publish or no room for
+  // them, and then the interval is all a part is tested against.
+  std::vector<Int128> key_values_;
 };
 
 }  // namespace antb1::exec

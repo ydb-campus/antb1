@@ -1,5 +1,6 @@
 #include "antb1/exec/key_filter.h"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstddef>
@@ -8,6 +9,7 @@
 #include <optional>
 #include <span>
 #include <utility>
+#include <vector>
 
 #include "antb1/common/check.h"
 #include "antb1/common/narrow.h"
@@ -57,6 +59,37 @@ void KeyFilter::Add(std::span<const std::uint64_t> hashes) {
   for (const std::uint64_t hash : hashes) {
     Add(hash);
   }
+}
+
+void KeyFilter::PublishKeys(std::vector<Int128> keys, const Int128& min, const Int128& max) {
+  key_range_ = KeyRange{.min = min, .max = max};
+  if (keys.empty()) {
+    return;  // the interval alone: above kMaxPublishedKeys the values were never collected
+  }
+  // Charged on top of the bits, which the reservation already holds. A refusal here keeps the old
+  // reservation (MemoryReservation::Resize), so dropping the values is all that is needed: the
+  // interval still prunes, and a filter that prunes fewer parts is slower and never wrong.
+  const int64_t bytes =
+      memory_.bytes() + (Narrow<int64_t>(keys.size()) * Narrow<int64_t>(sizeof(Int128)));
+  if (!memory_.Resize(bytes).ok()) {
+    return;
+  }
+  std::ranges::sort(keys);
+  key_values_ = std::move(keys);
+}
+
+bool KeyFilter::MayHoldAKeyIn(const Int128& min, const Int128& max) const {
+  if (!key_range_.has_value()) {
+    return true;  // nothing published: this filter rules out no part
+  }
+  if (!key_values_.empty()) {
+    // The first key at or after the part's lowest value; the part holds it when it is also at or
+    // before the part's highest. One binary search a part, which is why publishing the values is
+    // worth it even when they rule out nothing.
+    const auto key = std::ranges::lower_bound(key_values_, min);
+    return key != key_values_.end() && *key <= max;
+  }
+  return max >= key_range_->min && min <= key_range_->max;
 }
 
 }  // namespace antb1::exec

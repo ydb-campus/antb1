@@ -203,6 +203,55 @@ arrow::Result<RowHashes> HashRows(std::span<const std::shared_ptr<arrow::Array>>
   return RowHashes{.hashes = std::move(hashes), .compact = true};
 }
 
+// Widens [min, max] over the values of `array` and appends them to `values` when it is not null.
+template <class ArrayType>
+void CollectValues(const arrow::Array& array, std::vector<Int128>* values,
+                   std::optional<Int128>& min, std::optional<Int128>& max) {
+  const auto& typed = static_cast<const ArrayType&>(array);
+  for (int64_t row = 0; row < typed.length(); ++row) {
+    if (typed.IsNull(row)) {
+      continue;  // AppendNullKeys keeps NULL-keyed rows out of the pieces; skipped, not trusted
+    }
+    const Int128 value = typed.Value(row);
+    if (!min.has_value() || value < *min) {
+      min = value;
+    }
+    if (!max.has_value() || value > *max) {
+      max = value;
+    }
+    if (values != nullptr) {
+      values->push_back(value);
+    }
+  }
+}
+
+// The key values of one piece of a build, for KeyFilter::PublishKeys: in the engine's own domain,
+// which is the domain Table::part_stats reports a part's statistics in, because the two are
+// compared directly and nothing converts between them. False for an array whose values are not
+// integers there, which publishes nothing and so rules out no part.
+bool CollectKeyValues(const arrow::Array& keys, std::vector<Int128>* values,
+                      std::optional<Int128>& min, std::optional<Int128>& max) {
+  switch (keys.type_id()) {
+    case arrow::Type::INT16:
+      CollectValues<arrow::Int16Array>(keys, values, min, max);
+      return true;
+    case arrow::Type::UINT16:
+      CollectValues<arrow::UInt16Array>(keys, values, min, max);
+      return true;
+    case arrow::Type::INT32:
+      CollectValues<arrow::Int32Array>(keys, values, min, max);
+      return true;
+    case arrow::Type::INT64:
+      CollectValues<arrow::Int64Array>(keys, values, min, max);
+      return true;
+    case arrow::Type::DATE32:
+      CollectValues<arrow::Date32Array>(keys, values, min, max);
+      return true;
+    default:
+      return false;
+  }
+}
+
 // Calls visit(row, hash) for every row of `mask`, in order.
 template <class Visit>
 void ForEachRowHash(const RowMask& mask, const RowHashes& hashed, const Visit& visit) {
@@ -1130,14 +1179,42 @@ arrow::Result<std::shared_ptr<const KeyFilter>> JoinTableBuilder::MakeKeyFilter(
     return nullptr;  // no keys, or no room: the probe runs as it does without one
   }
   // In part order, though the order cannot matter: setting a bit twice sets it once, so the filter
-  // is the same whatever order the parts arrived in or the merges ran in.
+  // is the same whatever order the parts arrived in or the merges ran in. The key values are
+  // collected in the same walk, and sorting them is PublishKeys's, so their order does not matter
+  // either.
+  //
+  // Only up to kMaxPublishedKeys of them are kept: past that the interval is published alone, which
+  // costs one pass and no memory. The pieces are read for both because they are about to be freed
+  // -- Finish keeps no hash, and the direct layout keeps no key either.
+  const int key_column = spec_->keys().front().index;
+  const bool keep_values = rows <= KeyFilter::kMaxPublishedKeys;
+  std::vector<Int128> values;
+  if (keep_values) {
+    values.reserve(static_cast<std::size_t>(rows));
+  }
+  std::optional<Int128> min;
+  std::optional<Int128> max;
+  bool integer_keys = true;
   for (const std::shared_ptr<const JoinBuildPart>& part : parts_) {
     if (part == nullptr) {
       continue;
     }
     for (const JoinBuildPart::Piece& piece : part->pieces_) {
       filter->Add(piece.hashes);
+      if (!integer_keys || piece.rows == nullptr || key_column < 0 ||
+          key_column >= piece.rows->num_columns()) {
+        integer_keys = false;
+        continue;
+      }
+      integer_keys = CollectKeyValues(*piece.rows->column(key_column),
+                                      keep_values ? &values : nullptr, min, max);
     }
+  }
+  // A part of the probe's scan is ruled out by these (D2). Nothing is published when the keys are
+  // not integers in the engine's domain, or when every one of them was NULL -- a part can only be
+  // compared against a value, and a build of NULL keys alone matches nothing in any case.
+  if (integer_keys && min.has_value() && max.has_value()) {
+    filter->PublishKeys(keep_values ? std::move(values) : std::vector<Int128>{}, *min, *max);
   }
   return filter;
 }
