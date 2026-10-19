@@ -13,6 +13,7 @@ antb1_add_module(
     binder.cc
     logical_plan.cc
     optimizer.cc
+    shared_sub_plans.cc
     explain.cc
   PUBLIC_DEPS common sql
   PUBLIC_LIBS Arrow::arrow_shared
@@ -32,6 +33,7 @@ if(ANTB1_BUILD_TESTS)
       tests/column_ids_test.cc
       tests/folding_test.cc
       tests/optimizer_test.cc
+      tests/shared_sub_plans_test.cc
       tests/explain_test.cc
       tests/logical_plan_test.cc
       tests/sql_status_test.cc

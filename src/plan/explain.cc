@@ -5,6 +5,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <variant>
 #include <vector>
 
@@ -13,6 +14,8 @@
 #include "antb1/plan/catalog.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
+
+#include "shared_sub_plans.h"
 
 namespace antb1::plan {
 namespace {
@@ -184,11 +187,36 @@ struct NodeLine {
   }
 };
 
-void Render(const LogicalNode& node, std::size_t depth, std::string& out) {
-  out += std::string(2 * depth, ' ') + std::visit(NodeLine{}, node) + '\n';
+// Per node that heads a group of equivalent sub-plans, the suffix its line carries.
+using SharedNotes = std::unordered_map<const LogicalNode*, std::string>;
+
+// A note on every member of every group, numbered by the order the groups appear, so that a reader
+// can see that two subtrees compute the same rows and what one shared sub-plan would read
+// (docs/adr/0030-shared-sub-plans.md, E1). Nothing shares anything yet: this reports.
+SharedNotes NotesOf(const LogicalPlan& plan) {
+  SharedNotes notes;
+  int group = 0;
+  for (const SharedSubPlan& shared : SharedSubPlans(plan)) {
+    ++group;
+    for (const LogicalNodePtr& member : shared.members) {
+      notes[member.get()] =
+          std::format("  [shared #{} of {}, {} field{}]", group, shared.members.size(),
+                      shared.fields, shared.fields == 1 ? "" : "s");
+    }
+  }
+  return notes;
+}
+
+void Render(const LogicalNode& node, std::size_t depth, const SharedNotes& notes,
+            std::string& out) {
+  out += std::string(2 * depth, ' ') + std::visit(NodeLine{}, node);
+  if (const auto note = notes.find(&node); note != notes.end()) {
+    out += note->second;
+  }
+  out += '\n';
   for (const LogicalNodePtr& input : InputsOf(node)) {  // a Join's left input, then its right one
     if (input != nullptr) {
-      Render(*input, depth + 1, out);
+      Render(*input, depth + 1, notes, out);
     }
   }
 }
@@ -208,7 +236,7 @@ std::string ExplainOutput(const LogicalPlan& plan) {
 std::string Explain(const LogicalPlan& plan) {
   std::string out = ExplainOutput(plan) + '\n';
   if (plan.root != nullptr) {
-    Render(*plan.root, 0, out);
+    Render(*plan.root, 0, NotesOf(plan), out);
   }
   return out;
 }

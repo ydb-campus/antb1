@@ -34,6 +34,17 @@ Proposed (draft: the measurement below is taken, the design is not built)
   In every case the smaller column set is a **strict subset** of the larger, so column subsumption is the whole of
   what separates them. **Exact structural equality catches one of this ADR's three motivating queries.** That is
   the question E1 was written to answer, answered by reading plans instead of building it.
+- **Correction (2026-10-19, from E1 as built): there is a fourth, and this ADR dismissed it.** The Context below
+  says Q21 "repeats a scan too, but ... of `lineitem` for genuinely different work". Half of that is wrong. Q21
+  holds **three** references to `lineitem`, and two of them -- the outer one and the one under the anti join --
+  carry the *same* filter over the *same* four fields, so they compute the same rows and E1 groups them. Only the
+  third, the semi join's unfiltered probe, is different work. So the queries with a reducing sub-plan worth
+  materialising are **Q15, Q11, Q2 and Q21**, and Q21 is the largest of the four at SF 100.
+- **E1 also reports five queries that are a scan and nothing more** (Q7, Q8, Q17, Q18, Q22: repeated scans of
+  `nation`, `lineitem` or `customer` with no filter between them). Those are true findings and not false ones --
+  the scans do compute the same rows -- and every one is refused by the cost gate for the reason the Alternatives
+  give: a sub-plan is worth holding when it *reduces*, and a scan does not. They are what tells E1's report apart
+  from E2's decision, which is why the report is a separate item.
 - **And Q15's match is incidental, which is the stronger argument.** Its second reference is a scalar subquery
   taking the maximum of the CTE's revenue column, so it reads that column and **not** the supplier column the
   CTE also outputs -- yet both branches carry a project of both, so the unused one survives into the branch that

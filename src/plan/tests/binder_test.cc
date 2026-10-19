@@ -3671,15 +3671,17 @@ TEST(BinderTest, ASemiJoinOverOneRelationRunsOnItsBranch) {
   // onto its scan and the INNER join probes what the semi join kept.
   EXPECT_EQ(
       plan_of("SELECT COUNT(*) FROM t, ok WHERE t.i16 = ok.i16 AND ok.i16 IN (SELECT i16 FROM t)"),
+      // Both scans of `t` carry E1's note: the query reads it twice, once in the FROM and once in
+      // the subquery, and they read the same field (docs/adr/0030-shared-sub-plans.md).
       "Output: count_star():BIGINT\n"
       "Aggregate COUNT(*)\n"
       "  Join INNER build=right keys=[t.i16 = ok.i16]\n"
-      "    Scan table=t source=fake columns=[i16]\n"
+      "    Scan table=t source=fake columns=[i16]  [shared #1 of 2, 1 field]\n"
       R"(    Join SEMI build=right keys=["ok.i16" = i16])"
       "\n"
       "      Scan table=ok source=fake columns=[i16]\n"
       "      Project i16\n"
-      "        Scan table=t source=fake columns=[i16]\n");
+      "        Scan table=t source=fake columns=[i16]  [shared #1 of 2, 1 field]\n");
   // A subquery join above every join of its block renders before the INNER join; one on a branch
   // renders after it.
   const auto on_top = [&plan_of](std::string_view sql) {
@@ -3745,14 +3747,14 @@ TEST(BinderTest, ASemiJoinOverOneRelationRunsOnItsBranch) {
             "Output: count_star():BIGINT\n"
             "Aggregate COUNT(*)\n"
             "  Join INNER build=right keys=[t.i16 = ok.i16]\n"
-            "    Scan table=t source=fake columns=[i16]\n"
+            "    Scan table=t source=fake columns=[i16]  [shared #1 of 2, 1 field]\n"
             R"(    Join SEMI build=right keys=["ok.i16" = s16])"
             "\n"
             R"(      Join SEMI build=right keys=["ok.i16" = i16])"
             "\n"
             "        Scan table=ok source=fake columns=[i16]\n"
             "        Project i16\n"
-            "          Scan table=t source=fake columns=[i16]\n"
+            "          Scan table=t source=fake columns=[i16]  [shared #1 of 2, 1 field]\n"
             "      Project s16\n"
             "        Scan table=dec source=fake columns=[s16]\n");
 }

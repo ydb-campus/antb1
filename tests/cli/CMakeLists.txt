@@ -319,8 +319,10 @@ antb1_add_cli_golden(
     --table
     "zones=${_f}/star/zones.parquet"
 )
-# Decision C8 made visible: a CTE referenced twice is bound twice and scanned twice, so the plan
-# holds two identical subtrees rather than one shared node.
+# A CTE referenced twice is bound twice and scanned twice (ADR 0022), so the plan holds the subtree
+# twice rather than one shared node -- and says so: the two members carry the `shared` note
+# docs/adr/0030-shared-sub-plans.md's E1 adds. Nothing is shared yet; the note is what makes the
+# duplication visible to a reader instead of leaving it to be counted by hand.
 antb1_add_cli_golden(
   explain_cte_referenced_twice
   ARGS
