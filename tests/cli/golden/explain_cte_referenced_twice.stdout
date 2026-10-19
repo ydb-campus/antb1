@@ -1,9 +1,9 @@
 Output: count_star():BIGINT
 Aggregate COUNT(*)
   Join INNER build=right keys=[a.zone = b.zone]
-    Project tr_pickup, n
+    Project tr_pickup, n  [shared #1 of 2, 1 field]
       GroupAggregate keys=[tr_pickup] COUNT(*)
         Scan table=trips source=parquet(files=1, rows=3000) columns=[tr_pickup]
-    Project tr_pickup, n
+    Project tr_pickup, n  [shared #1 of 2, 1 field]
       GroupAggregate keys=[tr_pickup] COUNT(*)
         Scan table=trips source=parquet(files=1, rows=3000) columns=[tr_pickup]
