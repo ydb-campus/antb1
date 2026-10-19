@@ -535,6 +535,14 @@ this profiling fires:
     Q07 0.931x (2 to 3), Q06 0.947x (0 to 1). The three that read slower — Q05 1.041x, Q08 1.029x, Q12 1.027x —
     pushed exactly what they pushed before, which is what says they are noise rather than the cost of the decoder
     switch this change makes for the queries that gained one.
+  - **Replicated independently on 2026-10-19**, by a measurement that was not looking for it. A cumulative
+    before/after over [ADR 0029](0029-dynamic-join-filters.md)'s whole window (which contains C6, since C6 shipped
+    inside D1's PR as its prerequisite) found Q01 and Q06 moving even though neither holds a join, so neither can
+    be touched by a dynamic join filter. Chasing that led back here: the four queries the two runs have in common
+    agree closely -- Q19 0.824x then 0.815x, Q14 0.839x then 0.853x, Q01 0.912x then 0.907x, Q06 0.947x then
+    0.935x -- which is as good a replication as this harness gives. **The lesson is for whoever next measures a
+    window containing more than one item**: C6's gain is real, it is recorded here, and a cumulative figure over
+    ADR 0029 must not be credited to that ADR's filters.
 - **C7, ci: the 22 queries on demand.** A job in `bench.yml`, on `workflow_dispatch` with a scale-factor input and
   never on `push` or `pull_request`, generating its data at test time as the SLT runner does. `.github/` is a
   protected path, so the diff needs the maintainer.

@@ -257,8 +257,10 @@ class MemoryTable final : public plan::Table {
   void FailPart(int64_t part) { failing_parts_.push_back(part); }
   // ScanPart of `field` (with any other fields) fails with an IOError naming the field.
   void FailField(int field) { failing_field_ = field; }
-  // With `split`: exact statistics of the BIGINT columns (plan::Table::part_stats), unless turned
-  // off here.
+  // With `split`: exact statistics of the integer-valued columns (plan::Table::part_stats), unless
+  // turned off here. The types are the ones ParquetTable reports statistics for, so that a test can
+  // reach every arm of a reader of them -- a DATE key and a BIGINT key are different arms and only
+  // one of them is the common case.
   void set_stats(bool stats) { stats_ = stats; }
   // With `split`: whether the table applies scan filters (on unless turned off here), and how
   // many filtered scans of a part it made.
@@ -269,21 +271,41 @@ class MemoryTable final : public plan::Table {
   [[nodiscard]] int filtered_scans() const { return filtered_scans_; }
   std::optional<plan::PartStats> part_stats(int64_t part, int field) const override {
     if (!split_ || !stats_ || part < 0 || part >= num_parts() || field < 0 ||
-        field >= schema_->num_fields() ||
-        schema_->field(field)->type()->id() != arrow::Type::INT64) {
+        field >= schema_->num_fields()) {
       return std::nullopt;
     }
-    const auto& values = static_cast<const arrow::Int64Array&>(*Batch(part)->column(field));
+    const arrow::Array& column = *Batch(part)->column(field);
     plan::PartStats stats{
-        .min = std::nullopt, .max = std::nullopt, .null_count = 0, .rows = values.length()};
-    for (int64_t i = 0; i < values.length(); ++i) {
-      if (values.IsNull(i)) {
-        ++stats.null_count;
-        continue;
+        .min = std::nullopt, .max = std::nullopt, .null_count = 0, .rows = column.length()};
+    const auto exact = [&stats](const auto& values) {
+      for (int64_t i = 0; i < values.length(); ++i) {
+        if (values.IsNull(i)) {
+          ++stats.null_count;
+          continue;
+        }
+        const Int128 v = values.Value(i);
+        stats.min = stats.min.has_value() ? std::min(*stats.min, v) : v;
+        stats.max = stats.max.has_value() ? std::max(*stats.max, v) : v;
       }
-      const Int128 v = values.Value(i);
-      stats.min = stats.min.has_value() ? std::min(*stats.min, v) : v;
-      stats.max = stats.max.has_value() ? std::max(*stats.max, v) : v;
+    };
+    switch (column.type_id()) {
+      case arrow::Type::INT16:
+        exact(static_cast<const arrow::Int16Array&>(column));
+        break;
+      case arrow::Type::UINT16:
+        exact(static_cast<const arrow::UInt16Array&>(column));
+        break;
+      case arrow::Type::INT32:
+        exact(static_cast<const arrow::Int32Array&>(column));
+        break;
+      case arrow::Type::INT64:
+        exact(static_cast<const arrow::Int64Array&>(column));
+        break;
+      case arrow::Type::DATE32:
+        exact(static_cast<const arrow::Date32Array&>(column));
+        break;
+      default:
+        return std::nullopt;  // not integer-valued, as ParquetTable reports none either
     }
     return stats;
   }

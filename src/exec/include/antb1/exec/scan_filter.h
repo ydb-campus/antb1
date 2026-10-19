@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -39,7 +41,13 @@ arrow::Result<std::shared_ptr<const plan::ScanFilter>> MakeScanFilter(
 // `column` is a position in the scan's field list, of the one key column, which must be a
 // fixed-width type (plan::ScanValues carries VARCHAR as views, which this does not hash). Invalid
 // without a filter.
+//
+// `dropped` (nullptr: not counted) is added to by the rows it clears, for the scan to report what
+// the filter did (D3). It is counted here and not above because the operator over the scan is
+// handed the survivors alone and so cannot see the difference; one add per call and not per row,
+// and atomic because a ScanFilter is documented to be applied by several parts at once.
 arrow::Result<std::shared_ptr<const plan::ScanFilter>> MakeKeyScanFilter(
-    std::shared_ptr<const KeyFilter> filter, int column);
+    std::shared_ptr<const KeyFilter> filter, int column,
+    std::shared_ptr<std::atomic<int64_t>> dropped = nullptr);
 
 }  // namespace antb1::exec

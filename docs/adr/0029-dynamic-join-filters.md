@@ -4,7 +4,8 @@ Date: 2026-10-18
 
 ## Status
 
-Proposed (draft: the measurement below is taken, the design is not built)
+Proposed (D0-D3 are built and measured; D4's table is the cumulative result, on which this ADR is accepted or
+deferred)
 
 ## Context
 
@@ -97,15 +98,27 @@ Draft. What follows is the shape to build and measure, not a decision taken.
 - **Three uses, not two, and they do not substitute for each other.** The measurement above separates them:
   - a **min/max interval** prunes row groups from the footer, and reaches nothing once the keys are scattered. It
     shares the row-group test's entry point and its measurement, so it is published and applied **with that item**
-    and not before it: two integers that nothing reads are two integers nobody can measure. A **per-row** range test
+    and not before it: two integers that nothing reads are two integers nobody can measure.
+    - Correction (2026-10-19, D2 as built): it is not a separate mechanism to carry or drop either. A binary
+      search over the published key set already finds nothing for a part lying outside `[min, max]`, so the
+      interval is the **degenerate case of the key-set test**, not a second test beside it. It is published
+      because it costs one pass over values already being walked, and because it is what answers when there are
+      too many keys to publish as values; there was never a decision here to take.
+    A **per-row** range test
     is deliberately not built at all -- it is the weakest of the three in both directions, since where the envelope
     is narrow the row-group test has already pruned before anything was decoded, and where it is wide the per-row
     test rejects nothing that the Bloom filter does not reject more precisely.
   - **each row group's range against the key set** prunes whole row groups, decoding nothing for a pruned one. Its
     reach is `e^(-k/g)` and therefore decidable before it runs. A Bloom filter cannot do this -- it tests points, not
-    ranges -- so this is its own mechanism and needs its own entry point: `ScanFilter::Apply` sees values a table has
-    already decoded, where this must be asked *before* the decode, against footer statistics. That is an addition to
-    `plan::Table`, which makes it the one item here with an interface change in it.
+    ranges -- so this is its own mechanism, asked before anything is decoded rather than through
+    `ScanFilter::Apply`, which only ever sees values a table has already handed back.
+    - Correction (2026-10-19, D2 as built): this said the test "needs its own entry point ... an addition to
+      `plan::Table`, which makes it the one item here with an interface change in it". **It needs neither.** A
+      Parquet part *is* one row group of one file (`plan/table.h`'s `num_parts`), exec drives parts, and
+      `Table::part_stats(part, field)` already reports a part's exact integer statistics -- the top-N has pruned
+      parts at runtime through it ([ADR 0011](0011-sorting-and-top-n.md), `exec/part_pruning.h`'s `PartMayBeat`). So the
+      test belongs in exec beside that one, where the part is skipped before `ScanPart` is ever called, and this
+      item carries **no interface change at all**.
   - a **per-row Bloom filter** prunes rows inside a surviving group, before that row's other columns are decoded --
     the order ADR 0020's filtered scan already uses, predicate column first and the rest for survivors only. It is
     the only mechanism that reaches a scattered key set, so on the query above it is the one that pays.
@@ -199,6 +212,11 @@ lesson of [ADR 0027](0027-string-views.md)'s S1, which was planned as a win whos
       scan reads, and the filtered path had no DECIMAL case, so a scan reading one could take no filter at all --
       including both probe scans of the query this ADR is built around. [ADR 0026](0026-join-performance.md)'s C6
       shipped first and is what let D1 reach them.
+      - Note (2026-10-19): **C6 shipped in D1's PR, so this ADR's window contains it, and its gain is not this
+        ADR's.** C6 is worth 0.981x of the 22 on its own -- it unblocked *static* pushdown (ADR 0020) on every
+        query reading a DECIMAL, which is most of them -- and that is recorded in ADR 0026, not here. Any
+        before/after taken across D0-D3 therefore includes C6; D4's table says which share is whose, and the
+        join-free queries that move in it (Q01, Q06) are the proof that it must.
     - **The filter is always ready, so none of the readiness machinery above was built.** `PrepareBuilds` runs
       before the sink that schedules the probe pipeline's parts, and the serial path before `input_->Open`, so a
       build completes at one global moment on the consumer thread and every probe part is constructed after it. No
@@ -259,21 +277,107 @@ lesson of [ADR 0027](0027-string-views.md)'s S1, which was planned as a win whos
     duplication halves the cost before anything else is tried.
   - **D3 is only half done here.** The scan reports *that* a filter is attached (a `key_filter` metric, per part);
     the rows it dropped would need a counter inside the filtered scan, since the scan operator above it sees only
-    the survivors. That half stays with D3.
-- **D2, feat(plan+io): ask a table whether a row group can contain any published key.** The 27% the measurement
-  found, from about `g` binary searches over the sorted key set. It needs the new entry point named in the Decision,
-  since `ScanFilter::Apply` is handed values that have already been decoded, and a pruned row group is one that is
-  never decoded at all. Worth it only where `e^(-k/g)` is large, which the engine can evaluate before publishing
-  anything: both counts are known once the build finishes. **The min/max interval belongs to this item**, published
-  and applied through the same entry point, which is the only place anything reads it. It will prune nothing in the
-  22 and nothing in ClickBench, for the reason the Context measures -- so it is carried on the argument that it is
-  two integers behind a gate that already has to exist, and this item's acceptance rests on the key-set test alone.
-  If that reads as too thin a justification, the honest alternative is to leave the interval out until a workload
-  with a contiguous build side is in the gate set.
+    the survivors. That half stays with D3 -- which found it needed no counter in `io` at all, because the code
+    that clears the bits is exec's own.
+- **D2, perf(exec): skip a probe part no published key can be in.** The 27% the measurement found, from about `g`
+  binary searches over the sorted key set. Worth it only where `e^(-k/g)` is large, which the engine can evaluate
+  before publishing anything: both counts are known once the build finishes. **The min/max interval belongs to this
+  item**, published with it and read by the same test. It will prune nothing in the 22 and nothing in ClickBench,
+  for the reason the Context measures -- so it is carried on the argument that it is two integers collected in a
+  pass that already has to happen, and this item's acceptance rests on the key-set test alone.
+  - Update (2026-10-19, D2): **shipped, it prunes exactly what this ADR predicted, and it is worth almost
+    nothing.** Both halves of that sentence matter, and the second is the one to read first.
+    - **The prediction was right to within 1%.** On the query this ADR is built around the test prunes **1,337 of
+      lineitem's 4,896 row groups** against the 1,325 `e^(-k/g)` predicts, and 6 of orders' 1,222 against 6.7. The
+      profile reports both (D3's `key_pruned`), so this is the engine's own count and not an offline one.
+    - **It is worth 0.998x of the 22**, 61.90 s to 61.78 s: the one query it reaches goes **0.978x** (median of
+      seven) and every other query stays inside +-1.2%, which is this harness's noise. Across all 22 queries it
+      prunes a row group on **one** of them -- no other build is small enough against its probe's row-group count.
+    - **D1 had already taken this item's prize, and measuring row groups hid it.** The Context counted row groups
+      and assumed the time followed. It does not: D1's filtered scan decodes the key column, rejects the rows and
+      never touches the other columns, so a row group with no matching key was *already* cheap. Skipping the part
+      saves that key column's decode, its hashes and its probes and nothing else -- the probe scan goes 5.034 s to
+      3.692 s summed over 14 threads, which is about 96 ms of wall clock on a 4.5 s query. **A pruning mechanism's
+      reach and its value are different quantities, and this ADR measured the first while arguing the second.**
+    - **The item that would have paid is the one that shipped first.** Had D2 come before D1 it would have been
+      worth most of what D1 is worth on that query, and D1 would then have looked marginal. The order was chosen
+      (correctly) on D1 being the only mechanism that reaches a scattered key set -- but the corollary, that
+      whichever of the two ships first collects the shared prize, was not stated and should have been.
+    - **Three premises in the Decision were wrong, all in the cheaper direction**, and each is corrected inline
+      above: no `plan::Table` entry point is needed (a part *is* a row group and `part_stats` already exists), the
+      min/max interval is not a separate mechanism (the key-set search subsumes it), and D3's row counter does not
+      belong in the filtered scan. What shipped is **exec-only**: no interface change, no `io` change.
+    - **It reaches further than the per-row filter does, by construction.** A part that is never read needs no
+      filtered decoder, takes none of the single `ScanFilter` slot, and costs one binary search whether it prunes
+      or not -- so it applies to a probe scan that already pushes static predicates, which D1 must refuse, and it
+      ignores the build-share gate that bounds D1's cost. No query of the 22 exercises that combination, so it is
+      carried on its tests and not on a measurement.
+    - **The values are published only up to `KeyFilter::kMaxPublishedKeys` (65,536).** Above it the interval alone
+      is published, which costs one pass and no memory. That is a bound on the publication's cost, not a guess at
+      its benefit: the test itself is free once published. It is why the two SEMI/ANTI joins of another query --
+      7.3 million keys each -- get nothing, which is the right answer, since `e^(-k/g)` there is zero to many
+      decimal places.
+    - **Shipped rather than withdrawn, and the reasons are here for D4 to weigh** -- this entry records a
+      measurement, not an acceptance; the Status line above is still `Proposed`, and only a maintainer moves it.
+      For: it regresses nothing, its reach is arithmetic over two counts known before it runs (90% of row groups
+      at a 500-key build, 82% at 1,000, 27% at 6,398, nothing by 50,000), and the mechanism is about 320 lines of
+      exec confined to one path. Against: 0.2% of a gate set is below what new code usually has to earn, and ours
+      holds one 6,398-key case and nothing smaller, so the reach that would pay is not represented in it.
 - **D3, feat(exec): report what each filter pruned in `EXPLAIN ANALYZE`**, each half with the item that produces it
   -- rows with D1, row groups with D2 -- and not after either. Rows and row groups skipped, and whether the filter
   was ready: without that last one, a filter that never fires and a filter that is never ready are the same timing.
+  - Update (2026-10-19, D3): **shipped, as two metrics on the scan and not three.**
+    - `key_dropped`, the rows the per-row filter cleared, counted **inside the filter** rather than in the
+      filtered scan as D1's entry supposed. The code that clears the bit is `KeyScanFilter::Apply`, which is exec's
+      own, so it counts what it clears: one atomic add per call and not per row. A row another filter had already
+      cleared is not counted, because the bit is tested before it is touched.
+    - `key_pruned`, the parts the key set ruled out, written by the planner where it decides them. It is a count
+      and not a flag, so the per-part profile sums it to the figure above: 1,337 on the query that has it.
+    - **Together they account for the probe exactly, which is the first time either mechanism's share has been
+      visible.** On that query's lineitem probe: **163,106,013 rows never read** (the 1,337 row groups D2 pruned),
+      **436,744,092 read and dropped** by D1's filter, and 187,797 handed to the join -- the three summing to the
+      table's 600,037,902. So **D1 does 73% of the rejecting and D2 27%**, which is the same split the timing
+      shows and the quantitative form of "D1 had already taken this item's prize".
+    - **The readiness metric is not implemented, and this is the record of why.** D1 established that a build
+      completes before any probe part is constructed (`PrepareBuilds` runs before the sink that schedules them),
+      so there is no not-ready state for a filter to be in and nothing for the metric to distinguish. Left
+      unsaid, a reader would keep looking for it.
+    - Nothing was needed to carry a metric from the scan: `Profiled` already calls `Operator::set_profile` on
+      every operator, so `TableScanOperator::Close` reports through `profile()` like any other operator.
 - **D4, docs(adr): record what D0-D2 measured**, and either accept this ADR or defer it with the numbers.
+  - Update (2026-10-19, D4): **the cumulative measurement, taken fresh end to end rather than chained.** Each item
+    above was measured against its own contemporaneous baseline, and those baselines drift between sessions, so
+    the per-item ratios do **not** multiply out to the figure below -- which is the reason to take one matched
+    pair rather than trust arithmetic over four runs.
+  - **Protocol**, stated because the first attempt at it was wrong: both arms were built and measured in a single
+    run, each preceded by a **discarded warm-up pass over all 22**, best of three, antb1 and DuckDB interleaved
+    per query. The first attempt measured the two arms in separate sessions and attributed a 7-10% warm-up and
+    page-cache asymmetry to the code; the warm-up pass and DuckDB-as-control are what remove that. SF 100,
+    14 threads, `before` = the last commit with none of D0-D3 in it.
+
+    | | before | after | |
+    | --- | ---: | ---: | --- |
+    | the 22, total | 69.46 s | **60.35 s** | **0.869x** |
+    | the 22, geomean | 2.384 s | **2.147 s** | 0.901x |
+    | DuckDB, total (the drift control) | 29.78 s | 29.51 s | 0.991x -- so the move above is antb1's |
+    | **against DuckDB, total** | 2.33x | **2.05x** | |
+    | **against DuckDB, geomean** | 2.18x | **1.98x** | first time under 2x in this ADR's figures |
+
+  - **Where the 9.10 s went, which is not where this ADR's plan put it.** Q18 0.504x, Q04 0.609x and Q21 0.828x --
+    the three queries D0 and D1 were built for -- are **6.25 s of it, 69%**. Most of the rest is C6's static
+    pushdown (the note under D1), spread a few percent over queries no item here was aiming at. Two queries
+    regress, both already recorded under D1: Q11 1.129x and Q16 1.052x.
+  - **Per item, as measured by each**: D0 0.550x on its one query and 0.975x of the 22; D1 0.958x of the 22; D2
+    0.998x; D3 no timing of its own. So **D0 and D1 are this ADR, and D2 is a mechanism that works and does not
+    pay** -- the honest one-line summary of the whole plan.
+  - **Twice the value landed somewhere the plan did not predict**, which is the transferable lesson: D2 arrived to
+    find D1 had already taken the prize it was costed on, and C6 was planned as plumbing for D1 while being worth
+    more than its own entry expected. Both are failures of *ordering* analysis rather than of measurement -- the
+    plan reasoned about each item alone, and two mechanisms over the same rows share one prize, which goes to
+    whichever ships first.
+  - **This entry records the numbers; it does not move the Status line.** On these figures the ADR is accepted or
+    deferred by a maintainer: for, D0 and D1 together close 0.869x and the mechanisms are measured, bounded and
+    instrumented; against, D2 earns 0.2% and the reach that would pay for it is not represented in this gate set.
 
 **The gate, stated so it cannot be read backwards.** An earlier draft of D1 gated the Bloom filter on min/max having
 moved a query by 10%, which is exactly wrong: min/max pruning nothing *is* the signal that the keys are scattered,

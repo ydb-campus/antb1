@@ -3751,6 +3751,191 @@ TEST_F(HashJoinPlanTest, AKeyFilterDropsProbeRowsAndKeepsTheAnswer) {
   }
 }
 
+// ADR 0029's D2: a part of the probe's scan whose key column spans no key the build published is
+// not read at all. The control is the same plan over a table that reports no statistics, so it
+// scans every part -- and the answers must be identical either way, because a part wrongly skipped
+// loses rows and nothing but a comparison would show it.
+TEST_F(HashJoinPlanTest, APartHoldingNoBuildKeyIsNotScanned) {
+  const auto pool = MakeThreadPool();
+  const auto pk = MixedColumn("p", 0);
+  const auto bk = MixedColumn("b", 0);
+  const auto always = testing::Compare(MixedColumn("p", 2), plan::CompareOp::kGe,
+                                       testing::BigInt(0));  // p_id >= 0: every row
+  // The probe's 6 parts tile the key domain 80 keys at a time -- part 0 holds 0..79, part 1
+  // 80..159, part 2 160..239 and so on -- which is the shape a sorted Parquet column has, and the
+  // shape that makes a row-group test worth anything at all.
+  const auto probe_keys = [](int64_t i) -> std::optional<int64_t> { return i; };
+  // Five build keys, all of them inside parts 0 and 2. So parts 1, 3, 4 and 5 hold nothing the
+  // join can match, and the interval [0, 200] alone would rule out none of them: the gap between
+  // 40 and 180 is only visible in the key values, which is this item's whole argument.
+  const auto build_keys = [](int64_t i) -> std::optional<int64_t> {
+    constexpr std::array<int64_t, 5> kKeys = {0, 20, 40, 180, 200};
+    return kKeys[static_cast<std::size_t>(i % 5)];
+  };
+  const std::vector<int64_t> every_part = {0, 1, 2, 3, 4, 5};
+  const std::vector<int64_t> with_a_key = {0, 2};
+  for (arrow::internal::Executor* executor : Executors(pool.get())) {
+    SCOPED_TRACE(executor == nullptr ? "one thread" : "pool");
+    const auto build = MixedTable("b", 1, 5, build_keys);
+    for (const plan::JoinKind kind :
+         {plan::JoinKind::kInner, plan::JoinKind::kSemi, plan::JoinKind::kAnti}) {
+      SCOPED_TRACE(static_cast<int>(kind));
+      const std::size_t columns = kind == plan::JoinKind::kInner ? 6U : 3U;
+      // An anti join of this orientation emits the probe rows that found no match, so a part with
+      // no build key in it is precisely a part of the answer: it must be read like any other.
+      const bool pruned = kind != plan::JoinKind::kAnti;
+      const auto one = MixedTable("p", 6, 80, probe_keys);
+      auto got =
+          RunPlan(PlanOf(JoinOf(kind, ScanOf(one, "p"), ScanOf(build, "b"), {pk}, {bk}), columns),
+                  ContextOf(executor));
+      ASSERT_TRUE(got.ok()) << got.status().ToString();
+      EXPECT_EQ(one->scanned_parts(), pruned ? with_a_key : every_part);
+      // The same plan over a table that reports nothing: every part read, and the same answer.
+      const auto two = MixedTable("p", 6, 80, probe_keys);
+      two->set_stats(false);
+      auto control =
+          RunPlan(PlanOf(JoinOf(kind, ScanOf(two, "p"), ScanOf(build, "b"), {pk}, {bk}), columns),
+                  ContextOf(executor));
+      ASSERT_TRUE(control.ok()) << control.status().ToString();
+      EXPECT_EQ(two->scanned_parts(), every_part) << "statistics it does not have must not prune";
+      EXPECT_EQ(RowsOf(**got), RowsOf(**control));
+      EXPECT_FALSE(RowsOf(**got).empty());
+    }
+    // A scan that already pushes a predicate of its own still skips the parts, though it can take
+    // no key filter: the one filter slot is the per-row test's concern and not the part test's.
+    const auto pushed = MixedTable("p", 6, 80, probe_keys);
+    auto with_predicate = RunPlan(
+        PlanOf(JoinOf(plan::JoinKind::kInner,
+                      Node(plan::FilterNode{.input = ScanOf(pushed, "p"), .predicates = {always}}),
+                      ScanOf(build, "b"), {pk}, {bk}),
+               6),
+        ContextOf(executor));
+    ASSERT_TRUE(with_predicate.ok()) << with_predicate.status().ToString();
+    EXPECT_EQ(pushed->scanned_parts(), with_a_key);
+    EXPECT_EQ(pushed->filtered_scans(), 2) << "its own predicate is pushed into the parts it reads";
+  }
+}
+
+// ADR 0029's D3: what a dynamic join filter did is visible in the profile, both halves of it. The
+// rows are counted inside the filter because the operators above the scan are handed the survivors
+// alone, so without this a filter that rejects everything and one that is never applied read the
+// same.
+TEST_F(HashJoinPlanTest, TheProfileReportsWhatTheDynamicFilterPruned) {
+  const auto pk = MixedColumn("p", 0);
+  const auto bk = MixedColumn("b", 0);
+  const auto probe_keys = [](int64_t i) -> std::optional<int64_t> { return i; };
+  const auto build_keys = [](int64_t i) -> std::optional<int64_t> {
+    constexpr std::array<int64_t, 5> kKeys = {0, 20, 40, 180, 200};
+    return kKeys[static_cast<std::size_t>(i % 5)];
+  };
+  // The first node named `name`, depth first: the profile of a part pipeline nests a child a level.
+  const auto find = [](const ProfileNode& root, std::string_view name) -> const ProfileNode* {
+    const auto walk = [&name](const ProfileNode& node, const auto& self) -> const ProfileNode* {
+      if (node.name() == name) {
+        return &node;
+      }
+      for (const ProfileNode* child : node.children()) {
+        if (const ProfileNode* found = self(*child, self); found != nullptr) {
+          return found;
+        }
+      }
+      return nullptr;
+    };
+    return walk(root, walk);
+  };
+  const auto probe = MixedTable("p", 6, 80, probe_keys);
+  const auto build = MixedTable("b", 1, 5, build_keys);
+  ProfileNode profile;
+  auto got = RunPlan(
+      PlanOf(JoinOf(plan::JoinKind::kInner, ScanOf(probe, "p"), ScanOf(build, "b"), {pk}, {bk}), 6),
+      ContextOf(nullptr), &profile);
+  ASSERT_TRUE(got.ok()) << got.status().ToString();
+  const ProfileNode* scan = find(profile, "Scan");
+  ASSERT_NE(scan, nullptr);
+  EXPECT_EQ(MetricOf(*scan, "key_filter"), 1);
+  // Four of the six parts hold no build key, and the filter is what rejects the rest of the rows:
+  // parts 0 and 2 hold 160 rows between them and only 5 keys can match.
+  EXPECT_EQ(MetricOf(*scan, "key_pruned"), 4);
+  EXPECT_EQ(MetricOf(*scan, "key_dropped"), 155);
+  EXPECT_EQ(RowsOf(**got).size(), 5U) << "and the rows it kept are the answer";
+}
+
+// A DATE key, which is a different arm of the published-values dispatch from a BIGINT one and the
+// shape a date-partitioned table has. The values and the statistics must agree on the domain --
+// both are days -- or parts holding matching rows would be skipped and rows lost in silence.
+TEST_F(HashJoinPlanTest, APartIsSkippedOnADateKeyToo) {
+  // Parts of ten rows each, the key a DATE: part 0 holds days 0..9, part 1 10..19, part 2 20..29.
+  const auto days = [](const std::string& prefix, int64_t parts,
+                       const std::function<int32_t(int32_t)>& day) {
+    const auto schema = arrow::schema(
+        {arrow::field(prefix + "d", arrow::date32()), arrow::field(prefix + "n", arrow::int64())});
+    arrow::RecordBatchVector batches;
+    for (int64_t part = 0; part < parts; ++part) {
+      std::vector<std::optional<int32_t>> ds;
+      std::vector<std::optional<int64_t>> ns;
+      for (int32_t r = 0; r < 10; ++r) {
+        const auto i = static_cast<int32_t>(part * 10) + r;
+        ds.emplace_back(day(i));
+        ns.emplace_back(i);
+      }
+      batches.push_back(BatchOf(schema, {Dates(ds), Int64s(ns)}));
+    }
+    return std::make_shared<MemoryTable>(schema, std::move(batches), /*split=*/true);
+  };
+  const plan::BoundColumn probe_key = Column(0, "pd", LogicalType::kDate);
+  const plan::BoundColumn build_key = Column(0, "bd", LogicalType::kDate);
+  // The build holds days 2 and 5 only, both in part 0, so parts 1 and 2 can be ruled out.
+  const auto build = days("b", 1, [](int32_t i) { return i % 2 == 0 ? 2 : 5; });
+  const auto probe = days("p", 3, [](int32_t i) { return i; });
+  auto got = RunPlan(PlanOf(JoinOf(plan::JoinKind::kInner, ScanOf(probe, "p"), ScanOf(build, "b"),
+                                   {probe_key}, {build_key}),
+                            4),
+                     ContextOf(nullptr));
+  ASSERT_TRUE(got.ok()) << got.status().ToString();
+  EXPECT_EQ(probe->scanned_parts(), (std::vector<int64_t>{0}));
+  const auto control = days("p", 3, [](int32_t i) { return i; });
+  control->set_stats(false);
+  auto reference = RunPlan(PlanOf(JoinOf(plan::JoinKind::kInner, ScanOf(control, "p"),
+                                         ScanOf(build, "b"), {probe_key}, {build_key}),
+                                  4),
+                           ContextOf(nullptr));
+  ASSERT_TRUE(reference.ok()) << reference.status().ToString();
+  EXPECT_EQ(control->scanned_parts(), (std::vector<int64_t>{0, 1, 2}));
+  EXPECT_EQ(RowsOf(**got), RowsOf(**reference));
+  EXPECT_FALSE(RowsOf(**got).empty());
+}
+
+// A part whose key column is entirely NULL holds nothing any join can match, so it is skipped too:
+// the build publishes no NULL key, and a probe row with one matches nothing in any case.
+TEST_F(HashJoinPlanTest, APartOfNullKeysIsNotScanned) {
+  const auto pool = MakeThreadPool();
+  const auto pk = MixedColumn("p", 0);
+  const auto bk = MixedColumn("b", 0);
+  // Parts 0 and 2 hold keys 0..79 and 160..239; part 1's keys are all NULL.
+  const auto probe_keys = [](int64_t i) -> std::optional<int64_t> {
+    return (i / 80) == 1 ? std::optional<int64_t>{} : std::optional<int64_t>(i);
+  };
+  const auto build_keys = [](int64_t i) -> std::optional<int64_t> { return i * 60; };
+  for (arrow::internal::Executor* executor : Executors(pool.get())) {
+    SCOPED_TRACE(executor == nullptr ? "one thread" : "pool");
+    const auto build = MixedTable("b", 1, 4, build_keys);  // 0, 60, 120, 180
+    const auto one = MixedTable("p", 3, 80, probe_keys);
+    auto got = RunPlan(
+        PlanOf(JoinOf(plan::JoinKind::kInner, ScanOf(one, "p"), ScanOf(build, "b"), {pk}, {bk}), 6),
+        ContextOf(executor));
+    ASSERT_TRUE(got.ok()) << got.status().ToString();
+    EXPECT_EQ(one->scanned_parts(), (std::vector<int64_t>{0, 2}));
+    const auto two = MixedTable("p", 3, 80, probe_keys);
+    two->set_stats(false);
+    auto control = RunPlan(
+        PlanOf(JoinOf(plan::JoinKind::kInner, ScanOf(two, "p"), ScanOf(build, "b"), {pk}, {bk}), 6),
+        ContextOf(executor));
+    ASSERT_TRUE(control.ok()) << control.status().ToString();
+    EXPECT_EQ(RowsOf(**got), RowsOf(**control));
+    EXPECT_FALSE(RowsOf(**got).empty());
+  }
+}
+
 TEST_F(HashJoinPlanTest, FilterPushdownReachesEachSideWithItsOwnParts) {
   const auto pool = MakeThreadPool();
   const auto pk = MixedColumn("p", 0);

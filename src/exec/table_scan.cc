@@ -1,5 +1,6 @@
 #include "antb1/exec/table_scan.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -9,6 +10,7 @@
 
 #include <arrow/api.h>
 
+#include "antb1/exec/profile.h"
 #include "antb1/exec/scan_filter.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/table.h"
@@ -62,6 +64,13 @@ arrow::Status TableScanOperator::Open(ExecContext& ctx) {
   if ((!pushed_.empty() || key_scan_.has_value()) && !part_.has_value()) {
     return arrow::Status::Invalid("only the scan of a part applies predicates");
   }
+  // A part holding no key the build published matches nothing, so it is not read at all: no reader
+  // is opened, nothing is decoded, and Next() ends straight away (ADR 0029's D2). Before the
+  // branches below because it makes all of them moot -- including the narrow scan's.
+  pruned_ = key_scan_.has_value() && key_scan_->part_has_no_key;
+  if (pruned_) {
+    return arrow::Status::OK();
+  }
   if (late_.has_value()) {
     const LateScan& late = late_.value();
     if (!part_.has_value() || late.late.size() != fields_.size() || late.row_id < 0 ||
@@ -84,10 +93,12 @@ arrow::Status TableScanOperator::Open(ExecContext& ctx) {
     std::shared_ptr<const plan::ScanFilter> filter;
     if (!pushed_.empty()) {
       ARROW_ASSIGN_OR_RAISE(filter, MakeScanFilter(pushed_, *schema_, ctx.pool));
-    } else if (key_scan_.has_value()) {
+    } else if (key_scan_.has_value() && key_scan_->filter != nullptr) {
       // A scan takes one filter, so this is only for a scan with no pushed predicates of its own;
       // the planner attaches it on no other (ADR 0029's D1).
-      ARROW_ASSIGN_OR_RAISE(filter, MakeKeyScanFilter(key_scan_->filter, key_scan_->column));
+      key_dropped_ = std::make_shared<std::atomic<int64_t>>(0);
+      ARROW_ASSIGN_OR_RAISE(filter,
+                            MakeKeyScanFilter(key_scan_->filter, key_scan_->column, key_dropped_));
     }
     ARROW_ASSIGN_OR_RAISE(reader_,
                           table_->ScanPart(*part_, fields_, ctx.batch_size, ctx.pool, filter));
@@ -98,6 +109,9 @@ arrow::Status TableScanOperator::Open(ExecContext& ctx) {
 }
 
 arrow::Result<Batch> TableScanOperator::Next() {
+  if (pruned_) {
+    return Batch{};  // the part holds no published key, so it has no rows for the join
+  }
   if (reader_ == nullptr) {
     return arrow::Status::Invalid("table scan: Next() before Open()");
   }
@@ -182,6 +196,13 @@ arrow::Result<Batch> TableScanOperator::Narrow(const arrow::RecordBatch& read,
 }
 
 arrow::Status TableScanOperator::Close() {
+  // What the dynamic join filter did to this part, which nothing above the scan can see: the rows
+  // the key filter cleared, or that the part was skipped whole (ADR 0029's D3). On Close so that it
+  // is reported once a part, after every batch of it.
+  if (profile() != nullptr && key_dropped_ != nullptr) {
+    profile()->Add("key_dropped", MetricUnit::kCount,
+                   key_dropped_->load(std::memory_order_relaxed));
+  }
   if (reader_ == nullptr) {
     return arrow::Status::OK();
   }
