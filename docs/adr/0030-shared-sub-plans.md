@@ -237,12 +237,26 @@ avoid. Also out of scope, and each with its reason:
   rows only one consumer wants -- disjoint predicates make the disjunctive form a pure loss. Column subsumption
   cannot: it widens the result, never lengthens it, so its cost is extra columns times shared rows, computable
   before it runs.
-- **Scan sharing -- one decode feeding several consumers, with no materialisation.** A different mechanism, and the
-  one Q17 needs: it reads `lineitem` twice, 600,037,902 rows with column sets of 3 and 2, and is **3.7x of
-  DuckDB** at SF 100. Subsumption would match those two scans, and this ADR's cost gate then correctly refuses
-  them -- holding 600 M rows of 3 columns to save a scan is the trade the gate exists to reject. So Q17's
-  duplication is real, is not this ADR's to fix, and wants an item that tees a running scan rather than one that
-  holds its output.
+- **Scan sharing -- one decode feeding several consumers, with no materialisation.** A different mechanism, and
+  this ADR has **no case for it in the workload**. Subsumption matches several repeated scans and the cost gate
+  refuses them all, correctly; what was missing was the reason it would be wrong to tee them either.
+  - **Correction (2026-10-19).** This bullet first named Q17 as "the one Q17 needs", on the grounds that it reads
+    `lineitem` twice. It does, and sharing that decode would be **strictly worse**, for the reason recorded two
+    bullets above for Q21 and not applied here: its two scans emit **600,037,902 and 660,572** rows, because the
+    second is the probe of a join whose build holds 20,031 parts and
+    [ADR 0029](0029-dynamic-join-filters.md)'s filter drops **599,377,330** of its rows -- 99.9%. One decode
+    feeding both would hand the probe every row the filter exists to skip.
+  - **The rule that generalises it, which is this ADR's most portable finding.** Three of the repeated sub-plans
+    the workload holds -- Q21's, Q17's and Q8's -- looked shareable and are not, two of them because a consumer
+    **already carries a dynamic filter** that prunes it. So: **before costing a shared sub-plan, check whether a
+    consumer is already pruned by one.** A duplication that ADR 0029 has made cheap is a duplication it is a
+    mistake to remove, and the cost gate cannot see that -- it reads the logical plan, where both consumers look
+    alike.
+  - **And Q17's real cost is not duplication at all**, which is why naming it here was a mistake twice over. Its
+    grouped aggregate computes an average for **every one of 20,000,000 parts** when the answer uses the 20,031
+    that pass a brand and container filter: 4.40 s of a 6.22 s query, 319,678,579 local group insertions, 1.87 GB
+    peak. What that wants is the qualifying keys pushed *below the aggregate* -- a dynamic filter through a
+    grouped aggregate, which is ADR 0029's family and not this one's.
 - **A bare shared scan**, which subsumption matches and the cost gate refuses for the same reason: Q2 has two
   identical 80,000,000-row `partsupp` scans, and materialising one to avoid the other trades a scan for about two
   gigabytes. A sub-plan is worth holding when it *reduces*; a scan does not.
