@@ -1415,12 +1415,21 @@ struct Evaluator {
                                                 DecimalProgram& program) const {
     using Source = DecimalProgram::Source;
     // An earlier expression of this node that is this subtree: read its array as a column of the
-    // program. `checked` because a value this engine computed is within its own type already --
-    // only a column a file filled can hold what its declared width does not admit.
+    // program.
+    //
+    // `checked` only for an arithmetic root, and this is the one thing here that must not be got
+    // wrong. A DECIMAL +, - or * has its result range-tested against its own type before anyone
+    // sees it (RunDecimalProgram's step check, and DecimalArith on the recursive path), so an
+    // operand reading it needs no second test. Nothing else here gives that: a DECIMAL negation
+    // keeps its operand's type and tests only 128 bits -- Evaluate(NegateExpr) says so in as many
+    // words, "a file may still hold a value beyond its declared width (nothing checks it on
+    // read)" -- and a CASE whose branch type is already its own converts nothing. Either can
+    // therefore carry a value no value of that type should be, which is exactly what the step
+    // above has to keep checking. Marking those `checked` turns a cast error into an answer.
     if (const ArrayPtr* done = Reused(expr); done != nullptr && ReadableInPlace(**done)) {
       if (auto read = ReadDecimalOperand(**done, expr.type, std::string()); read.ok()) {
         read->owner = *done;
-        read->checked = true;
+        read->checked = std::holds_alternative<plan::ArithExpr>(expr.node);
         program.columns.push_back(*std::move(read));
         return Source{.kind = Source::Kind::kColumn, .at = program.columns.size() - 1};
       }

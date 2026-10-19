@@ -1471,40 +1471,82 @@ TEST_F(ComputeTest, ADuplicateExpressionAnswersTwice) {
 // A shared subtree that overflows must fail with the error the earlier expression raises, at its
 // own operation: reuse must not move which expression of a node reports first, since DuckDB
 // evaluates a select list in order and so does ComputeBatch.
-TEST_F(ComputeTest, AnOverflowInASharedSubtreeFailsAsTheEarlierExpressionDoes) {
+TEST_F(ComputeTest, ANodeFailsOnItsFirstFailingExpression) {
   const LogicalType d38 = LogicalType::Decimal(38, 0);
   // Doubling it is past DECIMAL(38, 0); the shift is unsigned because Int128 is signed.
   const auto huge = static_cast<Int128>(UInt128{1} << 126U);
   const auto column = Decimals(d38, {Int128ToString(huge)});
-  const auto doubled = Arith(ArithOp::kAdd, ColumnAt(0, d38), ColumnAt(0, d38), d38);
-  const auto twice_doubled = Arith(ArithOp::kAdd, doubled, doubled, d38);
+  // Two expressions that fail DIFFERENTLY, so the message says which one ran first. Comparing a
+  // node against one of its own expressions evaluated alone proves nothing -- it is the same code
+  // over the same input either way, which is what the first version of this case did.
+  const auto added = Arith(ArithOp::kAdd, ColumnAt(0, d38), ColumnAt(0, d38), d38);
+  const auto multiplied = Arith(ArithOp::kMultiply, ColumnAt(0, d38), ColumnAt(0, d38), d38);
 
-  auto alone = Eval(doubled, {column});
-  ASSERT_FALSE(alone.ok());
-  auto both = Appended({doubled, twice_doubled}, {column});
-  ASSERT_FALSE(both.status().ok());
-  EXPECT_EQ(both.status().ToString(), alone.status().ToString())
-      << "the node must fail on its first failing expression, with that expression's message";
+  auto add_first = Appended({added, multiplied}, {column});
+  auto multiply_first = Appended({multiplied, added}, {column});
+  ASSERT_FALSE(add_first.ok());
+  ASSERT_FALSE(multiply_first.ok());
+  EXPECT_NE(add_first.status().ToString(), multiply_first.status().ToString())
+      << "both orders gave the same message, so this case cannot see which expression ran first";
+  EXPECT_EQ(add_first.status().ToString(), Eval(added, {column}).status().ToString());
+  EXPECT_EQ(multiply_first.status().ToString(), Eval(multiplied, {column}).status().ToString());
 }
 
-// `checked` is set for a reused expression because this engine's own arithmetic has already
-// confirmed it fits its type. It must not be set for a column, which a file can fill with a value
-// its declared width does not admit -- so a node of two expressions still raises on such a column.
+// A column a file filled past its declared width is still checked beside a reused operand. The
+// first expression has to SUCCEED for this to test anything: ComputeBatch stops at its first
+// failing expression, so an out-of-width value in the shared expression itself would mean the
+// reusing expression is never compiled and the case passes while reaching none of the new code.
 TEST_F(ComputeTest, AColumnBeyondItsDeclaredWidthIsStillCheckedBesideAReusedExpression) {
-  const LogicalType narrow = LogicalType::Decimal(2, 1);  // admits 2 digits
-  const auto beyond = Decimals(narrow, {"150"});          // a file holding 3 of them
-  const auto wider = LogicalType::Decimal(3, 1);
+  const LogicalType narrow = LogicalType::Decimal(2, 1);
+  const LogicalType wider = LogicalType::Decimal(3, 1);  // the step's range is +-999
+  // Column 0 is inside its width; column 1 is the value a file holds that no DECIMAL(2,1) admits,
+  // and that no DECIMAL(3,1) admits either, so the step above has something to catch.
+  const auto in_width = Decimals(narrow, {"50"});
+  const auto beyond = Decimals(narrow, {"1500"});
   const auto shared = Arith(ArithOp::kAdd, ColumnAt(0, narrow), ConstantOf(1, narrow), narrow);
-  // The second expression reuses `shared` and reads the same out-of-width column beside it.
-  const auto with_column = Arith(ArithOp::kAdd, shared, ColumnAt(0, narrow), wider);
+  const auto with_column = Arith(ArithOp::kAdd, shared, ColumnAt(1, narrow), wider);
 
-  auto alone = Eval(shared, {beyond});
-  auto both = Appended({shared, with_column}, {beyond});
-  EXPECT_EQ(alone.ok(), both.ok())
-      << "a value past a column's declared width is a failure with reuse exactly as without it";
-  if (!alone.ok()) {
-    EXPECT_EQ(both.status().ToString(), alone.status().ToString());
-  }
+  auto alone = Eval(shared, {in_width, beyond});
+  ASSERT_TRUE(alone.ok()) << "the shared expression must succeed, or the next one never compiles: "
+                          << alone.status().ToString();
+  auto both = Appended({shared, with_column}, {in_width, beyond});
+  EXPECT_FALSE(both.ok())
+      << "the out-of-width column beside a reused operand must still be checked";
+
+  // And the same node without the reuse raises the same way, so this is the column's check and not
+  // an artefact of reuse: `with_column` alone compiles the shared subtree itself.
+  auto without_reuse = Appended({with_column}, {in_width, beyond});
+  EXPECT_FALSE(without_reuse.ok());
+  EXPECT_EQ(both.status().ToString(), without_reuse.status().ToString());
+}
+
+// The reused operand's own range test may only be skipped for an expression whose result the
+// arithmetic has already checked. A DECIMAL negation is not one: it keeps its operand's type and
+// tests only 128 bits, so it passes a file's out-of-width value straight through. Marking such an
+// array `checked` turned a cast error into an answer of 0.
+TEST_F(ComputeTest, AReusedNegationIsRangeCheckedByTheStepThatReadsIt) {
+  const LogicalType narrow = LogicalType::Decimal(2, 1);
+  const LogicalType wider = LogicalType::Decimal(3, 1);  // +-999, which 1500 is outside
+  const auto beyond = Decimals(narrow, {"1500"});
+  const auto negated = std::make_shared<const plan::Expr>(plan::Expr{
+      .node = plan::NegateExpr{.operand = ColumnAt(0, narrow)}, .type = narrow, .name = "n"});
+  // -1500 - (-1500) is 0, which fits DECIMAL(3,1): only testing the OPERANDS catches this, and the
+  // step's result test cannot. That is what makes it the case the wrong `checked` let through.
+  const auto difference = Arith(ArithOp::kSubtract, negated, negated, wider);
+
+  auto negation_alone = Eval(negated, {beyond});
+  ASSERT_TRUE(negation_alone.ok())
+      << "a negation keeps the value a file holds: " << negation_alone.status().ToString();
+
+  auto reused = Appended({negated, difference}, {beyond});
+  EXPECT_FALSE(reused.ok())
+      << "a reused negation carries an out-of-width value and must be checked";
+
+  // Without the reuse the program cannot compile the negation at all and the recursive path checks
+  // the operands: the two must agree, which is what "reuse changes no answer" means here.
+  auto alone = Eval(difference, {beyond});
+  EXPECT_FALSE(alone.ok());
+  EXPECT_EQ(reused.status().ToString(), alone.status().ToString());
 }
 
 }  // namespace
