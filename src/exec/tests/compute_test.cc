@@ -21,6 +21,7 @@
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
 
+#include "../parallel_compute.h"
 #include "exec_test_util.h"
 
 namespace antb1::exec {
@@ -1399,6 +1400,111 @@ TEST_F(ComputeTest, ConstantsFillEveryRow) {
   EXPECT_EQ((*out)->ToString(), "[\n  7,\n  7,\n  7\n]");
   auto missing = Eval(ColumnAt(3, LogicalType::kSmallInt), {Int16s({1})});
   EXPECT_TRUE(missing.status().IsInvalid());
+}
+
+// ---- reusing an earlier expression of the same Compute (ADR 0026's C10, one program per node)
+// ----
+
+// The columns a Compute appends for `exprs` over `columns`: ComputeBatch, which is what lets a
+// later expression read an earlier one's values rather than compile the same subtree again.
+arrow::Result<arrow::ArrayVector> Appended(const std::vector<plan::ExprPtr>& exprs,
+                                           const arrow::ArrayVector& columns) {
+  const std::shared_ptr<arrow::RecordBatch> in = BatchOf(columns);
+  const auto schema = ComputedSchema(*in->schema(), exprs);
+  ARROW_ASSIGN_OR_RAISE(const Batch out, ComputeBatch(Batch{.data = in, .selection = {}}, exprs,
+                                                      schema, arrow::default_memory_pool()));
+  arrow::ArrayVector appended;
+  for (int i = in->num_columns(); i < out.data->num_columns(); ++i) {
+    appended.push_back(out.data->column(i));
+  }
+  return appended;
+}
+
+// The shape a SUM-heavy grouped query computes: one expression is a whole subtree of the next, so
+// the second reads the first instead of compiling it again. What is asserted is the values, since
+// nothing observable reports that the reuse happened -- the evidence for that is the measurement.
+TEST_F(ComputeTest, ASharedSubtreeAnswersAsItWouldAlone) {
+  const LogicalType p = LogicalType::Decimal(15, 2);
+  const auto price = Decimals(p, {"1050025", "200000", "0", "999", std::nullopt});
+  const auto discount = Decimals(p, {"10", "0", "500", std::nullopt, "7"});
+  const auto tax = Decimals(p, {"8", "100", std::nullopt, "2", "3"});
+  const auto one = ConstantOf(100, p);
+
+  // `price * (1 - discount)`, then that whole expression times `(1 + tax)`.
+  const auto net =
+      Arith(ArithOp::kMultiply, ColumnAt(0, p),
+            Arith(ArithOp::kSubtract, one, ColumnAt(1, p), LogicalType::Decimal(16, 2)),
+            LogicalType::Decimal(31, 4));
+  const auto charged = Arith(ArithOp::kMultiply, net,
+                             Arith(ArithOp::kAdd, one, ColumnAt(2, p), LogicalType::Decimal(16, 2)),
+                             LogicalType::Decimal(38, 6));
+
+  auto both = Appended({net, charged}, {price, discount, tax});
+  ASSERT_TRUE(both.ok()) << both.status().ToString();
+  ASSERT_EQ(both->size(), 2U);
+
+  // Each against the same expression computed on its own, which is the path without any reuse.
+  auto net_alone = Eval(net, {price, discount, tax});
+  auto charged_alone = Eval(charged, {price, discount, tax});
+  ASSERT_TRUE(net_alone.ok()) << net_alone.status().ToString();
+  ASSERT_TRUE(charged_alone.ok()) << charged_alone.status().ToString();
+  EXPECT_EQ(UnscaledText(*(*both)[0]), UnscaledText(**net_alone));
+  EXPECT_EQ(UnscaledText(*(*both)[1]), UnscaledText(**charged_alone))
+      << "reading the earlier expression must give what recomputing it gave, NULLs included";
+}
+
+// The same expression twice in one node: the second is the first, so it is reused at its root.
+TEST_F(ComputeTest, ADuplicateExpressionAnswersTwice) {
+  const LogicalType p = LogicalType::Decimal(15, 2);
+  const auto a = Decimals(p, {"500", std::nullopt, "250"});
+  const auto sum = Arith(ArithOp::kAdd, ColumnAt(0, p), ConstantOf(100, p), p);
+
+  auto both = Appended({sum, sum}, {a});
+  ASSERT_TRUE(both.ok()) << both.status().ToString();
+  ASSERT_EQ(both->size(), 2U);
+  EXPECT_EQ(UnscaledText(*(*both)[0]), UnscaledText(*(*both)[1]));
+  auto alone = Eval(sum, {a});
+  ASSERT_TRUE(alone.ok()) << alone.status().ToString();
+  EXPECT_EQ(UnscaledText(*(*both)[0]), UnscaledText(**alone));
+}
+
+// A shared subtree that overflows must fail with the error the earlier expression raises, at its
+// own operation: reuse must not move which expression of a node reports first, since DuckDB
+// evaluates a select list in order and so does ComputeBatch.
+TEST_F(ComputeTest, AnOverflowInASharedSubtreeFailsAsTheEarlierExpressionDoes) {
+  const LogicalType d38 = LogicalType::Decimal(38, 0);
+  // Doubling it is past DECIMAL(38, 0); the shift is unsigned because Int128 is signed.
+  const auto huge = static_cast<Int128>(UInt128{1} << 126U);
+  const auto column = Decimals(d38, {Int128ToString(huge)});
+  const auto doubled = Arith(ArithOp::kAdd, ColumnAt(0, d38), ColumnAt(0, d38), d38);
+  const auto twice_doubled = Arith(ArithOp::kAdd, doubled, doubled, d38);
+
+  auto alone = Eval(doubled, {column});
+  ASSERT_FALSE(alone.ok());
+  auto both = Appended({doubled, twice_doubled}, {column});
+  ASSERT_FALSE(both.status().ok());
+  EXPECT_EQ(both.status().ToString(), alone.status().ToString())
+      << "the node must fail on its first failing expression, with that expression's message";
+}
+
+// `checked` is set for a reused expression because this engine's own arithmetic has already
+// confirmed it fits its type. It must not be set for a column, which a file can fill with a value
+// its declared width does not admit -- so a node of two expressions still raises on such a column.
+TEST_F(ComputeTest, AColumnBeyondItsDeclaredWidthIsStillCheckedBesideAReusedExpression) {
+  const LogicalType narrow = LogicalType::Decimal(2, 1);  // admits 2 digits
+  const auto beyond = Decimals(narrow, {"150"});          // a file holding 3 of them
+  const auto wider = LogicalType::Decimal(3, 1);
+  const auto shared = Arith(ArithOp::kAdd, ColumnAt(0, narrow), ConstantOf(1, narrow), narrow);
+  // The second expression reuses `shared` and reads the same out-of-width column beside it.
+  const auto with_column = Arith(ArithOp::kAdd, shared, ColumnAt(0, narrow), wider);
+
+  auto alone = Eval(shared, {beyond});
+  auto both = Appended({shared, with_column}, {beyond});
+  EXPECT_EQ(alone.ok(), both.ok())
+      << "a value past a column's declared width is a failure with reuse exactly as without it";
+  if (!alone.ok()) {
+    EXPECT_EQ(both.status().ToString(), alone.status().ToString());
+  }
 }
 
 }  // namespace

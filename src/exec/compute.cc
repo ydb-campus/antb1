@@ -9,6 +9,7 @@
 #include <format>
 #include <limits>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -964,13 +965,49 @@ arrow::Result<std::shared_ptr<arrow::Array>> ValuesWithANewline(const arrow::Str
   return mask.Finish();
 }
 
+// An expression of a Compute node that has already been computed, with its values. A later
+// expression of the same node that *is* this one reads the values instead of computing them again.
+// ADR 0026's C10 compiles one program per expression, and `ep * (1 - disc)` is the whole of one of
+// the two expressions a SUM-heavy grouped query computes and a subtree of the other, so it was
+// compiled and run twice: six steps a row where four do.
+//
+// Only an expression already materialised as one of the node's outputs qualifies, which is what
+// makes this free of C10's objection to evaluating node by node: no array is written that was not
+// written anyway, so it moves no extra bytes. It also leaves expression order alone, so a batch
+// still fails on its first failing expression, as DuckDB does -- and a shared subtree that raises
+// is raised by the earlier expression, with the same message and at the same row.
+struct ComputedExpr {
+  const plan::Expr* expr;
+  ArrayPtr values;
+};
+
 struct Evaluator {
   const arrow::RecordBatch& batch;
   arrow::MemoryPool* pool;
   arrow::compute::ExecContext* ctx;
+  // The node's earlier expressions, in evaluation order. Empty for an expression evaluated alone.
+  std::span<const ComputedExpr> computed;
 
   arrow::Result<ArrayPtr> operator()(const plan::Expr& expr) const {
+    if (const ArrayPtr* done = Reused(expr); done != nullptr) {
+      return *done;
+    }
     return std::visit([&](const auto& node) { return Evaluate(node, expr); }, expr.node);
+  }
+
+  // The values of an earlier expression of this node that is `expr`, or null. DECIMAL only: it is
+  // the program path that recompiles a whole subtree, and keeping the test there keeps every other
+  // type on exactly the path it had.
+  [[nodiscard]] const ArrayPtr* Reused(const plan::Expr& expr) const {
+    if (expr.type != plan::LogicalType::kDecimal) {
+      return nullptr;
+    }
+    for (const ComputedExpr& done : computed) {
+      if (plan::SameExpr(*done.expr, expr)) {
+        return &done.values;
+      }
+    }
+    return nullptr;
   }
 
   arrow::Result<ArrayPtr> Evaluate(const plan::ColumnExpr& column, const plan::Expr& /*e*/) const {
@@ -1377,6 +1414,17 @@ struct Evaluator {
   std::optional<DecimalProgram::Source> Compile(const plan::Expr& expr,
                                                 DecimalProgram& program) const {
     using Source = DecimalProgram::Source;
+    // An earlier expression of this node that is this subtree: read its array as a column of the
+    // program. `checked` because a value this engine computed is within its own type already --
+    // only a column a file filled can hold what its declared width does not admit.
+    if (const ArrayPtr* done = Reused(expr); done != nullptr && ReadableInPlace(**done)) {
+      if (auto read = ReadDecimalOperand(**done, expr.type, std::string()); read.ok()) {
+        read->owner = *done;
+        read->checked = true;
+        program.columns.push_back(*std::move(read));
+        return Source{.kind = Source::Kind::kColumn, .at = program.columns.size() - 1};
+      }
+    }
     if (const std::optional<Int128> value = UnscaledConstant(expr); value.has_value()) {
       program.constants.push_back(*value);
       return Source{.kind = Source::Kind::kConstant, .at = program.constants.size() - 1};
@@ -1422,20 +1470,25 @@ struct Evaluator {
     const Int128 left_factor = ScaleFactor(arith->left->type, expr.type, arith->op);
     const Int128 right_factor = ScaleFactor(arith->right->type, expr.type, arith->op);
     const bool rescales = arith->op != plan::ArithOp::kMultiply;
-    program.steps.push_back(DecimalProgram::Step{
-        .left_factor = left_factor,
-        .right_factor = right_factor,
-        .range = plan::RangeOf(expr.type),
-        .left = *left,
-        .right = *right,
-        .left_column = name(*arith->left),
-        .right_column = name(*arith->right),
-        .op = arith->op,
-        .check_left = rescales && left->kind == Source::Kind::kColumn && left_factor == 1,
-        .check_right = rescales && right->kind == Source::Kind::kColumn && right_factor == 1,
-        .type = expr.type,
-        .left_type = arith->left->type,
-        .right_type = arith->right->type});
+    // A column whose values a rescale has not already confirmed has to be checked against this
+    // step's range. A reused expression's array carries `checked`, so it is not re-checked.
+    const auto unchecked = [&](const Source& source, const Int128& factor) {
+      return rescales && source.kind == Source::Kind::kColumn && factor == 1 &&
+             !program.columns[source.at].checked;
+    };
+    program.steps.push_back(DecimalProgram::Step{.left_factor = left_factor,
+                                                 .right_factor = right_factor,
+                                                 .range = plan::RangeOf(expr.type),
+                                                 .left = *left,
+                                                 .right = *right,
+                                                 .left_column = name(*arith->left),
+                                                 .right_column = name(*arith->right),
+                                                 .op = arith->op,
+                                                 .check_left = unchecked(*left, left_factor),
+                                                 .check_right = unchecked(*right, right_factor),
+                                                 .type = expr.type,
+                                                 .left_type = arith->left->type,
+                                                 .right_type = arith->right->type});
     return Source{.kind = Source::Kind::kStep, .at = program.steps.size() - 1};
   }
 
@@ -1762,6 +1815,22 @@ struct Evaluator {
   }
 };
 
+// `expr` over `batch`, reusing the values of any of `computed` that it is. The public EvaluateExpr
+// is this with nothing computed yet.
+arrow::Result<ArrayPtr> EvaluateReusing(const plan::Expr& expr, const arrow::RecordBatch& batch,
+                                        std::span<const ComputedExpr> computed,
+                                        arrow::MemoryPool* pool) {
+  arrow::compute::ExecContext ctx(pool);
+  ARROW_ASSIGN_OR_RAISE(
+      ArrayPtr values,
+      (Evaluator{.batch = batch, .pool = pool, .ctx = &ctx, .computed = computed})(expr));
+  if (!values->type()->Equals(*plan::ToArrow(expr.type))) {
+    return arrow::Status::Invalid("expression of type ", plan::ToString(expr.type),
+                                  " evaluated to ", values->type()->ToString());
+  }
+  return values;
+}
+
 arrow::FieldVector ComputedFields(const arrow::Schema& input,
                                   const std::vector<plan::ExprPtr>& exprs) {
   arrow::FieldVector fields = input.fields();
@@ -1776,14 +1845,7 @@ arrow::FieldVector ComputedFields(const arrow::Schema& input,
 arrow::Result<std::shared_ptr<arrow::Array>> EvaluateExpr(const plan::Expr& expr,
                                                           const arrow::RecordBatch& batch,
                                                           arrow::MemoryPool* pool) {
-  arrow::compute::ExecContext ctx(pool);
-  ARROW_ASSIGN_OR_RAISE(ArrayPtr values,
-                        (Evaluator{.batch = batch, .pool = pool, .ctx = &ctx})(expr));
-  if (!values->type()->Equals(*plan::ToArrow(expr.type))) {
-    return arrow::Status::Invalid("expression of type ", plan::ToString(expr.type),
-                                  " evaluated to ", values->type()->ToString());
-  }
-  return values;
+  return EvaluateReusing(expr, batch, {}, pool);
 }
 
 std::shared_ptr<arrow::Schema> ComputedSchema(const arrow::Schema& input,
@@ -1797,8 +1859,14 @@ arrow::Result<Batch> ComputeBatch(const Batch& in, const std::vector<plan::ExprP
   // Only the selected rows are computed: an expression never fails on a row a filter dropped.
   ARROW_ASSIGN_OR_RAISE(auto rows, Materialize(in, pool));
   arrow::ArrayVector columns = rows->columns();
+  // Each expression may read the values of an earlier one of this node that it is, rather than
+  // computing the same subtree again (ComputedExpr). Order is the node's own, so the error a batch
+  // raises does not move.
+  std::vector<ComputedExpr> computed;
+  computed.reserve(exprs.size());
   for (const plan::ExprPtr& expr : exprs) {
-    ARROW_ASSIGN_OR_RAISE(auto values, EvaluateExpr(*expr, *rows, pool));
+    ARROW_ASSIGN_OR_RAISE(auto values, EvaluateReusing(*expr, *rows, computed, pool));
+    computed.push_back(ComputedExpr{.expr = expr.get(), .values = values});
     columns.push_back(std::move(values));
   }
   return Batch{.data = arrow::RecordBatch::Make(schema, rows->num_rows(), std::move(columns)),
