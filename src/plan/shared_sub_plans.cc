@@ -1,4 +1,4 @@
-#include "shared_sub_plans.h"
+#include "antb1/plan/shared_sub_plans.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -343,6 +343,51 @@ int64_t FieldUnion(const std::vector<LogicalNodePtr>& members) {
   return total;
 }
 
+// The group of `members`, or none when their outputs do not nest -- when no member's output columns
+// contain every other's, so that one result could not serve them all. Overlapping-but-not-nested
+// outputs are possible in principle (two scans reading {0,1} and {1,2}) and are reported as nothing
+// rather than as a group a consumer could not read.
+std::optional<SharedSubPlan> GroupOf(std::vector<LogicalNodePtr> members, const Origins& origins) {
+  // Each member's output columns as origin ordinals: two columns match when they come from the
+  // same place, which is the only sense in which the members' outputs can be compared -- their
+  // ColumnIds are minted per reference and never equal.
+  std::vector<std::vector<int>> outputs;
+  outputs.reserve(members.size());
+  for (const LogicalNodePtr& member : members) {
+    std::vector<int> ordinals;
+    for (const ColumnId id : OutputIds(*member)) {
+      ordinals.push_back(origins.Of(id));
+    }
+    outputs.push_back(std::move(ordinals));
+  }
+  // The widest is the candidate container; every other output must be found inside it.
+  std::size_t widest = 0;
+  for (std::size_t i = 1; i < outputs.size(); ++i) {
+    if (outputs[i].size() > outputs[widest].size()) {
+      widest = i;
+    }
+  }
+  std::vector<std::vector<int>> columns;
+  columns.reserve(members.size());
+  for (const std::vector<int>& output : outputs) {
+    std::vector<int> positions;
+    positions.reserve(output.size());
+    for (const int ordinal : output) {
+      const auto at = std::ranges::find(outputs[widest], ordinal);
+      if (ordinal == Origins::kUnknown || at == outputs[widest].end()) {
+        return std::nullopt;  // not nested, so not one result's to serve
+      }
+      positions.push_back(static_cast<int>(at - outputs[widest].begin()));
+    }
+    columns.push_back(std::move(positions));
+  }
+  const int64_t fields = FieldUnion(members);  // before the move, which empties `members`
+  return SharedSubPlan{.members = std::move(members),
+                       .widest = widest,
+                       .columns = std::move(columns),
+                       .fields = fields};
+}
+
 }  // namespace
 
 std::vector<SharedSubPlan> SharedSubPlans(const LogicalPlan& plan) {
@@ -385,9 +430,10 @@ std::vector<SharedSubPlan> SharedSubPlans(const LogicalPlan& plan) {
     const std::optional<std::string>& key = SubtreeKey(node, origins, memo);
     if (key.has_value() && by_key[*key].size() > 1) {
       if (reported.insert(*key).second) {
-        std::vector<LogicalNodePtr> members = by_key[*key];
-        const int64_t fields = FieldUnion(members);  // before the move, which empties `members`
-        out.push_back(SharedSubPlan{.members = std::move(members), .fields = fields});
+        if (std::optional<SharedSubPlan> group = GroupOf(by_key[*key], origins);
+            group.has_value()) {
+          out.push_back(*std::move(group));
+        }
       }
       return;  // no descending into a member: its children repeat too, and only this is maximal
     }

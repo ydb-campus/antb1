@@ -28,6 +28,8 @@ antb1_add_module(
     group_aggregate.cc
     join_table.cc
     key_filter.cc
+    materialized_table.cc
+    shared_builds.cc
     limit.cc
     gather.cc
     hash_join.cc
@@ -54,6 +56,7 @@ if(ANTB1_BUILD_TESTS)
       tests/sort_test.cc
       tests/like_test.cc
       tests/scan_filter_test.cc
+      tests/shared_builds_test.cc
       tests/parallel_test.cc
       tests/heavy_hitters_test.cc
       tests/join_table_test.cc

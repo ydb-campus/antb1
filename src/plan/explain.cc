@@ -13,9 +13,8 @@
 
 #include "antb1/plan/catalog.h"
 #include "antb1/plan/logical_plan.h"
+#include "antb1/plan/shared_sub_plans.h"
 #include "antb1/plan/types.h"
-
-#include "shared_sub_plans.h"
 
 namespace antb1::plan {
 namespace {

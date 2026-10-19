@@ -1,4 +1,4 @@
-#include "../shared_sub_plans.h"
+#include "antb1/plan/shared_sub_plans.h"
 
 #include <cstddef>
 #include <string>
@@ -74,10 +74,12 @@ TEST(SharedSubPlansTest, SharesNoNodeWhoseContentDiffers) {
                    "(SELECT i64 FROM t WHERE i32 > 1) AS b WHERE a.i64 = b.i64"),
             (std::vector<std::string>{"Scan 2x2"}))
       << "a different constant: the filters are not shared, the scans under them are";
-  EXPECT_EQ(Groups("SELECT COUNT(*) FROM (SELECT i64 FROM t WHERE i32 > 0) AS a, "
-                   "(SELECT i64 FROM t WHERE i16 > 0) AS b WHERE a.i64 = b.i64"),
-            (std::vector<std::string>{"Scan 2x3"}))
-      << "a different column: likewise, and the union is i64, i32 and i16";
+  EXPECT_TRUE(Groups("SELECT COUNT(*) FROM (SELECT i64 FROM t WHERE i32 > 0) AS a, "
+                     "(SELECT i64 FROM t WHERE i16 > 0) AS b WHERE a.i64 = b.i64")
+                  .empty())
+      << "a different column, and nothing at all is reported: the filters differ, and the scans "
+         "below them read {i64, i32} and {i64, i16} -- overlapping but neither inside the other, "
+         "so no one member's result could serve both and the group is not reported";
   EXPECT_TRUE(Groups("SELECT COUNT(*) FROM t AS a, u AS b WHERE a.i64 = b.i64").empty())
       << "a different table shares nothing at all";
   // A DECIMAL constant against the column's own type and a DOUBLE one, which ADR 0021 rule 11

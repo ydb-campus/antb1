@@ -229,7 +229,15 @@ class MemoryTable final : public plan::Table {
       : schema_(std::move(schema)), batches_(std::move(batches)), split_(split) {}
 
   const std::shared_ptr<arrow::Schema>& schema() const override { return schema_; }
+  // The rows it claims to hold, which is the batches' rows unless a test says otherwise. Claiming
+  // more is how a test reaches a gate that only a large table passes (ADR 0030's E2 shares a
+  // sub-plan only where it reads enough rows to be worth not reading twice) without carrying a
+  // large fixture to get there.
+  void set_claimed_rows(int64_t rows) { claimed_rows_ = rows; }
   std::optional<int64_t> exact_row_count() const override {
+    if (claimed_rows_.has_value()) {
+      return claimed_rows_;
+    }
     int64_t rows = 0;
     for (const auto& b : batches_) {
       rows += b->num_rows();
@@ -456,6 +464,7 @@ class MemoryTable final : public plan::Table {
   std::optional<int> failing_field_;
   bool stats_ = true;
   bool scan_filter_ = true;
+  std::optional<int64_t> claimed_rows_;
   mutable std::atomic<int> filtered_scans_ = 0;
   mutable std::atomic<int> scans_ = 0;
   mutable std::mutex mutex_;
