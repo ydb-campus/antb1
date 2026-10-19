@@ -4,7 +4,10 @@ Date: 2026-10-14
 
 ## Status
 
-Proposed
+Accepted (every item but C4, C7 and T4 built and measured; C12's four-arm run carries the numbers it was
+accepted on. Filter-aware estimates choose the build side, a cost model over any tree shape chooses the join
+order, and the join became the sink of its probe pipeline. 0.368x of the 22 and the gap to DuckDB from 6.75x
+to 2.48x -- three quarters of it Q21 alone, whose joins no longer build the largest relation.)
 
 ## Context
 
@@ -655,8 +658,6 @@ this profiling fires:
   needed a twelve-row case sliced at row 8 to catch at all -- at any offset that is not a whole number of bytes the
   code took the other path and the bug hid.
 
-## Alternatives considered
-
 - **C11, perf(exec): a constant operand as a scalar, not an array of copies, done 2026-10-16.** C9 stopped a DECIMAL
   constant being materialised; the **integer and DOUBLE path never got the same treatment**, and asking what it cost
   there gave a sharper answer than expected. Over 100M rows of one column, with a `GROUP BY` so that DuckDB's
@@ -688,6 +689,84 @@ this profiling fires:
   ways and compares answers *and* error messages, including a narrowing that fits, one that does not, an overflow,
   and a decimal past the exactly representable range. Worth recording that the two conversions agree on every value
   tried, so that case asserts the invariant rather than proving the routing necessary.
+
+- **C12, docs(adr): record what the eleven items measured together, and close this ADR.** The one figure no entry
+  above could give: a cumulative one. Each item was measured against its own control in its own session, and
+  [ADR 0029](0029-dynamic-join-filters.md)'s D4 shows what composing such figures is worth -- re-taken as one pair,
+  its own ratio moved 5%. So this is a **four-arm run, every arm built from a deleted release tree and measured in
+  one session**: a discarded warm-up pass each, best of three, antb1 and DuckDB interleaved per query, 14 threads,
+  SF 100. Arms ran in the order C, A, D, B, so the arm expected to be fastest met the coldest machine and any
+  monotonic drift biases *against* this ADR.
+
+  | arm | tree | holds |
+  | --- | --- | --- |
+  | A | the commit that recorded this ADR | none of C1-C11 |
+  | D | C11, the last item dated 2026-10-16 | C1 to C5a and C8 to C11; not C6 |
+  | B | the commit before ADR 0029's first item | and the GROUP BY, top-N and regexp work of 10-17 and 10-18 |
+  | C | main | and ADRs 0029 and 0030, C6 among them |
+
+  | | A | D | B | C |
+  | --- | ---: | ---: | ---: | ---: |
+  | **antb1, the 22** | 197.14 s | 72.59 s | 68.28 s | **56.51 s** |
+  | antb1 geomean | 3.918 s | 2.505 s | 2.345 s | **2.012 s** |
+  | DuckDB, the 22 (the drift control) | 29.21 s | 29.31 s | 29.24 s | 29.88 s |
+  | **against DuckDB, total** | **6.75x** | 2.48x | 2.33x | **1.89x** |
+  | against DuckDB, geomean | 3.64x | 2.33x | 2.18x | **1.83x** |
+
+  DuckDB over four arms spans 29.21 s to 29.88 s, **2.3%**, and its slowest arm is C: the tree with the best antb1
+  figure ran under the worst conditions of the four.
+
+  - **This ADR is A to D: 0.368x of the totals, 0.639x of the geomean, 124.55 s.** Everything after it is 16.08 s,
+    so these eleven items are **88.6% of every second this workload has gained**. The rest divides as D to B
+    0.941x (4.31 s, the GROUP BY merge, top-N part pruning and regexp items, none of them this ADR's) and B to C
+    0.828x (11.77 s, ADRs 0029 and 0030 with C6).
+  - **Three quarters of it is one query.** Q21 goes 99.826 s to 7.658 s, **0.077x**, which is 92.17 s of the
+    124.55 s. That is the profile [ADR 0023](0023-unnesting.md)'s trigger named on 2026-10-15 -- both its joins
+    building the whole of the largest relation -- and C2b, C2c and C3 are what removed it. Excluding Q21 the ADR
+    still measures **0.667x** over the other 21, and the geomean, which no single query can carry, is 0.639x. Both
+    readings are true and the honest summary needs both: **one catastrophe removed, plus a broad third off
+    everything else.** After Q21 come Q10 0.272x (8.66 s), Q07 0.418x, Q08 0.435x, Q09 0.598x and Q05 0.468x; those
+    six are 93% of the ADR's saving.
+  - **The control, and why one join-free query moves while the other does not.** Q06 holds no join and reads
+    **0.998x** -- flat, as a join ADR demands. Q01 holds no join either and reads 0.705x, which is not a
+    contradiction: C9, C10 and C11 are DECIMAL arithmetic items rather than join items, and Q01 runs decimal
+    arithmetic over nearly every row of the largest table. Q06's decimal work sits above a highly selective filter,
+    so the same three items have almost nothing to pay them there. A join-free query moving is only evidence of
+    a wrong attribution when no item of the ADR reaches it.
+  - **C2c's named beneficiary did not move.** Its entry profiled Q22's anti join building 150,000,000 rows to probe
+    them with 1,900,000. Q22 reads 0.851 s at A and 0.871 s at D, **1.024x**, and 0.860 s at main. So that build was
+    not what Q22 spends its time on at this scale and thread count, whatever the row counts say. Recorded as an
+    observation that wants a profile, not as a conclusion: the item is still right about the row counts, and the
+    build direction it fixed is the one C3 needs for the queries that did move.
+  - **Not built, and this is part of what is accepted.** **C4** (keep a large build parallel) -- deferred by its own
+    entry, since after C3 no query of the 22 reaches `OneAtATime`'s threshold, and the cliff at
+    `src/exec/join_table.cc:142` still waits for a legitimately large build. **C7** (the 22 as an on-demand CI job)
+    -- `.github/` is a protected path and the handoff diff was never written. **T4** (generate the shapes the build
+    directions answer) -- the choice itself has unit and integration coverage in `join_order_test.cc`,
+    `binder_test.cc` and `tests/integration/join_test.cc`, so this is not a change shipped untested; what is missing
+    is the *differential* layer, generated queries whose preserved side is the smaller one, so that `diff-random`
+    puts the plans C3 newly chooses against DuckDB. `tests/slt/runner/query_gen.cc` names no preserved side and no
+    build direction.
+  - **What this run says about measurement, which outlives the numbers.** Arms B and C are the same two trees
+    ADR 0029's D4 measured as a matched pair. D4 reported 0.787x; this run reads **0.828x**. Arm C reproduces to
+    1.0% (55.97 s against 56.51 s) but arm B differs by 4.0% (71.09 s against 68.28 s), and the direction follows
+    arm order exactly: B ran first, cold, in D4's run and third, warm, here. DuckDB registered 1.7% of that, so
+    **the drift control under-reports the very effect it exists to catch.** A matched pair in one session is
+    reproducible to about 5% on the ratio and no better; only the ordering of the arms fixes the sign of the
+    residual, which is why this run fixed it against itself.
+  - **Where the gap is now, which is the input to whatever comes next.** At A, Q21 alone was 95.99 s of a 167.93 s
+    deficit, 57%. At main the deficit is 26.63 s and its ten largest are 20.47 s, 77%, spread over Q21 2.68 s,
+    Q09 2.52 s, Q01 2.32 s, Q18 2.25 s, Q13 2.13 s, Q12 1.90 s, Q03 1.89 s, Q07 1.65 s, Q10 1.59 s and Q05 1.54 s.
+    **No single query dominates any more**, which is the change three ADRs bought and also the reason the next one
+    will be harder to justify per item. **Q13 has not moved at any arm** -- 4.378 s, 4.404 s, 4.265 s, 4.420 s --
+    and is now among the five largest gaps: nothing in ADRs 0026, 0029 or 0030 reaches it.
+  - **Accepted on these figures (2026-10-19), by the maintainer.** For: 0.368x of the 22, the gap to DuckDB from
+    6.75x to 2.48x on this ADR's own arms and to 1.89x with the two that followed, every mechanism measured and the
+    worst query of the workload no longer the worst by an order of magnitude. Against: three quarters of the gain is
+    one query, so the per-item case is thinner than the total suggests; C4, C7 and T4 are unbuilt; and C2c moved
+    nothing on the query it was profiled against.
+
+## Alternatives considered
 
 - **Keep the footer-only estimates and swap the side by a rule of thumb** (build on a scan, probe a join; build on
   the second relation of the FROM list). Cheap, and it would fix Q12. Rejected: it is not a rule anyone can predict

@@ -437,6 +437,14 @@ lesson of [ADR 0027](0027-string-views.md)'s S1, which was planned as a win whos
     figure: each was measured in its own session against its own control, and D5's control arm alone read 61.19 s
     where the previous pair's "after" read 60.35 s -- a session-to-session drift larger than several of the items.
     **A cumulative claim needs a cumulative pair, not a product of ratios.**
+  - **Correction (2026-10-19): this pair reads 0.828x, not 0.787x, when the arms run in the other order.**
+    [ADR 0026](0026-join-performance.md)'s C12 measured four arms in one session, two of them these same two
+    trees. The "after" arm reproduces to 1.0% (55.97 s against 56.51 s); the "before" arm differs by 4.0%
+    (71.09 s against 68.28 s), and the direction follows arm order -- it ran first and cold here, third and warm
+    there. DuckDB registered 1.7% of that, so the drift control under-reported the effect it exists to catch.
+    **Read this entry as 0.79x to 0.83x, and the gap as 1.85x to 1.89x**; C12's figures are the pessimistic ones
+    and are preferred where the two disagree. The decision below does not turn on the difference, and the
+    attribution above is unaffected: it divides one run's arms, not two runs' totals.
   - **Twice the value landed somewhere the plan did not predict**, which is the transferable lesson: D2 arrived to
     find D1 had already taken the prize it was costed on, and C6 was planned as plumbing for D1 while being worth
     more than its own entry expected. Both are failures of *ordering* analysis rather than of measurement -- the
