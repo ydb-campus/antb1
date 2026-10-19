@@ -190,6 +190,40 @@ TEST_F(GroupedSumAliasTest, TheSameAverageTwiceShares) {
   EXPECT_TRUE((*both)->column(2)->Equals(*(*one)->column(1)));
 }
 
+// The one case that fails if the sharing stops happening at all. Every other case here compares
+// answers, and answers are the same either way -- that is the point of the change -- so none of
+// them can see the alias. An alias charges no memory and a real accumulator charges its two
+// per-group vectors, so memory_usage() tells them apart without a new interface.
+TEST_F(GroupedSumAliasTest, OnlyOneAccumulatorIsBuiltForASumAndAnAvgOfOneColumn) {
+  const auto rows = Rows();
+  const auto key = Column(0, "k", LogicalType::kBigInt);
+  const auto built = [&](const std::vector<plan::AggregateCall>& calls) {
+    auto table =
+        GroupTable::Make({key}, calls, rows->num_columns(), arrow::default_memory_pool(), nullptr);
+    EXPECT_TRUE(table.ok()) << table.status().ToString();
+    EXPECT_TRUE((*table)->Consume(*rows).ok());  // sizes the per-group vectors
+    return std::move(*table);
+  };
+
+  const auto shared = built({Sum(1), Avg(1)});
+  EXPECT_GT(shared->state(0).memory_usage(), 0) << "the first call owns the accumulator";
+  EXPECT_EQ(shared->state(1).memory_usage(), 0)
+      << "the second call must read the first's accumulator, not build its own";
+
+  // Two columns: nothing to share, so both calls own one.
+  const auto separate = built({Sum(1), Sum(2)});
+  EXPECT_GT(separate->state(0).memory_usage(), 0);
+  EXPECT_GT(separate->state(1).memory_usage(), 0);
+
+  // An integer column uses another accumulator, which this change does not alias. Pinned here so
+  // that widening the scope later has to update a test rather than silently change behaviour.
+  const auto integers =
+      built({Call(plan::AggKind::kSum, 3, LogicalType::kBigInt, LogicalType::kHugeInt),
+             Call(plan::AggKind::kAvg, 3, LogicalType::kBigInt, LogicalType::kDouble)});
+  EXPECT_GT(integers->state(0).memory_usage(), 0);
+  EXPECT_GT(integers->state(1).memory_usage(), 0) << "an integer SUM and AVG do not share yet";
+}
+
 // An integer column is served by another accumulator, which this change does not alias: the point
 // of the case is that the answers are right either way, so the scope is pinned rather than assumed
 // and widening it later has a test to keep.
