@@ -18,6 +18,9 @@
 namespace antb1::plan {
 namespace {
 
+// Defined below, and used by Origins: a constant as its type and its text.
+std::string ConstantKey(const Constant& constant);
+
 // A column's plan-wide ordinal: two columns get the same one exactly when they come from the same
 // place. This is the whole trick of the pass. A ColumnId is minted per reference, so two references
 // to one CTE never share one, and BoundColumn::index is a position, which a scan reading one field
@@ -80,7 +83,7 @@ class Origins {
       const std::optional<Constant>* constant =
           i < node.constants.size() ? &node.constants[i] : nullptr;
       if (constant != nullptr && constant->has_value()) {
-        Set(node.ids[i], std::format("k{}", ToString(**constant)));
+        Set(node.ids[i], std::format("k{}", ConstantKey(**constant)));
       } else if (i < node.columns.size()) {
         Set(node.ids[i], std::format("={}", Key(node.columns[i])));
       }
@@ -117,6 +120,18 @@ class Origins {
   std::unordered_map<std::string, int> interned_;
 };
 
+// A constant as a key: **its type and its text**, never the text alone. ToString is a display
+// format, which renders 1 the same whatever integer type it has and says nothing about a DECIMAL's
+// precision -- and a constant's type is part of what it means. On a DECIMAL column a predicate's
+// constant is the column's type or DOUBLE, and those two compare differently (ADR 0021 rule 11); a
+// Project's constant decides its output column's type outright. Keying on the text alone would let
+// two sub-plans that compute different values be grouped, which is the one mistake this pass must
+// not make -- and it would be the same error as hanging identity on a display format, which the
+// column keys above deliberately avoid.
+std::string ConstantKey(const Constant& constant) {
+  return std::format("{}:{}", static_cast<int>(constant.type.id()), ToString(constant));
+}
+
 // `p` as a key. With `local`, its columns are the operand-local ones of a PredicateExpr (index 0
 // and 1 into the operands) rather than columns of a node's input, so they are keyed by position.
 std::string PredicateKey(const Predicate& p, const Origins& origins, bool local) {
@@ -127,10 +142,10 @@ std::string PredicateKey(const Predicate& p, const Origins& origins, bool local)
     return local ? std::format("@{}", c->index) : origins.Key(*c);
   };
   std::string key = std::format("P{},{},{},{},{}", static_cast<int>(p.kind), column(p.column),
-                                column(p.other), static_cast<int>(p.op), ToString(p.constant));
+                                column(p.other), static_cast<int>(p.op), ConstantKey(p.constant));
   for (const Constant& value : p.values) {
     key += ',';
-    key += ToString(value);
+    key += ConstantKey(value);
   }
   return key;
 }
@@ -156,7 +171,7 @@ std::string ExprKey(const ExprPtr& expr, const Origins& origins) {
           return e.id == kNoColumnId ? std::format("@{}", e.index)
                                      : std::format("c{}", origins.Of(e.id));
         } else if constexpr (std::is_same_v<T, ConstantExpr>) {
-          return std::format("k{}", ToString(e.value));
+          return std::format("k{}", ConstantKey(e.value));
         } else if constexpr (std::is_same_v<T, ArithExpr>) {
           return std::format("A{}({},{})", static_cast<int>(e.op), ExprKey(e.left, origins),
                              ExprKey(e.right, origins));
@@ -218,7 +233,7 @@ std::optional<std::string> NodeKey(const LogicalNode& node, const Origins& origi
           std::string key = "project(";
           for (std::size_t i = 0; i < n.columns.size(); ++i) {
             if (i < n.constants.size() && n.constants[i].has_value()) {
-              key += std::format("k{};", ToString(*n.constants[i]));
+              key += std::format("k{};", ConstantKey(*n.constants[i]));
             } else {
               key += std::format("{};", origins.Key(n.columns[i]));
             }

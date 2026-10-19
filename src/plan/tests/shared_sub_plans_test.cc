@@ -80,6 +80,16 @@ TEST(SharedSubPlansTest, SharesNoNodeWhoseContentDiffers) {
       << "a different column: likewise, and the union is i64, i32 and i16";
   EXPECT_TRUE(Groups("SELECT COUNT(*) FROM t AS a, u AS b WHERE a.i64 = b.i64").empty())
       << "a different table shares nothing at all";
+  // A DECIMAL constant against the column's own type and a DOUBLE one, which ADR 0021 rule 11
+  // compares differently. These two are told apart by their text alone (ToString renders them
+  // "1.50" and "1.5"), so this pins the behaviour without exercising ConstantKey's type component
+  // -- see the comment on ConstantKey for why that component is there regardless. No SQL of this
+  // subset spells one literal at two types, so the case it guards is not reachable to write a test
+  // for: a predicate's constant is typed as its column, and an integer literal has one type.
+  EXPECT_EQ(Groups("SELECT COUNT(*) FROM (SELECT p FROM dec WHERE p > 1.5) AS a, "
+                   "(SELECT p FROM dec WHERE p > 1.5e0) AS b WHERE a.p = b.p"),
+            (std::vector<std::string>{"Scan 2x1"}))
+      << "two constants of different types must not be shared";
 }
 
 // An ordered or limited sub-plan is never a member: a shared result cannot hand two consumers an
