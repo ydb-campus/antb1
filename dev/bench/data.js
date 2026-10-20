@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792507177257,
+  "lastUpdate": 1792514314561,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -15696,6 +15696,258 @@ window.BENCHMARK_DATA = {
             "value": 2631.5712509999685,
             "unit": "ms/iter",
             "extra": "iterations: 1\ncpu: 2631.4027210000004 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "35f996c70fcf62bb44daff860ef967ed69d4dcf9",
+          "message": "feat(io): a DECIMAL of at most 18 digits reads as decimal64 (#203)\n\n## What and why\n\nADR 0021's decimal64 item, **step 5** — option A of the two the ADR left\nopen. The engine type follows\n`plan::ToArrow` and nothing else, so a DECIMAL of at most 18 digits\nnarrows whatever the file stored it as.\n\n**Both paths.** The filtered scan already restricted itself to an INT32\nor INT64 physical column for a DECIMAL,\nwhere the decoded unscaled value *is* the engine value — so narrowing\nthere **removes** the widening it used to do:\neight bytes a survivor instead of sixteen, cheaper rather than merely\nequal. The unfiltered path converts whatever\nArrow decoded (decimal32, decimal128 or decimal256) into decimal64 of\nthe same precision and scale.\n\n**Arrow's reader option is not used, and that is a decision.**\n`set_smallest_decimal_enabled` is global per reader,\nso it cannot narrow one column and not another; it is **ignored outright\nwhen a file carries an `ARROW:schema`**,\nwhich would give files of mixed provenance different types within one\ntable and break `Open`'s cross-file schema\ncheck; and it infers from the precision rather than the storage.\nNarrowing in io's own conversion avoids all three.\n\n## The open question is settled, and the premise it was asked under was\nwrong\n\nI recommended \"narrow only INT32/INT64-backed columns\" and you agreed.\nMeasuring first turned up two things:\n\n1. **It could not have been expressed anyway.** `plan::Table::schema()`\nis `ToArrow(logical)` by construction\n(`table.h:69`), and a per-storage decision is not a property of a\nlogical type.\n2. **It would have made no difference.** Every Parquet storage of a\ndecimal is sized to the column's precision, so\nat ≤ 18 digits none can hold a value an int64 cannot. Measured against\nthis environment's writer:\n\n| p | 4 | 9 | 15 | **18** | 19 | 38 |\n|---|---|---|---|---|---|---|\n| FIXED_LEN_BYTE_ARRAY bytes | 2 | 4 | 7 | **8** | 9 | 16 |\n\nNarrowing is lossless **by the storage's own width**, not by trusting\nthe declared precision — and even a value\nbeyond that precision survives, because it had to fit the storage to\nexist. The ADR's bullet is corrected to say so.\n\nSo the range check in the narrowing conversion is a guard against a\n**malformed BYTE_ARRAY file**, not a behaviour\nchange on a valid one. Dropping it fails no test, and the comment says\nthat rather than leaving a reader to infer a\nhazard conforming files do not have. My first attempt at a test for it\nwrote a value past the column's precision\ninto an FLBA column and discovered the **writer** had truncated it — so\nthe case was about a corrupt file, not the\nengine. It is gone rather than left to look like coverage.\n\n## A step-3 gap, found by running the suite with the switch on\n\nThe ungrouped MIN/MAX uses `arrow::compute::MinMax`, and **Arrow 25 has\nno `min_max` kernel for decimal64 or\ndecimal32** — probed. That is a third missing kernel after `sum` and\n`array_sort_indices`, and the first one this\nengine actually calls. A narrow column is widened for the kernel and the\nanswer narrowed back at `Finalize`: one\ncast a batch, on a path that reduces a whole column to one row.\n\nI found it because, with every piece now in place, I defaulted the\nswitch on and ran the whole suite: **41 of 2788\nfailed**, and the MIN/MAX fix took 8 of those. Most of the rest are unit\ntests that construct decimal128 arrays by\nhand, which is correct for the default. The genuine end-to-end gaps left\nare **CASE over decimals and decimal\ncomparisons**, both \"internal error\" — that is step 6's scope, now known\nrather than guessed.\n\n## Tests\n\nThe existing storage-matrix and filtered-scan cases now run at **both\nwidths** — decimal32/64/128/256 storage, with\nand without an `ARROW:schema`, with and without integer storage — so the\nnarrow path is covered across the same\nmatrix the wide one was. Three mutations fail them: refusing a narrow\ndecimal in the filtered path, storing sixteen\nbytes for a narrow engine value, and the filtered path narrowing\ndifferently from the unfiltered one (the schema\nassertion catches that one).\n\n## Verification\n\n```\npixi run test     # full suite with the switch off, PASS\npixi run lint     # clang-format, typos, check_repo pass\n```\n\nclang-tidy clean on all five touched files. Gates not verifiable on this\nhost are as in #198 to #202.\n\nChecked against [ADR\n0006](../blob/main/docs/adr/0006-benchmark-data-policy.md): no data, no\nquery text, no timings\n— and still no end-to-end number, which arrives when step 6 lets the\nswitch go on.\n\n## AI assistance\n\n- Tool: Claude Code (Opus 5). It measured the FLBA width before writing\nthe rule, discarded a test that turned out\nto describe a corrupt file, and found the MIN/MAX gap by turning the\nswitch on rather than by reading.\n- Accountable human (has read and understands the whole diff): @hor911\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-20T19:35:11+03:00",
+          "tree_id": "e3e52d2560440f0ff2070014b22a839930c1b881",
+          "url": "https://github.com/ydb-campus/antb1/commit/35f996c70fcf62bb44daff860ef967ed69d4dcf9"
+        },
+        "date": 1792514313513,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 3643.8526573794334,
+            "unit": "ns/iter",
+            "extra": "iterations: 193386\ncpu: 3643.691725357575 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 73372.28106378077,
+            "unit": "ns/iter",
+            "extra": "iterations: 9062\ncpu: 73369.7898918561 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 84651.98462469807,
+            "unit": "ns/iter",
+            "extra": "iterations: 8260\ncpu: 84648.88280871669 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 375902.9065520922,
+            "unit": "ns/iter",
+            "extra": "iterations: 1862\ncpu: 375894.56552094535 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 352261.2206549074,
+            "unit": "ns/iter",
+            "extra": "iterations: 1985\ncpu: 352264.5566750629 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2172741.9719625944,
+            "unit": "ns/iter",
+            "extra": "iterations: 321\ncpu: 2172605.1464174464 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 41.647518235294,
+            "unit": "ms/iter",
+            "extra": "iterations: 17\ncpu: 41.64530935294116 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 39.01190999999926,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 39.00865644444446 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 180.54091466666478,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 180.5339583333332 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 11.643443899999776,
+            "unit": "ms/iter",
+            "extra": "iterations: 60\ncpu: 11.642723666666654 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 15.397512760869695,
+            "unit": "ms/iter",
+            "extra": "iterations: 46\ncpu: 15.39695839130437 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 32.79183247619109,
+            "unit": "ms/iter",
+            "extra": "iterations: 21\ncpu: 32.78963061904766 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.2075312820069353,
+            "unit": "ms/iter",
+            "extra": "iterations: 578\ncpu: 1.2075360847750867 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 67.03972939999971,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 67.0350791999999 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1000",
+            "value": 20.942788484848222,
+            "unit": "ms/iter",
+            "extra": "iterations: 33\ncpu: 20.941753242424234 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16384",
+            "value": 23.724123466666924,
+            "unit": "ms/iter",
+            "extra": "iterations: 30\ncpu: 23.723057700000005 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/262144",
+            "value": 48.530964571428726,
+            "unit": "ms/iter",
+            "extra": "iterations: 14\ncpu: 48.53017264285724 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1048576",
+            "value": 83.77903887500082,
+            "unit": "ms/iter",
+            "extra": "iterations: 8\ncpu: 83.77198974999978 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/4194304",
+            "value": 298.7081444999973,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 298.6900264999992 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16777216",
+            "value": 1526.104177999997,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1525.9743320000005 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1000",
+            "value": 25.97578111111063,
+            "unit": "ms/iter",
+            "extra": "iterations: 27\ncpu: 25.974737444444457 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16384",
+            "value": 29.39594224999927,
+            "unit": "ms/iter",
+            "extra": "iterations: 24\ncpu: 29.393722375000042 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/262144",
+            "value": 51.5389524999981,
+            "unit": "ms/iter",
+            "extra": "iterations: 14\ncpu: 51.45636542857142 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1048576",
+            "value": 102.64712299999701,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 102.64234042857164 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/4194304",
+            "value": 349.6132069999902,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 349.6015200000002 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16777216",
+            "value": 1741.7356249999898,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1741.6637199999982 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1000",
+            "value": 43.76418356249978,
+            "unit": "ms/iter",
+            "extra": "iterations: 16\ncpu: 43.76245018750002 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16384",
+            "value": 46.03961333333283,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 46.03736826666681 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/262144",
+            "value": 70.39583940000114,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 70.39341649999997 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1048576",
+            "value": 136.05220059999965,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 136.04362999999964 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/4194304",
+            "value": 424.66292950000195,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 424.6321815000016 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16777216",
+            "value": 2011.9634389999987,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2011.8855619999963 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1000",
+            "value": 51.3602469999991,
+            "unit": "ms/iter",
+            "extra": "iterations: 14\ncpu: 51.35667849999998 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16384",
+            "value": 54.726474769230784,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 54.726491461538494 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/262144",
+            "value": 81.93234111111123,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 81.92420666666717 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1048576",
+            "value": 159.92415999999565,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 159.9150999999992 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/4194304",
+            "value": 446.877520000001,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 446.8649470000017 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16777216",
+            "value": 2138.5887440000033,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2138.478651 ms\nthreads: 1"
           }
         ]
       }
