@@ -54,6 +54,35 @@ arrow::Decimal128 FromInt128(Int128 v) {
   return {static_cast<int64_t>(bits >> 64U), static_cast<uint64_t>(bits)};
 }
 
+DecimalColumnBuilder::DecimalColumnBuilder(plan::LogicalType type, arrow::MemoryPool* pool)
+    : narrow_(plan::ToArrow(type)->id() == arrow::Type::DECIMAL64),
+      narrow_builder_(narrow_ ? plan::ToArrow(type) : arrow::decimal64(1, 0), pool),
+      wide_builder_(narrow_ ? arrow::decimal128(1, 0) : plan::ToArrow(type), pool) {}
+
+arrow::Status DecimalColumnBuilder::Reserve(std::int64_t rows) {
+  return narrow_ ? narrow_builder_.Reserve(rows) : wide_builder_.Reserve(rows);
+}
+
+void DecimalColumnBuilder::UnsafeAppend(Int128 value) {
+  if (narrow_) {
+    narrow_builder_.UnsafeAppend(arrow::Decimal64(static_cast<std::int64_t>(value)));
+  } else {
+    wide_builder_.UnsafeAppend(FromInt128(value));
+  }
+}
+
+void DecimalColumnBuilder::UnsafeAppendNull() {
+  if (narrow_) {
+    narrow_builder_.UnsafeAppendNull();
+  } else {
+    wide_builder_.UnsafeAppendNull();
+  }
+}
+
+arrow::Status DecimalColumnBuilder::Finish(std::shared_ptr<arrow::Array>* out) {
+  return narrow_ ? narrow_builder_.Finish(out) : wide_builder_.Finish(out);
+}
+
 arrow::Result<UnscaledValues> ReadUnscaled(const arrow::Array& array) {
   UnscaledValues out{.values = std::vector<Int128>(static_cast<std::size_t>(array.length())),
                      .scale = 0};
@@ -103,18 +132,21 @@ arrow::Result<UnscaledValues> ReadUnscaled(const arrow::Array& array) {
 }
 
 arrow::Result<ArrayPtr> DecimalToDouble(const arrow::Array& values, arrow::MemoryPool* pool) {
-  if (values.type_id() != arrow::Type::DECIMAL128) {
+  if (values.type_id() != arrow::Type::DECIMAL128 && values.type_id() != arrow::Type::DECIMAL64) {
     return arrow::Status::Invalid("DECIMAL to DOUBLE of ", values.type()->ToString());
   }
-  const auto& decimals = AsDecimals(values);
-  const auto& type = static_cast<const arrow::Decimal128Type&>(*values.type());
+  // Through ReadUnscaled rather than the bytes, so this reads either physical width (ADR 0021's
+  // decimal64 item). It is one pass a batch on a path no measured query takes; the formula below
+  // is DuckDB's and does not change with the width.
+  ARROW_ASSIGN_OR_RAISE(const UnscaledValues read, ReadUnscaled(values));
+  const auto& type = static_cast<const arrow::DecimalType&>(*values.type());
   arrow::DoubleBuilder builder(pool);
-  ARROW_RETURN_NOT_OK(builder.Reserve(decimals.length()));
-  for (int64_t i = 0; i < decimals.length(); ++i) {
-    if (decimals.IsNull(i)) {
+  ARROW_RETURN_NOT_OK(builder.Reserve(values.length()));
+  for (int64_t i = 0; i < values.length(); ++i) {
+    if (values.IsNull(i)) {
       builder.UnsafeAppendNull();
     } else {
-      builder.UnsafeAppend(DuckDbDecimalToDouble(ToInt128(arrow::Decimal128(decimals.GetValue(i))),
+      builder.UnsafeAppend(DuckDbDecimalToDouble(read.values[static_cast<std::size_t>(i)],
                                                  type.precision(), type.scale()));
     }
   }
@@ -142,7 +174,7 @@ arrow::Result<ArrayPtr> CastToDecimal(const arrow::Array& values, plan::LogicalT
                                       arrow::MemoryPool* pool) {
   ARROW_ASSIGN_OR_RAISE(const UnscaledValues read, ReadUnscaled(values));
   const plan::IntegerRange range = plan::RangeOf(to);
-  arrow::Decimal128Builder builder(DecimalsType(to), pool);
+  DecimalColumnBuilder builder(to, pool);
   ARROW_RETURN_NOT_OK(builder.Reserve(values.length()));
   for (int64_t i = 0; i < values.length(); ++i) {
     if (values.IsNull(i)) {
@@ -154,7 +186,7 @@ arrow::Result<ArrayPtr> CastToDecimal(const arrow::Array& values, plan::LogicalT
     if (!cast.has_value() || *cast < range.min || *cast > range.max) {
       return DecimalCastError(value, from, to, column);
     }
-    builder.UnsafeAppend(FromInt128(*cast));
+    builder.UnsafeAppend(*cast);
   }
   ArrayPtr out;
   ARROW_RETURN_NOT_OK(builder.Finish(&out));

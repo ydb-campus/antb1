@@ -436,7 +436,7 @@ arrow::Result<ArrayPtr> DecimalArith(const DecimalOperand& left, const DecimalOp
   // and its length is the result's.
   const arrow::Array* const sized = left.is_scalar() ? right.array : left.array;
   const auto rows = static_cast<std::size_t>(sized->length());
-  arrow::Decimal128Builder builder(DecimalsType(result), pool);
+  DecimalColumnBuilder builder(result, pool);
   ARROW_RETURN_NOT_OK(builder.Reserve(sized->length()));
   // A constant is never NULL here and an array with no NULL needs no test, so a row is only looked
   // up in the bitmaps that have one.
@@ -492,7 +492,7 @@ arrow::Result<ArrayPtr> DecimalArith(const DecimalOperand& left, const DecimalOp
     if (overflow || value < range.min || value > range.max) {
       return DecimalOverflow(op, x, y, result);
     }
-    builder.UnsafeAppend(FromInt128(value));
+    builder.UnsafeAppend(value);
   }
   std::shared_ptr<arrow::Array> out;
   ARROW_RETURN_NOT_OK(builder.Finish(&out));
@@ -1153,7 +1153,7 @@ struct Evaluator {
       // The type is kept, and its range is symmetric. A file may still hold a value beyond its
       // declared width (nothing checks it on read), so the 128-bit minimum is an overflow, not UB.
       ARROW_ASSIGN_OR_RAISE(DecimalOperand values, ReadDecimalOperand(*operand, e.type, {}));
-      arrow::Decimal128Builder builder(DecimalsType(e.type), pool);
+      DecimalColumnBuilder builder(e.type, pool);
       ARROW_RETURN_NOT_OK(builder.Reserve(operand->length()));
       for (int64_t i = 0; i < operand->length(); ++i) {
         if (operand->IsNull(i)) {
@@ -1164,7 +1164,7 @@ struct Evaluator {
         if (__builtin_sub_overflow(Int128{0}, values.At(static_cast<std::size_t>(i)), &negated)) {
           return Overflow("negation", e.type);
         }
-        builder.UnsafeAppend(FromInt128(negated));
+        builder.UnsafeAppend(negated);
       }
       std::shared_ptr<arrow::Array> out;
       ARROW_RETURN_NOT_OK(builder.Finish(&out));
