@@ -325,12 +325,59 @@ with exit code 4. The PR ids are the roadmap's, not divergence ids.
       no module edge and no public header. **Its real purpose is to test the premise of N3 cheaply**: if the 4x
       above shows up in situ, the representation change is grounded; if it does not, the micro-benchmark does not
       transfer and N3 should be re-argued before anyone builds it.
-    - **N2, perf(exec): keep an intermediate step's values in int64**, which halves the traffic between steps.
-      Still inside the program.
+    - **N2, dropped on its own premise (2026-10-20).** It claimed to halve the traffic between steps. There is no
+      such traffic: the program's `slots` are one `Int128` per *step*, reused for every row
+      (`src/exec/compute.cc:585`), so they live in registers and on the stack rather than in a per-row array. The
+      entry was written while thinking of a tiled evaluation, where slots genuinely are per-tile arrays, and it
+      did not survive reading the loop it describes. What is actually left is a redundant int64 test on an operand
+      that an earlier narrow step produced and a round trip through a 128-bit slot -- about two instructions a
+      step, below what this host can measure. Folded into N3, which changes the representation anyway.
     - **N3, feat(plan,io,exec): a decimal64 representation for p <= 18.** The item as originally written, plus the
       arithmetic: `io` reads into decimal64 rather than widening Parquet's INT32 or INT64 to decimal128, and
-      aggregates, sorting, top-N, grouping, MIN and MAX, comparisons and join keys all take it. Several modules, so
-      it needs its own plan and its own review, and N1 and N2 are what justify paying for it.
+      aggregates, sorting, top-N, grouping, MIN and MAX, comparisons and join keys all take it. Several modules,
+      so it gets its plan here before any code.
+      - **Arrow 25 supports what this needs, probed on 2026-10-20 against the environment's own Arrow rather than
+        assumed.** `decimal64` is a type with `byte_width` 8, `Decimal64Builder` builds it, and `equal`, `less`,
+        `Take`, `Grouper::Make`, `Grouper::Consume` and casts to DOUBLE, to decimal128 and to another decimal64
+        all work on it. Two kernels have none -- `array_sort_indices` and `sum` -- and neither matters: this
+        engine sorts with its own key layout and never calls Arrow's `sum`, which
+        `src/exec/include/antb1/exec/aggregate_state.h:31` records as wrapping at 64 bits. So the Context's note
+        about missing decimal64 *arithmetic* kernels remains the only gap, and this engine's own arithmetic is
+        what fills it.
+      - **The surface, surveyed:** about 270 sites, most of them mechanical. The representation is fixed in
+        `plan` in exactly two places, `plan::ToArrow` (`src/plan/types.cc:56`) and the scalar helper behind
+        `plan::ToArrowScalar` (`src/plan/logical_plan.cc:48`); `FromArrow` (`src/plan/types.cc:95`) already
+        accepts decimal64. Everything else in `plan` works in logical `(p,s)` and `Int128` and needs no change.
+      - **The hazard that decides how this is sequenced.** Seven non-test sites hand `plan::ToArrow`'s result
+        straight to an `arrow::Decimal128Builder` -- `src/exec/aggregate_state.cc:72`,
+        `src/exec/compute.cc:159`, `src/exec/grouped_aggregate_state.cc:107`, `src/exec/decimal.cc:132` among
+        them -- and one to `GroupedMinMax<arrow::Decimal128Type>` (`src/exec/grouped_aggregate_state.cc:748`).
+        A builder constructed with a decimal64 type there goes through `checked_pointer_cast`, which is a
+        `static_pointer_cast` under NDEBUG: **in a release build it would not fail, it would write 16 bytes into
+        an 8-byte slot.** So those sites are found and made to fail loudly *before* `ToArrow` changes, not after.
+      - **Three decisions it has to take, none of them mechanical:**
+        - **A value a file carries beyond the column's declared width.** A FIXED_LEN_BYTE_ARRAY or BYTE_ARRAY
+          DECIMAL(18,s) can hold one; a decimal64 cannot. N1 above depends on such a value being representable,
+          and so does `src/exec/decimal.h:53`. Narrow only columns Parquet stores as INT32 or INT64, keep
+          decimal128 for the other two storages, or fail such a file: the first keeps every existing guarantee
+          and is the one to argue against.
+        - **p <= 9.** Arrow's own two mechanisms -- `arrow::smallest_decimal` and the Parquet reader's smallest-
+          type option -- give decimal32 there, so the reader option is not a shortcut to a single narrow
+          representation and `plan::ToArrow` must spell its own rule either way.
+        - **One physical type per `(p,s)`, or two with conversions at the boundaries.** Every type-equality check
+          in exec assumes one -- `src/exec/join_table.cc:298`, `src/exec/sort.cc:204`,
+          `src/exec/aggregate_state.cc:33`, `src/exec/filter.cc:96` -- and `plan::Table::schema()`
+          (`src/plan/include/antb1/plan/table.h:69`) is where that invariant is written down. Strict makes the
+          change all-or-nothing across io, exec and every test table; tolerating both needs a conversion at each
+          operator boundary and keeps the steps small.
+      - **Split, because this is too wide for one PR:** the reader-and-storage question in `io` (where
+        `parquet::ArrowReaderProperties::set_smallest_decimal_enabled` has to be set at all three type-inference
+        and read sites or the recorded schema stops matching the decoded arrays); exec's read and write sites;
+        and DECIMAL in part statistics, which is independent of the representation -- statistics are `Int128`
+        either way -- and need not travel with it.
+      - **And one thing to check rather than assume**: a group or join key hashed over 8 bytes instead of 16
+        (`src/exec/group_table.cc:92`) may change which partition a group lands in. No golden carries group order
+        that the survey could find, but the grouped-aggregate and join suites are what settle it.
     - **N4, docs(adr): record what N1 to N3 measured**, and accept or defer the rest on those numbers.
 
 ## Alternatives considered
