@@ -192,6 +192,18 @@ arrow::Result<std::shared_ptr<arrow::Array>> FixedArray(
     case arrow::Type::DOUBLE:
       nulls = StoreRows(decoded, max_def, selected, values->mutable_data_as<double>(), valid);
       break;
+    case arrow::Type::DECIMAL64:
+      // A decimal64's eight bytes ARE the unscaled integer Parquet stored, so there is no
+      // conversion left at all -- the widening the arm below does is exactly what this item
+      // removes (ADR 0021's decimal64 item). FilteredColumnOf admits only an INT32 or INT64
+      // physical column for a DECIMAL, so the value always fits.
+      if constexpr (std::is_integral_v<Value>) {
+        nulls = StoreRows(decoded, max_def, selected, values->mutable_data_as<int64_t>(), valid);
+      } else {
+        return arrow::Status::Invalid("a filtered scan cannot store ", type->ToString(),
+                                      " from a floating-point column");
+      }
+      break;
     case arrow::Type::DECIMAL128:
       // The decoded value is the unscaled integer Parquet stored, and the engine type carries the
       // same scale (FilteredColumnOf admits no other), so widening it to 128 bits is the whole
@@ -723,6 +735,27 @@ std::optional<FilteredColumn> FilteredColumnOf(const parquet::FileMetaData& meta
         return of(Physical::kByteArray);
       }
       break;
+    case arrow::Type::DECIMAL64: {
+      // ADR 0021's decimal64 item. The storage Arrow type is decimal128 for an INT32- or
+      // INT64-backed column unless an ARROW:schema restored it narrower, so both are admitted;
+      // what matters is that the precision and scale agree, since this path rescales nothing, and
+      // that the physical column is an integer, which is the restriction this path already made.
+      const auto& want = static_cast<const arrow::DecimalType&>(engine);
+      if (s != arrow::Type::DECIMAL128 && s != arrow::Type::DECIMAL64) {
+        break;
+      }
+      const auto& have = static_cast<const arrow::DecimalType&>(storage);
+      if (have.precision() != want.precision() || have.scale() != want.scale()) {
+        break;
+      }
+      if (physical == parquet::Type::INT32) {
+        return of(Physical::kInt32);
+      }
+      if (physical == parquet::Type::INT64) {
+        return of(Physical::kInt64);
+      }
+      break;
+    }
     case arrow::Type::DECIMAL128: {
       // A DECIMAL Parquet stores as an integer: the decoded unscaled value widens to decimal128 in
       // FixedArray, which is the only conversion needed as long as the storage carries the engine's

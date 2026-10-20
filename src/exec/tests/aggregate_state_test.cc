@@ -61,6 +61,13 @@ std::string Text(const AggregateState& state) {
     return arrow::Decimal128(static_cast<const arrow::Decimal128Array&>(*array).GetValue(0))
         .ToIntegerString();
   }
+  // The same canonical text for the narrow width, or a case comparing the two would differ in the
+  // helper rather than in the engine: Arrow's own ToString applies the scale, and the arm above
+  // does not (ADR 0021's decimal64 item).
+  if (array->type_id() == arrow::Type::DECIMAL64) {
+    return arrow::Decimal64(static_cast<const arrow::Decimal64Array&>(*array).GetValue(0))
+        .ToIntegerString();
+  }
   return array->GetScalar(0).ValueOrDie()->ToString();
 }
 
@@ -391,6 +398,71 @@ TEST_F(AggregateStateTest, MinMaxOfDatesUnsignedDoublesAndHugeInts) {
 
 // A DECIMAL(15,2) column of unscaled values; MIN and MAX keep the type, and the result carries its
 // (p,s).
+// A scoped flip of plan's transitional narrowing switch (ADR 0021's decimal64 item).
+class NarrowDecimalsFor {
+ public:
+  explicit NarrowDecimalsFor(bool on) : was_(plan::NarrowDecimals()) {
+    plan::SetNarrowDecimals(on);
+  }
+  ~NarrowDecimalsFor() { plan::SetNarrowDecimals(was_); }
+  NarrowDecimalsFor(const NarrowDecimalsFor&) = delete;
+  NarrowDecimalsFor& operator=(const NarrowDecimalsFor&) = delete;
+  NarrowDecimalsFor(NarrowDecimalsFor&&) = delete;
+  NarrowDecimalsFor& operator=(NarrowDecimalsFor&&) = delete;
+
+ private:
+  bool was_;
+};
+
+// The ungrouped MIN and MAX of a narrow DECIMAL. Arrow 25 has no min_max kernel for decimal64, so
+// this state widens for the kernel and narrows the answer back; what the case pins is that the
+// answer and its type are the ones the caller asked for, and that SUM and COUNT(DISTINCT) over the
+// same column -- which take other paths entirely -- agree with their wide arms too.
+TEST_F(AggregateStateTest, MinMaxOfANarrowDecimalAnswersAsTheWideOneDoes) {
+  const LogicalType type = LogicalType::Decimal(15, 2);
+  const std::vector<std::optional<int64_t>> unscaled = {1700, std::nullopt, -25, 1700,
+                                                        -99999999999999};
+  const auto wide_values = [&] {
+    arrow::Decimal128Builder builder(arrow::decimal128(15, 2));
+    for (const auto& v : unscaled) {
+      EXPECT_TRUE(
+          (v.has_value() ? builder.Append(arrow::Decimal128(*v)) : builder.AppendNull()).ok());
+    }
+    return builder.Finish().ValueOrDie();
+  }();
+  const auto narrow_values = [&] {
+    arrow::Decimal64Builder builder(arrow::decimal64(15, 2));
+    for (const auto& v : unscaled) {
+      EXPECT_TRUE(
+          (v.has_value() ? builder.Append(arrow::Decimal64(*v)) : builder.AppendNull()).ok());
+    }
+    return builder.Finish().ValueOrDie();
+  }();
+
+  for (const AggKind kind : {AggKind::kMin, AggKind::kMax}) {
+    std::string wide;
+    {
+      EXPECT_FALSE(plan::NarrowDecimals());
+      auto state = Make(kind, type, type);
+      ASSERT_TRUE(state->Consume(*wide_values, nullptr).ok());
+      wide = Text(*state);
+      EXPECT_TRUE(Result(*state)->type()->Equals(arrow::decimal128(15, 2)));
+    }
+    const NarrowDecimalsFor narrowing(true);
+    auto state = Make(kind, type, type);
+    ASSERT_TRUE(state->Consume(*narrow_values, nullptr).ok());
+    EXPECT_EQ(Text(*state), wide) << (kind == AggKind::kMin ? "MIN" : "MAX");
+    EXPECT_TRUE(Result(*state)->type()->Equals(arrow::decimal64(15, 2)))
+        << "the answer must come back at the width the caller asked for: "
+        << Result(*state)->type()->ToString();
+  }
+
+  // An empty column still gives one NULL of the narrow type rather than of the kernel's.
+  const NarrowDecimalsFor narrowing(true);
+  auto empty = Make(AggKind::kMin, type, type);
+  EXPECT_TRUE(Result(*empty)->type()->Equals(arrow::decimal64(15, 2)));
+}
+
 TEST_F(AggregateStateTest, MinMaxAndCountDistinctOfDecimals) {
   const LogicalType type = LogicalType::Decimal(15, 2);
   arrow::Decimal128Builder builder(plan::ToArrow(type));

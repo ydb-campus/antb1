@@ -20,6 +20,7 @@
 #include <gtest/gtest.h>
 #include <parquet/arrow/writer.h>
 #include <parquet/column_writer.h>
+#include <parquet/file_reader.h>
 #include <parquet/file_writer.h>
 #include <parquet/properties.h>
 #include <parquet/schema.h>
@@ -480,6 +481,23 @@ TEST_F(ParquetScanTest, ConvertsToTheEngineView) {
 // (INT32, INT64 or FIXED_LEN_BYTE_ARRAY) and whatever an ARROW:schema restores (decimal32,
 // decimal64, decimal128 or decimal256): the engine's DECIMAL(p, s) (ADR 0021). Wider decimals stay
 // unsupported.
+// A scoped flip of plan's transitional narrowing switch (ADR 0021's decimal64 item), so no case
+// leaves it on for the next.
+class NarrowDecimalsFor {
+ public:
+  explicit NarrowDecimalsFor(bool on) : was_(plan::NarrowDecimals()) {
+    plan::SetNarrowDecimals(on);
+  }
+  ~NarrowDecimalsFor() { plan::SetNarrowDecimals(was_); }
+  NarrowDecimalsFor(const NarrowDecimalsFor&) = delete;
+  NarrowDecimalsFor& operator=(const NarrowDecimalsFor&) = delete;
+  NarrowDecimalsFor(NarrowDecimalsFor&&) = delete;
+  NarrowDecimalsFor& operator=(NarrowDecimalsFor&&) = delete;
+
+ private:
+  bool was_;
+};
+
 TEST_F(ParquetScanTest, ReadsEveryDecimalStorage) {
   arrow::Decimal32Builder d9(arrow::decimal32(9, 2));
   arrow::Decimal64Builder d18(arrow::decimal64(18, 4));
@@ -521,9 +539,15 @@ TEST_F(ParquetScanTest, ReadsEveryDecimalStorage) {
                      arrow::field("wide", arrow::decimal256(40, 0))}),
       {d9.Finish().ValueOrDie(), d18.Finish().ValueOrDie(), d38.Finish().ValueOrDie(),
        d256.Finish().ValueOrDie(), d15.Finish().ValueOrDie(), wide.Finish().ValueOrDie()});
-  const std::vector<std::shared_ptr<arrow::DataType>> engine_types = {
+  const std::vector<std::shared_ptr<arrow::DataType>> wide_types = {
       arrow::decimal128(9, 2), arrow::decimal128(18, 4), arrow::decimal128(38, 10),
       arrow::decimal128(38, 0), arrow::decimal128(15, 2)};
+  // With ADR 0021's narrowing on, a DECIMAL of at most 18 digits is decimal64 whatever the file
+  // stored it as: the engine type follows plan::ToArrow and nothing else, which is the invariant
+  // plan::Table::schema() states. The 38-digit columns stay decimal128.
+  const std::vector<std::shared_ptr<arrow::DataType>> narrow_types = {
+      arrow::decimal64(9, 2), arrow::decimal64(18, 4), arrow::decimal128(38, 10),
+      arrow::decimal128(38, 0), arrow::decimal64(15, 2)};
   const std::vector<std::vector<std::string>> expected = {
       {"9999999.99", "null", "-9999999.99", "-0.05"},
       {"99999999999999.9999", "-0.0001", "null", "-99999999999999.9999"},
@@ -531,27 +555,32 @@ TEST_F(ParquetScanTest, ReadsEveryDecimalStorage) {
        "0E-10", "null"},
       {"null", "-" + nines38, nines38, "7"},
       {"-123.45", "9999999999999.99", "0.00", "null"}};
-  for (const bool store_schema : {false, true}) {
-    for (const bool as_integers : {false, true}) {
-      SCOPED_TRACE(std::format("ARROW:schema {}, integer storage {}", store_schema, as_integers));
-      const std::string path =
-          Write(std::format("decimals_{}_{}.parquet", store_schema, as_integers), data, 2,
-                store_schema, as_integers);
-      auto table = ParquetTable::Open({path}, ParquetTableOptions{});
-      ASSERT_TRUE(table.ok()) << table.status().ToString();
-      const auto& schema = *(*table)->schema();
-      for (std::size_t i = 0; i < engine_types.size(); ++i) {
-        EXPECT_TRUE(schema.field(static_cast<int>(i))->type()->Equals(*engine_types[i]))
-            << i << ": " << schema.field(static_cast<int>(i))->type()->ToString();
-      }
-      EXPECT_FALSE(plan::FromArrow(*schema.field(5)->type()).ok())
-          << "a 40-digit decimal stays unsupported";
-      for (const int64_t batch_size : {int64_t{1}, int64_t{3}}) {
-        const Scanned s = Scan(**table, {0, 1, 2, 3, 4}, batch_size);
-        ASSERT_NE(s.table, nullptr);
-        for (int c = 0; c < 5; ++c) {
-          EXPECT_EQ(Texts(*s.table, c), expected[static_cast<std::size_t>(c)])
-              << c << " " << batch_size;
+  for (const bool narrow : {false, true}) {
+    const NarrowDecimalsFor narrowing(narrow);
+    const auto& engine_types = narrow ? narrow_types : wide_types;
+    for (const bool store_schema : {false, true}) {
+      for (const bool as_integers : {false, true}) {
+        SCOPED_TRACE(std::format("narrowing {}, ARROW:schema {}, integer storage {}", narrow,
+                                 store_schema, as_integers));
+        const std::string path =
+            Write(std::format("decimals_{}_{}.parquet", store_schema, as_integers), data, 2,
+                  store_schema, as_integers);
+        auto table = ParquetTable::Open({path}, ParquetTableOptions{});
+        ASSERT_TRUE(table.ok()) << table.status().ToString();
+        const auto& schema = *(*table)->schema();
+        for (std::size_t i = 0; i < engine_types.size(); ++i) {
+          EXPECT_TRUE(schema.field(static_cast<int>(i))->type()->Equals(*engine_types[i]))
+              << i << ": " << schema.field(static_cast<int>(i))->type()->ToString();
+        }
+        EXPECT_FALSE(plan::FromArrow(*schema.field(5)->type()).ok())
+            << "a 40-digit decimal stays unsupported";
+        for (const int64_t batch_size : {int64_t{1}, int64_t{3}}) {
+          const Scanned s = Scan(**table, {0, 1, 2, 3, 4}, batch_size);
+          ASSERT_NE(s.table, nullptr);
+          for (int c = 0; c < 5; ++c) {
+            EXPECT_EQ(Texts(*s.table, c), expected[static_cast<std::size_t>(c)])
+                << c << " " << batch_size;
+          }
         }
       }
     }
@@ -842,6 +871,85 @@ TEST_F(ParquetScanTest, SameSizeRewriteIsIOError) {
     EXPECT_TRUE(st.IsIOError()) << part << ": " << st.ToString();
     EXPECT_NE(st.message().find("footer differs"), std::string::npos) << st.ToString();
     EXPECT_NE(st.message().find("a.parquet"), std::string::npos) << st.ToString();
+  }
+}
+
+// The narrowing conversion's own cases (ADR 0021's decimal64 item). A BYTE_ARRAY decimal's length
+// is not fixed, so this is the one storage that can carry more bytes than its precision implies --
+// every other is sized to the precision and so cannot. That makes it the only way to reach the
+// range check, and the reason the check exists.
+//
+// The same file also covers what else the conversion has to get right: a negative value, whose
+// high bytes are the sign extension rather than zero; a NULL row, whose value bytes are not
+// guaranteed to be anything; and a batch size below the row group, which hands the conversion a
+// sliced offset.
+TEST_F(ParquetScanTest, NarrowingAByteArrayDecimal) {
+  using parquet::schema::GroupNode;
+  using parquet::schema::PrimitiveNode;
+  const auto column_of = [this](const std::string& name,
+                                const std::vector<std::vector<uint8_t>>& rows) {
+    const auto node =
+        PrimitiveNode::Make("d", parquet::Repetition::OPTIONAL,
+                            parquet::LogicalType::Decimal(15, 2), parquet::Type::BYTE_ARRAY);
+    const auto schema = std::static_pointer_cast<GroupNode>(
+        GroupNode::Make("schema", parquet::Repetition::REQUIRED, {node}));
+    const std::string path = (dir_ / name).string();
+    auto out = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+    auto writer = parquet::ParquetFileWriter::Open(out, schema);
+    auto* values_out =
+        static_cast<parquet::ByteArrayWriter*>(writer->AppendRowGroup()->NextColumn());
+    std::vector<parquet::ByteArray> values;
+    values.reserve(rows.size());
+    for (const auto& row : rows) {
+      values.emplace_back(static_cast<uint32_t>(row.size()), row.data());
+    }
+    // One NULL, written as definition level 0 after the values.
+    std::vector<int16_t> definition(rows.size(), 1);
+    definition.push_back(0);
+    values_out->WriteBatch(static_cast<int64_t>(definition.size()), definition.data(), nullptr,
+                           values.data());
+    writer->Close();
+    EXPECT_TRUE(out->Close().ok());
+    return path;
+  };
+
+  {  // in range at both widths: a positive, a negative, and a NULL, over a sliced batch
+    const std::string path =
+        column_of("byte_array_ok.parquet", {{0x30, 0x39}, {0xFB}, {0x05, 0xF5, 0xE0, 0xFF}});
+    for (const bool narrow : {false, true}) {
+      SCOPED_TRACE(std::format("narrowing {}", narrow));
+      const NarrowDecimalsFor narrowing(narrow);
+      auto table = ParquetTable::Open({path}, ParquetTableOptions{});
+      ASSERT_TRUE(table.ok()) << table.status().ToString();
+      EXPECT_EQ((*table)->schema()->field(0)->type()->id(),
+                narrow ? arrow::Type::DECIMAL64 : arrow::Type::DECIMAL128);
+      for (const int64_t batch_size : {int64_t{1}, int64_t{2}, int64_t{64}}) {
+        const Scanned s = Scan(**table, {0}, batch_size);
+        ASSERT_NE(s.table, nullptr) << batch_size;
+        EXPECT_EQ(Texts(*s.table, 0),
+                  (std::vector<std::string>{"123.45", "-0.05", "999999.99", "null"}))
+            << batch_size;
+      }
+    }
+  }
+  {  // nine bytes: 2^64, which decimal128 holds and no int64 does
+    const std::string path = column_of("byte_array_wide.parquet",
+                                       {{0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}});
+    // No wide arm here. A value past the column's declared precision makes an array Arrow's own
+    // ValidateFull rejects, whatever width it is read at, so "this file reads today" is not a
+    // claim worth making: it is malformed by Arrow's standard and not only by this engine's. What
+    // the narrow arm has to do is name it rather than truncate it.
+    const NarrowDecimalsFor narrowing(true);
+    auto table = ParquetTable::Open({path}, ParquetTableOptions{});
+    ASSERT_TRUE(table.ok()) << table.status().ToString();
+    // Drained by hand: the Scan helper asserts every read succeeds, which is the opposite of what
+    // this half is about.
+    auto reader = (*table)->Scan({0}, 8);
+    ASSERT_TRUE(reader.ok()) << reader.status().ToString();
+    std::shared_ptr<arrow::RecordBatch> batch;
+    const arrow::Status st = (*reader)->ReadNext(&batch);
+    EXPECT_FALSE(st.ok()) << "a value no int64 holds was read as one";
+    EXPECT_NE(st.message().find("'d'"), std::string::npos) << st.ToString();
   }
 }
 

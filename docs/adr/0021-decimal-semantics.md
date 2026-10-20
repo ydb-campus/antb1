@@ -356,11 +356,21 @@ with exit code 4. The PR ids are the roadmap's, not divergence ids.
         `static_pointer_cast` under NDEBUG: **in a release build it would not fail, it would write 16 bytes into
         an 8-byte slot.** So those sites are found and made to fail loudly *before* `ToArrow` changes, not after.
       - **Three decisions it has to take, none of them mechanical:**
-        - **A value a file carries beyond the column's declared width.** A FIXED_LEN_BYTE_ARRAY or BYTE_ARRAY
-          DECIMAL(18,s) can hold one; a decimal64 cannot. N1 above depends on such a value being representable,
-          and so does `src/exec/decimal.h:53`. Narrow only columns Parquet stores as INT32 or INT64, keep
-          decimal128 for the other two storages, or fail such a file: the first keeps every existing guarantee
-          and is the one to argue against.
+        - **A value a file carries beyond the column's declared width.** N1 above depends on such a value
+          being representable, and so does `src/exec/decimal.h:53`.
+          - **Settled (2026-10-20), and the premise above was wrong.** Every Parquet storage of a decimal is
+            sized to the column's precision, so at no more than 18 digits none of them can carry a value an
+            int64 does not hold: INT32 is four bytes, INT64 is eight, and a FIXED_LEN_BYTE_ARRAY's own length
+            is derived from the precision -- measured against this environment's writer as 2 bytes at p=4, 4 at
+            p=9, 7 at p=15 and 8 at p=18, reaching 9 only at p=19, which does not narrow. Narrowing is
+            therefore lossless by the storage's own width rather than by trusting the declared precision, and
+            even a value beyond that precision survives, because it had to fit the storage to exist. So the
+            choice between narrowing only INT32 and INT64 columns and narrowing every column of at most 18
+            digits has no behavioural difference for a conforming file. The second is taken, and the first
+            could not have been expressed anyway: `plan::Table::schema()` is `ToArrow(logical)` by
+            construction (`src/plan/include/antb1/plan/table.h:69`), and a per-storage decision is not a
+            property of a logical type. What is left is a BYTE_ARRAY decimal carrying more bytes than its
+            precision implies -- a malformed file -- where io names the column instead of truncating.
         - **p <= 9.** Arrow's own two mechanisms -- `arrow::smallest_decimal` and the Parquet reader's smallest-
           type option -- give decimal32 there, so the reader option is not a shortcut to a single narrow
           representation and `plan::ToArrow` must spell its own rule either way.
