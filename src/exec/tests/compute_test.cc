@@ -21,6 +21,7 @@
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
 
+#include "../decimal_bytes.h"
 #include "../parallel_compute.h"
 #include "exec_test_util.h"
 
@@ -1671,6 +1672,23 @@ TEST_F(ComputeTest, AStepPast18DigitsIsNotNarrowed) {
   auto sum = Eval(Arith(ArithOp::kAdd, ColumnAt(0, d38), ColumnAt(0, d38), d38), {column});
   ASSERT_TRUE(sum.ok()) << sum.status().ToString();
   EXPECT_EQ(UnscaledText(**sum), "decimal128(38, 0): 24691357802469135780246913578");
+}
+
+// The guard every decimal read in exec goes through (src/exec/decimal_bytes.h). An array of
+// another physical type must abort rather than be reinterpreted: a static_cast of a decimal64
+// array to a Decimal128Array reads 8-byte values as 16-byte ones and says nothing, which is the
+// failure ADR 0021's N3 would otherwise introduce in a release build.
+TEST(DecimalBytesDeathTest, AnArrayOfAnotherPhysicalTypeIsNotReinterpreted) {
+  const auto ints = Int64s({1, 2, 3});
+  EXPECT_DEATH(AsDecimals(*ints), "check failed");
+}
+
+// And the type a builder is given is re-derived and checked, so a builder can never be constructed
+// for a width this code does not write.
+TEST(DecimalBytesTest, TheBuilderTypeIsTheLogicalTypesOwn) {
+  EXPECT_TRUE(DecimalsType(LogicalType::Decimal(15, 2))
+                  ->Equals(*plan::ToArrow(LogicalType::Decimal(15, 2))));
+  EXPECT_TRUE(DecimalsType(LogicalType::kHugeInt)->Equals(*plan::ToArrow(LogicalType::kHugeInt)));
 }
 
 }  // namespace

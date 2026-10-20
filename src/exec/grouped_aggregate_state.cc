@@ -27,6 +27,7 @@
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
 
+#include "decimal_bytes.h"
 #include "double_key.h"
 #include "grouped_sum_alias.h"
 #include "temporal_average.h"
@@ -104,7 +105,7 @@ arrow::Result<std::shared_ptr<arrow::Array>> HugeInts(std::span<const Int128> su
                                                       std::span<const std::int64_t> counts,
                                                       plan::LogicalType type,
                                                       arrow::MemoryPool* pool) {
-  arrow::Decimal128Builder builder(plan::ToArrow(type), pool);
+  arrow::Decimal128Builder builder(DecimalsType(type), pool);
   ARROW_RETURN_NOT_OK(builder.Reserve(static_cast<std::int64_t>(sums.size())));
   const plan::IntegerRange range = plan::RangeOf(type);
   for (std::size_t g = 0; g < sums.size(); ++g) {
@@ -357,7 +358,7 @@ class GroupedHugeIntSum final : public GroupedAggregateState {
       return arrow::Status::Invalid("SUM needs an argument column");
     }
     ARROW_RETURN_NOT_OK(CheckRows(values, plan::ToArrow(input_).get(), ids, num_groups()));
-    const auto& decimals = static_cast<const arrow::Decimal128Array&>(*values);
+    const auto& decimals = AsDecimals(*values);
     // Nothing to add. Also the one case where the array is allowed to carry no values buffer, so
     // the base below would be null: the loop would skip every row and never read it, which makes
     // this a guard that states the case rather than one an answer depends on.
@@ -744,8 +745,12 @@ std::unique_ptr<GroupedAggregateState> MinMaxState(bool min, plan::LogicalType i
     case plan::LogicalType::kUSmallInt:
       return std::make_unique<GroupedMinMax<arrow::UInt16Type>>(min, std::move(type));
     case plan::LogicalType::kHugeInt:
-    case plan::LogicalType::kDecimal:  // decimal128 of the column's own precision and scale
-      return std::make_unique<GroupedMinMax<arrow::Decimal128Type>>(min, std::move(type));
+    case plan::LogicalType::kDecimal:
+      // decimal128 of the column's own precision and scale. This is the one decimal site selected
+      // by the LOGICAL type rather than the physical one, so it is the one that would keep picking
+      // a 16-byte traits for an 8-byte array when ADR 0021's N3 narrows the representation.
+      // DecimalsType re-derives the same type and checks it, so that becomes a failure.
+      return std::make_unique<GroupedMinMax<arrow::Decimal128Type>>(min, DecimalsType(input));
     case plan::LogicalType::kDouble:
       return std::make_unique<GroupedMinMax<arrow::DoubleType>>(min, std::move(type));
     case plan::LogicalType::kVarchar:

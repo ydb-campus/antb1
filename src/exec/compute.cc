@@ -231,6 +231,13 @@ struct DecimalOperand {
 
 // Whether a decimal128 array holds its values where At() can read them: Arrow stores them as 16
 // contiguous bytes a row, which is what arrow::Decimal128's byte constructor reads.
+//
+// This is also the physical-type guard for everything below it, which is why this file keeps raw
+// casts where the rest of exec goes through decimal_bytes.h's AsDecimals: the test already happens
+// here, once per operand per batch, and routing the casts through the helper as well measured
+// 1.049x of this operator's own time on the heaviest decimal query -- repeatably, in both orders,
+// and for a reason I could not attribute. A guard that is already present is not worth paying for
+// twice (ADR 0021's N3).
 bool ReadableInPlace(const arrow::Array& array) {
   return array.type_id() == arrow::Type::DECIMAL128;
 }
