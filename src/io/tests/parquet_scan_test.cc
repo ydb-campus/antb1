@@ -874,6 +874,85 @@ TEST_F(ParquetScanTest, SameSizeRewriteIsIOError) {
   }
 }
 
+// The narrowing conversion's own cases (ADR 0021's decimal64 item). A BYTE_ARRAY decimal's length
+// is not fixed, so this is the one storage that can carry more bytes than its precision implies --
+// every other is sized to the precision and so cannot. That makes it the only way to reach the
+// range check, and the reason the check exists.
+//
+// The same file also covers what else the conversion has to get right: a negative value, whose
+// high bytes are the sign extension rather than zero; a NULL row, whose value bytes are not
+// guaranteed to be anything; and a batch size below the row group, which hands the conversion a
+// sliced offset.
+TEST_F(ParquetScanTest, NarrowingAByteArrayDecimal) {
+  using parquet::schema::GroupNode;
+  using parquet::schema::PrimitiveNode;
+  const auto column_of = [this](const std::string& name,
+                                const std::vector<std::vector<uint8_t>>& rows) {
+    const auto node =
+        PrimitiveNode::Make("d", parquet::Repetition::OPTIONAL,
+                            parquet::LogicalType::Decimal(15, 2), parquet::Type::BYTE_ARRAY);
+    const auto schema = std::static_pointer_cast<GroupNode>(
+        GroupNode::Make("schema", parquet::Repetition::REQUIRED, {node}));
+    const std::string path = (dir_ / name).string();
+    auto out = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+    auto writer = parquet::ParquetFileWriter::Open(out, schema);
+    auto* values_out =
+        static_cast<parquet::ByteArrayWriter*>(writer->AppendRowGroup()->NextColumn());
+    std::vector<parquet::ByteArray> values;
+    values.reserve(rows.size());
+    for (const auto& row : rows) {
+      values.emplace_back(static_cast<uint32_t>(row.size()), row.data());
+    }
+    // One NULL, written as definition level 0 after the values.
+    std::vector<int16_t> definition(rows.size(), 1);
+    definition.push_back(0);
+    values_out->WriteBatch(static_cast<int64_t>(definition.size()), definition.data(), nullptr,
+                           values.data());
+    writer->Close();
+    EXPECT_TRUE(out->Close().ok());
+    return path;
+  };
+
+  {  // in range at both widths: a positive, a negative, and a NULL, over a sliced batch
+    const std::string path =
+        column_of("byte_array_ok.parquet", {{0x30, 0x39}, {0xFB}, {0x05, 0xF5, 0xE0, 0xFF}});
+    for (const bool narrow : {false, true}) {
+      SCOPED_TRACE(std::format("narrowing {}", narrow));
+      const NarrowDecimalsFor narrowing(narrow);
+      auto table = ParquetTable::Open({path}, ParquetTableOptions{});
+      ASSERT_TRUE(table.ok()) << table.status().ToString();
+      EXPECT_EQ((*table)->schema()->field(0)->type()->id(),
+                narrow ? arrow::Type::DECIMAL64 : arrow::Type::DECIMAL128);
+      for (const int64_t batch_size : {int64_t{1}, int64_t{2}, int64_t{64}}) {
+        const Scanned s = Scan(**table, {0}, batch_size);
+        ASSERT_NE(s.table, nullptr) << batch_size;
+        EXPECT_EQ(Texts(*s.table, 0),
+                  (std::vector<std::string>{"123.45", "-0.05", "999999.99", "null"}))
+            << batch_size;
+      }
+    }
+  }
+  {  // nine bytes: 2^64, which decimal128 holds and no int64 does
+    const std::string path = column_of("byte_array_wide.parquet",
+                                       {{0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}});
+    // No wide arm here. A value past the column's declared precision makes an array Arrow's own
+    // ValidateFull rejects, whatever width it is read at, so "this file reads today" is not a
+    // claim worth making: it is malformed by Arrow's standard and not only by this engine's. What
+    // the narrow arm has to do is name it rather than truncate it.
+    const NarrowDecimalsFor narrowing(true);
+    auto table = ParquetTable::Open({path}, ParquetTableOptions{});
+    ASSERT_TRUE(table.ok()) << table.status().ToString();
+    // Drained by hand: the Scan helper asserts every read succeeds, which is the opposite of what
+    // this half is about.
+    auto reader = (*table)->Scan({0}, 8);
+    ASSERT_TRUE(reader.ok()) << reader.status().ToString();
+    std::shared_ptr<arrow::RecordBatch> batch;
+    const arrow::Status st = (*reader)->ReadNext(&batch);
+    EXPECT_FALSE(st.ok()) << "a value no int64 holds was read as one";
+    EXPECT_NE(st.message().find("'d'"), std::string::npos) << st.ToString();
+  }
+}
+
 // A DECIMAL stored as BYTE_ARRAY (big-endian two's complement of any length, which other writers
 // than Arrow's produce) reads as decimal128(p, s) too.
 TEST_F(ParquetScanTest, ReadsByteArrayDecimals) {
