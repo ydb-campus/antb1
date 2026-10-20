@@ -42,6 +42,16 @@ inline const arrow::Decimal128Array& AsDecimals(const arrow::Array& array) {
   return static_cast<const arrow::Decimal128Array&>(array);
 }
 
+// `array` as the fixed-width decimal array the engine reads, at either physical width: both
+// decimal64 and decimal128 arrays are FixedSizeBinaryArrays, and which one it is decides the stride
+// the caller reads with. The caller dispatches on array.type_id() once, never per value.
+inline const arrow::FixedSizeBinaryArray& AsDecimalValues(const arrow::Array& array) {
+  const bool decimal =
+      array.type_id() == arrow::Type::DECIMAL128 || array.type_id() == arrow::Type::DECIMAL64;
+  ANTB1_CHECK(decimal);
+  return static_cast<const arrow::FixedSizeBinaryArray&>(array);
+}
+
 // The Arrow type to build `type`'s values with:
 // `arrow::Decimal128Builder builder(DecimalsType(type), pool)`.
 inline std::shared_ptr<arrow::DataType> DecimalsType(plan::LogicalType type) {
