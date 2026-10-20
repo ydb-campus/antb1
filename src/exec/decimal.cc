@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <format>
 #include <memory>
 #include <optional>
@@ -62,6 +63,12 @@ arrow::Result<UnscaledValues> ReadUnscaled(const arrow::Array& array) {
       if (typed.IsValid(i)) {
         if constexpr (std::is_same_v<ArrayType, arrow::Decimal128Array>) {
           out.values[static_cast<std::size_t>(i)] = ToInt128(arrow::Decimal128(typed.GetValue(i)));
+        } else if constexpr (std::is_same_v<ArrayType, arrow::Decimal64Array>) {
+          // A decimal64's eight bytes are its unscaled value, two's complement and little-endian
+          // on both targets, so they widen by sign extension (ADR 0021's N3).
+          std::int64_t value = 0;
+          std::memcpy(&value, typed.GetValue(i), sizeof(value));
+          out.values[static_cast<std::size_t>(i)] = value;
         } else {
           out.values[static_cast<std::size_t>(i)] = typed.Value(i);
         }
@@ -80,6 +87,10 @@ arrow::Result<UnscaledValues> ReadUnscaled(const arrow::Array& array) {
       break;
     case arrow::Type::INT64:
       read.template operator()<arrow::Int64Array>();
+      break;
+    case arrow::Type::DECIMAL64:
+      read.template operator()<arrow::Decimal64Array>();
+      out.scale = static_cast<const arrow::Decimal64Type&>(*array.type()).scale();
       break;
     case arrow::Type::DECIMAL128:
       read.template operator()<arrow::Decimal128Array>();

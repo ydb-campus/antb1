@@ -21,6 +21,7 @@
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
 
+#include "../decimal.h"
 #include "../decimal_bytes.h"
 #include "../parallel_compute.h"
 #include "exec_test_util.h"
@@ -1689,6 +1690,107 @@ TEST(DecimalBytesTest, TheBuilderTypeIsTheLogicalTypesOwn) {
   EXPECT_TRUE(DecimalsType(LogicalType::Decimal(15, 2))
                   ->Equals(*plan::ToArrow(LogicalType::Decimal(15, 2))));
   EXPECT_TRUE(DecimalsType(LogicalType::kHugeInt)->Equals(*plan::ToArrow(LogicalType::kHugeInt)));
+}
+
+// ---- the same program at the narrow physical width (ADR 0021's N3, the program path) ----
+
+// A scoped flip of plan's transitional narrowing switch, so no case leaves it on for the next.
+class NarrowDecimalsFor {
+ public:
+  explicit NarrowDecimalsFor(bool on) : was_(plan::NarrowDecimals()) {
+    plan::SetNarrowDecimals(on);
+  }
+  ~NarrowDecimalsFor() { plan::SetNarrowDecimals(was_); }
+  NarrowDecimalsFor(const NarrowDecimalsFor&) = delete;
+  NarrowDecimalsFor& operator=(const NarrowDecimalsFor&) = delete;
+  NarrowDecimalsFor(NarrowDecimalsFor&&) = delete;
+  NarrowDecimalsFor& operator=(NarrowDecimalsFor&&) = delete;
+
+ private:
+  bool was_;
+};
+
+// A decimal64 column, which is what a DECIMAL of at most 18 digits becomes with the switch on.
+std::shared_ptr<arrow::Array> Decimals64(LogicalType type,
+                                         const std::vector<std::optional<std::string>>& unscaled) {
+  arrow::Decimal64Builder builder(arrow::decimal64(type.width(), type.scale()));
+  for (const auto& v : unscaled) {
+    const auto status =
+        v.has_value() ? builder.Append(arrow::Decimal64(std::stoll(*v))) : builder.AppendNull();
+    EXPECT_TRUE(status.ok()) << status.ToString();
+  }
+  std::shared_ptr<arrow::Array> out;
+  EXPECT_TRUE(builder.Finish(&out).ok());
+  return out;
+}
+
+// The unscaled values of a decimal array of either width, so the two arms can be compared when
+// their physical types differ by construction.
+std::string UnscaledOf(const arrow::Array& array) {
+  auto read = ReadUnscaled(array);
+  EXPECT_TRUE(read.ok()) << read.status().ToString();
+  std::string out;
+  for (std::size_t i = 0; i < read->values.size(); ++i) {
+    out += (i == 0 ? "" : " ") + (array.IsNull(static_cast<std::int64_t>(i))
+                                      ? std::string("null")
+                                      : Int128ToString(read->values[i]));
+  }
+  return out;
+}
+
+// The program's own shape -- a chain of DECIMAL arithmetic over columns -- at both widths. The
+// operands differ in physical type and the result type differs with them, so what is compared is
+// the unscaled values.
+TEST_F(ComputeTest, ANarrowProgramAnswersAsTheWideOneDoes) {
+  const LogicalType money = LogicalType::Decimal(15, 2);
+  const LogicalType step1 = LogicalType::Decimal(16, 2);
+  const LogicalType result = LogicalType::Decimal(18, 4);
+  // The last price is there so that a product needs more than 32 bits: 999999999999 * 100 is
+  // 99999999999900, and without it every value of this case fits an int32 and a narrow append that
+  // truncated to one would answer correctly anyway.
+  const std::vector<std::optional<std::string>> prices = {"1050025",    "200000", "0",
+                                                          std::nullopt, "5",      "999999999999"};
+  const std::vector<std::optional<std::string>> discounts = {"10", "0",          "500",
+                                                             "7",  std::nullopt, "0"};
+  // price * (1 - discount), which is the shape that made this item worth doing.
+  const auto expr =
+      Arith(ArithOp::kMultiply, ColumnAt(0, money),
+            Arith(ArithOp::kSubtract, ConstantOf(100, money), ColumnAt(1, money), step1), result);
+
+  std::string wide;
+  {
+    EXPECT_FALSE(plan::NarrowDecimals());
+    auto out = Eval(expr, {Decimals(money, prices), Decimals(money, discounts)});
+    ASSERT_TRUE(out.ok()) << out.status().ToString();
+    EXPECT_EQ((*out)->type_id(), arrow::Type::DECIMAL128);
+    wide = UnscaledOf(**out);
+  }
+  {
+    const NarrowDecimalsFor narrowing(true);
+    auto out = Eval(expr, {Decimals64(money, prices), Decimals64(money, discounts)});
+    ASSERT_TRUE(out.ok()) << out.status().ToString();
+    EXPECT_EQ((*out)->type_id(), arrow::Type::DECIMAL64)
+        << "a result of 18 digits must be built narrow with the switch on";
+    // The type alone does not say the values were WRITTEN narrow -- it is whatever type the builder
+    // was handed. Eight bytes a value is what says it, and a wide builder handed a narrow type
+    // would reserve sixteen.
+    EXPECT_EQ((*out)->data()->buffers[1]->size(),
+              static_cast<std::int64_t>(sizeof(std::int64_t)) * (*out)->length())
+        << "the values buffer is not eight bytes a row";
+    EXPECT_EQ(UnscaledOf(**out), wide) << "the narrow program answered differently";
+  }
+}
+
+// A result past 18 digits stays decimal128 even with the switch on, and still answers: the width
+// band is the result type's, not the switch's.
+TEST_F(ComputeTest, AWideResultStaysWideWithNarrowingOn) {
+  const NarrowDecimalsFor narrowing(true);
+  const LogicalType d38 = LogicalType::Decimal(38, 0);
+  const auto column = Decimals(d38, {"123456789012345678901234567"});
+  auto out = Eval(Arith(ArithOp::kAdd, ColumnAt(0, d38), ColumnAt(0, d38), d38), {column});
+  ASSERT_TRUE(out.ok()) << out.status().ToString();
+  EXPECT_EQ((*out)->type_id(), arrow::Type::DECIMAL128);
+  EXPECT_EQ(UnscaledOf(**out), "246913578024691357802469134");
 }
 
 }  // namespace
