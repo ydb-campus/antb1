@@ -388,7 +388,45 @@ with exit code 4. The PR ids are the roadmap's, not divergence ids.
       - **And one thing to check rather than assume**: a group or join key hashed over 8 bytes instead of 16
         (`src/exec/group_table.cc:92`) may change which partition a group lands in. No golden carries group order
         that the survey could find, but the grouped-aggregate and join suites are what settle it.
-    - **N4, docs(adr): record what N1 to N3 measured**, and accept or defer the rest on those numbers.
+      - **Every engine path reaches decimal64 as of 2026-10-20, and the switch-on run is what said so.** With
+        `SetNarrowDecimals` defaulted on, the whole of slt, oracle, metamorphic, diff and the TPC-H-derived
+        ratchet pass. Five places had to be fixed to get there, and the shape of the list is the finding: a type
+        test spelled `== DECIMAL128` where the question was "is this a decimal" is the entire failure mode, at
+        four of the five.
+        - `src/exec/compute.cc`'s DECIMAL-to-DOUBLE conversion. **The one that answered wrongly rather than
+          refusing**: a narrow column fell to Arrow's cast, which multiplies by 10^-s where ADR 0021 rule 8
+          divides by 10^s, so the two land on different doubles (5.0005 is one). The conversion already had a
+          test and could not catch it -- the test calls `DecimalToDouble`, and what broke was the route to it.
+        - `src/exec/filter.cc`'s three: a DOUBLE constant on a decimal column, a DOUBLE IN list, and the
+          decimal side of a comparison with a DOUBLE column. The first two refused the query as a type error;
+          the third took Arrow's cast, which is the same wrong answer as above.
+        - `plan::ToArrowScalar`, which built a `Decimal128Scalar` carrying a decimal64 type. Arrow's kernels
+          reach a scalar's value through a `checked_cast` on its type, a `static_cast` in the Release build the
+          prebuilt Arrow is, so this did not fail -- it read a `Decimal128`'s first eight bytes as a
+          `Decimal64`, which is the right answer for every value at this width on a little-endian target. An
+          accident of layout, now a class chosen from the type.
+        - `src/engine/format.cc`, where a decimal64 column reached the default case and Arrow's own `ToString`
+          wrote `0.125` for the `.125` rule 15 asks for.
+        - `Scatter` in `src/exec/compute.cc`, the CASE merge: Arrow has `replace_with_mask` for decimal128 and
+          **not** for decimal64, the same shape of gap as `min_max`'s. A scatter moves whole values, so the
+          narrow arm goes through the kernel as the `fixed_size_binary(8)` it already is -- `Array::View` is
+          zero-copy both ways, and the two routes were measured to agree on a NULL in either input, a NULL and
+          an all-NULL mask, and sliced inputs. Two TPC-H-derived queries and three slt files turned on this one
+          alone.
+      - **What is left is tests, not engine.** 27 unit cases still fail with the switch defaulted on, every one
+        of them an artifact of the default rather than a gap: cases that assert the off state, fixtures that
+        hand-build a decimal128 array where the plan now says decimal64 (the physical-type checks catch those
+        and say so), the `DecimalsType` check itself, text helpers that read 16 bytes from an 8-byte stride, and
+        one fixture whose premise -- a DECIMAL(18,0) column holding a 20-digit value -- cannot exist at the
+        narrow width at all. One of them is worth naming: `RandomColumn` in `grouped_aggregate_test.cc` casts
+        `MakeBuilder`'s result to `arrow::Decimal128Builder&` and so writes 16 bytes into an 8-byte slot, which
+        segfaults -- the test's own undefined behaviour, and a demonstration of exactly the hazard
+        `src/exec/decimal_bytes.h` exists to make loud.
+      - **DECIMAL in part statistics is not part of this after all.** `IntegerOf`
+        (`src/io/parquet_table.cc:547`) admits only integer scalars, so decimal statistics were never used at
+        either width. Adding them is a separate feature and does not gate the default.
+    - **N4, docs(adr): record what N1 to N3 measured**, and accept or defer the rest on those numbers. The
+      remaining decimal64 steps are the 27 test fixtures, then the default, then deleting the switch.
 
 ## Alternatives considered
 

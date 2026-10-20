@@ -11,6 +11,7 @@
 #include <vector>
 
 #include <arrow/api.h>
+#include <arrow/compute/cast.h>
 #include <gtest/gtest.h>
 
 #include "antb1/common/int128.h"
@@ -1841,6 +1842,90 @@ TEST_F(ComputeTest, ADecimalToDoubleReadsEitherWidth) {
   ASSERT_TRUE(narrow.ok()) << narrow.status().ToString();
   EXPECT_TRUE((*wide)->Equals(**narrow)) << (*wide)->ToString() << "\nagainst\n"
                                          << (*narrow)->ToString();
+}
+
+// A DOUBLE constant.
+plan::ExprPtr DoubleOf(double value) {
+  return std::make_shared<const plan::Expr>(plan::Expr{
+      .node =
+          plan::ConstantExpr{.value = plan::Constant{.type = LogicalType::kDouble, .value = value}},
+      .type = LogicalType::kDouble,
+      .name = "d"});
+}
+
+// Reaching that conversion is a separate thing from doing it right, and this is the test that fails
+// when a DECIMAL expression typed DOUBLE converts the column with Arrow's cast instead: the case
+// above calls DecimalToDouble itself, so it passes either way.
+//
+// The two conversions differ, and the case asserts that they still do, because the whole of this
+// test rests on the one value below being one they disagree about (ADR 0021 rule 8).
+TEST_F(ComputeTest, ADecimalConvertsToDoubleByDuckDbsRuleAtEitherWidth) {
+  const LogicalType d18_4 = LogicalType::Decimal(18, 4);
+  const std::vector<std::optional<std::string>> values = {"50005", std::nullopt, "-50005"};
+  // 5.0005 is DuckDB's 5.0004999999999997 (the unscaled value divided by 10^4 in DOUBLE) and
+  // Arrow's 5.0005000000000006 (multiplied by 10^-4). Without this the case proves nothing.
+  {
+    auto arrows = arrow::compute::Cast(Decimals(d18_4, {"50005"}), arrow::float64());
+    ASSERT_TRUE(arrows.ok()) << arrows.status().ToString();
+    ASSERT_NE(static_cast<const arrow::DoubleArray&>(*arrows->make_array()).Value(0),
+              DuckDbDecimalToDouble(50005, 18, 4))
+        << "Arrow's cast now agrees with DuckDB's rule at this value: the case cannot tell the two "
+           "conversions apart any more and needs another one";
+  }
+  // The shape the switch-on run failed on: a DECIMAL column in an expression typed DOUBLE, which
+  // is what makes CastTo convert it. Times one, so the conversion is the whole of the answer.
+  const auto expr =
+      Arith(ArithOp::kMultiply, ColumnAt(0, d18_4), DoubleOf(1.0), LogicalType::kDouble);
+  auto wide = Eval(expr, {Decimals(d18_4, values)});
+  ASSERT_TRUE(wide.ok()) << wide.status().ToString();
+  EXPECT_EQ(static_cast<const arrow::DoubleArray&>(**wide).Value(0),
+            DuckDbDecimalToDouble(50005, 18, 4));
+  const NarrowDecimalsFor narrowing(true);
+  auto narrow = Eval(expr, {Decimals64(d18_4, values)});
+  ASSERT_TRUE(narrow.ok()) << narrow.status().ToString();
+  EXPECT_TRUE((*wide)->Equals(**narrow)) << (*wide)->ToString() << "\nagainst\n"
+                                         << (*narrow)->ToString();
+}
+
+// A CASE over DECIMALs scatters each branch's values into the result, through a kernel Arrow has
+// for decimal128 and not for decimal64 (ADR 0021's decimal64 item). Two branches and an ELSE, so
+// the scatter runs more than once and over a result that already holds values.
+TEST_F(ComputeTest, ANarrowDecimalCaseScattersAsTheWideOneDoes) {
+  using Kind = plan::Predicate::Kind;
+  const LogicalType money = LogicalType::Decimal(15, 2);
+  const auto keys = Int16s({1, 2, 3, 4, 5, std::nullopt});
+  const auto first = Condition(Kind::kCompare, plan::CompareOp::kLt, 3,
+                               ColumnAt(0, LogicalType::kSmallInt));  // key < 3
+  const auto second = Condition(Kind::kCompare, plan::CompareOp::kLt, 5,
+                                ColumnAt(0, LogicalType::kSmallInt));  // key < 5
+  const auto expr = std::make_shared<const plan::Expr>(
+      plan::Expr{.node = plan::CaseExpr{.whens = {first, second},
+                                        .thens = {ColumnAt(1, money), ColumnAt(2, money)},
+                                        .otherwise = ColumnAt(3, money)},
+                 .type = money,
+                 .name = "case"});
+  // A NULL in each branch's column, and a NULL key, whose conditions are both NULL and so take
+  // neither branch -- it falls to the ELSE, which is the row that says the ELSE scatters too.
+  const std::vector<std::optional<std::string>> a = {"1700", std::nullopt, "1", "2", "3", "4"};
+  const std::vector<std::optional<std::string>> b = {"5", "6", "-25", std::nullopt, "7", "8"};
+  const std::vector<std::optional<std::string>> c = {"9", "10", "11", "12", std::nullopt, "13"};
+
+  std::string wide;
+  {
+    EXPECT_FALSE(plan::NarrowDecimals());
+    auto out = Eval(expr, {keys, Decimals(money, a), Decimals(money, b), Decimals(money, c)});
+    ASSERT_TRUE(out.ok()) << out.status().ToString();
+    wide = UnscaledOf(**out);
+    EXPECT_EQ(wide, "1700 null -25 null null 13") << "the wide arm answered something else";
+  }
+  const NarrowDecimalsFor narrowing(true);
+  auto out = Eval(expr, {keys, Decimals64(money, a), Decimals64(money, b), Decimals64(money, c)});
+  ASSERT_TRUE(out.ok()) << out.status().ToString();
+  EXPECT_EQ((*out)->type_id(), arrow::Type::DECIMAL64);
+  EXPECT_EQ((*out)->data()->buffers[1]->size(),
+            static_cast<std::int64_t>(sizeof(std::int64_t)) * (*out)->length())
+      << "the values buffer is not eight bytes a row: the scatter widened the result";
+  EXPECT_EQ(UnscaledOf(**out), wide) << "the narrow CASE answered differently";
 }
 
 }  // namespace

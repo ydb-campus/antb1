@@ -52,6 +52,14 @@ inline const arrow::FixedSizeBinaryArray& AsDecimalValues(const arrow::Array& ar
   return static_cast<const arrow::FixedSizeBinaryArray&>(array);
 }
 
+// Whether `type` is a decimal at either physical width. The question a caller asks with this is
+// "does this column hold a DECIMAL or a HUGEINT", which is about the value and not about its bytes,
+// so testing DECIMAL128 alone would silently answer no for a narrow column (ADR 0021's decimal64
+// item).
+inline bool IsDecimalType(const arrow::DataType& type) {
+  return type.id() == arrow::Type::DECIMAL128 || type.id() == arrow::Type::DECIMAL64;
+}
+
 // The Arrow type to build `type`'s values with:
 // `arrow::Decimal128Builder builder(DecimalsType(type), pool)`.
 inline std::shared_ptr<arrow::DataType> DecimalsType(plan::LogicalType type) {

@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <format>
 #include <string>
 #include <string_view>
@@ -115,6 +116,18 @@ std::string FormatValue(const arrow::Array& column, int64_t row, plan::LogicalTy
       return std::to_string(Value<arrow::Int64Array>(column, row));
     case arrow::Type::UINT16:
       return std::to_string(Value<arrow::UInt16Array>(column, row));
+    // A DECIMAL(p, s) of at most 18 digits (ADR 0021's decimal64 item). There is no ToIntegerString
+    // arm below it because the only logical type this physical type carries is kDecimal: a HUGEINT
+    // is 38 digits and never narrows.
+    case arrow::Type::DECIMAL64: {
+      // Eight bytes of little-endian two's complement, as decimal.cc's ReadUnscaled reads them.
+      // Without this arm the value reaches the default below, where Arrow's own ToString writes
+      // 0.125 for what rule 15 writes as .125 -- a difference in the answer, not in a type.
+      std::int64_t unscaled = 0;
+      std::memcpy(&unscaled, static_cast<const arrow::Decimal64Array&>(column).GetValue(row),
+                  sizeof(unscaled));
+      return plan::FormatDecimal(unscaled, type.width(), type.scale());
+    }
     case arrow::Type::DECIMAL128: {
       const arrow::Decimal128 v(static_cast<const arrow::Decimal128Array&>(column).GetValue(row));
       if (type == plan::LogicalType::kDecimal) {  // DuckDB's form: 17.00, .500 (ADR 0021 rule 15)

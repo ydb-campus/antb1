@@ -340,5 +340,94 @@ TEST_F(DecimalTest, ConditionsInsideExpressions) {
   EXPECT_EQ((*chosen)->ToString(), "[\n  1,\n  0,\n  0\n]");
 }
 
+// A scoped flip of plan's transitional narrowing switch, so no case leaves it on for the next. One
+// per test file that needs it, as the other cases of ADR 0021's decimal64 item do: all of them go
+// with the switch.
+class NarrowDecimalsFor {
+ public:
+  explicit NarrowDecimalsFor(bool on) : was_(plan::NarrowDecimals()) {
+    plan::SetNarrowDecimals(on);
+  }
+  ~NarrowDecimalsFor() { plan::SetNarrowDecimals(was_); }
+  NarrowDecimalsFor(const NarrowDecimalsFor&) = delete;
+  NarrowDecimalsFor& operator=(const NarrowDecimalsFor&) = delete;
+  NarrowDecimalsFor(NarrowDecimalsFor&&) = delete;
+  NarrowDecimalsFor& operator=(NarrowDecimalsFor&&) = delete;
+
+ private:
+  bool was_;
+};
+
+std::shared_ptr<arrow::Array> Decimals64(int precision, int scale,
+                                         const std::vector<std::optional<std::int64_t>>& unscaled) {
+  arrow::Decimal64Builder builder(arrow::decimal64(precision, scale));
+  for (const auto& v : unscaled) {
+    EXPECT_TRUE((v.has_value() ? builder.Append(arrow::Decimal64(*v)) : builder.AppendNull()).ok());
+  }
+  return builder.Finish().ValueOrDie();
+}
+
+// Every comparison a filter makes against a DECIMAL column, at the narrow physical width (ADR
+// 0021's decimal64 item). PredicateEvaluator::Make chooses the mode from the column's physical
+// type, so testing DECIMAL128 alone left a narrow column with no mode at all: the three it could
+// not reach rejected the query as a type error, and the fourth -- the DOUBLE column -- silently
+// converted with Arrow's cast instead of DuckDB's rule, which is a wrong answer rather than a
+// refusal.
+//
+// 5.0005 is the value the two conversions disagree about: DuckDB divides the unscaled value by
+// 10^4, Arrow multiplies by 10^-4, and they land on different doubles.
+TEST_F(DecimalTest, AFilterComparesANarrowDecimalAsItComparesTheWideOne) {
+  const int width = 18;
+  const int scale = 4;
+  const auto column = Column(0, "p", LogicalType::Decimal(width, scale));
+  // 5.0005, -5.0005, NULL, 1.5.
+  const std::vector<std::optional<std::int64_t>> unscaled = {50005, -50005, std::nullopt, 15000};
+  const auto doubles = Doubles({DuckDbDecimalToDouble(50005, width, scale), 0.0, 1.0,
+                                DuckDbDecimalToDouble(15000, width, scale)});
+  // DECIMAL(38,2), which stays wide at 38 digits: with the switch on this pairs a decimal64 column
+  // with a decimal128 one, which is the comparison of two decimal types that must still be the
+  // exact one. 5.00, -5.01, 0 and 1.50.
+  const auto other = Decimals(38, 2, {Int128{500}, Int128{-501}, Int128{0}, Int128{150}});
+
+  const auto answers = [&](const std::shared_ptr<arrow::Array>& values) {
+    const auto batch = BatchOf({values, doubles, other});
+    const auto d = Column(1, "d", LogicalType::kDouble);
+    const auto o = Column(2, "o", LogicalType::Decimal(38, 2));
+    std::vector<std::vector<std::optional<bool>>> out;
+    out.push_back(Evaluated(testing::Compare(column, CompareOp::kEq, Double(5.0005)), *batch));
+    out.push_back(Evaluated(testing::Compare(column, CompareOp::kLt, Double(1.5)), *batch));
+    plan::Predicate in{.kind = Kind::kIn, .column = column, .span = {}};
+    in.values = {Double(5.0005), Double(1.5)};
+    out.push_back(Evaluated(in, *batch));
+    out.push_back(Evaluated(Columns(column, CompareOp::kEq, d), *batch));
+    out.push_back(Evaluated(Columns(column, CompareOp::kGt, o), *batch));
+    // A DECIMAL constant of the column's own type: the kernel reads the scalar at the width the
+    // scalar's type claims, so a scalar built as the wrong class would read the wrong bytes.
+    out.push_back(Evaluated(
+        testing::Compare(
+            column, CompareOp::kEq,
+            plan::Constant{.type = LogicalType::Decimal(width, scale), .value = Int128{50005}}),
+        *batch));
+    return out;
+  };
+
+  const auto wide =
+      answers(Decimals(width, scale, {Int128{50005}, Int128{-50005}, std::nullopt, Int128{15000}}));
+  // Row 0 is the only 5.0005, so every arm but < and the exact one answers true there and nowhere
+  // else. Stated once, so a mode that answered "all false" could not pass by agreeing with itself.
+  ASSERT_EQ(wide.size(), 6U);
+  EXPECT_EQ(wide[0], (std::vector<std::optional<bool>>{true, false, kNull, false}));
+  EXPECT_EQ(wide[1], (std::vector<std::optional<bool>>{false, true, kNull, false}));
+  EXPECT_EQ(wide[2], (std::vector<std::optional<bool>>{true, false, kNull, true}));
+  EXPECT_EQ(wide[3], (std::vector<std::optional<bool>>{true, false, kNull, true}));
+  EXPECT_EQ(wide[4], (std::vector<std::optional<bool>>{true, true, kNull, false}));
+  EXPECT_EQ(wide[5], (std::vector<std::optional<bool>>{true, false, kNull, false}));
+
+  const NarrowDecimalsFor narrowing(true);
+  const auto narrow_values = Decimals64(width, scale, unscaled);
+  ASSERT_EQ(narrow_values->type_id(), arrow::Type::DECIMAL64);
+  EXPECT_EQ(answers(narrow_values), wide) << "a narrow column compared differently";
+}
+
 }  // namespace
 }  // namespace antb1::exec

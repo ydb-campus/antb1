@@ -68,7 +68,7 @@ arrow::Result<ArrayPtr> CastTo(const ArrayPtr& values, const std::shared_ptr<arr
   }
   // A DECIMAL (or HUGEINT) to DOUBLE converts as DuckDB converts it (ADR 0021 rule 8), which is
   // not Arrow's cast.
-  if (values->type_id() == arrow::Type::DECIMAL128 && type->id() == arrow::Type::DOUBLE) {
+  if (IsDecimalType(*values->type()) && type->id() == arrow::Type::DOUBLE) {
     return DecimalToDouble(*values,
                            ctx != nullptr ? ctx->memory_pool() : arrow::default_memory_pool());
   }
@@ -1910,6 +1910,21 @@ struct Evaluator {
                                   const ArrayPtr& values) const {
     if (values->length() == 0) {
       return into;
+    }
+    // Arrow has a replace_with_mask kernel for decimal128 and none for decimal64 (ADR 0021's
+    // decimal64 item, the same gap as min_max's). A scatter never looks inside a value, it moves
+    // whole values, so a narrow column goes through the kernel as the fixed_size_binary(8) it
+    // already is: Array::View hands the same buffers to another type, so neither view nor the view
+    // back copies anything. Measured to answer what the wide kernel answers on a NULL in either
+    // input, a NULL or an all-NULL mask (CASE's own), and sliced inputs.
+    if (into->type_id() == arrow::Type::DECIMAL64) {
+      const auto bytes = arrow::fixed_size_binary(into->type()->byte_width());
+      ARROW_ASSIGN_OR_RAISE(const ArrayPtr into_bytes, into->View(bytes));
+      ARROW_ASSIGN_OR_RAISE(const ArrayPtr value_bytes, values->View(bytes));
+      ARROW_ASSIGN_OR_RAISE(
+          const arrow::Datum out,
+          arrow::compute::CallFunction("replace_with_mask", {into_bytes, mask, value_bytes}, ctx));
+      return out.make_array()->View(into->type());
     }
     ARROW_ASSIGN_OR_RAISE(
         const arrow::Datum out,
