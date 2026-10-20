@@ -1549,5 +1549,129 @@ TEST_F(ComputeTest, AReusedNegationIsRangeCheckedByTheStepThatReadsIt) {
   EXPECT_EQ(reused.status().ToString(), alone.status().ToString());
 }
 
+// ---- a step computed in int64 where its range admits one (ADR 0021's decimal64 item, N1) ----
+
+// The same arithmetic forced down the Int128 path, as the control. `Compile` covers only DECIMAL
+// +, - and * over columns, constants and other such nodes, so a double negation of an operand --
+// the same value -- makes it bail and evaluate the whole tree recursively in Int128. Without a
+// control like this an equivalence test would compare the narrow path with itself.
+//
+// It is the RIGHT operand that is wrapped. A cast error names the column it came from, and
+// wrapping the left operand would leave the control unable to name it, so the two paths would
+// differ in the message for a reason that has nothing to do with the arithmetic.
+plan::ExprPtr Negated(const plan::ExprPtr& operand, LogicalType type) {
+  return std::make_shared<const plan::Expr>(
+      plan::Expr{.node = plan::NegateExpr{.operand = operand}, .type = type, .name = "n"});
+}
+plan::ExprPtr ThroughInt128(ArithOp op, const plan::ExprPtr& left, const plan::ExprPtr& right,
+                            LogicalType type) {
+  return Arith(op, left, Negated(Negated(right, right->type), right->type), type);
+}
+
+// Every value a narrow step may legitimately hold fits an int64, and every value it may not must
+// behave as the Int128 path behaves: the boundaries, one past them, a rescale that leaves int64,
+// and a column holding what its declared width does not admit.
+TEST_F(ComputeTest, ANarrowStepAgreesWithTheInt128PathAtItsBoundaries) {
+  struct Case {
+    std::string what;
+    LogicalType operand;
+    LogicalType result;
+    ArithOp op;
+    std::string left;
+    std::string right;
+  };
+  const LogicalType d18 = LogicalType::Decimal(18, 0);
+  const LogicalType d18s = LogicalType::Decimal(18, 2);
+  const std::string max18 = "999999999999999999";  // 10^18 - 1, inside an int64
+  const std::vector<Case> cases = {
+      {.what = "ordinary values",
+       .operand = d18,
+       .result = d18,
+       .op = ArithOp::kAdd,
+       .left = "1234",
+       .right = "5678"},
+      {.what = "the result exactly at the range maximum",
+       .operand = d18,
+       .result = d18,
+       .op = ArithOp::kAdd,
+       .left = "999999999999999998",
+       .right = "1"},
+      {.what = "one past the range maximum",
+       .operand = d18,
+       .result = d18,
+       .op = ArithOp::kAdd,
+       .left = max18,
+       .right = "1"},
+      {.what = "the negative boundary",
+       .operand = d18,
+       .result = d18,
+       .op = ArithOp::kSubtract,
+       .left = "-999999999999999998",
+       .right = "1"},
+      {.what = "a product past the range",
+       .operand = d18,
+       .result = d18,
+       .op = ArithOp::kMultiply,
+       .left = "1000000000",
+       .right = "1000000000"},
+      // A column holding more than its declared width, which no int64 holds either: the operand
+      // test has to send this row to the Int128 path rather than truncating it.
+      {.what = "a column past its declared width and past int64",
+       .operand = d18,
+       .result = d18,
+       .op = ArithOp::kAdd,
+       .left = "99999999999999999999999999999",
+       .right = "1"},
+      // 2^64 + 5, whose low 64 bits are 5. The case above does not pin the operand test on its
+      // own: truncating that value happens to land outside the step's range, so the range test
+      // rejects it either way and a truncating read would pass unnoticed. This one truncates to a
+      // value well INSIDE the range, so only a real test of whether it fits an int64 keeps it an
+      // error rather than an answer of 6.
+      {.what = "a value whose low 64 bits are inside the range",
+       .operand = d18,
+       .result = d18,
+       .op = ArithOp::kAdd,
+       .left = "18446744073709551621",
+       .right = "1"},
+      // A rescale to scale 2 multiplies by 100, which leaves an int64 for a large operand.
+      {.what = "a rescale that leaves int64",
+       .operand = d18,
+       .result = d18s,
+       .op = ArithOp::kAdd,
+       .left = max18,
+       .right = "0"},
+  };
+
+  for (const Case& c : cases) {
+    const auto left = Decimals(c.operand, {c.left});
+    const auto right = Decimals(c.operand, {c.right});
+    const auto l = ColumnAt(0, c.operand);
+    const auto r = ColumnAt(1, c.operand);
+    auto narrow = Eval(Arith(c.op, l, r, c.result), {left, right});
+    auto wide = Eval(ThroughInt128(c.op, l, r, c.result), {left, right});
+    ASSERT_EQ(narrow.ok(), wide.ok())
+        << c.what
+        << ": one path answered and the other did not\nnarrow: " << narrow.status().ToString()
+        << "\nwide: " << wide.status().ToString();
+    if (narrow.ok()) {
+      EXPECT_EQ(UnscaledText(**narrow), UnscaledText(**wide)) << c.what;
+    } else {
+      // The message names the operation and the values, so the two paths must raise the same one:
+      // the narrow path is required to stand aside rather than raise on its own account.
+      EXPECT_EQ(narrow.status().ToString(), wide.status().ToString()) << c.what;
+    }
+  }
+}
+
+// A step whose result needs more than 18 digits keeps the Int128 path, and still answers.
+TEST_F(ComputeTest, AStepPast18DigitsIsNotNarrowed) {
+  const LogicalType d38 = LogicalType::Decimal(38, 0);
+  const std::string big = "12345678901234567890123456789";  // 29 digits, no int64 holds it
+  const auto column = Decimals(d38, {big});
+  auto sum = Eval(Arith(ArithOp::kAdd, ColumnAt(0, d38), ColumnAt(0, d38), d38), {column});
+  ASSERT_TRUE(sum.ok()) << sum.status().ToString();
+  EXPECT_EQ(UnscaledText(**sum), "decimal128(38, 0): 24691357802469135780246913578");
+}
+
 }  // namespace
 }  // namespace antb1::exec

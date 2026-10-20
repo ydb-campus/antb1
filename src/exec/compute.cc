@@ -367,6 +367,10 @@ arrow::Status DecimalOverflow(plan::ArithOp op, Int128 x, Int128 y, plan::Logica
 // The semantics are the recursive path's, step for step: an operand of a +, - or % is rescaled to
 // its step's scale and must fit its range (DuckDB casts it to the result type first), the left one
 // before the right one, and a * takes the unscaled values because the scales add up.
+// The digits an int64 holds with room for a rescale: rule 6 caps a product of two operands of at
+// most this many digits at this many, which is what makes the int64 form of a step common.
+constexpr std::uint8_t kMaxNarrowDigits = 18;
+
 constexpr std::size_t kMaxProgramSteps = 16;
 
 struct DecimalProgram {
@@ -395,6 +399,16 @@ struct DecimalProgram {
     plan::LogicalType type;       // the step's result type, the cast error's target
     plan::LogicalType left_type;  // the operand types the cast error names
     plan::LogicalType right_type;
+    // The same step in int64, where this step's result type has at most 18 digits so every value
+    // the step may legitimately hold fits one -- rule 6's cap is what makes that common, since a
+    // product of two operands of at most 18 digits caps at 18 (ADR 0021's decimal64 item, N1). The
+    // factors are powers of ten up to 10^18, which fits an int64 too. An operand is not assumed to
+    // fit: a column can hold a value past its declared width, so each is tested as it is read.
+    std::int64_t left_factor64 = 1;
+    std::int64_t right_factor64 = 1;
+    std::int64_t min64 = 0;
+    std::int64_t max64 = 0;
+    bool narrow = false;
   };
 
   std::vector<DecimalOperand> columns;  // one per column *occurrence*, each read in place
@@ -501,6 +515,68 @@ Int128 ScaleFactor(plan::LogicalType from, plan::LogicalType to, plan::ArithOp o
 // the *left subtree*, having evaluated all of it before the right. Both raise, and each is
 // deterministic for a given plan and input, so what differs is which values the message names. The
 // alternative is to evaluate every step over every row, which is the pass this exists to remove.
+// `v` as an int64, or false when it needs more. A column can hold a value its declared width does
+// not admit, so no operand is assumed to fit however narrow its type says it is.
+bool FitsInt64(const Int128& v, std::int64_t* out) {
+  const auto narrow = static_cast<std::int64_t>(v);
+  if (static_cast<Int128>(narrow) != v) {
+    return false;
+  }
+  *out = narrow;
+  return true;
+}
+
+// One step of a narrow program in int64 (ADR 0021's decimal64 item, N1): an int64 multiply costs
+// about a quarter of an Int128 one, and this engine's own capping rule puts most steps within
+// reach of it.
+//
+// False on any overflow and on any value outside the step's range, without saying which -- the
+// caller then runs the Int128 path, which decides whether that is an error and raises with the
+// row's own values. So this can change neither an answer nor a message: it either agrees with the
+// Int128 path exactly, or it stands aside. For a step whose range fits an int64 the two cannot
+// disagree about what is an error anyway, since a result past int64 is past the range as well, but
+// the design does not rest on that argument.
+bool NarrowStep(const DecimalProgram::Step& step, std::int64_t x, std::int64_t y,
+                std::int64_t* out) {
+  if (step.left_factor64 != 1 && __builtin_mul_overflow(x, step.left_factor64, &x)) {
+    return false;
+  }
+  if ((step.left_factor64 != 1 || step.check_left) && (x < step.min64 || x > step.max64)) {
+    return false;
+  }
+  if (step.right_factor64 != 1 && __builtin_mul_overflow(y, step.right_factor64, &y)) {
+    return false;
+  }
+  if ((step.right_factor64 != 1 || step.check_right) && (y < step.min64 || y > step.max64)) {
+    return false;
+  }
+  std::int64_t value = 0;
+  switch (step.op) {
+    case plan::ArithOp::kAdd:
+      if (__builtin_add_overflow(x, y, &value)) {
+        return false;
+      }
+      break;
+    case plan::ArithOp::kSubtract:
+      if (__builtin_sub_overflow(x, y, &value)) {
+        return false;
+      }
+      break;
+    case plan::ArithOp::kMultiply:
+      if (__builtin_mul_overflow(x, y, &value)) {
+        return false;
+      }
+      break;
+    default:
+      return false;  // % keeps the Int128 path; Compile admits none, so this is a guard
+  }
+  if (value < step.min64 || value > step.max64) {
+    return false;
+  }
+  *out = value;
+  return true;
+}
+
 arrow::Result<ArrayPtr> RunDecimalProgram(const DecimalProgram& program, int64_t rows,
                                           const std::uint8_t* valid, plan::LogicalType result,
                                           arrow::MemoryPool* pool) {
@@ -530,6 +606,15 @@ arrow::Result<ArrayPtr> RunDecimalProgram(const DecimalProgram& program, int64_t
       const DecimalProgram::Step& step = steps[s];
       Int128 x = read(step.left, at);
       Int128 y = read(step.right, at);
+      if (step.narrow) {
+        std::int64_t xs = 0;
+        std::int64_t ys = 0;
+        std::int64_t value = 0;
+        if (FitsInt64(x, &xs) && FitsInt64(y, &ys) && NarrowStep(step, xs, ys, &value)) {
+          slots[s] = value;
+          continue;
+        }
+      }
       // The left operand is rescaled and checked before the right one, as the recursive path does.
       if (step.left_factor != 1) {
         if (__builtin_mul_overflow(x, step.left_factor, &x) || x < step.range.min ||
@@ -1498,6 +1583,17 @@ struct Evaluator {
                                                  .type = expr.type,
                                                  .left_type = arith->left->type,
                                                  .right_type = arith->right->type});
+    // The int64 form of this step, where its own range admits one. The step's result type decides:
+    // an operand still has to be tested as it is read, because a column can hold a value its
+    // declared width does not admit, and an operand of a wider type simply fails that test and
+    // keeps the Int128 path for its row.
+    DecimalProgram::Step& added = program.steps.back();
+    if (expr.type == plan::LogicalType::kDecimal && expr.type.width() <= kMaxNarrowDigits) {
+      added.narrow = FitsInt64(added.range.min, &added.min64) &&
+                     FitsInt64(added.range.max, &added.max64) &&
+                     FitsInt64(left_factor, &added.left_factor64) &&
+                     FitsInt64(right_factor, &added.right_factor64);
+    }
     return Source{.kind = Source::Kind::kStep, .at = program.steps.size() - 1};
   }
 
