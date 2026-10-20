@@ -31,6 +31,7 @@
 #include "antb1/plan/types.h"
 
 #include "decimal.h"
+#include "decimal_bytes.h"
 #include "parallel_compute.h"
 
 namespace antb1::exec {
@@ -435,7 +436,7 @@ arrow::Result<ArrayPtr> DecimalArith(const DecimalOperand& left, const DecimalOp
   // and its length is the result's.
   const arrow::Array* const sized = left.is_scalar() ? right.array : left.array;
   const auto rows = static_cast<std::size_t>(sized->length());
-  arrow::Decimal128Builder builder(plan::ToArrow(result), pool);
+  arrow::Decimal128Builder builder(DecimalsType(result), pool);
   ARROW_RETURN_NOT_OK(builder.Reserve(sized->length()));
   // A constant is never NULL here and an array with no NULL needs no test, so a row is only looked
   // up in the bitmaps that have one.
@@ -584,10 +585,40 @@ bool NarrowStep(const DecimalProgram::Step& step, std::int64_t x, std::int64_t y
   return true;
 }
 
+// One unscaled value into a column of whichever physical width plan::ToArrow asked for. A narrow
+// column takes the low 64 bits, which is the whole value: every result the program appends has been
+// range-checked against its step's type, and a type of at most 18 digits cannot hold more (ADR
+// 0021's N3).
+//
+// Overloads rather than a branch, and the loop below is a template rather than a switch on each
+// value, so neither width pays for the other's existence in a per-row test.
+void AppendUnscaled(arrow::Decimal128Builder& builder, const Int128& value) {
+  builder.UnsafeAppend(FromInt128(value));
+}
+void AppendUnscaled(arrow::Decimal64Builder& builder, const Int128& value) {
+  builder.UnsafeAppend(arrow::Decimal64(static_cast<std::int64_t>(value)));
+}
+
+template <class Builder>
+arrow::Result<ArrayPtr> RunProgramInto(const DecimalProgram& program, int64_t rows,
+                                       const std::uint8_t* valid, Builder& builder);
+
 arrow::Result<ArrayPtr> RunDecimalProgram(const DecimalProgram& program, int64_t rows,
                                           const std::uint8_t* valid, plan::LogicalType result,
                                           arrow::MemoryPool* pool) {
-  arrow::Decimal128Builder builder(plan::ToArrow(result), pool);
+  // One test per call, not per row: the width is a property of the result type.
+  std::shared_ptr<arrow::DataType> type = plan::ToArrow(result);
+  if (type->id() == arrow::Type::DECIMAL64) {
+    arrow::Decimal64Builder narrow(type, pool);
+    return RunProgramInto(program, rows, valid, narrow);
+  }
+  arrow::Decimal128Builder wide(type, pool);
+  return RunProgramInto(program, rows, valid, wide);
+}
+
+template <class Builder>
+arrow::Result<ArrayPtr> RunProgramInto(const DecimalProgram& program, int64_t rows,
+                                       const std::uint8_t* valid, Builder& builder) {
   ARROW_RETURN_NOT_OK(builder.Reserve(rows));
   std::array<Int128, kMaxProgramSteps> slots{};
   const std::span<const DecimalProgram::Step> steps(program.steps);
@@ -672,7 +703,7 @@ arrow::Result<ArrayPtr> RunDecimalProgram(const DecimalProgram& program, int64_t
       builder.UnsafeAppendNull();
       continue;
     }
-    builder.UnsafeAppend(FromInt128(slots[last]));
+    AppendUnscaled(builder, slots[last]);
   }
   std::shared_ptr<arrow::Array> out;
   ARROW_RETURN_NOT_OK(builder.Finish(&out));
@@ -1122,7 +1153,7 @@ struct Evaluator {
       // The type is kept, and its range is symmetric. A file may still hold a value beyond its
       // declared width (nothing checks it on read), so the 128-bit minimum is an overflow, not UB.
       ARROW_ASSIGN_OR_RAISE(DecimalOperand values, ReadDecimalOperand(*operand, e.type, {}));
-      arrow::Decimal128Builder builder(plan::ToArrow(e.type), pool);
+      arrow::Decimal128Builder builder(DecimalsType(e.type), pool);
       ARROW_RETURN_NOT_OK(builder.Reserve(operand->length()));
       for (int64_t i = 0; i < operand->length(); ++i) {
         if (operand->IsNull(i)) {
@@ -1536,7 +1567,11 @@ struct Evaluator {
         return std::nullopt;  // an integer column would have to be widened, which copies anyway
       }
       const ArrayPtr& values = batch.column(column->index);
-      if (!ReadableInPlace(*values)) {
+      // A decimal128 column is read in place. A decimal64 one is widened into the operand's own
+      // vector, which is one pass a batch rather than a test a row, and leaves this file's hot loop
+      // exactly as it was (ADR 0021's N3). An integer column would have to be widened as well and
+      // keeps the recursive path, as before.
+      if (!ReadableInPlace(*values) && values->type_id() != arrow::Type::DECIMAL64) {
         return std::nullopt;
       }
       auto read = ReadDecimalOperand(*values, expr.type, expr.name);
