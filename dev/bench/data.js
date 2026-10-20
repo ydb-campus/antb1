@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792514314561,
+  "lastUpdate": 1792519112046,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -15948,6 +15948,258 @@ window.BENCHMARK_DATA = {
             "value": 2138.5887440000033,
             "unit": "ms/iter",
             "extra": "iterations: 1\ncpu: 2138.478651 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "23d84490487e52a8e47548d76601091ea3618d2e",
+          "message": "feat(exec,engine,plan): the last five paths take decimal64 (#204)\n\n## Summary\n\n[ADR 0021](../blob/main/docs/adr/0021-decimal-semantics.md)'s decimal64\nitem, the step that makes **every** engine\npath reach the narrow width. With `SetNarrowDecimals` defaulted on, slt,\noracle, metamorphic, diff, the CLI goldens\nand the TPC-H-derived ratchet all pass; before this they did not. The\nswitch itself stays **off** — flipping it is\na later step, and the ADR now says what is left before that.\n\nFour of the five fixes were one mistake, and that is the finding worth\nkeeping: a type test spelled\n`== DECIMAL128` where the question being asked was *\"is this a\ndecimal\"*. `IsDecimalType` in `decimal_bytes.h` is\nwhere that question now lives, beside the two guards already there.\n\n| | what it did at the narrow width |\n| --- | --- |\n| `compute.cc`'s DECIMAL→DOUBLE | **answered wrongly** — fell to Arrow's\ncast |\n| `filter.cc` ×3 (DOUBLE constant, DOUBLE IN list, DOUBLE column) | two\nrefused the query; the third answered wrongly |\n| `plan::ToArrowScalar` | built a `Decimal128Scalar` carrying a\ndecimal64 type |\n| `format.cc` | wrote `0.125` where rule 15 writes `.125` |\n| `Scatter` (CASE) | `NotImplemented` — an Arrow kernel gap, not ours |\n\n**The conversion one is the one to look at.** A narrow column fell\nthrough to Arrow's cast, which multiplies by\n10⁻ˢ where [rule 8](../blob/main/docs/adr/0021-decimal-semantics.md)\ndivides by 10ˢ — different doubles (5.0005 is\none). It had a test, and that test could not catch it: the test calls\n`DecimalToDouble`, and what was broken was\nthe *route* to it. The new case goes through an expression instead, and\nasserts that the two conversions still\ndisagree at the value it picks, so it cannot go vacuous if Arrow's cast\never changes.\n\n**`ToArrowScalar` was wrong in a way that worked.** Arrow's kernels\nreach a scalar's value through a\n`checked_cast` on its type, which is a `static_cast` in the Release\nbuild the prebuilt Arrow is — so a\n`Decimal128Scalar` holding a decimal64 type never failed. It read a\n`Decimal128`'s first eight bytes as a\n`Decimal64`, which is the right answer for every value of this width on\na little-endian target. Correct by the\nlayout and by one endianness; `dynamic_cast` asks what the kernels\ncannot.\n\n**The fifth is Arrow's gap, not ours.** `replace_with_mask`, which CASE\nscatters each branch's values with, has a\ndecimal128 kernel and no decimal64 one — the same shape as `min_max`'s.\nA scatter never looks inside a value, it\nmoves whole values, so the narrow arm goes through the kernel as the\n`fixed_size_binary(8)` it already is;\n`Array::View` hands over the same buffers, so neither view copies. I\nmeasured the two routes against each other on\na NULL in either input, a NULL mask, the **all-NULL mask CASE itself\nbuilds**, and sliced inputs before using it.\nTwo TPC-H-derived queries and three slt files turned on this one alone.\n\n**No measurement, and none applies:** the switch is off, so nothing\nchanged here executes yet.\n\n## What is left of the item, now known rather than guessed\n\n27 unit cases still fail with the switch defaulted on, and every one is\nan artifact of the default rather than a\ngap: cases that assert the off state, fixtures that hand-build a\ndecimal128 array where the plan now says\ndecimal64 (the physical-type checks catch those and name them), the\n`DecimalsType` check itself, text helpers\nreading 16 bytes from an 8-byte stride, and one fixture whose premise —\na `DECIMAL(18,0)` column holding a\n20-digit value — cannot exist at the narrow width at all.\n\nOne deserves naming: `RandomColumn` in `grouped_aggregate_test.cc` casts\n`MakeBuilder`'s result to\n`arrow::Decimal128Builder&`, so with the switch on it writes 16 bytes\ninto an 8-byte slot and **segfaults**. That\nis the test's own undefined behaviour, and a live demonstration of\nexactly the hazard `decimal_bytes.h` was\nwritten to make loud.\n\n**DECIMAL in part statistics turns out not to belong to this item at\nall.** `IntegerOf`\n(`src/io/parquet_table.cc`) admits only integer scalars, so decimal\nstatistics were never used at *either* width.\nAdding them is a separate feature and does not gate the default. I had\nit down as a step of this item; it is not\none.\n\nOne deliberate choice to flag: `NarrowDecimalsFor` is now copy-pasted\ninto six test files. Consolidating it into\n`exec_test_util.h` would touch four passing test files for no behaviour,\nand all six copies go when the switch\ndoes — so it stays duplicated and goes in one deletion.\n\nCloses #\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run test\nANTB1-TESTS: PASS preset=dev junit=build/dev/junit.xml\n\n$ pixi run ci\n100% tests passed out of 2795\n\n$ pixi run lint\nclang-format, gersemi, ruff format, ruff check, markdownlint-cli2, typos, check_repo.py: Passed\nshellcheck: Failed -- ~37 pre-existing SC2218 on this host (macOS shellcheck), no shell script in this diff\n\n$ clang-tidy -p build/tidy --warnings-as-errors='*' <the nine touched files>\n(clean)\n\n$ ASAN_OPTIONS=detect_leaks=0 ./build/ci-asan/bin/antb1_{exec,plan,engine}_tests --gtest_filter=<the touched suites>\n43, 15 and 4 tests PASSED\n\n# every fix mutation-checked, each breaking exactly one case:\nScatter -> kernel for decimal64          ComputeTest.ANarrowDecimalCaseScattersAsTheWideOneDoes\nCastTo tests DECIMAL128 only             ComputeTest.ADecimalConvertsToDoubleByDuckDbsRuleAtEitherWidth\nfilter.cc's three back to DECIMAL128     DecimalTest.AFilterComparesANarrowDecimalAsItComparesTheWideOne\nformat.cc without its DECIMAL64 arm      FormatValueTest.NarrowDecimalsShowTheSameTextAsWideOnes\nToArrowScalar keeps Decimal128Scalar     LogicalPlanTest.ADecimalScalarsClassFollowsItsType\n\n# with the switch temporarily defaulted on (reverted before the commit):\nslt 69/69  oracle 72/72  metamorphic 154/154  diff 6/6  tpch 25/25  cli 88/88\n```\n\n`pixi run check` reports FAIL for lint only, on the shellcheck finding\nabove. `asan`, `tidy`, `ci-gcc` and\n`check-full` cannot run on this host (macOS): `pixi run asan` fails at\ndiscovery on a pre-existing\n`curl_global_init` leak, `pixi run tidy` fails on unmodified `main` with\nfour macOS-only findings, and the `gcc`\nenvironment is linux-64 only — so CI is the gate for those three.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests) — except the pre-existing\n      shellcheck findings above\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer — `docs/adr/` is\nCODEOWNERS; this adds findings under ADR 0021's existing `Proposed` plan\nand changes no status\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5) found\nthe five gaps by defaulting the switch on\nand reading every failure, probed Arrow 25 for the `replace_with_mask`\nroutes and their NULL and slice\nbehaviour, wrote the fixes and the five cases, and mutation-checked each\none.\n- Accountable human (has read and understands the whole diff): @hor911\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-20T20:54:53+03:00",
+          "tree_id": "2669a7e6293005717cebaa5efb5547f9b450ef58",
+          "url": "https://github.com/ydb-campus/antb1/commit/23d84490487e52a8e47548d76601091ea3618d2e"
+        },
+        "date": 1792519110857,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4535.51865664403,
+            "unit": "ns/iter",
+            "extra": "iterations: 154985\ncpu: 4533.285446978741 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 94656.9954003197,
+            "unit": "ns/iter",
+            "extra": "iterations: 6957\ncpu: 94653.70116429495 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 124780.36858059904,
+            "unit": "ns/iter",
+            "extra": "iterations: 5608\ncpu: 124772.19472182596 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 484915.6855955523,
+            "unit": "ns/iter",
+            "extra": "iterations: 1444\ncpu: 484742.07202216034 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 455255.80584416265,
+            "unit": "ns/iter",
+            "extra": "iterations: 1540\ncpu: 455077.4954545455 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2233176.0411393056,
+            "unit": "ns/iter",
+            "extra": "iterations: 316\ncpu: 2232277.727848101 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 54.08116484615606,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 54.076404615384575 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 49.828579500001524,
+            "unit": "ms/iter",
+            "extra": "iterations: 14\ncpu: 49.826555357142865 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 227.2534319999977,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 227.21598599999973 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 15.011624148935136,
+            "unit": "ms/iter",
+            "extra": "iterations: 47\ncpu: 15.01118785106381 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 18.570046973683187,
+            "unit": "ms/iter",
+            "extra": "iterations: 38\ncpu: 18.568662394736815 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 41.07755129411865,
+            "unit": "ms/iter",
+            "extra": "iterations: 17\ncpu: 41.07327847058815 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.5737678671172006,
+            "unit": "ms/iter",
+            "extra": "iterations: 444\ncpu: 1.5736539909909901 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 76.93771377777618,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 76.93549333333334 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1000",
+            "value": 26.96289923076952,
+            "unit": "ms/iter",
+            "extra": "iterations: 26\ncpu: 26.961658230769185 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16384",
+            "value": 29.909325913044302,
+            "unit": "ms/iter",
+            "extra": "iterations: 23\ncpu: 29.908628695652155 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/262144",
+            "value": 62.54889036363341,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 62.544429272727115 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1048576",
+            "value": 101.29848799999763,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 101.29220085714304 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/4194304",
+            "value": 352.51636699999267,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 352.48046549999935 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16777216",
+            "value": 1731.6333599999894,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1731.4902660000016 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1000",
+            "value": 33.50335038095409,
+            "unit": "ms/iter",
+            "extra": "iterations: 21\ncpu: 33.50119514285715 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16384",
+            "value": 37.54152199999944,
+            "unit": "ms/iter",
+            "extra": "iterations: 19\ncpu: 37.53876315789477 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/262144",
+            "value": 65.46967930000278,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 65.46735960000021 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1048576",
+            "value": 125.4248404000009,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 125.41628199999977 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/4194304",
+            "value": 434.0928750000046,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 434.0764330000013 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16777216",
+            "value": 2074.291085000027,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2074.025655 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1000",
+            "value": 55.186729384615774,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 55.17623007692298 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16384",
+            "value": 59.5894884166673,
+            "unit": "ms/iter",
+            "extra": "iterations: 12\ncpu: 59.581174333333216 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/262144",
+            "value": 92.06167812499899,
+            "unit": "ms/iter",
+            "extra": "iterations: 8\ncpu: 92.05002999999978 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1048576",
+            "value": 172.42806250000342,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 172.41144399999973 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/4194304",
+            "value": 514.9438319999717,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 514.9059009999987 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16777216",
+            "value": 2369.9146909999627,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2369.645313999996 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1000",
+            "value": 65.83949718181906,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 65.83367290909078 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16384",
+            "value": 70.44837930000085,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 70.4384798999996 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/262144",
+            "value": 110.67959583333693,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 110.66434866666697 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1048576",
+            "value": 198.5988533333322,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 198.58561966666602 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/4194304",
+            "value": 561.9863720000353,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 561.8905979999979 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16777216",
+            "value": 2553.4751030000393,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2553.2045839999996 ms\nthreads: 1"
           }
         ]
       }
