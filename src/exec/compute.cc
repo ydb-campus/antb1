@@ -204,6 +204,12 @@ arrow::Result<ArrayPtr> HugeIntArith(const arrow::Array& left, const arrow::Arra
 //
 //   `scalar`   a constant: one value, whatever the row (its array is never built either)
 //   `bytes`    a decimal128 array: its buffer, 16 bytes a row, read in place
+//   `narrow`   a decimal64 array: its buffer, 8 bytes a row, read in place and sign-extended.
+//              Without this shape a narrow column fell to `owned`, which is the one shape that
+//              allocates -- and it cost the heaviest decimal query 1.56x of this operator's own
+//              time, measured, because it traded reading 8 bytes a row in place for allocating and
+//              writing 16 (ADR 0021's decimal64 item). Halving the bytes a value moves cannot pay
+//              for widening every one of them back.
 //   `owned`    anything that had to be converted -- an integer array widened to Int128, or an
 //              operand a rescale moved -- which is the only shape that allocates
 //
@@ -213,6 +219,7 @@ arrow::Result<ArrayPtr> HugeIntArith(const arrow::Array& left, const arrow::Arra
 struct DecimalOperand {
   Int128 scalar = 0;
   const std::uint8_t* bytes = nullptr;
+  const std::int64_t* narrow = nullptr;
   std::vector<Int128> owned;
   const arrow::Array* array = nullptr;
   ArrayPtr owner;  // keeps `array`, and so `bytes`, alive
@@ -221,10 +228,19 @@ struct DecimalOperand {
   bool checked = false;
 
   [[nodiscard]] bool is_scalar() const { return array == nullptr; }
+  // Stops reading the array in place, so At reads `owned` instead. Every in-place shape is cleared
+  // here: leaving one set makes At return the value the rescale replaced, silently.
+  void Detach() {
+    bytes = nullptr;
+    narrow = nullptr;
+  }
   // The unscaled value of row `row`; 0 where it is NULL, as the vector held before.
   [[nodiscard]] Int128 At(std::size_t row) const {
     if (bytes != nullptr) {
       return ToInt128(arrow::Decimal128(bytes + (row * sizeof(Int128))));
+    }
+    if (narrow != nullptr) {  // an int64 widens by sign extension, which is the whole conversion
+      return narrow[row];
     }
     return owned.empty() ? scalar : owned[row];
   }
@@ -240,14 +256,21 @@ struct DecimalOperand {
 // and for a reason I could not attribute. A guard that is already present is not worth paying for
 // twice (ADR 0021's N3).
 bool ReadableInPlace(const arrow::Array& array) {
-  return array.type_id() == arrow::Type::DECIMAL128;
+  return array.type_id() == arrow::Type::DECIMAL128 || array.type_id() == arrow::Type::DECIMAL64;
 }
 
 arrow::Result<DecimalOperand> ReadDecimalOperand(const arrow::Array& array, plan::LogicalType type,
                                                  std::string column) {
   DecimalOperand operand{.array = &array, .type = type, .column = std::move(column)};
-  if (ReadableInPlace(array)) {
+  if (array.type_id() == arrow::Type::DECIMAL128) {
     operand.bytes = static_cast<const arrow::Decimal128Array&>(array).GetValue(0);
+    return operand;
+  }
+  if (array.type_id() == arrow::Type::DECIMAL64) {
+    // Eight contiguous bytes a row, little-endian two's complement on both targets, which is what
+    // At reads through a pointer of the right type rather than through a memcpy per row.
+    operand.narrow = reinterpret_cast<const std::int64_t*>(
+        static_cast<const arrow::Decimal64Array&>(array).GetValue(0));
     return operand;
   }
   auto unscaled = ReadUnscaled(array);  // an integer operand, widened into a vector
@@ -345,7 +368,7 @@ arrow::Status RescaleOperand(DecimalOperand& operand, plan::LogicalType result) 
     }
   }
   operand.owned = std::move(scaled);
-  operand.bytes = nullptr;
+  operand.Detach();
   return arrow::Status::OK();
 }
 
@@ -1576,11 +1599,9 @@ struct Evaluator {
         return std::nullopt;  // an integer column would have to be widened, which copies anyway
       }
       const ArrayPtr& values = batch.column(column->index);
-      // A decimal128 column is read in place. A decimal64 one is widened into the operand's own
-      // vector, which is one pass a batch rather than a test a row, and leaves this file's hot loop
-      // exactly as it was (ADR 0021's N3). An integer column would have to be widened as well and
-      // keeps the recursive path, as before.
-      if (!ReadableInPlace(*values) && values->type_id() != arrow::Type::DECIMAL64) {
+      // A decimal column of either width is read in place, 16 bytes a row or 8. An integer column
+      // would have to be widened and keeps the recursive path, as before.
+      if (!ReadableInPlace(*values)) {
         return std::nullopt;
       }
       auto read = ReadDecimalOperand(*values, expr.type, expr.name);

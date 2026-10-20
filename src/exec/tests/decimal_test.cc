@@ -370,11 +370,22 @@ TEST_F(DecimalTest, AFilterComparesANarrowDecimalAsItComparesTheWideOne) {
   // with a decimal128 one, which is the comparison of two decimal types that must still be the
   // exact one. 5.00, -5.01, 0 and 1.50.
   const auto other = Decimals(38, 2, {Int128{500}, Int128{-501}, Int128{0}, Int128{150}});
+  // And a column of the column's OWN type, which is the shape a narrow pair compares as integers:
+  // both sides carry the same scale, so the unscaled values order as the values do. 5.0005,
+  // -4.0004, NULL, 1.4999 against the column's 5.0005, -5.0005, NULL, 1.5.
+  const std::vector<std::optional<std::int64_t>> same_unscaled = {50005, -40004, std::nullopt,
+                                                                  14999};
 
   const auto answers = [&](const std::shared_ptr<arrow::Array>& values) {
-    const auto batch = BatchOf({values, doubles, other});
+    const bool narrow = values->type_id() == arrow::Type::DECIMAL64;
+    const auto same =
+        narrow
+            ? Decimals64(width, scale, same_unscaled)
+            : Decimals(width, scale, {Int128{50005}, Int128{-40004}, std::nullopt, Int128{14999}});
+    const auto batch = BatchOf({values, doubles, other, same});
     const auto d = Column(1, "d", LogicalType::kDouble);
     const auto o = Column(2, "o", LogicalType::Decimal(38, 2));
+    const auto same_type = Column(3, "same", LogicalType::Decimal(width, scale));
     std::vector<std::vector<std::optional<bool>>> out;
     out.push_back(Evaluated(testing::Compare(column, CompareOp::kEq, Double(5.0005)), *batch));
     out.push_back(Evaluated(testing::Compare(column, CompareOp::kLt, Double(1.5)), *batch));
@@ -383,6 +394,8 @@ TEST_F(DecimalTest, AFilterComparesANarrowDecimalAsItComparesTheWideOne) {
     out.push_back(Evaluated(in, *batch));
     out.push_back(Evaluated(Columns(column, CompareOp::kEq, d), *batch));
     out.push_back(Evaluated(Columns(column, CompareOp::kGt, o), *batch));
+    out.push_back(Evaluated(Columns(column, CompareOp::kGt, same_type), *batch));
+    out.push_back(Evaluated(Columns(column, CompareOp::kEq, same_type), *batch));
     // A DECIMAL constant of the column's own type: the kernel reads the scalar at the width the
     // scalar's type claims, so a scalar built as the wrong class would read the wrong bytes.
     out.push_back(Evaluated(
@@ -404,13 +417,17 @@ TEST_F(DecimalTest, AFilterComparesANarrowDecimalAsItComparesTheWideOne) {
   }
   // Row 0 is the only 5.0005, so every arm but < and the exact one answers true there and nowhere
   // else. Stated once, so a mode that answered "all false" could not pass by agreeing with itself.
-  ASSERT_EQ(wide.size(), 6U);
+  ASSERT_EQ(wide.size(), 8U);
   EXPECT_EQ(wide[0], (std::vector<std::optional<bool>>{true, false, kNull, false}));
   EXPECT_EQ(wide[1], (std::vector<std::optional<bool>>{false, true, kNull, false}));
   EXPECT_EQ(wide[2], (std::vector<std::optional<bool>>{true, false, kNull, true}));
   EXPECT_EQ(wide[3], (std::vector<std::optional<bool>>{true, false, kNull, true}));
   EXPECT_EQ(wide[4], (std::vector<std::optional<bool>>{true, true, kNull, false}));
-  EXPECT_EQ(wide[5], (std::vector<std::optional<bool>>{true, false, kNull, false}));
+  // Against the column of its own type: 5.0005 > 5.0005 false, -5.0005 > -4.0004 false, NULL,
+  // 1.5 > 1.4999 true; and = only on row 0.
+  EXPECT_EQ(wide[5], (std::vector<std::optional<bool>>{false, false, kNull, true}));
+  EXPECT_EQ(wide[6], (std::vector<std::optional<bool>>{true, false, kNull, false}));
+  EXPECT_EQ(wide[7], (std::vector<std::optional<bool>>{true, false, kNull, false}));
 
   const testing::NarrowDecimalsFor narrowing(true);
   const auto narrow_values = Decimals64(width, scale, unscaled);

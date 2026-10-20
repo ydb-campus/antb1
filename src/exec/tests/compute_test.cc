@@ -1901,6 +1901,34 @@ TEST_F(ComputeTest, ADecimalConvertsToDoubleByDuckDbsRuleAtEitherWidth) {
                                          << (*narrow)->ToString();
 }
 
+// An operand a rescale rewrote must be read from what the rescale wrote, at either width. The
+// operand shapes that read an array in place -- 16 bytes a row for decimal128, 8 for decimal64 --
+// are both cleared when the rescale copies the values out; leaving one set makes the arithmetic
+// read the value the rescale replaced and answer with the wrong scale, silently.
+//
+// A modulo is the sharp shape: it rescales the narrower operand and then divides by it, so an
+// un-rescaled divisor is 100x too small and the remainder is wrong rather than merely unscaled.
+TEST_F(ComputeTest, ARescaledOperandIsReadRescaledAtEitherWidth) {
+  const LogicalType money = LogicalType::Decimal(15, 2);  // the operand a rescale moves
+  const LogicalType finer = LogicalType::Decimal(18, 4);  // the result's scale
+  // 4.0004 % 10.50 is 4.0004: the dividend is smaller, so the answer is the dividend -- but only
+  // if the divisor really was rescaled to 105000. Un-rescaled it is 1050, and the answer is 0.0024.
+  const std::vector<std::optional<std::string>> dividend = {"40004", "-30003", std::nullopt};
+  const std::vector<std::optional<std::string>> divisor = {"1050", "1050", "1050"};
+  const auto expr = Arith(ArithOp::kModulo, ColumnAt(0, finer), ColumnAt(1, money), finer);
+
+  for (const bool narrowing_on : {false, true}) {
+    const NarrowDecimalsFor narrowing(narrowing_on);
+    SCOPED_TRACE(std::format("narrowing {}", narrowing_on));
+    const auto left = Decimals(finer, dividend);
+    const auto right = Decimals(money, divisor);
+    ASSERT_EQ(left->type_id(), narrowing_on ? arrow::Type::DECIMAL64 : arrow::Type::DECIMAL128);
+    auto out = Eval(expr, {left, right});
+    ASSERT_TRUE(out.ok()) << out.status().ToString();
+    EXPECT_EQ(UnscaledText(**out), "DECIMAL(18,4): 40004 -30003 null");
+  }
+}
+
 // A CASE over DECIMALs scatters each branch's values into the result, through a kernel Arrow has
 // for decimal128 and not for decimal64 (ADR 0021's decimal64 item). Two branches and an ELSE, so
 // the scatter runs more than once and over a result that already holds values.

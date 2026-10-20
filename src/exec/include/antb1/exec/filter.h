@@ -36,6 +36,9 @@ class PredicateEvaluator {
     kColumnToDouble,  // kCompare, kIn, kNotIn: the DECIMAL column converted to DOUBLE
     kInDouble,        // kCompareColumns: the side that is not DOUBLE converted to DOUBLE
     kExact,           // kCompareColumns: a DECIMAL with another type of number, by value
+    // A narrow DECIMAL against the same type: compared as the BIGINT it already is, both sides
+    // viewed rather than converted (ADR 0021's decimal64 item).
+    kNarrowAsInteger,
   };
 
   plan::Predicate predicate_;

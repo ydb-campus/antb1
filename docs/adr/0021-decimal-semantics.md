@@ -445,10 +445,44 @@ with exit code 4. The PR ids are the roadmap's, not divergence ids.
       - **DECIMAL in part statistics is not part of this after all.** `IntegerOf`
         (`src/io/parquet_table.cc:547`) admits only integer scalars, so decimal statistics were never used at
         either width. Adding them is a separate feature and does not gate the default.
-    - **N4, docs(adr): record what N1 to N3 measured**, and accept or defer the rest on those numbers. The
-      remaining decimal64 steps are the default, then deleting the switch (and with it `NarrowDecimalsFor`,
-      the two-arm cases that exist only to compare the widths, and the wide arms a p <= 18 type can no longer
-      take). Flipping the default is where the 8-bytes-a-value claim finally gets a number.
+    - **The flip was run on 2026-10-20, and it is deferred.** The 8-bytes-a-value claim finally got a number,
+      and the number says the item pays in memory and not yet in time.
+      - **Flipping the default with nothing else changed is a regression**: at SF 10, one thread, 22 queries,
+        three repeats with the arms interleaved, geomean 1.027x, carried by Q06 at 1.691x and Q01 at 1.138x.
+        Both were attributed rather than inferred -- Q06's whole cost sat in its scan (66 ms to 112 ms at SF
+        1, same rows and predicates), Q01's entirely in Compute's own time.
+      - **Arrow 25 has no specialised comparison kernel for decimal64.** Measured on this environment's
+        Arrow: `greater_equal` of a column against a scalar costs 1.23 ns a row at decimal128, **3.44 at
+        decimal64** (2.8x), and 0.13 at int64. The same shape of gap as the missing `min_max` and
+        `replace_with_mask` kernels, and the cause of Q06: a pushed predicate goes through
+        `PredicateEvaluator`, which calls that kernel.
+      - **So the comparison stopped going through it.** A decimal's bytes ARE its unscaled integer, and
+        `PredicateEvaluator::Make` already refuses a constant whose type differs from the column's, so where
+        it does not refuse both sides carry one scale and the comparison IS an integer comparison.
+        `Array::View` hands the same buffers to int64 at no copy, and the two routes were measured to agree
+        including on NULLs. That is `Mode::kNarrowAsInteger`, and it makes Q06 **0.817x** -- faster than
+        decimal128, not merely level with it, because the int64 kernel beats the decimal128 one 9x.
+      - **And Q01 was a shape of our own making.** `ReadDecimalOperand` read a decimal128 column in place and
+        sent a decimal64 one to the shape that allocates: a `std::vector<Int128>` filled by widening every
+        value. Compute's own time, 926 ms against 1442 ms at SF 10. Halving the bytes a value moves cannot
+        pay for widening every one of them back. A fourth operand shape reads the narrow column in place at
+        its own stride, and Q01 becomes **0.958x**. One trap came with it: `RescaleOperand` cleared `bytes`
+        and not the new pointer, so a rescaled operand read the value the rescale had replaced -- the modulo
+        in `decimal_literals.slt` caught it, and `DecimalOperand::Detach` now clears every in-place shape.
+      - **Where that leaves it.** SF 10 one thread geomean **0.984x**, four threads **0.991x**; SF 100 four
+        threads over 22 queries **0.995x**. Peak memory falls everywhere it moves at all: 0.868x on SF 10's
+        heaviest query (3765 MiB to 3267), and at SF 100 Q02 0.81x, Q09 down 636 MiB, Q05 down 338 MiB.
+      - **What defers the flip** is a consistent 2 to 8% regression at SF 100 on the join-heavy queries,
+        measured at five repeats with non-overlapping spreads: Q05 1.078x, Q12 1.039x, Q09 1.032x, Q21
+        1.022x, Q18 1.012x. **It is not explained.** Two hypotheses were tested and both are wrong: the
+        gather is 0.90x at the narrow width (a micro-benchmark of exactly what `gather.cc` does), and the
+        memory budget's heuristics are not reacting to the lower usage -- with an explicit identical limit on
+        both arms Q05 still reads 5.73 s against 6.12 s. Flipping the default on an unexplained regression is
+        not a trade worth making for a memory saving that will still be there once it is understood.
+      - **Next**, in order: find Q05's 6.7%; then flip; then delete the switch, and with it
+        `NarrowDecimalsFor`, the two-arm cases that exist only to compare the widths, and the wide arms a
+        p <= 18 type can no longer take.
+    - **N4, docs(adr): record what N1 to N3 measured**, and accept or defer the rest on those numbers.
 
 ## Alternatives considered
 
