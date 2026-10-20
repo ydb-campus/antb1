@@ -49,6 +49,10 @@ class LogicalType {
   }
   // The widest DECIMAL precision (and the widest HUGEINT, in digits).
   static constexpr std::uint8_t kMaxDecimalWidth = 38;
+  // The most digits an int64 holds, and so the band a decimal64 can represent. Rule 6 caps a
+  // product of two operands of at most this many digits at this many, which is what makes the
+  // band the common case rather than a corner.
+  static constexpr std::uint8_t kMaxNarrowDecimalWidth = 18;
 
   [[nodiscard]] constexpr Id id() const { return id_; }
   [[nodiscard]] constexpr std::uint8_t width() const { return width_; }
@@ -76,6 +80,22 @@ std::string ToString(LogicalType type);
 
 // The Arrow type the engine uses for a logical type (VARCHAR is always arrow::binary()).
 std::shared_ptr<arrow::DataType> ToArrow(LogicalType type);
+
+// Transitional, and the first step of [ADR
+// 0021](../../../../../docs/adr/0021-decimal-semantics.md)'s decimal64 item: whether a DECIMAL(p,s)
+// of at most LogicalType::kMaxNarrowDecimalWidth digits maps to decimal64 instead of decimal128,
+// which halves the bytes each of its values moves.
+//
+// Off by default, and it must stay off until the rest of that item lands: nothing in the engine
+// reads a decimal64 array yet, so turning it on now makes every decimal path fail its
+// physical-type check instead of answering. That is deliberate -- the checks went in first for
+// exactly this -- but it is not a configuration anyone should pick.
+//
+// Set once, before a query runs. It is atomic because ToArrow is called from the part pipelines of
+// a running query, and relaxed because nothing orders anything against it. It goes away with the
+// item's last step, and so does this comment.
+void SetNarrowDecimals(bool on);
+[[nodiscard]] bool NarrowDecimals();
 
 // Maps a storage type to a logical type; NotImplemented (with a clear message) for unsupported
 // types.
