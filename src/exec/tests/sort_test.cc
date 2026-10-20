@@ -132,6 +132,39 @@ TEST_F(SortTest, EveryEngineType) {
   EXPECT_EQ(SortedIds(batch, {Key(6, LogicalType::Decimal(15, 2), true)}), (Ids{0, 1, 3, 2}));
 }
 
+// A narrow DECIMAL key sorts to the same order as the wide one (ADR 0021's decimal64 item, step
+// 4). It takes a different comparator and a different prefix, and is `exact` where the wide one is
+// not -- the whole value fits the prefix -- so the comparator is never called for it and only the
+// order can say the prefix is right.
+TEST_F(SortTest, ANarrowDecimalKeySortsAsTheWideOneDoes) {
+  const LogicalType money = LogicalType::Decimal(15, 2);
+  const std::vector<std::optional<std::int64_t>> unscaled = {
+      1700, -25, std::nullopt, -99999999999999, 0, 1700};
+
+  arrow::Decimal128Builder wide_values(arrow::decimal128(money.width(), money.scale()));
+  arrow::Decimal64Builder narrow_values(arrow::decimal64(money.width(), money.scale()));
+  for (const auto& v : unscaled) {
+    if (v.has_value()) {
+      ASSERT_TRUE(wide_values.Append(arrow::Decimal128(*v)).ok());
+      ASSERT_TRUE(narrow_values.Append(arrow::Decimal64(*v)).ok());
+    } else {
+      ASSERT_TRUE(wide_values.AppendNull().ok());
+      ASSERT_TRUE(narrow_values.AppendNull().ok());
+    }
+  }
+  const auto wide = WithIds({wide_values.Finish().ValueOrDie()});
+  const auto narrow = WithIds({narrow_values.Finish().ValueOrDie()});
+
+  for (const bool descending : {false, true}) {
+    const Ids expected = SortedIds(wide, {Key(1, money, descending)});
+    plan::SetNarrowDecimals(true);
+    const Ids got = SortedIds(narrow, {Key(1, money, descending)});
+    plan::SetNarrowDecimals(false);
+    EXPECT_EQ(got, expected) << "descending=" << descending;
+  }
+  EXPECT_FALSE(plan::NarrowDecimals());
+}
+
 TEST_F(SortTest, LaterKeysBreakTies) {
   const auto batch =
       WithIds({Int64s({1, 2, 1, 2, 1}), Strings({"x", "y", "z", "a", std::nullopt})});

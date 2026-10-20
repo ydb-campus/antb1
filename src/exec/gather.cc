@@ -54,6 +54,8 @@ arrow::Status GatherTyped(const std::vector<const arrow::Array*>& arrays, std::s
       builder.UnsafeAppend(array.GetView(ref.row));
     } else if constexpr (std::is_same_v<ArrayType, arrow::Decimal128Array>) {
       builder.UnsafeAppend(arrow::Decimal128(array.GetValue(ref.row)));
+    } else if constexpr (std::is_same_v<ArrayType, arrow::Decimal64Array>) {
+      builder.UnsafeAppend(arrow::Decimal64(array.GetValue(ref.row)));
     } else {
       builder.UnsafeAppend(array.Value(ref.row));
     }
@@ -122,6 +124,11 @@ arrow::Status GatherRows(const std::vector<std::shared_ptr<arrow::RecordBatch>>&
     case arrow::Type::DOUBLE:
       return GatherTyped<arrow::DoubleArray, arrow::DoubleBuilder, kWithNulls>(arrays, refs,
                                                                                builder);
+    case arrow::Type::DECIMAL64:
+      // Without this a narrow decimal column would fall to the slice path below, which is correct
+      // and slower (ADR 0021's decimal64 item).
+      return GatherTyped<arrow::Decimal64Array, arrow::Decimal64Builder, kWithNulls>(arrays, refs,
+                                                                                     builder);
     case arrow::Type::DECIMAL128:
       return GatherTyped<arrow::Decimal128Array, arrow::Decimal128Builder, kWithNulls>(arrays, refs,
                                                                                        builder);
