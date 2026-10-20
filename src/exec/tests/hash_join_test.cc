@@ -2667,7 +2667,11 @@ TEST_F(HashJoinTest, LeftJoinPadsEveryType) {
   const auto build_schema = arrow::schema(
       {arrow::field("k", arrow::int64()), arrow::field("i16", arrow::int16(), /*nullable=*/false),
        arrow::field("i32", arrow::int32()), arrow::field("u16", arrow::uint16()),
-       arrow::field("huge", arrow::decimal128(38, 0)), arrow::field("dec", arrow::decimal128(5, 3)),
+       arrow::field("huge", arrow::decimal128(38, 0)),
+       // Through plan::ToArrow, like the column testing::Decimals builds below: a schema that
+       // names a width the array does not have is a table no plan could produce, and the only
+       // thing it would test is the mismatch (ADR 0021's decimal64 item).
+       arrow::field("dec", plan::ToArrow(plan::LogicalType::Decimal(5, 3))),
        arrow::field("dbl", arrow::float64()), arrow::field("str", arrow::binary()),
        arrow::field("day", arrow::date32()),
        arrow::field("ts", arrow::timestamp(arrow::TimeUnit::MICRO)),

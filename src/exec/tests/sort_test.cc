@@ -108,12 +108,11 @@ TEST_F(SortTest, EveryEngineType) {
   ASSERT_TRUE(decimals.Append(arrow::Decimal128::GetMaxValue(38).Negate()).ok());
   ASSERT_TRUE(decimals.AppendNull().ok());
   ASSERT_TRUE(decimals.Append(hugeint(-1)).ok());
-  // DECIMAL(15,2) orders by the unscaled value: 17.00, -0.25, NULL, -999999999999.99.
-  arrow::Decimal128Builder scaled(plan::ToArrow(LogicalType::Decimal(15, 2)));
-  ASSERT_TRUE(scaled.Append(hugeint(1700)).ok());
-  ASSERT_TRUE(scaled.Append(hugeint(-25)).ok());
-  ASSERT_TRUE(scaled.AppendNull().ok());
-  ASSERT_TRUE(scaled.Append(hugeint(-99999999999999)).ok());
+  // DECIMAL(15,2) orders by the unscaled value: 17.00, -0.25, NULL, -999999999999.99. Through the
+  // width-aware helper, so the column's physical type is the one the sort key's Bind expects at
+  // either setting of the narrowing switch (ADR 0021's decimal64 item).
+  const auto scaled = testing::Decimals(LogicalType::Decimal(15, 2),
+                                        {"1700", "-25", std::nullopt, "-99999999999999"});
   const auto batch = WithIds({
       testing::ArrayOf<arrow::Int16Builder, int16_t>(arrow::int16(), {3, -4, std::nullopt, 0}),
       testing::ArrayOf<arrow::Int32Builder, int32_t>(arrow::int32(), {3, -4, std::nullopt, 0}),
@@ -121,7 +120,7 @@ TEST_F(SortTest, EveryEngineType) {
                                                        {65535, 1, std::nullopt, 0}),
       testing::ArrayOf<arrow::Date32Builder, int32_t>(arrow::date32(), {3, -4, std::nullopt, 0}),
       decimals.Finish().ValueOrDie(),
-      scaled.Finish().ValueOrDie(),
+      scaled,
   });
   EXPECT_EQ(SortedIds(batch, {Key(1, LogicalType::kSmallInt)}), (Ids{1, 3, 0, 2}));
   EXPECT_EQ(SortedIds(batch, {Key(2, LogicalType::kInteger)}), (Ids{1, 3, 0, 2}));
@@ -138,31 +137,30 @@ TEST_F(SortTest, EveryEngineType) {
 // order can say the prefix is right.
 TEST_F(SortTest, ANarrowDecimalKeySortsAsTheWideOneDoes) {
   const LogicalType money = LogicalType::Decimal(15, 2);
-  const std::vector<std::optional<std::int64_t>> unscaled = {
-      1700, -25, std::nullopt, -99999999999999, 0, 1700};
+  const std::vector<std::optional<std::string>> unscaled = {
+      "1700", "-25", std::nullopt, "-99999999999999", "0", "1700"};
 
-  arrow::Decimal128Builder wide_values(arrow::decimal128(money.width(), money.scale()));
-  arrow::Decimal64Builder narrow_values(arrow::decimal64(money.width(), money.scale()));
-  for (const auto& v : unscaled) {
-    if (v.has_value()) {
-      ASSERT_TRUE(wide_values.Append(arrow::Decimal128(*v)).ok());
-      ASSERT_TRUE(narrow_values.Append(arrow::Decimal64(*v)).ok());
-    } else {
-      ASSERT_TRUE(wide_values.AppendNull().ok());
-      ASSERT_TRUE(narrow_values.AppendNull().ok());
-    }
-  }
-  const auto wide = WithIds({wide_values.Finish().ValueOrDie()});
-  const auto narrow = WithIds({narrow_values.Finish().ValueOrDie()});
+  // Both arms are the same code under a different setting: testing::Decimals builds at whatever
+  // width plan::ToArrow asks for, which is the width the sort key's Bind then dispatches on.
+  const auto column = [&](bool narrowing_on) {
+    const testing::NarrowDecimalsFor narrowing(narrowing_on);
+    const auto values = testing::Decimals(money, unscaled);
+    EXPECT_EQ(values->type_id(), narrowing_on ? arrow::Type::DECIMAL64 : arrow::Type::DECIMAL128);
+    return WithIds({values});
+  };
+  const auto wide = column(false);
+  const auto narrow = column(true);
 
   for (const bool descending : {false, true}) {
-    const Ids expected = SortedIds(wide, {Key(1, money, descending)});
-    plan::SetNarrowDecimals(true);
-    const Ids got = SortedIds(narrow, {Key(1, money, descending)});
-    plan::SetNarrowDecimals(false);
-    EXPECT_EQ(got, expected) << "descending=" << descending;
+    Ids expected;
+    {
+      const testing::NarrowDecimalsFor narrowing(false);
+      expected = SortedIds(wide, {Key(1, money, descending)});
+    }
+    const testing::NarrowDecimalsFor narrowing(true);
+    EXPECT_EQ(SortedIds(narrow, {Key(1, money, descending)}), expected)
+        << "descending=" << descending;
   }
-  EXPECT_FALSE(plan::NarrowDecimals());
 }
 
 TEST_F(SortTest, LaterKeysBreakTies) {

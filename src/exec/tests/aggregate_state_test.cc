@@ -396,24 +396,6 @@ TEST_F(AggregateStateTest, MinMaxOfDatesUnsignedDoublesAndHugeInts) {
   EXPECT_EQ(Text(*huge), "-99999999999999999999");
 }
 
-// A DECIMAL(15,2) column of unscaled values; MIN and MAX keep the type, and the result carries its
-// (p,s).
-// A scoped flip of plan's transitional narrowing switch (ADR 0021's decimal64 item).
-class NarrowDecimalsFor {
- public:
-  explicit NarrowDecimalsFor(bool on) : was_(plan::NarrowDecimals()) {
-    plan::SetNarrowDecimals(on);
-  }
-  ~NarrowDecimalsFor() { plan::SetNarrowDecimals(was_); }
-  NarrowDecimalsFor(const NarrowDecimalsFor&) = delete;
-  NarrowDecimalsFor& operator=(const NarrowDecimalsFor&) = delete;
-  NarrowDecimalsFor(NarrowDecimalsFor&&) = delete;
-  NarrowDecimalsFor& operator=(NarrowDecimalsFor&&) = delete;
-
- private:
-  bool was_;
-};
-
 // The ungrouped MIN and MAX of a narrow DECIMAL. Arrow 25 has no min_max kernel for decimal64, so
 // this state widens for the kernel and narrows the answer back; what the case pins is that the
 // answer and its type are the ones the caller asked for, and that SUM and COUNT(DISTINCT) over the
@@ -442,13 +424,13 @@ TEST_F(AggregateStateTest, MinMaxOfANarrowDecimalAnswersAsTheWideOneDoes) {
   for (const AggKind kind : {AggKind::kMin, AggKind::kMax}) {
     std::string wide;
     {
-      EXPECT_FALSE(plan::NarrowDecimals());
+      const testing::NarrowDecimalsFor narrowing(false);
       auto state = Make(kind, type, type);
       ASSERT_TRUE(state->Consume(*wide_values, nullptr).ok());
       wide = Text(*state);
       EXPECT_TRUE(Result(*state)->type()->Equals(arrow::decimal128(15, 2)));
     }
-    const NarrowDecimalsFor narrowing(true);
+    const testing::NarrowDecimalsFor narrowing(true);
     auto state = Make(kind, type, type);
     ASSERT_TRUE(state->Consume(*narrow_values, nullptr).ok());
     EXPECT_EQ(Text(*state), wide) << (kind == AggKind::kMin ? "MIN" : "MAX");
@@ -458,27 +440,24 @@ TEST_F(AggregateStateTest, MinMaxOfANarrowDecimalAnswersAsTheWideOneDoes) {
   }
 
   // An empty column still gives one NULL of the narrow type rather than of the kernel's.
-  const NarrowDecimalsFor narrowing(true);
+  const testing::NarrowDecimalsFor narrowing(true);
   auto empty = Make(AggKind::kMin, type, type);
   EXPECT_TRUE(Result(*empty)->type()->Equals(arrow::decimal64(15, 2)));
 }
 
 TEST_F(AggregateStateTest, MinMaxAndCountDistinctOfDecimals) {
   const LogicalType type = LogicalType::Decimal(15, 2);
-  arrow::Decimal128Builder builder(plan::ToArrow(type));
-  const std::vector<std::optional<int64_t>> unscaled = {1700, std::nullopt, -25, 1700,
-                                                        -99999999999999};
-  for (const std::optional<int64_t>& v : unscaled) {
-    ASSERT_TRUE(
-        (v.has_value() ? builder.Append(arrow::Decimal128(*v)) : builder.AppendNull()).ok());
-  }
-  const auto values = builder.Finish().ValueOrDie();
+  const auto values =
+      testing::Decimals(type, {"1700", std::nullopt, "-25", "1700", "-99999999999999"});
   const auto selection = Bools({true, true, true, true, false});
 
   auto min = Make(AggKind::kMin, type, type);
   ASSERT_TRUE(min->Consume(*values, selection.get()).ok());
   EXPECT_EQ(Text(*min), "-25");
-  EXPECT_TRUE(Result(*min)->type()->Equals(arrow::decimal128(15, 2)));
+  // MIN keeps the argument's type; which physical width that is at this precision is
+  // MinMaxOfANarrowDecimalAnswersAsTheWideOneDoes's subject, at both settings.
+  EXPECT_TRUE(Result(*min)->type()->Equals(*plan::ToArrow(type)))
+      << Result(*min)->type()->ToString();
   auto max = Make(AggKind::kMax, type, type);
   ASSERT_TRUE(max->Consume(*values, nullptr).ok());
   EXPECT_EQ(Text(*max), "1700");
@@ -499,22 +478,12 @@ TEST_F(AggregateStateTest, MinMaxAndCountDistinctOfDecimals) {
   EXPECT_FALSE(invalid(AggKind::kAvg, type, LogicalType::kDouble));
 }
 
-std::shared_ptr<arrow::Array> DecimalsOf(LogicalType type,
-                                         const std::vector<std::optional<std::string>>& unscaled) {
-  arrow::Decimal128Builder builder(plan::ToArrow(type));
-  for (const auto& v : unscaled) {
-    EXPECT_TRUE(
-        (v.has_value() ? builder.Append(arrow::Decimal128(*v)) : builder.AppendNull()).ok());
-  }
-  return builder.Finish().ValueOrDie();
-}
-
 // SUM of a DECIMAL(p,s) is an exact DECIMAL(38,s) (ADR 0021 rule 12), NULL over no values, checked
 // against 10^38 - 1 at the end and against 128 bits at every addition (also when merging); AVG is
 // DuckDB's DOUBLE (rule 13).
 TEST_F(AggregateStateTest, SumAndAvgOfDecimals) {
   const LogicalType p = LogicalType::Decimal(15, 2);
-  const auto values = DecimalsOf(p, {"1700", std::nullopt, "-25", "999999999999999"});
+  const auto values = testing::Decimals(p, {"1700", std::nullopt, "-25", "999999999999999"});
   auto sum = Make(AggKind::kSum, p, LogicalType::Decimal(38, 2));
   ASSERT_TRUE(sum->Consume(*values, Bools({true, true, true, false}).get()).ok());
   EXPECT_EQ(Text(*sum), "1675");
@@ -534,25 +503,25 @@ TEST_F(AggregateStateTest, SumAndAvgOfDecimals) {
   const LogicalType d38 = LogicalType::Decimal(38, 0);
   const std::string max38(38, '9');
   auto big = Make(AggKind::kSum, d38, LogicalType::Decimal(38, 0));
-  ASSERT_TRUE(big->Consume(*DecimalsOf(d38, {max38, "1"}), nullptr).ok());
+  ASSERT_TRUE(big->Consume(*testing::Decimals(d38, {max38, "1"}), nullptr).ok());
   const auto out = big->Finalize(arrow::default_memory_pool());
   EXPECT_TRUE(out.status().IsExecutionError()) << out.status().ToString();
   EXPECT_EQ(out.status().message(),
             "SUM overflow: the result is outside the range of DECIMAL(38,0) (38 decimal digits)");
   auto bits = Make(AggKind::kSum, d38, LogicalType::Decimal(38, 0));
-  const auto status = bits->Consume(*DecimalsOf(d38, {max38, max38}), nullptr);
+  const auto status = bits->Consume(*testing::Decimals(d38, {max38, max38}), nullptr);
   EXPECT_EQ(status.message(), "SUM overflow: the sum of a DECIMAL(38,0) column exceeds 128 bits");
   auto avg_bits = Make(AggKind::kAvg, d38, LogicalType::kDouble);
-  ASSERT_TRUE(avg_bits->Consume(*DecimalsOf(d38, {max38}), nullptr).ok());
+  ASSERT_TRUE(avg_bits->Consume(*testing::Decimals(d38, {max38}), nullptr).ok());
   auto avg_more = Make(AggKind::kAvg, d38, LogicalType::kDouble);
-  ASSERT_TRUE(avg_more->Consume(*DecimalsOf(d38, {max38}), nullptr).ok());
+  ASSERT_TRUE(avg_more->Consume(*testing::Decimals(d38, {max38}), nullptr).ok());
   EXPECT_EQ(avg_bits->Merge(*avg_more).message(),
             "AVG overflow: the sum of a DECIMAL(38,0) column exceeds 128 bits");
   // AVG of a single DECIMAL(38,0) value: DuckDB's halves, not a direct conversion (rule 13). The
   // value rounds twice with an x87 long double (the sum, then to double) or a double one (the lower
   // half, then the sum), but once, to the correctly rounded value, with an IEEE quad (arm64 Linux).
   auto halves = Make(AggKind::kAvg, d38, LogicalType::kDouble);
-  ASSERT_TRUE(halves->Consume(*DecimalsOf(d38, {"27670116110564329473"}), nullptr).ok());
+  ASSERT_TRUE(halves->Consume(*testing::Decimals(d38, {"27670116110564329473"}), nullptr).ok());
   EXPECT_EQ(Text(*halves), std::numeric_limits<long double>::digits == 113
                                ? "2.767011611056433e+19"
                                : "2.7670116110564327e+19");

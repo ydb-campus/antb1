@@ -32,8 +32,11 @@ namespace {
 
 using plan::ArithOp;
 using plan::LogicalType;
+using testing::Decimals;
 using testing::Int16s;
 using testing::Int64s;
+using testing::NarrowDecimalsFor;
+using testing::UnscaledText;
 
 class ComputeTest : public testing::ExecTest {};
 
@@ -189,27 +192,6 @@ TEST_F(ComputeTest, HugeIntArithmetic) {
   EXPECT_EQ((*product)->ToString(), "[\n  3,\n  6\n]");
 }
 
-std::shared_ptr<arrow::Array> Decimals(LogicalType type,
-                                       const std::vector<std::optional<std::string>>& unscaled) {
-  arrow::Decimal128Builder builder(plan::ToArrow(type));
-  for (const auto& v : unscaled) {
-    EXPECT_TRUE(
-        (v.has_value() ? builder.Append(arrow::Decimal128(*v)) : builder.AppendNull()).ok());
-  }
-  return builder.Finish().ValueOrDie();
-}
-
-// The unscaled values of a decimal128 array ("null" for NULL), and its type.
-std::string UnscaledText(const arrow::Array& array) {
-  std::string out = array.type()->ToString() + ":";
-  const auto& d = static_cast<const arrow::Decimal128Array&>(array);
-  for (int64_t i = 0; i < d.length(); ++i) {
-    out += " " +
-           (d.IsNull(i) ? std::string("null") : arrow::Decimal128(d.GetValue(i)).ToIntegerString());
-  }
-  return out;
-}
-
 plan::ExprPtr Named(const plan::ExprPtr& expr, std::string name) {
   plan::Expr copy = *expr;
   copy.name = std::move(name);
@@ -316,18 +298,18 @@ TEST_F(ComputeTest, DecimalArithmetic) {
   auto sum = Eval(Arith(ArithOp::kAdd, ColumnAt(0, p), ColumnAt(1, r), LogicalType::Decimal(18, 4)),
                   {price, rate});
   ASSERT_TRUE(sum.ok()) << sum.status().ToString();
-  EXPECT_EQ(UnscaledText(**sum), "decimal128(18, 4): 170005 -12500 null 100000000999999899");
+  EXPECT_EQ(UnscaledText(**sum), "DECIMAL(18,4): 170005 -12500 null 100000000999999899");
   auto difference =
       Eval(Arith(ArithOp::kSubtract, ColumnAt(1, r), ColumnAt(0, p), LogicalType::Decimal(18, 4)),
            {price, rate});
   ASSERT_TRUE(difference.ok()) << difference.status().ToString();
-  EXPECT_EQ(UnscaledText(**difference), "decimal128(18, 4): -169995 -7500 null -99999998999999901");
+  EXPECT_EQ(UnscaledText(**difference), "DECIMAL(18,4): -169995 -7500 null -99999998999999901");
   // p * r is DECIMAL(18,6), capped from 24: the last row needs 24 digits.
   const auto product =
       Arith(ArithOp::kMultiply, ColumnAt(0, p), ColumnAt(1, r), LogicalType::Decimal(18, 6));
   auto first = Eval(product, {price->Slice(0, 3), rate->Slice(0, 3)});
   ASSERT_TRUE(first.ok()) << first.status().ToString();
-  EXPECT_EQ(UnscaledText(**first), "decimal128(18, 6): 8500 250000 null");
+  EXPECT_EQ(UnscaledText(**first), "DECIMAL(18,6): 8500 250000 null");
   EXPECT_EQ(Eval(product, {price, rate}).status().message(),
             "Overflow in multiplication of DECIMAL(18) (999999999999999 * 999999999). You might "
             "want to add an explicit cast to a bigger decimal.");
@@ -339,10 +321,10 @@ TEST_F(ComputeTest, DecimalArithmetic) {
       Arith(ArithOp::kAdd, ColumnAt(0, p), ColumnAt(1, r), LogicalType::Decimal(18, 4));
   auto sliced = Eval(tail_sum, {price->Slice(1, 2), rate->Slice(1, 2)});
   ASSERT_TRUE(sliced.ok()) << sliced.status().ToString();
-  EXPECT_EQ(UnscaledText(**sliced), "decimal128(18, 4): -12500 null");
+  EXPECT_EQ(UnscaledText(**sliced), "DECIMAL(18,4): -12500 null");
   auto sliced_product = Eval(product, {price->Slice(1, 2), rate->Slice(1, 2)});
   ASSERT_TRUE(sliced_product.ok()) << sliced_product.status().ToString();
-  EXPECT_EQ(UnscaledText(**sliced_product), "decimal128(18, 6): 250000 null");
+  EXPECT_EQ(UnscaledText(**sliced_product), "DECIMAL(18,6): 250000 null");
   // A chain of operations runs in one pass over the rows (ADR 0026's C10), so the rows a NULL makes
   // NULL and the offset of a sliced operand both have to reach it: `(p + r) * r` over the tail of
   // three arrays, one of which is NULL in the middle, answers as the whole arrays do at those rows.
@@ -353,10 +335,10 @@ TEST_F(ComputeTest, DecimalArithmetic) {
   auto whole = Eval(chain, {price, rate});
   ASSERT_TRUE(whole.ok()) << whole.status().ToString();
   EXPECT_EQ(UnscaledText(**whole),
-            "decimal128(38, 8): 850025 125000000 null 100000000899999898000000101");
+            "DECIMAL(38,8): 850025 125000000 null 100000000899999898000000101");
   auto tail = Eval(chain, {price->Slice(1, 3), rate->Slice(1, 3)});
   ASSERT_TRUE(tail.ok()) << tail.status().ToString();
-  EXPECT_EQ(UnscaledText(**tail), "decimal128(38, 8): 125000000 null 100000000899999898000000101");
+  EXPECT_EQ(UnscaledText(**tail), "DECIMAL(38,8): 125000000 null 100000000899999898000000101");
   // The same at an offset that is a whole number of bytes, which is where taking one nullable
   // column's own bitmap for the rows would read bits of the wrong rows: twelve rows, NULL at row 9,
   // sliced from row 8.
@@ -370,19 +352,19 @@ TEST_F(ComputeTest, DecimalArithmetic) {
   const auto long_r = Decimals(r, ones);
   auto aligned = Eval(chain, {long_p->Slice(8, 4), long_r->Slice(8, 4)});
   ASSERT_TRUE(aligned.ok()) << aligned.status().ToString();
-  EXPECT_EQ(UnscaledText(**aligned), "decimal128(38, 8): 80001 null 100001 110001");
+  EXPECT_EQ(UnscaledText(**aligned), "DECIMAL(38,8): 80001 null 100001 110001");
   // An integer operand counts as DECIMAL(k,0): p + 7 is DECIMAL(16,2).
   auto plus_int = Eval(Arith(ArithOp::kAdd, ColumnAt(0, p), ConstantOf(7, LogicalType::kInteger),
                              LogicalType::Decimal(16, 2)),
                        {price});
   ASSERT_TRUE(plus_int.ok()) << plus_int.status().ToString();
-  EXPECT_EQ(UnscaledText(**plus_int), "decimal128(16, 2): 2400 675 null 1000000000000699");
+  EXPECT_EQ(UnscaledText(**plus_int), "DECIMAL(16,2): 2400 675 null 1000000000000699");
   // Negation keeps the type.
   const auto negate = std::make_shared<const plan::Expr>(
       plan::Expr{.node = plan::NegateExpr{.operand = ColumnAt(0, p)}, .type = p, .name = "-c"});
   auto negated = Eval(negate, {price});
   ASSERT_TRUE(negated.ok()) << negated.status().ToString();
-  EXPECT_EQ(UnscaledText(**negated), "decimal128(15, 2): -1700 25 null -999999999999999");
+  EXPECT_EQ(UnscaledText(**negated), "DECIMAL(15,2): -1700 25 null -999999999999999");
   // A file may hold a value beyond the declared width: the 128-bit minimum fails, it is not UB.
   const LogicalType d38 = LogicalType::Decimal(38, 0);
   const auto minimum = Decimals(d38, {"-170141183460469231731687303715884105728"});
@@ -456,23 +438,27 @@ TEST_F(ComputeTest, DecimalArithmeticErrors) {
   // rescale to catch it (ADR 0026's C9), so the arithmetic checks the operands as it reads them.
   // Both of these are out of DECIMAL(19,0) by one, and their sum is 0: without the check the query
   // would answer 0 where DuckDB raises its conversion error.
+  // 10^18 rather than 10^19, and the result DECIMAL(18,0) rather than (19,0): 10^18 is one past
+  // DECIMAL(18,0)'s declared width and still INSIDE an int64, so a narrow column holds it and the
+  // premise -- a file carrying a value beyond its declared width -- is a real input at both
+  // physical widths. 10^19 was expressible only while a p<=18 column was 128 bits wide, and it
+  // would have had to move to a 19-digit type, which is a different claim (ADR 0021's decimal64
+  // item). This way the narrow step's own range test runs over it as well.
   const LogicalType d18_0 = LogicalType::Decimal(18, 0);
-  const auto over = Decimals(d18_0, {"10000000000000000000"});
-  const auto under = Decimals(d18_0, {"-10000000000000000000"});
-  EXPECT_EQ(Eval(Arith(ArithOp::kAdd, Named(ColumnAt(0, d18_0), "wide"), ColumnAt(1, d18_0),
-                       LogicalType::Decimal(19, 0)),
+  const auto over = Decimals(d18_0, {"1000000000000000000"});
+  const auto under = Decimals(d18_0, {"-1000000000000000000"});
+  EXPECT_EQ(Eval(Arith(ArithOp::kAdd, Named(ColumnAt(0, d18_0), "wide"), ColumnAt(1, d18_0), d18_0),
                  {over, under})
                 .status()
                 .message(),
-            "Casting value \"10000000000000000000\" to type DECIMAL(19,0) failed: value is out of "
+            "Casting value \"1000000000000000000\" to type DECIMAL(18,0) failed: value is out of "
             "range! when casting from source column wide");
   // The right operand is reported when the left one fits.
-  EXPECT_EQ(Eval(Arith(ArithOp::kAdd, ColumnAt(1, d18_0), Named(ColumnAt(0, d18_0), "wide"),
-                       LogicalType::Decimal(19, 0)),
+  EXPECT_EQ(Eval(Arith(ArithOp::kAdd, ColumnAt(1, d18_0), Named(ColumnAt(0, d18_0), "wide"), d18_0),
                  {over, Decimals(d18_0, {"1"})})
                 .status()
                 .message(),
-            "Casting value \"10000000000000000000\" to type DECIMAL(19,0) failed: value is out of "
+            "Casting value \"1000000000000000000\" to type DECIMAL(18,0) failed: value is out of "
             "range! when casting from source column wide");
   // An integer operand that does not fit: DuckDB's integer cast message.
   const auto ints = testing::ArrayOf<arrow::Int32Builder>(
@@ -552,14 +538,14 @@ TEST_F(ComputeTest, DecimalDivisionAndModulo) {
                               LogicalType::Decimal(21, 2)),
                         {price, divisor});
   ASSERT_TRUE(remainder.ok()) << remainder.status().ToString();
-  EXPECT_EQ(UnscaledText(**remainder), "decimal128(21, 2): 200 null null null -125");
+  EXPECT_EQ(UnscaledText(**remainder), "DECIMAL(21,2): 200 null null null -125");
   // Scales differ: 17.00 % 0.0005 and -0.25 % -0.0003 in DECIMAL(17,4) (p % r).
   const LogicalType r = LogicalType::Decimal(9, 4);
   auto mixed =
       Eval(Arith(ArithOp::kModulo, ColumnAt(0, p), ColumnAt(1, r), LogicalType::Decimal(17, 4)),
            {Decimals(p, {"1700", "-25"}), Decimals(r, {"5", "-3"})});
   ASSERT_TRUE(mixed.ok()) << mixed.status().ToString();
-  EXPECT_EQ(UnscaledText(**mixed), "decimal128(17, 4): 0 -1");
+  EXPECT_EQ(UnscaledText(**mixed), "DECIMAL(17,4): 0 -1");
 }
 
 // A Compute appends its columns to the selected rows only: a row a filter dropped is never
@@ -1061,7 +1047,7 @@ TEST_F(ComputeTest, DecimalCaseValuesCastToTheCaseType) {
                  {keys, Decimals(p, {"1700", "-25", "999999999999999", "1", std::nullopt}),
                   Decimals(r, {"1", "2", "3", "-99999999", std::nullopt})});
   ASSERT_TRUE(up.ok()) << up.status().ToString();
-  EXPECT_EQ(UnscaledText(**up), "decimal128(17, 4): 170000 -2500 3 -99999999 null");
+  EXPECT_EQ(UnscaledText(**up), "DECIMAL(17,4): 170000 -2500 3 -99999999 null");
   // DECIMAL(38,10) next to DECIMAL(38,0) is DECIMAL(38,0): 1.5, -2.5, 0.4999999999 and
   // -9999999999999999999999999999.5 round to 2, -3, 0 and -10^28.
   const LogicalType z = LogicalType::Decimal(38, 10);
@@ -1072,7 +1058,7 @@ TEST_F(ComputeTest, DecimalCaseValuesCastToTheCaseType) {
                                  "-99999999999999999999999999995000000000", "0"}),
                     Decimals(h, {"0", "0", "0", "0", "-7"})});
   ASSERT_TRUE(down.ok()) << down.status().ToString();
-  EXPECT_EQ(UnscaledText(**down), "decimal128(38, 0): 2 -3 0 -10000000000000000000000000000 -7");
+  EXPECT_EQ(UnscaledText(**down), "DECIMAL(38,0): 2 -3 0 -10000000000000000000000000000 -7");
   // An integer that does not fit DECIMAL(38,30) fails where it is taken, named by its column (an
   // aggregate's output column too); a constant is not named.
   const LogicalType n = LogicalType::Decimal(38, 30);
@@ -1089,7 +1075,7 @@ TEST_F(ComputeTest, DecimalCaseValuesCastToTheCaseType) {
   auto untaken = Eval(make(bigint, ColumnAt(2, n), n),
                       {Int16s({5, 6}), Int64s({123456789, 99}), Decimals(n, {"1", std::nullopt})});
   ASSERT_TRUE(untaken.ok()) << untaken.status().ToString();
-  EXPECT_EQ(UnscaledText(**untaken), "decimal128(38, 30): 1 null");
+  EXPECT_EQ(UnscaledText(**untaken), "DECIMAL(38,30): 1 null");
   // A HUGEINT (an integer SUM) keeps the integer message; DECIMAL(15,2) next to it is
   // DECIMAL(38,2).
   auto huge = Eval(
@@ -1146,21 +1132,21 @@ TEST_F(ComputeTest, CastWidensExactly) {
   EXPECT_EQ(int64->ToString(), "[\n  -2147483648,\n  null,\n  2147483647\n]");
   const auto huge = cast(int32, LogicalType::kInteger, LogicalType::kHugeInt);
   ASSERT_NE(huge, nullptr);
-  EXPECT_EQ(UnscaledText(*huge), "decimal128(38, 0): -2147483648 null 2147483647");
+  EXPECT_EQ(UnscaledText(*huge), "DECIMAL(38,0): -2147483648 null 2147483647");
   const auto cents = cast(Int64s({std::numeric_limits<int64_t>::min(), std::nullopt,
                                   std::numeric_limits<int64_t>::max()}),
                           LogicalType::kBigInt, LogicalType::Decimal(21, 2));
   ASSERT_NE(cents, nullptr);
   EXPECT_EQ(UnscaledText(*cents),
-            "decimal128(21, 2): -922337203685477580800 null 922337203685477580700");
+            "DECIMAL(21,2): -922337203685477580800 null 922337203685477580700");
   const auto wider = cast(Decimals(LogicalType::Decimal(4, 2), {"9999", std::nullopt, "-9999"}),
                           LogicalType::Decimal(4, 2), LogicalType::Decimal(5, 3));
   ASSERT_NE(wider, nullptr);
-  EXPECT_EQ(UnscaledText(*wider), "decimal128(5, 3): 99990 null -99990");
+  EXPECT_EQ(UnscaledText(*wider), "DECIMAL(5,3): 99990 null -99990");
   const auto sums = cast(Decimals(LogicalType::kHugeInt, {std::string(38, '9'), std::nullopt}),
                          LogicalType::kHugeInt, LogicalType::Decimal(38, 0));
   ASSERT_NE(sums, nullptr);
-  EXPECT_EQ(UnscaledText(*sums), "decimal128(38, 0): " + std::string(38, '9') + " null");
+  EXPECT_EQ(UnscaledText(*sums), "DECIMAL(38,0): " + std::string(38, '9') + " null");
 }
 
 // Anything but an exact widening is a malformed plan, and a DECIMAL value beyond its own declared
@@ -1527,7 +1513,13 @@ TEST_F(ComputeTest, AColumnBeyondItsDeclaredWidthIsStillCheckedBesideAReusedExpr
 // arithmetic has already checked. A DECIMAL negation is not one: it keeps its operand's type and
 // tests only 128 bits, so it passes a file's out-of-width value straight through. Marking such an
 // array `checked` turned a cast error into an answer of 0.
-TEST_F(ComputeTest, AReusedNegationIsRangeCheckedByTheStepThatReadsIt) {
+// At both physical widths, because the check lives where the operand is READ and the two widths are
+// read by different arms of ReadDecimalOperand. The narrow arm widens into a vector, which is also
+// what an INTEGER operand does -- and an integer's values are inside its physical type, so that arm
+// used to mark every operand it took `checked`. A decimal64 column of DECIMAL(2,1) holds 1500 as
+// easily as a decimal128 one, so marking it checked answered 0 here instead of raising: the hole
+// #191 closed, reopened one width over, and caught only because this case runs at both.
+void CheckAReusedNegationIsRangeChecked() {
   const LogicalType narrow = LogicalType::Decimal(2, 1);
   const LogicalType wider = LogicalType::Decimal(3, 1);  // +-999, which 1500 is outside
   const auto beyond = Decimals(narrow, {"1500"});
@@ -1550,6 +1542,14 @@ TEST_F(ComputeTest, AReusedNegationIsRangeCheckedByTheStepThatReadsIt) {
   auto alone = Eval(difference, {beyond});
   EXPECT_FALSE(alone.ok());
   EXPECT_EQ(reused.status().ToString(), alone.status().ToString());
+}
+
+TEST_F(ComputeTest, AReusedNegationIsRangeCheckedByTheStepThatReadsIt) {
+  for (const bool narrowing_on : {false, true}) {
+    const NarrowDecimalsFor narrowing(narrowing_on);
+    SCOPED_TRACE(std::format("narrowing {}", narrowing_on));
+    CheckAReusedNegationIsRangeChecked();
+  }
 }
 
 // ---- a step computed in int64 where its range admits one (ADR 0021's decimal64 item, N1) ----
@@ -1619,8 +1619,13 @@ TEST_F(ComputeTest, ANarrowStepAgreesWithTheInt128PathAtItsBoundaries) {
        .right = "1000000000"},
       // A column holding more than its declared width, which no int64 holds either: the operand
       // test has to send this row to the Int128 path rather than truncating it.
-      {.what = "a column past its declared width and past int64",
-       .operand = d18,
+      // The operand type is 38 digits where the step's is 18: a p<=18 column cannot hold a value
+      // past int64 once it is 8 bytes wide, so a wider OPERAND is how this stays a real shape at
+      // both physical widths rather than a row that stops running when the default flips. The step
+      // is still narrowed -- that follows the RESULT's range -- so the operand test is what has to
+      // send this row to the Int128 path (ADR 0021's decimal64 item).
+      {.what = "an operand past the step's width and past int64",
+       .operand = LogicalType::Decimal(38, 0),
        .result = d18,
        .op = ArithOp::kAdd,
        .left = "99999999999999999999999999999",
@@ -1631,7 +1636,7 @@ TEST_F(ComputeTest, ANarrowStepAgreesWithTheInt128PathAtItsBoundaries) {
       // value well INSIDE the range, so only a real test of whether it fits an int64 keeps it an
       // error rather than an answer of 6.
       {.what = "a value whose low 64 bits are inside the range",
-       .operand = d18,
+       .operand = LogicalType::Decimal(38, 0),
        .result = d18,
        .op = ArithOp::kAdd,
        .left = "18446744073709551621",
@@ -1645,23 +1650,29 @@ TEST_F(ComputeTest, ANarrowStepAgreesWithTheInt128PathAtItsBoundaries) {
        .right = "0"},
   };
 
-  for (const Case& c : cases) {
-    const auto left = Decimals(c.operand, {c.left});
-    const auto right = Decimals(c.operand, {c.right});
-    const auto l = ColumnAt(0, c.operand);
-    const auto r = ColumnAt(1, c.operand);
-    auto narrow = Eval(Arith(c.op, l, r, c.result), {left, right});
-    auto wide = Eval(ThroughInt128(c.op, l, r, c.result), {left, right});
-    ASSERT_EQ(narrow.ok(), wide.ok())
-        << c.what
-        << ": one path answered and the other did not\nnarrow: " << narrow.status().ToString()
-        << "\nwide: " << wide.status().ToString();
-    if (narrow.ok()) {
-      EXPECT_EQ(UnscaledText(**narrow), UnscaledText(**wide)) << c.what;
-    } else {
-      // The message names the operation and the values, so the two paths must raise the same one:
-      // the narrow path is required to stand aside rather than raise on its own account.
-      EXPECT_EQ(narrow.status().ToString(), wide.status().ToString()) << c.what;
+  // At both representations: the narrow step is reached either way, and what changes is the width
+  // its operands are READ from, which is a different arm of ReadDecimalOperand.
+  for (const bool narrowing_on : {false, true}) {
+    const NarrowDecimalsFor narrowing(narrowing_on);
+    for (const Case& c : cases) {
+      SCOPED_TRACE(std::format("narrowing {}: {}", narrowing_on, c.what));
+      const auto left = Decimals(c.operand, {c.left});
+      const auto right = Decimals(c.operand, {c.right});
+      const auto l = ColumnAt(0, c.operand);
+      const auto r = ColumnAt(1, c.operand);
+      auto narrow = Eval(Arith(c.op, l, r, c.result), {left, right});
+      auto wide = Eval(ThroughInt128(c.op, l, r, c.result), {left, right});
+      ASSERT_EQ(narrow.ok(), wide.ok())
+          << c.what
+          << ": one path answered and the other did not\nnarrow: " << narrow.status().ToString()
+          << "\nwide: " << wide.status().ToString();
+      if (narrow.ok()) {
+        EXPECT_EQ(UnscaledText(**narrow), UnscaledText(**wide)) << c.what;
+      } else {
+        // The message names the operation and the values, so the two paths must raise the same one:
+        // the narrow path is required to stand aside rather than raise on its own account.
+        EXPECT_EQ(narrow.status().ToString(), wide.status().ToString()) << c.what;
+      }
     }
   }
 }
@@ -1673,7 +1684,7 @@ TEST_F(ComputeTest, AStepPast18DigitsIsNotNarrowed) {
   const auto column = Decimals(d38, {big});
   auto sum = Eval(Arith(ArithOp::kAdd, ColumnAt(0, d38), ColumnAt(0, d38), d38), {column});
   ASSERT_TRUE(sum.ok()) << sum.status().ToString();
-  EXPECT_EQ(UnscaledText(**sum), "decimal128(38, 0): 24691357802469135780246913578");
+  EXPECT_EQ(UnscaledText(**sum), "DECIMAL(38,0): 24691357802469135780246913578");
 }
 
 // The guard every decimal read in exec goes through (src/exec/decimal_bytes.h). An array of
@@ -1686,58 +1697,34 @@ TEST(DecimalBytesDeathTest, AnArrayOfAnotherPhysicalTypeIsNotReinterpreted) {
 }
 
 // And the type a builder is given is re-derived and checked, so a builder can never be constructed
-// for a width this code does not write.
-TEST(DecimalBytesTest, TheBuilderTypeIsTheLogicalTypesOwn) {
-  EXPECT_TRUE(DecimalsType(LogicalType::Decimal(15, 2))
-                  ->Equals(*plan::ToArrow(LogicalType::Decimal(15, 2))));
-  EXPECT_TRUE(DecimalsType(LogicalType::kHugeInt)->Equals(*plan::ToArrow(LogicalType::kHugeInt)));
+// for a width this code does not write. Both callers build the 38-digit result of an exact SUM --
+// HUGEINT or DECIMAL(38,s) -- which is decimal128 at either setting of the narrowing switch, so
+// the helper's check is the permanent statement that this builder is for that type and no other.
+TEST(DecimalBytesTest, TheBuilderTypeIsTheSumsOwn) {
+  for (const bool narrowing_on : {false, true}) {
+    const NarrowDecimalsFor narrowing(narrowing_on);
+    SCOPED_TRACE(std::format("narrowing {}", narrowing_on));
+    for (const LogicalType type :
+         {LogicalType(LogicalType::kHugeInt), LogicalType::Decimal(38, 4)}) {
+      EXPECT_TRUE(DecimalsType(type)->Equals(*arrow::decimal128(38, type.scale())))
+          << ToString(type) << " gave " << DecimalsType(type)->ToString();
+    }
+  }
+}
+
+// A type the SUM builder is not for aborts rather than handing back a width this code would then
+// write 16 bytes into. Only reachable with the switch on, which is what makes it worth pinning:
+// without the check a release build would construct a Decimal128Builder over 8-byte slots.
+TEST(DecimalBytesDeathTest, TheBuilderTypeRefusesANarrowDecimal) {
+  const NarrowDecimalsFor narrowing(true);
+  EXPECT_DEATH(DecimalsType(LogicalType::Decimal(15, 2)), "check failed");
 }
 
 // ---- the same program at the narrow physical width (ADR 0021's N3, the program path) ----
 
-// A scoped flip of plan's transitional narrowing switch, so no case leaves it on for the next.
-class NarrowDecimalsFor {
- public:
-  explicit NarrowDecimalsFor(bool on) : was_(plan::NarrowDecimals()) {
-    plan::SetNarrowDecimals(on);
-  }
-  ~NarrowDecimalsFor() { plan::SetNarrowDecimals(was_); }
-  NarrowDecimalsFor(const NarrowDecimalsFor&) = delete;
-  NarrowDecimalsFor& operator=(const NarrowDecimalsFor&) = delete;
-  NarrowDecimalsFor(NarrowDecimalsFor&&) = delete;
-  NarrowDecimalsFor& operator=(NarrowDecimalsFor&&) = delete;
-
- private:
-  bool was_;
-};
-
-// A decimal64 column, which is what a DECIMAL of at most 18 digits becomes with the switch on.
-std::shared_ptr<arrow::Array> Decimals64(LogicalType type,
-                                         const std::vector<std::optional<std::string>>& unscaled) {
-  arrow::Decimal64Builder builder(arrow::decimal64(type.width(), type.scale()));
-  for (const auto& v : unscaled) {
-    const auto status =
-        v.has_value() ? builder.Append(arrow::Decimal64(std::stoll(*v))) : builder.AppendNull();
-    EXPECT_TRUE(status.ok()) << status.ToString();
-  }
-  std::shared_ptr<arrow::Array> out;
-  EXPECT_TRUE(builder.Finish(&out).ok());
-  return out;
-}
-
-// The unscaled values of a decimal array of either width, so the two arms can be compared when
-// their physical types differ by construction.
-std::string UnscaledOf(const arrow::Array& array) {
-  auto read = ReadUnscaled(array);
-  EXPECT_TRUE(read.ok()) << read.status().ToString();
-  std::string out;
-  for (std::size_t i = 0; i < read->values.size(); ++i) {
-    out += (i == 0 ? "" : " ") + (array.IsNull(static_cast<std::int64_t>(i))
-                                      ? std::string("null")
-                                      : Int128ToString(read->values[i]));
-  }
-  return out;
-}
+// ---- the same program at the narrow physical width (ADR 0021's N3, the program path) ----
+// Both arms call the same Decimals, under NarrowDecimalsFor: with the helper width-aware the
+// two arms are literally the same code at two settings, which is what these cases claim.
 
 // The program's own shape -- a chain of DECIMAL arithmetic over columns -- at both widths. The
 // operands differ in physical type and the result type differs with them, so what is compared is
@@ -1760,15 +1747,15 @@ TEST_F(ComputeTest, ANarrowProgramAnswersAsTheWideOneDoes) {
 
   std::string wide;
   {
-    EXPECT_FALSE(plan::NarrowDecimals());
+    const NarrowDecimalsFor narrowing(false);
     auto out = Eval(expr, {Decimals(money, prices), Decimals(money, discounts)});
     ASSERT_TRUE(out.ok()) << out.status().ToString();
     EXPECT_EQ((*out)->type_id(), arrow::Type::DECIMAL128);
-    wide = UnscaledOf(**out);
+    wide = UnscaledText(**out);
   }
   {
     const NarrowDecimalsFor narrowing(true);
-    auto out = Eval(expr, {Decimals64(money, prices), Decimals64(money, discounts)});
+    auto out = Eval(expr, {Decimals(money, prices), Decimals(money, discounts)});
     ASSERT_TRUE(out.ok()) << out.status().ToString();
     EXPECT_EQ((*out)->type_id(), arrow::Type::DECIMAL64)
         << "a result of 18 digits must be built narrow with the switch on";
@@ -1778,7 +1765,7 @@ TEST_F(ComputeTest, ANarrowProgramAnswersAsTheWideOneDoes) {
     EXPECT_EQ((*out)->data()->buffers[1]->size(),
               static_cast<std::int64_t>(sizeof(std::int64_t)) * (*out)->length())
         << "the values buffer is not eight bytes a row";
-    EXPECT_EQ(UnscaledOf(**out), wide) << "the narrow program answered differently";
+    EXPECT_EQ(UnscaledText(**out), wide) << "the narrow program answered differently";
   }
 }
 
@@ -1791,7 +1778,7 @@ TEST_F(ComputeTest, AWideResultStaysWideWithNarrowingOn) {
   auto out = Eval(Arith(ArithOp::kAdd, ColumnAt(0, d38), ColumnAt(0, d38), d38), {column});
   ASSERT_TRUE(out.ok()) << out.status().ToString();
   EXPECT_EQ((*out)->type_id(), arrow::Type::DECIMAL128);
-  EXPECT_EQ(UnscaledOf(**out), "246913578024691357802469134");
+  EXPECT_EQ(UnscaledText(**out), "DECIMAL(38,0): 246913578024691357802469134");
 }
 
 // The recursive fallbacks at the narrow width (ADR 0021's decimal64 item, step 2b). Each of these
@@ -1814,21 +1801,21 @@ TEST_F(ComputeTest, TheRecursiveFallbacksAnswerAtTheNarrowWidth) {
     std::string wide;
     arrow::Type::type wide_id{};
     {
-      EXPECT_FALSE(plan::NarrowDecimals());
+      const NarrowDecimalsFor narrowing(false);
       auto out = Eval(expr, {Decimals(money, values)});
       ASSERT_TRUE(out.ok()) << out.status().ToString();
-      wide = UnscaledOf(**out);
+      wide = UnscaledText(**out);
       wide_id = (*out)->type_id();
     }
     EXPECT_EQ(wide_id, arrow::Type::DECIMAL128);
     const NarrowDecimalsFor narrowing(true);
-    auto out = Eval(expr, {Decimals64(money, values)});
+    auto out = Eval(expr, {Decimals(money, values)});
     ASSERT_TRUE(out.ok()) << out.status().ToString();
     EXPECT_EQ((*out)->type_id(), arrow::Type::DECIMAL64) << ToString(expr->type);
     EXPECT_EQ((*out)->data()->buffers[1]->size(),
               static_cast<std::int64_t>(sizeof(std::int64_t)) * (*out)->length())
         << "the values buffer is not eight bytes a row for " << ToString(expr->type);
-    EXPECT_EQ(UnscaledOf(**out), wide) << "the narrow fallback answered differently";
+    EXPECT_EQ(UnscaledText(**out), wide) << "the narrow fallback answered differently";
   }
 }
 
@@ -1836,8 +1823,18 @@ TEST_F(ComputeTest, TheRecursiveFallbacksAnswerAtTheNarrowWidth) {
 TEST_F(ComputeTest, ADecimalToDoubleReadsEitherWidth) {
   const LogicalType money = LogicalType::Decimal(15, 2);
   const std::vector<std::optional<std::string>> values = {"1050025", std::nullopt, "-7"};
-  auto wide = DecimalToDouble(*Decimals(money, values), arrow::default_memory_pool());
-  auto narrow = DecimalToDouble(*Decimals64(money, values), arrow::default_memory_pool());
+  // Each array under its own guard, and the physical types asserted to DIFFER: two arms built at
+  // the same width would compare an array against itself and pass whatever ReadUnscaled did.
+  const auto column = [&](bool narrowing_on) {
+    const NarrowDecimalsFor narrowing(narrowing_on);
+    return Decimals(money, values);
+  };
+  const auto wide_column = column(false);
+  const auto narrow_column = column(true);
+  ASSERT_EQ(wide_column->type_id(), arrow::Type::DECIMAL128);
+  ASSERT_EQ(narrow_column->type_id(), arrow::Type::DECIMAL64);
+  auto wide = DecimalToDouble(*wide_column, arrow::default_memory_pool());
+  auto narrow = DecimalToDouble(*narrow_column, arrow::default_memory_pool());
   ASSERT_TRUE(wide.ok()) << wide.status().ToString();
   ASSERT_TRUE(narrow.ok()) << narrow.status().ToString();
   EXPECT_TRUE((*wide)->Equals(**narrow)) << (*wide)->ToString() << "\nagainst\n"
@@ -1865,6 +1862,7 @@ TEST_F(ComputeTest, ADecimalConvertsToDoubleByDuckDbsRuleAtEitherWidth) {
   // 5.0005 is DuckDB's 5.0004999999999997 (the unscaled value divided by 10^4 in DOUBLE) and
   // Arrow's 5.0005000000000006 (multiplied by 10^-4). Without this the case proves nothing.
   {
+    const NarrowDecimalsFor narrowing(false);
     auto arrows = arrow::compute::Cast(Decimals(d18_4, {"50005"}), arrow::float64());
     ASSERT_TRUE(arrows.ok()) << arrows.status().ToString();
     ASSERT_NE(static_cast<const arrow::DoubleArray&>(*arrows->make_array()).Value(0),
@@ -1876,12 +1874,28 @@ TEST_F(ComputeTest, ADecimalConvertsToDoubleByDuckDbsRuleAtEitherWidth) {
   // is what makes CastTo convert it. Times one, so the conversion is the whole of the answer.
   const auto expr =
       Arith(ArithOp::kMultiply, ColumnAt(0, d18_4), DoubleOf(1.0), LogicalType::kDouble);
-  auto wide = Eval(expr, {Decimals(d18_4, values)});
+  // Each arm names its width and the two are asserted to DIFFER: an unguarded wide arm inherits
+  // whatever the default is, and in a build where it is on both arms would be the same array and
+  // the comparison below would hold for any conversion at all.
+  const auto column = [&](bool narrowing_on) {
+    const NarrowDecimalsFor narrowing(narrowing_on);
+    return Decimals(d18_4, values);
+  };
+  const auto wide_column = column(false);
+  const auto narrow_column = column(true);
+  ASSERT_EQ(wide_column->type_id(), arrow::Type::DECIMAL128);
+  ASSERT_EQ(narrow_column->type_id(), arrow::Type::DECIMAL64);
+
+  arrow::Result<std::shared_ptr<arrow::Array>> wide;
+  {
+    const NarrowDecimalsFor narrowing(false);
+    wide = Eval(expr, {wide_column});
+  }
   ASSERT_TRUE(wide.ok()) << wide.status().ToString();
   EXPECT_EQ(static_cast<const arrow::DoubleArray&>(**wide).Value(0),
             DuckDbDecimalToDouble(50005, 18, 4));
   const NarrowDecimalsFor narrowing(true);
-  auto narrow = Eval(expr, {Decimals64(d18_4, values)});
+  auto narrow = Eval(expr, {narrow_column});
   ASSERT_TRUE(narrow.ok()) << narrow.status().ToString();
   EXPECT_TRUE((*wide)->Equals(**narrow)) << (*wide)->ToString() << "\nagainst\n"
                                          << (*narrow)->ToString();
@@ -1912,20 +1926,21 @@ TEST_F(ComputeTest, ANarrowDecimalCaseScattersAsTheWideOneDoes) {
 
   std::string wide;
   {
-    EXPECT_FALSE(plan::NarrowDecimals());
+    const NarrowDecimalsFor narrowing(false);
     auto out = Eval(expr, {keys, Decimals(money, a), Decimals(money, b), Decimals(money, c)});
     ASSERT_TRUE(out.ok()) << out.status().ToString();
-    wide = UnscaledOf(**out);
-    EXPECT_EQ(wide, "1700 null -25 null null 13") << "the wide arm answered something else";
+    wide = UnscaledText(**out);
+    EXPECT_EQ(wide, "DECIMAL(15,2): 1700 null -25 null null 13")
+        << "the wide arm answered something else";
   }
   const NarrowDecimalsFor narrowing(true);
-  auto out = Eval(expr, {keys, Decimals64(money, a), Decimals64(money, b), Decimals64(money, c)});
+  auto out = Eval(expr, {keys, Decimals(money, a), Decimals(money, b), Decimals(money, c)});
   ASSERT_TRUE(out.ok()) << out.status().ToString();
   EXPECT_EQ((*out)->type_id(), arrow::Type::DECIMAL64);
   EXPECT_EQ((*out)->data()->buffers[1]->size(),
             static_cast<std::int64_t>(sizeof(std::int64_t)) * (*out)->length())
       << "the values buffer is not eight bytes a row: the scatter widened the result";
-  EXPECT_EQ(UnscaledOf(**out), wide) << "the narrow CASE answered differently";
+  EXPECT_EQ(UnscaledText(**out), wide) << "the narrow CASE answered differently";
 }
 
 }  // namespace

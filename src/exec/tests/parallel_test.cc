@@ -1757,7 +1757,10 @@ std::shared_ptr<MemoryTable> RoutedTable(bool split) {
       arrow::schema({arrow::field("u", arrow::int64()), arrow::field("k", arrow::int64()),
                      arrow::field("d", arrow::float64()), arrow::field("s", arrow::binary()),
                      arrow::field("v", arrow::int64()), arrow::field("m", arrow::decimal128(38, 2)),
-                     arrow::field("n", arrow::decimal128(15, 2))});
+                     // Through plan::ToArrow, like the column built below: the aggregate checks the
+                     // physical type of its input against the plan's, so a hand-named width here
+                     // tests nothing but the mismatch (ADR 0021's decimal64 item).
+                     arrow::field("n", plan::ToArrow(plan::LogicalType::Decimal(15, 2)))});
   const std::vector<double> doubles = {-0.0, 0.0, std::nan(""), 1.5, -std::nan("")};
   arrow::RecordBatchVector batches;
   for (int64_t part = 0; part < 12; ++part) {
@@ -1767,7 +1770,7 @@ std::shared_ptr<MemoryTable> RoutedTable(bool split) {
     std::vector<std::optional<std::string>> str;
     std::vector<std::optional<int64_t>> v;
     arrow::Decimal128Builder m(arrow::decimal128(38, 2));
-    arrow::Decimal128Builder n(arrow::decimal128(15, 2));
+    std::vector<std::optional<std::string>> n;
     const int64_t rows = part % 4 == 3 ? 0 : 40;
     for (int64_t i = 0; i < rows; ++i) {
       const int64_t r = (part * 40) + i;
@@ -1778,12 +1781,12 @@ std::shared_ptr<MemoryTable> RoutedTable(bool split) {
       str.emplace_back("s" + std::to_string(r % 7));
       v.emplace_back(r % 11);
       EXPECT_TRUE(m.Append(arrow::Decimal128(r % 11)).ok());
-      EXPECT_TRUE(n.Append(arrow::Decimal128(r % 11)).ok());
+      n.emplace_back(std::to_string(r % 11));
     }
     batches.push_back(arrow::RecordBatch::Make(
         schema, rows,
         {Int64s(u), Int64s(k), d.Finish().ValueOrDie(), testing::Strings(str), Int64s(v),
-         m.Finish().ValueOrDie(), n.Finish().ValueOrDie()}));
+         m.Finish().ValueOrDie(), testing::Decimals(plan::LogicalType::Decimal(15, 2), n)}));
   }
   if (!split) {
     auto combined = arrow::Table::FromRecordBatches(schema, batches).ValueOrDie();

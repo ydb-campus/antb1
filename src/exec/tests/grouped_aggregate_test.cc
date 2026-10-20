@@ -28,6 +28,7 @@
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
 
+#include "../decimal.h"
 #include "../group_table.h"
 #include "exec_test_util.h"
 
@@ -59,6 +60,22 @@ class Rng {
 
 // A column of `n` values of `type` with NULLs, extremes, repeats and (DOUBLE) NaN, infinities and
 // signed zeros.
+// Appends an unscaled value through whichever decimal builder plan::ToArrow asked for.
+//
+// A static_cast<arrow::Decimal128Builder&> of a decimal64 builder is neither a compile error nor a
+// reliable crash, which is what made this worth a helper: this file did it, and with the narrowing
+// switch on the binary's behaviour depended on the order its cases ran in -- passing alone, dying
+// in a suite run. ADR 0021's decimal64 item, and the hazard src/exec/decimal_bytes.h names.
+arrow::Status AppendUnscaled(arrow::ArrayBuilder& builder, Int128 value) {
+  if (builder.type()->id() == arrow::Type::DECIMAL64) {
+    return static_cast<arrow::Decimal64Builder&>(builder).Append(
+        arrow::Decimal64(static_cast<std::int64_t>(value)));
+  }
+  const auto bits = static_cast<UInt128>(value);
+  return static_cast<arrow::Decimal128Builder&>(builder).Append(
+      arrow::Decimal128(static_cast<std::int64_t>(bits >> 64U), static_cast<std::uint64_t>(bits)));
+}
+
 std::shared_ptr<arrow::Array> RandomColumn(LogicalType type, std::size_t n, Rng& rng) {
   auto builder = arrow::MakeBuilder(plan::ToArrow(type)).ValueOrDie();
   for (std::size_t i = 0; i < n; ++i) {
@@ -101,7 +118,9 @@ std::shared_ptr<arrow::Array> RandomColumn(LogicalType type, std::size_t n, Rng&
         const arrow::Decimal128 v(static_cast<std::int64_t>(rng.Next()), rng.Next() >> 8U);
         const arrow::Decimal128 bounded =
             v % arrow::Decimal128("1000000000000000000000000000000000000");
-        status = static_cast<arrow::Decimal128Builder&>(*builder).Append(bounded);
+        // HUGEINT is decimal128 at either setting, so this one could keep its cast; it goes
+        // through the helper so that no decimal arm of this switch is the odd one out.
+        status = AppendUnscaled(*builder, ToInt128(bounded));
         break;
       }
       case LogicalType::kDecimal: {  // within the precision, the extremes included
@@ -110,9 +129,7 @@ std::shared_ptr<arrow::Array> RandomColumn(LogicalType type, std::size_t n, Rng&
         if (pick < 2) {
           v = pick == 0 ? -max : max;
         }
-        const auto bits = static_cast<UInt128>(v);
-        status = static_cast<arrow::Decimal128Builder&>(*builder).Append(arrow::Decimal128(
-            static_cast<std::int64_t>(bits >> 64U), static_cast<std::uint64_t>(bits)));
+        status = AppendUnscaled(*builder, v);
         break;
       }
       case LogicalType::kDouble: {
@@ -583,12 +600,7 @@ TEST_F(GroupedAggregateTest, AnOverflowAnywhereInABatchFailsTheBatch) {
 // rows they both hold: the two are separate so that the first pays no validity test per row.
 TEST_F(GroupedAggregateTest, TheNullFreeAndNullBearingLoopsAgree) {
   const auto decimals = [](const std::vector<std::optional<std::string>>& values) {
-    arrow::Decimal128Builder builder(plan::ToArrow(LogicalType::Decimal(15, 2)));
-    for (const auto& v : values) {
-      EXPECT_TRUE(
-          (v.has_value() ? builder.Append(arrow::Decimal128(*v)) : builder.AppendNull()).ok());
-    }
-    return builder.Finish().ValueOrDie();
+    return testing::Decimals(LogicalType::Decimal(15, 2), values);
   };
   const Call call{.kind = AggKind::kSum,
                   .input = LogicalType::Decimal(15, 2),

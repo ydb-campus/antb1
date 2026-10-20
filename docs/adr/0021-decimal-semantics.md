@@ -413,20 +413,42 @@ with exit code 4. The PR ids are the roadmap's, not divergence ids.
           zero-copy both ways, and the two routes were measured to agree on a NULL in either input, a NULL and
           an all-NULL mask, and sliced inputs. Two TPC-H-derived queries and three slt files turned on this one
           alone.
-      - **What is left is tests, not engine.** 27 unit cases still fail with the switch defaulted on, every one
-        of them an artifact of the default rather than a gap: cases that assert the off state, fixtures that
-        hand-build a decimal128 array where the plan now says decimal64 (the physical-type checks catch those
-        and say so), the `DecimalsType` check itself, text helpers that read 16 bytes from an 8-byte stride, and
-        one fixture whose premise -- a DECIMAL(18,0) column holding a 20-digit value -- cannot exist at the
-        narrow width at all. One of them is worth naming: `RandomColumn` in `grouped_aggregate_test.cc` casts
-        `MakeBuilder`'s result to `arrow::Decimal128Builder&` and so writes 16 bytes into an 8-byte slot, which
-        segfaults -- the test's own undefined behaviour, and a demonstration of exactly the hazard
-        `src/exec/decimal_bytes.h` exists to make loud.
+      - **The fixtures followed, and one of them was not a fixture.** 29 unit cases failed with the switch
+        defaulted on; 28 were artifacts of the default, and the 29th was a soundness bug in `exec`.
+        - **`ReadDecimalOperand` marked every non-in-place operand `checked`** (`src/exec/compute.cc`), under
+          a comment whose own words were "only a decimal128 column can hold what its declared width does not
+          admit". True while decimal64 did not exist; false the moment it did. The arm exists for an INTEGER
+          operand, whose values are inside its physical type by the type rules -- a decimal64 column of
+          DECIMAL(2,1) holds 1500 as easily as a decimal128 one. So `DecimalArith` and the program's step
+          check both skipped the operand range test for a narrow column, and `SELECT (-d) - (-d)` over such a
+          column answered 0 where DuckDB raises a conversion error. **This is the hole #191 closed on the
+          reuse path, reopened one physical width over**, and it was `#191`'s own regression case that caught
+          it. The fix is one line: only an integer skips the test. The case now runs at both widths, so the
+          check is enforced with the switch off, which is the configuration CI runs.
+        - The other 28: cases asserting the off state, fixtures hand-building a decimal128 array where the
+          plan says decimal64, text helpers reading 16 bytes from an 8-byte stride, schemas naming a width
+          their own column did not have, and two fixtures whose premise needed restating.
+        - **One mechanism caused most of it**: `arrow::Decimal128Builder builder(plan::ToArrow(type))`, a
+          16-byte writer handed whichever type the switch chose, in nine places. `Decimal128Builder` checks
+          that type with `checked_pointer_cast`, a `static_pointer_cast` under NDEBUG, so what it does is
+          neither fail nor reliably crash: `RandomColumn` in `grouped_aggregate_test.cc` made the exec binary
+          pass alone and die in a suite run. They now all go through one width-aware fixture helper that
+          fails loudly on a value the narrow width cannot hold, since a silent truncation is the one way a
+          fixture could go quietly weaker.
+        - **Two premises had to be restated rather than repaired.** A fixture carrying 10^19 in a
+          DECIMAL(18,0) column was expressible only while a p <= 18 column was 128 bits wide; 10^18 is one
+          past the same declared width and inside an int64, so it is a real input at both widths and probes
+          the narrow range test as well. And "a column past its declared width AND past int64" has no narrow
+          form at all -- 8 bytes cannot hold it -- so that row's operand type moved to 38 digits while its
+          step stayed at 18, which keeps the operand test covered after the switch is gone instead of
+          silently ceasing to run.
       - **DECIMAL in part statistics is not part of this after all.** `IntegerOf`
         (`src/io/parquet_table.cc:547`) admits only integer scalars, so decimal statistics were never used at
         either width. Adding them is a separate feature and does not gate the default.
     - **N4, docs(adr): record what N1 to N3 measured**, and accept or defer the rest on those numbers. The
-      remaining decimal64 steps are the 27 test fixtures, then the default, then deleting the switch.
+      remaining decimal64 steps are the default, then deleting the switch (and with it `NarrowDecimalsFor`,
+      the two-arm cases that exist only to compare the widths, and the wide arms a p <= 18 type can no longer
+      take). Flipping the default is where the 8-bytes-a-value claim finally gets a number.
 
 ## Alternatives considered
 
