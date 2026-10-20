@@ -19,6 +19,7 @@
 #include "antb1/plan/types.h"
 
 #include "decimal.h"
+#include "decimal_bytes.h"
 
 namespace antb1::exec {
 namespace {
@@ -72,8 +73,7 @@ arrow::Result<PredicateEvaluator> PredicateEvaluator::Make(const plan::Predicate
     const arrow::DataType& other_type = *schema.field(out.other_)->type();
     const bool column_double = column_type.id() == arrow::Type::DOUBLE;
     const bool other_double = other_type.id() == arrow::Type::DOUBLE;
-    const bool any_decimal =
-        column_type.id() == arrow::Type::DECIMAL128 || other_type.id() == arrow::Type::DECIMAL128;
+    const bool any_decimal = IsDecimalType(column_type) || IsDecimalType(other_type);
     if (column_double != other_double) {
       out.mode_ = Mode::kInDouble;
     } else if (any_decimal && !column_type.Equals(other_type)) {
@@ -85,7 +85,7 @@ arrow::Result<PredicateEvaluator> PredicateEvaluator::Make(const plan::Predicate
   }
   // A DOUBLE constant or IN list on a DECIMAL column compares in DOUBLE (ADR 0021 rule 11).
   const bool decimal_column =
-      column_type.id() == arrow::Type::DECIMAL128 && p.column->type == plan::LogicalType::kDecimal;
+      IsDecimalType(column_type) && p.column->type == plan::LogicalType::kDecimal;
   const auto in_double = [&](const arrow::Scalar& constant) {
     return decimal_column && constant.type->id() == arrow::Type::DOUBLE;
   };
@@ -162,7 +162,7 @@ arrow::Result<arrow::Datum> PredicateEvaluator::Evaluate(const arrow::RecordBatc
         // DuckDB converts it (ADR 0021 rule 8), an integer rounds to the nearest double with
         // Arrow's cast (a BIGINT beyond 2^53 too, which Arrow's implicit cast refuses).
         arrow::Datum& other = left.type()->id() == arrow::Type::DOUBLE ? right : left;
-        if (other.type()->id() == arrow::Type::DECIMAL128) {
+        if (IsDecimalType(*other.type())) {
           ARROW_ASSIGN_OR_RAISE(const ArrayPtr converted,
                                 DecimalToDouble(*other.make_array(), pool));
           other = arrow::Datum(converted);

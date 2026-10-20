@@ -143,6 +143,48 @@ TEST(FormatValueTest, Decimals) {
   EXPECT_EQ(*FormatResult(r, OutputFormat::kCsv), "p\n17.00\n-0.25\n");
 }
 
+// The same text at the narrow physical width (ADR 0021's decimal64 item). Without an arm of its
+// own a decimal64 column reached the default case, where Arrow's own ToString applies the scale and
+// writes 0.125 for the .125 rule 15 asks for: a difference in the answer, which is why this is
+// stated beside the wide case rather than left to the switch-on run.
+TEST(FormatValueTest, NarrowDecimalsShowTheSameTextAsWideOnes) {
+  const auto narrow = [](int precision, int scale, std::int64_t unscaled) {
+    arrow::Decimal64Builder dec(arrow::decimal64(precision, scale));
+    EXPECT_TRUE(dec.Append(arrow::Decimal64(unscaled)).ok());
+    EXPECT_TRUE(dec.AppendNull().ok());
+    return dec.Finish().ValueOrDie();
+  };
+  const auto wide = [](int precision, int scale, std::int64_t unscaled) {
+    arrow::Decimal128Builder dec(arrow::decimal128(precision, scale));
+    EXPECT_TRUE(dec.Append(arrow::Decimal128(unscaled)).ok());
+    EXPECT_TRUE(dec.AppendNull().ok());
+    return dec.Finish().ValueOrDie();
+  };
+  // A whole number, a value below one (rule 15 writes no leading zero), a negative one, zero and
+  // the widest an int64 holds.
+  struct Case {
+    int precision;
+    int scale;
+    std::int64_t unscaled;
+  };
+  for (const Case c :
+       std::to_array<Case>({{.precision = 15, .scale = 2, .unscaled = 1700},
+                            {.precision = 3, .scale = 3, .unscaled = 125},
+                            {.precision = 3, .scale = 3, .unscaled = -7},
+                            {.precision = 15, .scale = 2, .unscaled = 0},
+                            {.precision = 18, .scale = 4, .unscaled = 999999999999999999},
+                            {.precision = 18, .scale = 0, .unscaled = -999999999999999999}})) {
+    const LogicalType type = LogicalType::Decimal(static_cast<std::uint8_t>(c.precision),
+                                                  static_cast<std::uint8_t>(c.scale));
+    const auto n = narrow(c.precision, c.scale, c.unscaled);
+    const auto w = wide(c.precision, c.scale, c.unscaled);
+    EXPECT_EQ(FormatValue(*n, 0, type), FormatValue(*w, 0, type)) << c.unscaled;
+    EXPECT_EQ(FormatValue(*n, 1, type), "NULL") << c.unscaled;
+  }
+  // One text written out, so the pair above cannot agree on something neither should print.
+  EXPECT_EQ(FormatValue(*narrow(3, 3, 125), 0, LogicalType::Decimal(3, 3)), ".125");
+}
+
 TEST(FormatResultTest, CsvJsonTable) {
   auto bin = Make<arrow::BinaryBuilder, std::string>(arrow::binary(), {"x\"y", "\xff"}, true);
   auto r = OneColumn(bin, "s", LogicalType::kVarchar);

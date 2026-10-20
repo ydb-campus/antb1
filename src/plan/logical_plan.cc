@@ -43,17 +43,32 @@ arrow::Result<std::shared_ptr<arrow::Scalar>> IntegerScalar(Int128 value, Logica
   return std::make_shared<ScalarType>(*narrow);
 }
 
-// A HUGEINT, or a DECIMAL(p, s) from its unscaled value: a decimal128 scalar of the type's own
-// precision and scale.
-arrow::Result<std::shared_ptr<arrow::Scalar>> Decimal128Scalar(Int128 value, LogicalType type) {
+// A HUGEINT, or a DECIMAL(p, s) from its unscaled value: a decimal scalar of the type's own
+// precision and scale, and of the scalar class that type's physical width belongs to.
+//
+// The class has to follow the type (ADR 0021's decimal64 item). Arrow's kernels reach a scalar's
+// value through a checked_cast on its type, which is a static_cast in the Release build the
+// prebuilt Arrow is, so a Decimal128Scalar carrying a decimal64 type does not fail -- it reads a
+// Decimal128's first eight bytes as a Decimal64. Those are its low bits on either target, and a
+// constant of at most 18 digits has nothing above them, so today it would answer correctly for
+// every value RangeOf admits. That is an accident of the layout and of one endianness, not a
+// property worth depending on.
+arrow::Result<std::shared_ptr<arrow::Scalar>> DecimalScalar(Int128 value, LogicalType type) {
   const IntegerRange range = RangeOf(type);
   if (value < range.min || value > range.max) {
     return arrow::Status::Invalid("constant ", Int128ToString(value), " is outside the range of ",
                                   ToString(type));
   }
+  std::shared_ptr<arrow::DataType> arrow_type = ToArrow(type);
+  if (arrow_type->id() == arrow::Type::DECIMAL64) {
+    // Every value of a type RangeOf admits at this width fits an int64 by construction: the width
+    // is at most 18 digits.
+    return std::make_shared<arrow::Decimal64Scalar>(arrow::Decimal64(static_cast<int64_t>(value)),
+                                                    std::move(arrow_type));
+  }
   const auto bits = static_cast<UInt128>(value);
   const arrow::Decimal128 decimal(static_cast<int64_t>(bits >> 64U), static_cast<uint64_t>(bits));
-  return std::make_shared<arrow::Decimal128Scalar>(decimal, ToArrow(type));
+  return std::make_shared<arrow::Decimal128Scalar>(decimal, std::move(arrow_type));
 }
 
 // One overload per node type: a node type without one fails to compile.
@@ -470,7 +485,7 @@ arrow::Result<std::shared_ptr<arrow::Scalar>> ToArrowScalar(const Constant& cons
         return IntegerScalar<arrow::Date32Scalar, int32_t>(*v, type);
       case LogicalType::kHugeInt:
       case LogicalType::kDecimal:
-        return Decimal128Scalar(*v, type);
+        return DecimalScalar(*v, type);
       case LogicalType::kTimestamp: {
         const auto micros = Int128ToInt64(*v);
         if (!micros.has_value()) {
