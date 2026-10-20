@@ -121,6 +121,63 @@ TEST(TypesTest, MapsDecimals) {
   EXPECT_FALSE(IsInteger(LogicalType::Decimal(38, 0)));
 }
 
+// A scoped flip of the transitional narrowing switch, so no case can leave it on for the next one
+// -- the cases of one binary run in one process, and every decimal path fails while it is on.
+class NarrowDecimalsFor {
+ public:
+  explicit NarrowDecimalsFor(bool on) : was_(NarrowDecimals()) { SetNarrowDecimals(on); }
+  ~NarrowDecimalsFor() { SetNarrowDecimals(was_); }
+  NarrowDecimalsFor(const NarrowDecimalsFor&) = delete;
+  NarrowDecimalsFor& operator=(const NarrowDecimalsFor&) = delete;
+  NarrowDecimalsFor(NarrowDecimalsFor&&) = delete;
+  NarrowDecimalsFor& operator=(NarrowDecimalsFor&&) = delete;
+
+ private:
+  bool was_;
+};
+
+// ADR 0021's decimal64 item, first step: with the switch on, a DECIMAL of at most 18 digits maps to
+// decimal64 and a wider one does not. Off is the default and the only configuration the rest of the
+// engine answers under today.
+TEST(TypesTest, NarrowingMapsADecimalOf18DigitsOrFewerToDecimal64) {
+  struct Case {
+    std::uint8_t width;
+    std::uint8_t scale;
+    bool narrow;  // whether the switch moves this one
+  };
+  constexpr auto kCases = std::to_array<Case>({{.width = 1, .scale = 0, .narrow = true},
+                                               {.width = 9, .scale = 2, .narrow = true},
+                                               {.width = 18, .scale = 0, .narrow = true},
+                                               {.width = 18, .scale = 18, .narrow = true},
+                                               {.width = 19, .scale = 2, .narrow = false},
+                                               {.width = 38, .scale = 6, .narrow = false}});
+
+  EXPECT_FALSE(NarrowDecimals()) << "the switch is off unless a case turns it on";
+  for (const Case& c : kCases) {
+    const LogicalType type = LogicalType::Decimal(c.width, c.scale);
+    EXPECT_TRUE(ToArrow(type)->Equals(*arrow::decimal128(c.width, c.scale)))
+        << "off: " << ToString(type);
+    EXPECT_EQ(*FromArrow(*ToArrow(type)), type) << "off: " << ToString(type);
+  }
+  {
+    const NarrowDecimalsFor narrowing(true);
+    EXPECT_TRUE(NarrowDecimals());
+    for (const Case& c : kCases) {
+      const LogicalType type = LogicalType::Decimal(c.width, c.scale);
+      const auto expected =
+          c.narrow ? arrow::decimal64(c.width, c.scale) : arrow::decimal128(c.width, c.scale);
+      EXPECT_TRUE(ToArrow(type)->Equals(*expected))
+          << "on: " << ToString(type) << " gave " << ToArrow(type)->ToString();
+      // The logical type survives the round trip either way, which is what lets the two
+      // representations coexist while the item's remaining steps land.
+      EXPECT_EQ(*FromArrow(*ToArrow(type)), type) << "on: " << ToString(type);
+    }
+    // HUGEINT is decimal128(38,0) whatever the switch says: 38 digits need 128 bits.
+    EXPECT_TRUE(ToArrow(LogicalType::kHugeInt)->Equals(*arrow::decimal128(38, 0)));
+  }
+  EXPECT_FALSE(NarrowDecimals()) << "the guard restored it";
+}
+
 TEST(TypesTest, Classification) {
   EXPECT_TRUE(IsInteger(LogicalType::kUSmallInt));
   EXPECT_FALSE(IsInteger(LogicalType::kDouble));
