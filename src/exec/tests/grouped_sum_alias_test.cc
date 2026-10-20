@@ -13,6 +13,7 @@
 // The merge case matters most: the alias folds nothing on a merge because the state it points at
 // does, and an alias that folded too would count every part's rows twice.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -313,6 +314,57 @@ TEST_F(GroupedSumAliasTest, TheAggregatesAnswerTheSameAtEitherWidth) {
     EXPECT_EQ((*narrow)->column(4)->ToString(), wide->column(4)->ToString())
         << "MAX, parts=" << parts;
   }
+}
+
+// The question ADR 0021's plan left open for step 4: a DECIMAL grouping key is hashed over its
+// bytes, so a narrow one is hashed over eight where a wide one is hashed over sixteen, and the
+// hash decides which partition a group lands in. Nothing observable may change -- the groups and
+// their values are the answer, and their order is unspecified either way -- so the case compares
+// the rows as sets.
+TEST_F(GroupedSumAliasTest, ADecimalGroupingKeyGivesTheSameGroupsAtEitherWidth) {
+  // The SUM of each group, as a sorted multiset. The key itself prints at its own physical width,
+  // so its text differs between the arms by construction; the sums are the answer and must not.
+  const auto sums_of = [](const std::shared_ptr<arrow::Table>& table) {
+    std::vector<std::string> sums;
+    sums.reserve(static_cast<std::size_t>(table->num_rows()));
+    for (int64_t row = 0; row < table->num_rows(); ++row) {
+      sums.push_back(table->column(1)->GetScalar(row).ValueOrDie()->ToString());
+    }
+    std::ranges::sort(sums);
+    return sums;
+  };
+
+  // Keyed on the decimal column itself, which is what puts a decimal through the key hash, with
+  // repeats so it groups; the other decimal column is summed so each group carries a value to
+  // compare. One aggregate is enough: what is in question is the grouping, not the aggregate.
+  const auto grouped = [&](bool narrow) {
+    const auto rows = RowsAtWidth(narrow);
+    const auto key = Column(1, "v", Money());
+    auto table = GroupTable::Make({key}, {Sum(2)}, rows->num_columns(),
+                                  arrow::default_memory_pool(), nullptr);
+    EXPECT_TRUE(table.ok()) << table.status().ToString();
+    EXPECT_TRUE((*table)->Consume(*rows).ok());
+    const auto schema = arrow::schema({arrow::field("key0", rows->column(1)->type()),
+                                       arrow::field("agg0", plan::ToArrow(SumOfMoney()))});
+    arrow::RecordBatchVector out;
+    while (true) {
+      auto chunk = (*table)->NextChunk(schema);
+      EXPECT_TRUE(chunk.ok()) << chunk.status().ToString();
+      if (!chunk.ok() || *chunk == nullptr) {
+        break;
+      }
+      out.push_back(std::move(*chunk));
+    }
+    return arrow::Table::FromRecordBatches(schema, out).ValueOrDie();
+  };
+
+  EXPECT_FALSE(plan::NarrowDecimals());
+  const auto wide = sums_of(grouped(false));
+  const NarrowDecimalsFor narrowing(true);
+  const auto narrow = sums_of(grouped(true));
+  // Three of the seven rows have a NULL key, which is one group, so the fixture has five.
+  EXPECT_EQ(wide.size(), 5U) << "the fixture no longer gives five groups";
+  EXPECT_EQ(narrow, wide) << "a narrow key grouped differently, so the hash width is observable";
 }
 
 }  // namespace

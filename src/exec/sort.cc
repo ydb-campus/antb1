@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -84,6 +85,21 @@ int CompareDecimal(const arrow::Array& a, int64_t i, const arrow::Array& b, int6
   return Order(x, y);
 }
 
+// A decimal64's eight bytes are its unscaled value, two's complement and little-endian on both
+// targets, so a sort orders it exactly as it orders a BIGINT -- and the prefix is the whole of it,
+// which is why the narrow decimal below is `exact` where the wide one cannot be (ADR 0021's
+// decimal64 item).
+std::int64_t Decimal64At(const arrow::Array& a, int64_t i) {
+  std::int64_t value = 0;
+  std::memcpy(&value, static_cast<const arrow::FixedSizeBinaryArray&>(a).GetValue(i),
+              sizeof(value));
+  return value;
+}
+
+int CompareDecimal64(const arrow::Array& a, int64_t i, const arrow::Array& b, int64_t j) {
+  return Order(Decimal64At(a, i), Decimal64At(b, j));
+}
+
 // By bytes: std::char_traits<char> compares characters as unsigned char.
 int CompareBinary(const arrow::Array& a, int64_t i, const arrow::Array& b, int64_t j) {
   const std::string_view x = static_cast<const arrow::BinaryArray&>(a).GetView(i);
@@ -98,6 +114,10 @@ template <class ArrayType>
 std::uint64_t SignedPrefix(const arrow::Array& a, int64_t i) {
   const auto v = static_cast<int64_t>(static_cast<const ArrayType&>(a).Value(i));
   return static_cast<std::uint64_t>(v) ^ (std::uint64_t{1} << 63U);
+}
+
+std::uint64_t Decimal64Prefix(const arrow::Array& a, int64_t i) {
+  return static_cast<std::uint64_t>(Decimal64At(a, i)) ^ (std::uint64_t{1} << 63U);
 }
 
 std::uint64_t UInt16Prefix(const arrow::Array& a, int64_t i) {
@@ -164,8 +184,15 @@ std::optional<TypeOrder> OrderFor(plan::LogicalType type) {
       return TypeOrder{.compare = &ComparePrimitive<arrow::Date32Array>,
                        .prefix = &SignedPrefix<arrow::Date32Array>,
                        .exact = true};
+    case plan::LogicalType::kDecimal:
+      // One scale per key, so the unscaled values order it. A narrow one's whole value fits the
+      // prefix, so it sorts without the comparator ever being called; HUGEINT is 38 digits and
+      // stays wide.
+      if (plan::ToArrow(type)->id() == arrow::Type::DECIMAL64) {
+        return TypeOrder{.compare = &CompareDecimal64, .prefix = &Decimal64Prefix, .exact = true};
+      }
+      [[fallthrough]];
     case plan::LogicalType::kHugeInt:
-    case plan::LogicalType::kDecimal:  // one scale per key: the unscaled values order it
       return TypeOrder{.compare = &CompareDecimal, .prefix = &DecimalPrefix, .exact = false};
     case plan::LogicalType::kDouble:
       return TypeOrder{.compare = &CompareDouble, .prefix = &DoublePrefix, .exact = true};
