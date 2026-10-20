@@ -334,13 +334,12 @@ TEST_F(GroupedSumAliasTest, ADecimalGroupingKeyGivesTheSameGroupsAtEitherWidth) 
     return sums;
   };
 
-  // Keyed on the decimal column itself, with repeats so it groups, and the other decimal column
-  // summed. Column 3 is the BIGINT, kept so the batch shape is the one Through expects.
-  const auto through = [&](bool narrow) {
+  // Keyed on the decimal column itself, which is what puts a decimal through the key hash, with
+  // repeats so it groups; the other decimal column is summed so each group carries a value to
+  // compare. One aggregate is enough: what is in question is the grouping, not the aggregate.
+  const auto grouped = [&](bool narrow) {
     const auto rows = RowsAtWidth(narrow);
     const auto key = Column(1, "v", Money());
-    const std::vector<plan::AggregateCall> calls = {
-        Sum(2), Call(plan::AggKind::kCountStar, 3, LogicalType::kBigInt, LogicalType::kBigInt)};
     auto table = GroupTable::Make({key}, {Sum(2)}, rows->num_columns(),
                                   arrow::default_memory_pool(), nullptr);
     EXPECT_TRUE(table.ok()) << table.status().ToString();
@@ -360,9 +359,9 @@ TEST_F(GroupedSumAliasTest, ADecimalGroupingKeyGivesTheSameGroupsAtEitherWidth) 
   };
 
   EXPECT_FALSE(plan::NarrowDecimals());
-  const auto wide = sums_of(through(false));
+  const auto wide = sums_of(grouped(false));
   const NarrowDecimalsFor narrowing(true);
-  const auto narrow = sums_of(through(true));
+  const auto narrow = sums_of(grouped(true));
   // Three of the seven rows have a NULL key, which is one group, so the fixture has five.
   EXPECT_EQ(wide.size(), 5U) << "the fixture no longer gives five groups";
   EXPECT_EQ(narrow, wide) << "a narrow key grouped differently, so the hash width is observable";
