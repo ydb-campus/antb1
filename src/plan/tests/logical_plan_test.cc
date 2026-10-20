@@ -382,10 +382,16 @@ TEST(LogicalPlanTest, ArrowScalars) {
   EXPECT_EQ(static_cast<const arrow::Decimal128Scalar&>(*s).value.ToIntegerString(),
             Int128ToString(big));
   // A DECIMAL constant carries its own (p,s), so it compares with the column at the same scale.
-  s = scalar({.type = LogicalType::Decimal(15, 2), .value = Int128{-1234}});
-  ASSERT_NE(s, nullptr);
-  ASSERT_TRUE(s->type->Equals(*arrow::decimal128(15, 2)));
-  EXPECT_EQ(static_cast<const arrow::Decimal128Scalar&>(*s).value.ToIntegerString(), "-1234");
+  // Explicitly at the wide width, because the two lines below name decimal128 and its scalar class:
+  // which width a narrow precision gets, and which class goes with it, is
+  // ADecimalScalarsClassFollowsItsType's subject.
+  {
+    const testing::NarrowDecimalsFor narrowing(false);
+    s = scalar({.type = LogicalType::Decimal(15, 2), .value = Int128{-1234}});
+    ASSERT_NE(s, nullptr);
+    ASSERT_TRUE(s->type->Equals(*arrow::decimal128(15, 2)));
+    EXPECT_EQ(static_cast<const arrow::Decimal128Scalar&>(*s).value.ToIntegerString(), "-1234");
+  }
 }
 
 // A decimal constant's scalar CLASS follows its type, at either physical width (ADR 0021's

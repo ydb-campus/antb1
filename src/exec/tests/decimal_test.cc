@@ -340,24 +340,6 @@ TEST_F(DecimalTest, ConditionsInsideExpressions) {
   EXPECT_EQ((*chosen)->ToString(), "[\n  1,\n  0,\n  0\n]");
 }
 
-// A scoped flip of plan's transitional narrowing switch, so no case leaves it on for the next. One
-// per test file that needs it, as the other cases of ADR 0021's decimal64 item do: all of them go
-// with the switch.
-class NarrowDecimalsFor {
- public:
-  explicit NarrowDecimalsFor(bool on) : was_(plan::NarrowDecimals()) {
-    plan::SetNarrowDecimals(on);
-  }
-  ~NarrowDecimalsFor() { plan::SetNarrowDecimals(was_); }
-  NarrowDecimalsFor(const NarrowDecimalsFor&) = delete;
-  NarrowDecimalsFor& operator=(const NarrowDecimalsFor&) = delete;
-  NarrowDecimalsFor(NarrowDecimalsFor&&) = delete;
-  NarrowDecimalsFor& operator=(NarrowDecimalsFor&&) = delete;
-
- private:
-  bool was_;
-};
-
 std::shared_ptr<arrow::Array> Decimals64(int precision, int scale,
                                          const std::vector<std::optional<std::int64_t>>& unscaled) {
   arrow::Decimal64Builder builder(arrow::decimal64(precision, scale));
@@ -411,8 +393,15 @@ TEST_F(DecimalTest, AFilterComparesANarrowDecimalAsItComparesTheWideOne) {
     return out;
   };
 
-  const auto wide =
-      answers(Decimals(width, scale, {Int128{50005}, Int128{-50005}, std::nullopt, Int128{15000}}));
+  // Each arm names its width, for the column AND for the constants: ToArrowScalar follows the same
+  // switch plan::ToArrow does, so a wide column with a narrow constant is a pair no plan builds and
+  // PredicateEvaluator::Make rightly refuses it.
+  std::vector<std::vector<std::optional<bool>>> wide;
+  {
+    const testing::NarrowDecimalsFor narrowing(false);
+    wide = answers(
+        Decimals(width, scale, {Int128{50005}, Int128{-50005}, std::nullopt, Int128{15000}}));
+  }
   // Row 0 is the only 5.0005, so every arm but < and the exact one answers true there and nowhere
   // else. Stated once, so a mode that answered "all false" could not pass by agreeing with itself.
   ASSERT_EQ(wide.size(), 6U);
@@ -423,7 +412,7 @@ TEST_F(DecimalTest, AFilterComparesANarrowDecimalAsItComparesTheWideOne) {
   EXPECT_EQ(wide[4], (std::vector<std::optional<bool>>{true, true, kNull, false}));
   EXPECT_EQ(wide[5], (std::vector<std::optional<bool>>{true, false, kNull, false}));
 
-  const NarrowDecimalsFor narrowing(true);
+  const testing::NarrowDecimalsFor narrowing(true);
   const auto narrow_values = Decimals64(width, scale, unscaled);
   ASSERT_EQ(narrow_values->type_id(), arrow::Type::DECIMAL64);
   EXPECT_EQ(answers(narrow_values), wide) << "a narrow column compared differently";

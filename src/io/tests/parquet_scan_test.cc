@@ -980,12 +980,21 @@ TEST_F(ParquetScanTest, ReadsByteArrayDecimals) {
     writer->Close();
     ASSERT_TRUE(out->Close().ok());
   }
-  auto table = ParquetTable::Open({path}, ParquetTableOptions{});
-  ASSERT_TRUE(table.ok()) << table.status().ToString();
-  EXPECT_TRUE((*table)->schema()->field(0)->type()->Equals(*arrow::decimal128(9, 2)));
-  const Scanned s = Scan(**table, {0}, 3);
-  ASSERT_NE(s.table, nullptr);
-  EXPECT_EQ(Texts(*s.table, 0), (std::vector<std::string>{"123.45", "-0.05", "null", "999999.99"}));
+  // At both engine widths, as ReadsEveryDecimalStorage does: the file is the same either way (the
+  // writer above is raw Parquet), and the engine type follows plan::ToArrow and nothing else.
+  for (const bool narrow : {false, true}) {
+    const NarrowDecimalsFor narrowing(narrow);
+    SCOPED_TRACE(std::format("narrowing {}", narrow));
+    auto table = ParquetTable::Open({path}, ParquetTableOptions{});
+    ASSERT_TRUE(table.ok()) << table.status().ToString();
+    const auto expected_type = narrow ? arrow::decimal64(9, 2) : arrow::decimal128(9, 2);
+    EXPECT_TRUE((*table)->schema()->field(0)->type()->Equals(*expected_type))
+        << (*table)->schema()->field(0)->type()->ToString();
+    const Scanned s = Scan(**table, {0}, 3);
+    ASSERT_NE(s.table, nullptr);
+    EXPECT_EQ(Texts(*s.table, 0),
+              (std::vector<std::string>{"123.45", "-0.05", "null", "999999.99"}));
+  }
 }
 
 // Statistics of a part (a row group) for skipping it: exact min, max and NULL count for

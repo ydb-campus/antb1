@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstddef>
+#include <memory>
 #include <sstream>
 #include <string_view>
 #include <type_traits>
@@ -9,8 +10,12 @@
 #include <arrow/api.h>
 #include <gtest/gtest.h>
 
+#include "plan_test_util.h"
+
 namespace antb1::plan {
 namespace {
+
+using testing::NarrowDecimalsFor;
 
 struct NamedType {
   LogicalType::Id id;
@@ -109,7 +114,12 @@ TEST(TypesTest, MapsDecimals) {
   EXPECT_EQ(decimal.width(), 15);
   EXPECT_EQ(decimal.scale(), 2);
   EXPECT_EQ(ToString(decimal), "DECIMAL(15,2)");
-  EXPECT_TRUE(ToArrow(decimal)->Equals(*arrow::decimal128(15, 2)));
+  // Which physical width ToArrow picks is NarrowingMapsADecimalOf18DigitsOrFewerToDecimal64's
+  // subject, at both settings; what this case needs is that whatever it picks is a decimal
+  // carrying this precision and scale, and that the logical type survives the round trip.
+  const std::shared_ptr<arrow::DataType> stored = ToArrow(decimal);  // held: *ToArrow() dangles
+  EXPECT_EQ(static_cast<const arrow::DecimalType&>(*stored).precision(), 15);
+  EXPECT_EQ(static_cast<const arrow::DecimalType&>(*stored).scale(), 2);
   EXPECT_EQ(*FromArrow(*ToArrow(decimal)), decimal);
   // Another precision or scale is another type, the same id.
   EXPECT_NE(decimal, LogicalType::Decimal(15, 3));
@@ -120,21 +130,6 @@ TEST(TypesTest, MapsDecimals) {
   EXPECT_FALSE(IsNumeric(decimal));
   EXPECT_FALSE(IsInteger(LogicalType::Decimal(38, 0)));
 }
-
-// A scoped flip of the transitional narrowing switch, so no case can leave it on for the next one
-// -- the cases of one binary run in one process, and every decimal path fails while it is on.
-class NarrowDecimalsFor {
- public:
-  explicit NarrowDecimalsFor(bool on) : was_(NarrowDecimals()) { SetNarrowDecimals(on); }
-  ~NarrowDecimalsFor() { SetNarrowDecimals(was_); }
-  NarrowDecimalsFor(const NarrowDecimalsFor&) = delete;
-  NarrowDecimalsFor& operator=(const NarrowDecimalsFor&) = delete;
-  NarrowDecimalsFor(NarrowDecimalsFor&&) = delete;
-  NarrowDecimalsFor& operator=(NarrowDecimalsFor&&) = delete;
-
- private:
-  bool was_;
-};
 
 // ADR 0021's decimal64 item, first step: with the switch on, a DECIMAL of at most 18 digits maps to
 // decimal64 and a wider one does not. Off is the default and the only configuration the rest of the
@@ -152,12 +147,15 @@ TEST(TypesTest, NarrowingMapsADecimalOf18DigitsOrFewerToDecimal64) {
                                                {.width = 19, .scale = 2, .narrow = false},
                                                {.width = 38, .scale = 6, .narrow = false}});
 
-  EXPECT_FALSE(NarrowDecimals()) << "the switch is off unless a case turns it on";
-  for (const Case& c : kCases) {
-    const LogicalType type = LogicalType::Decimal(c.width, c.scale);
-    EXPECT_TRUE(ToArrow(type)->Equals(*arrow::decimal128(c.width, c.scale)))
-        << "off: " << ToString(type);
-    EXPECT_EQ(*FromArrow(*ToArrow(type)), type) << "off: " << ToString(type);
+  const bool before = NarrowDecimals();
+  {
+    const NarrowDecimalsFor narrowing(false);
+    for (const Case& c : kCases) {
+      const LogicalType type = LogicalType::Decimal(c.width, c.scale);
+      EXPECT_TRUE(ToArrow(type)->Equals(*arrow::decimal128(c.width, c.scale)))
+          << "off: " << ToString(type);
+      EXPECT_EQ(*FromArrow(*ToArrow(type)), type) << "off: " << ToString(type);
+    }
   }
   {
     const NarrowDecimalsFor narrowing(true);
@@ -175,7 +173,7 @@ TEST(TypesTest, NarrowingMapsADecimalOf18DigitsOrFewerToDecimal64) {
     // HUGEINT is decimal128(38,0) whatever the switch says: 38 digits need 128 bits.
     EXPECT_TRUE(ToArrow(LogicalType::kHugeInt)->Equals(*arrow::decimal128(38, 0)));
   }
-  EXPECT_FALSE(NarrowDecimals()) << "the guard restored it";
+  EXPECT_EQ(NarrowDecimals(), before) << "the guard did not restore the setting";
 }
 
 TEST(TypesTest, Classification) {
@@ -228,8 +226,8 @@ TEST(TypesTest, PrintsItsName) {
   os << LogicalType(LogicalType::kHugeInt) << " " << LogicalType::kVarchar;
   EXPECT_EQ(os.str(), "HUGEINT VARCHAR");
   // gtest failure messages show the name, for a type and for an id.
-  EXPECT_EQ(testing::PrintToString(LogicalType(LogicalType::kDate)), "DATE");
-  EXPECT_EQ(testing::PrintToString(LogicalType::kBoolean), "BOOLEAN");
+  EXPECT_EQ(::testing::PrintToString(LogicalType(LogicalType::kDate)), "DATE");
+  EXPECT_EQ(::testing::PrintToString(LogicalType::kBoolean), "BOOLEAN");
 }
 
 }  // namespace

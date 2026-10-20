@@ -58,15 +58,10 @@ plan::AggregateCall Avg(int column) {
   return Call(plan::AggKind::kAvg, column, Money(), LogicalType::kDouble);
 }
 
+// Money() values at whatever width the switch asks for: testing::Decimals is width-aware, so the
+// two arms of every case below are the same call under a different setting.
 std::shared_ptr<arrow::Array> Decimals(const std::vector<std::optional<std::string>>& unscaled) {
-  arrow::Decimal128Builder builder(plan::ToArrow(Money()));
-  for (const auto& v : unscaled) {
-    EXPECT_TRUE(
-        (v.has_value() ? builder.Append(arrow::Decimal128(*v)) : builder.AppendNull()).ok());
-  }
-  std::shared_ptr<arrow::Array> out;
-  EXPECT_TRUE(builder.Finish(&out).ok());
-  return out;
+  return testing::Decimals(Money(), unscaled);
 }
 
 // Three groups: one with a NULL among its values, and one whose every value is NULL, so a shared
@@ -244,22 +239,6 @@ TEST_F(GroupedSumAliasTest, AnIntegerColumnAnswersThoughItSharesNothingYet) {
 
 // ---- the aggregates at the narrow physical width (ADR 0021's decimal64 item, step 3) ----
 
-// A scoped flip of plan's transitional narrowing switch.
-class NarrowDecimalsFor {
- public:
-  explicit NarrowDecimalsFor(bool on) : was_(plan::NarrowDecimals()) {
-    plan::SetNarrowDecimals(on);
-  }
-  ~NarrowDecimalsFor() { plan::SetNarrowDecimals(was_); }
-  NarrowDecimalsFor(const NarrowDecimalsFor&) = delete;
-  NarrowDecimalsFor& operator=(const NarrowDecimalsFor&) = delete;
-  NarrowDecimalsFor(NarrowDecimalsFor&&) = delete;
-  NarrowDecimalsFor& operator=(NarrowDecimalsFor&&) = delete;
-
- private:
-  bool was_;
-};
-
 std::shared_ptr<arrow::Array> Decimals64Of(
     const std::vector<std::optional<std::string>>& unscaled) {
   arrow::Decimal64Builder builder(arrow::decimal64(Money().width(), Money().scale()));
@@ -295,12 +274,12 @@ TEST_F(GroupedSumAliasTest, TheAggregatesAnswerTheSameAtEitherWidth) {
   for (const int parts : {1, 3}) {
     std::shared_ptr<arrow::Table> wide;
     {
-      EXPECT_FALSE(plan::NarrowDecimals());
+      const testing::NarrowDecimalsFor narrowing(false);
       auto out = Through({Sum(1), Avg(1), min_call, max_call}, *RowsAtWidth(false), parts);
       ASSERT_TRUE(out.ok()) << out.status().ToString();
       wide = *out;
     }
-    const NarrowDecimalsFor narrowing(true);
+    const testing::NarrowDecimalsFor narrowing(true);
     auto narrow = Through({Sum(1), Avg(1), min_call, max_call}, *RowsAtWidth(true), parts);
     ASSERT_TRUE(narrow.ok()) << narrow.status().ToString();
 
@@ -358,9 +337,12 @@ TEST_F(GroupedSumAliasTest, ADecimalGroupingKeyGivesTheSameGroupsAtEitherWidth) 
     return arrow::Table::FromRecordBatches(schema, out).ValueOrDie();
   };
 
-  EXPECT_FALSE(plan::NarrowDecimals());
-  const auto wide = sums_of(grouped(false));
-  const NarrowDecimalsFor narrowing(true);
+  decltype(sums_of(grouped(false))) wide;
+  {
+    const testing::NarrowDecimalsFor narrowing(false);
+    wide = sums_of(grouped(false));
+  }
+  const testing::NarrowDecimalsFor narrowing(true);
   const auto narrow = sums_of(grouped(true));
   // Three of the seven rows have a NULL key, which is one group, so the fixture has five.
   EXPECT_EQ(wide.size(), 5U) << "the fixture no longer gives five groups";

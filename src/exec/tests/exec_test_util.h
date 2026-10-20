@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <format>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -27,9 +28,14 @@
 #include <arrow/util/thread_pool.h>
 #include <gtest/gtest.h>
 
+#include "antb1/common/int128.h"
+#include "antb1/common/narrow.h"
 #include "antb1/exec/operator.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/table.h"
+#include "antb1/plan/types.h"
+
+#include "../decimal.h"
 
 // Helpers of the exec unit tests: arrays, an in-memory plan::Table, a scripted source operator, an
 // executor whose Submit throws and a pool that fails on workers.
@@ -156,15 +162,90 @@ inline std::shared_ptr<arrow::Array> Timestamps(const std::vector<std::optional<
   return ArrayOf<arrow::TimestampBuilder>(arrow::timestamp(arrow::TimeUnit::MICRO), micros);
 }
 
-// DECIMAL(precision, scale) values (HUGEINT: 38, 0), unscaled, in decimal digits.
+// A scoped flip of plan's transitional narrowing switch (ADR 0021's decimal64 item), so no case
+// leaves it on for the next. It goes away with the switch; what it is for until then is a case
+// whose subject IS one physical width, which has to say so rather than inherit it.
+class NarrowDecimalsFor {
+ public:
+  explicit NarrowDecimalsFor(bool on) : was_(plan::NarrowDecimals()) {
+    plan::SetNarrowDecimals(on);
+  }
+  ~NarrowDecimalsFor() { plan::SetNarrowDecimals(was_); }
+  NarrowDecimalsFor(const NarrowDecimalsFor&) = delete;
+  NarrowDecimalsFor& operator=(const NarrowDecimalsFor&) = delete;
+  NarrowDecimalsFor(NarrowDecimalsFor&&) = delete;
+  NarrowDecimalsFor& operator=(NarrowDecimalsFor&&) = delete;
+
+ private:
+  bool was_;
+};
+
+// DECIMAL(precision, scale) values (HUGEINT: 38, 0), unscaled, in decimal digits -- at the physical
+// width plan::ToArrow gives that type, which is decimal64 for at most 18 digits with the switch on
+// and decimal128 otherwise.
+//
+// Width-aware on purpose, and this is the helper every decimal fixture should go through.
+// `arrow::Decimal128Builder builder(plan::ToArrow(type))` is not a builder of the wrong width: it
+// is a 16-byte writer pointed at an 8-byte slot, because Decimal128Builder checks the type it is
+// handed with checked_pointer_cast, a static_pointer_cast under NDEBUG. That is the hazard
+// src/exec/decimal_bytes.h was written about, and the test code had it nine times.
+//
+// A value the narrow width cannot hold FAILS here rather than being truncated to its low 64 bits. A
+// silent truncation is the one way a fixture could go quietly weaker at the narrow width, so it is
+// the one thing this helper will not do.
 inline std::shared_ptr<arrow::Array> Decimals(
-    int32_t precision, int32_t scale, const std::vector<std::optional<std::string>>& values) {
+    plan::LogicalType logical, const std::vector<std::optional<std::string>>& values) {
+  const std::shared_ptr<arrow::DataType> type = plan::ToArrow(logical);
+  if (type->id() == arrow::Type::DECIMAL64) {
+    std::vector<std::optional<arrow::Decimal64>> unscaled;
+    unscaled.reserve(values.size());
+    for (const auto& v : values) {
+      if (!v.has_value()) {
+        unscaled.emplace_back(std::nullopt);
+        continue;
+      }
+      const arrow::Decimal128 wide(*v);
+      const auto narrow = wide.ToInteger<std::int64_t>();
+      EXPECT_TRUE(narrow.ok()) << *v
+                               << " does not fit a decimal64: the fixture needs a DECIMAL of "
+                                  "more than 18 digits to express it";
+      unscaled.emplace_back(arrow::Decimal64(narrow.ok() ? *narrow : 0));
+    }
+    return ArrayOf<arrow::Decimal64Builder>(type, unscaled);
+  }
   std::vector<std::optional<arrow::Decimal128>> unscaled;
   unscaled.reserve(values.size());
   for (const auto& v : values) {
     unscaled.push_back(v.has_value() ? std::optional(arrow::Decimal128(*v)) : std::nullopt);
   }
-  return ArrayOf<arrow::Decimal128Builder>(arrow::decimal128(precision, scale), unscaled);
+  return ArrayOf<arrow::Decimal128Builder>(type, unscaled);
+}
+
+// The same from a precision and a scale, for the cases that name them rather than a type.
+inline std::shared_ptr<arrow::Array> Decimals(
+    int32_t precision, int32_t scale, const std::vector<std::optional<std::string>>& values) {
+  return Decimals(
+      plan::LogicalType::Decimal(Narrow<std::uint8_t>(precision), Narrow<std::uint8_t>(scale)),
+      values);
+}
+
+// The unscaled values of a decimal array of either width, and its LOGICAL type: "DECIMAL(18,4):
+// 170005 -12500 null". The logical type rather than the physical one, because what these cases are
+// about is the arithmetic, and a physical width in the expected text makes every one of them assert
+// the representation by accident -- a case whose subject IS the width asserts type_id() itself.
+inline std::string UnscaledText(const arrow::Array& array) {
+  const auto& decimals = static_cast<const arrow::DecimalType&>(*array.type());
+  std::string out = std::format("DECIMAL({},{}):", decimals.precision(), decimals.scale());
+  const arrow::Result<UnscaledValues> read = ReadUnscaled(array);
+  EXPECT_TRUE(read.ok()) << read.status().ToString();
+  if (!read.ok()) {
+    return out;
+  }
+  for (std::size_t i = 0; i < read->values.size(); ++i) {
+    out += " " + (array.IsNull(static_cast<int64_t>(i)) ? std::string("null")
+                                                        : Int128ToString(read->values[i]));
+  }
+  return out;
 }
 
 inline std::shared_ptr<arrow::Array> Strings(

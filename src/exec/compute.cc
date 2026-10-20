@@ -255,9 +255,18 @@ arrow::Result<DecimalOperand> ReadDecimalOperand(const arrow::Array& array, plan
     return arrow::Status::Invalid("DECIMAL arithmetic over ", array.type()->ToString());
   }
   operand.owned = std::move(unscaled->values);
-  // An integer array's values are within its physical type, which the type rules nest in the
-  // result: only a decimal128 column can hold what its declared width does not admit.
-  operand.checked = true;
+  // An INTEGER array's values are within its physical type, which the type rules nest in the
+  // result, so no row of one needs testing. A DECIMAL array's are not, at either physical width: a
+  // file may hold a value beyond the declared width and nothing checks that on read, and a
+  // decimal64 column of DECIMAL(2,1) holds 1500 exactly as easily as a decimal128 one does. So a
+  // narrow decimal operand keeps the row test the in-place arm keeps, and only an integer skips it.
+  //
+  // This line said `true` unconditionally while decimal64 did not exist, which made the sentence
+  // above read "only a decimal128 column can hold what its declared width does not admit" -- true
+  // then, false the moment a decimal64 column could appear. Marking such an operand checked turns
+  // DuckDB's conversion error into an answer, which is ADR 0021's decimal64 item and the same
+  // soundness hole #191 closed on the reuse path.
+  operand.checked = !IsDecimalType(*array.type());
   return operand;
 }
 
