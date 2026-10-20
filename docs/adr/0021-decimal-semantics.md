@@ -215,6 +215,9 @@ This amends ADR 0012's list of unsupported constructs and three points of ADR 00
   ([ADR 0020](0020-filter-pushdown.md)) and in part statistics, when performance work resumes or the scale factor 1
   nightly misses its time budget on scan-bound queries. io's cast then targets decimal64 for p ≤ 18, narrowing a
   decimal128 or decimal256 that an ARROW:schema records, and it changes no answer.
+  - Update (2026-10-20): **the trigger fired** -- performance work resumed and three changes to the decimal
+    aggregate and expression paths landed -- and the measurement under the Plan's decimal64 item puts the
+    arithmetic, not io's cast, at the centre of it. The item is staged there as N1 to N4.
 
 ## Consequences
 
@@ -277,7 +280,58 @@ with exit code 4. The PR ids are the roadmap's, not divergence ids.
     rule 11.
   - **PR D4c,** feat(plan,exec): decimal case values and modulo beyond 38 digits. Rule 10 for CASE values, and `%`
     beyond 38 digits.
-- **decimal64 (deferred):** decimal64 for p ≤ 18, with DECIMAL in the filtered scan and in part statistics.
+- **decimal64:** decimal64 for p <= 18, with DECIMAL in the filtered scan and in part statistics.
+  - **The trigger fired (2026-10-20), and the measurement says this item was costed the wrong way round.**
+    The entry above and the consequence note both frame decimal64 as a *storage* narrowing in `io`. Storage is the
+    smaller half. The arithmetic is the larger one, and the three figures that decide it, taken on this host
+    against the environment's own Arrow on synthetic data rather than on any gate set:
+    - **int64 multiply with an overflow check costs 0.3 ns a row; the same in Int128 costs 1.2 ns** -- 4x, and it
+      is hardware rather than code. A 64-bit multiply is one instruction and vectorises; a 128-bit one compiles to
+      `mul` plus `umulh`, and neither NEON nor AVX2 has a 64x64->128 widening multiply to vectorise it into.
+    - **8 bytes a value instead of 16**, which halves the traffic of every decimal column read and every result
+      written. That matters more than it sounds: one step read and written the way this engine does it costs about
+      3.0 ns a row, of which the `Decimal128Builder` write is about 1.6 and the arithmetic with its range check
+      about 1.25. **The write is dearer than the multiply.**
+    - **Rule 6's cap is what makes this apply at all.** Because a product of two operands of at most 18 digits is
+      capped at 18, the whole decimal pipeline of the gate set's heaviest decimal query is DECIMAL(18,s) or
+      narrower: its discounted price is DECIMAL(18,4) and that price with tax is DECIMAL(18,6), both inside int64.
+      So this is not a narrow case that happens to fit -- the capping rule this ADR adopted from DuckDB is what
+      puts the arithmetic within reach of int64 in the first place.
+  - **The stated blocker does not apply to the arithmetic.** "Arrow 25 has no decimal32 or decimal64 arithmetic
+    kernels" is true and beside the point, because this engine does not use Arrow's decimal kernels for arithmetic:
+    rule 6 caps where Arrow widens, which Alternatives records as the reason. The arithmetic is this engine's own
+    program, so an int64 path in it is this engine's to write and waits on nothing. Arrow's decimal128 kernels were
+    measured for completeness -- `multiply` over two decimal128(15,2) gives decimal128(31,4), Arrow's widening
+    rule, at 1.3 ns a row against our own 1.2 -- so there was never any speed to borrow from them either.
+  - **And a negative result, so that it is not rediscovered.** The other candidate for the same cost was the
+    program's loop order: it runs a row at a time, and [ADR 0026](0026-join-performance.md)'s C10 chose that
+    deliberately. Inverting it -- step outer, rows inner, over a tile small enough to stay in L1 -- was built and
+    measured at **0.899x** of the operator's own time, with **the tile size making no difference at 128, 512 or
+    2048**. That last part is what settles it: were the gain cache locality the tile size would dominate, so what
+    an inversion buys is only the hoisted dispatch, and C10's own sentence about the dispatch predicting perfectly
+    was closer to right than the analysis that produced the branch. Kept, unproposed, on `perf/tiled-decimal-program`.
+  - **Where the cost actually sits**, so the next item is aimed rather than guessed: that operator costs 16.3 ns a
+    row on one thread and 23.8 summed over parts on fourteen, while the four steps it runs, read and written this
+    engine's way, cost 6.2 ns a row in isolation. So the expression evaluation proper is under 40% of it, memory
+    contention is most of the difference between one thread and fourteen, and a part of the remainder is
+    unexplained -- not the per-step dispatch (the branch above hoisted it), not per-batch allocation (one builder
+    pair per 60,500-row batch measures the same as one pair for everything), and not the validity path (it returns
+    no bitmap when no column is nullable). A sampling profiler, not another hypothesis, is what closes that.
+  - **Staged, smallest first:**
+    - **N1, perf(exec): compute a step in int64 where its types permit.** Inside the existing program only: where
+      a step's result and both its operands have p <= 18, narrow to int64, test the overflow on int64, and fall
+      back to the Int128 path for a value that does not fit -- which a column can hold, since a file may carry a
+      value beyond its declared width and the scan does not narrow it. Storage, types and answers all unchanged;
+      no module edge and no public header. **Its real purpose is to test the premise of N3 cheaply**: if the 4x
+      above shows up in situ, the representation change is grounded; if it does not, the micro-benchmark does not
+      transfer and N3 should be re-argued before anyone builds it.
+    - **N2, perf(exec): keep an intermediate step's values in int64**, which halves the traffic between steps.
+      Still inside the program.
+    - **N3, feat(plan,io,exec): a decimal64 representation for p <= 18.** The item as originally written, plus the
+      arithmetic: `io` reads into decimal64 rather than widening Parquet's INT32 or INT64 to decimal128, and
+      aggregates, sorting, top-N, grouping, MIN and MAX, comparisons and join keys all take it. Several modules, so
+      it needs its own plan and its own review, and N1 and N2 are what justify paying for it.
+    - **N4, docs(adr): record what N1 to N3 measured**, and accept or defer the rest on those numbers.
 
 ## Alternatives considered
 
