@@ -22,6 +22,7 @@
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
 
+#include "decimal_bytes.h"
 #include "double_key.h"
 #include "row_mask.h"
 #include "temporal_average.h"
@@ -69,7 +70,7 @@ arrow::Result<std::shared_ptr<arrow::Array>> OneDouble(std::optional<double> val
 arrow::Result<std::shared_ptr<arrow::Array>> OneSum(std::optional<Int128> value,
                                                     plan::LogicalType type,
                                                     arrow::MemoryPool* pool) {
-  arrow::Decimal128Builder builder(plan::ToArrow(type), pool);
+  arrow::Decimal128Builder builder(DecimalsType(type), pool);
   if (!value.has_value()) {
     ARROW_RETURN_NOT_OK(builder.AppendNull());
     return builder.Finish();
@@ -351,7 +352,7 @@ class HugeIntSumState final : public AggregateState {
     ARROW_RETURN_NOT_OK(CheckInput(values, selection, *plan::ToArrow(input_)));
     ARROW_ASSIGN_OR_RAISE(const RowMask mask,
                           RowMask::Make(&values, selection, values.length(), pool_));
-    const auto& decimals = static_cast<const arrow::Decimal128Array&>(values);
+    const auto& decimals = AsDecimals(values);
     bool overflow = false;
     mask.ForEachRun([&](int64_t position, int64_t length) {
       for (int64_t row = position; row < position + length && !overflow; ++row) {

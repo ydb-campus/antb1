@@ -16,6 +16,8 @@
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
 
+#include "decimal_bytes.h"
+
 namespace antb1::exec {
 namespace {
 
@@ -93,7 +95,7 @@ arrow::Result<ArrayPtr> DecimalToDouble(const arrow::Array& values, arrow::Memor
   if (values.type_id() != arrow::Type::DECIMAL128) {
     return arrow::Status::Invalid("DECIMAL to DOUBLE of ", values.type()->ToString());
   }
-  const auto& decimals = static_cast<const arrow::Decimal128Array&>(values);
+  const auto& decimals = AsDecimals(values);
   const auto& type = static_cast<const arrow::Decimal128Type&>(*values.type());
   arrow::DoubleBuilder builder(pool);
   ARROW_RETURN_NOT_OK(builder.Reserve(decimals.length()));
@@ -129,7 +131,7 @@ arrow::Result<ArrayPtr> CastToDecimal(const arrow::Array& values, plan::LogicalT
                                       arrow::MemoryPool* pool) {
   ARROW_ASSIGN_OR_RAISE(const UnscaledValues read, ReadUnscaled(values));
   const plan::IntegerRange range = plan::RangeOf(to);
-  arrow::Decimal128Builder builder(plan::ToArrow(to), pool);
+  arrow::Decimal128Builder builder(DecimalsType(to), pool);
   ARROW_RETURN_NOT_OK(builder.Reserve(values.length()));
   for (int64_t i = 0; i < values.length(); ++i) {
     if (values.IsNull(i)) {

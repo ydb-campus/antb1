@@ -74,6 +74,10 @@ int CompareDouble(const arrow::Array& a, int64_t i, const arrow::Array& b, int64
   return Order(x, y);
 }
 
+// A raw cast on purpose, where the rest of exec goes through AsDecimals: this runs once per
+// comparison, and Bind already checks the column's physical type against plan::ToArrow of its
+// declared type once per sort key (the Equals below), so a test here would be the same test again
+// in a loop. That one check is also what fails when ADR 0021's N3 changes the representation.
 int CompareDecimal(const arrow::Array& a, int64_t i, const arrow::Array& b, int64_t j) {
   const arrow::Decimal128 x(static_cast<const arrow::Decimal128Array&>(a).GetValue(i));
   const arrow::Decimal128 y(static_cast<const arrow::Decimal128Array&>(b).GetValue(j));
@@ -116,7 +120,7 @@ std::uint64_t DoublePrefix(const arrow::Array& a, int64_t i) {
 
 // The high 64 bits, as a signed number: not exact.
 std::uint64_t DecimalPrefix(const arrow::Array& a, int64_t i) {
-  const arrow::Decimal128 v(static_cast<const arrow::Decimal128Array&>(a).GetValue(i));
+  const arrow::Decimal128 v(static_cast<const arrow::Decimal128Array&>(a).GetValue(i));  // per row
   return static_cast<std::uint64_t>(v.high_bits()) ^ (std::uint64_t{1} << 63U);
 }
 
