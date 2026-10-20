@@ -501,9 +501,163 @@ Int128 ScaleFactor(plan::LogicalType from, plan::LogicalType to, plan::ArithOp o
 // the *left subtree*, having evaluated all of it before the right. Both raise, and each is
 // deterministic for a given plan and input, so what differs is which values the message names. The
 // alternative is to evaluate every step over every row, which is the pass this exists to remove.
+// ---- the same program, a step at a time over a tile of rows ----
+//
+// ADR 0026's C10 runs the program a row at a time, and says why: evaluating node by node "moves
+// about 160 bytes a row ... where reading its three columns and writing one result is 64". That is
+// right for a whole batch, where an intermediate is 64Ki x 16 bytes and leaves cache. It does not
+// hold for a tile: at 512 rows a step's results are 8 KB, so the extra passes stay in L1 and never
+// reach memory. What a tile buys is the dispatch -- the operand kinds and the operator are decided
+// once per step per tile instead of once per step per row -- and a loop with no branch out of it.
+//
+// This path is an optimisation only. It computes what the row-major loop computes, in the same
+// order within a row, and on ANY failure it computes nothing: the caller then runs the row-major
+// loop, which produces the message. So no error text, and no answer, can depend on this code.
+constexpr std::size_t kProgramTile = 512;
+
+// One operand of a step over a tile: a decimal128 buffer, a vector of Int128, or one value for
+// every row. Resolved once per step per tile, so reading it costs two predicted branches.
+struct TileSide {
+  const std::uint8_t* bytes = nullptr;  // 16 bytes a row, already offset to the tile
+  const Int128* ints = nullptr;         // already offset to the tile
+  Int128 scalar = 0;
+};
+
+Int128 SideAt(const TileSide& side, std::size_t i) {
+  if (side.bytes != nullptr) {
+    return ToInt128(arrow::Decimal128(side.bytes + (i * sizeof(Int128))));
+  }
+  if (side.ints != nullptr) {
+    return side.ints[i];
+  }
+  return side.scalar;
+}
+
+// One step over `n` rows. `kOp` is a template parameter so the operator is not a switch inside the
+// loop, and every failure -- a rescale that overflows, an operand or a result outside the step's
+// range -- is collected in one flag tested after the loop, as the grouped sum's overflow is.
+template <plan::ArithOp kOp>
+bool RunStepTile(const DecimalProgram::Step& step, const TileSide& left, const TileSide& right,
+                 Int128* dst, std::size_t n) {
+  const Int128 lo = step.range.min;
+  const Int128 hi = step.range.max;
+  const Int128 lf = step.left_factor;
+  const Int128 rf = step.right_factor;
+  // The original checks an operand whenever a rescale moved it, and otherwise only when the step
+  // says to.
+  const bool check_left = lf != 1 || step.check_left;
+  const bool check_right = rf != 1 || step.check_right;
+  bool bad = false;
+  for (std::size_t i = 0; i < n; ++i) {
+    Int128 x = SideAt(left, i);
+    Int128 y = SideAt(right, i);
+    if (lf != 1) {
+      bad |= __builtin_mul_overflow(x, lf, &x);
+    }
+    if (check_left) {
+      bad |= x < lo || x > hi;
+    }
+    if (rf != 1) {
+      bad |= __builtin_mul_overflow(y, rf, &y);
+    }
+    if (check_right) {
+      bad |= y < lo || y > hi;
+    }
+    Int128 value = 0;
+    if constexpr (kOp == plan::ArithOp::kAdd) {
+      bad |= __builtin_add_overflow(x, y, &value);
+    } else if constexpr (kOp == plan::ArithOp::kSubtract) {
+      bad |= __builtin_sub_overflow(x, y, &value);
+    } else {
+      bad |= __builtin_mul_overflow(x, y, &value);
+    }
+    bad |= value < lo || value > hi;
+    dst[i] = value;
+  }
+  return !bad;
+}
+
+// Whether the tiled path may run at all: no NULL to consider (a NULL row's operands read as 0, and
+// a step of a row the row-major loop skips could flag a failure that loop never sees), and every
+// operator one of the three a program holds -- Compile admits no other, so the test is a guard.
+bool Tileable(const DecimalProgram& program, const std::uint8_t* valid) {
+  return valid == nullptr && !program.steps.empty() &&
+         std::ranges::all_of(program.steps, [](const DecimalProgram::Step& step) {
+           return step.op == plan::ArithOp::kAdd || step.op == plan::ArithOp::kSubtract ||
+                  step.op == plan::ArithOp::kMultiply;
+         });
+}
+
+// The program over tiles, or nullopt for "run the row-major loop" -- which means either that this
+// path does not apply or that something failed and the row-major loop has to say what.
+std::optional<arrow::Result<ArrayPtr>> TryTiledDecimalProgram(const DecimalProgram& program,
+                                                              int64_t rows,
+                                                              plan::LogicalType result,
+                                                              arrow::MemoryPool* pool) {
+  const std::size_t steps = program.steps.size();
+  std::vector<Int128> slots(steps * kProgramTile, 0);
+  arrow::Decimal128Builder builder(plan::ToArrow(result), pool);
+  if (const arrow::Status status = builder.Reserve(rows); !status.ok()) {
+    return arrow::Result<ArrayPtr>(status);
+  }
+  const auto total = static_cast<std::size_t>(rows);
+  for (std::size_t start = 0; start < total; start += kProgramTile) {
+    const std::size_t n = std::min(kProgramTile, total - start);
+    for (std::size_t s = 0; s < steps; ++s) {
+      const DecimalProgram::Step& step = program.steps[s];
+      const auto side = [&](const DecimalProgram::Source& source) {
+        switch (source.kind) {
+          case DecimalProgram::Source::Kind::kColumn: {
+            const DecimalOperand& column = program.columns[source.at];
+            if (column.bytes != nullptr) {
+              return TileSide{.bytes = column.bytes + (start * sizeof(Int128))};
+            }
+            if (!column.owned.empty()) {
+              return TileSide{.ints = column.owned.data() + start};
+            }
+            return TileSide{.scalar = column.scalar};
+          }
+          case DecimalProgram::Source::Kind::kConstant:
+            return TileSide{.scalar = program.constants[source.at]};
+          default:
+            return TileSide{.ints = slots.data() + (source.at * kProgramTile)};
+        }
+      };
+      Int128* const dst = slots.data() + (s * kProgramTile);
+      const TileSide left = side(step.left);
+      const TileSide right = side(step.right);
+      const bool ok =
+          step.op == plan::ArithOp::kAdd
+              ? RunStepTile<plan::ArithOp::kAdd>(step, left, right, dst, n)
+              : (step.op == plan::ArithOp::kSubtract
+                     ? RunStepTile<plan::ArithOp::kSubtract>(step, left, right, dst, n)
+                     : RunStepTile<plan::ArithOp::kMultiply>(step, left, right, dst, n));
+      if (!ok) {
+        return std::nullopt;  // the row-major loop raises, with the row's own values
+      }
+    }
+    const Int128* const out = slots.data() + ((steps - 1) * kProgramTile);
+    for (std::size_t i = 0; i < n; ++i) {
+      builder.UnsafeAppend(FromInt128(out[i]));
+    }
+  }
+  std::shared_ptr<arrow::Array> array;
+  if (const arrow::Status status = builder.Finish(&array); !status.ok()) {
+    return arrow::Result<ArrayPtr>(status);
+  }
+  return arrow::Result<ArrayPtr>(array);
+}
+
 arrow::Result<ArrayPtr> RunDecimalProgram(const DecimalProgram& program, int64_t rows,
                                           const std::uint8_t* valid, plan::LogicalType result,
                                           arrow::MemoryPool* pool) {
+  if (Tileable(program, valid)) {
+    if (std::optional<arrow::Result<ArrayPtr>> tiled =
+            TryTiledDecimalProgram(program, rows, result, pool);
+        tiled.has_value()) {
+      return *std::move(tiled);
+    }
+  }
   arrow::Decimal128Builder builder(plan::ToArrow(result), pool);
   ARROW_RETURN_NOT_OK(builder.Reserve(rows));
   std::array<Int128, kMaxProgramSteps> slots{};
