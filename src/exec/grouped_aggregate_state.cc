@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -358,7 +359,7 @@ class GroupedHugeIntSum final : public GroupedAggregateState {
       return arrow::Status::Invalid("SUM needs an argument column");
     }
     ARROW_RETURN_NOT_OK(CheckRows(values, plan::ToArrow(input_).get(), ids, num_groups()));
-    const auto& decimals = AsDecimals(*values);
+    const arrow::FixedSizeBinaryArray& decimals = AsDecimalValues(*values);
     // Nothing to add. Also the one case where the array is allowed to carry no values buffer, so
     // the base below would be null: the loop would skip every row and never read it, which makes
     // this a guard that states the case rather than one an answer depends on.
@@ -372,22 +373,10 @@ class GroupedHugeIntSum final : public GroupedAggregateState {
     // declared width cannot rule an overflow out instead: a file may hold a decimal128 outside its
     // column's precision and the scan does not narrow it (see compute.cc's DecimalOperand), so only
     // the addition itself knows.
-    const std::uint8_t* const base = decimals.GetValue(0);
-    bool overflow = false;
-    if (decimals.null_count() == 0) {
-      for (std::size_t i = 0; i < ids.size(); ++i) {
-        overflow |= AddAt(ids[i], base, i);
-      }
-    } else {
-      // A separate loop so a column with no nulls pays no validity test per row, as KeyHashes
-      // splits them for the same reason (group_table.cc).
-      for (std::size_t i = 0; i < ids.size(); ++i) {
-        if (decimals.IsNull(static_cast<std::int64_t>(i))) {
-          continue;
-        }
-        overflow |= AddAt(ids[i], base, i);
-      }
-    }
+    // The stride is decided here, once a batch, so the loops below carry no test for it.
+    const bool overflow = values->type_id() == arrow::Type::DECIMAL64
+                              ? AddAll<sizeof(std::int64_t)>(decimals, ids)
+                              : AddAll<sizeof(Int128)>(decimals, ids);
     return overflow ? Overflowed() : arrow::Status::OK();
   }
   arrow::Status MergeGroups(const GroupedAggregateState& other, GroupIds from,
@@ -423,13 +412,50 @@ class GroupedHugeIntSum final : public GroupedAggregateState {
   }
 
  private:
-  // Row `row` of a decimal128 buffer into `group`: true when the sum wrapped, which the caller
+  // The unscaled value of row `row` of a buffer of `kBytes`-wide values. A decimal64's eight bytes
+  // are its value in two's complement, little-endian on both targets, so they widen by sign
+  // extension (ADR 0021's decimal64 item).
+  template <std::size_t kBytes>
+  static Int128 ValueAt(const std::uint8_t* base, std::size_t row) {
+    if constexpr (kBytes == sizeof(std::int64_t)) {
+      std::int64_t value = 0;
+      std::memcpy(&value, base + (row * kBytes), sizeof(value));
+      return value;
+    } else {
+      return HugeIntAt(base, row);
+    }
+  }
+
+  // Row `row` of a decimal buffer into `group`: true when the sum wrapped, which the caller
   // collects for the whole batch. Callers use `|=` rather than `||` because short-circuiting puts
   // back the per-row branch this is here to remove; either spelling answers the same, since a batch
   // that sets the flag fails and its sums are discarded.
+  template <std::size_t kBytes>
   [[nodiscard]] bool AddAt(std::uint32_t group, const std::uint8_t* base, std::size_t row) {
     ++counts_[group];
-    return __builtin_add_overflow(sums_[group], HugeIntAt(base, row), &sums_[group]);
+    return __builtin_add_overflow(sums_[group], ValueAt<kBytes>(base, row), &sums_[group]);
+  }
+
+  // Every row of `values` into its group, at one stride. A column with no nulls gets its own loop
+  // so it pays no validity test per row, as KeyHashes splits them for the same reason
+  // (group_table.cc).
+  template <std::size_t kBytes>
+  [[nodiscard]] bool AddAll(const arrow::FixedSizeBinaryArray& values, GroupIds ids) {
+    const std::uint8_t* const base = values.GetValue(0);
+    bool overflow = false;
+    if (values.null_count() == 0) {
+      for (std::size_t i = 0; i < ids.size(); ++i) {
+        overflow |= AddAt<kBytes>(ids[i], base, i);
+      }
+      return overflow;
+    }
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+      if (values.IsNull(static_cast<std::int64_t>(i))) {
+        continue;
+      }
+      overflow |= AddAt<kBytes>(ids[i], base, i);
+    }
+    return overflow;
   }
 
   [[nodiscard]] arrow::Status Overflowed() const {
@@ -569,6 +595,20 @@ struct MinMaxTraits<arrow::Decimal128Type> {
   using BuilderType = arrow::Decimal128Builder;
   using Value = arrow::Decimal128;
   using Stored = arrow::Decimal128;
+  static Value Get(const ArrayType& values, std::int64_t row) {
+    const Value value(values.GetValue(row));
+    return value;
+  }
+  static Stored Store(Value value) { return value; }
+  static Value View(const Stored& value) { return value; }
+};
+
+template <>
+struct MinMaxTraits<arrow::Decimal64Type> {  // ADR 0021's decimal64 item: eight bytes a value
+  using ArrayType = arrow::Decimal64Array;
+  using BuilderType = arrow::Decimal64Builder;
+  using Value = arrow::Decimal64;
+  using Stored = arrow::Decimal64;
   static Value Get(const ArrayType& values, std::int64_t row) {
     const Value value(values.GetValue(row));
     return value;
@@ -750,7 +790,10 @@ std::unique_ptr<GroupedAggregateState> MinMaxState(bool min, plan::LogicalType i
       // by the LOGICAL type rather than the physical one, so it is the one that would keep picking
       // a 16-byte traits for an 8-byte array when ADR 0021's N3 narrows the representation.
       // DecimalsType re-derives the same type and checks it, so that becomes a failure.
-      return std::make_unique<GroupedMinMax<arrow::Decimal128Type>>(min, DecimalsType(input));
+      if (type->id() == arrow::Type::DECIMAL64) {
+        return std::make_unique<GroupedMinMax<arrow::Decimal64Type>>(min, std::move(type));
+      }
+      return std::make_unique<GroupedMinMax<arrow::Decimal128Type>>(min, std::move(type));
     case plan::LogicalType::kDouble:
       return std::make_unique<GroupedMinMax<arrow::DoubleType>>(min, std::move(type));
     case plan::LogicalType::kVarchar:

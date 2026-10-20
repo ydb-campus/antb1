@@ -334,14 +334,25 @@ class TemporalAvgState final : public AggregateState {
   int64_t count_ = 0;
 };
 
-Int128 HugeIntAt(const arrow::Decimal128Array& values, int64_t row) {
-  const arrow::Decimal128 value(values.GetValue(row));
-  const UInt128 bits = (static_cast<UInt128>(static_cast<uint64_t>(value.high_bits())) << 64U) |
-                       static_cast<UInt128>(value.low_bits());
+// The unscaled value of row `row` of a decimal buffer, at each physical width. A decimal64's eight
+// bytes are its value in two's complement, little-endian on both targets, so they widen by sign
+// extension (ADR 0021's decimal64 item).
+Int128 NarrowAt(const std::uint8_t* base, std::size_t row) {
+  std::int64_t value = 0;
+  std::memcpy(&value, base + (row * sizeof(value)), sizeof(value));
+  return value;
+}
+
+Int128 HugeIntAt(const std::uint8_t* base, std::size_t row) {
+  const arrow::Decimal128 value(base + (row * sizeof(Int128)));
+  const UInt128 bits =
+      (static_cast<UInt128>(static_cast<std::uint64_t>(value.high_bits())) << 64U) |
+      static_cast<UInt128>(value.low_bits());
   return static_cast<Int128>(bits);
 }
 
-// SUM or AVG of a HUGEINT or DECIMAL argument (decimal128): every addition is checked. A
+// SUM or AVG of a HUGEINT or DECIMAL argument, at either physical width: every addition is
+// checked. A
 // DECIMAL(p,s) sums to DECIMAL(38,s), and averages as DuckDB does (DuckDbDecimalAverage).
 class HugeIntSumState final : public AggregateState {
  public:
@@ -352,11 +363,19 @@ class HugeIntSumState final : public AggregateState {
     ARROW_RETURN_NOT_OK(CheckInput(values, selection, *plan::ToArrow(input_)));
     ARROW_ASSIGN_OR_RAISE(const RowMask mask,
                           RowMask::Make(&values, selection, values.length(), pool_));
-    const auto& decimals = AsDecimals(values);
+    // Either physical width (ADR 0021's decimal64 item), decided once a batch. A branch a row is
+    // proportionate here where it would not be in the grouped accumulator: this loop already
+    // carries a checked add and a test of `overflow` in its own condition, so one more predictable
+    // branch is not what it spends its time on.
+    const arrow::FixedSizeBinaryArray& decimals = AsDecimalValues(values);
+    const bool narrow = values.type_id() == arrow::Type::DECIMAL64;
+    const std::uint8_t* const base = values.length() == 0 ? nullptr : decimals.GetValue(0);
     bool overflow = false;
     mask.ForEachRun([&](int64_t position, int64_t length) {
       for (int64_t row = position; row < position + length && !overflow; ++row) {
-        const auto next = CheckedAdd(sum_, HugeIntAt(decimals, row));
+        const auto value = narrow ? NarrowAt(base, static_cast<std::size_t>(row))
+                                  : HugeIntAt(base, static_cast<std::size_t>(row));
+        const auto next = CheckedAdd(sum_, value);
         overflow = !next.has_value();
         sum_ = next.value_or(sum_);
       }

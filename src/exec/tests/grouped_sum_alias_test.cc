@@ -241,5 +241,79 @@ TEST_F(GroupedSumAliasTest, AnIntegerColumnAnswersThoughItSharesNothingYet) {
   EXPECT_TRUE((*both)->column(2)->Equals(*(*avg_only)->column(1)));
 }
 
+// ---- the aggregates at the narrow physical width (ADR 0021's decimal64 item, step 3) ----
+
+// A scoped flip of plan's transitional narrowing switch.
+class NarrowDecimalsFor {
+ public:
+  explicit NarrowDecimalsFor(bool on) : was_(plan::NarrowDecimals()) {
+    plan::SetNarrowDecimals(on);
+  }
+  ~NarrowDecimalsFor() { plan::SetNarrowDecimals(was_); }
+  NarrowDecimalsFor(const NarrowDecimalsFor&) = delete;
+  NarrowDecimalsFor& operator=(const NarrowDecimalsFor&) = delete;
+  NarrowDecimalsFor(NarrowDecimalsFor&&) = delete;
+  NarrowDecimalsFor& operator=(NarrowDecimalsFor&&) = delete;
+
+ private:
+  bool was_;
+};
+
+std::shared_ptr<arrow::Array> Decimals64Of(
+    const std::vector<std::optional<std::string>>& unscaled) {
+  arrow::Decimal64Builder builder(arrow::decimal64(Money().width(), Money().scale()));
+  for (const auto& v : unscaled) {
+    const auto status =
+        v.has_value() ? builder.Append(arrow::Decimal64(std::stoll(*v))) : builder.AppendNull();
+    EXPECT_TRUE(status.ok()) << status.ToString();
+  }
+  std::shared_ptr<arrow::Array> out;
+  EXPECT_TRUE(builder.Finish(&out).ok());
+  return out;
+}
+
+// Rows whose decimal column is narrow or wide, with the keys and the other columns unchanged.
+std::shared_ptr<arrow::RecordBatch> RowsAtWidth(bool narrow) {
+  const auto keys = testing::Int64s({1, 1, 2, 2, 3, 3, 1});
+  const std::vector<std::optional<std::string>> v = {
+      "1050025", "2500", "700", std::nullopt, std::nullopt, std::nullopt, "999999999999"};
+  const auto values = narrow ? Decimals64Of(v) : Decimals(v);
+  const auto w = testing::Int64s({5, 6, 7, 8, 9, 10, 11});
+  return arrow::RecordBatch::Make(
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("v", values->type()),
+                     arrow::field("u", values->type()), arrow::field("w", arrow::int64())}),
+      7, {keys, values, values, w});
+}
+
+// SUM, AVG, MIN and MAX of a decimal column answer the same at either width, through one pass and
+// through a merge. SUM and AVG keep their 38-digit result type either way; MIN and MAX take the
+// column's own type, so theirs is the one that narrows with it.
+TEST_F(GroupedSumAliasTest, TheAggregatesAnswerTheSameAtEitherWidth) {
+  const auto min_call = Call(plan::AggKind::kMin, 1, Money(), Money());
+  const auto max_call = Call(plan::AggKind::kMax, 1, Money(), Money());
+  for (const int parts : {1, 3}) {
+    std::shared_ptr<arrow::Table> wide;
+    {
+      EXPECT_FALSE(plan::NarrowDecimals());
+      auto out = Through({Sum(1), Avg(1), min_call, max_call}, *RowsAtWidth(false), parts);
+      ASSERT_TRUE(out.ok()) << out.status().ToString();
+      wide = *out;
+    }
+    const NarrowDecimalsFor narrowing(true);
+    auto narrow = Through({Sum(1), Avg(1), min_call, max_call}, *RowsAtWidth(true), parts);
+    ASSERT_TRUE(narrow.ok()) << narrow.status().ToString();
+
+    // SUM and AVG are DECIMAL(38,s) and DOUBLE whatever the input width, so those columns compare
+    // directly; MIN and MAX follow the input, so they differ in type and compare as strings.
+    EXPECT_TRUE((*narrow)->column(1)->Equals(*wide->column(1))) << "SUM, parts=" << parts;
+    EXPECT_TRUE((*narrow)->column(2)->Equals(*wide->column(2))) << "AVG, parts=" << parts;
+    EXPECT_EQ((*narrow)->column(3)->type()->id(), arrow::Type::DECIMAL64) << "MIN stayed wide";
+    EXPECT_EQ((*narrow)->column(3)->ToString(), wide->column(3)->ToString())
+        << "MIN, parts=" << parts;
+    EXPECT_EQ((*narrow)->column(4)->ToString(), wide->column(4)->ToString())
+        << "MAX, parts=" << parts;
+  }
+}
+
 }  // namespace
 }  // namespace antb1::exec
