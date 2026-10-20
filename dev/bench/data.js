@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792502316688,
+  "lastUpdate": 1792507177257,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -15444,6 +15444,258 @@ window.BENCHMARK_DATA = {
             "value": 2198.6516569999994,
             "unit": "ms/iter",
             "extra": "iterations: 1\ncpu: 2198.487014000001 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "82f368f6552a8c6f8e68025e933fe8ee42e1c1cc",
+          "message": "feat(exec): the sort keys and the gather take decimal64 (#202)\n\n## What and why\n\nADR 0021's decimal64 item, **step 4** — and it is smaller than the plan\nexpected, because three of the four key\npaths needed nothing. That is worth stating as a result rather than\nsilently shipping a small diff.\n\n**Nothing to do, verified rather than assumed:**\n\n- a GROUP BY key is hashed over `type.byte_width()` bytes\n(`group_table.cc`), so a narrow one is hashed over eight\n  and the generic path already handles it;\n- a join key's layout is `byte_width()` too (`join_table.cc:82`);\n- and a decimal join key **publishes no key filter at either width** —\n`CollectKeyValues` covers the integer and\n  date types and returns `false` for everything else, exactly as before.\n\n**What needed doing: a sort key, and the gather.**\n\nA narrow sort key gets its own comparator and prefix, and is **`exact`\nwhere the wide one cannot be** — a decimal64's\neight bytes *are* its unscaled value, so the prefix is the whole of it\nand the comparator is never called. A narrow\ndecimal key therefore sorts as a BIGINT does, which is slightly *faster*\nthan the wide one rather than merely equal\nto it. `HUGEINT` is 38 digits and stays wide.\n\nThe gather gets a decimal64 case; without it a narrow column fell\nthrough to the slice path, which is correct and\nslower.\n\n## The open question, answered\n\nThe plan flagged that hashing 8 bytes instead of 16 changes the hash and\nso which partition a group lands in. It\ndoes — and **nothing observable changes.** The new case groups by a\nDECIMAL column at both widths and compares the\nsums as a multiset: five groups, the same five sums. The key itself\nprints at its own physical width, so its text\ndiffers by construction, and the case compares what is actually the\nanswer rather than the formatting.\n\n(My first version of that case asserted four groups. There are five —\nthree rows share a NULL key, which is one\ngroup — and the arms agreed all along; the assertion was wrong, not the\ncode.)\n\n## Mutations\n\n| mutation | caught by |\n| --- | --- |\n| the narrow prefix loses its sign flip |\n`ANarrowDecimalKeySortsAsTheWideOneDoes` |\n| a narrow key keeps the wide comparator and prefix | the same case |\n\nThe second is the one that matters: keeping the wide comparator\nreinterprets eight bytes as sixteen, which is the\nhazard this ADR's work has been guarding against since #197.\n\n## Verification\n\n```\npixi run test                                      # full suite, PASS\npixi run test -R 'exec\\.'                          # 353 cases, PASS\npixi run lint                                      # clang-format, typos, check_repo pass\n```\n\nclang-tidy on the four files reports only the pre-existing macOS-only\n`kPerRow` widening-cast finding in\n`sort.cc:373`, outside this diff's hunks; it also caught a missing\n`reserve` in my new test, now fixed. Gates not\nverifiable on this host are as in #198 to #201.\n\nChecked against [ADR\n0006](../blob/main/docs/adr/0006-benchmark-data-policy.md): no data, no\nquery text, no\ntimings.\n\n**Next is step 5, `io`** — the reader option at all three type-inference\nsites, the two decisions the plan records\n(out-of-width values in `FIXED_LEN_BYTE_ARRAY`/`BYTE_ARRAY` columns, and\nwhether p ≤ 9 is decimal32), and the first\nend-to-end number of this item, since it is the scan third.\n\n## AI assistance\n\n- Tool: Claude Code (Opus 5). It checked the three paths that needed\nnothing before changing the two that did, and\n  answered the plan's open question with a case rather than an argument.\n- Accountable human (has read and understands the whole diff): @hor911\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-20T17:35:34+03:00",
+          "tree_id": "3a3e536900e5a7c8d43f928643326d876f93a63c",
+          "url": "https://github.com/ydb-campus/antb1/commit/82f368f6552a8c6f8e68025e933fe8ee42e1c1cc"
+        },
+        "date": 1792507175944,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 5016.709907501045,
+            "unit": "ns/iter",
+            "extra": "iterations: 138380\ncpu: 5016.618694898107 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84506.37975977515,
+            "unit": "ns/iter",
+            "extra": "iterations: 7826\ncpu: 84499.90851009455 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222597.46986040927,
+            "unit": "ns/iter",
+            "extra": "iterations: 3152\ncpu: 222581.19289340108 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 438115.7192982425,
+            "unit": "ns/iter",
+            "extra": "iterations: 1596\ncpu: 438067.0789473682 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 402588.2027649816,
+            "unit": "ns/iter",
+            "extra": "iterations: 1736\ncpu: 402584.1509216589 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2089430.2686567293,
+            "unit": "ns/iter",
+            "extra": "iterations: 335\ncpu: 2089346.0208955214 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 51.216470923076955,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 51.212616076923084 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 47.81044460000127,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 47.80784026666668 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 192.83331366666326,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 192.8188863333329 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.368738142857344,
+            "unit": "ms/iter",
+            "extra": "iterations: 49\ncpu: 14.367275265306112 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 30.498702916666787,
+            "unit": "ms/iter",
+            "extra": "iterations: 24\ncpu: 30.496229083333272 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 37.86784516666665,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 37.86288361111111 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 2.2490538806450897,
+            "unit": "ms/iter",
+            "extra": "iterations: 310\ncpu: 2.2489691451612903 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 103.08730242857271,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 103.07803799999985 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1000",
+            "value": 28.05569347999949,
+            "unit": "ms/iter",
+            "extra": "iterations: 25\ncpu: 28.054907399999962 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16384",
+            "value": 31.173830136363666,
+            "unit": "ms/iter",
+            "extra": "iterations: 22\ncpu: 31.172155545454494 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/262144",
+            "value": 65.18265563636305,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 65.17869000000009 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1048576",
+            "value": 95.30990757142733,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 95.30040728571417 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/4194304",
+            "value": 335.7796350000086,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 335.76688849999846 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16777216",
+            "value": 1725.393868999987,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1725.275527000001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1000",
+            "value": 34.68487775,
+            "unit": "ms/iter",
+            "extra": "iterations: 20\ncpu: 34.68124924999998 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16384",
+            "value": 39.454929722222374,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 39.45266744444452 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/262144",
+            "value": 71.03303299999766,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 71.02459639999985 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1048576",
+            "value": 118.10638833333087,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 118.09896283333289 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/4194304",
+            "value": 410.0291910000067,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 409.9782155000007 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16777216",
+            "value": 2009.1570390000015,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2008.9779870000016 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1000",
+            "value": 58.78496108333309,
+            "unit": "ms/iter",
+            "extra": "iterations: 12\ncpu: 58.780655499999966 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16384",
+            "value": 63.65256918181992,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 63.64969245454527 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/262144",
+            "value": 94.38846428572235,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 94.37704085714316 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1048576",
+            "value": 165.885439500002,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 165.8711379999991 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/4194304",
+            "value": 494.85928749999175,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 494.8335009999987 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16777216",
+            "value": 2272.2044419999747,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2272.063174000003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1000",
+            "value": 70.08022640000036,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 70.0757368000005 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16384",
+            "value": 75.76703555554963,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 75.75744633333335 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/262144",
+            "value": 110.62660999999707,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 110.60849550000047 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1048576",
+            "value": 191.85692524999354,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 191.82439375000016 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/4194304",
+            "value": 586.4953789999845,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 586.367665999994 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16777216",
+            "value": 2631.5712509999685,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2631.4027210000004 ms\nthreads: 1"
           }
         ]
       }
