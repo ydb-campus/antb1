@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string_view>
 #include <vector>
@@ -17,6 +18,33 @@ namespace antb1::exec {
 
 Int128 ToInt128(const arrow::Decimal128& d);
 arrow::Decimal128 FromInt128(Int128 v);
+
+// Builds a column of DECIMAL values at whichever physical width plan::ToArrow asks for, which is
+// decimal128 today and decimal64 for a width of at most 18 digits once ADR 0021's transitional
+// switch is on. Values arrive as unscaled Int128 at either width; a narrow column stores the low 64
+// bits, which is the whole value, because every caller has already range-checked it against a type
+// of at most 18 digits.
+//
+// One predictable branch a value. That is why the program path in compute.cc templates its loop on
+// the builder instead and this serves the recursive fallbacks, which no measured query reaches.
+class DecimalColumnBuilder {
+ public:
+  DecimalColumnBuilder(plan::LogicalType type, arrow::MemoryPool* pool);
+
+  arrow::Status Reserve(std::int64_t rows);
+  void UnsafeAppend(Int128 value);
+  void UnsafeAppendNull();
+  arrow::Status Finish(std::shared_ptr<arrow::Array>* out);
+
+ private:
+  // Both are built and one is used. An optional pair would say the invariant better, but the
+  // analyser cannot see that exactly one of two optionals is engaged and reports every use of the
+  // other as unchecked -- and a builder holds no memory until Reserve, so the unused one costs an
+  // object and nothing else.
+  bool narrow_;
+  arrow::Decimal64Builder narrow_builder_;
+  arrow::Decimal128Builder wide_builder_;
+};
 
 // The values of an integer (int16, uint16, int32, int64) or decimal128 array as unscaled Int128
 // (0 where NULL), with the array's scale (0 for an integer).

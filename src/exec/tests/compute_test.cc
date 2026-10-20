@@ -1793,5 +1793,55 @@ TEST_F(ComputeTest, AWideResultStaysWideWithNarrowingOn) {
   EXPECT_EQ(UnscaledOf(**out), "246913578024691357802469134");
 }
 
+// The recursive fallbacks at the narrow width (ADR 0021's decimal64 item, step 2b). Each of these
+// shapes makes Compile bail, so the program path is not involved: a negation, a CASE whose branch
+// type is its own, a cast, and a chain whose operand the program cannot read.
+TEST_F(ComputeTest, TheRecursiveFallbacksAnswerAtTheNarrowWidth) {
+  const LogicalType money = LogicalType::Decimal(15, 2);
+  const LogicalType wider = LogicalType::Decimal(16, 2);
+  const std::vector<std::optional<std::string>> values = {"1050025", std::nullopt, "-7",
+                                                          "999999999999"};
+
+  // A negation keeps its operand's type, and Compile covers no NegateExpr, so this is the
+  // recursive path at whatever width the type asks for.
+  const auto negated = std::make_shared<const plan::Expr>(plan::Expr{
+      .node = plan::NegateExpr{.operand = ColumnAt(0, money)}, .type = money, .name = "n"});
+  // An arithmetic node whose operand is that negation: DecimalArith, not the program.
+  const auto sum = Arith(ArithOp::kAdd, negated, ConstantOf(100, money), wider);
+
+  for (const plan::ExprPtr& expr : {negated, sum}) {
+    std::string wide;
+    arrow::Type::type wide_id{};
+    {
+      EXPECT_FALSE(plan::NarrowDecimals());
+      auto out = Eval(expr, {Decimals(money, values)});
+      ASSERT_TRUE(out.ok()) << out.status().ToString();
+      wide = UnscaledOf(**out);
+      wide_id = (*out)->type_id();
+    }
+    EXPECT_EQ(wide_id, arrow::Type::DECIMAL128);
+    const NarrowDecimalsFor narrowing(true);
+    auto out = Eval(expr, {Decimals64(money, values)});
+    ASSERT_TRUE(out.ok()) << out.status().ToString();
+    EXPECT_EQ((*out)->type_id(), arrow::Type::DECIMAL64) << ToString(expr->type);
+    EXPECT_EQ((*out)->data()->buffers[1]->size(),
+              static_cast<std::int64_t>(sizeof(std::int64_t)) * (*out)->length())
+        << "the values buffer is not eight bytes a row for " << ToString(expr->type);
+    EXPECT_EQ(UnscaledOf(**out), wide) << "the narrow fallback answered differently";
+  }
+}
+
+// A DECIMAL cast to DOUBLE reads either width, and gives DuckDB's value either way.
+TEST_F(ComputeTest, ADecimalToDoubleReadsEitherWidth) {
+  const LogicalType money = LogicalType::Decimal(15, 2);
+  const std::vector<std::optional<std::string>> values = {"1050025", std::nullopt, "-7"};
+  auto wide = DecimalToDouble(*Decimals(money, values), arrow::default_memory_pool());
+  auto narrow = DecimalToDouble(*Decimals64(money, values), arrow::default_memory_pool());
+  ASSERT_TRUE(wide.ok()) << wide.status().ToString();
+  ASSERT_TRUE(narrow.ok()) << narrow.status().ToString();
+  EXPECT_TRUE((*wide)->Equals(**narrow)) << (*wide)->ToString() << "\nagainst\n"
+                                         << (*narrow)->ToString();
+}
+
 }  // namespace
 }  // namespace antb1::exec
