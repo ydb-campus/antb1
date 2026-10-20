@@ -780,7 +780,7 @@ Project RegionID, c  [rows=3 batches=1 time=38.946ms self=0.007ms]
 | DOUBLE | double | DOUBLE | |
 | BYTE_ARRAY, unannotated | binary | VARCHAR | compared byte-wise |
 | BYTE_ARRAY annotated STRING (UTF8) | utf8 | VARCHAR | same engine representation as unannotated |
-| DECIMAL(p, s), p ≤ 38 (stored as INT32, INT64, FIXED_LEN_BYTE_ARRAY or BYTE_ARRAY) | decimal128(p, s); decimal32, decimal64 and decimal256 (an ARROW:schema may give them) are widened exactly on read | DECIMAL(p,s) | the exact unscaled value with scale s (Semantics); a DECIMAL(38, 0) column is DECIMAL(38,0), no longer HUGEINT ([ADR 0021](adr/0021-decimal-semantics.md) rule 2) |
+| DECIMAL(p, s), p ≤ 38 (stored as INT32, INT64, FIXED_LEN_BYTE_ARRAY or BYTE_ARRAY) | decimal64(p, s) at p ≤ 18 and decimal128(p, s) above it ([ADR 0021](adr/0021-decimal-semantics.md)'s decimal64 item); every storage width an ARROW:schema may give is converted exactly on read | DECIMAL(p,s) | the exact unscaled value with scale s (Semantics); a DECIMAL(38, 0) column is DECIMAL(38,0), no longer HUGEINT ([ADR 0021](adr/0021-decimal-semantics.md) rule 2) |
 | DECIMAL(p, s), p > 38 | – | unsupported | |
 | – | decimal128(38, 0) | HUGEINT | only computed: the result type of integer SUM, and of integer literals beyond BIGINT |
 | – | timestamp[us] | TIMESTAMP | only computed (`toDateTime`, `date_trunc`) or a literal; a Parquet timestamp column is unsupported |
