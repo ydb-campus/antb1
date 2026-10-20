@@ -13,6 +13,7 @@
 #include <arrow/compute/api_aggregate.h>
 #include <arrow/compute/api_scalar.h>
 #include <arrow/compute/api_vector.h>
+#include <arrow/compute/cast.h>
 #include <arrow/compute/exec.h>
 #include <arrow/compute/row/grouper.h>
 #include <arrow/util/decimal.h>
@@ -479,7 +480,16 @@ bool IsNaN(const arrow::Scalar& scalar) {
 class MinMaxState final : public AggregateState {
  public:
   MinMaxState(bool min, std::shared_ptr<arrow::DataType> type, arrow::MemoryPool* pool)
-      : min_(min), type_(std::move(type)), pool_(pool) {}
+      : min_(min), type_(std::move(type)), pool_(pool) {
+    // Arrow 25 has no min_max kernel for a decimal narrower than 128 bits -- probed, not assumed --
+    // so a narrow column is widened for the kernel and the answer narrowed back at Finalize. One
+    // cast a batch, on the ungrouped MIN/MAX path; the grouped one reads the bytes itself and needs
+    // none (ADR 0021's decimal64 item).
+    if (type_->id() == arrow::Type::DECIMAL64 || type_->id() == arrow::Type::DECIMAL32) {
+      const auto& decimal = static_cast<const arrow::DecimalType&>(*type_);
+      wide_ = arrow::decimal128(decimal.precision(), decimal.scale());
+    }
+  }
 
   arrow::Status Consume(const arrow::Array& values, const arrow::BooleanArray* selection) override {
     ARROW_RETURN_NOT_OK(CheckInput(values, selection, *type_));
@@ -489,6 +499,10 @@ class MinMaxState final : public AggregateState {
       ARROW_ASSIGN_OR_RAISE(
           input, arrow::compute::Filter(input, arrow::Datum(selection->data()),
                                         arrow::compute::FilterOptions::Defaults(), &kernels));
+    }
+    if (wide_ != nullptr) {
+      ARROW_ASSIGN_OR_RAISE(
+          input, arrow::compute::Cast(input, wide_, arrow::compute::CastOptions::Safe(), &kernels));
     }
     ARROW_ASSIGN_OR_RAISE(
         const arrow::Datum extremes,
@@ -511,7 +525,16 @@ class MinMaxState final : public AggregateState {
     if (best_ == nullptr) {
       return arrow::MakeArrayOfNull(type_, 1, pool);
     }
-    return arrow::MakeArrayFromScalar(*best_, 1, pool);
+    ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Array> array,
+                          arrow::MakeArrayFromScalar(*best_, 1, pool));
+    if (wide_ == nullptr) {
+      return array;
+    }
+    arrow::compute::ExecContext kernels(pool);
+    ARROW_ASSIGN_OR_RAISE(
+        const arrow::Datum narrowed,
+        arrow::compute::Cast(array, type_, arrow::compute::CastOptions::Safe(), &kernels));
+    return narrowed.make_array();
   }
 
  private:
@@ -541,6 +564,9 @@ class MinMaxState final : public AggregateState {
 
   bool min_;
   std::shared_ptr<arrow::DataType> type_;
+  // decimal128 of type_'s precision and scale when type_ is narrower, else null: see the
+  // constructor.
+  std::shared_ptr<arrow::DataType> wide_;
   arrow::MemoryPool* pool_;
   std::shared_ptr<arrow::Scalar> best_;
 };

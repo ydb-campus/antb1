@@ -20,6 +20,7 @@
 #include <gtest/gtest.h>
 #include <parquet/arrow/writer.h>
 #include <parquet/column_writer.h>
+#include <parquet/file_reader.h>
 #include <parquet/file_writer.h>
 #include <parquet/properties.h>
 #include <parquet/schema.h>
@@ -480,6 +481,23 @@ TEST_F(ParquetScanTest, ConvertsToTheEngineView) {
 // (INT32, INT64 or FIXED_LEN_BYTE_ARRAY) and whatever an ARROW:schema restores (decimal32,
 // decimal64, decimal128 or decimal256): the engine's DECIMAL(p, s) (ADR 0021). Wider decimals stay
 // unsupported.
+// A scoped flip of plan's transitional narrowing switch (ADR 0021's decimal64 item), so no case
+// leaves it on for the next.
+class NarrowDecimalsFor {
+ public:
+  explicit NarrowDecimalsFor(bool on) : was_(plan::NarrowDecimals()) {
+    plan::SetNarrowDecimals(on);
+  }
+  ~NarrowDecimalsFor() { plan::SetNarrowDecimals(was_); }
+  NarrowDecimalsFor(const NarrowDecimalsFor&) = delete;
+  NarrowDecimalsFor& operator=(const NarrowDecimalsFor&) = delete;
+  NarrowDecimalsFor(NarrowDecimalsFor&&) = delete;
+  NarrowDecimalsFor& operator=(NarrowDecimalsFor&&) = delete;
+
+ private:
+  bool was_;
+};
+
 TEST_F(ParquetScanTest, ReadsEveryDecimalStorage) {
   arrow::Decimal32Builder d9(arrow::decimal32(9, 2));
   arrow::Decimal64Builder d18(arrow::decimal64(18, 4));
@@ -521,9 +539,15 @@ TEST_F(ParquetScanTest, ReadsEveryDecimalStorage) {
                      arrow::field("wide", arrow::decimal256(40, 0))}),
       {d9.Finish().ValueOrDie(), d18.Finish().ValueOrDie(), d38.Finish().ValueOrDie(),
        d256.Finish().ValueOrDie(), d15.Finish().ValueOrDie(), wide.Finish().ValueOrDie()});
-  const std::vector<std::shared_ptr<arrow::DataType>> engine_types = {
+  const std::vector<std::shared_ptr<arrow::DataType>> wide_types = {
       arrow::decimal128(9, 2), arrow::decimal128(18, 4), arrow::decimal128(38, 10),
       arrow::decimal128(38, 0), arrow::decimal128(15, 2)};
+  // With ADR 0021's narrowing on, a DECIMAL of at most 18 digits is decimal64 whatever the file
+  // stored it as: the engine type follows plan::ToArrow and nothing else, which is the invariant
+  // plan::Table::schema() states. The 38-digit columns stay decimal128.
+  const std::vector<std::shared_ptr<arrow::DataType>> narrow_types = {
+      arrow::decimal64(9, 2), arrow::decimal64(18, 4), arrow::decimal128(38, 10),
+      arrow::decimal128(38, 0), arrow::decimal64(15, 2)};
   const std::vector<std::vector<std::string>> expected = {
       {"9999999.99", "null", "-9999999.99", "-0.05"},
       {"99999999999999.9999", "-0.0001", "null", "-99999999999999.9999"},
@@ -531,27 +555,32 @@ TEST_F(ParquetScanTest, ReadsEveryDecimalStorage) {
        "0E-10", "null"},
       {"null", "-" + nines38, nines38, "7"},
       {"-123.45", "9999999999999.99", "0.00", "null"}};
-  for (const bool store_schema : {false, true}) {
-    for (const bool as_integers : {false, true}) {
-      SCOPED_TRACE(std::format("ARROW:schema {}, integer storage {}", store_schema, as_integers));
-      const std::string path =
-          Write(std::format("decimals_{}_{}.parquet", store_schema, as_integers), data, 2,
-                store_schema, as_integers);
-      auto table = ParquetTable::Open({path}, ParquetTableOptions{});
-      ASSERT_TRUE(table.ok()) << table.status().ToString();
-      const auto& schema = *(*table)->schema();
-      for (std::size_t i = 0; i < engine_types.size(); ++i) {
-        EXPECT_TRUE(schema.field(static_cast<int>(i))->type()->Equals(*engine_types[i]))
-            << i << ": " << schema.field(static_cast<int>(i))->type()->ToString();
-      }
-      EXPECT_FALSE(plan::FromArrow(*schema.field(5)->type()).ok())
-          << "a 40-digit decimal stays unsupported";
-      for (const int64_t batch_size : {int64_t{1}, int64_t{3}}) {
-        const Scanned s = Scan(**table, {0, 1, 2, 3, 4}, batch_size);
-        ASSERT_NE(s.table, nullptr);
-        for (int c = 0; c < 5; ++c) {
-          EXPECT_EQ(Texts(*s.table, c), expected[static_cast<std::size_t>(c)])
-              << c << " " << batch_size;
+  for (const bool narrow : {false, true}) {
+    const NarrowDecimalsFor narrowing(narrow);
+    const auto& engine_types = narrow ? narrow_types : wide_types;
+    for (const bool store_schema : {false, true}) {
+      for (const bool as_integers : {false, true}) {
+        SCOPED_TRACE(std::format("narrowing {}, ARROW:schema {}, integer storage {}", narrow,
+                                 store_schema, as_integers));
+        const std::string path =
+            Write(std::format("decimals_{}_{}.parquet", store_schema, as_integers), data, 2,
+                  store_schema, as_integers);
+        auto table = ParquetTable::Open({path}, ParquetTableOptions{});
+        ASSERT_TRUE(table.ok()) << table.status().ToString();
+        const auto& schema = *(*table)->schema();
+        for (std::size_t i = 0; i < engine_types.size(); ++i) {
+          EXPECT_TRUE(schema.field(static_cast<int>(i))->type()->Equals(*engine_types[i]))
+              << i << ": " << schema.field(static_cast<int>(i))->type()->ToString();
+        }
+        EXPECT_FALSE(plan::FromArrow(*schema.field(5)->type()).ok())
+            << "a 40-digit decimal stays unsupported";
+        for (const int64_t batch_size : {int64_t{1}, int64_t{3}}) {
+          const Scanned s = Scan(**table, {0, 1, 2, 3, 4}, batch_size);
+          ASSERT_NE(s.table, nullptr);
+          for (int c = 0; c < 5; ++c) {
+            EXPECT_EQ(Texts(*s.table, c), expected[static_cast<std::size_t>(c)])
+                << c << " " << batch_size;
+          }
         }
       }
     }

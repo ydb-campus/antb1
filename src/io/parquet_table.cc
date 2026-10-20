@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <format>
 #include <limits>
@@ -13,11 +14,13 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 #include <arrow/api.h>
 #include <arrow/io/file.h>
+#include <arrow/util/bit_util.h>
 #include <parquet/arrow/reader.h>
 #include <parquet/arrow/schema.h>
 #include <parquet/exception.h>
@@ -133,8 +136,11 @@ enum class Conversion : std::uint8_t {
   kUInt16ToDate32,  // ClickBench EventDate read as DATE
   kFloatToDouble,
   kDecimal32To128,   // a decimal of at most 38 digits that an ARROW:schema restores narrower or
-  kDecimal64To128,   // wider than decimal128 (ADR 0021): the engine reads every DECIMAL(p, s) as
-  kDecimal256To128,  // decimal128(p, s)
+  kDecimal64To128,   // wider than decimal128 (ADR 0021): the engine reads a DECIMAL(p, s) of more
+  kDecimal256To128,  // than 18 digits as decimal128(p, s)
+  kDecimal32To64,    // and one of at most 18 digits as decimal64(p, s), whose values move eight
+  kDecimal128To64,   // bytes instead of sixteen (ADR 0021's decimal64 item)
+  kDecimal256To64,
 };
 
 struct ConversionRule {
@@ -167,6 +173,15 @@ constexpr auto kConversionRules = std::to_array<ConversionRule>({
     {.storage = arrow::Type::DECIMAL256,
      .engine = arrow::Type::DECIMAL128,
      .conversion = Conversion::kDecimal256To128},
+    {.storage = arrow::Type::DECIMAL32,
+     .engine = arrow::Type::DECIMAL64,
+     .conversion = Conversion::kDecimal32To64},
+    {.storage = arrow::Type::DECIMAL128,
+     .engine = arrow::Type::DECIMAL64,
+     .conversion = Conversion::kDecimal128To64},
+    {.storage = arrow::Type::DECIMAL256,
+     .engine = arrow::Type::DECIMAL64,
+     .conversion = Conversion::kDecimal256To64},
     // Column overrides (--column-type COL=DATE, --clickbench).
     {.storage = arrow::Type::INT32, .engine = arrow::Type::DATE32, .conversion = Conversion::kView},
     {.storage = arrow::Type::UINT16,
@@ -227,6 +242,61 @@ arrow::Result<std::shared_ptr<arrow::Array>> Decimal256To128(
                                                  data.null_count, data.offset));
 }
 
+// A decimal of at most 18 digits -> decimal64 of the same precision and scale (ADR 0021's
+// decimal64 item): the value is its low 64 bits, and the rest of it has to be the sign extension of
+// those, which is where the check below comes from.
+//
+// The check is a guard, and measurement says it is unreachable for a conforming file. Every
+// Parquet storage of a decimal is sized to the column's precision, so none of them can carry a
+// value an int64 does not hold once the precision is at most 18 digits: INT32 is four bytes, INT64
+// is eight, and a FIXED_LEN_BYTE_ARRAY's own length is derived from the precision -- 2 bytes at
+// p=4, 4 at p=9, 7 at p=15 and 8 at p=18, measured against this environment's Parquet writer, with
+// 9 bytes only from p=19 upward, which does not narrow. So narrowing is lossless by the storage's
+// width rather than by trusting the declared precision, and even a value beyond that precision
+// survives -- because it had to fit the storage to exist.
+//
+// What is left is a BYTE_ARRAY decimal, whose length is not fixed, carrying more bytes than its
+// precision implies: a malformed file. That one names the column instead of truncating the value.
+// Nothing in the suite constructs it, so dropping this check fails no test -- which is why the
+// comment says what it is for rather than leaving a reader to infer a hazard that conforming files
+// do not have.
+//
+// A NULL's value bytes are not guaranteed to be anything, so a NULL row is skipped rather than
+// checked; its value stays the zero every conversion here leaves.
+template <std::size_t kIn>
+arrow::Result<std::shared_ptr<arrow::Array>> DecimalToInt64(
+    const arrow::ArrayData& data, const std::shared_ptr<arrow::DataType>& type,
+    std::string_view column, arrow::MemoryPool* pool) {
+  static_assert(kIn >= sizeof(int64_t), "a narrower decimal widens instead");
+  const int64_t end = data.offset + data.length;
+  ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Buffer> values,
+                        arrow::AllocateBuffer(end * Narrow<int64_t>(sizeof(int64_t)), pool));
+  const std::span<int64_t> out = values->mutable_span_as<int64_t>();
+  std::ranges::fill(out, int64_t{0});
+  // Scans never convert empty batches (they are skipped), so the values buffer exists.
+  const std::span<const uint8_t> in(data.GetValues<uint8_t>(1, 0), Narrow<std::size_t>(end) * kIn);
+  const uint8_t* const valid = data.buffers[0] != nullptr ? data.buffers[0]->data() : nullptr;
+  for (auto i = Narrow<std::size_t>(data.offset); i < Narrow<std::size_t>(end); ++i) {
+    if (valid != nullptr && !arrow::bit_util::GetBit(valid, i)) {
+      continue;
+    }
+    int64_t low = 0;
+    std::memcpy(&low, in.data() + (i * kIn), sizeof(low));
+    const auto fill = static_cast<uint8_t>(low < 0 ? 0xFF : 0x00);
+    for (std::size_t byte = sizeof(low); byte < kIn; ++byte) {
+      if (in[(i * kIn) + byte] != fill) {
+        return arrow::Status::Invalid(
+            "a value of column '", column, "' does not fit ", type->ToString(),
+            ": the column is stored as a byte array, which can hold a value its own declared "
+            "precision does not admit");
+      }
+    }
+    out[i] = low;
+  }
+  return arrow::MakeArray(arrow::ArrayData::Make(type, data.length, {data.buffers[0], values},
+                                                 data.null_count, data.offset));
+}
+
 // large_binary (or large_utf8) -> binary: rebases the 64-bit offsets onto the first value and
 // narrows them to 32 bits; the value bytes are shared.
 arrow::Result<std::shared_ptr<arrow::Array>> LargeToBinary(const arrow::ArrayData& data,
@@ -263,6 +333,7 @@ arrow::Result<std::shared_ptr<arrow::Array>> LargeToBinary(const arrow::ArrayDat
 arrow::Result<std::shared_ptr<arrow::Array>> Convert(const std::shared_ptr<arrow::Array>& array,
                                                      Conversion conversion,
                                                      const std::shared_ptr<arrow::DataType>& type,
+                                                     std::string_view column,
                                                      arrow::MemoryPool* pool) {
   switch (conversion) {
     case Conversion::kNone:
@@ -281,6 +352,12 @@ arrow::Result<std::shared_ptr<arrow::Array>> Convert(const std::shared_ptr<arrow
       return Widen<int64_t, arrow::Decimal128>(*array->data(), type, pool);
     case Conversion::kDecimal256To128:
       return Decimal256To128(*array->data(), type, pool);
+    case Conversion::kDecimal32To64:  // four bytes into eight: no value of one fails to fit
+      return Widen<int32_t, int64_t>(*array->data(), type, pool);
+    case Conversion::kDecimal128To64:
+      return DecimalToInt64<16>(*array->data(), type, column, pool);
+    case Conversion::kDecimal256To64:
+      return DecimalToInt64<32>(*array->data(), type, column, pool);
   }
   return arrow::Status::Invalid("unknown conversion");
 }
@@ -415,8 +492,9 @@ class ScanReader final : public arrow::RecordBatchReader {
     for (std::size_t i = 0; i < columns_.size(); ++i) {
       const Column& column = columns_[i];
       const std::shared_ptr<arrow::Array>& array = batch.column(Narrow<int>(i));
-      ARROW_ASSIGN_OR_RAISE(auto converted, Convert(array, column.conversion,
-                                                    schema_->field(Narrow<int>(i))->type(), pool_));
+      const std::shared_ptr<arrow::Field>& field = schema_->field(Narrow<int>(i));
+      ARROW_ASSIGN_OR_RAISE(auto converted,
+                            Convert(array, column.conversion, field->type(), field->name(), pool_));
       arrays.push_back(std::move(converted));
     }
     return arrow::RecordBatch::Make(schema_, batch.num_rows(), std::move(arrays));
