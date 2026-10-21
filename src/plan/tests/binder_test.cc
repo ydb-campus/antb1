@@ -3703,7 +3703,10 @@ TEST(BinderTest, ASemiJoinOverOneRelationRunsOnItsBranch) {
                 .on_top = false,
                 .why = "7 rows under a join estimated to output more"},
            // The guard against moving it onto more rows than it would see above: `t` holds 100,
-           // and this join of 100 rows and 7 over a wide key domain outputs fewer than either.
+           // and this join of 100 rows and 7 outputs fewer than either, because `t.i16` declares a
+           // domain of 100 (plan_test_util.h). That the domain is DECLARED is the point of the
+           // case: an estimator that stands a relation's rows in for an unknown domain reaches the
+           // same number here by accident, and this guard then rests on nothing.
            Case{.sql = "SELECT COUNT(*) FROM t, ok WHERE t.i16 = ok.i16 AND t.i32 IN (SELECT "
                        "i16 FROM ok)",
                 .on_top = true,
