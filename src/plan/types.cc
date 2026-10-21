@@ -45,8 +45,9 @@ std::ostream& operator<<(std::ostream& os, LogicalType type) { return os << ToSt
 
 namespace {
 
-// See types.h: transitional, off by default, and read from several threads of a running query.
-std::atomic<bool> narrow_decimals{false};
+// See types.h: transitional, on by default as of ADR 0021's decimal64 step, and read from several
+// threads of a running query.
+std::atomic<bool> narrow_decimals{true};
 
 }  // namespace
 

@@ -1,7 +1,6 @@
 #include "antb1/io/parquet_table.h"
 
 #include <algorithm>
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -268,30 +267,73 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecimalToInt64(
     const arrow::ArrayData& data, const std::shared_ptr<arrow::DataType>& type,
     std::string_view column, arrow::MemoryPool* pool) {
   static_assert(kIn >= sizeof(int64_t), "a narrower decimal widens instead");
+  static_assert(kIn % sizeof(int64_t) == 0, "a decimal is a whole number of 64-bit words");
+  constexpr std::size_t kWords = kIn / sizeof(int64_t);
   const int64_t end = data.offset + data.length;
   ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Buffer> values,
                         arrow::AllocateBuffer(end * Narrow<int64_t>(sizeof(int64_t)), pool));
   const std::span<int64_t> out = values->mutable_span_as<int64_t>();
-  std::ranges::fill(out, int64_t{0});
+  // Only the rows this batch owns are written, so the slice's prefix is zeroed rather than left as
+  // whatever the allocator held: nothing reads it, but it is handed to Arrow. It is empty for the
+  // batches a scan produces, which have no offset.
+  std::ranges::fill(out.first(Narrow<std::size_t>(data.offset)), int64_t{0});
   // Scans never convert empty batches (they are skipped), so the values buffer exists.
   const std::span<const uint8_t> in(data.GetValues<uint8_t>(1, 0), Narrow<std::size_t>(end) * kIn);
   const uint8_t* const valid = data.buffers[0] != nullptr ? data.buffers[0]->data() : nullptr;
-  for (auto i = Narrow<std::size_t>(data.offset); i < Narrow<std::size_t>(end); ++i) {
-    if (valid != nullptr && !arrow::bit_util::GetBit(valid, i)) {
-      continue;
-    }
-    int64_t low = 0;
-    std::memcpy(&low, in.data() + (i * kIn), sizeof(low));
-    const auto fill = static_cast<uint8_t>(low < 0 ? 0xFF : 0x00);
-    for (std::size_t byte = sizeof(low); byte < kIn; ++byte) {
-      if (in[(i * kIn) + byte] != fill) {
-        return arrow::Status::Invalid(
-            "a value of column '", column, "' does not fit ", type->ToString(),
-            ": the column is stored as a byte array, which can hold a value its own declared "
-            "precision does not admit");
+  // The low word IS the value; the words above it must be its sign extension, which is one 64-bit
+  // comparison each rather than kIn - 8 byte comparisons. This runs over every value of every
+  // narrowed column of a scan that pushes no predicate, so what it costs is what the
+  // representation costs on that path (ADR 0021's decimal64 item).
+  const auto word_at = [&](std::size_t row, std::size_t word) {
+    int64_t value = 0;
+    std::memcpy(&value, in.data() + (row * kIn) + (word * sizeof(value)), sizeof(value));
+    return value;
+  };
+  // One 64-bit load a word, rather than a copy of the whole value into a stack array that the
+  // optimizer then has to see through: the loads are the only thing this needs, so it asks for
+  // them directly.
+  const auto narrow_row = [&](std::size_t row, int64_t* low) {
+    *low = word_at(row, 0);
+    const int64_t sign = *low < 0 ? -1 : 0;  // the two's complement fill of the low word
+    for (std::size_t w = 1; w < kWords; ++w) {
+      if (word_at(row, w) != sign) {
+        return false;
       }
     }
-    out[i] = low;
+    return true;
+  };
+  const auto does_not_fit = [&] {
+    return arrow::Status::Invalid(
+        "a value of column '", column, "' does not fit ", type->ToString(),
+        ": the column is stored as a byte array, which can hold a value its own declared "
+        "precision does not admit");
+  };
+  const auto begin = Narrow<std::size_t>(data.offset);
+  const auto stop = Narrow<std::size_t>(end);
+  // Split so that the common column -- no NULLs at all -- pays no validity test a row.
+  if (valid == nullptr || data.null_count == 0) {
+    for (std::size_t i = begin; i < stop; ++i) {
+      if (!narrow_row(i, &out[i])) {
+        return does_not_fit();
+      }
+    }
+  } else {
+    // A NULL's value bytes are not guaranteed to be anything, so a NULL row is neither checked nor
+    // read: it gets the zero every conversion here leaves. Both halves of that are guards no test
+    // reaches, and deliberately so -- dropping either passes the suite. Reading a NULL row would
+    // raise the error above for a conforming file whenever those bytes happened not to be a sign
+    // extension, and leaving the slot unwritten would hand Arrow whatever the allocator held. What
+    // makes them unreachable is that this environment's reader zeroes a NULL slot; nothing in the
+    // format promises it.
+    for (std::size_t i = begin; i < stop; ++i) {
+      if (!arrow::bit_util::GetBit(valid, i)) {
+        out[i] = 0;
+        continue;
+      }
+      if (!narrow_row(i, &out[i])) {
+        return does_not_fit();
+      }
+    }
   }
   return arrow::MakeArray(arrow::ArrayData::Make(type, data.length, {data.buffers[0], values},
                                                  data.null_count, data.offset));

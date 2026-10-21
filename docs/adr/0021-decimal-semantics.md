@@ -472,16 +472,34 @@ with exit code 4. The PR ids are the roadmap's, not divergence ids.
       - **Where that leaves it.** SF 10 one thread geomean **0.984x**, four threads **0.991x**; SF 100 four
         threads over 22 queries **0.995x**. Peak memory falls everywhere it moves at all: 0.868x on SF 10's
         heaviest query (3765 MiB to 3267), and at SF 100 Q02 0.81x, Q09 down 636 MiB, Q05 down 338 MiB.
-      - **What defers the flip** is a consistent 2 to 8% regression at SF 100 on the join-heavy queries,
-        measured at five repeats with non-overlapping spreads: Q05 1.078x, Q12 1.039x, Q09 1.032x, Q21
-        1.022x, Q18 1.012x. **It is not explained.** Two hypotheses were tested and both are wrong: the
-        gather is 0.90x at the narrow width (a micro-benchmark of exactly what `gather.cc` does), and the
-        memory budget's heuristics are not reacting to the lower usage -- with an explicit identical limit on
-        both arms Q05 still reads 5.73 s against 6.12 s. Flipping the default on an unexplained regression is
-        not a trade worth making for a memory saving that will still be there once it is understood.
-      - **Next**, in order: find Q05's 6.7%; then flip; then delete the switch, and with it
-        `NarrowDecimalsFor`, the two-arm cases that exist only to compare the widths, and the wide arms a
-        p <= 18 type can no longer take.
+      - **The join-heavy regression was the unfiltered scan's narrowing pass, found with a sampling
+        profiler after two hypotheses had been refuted by measurement.** It cost 2 to 8% at SF 100 on five
+        queries (Q05 1.078x at five repeats with non-overlapping spreads). The gather was not it -- a
+        micro-benchmark of exactly what `gather.cc` does is 0.90x at the narrow width -- and neither were
+        the memory budget's heuristics reacting to the lower usage, since with an explicit identical limit on
+        both arms Q05 still read 5.73 s against 6.12 s. `sample` over both arms settled it in one run:
+        `io::Convert` took 4.9% of samples in the narrow arm and does not appear in the wide one at all.
+        - **The asymmetry is which scan path a query takes.** A scan that pushes a predicate decodes
+          Parquet's INT64 straight into int64 slots and narrows for free; a scan that pushes none goes
+          through Arrow's Parquet reader, which produces decimal128, and every value is then narrowed in a
+          pass of its own. Q06 and Q01 push predicates on lineitem and so never paid it; Q05 pushes none
+          and paid it over 600 million rows of two columns.
+        - **Making that pass cheap recovered most of it**: Q05 1.078x to 1.007x, Q09 1.032x to 1.008x, Q21
+          1.022x to 1.000x. The loop zeroed its whole output buffer before writing it, and tested the high
+          bytes of each value one byte at a time; it now writes each row once and compares whole 64-bit
+          words, with the validity test hoisted out of the loop for a column that has no NULLs.
+      - **Accepted, and the default is on.** SF 100, four threads, 22 queries, three repeats interleaved:
+        geomean **0.985x**, total 0.992x. SF 10, one thread: geomean **0.984x**, total 0.989x. Peak memory
+        falls wherever it moves: **0.765x** on Q01 at SF 100 (362 MiB to 277), 0.79x on Q02, Q09 down 577
+        MiB, and 0.866x on SF 10's heaviest query. The largest single gains are Q06 at 0.804x and Q01 at
+        0.948x, both from paths this item had to own because Arrow's decimal64 support is younger than its
+        decimal128 support.
+      - **What is still slower**, and small enough to accept with the memory saving: Q05 1.018x, Q07 1.018x,
+        Q21 1.013x, Q18 1.009x, Q09 1.008x at SF 100. Q05's remainder is the same conversion pass, now
+        cheaper rather than gone -- removing it altogether means decoding Parquet without Arrow's
+        Parquet-to-Arrow transfer on the unfiltered path too, which is a larger change than this item.
+      - **Next**: delete the switch, and with it `NarrowDecimalsFor`, the two-arm cases that exist only to
+        compare the widths, and the wide arms a p <= 18 type can no longer take.
     - **N4, docs(adr): record what N1 to N3 measured**, and accept or defer the rest on those numbers.
 
 ## Alternatives considered

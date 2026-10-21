@@ -86,10 +86,11 @@ std::shared_ptr<arrow::DataType> ToArrow(LogicalType type);
 // of at most LogicalType::kMaxNarrowDecimalWidth digits maps to decimal64 instead of decimal128,
 // which halves the bytes each of its values moves.
 //
-// Off by default, and it must stay off until the rest of that item lands: nothing in the engine
-// reads a decimal64 array yet, so turning it on now makes every decimal path fail its
-// physical-type check instead of answering. That is deliberate -- the checks went in first for
-// exactly this -- but it is not a configuration anyone should pick.
+// ON by default as of this step, on a measurement: at SF 100 over the 22 TPC-H-derived queries the
+// geomean is 0.985x of decimal128 and peak memory falls as far as 0.765x on one of them. Off is
+// kept for one PR longer, so that a regression attributable to the representation can be confirmed
+// by flipping one call rather than by reverting a merge; it is not a configuration to build on,
+// since the wide arms of the cases that compare the two widths go away with the switch.
 //
 // Set once, before a query runs. It is atomic because ToArrow is called from the part pipelines of
 // a running query, and relaxed because nothing orders anything against it. It goes away with the
