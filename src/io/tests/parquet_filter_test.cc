@@ -1,6 +1,7 @@
 // ParquetTable::ScanPart with a plan::ScanFilter (docs/adr/0020-filter-pushdown.md): the rows of
 // the part that pass the filter, as ScanPart without one returns them, in the same order.
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -61,6 +62,30 @@ class TestFilter final : public plan::ScanFilter {
     if (fail_) {
       return arrow::Status::Invalid("the filter failed");
     }
+    if (values.array == nullptr) {
+      // A string column: did the scan offer the chunk's dictionary (ADR 0020)? Recorded so a case
+      // can say which path it exercised, and checked here against the views, which are filled
+      // either way -- a dictionary whose indices disagreed with them would answer differently in
+      // the engine and identically in this double.
+      if (values.dictionary.empty()) {
+        saw_views_ = true;
+      } else {
+        saw_dictionary_ = true;
+        EXPECT_EQ(values.indices.size(), static_cast<std::size_t>(values.rows));
+        for (int64_t i = 0; i < values.rows; ++i) {
+          if (values.validity != nullptr &&
+              !arrow::bit_util::GetBit(values.validity, static_cast<std::uint64_t>(i))) {
+            continue;
+          }
+          const auto index = static_cast<std::size_t>(values.indices[static_cast<std::size_t>(i)]);
+          EXPECT_LT(index, values.dictionary.size());
+          if (index < values.dictionary.size()) {
+            EXPECT_EQ(values.dictionary[index], values.strings[static_cast<std::size_t>(i)])
+                << "the dictionary index disagrees with the view at row " << i;
+          }
+        }
+      }
+    }
     for (int64_t i = 0; i < values.rows; ++i) {
       const auto bit = static_cast<std::uint64_t>(offset + i);
       if (!arrow::bit_util::GetBit(selected, bit)) {
@@ -75,6 +100,8 @@ class TestFilter final : public plan::ScanFilter {
   }
 
   void Fail() { fail_ = true; }
+  [[nodiscard]] bool saw_dictionary() const { return saw_dictionary_; }
+  [[nodiscard]] bool saw_views() const { return saw_views_; }
 
   static Value ValueOf(const arrow::Array& array, int64_t i) {
     Value v;
@@ -125,6 +152,8 @@ class TestFilter final : public plan::ScanFilter {
   std::vector<int> columns_;
   std::vector<Predicate> predicates_;
   bool fail_ = false;
+  mutable bool saw_dictionary_ = false;
+  mutable bool saw_views_ = false;
 };
 
 constexpr int64_t kRows = 3000;
@@ -405,6 +434,44 @@ TEST_P(ParquetFilterTest, ReturnsTheRowsThatPassAsAScanWithoutAFilter) {
 
 // A projection in another order, a filter on a column not output first, and no column at all
 // but the filter's (rows counted only through a filter column).
+// Which read a string column takes, per encoding (ADR 0020). The three cases above compare the
+// filtered scan against the unfiltered one for every encoding, so the dictionary read is already
+// checked to ANSWER the same; what this adds is that it happens at all -- without it the read
+// could stop being taken and every case would still pass, just slower.
+//
+// Arrow grants the dictionary only for a chunk it can prove is fully dictionary-encoded, from the
+// optional encoding_stats metadata: so a dictionary-encoded file written by Arrow gets it, a
+// plain-encoded one does not, and one whose writer fell back to plain partway does not either --
+// which is the case that would otherwise throw, since ReadBatchWithDictionary refuses a plain page
+// rather than degrading.
+TEST_P(ParquetFilterTest, AStringColumnTakesTheDictionaryReadWhenArrowGrantsIt) {
+  const auto table = Open(Write(GetParam()));
+  const std::vector<int> fields = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+  // Column 4 of the scan is the VARCHAR one the string cases read.
+  const std::vector<Case> cases = Cases();  // held: find_if over a temporary dangles
+  const auto found =
+      std::ranges::find_if(cases, [](const Case& c) { return c.name == "string_contains"; });
+  ASSERT_NE(found, cases.end());
+  const Case& text = *found;
+  auto filter = std::make_shared<TestFilter>(text.columns, text.predicates);
+  auto filtered = table->ScanPart(0, fields, 1000, arrow::default_memory_pool(), filter);
+  ASSERT_TRUE(filtered.ok()) << filtered.status().ToString();
+  const auto rows = Drain(**filtered, 1000);
+  ASSERT_NE(rows, nullptr);
+  EXPECT_TRUE(filter->saw_dictionary() || filter->saw_views()) << "the filter saw no string column";
+  if (GetParam() == Encoding::kDictionary) {
+    EXPECT_TRUE(filter->saw_dictionary())
+        << "a fully dictionary-encoded chunk was read as values, so the predicate is being asked "
+           "once a row rather than once a distinct value";
+    EXPECT_FALSE(filter->saw_views());
+  } else {
+    EXPECT_FALSE(filter->saw_dictionary())
+        << "Arrow exposed a dictionary for a chunk with a plain data page, which "
+           "ReadBatchWithDictionary cannot read";
+    EXPECT_TRUE(filter->saw_views());
+  }
+}
+
 TEST_P(ParquetFilterTest, AnyProjection) {
   const auto table = Open(Write(GetParam()));
   const std::vector<int> fields = {7, 3, 6};

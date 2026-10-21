@@ -99,7 +99,37 @@ Proposed
   - parts of several files.
 
   They also check that a corrupt page is an IOError naming the file.
-- **Deferred** until a dataset needs them (the ClickBench files have no page index and large pages, and their long
-  strings are mostly plain-encoded, so neither would gain much there):
-  - **skipping pages by statistics** (granularity 2), for files written with page indexes and smaller pages;
-  - **evaluating string predicates once per dictionary entry** for dictionary-encoded pages.
+- **Deferred** until a dataset needs it (the ClickBench files have no page index and large pages):
+  - **skipping pages by statistics** (granularity 2), for files written with page indexes and smaller pages.
+- **Evaluating a string predicate once per dictionary entry: built 2026-10-21**, and the shape it had to take is
+  worth recording because the obvious form of it is not available.
+  - **Arrow 25 will expose a column chunk's dictionary only for a chunk it can prove is fully dictionary
+    encoded, and it proves that from the optional `encoding_stats` metadata alone.** Measured: the
+    TPC-H-derived files on hand carry no `encoding_stats`, so both doors --
+    `RowGroupReader::ColumnWithExposeEncoding` and `RecordReaderWithExposeEncoding` -- decline for them, even
+    though their `encodings` list is `PLAIN_DICTIONARY` with no `PLAIN` at all, which for a v1 writer proves
+    every data page is dictionary encoded. Files Arrow itself wrote, including this repository's fixtures,
+    do carry it and are granted. A gate of our own is worse than useless there: Arrow's is the one that
+    decides whether `ReadBatchWithDictionary` throws, and it throws rather than degrading on the first
+    plain-encoded page, so the only sound sequence is to ask and read back the answer.
+  - So **two paths, and the measurement is what justifies keeping both.** Where Arrow grants the dictionary,
+    `plan::ScanValues` carries it with one index per row and `exec`'s scan filter asks each predicate once per
+    distinct value -- every kind of predicate, LIKE included, since a dictionary says nothing about what is
+    being asked. Where it does not, the per-row path got faster on its own account: a short `IN` list is now
+    walked with a length test first rather than binary-searched, because the search calls `std::less<>` on
+    string views, which is an out-of-line `memcmp`. Over a seven-value CHAR column, 20M rows: **12.5 ns a row
+    for the search, 5.6 for the walk, 0.19 through the dictionary.**
+  - **Measured end to end** at SF 100, four threads, three repeats interleaved: the bare predicate over 600
+    million rows 3.37 s to 2.21 s (**0.655x**), Q12 **0.775x** and Q19 0.922x, geomean 0.989x over the 22
+    queries. Q12 was the worst query against DuckDB at 3.35x of its time and is now 2.60x. Q3, Q7, Q8 and Q14
+    looked up at three repeats and come out at 1.004x over five -- noise.
+  - **The dictionary pointer the reader hands back is not stable across the pieces of one column chunk**,
+    although the format gives a chunk one dictionary page. That was found by asserting the opposite: the views
+    were first cached and rebuilt when the pointer changed, a reviewer pointed out that an equal pointer does
+    not mean equal values once a dictionary has been freed and its successor allocated over it, and an
+    ANTB1_CHECK written to pin "one dictionary per reader" fired on the first run. So the comparison had never
+    skipped a rebuild, and the views are now rebuilt every piece -- the same work, without the reasoning.
+  - **Only the per-row path reached the data that motivated the work**, which is the honest reading: the
+    dictionary path is exercised by the fixtures and by any file from a writer that emits `encoding_stats`.
+    Reaching it for the rest means decoding the pages without Arrow's reader, which is a larger decision than
+    this item and the same one ADR 0021's residual narrowing pass wants.

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -46,6 +47,41 @@ void KeepStrings(const plan::ScanValues& values, int64_t offset, std::uint8_t* s
       arrow::bit_util::ClearBit(selected, offset + i);
     }
   }
+}
+
+// The same, evaluating `test` once per distinct value of the chunk's dictionary and then reading
+// one index a row. Every predicate kind gets this and none of them knows about it: a dictionary
+// says nothing about what is being asked of a value, only that the same value recurs (ADR 0020).
+//
+// Taken only when there are no more distinct values than rows in the piece. The dictionary belongs
+// to the whole column chunk while a piece is at most a page of it, so a dictionary far larger than
+// the piece would cost more evaluations than the rows it saves -- the one shape where asking per
+// value is the slower question.
+template <class Test>
+bool KeepByDictionary(const plan::ScanValues& values, int64_t offset, std::uint8_t* selected,
+                      const Test& test) {
+  if (values.dictionary.empty() || values.indices.size() != static_cast<std::size_t>(values.rows) ||
+      std::cmp_greater(values.dictionary.size(), values.rows)) {
+    return false;
+  }
+  // A byte a value, not std::vector<bool>: this is read once a row, and a bit-packed read costs a
+  // shift and a mask where a byte costs a load. The allocation is one per piece per predicate,
+  // against a piece of up to a page of rows.
+  std::vector<std::uint8_t> matches(values.dictionary.size());
+  for (std::size_t d = 0; d < values.dictionary.size(); ++d) {
+    matches[d] = static_cast<std::uint8_t>(test(values.dictionary[d]) ? 1 : 0);
+  }
+  for (int64_t i = 0; i < values.rows; ++i) {
+    if (!BitAt(selected, offset + i)) {
+      continue;
+    }
+    const auto row = static_cast<std::size_t>(i);
+    if ((values.validity != nullptr && !BitAt(values.validity, i)) ||
+        matches[static_cast<std::size_t>(values.indices[row])] == 0) {
+      arrow::bit_util::ClearBit(selected, offset + i);
+    }
+  }
+  return true;
 }
 
 // One predicate on a VARCHAR column, evaluated on views.
@@ -92,7 +128,11 @@ class StringPredicate {
 
   void Apply(const plan::ScanValues& values, int64_t offset, std::uint8_t* selected) const {
     const std::string_view c = constant_;
-    const auto keep = [&](const auto& test) { KeepStrings(values, offset, selected, test); };
+    const auto keep = [&](const auto& test) {
+      if (!KeepByDictionary(values, offset, selected, test)) {
+        KeepStrings(values, offset, selected, test);
+      }
+    };
     switch (kind_) {
       case Kind::kCompare:
         switch (op_) {
@@ -123,14 +163,10 @@ class StringPredicate {
         keep([this](std::string_view v) { return !pattern_->Matches(v); });
         break;
       case Kind::kIn:
-        keep([this](std::string_view v) {
-          return std::ranges::binary_search(values_, v, std::less<>());
-        });
+        keep([this](std::string_view v) { return Holds(v); });
         break;
       case Kind::kNotIn:
-        keep([this](std::string_view v) {
-          return !std::ranges::binary_search(values_, v, std::less<>());
-        });
+        keep([this](std::string_view v) { return !Holds(v); });
         break;
       default:  // kIsNotNull: NULL fails
         keep([](std::string_view) { return true; });
@@ -139,6 +175,24 @@ class StringPredicate {
   }
 
  private:
+  // Whether the IN list holds `v`. A short list is walked rather than searched: a binary search
+  // calls std::less<> on string_views, which is an out-of-line memcmp, where a length test rejects
+  // most candidates before any byte is read. Measured over a seven-value CHAR column, 20M rows:
+  // 12.5 ns a row for the search against 5.6 for the walk. The search wins again once the list is
+  // long enough for log2(n) comparisons to beat n length tests, so both are kept and the list's
+  // size chooses -- and where the column's dictionary is available neither runs more than once per
+  // distinct value (KeepByDictionary).
+  [[nodiscard]] bool Holds(std::string_view v) const {
+    if (values_.size() > kLinearValues) {
+      return std::ranges::binary_search(values_, v, std::less<>());
+    }
+    return std::ranges::any_of(values_, [v](const std::string& candidate) {
+      return candidate.size() == v.size() && std::memcmp(candidate.data(), v.data(), v.size()) == 0;
+    });
+  }
+
+  static constexpr std::size_t kLinearValues = 8;
+
   Kind kind_ = Kind::kIsNotNull;
   plan::CompareOp op_ = plan::CompareOp::kEq;
   std::string constant_;                // kCompare
