@@ -590,15 +590,18 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
     if (levels <= 0) {
       return arrow::Status::IOError("a column chunk holds fewer rows than its row group");
     }
-    // One dictionary page per chunk, so this is the same pointer for every piece of it; the views
-    // are rebuilt only when it changes, which is once.
-    if (dict != dict_ || std::cmp_not_equal(dict_views_.size(), dict_len)) {
-      dict_ = dict;
-      dict_views_.resize(static_cast<std::size_t>(dict_len));
-      for (std::int32_t d = 0; d < dict_len; ++d) {
-        dict_views_[static_cast<std::size_t>(d)] =
-            std::string_view(reinterpret_cast<const char*>(dict[d].ptr), dict[d].len);
-      }
+    // Rebuilt every piece, and there is nothing here to cache. The pointer the reader hands back
+    // is NOT stable across the pieces of one column chunk, which an ANTB1_CHECK of the opposite
+    // established in one run -- so "the pointer is unchanged, keep the views" was never skipping
+    // work in the first place, and comparing pointers to decide was unsound into the bargain: a
+    // freed dictionary and its successor can share an address, and an equal pointer would then
+    // mean different values in the same place, with the views reading whatever replaced them and
+    // the filter answering from that. This costs what the comparison already cost and owes no
+    // argument.
+    dict_views_.resize(static_cast<std::size_t>(dict_len));
+    for (std::int32_t d = 0; d < dict_len; ++d) {
+      dict_views_[static_cast<std::size_t>(d)] =
+          std::string_view(reinterpret_cast<const char*>(dict[d].ptr), dict[d].len);
     }
     views_.resize(static_cast<std::size_t>(levels));
     piece_nulls_ = indices_read < levels;
@@ -759,10 +762,8 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
   int64_t batch_size_;
   arrow::MemoryPool* pool_;
   std::shared_ptr<const plan::ScanFilter> filter_;
-  // The chunk's dictionary, and one index per row of the piece: filled only by the dictionary
-  // read. dict_ is the pointer the reader last handed over, which is how a rebuild is skipped for
-  // every piece after the first.
-  const parquet::ByteArray* dict_ = nullptr;
+  // The dictionary of the piece just read, as views, and one index per row of it: filled only by
+  // the dictionary read, and rebuilt each time so that no view outlives the bytes it points at.
   std::vector<std::string_view> dict_views_;
   std::vector<std::int32_t> indices_;
   bool positions_ = false;         // a last column with the rows' positions in the row group

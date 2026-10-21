@@ -123,6 +123,12 @@ Proposed
     million rows 3.37 s to 2.21 s (**0.655x**), Q12 **0.775x** and Q19 0.922x, geomean 0.989x over the 22
     queries. Q12 was the worst query against DuckDB at 3.35x of its time and is now 2.60x. Q3, Q7, Q8 and Q14
     looked up at three repeats and come out at 1.004x over five -- noise.
+  - **The dictionary pointer the reader hands back is not stable across the pieces of one column chunk**,
+    although the format gives a chunk one dictionary page. That was found by asserting the opposite: the views
+    were first cached and rebuilt when the pointer changed, a reviewer pointed out that an equal pointer does
+    not mean equal values once a dictionary has been freed and its successor allocated over it, and an
+    ANTB1_CHECK written to pin "one dictionary per reader" fired on the first run. So the comparison had never
+    skipped a rebuild, and the views are now rebuilt every piece -- the same work, without the reasoning.
   - **Only the per-row path reached the data that motivated the work**, which is the honest reading: the
     dictionary path is exercised by the fixtures and by any file from a writer that emits `encoding_stats`.
     Reaching it for the rest means decoding the pages without Arrow's reader, which is a larger decision than

@@ -64,9 +64,12 @@ bool KeepByDictionary(const plan::ScanValues& values, int64_t offset, std::uint8
       std::cmp_greater(values.dictionary.size(), values.rows)) {
     return false;
   }
-  std::vector<bool> matches(values.dictionary.size());
+  // A byte a value, not std::vector<bool>: this is read once a row, and a bit-packed read costs a
+  // shift and a mask where a byte costs a load. The allocation is one per piece per predicate,
+  // against a piece of up to a page of rows.
+  std::vector<std::uint8_t> matches(values.dictionary.size());
   for (std::size_t d = 0; d < values.dictionary.size(); ++d) {
-    matches[d] = test(values.dictionary[d]);
+    matches[d] = static_cast<std::uint8_t>(test(values.dictionary[d]) ? 1 : 0);
   }
   for (int64_t i = 0; i < values.rows; ++i) {
     if (!BitAt(selected, offset + i)) {
@@ -74,7 +77,7 @@ bool KeepByDictionary(const plan::ScanValues& values, int64_t offset, std::uint8
     }
     const auto row = static_cast<std::size_t>(i);
     if ((values.validity != nullptr && !BitAt(values.validity, i)) ||
-        !matches[static_cast<std::size_t>(values.indices[row])]) {
+        matches[static_cast<std::size_t>(values.indices[row])] == 0) {
       arrow::bit_util::ClearBit(selected, offset + i);
     }
   }
