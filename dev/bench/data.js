@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792589238451,
+  "lastUpdate": 1792599726598,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -17712,6 +17712,258 @@ window.BENCHMARK_DATA = {
             "value": 2495.417906,
             "unit": "ms/iter",
             "extra": "iterations: 1\ncpu: 2495.010756999996 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "db3d958470518ddd642cf1182e3f8a37ddc4426f",
+          "message": "perf(exec): order a scan's filter columns by cost over what they remove (#213)\n\n## Summary\n\nThe scan applies the filter's columns one at a time, each narrowing the\nselection the next one sees, so a column\nplaced late does its per-row predicate work only over the rows the\nearlier ones left. The order was the order the\npredicates appeared in the `WHERE` clause, so **the spelling of a query\ndecided its cost**: one filter over 600\nmillion rows at four threads, two bounds on a DATE column and a\ntwo-value `IN` on a VARCHAR one, ran **1.102 s\nwritten dates-first and 2.507 s written the other way round, a 2.28x\npenalty for a reordering that changes no\nanswer.** Both spellings now read 1.103 s.\n\n`MakeScanFilter` stably sorts its columns by Hellerstein and\nStonebraker's rank for a conjunction -- ascending\ncost over the fraction removed -- compared as a cross product so that no\ndivision and no floating point enters a\nplanning decision. This is the choke point Dreseler et al. call\npredicate positioning (PVLDB 13(8)), the second\nlargest in their Table 3.\n\n**Only the work a late position avoids belongs in the weight**, which is\nnarrower than it looks, and a\nmeasurement corrected the first model I wrote here. `io` reads every row\nof every one of the filter's columns\nwhatever the selection says, and a fixed-width column's predicate is an\nArrow kernel over the whole array, so\nneither its decode nor its predicate moves with its position. A\nfixed-width column therefore belongs **first**\neven when it removes far less than a VARCHAR one: measured **2.13 s with\nit first against 2.30 s with it last**.\nThe first model charged every column its read and ordered that pair the\nother way round -- 8% slower -- and one\nof my own tests pinned the slower order until the measurement settled\nit.\n\n**No order can change an answer**, because every predicate only clears\nbits of one shared selection, so this\nitem is testable by the order alone and the existing\nequivalence-with-the-Filter-operator test covers the\nanswers under any permutation.\n\nCloses #\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [x] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run ci                 # clang Debug -Werror + the hermetic suite\n100% tests passed out of 2810\n\n$ pixi run test\nANTB1-TESTS: PASS preset=dev junit=build/dev/junit.xml\n\n$ ANTB1_DIFF_SEED=20261021 pixi run diff-random\nDIFF: PASS seed=20261021 queries=2000 failed=0 unsupported=0\n\n$ pixi run lint\nclang-format, gersemi, ruff, tombi, markdownlint, typos, zizmor, check_repo.py: Passed\nshellcheck: Failed -- 37 pre-existing SC2218 findings in scripts/ and tools/github/, on files this\nPR does not touch; `git stash && pixi run lint` fails identically on main. This host's shellcheck\nis stricter than CI's, so `pixi run check` cannot complete locally; `pixi run ci` was run directly.\n\n$ clang-tidy -p build/tidy --warnings-as-errors='*' src/exec/scan_filter.cc src/exec/tests/scan_filter_test.cc\nclean (it first found the new helpers had external linkage -- they are now inside the anonymous namespace)\n\n$ ASAN_OPTIONS=detect_leaks=0 ./build/ci-asan/bin/antb1_{exec,io,plan}_tests\nPASS (356, 52, 814 tests)\n`pixi run asan` cannot run on this host: it fails at test discovery on a pre-existing curl_global_init\nleak, so the binaries were run directly after generating the ci-asan fixtures.\n\nNot run on this host: pixi run ci-gcc and codeql-build (the gcc environment is linux-64 only).\n```\n\n**Performance**, SF 100, four threads, two arms built from this branch\nand `main`, interleaved, three repeats,\nbest of each (TPC-H-derived data generated locally; not TPC-H Benchmark\nresults):\n\n| | ratio |\n| --- | ---: |\n| the two spellings of one filter, 600 M rows | **2.507 s -> 1.103 s\n(0.440x)** |\n| Q12 | **0.688x** |\n| Q16 | 0.948x |\n| Q21, Q10 | 0.975x |\n| geomean over the 22 queries | **0.976x** |\n| peak memory | unchanged |\n\nTwo queries looked like regressions and were not. Q8 read 1.030x at\nthree repeats and 0.974x at four rotated\nones. Q3 read 1.024x with its B minimum above its A maximum -- and\n1.005x rotated; it could not have moved\neither way, since each of its scans has a single filter column for this\nitem to order.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests) -- **not ticked, and\nhere is the honest state:** `check` stops at `lint`, which fails on 37\npre-existing SC2218 shellcheck findings\nin files this PR does not touch (`git stash && pixi run lint` fails\nidentically on `main`; this host's\nshellcheck is stricter than CI's). Its two halves were run separately\nand both pass: `pixi run lint` clean\n  apart from that, and `pixi run ci` 2810/2810.\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer\n\n**The one open checklist item:** this PR edits\n`docs/adr/0020-filter-pushdown.md`, which CODEOWNERS and the\nAGENTS.md \"Ask a human first\" list both cover. The code and tests stand\non their own if you would rather the ADR\nhunk went separately -- say so and I will split it.\n\n### Tests\n\nSeven new cases in `src/exec/tests/scan_filter_test.cc` (13 in the\nsuite, all green), each pinning one statement\nof the model: both terms of the comparator, the ordering of the\npredicate kinds by weight, that a fixed-width\ncolumn's predicates are free of position, that a second predicate on a\nVARCHAR column adds its own weight, and\nthat the order does not depend on how the query was written.\n\n**12 of 13 mutations caught**, each by a test. The thirteenth is\n`stable_sort` to `sort`, which no\nsingle-platform test can observe -- stability is there so that columns\nof equal rank keep the query's order\nrather than the standard library's, and a single platform cannot\ndisagree with itself.\n\nWhich mutations are observable at all was found by enumerating the\nmodel's reachable column shapes and every\nordered pair of them (1198 shapes, 1.4 million pairs). That enumeration\ntwice overturned my reasoning: two\nmutations I had argued were unobservable flip 256 and 422 pairs\nrespectively, in ordinary query shapes, and both\nnow have a test. The same enumeration shows the comparator is exactly\n`cost / removed` compared over the\nrationals extended by the infinity at `removed == 0`, hence a strict\nweak ordering as `stable_sort` requires --\nwhich holds only while every weight is positive, so a `static_assert`\nnow holds them so (verified to fire).\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5) wrote\nthe cost model, the ordering, the tests\nand the ADR entry, ran the gates and the SF 100 measurements, and ran\nits own reviewer subagent on the diff --\nwhich caught that the new helpers sat outside the anonymous namespace,\nthat two claims in my comment and ADR\noverstated what the tests pin, and the position-independence of the read\nthat led to the model being rewritten.\n- Accountable human (has read and understands the whole diff): @hor911\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-21T19:17:58+03:00",
+          "tree_id": "9cae10ec4a6d003a962b4a5d32cb709043426a70",
+          "url": "https://github.com/ydb-campus/antb1/commit/db3d958470518ddd642cf1182e3f8a37ddc4426f"
+        },
+        "date": 1792599725751,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 5056.5062922614825,
+            "unit": "ns/iter",
+            "extra": "iterations: 138424\ncpu: 5055.860154308502 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84892.85352507085,
+            "unit": "ns/iter",
+            "extra": "iterations: 7858\ncpu: 84888.4367523543 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222507.4836248032,
+            "unit": "ns/iter",
+            "extra": "iterations: 3145\ncpu: 222475.186645469 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 440215.5663105006,
+            "unit": "ns/iter",
+            "extra": "iterations: 1591\ncpu: 440184.86109365174 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 361636.15773195075,
+            "unit": "ns/iter",
+            "extra": "iterations: 1940\ncpu: 361606.2159793811 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2099000.563253033,
+            "unit": "ns/iter",
+            "extra": "iterations: 332\ncpu: 2098831.051204819 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 52.64079269230793,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 52.63202923076927 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 46.21994433333233,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 46.21209226666666 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 239.07639133333683,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 239.0390036666664 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 15.129278638297858,
+            "unit": "ms/iter",
+            "extra": "iterations: 47\ncpu: 15.128336 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 22.056930749999815,
+            "unit": "ms/iter",
+            "extra": "iterations: 32\ncpu: 22.05341087500001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 38.67716172222262,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 38.67333105555559 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 2.070108442136473,
+            "unit": "ms/iter",
+            "extra": "iterations: 337\ncpu: 2.06991979821959 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 150.05081499999733,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 150.04023659999993 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1000",
+            "value": 28.437756499999505,
+            "unit": "ms/iter",
+            "extra": "iterations: 24\ncpu: 28.435460708333324 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16384",
+            "value": 31.904132954544842,
+            "unit": "ms/iter",
+            "extra": "iterations: 22\ncpu: 31.89963349999997 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/262144",
+            "value": 66.82028289999948,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 66.81206960000026 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1048576",
+            "value": 134.24435800000367,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 134.2338363333333 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/4194304",
+            "value": 427.58529949999513,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 427.53209199999986 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16777216",
+            "value": 1863.1934890000252,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1862.961746 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1000",
+            "value": 34.73110049999946,
+            "unit": "ms/iter",
+            "extra": "iterations: 20\ncpu: 34.727420299999956 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16384",
+            "value": 39.72791549999973,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 39.72514488888893 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/262144",
+            "value": 70.36671870000077,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 70.35438469999988 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1048576",
+            "value": 169.51483900000142,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 169.4979029999999 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/4194304",
+            "value": 509.0096259999939,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 508.98909300000025 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16777216",
+            "value": 2241.3926099999912,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2241.099379000001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1000",
+            "value": 59.13662066666584,
+            "unit": "ms/iter",
+            "extra": "iterations: 12\ncpu: 59.1326755000002 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16384",
+            "value": 64.03431581818289,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 64.01826490909102 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/262144",
+            "value": 100.24400514285503,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 100.23592928571442 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1048576",
+            "value": 244.44475566666787,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 244.41986333333193 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/4194304",
+            "value": 613.0579990000058,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 612.9822079999983 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16777216",
+            "value": 2665.0692499999877,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2664.792458000001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1000",
+            "value": 71.06395649999797,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 71.05541219999978 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16384",
+            "value": 76.29276300000103,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 76.28721466666613 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/262144",
+            "value": 120.85049250000186,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 120.8348688333333 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1048576",
+            "value": 267.4072500000004,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 267.3506356666688 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/4194304",
+            "value": 647.549003999984,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 647.4980750000014 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16777216",
+            "value": 2784.6664699999906,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2784.3393119999932 ms\nthreads: 1"
           }
         ]
       }
