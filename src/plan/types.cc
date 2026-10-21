@@ -129,4 +129,9 @@ bool IsInteger(LogicalType type) {
 
 bool IsNumeric(LogicalType type) { return IsInteger(type) || type == LogicalType::kDouble; }
 
+bool HasComparableStatistics(LogicalType type) {
+  return (IsInteger(type) && type != LogicalType::kHugeInt) || type == LogicalType::kDate ||
+         type == LogicalType::kDecimal;
+}
+
 }  // namespace antb1::plan

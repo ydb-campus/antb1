@@ -1022,11 +1022,19 @@ TEST_F(ParquetScanTest, PartStatisticsOfIntegerColumns) {
   expect(0, 5, -3, -1, 0);        // DATE read from INTEGER day numbers, before 1970
   expect(0, 2, -2, 0, 0);
   expect(1, 2, std::nullopt, std::nullopt, 3);  // every value NULL
-  // DECIMAL: no part statistics (ADR 0021), also when stored as INT32 or INT64, whose Parquet
-  // statistics are plain integers of the unscaled values.
-  EXPECT_FALSE(stats(0, 6).has_value()) << "DECIMAL(38,0)";
-  EXPECT_FALSE(stats(0, 7).has_value()) << "DECIMAL(9,2) as INT32";
-  EXPECT_FALSE(stats(0, 8).has_value()) << "DECIMAL(15,2) as INT64";
+  // A DECIMAL stored as INT32 or INT64 reports its unscaled min and max, which is what a predicate
+  // or a sort bound on that column compares against (ADR 0021's part-statistics item). `small` is
+  // i * 125 and `mid` is -i * 1999 over nine rows in three parts, so each part is its own window
+  // and the two directions are both covered.
+  expect(0, 7, 0, 250, 0);  // DECIMAL(9,2) as INT32, ascending
+  expect(2, 7, 750, 1000, 0);
+  expect(0, 8, -3998, 0, 0);  // DECIMAL(15,2) as INT64, descending
+  expect(2, 8, -15992, -11994, 0);
+  // Not from a FIXED_LEN_BYTE_ARRAY one, whatever its precision: its min and max are big-endian
+  // two's complement that must be ordered as signed, and a writer that ordered them as unsigned
+  // byte strings put the negatives at the wrong end -- which this reader cannot detect, because
+  // either ordering is a valid byte string. 38 digits cannot be stored any other way.
+  EXPECT_FALSE(stats(0, 6).has_value()) << "DECIMAL(38,0), a FIXED_LEN_BYTE_ARRAY";
   EXPECT_FALSE(stats(0, 3).has_value()) << "DOUBLE: NaN may be missing from min/max";
   EXPECT_FALSE(stats(0, 4).has_value()) << "VARCHAR: min/max may be truncated";
   EXPECT_FALSE(stats(3, 0).has_value());

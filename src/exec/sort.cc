@@ -24,6 +24,7 @@
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
 
+#include "decimal.h"
 #include "gather.h"
 
 namespace antb1::exec {
@@ -32,29 +33,6 @@ namespace {
 template <class T>
 int Order(const T& x, const T& y) {
   return static_cast<int>(y < x) - static_cast<int>(x < y);
-}
-
-// A row's value as a number, for the integer-valued types plan::Table::part_stats keeps statistics
-// for (ParquetTable::part_stats; DECIMAL and HUGEINT are deliberately not among them). Empty for a
-// NULL and for every other type, so a bound from one never compares with a part's statistics.
-std::optional<Int128> IntegerAt(const arrow::Array& values, int64_t row) {
-  if (values.IsNull(row)) {
-    return std::nullopt;
-  }
-  switch (values.type_id()) {
-    case arrow::Type::INT16:
-      return Int128{static_cast<const arrow::Int16Array&>(values).Value(row)};
-    case arrow::Type::INT32:
-      return Int128{static_cast<const arrow::Int32Array&>(values).Value(row)};
-    case arrow::Type::INT64:
-      return Int128{static_cast<const arrow::Int64Array&>(values).Value(row)};
-    case arrow::Type::UINT16:
-      return Int128{static_cast<const arrow::UInt16Array&>(values).Value(row)};
-    case arrow::Type::DATE32:
-      return Int128{static_cast<const arrow::Date32Array&>(values).Value(row)};
-    default:
-      return std::nullopt;
-  }
 }
 
 template <class ArrayType>
@@ -94,6 +72,38 @@ std::int64_t Decimal64At(const arrow::Array& a, int64_t i) {
   std::memcpy(&value, static_cast<const arrow::FixedSizeBinaryArray&>(a).GetValue(i),
               sizeof(value));
   return value;
+}
+
+// A row's value as a number, for the integer-valued types plan::Table::part_stats keeps statistics
+// for (ParquetTable::part_stats; DECIMAL and HUGEINT are deliberately not among them). Empty for a
+// NULL and for every other type, so a bound from one never compares with a part's statistics.
+std::optional<Int128> IntegerAt(const arrow::Array& values, int64_t row) {
+  if (values.IsNull(row)) {
+    return std::nullopt;
+  }
+  switch (values.type_id()) {
+    case arrow::Type::INT16:
+      return Int128{static_cast<const arrow::Int16Array&>(values).Value(row)};
+    case arrow::Type::INT32:
+      return Int128{static_cast<const arrow::Int32Array&>(values).Value(row)};
+    case arrow::Type::INT64:
+      return Int128{static_cast<const arrow::Int64Array&>(values).Value(row)};
+    case arrow::Type::UINT16:
+      return Int128{static_cast<const arrow::UInt16Array&>(values).Value(row)};
+    case arrow::Type::DATE32:
+      return Int128{static_cast<const arrow::Date32Array&>(values).Value(row)};
+    // A DECIMAL key's unscaled value, at either physical width. Without it a top-N over a DECIMAL
+    // column had no threshold to publish, so PartMayBeat was never asked about one and a part that
+    // could not reach the kept rows was read anyway (ADR 0021's part-statistics item). The
+    // statistics it is compared against are the same column's, so both carry the same scale.
+    case arrow::Type::DECIMAL64:
+      return Int128{Decimal64At(values, row)};
+    case arrow::Type::DECIMAL128:
+      return ToInt128(
+          arrow::Decimal128(static_cast<const arrow::Decimal128Array&>(values).GetValue(row)));
+    default:
+      return std::nullopt;
+  }
 }
 
 int CompareDecimal64(const arrow::Array& a, int64_t i, const arrow::Array& b, int64_t j) {

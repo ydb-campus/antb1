@@ -598,6 +598,20 @@ std::optional<Int128> IntegerOf(const arrow::Scalar& scalar) {
       return Int128{static_cast<const arrow::UInt16Scalar&>(scalar).value};
     case arrow::Type::DATE32:
       return Int128{static_cast<const arrow::Date32Scalar&>(scalar).value};
+    // A DECIMAL's statistics are its unscaled value, which is what plan::PartStats carries and
+    // what a DECIMAL predicate or sort bound compares against -- both at the column's own scale,
+    // so no rescale enters (ADR 0021's part-statistics item). StatisticsAsScalars builds the
+    // scalar from the Parquet descriptor, so which of the three widths it is depends on the file.
+    case arrow::Type::DECIMAL32:
+      return Int128{static_cast<const arrow::Decimal32Scalar&>(scalar).value.value()};
+    case arrow::Type::DECIMAL64:
+      return Int128{static_cast<const arrow::Decimal64Scalar&>(scalar).value.value()};
+    case arrow::Type::DECIMAL128: {
+      const arrow::Decimal128& value = static_cast<const arrow::Decimal128Scalar&>(scalar).value;
+      return static_cast<Int128>(
+          (static_cast<UInt128>(static_cast<std::uint64_t>(value.high_bits())) << 64U) |
+          value.low_bits());
+    }
     default:
       return std::nullopt;
   }
@@ -712,13 +726,24 @@ std::optional<plan::PartStats> ParquetTable::part_stats(int64_t part, int field)
   // The schema is the engine view, so its types always convert.
   const plan::LogicalType engine =
       plan::FromArrow(*schema_->field(field)->type()).ValueOr(plan::LogicalType::kVarchar);
-  // DECIMAL is left out (not an integer type; ADR 0021): a FIXED_LEN_BYTE_ARRAY decimal's
-  // statistics some writers got wrong (compared as unsigned bytes) in ways a reader cannot always
-  // detect. No column is HUGEINT; the check below keeps it out as well.
-  const bool integer_valued = (plan::IsInteger(engine) && engine != plan::LogicalType::kHugeInt) ||
-                              engine == plan::LogicalType::kDate;
-  if (leaf < 0 || !integer_valued) {
+  if (leaf < 0 || !plan::HasComparableStatistics(engine)) {
     return std::nullopt;
+  }
+  // A DECIMAL's statistics are admitted only from an INT32- or INT64-backed column (ADR 0021's
+  // part-statistics item). The reason is the writer hazard this comment has recorded since the
+  // statistics were integer-only: a FIXED_LEN_BYTE_ARRAY or BYTE_ARRAY decimal's min and max are
+  // big-endian two's complement and must be ordered as signed, and writers that ordered them as
+  // unsigned byte strings put negative values at the wrong end -- which a reader cannot always
+  // detect, because the bytes themselves are valid either way. An integer-backed decimal has no
+  // such ambiguity: its statistics are a signed INT32 or INT64 min and max, ordered the one way.
+  // That is the same restriction FilteredColumnOf already makes on this type, for a related
+  // reason, and it covers the storage every writer in reach actually produces.
+  if (engine == plan::LogicalType::kDecimal) {
+    const parquet::Type::type physical =
+        metadata_[parts_[Narrow<std::size_t>(part)].file]->schema()->Column(leaf)->physical_type();
+    if (physical != parquet::Type::INT32 && physical != parquet::Type::INT64) {
+      return std::nullopt;
+    }
   }
   const Part& p = parts_[Narrow<std::size_t>(part)];
   try {

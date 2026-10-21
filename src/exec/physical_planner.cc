@@ -189,8 +189,9 @@ std::vector<plan::Predicate> FiltersOnScan(const plan::LogicalNodePtr& node) {
 // statistics and prune nothing, so the top-N does not take the bound's cost for it either.
 std::optional<int> LeadingKeyField(const plan::LogicalNodePtr& node, const plan::SortKey& key) {
   const plan::ScanNode* scan = PipelineScan(node);
-  if (scan == nullptr || key.column.index < 0 ||
-      !(plan::IsInteger(key.column.type) || key.column.type == plan::LogicalType::kDate)) {
+  // A DECIMAL key is admitted as well (ADR 0021's part-statistics item): its bound and the
+  // statistics it is compared with are the same column's unscaled values, so no scale enters.
+  if (scan == nullptr || key.column.index < 0 || !plan::HasComparableStatistics(key.column.type)) {
     return std::nullopt;
   }
   std::vector<const plan::LogicalNode*> chain;  // the top down to the scan

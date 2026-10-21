@@ -238,10 +238,9 @@ This amends ADR 0012's list of unsupported constructs and three points of ADR 00
   divergence.
 - **Exact comparison comes first.** The harness compares DECIMAL text and `DECIMAL(p,s)` type names exactly (PR H5)
   before any DECIMAL engine code lands, since the DOUBLE tolerance would let a wrong cent pass.
-- **Filter pushdown is lost for scans that read a DECIMAL column,** until the decimal64 item. ADR 0020 needs every
-  read column to be filterable, so such a scan is not filtered at all, and a predicate on a DECIMAL column skips no
-  row group, because part statistics cover integer-valued columns only. Most scans of the queries derived from
-  TPC-H read DECIMAL columns, so they run unfiltered until then. Answers are unaffected.
+- **Filter pushdown was lost for scans that read a DECIMAL column** until the decimal64 item, and a predicate on
+  one skipped no row group until the part-statistics item below. Both are closed; the sentence is kept because the
+  Consequences list is what a reader checks for what a slice costs while it is open.
 - **Cost:** a DECIMAL of up to 18 digits takes 16 bytes and Int128 arithmetic instead of 8 bytes and int64. Accepted
   until decimal64.
 - **Every slice fails cleanly.** Each code PR rejects the DECIMAL contexts it does not implement yet with
@@ -442,9 +441,9 @@ with exit code 4. The PR ids are the roadmap's, not divergence ids.
           form at all -- 8 bytes cannot hold it -- so that row's operand type moved to 38 digits while its
           step stayed at 18, which keeps the operand test covered after the switch is gone instead of
           silently ceasing to run.
-      - **DECIMAL in part statistics is not part of this after all.** `IntegerOf`
-        (`src/io/parquet_table.cc:547`) admits only integer scalars, so decimal statistics were never used at
-        either width. Adding them is a separate feature and does not gate the default.
+      - **DECIMAL in part statistics is not part of this after all.** `IntegerOf` admitted only integer
+        scalars, so decimal statistics were never used at either width. It is its own item, below, and it did
+        not gate the default.
     - **The flip was run on 2026-10-20, and it is deferred.** The 8-bytes-a-value claim finally got a number,
       and the number says the item pays in memory and not yet in time.
       - **Flipping the default with nothing else changed is a regression**: at SF 10, one thread, 22 queries,
@@ -518,6 +517,33 @@ with exit code 4. The PR ids are the roadmap's, not divergence ids.
           still has.
         - Three mutations confirm the collapsed cases still bite: a narrow append truncated to 32 bits, a
           MIN/MAX answer left at the kernel's width, and a narrow sort prefix carrying no information.
+    - **Part statistics for DECIMAL, feat(plan,io,exec): built 2026-10-21.** A predicate, a top-N bound or a
+      published key set on a DECIMAL column can now skip whole row groups, which ADR 0020's Consequences and
+      this ADR's both recorded as missing. Four gates had to open, and the shape of that is the finding:
+      `Table::part_stats` reported nothing for the type, `part_pruning` could not compare a DECIMAL constant,
+      `physical_planner`'s `LeadingKeyField` would not take a DECIMAL sort key, and `SortBuffer::ThresholdKey`
+      had no value to publish for one -- so even with the statistics present a top-N would have pruned
+      nothing. Three of the four were invisible from the ADR text and only the fourth was the one the item
+      named.
+      - **Only an INT32- or INT64-backed decimal's statistics are admitted.** A FIXED_LEN_BYTE_ARRAY or
+        BYTE_ARRAY decimal's min and max are big-endian two's complement that must be ordered as signed, and
+        writers that ordered them as unsigned byte strings put the negatives at the wrong end -- which a reader
+        cannot detect, because either ordering is a valid byte string. That hazard was already recorded in the
+        code and is the reason the statistics were integer-only; the restriction keeps it closed rather than
+        relying on writer detection, and it is the same restriction `FilteredColumnOf` makes on this type.
+      - **Two unscaled values compare only at one scale**, so a predicate's constant is compared only when its
+        type equals the column's. The binder folds a constant to the column's type, so this is a guard rather
+        than a shape a plan produces -- and it is the one thing that would have been silently wrong, since 2500
+        is 25.00 at scale 2 and 2.500 at scale 3. A sort bound needs no such check: it comes from the same
+        column as the statistics.
+      - **`plan::HasComparableStatistics` says which types have statistics that compare as one number**, in one
+        place, because four sites needed the same answer across two modules and the three that disagreed with
+        each other are why this item looked like one gate instead of four.
+      - **No measurement.** Pruning fires only where a part's window excludes the predicate, and no
+        TPC-H-derived query has that shape on a decimal column: lineitem's decimal columns span every row
+        group, which the earlier `skipped=0` on Q06 already showed for its date range. What this buys is the
+        shape, not a number on this workload -- Q18's `ORDER BY o_totalprice DESC LIMIT 100` is the nearest
+        candidate, and its parts are not ordered by price either.
     - **N4, docs(adr): record what N1 to N3 measured**, and accept or defer the rest on those numbers. Done,
       above: N1 and N3 are accepted on the SF 100 and SF 10 runs, N2 was dropped on its own premise, and the
       item is closed. What it bought, against decimal128 and measured with the arms interleaved, is a geomean
