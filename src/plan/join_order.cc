@@ -68,11 +68,11 @@ int64_t BlockRows(std::span<const JoinRelation> relations, std::size_t relation)
 // side that does not fit (ADR 0026's C5), and under-stating an intermediate is what lets the search
 // pick a plan that multiplies.
 //
-// This is the whole of a 1013x: a derived table's columns have no domain at all, because
-// KeyDomainOf (src/plan/binder.cc) reads one only from a table, so an edge between a base-table
-// column of 25 values and a derived column of 1,200,243 rows divided by 1,200,243 instead of by 25,
-// and a join the search ranked cheapest at 150,000 rows produced 6,697,748,923 of them. ADR 0022
-// records both halves of that and never joined them up.
+// The whole of a 145.2 s against 140.6 ms: a derived table's columns have no domain at all,
+// because KeyDomainOf (src/plan/binder.cc) reads one only from a table, so an edge between a
+// base-table column of 25 values and a derived column of 1,200,243 rows divided by 1,200,243
+// instead of by 25, and a join the search ranked cheapest at 150,000 rows produced 6,697,748,923
+// of them. ADR 0022 records both halves of that and never joined them up.
 //
 // Where neither side is known the edge divides by 1 and the join reads as the product of its
 // inputs. That is deliberately the most pessimistic reading available: there is no value between
