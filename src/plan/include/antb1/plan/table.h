@@ -38,6 +38,16 @@ struct ScanValues {
   const std::uint8_t* validity = nullptr;     // VARCHAR: a bit per row, 1 where not NULL;
                                               // nullptr: no row is NULL
   int64_t rows = 0;
+  // VARCHAR, and only when every data page of the column chunk is dictionary-encoded: the chunk's
+  // distinct values, and one index into them per row. `strings` is filled either way, so a reader
+  // of these is free to ignore them; what they are for is evaluating a predicate once per distinct
+  // value instead of once per row ([ADR 0020](../../../../../docs/adr/0020-filter-pushdown.md)).
+  //
+  // Empty when the chunk has a plain-encoded data page, which a writer produces once its
+  // dictionary outgrows its page limit. A NULL row's index is not meaningful -- it has no value --
+  // so `validity` decides a row before its index is read.
+  std::span<const std::string_view> dictionary;
+  std::span<const std::int32_t> indices;
 };
 
 // Predicates a table applies while it scans, before it copies the values it decoded (filter
