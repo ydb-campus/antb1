@@ -382,32 +382,27 @@ TEST(LogicalPlanTest, ArrowScalars) {
   EXPECT_EQ(static_cast<const arrow::Decimal128Scalar&>(*s).value.ToIntegerString(),
             Int128ToString(big));
   // A DECIMAL constant carries its own (p,s), so it compares with the column at the same scale.
-  // Explicitly at the wide width, because the two lines below name decimal128 and its scalar class:
-  // which width a narrow precision gets, and which class goes with it, is
-  // ADecimalScalarsClassFollowsItsType's subject.
-  {
-    const testing::NarrowDecimalsFor narrowing(false);
-    s = scalar({.type = LogicalType::Decimal(15, 2), .value = Int128{-1234}});
-    ASSERT_NE(s, nullptr);
-    ASSERT_TRUE(s->type->Equals(*arrow::decimal128(15, 2)));
-    EXPECT_EQ(static_cast<const arrow::Decimal128Scalar&>(*s).value.ToIntegerString(), "-1234");
-  }
+  // At 19 digits, which is the narrowest precision still 128 bits wide: 15 digits would be a
+  // decimal64 now, and which class goes with which width is
+  // ADecimalScalarsClassFollowsItsType's subject rather than this case's.
+  s = scalar({.type = LogicalType::Decimal(19, 2), .value = Int128{-1234}});
+  ASSERT_NE(s, nullptr);
+  ASSERT_TRUE(s->type->Equals(*arrow::decimal128(19, 2)));
+  EXPECT_EQ(static_cast<const arrow::Decimal128Scalar&>(*s).value.ToIntegerString(), "-1234");
+  // And a narrow one carries its own (p,s) just the same, in the class that width belongs to.
+  s = scalar({.type = LogicalType::Decimal(15, 2), .value = Int128{-1234}});
+  ASSERT_NE(s, nullptr);
+  ASSERT_TRUE(s->type->Equals(*arrow::decimal64(15, 2)));
+  EXPECT_EQ(static_cast<const arrow::Decimal64Scalar&>(*s).value.ToIntegerString(), "-1234");
 }
 
-// A decimal constant's scalar CLASS follows its type, at either physical width (ADR 0021's
-// decimal64 item). Arrow's kernels reach a scalar's value through a checked_cast on its type, which
-// is a static_cast in the Release build the prebuilt Arrow is, so a Decimal128Scalar carrying a
+// A decimal constant's scalar CLASS follows its type at both physical widths (ADR 0021's decimal64
+// item). Arrow's kernels reach a scalar's value through a checked_cast on its type, which is a
+// static_cast in the Release build the prebuilt Arrow is, so a Decimal128Scalar carrying a
 // decimal64 type reads a Decimal128's first eight bytes as a Decimal64 instead of failing -- the
 // right answer today, by the layout and by one endianness, and nothing that holds by construction.
 // dynamic_cast asks the question the kernels cannot.
 TEST(LogicalPlanTest, ADecimalScalarsClassFollowsItsType) {
-  const bool was = NarrowDecimals();
-  SetNarrowDecimals(true);
-  struct Restore {
-    bool to;
-    ~Restore() { SetNarrowDecimals(to); }
-  } const restore{.to = was};
-
   // At 18 digits or fewer the type is decimal64, so the scalar must be a Decimal64Scalar.
   auto narrow = ToArrowScalar({.type = LogicalType::Decimal(18, 4), .value = Int128{-50005}});
   ASSERT_TRUE(narrow.ok()) << narrow.status().ToString();
@@ -416,7 +411,7 @@ TEST(LogicalPlanTest, ADecimalScalarsClassFollowsItsType) {
       << "a decimal64 type on a scalar of another class";
   EXPECT_EQ(static_cast<const arrow::Decimal64Scalar&>(**narrow).value.ToIntegerString(), "-50005");
 
-  // Past 18 digits, and a HUGEINT at any setting, stay decimal128.
+  // Past 18 digits, and a HUGEINT, are decimal128.
   for (const LogicalType type : {LogicalType::Decimal(19, 0), LogicalType(LogicalType::kHugeInt)}) {
     auto wide = ToArrowScalar({.type = type, .value = Int128{-50005}});
     ASSERT_TRUE(wide.ok()) << wide.status().ToString();

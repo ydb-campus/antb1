@@ -400,49 +400,35 @@ TEST_F(AggregateStateTest, MinMaxOfDatesUnsignedDoublesAndHugeInts) {
 // this state widens for the kernel and narrows the answer back; what the case pins is that the
 // answer and its type are the ones the caller asked for, and that SUM and COUNT(DISTINCT) over the
 // same column -- which take other paths entirely -- agree with their wide arms too.
-TEST_F(AggregateStateTest, MinMaxOfANarrowDecimalAnswersAsTheWideOneDoes) {
-  const LogicalType type = LogicalType::Decimal(15, 2);
-  const std::vector<std::optional<int64_t>> unscaled = {1700, std::nullopt, -25, 1700,
-                                                        -99999999999999};
-  const auto wide_values = [&] {
-    arrow::Decimal128Builder builder(arrow::decimal128(15, 2));
-    for (const auto& v : unscaled) {
-      EXPECT_TRUE(
-          (v.has_value() ? builder.Append(arrow::Decimal128(*v)) : builder.AppendNull()).ok());
+TEST_F(AggregateStateTest, MinMaxOfANarrowDecimalAnswersAtItsOwnWidth) {
+  // 17.00, NULL, -0.25, 17.00 and -999999999999.99, at 15 digits and again at 19: the precision
+  // picks the physical width, so one arm goes through the widen-and-narrow path and the other
+  // straight to the kernel, and both owe the same answer.
+  const std::vector<std::optional<std::string>> unscaled = {"1700", std::nullopt, "-25", "1700",
+                                                            "-99999999999999"};
+  struct Arm {
+    LogicalType type;
+    arrow::Type::type physical;
+  };
+  for (const Arm arm :
+       {Arm{.type = LogicalType::Decimal(15, 2), .physical = arrow::Type::DECIMAL64},
+        Arm{.type = LogicalType::Decimal(19, 2), .physical = arrow::Type::DECIMAL128}}) {
+    SCOPED_TRACE(ToString(arm.type));
+    const auto values = testing::Decimals(arm.type, unscaled);
+    ASSERT_EQ(values->type_id(), arm.physical);
+    for (const AggKind kind : {AggKind::kMin, AggKind::kMax}) {
+      auto state = Make(kind, arm.type, arm.type);
+      ASSERT_TRUE(state->Consume(*values, nullptr).ok());
+      EXPECT_EQ(Text(*state), kind == AggKind::kMin ? "-99999999999999" : "1700");
+      // Arrow has no min_max kernel for decimal64, so the narrow arm widens, calls the kernel and
+      // narrows the answer back. Leaving it wide is what this pins (ADR 0021's decimal64 item).
+      EXPECT_TRUE(Result(*state)->type()->Equals(*plan::ToArrow(arm.type)))
+          << "the answer came back as " << Result(*state)->type()->ToString();
     }
-    return builder.Finish().ValueOrDie();
-  }();
-  const auto narrow_values = [&] {
-    arrow::Decimal64Builder builder(arrow::decimal64(15, 2));
-    for (const auto& v : unscaled) {
-      EXPECT_TRUE(
-          (v.has_value() ? builder.Append(arrow::Decimal64(*v)) : builder.AppendNull()).ok());
-    }
-    return builder.Finish().ValueOrDie();
-  }();
-
-  for (const AggKind kind : {AggKind::kMin, AggKind::kMax}) {
-    std::string wide;
-    {
-      const testing::NarrowDecimalsFor narrowing(false);
-      auto state = Make(kind, type, type);
-      ASSERT_TRUE(state->Consume(*wide_values, nullptr).ok());
-      wide = Text(*state);
-      EXPECT_TRUE(Result(*state)->type()->Equals(arrow::decimal128(15, 2)));
-    }
-    const testing::NarrowDecimalsFor narrowing(true);
-    auto state = Make(kind, type, type);
-    ASSERT_TRUE(state->Consume(*narrow_values, nullptr).ok());
-    EXPECT_EQ(Text(*state), wide) << (kind == AggKind::kMin ? "MIN" : "MAX");
-    EXPECT_TRUE(Result(*state)->type()->Equals(arrow::decimal64(15, 2)))
-        << "the answer must come back at the width the caller asked for: "
-        << Result(*state)->type()->ToString();
+    // An empty column still gives one NULL of that type rather than of the kernel's.
+    auto empty = Make(AggKind::kMin, arm.type, arm.type);
+    EXPECT_TRUE(Result(*empty)->type()->Equals(*plan::ToArrow(arm.type)));
   }
-
-  // An empty column still gives one NULL of the narrow type rather than of the kernel's.
-  const testing::NarrowDecimalsFor narrowing(true);
-  auto empty = Make(AggKind::kMin, type, type);
-  EXPECT_TRUE(Result(*empty)->type()->Equals(arrow::decimal64(15, 2)));
 }
 
 TEST_F(AggregateStateTest, MinMaxAndCountDistinctOfDecimals) {
@@ -455,7 +441,7 @@ TEST_F(AggregateStateTest, MinMaxAndCountDistinctOfDecimals) {
   ASSERT_TRUE(min->Consume(*values, selection.get()).ok());
   EXPECT_EQ(Text(*min), "-25");
   // MIN keeps the argument's type; which physical width that is at this precision is
-  // MinMaxOfANarrowDecimalAnswersAsTheWideOneDoes's subject, at both settings.
+  // MinMaxOfANarrowDecimalAnswersAtItsOwnWidth's subject.
   EXPECT_TRUE(Result(*min)->type()->Equals(*plan::ToArrow(type)))
       << Result(*min)->type()->ToString();
   auto max = Make(AggKind::kMax, type, type);

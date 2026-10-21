@@ -43,17 +43,6 @@ std::string ToString(LogicalType type) {
 
 std::ostream& operator<<(std::ostream& os, LogicalType type) { return os << ToString(type); }
 
-namespace {
-
-// See types.h: transitional, on by default as of ADR 0021's decimal64 step, and read from several
-// threads of a running query.
-std::atomic<bool> narrow_decimals{true};
-
-}  // namespace
-
-void SetNarrowDecimals(bool on) { narrow_decimals.store(on, std::memory_order_relaxed); }
-bool NarrowDecimals() { return narrow_decimals.load(std::memory_order_relaxed); }
-
 std::shared_ptr<arrow::DataType> ToArrow(LogicalType type) {
   switch (type.id()) {
     case LogicalType::kSmallInt:
@@ -67,10 +56,10 @@ std::shared_ptr<arrow::DataType> ToArrow(LogicalType type) {
     case LogicalType::kHugeInt:
       return arrow::decimal128(38, 0);
     case LogicalType::kDecimal:
-      if (NarrowDecimals() && type.width() <= LogicalType::kMaxNarrowDecimalWidth) {
-        return arrow::decimal64(type.width(), type.scale());
-      }
-      return arrow::decimal128(type.width(), type.scale());
+      // Eight bytes a value up to 18 digits, sixteen above it (ADR 0021's decimal64 item).
+      return type.width() <= LogicalType::kMaxNarrowDecimalWidth
+                 ? arrow::decimal64(type.width(), type.scale())
+                 : arrow::decimal128(type.width(), type.scale());
     case LogicalType::kDouble:
       return arrow::float64();
     case LogicalType::kVarchar:

@@ -35,7 +35,6 @@ using plan::LogicalType;
 using testing::Decimals;
 using testing::Int16s;
 using testing::Int64s;
-using testing::NarrowDecimalsFor;
 using testing::UnscaledText;
 
 class ComputeTest : public testing::ExecTest {};
@@ -1513,12 +1512,11 @@ TEST_F(ComputeTest, AColumnBeyondItsDeclaredWidthIsStillCheckedBesideAReusedExpr
 // arithmetic has already checked. A DECIMAL negation is not one: it keeps its operand's type and
 // tests only 128 bits, so it passes a file's out-of-width value straight through. Marking such an
 // array `checked` turned a cast error into an answer of 0.
-// At both physical widths, because the check lives where the operand is READ and the two widths are
-// read by different arms of ReadDecimalOperand. The narrow arm widens into a vector, which is also
-// what an INTEGER operand does -- and an integer's values are inside its physical type, so that arm
-// used to mark every operand it took `checked`. A decimal64 column of DECIMAL(2,1) holds 1500 as
-// easily as a decimal128 one, so marking it checked answered 0 here instead of raising: the hole
-// #191 closed, reopened one width over, and caught only because this case runs at both.
+// The check lives where the operand is READ. ReadDecimalOperand's narrow arm is the one an INTEGER
+// operand also takes -- and an integer's values are inside its physical type, so that arm used to
+// mark every operand it took `checked`. A decimal64 column of DECIMAL(2,1) holds 1500 as easily as
+// a decimal128 one did, so marking it checked answered 0 here instead of raising: the hole #191
+// closed, reopened one width over (ADR 0021's decimal64 item).
 void CheckAReusedNegationIsRangeChecked() {
   const LogicalType narrow = LogicalType::Decimal(2, 1);
   const LogicalType wider = LogicalType::Decimal(3, 1);  // +-999, which 1500 is outside
@@ -1545,11 +1543,7 @@ void CheckAReusedNegationIsRangeChecked() {
 }
 
 TEST_F(ComputeTest, AReusedNegationIsRangeCheckedByTheStepThatReadsIt) {
-  for (const bool narrowing_on : {false, true}) {
-    const NarrowDecimalsFor narrowing(narrowing_on);
-    SCOPED_TRACE(std::format("narrowing {}", narrowing_on));
-    CheckAReusedNegationIsRangeChecked();
-  }
+  CheckAReusedNegationIsRangeChecked();
 }
 
 // ---- a step computed in int64 where its range admits one (ADR 0021's decimal64 item, N1) ----
@@ -1650,12 +1644,12 @@ TEST_F(ComputeTest, ANarrowStepAgreesWithTheInt128PathAtItsBoundaries) {
        .right = "0"},
   };
 
-  // At both representations: the narrow step is reached either way, and what changes is the width
-  // its operands are READ from, which is a different arm of ReadDecimalOperand.
-  for (const bool narrowing_on : {false, true}) {
-    const NarrowDecimalsFor narrowing(narrowing_on);
+  // What this compares is the narrow STEP against the Int128 path over the same operands, which is
+  // a comparison within one representation: the operand's physical width follows its precision,
+  // and the 38-digit rows below are the ones that exercise the wide arm of ReadDecimalOperand.
+  {
     for (const Case& c : cases) {
-      SCOPED_TRACE(std::format("narrowing {}: {}", narrowing_on, c.what));
+      SCOPED_TRACE(c.what);
       const auto left = Decimals(c.operand, {c.left});
       const auto right = Decimals(c.operand, {c.right});
       const auto l = ColumnAt(0, c.operand);
@@ -1698,38 +1692,29 @@ TEST(DecimalBytesDeathTest, AnArrayOfAnotherPhysicalTypeIsNotReinterpreted) {
 
 // And the type a builder is given is re-derived and checked, so a builder can never be constructed
 // for a width this code does not write. Both callers build the 38-digit result of an exact SUM --
-// HUGEINT or DECIMAL(38,s) -- which is decimal128 at either setting of the narrowing switch, so
-// the helper's check is the permanent statement that this builder is for that type and no other.
+// HUGEINT or DECIMAL(38,s) -- which is decimal128, so the helper's check is the statement that
+// this builder is for that type and no other.
 TEST(DecimalBytesTest, TheBuilderTypeIsTheSumsOwn) {
-  for (const bool narrowing_on : {false, true}) {
-    const NarrowDecimalsFor narrowing(narrowing_on);
-    SCOPED_TRACE(std::format("narrowing {}", narrowing_on));
-    for (const LogicalType type :
-         {LogicalType(LogicalType::kHugeInt), LogicalType::Decimal(38, 4)}) {
-      EXPECT_TRUE(DecimalsType(type)->Equals(*arrow::decimal128(38, type.scale())))
-          << ToString(type) << " gave " << DecimalsType(type)->ToString();
-    }
+  for (const LogicalType type : {LogicalType(LogicalType::kHugeInt), LogicalType::Decimal(38, 4)}) {
+    EXPECT_TRUE(DecimalsType(type)->Equals(*arrow::decimal128(38, type.scale())))
+        << ToString(type) << " gave " << DecimalsType(type)->ToString();
   }
 }
 
 // A type the SUM builder is not for aborts rather than handing back a width this code would then
-// write 16 bytes into. Only reachable with the switch on, which is what makes it worth pinning:
-// without the check a release build would construct a Decimal128Builder over 8-byte slots.
+// write 16 bytes into: without the check a release build would construct a Decimal128Builder over
+// the 8-byte slots a DECIMAL(15,2) now has.
 TEST(DecimalBytesDeathTest, TheBuilderTypeRefusesANarrowDecimal) {
-  const NarrowDecimalsFor narrowing(true);
   EXPECT_DEATH(DecimalsType(LogicalType::Decimal(15, 2)), "check failed");
 }
 
-// ---- the same program at the narrow physical width (ADR 0021's N3, the program path) ----
+// ---- the program at the narrow physical width (ADR 0021's decimal64 item, the program path) ----
 
-// ---- the same program at the narrow physical width (ADR 0021's N3, the program path) ----
-// Both arms call the same Decimals, under NarrowDecimalsFor: with the helper width-aware the
-// two arms are literally the same code at two settings, which is what these cases claim.
-
-// The program's own shape -- a chain of DECIMAL arithmetic over columns -- at both widths. The
-// operands differ in physical type and the result type differs with them, so what is compared is
-// the unscaled values.
-TEST_F(ComputeTest, ANarrowProgramAnswersAsTheWideOneDoes) {
+// The program's own shape: a chain of DECIMAL arithmetic over columns, computed in int64 because
+// every step's range admits one. The expected values are written out rather than compared against
+// another arm -- there is one physical width now, so a comparison would have nothing to compare to
+// (ADR 0021's decimal64 item).
+TEST_F(ComputeTest, ANarrowProgramAnswersExactlyAndWritesEightBytesARow) {
   const LogicalType money = LogicalType::Decimal(15, 2);
   const LogicalType step1 = LogicalType::Decimal(16, 2);
   const LogicalType result = LogicalType::Decimal(18, 4);
@@ -1745,34 +1730,23 @@ TEST_F(ComputeTest, ANarrowProgramAnswersAsTheWideOneDoes) {
       Arith(ArithOp::kMultiply, ColumnAt(0, money),
             Arith(ArithOp::kSubtract, ConstantOf(100, money), ColumnAt(1, money), step1), result);
 
-  std::string wide;
-  {
-    const NarrowDecimalsFor narrowing(false);
-    auto out = Eval(expr, {Decimals(money, prices), Decimals(money, discounts)});
-    ASSERT_TRUE(out.ok()) << out.status().ToString();
-    EXPECT_EQ((*out)->type_id(), arrow::Type::DECIMAL128);
-    wide = UnscaledText(**out);
-  }
-  {
-    const NarrowDecimalsFor narrowing(true);
-    auto out = Eval(expr, {Decimals(money, prices), Decimals(money, discounts)});
-    ASSERT_TRUE(out.ok()) << out.status().ToString();
-    EXPECT_EQ((*out)->type_id(), arrow::Type::DECIMAL64)
-        << "a result of 18 digits must be built narrow with the switch on";
-    // The type alone does not say the values were WRITTEN narrow -- it is whatever type the builder
-    // was handed. Eight bytes a value is what says it, and a wide builder handed a narrow type
-    // would reserve sixteen.
-    EXPECT_EQ((*out)->data()->buffers[1]->size(),
-              static_cast<std::int64_t>(sizeof(std::int64_t)) * (*out)->length())
-        << "the values buffer is not eight bytes a row";
-    EXPECT_EQ(UnscaledText(**out), wide) << "the narrow program answered differently";
-  }
+  auto out = Eval(expr, {Decimals(money, prices), Decimals(money, discounts)});
+  ASSERT_TRUE(out.ok()) << out.status().ToString();
+  EXPECT_EQ((*out)->type_id(), arrow::Type::DECIMAL64) << "18 digits is a narrow result";
+  // The type alone does not say the values were WRITTEN narrow -- it is whatever type the builder
+  // was handed. Eight bytes a value is what says it, and a wide builder handed a narrow type would
+  // reserve sixteen.
+  EXPECT_EQ((*out)->data()->buffers[1]->size(),
+            static_cast<std::int64_t>(sizeof(std::int64_t)) * (*out)->length())
+      << "the values buffer is not eight bytes a row";
+  // price * (1.00 - discount), unscaled at scale 4: 1050025 * 90, 200000 * 100, 0 * -400, a NULL
+  // price, a NULL discount, and 999999999999 * 100 -- the last being the one that needs more than
+  // 32 bits.
+  EXPECT_EQ(UnscaledText(**out), "DECIMAL(18,4): 94502250 20000000 0 null null 99999999999900");
 }
 
-// A result past 18 digits stays decimal128 even with the switch on, and still answers: the width
-// band is the result type's, not the switch's.
-TEST_F(ComputeTest, AWideResultStaysWideWithNarrowingOn) {
-  const NarrowDecimalsFor narrowing(true);
+// A result past 18 digits is decimal128 and still answers: the width band is the result type's.
+TEST_F(ComputeTest, AResultPast18DigitsStaysDecimal128) {
   const LogicalType d38 = LogicalType::Decimal(38, 0);
   const auto column = Decimals(d38, {"123456789012345678901234567"});
   auto out = Eval(Arith(ArithOp::kAdd, ColumnAt(0, d38), ColumnAt(0, d38), d38), {column});
@@ -1781,9 +1755,9 @@ TEST_F(ComputeTest, AWideResultStaysWideWithNarrowingOn) {
   EXPECT_EQ(UnscaledText(**out), "DECIMAL(38,0): 246913578024691357802469134");
 }
 
-// The recursive fallbacks at the narrow width (ADR 0021's decimal64 item, step 2b). Each of these
-// shapes makes Compile bail, so the program path is not involved: a negation, a CASE whose branch
-// type is its own, a cast, and a chain whose operand the program cannot read.
+// The recursive fallbacks at the narrow width (ADR 0021's decimal64 item). Each of these shapes
+// makes Compile bail, so the program path is not involved: a negation, a CASE whose branch type is
+// its own, a cast, and a chain whose operand the program cannot read.
 TEST_F(ComputeTest, TheRecursiveFallbacksAnswerAtTheNarrowWidth) {
   const LogicalType money = LogicalType::Decimal(15, 2);
   const LogicalType wider = LogicalType::Decimal(16, 2);
@@ -1797,48 +1771,41 @@ TEST_F(ComputeTest, TheRecursiveFallbacksAnswerAtTheNarrowWidth) {
   // An arithmetic node whose operand is that negation: DecimalArith, not the program.
   const auto sum = Arith(ArithOp::kAdd, negated, ConstantOf(100, money), wider);
 
-  for (const plan::ExprPtr& expr : {negated, sum}) {
-    std::string wide;
-    arrow::Type::type wide_id{};
-    {
-      const NarrowDecimalsFor narrowing(false);
-      auto out = Eval(expr, {Decimals(money, values)});
-      ASSERT_TRUE(out.ok()) << out.status().ToString();
-      wide = UnscaledText(**out);
-      wide_id = (*out)->type_id();
-    }
-    EXPECT_EQ(wide_id, arrow::Type::DECIMAL128);
-    const NarrowDecimalsFor narrowing(true);
+  // Each fallback's own answer, written out: negation is -value, and the sum adds 1.00 to it at
+  // the same scale, so neither rescales and both keep the operand's own values.
+  const std::vector<std::pair<plan::ExprPtr, std::string>> cases = {
+      {negated, "DECIMAL(15,2): -1050025 null 7 -999999999999"},
+      {sum, "DECIMAL(16,2): -1049925 null 107 -999999999899"}};
+  for (const auto& [expr, expected] : cases) {
     auto out = Eval(expr, {Decimals(money, values)});
     ASSERT_TRUE(out.ok()) << out.status().ToString();
     EXPECT_EQ((*out)->type_id(), arrow::Type::DECIMAL64) << ToString(expr->type);
     EXPECT_EQ((*out)->data()->buffers[1]->size(),
               static_cast<std::int64_t>(sizeof(std::int64_t)) * (*out)->length())
         << "the values buffer is not eight bytes a row for " << ToString(expr->type);
-    EXPECT_EQ(UnscaledText(**out), wide) << "the narrow fallback answered differently";
+    EXPECT_EQ(UnscaledText(**out), expected);
   }
 }
 
-// A DECIMAL cast to DOUBLE reads either width, and gives DuckDB's value either way.
 TEST_F(ComputeTest, ADecimalToDoubleReadsEitherWidth) {
-  const LogicalType money = LogicalType::Decimal(15, 2);
+  // The precision picks the width now: 15 digits is decimal64 and 19 is decimal128, and the two
+  // are compared against each other AND against DuckDB's own formula, so neither arm can drift.
+  // Only the scale enters that formula above 4 digits, so both widths owe the same doubles.
   const std::vector<std::optional<std::string>> values = {"1050025", std::nullopt, "-7"};
-  // Each array under its own guard, and the physical types asserted to DIFFER: two arms built at
-  // the same width would compare an array against itself and pass whatever ReadUnscaled did.
-  const auto column = [&](bool narrowing_on) {
-    const NarrowDecimalsFor narrowing(narrowing_on);
-    return Decimals(money, values);
-  };
-  const auto wide_column = column(false);
-  const auto narrow_column = column(true);
-  ASSERT_EQ(wide_column->type_id(), arrow::Type::DECIMAL128);
+  const auto narrow_column = Decimals(LogicalType::Decimal(15, 2), values);
+  const auto wide_column = Decimals(LogicalType::Decimal(19, 2), values);
   ASSERT_EQ(narrow_column->type_id(), arrow::Type::DECIMAL64);
-  auto wide = DecimalToDouble(*wide_column, arrow::default_memory_pool());
+  ASSERT_EQ(wide_column->type_id(), arrow::Type::DECIMAL128);
   auto narrow = DecimalToDouble(*narrow_column, arrow::default_memory_pool());
-  ASSERT_TRUE(wide.ok()) << wide.status().ToString();
+  auto wide = DecimalToDouble(*wide_column, arrow::default_memory_pool());
   ASSERT_TRUE(narrow.ok()) << narrow.status().ToString();
+  ASSERT_TRUE(wide.ok()) << wide.status().ToString();
   EXPECT_TRUE((*wide)->Equals(**narrow)) << (*wide)->ToString() << "\nagainst\n"
                                          << (*narrow)->ToString();
+  const auto& doubles = static_cast<const arrow::DoubleArray&>(**narrow);
+  EXPECT_EQ(doubles.Value(0), DuckDbDecimalToDouble(1050025, 15, 2));
+  EXPECT_TRUE(doubles.IsNull(1));
+  EXPECT_EQ(doubles.Value(2), DuckDbDecimalToDouble(-7, 15, 2));
 }
 
 // A DOUBLE constant.
@@ -1860,10 +1827,12 @@ TEST_F(ComputeTest, ADecimalConvertsToDoubleByDuckDbsRuleAtEitherWidth) {
   const LogicalType d18_4 = LogicalType::Decimal(18, 4);
   const std::vector<std::optional<std::string>> values = {"50005", std::nullopt, "-50005"};
   // 5.0005 is DuckDB's 5.0004999999999997 (the unscaled value divided by 10^4 in DOUBLE) and
-  // Arrow's 5.0005000000000006 (multiplied by 10^-4). Without this the case proves nothing.
+  // Arrow's 5.0005000000000006 (multiplied by 10^-4). Without this the case proves nothing. The
+  // probe is built at 19 digits so that it is a decimal128, which is the width Arrow's cast was
+  // measured on; the value and scale are the ones under test.
   {
-    const NarrowDecimalsFor narrowing(false);
-    auto arrows = arrow::compute::Cast(Decimals(d18_4, {"50005"}), arrow::float64());
+    auto arrows =
+        arrow::compute::Cast(Decimals(LogicalType::Decimal(19, 4), {"50005"}), arrow::float64());
     ASSERT_TRUE(arrows.ok()) << arrows.status().ToString();
     ASSERT_NE(static_cast<const arrow::DoubleArray&>(*arrows->make_array()).Value(0),
               DuckDbDecimalToDouble(50005, 18, 4))
@@ -1872,31 +1841,22 @@ TEST_F(ComputeTest, ADecimalConvertsToDoubleByDuckDbsRuleAtEitherWidth) {
   }
   // The shape the switch-on run failed on: a DECIMAL column in an expression typed DOUBLE, which
   // is what makes CastTo convert it. Times one, so the conversion is the whole of the answer.
-  const auto expr =
-      Arith(ArithOp::kMultiply, ColumnAt(0, d18_4), DoubleOf(1.0), LogicalType::kDouble);
-  // Each arm names its width and the two are asserted to DIFFER: an unguarded wide arm inherits
-  // whatever the default is, and in a build where it is on both arms would be the same array and
-  // the comparison below would hold for any conversion at all.
-  const auto column = [&](bool narrowing_on) {
-    const NarrowDecimalsFor narrowing(narrowing_on);
-    return Decimals(d18_4, values);
+  const auto times_one = [](LogicalType operand) {
+    return Arith(ArithOp::kMultiply, ColumnAt(0, operand), DoubleOf(1.0), LogicalType::kDouble);
   };
-  const auto wide_column = column(false);
-  const auto narrow_column = column(true);
-  ASSERT_EQ(wide_column->type_id(), arrow::Type::DECIMAL128);
+  // The precision picks the width: 18 digits is decimal64, 19 is decimal128, and each is asserted
+  // to be the width it claims so neither arm can quietly become the other.
+  const auto narrow_column = Decimals(d18_4, values);
+  const auto wide_column = Decimals(LogicalType::Decimal(19, 4), values);
   ASSERT_EQ(narrow_column->type_id(), arrow::Type::DECIMAL64);
+  ASSERT_EQ(wide_column->type_id(), arrow::Type::DECIMAL128);
 
-  arrow::Result<std::shared_ptr<arrow::Array>> wide;
-  {
-    const NarrowDecimalsFor narrowing(false);
-    wide = Eval(expr, {wide_column});
-  }
-  ASSERT_TRUE(wide.ok()) << wide.status().ToString();
-  EXPECT_EQ(static_cast<const arrow::DoubleArray&>(**wide).Value(0),
-            DuckDbDecimalToDouble(50005, 18, 4));
-  const NarrowDecimalsFor narrowing(true);
-  auto narrow = Eval(expr, {narrow_column});
+  auto narrow = Eval(times_one(d18_4), {narrow_column});
   ASSERT_TRUE(narrow.ok()) << narrow.status().ToString();
+  EXPECT_EQ(static_cast<const arrow::DoubleArray&>(**narrow).Value(0),
+            DuckDbDecimalToDouble(50005, 18, 4));
+  auto wide = Eval(times_one(LogicalType::Decimal(19, 4)), {wide_column});
+  ASSERT_TRUE(wide.ok()) << wide.status().ToString();
   EXPECT_TRUE((*wide)->Equals(**narrow)) << (*wide)->ToString() << "\nagainst\n"
                                          << (*narrow)->ToString();
 }
@@ -1908,7 +1868,7 @@ TEST_F(ComputeTest, ADecimalConvertsToDoubleByDuckDbsRuleAtEitherWidth) {
 //
 // A modulo is the sharp shape: it rescales the narrower operand and then divides by it, so an
 // un-rescaled divisor is 100x too small and the remainder is wrong rather than merely unscaled.
-TEST_F(ComputeTest, ARescaledOperandIsReadRescaledAtEitherWidth) {
+TEST_F(ComputeTest, ARescaledOperandIsReadRescaled) {
   const LogicalType money = LogicalType::Decimal(15, 2);  // the operand a rescale moves
   const LogicalType finer = LogicalType::Decimal(18, 4);  // the result's scale
   // 4.0004 % 10.50 is 4.0004: the dividend is smaller, so the answer is the dividend -- but only
@@ -1917,12 +1877,10 @@ TEST_F(ComputeTest, ARescaledOperandIsReadRescaledAtEitherWidth) {
   const std::vector<std::optional<std::string>> divisor = {"1050", "1050", "1050"};
   const auto expr = Arith(ArithOp::kModulo, ColumnAt(0, finer), ColumnAt(1, money), finer);
 
-  for (const bool narrowing_on : {false, true}) {
-    const NarrowDecimalsFor narrowing(narrowing_on);
-    SCOPED_TRACE(std::format("narrowing {}", narrowing_on));
+  {
     const auto left = Decimals(finer, dividend);
     const auto right = Decimals(money, divisor);
-    ASSERT_EQ(left->type_id(), narrowing_on ? arrow::Type::DECIMAL64 : arrow::Type::DECIMAL128);
+    ASSERT_EQ(left->type_id(), arrow::Type::DECIMAL64);
     auto out = Eval(expr, {left, right});
     ASSERT_TRUE(out.ok()) << out.status().ToString();
     EXPECT_EQ(UnscaledText(**out), "DECIMAL(18,4): 40004 -30003 null");
@@ -1932,7 +1890,7 @@ TEST_F(ComputeTest, ARescaledOperandIsReadRescaledAtEitherWidth) {
 // A CASE over DECIMALs scatters each branch's values into the result, through a kernel Arrow has
 // for decimal128 and not for decimal64 (ADR 0021's decimal64 item). Two branches and an ELSE, so
 // the scatter runs more than once and over a result that already holds values.
-TEST_F(ComputeTest, ANarrowDecimalCaseScattersAsTheWideOneDoes) {
+TEST_F(ComputeTest, ANarrowDecimalCaseScattersIntoItsResult) {
   using Kind = plan::Predicate::Kind;
   const LogicalType money = LogicalType::Decimal(15, 2);
   const auto keys = Int16s({1, 2, 3, 4, 5, std::nullopt});
@@ -1952,23 +1910,15 @@ TEST_F(ComputeTest, ANarrowDecimalCaseScattersAsTheWideOneDoes) {
   const std::vector<std::optional<std::string>> b = {"5", "6", "-25", std::nullopt, "7", "8"};
   const std::vector<std::optional<std::string>> c = {"9", "10", "11", "12", std::nullopt, "13"};
 
-  std::string wide;
-  {
-    const NarrowDecimalsFor narrowing(false);
-    auto out = Eval(expr, {keys, Decimals(money, a), Decimals(money, b), Decimals(money, c)});
-    ASSERT_TRUE(out.ok()) << out.status().ToString();
-    wide = UnscaledText(**out);
-    EXPECT_EQ(wide, "DECIMAL(15,2): 1700 null -25 null null 13")
-        << "the wide arm answered something else";
-  }
-  const NarrowDecimalsFor narrowing(true);
   auto out = Eval(expr, {keys, Decimals(money, a), Decimals(money, b), Decimals(money, c)});
   ASSERT_TRUE(out.ok()) << out.status().ToString();
   EXPECT_EQ((*out)->type_id(), arrow::Type::DECIMAL64);
   EXPECT_EQ((*out)->data()->buffers[1]->size(),
             static_cast<std::int64_t>(sizeof(std::int64_t)) * (*out)->length())
       << "the values buffer is not eight bytes a row: the scatter widened the result";
-  EXPECT_EQ(UnscaledText(**out), wide) << "the narrow CASE answered differently";
+  // Rows 0 and 2 come from the first and second branches; the rest from the ELSE, which is where
+  // the NULL key lands.
+  EXPECT_EQ(UnscaledText(**out), "DECIMAL(15,2): 1700 null -25 null null 13");
 }
 
 }  // namespace

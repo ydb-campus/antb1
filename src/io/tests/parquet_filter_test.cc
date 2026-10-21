@@ -664,21 +664,6 @@ TEST_F(ParquetFilterErrorsTest, FixedWidthFilterErrorsAndClose) {
 // values are the gate: read with a filter on another column, the decimals must be exactly what the
 // unfiltered scan returns for the same rows, NULLs included, for an INT32- and an INT64-backed
 // column and whatever the batch size. ADR 0029's D1 is what needs this.
-// A scoped flip of plan's transitional narrowing switch (ADR 0021's decimal64 item).
-class NarrowDecimalsFor {
- public:
-  explicit NarrowDecimalsFor(bool on) : was_(plan::NarrowDecimals()) {
-    plan::SetNarrowDecimals(on);
-  }
-  ~NarrowDecimalsFor() { plan::SetNarrowDecimals(was_); }
-  NarrowDecimalsFor(const NarrowDecimalsFor&) = delete;
-  NarrowDecimalsFor& operator=(const NarrowDecimalsFor&) = delete;
-  NarrowDecimalsFor(NarrowDecimalsFor&&) = delete;
-  NarrowDecimalsFor& operator=(NarrowDecimalsFor&&) = delete;
-
- private:
-  bool was_;
-};
 
 TEST_F(ParquetFilterErrorsTest, DecimalColumnsReadAsTheUnfilteredScanReadsThem) {
   arrow::Int64Builder key;
@@ -719,17 +704,14 @@ TEST_F(ParquetFilterErrorsTest, DecimalColumnsReadAsTheUnfilteredScanReadsThem) 
     EXPECT_EQ(metadata->schema()->Column(1)->physical_type(), parquet::Type::INT32);
     EXPECT_EQ(metadata->schema()->Column(2)->physical_type(), parquet::Type::INT64);
   }
-  // Both widths (ADR 0021's decimal64 item). The switch has to be set before Open, which is where
-  // the engine schema is fixed, and the assertion that the two scans agree on their schema is what
-  // catches a filtered path that narrowed differently from the unfiltered one.
-  for (const bool narrow : {false, true}) {
-    SCOPED_TRACE(std::format("narrowing {}", narrow));
-    const NarrowDecimalsFor narrowing(narrow);
+  {
+    // The engine schema is fixed at Open, and the assertion that the filtered and unfiltered scans
+    // agree on it is what catches a filtered path that narrowed differently from the other one
+    // (ADR 0021's decimal64 item).
     auto opened = ParquetTable::Open({path}, ParquetTableOptions{});
     ASSERT_TRUE(opened.ok()) << opened.status().ToString();
     const auto& scanned = *opened;
-    EXPECT_EQ(scanned->schema()->field(1)->type()->id(),
-              narrow ? arrow::Type::DECIMAL64 : arrow::Type::DECIMAL128);
+    EXPECT_EQ(scanned->schema()->field(1)->type()->id(), arrow::Type::DECIMAL64);
     const std::vector<int> fields = {0, 1, 2};
     ASSERT_TRUE(scanned->supports_scan_filter(fields));  // the point of the change
     // A predicate on the key, not on a decimal: a decimal predicate is not pushed (PushableToScan).

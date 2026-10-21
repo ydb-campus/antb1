@@ -10,12 +10,8 @@
 #include <arrow/api.h>
 #include <gtest/gtest.h>
 
-#include "plan_test_util.h"
-
 namespace antb1::plan {
 namespace {
-
-using testing::NarrowDecimalsFor;
 
 struct NamedType {
   LogicalType::Id id;
@@ -131,14 +127,16 @@ TEST(TypesTest, MapsDecimals) {
   EXPECT_FALSE(IsInteger(LogicalType::Decimal(38, 0)));
 }
 
-// ADR 0021's decimal64 item, first step: with the switch on, a DECIMAL of at most 18 digits maps to
-// decimal64 and a wider one does not. Off is the default and the only configuration the rest of the
-// engine answers under today.
-TEST(TypesTest, NarrowingMapsADecimalOf18DigitsOrFewerToDecimal64) {
+// ADR 0021's decimal64 item: a DECIMAL of at most 18 digits is decimal64 and a wider one is
+// decimal128. The table is the boundary, which is the only interesting part of the rule -- 18
+// narrows and 19 does not -- and the round trip is what keeps the two representations one logical
+// type. There is no longer a setting under which a p <= 18 DECIMAL is decimal128, so the arm that
+// asserted it is gone with the switch rather than weakened.
+TEST(TypesTest, ADecimalOf18DigitsOrFewerMapsToDecimal64) {
   struct Case {
     std::uint8_t width;
     std::uint8_t scale;
-    bool narrow;  // whether the switch moves this one
+    bool narrow;
   };
   constexpr auto kCases = std::to_array<Case>({{.width = 1, .scale = 0, .narrow = true},
                                                {.width = 9, .scale = 2, .narrow = true},
@@ -146,34 +144,16 @@ TEST(TypesTest, NarrowingMapsADecimalOf18DigitsOrFewerToDecimal64) {
                                                {.width = 18, .scale = 18, .narrow = true},
                                                {.width = 19, .scale = 2, .narrow = false},
                                                {.width = 38, .scale = 6, .narrow = false}});
-
-  const bool before = NarrowDecimals();
-  {
-    const NarrowDecimalsFor narrowing(false);
-    for (const Case& c : kCases) {
-      const LogicalType type = LogicalType::Decimal(c.width, c.scale);
-      EXPECT_TRUE(ToArrow(type)->Equals(*arrow::decimal128(c.width, c.scale)))
-          << "off: " << ToString(type);
-      EXPECT_EQ(*FromArrow(*ToArrow(type)), type) << "off: " << ToString(type);
-    }
+  for (const Case& c : kCases) {
+    const LogicalType type = LogicalType::Decimal(c.width, c.scale);
+    const auto expected =
+        c.narrow ? arrow::decimal64(c.width, c.scale) : arrow::decimal128(c.width, c.scale);
+    EXPECT_TRUE(ToArrow(type)->Equals(*expected))
+        << ToString(type) << " gave " << ToArrow(type)->ToString();
+    EXPECT_EQ(*FromArrow(*ToArrow(type)), type) << ToString(type);
   }
-  {
-    const NarrowDecimalsFor narrowing(true);
-    EXPECT_TRUE(NarrowDecimals());
-    for (const Case& c : kCases) {
-      const LogicalType type = LogicalType::Decimal(c.width, c.scale);
-      const auto expected =
-          c.narrow ? arrow::decimal64(c.width, c.scale) : arrow::decimal128(c.width, c.scale);
-      EXPECT_TRUE(ToArrow(type)->Equals(*expected))
-          << "on: " << ToString(type) << " gave " << ToArrow(type)->ToString();
-      // The logical type survives the round trip either way, which is what lets the two
-      // representations coexist while the item's remaining steps land.
-      EXPECT_EQ(*FromArrow(*ToArrow(type)), type) << "on: " << ToString(type);
-    }
-    // HUGEINT is decimal128(38,0) whatever the switch says: 38 digits need 128 bits.
-    EXPECT_TRUE(ToArrow(LogicalType::kHugeInt)->Equals(*arrow::decimal128(38, 0)));
-  }
-  EXPECT_EQ(NarrowDecimals(), before) << "the guard did not restore the setting";
+  // HUGEINT is decimal128(38,0): 38 digits need 128 bits.
+  EXPECT_TRUE(ToArrow(LogicalType::kHugeInt)->Equals(*arrow::decimal128(38, 0)));
 }
 
 TEST(TypesTest, Classification) {

@@ -498,9 +498,33 @@ with exit code 4. The PR ids are the roadmap's, not divergence ids.
         Q21 1.013x, Q18 1.009x, Q09 1.008x at SF 100. Q05's remainder is the same conversion pass, now
         cheaper rather than gone -- removing it altogether means decoding Parquet without Arrow's
         Parquet-to-Arrow transfer on the unfiltered path too, which is a larger change than this item.
-      - **Next**: delete the switch, and with it `NarrowDecimalsFor`, the two-arm cases that exist only to
-        compare the widths, and the wide arms a p <= 18 type can no longer take.
-    - **N4, docs(adr): record what N1 to N3 measured**, and accept or defer the rest on those numbers.
+      - **Done.** The switch is deleted: `plan::ToArrow` narrows unconditionally at 18 digits or fewer, and
+        `SetNarrowDecimals`, `NarrowDecimals` and the four copies of the `NarrowDecimalsFor` guard are gone.
+        What the deletion asked of the cases that compared the two widths is the part worth recording, because
+        "collapse the arms" and "drop the assertion" look alike in a diff:
+        - **Where the two widths were selected by a SWITCH, they are now selected by the PRECISION**, which is
+          both expressible and stronger: 15 or 18 digits is decimal64 and 19 is decimal128, so the comparisons
+          in `ADecimalToDoubleReadsEitherWidth`, `ADecimalConvertsToDoubleByDuckDbsRule...`,
+          `MinMaxOfANarrowDecimalAnswersAtItsOwnWidth` and `ANarrowStepAgreesWithTheInt128Path...` survive
+          with both arms real. Each asserts the physical type of each arm, so neither can quietly become the
+          other.
+        - **Where one arm WAS the expectation, the expectation is now written out** and derived from the
+          arithmetic rather than read off the engine: the program's `94502250 20000000 0 null null
+          99999999999900`, the fallbacks' two rows, the sort orders, the five group sums, the MIN and MAX
+          texts. Every one of them was right first time, which is the only evidence that they state the rule
+          rather than the behaviour.
+        - **Where the arm was the subject itself, the case found a different differential**: the grouped
+          aggregates now compare one pass against a merge of three parts, which is a question the one width
+          still has.
+        - Three mutations confirm the collapsed cases still bite: a narrow append truncated to 32 bits, a
+          MIN/MAX answer left at the kernel's width, and a narrow sort prefix carrying no information.
+    - **N4, docs(adr): record what N1 to N3 measured**, and accept or defer the rest on those numbers. Done,
+      above: N1 and N3 are accepted on the SF 100 and SF 10 runs, N2 was dropped on its own premise, and the
+      item is closed. What it bought, against decimal128 and measured with the arms interleaved, is a geomean
+      of 0.985x at SF 100 and 0.984x at SF 10 with peak memory as low as 0.765x on one query; the single
+      largest gain is Q06 at 0.804x, which is also the one TPC-H-derived query this engine now answers faster
+      than DuckDB. What it cost is three paths this engine had to own because Arrow's decimal64 support is
+      younger than its decimal128 support: the comparison, the operand read, and the scatter.
 
 ## Alternatives considered
 
