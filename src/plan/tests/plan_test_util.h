@@ -233,21 +233,4 @@ inline std::string ScannedTable(const LogicalNode& node) {
   return "";
 }
 
-// A scoped flip of the transitional narrowing switch (ADR 0021's decimal64 item), so no case can
-// leave it on for the next one -- the cases of one binary run in one process. It goes away with the
-// switch; what it is for until then is a case whose subject IS one physical width, which has to say
-// so rather than inherit whatever the default happens to be.
-class NarrowDecimalsFor {
- public:
-  explicit NarrowDecimalsFor(bool on) : was_(NarrowDecimals()) { SetNarrowDecimals(on); }
-  ~NarrowDecimalsFor() { SetNarrowDecimals(was_); }
-  NarrowDecimalsFor(const NarrowDecimalsFor&) = delete;
-  NarrowDecimalsFor& operator=(const NarrowDecimalsFor&) = delete;
-  NarrowDecimalsFor(NarrowDecimalsFor&&) = delete;
-  NarrowDecimalsFor& operator=(NarrowDecimalsFor&&) = delete;
-
- private:
-  bool was_;
-};
-
 }  // namespace antb1::plan::testing

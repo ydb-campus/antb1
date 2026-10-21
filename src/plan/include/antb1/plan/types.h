@@ -20,7 +20,8 @@ class LogicalType {
     kBigInt,     // int64
     kUSmallInt,  // uint16 (ClickBench EventDate before the DATE override)
     kHugeInt,    // 128-bit integer result of integer SUM: arrow decimal128(38, 0)
-    // DECIMAL(p, s), 1 <= p <= 38, 0 <= s <= p: arrow decimal128(p, s), the unscaled value in an
+    // DECIMAL(p, s), 1 <= p <= 38, 0 <= s <= p: arrow decimal64(p, s) up to kMaxNarrowDecimalWidth
+    // digits and decimal128(p, s) above it, the unscaled value in an
     // Int128 (docs/adr/0021-decimal-semantics.md). Never an integer or numeric type for
     // IsInteger/IsNumeric: every context but the ones ADR 0021 lists for it rejects it.
     kDecimal,
@@ -49,9 +50,10 @@ class LogicalType {
   }
   // The widest DECIMAL precision (and the widest HUGEINT, in digits).
   static constexpr std::uint8_t kMaxDecimalWidth = 38;
-  // The most digits an int64 holds, and so the band a decimal64 can represent. Rule 6 caps a
-  // product of two operands of at most this many digits at this many, which is what makes the
-  // band the common case rather than a corner.
+  // The most digits an int64 holds, and so the band ToArrow gives decimal64 rather than decimal128
+  // ([ADR 0021](../../../../../docs/adr/0021-decimal-semantics.md)'s decimal64 item). Rule 6 caps a
+  // product of two operands of at most this many digits at this many, which is what makes the band
+  // the common case rather than a corner.
   static constexpr std::uint8_t kMaxNarrowDecimalWidth = 18;
 
   [[nodiscard]] constexpr Id id() const { return id_; }
@@ -80,23 +82,6 @@ std::string ToString(LogicalType type);
 
 // The Arrow type the engine uses for a logical type (VARCHAR is always arrow::binary()).
 std::shared_ptr<arrow::DataType> ToArrow(LogicalType type);
-
-// Transitional, and the first step of [ADR
-// 0021](../../../../../docs/adr/0021-decimal-semantics.md)'s decimal64 item: whether a DECIMAL(p,s)
-// of at most LogicalType::kMaxNarrowDecimalWidth digits maps to decimal64 instead of decimal128,
-// which halves the bytes each of its values moves.
-//
-// ON by default as of this step, on a measurement: at SF 100 over the 22 TPC-H-derived queries the
-// geomean is 0.985x of decimal128 and peak memory falls as far as 0.765x on one of them. Off is
-// kept for one PR longer, so that a regression attributable to the representation can be confirmed
-// by flipping one call rather than by reverting a merge; it is not a configuration to build on,
-// since the wide arms of the cases that compare the two widths go away with the switch.
-//
-// Set once, before a query runs. It is atomic because ToArrow is called from the part pipelines of
-// a running query, and relaxed because nothing orders anything against it. It goes away with the
-// item's last step, and so does this comment.
-void SetNarrowDecimals(bool on);
-[[nodiscard]] bool NarrowDecimals();
 
 // Maps a storage type to a logical type; NotImplemented (with a clear message) for unsupported
 // types.

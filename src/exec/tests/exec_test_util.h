@@ -162,27 +162,8 @@ inline std::shared_ptr<arrow::Array> Timestamps(const std::vector<std::optional<
   return ArrayOf<arrow::TimestampBuilder>(arrow::timestamp(arrow::TimeUnit::MICRO), micros);
 }
 
-// A scoped flip of plan's transitional narrowing switch (ADR 0021's decimal64 item), so no case
-// leaves it on for the next. It goes away with the switch; what it is for until then is a case
-// whose subject IS one physical width, which has to say so rather than inherit it.
-class NarrowDecimalsFor {
- public:
-  explicit NarrowDecimalsFor(bool on) : was_(plan::NarrowDecimals()) {
-    plan::SetNarrowDecimals(on);
-  }
-  ~NarrowDecimalsFor() { plan::SetNarrowDecimals(was_); }
-  NarrowDecimalsFor(const NarrowDecimalsFor&) = delete;
-  NarrowDecimalsFor& operator=(const NarrowDecimalsFor&) = delete;
-  NarrowDecimalsFor(NarrowDecimalsFor&&) = delete;
-  NarrowDecimalsFor& operator=(NarrowDecimalsFor&&) = delete;
-
- private:
-  bool was_;
-};
-
 // DECIMAL(precision, scale) values (HUGEINT: 38, 0), unscaled, in decimal digits -- at the physical
-// width plan::ToArrow gives that type, which is decimal64 for at most 18 digits with the switch on
-// and decimal128 otherwise.
+// width plan::ToArrow gives that type, which is decimal64 up to 18 digits and decimal128 above it.
 //
 // Width-aware on purpose, and this is the helper every decimal fixture should go through.
 // `arrow::Decimal128Builder builder(plan::ToArrow(type))` is not a builder of the wrong width: it

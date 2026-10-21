@@ -481,22 +481,6 @@ TEST_F(ParquetScanTest, ConvertsToTheEngineView) {
 // (INT32, INT64 or FIXED_LEN_BYTE_ARRAY) and whatever an ARROW:schema restores (decimal32,
 // decimal64, decimal128 or decimal256): the engine's DECIMAL(p, s) (ADR 0021). Wider decimals stay
 // unsupported.
-// A scoped flip of plan's transitional narrowing switch (ADR 0021's decimal64 item), so no case
-// leaves it on for the next.
-class NarrowDecimalsFor {
- public:
-  explicit NarrowDecimalsFor(bool on) : was_(plan::NarrowDecimals()) {
-    plan::SetNarrowDecimals(on);
-  }
-  ~NarrowDecimalsFor() { plan::SetNarrowDecimals(was_); }
-  NarrowDecimalsFor(const NarrowDecimalsFor&) = delete;
-  NarrowDecimalsFor& operator=(const NarrowDecimalsFor&) = delete;
-  NarrowDecimalsFor(NarrowDecimalsFor&&) = delete;
-  NarrowDecimalsFor& operator=(NarrowDecimalsFor&&) = delete;
-
- private:
-  bool was_;
-};
 
 TEST_F(ParquetScanTest, ReadsEveryDecimalStorage) {
   arrow::Decimal32Builder d9(arrow::decimal32(9, 2));
@@ -539,13 +523,10 @@ TEST_F(ParquetScanTest, ReadsEveryDecimalStorage) {
                      arrow::field("wide", arrow::decimal256(40, 0))}),
       {d9.Finish().ValueOrDie(), d18.Finish().ValueOrDie(), d38.Finish().ValueOrDie(),
        d256.Finish().ValueOrDie(), d15.Finish().ValueOrDie(), wide.Finish().ValueOrDie()});
-  const std::vector<std::shared_ptr<arrow::DataType>> wide_types = {
-      arrow::decimal128(9, 2), arrow::decimal128(18, 4), arrow::decimal128(38, 10),
-      arrow::decimal128(38, 0), arrow::decimal128(15, 2)};
-  // With ADR 0021's narrowing on, a DECIMAL of at most 18 digits is decimal64 whatever the file
-  // stored it as: the engine type follows plan::ToArrow and nothing else, which is the invariant
-  // plan::Table::schema() states. The 38-digit columns stay decimal128.
-  const std::vector<std::shared_ptr<arrow::DataType>> narrow_types = {
+  // A DECIMAL of at most 18 digits is decimal64 whatever width the file stored it as, and a wider
+  // one is decimal128: the engine type follows plan::ToArrow and nothing else, which is the
+  // invariant plan::Table::schema() states (ADR 0021's decimal64 item).
+  const std::vector<std::shared_ptr<arrow::DataType>> engine_types = {
       arrow::decimal64(9, 2), arrow::decimal64(18, 4), arrow::decimal128(38, 10),
       arrow::decimal128(38, 0), arrow::decimal64(15, 2)};
   const std::vector<std::vector<std::string>> expected = {
@@ -555,13 +536,10 @@ TEST_F(ParquetScanTest, ReadsEveryDecimalStorage) {
        "0E-10", "null"},
       {"null", "-" + nines38, nines38, "7"},
       {"-123.45", "9999999999999.99", "0.00", "null"}};
-  for (const bool narrow : {false, true}) {
-    const NarrowDecimalsFor narrowing(narrow);
-    const auto& engine_types = narrow ? narrow_types : wide_types;
+  {
     for (const bool store_schema : {false, true}) {
       for (const bool as_integers : {false, true}) {
-        SCOPED_TRACE(std::format("narrowing {}, ARROW:schema {}, integer storage {}", narrow,
-                                 store_schema, as_integers));
+        SCOPED_TRACE(std::format("ARROW:schema {}, integer storage {}", store_schema, as_integers));
         const std::string path =
             Write(std::format("decimals_{}_{}.parquet", store_schema, as_integers), data, 2,
                   store_schema, as_integers);
@@ -913,16 +891,13 @@ TEST_F(ParquetScanTest, NarrowingAByteArrayDecimal) {
     return path;
   };
 
-  {  // in range at both widths: a positive, a negative, and a NULL, over a sliced batch
+  {  // in range: a positive, a negative, and a NULL, over a sliced batch
     const std::string path =
         column_of("byte_array_ok.parquet", {{0x30, 0x39}, {0xFB}, {0x05, 0xF5, 0xE0, 0xFF}});
-    for (const bool narrow : {false, true}) {
-      SCOPED_TRACE(std::format("narrowing {}", narrow));
-      const NarrowDecimalsFor narrowing(narrow);
+    {
       auto table = ParquetTable::Open({path}, ParquetTableOptions{});
       ASSERT_TRUE(table.ok()) << table.status().ToString();
-      EXPECT_EQ((*table)->schema()->field(0)->type()->id(),
-                narrow ? arrow::Type::DECIMAL64 : arrow::Type::DECIMAL128);
+      EXPECT_EQ((*table)->schema()->field(0)->type()->id(), arrow::Type::DECIMAL64);
       for (const int64_t batch_size : {int64_t{1}, int64_t{2}, int64_t{64}}) {
         const Scanned s = Scan(**table, {0}, batch_size);
         ASSERT_NE(s.table, nullptr) << batch_size;
@@ -939,7 +914,6 @@ TEST_F(ParquetScanTest, NarrowingAByteArrayDecimal) {
     // ValidateFull rejects, whatever width it is read at, so "this file reads today" is not a
     // claim worth making: it is malformed by Arrow's standard and not only by this engine's. What
     // the narrow arm has to do is name it rather than truncate it.
-    const NarrowDecimalsFor narrowing(true);
     auto table = ParquetTable::Open({path}, ParquetTableOptions{});
     ASSERT_TRUE(table.ok()) << table.status().ToString();
     // Drained by hand: the Scan helper asserts every read succeeds, which is the opposite of what
@@ -980,21 +954,15 @@ TEST_F(ParquetScanTest, ReadsByteArrayDecimals) {
     writer->Close();
     ASSERT_TRUE(out->Close().ok());
   }
-  // At both engine widths, as ReadsEveryDecimalStorage does: the file is the same either way (the
-  // writer above is raw Parquet), and the engine type follows plan::ToArrow and nothing else.
-  for (const bool narrow : {false, true}) {
-    const NarrowDecimalsFor narrowing(narrow);
-    SCOPED_TRACE(std::format("narrowing {}", narrow));
-    auto table = ParquetTable::Open({path}, ParquetTableOptions{});
-    ASSERT_TRUE(table.ok()) << table.status().ToString();
-    const auto expected_type = narrow ? arrow::decimal64(9, 2) : arrow::decimal128(9, 2);
-    EXPECT_TRUE((*table)->schema()->field(0)->type()->Equals(*expected_type))
-        << (*table)->schema()->field(0)->type()->ToString();
-    const Scanned s = Scan(**table, {0}, 3);
-    ASSERT_NE(s.table, nullptr);
-    EXPECT_EQ(Texts(*s.table, 0),
-              (std::vector<std::string>{"123.45", "-0.05", "null", "999999.99"}));
-  }
+  auto table = ParquetTable::Open({path}, ParquetTableOptions{});
+  ASSERT_TRUE(table.ok()) << table.status().ToString();
+  // Nine digits, so decimal64: the engine type follows plan::ToArrow and not the storage, which is
+  // a BYTE_ARRAY here (ADR 0021's decimal64 item).
+  EXPECT_TRUE((*table)->schema()->field(0)->type()->Equals(*arrow::decimal64(9, 2)))
+      << (*table)->schema()->field(0)->type()->ToString();
+  const Scanned s = Scan(**table, {0}, 3);
+  ASSERT_NE(s.table, nullptr);
+  EXPECT_EQ(Texts(*s.table, 0), (std::vector<std::string>{"123.45", "-0.05", "null", "999999.99"}));
 }
 
 // Statistics of a part (a row group) for skipping it: exact min, max and NULL count for

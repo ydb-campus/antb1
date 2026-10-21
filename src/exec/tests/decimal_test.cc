@@ -349,16 +349,15 @@ std::shared_ptr<arrow::Array> Decimals64(int precision, int scale,
   return builder.Finish().ValueOrDie();
 }
 
-// Every comparison a filter makes against a DECIMAL column, at the narrow physical width (ADR
+// Every comparison a filter makes against a DECIMAL column of the narrow physical width (ADR
 // 0021's decimal64 item). PredicateEvaluator::Make chooses the mode from the column's physical
-// type, so testing DECIMAL128 alone left a narrow column with no mode at all: the three it could
-// not reach rejected the query as a type error, and the fourth -- the DOUBLE column -- silently
-// converted with Arrow's cast instead of DuckDB's rule, which is a wrong answer rather than a
-// refusal.
+// type, so when that type was new it left a narrow column with no mode at all: three of these
+// rejected the query as a type error, and the fourth -- the DOUBLE column -- silently converted
+// with Arrow's cast instead of DuckDB's rule, which is a wrong answer rather than a refusal.
 //
 // 5.0005 is the value the two conversions disagree about: DuckDB divides the unscaled value by
 // 10^4, Arrow multiplies by 10^-4, and they land on different doubles.
-TEST_F(DecimalTest, AFilterComparesANarrowDecimalAsItComparesTheWideOne) {
+TEST_F(DecimalTest, AFilterComparesANarrowDecimalEveryWayItCan) {
   const int width = 18;
   const int scale = 4;
   const auto column = Column(0, "p", LogicalType::Decimal(width, scale));
@@ -406,33 +405,21 @@ TEST_F(DecimalTest, AFilterComparesANarrowDecimalAsItComparesTheWideOne) {
     return out;
   };
 
-  // Each arm names its width, for the column AND for the constants: ToArrowScalar follows the same
-  // switch plan::ToArrow does, so a wide column with a narrow constant is a pair no plan builds and
-  // PredicateEvaluator::Make rightly refuses it.
-  std::vector<std::vector<std::optional<bool>>> wide;
-  {
-    const testing::NarrowDecimalsFor narrowing(false);
-    wide = answers(
-        Decimals(width, scale, {Int128{50005}, Int128{-50005}, std::nullopt, Int128{15000}}));
-  }
+  const std::vector<std::vector<std::optional<bool>>> answered =
+      answers(Decimals64(width, scale, unscaled));
   // Row 0 is the only 5.0005, so every arm but < and the exact one answers true there and nowhere
   // else. Stated once, so a mode that answered "all false" could not pass by agreeing with itself.
-  ASSERT_EQ(wide.size(), 8U);
-  EXPECT_EQ(wide[0], (std::vector<std::optional<bool>>{true, false, kNull, false}));
-  EXPECT_EQ(wide[1], (std::vector<std::optional<bool>>{false, true, kNull, false}));
-  EXPECT_EQ(wide[2], (std::vector<std::optional<bool>>{true, false, kNull, true}));
-  EXPECT_EQ(wide[3], (std::vector<std::optional<bool>>{true, false, kNull, true}));
-  EXPECT_EQ(wide[4], (std::vector<std::optional<bool>>{true, true, kNull, false}));
+  ASSERT_EQ(answered.size(), 8U);
+  EXPECT_EQ(answered[0], (std::vector<std::optional<bool>>{true, false, kNull, false}));
+  EXPECT_EQ(answered[1], (std::vector<std::optional<bool>>{false, true, kNull, false}));
+  EXPECT_EQ(answered[2], (std::vector<std::optional<bool>>{true, false, kNull, true}));
+  EXPECT_EQ(answered[3], (std::vector<std::optional<bool>>{true, false, kNull, true}));
+  EXPECT_EQ(answered[4], (std::vector<std::optional<bool>>{true, true, kNull, false}));
   // Against the column of its own type: 5.0005 > 5.0005 false, -5.0005 > -4.0004 false, NULL,
   // 1.5 > 1.4999 true; and = only on row 0.
-  EXPECT_EQ(wide[5], (std::vector<std::optional<bool>>{false, false, kNull, true}));
-  EXPECT_EQ(wide[6], (std::vector<std::optional<bool>>{true, false, kNull, false}));
-  EXPECT_EQ(wide[7], (std::vector<std::optional<bool>>{true, false, kNull, false}));
-
-  const testing::NarrowDecimalsFor narrowing(true);
-  const auto narrow_values = Decimals64(width, scale, unscaled);
-  ASSERT_EQ(narrow_values->type_id(), arrow::Type::DECIMAL64);
-  EXPECT_EQ(answers(narrow_values), wide) << "a narrow column compared differently";
+  EXPECT_EQ(answered[5], (std::vector<std::optional<bool>>{false, false, kNull, true}));
+  EXPECT_EQ(answered[6], (std::vector<std::optional<bool>>{true, false, kNull, false}));
+  EXPECT_EQ(answered[7], (std::vector<std::optional<bool>>{true, false, kNull, false}));
 }
 
 }  // namespace

@@ -131,36 +131,20 @@ TEST_F(SortTest, EveryEngineType) {
   EXPECT_EQ(SortedIds(batch, {Key(6, LogicalType::Decimal(15, 2), true)}), (Ids{0, 1, 3, 2}));
 }
 
-// A narrow DECIMAL key sorts to the same order as the wide one (ADR 0021's decimal64 item, step
-// 4). It takes a different comparator and a different prefix, and is `exact` where the wide one is
-// not -- the whole value fits the prefix -- so the comparator is never called for it and only the
-// order can say the prefix is right.
-TEST_F(SortTest, ANarrowDecimalKeySortsAsTheWideOneDoes) {
+// A narrow DECIMAL key takes its own comparator and its own prefix, and is `exact` -- the whole
+// value fits the prefix -- so the comparator is never called for it and only the order can say the
+// prefix is right (ADR 0021's decimal64 item).
+TEST_F(SortTest, ANarrowDecimalKeySortsByItsValue) {
   const LogicalType money = LogicalType::Decimal(15, 2);
-  const std::vector<std::optional<std::string>> unscaled = {
-      "1700", "-25", std::nullopt, "-99999999999999", "0", "1700"};
+  // 17.00, -0.25, NULL, -999999999999.99, 0.00 and 17.00 again -- the repeat is there because a
+  // tie is the one thing a prefix cannot decide on its own.
+  const auto batch = WithIds(
+      {testing::Decimals(money, {"1700", "-25", std::nullopt, "-99999999999999", "0", "1700"})});
+  ASSERT_EQ(batch->column(1)->type_id(), arrow::Type::DECIMAL64);
 
-  // Both arms are the same code under a different setting: testing::Decimals builds at whatever
-  // width plan::ToArrow asks for, which is the width the sort key's Bind then dispatches on.
-  const auto column = [&](bool narrowing_on) {
-    const testing::NarrowDecimalsFor narrowing(narrowing_on);
-    const auto values = testing::Decimals(money, unscaled);
-    EXPECT_EQ(values->type_id(), narrowing_on ? arrow::Type::DECIMAL64 : arrow::Type::DECIMAL128);
-    return WithIds({values});
-  };
-  const auto wide = column(false);
-  const auto narrow = column(true);
-
-  for (const bool descending : {false, true}) {
-    Ids expected;
-    {
-      const testing::NarrowDecimalsFor narrowing(false);
-      expected = SortedIds(wide, {Key(1, money, descending)});
-    }
-    const testing::NarrowDecimalsFor narrowing(true);
-    EXPECT_EQ(SortedIds(narrow, {Key(1, money, descending)}), expected)
-        << "descending=" << descending;
-  }
+  // By value, NULLS LAST, and the tie between rows 0 and 5 broken by their order in the input.
+  EXPECT_EQ(SortedIds(batch, {Key(1, money)}), (Ids{3, 1, 4, 0, 5, 2}));
+  EXPECT_EQ(SortedIds(batch, {Key(1, money, /*descending=*/true)}), (Ids{0, 5, 4, 1, 3, 2}));
 }
 
 TEST_F(SortTest, LaterKeysBreakTies) {

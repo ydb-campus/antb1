@@ -239,25 +239,14 @@ TEST_F(GroupedSumAliasTest, AnIntegerColumnAnswersThoughItSharesNothingYet) {
 
 // ---- the aggregates at the narrow physical width (ADR 0021's decimal64 item, step 3) ----
 
-std::shared_ptr<arrow::Array> Decimals64Of(
-    const std::vector<std::optional<std::string>>& unscaled) {
-  arrow::Decimal64Builder builder(arrow::decimal64(Money().width(), Money().scale()));
-  for (const auto& v : unscaled) {
-    const auto status =
-        v.has_value() ? builder.Append(arrow::Decimal64(std::stoll(*v))) : builder.AppendNull();
-    EXPECT_TRUE(status.ok()) << status.ToString();
-  }
-  std::shared_ptr<arrow::Array> out;
-  EXPECT_TRUE(builder.Finish(&out).ok());
-  return out;
-}
-
 // Rows whose decimal column is narrow or wide, with the keys and the other columns unchanged.
-std::shared_ptr<arrow::RecordBatch> RowsAtWidth(bool narrow) {
+// The same shape as Rows(), with values that reach past 32 bits so a narrow append that truncated
+// to one would be caught, and with the decimal column repeated so it can be both key and value.
+std::shared_ptr<arrow::RecordBatch> WideValueRows() {
   const auto keys = testing::Int64s({1, 1, 2, 2, 3, 3, 1});
   const std::vector<std::optional<std::string>> v = {
       "1050025", "2500", "700", std::nullopt, std::nullopt, std::nullopt, "999999999999"};
-  const auto values = narrow ? Decimals64Of(v) : Decimals(v);
+  const auto values = Decimals(v);
   const auto w = testing::Int64s({5, 6, 7, 8, 9, 10, 11});
   return arrow::RecordBatch::Make(
       arrow::schema({arrow::field("k", arrow::int64()), arrow::field("v", values->type()),
@@ -265,33 +254,28 @@ std::shared_ptr<arrow::RecordBatch> RowsAtWidth(bool narrow) {
       7, {keys, values, values, w});
 }
 
-// SUM, AVG, MIN and MAX of a decimal column answer the same at either width, through one pass and
-// through a merge. SUM and AVG keep their 38-digit result type either way; MIN and MAX take the
-// column's own type, so theirs is the one that narrows with it.
-TEST_F(GroupedSumAliasTest, TheAggregatesAnswerTheSameAtEitherWidth) {
+// SUM, AVG, MIN and MAX of a narrow decimal column: the result TYPES are the thing the width
+// decides, and one pass must answer what a merge of three parts answers. SUM keeps its 38-digit
+// type and AVG is DOUBLE whatever the input is, so neither narrows; MIN and MAX take the column's
+// own type and so are decimal64 with it (ADR 0021's decimal64 item).
+TEST_F(GroupedSumAliasTest, TheAggregatesKeepTheirOwnWidthsAndMergeToOnePass) {
   const auto min_call = Call(plan::AggKind::kMin, 1, Money(), Money());
   const auto max_call = Call(plan::AggKind::kMax, 1, Money(), Money());
-  for (const int parts : {1, 3}) {
-    std::shared_ptr<arrow::Table> wide;
-    {
-      const testing::NarrowDecimalsFor narrowing(false);
-      auto out = Through({Sum(1), Avg(1), min_call, max_call}, *RowsAtWidth(false), parts);
-      ASSERT_TRUE(out.ok()) << out.status().ToString();
-      wide = *out;
-    }
-    const testing::NarrowDecimalsFor narrowing(true);
-    auto narrow = Through({Sum(1), Avg(1), min_call, max_call}, *RowsAtWidth(true), parts);
-    ASSERT_TRUE(narrow.ok()) << narrow.status().ToString();
+  const std::vector<plan::AggregateCall> calls = {Sum(1), Avg(1), min_call, max_call};
+  auto single = Through(calls, *WideValueRows(), /*parts=*/1);
+  ASSERT_TRUE(single.ok()) << single.status().ToString();
+  auto merged = Through(calls, *WideValueRows(), /*parts=*/3);
+  ASSERT_TRUE(merged.ok()) << merged.status().ToString();
 
-    // SUM and AVG are DECIMAL(38,s) and DOUBLE whatever the input width, so those columns compare
-    // directly; MIN and MAX follow the input, so they differ in type and compare as strings.
-    EXPECT_TRUE((*narrow)->column(1)->Equals(*wide->column(1))) << "SUM, parts=" << parts;
-    EXPECT_TRUE((*narrow)->column(2)->Equals(*wide->column(2))) << "AVG, parts=" << parts;
-    EXPECT_EQ((*narrow)->column(3)->type()->id(), arrow::Type::DECIMAL64) << "MIN stayed wide";
-    EXPECT_EQ((*narrow)->column(3)->ToString(), wide->column(3)->ToString())
-        << "MIN, parts=" << parts;
-    EXPECT_EQ((*narrow)->column(4)->ToString(), wide->column(4)->ToString())
-        << "MAX, parts=" << parts;
+  EXPECT_EQ((*single)->column(1)->type()->id(), arrow::Type::DECIMAL128) << "SUM is 38 digits";
+  EXPECT_EQ((*single)->column(2)->type()->id(), arrow::Type::DOUBLE) << "AVG is DOUBLE";
+  EXPECT_TRUE((*single)->column(3)->type()->Equals(*plan::ToArrow(Money())))
+      << "MIN takes the column's own type: " << (*single)->column(3)->type()->ToString();
+  EXPECT_EQ((*single)->column(3)->type()->id(), arrow::Type::DECIMAL64);
+  EXPECT_EQ((*single)->column(4)->type()->id(), arrow::Type::DECIMAL64);
+  for (int column = 1; column <= 4; ++column) {
+    EXPECT_EQ((*merged)->column(column)->ToString(), (*single)->column(column)->ToString())
+        << "a merge of three parts answered differently in column " << column;
   }
 }
 
@@ -300,7 +284,7 @@ TEST_F(GroupedSumAliasTest, TheAggregatesAnswerTheSameAtEitherWidth) {
 // hash decides which partition a group lands in. Nothing observable may change -- the groups and
 // their values are the answer, and their order is unspecified either way -- so the case compares
 // the rows as sets.
-TEST_F(GroupedSumAliasTest, ADecimalGroupingKeyGivesTheSameGroupsAtEitherWidth) {
+TEST_F(GroupedSumAliasTest, ADecimalGroupingKeyGroupsByItsValue) {
   // The SUM of each group, as a sorted multiset. The key itself prints at its own physical width,
   // so its text differs between the arms by construction; the sums are the answer and must not.
   const auto sums_of = [](const std::shared_ptr<arrow::Table>& table) {
@@ -316,8 +300,8 @@ TEST_F(GroupedSumAliasTest, ADecimalGroupingKeyGivesTheSameGroupsAtEitherWidth) 
   // Keyed on the decimal column itself, which is what puts a decimal through the key hash, with
   // repeats so it groups; the other decimal column is summed so each group carries a value to
   // compare. One aggregate is enough: what is in question is the grouping, not the aggregate.
-  const auto grouped = [&](bool narrow) {
-    const auto rows = RowsAtWidth(narrow);
+  const auto grouped = [&] {
+    const auto rows = WideValueRows();
     const auto key = Column(1, "v", Money());
     auto table = GroupTable::Make({key}, {Sum(2)}, rows->num_columns(),
                                   arrow::default_memory_pool(), nullptr);
@@ -337,16 +321,14 @@ TEST_F(GroupedSumAliasTest, ADecimalGroupingKeyGivesTheSameGroupsAtEitherWidth) 
     return arrow::Table::FromRecordBatches(schema, out).ValueOrDie();
   };
 
-  decltype(sums_of(grouped(false))) wide;
-  {
-    const testing::NarrowDecimalsFor narrowing(false);
-    wide = sums_of(grouped(false));
-  }
-  const testing::NarrowDecimalsFor narrowing(true);
-  const auto narrow = sums_of(grouped(true));
-  // Three of the seven rows have a NULL key, which is one group, so the fixture has five.
-  EXPECT_EQ(wide.size(), 5U) << "the fixture no longer gives five groups";
-  EXPECT_EQ(narrow, wide) << "a narrow key grouped differently, so the hash width is observable";
+  const auto table = grouped();
+  const auto sums = sums_of(table);
+  // Three of the seven rows have a NULL key, which is one group, so the fixture has five. The key
+  // column is decimal64, which is what puts eight bytes rather than sixteen through the key hash.
+  EXPECT_EQ(table->column(0)->type()->id(), arrow::Type::DECIMAL64);
+  ASSERT_EQ(sums.size(), 5U) << "the fixture no longer gives five groups";
+  EXPECT_EQ(sums, (std::vector<std::string>{"10500.25", "25.00", "7.00", "9999999999.99", "null"}))
+      << "a decimal key grouped by something other than its value";
 }
 
 }  // namespace
