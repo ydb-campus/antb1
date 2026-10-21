@@ -268,6 +268,13 @@ Accepted (with the maintainer-approved roadmap for joins, query blocks and uncor
   relations. Filters implied by an OR (each binding's conjuncts from every branch, OR-ed) are deferred.
   - Update (2026-10-10, J3): shipped as `src/plan/or_factoring.h`, called per element of `WHERE` and of an inner
     `ON`; `HAVING` is not factored. Q19 passes, so the TPC-H-derived ratchet moves to 8 of 22.
+  - Update (2026-10-21, J3): **the implied filters are no longer deferred** -- the sentence above was left standing
+    after they shipped. `DeriveImpliedInLists` (`src/plan/or_factoring.cc`) derives them per COLUMN rather than per
+    binding: where every branch of a top-level OR constrains one column to literals, their union holds for every row
+    the OR keeps, so `(c = 'A' AND x) OR (c = 'B' AND y)` contributes `c IN ('A', 'B')` beside the OR. The OR stays
+    where it is, which is what makes the derived conjunct redundant and so unable to change an answer -- only a plan.
+    Shipped 2026-10-15 in `f6c8563` (#144), which recorded the change in docs/sql-subset.md rather than here because
+    this path is CODEOWNERS-owned.
   - Update (2026-10-10, J3): the drop rule above is implemented as bind-then-drop, not as a plain drop. Taken
     literally, dropping `A OR (A AND Y)` down to `A` deletes `Y` before it is ever bound, so a bind error inside it
     disappears and `WHERE id = 1 OR (id = 1 AND nope > 1)` would answer instead of reporting that `nope` does not

@@ -128,7 +128,7 @@ Proposed
     string**. A table that cleared the old gates and not the 16 M column would not move Q32-Q34 at all, which is
     what the gates exist to prevent.
   - Update (2026-10-18, **the counts are wrong in both directions**): 4 M and 16 M, added the day before, measure
-    tables the engine cannot build — 64 partitions and a part bounded by its row group put every one of them in
+    tables the engine cannot build — the partition count and a part bounded by its row group put every one of them in
     10⁴-10⁶ groups (see the Consequences below). A table has to win **in that band**, so the counts to sweep are
     16 Ki, 256 Ki and 1 Mi, and the targets are the grouper's costs there rather than the 16 M column's. Keeping
     1000 is still right, and 4 M is worth reporting as the band the engine would reach if
@@ -153,7 +153,9 @@ Proposed
     cardinality, from one hint. With it, and with rows padded to whole words, the micro benchmark reads: 0.43× and
     0.39× at a thousand groups, 0.73× and 0.86× at 1 M, **1.38× and 1.59× at 4 M, 1.44× and 1.56× at 16 M** for one
     and two fixed-width keys.
-  - **What the gates could not see.** Those counts do not occur. `GroupTable::kPartitions` is 64 and a part's table
+  - **What the gates could not see.** Those counts do not occur. `GroupTable::kPartitions` was 64 when this was
+    measured and is 32 since #167 (`3132647`), which halves the partition count without moving the band this
+    paragraph is about; the two-level operator keeps its own 64 (`src/exec/part_operators.cc`). A part's table
     is bounded by its rows, so the largest table this engine builds is a partition table of q32 at **1,562,460
     groups**, and a part table is at most a row group — 442,467 rows on the official dataset. Every table the engine
     constructs falls in the 10⁴-10⁶ band, which is where the micro benchmark has this design at 0.46-0.88×. **The
