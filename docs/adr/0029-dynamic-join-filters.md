@@ -365,6 +365,43 @@ lesson of [ADR 0027](0027-string-views.md)'s S1, which was planned as a win whos
     | the other 21 | | 1.0009, this harness's noise |
 
     It closes that query from **4.6x of DuckDB to 1.35x**, and the answer is DuckDB's to the last digit.
+  - Update (2026-10-22, D5): **a Filter between the join and the aggregate dropped the offer**, so D5 reached
+    only an aggregate whose input had no `WHERE` of its own. The field carrying the offer names the nodes that
+    pass it on -- "a Filter as it is, a Project and a Compute with the key remapped, and every other node drops
+    it" -- and `Compute` and `Project` each do, each with the remap its node needs. `Filter`, named first and
+    needing no remap at all, never read it: its fallback passed six arguments where those two pass seven, so the
+    offer became a null pointer. The fix is that seventh argument.
+    - **The symptom is sharper than the cause**: a predicate that removes nothing at all still cost the filter.
+      Over one tenth-scale fact table, the aggregate built 147,241 groups with no predicate below it and
+      **1,500,000** with a predicate keeping every row. Selectivity had nothing to do with it, and neither did
+      the scan's one filter slot -- a predicate the scan cannot apply leaves that slot free and the offer was
+      still dropped.
+    - **Measured on the shape this item was built for**, plus a predicate below the aggregate that the scan
+      cannot apply, at SF 100 and four threads:
+
+      | | before | after |
+      | --- | ---: | ---: |
+      | the query | 8.373 s | **2.791 s (0.333x)** |
+      | rows out of its scan | 600,037,902 | **24,175,686** |
+      | its groups | 20,000,000 | **805,847** |
+      | its peak memory | 2,121 MB | **391 MB** |
+      | the 22 | | **1.002x -- no query of the 22 has this shape** |
+
+      That last line is the honest reading: this is worth 3x where it applies and nothing on this benchmark,
+      because every `WHERE` the 22 put below such an aggregate is one the scan can apply itself.
+    - **Why the suite could not see it.** D5's only positive case has no `WHERE` inside its inline view, which
+      is the one arrangement that worked, and its three refusals assert that nothing is dropped -- so they went
+      on passing for the wrong reason. Three cases join it: a predicate the scan cannot apply, red before the
+      fix; the refusal on a key the aggregate does not group by **with a Filter in the way**, a combination
+      nothing could reach before and which must still refuse, since a Filter does nothing to make the
+      aggregate's own value safe to filter on; and the limitation the fix stops at, pinned so that lifting it is
+      a visible change.
+    - **Still not carried: a Filter whose predicates go into the scan** (ADR 0020). They hold the one filter
+      slot a scan takes, so the published keys have nowhere to attach, and lifting that needs a `plan::ScanFilter`
+      that is the conjunction of two. Mechanical in principle -- a scan filter only clears bits of one shared
+      mask -- but it is a policy decision as much as a mechanism, because something has to choose between two
+      filters when only one slot exists, and which prunes more is not knowable at planning time. Left for its
+      own item, with a test standing on the current behaviour.
   - **The correctness condition is one sentence**: the filter is applied to a column the aggregate **groups by**,
     so it removes whole groups and never changes a surviving group's value. On any other column it would corrupt
     every aggregate. Mutation-checked -- dropping that requirement fails a test.
