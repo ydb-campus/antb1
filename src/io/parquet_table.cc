@@ -1,7 +1,6 @@
 #include "antb1/io/parquet_table.h"
 
 #include <algorithm>
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -285,13 +284,19 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecimalToInt64(
   // comparison each rather than kIn - 8 byte comparisons. This runs over every value of every
   // narrowed column of a scan that pushes no predicate, so what it costs is what the
   // representation costs on that path (ADR 0021's decimal64 item).
+  const auto word_at = [&](std::size_t row, std::size_t word) {
+    int64_t value = 0;
+    std::memcpy(&value, in.data() + (row * kIn) + (word * sizeof(value)), sizeof(value));
+    return value;
+  };
+  // One 64-bit load a word, rather than a copy of the whole value into a stack array that the
+  // optimizer then has to see through: the loads are the only thing this needs, so it asks for
+  // them directly.
   const auto narrow_row = [&](std::size_t row, int64_t* low) {
-    std::array<int64_t, kWords> words{};
-    std::memcpy(words.data(), in.data() + (row * kIn), kIn);
-    *low = words[0];
-    const int64_t sign = words[0] < 0 ? -1 : 0;  // the two's complement fill of the low word
+    *low = word_at(row, 0);
+    const int64_t sign = *low < 0 ? -1 : 0;  // the two's complement fill of the low word
     for (std::size_t w = 1; w < kWords; ++w) {
-      if (words[w] != sign) {
+      if (word_at(row, w) != sign) {
         return false;
       }
     }
