@@ -224,10 +224,24 @@ TEST(JoinOrderTest, SubsetRowsDividesOncePerPair) {
   EXPECT_EQ(SubsetRows(relations, std::vector{Edge(0, 1, 100, 100), Edge(0, 2, 10, 10)},
                        set_of({0, 1, 2})),
             1000);
-  // A key with no value at all empties the join; an unknown domain falls back to the relation's
-  // rows; and a relation of unknown rows counts as the largest, saturating rather than wrapping.
+  // A key with no value at all empties the join, whether or not the other side has a domain: one
+  // side having no value is the whole of the answer, and the unknown side cannot put rows back.
   EXPECT_EQ(SubsetRows(relations, std::vector{Edge(0, 1, 0, 100)}, set_of({0, 1})), 0);
-  EXPECT_EQ(SubsetRows(relations, std::vector{Edge(0, 1)}, set_of({0, 1})), 100);
+  EXPECT_EQ(SubsetRows(relations, std::vector{Edge(0, 1, std::nullopt, 0)}, set_of({0, 1})), 0);
+  EXPECT_EQ(SubsetRows(relations, std::vector{Edge(0, 1, 0, std::nullopt)}, set_of({0, 1})), 0);
+  // An edge neither side of which has a domain divides by nothing, so the join reads as the product
+  // of its inputs. A domain divides, so standing in the largest domain available -- the relation's
+  // rows -- would make the join read as the FEWEST rows it could have rather than the most, which
+  // is the one direction this estimate may not err in.
+  EXPECT_EQ(SubsetRows(relations, std::vector{Edge(0, 1)}, set_of({0, 1})), 1000 * 100);
+  // One side's domain is enough, and it divides alone: the unknown side cannot be fewer than the
+  // known one, so the known one is the whole of what the pair's selectivity is known to be. This is
+  // the case a derived table always produces, since only a table carries a domain.
+  EXPECT_EQ(SubsetRows(relations, std::vector{Edge(0, 1, std::nullopt, 25)}, set_of({0, 1})),
+            1000 * 100 / 25);
+  EXPECT_EQ(SubsetRows(relations, std::vector{Edge(0, 1, 25, std::nullopt)}, set_of({0, 1})),
+            1000 * 100 / 25);
+  // A relation of unknown rows still counts as the largest, saturating rather than wrapping.
   EXPECT_EQ(
       SubsetRows(Relations({std::nullopt, std::nullopt}), std::vector{Edge(0, 1)}, set_of({0, 1})),
       kLargest);
@@ -312,9 +326,14 @@ TEST(JoinOrderTest, AManyToManyEdgeWaitsWhileAKeyEdgeIsAvailable) {
       GreedyOrder(relations, std::vector{Edge(0, 1, 500, 500), Edge(0, 2, 2, 2)});
   EXPECT_EQ(Order(with_domains), (std::vector<std::size_t>{0, 1, 2}));
   EXPECT_EQ(Estimates(with_domains), (std::vector<int64_t>{1000, 5000}));
+  // The control still takes m first, on row counts alone. What it no longer does is believe that
+  // doing so costs 10 rows: with no domain on either edge the steps read as the products of their
+  // inputs, 10,000 and 5,000,000, which over-states the true 5,000 twofold where the old reading
+  // under-stated it five-hundredfold. An estimate that reads a many-to-many join as a key lookup
+  // is how the search comes to pick one.
   const auto rows_only = GreedyOrder(relations, std::vector{Edge(0, 1), Edge(0, 2)});
   EXPECT_EQ(Order(rows_only), (std::vector<std::size_t>{0, 2, 1}));
-  EXPECT_EQ(Estimates(rows_only), (std::vector<int64_t>{10, 5}));
+  EXPECT_EQ(Estimates(rows_only), (std::vector<int64_t>{10'000, 5'000'000}));
 }
 
 // Every edge between the relation that joins and those already joined is a key of its join, so the

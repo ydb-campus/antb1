@@ -335,6 +335,46 @@ Accepted (with the maintainer-approved roadmap for joins, query blocks and uncor
     bits, rounded down and saturated at 2^63 - 1, and is at least 1 unless an input has no row or a key column no
     non-NULL value (then it is 0). A relation of unknown rows counts as the largest, also where its rows stand in for
     an unknown domain.
+  - Update (2026-10-22): **an unknown domain no longer stands in its relation's rows, because this ADR stated both
+    halves of a hazard and never joined them up.** Four lines above, it says the domains are what keep a
+    many-to-many edge out of the order, since "ordering by row counts alone can take such an edge first and
+    multiply the intermediate result". Then the refinement above made an unknown domain read as exactly that: the
+    relation's rows. An edge with one such side therefore divided by the row count instead of by the domain the
+    footers did know, because the pair's divisor is the larger of the two.
+    - **A domain divides, so it is the mirror of a row count and not its twin.** Unknown rows must read as the
+      largest because rows multiply, and the largest reading is the most rows. A domain in a denominator inverts
+      that: the largest reading is the FEWEST rows, which is the one direction an estimate may not err in. The two
+      helpers sat beside each other with the same word and opposite safety.
+    - **Measured, and it is not a small error.** A derived table's columns carry no domain at all -- the binder
+      reads one only from a table -- so an edge between a base-table column of 25 values and a derived column of
+      1,200,243 rows divided by 1,200,243. A join the search then ranked **cheapest at 150,000 rows produced
+      6,697,748,923**, and the query ran **145.2 s where the same query with that one join ordered differently runs
+      140.6 ms: 1033x**, same answer either way. With the domain read correctly the estimate lands within 8% of the
+      truth: one wrong input, nothing else.
+    - **What it now does.** An edge divides by the largest of its two sides' domains that the footers know, and an
+      unknown side contributes nothing. One known side is enough: since the divisor is the larger of the two
+      domains, and the unknown one can only be larger or smaller with nothing to say which, the known domain is
+      the whole of what the pair's selectivity is known to be. Where neither side is known the edge divides by 1
+      and the join reads as the
+      product of its inputs -- deliberately the most pessimistic reading available, since any value between "the
+      largest domain possible" and "no information" is a guess, and a guess here is paid for in materialised rows.
+    - **No query of the 22 reached it**, because none of them joins on a derived table's column inside a block
+      where the order matters. Every rewrite that introduces a derived table does reach it, which is how it was
+      found: the first attempt at moving a grouped aggregate below a join hit it immediately.
+    - **Two tests encoded the old reading as correct, and both are now corrected rather than relaxed.** One
+      asserted an estimate of 10 for a join whose output its own comment put at 5,000 -- a 500x under-statement,
+      labelled "the control"; it now reads 10,000, a 2x over-statement. The other was a guard against moving a
+      semi join onto more rows than it would see above (ADR 0029's D0), and its comment credited "a wide key
+      domain" that did not exist: the fixture's table declared a row count and no statistics, so the guard rested
+      on the substitution it was testing against. The fixture now declares the domain, which is the number the
+      estimator used to invent, so that case reads as it always did and now for a stated reason.
+    - **A guard against the shape was considered and refused.** Penalising a join whose only edge has a tiny
+      domain fires on 9 of the 22 -- every one a dimension lookup where the small side's key is its primary key,
+      including Q09's own supplier-to-nation join, which is the query ADR 0026's C5 rule exists to protect. The
+      discriminating condition is non-uniqueness on both sides, which the metadata gives for a base table and
+      cannot give for a derived one, so the fix belongs at the input and not at the decision. Propagating a base
+      column's domain through a derived table's pass-through columns would narrow the remaining gap and is left as
+      its own item.
 - **Build sides.**
   - An inner join builds on the input with the smaller footer row count, where a join below stands in with its
     estimate, and on the relation being added on a tie. With the largest relation as the probe, the probe side

@@ -59,11 +59,41 @@ int64_t BlockRows(std::span<const JoinRelation> relations, std::size_t relation)
   return std::max<int64_t>(relations[relation].rows.value_or(kLargest), 0);
 }
 
-// A key's distinct values: the footers' domain where there is one, else its relation's rows, which
-// is the most distinct values it could have.
-int64_t BlockDomain(std::span<const JoinRelation> relations, const std::optional<int64_t>& domain,
-                    std::size_t relation) {
-  return domain.has_value() ? std::max<int64_t>(*domain, 0) : BlockRows(relations, relation);
+// What one edge divides by, and whether it is empty: the largest of its two sides' domains that the
+// footers know. An unknown domain contributes NOTHING here rather than standing in its relation's
+// rows -- the exact mirror of BlockRows above, and for the mirrored reason. Rows multiply, so an
+// unknown that reads as the largest reads as the most rows, which is the safe direction. A domain
+// DIVIDES, so an unknown that reads as the largest reads as the FEWEST rows, which is the one
+// direction an estimate must never err in: under-stating the rows of a build is what materialises a
+// side that does not fit (ADR 0026's C5), and under-stating an intermediate is what lets the search
+// pick a plan that multiplies.
+//
+// This is the whole of a 1013x: a derived table's columns have no domain at all, because
+// KeyDomainOf (src/plan/binder.cc) reads one only from a table, so an edge between a base-table
+// column of 25 values and a derived column of 1,200,243 rows divided by 1,200,243 instead of by 25,
+// and a join the search ranked cheapest at 150,000 rows produced 6,697,748,923 of them. ADR 0022
+// records both halves of that and never joined them up.
+//
+// Where neither side is known the edge divides by 1 and the join reads as the product of its
+// inputs. That is deliberately the most pessimistic reading available: there is no value between
+// "the largest domain possible" and "no information" that is not a guess, and a guess here is paid
+// for in materialised rows.
+struct EdgeDivisor {
+  int64_t divisor = 1;  // 1: neither side's domain is known
+  bool empty = false;   // a known domain of zero: that key has no value at all
+};
+
+EdgeDivisor DivisorOf(const JoinEdge& edge) {
+  EdgeDivisor out;
+  for (const std::optional<int64_t>& domain : {edge.a_domain, edge.b_domain}) {
+    if (!domain.has_value()) {
+      continue;
+    }
+    const int64_t values = std::max<int64_t>(*domain, 0);
+    out.empty = out.empty || values == 0;
+    out.divisor = std::max(out.divisor, values);
+  }
+  return out;
 }
 
 // `a * b`, saturated: a subset of a dozen relations can multiply past 128 bits before any domain
@@ -80,16 +110,14 @@ Int128 Multiplied(Int128 a, int64_t b) {
 // under-stating the rows of a build is what materialises a side that does not fit. ADR 0026's C5
 // records the query that proved it. This is the estimate a step carries and the one ChooseBuildSide
 // reads; only the search's own cost reads the narrower, independence-assuming one.
-int64_t JoinRowsOf(std::span<const JoinRelation> relations, std::span<const JoinEdge> edges,
-                   int64_t left, int64_t right, std::span<const std::size_t> crossing) {
+int64_t JoinRowsOf(std::span<const JoinEdge> edges, int64_t left, int64_t right,
+                   std::span<const std::size_t> crossing) {
   bool empty = left == 0 || right == 0;
   int64_t divisor = 1;
   for (const std::size_t e : crossing) {
-    const JoinEdge& edge = edges[e];
-    const int64_t a = BlockDomain(relations, edge.a_domain, edge.a);
-    const int64_t b = BlockDomain(relations, edge.b_domain, edge.b);
-    empty = empty || a == 0 || b == 0;
-    divisor = std::max({divisor, a, b});
+    const EdgeDivisor edge = DivisorOf(edges[e]);
+    empty = empty || edge.empty;
+    divisor = std::max(divisor, edge.divisor);
   }
   return empty ? 0 : std::max<int64_t>(Saturated(Int128{left} * right / divisor), 1);
 }
@@ -105,8 +133,7 @@ struct PairDivisors {
   [[nodiscard]] std::size_t At(std::size_t u, std::size_t v) const { return (u * n) + v; }
 };
 
-PairDivisors DivisorsOf(std::span<const JoinRelation> relations, std::span<const JoinEdge> edges) {
-  const std::size_t n = relations.size();
+PairDivisors DivisorsOf(std::size_t n, std::span<const JoinEdge> edges) {
   PairDivisors out{
       .divisor = std::vector<int64_t>(n * n, 1), .empty = std::vector<bool>(n * n, false), .n = n};
   std::vector<Int128> product(n * n, 0);  // 0: no edge between the pair yet
@@ -114,17 +141,16 @@ PairDivisors DivisorsOf(std::span<const JoinRelation> relations, std::span<const
     ANTB1_CHECK(edge.a < n);
     ANTB1_CHECK(edge.b < n);
     ANTB1_CHECK(edge.a != edge.b);
-    const int64_t a = BlockDomain(relations, edge.a_domain, edge.a);
-    const int64_t b = BlockDomain(relations, edge.b_domain, edge.b);
+    const EdgeDivisor one = DivisorOf(edge);
     const std::size_t at = out.At(std::min(edge.a, edge.b), std::max(edge.a, edge.b));
-    if (a == 0 || b == 0) {
+    if (one.empty) {
       out.empty[at] = true;  // a key with no value at all: the join keeps no row
     }
     // Within a pair the larger domain wins rather than the two multiplying: two keys between the
     // same two relations are one composite key, and its parts narrow together -- a foreign key
     // into a composite primary key is the common case, and multiplying there under-stated Q09's
     // largest join by 7.5x and made the search choose it first (ADR 0026's C5).
-    product[at] = std::max({product[at], Int128{1}, Int128{a}, Int128{b}});
+    product[at] = std::max({product[at], Int128{1}, Int128{one.divisor}});
   }
   for (std::size_t u = 0; u < n; ++u) {
     for (std::size_t v = u + 1; v < n; ++v) {
@@ -240,9 +266,8 @@ class Searcher {
         crossing.push_back(e);
       }
     }
-    const int64_t rows =
-        JoinRowsOf(relations_, edges_, std::max<int64_t>(left.rows.value_or(kLargest), 0),
-                   std::max<int64_t>(right.rows.value_or(kLargest), 0), crossing);
+    const int64_t rows = JoinRowsOf(edges_, std::max<int64_t>(left.rows.value_or(kLargest), 0),
+                                    std::max<int64_t>(right.rows.value_or(kLargest), 0), crossing);
     steps.push_back(JoinStep{.left = left.operand,
                              .right = right.operand,
                              .edges = std::move(crossing),
@@ -484,7 +509,7 @@ class Orderer {
     if (crossing.empty()) {
       return std::nullopt;  // no edge to the joined relations: it cannot join yet
     }
-    return JoinRowsOf(relations_, edges_, rows, Rows(candidate), crossing);
+    return JoinRowsOf(edges_, rows, Rows(candidate), crossing);
   }
 
   // The side the step that adds `relation` builds on (rule 5): the relation it adds, unless its
@@ -583,7 +608,7 @@ std::optional<std::size_t> FirstUnconnected(std::size_t relations,
 
 int64_t SubsetRows(std::span<const JoinRelation> relations, std::span<const JoinEdge> edges,
                    RelationSet set) {
-  const PairDivisors pairs = DivisorsOf(relations, edges);
+  const PairDivisors pairs = DivisorsOf(relations.size(), edges);
   // In relation order, multiplying each relation's rows in and dividing by the divisor of every
   // pair it closes with a relation already taken in. Dividing as it goes keeps the running value
   // near a real cardinality, so nothing overflows in practice, and the order is fixed, so the

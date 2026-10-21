@@ -143,7 +143,13 @@ inline Catalog MakeCatalog() {
       std::abort();
     }
   };
-  must(catalog.Register("t", std::make_shared<FakeTable>(AllTypesSchema(), 100)));
+  // `t`'s key column declares a domain, rather than leaving the estimator to stand its row count
+  // in for one: a join over it then narrows because the metadata says so. The number is the row
+  // count, so `i16` is a key of these 100 rows, which is what the cases joining `t` to `ok` were
+  // written against -- they read as they always did, and now for a stated reason.
+  const auto with_key = std::make_shared<FakeTable>(AllTypesSchema(), 100);
+  with_key->WithDistinctCount(0, /*field=*/0, 100);  // i16
+  must(catalog.Register("t", with_key));
   must(catalog.Register("u", std::make_shared<FakeTable>(AllTypesSchema(), std::nullopt)));
   must(catalog.Register(
       "dup", std::make_shared<FakeTable>(arrow::schema({arrow::field("a", arrow::int32()),
