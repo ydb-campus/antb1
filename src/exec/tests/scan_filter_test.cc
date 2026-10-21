@@ -293,15 +293,125 @@ TEST_F(ScanFilterTest, DecimalsComparedInDouble) {
                  "NOT IN");
 }
 
-// columns() lists each column a predicate reads once, in the order of first use.
-TEST_F(ScanFilterTest, ReadsEachColumnOnce) {
+// columns() lists each column a predicate reads once, cheapest work per row removed first -- not in
+// the order the predicates were given. Here a BIGINT column (decode, keeping a third of the rows)
+// outranks a VARCHAR column asked for a LIKE and an IS NOT NULL, even though the VARCHAR one is
+// named first (ADR 0020's predicate ordering).
+TEST_F(ScanFilterTest, ReadsEachColumnOnceCheapestFirst) {
   const auto batch = Batch();
   const auto filter = MakeScanFilter(
       {Like(S(), "a%", false), testing::Compare(B(), CompareOp::kGt, testing::BigInt(0)),
        Of(Kind::kIsNotNull, S())},
       *batch->schema(), arrow::default_memory_pool());
   ASSERT_TRUE(filter.ok()) << filter.status().ToString();
-  EXPECT_EQ((*filter)->columns(), (std::vector<int>{3, 0}));
+  EXPECT_EQ((*filter)->columns(), (std::vector<int>{0, 3}));
+}
+
+// And the order does not depend on the order the query wrote its conjuncts in, which is the whole
+// point: the same filter spelled either way reads its columns in the same order. Spelled with the
+// VARCHAR IN first, this cost 2.486 s against 1.091 s the other way round over 600 million rows
+// (ADR 0020), because the scan applied the columns as the WHERE clause named them.
+TEST_F(ScanFilterTest, TheOrderDoesNotDependOnHowTheQueryWroteIt) {
+  const auto batch = Batch();
+  const std::vector<plan::Predicate> cheap_first = {
+      testing::Compare(B(), CompareOp::kGt, testing::BigInt(0)),
+      In(S(), {Text("a"), Text("b")}, false)};
+  const std::vector<plan::Predicate> dear_first = {cheap_first[1], cheap_first[0]};
+  const auto order = [&](const std::vector<plan::Predicate>& predicates) {
+    auto filter = MakeScanFilter(predicates, *batch->schema(), arrow::default_memory_pool());
+    EXPECT_TRUE(filter.ok()) << filter.status().ToString();
+    return filter.ok() ? (*filter)->columns() : std::vector<int>{};
+  };
+  EXPECT_EQ(order(cheap_first), (std::vector<int>{0, 3}));
+  EXPECT_EQ(order(dear_first), (std::vector<int>{0, 3})) << "the spelling decided the order";
+}
+
+// Two columns of equal rank keep the order the query wrote: a plan may depend on the query and the
+// metadata and on nothing else, so the tie-break has to be something the query fixes.
+TEST_F(ScanFilterTest, TwoColumnsOfOneCostGoByWhatTheyRemove) {
+  const auto batch = Batch();
+  // Both fixed-width, so both cost their decode and nothing else: only selectivity is left to
+  // decide, and an equality is assumed to remove more than a range bound.
+  const auto filter = MakeScanFilter({testing::Compare(I(), CompareOp::kGt, Integer(0)),
+                                      testing::Compare(B(), CompareOp::kEq, testing::BigInt(0))},
+                                     *batch->schema(), arrow::default_memory_pool());
+  ASSERT_TRUE(filter.ok()) << filter.status().ToString();
+  EXPECT_EQ((*filter)->columns(), (std::vector<int>{0, 1}));
+}
+
+TEST_F(ScanFilterTest, AnInListOfSeveralValuesCostsOnePerValue) {
+  const auto batch = Batch();
+  // Two VARCHAR columns, each read once: three values compared cost more than one pattern matched,
+  // enough to outweigh the pattern being assumed the more selective of the two.
+  const auto filter =
+      MakeScanFilter({In(S(), {Text("a"), Text("b"), Text("c")}, false), Like(N(), "a%", false)},
+                     *batch->schema(), arrow::default_memory_pool());
+  ASSERT_TRUE(filter.ok()) << filter.status().ToString();
+  EXPECT_EQ((*filter)->columns(), (std::vector<int>{4, 3}));
+}
+
+TEST_F(ScanFilterTest, APatternMatchCostsMoreThanTwoValuesCompared) {
+  const auto batch = Batch();
+  // The other side of the same coin: a pattern match is dearer per row than two values compared,
+  // by enough to outweigh the pattern being assumed the more selective. Written pattern-first, so
+  // only the cost of the kinds can produce the expected order.
+  const auto filter =
+      MakeScanFilter({Like(S(), "a%", false), In(N(), {Text("a"), Text("b")}, false)},
+                     *batch->schema(), arrow::default_memory_pool());
+  ASSERT_TRUE(filter.ok()) << filter.status().ToString();
+  EXPECT_EQ((*filter)->columns(), (std::vector<int>{4, 3}));
+}
+
+// The next two cases are the ones where the cost decides against the selectivity, so neither can
+// come out right by accident: a fixed-width column goes first although it removes far less, and a
+// VARCHAR column's second predicate adds its own weight rather than riding along with the first.
+TEST_F(ScanFilterTest, AFixedWidthColumnGoesFirstEvenWhenItRemovesLittle) {
+  const auto batch = Batch();
+  const auto filter = MakeScanFilter({testing::Compare(S(), CompareOp::kLt, Text("a")),
+                                      testing::Compare(B(), CompareOp::kNe, testing::BigInt(0)),
+                                      testing::Compare(B(), CompareOp::kNe, testing::BigInt(1))},
+                                     *batch->schema(), arrow::default_memory_pool());
+  ASSERT_TRUE(filter.ok()) << filter.status().ToString();
+  EXPECT_EQ((*filter)->columns(), (std::vector<int>{0, 3}))
+      << "a column that removes a fifth of the rows for nothing still goes first";
+}
+
+TEST_F(ScanFilterTest, ASecondPredicateOnAColumnAddsItsOwnCost) {
+  const auto batch = Batch();
+  const auto filter = MakeScanFilter({testing::Compare(S(), CompareOp::kGt, Text("a")),
+                                      testing::Compare(S(), CompareOp::kLt, Text("b")),
+                                      testing::Compare(N(), CompareOp::kEq, Text("a"))},
+                                     *batch->schema(), arrow::default_memory_pool());
+  ASSERT_TRUE(filter.ok()) << filter.status().ToString();
+  EXPECT_EQ((*filter)->columns(), (std::vector<int>{4, 3}))
+      << "two predicates on one column were weighed as one";
+}
+
+TEST_F(ScanFilterTest, AFixedWidthColumnsPredicateCountDoesNotMoveIt) {
+  const auto batch = Batch();
+  // A two-sided range and an equality are assumed to remove the same share, and a fixed-width
+  // column's predicates are free, so these two tie and the query's order stands. Were the second
+  // predicate on the first column billed anything, it would sink below the one-predicate column.
+  const auto filter = MakeScanFilter({testing::Compare(B(), CompareOp::kGt, testing::BigInt(0)),
+                                      testing::Compare(B(), CompareOp::kLt, testing::BigInt(5)),
+                                      testing::Compare(I(), CompareOp::kEq, Integer(0))},
+                                     *batch->schema(), arrow::default_memory_pool());
+  ASSERT_TRUE(filter.ok()) << filter.status().ToString();
+  EXPECT_EQ((*filter)->columns(), (std::vector<int>{0, 1}));
+}
+
+TEST_F(ScanFilterTest, ColumnsOfEqualRankKeepTheOrderTheQueryGave) {
+  const auto batch = Batch();
+  // Two VARCHAR columns asked the same thing: equal cost and equal assumed selectivity.
+  const auto both = [&](const plan::BoundColumn& first, const plan::BoundColumn& second) {
+    auto filter = MakeScanFilter({testing::Compare(first, CompareOp::kGt, Text("a")),
+                                  testing::Compare(second, CompareOp::kGt, Text("a"))},
+                                 *batch->schema(), arrow::default_memory_pool());
+    EXPECT_TRUE(filter.ok()) << filter.status().ToString();
+    return filter.ok() ? (*filter)->columns() : std::vector<int>{};
+  };
+  EXPECT_EQ(both(S(), N()), (std::vector<int>{3, 4}));
+  EXPECT_EQ(both(N(), S()), (std::vector<int>{4, 3}));
 }
 
 TEST_F(ScanFilterTest, PushesSingleColumnComparisonsWithConstants) {

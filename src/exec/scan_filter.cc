@@ -6,6 +6,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -201,11 +202,72 @@ class StringPredicate {
 };
 
 // The predicates of one scan column.
+// Per-column cost, in units of a hundredth of a second over the measurement below, and measured
+// end to end rather than guessed: one predicate on one column of 600 million rows at four threads,
+// the column held constant so the decode is constant, wall seconds ->
+//
+//   a DATE column, one range bound        0.389   (two bounds: also 0.389)
+//   a VARCHAR column, = one value         1.560
+//   a VARCHAR column, IN two values       2.156
+//   a VARCHAR column, LIKE a suffix       2.742
+//
+// What belongs in this weight is only the work a LATE position avoids, because that is the only
+// work the order can move. A column's decode is not it: io reads every row of every one of the
+// filter's columns whatever the selection says, and a fixed-width column's predicate is an Arrow
+// kernel over the whole array (io::FilteredScanReader::FilterStrings and ReadFixed). What a late
+// position does avoid is the per-row predicate work on a VARCHAR column, which skips the rows
+// already rejected, and the copy of the values it keeps.
+//
+// So the 1.560 s above is mostly unavoidable and only its difference from 2.156 s is not: one value
+// compared is 0.596 s. Taking a hundredth of a second as the unit,
+//
+//   one value compared, length and memcmp    60 units   (0.596 s)
+//   one LIKE pattern matched                180 units   (2.742 s less the 0.964 s decode)
+//   a fixed-width column's predicates         1 unit    (under the noise floor; see below)
+//
+// A fixed-width column gets 1 rather than 0 because two bounds on a DATE column cost what one bound
+// does, 0.389 s either way, which puts its avoidable work under the ~0.005 s those repeats agree
+// to -- under a single unit, not at zero. Zero would also break the comparator (see Order).
+//
+// Measured against the two orders this gets right and the old one got wrong: a fixed-width column
+// removing a seventh of the rows, and a VARCHAR column with two predicates removing almost all of
+// them, run 2.13 s with the fixed-width column first and 2.30 s with it last -- the fixed-width
+// column should go first even though it removes far less, because its own work costs the same
+// wherever it goes.
+//
+// A dictionary-encoded VARCHAR column is far cheaper than these weights (ADR 0020: 0.19 ns a row
+// against 5.6), but whether Arrow will grant the dictionary is known only when the chunk is read,
+// which is after this order is fixed. So the weights are the undiscounted ones, and a column that
+// turns out to be dictionary-encoded is ordered more pessimistically than it deserves.
+constexpr std::int64_t kFixedWidthCost = 1;
+constexpr std::int64_t kStringCompareCost = 60;
+constexpr std::int64_t kStringLikeCost = 180;
+
+// The fraction of rows a predicate is assumed to keep, out of kAllSurvive, when nothing is known
+// about the column's values. These mirror the no-statistics defaults of plan::PredicateRows
+// (src/plan/join_order.cc) and are deliberately a separate, coarser statement: that one estimates
+// a relation's rows for the join order and divides by a column's domain where the footers give
+// one, while this one ranks columns within a scan and has no statistics at hand at all. Neither
+// term dominates: what a column removes spans 10..100 of these, and nothing at all for the kinds
+// assumed to keep every row, which is as wide a span as the weights above. So both halves of the
+// rank decide real orders, and the next real improvement here is this column's own part
+// statistics, which the scan could reach through plan::Table::part_stats.
+constexpr std::int64_t kAllSurvive = 100;
+constexpr std::int64_t kEqualSurvives = 10;
+constexpr std::int64_t kRangeSurvives = 33;
+constexpr std::int64_t kLikeSurvives = 25;
+
 struct ColumnPredicates {
   bool strings = false;                     // VARCHAR: evaluated on views
   std::shared_ptr<arrow::Schema> schema;    // the column alone (fixed-width)
   std::vector<PredicateEvaluator> fixed;    // fixed-width, on the column alone
   std::vector<StringPredicate> on_strings;  // VARCHAR
+  // What reading and filtering this column costs -- its read plus a term per predicate -- and what
+  // fraction of rows survives it, for the order the scan applies the columns in (Order below). Both
+  // are per column, because the unit the scan loops over is a column: it reads one, narrows the
+  // selection, and only then reads the next.
+  std::int64_t cost = 0;
+  std::int64_t survives = kAllSurvive;  // out of kAllSurvive
 };
 
 class PredicateScanFilter final : public plan::ScanFilter {
@@ -325,6 +387,106 @@ class KeyScanFilter final : public plan::ScanFilter {
   std::shared_ptr<std::atomic<int64_t>> dropped_;  // nullptr: the scan is not counting
 };
 
+// What `p` adds to its column's cost. A predicate on a fixed-width column adds nothing a late
+// position would avoid: its kernel runs over the whole array wherever the column is placed.
+std::int64_t CostOf(const ColumnPredicates& c, const plan::Predicate& p) {
+  if (!c.strings) {
+    return 0;
+  }
+  switch (p.kind) {
+    case Kind::kLike:
+    case Kind::kNotLike:
+      return kStringLikeCost;
+    case Kind::kIn:
+    case Kind::kNotIn:
+      // One length test and memcmp per value of the list. Linear is right over the range where
+      // this term can decide anything: a list of ten values or more is assumed below to keep every
+      // row, which sends the column last on selectivity alone whatever its cost, and under ten is
+      // also where StringPredicate walks the values instead of searching them.
+      return kStringCompareCost * std::max<std::int64_t>(1, Narrow<std::int64_t>(p.values.size()));
+    default:
+      return kStringCompareCost;
+  }
+}
+
+// The fraction of rows `p` is assumed to keep, out of kAllSurvive.
+std::int64_t SurvivesOf(const plan::Predicate& p) {
+  switch (p.kind) {
+    case Kind::kCompare:
+      switch (p.op) {
+        case plan::CompareOp::kEq:
+          return kEqualSurvives;
+        case plan::CompareOp::kNe:
+          return kAllSurvive - kEqualSurvives;
+        default:
+          return kRangeSurvives;
+      }
+    case Kind::kIn:
+      return std::min(kAllSurvive, kEqualSurvives * Narrow<std::int64_t>(p.values.size()));
+    case Kind::kNotIn:
+      return kAllSurvive -
+             std::min(kAllSurvive, kEqualSurvives * Narrow<std::int64_t>(p.values.size()));
+    case Kind::kLike:
+      return kLikeSurvives;
+    case Kind::kNotLike:
+      return kAllSurvive - kLikeSurvives;
+    default:  // kIsNotNull and anything else: assume it keeps everything
+      return kAllSurvive;
+  }
+}
+
+// Orders the columns the scan applies, cheapest work per row removed first.
+//
+// The scan reads one column, narrows the selection, then reads the next, so a column placed early
+// pays its cost over every row while the columns after it pay theirs only over the rows it left.
+// The order that minimises the total is by ascending `cost / (1 - survives)` -- Hellerstein and
+// Stonebraker's rank ordering for a conjunction, and the choke point Dreseler et al. call predicate
+// positioning (PVLDB 13(8); ADR 0020, "ordering the columns a scan filters"). Compared as a cross
+// product, so no division and no floating point enters a planning decision, and stable, so columns
+// of equal rank keep the order the query wrote them in: std::sort would leave their order to the
+// standard library and so to the platform, and an EXPLAIN must not depend on that.
+//
+// A column that removes nothing needs no case of its own: its rank is a division by zero, and the
+// cross product sends it last on its own, because every cost is positive.
+//
+// That a cost is positive is also what makes this comparator a strict weak ordering, which
+// stable_sort requires and does not check: with it, the comparison is exactly `cost / removed`
+// compared over the rationals extended by the infinity at removed == 0, and a comparison of keys
+// drawn from an ordered set is a strict weak ordering by construction. A cost of zero would break
+// it -- a (0, 0) column would compare equivalent both to every other zero-cost column and to a
+// column of positive cost that those compare strictly before, and an intransitive equivalence in
+// stable_sort is undefined behaviour. Hence the assertion below rather than a remark here: a cost
+// is a sum of the weights above, so those being positive is the whole condition.
+//
+// No order changes an answer, so this is worth only time -- and it is worth 2.28x of it: the same
+// filter, two bounds on a DATE column and a two-value IN on a VARCHAR one over 600 million rows at
+// four threads, read 1.102 s written dates-first and 2.507 s written the other way round, because
+// the order was the order of the WHERE clause. Both spellings now read 1.103 s.
+//
+// The products cannot overflow: a column's cost would have to exceed 9.2e16 for `cost * removed` to
+// leave int64, and a cost is bounded by the length of the query's IN lists.
+static_assert(kFixedWidthCost > 0 && kStringCompareCost > 0 && kStringLikeCost > 0);
+
+void Order(std::vector<int>& columns, std::vector<ColumnPredicates>& per_column) {
+  std::vector<std::size_t> by_rank(columns.size());
+  std::ranges::iota(by_rank, std::size_t{0});
+  std::ranges::stable_sort(by_rank, [&](std::size_t a, std::size_t b) {
+    const std::int64_t removed_a = kAllSurvive - per_column[a].survives;
+    const std::int64_t removed_b = kAllSurvive - per_column[b].survives;
+    return per_column[a].cost * removed_b < per_column[b].cost * removed_a;
+  });
+  std::vector<int> ordered_columns;
+  std::vector<ColumnPredicates> ordered;
+  ordered_columns.reserve(columns.size());
+  ordered.reserve(per_column.size());
+  for (const std::size_t at : by_rank) {
+    ordered_columns.push_back(columns[at]);
+    ordered.push_back(std::move(per_column[at]));
+  }
+  columns = std::move(ordered_columns);
+  per_column = std::move(ordered);
+}
+
 }  // namespace
 
 bool PushableToScan(const plan::Predicate& predicate) {
@@ -375,10 +537,13 @@ arrow::Result<std::shared_ptr<const plan::ScanFilter>> MakeScanFilter(
       columns.push_back(index);
       ColumnPredicates c;
       c.strings = schema.field(index)->type()->id() == arrow::Type::BINARY;
+      c.cost = c.strings ? 0 : kFixedWidthCost;
       c.schema = arrow::schema({schema.field(index)});
       per_column.push_back(std::move(c));
     }
     ColumnPredicates& c = per_column[position];
+    c.cost += CostOf(c, p);
+    c.survives = (c.survives * SurvivesOf(p)) / kAllSurvive;
     if (c.strings) {
       // Same checks and errors as the Filter operator's.
       ARROW_RETURN_NOT_OK(PredicateEvaluator::Make(p, schema).status());
@@ -392,6 +557,7 @@ arrow::Result<std::shared_ptr<const plan::ScanFilter>> MakeScanFilter(
       c.fixed.push_back(std::move(evaluator));
     }
   }
+  Order(columns, per_column);
   return std::make_shared<const PredicateScanFilter>(std::move(columns), std::move(per_column),
                                                      pool);
 }
