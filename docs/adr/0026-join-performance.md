@@ -511,6 +511,13 @@ this profiling fires:
   no filter node at all, and four joins each carry 182,301,190 rows before the fifth cuts them to 583,512. No
   estimate can see that, so C5 cannot help until `n_name IN (...)` is *derived* from the disjunction — ADR 0022's
   deferred "filters implied by ORs". Self-contained, and `or_factoring.h` already exists for the related transform.
+  - **Update (2026-10-21): done, and this entry was stale.** The derivation shipped on 2026-10-15 in `f6c8563`
+    (#144) and ADR 0022's own J3 bullet now records it. `explain` of Q7 on this main holds
+    `Filter n1.n_name IN ('FRANCE', 'GERMANY')` above the nation scan, which is the node this entry says cannot
+    exist, and the scan is shared between the query's two nation relations as well (ADR 0030). Q7 reads 1.77x of
+    DuckDB at SF 100 on four threads, against the 4.8x recorded above -- measured on one binary, arms interleaved,
+    so it is comparable with the other figures in this ADR, though the work between the two is more than this one
+    item and the whole of that fall is not attributable to it.
 - **Q2 and Q17** want the semi-join reduction, as C3a's update above establishes by measurement.
 - **Q5, 4.6x**, is the one that genuinely wants C5: its filters are visible and its order is still greedy left-deep
   from the largest relation.

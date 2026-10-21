@@ -308,8 +308,9 @@ SELECT zn_id FROM zones WHERE EXISTS (SELECT * FROM trips WHERE tr_pickup = zn_i
 38
 40
 
-# An EXISTS outside a NOT EXISTS: the anti join keeps building on its subquery (ADR 0026's C2c is
-# not in), and the semi join above it reads its rows rather than giving up on them.
+# An EXISTS outside a NOT EXISTS: the semi join above the anti join reads its rows rather than
+# giving up on them. (This said "ADR 0026's C2c is not in" until 2026-10-21; C2c shipped on
+# 2026-10-16, so both joins may now emit their build side.)
 query I nosort
 SELECT COUNT(*) FROM zones WHERE NOT EXISTS (SELECT * FROM trips WHERE tr_pickup = zn_id AND tr_fare > 60) AND EXISTS (SELECT * FROM trips WHERE tr_dropoff = zn_id)
 ----
