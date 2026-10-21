@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -162,8 +163,22 @@ Int128 IntegerAt(const arrow::Array& column, int64_t i) {
       return static_cast<const arrow::UInt16Array&>(column).Value(i);
     case arrow::Type::DATE32:
       return static_cast<const arrow::Date32Array&>(column).Value(i);
+    // A DECIMAL's unscaled value, which is what its statistics carry (ADR 0021's part-statistics
+    // item). Eight bytes at 18 digits or fewer, sixteen above it.
+    case arrow::Type::DECIMAL64: {
+      std::int64_t value = 0;
+      std::memcpy(&value, static_cast<const arrow::Decimal64Array&>(column).GetValue(i),
+                  sizeof(value));
+      return value;
+    }
+    case arrow::Type::DECIMAL128: {
+      const arrow::Decimal128 value(static_cast<const arrow::Decimal128Array&>(column).GetValue(i));
+      return static_cast<Int128>(
+          (static_cast<UInt128>(static_cast<std::uint64_t>(value.high_bits())) << 64U) |
+          value.low_bits());
+    }
     default:
-      ADD_FAILURE() << "not integer-valued: " << column.type()->ToString();
+      ADD_FAILURE() << "no comparable value: " << column.type()->ToString();
       return 0;
   }
 }
@@ -189,12 +204,16 @@ TEST(Scan, PartStatisticsMatchThePartsRows) {
     ASSERT_NE(table, nullptr);
     for (int field = 0; field < table->schema()->num_fields(); ++field) {
       const auto type = plan::FromArrow(*table->schema()->field(field)->type());
-      const bool integer_valued =
+      // The types part_stats may report: integer-valued ones, and a DECIMAL whose storage is an
+      // integer. A DECIMAL's statistics may still be absent -- a FIXED_LEN_BYTE_ARRAY one is
+      // refused on the writer hazard -- which the `!stats.has_value()` skip below allows for, so
+      // what this checks for a decimal is that whatever IS reported matches the rows.
+      const bool comparable =
           type.ok() && ((plan::IsInteger(*type) && *type != plan::LogicalType::kHugeInt) ||
-                        *type == plan::LogicalType::kDate);
+                        *type == plan::LogicalType::kDate || *type == plan::LogicalType::kDecimal);
       for (int64_t part = 0; part < table->num_parts(); ++part) {
         const auto stats = table->part_stats(part, field);
-        if (!integer_valued) {
+        if (!comparable) {
           EXPECT_FALSE(stats.has_value()) << file << " field " << field;
           continue;
         }
@@ -233,7 +252,7 @@ TEST(Scan, PartStatisticsMatchThePartsRows) {
       }
     }
   }
-  EXPECT_GT(checked, 50) << "the fixtures have integer columns with statistics";
+  EXPECT_GT(checked, 50) << "the fixtures have columns with statistics";
   const auto edge = OpenFixture("edge.parquet");
   ASSERT_NE(edge, nullptr);
   for (const auto& [part, field] : std::vector<std::pair<int64_t, int>>{

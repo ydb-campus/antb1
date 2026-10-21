@@ -90,4 +90,15 @@ arrow::Result<LogicalType> FromArrow(const arrow::DataType& type);
 bool IsInteger(LogicalType type);
 bool IsNumeric(LogicalType type);
 
+// Whether a column of this type has part statistics that compare as one number: the integer-valued
+// types by value, and DECIMAL by its unscaled value. Said once here because three places need the
+// same answer and they are in different modules -- io decides what to report through
+// Table::part_stats, and exec decides what a predicate and what a top-N's bound may be compared
+// against. A HUGEINT is excluded: no column is one.
+//
+// It is NOT sufficient on its own for a DECIMAL. Two unscaled values compare only at one scale, so
+// a caller holding a constant as well as a column must check that their types agree; and io admits
+// a decimal's statistics only from an integer-backed column, on a writer hazard this cannot see.
+bool HasComparableStatistics(LogicalType type);
+
 }  // namespace antb1::plan

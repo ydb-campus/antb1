@@ -39,6 +39,7 @@
 
 #include "../group_table.h"
 #include "../part_operators.h"
+#include "../part_pruning.h"
 #include "../part_scheduler.h"
 #include "exec_test_util.h"
 
@@ -2275,6 +2276,107 @@ TEST_F(PartOperatorsTest, FiltersSkipPartsByTheirStatistics) {
 
 // Parts where the column is NULL on every row match no comparison, IN or IS NOT NULL; a folded
 // FALSE matches no part (a global aggregate over no part still gives its one row).
+// A DECIMAL column's statistics skip parts the same way an integer column's do, and the comparison
+// is on the UNSCALED values both sides carry (ADR 0021's part-statistics item). KeptParts is called
+// directly: what is in question is which parts survive a predicate, and a pipeline would only add
+// noise to that.
+//
+// The fixture is one part per decade of the value: part k holds 10.00*k .. 10.00*k + 9.00, so a
+// predicate's window maps onto whole parts and the expected set is arithmetic rather than a guess.
+TEST_F(PartOperatorsTest, KeptPartsSkipsByADecimalsStatistics) {
+  const LogicalType money = LogicalType::Decimal(15, 2);
+  const auto schema = arrow::schema({arrow::field("p", plan::ToArrow(money))});
+  arrow::RecordBatchVector batches;
+  for (int part = 0; part < 4; ++part) {
+    std::vector<std::optional<std::string>> unscaled;
+    unscaled.reserve(10);
+    for (int i = 0; i < 10; ++i) {
+      unscaled.emplace_back(std::to_string(((part * 10) + i) * 100));  // (10k + i).00
+    }
+    batches.push_back(arrow::RecordBatch::Make(schema, 10, {testing::Decimals(money, unscaled)}));
+  }
+  const auto table = std::make_shared<MemoryTable>(schema, std::move(batches), /*split=*/true);
+  ASSERT_EQ(table->num_parts(), 4);
+  const auto p = Column(0, "p", money);
+  const std::vector<int> fields = {0};
+  const auto decimal = [&](std::int64_t value) {
+    return plan::Constant{.type = money, .value = Int128{value}};
+  };
+  const auto kept = [&](const plan::Predicate& predicate) {
+    return KeptParts(*table, fields, {predicate});
+  };
+
+  // 25.00 lies in part 2 (20.00..29.00), so = keeps only it and the inequalities split there.
+  EXPECT_EQ(kept(testing::Compare(p, plan::CompareOp::kEq, decimal(2500))),
+            (std::vector<int64_t>{2}));
+  EXPECT_EQ(kept(testing::Compare(p, plan::CompareOp::kLt, decimal(2500))),
+            (std::vector<int64_t>{0, 1, 2}));
+  EXPECT_EQ(kept(testing::Compare(p, plan::CompareOp::kGt, decimal(2500))),
+            (std::vector<int64_t>{2, 3}));
+  // Outside every part's window, in both directions.
+  EXPECT_EQ(kept(testing::Compare(p, plan::CompareOp::kGt, decimal(100000))),
+            (std::vector<int64_t>{}));
+  EXPECT_EQ(kept(testing::Compare(p, plan::CompareOp::kLt, decimal(-1))), (std::vector<int64_t>{}));
+  plan::Predicate in{.kind = plan::Predicate::Kind::kIn, .column = p};
+  in.values = {decimal(500), decimal(3100)};  // 5.00 in part 0 and 31.00 in part 3
+  EXPECT_EQ(kept(in), (std::vector<int64_t>{0, 3}));
+
+  // A constant of another scale skips NOTHING, because an unscaled value means nothing without
+  // one: 2500 is 25.00 here and 2.500 at scale 3, and the statistics are this column's. The binder
+  // folds a constant to the column's type, so this is a guard rather than a shape a plan produces
+  // -- and the one thing that would be silently wrong if the scale were not checked.
+  EXPECT_EQ(kept(testing::Compare(
+                p, plan::CompareOp::kEq,
+                plan::Constant{.type = LogicalType::Decimal(15, 3), .value = Int128{2500}})),
+            (std::vector<int64_t>{0, 1, 2, 3}));
+}
+
+// And a top-N over a DECIMAL key prunes by its bound, which needs SortBuffer::ThresholdKey to have
+// a value for a decimal key at all -- it had none before this item, so PartMayBeat was never asked
+// (ADR 0021's part-statistics item). Part 0 holds the four smallest values, so `LIMIT 4` is
+// satisfied by it and the three parts after it are each ruled out.
+TEST_F(PartOperatorsTest, ATopNOnADecimalKeySkipsPartsItsBoundRulesOut) {
+  const LogicalType money = LogicalType::Decimal(15, 2);
+  const auto schema = arrow::schema({arrow::field("p", plan::ToArrow(money))});
+  arrow::RecordBatchVector batches;
+  for (int part = 0; part < 4; ++part) {
+    std::vector<std::optional<std::string>> unscaled;
+    unscaled.reserve(10);
+    for (int i = 0; i < 10; ++i) {
+      unscaled.emplace_back(std::to_string(((part * 10) + i) * 100));
+    }
+    batches.push_back(arrow::RecordBatch::Make(schema, 10, {testing::Decimals(money, unscaled)}));
+  }
+  const auto table = std::make_shared<MemoryTable>(schema, std::move(batches), /*split=*/true);
+  const auto p = Column(0, "p", money);
+  const auto sort = Node(plan::SortNode{
+      .input = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0}}),
+      .keys = {{.column = p, .descending = false, .nulls_first = false}}});
+  plan::LogicalPlan plan{.root = Node(plan::LimitNode{.input = sort, .limit = 4, .offset = 0}),
+                         .output = {}};
+  plan.output.push_back({.name = "p", .type = money});
+
+  ProfileNode profile;
+  auto op = BuildPhysicalPlan(plan, &profile);
+  ASSERT_TRUE(op.ok()) << op.status().ToString();
+  ExecContext ctx{.pool = arrow::default_memory_pool(), .batch_size = 3, .threads = 1};
+  const auto rows = Drain(**op, ctx);
+  ASSERT_TRUE(rows.ok()) << rows.status().ToString();
+  EXPECT_EQ((*rows)->num_rows(), 4);
+  // Only part 0 is read: the three after it are never scanned, let alone decoded.
+  std::vector<int64_t> seen = table->scanned_parts();
+  const auto repeated = std::ranges::unique(seen);
+  seen.erase(repeated.begin(), repeated.end());
+  EXPECT_EQ(seen, (std::vector<int64_t>{0}));
+  std::int64_t pruned = 0;
+  for (const ProfileMetric& metric : profile.metrics()) {
+    if (metric.name == "pruned") {
+      pruned = metric.value;
+    }
+  }
+  EXPECT_EQ(pruned, 3) << "a decimal key's bound ruled out no part";
+}
+
 TEST_F(PartOperatorsTest, NullPartsAndFalseSkipEverything) {
   const auto schema = arrow::schema({arrow::field("z", arrow::int64())});
   arrow::RecordBatchVector batches = {

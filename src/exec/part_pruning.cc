@@ -15,10 +15,22 @@
 namespace antb1::exec {
 namespace {
 
-// A constant of an integer-valued column (integers, USMALLINT, DATE) as a number.
-std::optional<Int128> IntegerOf(const plan::Constant& constant) {
+// A constant as the number the statistics of `column` can be compared with: integers, USMALLINT
+// and DATE by value, and a DECIMAL by its unscaled value.
+//
+// The DECIMAL case needs the column's type and the integer cases do not, which is the whole reason
+// this takes one. An integer's value means the same thing whatever the column's type is, but a
+// decimal's unscaled value means nothing without a scale: 150 is 1.50 at scale 2 and 0.150 at
+// scale 3. part_stats reports the column's own unscaled min and max, so the two are comparable
+// only when the constant carries that same scale -- and the same precision, since the type is what
+// the binder folded the constant to (ADR 0021's part-statistics item).
+std::optional<Int128> ComparableWith(const plan::Constant& constant, plan::LogicalType column) {
   const plan::LogicalType type = constant.type;
-  if (!plan::IsInteger(type) && type != plan::LogicalType::kDate) {
+  if (!plan::HasComparableStatistics(type)) {
+    return std::nullopt;
+  }
+  // The scale check plan::HasComparableStatistics cannot make, because it sees one type at a time.
+  if (type == plan::LogicalType::kDecimal && type != column) {
     return std::nullopt;
   }
   if (const auto* value = std::get_if<Int128>(&constant.value)) {
@@ -30,6 +42,8 @@ std::optional<Int128> IntegerOf(const plan::Constant& constant) {
 // Whether `predicate` is false for every row of a part with these statistics of its column.
 bool NeverTrue(const plan::Predicate& predicate, const plan::PartStats& stats) {
   using Kind = plan::Predicate::Kind;
+  const plan::LogicalType column =
+      predicate.column.has_value() ? predicate.column->type : plan::LogicalType::kVarchar;
   if (stats.rows <= 0) {
     return false;
   }
@@ -39,7 +53,7 @@ bool NeverTrue(const plan::Predicate& predicate, const plan::PartStats& stats) {
       if (all_null) {
         return true;  // a comparison with NULL is never true
       }
-      const auto c = IntegerOf(predicate.constant);
+      const auto c = ComparableWith(predicate.constant, column);
       if (!c.has_value() || !stats.min.has_value() || !stats.max.has_value()) {
         return false;
       }
@@ -70,7 +84,7 @@ bool NeverTrue(const plan::Predicate& predicate, const plan::PartStats& stats) {
       }
       // Every value outside [min, max]; a value that may match (or is not a number) keeps it.
       return std::ranges::all_of(predicate.values, [&](const plan::Constant& value) {
-        const auto v = IntegerOf(value);
+        const auto v = ComparableWith(value, column);
         return v.has_value() && (*v < *stats.min || *v > *stats.max);
       });
     }

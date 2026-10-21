@@ -327,7 +327,8 @@ class MemoryTable final : public plan::Table {
   void FailPart(int64_t part) { failing_parts_.push_back(part); }
   // ScanPart of `field` (with any other fields) fails with an IOError naming the field.
   void FailField(int field) { failing_field_ = field; }
-  // With `split`: exact statistics of the integer-valued columns (plan::Table::part_stats), unless
+  // With `split`: exact statistics of the columns ParquetTable reports them for -- integer-valued
+  // ones and DECIMAL (plan::Table::part_stats) -- unless
   // turned off here. The types are the ones ParquetTable reports statistics for, so that a test can
   // reach every arm of a reader of them -- a DATE key and a BIGINT key are different arms and only
   // one of them is the common case.
@@ -374,8 +375,29 @@ class MemoryTable final : public plan::Table {
       case arrow::Type::DATE32:
         exact(static_cast<const arrow::Date32Array&>(column));
         break;
+      // A DECIMAL's unscaled values, which is what ParquetTable reports for an integer-backed one
+      // (ADR 0021's part-statistics item). ReadUnscaled reads either physical width, so this does
+      // not care which the precision gave it.
+      case arrow::Type::DECIMAL64:
+      case arrow::Type::DECIMAL128: {
+        const arrow::Result<UnscaledValues> read = ReadUnscaled(column);
+        EXPECT_TRUE(read.ok()) << read.status().ToString();
+        if (!read.ok()) {
+          return std::nullopt;
+        }
+        for (std::size_t i = 0; i < read->values.size(); ++i) {
+          if (column.IsNull(static_cast<int64_t>(i))) {
+            ++stats.null_count;
+            continue;
+          }
+          const Int128 v = read->values[i];
+          stats.min = stats.min.has_value() ? std::min(*stats.min, v) : v;
+          stats.max = stats.max.has_value() ? std::max(*stats.max, v) : v;
+        }
+        break;
+      }
       default:
-        return std::nullopt;  // not integer-valued, as ParquetTable reports none either
+        return std::nullopt;  // a type ParquetTable reports no statistics for either
     }
     return stats;
   }
