@@ -143,6 +143,55 @@ TEST_F(AggregateFilterTest, FiltersTheAggregatesInputAndKeepsTheAnswer) {
       << without->rows->ToString();
 }
 
+// A Filter between the aggregate and its scan. The field carrying the offer says a Filter passes it
+// on "as it is", and it must: a Filter only removes rows, so it neither mints nor moves a ColumnId
+// and the key the aggregate groups by is still the one the join published. The predicate here is
+// over two columns, which the scan cannot apply, so the Filter stays an operator of its own -- and
+// it keeps every row, so both arms answer exactly what they answer without it.
+TEST_F(AggregateFilterTest, CarriesThroughAFilterItCannotPush) {
+  constexpr std::string_view kQuery =
+      "SELECT COUNT(*) FROM (SELECT k, SUM(v) AS s FROM f WHERE v >= v GROUP BY k) AS g, d "
+      "WHERE g.k = d.dk AND d.flag = 1";
+  const auto facts = Facts();
+  facts->set_claimed_rows(20'000'000);
+  auto with = Execute(kQuery, facts, Dimension());
+  ASSERT_TRUE(with.ok()) << with.status().ToString();
+
+  const auto few = Facts();
+  few->set_claimed_rows(16);
+  auto without = Execute(kQuery, few, Dimension());
+  ASSERT_TRUE(without.ok()) << without.status().ToString();
+
+  EXPECT_GT(with->dropped, 0) << "the offer did not survive the Filter between the two";
+  EXPECT_EQ(without->dropped, 0);
+  ASSERT_NE(with->rows, nullptr);
+  ASSERT_NE(without->rows, nullptr);
+  EXPECT_TRUE(with->rows->Equals(*without->rows)) << with->rows->ToString() << "\nagainst\n"
+                                                  << without->rows->ToString();
+}
+
+// The limitation the carry above stops at, pinned so that lifting it is a visible change. When the
+// Filter's predicates go into the scan instead (ADR 0020), they hold the one filter slot a scan
+// takes, and the published keys have nowhere to attach. Lifting this needs a scan filter that is
+// the conjunction of two -- the predicates and the keys -- which is a decision of its own, not a
+// consequence of this one. The answer is right either way, which is why only the metric moves.
+TEST_F(AggregateFilterTest, YieldsToPredicatesPushedIntoTheScan) {
+  constexpr std::string_view kQuery =
+      "SELECT COUNT(*) FROM (SELECT k, SUM(v) AS s FROM f WHERE v >= 0 GROUP BY k) AS g, d "
+      "WHERE g.k = d.dk AND d.flag = 1";
+  const auto facts = Facts();
+  facts->set_claimed_rows(20'000'000);  // the share gate would admit it
+  auto run = Execute(kQuery, facts, Dimension());
+  ASSERT_TRUE(run.ok()) << run.status().ToString();
+  EXPECT_EQ(run->dropped, 0) << "a scan takes one filter and the pushed predicate holds it";
+
+  auto control = Execute(kQuery, Facts(), Dimension());
+  ASSERT_TRUE(control.ok()) << control.status().ToString();
+  ASSERT_NE(run->rows, nullptr);
+  ASSERT_NE(control->rows, nullptr);
+  EXPECT_TRUE(run->rows->Equals(*control->rows));
+}
+
 // The condition the whole rewrite rests on: the filter may only be applied to a column the
 // aggregate **groups by**, because then it drops whole groups. Here the join reads the aggregate's
 // *value* instead, so the key is not among its grouping keys and nothing may be attached -- on any
@@ -163,6 +212,28 @@ TEST_F(AggregateFilterTest, RefusesAKeyTheAggregateDoesNotGroupBy) {
       "WHERE g.s = d.dk AND d.flag = 1",
       Facts(), Dimension());
   ASSERT_TRUE(control.ok()) << control.status().ToString();
+  EXPECT_TRUE(run->rows->Equals(*control->rows)) << "and the sums are the sums";
+}
+
+// The refusal above, now that a Filter no longer hides it. Before the carry, a Filter between the
+// join and the aggregate stopped every offer, so this combination never reached the check that the
+// key must be one the aggregate groups by; it does now, and it must still refuse. On the
+// aggregate's value the filter would drop rows inside surviving groups and corrupt their sums,
+// which the Filter in between does nothing to make safe.
+TEST_F(AggregateFilterTest, RefusesAKeyItDoesNotGroupByThroughAFilterToo) {
+  constexpr std::string_view kQuery =
+      "SELECT COUNT(*) FROM (SELECT k, SUM(v) AS s FROM f WHERE v >= v GROUP BY k) AS g, d "
+      "WHERE g.s = d.dk AND d.flag = 1";
+  const auto facts = Facts();
+  facts->set_claimed_rows(20'000'000);
+  auto run = Execute(kQuery, facts, Dimension());
+  ASSERT_TRUE(run.ok()) << run.status().ToString();
+  EXPECT_EQ(run->dropped, 0) << "a join on the aggregate's value must reach nothing below it";
+
+  auto control = Execute(kQuery, Facts(), Dimension());
+  ASSERT_TRUE(control.ok()) << control.status().ToString();
+  ASSERT_NE(run->rows, nullptr);
+  ASSERT_NE(control->rows, nullptr);
   EXPECT_TRUE(run->rows->Equals(*control->rows)) << "and the sums are the sums";
 }
 

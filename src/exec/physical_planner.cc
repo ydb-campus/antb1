@@ -849,7 +849,12 @@ struct Builder {
         return std::make_unique<FilterOperator>(std::move(input), std::move(rest));
       }
     }
-    ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input, part, Input(), late, nullptr, builds));
+    // `above` carried on: a Filter only removes rows, so it neither mints nor moves a ColumnId and
+    // the key the aggregate below groups by is still the key the join above published (the field's
+    // own contract). The branch over this one cannot carry it: it hands the pushed predicates to
+    // the scan, and those hold the one filter slot a scan takes.
+    ARROW_ASSIGN_OR_RAISE(auto input,
+                          Build(node.input, part, Input(), late, nullptr, builds, above));
     return std::make_unique<FilterOperator>(std::move(input), node.predicates);
   }
   OperatorResult operator()(const plan::ComputeNode& node) const {
