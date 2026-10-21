@@ -81,6 +81,7 @@ Proposed
     and bytewise comparisons.
   - The logical plan and EXPLAIN are unchanged; the Filter operator keeps only what was not pushed, and
     `explain --analyze` shows the count on the `Scan`.
+  - **The order the scan applies the columns in is chosen, not inherited from the query** (`Order`, below).
 - **Late materialization's narrow scans** (ADR 0016) are filtered too, on their early columns. Their row ids name a
   row's position in the part, which a filtered scan no longer gives by counting, so a filtered `ScanPart` can report
   them: with `positions`, every batch ends with a `position` column (INT64), each row's position in the part.
@@ -133,3 +134,62 @@ Proposed
     dictionary path is exercised by the fixtures and by any file from a writer that emits `encoding_stats`.
     Reaching it for the rest means decoding the pages without Arrow's reader, which is a larger decision than
     this item and the same one ADR 0021's residual narrowing pass wants.
+- **Ordering the columns a scan filters: built 2026-10-21.** The scan applies the filter's columns one at a
+  time, each narrowing the selection the next one sees, so a column placed late does its per-row predicate work
+  only over the rows the earlier ones left. Until this item the order was the order the predicates appeared in
+  the `WHERE` clause, which made **the spelling of a query decide its cost**: one filter over 600 million rows at
+  four threads, two bounds on a DATE column and a two-value `IN` on a VARCHAR one, measured **1.102 s written
+  dates-first and 2.507 s written the other way round, a 2.28x penalty for a reordering that changes no answer.**
+  Both spellings now read 1.103 s.
+  - **The rule is Hellerstein and Stonebraker's rank ordering for a conjunction**: ascending `cost / (1 -
+    selectivity)`, which is optimal for independent predicates applied in sequence, and the choke point Dreseler
+    et al. call predicate positioning (PVLDB 13(8)). It is compared as a cross product, so no division and no
+    floating point enters a planning decision, and the sort is **stable**, so columns of equal rank keep the
+    order the query wrote them in -- `std::sort` would leave their order to the standard library and so to the
+    platform, and an EXPLAIN must not depend on that. That last property is the one thing here no test can
+    observe, since a single platform cannot disagree with itself.
+  - **Only the work a late position avoids belongs in the weight**, which is narrower than it first looks and was
+    got wrong before a measurement corrected it. `io` reads every row of every one of the filter's columns
+    whatever the selection says, and a fixed-width column's predicate is an Arrow kernel over the whole array, so
+    neither its decode nor its predicate moves with its position. What does move is a VARCHAR column's per-row
+    predicate work, which skips the rows already rejected. **So a fixed-width column belongs first even when it
+    removes far less than a VARCHAR one**: measured at SF 100 over 600 million rows, a fixed-width column
+    removing a seventh of the rows against a VARCHAR column with two predicates removing almost all of them runs
+    **2.13 s with the fixed-width column first and 2.30 s with it last**. A model that charged each column its
+    read ordered that pair the other way round and was 8% slower on it.
+  - **The weights are measured, not guessed**, one predicate on one column of 600 million rows at four threads: a
+    DATE column with one range bound 0.389 s, **with two bounds also 0.389**, a VARCHAR column `=` one value
+    1.560 s, `IN` two values 2.156 s, `LIKE` a suffix 2.742 s. Only differences between those are avoidable, so
+    one value compared is 2.156 - 1.560 = 0.596 s and the rest of the 1.560 is decode. In units of a hundredth of
+    a second: **60 for a value compared, 180 for a pattern matched, and 1 for all of a fixed-width column's
+    predicates** -- 1 rather than 0 because two bounds cost what one bound does to within the ~0.005 s those
+    repeats agree to, which bounds the avoidable part below one unit rather than at zero. Zero would also make
+    the comparator intransitive, so a `static_assert` holds the weights positive.
+  - **The selectivity defaults are coarse on purpose** and deliberately separate from `plan::PredicateRows`
+    (`src/plan/join_order.cc`): that one estimates a relation's rows for the join order and divides by a column's
+    domain where the footers give one, while this one ranks columns within a scan with no statistics at hand.
+    Neither term of the rank dominates the other -- what a column removes spans 10 to 100 of these defaults, and
+    nothing at all for the kinds assumed to keep every row, as wide a span as the weights. **The next real
+    improvement here is this column's own part statistics**, which the scan could reach through
+    `plan::Table::part_stats` (ADR 0021's part-statistics item made them comparable for DECIMAL).
+  - **A dictionary-encoded VARCHAR column is far cheaper than these weights** (0.19 ns a row against 5.6,
+    above), but whether Arrow will grant the dictionary is known only when the chunk is read, which is after this
+    order is fixed. So the weights are the undiscounted ones and such a column is ordered more pessimistically
+    than it deserves -- a known, bounded inaccuracy, not a correctness question: **no order changes an answer**,
+    because every predicate only clears bits of one shared selection, which is why this item is testable by the
+    order alone and why the existing equivalence test still covers the answers under any permutation.
+  - **Measured end to end** at SF 100, four threads, three interleaved repeats: Q12 **0.688x**, Q16 0.948x,
+    geomean **0.976x** over the 22 queries, peak memory unchanged. Two queries looked like regressions and were
+    not, which is the same trap ADR 0021's acceptance recorded: Q8 read 1.030x at three repeats and 0.974x at
+    four rotated ones, and Q3 read 1.024x with its B minimum above its A maximum, yet 1.005x rotated -- and
+    could not have moved either way, since each of its scans has a single filter column for this item to order.
+  - **What the tests pin, and what they do not.** Both terms of the comparator, the ordering of the predicate
+    kinds by weight, that a fixed-width column's predicates are free of position, and that a second predicate on
+    a VARCHAR column adds its own weight: each fails a case if changed, 12 of 13 mutations caught, the
+    thirteenth being `stable_sort` to `sort`, which no single-platform test can see. The weights' exact values
+    are pinned only as the bands in which they keep those orders -- a cost model is an approximation, and
+    pinning each constant to the unit would turn a re-measurement into a test rewrite. Which mutations are
+    observable at all was found by **enumerating the model's reachable column shapes and every ordered pair of
+    them** (1198 shapes, 1.4 million pairs), the same enumeration that showed the comparator is exactly
+    `cost / removed` compared over the rationals extended by the infinity at `removed == 0`, and so a strict
+    weak ordering as `stable_sort` requires.
