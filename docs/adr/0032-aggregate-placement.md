@@ -231,7 +231,8 @@ entirely, because a pre-grouped relation has exactly one row per key.
     the gate computes its own by ADR 0022's rule 3, locally. Changing what `EstimateRows` answers for a join
     would move `ChooseBuildSide`, which is ADR 0026's decision and not this item's.
 - **G2b, perf(plan): perform the rewrite behind the gate.**
-  - Update (2026-10-22, G2b): **shipped for SUM, MIN and MAX, and it fires on no query of the 22** -- because
+  - Update (2026-10-22, G2b): **shipped for SUM, MIN and MAX, and on landing it fired on no query of the 22**
+    -- because
     the one placement the gate admits is a count, and a count is the one kind the plan cannot yet express.
     Measured where it does fire: a SUM over the same shape as Q13's at SF 100 goes **3.417 s to 3.003 s
     (0.879x)**, answers identical, and the exchange is answer-identical on an inner join, on a LEFT JOIN whose

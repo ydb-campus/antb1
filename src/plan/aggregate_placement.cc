@@ -458,11 +458,17 @@ std::optional<LogicalNodePtr> Exchange(const AggregatePlacement& placement, Colu
       std::make_shared<const LogicalNode>(std::move(partial));
   LogicalNodePtr input = std::make_shared<const LogicalNode>(std::move(over));
 
-  // No padding is built, and with the counts refused none is needed: `needs_identity` says a
-  // preserved row may find no partial, and the value the written query gave such a row is NULL for
-  // every kind this performs -- which is already what an aggregate of a NULL partial answers. Only
-  // a count wants something else there (1 for COUNT(*), 0 for COUNT(col)), so the mapping arrives
-  // with the kind that makes a count exchangeable at all, and not before it can be reached.
+  // No padding is built, and none is needed for any kind that reaches here. `needs_identity` says a
+  // preserved row may find no partial at all, and the value the written query gave such a row is:
+  //
+  //   NULL for SUM, MIN and MAX   -- already what an aggregate of a missing partial answers
+  //   0    for COUNT(col)         -- and kSumCounts reads a missing partial as having counted
+  //                                  nothing, so that is already what it answers too
+  //   1    for COUNT(*)           -- it counted the padded row, so this one does want a value
+  //                                  supplied, which is why it is refused above
+  //
+  // So the mapping ADR 0032's condition 5 asks for is, for every spelling this performs, a property
+  // of the kind rather than something to build.
   GroupAggregateNode final = aggregate;
   final.input = std::move(input);
   final.aggregates = std::move(finals);
