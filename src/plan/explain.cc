@@ -16,6 +16,8 @@
 #include "antb1/plan/shared_sub_plans.h"
 #include "antb1/plan/types.h"
 
+#include "aggregate_placement.h"
+
 namespace antb1::plan {
 namespace {
 
@@ -202,6 +204,24 @@ SharedNotes NotesOf(const LogicalPlan& plan) {
           std::format("  [shared #{} of {}, {} field{}]", group, shared.members.size(),
                       shared.fields, shared.fields == 1 ? "" : "s");
     }
+  }
+  // A note on every grouped aggregate that could be computed on one input of the join it reads
+  // (docs/adr/0032-aggregate-placement.md, G1). Nothing is rewritten: this reports what a later
+  // item could exchange, and what that side would have to be grouped by for the answer to hold.
+  for (const AggregatePlacement& placement : AggregatePlacements(plan)) {
+    std::string note =
+        std::format("  [groupable below the {} join, {} key{}",
+                    placement.left_is_aggregated ? "left of" : "right of",
+                    placement.pre_grouping.size(), placement.pre_grouping.size() == 1 ? "" : "s");
+    if (placement.grouping_from_aggregated_side > 0) {
+      note += std::format(", {} from the grouping set", placement.grouping_from_aggregated_side);
+    }
+    if (placement.needs_identity) {
+      note += ", padding";
+    }
+    // Appended, not assigned: a node can be both a member of a shared group and a placement, and
+    // ADR 0030's E1 promises a note on every member of every group.
+    notes[placement.aggregate.get()] += note + "]";
   }
   return notes;
 }

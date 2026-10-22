@@ -1,0 +1,86 @@
+#pragma once
+
+#include <cstddef>
+#include <vector>
+
+#include "antb1/plan/logical_plan.h"
+
+// Where a grouped aggregate could be computed on one input of the join below it
+// (docs/adr/0032-aggregate-placement.md, item G1): **finding and reporting only, never a rewrite.**
+// A pass that only reports cannot give a wrong answer, and every later item of that ADR depends on
+// this legality test being right -- particularly condition 3's second half, which is the one whose
+// omission changes aggregate values rather than row counts.
+//
+// Private to the plan module: explain.cc and this module's tests include it. Public when a consumer
+// needs it, as ADR 0030's E1 was (ADR 0027's S1: a producer shipped ahead of its consumer is a
+// producer nothing measures).
+
+namespace antb1::plan {
+
+// One legal placement of a grouped aggregate below the join it reads.
+struct AggregatePlacement {
+  LogicalNodePtr aggregate;  // the GroupAggregateNode, as a walk from the root meets it
+  LogicalNodePtr join;       // the JoinNode it reads, below any Compute between them
+  // Which input of that join the aggregates read: the side a rewrite would pre-group. The other
+  // side carries the grouping columns that do not come from this one.
+  bool left_is_aggregated = false;
+  // What that side must be grouped by for the rewrite to keep the answer: its join columns, then
+  // every grouping column of `aggregate` that comes from it (ADR 0032's condition 3). Ids, not
+  // indices, because every node between the two positions moves an index and none moves an id.
+  //
+  // **Every id here is one the aggregated side outputs**, which is what makes the list usable by a
+  // rewrite. A join key is a column of its own input by construction, and a widened key's Compute
+  // sits on that input's branch; a grouping column the query computed ABOVE the join names no
+  // column below it, so this holds the columns that computed it instead -- grouping finer than the
+  // outer set, which keeps the answer because the final step groups again.
+  std::vector<ColumnId> pre_grouping;
+  // Grouping columns of `aggregate` that come from the aggregated side, of `pre_grouping`. Zero
+  // means the pre-grouping is the join key alone, which is the shape where the reduction is most
+  // often real; above zero is the shape where condition 3's second half is load-bearing.
+  std::size_t grouping_from_aggregated_side = 0;
+  // The aggregated side is the null-supplying input of an outer join, so a rewrite's final step has
+  // to supply, for a preserved row with no partial, what the written query answered over the one
+  // padded row the join gave it (condition 5). That value is per call and COUNT(*) is the one that
+  // surprises:
+  //
+  //   COUNT(*)      1     -- it counted the padded row itself
+  //   COUNT(col)    0     -- the padded column was NULL, so it counted nothing
+  //   SUM, MIN, MAX, AVG   NULL
+  //
+  // So "the aggregate over the empty set" is the right rule for every call but COUNT(*), which is
+  // over one row and not none.
+  bool needs_identity = false;
+};
+
+// Every legal placement in `plan`, in the order a walk from the root meets its aggregates.
+//
+// A placement is reported only when all of ADR 0032's legality conditions hold, and the test is
+// deliberately **blind to functional dependencies**: where a grouping column of the aggregated side
+// is determined by the join key, omitting it from the pre-grouping still answers correctly, so a
+// test that reasoned about dependencies would pass on exactly the queries that hide the error.
+//
+// What is refused, each because refusing reports less and reporting less is always safe:
+//
+//   - anything but a Compute between the aggregate and the join. A Filter removes rows, and its
+//     predicate may read both inputs, so it cannot simply travel with the aggregate; a Project
+//     mints new ids even for a column it passes through. Both are tractable and neither is needed
+//     by the two queries this ADR measures. In a bound plan the two arrive together: a conjunct
+//     over one relation is pushed below the join, so a Filter reaches this position only above a
+//     derived table's Project, which is why the tests pin the pair and not the Filter alone.
+//   - a join carrying a residual, which decides which pairs match on something other than the
+//     keys. The pre-grouping destroys exactly the per-row values the residual reads, so a partial
+//     would aggregate rows the residual rejects and no final step can take that back. A residual
+//     reading only the side that is not aggregated would be safe and is not admitted yet.
+//   - a join whose kind does not output both inputs' columns, since an aggregate cannot read what
+//     a semi or anti join does not emit, and a one-row join has no keys to group by.
+//   - a join with no keys: the exchange needs an equi-join on the columns the side is grouped by.
+//   - an aggregate call reading both inputs, or an expression mixing them.
+//   - COUNT(DISTINCT), which is not decomposable unless the distinct column enters the
+//     pre-grouping -- which makes that pre-grouping a key of its side, so the exchange would group
+//     once per row and reduce nothing.
+//   - a placement no aggregate call names a side for, which is every call being COUNT(*). Both
+//     sides are then legal and nothing here chooses between them; reporting both would overstate
+//     what this pass knows.
+std::vector<AggregatePlacement> AggregatePlacements(const LogicalPlan& plan);
+
+}  // namespace antb1::plan

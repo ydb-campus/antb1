@@ -9,6 +9,7 @@ antb1_add_module(
     key_type.cc
     join_order.cc
     or_factoring.cc
+    aggregate_placement.cc
     relation_count.cc
     binder.cc
     logical_plan.cc
@@ -29,6 +30,7 @@ if(ANTB1_BUILD_TESTS)
       tests/scope_test.cc
       tests/join_order_test.cc
       tests/or_factoring_test.cc
+      tests/aggregate_placement_test.cc
       tests/relation_count_test.cc
       tests/column_ids_test.cc
       tests/folding_test.cc
