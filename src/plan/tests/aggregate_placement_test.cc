@@ -25,6 +25,50 @@ LogicalPlan Planned(std::string_view sql) {
   return plan.ok() ? Optimized(*plan) : LogicalPlan{};
 }
 
+// A catalog of its own for the gate's cases, so that declaring statistics here cannot move another
+// suite's expectations. `facts` holds 1000 rows: `few` takes 10 distinct values, `many` is unique,
+// and `plain` declares nothing. The dimensions differ only in how many of the facts' keys they
+// carry, which is what the gate's conditions turn on.
+Catalog GateCatalog() {
+  Catalog catalog;
+  const auto facts = std::make_shared<testing::FakeTable>(
+      arrow::schema({arrow::field("few", arrow::int32()), arrow::field("many", arrow::int32()),
+                     arrow::field("plain", arrow::int32()), arrow::field("v", arrow::int32())}),
+      1000);
+  facts->WithDistinctCount(0, /*field=*/0, 10).WithDistinctCount(0, /*field=*/1, 1000);
+  const auto wide =
+      std::make_shared<testing::FakeTable>(arrow::schema({arrow::field("dk", arrow::int32())}), 10);
+  wide->WithDistinctCount(0, /*field=*/0, 10);
+  const auto narrow =
+      std::make_shared<testing::FakeTable>(arrow::schema({arrow::field("dk", arrow::int32())}), 2);
+  narrow->WithDistinctCount(0, /*field=*/0, 2);
+  // Carries every value of the facts' unique key, so a join on it discards nothing and the
+  // reduction test is reached rather than shadowed by the condition checked before it.
+  const auto twin = std::make_shared<testing::FakeTable>(
+      arrow::schema({arrow::field("dk", arrow::int32())}), 1000);
+  twin->WithDistinctCount(0, /*field=*/0, 1000);
+  const auto must = [](const arrow::Status& status) { EXPECT_TRUE(status.ok()) << status; };
+  must(catalog.Register("facts", facts));
+  must(catalog.Register("wide", wide));
+  must(catalog.Register("narrow", narrow));
+  must(catalog.Register("twin", twin));
+  return catalog;
+}
+
+std::vector<std::string> Verdicts(std::string_view sql) {
+  static const Catalog catalog = GateCatalog();
+  auto plan = BindSql(sql, catalog);
+  EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+  std::vector<std::string> out;
+  if (!plan.ok()) {
+    return out;
+  }
+  for (const AggregatePlacement& p : AggregatePlacements(Optimized(*plan))) {
+    out.emplace_back(ToString(p.verdict));
+  }
+  return out;
+}
+
 // Each placement as "<side> <pre-grouping size>+<from the grouping set>[ padding]", so a case reads
 // as the three things a rewrite would need: which input to group, how wide the pre-grouping is, and
 // whether the final step has to pad an unmatched row.
@@ -86,8 +130,11 @@ TEST(AggregatePlacementTest, SaysSoInExplain) {
   const std::string plan =
       Explain(Planned("SELECT t.i16, ok.s, SUM(ok.i16) FROM t LEFT JOIN ok ON t.i32 = ok.i16 GROUP "
                       "BY t.i16, ok.s"));
+  // "unknown" because `ok` declares no statistics, so nothing estimates the groups a pre-grouping
+  // of it would build -- and an unknown is a refusal here, since a small group count is what would
+  // argue for the rewrite.
   EXPECT_NE(plan.find("[groupable below the right of join, 2 keys, 1 from the grouping set, "
-                      "padding]"),
+                      "padding, unknown]"),
             std::string::npos)
       << plan;
 }
@@ -118,6 +165,55 @@ TEST(AggregatePlacementTest, AComputedGroupingColumnNamesWhatComputedIt) {
   EXPECT_EQ(Placements("SELECT ok.i16 + 1, SUM(ok.i16) FROM t, ok WHERE t.i16 = ok.i16 "
                        "GROUP BY ok.i16 + 1"),
             (std::vector<std::string>{"right 1+0"}));
+}
+
+// The gate, on the one shape it exists to admit: the pre-grouping reduces ten to one, and the join
+// above keeps every row because the dimension carries every key the facts hold.
+TEST(AggregatePlacementTest, TheGateAdmitsAReductionTheJoinKeeps) {
+  EXPECT_EQ(Verdicts("SELECT wide.dk, SUM(facts.v) FROM facts, wide WHERE facts.few = wide.dk "
+                     "GROUP BY wide.dk"),
+            (std::vector<std::string>{"worth"}));
+}
+
+// Each refusal the gate can decide, and what decides it.
+TEST(AggregatePlacementTest, TheGateRefusals) {
+  struct Case {
+    std::string_view sql;
+    std::string_view verdict;
+    std::string_view why;
+  };
+  for (const Case& c : {
+           // The pre-grouping key is unique in the facts, so grouping by it makes one group a row
+           // and the pre-aggregation is pure overhead. This is the shape ADR 0032's survey found
+           // in most of the queries that are legal but not worth it.
+           Case{.sql = "SELECT twin.dk, SUM(facts.v) FROM facts, twin WHERE facts.many = twin.dk "
+                       "GROUP BY twin.dk",
+                .verdict = "no reduction",
+                .why = "the pre-grouping key is unique"},
+           // The same unique key against a dimension holding a tenth of its values: the join keeps
+           // ten rows where the pre-aggregation would read a thousand. Two conditions hold at once
+           // here, and the order of the checks decides which one is reported.
+           Case{.sql = "SELECT wide.dk, SUM(facts.v) FROM facts, wide WHERE facts.many = wide.dk "
+                       "GROUP BY wide.dk",
+                .verdict = "below a filter",
+                .why = "a unique key against a narrow dimension"},
+           // The dimension carries two of the facts' ten keys, so the join discards most rows and
+           // the aggregate would read far more below it than it reads now.
+           Case{.sql = "SELECT narrow.dk, SUM(facts.v) FROM facts, narrow "
+                       "WHERE facts.few = narrow.dk GROUP BY narrow.dk",
+                .verdict = "below a filter",
+                .why = "the join above keeps a fifth of the keys"},
+           // No statistics on the pre-grouping column, so nothing estimates the groups. An unknown
+           // is a refusal: a *small* group count is what argues for the rewrite, so an unknown one
+           // must argue against it.
+           Case{.sql = "SELECT wide.dk, SUM(facts.v) FROM facts, wide WHERE facts.plain = wide.dk "
+                       "GROUP BY wide.dk",
+                .verdict = "unknown",
+                .why = "the column declares no distinct count"},
+       }) {
+    EXPECT_EQ(Verdicts(c.sql), (std::vector<std::string>{std::string(c.verdict)}))
+        << c.why << ": " << c.sql;
+  }
 }
 
 // Every refusal. Each reports nothing, and reporting nothing is always safe -- but each is here

@@ -1,6 +1,9 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <string_view>
 #include <vector>
 
 #include "antb1/plan/logical_plan.h"
@@ -50,7 +53,28 @@ struct AggregatePlacement {
   // So "the aggregate over the empty set" is the right rule for every call but COUNT(*), which is
   // over one row and not none.
   bool needs_identity = false;
+
+  // What the gate of ADR 0032 makes of this placement: `worth` only when every condition it can
+  // decide holds. The estimates are the ones a plan node can reach, so an unknown is a refusal --
+  // this is a judgement about *whether to rewrite*, and the shape of its evidence is that a small
+  // group count argues for one, so an unknown group count must argue against.
+  enum class Verdict : std::uint8_t {
+    kWorth,        // every condition the gate can decide holds
+    kNoReduction,  // the pre-grouping makes about as many groups as it reads rows (conditions 2, 5)
+    kBelowAFilter,  // the aggregate would read more rows there than it reads now (condition 3)
+    kJoinDiscards,  // the joins above throw away most of the groups it would build (condition 4)
+    kUnknown,       // the footers do not give an estimate this needs
+  };
+  Verdict verdict = Verdict::kUnknown;
+  // What the verdict was decided on, each std::nullopt where nothing estimated it: the rows the
+  // aggregate reads now, the rows it would read below, and the groups it would build there.
+  std::optional<int64_t> rows_now;
+  std::optional<int64_t> rows_below;
+  std::optional<int64_t> groups;
 };
+
+// "worth", "no reduction", and so on.
+std::string_view ToString(AggregatePlacement::Verdict verdict);
 
 // Every legal placement in `plan`, in the order a walk from the root meets its aggregates.
 //
@@ -81,6 +105,24 @@ struct AggregatePlacement {
 //   - a placement no aggregate call names a side for, which is every call being COUNT(*). Both
 //     sides are then legal and nothing here chooses between them; reporting both would overstate
 //     what this pass knows.
+// Two of ADR 0032's six gate conditions are not decidable here, and saying which is the point:
+//
+//   - "not a superkey" has no metadata behind it, because Parquet carries no keys. Its effect is
+//     covered by the reduction test, which refuses the same shapes for a measured reason instead of
+//     an asserted one -- but only where the footers give a domain, so a table without statistics is
+//     refused as unknown rather than admitted.
+//   - condition 5's second half, "a join between the two positions multiplies rows", needs to know
+//     whether a build is unique on its key, which is a runtime fact. The obvious plan-time proxy --
+//     a join emitting more than its larger input -- is wrong, and measurably: the query this ADR
+//     gains most on joins 150,000 rows to 1,500,000 and emits 1,500,000, multiplying nothing at
+//     all, and the rewrite is still worth 0.494x there because what shrinks is the build and the
+//     final grouping's input rather than the join's output.
+//   - "do not destroy an existing prune" is not a property of a logical plan at all: ADR 0029's
+//     filters are attached by the physical planner, long after this runs. It belongs with the
+//     rewrite and not with this report.
+//
+// So a `kWorth` verdict here means "every condition a logical plan can decide", which is weaker
+// than ADR 0032's gate and is why this reports rather than rewrites.
 std::vector<AggregatePlacement> AggregatePlacements(const LogicalPlan& plan);
 
 }  // namespace antb1::plan

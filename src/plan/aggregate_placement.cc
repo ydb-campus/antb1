@@ -2,13 +2,18 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <limits>
 #include <optional>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <variant>
 #include <vector>
 
+#include "antb1/common/int128.h"
 #include "antb1/plan/logical_plan.h"
+
+#include "join_order.h"
 
 namespace antb1::plan {
 namespace {
@@ -145,6 +150,81 @@ bool Exchangeable(const JoinNode& join) {
   return false;
 }
 
+// The gate's thresholds. Deliberately coarse: the quantities they compare are footer estimates,
+// and ADR 0032's survey separates its two worthwhile queries from its refusals by an order of
+// magnitude on each, not by a few percent.
+constexpr int64_t kLargestRows = std::numeric_limits<int64_t>::max();
+constexpr int64_t kLeastReduction = 3;     // rows per group, below which the grouping is overhead
+constexpr int64_t kLeastKeptPercent = 90;  // of the groups built, surviving the joins above
+
+// The rows a join outputs. The binder keeps an estimate on the node for the joins its order search
+// ranked, and **not for a LEFT JOIN**, so this computes one the same way ADR 0022's rule 3 does:
+// the inputs multiplied over the larger of the two key domains, and never below the preserved side
+// for an outer join. Local to this gate on purpose -- EstimateRows feeds ChooseBuildSide, and
+// changing what a join reads as there is ADR 0026's decision and not this item's.
+std::optional<int64_t> JoinRows(const JoinNode& join) {
+  if (join.estimate.has_value()) {
+    return join.estimate;
+  }
+  const std::optional<int64_t> left = EstimateRows(*join.left);
+  const std::optional<int64_t> right = EstimateRows(*join.right);
+  if (!left.has_value() || !right.has_value()) {
+    return std::nullopt;
+  }
+  // The largest domain of any key column, over both inputs: two walks of the plan rather than two
+  // a key, which is what asking column by column would cost.
+  std::vector<ColumnId> on_left;
+  std::vector<ColumnId> on_right;
+  on_left.reserve(join.keys.size());
+  on_right.reserve(join.keys.size());
+  for (const JoinKey& key : join.keys) {
+    on_left.push_back(key.left.id);
+    on_right.push_back(key.right.id);
+  }
+  int64_t divisor = 1;
+  for (const auto& [node, ids] :
+       {std::pair(join.left.get(), &on_left), std::pair(join.right.get(), &on_right)}) {
+    for (const std::optional<int64_t>& domain : EachDistinctValues(*node, *ids)) {
+      if (domain.has_value()) {
+        divisor = std::max(divisor, *domain);
+      }
+    }
+  }
+  const int64_t rows =
+      Int128ToInt64(Int128{*left} * Int128{*right} / divisor).value_or(kLargestRows);
+  return join.kind == JoinKind::kLeft ? std::max(rows, *left) : rows;
+}
+
+// What the gate makes of a legal placement, from the estimates a plan node can reach.
+AggregatePlacement::Verdict Judge(const AggregatePlacement& placement) {
+  using Verdict = AggregatePlacement::Verdict;
+  if (!placement.rows_now.has_value() || !placement.rows_below.has_value() ||
+      !placement.groups.has_value()) {
+    return Verdict::kUnknown;
+  }
+  const int64_t now = *placement.rows_now;
+  const int64_t below = *placement.rows_below;
+  const int64_t groups = std::max<int64_t>(*placement.groups, 1);
+  // Condition 3: the aggregate must not end up reading more rows than it reads today. A filter
+  // between the two positions is the usual way that happens, and a reduction ratio hides it.
+  if (below > now) {
+    return Verdict::kBelowAFilter;
+  }
+  // Conditions 2 and 5: the pre-grouping has to reduce. A pre-grouping key that is a key of its
+  // own side makes one group per row, which is the dominant shape of this schema and the reason
+  // most legal placements are not worth taking.
+  if (below / groups < kLeastReduction) {
+    return Verdict::kNoReduction;
+  }
+  // Condition 4: the joins above must keep most of the groups, or the pre-aggregation builds them
+  // to have them thrown away. `now` is what the join above actually emits, so the share of the
+  // aggregated side's rows that survive it stands in for the share of its groups that do.
+  if (Int128{now} * 100 < Int128{below} * kLeastKeptPercent) {
+    return Verdict::kJoinDiscards;
+  }
+  return Verdict::kWorth;
+}
+
 void Add(std::vector<ColumnId>& out, ColumnId id) {
   if (id != kNoColumnId && std::ranges::find(out, id) == out.end()) {
     out.push_back(id);
@@ -223,6 +303,12 @@ std::optional<AggregatePlacement> PlacementOf(const LogicalNodePtr& node) {
       }
     }
   }
+  // The estimates the gate judges on, and then the verdict.
+  const LogicalNodePtr& aggregated_side = left_aggregated ? join.left : join.right;
+  out.rows_now = JoinRows(join);
+  out.rows_below = EstimateRows(*aggregated_side);
+  out.groups = DistinctValues(*aggregated_side, out.pre_grouping);
+  out.verdict = Judge(out);
   return out;
 }
 
@@ -239,6 +325,22 @@ void Walk(const LogicalNodePtr& node, std::vector<AggregatePlacement>& out) {
 }
 
 }  // namespace
+
+std::string_view ToString(AggregatePlacement::Verdict verdict) {
+  switch (verdict) {
+    case AggregatePlacement::Verdict::kWorth:
+      return "worth";
+    case AggregatePlacement::Verdict::kNoReduction:
+      return "no reduction";
+    case AggregatePlacement::Verdict::kBelowAFilter:
+      return "below a filter";
+    case AggregatePlacement::Verdict::kJoinDiscards:
+      return "the join discards";
+    case AggregatePlacement::Verdict::kUnknown:
+      return "unknown";
+  }
+  return "unknown";
+}
 
 std::vector<AggregatePlacement> AggregatePlacements(const LogicalPlan& plan) {
   std::vector<AggregatePlacement> out;
