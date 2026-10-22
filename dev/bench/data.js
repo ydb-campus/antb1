@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792652624016,
+  "lastUpdate": 1792656521467,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -18720,6 +18720,258 @@ window.BENCHMARK_DATA = {
             "value": 2447.094851999992,
             "unit": "ms/iter",
             "extra": "iterations: 1\ncpu: 2446.8438259999984 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d9cda57720c6d11054ee64343479de1c259e2423",
+          "message": "perf(exec): keep 4 x threads parts ahead of a sink that merges states (#218)\n\n## Summary\n\nA sink that merges each part into partial states -- the global, grouped\nand two-level aggregates and the top-N --\nnow lets 4 × threads parts run or wait ahead of its consumer instead of\n2 × threads (`MergeWindow`); a GROUP BY's\nlanes take the same value as their bound. A part union, a join's build\nand the probe a right join schedules itself\nkeep 2 × threads (`PartWindow`). Every part pipeline below a merging\nsink, a join's probe included, runs in the wider\nwindow.\n\nWhy (ADR 0013 load balance, step 1's measurement, on a 2-socket,\n64-core, 128-hardware-thread host): at 16 and 32\nthreads antb1's threads idle where DuckDB's do not, and the idle is the\nwindow. A part takes as long as the bytes it\nreads; on the full ClickBench data one row group of the most uneven\ncolumn holds about 6 times the mean, and while\nit runs the parts after it finish and fill the window, which only taking\nthat part frees. Traced part by part, Q20\nat 16 threads kept its workers 68% busy with 28% of the threads' time\nlost to the full window; DuckDB, handing out\nthe same row groups without a window, kept 95% busy. With 4 × threads\nthe same trace is 94% busy.\n\nADR 0013 is amended with the measurement (Decision, Memory and Load\nbalance), including what the change does not\nfix: from 64 threads the idle is the last parts, started in part order\n(step 2), and the merge's 32 lanes; on the\nqueries derived from TPC-H the idle is the consumer's own work (a right\njoin's serial gather of its emitted rows,\nADR 0026's C2b).\n\n## Type of change\n\n- [x] perf: performance improvement\n\n## Verification\n\nMeasured on the 128-thread host with two frozen builds (`pixi run\nrelease` of main 20b5c53 and of this change on\nit, `cmp`-different), one process per query, best of 3 tries, two rounds\nwith the arm order alternating per query\nand per round; the host is shared, so every run records the CPU other\nprocesses used and disturbed points were\nre-run. Full data (100 files). The branch was then rebased onto main\nb9337b9 without conflicts: #215-#217 change only\n`src/plan/` and other ADRs (none of the ClickBench queries has a join,\nso their plans are unchanged).\n\nClickBench, all 43 queries, total of the best times, main → this change:\n\n| threads | main | this change | highest peak memory of a query |\n| ---: | ---: | ---: | --- |\n| 16 | 34.269 s | 30.745 s | 18.8 → 19.4 GB |\n| 32 | 22.190 s | 21.011 s | 20.3 → 20.7 GB |\n| 64 | 16.532 s | 15.841 s | 23.7 → 26.8 GB |\n| 128 | 16.370 s | 16.380 s | 29.7 → 31.4 GB |\n\nLargest moves: Q20 1.103 → 0.825 s at 16 threads and 0.527 → 0.368 s at\n64; Q27 1.290 → 0.966 s and 0.649 →\n0.511 s; Q28 4.303 → 3.602 s at 16. Slower beyond the noise: only Q23 at\n64 threads (0.398 → 0.535 s; it gains at 16\nand 32). Lane-heavy GROUP BYs (Q4, Q17, Q18) lean slower at 64 threads\ninside main's spread. At 128 threads the idle\nis the last parts and the merge's 32 lanes, which this change does not\ntouch.\n\nThe 22 queries derived from TPC-H (sf100), as a control, page cache\nverified resident: 16 threads 116.535 →\n116.321 s, 64 threads 58.367 → 58.781 s; traced, Q1 and Q4 keep the same\nschedule (97% and 75% busy) with either\nwindow. This workload is derived from the TPC-H Benchmark and is not\ncomparable to published TPC-H Benchmark\nresults, as this implementation does not comply with all requirements of\nthe TPC-H Benchmark.\n\nTests: `MergingSinksKeepAWiderWindow` checks both windows;\n`EachSinkOpensItsWindowAheadOfAFailedFirstPart` checks,\nfor every sink kind, that exactly its window's parts open ahead of a\nfailed first part. Mutation-checked: with\n`MergeWindow` at 2 × threads both fail; with only the GROUP BY's\n`window_` at `PartWindow` the second fails.\n\n```text\n$ pixi run check               (this branch, rebased on b9337b9)\nlint: PASS\n100% tests passed out of 2825\n\n$ pixi run check-full          (the same change on 20b5c53, on the 128-thread Linux host)\nclang-format / gersemi / ruff / tombi / markdownlint-cli2 / typos / shellcheck / actionlint / zizmor /\ncheck_repo.py ... Passed\nlint: PASS\nci (clang Debug -Werror): 100% tests passed out of 2815\nasan (ASan+UBSan -Werror): 100% tests passed out of 2815\ntidy: clean (a first run rejected the new test's initializers; fixed in its own commit)\ncoverage: 100% tests passed out of 2815; Coverage gate: PASS\nfuzz-smoke: 100% tests passed out of 2\nci-gcc (GCC 15 Debug -Werror): 100% tests passed out of 2815\ncheck-full exit=0\n```\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change\n- [x] Docs updated: ADR 0013 (amended), docs/architecture.md, comments\n- [x] No ClickBench-derived data is committed\n- [x] Nothing derived from TPC-H is committed\n- [ ] Changes to governance paths were agreed with a maintainer:\n`docs/adr/0013-parallel-execution.md` is under\n  CODEOWNERS and needs a maintainer's review\n\n## AI assistance\n\n- [x] AI-assisted. Claude Code (Claude Opus 5.5) found the cause by\nmeasurement on the 128-thread host, wrote the\nchange, the tests and the ADR amendment; a read-only reviewer agent\nreviewed the diff (5 findings, all fixed).\n- Accountable human (has read and understands the whole diff): @\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n---------\n\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-10-22T11:05:28+03:00",
+          "tree_id": "cfcf0adaa1894a6e13c811763d61fabdd50cb4cc",
+          "url": "https://github.com/ydb-campus/antb1/commit/d9cda57720c6d11054ee64343479de1c259e2423"
+        },
+        "date": 1792656520466,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 3629.2208198299836,
+            "unit": "ns/iter",
+            "extra": "iterations: 193162\ncpu: 3628.978380840952 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 73250.8138922401,
+            "unit": "ns/iter",
+            "extra": "iterations: 9113\ncpu: 73247.66147262153 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 84651.89761876082,
+            "unit": "ns/iter",
+            "extra": "iterations: 8273\ncpu: 84647.82461017766 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 375330.5665236085,
+            "unit": "ns/iter",
+            "extra": "iterations: 1864\ncpu: 375303.61802575114 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 352394.5108203313,
+            "unit": "ns/iter",
+            "extra": "iterations: 1987\ncpu: 352367.88122798176 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2167799.717391315,
+            "unit": "ns/iter",
+            "extra": "iterations: 322\ncpu: 2167691.3260869575 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 41.57244382353089,
+            "unit": "ms/iter",
+            "extra": "iterations: 17\ncpu: 41.56942588235293 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 38.77165311111084,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 38.77089827777781 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 172.8392324999959,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 172.82449 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 11.65420633333317,
+            "unit": "ms/iter",
+            "extra": "iterations: 60\ncpu: 11.653655133333332 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 14.95787872340468,
+            "unit": "ms/iter",
+            "extra": "iterations: 47\ncpu: 14.956373638297846 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 32.49041895238119,
+            "unit": "ms/iter",
+            "extra": "iterations: 21\ncpu: 32.48758761904757 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.4213991857142405,
+            "unit": "ms/iter",
+            "extra": "iterations: 490\ncpu: 1.4213042612244897 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 57.88434749999993,
+            "unit": "ms/iter",
+            "extra": "iterations: 12\ncpu: 57.87822733333329 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1000",
+            "value": 20.88835314705845,
+            "unit": "ms/iter",
+            "extra": "iterations: 34\ncpu: 20.887668852941182 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16384",
+            "value": 23.156844966666768,
+            "unit": "ms/iter",
+            "extra": "iterations: 30\ncpu: 23.154645933333324 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/262144",
+            "value": 50.13011671428558,
+            "unit": "ms/iter",
+            "extra": "iterations: 14\ncpu: 50.125956928571476 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1048576",
+            "value": 77.4819515555565,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 77.47576477777764 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/4194304",
+            "value": 297.98993949999897,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 297.9780175000002 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16777216",
+            "value": 1433.53670099998,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1433.442276000001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1000",
+            "value": 25.903059962963148,
+            "unit": "ms/iter",
+            "extra": "iterations: 27\ncpu: 25.900557407407376 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16384",
+            "value": 29.184593624999405,
+            "unit": "ms/iter",
+            "extra": "iterations: 24\ncpu: 29.182656791666727 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/262144",
+            "value": 51.53915592857215,
+            "unit": "ms/iter",
+            "extra": "iterations: 14\ncpu: 51.5325645714285 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1048576",
+            "value": 94.94635699999776,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 94.94022914285745 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/4194304",
+            "value": 340.20852949998925,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 340.16917000000115 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16777216",
+            "value": 1703.4883750000063,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1703.3537169999988 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1000",
+            "value": 42.749200187500946,
+            "unit": "ms/iter",
+            "extra": "iterations: 16\ncpu: 42.74788012500008 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16384",
+            "value": 45.203452562500246,
+            "unit": "ms/iter",
+            "extra": "iterations: 16\ncpu: 45.202112624999955 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/262144",
+            "value": 70.8666356000009,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 70.86066990000006 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1048576",
+            "value": 135.84126380000043,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 135.82307 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/4194304",
+            "value": 412.9157819999989,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 412.8930570000016 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16777216",
+            "value": 1972.4113980000197,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1972.2135899999955 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1000",
+            "value": 50.997779214286865,
+            "unit": "ms/iter",
+            "extra": "iterations: 14\ncpu: 50.99103171428559 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16384",
+            "value": 54.225698384615185,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 54.22122015384572 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/262144",
+            "value": 82.30905075000194,
+            "unit": "ms/iter",
+            "extra": "iterations: 8\ncpu: 82.2991609999999 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1048576",
+            "value": 154.68557399999838,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 154.66827424999963 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/4194304",
+            "value": 441.2041794999908,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 441.1558274999976 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16777216",
+            "value": 2109.1799309999997,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2108.938082999998 ms\nthreads: 1"
           }
         ]
       }
