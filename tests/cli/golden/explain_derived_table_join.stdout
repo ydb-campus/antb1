@@ -1,6 +1,6 @@
 Output: zn_city:SMALLINT sum(n):HUGEINT
 Project zn_city, "sum(n)"
-  GroupAggregate keys=[zones.zn_city] SUM(p.n)
+  GroupAggregate keys=[zones.zn_city] SUM(p.n)  [groupable below the left of join, 1 key]
     Join INNER build=right keys=[p.tr_pickup = zones.zn_id]
       Project tr_pickup, n
         GroupAggregate keys=[tr_pickup] COUNT(*)

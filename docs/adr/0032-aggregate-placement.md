@@ -102,8 +102,11 @@ entirely, because a pre-grouped relation has exactly one row per key.
   2. every aggregate is decomposable (the table below);
   3. `S` is pre-grouped by its join columns **plus every `S` column appearing in `G`**;
   4. the join is an equi-join on those columns;
-  5. where `S` is the null-supplying side of an outer join, the final step maps a missing partial to `F` over the
-     empty set.
+  5. where `S` is the null-supplying side of an outer join, the final step supplies, for a preserved row with no
+     partial, what the written query answered over the one padded row the join gave it. **That is not quite "F
+     over the empty set", and COUNT(*) is where the difference bites**: it counted the padded row, so its value
+     is 1, where `COUNT(col)` on that side counted a NULL and is 0, and every other kind is NULL. Corrected
+     after item G1's review caught the earlier wording, which gave 0 for both counts.
 
   **Condition 3 is the one that produces a wrong answer silently** if its second half is dropped: a partial group
   then mixes rows the outer grouping separates, and the answer comes back with too few rows and inflated measures.
@@ -127,8 +130,9 @@ entirely, because a pre-grouped relation has exactly one row per key.
   | `kCountDistinct` | -- | not decomposable unless the distinct column enters the pre-grouping |
 
   Integer SUM accumulates in `Int128` and COUNT returns HUGEINT on both sides of the split, and a partial SUM over
-  a DECIMAL keeps its own scale (ADR 0021). Only COUNT has a non-NULL identity, so condition 5's mapping is
-  injected per aggregate rather than once per node.
+  a DECIMAL keeps its own scale (ADR 0021). Only the two counts have a non-NULL value for a preserved row with
+  no partial, and they differ from each other, so condition 5's mapping is injected per call and never once per
+  node.
 
 - **The gate, all six required.** Let `N_before` be the rows the aggregate consumes today, `N_pre` the rows it
   would consume at its new position, `G` the groups it would emit, `keep` the fraction of those surviving the
@@ -176,6 +180,17 @@ entirely, because a pre-grouped relation has exactly one row per key.
   0030's E1 precedent: a pass that only reports cannot give a wrong answer, and every later item depends on the
   legality test -- particularly condition 3's second half -- being right. It also replaces the survey's by-hand
   cardinalities with ones the engine computes.
+  - Update (2026-10-22, G1): **shipped.** It reports **8 of the 22**, and every query the survey called
+    shape-positive but G1 does not report is one of its own documented refusals: a Project between the aggregate
+    and the join for five of them, and for one an aggregate whose `CASE` argument reads both inputs, which is
+    condition 1 and which the survey had independently noted would need an extension to be legal at all. Both
+    queries this ADR says are worth doing are reported.
+  - **Two things G1's review corrected, each of which would have become a wrong answer in G2.** A join carrying
+    a residual was reported as legal and is not: the residual decides which pairs match on something other than
+    the keys, so the pre-grouping destroys the per-row values it reads and a partial aggregates rows the residual
+    rejects, which no final step can take back. And condition 5's value above was wrong for `COUNT(*)`. Neither
+    could reach an answer, because G1 rewrites nothing -- which is the whole argument for shipping a reporting
+    pass first, and it earned its keep on the first review.
 - **G2, perf(plan,exec): perform the rewrite behind the gate.** Measured at SF 100 with peak memory beside time,
   interleaved and rotated, on Q13 and Q10 with the other 20 as the control. The gate's refusals are tested by
   construction, each with the query shape that must be refused and why.
