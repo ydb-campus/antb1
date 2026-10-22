@@ -4,7 +4,12 @@ Date: 2026-10-22
 
 ## Status
 
-Proposed
+Accepted (G1, G2a, G2b and G2c built and measured; G3's entry carries the numbers it was accepted on. A grouped
+aggregate that reads one input of the join below it is computed on that input where the gate admits it, which
+across the 22 is **one query** -- so this is accepted on what it does to that query's memory, **0.131x of its
+peak**, and not on throughput, where it is 0.973x of the 22. The mirror direction, a guard on the join shape and
+a larger key-filter cap were each measured and **refused**, not deferred; two things are left open and named in
+G3.)
 
 ## Context
 
@@ -290,6 +295,42 @@ entirely, because a pre-grouped relation has exactly one row per key.
     rows, and a sum of counts is 0 over no rows by design, so it classifies there as a count. ADR 0014's
     merge-order rule takes it as order-independent, counts adding exactly and sums of them likewise.
 - **G3, docs(adr): record what G1 and G2 measured**, and either accept this ADR or defer it with the numbers.
+  - Update (2026-10-22, G3): **accepted, on one query of the 22 and on its memory rather than its time.**
+    Everything below is SF 100, four threads, interleaved and rotated, both arms built from the same tree,
+    answers identical:
+
+    | | before | after |
+    | --- | ---: | ---: |
+    | Q13 | 10.451 s | **5.896 s (0.564x)** |
+    | Q13's peak memory | 13,959 MiB | **1,833 MiB (0.131x)** |
+    | the 22 | 119.64 s | 114.85 s, geomean **0.973x** |
+    | the 22's peak memory | 13,959 MiB | 13,609 MiB, Q13 no longer setting it |
+
+  - **Why that is worth accepting, stated plainly.** 4.8 seconds over 22 queries is not a throughput result and
+    this ADR has said so since its Consequences were first written. What it is: a query that needed **14 GB**
+    now needs **1.8**, which is the difference between fitting in a container and not. Peak memory is the
+    dimension antb1 looks worst on against DuckDB, and this is the largest single reduction in it that any item
+    of this project has produced.
+  - **The gate is the artifact, not the rewrite.** Fourteen of the 22 have the shape and the gate admits one.
+    Every refusal is a measured one or a cardinality one, and the natural rule -- reduce a lot, discard little --
+    was shown wrong in both directions before the gate was written: it rates Q9 best in the survey on both axes
+    while doing provably nothing to it, and it orders the two queries that matter the wrong way round. Three of its six
+    conditions are not decidable in a logical plan and the code says which.
+  - **What the sequencing bought, since it is the transferable part.** Four items, each shipping only what could
+    be verified: the finder before the gate, the gate before the rewrite, the rewrite before the aggregate kind.
+    Two defects in the legality test and one wrong cost proxy were caught while nothing could yet change an
+    answer -- a join carrying a residual reported as exchangeable, `COUNT(*)`'s padded value, and a
+    plan-time proxy for "a join multiplies" that refused the one query this ADR is about. Each would have been a
+    wrong answer or a lost win had the rewrite landed first.
+  - **Two things are open, and neither is a defect.**
+    - **An iterated exchange**, pushing an aggregate along a chain of joins. Q10's measured 0.945x lives at a
+      placement two joins down, which this decision's single exchange does not reach; the placement it does
+      reach is 1.245x slower and the gate refuses it. A second query would come from this and nothing else here
+      will produce it.
+    - **`COUNT(*)` where the grouped side can go missing**, which answered 1 over the padded row and so wants a
+      value supplied where every other spelling wants nothing. No query of the 22 has that shape.
+  - **One error path changed** and is recorded under G2b: a group whose total fits a DECIMAL width while its
+    partial sums cancel across the top of it would now raise an overflow where the written plan answered.
 
 ## Alternatives considered
 
