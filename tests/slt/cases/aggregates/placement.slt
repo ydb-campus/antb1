@@ -232,21 +232,117 @@ WHERE a.tr_pickup > 40 GROUP BY a.tr_day ORDER BY a.tr_day
 2026-03-31	NULL	NULL
 NULL	NULL	NULL
 
-# ---- shapes the exchange declines, whose answers must be the written ones ----
+# ---- counts, which merge through a kind of their own ----
 
-# A count beside the sum: summing partial counts returns HUGEINT where COUNT returns BIGINT, so the exchange
-# has nothing to say the plan can express and leaves the query alone.
-query IDI nosort
-SELECT zn_city, SUM(tr_fare), COUNT(*) FROM trips LEFT JOIN zones ON tr_pickup = zn_id
+# COUNT of a column of the grouped side, which is the shape ADR 0032 was written for. The exchange counts
+# below and sums those counts above, through a kind whose result stays BIGINT -- a SUM of integers would have
+# returned HUGEINT, which is not the type COUNT asked for.
+query II nosort
+SELECT zn_city, COUNT(tr_fare) FROM trips LEFT JOIN zones ON tr_pickup = zn_id
 GROUP BY zn_city ORDER BY zn_city
 ----
-1	8401.75	559
-2	8432.75	559
-3	7356.00	490
-4	7328.75	489
-5	8320.50	558
-9	1016.00	69
-NULL	4136.75	276
+1	540
+2	542
+3	474
+4	474
+5	539
+9	67
+NULL	267
+
+# The same over a grouped side that can go missing, where a left row with no match reads no partial at all.
+# A missing partial counted nothing, so it adds zero -- and 0 is what COUNT of a column answered for such a
+# row. This is the case the whole kind exists to get right.
+query TI nosort
+SELECT a.tr_day, COUNT(b.tr_fare) FROM trips a LEFT JOIN trips b ON a.tr_pickup = b.tr_dropoff
+WHERE a.tr_pickup > 40 GROUP BY a.tr_day ORDER BY a.tr_day
+----
+2026-03-01	0
+2026-03-02	0
+2026-03-03	0
+2026-03-04	0
+2026-03-05	0
+2026-03-06	0
+2026-03-07	0
+2026-03-08	0
+2026-03-09	0
+2026-03-10	0
+2026-03-11	0
+2026-03-12	0
+2026-03-13	0
+2026-03-14	0
+2026-03-15	0
+2026-03-16	0
+2026-03-17	0
+2026-03-18	0
+2026-03-19	0
+2026-03-20	0
+2026-03-21	0
+2026-03-22	0
+2026-03-23	0
+2026-03-24	0
+2026-03-25	0
+2026-03-26	0
+2026-03-27	0
+2026-03-28	0
+2026-03-29	0
+2026-03-30	0
+2026-03-31	0
+NULL	0
+
+# A count beside a sum, both exchanging together.
+query IDI nosort
+SELECT zn_city, SUM(tr_fare), COUNT(tr_fare) FROM trips LEFT JOIN zones ON tr_pickup = zn_id
+GROUP BY zn_city ORDER BY zn_city
+----
+1	8401.75	540
+2	8432.75	542
+3	7356.00	474
+4	7328.75	474
+5	8320.50	539
+9	1016.00	67
+NULL	4136.75	267
+
+# ---- shapes the exchange declines, whose answers must be the written ones ----
+
+# COUNT(*) over a grouped side that can go missing: a missing partial counted nothing, which is what
+# COUNT(col) answered there and not what COUNT(*) did -- it counted the padded row. Declined, so this is the
+# written query's answer.
+query TDI nosort
+SELECT a.tr_day, SUM(b.tr_fare), COUNT(*) FROM trips a LEFT JOIN trips b ON a.tr_pickup = b.tr_dropoff
+GROUP BY a.tr_day ORDER BY a.tr_day
+----
+2026-03-01	93295.75	6219
+2026-03-02	93094.50	6222
+2026-03-03	93128.25	6219
+2026-03-04	94215.50	6290
+2026-03-05	93073.25	6216
+2026-03-06	93326.25	6220
+2026-03-07	93058.75	6217
+2026-03-08	92326.25	6150
+2026-03-09	93114.00	6221
+2026-03-10	92111.25	6148
+2026-03-11	93255.75	6220
+2026-03-12	92129.00	6150
+2026-03-13	93145.75	6218
+2026-03-14	93074.25	6221
+2026-03-15	94222.00	6288
+2026-03-16	94212.25	6291
+2026-03-17	93067.25	6216
+2026-03-18	93427.50	6222
+2026-03-19	93135.25	6217
+2026-03-20	92255.25	6151
+2026-03-21	92035.25	6150
+2026-03-22	92134.75	6149
+2026-03-23	93119.50	6220
+2026-03-24	92047.25	6149
+2026-03-25	93237.75	6219
+2026-03-26	93084.25	6219
+2026-03-27	91122.25	6079
+2026-03-28	92033.00	6150
+2026-03-29	92052.50	6146
+2026-03-30	92189.50	6150
+2026-03-31	92074.75	6147
+NULL	79340.25	5299
 
 # AVG, whose partial is a pair and whose final divides.
 query IR nosort

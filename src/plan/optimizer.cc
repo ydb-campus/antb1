@@ -763,6 +763,10 @@ bool StrictAggregates(const std::vector<AggregateCall>& calls) {
       case AggKind::kCountStar:
       case AggKind::kCount:
       case AggKind::kCountDistinct:
+      // A sum of counts is a count for this rule's purpose, and for its stated reason: it answers
+      // 0 over no rows, by design (ADR 0032's G2c). Unreachable today, since the unnesting runs
+      // before the exchange that makes one, and correct if that ever changes.
+      case AggKind::kSumCounts:
         return false;
     }
     return false;

@@ -269,6 +269,61 @@ class GroupedIntegerSum final : public GroupedAggregateState {
   std::vector<std::int64_t> counts_;
 };
 
+// The final half of a count computed in two places, per group (ADR 0032's G2c): BIGINT counts
+// summed into a BIGINT. A NULL partial is one the join found no row for, which counted nothing, so
+// it adds zero and a group of nothing but NULLs answers 0 rather than NULL -- which is what
+// COUNT(col) answers for a row with no match. See the ungrouped SumCountsState for why a BIGINT
+// holds the total.
+class GroupedSumCounts final : public GroupedAggregateState {
+ public:
+  [[nodiscard]] std::uint32_t num_groups() const override {
+    return static_cast<std::uint32_t>(sums_.size());
+  }
+  void Resize(std::uint32_t num_groups) override { sums_.resize(num_groups, 0); }
+  [[nodiscard]] std::int64_t memory_usage() const override { return VectorBytes(sums_); }
+  arrow::Status Consume(const arrow::Array* values, GroupIds ids) override {
+    if (values == nullptr) {
+      return arrow::Status::Invalid("SUM of counts needs an argument column");
+    }
+    ARROW_RETURN_NOT_OK(CheckRows(values, arrow::int64().get(), ids, num_groups()));
+    const auto* data = values->data()->GetValues<std::int64_t>(1);
+    const bool nulls = values->null_count() != 0;
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+      if (nulls && values->IsNull(static_cast<std::int64_t>(i))) {
+        continue;
+      }
+      sums_[ids[i]] += data[i];
+    }
+    return arrow::Status::OK();
+  }
+  arrow::Status MergeGroups(const GroupedAggregateState& other, GroupIds from,
+                            GroupIds to) override {
+    ARROW_ASSIGN_OR_RAISE(const auto* same,
+                          SameKind<GroupedSumCounts>(other, from, to, num_groups()));
+    for (std::size_t i = 0; i < from.size(); ++i) {
+      sums_[to[i]] += same->sums_[from[i]];
+    }
+    return arrow::Status::OK();
+  }
+  [[nodiscard]] arrow::Result<std::shared_ptr<arrow::Array>> Finalize(
+      std::uint32_t begin, std::uint32_t end, arrow::MemoryPool* pool) const override {
+    ARROW_ASSIGN_OR_RAISE(const auto sums, GroupRange(sums_, begin, end));
+    std::vector<std::int64_t> totals;
+    totals.reserve(sums.size());
+    for (const Int128 sum : sums) {
+      const std::optional<std::int64_t> total = Int128ToInt64(sum);
+      if (!total.has_value()) {
+        return arrow::Status::Invalid("SUM of counts outside BIGINT");
+      }
+      totals.push_back(*total);
+    }
+    return Int64s(totals, pool);
+  }
+
+ private:
+  std::vector<Int128> sums_;
+};
+
 // AVG of DATE or TIMESTAMP values per group: a TIMESTAMP, averaged in 128 bits as DuckDB does.
 class GroupedTemporalAvg final : public GroupedAggregateState {
  public:
@@ -996,6 +1051,11 @@ arrow::Result<std::unique_ptr<GroupedAggregateState>> MakeGroupedAggregateState(
         return invalid();
       }
       return std::make_unique<GroupedCount>(plan::ToArrow(*input));
+    case plan::AggKind::kSumCounts:
+      if (*input != plan::LogicalType::kBigInt || result != plan::LogicalType::kBigInt) {
+        return invalid();
+      }
+      return std::make_unique<GroupedSumCounts>();
     case plan::AggKind::kSum:
     case plan::AggKind::kAvg: {
       const bool average = kind == plan::AggKind::kAvg;

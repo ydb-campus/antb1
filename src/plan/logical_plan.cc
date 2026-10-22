@@ -442,6 +442,8 @@ std::string_view ToString(AggKind kind) {
       return "MIN";
     case AggKind::kMax:
       return "MAX";
+    case AggKind::kSumCounts:
+      return "SUM_COUNTS";
   }
   return "?";
 }
