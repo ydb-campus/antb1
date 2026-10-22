@@ -144,6 +144,56 @@ class CountState final : public AggregateState {
   int64_t count_ = 0;
 };
 
+// ---- the final half of a count computed in two places (ADR 0032's G2c) ----
+
+// Sums BIGINT counts into a BIGINT. Two things make it a kind of its own rather than a SUM: the
+// result type, since an integer SUM returns HUGEINT and a count's own result is BIGINT; and what a
+// missing value means. A partial that is NULL is one the join found no row for, which counted
+// nothing, so it adds zero -- where SUM of no non-NULL value at all is NULL. So this never answers
+// NULL, which is exactly what COUNT(col) answers for a row with no match.
+//
+// It cannot overflow a BIGINT: the sum of counts over a plan is bounded by the rows it read, and a
+// plan cannot read more rows than an int64 counts. The accumulator is Int128 regardless, so the
+// bound is a fact about the data rather than something this relies on.
+class SumCountsState final : public AggregateState {
+ public:
+  explicit SumCountsState(arrow::MemoryPool* pool) : pool_(pool) {}
+
+  arrow::Status Consume(const arrow::Array& values, const arrow::BooleanArray* selection) override {
+    ARROW_RETURN_NOT_OK(CheckInput(values, selection, *arrow::int64()));
+    // The mask is the selected rows that are not NULL -- a NULL partial is one the join found no
+    // row for, which counted nothing, so leaving it out is what adds its zero.
+    ARROW_ASSIGN_OR_RAISE(const RowMask mask,
+                          RowMask::Make(&values, selection, values.length(), pool_));
+    const auto* data = values.data()->GetValues<std::int64_t>(1);
+    Int128 sum = 0;
+    mask.ForEachRun([&sum, data](int64_t position, int64_t count) {
+      for (int64_t i = 0; i < count; ++i) {
+        sum += data[position + i];
+      }
+    });
+    sum_ += sum;
+    return arrow::Status::OK();
+  }
+  arrow::Status Merge(const AggregateState& other) override {
+    ARROW_ASSIGN_OR_RAISE(const auto* same, SameKind<SumCountsState>(other));
+    sum_ += same->sum_;
+    return arrow::Status::OK();
+  }
+  [[nodiscard]] arrow::Result<std::shared_ptr<arrow::Array>> Finalize(
+      arrow::MemoryPool* pool) const override {
+    const std::optional<std::int64_t> total = Int128ToInt64(sum_);
+    if (!total.has_value()) {
+      return arrow::Status::Invalid("SUM of counts outside BIGINT");
+    }
+    return OneInt64(*total, pool);
+  }
+
+ private:
+  arrow::MemoryPool* pool_;
+  Int128 sum_ = 0;
+};
+
 // ---- COUNT(DISTINCT c) ----
 
 // The distinct selected values, as the keys of a grouper; NULL is a key of its own that the count
@@ -627,6 +677,11 @@ arrow::Result<std::unique_ptr<AggregateState>> MakeAggregateState(
         return invalid();
       }
       return std::make_unique<CountState>(plan::ToArrow(*input), pool);
+    case plan::AggKind::kSumCounts:
+      if (*input != plan::LogicalType::kBigInt || result != plan::LogicalType::kBigInt) {
+        return invalid();
+      }
+      return std::make_unique<SumCountsState>(pool);
     case plan::AggKind::kSum:
     case plan::AggKind::kAvg: {
       const bool average = kind == plan::AggKind::kAvg;

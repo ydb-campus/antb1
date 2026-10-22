@@ -254,6 +254,24 @@ TEST(AggregatePlacementTest, PerformsThePlacementTheGateAdmits) {
   EXPECT_NE(text.find("GroupAggregate keys=[wide.dk] SUM("), std::string::npos) << text;
 }
 
+// A count exchanges through the kind that merges partial counts: COUNT below, SUM_COUNTS above.
+// Its result stays BIGINT, which is what the query asked for and what a SUM of integers would not
+// have given.
+TEST(AggregatePlacementTest, ACountExchangesThroughTheKindThatMergesCounts) {
+  static const Catalog catalog = GateCatalog();
+  auto plan = BindSql(
+      "SELECT wide.dk, COUNT(facts.v) FROM facts, wide WHERE facts.few = wide.dk "
+      "GROUP BY wide.dk",
+      catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  const std::string text = Explain(Optimized(*plan));
+  EXPECT_NE(text.find("GroupAggregate keys=[facts.few] COUNT(facts.v)"), std::string::npos) << text;
+  EXPECT_NE(text.find("SUM_COUNTS("), std::string::npos) << text;
+  EXPECT_NE(text.find("count(facts.v):BIGINT"), std::string::npos)
+      << "the result type is the one the query asked for\n"
+      << text;
+}
+
 // Everything the exchange declines to build, each leaving one aggregate where the query wrote one.
 TEST(AggregatePlacementTest, DeclinesToBuild) {
   struct Case {
@@ -261,16 +279,11 @@ TEST(AggregatePlacementTest, DeclinesToBuild) {
     std::string_view why;
   };
   for (const Case& c : {
-           // A count: the final would be a SUM of counts, which returns HUGEINT where COUNT
-           // returns BIGINT, and a plan cannot narrow one back.
-           Case{.sql = "SELECT wide.dk, COUNT(facts.v) FROM facts, wide WHERE facts.few = wide.dk "
-                       "GROUP BY wide.dk",
-                .why = "a count needs a kind of its own to merge"},
-           // The same, with the count beside a kind that would decompose: one call it cannot build
-           // stops the placement, since a half-exchanged aggregate is not a plan.
-           Case{.sql = "SELECT wide.dk, SUM(facts.v), COUNT(*) FROM facts, wide "
-                       "WHERE facts.few = wide.dk GROUP BY wide.dk",
-                .why = "one unbuildable call stops the whole placement"},
+           // COUNT(*) where the grouped side can go missing: a missing partial counted nothing,
+           // which is COUNT(col)'s answer and not COUNT(*)'s -- that one counted the padded row.
+           Case{.sql = "SELECT wide.dk, SUM(facts.v), COUNT(*) FROM wide LEFT JOIN facts "
+                       "ON wide.dk = facts.few GROUP BY wide.dk",
+                .why = "COUNT(*) over a side that can be missing"},
            // AVG, whose partial is a (SUM, COUNT) pair and whose final divides.
            Case{.sql = "SELECT wide.dk, AVG(facts.v) FROM facts, wide WHERE facts.few = wide.dk "
                        "GROUP BY wide.dk",

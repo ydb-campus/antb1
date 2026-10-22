@@ -68,7 +68,23 @@ std::string_view ToString(CompareOp op);
 
 // kCountDistinct is COUNT(DISTINCT col): the number of distinct non-NULL values (a DOUBLE -0.0 is
 // 0.0 and every NaN one value, as in DuckDB).
-enum class AggKind : std::uint8_t { kCountStar, kCount, kSum, kAvg, kMin, kMax, kCountDistinct };
+//
+// kSumCounts is the one kind no query can write: the final half of a count computed in two places
+// (docs/adr/0032-aggregate-placement.md's G2c). It sums BIGINT counts into a BIGINT, where kSum
+// over an integer returns HUGEINT because a general integer sum can leave int64 -- a sum of counts
+// cannot, being bounded by the rows counted, and COUNT's own result is BIGINT, which is the type
+// the query asked for. Only plan::ExchangeAggregates makes one; the binder never does, and no
+// parser reaches it.
+enum class AggKind : std::uint8_t {
+  kCountStar,
+  kCount,
+  kSum,
+  kAvg,
+  kMin,
+  kMax,
+  kCountDistinct,
+  kSumCounts,
+};
 
 // "COUNT", "SUM", "AVG", "MIN", "MAX" (COUNT for COUNT(*), COUNT(col) and COUNT(DISTINCT col)).
 std::string_view ToString(AggKind kind);

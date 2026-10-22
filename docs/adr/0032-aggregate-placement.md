@@ -173,8 +173,8 @@ entirely, because a pre-grouped relation has exactly one row per key.
 
 - **One query of 22 improves at the placement this decision reaches** -- Q13 -- and the rest of the fourteen
   shape-positive ones must be refused, so the gate is most of this item's value and nearly all of its risk.
-  **As of G2b that one query does not improve yet**: it is a count, and merging partial counts needs the kind
-  item G2c adds.
+  As of G2c it does improve: **0.564x and 0.131x of its peak memory**, which is the case this ADR was written
+  on and the dimension it rests on.
   Q10's win needs an iterated exchange this ADR does not describe (see the correction in the Context). A
   wrongly gated rule is comfortably net negative: the survey
   produced four written rewrites that regress by 1.03x to 1.89x and one that regressed by about 2,700x before the
@@ -231,7 +231,8 @@ entirely, because a pre-grouped relation has exactly one row per key.
     the gate computes its own by ADR 0022's rule 3, locally. Changing what `EstimateRows` answers for a join
     would move `ChooseBuildSide`, which is ADR 0026's decision and not this item's.
 - **G2b, perf(plan): perform the rewrite behind the gate.**
-  - Update (2026-10-22, G2b): **shipped for SUM, MIN and MAX, and it fires on no query of the 22** -- because
+  - Update (2026-10-22, G2b): **shipped for SUM, MIN and MAX, and on landing it fired on no query of the 22**
+    -- because
     the one placement the gate admits is a count, and a count is the one kind the plan cannot yet express.
     Measured where it does fire: a SUM over the same shape as Q13's at SF 100 goes **3.417 s to 3.003 s
     (0.879x)**, answers identical, and the exchange is answer-identical on an inner join, on a LEFT JOIN whose
@@ -262,9 +263,32 @@ entirely, because a pre-grouped relation has exactly one row per key.
     against its DECIMAL width, so a group whose total fits while its partial sums cancel across the top of that
     width would now raise an overflow where the written plan answered. It needs values near 10^38 and no query
     of the 22 is close, but a rewrite that can turn an answer into an error is worth stating plainly.
-- **G2c, feat(plan,exec): a kind that merges partial counts, whose result is BIGINT.** The one capability
-  between this decision and its measured 0.494x. It crosses into `exec` and touches ADR 0014's merge-order
-  classification and every switch over `AggKind`, which is why it is its own item rather than part of G2b.
+- **G2c, feat(plan,exec): a kind that merges partial counts, whose result is BIGINT.**
+  - Update (2026-10-22, G2c): **shipped, and this decision now earns its number from the engine rather than
+    from a query written by hand.** `AggKind::kSumCounts` sums BIGINT counts into a BIGINT; a query cannot write
+    one and the binder never makes one. At SF 100 on four threads, interleaved and rotated, answers identical
+    over all 48 rows:
+
+    | | before | after |
+    | --- | ---: | ---: |
+    | Q13 | 10.451 s | **5.896 s (0.564x)** |
+    | its peak memory | 13,959 MiB | **1,833 MiB (0.131x)** |
+    | the 22 | 119.64 s | **114.85 s**, geomean 0.973x |
+    | the 22's peak memory | 13,959 MiB | 13,609 MiB -- Q13 no longer sets it |
+
+    Every other query of the 22 is within its own spread. The hand-written form measured 0.494x because it
+    could drop the outer grouping, knowing a customer key unique; the engine keeps that grouping because
+    nothing tells it so, and pays the difference.
+  - **The padding of condition 5 turned out not to be needed for `COUNT(col)`, which is the whole of Q13.**
+    The kind reads a missing partial as having counted nothing, so a preserved row the join found no match for
+    answers 0 -- which is exactly what `COUNT(col)` answered over the one padded row, the column there being
+    NULL. So the mapping this ADR twice said would arrive with G2c is, for that spelling, not a mapping at all
+    but a property of the kind. `COUNT(*)` is the spelling that still needs one, having counted the padded row
+    itself and answered 1, and it stays refused where the grouped side can go missing.
+  - **Five places classify an `AggKind` and `-Werror` found all five**, which is worth recording because one of
+    them is a judgement and not a mechanism: ADR 0023's Path 2 admits only the calls that are not 0 over no
+    rows, and a sum of counts is 0 over no rows by design, so it classifies there as a count. ADR 0014's
+    merge-order rule takes it as order-independent, counts adding exactly and sums of them likewise.
 - **G3, docs(adr): record what G1 and G2 measured**, and either accept this ADR or defer it with the numbers.
 
 ## Alternatives considered

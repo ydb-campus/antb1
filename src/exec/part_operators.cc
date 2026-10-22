@@ -591,8 +591,9 @@ bool TwoLevelAggregation(const std::vector<plan::BoundColumn>& keys,
             return key.index == call.arg->index;
           });
       distinct = true;
-    } else if (call.kind == plan::AggKind::kCountStar || call.kind == plan::AggKind::kCount) {
-      order_independent = true;
+    } else if (call.kind == plan::AggKind::kCountStar || call.kind == plan::AggKind::kCount ||
+               call.kind == plan::AggKind::kSumCounts) {
+      order_independent = true;  // counts add exactly, and so do sums of them
     } else if (call.kind == plan::AggKind::kMin || call.kind == plan::AggKind::kMax) {
       // -0.0 and 0.0 compare equal: which one a DOUBLE MIN keeps depends on the order.
       order_independent = input.has_value() && *input != plan::LogicalType::kDouble;

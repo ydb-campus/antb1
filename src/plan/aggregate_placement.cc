@@ -111,7 +111,8 @@ bool Decomposable(AggKind kind) {
     case AggKind::kSum:
     case AggKind::kMin:
     case AggKind::kMax:
-    case AggKind::kAvg:  // as a (SUM, COUNT) pair, divided above the join
+    case AggKind::kAvg:        // as a (SUM, COUNT) pair, divided above the join
+    case AggKind::kSumCounts:  // a sum of counts is itself one, being associative
       return true;
     case AggKind::kCountDistinct:
       return false;
@@ -383,21 +384,18 @@ std::optional<LogicalNodePtr> Exchange(const AggregatePlacement& placement, Colu
   if (!join->residual.empty()) {
     return std::nullopt;
   }
-  // Refused for now, each because the plan cannot yet say what the rewrite needs:
+  // What is still refused, and why:
   //
   //   - kAvg, whose partial is a (SUM, COUNT) pair and whose final divides, so the exchange would
   //     change the node's output arity.
-  //   - the counts, and this one is the interesting refusal. A count decomposes into a count below
-  //     and a SUM of counts above -- and an integer SUM returns HUGEINT, by the rule that keeps it
-  //     from wrapping at int64 (AGENTS.md, ADR 0021), while COUNT's own output is BIGINT. So the
-  //     honest final has a type the query did not ask for, and a plan cannot narrow it back: a
-  //     CastExpr is an exact widening only. Summing partial counts needs a kind of its own, whose
-  //     result is BIGINT and which cannot overflow one because it is bounded by the rows counted.
-  //     **This is the refusal that matters**: the one placement the gate admits across the 22 is a
-  //     count, so the rewrite currently fires on none of them.
-  if (std::ranges::any_of(aggregate.aggregates, [](const AggregateCall& call) {
-        return call.kind == AggKind::kAvg || call.kind == AggKind::kCountStar ||
-               call.kind == AggKind::kCount;
+  //   - COUNT(*) where the grouped side can go missing. A count merges through kSumCounts, which
+  //     reads a missing partial as having counted nothing -- which is exactly what COUNT(col)
+  //     answered for a row the join found no match for, so that case needs nothing. COUNT(*)
+  //     answered 1 there, having counted the padded row itself, so it needs a value supplied
+  //     rather than a zero assumed, and that mapping is not built.
+  if (std::ranges::any_of(aggregate.aggregates, [&placement](const AggregateCall& call) {
+        return call.kind == AggKind::kAvg ||
+               (call.kind == AggKind::kCountStar && placement.needs_identity);
       })) {
     return std::nullopt;
   }
@@ -442,6 +440,9 @@ std::optional<LogicalNodePtr> Exchange(const AggregatePlacement& placement, Colu
     below.id = Mint(last_id);
     partial.aggregates.push_back(below);
     AggregateCall above = call;  // keeps the original id, so nothing above this changes
+    if (call.kind == AggKind::kCountStar || call.kind == AggKind::kCount) {
+      above.kind = AggKind::kSumCounts;  // a count below, a sum of those counts above
+    }
     above.arg =
         BoundColumn{.index = 0,
                     .id = below.id,
@@ -457,11 +458,17 @@ std::optional<LogicalNodePtr> Exchange(const AggregatePlacement& placement, Colu
       std::make_shared<const LogicalNode>(std::move(partial));
   LogicalNodePtr input = std::make_shared<const LogicalNode>(std::move(over));
 
-  // No padding is built, and with the counts refused none is needed: `needs_identity` says a
-  // preserved row may find no partial, and the value the written query gave such a row is NULL for
-  // every kind this performs -- which is already what an aggregate of a NULL partial answers. Only
-  // a count wants something else there (1 for COUNT(*), 0 for COUNT(col)), so the mapping arrives
-  // with the kind that makes a count exchangeable at all, and not before it can be reached.
+  // No padding is built, and none is needed for any kind that reaches here. `needs_identity` says a
+  // preserved row may find no partial at all, and the value the written query gave such a row is:
+  //
+  //   NULL for SUM, MIN and MAX   -- already what an aggregate of a missing partial answers
+  //   0    for COUNT(col)         -- and kSumCounts reads a missing partial as having counted
+  //                                  nothing, so that is already what it answers too
+  //   1    for COUNT(*)           -- it counted the padded row, so this one does want a value
+  //                                  supplied, which is why it is refused above
+  //
+  // So the mapping ADR 0032's condition 5 asks for is, for every spelling this performs, a property
+  // of the kind rather than something to build.
   GroupAggregateNode final = aggregate;
   final.input = std::move(input);
   final.aggregates = std::move(finals);
