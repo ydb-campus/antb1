@@ -8,11 +8,16 @@
 
 #include "antb1/plan/logical_plan.h"
 
-// Where a grouped aggregate could be computed on one input of the join below it
-// (docs/adr/0032-aggregate-placement.md, item G1): **finding and reporting only, never a rewrite.**
-// A pass that only reports cannot give a wrong answer, and every later item of that ADR depends on
-// this legality test being right -- particularly condition 3's second half, which is the one whose
-// omission changes aggregate values rather than row counts.
+// A grouped aggregate computed on one input of the join below it
+// (docs/adr/0032-aggregate-placement.md). Two things live here: `AggregatePlacements` finds where
+// the exchange is legal and what the gate makes of it, reporting only (item G1), and
+// `ExchangeAggregates` performs the ones the gate admits (item G2b). The finder shipped first on
+// the argument that a pass which only reports cannot give a wrong answer, and it earned that -- two
+// defects in the legality test came out of its review before any answer could move.
+//
+// Condition 3's second half is the one to keep in view: a pre-grouping missing a grouping column of
+// the aggregated side merges rows the query separates, which changes aggregate values rather than
+// row counts, so nothing crashes and no count looks wrong.
 //
 // Private to the plan module: explain.cc and this module's tests include it. Public when a consumer
 // needs it, as ADR 0030's E1 was (ADR 0027's S1: a producer shipped ahead of its consumer is a
@@ -124,5 +129,28 @@ std::string_view ToString(AggregatePlacement::Verdict verdict);
 // So a `kWorth` verdict here means "every condition a logical plan can decide", which is weaker
 // than ADR 0032's gate and is why this reports rather than rewrites.
 std::vector<AggregatePlacement> AggregatePlacements(const LogicalPlan& plan);
+
+// `root` with every placement the gate calls `kWorth` performed: the aggregated side grouped by
+// `pre_grouping` into partial states, the join over those partials, and the original aggregate left
+// in place over them as the final step (ADR 0032's item G2b). `root` itself where none fires, which
+// is every plan the gate does not admit.
+//
+// `last_id` is the largest column id in use and is advanced for each column this mints; the caller
+// owns it because a plan's ids must stay unique across every pass that adds one.
+//
+// **Indices are not maintained and do not need to be.** A column this introduces carries the id of
+// the column it stands for, or a fresh one, and `plan::ResolvePositions` -- which `Optimize` runs
+// after every pass -- recomputes every `BoundColumn::index` from the ids. A rewrite that tried to
+// keep indices in step would be maintaining a second, redundant truth.
+//
+// What it declines to build, leaving the plan as it is even where the gate admits the placement:
+//
+//   - a `Compute` between the aggregate and the join. The aggregate's argument is then an
+//     expression over the aggregated side, so the `Compute` would have to travel down with the
+//     partial; sound, and not needed by the one placement of the 22 the gate admits.
+//   - `kAvg`, whose partial is a (SUM, COUNT) pair and whose final divides. Decomposable, but it
+//     is the one kind whose rewrite changes the node's output arity, and no query of the 22 has an
+//     AVG in a position the gate admits.
+LogicalNodePtr ExchangeAggregates(const LogicalNodePtr& root, ColumnId& last_id);
 
 }  // namespace antb1::plan

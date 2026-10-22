@@ -63,7 +63,10 @@ std::vector<std::string> Verdicts(std::string_view sql) {
   if (!plan.ok()) {
     return out;
   }
-  for (const AggregatePlacement& p : AggregatePlacements(Optimized(*plan))) {
+  // The bound plan, not the optimized one: a verdict is what the gate makes of a placement
+  // *before* the exchange, and Optimize performs the ones it calls worth -- so reading the
+  // optimized plan would ask the gate about a plan it has already changed.
+  for (const AggregatePlacement& p : AggregatePlacements(*plan)) {
     out.emplace_back(ToString(p.verdict));
   }
   return out;
@@ -216,8 +219,73 @@ TEST(AggregatePlacementTest, TheGateRefusals) {
   }
 }
 
-// Every refusal. Each reports nothing, and reporting nothing is always safe -- but each is here
-// because it is a shape that would otherwise look legal.
+// How many grouped aggregates the optimized plan holds: one where the exchange did not fire, two
+// where it did -- the partial on the aggregated side and the original left above the join.
+int Aggregates(std::string_view sql) {
+  static const Catalog catalog = GateCatalog();
+  auto plan = BindSql(sql, catalog);
+  EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+  if (!plan.ok()) {
+    return -1;
+  }
+  int count = 0;
+  const std::string text = Explain(Optimized(*plan));
+  for (std::size_t at = text.find("GroupAggregate"); at != std::string::npos;
+       at = text.find("GroupAggregate", at + 1)) {
+    ++count;
+  }
+  return count;
+}
+
+// The exchange performed: the admitted placement of the gate's own fixture gains an aggregate.
+TEST(AggregatePlacementTest, PerformsThePlacementTheGateAdmits) {
+  EXPECT_EQ(Aggregates("SELECT wide.dk, SUM(facts.v) FROM facts, wide WHERE facts.few = wide.dk "
+                       "GROUP BY wide.dk"),
+            2);
+  // And the partial groups the aggregated side by the join key, with the original left above it.
+  static const Catalog catalog = GateCatalog();
+  auto plan = BindSql(
+      "SELECT wide.dk, SUM(facts.v) FROM facts, wide WHERE facts.few = wide.dk "
+      "GROUP BY wide.dk",
+      catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  const std::string text = Explain(Optimized(*plan));
+  EXPECT_NE(text.find("GroupAggregate keys=[facts.few] SUM(facts.v)"), std::string::npos) << text;
+  EXPECT_NE(text.find("GroupAggregate keys=[wide.dk] SUM("), std::string::npos) << text;
+}
+
+// Everything the exchange declines to build, each leaving one aggregate where the query wrote one.
+TEST(AggregatePlacementTest, DeclinesToBuild) {
+  struct Case {
+    std::string_view sql;
+    std::string_view why;
+  };
+  for (const Case& c : {
+           // A count: the final would be a SUM of counts, which returns HUGEINT where COUNT
+           // returns BIGINT, and a plan cannot narrow one back.
+           Case{.sql = "SELECT wide.dk, COUNT(facts.v) FROM facts, wide WHERE facts.few = wide.dk "
+                       "GROUP BY wide.dk",
+                .why = "a count needs a kind of its own to merge"},
+           // The same, with the count beside a kind that would decompose: one call it cannot build
+           // stops the placement, since a half-exchanged aggregate is not a plan.
+           Case{.sql = "SELECT wide.dk, SUM(facts.v), COUNT(*) FROM facts, wide "
+                       "WHERE facts.few = wide.dk GROUP BY wide.dk",
+                .why = "one unbuildable call stops the whole placement"},
+           // AVG, whose partial is a (SUM, COUNT) pair and whose final divides.
+           Case{.sql = "SELECT wide.dk, AVG(facts.v) FROM facts, wide WHERE facts.few = wide.dk "
+                       "GROUP BY wide.dk",
+                .why = "AVG changes the node's arity"},
+           // A placement the gate refuses is not performed however buildable it is.
+           Case{.sql = "SELECT twin.dk, SUM(facts.v) FROM facts, twin WHERE facts.many = twin.dk "
+                       "GROUP BY twin.dk",
+                .why = "the gate refuses it"},
+       }) {
+    EXPECT_EQ(Aggregates(c.sql), 1) << c.why << ": " << c.sql;
+  }
+}
+
+// Every refusal. Each reports nothing, and reporting nothing is always safe -- but
+// each is here because it is a shape that would otherwise look legal.
 TEST(AggregatePlacementTest, Refusals) {
   struct Case {
     std::string_view sql;

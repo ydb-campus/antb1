@@ -173,6 +173,8 @@ entirely, because a pre-grouped relation has exactly one row per key.
 
 - **One query of 22 improves at the placement this decision reaches** -- Q13 -- and the rest of the fourteen
   shape-positive ones must be refused, so the gate is most of this item's value and nearly all of its risk.
+  **As of G2b that one query does not improve yet**: it is a count, and merging partial counts needs the kind
+  item G2c adds.
   Q10's win needs an iterated exchange this ADR does not describe (see the correction in the Context). A
   wrongly gated rule is comfortably net negative: the survey
   produced four written rewrites that regress by 1.03x to 1.89x and one that regressed by about 2,700x before the
@@ -228,9 +230,41 @@ entirely, because a pre-grouped relation has exactly one row per key.
   - **A LEFT JOIN carries no row estimate**: the binder keeps one only for the joins its order search ranked, so
     the gate computes its own by ADR 0022's rule 3, locally. Changing what `EstimateRows` answers for a join
     would move `ChooseBuildSide`, which is ADR 0026's decision and not this item's.
-- **G2b, perf(plan,exec): perform the rewrite behind the gate.** Measured at SF 100 with peak memory beside time,
-  interleaved and rotated, on Q13 with the other 21 as the control. The gate's refusals are tested by
-  construction, each with the query shape that must be refused and why.
+- **G2b, perf(plan): perform the rewrite behind the gate.**
+  - Update (2026-10-22, G2b): **shipped for SUM, MIN and MAX, and it fires on no query of the 22** -- because
+    the one placement the gate admits is a count, and a count is the one kind the plan cannot yet express.
+    Measured where it does fire: a SUM over the same shape as Q13's at SF 100 goes **3.417 s to 3.003 s
+    (0.879x)**, answers identical, and the exchange is answer-identical on an inner join, on a LEFT JOIN whose
+    preserved side is the grouped one, and with a grouping column drawn from the grouped side.
+  - **Why a count cannot be built, which is the finding of this item.** A count decomposes into a count below
+    and a SUM of counts above. An integer SUM returns HUGEINT, by the rule that stops it wrapping at int64
+    (AGENTS.md, ADR 0021), while COUNT's own output is BIGINT -- so the honest final has a type the query did
+    not ask for, and a plan cannot narrow it back, `CastExpr` being an exact widening only. The executor says so
+    outright: *no grouped aggregate SUM(BIGINT) -> BIGINT*. Built anyway, it fails Q13 and the TPC-H ratchet
+    catches it, which is how this was found rather than reasoned.
+  - **Two alternatives were rejected.** A narrowing cast in the plan would be a general capability introduced
+    for one caller, and narrowing is exactly where an overflow hides. Registering a `SUM(BIGINT) -> BIGINT`
+    accumulator would undo the rule that keeps an integer SUM from wrapping. A sum *of counts* is safe where a
+    general one is not, because it is bounded by the rows counted -- so the capability wanted is narrow, and
+    belongs in a kind of its own.
+  - **The padding of condition 5 is not built either, and needs nothing until a count is exchangeable.** For
+    every kind this performs, the value a preserved row with no partial should read is NULL, which is already
+    what an aggregate of a NULL partial answers. Only a count wants something else there, so the mapping ships
+    with the kind that makes a count exchangeable -- rather than sitting unreachable, which is what it was when
+    first written here.
+  - **Condition 3's failure mode is harder to reach than feared, and the plan validator is why.** A pre-grouping
+    missing a grouping column of the aggregated side leaves the final aggregate's key reading a column the
+    partial no longer outputs, and the validator refuses it -- *column is not in its input* -- rather than
+    answering. So the condition that changes aggregate values silently is, in this rewrite, caught structurally.
+    That is worth knowing and not worth relying on: the `.slt` cases still compare answers against DuckDB,
+    including a pre-grouping of two columns and a self-join whose grouped side is the null-supplying one.
+  - **One error path changes**, which is new behaviour this ADR should own: the partial range-checks each group
+    against its DECIMAL width, so a group whose total fits while its partial sums cancel across the top of that
+    width would now raise an overflow where the written plan answered. It needs values near 10^38 and no query
+    of the 22 is close, but a rewrite that can turn an answer into an error is worth stating plainly.
+- **G2c, feat(plan,exec): a kind that merges partial counts, whose result is BIGINT.** The one capability
+  between this decision and its measured 0.494x. It crosses into `exec` and touches ADR 0014's merge-order
+  classification and every switch over `AggKind`, which is why it is its own item rather than part of G2b.
 - **G3, docs(adr): record what G1 and G2 measured**, and either accept this ADR or defer it with the numbers.
 
 ## Alternatives considered
