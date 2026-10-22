@@ -36,7 +36,16 @@ using PartPipeline = std::function<arrow::Result<std::unique_ptr<Operator>>(int6
 ExecContext PartContext(const ExecContext& ctx);
 
 // The number of parts that may run ahead of the consumer: 2 * threads with an executor, else 1.
+// For a sink that hands on each part's rows (PartUnionOperator) and for a join's build and probe.
 int64_t PartWindow(const ExecContext& ctx);
+
+// The number of parts that may run ahead of a sink that merges each part into partial states (a
+// global, grouped or two-level aggregate, or a top-N): 4 * threads with an executor, else 1. What
+// it holds per part is a partial state rather than the part's rows, and the window decides how
+// long one slow part holds the others up: a part takes as long as the bytes it reads, and a part
+// several times the mean fills a window of 2 * threads with finished parts while it runs, which
+// leaves the other threads idle (docs/adr/0013-parallel-execution.md, amended 2026-10-22).
+int64_t MergeWindow(const ExecContext& ctx);
 
 // Opens the part's pipeline, hands every batch with selected rows to `consume` until it returns
 // false or the pipeline ends, and closes the pipeline. Once `stop` is set the part is abandoned

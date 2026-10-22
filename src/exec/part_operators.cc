@@ -47,6 +47,10 @@ int64_t PartWindow(const ExecContext& ctx) {
   return ctx.executor == nullptr ? 1 : int64_t{2} * (ctx.threads < 1 ? 1 : ctx.threads);
 }
 
+int64_t MergeWindow(const ExecContext& ctx) {
+  return ctx.executor == nullptr ? 1 : int64_t{4} * (ctx.threads < 1 ? 1 : ctx.threads);
+}
+
 arrow::Status RunPart(const PartPipeline& pipeline, int64_t part, ExecContext ctx,
                       const std::atomic<bool>& stop,
                       const std::function<arrow::Result<bool>(Batch)>& consume) {
@@ -185,7 +189,7 @@ arrow::Status PartAggregateOperator::Open(ExecContext& ctx) {
     return shared;
   };
   scheduler_ = std::make_unique<PartScheduler<PartStates>>(
-      num_parts_, std::move(task), ctx.executor, PartWindow(ctx), ctx.budget);
+      num_parts_, std::move(task), ctx.executor, MergeWindow(ctx), ctx.budget);
   return arrow::Status::OK();
 }
 
@@ -282,7 +286,7 @@ arrow::Status PartGroupAggregateOperator::Open(ExecContext& ctx) {
   pool_ = ctx.pool;
   budget_ = ctx.budget;
   executor_ = ctx.executor;
-  window_ = PartWindow(ctx);
+  window_ = MergeWindow(ctx);
   threads_ = ctx.executor == nullptr ? 1 : static_cast<std::size_t>(std::max(ctx.threads, 1));
   merged_ = false;
   opened_ = true;
@@ -356,7 +360,7 @@ arrow::Status PartGroupAggregateOperator::Open(ExecContext& ctx) {
     return groups;
   };
   scheduler_ = std::make_unique<PartScheduler<PartTable>>(num_parts_, std::move(task), ctx.executor,
-                                                          PartWindow(ctx), ctx.budget);
+                                                          MergeWindow(ctx), ctx.budget);
   return arrow::Status::OK();
 }
 
@@ -648,7 +652,7 @@ arrow::Status PartTwoLevelAggregateOperator::Open(ExecContext& ctx) {
   budget_ = ctx.budget;
   executor_ = ctx.executor;
   part_ctx_ = PartContext(ctx);
-  window_ = PartWindow(ctx);
+  window_ = MergeWindow(ctx);
   opened_ = true;
   return arrow::Status::OK();
 }
@@ -1007,7 +1011,7 @@ arrow::Status PartTopNOperator::Open(ExecContext& ctx) {
     return rows;
   };
   scheduler_ = std::make_unique<PartScheduler<PartBuffer>>(
-      num_parts_, std::move(task), ctx.executor, PartWindow(ctx), ctx.budget);
+      num_parts_, std::move(task), ctx.executor, MergeWindow(ctx), ctx.budget);
   return arrow::Status::OK();
 }
 
