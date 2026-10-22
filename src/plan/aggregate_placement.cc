@@ -1,7 +1,6 @@
 #include "aggregate_placement.h"
 
 #include <algorithm>
-#include <array>
 #include <cstddef>
 #include <limits>
 #include <optional>
@@ -172,12 +171,21 @@ std::optional<int64_t> JoinRows(const JoinNode& join) {
   if (!left.has_value() || !right.has_value()) {
     return std::nullopt;
   }
-  int64_t divisor = 1;
+  // The largest domain of any key column, over both inputs: two walks of the plan rather than two
+  // a key, which is what asking column by column would cost.
+  std::vector<ColumnId> on_left;
+  std::vector<ColumnId> on_right;
+  on_left.reserve(join.keys.size());
+  on_right.reserve(join.keys.size());
   for (const JoinKey& key : join.keys) {
-    for (const auto& [node, id] :
-         {std::pair(join.left.get(), key.left.id), std::pair(join.right.get(), key.right.id)}) {
-      const std::array<ColumnId, 1> one{id};
-      if (const std::optional<int64_t> domain = DistinctValues(*node, one); domain.has_value()) {
+    on_left.push_back(key.left.id);
+    on_right.push_back(key.right.id);
+  }
+  int64_t divisor = 1;
+  for (const auto& [node, ids] :
+       {std::pair(join.left.get(), &on_left), std::pair(join.right.get(), &on_right)}) {
+    for (const std::optional<int64_t>& domain : EachDistinctValues(*node, *ids)) {
+      if (domain.has_value()) {
         divisor = std::max(divisor, *domain);
       }
     }

@@ -911,19 +911,32 @@ void ScannedColumns(const LogicalNode& node,
 
 }  // namespace
 
+std::vector<std::optional<int64_t>> EachDistinctValues(const LogicalNode& node,
+                                                       std::span<const ColumnId> columns) {
+  std::vector<std::optional<int64_t>> out;
+  out.reserve(columns.size());
+  if (columns.empty()) {
+    return out;
+  }
+  std::unordered_map<ColumnId, std::pair<const Table*, int>> scanned;
+  ScannedColumns(node, scanned);  // once, however many columns are asked about
+  for (const ColumnId column : columns) {
+    const auto found = scanned.find(column);
+    if (found == scanned.end() || found->second.first == nullptr) {
+      out.emplace_back(std::nullopt);  // computed, or from no Scan of this subtree
+      continue;
+    }
+    out.push_back(KeyDomain(*found->second.first, found->second.second));
+  }
+  return out;
+}
+
 std::optional<int64_t> DistinctValues(const LogicalNode& node, std::span<const ColumnId> columns) {
   if (columns.empty()) {
     return std::nullopt;
   }
-  std::unordered_map<ColumnId, std::pair<const Table*, int>> scanned;
-  ScannedColumns(node, scanned);
   Int128 product = 1;
-  for (const ColumnId column : columns) {
-    const auto found = scanned.find(column);
-    if (found == scanned.end() || found->second.first == nullptr) {
-      return std::nullopt;  // computed, or from no Scan of this subtree
-    }
-    const std::optional<int64_t> domain = KeyDomain(*found->second.first, found->second.second);
+  for (const std::optional<int64_t>& domain : EachDistinctValues(node, columns)) {
     if (!domain.has_value()) {
       return std::nullopt;
     }

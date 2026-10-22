@@ -198,6 +198,13 @@ std::optional<int64_t> RelationRows(const Binding& binding);
 // is what keeps it from arguing against one absurdly.
 std::optional<int64_t> DistinctValues(const LogicalNode& node, std::span<const ColumnId> columns);
 
+// The distinct values of each of `columns` on its own, in their order, std::nullopt where the
+// footers give none. One walk of the subtree answers for all of them, where asking DistinctValues
+// once a column costs a walk each -- which matters to a caller wanting the largest of several
+// domains rather than their product, since a maximum cannot be taken from one product.
+std::vector<std::optional<int64_t>> EachDistinctValues(const LogicalNode& node,
+                                                       std::span<const ColumnId> columns);
+
 // The rows a plan's node outputs, estimated from footer row counts: a Scan's table's, one for an
 // ungrouped Aggregate and a RowCount, its input's for any other single-input node (an upper bound),
 // and a Join's own `estimate`, which the binder kept there because the domains rule 3 divides by
