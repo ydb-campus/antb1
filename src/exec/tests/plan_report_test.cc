@@ -190,8 +190,14 @@ TEST_F(PlanReportTest, AScanBelowAGroupedAggregateNamesTheJoinsKey) {
 // "candidate" covers: it is settled by the plan, and the old code enforced it only by accident,
 // through the null filter that ProbeKeyStructure no longer tests.
 TEST_F(PlanReportTest, NoCandidateForAKeyNoBuildCanPublish) {
-  for (const std::string_view sql : {"SELECT COUNT(*) FROM f, d WHERE f.ks = d.dks",
-                                     "SELECT COUNT(*) FROM f, d WHERE f.ks = d.dks AND f.v > 1"}) {
+  for (const std::string_view sql :
+       {"SELECT COUNT(*) FROM f, d WHERE f.ks = d.dks",
+        "SELECT COUNT(*) FROM f, d WHERE f.ks = d.dks AND f.v > 1",
+        // The grouped-aggregate arm reads its filter from a build as well, so the same key leaves
+        // it with nothing to offer. Its own arm, because it reaches the scan by ColumnId rather
+        // than through the pipeline's joins, and so tests the condition separately.
+        "SELECT COUNT(*) FROM (SELECT ks, SUM(v) AS s FROM f GROUP BY ks) AS g, d "
+        "WHERE g.ks = d.dks AND d.flag = 1"}) {
     SCOPED_TRACE(sql);
     ProfileNode profile;
     ASSERT_TRUE(PlanOnly(sql, Facts(), Dimension(), &profile).ok());

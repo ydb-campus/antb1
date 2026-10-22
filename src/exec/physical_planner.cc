@@ -812,7 +812,12 @@ struct Builder {
         column.has_value()) {
       return column;
     }
+    // CanPublishKeyFilter here too, and for the same reason it is in ProbeKeyStructure: this arm
+    // reads its filter from a build as well, so a key no build can publish for has no candidate on
+    // either of them. The run path tests it through `above->build->key_filter()`, which is null for
+    // such a key -- the very implication a report cannot lean on.
     if (above == nullptr || above->build == nullptr || late_scan.has_value() ||
+        !CanPublishKeyFilter(above->build->spec()) ||
         !node.table->supports_scan_filter(ReadFields(node, nullptr))) {
       return std::nullopt;
     }
