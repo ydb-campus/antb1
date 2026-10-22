@@ -79,6 +79,7 @@ struct Inputs {
   std::string format = "table";
   bool timing = false;
   bool analyze = false;                 // explain --analyze
+  bool physical = false;                // explain --physical
   std::string profile_format = "text";  // explain --analyze --format
   int threads = 1;                      // --threads (query and bench)
   // --memory-limit (query and bench); std::nullopt for commands that run no query.
@@ -333,14 +334,19 @@ int RunCli(std::span<const std::string> args, std::istream& in_stream, std::ostr
 
   auto* explain = app.add_subcommand(
       "explain",
-      "Print the logical plan of a query; with --analyze, run it and print its profiled "
-      "physical plan");
+      "Print the logical plan of a query; with --physical, the physical plan it would run; with "
+      "--analyze, run it and print its profiled physical plan");
   AddSqlOptions(explain, in);
   AddTableOptions(explain, in);
   auto* analyze = explain->add_flag(
       "--analyze", in.analyze,
       "Run the query (dropping its rows) and print every physical operator with its rows, times "
       "and metrics");
+  explain
+      ->add_flag("--physical", in.physical,
+                 "Print the physical plan without running the query: part pipelines, the builds "
+                 "of its joins, pushed predicates and key filter candidates")
+      ->excludes(analyze);
   explain->add_option("--format", in.profile_format, "Profile format (with --analyze)")
       ->check(CLI::IsMember({"text", "json"}))
       ->needs(analyze);
@@ -446,7 +452,7 @@ int RunCli(std::span<const std::string> args, std::istream& in_stream, std::ostr
   }
 
   if (explain->parsed()) {
-    auto text = (*session)->Explain(sql);
+    auto text = in.physical ? (*session)->ExplainPhysical(sql) : (*session)->Explain(sql);
     if (!text.ok()) {
       return Fail(text.status(), sql, in, err);
     }

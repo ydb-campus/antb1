@@ -171,6 +171,39 @@ TEST_F(SessionTest, ExplainAnalyzeProfilesTheQuery) {
   }
 }
 
+// `explain --physical` is the plan `explain --analyze` profiles, without what only a run can
+// measure: strip the brackets off the profile's text and the two are the same tree, line for line.
+// It is the comparison that keeps the two renderings from drifting apart, and the query is one
+// whose scan a run would have to open parts of.
+TEST_F(SessionTest, ExplainPhysicalIsTheProfiledPlanWithoutTheCounters) {
+  const std::string sql =
+      "SELECT AdvEngineID, COUNT(*) FROM t WHERE AdvEngineID > 2 GROUP BY AdvEngineID "
+      "ORDER BY AdvEngineID LIMIT 5";
+  auto session = Session::Make({.threads = 4}).ValueOrDie();
+  ASSERT_TRUE(session->RegisterParquet("t", {path_}).ok());
+  const auto physical = session->ExplainPhysical(sql);
+  ASSERT_TRUE(physical.ok()) << physical.status().ToString();
+  // The planner's decisions are what the lines are for: this one pushes its predicate into the
+  // scan, which the logical plan of Explain cannot show.
+  EXPECT_NE(physical->find("pushed predicate"), std::string::npos) << *physical;
+
+  const auto profile = session->ExplainAnalyze(sql);
+  ASSERT_TRUE(profile.ok()) << profile.status().ToString();
+  std::string stripped;
+  const std::string text = FormatProfile(*profile, ProfileFormat::kText);
+  for (std::size_t start = 0; start < text.size();) {
+    const std::size_t end = text.find('\n', start);
+    const std::string line = text.substr(start, end - start);
+    start = end == std::string::npos ? text.size() : end + 1;
+    if (line.starts_with("Total: ")) {
+      continue;  // a run's own line, which a plan has nothing to put in
+    }
+    const std::size_t counters = line.find("  [rows=");
+    stripped += line.substr(0, counters == std::string::npos ? line.size() : counters) + '\n';
+  }
+  EXPECT_EQ(*physical, stripped);
+}
+
 // Explain shows the optimized plan of every bound query: pruned scans, folded literals.
 TEST_F(SessionTest, ExplainShowsTheOptimizedPlan) {
   SessionOptions options;
@@ -458,6 +491,7 @@ TEST_F(SessionTest, CorrelatedSubqueriesAreUnsupportedInEveryEntryPoint) {
            "WHERE u.AdvEngineID = t.AdvEngineID) AS d",
        }) {
     const auto statuses = {session->Execute(sql).status(), session->Explain(sql).status(),
+                           session->ExplainPhysical(sql).status(),
                            session->ExplainAnalyze(sql).status()};
     for (const arrow::Status& status : statuses) {
       const auto detail = plan::GetSqlError(status);
@@ -476,6 +510,7 @@ TEST_F(SessionTest, CorrelatedSubqueriesAreUnsupportedInEveryEntryPoint) {
         "(SELECT * FROM u WHERE u.AdvEngineID = t.AdvEngineID)"}) {
     EXPECT_TRUE(session->Execute(answered).ok()) << answered;
     EXPECT_TRUE(session->Explain(answered).ok()) << answered;
+    EXPECT_TRUE(session->ExplainPhysical(answered).ok()) << answered;
     EXPECT_TRUE(session->ExplainAnalyze(answered).ok()) << answered;
   }
 }

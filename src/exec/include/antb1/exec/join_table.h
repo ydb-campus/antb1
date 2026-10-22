@@ -115,6 +115,15 @@ class JoinBuildSpec {
   bool keep_null_keys_ = false;
 };
 
+// Whether a build on this spec can publish a key filter at all (JoinTableBuilder::MakeKeyFilter):
+// one key, of a type a Parquet scan decodes to the same values the build hashed.
+//
+// **A fact of the plan, not of the run**, which is why it has a name: the physical planner reads it
+// to say whether a scan could take ADR 0029's filter before any build exists (`explain --physical`,
+// physical_planner.cc's KeyFilterCandidate), while whether a filter was really made -- its keys
+// collected, its bits afforded -- stays the build's own answer.
+bool CanPublishKeyFilter(const std::shared_ptr<const JoinBuildSpec>& spec);
+
 // One part of a build's input, partitioned as it is appended. Single-threaded: a part task appends
 // to it on any thread, then hands it to the consumer (JoinTableBuilder::Add), which only reads it.
 class JoinBuildPart {

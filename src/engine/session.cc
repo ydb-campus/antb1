@@ -12,6 +12,7 @@
 #include <arrow/compute/api.h>
 #include <arrow/util/thread_pool.h>
 
+#include "antb1/engine/format.h"
 #include "antb1/exec/memory_budget.h"
 #include "antb1/exec/operator.h"
 #include "antb1/exec/physical_planner.h"
@@ -164,6 +165,18 @@ arrow::Result<std::string> Session::Explain(std::string_view sql) {
   ARROW_ASSIGN_OR_RAISE(auto logical,
                         ParseAndBind(sql, catalog_, BindOptionsOf(options_), nullptr));
   return plan::Explain(logical);
+}
+
+arrow::Result<std::string> Session::ExplainPhysical(std::string_view sql) {
+  ARROW_ASSIGN_OR_RAISE(auto logical,
+                        ParseAndBind(sql, catalog_, BindOptionsOf(options_), nullptr));
+  exec::ProfileNode root;
+  // The operator tree is built and dropped: it is the plan-time build of the plan that names every
+  // node and records what the planner decided (physical_planner.cc's Builder), and nothing here
+  // opens a part or reserves a buffer.
+  ARROW_ASSIGN_OR_RAISE(const std::unique_ptr<exec::Operator> op,
+                        exec::BuildPhysicalPlan(logical, &root));
+  return FormatPhysicalPlan(plan::ExplainOutput(logical), root);
 }
 
 arrow::Result<QueryProfile> Session::ExplainAnalyze(std::string_view sql) {

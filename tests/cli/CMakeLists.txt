@@ -253,6 +253,33 @@ antb1_add_cli_golden(
     --table
     "zones=${_f}/star/zones.parquet"
 )
+# explain --physical: the plan the planner would run, which the logical plan cannot show. Over the
+# split fixture so the parts are real -- a part pipeline over trips under the join, the build of
+# that join beside it, the predicate of each side pushed into its scan, and on the probe's scan the
+# key filter ADR 0029 could prune its parts with. Deterministic, because nothing here is measured:
+# a run's rows, times and metrics are what --analyze adds to these same lines.
+antb1_add_cli_golden(
+  explain_physical
+  ARGS
+    explain
+    --physical
+    --threads
+    1
+    -c
+    "SELECT COUNT(*), SUM(tr_fare) FROM trips, zones WHERE tr_pickup = zn_id AND tr_row >= 100 AND zn_city = 2"
+    --table
+    "trips=${_f}/star/trips.parquet"
+    --table
+    "zones=${_f}/star/zones.parquet"
+)
+# --physical and --analyze are the same plan, so they cannot both be asked for. The message is
+# pinned, not just the exit code: a usage error for another reason would also exit 2.
+antb1_add_cli_golden(
+  explain_physical_excludes_analyze
+  EXIT_CODE 2
+  STDERR_REGEX "--physical"
+  ARGS explain --physical --analyze -c "SELECT COUNT(*) FROM t" --table "${_t}"
+)
 # The first branch is only the shared equality, so it makes the OR true wherever the equality holds
 # and the equality is the whole condition: nothing of zn_radius reaches the plan, and zones reads
 # the key's column alone.

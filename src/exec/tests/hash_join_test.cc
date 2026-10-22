@@ -3963,8 +3963,14 @@ TEST_F(HashJoinPlanTest, FilterPushdownReachesEachSideWithItsOwnParts) {
     for (const ProfileNode* side : profile.children()) {
       const ProfileNode& filter = *side->children()[0];
       EXPECT_EQ(filter.name(), "Filter");
-      EXPECT_TRUE(filter.children()[0]->detail().ends_with(", 1 pushed predicate"))
-          << filter.children()[0]->detail();
+      const std::string detail = filter.children()[0]->detail();
+      // Besides its pushed predicate, the probe's scan carries what ADR 0029's part test could do
+      // with this join's keys, which is what `explain --physical` reports. The build's own pipeline
+      // has no join above it and so has no candidate to name.
+      const bool probe = detail.starts_with("Scan table=p ");
+      EXPECT_TRUE(detail.ends_with(probe ? ", 1 pushed predicate, part skip candidate on pk"
+                                         : ", 1 pushed predicate"))
+          << detail;
     }
     const auto q = MixedTable("p", 6, 7, ProbeKey);
     const auto c = MixedTable("b", 2, 6, key);

@@ -695,6 +695,46 @@ Join INNER build=right keys=[a.k = b.k] residual=[(a.x < b.y)]
   Scan table=b source=parquet(files=1, rows=10) columns=[k, y]
 ```
 
+### `explain --physical`
+
+`antb1 explain --physical` prints the physical plan the query would run, without running it: the operator tree
+`--analyze` profiles, with none of what a run measures. It takes `--threads`, `--memory-limit`,
+`--build-side-ratio` and `--join-order`, and cannot be given together with `--analyze`; its errors and exit codes
+are those of `antb1 query`.
+
+It shows what no logical plan holds, because the physical planner is what decides it:
+
+- part pipelines and the operators that consume them (`PartUnion`, `PartAggregate`, `PartGroupAggregate`,
+  `PartTopN`), and each hash join split into its `HashJoin` probe and the `HashBuild` under the operator that
+  prepares it, laid out exactly as `--analyze` lays them out;
+- a `Scan` that applies predicates of the `Filter` above it while it reads: `, N pushed predicates`
+  ([ADR 0020](adr/0020-filter-pushdown.md));
+- a `Scan` a dynamic join filter could be applied to ([ADR 0029](adr/0029-dynamic-join-filters.md)):
+  `, key filter candidate on <column>` where that filter could reject rows as the scan decodes them, and
+  `, part skip candidate on <column>` where it could only rule out a part whole — because the pushed
+  predicates hold the scan's one filter slot, or because the table has no filtered decoder for the fields this
+  scan reads. Neither appears for a key no build can publish a filter for, which is any key but a single
+  integer or DATE one.
+
+```text
+Output: count_star():BIGINT
+PartAggregate Aggregate COUNT(*)
+  HashJoin Join INNER build=right keys=[trips.tr_pickup = zones.zn_id]
+    Filter trips.tr_row >= 100
+      Scan table=trips source=parquet(files=1, rows=3000) columns=[tr_row, tr_pickup], 1 pushed predicate, part skip candidate on tr_pickup
+  HashBuild Join INNER build=right keys=[trips.tr_pickup = zones.zn_id]
+    Scan table=zones source=parquet(files=1, rows=40) columns=[zn_id]
+```
+
+**A candidate is not a fact, and the word is load-bearing.** Three of the conditions behind a key filter are not
+properties of a plan at all: whether the build really published a filter (it makes one as it finishes, and its keys
+may not fit the budget), whether it stayed small enough against the probe for the filter to be worth its cost, and
+whether a part's statistics exclude every published key. Everything a plan *can* settle — the join's kind, one key
+of a type a build can publish, the chain of nodes down to the scan, and which of the two mechanisms the table
+supports — is settled before the line is printed, so a candidate is never offered where no run could attach one.
+What a run really did is in `--analyze`'s `key_filter`, `key_dropped` and `key_pruned` metrics below; a candidate
+with none of them beside it is a filter the run declined.
+
 ### `explain --analyze`
 
 `antb1 explain --analyze` runs the query, drops its rows, and prints the physical plan with what each operator did

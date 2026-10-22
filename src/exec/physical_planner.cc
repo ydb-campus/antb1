@@ -26,6 +26,7 @@
 #include "antb1/exec/scan_filter.h"
 #include "antb1/exec/sort.h"
 #include "antb1/exec/table_scan.h"
+#include "antb1/plan/catalog.h"
 #include "antb1/plan/explain.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/shared_sub_plans.h"
@@ -568,23 +569,32 @@ constexpr int64_t kFilterBuildShare = 16;
 //     (EmitsBuildRows), which is the form ADR 0026's C2b gave them. A null-aware anti join is
 //     excluded outright: it answers from the whole set, not row by row.
 //   - one key, whose column maps to a field of the scan through FilterNodes alone (a Compute
-//     appends, a Project reorders), and whose type the build hashed and a scan decodes the same.
-//   - the build must have published a filter: its keys may not be hashable, or it may not have fit
-//     the budget.
+//     appends, a Project reorders), and whose type the build hashed and a scan decodes the same
+//     (CanPublishKeyFilter).
+//   - the build must have published a filter, which the type above makes possible and nothing
+//     guarantees: its keys may not have fit the budget.
 //
 // These are the conditions on the *rows* the join can be asked about, so both halves of ADR 0029
 // share them: the per-row test (D1, KeyScanOf) and the part test (D2, PartHasNoKey), which then
 // require different things of the scan itself.
 //
 // Called per part, from the part's own pipeline build, which is why the build has already finished
-// and `key_filter()` is there to read (hash_join.cc's PrepareBuilds).
+// and `key_filter()` is there to read (hash_join.cc's PrepareBuilds). The last condition is the
+// only one of these a plan cannot decide, which is why it is a step of its own
+// (ProbeKeyStructure) -- and why the type test has to be stated there rather than ridden in on a
+// null filter, which is how it used to be enforced.
 struct ProbeKey {
-  const JoinBuild* build = nullptr;  // its key_filter() is published and not null
+  const JoinBuild* build = nullptr;  // from ProbeKeyOf: its key_filter() is published and not null
   int column = 0;                    // a position in scan.fields, of the probe's one key
 };
 
-std::optional<ProbeKey> ProbeKeyOf(const plan::ScanNode& scan, const PipelineBuilds* builds,
-                                   const std::optional<LateScan>& late) {
+// ProbeKeyOf's conditions on the join and on the chain down to the scan, every one of them a fact
+// of the plan. The one condition that is not -- the build having published its filter, which it
+// makes in its finish -- is ProbeKeyOf's own, and so **the key this returns may have no filter to
+// read**: only ProbeKeyOf, for a run, and KeyFilterCandidate, for a report of what the planner
+// decided, may call it.
+std::optional<ProbeKey> ProbeKeyStructure(const plan::ScanNode& scan, const PipelineBuilds* builds,
+                                          const std::optional<LateScan>& late) {
   if (builds == nullptr || builds->joins.empty() || builds->builds.empty() || late.has_value()) {
     return std::nullopt;  // a narrow scan reads other fields: its indices are the late scan's
   }
@@ -598,6 +608,14 @@ std::optional<ProbeKey> ProbeKeyOf(const plan::ScanNode& scan, const PipelineBui
     return std::nullopt;
   }
   if (join->kind == plan::JoinKind::kNullAwareAnti || join->kind == plan::JoinKind::kOneRow) {
+    return std::nullopt;
+  }
+  // No build on this key can make a filter, whatever happens at run time: it is one key of a type
+  // the probe hashes the same way or nothing (CanPublishKeyFilter). This is the condition that made
+  // the old `key_filter() == nullptr` test do two jobs, and it belongs here, with the other
+  // conditions a plan decides -- a report that left it out would offer a candidate on, say, a
+  // VARCHAR key, where no run could ever attach one.
+  if (!CanPublishKeyFilter(build->spec())) {
     return std::nullopt;
   }
   const arrow::Result<JoinShape> shape = ShapeOf(*join);
@@ -620,10 +638,35 @@ std::optional<ProbeKey> ProbeKeyOf(const plan::ScanNode& scan, const PipelineBui
       return std::nullopt;
     }
   }
-  if (build->key_filter() == nullptr) {
+  return ProbeKey{.build = build.get(), .column = column};
+}
+
+std::optional<ProbeKey> ProbeKeyOf(const plan::ScanNode& scan, const PipelineBuilds* builds,
+                                   const std::optional<LateScan>& late) {
+  const std::optional<ProbeKey> key = ProbeKeyStructure(scan, builds, late);
+  if (!key.has_value() || key->build->key_filter() == nullptr) {
     return std::nullopt;
   }
-  return ProbeKey{.build = build.get(), .column = column};
+  return key;
+}
+
+// The field of `scan` a key filter could be applied to, as a position in `scan.fields`: every
+// condition a plan decides holds, and none of the three only a run can test -- whether the build
+// published a filter at all, whether it stayed small enough for D1's share gate, and whether a
+// part's statistics exclude its keys. For `explain --physical`, which reports what the planner
+// decided and must not claim what it cannot know, so what this finds is a *candidate*.
+std::optional<int> KeyFilterCandidate(const plan::ScanNode& scan, const PipelineBuilds* builds,
+                                      const std::optional<LateScan>& late) {
+  const std::optional<ProbeKey> key = ProbeKeyStructure(scan, builds, late);
+  return key.has_value() ? std::optional<int>(key->column) : std::nullopt;
+}
+
+// A scan field's name as EXPLAIN writes a column (plan/explain.cc's Name): a plain identifier as
+// is, anything else double-quoted.
+std::string ScanFieldName(const plan::ScanNode& scan, int column) {
+  const std::string& name =
+      scan.table->schema()->field(scan.fields[static_cast<std::size_t>(column)])->name();
+  return plan::IsPlainIdentifier(name) ? name : "\"" + plan::EscapeText(name, '"') + "\"";
 }
 
 // Whether `scan` can reject rows with the build's filter, row by row as it decodes them (ADR
@@ -755,6 +798,29 @@ struct Builder {
     }
   }
 
+  // The field of `node` a key filter could be applied to, from either source a run would take one
+  // from: a join of this pipeline (ADR 0029's D1 and D2, KeyFilterCandidate) or a join above the
+  // grouped aggregate this scan feeds. Only the conditions a plan decides, so the answer is a
+  // candidate and never a fact; none outside a part pipeline, which is the only place either is
+  // attached.
+  [[nodiscard]] std::optional<int> CandidateKeyField(
+      const plan::ScanNode& node, const std::optional<LateScan>& late_scan) const {
+    if (!part.has_value()) {
+      return std::nullopt;
+    }
+    if (const std::optional<int> column = KeyFilterCandidate(node, builds, late_scan);
+        column.has_value()) {
+      return column;
+    }
+    if (above == nullptr || above->build == nullptr || late_scan.has_value() ||
+        !node.table->supports_scan_filter(ReadFields(node, nullptr))) {
+      return std::nullopt;
+    }
+    const auto at = std::ranges::find(node.ids, above->key);
+    return at == node.ids.end() ? std::nullopt
+                                : std::optional<int>(static_cast<int>(at - node.ids.begin()));
+  }
+
   OperatorResult operator()(const plan::ScanNode& node) const {
     if (node.table == nullptr) {
       return arrow::Status::Invalid("scan without a table");
@@ -790,6 +856,25 @@ struct Builder {
       }
     }
     Name("Scan");
+    // What a key filter could do here, which is all a plan knows and all `explain --physical`
+    // reports: the planner's own conditions hold on this scan's field, and the conditions that
+    // decide whether a filter is really attached are the build's at run time. Written on the first
+    // build of the plan only, where the detail is still empty (Profiled fills it after this), and
+    // the node is rewrapped for ExplainNode because a visitor sees the alternative and not the
+    // LogicalNode holding it -- a copy of a scan's vectors, once per scan, at planning time.
+    if (slot != nullptr && slot->detail().empty()) {
+      if (const std::optional<int> column = CandidateKeyField(node, late_scan);
+          column.has_value()) {
+        // Which of the two mechanisms this scan could take, which is not the same question as
+        // whether a key reaches it: the per-row filter needs a filtered decoder over the fields
+        // this scan reads, and a part the published keys are not in is skipped whole and needs
+        // none (ADR 0029's D2). Without that decoder the honest claim is the narrower one.
+        const bool rows = node.table->supports_scan_filter(ReadFields(node, nullptr));
+        slot->set_detail(
+            std::format("{}, {} candidate on {}", plan::ExplainNode(plan::LogicalNode(node)),
+                        rows ? "key filter" : "part skip", ScanFieldName(node, *column)));
+      }
+    }
     // Per part, so a reader can see the filter is in use. It is a metric and not the node's detail
     // because the plan-time build of this pipeline runs before the join's build exists and so
     // carries no filter -- and only that first build may write a name or a detail.
@@ -819,7 +904,8 @@ struct Builder {
             return p.kind == plan::Predicate::Kind::kFalse;
           })) {
         ProfileNode* input_slot = Input();
-        if (input_slot != nullptr && input_slot->name().empty()) {
+        const bool names_it = input_slot != nullptr && input_slot->name().empty();
+        if (names_it) {
           input_slot->set_name("Scan");
           input_slot->set_detail(std::format("{}, {} pushed predicate{}",
                                              plan::ExplainNode(*node.input), pushed.size(),
@@ -827,6 +913,17 @@ struct Builder {
         }
         const std::optional<LateScan> late_scan =
             late == nullptr ? std::nullopt : std::optional<LateScan>(*late);
+        // What a key filter could do here, for `explain --physical`: only skip a part. The pushed
+        // predicates hold the one filter slot, so no per-row filter is ever attached over them --
+        // which is why this says part and the branch above says key filter.
+        if (names_it) {
+          if (const std::optional<int> column = KeyFilterCandidate(*scan, builds, late_scan);
+              column.has_value()) {
+            input_slot->set_detail(
+                input_slot->detail() +
+                std::format(", part skip candidate on {}", ScanFieldName(*scan, *column)));
+          }
+        }
         // The part test, which these pushed predicates do not stand in the way of: a part no
         // published key can be in is not read, so it needs neither the filter slot they take nor
         // the filtered decoder they use (ADR 0029's D2). The per-row filter is dropped, because
