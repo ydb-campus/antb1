@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792674296475,
+  "lastUpdate": 1792713468386,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -19728,6 +19728,258 @@ window.BENCHMARK_DATA = {
             "value": 2544.3316589999654,
             "unit": "ms/iter",
             "extra": "iterations: 1\ncpu: 2544.1117529999956 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Aleksandr Khoroshilov",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "26ab63c6327878d0b38d4723fcd0a6e500521a9b",
+          "message": "feat(cli): add explain --physical (#223)\n\n## Summary\n\nAdds `antb1 explain --physical`: the physical plan a query would run,\nprinted without running it.\n\nThe information was already there and unreachable. `antb1 explain`\nprints the optimized **logical** plan, so none\nof the physical planner's decisions show: part pipelines, the hoisted\n`HashBuild` of each join, filter pushdown\n(ADR 0020), ADR 0029's dynamic key filters. Today the only way to see\nany of them is `explain --analyze`, which\nhas to run the query first — minutes on a large table, and impossible\nwhen the point is to inspect a plan before\npaying for it.\n\nNo new machinery is needed, because the plan-time build of a physical\nplan already names every profile node and\nwrites its detail (`physical_planner.cc`'s `Builder`):\n`BuildPhysicalPlan(plan, &root)` alone yields a complete\ntree, which `engine::FormatPhysicalPlan` renders with the brackets —\nrows, times, metrics — left off. It therefore\ncannot drift from `--analyze`, because it *is* the planner's output\nrather than a second model of it. A session\ntest strips the counters off the profiled text and expects the two to be\nequal line for line.\n\nThe one genuinely new thing is the key filter annotation, and its\nwording is load-bearing. Three of the conditions\nbehind an ADR 0029 filter are not properties of a plan: whether the\nbuild really published a filter (its keys may\nnot fit the budget), whether it stayed under D1's share gate (measured\nagainst the build's *finished* table), and\nwhether a part's statistics exclude every published key. So a scan line\nsays `, key filter candidate on <column>`,\nor `, part skip candidate on <column>` where only that mechanism could\napply. What actually happened stays in\n`--analyze`'s `key_filter`, `key_dropped` and `key_pruned`; a candidate\nwith none of them beside it is a filter the\nrun declined.\n\nTo report candidacy without claiming it, `ProbeKeyOf` is split:\n`ProbeKeyStructure` holds the conditions a plan\ndecides and `ProbeKeyOf` adds the one it cannot, so the two paths cannot\ndisagree about the structure and only\n`ProbeKeyOf` ever hands out a `ProbeKey` whose `key_filter()` is\nnon-null.\n\nThe converse of \"a candidate is not a fact\" matters as much, and the\nfirst draft of this PR got it wrong twice\n(both found by the `reviewer` subagent, both now covered by a test that\nfails without the fix):\n\n- the key's **type** is a plan-time fact, not a run-time one.\n`MakeKeyFilter` publishes nothing unless the single\nkey is an integer or DATE, and the old code enforced that only by\naccident — through the null filter that\n`ProbeKeyStructure` no longer tests — so the first draft offered a\ncandidate on a VARCHAR key, where no run\ncould ever attach one. The rule is now named once,\n`exec::CanPublishKeyFilter`, and read by both the build that\n  publishes the filter and the planner that reports it.\n- **which mechanism** is also a plan-time fact. The per-row filter needs\na filtered decoder over the fields the\nscan reads (`CanFilterRows` asks the table first); without one, only a\npart skip is possible. The wording now\nfollows `supports_scan_filter` rather than assuming the per-row form\nwhenever no predicate was pushed.\n\nAnswers cannot move: outside the tests and docs this changes\nprofile-node detail strings, adds a read-only session\nentry point and a CLI flag, and refactors one predicate without changing\nwhat it decides.\n\nPart of the `explain` surface; no issue.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n`pixi run check` cannot complete on this macOS host: its `lint` leg\nstops on 36 pre-existing shellcheck SC2218\nfindings in `tools/github/apply-settings.sh` and\n`scripts/agent-setup.sh`, neither of which this PR touches. The\ntwo legs were run separately, and every other gate that can run locally\nwas run.\n\n```text\n$ pixi run ci            # clang Debug -Werror + the full hermetic suite\n100% tests passed out of 2844\n(exit 0; one test skipped, the pre-existing window-function canary)\n\n$ pixi run test\nANTB1-TESTS: PASS preset=dev junit=build/dev/junit.xml\n\n$ pixi run lint\nclang-format, gersemi, ruff, tombi, markdownlint, typos, actionlint, zizmor, check_repo.py (R001-R015): Passed\nshellcheck: Failed - 36 pre-existing SC2218 findings, none in a file this PR touches\n\n$ ANTB1_DIFF_SEED=20261023 pixi run diff-random\nDIFF: PASS seed=20261023 queries=2000 failed=0 unsupported=0\n\n$ ./.pixi/envs/default/bin/clang-tidy -p build/tidy <each changed .cc>\nnothing in user code (every finding it reports is in non-user code)\n\n$ ASAN_OPTIONS=detect_leaks=0 ./build/ci-asan/bin/antb1_{exec,engine,integration}_tests --gtest_filter=...\nPASSED (the new and changed tests, plus the CLI golden reproduced from the ASan build)\n```\n\nGates that could **not** be run here, with no local substitute: `pixi\nrun asan` (fails at test discovery on a\npre-existing `curl_global_init` leak, so the suites were run from the\nASan build directly, as above),\n`pixi run tidy` (fails on an unmodified `main` on this host with 4\nmacOS-only findings, so clang-tidy was run on\nthe changed files instead) and `pixi run ci-gcc`/`codeql-build` (the\n`gcc` environment is linux-64 only). CI is\nthe gate for those three.\n\n## Checklist\n\n- [ ] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer\n\n`pixi run check` is unchecked for the reason above, not because it was\nskipped. The governance path is\n`docs/adr/0015-query-profiles.md`, which gains a bullet under its\nDecision recording this surface and why the\nannotation says \"candidate\"; @hor911 agreed to keep that hunk.\n\n### What the tests cover\n\n- `src/exec/tests/plan_report_test.cc` (new, 7 cases, binds SQL so the\nColumnId path is real): a probe scan names\nthe filter it could take while the build's own pipeline names none;\npushed predicates leave only a part skip\ncandidate; no candidate where the join emits unmatched probe rows, nor\nwith more than one key; and a scan below a\ngrouped aggregate names the join's key **in both arms of the share\ngate** — the case that pins \"candidate\" as\ndistinct from \"fact\". Each refusal was mutation-checked: dropping the\njoin-kind conditions, loosening the\none-key test, and making the report require the published filter each\nfail exactly the test that covers it.\n- `src/engine/tests/format_test.cc`: `FormatPhysicalPlan` on a tree that\n*has* rows, a time and metrics, since\n  dropping them is the whole difference between a plan and a profile.\n- `src/engine/tests/session_test.cc`: the stripped-profile equality\nabove, and `ExplainPhysical` added to the\nentry-point test that pins error kinds across\n`Execute`/`Explain`/`ExplainAnalyze`.\n- `tests/cli/golden/explain_physical.stdout` plus an exit-2 golden for\n`--physical --analyze` together.\n- Two existing assertions were **updated, not weakened**:\n`hash_join_test.cc` and\n`tests/integration/join_test.cc` matched a Scan detail that now carries\nthe candidate suffix on the probe\nside, so each now asserts the exact full suffix for each side rather\nthan a shared prefix.\n- Review round: `NoCandidateForAKeyNoBuildCanPublish` (a VARCHAR key,\nwith and without a pushed predicate) and\n`WithoutAFilteredDecoderOnlyAPartCanBeSkipped` (the same table with\n`supports_scan_filter` off and on). Both\nfail without their fix; the exclusion golden now pins the message with\n`STDERR_REGEX`, not just exit 2.\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5) wrote\nthe change, its tests and its docs, ran the\ngates listed above, and mutation-checked every refusal. The project's\n`reviewer` subagent reviewed the diff and\nfound two real defects in the annotation (the key type and the mechanism\nwording, both described above); each\nwas reproduced from the CLI before the fix and is now pinned by a test\nthat fails without it.\n- Accountable human (has read and understands the whole diff): @hor911\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-23T02:53:51+03:00",
+          "tree_id": "a259f987dea33824bfc47105db85e863e49e2c0c",
+          "url": "https://github.com/ydb-campus/antb1/commit/26ab63c6327878d0b38d4723fcd0a6e500521a9b"
+        },
+        "date": 1792713467144,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 5212.472658602488,
+            "unit": "ns/iter",
+            "extra": "iterations: 134503\ncpu: 5212.268209631012 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 85150.92079584597,
+            "unit": "ns/iter",
+            "extra": "iterations: 7891\ncpu: 85137.00620960588 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222668.69660424767,
+            "unit": "ns/iter",
+            "extra": "iterations: 3151\ncpu: 222619.3341796254 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 436482.54732252914,
+            "unit": "ns/iter",
+            "extra": "iterations: 1606\ncpu: 436404.2048567871 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 402719.55797932076,
+            "unit": "ns/iter",
+            "extra": "iterations: 1742\ncpu: 402687.9678530427 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2084839.54761904,
+            "unit": "ns/iter",
+            "extra": "iterations: 336\ncpu: 2084654.351190477 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 51.33544615384704,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 51.30935576923079 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 46.125102600001355,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 46.11766339999998 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 188.96336466666716,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 188.95336033333385 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.872267914893927,
+            "unit": "ms/iter",
+            "extra": "iterations: 47\ncpu: 14.870726851063846 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 19.818314085714356,
+            "unit": "ms/iter",
+            "extra": "iterations: 35\ncpu: 19.816737114285743 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 36.78133047368479,
+            "unit": "ms/iter",
+            "extra": "iterations: 19\ncpu: 36.77704021052626 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.66346513095238,
+            "unit": "ms/iter",
+            "extra": "iterations: 420\ncpu: 1.6633547476190491 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 91.66372457142658,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 91.6521985714286 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1000",
+            "value": 28.029272840000203,
+            "unit": "ms/iter",
+            "extra": "iterations: 25\ncpu: 28.026658200000014 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16384",
+            "value": 31.10228778260935,
+            "unit": "ms/iter",
+            "extra": "iterations: 23\ncpu: 31.098795086956496 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/262144",
+            "value": 65.05608672727125,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 65.05187672727268 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1048576",
+            "value": 95.81697014285899,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 95.80434700000038 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/4194304",
+            "value": 326.29722650000303,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 326.23669650000056 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16777216",
+            "value": 1577.78639899999,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1577.5796010000001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1000",
+            "value": 34.59224525000053,
+            "unit": "ms/iter",
+            "extra": "iterations: 20\ncpu: 34.59008345000001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16384",
+            "value": 39.45243199999974,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 39.44878949999995 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/262144",
+            "value": 67.49037650000105,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 67.48481260000005 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1048576",
+            "value": 119.53682283332985,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 119.51734616666698 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/4194304",
+            "value": 398.9133940000045,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 398.89267050000046 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16777216",
+            "value": 1891.1010919999853,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1890.928143 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1000",
+            "value": 58.97090441666345,
+            "unit": "ms/iter",
+            "extra": "iterations: 12\ncpu: 58.965154416666714 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16384",
+            "value": 63.15736727272927,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 63.14907036363625 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/262144",
+            "value": 94.85863814286078,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 94.8539150000001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1048576",
+            "value": 164.87816375000364,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 164.8635780000003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/4194304",
+            "value": 481.3387400000124,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 481.2619069999968 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16777216",
+            "value": 2217.8593069999692,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2217.6088450000007 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1000",
+            "value": 69.95363670000074,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 69.94889870000023 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16384",
+            "value": 74.81991733333062,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 74.81080666666647 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/262144",
+            "value": 108.51250833332908,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 108.50326149999982 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1048576",
+            "value": 185.87639300000092,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 185.8396512500011 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/4194304",
+            "value": 532.1284070000161,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 532.0163550000032 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16777216",
+            "value": 2382.5477980000187,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2382.309292999999 ms\nthreads: 1"
           }
         ]
       }
