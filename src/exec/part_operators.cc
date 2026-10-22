@@ -359,8 +359,10 @@ arrow::Status PartGroupAggregateOperator::Open(ExecContext& ctx) {
     }
     return groups;
   };
+  // The lanes take window_ as their max_pending (Merge): one value bounds the parts ahead of the
+  // consumer and the parts it has handed on, so that neither can change without the other.
   scheduler_ = std::make_unique<PartScheduler<PartTable>>(num_parts_, std::move(task), ctx.executor,
-                                                          MergeWindow(ctx), ctx.budget);
+                                                          window_, ctx.budget);
   return arrow::Status::OK();
 }
 

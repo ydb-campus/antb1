@@ -635,7 +635,7 @@ TEST_F(PartOperatorsTest, EachSinkOpensItsWindowAheadOfAFailedFirstPart) {
     const auto failed = Run(PlanOf(shape.make(Scan(table)), shape.width), pool.get());
     EXPECT_TRUE(failed.status().IsIOError()) << shape.name << ": " << failed.status().ToString();
     EXPECT_EQ(failed.status().message(), "part 0 is broken") << shape.name;
-    std::vector<int64_t> window(static_cast<std::size_t>(shape.window));
+    std::vector<int64_t> window(static_cast<std::size_t>(std::min(shape.window, kParts)));
     std::iota(window.begin(), window.end(), int64_t{0});
     EXPECT_EQ(table->scanned_parts(), window) << shape.name;
   }
