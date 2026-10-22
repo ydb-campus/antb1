@@ -189,7 +189,10 @@ built once per part with a `TableScanOperator` of that part, so parts share no o
 part read the same builds, made once with the pipeline. `exec::PartScheduler` runs the parts on
 `ExecContext::executor` (an Arrow `ThreadPool` the `Session` owns when it has more than one thread) and hands their
 results back strictly in part order. At most
-2 × threads parts are running or finished but not yet taken. With one thread, each part runs on the calling thread
+2 × threads parts are running or finished but not yet taken, or 4 × threads under a sink that merges the parts into
+partial states (an aggregate or a top-N, a join's probe below one included), whose finished parts mostly hold far
+less than their rows: one slow part then holds up fewer of the others (ADR 0013, amended 2026-10-22). With one
+thread, each part runs on the calling thread
 when it is reached: the same code, so a result does not depend on the thread count. The first failing part in part
 order decides the error. Parts after the point where the consumer stops (a met `LIMIT`) are never started or are
 stopped at their next batch, and their errors are dropped.

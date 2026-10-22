@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -512,7 +513,8 @@ TEST_F(PartOperatorsTest, ProjectionsKeepPartOrder) {
 }
 
 // A LIMIT met by the first parts stops scheduling: on one thread no later part is scanned, on the
-// pool only the parts within the window (2 * threads beyond the taken ones).
+// pool only the parts within the window (2 * threads beyond the taken ones: a projection hands on
+// rows, so it keeps PartWindow, not MergeWindow).
 TEST_F(PartOperatorsTest, LimitStopsSchedulingParts) {
   const auto pool = Pool();
   for (arrow::internal::Executor* executor :
@@ -558,6 +560,98 @@ TEST_F(PartOperatorsTest, ErrorsFollowPartOrder) {
     const auto limited = Run(PlanOf(project, 1), executor);
     ASSERT_TRUE(limited.ok()) << limited.status().ToString();
     EXPECT_EQ(Int64Column(**limited), (std::vector<std::optional<int64_t>>{0, 1}));
+  }
+}
+
+// A sink that merges parts into partial states keeps 4 * threads parts ahead of the consumer; one
+// that hands on each part's rows, 2 * threads (docs/adr/0013-parallel-execution.md, amended
+// 2026-10-22). Without an executor each part runs when it is reached.
+TEST_F(PartOperatorsTest, MergingSinksKeepAWiderWindow) {
+  const auto pool = Pool();
+  const ExecContext pooled{.executor = pool.get(), .threads = kThreads};
+  EXPECT_EQ(PartWindow(pooled), 2 * kThreads);
+  EXPECT_EQ(MergeWindow(pooled), 4 * kThreads);
+  const ExecContext serial{};
+  EXPECT_EQ(PartWindow(serial), 1);
+  EXPECT_EQ(MergeWindow(serial), 1);
+}
+
+// Which window each sink keeps, seen from the parts it opens: the consumer fills the window before
+// it waits for the first part, and when that part fails, every part submitted with it still opens
+// its scan before it sees the stop -- so the parts scanned are exactly the window's, whatever the
+// timing.
+TEST_F(PartOperatorsTest, EachSinkOpensItsWindowAheadOfAFailedFirstPart) {
+  const auto pool = Pool();
+  const auto x = Column(0, "x", LogicalType::kBigInt);
+  const auto y = Column(2, "y", LogicalType::kBigInt);
+  const plan::AggregateCall count{
+      .kind = plan::AggKind::kCountStar, .arg = {}, .type = LogicalType::kBigInt};
+  struct Shape {
+    const char* name;
+    std::function<plan::LogicalNodePtr(plan::LogicalNodePtr)> make;
+    std::size_t width;
+    int64_t window;
+  };
+  // The two windows, in the type the scheduler takes.
+  constexpr int64_t kMergeWindow = int64_t{4} * kThreads;
+  constexpr int64_t kPartWindow = int64_t{2} * kThreads;
+  const std::vector<Shape> shapes = {
+      {.name = "global aggregate",
+       .make =
+           [&](plan::LogicalNodePtr input) {
+             return Node(plan::AggregateNode{.input = std::move(input), .aggregates = {count}});
+           },
+       .width = 1,
+       .window = kMergeWindow},
+      {.name = "grouped aggregate",
+       .make =
+           [&](plan::LogicalNodePtr input) {
+             return Node(plan::GroupAggregateNode{
+                 .input = std::move(input), .keys = {y}, .aggregates = {count}});
+           },
+       .width = 2,
+       .window = kMergeWindow},
+      // COUNT(DISTINCT) of a column that is not the key: the two-level aggregation, whose sample
+      // (here every part: they hold far fewer rows than a sample) runs in the same window.
+      {.name = "two-level aggregate",
+       .make =
+           [&](plan::LogicalNodePtr input) {
+             return Node(
+                 plan::GroupAggregateNode{.input = std::move(input),
+                                          .keys = {y},
+                                          .aggregates = {{.kind = plan::AggKind::kCountDistinct,
+                                                          .arg = x,
+                                                          .type = LogicalType::kBigInt}}});
+           },
+       .width = 2,
+       .window = kMergeWindow},
+      {.name = "top-N",
+       .make =
+           [&](plan::LogicalNodePtr input) {
+             const auto sort = Node(plan::SortNode{.input = std::move(input),
+                                                   .keys = {{.column = y, .descending = true}}});
+             return Node(plan::ProjectNode{
+                 .input = Node(plan::LimitNode{.input = sort, .limit = 5}), .columns = {x}});
+           },
+       .width = 1,
+       .window = kMergeWindow},
+      {.name = "projection",
+       .make =
+           [&](plan::LogicalNodePtr input) {
+             return Node(plan::ProjectNode{.input = std::move(input), .columns = {x}});
+           },
+       .width = 1,
+       .window = kPartWindow},
+  };
+  for (const Shape& shape : shapes) {
+    const auto table = Table();
+    table->FailPart(0);
+    const auto failed = Run(PlanOf(shape.make(Scan(table)), shape.width), pool.get());
+    EXPECT_TRUE(failed.status().IsIOError()) << shape.name << ": " << failed.status().ToString();
+    EXPECT_EQ(failed.status().message(), "part 0 is broken") << shape.name;
+    std::vector<int64_t> window(static_cast<std::size_t>(std::min(shape.window, kParts)));
+    std::ranges::iota(window, int64_t{0});
+    EXPECT_EQ(table->scanned_parts(), window) << shape.name;
   }
 }
 
