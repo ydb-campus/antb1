@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792625050930,
+  "lastUpdate": 1792652624016,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -18468,6 +18468,258 @@ window.BENCHMARK_DATA = {
             "value": 1961.0500510000008,
             "unit": "ms/iter",
             "extra": "iterations: 1\ncpu: 1961.0301430000022 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Hor911",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b9337b9af0d4102cb86c21d414330e0460e9bb0a",
+          "message": "feat(plan): report where a grouped aggregate could be computed below its join (#217)\n\n## Summary\n\n**Item G1 of [ADR 0032](docs/adr/0032-aggregate-placement.md).** A\ngrouped aggregate that reads one input of the\njoin below it can be computed on that input first; this finds where that\nis legal and reports it in `EXPLAIN`.\n**It rewrites nothing**, on ADR 0030 E1's precedent: a pass that only\nreports cannot give a wrong answer, and\nevery later item of the ADR depends on this legality test being right.\n\n```text\nGroupAggregate keys=[zones.zn_city] SUM(trips.tr_fare)  [groupable below the left of join, 1 key]\n  Join INNER build=right keys=[trips.tr_pickup = zones.zn_id]\n```\n\nThe note carries the three things a rewrite would need: which input to\ngroup, how wide the pre-grouping must be,\nand whether the final step has to pad a preserved row that found no\nmatch.\n\n**It reports 8 of the 22**, and every query the ADR's survey called\nshape-positive but this does not report is\none of its own documented refusals — a `Project` between the aggregate\nand the join for five of them, and for\none an aggregate whose `CASE` argument reads both inputs (condition 1,\nwhich the survey had independently noted\nwould need an extension to be legal at all). **Both queries the ADR says\nare worth doing are reported**,\nincluding the one whose aggregate argument is a computed expression:\nthat is why a `Compute` between the two is\nlooked through rather than refused, resolving the aggregate's column to\nthe columns that computed it.\n\nCloses #\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run ci                 # clang Debug -Werror + the hermetic suite\n100% tests passed out of 2823\n\n$ ANTB1_DIFF_SEED=20261024 pixi run diff-random\nDIFF: PASS seed=20261024 queries=2000 failed=0 unsupported=0\n\n$ clang-tidy -p build/tidy --warnings-as-errors='*' src/plan/aggregate_placement.cc src/plan/tests/aggregate_placement_test.cc src/plan/explain.cc\nclean\n\n$ ASAN_OPTIONS=detect_leaks=0 ./build/ci-asan/bin/antb1_plan_tests\n824 tests PASSED\n`pixi run asan` cannot run on this host (it fails at discovery on a pre-existing curl_global_init leak), so the\nbinary was run directly after generating the ci-asan fixtures.\n\n$ pixi run lint\nevery hook Passed except shellcheck: 37 pre-existing SC2218 findings in files this PR does not touch;\n`git stash && pixi run lint` fails identically on main and CI's lint leg passes.\n\nNot run on this host: pixi run ci-gcc and codeql-build (the gcc environment is linux-64 only).\n```\n\nNo performance change: nothing is rewritten and the pass runs once per\n`EXPLAIN`.\n\nOne CLI golden moved, which is the intended output change — a one-line\ndiff adding the note to a plan whose\naggregated side is itself a grouped aggregate. Reviewed before updating\nwith `ANTB1_UPDATE_GOLDENS=1`. That case\nis a good illustration of the division of labour: the placement is\nlegal, and G2's gate will refuse it because\nthe pre-grouping key is already a key of that side.\n\n## Checklist\n\n- [ ] `pixi run check` passes locally — **not ticked**: `check` stops at\nthe pre-existing shellcheck findings.\n  Both halves were run separately and pass.\n- [x] Tests cover the change (unit tests under `src/<module>/tests/`, or\nwhy none are needed)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [ ] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer\n\n**The open item:** `docs/adr/0032-aggregate-placement.md` is CODEOWNERS.\nThe edit records what G1 found and\n**corrects an error in the ADR's own condition 5** (below).\n`src/plan/CMakeLists.txt` and `tests/cli/golden/` are\nnot on the \"Ask a human first\" list.\n\n### Two defects review caught, each of which would have become a wrong\nanswer in G2\n\n1. **A join carrying a residual was reported as legal, and it is not.**\nA residual decides which pairs match on\nsomething other than the keys, so the pre-grouping destroys exactly the\nper-row values it reads: the partial\nwould aggregate rows the residual rejects, over columns no longer\npresent to reject them by, and no final\nstep can take that back. ADR 0032's condition 4 asks for an equi-join on\nthe grouped columns and this is the\nrest of that ask. Verified before and after on the star fixtures — the\nnote appears on a plain equi-join and\n   is gone from one carrying `residual=[(tr_fare > zn_radius)]`.\n2. **The padded value for `COUNT(*)` is 1, not 0.** On a null-supplying\naggregated side, `COUNT(*)` counted the\npadded row the join produced, where `COUNT(col)` counted a NULL and is\n0. The ADR's condition 5 said \"F over\nthe empty set\" and gave 0 for both counts; it is corrected here, and the\nmixed `COUNT(*)` plus side-naming\n   call shape now has a test.\n\nNeither could reach an answer, because G1 rewrites nothing. That is the\nentire argument for shipping a reporting\npass before a rewrite, and it earned its keep on the first review.\n\n### Tests\n\nTen cases: the shape the ADR is written for, the `Compute` look-through,\ncondition 3's second half, padding in\nboth orientations of a LEFT JOIN, a widened join key (admitted — the\nwidening is a `Compute` on that input's own\nbranch, so the column is below the join after all, which is easy to\nassume the other way round), a computed\ngrouping column resolved to what computed it, the rendered `EXPLAIN`\nnote, and a table of eight refusals.\n\n**Eleven mutations checked, ten caught.** Each legality condition, each\nhalf of the padding rule, the residual\nrefusal, the computed-grouping resolution and the semi-join refusal all\nfail a case. The one that is not caught\nis descending through a `Filter`, and the reason is worth recording\nrather than papering over: a conjunct over\none relation is pushed *below* the join, so a `Filter` reaches that\nposition only above a derived table's\n`Project` — nothing produces a bare one, so no case can isolate it. The\nheader and the test say so.\n\nTwo guards I wrote and then removed as unreachable rather than leave\nuntestable: a `keys.empty()` check (a bound\nglobal aggregate is an `AggregateNode`, a different variant) and a\njoin-key membership check (a key names a\ncolumn of its own input by construction).\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5) wrote\nthe pass, the tests, the `EXPLAIN`\nannotation and the ADR update, and ran the gates. Its `reviewer`\nsubagent found the residual P0 and the\n`COUNT(*)` identity, both of which I reproduced myself before fixing; I\nhad separately mutation-checked my way\nto two other gaps. One finding of its four P1s I judged differently and\ndid not apply as suggested — the\nwidened-key case turned out to be legal rather than a refusal, which the\nnew test now pins.\n- Accountable human (has read and understands the whole diff): @hor911\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-22T09:59:39+03:00",
+          "tree_id": "cfe5eb4ad77793ed5995841456f6b962b31752a2",
+          "url": "https://github.com/ydb-campus/antb1/commit/b9337b9af0d4102cb86c21d414330e0460e9bb0a"
+        },
+        "date": 1792652622866,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4981.388437095787,
+            "unit": "ns/iter",
+            "extra": "iterations: 140674\ncpu: 4981.112707394401 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 85895.29353878259,
+            "unit": "ns/iter",
+            "extra": "iterations: 7723\ncpu: 85888.163019552 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 221474.4148430073,
+            "unit": "ns/iter",
+            "extra": "iterations: 3153\ncpu: 221457.25467808434 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 441262.0828625239,
+            "unit": "ns/iter",
+            "extra": "iterations: 1593\ncpu: 441217.4011299432 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 360195.7426659803,
+            "unit": "ns/iter",
+            "extra": "iterations: 1943\ncpu: 360135.7138445704 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2083651.4744745032,
+            "unit": "ns/iter",
+            "extra": "iterations: 333\ncpu: 2083438.1621621635 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 50.995516928572165,
+            "unit": "ms/iter",
+            "extra": "iterations: 14\ncpu: 50.98047992857145 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 44.94362656250139,
+            "unit": "ms/iter",
+            "extra": "iterations: 16\ncpu: 44.93807687499996 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 193.097040749997,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 193.06050774999983 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.817603680851189,
+            "unit": "ms/iter",
+            "extra": "iterations: 47\ncpu: 14.814867808510638 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 19.86985388571481,
+            "unit": "ms/iter",
+            "extra": "iterations: 35\ncpu: 19.86642911428567 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 37.05536568421053,
+            "unit": "ms/iter",
+            "extra": "iterations: 19\ncpu: 37.04850115789473 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.9281398272981007,
+            "unit": "ms/iter",
+            "extra": "iterations: 359\ncpu: 1.9278665793871868 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 102.08932733333143,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 102.07827549999996 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1000",
+            "value": 28.0791048399999,
+            "unit": "ms/iter",
+            "extra": "iterations: 25\ncpu: 28.075100719999995 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16384",
+            "value": 31.066890000000118,
+            "unit": "ms/iter",
+            "extra": "iterations: 22\ncpu: 31.063582681818215 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/262144",
+            "value": 64.51725136363703,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 64.50957845454526 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1048576",
+            "value": 97.31265342857195,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 97.30595985714275 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/4194304",
+            "value": 340.1804684999945,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 340.14084400000047 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16777216",
+            "value": 1654.9778340000216,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1654.8023260000023 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1000",
+            "value": 34.74818250000027,
+            "unit": "ms/iter",
+            "extra": "iterations: 20\ncpu: 34.746727649999976 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16384",
+            "value": 39.07869622222253,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 39.073900500000036 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/262144",
+            "value": 67.1899580999991,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 67.1871380999999 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1048576",
+            "value": 120.5250893333319,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 120.51394466666683 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/4194304",
+            "value": 428.04232299999967,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 427.99258299999997 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16777216",
+            "value": 1907.0759450000025,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1906.8331699999987 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1000",
+            "value": 58.70263308333298,
+            "unit": "ms/iter",
+            "extra": "iterations: 12\ncpu: 58.696076333333444 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16384",
+            "value": 62.52231645454355,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 62.51555063636358 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/262144",
+            "value": 93.24315157142645,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 93.23339085714265 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1048576",
+            "value": 168.63836300000656,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 168.6168204999987 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/4194304",
+            "value": 506.5405329999919,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 506.46847199999456 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16777216",
+            "value": 2319.374805000024,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2319.153876999998 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1000",
+            "value": 69.72686010000189,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 69.72359040000029 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16384",
+            "value": 74.60620499999966,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 74.597609222222 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/262144",
+            "value": 108.6513765000016,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 108.63963716666683 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1048576",
+            "value": 185.92872574999575,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 185.91700150000003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/4194304",
+            "value": 556.9592409999871,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 556.8903050000031 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16777216",
+            "value": 2447.094851999992,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2446.8438259999984 ms\nthreads: 1"
           }
         ]
       }
