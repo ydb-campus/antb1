@@ -22,9 +22,21 @@ Proposed
 
 - **Surface: `antb1 explain --analyze`** (with `--threads`, `--memory-limit`, `--format text|json`).
   - It runs the query, drops its rows and prints every physical operator with its numbers.
-  - Without `--analyze`, `explain` is unchanged.
+  - Without `--analyze` or `--physical`, `explain` is unchanged.
   - The SQL `EXPLAIN [ANALYZE]` statement is deferred (maintainer's choice, 2026-09-30). It would change the parser,
     the AST, the unparser round-trip and the fuzzer.
+- **`antb1 explain --physical`: the same tree, unrun** (added 2026-10-23, excludes `--analyze`). The plan-time build
+  already names every node and writes its detail, so a profile root filled by `BuildPhysicalPlan` alone is a
+  complete physical plan; `engine::FormatPhysicalPlan` prints it without the brackets.
+  - It cannot drift from `--analyze`, because it *is* the planner's output rather than a second model of it: a
+    session test strips the counters off the profiled text and expects the two to be equal line for line.
+  - What it must not do is state a decision it cannot know. ADR 0029's key filter depends on three run-time facts
+    (the build really published a filter, it stayed under the share gate, a part's statistics exclude its keys), so
+    the scan line says `key filter candidate on <column>` -- or `part skip candidate` where only that mechanism
+    could apply -- and the facts stay in `--analyze`'s metrics.
+  - The converse matters as much: every condition a plan *can* settle has to be settled here, or the report claims
+    what no run could do. The key's type is one, and it was the one defect of the first draft, because it used to
+    ride in on the build's null filter rather than being tested (`exec::CanPublishKeyFilter` now names it).
 - **The profile is a tree of `exec::ProfileNode`, one per physical operator** (`src/exec/include/antb1/exec/profile.h`).
   - Each node holds a name, the logical node's EXPLAIN text (`plan::ExplainNode`), whether it runs per part, and its
     inputs.

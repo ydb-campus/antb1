@@ -104,11 +104,21 @@ std::string_view DetailText(const exec::ProfileNode& node) {
   return detail;
 }
 
-void Text(const exec::ProfileNode& node, std::size_t depth, std::string& out) {
+// One line per operator, root first. Without `counters` -- a plan nobody ran
+// (FormatPhysicalPlan) -- the line ends after the operator and its logical node, since rows, times
+// and metrics are what a run measures and this node has never been through one.
+void Text(const exec::ProfileNode& node, std::size_t depth, bool counters, std::string& out) {
   std::string line = std::string(2 * depth, ' ') + node.name();
   if (const std::string_view detail = DetailText(node); !detail.empty()) {
     line += ' ';
     line += detail;
+  }
+  if (!counters) {
+    out += line + '\n';
+    for (const exec::ProfileNode* child : node.children()) {
+      Text(*child, depth + 1, counters, out);
+    }
+    return;
   }
   line += std::format("  [rows={} batches={}", node.rows(), node.batches());
   if (node.per_part()) {
@@ -125,7 +135,7 @@ void Text(const exec::ProfileNode& node, std::size_t depth, std::string& out) {
   }
   out += line + "]\n";
   for (const exec::ProfileNode* child : node.children()) {
-    Text(*child, depth + 1, out);
+    Text(*child, depth + 1, counters, out);
   }
 }
 
@@ -172,8 +182,14 @@ std::string FormatProfile(const QueryProfile& profile, ProfileFormat format) {
                      Duration(profile.time.count()), profile.rows,
                      exec::FormatBytes(profile.peak_memory), profile.threads);
   if (profile.root != nullptr) {
-    Text(*profile.root, 0, out);
+    Text(*profile.root, 0, /*counters=*/true, out);
   }
+  return out;
+}
+
+std::string FormatPhysicalPlan(std::string_view output, const exec::ProfileNode& root) {
+  std::string out = std::string(output) + '\n';
+  Text(root, 0, /*counters=*/false, out);
   return out;
 }
 

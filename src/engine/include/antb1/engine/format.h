@@ -35,6 +35,13 @@ enum class ProfileFormat { kText, kJson };
 // nanoseconds, memory in bytes.
 std::string FormatProfile(const QueryProfile& profile, ProfileFormat format);
 
+// Renders a physical plan nobody ran (`antb1 explain --physical`, Session::ExplainPhysical): the
+// "Output:" line, then one line per physical operator exactly as FormatProfile's kText writes it
+// but without the brackets. What is in them -- rows, times, metrics -- is what a run measures, and
+// the decisions the planner made are in the lines themselves: part pipelines, hoisted builds,
+// pushed predicates (ADR 0020) and ADR 0029's key filter candidates.
+std::string FormatPhysicalPlan(std::string_view output, const exec::ProfileNode& root);
+
 // The body of a JSON string (without the quotes): quotes, backslashes and control characters
 // escaped, and every byte of an ill-formed UTF-8 sequence written as the text \xHH, so the result
 // is always valid UTF-8. Also used by the CLI's error object and bench report.

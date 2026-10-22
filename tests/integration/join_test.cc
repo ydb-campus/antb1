@@ -373,8 +373,14 @@ TEST_F(JoinTest, PruningAndPushdownOnBothSides) {
   for (const exec::ProfileNode* side : profile.children()) {
     const exec::ProfileNode& filter = *side->children()[0];
     ASSERT_EQ(filter.name(), "Filter");
-    EXPECT_TRUE(filter.children()[0]->detail().ends_with(", 1 pushed predicate"))
-        << filter.children()[0]->detail();
+    const std::string detail = filter.children()[0]->detail();
+    // Besides its pushed predicate, the probe's scan carries what ADR 0029's part test could do
+    // with this join's keys, which is what `explain --physical` reports; the build's own pipeline
+    // has no join above it and so has no candidate to name.
+    const bool probes = detail.starts_with("Scan table=trips ");
+    EXPECT_TRUE(detail.ends_with(probes ? ", 1 pushed predicate, part skip candidate on tr_pickup"
+                                        : ", 1 pushed predicate"))
+        << detail;
   }
 }
 

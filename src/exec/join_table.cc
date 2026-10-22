@@ -1159,13 +1159,17 @@ arrow::Status JoinTableBuilder::Merged() {
   });
 }
 
-arrow::Result<std::shared_ptr<const KeyFilter>> JoinTableBuilder::MakeKeyFilter() const {
+bool CanPublishKeyFilter(const std::shared_ptr<const JoinBuildSpec>& spec) {
   // One key, and of a type a Parquet scan decodes to the same values the build hashed: the probe
   // side hashes with KeyHashes over the scan's own array, so the two agree only when the one key
   // column is there to hash. (The same restriction LeadingKeyField states for a sort key.)
-  if (spec_ == nullptr || spec_->keys().size() != 1 ||
-      !(plan::IsInteger(spec_->keys().front().type) ||
-        spec_->keys().front().type == plan::LogicalType::kDate)) {
+  return spec != nullptr && spec->keys().size() == 1 &&
+         (plan::IsInteger(spec->keys().front().type) ||
+          spec->keys().front().type == plan::LogicalType::kDate);
+}
+
+arrow::Result<std::shared_ptr<const KeyFilter>> JoinTableBuilder::MakeKeyFilter() const {
+  if (!CanPublishKeyFilter(spec_)) {
     return nullptr;
   }
   int64_t rows = 0;

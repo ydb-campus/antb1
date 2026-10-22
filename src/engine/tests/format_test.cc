@@ -427,5 +427,41 @@ TEST(FormatProfileTest, JoinMetricsShowInAFixedOrder) {
       << json;
 }
 
+// The physical plan of `explain --physical`: the operators and their logical nodes, and not one
+// counter -- deliberately tested on a tree that *has* rows, a time and metrics, because dropping
+// them is the whole difference between a plan and a profile. What the lines do carry is what the
+// planner decided, which is why the scan's pushed predicates and key filter candidate are part of
+// the expectation.
+TEST(FormatPhysicalPlanTest, PrintsTheOperatorsWithoutAnyCounter) {
+  auto root = std::make_shared<exec::ProfileNode>();
+  root->set_name("PartAggregate");
+  root->set_detail("Aggregate COUNT(*)");
+  root->AddRows(1);
+  root->AddTime(std::chrono::nanoseconds(int64_t{1000} * 1000));
+  root->Max("parts", exec::MetricUnit::kCount, 6);
+  exec::ProfileNode& probe = *root->Child(0);
+  probe.set_name("HashJoin");
+  probe.set_detail("Join INNER build=right keys=[a = b]");
+  probe.set_per_part(true);
+  probe.Add("find", exec::MetricUnit::kNanos, int64_t{1000} * 1000);
+  exec::ProfileNode& scan = *probe.Child(0);
+  scan.set_name("Scan");
+  scan.set_detail(
+      "Scan table=t source=memory columns=[a], 1 pushed predicate, part skip candidate on a");
+  scan.set_per_part(true);
+  scan.Max("key_pruned", exec::MetricUnit::kCount, 1);
+  exec::ProfileNode& build = *root->Child(1);
+  build.set_name("HashBuild");
+  build.set_detail("Join INNER build=right keys=[a = b]");
+  build.Max("unique", exec::MetricUnit::kCount, 1);
+  EXPECT_EQ(FormatPhysicalPlan("Output: c:BIGINT", *root),
+            "Output: c:BIGINT\n"
+            "PartAggregate Aggregate COUNT(*)\n"
+            "  HashJoin Join INNER build=right keys=[a = b]\n"
+            "    Scan table=t source=memory columns=[a], 1 pushed predicate, part skip candidate "
+            "on a\n"
+            "  HashBuild Join INNER build=right keys=[a = b]\n");
+}
+
 }  // namespace
 }  // namespace antb1::engine

@@ -97,6 +97,11 @@ class Session {
 
   arrow::Result<QueryResult> Execute(std::string_view sql);
   arrow::Result<std::string> Explain(std::string_view sql);
+  // The physical plan of a query without running it: what the physical planner decided, which the
+  // logical plan of Explain does not hold (part pipelines, hoisted builds, pushed predicates, key
+  // filter candidates). It builds the operator tree and drops it, so it opens no part and reads
+  // nothing but the footers the catalog already has.
+  arrow::Result<std::string> ExplainPhysical(std::string_view sql);
   // Runs the query with every physical operator profiled; the result rows are dropped.
   arrow::Result<QueryProfile> ExplainAnalyze(std::string_view sql);
 
