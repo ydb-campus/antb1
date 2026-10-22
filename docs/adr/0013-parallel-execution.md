@@ -65,7 +65,8 @@ Accepted (with the maintainer-approved plan for parallel execution over row grou
 - **Partial results are merged in part order, whatever the thread count and schedule.**
   - A part's partial result is merged into the global one once every earlier part's result is merged.
   - Results that finish early wait in a window, bounded at twice the thread count. The scheduler does not start a part
-    beyond the window.
+    beyond the window. Amended 2026-10-22: four times the thread count for a sink that merges the parts into partial
+    states (an aggregate or a top-N); see Load balance.
   - So the answer is a function of the parts only, never of timing: the same on 1 thread and on 64.
   - GROUP BY merges map each part's groups through the global grouper (its unique keys, normalized as today). The
     first-seen key of a group stays the one from the earliest part.
@@ -118,7 +119,10 @@ subqueries; both amend this section where marked.
   `plan::Optimize` can fail. The executor never runs a subquery per row.
 - **Memory:** the window bounds what is in flight: up to 2 × threads parts' partial states or, under a part union
   (a projection, or a blocking operator without its own sink yet), their whole output, because a part hands on its
-  batches only when it is finished. A hash-join build is one table shared read-only by the probe threads. An inner
+  batches only when it is finished. Amended 2026-10-22: 4 × threads parts' partial states under a sink that merges
+  them, and a GROUP BY's lanes hold as many again until every lane has merged them; a routed GROUP BY part's state is
+  its rows, split by partition, and a top-N part's at most limit + offset rows. A hash-join build is one table shared
+  read-only by the probe threads. An inner
   join builds on the side with the smaller footer row count; an outer, semi or anti join builds on the side whose
   rows it does not preserve, until build-side output gets its own ADR. The plan depends on metadata only, never on
   the thread count (amended 2026-10-02, ADR 0022). The session memory limit (`exec::MemoryBudget`: a counting memory
@@ -150,6 +154,50 @@ subqueries; both amend this section where marked.
      counts, MIN and MAX. The order-dependent results keep the ordered merge: DOUBLE sums, the first-seen spelling of
      a DOUBLE key, and the output order of groups, ties and LIMIT without ORDER BY. Output order would then come from
      sorting the groups at the end, so answers stay the same for any thread count.
+
+  Amended 2026-10-22, step 1's measurement on the full data at 16 to 128 threads (2 sockets, 64 cores, 128 hardware
+  threads): **the threads idle, and at 16 and 32 threads most of the idle is the window, not the parts' sizes. A
+  sink that merges the parts into partial states (`MergeWindow`) keeps 4 × threads parts ahead of its consumer, and so
+  does every part pipeline below one, a join's probe included; a GROUP BY's lanes take the same value as their bound.
+  A part union, a join's build and the probe a right join schedules itself keep 2 × threads (`PartWindow`).**
+  - A part takes as long as the bytes it reads, not its rows. In the most uneven column the measured queries read,
+    the largest row group holds about 6 times the mean, and 44 of the 325 stay dictionary-encoded and cost almost
+    nothing. While such a part runs, the parts after it finish and fill the window, which only taking that part
+    frees: every other worker waits.
+  - Traced part by part (submitted, started, finished, taken; a scratch build, not committed), Q20 at 16 threads kept
+    its workers busy 68% of the time, lost 28% of the threads' time with the window full of finished parts behind one
+    still running, and 4% to the last parts. DuckDB, which hands out the same row groups in order without a window,
+    kept 95% of its 16 threads busy on the same query. A simulation of the window over the footers' byte counts gives
+    66% for 2 × threads and 93% for 4 × or no window at all; 4 × threads measured 94%.
+  - Paired against main on all 43 queries (two builds, one process per query, best of 3 tries, two runs per point
+    with the arm order reversed between them, the run least disturbed by the host's other load kept), total seconds,
+    main → this change: 34.269 → 30.745 at 16 threads, 22.190 → 21.011 at 32, 16.532 → 15.841 at 64, 16.370 →
+    16.380 at 128. Q20 1.103 → 0.825 at 16 threads and 0.527 → 0.368 at 64; Q27 1.290 → 0.966 and 0.649 → 0.511;
+    Q28 4.303 → 3.602 at 16; the top-N queries Q24-Q26 0.287-0.380 → 0.203-0.292 at 16. The highest peak memory of
+    a query at 64 threads went 23.7 → 26.8 GB (Q34, GROUP BY on a string: its parts and its lanes hold more groups),
+    at 16 threads 18.8 → 19.4 GB.
+  - The 22 queries derived from TPC-H (sf100, page cache checked resident), as a control, 2 tries, two rounds:
+    116.535 → 116.321 s at 16 threads, 58.367 → 58.781 s at 64. Their row groups are even, and traced, Q1 and Q4
+    keep the same schedule with either window (97% and 75% of the threads busy). (This workload is derived from the
+    TPC-H Benchmark and is not comparable to published TPC-H Benchmark results, as this implementation does not comply
+    with all requirements of the TPC-H Benchmark.)
+  - 8 × threads measured no better than 4 × at any thread count and held more memory; a part union's finished parts
+    hold their rows, so it keeps the narrower window, and so does a LIMIT's early stop. Keeping the lanes' bound at
+    2 × threads under a 4 × window measured no better on 13 GROUP BY queries (0.9% worse at 64 threads), so one value
+    bounds both.
+  - What it does not fix. From 64 threads on the idle is elsewhere: the last parts, started in part order (Q20 at 64
+    threads: 28.5% of the threads' time, 36.0% at 128), which step 2 addresses; and the merge's 32 lanes, one task
+    each, and its output built 32 partitions at a time (Plan item 4's cap, now measured: Q32 at 64 threads leaves
+    47.5% of the threads' time idle outside any wait for a part, 68.7% at 128, with the same span at both). On the
+    queries derived from TPC-H, whose row groups are even, the window and the tail are under 5% and the idle is the
+    consumer working alone: Q21's SEMI right join gathers its 7 M emitted build rows on the consumer (5.6 s of 17.6 s
+    at 16 threads; ADR 0026's C2b). A top-N's bound also reaches fewer of the parts that start early, since more of
+    them start ahead of the merge: Q23 at 64 threads went 0.398 → 0.535 s, the one query measured slower beyond the
+    noise, while it gains at 16 and 32 threads (0.800 → 0.600 s, 0.572 → 0.469 s); a part that started before the
+    bound tightened could check it again between batches. The GROUP BYs whose lanes do most of their work lean slower
+    at 64 threads, inside main's spread (Q4 0.225 → 0.243 s, Q17 0.564 → 0.618 s, Q18 1.058 → 1.143 s). Not
+    measured why; the lanes' bound is not it (2 × threads under a 4 × window did not remove it), and a guess is that
+    their lanes' tasks wait behind more queued parts in the pool's one FIFO queue.
 - **Memory:** it grows with the window and the per-part partial states. High-cardinality grouping holds partial group
   tables for at most the window's parts.
 - **Tests:**
