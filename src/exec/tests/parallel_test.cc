@@ -592,42 +592,56 @@ TEST_F(PartOperatorsTest, EachSinkOpensItsWindowAheadOfAFailedFirstPart) {
     std::size_t width;
     int64_t window;
   };
+  // The two windows, in the type the scheduler takes.
+  constexpr int64_t kMergeWindow = int64_t{4} * kThreads;
+  constexpr int64_t kPartWindow = int64_t{2} * kThreads;
   const std::vector<Shape> shapes = {
-      {"global aggregate",
-       [&](plan::LogicalNodePtr input) {
-         return Node(plan::AggregateNode{.input = std::move(input), .aggregates = {count}});
-       },
-       1, 4 * kThreads},
-      {"grouped aggregate",
-       [&](plan::LogicalNodePtr input) {
-         return Node(plan::GroupAggregateNode{
-             .input = std::move(input), .keys = {y}, .aggregates = {count}});
-       },
-       2, 4 * kThreads},
+      {.name = "global aggregate",
+       .make =
+           [&](plan::LogicalNodePtr input) {
+             return Node(plan::AggregateNode{.input = std::move(input), .aggregates = {count}});
+           },
+       .width = 1,
+       .window = kMergeWindow},
+      {.name = "grouped aggregate",
+       .make =
+           [&](plan::LogicalNodePtr input) {
+             return Node(plan::GroupAggregateNode{
+                 .input = std::move(input), .keys = {y}, .aggregates = {count}});
+           },
+       .width = 2,
+       .window = kMergeWindow},
       // COUNT(DISTINCT) of a column that is not the key: the two-level aggregation, whose sample
       // (here every part: they hold far fewer rows than a sample) runs in the same window.
-      {"two-level aggregate",
-       [&](plan::LogicalNodePtr input) {
-         return Node(plan::GroupAggregateNode{
-             .input = std::move(input),
-             .keys = {y},
-             .aggregates = {
-                 {.kind = plan::AggKind::kCountDistinct, .arg = x, .type = LogicalType::kBigInt}}});
-       },
-       2, 4 * kThreads},
-      {"top-N",
-       [&](plan::LogicalNodePtr input) {
-         const auto sort = Node(plan::SortNode{.input = std::move(input),
-                                               .keys = {{.column = y, .descending = true}}});
-         return Node(plan::ProjectNode{.input = Node(plan::LimitNode{.input = sort, .limit = 5}),
-                                       .columns = {x}});
-       },
-       1, 4 * kThreads},
-      {"projection",
-       [&](plan::LogicalNodePtr input) {
-         return Node(plan::ProjectNode{.input = std::move(input), .columns = {x}});
-       },
-       1, 2 * kThreads},
+      {.name = "two-level aggregate",
+       .make =
+           [&](plan::LogicalNodePtr input) {
+             return Node(
+                 plan::GroupAggregateNode{.input = std::move(input),
+                                          .keys = {y},
+                                          .aggregates = {{.kind = plan::AggKind::kCountDistinct,
+                                                          .arg = x,
+                                                          .type = LogicalType::kBigInt}}});
+           },
+       .width = 2,
+       .window = kMergeWindow},
+      {.name = "top-N",
+       .make =
+           [&](plan::LogicalNodePtr input) {
+             const auto sort = Node(plan::SortNode{.input = std::move(input),
+                                                   .keys = {{.column = y, .descending = true}}});
+             return Node(plan::ProjectNode{
+                 .input = Node(plan::LimitNode{.input = sort, .limit = 5}), .columns = {x}});
+           },
+       .width = 1,
+       .window = kMergeWindow},
+      {.name = "projection",
+       .make =
+           [&](plan::LogicalNodePtr input) {
+             return Node(plan::ProjectNode{.input = std::move(input), .columns = {x}});
+           },
+       .width = 1,
+       .window = kPartWindow},
   };
   for (const Shape& shape : shapes) {
     const auto table = Table();
@@ -636,7 +650,7 @@ TEST_F(PartOperatorsTest, EachSinkOpensItsWindowAheadOfAFailedFirstPart) {
     EXPECT_TRUE(failed.status().IsIOError()) << shape.name << ": " << failed.status().ToString();
     EXPECT_EQ(failed.status().message(), "part 0 is broken") << shape.name;
     std::vector<int64_t> window(static_cast<std::size_t>(std::min(shape.window, kParts)));
-    std::iota(window.begin(), window.end(), int64_t{0});
+    std::ranges::iota(window, int64_t{0});
     EXPECT_EQ(table->scanned_parts(), window) << shape.name;
   }
 }
