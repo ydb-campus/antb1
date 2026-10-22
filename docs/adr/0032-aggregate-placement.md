@@ -39,7 +39,7 @@ entirely, because a pre-grouped relation has exactly one row per key.
   | query | reduction | keeps | verdict |
   | --- | ---: | ---: | --- |
   | Q13 | 10:1 | 100% | **worth it** -- 0.494x, peak 0.108x |
-  | Q10 | 3.02:1 | 100% | **worth it** -- 0.935x, peak 0.827x |
+  | Q10 | 3.02:1 | 100% | **worth it at a placement this ADR does not describe** -- see the G2a update |
   | Q9 | 1825:1 | 100% | no effect -- the ratio is a false positive, see below |
   | Q7 | 1484:1 | 4% | refuse -- the aggregate's own input grows 25x |
   | Q21 | 9.88:1 | 4.1% | refuse -- input grows 23.9x, and it destroys a 24:1 prune on three scans |
@@ -76,6 +76,16 @@ entirely, because a pre-grouped relation has exactly one row per key.
   measured arm after arm, and interleaved and rotated over six repeats the same pair is 1.010x** -- the apparent
   win was the second arm running on a warmer page cache every time. Peak memory does improve, 7,301 to 6,716 MiB
   (0.920x). So there is no time to recover here, and this ADR decides only the forward direction.
+
+- **Correction (2026-10-22, from G2a): Q10's 0.945x is at a placement this ADR's Decision does not describe.**
+  The rewrite below exchanges an aggregate with **one** join. Q10's measured win pre-groups two joins further
+  down, and the placement the single exchange actually reaches -- pre-grouping at the join to the nation
+  dimension, by the seven columns condition 3 requires there -- measures **1.245x slower** at SF 100 (3.155 s to
+  3.926 s, peak 5,164 to 6,819 MiB), answers identical, interleaved and rotated. **The gate refuses it**, so
+  nothing is wrong with the gate; what is wrong is counting Q10 among the queries this decision wins. An
+  iterated exchange, pushing an aggregate along a chain of joins, would reach the measured placement and is not
+  part of this ADR. On its own evidence, then, **this decision is worth one query of the 22** and the honest
+  reading of its case is Q13's 0.494x and 12.3x memory alone.
 
 - **A prerequisite had to be fixed before any of this could be measured honestly, and it is the sharpest lesson of
   the work.** Every rewrite that introduces a derived table exposes join keys whose domains the binder cannot
@@ -161,13 +171,16 @@ entirely, because a pre-grouped relation has exactly one row per key.
 
 ## Consequences
 
-- **Two queries of 22 improve and twelve of the fourteen shape-positive ones must be refused**, so the gate is
-  most of this item's value and nearly all of its risk. A wrongly gated rule is comfortably net negative: the survey
+- **One query of 22 improves at the placement this decision reaches** -- Q13 -- and the rest of the fourteen
+  shape-positive ones must be refused, so the gate is most of this item's value and nearly all of its risk.
+  Q10's win needs an iterated exchange this ADR does not describe (see the correction in the Context). A
+  wrongly gated rule is comfortably net negative: the survey
   produced four written rewrites that regress by 1.03x to 1.89x and one that regressed by about 2,700x before the
   estimator fix.
-- **The case rests on peak memory more than on throughput.** Q13 is 0.494x on time and 0.108x on peak; Q10 is
-  0.935x and 0.827x. Projecting the 22-query geomean from two queries gives roughly 3%, and that projection is
-  dominated by one query -- it should not be quoted as a measurement.
+- **The case rests on peak memory more than on throughput, and on one query.** Q13 is 0.494x on time and
+  **0.108x on peak**, which is the number that carries this decision: 14,325 MiB to 1,554. Against the 22 that
+  is about 1% of the total time, so **this is not a throughput item** and should not be sold as one. It is worth
+  doing for what it does to the memory of the query that needs 14 GB.
 - **No answer may change**, and unlike most items here that is not self-evident from the mechanism: a pre-grouping
   that merges rows the outer grouping would separate changes aggregate *values*, not row counts, so the oracle and
   the differential tester matter more than any counter assertion.
@@ -191,8 +204,32 @@ entirely, because a pre-grouped relation has exactly one row per key.
     rejects, which no final step can take back. And condition 5's value above was wrong for `COUNT(*)`. Neither
     could reach an answer, because G1 rewrites nothing -- which is the whole argument for shipping a reporting
     pass first, and it earned its keep on the first review.
-- **G2, perf(plan,exec): perform the rewrite behind the gate.** Measured at SF 100 with peak memory beside time,
-  interleaved and rotated, on Q13 and Q10 with the other 20 as the control. The gate's refusals are tested by
+- **G2 split into two, because the gate needs a cardinality estimate this planner has never had.** Nothing
+  estimates the groups a grouping would make: `EstimateRows` returns a `GroupAggregate`'s *input* rows as an
+  upper bound (`join_order.cc`), which is exactly the quantity the gate's reduction test cannot use. Building
+  that estimate and then verifying the gate against this ADR's own table is worth doing before any answer can
+  move, on the same reasoning that made G1 a reporting pass.
+- **G2a, feat(plan): estimate the groups a pre-aggregation would build, and report the gate's verdict**, still
+  rewriting nothing.
+  - Update (2026-10-22, G2a): **shipped, and it admits exactly one placement of the 22 -- Q13's**, reported as
+    `worth 1500000->149999`, which is the 10:1 the survey measured by hand. Every other legal placement is
+    refused, and the one refusal worth examining is Q10's (below).
+  - **Three of the six gate conditions are not decidable in a logical plan**, and saying which is more useful
+    than pretending otherwise. "Not a superkey" has no metadata behind it, since Parquet carries no keys -- its
+    effect falls out of the reduction test instead. Condition 5's second half, that a join between the two
+    positions multiplies rows, needs to know whether a build is unique on its key, which is a runtime fact; the
+    obvious plan-time proxy is **wrong**, and measurably so, because Q13's join takes 150,000 rows to 1,500,000
+    and emits 1,500,000, multiplying nothing at all, while the rewrite is still worth 0.494x there -- what
+    shrinks is the build and the final grouping's input, not the join's output. And condition 6 is a property of
+    the physical plan, since ADR 0029's filters are attached long after this runs.
+  - **An unknown estimate is a refusal, and the direction matters.** This quantity sits where a *small* value
+    argues for a rewrite, so an unknown group count must argue against one -- the mirror of the lesson ADR 0022's
+    2026-10-22 update records, where an unknown domain divides and so had to stop reading as the largest.
+  - **A LEFT JOIN carries no row estimate**: the binder keeps one only for the joins its order search ranked, so
+    the gate computes its own by ADR 0022's rule 3, locally. Changing what `EstimateRows` answers for a join
+    would move `ChooseBuildSide`, which is ADR 0026's decision and not this item's.
+- **G2b, perf(plan,exec): perform the rewrite behind the gate.** Measured at SF 100 with peak memory beside time,
+  interleaved and rotated, on Q13 with the other 21 as the control. The gate's refusals are tested by
   construction, each with the query shape that must be refused and why.
 - **G3, docs(adr): record what G1 and G2 measured**, and either accept this ADR or defer it with the numbers.
 

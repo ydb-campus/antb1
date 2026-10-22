@@ -182,6 +182,22 @@ int64_t PredicateRows(int64_t rows, const Predicate& predicate, const ColumnRang
 // The rows of a binding: a table's exact row count, a sub-plan's estimate (EstimateRows).
 std::optional<int64_t> RelationRows(const Binding& binding);
 
+// The distinct values a grouping of `columns` over `node` would produce -- the groups a
+// pre-aggregation there would build (docs/adr/0032-aggregate-placement.md's gate). The product of
+// each column's KeyDomain, saturated, capped at the node's own estimated rows, since a grouping
+// cannot make more groups than it reads rows.
+//
+// **std::nullopt where any column's domain is unknown, and a caller must read that as "no reduction
+// known" and not as a small number.** This quantity sits where a *small* value argues for a
+// rewrite, so the direction an unknown must not take is the favourable one -- the mirror of
+// BlockDomain's lesson one screen up, and of BlockRows's the other way again. A column no Scan of
+// `node` defines, which is every computed one, is unknown by the same rule.
+//
+// The product assumes the columns vary independently, which over-states the groups of a correlated
+// pair; over-stating argues *against* a rewrite, so it errs the safe way for this caller. The cap
+// is what keeps it from arguing against one absurdly.
+std::optional<int64_t> DistinctValues(const LogicalNode& node, std::span<const ColumnId> columns);
+
 // The rows a plan's node outputs, estimated from footer row counts: a Scan's table's, one for an
 // ungrouped Aggregate and a RowCount, its input's for any other single-input node (an upper bound),
 // and a Join's own `estimate`, which the binder kept there because the domains rule 3 divides by

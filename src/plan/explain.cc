@@ -219,6 +219,10 @@ SharedNotes NotesOf(const LogicalPlan& plan) {
     if (placement.needs_identity) {
       note += ", padding";
     }
+    note += std::format(", {}", ToString(placement.verdict));
+    if (placement.rows_below.has_value() && placement.groups.has_value()) {
+      note += std::format(" {}->{}", *placement.rows_below, *placement.groups);
+    }
     // Appended, not assigned: a node can be both a member of a shared group and a placement, and
     // ADR 0030's E1 promises a note on every member of every group.
     notes[placement.aggregate.get()] += note + "]";

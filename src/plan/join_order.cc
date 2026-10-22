@@ -7,6 +7,8 @@
 #include <limits>
 #include <optional>
 #include <span>
+#include <unordered_map>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -884,5 +886,52 @@ std::optional<int64_t> RelationRows(const Binding& binding) {
 }
 
 std::optional<int64_t> EstimateRows(const LogicalNode& node) { return std::visit(RowsOf{}, node); }
+
+namespace {
+
+// Every column a Scan below `node` defines, as its table and field: the only columns whose domain
+// the footers can give. Collected rather than looked up one at a time because one walk answers for
+// every column of a pre-grouping.
+void ScannedColumns(const LogicalNode& node,
+                    std::unordered_map<ColumnId, std::pair<const Table*, int>>& out) {
+  if (const auto* scan = std::get_if<ScanNode>(&node)) {
+    for (std::size_t i = 0; i < scan->ids.size() && i < scan->fields.size(); ++i) {
+      if (scan->ids[i] != kNoColumnId && scan->table != nullptr) {
+        out.emplace(scan->ids[i], std::pair(scan->table.get(), scan->fields[i]));
+      }
+    }
+    return;
+  }
+  for (const LogicalNodePtr& input : InputsOf(node)) {
+    if (input != nullptr) {
+      ScannedColumns(*input, out);
+    }
+  }
+}
+
+}  // namespace
+
+std::optional<int64_t> DistinctValues(const LogicalNode& node, std::span<const ColumnId> columns) {
+  if (columns.empty()) {
+    return std::nullopt;
+  }
+  std::unordered_map<ColumnId, std::pair<const Table*, int>> scanned;
+  ScannedColumns(node, scanned);
+  Int128 product = 1;
+  for (const ColumnId column : columns) {
+    const auto found = scanned.find(column);
+    if (found == scanned.end() || found->second.first == nullptr) {
+      return std::nullopt;  // computed, or from no Scan of this subtree
+    }
+    const std::optional<int64_t> domain = KeyDomain(*found->second.first, found->second.second);
+    if (!domain.has_value()) {
+      return std::nullopt;
+    }
+    product = Multiplied(product, std::max<int64_t>(*domain, 1));
+  }
+  const int64_t groups = Saturated(product);
+  const std::optional<int64_t> rows = EstimateRows(node);
+  return rows.has_value() ? std::min(groups, std::max<int64_t>(*rows, 1)) : groups;
+}
 
 }  // namespace antb1::plan
