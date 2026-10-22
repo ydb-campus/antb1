@@ -206,8 +206,10 @@ SharedNotes NotesOf(const LogicalPlan& plan) {
     }
   }
   // A note on every grouped aggregate that could be computed on one input of the join it reads
-  // (docs/adr/0032-aggregate-placement.md, G1). Nothing is rewritten: this reports what a later
-  // item could exchange, and what that side would have to be grouped by for the answer to hold.
+  // (docs/adr/0032-aggregate-placement.md). `Optimize` performs the ones the gate calls worth, so
+  // on an optimized plan this reports what is LEFT -- which is why a note with a refusing verdict
+  // can sit above a partial the exchange already built: it says that nothing more is worth doing
+  // there, and the verdict says why.
   for (const AggregatePlacement& placement : AggregatePlacements(plan)) {
     std::string note =
         std::format("  [groupable below the {} join, {} key{}",

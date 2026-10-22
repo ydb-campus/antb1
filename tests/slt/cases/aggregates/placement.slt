@@ -1,0 +1,274 @@
+# A grouped aggregate computed on one input of the join it reads (docs/adr/0032-aggregate-placement.md). The
+# rewrite is invisible in SQL -- it changes no answer, which is the whole of what these cases check. Each one
+# below is a shape the gate admits, so each really is answered by the exchanged plan and not by the written one --
+# `antb1 explain` shows two GroupAggregate nodes where the query has one, and that was checked for each rather
+# than assumed: the first attempt at the condition 3 case grouped by a column of 3000 distinct values, which the
+# gate refuses for making one group a row, so it was answered by the written plan and proved nothing. The
+# refusals at the end are here because a rewrite that fired on them would answer differently.
+
+# ---- the inputs, so a wrong exchange cannot hide in a shape nobody checked ----
+
+query I nosort
+SELECT COUNT(*) FROM trips
+----
+3000
+
+# Every zone is picked up from, so no row of `zones` goes unmatched -- which is why nothing below needs the
+# padding of condition 5: the side being grouped here is `trips`, the preserved one.
+query I nosort
+SELECT COUNT(*) FROM zones WHERE zn_id NOT IN (SELECT tr_pickup FROM trips)
+----
+0
+
+# ---- shapes the exchange takes ----
+
+# SUM of the aggregated side, grouped by a column of the other. The sum of partial sums is the sum.
+query ID nosort
+SELECT zn_city, SUM(tr_fare) FROM trips LEFT JOIN zones ON tr_pickup = zn_id GROUP BY zn_city ORDER BY zn_city
+----
+1	8401.75
+2	8432.75
+3	7356.00
+4	7328.75
+5	8320.50
+9	1016.00
+NULL	4136.75
+
+# MIN and MAX together, which merge by taking the same function of the partials.
+query IDD nosort
+SELECT zn_city, MIN(tr_fare), MAX(tr_fare) FROM trips LEFT JOIN zones ON tr_pickup = zn_id
+GROUP BY zn_city ORDER BY zn_city
+----
+1	3.50	27.50
+2	3.50	27.50
+3	3.50	27.50
+4	3.50	27.50
+5	3.50	27.50
+9	3.50	27.50
+NULL	3.50	27.50
+
+# Two grouping columns, both from the far side, so the pre-grouping is the join key alone.
+query IRD nosort
+SELECT zn_city, zn_radius, SUM(tr_fare) FROM trips LEFT JOIN zones ON tr_pickup = zn_id
+GROUP BY zn_city, zn_radius ORDER BY zn_city, zn_radius
+----
+1	0.5	1075.00
+1	1.25	1042.75
+1	1.75	1025.50
+1	2	1042.25
+1	2.5	1052.75
+1	3	1070.50
+1	3.25	1045.50
+1	NULL	1047.50
+2	0.5	1001.50
+2	0.75	1063.50
+2	1	1061.50
+2	1.5	1047.75
+2	2	1034.00
+2	2.25	1056.25
+2	2.75	1091.00
+2	3.25	1077.25
+3	1	1077.50
+3	1.25	1025.75
+3	1.75	999.75
+3	2.25	1023.75
+3	2.5	1093.25
+3	3	1069.00
+3	NULL	1067.00
+4	0.75	1079.75
+4	1.25	1044.25
+4	1.5	1015.50
+4	2	1026.00
+4	2.5	1036.50
+4	2.75	1057.50
+4	3.25	1069.25
+5	0.5	1050.25
+5	1	1045.25
+5	1.25	1021.50
+5	1.5	1031.50
+5	1.75	1022.50
+5	2.25	1040.00
+5	2.75	1050.50
+5	3	1059.00
+9	NULL	1016.00
+NULL	0.75	1033.50
+NULL	NULL	3103.25
+
+# A grouping column of the AGGREGATED side, which condition 3 puts into the pre-grouping: the partial groups the
+# trips by their promo as well as by the join key, or its groups would merge rows this query separates. This is
+# the condition whose omission changes aggregate values rather than row counts, so it is the one case here that
+# has to be answered by the exchange -- `keys=[trips.tr_pickup, trips.tr_promo]` below the join.
+query IID nosort
+SELECT zn_city, tr_promo, SUM(tr_fare) FROM trips LEFT JOIN zones ON tr_pickup = zn_id
+GROUP BY zn_city, tr_promo ORDER BY zn_city, tr_promo
+----
+1	1	37.25
+1	2	49.50
+1	3	19.50
+1	4	58.25
+1	NULL	8237.25
+2	1	34.75
+2	2	32.25
+2	3	56.25
+2	4	69.75
+2	NULL	8239.75
+3	1	47.50
+3	2	31.50
+3	3	25.50
+3	4	54.75
+3	NULL	7196.75
+4	1	40.50
+4	2	53.00
+4	3	14.00
+4	4	30.00
+4	NULL	7191.25
+5	1	51.00
+5	2	45.00
+5	3	37.75
+5	4	27.00
+5	NULL	8159.75
+9	3	14.50
+9	NULL	1001.50
+NULL	1	19.75
+NULL	2	15.00
+NULL	3	25.50
+NULL	4	7.50
+NULL	NULL	4069.00
+
+# A filter on the grouped side, which the planner pushes below the join and so below the partial: the partial
+# must aggregate the rows that survive it, not the rows the table holds. The first case above already shows
+# that unmatched trips survive, as its NULL group.
+query ID nosort
+SELECT zn_city, SUM(tr_fare) FROM trips LEFT JOIN zones ON tr_pickup = zn_id
+WHERE tr_fare > 10 GROUP BY zn_city ORDER BY zn_city
+----
+1	7378.50
+2	7416.00
+3	6467.25
+4	6440.75
+5	7314.75
+9	894.75
+NULL	3627.50
+
+# ---- the padding shape: the grouped side is the one that can go missing ----
+
+# A self-join whose right side is grouped, so a left row with no match reads no partial at all. For SUM and MAX
+# the written query answered NULL there, which is already what an aggregate of a missing partial gives -- which
+# is why the exchange builds no mapping. This is the shape ADR 0032 exists for, and the only one here where
+# `needs_identity` is set.
+query TDD nosort
+SELECT a.tr_day, SUM(b.tr_fare), MAX(b.tr_fare) FROM trips a LEFT JOIN trips b ON a.tr_pickup = b.tr_dropoff
+GROUP BY a.tr_day ORDER BY a.tr_day
+----
+2026-03-01	93295.75	27.50
+2026-03-02	93094.50	27.50
+2026-03-03	93128.25	27.50
+2026-03-04	94215.50	27.50
+2026-03-05	93073.25	27.50
+2026-03-06	93326.25	27.50
+2026-03-07	93058.75	27.50
+2026-03-08	92326.25	27.50
+2026-03-09	93114.00	27.50
+2026-03-10	92111.25	27.50
+2026-03-11	93255.75	27.50
+2026-03-12	92129.00	27.50
+2026-03-13	93145.75	27.50
+2026-03-14	93074.25	27.50
+2026-03-15	94222.00	27.50
+2026-03-16	94212.25	27.50
+2026-03-17	93067.25	27.50
+2026-03-18	93427.50	27.50
+2026-03-19	93135.25	27.50
+2026-03-20	92255.25	27.50
+2026-03-21	92035.25	27.50
+2026-03-22	92134.75	27.50
+2026-03-23	93119.50	27.50
+2026-03-24	92047.25	27.50
+2026-03-25	93237.75	27.50
+2026-03-26	93084.25	27.50
+2026-03-27	91122.25	27.50
+2026-03-28	92033.00	27.50
+2026-03-29	92052.50	27.50
+2026-03-30	92189.50	27.50
+2026-03-31	92074.75	27.50
+NULL	79340.25	27.50
+
+# The same with every group unmatched, so every row must come back NULL: if a missing partial were read as
+# anything else, this block is where it would show.
+query TDD nosort
+SELECT a.tr_day, SUM(b.tr_fare), MAX(b.tr_fare) FROM trips a LEFT JOIN trips b ON a.tr_pickup = b.tr_dropoff
+WHERE a.tr_pickup > 40 GROUP BY a.tr_day ORDER BY a.tr_day
+----
+2026-03-01	NULL	NULL
+2026-03-02	NULL	NULL
+2026-03-03	NULL	NULL
+2026-03-04	NULL	NULL
+2026-03-05	NULL	NULL
+2026-03-06	NULL	NULL
+2026-03-07	NULL	NULL
+2026-03-08	NULL	NULL
+2026-03-09	NULL	NULL
+2026-03-10	NULL	NULL
+2026-03-11	NULL	NULL
+2026-03-12	NULL	NULL
+2026-03-13	NULL	NULL
+2026-03-14	NULL	NULL
+2026-03-15	NULL	NULL
+2026-03-16	NULL	NULL
+2026-03-17	NULL	NULL
+2026-03-18	NULL	NULL
+2026-03-19	NULL	NULL
+2026-03-20	NULL	NULL
+2026-03-21	NULL	NULL
+2026-03-22	NULL	NULL
+2026-03-23	NULL	NULL
+2026-03-24	NULL	NULL
+2026-03-25	NULL	NULL
+2026-03-26	NULL	NULL
+2026-03-27	NULL	NULL
+2026-03-28	NULL	NULL
+2026-03-29	NULL	NULL
+2026-03-30	NULL	NULL
+2026-03-31	NULL	NULL
+NULL	NULL	NULL
+
+# ---- shapes the exchange declines, whose answers must be the written ones ----
+
+# A count beside the sum: summing partial counts returns HUGEINT where COUNT returns BIGINT, so the exchange
+# has nothing to say the plan can express and leaves the query alone.
+query IDI nosort
+SELECT zn_city, SUM(tr_fare), COUNT(*) FROM trips LEFT JOIN zones ON tr_pickup = zn_id
+GROUP BY zn_city ORDER BY zn_city
+----
+1	8401.75	559
+2	8432.75	559
+3	7356.00	490
+4	7328.75	489
+5	8320.50	558
+9	1016.00	69
+NULL	4136.75	276
+
+# AVG, whose partial is a pair and whose final divides.
+query IR nosort
+SELECT zn_city, AVG(tr_fare) FROM trips LEFT JOIN zones ON tr_pickup = zn_id GROUP BY zn_city ORDER BY zn_city
+----
+1	15.558796296296297
+2	15.558579335793358
+3	15.518987341772151
+4	15.461497890295359
+5	15.436920222634509
+9	15.164179104477611
+NULL	15.493445692883896
+
+# An aggregate reading both inputs, which no single side can compute.
+query IR nosort
+SELECT zn_city, SUM(tr_fare + zn_radius) FROM trips LEFT JOIN zones ON tr_pickup = zn_id
+GROUP BY zn_city ORDER BY zn_city
+----
+1	8314
+2	9383.75
+3	7083.25
+4	8276.75
+5	9263
+9	NULL
+NULL	1083.75

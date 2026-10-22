@@ -3,10 +3,12 @@
 #include <algorithm>
 #include <cstddef>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -340,6 +342,157 @@ std::string_view ToString(AggregatePlacement::Verdict verdict) {
       return "unknown";
   }
   return "unknown";
+}
+
+namespace {
+
+ColumnId Mint(ColumnId& last_id) {
+  last_id = ColumnId{std::to_underlying(last_id) + 1};
+  return last_id;
+}
+
+// Every kind this exchange performs computes the same call on both sides: a partial SUM is summed,
+// a partial MIN is minimised. A count is the one that differs -- a count below, a SUM of counts
+// above -- and since a count is refused here until a kind exists that can merge one (ADR 0032's
+// G2c), there is no mapping left to write. The full table is in that ADR's Decision.
+// A BoundColumn for `id`, from the columns of the plan that already name it.
+struct Columns {
+  std::unordered_map<ColumnId, BoundColumn> by_id;
+
+  void Note(const BoundColumn& column) {
+    if (column.id != kNoColumnId) {
+      by_id.emplace(column.id, column);
+    }
+  }
+  [[nodiscard]] std::optional<BoundColumn> Of(ColumnId id) const {
+    const auto found = by_id.find(id);
+    return found == by_id.end() ? std::nullopt : std::optional<BoundColumn>(found->second);
+  }
+};
+
+// One placement performed, or nullopt where this declines to build it.
+std::optional<LogicalNodePtr> Exchange(const AggregatePlacement& placement, ColumnId& last_id) {
+  const auto& aggregate = std::get<GroupAggregateNode>(*placement.aggregate);
+  const auto* join = std::get_if<JoinNode>(placement.join.get());
+  if (join == nullptr || aggregate.input != placement.join) {
+    return std::nullopt;  // a Compute between the two: the expression would have to travel down
+  }
+  // The finder refuses a residual before this runs; re-checked because it is the one assumption
+  // whose future relaxation would reach the builder, where the pre-grouping destroys exactly the
+  // per-row values a residual reads.
+  if (!join->residual.empty()) {
+    return std::nullopt;
+  }
+  // Refused for now, each because the plan cannot yet say what the rewrite needs:
+  //
+  //   - kAvg, whose partial is a (SUM, COUNT) pair and whose final divides, so the exchange would
+  //     change the node's output arity.
+  //   - the counts, and this one is the interesting refusal. A count decomposes into a count below
+  //     and a SUM of counts above -- and an integer SUM returns HUGEINT, by the rule that keeps it
+  //     from wrapping at int64 (AGENTS.md, ADR 0021), while COUNT's own output is BIGINT. So the
+  //     honest final has a type the query did not ask for, and a plan cannot narrow it back: a
+  //     CastExpr is an exact widening only. Summing partial counts needs a kind of its own, whose
+  //     result is BIGINT and which cannot overflow one because it is bounded by the rows counted.
+  //     **This is the refusal that matters**: the one placement the gate admits across the 22 is a
+  //     count, so the rewrite currently fires on none of them.
+  if (std::ranges::any_of(aggregate.aggregates, [](const AggregateCall& call) {
+        return call.kind == AggKind::kAvg || call.kind == AggKind::kCountStar ||
+               call.kind == AggKind::kCount;
+      })) {
+    return std::nullopt;
+  }
+  // Every column the pre-grouping names, as the plan already describes it.
+  Columns known;
+  for (const JoinKey& key : join->keys) {
+    known.Note(key.left);
+    known.Note(key.right);
+  }
+  for (const BoundColumn& key : aggregate.keys) {
+    known.Note(key);
+  }
+  GroupAggregateNode partial{.input = placement.left_is_aggregated ? join->left : join->right,
+                             .keys = {},
+                             .key_ids = {},
+                             .aggregates = {},
+                             .span = aggregate.span};
+  // A grouped aggregate DEFINES its key outputs, so each takes a fresh id and everything above the
+  // join that read the old one is pointed at the new. Only the join's own key on this side and the
+  // final aggregate's keys can read one -- by condition 3 those are the only aggregated-side
+  // columns it groups by -- since its calls read the partials instead.
+  std::unordered_map<ColumnId, ColumnId> renamed;
+  for (const ColumnId id : placement.pre_grouping) {
+    const std::optional<BoundColumn> column = known.Of(id);
+    if (!column.has_value()) {
+      return std::nullopt;  // a column this cannot name is one it cannot group by
+    }
+    partial.keys.push_back(*column);
+    partial.key_ids.push_back(Mint(last_id));
+    renamed.emplace(id, partial.key_ids.back());
+  }
+  const auto rename = [&renamed](BoundColumn& column) {
+    if (const auto found = renamed.find(column.id); found != renamed.end()) {
+      column.id = found->second;
+    }
+  };
+  // The partial calls, each with an id of its own, and the finals that read them.
+  std::vector<AggregateCall> finals;
+  finals.reserve(aggregate.aggregates.size());
+  for (const AggregateCall& call : aggregate.aggregates) {
+    AggregateCall below = call;
+    below.id = Mint(last_id);
+    partial.aggregates.push_back(below);
+    AggregateCall above = call;  // keeps the original id, so nothing above this changes
+    above.arg =
+        BoundColumn{.index = 0,
+                    .id = below.id,
+                    .name = call.arg.has_value() ? call.arg->name : std::string("count_star()"),
+                    .type = below.type};
+    finals.push_back(above);
+  }
+  JoinNode over = *join;
+  for (JoinKey& key : over.keys) {
+    rename(placement.left_is_aggregated ? key.left : key.right);
+  }
+  (placement.left_is_aggregated ? over.left : over.right) =
+      std::make_shared<const LogicalNode>(std::move(partial));
+  LogicalNodePtr input = std::make_shared<const LogicalNode>(std::move(over));
+
+  // No padding is built, and with the counts refused none is needed: `needs_identity` says a
+  // preserved row may find no partial, and the value the written query gave such a row is NULL for
+  // every kind this performs -- which is already what an aggregate of a NULL partial answers. Only
+  // a count wants something else there (1 for COUNT(*), 0 for COUNT(col)), so the mapping arrives
+  // with the kind that makes a count exchangeable at all, and not before it can be reached.
+  GroupAggregateNode final = aggregate;
+  final.input = std::move(input);
+  final.aggregates = std::move(finals);
+  for (BoundColumn& key : final.keys) {
+    rename(key);
+  }
+  return std::make_shared<const LogicalNode>(std::move(final));
+}
+
+}  // namespace
+
+LogicalNodePtr ExchangeAggregates(const LogicalNodePtr& root, ColumnId& last_id) {
+  if (root == nullptr) {
+    return root;
+  }
+  std::vector<LogicalNodePtr> inputs = InputsOf(*root);
+  bool changed = false;
+  for (LogicalNodePtr& input : inputs) {
+    LogicalNodePtr rewritten = ExchangeAggregates(input, last_id);
+    changed = changed || rewritten != input;
+    input = std::move(rewritten);
+  }
+  LogicalNodePtr here = changed ? WithInputs(*root, std::move(inputs)) : root;
+  if (const std::optional<AggregatePlacement> placement = PlacementOf(here);
+      placement.has_value() && placement->verdict == AggregatePlacement::Verdict::kWorth) {
+    if (std::optional<LogicalNodePtr> exchanged = Exchange(*placement, last_id);
+        exchanged.has_value()) {
+      return *exchanged;
+    }
+  }
+  return here;
 }
 
 std::vector<AggregatePlacement> AggregatePlacements(const LogicalPlan& plan) {

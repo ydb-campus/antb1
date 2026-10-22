@@ -20,6 +20,7 @@
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/sql_status.h"
 
+#include "aggregate_placement.h"
 #include "join_order.h"
 #include "key_type.h"
 
@@ -1070,6 +1071,12 @@ arrow::Result<LogicalPlan> Optimize(const LogicalPlan& plan, const BindOptions& 
   }
   ARROW_ASSIGN_OR_RAISE(LogicalNodePtr root, Unnest(plan.root, options.build_side_ratio));
   root = LimitBelowProject(DependentKeys(CountStarToRowCount(root), /*limited=*/false));
+  // A grouped aggregate computed on one input of the join it reads, where the gate admits it
+  // (docs/adr/0032-aggregate-placement.md's G2b). After the unnesting, so that a correlated
+  // subquery's own aggregate is a candidate too, and before Prune, which then drops the columns
+  // the aggregated side no longer has to carry.
+  ColumnId last_exchanged = MaxColumnId(*root);
+  root = ExchangeAggregates(root, last_exchanged);
   const std::vector<ColumnId> output = OutputIds(*root);
   root = Prune(root, Needed(output.begin(), output.end()));
   // A dependent join that Unnest left behind is a bug in the pass, never an unsupported query: no
