@@ -1165,6 +1165,26 @@ TEST_F(PartOperatorsTest, TopNKeepsEachPartsFirstRows) {
     ExecContext ctx{.pool = arrow::default_memory_pool(), .batch_size = 3};
     return Drain(op, ctx);
   };
+  // And the reference's own reference, so that a fault of the sort buffer both share shows: x of
+  // the window [offset, offset + limit) of the table's rows stably sorted by y (x, NULL where x is
+  // a multiple of 5).
+  const auto model = [](int64_t limit, int64_t offset, bool descending, bool nulls_first) {
+    std::vector<int64_t> xs(static_cast<std::size_t>(kParts * kRows));
+    std::ranges::iota(xs, int64_t{0});
+    const auto null = [](int64_t x) { return x % 5 == 0; };
+    std::ranges::stable_sort(xs, [&](int64_t a, int64_t b) {
+      if (null(a) || null(b)) {
+        return null(a) != null(b) && null(a) == nulls_first;
+      }
+      return descending ? a > b : a < b;
+    });
+    std::vector<std::optional<int64_t>> window;
+    for (auto i = static_cast<std::size_t>(std::min<int64_t>(offset, kParts * kRows));
+         i < xs.size() && std::cmp_less(i - static_cast<std::size_t>(offset), limit); ++i) {
+      window.emplace_back(xs[i]);
+    }
+    return window;
+  };
   for (const auto& [limit, offset] :
        std::vector<std::pair<int64_t, int64_t>>{{1, 0},
                                                 {5, 3},
@@ -1181,6 +1201,8 @@ TEST_F(PartOperatorsTest, TopNKeepsEachPartsFirstRows) {
         ASSERT_TRUE(serial.ok() && one_thread.ok() && four_threads.ok())
             << serial.status().ToString() << one_thread.status().ToString()
             << four_threads.status().ToString();
+        EXPECT_EQ(Int64Column(**serial), model(limit, offset, descending, nulls_first))
+            << limit << " " << offset << " " << descending << " " << nulls_first;
         EXPECT_TRUE(SameRows(**one_thread, **serial)) << limit << " " << offset;
         EXPECT_TRUE(SameRows(**four_threads, **one_thread)) << limit << " " << offset;
       }

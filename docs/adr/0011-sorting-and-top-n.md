@@ -61,6 +61,47 @@ Accepted (with the maintainer-approved plan for GROUP BY, ORDER BY and COUNT(DIS
   them reading 59 and 52 of 226 parts; they were the only queries of the 43 to move outside a ±8% band and none was
   slower.
 
+- **A sort buffer takes each chunk's column arrays once** (amended 2026-10-23): `Slice` asked every chunk for every
+  column it gathered (`RecordBatch::column`, which locks the batch and counts a reference) on every batch the sort
+  emits, so a sort without a limit over many small chunks, such as a selective filter's output over many files, made
+  output batches × chunks × columns of those calls. The buffer now keeps, per column, every chunk's array, taken from
+  the batch's own list (`RecordBatch::columns`: Arrow boxes each column once and keeps it while the batch lives) as
+  the chunk arrives, and `Slice` gathers from those lists, as a hash join's gathers do since
+  [ADR 0013](0013-parallel-execution.md)'s amendment of the same date. The lists change only together with the chunks
+  (in `Add`, `Compact` and `Merge`, through `PushChunk` and `ClearChunks`), so no `Add`, compaction or merge can leave
+  them naming a chunk the buffer dropped, and `Slice` checks that they cover every chunk. They hold 8 bytes per chunk
+  and column, which `memory_usage` counts by capacity like the buffer's other containers. `Merge` now also refuses to
+  merge a buffer into itself and empties `other` before it adds `other`'s rows, so an `Add` that fails part-way
+  leaves `other` empty instead of sorted over chunks it no longer holds.
+  - Full sorts (no `LIMIT`), main ed88789 against the change, on a 2-socket, 64-core host (128 hardware threads): two
+    frozen release builds, two rounds with the arm order alternating per point and per round, in each round one
+    process per build and point with 3 tries (2 for the 1/6 filter over 100 files), the page cache checked resident,
+    both builds of a point measured back to back with at most 0.81 cores of other load. Each figure is the whole
+    query's time, the best of a build's 6 tries at a point over both rounds (4 for the 1/6 filter over 100 files).
+    Over TPC-H-derived lineitem (sf100, 100 files), a filter keeping about 1/30 of the rows leaves 9,800 chunks: the
+    query sorting 6 of its columns took 11.381 → 10.190 s at 16 threads and 10.705 → 9.447 s at 64, the same with
+    the sort key in file order 6.795 → 5.624 s and 5.346 → 4.104 s, and 2 integer columns 6.536 → 6.171 s at 16. A
+    filter keeping about 1/6 (6 columns, 9,800 chunks): 48.026 → 43.308 s at 16 threads and 51.113 → 43.590 s at 64;
+    the same filter over 20 of the files (1,960 chunks) 7.797 → 7.586 s at 16. In each of these the change's slowest
+    try beat main's fastest. (This workload is derived from the TPC-H Benchmark and is not comparable to published
+    TPC-H Benchmark results, as this implementation does not comply with all requirements of the TPC-H Benchmark.)
+    Two columns of the ClickBench data unfiltered (1,668 chunks) read 15.383 → 15.223 s at 16 threads and
+    15.465 → 15.063 s at 64, inside the spread of tries.
+  - Over the TPC-H-derived sorts, each call removed (output batches × chunks × columns) saves about 130 user
+    instructions (101-140) and 53-66 ns at 16 threads, 69-84 ns at 64; the ClickBench sort's difference is inside its
+    spread of tries. Profiled (`explain --analyze`, one try in each of two processes per point; medians), the sort
+    operator's time outside its sort fell 5.299 → 3.771 s, 2.278 → 1.056 s and 27.001 → 20.513 s at 16 threads for
+    the three 6-column sorts over 9,800 chunks, and their counted peaks grew by exactly the lists' capacity: 786,576
+    bytes, 6 lists of 16,384 slots and the vector that holds them (of 1.92 GB for the 1/30 filter, of 9.60 GB for the
+    1/6).
+  - No regression where a sort emits at most one batch: the 22 TPC-H-derived queries total 50.090 → 50.140 s at 64
+    threads and 107.377 → 106.954 s at 16, ClickBench's 43 15.457 → 15.533 s and 34.588 → 34.605 s, with at most 2.3
+    cores of other load. The one query whose tries were all slower than main's, ClickBench Q29 at 16 threads (+13%,
+    one process per build), has no sort; four more processes per build, of 10 tries each, read 0.0446 → 0.0447 s
+    (the best of each build's 40 tries).
+  - A column that no typed gather covers (BOOLEAN among the engine's types) still goes through the slice gather,
+    which sets up a slot for every chunk on each call: O(chunks) per gather, in sorts and joins alike, as before.
+
 ## Consequences
 
 - Follow-up: a top-N over table parts reads the columns only the result needs for the result's rows alone

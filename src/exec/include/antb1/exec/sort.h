@@ -88,7 +88,9 @@ class SortBuffer {
 
   // Rows with the comparator's schema, without a selection.
   arrow::Status Add(std::shared_ptr<arrow::RecordBatch> rows, arrow::MemoryPool* pool);
-  // Moves the rows of `other` (same schema and keep) behind this buffer's rows.
+  // Moves the rows of `other` (another buffer of the same schema and keep) behind this buffer's
+  // rows. `other` is left empty and unsorted, like a new buffer, also when adding its rows fails; a
+  // merge it refuses (of a buffer into itself, or of another schema or keep) changes neither.
   arrow::Status Merge(SortBuffer& other, arrow::MemoryPool* pool);
   // Sorts the rows; afterwards num_rows() is at most keep.
   arrow::Status Sort(arrow::MemoryPool* pool);
@@ -106,22 +108,33 @@ class SortBuffer {
   // The number of rows (after Sort: the sorted rows).
   [[nodiscard]] int64_t num_rows() const { return rows_; }
   // The bytes held outside Arrow buffers (the rows' batches are counted by their pool): the
-  // per-chunk vectors and the sorted row references.
+  // per-chunk vectors (each chunk's key arrays), the per-column lists of every chunk's arrays and
+  // the sorted row references.
   [[nodiscard]] int64_t memory_usage() const;
   // At most the bytes Sort holds on top of memory_usage() while it sorts.
   [[nodiscard]] int64_t sort_memory() const;
-  // Rows [begin, end) of the sorted order as one batch; call after Sort.
+  // Rows [begin, end) of the sorted order as one batch, each column gathered from its arrays (taken
+  // once per chunk, as it arrived). Invalid unless the rows are sorted: after Sort, and after a
+  // compaction (Tighten, or an Add with `keep` past its slack), until the next Add of rows.
   [[nodiscard]] arrow::Result<std::shared_ptr<arrow::RecordBatch>> Slice(
       int64_t begin, int64_t end, arrow::MemoryPool* pool) const;
 
  private:
   // Sorts and, with `keep`, keeps only the first rows (as one chunk) and remembers the last one.
   arrow::Status Compact(arrow::MemoryPool* pool);
+  // The only places chunks_, chunk_keys_ and column_arrays_ change, so that they stay in step.
+  // ClearChunks empties all three and returns the chunks it took.
+  void PushChunk(std::shared_ptr<arrow::RecordBatch> rows, RowComparator::KeyArrays keys);
+  std::vector<std::shared_ptr<arrow::RecordBatch>> ClearChunks();
 
   RowComparator comparator_;
   std::optional<int64_t> keep_;
   std::vector<std::shared_ptr<arrow::RecordBatch>> chunks_;
   std::vector<RowComparator::KeyArrays> chunk_keys_;  // per chunk
+  // Per column, its array in every chunk, in chunk order: the batches' own
+  // (arrow::RecordBatch::columns), taken once as each chunk arrives, so that Slice gathers without
+  // asking every chunk for every column again (a lock and a reference count each).
+  std::vector<std::vector<const arrow::Array*>> column_arrays_;
   int64_t rows_ = 0;
   std::vector<RowRef> order_;        // after Sort
   std::optional<RowRef> threshold_;  // with keep: the last kept row after a compaction
