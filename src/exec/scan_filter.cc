@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -347,6 +348,19 @@ class KeyScanFilter final : public plan::ScanFilter {
       // A VARCHAR column, which MakeKeyScanFilter refuses: nothing to hash here.
       return arrow::Status::Invalid("a key scan filter needs a fixed-width column");
     }
+    // The row count first, because the loop below runs to it while `hashes` is sized from the
+    // array, and because a negative one would overflow the offset check's own subtraction. Then the
+    // offset, the bit of the batch's first row, which plan::ScanFilter documents and every caller
+    // gives: this is the one filter that does arithmetic on it, and `offset + row` is the bit
+    // ClearBit writes, so a negative offset -- or one so large that the sum wraps -- would clear a
+    // bit before the mask instead of in it.
+    if (values.rows < 0 || values.array->length() != values.rows) {
+      return arrow::Status::Invalid("a key scan filter was given ", values.rows, " rows of a ",
+                                    values.array->length(), "-row column");
+    }
+    if (offset < 0 || offset > std::numeric_limits<int64_t>::max() - values.rows) {
+      return arrow::Status::Invalid("a scan filter's offset is outside the selection: ", offset);
+    }
     // KeyHashes, not a hash of our own: the build hashed with it (JoinBuildPart's HashRows), and a
     // hash that differed by one bit would make the filter miss rows the join must keep.
     ARROW_ASSIGN_OR_RAISE(
@@ -359,6 +373,21 @@ class KeyScanFilter final : public plan::ScanFilter {
     // probe of Q16 at SF 100, scan time summed over parts: 1.443 s at 8 rows, 1.321 at 16, 1.228
     // at 32, 1.142 at 64, 1.125 at 128 and back up to 1.189 at 256, where the lines are evicted
     // before they are read.
+    //
+    // **It prefetches for every row, including rows another filter has already cleared, and that is
+    // not an oversight.** Where this filter shares a scan with pushed predicates
+    // (MakeBothScanFilters) most bits are clear by the time the key column arrives, so the obvious
+    // economy is to test the bit before issuing the prefetch. Measured, that is **1.010x over the
+    // 22 and 1.028x on the query it was meant to help** (7 repeats, interleaved and rotated, the
+    // guard the only change). A prefetch is a non-blocking hint whose line is evicted harmlessly if
+    // nothing reads it; the bitmap read needed to avoid issuing one is not. The lookup below is
+    // already behind the bit test, which is the half that pays.
+    //
+    // What is left on the table is the hashing, not the prefetching: KeyHashes runs over the whole
+    // array, so on that query it hashes 600,037,902 rows of which 148,067,261 are still selected --
+    // about 0.81 s summed over parts, 3% of the query. Taking it needs the selected values
+    // compacted before hashing and a threshold for when that is cheaper than hashing everything,
+    // which is its own change with its own measurement.
     constexpr int64_t kPrefetch = 128;
     int64_t dropped = 0;
     for (int64_t row = 0; row < values.rows; ++row) {
@@ -487,6 +516,75 @@ void Order(std::vector<int>& columns, std::vector<ColumnPredicates>& per_column)
   per_column = std::move(ordered);
 }
 
+// Both filters over one mask (MakeBothScanFilters).
+//
+// Its column list is the **union** of theirs and not the concatenation, because a ScanFilter names
+// each column it reads once (plan::ScanFilter, enforced by io's filtered scan) and the two may well
+// read the same one -- a predicate on a column that is also the join's key is the ordinary case,
+// and concatenating made every such scan fail. So each column of the union carries the position it
+// has in each child's own list, or none, and Apply drives whichever of the two reads it: both for a
+// shared column, which is sound because each only clears bits of the mask it is handed.
+class BothScanFilters : public plan::ScanFilter {
+ public:
+  BothScanFilters(std::shared_ptr<const plan::ScanFilter> first,
+                  std::shared_ptr<const plan::ScanFilter> second)
+      : first_(std::move(first)), second_(std::move(second)) {
+    const auto place = [this](const std::vector<int>& theirs, bool is_first) {
+      for (std::size_t i = 0; i < theirs.size(); ++i) {
+        const auto at = std::ranges::find(columns_, theirs[i]);
+        if (at == columns_.end()) {
+          columns_.push_back(theirs[i]);
+          in_first_.push_back(-1);
+          in_second_.push_back(-1);
+        }
+        const auto k =
+            Narrow<std::size_t>(std::ranges::find(columns_, theirs[i]) - columns_.begin());
+        (is_first ? in_first_ : in_second_)[k] = Narrow<int>(i);
+      }
+    };
+    place(first_->columns(), true);
+    place(second_->columns(), false);
+  }
+
+  [[nodiscard]] const std::vector<int>& columns() const override { return columns_; }
+
+  arrow::Status Apply(int column, const plan::ScanValues& values, int64_t offset,
+                      std::uint8_t* selected) const override {
+    if (column < 0 || std::cmp_greater_equal(column, columns_.size())) {
+      return arrow::Status::Invalid("a conjunction of scan filters has no column ", column);
+    }
+    const auto k = Narrow<std::size_t>(column);
+    // Each index is a position in that child's own column list, by construction. Both bounds are
+    // checked rather than asserted so that the position a child is handed is provably one of its
+    // own -- which is what its own Apply documents taking, and what a reader of either side can
+    // rely on without following the constructor.
+    ARROW_RETURN_NOT_OK(Dispatch(*first_, in_first_[k], values, offset, selected));
+    return Dispatch(*second_, in_second_[k], values, offset, selected);
+  }
+
+ private:
+  // `filter` applied for its own column `at`, or nothing where `at` is -1: this filter's column is
+  // not one that filter reads.
+  static arrow::Status Dispatch(const plan::ScanFilter& filter, int at,
+                                const plan::ScanValues& values, int64_t offset,
+                                std::uint8_t* selected) {
+    if (at < 0) {
+      return arrow::Status::OK();
+    }
+    if (std::cmp_greater_equal(at, filter.columns().size())) {
+      return arrow::Status::Invalid("a conjunction of scan filters names column ", at,
+                                    " of a filter that reads ", filter.columns().size());
+    }
+    return filter.Apply(at, values, offset, selected);
+  }
+
+  std::shared_ptr<const plan::ScanFilter> first_;
+  std::shared_ptr<const plan::ScanFilter> second_;
+  std::vector<int> columns_;    // the union, each position once
+  std::vector<int> in_first_;   // where each is in first_->columns(), or -1
+  std::vector<int> in_second_;  // and in second_->columns()
+};
+
 }  // namespace
 
 bool PushableToScan(const plan::Predicate& predicate) {
@@ -560,6 +658,14 @@ arrow::Result<std::shared_ptr<const plan::ScanFilter>> MakeScanFilter(
   Order(columns, per_column);
   return std::make_shared<const PredicateScanFilter>(std::move(columns), std::move(per_column),
                                                      pool);
+}
+
+arrow::Result<std::shared_ptr<const plan::ScanFilter>> MakeBothScanFilters(
+    std::shared_ptr<const plan::ScanFilter> first, std::shared_ptr<const plan::ScanFilter> second) {
+  if (first == nullptr || second == nullptr) {
+    return arrow::Status::Invalid("a conjunction of scan filters without both of them");
+  }
+  return std::make_shared<const BothScanFilters>(std::move(first), std::move(second));
 }
 
 }  // namespace antb1::exec

@@ -198,10 +198,15 @@ TEST_F(AggregateFilterTest, CarriesThroughAFilterItCannotPush) {
 }
 
 // The limitation the carry above stops at, pinned so that lifting it is a visible change. When the
-// Filter's predicates go into the scan instead (ADR 0020), they hold the one filter slot a scan
-// takes, and the published keys have nowhere to attach. Lifting this needs a scan filter that is
-// the conjunction of two -- the predicates and the keys -- which is a decision of its own, not a
-// consequence of this one. The answer is right either way, which is why only the metric moves.
+// Filter's predicates go into the scan instead (ADR 0020), the scan is built in the planner's
+// FilterNode branch, and that branch reads the joins of the scan's own pipeline (D1) and not the
+// offer a join above the aggregate makes -- so the offer has nowhere to go.
+//
+// **It is no longer the filter slot that stops it.** A scan applies the conjunction of its pushed
+// predicates and a key filter (exec::MakeBothScanFilters), which is how D1 reaches such a scan; the
+// same conjunction would serve this offer, and extending the FilterNode branch to read it is the
+// change this test would make visible. The answer is right either way, which is why only the
+// metric moves.
 TEST_F(AggregateFilterTest, YieldsToPredicatesPushedIntoTheScan) {
   constexpr std::string_view kQuery =
       "SELECT COUNT(*) FROM (SELECT k, SUM(v) AS s FROM f WHERE v >= 0 GROUP BY k) AS g, d "
@@ -210,7 +215,7 @@ TEST_F(AggregateFilterTest, YieldsToPredicatesPushedIntoTheScan) {
   facts->set_claimed_rows(20'000'000);  // the share gate would admit it
   auto run = Execute(kQuery, facts, Dimension());
   ASSERT_TRUE(run.ok()) << run.status().ToString();
-  EXPECT_EQ(run->dropped, 0) << "a scan takes one filter and the pushed predicate holds it";
+  EXPECT_EQ(run->dropped, 0) << "the offer is not read where a scan's predicates are pushed";
 
   auto control = Execute(kQuery, Facts(), Dimension());
   ASSERT_TRUE(control.ok()) << control.status().ToString();

@@ -396,12 +396,38 @@ lesson of [ADR 0027](0027-string-views.md)'s S1, which was planned as a win whos
       nothing could reach before and which must still refuse, since a Filter does nothing to make the
       aggregate's own value safe to filter on; and the limitation the fix stops at, pinned so that lifting it is
       a visible change.
-    - **Still not carried: a Filter whose predicates go into the scan** (ADR 0020). They hold the one filter
-      slot a scan takes, so the published keys have nowhere to attach, and lifting that needs a `plan::ScanFilter`
-      that is the conjunction of two. Mechanical in principle -- a scan filter only clears bits of one shared
-      mask -- but it is a policy decision as much as a mechanism, because something has to choose between two
-      filters when only one slot exists, and which prunes more is not knowable at planning time. Left for its
-      own item, with a test standing on the current behaviour.
+    - **Carried 2026-10-23: a Filter whose predicates go into the scan** (ADR 0020). They used to hold the one
+      filter slot a scan takes, leaving the published keys nowhere to attach.
+      - **The policy decision this was left for does not have to be made.** The item asked which of two filters
+        to choose when only one slot exists, "and which prunes more is not knowable at planning time". The answer
+        is to choose neither: `exec::MakeBothScanFilters` applies their conjunction, which the interface already
+        allowed -- a `ScanFilter` only ever *clears* bits of the mask it is handed, so running both in either
+        order leaves the rows that pass both, and neither has to know what the other did.
+      - **And the cost this item feared is already paid.** The 9% regression measured above came from a scan that
+        the *always-true predicate* had switched to the filtered decoder (13% of it) plus the filter itself
+        (87%). A scan that reaches this case has real pushed predicates, so it was decoding with a filter
+        already: the key filter adds its own per-row cost against join work it can only reduce.
+      - **Measured** at SF 100, 4 threads, 3 repeats, arms interleaved: the 22 go **0.992x** in geomean and
+        0.991x in total, with **no query slower** (the worst is 1.003x, inside its own spread, and the query that
+        lost 9% above is unchanged at 1.000x). The two that gain are 0.958x and 0.976x. On the first, the probe
+        falls from 148,067,261 rows to 11,488,814 -- `key_dropped=136,578,447` -- and its join's `find` from
+        2.936 s to 728 ms, while its scan goes 15.926 s to 17.181 s summed: **a 92% row prune is worth 4% and not
+        more**, because reading the rows is the cost a row filter cannot avoid and that scan is the query.
+      - **Two economies that look obvious over a shared scan, measured.** The filter now often runs after a
+        predicate has cleared most bits, so both of these were put to the 22:
+        - **Testing the bit before issuing the prefetch is 1.010x, and 1.028x on the query it was for** (7
+          repeats, interleaved and rotated). A prefetch is a non-blocking hint whose line is evicted harmlessly;
+          the bitmap read that avoids issuing one is not. A single run had said 0.976x, which is what three
+          repeats are worth on a sub-5% effect. Not done, and recorded at the loop so it is not retried blind.
+        - **Hashing only the selected rows is worth about 3%** on that query -- `KeyHashes` runs over the whole
+          array, 600,037,902 rows of which 148,067,261 are still selected, about 0.81 s summed over parts. It
+          needs the selected values compacted before hashing and a threshold for when that beats hashing
+          everything. **Deferred as its own item**, with that sizing as its trigger.
+      - **Not carried with it:** the filter a join above a grouped aggregate offers (D5) still yields to pushed
+        predicates, because it is offered in the scan's own branch of the planner and a scan with predicates is
+        built in the `FilterNode` branch. The same conjunction would serve it; it is not measured here, so it is
+        not done here. `src/exec/tests/aggregate_filter_test.cc`'s `YieldsToPredicatesPushedIntoTheScan` still
+        stands on that behaviour.
   - **The correctness condition is one sentence**: the filter is applied to a column the aggregate **groups by**,
     so it removes whole groups and never changes a surviving group's value. On any other column it would corrupt
     every aggregate. Mutation-checked -- dropping that requirement fails a test.

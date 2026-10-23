@@ -20,6 +20,7 @@
 
 #include "antb1/common/int128.h"
 #include "antb1/exec/filter.h"
+#include "antb1/exec/key_filter.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/table.h"
 
@@ -205,6 +206,81 @@ class ScanFilterTest : public testing::ExecTest {
     }
   }
 };
+
+// Two filters over one scan keep exactly the rows one filter over all of their predicates keeps,
+// however a table feeds the columns in (every piece size and bit offset the harness drives). That
+// is the property ADR 0029 deferred as "a plan::ScanFilter that is the conjunction of two", and it
+// holds because a ScanFilter only ever *clears* bits: neither filter has to know what the other
+// did, and the order they run in cannot matter.
+//
+// The pair is built from predicates here rather than from a key filter so that one expectation
+// covers both -- the rows a key filter keeps are a superset of a join's, which no predicate list
+// can state -- and MakeBothScanFilters does not know what it is composing.
+TEST_F(ScanFilterTest, TheConjunctionOfTwoKeepsWhatBothKeep) {
+  const auto batch = Batch();
+  const std::vector<std::vector<plan::Predicate>> halves = {
+      {testing::Compare(B(), CompareOp::kGe, testing::BigInt(1))},
+      {testing::Compare(B(), CompareOp::kLe, testing::BigInt(7))},
+      {Like(S(), "a%", /*negated=*/false)},
+      {testing::Compare(I(), CompareOp::kNe, Integer(3))},
+  };
+  for (std::size_t a = 0; a < halves.size(); ++a) {
+    for (std::size_t b = 0; b < halves.size(); ++b) {
+      if (a == b) {
+        continue;
+      }
+      const std::string what = std::format("halves {} and {}", a, b);
+      auto first = MakeScanFilter(halves[a], *batch->schema(), arrow::default_memory_pool());
+      ASSERT_TRUE(first.ok()) << what << ": " << first.status().ToString();
+      auto second = MakeScanFilter(halves[b], *batch->schema(), arrow::default_memory_pool());
+      ASSERT_TRUE(second.ok()) << what << ": " << second.status().ToString();
+      auto both = MakeBothScanFilters(*first, *second);
+      ASSERT_TRUE(both.ok()) << what << ": " << both.status().ToString();
+
+      // **Each column once**, which plan::ScanFilter requires and io's filtered scan enforces:
+      // concatenating the two lists repeated any column they both read -- a predicate on a column
+      // that is also the join's key, the ordinary case -- and every such scan failed to open.
+      std::vector<int> seen = (*both)->columns();
+      std::ranges::sort(seen);
+      EXPECT_EQ(std::ranges::unique(seen).begin(), seen.end()) << what << ": a column twice";
+      for (const int column : (*first)->columns()) {
+        EXPECT_NE(std::ranges::find((*both)->columns(), column), (*both)->columns().end()) << what;
+      }
+      for (const int column : (*second)->columns()) {
+        EXPECT_NE(std::ranges::find((*both)->columns(), column), (*both)->columns().end()) << what;
+      }
+
+      std::vector<plan::Predicate> all = halves[a];
+      all.insert(all.end(), halves[b].begin(), halves[b].end());
+      const std::vector<bool> expected = Expected(all, *batch);
+      for (const int64_t piece : {int64_t{1}, int64_t{3}, int64_t{64}}) {
+        for (const int64_t shift : {int64_t{0}, int64_t{5}}) {
+          EXPECT_EQ(Applied(**both, *batch, piece, shift), expected)
+              << what << " piece=" << piece << " shift=" << shift;
+        }
+      }
+    }
+  }
+  // Both are required: a conjunction of one is a programming error, not a filter.
+  auto one = MakeScanFilter(halves[0], *batch->schema(), arrow::default_memory_pool());
+  ASSERT_TRUE(one.ok());
+  EXPECT_TRUE(MakeBothScanFilters(*one, nullptr).status().IsInvalid());
+  EXPECT_TRUE(MakeBothScanFilters(nullptr, *one).status().IsInvalid());
+
+  // An offset outside the selection is refused rather than written through. The key filter is the
+  // one that computes a bit from it, and `offset + row` either side of the range would clear a bit
+  // outside the mask it was handed -- below it when negative, and when the sum wraps.
+  auto built = KeyFilter::Make(/*num_keys=*/8, /*budget=*/nullptr);
+  ASSERT_TRUE(built.ok()) << built.status().ToString();
+  auto keys = MakeKeyScanFilter(*built, 0);
+  ASSERT_TRUE(keys.ok()) << keys.status().ToString();
+  std::vector<std::uint8_t> mask(8, 0xFF);
+  const plan::ScanValues values{
+      .array = batch->column(0), .strings = {}, .validity = nullptr, .rows = batch->num_rows()};
+  EXPECT_TRUE((*keys)->Apply(0, values, -1, mask.data()).IsInvalid());
+  EXPECT_TRUE(
+      (*keys)->Apply(0, values, std::numeric_limits<int64_t>::max(), mask.data()).IsInvalid());
+}
 
 // Every pushed predicate kind, on every column type and NULL pattern, keeps exactly the rows the
 // Filter operator keeps.
