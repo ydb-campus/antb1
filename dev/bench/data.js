@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792735682426,
+  "lastUpdate": 1792742871600,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -20232,6 +20232,258 @@ window.BENCHMARK_DATA = {
             "value": 2465.0878970000176,
             "unit": "ms/iter",
             "extra": "iterations: 1\ncpu: 2464.7346029999967 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Aleksandr Khoroshilov",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f686360a2d590f723a226e72318f4bb9f283126b",
+          "message": "perf(plan): restrict a correlated aggregate to the keys its outer side binds (#225)\n\n## Summary\n\nADR 0023's Path 2 unnests a correlated scalar aggregate by equivalence\nsubstitution and is, in that\nADR's own words, **non-relevant**: the formalization's Lemma 4.2 puts a\nmap where the domain D was,\nwhich keeps the answer and drops the restriction D carried, \"because a\nmap restricts nothing\". So\nthe aggregation groups a whole table by a key the join above it barely\nreads.\n\nThe ADR defers the fix under its own name, with a trigger: *\"until\nprofiles of correlated aggregates\nor the divergence call for the semi-join reduction\"*. This fires that\ntrigger.\n\nMeasured at SF 100, 4 threads, 3 repeats, arms **interleaved**, nothing\nelse running on the host:\n\n| | time | peak |\n| --- | ---: | --- |\n| **Q20** — two correlated columns | **0.674×** | 6,910 → **639 MiB** |\n| **Q22** — the estimate below | **0.745×** | 4,019 → **482 MiB** |\n| total / geomean over 22 | 0.978× / **0.970×** | 14,072 → 14,027 MiB |\n\nQ20's aggregation now reads 989,835 rows for 593,278 groups where it\nread 91,030,658 for\n54,543,918. **All 22 answers are byte-identical to main, and exactly two\nof the 22 plans change** —\nso every other ratio in the run is noise, including Q12's 1.079× (its\nplan is byte-identical, and\nits own spread is 3.509–4.410 s against the other arm's 3.788–3.907).\n\n## What changes\n\nThree pieces, all in `plan`:\n\n1. **The reduction** (`optimizer.cc`, inside `Path2`). A semi join\nbetween the substituted inner\nside and the grouped aggregate, keyed on the correlated pairs, whose\nbuild is the outer side.\nIt removes only rows whose group no outer row reads, so no surviving\ngroup's value moves; and\nthe join above already matches each outer row to at most one group, so\nno row count moves.\n2. **`CloneWithFreshIds`** (`logical_plan.{h,cc}`, beside `CollectIds`).\nThe domain is a *clone* of\nthe outer side, because a plan is a tree: `PositionMismatch` fails with\n\"column N is defined\ntwice\" and `ResolvePositions` **aborts the process**, so the same node\nmay not be reached twice.\nIt mirrors `IdsOfNode` in the same file — a site that `Define`s there\n`Mint`s here, a `Read`\n   `Rename`s — and the two are a screen apart for that reason.\n3. **An estimate for ADR 0022's J5 subquery joins** (`binder.cc:4579`).\nThey carried none, and the\ngate below needs one: Q20's outer side *is* an `IN` semi join, so\nwithout this the rewrite could\nnot see the one query it gains most on. The bound is the left input's\nrows, which a semi or anti\njoin keeps a subset of and a one-row join pairs each of with one — the\nsame bound Path 1 already\nkeeps. This is also the whole of Q22's win: with an estimate,\n`ChooseBuildSide` finally flips the\nanti join that ADR 0023 recorded as building 150 M rows to probe them\nwith 1.9 M.\n\n**A semi join rather than an inner join to a de-duplicated domain**, and\neach reason was measured:\nit cannot multiply the rows it groups, so Theorem 4.1's\nduplicate-freeness needs neither an argument\nnor a `GROUP BY` to enforce it; ADR 0022 fixes its build side to the\nouter side whatever the\nestimates say, which is the difference between 639 MiB and 5.5 GB; and\nit outputs its probe's\ncolumns alone, so the grouping above reads exactly what it read before.\n\n## The gate, and the regression that set it\n\n**One correlated column is ADR 0029's D5's job, not this rewrite's.** D5\nrestricts the same rows for\nthe price of a scan filter rather than a build and a probe, and it takes\nexactly one key. An earlier\nrevision of this PR fired on one key too, and the 22-query control\ncaught it: **Q17 at 1.420×**. Its\naggregate's rows and groups did not move at all — D5 had already removed\nthem — while the clone\nre-read the 600-million-row join that query's outer side is.\n\nThat is ADR 0030's lesson in its own words: *\"before costing a shared\nsub-plan, check whether a\nconsumer is already pruned by one.\"* A plan cannot see D5's filters,\nwhich the physical planner\nattaches long after this pass runs, so the key count stands in for them.\nWith the gate on\n`> 1 key`, Q17 is **1.006×**.\n\nThe size gate is secondary and deliberately weak: fire only when both\nestimates are known and the\ninner side is at least 4× the outer. The outer number is an *upper\nbound* and can be far loose — on\nQ20 it is 80,000,000 standing for the 868,888 the join really yields —\nso the test errs towards\nrefusing, which is the safe direction. An unknown refuses, for ADR\n0032's stated reason: a small\nouter side is what argues *for* the rewrite, so an unknown one must\nargue against.\n\n**Not the direction ADR 0032 rejected.** That ADR records Q20 at 1.010×,\nwhich was *relocating* the\naggregate across its join. This restricts its input and leaves it where\nit is.\n\n## Verification\n\n`pixi run check` cannot complete on this macOS host: its `lint` leg\nstops on 36 pre-existing\nshellcheck SC2218 findings in files this PR does not touch. The legs\nwere run separately.\n\n```text\n$ pixi run ci                 # clang Debug -Werror + the full hermetic suite\n100% tests passed out of 2854            (exit 0)\n\n$ pixi run test\nANTB1-TESTS: PASS preset=dev junit=build/dev/junit.xml\n\n$ ANTB1_DIFF_SEED=20261026 pixi run diff-random\nDIFF: PASS seed=20261026 queries=2000 failed=0 unsupported=0\n\n$ pixi run lint\nevery linter Passed except shellcheck (36 pre-existing SC2218, none in a file this PR touches)\n\n$ ./.pixi/envs/default/bin/clang-tidy -p build/tidy --warnings-as-errors='*' <the three changed .cc>\nnothing in user code\n\n$ ASAN_OPTIONS=detect_leaks=0 ./build/ci-asan/bin/antb1_plan_tests --gtest_filter='*Clone*:*SemiJoinReduction*:*Path2*:*EverySubqueryJoin*'\n[  PASSED  ] 15 tests.\n$ ASAN_OPTIONS=detect_leaks=0 ./build/ci-asan/bin/antb1-slt run .../subqueries/scalar.slt ...\nSLT: PASS engine=antb1 files=1 records=42 failed=0\n```\n\nGates with no local substitute here: `pixi run asan` (fails at discovery\non a pre-existing\n`curl_global_init` leak, so the suites were run from the ASan build\ndirectly, as above),\n`pixi run tidy` (fails on an unmodified `main` on this host with 4\nmacOS-only findings, so\nclang-tidy was run per file) and `ci-gcc`/`codeql-build` (the `gcc`\nenvironment is linux-64 only).\nCI is the gate for those.\n\n## Tests\n\n- `optimizer_test.cc`: the restriction fires with the expected kind,\nbuild side and one key per\ncorrelated column, its probe is the aggregation's own input, and its\nkeys name the **clone** and\nnot the outer side; it is refused for one key, for an outer side the\ninner side does not dwarf,\njust under the ratio, for an unknown estimate and for an outer side of\nno rows — and fires just\nover the ratio, so the boundary is the gate's and not an accident of the\nshape.\n- `column_ids_test.cc`: five cases for `CloneWithFreshIds` — the\nnegative one that shows why it\nexists (the same `Scan` under both inputs of a join is \"column #1 is\ndefined twice\"), one over\nevery node kind that defines a column (a RowCount's own id, a dependent\njoin's mark, an aggregate\n  call's result), and a pass-through `Project` with a consumer above it.\n- `optimizer_test.cc`: a stacked pair of Path-2 rewrites yields exactly\none restriction and a node\n  count within a factor of the unstacked plan's.\n- `binder_test.cc`: every J5 subquery join bounds its rows.\n- `scalar.slt`, four new records against DuckDB, on the fixture whose\ntwo-column `ref` edge has\n**repeated key pairs and NULLs in both key columns on both sides**:\npairs with no inner row at\nall, the same shape with AVG, the repeated keys listed rather than\ncounted, and an outer side\nholding a dependent join of its own, where the restriction declines and\nthe answer is unchanged.\n- Mutation-checked: replacing the semi join with an inner join **fails\nthe `.slt` answers** on both\nthe serial and parallel legs; removing the key-count gate, the size gate\nor the new `.estimate`\n  each fails exactly the test that covers it.\n\n## What the review round changed\n\nThe project's `reviewer` found two real defects, both now fixed and both\nmutation-checked:\n\n- **The clone was unbudgeted, so stacked rewrites multiplied the plan.**\nThe pass is top-down, so a\ndependent join still in this one's left input is one the rewrite has not\nreached; cloning it\nduplicated a rewrite that clones in turn. Measured on a query of k\nconjuncts over one correlation:\n**1,533 plan lines at k=8 and 24,573 at k=12, where planning alone took\n1.3 s** — and past k≈20 an\nunbounded hang ending in `bad_alloc`. ADR 0023's relation limit caps k\nat ~127, not the 2^k nodes,\nso nothing bounded it. The fix refuses to clone an outer side that still\nholds a dependent join:\nthe outermost such rewrite declines, then the next, down to the\ninnermost, which clones once. Now\n**4 plan lines per added conjunct and 0.07 s flat at k=20.** The same\ncondition makes the Lemma\n3.1 check unreachable by construction, since a free variable can only\nenter `join.left` through a\n  dependent join (a `FreeVariables` precondition is there too).\n- **`Mint` used `emplace`, which does not overwrite**, so a subtree\ndefining one id twice — the\npass-through `Project` the resolver allows at `logical_plan.cc:873-877`\n— cloned into a plan that\nfails `ResolvePositions` and **aborts the process**, the exact failure\nthe function exists to\nprevent. Reproduced as `\"Filter: column #5 is not in its input\"`. Fixed\ntwo ways, each\nindependently sufficient: a pass-through column now carries the\n*renamed* id through rather than\nminting a second definition (mirroring the resolver's rule rather than\n`IdsOfNode`'s), and `Mint`\nuses `insert_or_assign` so the map always agrees with what the node\nholds.\n\nBoth are covered by new tests that fail without their fix. Neither\nchanges any of the 22 plans — I\nre-verified every one is byte-identical to the build the numbers above\nwere measured on, so the\nmeasurement stands; and all 22 answers are still byte-identical to main.\n\n## Known limitations, for a maintainer's judgement\n\nTwo P2s the reviewer raised that I have **not** addressed, because\nmitigating either is a design\nchoice rather than a bug fix:\n\n- The new semi join sits between the `GroupAggregate` and its input, and\nADR 0032's `Exchangeable`\nrefuses `kSemi`, so where that exchange used to fire for a correlated\naggregate over a join it now\ncannot. Unmeasured; the suite measurements above show no query of the 22\naffected.\n- The clone creates an ADR 0030 sharing group that did not exist. Below\n10 M input rows\n`WorthSharing` declines, but an aggregate-topped outer side above it\nwould be materialized, and\n`MaterializedTable::Append` turns >256 MiB into `OutOfMemory` — so a\nquery that answered before\ncould fail. Narrow (it needs an aggregate-topped outer side, ≥10 M rows\nbeneath it, and a >256 MiB\nresult) and no query of the 22 reaches it, but it is a new failure mode\nin kind. Declining the\nrestriction for an aggregate-topped outer side would remove it; I would\nrather not add a third\n  gate condition without a measurement behind it.\n\n## Out of scope\n\nThe one-column case where D5 cannot apply *either*, because the\naggregation's scan has already spent\nits one filter slot on another key. Measured by hand at 0.915× and 467\nMiB against 997 on the query\nof the 22 where that happens — it needs two key filters on one scan, not\nthis rewrite.\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [x] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change\n\n## Checklist\n\n- [ ] `pixi run check` passes locally — unchecked for the reason above,\nnot because it was skipped\n- [x] Tests cover the change\n- [x] Docs updated: ADR 0023's trigger fired in place and its \"never\ncopies a sub-plan\" invariant\n      amended; divergence D24 in docs/sql-subset.md narrowed\n- [x] No ClickBench-derived data is committed\n- [x] Nothing derived from TPC-H is committed: no query text, data,\nanswers or EXPLAIN output\n- [x] Changes to governance paths were agreed with a maintainer —\n`docs/adr/0023-unnesting.md` is\nCODEOWNERS; @hor911 approved the plan that specified this amendment\n\n## AI assistance\n\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5)\nmeasured the problem, planned it,\nwrote the change, its tests and its docs, mutation-checked every gate\nand refusal, and ran the\ngates above. Its first revision regressed Q17 by 42% and the 22-query\ncontrol caught it; the\ngate is what changed in response. The project's `reviewer` subagent then\nfound two defects —\nunbounded cloning across stacked rewrites, and an id-map bug that could\nabort the process —\nboth reproduced, fixed and mutation-checked before this was opened.\n- Accountable human (has read and understands the whole diff): @hor911\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-23T11:05:00+03:00",
+          "tree_id": "78bd9c835dded4fe33c55de1e3510e07453118bd",
+          "url": "https://github.com/ydb-campus/antb1/commit/f686360a2d590f723a226e72318f4bb9f283126b"
+        },
+        "date": 1792742870189,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 2554.4624292984836,
+            "unit": "ns/iter",
+            "extra": "iterations: 271741\ncpu: 2554.2095819180763 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 60491.479989034946,
+            "unit": "ns/iter",
+            "extra": "iterations: 10944\ncpu: 60478.63349780703 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 68836.8461917935,
+            "unit": "ns/iter",
+            "extra": "iterations: 10136\ncpu: 68823.38348460931 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 251892.6868211498,
+            "unit": "ns/iter",
+            "extra": "iterations: 2762\ncpu: 251783.87110789277 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 251692.0759087629,
+            "unit": "ns/iter",
+            "extra": "iterations: 2806\ncpu: 251614.75124732702 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 1438969.7833333176,
+            "unit": "ns/iter",
+            "extra": "iterations: 480\ncpu: 1438797.0416666674 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 30.26137869565189,
+            "unit": "ms/iter",
+            "extra": "iterations: 23\ncpu: 30.251905782608684 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 29.77344895999977,
+            "unit": "ms/iter",
+            "extra": "iterations: 25\ncpu: 29.76984828000003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 149.8668548000012,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 149.8482159999998 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 8.693599749999947,
+            "unit": "ms/iter",
+            "extra": "iterations: 80\ncpu: 8.691881350000008 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 12.224902311475425,
+            "unit": "ms/iter",
+            "extra": "iterations: 61\ncpu: 12.22385501639344 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 29.08016484000086,
+            "unit": "ms/iter",
+            "extra": "iterations: 25\ncpu: 29.07586092000002 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 0.9691257450980504,
+            "unit": "ms/iter",
+            "extra": "iterations: 714\ncpu: 0.9690436652661083 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 94.87883587499724,
+            "unit": "ms/iter",
+            "extra": "iterations: 8\ncpu: 94.835907125 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1000",
+            "value": 16.518559809523616,
+            "unit": "ms/iter",
+            "extra": "iterations: 42\ncpu: 16.51669952380949 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16384",
+            "value": 19.2105380000003,
+            "unit": "ms/iter",
+            "extra": "iterations: 35\ncpu: 19.207638171428545 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/262144",
+            "value": 36.77315478947357,
+            "unit": "ms/iter",
+            "extra": "iterations: 19\ncpu: 36.76911031578951 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1048576",
+            "value": 76.25270214285658,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 76.2463704285715 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/4194304",
+            "value": 275.07988700000396,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 275.05995199999944 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16777216",
+            "value": 1336.766775000001,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1336.5164510000013 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1000",
+            "value": 19.739879200000132,
+            "unit": "ms/iter",
+            "extra": "iterations: 35\ncpu: 19.7388774285714 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16384",
+            "value": 22.715507133333784,
+            "unit": "ms/iter",
+            "extra": "iterations: 30\ncpu: 22.710604933333418 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/262144",
+            "value": 41.09092968421111,
+            "unit": "ms/iter",
+            "extra": "iterations: 19\ncpu: 41.0880932631579 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1048576",
+            "value": 93.22182042857159,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 93.19909914285672 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/4194304",
+            "value": 373.5822735000056,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 373.54350100000033 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16777216",
+            "value": 1643.7651900000105,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1643.554891000001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1000",
+            "value": 34.28232760000043,
+            "unit": "ms/iter",
+            "extra": "iterations: 20\ncpu: 34.27637060000013 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16384",
+            "value": 38.69731664999989,
+            "unit": "ms/iter",
+            "extra": "iterations: 20\ncpu: 38.692581250000124 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/262144",
+            "value": 56.47941324999787,
+            "unit": "ms/iter",
+            "extra": "iterations: 12\ncpu: 56.47170933333327 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1048576",
+            "value": 178.96418349999976,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 178.92999975000023 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/4194304",
+            "value": 425.3645984999963,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 425.33319049999994 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16777216",
+            "value": 2025.4607450000037,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2025.1095750000018 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1000",
+            "value": 41.338996470589045,
+            "unit": "ms/iter",
+            "extra": "iterations: 17\ncpu: 41.32254082352915 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16384",
+            "value": 46.65079156249874,
+            "unit": "ms/iter",
+            "extra": "iterations: 16\ncpu: 46.64834006250018 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/262144",
+            "value": 77.57315944444245,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 77.55902233333323 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1048576",
+            "value": 202.935510333333,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 202.92311233333274 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/4194304",
+            "value": 447.58546199999216,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 447.50926149999873 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16777216",
+            "value": 2027.17166299999,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2026.871921999998 ms\nthreads: 1"
           }
         ]
       }
