@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792742871600,
+  "lastUpdate": 1792753080785,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -20484,6 +20484,258 @@ window.BENCHMARK_DATA = {
             "value": 2027.17166299999,
             "unit": "ms/iter",
             "extra": "iterations: 1\ncpu: 2026.871921999998 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Aleksandr Khoroshilov",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "62c5ff085be2036dd73a31b6183c0993cbf7ab5f",
+          "message": "perf(plan): restrict a one-column correlation whose aggregate reads a join (#226)\n\n## Summary\n\nA one-condition follow-up to #225. That PR added ADR 0023's semi-join\nreduction gated on **more than\none correlated column**, because a single column is ADR 0029's D5 to\nrestrict for the price of a scan\nfilter rather than a build and a probe — doing both measured 1.420×.\nThis adds the other case D5\ncannot reach: **a single column whose aggregation reads a join.**\n\n**The offer does not survive a join.** The physical planner threads an\n`AggregateFilter` down only\nthrough the nodes that keep every row, and its `JoinNode` arm forwards\nno inherited offer to its\nprobe — it passes the join's own. So an aggregation whose input holds a\njoin gets no filter however\npublishable the keys are and however free the scan's filter slot is. The\ntest is total rather than\nincidental: `LogicalNode` has exactly two multi-input alternatives, so a\nsubtree with no join *is*\nthe chain an offer could travel. And the structural fact is plan-visible\nwhere the filter itself is\nnot, since the physical planner attaches it long after this pass runs.\n\nMeasured at SF 100, 4 threads, 3 repeats, arms interleaved, against\n`main`:\n\n| | time | peak MiB |\n| --- | ---: | --- |\n| **Q2** | **0.931×** | 1,011 → **483** |\n| Q17 — one key over a scan | 1.003× | declines, as designed |\n| Q20 — two keys | 0.987× | unchanged, already restricted |\n| total / geomean over 22 | 0.995× / **0.992×** | 13,895 → 13,756 |\n\nQ2's aggregation builds **47,107 groups over ~64,000 rows** where it\nbuilt 11,829,402 over\n16,042,800. No other query of the 22 moves outside its own spread\n(largest: Q8 0.974×, Q5 1.010×).\nAll 22 answers are byte-identical to `main`.\n\nAgainst DuckDB that takes Q2 from 1.988× to about 1.85× — still the\nworst of the 22 — and its peak\nfrom 2.4× DuckDB's footprint to 1.16×. **The memory is the firmer half\nof this; the time gain is one\nquery at 0.931× and 0.992× over the suite.**\n\n## Why this shape and not a scan filter\n\nThe direct fix for Q2 would be composing two filters on one scan, which\nADR 0029 leaves as its own\nitem. I had argued for it on Q2's selectivity — the key set drops\n79,673,224 of 80 M rows — and that\nargument is wrong by ADR 0029's own measurement:\n\n> a filter pays exactly when the join costs more per probe row than the\nfilter does, and the\n> **rejection rate — 85% to 96% in every one of these — does not\ndiscriminate at all**. Neither does\n> the build's size ... **There is no static quantity here that separates\nthem.**\n\nSo this reuses the mechanism that already shipped instead, where the\ngain is measured rather than\npredicted from selectivity. Composing filters stays ADR 0029's item.\n\n## What the review round changed\n\nThe project's `reviewer` found that **the reason I had recorded for this\ngate is not the operative\none**, and the counter-example is reproducible:\n\n```\nantb1 explain --physical -c \"SELECT COUNT(*) FROM riders WHERE 0 < (SELECT SUM(tr_fare)\n  FROM trips JOIN tariffs ON tr_tariff = tf_code WHERE tr_rider = rd_id)\"\n```\n\nThe inner join's key is VARCHAR, so `CanPublishKeyFilter` is false,\nnothing is published and **the\nscan's one filter slot is free** — yet D5 still cannot reach the scan\nand the gate fires. So \"the\njoin claimed the slot\" is false, and the ADR 0029 item I quoted is about\nstatic pushdown, which is\nthe shape this gate still *declines*.\n\nThe operative reason is better than the one I gave, because it is total\nrather than incidental:\n**the offer does not survive a join.** The physical planner threads an\n`AggregateFilter` down only\nthrough nodes that keep every row, and its `JoinNode` arm forwards no\ninherited offer to its probe —\nit passes the join's own. Past a pipeline breaker there is no offer at\nall. Since `LogicalNode` has\nexactly two multi-input alternatives, a subtree with no join *is* the\nchain an offer could travel,\nso `ReadsAJoin` is false exactly when an offer could arrive. Corrected\nin the code comment and the\nADR.\n\nFour more findings, all addressed:\n\n- **The invariant the gate rests on had no test.** If someone threads\nthe offer through a join —\na natural change — this gate would pay for a reduction D5 already made,\nand #225's 1.420× would\n  return with every test green. `aggregate_filter_test.cc` gains\n`TheOfferDoesNotSurviveAJoinBelowTheAggregate`, on the reviewer's own\ncounter-example shape: a\nVARCHAR inner join key, so the slot is demonstrably free and the offer\nstill does not arrive.\nMy first attempt at this test used an integer inner key and **passed\nunder the mutation**, because\n  there the slot really was taken — the corrected version fails it.\n- **No end-to-end record for the admitted shape.** #225 added four\n`.slt` records; this added none.\nNow three, against DuckDB, one listing rows rather than counting so a\nchanged group value shows,\n  plus a LEFT JOIN inside and a residual on the inner join.\n- **A real gap got deleted from the ADR.** `main` recorded the\none-column case whose scan has spent\nits slot on pushed predicates as still unhandled, and my rewrite of that\nbullet removed it while\nclaiming the same query's number — conflating Q2's two possible\nblockers. The bullet is restored\nfor the shape that remains (`ReadsAJoin` is false there and D5 is off),\nand the ADR now says\nexplicitly that this PR **reverses** `main`'s \"not this rewrite\" reading\nfor the join case.\n- **Two consequences widen to one key** and are now recorded in the ADR:\nthe restriction preempts\nADR 0032's G2b exchange, and the ADR 0030 sharing group it creates\nbrings `MaterializedTable`'s\n256 MiB ceiling within reach for an aggregate-topped outer side. Neither\nis reached by any of the\n  22.\n\nThe plan test also now pins `build=right` and a probe that is the\nblock's own join, since\n`RestrictionUnder` returns that join rather than `nullptr` when the gate\ndeclines in this shape.\n\n**None of this changed behaviour**: I re-checked that all 22 plans are\nbyte-identical to the build\nthe measurements came from, and all 22 answers byte-identical to `main`.\n\n## Honest notes\n\n- **My proxy over-promised.** A hand-written restriction of Q2 measured\n0.738×; the real rewrite\ngives 0.931×, because the hand form restricted by one small table while\nthe rewrite clones Q2's\nwhole outer side, partsupp's 80 M rows included. The memory half of the\nproxy was accurate (3.94×\npredicted, 2.1× measured). Same proxy/reality gap that made Q17 regress\nin #225's first revision.\n- **I predicted this would regress and it does not.** Worth recording,\nsince the prediction was that\n  cloning a large outer side would cost what it cost on Q17.\n- `ReadsAJoin` recurses through the whole input subtree. The review\nconfirmed this is the\nconservative direction rather than the risky one: past a pipeline\nbreaker D5 is off as well, so\n  recursing cannot admit a shape D5 could have served.\n\n## Verification\n\n`pixi run check` cannot complete on this macOS host: its `lint` leg\nstops on 36 pre-existing\nshellcheck SC2218 findings in files this PR does not touch. The legs\nwere run separately.\n\n```text\n$ pixi run ci                 # clang Debug -Werror + the full hermetic suite\n100% tests passed out of 2863            (exit 0)\n\n$ pixi run test\nANTB1-TESTS: PASS preset=dev junit=build/dev/junit.xml\n\n$ ANTB1_DIFF_SEED=20261028 pixi run diff-random\nDIFF: PASS seed=20261028 queries=2000 failed=0 unsupported=0\n\n$ pixi run lint\nevery linter Passed except shellcheck (36 pre-existing SC2218, none in a file this PR touches)\n\n$ ./.pixi/envs/default/bin/clang-tidy -p build/tidy --warnings-as-errors='*' \\\n    src/plan/optimizer.cc src/plan/tests/optimizer_test.cc src/exec/tests/aggregate_filter_test.cc\nnothing in user code\n\n$ ASAN_OPTIONS=detect_leaks=0 ./build/ci-asan/bin/antb1_plan_tests --gtest_filter='*SemiJoinReduction*:*Path2*'\n[  PASSED  ] 10 tests.\n$ ... ./bin/antb1_exec_tests --gtest_filter='AggregateFilterTest.*'\n[  PASSED  ] 8 tests.\n$ ASAN_OPTIONS=detect_leaks=0 ./build/ci-asan/bin/antb1-slt run .../subqueries/scalar.slt ...\nSLT: PASS engine=antb1 files=1 records=45 failed=0\n```\n\nclang-tidy was run on the changed **test** file this time as well as the\nsource — that gap is what\nlet a `modernize-use-auto` through to CI on #225. Gates with no local\nsubstitute here: `pixi run\nasan` (fails at discovery on a pre-existing `curl_global_init` leak, so\nthe suites were run from the\nASan build directly), `pixi run tidy` (fails on an unmodified `main` on\nthis host with 4 macOS-only\nfindings) and `ci-gcc`/`codeql-build` (linux-64 only). CI is the gate\nfor those.\n\nThe plans the numbers were measured on are byte-identical to this\nbranch's, which I checked across\nall 22 after the cleanup, so the measurement describes what is being\nmerged.\n\n## Tests\n\n`optimizer_test.cc` gains\n`TheSemiJoinReductionRestrictsOneKeyOverAJoin`, which pairs with the\nexisting `...LeavesOneKeyToTheDynamicFilter`: the **same single key**\nrestricts over a join and does\nnot over a bare scan, so the pair pins the structural fact rather than\nthe key count. Removing the\n`ReadsAJoin` half of the gate fails exactly the new test.\n\n`aggregate_filter_test.cc` gains\n`TheOfferDoesNotSurviveAJoinBelowTheAggregate`, which pins the exec\ninvariant the gate depends on; forwarding the offer past the join in\n`physical_planner.cc` fails it.\n\n`scalar.slt` gains three records of the newly admitted shape,\nexpectations written by\n`pixi run slt-complete` from DuckDB.\n\n## Type of change\n\n- [ ] feat / fix\n- [x] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change\n\n## Checklist\n\n- [ ] `pixi run check` passes locally — unchecked for the reason above,\nnot because it was skipped\n- [x] Tests cover the change\n- [x] Docs updated: ADR 0023's reduction item records the extension and\nits measurement\n- [x] No ClickBench-derived data is committed\n- [x] Nothing derived from TPC-H is committed: no query text, data,\nanswers or EXPLAIN output\n- [x] Changes to governance paths were agreed with a maintainer —\n`docs/adr/0023-unnesting.md` is\nCODEOWNERS; @hor911 approved shipping this on the measurements above\n\n## AI assistance\n\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5) formed\nthe hypothesis, tested it\nbehind a throwaway branch before writing anything, measured it, and\nwrote the change, its test\nand its docs. The maintainer caught that a related mechanism had been\nmeasured and rejected,\nwhich is what redirected this away from composing scan filters. The\nproject's `reviewer`\nsubagent reviewed the diff and found that the reason recorded for the\ngate was wrong, that the\ninvariant it rests on had no test, and that a real gap had been deleted\nfrom the ADR — all\n      reproduced and fixed before this was opened.\n- Accountable human (has read and understands the whole diff): @hor911\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-23T13:54:45+03:00",
+          "tree_id": "8ba51d18765da149781cbc8e5ce5bb3b819a60d0",
+          "url": "https://github.com/ydb-campus/antb1/commit/62c5ff085be2036dd73a31b6183c0993cbf7ab5f"
+        },
+        "date": 1792753079707,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 3628.587964873859,
+            "unit": "ns/iter",
+            "extra": "iterations: 193816\ncpu: 3628.4448342758074 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 73170.82765273326,
+            "unit": "ns/iter",
+            "extra": "iterations: 9330\ncpu: 73165.36816720256 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 84683.50961654804,
+            "unit": "ns/iter",
+            "extra": "iterations: 8267\ncpu: 84670.00689488329 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 375790.03864735476,
+            "unit": "ns/iter",
+            "extra": "iterations: 1863\ncpu: 375744.71497584553 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 353201.09274193255,
+            "unit": "ns/iter",
+            "extra": "iterations: 1984\ncpu: 353170.7978830646 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2167876.909657347,
+            "unit": "ns/iter",
+            "extra": "iterations: 321\ncpu: 2167612.3239875375 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 42.403142882353876,
+            "unit": "ms/iter",
+            "extra": "iterations: 17\ncpu: 42.401743470588215 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 37.49380536842152,
+            "unit": "ms/iter",
+            "extra": "iterations: 19\ncpu: 37.48555452631584 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 173.18517700000058,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 173.17661625000014 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 11.707134899999971,
+            "unit": "ms/iter",
+            "extra": "iterations: 60\ncpu: 11.706181833333318 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 15.193677155555937,
+            "unit": "ms/iter",
+            "extra": "iterations: 45\ncpu: 15.190798644444413 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 32.69843133333389,
+            "unit": "ms/iter",
+            "extra": "iterations: 21\ncpu: 32.6944043333333 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.4609450817610352,
+            "unit": "ms/iter",
+            "extra": "iterations: 477\ncpu: 1.4607045932914031 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 60.146878636363574,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 60.13763054545443 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1000",
+            "value": 21.03621796969736,
+            "unit": "ms/iter",
+            "extra": "iterations: 33\ncpu: 21.032568727272732 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16384",
+            "value": 23.288145700000012,
+            "unit": "ms/iter",
+            "extra": "iterations: 30\ncpu: 23.28585813333331 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/262144",
+            "value": 50.32385585714191,
+            "unit": "ms/iter",
+            "extra": "iterations: 14\ncpu: 50.32124521428573 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1048576",
+            "value": 78.81015862500007,
+            "unit": "ms/iter",
+            "extra": "iterations: 8\ncpu: 78.80301137499978 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/4194304",
+            "value": 288.9752800000025,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 288.91582049999977 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16777216",
+            "value": 1468.6468440000056,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1468.4750810000012 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1000",
+            "value": 25.97631862963007,
+            "unit": "ms/iter",
+            "extra": "iterations: 27\ncpu: 25.975287074074163 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16384",
+            "value": 29.26475429166686,
+            "unit": "ms/iter",
+            "extra": "iterations: 24\ncpu: 29.260282124999947 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/262144",
+            "value": 50.952972000000536,
+            "unit": "ms/iter",
+            "extra": "iterations: 14\ncpu: 50.948598142857136 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1048576",
+            "value": 99.86714942857182,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 99.85863128571434 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/4194304",
+            "value": 381.2346834999971,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 381.21516800000063 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16777216",
+            "value": 1783.4051950000003,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1783.171548000002 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1000",
+            "value": 42.701765000000336,
+            "unit": "ms/iter",
+            "extra": "iterations: 16\ncpu: 42.69512868750014 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16384",
+            "value": 47.65107246666579,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 47.64088446666672 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/262144",
+            "value": 71.12885280000114,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 71.1144731000001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1048576",
+            "value": 164.75839280000173,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 164.72219540000026 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/4194304",
+            "value": 432.54029499999547,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 432.4411569999995 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16777216",
+            "value": 2047.860065000009,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2047.579158000005 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1000",
+            "value": 51.09004835714107,
+            "unit": "ms/iter",
+            "extra": "iterations: 14\ncpu: 51.085603571428756 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16384",
+            "value": 55.35161946153922,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 55.34505638461586 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/262144",
+            "value": 88.08476700000156,
+            "unit": "ms/iter",
+            "extra": "iterations: 8\ncpu: 88.06160000000051 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1048576",
+            "value": 169.3612019999975,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 169.3401107500012 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/4194304",
+            "value": 474.42268650000585,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 474.341527 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16777216",
+            "value": 2200.857452999998,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2200.4107000000063 ms\nthreads: 1"
           }
         ]
       }
