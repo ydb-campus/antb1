@@ -660,7 +660,7 @@ TEST(ColumnIdsTest, ACloneCoversEveryNodeThatDefinesAColumn) {
   // A RowCount defines its own id and has no input, so it is the only column minted.
   const LogicalNodePtr row_count = Node(RowCountNode{
       .table = std::make_shared<FakeTable>(AllTypesSchema(), 100), .id = ColumnId{20}});
-  ColumnId last = ColumnId{20};
+  auto last = ColumnId{20};
   EXPECT_EQ(OutputIds(*CloneWithFreshIds(row_count, last)), (std::vector<ColumnId>{ColumnId{21}}));
   EXPECT_EQ(last, ColumnId{21});
 
