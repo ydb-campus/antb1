@@ -174,8 +174,8 @@ subqueries; both amend this section where marked.
     main → this change: 34.269 → 30.745 at 16 threads, 22.190 → 21.011 at 32, 16.532 → 15.841 at 64, 16.370 →
     16.380 at 128. Q20 1.103 → 0.825 at 16 threads and 0.527 → 0.368 at 64; Q27 1.290 → 0.966 and 0.649 → 0.511;
     Q28 4.303 → 3.602 at 16; the top-N queries Q24-Q26 0.287-0.380 → 0.203-0.292 at 16. The highest peak memory of
-    a query at 64 threads went 23.7 → 26.8 GB (Q34, GROUP BY on a string: its parts and its lanes hold more groups),
-    at 16 threads 18.8 → 19.4 GB.
+    a query at 64 threads went 24.3 → 27.5 GB (Q34, GROUP BY on a string: its parts and its lanes hold more groups),
+    at 16 threads 19.2 → 19.8 GB (corrected 2026-10-23: first given in units of 10^6 KiB).
   - The 22 queries derived from TPC-H (sf100, page cache checked resident), as a control, 2 tries, two rounds:
     116.535 → 116.321 s at 16 threads, 58.367 → 58.781 s at 64. Their row groups are even, and traced, Q1 and Q4
     keep the same schedule with either window (97% and 75% of the threads busy). (This workload is derived from the
@@ -198,6 +198,46 @@ subqueries; both amend this section where marked.
     at 64 threads, inside main's spread (Q4 0.225 → 0.243 s, Q17 0.564 → 0.618 s, Q18 1.058 → 1.143 s). Not
     measured why; the lanes' bound is not it (2 × threads under a 4 × window did not remove it), and a guess is that
     their lanes' tasks wait behind more queued parts in the pool's one FIFO queue.
+
+  Amended 2026-10-23, from the same study: **a hash join's gathers of build rows read each chunk's array of each column
+  from a list its build takes once (`exec::JoinColumns`), not from the chunks.** Asking an Arrow 25 batch for a column
+  (`SimpleRecordBatch::column`) locks and unlocks a mutex of that batch and counts a reference up, which the caller
+  counts down: four atomic read-modify-writes on lines that every thread gathering from that chunk shares. Every gather
+  asked each chunk of the build for each column it gathered: a probe batch's matches, the build columns its residuals
+  read for its candidate pairs, and every batch a right join emits.
+  - The 22 queries derived from TPC-H (sf100, page cache checked resident), main a4ab1d8 against the change: two frozen
+    release builds, one process per query, 3 tries per process, two rounds with the arm order alternating per query and
+    per round, no run disturbed by the host's other load (at most 1.6 cores of it); each figure is the best of a
+    point's 6 tries. Total seconds 105.119 → 92.790 at 16 threads (0.883x), 53.998 → 49.728 at 64 (0.921x); the best
+    of 3 of each round alone gives 0.882x in both rounds at 16 threads, 0.923x and 0.916x at 64. No query is slower by
+    more than main's own spread of tries (the most, Q18 at 64 threads, +1.2%), and the two queries without a join, Q1
+    and Q6, read 6.362 → 6.383 s and 1.281 → 1.248 s at 16 threads, 2.338 → 2.356 s and 0.601 → 0.604 s at 64, all
+    inside that spread. The highest peak RSS of a query (Q18) is 18.2 GB at 16 threads with either build and 23.8 →
+    24.2 GB at 64, inside one build's run-to-run spread. (This workload is derived from the TPC-H Benchmark and is not
+    comparable to published TPC-H Benchmark results, as this implementation does not comply with all requirements of
+    the TPC-H Benchmark.)
+  - Largest by ratio at 16 threads: Q12 3.180 → 2.140 s, Q8 5.649 → 4.029 s, Q7 5.257 → 3.980 s, Q3 4.987 → 3.798 s, Q21
+    15.194 → 12.410 s; at 64: Q12 1.444 → 1.135 s, Q8 2.337 → 1.856 s, Q2 1.058 → 0.842 s, Q21 10.425 → 8.756 s, Q7
+    2.132 → 1.799 s. Q21 alone is 23% of the gain at 16 threads and 39% at 64; without it the totals read 0.894x and
+    0.940x.
+  - It removed stalls and sleeps, not instructions (sums over every process, per try): CPU 0.886x at 16 threads and
+    0.912x at 64, user instructions 0.978x at both, user cycles 0.892x and 0.918x, system time 0.75x and 0.81x,
+    voluntary context switches 0.46x and 0.71x, and 80% and 60% fewer user-space loads served from a line modified in
+    the other socket's cache. Sampled at 64 threads (one profile of user cycles per build, without call graphs),
+    `column` and the pthread mutex were 7.7% of the 22 queries' user cycles and 18.1% of Q3's (2.154 → 1.933 s at 64
+    threads); with the change none of them reaches the report's 0.3% cut-off, and the gather's own share fell from
+    4.5% to 3.4%.
+  - Q21, profiled twice per point: its SEMI join's probe gathers, for each candidate pair, the build columns its
+    residuals read. That `gather`, summed over parts, takes 0.47-0.48 s at 16 threads instead of 14.9-16.2 s (0.74 s
+    instead of 24.9-25.7 s at 64), and the consumer's wait for the probe parts falls from 2.65-2.78 s to 1.68-1.69 s
+    (1.06-1.07 s to 0.66 s at 64). The SEMI right join's own gather of its emitted build rows takes 3.055-3.282 s
+    instead of 4.220-4.422 s (3.345-3.385 s instead of 4.671-4.874 s at 64): cheaper, still one thread's work on the
+    consumer (ADR 0026's C2b), and at 64 threads most of the query's gain. On main a4ab1d8 that gather is 4.2-4.4 s of
+    a 15.2-15.4 s query; the 5.6 s of 17.6 s above is one profile of a build that predates #215-#222. The ANTI right
+    join, whose gather is under 0.1 s, keeps its part_time (32.2-33.7 s at 16 threads, 52.3-53.1 s at 64).
+  - The list holds 8 bytes per chunk and column of a build, charged to the budget, and is taken in the build's `finish`
+    (Q21's SEMI build: 10-20 ms more). The sort buffer still asks its chunks on each gather, once per batch it emits.
+    Measured at 16 and 64 threads, on the queries derived from TPC-H only.
 - **Memory:** it grows with the window and the per-part partial states. High-cardinality grouping holds partial group
   tables for at most the window's parts.
 - **Tests:**

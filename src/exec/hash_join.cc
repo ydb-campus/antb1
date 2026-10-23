@@ -114,6 +114,20 @@ arrow::Result<std::shared_ptr<const OneRowValues>> OneRowValuesOf(const JoinTabl
   return values;
 }
 
+// The columns of `table` for its gathers (JoinColumns): every chunk's array of every field of its
+// build schema, the vector charged to `budget` before it is made.
+arrow::Result<std::shared_ptr<const JoinColumns>> MakeJoinColumns(
+    std::shared_ptr<const JoinTable> table, MemoryBudget* budget) {
+  auto columns = std::make_shared<JoinColumns>();
+  const int fields = table->spec().schema()->num_fields();
+  columns->memory.Reset(budget);
+  ARROW_RETURN_NOT_OK(
+      columns->memory.Resize(ChunkColumns::MemoryUsage(table->chunks().size(), fields)));
+  columns->arrays = ChunkColumns(table->chunks(), fields);
+  columns->table = std::move(table);
+  return std::shared_ptr<const JoinColumns>(std::move(columns));
+}
+
 }  // namespace
 
 // ---- JoinBuild ----
@@ -168,6 +182,7 @@ arrow::Status JoinBuild::PrepareMarks(ExecContext& ctx) {
 
 void JoinBuild::Release() {
   table_.reset();
+  columns_.reset();
   values_.reset();
   marks_.reset();
   key_filter_.reset();
@@ -292,6 +307,7 @@ arrow::Status JoinBuild::BuildTable(ExecContext& ctx) {
     // Before Finish: it frees the parts the per-row hashes live in (ADR 0029's D1).
     ARROW_ASSIGN_OR_RAISE(key_filter_, builder->MakeKeyFilter());
     ARROW_ASSIGN_OR_RAISE(table_, builder->Finish());
+    ARROW_ASSIGN_OR_RAISE(columns_, MakeJoinColumns(table_, ctx.budget));
     if (kind_ == plan::JoinKind::kOneRow) {
       // A planner bug, never an answer: SQL plans only an aggregate without groups here.
       if (table_->num_rows() != 1) {
@@ -466,8 +482,9 @@ arrow::Result<Batch> PartRightJoinOperator::Next() {
 
 arrow::Result<std::optional<Batch>> PartRightJoinOperator::NextMarked() {
   const std::shared_ptr<const JoinTable>& table = build_->table();
+  const std::shared_ptr<const JoinColumns>& build_columns = build_->columns();
   const JoinMarks* marks = build_->marks();
-  if (table == nullptr || marks == nullptr) {
+  if (table == nullptr || build_columns == nullptr || marks == nullptr) {
     return arrow::Status::Invalid("a join that emits its build rows lost its build");
   }
   const int64_t num_rows = table->num_rows();
@@ -495,7 +512,8 @@ arrow::Result<std::optional<Batch>> PartRightJoinOperator::NextMarked() {
   for (int c = 0; c < schema_->num_fields(); ++c) {
     ARROW_ASSIGN_OR_RAISE(std::unique_ptr<arrow::ArrayBuilder> builder,
                           arrow::MakeBuilder(schema_->field(c)->type(), pool_));
-    ARROW_RETURN_NOT_OK((GatherRows<false, JoinRowRef>(table->chunks(), c, rows_, *builder)));
+    ARROW_RETURN_NOT_OK(
+        (GatherRows<false, JoinRowRef>(build_columns->arrays.column(c), rows_, *builder)));
     ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Array> column, builder->Finish());
     columns.push_back(std::move(column));
   }
@@ -720,7 +738,8 @@ arrow::Status HashJoinOperator::Start() {
     ARROW_RETURN_NOT_OK(build_->Prepare(ctx_));
   }
   table_ = build_->table();
-  if (table_ == nullptr) {
+  columns_ = build_->columns();
+  if (table_ == nullptr || columns_ == nullptr) {
     return arrow::Status::Invalid("a hash join probe before its build is prepared");
   }
   if (EmptiesJoin(kind_, *table_)) {
@@ -1188,7 +1207,8 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> HashJoinOperator::PairBatch(i
   for (const int c : pair_build_) {
     ARROW_ASSIGN_OR_RAISE(std::unique_ptr<arrow::ArrayBuilder> builder,
                           arrow::MakeBuilder(schema.field(c)->type(), ctx_.pool));
-    ARROW_RETURN_NOT_OK((GatherRows<false, JoinRowRef>(table_->chunks(), c, refs, *builder)));
+    ARROW_RETURN_NOT_OK(
+        (GatherRows<false, JoinRowRef>(columns_->arrays.column(c), refs, *builder)));
     ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Array> column, builder->Finish());
     columns.push_back(std::move(column));
   }
@@ -1382,7 +1402,8 @@ arrow::Result<arrow::ArrayVector> HashJoinOperator::GatherBuild(int64_t rows) {
   for (int c = 0; c < schema.num_fields(); ++c) {
     ARROW_ASSIGN_OR_RAISE(std::unique_ptr<arrow::ArrayBuilder> builder,
                           arrow::MakeBuilder(schema.field(c)->type(), ctx_.pool));
-    ARROW_RETURN_NOT_OK((GatherRows<kWithNulls, JoinRowRef>(table_->chunks(), c, refs, *builder)));
+    ARROW_RETURN_NOT_OK(
+        (GatherRows<kWithNulls, JoinRowRef>(columns_->arrays.column(c), refs, *builder)));
     ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Array> column, builder->Finish());
     columns.push_back(std::move(column));
   }
@@ -1441,6 +1462,7 @@ void HashJoinOperator::End() {
   evaluated_ = false;
   row_passed_ = false;
   table_.reset();
+  columns_.reset();
   values_.reset();
   marks_ = nullptr;  // the build's, which outlives this run only while it holds its table
   empty_.reset();

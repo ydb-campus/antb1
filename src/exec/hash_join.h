@@ -18,6 +18,7 @@
 #include "antb1/exec/operator.h"
 #include "antb1/plan/logical_plan.h"
 
+#include "gather.h"
 #include "part_operators.h"
 
 // The hash joins (docs/adr/0022-joins-and-query-blocks.md, "Execution"): inner, left, semi, anti,
@@ -47,6 +48,18 @@ struct OneRowValues {
   int64_t rows = 0;
 };
 
+// A join table's columns, each chunk's array of each field of its build schema, taken once per
+// build (ChunkColumns) for every gather of build rows: the probes' (HashJoinOperator) and those of
+// a join that emits its build rows (PartRightJoinOperator). A gather over the table's chunks would
+// ask every chunk for its column on every call, and each ask locks the chunk's batch. It holds the
+// table, whose chunks own the arrays, and charges its own vector to the build's budget while it
+// lives. Immutable.
+struct JoinColumns {
+  std::shared_ptr<const JoinTable> table;
+  ChunkColumns arrays;
+  MemoryReservation memory;
+};
+
 // The build side of a hash join: the JoinTable of its input, prepared by the operator that runs its
 // probe pipeline and read by the probes of every part of that pipeline. Its join's kind decides
 // what its probes do (HashJoinOperator) and whether its table empties the join (EmptiesJoin).
@@ -64,8 +77,8 @@ struct OneRowValues {
 // Prepare holds nothing: no table, no part, no batch of a drained input, no table of the builds its
 // input probes.
 //
-// Thread safety: Prepare and Release on the consumer thread only; table() and values() from any
-// thread between a successful Prepare and the next Release.
+// Thread safety: Prepare and Release on the consumer thread only; table(), columns() and values()
+// from any thread between a successful Prepare and the next Release.
 //
 // A one-row join's build (a keyless spec) must hold exactly one row: any other count is Invalid,
 // from Prepare, before any probe part runs (a planner bug: SQL never sees it). Its values are then
@@ -73,8 +86,8 @@ struct OneRowValues {
 //
 // Profile (`profile`, nullptr: none): each Prepare's time and instance, the rows the table holds
 // (one batch per chunk of the table), and the metrics parts, part_time, wait, lanes_tail, finish
-// (the table, and a one-row join's values), null_keys, unique and direct (1 for a table of unique
-// keys, of the direct layout).
+// (the table, its columns and a one-row join's values), null_keys, unique and direct (1 for a table
+// of unique keys, of the direct layout).
 class JoinBuild {
  public:
   // A build for a join of `kind` of the `num_parts` parts of `pipeline`, whose batches have
@@ -106,6 +119,8 @@ class JoinBuild {
 
   // The table: nullptr before Prepare, after a failed one and after Release.
   [[nodiscard]] const std::shared_ptr<const JoinTable>& table() const { return table_; }
+  // The table's columns, for gathers of its rows (JoinColumns): nullptr whenever table() is.
+  [[nodiscard]] const std::shared_ptr<const JoinColumns>& columns() const { return columns_; }
   // The filter over the build's key hashes, for the scan of its probe side to reject rows with
   // (ADR 0029's D1); nullptr when the keys are not one a scan can hash, when the filter did not fit
   // the budget, or before Prepare. Whether a probe scan may *use* it is the physical planner's
@@ -132,6 +147,7 @@ class JoinBuild {
   ProfileNode* profile_;
   plan::JoinKind kind_;
   std::shared_ptr<const JoinTable> table_;
+  std::shared_ptr<const JoinColumns> columns_;
   std::shared_ptr<const OneRowValues> values_;
   std::unique_ptr<JoinMarks> marks_;
   std::shared_ptr<const KeyFilter> key_filter_;
@@ -402,6 +418,7 @@ class HashJoinOperator final : public Operator {
   bool done_ = false;          // the input ended, or the build empties the join
   Keep keep_ = Keep::kMatched;
   std::shared_ptr<const JoinTable> table_;
+  std::shared_ptr<const JoinColumns> columns_;       // the table's, for PairBatch and GatherBuild
   std::shared_ptr<const OneRowValues> values_;       // a one-row join's
   Batch batch_;                                      // the probe batch being joined (no data: none)
   std::vector<std::shared_ptr<arrow::Array>> keys_;  // batch_'s key columns
@@ -444,7 +461,7 @@ class HashJoinOperator final : public Operator {
 // drains: the marks and the rows it reads belong to the build, which its parts-done callback
 // releases (BuildsFirstOperator). A failed run does not call it.
 //
-// Memory: the marks and the table are the build's; the gathered batches come from
+// Memory: the marks, the table and its columns are the build's; the gathered batches come from
 // ExecContext::pool. Profile: the metrics part_time and wait, as the other sinks', and gather (the
 // build columns of the rows it emits) and marked (the rows the marks selected).
 class PartRightJoinOperator final : public PartSink {

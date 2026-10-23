@@ -11,10 +11,39 @@
 #include <arrow/api.h>
 #include <arrow/array/data.h>
 
+#include "antb1/common/check.h"
+#include "antb1/common/narrow.h"
 #include "antb1/exec/join_table.h"
 #include "antb1/exec/sort.h"
 
 namespace antb1::exec {
+
+ChunkColumns::ChunkColumns(const std::vector<std::shared_ptr<arrow::RecordBatch>>& chunks,
+                           int num_columns)
+    : chunks_(chunks.size()) {
+  const auto fields = Narrow<std::size_t>(num_columns);
+  arrays_.resize(chunks_ * fields);
+  for (std::size_t k = 0; k < chunks_; ++k) {
+    // The batch's own vector: it boxes each column once and keeps it while the batch lives.
+    const arrow::ArrayVector& columns = chunks[k]->columns();
+    ANTB1_CHECK(fields <= columns.size());
+    for (std::size_t c = 0; c < fields; ++c) {
+      arrays_[(c * chunks_) + k] = columns[c].get();
+    }
+  }
+}
+
+int64_t ChunkColumns::MemoryUsage(std::size_t num_chunks, int num_columns) {
+  return Narrow<int64_t>(num_chunks * Narrow<std::size_t>(num_columns) *
+                         sizeof(const arrow::Array*));
+}
+
+std::span<const arrow::Array* const> ChunkColumns::column(int column) const {
+  const auto first = Narrow<std::size_t>(column) * chunks_;
+  ANTB1_CHECK(first + chunks_ <= arrays_.size());
+  return std::span<const arrow::Array* const>(arrays_).subspan(first, chunks_);
+}
+
 namespace {
 
 // Whether `ref` names no row (only a gather with NULLs has such refs).
@@ -29,7 +58,7 @@ bool NoRow(const Ref& ref) {
 
 // The rows `refs` of `arrays` (one array per chunk), appended to a builder of their type.
 template <class ArrayType, class BuilderType, bool kWithNulls, class Ref>
-arrow::Status GatherTyped(const std::vector<const arrow::Array*>& arrays, std::span<const Ref> refs,
+arrow::Status GatherTyped(std::span<const arrow::Array* const> arrays, std::span<const Ref> refs,
                           arrow::ArrayBuilder& out) {
   auto& builder = static_cast<BuilderType&>(out);
   ARROW_RETURN_NOT_OK(builder.Reserve(static_cast<int64_t>(refs.size())));
@@ -66,10 +95,10 @@ arrow::Status GatherTyped(const std::vector<const arrow::Array*>& arrays, std::s
 // Any other type: one slice per run of consecutive rows of a chunk (and one run of NULLs per run
 // of refs without a row).
 template <bool kWithNulls, class Ref>
-arrow::Status GatherSlices(const std::vector<std::shared_ptr<arrow::RecordBatch>>& chunks,
-                           int column, std::span<const Ref> refs, arrow::ArrayBuilder& builder) {
+arrow::Status GatherSlices(std::span<const arrow::Array* const> arrays, std::span<const Ref> refs,
+                           arrow::ArrayBuilder& builder) {
   ARROW_RETURN_NOT_OK(builder.Reserve(static_cast<int64_t>(refs.size())));
-  std::vector<std::optional<arrow::ArraySpan>> spans(chunks.size());
+  std::vector<std::optional<arrow::ArraySpan>> spans(arrays.size());
   for (std::size_t i = 0; i < refs.size();) {
     const Ref first = refs[i];
     std::size_t length = 1;
@@ -87,7 +116,7 @@ arrow::Status GatherSlices(const std::vector<std::shared_ptr<arrow::RecordBatch>
     }
     auto& span = spans[first.chunk];
     if (!span.has_value()) {
-      span.emplace(*chunks[first.chunk]->column_data(column));
+      span.emplace(*arrays[first.chunk]->data());
     }
     ARROW_RETURN_NOT_OK(builder.AppendArraySlice(*span, first.row, static_cast<int64_t>(length)));
     i += length;
@@ -98,13 +127,8 @@ arrow::Status GatherSlices(const std::vector<std::shared_ptr<arrow::RecordBatch>
 }  // namespace
 
 template <bool kWithNulls, class Ref>
-arrow::Status GatherRows(const std::vector<std::shared_ptr<arrow::RecordBatch>>& chunks, int column,
-                         std::span<const Ref> refs, arrow::ArrayBuilder& builder) {
-  std::vector<const arrow::Array*> arrays;
-  arrays.reserve(chunks.size());
-  for (const auto& chunk : chunks) {
-    arrays.push_back(chunk->column(column).get());
-  }
+arrow::Status GatherRows(std::span<const arrow::Array* const> arrays, std::span<const Ref> refs,
+                         arrow::ArrayBuilder& builder) {
   switch (builder.type()->id()) {
     case arrow::Type::INT16:
       return GatherTyped<arrow::Int16Array, arrow::Int16Builder, kWithNulls>(arrays, refs, builder);
@@ -136,18 +160,32 @@ arrow::Status GatherRows(const std::vector<std::shared_ptr<arrow::RecordBatch>>&
       return GatherTyped<arrow::BinaryArray, arrow::BinaryBuilder, kWithNulls>(arrays, refs,
                                                                                builder);
     default:
-      return GatherSlices<kWithNulls>(chunks, column, refs, builder);
+      return GatherSlices<kWithNulls>(arrays, refs, builder);
   }
 }
 
+template <bool kWithNulls, class Ref>
+arrow::Status GatherRows(const std::vector<std::shared_ptr<arrow::RecordBatch>>& chunks, int column,
+                         std::span<const Ref> refs, arrow::ArrayBuilder& builder) {
+  std::vector<const arrow::Array*> arrays;
+  arrays.reserve(chunks.size());
+  for (const auto& chunk : chunks) {
+    arrays.push_back(chunk->column(column).get());
+  }
+  return GatherRows<kWithNulls, Ref>(std::span<const arrow::Array* const>(arrays), refs, builder);
+}
+
+template arrow::Status GatherRows<false, SortBuffer::RowRef>(
+    std::span<const arrow::Array* const> arrays, std::span<const SortBuffer::RowRef> refs,
+    arrow::ArrayBuilder& builder);
+template arrow::Status GatherRows<false, JoinRowRef>(std::span<const arrow::Array* const> arrays,
+                                                     std::span<const JoinRowRef> refs,
+                                                     arrow::ArrayBuilder& builder);
+template arrow::Status GatherRows<true, JoinRowRef>(std::span<const arrow::Array* const> arrays,
+                                                    std::span<const JoinRowRef> refs,
+                                                    arrow::ArrayBuilder& builder);
 template arrow::Status GatherRows<false, SortBuffer::RowRef>(
     const std::vector<std::shared_ptr<arrow::RecordBatch>>& chunks, int column,
     std::span<const SortBuffer::RowRef> refs, arrow::ArrayBuilder& builder);
-template arrow::Status GatherRows<false, JoinRowRef>(
-    const std::vector<std::shared_ptr<arrow::RecordBatch>>& chunks, int column,
-    std::span<const JoinRowRef> refs, arrow::ArrayBuilder& builder);
-template arrow::Status GatherRows<true, JoinRowRef>(
-    const std::vector<std::shared_ptr<arrow::RecordBatch>>& chunks, int column,
-    std::span<const JoinRowRef> refs, arrow::ArrayBuilder& builder);
 
 }  // namespace antb1::exec
