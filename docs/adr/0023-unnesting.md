@@ -160,10 +160,20 @@ work: mark and single dependent-join kinds, and lifting those rejections.
 - **The test of a rewrite is the formalization's Lemma 3.1:** a path applies only when, after its rewrite, the new
   join's right input has no free variables. Since the binder rejects an outer reference that skips a block, every free
   variable of a right input is a column of its left input.
-- **Within the relation limit.** The pass never copies a sub-plan: both paths only move, rewrite or drop conjuncts,
-  drop a select list, and turn an aggregate into a grouped one and the dependent join into a join. So the unnested
-  plan reads the same relations as the bound one, and ADR 0022's relation limit, counted before binding, bounds the
-  pass and every walk after it.
+- **Within the relation limit.** Both paths otherwise only move, rewrite or drop conjuncts, drop a select list, and
+  turn an aggregate into a grouped one and the dependent join into a join.
+  - **Amended 2026-10-23 by the semi-join reduction, which does copy one — and the limit still holds.** Where it
+    fires, Path 2 clones the dependent join's left input to build the domain that restricts the aggregation, so the
+    unnested plan reads that sub-plan's relations twice and a walk that does not memoize visits them twice.
+    **The copy is bounded by refusing to clone an outer side that still holds a dependent join.** The pass is
+    top-down, so such a join is one the rewrite has not reached: cloning it would duplicate a rewrite that clones in
+    turn, and k stacked correlated subqueries would have cost 2^k nodes — measured, before the condition existed, at
+    1,533 plan lines for k=8 and 24,573 for k=12, where planning alone took 1.3 s. With it the outermost such
+    rewrite declines, then the next, down to the innermost, which clones once: a chain costs one clone, a plan's size
+    stays linear in the rewrites, and ADR 0022's relation limit goes on bounding every walk.
+    [ADR 0030](0030-shared-sub-plans.md)'s finder recognises the clone (it compares columns by origin, not by id), so
+    the two copies are reported as one shared sub-plan; its exec gate admits only an aggregate-topped sub-plan, so
+    the measured query computes its outer side twice and still wins.
 - **In U1 the pass rejects every dependent join.** U2 adds Path 1 and U3 adds Path 2.
 
 ### Path 1: correlated selections pulled up (EXISTS and NOT EXISTS, U2)
@@ -330,7 +340,24 @@ hand reach it without Optimize, as ADR 0022's join kinds do before E2.
 - **Correct plans that are not the fastest,** each deferred until its trigger:
   - an aggregation computes the group of every inner key, not only the groups that the outer side needs (in Q17 the
     scan of the inner table dominates anyway), until profiles of correlated aggregates or the divergence call for the
-    semi-join reduction;
+    semi-join reduction — **fired 2026-10-23: the reduction ships for a correlation of more than one column.** Path 2
+    now restricts the aggregation's input with a semi join on the outer side's keys, built from a clone of that side
+    (`CloneWithFreshIds`, because a plan is a tree and the same node read twice is a column defined twice). A semi
+    join and not an inner join to a de-duplicated domain: it cannot multiply the rows it groups, so Theorem 4.1's
+    duplicate-freeness needs neither an argument nor a GROUP BY to enforce it, and ADR 0022 fixes its build side to
+    the outer side whatever the estimates say. Measured at SF 100 on the query of the 22 that correlates on two
+    columns: its aggregation reads 989,835 rows for 593,278 groups where it read 91,030,658 for 54,543,918, and the
+    query is **0.674x** at **620 MiB against 6,869**.
+    - **One correlated column is left to [ADR 0029](0029-dynamic-join-filters.md)'s D5**, which restricts the same
+      rows for the price of a scan filter rather than a build and a probe, and which takes exactly one key. Doing
+      both measured **1.420x** on the query whose correlation is a single column: its aggregate's rows and groups did
+      not move at all, D5 having already removed them, while the clone re-read the 600-million-row join that query's
+      outer side is. So the key count is what the rewrite is gated on, which is ADR 0030's "before costing a shared
+      sub-plan, check whether a consumer is already pruned by one" — and a plan cannot see D5's filters, which the
+      physical planner attaches long after this pass runs.
+    - **What is left:** the one-column case where D5 cannot apply either, because the aggregation's scan has already
+      spent its one filter slot on another key. Measured by hand at **0.915x** and 467 MiB against 997 on the query
+      of the 22 where that happens; it needs two key filters on one scan, not this rewrite, and is not deferred here.
   - a semi or anti join with a residual keeps every build row (Q21), until profiles of Q21 at SF 10 or above ask for a
     smaller build — **fired 2026-10-15: profiles of Q21 at SF 100 show both its joins building the whole of the
     largest relation, [ADR 0026](0026-join-performance.md)**;

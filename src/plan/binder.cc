@@ -4576,6 +4576,12 @@ LogicalNodePtr SubqueryJoins(LogicalNodePtr node, std::vector<SubqueryJoin>& joi
                                     .mark = kNoColumnId,
                                     .span = join.span});
     } else {
+      // A semi or anti join keeps a subset of its left input and a one-row join pairs each of its
+      // rows with the subquery's single row, so the left input's estimate is an upper bound for
+      // every kind this builds -- the same bound ADR 0023's Path 1 keeps on the joins it makes.
+      // Without it every pass above reads this join's rows as unknown, which is what kept ADR
+      // 0023's semi-join reduction from seeing the one query it gains most on.
+      const std::optional<int64_t> left_rows = EstimateRows(*node);
       node = Make(JoinNode{
           .kind = join.kind,
           .left = std::move(node),
@@ -4583,6 +4589,7 @@ LogicalNodePtr SubqueryJoins(LogicalNodePtr node, std::vector<SubqueryJoin>& joi
           .keys = std::move(keys),
           .residual = {},
           .build = BuildSide::kRight,  // the side whose rows the join does not keep, or the one row
+          .estimate = left_rows,
           .span = join.span});
     }
     if (!join.filter.empty()) {

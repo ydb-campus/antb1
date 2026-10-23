@@ -287,3 +287,40 @@ query I nosort
 SELECT COUNT(*) FROM zones WHERE 2 < (SELECT MIN(tr_fare) FROM trips WHERE trips.tr_pickup = zones.zn_id AND trips.tr_pickup = zones.zn_parent)
 ----
 0
+
+# ---- the semi-join reduction (ADR 0023): two correlated keys, where the restriction fires ----
+# The aggregation's input is restricted to the key pairs the outer side binds, which only a semi
+# join may do: it must not multiply the rows it groups, and shifts holds repeated (driver, day)
+# pairs and NULLs in both key columns, so a restriction that duplicated a row or admitted a NULL
+# pair would change a SUM rather than a row count.
+
+# Pairs with no trip at all: SUM is NULL over them and the comparison drops the outer row, which is
+# the group the restriction removes and the inner join above it would have dropped anyway.
+query I nosort
+SELECT COUNT(*) FROM shifts WHERE sh_hours > 0 AND 0 < (SELECT SUM(tr_fare) FROM trips WHERE tr_driver = sh_driver AND tr_day = sh_day)
+----
+412
+
+# The same shape with AVG, whose value moves if the restriction changed which rows are aggregated.
+query I nosort
+SELECT COUNT(*) FROM shifts WHERE sh_hours * 2 < (SELECT AVG(tr_distance) FROM trips WHERE tr_driver = sh_driver AND tr_day = sh_day)
+----
+93
+
+# Repeated outer keys, listed rather than counted: a restriction that multiplied the aggregation's
+# input would show up here as a changed SUM, and one that multiplied the outer rows as extra rows.
+query IT rowsort
+SELECT sh_driver, sh_day FROM shifts WHERE sh_driver < 1010 AND sh_hours < (SELECT SUM(tr_fare) FROM trips WHERE tr_driver = sh_driver AND tr_day = sh_day)
+----
+1000	2026-03-12
+1000	2026-03-15
+1000	2026-03-23
+
+# An outer side that still holds a dependent join of its own is not cloned: the pass is top-down, so
+# cloning it would duplicate a rewrite that clones in turn, and k stacked correlated subqueries would
+# cost 2^k nodes. Here the EXISTS is below the scalar aggregate, so the restriction declines and the
+# answer is the same either way -- which is what this record pins.
+query I nosort
+SELECT COUNT(*) FROM shifts WHERE EXISTS (SELECT * FROM drivers WHERE dv_id = sh_driver) AND sh_hours > 0 AND 0 < (SELECT SUM(tr_fare) FROM trips WHERE tr_driver = sh_driver AND tr_day = sh_day)
+----
+408

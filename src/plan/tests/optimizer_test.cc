@@ -1043,6 +1043,183 @@ TEST(OptimizerTest, Path2GroupsByTheInnerEquivalent) {
   EXPECT_EQ(PositionMismatch(plan), std::nullopt) << Explain(plan);
 }
 
+// ---- ADR 0023's semi-join reduction ----
+
+// A scalar block whose inner relation holds `rows`, so that the gate's ratio can be set: it fires
+// only where the aggregation's own input is at least kLeastRestriction times the outer side.
+LogicalNodePtr ScalarBlockRows(std::vector<ExprPtr> conjuncts, std::uint32_t first_id,
+                               std::optional<int64_t> rows, std::uint32_t inner_first = 11) {
+  const ColumnId value{first_id + 90};
+  return Node(AggregateNode{
+      .input = CorrelatedBlockOver(
+          Node(ScanNode{
+              .table = std::make_shared<testing::FakeTable>(testing::AllTypesSchema(), rows),
+              .table_name = "t" + std::to_string(inner_first),
+              .fields = {0, 1, 2, 3},
+              .ids = {ColumnId{inner_first}, ColumnId{inner_first + 1}, ColumnId{inner_first + 2},
+                      ColumnId{inner_first + 3}},
+              .span = {}}),
+          std::move(conjuncts), first_id),
+      .aggregates = {AggregateCall{.kind = AggKind::kMin,
+                                   .arg = FieldOf(inner_first, 2),
+                                   .type = LogicalType::kBigInt,
+                                   .id = value}}});
+}
+
+// The nodes of a plan, counted: what an unbounded clone shows up in.
+std::size_t NodeCount(const LogicalNodePtr& node) {
+  if (node == nullptr) {
+    return 0;
+  }
+  std::size_t count = 1;
+  for (const LogicalNodePtr& input : InputsOf(*node)) {
+    count += NodeCount(input);
+  }
+  return count;
+}
+
+// Path 2's plan with an outer side of `outer` rows and an inner one of `inner`.
+LogicalPlan Path2Plan(std::vector<ExprPtr> conjuncts, int64_t outer, std::optional<int64_t> inner) {
+  return Optimized(
+      PlanOverJoin(Node(DependentJoinNode{.kind = JoinKind::kOneRow,
+                                          .left = FourFieldsRows(1, outer),
+                                          .right = ScalarBlockRows(std::move(conjuncts), 50, inner),
+                                          .span = {}}),
+                   1));
+}
+
+// The restriction below the group aggregate, or nullptr where the gate refused.
+const JoinNode* RestrictionUnder(const LogicalPlan& plan) {
+  const auto* join = JoinUnder(plan);
+  if (join == nullptr) {
+    return nullptr;
+  }
+  const auto* grouped = std::get_if<GroupAggregateNode>(join->right.get());
+  return grouped == nullptr ? nullptr : std::get_if<JoinNode>(grouped->input.get());
+}
+
+// The reduction the ADR defers under its own name: the aggregation's input restricted to the rows
+// whose correlated keys the outer side binds. A semi join, which cannot multiply its probe's rows,
+// building on its right input (ADR 0022) so that the outer side is the build whatever the
+// estimates say, and with one key per correlated column so that no correlation is dropped.
+TEST(OptimizerTest, TheSemiJoinReductionRestrictsTheAggregatesInput) {
+  const LogicalPlan plan = Path2Plan({Compare(FieldOf(11, 1), FieldOf(1, 1), CompareOp::kEq),
+                                      Compare(FieldOf(11, 2), FieldOf(1, 2), CompareOp::kEq)},
+                                     10, 1000);
+  const auto* restriction = RestrictionUnder(plan);
+  ASSERT_NE(restriction, nullptr) << Explain(plan);
+  EXPECT_EQ(restriction->kind, JoinKind::kSemi);
+  EXPECT_EQ(restriction->build, BuildSide::kRight) << "the outer side is the build";
+  ASSERT_EQ(restriction->keys.size(), 2U) << Explain(plan);
+  EXPECT_EQ(restriction->keys[0].left.id, FieldOf(11, 1).id) << "the inner column it groups by";
+  EXPECT_EQ(restriction->keys[1].left.id, FieldOf(11, 2).id);
+  EXPECT_TRUE(std::holds_alternative<ScanNode>(*restriction->left))
+      << "its probe is the aggregation's own input: " << Explain(plan);
+
+  // The domain is a clone, so its keys are columns of neither the outer side nor the inner one: the
+  // same node under both the join and the restriction would be a column defined twice.
+  const std::vector<ColumnId> outer = OutputIds(*FourFieldsRows(1, 10));
+  for (const JoinKey& key : restriction->keys) {
+    EXPECT_EQ(std::ranges::find(outer, key.right.id), outer.end())
+        << "the restriction keys on the clone, not on the outer side itself";
+  }
+  EXPECT_EQ(PositionMismatch(plan), std::nullopt) << Explain(plan);
+}
+
+// **Stacked rewrites may not multiply the plan.** The pass is top-down, so a dependent join still
+// in this one's left input is one the rewrite has not reached; cloning it would duplicate a rewrite
+// that clones in turn, and k stacked correlated subqueries would cost 2^k nodes. Measured before
+// the condition that forbids it, on a query of k conjuncts over one correlation: 1,533 plan lines
+// at k=8 and 24,573 at k=12, where planning alone took 1.3 s.
+//
+// So the outer of two stacked rewrites declines and the inner one restricts: one clone for the
+// chain, and a node count within a factor of the unstacked plan's.
+TEST(OptimizerTest, TheSemiJoinReductionDoesNotCloneAStackOfRewrites) {
+  const auto two_keys = [](std::uint32_t inner) {
+    return std::vector<ExprPtr>{Compare(FieldOf(inner, 1), FieldOf(1, 1), CompareOp::kEq),
+                                Compare(FieldOf(inner, 2), FieldOf(1, 2), CompareOp::kEq)};
+  };
+  const LogicalNodePtr inner =
+      Node(DependentJoinNode{.kind = JoinKind::kOneRow,
+                             .left = FourFieldsRows(1, 10),
+                             .right = ScalarBlockRows(two_keys(11), 50, 1000, 11),
+                             .span = {}});
+  const LogicalPlan one = Optimized(PlanOverJoin(inner, 1));
+  const LogicalPlan two = Optimized(
+      PlanOverJoin(Node(DependentJoinNode{.kind = JoinKind::kOneRow,
+                                          .left = inner,
+                                          .right = ScalarBlockRows(two_keys(21), 60, 1000, 21),
+                                          .span = {}}),
+                   1));
+  EXPECT_EQ(PositionMismatch(one), std::nullopt) << Explain(one);
+  EXPECT_EQ(PositionMismatch(two), std::nullopt) << Explain(two);
+
+  // Exactly one restriction in the stacked plan: the inner rewrite's, whose own left input holds no
+  // dependent join. Doubling would show here as two, and as a node count far above the single
+  // plan's.
+  const auto semi_joins = [](const LogicalNodePtr& node) {
+    std::size_t found = 0;
+    const auto walk = [&found](const LogicalNodePtr& n, const auto& self) -> void {
+      if (n == nullptr) {
+        return;
+      }
+      if (const auto* join = std::get_if<JoinNode>(n.get());
+          join != nullptr && join->kind == JoinKind::kSemi) {
+        ++found;
+      }
+      for (const LogicalNodePtr& input : InputsOf(*n)) {
+        self(input, self);
+      }
+    };
+    walk(node, walk);
+    return found;
+  };
+  EXPECT_EQ(semi_joins(one.root), 1U) << Explain(one);
+  EXPECT_EQ(semi_joins(two.root), 1U) << Explain(two);
+  EXPECT_LT(NodeCount(two.root), NodeCount(one.root) * 2)
+      << "a stacked rewrite costs a constant, not a factor: " << Explain(two);
+}
+
+// One correlated column is ADR 0029's D5 to restrict: it costs a filter where this costs a build
+// and a probe, and restricting such a query as well was measured at 1.420x. More than one key is
+// what D5 cannot reach, so the key count is what this rewrite is gated on.
+TEST(OptimizerTest, TheSemiJoinReductionLeavesOneKeyToTheDynamicFilter) {
+  const LogicalPlan plan =
+      Path2Plan({Compare(FieldOf(11, 1), FieldOf(1, 1), CompareOp::kEq)}, 10, 1000);
+  EXPECT_EQ(RestrictionUnder(plan), nullptr) << Explain(plan);
+  const auto* join = JoinUnder(plan);
+  ASSERT_NE(join, nullptr) << Explain(plan);
+  const auto* grouped = std::get_if<GroupAggregateNode>(join->right.get());
+  ASSERT_NE(grouped, nullptr) << Explain(plan);
+  EXPECT_TRUE(std::holds_alternative<ScanNode>(*grouped->input)) << Explain(plan);
+}
+
+// The gate: an outer side the aggregation's input does not dwarf buys a build and a probe for
+// nothing, and an outer side nothing estimated cannot be shown to be small at all. Both leave
+// Path 2's plan exactly as it was, which is correct and is what shipped before this.
+TEST(OptimizerTest, TheSemiJoinReductionRefusesWhatItCannotShowIsWorthIt) {
+  const std::vector<ExprPtr> two = {Compare(FieldOf(11, 1), FieldOf(1, 1), CompareOp::kEq),
+                                    Compare(FieldOf(11, 2), FieldOf(1, 2), CompareOp::kEq)};
+  const auto refuses = [&two](int64_t outer, std::optional<int64_t> inner) {
+    const LogicalPlan plan = Path2Plan(two, outer, inner);
+    EXPECT_EQ(RestrictionUnder(plan), nullptr) << Explain(plan);
+    const auto* join = JoinUnder(plan);
+    ASSERT_NE(join, nullptr) << Explain(plan);
+    const auto* grouped = std::get_if<GroupAggregateNode>(join->right.get());
+    ASSERT_NE(grouped, nullptr) << Explain(plan);
+    EXPECT_TRUE(std::holds_alternative<ScanNode>(*grouped->input)) << Explain(plan);
+    EXPECT_EQ(PositionMismatch(plan), std::nullopt) << Explain(plan);
+  };
+  refuses(1000, 1000);        // the same size: the restriction removes little
+  refuses(1000, 3999);        // just under the ratio
+  refuses(10, std::nullopt);  // an inner side nothing estimated
+  refuses(0, 1000);           // an outer side of no rows, which may not read as small
+
+  // Just over the ratio it fires, so the boundary is the gate's and not an accident of the shape.
+  const LogicalPlan fires = Path2Plan(two, 1000, 4000);
+  EXPECT_NE(RestrictionUnder(fires), nullptr) << Explain(fires);
+}
+
 // One key per OUTER column. Two correlations give two keys and two group keys; the case where two
 // outer columns share one inner equivalent, where a key per CLASS would drop the second column's
 // constraint and keep rows SQL rejects, needs two outer columns of one type and is pinned against
